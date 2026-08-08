@@ -186,6 +186,110 @@ committed snapshot and never blocks; on a non-snapshot box engine with `mssql_ma
 row the same transaction is **writing** would block on the writer's locks — so don't read rows the open
 transaction is modifying when you force MARS off on box.
 
+#### ⚠ MEASURED LIVE on Fabric Warehouse, 2026-08-08 — the paragraph above was reasoning; this is the number
+
+The question is whether we share a defect common to extensions that pin one connection per transaction:
+**that connection cannot stream a result set and receive a bulk load at the same time**, so reading and
+writing the same attached catalog inside a transaction fails. `duckdb-postgres` avoids it with
+`MaterializePostgresScans` in `PlanCreateTableAs`, and `duckdb-mysql` with `MaterializeMySQLScans` called from
+its INSERT/CTAS planner ([41ddbe2](https://github.com/duckdb/duckdb-mysql/commit/41ddbe2aff6b65455eefbd6a860cb9026631a704))
+— both materialise their own scans before the sink so the single connection is never doing both at once.
+
+Profile confirmed first: `engine_edition 11`, `is_warehouse true`, **`supports_mars false`**,
+`default_write_isolation snapshot`. Then, on a 3-row seeded table:
+
+```sql
+BEGIN;
+  INSERT INTO w.dbo.marsprobe VALUES (4,'intxn');
+  SELECT count(*) FROM w.dbo.marsprobe;                                    -- 3, NOT 4
+  INSERT INTO w.dbo.marsprobe SELECT id + 100, 'selfcopy' FROM w.dbo.marsprobe;
+COMMIT;
+SELECT count(*) FROM w.dbo.marsprobe;                                      -- 7
+```
+
+**The self-referencing INSERT SUCCEEDS** — we do not have that defect. And the final count is the
+discriminator, chosen so one number settles it: **7** (seed 3 + intxn 1 + selfcopy 3) means the scan read the
+COMMITTED state; **8** would have meant read-your-writes. Tags came back `seed 3 / intxn 1 / selfcopy 3`.
+
+Mechanism confirmed from the `Fabricator.Sql` routing log rather than inferred: inside the explicit
+transaction **every data scan logged `[pooled txn=13]`** while the writes went to the pinned connection
+(`[dbo].[marsprobe]: 3 rows copied`). The only two `[pinned …]` lines both carry the ` ryw` marker — i.e. the
+metadata reads that are deliberately exempt from the MARS gate, exactly as documented above.
+
+#### ⚠⚠ AND THE "WE DO NOT HAVE IT" CONCLUSION ABOVE WAS WRONG — MEASURED 2026-08-08, FIXED THE SAME DAY
+
+The Fabric run settled Fabric and nothing else. On **box SQL Server the same shape FAILS**, and only a
+too-small probe hid it:
+
+```
+595: Bulk Insert with another outstanding result set should be run with XACT_ABORT on.
+```
+
+**It is SIZE-DEPENDENT.** With a `(INTEGER, VARCHAR)` row: 500 / 1k / 2k / 5k / 10k / 20k rows all PASS;
+**30k / 50k / 75k / 100k all FAIL.** Below roughly one buffered result the scan drains before the bulk
+begins and nothing collides — which is why every existing suite was green. It fails in **autocommit too**,
+not just inside `BEGIN`: the bulk session pins the connection at operator init, *before* the scan streams,
+so the scan then reuses it.
+
+**⇒ MARS is not what saves us; it is what breaks us.** The pooled-scan routing we only do BECAUSE Fabric
+lacks MARS is the half that was correct all along — Fabric returned 200000/200000 at the same 100k seed.
+
+Two plausible fixes are MEASURED WRONG, and both are the obvious guesses:
+- **`READ_COMMITTED_SNAPSHOT ON`** at the database level changes NOTHING — 595 fires identically. Snapshot
+  isolation fixes readers BLOCKING writers, and nothing here ever blocks; a lock conflict would surface as
+  a wait or a 1205. This is a MARS restriction about **error semantics**, not visibility.
+- **`SET XACT_ABORT ON`** via `fabricator_exec` did not help either — but that result is **VOID, not
+  negative**: it was never established that the SET landed on the connection the bulk copy used. Not
+  pursued, because it would do nothing for Fabric and would make any error abort the whole transaction.
+
+**THE FIX (2026-08-08): materialise our own scans — `FabricatorCatalog::MaterializeOwnScans`.** A recursive
+walk over the physical plan in `PlanInsert`/`PlanCreateTableAs` marks every fabricator scan whose table
+belongs to THIS catalog; the mark rides `spec_json` as `"materialize":true` (**no ABI bump** — that field is
+free-form), and `SqlServerBackend` drains the reader and **disposes** it before returning the stream.
+- **The DISPOSE is the load-bearing part, not the buffering.** `DbDataReaderArrowStream` closes its reader
+  only in `Dispose()`, and the scan releases its Arrow stream in the global state's DESTRUCTOR (query
+  teardown, not pipeline end) — so a merely-blocking operator would leave a drained-but-OPEN reader, which
+  SQL Server still counts as outstanding. Worth knowing before anyone "optimises" this into a plan operator.
+- **Both payoffs from one change**: box stops failing, and because a drained scan leaves no outstanding
+  reader, it may use the PINNED connection even without MARS ⇒ **read-your-writes RESTORED on Fabric**
+  (measured: the self-copy now sees the transaction's own row — final **8**, `selfcopy 4`, where before it
+  was 7 / 3).
+- **Ours is NARROWER than the reference implementations.** `MaterializePostgresScans` and
+  `MaterializeMySQLScans` match on the function NAME, so they materialise every scan of their type in the
+  plan — including one from a DIFFERENT attached database of the same kind. We match on bind-data type
+  **plus catalog identity**, so a scan of another fabricator catalog keeps its pipelining.
+- **Provider-agnostic by construction**: C++ only states "this scan and a sink share a catalog". Only
+  `SqlServerBackend` reads the flag; Delta/DAX/DeltaRs parse the spec and ignore it, which is correct — a
+  provider holding no connection has nothing to collide.
+- **`max_threads = 1` is NOT needed here**, though postgres sets it: their scan is parallel by default,
+  ours declares `MaxThreads() { return 1; }` ("a single Arrow C stream is consumed serially"). Checked
+  rather than assumed.
+- ⚠ **COST, and it is the same one postgres and mysql pay: the whole source is BUFFERED IN MEMORY, with no
+  spill to disk.** Neither reference implementation spills either (both just tell the client library to
+  buffer), so this is parity, not a shortcut — but it converts a hard failure at scale into a memory cost
+  at scale, and the ceiling is unmeasured. The better design, deliberately deferred, is a
+  `ColumnDataCollection`-backed operator (which DuckDB would spill) **plus** an eager close-on-exhaustion —
+  the operator alone is not sufficient, per the DISPOSE note above.
+- Gate: `test/verify_read_write_same_catalog.test` (**36**, service tier) — autocommit and in-transaction at
+  30k, read-your-writes, and a small-table control whose absence would let the others pass by self-insert
+  simply having stopped working.
+
+**⚠ So we avoid it by ROUTING, where postgres/mysql avoid it by MATERIALISING — and the trade is not free.**
+They keep read-your-writes (their materialised scan runs on the same connection); we give it up on every
+no-MARS engine. Nothing hangs, nothing errors, and a statement that silently reads a different snapshot than
+the user expects is the failure mode to watch for here.
+- **The improvement this suggests is theirs applied to our weak spot, not our strong one.** What forbids the
+  pinned connection with MARS off is an *open reader* coexisting with DML — and materialising removes the open
+  reader. So the same planner rewrite (we already own `FabricatorCatalog::PlanInsert` / `PlanCreateTableAs`)
+  would let a no-MARS engine scan on the pinned connection and **restore read-your-writes on Fabric**. Not
+  built; it needs a signal to C# that a scan is materialised so `ExecuteQuery` may pin it.
+- ⚠ Worth stealing from the mysql commit if it is ever built: it decides **per plan** whether to stream or
+  materialise (streaming only when a single scan is present) instead of materialising unconditionally as
+  postgres does, and it logs the streaming flag — which is what makes the choice observable rather than
+  arguable.
+- Scope: SQL-Server-path only. The **Delta** provider holds no connections, so this whole class is unreachable
+  there.
+
 **Metadata reads are the exception — they keep read-your-writes even with MARS off.** A short metadata read
 (`ExecuteMetadataQuery`: `FetchTableColumns` / `FetchRowIdColumns` / the catalog discovery queries) reuses the
 pinned write connection whenever one exists, **regardless of MARS**. It holds no long-lived reader (it drains

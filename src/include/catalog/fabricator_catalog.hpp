@@ -108,6 +108,12 @@ public:
 	                                              OnEntryNotFound if_not_found) override;
 	void ScanSchemas(ClientContext &context, std::function<void(SchemaCatalogEntry &)> callback) override;
 
+	//! Mark every fabricator scan in `plan` that reads THIS catalog, so the provider produces the whole
+	//! result before returning the stream instead of streaming it into a concurrent sink. Same-catalog
+	//! only — a scan of a DIFFERENT catalog cannot collide with this sink's connection and keeps its
+	//! pipelining. See ArrowStreamBindData::force_materialize for why, and why it is safe at plan time.
+	void MaterializeOwnScans(PhysicalOperator &plan);
+
 	PhysicalOperator &PlanCreateTableAs(ClientContext &context, PhysicalPlanGenerator &planner,
 	                                    LogicalCreateTable &op, PhysicalOperator &plan) override;
 	PhysicalOperator &PlanInsert(ClientContext &context, PhysicalPlanGenerator &planner, LogicalInsert &op,

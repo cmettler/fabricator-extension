@@ -663,6 +663,46 @@ current code still uses the single-provider `fabricator` naming):
 ## Next up (open threads for future sessions)
 
 In-flight / planned refactors (all C#-only unless noted; tests stay green per slice):
+- **READ+WRITE OF ONE CATALOG IN ONE STATEMENT FAILED ON BOX AT SCALE — FIXED 2026-08-08 (C++ + C#, NO ABI
+  bump). `INSERT INTO t SELECT … FROM t` raised `595: Bulk Insert with another outstanding result set
+  should be run with XACT_ABORT on`.** Full record: [docs/transactions.md](docs/transactions.md) §5.1.
+  Cause: the bulk session pins the connection at operator INIT, before the scan streams, so with MARS on the
+  scan reuses that connection and the bulk copy starts with the reader still open.
+  - **⚠ SIZE-DEPENDENT, WHICH IS WHY EVERY SUITE WAS GREEN.** Measured on a `(INTEGER, VARCHAR)` row:
+    **500 → 20k rows PASS; 30k / 50k / 75k / 100k FAIL.** Below ~one buffered result the scan drains first
+    and nothing collides. **A read+write test at "a few rows" asserts nothing about this.** Fails in
+    AUTOCOMMIT too, not just inside `BEGIN`.
+  - **⚠ MARS IS NOT WHAT SAVES US, IT IS WHAT BREAKS US** — and this reverses the obvious reading. The
+    pooled-scan routing we do only BECAUSE Fabric/Synapse lack MARS is the correct half: Fabric returned
+    **200000/200000** at the same 100k seed while box failed.
+  - **⚠ TWO OBVIOUS FIXES ARE MEASURED WRONG.** `READ_COMMITTED_SNAPSHOT ON` changes NOTHING (595 fires
+    identically — snapshot isolation fixes readers BLOCKING writers, and nothing here blocks; a lock
+    conflict would be a wait or 1205). `SET XACT_ABORT ON` is **VOID, not negative** — it was never
+    established that the SET reached the connection the bulk used.
+  - Fix: `FabricatorCatalog::MaterializeOwnScans` walks the physical plan in `PlanInsert`/`PlanCreateTableAs`
+    and marks fabricator scans whose table belongs to THIS catalog; the mark rides `spec_json` as
+    `"materialize":true` (free-form ⇒ no ABI bump); `SqlServerBackend` drains **and disposes** the reader.
+    - **⚠ THE DISPOSE IS LOAD-BEARING, NOT THE BUFFERING** — `DbDataReaderArrowStream` closes its reader only
+      in `Dispose()`, and the scan releases its Arrow stream in the global state's DESTRUCTOR (query
+      teardown, not pipeline end), so a merely-BLOCKING plan operator would leave a drained-but-OPEN reader,
+      which SQL Server still counts as outstanding. Know this before "optimising" it into an operator.
+    - **Both payoffs from one change**: box stops failing AND, since a drained scan leaves no outstanding
+      reader, it may use the PINNED connection without MARS ⇒ **read-your-writes RESTORED on Fabric**
+      (measured 8 / `selfcopy 4`, was 7 / 3).
+    - **Ours is NARROWER than upstream's**: `MaterializePostgresScans`/`MaterializeMySQLScans` match the
+      function NAME and so materialise every scan of their type — including one from a DIFFERENT attached
+      database. We match bind-data type **plus catalog identity**, so another catalog's scan keeps streaming.
+    - Provider-agnostic: only `SqlServerBackend` reads the flag; Delta/DAX/DeltaRs parse the spec and ignore
+      it, which is right — a provider holding no connection has nothing to collide.
+    - **`max_threads = 1` is NOT needed** though postgres sets it: ours already declares
+      `MaxThreads() { return 1; }` ("a single Arrow C stream is consumed serially"). Checked, not assumed.
+  - ⚠ **COST: the whole source is BUFFERED IN MEMORY, no spill.** Parity with postgres/mysql (neither
+    spills — both just tell the client library to buffer), but it trades a hard failure at scale for a
+    memory cost at scale, and the ceiling is UNMEASURED. Better design, deliberately deferred: a
+    `ColumnDataCollection`-backed operator (DuckDB would spill) **plus** eager close-on-exhaustion — the
+    operator alone is insufficient per the DISPOSE note.
+  - Gate `test/verify_read_write_same_catalog.test` (**36**, service tier); the small-table control is
+    load-bearing — without it the others could pass by self-insert having stopped working entirely.
 - **`delta.checkpointInterval` WAS ACCEPTED, STORED AND IGNORED — FIXED 2026-08-08 (one EW patch).**
   MEASURED: `CREATE TABLE … WITH ("delta.checkpointInterval" = '25')` writes the value into the v0 `metaData`
   and the table was still checkpointed at **10 and 20**. It is in `DeltaWithOptions.CanonicalKeys`, so we

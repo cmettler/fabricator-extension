@@ -50,6 +50,17 @@ public sealed class SqlServerBackend : IBackend
                 Str("mssql_ctas_text_type"),
                 Str("mssql_isolation_level", "fabricator: SQL transaction isolation level for table-in-out sessions"),
                 Str("mssql_mars", "fabricator: MARS mode — auto (default, per engine) | true | false"),
+                // BOOLEAN, not the auto|true|false tri-state mssql_mars uses, and deliberately: there is no
+                // per-engine variation to express here. The default is always "materialise the scans the
+                // planner marked", so an `auto` state would be identical to `true` and the tri-state would
+                // carry a distinction that does not exist.
+                Bool("mssql_materialize",
+                     "fabricator: buffer a scan that reads the SAME catalog a statement writes to, before the " +
+                     "write starts (default true). Required on MARS engines — without it INSERT INTO t SELECT " +
+                     "... FROM t fails at scale with 595; it is also what gives read-your-writes on Fabric. " +
+                     "Set false to keep streaming instead: needs ALLOW_SNAPSHOT_ISOLATION on the database, and " +
+                     "the scan then reads a committed snapshot (no read-your-writes). Overrides the per-catalog " +
+                     "materialize ATTACH option"),
                 Str("mssql_default_table_type",
                     "fabricator: created-table storage — '' (rowstore, default) | 'clustered columnstore' " +
                     "(CCI, box/Azure SQL; Fabric/Synapse tables are columnstore already so it is a no-op there)"),
@@ -545,6 +556,9 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     // (schema_filter already gates functions by schema on the C++ side).
     private readonly Regex? _functionFilter;
     private readonly string _isolationLevel = "";
+    // ATTACH option `materialize true|false` (default true). See ResolveMaterialize; a SET mssql_materialize
+    // overrides it per session, the same precedence as isolation_level and command_timeout.
+    private readonly bool? _materialize;
     // ATTACH option `command_timeout <seconds>` (0 = infinite, default): the catalog default SqlCommand.CommandTimeout
     // for scans/DML/bulk. A SET mssql_command_timeout overrides it per session (ResolveCommandTimeout).
     private readonly int _commandTimeout;
@@ -645,6 +659,9 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
                     case "table_filter": _tableFilter = CompileFilter("table_filter", val); break;
                     case "function_filter": _functionFilter = CompileFilter("function_filter", val); break;
                     case "isolation_level": _isolationLevel = val; break;
+                    case "materialize":
+                        _materialize = !(string.Equals(val, "false", StringComparison.OrdinalIgnoreCase) || val == "0");
+                        break;
                     case "command_timeout":
                         if (int.TryParse(val, out var ctSecs) && ctSecs >= 0) { _commandTimeout = ctSecs; }
                         break;
@@ -1142,7 +1159,66 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     // write connection whenever one exists, regardless of MARS.
     internal IArrowArrayStream ExecuteMetadataQuery(string sql) => ExecuteQuery(sql, null, readYourWrites: true);
 
+    // Drains `source` completely and hands back an equivalent in-memory stream, disposing the source (and
+    // with it the reader, so nothing is left outstanding on the connection). This is the whole point of
+    // ScanSpec.Materialize: SQL Server refuses a bulk load while a result set is still open on the same
+    // MARS connection (error 595), and closing the reader before the sink starts is what removes it.
+    // Costs the pipelining — the full source is buffered before the sink sees a row — which is why the
+    // host only asks for it when a scan and a sink share a catalog.
+    private static IArrowArrayStream DrainToMemory(IArrowArrayStream source)
+    {
+        try
+        {
+            var batches = new List<RecordBatch>();
+            while (true)
+            {
+                var batch = source.ReadNextRecordBatchAsync().GetAwaiter().GetResult();
+                if (batch is null)
+                {
+                    break;
+                }
+                batches.Add(batch);
+            }
+            return new InMemoryArrayStream(source.Schema, batches);
+        }
+        finally
+        {
+            // Always — on the throw path too, or a failed drain leaves the reader open on the pinned
+            // connection and the very collision this exists to prevent happens on the NEXT statement.
+            source.Dispose();
+        }
+    }
+
+    // SET mssql_materialize wins if set, else this catalog's `materialize` ATTACH option, else TRUE.
+    // Default true because false is only safe where the database allows snapshot isolation — an opt-in with
+    // a prerequisite must not be the default.
+    internal bool ResolveMaterialize()
+    {
+        var set = ProviderSettingsStore.Instance.GetBool(SqlServerBackend.ProviderName, "mssql_materialize");
+        return set ?? _materialize ?? true;
+    }
+
     public IArrowArrayStream ExecuteQuery(string sql, IReadOnlyList<SqlParameter>? parameters, bool readYourWrites)
+        => ExecuteQuery(sql, parameters, readYourWrites, materialize: false);
+
+    public IArrowArrayStream ExecuteQuery(string sql, IReadOnlyList<SqlParameter>? parameters, bool readYourWrites,
+                                          bool materialize)
+        => ExecuteQuery(sql, parameters, readYourWrites, materialize, snapshotRead: false);
+
+    // `snapshotRead` is the mssql_materialize=false route for a scan the planner marked: instead of draining
+    // the reader, keep STREAMING it but force it onto a POOLED connection at SNAPSHOT isolation, so it shares
+    // no connection with the pinned writer.
+    //
+    // ⚠ THE SNAPSHOT IS NOT OPTIONAL AND MUST NEVER FALL BACK TO READ COMMITTED. MEASURED on box, 100k rows,
+    // pooled streaming read + pinned write: under READ COMMITTED it HANGS — an unbounded lock wait, no error,
+    // no timeout (the reader blocks on the writer's locks). With versioned reads the same shape completes at
+    // exactly 2N rows. So a silent fallback would turn an opt-in optimisation into a deadlock.
+    //
+    // It requires ALLOW_SNAPSHOT_ISOLATION on the database; without it SQL Server raises Msg 3952, which names
+    // the ALTER to run. That is a documented prerequisite of the setting, and a loud failure rather than a
+    // silent one — which is also what keeps the reader from ever seeing the rows the write is producing.
+    public IArrowArrayStream ExecuteQuery(string sql, IReadOnlyList<SqlParameter>? parameters, bool readYourWrites,
+                                          bool materialize, bool snapshotRead)
     {
         // Inside a transaction that has a pinned connection (a write has happened), read on that connection
         // so the query sees uncommitted changes (read-your-writes). Borrowed: the stream must not dispose the
@@ -1160,7 +1236,13 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         {
             lock (state)
             {
-                if (state.Connection is not null && (_marsEnabled || readYourWrites))
+                // `materialize` joins the MARS/metadata exemptions for the same reason they qualify: the
+                // reader is drained before this call returns, so the pinned connection never carries a
+                // concurrent scan reader. That is what restores READ-YOUR-WRITES on a no-MARS engine
+                // (Fabric/Synapse), where an ordinary scan is routed to a pooled connection and therefore
+                // sees only committed state.
+                if (state.Connection is not null && !snapshotRead &&
+                    (_marsEnabled || readYourWrites || materialize))
                 {
                     pinned = state.Connection;
                     pinnedTransaction = state.Transaction;
@@ -1189,8 +1271,9 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
             try
             {
                 var pinnedReader = pinnedCommand.ExecuteReaderAsync(token).GetAwaiter().GetResult();
-                return new DbDataReaderArrowStream(pinned, pinnedCommand, pinnedReader,
-                                                   ownsConnection: false, interrupt: interrupt);
+                IArrowArrayStream pinnedStream = new DbDataReaderArrowStream(
+                    pinned, pinnedCommand, pinnedReader, ownsConnection: false, interrupt: interrupt);
+                return materialize ? DrainToMemory(pinnedStream) : pinnedStream;
             }
             catch
             {
@@ -1206,13 +1289,26 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         {
             connection = OpenConnection();
             connection.OpenAsync(token).GetAwaiter().GetResult();
+            if (snapshotRead)
+            {
+                // Session-scoped, so it governs the implicit transaction this SELECT runs in. Set on every
+                // such open rather than once: pooled connections are recycled and sp_reset_connection puts
+                // the isolation level back to the default, so assuming it persists would silently give us a
+                // READ COMMITTED reader — the shape measured to hang.
+                using var iso = connection.CreateCommand();
+                iso.CommandText = "SET TRANSACTION ISOLATION LEVEL SNAPSHOT";
+                iso.CommandType = CommandType.Text;
+                iso.ExecuteNonQuery();
+            }
             command = connection.CreateCommand();
             command.CommandText = sql;
             command.CommandType = CommandType.Text;
             command.CommandTimeout = ResolveCommandTimeout();
             AddParameters(command, parameters);
             var reader = command.ExecuteReaderAsync(token).GetAwaiter().GetResult();
-            return new DbDataReaderArrowStream(connection, command, reader, interrupt: interrupt);
+            IArrowArrayStream pooledStream =
+                new DbDataReaderArrowStream(connection, command, reader, interrupt: interrupt);
+            return materialize ? DrainToMemory(pooledStream) : pooledStream;
         }
         catch
         {
@@ -2163,7 +2259,9 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
                 var where = builder.Build(spec.Filter);
                 var allParams = new List<SqlParameter>(sourceParams);
                 allParams.AddRange(builder.Parameters); // source @a* + filter @p* are disjoint
-                return ExecuteQuery($"SELECT {top}{columns} FROM {source} WHERE {where}{orderBy}{optionClause}", allParams);
+                return ExecuteQuery($"SELECT {top}{columns} FROM {source} WHERE {where}{orderBy}{optionClause}", allParams,
+                                    readYourWrites: false, materialize: spec.Materialize && ResolveMaterialize(),
+                                    snapshotRead: spec.Materialize && !ResolveMaterialize());
             }
             catch
             {
@@ -2172,8 +2270,11 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         }
 
         filterValues?.Dispose();
+        var marked = spec?.Materialize == true;
         return ExecuteQuery($"SELECT {top}{columns} FROM {source}{orderBy}{optionClause}",
-                            sourceParams.Count > 0 ? sourceParams : null);
+                            sourceParams.Count > 0 ? sourceParams : null,
+                            readYourWrites: false, materialize: marked && ResolveMaterialize(),
+                            snapshotRead: marked && !ResolveMaterialize());
     }
 
     // Reads the one-row filter value batch (column i == value i) into CLR values.

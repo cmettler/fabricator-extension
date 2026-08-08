@@ -15,6 +15,19 @@ IF DB_ID('TestDB')   IS NULL CREATE DATABASE TestDB;
 -- MSSQL_BINCOLL_DSN and does NOT self-provision, so without this database that suite can only ever
 -- skip — which is exactly the silent-no-coverage shape CI is meant to prevent.
 IF DB_ID('BinCollTest') IS NULL CREATE DATABASE BinCollTest COLLATE Latin1_General_100_BIN2_UTF8;
+-- ALLOW_SNAPSHOT_ISOLATION is a PREREQUISITE of `mssql_materialize=false`, which keeps a scan of the
+-- catalog being written STREAMING by routing it to a pooled connection at SNAPSHOT isolation instead of
+-- buffering it. Sessions still have to opt in (SET TRANSACTION ISOLATION LEVEL SNAPSHOT), so this changes
+-- nothing for any other suite — it only makes the option reachable.
+--
+-- ⚠ WITHOUT IT that path raises Msg 3952 ("snapshot isolation is not allowed in this database"). That is
+-- the SAFE failure and is deliberate: the alternative, silently falling back to READ COMMITTED, was
+-- MEASURED to HANG — a pooled streaming reader blocks forever on the pinned writer's locks, with no error
+-- and no timeout. So the prerequisite is never inferred or worked around.
+--
+-- ⚠ NOT READ_COMMITTED_SNAPSHOT: that one is database-wide and would redefine READ COMMITTED for every
+-- other suite. ALLOW_SNAPSHOT_ISOLATION is opt-in per session, which is why it is the safe one to provision.
+ALTER DATABASE TestDB SET ALLOW_SNAPSHOT_ISOLATION ON;
 '@
 
 # The collation fixture, verbatim from the header of test/verify_collation_pushdown.test.

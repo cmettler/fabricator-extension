@@ -249,7 +249,10 @@ case "$TIER" in
         # (+161, the same count as its native leg). 42 suites, 43 runs Ã¢ÂÂ the floor is on RUNS.
         # 44 RUNS / 1413 since 2026-07-31: verify_session_tag (+25) Ã¢ÂÂ fabricator_session_tag, which needs a
         # real server (it pins a provider connection and reads the session's own monitoring ids).
-        : "${MIN_SUITES:=45}"
+        # 46 RUNS since 2026-08-08: verify_read_write_same_catalog — INSERT INTO t SELECT ... FROM t, the
+        # MARS outstanding-result-set collision (error 595). Service-only: it needs a real SQL Server, and
+        # its seed size is load-bearing (the bug does not reproduce below ~30k rows).
+        : "${MIN_SUITES:=46}"
         # 1424 since 2026-08-01: verify_exec_invalidate_cache 10 -> 21, for the OUT-OF-BAND DROP path Ã¢ÂÂ the
         # catalog's self-heal, documented in CLAUDE.md and until now covered by NOTHING. The service tier ran
         # 44/44 green while that path was broken, which is why the section exists. It must run with
@@ -289,7 +292,11 @@ case "$TIER" in
         # INTACT after the VACUUM, so a vacuum that removed a live file fails HERE rather than in some later
         # run. See the section header in that suite for what it bounds (data files) and what it does not
         # (the log, which engineered-wood never cleans and which this makes grow slightly FASTER).
-        : "${MIN_ASSERTIONS:=1678}"
+        # 1714 since 2026-08-08: verify_read_write_same_catalog (+36). The tier went 45/1678 -> 46/1714, i.e.
+        # the gap is EXACTLY the new suite and every pre-existing suite kept its own count — which is the
+        # behaviour-preservation evidence for the scan-materialisation change (FabricatorCatalog::
+        # MaterializeOwnScans + ScanSpec.Materialize) that landed with it. Raised in the same commit.
+        : "${MIN_ASSERTIONS:=1714}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

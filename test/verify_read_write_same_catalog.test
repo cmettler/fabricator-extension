@@ -1,0 +1,169 @@
+# name: test/verify_read_write_same_catalog.test
+# description: reading and writing the SAME attached catalog in one statement (INSERT INTO t SELECT ... FROM t) — the MARS outstanding-result-set collision (error 595)
+# group: [fabricator]
+
+require fabricator
+
+require-env MSSQL_TESTDB_DSN
+
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+# WHAT THIS PINS
+#
+# A statement that both READS and WRITES one attached catalog puts an open scan reader and a
+# SqlBulkCopy on the SAME pinned connection: the bulk session pins the connection at operator init,
+# BEFORE the scan starts streaming, so with MARS on the scan then reuses it. SQL Server refuses that
+# combination:
+#
+#   595: Bulk Insert with another outstanding result set should be run with XACT_ABORT on.
+#
+# ⚠ IT IS SIZE-DEPENDENT, WHICH IS WHY IT WENT UNNOTICED. Below roughly one buffered result the scan
+# DRAINS before the bulk begins and nothing collides. MEASURED on box SQL Server 2025 with a
+# (INTEGER, VARCHAR) row: 500 / 1k / 2k / 5k / 10k / 20k rows all PASS; 30k / 50k / 75k / 100k all
+# FAIL. So a test at "a few rows" asserts nothing about this — the seed size below is load-bearing
+# and must stay above the threshold.
+#
+# ⚠ NOT an isolation or locking problem, and the obvious guesses are MEASURED WRONG:
+#   - READ_COMMITTED_SNAPSHOT ON at the database level changes NOTHING — 595 fires identically.
+#     Snapshot isolation fixes readers BLOCKING writers; nothing here ever blocks. A lock conflict
+#     would surface as a wait or a 1205 deadlock, never as this.
+#   - It is a MARS protocol restriction about ERROR SEMANTICS: with a result set still outstanding,
+#     a mid-flight bulk failure leaves a transaction state SQL Server will not reason about.
+#
+# ⚠ The engines DIVERGE here, and the irony is worth keeping: on a NO-MARS engine (Fabric /
+# Synapse) this shape WORKS, because scans there are routed to a fresh POOLED connection and so
+# never collide — measured 200000/200000 on Fabric Warehouse at the same 100k seed. MARS is not what
+# saves us; the routing we only do BECAUSE Fabric lacks MARS is what is correct.
+# See docs/transactions.md §5.1.
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE fabricator);
+
+# Positive control: this suite is meaningless unless MARS is actually on, since the whole collision
+# requires the scan to share the pinned connection. On the docker box engine it must be true.
+query I
+SELECT value FROM fabricator_server_info('db') WHERE property = 'supports_mars';
+----
+true
+
+# ── §1  AUTOCOMMIT — INSERT INTO t SELECT ... FROM t above the threshold ─────────────────────────
+# Not transaction-specific: the bulk session pins the connection at operator init even in
+# autocommit, so the scan lands on it just the same.
+
+statement ok
+DROP TABLE IF EXISTS db.dbo.rw_auto;
+
+statement ok
+CREATE TABLE db.dbo.rw_auto (id INTEGER, pad VARCHAR);
+
+statement ok
+INSERT INTO db.dbo.rw_auto SELECT r, 'seed' FROM range(0, 30000) t(r);
+
+statement ok
+INSERT INTO db.dbo.rw_auto SELECT id + 9000000, 'copy' FROM db.dbo.rw_auto;
+
+query I
+SELECT count(*) FROM db.dbo.rw_auto;
+----
+60000
+
+# The copy must be exactly one generation — never the scan re-reading its own inserts.
+query II
+SELECT pad, count(*) FROM db.dbo.rw_auto GROUP BY pad ORDER BY pad;
+----
+copy	30000
+seed	30000
+
+statement ok
+DROP TABLE db.dbo.rw_auto;
+
+# ── §2  EXPLICIT TRANSACTION — same shape inside BEGIN/COMMIT ────────────────────────────────────
+
+statement ok
+DROP TABLE IF EXISTS db.dbo.rw_txn;
+
+statement ok
+CREATE TABLE db.dbo.rw_txn (id INTEGER, pad VARCHAR);
+
+statement ok
+INSERT INTO db.dbo.rw_txn SELECT r, 'seed' FROM range(0, 30000) t(r);
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO db.dbo.rw_txn SELECT id + 9000000, 'copy' FROM db.dbo.rw_txn;
+
+statement ok
+COMMIT;
+
+query I
+SELECT count(*) FROM db.dbo.rw_txn;
+----
+60000
+
+statement ok
+DROP TABLE db.dbo.rw_txn;
+
+# ── §3  READ-YOUR-WRITES is preserved (MARS engines have it today; must not regress) ─────────────
+# A scan inside a write transaction sees that transaction's own uncommitted rows. This is what a
+# materialise-the-scan fix must PRESERVE on box — and what it is meant to RESTORE on no-MARS
+# engines, where the pooled-scan routing gives it up (measured on Fabric: this returns 3, not 4).
+
+statement ok
+DROP TABLE IF EXISTS db.dbo.rw_ryw;
+
+statement ok
+CREATE TABLE db.dbo.rw_ryw (id INTEGER, tag VARCHAR);
+
+statement ok
+INSERT INTO db.dbo.rw_ryw VALUES (1,'seed'),(2,'seed'),(3,'seed');
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO db.dbo.rw_ryw VALUES (4,'intxn');
+
+query I
+SELECT count(*) FROM db.dbo.rw_ryw;
+----
+4
+
+statement ok
+COMMIT;
+
+query I
+SELECT count(*) FROM db.dbo.rw_ryw;
+----
+4
+
+statement ok
+DROP TABLE db.dbo.rw_ryw;
+
+# ── §4  Small-table control — the shape that ALWAYS worked ───────────────────────────────────────
+# Load-bearing: without it, §1/§2 going green could equally mean self-insert had stopped working
+# altogether rather than that the collision was fixed.
+
+statement ok
+DROP TABLE IF EXISTS db.dbo.rw_small;
+
+statement ok
+CREATE TABLE db.dbo.rw_small (id INTEGER, pad VARCHAR);
+
+statement ok
+INSERT INTO db.dbo.rw_small SELECT r, 'seed' FROM range(0, 100) t(r);
+
+statement ok
+INSERT INTO db.dbo.rw_small SELECT id + 9000000, 'copy' FROM db.dbo.rw_small;
+
+query I
+SELECT count(*) FROM db.dbo.rw_small;
+----
+200
+
+statement ok
+DROP TABLE db.dbo.rw_small;
+
+statement ok
+DETACH db;

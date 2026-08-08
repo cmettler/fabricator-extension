@@ -76,6 +76,28 @@ struct ArrowStreamBindData : public duckdb::TableFunctionData {
 	//! scan maps output columns by NAME. When false (raw queries), the full result is
 	//! fetched and projected positionally.
 	bool push_projection = false;
+	//! Set at PLAN time when this scan reads the SAME catalog a sink in the same plan writes to
+	//! (FabricatorCatalog::MaterializeOwnScans, called from PlanInsert/PlanCreateTableAs). It asks the
+	//! provider to produce the whole result BEFORE returning the stream, instead of streaming it.
+	//!
+	//! WHY. A provider that pins one connection per transaction cannot hold an open reader and run a
+	//! bulk load on it at the same time. On SQL Server that is error 595 ("Bulk Insert with another
+	//! outstanding result set should be run with XACT_ABORT on") and it is SIZE-DEPENDENT: below
+	//! roughly one buffered result the reader drains first and nothing collides, which is why a
+	//! small-table test never sees it. Materialising removes the OUTSTANDING READER, which is the
+	//! thing the engine objects to — the same fix duckdb-postgres and duckdb-mysql apply.
+	//!
+	//! It is PROVIDER-AGNOSTIC BY DESIGN: C++ only states "this scan and a sink share a catalog".
+	//! Whether that costs anything is the backend's call — the Delta provider holds no connections and
+	//! ignores it; the SQL Server backend drains the reader and, having no open reader afterwards, may
+	//! then use the PINNED connection even without MARS (which is what restores read-your-writes on
+	//! Fabric/Synapse, where scans are otherwise routed to a pooled connection).
+	//!
+	//! Marked at plan time rather than execution time BECAUSE IT IS A PROPERTY OF THE PLAN SHAPE, not
+	//! of the transaction: "does this plan contain a scan of the sink's catalog" cannot change between
+	//! executions of the same prepared statement. (Contrast FabricatorModifyTarget's force_buffered,
+	//! which depends on the transaction and therefore MUST be set in GetGlobalSinkState.)
+	bool force_materialize = false;
 	//! Re-creates the data stream for each scan.
 	StreamFactory factory;
 

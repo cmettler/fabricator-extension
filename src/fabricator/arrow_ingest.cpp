@@ -155,6 +155,7 @@ unique_ptr<FunctionData> ArrowStreamBindData::Copy() const {
 	copy->column_nullable = column_nullable;
 	copy->column_ndv = column_ndv;
 	copy->push_projection = push_projection;
+	copy->force_materialize = force_materialize;
 	copy->factory = factory;
 	copy->filter_json = filter_json;
 	copy->filter_constants = filter_constants;
@@ -747,6 +748,12 @@ static string BuildScanSpec(const ArrowStreamBindData &bind_data, const vector<c
 		json += ",\"value\":";
 		JsonEscape(bind_data.at_value, json);
 		json += "}";
+	}
+	// Same-catalog read+write in one plan: the provider must produce the whole result before returning
+	// the stream, so no reader is still open when the sink's bulk load starts. Emitted only when set,
+	// so an ordinary scan's spec is byte-identical to before. See ArrowStreamBindData::force_materialize.
+	if (bind_data.force_materialize) {
+		json += ",\"materialize\":true";
 	}
 	json += "}";
 	return json;

@@ -44,6 +44,23 @@ public sealed class ScanSpec
     [JsonPropertyName("at")]
     public AtSpec? At { get; set; }
 
+    /// <summary>
+    /// The host marked this scan as reading the SAME catalog a sink in the same plan writes to
+    /// (<c>FabricatorCatalog::MaterializeOwnScans</c>). The provider should produce the whole result
+    /// BEFORE returning the stream rather than streaming it.
+    ///
+    /// <para>It is a statement about the PLAN, not an instruction about connections: a provider that
+    /// holds no connection (Delta) may ignore it entirely. A provider that pins one connection per
+    /// transaction cannot hold an open reader while a bulk load runs on it — on SQL Server that is
+    /// error 595, and it is size-dependent, so a small result never trips it.</para>
+    ///
+    /// <para>The second effect matters as much as the first: with the reader fully drained there is no
+    /// outstanding result set, so the scan may run on the PINNED connection even where MARS is
+    /// unavailable — which is what gives read-your-writes back on Fabric/Synapse.</para>
+    /// </summary>
+    [JsonPropertyName("materialize")]
+    public bool Materialize { get; set; }
+
     private static readonly JsonSerializerOptions Options = new()
     {
         PropertyNameCaseInsensitive = true,

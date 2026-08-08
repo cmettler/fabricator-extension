@@ -7,7 +7,9 @@
 
 #include <regex>
 
+#include "fabricator/arrow_ingest.hpp"
 #include "fabricator/clr_host.hpp"
+#include "duckdb/execution/operator/scan/physical_table_scan.hpp"
 #include "catalog/fabricator_metadata.hpp"
 #include "catalog/fabricator_schema_entry.hpp"
 #include "catalog/fabricator_txn_util.hpp"
@@ -328,8 +330,26 @@ ErrorData FabricatorCatalog::SupportsCreateTable(BoundCreateTableInfo &info) {
 	// three clauses.
 	return ErrorData();
 }
+void FabricatorCatalog::MaterializeOwnScans(PhysicalOperator &plan) {
+	if (plan.type == PhysicalOperatorType::TABLE_SCAN) {
+		auto &scan = plan.Cast<PhysicalTableScan>();
+		// dynamic_cast, not Cast<>: the plan may hold ANY table function's bind data (read_parquet, a
+		// custom TVF, another catalog's scan), and only ours carries an ArrowStreamBindData.
+		auto *bind_data = dynamic_cast<fabricator::ArrowStreamBindData *>(scan.bind_data.get());
+		// `table` is null for a raw fabricator_query scan, which belongs to no catalog and therefore
+		// cannot be the sink's own — leave it streaming.
+		if (bind_data && bind_data->table && &bind_data->table->schema.catalog == this) {
+			bind_data->force_materialize = true;
+		}
+	}
+	for (auto &child : plan.children) {
+		MaterializeOwnScans(child.get());
+	}
+}
+
 PhysicalOperator &FabricatorCatalog::PlanCreateTableAs(ClientContext &context, PhysicalPlanGenerator &planner,
                                                      LogicalCreateTable &op, PhysicalOperator &plan) {
+	MaterializeOwnScans(plan);
 	auto &create_info = op.info->base->Cast<CreateTableInfo>();
 
 	FabricatorCtasInfo info;
@@ -354,6 +374,11 @@ PhysicalOperator &FabricatorCatalog::PlanCreateTableAs(ClientContext &context, P
 }
 PhysicalOperator &FabricatorCatalog::PlanInsert(ClientContext &context, PhysicalPlanGenerator &planner,
                                               LogicalInsert &op, optional_ptr<PhysicalOperator> plan) {
+	// INSERT ... SELECT reading this same catalog: drain the scan before the bulk load starts. `plan` is
+	// null for INSERT ... VALUES, which reads nothing and needs no rewrite.
+	if (plan) {
+		MaterializeOwnScans(*plan);
+	}
 	FabricatorInsertTarget target;
 	target.returning = op.return_chunk;
 	target.schema_name = op.table.schema.name;
