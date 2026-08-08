@@ -2806,6 +2806,10 @@ public sealed class DeltaCatalog : IBackendCatalog
         // starts seeing a concurrent writer's commits mid-transaction — snapshot isolation silently broken.
         // Releasing per transaction makes the panic path unreachable in normal operation.
         SnapshotPinning.Release(txnId);
+        // ⚠ CAPTURED BEFORE Remove, which CLEARS the explicit marker along with the buffer. Read after it,
+        // this is always false and the blind-append declaration below silently degrades to "say nothing" —
+        // green, and quietly never emitting the flag it exists to emit. Same ordering fact as §4b.3.
+        bool wasExplicit = _txnBuffer.IsExplicit(txnId);
         var tables = _txnBuffer.Remove(txnId);
         if (tables is null)
         {
@@ -2844,7 +2848,16 @@ public sealed class DeltaCatalog : IBackendCatalog
                 }
                 else if (pending.Files.Count > 0)
                 {
-                    long v = FlushDeferredFiles(opener, kv.Key, pending.Files);
+                    // ⚠ THE DECLARATION IS ONLY MADE WHERE IT CAN BE TRUE, and the asymmetry is the point.
+                    // Scan-time read recording (see the `IsExplicit` gate at the scan) happens ONLY inside an
+                    // explicit transaction, so there we know whether anything was read and can say so. In
+                    // AUTOCOMMIT nothing is recorded at all, which makes an append indistinguishable from
+                    // `INSERT INTO t SELECT … FROM t` — the anti-join incremental shape, which READS the
+                    // target and emits only AddFiles. Declaring blind there would be a claim we cannot
+                    // support, and a wrong `true` is the UNSAFE direction: another engine SKIPS a conflict
+                    // check it owes. Saying nothing costs only spurious aborts, so autocommit says nothing.
+                    bool? blind = wasExplicit ? !pending.HasReads : null;
+                    long v = FlushDeferredFiles(opener, kv.Key, pending.Files, blind);
                     _log.LogInformation("delta txn {Txn} commit {Path}: v{Version} ({Files} file(s), {Rows} row(s))",
                         txnId, kv.Key, v, pending.Files.Count, pending.Rows);
                 }
@@ -3034,11 +3047,13 @@ public sealed class DeltaCatalog : IBackendCatalog
     // Commits transaction-deferred streamed files as ONE Delta commit, with the standard OCC retry
     // (appends are snapshot-independent, so reopening at the new latest and re-committing is safe).
     private long FlushDeferredFiles(nint opener, string tablePath,
-                                    System.Collections.Generic.IReadOnlyList<EngineeredWood.DeltaLake.Table.WrittenDataFile> files)
-        => FlushDeferredFilesAsync(opener, tablePath, files).GetAwaiter().GetResult();
+                                    System.Collections.Generic.IReadOnlyList<EngineeredWood.DeltaLake.Table.WrittenDataFile> files,
+                                    bool? isBlindAppend)
+        => FlushDeferredFilesAsync(opener, tablePath, files, isBlindAppend).GetAwaiter().GetResult();
 
     private static async Task<long> FlushDeferredFilesAsync(nint opener, string tablePath,
-                                    System.Collections.Generic.IReadOnlyList<EngineeredWood.DeltaLake.Table.WrittenDataFile> files)
+                                    System.Collections.Generic.IReadOnlyList<EngineeredWood.DeltaLake.Table.WrittenDataFile> files,
+                                    bool? isBlindAppend)
     {
         // Cancel the COMMIT phase on query interrupt (Ctrl+C during a slow COMMIT / a spinning OCC retry loop) —
         // safe: a cancel before the log commit lands leaves invisible orphan files (VACUUM reclaims them), i.e.
@@ -3054,7 +3069,8 @@ public sealed class DeltaCatalog : IBackendCatalog
                 .ConfigureAwait(false);
             try
             {
-                return await table.CommitDataFilesAsync(files, DeltaWriteMode.Append, cancellationToken: token)
+                return await table.CommitDataFilesAsync(files, DeltaWriteMode.Append, cancellationToken: token,
+                        isBlindAppend: isBlindAppend)
                     .ConfigureAwait(false);
             }
             catch (EngineeredWood.DeltaLake.DeltaConflictException) when (attempt < maxAttempts)

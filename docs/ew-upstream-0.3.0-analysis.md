@@ -273,7 +273,27 @@ would not."* Our patch is one of its four decisions. The rest:
 Upstream also draws a distinction ours does not: *"a recorded `false` should be trusted absolutely, while a
 recorded `true` is a claim by another writer."*
 
-#### ⚠ THE WRITE HALF CANNOT BE SOURCED FROM `LogCommitRequest` AS #88 PROPOSES — not for us (2026-08-08)
+#### ✅ THE WRITE HALF IS BUILT (2026-08-08) — by making the claim EXPLICIT instead of derived
+
+**Resolved.** The objection below stands as an objection to #88 decision 1 *as written* (source the flag
+from the request's read set) and is answered by not doing that: `LogCommitRequest.IsBlindAppend` is a
+`bool?` the caller **states**, `CommitDataFilesAsync` takes it as a parameter, and `null` writes no field.
+A defaulted `ReadSet.Blind` never becomes an assertion.
+
+- **Ours:** the buffered append flush declares `!pending.HasReads`; **autocommit declares nothing**, because
+  scan-time read recording is gated on `IsExplicit` and an unrecorded append is indistinguishable from the
+  anti-join shape. Measured under `write_serializable`: blind ⇒ `true`, `INSERT INTO t SELECT … FROM t` ⇒
+  `false`, autocommit ⇒ absent. Gate `verify_delta_catalog_transactions` §42, mutation-tested.
+- **⚠ Still open on our side:** autocommit read recording. Absent is the safe answer (Delta reads it as
+  "not blind"), so this costs spurious aborts, not correctness.
+- **⚠ Still narrow:** nothing changes under `serializable`, and Fabric Spark's DDL refuses to SET
+  `write_serializable` — so it helps tables we stamped.
+
+**What to still say on #88**, now with an implementation behind it: decision 1 should take an explicit
+declaration rather than reading the request's `Reads`, precisely because `ReadSet.Blind` is the DEFAULT.
+The original objection, kept verbatim because the reasoning is what generalises:
+
+#### (original) ⚠ THE WRITE HALF CANNOT BE SOURCED FROM `LogCommitRequest` AS #88 PROPOSES — not for us
 
 Decision 1 says to write the flag from the request: blind read set + no planned removes ⇒ `isBlindAppend:
 true`. That is only as truthful as every caller's read declaration, and **our append path declares

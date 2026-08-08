@@ -17,6 +17,10 @@ require fabricator
 
 require parquet
 
+# §42 asserts on commitInfo.isBlindAppend, which no SQL surface exposes — it reads the raw commit
+# JSON with read_json_auto. Linked like parquet, so this loads rather than skips.
+require json
+
 require-env FABRICATOR_DELTA_WRITE_DIR
 
 # ENGINE-PARAMETERIZED: this suite runs TWICE, once per Delta engine, because its subject — write /
@@ -3334,3 +3338,79 @@ SELECT version, operation FROM fabricator_delta_snapshots('mdc', 'main.t2') ORDE
 
 statement ok
 DETACH mdc;
+
+# ============================================================================
+# 42. commitInfo.isBlindAppend — the DECLARATION another engine reads
+# ============================================================================
+#
+# Delta exempts a declared-blind append from a concurrent reader's predicate check under
+# `write_serializable`: a transaction that looked at nothing cannot have depended on anything the other one
+# changed. We emitted NOTHING, and Delta reads an absent flag as NOT blind
+# (`isBlindAppendOption.getOrElse(false)`) — so a Fabric Spark transaction ABORTED against our concurrent
+# append whatever the table declared. Measured live on Spark 4.1.1.5.5 / Delta-Lake 4.2.0.
+#
+# ⚠ THE DECLARATION IS ONLY MADE WHERE IT CAN BE TRUE, and the `false` row below is the load-bearing one.
+# Delta's definition is CONJUNCTIVE — `onlyAddFiles && !dependsOnFiles` — so `INSERT INTO t SELECT … FROM t`
+# is NOT blind even though it emits only AddFiles. That is the dbt-incremental anti-join shape, i.e. the
+# common case, and a wrong `true` there is the UNSAFE direction: another engine SKIPS a check it owes.
+# Deriving the flag from action shape would get exactly that case wrong.
+#
+# ⚠ AUTOCOMMIT DECLARES NOTHING, deliberately. Scan-time read recording happens only inside an explicit
+# transaction, so in autocommit an append is indistinguishable from the anti-join shape. Saying nothing
+# costs spurious aborts; claiming blind wrongly costs correctness somewhere else.
+#
+# ⚠ `write_serializable` is required to reach the interesting row. Under `serializable` (our default) a
+# read-then-append routes to the DML flush instead, which declares its reads to engineered-wood directly —
+# and Delta ignores the flag at that level anyway, since it examines blind appends by design.
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_blind' AS bl (TYPE fabricator, PROVIDER '${DELTA_PROVIDER}', isolation_level 'write_serializable');
+
+statement ok
+CREATE TABLE bl.main.t AS SELECT r AS id FROM range(1, 5) t(r);
+
+# v2 — buffered append that reads NOTHING
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO bl.main.t VALUES (100);
+
+statement ok
+COMMIT;
+
+# v3 — buffered append that READS THE TARGET (the anti-join shape)
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO bl.main.t SELECT max(id) + 1 FROM bl.main.t;
+
+statement ok
+COMMIT;
+
+# v4 — autocommit: nothing was recorded, so nothing is claimed
+statement ok
+INSERT INTO bl.main.t VALUES (999);
+
+query IT
+SELECT CAST(regexp_extract(filename, '(\d{20})\.json', 1) AS BIGINT) AS version,
+       coalesce(json_extract_string(commitInfo, '$.isBlindAppend'), '<none>') AS blind
+FROM read_json_auto('${FABRICATOR_DELTA_WRITE_DIR}/txn_blind/t/_delta_log/*.json',
+                    union_by_name = true, filename = true)
+WHERE commitInfo IS NOT NULL
+ORDER BY version;
+----
+0	<none>
+1	<none>
+2	true
+3	false
+4	<none>
+
+query I
+SELECT count(*) FROM bl.main.t;
+----
+7
+
+statement ok
+DETACH bl;

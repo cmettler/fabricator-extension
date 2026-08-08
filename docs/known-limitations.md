@@ -154,7 +154,7 @@ ExemptRowLevelFromWholeTableRead:  gated on isolationLevel != Serializable
 |---|---|---|---|
 | `ExemptRowLevelFromWholeTableRead` | OUR concurrent row-level DML from aborting on a whole-table read declaration | inward (our decisions) | write_serializable only |
 | `isBlindAppend` **reading** half (shipped) | US from wrongly skipping a check another engine declared we owe | inward | write_serializable only |
-| `isBlindAppend` **writing** half (**not built**) | OTHER engines from aborting against our appends | outward (Spark's decisions) | write_serializable only |
+| `isBlindAppend` **writing** half (**BUILT 2026-08-08**) | OTHER engines from aborting against our appends | outward (Spark's decisions) | write_serializable only; **explicit transactions only** — autocommit declares nothing |
 
 **⚠ Two things people get wrong here.** (1) `isBlindAppend` never "allows concurrent appends" — two appends never
 conflict at ANY level, because the check asks whether a concurrent add matches *my read predicates* and an appender
@@ -172,7 +172,7 @@ capability exists and nobody gets it without opting into the level we do not yet
 
 | # | item | why |
 |---|---|---|
-| 4.1 | **build the `isBlindAppend` WRITING half** | **without it, stamping `WriteSerializable` changes nothing cross-engine.** Measured A/B on Fabric Spark 4.1.1 / Delta 4.2.0: `Serializable` ⇒ Spark aborts naming our v8; `WriteSerializable` ⇒ Spark aborts TOO, naming our v23 — because Delta reads an ABSENT flag as "not blind". Emitting it would make Spark commit on a stamped table and change nothing on a `Serializable` one |
+| 4.1 | ~~build the `isBlindAppend` WRITING half~~ **DONE 2026-08-08** — declared for buffered appends (`true` when the transaction read nothing, `false` for the anti-join shape); **autocommit still declares NOTHING**, which is the remaining half and costs spurious aborts rather than correctness | **without it, stamping `WriteSerializable` changes nothing cross-engine.** Measured A/B on Fabric Spark 4.1.1 / Delta 4.2.0: `Serializable` ⇒ Spark aborts naming our v8; `WriteSerializable` ⇒ Spark aborts TOO, naming our v23 — because Delta reads an ABSENT flag as "not blind". Emitting it would make Spark commit on a stamped table and change nothing on a `Serializable` one |
 | 4.2 | autocommit read-tracking, or truthful omission | the writing half is only reliable inside `BEGIN…COMMIT`, where reads are staged. In autocommit nothing is recorded, so `INSERT … SELECT FROM t` (read) is indistinguishable from `INSERT … VALUES` (blind). Asymmetry rule: staged reads may DOWNGRADE a declared `true` to `false`, never the reverse |
 | 4.3 | fix the unconditional exemption (§2.2) | we currently relax more than we justify; that cannot ship as a guarantee |
 | 4.4 | real-concurrency test of the AUTOCOMMIT row-level path | untestable in-process, and **impossible on a Windows local root** (§1.1). Needs OneLake or S3-with-a-named-secret |

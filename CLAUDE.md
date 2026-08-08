@@ -237,11 +237,11 @@ SMALL upstreamable patch set ON TOP of clast master — never a fork again — s
 merge-upstream-into-fabricator-patches + re-pin. **⚠ That upstream branch is now
 `upstream/main`, NOT `master`** — upstream renamed it (`8caf8d8`) and the stale `upstream/master`
 remote-tracking ref still resolves, so a merge of it silently lands on an abandoned branch.
-**Current pin: `618f3dc`** (⚠ the line here has twice gone stale —
+**Current pin: `1422ce6`** (⚠ the line here has twice gone stale —
 **`git ls-tree HEAD engineered-wood` is the authority, this prose is not**).
-**Patch set MEASURED 2026-08-08 (`git diff upstream/main --shortstat -- src/`): +399 / −26 across FIVE
-files** — `DeltaTable.cs` 64, `VacuumExecutor` 72, `ConflictChecker` 48, `LogCleanup` 202 (new),
-`LogCommitter` 13. It was 4 files / +175 on 2026-08-04 and +867 across 8 on 2026-08-03; the variant
+**Patch set MEASURED 2026-08-08 (`git diff upstream/main --shortstat -- src/`): +448 / −30 across SEVEN
+files** — `DeltaTable.cs`, `VacuumExecutor`, `ConflictChecker`, `LogCleanup` (new), `LogCommitter`,
+`LogCommitRequest`, `InCommitTimestamp`. It was 4 files / +175 on 2026-08-04 and +867 across 8 on 2026-08-03; the variant
 transport was ~60% of that and has left entirely (§THE UPSTREAM STRATEGY).
 - **⚠ THE PATCH SET GREW ON PURPOSE, and every new line is OFFER-READY rather than divergence.** Three of
   the five files are the 2026-08-08 work, each open upstream as a draft the same day it was written:
@@ -1904,8 +1904,40 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   concurrent append whatever the table declares.** Full record:
   [docs/delta-transactions.md](docs/delta-transactions.md) §10.6 +
   [docs/ew-master-migration.md](docs/ew-master-migration.md) §isBlindAppend §4a.
-  - **⚠ THE WRITE HALF IS NO LONGER CLEARED TO BUILD — BLOCKED 2026-08-08 on a SECOND obstacle, unrelated to
-    the first.** The line below ("cleared to build") settled whether emitting the flag would HELP; it did not
+  - **✅ THE WRITE HALF IS BUILT (2026-08-08, user-asked) — WE NOW EMIT `commitInfo.isBlindAppend`, and the
+    blocker below was resolved by making the claim EXPLICIT rather than derived.** The obstacle was real:
+    `CommitDataFilesAsync` hardcodes `Reads = ReadSet.Blind`, so sourcing the flag from the read set (which
+    is what upstream #88 decision 1 proposes) would have stamped `true` on every silent caller. The fix is
+    not to source it from `Reads` at all — a DEFAULTED `ReadSet.Blind` means *"this caller said nothing"*,
+    not *"this caller declares it read nothing"*, and writing a spec field off a default turns every silent
+    caller into an assertive one. So `LogCommitRequest.IsBlindAppend` is a `bool?` the caller STATES, and
+    `CommitDataFilesAsync` takes it as a parameter. **Three states, and `null` writes NO FIELD.**
+    - **MEASURED end to end under `write_serializable`** (`verify_delta_catalog_transactions` §42): buffered
+      blind append ⇒ **`true`**; buffered `INSERT INTO t SELECT … FROM t` ⇒ **`false`**; autocommit ⇒
+      **absent**. Mutation-tested by claiming blind regardless of reads — dies at exactly the anti-join row.
+    - **⚠ THE `false` ROW IS THE LOAD-BEARING ONE.** Delta's definition is CONJUNCTIVE —
+      `onlyAddFiles && !dependsOnFiles` — and it computes `onlyAddFiles` separately then pointedly does not
+      use it alone. So the anti-join incremental shape emits only AddFiles and is still NOT blind. A wrong
+      `true` there is the UNSAFE direction: another engine SKIPS a check it owes.
+    - **⚠ AUTOCOMMIT DECLARES NOTHING, deliberately, and that is a REMAINING GAP not a design choice to
+      admire.** Scan-time read recording is gated on `_txnBuffer.IsExplicit`, so autocommit records nothing
+      and an append there is indistinguishable from the anti-join shape. Absent ⇒ Delta reads "not blind" ⇒
+      spurious aborts, which is the safe direction. Closing it means extending read recording to autocommit
+      — ours, not upstream's, and not done.
+    - **⚠ A BUG THE FIRST VERSION HAD, found by measuring rather than by review: `_txnBuffer.Remove(txnId)`
+      CLEARS the explicit marker, and `CommitTransaction` calls it BEFORE the flush.** Reading
+      `IsExplicit` after it is always false, so the declaration silently degraded to "say nothing" — green,
+      and quietly never emitting the flag it exists to emit. Captured before `Remove` now. Same ordering
+      fact as §4b.3.
+    - **⚠ AND THE BUFFER'S OWN PATH SPLIT ALREADY SEPARATES THE TWO CASES**, which is why this is small: an
+      append that READ routes to the DML flush (which declares its reads to engineered-wood directly) and
+      only a genuinely blind one reaches `FlushDeferredFiles`. The `false` branch is reachable because
+      `PendingSerializable` sends a read-then-append back down the deferred path under `write_serializable`
+      — the one level where the flag matters at all.
+    - **⚠ SCOPE, unchanged and worth restating: this changes NOTHING under `serializable`** (Delta examines
+      blind appends there by design) and Fabric Spark's DDL refuses to SET `write_serializable`, so the
+      tables it helps are ones WE stamped.
+  - **The ORIGINAL blocker, kept because the reasoning is the reusable part:** The line below ("cleared to build") settled whether emitting the flag would HELP; it did not
     ask whether we could emit it TRUTHFULLY. We cannot, on the path that matters. `CommitDataFilesAsync`
     hardcodes `Reads = ReadSet.Blind` and **takes no read-set parameter**, and our buffered append flush goes
     straight through it — so sourcing the flag from the request (which is what upstream issue #88 decision 1

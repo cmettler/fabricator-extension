@@ -1963,10 +1963,23 @@ knowing:
 
 - You may see a conflict where an older build silently allowed one. That is the check working; the
   earlier behaviour could let a concurrent read-then-append go unvalidated.
-- **We do not yet emit the flag ourselves.** Other engines therefore treat *our* appends as
-  possibly-having-read and check them under every isolation level, so a Spark transaction can abort
-  against our concurrent append (`DELTA_CONCURRENT_APPEND`) even on a `write_serializable` table where it
-  would have committed against Spark's own blind append. Retry is the workaround; the fix is tracked.
+- **We now emit the flag ourselves** (since 2026-08-08), so another engine can exempt our appends the same
+  way. It is declared only where it can be true, which is narrower than it sounds:
+
+  | your statement | what we declare |
+  |---|---|
+  | `BEGIN; INSERT INTO t VALUES (…); COMMIT;` | `isBlindAppend: true` |
+  | `BEGIN; INSERT INTO t SELECT … FROM t …; COMMIT;` | `false` — it read the target |
+  | any **autocommit** `INSERT` | nothing |
+
+  Autocommit says nothing because we only track what a statement read inside an explicit transaction, and
+  an unrecorded append is indistinguishable from the read-then-append above. An absent flag is read as
+  "not blind", so that costs a possible retry, never a skipped check — but it does mean **wrap an append in
+  `BEGIN … COMMIT` if you want other engines to commute with it.**
+
+  ⚠ This only matters on a `write_serializable` table. Under `serializable` (our default) Delta examines
+  blind appends by design, so nothing changes — and Fabric Spark's DDL refuses to *set* `write_serializable`,
+  so the tables it helps are ones you stamped via `WITH ("delta.isolationLevel"='WriteSerializable')`.
 
 So a **default** table is read by Spark, delta-kernel, and Fabric Spark + OneLake conversion (all
 validated live) — but **not** by SQL Server's DELTA reader (**protocol 1.0 only**) or the Fabric T-SQL

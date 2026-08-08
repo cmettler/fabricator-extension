@@ -232,7 +232,13 @@ case "$TIER" in
         # engineered-wood's LogCleanupTests, which injects a clock. ⚠ It guards a real hazard: our host
         # filesystem reported a HARDCODED Unix epoch as every file's mtime until this date, under which
         # every commit looks 56 years old and a 30-day retention collects one written a second ago.
-        : "${MIN_ASSERTIONS:=6853}"
+        # 6891 since 2026-08-08: verify_delta_catalog_transactions 1021 -> 1042 (x2 legs), §42 — we now emit
+        # commitInfo.isBlindAppend, the declaration a CONCURRENT engine reads to exempt our append from its
+        # predicate check. ⚠ The `false` row is the load-bearing one: Delta's definition is CONJUNCTIVE
+        # (onlyAddFiles && !dependsOnFiles), so `INSERT INTO t SELECT ... FROM t` is NOT blind despite
+        # emitting only AddFiles — the dbt anti-join shape, where a wrong `true` makes another engine skip a
+        # check it owes. Mutation-tested by claiming blind regardless of reads; dies at exactly that row.
+        : "${MIN_ASSERTIONS:=6891}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh
