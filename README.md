@@ -2074,11 +2074,15 @@ CREATE TABLE lake.main.t WITH ("delta.isolationLevel"='Serializable', "fabricato
 ```
 
 > **⚠ A quoted `delta.*` property is a DECLARATION stored in the table, and most of them are for OTHER
-> engines to read — we do not implement every one.** Two we do act on: `delta.isolationLevel` (a table's own
-> level outranks the catalog's `isolation_level`) and `delta.checkpointInterval` (how often we checkpoint
-> the log — honoured since 2026-08-08; it was stored and ignored before, so a table declaring `100` was
-> still checkpointed every 10). `delta.logRetentionDuration` is stored and **not** implemented: nothing here
-> deletes a superseded commit file, so the log grows for the life of the table.
+> engines to read — we do not implement every one.** Three we do act on:
+>
+> - `delta.isolationLevel` — a table's own level outranks the catalog's `isolation_level`.
+> - `delta.checkpointInterval` — how often the log is checkpointed. Honoured since 2026-08-08; before that
+>   it was stored and ignored, so a table declaring `100` was still checkpointed every 10.
+> - `delta.logRetentionDuration` — how long a superseded commit file is kept (default 30 days). Also
+>   honoured since 2026-08-08; before that `_delta_log` grew for the life of the table. Cleanup runs after a
+>   checkpoint, deletes only commits that checkpoint covers, and never touches a file inside the window. Set
+>   `delta.enableExpiredLogCleanup = false` to switch it off.
 
 Keys: `parquet_compression` / `parquet_row_group_size` / `parquet_bloom_filter_columns`; `deletion_vectors`
 / `column_mapping` / `row_tracking` / `change_data_feed` / `in_commit_timestamps`; any quoted `delta.*` /

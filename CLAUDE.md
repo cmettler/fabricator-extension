@@ -176,9 +176,35 @@ if that is impossible, and then **make our amendments clear IN THE CODE**.
   (1) `ConflictChecker` isBlindAppend — 42 lines, internal, 7 tests, but
   present BOTH shapes; (2) `ExemptRowLevelFromWholeTableRead` — **only after the §2.2 fix**, and pitched as a
   DEPARTURE not an inconsistency; (3) a transaction that can CREATE a table — a design conversation; and
-  **(4) LOG CLEANUP — CONFIRMED ABSENT 2026-08-07 BY A CONTROLLED EXPERIMENT, and worth offering because it
-  is a plain SPEC GAP rather than a fabricator-shaped need.** engineered-wood accepts and stores
-  `delta.logRetentionDuration`, never reads it, and never deletes a commit a checkpoint subsumes.
+  **(4) LOG CLEANUP — BUILT 2026-08-08 (user-asked), so this is now an OFFER-READY PATCH rather than a gap
+  to report.** engineered-wood accepted and stored `delta.logRetentionDuration`, never read it, and never
+  deleted a commit a checkpoint subsumed. New `LogCleanup` (`EngineeredWood.DeltaLake/Log/LogCleanup.cs`),
+  called from `LogCommitter` immediately after a checkpoint is written — Delta's own trigger point, and the
+  one that bounds the cost to once per `CheckpointInterval` rather than a listing per commit.
+  - Delta's rule, both halves required: a checkpoint must exist AFTER the file AND it must be older than
+    `now - logRetentionDuration`. No `_last_checkpoint` ⇒ deletes NOTHING. Deletion is a contiguous PREFIX,
+    because replay demands unbroken coverage and a HOLE reads as corruption (upstream #36 made that loud).
+  - **⚠ IT EXPOSED A SHIPPED FAKE, and this is the part worth carrying forward.** `DuckDbTableFileSystem`
+    reported a HARDCODED `DateTimeOffset.UnixEpoch` as every file's modification time. Nothing read it, so
+    nothing noticed — and the first thing to read it deletes by AGE, under which every commit looks 56 years
+    old and a 30-day retention collects one written a second ago. Fixed on both sides (`HostFsGlob` now
+    emits `last_modified` from `extended_info`, exactly as it already did for `file_size`; the managed side
+    maps an absent value to a sentinel), **plus a guard in `LogCleanup` that declines the whole pass when
+    any file cannot be dated** — unknown must stay unknown rather than default to a date. ⚠ C++-TOUCHING, so
+    it needed the full rebuild.
+  - **⚠ THE ADJUSTMENT ANCHOR.** Delta presents commit timestamps as strictly increasing, adjusting a file
+    not newer than its predecessor. A reader doing time-travel-BY-TIMESTAMP depends on that anchor, so
+    deleting it changes which version a timestamp query answers with. Ours is immune (in-commit timestamps,
+    read from the actions) but a Delta reader is not, so the cut walks BACK over the chain the first
+    SURVIVOR depends on — retaining the chain, not the whole log.
+  - Gates: `LogCleanupTests` **+13 (364 → 377 × {net10.0, net8.0, net472})**, three mutants each killed at
+    its own test; `verify_delta_tblproperties` 84 → **94**, which pins the DANGEROUS direction (a commit
+    inside the window is never collected) because that is what a tier can assert deterministically. ⚠ The
+    POSITIVE is timing-dependent and is NOT in CI — it lives in the EW tests via an injected clock, plus a
+    hand-run end-to-end check (7 commits, a 3 s wait past a 2 s horizon, **v0–v6 collected, 4 survivors,
+    table still reads all 10 rows**).
+  - ⚠ **`netstandard2.0` has no `DateTimeOffset.UnixEpoch`** — this assembly still targets it for the net472
+    leg, and only the all-TFM run catches it. Spell the epoch out.
   - **THE MEASUREMENT (this is what settles it — the two greps below do not):** two local tables, 26 commits
     each, two checkpoints each; one with `delta.logRetentionDuration = 'interval 1 seconds'`, one with the
     property unset. **28 commit JSONs vs 27** — the difference being only the extra `set_tblproperties`
@@ -630,8 +656,8 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
     - **⚠ EACH INSERT MUST BE ITS OWN STATEMENT.** One bulk `INSERT … SELECT r FROM range(2, 27)` is ONE
       commit, so the first version of this section reached v2, neither interval fired, and it passed for the
       wrong reason. Counting the on-disk versions is what caught it.
-  - ⇒ **`delta.logRetentionDuration` is now the LAST accepted-but-unread Delta property.** Same shape,
-    much bigger fix — it needs actual log cleanup, not a value read.
+  - ⇒ `delta.logRetentionDuration` was the last accepted-but-unread Delta property, and it was BUILT the
+    next day — see the offer list, item 4.
 - **VACUUM WAS BLIND BELOW THE TABLE ROOT — FIXED 2026-08-08 (C# + one EW patch). On a PARTITIONED table it
   reclaimed NOTHING.** `ITableFileSystem.ListAsync` globbed `<root>/<prefix>*` — ONE LEVEL — in all three of
   our filesystems, each with a comment justifying it as *"the Delta log is flat"*. True of the log; false of
@@ -3558,9 +3584,12 @@ VS 18 vcvars64 shell** (see the VS-dev-env bullet — VS 2022 fails at link).
       table still costs 7.2 s with ~151 commits and ONE file, while the 148-commit `lake/t` costs 2.6 s. Those
       two disagree by ~3×, so log length alone does not explain the residual (the OPTIMIZE commit carries 150
       REMOVE actions, which replay is not free). Establish that before optimising for it.
-    - **⚠ ENGINEERED-WOOD NEVER DELETES A SUPERSEDED COMMIT FILE — CONFIRMED by forcing
+    - **⚠ ENGINEERED-WOOD NEVER DELETED A SUPERSEDED COMMIT FILE — CONFIRMED by forcing
       `delta.logRetentionDuration` to one second and finding 28 commit JSONs still there past two
-      checkpoints (see the offer list for the experiment and for the two weaker arguments it replaced).**
+      checkpoints (see the offer list for the experiment and for the two weaker arguments it replaced).
+      FIXED 2026-08-08 — `LogCleanup` implements the property, so a table whose retention has passed now
+      reclaims its subsumed commits at each checkpoint. The measurements below were taken BEFORE that and
+      still describe what a log full of dead commits costs; what has changed is that it need not stay full.**
       It writes
       a checkpoint every 10 versions (`DeltaTableOptions.CheckpointInterval`) and keeps every commit the
       checkpoint subsumes. Verified: the ONLY `DeleteAsync` on a log path is the temp-file cleanup after a
@@ -3876,6 +3905,19 @@ are missing.
     (`Get-CimInstance Win32_Process … CommandLine -like '*run-suites.sh*'`), not by killing the shell.
   - ⚠ It also means a timed-out run must never be treated as "no result" — it is a RUNNING result, and the
     numbers from anything started next to it are void.
+- **⚠ A BACKGROUNDED TIER WRITES NOTHING TO ITS LOG FOR MINUTES — the redirect is BLOCK-buffered, and an
+  empty log reads exactly like a dead run. Cost two VOID service-tier runs on 2026-08-08.** `run-suites.sh`
+  emits ~70 bytes per suite and a suite takes seconds, so a 4 KB block does not fill for several minutes.
+  I read `0 bytes` as "it died", started a SECOND run on top of the first, and only noticed when
+  `Get-CimInstance Win32_Process -Filter "Name='unittest.exe'"` showed **two** — both against the same SQL
+  Server and the same MinIO bucket, which voids both by the rule in the entry above.
+  - **Fix: `stdbuf -oL -eL bash <runner> > log 2>&1`.** Line-buffered, so the log grows per suite and
+    liveness is readable at a glance. Verified `stdbuf` is present in this Git Bash.
+  - **⚠ `ps | grep -c unittest` is NOT a liveness check** — one process per suite means it is legitimately
+    0 BETWEEN suites. The same sampling error cost a premature "tier finished" earlier the same day. Check
+    the LOG SIZE GROWING, or wait on the background task's own completion notification.
+  - ⚠ And a foreground `timeout N cmd | head` proves nothing either: the PIPE is block-buffered too, so a
+    healthy run looks silent. That is what made the wrapper script look broken when it was fine.
 - **⚠ NEVER EDIT A SHELL SCRIPT WHILE A BACKGROUND JOB IS EXECUTING IT — it kills the RUN, and the error
   blames the FILE.** bash reads a script INCREMENTALLY, so inserting lines shifts the byte offsets under
   the already-running shell and it resumes mid-token. Symptoms are a syntax error at a line that is

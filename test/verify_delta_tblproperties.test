@@ -353,3 +353,59 @@ SELECT count(*) FROM ck.main.declared;
 
 statement ok
 DETACH ck;
+
+# ============================================================================
+# delta.logRetentionDuration — cleanup NEVER touches a commit inside the window
+# ============================================================================
+#
+# Log cleanup deletes commit files a checkpoint has made redundant. This section pins the DANGEROUS
+# direction — that a recent commit is never collected — because that is the assertion a CI tier can make
+# deterministically. The positive (files past the horizon really are collected) is timing-dependent and
+# lives in engineered-wood's LogCleanupTests, which injects a clock instead of sleeping; it is also
+# verified end to end by hand.
+#
+# ⚠ WHY THIS IS WORTH A GATE. Our host filesystem reported a HARDCODED Unix epoch as every file's
+# modification time until 2026-08-08 — nothing read it, so nothing noticed. Under that value every commit
+# looks 56 years old, so a 30-day retention would collect a commit written one second ago. If the fake ever
+# returns, or the timestamp plumbing regresses to a constant, this section fails: the table below keeps
+# every commit only because their real ages are minutes.
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/logret' AS lr (TYPE fabricator, PROVIDER 'delta');
+
+# checkpointInterval 2 so several checkpoints land — each one is a cleanup opportunity.
+statement ok
+CREATE TABLE lr.main.t WITH ("delta.checkpointInterval" = '2') AS SELECT 1 AS id;
+
+statement ok
+INSERT INTO lr.main.t VALUES (2);
+
+statement ok
+INSERT INTO lr.main.t VALUES (3);
+
+statement ok
+INSERT INTO lr.main.t VALUES (4);
+
+statement ok
+INSERT INTO lr.main.t VALUES (5);
+
+# POSITIVE CONTROL: checkpoints really were written, so cleanup had something to act on and the assertion
+# below is about RETENTION rather than about cleanup never having been reachable.
+query I
+SELECT count(*) > 0 FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/logret/t/_delta_log/*.checkpoint.parquet');
+----
+true
+
+# Every commit survives: v0..v5, all written seconds ago, against the default 30-day retention.
+query I
+SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/logret/t/_delta_log/*.json');
+----
+6
+
+query I
+SELECT count(*) FROM lr.main.t;
+----
+5
+
+statement ok
+DETACH lr;

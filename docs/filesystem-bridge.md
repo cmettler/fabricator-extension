@@ -72,8 +72,18 @@ proven code path.
 through DuckDB's FileSystem** over the host callbacks — so local, `az://`, `s3://`, `https://` paths and DuckDB
 secrets all work, one auth config shared with native reads.
 
-- **`HostFs.fs_glob`** added to `FabricatorHostServices` (DuckDB `FileSystem::Glob` → JSON `[{path,size}]`) — the
-  directory listing engineered-wood needs to enumerate `_delta_log/`.
+- **`HostFs.fs_glob`** added to `FabricatorHostServices` (DuckDB `FileSystem::Glob` → JSON
+  `[{path,size,modified_ms}]`) — the directory listing engineered-wood needs to enumerate `_delta_log/`.
+  Both `size` and `modified_ms` are best-effort from `OpenFileInfo::extended_info` (object-store listings
+  carry them free; DuckDB's local filesystem fills them too), `-1` when unknown, and deliberately NO
+  `OpenFile`-per-match — that cost a lakehouse ATTACH minutes.
+  - **⚠ `modified_ms` was added 2026-08-08, and until then `ListAsync` reported a HARDCODED
+    `DateTimeOffset.UnixEpoch` for every file.** Harmless while nothing read it; a live hazard the moment
+    something did, because the first consumer (Delta log cleanup) deletes by AGE — under a fake 1970 stamp
+    every commit is expired the instant it is written. **The lesson is about the SHAPE of the placeholder,
+    not the omission**: a constant that is a plausible VALUE cannot be distinguished from a real answer,
+    whereas `-1`/`DateTimeOffset.MinValue` forces a caller to decide what unknown means. `LogCleanup` now
+    declines its whole pass when any file cannot be dated.
 - **C# `DuckDbTableFileSystem : ITableFileSystem`** + `DuckDbRandomAccessFile : IRandomAccessFile`
   (`DuckDbTableFileSystem.cs`) — read-only, over the host callbacks. Paths are root-relative (matching
   `LocalTableFileSystem`): `ListAsync` returns paths relative to the table root, re-resolved by

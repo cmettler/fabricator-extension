@@ -260,6 +260,8 @@ internal sealed record DeltaWithOptions
         "delta.targetFileSize",
         "delta.checkpointInterval",
         "delta.logRetentionDuration",
+        // Not a protocol feature despite the delta.enable* spelling — see GuardPropertyKey.
+        "delta.enableExpiredLogCleanup",
         "delta.deletedFileRetentionDuration",
         "delta.setTransactionRetentionDuration",
         "delta.dataSkippingNumIndexedCols",
@@ -286,7 +288,14 @@ internal sealed record DeltaWithOptions
     // (mirrors the fabricator_delta_set_tblproperties guard). fabricator.sortedBy has a native clause.
     private static void GuardPropertyKey(string key)
     {
-        if (key.StartsWith("delta.enable", StringComparison.OrdinalIgnoreCase))
+        // ⚠ `delta.enable*` is a PREFIX, not a category: it matches every property that happens to start
+        // with the word, and not all of them declare a protocol feature. `delta.enableExpiredLogCleanup` is
+        // the counter-example — a plain behaviour switch for log retention, with no reader/writer feature
+        // behind it and therefore no explicit WITH key to point the user at. Refusing it left the property
+        // unsettable from `WITH` and the error naming four alternatives, none of which do what it does.
+        // Found by RUNNING the README example that documents it.
+        if (key.StartsWith("delta.enable", StringComparison.OrdinalIgnoreCase)
+            && !key.Equals("delta.enableExpiredLogCleanup", StringComparison.OrdinalIgnoreCase))
         {
             throw new ArgumentException(
                 $"WITH \"{key}\": feature-enabling properties need a protocol declaration — use the "

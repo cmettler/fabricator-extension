@@ -124,7 +124,15 @@ internal sealed unsafe class DuckDbTableFileSystem : ITableFileSystem
                     size = 0;
                 }
             }
-            yield return new TableFileInfo(ToRelative(entry.Path), size, DateTimeOffset.UnixEpoch);
+            // ⚠ THIS WAS A HARDCODED DateTimeOffset.UnixEpoch until 2026-08-08, i.e. every file claimed to
+            // be from 1970. Harmless while nothing read it and a live hazard the moment something did:
+            // Delta log cleanup deletes by AGE, so a fake 56-year-old timestamp makes every commit
+            // eligible however recently it was written. UNKNOWN must therefore stay UNKNOWN — a caller
+            // that cannot establish a file's age has to decline rather than assume one.
+            var modified = entry.ModifiedMs >= 0
+                ? DateTimeOffset.FromUnixTimeMilliseconds(entry.ModifiedMs)
+                : UnknownModified;
+            yield return new TableFileInfo(ToRelative(entry.Path), size, modified);
         }
         await Task.CompletedTask.ConfigureAwait(false);
     }
@@ -357,7 +365,14 @@ internal sealed unsafe class DuckDbTableFileSystem : ITableFileSystem
         return ValueTask.CompletedTask;
     }
 
-    private readonly record struct GlobEntry(string Path, long Size);
+    /// <summary>
+    /// The sentinel a listing reports when the host could not supply a modification time. Callers that act
+    /// on file AGE must treat it as "unknown" and decline — see <c>LogCleanup</c>, which refuses to delete
+    /// anything it cannot date.
+    /// </summary>
+    internal static readonly DateTimeOffset UnknownModified = DateTimeOffset.MinValue;
+
+    private readonly record struct GlobEntry(string Path, long Size, long ModifiedMs);
 
     private static List<GlobEntry> ParseGlob(string json)
     {
@@ -367,7 +382,8 @@ internal sealed unsafe class DuckDbTableFileSystem : ITableFileSystem
         {
             var path = el.GetProperty("path").GetString() ?? string.Empty;
             long size = el.TryGetProperty("size", out var s) ? s.GetInt64() : -1;
-            result.Add(new GlobEntry(path, size));
+            long modified = el.TryGetProperty("modified_ms", out var m) ? m.GetInt64() : -1;
+            result.Add(new GlobEntry(path, size, modified));
         }
         return result;
     }

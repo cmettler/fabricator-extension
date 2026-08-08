@@ -122,10 +122,29 @@ int32_t HostFsGlob(FabricatorHandle opener, const char *pattern, char **out_json
 					}
 				}
 			}
+			// Modification time, same best-effort deal as size and from the same place: DuckDB's own
+			// local_file_system fills `last_modified` for a local glob, and object-store listings carry it
+			// for free. -1 = unknown, which the managed side must treat as "cannot judge age" rather than
+			// as a date — reporting a FAKE time (this emitted DateTimeOffset.UnixEpoch for every file until
+			// 2026-08-08) makes every file look 56 years old, which is not a cosmetic error for anything
+			// that deletes by age: Delta log cleanup would have collected a commit written a second ago.
+			int64_t modified_ms = -1;
+			if (files[i].extended_info) {
+				auto it = files[i].extended_info->options.find("last_modified");
+				if (it != files[i].extended_info->options.end()) {
+					try {
+						auto ts = it->second.GetValue<timestamp_t>();
+						modified_ms = Timestamp::GetEpochMs(ts);
+					} catch (...) {
+						modified_ms = -1;
+					}
+				}
+			}
 			if (i) {
 				json += ",";
 			}
-			json += "{\"path\":\"" + JsonEscape(p) + "\",\"size\":" + std::to_string(size) + "}";
+			json += "{\"path\":\"" + JsonEscape(p) + "\",\"size\":" + std::to_string(size) +
+			        ",\"modified_ms\":" + std::to_string(modified_ms) + "}";
 		}
 		json += "]";
 		*out_json = DupErr(json);

@@ -226,7 +226,13 @@ case "$TIER" in
         # so VacuumExecutor — which lists the whole table ROOT — only ever collected orphans AT the root and
         # reclaimed nothing under col=value/. ⚠ The assertion must be on a file INSIDE a partition directory;
         # an unpartitioned VACUUM test passes with the bug fully present. Both mutation-tested.
-        : "${MIN_ASSERTIONS:=6843}"
+        # 6853 since 2026-08-08: verify_delta_tblproperties 84 -> 94 — delta.logRetentionDuration. Log
+        # cleanup is implemented now, and this pins the DANGEROUS direction (a commit inside the window is
+        # never collected) because that is what a tier can assert deterministically; the positive lives in
+        # engineered-wood's LogCleanupTests, which injects a clock. ⚠ It guards a real hazard: our host
+        # filesystem reported a HARDCODED Unix epoch as every file's mtime until this date, under which
+        # every commit looks 56 years old and a 30-day retention collects one written a second ago.
+        : "${MIN_ASSERTIONS:=6853}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh
