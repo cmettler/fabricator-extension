@@ -835,10 +835,32 @@ S3 with a NAMED secret, or POSIX local (WSL). `scratchpad/mor_update_race.sh` ca
 **Check the probe before believing a multi-writer result**, exactly as §8.4 concluded for the opposite reason
 (there the probe was too OPTIMISTIC; here it is correct and was simply never run on this platform).
 
-**Not investigated:** whether this is a DuckDB `LocalFileSystem` limitation (no `CREATE_NEW` / no
-`FILE_FLAG_OPEN_REPARSE`-style exclusive create on Windows) or something in our own `HostFsOpenWrite` mapping.
-Fixing it would mean a conditional-create path for Windows plus write-temp-then-atomic-publish; neither is
-attempted here, and single-writer behaviour — every suite in the hermetic tier — is unaffected.
+**ROOT-CAUSED 2026-08-08 — it is a DuckDB bug, NOT a Windows limitation, and NOT our mapping.** Full
+write-up ready to file: [duckdb-upstream-issues.md](duckdb-upstream-issues.md) §4. In one line:
+**`FileOpenFlags::ExclusiveCreate()` is read in exactly one place in all of DuckDB** —
+`local_file_system.cpp:370-371`, inside the **POSIX** branch (`open_flags |= O_EXCL`). The Windows
+`OpenFile` (`:1069-1075`) consults only `CreateFileIfNotExists()` → `OPEN_ALWAYS` and
+`OverwriteExistingFile()` → `CREATE_ALWAYS`; **`CREATE_NEW` — the Win32 disposition that fails with
+`ERROR_FILE_EXISTS`, i.e. exactly this primitive — appears nowhere in the file.** So the flag is silently
+dropped and the open falls to `OPEN_ALWAYS` = "open, creating if absent", which is precisely what the probe
+reports. Windows has had the feature since forever; DuckDB just never selects it.
+
+⚠ **The earlier speculation in this paragraph was half right in a misleading way.** It guessed "no
+`CREATE_NEW` … on Windows", which reads as *the platform lacks it*. The platform has it; the mapping omits
+it. Worth keeping as a reminder that a plausible cause written into a doc gets read as a finding.
+
+Two things make it easy to believe and easy to miss: the flag is **public, documented surface** — `Verify()`
+asserts its combination rules and the C API exposes it as `DUCKDB_FILE_FLAG_CREATE_NEW` — while
+`FILE_FLAGS_EXCLUSIVE_CREATE` has **zero internal DuckDB callers**, so no upstream test can reach the gap.
+And DuckDB has *two* names containing `CREATE_NEW` with opposite meanings (the C API's = exclusive, the
+internal `FILE_FLAGS_FILE_CREATE_NEW` = truncate), so the Windows branch looks complete.
+
+The upstream fix is ~3 lines (test `ExclusiveCreate()` **first**, map to `CREATE_NEW`) and would make local
+Windows as safe as local POSIX **with no change on our side** — `HostFsOpenWrite` already passes
+`WRITE | FILE_CREATE | EXCLUSIVE_CREATE`. A local workaround (write-temp-then-atomic-publish, or a
+platform-specific conditional create in our own filesystem) is therefore deliberately NOT attempted: it
+would duplicate a fix that belongs one layer down. Single-writer behaviour — every suite in the hermetic
+tier — is unaffected either way.
 
 #### 8.5a ⚠ `fabricator_fs_write_probe` HAS A FALSE-POSITIVE MODE — FOUND, **NOT FIXED** (2026-08-03)
 

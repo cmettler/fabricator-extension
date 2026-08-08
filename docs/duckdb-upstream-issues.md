@@ -202,6 +202,154 @@ While reading the C API for §2: `duckdb_arrow_scan` calls `stream->get_schema(s
 `schema`**. One leaked exported schema per registered input view. Real but small, and we register few views
 per query; recorded so it is not re-discovered as a mystery rather than because it is worth an issue.
 
+## 4. `FILE_FLAGS_EXCLUSIVE_CREATE` is SILENTLY IGNORED on Windows — no put-if-absent primitive
+
+**Status: FIXED, VALIDATED, AND SUBMITTED — [duckdb/duckdb#24612](https://github.com/duckdb/duckdb/pull/24612)
+(draft, 2026-08-08), from `cmettler/duckdb@fix/windows-exclusive-create` (`f894841e`) off `duckdb/main`
+(`e500d778`).** No existing DuckDB issue or PR mentioned `EXCLUSIVE_CREATE`. This is the cause of
+[delta-transactions.md](delta-transactions.md) §8.5, which had recorded it as "not investigated".
+
+**Upstream CI green on all three platforms** (fork run of `Main` + `OSX` on `f894841e`): **Windows (64 Bit)
+5246 passed / 0 failed**, twice (MSVC and the VS2019-stdlib rebuild); Linux `make allunit`; macOS 6187 passed;
+plus format, generated-files, clang-tidy, clang warnings-as-errors, and **Linux Relassert Tests** — the last
+being the only leg that exercises `FileOpenFlags::Verify()`, which is `#ifdef DEBUG` and so invisible to every
+release-build green. The sole red anywhere is an unrelated `test_string_agg_overflow.test_slow` OOM (asked for
+4 GiB with 3.8 of 5.5 GiB used) on an undersized fork macOS runner; upstream runs that on larger hardware.
+- ⚠ **THREE of those greens do NOT test what their name suggests, and each nearly got over-claimed here.**
+  `Linux Release` runs `make smoke T=--changed-tests=…` (6 seconds — a subset, not the suite); `OSX Debug` is
+  a warnings-as-errors COMPILE with no test step; and confirming Windows took four hops — job steps → the
+  `run.py` runner it invokes → the Makefile's `-DENABLE_UNITTEST_CPP_TESTS=0` path → establishing that nothing in
+  `.github/` or `scripts/` ever sets `DISABLE_CPP_UNITTESTS`, so the `TRUE` default holds. **On this workflow
+  "build" and "tests" are deliberately separate jobs; a passing build job says nothing about coverage.**
+- ⚠ Test names are NOT printed in these job logs — grepping for one is a VOID check. Verified with a positive
+  control: five pre-existing `[file_system]` test names are equally absent from a log of a run that certainly
+  executed them. Coverage here is established BY CONSTRUCTION (default-on CMake option + `'*'` selector), not
+  by log inspection.
+
+**The fix is two changes, both mirroring the POSIX branch** — `ExclusiveCreate()` → `CREATE_NEW` (tested
+FIRST), and the `ERROR_FILE_EXISTS` mirror of POSIX's `EEXIST` so `FILE_FLAGS_NULL_IF_EXISTS` works. Validated
+four ways: the probe flips to `true`; the 6-writer race goes **150/900 → 900/900 rows and 4/19 → 19/19 commit
+files**; a new platform-agnostic `TEST_CASE` passes (7 assertions, run via a temporary
+`ENABLE_UNITTEST_CPP_TESTS=TRUE`); and the fabricator hermetic tier is **67/67 — 6895, identical to baseline**.
+Harness: `scratchpad/local_win_race.sh` (runs both legs). The src half is saved as
+`scratchpad/duckdb-win-exclusive-create.patch` so the local capability is one `git apply` away.
+
+⚠ **Do NOT re-pin our submodule to a patched DuckDB.** We ship a *loadable* extension, so
+`LocalFileSystem::OpenFile` executes inside the **host's** DuckDB — a patched submodule fixes only our own
+statically-linked `unittest.exe`/`duckdb.exe`, which is useful for running multi-writer experiments here and
+worthless to anyone using the extension. Only an upstream release reaches users.
+
+`FileOpenFlags::ExclusiveCreate()` is read in **exactly one place in all of DuckDB** —
+`local_file_system.cpp:370-371`, inside the **POSIX** branch:
+
+```cpp
+if (flags.ExclusiveCreate()) {
+    open_flags |= O_EXCL;
+}
+```
+
+The **Windows** `LocalFileSystem::OpenFile` (`local_file_system.cpp:1069-1075`) never consults it:
+
+```cpp
+if (open_write) {
+    if (flags.CreateFileIfNotExists()) {        // FILE_FLAGS_FILE_CREATE
+        creation_disposition = OPEN_ALWAYS;
+    } else if (flags.OverwriteExistingFile()) { // FILE_FLAGS_FILE_CREATE_NEW
+        creation_disposition = CREATE_ALWAYS;
+    }
+}
+```
+
+`CREATE_NEW` — the Win32 disposition that fails with `ERROR_FILE_EXISTS` when the target exists, i.e.
+*precisely* the missing primitive — **appears nowhere in the file.** So the flag is dropped, and since
+`Verify()` requires it to be combined with `FILE_CREATE` (below), the open falls to `OPEN_ALWAYS` = "open,
+creating if absent" — which succeeds happily on an existing file. **The OS is not the limitation; the
+disposition is simply never selected.**
+
+### It is public, documented surface, not a half-built flag
+
+- `FileOpenFlags::Verify()` (`file_system.cpp:90-93`) asserts its combination rules and comments them:
+  *"FILE_FLAGS_EXCLUSIVE_CREATE only can be combined with CREATE/CREATE_NEW"*.
+- It is exposed on the **C API**: `DUCKDB_FILE_FLAG_CREATE_NEW` → `FILE_FLAGS_EXCLUSIVE_CREATE`
+  (`main/capi/file_system-c.cpp:81-82`), reachable via `duckdb_file_system_open`.
+
+⇒ **a stock repro needs no extension**: open an existing path with
+`DUCKDB_FILE_FLAG_WRITE | DUCKDB_FILE_FLAG_CREATE | DUCKDB_FILE_FLAG_CREATE_NEW`. It fails on Linux/macOS
+and **succeeds on Windows**. Same shape as §2's C repro; worth writing before filing.
+
+### The naming collision that probably hid it
+
+DuckDB has **two** things called `CREATE_NEW`, meaning opposite things:
+
+| name | meaning | Win32 equivalent |
+|---|---|---|
+| C API `DUCKDB_FILE_FLAG_CREATE_NEW` | exclusive create — fail if exists | `CREATE_NEW` |
+| internal `FILE_FLAGS_FILE_CREATE_NEW` → `OverwriteExistingFile()` | truncate — overwrite if exists | `CREATE_ALWAYS` |
+
+So the Windows branch *looks* complete — it handles a flag named `CREATE_NEW` — while the flag it handles is
+the truncating one, and the one that matches the Win32 disposition by name is the one it ignores.
+
+### Why upstream has not hit it — ESTABLISHED FROM HISTORY, not inferred
+
+The obvious question is whether the Windows branch was left alone on purpose for some undocumented reason.
+It was not. `git blame` on `duckdb/main` settles it:
+
+| line | commit | date | what |
+|---|---|---|---|
+| POSIX `if (flags.ExclusiveCreate())` | `b2f9767a` | **2024-07-24** | *"Create file with O_EXCL flag set."* — [#13123](https://github.com/duckdb/duckdb/pull/13123) |
+| Windows `creation_disposition` block | `74561a79` / `8e80101f` / `eee76b85` | 2021-09 … 2024-03 | predates the flag entirely, never revisited |
+
+**One PR introduced both `FILE_FLAGS_EXCLUSIVE_CREATE` and `FILE_FLAGS_NULL_IF_EXISTS`, added their
+combination rules to `FileOpenFlags::Verify`, and implemented them in the POSIX branch of
+`local_file_system.cpp` — while the Windows branch of the same function, in the same file, went untouched.**
+Its description is written purely in POSIX vocabulary (*"When O_EXCL is used WITH O_CREAT open will fail if
+file exists"*), so Windows never entered the frame. Nobody writes `Verify()` assertion rules for a flag they
+intend to no-op on a platform, and nothing anywhere — comment, doc or issue — records the flag as POSIX-only.
+
+Two aggravating facts. `FILE_FLAGS_EXCLUSIVE_CREATE` has **zero internal callers** (a grep finds only the flag
+machinery and the C-API translation), so no DuckDB test could ever reach the Windows path — that is the
+*mechanism* by which it stayed invisible for two years, and it also means the fix carries essentially no
+regression risk for DuckDB proper. And 14 months later `d4f7b546` promoted it to **public C API surface** as
+`DUCKDB_FILE_FLAG_CREATE_NEW`, by which time the gap was already there and unnoticed.
+
+⚠ The one Windows wrinkle worth knowing, and it is not a reason to have omitted the disposition: `CREATE_NEW`
+against an existing **directory** reports `ERROR_ACCESS_DENIED` rather than `ERROR_FILE_EXISTS`, and some
+existing entries report `ERROR_ALREADY_EXISTS`. The fix accepts both of the latter two for the
+`NULL_IF_EXISTS` path.
+
+### The fix is three lines, and the ORDER is load-bearing
+
+```cpp
+if (open_write) {
+    if (flags.ExclusiveCreate()) {
+        creation_disposition = CREATE_NEW;        // fails with ERROR_FILE_EXISTS if present
+    } else if (flags.CreateFileIfNotExists()) {
+        creation_disposition = OPEN_ALWAYS;
+    } else if (flags.OverwriteExistingFile()) {
+        creation_disposition = CREATE_ALWAYS;
+    }
+}
+```
+
+Exclusive must be tested **first**: `Verify()` *requires* `EXCLUSIVE_CREATE` to be accompanied by
+`FILE_CREATE`, so every legal caller sets both — testing `CreateFileIfNotExists()` first preserves the bug
+verbatim.
+
+⚠ A complete fix should also make the failure **classifiable**. `CreateFileW` sets `ERROR_FILE_EXISTS` (80),
+which DuckDB stringifies through `GetLastErrorAsString()` — **locale-dependent prose**. The POSIX side
+already surfaces a structured `errno`, which is what our own conflict classifier reads (matching on the
+message is a trap we have already been bitten by on a fuse mount). Without an equivalent on Windows, a caller
+still cannot cheaply tell "already exists" from a real IO error.
+
+### What it costs us
+
+It is the whole of §8.5: on a local Windows Delta root **neither** commit primitive is conditional
+(`MoveFile` overwrites too), so concurrent writers lose commits silently — measured at 6 writers × 3 INSERTs
+× 50 rows ⇒ **400 of 900 rows landed, 500 lost, every writer exit 0**. Single-writer is unaffected, which is
+the entire hermetic tier, so this constrains *harness design* rather than the shipped product: a Windows
+local root cannot host any multi-writer experiment. Fixing it upstream would make local Windows as safe as
+local POSIX for free — the code above `HostFsOpenWrite` needs no change at all.
+
 ## Not a bug, but pinned here because it wasted time three times
 
 `read_parquet` answers `count(*)` — and `count(<col>)` — from parquet footer metadata without decoding the

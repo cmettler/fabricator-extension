@@ -325,6 +325,26 @@ transport was ~60% of that and has left entirely (§THE UPSTREAM STRATEGY).
   anything about Windows and "local" reads as covering it. **Consequence: a local Windows root cannot host any
   multi-writer experiment** (the substrate swamps both legs of an A/B); use OneLake/abfss, S3 with a NAMED
   secret, or WSL. Single-writer behaviour is unaffected (the whole hermetic tier is green).
+  - **⚠ ROOT-CAUSED 2026-08-08 — IT IS A DuckDB BUG, NOT A WINDOWS LIMITATION AND NOT OUR MAPPING. Ready to
+    file: [docs/duckdb-upstream-issues.md](docs/duckdb-upstream-issues.md) §4.** `FileOpenFlags::ExclusiveCreate()`
+    is read in **exactly ONE place in all of DuckDB** — `local_file_system.cpp:370-371`, in the **POSIX** branch
+    (`open_flags |= O_EXCL`). The Windows `OpenFile` (`:1069-1075`) consults only `CreateFileIfNotExists()` →
+    `OPEN_ALWAYS` and `OverwriteExistingFile()` → `CREATE_ALWAYS`; **`CREATE_NEW` — the Win32 disposition that
+    fails with `ERROR_FILE_EXISTS`, i.e. exactly this primitive — appears NOWHERE in the file.** The flag is
+    silently dropped, the open falls to `OPEN_ALWAYS` ("open, creating if absent"), and that is what the probe
+    reports. ⚠ **§8.5's own guess ("no `CREATE_NEW` … on Windows") read as *the platform lacks it* and was
+    wrong** — a plausible cause written into a doc gets read later as a finding.
+    - Easy to miss because DuckDB has **two** names containing `CREATE_NEW` with OPPOSITE meanings: the C API's
+      `DUCKDB_FILE_FLAG_CREATE_NEW` = exclusive, the internal `FILE_FLAGS_FILE_CREATE_NEW` = TRUNCATE. So the
+      Windows branch looks complete while handling the wrong one.
+    - Easy to believe because the flag is **public surface** (`Verify()` asserts its combination rules;
+      `duckdb_file_system_open` exposes it) with **ZERO internal DuckDB callers** — no upstream test can reach
+      it, so the gap is invisible to everyone except extensions. That also means a stock **C-API** repro is
+      possible (not yet written) and the fix carries no regression risk for DuckDB proper.
+    - Fix is ~3 lines and ORDER-SENSITIVE (test `ExclusiveCreate()` FIRST → `CREATE_NEW`; `Verify()` requires
+      `FILE_CREATE` alongside, so every legal caller sets both and testing the other first preserves the bug).
+      It would make local Windows as safe as local POSIX **with no change on our side** — hence a local
+      workaround (write-temp-then-publish) is deliberately NOT built: it duplicates a fix one layer down.
   - **⚠ AND `fabricator_fs_write_probe` HAS A FALSE-POSITIVE MODE — FOUND, NOT FIXED (§8.5a).** Aimed at a path
     whose parent does not exist, `exclusive_create_existing_fails` reports **`true` ("put-if-absent works")**
     because the exclusive open threw for a MISSING DIRECTORY — the verdict is recorded as "it threw"
