@@ -671,11 +671,33 @@ assertions.
 forget them here … a cancellation between the write and the refresh would otherwise surface as a failed
 commit whose cleanup deletes live data."*
 
-That names our exact structure: `DiscardBufferedFiles` reclaims `pending.Files` on rollback, and our flush
-runs under an `InterruptScope` — so a Ctrl+C landing between the log write and the return is precisely the
-described window. We are protected today, but INDIRECTLY: `DiscardDataFilesAsync` re-reads a FRESH log and
-refuses anything it references. That is a re-read per rollback where a callback would be exact.
-Only reachable by constructing the request ourselves ⇒ Phase C, not free.
+That names our shape: `DiscardBufferedFiles` reclaims `pending.Files` on rollback, and our flush runs under
+an `InterruptScope` whose token reaches `CommitDataFilesAsync` — so a Ctrl+C between `WriteCommitAsync` and
+the snapshot refresh (both take that token) makes a DURABLE commit throw.
+
+**⚠ BUT THE HAZARD DOES NOT REACH US, and the reason is NOT the one recorded here first (2026-08-08).** This
+entry used to say *"we are protected today, but INDIRECTLY: `DiscardDataFilesAsync` re-reads a FRESH log and
+refuses anything it references."* True about that method and beside the point, because **nothing ever asks
+it**: `CommitTransaction` calls `_txnBuffer.Remove(txnId)` BEFORE the flush loop, so a throw out of the flush
+leaves `RollbackTransaction` with `tables is null` and it returns immediately. There is no cleanup to be
+wrong. The protection is an ORDERING in our own code, and the EW guard is a second line with no first line.
+
+Probed for a reachable route and found none: a buffered INSERT rolled back and an identity CREATE + INSERT
+rolled back both reclaim cleanly (`reclaimed 1 of 1`), and a `CREATE OR REPLACE` inside a transaction commits
+its own files while contributing NONE to `pending.Files`. ⇒ **`OnCommitDurable` would close a window we do
+not have.** Kept in this list only because the reasoning generalises: any future change that flushes BEFORE
+removing the buffer, or that reclaims from a source the flush does not clear, re-opens it.
+
+What the probe DID produce is a fixed log line: the referenced-file branch reported *"they remain as
+invisible orphans for VACUUM"*, which asserts the opposite of what happened — a referenced file is live table
+data. Now two branches with an accurate message each, and the anticipated one says plainly that no route to
+it is known. ⚠ It is NOT gated: logging is off by default and no suite asserts log text, so this rests on the
+probes above rather than on a test.
+
+Still Phase C if it were ever wanted: `OnCommitDurable` is set INSIDE `CommitOccAsync` (`DeltaTable.cs:2636`,
+wired to EW's own `WrittenFileLedger.Clear`) and is not a parameter on anything we call, so using it means
+constructing `LogCommitRequest` ourselves — i.e. driving `LogCommitter` instead of the table API, and owning
+action assembly, rebase handlers, preconditions and protocol gating with it.
 
 ### 4b.6 RESUMING 4b — the concrete plan, so it is not re-derived
 

@@ -2967,6 +2967,24 @@ public sealed class DeltaCatalog : IBackendCatalog
     /// uncommitted by construction, but the immediate-by-design operations (identity creates, CREATE OR
     /// REPLACE, partition overwrite) commit inside the transaction, so treating "referenced" as impossible
     /// would be an assumption about a list we do not fully own. Let EW decide and log what it says.</para>
+    ///
+    /// <para><b>⚠ THAT CASE IS NOT AN ORPHAN, AND IT IS LOGGED SEPARATELY BECAUSE OF IT.</b> A referenced
+    /// file is LIVE TABLE DATA: the commit landed, nothing leaked, and there is nothing for VACUUM to do.
+    /// Reporting it as "invisible orphans for VACUUM" — which one message for both cases did — asserts the
+    /// opposite outcome and would send someone hunting for storage that was never wasted.</para>
+    ///
+    /// <para><b>⚠ NO ROUTE TO IT IS KNOWN — it is a second line with no first line, and saying so is the
+    /// point.</b> Probed three shapes, none of which reached it: a buffered INSERT rolled back and an
+    /// identity CREATE + INSERT rolled back both reclaim cleanly (the files are uncommitted, which is the
+    /// whole design), and a CREATE OR REPLACE inside a transaction commits its own files without
+    /// contributing any to <c>pending.Files</c> at all. And the case that looks most like it — a commit
+    /// that becomes DURABLE and then throws, the window upstream's <c>LogCommitRequest.OnCommitDurable</c>
+    /// exists to close — CANNOT arrive here either: <c>CommitTransaction</c> calls
+    /// <c>_txnBuffer.Remove(txnId)</c> BEFORE it flushes, so a throw out of the flush leaves
+    /// <c>RollbackTransaction</c> nothing to discard. That ordering, not this guard, is what protects us
+    /// there. Kept anyway because the guard above is already defensive for the same reason, and a defensive
+    /// branch that describes the wrong outcome is worse than none. See
+    /// docs/ew-upstream-0.3.0-analysis.md §4b.3.</para>
     /// </summary>
     private int DiscardBufferedFiles(string tablePath, DeltaTxnBuffer.PendingAppends pending)
     {
@@ -2987,6 +3005,21 @@ public sealed class DeltaCatalog : IBackendCatalog
             {
                 table.DisposeAsync().GetAwaiter().GetResult();
             }
+        }
+        // Classified on the TYPE, which is upstream's documented contract for this meaning (the
+        // <exception cref="ArgumentException"> tag on DiscardDataFilesAsync says "one of the files is
+        // REFERENCED by the table's current version"), never on the message text. ArgumentNullException is
+        // excluded because it would mean WE passed null — our own bug, and an orphan report is the right
+        // answer to it.
+        catch (System.ArgumentException ex) when (ex is not System.ArgumentNullException)
+        {
+            _log.LogWarning(
+                "delta rollback {Path}: {Files} written file(s) are COMMITTED and were left alone — they are "
+                + "the table's data, so nothing was reclaimed and nothing was lost. NOT orphans; there is "
+                + "nothing for VACUUM to collect here. ⚠ No route to this is known — if you are reading it, "
+                + "the rollback path reached a state the code only anticipated. ({Reason})",
+                tablePath, pending.Files.Count, ex.Message);
+            return 0;
         }
         catch (System.Exception ex)
         {
