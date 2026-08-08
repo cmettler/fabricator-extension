@@ -273,6 +273,49 @@ would not."* Our patch is one of its four decisions. The rest:
 Upstream also draws a distinction ours does not: *"a recorded `false` should be trusted absolutely, while a
 recorded `true` is a claim by another writer."*
 
+#### ⚠ THE WRITE HALF CANNOT BE SOURCED FROM `LogCommitRequest` AS #88 PROPOSES — not for us (2026-08-08)
+
+Decision 1 says to write the flag from the request: blind read set + no planned removes ⇒ `isBlindAppend:
+true`. That is only as truthful as every caller's read declaration, and **our append path declares
+`ReadSet.Blind` unconditionally, whatever the transaction read.**
+
+- `CommitDataFilesAsync` hardcodes `Reads = ReadSet.Blind` and **takes no read-set parameter** — a host
+  cannot correct it. Our buffered append flush (`FlushDeferredFilesAsync`) goes straight through it.
+- We DO record reads: `DeltaCatalog.cs:1620` stages a predicate per scan, or `ReadWholeTable` when nothing
+  pushed. But that is gated on `_txnBuffer.IsExplicit(scanTxn)` — **autocommit records nothing** — and even
+  inside a transaction the APPEND flush has no `DeltaTransaction` to declare into, so `pending.ReadPredicates`
+  / `ReadWholeTable` are collected and then DISCARDED. Only the DML flush (which holds one) declares them.
+
+⇒ implementing decision 1 naively would make us stamp `isBlindAppend: true` on
+`INSERT INTO t SELECT … FROM t …` — the anti-join incremental shape this file already names as **the
+DECIDING SHAPE**, because it reads the target and emits only `AddFile`s. A wrong `true` is the UNSAFE
+direction: other engines then SKIP a check they should run. We would be creating, in the write direction,
+exactly the defect §2b fixed in the read direction.
+
+**What to say on the issue instead**, in ascending order of what it costs upstream:
+1. **`CommitDataFilesAsync` needs to accept a `ReadSet`.** Without it the flag is unsourceable for any host
+   with its own data plane — the very hosts `LogCommitter` was extracted to serve. Small and additive.
+   ⚠ **It would NOT, on its own, give our appends `concurrentDeleteRead` protection**, and an earlier draft
+   of this bullet claimed it would. A second, independent fact blocks that: §4b.2 — our append flush opens
+   the table FRESH at COMMIT, so its concurrent range is EMPTY and no rule runs whatever it declares. The two
+   are separable because the flag describes what THIS transaction READ (a property of the transaction) while
+   the check needs a base the concurrent commits sit after (a property of the commit). A read set fixes the
+   first alone. ⚠ **And no SQL-level test can tell the two apart** — a probe of "append-only transaction vs a
+   concurrent remove" returns "no conflict" under either cause, because the window between our open and our
+   write is microseconds. Do not write one and read its green as evidence.
+2. **A blind read set must not be read as "declared blind".** `ReadSet.Blind` is the DEFAULT, so it means
+   "this caller said nothing", which is not the same claim. Writing a spec field off a defaulted value turns
+   every silent caller into an assertive one. If the flag is to be written from the request, the request
+   needs a way to distinguish *declared* blind from *unset* — otherwise the safe reading of `Blind` is
+   "omit the field", which is today's behaviour and costs only spurious aborts.
+3. Our own remaining half: autocommit records no reads at all, so even with (1) we could declare truthfully
+   only on the buffered path. Extending the scan-time recording to autocommit is OUR work, not upstream's.
+
+**⇒ NOT BUILT, and deliberately.** The cross-engine gap CLAUDE.md carries as OPEN (Fabric Spark aborting
+against our concurrent append) stays open, because the available fix would trade spurious aborts — a
+performance complaint — for silently skipped conflict checks in another engine. Wrong in the direction that
+loses data.
+
 ### #86 — DML-written tables NEVER CHECKPOINT — **FIXED 2026-08-07, and it is our second patch**
 
 **Implemented on `fabricator-patches-v2` (`d3a1301`), marked `[FABRICATOR-PATCH: OFFER-READY — #86]`.**
@@ -331,11 +374,55 @@ Original finding, kept because the consequence chain is the argument for the fix
   incomplete: cleanup DEPENDS on checkpoints, and a DML-written table has none — so even a correct cleanup
   could reclaim nothing on our tables. The two compound, and #86 is the one to fix first.
 
-### #54 — a live risk in what this session COMMITTED
+### #54 — WORKED 2026-08-08. The stated risk did NOT reproduce, because a BIGGER bug was hiding it
 
-*"VACUUM collects every sidecar directory it does not know about, starting with `_delta_index`."* The S3
-suite teardown added today runs `VACUUM … RETAIN 0 HOURS`. Harmless on the rig (nothing there writes
-sidecars) — but it must not be recommended to users, and any table with a sidecar index is exposed.
+*"VACUUM collects every sidecar directory it does not know about, starting with `_delta_index`."* Probed it
+directly — planted backdated files in `_myindex/`, `_delta_index/` and `.hidden/` and ran
+`VACUUM … RETAIN 0 HOURS`. **All survived.** They survived for a reason that is much worse than the risk:
+
+**⚠ OUR `ListAsync` LISTED ONE LEVEL, so VACUUM only ever collected orphans at the TABLE ROOT — on a
+PARTITIONED table it reclaimed NOTHING.** MEASURED, same run: a backdated orphan in `p=a/` survived while an
+identical one at the root was collected. All three of our filesystems did it, each carrying a comment
+justifying it with *"the Delta log is flat"* — true of the log, and false of `VacuumExecutor`, the other
+caller, which lists the whole table root. **engineered-wood's own `LocalTableFileSystem` enumerates with
+`SearchOption.AllDirectories`**, so recursion is the contract its consumers are written against; ours
+narrowed an interface silently, and the only consumer that would have noticed was the one nobody tested.
+
+⚠ **Reaching that finding needed TWO corrections to my own probe, both the standard traps.** The first run
+reported `0 files deleted` — a VOID result, indistinguishable from "the sidecars were spared", because the
+DV DELETE left nothing unreferenced; it needed an OPTIMIZE to produce real orphans as a positive control.
+The second planted files that were seconds old, and `RETAIN 0 HOURS` keeps anything not strictly older than
+the cutoff — so they were ineligible, not protected. Only backdating them made the run discriminating.
+
+**FIXED, in two halves that must ship together** — and the second is #54's actual answer:
+
+1. **Our three filesystems now list RECURSIVELY.** Host FS: the glob is `<root>/<prefix>**` (measured: `**`
+   also returns the prefix's own level, and for a FILENAME-fragment prefix `pre**` behaves exactly like
+   `pre*`, so the shape no Delta caller uses cannot change). ADLS: `GetPathsAsync(recursive: true)`, whose
+   existing full-prefix filter already makes deeper results correct. S3 delegates to the host FS.
+2. **`VacuumExecutor` gained Delta's HIDDEN-NAME rule** — because half 1 alone makes #54's risk LIVE
+   (measured: with recursion and the old exclusions, `_myindex/i.parquet` WAS deleted). A component
+   beginning `_` or `.` is left alone at any depth, with partition directories as the exception.
+
+**⚠ The exception is what keeps it honest**: a partition column may be named with a leading underscore, so
+`_region=eu/` is a hidden NAME holding live data, and excluding it would make every orphan inside immortal —
+silently, on exactly the tables where orphans accumulate. Matched against the snapshot's declared partition
+columns, not by looking for `=`.
+
+**Read against Delta's own rule** (`DeltaTableUtils.isHiddenDirectory`, applied per path COMPONENT to files
+as well as directories, via `DeltaFileOperations.recursiveListDirs`): Delta un-hides `_delta_index` and
+`_change_data` so both ARE collected. **We deliberately diverge on both, conservatively** — there is no CDF
+keep-set here (the snapshot does not track `cdc` actions, which EW already documented), and an index this
+library does not write is one it cannot know is dead. Under-deleting leaves storage; over-deleting destroys
+another engine's data. ⚠ Note this means #54's own framing picks the one example where Delta AGREES with
+collecting: the real exposure was every OTHER `_`-prefixed name.
+
+Gates: EW `VacuumTests` 835 → **837 × {net10.0, net8.0, net472}**, both mutation-tested (dropping the
+partition exception kills the partition test; checking only the first path component kills the hidden test
+AND the pre-existing CDF-preservation test, which is independent evidence the new rule subsumes the old
+`_change_data` exclusion). Ours: `verify_delta_catalog_optimize` 40 → **56**, mutation-tested by reverting
+the glob to `*`. ⚠ The ADLS half is NOT covered by either CI tier — `verify_delta_catalog_adls` is the
+manual/live-account tier.
 
 ### #85 / #84 — the partition-path opportunity is NOT as clean as §3.2 says
 
@@ -526,6 +613,27 @@ tree is not an offer.
 **Each PR states what it deliberately omits**, rather than leaving a reviewer to find the gaps: #91 lists
 the three parts of #88 it does not do (writing the flag, unifying the two inferences, the
 `metadataChanged` guard); #90 flags that `delta.checkpointInterval` is still ignored.
+
+**⚠ THAT LAST ONE IS NOW FIXED (2026-08-08) — and it was worse than "ignored".** MEASURED: a table created
+`WITH ("delta.checkpointInterval" = '25')` stores the value in its v0 `metaData` and was still checkpointed
+at **10 and 20**. We ACCEPT the property (it is in `DeltaWithOptions.CanonicalKeys`), write it into the table
+config where another engine reads and believes it, and then honoured someone else's declaration incorrectly —
+ten times the checkpoint objects a table declaring 100 asked for. `DeltaTable` now resolves the interval from
+`snapshot.Metadata.Configuration` and falls back to the code-level `DeltaTableOptions.CheckpointInterval`.
+- **⚠ `CheckpointInterval = 0` stays an ABSOLUTE caller override**: it means "never checkpoint", and letting a
+  table property switch it back on would make a host that owns checkpointing on its own schedule start racing
+  one it did not ask for. Its own test.
+- Resolved once per OPEN, so a `set_tblproperties` change takes effect on the next open — the same
+  granularity as every other configuration read there.
+- Gates: EW `DmlCheckpointTests` 837 → **840 × 3 TFMs** (declared / fallback control / the zero override,
+  two mutants each killed at their own test) and `verify_delta_tblproperties` 58 → **84**, which pins the
+  WITH → table-config → engineered-wood chain that the EW tests cannot see. ⚠ Its CONTROL is the load-bearing
+  half — two tables taking identical statements, differing only in the property, so "the declaring table has
+  no checkpoint at v10" cannot pass by checkpointing having simply broken. ⚠ And each INSERT must be its own
+  statement: one bulk `INSERT … range(2, 27)` is ONE commit, so a version of this that used it reached v2 and
+  neither interval fired — it passed for the wrong reason until the on-disk versions were counted.
+- ⇒ **`delta.logRetentionDuration` is now the LAST accepted-but-unread Delta property** (offer list item 4).
+  Same shape, much bigger fix: it needs actual log cleanup, not a value read.
 
 **⚠ #91 explicitly DECLINES to settle upstream's open question.** #88 lists "absent ⇒ infer" vs "absent ⇒
 not blind" as undecided. Ours picks permissive with a stated reason, says plainly that this is

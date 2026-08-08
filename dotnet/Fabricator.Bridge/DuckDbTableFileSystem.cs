@@ -87,8 +87,22 @@ internal sealed unsafe class DuckDbTableFileSystem : ITableFileSystem
     public async IAsyncEnumerable<TableFileInfo> ListAsync(
         string prefix, [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
-        // DuckDB glob: <root>/<prefix>* (the Delta log is flat — _delta_log/*.json + checkpoint parquet).
-        var pattern = _root + "/" + Normalize(prefix) + "*";
+        // DuckDB glob: <root>/<prefix>** — RECURSIVE, and it has to be.
+        //
+        // ⚠ This read `+ "*"` with the comment "the Delta log is flat", which is true of the log and false of
+        // the OTHER caller: VacuumExecutor lists the whole TABLE ROOT to find files no version references. A
+        // one-level glob made VACUUM collect only what sits at the root, so on a PARTITIONED table it
+        // reclaimed nothing at all — measured: a backdated orphan in `p=a/` survived `VACUUM RETAIN 0 HOURS`
+        // while an identical one at the root was collected. Storage below the root grew forever.
+        //
+        // engineered-wood's own LocalTableFileSystem enumerates with SearchOption.AllDirectories, so RECURSIVE
+        // is the contract its consumers are written against and its suite runs them that way — this was our
+        // implementation silently narrowing an interface, not upstream assuming too much.
+        //
+        // `**` also matches files at the level of the prefix itself (measured), so the root's own files still
+        // come back; and for a prefix that is a FILENAME fragment rather than a directory, `pre**` behaves
+        // exactly like `pre*` (also measured) — so this cannot change the shape no Delta caller uses.
+        var pattern = _root + "/" + Normalize(prefix) + "**";
         var json = HostFs.Glob(Opener, pattern);
         foreach (var entry in ParseGlob(json))
         {

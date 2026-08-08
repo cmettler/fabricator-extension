@@ -90,9 +90,16 @@ internal sealed class AdlsGen2TableFileSystem : ITableFileSystem
     public async IAsyncEnumerable<TableFileInfo> ListAsync(
         string prefix, [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
-        // The Delta log is a flat directory (_delta_log/*.json + *.checkpoint.parquet), so treat the prefix's
-        // directory part as the listing target and filter by the full prefix. GetPathsAsync lists a directory's
-        // children (non-recursive is enough for the flat log). A missing directory (fresh table) => empty.
+        // Treat the prefix's directory part as the listing target and filter by the full prefix.
+        // A missing directory (fresh table) => empty.
+        //
+        // ⚠ RECURSIVE, and the comment here used to justify the opposite: "non-recursive is enough for the
+        // flat log". Enough for the log, wrong for the other caller — VacuumExecutor lists the whole TABLE
+        // ROOT, so a one-level listing made VACUUM reclaim nothing below it (a partitioned table's orphans
+        // never collected). engineered-wood's own LocalTableFileSystem uses SearchOption.AllDirectories, so
+        // recursion is the contract, not an extension of it. Safe for the log too: the filter below keeps
+        // only names starting with the full prefix, so a deeper file is returned only when it is genuinely
+        // under it (and the log's own _sidecars/ entries are what a V2 checkpoint reader wants anyway).
         // IMPORTANT: keep the prefix's trailing slash — a directory prefix like "_delta_log/" must list the
         // "_delta_log" directory itself, NOT the table root (trimming the slash would drop a level → the log
         // files, one dir deeper, would be missed, and the read-back sees an empty log = "no metadata action").
@@ -107,7 +114,7 @@ internal sealed class AdlsGen2TableFileSystem : ITableFileSystem
         AsyncPageable<PathItem> pages;
         try
         {
-            pages = _fs.GetPathsAsync(dirUnderFs, recursive: false, cancellationToken: cancellationToken);
+            pages = _fs.GetPathsAsync(dirUnderFs, recursive: true, cancellationToken: cancellationToken);
         }
         catch (RequestFailedException ex) when (ex.Status == 404)
         {

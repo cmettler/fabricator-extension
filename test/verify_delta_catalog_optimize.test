@@ -132,3 +132,67 @@ FROM parquet_metadata('${FABRICATOR_DELTA_WRITE_DIR}/optnw/t/*.parquet');
 
 statement ok
 DETACH nw;
+
+# ============================================================================
+# VACUUM ON A PARTITIONED TABLE — it used to reclaim NOTHING below the table root
+# ============================================================================
+#
+# ⚠ THE BUG THIS PINS, measured: our ITableFileSystem.ListAsync globbed <root>/<prefix>* — ONE LEVEL — and
+# VacuumExecutor lists the whole table ROOT to find files no version references. So VACUUM only ever
+# collected orphans sitting at the root, and on a PARTITIONED table it collected nothing at all: storage
+# under every `col=value/` directory grew forever. engineered-wood's own LocalTableFileSystem enumerates
+# with SearchOption.AllDirectories, so recursion is the contract its consumers are written against — this
+# was our implementation silently narrowing an interface, and the flat `_delta_log` (the only other caller)
+# never exercised the difference.
+#
+# ⚠ THE ASSERTION MUST BE ON A FILE INSIDE A PARTITION DIRECTORY. A VACUUM test on an unpartitioned table
+# passes with the bug fully present — the whole point is that the root was always swept correctly.
+#
+# ⚠ The glob is `*=a/`, not `p=a/`: column mapping is ON by default, so the partition directory is named
+# with the PHYSICAL column name (`col-e62009…=a`). Writing the logical name matches nothing and the section
+# fails at its own positive control — which is how this was found.
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/optpart' AS pv (TYPE fabricator, PROVIDER 'delta');
+
+statement ok
+CREATE TABLE pv.main.t (id BIGINT, p VARCHAR) PARTITIONED BY (p);
+
+# Several writes into ONE partition ⇒ several small files inside `p=a/`, which OPTIMIZE then supersedes.
+statement ok
+INSERT INTO pv.main.t VALUES (1, 'a');
+
+statement ok
+INSERT INTO pv.main.t VALUES (2, 'a');
+
+statement ok
+INSERT INTO pv.main.t VALUES (3, 'a');
+
+statement ok
+SELECT fabricator_exec('pv', 'OPTIMIZE main.t');
+
+# POSITIVE CONTROL: the compaction really did leave superseded files inside the partition directory, so a
+# later "they are gone" assertion means VACUUM collected them rather than them never having existed.
+query I
+SELECT count(*) > 1 FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/optpart/t/*=a/*.parquet');
+----
+true
+
+statement ok
+SELECT fabricator_exec('pv', 'VACUUM main.t RETAIN 0 HOURS');
+
+# THE REGRESSION ASSERTION: exactly the compacted file survives inside the partition.
+query I
+SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/optpart/t/*=a/*.parquet');
+----
+1
+
+query II
+SELECT id, p FROM pv.main.t ORDER BY id;
+----
+1	a
+2	a
+3	a
+
+statement ok
+DETACH pv;

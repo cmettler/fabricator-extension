@@ -220,7 +220,13 @@ case "$TIER" in
         # that races a property edit. Mutation-tested with two mutants, each killed at its own assertion:
         # dropping the second property edit makes the COMMIT unexpectedly succeed, and moving the first one
         # outside con1's window breaks the version ladder that proves the window was open at all.
-        : "${MIN_ASSERTIONS:=6801}"
+        # 6843 since 2026-08-08: verify_delta_catalog_optimize 40 -> 56 (VACUUM on a PARTITIONED table) and
+        # verify_delta_tblproperties 58 -> 84 (delta.checkpointInterval is HONOURED, not merely stored).
+        # The first pins a fixed bug with a wide blast radius: ITableFileSystem.ListAsync globbed one level,
+        # so VacuumExecutor — which lists the whole table ROOT — only ever collected orphans AT the root and
+        # reclaimed nothing under col=value/. ⚠ The assertion must be on a file INSIDE a partition directory;
+        # an unpartitioned VACUUM test passes with the bug fully present. Both mutation-tested.
+        : "${MIN_ASSERTIONS:=6843}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

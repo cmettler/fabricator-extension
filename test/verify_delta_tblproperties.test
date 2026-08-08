@@ -244,3 +244,112 @@ COMMIT;
 
 statement ok
 DETACH dflt;
+
+# ============================================================================
+# delta.checkpointInterval is HONOURED, not merely stored
+# ============================================================================
+#
+# The property was in the canonical WITH list — accepted, written into the table config, and read by
+# nobody: engineered-wood took its interval from a code-level option only, so a table declaring 25 was
+# still checkpointed every 10. Storing a declaration and then honouring it incorrectly is worse than not
+# accepting it, because another engine reads that config and believes it.
+#
+# ⚠ THE CONTROL IS THE LOAD-BEARING HALF. Asserting only "the declaring table has no checkpoint at v10"
+# passes equally if checkpointing had simply stopped working. The two tables take the SAME statements and
+# differ ONLY in the property.
+#
+# ⚠ Each INSERT must be its own statement: one bulk INSERT is ONE commit, so a `range(2, 27)` version of
+# this reaches v2 and neither interval fires — the section then passes for the wrong reason.
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/ckint' AS ck (TYPE fabricator, PROVIDER 'delta');
+
+statement ok
+CREATE TABLE ck.main.declared WITH ("delta.checkpointInterval" = '25') AS SELECT 1 AS id;
+
+statement ok
+CREATE TABLE ck.main.plain AS SELECT 1 AS id;
+
+# The declaration really is on the table (not silently dropped at CREATE).
+query I
+SELECT count(*) FROM fabricator_delta_tblproperties('ck', 'main.declared')
+WHERE property = 'delta.checkpointInterval' AND value = '25';
+----
+1
+
+# CREATE AS SELECT is v0 + v1, so eight more commits each lands both tables on v9...
+
+statement ok
+INSERT INTO ck.main.declared VALUES (2);
+
+statement ok
+INSERT INTO ck.main.plain VALUES (2);
+
+statement ok
+INSERT INTO ck.main.declared VALUES (3);
+
+statement ok
+INSERT INTO ck.main.plain VALUES (3);
+
+statement ok
+INSERT INTO ck.main.declared VALUES (4);
+
+statement ok
+INSERT INTO ck.main.plain VALUES (4);
+
+statement ok
+INSERT INTO ck.main.declared VALUES (5);
+
+statement ok
+INSERT INTO ck.main.plain VALUES (5);
+
+statement ok
+INSERT INTO ck.main.declared VALUES (6);
+
+statement ok
+INSERT INTO ck.main.plain VALUES (6);
+
+statement ok
+INSERT INTO ck.main.declared VALUES (7);
+
+statement ok
+INSERT INTO ck.main.plain VALUES (7);
+
+statement ok
+INSERT INTO ck.main.declared VALUES (8);
+
+statement ok
+INSERT INTO ck.main.plain VALUES (8);
+
+statement ok
+INSERT INTO ck.main.declared VALUES (9);
+
+statement ok
+INSERT INTO ck.main.plain VALUES (9);
+
+# ...and the ninth crosses v10, the DEFAULT interval.
+statement ok
+INSERT INTO ck.main.declared VALUES (10);
+
+statement ok
+INSERT INTO ck.main.plain VALUES (10);
+
+# CONTROL: the default interval fired, so checkpointing works and the table below is not merely broken.
+query I
+SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/ckint/plain/_delta_log/*.checkpoint.parquet');
+----
+1
+
+# THE ASSERTION: the declared interval (25) is respected, so v10 produced NOTHING.
+query I
+SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/ckint/declared/_delta_log/*.checkpoint.parquet');
+----
+0
+
+query I
+SELECT count(*) FROM ck.main.declared;
+----
+10
+
+statement ok
+DETACH ck;

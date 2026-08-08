@@ -1831,6 +1831,27 @@ un-commit. Read the recorded version back and decide whether the batch still nee
 > what Delta schema evolution means. It is `UPDATE` / `DELETE` inside `BEGIN … COMMIT` that hold a pinned
 > snapshot and can therefore be invalidated.
 
+> ### What `VACUUM` does and does not touch
+>
+> `SELECT fabricator_exec('lake', 'VACUUM main.t RETAIN 168 HOURS');` deletes files under the table that no
+> current version references and that are older than the retention period.
+>
+> It **does** descend into partition directories. (Before 2026-08-08 it did not — it swept only the table
+> root, so a partitioned table's superseded files were never reclaimed. If you have long-lived partitioned
+> tables, the first `VACUUM` after upgrading may free a lot.)
+>
+> It **never** touches a directory or file whose name begins with `_` or `.` — `_delta_log/`,
+> `_change_data/`, and anything another engine keeps beside your data such as an index sidecar. Two
+> consequences worth knowing:
+>
+> - **Change-data-feed files are never collected.** They are referenced by `cdc` actions rather than by
+>   `add` actions, so nothing here can tell a live one from an expired one. CDF history accumulates; delete
+>   it deliberately if you need the space.
+> - **This is deliberately more conservative than Delta Spark**, which does collect `_delta_index` and
+>   `_change_data`. Leaving them costs storage; collecting them could destroy another engine's data.
+>
+> A partition directory is still swept even if the column name starts with an underscore (`_region=eu/`).
+
 ### `COPY … TO` a Delta path (no ATTACH)
 
 `COPY … TO '<path>' (FORMAT delta, …)` writes a Delta table to **any path** — local, `s3://`, `onelake://`,
@@ -2051,6 +2072,13 @@ CREATE TABLE lake.main.plain WITH (deletion_vectors=false, column_mapping='none'
 -- delta.* / fabricator.* table properties stamped in the CREATE commit (one commit, no follow-up set)
 CREATE TABLE lake.main.t WITH ("delta.isolationLevel"='Serializable', "fabricator.myTag"='hello') AS SELECT …;
 ```
+
+> **⚠ A quoted `delta.*` property is a DECLARATION stored in the table, and most of them are for OTHER
+> engines to read — we do not implement every one.** Two we do act on: `delta.isolationLevel` (a table's own
+> level outranks the catalog's `isolation_level`) and `delta.checkpointInterval` (how often we checkpoint
+> the log — honoured since 2026-08-08; it was stored and ignored before, so a table declaring `100` was
+> still checkpointed every 10). `delta.logRetentionDuration` is stored and **not** implemented: nothing here
+> deletes a superseded commit file, so the log grows for the life of the table.
 
 Keys: `parquet_compression` / `parquet_row_group_size` / `parquet_bloom_filter_columns`; `deletion_vectors`
 / `column_mapping` / `row_tracking` / `change_data_feed` / `in_commit_timestamps`; any quoted `delta.*` /

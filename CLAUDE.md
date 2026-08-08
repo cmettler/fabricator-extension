@@ -607,6 +607,70 @@ current code still uses the single-provider `fabricator` naming):
 ## Next up (open threads for future sessions)
 
 In-flight / planned refactors (all C#-only unless noted; tests stay green per slice):
+- **`delta.checkpointInterval` WAS ACCEPTED, STORED AND IGNORED — FIXED 2026-08-08 (one EW patch).**
+  MEASURED: `CREATE TABLE … WITH ("delta.checkpointInterval" = '25')` writes the value into the v0 `metaData`
+  and the table was still checkpointed at **10 and 20**. It is in `DeltaWithOptions.CanonicalKeys`, so we
+  advertise it on the `WITH` surface AND persist it where another engine reads and believes it — which makes
+  ignoring it worse than not accepting it: a table declaring 100 got ten times the checkpoint objects its
+  owner asked for. `DeltaTable` now resolves the interval from `snapshot.Metadata.Configuration`, falling
+  back to the code-level `DeltaTableOptions.CheckpointInterval`.
+  - **⚠ `CheckpointInterval = 0` remains an ABSOLUTE caller override** — it means "never checkpoint", and a
+    table property must not switch it back on or a host that owns checkpointing on its own schedule starts
+    racing one it did not ask for. Its own test.
+  - Resolved once per OPEN, so a later `set_tblproperties` takes effect on the next open — the same
+    granularity as every other configuration read there. A malformed value is IGNORED, not fatal: this is a
+    declaration read from a table someone else may have written, and refusing to open over it would turn a
+    bad property into an unreadable table.
+  - Gates: EW `DmlCheckpointTests` 837 → **840 × 3 TFMs** (declared / fallback CONTROL / the zero override;
+    two mutants, each killed at its own test) and `verify_delta_tblproperties` 58 → **84**, which pins the
+    WITH → table-config → engineered-wood chain the EW tests cannot see, mutation-tested.
+    - **⚠ ITS CONTROL IS THE LOAD-BEARING HALF**: two tables take IDENTICAL statements and differ only in the
+      property, so "the declaring table has no checkpoint at v10" cannot pass by checkpointing having simply
+      stopped working.
+    - **⚠ EACH INSERT MUST BE ITS OWN STATEMENT.** One bulk `INSERT … SELECT r FROM range(2, 27)` is ONE
+      commit, so the first version of this section reached v2, neither interval fired, and it passed for the
+      wrong reason. Counting the on-disk versions is what caught it.
+  - ⇒ **`delta.logRetentionDuration` is now the LAST accepted-but-unread Delta property.** Same shape,
+    much bigger fix — it needs actual log cleanup, not a value read.
+- **VACUUM WAS BLIND BELOW THE TABLE ROOT — FIXED 2026-08-08 (C# + one EW patch). On a PARTITIONED table it
+  reclaimed NOTHING.** `ITableFileSystem.ListAsync` globbed `<root>/<prefix>*` — ONE LEVEL — in all three of
+  our filesystems, each with a comment justifying it as *"the Delta log is flat"*. True of the log; false of
+  the OTHER caller. `VacuumExecutor` lists the whole table ROOT to find files no version references, so it
+  only ever collected orphans sitting at the root, and everything under `col=value/` grew forever.
+  - **MEASURED both ways**: a backdated orphan in `p=a/` survived `VACUUM RETAIN 0 HOURS` while an identical
+    one at the root was collected; after the fix, 3 collected including the partition one, table intact.
+  - **⚠ IT IS OURS, NOT UPSTREAM'S — established by reading EW's OWN implementation.** `LocalTableFileSystem`
+    enumerates with `SearchOption.AllDirectories`, so RECURSIVE is the contract every consumer is written
+    against and EW's suite runs them that way. We narrowed an interface silently, and the only consumer that
+    would have noticed is the one nobody tested. **Before deciding whose bug an interface mismatch is, read
+    the reference implementation** — the doc comment on `ListAsync` says nothing about recursion.
+  - Fix: host FS glob `<root>/<prefix>**`; ADLS `GetPathsAsync(recursive: true)`; S3 delegates to the host FS.
+    ⚠ MEASURED that `**` also returns the prefix's own level, and that for a FILENAME-fragment prefix `pre**`
+    behaves exactly like `pre*` — so the shape no Delta caller uses cannot change.
+  - **⚠ THE RECURSION FIX IS UNSAFE ALONE, and that is what closed upstream issue #54.** With recursion and
+    the old two-directory exclusion, VACUUM DELETED a planted `_myindex/i.parquet` (measured). So
+    `VacuumExecutor` gained Delta's HIDDEN-NAME rule: a path component beginning `_` or `.` is left alone at
+    any depth — applied PER COMPONENT and to FILES as well as directories, which is what Delta does
+    (`DeltaFileOperations.recursiveListDirs` filters on `getPath.getName` at every level).
+    - **⚠ PARTITION DIRECTORIES ARE THE EXCEPTION and without it the rule silently stops collecting**: a
+      partition column may be named `_region`, so `_region=eu/` is a hidden NAME holding live data. Matched
+      against the snapshot's declared partition columns, never by looking for `=`.
+    - **We diverge from Delta on TWO names, deliberately and conservatively**: Delta UN-hides `_delta_index`
+      and `_change_data` so both ARE collected; we keep both. There is no CDF keep-set here (the snapshot
+      does not track `cdc` actions) and an index this library does not write is one it cannot know is dead.
+      ⚠ So #54's own example (`_delta_index`) is the one case where Delta AGREES with collecting — the real
+      exposure was every OTHER `_`-prefixed name.
+  - **⚠ THE PROBE NEEDED TWO CORRECTIONS, both the standard traps.** First run: `0 files deleted` — VOID, not
+    a negative, because a DV DELETE leaves nothing unreferenced; it needed an OPTIMIZE for a positive
+    control. Second: the planted files were seconds old and `RETAIN 0 HOURS` keeps anything not STRICTLY
+    older than the cutoff, so they were ineligible rather than protected. Only backdating discriminated.
+  - Gates: EW `VacuumTests` 835 → **837 × 3 TFMs** (both mutation-tested; the first-component-only mutant
+    also kills the pre-existing CDF-preservation test, which is independent evidence the new rule subsumes
+    the old `_change_data` exclusion) and `verify_delta_catalog_optimize` 40 → **56**, mutation-tested by
+    reverting the glob. ⚠ **The gate must assert a file INSIDE a partition directory** — an unpartitioned
+    VACUUM test passes with the bug fully present. ⚠ And the glob is `*=a/`, not `p=a/`: column mapping is on
+    by default, so the partition directory carries the PHYSICAL column name. ⚠ **The ADLS half is in NEITHER
+    CI tier** (`verify_delta_catalog_adls` is manual/live-account).
 - **THE WRITE-OPTIONS REVISIT — AGREED, NOT STARTED (user, 2026-08-06). Where each parquet knob BELONGS, not
   just whether it is plumbed.** Triggered by the measured gap below, but the user's ask is deliberately wider:
   it is a surface question, so decide the surface before finishing the plumbing.
@@ -1793,7 +1857,32 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   concurrent append whatever the table declares.** Full record:
   [docs/delta-transactions.md](docs/delta-transactions.md) §10.6 +
   [docs/ew-master-migration.md](docs/ew-master-migration.md) §isBlindAppend §4a.
-  - **THE WRITE HALF IS CLEARED TO BUILD, and its scope is narrower than "fixes the aborts".** The blocking
+  - **⚠ THE WRITE HALF IS NO LONGER CLEARED TO BUILD — BLOCKED 2026-08-08 on a SECOND obstacle, unrelated to
+    the first.** The line below ("cleared to build") settled whether emitting the flag would HELP; it did not
+    ask whether we could emit it TRUTHFULLY. We cannot, on the path that matters. `CommitDataFilesAsync`
+    hardcodes `Reads = ReadSet.Blind` and **takes no read-set parameter**, and our buffered append flush goes
+    straight through it — so sourcing the flag from the request (which is what upstream issue #88 decision 1
+    proposes) would stamp `isBlindAppend: true` on `INSERT INTO t SELECT … FROM t …`, the anti-join
+    incremental shape this same entry names as **the DECIDING SHAPE**. A wrong `true` is the UNSAFE
+    direction — other engines then SKIP a check they should run — i.e. we would create in the WRITE
+    direction exactly the defect we fixed in the read direction.
+    - We do record reads (`DeltaCatalog.cs:1620`, a predicate per scan or `ReadWholeTable`), but only when
+      `_txnBuffer.IsExplicit` — **autocommit records nothing** — and even inside a transaction the APPEND
+      flush holds no `DeltaTransaction` to declare into, so those reads are collected and DISCARDED. Only
+      the DML flush declares them.
+    - ⇒ the ask on #88 is **"`CommitDataFilesAsync` must accept a `ReadSet`"** plus **"a DEFAULTED
+      `ReadSet.Blind` means the caller said nothing, not that it declared blind"** — writing a spec field
+      off a default turns every silent caller into an assertive one. Full reasoning:
+      [docs/ew-upstream-0.3.0-analysis.md](docs/ew-upstream-0.3.0-analysis.md) §#88.
+    - **⚠ A read set would NOT also buy our appends `concurrentDeleteRead` protection**, and it is worth not
+      conflating them: §4b.2 established the append flush opens FRESH at COMMIT, so its concurrent range is
+      empty and no rule runs whatever it declares. The flag is about what this transaction READ; the check
+      needs a base the concurrent commits sit after. ⚠ **No SQL-level test separates the two** — the window
+      between our open and our write is microseconds, so such a probe returns "no conflict" under either
+      cause. Do not write one and read its green as evidence.
+    - **The gap therefore stays OPEN deliberately.** Spurious Spark aborts are a performance complaint;
+      silently skipped conflict checks in another engine lose data.
+  - **The FIRST obstacle was cleared, and that part stands: the write half's scope is narrower than "fixes the aborts".** The blocking
     uncertainty was upstream PR #24's report that a whole-table read declaration conflicts even with a blind
     append; **reading `ConflictChecker.scala` at the `v4.2.0` tag REFUTES that for WriteSerializable** — with
     the flag set, `changedDataAddedFiles` is `Seq()`, and that EMPTY list is what the predicate check runs on,
