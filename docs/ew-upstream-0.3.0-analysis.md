@@ -483,21 +483,39 @@ retracted for being a semantics request in disguise. This one is not: the two su
   patch covers our path" but **"EW expects a buffered host to use this and we don't"** — a divergence from the
   intended shape that nobody chose. Settle it in Phase C.
 
-### 4a.5 THE OFFERS (2026-08-07) — two open as drafts, a third built and not yet pushed
+### 4a.5 THE OFFERS (2026-08-07) — TWO are open as drafts. A third exists and is NOT being offered
 
-| PR | branch | issue |
-|---|---|---|
-| [clast-project/engineered-wood#90](https://github.com/clast-project/engineered-wood/pull/90) | `offer/dml-checkpoint` | **Closes #86** |
-| [clast-project/engineered-wood#91](https://github.com/clast-project/engineered-wood/pull/91) | `offer/blind-append-declaration` | **Addresses #88**, decision 2 of 4 |
-| *(not pushed — local only)* | `offer/commit-retry-signal` | `LogCommitRequest.OnRetry`, §4b.1 |
+| PR | branch | on the pin? | status |
+|---|---|---|---|
+| [engineered-wood#90](https://github.com/clast-project/engineered-wood/pull/90) | `offer/dml-checkpoint` | **YES** — we need it | draft, **Closes #86** |
+| [engineered-wood#91](https://github.com/clast-project/engineered-wood/pull/91) | `offer/blind-append-declaration` | **YES** — we need it | draft, **Addresses #88**, decision 2 of 4 |
+| — | `offer/commit-retry-signal` | **NO** | **built, NOT pushed, NOT recommended** — see below |
 
 Each is cut off `upstream/main` with ONE change and its tests — never off `fabricator-patches-v2`, which
 carries the first two — following the `offer/*` convention already in the fork (13 prior branches).
 
-**⚠ The third is the clearest case for the convention, because we do NOT consume it.** It exists for a host
-with no outer retry loop of its own; we have one and it already logs. Putting it on the pin would grow the
-patch set to 4 files / +109 for an API nobody in this tree calls, so it stays off — and building it against
-BARE upstream (360/360 × 3 TFMs) is what proves it needs none of our other patches.
+**⚠ THE THIRD IS AN ORPHAN AND SHOULD NOT BE SENT — read this before treating it as pending work.**
+`LogCommitRequest.OnRetry` (a callback reporting a commit retry the loop recovered from) is **not a fix**;
+nothing is broken, and it adds observability a host without its own retry loop would want. **We are not such
+a host.** It was built as §4b.1's unblocker — the plan said deleting our outer OCC retry loop required a
+replacement diagnostic first — and then §4b.1 was REVERSED: the loop must stay. So the enabler outlived the
+thing it enabled, which is an order-of-operations mistake (build the enabler only after the thing it enables
+is confirmed).
+
+Why NOT offer it anyway, given it is written and green (360/360 × 3 TFMs against BARE upstream): this file
+already records the rule, from `RowUpdateMode` — *"no divergence left for it to retire and no need for it, so
+do NOT bring it; spending credibility on a request we do not need weakens the ones we do."* It retires none
+of our divergence and we consume none of it, and #90/#91 are pending review, so a third weaker PR competes
+with the two that matter.
+
+**What it is NOT:** it is not on `fabricator-patches-v2`, so the patch set stays **2 files / +69** and nothing
+we build contains it. Moving it off the working branch is the whole reason it lives on its own — carrying it
+would have made the pin 4 files / +109 for an API no caller in this tree touches.
+
+**What would revive it:** taking §4b.3 / Phase C (constructing `LogCommitRequest` ourselves to reach
+`OnCommitDurable`), at which point we would want the retry signal in the same breath and the two go upstream
+as a motivated pair. Absent that, **deleting the branch loses nothing** — the design is described here well
+enough to re-derive in an afternoon.
 
 **⚠ THE INTERNAL MARKERS MUST BE STRIPPED, and this is the step easiest to forget.** Both branches were
 verified to contain **zero** `FABRICATOR` references: the `[FABRICATOR-PATCH: OFFER-READY]` tags and
@@ -567,15 +585,15 @@ CLOSED: **nothing to delete**, one flagged hazard that does not reach us, and a 
 ### 4b.1 ❌ DO **NOT** DELETE our outer OCC retry loop — the offer is BUILT, the deletion is REFUSED, and the second reason is the real one
 
 > **RESOLVED 2026-08-07.** The ✅ below was written before 4b.2 was measured, and 4b.2 changed the answer.
-> **Option (1) is DONE — `LogCommitRequest.OnRetry` is built, tested and offer-ready** (`CommitRetryInfo`
+> **Option (1) was BUILT — `LogCommitRequest.OnRetry`** (`CommitRetryInfo`
 > carrying the lost version, the latest version, and the attempt index; mutation-tested — moving the
 > invocation above the verdict throw kills the "a conflict is not a retry" test).
-> **⚠ It lives on `offer/commit-retry-signal`, cut off `upstream/main`, and is deliberately NOT on the pin**
-> — we do not consume it (our own loop already logs), so carrying it would grow the patch set from 2 files /
-> +69 to 4 / +109 for an API nobody here calls. That is the `offer/*` convention doing its job: 360/360 ×
-> {net10.0, net8.0, net472} against BARE upstream, which is also the only build that proves it applies
-> without our patches. **But taking it and deleting our loop is now REFUSED**, because the diagnostic was
-> never the only thing the loop does:
+> **⚠ AND IT IS AN ORPHAN — built, then made pointless by this very reversal. It is NOT on the pin and is
+> NOT being offered** (§4a.5 has the full reasoning): we do not consume it, our own loop already logs, and
+> carrying it would grow the patch set from 2 files / +69 to 4 / +109 for an API nobody here calls. It sits
+> on `offer/commit-retry-signal` off `upstream/main`, green at 360/360 × {net10.0, net8.0, net472} against
+> BARE upstream. **Taking it and deleting our loop is REFUSED**, because the diagnostic was never the only
+> thing the loop does:
 >
 > **⚠ THE OUTER LOOP REOPENS; THE INNER ONE DOES NOT — and that is a behaviour difference, not a
 > duplication.** `LogCommitter` holds `BaseSnapshot` FIXED across its attempts and re-runs the checker over
@@ -587,9 +605,8 @@ CLOSED: **nothing to delete**, one flagged hazard that does not reach us, and a 
 > → reopen → retry), not measured — the window is microseconds and cannot be opened from SQL.
 >
 > ⇒ **the loop stays, and now carries a comment saying why.** The 16 × 16 "multiplicative" objection below
-> still stands on paper and has never been observed; it is the price of the recovery. The `OnRetry` offer is
-> still worth sending — it is what a host with no outer loop of its own needs — it just no longer unblocks a
-> deletion here.
+> still stands on paper and has never been observed; it is the price of the recovery. And with the deletion
+> refused, `OnRetry` has nothing left to serve HERE — it is not being offered either (§4a.5).
 >
 > **⚠ AND BE HONEST ABOUT WHAT THE REOPEN IS.** Upstream's own comment on that hunk says the opt-out it
 > would accept *"reopens a real hole, so it should be asked for rather than offered"* — and a reopen-and-
