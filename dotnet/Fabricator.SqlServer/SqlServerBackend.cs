@@ -1198,6 +1198,42 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         return set ?? _materialize ?? true;
     }
 
+    // -1 unknown, 0 disallowed, 1 allowed. Cached per catalog: the answer is a database property, and the
+    // check costs a round trip we only ever pay on the opt-in mssql_materialize=false path.
+    private int _snapshotIsolationAllowed = -1;
+
+    // mssql_materialize=false keeps a scan of the catalog being written STREAMING by putting it on a pooled
+    // connection at SNAPSHOT isolation. That requires ALLOW_SNAPSHOT_ISOLATION on the database, and there is
+    // no way to satisfy it from here — enabling it is an ALTER DATABASE with a tempdb version-store cost that
+    // is the DBA's decision, not ours. So: fail with a message that names the setting AND the remedy.
+    private void EnsureSnapshotIsolationAllowed(SqlConnection connection)
+    {
+        if (_snapshotIsolationAllowed < 0)
+        {
+            using var probe = connection.CreateCommand();
+            // ⚠ 0 = OFF, 1 = ON, 2/3 = in transition — VERIFIED against sys.databases, not recalled. A first
+            // version of this used 2 for OFF (the value actually means "in transition to on"), so the probe
+            // read a disabled database as enabled and let SQL Server's raw Msg 3952 through instead — the
+            // exact confusion this method exists to prevent.
+            //
+            // Only a definite 0 refuses. A transitional state is treated as allowed: SQL Server's own error is
+            // the authoritative answer, and refusing mid-transition would fail a statement about to be legal.
+            probe.CommandText = "SELECT snapshot_isolation_state FROM sys.databases WHERE database_id = DB_ID()";
+            probe.CommandType = CommandType.Text;
+            var state = probe.ExecuteScalar();
+            _snapshotIsolationAllowed = (state is byte b && b == 0) ? 0 : 1;
+        }
+        if (_snapshotIsolationAllowed == 0)
+        {
+            throw new InvalidOperationException(
+                "fabricator: mssql_materialize=false needs snapshot isolation, which is not enabled on this " +
+                "database. It keeps a scan of the table being written STREAMING by reading it on a separate " +
+                "connection at SNAPSHOT isolation; without that the read would block on the write's locks " +
+                "indefinitely. Either run ALTER DATABASE [<db>] SET ALLOW_SNAPSHOT_ISOLATION ON, or leave " +
+                "mssql_materialize at its default (true), which buffers the scan instead and needs nothing.");
+        }
+    }
+
     public IArrowArrayStream ExecuteQuery(string sql, IReadOnlyList<SqlParameter>? parameters, bool readYourWrites)
         => ExecuteQuery(sql, parameters, readYourWrites, materialize: false);
 
@@ -1291,10 +1327,18 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
             connection.OpenAsync(token).GetAwaiter().GetResult();
             if (snapshotRead)
             {
+                // PRECONDITION FIRST, and deliberately not a try/catch around the read. SET TRANSACTION
+                // ISOLATION LEVEL SNAPSHOT SUCCEEDS on a database that disallows it — SQL Server only raises
+                // Msg 3952 later, when a snapshot transaction first touches a USER table, which on this path
+                // is inside the lazily-consumed reader. The user would then see it as "failed to read next
+                // batch from stream: Snapshot isolation transaction failed ...", naming neither the setting
+                // they changed nor the fact that it is OUR opt-in path that requires it.
+                EnsureSnapshotIsolationAllowed(connection);
+
                 // Session-scoped, so it governs the implicit transaction this SELECT runs in. Set on every
                 // such open rather than once: pooled connections are recycled and sp_reset_connection puts
                 // the isolation level back to the default, so assuming it persists would silently give us a
-                // READ COMMITTED reader — the shape measured to hang.
+                // READ COMMITTED reader — the shape measured to HANG (unbounded lock wait, no error).
                 using var iso = connection.CreateCommand();
                 iso.CommandText = "SET TRANSACTION ISOLATION LEVEL SNAPSHOT";
                 iso.CommandType = CommandType.Text;

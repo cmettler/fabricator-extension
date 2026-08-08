@@ -292,11 +292,14 @@ case "$TIER" in
         # INTACT after the VACUUM, so a vacuum that removed a live file fails HERE rather than in some later
         # run. See the section header in that suite for what it bounds (data files) and what it does not
         # (the log, which engineered-wood never cleans and which this makes grow slightly FASTER).
-        # 1714 since 2026-08-08: verify_read_write_same_catalog (+36). The tier went 45/1678 -> 46/1714, i.e.
+        # 1746 since 2026-08-08 (same day, second pass): verify_read_write_same_catalog 36 -> 68 for the
+        # mssql_materialize opt-out — the streaming pooled+SNAPSHOT path (§5) and the per-catalog ATTACH
+        # option (§6, whose second catalog is the control proving the option is not process-global).
+        # 1714 was the count before that: verify_read_write_same_catalog (+36). The tier went 45/1678 -> 46/1714, i.e.
         # the gap is EXACTLY the new suite and every pre-existing suite kept its own count — which is the
         # behaviour-preservation evidence for the scan-materialisation change (FabricatorCatalog::
         # MaterializeOwnScans + ScanSpec.Materialize) that landed with it. Raised in the same commit.
-        : "${MIN_ASSERTIONS:=1714}"
+        : "${MIN_ASSERTIONS:=1746}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

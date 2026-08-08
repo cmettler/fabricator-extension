@@ -221,6 +221,10 @@ ATTACH 'mssql://sa:***@host:1433/db' AS mssql (TYPE fabricator);
 -- Restrict catalog discovery on large servers (case-insensitive regex, partial match)
 ATTACH 'Server=...;Database=...' AS mssql
   (TYPE fabricator, schema_filter '^(dbo|sales)$', table_filter '^fact_');
+
+-- Per-catalog opt-out of buffering a scan of the catalog being written (see mssql_materialize).
+-- Keeps INSERT INTO t SELECT ... FROM t STREAMING; needs ALLOW_SNAPSHOT_ISOLATION on the database.
+ATTACH 'Server=...;Database=...' AS mssql (TYPE fabricator, materialize false);
 ```
 
 On a **Fabric** SQL endpoint the catalog also gains a `fabric` schema of platform functions, which need no
@@ -306,6 +310,10 @@ What the profile drives automatically:
   with `SET mssql_mars='true'|'false'|'auto'` **before** ATTACH. (Read-your-writes for *scans* is given up on
   MARS-off engines — a documented trade-off — but *metadata* reads still see your own uncommitted DDL, so
   `CREATE TABLE` then immediate use works.)
+  - **Exception, since the scan-materialisation fix:** a scan that feeds a write into the **same catalog**
+    (`INSERT INTO t SELECT … FROM t`, or a CTAS reading that catalog) *does* see the transaction's own
+    uncommitted rows on Fabric/Synapse, because it is buffered and can therefore run on the pinned
+    connection. A standalone `SELECT` inside the transaction is unaffected and still reads committed state.
 - **Type mapping** is collation/edition-driven: `VARCHAR` (UTF-8, not `NVARCHAR`), `DATETIME2(6)`, and UTC
   `DATETIME2` for tz instants (Fabric has no `datetimeoffset`). See the type table below.
 - **Constraints.** Fabric accepts `PRIMARY KEY`/`UNIQUE` only as `NONCLUSTERED NOT ENFORCED` hints added via
@@ -1299,6 +1307,7 @@ setting (see [Partitioning & write tuning](#partitioning--write-tuning)).
 | Setting | Status | Description |
 |---------|--------|-------------|
 | `mssql_mars` | **Active** | MARS mode: `auto` (default, per engine — off for Fabric/Synapse) \| `true` \| `false`. Resolved once at first connection — set **before** ATTACH |
+| `mssql_materialize` | **Active** | Buffer a scan that reads the **same catalog** a statement writes to, before the write starts (default `true`). Required on MARS engines — without it `INSERT INTO t SELECT … FROM t` fails at scale with `595`; it is also what gives read-your-writes for that scan on Fabric/Synapse. Set `false` to keep it **streaming** instead: needs `ALLOW_SNAPSHOT_ISOLATION` on the database, and the scan then reads a committed snapshot. Overrides the per-catalog `materialize` ATTACH option |
 | `mssql_command_timeout` | **Active** | `SqlCommand.CommandTimeout` (seconds) for scans / DML / bulk; **default `0` = infinite**. Server-enforced per round-trip; overrides the per-catalog `command_timeout` ATTACH option |
 | `mssql_default_varchar_length` | **Active** | Length `n` for created text columns (`NVARCHAR(n)`/`VARCHAR(n)`); unset ⇒ `MAX`. Needed for indexable string keys |
 | `mssql_default_table_type` | **Active** | Created-table storage: `''` (rowstore) \| `clustered columnstore` (CCI, box/Azure; no-op on Fabric — columnstore already) |

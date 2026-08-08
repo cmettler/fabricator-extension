@@ -167,3 +167,123 @@ DROP TABLE db.dbo.rw_small;
 
 statement ok
 DETACH db;
+
+# ── §5  mssql_materialize=false — the opt-out keeps the scan STREAMING ───────────────────────────
+# Instead of buffering, the marked scan is routed to a POOLED connection at SNAPSHOT isolation, so it
+# shares no connection with the pinned writer. Same correct answer, no buffer, no read-your-writes.
+#
+# ⚠ REQUIRES ALLOW_SNAPSHOT_ISOLATION on the database — provisioned on TestDB by docker/provision.ps1.
+# The snapshot is NOT optional: falling back to READ COMMITTED was MEASURED to HANG (unbounded lock
+# wait, no error), so the code sets it unconditionally and refuses up front when the database says no.
+#
+# ⚠ THE NEGATIVE CASE IS NOT COVERED HERE and that is a real gap, not an oversight. It needs a database
+# WITHOUT snapshot isolation; ArrowTest is exactly that, but this tier publishes no DSN for it, and
+# toggling the setting off mid-suite would leave the rig broken for later runs if the suite aborted.
+# Verified by hand instead: the scan fails at scan_table (before any work) with a message naming
+# mssql_materialize and both remedies — see EnsureSnapshotIsolationAllowed.
+#
+# NOTE: end with SET mssql_materialize=true, not RESET — RESET does not fire an extension option's
+# set-callback, so it would leak materialize=false into every later .test file in the same process.
+
+statement ok
+SET mssql_materialize=false;
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS nomat (TYPE fabricator);
+
+statement ok
+DROP TABLE IF EXISTS nomat.dbo.rw_stream;
+
+statement ok
+CREATE TABLE nomat.dbo.rw_stream (id INTEGER, pad VARCHAR);
+
+statement ok
+INSERT INTO nomat.dbo.rw_stream SELECT r, 'seed' FROM range(0, 30000) t(r);
+
+statement ok
+INSERT INTO nomat.dbo.rw_stream SELECT id + 9000000, 'copy' FROM nomat.dbo.rw_stream;
+
+query I
+SELECT count(*) FROM nomat.dbo.rw_stream;
+----
+60000
+
+query II
+SELECT pad, count(*) FROM nomat.dbo.rw_stream GROUP BY pad ORDER BY pad;
+----
+copy	30000
+seed	30000
+
+statement ok
+DROP TABLE nomat.dbo.rw_stream;
+
+statement ok
+DETACH nomat;
+
+statement ok
+SET mssql_materialize=true;
+
+# ── §6  the same opt-out as a PER-CATALOG ATTACH option, with no SET in force ────────────────────
+# Load-bearing: it proves the option is per-catalog rather than process-global. Without the second
+# catalog below, `materialize false` could be leaking into every attach and this would still pass.
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS attnomat (TYPE fabricator, materialize false);
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS attdefault (TYPE fabricator);
+
+statement ok
+DROP TABLE IF EXISTS attnomat.dbo.rw_att;
+
+statement ok
+CREATE TABLE attnomat.dbo.rw_att (id INTEGER, pad VARCHAR);
+
+statement ok
+INSERT INTO attnomat.dbo.rw_att SELECT r, 'seed' FROM range(0, 30000) t(r);
+
+statement ok
+INSERT INTO attnomat.dbo.rw_att SELECT id + 9000000, 'copy' FROM attnomat.dbo.rw_att;
+
+query I
+SELECT count(*) FROM attnomat.dbo.rw_att;
+----
+60000
+
+statement ok
+DROP TABLE attnomat.dbo.rw_att;
+
+# The OTHER catalog took no option, so it still materialises — and therefore still has
+# read-your-writes. This is the assertion that makes §6 about scoping rather than about the value.
+
+statement ok
+DROP TABLE IF EXISTS attdefault.dbo.rw_att2;
+
+statement ok
+CREATE TABLE attdefault.dbo.rw_att2 (id INTEGER, tag VARCHAR);
+
+statement ok
+INSERT INTO attdefault.dbo.rw_att2 VALUES (1,'seed');
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO attdefault.dbo.rw_att2 VALUES (2,'intxn');
+
+query I
+SELECT count(*) FROM attdefault.dbo.rw_att2;
+----
+2
+
+statement ok
+COMMIT;
+
+statement ok
+DROP TABLE attdefault.dbo.rw_att2;
+
+statement ok
+DETACH attnomat;
+
+statement ok
+DETACH attdefault;
