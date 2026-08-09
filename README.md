@@ -1306,7 +1306,7 @@ setting (see [Partitioning & write tuning](#partitioning--write-tuning)).
 
 | Setting | Status | Description |
 |---------|--------|-------------|
-| `mssql_mars` | **Active** | MARS mode: `auto` (default, per engine — off for Fabric/Synapse) \| `true` \| `false`. Resolved once at first connection — set **before** ATTACH |
+| `mssql_mars` | **Active** | MARS mode: `auto` (default, per engine — off for Fabric/Synapse) \| `true` \| `false`. Resolved once at first connection — set **before** ATTACH. ⚠ Forcing `false` on **box SQL Server** additionally requires the database to have `READ_COMMITTED_SNAPSHOT ON`: without it, any scan of a table the open transaction has already written **hangs unboundedly** (measured — see [known-limitations.md](docs/known-limitations.md) 1.15). Fabric/Synapse are unaffected |
 | `mssql_materialize` | **Active** | Buffer a scan that reads the **same catalog** a statement writes to, before the write starts (default `true`). Required on MARS engines — without it `INSERT INTO t SELECT … FROM t` fails at scale with `595`; it is also what gives read-your-writes for that scan on Fabric/Synapse. Set `false` to keep it **streaming** instead: needs `ALLOW_SNAPSHOT_ISOLATION` on the database, and the scan then reads a committed snapshot. Overrides the per-catalog `materialize` ATTACH option |
 | `mssql_command_timeout` | **Active** | `SqlCommand.CommandTimeout` (seconds) for scans / DML / bulk; **default `0` = infinite**. Server-enforced per round-trip; overrides the per-catalog `command_timeout` ATTACH option |
 | `mssql_default_varchar_length` | **Active** | Length `n` for created text columns (`NVARCHAR(n)`/`VARCHAR(n)`); unset ⇒ `MAX`. Needed for indexable string keys |

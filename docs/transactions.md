@@ -183,8 +183,10 @@ read-your-writes for scans within the write transaction** — a scan sees the la
 transaction's uncommitted writes. This is the documented warehouse behavior ("pin only for writes, pooled
 connections for reads"). On a **snapshot**-isolation engine (Fabric) the pooled read sees a consistent
 committed snapshot and never blocks; on a non-snapshot box engine with `mssql_mars=false`, a pooled read of a
-row the same transaction is **writing** would block on the writer's locks — so don't read rows the open
-transaction is modifying when you force MARS off on box.
+row the same transaction is **writing** blocks on the writer's locks — so don't read rows the open
+transaction is modifying when you force MARS off on box. ⚠ **That last clause is measured, and it is worse
+than "don't do it": the block happens at BIND, it is unbounded, and `mssql_materialize=false` does not avoid
+it** — see "the bind-time schema scan" below.
 
 #### ⚠ MEASURED LIVE on Fabric Warehouse, 2026-08-08 — the paragraph above was reasoning; this is the number
 
@@ -270,25 +272,69 @@ free-form), and `SqlServerBackend` drains the reader and **disposes** it before 
   at scale, and the ceiling is unmeasured. The better design, deliberately deferred, is a
   `ColumnDataCollection`-backed operator (which DuckDB would spill) **plus** an eager close-on-exhaustion —
   the operator alone is not sufficient, per the DISPOSE note above.
-- Gate: `test/verify_read_write_same_catalog.test` (**36**, service tier) — autocommit and in-transaction at
+- Gate: `test/verify_read_write_same_catalog.test` (**68**, service tier) — autocommit and in-transaction at
   30k, read-your-writes, and a small-table control whose absence would let the others pass by self-insert
   simply having stopped working.
 
-**⚠ So we avoid it by ROUTING, where postgres/mysql avoid it by MATERIALISING — and the trade is not free.**
-They keep read-your-writes (their materialised scan runs on the same connection); we give it up on every
-no-MARS engine. Nothing hangs, nothing errors, and a statement that silently reads a different snapshot than
-the user expects is the failure mode to watch for here.
-- **The improvement this suggests is theirs applied to our weak spot, not our strong one.** What forbids the
-  pinned connection with MARS off is an *open reader* coexisting with DML — and materialising removes the open
-  reader. So the same planner rewrite (we already own `FabricatorCatalog::PlanInsert` / `PlanCreateTableAs`)
-  would let a no-MARS engine scan on the pinned connection and **restore read-your-writes on Fabric**. Not
-  built; it needs a signal to C# that a scan is materialised so `ExecuteQuery` may pin it.
+**⚠ So we avoid it by ROUTING where postgres/mysql avoid it by MATERIALISING — and since 2026-08-08 we do
+BOTH, which is what closed the gap this paragraph used to describe as open.** They keep read-your-writes
+(their materialised scan runs on the same connection); we gave it up on every no-MARS engine. Materialising
+removes the open reader, which is precisely what forbids the pinned connection with MARS off — so a
+**MARKED** scan now pins on a no-MARS engine too and read-your-writes is restored for it (the `materialize`
+term in `ExecuteQuery`'s routing condition). ⚠ **The restoration is SCOPED to marked scans**, i.e. to a
+statement that reads and writes the same catalog: an ordinary in-transaction `SELECT` is unmarked, still
+pooled on a no-MARS engine, and still sees only committed state. A statement that silently reads a different
+snapshot than the user expects is the failure mode to watch for there.
 - ⚠ Worth stealing from the mysql commit if it is ever built: it decides **per plan** whether to stream or
   materialise (streaming only when a single scan is present) instead of materialising unconditionally as
   postgres does, and it logs the streaming flag — which is what makes the choice observable rather than
   arguable.
 - Scope: SQL-Server-path only. The **Delta** provider holds no connections, so this whole class is unreachable
   there.
+
+#### ⚠ THE BIND-TIME SCHEMA SCAN IS A THIRD ROUTE, AND WITH MARS OFF IT BLOCKS — measured 2026-08-09
+
+**Every scan binds by opening a throwaway, UNPROJECTED `SELECT * FROM t`** purely to read the Arrow schema,
+then releasing it (`PopulateReturnSchema`, `src/fabricator/arrow_ingest.cpp:179` — *"a bare request (no
+projection/filter) ⇒ the provider reports the full column set"*). So a statement issues **two** scan queries,
+visible at `FABRICATOR_LOG_LEVEL=Debug`:
+
+```
+47.153  query [pooled txn=11]: SELECT * FROM [dbo].[t]      ← bind-time schema scan
+47.182  bulk [dbo].[t]: … txn=11                             ← the pin is created HERE
+47.212  query [pinned txn=11]: SELECT [id] FROM [dbo].[t]   ← execution scan (marked, materialised)
+```
+
+**That bind scan carries NO scan spec**, so `materialize` and `snapshotRead` are both false and the routing
+condition reduces to `pin exists && mars`. With MARS off it is therefore a plain **pooled READ COMMITTED**
+read — and in a transaction that has already written to `t` it blocks on that transaction's own uncommitted
+rows. `mssql_command_timeout` defaults to **0 = infinite**, so this is an unbounded hang, not an error.
+
+| exp | `mssql_mars` | `mssql_materialize` | RCSI | bind scan | outcome |
+|---|---|---|---|---|---|
+| C | off | true | off | pooled | **blocked** (capped at 15 s to observe it) |
+| D | off | false | off | pooled | **blocked** |
+| E | **on** | false | off | pinned | completed |
+| F | off | false | **on** | pooled | completed |
+
+C/D vs E isolates the routing; **D vs F is byte-identical but for RCSI** and isolates the remedy.
+
+- **The hazard is broader than same-catalog read+write.** It is: MARS off + a transaction that has already
+  written to `t` + *any* later scan of `t`. The self-copy shape is merely where it was met.
+- **⚠ `mssql_materialize=false` demands the WRONG prerequisite on box.** `EnsureSnapshotIsolationAllowed`
+  requires `ALLOW_SNAPSHOT_ISOLATION`, which covers the **execution** scan (it issues an explicit `SET
+  TRANSACTION ISOLATION LEVEL SNAPSHOT`). The **bind** scan never asks for snapshot, so only database-level
+  **RCSI** covers it — experiment D has `ALLOW_SNAPSHOT_ISOLATION` on and still blocks.
+- **Fabric/Synapse are unaffected**, which is why this has never been seen in the field: they are
+  snapshot-isolated by construction, so a pooled read never blocks. On box it is reachable only by
+  explicitly setting `mssql_mars=false`.
+- **It also CONFIRMS the materialise fix's ordering assumption rather than undermining it.** The bulk pins at
+  operator init *before* the execution scan runs (the trace above), so a marked scan takes the pinned
+  connection even with MARS off — the fix does not depend on luck. An earlier note recorded the opposite as
+  an open worry; the trace closes it.
+- ⚠ **The bind scan is released SYNCHRONOUSLY at bind** (`arrow_ingest.cpp:191-199`), so it is never alive
+  during the bulk — which is what rules it out as a mechanism for the 595 collision. It does cost an extra
+  server round trip and a started `SELECT *` per scan; bounded, but not free.
 
 **Metadata reads are the exception — they keep read-your-writes even with MARS off.** A short metadata read
 (`ExecuteMetadataQuery`: `FetchTableColumns` / `FetchRowIdColumns` / the catalog discovery queries) reuses the
