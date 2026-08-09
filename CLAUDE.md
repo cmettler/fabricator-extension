@@ -755,6 +755,18 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
     when reads are versioned (their snapshots are taken at the same instant), and one connection does not save
     you when they are not. The matrix's ❌ for rows 3–5 came from "separate connections ⇒ separate snapshots"
     and was wrong; rows 4 and 5 are now ✅ and row 3 splits by engine.
+  - **⚠ ROWS 3 AND 4 MEASURED AS ONE A/B (box), each leg the other's control.** One statement,
+    `INSERT INTO dst SELECT (SELECT count(a) FROM src), (SELECT count(pad) FROM src)` — both scans MARKED
+    because `src` is in the sink's own catalog — with a writer committing mid-statement, run twice:
+    `materialize=false` ⇒ **150000/150000 AGREE**; `materialize=true` ⇒ **155000/160000 DIVERGE**. Only the
+    flag differs, so the difference is attributable — **and that is what PROVES the false leg took the
+    SNAPSHOT route**, since nothing logs the `SET TRANSACTION ISOLATION LEVEL SNAPSHOT` (separate unlogged
+    command) and its absence from the log proves nothing.
+    - ⚠ **Incidental, and it contradicts an assumption in the 595 story: the marked scans logged `pooled`,
+      not `pinned`** — the scalar subqueries execute BEFORE the INSERT sink initialises, so the bulk session
+      has not pinned yet. Row 3's "pinned" describes the `INSERT … SELECT … FROM t` shape 595 is about. The
+      verdict is unaffected (pooled and pinned READ COMMITTED are both unversioned), but **which connection a
+      marked scan uses is per-plan-shape and should be checked, not assumed.**
   - No gate: it is the database's behaviour, not ours, and sqllogictest runs connections sequentially.
 - **READ+WRITE OF ONE CATALOG IN ONE STATEMENT FAILED ON BOX AT SCALE — FIXED 2026-08-08 (C++ + C#, NO ABI
   bump). `INSERT INTO t SELECT … FROM t` raised `595: Bulk Insert with another outstanding result set

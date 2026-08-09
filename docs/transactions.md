@@ -676,8 +676,8 @@ kept distinct because this section has been wrong twice by reasoning where it co
 |---|---|---|---|---|---|---|---|---|
 | 1 | **no pin yet** — autocommit, or a txn that has not written. **The commonest read there is** | pooled | server default, per statement (READ COMMITTED on box) | ✅ | — (nothing written) | ❌ **M** | ❌ **M** | ✅ **M** |
 | 2 | MARS on, ordinary scan, txn HAS written — **the box default from then on** | pinned | the pinned txn's ⇒ **server default** (READ COMMITTED on box) | ✅ | ✅ | ❌ **M** | ❌ **M** | ❌ |
-| 3 | same-catalog read+write, `materialize=true` — **the default** | pinned, buffered | the pinned txn's ⇒ **SNAPSHOT on Fabric/Synapse-serverless**, server default on box | ❌ | ✅ | ❌ box / ✅ Fabric **d** | ❌ **d** | ❌ |
-| 4 | same-catalog read+write, `materialize=false` | pooled | **SNAPSHOT**, set per scan | ✅ | ❌ | ✅ **d** | ❌ **d** | ✅ |
+| 3 | same-catalog read+write, `materialize=true` — **the default** | pinned, buffered | the pinned txn's ⇒ **SNAPSHOT on Fabric/Synapse-serverless**, server default on box | ❌ | ✅ | ❌ box **M** / ✅ Fabric **d** | ❌ **d** | ❌ |
+| 4 | same-catalog read+write, `materialize=false` | pooled | **SNAPSHOT**, set per scan | ✅ | ❌ | **✅ M** | ❌ **d** | ✅ |
 | 5 | MARS off, ordinary scan — **Fabric / Synapse** | pooled | the engine default (snapshot on Fabric) | ✅ | ❌ | **✅ M** (live on Fabric) | ❌ **M** | ✅ |
 | 6 | `read_isolation 'snapshot'`, MARS on — **OPT-IN** (§5.8) | pinned | **SNAPSHOT**, transaction-scoped | ✅ | ✅ | **✅ M** | **✅ M** | ❌ |
 | 7 | `read_isolation 'snapshot'`, MARS off — **OPT-IN** (§5.8) | pinned, buffered + serialized | **SNAPSHOT**, transaction-scoped | ❌ | ✅ | **✅ M** | **✅ M** (also live on **Fabric**) | ❌ |
@@ -704,9 +704,31 @@ go wrong for a statement to be internally inconsistent, and a separate connectio
    statement is consistent — even across two connections. ⚠ It is a bound, not a guarantee: a plan that
    starts its scans at different times (hash-join build then probe) reopens it.
 
-So row 5 is ✅, row 4 is ✅ (its per-scan `SET TRANSACTION ISOLATION LEVEL SNAPSHOT` is exactly condition 2
+So row 5 is ✅, row 4 is ✅ (its per-scan `SET TRANSACTION ISOLATION LEVEL SNAPSHOT` is exactly condition 1
 being satisfied — the very cell the old text singled out as obviously ❌), and row 3 splits by engine because
 its isolation does.
+
+**⚠ ROWS 3 AND 4 WERE THEN MEASURED TOO, AS ONE A/B, and each leg is the other's control.** One statement —
+`INSERT INTO dst SELECT (SELECT count(a) FROM src), (SELECT count(pad) FROM src)`, both scans MARKED because
+`src` is in the sink's own catalog — run twice on box (RCSI off, `ALLOW_SNAPSHOT_ISOLATION` on) with a writer
+committing 5000 rows mid-statement:
+
+| leg | ca | cpad | agree | window proven by |
+|---|---|---|---|---|
+| `materialize=false` (row 4) | 150000 | 150000 | **yes** | scans 22:46:43.9, commit 22:46:47.2, slow scan to 22:46:56.3 |
+| `materialize=true` (row 3, box) | 155000 | **160000** | **no** | scans 22:48:08.4, commit 22:48:12.0, slow scan to 22:48:21.6 |
+
+Only the flag differs, so the difference is attributable to it — **and that is also what proves the `false`
+leg genuinely took the SNAPSHOT route.** Nothing logs the `SET TRANSACTION ISOLATION LEVEL SNAPSHOT` (it is
+issued as a separate unlogged command), so its absence from the log proves nothing; the `true` leg diverging
+under the identical window does.
+
+⚠ **Incidental, and it contradicts an assumption in the 595 story:** in this shape the marked scans logged
+**`pooled`**, not `pinned` — the scalar subqueries execute before the INSERT sink initialises, so the bulk
+session has not pinned a connection yet. Row 3's "pinned" describes the `INSERT … SELECT … FROM t` shape the
+595 finding is about. It does not change the verdict — pooled and pinned READ COMMITTED are both unversioned,
+and row 2 measures the pinned route at ❌ independently — but a claim about WHICH connection a marked scan
+uses should be checked per plan shape rather than assumed.
 
 **⚠ Rows 6 and 7 are ✅ WITHIN a statement in AUTOCOMMIT too**, which was not designed: DuckDB's autocommit
 carries an implicit transaction with a nonzero id, so the opt-in pins there as well and every scan of the
