@@ -389,6 +389,54 @@ fact; it is not. If "pin the reads too" is ever built, measuring this is part of
 MVCC covers DuckDB-native storage; an attached catalog is a passthrough, so cross-statement read stability is
 whatever the remote engine's isolation gives — never more.
 
+#### What it WOULD take on box — designed, NOT built (2026-08-09)
+
+Which isolation level actually delivers it, measured directly in T-SQL on the docker box
+(`ALLOW_SNAPSHOT_ISOLATION` on, RCSI **off**), one script per level, same 9 s window and same concurrent
+inserter:
+
+| `SET TRANSACTION ISOLATION LEVEL` | first → second | the writer |
+|---|---|---|
+| **`SNAPSHOT`** | **3 → 3** | committed immediately — versioned, never blocked |
+| `READ COMMITTED` | 3 → 4 | committed |
+| **`REPEATABLE READ`** | **3 → 4** | committed |
+| `SERIALIZABLE` | 3 → 3 | prevented from committing inside the window |
+
+**⚠ Three traps, and the first two are what make the obvious design wrong.**
+
+1. **There is no `READ COMMITTED SNAPSHOT` session level.** RCSI is a *database* option, and enabling it makes
+   READ COMMITTED versioned **per statement**, not per transaction — §5.2's second row (4 → 5 on one pinned
+   connection) is that measurement. The level to ask for is **`SNAPSHOT`**, whose prerequisite is
+   `ALLOW_SNAPSHOT_ISOLATION`, **not** RCSI. The two are routinely conflated because the *behaviours* are both
+   "versioned reads"; only the SCOPE differs, and the scope is the whole point here.
+2. **`REPEATABLE READ` does NOT deliver it** — measured 3 → 4. It forbids re-reading a *row* differently, not
+   new rows appearing, and `count(*)` is exactly the phantom case. The name promises the property and does not
+   provide it.
+3. **`SERIALIZABLE` works by BLOCKING writers**, which is a far worse trade for a reporting workload.
+   ⚠ The blocking is inferred from a controlled contrast, not timed: under the identical delay READ COMMITTED
+   and REPEATABLE READ both let the insert land inside the window and SERIALIZABLE did not.
+
+**Three changes would be needed, and MARS is the least of them.**
+
+- **(a) Reads must PIN.** This is the substantive one: `TxnState` is created by `BeginWrite`, so a read-only
+  transaction has no server-side transaction for an isolation level to apply to. The state would have to be
+  created on first *catalog touch*, and `BeginWrite` would stop being a write-only concept.
+- **(b) `isolation_level` must reach that transaction.** Already parsed into `_isolationLevel`, and
+  `ParseIsolationLevel` already maps `'snapshot'` — it is simply never read outside `InOutBind`. Wire it as the
+  value with `ServerProfile.DefaultWriteIsolation` as the FALLBACK, so the ATTACH option overrides the profile.
+- **(c) MARS on** — but only for a statement carrying **two or more concurrent scans** of the same catalog (a
+  self-join). Two sequential `SELECT`s each drain and close their reader, so the plain repeat-read case does
+  not need it.
+
+**⚠ It must be opt-in, and the cost is not the connection count.** A pinned read transaction holds a SQL
+Server connection **and an open transaction** for the whole DuckDB transaction's life — pool pressure under
+`dbt --threads N`, and under `SNAPSHOT` a tempdb **version store that grows for that entire duration**. A
+long-running analytical DuckDB transaction would therefore impose a cost on the server that today it cannot.
+
+⚠ **On Fabric only (a) and (b) would be needed** — snapshot is its only level, so (c) is moot and the level is
+already right. But that rests on the transaction-scoped property flagged as UNKNOWN above: no one has observed
+it through our routing, because two reads cannot share a connection there today.
+
 ### Contrast: the native `mssql-extension` (TDS sibling) does NOT use MARS
 
 The compatibility-target sibling `mssql-extension` (`D:\repos\mssql-extension`, native C++ TDS, no
