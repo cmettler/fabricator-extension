@@ -404,11 +404,19 @@ inserter:
 
 **⚠ Three traps, and the first two are what make the obvious design wrong.**
 
-1. **There is no `READ COMMITTED SNAPSHOT` session level.** RCSI is a *database* option, and enabling it makes
-   READ COMMITTED versioned **per statement**, not per transaction — §5.2's second row (4 → 5 on one pinned
-   connection) is that measurement. The level to ask for is **`SNAPSHOT`**, whose prerequisite is
-   `ALLOW_SNAPSHOT_ISOLATION`, **not** RCSI. The two are routinely conflated because the *behaviours* are both
-   "versioned reads"; only the SCOPE differs, and the scope is the whole point here.
+1. **There is no `READ COMMITTED SNAPSHOT` session level — it does not parse.** Measured, both spellings:
+   `SET TRANSACTION ISOLATION LEVEL READ_COMMITTED_SNAPSHOT` ⇒ *Msg 102, Incorrect syntax near
+   'READ_COMMITTED_SNAPSHOT'*; with spaces ⇒ *Msg 1018, Incorrect syntax near 'SNAPSHOT'*; `SNAPSHOT` alone is
+   accepted. **RCSI is not a LEVEL, it is a reinterpretation of one**: `ALTER DATABASE … SET
+   READ_COMMITTED_SNAPSHOT ON` changes what READ COMMITTED *does* on that database (row versions instead of
+   shared locks), so there is nothing for a session to select — the session still selects READ COMMITTED and
+   the database decides how it is implemented. That is precisely why it is a database option.
+   **And it would not help even if it parsed: RCSI changes the MECHANISM, not the SCOPE.** Both flavours of
+   READ COMMITTED take a fresh view per STATEMENT; RCSI changes how that view is obtained, not when it is
+   taken — §5.2's second row (4 → 5 on one pinned connection) is that measurement. So "snapshot" appears in
+   two unrelated senses, which is the whole trap: `READ_COMMITTED_SNAPSHOT` names a **versioning mechanism**
+   with per-statement scope; `SNAPSHOT` names a **level** with per-transaction scope. The one to ask for is
+   **`SNAPSHOT`**, whose prerequisite is `ALLOW_SNAPSHOT_ISOLATION`, **not** RCSI.
 2. **`REPEATABLE READ` does NOT deliver it** — measured 3 → 4. It forbids re-reading a *row* differently, not
    new rows appearing, and `count(*)` is exactly the phantom case. The name promises the property and does not
    provide it.
