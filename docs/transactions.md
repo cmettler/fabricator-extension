@@ -621,7 +621,7 @@ apart; each is lost by a different mechanism and fixed by a different change.
 |---|---|---|
 | **read-your-writes** | is this read INSIDE the transaction at all? | the read goes to a pooled connection — a different session |
 | **cross-statement read stability** | do successive statements share one view? | the level is statement-scoped, or there is no shared transaction to scope |
-| **intra-statement consistency** | do all scans of ONE statement share one view? | each pooled scan takes its OWN snapshot at its own instant |
+| **intra-statement consistency** | do all scans of ONE statement share one view? | one DuckDB statement issues SEVERAL server statements, and the level is statement-scoped (§5.7) |
 
 **⚠ Read-your-writes is NOT an isolation property.** ANSI defines isolation by the anomalies it prevents
 BETWEEN transactions (dirty read, non-repeatable read, phantom); seeing your OWN uncommitted changes is
@@ -653,10 +653,13 @@ read-your-writes outright, and buys stability only if the LEVEL is also right (�
 a reader can take it to mean the weaker guarantee we already have; SQL Server's own split is `SNAPSHOT` vs
 `READ_COMMITTED_SNAPSHOT`, the same ambiguity. Qualify it every time.
 
-The third property is the one no standard term covers well, and it is not academic: under `materialize=false`
-every scan opens its own pooled connection and issues its own `SET TRANSACTION ISOLATION LEVEL SNAPSHOT`, so
-a statement's scans can straddle a concurrent commit **while each individual read is snapshot-isolated**. A
-single "read consistency" column would hide exactly that. ⚠ Still NOT measured.
+The third property is the one no standard term covers well, and it is not academic: a statement's scans can
+straddle a concurrent commit **while each individual read is correctly isolated**, because the isolation is
+per SERVER statement and one DuckDB statement issues several. A single "read consistency" column would hide
+exactly that. **MEASURED 2026-08-09 — §5.7. It is absent on box by default, in BOTH routings, and it is NOT
+a property of the `materialize=false` opt-out** (an earlier version of this section framed it that way and
+was wrong: a plain `SELECT` is never marked by `MaterializeOwnScans`, so the opt-out does not apply to it at
+all).
 
 | configuration | scan runs on | the read's ISOLATION | streams | read-your-writes | consistent across statements | scans may OVERLAP |
 |---|---|---|---|---|---|---|
@@ -686,10 +689,66 @@ never internally parallel, because our table function declares `MaxThreads() { r
 stream is consumed serially).
 
 **No column is ✅ for consistency across statements**, in any configuration — see §5.2 for the measurements
-and §5.4 for what it would cost. And ⚠ under `materialize=false` even INTRA-statement consistency is
-questionable: each scan opens its own pooled connection and issues its own `SET TRANSACTION ISOLATION LEVEL
-SNAPSHOT`, so two scans take two snapshots at two instants. That follows from the routing and is **NOT
-measured** — establish it before relying on the opt-out for anything but throughput.
+and §5.4 for what it would cost. **And ⚠ no column is ✅ for INTRA-statement consistency on box either**
+(§5.7, measured): pinning does not buy it, because MARS gives the scans one SESSION while each remains its
+own server STATEMENT, and READ COMMITTED is scoped to the statement. Database-level **RCSI is what buys it**
+— 6/6 trials — and it is a database option, not something this extension selects.
+
+### 5.7 Intra-statement consistency — MEASURED 2026-08-09, and it is absent by default
+
+**ONE DuckDB statement can report two different states of ONE table, and a single scan can see a FRACTION of
+one committed transaction.** Measured on box SQL Server, `TestDB` at its rig defaults (RCSI **off**,
+`ALLOW_SNAPSHOT_ISOLATION` on), MARS on, `mssql_materialize` at its default `true`.
+
+Shape — `SELECT (SELECT count(a) FROM t) AS ca, (SELECT count(pad) FROM t) AS cpad` over a
+`(a INT, pad CHAR(4000))` table of 150k rows, with a separate session committing 5000 rows ~3 s in:
+
+| RCSI | scan routing | trials | ca vs cpad |
+|---|---|---|---|
+| off | `pooled` (no pin — autocommit, or a transaction that has not written) | 3 | **3/3 DIVERGE** |
+| off | `pinned` (transaction wrote first) | 3 | **3/3 DIVERGE** |
+| on | `pooled` | 3 | 3/3 agree |
+| on | `pinned` | 3 | 3/3 agree |
+
+**Why the shape is what it is, and why the obvious ones do not work.** The two scans start in the SAME
+MILLISECOND and run concurrently (logged: two `SELECT [a]`/`SELECT [pad]` queries at one timestamp), so a
+commit landing between two *equal* scans is not aimable. The asymmetric projection is what creates the
+window: `count(a)` releases after **154 ms**, `count(pad)` after **12.4 s**, leaving a 12-second interval in
+which the writer's commit is provably inside the statement. ⚠ **A self-join will not show this** — a hash
+join drains its build side before the probe side opens (§5.3's trace), so there is no held window to inject
+into. ⚠ And the two subqueries must project **different columns**, or DuckDB's common-subplan optimizer
+dedups them into one scan and the measurement is vacuous (verified in `EXPLAIN`: two `FABRICATOR_SCAN` nodes).
+
+**Three findings, in order of how surprising they are.**
+
+1. **Pinning does not buy it, and I recorded the opposite from a single run before repeating.** The first
+   pinned trial returned 150000/150000 and looked like a clean "the pinned session is consistent"; three
+   trials then diverged 3/3. MARS is *interleaved-serial*, so both scans share one SESSION — but each is
+   still its own server STATEMENT, and READ COMMITTED is scoped to the statement, not the transaction. **One
+   green run of a timing-dependent race is not a measurement.**
+2. **A single scan can see PART of one committed transaction.** Three of the six diverging trials picked up
+   **2036**, **2376** and **3770** of the writer's 5000 rows — not the before state, not the after state, a
+   torn one. That is ordinary non-RCSI READ COMMITTED behaviour (an allocation-order scan meets rows
+   appended ahead of its position), but it means the anomaly is *within* a scan as well as *between* scans,
+   so no amount of scan-to-scan coordination on our side would fix it.
+3. **RCSI fixes it, 6/6, in both routings** — and it does so for a long scan too: the 12.4 s scan did not
+   pick up a commit that landed 2.7 s into it. RCSI gives each server statement a snapshot at ITS start, and
+   because our scans start together the per-statement snapshots coincide. ⚠ **Read that as a bound, not a
+   guarantee**: the guarantee is per scan-start instant, so where a plan starts scans at different times
+   (hash-join build then probe) the spread reopens. RCSI is a DATABASE option — nothing in this extension
+   selects it, and `mssql_materialize=false` demands the *other* prerequisite (`ALLOW_SNAPSHOT_ISOLATION`),
+   which does not cover this (§5.1).
+
+**Controls, because every cell here could pass for the wrong reason.** With no concurrent writer the two
+different projections return the SAME count (155000 = 155000) — so divergence is the writer's doing, not an
+artifact of counting different columns. Under RCSI the writer's commits are proven to have landed by the
+counts advancing exactly 5000 per trial (185000 → 210000, table total 215000 afterwards) **while each
+statement returned the pre-insert value** — otherwise "both agree" would be indistinguishable from an
+inserter that silently died, which is the failure this repo has already paid for twice.
+
+**Scope.** Fabric / Synapse-serverless are not exposed the same way: they are snapshot-isolated by
+construction, so a statement's scans read versioned data with no database option to set. This is a box
+SQL Server (and Azure SQL without RCSI) property.
 
 ### Contrast: the native `mssql-extension` (TDS sibling) does NOT use MARS
 

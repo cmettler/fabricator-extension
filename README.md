@@ -420,6 +420,16 @@ SELECT count(*) FROM mssql.dbo.people;   -- sees the uncommitted INSERT
 ROLLBACK;                                -- both statements undone
 ```
 
+**⚠ A transaction gives you read-your-writes, NOT a stable view of the rest of the world.** Two identical
+`SELECT`s inside one `BEGIN … COMMIT` can return different answers if another session commits in between,
+on box **and** on Fabric — no setting changes it. On box SQL Server without `READ_COMMITTED_SNAPSHOT`, even
+a *single statement* is not a boundary: a statement referencing one table twice can report two different
+states of it, and one scan can return part of a concurrent transaction's rows. Enabling database-level
+`READ_COMMITTED_SNAPSHOT` fixes the single-statement case (Fabric / Synapse-serverless are already
+snapshot-isolated); for a stable view across statements, materialise once into DuckDB
+(`CREATE TEMP TABLE … AS SELECT`). Details and measurements:
+[known-limitations.md](docs/known-limitations.md) 1.16–1.17.
+
 ## INSERT / UPDATE / DELETE
 
 ```sql
