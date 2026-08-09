@@ -352,6 +352,43 @@ engines (`ServerProfile.DefaultWriteIsolation`); box SQL Server / Azure SQL DB /
 connection/server default (Synapse dedicated is intentionally **not** forced to snapshot — its default is READ
 UNCOMMITTED and snapshot may be disabled).
 
+### 5.2 A DuckDB transaction is NOT a read-consistency boundary — measured 2026-08-09
+
+`BEGIN; SELECT count(*) FROM t; SELECT count(*) FROM t; COMMIT;` can return **different answers** if another
+session commits an insert in between. Measured on three configurations:
+
+| engine | config | FIRST → SECOND |
+|---|---|---|
+| box | `mssql_mars=false`, RCSI on, read-only txn | 3 → **4** |
+| box | MARS on, txn had already written (both reads `pinned txn=2`, ONE `SqlTransaction`) | 4 → **5** |
+| **Fabric Warehouse** | default (MARS off, snapshot engine) | 3 → **4** |
+
+**Two independent causes; on box BOTH apply, on Fabric only the first.**
+
+1. **Reads never pin.** The `TxnState` is created by `BeginWrite`, so a transaction that has not written has
+   no pinned connection and every scan takes a **fresh pooled connection in its own implicit transaction** —
+   two `SELECT`s are two unrelated server sessions. This is independent of MARS: MARS decides whether an
+   *existing* pin may be reused, not whether one exists.
+2. **READ COMMITTED is statement-scoped, and RCSI does not change that.** RCSI makes READ COMMITTED
+   *versioned* (a snapshot per statement) rather than transaction-wide. The second row above is the proof:
+   both reads on one connection inside one `SqlTransaction`, and the phantom still appeared.
+
+**There is no knob.** `BeginWrite` opens the pinned transaction at `ServerProfile.DefaultWriteIsolation`;
+the `isolation_level` ATTACH option and `SET mssql_isolation_level` are read **only** by `InOutBind`, i.e.
+they govern table-in-out (`fn_each`) sessions. The names invite the wrong reading — the README scopes them
+correctly in both places, so this is a naming trap rather than a documentation error.
+
+⚠ **UNKNOWN, and do not assume it: whether pinning the reads would be sufficient on Fabric.** SQL Server's
+SNAPSHOT isolation is documented as transaction-scoped (snapshot taken at first data access, held for the
+transaction), which would make cause 2 inapplicable there — but **our routing can never put two reads on one
+connection on Fabric** (MARS off, and only a MARKED scan carries the `materialize` exemption), so the
+property is unexercised and untested through our surface. An earlier draft of this section asserted it as
+fact; it is not. If "pin the reads too" is ever built, measuring this is part of the work.
+
+**What to do instead:** materialise once into DuckDB (`CREATE TEMP TABLE … AS SELECT`) and read that. DuckDB's
+MVCC covers DuckDB-native storage; an attached catalog is a passthrough, so cross-statement read stability is
+whatever the remote engine's isolation gives — never more.
+
 ### Contrast: the native `mssql-extension` (TDS sibling) does NOT use MARS
 
 The compatibility-target sibling `mssql-extension` (`D:\repos\mssql-extension`, native C++ TDS, no
