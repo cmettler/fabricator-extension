@@ -101,6 +101,24 @@ struct ArrowStreamBindData : public duckdb::TableFunctionData {
 	//! Re-creates the data stream for each scan.
 	StreamFactory factory;
 
+	//! OPTIONAL schema-only producer, used by PopulateReturnSchema INSTEAD of running `factory` with an
+	//! empty request. Set it when the bound object can DESCRIBE itself more cheaply than by being executed
+	//! — a catalog table can (FABRICATOR_META_COLUMNS is a zero-row stream whose Arrow schema IS the column
+	//! layout); `fabricator_query(sql)`, a host query and a global table function cannot, so they leave it
+	//! null and keep the run-it-and-read-its-schema default.
+	//!
+	//! ⚠ WHY THIS EXISTS AT ALL: without it a catalog scan's bind ran the SCAN factory with no projection,
+	//! i.e. an unfiltered `SELECT * FROM t`, purely to learn the column types the catalog entry had ALREADY
+	//! fetched moments earlier by the cheap route. Two describes per statement, the second one a full table
+	//! read that the server begins executing before we cancel it — and, being an ordinary data read, one
+	//! that takes a POOLED connection and could block on the transaction's own uncommitted rows with MARS
+	//! off (docs/known-limitations.md 1.15). A metadata read takes the pinned connection instead.
+	//!
+	//! ⚠ The schema it yields must MATCH what `factory` produces, since the Arrow→DuckDB converters built
+	//! here are the ones the scan's batches are read through. Both sides derive from the provider's own
+	//! column mapping, but that is a per-provider claim, not a structural guarantee.
+	std::function<void(ArrowArrayStream &)> schema_factory;
+
 	//! Filter pushdown (Phase 2). Set by the catalog scan's pushdown_complex_filter
 	//! callback: `filter_json` is a predicate-tree (FilterNode) whose constants are
 	//! referenced by index into `filter_constants`; the scan ships them to the

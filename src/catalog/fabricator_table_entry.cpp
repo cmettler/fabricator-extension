@@ -788,6 +788,20 @@ TableFunction FabricatorTableEntry::BuildScanFunction(ClientContext &context, un
 	data->factory = [handle, schema_name, table_name](const fabricator::ArrowScanRequest &req, ArrowArrayStream &out) {
 		fabricator::ScanTable(handle, schema_name, table_name, req.spec_json, req.filter_values, out);
 	};
+	// Describe the table WITHOUT reading it: the same scan call, asked for schema only. Without this the
+	// bind below ran the scan factory with an empty request — an unfiltered `SELECT *` the server begins
+	// executing before we cancel it — purely to learn column types.
+	//
+	// ⚠ IT MUST STAY ON THE SCAN PATH, and routing it to the COLUMNS metadata stream instead was MEASURED
+	// WRONG: on a `native_read` Delta catalog that stream answers from the CODEC route, so the describe
+	// seeded a codec snapshot pin while the data seeded a native one — two independent pins that a
+	// concurrent commit can separate, i.e. the schema and the rows read at different versions. Caught by
+	// verify_delta_autocommit_pin, whose whole subject is that one statement gets ONE cut. Asking the scan
+	// keeps provider routing, native-vs-codec selection and pin seeding identical to a real scan; the only
+	// thing that changes is that no rows are produced.
+	data->schema_factory = [handle, schema_name, table_name](ArrowArrayStream &out) {
+		fabricator::ScanTable(handle, schema_name, table_name, "{\"schema_only\":true}", nullptr, out);
+	};
 	data->push_projection = true; // push the projected column list (and later, filters) to SQL
 	// String-keyed ORDER BY may be pushed only under a binary database collation (byte-order sort ==
 	// DuckDB); the optimizer's TopN pushdown reads this. Detected once at LoadCatalog.

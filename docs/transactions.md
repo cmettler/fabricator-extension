@@ -301,6 +301,12 @@ snapshot than the user expects is the failure mode to watch for there.
 
 #### ⚠ THE BIND-TIME SCHEMA SCAN IS A THIRD ROUTE, AND WITH MARS OFF IT BLOCKS — measured 2026-08-09
 
+> **⚠ PARTLY SUPERSEDED THE SAME DAY (§5.4): the probe no longer reads the table** — it asks for schema only,
+> so SQL Server renders `WHERE 1 = 0`. **The hazard below did NOT go away, it MOVED**: re-measured after the
+> change, the bind no longer blocks and the EXECUTION scan does, one query later. Read the mechanism here as
+> the general shape (an unversioned pooled read against the transaction's own uncommitted rows) rather than as
+> a statement about which query blocks.
+
 **Every scan binds by opening a throwaway, UNPROJECTED `SELECT * FROM t`** purely to read the Arrow schema,
 then releasing it (`PopulateReturnSchema`, `src/fabricator/arrow_ingest.cpp:179` — *"a bare request (no
 projection/filter) ⇒ the provider reports the full column set"*). So a statement issues **two** scan queries,
@@ -510,6 +516,46 @@ never pull a batch, so they never reach EOF. That is the limitation demonstratin
 
 Gate: service tier **46/46 — 1746, identical to the pre-change counts**, which is the behaviour-preservation
 claim; plus the positive control above. C#-only, no ABI change.
+
+### 5.4 The bind-time probe DESCRIBES instead of reading (2026-08-09)
+
+Every scan's bind ran the scan factory with an empty request — an unfiltered `SELECT * FROM t` — purely to
+learn the Arrow schema the catalog entry had *already* fetched by the cheap route moments earlier. Two
+describes per statement, the second a full table read the server begins executing before the bind cancels it.
+
+The bound object now decides how it is described: `ArrowStreamBindData::schema_factory`, set by a catalog
+table and left null by `fabricator_query(sql)` / host queries / global table functions, for which running the
+thing genuinely is the only way to know its schema. The catalog table's probe is **the same `ScanTable` call**
+carrying `{"schema_only":true}` in the free-form `spec_json` (no ABI bump — the `materialize` flag's trick).
+SQL Server renders `WHERE 1 = 0`; a provider that ignores the flag is still CORRECT, since the schema of a
+scan returning no rows is the schema of that scan returning rows.
+
+**⚠ TWO WRONG TURNS, BOTH ON DELTA, BOTH CAUGHT BY `verify_delta_autocommit_pin` — and the pattern is that
+each looked like the obvious simplification.**
+
+1. **Routing the probe to the COLUMNS metadata stream** — the natural "describe result set" call, and it is
+   what builds the catalog entry. But on a `native_read` catalog that stream answers from the **codec** route,
+   so the schema seeded a codec snapshot pin while the data seeded a native one: two independent pins a
+   concurrent commit can separate, i.e. schema and rows read at different versions. Exactly the consistent-cut
+   property that suite exists to defend. **Keep the probe on the provider's own scan path** — that is what
+   preserves routing, native-vs-codec selection and pin seeding.
+2. **Giving the probe a spec at all.** Delta identified the bind probe IMPLICITLY as `spec == null`,
+   reasoning that *"every real scan carries a spec with at least its projected columns"*. A probe carrying
+   `schema_only` therefore read as a data read, was recorded in the read set, and paid an extra `_delta_log`
+   open through the retired as-of resolver. Now EXPLICIT (`spec is null || spec.SchemaOnly`) — better than
+   before in its own right, since the old inference was fragile in both directions.
+
+**⚠ METHOD, and it is the transferable part.** The first diagnosis was wrong: the failing assertion is the
+THIRD query in that block, not the codec-pin one it sits next to — only reading the file settled it. Causation
+was then established by a **one-line A/B** (disable the wiring, rebuild, re-run) rather than by argument:
+**disabled ⇒ 65 assertions, resolver fires 0; enabled ⇒ 63, fires 1.** Five minutes, no doubt left.
+
+**⚠ IT DOES NOT FIX §5.2/1.15, and predicting that it would was wrong.** Re-measured: the bind no longer
+blocks, and the EXECUTION scan blocks instead, one query later. The cause is the unversioned pooled routing,
+not the probe.
+
+Gate: hermetic and service tiers at their baseline counts, plus `verify_delta_autocommit_pin` back to its
+control count with the as-of resolver silent.
 
 ### Contrast: the native `mssql-extension` (TDS sibling) does NOT use MARS
 

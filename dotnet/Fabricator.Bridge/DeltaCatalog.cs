@@ -1615,10 +1615,19 @@ public sealed class DeltaCatalog : IBackendCatalog
         // scans read committed history, not the transaction's snapshot — excluded. Under SERIALIZABLE the
         // first read also pins the transaction's base version (the rebase walks pin+1..latest; without a
         // pin an append-only transaction's reads would have no base to check against).
-        // spec == null is the BIND-TIME schema probe (no projection, no filter — not a data read);
-        // every real scan carries a spec with at least its projected columns.
+        // ⚠ THE BIND-TIME SCHEMA PROBE MUST BE EXCLUDED — it asks what the columns are, it does not read
+        // rows, and recording it would both pollute the read set and (via PinVersion below) cost an extra
+        // `_delta_log` open through ResolveVersionAsOf.
+        //
+        // It used to be identified IMPLICITLY as `spec == null`, on the reasoning that "every real scan
+        // carries a spec with at least its projected columns". That was fragile in both directions and it
+        // BROKE the moment the host had anything else to say about a probe: giving the probe a spec of its
+        // own (`schema_only`) made it look like a data read here, and `verify_delta_autocommit_pin` caught
+        // it as the retired as-of resolver reappearing. The test is now EXPLICIT — a probe says so — and a
+        // null spec still counts as one for callers that send none.
         long scanTxn = AmbientTransaction.Current;
-        if (spec is not null && scanTxn != 0 && spec.At is null && _txnBuffer.IsExplicit(scanTxn))
+        bool schemaProbe = spec is null || spec.SchemaOnly;
+        if (!schemaProbe && scanTxn != 0 && spec!.At is null && _txnBuffer.IsExplicit(scanTxn))
         {
             var readPending = _txnBuffer.GetOrCreate(scanTxn, path);
             if (filter is null)

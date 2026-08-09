@@ -157,6 +157,7 @@ unique_ptr<FunctionData> ArrowStreamBindData::Copy() const {
 	copy->push_projection = push_projection;
 	copy->force_materialize = force_materialize;
 	copy->factory = factory;
+	copy->schema_factory = schema_factory;
 	copy->filter_json = filter_json;
 	copy->filter_constants = filter_constants;
 	copy->native_filter_sql = native_filter_sql;
@@ -182,7 +183,12 @@ void PopulateReturnSchema(ClientContext &context, ArrowStreamBindData &bind_data
 	// can resolve DuckDB secrets while reading its schema; SQL/compute factories ignore it.
 	SetActiveOpener(reinterpret_cast<FabricatorHandle>(&context));
 	ArrowArrayStream schema_stream {};
-	bind_data.factory(ArrowScanRequest {}, schema_stream);
+	if (bind_data.schema_factory) {
+		// The bound object can describe itself — ask it instead of executing it. See `schema_factory`.
+		bind_data.schema_factory(schema_stream);
+	} else {
+		bind_data.factory(ArrowScanRequest {}, schema_stream);
+	}
 
 	int ret = schema_stream.get_schema(&schema_stream, &bind_data.schema_root.arrow_schema);
 	if (ret != 0) {

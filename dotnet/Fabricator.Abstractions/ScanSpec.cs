@@ -61,6 +61,22 @@ public sealed class ScanSpec
     [JsonPropertyName("materialize")]
     public bool Materialize { get; set; }
 
+    /// <summary>
+    /// DESCRIBE ONLY: the caller wants this scan's Arrow schema and no rows (the bind-time probe behind
+    /// <c>PopulateReturnSchema</c>). A backend that can answer more cheaply should — SQL Server appends
+    /// <c>WHERE 1 = 0</c> so the server produces no rows instead of starting a full table read that the
+    /// bind then cancels.
+    /// </summary>
+    /// <remarks>
+    /// ⚠ Ignoring it is always CORRECT — the schema of a scan that returns no rows is the schema of the
+    /// same scan returning rows — so a provider need not implement it. That is deliberate: the request rides
+    /// the ordinary scan path precisely so provider routing (native vs codec), credential resolution and
+    /// snapshot-pin seeding stay identical to a real scan. Answering it from a separate metadata route was
+    /// measured to break exactly that on Delta (see FabricatorTableEntry's schema_factory).
+    /// </remarks>
+    [JsonPropertyName("schema_only")]
+    public bool SchemaOnly { get; set; }
+
     private static readonly JsonSerializerOptions Options = new()
     {
         PropertyNameCaseInsensitive = true,

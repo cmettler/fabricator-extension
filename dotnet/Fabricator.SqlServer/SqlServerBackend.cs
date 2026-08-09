@@ -2290,6 +2290,23 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
             ? " ORDER BY " + string.Join(", ", keys.Select(k => $"{Quote(k.Col)}{(k.Desc ? " DESC" : " ASC")}"))
             : "";
 
+        // DESCRIBE ONLY: the bind-time probe wants this scan's Arrow schema and no rows. `WHERE 1 = 0` is a
+        // constant-false predicate, so the server returns the result-set METADATA without reading the table
+        // — where the same probe without it starts a full scan that the bind then cancels. Placed ahead of
+        // the filter branch because a schema request never carries one.
+        //
+        // ⚠ Routing is deliberately UNCHANGED (readYourWrites: false), so this stays an ordinary data read
+        // on the same connection it used before. Marking it a metadata read would move it to the pinned
+        // connection — arguably right, since it drains immediately — but that is a connection-routing change
+        // with its own consequences and does not belong in a change about not reading the table.
+        if (spec?.SchemaOnly == true)
+        {
+            filterValues?.Dispose();
+            return ExecuteQuery($"SELECT {columns} FROM {source} WHERE 1 = 0{optionClause}",
+                                sourceParams.Count > 0 ? sourceParams : null,
+                                readYourWrites: false, materialize: false, snapshotRead: false);
+        }
+
         // Filter pushdown: render spec.Filter into a parameterized WHERE. This is
         // best-effort — DuckDB re-applies every predicate above the scan — so if we
         // can't read a value or render a node, omit the WHERE and let DuckDB filter.
