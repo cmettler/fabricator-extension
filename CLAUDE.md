@@ -64,6 +64,11 @@ use it) logs `ws=` / `heap=` / `alloc=` / `rows=` at named points in the row-sca
 throwaway probe: the UPDATE grouping was built against a plausible story about where the memory went and the
 story was WRONG** (it halved the heap and moved the process peak ~11%, because the dominant term was upstream
 of the code being changed) — that was only findable by marking the working set along the path, so the marks stay.
+- **⚠ `heap` IS BLIND TO ARROW BUFFERS — measured 2026-08-09, and it inverts the usual reading.** Apache.Arrow
+  allocates a `RecordBatch`'s buffers in NATIVE memory, so `GC.GetTotalMemory` never sees them. At
+  `mssql scan: drained to memory`, buffering a 389 MB result: **`ws=471MB heap=1MB alloc=2041MB`** — a 1 MB
+  heap beside 388 MB of genuinely retained bytes. On any path that RETAINS batches, `ws` is the only one of
+  the three that reports the retention, and a small `heap` there means nothing.
 - **⚠ Read `ws` and `heap` TOGETHER — they answer different questions, and reporting one as the other is the
   mistake this exists to prevent.** `heap` is what OUR allocations control and responds immediately to dropped
   references; `ws` includes DuckDB's own side of the statement and LAGS, because the OS does not take pages back
@@ -74,7 +79,10 @@ of the code being changed) — that was only findable by marking the working set
   built` / `group flushed` / `committed`; `delta buffered update: group flushed`; `delta delete: deletion vector
   committed` (the **no-boxing DML floor**, i.e. the control to compare an UPDATE against) / `copy-on-write
   rewrite done`; `delta bulk: streamed to files, actions parked` / `batches PARKED until commit`;
-  `delta flush: begin`; `bulk: load complete` (the provider-agnostic bulk seam — every INSERT/CTAS/COPY on every
+  `delta flush: begin`; **`mssql scan: drained to memory`** (the ONLY unbounded in-memory buffer on the READ
+  path, and until 2026-08-09 the one heavy path with no mark — it carries both the `materialize=true` default
+  and the no-MARS `mssql_read_isolation` route; ⚠ its ABSENCE is the streaming control, since it fires only
+  when a drain happens); `bulk: load complete` (the provider-agnostic bulk seam — every INSERT/CTAS/COPY on every
   backend ends there, so it is the one mark worth comparing ACROSS backends); `mssql delete|update: rowid DML
   complete`.
 - **⚠ Gated on `ILogger.IsEnabled` and it must stay that way** — `Environment.WorkingSet` queries OS process

@@ -1260,6 +1260,10 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         try
         {
             var batches = new List<RecordBatch>();
+            // ⚠ The row count exists ONLY for the mark, so it is gated — MemoryProbe's own rule. Off (the
+            // default) this adds one bool test per batch.
+            bool marking = Fabricator.Bridge.MemoryProbe.Enabled;
+            long rows = 0;
             while (true)
             {
                 var batch = source.ReadNextRecordBatchAsync().GetAwaiter().GetResult();
@@ -1268,6 +1272,18 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
                     break;
                 }
                 batches.Add(batch);
+                if (marking)
+                {
+                    rows += batch.Length;
+                }
+            }
+            // The ONLY unbounded in-memory buffer on the read path, and until now the one heavy path with no
+            // mark on it — every other mark is DML or bulk. It carries BOTH consumers: the default
+            // same-catalog read+write materialisation, and the no-MARS mssql_read_isolation route where every
+            // read is drained. `heap` is the buffer; `ws` includes DuckDB's side and lags (see MemoryProbe).
+            if (marking)
+            {
+                Fabricator.Bridge.MemoryProbe.Mark("mssql scan: drained to memory", rows);
             }
             return new InMemoryArrayStream(source.Schema, batches);
         }

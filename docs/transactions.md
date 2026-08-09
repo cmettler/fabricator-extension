@@ -801,6 +801,18 @@ not an inserter that quietly failed. Both reads log `pinned txn=2` where they lo
   `ExecGate` serializes execute+drain. So on Fabric/Synapse the opt-in trades streaming multi-ref reads for
   consistency; they are mutually exclusive there.
 
+**⚠ WHAT THAT DRAIN COSTS — MEASURED 2026-08-09, and it is the whole scanned result in memory with no
+spill.** 2M rows × `(INT, CHAR(200))` = **389 MB** on the server, read inside a transaction with MARS off:
+**peak process working set 83 MB streaming vs 471 MB buffered** (twice each; time barely moves, 3.8 s → 3.9 s).
+The delta is **388 MB against a 389 MB result — one byte of working set per byte of result.** So on a no-MARS
+engine the opt-in's memory ceiling is the largest single result the transaction reads, and there is no spill.
+That is the same unbounded-buffer shape as the `materialize=true` default, now reachable for ordinary reads;
+the `ColumnDataCollection` operator noted in CLAUDE.md's "Next up" is what would give it DuckDB's spilling.
+
+The seam now carries a permanent `Fabricator.Memory` mark (`mssql scan: drained to memory`) — it was the only
+heavy path with none, every other mark being DML or bulk. ⚠ **Its absence IS the streaming control**: the mark
+fires only when `DrainToMemory` runs, so a run with the option off produces no line at all.
+
 **⚠ Exempting a check must be paid for by guaranteeing the condition it checked for.** The opt-in makes
 `EnsureScanCannotSelfBlock` (§5.5) stand down, because a read on the transaction's own connection cannot wait
 on that transaction's locks. That is only true if the read really is pinned — so the routing sets `pinned`
@@ -824,9 +836,16 @@ gain a round trip on the one engine where snapshot is the only level there is.
 autocommit carries an implicit transaction with a nonzero id, so a bare `SELECT` under the opt-in logs
 `pinned txn=6`. Consequence, measured after the fact: every scan of one statement lands in ONE
 transaction-scoped snapshot, so **§5.7's intra-statement inconsistency is fixed as well, without RCSI** (3/3
-identical where the same shape diverges 6/6). Cost: a BEGIN/COMMIT round trip per autocommit statement.
-⚠ A first version of the gate asserted the opposite ("autocommit must not pin"), and its assertion could not
-tell the difference — only the Debug log could.
+identical where the same shape diverges 6/6). ⚠ A first version of the gate asserted the opposite ("autocommit
+must not pin"), and its assertion could not tell the difference — only the Debug log could.
+
+**The autocommit cost, MEASURED, because "it pins every statement" invites the wrong worry.** 500 trivial
+autocommit reads: **2.17 s off vs 2.79 s on**, twice each ⇒ **+1.3 ms per statement (~+29%)**. That is the
+WORST-CASE ratio — a `count(*)` on a one-row table is nearly all overhead, and any real query amortises it.
+**And nothing accumulates: 3 SQL Server sessions after 400 statements, identical at 50**, so ADO.NET pooling
+reuses the connection and each statement's transaction is committed and released. The pool-pressure warning
+in this section is about a LONG-LIVED explicit transaction holding one connection, NOT about autocommit
+leaking them.
 
 **⚠ STILL UNKNOWN, unchanged by this work: whether Fabric's transaction-scoped snapshot delivers through our
 routing.** The opt-in now puts two reads on one Fabric connection for the first time, so the experiment is

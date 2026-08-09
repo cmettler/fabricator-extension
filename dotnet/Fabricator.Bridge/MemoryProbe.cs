@@ -22,6 +22,13 @@ namespace Fabricator.Bridge;
 /// allocation, so its DELTA between two marks is the churn a stage caused whether or not it retained
 /// anything: a stage with a small heap footprint and a huge alloc delta is a copying problem, not a
 /// retention one.</para>
+/// <para><b>⚠ <c>heap</c> IS BLIND TO ARROW BUFFERS, and on those paths reading it as "we retain nothing" is
+/// exactly the misreading this class exists to prevent.</b> Apache.Arrow allocates a <c>RecordBatch</c>'s
+/// buffers in NATIVE memory, which <see cref="System.GC.GetTotalMemory"/> does not see. MEASURED at
+/// <c>mssql scan: drained to memory</c> while buffering a 389 MB result: <c>ws=471MB heap=1MB
+/// alloc=2041MB</c> — a 1 MB heap next to 388 MB of genuinely retained bytes. On any path that RETAINS
+/// <c>RecordBatch</c>es, <c>ws</c> is the only one of the three that reports the retention; <c>heap</c>
+/// measures the managed wrappers and <c>alloc</c> the churn.</para>
 /// <para><b>⚠ It is gated on <see cref="ILogger.IsEnabled"/> and must stay that way.</b>
 /// <c>Environment.WorkingSet</c> queries the OS for process counters — cheap next to a DML statement, not
 /// cheap inside a per-batch loop, and these marks sit in per-batch loops. Never compute the values before
