@@ -557,6 +557,48 @@ not the probe.
 Gate: hermetic and service tiers at their baseline counts, plus `verify_delta_autocommit_pin` back to its
 control count with the as-of resolver silent.
 
+### 5.5 The MARS-off self-deadlock is REFUSED, not hung (2026-08-09)
+
+§5.1's hazard was an unbounded hang: with MARS off a data scan takes a POOLED connection, so reading a table
+the same transaction has already written waits on locks only that transaction can release — and it cannot,
+because it is blocked waiting for that scan. A self-deadlock across two connections, invisible to SQL Server's
+deadlock monitor (one session waits, the other merely sits idle), with `mssql_command_timeout` defaulting to
+0 = infinite. `EnsureScanCannotSelfBlock` now refuses it up front, naming the table and the three remedies.
+
+**⚠ THE REFUSAL IS PRECISE, AND THAT IS WHAT THE WORK WAS.** The cheap version — "MARS off and this
+transaction has written *something*" — would refuse reads of tables the transaction never touched, which is
+the ordinary shape (read sources, write a target). So `TxnState` tracks WHICH tables were written, populated
+by the seven write paths that know their table.
+
+| case | outcome |
+|---|---|
+| MARS off, no RCSI, table this txn **wrote** | **refused** |
+| MARS off, table this txn did **not** write | reads normally |
+| MARS **on** (the box default) | reads normally |
+| MARS off + **RCSI**, data write | reads normally |
+| MARS off + RCSI, uncommitted **ALTER** | **refused** |
+
+**⚠ DATA and SCHEMA writes are not the same case.** RCSI versions ROWS, so with it on a pooled read no longer
+blocks on uncommitted rows and there is nothing to refuse. It does NOT version METADATA: an uncommitted
+`ALTER` holds Sch-M, which blocks a reader's Sch-S at every isolation level. Hence the last row.
+
+**⚠ TWO BUILD ERRORS, both found by measuring rather than review.**
+1. **`RecordTouch` placed before `BeginWrite` records nothing** — the `TxnState` does not exist yet on a
+   transaction's FIRST write, i.e. precisely the write that creates the hazard. `GetOrAdd`, not
+   `TryGetValue`.
+2. **Exempting the bind-time schema probe reproduced the original hang.** The reasoning — "a probe reads no
+   rows, so row locks cannot block it" — is true of ROWS and false of METADATA: `WHERE 1 = 0` still needs
+   Sch-S. The debug log showed the probe WAS the blocking query. It is now exempt from the data case only.
+
+**⚠ INCOMPLETE IN THE SAFE DIRECTION**: a write issued through raw `fabricator_exec` names no table we can
+see, so a scan of a table written that way is not refused and hangs as before. A missed path costs the old
+behaviour, never a wrong refusal.
+
+Gate: `verify_read_write_same_catalog` §7 (68 → 101), **mutation-tested** — disabling the tracking kills it
+at the refusal assertion. ⚠ That section deliberately sets a finite `mssql_command_timeout`: a regression
+here does not FAIL, it HANGS, which would stall the whole service tier instead of breaking it. The mutant run
+confirmed the timeout turns it into a loud error rather than a stall.
+
 ### Contrast: the native `mssql-extension` (TDS sibling) does NOT use MARS
 
 The compatibility-target sibling `mssql-extension` (`D:\repos\mssql-extension`, native C++ TDS, no

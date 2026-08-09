@@ -287,3 +287,139 @@ DETACH attnomat;
 
 statement ok
 DETACH attdefault;
+
+# ── §7  mssql_mars=false: a scan that would DEADLOCK against its own transaction is REFUSED ───────
+# With MARS off a data scan cannot share the transaction's pinned connection, so it takes a POOLED one.
+# Reading a table this same transaction has written then waits on locks only that transaction can release —
+# and it cannot, because it is blocked waiting for this very scan. SQL Server's deadlock monitor cannot see
+# it (one session waits, the other sits idle) and mssql_command_timeout defaults to 0 = infinite, so the
+# symptom was an UNBOUNDED HANG with no error. See docs/known-limitations.md 1.15.
+#
+# ⚠ THE POSITIVE CONTROLS ARE THE LOAD-BEARING HALF. A suite that only asserted the refusal would pass
+# equally if reading inside a write transaction had stopped working altogether, or if the refusal fired on
+# every table. Both controls below deny that: an UNTOUCHED table still reads (so the check is precise, not
+# blanket), and the whole shape works with MARS on (so nothing about it is broken in the shipped default).
+#
+# ⚠ mssql_mars is resolved ONCE per catalog at its first connection, so it must be SET before the ATTACH
+# and the catalog must be a fresh one. Restore with SET (not RESET — RESET does not fire the set-callback,
+# so it would leak mars=false into every later .test file in this process).
+
+statement ok
+SET mssql_mars='false';
+
+# ⚠ BOUND THE FAILURE MODE. If the refusal below ever regresses, the statement does not fail — it HANGS,
+# unbounded (mssql_command_timeout defaults to 0 = infinite), which would stall the whole service tier
+# instead of failing it. A finite timeout turns a regression into a loud error. Restored to 0 at the end.
+statement ok
+SET mssql_command_timeout=30;
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS nomars (TYPE fabricator);
+
+statement ok
+DROP TABLE IF EXISTS nomars.dbo.rw_lock_w;
+
+statement ok
+DROP TABLE IF EXISTS nomars.dbo.rw_lock_u;
+
+statement ok
+CREATE TABLE nomars.dbo.rw_lock_w (id INTEGER, tag VARCHAR);
+
+statement ok
+CREATE TABLE nomars.dbo.rw_lock_u (id INTEGER);
+
+statement ok
+INSERT INTO nomars.dbo.rw_lock_w VALUES (1,'seed'),(2,'seed');
+
+statement ok
+INSERT INTO nomars.dbo.rw_lock_u VALUES (7),(8),(9);
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO nomars.dbo.rw_lock_w VALUES (3,'intxn');
+
+# POSITIVE CONTROL: a table this transaction has NOT written still reads. Without this the refusal below
+# could pass by refusing every scan in a write transaction.
+query I
+SELECT count(*) FROM nomars.dbo.rw_lock_u;
+----
+3
+
+# The refusal: named table, named setting, and it arrives at once instead of hanging forever.
+statement error
+SELECT count(*) FROM nomars.dbo.rw_lock_w;
+----
+cannot read
+
+statement ok
+ROLLBACK;
+
+# An uncommitted ALTER is refused for a DIFFERENT reason and must stay refused even where row versioning is
+# on: Sch-M blocks a reader's Sch-S at EVERY isolation level, because row versioning does not version
+# METADATA. ⚠ The blocking query here is the bind-time SCHEMA PROBE (`WHERE 1 = 0`) — it reads no rows, so
+# it is exempt from the data-write case, and exempting it from this one too was measured to reproduce the
+# original hang.
+statement ok
+BEGIN;
+
+statement ok
+ALTER TABLE nomars.dbo.rw_lock_u ADD COLUMN extra INTEGER;
+
+statement error
+SELECT count(*) FROM nomars.dbo.rw_lock_u;
+----
+uncommitted schema change
+
+statement ok
+ROLLBACK;
+
+statement ok
+DROP TABLE nomars.dbo.rw_lock_w;
+
+statement ok
+DROP TABLE nomars.dbo.rw_lock_u;
+
+statement ok
+DETACH nomars;
+
+statement ok
+SET mssql_mars='auto';
+
+statement ok
+SET mssql_command_timeout=0;
+
+# POSITIVE CONTROL for the whole section: with MARS on (the shipped default on box) the SAME shape works —
+# the scan shares the pinned connection, so there is nothing to refuse and read-your-writes holds.
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS marson (TYPE fabricator);
+
+statement ok
+DROP TABLE IF EXISTS marson.dbo.rw_lock_ok;
+
+statement ok
+CREATE TABLE marson.dbo.rw_lock_ok (id INTEGER);
+
+statement ok
+INSERT INTO marson.dbo.rw_lock_ok VALUES (1),(2);
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO marson.dbo.rw_lock_ok VALUES (3);
+
+query I
+SELECT count(*) FROM marson.dbo.rw_lock_ok;
+----
+3
+
+statement ok
+COMMIT;
+
+statement ok
+DROP TABLE marson.dbo.rw_lock_ok;
+
+statement ok
+DETACH marson;

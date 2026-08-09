@@ -907,6 +907,42 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     {
         public SqlConnection? Connection;
         public SqlTransaction? Transaction;
+
+        /// <summary>
+        /// Tables this transaction has written, keyed <c>[schema].[table]</c>; the value is true when the
+        /// write changed the SCHEMA (DDL). Read by <see cref="EnsureScanCannotSelfBlock"/> — with MARS off a
+        /// scan takes a POOLED connection, so reading a table this same transaction has written on its
+        /// PINNED connection waits on locks only that transaction can release, and it cannot release them
+        /// because it is blocked waiting for the scan. Guarded by the lock on this instance, like the rest.
+        /// </summary>
+        public readonly Dictionary<string, bool> Touched = new(System.StringComparer.OrdinalIgnoreCase);
+    }
+
+    /// <summary>Records that the ambient transaction has written <paramref name="tableName"/>, so a later
+    /// scan of it can be refused rather than deadlocking (see <see cref="EnsureScanCannotSelfBlock"/>).
+    /// No-op outside a transaction that has pinned a connection.</summary>
+    /// <remarks>⚠ INCOMPLETE BY CONSTRUCTION, in the SAFE direction: a write issued through raw
+    /// <c>fabricator_exec</c> (<see cref="ExecuteNonQuery"/>) names no table we can see, so a scan of a table
+    /// written that way is NOT refused and still hangs as before. Every path that knows its table records
+    /// here; a missed one costs the old behaviour, never a wrong refusal.</remarks>
+    private void RecordTouch(string schemaName, string tableName, bool schemaChanged = false)
+    {
+        long txnId = AmbientTransaction.Current;
+        if (txnId == 0)
+        {
+            return;
+        }
+        // ⚠ GetOrAdd, NOT TryGetValue: every caller records BEFORE its BeginWrite(), so on the transaction's
+        // FIRST write no state exists yet and a lookup would silently record nothing — the tracking would be
+        // dead for exactly the write that creates the hazard. BeginWrite's own GetOrAdd then finds this
+        // entry and fills in the connection; a state with a null Connection is already handled everywhere
+        // (the routing and the check both test it).
+        var state = _txns.GetOrAdd(txnId, _ => new TxnState());
+        var key = $"{Quote(schemaName)}.{Quote(tableName)}";
+        lock (state)
+        {
+            state.Touched[key] = state.Touched.TryGetValue(key, out var was) ? (was || schemaChanged) : schemaChanged;
+        }
     }
 
     private readonly System.Collections.Concurrent.ConcurrentDictionary<long, TxnState> _txns = new();
@@ -1410,6 +1446,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
                            IReadOnlyList<string>? sortColumns, string? schemaMode, bool partitionOverwrite,
                            string? optionsJson)
     {
+        RecordTouch(schemaName, tableName, schemaChanged: false);
         if (partitionOverwrite)
         {
             // An overwrite flag must never be silently ignored: SQL Server's bulk path has no partition
@@ -1545,6 +1582,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
 
     public long ExecuteDelete(string schemaName, string tableName, IArrowArrayStream keys)
     {
+        RecordTouch(schemaName, tableName, schemaChanged: false);
         // slice D: a detected external DELTA table's rowid is its Delta IDENTITY column — the DELETE routes
         // to storage (identity -> transient rowid resolution + the delta provider's own rowid DELETE).
         if (DetectExternalTable(schemaName, tableName) is { IdentityColumn: { } delIdCol } extDel)
@@ -1643,6 +1681,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
 
     public long ExecuteUpdate(string schemaName, string tableName, int setColumnCount, IArrowArrayStream data)
     {
+        RecordTouch(schemaName, tableName, schemaChanged: false);
         // slice D: identity-keyed UPDATE routes to storage (see ExecuteDelete). SET of the identity column
         // itself is rejected — it is engine-assigned.
         if (DetectExternalTable(schemaName, tableName) is { IdentityColumn: { } updIdCol } extUpd)
@@ -1727,6 +1766,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
 
     public IArrowArrayStream InsertReturning(string schemaName, string tableName, IArrowArrayStream rows)
     {
+        RecordTouch(schemaName, tableName, schemaChanged: false);
         if (DetectExternalTable(schemaName, tableName) is not null)
         {
             rows.Dispose(); // never leak the imported stream to the finalizer
@@ -2229,8 +2269,109 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
                                        IArrowArrayStream? filterValues)
     {
         var qualified = $"{Quote(schemaName)}.{Quote(tableName)}";
-        return ScanFromSource(qualified, System.Array.Empty<SqlParameter>(), specJson, filterValues);
+        return ScanFromSource(qualified, System.Array.Empty<SqlParameter>(), specJson, filterValues,
+                              touchKey: qualified);
     }
+
+    /// <summary>
+    /// Refuses a scan that would DEADLOCK AGAINST ITS OWN TRANSACTION instead of letting it hang forever.
+    /// </summary>
+    /// <remarks>
+    /// <para>With MARS off a data scan cannot share the transaction's pinned connection, so it takes a
+    /// POOLED one. Reading a table this same transaction has already written then waits on locks only that
+    /// transaction can release — and it cannot, because it is blocked waiting for this very scan. It is a
+    /// genuine self-deadlock across two connections, invisible to SQL Server's deadlock monitor (one session
+    /// waits, the other merely sits idle), and <c>mssql_command_timeout</c> defaults to 0 = infinite, so the
+    /// symptom is an unbounded hang with no error. Measured: docs/known-limitations.md 1.15.</para>
+    /// <para><b>⚠ The check is ordered so the only expensive step runs LAST</b> — the RCSI probe is a round
+    /// trip, and every condition before it is false in normal operation (MARS is on by default on box, and
+    /// off only where reads are versioned anyway). In the shipped configuration this method returns at the
+    /// first test.</para>
+    /// <para><b>⚠ Why DATA writes and SCHEMA writes differ.</b> Row versioning versions ROWS, so with RCSI
+    /// on a pooled read no longer blocks on uncommitted rows and there is nothing to refuse. It does NOT
+    /// version METADATA: an uncommitted `ALTER` holds Sch-M, which blocks a reader's Sch-S at every
+    /// isolation level. So a schema change is refused regardless of RCSI.</para>
+    /// </remarks>
+    private void EnsureScanCannotSelfBlock(string qualified, bool materialize, bool snapshotRead,
+                                           bool schemaProbe)
+    {
+        if (_marsEnabled)
+        {
+            return; // the scan shares the pinned connection — same session, owns the locks
+        }
+        if (materialize || snapshotRead)
+        {
+            return; // materialise => pinned + drained; snapshotRead => pooled at SNAPSHOT. Neither blocks.
+        }
+        long txnId = AmbientTransaction.Current;
+        if (txnId == 0 || !_txns.TryGetValue(txnId, out var state))
+        {
+            return; // nothing pinned => no uncommitted work of ours to block on
+        }
+        bool schemaChanged;
+        lock (state)
+        {
+            if (state.Connection is null || !state.Touched.TryGetValue(qualified, out schemaChanged))
+            {
+                return; // this transaction has not written THIS table — reading it is fine
+            }
+        }
+        if (schemaProbe && !schemaChanged)
+        {
+            return; // a `WHERE 1 = 0` probe reads no rows, so uncommitted ROWS cannot block it
+        }
+        if (!schemaChanged && VersionedReads())
+        {
+            return; // RCSI (or a snapshot engine): the pooled read sees a version, never a lock
+        }
+        var why = schemaChanged
+            ? "this transaction has an uncommitted schema change on it (an uncommitted ALTER holds a "
+              + "schema-modification lock, which blocks readers at EVERY isolation level — row versioning "
+              + "does not version metadata)"
+            : "this transaction has uncommitted writes to it and this database does not have "
+              + "READ_COMMITTED_SNAPSHOT enabled";
+        throw new System.InvalidOperationException(
+            $"fabricator: cannot read {qualified} — {why}, and mssql_mars is off, so the scan would run on a "
+            + "separate connection and wait forever for locks only this transaction can release. Remedies: "
+            + "SET mssql_mars='auto' before ATTACH (the default on SQL Server, which lets the scan share the "
+            + "transaction's connection)"
+            + (schemaChanged
+                ? "; or COMMIT the schema change before reading the table."
+                : "; ALTER DATABASE <db> SET READ_COMMITTED_SNAPSHOT ON; or COMMIT before reading."));
+    }
+
+    // is_read_committed_snapshot_on for THIS database, probed once per catalog. A warehouse engine
+    // (Fabric/Synapse) reads at SNAPSHOT by construction and is reported versioned without a round trip.
+    // ⚠ A FAILED probe answers TRUE (= "assume versioned, do not refuse"): this gate only ever turns a hang
+    // into an error, so being unable to establish the fact must not manufacture a refusal.
+    private bool VersionedReads()
+    {
+        if (_versionedReads is { } cached)
+        {
+            return cached;
+        }
+        bool result = true;
+        try
+        {
+            if (_profile?.IsWarehouse != true)
+            {
+                using var conn = OpenConnection();
+                conn.Open();
+                using var cmd = conn.CreateCommand();
+                cmd.CommandText =
+                    "SELECT CAST(is_read_committed_snapshot_on AS INT) FROM sys.databases WHERE database_id = DB_ID()";
+                result = System.Convert.ToInt32(cmd.ExecuteScalar() ?? 1) != 0;
+            }
+        }
+        catch
+        {
+            result = true;
+        }
+        _versionedReads = result;
+        return result;
+    }
+
+    private bool? _versionedReads;
 
     // Builds + runs a projected/filtered SELECT over an arbitrary FROM <source> — a table
     // (`[s].[t]`) or a parameterized TVF call (`[s].[f](@a0, ...)`). `sourceParams` are
@@ -2239,9 +2380,19 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     // best-effort — on any failure we fall back to no WHERE (DuckDB re-applies every
     // predicate, so correctness holds).
     internal IArrowArrayStream ScanFromSource(string source, IReadOnlyList<SqlParameter> sourceParams, string? specJson,
-                                             IArrowArrayStream? filterValues)
+                                             IArrowArrayStream? filterValues, string? touchKey = null)
     {
         var spec = ScanSpec.Parse(specJson);
+        // Only a CATALOG TABLE scan passes a touchKey — a TVF source has no table identity to compare.
+        // ⚠ A SCHEMA PROBE IS CHECKED TOO, and excluding it was measured wrong: it reads no rows, so ROW
+        // locks cannot block it, but `WHERE 1 = 0` still needs Sch-S and an uncommitted ALTER holds Sch-M.
+        // The probe was the query that actually hung. It is exempted only from the data-write case.
+        if (touchKey is not null)
+        {
+            EnsureScanCannotSelfBlock(touchKey, spec?.Materialize == true && ResolveMaterialize(),
+                                      spec?.Materialize == true && !ResolveMaterialize(),
+                                      schemaProbe: spec?.SchemaOnly == true);
+        }
 
         // Time travel (DuckDB AT clause). Only a catalog table scan carries it (AT is a base-table feature; a
         // TVF source never sets it). "version" (and any other unit) has no SQL Server equivalent -> a clean error.
@@ -2718,6 +2869,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
                             IReadOnlyList<string>? sortColumns, IReadOnlyList<string>? identityColumns,
                             string? optionsJson)
     {
+        RecordTouch(schemaName, tableName, schemaChanged: true);
         // CETAS-analog, empty-CREATE shape (slice B): commit-0 Delta table + external table. The identity
         // marker rides through to the Delta create (declared plain BIGINT SQL-side — external tables can't
         // carry IDENTITY and don't need to), making the table slice-D DML-capable from birth.
@@ -2835,6 +2987,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
 
     public void DropTable(string schemaName, string tableName, bool ifExists)
     {
+        RecordTouch(schemaName, tableName, schemaChanged: true);
         string qualified = Quote(schemaName) + "." + Quote(tableName);
         // A detected external table needs the EXTERNAL DDL form (SQL Server rejects plain DROP TABLE for
         // them). Metadata-only — the storage data stays (document; no purge). No IF EXISTS form exists for
@@ -2870,6 +3023,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     public void AlterTable(int alterKind, string schemaName, string tableName, string? arg1, string? arg2,
                            Field? column, int flags)
     {
+        RecordTouch(schemaName, tableName, schemaChanged: true);
         string qualified = Quote(schemaName) + "." + Quote(tableName);
         bool ifFlag = (flags & AlterKind.FlagIfExists) != 0;
         Log.LogDebug("ddl alter [txn={Txn}] {Table}: kind={Kind} arg1={A1} arg2={A2}",

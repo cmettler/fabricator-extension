@@ -292,6 +292,13 @@ case "$TIER" in
         # INTACT after the VACUUM, so a vacuum that removed a live file fails HERE rather than in some later
         # run. See the section header in that suite for what it bounds (data files) and what it does not
         # (the log, which engineered-wood never cleans and which this makes grow slightly FASTER).
+        # 1779 since 2026-08-09: verify_read_write_same_catalog 68 -> 101 for the mssql_mars=false
+        # self-deadlock precheck (section 7). Its two POSITIVE CONTROLS are the load-bearing half — an
+        # UNTOUCHED table still reads (so the refusal is precise, not blanket) and the same shape works with
+        # MARS on (so nothing is broken in the shipped default). Mutation-tested: disabling RecordTouch kills
+        # it at the refusal assertion. That section also SETs a finite mssql_command_timeout on purpose --
+        # a regression there does not fail, it HANGS unbounded, which would stall this tier instead of
+        # failing it; the mutant run confirmed the timeout converts it into a loud error.
         # 1746 since 2026-08-08 (same day, second pass): verify_read_write_same_catalog 36 -> 68 for the
         # mssql_materialize opt-out — the streaming pooled+SNAPSHOT path (§5) and the per-catalog ATTACH
         # option (§6, whose second catalog is the control proving the option is not process-global).
@@ -299,7 +306,7 @@ case "$TIER" in
         # the gap is EXACTLY the new suite and every pre-existing suite kept its own count — which is the
         # behaviour-preservation evidence for the scan-materialisation change (FabricatorCatalog::
         # MaterializeOwnScans + ScanSpec.Materialize) that landed with it. Raised in the same commit.
-        : "${MIN_ASSERTIONS:=1746}"
+        : "${MIN_ASSERTIONS:=1779}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2
