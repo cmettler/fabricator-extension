@@ -665,17 +665,41 @@ a property of the `materialize=false` opt-out** (an earlier version of this sect
 was wrong: a plain `SELECT` is never marked by `MaterializeOwnScans`, so the opt-out does not apply to it at
 all).
 
-| configuration | scan runs on | the read's ISOLATION | streams | read-your-writes | consistent across statements | scans may OVERLAP |
-|---|---|---|---|---|---|---|
-| MARS on, ordinary scan — **the box default** | pinned | the pinned txn's ⇒ **server default** (READ COMMITTED on box) | ✅ | ✅ | ❌ | ❌ |
-| same-catalog read+write, `materialize=true` — **the default** | pinned, buffered | the pinned txn's ⇒ **SNAPSHOT on Fabric/Synapse-serverless**, server default on box | ❌ | ✅ | ❌ | ❌ |
-| same-catalog read+write, `materialize=false` | pooled | **SNAPSHOT**, set per scan | ✅ | ❌ | ❌ | ✅ |
-| MARS off, ordinary scan — **Fabric / Synapse** | pooled | the engine default (snapshot on Fabric) | ✅ | ❌ | ❌ | ✅ |
-| `read_isolation 'snapshot'`, MARS on — **OPT-IN** (§5.8) | pinned | **SNAPSHOT**, transaction-scoped | ✅ | ✅ | **✅** | ❌ |
-| `read_isolation 'snapshot'`, MARS off — **OPT-IN** (§5.8) | pinned, buffered + serialized | **SNAPSHOT**, transaction-scoped | ❌ | ✅ | **✅** | ❌ |
+One column per property named above, so the table answers the three questions separately. On the two
+CONSISTENCY columns every cell carries **M** = measured or **d** = derived from the routing and NOT measured —
+kept distinct because this section has been wrong twice by reasoning where it could have measured.
 
-**⚠ "PINNED @ SNAPSHOT" IS NOW SELECTABLE — rows 5 and 6, via the §5.8 opt-in. The paragraph below described
-the state BEFORE it and is kept because it is still true of every DEFAULT configuration** — read row 2.
+| # | configuration | scan runs on | the read's ISOLATION | streams | read-your-writes | consistent WITHIN one statement | consistent ACROSS statements | scans may OVERLAP |
+|---|---|---|---|---|---|---|---|---|
+| 1 | **no pin yet** — autocommit, or a txn that has not written. **The commonest read there is** | pooled | server default, per statement (READ COMMITTED on box) | ✅ | — (nothing written) | ❌ **M** | ❌ **M** | ✅ **M** |
+| 2 | MARS on, ordinary scan, txn HAS written — **the box default from then on** | pinned | the pinned txn's ⇒ **server default** (READ COMMITTED on box) | ✅ | ✅ | ❌ **M** | ❌ **M** | ❌ |
+| 3 | same-catalog read+write, `materialize=true` — **the default** | pinned, buffered | the pinned txn's ⇒ **SNAPSHOT on Fabric/Synapse-serverless**, server default on box | ❌ | ✅ | ❌ **d** | ❌ **d** | ❌ |
+| 4 | same-catalog read+write, `materialize=false` | pooled | **SNAPSHOT**, set per scan | ✅ | ❌ | ❌ **d** | ❌ **d** | ✅ |
+| 5 | MARS off, ordinary scan — **Fabric / Synapse** | pooled | the engine default (snapshot on Fabric) | ✅ | ❌ | ❌ **d** | ❌ **M** | ✅ |
+| 6 | `read_isolation 'snapshot'`, MARS on — **OPT-IN** (§5.8) | pinned | **SNAPSHOT**, transaction-scoped | ✅ | ✅ | **✅ M** | **✅ M** | ❌ |
+| 7 | `read_isolation 'snapshot'`, MARS off — **OPT-IN** (§5.8) | pinned, buffered + serialized | **SNAPSHOT**, transaction-scoped | ❌ | ✅ | **✅ M** | **✅ M** | ❌ |
+
+**⚠ ROW 1 WAS MISSING FROM THIS TABLE UNTIL 2026-08-09, and it is the row most reads actually take.** The pin
+is created lazily by the first WRITE, so a plain `SELECT` — in autocommit or in a transaction that has not
+written yet — has no pinned connection to reuse and goes POOLED. The old row 2 was written as if "MARS on"
+were sufficient for a pinned scan; MARS decides whether an EXISTING pin may be reused, not whether one
+exists. Measured directly: the §5.7 statement logged `pooled txn=2` for both its scans in a read-only
+transaction, and `pinned txn=2` only once an INSERT had run first.
+
+**⚠ The WITHIN-one-statement column is ❌ for every default row, and rows 1 and 2 are measured that way — 6/6
+divergence, three pooled and three pinned** (§5.7). Pinning does not buy it: MARS gives the scans one SESSION
+while each stays its own server STATEMENT, and READ COMMITTED is scoped to the statement. Rows 3–5 are marked
+**d**: same mechanism, not separately measured. ⚠ Row 4 is worth stating explicitly because the word
+"snapshot" appears in it — each scan sets its OWN `SET TRANSACTION ISOLATION LEVEL SNAPSHOT` on its OWN pooled
+connection, so every read is correctly isolated and they still take different snapshots.
+
+**⚠ Rows 6 and 7 are ✅ WITHIN a statement in AUTOCOMMIT too**, which was not designed: DuckDB's autocommit
+carries an implicit transaction with a nonzero id, so the opt-in pins there as well and every scan of the
+statement lands in one transaction-scoped snapshot (§5.7, 3/3). That is the one route to intra-statement
+consistency on box that does not require a DBA to enable RCSI.
+
+**⚠ "PINNED @ SNAPSHOT" IS NOW SELECTABLE — rows 6 and 7, via the §5.8 opt-in. The paragraph below described
+the state BEFORE it and is kept because it is still true of every DEFAULT configuration** — read row 3.
 `ServerProfile.DefaultWriteIsolation` is `"snapshot"` for Fabric / Synapse-serverless and EMPTY everywhere
 else, so a pinned scan inherits transaction-scoped snapshot isolation on those engines and the server default
 (READ COMMITTED on box, READ UNCOMMITTED on Synapse-dedicated) on the rest. Nothing chooses it: the ATTACH
@@ -684,10 +708,17 @@ at all.**
 
 **⚠ THE LAST COLUMN INVERTS THE INTUITION, and it is the reason to have the table.** MARS is *interleaved*
 execution, not parallel — only one request runs on a session at a time (§5) — so the pinned configurations
-put every scan of a statement through ONE server session. The configurations usually described as degraded
-(no MARS, or the `materialize=false` opt-out) give each scan its **own connection**, and are therefore the
-only ones where two tables can be read simultaneously. Same shape as the 595 finding: *MARS is not what
-saves us there either.*
+put every scan of a statement through ONE server session. The configurations that give each scan its **own
+connection**, and are therefore the only ones where two tables are read simultaneously, are row 1 (no pin —
+the DEFAULT for a plain `SELECT`) plus the two usually described as degraded (no MARS, and the
+`materialize=false` opt-out). Same shape as the 595 finding: *MARS is not what saves us there either.*
+
+**⚠ And the last two columns are in TENSION with it, which is the trade the table exists to show.** Every row
+that can read two tables simultaneously is ❌ on both consistency columns, and every row that is ✅ on them
+serialises the scans — because both properties come from the same mechanism, putting the scans in ONE
+transaction. Row 7 is the extreme: no MARS means the reads are drained *and* serialized, so consistency costs
+both the streaming and the overlap. There is no row that is ✅ everywhere and, on these engines, there cannot
+be one.
 
 **Read that column as a CEILING, not a promise.** It says our routing PERMITS overlap; whether two scans
 actually overlap is DuckDB's plan's decision — a hash join drains its build side before the probe side opens,
@@ -695,11 +726,15 @@ and `PhysicalUnion::BuildPipelines` may run branches sequentially. Orthogonal an
 never internally parallel, because our table function declares `MaxThreads() { return 1; }` (one Arrow C
 stream is consumed serially).
 
-**No DEFAULT configuration is ✅ for consistency across statements** — the last two rows are the opt-in
-(§5.8), unset unless you ask for it; see §5.2 for the measurements and §5.4 for what it costs. **And ⚠ no column is ✅ for INTRA-statement consistency on box either**
-(§5.7, measured): pinning does not buy it, because MARS gives the scans one SESSION while each remains its
-own server STATEMENT, and READ COMMITTED is scoped to the statement. Database-level **RCSI is what buys it**
-— 6/6 trials — and it is a database option, not something this extension selects.
+**NO DEFAULT CONFIGURATION IS ✅ FOR EITHER CONSISTENCY COLUMN** — rows 1–5 are what you get without asking,
+and every one of them is ❌ twice over. Only the opt-in rows 6 and 7 are ✅, and they are unset unless you ask
+(§5.8); see §5.2 and §5.7 for the measurements and §5.4 for the cost.
+
+**Two independent ways out of the WITHIN-a-statement ❌, and they are owned by different people.**
+Database-level **RCSI** fixes it (6/6 trials, both routings) and is a DBA action this extension cannot take;
+the **`read_isolation` opt-in** fixes it too (3/3) and needs no database change, at the price in §5.8. Neither
+is a default. ⚠ And RCSI's guarantee is per scan-START instant rather than per statement, so a plan that
+starts its scans at different times reopens the gap — the opt-in's transaction-scoped snapshot does not.
 
 ### 5.7 Intra-statement consistency — MEASURED 2026-08-09, and it is absent by default
 
@@ -783,6 +818,13 @@ analytical DuckDB transaction would impose a server cost it cannot impose today,
 
 The writer's own count is the control: it reported 5 while the transaction kept reading 4, so "both agree" is
 not an inserter that quietly failed. Both reads log `pinned txn=2` where they logged `pooled` before.
+
+**Measured on BOTH MARS states, because they take different routes** (streaming on the pinned connection vs
+drained + serialized) and only one of them had numbers at first. With `mssql_mars='false'`: across statements
+**3 → 3** while the writer took the table to 4; within one statement **3/3 identical** over the two-concurrent-
+scan shape, the counts advancing exactly 5000 per trial (150000 → 160000, total 165000 afterwards) so every
+writer is proven to have committed. That is what earns the **M** on both opt-in rows of §5.6's matrix — before
+these runs, row 7's cells were derived from row 6's and the matrix said otherwise.
 
 **What it changes, in the order it matters.**
 
