@@ -248,10 +248,14 @@ Two plausible fixes are MEASURED WRONG, and both are the obvious guesses:
 walk over the physical plan in `PlanInsert`/`PlanCreateTableAs` marks every fabricator scan whose table
 belongs to THIS catalog; the mark rides `spec_json` as `"materialize":true` (**no ABI bump** — that field is
 free-form), and `SqlServerBackend` drains the reader and **disposes** it before returning the stream.
-- **The DISPOSE is the load-bearing part, not the buffering.** `DbDataReaderArrowStream` closes its reader
-  only in `Dispose()`, and the scan releases its Arrow stream in the global state's DESTRUCTOR (query
-  teardown, not pipeline end) — so a merely-blocking operator would leave a drained-but-OPEN reader, which
-  SQL Server still counts as outstanding. Worth knowing before anyone "optimises" this into a plan operator.
+- **The DISPOSE is the load-bearing part, not the buffering.** `DbDataReaderArrowStream` used to close its
+  reader only in `Dispose()`, while the scan releases its Arrow stream in the global state's DESTRUCTOR
+  (query teardown, not pipeline end) — so a merely-blocking operator would have left a drained-but-OPEN
+  reader, which SQL Server still counts as outstanding.
+  - **⚠ SUPERSEDED 2026-08-09 — the stream now releases at END OF RESULT SET** (§5.3), so a drained scan
+    stops being outstanding at once. That does NOT change this fix: here the scan and the bulk are
+    PIPELINED, so the reader is open *while* the bulk consumes it and no eager close can help. What it does
+    change is the deferred design below — a blocking operator is now sufficient on its own.
 - **Both payoffs from one change**: box stops failing, and because a drained scan leaves no outstanding
   reader, it may use the PINNED connection even without MARS ⇒ **read-your-writes RESTORED on Fabric**
   (measured: the self-copy now sees the transaction's own row — final **8**, `selfcopy 4`, where before it
@@ -271,7 +275,10 @@ free-form), and `SqlServerBackend` drains the reader and **disposes** it before 
   buffer), so this is parity, not a shortcut — but it converts a hard failure at scale into a memory cost
   at scale, and the ceiling is unmeasured. The better design, deliberately deferred, is a
   `ColumnDataCollection`-backed operator (which DuckDB would spill) **plus** an eager close-on-exhaustion —
-  the operator alone is not sufficient, per the DISPOSE note above.
+  the operator alone was not sufficient, per the DISPOSE note above.
+  - **⚠ THE SECOND HALF IS NOW BUILT (2026-08-09, §5.3), so the operator IS sufficient on its own and this
+    stops being a two-part change.** That materially re-prices it: the memory ceiling flagged as unmeasured
+    here would be replaced by DuckDB's own spilling, and nothing else is blocking.
 - Gate: `test/verify_read_write_same_catalog.test` (**68**, service tier) — autocommit and in-transaction at
   30k, read-your-writes, and a small-table control whose absence would let the others pass by self-insert
   simply having stopped working.
@@ -434,7 +441,9 @@ inserter:
   value with `ServerProfile.DefaultWriteIsolation` as the FALLBACK, so the ATTACH option overrides the profile.
 - **(c) MARS on** — but only for a statement carrying **two or more concurrent scans** of the same catalog (a
   self-join). Two sequential `SELECT`s each drain and close their reader, so the plain repeat-read case does
-  not need it.
+  not need it. ⚠ **Weakened by §5.3**: a hash join drains its build side before the probe side opens, and the
+  reader is now released at that point, so the self-join no longer overlaps either — measured. Genuinely
+  concurrent scans (parallel branches) would still need MARS or materialisation.
 
 **⚠ It must be opt-in, and the cost is not the connection count.** A pinned read transaction holds a SQL
 Server connection **and an open transaction** for the whole DuckDB transaction's life — pool pressure under
@@ -444,6 +453,63 @@ long-running analytical DuckDB transaction would therefore impose a cost on the 
 ⚠ **On Fabric only (a) and (b) would be needed** — snapshot is its only level, so (c) is moot and the level is
 already right. But that rests on the transaction-scoped property flagged as UNKNOWN above: no one has observed
 it through our routing, because two reads cannot share a connection there today.
+
+### 5.3 The reader is released at END OF RESULT SET, not at query teardown (2026-08-09)
+
+`DbDataReaderArrowStream` closed its reader only in `Dispose()`, and the consumer releases the exported stream
+from the scan's global-state **destructor** — query teardown, not pipeline end. A fully-drained scan therefore
+held a SQL Server result set open for the rest of the statement. It now releases the reader, command and
+(owned) connection **the moment the result set ends**.
+
+Mechanically: the read loop distinguishes *"this batch is full"* from *"the result set ended"*, so EOF is
+detected on the **last data batch** rather than one pull later; `Release()` sits behind a `_released` flag and
+is called from both EOF points and from `Dispose()`.
+
+**⚠ Idempotency is now load-bearing rather than defensive.** Every drained scan releases **twice** — once
+eagerly, once when the consumer releases the exported stream — so the flag is what makes the ordinary path
+correct, not a guard against a rare double free. The whole service tier exercises it.
+
+**⚠ It is only sound because the batch owns its memory**, and that is the invariant to protect: two copies
+stand between a returned batch and reader-owned memory — `DbDataReader`'s indexer builds a fresh object per
+row (it is `GetValue`, never a reusable caller buffer; we use neither `GetBytes`/`GetChars` nor
+`SequentialAccess`), and every `ColumnAppender` copies into Arrow builder buffers. `Schema` is captured in the
+constructor. An appender that ALIASED the incoming object would turn this into a use-after-free.
+
+**Positive control** — the change is invisible from SQL, so `Release` logs `reader released (eof|dispose)` at
+Debug. On a self-join inside a write transaction the release now falls BETWEEN the two scans, where before
+both came at teardown:
+
+```
+query [pinned txn=8]: SELECT [id] FROM [dbo].[e1]     ← build side
+reader released (eof)
+query [pinned txn=8]: SELECT [id] FROM [dbo].[e1]     ← probe side
+reader released (eof)
+```
+
+⚠ The two bind-time `SELECT *` scans in the same log release with `(dispose)` — they read only the schema and
+never pull a batch, so they never reach EOF. That is the limitation demonstrating itself.
+
+**What it does and does not cover.**
+- **Covers** any scan the consumer drains — which includes a hash-join build side, so the multi-ref case of
+  §5.2(c) stops needing MARS. Measured beforehand, both routes work and both put the scans on the pinned
+  connection: MARS on with a self-join in a write transaction, and MARS **off** with a marked (materialised)
+  self-join. 50 000-row table, correct answer both times.
+- **Does NOT cover** a scan abandoned early — `LIMIT`, a short-circuiting join, the bind-time schema scan.
+  Those still hold the reader to teardown.
+- **Does NOT supersede the materialise fix for error 595.** There the scan feeds the bulk row by row, so the
+  reader is open *while* the bulk runs by construction and no eager close is possible.
+
+**Two consequences worth acting on.**
+1. **It unblocks the `ColumnDataCollection` operator** (§5.1's deferred design), whose stated blocker was
+   exactly the missing eager close. That would replace today's unbounded in-memory materialisation with
+   DuckDB's own spilling.
+2. **It brings this class in line with `DaxArrowStream`.** The old loop returned a partial batch without
+   setting `_done`, so the next pull read **past EOF**. Harmless on `SqlDataReader`, which is idempotent
+   there — but `docs/dax-provider.md` records that exact call throwing on ADOMD, which is why DAX has its own
+   stream class. Both now stop at the first `false`.
+
+Gate: service tier **46/46 — 1746, identical to the pre-change counts**, which is the behaviour-preservation
+claim; plus the positive control above. C#-only, no ABI change.
 
 ### Contrast: the native `mssql-extension` (TDS sibling) does NOT use MARS
 

@@ -682,10 +682,14 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   - Fix: `FabricatorCatalog::MaterializeOwnScans` walks the physical plan in `PlanInsert`/`PlanCreateTableAs`
     and marks fabricator scans whose table belongs to THIS catalog; the mark rides `spec_json` as
     `"materialize":true` (free-form ⇒ no ABI bump); `SqlServerBackend` drains **and disposes** the reader.
-    - **⚠ THE DISPOSE IS LOAD-BEARING, NOT THE BUFFERING** — `DbDataReaderArrowStream` closes its reader only
+    - **⚠ THE DISPOSE IS LOAD-BEARING, NOT THE BUFFERING** — `DbDataReaderArrowStream` closed its reader only
       in `Dispose()`, and the scan releases its Arrow stream in the global state's DESTRUCTOR (query
       teardown, not pipeline end), so a merely-BLOCKING plan operator would leave a drained-but-OPEN reader,
-      which SQL Server still counts as outstanding. Know this before "optimising" it into an operator.
+      which SQL Server still counts as outstanding.
+      - **⚠ SUPERSEDED 2026-08-09 — THE STREAM NOW RELEASES AT END OF RESULT SET** (see the eager-close entry
+        below). **This fix is unaffected**: here the scan and the bulk are PIPELINED, so the reader is open
+        *while* the bulk consumes it and no eager close can reach it. What changed is the deferred design —
+        a blocking operator is now sufficient ON ITS OWN.
     - **Both payoffs from one change**: box stops failing AND, since a drained scan leaves no outstanding
       reader, it may use the PINNED connection without MARS ⇒ **read-your-writes RESTORED on Fabric**
       (measured 8 / `selfcopy 4`, was 7 / 3).
@@ -700,8 +704,10 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
     spills — both just tell the client library to buffer), but it trades a hard failure at scale for a
     memory cost at scale, and the ceiling is UNMEASURED. Better design, deliberately deferred: a
     `ColumnDataCollection`-backed operator (DuckDB would spill) **plus** eager close-on-exhaustion — the
-    operator alone is insufficient per the DISPOSE note.
-  - Gate `test/verify_read_write_same_catalog.test` (**36**, service tier); the small-table control is
+    operator alone was insufficient per the DISPOSE note. **⚠ THE SECOND HALF IS BUILT (2026-08-09), so the
+    operator IS now sufficient on its own** and this is a one-part change that would swap the unbounded
+    in-memory buffer for DuckDB's spilling. Re-priced, not merely still-open.
+  - Gate `test/verify_read_write_same_catalog.test` (**68**, service tier); the small-table control is
     load-bearing — without it the others could pass by self-insert having stopped working entirely.
 - **`delta.checkpointInterval` WAS ACCEPTED, STORED AND IGNORED — FIXED 2026-08-08 (one EW patch).**
   MEASURED: `CREATE TABLE … WITH ("delta.checkpointInterval" = '25')` writes the value into the v0 `metaData`
@@ -1115,6 +1121,31 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
       flush on the buffered path; it should start behaving like autocommit.
     - ⚠ Sweep the other bare `DeltaWriter.Options()` opens in `DeltaReader` for the same question — the
       grep is ~30 sites and this one was found by accident, not by looking.
+  - **THE SQL READER NOW RELEASES AT END OF RESULT SET — DONE 2026-08-09 (C#-only, no ABI). This is the
+    "eager-close entry" the read+write item points at.** `DbDataReaderArrowStream` closed its reader only in
+    `Dispose()`, while the consumer releases the exported stream from the scan's global-state DESTRUCTOR —
+    query teardown, not pipeline end — so a fully-drained scan held a SQL Server result set open for the rest
+    of the statement. It now releases reader/command/(owned) connection the moment the result set ends. Full
+    record: [docs/transactions.md](docs/transactions.md) §5.3.
+    - The read loop now distinguishes "this batch is full" from "the result set ended", so EOF is caught on
+      the LAST DATA BATCH rather than one pull later; `Release()` sits behind a `_released` flag.
+    - **⚠ IDEMPOTENCY IS LOAD-BEARING, NOT DEFENSIVE** — every drained scan now releases TWICE (eagerly, then
+      when the consumer releases the exported stream), so the flag makes the ORDINARY path correct. The whole
+      service tier is the test.
+    - **⚠ SOUND ONLY BECAUSE THE BATCH OWNS ITS MEMORY**, which is the invariant to protect: the
+      `DbDataReader` indexer builds a fresh object per row (`GetValue`, never a reusable caller buffer — we
+      use neither `GetBytes`/`GetChars` nor `SequentialAccess`) and every `ColumnAppender` copies into Arrow
+      builder buffers. An appender gaining a zero-copy path would make this a use-after-free.
+    - **⚠ IT DOES NOT COVER AN EARLY-ABANDONED SCAN** (`LIMIT`, a short-circuiting join, the bind-time schema
+      scan — which is visible in the log releasing at `dispose`), and **does NOT supersede the materialise fix
+      for 595**, where the scan feeds the bulk row by row so the reader is open by construction.
+    - **It BRINGS THIS CLASS IN LINE WITH `DaxArrowStream`**, and that is a bug avoided rather than a
+      tidiness win: the old loop returned a partial batch without setting `_done`, so the next pull read PAST
+      EOF. Idempotent on `SqlDataReader`; `docs/dax-provider.md` records months lost to that exact call
+      THROWING on ADOMD, which is why DAX has its own stream class.
+    - Gate: service **46/46 — 1746, identical to pre-change** ⇒ behaviour-preserving, plus a Debug
+      `reader released (eof|dispose)` line as the positive control (the change is otherwise invisible from
+      SQL — on a self-join the release now falls BETWEEN the two scans).
   - Other paths the audit must cover, not only `Materialize`: `pending.Batches` (the buffered park),
     `BulkSession`'s bounded channel (already streaming — confirm, do not assume), the CDF capture,
     `DeltaWriter.Write`'s batch list, `ArrowDataReader`, and the collector/in-out sessions. The

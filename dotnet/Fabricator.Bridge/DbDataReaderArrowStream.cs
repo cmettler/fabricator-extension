@@ -3,6 +3,7 @@ using Apache.Arrow;
 using Apache.Arrow.Ipc;
 using Apache.Arrow.Types;
 using Fabricator.Bridge.Conversion;
+using Microsoft.Extensions.Logging;
 
 namespace Fabricator.Bridge;
 
@@ -29,6 +30,9 @@ public sealed class DbDataReaderArrowStream : IArrowArrayStream
     private readonly InterruptScope? _interrupt;
     private readonly CancellationToken _token;
     private bool _done;
+    private bool _released;
+
+    private static readonly ILogger Log = FabricatorLog.CreateLogger("Fabricator.Sql");
 
     public DbDataReaderArrowStream(DbConnection connection, DbCommand command, DbDataReader reader,
                                    int batchSize = 2048, bool ownsConnection = true,
@@ -72,11 +76,17 @@ public sealed class DbDataReaderArrowStream : IArrowArrayStream
         }
 
         int rows = 0;
+        bool exhausted = false;
         // ReadAsync honors the interrupt token — a blocking network packet fetch cancels on Ctrl+C/timeout.
         // For a provider without true async (e.g. ADOMD) DbDataReader.ReadAsync falls back to a synchronous
         // read, so this is safe everywhere; for buffered rows it completes synchronously (no overhead spike).
-        while (rows < _batchSize && await _reader.ReadAsync(_token).ConfigureAwait(false))
+        while (rows < _batchSize)
         {
+            if (!await _reader.ReadAsync(_token).ConfigureAwait(false))
+            {
+                exhausted = true; // the RESULT SET ended — distinguishable from "this batch is full"
+                break;
+            }
             for (int i = 0; i < appenders.Length; i++)
             {
                 var value = _reader[i];
@@ -95,6 +105,7 @@ public sealed class DbDataReaderArrowStream : IArrowArrayStream
         if (rows == 0)
         {
             _done = true;
+            Release("eof");
             return null;
         }
 
@@ -103,11 +114,55 @@ public sealed class DbDataReaderArrowStream : IArrowArrayStream
         {
             arrays[i] = appenders[i].Build();
         }
-        return new RecordBatch(Schema, arrays, rows);
+        var batch = new RecordBatch(Schema, arrays, rows);
+        if (exhausted)
+        {
+            // ⚠ RELEASING HERE IS ONLY SOUND BECAUSE THE BATCH OWNS ITS OWN MEMORY, and that is the
+            // invariant to protect if ColumnAppender ever gains a zero-copy path. Two copies stand between
+            // this batch and reader-owned memory: DbDataReader's indexer builds a FRESH object per row (it
+            // is GetValue, never a reusable caller buffer — we use neither GetBytes/GetChars nor
+            // SequentialAccess), and every appender copies into Arrow builder buffers (binary goes through
+            // Append(ReadOnlySpan<byte>)). `Schema` is likewise captured in the constructor, so it outlives
+            // the reader too. An appender that ALIASED the incoming object would make this a use-after-free.
+            _done = true;
+            Release("eof");
+        }
+        return batch;
     }
 
-    public void Dispose()
+    /// <summary>
+    /// Releases the reader/command/connection. Called at END OF RESULT SET as well as from
+    /// <see cref="Dispose"/>, so a drained scan stops holding a SQL Server result set open for the rest of
+    /// the query.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>Why eagerly:</b> the consumer releases this stream from the scan's global-state DESTRUCTOR,
+    /// i.e. at query teardown rather than at pipeline end. A fully-drained reader therefore stayed OPEN for
+    /// the rest of the statement, and SQL Server counts that as an outstanding result set — which is what
+    /// forces MARS (or materialisation) for a statement that scans one catalog table twice, since the
+    /// hash-join build side is drained long before the probe side opens its reader. See
+    /// docs/transactions.md §5.1/§5.2.</para>
+    /// <para><b>⚠ Idempotency is load-bearing, not defensive.</b> After this change EVERY drained scan
+    /// releases twice — once here, once when the consumer releases the exported stream — so the flag is what
+    /// makes the ordinary path correct, not merely what tolerates a rare double free.</para>
+    /// <para><b>⚠ What this does NOT fix:</b> a scan the consumer abandons early (LIMIT, a short-circuiting
+    /// join) never reaches end of result set, so its reader still lives to teardown. And it cannot help the
+    /// bulk-insert collision (error 595), where the scan feeds the bulk row by row and the reader must stay
+    /// open by construction — that one needs materialisation.</para>
+    /// </remarks>
+    private void Release(string why)
     {
+        if (_released)
+        {
+            return;
+        }
+        _released = true;
+        // The ONLY way to observe this from outside: whether a drained reader is released at end of result
+        // set or at query teardown is invisible from SQL. `why` is what makes the eager path falsifiable.
+        if (Log.IsEnabled(LogLevel.Debug))
+        {
+            Log.LogDebug("reader released ({Why})", why);
+        }
         _reader.Dispose();
         _command.Dispose();
         // A borrowed (pinned-transaction) connection is owned by the catalog.
@@ -118,4 +173,6 @@ public sealed class DbDataReaderArrowStream : IArrowArrayStream
         // Stop the interrupt poller before the ClientContext it polls is freed.
         _interrupt?.Dispose();
     }
+
+    public void Dispose() => Release("dispose");
 }
