@@ -1,0 +1,261 @@
+# name: test/verify_read_isolation.test
+# description: the mssql_read_isolation OPT-IN — routing reads INTO the DuckDB transaction so statements share one view
+# group: [fabricator]
+
+require fabricator
+
+require-env MSSQL_TESTDB_DSN
+
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+# WHAT THIS PINS
+#
+# `read_isolation '<level>'` (ATTACH) / `SET mssql_read_isolation` is OPT-IN and unset by default.
+# Set, an ordinary scan inside a DuckDB transaction runs on that transaction's PINNED connection,
+# which is opened at that level — so successive statements share one view. Unset, every read takes a
+# pooled connection and shares nothing (docs/known-limitations.md 1.16, measured).
+#
+# ⚠ THE HEADLINE PROPERTY CANNOT BE ASSERTED HERE, and saying so is the point: proving "two reads
+# return the same answer while another session commits between them" needs a CONCURRENT writer, and
+# sqllogictest drives its connections SEQUENTIALLY. That measurement is in transactions.md §5.2/§5.7
+# (control 3 -> 4 with the option off; 4 -> 4 with it on, while the writer committed a fifth row).
+#
+# What IS deterministic here is the ROUTING, and there is a sharp observable for it: with MARS OFF,
+# reading a table this transaction has already written is REFUSED (limitation 1.15 — the pooled read
+# would wait forever on locks only this transaction can release). It stops being refused exactly when
+# the read joins the transaction's own connection. So §3 asserts the read SUCCEEDS and §2 asserts the
+# identical shape is REFUSED without the option — a positive control, without which §3 would pass
+# equally if the refusal had simply stopped working.
+
+statement ok
+SET mssql_mars='false';
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS plain (TYPE fabricator);
+
+statement ok
+CREATE OR REPLACE TABLE plain.dbo.rdiso_t AS
+    SELECT * FROM (VALUES (1, 'a'), (2, 'b'), (3, 'c')) t(id, tag);
+
+# ⚠ ATTACHED AFTER THE CREATE, DELIBERATELY, and the other order made this suite ALTERNATE pass/fail.
+# `iso` and `plain` are two attaches of ONE database, each with its own catalog cache: a table created
+# through `plain` is invisible to a cache `iso` populated before it existed. A failing run never
+# reached its DROP, so the next run's ATTACH-time discovery DID find the leftover table and passed —
+# fail, pass, fail, pass. Ordinary documented cache behaviour (fabricator_refresh_cache exists for
+# it), but it made the suite depend on its own previous outcome.
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS iso (TYPE fabricator, read_isolation 'snapshot');
+
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+# §1 the option is validated at ATTACH, not at first use
+#
+# A typo must fail the statement that NAMES the option. Deferring it to the first SELECT inside a
+# transaction reports the error against a statement that mentions nothing about isolation.
+
+statement error
+ATTACH '${MSSQL_TESTDB_DSN}' AS bad (TYPE fabricator, read_isolation 'nonsense');
+----
+unknown isolation level
+
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+# §2 POSITIVE CONTROL — without the option, MARS off, the read of a self-written table is REFUSED
+#
+# This is the assertion that makes §3 mean something. If it ever stops failing, §3's success no longer
+# demonstrates that the read joined the transaction.
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO plain.dbo.rdiso_t VALUES (10, 'x');
+
+statement error
+SELECT count(*) FROM plain.dbo.rdiso_t;
+----
+cannot read
+
+statement ok
+ROLLBACK;
+
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+# §3 with the option, the SAME shape works — the read is on the transaction's own connection
+#
+# It also proves read-your-writes survives: 3 committed rows + 1 uncommitted = 4.
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO iso.dbo.rdiso_t VALUES (11, 'x');
+
+query I
+SELECT count(*) FROM iso.dbo.rdiso_t;
+----
+4
+
+statement ok
+ROLLBACK;
+
+# ROLLBACK really undid it — the pinned read transaction is a real SQL Server transaction, not a
+# routing trick.
+query I
+SELECT count(*) FROM iso.dbo.rdiso_t;
+----
+3
+
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+# §4 COMMIT persists through the same path
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO iso.dbo.rdiso_t VALUES (12, 'x');
+
+statement ok
+COMMIT;
+
+query I
+SELECT count(*) FROM iso.dbo.rdiso_t;
+----
+4
+
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+# §5 the SET overrides the per-catalog ATTACH option, same precedence as every other knob here
+#
+# `plain` was attached WITHOUT the option, so this can only be the SET taking effect — and MARS is
+# still off, so the refusal of §2 is what it has to overcome.
+
+statement ok
+SET mssql_read_isolation='snapshot';
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO plain.dbo.rdiso_t VALUES (13, 'x');
+
+query I
+SELECT count(*) FROM plain.dbo.rdiso_t;
+----
+5
+
+statement ok
+ROLLBACK;
+
+statement ok
+RESET mssql_read_isolation;
+
+# ⚠ RESET does not fire set-callbacks (documented, docs/settings-architecture.md), so restore the
+# empty value explicitly — otherwise §6 would run with the opt-in still in force and its refusal
+# would fire for the wrong reason.
+statement ok
+SET mssql_read_isolation='';
+
+# The refusal is back once the option is gone: RESET/SET '' really turned it off, rather than the
+# option having been irrelevant all along.
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO plain.dbo.rdiso_t VALUES (14, 'x');
+
+statement error
+SELECT count(*) FROM plain.dbo.rdiso_t;
+----
+cannot read
+
+statement ok
+ROLLBACK;
+
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+# §6 the contradiction with mssql_materialize=false is REFUSED, not silently resolved
+#
+# Both are ACTIVE requests pointing opposite ways: materialize=false keeps the same-catalog read+write
+# scan STREAMING on a POOLED connection outside the transaction; read_isolation puts every read INSIDE
+# it. Honouring either silently would give the statement a view nobody asked for.
+
+statement ok
+SET mssql_materialize=false;
+
+statement ok
+SET mssql_read_isolation='snapshot';
+
+statement ok
+BEGIN;
+
+statement error
+INSERT INTO iso.dbo.rdiso_t SELECT id + 100, tag FROM iso.dbo.rdiso_t;
+----
+contradict each other
+
+statement ok
+ROLLBACK;
+
+statement ok
+SET mssql_materialize=true;
+
+statement ok
+SET mssql_read_isolation='';
+
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+# §7 AUTOCOMMIT ALSO PINS — and an earlier version of this section claimed the opposite
+#
+# ⚠ It read "there is no transaction to be stable across, so the option must not pin anything". FALSE,
+# and the assertion below could not tell: DuckDB's autocommit still carries an implicit transaction with
+# a NONZERO id, so `pinned txn=6` is what the log shows for a bare SELECT under the opt-in.
+#
+# That is not a defect — it is the second property the opt-in buys. All of a statement's scans then sit
+# in ONE transaction-scoped snapshot, which is limitation 1.17 (a single statement reporting two states
+# of one table) fixed WITHOUT RCSI: measured 3/3 identical where the same shape diverges 6/6 without the
+# option (transactions.md §5.7). The cost is a BEGIN/COMMIT round trip per autocommit statement.
+#
+# What this section can assert deterministically is that the autocommit pin path works at all — with
+# MARS off, so it exercises the drain-and-serialize route rather than the MARS one.
+
+statement ok
+SET mssql_read_isolation='snapshot';
+
+query I
+SELECT count(*) FROM iso.dbo.rdiso_t;
+----
+4
+
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+# §8 TWO CONCURRENT SCANS in one statement, MARS off — the Fabric shape, and the only section that
+#     exercises the drain
+#
+# The pinned connection admits exactly ONE open reader without MARS, and two scalar subqueries over
+# one table start in the SAME MILLISECOND (measured — transactions.md §5.7). So routing both onto that
+# connection while STREAMING would collide with "there is already an open DataReader"; the opt-in
+# drains instead. That is the trade it makes on a no-MARS engine: transaction-scoped consistency and
+# streaming multi-ref reads are mutually exclusive there, and it picks consistency.
+#
+# ⚠ THE TWO SUBQUERIES MUST PROJECT DIFFERENT COLUMNS. Over the same projection, DuckDB's
+# common-subplan optimizer dedups them into ONE scan and the section silently stops testing anything.
+
+statement ok
+SET mssql_read_isolation='snapshot';
+
+statement ok
+BEGIN;
+
+query II
+SELECT (SELECT count(id) FROM iso.dbo.rdiso_t) AS by_id,
+       (SELECT count(tag) FROM iso.dbo.rdiso_t) AS by_tag;
+----
+4	4
+
+statement ok
+COMMIT;
+
+statement ok
+SET mssql_read_isolation='';
+
+statement ok
+DROP TABLE plain.dbo.rdiso_t;
+
+statement ok
+DETACH plain;
+
+statement ok
+DETACH iso;

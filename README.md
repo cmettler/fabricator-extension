@@ -426,8 +426,21 @@ on box **and** on Fabric — no setting changes it. On box SQL Server without `R
 a *single statement* is not a boundary: a statement referencing one table twice can report two different
 states of it, and one scan can return part of a concurrent transaction's rows. Enabling database-level
 `READ_COMMITTED_SNAPSHOT` fixes the single-statement case (Fabric / Synapse-serverless are already
-snapshot-isolated); for a stable view across statements, materialise once into DuckDB
-(`CREATE TEMP TABLE … AS SELECT`). Details and measurements:
+snapshot-isolated). For a stable view **across** statements — and for the single-statement case too, if you
+cannot change the database — there is an opt-in:
+
+```sql
+-- every read inside a transaction joins it, at SNAPSHOT — so the two SELECTs agree
+SET mssql_read_isolation = 'snapshot';
+BEGIN;
+SELECT count(*) FROM mssql.dbo.people;   -- another session commits an insert here …
+SELECT count(*) FROM mssql.dbo.people;   -- … and this still returns the same count
+COMMIT;
+```
+
+It is off by default because it holds a connection and an open transaction for the whole DuckDB
+transaction's life (and on Fabric/Synapse it buffers reads instead of streaming them). The alternative is
+to materialise once into DuckDB (`CREATE TEMP TABLE … AS SELECT`). Details and measurements:
 [known-limitations.md](docs/known-limitations.md) 1.16–1.17.
 
 ## INSERT / UPDATE / DELETE
@@ -1326,6 +1339,7 @@ setting (see [Partitioning & write tuning](#partitioning--write-tuning)).
 | `mssql_ctas_text_type` | **Active** | Whole-type override for text columns on CREATE/CTAS/COPY (e.g. `'VARCHAR(64)'`); wins over the collation choice + length |
 | `mssql_exec_invalidate_cache` | **Active** | Auto-invalidate the catalog cache after DDL run via `fabricator_exec` (default `false`) |
 | `mssql_isolation_level` | **Active** | SQL transaction isolation level for table-in-out (`fn_each`) calls; overrides the ATTACH `isolation_level` per session (empty ⇒ provider default) |
+| `mssql_read_isolation` | **Active** | **Opt-in, unset by default.** Isolation level for READS inside a DuckDB transaction: routes ordinary scans onto that transaction's own connection, opened at this level, so successive statements share **one view** (without it two identical `SELECT`s can differ — see [known-limitations.md](docs/known-limitations.md) 1.16). Use `'snapshot'`: it is the only level that delivers it (`'repeatable read'` still permits the phantoms a `count(*)` sees, `'serializable'` works by blocking writers), and on box it needs `ALLOW_SNAPSHOT_ISOLATION`. **Costs** a held connection + open transaction for the transaction's life, and on a no-MARS engine (Fabric/Synapse) reads are buffered instead of streamed. Overrides the per-catalog `read_isolation` ATTACH option |
 | `mssql_insert_batch_size`, `mssql_insert_max_rows_per_statement`, `mssql_insert_max_sql_bytes`, `mssql_insert_use_returning_output` | Accepted | Registered with defaults + `>= 1` validation; no-op (INSERT streams via SqlBulkCopy) |
 | `mssql_connection_*`, `mssql_*_timeout`, `mssql_min_connections`, `mssql_connection_cache` | Accepted | No-op (SqlClient pools by connection string) |
 | `mssql_order_pushdown` | Accepted | No-op — TopN is pushed automatically when safe (always-on, not gated) |

@@ -663,6 +663,70 @@ current code still uses the single-provider `fabricator` naming):
 ## Next up (open threads for future sessions)
 
 In-flight / planned refactors (all C#-only unless noted; tests stay green per slice):
+- **CROSS-STATEMENT READ STABILITY — BUILT 2026-08-09 as an OPT-IN (`mssql_read_isolation` / the
+  `read_isolation` ATTACH option; C#-only, no ABI). Full record: [docs/transactions.md](docs/transactions.md)
+  §5.8.** `BEGIN; SELECT count(*) FROM t; SELECT count(*) FROM t; COMMIT;` used to return DIFFERENT answers
+  under a concurrent committer with **no setting that changed it**. MEASURED: unset **3 → 4**, `'snapshot'`
+  **4 → 4** while the writer committed a fifth row (its own count is the control).
+  - **⚠ OPT-IN IS A REQUIREMENT, NOT A DEFAULT POSITION (user, explicit).** It holds a connection AND an open
+    transaction for the DuckDB transaction's life — pool pressure under `dbt --threads N` — plus a tempdb
+    version store growing for that duration under SNAPSHOT. Never inferred, never on by observation.
+  - **⚠ IT DELIBERATELY DID NOT REUSE `isolation_level`.** That option exists and today scopes table-in-out
+    sessions only, so widening it would have switched this on for everyone who had ever set it — inferring the
+    cost above from an unrelated past request.
+  - **(a) A READ now creates the pin** (`EnsureTxnConnection`, factored out of `BeginWrite`). That was the
+    whole problem: on Fabric a pinned transaction at transaction-scoped SNAPSHOT already existed on every
+    write transaction and delivered nothing, because ordinary reads never routed onto it.
+  - **(b) ONE resolver picks the level** (`ResolveTxnIsolation`), used by the read pin AND `BeginWrite`. With
+    two, the level would depend on whether a READ or a WRITE touched the catalog first — opened once by
+    whichever came first, silently keeping that level.
+  - **(c) ⚠ ON A NO-MARS ENGINE, DRAINING IS NOT ENOUGH — found by measurement, not design.** Two scalar
+    subqueries over one table start in the **same millisecond on two threads**, so the second `ExecuteReader`
+    lands while the first is still draining: *"The connection does not support MultipleActiveResultSets"*. It
+    needs a per-transaction `ExecGate` serializing execute+drain as well. So on Fabric/Synapse the opt-in
+    trades streaming multi-ref reads for consistency — they are mutually exclusive there.
+  - **⚠ EXEMPTING A CHECK MUST BE PAID FOR BY GUARANTEEING THE CONDITION IT CHECKED FOR.** The opt-in makes
+    the §5.5 MARS-off precheck stand down (a read on the transaction's own connection cannot wait on that
+    transaction's locks), so the routing sets `pinned` DIRECTLY instead of going through the `materialize`
+    gate below it — routed that way, a later change to that gate would send the scan POOLED with the check
+    already disabled, which is limitation 1.15's **unbounded hang**, not an error. It is also now a FOURTH
+    remedy in 1.15's message, by a different mechanism than the other three: it does not make the pooled read
+    safe, it stops the read being pooled.
+  - **⚠ THE PROBE IS GATED ON THE OPT-IN, NOT ON THE LEVEL.** `DefaultWriteIsolation` is `"snapshot"` on
+    Fabric/Synapse-serverless, so checking `ALLOW_SNAPSHOT_ISOLATION` whenever the level is Snapshot would add
+    a round trip to EVERY write transaction on the one engine where snapshot is the only level there is.
+  - Refusals, both because the alternative is a silently wrong view: a bad level fails the **ATTACH** (not the
+    first `SELECT`, by which point the failing statement mentions nothing about isolation), and
+    `mssql_materialize=false` + `mssql_read_isolation` is refused as contradictory.
+  - **⚠ STILL UNKNOWN and unchanged: whether Fabric's transaction-scoped snapshot delivers through our
+    routing.** The opt-in puts two reads on one Fabric connection for the first time, so the experiment is
+    finally expressible — it has NOT been run. Do not read the box measurement as covering Fabric.
+  - Gate `test/verify_read_isolation.test` (**47**, service tier), mutation-tested with three mutants each
+    killed at its own section. ⚠ **The headline property is NOT in it** — proving it needs a concurrent writer
+    and sqllogictest drives connections sequentially; what it pins is the ROUTING, via the sharp observable
+    that with MARS off a self-written table is unreadable unless the read joined the transaction. The third
+    mutant (drop the `ExecGate`) survives **40 assertions** before the concurrent-scan section catches it.
+  - ⚠ **The suite ALTERNATED pass/fail before its ATTACH order was fixed**, and the cause is worth knowing
+    generally: two attaches of ONE database each keep their own catalog cache, so a table created through the
+    first is invisible to a cache the second populated earlier. A failing run never reached its `DROP`, so the
+    next run's discovery found the leftover table and passed.
+- **A SINGLE STATEMENT IS NOT A READ-CONSISTENCY BOUNDARY EITHER, on box without RCSI — MEASURED 2026-08-09,
+  12 trials. Full record: [docs/transactions.md](docs/transactions.md) §5.7; limitation 1.17.** One statement
+  referencing a table twice reported **150000 and 155000**, and a single scan returned a FRACTION of one
+  committed transaction (**2036 / 2376 / 3770** of 5000 rows).
+  - **⚠ PINNING DOES NOT BUY IT, and I recorded the opposite from ONE run before repeating.** The first pinned
+    trial came back consistent; three trials then diverged 3/3. MARS is interleaved-serial, so the scans share
+    one SESSION while each stays its own server STATEMENT, and READ COMMITTED is scoped to the statement.
+  - **⚠ IT IS NOT THE `materialize=false` OPT-OUT** — a plain `SELECT` is never marked by
+    `MaterializeOwnScans` (called only from `PlanInsert`/`PlanCreateTableAs`), so this is the DEFAULT
+    configuration; §5.6 had framed the question that way and was wrong.
+  - **RCSI fixes it 6/6, both routings**, including a 12.4 s scan that ignored a commit landing 2.7 s into it.
+    A DATABASE option — nothing here selects it, and `materialize=false` demands the OTHER prerequisite.
+  - Method, reusable: the two subqueries must project **different columns** or the common-subplan optimizer
+    dedups them into one scan and the measurement is vacuous; a **self-join cannot show it** (a hash join
+    drains its build side before the probe opens — no held window); and the ASYMMETRIC projection is what
+    creates the window at all (154 ms vs 12.4 s), because equal scans start in the same millisecond.
+  - No gate: it is the database's behaviour, not ours, and sqllogictest runs connections sequentially.
 - **READ+WRITE OF ONE CATALOG IN ONE STATEMENT FAILED ON BOX AT SCALE — FIXED 2026-08-08 (C++ + C#, NO ABI
   bump). `INSERT INTO t SELECT … FROM t` raised `595: Bulk Insert with another outstanding result set
   should be run with XACT_ABORT on`.** Full record: [docs/transactions.md](docs/transactions.md) §5.1.

@@ -386,10 +386,11 @@ session commits an insert in between. Measured on three configurations:
    *versioned* (a snapshot per statement) rather than transaction-wide. The second row above is the proof:
    both reads on one connection inside one `SqlTransaction`, and the phantom still appeared.
 
-**There is no knob.** `BeginWrite` opens the pinned transaction at `ServerProfile.DefaultWriteIsolation`;
-the `isolation_level` ATTACH option and `SET mssql_isolation_level` are read **only** by `InOutBind`, i.e.
-they govern table-in-out (`fn_each`) sessions. The names invite the wrong reading — the README scopes them
-correctly in both places, so this is a naming trap rather than a documentation error.
+**There was no knob; since 2026-08-09 there is an OPT-IN one — `mssql_read_isolation` / the `read_isolation`
+ATTACH option (§5.8). The table above is what you get with it UNSET, which is the default.** Note the
+`isolation_level` ATTACH option and `SET mssql_isolation_level` are a DIFFERENT knob and still govern
+table-in-out (`fn_each`) sessions only; the names invite the wrong reading, which is exactly why the new
+option did not reuse them.
 
 ⚠ **UNKNOWN, and do not assume it: whether pinning the reads would be sufficient on Fabric.** SQL Server's
 SNAPSHOT isolation is documented as transaction-scoped (snapshot taken at first data access, held for the
@@ -398,11 +399,13 @@ connection on Fabric** (MARS off, and only a MARKED scan carries the `materializ
 property is unexercised and untested through our surface. An earlier draft of this section asserted it as
 fact; it is not. If "pin the reads too" is ever built, measuring this is part of the work.
 
-**What to do instead:** materialise once into DuckDB (`CREATE TEMP TABLE … AS SELECT`) and read that. DuckDB's
-MVCC covers DuckDB-native storage; an attached catalog is a passthrough, so cross-statement read stability is
-whatever the remote engine's isolation gives — never more.
+**What to do instead:** set `mssql_read_isolation='snapshot'` (§5.8, opt-in — it holds a connection and an
+open transaction for the DuckDB transaction's life), or materialise once into DuckDB
+(`CREATE TEMP TABLE … AS SELECT`) and read that. DuckDB's MVCC covers DuckDB-native storage; an attached
+catalog is a passthrough, so cross-statement read stability is whatever the remote engine's isolation gives —
+never more.
 
-#### What it WOULD take on box — designed, NOT built (2026-08-09)
+#### What it takes on box — the analysis the opt-in was built from (2026-08-09)
 
 Which isolation level actually delivers it, measured directly in T-SQL on the docker box
 (`ALLOW_SNAPSHOT_ISOLATION` on, RCSI **off**), one script per level, same 9 s window and same concurrent
@@ -437,7 +440,8 @@ inserter:
    ⚠ The blocking is inferred from a controlled contrast, not timed: under the identical delay READ COMMITTED
    and REPEATABLE READ both let the insert land inside the window and SERIALIZABLE did not.
 
-**Three changes would be needed, and MARS is the least of them.**
+**Three changes were needed, and MARS was the least of them.** All three are in §5.8; the analysis is kept
+because two of its three conclusions were the reason the shipped shape looks as it does.
 
 - **(a) Reads must PIN.** This is the substantive one: `TxnState` is created by `BeginWrite`, so a read-only
   transaction has no server-side transaction for an isolation level to apply to. The state would have to be
@@ -667,8 +671,11 @@ all).
 | same-catalog read+write, `materialize=true` — **the default** | pinned, buffered | the pinned txn's ⇒ **SNAPSHOT on Fabric/Synapse-serverless**, server default on box | ❌ | ✅ | ❌ | ❌ |
 | same-catalog read+write, `materialize=false` | pooled | **SNAPSHOT**, set per scan | ✅ | ❌ | ❌ | ✅ |
 | MARS off, ordinary scan — **Fabric / Synapse** | pooled | the engine default (snapshot on Fabric) | ✅ | ❌ | ❌ | ✅ |
+| `read_isolation 'snapshot'`, MARS on — **OPT-IN** (§5.8) | pinned | **SNAPSHOT**, transaction-scoped | ✅ | ✅ | **✅** | ❌ |
+| `read_isolation 'snapshot'`, MARS off — **OPT-IN** (§5.8) | pinned, buffered + serialized | **SNAPSHOT**, transaction-scoped | ❌ | ✅ | **✅** | ❌ |
 
-**⚠ THERE IS NO SELECTABLE "PINNED @ SNAPSHOT" MODE, but the combination is not absent either** — read row 2.
+**⚠ "PINNED @ SNAPSHOT" IS NOW SELECTABLE — rows 5 and 6, via the §5.8 opt-in. The paragraph below described
+the state BEFORE it and is kept because it is still true of every DEFAULT configuration** — read row 2.
 `ServerProfile.DefaultWriteIsolation` is `"snapshot"` for Fabric / Synapse-serverless and EMPTY everywhere
 else, so a pinned scan inherits transaction-scoped snapshot isolation on those engines and the server default
 (READ COMMITTED on box, READ UNCOMMITTED on Synapse-dedicated) on the rest. Nothing chooses it: the ATTACH
@@ -688,8 +695,8 @@ and `PhysicalUnion::BuildPipelines` may run branches sequentially. Orthogonal an
 never internally parallel, because our table function declares `MaxThreads() { return 1; }` (one Arrow C
 stream is consumed serially).
 
-**No column is ✅ for consistency across statements**, in any configuration — see §5.2 for the measurements
-and §5.4 for what it would cost. **And ⚠ no column is ✅ for INTRA-statement consistency on box either**
+**No DEFAULT configuration is ✅ for consistency across statements** — the last two rows are the opt-in
+(§5.8), unset unless you ask for it; see §5.2 for the measurements and §5.4 for what it costs. **And ⚠ no column is ✅ for INTRA-statement consistency on box either**
 (§5.7, measured): pinning does not buy it, because MARS gives the scans one SESSION while each remains its
 own server STATEMENT, and READ COMMITTED is scoped to the statement. Database-level **RCSI is what buys it**
 — 6/6 trials — and it is a database option, not something this extension selects.
@@ -746,9 +753,90 @@ counts advancing exactly 5000 per trial (185000 → 210000, table total 215000 a
 statement returned the pre-insert value** — otherwise "both agree" would be indistinguishable from an
 inserter that silently died, which is the failure this repo has already paid for twice.
 
+**⚠ THE §5.8 OPT-IN ALSO FIXES THIS, and without RCSI — measured 3/3 after the fact.** It was built for
+CROSS-statement stability, and this fell out of it: DuckDB's autocommit still carries an implicit transaction
+with a nonzero id, so `mssql_read_isolation='snapshot'` pins there too and all of a statement's scans land in
+ONE transaction-scoped snapshot. Same shape, same concurrent writer, RCSI **off**: `150000 150000` /
+`155000 155000` / `160000 160000`, the counts advancing exactly 5000 per trial (final total 165000) so every
+writer is proven to have committed. Compare 6/6 divergence without it. The cost is a BEGIN/COMMIT round trip
+per autocommit statement — so RCSI remains the cheaper answer where a DBA can set it, and this is the answer
+where they cannot.
+
 **Scope.** Fabric / Synapse-serverless are not exposed the same way: they are snapshot-isolated by
 construction, so a statement's scans read versioned data with no database option to set. This is a box
 SQL Server (and Azure SQL without RCSI) property.
+
+### 5.8 `mssql_read_isolation` — cross-statement read stability, OPT-IN (BUILT 2026-08-09)
+
+`SET mssql_read_isolation='<level>'`, or per catalog `ATTACH … (TYPE fabricator, read_isolation '<level>')`.
+**Unset by default, and that is a requirement rather than a starting position** — it holds a SQL Server
+connection AND an open transaction for the whole DuckDB transaction's life (pool pressure under
+`dbt --threads N`), and under `SNAPSHOT` a tempdb version store that grows for that duration. A long
+analytical DuckDB transaction would impose a server cost it cannot impose today, so it is never inferred.
+
+**MEASURED, same harness as §5.2, with a verified concurrent writer committing between the two reads:**
+
+| `read_isolation` | first → second read | the writer |
+|---|---|---|
+| unset (default) | 3 → **4** | committed |
+| `'snapshot'` | 4 → **4** | committed a fifth row — and the second read still said 4 |
+
+The writer's own count is the control: it reported 5 while the transaction kept reading 4, so "both agree" is
+not an inserter that quietly failed. Both reads log `pinned txn=2` where they logged `pooled` before.
+
+**What it changes, in the order it matters.**
+
+- **(a) A READ now creates the pin.** `EnsureTxnConnection` is factored out of `BeginWrite` and called from
+  `ExecuteQuery` too, so a transaction that has not written still has a server-side transaction for a level to
+  apply to. This was the whole problem: on Fabric the ingredients (a pinned transaction at transaction-scoped
+  SNAPSHOT) already existed and delivered nothing, because ordinary reads never routed onto them.
+- **(b) ONE resolver picks the level** (`ResolveTxnIsolation`), used by the read pin and `BeginWrite` alike.
+  ⚠ With two, the level would depend on whether a READ or a WRITE touched the catalog first — the transaction
+  is opened once, by whichever came first, and silently keeps that level. Fallback stays
+  `ServerProfile.DefaultWriteIsolation`, so Fabric is unchanged when the option is unset.
+- **(c) On a no-MARS engine the reads are DRAINED and SERIALIZED.** Both halves are required and the second
+  was found by measurement, not design: draining bounds how long a reader is open, but two scalar subqueries
+  over one table start in the **same millisecond on two threads**, so the second `ExecuteReader` lands while
+  the first is still draining — `The connection does not support MultipleActiveResultSets`. A per-transaction
+  `ExecGate` serializes execute+drain. So on Fabric/Synapse the opt-in trades streaming multi-ref reads for
+  consistency; they are mutually exclusive there.
+
+**⚠ Exempting a check must be paid for by guaranteeing the condition it checked for.** The opt-in makes
+`EnsureScanCannotSelfBlock` (§5.5) stand down, because a read on the transaction's own connection cannot wait
+on that transaction's locks. That is only true if the read really is pinned — so the routing sets `pinned`
+DIRECTLY rather than going through the `materialize` gate three lines below it. Routed the other way, any
+future change to that gate would send the scan POOLED with the check already disabled, which is limitation
+1.15's **unbounded hang**, not an error. This also makes the opt-in a fourth remedy in 1.15's message.
+
+**Refusals, both because the alternative is a silently wrong view.** A bad level fails the ATTACH, not the
+first `SELECT` inside a transaction (by then the failing statement mentions nothing about isolation). And
+`mssql_materialize=false` + `mssql_read_isolation` is refused: the first asks for a scan OUTSIDE the
+transaction on a pooled connection, the second for every read INSIDE it — honouring either silently gives the
+statement a view nobody asked for.
+
+**⚠ `'snapshot'` is the level to ask for, and the two obvious alternatives are measured wrong** (§5.4):
+`REPEATABLE READ` still permits the phantom a `count(*)` sees (3 → 4), and `SERIALIZABLE` works by BLOCKING
+writers. On box `'snapshot'` needs `ALLOW_SNAPSHOT_ISOLATION`; we probe and name the `ALTER` — but ONLY when
+the level came from this option, never when it came from the profile, or every Fabric write transaction would
+gain a round trip on the one engine where snapshot is the only level there is.
+
+**⚠ IT PINS IN AUTOCOMMIT TOO, which was NOT designed and is the better half of the deal.** DuckDB's
+autocommit carries an implicit transaction with a nonzero id, so a bare `SELECT` under the opt-in logs
+`pinned txn=6`. Consequence, measured after the fact: every scan of one statement lands in ONE
+transaction-scoped snapshot, so **§5.7's intra-statement inconsistency is fixed as well, without RCSI** (3/3
+identical where the same shape diverges 6/6). Cost: a BEGIN/COMMIT round trip per autocommit statement.
+⚠ A first version of the gate asserted the opposite ("autocommit must not pin"), and its assertion could not
+tell the difference — only the Debug log could.
+
+**⚠ STILL UNKNOWN, unchanged by this work: whether Fabric's transaction-scoped snapshot delivers through our
+routing.** The opt-in now puts two reads on one Fabric connection for the first time, so the experiment is
+finally expressible — it has not been run. Do not report the box measurement as covering Fabric.
+
+Gate: `test/verify_read_isolation.test` (47, service tier). ⚠ The headline property is NOT in it — proving it
+needs a concurrent writer and sqllogictest drives connections sequentially. What the suite pins is the
+ROUTING, through a sharp observable: with MARS off, reading a self-written table is refused unless the read
+joined the transaction. Mutation-tested with three mutants, each killed at its own section; the third (drop
+the `ExecGate`) survives **40 assertions** before the concurrent-scan section catches it.
 
 ### Contrast: the native `mssql-extension` (TDS sibling) does NOT use MARS
 

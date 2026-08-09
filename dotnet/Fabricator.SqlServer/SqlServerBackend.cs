@@ -49,6 +49,17 @@ public sealed class SqlServerBackend : IBackend
                      "fine); overrides the per-catalog command_timeout ATTACH option", 0L, 0),
                 Str("mssql_ctas_text_type"),
                 Str("mssql_isolation_level", "fabricator: SQL transaction isolation level for table-in-out sessions"),
+                // OPT-IN, and it must stay that way: it holds a SQL Server connection AND an open transaction
+                // for the whole DuckDB transaction's life (pool pressure under dbt --threads N, and under
+                // SNAPSHOT a tempdb version store that grows for that duration). Never infer it.
+                Str("mssql_read_isolation",
+                    "fabricator: OPT-IN, unset by default. SQL isolation level for READS inside a DuckDB " +
+                    "transaction: routes ordinary scans onto that transaction's pinned connection, opened at " +
+                    "this level, so successive statements share ONE view. Use 'snapshot' — it is the only " +
+                    "level that delivers it ('repeatable read' still permits the phantoms a count(*) sees, " +
+                    "and 'serializable' works by blocking writers); on box it needs ALLOW_SNAPSHOT_ISOLATION. " +
+                    "Unset = reads take a pooled connection and share no view. Overrides the per-catalog " +
+                    "read_isolation ATTACH option"),
                 Str("mssql_mars", "fabricator: MARS mode — auto (default, per engine) | true | false"),
                 // BOOLEAN, not the auto|true|false tri-state mssql_mars uses, and deliberately: there is no
                 // per-engine variation to express here. The default is always "materialise the scans the
@@ -556,6 +567,12 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     // (schema_filter already gates functions by schema on the C++ side).
     private readonly Regex? _functionFilter;
     private readonly string _isolationLevel = "";
+    // ATTACH option `read_isolation '<level>'` (unset = OFF = the shipped behaviour). Set, it makes ordinary
+    // scans inside a DuckDB transaction run on that transaction's pinned connection, which is then opened at
+    // this level — the opt-in for cross-statement read stability. ⚠ DISTINCT from _isolationLevel above, which
+    // scopes table-in-out sessions only; reusing that one would have switched this on for anyone who had ever
+    // set it, and the cost (a held connection + open transaction for the transaction's life) must be asked for.
+    private readonly string _readIsolation = "";
     // ATTACH option `materialize true|false` (default true). See ResolveMaterialize; a SET mssql_materialize
     // overrides it per session, the same precedence as isolation_level and command_timeout.
     private readonly bool? _materialize;
@@ -659,6 +676,12 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
                     case "table_filter": _tableFilter = CompileFilter("table_filter", val); break;
                     case "function_filter": _functionFilter = CompileFilter("function_filter", val); break;
                     case "isolation_level": _isolationLevel = val; break;
+                    // Validated HERE so a typo fails the ATTACH, not the first SELECT inside a transaction —
+                    // by then the statement that fails is not the one that named the option.
+                    case "read_isolation":
+                        ParseIsolationLevel(val);
+                        _readIsolation = val;
+                        break;
                     case "materialize":
                         _materialize = !(string.Equals(val, "false", StringComparison.OrdinalIgnoreCase) || val == "0");
                         break;
@@ -916,6 +939,14 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         /// because it is blocked waiting for the scan. Guarded by the lock on this instance, like the rest.
         /// </summary>
         public readonly Dictionary<string, bool> Touched = new(System.StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>
+        /// Serializes execute+drain on <see cref="Connection"/> for the no-MARS <c>mssql_read_isolation</c>
+        /// path, where several of a statement's scans share this one connection and it admits a single reader.
+        /// ⚠ A SEPARATE object from the instance lock ON PURPOSE: it is held for a whole query, and the
+        /// instance lock guards short field reads that must not queue behind one.
+        /// </summary>
+        public readonly object ExecGate = new();
     }
 
     /// <summary>Records that the ambient transaction has written <paramref name="tableName"/>, so a later
@@ -1030,30 +1061,53 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         }
         if (txnId != 0)
         {
-            var state = _txns.GetOrAdd(txnId, _ => new TxnState());
-            // One thread at a time touches a given transaction (DuckDB serializes a transaction's
-            // statements), so locking the single state is enough; distinct transactions use distinct states.
+            var state = EnsureTxnConnection(txnId);
             lock (state)
             {
-                if (state.Connection is null)
-                {
-                    var conn = OpenConnection();
-                    conn.Open();
-                    // Warehouse engines run the write transaction at SNAPSHOT (Fabric's only isolation
-                    // level); box SQL Server keeps the connection/server default (Unspecified). Profile is
-                    // already detected (OpenConnection ran EnsureProfile).
-                    var level = ParseIsolationLevel(_profile!.DefaultWriteIsolation);
-                    state.Connection = conn;
-                    state.Transaction = level == IsolationLevel.Unspecified
-                        ? conn.BeginTransaction()
-                        : conn.BeginTransaction(level);
-                }
-                return (state.Connection, state.Transaction, false);
+                return (state.Connection!, state.Transaction, false);
             }
         }
         var connection = OpenConnection();
         connection.Open();
         return (connection, null, true);
+    }
+
+    // Opens (once) the connection + provider transaction pinned to DuckDB transaction `txnId`, at the level
+    // ResolveTxnIsolation picks, and returns the state with a non-null Connection.
+    //
+    // ⚠ Called from TWO places now — the first WRITE (BeginWrite) and, under the mssql_read_isolation opt-in,
+    // the first READ. That is the substantive half of the opt-in: before it, a read-only transaction had no
+    // server-side transaction at all, so there was nothing for an isolation level to apply to and no amount of
+    // level-setting could have given cross-statement stability.
+    private TxnState EnsureTxnConnection(long txnId)
+    {
+        var state = _txns.GetOrAdd(txnId, _ => new TxnState());
+        // One thread at a time touches a given transaction (DuckDB serializes a transaction's statements), so
+        // locking the single state is enough; distinct transactions use distinct states.
+        lock (state)
+        {
+            if (state.Connection is null)
+            {
+                var conn = OpenConnection();
+                conn.Open();
+                var level = ResolveTxnIsolation();
+                // ⚠ Probe ONLY when the level came from the OPT-IN, never when it came from the profile.
+                // ServerProfile.DefaultWriteIsolation is "snapshot" on Fabric/Synapse-serverless, so an
+                // unconditional check would add a round trip to EVERY write transaction on the engines where
+                // snapshot is the only level there is — and could fail on a surface that does not expose the
+                // DMV. Fabric needs no probe: it cannot be turned off there.
+                if (level == IsolationLevel.Snapshot && !string.IsNullOrEmpty(ResolveReadIsolation()))
+                {
+                    // Msg 3952 otherwise, which names the ALTER but not which of our options asked for it.
+                    EnsureSnapshotIsolationAllowed(conn, "mssql_read_isolation='snapshot'");
+                }
+                state.Connection = conn;
+                state.Transaction = level == IsolationLevel.Unspecified
+                    ? conn.BeginTransaction()
+                    : conn.BeginTransaction(level);
+            }
+            return state;
+        }
     }
 
     /// <summary>
@@ -1234,6 +1288,28 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         return set ?? _materialize ?? true;
     }
 
+    // SET mssql_read_isolation wins if set, else this catalog's `read_isolation` ATTACH option, else "" (OFF).
+    // "" is the shipped behaviour: reads do not join the transaction. See ResolveTxnIsolation.
+    internal string ResolveReadIsolation()
+    {
+        var set = ProviderSettingsStore.Instance.GetString(SqlServerBackend.ProviderName, "mssql_read_isolation");
+        return string.IsNullOrEmpty(set) ? _readIsolation : set;
+    }
+
+    // The level the DuckDB transaction's pinned SqlTransaction is opened at.
+    //
+    // ⚠ ONE resolver, used by BOTH BeginWrite and the read pin, and that is the point: with two, the level
+    // would depend on whether a READ or a WRITE touched the catalog first — the transaction is opened once, by
+    // whichever came first, and silently keeps that level. A transaction whose isolation depends on statement
+    // order is the kind of thing that is only ever discovered in production.
+    private IsolationLevel ResolveTxnIsolation()
+    {
+        var read = ResolveReadIsolation();
+        // Profile is already detected (OpenConnection runs EnsureProfile). Warehouse engines report
+        // "snapshot" (Fabric's only level); box reports empty => Unspecified => connection/server default.
+        return ParseIsolationLevel(string.IsNullOrEmpty(read) ? _profile!.DefaultWriteIsolation : read);
+    }
+
     // -1 unknown, 0 disallowed, 1 allowed. Cached per catalog: the answer is a database property, and the
     // check costs a round trip we only ever pay on the opt-in mssql_materialize=false path.
     private int _snapshotIsolationAllowed = -1;
@@ -1242,7 +1318,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     // connection at SNAPSHOT isolation. That requires ALLOW_SNAPSHOT_ISOLATION on the database, and there is
     // no way to satisfy it from here — enabling it is an ALTER DATABASE with a tempdb version-store cost that
     // is the DBA's decision, not ours. So: fail with a message that names the setting AND the remedy.
-    private void EnsureSnapshotIsolationAllowed(SqlConnection connection)
+    private void EnsureSnapshotIsolationAllowed(SqlConnection connection, string? asker = null)
     {
         if (_snapshotIsolationAllowed < 0)
         {
@@ -1259,6 +1335,14 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
             var state = probe.ExecuteScalar();
             _snapshotIsolationAllowed = (state is byte b && b == 0) ? 0 : 1;
         }
+        if (_snapshotIsolationAllowed == 0 && asker is not null)
+        {
+            throw new InvalidOperationException(
+                $"fabricator: {asker} needs snapshot isolation, which is not enabled on this database. It " +
+                "opens this DuckDB transaction's SQL Server transaction at SNAPSHOT so every read inside it " +
+                "sees one consistent view. Either run ALTER DATABASE [<db>] SET ALLOW_SNAPSHOT_ISOLATION ON, " +
+                "or unset mssql_read_isolation (the default), in which case each read takes its own view.");
+        }
         if (_snapshotIsolationAllowed == 0)
         {
             throw new InvalidOperationException(
@@ -1267,6 +1351,34 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
                 "connection at SNAPSHOT isolation; without that the read would block on the write's locks " +
                 "indefinitely. Either run ALTER DATABASE [<db>] SET ALLOW_SNAPSHOT_ISOLATION ON, or leave " +
                 "mssql_materialize at its default (true), which buffers the scan instead and needs nothing.");
+        }
+    }
+
+    // The pinned-connection half of ExecuteQuery, extracted only so the no-MARS read_isolation path can wrap
+    // the WHOLE execute+drain in one lock (see TxnState.ExecGate). Behaviour is identical to the inline form
+    // it replaced.
+    private IArrowArrayStream RunPinned(SqlConnection pinned, SqlTransaction? pinnedTransaction, string sql,
+                                        IReadOnlyList<SqlParameter>? parameters, bool materialize,
+                                        InterruptScope? interrupt, System.Threading.CancellationToken token)
+    {
+        var pinnedCommand = pinned.CreateCommand();
+        pinnedCommand.CommandText = sql;
+        pinnedCommand.CommandType = CommandType.Text;
+        pinnedCommand.CommandTimeout = ResolveCommandTimeout();
+        pinnedCommand.Transaction = pinnedTransaction;
+        AddParameters(pinnedCommand, parameters);
+        try
+        {
+            var pinnedReader = pinnedCommand.ExecuteReaderAsync(token).GetAwaiter().GetResult();
+            IArrowArrayStream pinnedStream = new DbDataReaderArrowStream(
+                pinned, pinnedCommand, pinnedReader, ownsConnection: false, interrupt: interrupt);
+            return materialize ? DrainToMemory(pinnedStream) : pinnedStream;
+        }
+        catch
+        {
+            pinnedCommand.Dispose();
+            interrupt?.Dispose();
+            throw;
         }
     }
 
@@ -1304,7 +1416,61 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         SqlConnection? pinned = null;
         SqlTransaction? pinnedTransaction = null;
         long txnId = AmbientTransaction.Current;
-        if (txnId != 0 && _txns.TryGetValue(txnId, out var state))
+        // OPT-IN (mssql_read_isolation): CREATE the pin for a read, so a transaction that has not written
+        // still has a server-side transaction for the level to apply to. Without this the block below finds no
+        // state at all and the read goes pooled — which is why the level alone was never enough.
+        //
+        // ⚠ NOT for a snapshotRead scan: that is mssql_materialize=false explicitly asking for a POOLED read
+        // outside the transaction, the opposite request. Refused rather than silently resolved (below).
+        // ⚠ NOT in autocommit (txnId == 0): there is no transaction to be stable across.
+        if (snapshotRead && txnId != 0 && !string.IsNullOrEmpty(ResolveReadIsolation()))
+        {
+            // Both are ACTIVE requests and they contradict: one asks for every read to be inside the
+            // transaction, the other for this particular read to be outside it on a pooled connection. Honouring
+            // either silently would give the statement a view the user did not ask for, so refuse and let them
+            // pick. (mssql_materialize=false only ever marks a same-catalog read+write scan, so this cannot
+            // fire on an ordinary SELECT.)
+            throw new InvalidOperationException(
+                "fabricator: mssql_materialize=false and mssql_read_isolation contradict each other. The first " +
+                "keeps a scan of the table being written STREAMING on a POOLED connection outside this " +
+                "transaction; the second puts every read INSIDE it so they share one view. This scan cannot do " +
+                "both. Either unset mssql_read_isolation, or leave mssql_materialize at its default (true), " +
+                "which buffers that scan onto the transaction's own connection.");
+        }
+        // Non-null only on the no-MARS read_isolation path: serializes execute+drain on the shared pinned
+        // connection (see below). Never taken on the default path, so ordinary routing is unaffected.
+        object? execGate = null;
+        bool readIsolationPin = txnId != 0 && !snapshotRead && !string.IsNullOrEmpty(ResolveReadIsolation());
+        if (readIsolationPin)
+        {
+            var opted = EnsureTxnConnection(txnId);
+            lock (opted)
+            {
+                // ⚠ SET DIRECTLY rather than left to the gate below, and that is not style. Routing it
+                // through `materialize` would couple this to a condition three lines away: if that gate ever
+                // stopped admitting the read, the scan would go POOLED while EnsureScanCannotSelfBlock had
+                // already exempted it — and a pooled read against this transaction's own uncommitted writes
+                // with MARS off is the UNBOUNDED HANG of limitation 1.15, not an error. Exempting a check
+                // must be paid for by guaranteeing the condition it checked for.
+                pinned = opted.Connection;
+                pinnedTransaction = opted.Transaction;
+            }
+            if (!_marsEnabled)
+            {
+                // With MARS off the pinned connection admits ONE reader at a time, so BOTH halves are needed
+                // and draining alone is NOT enough — measured: two scalar subqueries over one table start in
+                // the same millisecond on two threads, so the second ExecuteReader lands while the first is
+                // still draining ("The connection does not support MultipleActiveResultSets"). The drain
+                // bounds how long a reader is open; the gate stops two from being open at once.
+                //
+                // This is the cost the opt-in trades streaming for on a no-MARS engine (Fabric/Synapse):
+                // transaction-scoped consistency and streaming multi-ref reads are mutually exclusive there,
+                // and it picks consistency.
+                materialize = true;
+                execGate = opted.ExecGate;
+            }
+        }
+        if (!readIsolationPin && txnId != 0 && _txns.TryGetValue(txnId, out var state))
         {
             lock (state)
             {
@@ -1334,25 +1500,17 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         var token = interrupt?.Token ?? default;
         if (pinned is not null)
         {
-            var pinnedCommand = pinned.CreateCommand();
-            pinnedCommand.CommandText = sql;
-            pinnedCommand.CommandType = CommandType.Text;
-            pinnedCommand.CommandTimeout = ResolveCommandTimeout();
-            pinnedCommand.Transaction = pinnedTransaction;
-            AddParameters(pinnedCommand, parameters);
-            try
+            // execGate is non-null only on the no-MARS read_isolation path, where `materialize` is forced
+            // true — so the gate is released with the reader already drained and closed, never held across a
+            // stream the caller is still pulling from.
+            if (execGate is not null)
             {
-                var pinnedReader = pinnedCommand.ExecuteReaderAsync(token).GetAwaiter().GetResult();
-                IArrowArrayStream pinnedStream = new DbDataReaderArrowStream(
-                    pinned, pinnedCommand, pinnedReader, ownsConnection: false, interrupt: interrupt);
-                return materialize ? DrainToMemory(pinnedStream) : pinnedStream;
+                lock (execGate)
+                {
+                    return RunPinned(pinned, pinnedTransaction, sql, parameters, materialize, interrupt, token);
+                }
             }
-            catch
-            {
-                pinnedCommand.Dispose();
-                interrupt?.Dispose();
-                throw;
-            }
+            return RunPinned(pinned, pinnedTransaction, sql, parameters, materialize, interrupt, token);
         }
 
         SqlConnection? connection = null;
@@ -2303,6 +2461,14 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         {
             return; // materialise => pinned + drained; snapshotRead => pooled at SNAPSHOT. Neither blocks.
         }
+        if (!string.IsNullOrEmpty(ResolveReadIsolation()))
+        {
+            // The mssql_read_isolation opt-in routes this scan onto the transaction's OWN connection (and
+            // drains it, since MARS is off here), so it runs in the session that holds the locks and cannot
+            // wait on them. This precheck and the opt-in are alternative answers to the same hazard; leaving
+            // both armed would refuse a scan that now works.
+            return;
+        }
         long txnId = AmbientTransaction.Current;
         if (txnId == 0 || !_txns.TryGetValue(txnId, out var state))
         {
@@ -2335,6 +2501,11 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
             + "separate connection and wait forever for locks only this transaction can release. Remedies: "
             + "SET mssql_mars='auto' before ATTACH (the default on SQL Server, which lets the scan share the "
             + "transaction's connection)"
+            // The read_isolation opt-in is a remedy here too, and for a DIFFERENT reason than the others: it
+            // does not make the pooled read safe, it stops the read being pooled at all (the scan joins the
+            // transaction's own connection, drained). Offered last because it changes the transaction's
+            // isolation and holds a connection for its life — a bigger commitment than turning MARS back on.
+            + "; SET mssql_read_isolation='snapshot' (puts the read on this transaction's own connection)"
             + (schemaChanged
                 ? "; or COMMIT the schema change before reading the table."
                 : "; ALTER DATABASE <db> SET READ_COMMITTED_SNAPSHOT ON; or COMMIT before reading."));

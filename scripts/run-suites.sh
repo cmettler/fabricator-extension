@@ -252,7 +252,11 @@ case "$TIER" in
         # 46 RUNS since 2026-08-08: verify_read_write_same_catalog — INSERT INTO t SELECT ... FROM t, the
         # MARS outstanding-result-set collision (error 595). Service-only: it needs a real SQL Server, and
         # its seed size is load-bearing (the bug does not reproduce below ~30k rows).
-        : "${MIN_SUITES:=46}"
+        # 47 RUNS since 2026-08-09: verify_read_isolation — the mssql_read_isolation OPT-IN (reads join the
+        # DuckDB transaction, so successive statements share one view). Service-only: it needs a real SQL
+        # Server, and its load-bearing observable is a REFUSAL that only exists against one (with MARS off,
+        # a self-written table is unreadable unless the read joined the transaction).
+        : "${MIN_SUITES:=47}"
         # 1424 since 2026-08-01: verify_exec_invalidate_cache 10 -> 21, for the OUT-OF-BAND DROP path Ã¢ÂÂ the
         # catalog's self-heal, documented in CLAUDE.md and until now covered by NOTHING. The service tier ran
         # 44/44 green while that path was broken, which is why the section exists. It must run with
@@ -306,7 +310,10 @@ case "$TIER" in
         # the gap is EXACTLY the new suite and every pre-existing suite kept its own count — which is the
         # behaviour-preservation evidence for the scan-materialisation change (FabricatorCatalog::
         # MaterializeOwnScans + ScanSpec.Materialize) that landed with it. Raised in the same commit.
-        : "${MIN_ASSERTIONS:=1779}"
+        # 1826 since 2026-08-09: verify_read_isolation (+47). The tier went 46/1779 -> 47/1826, i.e. the gap
+        # is EXACTLY the new suite and every pre-existing suite kept its own count — the behaviour-preservation
+        # evidence that routing reads into the transaction changed nothing with the option UNSET (its default).
+        : "${MIN_ASSERTIONS:=1826}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2
