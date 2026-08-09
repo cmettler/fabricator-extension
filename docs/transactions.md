@@ -599,6 +599,34 @@ at the refusal assertion. ⚠ That section deliberately sets a finite `mssql_com
 here does not FAIL, it HANGS, which would stall the whole service tier instead of breaking it. The mutant run
 confirmed the timeout turns it into a loud error rather than a stall.
 
+### 5.6 What each configuration actually buys — the consolidated matrix
+
+| configuration | scan runs on | streams | read-your-writes | consistent across statements | scans may OVERLAP |
+|---|---|---|---|---|---|
+| MARS on, ordinary scan — **the box default** | pinned | ✅ | ✅ | ❌ | ❌ |
+| same-catalog read+write, `materialize=true` — **the default** | pinned, buffered | ❌ | ✅ | ❌ | ❌ |
+| same-catalog read+write, `materialize=false` | pooled @ SNAPSHOT | ✅ | ❌ | ❌ | ✅ |
+| MARS off, ordinary scan — **Fabric / Synapse** | pooled | ✅ | ❌ | ❌ | ✅ |
+
+**⚠ THE LAST COLUMN INVERTS THE INTUITION, and it is the reason to have the table.** MARS is *interleaved*
+execution, not parallel — only one request runs on a session at a time (§5) — so the pinned configurations
+put every scan of a statement through ONE server session. The configurations usually described as degraded
+(no MARS, or the `materialize=false` opt-out) give each scan its **own connection**, and are therefore the
+only ones where two tables can be read simultaneously. Same shape as the 595 finding: *MARS is not what
+saves us there either.*
+
+**Read that column as a CEILING, not a promise.** It says our routing PERMITS overlap; whether two scans
+actually overlap is DuckDB's plan's decision — a hash join drains its build side before the probe side opens,
+and `PhysicalUnion::BuildPipelines` may run branches sequentially. Orthogonal and fixed: a SINGLE scan is
+never internally parallel, because our table function declares `MaxThreads() { return 1; }` (one Arrow C
+stream is consumed serially).
+
+**No column is ✅ for consistency across statements**, in any configuration — see §5.2 for the measurements
+and §5.4 for what it would cost. And ⚠ under `materialize=false` even INTRA-statement consistency is
+questionable: each scan opens its own pooled connection and issues its own `SET TRANSACTION ISOLATION LEVEL
+SNAPSHOT`, so two scans take two snapshots at two instants. That follows from the routing and is **NOT
+measured** — establish it before relying on the opt-out for anything but throughput.
+
 ### Contrast: the native `mssql-extension` (TDS sibling) does NOT use MARS
 
 The compatibility-target sibling `mssql-extension` (`D:\repos\mssql-extension`, native C++ TDS, no
