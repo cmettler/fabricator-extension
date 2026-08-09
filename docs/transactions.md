@@ -633,6 +633,17 @@ SNAPSHOT; BEGIN TRAN; SELECT count(*) …` ⇒ 2; `INSERT`; the same `SELECT` �
 holds a transaction-scoped view of everything else AND still sees its own writes. Choosing transaction-scoped
 consistency costs you nothing in read-your-writes.
 
+**⚠ A READ-YOUR-WRITES FAILURE IS NOT SNAPSHOT'S WRITE-SKEW DRAWBACK — do not file it under "that is just
+what snapshot does".** The two look alike (an anti-join `INSERT … WHERE NOT EXISTS` duplicating rows) and have
+different causes. Missing a CONCURRENT transaction's committed rows is write skew: general to snapshot
+isolation, accepted everywhere, answered by a unique constraint or SERIALIZABLE, and nothing here makes it
+better or worse. Missing YOUR OWN rows is a MEMBERSHIP failure — the read ran in a different transaction —
+and no isolation level has that behaviour. Measured both ways: `SET TRANSACTION ISOLATION LEVEL SNAPSHOT`
+inside the writing transaction reads **2 then 3** across its own insert, while a pooled read beside a pinned
+writer returns **2** where the transaction had inserted a third row (**3** with MARS on, i.e. on the pinned
+connection). So a read outside the transaction is STRICTLY WEAKER than any isolation level: it sees neither
+its own writes nor concurrent commits.
+
 **⚠ Our system couples the first two, and that coupling is OURS.** Both require the scan to run on the pinned
 connection, so losing the pin loses both at once — which is why they read like one property in the matrix.
 They are not, and a fix addresses them at different depths: routing a read onto the pinned connection buys
