@@ -456,9 +456,20 @@ Server connection **and an open transaction** for the whole DuckDB transaction's
 `dbt --threads N`, and under `SNAPSHOT` a tempdb **version store that grows for that entire duration**. A
 long-running analytical DuckDB transaction would therefore impose a cost on the server that today it cannot.
 
-⚠ **On Fabric only (a) and (b) would be needed** — snapshot is its only level, so (c) is moot and the level is
-already right. But that rests on the transaction-scoped property flagged as UNKNOWN above: no one has observed
-it through our routing, because two reads cannot share a connection there today.
+⚠ **On Fabric the picture is different, and an earlier version of this line got it wrong in both directions.**
+It read *"only (a) and (b) would be needed — snapshot is its only level, so (c) is moot and the level is
+already right."* Corrected: **(b) is ALREADY SATISFIED** — `ServerProfile.DefaultWriteIsolation` opens the
+pinned transaction at `snapshot` there, so nothing needs wiring; and **(c) is NOT moot, it is UNAVAILABLE** —
+Fabric rejects MARS, so a statement with two concurrent scans could not put both on the pinned connection and
+would have to MATERIALISE them. On a no-MARS engine, transaction-scoped read consistency and streaming
+multi-ref reads are therefore **mutually exclusive**. So the missing piece on Fabric is (a) alone for the
+single-scan case, and (a) plus unconditional materialisation for the multi-scan one.
+
+⚠ **The ingredients already coexist there and still deliver nothing**, which is worth stating plainly: a
+pinned transaction at transaction-scoped SNAPSHOT exists on every Fabric write transaction, and ordinary
+reads simply never route onto it (only a MARKED scan does). That is what makes (a) the whole of the problem
+rather than one third of it. It still rests on the transaction-scoped property flagged as UNKNOWN above — no
+one has observed it through our routing, because two reads cannot share a connection there today.
 
 ### 5.3 The reader is released at END OF RESULT SET, not at query teardown (2026-08-09)
 
@@ -601,12 +612,19 @@ confirmed the timeout turns it into a loud error rather than a stall.
 
 ### 5.6 What each configuration actually buys — the consolidated matrix
 
-| configuration | scan runs on | streams | read-your-writes | consistent across statements | scans may OVERLAP |
-|---|---|---|---|---|---|
-| MARS on, ordinary scan — **the box default** | pinned | ✅ | ✅ | ❌ | ❌ |
-| same-catalog read+write, `materialize=true` — **the default** | pinned, buffered | ❌ | ✅ | ❌ | ❌ |
-| same-catalog read+write, `materialize=false` | pooled @ SNAPSHOT | ✅ | ❌ | ❌ | ✅ |
-| MARS off, ordinary scan — **Fabric / Synapse** | pooled | ✅ | ❌ | ❌ | ✅ |
+| configuration | scan runs on | the read's ISOLATION | streams | read-your-writes | consistent across statements | scans may OVERLAP |
+|---|---|---|---|---|---|---|
+| MARS on, ordinary scan — **the box default** | pinned | the pinned txn's ⇒ **server default** (READ COMMITTED on box) | ✅ | ✅ | ❌ | ❌ |
+| same-catalog read+write, `materialize=true` — **the default** | pinned, buffered | the pinned txn's ⇒ **SNAPSHOT on Fabric/Synapse-serverless**, server default on box | ❌ | ✅ | ❌ | ❌ |
+| same-catalog read+write, `materialize=false` | pooled | **SNAPSHOT**, set per scan | ✅ | ❌ | ❌ | ✅ |
+| MARS off, ordinary scan — **Fabric / Synapse** | pooled | the engine default (snapshot on Fabric) | ✅ | ❌ | ❌ | ✅ |
+
+**⚠ THERE IS NO SELECTABLE "PINNED @ SNAPSHOT" MODE, but the combination is not absent either** — read row 2.
+`ServerProfile.DefaultWriteIsolation` is `"snapshot"` for Fabric / Synapse-serverless and EMPTY everywhere
+else, so a pinned scan inherits transaction-scoped snapshot isolation on those engines and the server default
+(READ COMMITTED on box, READ UNCOMMITTED on Synapse-dedicated) on the rest. Nothing chooses it: the ATTACH
+`isolation_level` option reaches table-in-out sessions only (§5.2). **On box the combination is unreachable
+at all.**
 
 **⚠ THE LAST COLUMN INVERTS THE INTUITION, and it is the reason to have the table.** MARS is *interleaved*
 execution, not parallel — only one request runs on a session at a time (§5) — so the pinned configurations
