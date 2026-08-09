@@ -747,6 +747,14 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
     dedups them into one scan and the measurement is vacuous; a **self-join cannot show it** (a hash join
     drains its build side before the probe opens — no held window); and the ASYMMETRIC projection is what
     creates the window at all (154 ms vs 12.4 s), because equal scans start in the same millisecond.
+  - **⚠ FABRIC IS IMMUNE — MEASURED LIVE 2026-08-09, and it FALSIFIED the derivation the matrix used for three
+    cells.** The same shape returns **155000/155000** there, with the commit PROVEN inside the window (writer
+    server time `22:37:22.66`→`23.70`; reader's fast scan released `22:37:11.2`, slow scan `22:37:47.4`) and
+    the table going 155000 → **160000**. Both scans were `pooled` on two connections at the same millisecond,
+    i.e. §5.6 row 5 exactly. **The axis is VERSIONED-vs-not, not pooled-vs-pinned**: two connections are fine
+    when reads are versioned (their snapshots are taken at the same instant), and one connection does not save
+    you when they are not. The matrix's ❌ for rows 3–5 came from "separate connections ⇒ separate snapshots"
+    and was wrong; rows 4 and 5 are now ✅ and row 3 splits by engine.
   - No gate: it is the database's behaviour, not ours, and sqllogictest runs connections sequentially.
 - **READ+WRITE OF ONE CATALOG IN ONE STATEMENT FAILED ON BOX AT SCALE — FIXED 2026-08-08 (C++ + C#, NO ABI
   bump). `INSERT INTO t SELECT … FROM t` raised `595: Bulk Insert with another outstanding result set

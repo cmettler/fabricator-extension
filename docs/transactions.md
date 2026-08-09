@@ -676,9 +676,9 @@ kept distinct because this section has been wrong twice by reasoning where it co
 |---|---|---|---|---|---|---|---|---|
 | 1 | **no pin yet** — autocommit, or a txn that has not written. **The commonest read there is** | pooled | server default, per statement (READ COMMITTED on box) | ✅ | — (nothing written) | ❌ **M** | ❌ **M** | ✅ **M** |
 | 2 | MARS on, ordinary scan, txn HAS written — **the box default from then on** | pinned | the pinned txn's ⇒ **server default** (READ COMMITTED on box) | ✅ | ✅ | ❌ **M** | ❌ **M** | ❌ |
-| 3 | same-catalog read+write, `materialize=true` — **the default** | pinned, buffered | the pinned txn's ⇒ **SNAPSHOT on Fabric/Synapse-serverless**, server default on box | ❌ | ✅ | ❌ **d** | ❌ **d** | ❌ |
-| 4 | same-catalog read+write, `materialize=false` | pooled | **SNAPSHOT**, set per scan | ✅ | ❌ | ❌ **d** | ❌ **d** | ✅ |
-| 5 | MARS off, ordinary scan — **Fabric / Synapse** | pooled | the engine default (snapshot on Fabric) | ✅ | ❌ | ❌ **d** | ❌ **M** | ✅ |
+| 3 | same-catalog read+write, `materialize=true` — **the default** | pinned, buffered | the pinned txn's ⇒ **SNAPSHOT on Fabric/Synapse-serverless**, server default on box | ❌ | ✅ | ❌ box / ✅ Fabric **d** | ❌ **d** | ❌ |
+| 4 | same-catalog read+write, `materialize=false` | pooled | **SNAPSHOT**, set per scan | ✅ | ❌ | ✅ **d** | ❌ **d** | ✅ |
+| 5 | MARS off, ordinary scan — **Fabric / Synapse** | pooled | the engine default (snapshot on Fabric) | ✅ | ❌ | **✅ M** (live on Fabric) | ❌ **M** | ✅ |
 | 6 | `read_isolation 'snapshot'`, MARS on — **OPT-IN** (§5.8) | pinned | **SNAPSHOT**, transaction-scoped | ✅ | ✅ | **✅ M** | **✅ M** | ❌ |
 | 7 | `read_isolation 'snapshot'`, MARS off — **OPT-IN** (§5.8) | pinned, buffered + serialized | **SNAPSHOT**, transaction-scoped | ❌ | ✅ | **✅ M** | **✅ M** (also live on **Fabric**) | ❌ |
 
@@ -689,12 +689,24 @@ were sufficient for a pinned scan; MARS decides whether an EXISTING pin may be r
 exists. Measured directly: the §5.7 statement logged `pooled txn=2` for both its scans in a read-only
 transaction, and `pinned txn=2` only once an INSERT had run first.
 
-**⚠ The WITHIN-one-statement column is ❌ for every default row, and rows 1 and 2 are measured that way — 6/6
-divergence, three pooled and three pinned** (§5.7). Pinning does not buy it: MARS gives the scans one SESSION
-while each stays its own server STATEMENT, and READ COMMITTED is scoped to the statement. Rows 3–5 are marked
-**d**: same mechanism, not separately measured. ⚠ Row 4 is worth stating explicitly because the word
-"snapshot" appears in it — each scan sets its OWN `SET TRANSACTION ISOLATION LEVEL SNAPSHOT` on its OWN pooled
-connection, so every read is correctly isolated and they still take different snapshots.
+**⚠ THE WITHIN-ONE-STATEMENT COLUMN TURNS ON WHETHER THE READ IS VERSIONED — NOT on pooled-vs-pinned, and an
+earlier version of this table got three cells wrong by assuming otherwise.** It read: *"❌ for every default
+row … rows 3–5 are marked d: same mechanism"*, the mechanism being "each scan takes its own connection, so
+they take different snapshots". **Measured live on Fabric and FALSIFIED** (row 5, below). Two things have to
+go wrong for a statement to be internally inconsistent, and a separate connection is neither of them:
+
+1. **The read is NOT versioned** — plain READ COMMITTED without RCSI. A long scan then meets rows committed
+   after it started, so it diverges from a short one *and can tear within itself*. This is what rows 1 and 2
+   measure (6/6, three pooled and three pinned): pinning does not help, because MARS gives the scans one
+   SESSION while each stays its own server STATEMENT.
+2. **The scans take their snapshots at DIFFERENT instants.** Independent subqueries start in the SAME
+   MILLISECOND (measured on both engines), so where reads ARE versioned the snapshots coincide and the
+   statement is consistent — even across two connections. ⚠ It is a bound, not a guarantee: a plan that
+   starts its scans at different times (hash-join build then probe) reopens it.
+
+So row 5 is ✅, row 4 is ✅ (its per-scan `SET TRANSACTION ISOLATION LEVEL SNAPSHOT` is exactly condition 2
+being satisfied — the very cell the old text singled out as obviously ❌), and row 3 splits by engine because
+its isolation does.
 
 **⚠ Rows 6 and 7 are ✅ WITHIN a statement in AUTOCOMMIT too**, which was not designed: DuckDB's autocommit
 carries an implicit transaction with a nonzero id, so the opt-in pins there as well and every scan of the
@@ -800,9 +812,25 @@ writer is proven to have committed. Compare 6/6 divergence without it. The cost 
 per autocommit statement — so RCSI remains the cheaper answer where a DBA can set it, and this is the answer
 where they cannot.
 
-**Scope.** Fabric / Synapse-serverless are not exposed the same way: they are snapshot-isolated by
-construction, so a statement's scans read versioned data with no database option to set. This is a box
-SQL Server (and Azure SQL without RCSI) property.
+**Scope — MEASURED on Fabric 2026-08-09, and it confirms the boundary rather than assuming it.** Fabric /
+Synapse-serverless are snapshot-isolated by construction, so a statement's scans read versioned data with no
+database option to set. Live on a Fabric Warehouse, the same shape that diverges 6/6 on box: **155000 /
+155000**, agreeing.
+- **The window is PROVEN, not assumed** — the writer reported server time either side of its INSERT
+  (`22:37:22.66` → `22:37:23.70`) against the reader's own log (`SELECT [a]` released `22:37:11.2`, `[pad]`
+  released `22:37:47.4`), so the commit landed **11.4 s after the fast scan finished and 24 s before the slow
+  one did**. Control: the table went 155000 → **160000** while both reads returned 155000.
+- Both scans logged `pooled txn=3` at the SAME MILLISECOND on two connections — so this is row 5 of §5.6's
+  matrix exactly, with no opt-in in play.
+- ⚠ **This FALSIFIED the reasoning the matrix used for three cells** (see §5.6): "separate connections ⇒
+  separate snapshots ⇒ inconsistent" ignores that the snapshots are taken at the same instant. Where reads are
+  versioned, two connections are fine; where they are not, one connection does not save you (row 2). **The
+  axis is versioned-vs-not, not pooled-vs-pinned.**
+- ⚠ Getting a usable window on Fabric took two attempts: at 30k × 4000 bytes the slow scan ran only 4.0 s
+  against a ~10 s connect, so the writer could not land inside. 150k × 8000 bytes gives ~36 s, and the writer
+  must be PRE-WARMED (attach, a trivial query, then `WAITFOR DELAY` to align) so its insert costs one round
+  trip. ⚠ `sys.all_columns` cross joins are refused in Fabric's distributed mode (*15816*) — build the probe
+  table with a DuckDB CTAS instead.
 
 ### 5.8 `mssql_read_isolation` — cross-statement read stability, OPT-IN (BUILT 2026-08-09)
 
