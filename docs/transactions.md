@@ -612,6 +612,41 @@ confirmed the timeout turns it into a loud error rather than a stall.
 
 ### 5.6 What each configuration actually buys — the consolidated matrix
 
+#### Terminology — THREE properties, not one, and they are independent
+
+The columns below name properties that are easy to collapse into a single vague "read consistency". Keep them
+apart; each is lost by a different mechanism and fixed by a different change.
+
+| property | the question it answers | how we lose it |
+|---|---|---|
+| **read-your-writes** | is this read INSIDE the transaction at all? | the read goes to a pooled connection — a different session |
+| **cross-statement read stability** | do successive statements share one view? | the level is statement-scoped, or there is no shared transaction to scope |
+| **intra-statement consistency** | do all scans of ONE statement share one view? | each pooled scan takes its OWN snapshot at its own instant |
+
+**⚠ Read-your-writes is NOT an isolation property.** ANSI defines isolation by the anomalies it prevents
+BETWEEN transactions (dirty read, non-repeatable read, phantom); seeing your OWN uncommitted changes is
+assumed by every level, including READ UNCOMMITTED. It is a question here only because our reads can leave
+the session — which is a property of our architecture, not of the database.
+
+**⚠ They COMPOSE — measured, because the opposite is a natural assumption.** `SET TRANSACTION ISOLATION LEVEL
+SNAPSHOT; BEGIN TRAN; SELECT count(*) …` ⇒ 2; `INSERT`; the same `SELECT` ⇒ **3**. A snapshot transaction
+holds a transaction-scoped view of everything else AND still sees its own writes. Choosing transaction-scoped
+consistency costs you nothing in read-your-writes.
+
+**⚠ Our system couples the first two, and that coupling is OURS.** Both require the scan to run on the pinned
+connection, so losing the pin loses both at once — which is why they read like one property in the matrix.
+They are not, and a fix addresses them at different depths: routing a read onto the pinned connection buys
+read-your-writes outright, and buys stability only if the LEVEL is also right (§5.4).
+
+**⚠ Avoid the bare term "read consistency" in this repo.** Oracle uses it for the STATEMENT-level default, so
+a reader can take it to mean the weaker guarantee we already have; SQL Server's own split is `SNAPSHOT` vs
+`READ_COMMITTED_SNAPSHOT`, the same ambiguity. Qualify it every time.
+
+The third property is the one no standard term covers well, and it is not academic: under `materialize=false`
+every scan opens its own pooled connection and issues its own `SET TRANSACTION ISOLATION LEVEL SNAPSHOT`, so
+a statement's scans can straddle a concurrent commit **while each individual read is snapshot-isolated**. A
+single "read consistency" column would hide exactly that. ⚠ Still NOT measured.
+
 | configuration | scan runs on | the read's ISOLATION | streams | read-your-writes | consistent across statements | scans may OVERLAP |
 |---|---|---|---|---|---|---|
 | MARS on, ordinary scan — **the box default** | pinned | the pinned txn's ⇒ **server default** (READ COMMITTED on box) | ✅ | ✅ | ❌ | ❌ |
