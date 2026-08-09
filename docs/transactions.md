@@ -392,12 +392,15 @@ ATTACH option (§5.8). The table above is what you get with it UNSET, which is t
 table-in-out (`fn_each`) sessions only; the names invite the wrong reading, which is exactly why the new
 option did not reuse them.
 
-⚠ **UNKNOWN, and do not assume it: whether pinning the reads would be sufficient on Fabric.** SQL Server's
-SNAPSHOT isolation is documented as transaction-scoped (snapshot taken at first data access, held for the
-transaction), which would make cause 2 inapplicable there — but **our routing can never put two reads on one
-connection on Fabric** (MARS off, and only a MARKED scan carries the `materialize` exemption), so the
-property is unexercised and untested through our surface. An earlier draft of this section asserted it as
-fact; it is not. If "pin the reads too" is ever built, measuring this is part of the work.
+✅ **RESOLVED 2026-08-09 — pinning the reads IS sufficient on Fabric, MEASURED LIVE on a Fabric Warehouse.**
+This paragraph read *"UNKNOWN, and do not assume it … our routing can never put two reads on one connection on
+Fabric, so the property is unexercised and untested"*. The §5.8 opt-in put two reads on one Fabric connection
+for the first time, and the answer is yes: control **3 → 4**, opt-in **4 → 4** while the writer committed a
+fifth row (verified afterwards — the table held 5 while both reads said 4), both reads logging `pinned txn=3`.
+So SQL Server's documented transaction-scoped SNAPSHOT does hold through our routing, and cause 2 really is
+inapplicable there. ⚠ The caution the paragraph carried was still right at the time: an earlier draft had
+asserted it as fact without a measurement, and the fact happened to be true — which is not the same as having
+known it.
 
 **What to do instead:** set `mssql_read_isolation='snapshot'` (§5.8, opt-in — it holds a connection and an
 open transaction for the DuckDB transaction's life), or materialise once into DuckDB
@@ -469,11 +472,11 @@ would have to MATERIALISE them. On a no-MARS engine, transaction-scoped read con
 multi-ref reads are therefore **mutually exclusive**. So the missing piece on Fabric is (a) alone for the
 single-scan case, and (a) plus unconditional materialisation for the multi-scan one.
 
-⚠ **The ingredients already coexist there and still deliver nothing**, which is worth stating plainly: a
+⚠ **The ingredients already coexisted there and still delivered nothing**, which is worth stating plainly: a
 pinned transaction at transaction-scoped SNAPSHOT exists on every Fabric write transaction, and ordinary
-reads simply never route onto it (only a MARKED scan does). That is what makes (a) the whole of the problem
-rather than one third of it. It still rests on the transaction-scoped property flagged as UNKNOWN above — no
-one has observed it through our routing, because two reads cannot share a connection there today.
+reads simply never routed onto it (only a MARKED scan did). That is what makes (a) the whole of the problem
+rather than one third of it — and it is now CONFIRMED rather than argued: with (a) built, the same engine and
+the same level deliver 4 → 4 live (§5.8). The transaction-scoped property flagged as UNKNOWN above holds.
 
 ### 5.3 The reader is released at END OF RESULT SET, not at query teardown (2026-08-09)
 
@@ -677,7 +680,7 @@ kept distinct because this section has been wrong twice by reasoning where it co
 | 4 | same-catalog read+write, `materialize=false` | pooled | **SNAPSHOT**, set per scan | ✅ | ❌ | ❌ **d** | ❌ **d** | ✅ |
 | 5 | MARS off, ordinary scan — **Fabric / Synapse** | pooled | the engine default (snapshot on Fabric) | ✅ | ❌ | ❌ **d** | ❌ **M** | ✅ |
 | 6 | `read_isolation 'snapshot'`, MARS on — **OPT-IN** (§5.8) | pinned | **SNAPSHOT**, transaction-scoped | ✅ | ✅ | **✅ M** | **✅ M** | ❌ |
-| 7 | `read_isolation 'snapshot'`, MARS off — **OPT-IN** (§5.8) | pinned, buffered + serialized | **SNAPSHOT**, transaction-scoped | ❌ | ✅ | **✅ M** | **✅ M** | ❌ |
+| 7 | `read_isolation 'snapshot'`, MARS off — **OPT-IN** (§5.8) | pinned, buffered + serialized | **SNAPSHOT**, transaction-scoped | ❌ | ✅ | **✅ M** | **✅ M** (also live on **Fabric**) | ❌ |
 
 **⚠ ROW 1 WAS MISSING FROM THIS TABLE UNTIL 2026-08-09, and it is the row most reads actually take.** The pin
 is created lazily by the first WRITE, so a plain `SELECT` — in autocommit or in a transaction that has not
@@ -889,9 +892,20 @@ reuses the connection and each statement's transaction is committed and released
 in this section is about a LONG-LIVED explicit transaction holding one connection, NOT about autocommit
 leaking them.
 
-**⚠ STILL UNKNOWN, unchanged by this work: whether Fabric's transaction-scoped snapshot delivers through our
-routing.** The opt-in now puts two reads on one Fabric connection for the first time, so the experiment is
-finally expressible — it has not been run. Do not report the box measurement as covering Fabric.
+**✅ IT WORKS ON FABRIC — MEASURED LIVE 2026-08-09, and this closes the last open question in §5.2/§5.4.**
+Fabric Warehouse, `Test Warehouse`, service principal: control **3 → 4**; with `read_isolation 'snapshot'`
+**4 → 4** while a second process committed a fifth row, confirmed afterwards (the table held **5** while both
+reads returned 4). Both reads logged `pinned txn=3` — two reads on ONE Fabric connection, which our routing
+could not produce before this option existed. So Fabric's documented transaction-scoped SNAPSHOT does deliver
+through our routing, and row 7 of §5.6's matrix is measured on the real engine and not only on box with MARS
+forced off.
+- ⚠ **The window has to be long there.** A Fabric connect costs seconds (SP token + endpoint), so a writer
+  fired at t+8 s needs a wide window to land inside; a 40-second `WAITFOR DELAY` was used. **`WAITFOR DELAY`
+  IS supported on Fabric Warehouse** — worth knowing, since much of the T-SQL surface is not.
+- ⚠ **`read_isolation` is what makes the reads PIN there; the level itself was already right.** Fabric's
+  `ServerProfile.DefaultWriteIsolation` is already `snapshot`, so the option's VALUE changes nothing on that
+  engine — its whole effect is (a), routing the reads into the transaction. That is the clearest available
+  evidence that (a) was the substance and (b) was bookkeeping.
 
 Gate: `test/verify_read_isolation.test` (47, service tier). ⚠ The headline property is NOT in it — proving it
 needs a concurrent writer and sqllogictest drives connections sequentially. What the suite pins is the

@@ -706,9 +706,22 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
   - Refusals, both because the alternative is a silently wrong view: a bad level fails the **ATTACH** (not the
     first `SELECT`, by which point the failing statement mentions nothing about isolation), and
     `mssql_materialize=false` + `mssql_read_isolation` is refused as contradictory.
-  - **⚠ STILL UNKNOWN and unchanged: whether Fabric's transaction-scoped snapshot delivers through our
-    routing.** The opt-in puts two reads on one Fabric connection for the first time, so the experiment is
-    finally expressible — it has NOT been run. Do not read the box measurement as covering Fabric.
+  - **✅ VERIFIED LIVE ON FABRIC 2026-08-09 — the last open question of §5.2/§5.4 is CLOSED.** Fabric
+    Warehouse, SP auth: control **3 → 4**, opt-in **4 → 4** while a second process committed a fifth row
+    (table held **5** while both reads returned 4), both reads logging `pinned txn=3` — two reads on ONE
+    Fabric connection, impossible through our routing before this option. So the documented transaction-scoped
+    SNAPSHOT does hold through us.
+    - **⚠ On Fabric the option's VALUE changes nothing — its whole effect is the PINNING.**
+      `DefaultWriteIsolation` is already `snapshot` there, so this is the cleanest evidence that (a) was the
+      substance and (b) bookkeeping.
+    - ⚠ The window must be LONG (a Fabric connect costs seconds, so the writer needs room to land inside);
+      a 40 s `WAITFOR DELAY` was used, and **`WAITFOR DELAY` IS supported on Fabric Warehouse**.
+  - **⚠ FOUND WHILE RUNNING IT, UNRELATED AND CURRENT: full catalog ENUMERATION is BROKEN on that Fabric
+    Warehouse** — `duckdb_tables()` / a cache refresh fails with *"15871: 'managed_delta_table_forks' is not
+    supported"*, a Fabric-side object our TABLES discovery SQL now trips over. **Targeted access is
+    unaffected** (`SELECT … FROM w.dbo.t` and `fabricator_exec` DDL/DML all work), which is why the isolation
+    experiment could still run. Not diagnosed further; it is the same hazard class as §6.5 (a dbt run does
+    `information_schema.tables` before building) and deserves its own pass.
   - Gate `test/verify_read_isolation.test` (**47**, service tier), mutation-tested with three mutants each
     killed at its own section. ⚠ **The headline property is NOT in it** — proving it needs a concurrent writer
     and sqllogictest drives connections sequentially; what it pins is the ROUTING, via the sharp observable
