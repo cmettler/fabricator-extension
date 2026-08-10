@@ -4315,6 +4315,17 @@ never actually declares, so a passing local run proves nothing about a fresh one
    remembering as a general rule: **anything relying on an exported symbol other than the single blessed
    entry point needs an explicit macOS whitelist entry.**
 
+### ⚠ `gh` IS INSTALLED BUT NOT ON PATH — `C:\Program Files\GitHub CLI\gh.exe` (2026-08-10)
+
+`gh --version` from a plain shell says *"command not found"*, which reads as "not installed" and sends you to
+the raw REST API instead. **It is there, and it is authenticated** (`gh auth status` ⇒ logged in as `cmettler`,
+keyring). Prepend it: `export PATH="$PATH:/c/Program Files/GitHub CLI"`.
+- **Why this is worth a note rather than a rediscovery:** the fallback is `curl` against
+  `api.github.com` UNAUTHENTICATED, which allows **60 requests/hour**. Polling a build every 10 s exhausts
+  that in ten minutes and then returns a 403 whose JSON has no `jobs` key — so the failure surfaces as a
+  `KeyError` in whatever parses it, not as "you are rate limited". Authenticated is 5000/hour.
+- Consequence for watching a packaging run: use `gh run watch <id> --exit-status`, not a polling loop.
+
 ### TWO CONCURRENT RELEASE LINES — releases MUST be distinguishable (requirement, 2026-07-26)
 
 We will ship builds for BOTH lines at once: the current **`v1.5-variegata`** (DuckDB 1.5.x) and an
