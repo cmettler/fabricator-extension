@@ -155,7 +155,9 @@ unique_ptr<FunctionData> ArrowStreamBindData::Copy() const {
 	copy->column_nullable = column_nullable;
 	copy->column_ndv = column_ndv;
 	copy->push_projection = push_projection;
-	copy->force_materialize = force_materialize;
+	copy->sink_schema = sink_schema;
+	copy->sink_table = sink_table;
+	copy->sink_kind = sink_kind;
 	copy->factory = factory;
 	copy->schema_factory = schema_factory;
 	copy->filter_json = filter_json;
@@ -755,11 +757,19 @@ static string BuildScanSpec(const ArrowStreamBindData &bind_data, const vector<c
 		JsonEscape(bind_data.at_value, json);
 		json += "}";
 	}
-	// Same-catalog read+write in one plan: the provider must produce the whole result before returning
-	// the stream, so no reader is still open when the sink's bulk load starts. Emitted only when set,
-	// so an ordinary scan's spec is byte-identical to before. See ArrowStreamBindData::force_materialize.
-	if (bind_data.force_materialize) {
-		json += ",\"materialize\":true";
+	// Same-catalog read+write in one plan: NAME THE SINK and let the provider decide whether that costs
+	// anything (see ArrowStreamBindData::sink_table). Its presence alone carries what the old
+	// `"materialize":true` said — "a sink of this catalog is in this plan" — so a provider that only wants
+	// the boolean reads `sink != null`. Emitted only when set, so an ordinary scan's spec is byte-identical
+	// to before.
+	if (bind_data.HasSink()) {
+		json += ",\"sink\":{\"schema\":";
+		JsonEscape(bind_data.sink_schema, json);
+		json += ",\"table\":";
+		JsonEscape(bind_data.sink_table, json);
+		json += ",\"kind\":";
+		JsonEscape(bind_data.sink_kind, json);
+		json += "}";
 	}
 	json += "}";
 	return json;

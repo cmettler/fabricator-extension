@@ -671,6 +671,43 @@ current code still uses the single-provider `fabricator` naming):
 ## Next up (open threads for future sessions)
 
 In-flight / planned refactors (all C#-only unless noted; tests stay green per slice):
+- **THE SAME-CATALOG READ+WRITE MARK NAMES THE SINK — the PROVIDER decides (2026-08-10, C++ + C#, no ABI
+  bump). Full record: [docs/transactions.md](docs/transactions.md) §5.9.** The host emitted
+  `"materialize":true`; it now emits `"sink":{"schema","table","kind"}` and `SinkRequiresDrainedScan` answers
+  on the provider side. Presence alone carries what the boolean said (`ScanSpec.HasSink`).
+  - **⚠ IT IS A FIX, NOT A TIDY-UP — MEASURED.** `INSERT INTO <SQL Server external table> SELECT … FROM <same
+    catalog>` drained **200 000 rows** into memory to protect against a `SqlBulkCopy` that never runs: an
+    external table's INSERT routes to STORAGE. After: the `mssql scan: drained to memory` mark is ABSENT, the
+    write still shows `delta bulk: streamed to files`, and the same 200001 rows land. The drain has no spill
+    (~1 byte of working set per byte of result), so this was the whole source buffered for nothing.
+  - **⚠ THE QUESTION IS "DOES THE DRAIN BUY ANYTHING", NOT "IS A BULK LOAD COMING" — and getting that wrong
+    would have been a silent regression.** With MARS OFF an ordinary scan reaches the pinned connection ONLY
+    via the drain, so dropping it there costs READ-YOUR-WRITES on the SOURCE and, where this transaction has
+    written that table, converts a working statement into limitation 1.15's refusal. Hence
+    `if (!_marsEnabled) return true;` BEFORE the external check. Verified both ways on one shape: **MARS on ⇒
+    0 drains, MARS off ⇒ 1 drain**, both landing 200001 rows.
+  - ⚠ Restricted to `kind = "insert"` — a CTAS/replace over an external table is not the storage-write shape
+    (`BulkInsert`'s own guard is `!createTable && !replace`). Cost is nil: `DetectExternalTable` is cached and
+    returns null immediately on a warehouse engine, and `BulkInsert` makes the same call moments later.
+  - **⚠ WHAT IS NOT GATED, and the honest split.** `verify_mssql_s3_polybase` 252 → **263** pins the RESULT of
+    the INSERT-SELECT shape — which NOTHING covered before, because every earlier external INSERT in that
+    suite is `INSERT … VALUES` and so has no scan to mark. It does NOT assert the streaming (invisible from
+    SQL). **The dangerous direction already has a gate**: streaming a scan whose sink really does bulk-load
+    fails `verify_read_write_same_catalog` with 595 at its 30k+ sections.
+  - ⚠ Adding rows to that suite broke a LATER count of the same Delta location (3 → 5). A suite that re-counts
+    a shared location downstream is not append-safe; check for later assertions on the same object.
+  - **The sink is SINGULAR by construction** — DuckDB gives a plan one sink and MERGE INTO's operators all
+    address one target; the READ set needs no transport, since each scan already passes its own `touchKey`.
+  - **NEXT, NOT BUILT: Fabric `COPY INTO` instead of `SqlBulkCopy`** (§5.9). Verified from the COPY INTO
+    reference: **OneLake IS a supported source**
+    (`https://onelake.dfs.fabric.microsoft.com/<workspaceId>/<lakehouseId>/Files/`), PARQUET is supported, and
+    ONE statement consumes MANY files — a folder loads recursively, wildcards work, and a comma-separated list
+    is preferred over a broad wildcard by the doc itself. So a parallel DuckDB `COPY … TO <dir>` is a natural
+    producer. ⚠ **OneLake as a source is ENTRA-ONLY** (no SAS, no key), and ⚠ **files beginning `_` or `.` are
+    IGNORED** unless named — so the staging dir must not be `_`-prefixed. Needs a staging-location option, the
+    parquet write, COPY INTO generation, cleanup and transaction semantics. **This refactor is the only part
+    that had to land first**: such a path answers `SinkRequiresDrainedScan` with `false` and the host never
+    changes.
 - **CROSS-STATEMENT READ STABILITY — BUILT 2026-08-09 as an OPT-IN (`mssql_read_isolation` / the
   `read_isolation` ATTACH option; C#-only, no ABI). Full record: [docs/transactions.md](docs/transactions.md)
   §5.8.** `BEGIN; SELECT count(*) FROM t; SELECT count(*) FROM t; COMMIT;` used to return DIFFERENT answers

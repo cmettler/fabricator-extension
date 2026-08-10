@@ -77,8 +77,9 @@ struct ArrowStreamBindData : public duckdb::TableFunctionData {
 	//! fetched and projected positionally.
 	bool push_projection = false;
 	//! Set at PLAN time when this scan reads the SAME catalog a sink in the same plan writes to
-	//! (FabricatorCatalog::MaterializeOwnScans, called from PlanInsert/PlanCreateTableAs). It asks the
-	//! provider to produce the whole result BEFORE returning the stream, instead of streaming it.
+	//! (FabricatorCatalog::MarkSinkOnOwnScans, called from PlanInsert/PlanCreateTableAs). It NAMES that
+	//! sink; whether the scan must be produced in full before the stream is returned is then the
+	//! PROVIDER's decision, not the host's.
 	//!
 	//! WHY. A provider that pins one connection per transaction cannot hold an open reader and run a
 	//! bulk load on it at the same time. On SQL Server that is error 595 ("Bulk Insert with another
@@ -87,17 +88,37 @@ struct ArrowStreamBindData : public duckdb::TableFunctionData {
 	//! small-table test never sees it. Materialising removes the OUTSTANDING READER, which is the
 	//! thing the engine objects to — the same fix duckdb-postgres and duckdb-mysql apply.
 	//!
-	//! It is PROVIDER-AGNOSTIC BY DESIGN: C++ only states "this scan and a sink share a catalog".
+	//! It is PROVIDER-AGNOSTIC BY DESIGN: C++ only states "this scan shares a catalog with THIS SINK".
 	//! Whether that costs anything is the backend's call — the Delta provider holds no connections and
 	//! ignores it; the SQL Server backend drains the reader and, having no open reader afterwards, may
 	//! then use the PINNED connection even without MARS (which is what restores read-your-writes on
 	//! Fabric/Synapse, where scans are otherwise routed to a pooled connection).
 	//!
+	//! ⚠ IT NAMES THE SINK RATHER THAN ASSERTING "MATERIALIZE", and that is the whole point of the shape.
+	//! It was a bare `bool force_materialize` until 2026-08-10, which put a PROVIDER decision in the HOST:
+	//! whether a drain is needed depends on how the backend will WRITE, and only the backend knows that.
+	//! MEASURED cost of getting it wrong: an `INSERT INTO <external table> SELECT … FROM <same catalog>`
+	//! drained 200 000 rows into memory to protect against a `SqlBulkCopy` that never runs — a SQL Server
+	//! external table's INSERT routes to STORAGE, so nothing was ever going to be outstanding on that
+	//! connection. Naming the sink lets the provider answer for itself, and a future write path that does
+	//! not hold a reader (Fabric `COPY INTO` from staged parquet, say) needs no host change to benefit.
+	//!
+	//! SINGULAR, and that is not a simplification: DuckDB gives a plan ONE sink, and MERGE INTO's several
+	//! operators all address one target. The READ set needs no transport — each scan already knows the
+	//! table it reads.
+	//!
 	//! Marked at plan time rather than execution time BECAUSE IT IS A PROPERTY OF THE PLAN SHAPE, not
 	//! of the transaction: "does this plan contain a scan of the sink's catalog" cannot change between
 	//! executions of the same prepared statement. (Contrast FabricatorModifyTarget's force_buffered,
 	//! which depends on the transaction and therefore MUST be set in GetGlobalSinkState.)
-	bool force_materialize = false;
+	duckdb::string sink_schema;
+	duckdb::string sink_table;
+	//! "insert" or "create" (CTAS / CREATE OR REPLACE). The kind matters to the provider: a SQL Server
+	//! external table accepts a routed INSERT but a CTAS over one is not a storage-write shape.
+	duckdb::string sink_kind;
+	bool HasSink() const {
+		return !sink_table.empty();
+	}
 	//! Re-creates the data stream for each scan.
 	StreamFactory factory;
 

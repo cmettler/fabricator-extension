@@ -1251,7 +1251,8 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
 
     // Drains `source` completely and hands back an equivalent in-memory stream, disposing the source (and
     // with it the reader, so nothing is left outstanding on the connection). This is the whole point of
-    // ScanSpec.Materialize: SQL Server refuses a bulk load while a result set is still open on the same
+    // a marked scan the provider chose to drain (see SinkRequiresDrainedScan): SQL Server refuses a bulk
+    // load while a result set is still open on the same
     // MARS connection (error 595), and closing the reader before the sink starts is what removes it.
     // Costs the pipelining — the full source is buffered before the sink sees a row — which is why the
     // host only asks for it when a scan and a sink share a catalog.
@@ -1302,6 +1303,54 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     {
         var set = ProviderSettingsStore.Instance.GetBool(SqlServerBackend.ProviderName, "mssql_materialize");
         return set ?? _materialize ?? true;
+    }
+
+    // Does a scan the host MARKED (its plan writes to this catalog) actually have to be drained?
+    //
+    // ⚠ THE HOST NO LONGER ANSWERS THIS, and this method is why. Whether an open reader is a problem depends
+    // on how WE are about to write, which the host cannot know. Today there is exactly one case where the
+    // answer is no, and it is worth real memory:
+    //
+    //   INSERT INTO <SQL Server EXTERNAL table> SELECT ... FROM <a table in this catalog>
+    //
+    // routes the write to STORAGE (ExternalTableInsert -> parquet/Delta on S3 or ADLS), so no SqlBulkCopy
+    // ever runs on the pinned connection and there is nothing for an outstanding result set to collide with.
+    // MEASURED before this split: that shape drained 200 000 rows into memory for no reason
+    // (`mssql scan: drained to memory` beside `delta bulk: streamed to files`), and the drain has no spill —
+    // roughly one byte of process working set per byte of result.
+    //
+    // ⚠ Restricted to `insert`. A CTAS/replace over an external table is NOT the storage-write shape
+    // (BulkInsert's own guard is `!createTable && !replace`), so claiming it here would stream a scan into a
+    // bulk load that really does run.
+    //
+    // ⚠ DetectExternalTable is CACHED per table and returns null immediately on a warehouse engine, so this
+    // costs nothing in the common case — and on the path where it does probe, BulkInsert is about to make
+    // the identical call moments later and hit the same cache entry.
+    //
+    // A future write path that holds no reader — Fabric `COPY INTO` over staged parquet, say — extends this
+    // method and needs no host change at all. That is the point of the sink being NAMED rather than judged.
+    private bool SinkRequiresDrainedScan(ScanSpec.SinkInfo sink)
+    {
+        // ⚠ WITH MARS OFF THE DRAIN BUYS A SECOND THING, and skipping it here would be a quiet regression.
+        // An ordinary scan reaches the PINNED connection only when `_marsEnabled || readYourWrites ||
+        // materialize` (see ExecuteQuery), so on a no-MARS engine the drain is the ONLY reason the scan runs
+        // inside the transaction at all — dropping it would cost read-your-writes, and (where this
+        // transaction has already written the scanned table) turn a working statement into limitation 1.15's
+        // refusal. The 595 argument below is about the sink; this one is about the source, and it is why the
+        // question is "does the drain buy anything", not "is a bulk load coming".
+        //
+        // Fabric/Synapse are unaffected either way: DetectExternalTable returns null on a warehouse engine,
+        // so the branch below could never fire there. This guard is what protects box with mssql_mars=false.
+        if (!_marsEnabled)
+        {
+            return true;
+        }
+        if (string.Equals(sink.Kind, "insert", StringComparison.OrdinalIgnoreCase) &&
+            DetectExternalTable(sink.Schema, sink.Table) is not null)
+        {
+            return false; // the write goes to storage, not through this connection
+        }
+        return true;
     }
 
     // SET mssql_read_isolation wins if set, else this catalog's `read_isolation` ATTACH option, else "" (OFF).
@@ -2576,8 +2625,9 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         // The probe was the query that actually hung. It is exempted only from the data-write case.
         if (touchKey is not null)
         {
-            EnsureScanCannotSelfBlock(touchKey, spec?.Materialize == true && ResolveMaterialize(),
-                                      spec?.Materialize == true && !ResolveMaterialize(),
+            bool drains = spec?.HasSink == true && SinkRequiresDrainedScan(spec.Sink!);
+            EnsureScanCannotSelfBlock(touchKey, drains && ResolveMaterialize(),
+                                      drains && !ResolveMaterialize(),
                                       schemaProbe: spec?.SchemaOnly == true);
         }
 
@@ -2658,9 +2708,10 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
                 var where = builder.Build(spec.Filter);
                 var allParams = new List<SqlParameter>(sourceParams);
                 allParams.AddRange(builder.Parameters); // source @a* + filter @p* are disjoint
+                bool drainF = spec.HasSink && SinkRequiresDrainedScan(spec.Sink!);
                 return ExecuteQuery($"SELECT {top}{columns} FROM {source} WHERE {where}{orderBy}{optionClause}", allParams,
-                                    readYourWrites: false, materialize: spec.Materialize && ResolveMaterialize(),
-                                    snapshotRead: spec.Materialize && !ResolveMaterialize());
+                                    readYourWrites: false, materialize: drainF && ResolveMaterialize(),
+                                    snapshotRead: drainF && !ResolveMaterialize());
             }
             catch
             {
@@ -2669,7 +2720,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         }
 
         filterValues?.Dispose();
-        var marked = spec?.Materialize == true;
+        var marked = spec?.HasSink == true && SinkRequiresDrainedScan(spec.Sink!);
         return ExecuteQuery($"SELECT {top}{columns} FROM {source}{orderBy}{optionClause}",
                             sourceParams.Count > 0 ? sourceParams : null,
                             readYourWrites: false, materialize: marked && ResolveMaterialize(),

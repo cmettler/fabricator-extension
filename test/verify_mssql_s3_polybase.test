@@ -384,6 +384,56 @@ SELECT count(*) FROM plake.main.ins;
 ----
 3
 
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+# INSERT ... SELECT from the SAME catalog — the shape whose scan the host MARKS
+#
+# Everything above inserts VALUES, which has no scan, so none of it exercises the sink mark at all.
+# Here the source is a regular table in the SAME SQL Server catalog, so FabricatorCatalog::
+# MarkSinkOnOwnScans names the sink on that scan and the PROVIDER decides whether to drain it. The
+# answer here is NO: an external table's INSERT routes to STORAGE, so no SqlBulkCopy ever runs on the
+# pinned connection and there is nothing for an open reader to collide with.
+#
+# ⚠ WHAT THIS SECTION CAN AND CANNOT ASSERT. It pins the RESULT of the shape — which was uncovered
+# until now — not the streaming. Whether the scan was drained is invisible from SQL; it is visible as
+# the `mssql scan: drained to memory` mark under FABRICATOR_LOG_LEVEL=Debug, and measured in
+# docs/transactions.md. The DANGEROUS direction needs no assertion here and already has one:
+# if the provider ever streamed a scan whose sink really does bulk-load,
+# verify_read_write_same_catalog fails with error 595 at its 30k+ row sections.
+
+statement ok
+SELECT fabricator_exec('sqldb',
+  'IF OBJECT_ID(''dbo.s3_ins_src'') IS NOT NULL DROP TABLE dbo.s3_ins_src');
+
+statement ok
+SELECT fabricator_exec('sqldb',
+  'CREATE TABLE dbo.s3_ins_src (id BIGINT, name VARCHAR(20))');
+
+statement ok
+SELECT fabricator_exec('sqldb',
+  'INSERT INTO dbo.s3_ins_src VALUES (200, ''fromsel''), (201, ''fromsel'')');
+
+statement ok
+SELECT fabricator_refresh_cache('sqldb');
+
+statement ok
+INSERT INTO sqldb.dbo.s3_delta_ins SELECT id, name FROM sqldb.dbo.s3_ins_src;
+
+# the rows really crossed: SQL Server's own external-table read sees them
+query IT
+SELECT id, name FROM sqldb.dbo.s3_delta_ins WHERE id >= 200 ORDER BY id;
+----
+200	fromsel
+201	fromsel
+
+# and our Delta view of the same location agrees — 3 from the VALUES sections + 2 here
+query I
+SELECT count(*) FROM plake.main.ins;
+----
+5
+
+statement ok
+SELECT fabricator_exec('sqldb', 'DROP TABLE dbo.s3_ins_src');
+
 # guard: the storage write is its own Delta commit — it cannot join an explicit DuckDB transaction
 statement ok
 BEGIN;
@@ -453,11 +503,12 @@ SELECT count(*) FROM fabricator_query('sqldb',
 ----
 0
 
-# the delta data itself STAYS on storage (metadata-only drop)
+# the delta data itself STAYS on storage (metadata-only drop) — 3 from the VALUES sections
+# plus the 2 the INSERT ... SELECT section added
 query I
 SELECT count(*) FROM plake.main.ins;
 ----
-3
+5
 
 statement ok
 DROP TABLE sqldb.dbo.s3_pq_ins;

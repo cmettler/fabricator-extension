@@ -45,21 +45,53 @@ public sealed class ScanSpec
     public AtSpec? At { get; set; }
 
     /// <summary>
-    /// The host marked this scan as reading the SAME catalog a sink in the same plan writes to
-    /// (<c>FabricatorCatalog::MaterializeOwnScans</c>). The provider should produce the whole result
-    /// BEFORE returning the stream rather than streaming it.
+    /// Present when this scan reads the SAME catalog a sink in the same plan writes to, and it NAMES that
+    /// sink (<c>FabricatorCatalog::MarkSinkOnOwnScans</c>). Absent on an ordinary scan.
     ///
-    /// <para>It is a statement about the PLAN, not an instruction about connections: a provider that
-    /// holds no connection (Delta) may ignore it entirely. A provider that pins one connection per
-    /// transaction cannot hold an open reader while a bulk load runs on it — on SQL Server that is
-    /// error 595, and it is size-dependent, so a small result never trips it.</para>
+    /// <para><b>The host states a fact, not a verdict.</b> Whether the scan must be produced in full before
+    /// the stream is returned depends on how the backend will WRITE, which only the backend knows — so the
+    /// decision belongs here, on the provider side. A provider that holds no connection (Delta) ignores it
+    /// entirely. A provider that pins one connection per transaction cannot hold an open reader while a bulk
+    /// load runs on it — on SQL Server that is error 595, and it is size-dependent, so a small result never
+    /// trips it.</para>
     ///
     /// <para>The second effect matters as much as the first: with the reader fully drained there is no
     /// outstanding result set, so the scan may run on the PINNED connection even where MARS is
     /// unavailable — which is what gives read-your-writes back on Fabric/Synapse.</para>
+    ///
+    /// <para>⚠ This replaced a bare <c>"materialize": true</c> on 2026-08-10, because that spelling put a
+    /// provider decision in the host and got it wrong in a measurable way: an
+    /// <c>INSERT INTO &lt;external table&gt; SELECT … FROM &lt;same catalog&gt;</c> drained 200 000 rows into
+    /// memory to protect against a <c>SqlBulkCopy</c> that never runs, since a SQL Server external table's
+    /// INSERT routes to STORAGE. <see cref="HasSink"/> reproduces the old boolean exactly for any consumer
+    /// that only wants it.</para>
     /// </summary>
-    [JsonPropertyName("materialize")]
-    public bool Materialize { get; set; }
+    [JsonPropertyName("sink")]
+    public SinkInfo? Sink { get; set; }
+
+    /// <summary>Exactly the old <c>materialize</c> boolean: "a sink of this catalog is in this plan".</summary>
+    [JsonIgnore]
+    public bool HasSink => Sink is not null && !string.IsNullOrEmpty(Sink.Table);
+
+    /// <summary>
+    /// The sink a marked scan shares its plan with. SINGULAR by construction — DuckDB gives a plan one sink,
+    /// and MERGE INTO's several operators all address one target. The read set needs no transport: each scan
+    /// already knows the table it reads.
+    /// </summary>
+    public sealed class SinkInfo
+    {
+        [JsonPropertyName("schema")]
+        public string Schema { get; set; } = "";
+
+        [JsonPropertyName("table")]
+        public string Table { get; set; } = "";
+
+        /// <summary><c>insert</c> or <c>create</c> (CTAS / CREATE OR REPLACE). The kind is load-bearing for at
+        /// least one provider decision: a SQL Server external table accepts a routed INSERT, but a CTAS over
+        /// one is not a storage-write shape.</summary>
+        [JsonPropertyName("kind")]
+        public string Kind { get; set; } = "";
+    }
 
     /// <summary>
     /// DESCRIBE ONLY: the caller wants this scan's Arrow schema and no rows (the bind-time probe behind

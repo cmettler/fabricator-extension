@@ -330,7 +330,8 @@ ErrorData FabricatorCatalog::SupportsCreateTable(BoundCreateTableInfo &info) {
 	// three clauses.
 	return ErrorData();
 }
-void FabricatorCatalog::MaterializeOwnScans(PhysicalOperator &plan) {
+void FabricatorCatalog::MarkSinkOnOwnScans(PhysicalOperator &plan, const string &sink_schema,
+                                           const string &sink_table, const string &sink_kind) {
 	if (plan.type == PhysicalOperatorType::TABLE_SCAN) {
 		auto &scan = plan.Cast<PhysicalTableScan>();
 		// dynamic_cast, not Cast<>: the plan may hold ANY table function's bind data (read_parquet, a
@@ -339,18 +340,20 @@ void FabricatorCatalog::MaterializeOwnScans(PhysicalOperator &plan) {
 		// `table` is null for a raw fabricator_query scan, which belongs to no catalog and therefore
 		// cannot be the sink's own — leave it streaming.
 		if (bind_data && bind_data->table && &bind_data->table->schema.catalog == this) {
-			bind_data->force_materialize = true;
+			bind_data->sink_schema = sink_schema;
+			bind_data->sink_table = sink_table;
+			bind_data->sink_kind = sink_kind;
 		}
 	}
 	for (auto &child : plan.children) {
-		MaterializeOwnScans(child.get());
+		MarkSinkOnOwnScans(child.get(), sink_schema, sink_table, sink_kind);
 	}
 }
 
 PhysicalOperator &FabricatorCatalog::PlanCreateTableAs(ClientContext &context, PhysicalPlanGenerator &planner,
                                                      LogicalCreateTable &op, PhysicalOperator &plan) {
-	MaterializeOwnScans(plan);
 	auto &create_info = op.info->base->Cast<CreateTableInfo>();
+	MarkSinkOnOwnScans(plan, create_info.schema, create_info.table, "create");
 
 	FabricatorCtasInfo info;
 	info.schema_name = create_info.schema;
@@ -374,10 +377,10 @@ PhysicalOperator &FabricatorCatalog::PlanCreateTableAs(ClientContext &context, P
 }
 PhysicalOperator &FabricatorCatalog::PlanInsert(ClientContext &context, PhysicalPlanGenerator &planner,
                                               LogicalInsert &op, optional_ptr<PhysicalOperator> plan) {
-	// INSERT ... SELECT reading this same catalog: drain the scan before the bulk load starts. `plan` is
-	// null for INSERT ... VALUES, which reads nothing and needs no rewrite.
+	// INSERT ... SELECT reading this same catalog: name the sink on those scans so the provider can decide
+	// whether to drain them. `plan` is null for INSERT ... VALUES, which reads nothing and needs no mark.
 	if (plan) {
-		MaterializeOwnScans(*plan);
+		MarkSinkOnOwnScans(*plan, op.table.schema.name, op.table.name, "insert");
 	}
 	FabricatorInsertTarget target;
 	target.returning = op.return_chunk;

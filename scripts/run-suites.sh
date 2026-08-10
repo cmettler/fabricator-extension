@@ -313,7 +313,10 @@ case "$TIER" in
         # 1826 since 2026-08-09: verify_read_isolation (+47). The tier went 46/1779 -> 47/1826, i.e. the gap
         # is EXACTLY the new suite and every pre-existing suite kept its own count — the behaviour-preservation
         # evidence that routing reads into the transaction changed nothing with the option UNSET (its default).
-        : "${MIN_ASSERTIONS:=1826}"
+        # 1837 since 2026-08-10: verify_mssql_s3_polybase 252 -> 263 — an INSERT ... SELECT into an EXTERNAL
+        # table from the same catalog, the shape whose scan the host marks. Every earlier external INSERT in
+        # that suite is INSERT ... VALUES, which has no scan, so the mark was entirely uncovered there.
+        : "${MIN_ASSERTIONS:=1837}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

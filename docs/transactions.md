@@ -773,6 +773,79 @@ the **`read_isolation` opt-in** fixes it too (3/3) and needs no database change,
 is a default. ⚠ And RCSI's guarantee is per scan-START instant rather than per statement, so a plan that
 starts its scans at different times reopens the gap — the opt-in's transaction-scoped snapshot does not.
 
+### 5.9 The same-catalog read+write mark NAMES THE SINK — the provider decides (2026-08-10)
+
+The host used to emit `"materialize": true` on a scan whose plan writes to the same catalog. That put a
+PROVIDER decision in the HOST: whether an open reader is a problem depends on how the backend is about to
+WRITE, and the host cannot know that. It now emits the sink's identity instead —
+`"sink": {"schema":…, "table":…, "kind":"insert"|"create"}` — and `SinkRequiresDrainedScan` answers on the
+provider side. Presence alone carries exactly what the boolean said, so `ScanSpec.HasSink` reproduces it.
+
+**MEASURED, which is why this is a fix and not a tidy-up.** `INSERT INTO <SQL Server external table>
+SELECT … FROM <a table in the same catalog>`, 200 000 rows:
+
+| | before | after |
+|---|---|---|
+| `mssql scan: drained to memory` | fires, `rows=200000` | **absent** |
+| what the write actually did | `delta bulk: streamed to files` | unchanged |
+| rows landed | 200001 | 200001 |
+
+The drain was protecting against a `SqlBulkCopy` that never runs: an external table's INSERT routes to
+STORAGE (`ExternalTableInsert`). And the drain has no spill — roughly one byte of working set per byte of
+result (§5.8) — so this was the full source buffered for nothing.
+
+**⚠ THE DECISION IS "DOES THE DRAIN BUY ANYTHING", NOT "IS A BULK LOAD COMING", and the difference is a
+second guard.** With MARS off, an ordinary scan reaches the pinned connection ONLY via the drain
+(`_marsEnabled || readYourWrites || materialize`), so dropping it there would cost READ-YOUR-WRITES on the
+source and, where this transaction has already written that table, convert a working statement into
+limitation 1.15's refusal. Hence `if (!_marsEnabled) return true;` before the external check. Verified both
+ways on the same shape: **MARS on ⇒ 0 drains, MARS off ⇒ 1 drain**, both landing 200001 rows.
+
+**⚠ Restricted to `kind = "insert"`.** A CTAS/replace over an external table is not the storage-write shape —
+`BulkInsert`'s own guard is `!createTable && !replace` — so claiming it would stream a scan into a bulk load
+that really does run.
+
+**Cost: none.** `DetectExternalTable` is cached per table and returns null immediately on a warehouse engine;
+on the path where it does probe, `BulkInsert` makes the identical call moments later and hits the same entry.
+
+**⚠ What is NOT gated, stated plainly.** `verify_mssql_s3_polybase` (252 → **263**) pins the RESULT of the
+INSERT-SELECT shape, which nothing covered before — every earlier external INSERT in that suite is
+`INSERT … VALUES`, which has no scan and never exercised the mark at all. It does NOT assert the streaming:
+whether a scan was drained is invisible from SQL. **The dangerous direction needs no new gate and already has
+one** — if the provider ever streamed a scan whose sink really does bulk-load, `verify_read_write_same_catalog`
+fails with 595 at its 30k+ row sections (still 101 assertions).
+
+**Why the sink is SINGULAR.** DuckDB gives a plan one sink, and MERGE INTO's several operators all address one
+target. The READ set needs no transport — each scan already knows the table it reads, and passes it as
+`touchKey`.
+
+#### What this unlocks next — Fabric `COPY INTO`, NOT BUILT (2026-08-10)
+
+The reason to move the decision rather than special-case external tables: **a write path that holds no reader
+makes the drain pointless, and the provider is where that is known.** The concrete candidate is loading a
+Fabric Warehouse by staging parquet and issuing `COPY INTO` on a separate connection, instead of
+`SqlBulkCopy`. Verified against the `COPY INTO` reference (Fabric moniker) before writing this down:
+
+- **OneLake IS a supported source** — `https://onelake.dfs.fabric.microsoft.com/<workspaceId>/<lakehouseId>/Files/`
+  — alongside ADLS Gen2 and Blob. Formats: CSV, JSONL, **PARQUET**.
+- **One statement consumes MANY files.** A folder path loads every file under it recursively, wildcards are
+  allowed, and a comma-separated list of locations is accepted (same storage account + container). The doc
+  explicitly prefers the list over a broad wildcard: *"For best performance, avoid specifying wildcards that
+  expand over a larger number of files. If possible, list multiple file locations instead."* That is what makes
+  a DuckDB `COPY … TO <dir> (FORMAT parquet)` — parallel, and already our fastest writer — a natural producer.
+- **⚠ OneLake as a source is ENTRA-ONLY**: *"COPY INTO using OneLake as source only supports EntraID
+  authentication."* No SAS, no account key. Our Fabric attach already carries an SP or the ambient token, but
+  the identity running the statement needs read access to the staging lakehouse — a permission story, not a
+  credential-plumbing one.
+- **⚠ Files beginning with `_` or `.` are IGNORED** unless named explicitly. A staging directory must not be
+  `_`-prefixed, and a Delta-style layout would have its `_delta_log` skipped — which is fine for plain parquet
+  staging and a trap for anything cleverer.
+
+What it needs that does not exist yet: a staging location option (`SET`/ATTACH, per the shape every other
+knob here uses), the parquet write to that location, `COPY INTO` generation, staged-file cleanup, and a
+decision about transaction semantics. **The refactor above is the only part that had to land first** — with
+the sink named, such a path answers `SinkRequiresDrainedScan` with `false` and the host never changes.
+
 ### 5.7 Intra-statement consistency — MEASURED 2026-08-09, and it is absent by default
 
 **ONE DuckDB statement can report two different states of ONE table, and a single scan can see a FRACTION of
