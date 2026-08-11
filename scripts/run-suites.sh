@@ -343,7 +343,13 @@ case "$TIER" in
         # reached each catalog, via the new fabricator_server_info `mars_enabled` row — every other section
         # of that suite passes VACUOUSLY on a MARS-ON catalog, and nothing in SQL could tell before).
         # 2005 since 2026-08-11: verify_mars_dynamic (+44) — see the MIN_SUITES note above.
-        : "${MIN_ASSERTIONS:=2005}"
+        # 2024 since 2026-08-11: verify_mars_off_same_catalog 95 -> 104 and verify_mars_dynamic 44 -> 57,
+        # both re-pinned when `mssql_materialize` went back to a flat `true`. ⚠ NEITHER WAS A NUMBER BUMP.
+        # Each suite had a section whose A/B rested on `materialize` FOLLOWING MARS, so with the flat default
+        # both legs take the same route and the section stops varying with MARS at all — mars_dynamic §3 was
+        # the load-bearing one, and re-pinning its 200 to 400 would have left it asserting nothing. Both now
+        # discriminate on observables `materialize` cannot reach.
+        : "${MIN_ASSERTIONS:=2024}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

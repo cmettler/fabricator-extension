@@ -100,16 +100,84 @@ false
 # straight from the setting and every assertion above would still pass while connections kept using the
 # cached mode.
 #
-# The observable is READ-YOUR-WRITES on a same-catalog self-insert inside one transaction, and it is a true
-# A/B: the two sessions share ONE attached catalog and run BYTE-IDENTICAL statements against their own
-# tables, differing only in `mssql_mars`. `mssql_materialize` defaults to whatever MARS is, so
-#   • MARS on  ⇒ the scan is drained onto the transaction's pinned connection ⇒ it sees the uncommitted
-#     200 rows ⇒ 400;
-#   • MARS off ⇒ it streams POOLED at SNAPSHOT ⇒ it sees committed state, which is empty ⇒ 200.
-# Under the old catalog-wide mode these two could not differ at all.
+# ⚠ THIS SECTION USED A DIFFERENT OBSERVABLE UNTIL 2026-08-11, AND THAT ONE IS NOW DEAD. It ran a
+# same-catalog self-insert and read 400 vs 200, which worked only because `mssql_materialize` FOLLOWED
+# MARS: the MARS-off leg streamed pooled at SNAPSHOT and saw committed state. With materialize back to a
+# flat `true` BOTH legs drain and pin, so both answer 400 and the A/B no longer varies with MARS at all.
+# §3b below pins that new uniformity rather than deleting the measurement.
 #
-# ⚠ The 200 is an ASSERTION OF ABSENCE (no read-your-writes) and is only meaningful beside the 400 — which
-# is why both legs are here rather than just the interesting one.
+# The live observable is an ORDINARY read — a plain SELECT, not a scan feeding a write — of a table THIS
+# transaction has already written. It is the right one precisely because `materialize` cannot reach it:
+# that setting routes MARKED scans only, so this asks about MARS and nothing else.
+#   • MARS on  ⇒ the read reuses the transaction's pinned connection ⇒ it succeeds and sees the
+#     uncommitted row;
+#   • MARS off ⇒ it would have to run pooled, where it would wait forever on locks only this transaction
+#     can release, so EnsureScanCannotSelfBlock REFUSES it up front.
+# Two sessions, ONE attached catalog, byte-identical statements, differing only in `mssql_mars`. Under the
+# old catalog-wide mode these two could not differ at all.
+#
+# ⚠ The refusal is an ASSERTION OF ABSENCE and is only meaningful beside the success — which is why both
+# legs are here rather than just the interesting one.
+#
+# ⚠ MUTATION-TESTED TWICE, AND THE SECOND RESULT IS A CAVEAT RATHER THAN A CLEAN KILL — say it that way.
+# Making the MARS resolver session-blind dies immediately at §1, so it proves nothing about §3. The
+# §3-specific mutant is one where `mars_enabled` REPORTING stays correct and only the ROUTING ignores MARS
+# (`TxnMars() => true`), which is exactly the hazard this section exists for — and it does NOT produce a
+# failure. It HANGS: forcing the routing to believe MARS is available sends the read to a pooled
+# connection that waits forever on locks only this transaction can release, which is limitation 1.15's
+# unbounded wait and precisely what the refusal prevents. So the section is discriminating, but its
+# mutant is a hang, and no assertion here can catch a hang. Do not record it as "mutation-tested, killed".
+
+statement ok con_a
+CREATE OR REPLACE TABLE d.dbo.mdyn_ryw AS SELECT i AS a FROM range(10) t(i);
+
+statement ok con_a
+BEGIN;
+
+statement ok con_a
+INSERT INTO d.dbo.mdyn_ryw VALUES (99);
+
+# con_a: MARS on (nothing set) ⇒ the read joins the transaction and sees its uncommitted row.
+query I con_a
+SELECT count(*) FROM d.dbo.mdyn_ryw;
+----
+11
+
+statement ok con_a
+COMMIT;
+
+statement ok con_b
+SET mssql_mars = 'false';
+
+statement ok con_b
+CREATE OR REPLACE TABLE d.dbo.mdyn_ryw_b AS SELECT i AS a FROM range(10) t(i);
+
+statement ok con_b
+BEGIN;
+
+statement ok con_b
+INSERT INTO d.dbo.mdyn_ryw_b VALUES (99);
+
+# con_b: MARS off ON THE SAME CATALOG ⇒ the identical read is refused rather than deadlocking.
+statement error con_b
+SELECT count(*) FROM d.dbo.mdyn_ryw_b;
+----
+mssql_mars is off
+
+statement ok con_b
+ROLLBACK;
+
+statement ok con_a
+DROP TABLE d.dbo.mdyn_ryw;
+
+statement ok con_b
+DROP TABLE d.dbo.mdyn_ryw_b;
+
+# §3b — MARS NO LONGER CHANGES A MARKED SCAN'S ANSWER, and that is the point rather than a gap.
+# `materialize` defaults to true on every engine, so a same-catalog self-insert is drained and pinned
+# whether or not MARS is available — the bulk deferral is what makes that safe without MARS. Both legs
+# therefore see their own uncommitted rows. Asserted on BOTH sessions so a regression that quietly
+# restored the MARS-dependent routing would show up as one leg answering 200.
 
 statement ok con_a
 CREATE OR REPLACE TABLE d.dbo.mdyn_a_src AS SELECT i AS a, ('v' || i::VARCHAR) AS b FROM range(200) t(i);
@@ -156,11 +224,12 @@ INSERT INTO d.dbo.mdyn_b_dst SELECT * FROM d.dbo.mdyn_b_dst;
 statement ok con_b
 COMMIT;
 
-# con_b: MARS off ON THE SAME CATALOG ⇒ the self-insert's scan reads committed state, which is still empty.
+# con_b: MARS off ON THE SAME CATALOG ⇒ the SAME 400. It read 200 until 2026-08-11, when `materialize`
+# followed MARS and this scan therefore streamed from a committed snapshot.
 query I con_b
 SELECT count(*) FROM d.dbo.mdyn_b_dst;
 ----
-200
+400
 
 statement ok con_a
 DROP TABLE d.dbo.mdyn_a_dst;
