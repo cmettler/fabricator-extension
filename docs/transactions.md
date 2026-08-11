@@ -1016,7 +1016,7 @@ transaction's uncommitted rows, without which the first assertion would pass equ
 disabled outright.
 
 **The DEFAULTS, spelled out, because "default" in a cell is useless:** `mssql_mars` = **auto** (⇒ ON on box
-and Azure SQL, unavailable on Fabric/Synapse); `mssql_materialize` = **follows MARS** (true where MARS is on, false where it is not — see THE FIX below); `mssql_read_isolation` =
+and Azure SQL, unavailable on Fabric/Synapse); `mssql_materialize` = **`true`** (a flat default again since 2026-08-11 — it followed MARS for one day, see THE FIX below); `mssql_read_isolation` =
 **unset** (off); `mssql_copy_into_staging` = **unset** (off). So rows 3–6 are the SHIPPED configuration on
 Fabric with nothing set, and row 1 is the shipped configuration on box.
 
@@ -1096,9 +1096,20 @@ Gates: hermetic **67/67 — 6895** and service **49/49 — 1935 at the time**, b
 uses 200 rows rather than 15 ON PURPOSE: the underlying failure is a race that a small scan sometimes wins, and
 a gate that fails only sometimes is worse than none.
 
-#### THE FIX — `mssql_materialize` now DEFAULTS TO MARS (2026-08-10)
+#### THE FIX — `mssql_materialize` DEFAULTED TO MARS (2026-08-10) — ⚠ **REVERSED 2026-08-11**
 
-`ResolveMaterialize()` was `set ?? _materialize ?? true`; it is now `set ?? _materialize ?? _marsEnabled`. On a
+> ⚠ **The default is a flat `true` again (user decision, 2026-08-11) — and the hazard below is NOT reachable
+> from it, which is the opposite of what I first wrote here.** `ResolveMaterialize()` reads
+> `set ?? _materialize ?? true`. The 0-of-8 measurement in this section predates **the bulk deferral**
+> (§5.9, same day), which made `WriteToServer` acquire SECOND and turned the very same configuration into
+> 8 of 8 with read-your-writes. MEASURED again under the new default on a `mars 'false'` catalog: the
+> same-catalog INSERT and CTAS run clean and the read-your-writes probe answers **15**, not 10.
+>
+> So read this section as *why following MARS looked necessary before the deferral*. The live trade is
+> DRAIN vs STREAM — memory and CPU, per §5.9's own 1M-row numbers — and `SET mssql_materialize='false'` is
+> how you take the streaming side.
+
+`ResolveMaterialize()` was `set ?? _materialize ?? true`; it became `set ?? _materialize ?? _marsEnabled`. On a
 MARS engine nothing changes (the marked scan is still drained and pinned, and row 1 keeps read-your-writes).
 Without MARS the marked scan takes the SNAPSHOT-READ route — pooled, at SNAPSHOT — so it never shares the
 connection with the load. **Measured: the box shape went from 0 of 8 to 8 of 8.**

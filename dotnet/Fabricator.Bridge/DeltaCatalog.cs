@@ -344,15 +344,33 @@ public sealed class DeltaCatalog : IBackendCatalog
         _pushdownMode = ParsePushdownFiltersOption(optionsJson, _nativeRead);
         _copyDisposition = ParseStringOption(optionsJson, "copy_disposition");
         var isolation = ParseStringOption(optionsJson, "isolation_level");
-        // DEFAULT = serializable (2026-08-01, behaviour-breaking). It used to be write_serializable on the
-        // belief that this matched Spark; MEASURED FALSE — Fabric Spark commits at Serializable, so the old
-        // default made US the weaker writer on any table that does not declare a level, and which engine
-        // wrote last silently decided the guarantee. Aligning removes that. Explicit options still win, and a
-        // table's own delta.isolationLevel still overrides the catalog (PendingSerializable).
+        // DEFAULT = write_serializable (restored 2026-08-11 by user decision, reversing the 2026-08-01 flip
+        // to serializable). Explicit options still win, and a table's own delta.isolationLevel still
+        // overrides the catalog (PendingSerializable).
+        //
+        // ⚠ WHAT THE FLIP TO `serializable` WAS FOR, kept because the finding stands and the trade-off is
+        // now taken the other way: `write_serializable` is DATABRICKS' default, NOT Spark's. Fabric Spark
+        // 4.1.1 records `Serializable` for its own commits and its DDL validator REJECTS
+        // `delta.isolationLevel='WriteSerializable'` outright. So on a shared table that DECLARES NO LEVEL we
+        // are again the more permissive writer, and which engine wrote last decides the effective guarantee.
+        // Attach `isolation_level 'serializable'` to match Fabric Spark.
+        //
+        // ⚠ WHAT IT BUYS, and why it is a defensible default rather than merely looser: ROW-LEVEL CONCURRENCY
+        // is a WriteSerializable-ONLY relaxation, so concurrent disjoint-row DML on one file COMPOSES here and
+        // CONFLICTS under serializable. That is the property `verify_delta_row_level_concurrency` exists for.
+        //
+        // ⚠ AND IT MAKES A KNOWN OVER-BROAD OPT-IN LIVE. The Bridge sets
+        // `ExemptRowLevelFromWholeTableRead` UNCONDITIONALLY while the departure it licenses is justified by
+        // ROW-LOCALITY; EW's gate is `exempt && rowLevel && isolationLevel != Serializable`, so under the
+        // 2026-08-01 default the flag was IGNORED and the looseness was unreachable. It is reachable again:
+        // `BEGIN; SELECT avg(x) FROM t; DELETE FROM t WHERE x > 42; COMMIT;` is exempted although the
+        // row-level validation covers only the REMOVED rows, not a threshold derived from a whole-table read.
+        // Fixing it needs provenance on `ReadWholeTable` (DML's own scan vs an arbitrary SELECT), which the
+        // buffer does not carry. Reasoned, not measured, and no longer inert.
         _serializable = isolation?.Replace("_", "").ToLowerInvariant() switch
         {
-            null or "" or "serializable" => true,
-            "writeserializable" => false,
+            "serializable" => true,
+            null or "" or "writeserializable" => false,
             _ => throw new System.ArgumentException(
                 $"delta: unknown isolation_level '{isolation}' — expected 'serializable' or 'write_serializable'."),
         };

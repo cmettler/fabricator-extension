@@ -1409,17 +1409,28 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         }
     }
 
-    // SET mssql_materialize wins if set, else this catalog's `materialize` ATTACH option, else it FOLLOWS
-    // MARS: true where MARS is available, false where it is not.
+    // SET mssql_materialize wins if set, else this catalog's `materialize` ATTACH option, else TRUE.
     //
-    // ⚠ THE DEFAULT IS MARS-DEPENDENT BECAUSE DRAINING IS UNSAFE WITHOUT MARS — measured 2026-08-10, and the
-    // flat `true` it replaces was a shipped defect rather than a conservative choice. Draining PINS the
-    // marked scan onto the transaction's connection, and the bulk's consumer calls `SqlBulkCopy.WriteToServer`
-    // on that same connection as soon as it starts — so reader and load are concurrent BY CONSTRUCTION. With
-    // MARS they coexist; without it they cannot, and the statement dies: box with `mssql_mars='false'` failed
-    // **0 of 8** runs, Fabric (no MARS at all) 4 of 4, variously as *"does not support
-    // MultipleActiveResultSets"*, *"already an open DataReader"*, or a 30 s `Execution Timeout` that takes the
-    // whole transaction with it. Full grid: docs/transactions.md §5.6a.
+    // ⚠ THE FLAT `true` IS A USER DECISION (2026-08-11), AND IT IS NOT THE HAZARD THE HISTORY MAKES IT LOOK.
+    // Between 2026-08-10 and 2026-08-11 this read `?? TxnMars()`, i.e. it FOLLOWED MARS, because draining PINS
+    // the marked scan onto the transaction's connection and `SqlBulkCopy.WriteToServer` wanted that same
+    // connection — box with `mssql_mars='false'` failed 0 of 8 and Fabric 4 of 4. **That measurement predates
+    // the BULK DEFERRAL, which landed the same day.** `BulkSession` now waits for the first batch (or
+    // end-of-stream) before calling BulkInsert, so the load always acquires SECOND, after a drained scan has
+    // finished and released. MEASURED after it: `mars='false'` + `materialize='true'` went 0 of 8 to **8 of 8,
+    // with read-your-writes restored** — gated at verify_mars_off_same_catalog §6, which calls it a supported
+    // configuration rather than an accident.
+    //
+    // ⇒ the flat default makes that working configuration the default on EVERY engine, MARS or not, and
+    // read-your-writes on the scanned table comes with it (measured 15 rows where the pooled route answers
+    // 10). The real trade is DRAIN vs STREAM — the whole source is buffered in memory with no spill, and a
+    // same-catalog 1M-row CTAS on Fabric measured ~27% more CPU and 484 MB more allocation drained than
+    // streamed. `SET mssql_materialize='false'` (or the `materialize false` ATTACH option) takes the
+    // snapshot-read route and buys the streaming back, at the cost of read-your-writes.
+    //
+    // ⚠ DO NOT RE-DERIVE THE OLD WARNING FROM THE OLD NUMBERS. "No MARS ⇒ draining deadlocks" was true for
+    // one day and is false now; the 0-of-8 grid in docs/transactions.md §5.6a describes the pre-deferral
+    // engine. I asserted the hazard three times from those numbers before measuring it.
     //
     // ⚠ FALSE HERE MEANS THE SNAPSHOT-READ ROUTE, NOT A PLAIN POOLED READ, and that distinction is what makes
     // it safe. `ScanFromSource` maps it to `snapshotRead`, i.e. pooled AND at SNAPSHOT — which is exempt from
@@ -1440,10 +1451,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     internal bool ResolveMaterialize()
     {
         var set = ProviderSettingsStore.Instance.GetBool(SqlServerBackend.ProviderName, "mssql_materialize");
-        // TxnMars(), not EffectiveMars(): the default exists because draining PINS the scan onto the write
-        // connection, so the question is whether THAT connection can carry it — the pinned one when this
-        // transaction already has one.
-        return set ?? _materialize ?? TxnMars();
+        return set ?? _materialize ?? true;
     }
 
     /// <summary>

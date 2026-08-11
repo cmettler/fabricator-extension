@@ -1102,6 +1102,16 @@ OSS Delta **knows** the enum value — it is the **table-property validator** th
       | `Serializable` | ✅ Spark named our commit (v8) | **ABORTED** — `DELTA_CONCURRENT_APPEND` |
       | `WriteSerializable` | ✅ Spark named our commit (v23) | **ABORTED** — same error |
 
+      > ⚠ **"we never emit that field" IS HISTORY — the write half shipped 2026-08-08 and the surface grew
+      > again on 2026-08-11.** A buffered append inside an explicit transaction now declares `true` when it
+      > read nothing and `false` when it did; autocommit still declares nothing, deliberately, because
+      > scan-time read recording is gated on the transaction being explicit. Since the engineered-wood bump
+      > onto `upstream/main`, EW ALSO writes the field for commits it drives itself — and its plain-append
+      > path claimed `true` on our behalf, which the `fabricator-patches-v3` patch reverses (a host that
+      > scanned the table and staged the result made a read EW never saw). See
+      > [ew-master-migration.md](ew-master-migration.md) §THE 2026-08-11 BUMP §4. The measurement below
+      > stands as the reason the field matters; only the "we emit nothing" premise has moved.
+
       **Both abort.** The relaxation exists (link 1) and the property does select the level (link 2),
       but it buys our appends nothing — because the exemption applies only to files from a commit
       marked `isBlindAppend`, and **we never emit that field**:

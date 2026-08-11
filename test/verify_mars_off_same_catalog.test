@@ -29,10 +29,16 @@ require-env MSSQL_TESTDB_DSN
 # deterministic (8/8 after, 0/8 before). If one of them ever goes intermittent, treat that as the bug
 # returning, not as a flaky test.
 #
-# The fix: `mssql_materialize` DEFAULTS TO MARS. On a MARS engine a marked scan is still drained and
-# pinned (§1, read-your-writes preserved); without MARS it takes the snapshot-read route — pooled, at
-# SNAPSHOT — so it never shares the connection with the load. The cost is read-your-writes on the
-# scanned table, accepted deliberately for a bulk path and pinned in §4.
+# ⚠ THE FIX THAT MADE THESE SECTIONS PASS IS NOT THE ONE THIS HEADER USED TO NAME, and the distinction
+# decides how to read every number below. It said "the fix: `mssql_materialize` DEFAULTS TO MARS", i.e.
+# the no-MARS scan avoids the collision by not being drained. That default existed for ONE DAY. The fix
+# that actually holds is the BULK DEFERRAL (docs/transactions.md §5.9): BulkSession waits for the first
+# batch — or end-of-stream — before calling BulkInsert, so `WriteToServer` can no longer own the
+# connection while it is merely waiting for rows, and the load always acquires SECOND. That makes the
+# DRAINED scan safe without MARS, which §6 measured at 8 of 8 where it had been 0 of 8.
+#
+# Since 2026-08-11 `mssql_materialize` is a flat `true` again, so the drained route is the default on
+# every engine and read-your-writes comes with it (§4a). The streaming route is now the opt-OUT (§4b).
 
 # ⚠ THE MODE IS A PER-CATALOG **ATTACH OPTION** HERE, AND IT HAS TO BE — a `SET` cannot express this suite
 # any more. Until 2026-08-11 MARS was frozen per catalog at its first connect, so `SET` before each ATTACH
@@ -194,20 +200,29 @@ SELECT count(*) FROM m_off.dbo.mf_src;
 201
 
 # ═════════════════════════════════════════════════════════════════════════════════════════════════
-# §4  MARS OFF — READ-YOUR-WRITES IS ABSENT. The accepted cost, pinned.
+# §4  MARS OFF — READ-YOUR-WRITES IS PRESENT BY DEFAULT, and the streaming route is the opt-OUT
 # ═════════════════════════════════════════════════════════════════════════════════════════════════
 #
-# Without MARS the marked scan reads a committed snapshot, so a table this transaction has just
-# written is seen at its COMMITTED state. That is deliberate (a bulk path moves bytes; it does not
-# need to observe its own uncommitted rows) and it is the direct trade for §2 working at all — every
-# configuration that WOULD deliver read-your-writes here is one that deadlocks.
+# ⚠ THIS SECTION ASSERTED THE OPPOSITE UNTIL 2026-08-11, and the reversal is the interesting part rather
+# than a number that moved. It used to read "READ-YOUR-WRITES IS ABSENT — the accepted cost", justified by
+# "every configuration that WOULD deliver read-your-writes here is one that deadlocks". That justification
+# was true when it was written and had ALREADY been overtaken by the BULK DEFERRAL on the same day:
+# BulkSession now waits for the first batch before calling BulkInsert, so the load always acquires SECOND
+# and a drained scan finishes and releases first. §6 measured exactly that (0 of 8 → 8 of 8) and pinned it
+# as a supported configuration — while this section went on describing it as impossible.
 #
-# It is pinned rather than left implicit so that regaining it — or losing it on a MARS engine, where
-# §1 asserts it is still there — has to be a deliberate change with a failing test attached.
+# With `mssql_materialize` back to a flat `true` (2026-08-11) that supported configuration IS the default,
+# so a no-MARS engine now gets read-your-writes with no setting at all.
+#
+# ⚠ TWO LEGS, BECAUSE ONE PROVES NOTHING. §4a alone would pass equally if the scan had silently become a
+# plain uncommitted read; §4b is the discriminator — same catalog, same statements, ONE setting different,
+# opposite answer. Together they pin the trade the default now makes: buffering (memory, CPU) in exchange
+# for seeing this transaction's own rows.
 
 statement ok
 CREATE OR REPLACE TABLE m_off.dbo.mf_ryw AS SELECT i AS a FROM range(10) t(i);
 
+# §4a — THE DEFAULT: no SET anywhere, MARS off, and the scan is drained onto the transaction's connection.
 statement ok
 BEGIN;
 
@@ -220,18 +235,54 @@ CREATE OR REPLACE TABLE m_off.dbo.mf_ryw_copy AS SELECT a FROM m_off.dbo.mf_ryw;
 statement ok
 COMMIT;
 
-# 10, not 15: the five rows inserted in the same transaction were not visible to the scan.
+# 15: the five rows inserted in the same transaction WERE visible to the scan.
 query I
 SELECT count(*) FROM m_off.dbo.mf_ryw_copy;
 ----
-10
+15
 
-# ⚠ THE CONTROL THAT MAKES THE 10 MEANINGFUL. Without it, a `10` above would pass equally if the
-# INSERT had simply done nothing — which is exactly the pre-fix failure mode.
+# ⚠ THE CONTROL. Without it a `15` above would pass equally if the CTAS had simply re-read the table after
+# the COMMIT rather than during the transaction — so the source must independently hold 15 too.
 query I
 SELECT count(*) FROM m_off.dbo.mf_ryw;
 ----
 15
+
+# §4b — THE OPT-OUT: `materialize='false'` sends the marked scan down the snapshot-read route (pooled, at
+# SNAPSHOT), which is what keeps it STREAMING. The cost is exactly the read-your-writes §4a just showed.
+statement ok
+SET mssql_materialize='false';
+
+statement ok
+CREATE OR REPLACE TABLE m_off.dbo.mf_ryw2 AS SELECT i AS a FROM range(10) t(i);
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO m_off.dbo.mf_ryw2 SELECT 100 + i FROM range(5) t(i);
+
+statement ok
+CREATE OR REPLACE TABLE m_off.dbo.mf_ryw2_copy AS SELECT a FROM m_off.dbo.mf_ryw2;
+
+statement ok
+COMMIT;
+
+# 10, not 15: the scan read a committed snapshot and never saw the transaction's own rows.
+query I
+SELECT count(*) FROM m_off.dbo.mf_ryw2_copy;
+----
+10
+
+# ⚠ THE CONTROL THAT MAKES THE 10 MEANINGFUL. Without it, a `10` would pass equally if the INSERT had
+# simply done nothing — which is exactly the pre-deferral failure mode.
+query I
+SELECT count(*) FROM m_off.dbo.mf_ryw2;
+----
+15
+
+statement ok
+RESET mssql_materialize;
 
 # ═════════════════════════════════════════════════════════════════════════════════════════════════
 # §5  MARS OFF + `read_isolation` — the combination that was REFUSED outright
@@ -241,11 +292,15 @@ SELECT count(*) FROM m_off.dbo.mf_ryw;
 # scan to stay OUTSIDE the transaction on a pooled connection, the other for every read to be INSIDE
 # it. Both are active requests, so refusing and letting the user pick is right.
 #
-# ⚠ BUT THAT CHECK TESTED THE RESOLVED VALUE, AND `materialize` NOW DEFAULTS TO MARS — so on any
-# no-MARS engine it resolves false with NOBODY having requested it, and the refusal fired for every
-# user who set `read_isolation` alone. Measured: 3 of 3 runs refused on box with MARS off; on
-# Fabric, where the default is always false, `read_isolation` would have been unusable outright.
-# A DEFAULT IS NOT A REQUEST — the check now tests what the user supplied, not what resolved.
+# ⚠ BUT THAT CHECK TESTED THE RESOLVED VALUE, and for one day (2026-08-10..08-11) `materialize`
+# DEFAULTED TO MARS — so on any no-MARS engine it resolved false with NOBODY having requested it, and
+# the refusal fired for every user who set `read_isolation` alone. Measured then: 3 of 3 runs refused
+# on box with MARS off; on Fabric, where that default was always false, `read_isolation` would have
+# been unusable outright. A DEFAULT IS NOT A REQUEST — the check tests what the user SUPPLIED.
+#
+# The flat `true` default (2026-08-11) means that hazard cannot arise from the default any more, but
+# the narrowing stays right and stays gated: an EXPLICIT `materialize='false'` beside `read_isolation`
+# is still two contradicting requests, pinned at the end of this section.
 
 # ⚠ `mars 'false'` as an ATTACH option, NOT a SET: a SET would apply to m_on and m_off as well (it outranks
 # the option and is not per catalog), which would undo §1's control and every assertion that rests on it.
@@ -264,19 +319,22 @@ BEGIN;
 statement ok
 INSERT INTO r_iso.dbo.ri_src VALUES (999);
 
-# The marked scan takes the POOLED snapshot route even here: `read_isolation` pins ORDINARY reads,
-# but pinning a scan that feeds a bulk load is the collision this whole file is about.
+# The marked scan is DRAINED and pinned, because `materialize` defaults to true — so it joins the
+# transaction here just as an ordinary `read_isolation` read does, and the two options no longer pull in
+# opposite directions at the default.
 statement ok
 INSERT INTO r_iso.dbo.ri_dst SELECT a FROM r_iso.dbo.ri_src;
 
 statement ok
 COMMIT;
 
-# 200, not 201 — committed state, the same read-your-writes trade as §4.
+# 201, not 200 — the row this transaction inserted WAS visible to the scan. ⚠ It read 200 until
+# 2026-08-11, when `materialize` followed MARS and this scan therefore streamed from a pooled snapshot;
+# the flip is the same one §4a records, reached here through a catalog that also sets `read_isolation`.
 query I
 SELECT count(*) FROM r_iso.dbo.ri_dst;
 ----
-200
+201
 
 # ⚠ POSITIVE CONTROL: `read_isolation` MUST STILL PIN AN ORDINARY READ. Without this, §5 above would
 # pass equally if the option had simply been disabled. The observable is sharp: with MARS off, reading
@@ -324,14 +382,15 @@ RESET mssql_materialize;
 # had asked for one. Deferring makes the order deterministic — the load always acquires SECOND, after
 # a drained scan has finished and released.
 #
-# ⚠ THIS IS A SUPPORTED CONFIGURATION, NOT AN ACCIDENT, WHICH IS WHY IT IS PINNED. It is the only way
-# to get read-your-writes on an engine without MARS. Nothing else in this file covers it: §2–§4 pin
-# the DEFAULT (materialize follows MARS ⇒ false here), so a change that re-broke the explicit case
-# would leave every other section green.
+# ⚠ THIS IS A SUPPORTED CONFIGURATION, NOT AN ACCIDENT, WHICH IS WHY IT IS PINNED — and since
+# 2026-08-11 it is also the DEFAULT (§4a reaches the same place with no setting at all). What §6 still
+# adds over §4a is that the EXPLICIT `SET mssql_materialize='true'` reaches it too: the setting and the
+# default are separate code paths (`set ?? _materialize ?? true`), and a regression that broke the
+# resolver's first branch would leave §4a green.
 #
 # ⚠ AND §6b IS THE HALF THAT MATTERS. §6a only says "the statement ran"; a regression could make it
-# run by silently falling back to a POOLED scan, which is exactly §4's behaviour. §6b is the
-# discriminator: same engine, same statement, ONE setting different from §4, opposite answer.
+# run by silently falling back to a POOLED scan, which is exactly §4b's behaviour. §6b is the
+# discriminator: same engine, same statement, ONE setting different from §4b, opposite answer.
 
 statement ok
 SET mssql_materialize='true';

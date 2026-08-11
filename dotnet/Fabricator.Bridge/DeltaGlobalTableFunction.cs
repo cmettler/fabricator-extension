@@ -549,13 +549,21 @@ internal static class DeltaWriter
         // with the stamp in place, attaching the same path twice at two levels stopped honoring the second
         // one, which is exactly the composition our own level-contrast suites rely on.
         //
-        // Not stamping costs nothing in the common case, because the DEFAULT now matches Fabric Spark
-        // (Serializable) — silence already means cross-engine agreement. A user who deliberately runs
-        // write_serializable and wants every engine to honor it can say so explicitly and durably, with
+        // ⚠ THE ORIGINAL JUSTIFICATION FOR NOT STAMPING IS NOW STALE, AND THE REASON STILL HOLDS. It read:
+        // "not stamping costs nothing, because the DEFAULT now matches Fabric Spark (Serializable) — silence
+        // already means cross-engine agreement". Since the catalog default went back to write_serializable
+        // (2026-08-11) SILENCE NO LONGER MEANS AGREEMENT: a table created here and declaring nothing is read
+        // as Serializable by Spark and as WriteSerializable by us, so a user relying on ROW-LEVEL CONCURRENCY
+        // across engines does not get it from the catalog default alone.
+        //
+        // Stamping is still the wrong fix, for the reason above rather than for that one: the property
+        // outranks EVERY catalog, so an ephemeral attach-time choice would become permanent and would
+        // silently override a later, explicit setting on another attach. MEASURED when the stamp existed.
+        //
+        // The durable, per-table, visible-in-the-SQL route is unchanged:
         // CREATE TABLE ... WITH ("delta.isolationLevel"='WriteSerializable') or
-        // fabricator_delta_set_tblproperties; Spark HONORS such a value even though its own DDL refuses to
-        // set it (measured 2026-07-31). That path is deliberate, visible in the SQL, and per-table.
-        // docs/delta-transactions.md §10.6a.
+        // fabricator_delta_set_tblproperties. Spark HONORS such a value even though its own DDL refuses to
+        // set it (measured 2026-07-31). docs/delta-transactions.md §10.6a.
         if (deletionVectors)
         {
             config["delta.enableDeletionVectors"] = "true";

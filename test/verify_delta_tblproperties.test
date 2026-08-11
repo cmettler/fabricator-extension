@@ -194,11 +194,16 @@ WHERE content LIKE '%WriteSerializable%';
 statement ok
 DETACH dc;
 
-# ---- The CATALOG DEFAULT is serializable (changed 2026-08-01) ----
-# Pinned directly, because everything above now states its level EXPLICITLY — without this, a regression in
-# the default would not fail any test. The shape is slice 2's, minus the property and minus the ATTACH
-# option: a concurrent blind append MATCHING the transaction's read predicate must CONFLICT, which is the
-# serializable behaviour. Under the old write_serializable default the same shape committed.
+# ---- The CATALOG DEFAULT is write_serializable (restored 2026-08-11; was serializable 2026-08-01..08-11) ----
+# Pinned directly, because everything above states its level EXPLICITLY — without this, a regression in the
+# default would not fail any test. The shape is slice 2's, minus the property and minus the ATTACH option: a
+# concurrent blind append MATCHING the transaction's read predicate. Under write_serializable it COMMITS
+# (a blind append is exempt from the reader's predicate check); under serializable it conflicts.
+#
+# ⚠ THREE LEGS, EACH THE OTHERS' CONTROL, and the first is worthless alone. "The commit succeeded" would pass
+# equally if conflict detection had stopped working entirely, or if the transaction had never recorded a read
+# — so the STRICTER legs have to be here, and they have to reach strictness by the two different routes that
+# outrank a catalog default: the per-table PROPERTY (§b) and the ATTACH OPTION (§c).
 
 statement ok
 ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/defiso' AS dflt (TYPE fabricator, PROVIDER 'delta');
@@ -206,12 +211,14 @@ ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/defiso' AS dflt (TYPE fabricator, PROVIDER
 statement ok
 CREATE TABLE dflt.main.t AS SELECT i AS id, 'x' AS name FROM range(10) t(i);
 
-# no property was stamped, so the level really does come from the catalog default
+# No property was stamped — not by the default and not by anything else — so the level really does come from
+# the catalog default. This is also the assertion that pins "a CREATE never bakes the catalog's level in".
 query I
 SELECT count(*) FROM fabricator_delta_tblproperties('dflt', 'main.t') WHERE property = 'delta.isolationLevel';
 ----
 0
 
+# §a — THE DEFAULT: the blind append is exempt, so the transaction commits.
 statement ok con1
 BEGIN;
 
@@ -221,14 +228,14 @@ DELETE FROM dflt.main.t WHERE id = 1;
 statement ok con2
 INSERT INTO dflt.main.t VALUES (1, 'dup');
 
-statement error con1
+statement ok con1
 COMMIT;
-----
-transaction conflict
 
-# and the looser level is still reachable per-table, overriding that default
+# §b — the STRICTER level is reachable per-table and OVERRIDES the catalog default. This is the direction
+# that matters for cross-engine work: Fabric Spark commits at Serializable and its DDL cannot set
+# WriteSerializable, so a table shared with it wants this property rather than an ATTACH option.
 statement ok
-SELECT * FROM fabricator_delta_set_tblproperties('dflt', 'main.t', '{"delta.isolationLevel":"WriteSerializable"}');
+SELECT * FROM fabricator_delta_set_tblproperties('dflt', 'main.t', '{"delta.isolationLevel":"Serializable"}');
 
 statement ok con1
 BEGIN;
@@ -239,11 +246,43 @@ DELETE FROM dflt.main.t WHERE id = 3;
 statement ok con2
 INSERT INTO dflt.main.t VALUES (3, 'dup2');
 
-statement ok con1
+statement error con1
 COMMIT;
+----
+transaction conflict
 
 statement ok
 DETACH dflt;
+
+# §c — the ATTACH OPTION reaches the same strictness on a table that declares NOTHING, which is what
+# separates "the property was read" from "the option was read". Its own root, so no property can leak in.
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/defiso_s' AS strict (TYPE fabricator, PROVIDER 'delta', isolation_level 'serializable');
+
+statement ok
+CREATE TABLE strict.main.t AS SELECT i AS id, 'x' AS name FROM range(10) t(i);
+
+query I
+SELECT count(*) FROM fabricator_delta_tblproperties('strict', 'main.t') WHERE property = 'delta.isolationLevel';
+----
+0
+
+statement ok con1
+BEGIN;
+
+statement ok con1
+DELETE FROM strict.main.t WHERE id = 5;
+
+statement ok con2
+INSERT INTO strict.main.t VALUES (5, 'dup3');
+
+statement error con1
+COMMIT;
+----
+transaction conflict
+
+statement ok
+DETACH strict;
 
 # ============================================================================
 # delta.checkpointInterval is HONOURED, not merely stored
