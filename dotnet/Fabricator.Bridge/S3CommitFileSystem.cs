@@ -119,6 +119,18 @@ internal sealed class S3CommitFileSystem : ITableFileSystem
         _client = new Lazy<IAmazonS3>(() => BuildClient(_cred));
     }
 
+    /// <summary>
+    /// <inheritdoc cref="ITableFileSystem.PathConstraints"/>
+    /// </summary>
+    /// <remarks>
+    /// S3 holds any byte sequence in a key, so there is nothing to report — the same answer
+    /// engineered-wood's own <c>S3TableFileSystem</c> gives, and it MEASURED it. Stated directly rather
+    /// than delegated to <see cref="_inner"/>: this class is only ever constructed for an <c>s3://</c>
+    /// root (see <see cref="IsS3"/>), so the storage is known here and does not depend on the inner
+    /// filesystem answering correctly for a scheme it merely forwards.
+    /// </remarks>
+    public PathNameConstraints PathConstraints => PathNameConstraints.None;
+
     /// <summary>True when <paramref name="path"/> is an <c>s3://</c> URL.</summary>
     public static bool IsS3(string path) =>
         path.TrimStart().StartsWith("s3://", StringComparison.OrdinalIgnoreCase);

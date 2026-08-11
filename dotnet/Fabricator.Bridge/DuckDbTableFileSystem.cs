@@ -33,6 +33,41 @@ internal sealed unsafe class DuckDbTableFileSystem : ITableFileSystem
     }
 
     /// <summary>
+    /// <inheritdoc cref="ITableFileSystem.PathConstraints"/>
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The one implementation here whose answer genuinely varies, and it varies by ROOT rather than by
+    /// process: DuckDB's <c>FileSystem</c> is a dispatcher, so this object fronts a local volume or an
+    /// object store depending on the path it was constructed with. A <c>scheme://</c> root is a network
+    /// store on any machine; a bare path is a local volume, whose rules are the running OS's.
+    /// </para>
+    /// <para>
+    /// <b>The local-Windows case is the one with teeth.</b> Under the default
+    /// <c>PartitionPathSpelling.SparkCompatible</c> only
+    /// <see cref="PathNameConstraints.Win32ReservedCharacters"/> is consulted, and it is what makes a
+    /// partition value containing <c>&lt; &gt; |</c> or a TRAILING SPACE writable at all: Win32 silently
+    /// strips a trailing space from a component, so <c>region=a b </c> creates <c>region=a b</c> and then
+    /// fails to open the file underneath it. Under-reporting is therefore a stray directory and a lost
+    /// write, not an ugly name.
+    /// </para>
+    /// <para>
+    /// For a scheme root we report the union of what the object stores constrain rather than
+    /// <see cref="PathNameConstraints.None"/>, because we do NOT know which backend DuckDB will resolve
+    /// the path to and over-reporting is the safe direction. It costs nothing today: none of these flags
+    /// is read under <c>SparkCompatible</c>, so this differs from <c>None</c> only for a caller asking
+    /// for a portable spelling — which is exactly the caller that should get the conservative answer.
+    /// </para>
+    /// </remarks>
+    public PathNameConstraints PathConstraints =>
+        _root.Contains("://")
+            ? PathNameConstraints.NoControlCharacters | PathNameConstraints.NoTrailingDot
+                | PathNameConstraints.NoDotOnlySegments
+            : OperatingSystem.IsWindows()
+                ? PathNameConstraints.Win32
+                : PathNameConstraints.None;
+
+    /// <summary>
     /// The host-FS opener to use for THIS call, preferring the one currently in scope over the one captured
     /// at construction.
     /// </summary>

@@ -130,7 +130,12 @@ case "$TIER" in
         # SetScope (ABI v69) — a `SET` in one connection must not reach another. Before v69 that leak was a
         # DATA bug, not a config wart: `SET mssql_mars='false'` in one connection changed the row count a
         # CTAS in ANOTHER connection produced (10 vs 15).
-        : "${MIN_SUITES:=68}"
+        # 69 runs since 2026-08-11: verify_delta_partition_escaping (56) pins that a partition VALUE the
+        # target storage cannot hold literally still round-trips AND that the data file under it still
+        # OPENS. It exists because the engineered-wood bump onto upstream/main made partition-directory
+        # escaping depend on what the filesystem declares it cannot hold, and nothing here covered that in
+        # either direction — no partition value in any other suite contains a Win32-sensitive character.
+        : "${MIN_SUITES:=69}"
         # 5656 since 2026-08-02: verify_delta_catalog_transactions 943 -> 944 Ã¢ÂÂ ROLLBACK now RECLAIMS the
         # data files the transaction eagerly wrote (EW #52's DiscardDataFilesAsync) instead of leaving them
         # for VACUUM. +2, not +1: that suite is one of the DOUBLED ones below, so an assertion added to it
@@ -247,7 +252,13 @@ case "$TIER" in
         # spec too. The pre-existing section next to it REQUIRES the codec engine (under native_write DuckDB's
         # COPY writes the bytes, so engineered-wood's options never apply), which is exactly why the native
         # half was asserted nowhere and was broken.
-        : "${MIN_ASSERTIONS:=6929}"
+        # 6981 since 2026-08-11: verify_delta_partition_escaping (+56) minus verify_delta_catalog_transactions
+        # (-2 per leg, x2 legs). §42 was restructured because the EW bump made the two ENGINES legitimately
+        # disagree on a version neither of them declares for — a CTAS's data write records `false` on the
+        # codec engine and nothing on the native one, both safe. Pinning the old exact five-row table pinned
+        # an ENGINE rather than a behaviour, which an engine-doubled suite cannot do; it now pins the
+        # declarations plus the SAFETY PROPERTY (no version except the genuinely blind one claims blind).
+        : "${MIN_ASSERTIONS:=6981}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

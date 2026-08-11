@@ -3359,6 +3359,25 @@ DETACH mdc;
 # transaction, so in autocommit an append is indistinguishable from the anti-join shape. Saying nothing
 # costs spurious aborts; claiming blind wrongly costs correctness somewhere else.
 #
+# ⚠ THE ASSERTIONS ARE SPLIT INTO A DECLARATION PIN AND A SAFETY PROPERTY, and the split is what makes this
+# survive being engine-doubled. Only the two versions this host DECLARES for are identical on both engines;
+# the versions it says nothing about are answered by engineered-wood, which knows different things on each
+# path. A CTAS's data write records `false` on the CODEC engine (it takes the overwrite branch, which reads
+# the active-file set to decide what to remove — a fact, and the safe direction) and nothing on the NATIVE
+# engine, where the files are DuckDB's and the commit goes through CommitDataFilesAsync. Both are correct;
+# Delta reads absent and `false` identically (`getOrElse(false)`). Pinning the exact five-row table would
+# therefore pin an engine, not a behaviour.
+#
+# ⚠ THE `count(*) = 0` IS NOT A FORMALITY — it is the assertion that catches a claim made on our behalf.
+# engineered-wood's WriteAsync hardcoded `isBlindAppend: true` for any plain append (upstream #125), which
+# is a claim only the CALLER can make: a host that scanned the table and staged the result made a read the
+# library never saw. MEASURED against that: the autocommit anti-join below recorded `true`. The
+# fabricator-patches `WriteAsync(..., isBlindAppend:)` parameter is what restores the caller's authority.
+# MUTATION-TESTED by restoring the hardcode: it dies at §42b, which counts THREE blind claims where one is
+# true (v2 legitimately, plus the two autocommit appends the library claimed for us). ⚠ §42b rather than
+# §42d — the count is the earlier and sharper of the two, and saying "§42d catches it" would be a guess
+# about which assertion fires first rather than the measurement.
+#
 # ⚠ `write_serializable` is required to reach the interesting row. Under `serializable` (our default) a
 # read-then-append routes to the DML flush instead, which declares its reads to engineered-wood directly —
 # and Delta ignores the flag at that level anyway, since it examines blind appends by design.
@@ -3393,24 +3412,55 @@ COMMIT;
 statement ok
 INSERT INTO bl.main.t VALUES (999);
 
+# v5 — AUTOCOMMIT anti-join: reads the target, emits nothing but adds. THE shape the flag exists to tell
+# apart from v2, and the one a library claiming on our behalf gets wrong.
+statement ok
+INSERT INTO bl.main.t SELECT max(id) + 1 FROM bl.main.t;
+
+# §42a — THE DECLARATIONS. Both engines, byte-identical: these two are ours and nobody else's.
 query IT
 SELECT CAST(regexp_extract(filename, '(\d{20})\.json', 1) AS BIGINT) AS version,
        coalesce(json_extract_string(commitInfo, '$.isBlindAppend'), '<none>') AS blind
 FROM read_json_auto('${FABRICATOR_DELTA_WRITE_DIR}/txn_blind/t/_delta_log/*.json',
                     union_by_name = true, filename = true)
-WHERE commitInfo IS NOT NULL
+WHERE commitInfo IS NOT NULL AND CAST(regexp_extract(filename, '(\d{20})\.json', 1) AS BIGINT) IN (2, 3)
 ORDER BY version;
 ----
-0	<none>
-1	<none>
 2	true
 3	false
-4	<none>
+
+# §42b — the POSITIVE CONTROL for §42d. Without it, "no version except v2 claims blind" would pass equally
+# if the field had stopped being written at all.
+query I
+SELECT count(*) FROM read_json_auto('${FABRICATOR_DELTA_WRITE_DIR}/txn_blind/t/_delta_log/*.json',
+                                    union_by_name = true, filename = true)
+WHERE json_extract_string(commitInfo, '$.isBlindAppend') = 'true';
+----
+1
+
+# §42c — every commit is accounted for, so §42d cannot pass by versions having gone missing.
+query I
+SELECT count(*) FROM read_json_auto('${FABRICATOR_DELTA_WRITE_DIR}/txn_blind/t/_delta_log/*.json',
+                                    union_by_name = true, filename = true)
+WHERE commitInfo IS NOT NULL;
+----
+6
+
+# §42d — THE SAFETY PROPERTY: v2 is the only transaction that genuinely read nothing, so it must be the only
+# commit claiming blind. Engine-independent, because it asserts the ABSENCE of a wrong claim rather than the
+# presence of a particular right one.
+query I
+SELECT count(*) FROM read_json_auto('${FABRICATOR_DELTA_WRITE_DIR}/txn_blind/t/_delta_log/*.json',
+                                    union_by_name = true, filename = true)
+WHERE json_extract_string(commitInfo, '$.isBlindAppend') = 'true'
+  AND CAST(regexp_extract(filename, '(\d{20})\.json', 1) AS BIGINT) <> 2;
+----
+0
 
 query I
 SELECT count(*) FROM bl.main.t;
 ----
-7
+8
 
 statement ok
 DETACH bl;

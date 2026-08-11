@@ -1407,7 +1407,7 @@ use: a transaction's pinned connection keeps the MARS mode it was opened with fo
 | Setting | Status | Description |
 |---------|--------|-------------|
 | `mssql_mars` | **Active** | MARS mode: `auto` (default, per engine — off for Fabric/Synapse) \| `true` \| `false`. Resolved **per connection, when it is opened**, so it applies to connections this catalog opens after the `SET` — no need to set it before `ATTACH`, and two DuckDB connections sharing one attached catalog can use different modes. A transaction's pinned connection keeps the mode it was opened with. Confirm with `SELECT value FROM fabricator_server_info('<cat>') WHERE property = 'mars_enabled'`. Because a `SET` covers the whole DuckDB connection, use the per-catalog **`mars` ATTACH option** when two catalogs must differ (a `SET` outranks it). ⚠ Forcing `false` on **box SQL Server**: a scan of a table the open transaction has already written cannot run (it would deadlock against its own transaction) and is **refused with a message naming the remedies** — enable `READ_COMMITTED_SNAPSHOT` on the database, turn MARS back on, or COMMIT first. Reads of other tables are unaffected, as are Fabric/Synapse. See [known-limitations.md](docs/known-limitations.md) 1.15 |
-| `mssql_materialize` | **Active** | Buffer a scan that reads the **same catalog** a statement writes to, before the write starts. **Defaults to whatever MARS is** — `true` where MARS is available (box, Azure SQL), `false` where it is not (Fabric, Synapse, or `mssql_mars='false'`), because buffering pins the scan onto the write connection and without MARS the scan and the bulk load cannot share it (the statement fails, variously, as `MultipleActiveResultSets`, `already an open DataReader`, or a 30 s timeout that kills the transaction). With it `false` the scan streams from a pooled connection at SNAPSHOT and therefore does **not** see rows the same transaction wrote. Required on MARS engines — without it `INSERT INTO t SELECT … FROM t` fails at scale with `595`; it is also what gives read-your-writes for that scan on Fabric/Synapse. Set `false` to keep it **streaming** instead: needs `ALLOW_SNAPSHOT_ISOLATION` on the database, and the scan then reads a committed snapshot. Overrides the per-catalog `materialize` ATTACH option |
+| `mssql_materialize` | **Active** | Buffer a scan that reads the **same catalog** a statement writes to, before the write starts. **Defaults to `true`, on every engine.** Required on MARS engines — without it `INSERT INTO t SELECT … FROM t` fails at scale with `595` — and it is what gives that scan **read-your-writes**, now including on engines with no MARS at all (Fabric, Synapse). Set `false` to keep the scan **streaming** instead: it then reads from a pooled connection at SNAPSHOT (needs `ALLOW_SNAPSHOT_ISOLATION` on the database) and therefore does **not** see rows the same transaction wrote — worth it for bulk movement, where a drained scan buffers the whole source in memory with no spill (a 1M-row same-catalog CTAS measured ~27% more CPU and 484 MB more allocation drained than streamed). Overrides the per-catalog `materialize` ATTACH option |
 | `mssql_command_timeout` | **Active** | `SqlCommand.CommandTimeout` (seconds) for scans / DML / bulk; **default `0` = infinite**. Server-enforced per round-trip; overrides the per-catalog `command_timeout` ATTACH option |
 | `mssql_default_varchar_length` | **Active** | Length `n` for created text columns (`NVARCHAR(n)`/`VARCHAR(n)`); unset ⇒ `MAX`. Needed for indexable string keys |
 | `mssql_default_table_type` | **Active** | Created-table storage: `''` (rowstore) \| `clustered columnstore` (CCI, box/Azure; no-op on Fabric — columnstore already) |
@@ -1822,6 +1822,7 @@ principal wins even if `PROVIDER` says something else:
 | **Exactly-once appends** (Delta application transactions / Spark `txnAppId`): `fabricator_delta_set_transaction_version` + `_get_transaction_version` | ✅ |
 | **Change Data Feed**: `change_data_feed true` + `fabricator_delta_changes('<catalog>', '<schema.>table', from[, to])` | ✅ |
 | **Partitioning**: native `CREATE TABLE … PARTITIONED BY (cols)` (or the `delta_write_options` setting) → Hive `col=value/` layout | ✅ |
+
 | **Write tuning**: compression / row-group size / bloom filters via ATTACH options, the `delta_write_options` setting, or per-table `WITH (…)` | ✅ |
 | **Liquid clustering**: `SORTED BY (cols)`, `bucket()` / `hilbert_index()`, clustered `OPTIMIZE` (incremental ZCube), `ALTER … SET SORTED BY` | ✅ |
 | Per-table `WITH (…)` — Delta properties / feature-flag overrides / write tuning stamped in the CREATE commit | ✅ |
@@ -1829,6 +1830,17 @@ principal wins even if `PROVIDER` says something else:
 | VARIANT columns; `set_tblproperties` / `tblproperties`; `OPTIMIZE` / `VACUUM` maintenance | ✅ |
 | Concurrent writers: OCC retry (append/CTAS) + **row-level concurrency** (disjoint-row DML on DV tables); S3 multi-writer via a secret | ✅ |
 | Concurrent writers on **OneLake**, many processes appending to ONE table — no lost writes (measured: 96 concurrent commits, all landed), but a losing writer can occasionally surface an error rather than retrying transparently, so retry the statement | ⚠ |
+
+> **Partition values are escaped the way Spark escapes them**, so a value containing `/ : = % ? * " ' #` or a
+> backslash or a control character becomes `%XX` in the directory name (`region=a/b` → `region=a%2Fb`). The
+> value you read back is always the original — Delta records it in the log, not in the path.
+>
+> ⚠ **On a LOCAL path on Windows, `<`, `>`, `|` and a trailing space are escaped too**, because Windows
+> cannot hold them in a directory name (it silently *strips* a trailing space, which would leave the data
+> file unreachable). The same table written to `s3://` or `abfss://` keeps them literal, matching Spark — so
+> one logical partition value can have two directory spellings across storage backends; both are correct and
+> both read back identically. Since 2026-08-11; before that such a value was written unescaped on Windows and
+> the file under it could not be opened.
 
 ```sql
 -- Time travel + history
@@ -2101,7 +2113,7 @@ Any of these can also be set **per table** with `CREATE TABLE … WITH (…)` (a
 | `column_mapping` | **`'name'`** | writer v7; metadata-only RENAME / DROP COLUMN; Fabric T-SQL-endpoint compatible |
 | `native_read`, `native_write` | **from the PROVIDER name** | `PROVIDER 'delta'` ⇒ both **on** (DuckDB's Parquet reader/writer — the production path); `PROVIDER 'engineeredwooddelta'` ⇒ both **off** (pure-EW codec). Either is still settable explicitly on either spelling |
 | `change_data_feed`, `in_commit_timestamps`, `row_tracking`, `schemas` | `false` / off | opt-in |
-| `isolation_level` | **`serializable`** | Matches Fabric Spark, which commits at `Serializable` — so a table with no `delta.isolationLevel` property gets the same guarantee whichever engine writes it. **Changed 2026-08-01** (was `write_serializable`, Databricks' default, which made us the weaker writer on any undeclared table). ⚠ **Row-level concurrency needs `write_serializable`**: under `serializable` concurrent disjoint-row DML on one file conflicts instead of composing, so set `isolation_level 'write_serializable'` if you rely on it |
+| `isolation_level` | **`write_serializable`** | Concurrent **disjoint-row DML on one file composes** instead of conflicting — row-level concurrency is a `write_serializable`-only relaxation, and it is why this is the default. ⚠ **It does NOT match Fabric Spark**, which commits at `Serializable` and whose DDL will not even set `WriteSerializable`: on a table that declares no `delta.isolationLevel` we are the more permissive writer, so the effective guarantee depends on which engine wrote last. Attach `isolation_level 'serializable'` to align. (Was `serializable` between 2026-08-01 and 2026-08-11.) |
 | `compression` | `snappy` | + auto dictionary encoding + always-on min/max stats |
 
 **Concurrent writers from another engine (Spark, Databricks, delta-rs).** A writer records in its commit
@@ -2240,7 +2252,13 @@ CREATE TABLE lake.main.t WITH ("delta.isolationLevel"='Serializable', "fabricato
 > **⚠ A quoted `delta.*` property is a DECLARATION stored in the table, and most of them are for OTHER
 > engines to read — we do not implement every one.** Three we do act on:
 >
-> - `delta.isolationLevel` — a table's own level outranks the catalog's `isolation_level`.
+> - `delta.isolationLevel` — a table's own level outranks the catalog's `isolation_level`. ⚠ **The catalog's
+>   level is never written into a table** — not the default, and not an explicit `isolation_level` on the
+>   ATTACH. It governs how *this* attach's transactions behave; only `WITH (…)` or
+>   `fabricator_delta_set_tblproperties` makes a durable declaration other engines can read. That matters
+>   because silence does **not** mean agreement: a table declaring nothing is read as `Serializable` by
+>   Spark and as `WriteSerializable` by us, so if you rely on row-level concurrency across engines, declare
+>   it on the table.
 > - `delta.checkpointInterval` — how often the log is checkpointed. Honoured since 2026-08-08; before that
 >   it was stored and ignored, so a table declaring `100` was still checkpointed every 10.
 > - `delta.logRetentionDuration` — how long a superseded commit file is kept (default 30 days). Also

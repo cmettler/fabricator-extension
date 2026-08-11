@@ -2893,6 +2893,14 @@ public sealed class DeltaCatalog : IBackendCatalog
                 }
                 else if (pending.Batches.Count > 0)
                 {
+                    // The SAME declaration as the Files branch above, for the same reason — this is the
+                    // parked-batch path (identity / iceberg / pending-ALTER, and every write on the CODEC
+                    // engine), and it lands in engineered-wood's WriteAsync rather than in
+                    // CommitDataFilesAsync. ⚠ Passing it is not optional: since the isBlindAppend feature
+                    // landed upstream, WriteAsync's plain-append branch claims `true` on the caller's behalf
+                    // unless told otherwise, so an autocommit `INSERT INTO t SELECT … FROM t` would record a
+                    // blind-append claim for a statement that read the target — the unsafe direction.
+                    bool? batchBlind = wasExplicit ? !pending.HasReads : null;
                     long v = DeltaWriter.Write(
                         opener, kv.Key, pending.BatchSchema!, pending.Batches, DeltaWriteMode.Append, default,
                         deletionVectors: _deletionVectorsOnCreate,
@@ -2900,7 +2908,8 @@ public sealed class DeltaCatalog : IBackendCatalog
                         changeDataFeed: _changeDataFeedOnCreate,
                         rowTracking: _rowTrackingOnCreate,
                         spec: ResolveWriteSpec(null, null, kv.Key), nativeWrite: _nativeWrite,
-                        columnMapping: _columnMappingMode, serializable: _serializable);
+                        columnMapping: _columnMappingMode, serializable: _serializable,
+                        isBlindAppend: batchBlind);
                     _log.LogInformation("delta txn {Txn} commit {Path}: v{Version} ({Rows} buffered row(s))",
                         txnId, kv.Key, v, pending.Rows);
                 }

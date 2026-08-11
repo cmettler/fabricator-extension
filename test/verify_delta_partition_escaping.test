@@ -1,0 +1,148 @@
+# name: test/verify_delta_partition_escaping.test
+# description: A partition VALUE containing characters the target storage cannot hold literally must still
+#              round-trip, and the data file underneath the directory must still OPEN. engineered-wood derives
+#              the Hive directory name from the value (DeltaPath.EscapePathName) and asks the filesystem what it
+#              cannot hold (ITableFileSystem.PathConstraints); our DuckDbTableFileSystem answers Win32 for a
+#              LOCAL root on Windows and the object-store union for a scheme:// root.
+#
+#              THE FAILURE THIS GUARDS IS SILENT AND WIN32-ONLY: Win32 strips a TRAILING SPACE from a path
+#              component, so an unescaped `region=a b ` creates the directory `region=a b` and then fails to
+#              open the file underneath it — a stray directory and a lost write. `< > |` are rejected outright.
+#              Escaped as %20 / %3C / %3E / %7C, all four are writable.
+#
+#              ⚠ THE ASSERTIONS ARE DELIBERATELY ABOUT THE ROUND TRIP, NOT THE SPELLING. The correct directory
+#              name is PLATFORM-DEPENDENT (Win32 rules apply to a local Windows volume and to nothing else), and
+#              sqllogictest cannot branch on the platform — so pinning `region=a%20b%20` would fail on Linux,
+#              where the literal name is correct. What holds everywhere is that the value survives and the file
+#              opens. On Windows that can only be true if the escaping happened; on Linux this is a control that
+#              passes either way. Say that rather than implying uniform coverage.
+#
+#              ⚠ THE COUNT/SUM IS THE LOAD-BEARING ASSERTION, not the value round trip. Delta reads partition
+#              values from the LOG (add.partitionValues), never from the directory name, so `SELECT region`
+#              would return the right string even if the file were unreachable. Only reading the DATA proves the
+#              path resolves.
+#
+#              ⚠ EVERY TRAILING-SPACE VALUE IS BRACKETED (`'['||region||']'`) BEFORE IT IS COMPARED. A trailing
+#              space at the end of an expected-result line is invisible in the source and is not reliably
+#              preserved, so asserting the bare column would silently compare something other than the value
+#              this suite is about.
+#
+#              Set FABRICATOR_DELTA_WRITE_DIR to a WRITABLE base path. Local FS.
+# group: [fabricator]
+
+require fabricator
+
+require parquet
+
+require-env FABRICATOR_DELTA_WRITE_DIR
+
+# ── §1 CODEC engine: engineered-wood derives the directory name itself, so this is the section the
+#    PathConstraints answer governs. `PROVIDER 'engineeredwooddelta'` selects it explicitly (the plain
+#    'delta' spelling defaults native_write ON, where DuckDB's COPY names the directory — see §4).
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/partesc' AS ew (TYPE fabricator, PROVIDER 'engineeredwooddelta');
+
+# A POSITIVE CONTROL first: an ordinary value partitions and reads back. Without it, every assertion below
+# would pass equally if partitioned writes had simply stopped working on this engine.
+statement ok
+CREATE TABLE ew.main.plain PARTITIONED BY (region) AS
+  SELECT * FROM (VALUES (1,'US',10),(2,'EU',20)) AS t(id,region,amt);
+
+query TII
+SELECT region, count(*), sum(amt) FROM ew.main.plain GROUP BY region ORDER BY region;
+----
+EU	1	20
+US	1	10
+
+# ── §2 The four Win32-sensitive shapes, in ONE table so a single scan has to resolve all of them.
+#    A TRAILING SPACE is the sharpest: it is the one Win32 strips SILENTLY rather than rejecting.
+statement ok
+CREATE TABLE ew.main.odd PARTITIONED BY (region) AS
+  SELECT * FROM (VALUES
+    (1, 'a b ',   10),
+    (2, 'x<y',    20),
+    (3, 'x>y',    30),
+    (4, 'x|y',    40),
+    (5, 'plain',  50)) AS t(id,region,amt);
+
+# The values survive. (Cheap, and not the proof — see the header.)
+query T
+SELECT '[' || region || ']' FROM ew.main.odd ORDER BY id;
+----
+[a b ]
+[x<y]
+[x>y]
+[x|y]
+[plain]
+
+# THE LOAD-BEARING ONE: reading the amounts forces every data file to be opened by the path recorded in
+# add.path. A directory Win32 renamed out from under the writer fails here and nowhere else.
+query TII
+SELECT '[' || region || ']', count(*), sum(amt) FROM ew.main.odd GROUP BY region ORDER BY region;
+----
+[a b ]	1	10
+[plain]	1	50
+[x<y]	1	20
+[x>y]	1	30
+[x|y]	1	40
+
+query II
+SELECT count(*), sum(amt) FROM ew.main.odd;
+----
+5	150
+
+# A predicate on the partition column must still prune to the right partition rather than to a directory
+# whose name was normalised. The trailing-space value is the one to ask for.
+query II
+SELECT count(*), sum(amt) FROM ew.main.odd WHERE region = 'a b ';
+----
+1	10
+
+# And an APPEND into an existing odd partition must land in the SAME place the create wrote — the shape that
+# would produce two directories for one logical partition if the two writes spelled it differently.
+statement ok
+INSERT INTO ew.main.odd VALUES (6, 'a b ', 60);
+
+query II
+SELECT count(*), sum(amt) FROM ew.main.odd WHERE region = 'a b ';
+----
+2	70
+
+# ── §3 `}` is NOT escaped under the Spark-compatible spelling, and engineered-wood escaped it until Spark's
+#    own table said otherwise (Spark's set is `{ [ ] ^`, with no closing brace). Pinned because the value is
+#    legal on every backend, so the only way to notice a change is to ask.
+statement ok
+CREATE TABLE ew.main.brace PARTITIONED BY (region) AS
+  SELECT * FROM (VALUES (1,'a}b',10),(2,'a{b',20)) AS t(id,region,amt);
+
+query TII
+SELECT region, count(*), sum(amt) FROM ew.main.brace GROUP BY region ORDER BY region;
+----
+a{b	1	20
+a}b	1	10
+
+# ── §4 NATIVE engine: DuckDB's COPY … PARTITION_BY names the directory and RETURN_STATS.filename supplies
+#    add.path, so engineered-wood's escaping is not on this path at all and the two cannot disagree by
+#    construction. Asserted so the claim is measured rather than reasoned — and so a future change that routed
+#    the native path through DeltaPath would have to reckon with it.
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/partescnat' AS nat (TYPE fabricator, PROVIDER 'delta');
+
+statement ok
+CREATE TABLE nat.main.odd PARTITIONED BY (region) AS
+  SELECT * FROM (VALUES
+    (1, 'a b ',   10),
+    (2, 'x<y',    20),
+    (3, 'plain',  30)) AS t(id,region,amt);
+
+query TII
+SELECT '[' || region || ']', count(*), sum(amt) FROM nat.main.odd GROUP BY region ORDER BY region;
+----
+[a b ]	1	10
+[plain]	1	30
+[x<y]	1	20
+
+query II
+SELECT count(*), sum(amt) FROM nat.main.odd;
+----
+3	60

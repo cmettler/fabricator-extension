@@ -49,6 +49,19 @@ internal sealed class AdlsGen2TableFileSystem : ITableFileSystem
         _rootUnderFs = pathUnderFs.TrimEnd('/');
     }
 
+    /// <summary>
+    /// <inheritdoc cref="ITableFileSystem.PathConstraints"/>
+    /// </summary>
+    /// <remarks>
+    /// The same answer engineered-wood's own <c>AzureTableFileSystem</c> gives, because it is the same
+    /// backend reached by a different SDK surface. Note this is INERT under the default
+    /// <c>PartitionPathSpelling.SparkCompatible</c>, which reads only
+    /// <see cref="PathNameConstraints.Win32ReservedCharacters"/> (control characters are escaped
+    /// unconditionally there); it is honest for a caller that asks for a portable spelling.
+    /// </remarks>
+    public PathNameConstraints PathConstraints =>
+        PathNameConstraints.NoControlCharacters | PathNameConstraints.NoTrailingDot;
+
     /// <summary>Parses <c>abfss://&lt;container&gt;@&lt;host&gt;/&lt;path&gt;</c> into (host, container, pathUnderFs).</summary>
     internal static (string Host, string FileSystem, string PathUnderFs) ParseAbfss(string abfss)
     {

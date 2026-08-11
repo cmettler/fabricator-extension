@@ -615,13 +615,15 @@ internal static class DeltaWriter
                              bool rowTracking = false, DeltaWriteSpec? spec = null, bool nativeWrite = false,
                              EngineeredWood.DeltaLake.Schema.ColumnMappingMode columnMapping =
                                  EngineeredWood.DeltaLake.Schema.ColumnMappingMode.None,
-                             bool serializable = false, IReadOnlyList<string>? sortedBy = null)
+                             bool serializable = false, IReadOnlyList<string>? sortedBy = null,
+                             bool? isBlindAppend = null)
     {
         // Liveness probe markers (level 2 only): the write is what READS the retained batches, so a release
         // printed between these two lines would be the use-after-free the IPC copy used to guard against.
         LivenessMark($"write BEGIN reading {batches.Count} retained batch(es)");
         long version = WriteAsync(opener, path, schema, batches, mode, ct, deletionVectors, inCommitTimestamps,
-                      changeDataFeed, rowTracking, spec, nativeWrite, columnMapping, serializable, sortedBy)
+                      changeDataFeed, rowTracking, spec, nativeWrite, columnMapping, serializable, sortedBy,
+                      isBlindAppend)
             .GetAwaiter().GetResult();
         LivenessMark("write END");
         return version;
@@ -633,7 +635,8 @@ internal static class DeltaWriter
                              bool inCommitTimestamps, bool changeDataFeed,
                              bool rowTracking, DeltaWriteSpec? spec, bool nativeWrite,
                              EngineeredWood.DeltaLake.Schema.ColumnMappingMode columnMapping,
-                             bool serializable, IReadOnlyList<string>? sortedBy = null)
+                             bool serializable, IReadOnlyList<string>? sortedBy = null,
+                             bool? isBlindAppend = null)
     {
         // native_write: DuckDB's parquet writer produces the data-file bytes (via COPY on a fresh host
         // connection); engineered-wood keeps the _delta_log commit. Falls back to EW's codec if host_query is
@@ -716,7 +719,13 @@ internal static class DeltaWriter
                     ? await table.OverwritePartitionsAsync(batches, parts, ct).ConfigureAwait(false)
                     : spec?.DynamicPartitionOverwrite == true
                         ? await table.DynamicOverwriteAsync(batches, ct).ConfigureAwait(false)
-                        : await table.WriteAsync(batches, mode, ct, repartitionTo: repartitionTo)
+                        // ⚠ isBlindAppend is ONLY meaningful on the plain-append branch — engineered-wood
+                        // ignores it for the overwrite family, which declares FALSE from its own read of
+                        // the active-file set. Passing our claim here is what keeps the CODEC engine's
+                        // autocommit appends honest: without it EW claims `true` on our behalf, and an
+                        // `INSERT INTO t SELECT … FROM t` reaches this call as an ordinary Append.
+                        : await table.WriteAsync(batches, mode, ct, repartitionTo: repartitionTo,
+                                                 isBlindAppend: isBlindAppend)
                             .ConfigureAwait(false);
                 Log.LogInformation("delta write {Path}: committed v{Version}", path, version);
                 return version;

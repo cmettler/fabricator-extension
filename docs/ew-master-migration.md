@@ -2893,3 +2893,144 @@ concurrent appends (absent ⇒ not blind in Delta, so our adds land in `changedD
 to the inference (backwards-compatible); (2) Delta parity — believe the flag, absent means not blind (safer, but
 changes conflict behaviour for every flag-less writer, so it wants a release note).
 
+
+## THE 2026-08-11 BUMP — onto a FRESH branch off `upstream/main` (`154f800`), because the patch set RETIRED
+
+The branch model's stated goal, reached: **every one of our seven patches is upstream**, so the bump was not a
+merge but a `git checkout -b fabricator-patches-v3 upstream/main`. What we carry now is ONE new patch, found
+by running the tier rather than by reading the diff (§4).
+
+### 1. The patch set is subsumed — established by CONTENT, not by PR state
+
+`upstream/main` = `154f800`, **22 commits** ahead of the merge base `fa9b556`. Ours were +448/−30 across seven
+files. Each landed re-cut:
+
+| ours | landed as |
+|---|---|
+| `c46a70a` + `98cf471` + `1422ce6` isBlindAppend (read + write halves) | **#125** (`56ff960`) |
+| `83133cd` vacuum below the table root / hidden names | **#121** (`107b858`) |
+| `a3eadba` `LogCleanup` + the `LogCommitter` call | **#112** (`3f936cc`) |
+| `83133cd` `delta.checkpointInterval` honoured as declared | **#110** (`5a1f280`) |
+| `d3a1301` + `618f3dc` the interval reached one trigger of two | **#108** (`2cbc497`) |
+
+⚠ **Checked semantically rather than by reading PR titles**, because a re-cut can drop the part that mattered:
+`_checkpointInterval` resolved ONCE into a field (the `618f3dc` fix, whose whole point is that the two triggers
+cannot drift), `InferBlindAppend` surviving as the fallback, the vacuum rule's **partition-column exception**
+(the subtle half — a partition column may be named `_region`), and `LogCleanup.RunAsync` called from
+`LogCommitter`. `LogCommitRequest.IsBlindAppend`'s doc comment and `CommitDataFilesAsync`'s parameter list came
+back **byte-identical**, so no Bridge call site changed.
+
+**Upstream extended two of them, which is the branch model's better half.** #125 did what we could not: measured
+delta-spark's actual `isBlindAppend` across five commit shapes and confirmed the claim we had derived from
+reading Delta's source, including that `INSERT INTO t SELECT ... FROM t` records `false` while emitting only
+adds. **#116 fixed a gap in our `LogCleanup`**: it reclaimed commits and checkpoint bodies but left V2
+**sidecars** — the megabytes, on exactly the large tables cleanup exists for — and never parsed Spark's
+`<version>.crc` at all. We had documented the sidecar limitation; the `.crc` one we never saw.
+
+### 2. What the other 17 commits are
+
+- **Seven are a new Spark SQL expression parser** (#105/#106/#114/#118/#120/#123/#128, `7a6b381`), entirely
+  additive under `EngineeredWood.Expressions/Sql/`. We consume only `Expressions.Predicate`. No impact.
+- **Five are checkpoint work** — V2 sidecars read (#98), the checkpoint writer made callable (#99), kernel's
+  V1-on-a-V2-table rule (#100), plus `CheckpointFormat`/`CheckpointPolicy` as new init-only
+  `DeltaTableOptions` properties with defaults. `DeltaTable`'s public method surface is **unchanged** (audited
+  base vs upstream: nothing added, nothing removed).
+  - **A capability GAIN worth knowing: EW now decodes a Parquet-bodied V2 checkpoint.** `SnapshotBuilder`'s
+    error text went from "This implementation decodes only the NDJSON V2 body" to naming a body that is
+    *neither* of the two legal forms — i.e. a table another engine checkpointed in the V2 Parquet form used to
+    fail to build a snapshot and now reads. It also detects a TORN multi-part checkpoint instead of silently
+    loading a prefix.
+- **Two are partition-path escaping** (#89, #95) — the only ones with teeth for us, §3.
+- **Three are hygiene** — BOM removal, and an interop CI tier that *reported PASSED when it could not reach its
+  toolchain*.
+
+### 3. The entire compile cost was ONE new interface member, on three classes
+
+`ITableFileSystem` gained a required `PathNameConstraints PathConstraints { get; }`. Measured by building the
+Bridge against `upstream/main`: **exactly three errors, all that member, nothing else.**
+
+It has **one consumer** — `DeltaTable.cs:4003`, deriving the Hive partition directory name — and under the
+default `PartitionPathSpelling.SparkCompatible` **only `Win32ReservedCharacters` is read at all** (control
+characters are escaped unconditionally there; the trailing-dot / dot-only / trailing-space flags are consulted
+only under `Portable`). That collapses the design question: the answer matters iff it decides Win32.
+
+| our filesystem | answers | why |
+|---|---|---|
+| `S3CommitFileSystem` | `None` | upstream's own measured S3 answer; stated directly rather than delegated to `_inner`, since this class is only ever constructed for an `s3://` root |
+| `AdlsGen2TableFileSystem` | `NoControlCharacters \| NoTrailingDot` | upstream's own `AzureTableFileSystem` answer — same backend, different SDK surface. Inert under `SparkCompatible` |
+| `DuckDbTableFileSystem` | per ROOT: `scheme://` gets the object-store union; local gets `Win32` on Windows, else `None` | DuckDB's `FileSystem` is a dispatcher, so this one object fronts a local volume or an object store depending on the path it was constructed with |
+
+⚠ **The native write path is immune BY CONSTRUCTION and this is worth not re-deriving.** Under `native_write`
+the partition directory is written by DuckDB's `COPY ... PARTITION_BY` and `add.path` comes from
+`RETURN_STATS.filename`, so `DeltaPath.EscapePathName` is never consulted and the directory cannot disagree
+with the log. Only the **codec** engine derives the name.
+
+⚠ **On the codec engine this IS a behaviour change on a local Windows root.** At the merge base EW escaped a
+fixed set and never touched `< > |` or a space; now those are percent-escaped (and `}` stops being escaped,
+matching Spark's actual list). Correct — Win32 silently strips a trailing space from a component, so the old
+unescaped form created `region=a b` and then failed to open the file under it — but a value like `a b ` now
+lands in a different directory than it did before.
+
+**Nothing in the tier covered it in either direction**, so it got its own gate:
+`test/verify_delta_partition_escaping.test` (**56**, hermetic). ⚠ Its assertions are about the ROUND TRIP and
+never the spelling, because the correct name is PLATFORM-DEPENDENT and sqllogictest cannot branch on the
+platform — pinning `region=a%20b%20` would fail on Linux, where the literal name is right. What holds
+everywhere is that the value survives and the file OPENS; on Windows that can only be true if the escaping
+happened, and on Linux the section is a control that passes either way. ⚠ The count/sum is the load-bearing
+assertion, not the value: Delta reads partition values from `add.partitionValues`, so `SELECT region` returns
+the right string even when the file is unreachable. Mutation-tested — making `DuckDbTableFileSystem` report
+`None` for a local root kills it at exactly section 2's CREATE, with section 1's ordinary-value control passing
+first.
+
+### 4. ⚠ THE REGRESSION THE TIER FOUND, WHICH READING THE DIFF DID NOT — `WriteAsync` now claims `isBlindAppend` ON THE CALLER'S BEHALF
+
+`verify_delta_catalog_transactions` failed on the **codec** leg only. Root cause, measured:
+`CommitWriteAsync` hardcodes `isBlindAppend: true` for any plain append (#125), reasoning that "a plain append
+takes its rows from the caller and reads no file of this table to decide what to write". That is true of what
+the library does and false of what the field means — Delta's `isBlindAppend` describes the **transaction**, and
+a host with its own data plane that scanned the table and staged the result made a read EW never saw.
+
+**#125's own `DeltaTransaction.IsBlindAppend` says exactly that, one file away** ("This library cannot derive it
+for a host with its own data plane..."), and `WriteAsync` IS the host-facing surface. So the derivation upstream
+got right on the staged surface was skipped on the auto-committing one.
+
+MEASURED, codec engine, autocommit, `write_serializable`:
+
+| version | statement | recorded |
+|---|---|---|
+| 2 | `INSERT INTO t VALUES (100)` | `true` — correct |
+| 3 | `INSERT INTO t SELECT max(id) + 1 FROM t` | **`true` — WRONG** |
+
+v3 is the anti-join incremental shape — reads the target, emits nothing but adds — i.e. the `insert_select_self`
+row **#125's own interop tier singled out** as the one the recorded flag alone can tell apart from a genuine
+blind append. So #125 taught the reader to believe the flag and, on this path, made the writer emit a false one
+for precisely the shape it exists to distinguish. Under WriteSerializable another engine then SKIPS the
+`concurrentAppend` check it owed — the unsafe direction, which #125 itself names as the one that matters.
+
+**The patch (the whole of `fabricator-patches-v3`, +37/-13 in `DeltaTable.cs`, OFFER-READY):** `bool?
+isBlindAppend = null` threaded through the two public `WriteAsync` overloads into `WriteCoreAsync` and
+`CommitWriteAsync`, replacing the hardcode. Default null = absent = the pre-#125 behaviour for a caller that
+says nothing. The overwrite branch keeps its hardcoded `false` — that one EW genuinely knows, because it reads
+the active-file set to decide what to remove. `DeltaTransaction.EffectiveIsBlindAppend` is untouched: its
+one-directional derivation is right and is the model this mirrors.
+
+**Bridge side:** the parked-batch flush branch now passes the SAME `wasExplicit ? !pending.HasReads : null` the
+files branch already passed. ⚠ That branch is not an edge case — it is every write on the codec engine, plus
+identity / iceberg / pending-ALTER on the native one.
+
+⚠ **Two engines now legitimately DISAGREE on a version neither of us declares for**: a CTAS's data write records
+`false` on the codec engine (it takes the overwrite branch, which reads the active-file set — a fact) and
+nothing on the native engine, where the files are DuckDB's and the commit goes through `CommitDataFilesAsync`.
+Both are safe; Delta reads absent and `false` identically (`getOrElse(false)`).
+
+**Gate: `verify_delta_catalog_transactions` section 42 restructured** (1042 to 1040 per leg) into a declaration
+pin (42a: the two versions the host declares for, byte-identical on both engines), a positive control (42b:
+exactly one blind claim), a completeness check (42c), and the SAFETY PROPERTY (42d: no other version claims
+blind). ⚠ The old form pinned an exact five-row table including versions neither engine controls — that pinned
+an ENGINE, not a behaviour, and is what an engine-doubled suite cannot do. It also gained the autocommit
+anti-join, the actual unsafe shape, which the original section 42 never had (its autocommit row was
+`INSERT ... VALUES`, genuinely blind). Mutation-tested by restoring the hardcode: dies at **42b** with three
+blind claims where one is true.
+
+Offer draft (not yet sent): the argument is upstream's own, from `DeltaTransaction.IsBlindAppend` and #125's
+interop measurement.
