@@ -60,6 +60,14 @@
     -->
     <Compile Include="..\Fabricator.Bridge\DeltaParquetProperties.cs"
              Link="Linked\DeltaParquetProperties.cs" />
+    <!--
+      The Fabric Warehouse COPY INTO staging root. Admissible because it is pure string derivation. It is the
+      third place in this codebase where one storage account must be named differently by us and by the SQL
+      engine, and the first two both shipped a bug in that translation — so the round trip is worth pinning
+      offline rather than only through a live Fabric load.
+    -->
+    <Compile Include="..\Fabricator.Bridge\OneLakeStagingLocation.cs"
+             Link="Linked\OneLakeStagingLocation.cs" />
   </ItemGroup>
 
 </Project>

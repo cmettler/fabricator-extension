@@ -1,0 +1,427 @@
+# name: test/verify_mars_off_same_catalog.test
+# description: same-catalog read+write with MARS OFF — the shape that is broken on every no-MARS engine
+# group: [fabricator]
+
+require fabricator
+
+require-env MSSQL_TESTDB_DSN
+
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+# WHAT THIS PINS, AND WHY IT EXISTS AT ALL
+#
+# A statement that reads and writes the SAME catalog marks its scan. A marked scan used to be DRAINED
+# unconditionally, which PINS it onto the transaction's connection — the same connection the bulk load
+# runs on. The bulk's consumer calls SqlBulkCopy.WriteToServer as soon as it starts, so the scan's
+# reader and the load are concurrent BY CONSTRUCTION. With MARS they coexist. Without it they cannot.
+#
+# MEASURED 2026-08-10 before the fix: this box shape failed **0 of 8 runs**, and Fabric (which has no
+# MARS at all) failed 4 of 4 — as "does not support MultipleActiveResultSets", "already an open
+# DataReader", or a 30 s Execution Timeout that killed the whole transaction. Full grid:
+# docs/transactions.md §5.6a.
+#
+# ⚠ THE BUG WAS ONLY EVER SEEN ON FABRIC, AND THAT IS THE POINT OF THIS FILE. Box hides it because
+# MARS is ON by default there, so every existing suite passes while the shape is broken on the engine
+# most users deploy to. `SET mssql_mars='false'` reproduces it on box in under a second, which is what
+# makes it gateable at all — and its absence is why it survived for months.
+#
+# ⚠ IT WAS ALSO FLAKY, NOT DEAD: roughly one run in a dozen succeeded. A single green sample is
+# therefore worthless here — the ONLY reason these sections can assert `ok` is that the fix makes them
+# deterministic (8/8 after, 0/8 before). If one of them ever goes intermittent, treat that as the bug
+# returning, not as a flaky test.
+#
+# The fix: `mssql_materialize` DEFAULTS TO MARS. On a MARS engine a marked scan is still drained and
+# pinned (§1, read-your-writes preserved); without MARS it takes the snapshot-read route — pooled, at
+# SNAPSHOT — so it never shares the connection with the load. The cost is read-your-writes on the
+# scanned table, accepted deliberately for a bulk path and pinned in §4.
+
+# ⚠ `SET mssql_mars` MUST PRECEDE THE ATTACH — the value is resolved once, when the catalog first
+# connects, and a later SET does not reach an existing attach. Writing this test with the SET after the
+# ATTACH silently produced a MARS-ON catalog and a vacuously passing §2/§4.
+statement ok
+SET mssql_mars='auto';
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS m_on (TYPE fabricator);
+
+statement ok
+SET mssql_mars='false';
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS m_off (TYPE fabricator);
+
+# ═════════════════════════════════════════════════════════════════════════════════════════════════
+# §1  MARS ON — the shipped box behaviour. POSITIVE CONTROL for everything below.
+# ═════════════════════════════════════════════════════════════════════════════════════════════════
+#
+# Without this section §2–§4 could pass equally if same-catalog read+write had simply stopped working,
+# or if the tables had stopped being created.
+
+statement ok
+CREATE OR REPLACE TABLE m_on.dbo.mo_src AS SELECT i AS a, ('v' || i::VARCHAR) AS b FROM range(200) t(i);
+
+statement ok
+CREATE OR REPLACE TABLE m_on.dbo.mo_dst AS SELECT a, b FROM m_on.dbo.mo_src;
+
+query II
+SELECT count(*), sum(a) FROM m_on.dbo.mo_dst;
+----
+200	19900
+
+statement ok
+INSERT INTO m_on.dbo.mo_dst SELECT a, b FROM m_on.dbo.mo_src;
+
+query I
+SELECT count(*) FROM m_on.dbo.mo_dst;
+----
+400
+
+# READ-YOUR-WRITES on a MARS engine: the drain pins the scan inside the transaction, so the CTAS sees
+# rows this transaction has not committed yet. This is what §4 gives up, and pinning it here is what
+# makes that trade visible rather than accidental.
+statement ok
+CREATE OR REPLACE TABLE m_on.dbo.mo_ryw AS SELECT i AS a FROM range(10) t(i);
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO m_on.dbo.mo_ryw SELECT 100 + i FROM range(5) t(i);
+
+statement ok
+CREATE OR REPLACE TABLE m_on.dbo.mo_ryw_copy AS SELECT a FROM m_on.dbo.mo_ryw;
+
+statement ok
+COMMIT;
+
+query I
+SELECT count(*) FROM m_on.dbo.mo_ryw_copy;
+----
+15
+
+# ═════════════════════════════════════════════════════════════════════════════════════════════════
+# §2  MARS OFF, INSERT — THE REGRESSION GATE. This is the 0-of-8 shape.
+# ═════════════════════════════════════════════════════════════════════════════════════════════════
+
+statement ok
+CREATE OR REPLACE TABLE m_off.dbo.mf_src AS SELECT i AS a, ('v' || i::VARCHAR) AS b FROM range(200) t(i);
+
+statement ok
+CREATE OR REPLACE TABLE m_off.dbo.mf_dst AS SELECT i AS a, ('v' || i::VARCHAR) AS b FROM range(1) t(i) WHERE false;
+
+statement ok
+INSERT INTO m_off.dbo.mf_dst SELECT a, b FROM m_off.dbo.mf_src;
+
+# The COUNT is the assertion that matters: the pre-fix failure landed ZERO rows while the statement
+# reported an error, so a test that only checked "no error" would still have caught it — but one that
+# only checked the count would not have caught a partial load. Both, then.
+query II
+SELECT count(*), sum(a) FROM m_off.dbo.mf_dst;
+----
+200	19900
+
+# The values, not just the cardinality — a pooled scan must not reorder or drop columns.
+query I
+SELECT b FROM m_off.dbo.mf_dst WHERE a = 137;
+----
+v137
+
+# ═════════════════════════════════════════════════════════════════════════════════════════════════
+# §3  MARS OFF, CTAS — a SEPARATE shape, not covered by §2
+# ═════════════════════════════════════════════════════════════════════════════════════════════════
+#
+# ⚠ CTAS and INSERT route their marked scan DIFFERENTLY (measured: on Fabric the CTAS's scan logged
+# `pooled` and the INSERT's `pinned` under identical settings), because the routing turns on whether
+# the transaction's connection exists YET when the scan starts and the two operators initialise their
+# sink in a different order. So neither section covers the other.
+
+statement ok
+CREATE OR REPLACE TABLE m_off.dbo.mf_ctas AS SELECT a, b FROM m_off.dbo.mf_src;
+
+query II
+SELECT count(*), sum(a) FROM m_off.dbo.mf_ctas;
+----
+200	19900
+
+# ... and inside an EXPLICIT transaction that has already written, which is where the 30 s timeout hit.
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO m_off.dbo.mf_src VALUES (999, 'sentinel');
+
+statement ok
+CREATE OR REPLACE TABLE m_off.dbo.mf_ctas2 AS SELECT a, b FROM m_off.dbo.mf_src;
+
+statement ok
+COMMIT;
+
+query I
+SELECT count(*) FROM m_off.dbo.mf_src;
+----
+201
+
+# ═════════════════════════════════════════════════════════════════════════════════════════════════
+# §4  MARS OFF — READ-YOUR-WRITES IS ABSENT. The accepted cost, pinned.
+# ═════════════════════════════════════════════════════════════════════════════════════════════════
+#
+# Without MARS the marked scan reads a committed snapshot, so a table this transaction has just
+# written is seen at its COMMITTED state. That is deliberate (a bulk path moves bytes; it does not
+# need to observe its own uncommitted rows) and it is the direct trade for §2 working at all — every
+# configuration that WOULD deliver read-your-writes here is one that deadlocks.
+#
+# It is pinned rather than left implicit so that regaining it — or losing it on a MARS engine, where
+# §1 asserts it is still there — has to be a deliberate change with a failing test attached.
+
+statement ok
+CREATE OR REPLACE TABLE m_off.dbo.mf_ryw AS SELECT i AS a FROM range(10) t(i);
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO m_off.dbo.mf_ryw SELECT 100 + i FROM range(5) t(i);
+
+statement ok
+CREATE OR REPLACE TABLE m_off.dbo.mf_ryw_copy AS SELECT a FROM m_off.dbo.mf_ryw;
+
+statement ok
+COMMIT;
+
+# 10, not 15: the five rows inserted in the same transaction were not visible to the scan.
+query I
+SELECT count(*) FROM m_off.dbo.mf_ryw_copy;
+----
+10
+
+# ⚠ THE CONTROL THAT MAKES THE 10 MEANINGFUL. Without it, a `10` above would pass equally if the
+# INSERT had simply done nothing — which is exactly the pre-fix failure mode.
+query I
+SELECT count(*) FROM m_off.dbo.mf_ryw;
+----
+15
+
+# ═════════════════════════════════════════════════════════════════════════════════════════════════
+# §5  MARS OFF + `read_isolation` — the combination that was REFUSED outright
+# ═════════════════════════════════════════════════════════════════════════════════════════════════
+#
+# `mssql_materialize=false` + `mssql_read_isolation` is refused as contradictory: one asks for the
+# scan to stay OUTSIDE the transaction on a pooled connection, the other for every read to be INSIDE
+# it. Both are active requests, so refusing and letting the user pick is right.
+#
+# ⚠ BUT THAT CHECK TESTED THE RESOLVED VALUE, AND `materialize` NOW DEFAULTS TO MARS — so on any
+# no-MARS engine it resolves false with NOBODY having requested it, and the refusal fired for every
+# user who set `read_isolation` alone. Measured: 3 of 3 runs refused on box with MARS off; on
+# Fabric, where the default is always false, `read_isolation` would have been unusable outright.
+# A DEFAULT IS NOT A REQUEST — the check now tests what the user supplied, not what resolved.
+
+statement ok
+SET mssql_mars='false';
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS r_iso (TYPE fabricator, read_isolation 'snapshot');
+
+statement ok
+CREATE OR REPLACE TABLE r_iso.dbo.ri_src AS SELECT i AS a FROM range(200) t(i);
+
+statement ok
+CREATE OR REPLACE TABLE r_iso.dbo.ri_dst AS SELECT i AS a FROM range(1) t(i) WHERE false;
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO r_iso.dbo.ri_src VALUES (999);
+
+# The marked scan takes the POOLED snapshot route even here: `read_isolation` pins ORDINARY reads,
+# but pinning a scan that feeds a bulk load is the collision this whole file is about.
+statement ok
+INSERT INTO r_iso.dbo.ri_dst SELECT a FROM r_iso.dbo.ri_src;
+
+statement ok
+COMMIT;
+
+# 200, not 201 — committed state, the same read-your-writes trade as §4.
+query I
+SELECT count(*) FROM r_iso.dbo.ri_dst;
+----
+200
+
+# ⚠ POSITIVE CONTROL: `read_isolation` MUST STILL PIN AN ORDINARY READ. Without this, §5 above would
+# pass equally if the option had simply been disabled. The observable is sharp: with MARS off, reading
+# a table THIS transaction has written is refused unless the read joined the transaction — so this
+# SELECT succeeding is proof the pin still happens, and its count proves it sees uncommitted rows.
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO r_iso.dbo.ri_src VALUES (1000);
+
+query I
+SELECT count(*) FROM r_iso.dbo.ri_src;
+----
+202
+
+statement ok
+COMMIT;
+
+# ⚠ AND THE REFUSAL MUST SURVIVE FOR THE CASE IT WAS WRITTEN FOR — an EXPLICIT materialize=false
+# beside read_isolation is still two contradicting requests. This pins that the check was NARROWED,
+# not deleted.
+statement ok
+SET mssql_materialize='false';
+
+statement error
+INSERT INTO r_iso.dbo.ri_dst SELECT a FROM r_iso.dbo.ri_src;
+----
+contradict each other
+
+statement ok
+RESET mssql_materialize;
+
+# ═════════════════════════════════════════════════════════════════════════════════════════════════
+# §6  MARS OFF + `materialize='true'` — the combination the bulk deferral UNLOCKED
+# ═════════════════════════════════════════════════════════════════════════════════════════════════
+#
+# Asking for the drain EXPLICITLY on a no-MARS engine used to be the broken shape: the scan pins onto
+# the transaction's connection and the bulk load takes that same connection, so one of them lost —
+# measured 0 of 8 runs on box, and every failing Fabric row in docs/transactions.md §5.6a.
+#
+# It works now because `BulkSession` WAITS FOR THE FIRST BATCH (or end-of-stream) before calling
+# BulkInsert. `SqlBulkCopy.WriteToServer` holds the connection for the whole load INCLUDING the time
+# it merely waits for rows, so starting it eagerly meant the load held the connection before the scan
+# had asked for one. Deferring makes the order deterministic — the load always acquires SECOND, after
+# a drained scan has finished and released.
+#
+# ⚠ THIS IS A SUPPORTED CONFIGURATION, NOT AN ACCIDENT, WHICH IS WHY IT IS PINNED. It is the only way
+# to get read-your-writes on an engine without MARS. Nothing else in this file covers it: §2–§4 pin
+# the DEFAULT (materialize follows MARS ⇒ false here), so a change that re-broke the explicit case
+# would leave every other section green.
+#
+# ⚠ AND §6b IS THE HALF THAT MATTERS. §6a only says "the statement ran"; a regression could make it
+# run by silently falling back to a POOLED scan, which is exactly §4's behaviour. §6b is the
+# discriminator: same engine, same statement, ONE setting different from §4, opposite answer.
+
+statement ok
+SET mssql_materialize='true';
+
+statement ok
+CREATE OR REPLACE TABLE m_off.dbo.mt_src AS SELECT i AS a, ('v' || i::VARCHAR) AS b FROM range(200) t(i);
+
+statement ok
+CREATE OR REPLACE TABLE m_off.dbo.mt_dst AS SELECT i AS a, ('v' || i::VARCHAR) AS b FROM range(1) t(i) WHERE false;
+
+# §6a — the 0-of-8 shape: an explicit drain on a no-MARS engine.
+statement ok
+INSERT INTO m_off.dbo.mt_dst SELECT a, b FROM m_off.dbo.mt_src;
+
+query II
+SELECT count(*), sum(a) FROM m_off.dbo.mt_dst;
+----
+200	19900
+
+# §6b — READ-YOUR-WRITES IS BACK. Contrast with §4, which is byte-identical apart from this SET and
+# answers 10: there the scan is pooled and sees committed state only; here it is pinned inside the
+# transaction and sees the five rows this transaction has not committed yet.
+statement ok
+CREATE OR REPLACE TABLE m_off.dbo.mt_ryw AS SELECT i AS a FROM range(10) t(i);
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO m_off.dbo.mt_ryw SELECT 100 + i FROM range(5) t(i);
+
+statement ok
+CREATE OR REPLACE TABLE m_off.dbo.mt_ryw_copy AS SELECT a FROM m_off.dbo.mt_ryw;
+
+statement ok
+COMMIT;
+
+# 15, where §4 gives 10.
+query I
+SELECT count(*) FROM m_off.dbo.mt_ryw_copy;
+----
+15
+
+# ⚠ THE EMPTY-SOURCE CASE, HERE BECAUSE THE DEFERRAL IS WHAT COULD BREAK IT. The consumer waits for
+# "a batch OR completion"; waiting for a batch alone would hang forever on a source that yields none,
+# and this shape still has to CREATE the table. A hang, not a wrong answer, is the failure mode — so
+# this assertion is really a timeout guard.
+statement ok
+CREATE OR REPLACE TABLE m_off.dbo.mt_empty AS SELECT a, b FROM m_off.dbo.mt_src WHERE false;
+
+query I
+SELECT count(*) FROM m_off.dbo.mt_empty;
+----
+0
+
+statement ok
+INSERT INTO m_off.dbo.mt_empty SELECT a, b FROM m_off.dbo.mt_src WHERE false;
+
+query I
+SELECT count(*) FROM m_off.dbo.mt_empty;
+----
+0
+
+statement ok
+RESET mssql_materialize;
+
+statement ok
+DROP TABLE m_off.dbo.mt_empty;
+
+statement ok
+DROP TABLE m_off.dbo.mt_ryw_copy;
+
+statement ok
+DROP TABLE m_off.dbo.mt_ryw;
+
+statement ok
+DROP TABLE m_off.dbo.mt_dst;
+
+statement ok
+DROP TABLE m_off.dbo.mt_src;
+
+statement ok
+DROP TABLE r_iso.dbo.ri_dst;
+
+statement ok
+DROP TABLE r_iso.dbo.ri_src;
+
+statement ok
+DETACH r_iso;
+
+statement ok
+DROP TABLE m_off.dbo.mf_ryw_copy;
+
+statement ok
+DROP TABLE m_off.dbo.mf_ryw;
+
+statement ok
+DROP TABLE m_off.dbo.mf_ctas2;
+
+statement ok
+DROP TABLE m_off.dbo.mf_ctas;
+
+statement ok
+DROP TABLE m_off.dbo.mf_dst;
+
+statement ok
+DROP TABLE m_off.dbo.mf_src;
+
+statement ok
+DROP TABLE m_on.dbo.mo_ryw_copy;
+
+statement ok
+DROP TABLE m_on.dbo.mo_ryw;
+
+statement ok
+DROP TABLE m_on.dbo.mo_dst;
+
+statement ok
+DROP TABLE m_on.dbo.mo_src;
+
+statement ok
+DETACH m_off;
+
+statement ok
+DETACH m_on;

@@ -295,6 +295,27 @@ public sealed class DeltaCatalog : IBackendCatalog
         _root = Normalize(clean).TrimEnd('/');
         _fabricCredential = credential;
         _adlsCredential = storage;
+        // ⚠ ON FABRIC COMPUTE THE AMBIENT TOKEN IS THE CREDENTIAL, AND WITHOUT THIS THE COMMIT GUARD WAS OFF
+        // FOR EVERY SECRET-LESS NOTEBOOK ATTACH. `storage` comes ONLY from the base64 marker that
+        // DeltaBackend.BuildConnectionString appends from the secret the ATTACH *names*, so a notebook that
+        // relies on the ambient identity — the documented, credential-free Fabric story — arrived here with
+        // null and fell through to the host FS, i.e. duckdb-azure, whose ExclusiveCreate is a client-side
+        // existence check rather than a conditional PUT (measured: 6 writers x 8 commits landed 41 of 48, six
+        // losses silent). Reads were fine, because DeltaReader.ToReadableRoot rewrites the root to
+        // `onelake://` for DuckDB's native reader — but that rewrite is READER-ONLY, and TablePath() hands the
+        // commit path the root exactly as attached. So reads went one way and commits the other.
+        //
+        // ⚠ SCOPED TO `IsAvailable`, NOT TO abfss:// GENERALLY, and the narrowness is the point: for a plain
+        // ADLS account the status quo is that duckdb-azure does the IO using whatever azure secret is in
+        // SCOPE, so adopting an ambient credential there could turn a working attach into an auth failure if
+        // the ambient identity has no RBAC on that account. On Fabric compute the ambient token IS the
+        // documented credential and there is no in-scope-secret story to break.
+        //
+        // An explicitly NAMED secret still wins: this only fills the gap where there was nothing at all.
+        if (_adlsCredential is null && FabricLakehouse.IsOneLake(_root) && FabricNotebookCredential.IsAvailable)
+        {
+            _adlsCredential = AdlsCredential.FromToken(FabricCredentialResolver.AmbientChain());
+        }
         // Deletion vectors are the DEFAULT DML mode (the modern Delta standard: DELETE marks rows in a DV bitmap
         // instead of rewriting the whole file — cheap, and it preserves row-tracking ids/versions for free).
         // Opt OUT with `deletion_vectors false` for the maximally-compatible plain copy-on-write table (minReader

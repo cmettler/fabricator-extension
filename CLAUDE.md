@@ -670,6 +670,203 @@ current code still uses the single-provider `fabricator` naming):
 
 ## Next up (open threads for future sessions)
 
+- **THE AMBIENT CREDENTIAL NOW REACHES THE DELTA CATALOG ON FABRIC COMPUTE (2026-08-11, C#-only) — before
+  this, EVERY secret-less notebook attach to `abfss://…onelake…` had a NON-ATOMIC COMMIT.** `_adlsCredential`
+  came only from the base64 marker `DeltaBackend.BuildConnectionString` appends from the secret the ATTACH
+  *names*, so the documented credential-free Fabric story arrived at `TableFileSystems.Create` with null and
+  fell through to the host FS — duckdb-azure, whose `ExclusiveCreate` is a client-side existence check, not a
+  conditional PUT (the measured 41-of-48 shape). `DeltaCatalog`'s constructor now adopts
+  `FabricCredentialResolver.AmbientChain()` when the root is OneLake, no secret was named, and
+  `FabricNotebookCredential.IsAvailable`.
+  - **⚠ READS WERE ALWAYS FINE, WHICH IS WHY NOBODY NOTICED.** `DeltaReader.ToReadableRoot` rewrites an
+    `abfss://…onelake…` root to `onelake://` so DuckDB's native reader uses our VFS — but **that rewrite is
+    READER-ONLY**, and `TablePath()` hands the commit path the root exactly as attached. Reads went one way
+    and commits the other.
+  - **⚠ THE TWO ARE NOT COMPETING FILESYSTEMS, and thinking they were cost a wrong plan.**
+    `AdlsGen2TableFileSystem` (engineered-wood's `ITableFileSystem`, used for the Delta LOG) and
+    `OneLakeForwardFs` (the DuckDB VFS behind `onelake://`, used for DATA files) are two consumers of the
+    SAME Azure DataLake SDK against the same endpoint — the former was literally renamed from
+    `OneLakeDataLakeFileSystem`. "Route commits through `onelake://`" is a category error: the commit never
+    goes through a DuckDB VFS at all.
+  - **⚠ SCOPED TO `IsAvailable`, NOT TO abfss:// GENERALLY.** For a plain ADLS account the status quo is that
+    duckdb-azure does the IO with whatever azure secret is in SCOPE; adopting an ambient credential there
+    could turn a working attach into an auth failure when the ambient identity has no RBAC on the account. On
+    Fabric compute the ambient token IS the documented credential and there is no in-scope-secret story to
+    break. A NAMED secret still wins — this only fills the gap where there was nothing.
+  - **✅ VALIDATED LIVE IN A FABRIC NOTEBOOK (2026-08-11).** A secretless `abfss://…onelake…` ATTACH,
+    CREATE + INSERT: **`{"rows":[50,1225],"rows_after_insert":55,"fs_direct_sdk":20,
+    "commit_guard_off_warnings":0,"verdict":"ATOMIC (direct SDK)"}`** — 20 log lines naming
+    `AdlsGen2TableFileSystem`, zero fallback warnings. So the ambient token both SELECTS the direct SDK and
+    AUTHENTICATES against OneLake.
+  - Predicted first by SIMULATING Fabric on box: `IsAvailable` keys on two ENV VARS
+    (`AZURE_FABRIC_TOKEN_SERVICE_URL`, `MSNOTEBOOKUTILS_TRIDENT_SESSION_TOKEN`), so setting them flips the
+    selection — "commit guard is OFF" **1 → 0** with the env var as the only variable. ⚠ That proved the
+    SELECTION only (the fake vars point at no token service); the notebook run is what proved the TOKEN.
+  - **⚠ THE PROBE HAD TO BE EXTENDED TO WRITE, AND THAT IS THE WHOLE REASON THIS SURVIVED.** The existing
+    `delta ATTACH abfss ambient (no secret)` step only READ — and reads were always fine, because
+    `ToReadableRoot` sends them through `onelake://`. A read-only probe of a read-only-correct path proves
+    nothing about the commit.
+  - **⚠ `scratchpad/fabricnb`'s two halves had drifted apart, costing a wasted run.** The driver's UPLOAD
+    side still supported the raw-loadable + payload-zip override (`FABRICNB_ARTIFACT`/`FABRICNB_PAYLOAD`)
+    while the NOTEBOOK side had been rewritten for the single-file artifact and no longer unpacked the zip.
+    The run then loaded the raw artifact against a STALE managed dir from an earlier run, whose missing
+    `Fabricator.SqlServer.dll` made `clr_host` fall back to `Fabricator.Bridge.dll` (no runtimeconfig) and
+    fail `AppArgNotRunnable` (0x80008094) — cascading into 18 meaningless failures. `stage()` now handles
+    BOTH shapes, wipes the managed dir first, and ASSERTS `has_composition_assembly` up front so the same
+    fault is named at its cause instead of surfacing as a hostfxr code three steps later.
+  - ⚠ `OneLakeForwardFs`'s XML doc still says an empty credential set yields `DefaultAzureCredential`; the
+    code calls `AmbientChain()` (notebook token first). Stale prose that sent an earlier analysis down the
+    wrong path — worth fixing.
+  - README gained a **"Running inside a Fabric notebook"** section (the secret-shape table + the two ⚠ boxes);
+    it had NO notebook documentation at all before, despite ambient auth being shipped and live-validated.
+
+- **SqlClient PINNED TO 7.0.2 (2026-08-10, user-asked; was 6.0.2) — AND IT NEEDED A SECOND PACKAGE THAT NO
+  CI TIER WOULD HAVE DEMANDED.** `Microsoft.Data.SqlClient` 7.0 **MOVED the Entra (Azure AD) authentication
+  providers out of the core package** into `Microsoft.Data.SqlClient.Extensions.Azure`, so every
+  `Authentication=Active Directory …` connection string — Fabric Warehouse via a service principal, the
+  Fabric SQL endpoint, Azure SQL with Entra, the ambient notebook token — fails at CONNECT with *"Cannot find
+  an authentication provider for 'ActiveDirectoryServicePrincipal'"*. Added at the same version (they ship as
+  a matched pair), which forced **`Azure.Identity` 1.13.2 → 1.21.0** (the extension requires ≥ 1.18.0; the
+  downgrade surfaces as `NU1605`, an error here because warnings-as-errors is on).
+  - **⚠ NEITHER CI TIER CAN CATCH ITS ABSENCE, and that is the durable lesson: the docker rig authenticates
+    with `sa`/password, so tier 1 and tier 2 stay GREEN — 48/48 — 1867 — while every Entra attach in the
+    product is broken.** It surfaced only by re-running a LIVE Fabric shape after the bump. Any future
+    SqlClient bump needs a live Entra attach before it is believed, and the same hole exists for anything
+    else auth-shaped.
+  - Gates after the bump: service **48/48 — 1867** and hermetic **67/67 — 6895**, both IDENTICAL to the
+    pre-bump counts ⇒ behaviour-preserving on everything the tiers reach.
+  - ⚠ `7.1.0-preview2` exists and is deliberately NOT taken: a preview does not belong in the shipped
+    dependency. Note [docs/aot-bridge.md](docs/aot-bridge.md) records the AOT SKU as targeting 7.1+, so that
+    plan's pin and this one will need reconciling when 7.1 ships stable.
+- **⚠ CTAS WITH A SAME-CATALOG SOURCE INSIDE AN EXPLICIT TRANSACTION IS BROKEN ON FABRIC — PRE-EXISTING,
+  FOUND 2026-08-10, NOT FIXED.** `BEGIN; INSERT INTO wh.t …; CREATE TABLE wh.u AS SELECT … FROM wh.t; COMMIT;`
+  dies after ~30 s with `Execution Timeout Expired` or an SSL/TLS handshake failure, and the aborted
+  transaction then reports the far less helpful `208: Invalid object name`.
+  - **Cause, from the Debug log — a race on the PINNED connection, with MARS off:**
+    `19.442 query [pinned txn=10]: SELECT [a] FROM [dbo].[ci_ryw]` then
+    `19.454 bulk ddl [txn=10 own=False]: … CREATE TABLE [dbo].[ci_ryw_copy]` — 12 ms apart, SAME connection.
+    The sink's DDL runs on the bulk's BACKGROUND thread while the scan's `ExecuteReader` is still open on
+    that connection. **The drain cannot help**: the collision is at `ExecuteReader` time, before there is
+    anything drained.
+  - **⚠ IT IS NOT THE `COPY INTO` WORK AND NOT THE SqlClient BUMP — established by CONTROLS, not by
+    reasoning.** The identical shape with NO `copy_into_staging` (plain `SqlBulkCopy`) fails the same way, and
+    both failure modes appear on 6.0.2 AND 7.0.2. ⚠ A first pass here reported "7.0.2 fixed the TLS error"
+    off ONE run; the control run on 7.0.2 then produced four handshake failures. **One trial of a
+    timing-dependent failure is not a measurement** — the same rule this file already records for the pinned
+    intra-statement read.
+  - **⚠ FULLY MAPPED 2026-08-10 — the settings × engine × statement matrix is
+    [docs/transactions.md](docs/transactions.md) §5.6a (11 rows, every one measured live). Three findings
+    there change how this should be read:**
+    - **MARS IS THE WHOLE STORY: a PINNED scan feeding a same-catalog bulk write is broken whenever MARS is
+      OFF, on ANY engine.** The bulk's consumer calls `WriteToServer` as soon as it starts, so the scan's
+      reader and the load hold the pinned connection CONCURRENTLY by construction; MARS is what lets them
+      coexist. Box with `mssql_mars='false'` fails **0 of 8**; Fabric has no MARS and fails the same way.
+      ⇒ **`SET mssql_mars='false'` REPRODUCES IT ON BOX in under a second with 15 rows** — so this is a
+      service-tier gate, and its absence is why the hazard had only ever been seen on Fabric.
+      - ⚠ **I FIRST RECORDED THE OPPOSITE OFF ONE RUN.** Row 2 went into the matrix as ✅ ("box drains in
+        ~1 ms and wins the race"), with a whole latency-race model on top. The byte-identical script then
+        gave 0/8, ~1 success in a dozen. The mechanism IS a race — box just does not reliably win it either,
+        and the single green run was the rare outcome promoted to a fact. **A flaky failure sampled once is
+        indistinguishable from a pass.**
+    - **CTAS AND INSERT DIVERGE ON IDENTICAL SETTINGS** — the CTAS's scan logs `pooled`, the INSERT's logs
+      `pinned`, because the routing turns on whether the transaction's connection EXISTS YET when the scan
+      starts and the two operators initialise their sink in a different order relative to the source. So a
+      marked scan pins or pools by statement KIND, which no setting expresses.
+    - **`read_isolation='snapshot'` DOES NOT RESCUE IT (measured) — it makes it worse**, since its whole job
+      is to route the read onto the transaction's connection, which is exactly what must not happen while a
+      bulk holds it. Do not offer it as the remedy here.
+  - **✅ THE BULK DEFERRAL (2026-08-10): `WriteToServer` NO LONGER ACQUIRES BEFORE IT HAS DATA — and it made
+    read-your-writes REACHABLE without MARS, which this file twice recorded as impossible.**
+    `BulkSession`'s consumer called `BulkInsert` immediately, and `SqlBulkCopy.WriteToServer` holds the
+    connection for the WHOLE load including the time it is only waiting for rows — so the load owned the
+    connection before the scan had asked for one. It now waits for the first batch OR end-of-stream, making
+    the acquisition order deterministic: **the load always acquires SECOND.**
+    - **⚠ THE FAILURE WAS AT ACQUISITION, NOT RELEASE.** The scan releases fine (eagerly at end of result
+      set). Whoever asks SECOND is refused, and which one varies: measured BOTH directions — *"There is
+      already an open DataReader"* (scan second) and *"does not support MultipleActiveResultSets"* (load
+      second), plus a 30 s timeout where the loser waits. Two of my explanations before this were wrong.
+    - **MEASURED: `mssql_mars='false'` + explicit `mssql_materialize='true'` went 0 of 8 → 8 of 8, with
+      READ-YOUR-WRITES RESTORED** (CTAS 15 vs the pooled default's 10; scan `pinned`, drain count 1). The
+      DEFAULT is unchanged — streaming still wins on speed and memory — so this makes read-your-writes
+      OPT-IN rather than impossible.
+    - **⚠ THE WAIT IS "BATCH **OR** COMPLETION", NEVER "BATCH"** — a zero-row source completes the channel
+      without ever writing, so waiting for a batch alone hangs forever on a shape that still has to CREATE
+      the table. Verified: empty CTAS/INSERT/COPY all return immediately. ⚠ No cancellation token belongs
+      there either: `_consumerExited` is cancelled by the consumer's own `finally` so it can never fire
+      while waiting; interrupt and abort FAULT the channel, which makes the wait throw into that same
+      `finally`.
+    - Gates: hermetic **67/67 — 6895** and service **49/49**, both byte-identical to pre-change ⇒
+      behaviour-preserving for EVERY provider (`BulkSession` is provider-agnostic, so Delta runs through it).
+      §6 of the gate pins the unlocked configuration, **mutation-tested 4 of 4** at exactly the §6a INSERT.
+      ⚠ §6 uses 200 rows not 15 ON PURPOSE — the failure is a race a small scan sometimes wins, and a gate
+      that fails only sometimes is worse than none.
+  - **✅ FIXED 2026-08-10: `mssql_materialize` NOW DEFAULTS TO MARS** — `set ?? _materialize ?? _marsEnabled`,
+    where it used to be a flat `?? true`. On a MARS engine nothing changes (drained + pinned, read-your-writes
+    intact); without MARS the marked scan takes the SNAPSHOT-READ route — pooled, at SNAPSHOT — so it never
+    shares the connection with the load. **MEASURED: box went 0 of 8 → 8 of 8, and the three Fabric shapes
+    that failed (autocommit INSERT, explicit-txn CTAS, explicit-txn INSERT) all pass with 0 errors.**
+    - **⚠ FALSE MEANS SNAPSHOT-READ, NOT PLAIN POOLED, and that is what makes it safe.** Returning false from
+      `SinkRequiresDrainedScan` instead — neither drained NOR snapshot-read — gives a READ COMMITTED pooled
+      read, which `EnsureScanCannotSelfBlock` REFUSES: a hang traded for a refusal, not a fix.
+    - **⚠ IT FOLLOWS MARS RATHER THAN BEING UNCONDITIONAL** because the route needs snapshot isolation, and
+      the engines that lack MARS (Fabric/Synapse) are exactly the ones that have it by construction. Forcing
+      `mssql_mars='false'` on a box database without ALLOW_SNAPSHOT_ISOLATION yields a clear error from the
+      isolation SET, not a hang — and that is opt-in twice over.
+    - **Cost: read-your-writes on the scanned table**, accepted deliberately (bulk movement does not need to
+      observe its own uncommitted rows). It removes nothing that worked — every configuration that would have
+      delivered it without MARS is one of the shapes that deadlocked.
+    - **⚠ ROW 7 FIXED IN THE SAME PASS — AND FIXING IT REMOVED A REGRESSION THE MARS DEFAULT HAD JUST
+      INTRODUCED (found by testing row 7 on box, 3 of 3).** `mssql_materialize=false` + `mssql_read_isolation`
+      is refused as contradictory, which is right when BOTH are active requests — but that check tested the
+      RESOLVED value, and once `materialize` defaulted to MARS it resolved false with nobody asking. So the
+      refusal fired for every no-MARS user who set `read_isolation` ALONE, i.e. it would have made the option
+      unusable on Fabric outright. Now it tests what the USER supplied (`MaterializeExplicitlyFalse`), and
+      row 7 then falls through to the pooled snapshot route by itself, because `readIsolationPin` already
+      required `!snapshotRead`. **Standing lesson: a rule phrased "the user set X" must test what the USER
+      SUPPLIED, not what the resolver returned — the day the default changes, it silently starts applying to
+      everybody.**
+      - `read_isolation` still pins ORDINARY reads; only a MARKED scan is exempt. Both halves gated in §5,
+        and the ordinary-read control is load-bearing: without it the write assertion would pass equally if
+        the option had simply been disabled. Mutation-tested — restoring the resolved-value check kills it
+        2 of 2 at exactly the §5 INSERT, with §1–§4 passing first.
+    - Gate `test/verify_mars_off_same_catalog.test` (**90**, service tier), **mutation-tested: restoring the
+      flat `?? true` kills it 3 of 3 at exactly the §2 INSERT**, with the §1 MARS-ON control passing first.
+      ⚠ **`SET mssql_mars` MUST PRECEDE THE ATTACH** (the value is resolved at first connect) — writing the
+      gate the other way round silently produced a MARS-ON catalog and a vacuously passing suite.
+  - **⚠ `SET mssql_materialize='false'` MAKES IT RUN — AND SILENTLY CHANGES THE ANSWER. MEASURED.** It sends
+    the marked scan down the `snapshotRead` route (pooled at SNAPSHOT) instead of drain-and-pin, so the scan
+    and the sink's DDL stop sharing a connection: **0 failures, every query `pooled`, transaction committed**
+    where the same script otherwise hangs 30 s and dies. But the CTAS then reads COMMITTED state, so the
+    transaction's own 5 uncommitted rows are invisible — **10 rows landed where 15 were expected.**
+    ⇒ a legitimate workaround where read-your-writes is not needed, and NOT a fix: it trades a loud hang for
+    a quiet wrong answer, which on this shape is the worse of the two.
+  - **⚠ THE "REAL FIX" — HOISTING THE SINK'S DDL INTO `begin_bulk` — WAS BUILT, MEASURED AND REVERTED
+    (2026-08-10, user-asked). IT WORKS AND IS STILL NET-NEGATIVE. Do not rebuild it without reading this.**
+    A `PrepareBulkTarget` DIM on `IBackendCatalog` (default no-op, so only SQL Server was affected) ran the
+    DROP/CREATE synchronously in `BulkSession`'s constructor — i.e. inside `begin_bulk`, which DuckDB calls
+    when it builds the sink's global state — and then asked the consumer for `createTable:false,
+    replace:false`.
+    - **The ordering premise was CORRECT and is now measured**: the log went from `scan 19.442 → ddl 19.454`
+      to `ddl 15.101 → scan 15.368`. Sink-state construction really does precede source-state construction,
+      and the 30 s `Execution Timeout` became an immediate, self-explanatory
+      *"There is already an open DataReader associated with this Connection"*.
+    - **⚠ AND IT BROKE A SHAPE THAT WORKED, through a side effect nothing in the design predicted.**
+      `PrepareBulkTarget` must call `BeginWrite()` to get the transaction's connection — which MATERIALISES
+      that connection EARLIER than before. A marked scan then finds a connection to pin to where it
+      previously found none and went POOLED; and a PINNED scan cannot coexist with `SqlBulkCopy` on the same
+      connection without MARS. **MEASURED with the hoist as the only variable**: autocommit same-catalog CTAS
+      on Fabric ⇒ hoist ON *"The connection does not support MultipleActiveResultSets"*, scan `pinned`;
+      hoist OFF ⇒ **10 rows, scan `pooled`**.
+    - **⇒ the scan's ROUTING is a hidden dependency of when the connection is first opened**, which is not
+      visible from the call site and is exactly the kind of coupling a "pure ordering fix" is assumed not to
+      have. Any future attempt must either avoid `BeginWrite()` in the prepare step (but the DDL must share
+      the transaction, or create+load stop being atomic) or make a marked scan decline to pin while a bulk
+      session holds the connection.
+    - **The shape has a working answer already: the staged `COPY INTO` path**, which never meets the hazard —
+      its scan streams POOLED and its load is a separate statement issued after the scan has finished. The
+      plain `SqlBulkCopy` path on a no-MARS engine remains broken inside an explicit transaction, and
+      `SET mssql_materialize='false'` remains its workaround (measured above).
+
 In-flight / planned refactors (all C#-only unless noted; tests stay green per slice):
 - **THE SAME-CATALOG READ+WRITE MARK NAMES THE SINK — the PROVIDER decides (2026-08-10, C++ + C#, no ABI
   bump). Full record: [docs/transactions.md](docs/transactions.md) §5.9.** The host emitted
@@ -698,16 +895,87 @@ In-flight / planned refactors (all C#-only unless noted; tests stay green per sl
     a shared location downstream is not append-safe; check for later assertions on the same object.
   - **The sink is SINGULAR by construction** — DuckDB gives a plan one sink and MERGE INTO's operators all
     address one target; the READ set needs no transport, since each scan already passes its own `touchKey`.
-  - **NEXT, NOT BUILT: Fabric `COPY INTO` instead of `SqlBulkCopy`** (§5.9). Verified from the COPY INTO
-    reference: **OneLake IS a supported source**
-    (`https://onelake.dfs.fabric.microsoft.com/<workspaceId>/<lakehouseId>/Files/`), PARQUET is supported, and
-    ONE statement consumes MANY files — a folder loads recursively, wildcards work, and a comma-separated list
-    is preferred over a broad wildcard by the doc itself. So a parallel DuckDB `COPY … TO <dir>` is a natural
-    producer. ⚠ **OneLake as a source is ENTRA-ONLY** (no SAS, no key), and ⚠ **files beginning `_` or `.` are
-    IGNORED** unless named — so the staging dir must not be `_`-prefixed. Needs a staging-location option, the
-    parquet write, COPY INTO generation, cleanup and transaction semantics. **This refactor is the only part
-    that had to land first**: such a path answers `SinkRequiresDrainedScan` with `false` and the host never
-    changes.
+- **THE FABRIC `COPY INTO` LOAD PATH — BUILT 2026-08-10 as an OPT-IN (`mssql_copy_into_staging` / the
+  `copy_into_staging` ATTACH option; C#-only, no ABI). Full record:
+  [docs/transactions.md](docs/transactions.md) §5.9.** Name a storage location this extension may stage
+  temporary parquet in and a bulk write on a WAREHOUSE engine writes it there with DuckDB's own parallel
+  writer (`COPY … TO <dir> (FORMAT parquet, PER_THREAD_OUTPUT true)`), then loads the folder with ONE
+  `COPY INTO` — the rows never cross TDS. New: `Fabricator.Bridge/OneLakeStagingLocation.cs`,
+  `Fabricator.Bridge/HostParquetStaging.cs` (provider-agnostic), `Fabricator.SqlServer/WarehouseCopyInto.cs`.
+  - **THE LOCATION IS THE SWITCH, and there is deliberately NO size threshold.** There is no defensible
+    default for "where may this extension write temporary files", so the option that names it is the opt-in.
+    A threshold would need the row count, which is unknown until the stream has been consumed — and
+    `COPY INTO` costs seconds of fixed overhead, so guessing wrong on a small INSERT is a pessimisation.
+  - **⚠ THE COLUMN LIST IS NEVER OMITTED — correctness, not clarity.** Without one, `COPY INTO` maps source
+    fields to target columns **by ORDINAL**, so an INSERT whose stream is ordered differently from the table
+    loads every value into the wrong column and SUCCEEDS. Naming the columns in the stream's own order makes
+    the ordinal and by-name readings agree, since the staged parquet is written in that order.
+  - **⚠ A HIDDEN STAGING SEGMENT FAILS SILENTLY, so it is REFUSED AT ATTACH.** `COPY INTO` SKIPS files
+    beginning `_` or `.` — a root like `Files/_stage` stages perfectly, the load succeeds, and NOTHING is
+    inserted. Same for a lakehouse `Tables/` root (loose parquet there surfaces as a broken managed table).
+    ⚠ **The `Tables/` check tests the SECOND path segment**: on OneLake the FILESYSTEM is the workspace, so
+    the path reads `<item>/<area>/…`. My first version tested segment 0, never fired, and its own offline
+    test is what caught it — the same payoff `FabricSqlEndpointHost`'s tests gave on their first run.
+  - **⚠ It runs on the SAME connection and transaction `SqlBulkCopy` would have used**, so an explicit
+    `BEGIN … ROLLBACK` still governs it. A separate connection — the original sketch — would commit the load
+    independently of the DuckDB transaction, i.e. a behaviour change dressed as an implementation detail.
+    ⚠ Whether Fabric permits `COPY INTO` inside an explicit transaction is **UNMEASURED**; the reference is
+    silent on it.
+  - **⚠ `KeepIdentity` has NO `COPY INTO` equivalent** ⇒ refused, naming the way back (explicit IDENTITY
+    values would otherwise be replaced by engine-generated ones). `checkConstraints` needs no guard: a
+    warehouse enforces no CHECK or FOREIGN KEY constraint at all, so that flag is already vacuous there.
+  - **⚠ Configured on an engine with no `COPY INTO` it is IGNORED, not refused** — a `SET` spans every
+    catalog in the session, so a dbt project attaching Fabric beside box must not have its box writes fail
+    on a setting never aimed at them. The ATTACH option is parsed before any connection exists, so the
+    engine is not yet known there either.
+  - **✅ VALIDATED LIVE 2026-08-10** (Fabric `Test Warehouse`, SP auth): a 50 000-row CTAS staged to OneLake
+    and loaded, every value correct (`count 50000`, `sum(a) 1249975000`, `sum(c) 1874962500.0`, `min(b) v0`).
+    **Both defects it found were invisible to reading:**
+    - **⚠ ON ONELAKE THE WORKSPACE AND ITEM MUST BE GUIDs — and the two spellings differ ONLY at the far
+      end.** A display-name root stages parquet perfectly (our writer resolves names) and the `COPY INTO`
+      then fails with **`13840: Access token couldn't be fetched for storage path '…' as it's an unsupported
+      URL or cause of a transient error`** — naming neither names nor GUIDs, and reading like a permissions
+      problem. The byte-identical GUID path loads. In hindsight the reference said so: its example is
+      `…/<workspaceId>/<lakehouseId>/Files/`, `Id` in both placeholders. **Now refused at ATTACH**, naming
+      the GUID form and `fabric.workspaces()` / `fabric.items()`. Resolving names ourselves is possible
+      (`FabricApiClient` does it for the `fabric.*` functions) and deliberately not done — it would cost a
+      REST listing at ATTACH and a Fabric credential on a path that has neither.
+    - **⚠ `RemoveDirectory` IS UNIMPLEMENTED ON abfss ⇒ every load LEAKED its staged parquet** on the one
+      platform this runs on. Fixed with a per-file glob-and-remove fallback — **the same shape
+      `DeltaCatalog.RemoveTableFolder` already needed** for `DROP TABLE` on abfss and s3, whose comment even
+      names abfss. **The precedent was in the tree the whole time; the leak was found by RUNNING the
+      feature, not by reading for it.**
+    - Incidentally: a failed load leaves **NO table** (`sys.tables` = 0 after the 13840 failure), so the
+      CTAS's CREATE rolls back with it — unlike the Delta CTAS's two commits (limitation 1.5).
+  - **THE DRAIN IS NARROWED AND STREAMING IS THE DEFAULT HERE (2026-08-10, MEASURED — user-prompted).** A
+    same-catalog 1M-row CTAS on Fabric: streaming **14.5 / 15.3 / 15.4 / 16.1 s** vs drained **16.8 / 17.4 /
+    28.9 s** (no overlap between the sets), ~27% less CPU (4.5 s vs 6.2 s user) and **484 MB of allocation
+    avoided**. Draining serialises the SQL read and the parquet write; both legs are network-bound.
+    - **⚠ THE DRAIN WAS BUYING NOTHING IN THAT SHAPE — sharper than "it was slower": BOTH legs logged the
+      scan as `pooled`.** On an autocommit CTAS the transaction's connection does not exist yet when the
+      scan starts, so `materialize` had nothing to pin to and bought neither read-your-writes nor 595
+      protection, only the copy.
+    - **⚠ IT NEVER DRAINS, AND SURRENDERING READ-YOUR-WRITES IS A DELIBERATE PRODUCT DECISION (user,
+      2026-08-10), not an oversight.** A staged load is chosen for BULK — the point is to move bytes, not to
+      observe this transaction's own uncommitted rows — so the scan reads a committed snapshot and streams.
+      MEASURED inside an explicit transaction that had just written the source: **0 drains, 0 failures, every
+      query pooled, 10 rows** (the committed state; the 5 uncommitted rows are deliberately invisible).
+    - **⚠ AN INTERMEDIATE VERSION DRAINED WHEN THE TRANSACTION HAD WRITTEN THE SCANNED TABLE, and removing it
+      was not just simplification — it was ACTIVELY HARMFUL.** Draining pins the scan onto the WRITE
+      connection, where it collides with the sink's own `CREATE TABLE` (issued from the bulk's BACKGROUND
+      thread) on a no-MARS engine: 30 s hang, dead transaction. Measured both ways — drained ⇒ hang,
+      streaming ⇒ commits. ⚠ That collision is PRE-EXISTING and not ours (the same shape fails identically
+      with no staging, on the plain `SqlBulkCopy` path), so this does not FIX it, it declines to walk into it.
+    - ⚠ It needs no `mssql_materialize='false'`: that setting reaches the same place by another route
+      (`snapshotRead`, pooled at SNAPSHOT) and is the workaround for the NON-staged path.
+    - `PooledScanSelfBlockReason` / `TransactionHasWritten` survive the removal as a factoring of
+      `EnsureScanCannotSelfBlock` — worth keeping, since the refusal still needs exactly that question.
+  - Gate `test/verify_copy_into_staging.test` (**30**, service tier), **mutation-tested with two mutants,
+    each killed at its own section**. ⚠ **The load itself is in NEITHER CI tier** — no engine the service
+    tier can reach has `COPY INTO`, so the positive leg is manual against live Fabric, like `verify_dax`.
+    §2 pins the thing that IS assertable: a valid Fabric staging location on a BOX attach changes nothing.
+    ⚠ Its COPY leg needs `(FORMAT mssql)` — a bare `COPY … TO '<string>'` is a FILE target in DuckDB, so
+    without it the statement writes a CSV named after the table and succeeds.
 - **CROSS-STATEMENT READ STABILITY — BUILT 2026-08-09 as an OPT-IN (`mssql_read_isolation` / the
   `read_isolation` ATTACH option; C#-only, no ABI). Full record: [docs/transactions.md](docs/transactions.md)
   §5.8.** `BEGIN; SELECT count(*) FROM t; SELECT count(*) FROM t; COMMIT;` used to return DIFFERENT answers
@@ -4093,9 +4361,9 @@ commits do not compile DuckDB:
 
 | tier | workflow | what | trigger |
 |---|---|---|---|
-| 0 | `installer-core.yml` — **TWO jobs** | job `test`: `Fabricator.Installer.Core.Tests`, floor **92**. job `bridge`: `Fabricator.Bridge.Tests`, floor **106** (the variable-library format, the Fabric SQL endpoint-host derivation, and the persisted Delta parquet tuning). Both × {net8.0,net10.0} × {win,linux}. No C++, no vcpkg, **no submodules**. ~2 min | push/PR |
-| 1 | `extension.yml` | build + the hermetic tier, **67 runs / 6801 assertions** as of 2026-08-07 (scratch dir + in-repo fixtures only). 3 platforms | push/PR |
-| 2 | `integration.yml` | the service tier, **45 runs / 1678 assertions** as of 2026-08-07, via `docker/docker-compose.yml` (SQL Server 2025 + MinIO + generated certs + `provision.ps1`). linux only | schedule + dispatch |
+| 0 | `installer-core.yml` — **TWO jobs** | job `test`: `Fabricator.Installer.Core.Tests`, floor **92**. job `bridge`: `Fabricator.Bridge.Tests`, floor **146** (the variable-library format, the Fabric SQL endpoint-host derivation, the persisted Delta parquet tuning, and the COPY INTO staging location). Both × {net8.0,net10.0} × {win,linux}. No C++, no vcpkg, **no submodules**. ~2 min | push/PR |
+| 1 | `extension.yml` | build + the hermetic tier, **67 runs / 6895 assertions** as of 2026-08-10 (scratch dir + in-repo fixtures only). 3 platforms | push/PR |
+| 2 | `integration.yml` | the service tier, **48 runs / 1867 assertions** as of 2026-08-10, via `docker/docker-compose.yml` (SQL Server 2025 + MinIO + generated certs + `provision.ps1`). linux only | schedule + dispatch |
 | 3 | `distribution.yml` | the single-file artifact per platform + the **12-check smoke against a STOCK DuckDB wheel** (`test/distribution/smoke_distribution.py`). 3 platforms; needs `OVERRIDE_GIT_DESCRIBE` (the one tier that does) | dispatch + `v*` tags |
 | — | manual | `verify_dax` (Power BI Desktop), live Fabric/OneLake (gitignored SP creds), the 7 deltars suites (`-IncludeDeltaRs`, ~240 MB), and on macOS: Gatekeeper/`com.apple.quarantine` + code signing | by hand |
 
@@ -4126,9 +4394,9 @@ exercised the next time a pin moves on its own.
 **Suite selection is DERIVED, never a hand-kept list** — `scripts/list-hermetic-suites.sh` and
 `scripts/list-service-suites.sh` classify by the `require-env`/`require` directives each suite
 declares, so a new suite cannot silently sit outside CI. The accounting is complete and checked:
-**62 hermetic + 44 service + 11 excluded = 117 suite FILES** (recomputed 2026-08-07), no overlap. ⚠ Suite
+**62 hermetic + 47 service + 11 excluded = 120 suite FILES** (recomputed 2026-08-10), no overlap. ⚠ Suite
 FILES and suite RUNS differ and the floors are on RUNS: five hermetic suites and one service suite are
-engine-doubled, so 62 files ⇒ **67 runs / 6801 assertions** and 44 ⇒ **45 runs / 1678**. Recompute rather
+engine-doubled, so 62 files ⇒ **67 runs / 6895 assertions** and 47 ⇒ **48 runs / 1867**. Recompute rather
 than copy — the line here read `53 + 42 + 9 = 104` for a while after the counts had moved, and then
 `59 + 43 + 11 = 113` for a while after THAT, which is what a hand-copied number does. The one-liner:
 `H=$(./scripts/list-hermetic-suites.sh | wc -l); S=$(./scripts/list-service-suites.sh | wc -l);

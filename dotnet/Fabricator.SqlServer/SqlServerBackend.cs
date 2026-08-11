@@ -60,6 +60,18 @@ public sealed class SqlServerBackend : IBackend
                     "and 'serializable' works by blocking writers); on box it needs ALLOW_SNAPSHOT_ISOLATION. " +
                     "Unset = reads take a pooled connection and share no view. Overrides the per-catalog " +
                     "read_isolation ATTACH option"),
+                // OPT-IN, and the location IS the switch — there is no defensible default for "where may
+                // this extension write temporary files". Never inferred from the engine: COPY INTO carries
+                // seconds of fixed cost, so it is the wrong choice for a small INSERT, and the row count that
+                // would decide is not known until the stream has already been consumed.
+                Str("mssql_copy_into_staging",
+                    "fabricator: OPT-IN, unset by default. A storage location this extension may write " +
+                    "temporary parquet to (abfss://<fs>@<host>/<path> or the equivalent https://<host>/<fs>/" +
+                    "<path>). Set it on a Fabric Warehouse / Synapse attach to load INSERT/CTAS/COPY data " +
+                    "with a staged COPY INTO — DuckDB writes the parquet in parallel and the warehouse " +
+                    "ingests the folder in one statement — instead of streaming rows over TDS with " +
+                    "SqlBulkCopy. Unset = SqlBulkCopy. Ignored on engines with no COPY INTO. Overrides the " +
+                    "per-catalog copy_into_staging ATTACH option"),
                 Str("mssql_mars", "fabricator: MARS mode — auto (default, per engine) | true | false"),
                 // BOOLEAN, not the auto|true|false tri-state mssql_mars uses, and deliberately: there is no
                 // per-engine variation to express here. The default is always "materialise the scans the
@@ -573,6 +585,10 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     // scopes table-in-out sessions only; reusing that one would have switched this on for anyone who had ever
     // set it, and the cost (a held connection + open transaction for the transaction's life) must be asked for.
     private readonly string _readIsolation = "";
+    // ATTACH option `copy_into_staging <location>` (default unset = SqlBulkCopy). The storage location this
+    // catalog may stage temporary parquet in, which is also the opt-in for the COPY INTO load path — see
+    // ResolveCopyIntoStaging and WarehouseCopyInto. Validated at ATTACH so a typo fails there.
+    private readonly string _copyIntoStaging = "";
     // ATTACH option `materialize true|false` (default true). See ResolveMaterialize; a SET mssql_materialize
     // overrides it per session, the same precedence as isolation_level and command_timeout.
     private readonly bool? _materialize;
@@ -681,6 +697,13 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
                     case "read_isolation":
                         ParseIsolationLevel(val);
                         _readIsolation = val;
+                        break;
+                    // Validated at ATTACH for the same reason: a mistyped staging location would otherwise
+                    // surface at the first large INSERT, as a storage error naming a path the statement did
+                    // not mention. Parse throws with the accepted spellings.
+                    case "copy_into_staging":
+                        OneLakeStagingLocation.Parse(val);
+                        _copyIntoStaging = val;
                         break;
                     case "materialize":
                         _materialize = !(string.Equals(val, "false", StringComparison.OrdinalIgnoreCase) || val == "0");
@@ -1296,13 +1319,56 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         }
     }
 
-    // SET mssql_materialize wins if set, else this catalog's `materialize` ATTACH option, else TRUE.
-    // Default true because false is only safe where the database allows snapshot isolation — an opt-in with
-    // a prerequisite must not be the default.
+    // SET mssql_materialize wins if set, else this catalog's `materialize` ATTACH option, else it FOLLOWS
+    // MARS: true where MARS is available, false where it is not.
+    //
+    // ⚠ THE DEFAULT IS MARS-DEPENDENT BECAUSE DRAINING IS UNSAFE WITHOUT MARS — measured 2026-08-10, and the
+    // flat `true` it replaces was a shipped defect rather than a conservative choice. Draining PINS the
+    // marked scan onto the transaction's connection, and the bulk's consumer calls `SqlBulkCopy.WriteToServer`
+    // on that same connection as soon as it starts — so reader and load are concurrent BY CONSTRUCTION. With
+    // MARS they coexist; without it they cannot, and the statement dies: box with `mssql_mars='false'` failed
+    // **0 of 8** runs, Fabric (no MARS at all) 4 of 4, variously as *"does not support
+    // MultipleActiveResultSets"*, *"already an open DataReader"*, or a 30 s `Execution Timeout` that takes the
+    // whole transaction with it. Full grid: docs/transactions.md §5.6a.
+    //
+    // ⚠ FALSE HERE MEANS THE SNAPSHOT-READ ROUTE, NOT A PLAIN POOLED READ, and that distinction is what makes
+    // it safe. `ScanFromSource` maps it to `snapshotRead`, i.e. pooled AND at SNAPSHOT — which is exempt from
+    // the EnsureScanCannotSelfBlock refusal because a versioned read cannot wait on this transaction's locks.
+    // Returning false all the way up (not drained AND not snapshot-read) would instead give a plain READ
+    // COMMITTED pooled read, which that precheck REFUSES — trading a hang for a refusal rather than a fix.
+    //
+    // ⚠ ITS PREREQUISITE IS SNAPSHOT ISOLATION, which is why this follows MARS rather than being unconditional.
+    // Fabric/Synapse are snapshot-versioned by construction, so the engines that lack MARS are exactly the
+    // engines that have the prerequisite. A box user who FORCES `mssql_mars='false'` on a database without
+    // ALLOW_SNAPSHOT_ISOLATION gets a clear error from the `SET TRANSACTION ISOLATION LEVEL SNAPSHOT`, not a
+    // hang — and that combination is opt-in twice over.
+    //
+    // ⚠ THE COST IS READ-YOUR-WRITES ON THE SCANNED TABLE, accepted deliberately (user, 2026-08-10): this path
+    // exists for bulk movement, where observing the transaction's own uncommitted rows is not the point. It
+    // takes nothing away that worked — every configuration that WOULD have delivered read-your-writes here is
+    // one of the failing rows above.
     internal bool ResolveMaterialize()
     {
         var set = ProviderSettingsStore.Instance.GetBool(SqlServerBackend.ProviderName, "mssql_materialize");
-        return set ?? _materialize ?? true;
+        _ = Profile; // force profile resolution so _marsEnabled is populated before it is read
+        return set ?? _materialize ?? _marsEnabled;
+    }
+
+    /// <summary>
+    /// Did someone ASK for <c>materialize=false</c> (via <c>SET</c> or the ATTACH option), as opposed to it
+    /// resolving false from the MARS-derived default?
+    /// </summary>
+    /// <remarks>
+    /// ⚠ The distinction only started to matter when the default stopped being a constant. A rule written as
+    /// "the user set X" must test what the USER supplied, not what the resolver returned — otherwise the day
+    /// the default changes, the rule silently starts applying to everybody. That is exactly what happened
+    /// here: the read_isolation contradiction check tested the resolved value and became a hard error for
+    /// every no-MARS user of `mssql_read_isolation`.
+    /// </remarks>
+    private bool MaterializeExplicitlyFalse()
+    {
+        var set = ProviderSettingsStore.Instance.GetBool(SqlServerBackend.ProviderName, "mssql_materialize");
+        return (set ?? _materialize) == false;
     }
 
     // Does a scan the host MARKED (its plan writes to this catalog) actually have to be drained?
@@ -1329,8 +1395,41 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     //
     // A future write path that holds no reader — Fabric `COPY INTO` over staged parquet, say — extends this
     // method and needs no host change at all. That is the point of the sink being NAMED rather than judged.
-    private bool SinkRequiresDrainedScan(ScanSpec.SinkInfo sink)
+    private bool SinkRequiresDrainedScan(ScanSpec.SinkInfo sink, string? touchKey, bool schemaProbe)
     {
+        // THE STAGED `COPY INTO` PATH STREAMS. It runs no SqlBulkCopy, so nothing on the write connection can
+        // collide with an open reader — and MEASURED 2026-08-10 on Fabric, a same-catalog 1M-row CTAS: four
+        // streaming trials 14.5–16.1 s against three drained ones 16.8–28.9 s (no overlap between the two
+        // sets), ~27% less CPU (4.5 s vs 6.2 s user) and 484 MB of allocation avoided. Draining serialises
+        // the SQL read and the parquet write; streaming overlaps them, and both legs are network-bound.
+        //
+        // ⚠ THE DRAIN WAS BUYING NOTHING IN THAT SHAPE, which is sharper than "it was slower": BOTH legs
+        // logged the scan as `pooled`. On an autocommit CTAS the transaction's connection does not exist yet
+        // when the scan starts, so `materialize` had nothing to pin the scan to and the drain bought neither
+        // read-your-writes nor 595 protection — only the copy.
+        //
+        // ⚠ BUT IT IS NOT UNCONDITIONAL, because there IS a shape where the drain is the difference between
+        // working and refused: inside an explicit transaction that has already WRITTEN the scanned table, a
+        // pooled read waits forever on locks only this transaction can release (limitation 1.15). Draining
+        // pins the scan onto that same connection and makes it legal. So the question is asked directly —
+        // via the same predicate the refusal uses, so the two cannot disagree.
+        // ⚠ IT NEVER DRAINS, AND GIVING UP READ-YOUR-WRITES HERE IS A DELIBERATE PRODUCT DECISION (user,
+        // 2026-08-10) RATHER THAN AN OVERSIGHT. A staged load is chosen for BULK — the shape where the source
+        // is a large scan and the point is to move bytes, not to observe this transaction's own uncommitted
+        // rows. So the scan reads a committed snapshot and streams.
+        //
+        // An earlier version drained when the transaction had already written the scanned table, to keep
+        // read-your-writes for that one shape. It was removed for two reasons: it bought a guarantee this
+        // path does not need, and it was ACTIVELY HARMFUL — draining pins the scan onto the write connection,
+        // where it collides with the sink's own CREATE TABLE (issued from the bulk's background thread) on a
+        // no-MARS engine, hanging 30 s and killing the transaction. MEASURED both ways: drained ⇒ hang;
+        // streaming ⇒ commits, every query pooled, 0 failures. ⚠ That collision is PRE-EXISTING and not ours
+        // — the same shape fails identically with no staging at all, on the plain SqlBulkCopy path — so this
+        // does not fix it, it just declines to walk into it.
+        if (ResolveCopyIntoStaging() is not null)
+        {
+            return false;
+        }
         // ⚠ WITH MARS OFF THE DRAIN BUYS A SECOND THING, and skipping it here would be a quiet regression.
         // An ordinary scan reaches the PINNED connection only when `_marsEnabled || readYourWrites ||
         // materialize` (see ExecuteQuery), so on a no-MARS engine the drain is the ONLY reason the scan runs
@@ -1341,6 +1440,10 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         //
         // Fabric/Synapse are unaffected either way: DetectExternalTable returns null on a warehouse engine,
         // so the branch below could never fire there. This guard is what protects box with mssql_mars=false.
+        if (ResolveCopyIntoStaging() is not null)
+        {
+            return false;
+        }
         if (!_marsEnabled)
         {
             return true;
@@ -1359,6 +1462,39 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     {
         var set = ProviderSettingsStore.Instance.GetString(SqlServerBackend.ProviderName, "mssql_read_isolation");
         return string.IsNullOrEmpty(set) ? _readIsolation : set;
+    }
+
+    // SET mssql_copy_into_staging wins if set, else this catalog's `copy_into_staging` ATTACH option, else
+    // null = OFF (SqlBulkCopy, the shipped behaviour).
+    //
+    // ⚠ A CONFIGURED LOCATION ON AN ENGINE WITH NO `COPY INTO` IS IGNORED, NOT REFUSED — deliberately, and
+    // it is the same split this codebase applies to the Delta write options. A SET spans every catalog in the
+    // session, so a dbt project attaching a Fabric warehouse AND a box SQL Server would have its box writes
+    // fail on a setting that was never aimed at them. The ATTACH option names one catalog and could in
+    // principle refuse, but it is parsed before any connection exists, so the engine is not yet known — and
+    // an option that refuses through one door and is ignored through the other is worse than one rule.
+    internal StagingLocation? ResolveCopyIntoStaging()
+    {
+        if (!Profile.IsWarehouse)
+        {
+            return null;
+        }
+        var set = ProviderSettingsStore.Instance.GetString(SqlServerBackend.ProviderName, "mssql_copy_into_staging");
+        var location = string.IsNullOrEmpty(set) ? _copyIntoStaging : set;
+        if (string.IsNullOrEmpty(location))
+        {
+            return null;
+        }
+        if (!WarehouseCopyInto.CanStage)
+        {
+            // The parquet is written through the host's own COPY, so with no host query surface there is no
+            // way to stage. Loud rather than a silent fallback: the user asked for this path by naming a
+            // location, and quietly loading over TDS instead would look like the option had no effect.
+            throw new NotSupportedException(
+                "mssql_copy_into_staging is set, but the host query surface needed to write the staged "
+                + "parquet is unavailable in this context.");
+        }
+        return OneLakeStagingLocation.Parse(location);
     }
 
     // The level the DuckDB transaction's pinned SqlTransaction is opened at.
@@ -1488,7 +1624,15 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         // ⚠ NOT for a snapshotRead scan: that is mssql_materialize=false explicitly asking for a POOLED read
         // outside the transaction, the opposite request. Refused rather than silently resolved (below).
         // ⚠ NOT in autocommit (txnId == 0): there is no transaction to be stable across.
-        if (snapshotRead && txnId != 0 && !string.IsNullOrEmpty(ResolveReadIsolation()))
+        //
+        // ⚠ AND ONLY WHEN THE FALSE WAS ASKED FOR — `MaterializeExplicitlyFalse`, not `!ResolveMaterialize()`.
+        // Since `mssql_materialize` began DEFAULTING to MARS (2026-08-10), a no-MARS engine resolves it to
+        // false with nobody having requested anything, so testing the RESOLVED value made this refusal fire
+        // for every user who set `mssql_read_isolation` alone — a hard error on Fabric/Synapse, where the
+        // default is always false. MEASURED on box with `mssql_mars='false'`: 3 of 3 runs refused. The whole
+        // premise of the message below is that BOTH are active requests; a default is not a request.
+        if (snapshotRead && txnId != 0 && MaterializeExplicitlyFalse() &&
+            !string.IsNullOrEmpty(ResolveReadIsolation()))
         {
             // Both are ACTIVE requests and they contradict: one asks for every read to be inside the
             // transaction, the other for this particular read to be outside it on a pooled connection. Honouring
@@ -1778,6 +1922,28 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
             if (checkConstraints)
             {
                 options |= SqlBulkCopyOptions.CheckConstraints;
+            }
+
+            // THE STAGED `COPY INTO` PATH (warehouse engines, opt-in via mssql_copy_into_staging). Placed
+            // here on purpose: after the CREATE, because COPY INTO requires the target table to exist, and
+            // after `options`, so the one bulk-copy behaviour it cannot express is decided by exactly the
+            // computation the bulk path uses rather than a second, drifting copy of it.
+            if (ResolveCopyIntoStaging() is { } staging)
+            {
+                // ⚠ KeepIdentity has NO COPY INTO equivalent, so the explicit values would be replaced by
+                // engine-generated ones — a silently different table. Refuse and name the way back.
+                // (`checkConstraints` needs no such guard: a warehouse enforces no CHECK or FOREIGN KEY
+                // constraint at all, so SqlBulkCopy's CheckConstraints is already vacuous here — the two
+                // paths cannot diverge on it.)
+                if (options.HasFlag(SqlBulkCopyOptions.KeepIdentity))
+                {
+                    throw new NotSupportedException(
+                        $"{qualified}: the insert supplies values for an IDENTITY column, which a staged "
+                        + "COPY INTO load cannot preserve (the engine would generate its own). Unset "
+                        + "mssql_copy_into_staging for this statement to load it over TDS instead.");
+                }
+                return WarehouseCopyInto.Load(connection, transaction, qualified, staging, data,
+                                              ResolveCommandTimeout());
             }
 
             using var reader = new ArrowDataReader(data);
@@ -2515,6 +2681,68 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     /// version METADATA: an uncommitted `ALTER` holds Sch-M, which blocks a reader's Sch-S at every
     /// isolation level. So a schema change is refused regardless of RCSI.</para>
     /// </remarks>
+    /// <summary>
+    /// Would a POOLED read of <paramref name="qualified"/> wait on locks only THIS transaction can release?
+    /// Returns the reason, or null when the read is safe.
+    /// </summary>
+    /// <remarks>
+    /// Factored out of <see cref="EnsureScanCannotSelfBlock"/> because two callers need the same question and
+    /// give it opposite answers: the precheck REFUSES the scan, while <see cref="SinkRequiresDrainedScan"/>
+    /// uses it to decide whether draining is worth its cost — the drain pins the scan onto the transaction's
+    /// own connection, which is exactly the remedy for this hazard. Sharing one predicate is what keeps
+    /// "when do we drain" and "when do we refuse" from drifting into disagreement, which would show up as a
+    /// scan that is refused although the drain would have saved it, or drained although nothing needed it.
+    /// </remarks>
+    /// <summary>Has the CURRENT transaction written <paramref name="qualified"/> on its own pinned
+    /// connection? <paramref name="schemaChanged"/> distinguishes a DDL touch from a data write.</summary>
+    private bool TransactionHasWritten(string qualified, out bool schemaChanged)
+    {
+        schemaChanged = false;
+        long txnId = AmbientTransaction.Current;
+        if (txnId == 0 || !_txns.TryGetValue(txnId, out var state))
+        {
+            return false; // nothing pinned => no uncommitted work of ours
+        }
+        lock (state)
+        {
+            return state.Connection is not null && state.Touched.TryGetValue(qualified, out schemaChanged);
+        }
+    }
+
+    private (string Why, bool SchemaChanged)? PooledScanSelfBlockReason(string qualified, bool schemaProbe)
+    {
+        if (_marsEnabled)
+        {
+            return null; // the scan shares the pinned connection — same session, owns the locks
+        }
+        if (!string.IsNullOrEmpty(ResolveReadIsolation()))
+        {
+            // The mssql_read_isolation opt-in routes this scan onto the transaction's OWN connection (and
+            // drains it, since MARS is off here), so it runs in the session that holds the locks and cannot
+            // wait on them. This hazard and the opt-in are alternative answers to the same problem; leaving
+            // both armed would refuse a scan that now works.
+            return null;
+        }
+        if (!TransactionHasWritten(qualified, out bool schemaChanged))
+        {
+            return null; // nothing pinned, or this transaction has not written THIS table
+        }
+        if (schemaProbe && !schemaChanged)
+        {
+            return null; // a `WHERE 1 = 0` probe reads no rows, so uncommitted ROWS cannot block it
+        }
+        if (!schemaChanged && VersionedReads())
+        {
+            return null; // RCSI (or a snapshot engine): the pooled read sees a version, never a lock
+        }
+        return (schemaChanged
+            ? "this transaction has an uncommitted schema change on it (an uncommitted ALTER holds a "
+              + "schema-modification lock, which blocks readers at EVERY isolation level — row versioning "
+              + "does not version metadata)"
+            : "this transaction has uncommitted writes to it and this database does not have "
+              + "READ_COMMITTED_SNAPSHOT enabled", schemaChanged);
+    }
+
     private void EnsureScanCannotSelfBlock(string qualified, bool materialize, bool snapshotRead,
                                            bool schemaProbe)
     {
@@ -2526,41 +2754,11 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         {
             return; // materialise => pinned + drained; snapshotRead => pooled at SNAPSHOT. Neither blocks.
         }
-        if (!string.IsNullOrEmpty(ResolveReadIsolation()))
+        if (PooledScanSelfBlockReason(qualified, schemaProbe) is not { } block)
         {
-            // The mssql_read_isolation opt-in routes this scan onto the transaction's OWN connection (and
-            // drains it, since MARS is off here), so it runs in the session that holds the locks and cannot
-            // wait on them. This precheck and the opt-in are alternative answers to the same hazard; leaving
-            // both armed would refuse a scan that now works.
             return;
         }
-        long txnId = AmbientTransaction.Current;
-        if (txnId == 0 || !_txns.TryGetValue(txnId, out var state))
-        {
-            return; // nothing pinned => no uncommitted work of ours to block on
-        }
-        bool schemaChanged;
-        lock (state)
-        {
-            if (state.Connection is null || !state.Touched.TryGetValue(qualified, out schemaChanged))
-            {
-                return; // this transaction has not written THIS table — reading it is fine
-            }
-        }
-        if (schemaProbe && !schemaChanged)
-        {
-            return; // a `WHERE 1 = 0` probe reads no rows, so uncommitted ROWS cannot block it
-        }
-        if (!schemaChanged && VersionedReads())
-        {
-            return; // RCSI (or a snapshot engine): the pooled read sees a version, never a lock
-        }
-        var why = schemaChanged
-            ? "this transaction has an uncommitted schema change on it (an uncommitted ALTER holds a "
-              + "schema-modification lock, which blocks readers at EVERY isolation level — row versioning "
-              + "does not version metadata)"
-            : "this transaction has uncommitted writes to it and this database does not have "
-              + "READ_COMMITTED_SNAPSHOT enabled";
+        var (why, schemaChanged) = block;
         throw new System.InvalidOperationException(
             $"fabricator: cannot read {qualified} — {why}, and mssql_mars is off, so the scan would run on a "
             + "separate connection and wait forever for locks only this transaction can release. Remedies: "
@@ -2625,7 +2823,8 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         // The probe was the query that actually hung. It is exempted only from the data-write case.
         if (touchKey is not null)
         {
-            bool drains = spec?.HasSink == true && SinkRequiresDrainedScan(spec.Sink!);
+            bool drains = spec?.HasSink == true &&
+                          SinkRequiresDrainedScan(spec.Sink!, touchKey, spec?.SchemaOnly == true);
             EnsureScanCannotSelfBlock(touchKey, drains && ResolveMaterialize(),
                                       drains && !ResolveMaterialize(),
                                       schemaProbe: spec?.SchemaOnly == true);
@@ -2708,7 +2907,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
                 var where = builder.Build(spec.Filter);
                 var allParams = new List<SqlParameter>(sourceParams);
                 allParams.AddRange(builder.Parameters); // source @a* + filter @p* are disjoint
-                bool drainF = spec.HasSink && SinkRequiresDrainedScan(spec.Sink!);
+                bool drainF = spec.HasSink && SinkRequiresDrainedScan(spec.Sink!, touchKey, spec.SchemaOnly);
                 return ExecuteQuery($"SELECT {top}{columns} FROM {source} WHERE {where}{orderBy}{optionClause}", allParams,
                                     readYourWrites: false, materialize: drainF && ResolveMaterialize(),
                                     snapshotRead: drainF && !ResolveMaterialize());
@@ -2720,7 +2919,8 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         }
 
         filterValues?.Dispose();
-        var marked = spec?.HasSink == true && SinkRequiresDrainedScan(spec.Sink!);
+        var marked = spec?.HasSink == true &&
+                     SinkRequiresDrainedScan(spec.Sink!, touchKey, spec?.SchemaOnly == true);
         return ExecuteQuery($"SELECT {top}{columns} FROM {source}{orderBy}{optionClause}",
                             sourceParams.Count > 0 ? sourceParams : null,
                             readYourWrites: false, materialize: marked && ResolveMaterialize(),

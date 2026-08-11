@@ -57,6 +57,35 @@ internal sealed class BulkSession
             AmbientOpener.Current = opener;
             try
             {
+                // ⚠ WAIT FOR THE FIRST BATCH (or end-of-stream) BEFORE TOUCHING THE BACKEND. `BulkInsert`
+                // acquires the provider's connection and, on SQL Server, hands it straight to
+                // `SqlBulkCopy.WriteToServer`, which HOLDS it for the whole load — including the entire time
+                // it is merely waiting for rows. Started eagerly, that means the load has the connection
+                // before the SOURCE SCAN has even asked for one, and on an engine without MARS the two
+                // cannot share it. Which side then fails is a RACE with no fixed loser — measured both
+                // directions: `ScanTable failed: There is already an open DataReader` (the scan asked
+                // second) and `CompleteBulk failed: does not support MultipleActiveResultSets` (the load
+                // asked second), plus a 30 s `Execution Timeout` when the loser waits instead of erroring.
+                //
+                // Waiting here makes the order DETERMINISTIC — the load always acquires second, after the
+                // scan has produced at least one batch. For a materialised (drained) scan that is after the
+                // scan has finished and released entirely, which is what allows a PINNED scan to coexist
+                // with the load at all. Nothing is released earlier than before; the load simply stops
+                // acquiring earlier than it needs to.
+                //
+                // ⚠ IT MUST BE "BATCH **OR** COMPLETION", NEVER "BATCH". A source that yields no rows
+                // completes the channel without ever writing, and waiting for a batch alone would hang
+                // forever — on the shape (`CREATE TABLE … AS SELECT … WHERE false`) that still has to create
+                // the table. `WaitToReadAsync` returns false on a completed-and-empty channel, so the load
+                // proceeds and sees an empty stream, exactly as before.
+                //
+                // ⚠ NO CANCELLATION TOKEN IS NEEDED, AND ADDING THE OBVIOUS ONE WOULD BE WRONG:
+                // `_consumerExited` is cancelled BY this task's own `finally`, so it can never fire while we
+                // are waiting here. Interrupt and abort both work through the CHANNEL instead — they fault
+                // it, and a faulted channel makes this call throw, which lands in the same `finally` as any
+                // other failure. That is the pre-existing teardown path, not a new one.
+                reader.WaitToReadAsync().AsTask().GetAwaiter().GetResult();
+
                 return catalog.BulkInsert(schemaName, tableName, new ChannelArrowStream(schema, reader), createTable,
                                           replace, checkConstraints, txnId, partitionColumns, sortColumns, schemaMode,
                                           partitionOverwrite, optionsJson);

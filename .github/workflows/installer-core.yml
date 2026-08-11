@@ -178,7 +178,7 @@ jobs:
           # 115 cases today (theories expand): the variable-library format, the Fabric SQL endpoint
           # host/connstr derivation, and the persisted Delta parquet tuning (fabricator.parquet.*).
           # Nothing here is platform-skipped, so Total is the same on both runners.
-          EXPECTED_MINIMUM: 115
+          EXPECTED_MINIMUM: 146
         run: |
           total=$(grep -oE 'Total:[[:space:]]+[0-9]+' bridge-test-output.txt | grep -oE '[0-9]+' | head -1)
           if [ -z "$total" ]; then

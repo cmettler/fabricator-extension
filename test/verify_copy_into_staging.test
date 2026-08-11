@@ -1,0 +1,201 @@
+# name: test/verify_copy_into_staging.test
+# description: the mssql_copy_into_staging OPT-IN — the staged-parquet COPY INTO load path for warehouse engines
+# group: [fabricator]
+
+require fabricator
+
+require-env MSSQL_TESTDB_DSN
+
+# ─────────────────────────────────────────────────────────────────────────────────────────────────
+# WHAT THIS PINS
+#
+# `copy_into_staging '<location>'` (ATTACH) / `SET mssql_copy_into_staging` is OPT-IN and unset by
+# default. Set on a WAREHOUSE engine (Fabric / Synapse), a bulk write stages its parquet at that
+# location with DuckDB's own parallel writer and the warehouse ingests the folder with ONE
+# `COPY INTO` — the rows never cross TDS. Unset, or on any other engine, SqlBulkCopy is used exactly
+# as before.
+#
+# ⚠ THE LOAD ITSELF CANNOT BE ASSERTED HERE, and the split is worth stating rather than implying.
+# `COPY INTO` exists on no engine this tier can reach: the docker rig is box SQL Server. So the
+# positive leg is MANUAL, against a live Fabric Warehouse (docs/transactions.md §5.9), like
+# verify_dax.
+#
+# What IS deterministic here — and is where this feature can actually hurt someone — is the two
+# decisions taken BEFORE any load runs:
+#
+#   §1  a staging location is VALIDATED AT ATTACH. Every refusal below describes an input that every
+#       layer underneath would accept and then do something quiet and wrong with, so each one is a
+#       safety assertion rather than input hygiene.
+#   §2  a location configured on an engine with NO `COPY INTO` is IGNORED, not obeyed and not
+#       refused — because a SET spans every catalog in the session, and a dbt project attaching a
+#       Fabric warehouse beside a box SQL Server must not have its box writes fail on a setting that
+#       was never aimed at them.
+#
+# §2 is the load-bearing half: with the engine gate removed, box would try to run `COPY INTO` and
+# every write in it would fail. Its row assertions are what catch that.
+
+# ═════════════════════════════════════════════════════════════════════════════════════════════════
+# §1  ATTACH-TIME VALIDATION — a bad location fails HERE, not at the first large INSERT
+# ═════════════════════════════════════════════════════════════════════════════════════════════════
+
+# Not a storage URL COPY INTO can read. Names both accepted spellings rather than just refusing.
+statement error
+ATTACH '${MSSQL_TESTDB_DSN}' AS bad1 (TYPE fabricator, copy_into_staging 's3://bucket/stage');
+----
+expected abfss://<filesystem>@<host>/<path> or https://<host>/<filesystem>/<path>
+
+# Our own shorthand is not a storage URL either — an easy thing to reach for from a Delta attach.
+statement error
+ATTACH '${MSSQL_TESTDB_DSN}' AS bad2 (TYPE fabricator, copy_into_staging 'onelake://Test/LH.Lakehouse/Files/stage');
+----
+expected abfss://<filesystem>@<host>/<path> or https://<host>/<filesystem>/<path>
+
+# ⚠ THE SILENT ONE. COPY INTO SKIPS files whose name begins with '_' or '.', so staging under such a
+# path stages the parquet perfectly, the load succeeds, and NOTHING is inserted. A load that reports
+# success and moves no rows is the worst outcome this feature has available to it.
+statement error
+ATTACH '${MSSQL_TESTDB_DSN}' AS bad3 (TYPE fabricator, copy_into_staging 'abfss://6dede267-a842-49d0-9956-3dcc9f7cecef@onelake.dfs.fabric.microsoft.com/3c4e8846-4b8f-4c8d-ada3-0d8233cdbe1e/Files/_stage');
+----
+COPY INTO ignores such names
+
+# ANY segment, not only the last — the check walks the whole path.
+statement error
+ATTACH '${MSSQL_TESTDB_DSN}' AS bad4 (TYPE fabricator, copy_into_staging 'abfss://6dede267-a842-49d0-9956-3dcc9f7cecef@onelake.dfs.fabric.microsoft.com/3c4e8846-4b8f-4c8d-ada3-0d8233cdbe1e/_Files/stage');
+----
+COPY INTO ignores such names
+
+# A lakehouse's Tables/ area is its MANAGED-table area; loose parquet dropped there surfaces as a
+# broken table to every engine that browses the lakehouse.
+statement error
+ATTACH '${MSSQL_TESTDB_DSN}' AS bad5 (TYPE fabricator, copy_into_staging 'abfss://6dede267-a842-49d0-9956-3dcc9f7cecef@onelake.dfs.fabric.microsoft.com/3c4e8846-4b8f-4c8d-ada3-0d8233cdbe1e/Tables/stage');
+----
+Stage under Files/ instead
+
+# The https spelling is accepted, so it is also validated: a filesystem with no path inside it.
+statement error
+ATTACH '${MSSQL_TESTDB_DSN}' AS bad6 (TYPE fabricator, copy_into_staging 'https://onelake.dfs.fabric.microsoft.com/6dede267-a842-49d0-9956-3dcc9f7cecef');
+----
+names a filesystem but no path inside it
+
+# ⚠ THE ONE THAT COST A LIVE ROUND TRIP TO FIND. A OneLake root named by DISPLAY NAME stages parquet
+# perfectly — our writer accepts names — and then the warehouse fails to read it with
+# `13840: Access token couldn't be fetched for storage path '…' as it's an unsupported URL or cause of
+# a transient error`, which mentions neither names nor GUIDs and reads like a permissions problem. The
+# identical path with both segments as GUIDs loaded 50 000 rows.
+statement error
+ATTACH '${MSSQL_TESTDB_DSN}' AS bad7 (TYPE fabricator, copy_into_staging 'abfss://Test@onelake.dfs.fabric.microsoft.com/LH.Lakehouse/Files/stage');
+----
+DISPLAY NAME
+
+# One name is enough to refuse — here only the item.
+statement error
+ATTACH '${MSSQL_TESTDB_DSN}' AS bad8 (TYPE fabricator, copy_into_staging 'abfss://6dede267-a842-49d0-9956-3dcc9f7cecef@onelake.dfs.fabric.microsoft.com/LH.Lakehouse/Files/stage');
+----
+DISPLAY NAME
+
+# ⚠ AND THE RULE IS ONELAKE'S, NOT OURS — a plain ADLS account has display names nowhere in its URL,
+# so `stg2` below (a named container and path on acct.dfs.core.windows.net) must still be accepted.
+# Without that control the GUID check could tighten into "reject anything unguid-like" unnoticed.
+
+# ⚠ POSITIVE CONTROL for the whole of §1. Without it, every refusal above would pass equally if the
+# option had simply stopped being read — or if ATTACH had stopped working at all.
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS stg (TYPE fabricator, copy_into_staging 'abfss://6dede267-a842-49d0-9956-3dcc9f7cecef@onelake.dfs.fabric.microsoft.com/3c4e8846-4b8f-4c8d-ada3-0d8233cdbe1e/Files/stage');
+
+# The other accepted spelling, on a plain ADLS account (nothing here is OneLake-only except the
+# Tables/ rule above).
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS stg2 (TYPE fabricator, copy_into_staging 'https://acct.dfs.core.windows.net/fs/stage/warehouse');
+
+statement ok
+DETACH stg2;
+
+# ═════════════════════════════════════════════════════════════════════════════════════════════════
+# §2  ON AN ENGINE WITH NO `COPY INTO` THE LOCATION IS IGNORED — writes keep working, unchanged
+# ═════════════════════════════════════════════════════════════════════════════════════════════════
+#
+# `stg` above carries a perfectly valid Fabric staging location and is a BOX SQL Server. Every write
+# below must go through SqlBulkCopy as if the option were unset. With the `Profile.IsWarehouse` gate
+# removed these all fail — box has no COPY INTO statement — which is what makes this section the
+# mutation gate for the engine check.
+
+statement ok
+CREATE OR REPLACE TABLE stg.dbo.ci_stage_t AS SELECT i AS a, ('v' || i::VARCHAR) AS b FROM range(5) t(i);
+
+query I
+SELECT count(*) FROM stg.dbo.ci_stage_t;
+----
+5
+
+statement ok
+INSERT INTO stg.dbo.ci_stage_t SELECT i, ('w' || i::VARCHAR) FROM range(5, 12) t(i);
+
+query II
+SELECT count(*), sum(a) FROM stg.dbo.ci_stage_t;
+----
+12	66
+
+# The values, not just the count — an ignored option must not reorder or drop columns either.
+query I
+SELECT b FROM stg.dbo.ci_stage_t WHERE a = 7;
+----
+w7
+
+# A COPY through the same path. ⚠ `(FORMAT mssql)` is REQUIRED and its absence is not an error: a bare
+# `COPY … TO '<string>'` is a FILE target in DuckDB, so without it this writes a CSV named
+# `stg.dbo.ci_stage_t` into the working directory and succeeds.
+statement ok
+COPY (SELECT 99 AS a, 'copied' AS b) TO 'stg.dbo.ci_stage_t' (FORMAT mssql);
+
+query I
+SELECT b FROM stg.dbo.ci_stage_t WHERE a = 99;
+----
+copied
+
+# ═════════════════════════════════════════════════════════════════════════════════════════════════
+# §3  THE SESSION SETTING — same validation, same precedence, same engine gate
+# ═════════════════════════════════════════════════════════════════════════════════════════════════
+#
+# ⚠ THE SETTING IS NOT VALIDATED WHEN IT IS SET, and that asymmetry is deliberate: an ATTACH names
+# ONE catalog so it can refuse, while a SET spans every catalog in the session and is resolved per
+# write. So a bad value surfaces at the first bulk write into a warehouse catalog — and on any other
+# engine it is never resolved at all, which is exactly what this section shows.
+
+statement ok
+SET mssql_copy_into_staging='abfss://6dede267-a842-49d0-9956-3dcc9f7cecef@onelake.dfs.fabric.microsoft.com/3c4e8846-4b8f-4c8d-ada3-0d8233cdbe1e/Files/session';
+
+statement ok
+INSERT INTO stg.dbo.ci_stage_t VALUES (100, 'session');
+
+query I
+SELECT b FROM stg.dbo.ci_stage_t WHERE a = 100;
+----
+session
+
+# It reaches a catalog that never named the option at all — the "a SET spans catalogs" case, and the
+# reason ignoring is right here rather than refusing.
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS plain (TYPE fabricator);
+
+statement ok
+CREATE OR REPLACE TABLE plain.dbo.ci_plain_t AS SELECT 1 AS a;
+
+query I
+SELECT count(*) FROM plain.dbo.ci_plain_t;
+----
+1
+
+statement ok
+RESET mssql_copy_into_staging;
+
+statement ok
+DROP TABLE plain.dbo.ci_plain_t;
+
+statement ok
+DROP TABLE stg.dbo.ci_stage_t;
+
+statement ok
+DETACH plain;
+
+statement ok
+DETACH stg;

@@ -819,12 +819,12 @@ fails with 595 at its 30k+ row sections (still 101 assertions).
 target. The READ set needs no transport — each scan already knows the table it reads, and passes it as
 `touchKey`.
 
-#### What this unlocks next — Fabric `COPY INTO`, NOT BUILT (2026-08-10)
+#### The Fabric `COPY INTO` load path — BUILT 2026-08-10, opt-in (C#-only, no ABI)
 
 The reason to move the decision rather than special-case external tables: **a write path that holds no reader
-makes the drain pointless, and the provider is where that is known.** The concrete candidate is loading a
-Fabric Warehouse by staging parquet and issuing `COPY INTO` on a separate connection, instead of
-`SqlBulkCopy`. Verified against the `COPY INTO` reference (Fabric moniker) before writing this down:
+makes the drain pointless, and the provider is where that is known.** The concrete candidate was loading a
+Fabric Warehouse by staging parquet and issuing `COPY INTO`, instead of `SqlBulkCopy`. Verified against the
+`COPY INTO` reference (Fabric moniker) before writing this down:
 
 - **OneLake IS a supported source** — `https://onelake.dfs.fabric.microsoft.com/<workspaceId>/<lakehouseId>/Files/`
   — alongside ADLS Gen2 and Blob. Formats: CSV, JSONL, **PARQUET**.
@@ -841,10 +841,327 @@ Fabric Warehouse by staging parquet and issuing `COPY INTO` on a separate connec
   `_`-prefixed, and a Delta-style layout would have its `_delta_log` skipped — which is fine for plain parquet
   staging and a trap for anything cleverer.
 
-What it needs that does not exist yet: a staging location option (`SET`/ATTACH, per the shape every other
-knob here uses), the parquet write to that location, `COPY INTO` generation, staged-file cleanup, and a
-decision about transaction semantics. **The refactor above is the only part that had to land first** — with
-the sink named, such a path answers `SinkRequiresDrainedScan` with `false` and the host never changes.
+**As built.** `mssql_copy_into_staging` / the `copy_into_staging` ATTACH option names a storage location this
+extension may write temporary parquet to; on a warehouse engine a bulk write then stages there with DuckDB's
+own parallel writer (`COPY … TO <dir> (FORMAT parquet, PER_THREAD_OUTPUT true)`) and the warehouse ingests the
+folder with ONE `COPY INTO`. New: `Fabricator.Bridge/OneLakeStagingLocation.cs` (the location, in both
+spellings), `Fabricator.Bridge/HostParquetStaging.cs` (write the directory / remove it — provider-agnostic),
+`Fabricator.SqlServer/WarehouseCopyInto.cs` (statement generation + the load).
+
+- **THE LOCATION IS THE SWITCH, and there is no size threshold.** There is no defensible default for "where
+  may this extension write temporary files", so the option that names it is also the opt-in. A threshold would
+  need the row count, which is not known until the stream has already been consumed — and `COPY INTO` carries
+  seconds of fixed cost, so guessing wrong on a ten-row INSERT is a pessimisation. Unset ⇒ `SqlBulkCopy`,
+  byte-for-byte as before.
+- **⚠ THE COLUMN LIST IS NEVER OMITTED, and that is correctness rather than clarity.** Without one, `COPY INTO`
+  maps source fields to target columns **by ordinal**, so an INSERT whose stream is ordered differently from
+  the table would load every value into the wrong column and SUCCEED. Naming the columns in the stream's own
+  order makes the ordinal and by-name readings agree, because the staged parquet is written in that order.
+- **⚠ A HIDDEN STAGING SEGMENT IS REFUSED AT ATTACH** — `COPY INTO` SKIPS files beginning `_` or `.`, so a root
+  like `Files/_stage` stages the parquet perfectly, the load succeeds, and NOTHING is inserted. A load that
+  reports success and moves no rows is the worst outcome this feature has available, so it fails at the ATTACH
+  that named the location rather than at the first large INSERT. Same for a lakehouse `Tables/` root (loose
+  parquet there surfaces as a broken managed table). ⚠ The `Tables/` check tests the **second** path segment —
+  on OneLake the FILESYSTEM is the workspace, so the path reads `<item>/<area>/…`; the first version tested
+  segment 0 and never fired, and its own offline test is what caught that.
+- **It runs on the SAME connection and transaction `SqlBulkCopy` would have used**, so transaction semantics
+  are unchanged by choosing the path — an explicit `BEGIN … ROLLBACK` still governs it. (An earlier sketch here
+  said "a separate connection"; that would commit the load independently of the DuckDB transaction, which is a
+  behaviour change dressed as an implementation detail.) ⚠ Whether Fabric permits `COPY INTO` inside an
+  explicit transaction is **UNMEASURED** — the reference says nothing about it.
+- **⚠ `KeepIdentity` HAS NO `COPY INTO` EQUIVALENT** and is refused, naming the way back. An insert supplying
+  explicit IDENTITY values would otherwise have them replaced by engine-generated ones — a silently different
+  table. `checkConstraints` needs no such guard: a warehouse enforces no CHECK or FOREIGN KEY constraint at
+  all, so `SqlBulkCopy`'s `CheckConstraints` is already vacuous there and the two paths cannot diverge on it.
+- **⚠ A location configured on an engine with NO `COPY INTO` is IGNORED, not refused.** A `SET` spans every
+  catalog in the session, so a dbt project attaching a Fabric warehouse beside a box SQL Server must not have
+  its box writes fail on a setting never aimed at them. The ATTACH option names one catalog and could refuse,
+  but it is parsed before any connection exists, so the engine is not yet known — and one rule beats an option
+  that refuses through one door and is ignored through the other.
+**✅ VALIDATED LIVE 2026-08-10** against the `Test Warehouse` on Fabric, SP auth: a 50 000-row CTAS staged to
+OneLake and loaded, `count = 50000`, `sum(a) = 1249975000`, `sum(c) = 1874962500.0`, `min(b) = 'v0'` — every
+value correct. Also verified: an `INSERT INTO t (c, b, a)` whose column list is in a DIFFERENT order from the
+table lands every value in its right column (`a=1, b='row1', c=100`), so the column-list rule above is
+measured rather than argued.
+
+**Both halves of the mechanism are visible in the staged files: the 50 000-row load produced 20
+`data_<n>.parquet` files** (the 3-row loads produced 1), all ingested by ONE `COPY INTO`. So
+`PER_THREAD_OUTPUT` really does write in parallel, and the reference's "one statement consumes many files"
+holds in practice, not just on paper.
+
+Two things the live run found that no amount of reading would have:
+
+- **⚠ ON ONELAKE THE WORKSPACE AND ITEM MUST BE GUIDs, NOT DISPLAY NAMES — and the two spellings differ ONLY
+  at the far end.** `abfss://Test@onelake…/LH.Lakehouse/Files/stage` stages parquet perfectly (our writer
+  resolves names), and the `COPY INTO` then fails with **`13840: Access token couldn't be fetched for storage
+  path '…' as it's an unsupported URL or cause of a transient error`** — an error naming neither the names,
+  the GUIDs, nor anything actionable, and reading like a permissions or outage problem. The byte-identical
+  path with both segments as GUIDs is the run above. In hindsight the reference said so: its example is
+  `https://onelake.dfs.fabric.microsoft.com/<workspaceId>/<lakehouseId>/Files/`, with `Id` in both
+  placeholders. **Now REFUSED at ATTACH**, naming the GUID form and where to get the ids
+  (`fabric.workspaces()` / `fabric.items()`). Resolving names → GUIDs ourselves is possible — `FabricApiClient`
+  already does it for the `fabric.*` functions — and is deliberately not done: it would cost a REST listing at
+  ATTACH and a Fabric credential on a path that has neither.
+- **⚠ `RemoveDirectory` IS UNIMPLEMENTED ON abfss, SO EVERY LOAD LEAKED ITS STAGED PARQUET** —
+  `AzureDfsStorageFileSystem: RemoveDirectory is not implemented!`, on the one platform this path runs on.
+  Fixed with the per-file glob-and-remove fallback, which is **the same shape `DeltaCatalog.RemoveTableFolder`
+  already needed** for `DROP TABLE` on abfss and s3 — its comment even names abfss. The precedent was in the
+  tree the whole time; the leak was found by running the feature, not by reading for it.
+- Incidentally established: **a failed load leaves NO table.** After the first (13840) failure
+  `sys.tables` reported 0 rows for the target, so the CTAS's `CREATE` rolled back with the load — the
+  create-then-load pair is atomic here, unlike the Delta CTAS's two commits (§7.1).
+
+**THE DRAIN IS NOW NARROWED, AND STREAMING IS THE DEFAULT ON THIS PATH (2026-08-10, MEASURED).** The staged
+load runs no `SqlBulkCopy`, so nothing on the write connection can collide with an open reader, and draining
+only serialises two network-bound legs that could overlap. Measured on Fabric, a same-catalog 1M-row CTAS:
+
+| | wall clock (trials) | user CPU | allocation |
+|---|---|---|---|
+| streaming | 14.5 / 15.3 / 15.4 / 16.1 s | ~4.5 s | — |
+| drained | 16.8 / 17.4 / 28.9 s | ~6.2 s | 484 MB, ws 163 MB |
+
+No overlap between the two sets. **The sharper finding is that the drain was buying NOTHING in that shape:
+BOTH legs logged the scan as `pooled`** — on an autocommit CTAS the transaction's connection does not exist
+yet when the scan starts, so `materialize` had nothing to pin to and bought neither read-your-writes nor 595
+protection, only the copy.
+
+- **⚠ IT NEVER DRAINS, AND SURRENDERING READ-YOUR-WRITES IS A DELIBERATE PRODUCT DECISION (user,
+  2026-08-10).** A staged load is chosen for BULK — the point is to move bytes, not to observe this
+  transaction's own uncommitted rows — so the scan reads a committed snapshot and streams. Measured inside an
+  explicit transaction that had just written the source: **0 drains, 0 failures, every query pooled, 10 rows**
+  (the committed state; the 5 uncommitted rows deliberately invisible).
+- **⚠ AN INTERMEDIATE VERSION DRAINED WHEN THE TRANSACTION HAD WRITTEN THE SCANNED TABLE, and removing it was
+  not merely simplification — it was ACTIVELY HARMFUL.** Draining pins the scan onto the WRITE connection,
+  where it collides with the sink's own `CREATE TABLE` — issued from the bulk's BACKGROUND thread, 12 ms
+  later — on a no-MARS engine: a 30 s hang and a dead transaction. Measured both ways: drained ⇒ hang,
+  streaming ⇒ commits. ⚠ The collision is PRE-EXISTING and not ours; the identical shape fails the same way
+  with no staging configured at all, on the plain `SqlBulkCopy` path. This does not FIX it, it declines to
+  walk into it.
+- It needs no `mssql_materialize='false'` — that setting reaches the same place by another route
+  (`snapshotRead`, pooled at SNAPSHOT) and remains the workaround for the NON-staged path.
+- `PooledScanSelfBlockReason` / `TransactionHasWritten` survive as a factoring of
+  `EnsureScanCannotSelfBlock`: the refusal still needs exactly that question, and sharing one predicate keeps
+  "when do we drain" and "when do we refuse" from drifting apart.
+
+- **⚠ A CLAIM MADE HERE FIRST WAS WRONG, and it is kept because the error is instructive.** This entry
+  originally read *"the win in this slice is the LOAD side, not memory — dropping the drain sends the scan
+  POOLED … and with MARS off that is the 595 shape again."* The second half describes a DIFFERENT variant.
+  There are three, and the write-up argued against (c) while proposing (b):
+  - **(a) drained + pinned** — the old behaviour: read-your-writes, serialised, unbounded memory.
+  - **(b) streaming + POOLED** — what dropping the drain actually produces on a no-MARS engine, since
+    `materialize` is the only term that can pin the scan there (`_marsEnabled || readYourWrites ||
+    materialize`). The scan and the load are then on DIFFERENT connections, so **there is no 595 hazard at
+    all**, `LIMIT` or not.
+  - **(c) streaming + pinned** — the variant whose early-abandoned scan really would leave a reader open on
+    the write connection. Nothing proposes it.
+  The cost of (b) is read-your-writes on a same-catalog source, which is exactly what the narrowing above
+  buys back by draining only when the transaction has written the scanned table.
+
+**Gate `test/verify_copy_into_staging.test` (30, service tier), mutation-tested with two mutants, each killed
+at its own section** — dropping the ATTACH validation dies at the first refusal, dropping the engine gate
+survives all six refusals and dies at §2's first write. ⚠ **The load itself is NOT in either CI tier**: no
+engine the service tier can reach has `COPY INTO`, so the positive leg is manual against a live Fabric
+Warehouse, like `verify_dax`. What §2 pins instead is that a valid Fabric staging location on a BOX attach
+changes nothing — which is the assertion that catches the engine gate going away.
+
+### 5.6a Same-catalog read+write: settings × engine × statement — MEASURED 2026-08-10
+
+§5.6 answers "what does a READ see". This one answers the question that actually bites: **for a statement
+that reads and writes the SAME catalog, which settings work on which engine, and what does each cost.** Every
+row was run live; **M** = measured here, **d** = derived and NOT measured.
+
+The three settings are independent and are kept in their own columns, because their interaction is the whole
+story: `mssql_mars` decides whether a scan may share the write connection at all, `mssql_materialize` decides
+whether a marked scan is buffered (and therefore PINNED) or streamed (POOLED), and `mssql_read_isolation`
+decides whether ordinary reads join the transaction.
+
+The last three columns are the SAME three properties §5.6 defines, carried over so this table is complete on
+its own — a configuration that works but reads inconsistently is not a configuration anyone should pick
+blind. On those three, **M** on an ENGINE-level fact means §5.7/§5.8 measured it for that engine and the cell
+applies it; **d** means derived from the routing only.
+
+| # | engine | statement | transaction state | `mssql_mars` | `mssql_materialize` | `mssql_read_isolation` | `mssql_copy_into_staging` | scan runs on | result | STREAMS | scans may OVERLAP | read-your-writes | consistent WITHIN one stmt | consistent ACROSS stmts |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | box | either | either | auto ⇒ **on** | **true** *(⇐ MARS)* | unset | unset | pinned | ✅ **M** suite, 101 assertions | ❌ **d** | ❌ **d** | ✅ **M** suite §3 | ❌ **M** §5.7 | ❌ **M** §5.8 |
+| 2 | box | INSERT | autocommit | **off** | **false** *(⇐ MARS)* | unset | unset | **pooled** | ✅ **M** 8 of 8 *(was 0 of 8)* | ✅ **d** | ✅ **d** | ❌ **M** 10 of 15 | ✅ **d** | ❌ **d** |
+| 3 | Fabric | CTAS | autocommit | n/a *(no MARS)* | **false** *(⇐ MARS)* | unset | unset | **pooled** | ✅ **M** | ✅ **d** | ✅ **d** | — | ✅ **M** §5.7 | ❌ **d** |
+| 4 | Fabric | INSERT | autocommit | n/a | **false** *(⇐ MARS)* | unset | unset | **pooled** | ✅ **M** 16 rows *(was ❌ 4 of 4)* | ✅ **d** | ✅ **d** | — | ✅ **M** §5.7 | ❌ **d** |
+| 5 | Fabric | CTAS | **explicit, already wrote** | n/a | **false** *(⇐ MARS)* | unset | unset | **pooled** | ✅ **M** *(was ❌ 30 s timeout, txn DEAD)* | ✅ **d** | ✅ **d** | ❌ **M** committed state | ✅ **M** §5.7 | ❌ **d** |
+| 6 | Fabric | INSERT | **explicit, already wrote** | n/a | **false** *(⇐ MARS)* | unset | unset | **pooled** | ✅ **M** 17 rows *(was ❌)* | ✅ **d** | ✅ **d** | ❌ **d** | ✅ **M** §5.7 | ❌ **d** |
+| 7 | Fabric | CTAS | **explicit, already wrote** | n/a | **false** *(⇐ MARS)* | **snapshot** | unset | **pooled** | ✅ **M** 3 of 3 *(was ❌ timeout, txn DEAD)* | ✅ **d** | ✅ **d** | ❌ **M** committed state | ✅ **M** §5.7 | ❌ **d** *(for THIS scan; ordinary reads still pin)* |
+| 8 | Fabric | CTAS | **explicit, already wrote** | n/a | **false** *(explicit)* | unset | unset | **pooled** | ✅ **M** | ✅ **d** | ✅ **d** | ❌ **M** 10 of 15 | ✅ **d** | ❌ **d** |
+| 9 | Fabric | INSERT | **explicit, already wrote** | n/a | **false** *(explicit)* | unset | unset | **pooled** | ✅ **M** 14 rows | ✅ **d** | ✅ **d** | ❌ **d** | ✅ **d** | ❌ **d** |
+| 10 | Fabric | CTAS | autocommit | n/a | *(not consulted — path streams)* | unset | **SET** | **pooled** | ✅ **M** 50 k / 1 M | ✅ **M** 0 drain marks | ✅ **d** | — | ✅ **M** §5.7 | ❌ **d** |
+| 11 | Fabric | CTAS | **explicit, already wrote** | n/a | *(not consulted — path streams)* | unset | **SET** | **pooled** | ✅ **M** | ✅ **M** 0 drain marks | ✅ **d** | ❌ **M** 10 of 15 | ✅ **M** §5.7 | ❌ **d** |
+
+**⚠ ROWS 2 AND 4–6 ARE POST-FIX (2026-08-10) — every one of them FAILED before it.** They are kept in the
+table with their old outcome in brackets rather than deleted, because the shipped-default rows are exactly the
+ones a reader must be able to check against a bug report. Rows 8 and 9 now describe the DEFAULT rather than an
+override: setting `mssql_materialize='false'` by hand on a no-MARS engine changes nothing.
+
+**⚠ ROW 7 WAS FIXED SEPARATELY, AND FIXING IT REMOVED A REGRESSION THE MARS DEFAULT HAD JUST INTRODUCED.**
+`mssql_materialize=false` + `mssql_read_isolation` is refused as contradictory — correctly, when BOTH are
+active requests. But that check tested the RESOLVED value, and once `materialize` began defaulting to MARS it
+resolved false with nobody asking, so the refusal fired for every no-MARS user who set `read_isolation`
+ALONE — measured 3 of 3 on box, and it would have made `read_isolation` unusable on Fabric outright. The check
+now tests what the USER supplied (`MaterializeExplicitlyFalse`), and row 7 then falls through to the pooled
+snapshot route on its own, because `readIsolationPin` already required `!snapshotRead`. **A rule phrased "the
+user set X" must test what the user supplied, not what the resolver returned — or the day the default changes
+it silently starts applying to everybody.**
+
+⚠ `read_isolation` still pins ORDINARY reads; only a MARKED scan (one feeding a same-catalog write) is exempt,
+which is the one that cannot share the connection with the bulk. Both halves are gated — §5 of
+`verify_mars_off_same_catalog.test` asserts the write works AND that an ordinary read still sees this
+transaction's uncommitted rows, without which the first assertion would pass equally if the option had been
+disabled outright.
+
+**The DEFAULTS, spelled out, because "default" in a cell is useless:** `mssql_mars` = **auto** (⇒ ON on box
+and Azure SQL, unavailable on Fabric/Synapse); `mssql_materialize` = **follows MARS** (true where MARS is on, false where it is not — see THE FIX below); `mssql_read_isolation` =
+**unset** (off); `mssql_copy_into_staging` = **unset** (off). So rows 3–6 are the SHIPPED configuration on
+Fabric with nothing set, and row 1 is the shipped configuration on box.
+
+**Column meanings, because two of them were previously conflated in one:**
+- **transaction state** — `autocommit`, or an EXPLICIT `BEGIN` in which this transaction has ALREADY WRITTEN
+  something. It is a separate axis from every setting and it is what decides whether the transaction's pinned
+  connection EXISTS YET when the scan starts — which is what decides `pinned` vs `pooled`. An explicit
+  transaction that has not yet written behaves like autocommit.
+- **`mssql_copy_into_staging`** — SET means the staged Fabric `COPY INTO` load path is in use (§5.9): the
+  source is written to parquet and the warehouse ingests the folder. `unset` means the ordinary `SqlBulkCopy`
+  load. It is a SETTING, not a property of the statement.
+- **STREAMS** — the source is NOT drained into memory first. The drain has no spill, so ❌ means peak memory
+  scales with the whole result.
+- **scans may OVERLAP** — two scans of ONE statement can run concurrently (they are on different pooled
+  connections) rather than being serialised onto one.
+
+**⚠ NOTHING IN THIS TABLE BUYS CROSS-STATEMENT STABILITY** — that is `mssql_read_isolation`'s job alone (§5.8),
+and row 7 shows it cannot be combined with a same-catalog write today. So a dbt model that must both write and
+read a stable view across several statements has no configuration here that delivers both.
+
+**⚠ THE WITHIN-STATEMENT COLUMN IS AN ENGINE PROPERTY, NOT OURS.** Fabric reads are versioned by
+construction, so every Fabric row that runs at all is ✅; box at its rig default is unversioned and is ❌ even
+on row 1, the shipped happy path. Turning on `READ_COMMITTED_SNAPSHOT` fixes box (§5.7, measured 6/6) and no
+setting of ours substitutes for it.
+
+#### THE BULK DEFERRAL — `WriteToServer` no longer acquires before it has data (2026-08-10)
+
+`BulkSession`'s consumer task called `catalog.BulkInsert` immediately, and on SQL Server that hands the
+connection straight to `SqlBulkCopy.WriteToServer`, **which holds it for the whole load including the time it
+is merely waiting for rows**. So the load owned the connection before the source scan had asked for one. The
+consumer now waits for the first batch — or end-of-stream — first, which makes the acquisition order
+deterministic: the load always acquires SECOND.
+
+⚠ **THE FAILURE WAS AT ACQUISITION, NOT RELEASE, and that took two wrong explanations to get right.** The scan
+releases perfectly well (eagerly at end of result set, §5.3). Whoever asks SECOND is refused, and which one
+that is varies run to run — measured in both directions: `ScanTable failed: There is already an open
+DataReader` (scan second) and `CompleteBulk failed: does not support MultipleActiveResultSets` (load second),
+plus a 30 s `Execution Timeout` where the loser waits instead of erroring.
+
+**MEASURED: the pinned-and-drained shape — `mssql_mars='false'` with `mssql_materialize='true'` explicitly —
+went from 0 of 8 to 8 of 8, and READ-YOUR-WRITES CAME WITH IT** (CTAS returns 15 where the pooled default
+returns 10, scan logged `pinned`, drain count 1). That is the property §5.6a previously recorded as
+unreachable without MARS; it is now available on request. The DEFAULT is unchanged — streaming still wins on
+speed and memory — so this converts read-your-writes from impossible into opt-in.
+
+⚠ **THE WAIT IS "BATCH **OR** COMPLETION", NEVER "BATCH".** A source that yields no rows completes the channel
+without ever writing, so waiting for a batch alone hangs forever — on a shape (`… AS SELECT … WHERE false`)
+that still has to CREATE the table. Verified end to end: empty CTAS, empty INSERT and empty COPY all return
+immediately. ⚠ And no cancellation token belongs on that wait: `_consumerExited` is cancelled by the
+consumer's own `finally`, so it can never fire while waiting; interrupt and abort work by FAULTING the
+channel, which makes the wait throw into the same `finally` as any other failure.
+
+Gates: hermetic **67/67 — 6895** and service **49/49 — 1935 at the time**, both byte-identical to pre-change
+⇒ behaviour-preserving for every provider (the deferral is in the provider-agnostic `BulkSession`, so Delta's
+`BulkInsert` runs through it too). §6 of `verify_mars_off_same_catalog.test` pins the unlocked configuration,
+**mutation-tested 4 of 4** — removing the wait dies at exactly the §6a INSERT with §1–§5 passing first. ⚠ §6
+uses 200 rows rather than 15 ON PURPOSE: the underlying failure is a race that a small scan sometimes wins, and
+a gate that fails only sometimes is worse than none.
+
+#### THE FIX — `mssql_materialize` now DEFAULTS TO MARS (2026-08-10)
+
+`ResolveMaterialize()` was `set ?? _materialize ?? true`; it is now `set ?? _materialize ?? _marsEnabled`. On a
+MARS engine nothing changes (the marked scan is still drained and pinned, and row 1 keeps read-your-writes).
+Without MARS the marked scan takes the SNAPSHOT-READ route — pooled, at SNAPSHOT — so it never shares the
+connection with the load. **Measured: the box shape went from 0 of 8 to 8 of 8.**
+
+⚠ **FALSE HERE MEANS SNAPSHOT-READ, NOT A PLAIN POOLED READ**, and that is what makes it safe rather than
+merely different. `ScanFromSource` maps it to `snapshotRead`, which `EnsureScanCannotSelfBlock` exempts
+because a versioned read cannot wait on this transaction's locks. Making `SinkRequiresDrainedScan` return
+false instead — neither drained NOR snapshot-read — would give a plain READ COMMITTED pooled read, which that
+precheck REFUSES: a hang traded for a refusal, not a fix.
+
+⚠ **IT FOLLOWS MARS RATHER THAN BEING UNCONDITIONAL BECAUSE THE ROUTE HAS A PREREQUISITE.** Snapshot isolation
+must be available; Fabric/Synapse have it by construction, so the engines that lack MARS are exactly the
+engines that satisfy it. A box user who FORCES `mssql_mars='false'` on a database without
+`ALLOW_SNAPSHOT_ISOLATION` gets a clear error from the isolation `SET`, not a hang — and that combination is
+opt-in twice over.
+
+⚠ **THE COST IS READ-YOUR-WRITES ON THE SCANNED TABLE** (rows 8/9/11), accepted deliberately for a bulk path.
+It takes away nothing that worked: every configuration that WOULD have delivered read-your-writes without MARS
+is one of the failing rows above.
+
+**Gate `test/verify_mars_off_same_catalog.test` (90, service tier), mutation-tested — restoring the flat
+`?? true` default kills it 3 of 3 runs at exactly the §2 INSERT, with §1 passing first** (so it is caught by
+the MARS-off shape specifically, not by general breakage). ⚠ Its §1 MARS-ON control is load-bearing twice:
+without it §2–§4 would pass equally if same-catalog read+write had stopped working entirely, and it is what
+pins that read-your-writes is still there where MARS exists.
+
+⚠ **`SET mssql_mars` MUST PRECEDE THE ATTACH** — the value is resolved once, when the catalog first connects.
+Writing the gate with the SET after the ATTACH silently produced a MARS-ON catalog and a vacuously passing
+§2/§4; that ordering is now part of the suite.
+
+**⚠ MARS IS THE WHOLE STORY: A PINNED SCAN FEEDING A SAME-CATALOG BULK WRITE IS BROKEN WHENEVER MARS IS
+OFF — ON ANY ENGINE.** The bulk's consumer task calls `WriteToServer` as soon as it starts, so the scan's
+reader and the load are on the pinned connection CONCURRENTLY by construction. With MARS they coexist; without
+it they cannot. Row 1 (box, MARS on) works; row 2 (box, MARS forced OFF, everything else identical) fails
+**0 of 8**; Fabric has no MARS at all and fails the same way (rows 4–7). Engine and data size are NOT the
+variable — `mssql_mars` is.
+
+**⚠ AN EARLIER VERSION OF THIS SECTION SAID THE OPPOSITE, OFF A SINGLE RUN, AND THE ERROR IS WORTH KEEPING.**
+It recorded row 2 as ✅ ("box drains in ~1 ms and wins the race") and built a whole 'latency race' model on
+top — box fast, Fabric slow. Re-running the byte-identical script gave **0/8**, with roughly one success in a
+dozen attempts. So the mechanism IS a race, but box does not reliably win it either; the single green run was
+the rare outcome, promoted to a fact. **A flaky failure sampled once is indistinguishable from a pass** — the
+same trap this file already records for the pinned intra-statement read, hit again by the same shortcut.
+
+**⇒ THE GOOD NEWS, AND IT MAKES THIS TESTABLE: `SET mssql_mars='false'` REPRODUCES IT ON BOX** with 15 rows,
+in under a second, no Fabric and no latency simulation. That is a service-tier gate, and its absence is why
+the hazard has only ever been seen in production.
+
+**⚠ CTAS AND INSERT DIVERGE, AND NOT FOR A REASON ANYONE WOULD GUESS (rows 3 vs 4).** Identical engine,
+identical settings; the CTAS's scan logs `pooled` and the INSERT's logs `pinned`. The routing turns on whether
+the transaction's connection EXISTS YET when the scan starts — `state.Connection is not null` — and the two
+operators initialise their sink in a different order relative to the source. A marked scan therefore pins or
+pools depending on the statement KIND, which no setting expresses and no user could predict.
+
+**⚠ `read_isolation` DOES NOT RESCUE THIS (row 7), which is the opposite of the natural expectation.** Its
+whole job is to route reads ONTO the transaction's connection — exactly what must not happen while a bulk load
+holds it. Measured: scan still `pinned`, still a timeout, transaction still dead. Do not offer it as the
+read-your-writes remedy for a same-catalog write.
+
+**What each setting costs, stated plainly:**
+
+- **`mssql_materialize='false'`** — the working answer on Fabric without staging (rows 8, 9). It routes the
+  marked scan POOLED at SNAPSHOT, so it cannot collide. **Cost: read-your-writes, silently** — the CTAS reads
+  committed state (10 of 15 rows, measured, with the source proven to hold 15). It trades a loud 30 s hang for
+  a quiet short answer, which on this shape is arguably the worse failure — so it is a deliberate choice, not
+  a default to reach for blindly. Its own prerequisite is a snapshot-versioned database (native on
+  Fabric/Synapse; on box it needs `ALLOW_SNAPSHOT_ISOLATION`).
+- **`mssql_copy_into_staging`** — the best answer where it applies (rows 10, 11): the scan streams POOLED and
+  the load is a SEPARATE statement issued after the scan has finished, so scan and load are never concurrent
+  and the hazard cannot arise. Same read-your-writes cost, for the same reason, deliberately accepted (bulk
+  movement does not need to observe its own uncommitted rows). Warehouse engines only.
+- **`mssql_read_isolation='snapshot'`** — buys cross-statement stability for ORDINARY reads (§5.8) and is
+  actively harmful here (row 7).
+- **`mssql_mars`** — on box, leaving it on is what makes rows 1–2 work at all; there is nothing to set on
+  Fabric, where MARS does not exist.
+
+**⚠ Read-your-writes for a same-catalog write is UNREACHABLE on Fabric today, under every combination
+above.** Not merely opt-in — every route that would deliver it pins the scan, and a pinned scan races the
+bulk. It is not a property of "no MARS" though: it is a property of the bulk engaging the connection BEFORE it
+has data. A bulk that deferred `WriteToServer` until the first batch arrived would let a drained scan finish
+first and would make row 5 work with read-your-writes intact. That is unbuilt and unmeasured, and it is the
+shape any real fix should take — see the reverted DDL-hoist experiment in CLAUDE.md for why the neighbouring
+"obvious" fix is not it.
 
 ### 5.7 Intra-statement consistency — MEASURED 2026-08-09, and it is absent by default
 

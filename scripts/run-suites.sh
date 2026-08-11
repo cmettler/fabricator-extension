@@ -256,7 +256,7 @@ case "$TIER" in
         # DuckDB transaction, so successive statements share one view). Service-only: it needs a real SQL
         # Server, and its load-bearing observable is a REFUSAL that only exists against one (with MARS off,
         # a self-written table is unreadable unless the read joined the transaction).
-        : "${MIN_SUITES:=47}"
+        : "${MIN_SUITES:=49}"
         # 1424 since 2026-08-01: verify_exec_invalidate_cache 10 -> 21, for the OUT-OF-BAND DROP path Ã¢ÂÂ the
         # catalog's self-heal, documented in CLAUDE.md and until now covered by NOTHING. The service tier ran
         # 44/44 green while that path was broken, which is why the section exists. It must run with
@@ -316,7 +316,7 @@ case "$TIER" in
         # 1837 since 2026-08-10: verify_mssql_s3_polybase 252 -> 263 — an INSERT ... SELECT into an EXTERNAL
         # table from the same catalog, the shape whose scan the host marks. Every earlier external INSERT in
         # that suite is INSERT ... VALUES, which has no scan, so the mark was entirely uncovered there.
-        : "${MIN_ASSERTIONS:=1837}"
+        : "${MIN_ASSERTIONS:=1957}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

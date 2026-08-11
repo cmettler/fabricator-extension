@@ -465,6 +465,47 @@ not support RETURNING.
 
 `UPDATE … SET col = DEFAULT` is not supported — write the default value explicitly.
 
+### Loading a Fabric Warehouse with `COPY INTO` (opt-in)
+
+`SqlBulkCopy` streams rows over TDS one buffer at a time, which against a Fabric Warehouse is a round trip
+per buffer. Name a storage location this extension may stage temporary parquet in and a bulk write takes a
+different route instead: DuckDB writes the whole result there with its own parallel parquet writer, and the
+warehouse ingests the folder with **one `COPY INTO`** — the rows never cross TDS.
+
+```sql
+-- ⚠ the OneLake workspace and item must be GUIDs, not display names (see below)
+ATTACH 'Server=<ep>.datawarehouse.fabric.microsoft.com;Database=MyWH' AS wh
+  (TYPE fabricator, SECRET fabric_sp,
+   copy_into_staging 'abfss://<workspaceId>@onelake.dfs.fabric.microsoft.com/<lakehouseId>/Files/staging');
+
+-- staged as parquet, then loaded with a single COPY INTO
+CREATE TABLE wh.dbo.big AS SELECT * FROM read_parquet('local/*.parquet');
+```
+
+`SET mssql_copy_into_staging = '…'` is the session form and overrides the ATTACH option. Either spelling of
+the location works — `abfss://<fs>@<host>/<path>` or `https://<host>/<fs>/<path>` — because the two engines
+need different ones and this translates between them.
+
+- **It is off unless you name a location**, and there is no size threshold: `COPY INTO` has seconds of fixed
+  cost, so it is the wrong choice for a small INSERT and the decision stays yours.
+- **⚠ A OneLake staging path must name its workspace and item by GUID.** Display names stage fine and then
+  fail the load with `13840 … unsupported URL`, so they are refused at ATTACH instead. Get the ids from
+  `fabric.workspaces()` and `fabric.items()` on a OneLake attach.
+- **The identity running the statement needs read access to the staging area.** OneLake as a `COPY INTO`
+  source supports **Entra ID only** — no SAS, no account key.
+- **Staged files are removed after the load.** A cleanup failure is logged, never raised: it cannot make a
+  successful load look failed.
+- Ignored on engines without `COPY INTO` (box SQL Server, Azure SQL) — those keep `SqlBulkCopy`, so one
+  session setting can span a mixed set of attaches safely.
+- An INSERT that supplies explicit `IDENTITY` values is **refused** on this path (`COPY INTO` cannot preserve
+  them); unset the option for that statement.
+- The load runs inside your transaction, so `BEGIN … ROLLBACK` still governs it.
+- **The source scan streams and reads a committed snapshot**, so a staged load does *not* see rows the same
+  transaction wrote moments earlier. That is deliberate: this path is for bulk movement, and streaming rather
+  than buffering the whole source is what makes it fast (measured ~11% faster wall clock, ~27% less CPU and
+  484 MB less allocation on a 1M-row load). Unset the staging option for a statement that needs to read its
+  own uncommitted writes.
+
 ### MERGE INTO
 
 `MERGE INTO` works on every provider that supports UPDATE/DELETE (SQL Server and Delta), including
@@ -1330,7 +1371,7 @@ setting (see [Partitioning & write tuning](#partitioning--write-tuning)).
 | Setting | Status | Description |
 |---------|--------|-------------|
 | `mssql_mars` | **Active** | MARS mode: `auto` (default, per engine — off for Fabric/Synapse) \| `true` \| `false`. Resolved once at first connection — set **before** ATTACH. ⚠ Forcing `false` on **box SQL Server**: a scan of a table the open transaction has already written cannot run (it would deadlock against its own transaction) and is **refused with a message naming the remedies** — enable `READ_COMMITTED_SNAPSHOT` on the database, turn MARS back on, or COMMIT first. Reads of other tables are unaffected, as are Fabric/Synapse. See [known-limitations.md](docs/known-limitations.md) 1.15 |
-| `mssql_materialize` | **Active** | Buffer a scan that reads the **same catalog** a statement writes to, before the write starts (default `true`). Required on MARS engines — without it `INSERT INTO t SELECT … FROM t` fails at scale with `595`; it is also what gives read-your-writes for that scan on Fabric/Synapse. Set `false` to keep it **streaming** instead: needs `ALLOW_SNAPSHOT_ISOLATION` on the database, and the scan then reads a committed snapshot. Overrides the per-catalog `materialize` ATTACH option |
+| `mssql_materialize` | **Active** | Buffer a scan that reads the **same catalog** a statement writes to, before the write starts. **Defaults to whatever MARS is** — `true` where MARS is available (box, Azure SQL), `false` where it is not (Fabric, Synapse, or `mssql_mars='false'`), because buffering pins the scan onto the write connection and without MARS the scan and the bulk load cannot share it (the statement fails, variously, as `MultipleActiveResultSets`, `already an open DataReader`, or a 30 s timeout that kills the transaction). With it `false` the scan streams from a pooled connection at SNAPSHOT and therefore does **not** see rows the same transaction wrote. Required on MARS engines — without it `INSERT INTO t SELECT … FROM t` fails at scale with `595`; it is also what gives read-your-writes for that scan on Fabric/Synapse. Set `false` to keep it **streaming** instead: needs `ALLOW_SNAPSHOT_ISOLATION` on the database, and the scan then reads a committed snapshot. Overrides the per-catalog `materialize` ATTACH option |
 | `mssql_command_timeout` | **Active** | `SqlCommand.CommandTimeout` (seconds) for scans / DML / bulk; **default `0` = infinite**. Server-enforced per round-trip; overrides the per-catalog `command_timeout` ATTACH option |
 | `mssql_default_varchar_length` | **Active** | Length `n` for created text columns (`NVARCHAR(n)`/`VARCHAR(n)`); unset ⇒ `MAX`. Needed for indexable string keys |
 | `mssql_default_table_type` | **Active** | Created-table storage: `''` (rowstore) \| `clustered columnstore` (CCI, box/Azure; no-op on Fabric — columnstore already) |
@@ -1340,6 +1381,7 @@ setting (see [Partitioning & write tuning](#partitioning--write-tuning)).
 | `mssql_exec_invalidate_cache` | **Active** | Auto-invalidate the catalog cache after DDL run via `fabricator_exec` (default `false`) |
 | `mssql_isolation_level` | **Active** | SQL transaction isolation level for table-in-out (`fn_each`) calls; overrides the ATTACH `isolation_level` per session (empty ⇒ provider default) |
 | `mssql_read_isolation` | **Active** | **Opt-in, unset by default.** Isolation level for READS inside a DuckDB transaction: routes ordinary scans onto that transaction's own connection, opened at this level, so successive statements share **one view** (without it two identical `SELECT`s can differ — see [known-limitations.md](docs/known-limitations.md) 1.16). Use `'snapshot'`: it is the only level that delivers it (`'repeatable read'` still permits the phantoms a `count(*)` sees, `'serializable'` works by blocking writers), and on box it needs `ALLOW_SNAPSHOT_ISOLATION`. **Costs** a held connection + open transaction for the transaction's life, and on a no-MARS engine (Fabric/Synapse) reads are buffered instead of streamed, with no spill — measured 83 MB peak working set streaming vs 471 MB for a 389 MB result, so the ceiling is the largest single result the transaction reads. Overrides the per-catalog `read_isolation` ATTACH option |
+| `mssql_copy_into_staging` | **Active** | **Opt-in, unset by default.** A storage location this extension may write temporary parquet to (`abfss://<fs>@<host>/<path>` or the equivalent `https://<host>/<fs>/<path>`). Set on a **Fabric Warehouse / Synapse** attach, a bulk write stages its parquet there with DuckDB's parallel writer and the warehouse ingests the folder with one `COPY INTO`, instead of streaming rows over TDS with `SqlBulkCopy`. Unset ⇒ `SqlBulkCopy`; **ignored** on engines without `COPY INTO`, so one session setting can span a mixed set of attaches. The staging identity needs read access via **Entra ID only** (no SAS/key), and the path must have no `_`- or `.`-prefixed segment — `COPY INTO` skips such names, which would load zero rows without an error, so it is refused at ATTACH. Overrides the per-catalog `copy_into_staging` ATTACH option |
 | `mssql_insert_batch_size`, `mssql_insert_max_rows_per_statement`, `mssql_insert_max_sql_bytes`, `mssql_insert_use_returning_output` | Accepted | Registered with defaults + `>= 1` validation; no-op (INSERT streams via SqlBulkCopy) |
 | `mssql_connection_*`, `mssql_*_timeout`, `mssql_min_connections`, `mssql_connection_cache` | Accepted | No-op (SqlClient pools by connection string) |
 | `mssql_order_pushdown` | Accepted | No-op — TopN is pushed automatically when safe (always-on, not gated) |
@@ -1591,6 +1633,46 @@ ATTACH 'abfss://myfilesystem@myaccount.dfs.core.windows.net/lake'
 
 SELECT * FROM lake.main.t WHERE id > 10;          -- streaming scan + file/row-group filter pushdown
 ```
+
+### Running inside a Fabric notebook
+
+On Fabric compute the extension authenticates with the **ambient notebook token** — no secret, no service
+principal, no connection string. The token comes from the notebook's own token service and **refreshes
+itself**, which a pasted `ACCESS_TOKEN` does not.
+
+```sql
+-- Managed Tables area through the fuse mount: the simplest option, no credentials at all.
+ATTACH '/lakehouse/default/Tables' AS lake (TYPE fabricator, PROVIDER 'delta', schemas true);
+
+-- OneLake by URI, also with no secret. Reads route through the onelake:// filesystem (DuckDB's native
+-- parquet reader, cached); writes commit through the Azure DataLake SDK.
+ATTACH 'abfss://<workspaceId>@onelake.dfs.fabric.microsoft.com/<itemId>/Tables' AS lake
+  (TYPE fabricator, PROVIDER 'delta', READ_ONLY false);
+```
+
+`READ_ONLY false` is required on the URI form — DuckDB forces a remote ATTACH read-only otherwise.
+
+**A secret is optional, and only needed to use a DIFFERENT identity than the notebook's.** When you do want
+one, these are the shapes that work — the fields are authoritative, so an explicitly configured service
+principal wins even if `PROVIDER` says something else:
+
+| secret | credential used |
+|---|---|
+| *(none, on Fabric compute)* | the ambient notebook token — **recommended** |
+| `PROVIDER credential_chain` | the ambient chain (notebook token on Fabric, `DefaultAzureCredential` elsewhere) |
+| `PROVIDER service_principal` + `TENANT_ID`/`CLIENT_ID`/`CLIENT_SECRET` | that service principal |
+| `PROVIDER managed_identity` (+ `CLIENT_ID` for user-assigned) | that managed identity |
+| `PROVIDER access_token` + `ACCESS_TOKEN` | the token as-is, expiry read from the JWT |
+
+> **⚠ `ACCESS_TOKEN` does not refresh.** The token source lives outside the process, so a long-running
+> notebook will outlive it — re-create the secret to refresh. Ambient is strictly better on Fabric for that
+> reason. A single static storage token also cannot serve an `abfss://` ATTACH at all: that path needs both
+> the Fabric and storage audiences, and one token carries one.
+
+> **⚠ Off Fabric, the `abfss://` concurrency rule below still applies.** The ambient credential is adopted
+> only where the notebook token service actually exists. On a developer machine or any non-Fabric host, an
+> `abfss://` attach with no NAMED secret falls back to DuckDB's azure filesystem and loses the atomic commit
+> — see the box immediately below.
 
 > ### ⚠ Writing to `abfss://` concurrently: NAME the secret (same rule as `s3://`)
 >
@@ -2246,6 +2328,14 @@ DirectLake-passthrough / TMDL notes: [`docs/dax-provider.md`](docs/dax-provider.
 dotnet build dotnet/Fabricator.Bridge -c Release
 pwsh scripts/publish-managed.ps1     # self-contained publish next to the built extension
 ```
+
+SQL Server access uses **`Microsoft.Data.SqlClient` 7.0.2**, alongside
+**`Microsoft.Data.SqlClient.Extensions.Azure`** at the same version. The second package is **not optional**:
+since SqlClient 7.0 the Entra ID (Azure AD) authentication providers live there, so without it every
+`Authentication=Active Directory …` connection — Fabric Warehouse with a service principal, the Fabric SQL
+endpoint, Azure SQL with Entra — fails at connect with *"Cannot find an authentication provider for
+'ActiveDirectoryServicePrincipal'"*. Both are declared in the csproj files; the note matters only if you
+repin them.
 
 ### Extension
 
