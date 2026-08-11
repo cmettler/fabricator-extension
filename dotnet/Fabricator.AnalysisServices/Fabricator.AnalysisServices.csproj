@@ -23,7 +23,7 @@
     <!-- Entra token acquisition for Fabric/AAS XMLA: mint a Power BI-scoped token from the same Azure
          principal the SqlServer warehouse uses (service principal / managed identity / default chain),
          set as AdomdConnection.AccessToken (ADOMD has no interactive flow in the CLR host). -->
-    <PackageReference Include="Azure.Identity" Version="1.13.2" />
+    <PackageReference Include="Azure.Identity" Version="1.21.0" />
   </ItemGroup>
 
 </Project>

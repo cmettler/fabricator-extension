@@ -18,7 +18,9 @@
     <PackageReference Include="Fluid.Core" Version="2.31.0" />
     <ProjectReference Include="..\Fabricator.Abstractions\Fabricator.Abstractions.csproj" />
     <ProjectReference Include="..\Fabricator.Bridge\Fabricator.Bridge.csproj" />
-    <PackageReference Include="Microsoft.Data.SqlClient" Version="6.0.2" />
+    <PackageReference Include="Microsoft.Data.SqlClient" Version="7.0.2" />
+    <!-- Entra auth providers, split out of the core package in SqlClient 7.0 — see Fabricator.Bridge.csproj. -->
+    <PackageReference Include="Microsoft.Data.SqlClient.Extensions.Azure" Version="7.0.2" />
   </ItemGroup>
 
 </Project>
