@@ -603,7 +603,18 @@ typedef struct FabricatorVTable {
 	// set_setting: push a setting's new value (rendered UTF-8; NULL/empty => unset/reset) into the managed
 	// ProviderSettingsStore. Called from each option's set-callback when the value is SET, and once per
 	// setting at registration for its default.
-	int32_t (*set_setting)(const char *provider, const char *name, const char *value, char **err);
+	//
+	// `session` scopes the write, honouring DuckDB's SetScope (ABI v69): 0 = the GLOBAL layer (a `SET GLOBAL`,
+	// and every registration default), non-zero = the SESSION layer, keyed by the setting connection's
+	// ClientContext address (fabricator::SessionKeyFor). A read resolves session-then-global, so a
+	// session-scoped value shadows the global one for that DuckDB connection ALONE.
+	//
+	// ⚠ Before v69 there was no session key and every SET was process-wide. That was not a missing nicety:
+	// MEASURED, `SET mssql_mars='false'` in one connection made a same-catalog CTAS in ANOTHER connection —
+	// which set nothing — return 10 rows instead of 15. A setting applied in one connection changed the DATA
+	// another connection saw. DuckDB registers our options with default_scope = SESSION and already stores
+	// the value per-connection on its side; only this push was global.
+	int32_t (*set_setting)(int64_t session, const char *provider, const char *name, const char *value, char **err);
 
 	// -------------------------------------------------------------------------
 	// Per-transaction connection routing (write-concurrency fix; see
@@ -682,7 +693,19 @@ typedef struct FabricatorVTable {
 	// host-FS binding reads it. `opener` is the operator's ClientContext (reinterpret_cast to a handle), valid
 	// only for the duration of the call it precedes; NULL clears it. SQL/compute table functions ignore it.
 	// Best-effort (a failure to set the ambient must not abort the statement). See docs/global-functions.md.
-	int32_t (*set_active_opener)(FabricatorHandle opener, char **err);
+	//
+	// `session` (ABI v69) records, in a SECOND ambient, which DuckDB connection's session-scoped provider
+	// settings apply — see set_setting. It rides this entry because the two are set at the same moments and
+	// setting them together is what stops them drifting.
+	//
+	// ⚠ THEY ARE NOT THE SAME VALUE, and the one place they differ is the reason this is a parameter rather
+	// than something the managed side derives from `opener`. The commit flush and the rollback path
+	// deliberately open their OWN short-lived connection and pass ITS context as the opener (the user's
+	// transaction is ending), while the settings that govern that flush — delta_write_options,
+	// copy_into_staging, the parquet tuning — were SET on the USER's connection. Deriving the session from
+	// the opener there would resolve against a connection that has set nothing, silently writing at the
+	// engine defaults.
+	int32_t (*set_active_opener)(FabricatorHandle opener, int64_t session, char **err);
 
 	// -------------------------------------------------------------------------
 	// onelake:// FileSystem forward callbacks (Phase-3 filesystem subsystem). A C++ FileSystem registered in
@@ -763,6 +786,20 @@ typedef struct FabricatorVTable {
 	int32_t (*generate_table_sql)(FabricatorHandle handle, const char *schema, const char *func,
 	                              const char *catalog_name, struct ArrowArrayStream *args, char **out_sql,
 	                              char **err);
+
+	// -------------------------------------------------------------------------
+	// Session-scoped provider settings (ABI v69; see set_setting). Appended at the vtable end so no earlier
+	// slot shifts.
+	// -------------------------------------------------------------------------
+	// clear_session_settings: drop every session-scoped value for `session`. The host calls this when the
+	// owning DuckDB connection closes (from a ClientContextState destructor, so it must never throw).
+	//
+	// ⚠ NOT HOUSEKEEPING — the session key is a ClientContext ADDRESS, so an entry left behind can be
+	// INHERITED by a later connection the allocator happens to place at the same address. That is a silent
+	// wrong answer, and it surfaces only under connection churn (a dbt run), where it is hardest to
+	// attribute. Must be idempotent and cheap for a session that never set anything: the host arms the
+	// cleanup once per connection, not once per setting.
+	int32_t (*clear_session_settings)(int64_t session, char **err);
 } FabricatorVTable;
 
 // -----------------------------------------------------------------------------
@@ -879,7 +916,7 @@ typedef struct FabricatorHostServices {
 // state blob is this many bytes + a 4-byte length prefix). Serialize() must fit within it.
 #define FABRICATOR_AGG_SPILL_CAP 1024
 
-#define FABRICATOR_ABI_VERSION 68
+#define FABRICATOR_ABI_VERSION 69
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(FabricatorVTable) as seen

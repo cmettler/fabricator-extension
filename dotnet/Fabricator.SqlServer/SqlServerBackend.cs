@@ -564,8 +564,12 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     // Probed on a NON-MARS connection (Synapse/Fabric reject a MARS connection outright), after which the
     // working connection string re-enables MARS only when the engine supports it.
     private volatile ServerProfile? _profile;
-    private string? _connectionString;               // finalized in EnsureProfile (MARS per the resolved mode)
-    private bool _marsEnabled;                        // resolved in EnsureProfile (mssql_mars ?? profile.SupportsMars)
+    // BOTH finalized in EnsureProfile — the SERVER's capability is a property of the server and is cached
+    // once, but WHICH of these a connection uses is decided per connection, from the opening SESSION's
+    // `mssql_mars` (see EffectiveMars). Two strings rather than one rebuilt per open: SqlClient pools BY
+    // connection string, so a stable pair gives two pools instead of a new pool per open.
+    private string? _connectionStringMars;
+    private string? _connectionStringNoMars;
     private readonly object _profileLock = new();
 
     // Provider-owned ATTACH options (parsed from open_catalog's options_json; docs/provider-extensibility.md §3).
@@ -589,6 +593,10 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     // catalog may stage temporary parquet in, which is also the opt-in for the COPY INTO load path — see
     // ResolveCopyIntoStaging and WarehouseCopyInto. Validated at ATTACH so a typo fails there.
     private readonly string _copyIntoStaging = "";
+    // ATTACH option `mars auto|true|false` (unset => auto). Outranked by a SET mssql_mars, like every other
+    // behaviour option here. Kept as the raw string so one parser validates both surfaces.
+    private readonly string? _mars;
+
     // ATTACH option `materialize true|false` (default true). See ResolveMaterialize; a SET mssql_materialize
     // overrides it per session, the same precedence as isolation_level and command_timeout.
     private readonly bool? _materialize;
@@ -707,6 +715,16 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
                         break;
                     case "materialize":
                         _materialize = !(string.Equals(val, "false", StringComparison.OrdinalIgnoreCase) || val == "0");
+                        break;
+                    // ⚠ ADDED WITH CHANGE B, and it RESTORES a capability that change would otherwise have
+                    // removed. MARS used to be frozen per catalog at its first connect, so attaching twice
+                    // under different `SET mssql_mars` values was the way to get two catalogs on different
+                    // modes. Resolving per connection makes MARS a SESSION property, under which those two
+                    // attaches are identical — so the per-catalog form has to be expressible directly.
+                    // Validated here, at ATTACH, rather than at the first connection that uses it.
+                    case "mars":
+                        ParseMarsMode(val); // throws on a bad spelling
+                        _mars = val;
                         break;
                     case "command_timeout":
                         if (int.TryParse(val, out var ctSecs) && ctSecs >= 0) { _commandTimeout = ctSecs; }
@@ -848,9 +866,12 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         get { EnsureProfile(); return _profile!; }
     }
 
-    // Detect the server profile on first use and finalize the working connection string. Probed on a
-    // NON-MARS connection so Synapse/Fabric (which reject a MARS connection) can be classified; MARS is
-    // then re-enabled in _connectionString only when the engine supports it. One-time per catalog.
+    // Detect the server profile on first use and build BOTH working connection strings. Probed on a NON-MARS
+    // connection so Synapse/Fabric (which reject a MARS connection) can be classified.
+    //
+    // One-time per catalog, and that is right for the PROFILE — it describes the server. It is NOT right for
+    // the MARS choice, which is why that no longer happens here: `mssql_mars` is session-scoped, so which of
+    // the two strings a connection uses is decided per connection, at open time (see OpenConnection).
     private void EnsureProfile()
     {
         if (_profile is not null)
@@ -872,12 +893,54 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
             // mssql_mars (provider setting) is tri-state: auto (default) => the engine's capability
             // (profile.SupportsMars); true/false force it. Forcing MARS on an engine that rejects it
             // (Fabric/Synapse) is the user's choice — it fails loudly at connect.
-            bool mars = ResolveMarsMode(profile);
-            _connectionString =
-                new SqlConnectionStringBuilder(_baseConnectionString) { MultipleActiveResultSets = mars }.ConnectionString;
-            _marsEnabled = mars;
-            _profile = profile; // volatile write last → publishes _connectionString + _marsEnabled to fast-path readers
+            _connectionStringMars =
+                new SqlConnectionStringBuilder(_baseConnectionString) { MultipleActiveResultSets = true }.ConnectionString;
+            _connectionStringNoMars =
+                new SqlConnectionStringBuilder(_baseConnectionString) { MultipleActiveResultSets = false }.ConnectionString;
+            _profile = profile; // volatile write last → publishes both strings to fast-path readers
         }
+    }
+
+    /// <summary>
+    /// The MARS mode a connection opened NOW would get: <c>mssql_mars</c> resolved against the server's
+    /// capability, read from the CURRENT session each time.
+    /// </summary>
+    /// <remarks>
+    /// ⚠ NOT CACHED, and that is the whole of change B. It used to be resolved once per catalog in
+    /// <see cref="EnsureProfile"/>, which made `SET mssql_mars` after the ATTACH a SILENT no-op — the README
+    /// had to tell users to set it first, and a catalog is shared by every DuckDB connection, so even a
+    /// correctly-ordered SET applied to everyone. Session-scoped settings (ABI v69) made that the last
+    /// setting still baked at first connect; every other one is already read at use time.
+    /// </remarks>
+    private bool EffectiveMars() => ResolveMarsMode(Profile);
+
+    /// <summary>
+    /// The MARS mode that governs the AMBIENT DuckDB transaction: the PINNED connection's own mode when one
+    /// exists, else what a fresh connection would get.
+    /// </summary>
+    /// <remarks>
+    /// ⚠ THE DISTINCTION IS LOAD-BEARING, and using <see cref="EffectiveMars"/> at the routing sites instead
+    /// would be a correctness bug rather than an imprecision. A pinned connection's MARS mode was fixed when
+    /// it was opened; the routing questions ("may this scan reuse the pinned connection?", "can it block on
+    /// this transaction's own locks?") are about THAT connection, not about one we might open later. They
+    /// differ exactly when a session changes `mssql_mars` mid-transaction — which is meaningless as a
+    /// request, but must not be allowed to reroute a scan onto a connection that cannot take it: on a
+    /// no-MARS pinned connection that is limitation 1.15's UNBOUNDED HANG, not an error.
+    /// </remarks>
+    private bool TxnMars()
+    {
+        long txnId = AmbientTransaction.Current;
+        if (txnId != 0 && _txns.TryGetValue(txnId, out var state))
+        {
+            lock (state)
+            {
+                if (state.Connection is not null)
+                {
+                    return state.MarsEnabled;
+                }
+            }
+        }
+        return EffectiveMars();
     }
 
     // mssql_mars: "auto"/empty => the engine default (profile.SupportsMars); "true"/"false" force it.
@@ -885,28 +948,32 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     // (no read-your-writes) — they take a fresh pooled connection (see ExecuteQuery), which is what makes
     // a non-MARS warehouse (Fabric/Synapse) work: an open scan reader and DML can't coexist on one
     // non-MARS connection. See docs/transactions.md + docs/warehouse-support.md.
-    private static bool ResolveMarsMode(ServerProfile profile)
+    private bool ResolveMarsMode(ServerProfile profile)
     {
+        // SET wins over the ATTACH option, matching materialize / read_isolation / copy_into_staging.
         var v = ProviderSettingsStore.Instance.GetString(SqlServerBackend.ProviderName, "mssql_mars");
-        switch ((v ?? string.Empty).Trim().ToLowerInvariant())
+        if (string.IsNullOrWhiteSpace(v))
         {
-            case "":
-            case "auto":
-                return profile.SupportsMars;
-            case "true":
-            case "on":
-            case "1":
-            case "yes":
-                return true;
-            case "false":
-            case "off":
-            case "0":
-            case "no":
-                return false;
-            default:
-                throw new ArgumentException($"fabricator: invalid mssql_mars '{v}' (expected auto | true | false)");
+            v = _mars;
         }
+        return ParseMarsMode(v) ?? profile.SupportsMars;
     }
+
+    /// <summary>
+    /// Parses an `mssql_mars` / ATTACH `mars` value. Null (and `auto`) mean "the engine's capability";
+    /// anything unrecognised THROWS rather than silently meaning auto.
+    /// </summary>
+    /// <remarks>Shared by the setting and the ATTACH option so the two cannot accept different spellings —
+    /// and so the option is validated AT ATTACH, where the mistake is, rather than at the first connection
+    /// that happens to use it.</remarks>
+    private static bool? ParseMarsMode(string? v) =>
+        (v ?? string.Empty).Trim().ToLowerInvariant() switch
+        {
+            "" or "auto" => null,
+            "true" or "on" or "1" or "yes" => true,
+            "false" or "off" or "0" or "no" => false,
+            _ => throw new ArgumentException($"fabricator: invalid mssql_mars '{v}' (expected auto | true | false)"),
+        };
 
     // Builds a connection on a specific connection string, applying an Azure access token when one was
     // supplied via the secret (Entra "bring-your-own-token" auth). Does NOT trigger profile detection
@@ -934,10 +1001,18 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
 
     // Creates a connection on the finalized (profile-aware) connection string, detecting the server
     // profile on first use.
-    private SqlConnection OpenConnection()
+    private SqlConnection OpenConnection() => OpenConnection(out _);
+
+    /// <summary>
+    /// Opens a connection on the profile-aware string, reporting which MARS mode it got. The opening SESSION
+    /// decides (see <see cref="EffectiveMars"/>); a transaction's PINNED connection records the answer in
+    /// <see cref="TxnState.MarsEnabled"/> so the routing keeps asking about the connection in play.
+    /// </summary>
+    private SqlConnection OpenConnection(out bool marsEnabled)
     {
-        EnsureProfile();
-        return OpenRaw(_connectionString!);
+        EnsureProfile(); // explicit: the strings below are null until it has run
+        marsEnabled = EffectiveMars();
+        return OpenRaw(marsEnabled ? _connectionStringMars! : _connectionStringNoMars!);
     }
 
     // ---- Transaction state (per DuckDB transaction) ---------------------------
@@ -953,6 +1028,17 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     {
         public SqlConnection? Connection;
         public SqlTransaction? Transaction;
+
+        /// <summary>
+        /// The MARS mode <see cref="Connection"/> was opened with. Meaningless while Connection is null.
+        /// </summary>
+        /// <remarks>
+        /// ⚠ Recorded rather than re-derived because `mssql_mars` is session-scoped and read per open (change
+        /// B): re-resolving it later could answer differently from what this connection actually has, and the
+        /// routing decisions it feeds are about THIS connection — a scan sent to a no-MARS pinned connection
+        /// on the strength of a MARS-on answer is limitation 1.15's unbounded hang.
+        /// </remarks>
+        public bool MarsEnabled;
 
         /// <summary>
         /// Tables this transaction has written, keyed <c>[schema].[table]</c>; the value is true when the
@@ -1111,7 +1197,10 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         {
             if (state.Connection is null)
             {
-                var conn = OpenConnection();
+                // ⚠ The mode comes from the SAME call that chose the connection string, so the recorded
+                // value cannot disagree with the connection: every routing decision for this transaction
+                // reads it back rather than re-resolving a session setting that may since have changed.
+                var conn = OpenConnection(out bool mars);
                 conn.Open();
                 var level = ResolveTxnIsolation();
                 // ⚠ Probe ONLY when the level came from the OPT-IN, never when it came from the profile.
@@ -1124,6 +1213,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
                     // Msg 3952 otherwise, which names the ALTER but not which of our options asked for it.
                     EnsureSnapshotIsolationAllowed(conn, "mssql_read_isolation='snapshot'");
                 }
+                state.MarsEnabled = mars; // before publishing Connection — TxnMars() reads it under this lock
                 state.Connection = conn;
                 state.Transaction = level == IsolationLevel.Unspecified
                     ? conn.BeginTransaction()
@@ -1350,8 +1440,10 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     internal bool ResolveMaterialize()
     {
         var set = ProviderSettingsStore.Instance.GetBool(SqlServerBackend.ProviderName, "mssql_materialize");
-        _ = Profile; // force profile resolution so _marsEnabled is populated before it is read
-        return set ?? _materialize ?? _marsEnabled;
+        // TxnMars(), not EffectiveMars(): the default exists because draining PINS the scan onto the write
+        // connection, so the question is whether THAT connection can carry it — the pinned one when this
+        // transaction already has one.
+        return set ?? _materialize ?? TxnMars();
     }
 
     /// <summary>
@@ -1431,7 +1523,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
             return false;
         }
         // ⚠ WITH MARS OFF THE DRAIN BUYS A SECOND THING, and skipping it here would be a quiet regression.
-        // An ordinary scan reaches the PINNED connection only when `_marsEnabled || readYourWrites ||
+        // An ordinary scan reaches the PINNED connection only when `TxnMars() || readYourWrites ||
         // materialize` (see ExecuteQuery), so on a no-MARS engine the drain is the ONLY reason the scan runs
         // inside the transaction at all — dropping it would cost read-your-writes, and (where this
         // transaction has already written the scanned table) turn a working statement into limitation 1.15's
@@ -1444,7 +1536,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         {
             return false;
         }
-        if (!_marsEnabled)
+        if (!TxnMars())
         {
             return true;
         }
@@ -1649,6 +1741,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         // Non-null only on the no-MARS read_isolation path: serializes execute+drain on the shared pinned
         // connection (see below). Never taken on the default path, so ordinary routing is unaffected.
         object? execGate = null;
+        bool optedMars = false; // the read_isolation pin's own connection mode; only read under readIsolationPin
         bool readIsolationPin = txnId != 0 && !snapshotRead && !string.IsNullOrEmpty(ResolveReadIsolation());
         if (readIsolationPin)
         {
@@ -1663,8 +1756,9 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
                 // must be paid for by guaranteeing the condition it checked for.
                 pinned = opted.Connection;
                 pinnedTransaction = opted.Transaction;
+                optedMars = opted.MarsEnabled; // this connection's own mode, read with the fields it describes
             }
-            if (!_marsEnabled)
+            if (!optedMars)
             {
                 // With MARS off the pinned connection admits ONE reader at a time, so BOTH halves are needed
                 // and draining alone is NOT enough — measured: two scalar subqueries over one table start in
@@ -1688,8 +1782,18 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
                 // concurrent scan reader. That is what restores READ-YOUR-WRITES on a no-MARS engine
                 // (Fabric/Synapse), where an ordinary scan is routed to a pooled connection and therefore
                 // sees only committed state.
+                // ⚠ state.MarsEnabled, NOT a freshly resolved value: this decides whether the scan may reuse
+                // THIS pinned connection, and only the mode it was opened with answers that.
+                //
+                // ⚠ DEFENSIVE, NOT GATED — say so rather than implying a test covers it. Re-resolving here
+                // is a mutant that SURVIVES the suite, and necessarily: a transaction belongs to ONE DuckDB
+                // connection, so the two answers can differ only if that session changes `mssql_mars`
+                // BETWEEN pinning the connection and this scan. That is meaningless as a request, and the
+                // failure it would cause (a scan sent to a no-MARS pinned connection) is limitation 1.15's
+                // unbounded HANG — so a gate for it would be a test that hangs rather than fails, which is
+                // worse than none.
                 if (state.Connection is not null && !snapshotRead &&
-                    (_marsEnabled || readYourWrites || materialize))
+                    (state.MarsEnabled || readYourWrites || materialize))
                 {
                     pinned = state.Connection;
                     pinnedTransaction = state.Transaction;
@@ -2366,7 +2470,17 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     // detects it (via the non-MARS probe) on first use; for an attached catalog it is already cached.
     private IArrowArrayStream ServerInfoStream()
     {
-        var rows = Profile.Properties();
+        // `supports_mars` is the SERVER's capability; `mars_enabled` is what a connection opened by THIS
+        // SESSION gets (capability ∧ the mssql_mars setting/ATTACH option), which was observable from SQL
+        // nowhere at all. That gap had teeth: `verify_mars_off_same_catalog` exists to exercise the no-MARS
+        // path and its own header warns that getting the SET/ATTACH order wrong "silently produced a MARS-ON
+        // catalog and a vacuously passing suite" — with no assertion able to tell the difference. This is
+        // that assertion's observable.
+        //
+        // ⚠ SESSION-DEPENDENT since change B — two connections on one catalog can legitimately report
+        // different values, which is the feature, not an inconsistency to normalise away.
+        var rows = Profile.Properties().Concat(new[] { ("mars_enabled", EffectiveMars() ? "true" : "false") })
+                          .ToList();
         var schema = new Schema(new[]
         {
             new Field("property", StringType.Default, nullable: false),
@@ -2711,7 +2825,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
 
     private (string Why, bool SchemaChanged)? PooledScanSelfBlockReason(string qualified, bool schemaProbe)
     {
-        if (_marsEnabled)
+        if (TxnMars())
         {
             return null; // the scan shares the pinned connection — same session, owns the locks
         }
@@ -2746,7 +2860,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     private void EnsureScanCannotSelfBlock(string qualified, bool materialize, bool snapshotRead,
                                            bool schemaProbe)
     {
-        if (_marsEnabled)
+        if (TxnMars())
         {
             return; // the scan shares the pinned connection — same session, owns the locks
         }

@@ -57,7 +57,7 @@ public static unsafe class Bootstrap
             return new InMemoryArrayStream(schema, new[] { batch });
         });
 
-        vtable->AbiVersion = 68;
+        vtable->AbiVersion = 69;
         vtable->OpenCatalog = &OpenCatalog;
         vtable->CloseCatalog = &CloseCatalog;
         vtable->ExecuteQuery = &ExecuteQuery;
@@ -121,6 +121,7 @@ public static unsafe class Bootstrap
         vtable->OneLakeRemove = &OneLakeRemove;
         vtable->OneLakeMove = &OneLakeMove;
         vtable->GenerateTableSql = &GenerateTableSql;
+        vtable->ClearSessionSettings = &ClearSessionSettings;
         return FabricatorStatus.Ok;
     }
 
@@ -558,9 +559,13 @@ public static unsafe class Bootstrap
     // DuckDB secrets while reading through the host FileSystem callbacks. The host calls this immediately
     // before each table-function bind + execution, on the same thread. 0 clears it. Mirrors SetActiveTxn.
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static int SetActiveOpener(nint opener, byte** err)
+    private static int SetActiveOpener(nint opener, long session, byte** err)
     {
         AmbientOpener.Current = opener;
+        // The settings session rides this entry because the two are set at the same moments — but it is a
+        // SEPARATE value, not `opener` reinterpreted: the commit flush and the rollback pass their own
+        // short-lived connection as the opener while the settings that govern them were SET on the user's.
+        ProviderSettingsStore.CurrentSession = session;
         return FabricatorStatus.Ok;
     }
 
@@ -1546,14 +1551,41 @@ public static unsafe class Bootstrap
     };
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static int SetSetting(byte* provider, byte* name, byte* value, byte** err)
+    private static int SetSetting(long session, byte* provider, byte* name, byte* value, byte** err)
     {
         try
         {
             var p = Marshal.PtrToStringUTF8((nint)provider) ?? string.Empty;
             var n = Marshal.PtrToStringUTF8((nint)name) ?? string.Empty;
             var v = Marshal.PtrToStringUTF8((nint)value); // null => unset / reset
-            ProviderSettingsStore.Instance.Set(p, n, v);
+            // `session` honours DuckDB's SetScope: 0 (a SET GLOBAL, or a registration default) writes the
+            // process-wide layer, anything else this DuckDB connection's own. SetForSession routes 0 to the
+            // global layer itself, so there is no branch here to get wrong.
+            ProviderSettingsStore.Instance.SetForSession(session, p, n, v);
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    // The owning DuckDB connection closed — drop its session-scoped settings so a later connection landing on
+    // the same ClientContext ADDRESS cannot inherit them. Called from a C++ destructor, so it must not throw
+    // across the boundary; the catch below is what guarantees that.
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int ClearSessionSettings(long session, byte** err)
+    {
+        try
+        {
+            ProviderSettingsStore.Instance.ClearSession(session);
+            // Off by default. The C++ half of this — a ClientContextState destructor firing on connection
+            // close — is invisible from SQL and has no other observable, so this line is how it gets
+            // verified at all; leaving it in makes "did the connection's settings get reclaimed?" a grep
+            // rather than a rebuild.
+            BridgeLog.LogDebug("settings: cleared session {Session} ({Remaining} session(s) still held)",
+                               session, ProviderSettingsStore.Instance.SessionCount);
             return FabricatorStatus.Ok;
         }
         catch (Exception ex)

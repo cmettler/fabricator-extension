@@ -320,7 +320,7 @@ static unique_ptr<GlobalFunctionData> CopyToInitGlobal(ClientContext &context, F
 	if (bind_data.transient_delta) {
 		// FORMAT delta: open the per-execution transient catalog rooted at the target's parent directory.
 		// Owned by the gstate (closed at finalize; rolled back + closed by the destructor on failure).
-		fabricator::SetActiveOpener(reinterpret_cast<FabricatorHandle>(&context));
+		fabricator::SetActiveOpener(reinterpret_cast<FabricatorHandle>(&context), fabricator::SessionKeyFor(&context));
 		// A COPY has no SECRET clause, but it opens a REAL catalog and needs the same credential an ATTACH
 		// would carry: without one the provider silently falls back to the host filesystem, which on
 		// abfss:// cannot commit atomically and cannot rename or remove a directory at all. Resolve the
@@ -341,7 +341,7 @@ static unique_ptr<GlobalFunctionData> CopyToInitGlobal(ClientContext &context, F
 	std::memset(&schema, 0, sizeof(schema));
 	auto *stream = gstate->producer->Stream();
 	stream->get_schema(stream, &schema);
-	fabricator::SetActiveOpener(reinterpret_cast<FabricatorHandle>(&context)); // host-FS opener for a Delta-catalog COPY
+	fabricator::SetActiveOpener(reinterpret_cast<FabricatorHandle>(&context), fabricator::SessionKeyFor(&context)); // host-FS opener for a Delta-catalog COPY
 	gstate->bulk_session = fabricator::BeginBulk(handle, bind_data.schema_name, bind_data.table_name,
 	                                           bind_data.create_table, bind_data.replace, /*check_constraints=*/false,
 	                                           gstate->txn_id, schema, bind_data.partition_columns,
@@ -392,7 +392,7 @@ static void CopyToFinalize(ClientContext &context, FunctionData &bind_data_p, Gl
 		// drives the commit itself (a no-op for CREATE/REPLACE, which committed in complete_bulk). The
 		// finalize context's transaction is still active, so the opener resolves secrets directly.
 		auto handle = gstate.owned_catalog;
-		fabricator::SetActiveOpener(reinterpret_cast<FabricatorHandle>(&context));
+		fabricator::SetActiveOpener(reinterpret_cast<FabricatorHandle>(&context), fabricator::SessionKeyFor(&context));
 		fabricator::SetActiveTxn(handle, gstate.txn_id);
 		fabricator::CommitTransaction(handle);
 		gstate.owned_catalog = nullptr;

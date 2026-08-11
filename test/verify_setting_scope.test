@@ -1,0 +1,207 @@
+# name: test/verify_setting_scope.test
+# description: Provider settings honour DuckDB's SetScope (ABI v69) — a `SET` in one DuckDB connection must
+#              NOT be visible to another. Before v69 the managed ProviderSettingsStore was process-wide and
+#              the host's set-callback discarded the scope, so every SET was global to the process.
+#
+#              ⚠ THAT WAS A DATA BUG, NOT A MISSING NICETY. MEASURED against SQL Server with the sharpest
+#              observable available: `SET mssql_mars='false'` in connection A made a same-catalog CTAS in
+#              connection B — which set nothing — return 10 rows instead of 15, while the control (same
+#              script, no SET) returned 15. A setting applied in one connection changed the DATA another
+#              connection saw. The practical consequence: configuring ONE dbt model with a pre-hook could
+#              not work, because the value leaked to models building concurrently on other threads.
+#
+#              This suite pins the property HERMETICALLY, using `delta_write_options` compression as the
+#              observable — the setting's effect is written into the parquet files, so it can be read back
+#              with parquet_metadata instead of inferred. DuckDB registers our options with
+#              default_scope = SESSION, so an unqualified SET is session-scoped and `SET GLOBAL` is the
+#              explicit way to reach every connection.
+# group: [fabricator]
+
+require fabricator
+
+require parquet
+
+require-env FABRICATOR_DELTA_WRITE_DIR
+
+# ONE attach, shared by both connections — an ATTACH is database-level, so a second one errors with
+# "database with name lake already exists". That makes the test sharper rather than weaker: both connections
+# drive the SAME managed DeltaCatalog object, so a difference in what they write can only come from the
+# settings resolving per session.
+statement ok con_a
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/scopelake' AS lake (TYPE fabricator, PROVIDER 'delta', native_read true, native_write true);
+
+# ==== 1. THE HEADLINE PROPERTY: a session SET does not reach another connection ====
+
+statement ok con_a
+SET delta_write_options = '{"compression":"zstd"}';
+
+statement ok con_a
+CREATE OR REPLACE TABLE lake.main.a_own AS SELECT i, 'v' || i AS s FROM range(2000) t(i);
+
+# POSITIVE CONTROL, and it is load-bearing: without it the con_b assertion below would pass equally if the
+# setting had simply stopped working, or if delta_write_options had stopped reaching the writer at all.
+query I con_a
+SELECT DISTINCT compression FROM parquet_metadata('${FABRICATOR_DELTA_WRITE_DIR}/scopelake/a_own/*.parquet')
+WHERE compression <> '';
+----
+ZSTD
+
+# THE LEAK, in the shape it was measured: con_b set nothing, so it must write the engine default.
+statement ok con_b
+CREATE OR REPLACE TABLE lake.main.b_own AS SELECT i, 'v' || i AS s FROM range(2000) t(i);
+
+query I con_b
+SELECT DISTINCT compression FROM parquet_metadata('${FABRICATOR_DELTA_WRITE_DIR}/scopelake/b_own/*.parquet')
+WHERE compression <> '';
+----
+SNAPPY
+
+# ==== 2. the setter keeps its own value across statements (it is session-scoped, not statement-scoped) ====
+
+statement ok con_a
+CREATE OR REPLACE TABLE lake.main.a_again AS SELECT i FROM range(2000) t(i);
+
+query I con_a
+SELECT DISTINCT compression FROM parquet_metadata('${FABRICATOR_DELTA_WRITE_DIR}/scopelake/a_again/*.parquet')
+WHERE compression <> '';
+----
+ZSTD
+
+# ==== 3. SET GLOBAL still reaches every connection ====
+#
+# The scoping must not have been bought by making settings connection-local FULL STOP — a global setting is
+# how a session-wide policy (a storage-cost default) is still expressed, and this is what would catch a
+# trampoline that keyed everything by session regardless of scope.
+
+statement ok con_a
+SET GLOBAL delta_write_options = '{"compression":"gzip"}';
+
+statement ok con_b
+CREATE OR REPLACE TABLE lake.main.b_global AS SELECT i FROM range(2000) t(i);
+
+query I con_b
+SELECT DISTINCT compression FROM parquet_metadata('${FABRICATOR_DELTA_WRITE_DIR}/scopelake/b_global/*.parquet')
+WHERE compression <> '';
+----
+GZIP
+
+# ==== 4. a session value OUTRANKS the global one, for that connection only ====
+
+statement ok con_b
+SET delta_write_options = '{"compression":"zstd"}';
+
+statement ok con_b
+CREATE OR REPLACE TABLE lake.main.b_over AS SELECT i FROM range(2000) t(i);
+
+query I con_b
+SELECT DISTINCT compression FROM parquet_metadata('${FABRICATOR_DELTA_WRITE_DIR}/scopelake/b_over/*.parquet')
+WHERE compression <> '';
+----
+ZSTD
+
+# A third connection, which has never touched the setting, still sees the GLOBAL value — the mirror image of
+# §1, and what makes this a scoping test rather than a "last writer wins" test. (con_a cannot play this role:
+# it holds a session value of its own from §1.)
+statement ok con_c
+CREATE OR REPLACE TABLE lake.main.c_global AS SELECT i FROM range(2000) t(i);
+
+query I con_c
+SELECT DISTINCT compression FROM parquet_metadata('${FABRICATOR_DELTA_WRITE_DIR}/scopelake/c_global/*.parquet')
+WHERE compression <> '';
+----
+GZIP
+
+# ==== 5. a write performed at COMMIT still resolves the session's write tuning ====
+#
+# ⚠ WHAT THIS DOES **NOT** PIN, stated up front because the section was originally written claiming it did.
+# The commit flush opens its OWN short-lived connection and passes ITS context as the host-FS opener (the
+# user's transaction is already ending and the secret manager needs an active one), so the settings session
+# is carried separately, from the USER's context. That separation is REASONED, NOT MEASURED: deriving the
+# session from the flush connection instead is a mutant that SURVIVES this section and every other shape
+# that could be constructed for it. The eager-write buffer and the transaction hoist moved essentially every
+# tuning-sensitive write to STATEMENT time, where the session is trivially correct.
+#
+# What the section DOES pin is that a flush-path write reads the write tuning at all — it would catch the
+# flush losing the spec entirely. Two things about the shape are load-bearing:
+#
+# (a) IT MUST BE AN IDENTITY TABLE. MEASURED: a buffered `INSERT`, a `CREATE OR REPLACE … AS SELECT` inside
+#     BEGIN/COMMIT, and even a CDF table's `_change_data` files (staged at statement time since the
+#     transaction hoist) are all written at STATEMENT time. The one branch that still RETAINS batches until
+#     COMMIT is identity/iceberg or a pending ALTER, so an IDENTITY table is what puts a parquet write on
+#     the flush path at all.
+#
+# (b) IT MUST BE THE CODEC ENGINE. MEASURED: on `native_write` this exact shape comes out SNAPPY — the write
+#     spec does not reach DuckDB's COPY on the FLUSH path specifically, a separate pre-existing gap (the
+#     statement-time native writes DO honour it). Written on the native engine the section fails for that
+#     unrelated reason.
+
+statement ok con_b
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/scopecodec' AS codec (TYPE fabricator, PROVIDER 'engineeredwooddelta');
+
+statement ok con_b
+CREATE OR REPLACE TABLE codec.main.b_ident (id BIGINT AS (0), v BIGINT);
+
+statement ok con_b
+BEGIN;
+
+statement ok con_b
+INSERT INTO codec.main.b_ident (v) SELECT i FROM range(2000) t(i);
+
+statement ok con_b
+COMMIT;
+
+query I con_b
+SELECT DISTINCT compression FROM parquet_metadata('${FABRICATOR_DELTA_WRITE_DIR}/scopecodec/b_ident/*.parquet')
+WHERE compression <> '';
+----
+ZSTD
+
+query I con_b
+SELECT count(*) FROM codec.main.b_ident;
+----
+2000
+
+# ==== 6. ⚠ A SESSION `RESET` LATCHES "UNSET" — IT DOES NOT FALL BACK TO THE GLOBAL VALUE ====
+#
+# The intuitive expectation is GZIP (the global set in §3) and it is WRONG. `RESET` at session scope stores
+# the option's DEFAULT — NULL here — as this connection's own value, which SHADOWS the global one. So the
+# resetting connection writes at the ENGINE default, and a later `SET GLOBAL` will not reach it either.
+#
+# ⚠ This is DuckDB's behaviour, not ours, and it was VERIFIED rather than assumed: after `RESET`,
+# `current_setting('delta_write_options')` reports NULL, and it STILL reports NULL after a subsequent
+# `SET GLOBAL … = gzip` in the same connection. `PhysicalReset::ResetExtensionVariable` does exactly this
+# (`client_config.user_settings.SetUserSetting(idx, default_value)`), so matching it keeps our resolution and
+# `current_setting`'s answer in agreement — which is the property that matters, since a user diagnosing a
+# write will read the setting back with `current_setting`.
+
+statement ok con_b
+RESET delta_write_options;
+
+# The corroborating control, in DuckDB's own vocabulary: the value con_b will resolve is NULL, not the global.
+query I con_b
+SELECT current_setting('delta_write_options') IS NULL;
+----
+true
+
+statement ok con_b
+CREATE OR REPLACE TABLE lake.main.b_reset AS SELECT i FROM range(2000) t(i);
+
+query I con_b
+SELECT DISTINCT compression FROM parquet_metadata('${FABRICATOR_DELTA_WRITE_DIR}/scopelake/b_reset/*.parquet')
+WHERE compression <> '';
+----
+SNAPPY
+
+# …while a connection that never reset still sees the global — so §6 pins the latch, not a global that
+# stopped working.
+statement ok con_c
+CREATE OR REPLACE TABLE lake.main.c_still AS SELECT i FROM range(2000) t(i);
+
+query I con_c
+SELECT DISTINCT compression FROM parquet_metadata('${FABRICATOR_DELTA_WRITE_DIR}/scopelake/c_still/*.parquet')
+WHERE compression <> '';
+----
+GZIP
+
+statement ok con_a
+RESET GLOBAL delta_write_options;

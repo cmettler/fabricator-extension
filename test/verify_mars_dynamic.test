@@ -1,0 +1,202 @@
+# name: test/verify_mars_dynamic.test
+# description: `mssql_mars` is resolved PER CONNECTION, at open time, from the setting session — not once per
+#              catalog at its first connect (change B, on top of ABI v69's session-scoped settings).
+#
+#              ⚠ WHAT THIS REPLACED, and why it was worse than a missing feature. The mode used to be
+#              finalized in EnsureProfile and cached for the catalog's life, so a `SET mssql_mars` after the
+#              ATTACH was a SILENT no-op — the README had to tell users to set it FIRST, and there was no
+#              way to observe that they had failed to (fabricator_server_info's `mars_enabled` row is new,
+#              added for exactly this). Worse, a catalog is DATABASE-level: one SqlServerCatalog is shared by
+#              every DuckDB connection, so even a correctly-ordered SET applied to all of them. That made the
+#              motivating case — configuring ONE dbt model with a pre-hook — impossible twice over.
+#
+#              ⚠ THE PROFILE IS STILL CACHED, deliberately: `supports_mars` describes the SERVER, so it is
+#              detected once. Only the CHOICE moved. Both are asserted together throughout, because
+#              `supports_mars` staying true is what shows the difference is the setting rather than the
+#              engine.
+# group: [fabricator]
+
+require fabricator
+
+require-env MSSQL_TESTDB_DSN
+
+# ═════════════════════════════════════════════════════════════════════════════════════════════════
+# §1  A `SET` AFTER THE ATTACH TAKES EFFECT — the silent no-op this change removes.
+# ═════════════════════════════════════════════════════════════════════════════════════════════════
+
+statement ok con_a
+ATTACH '${MSSQL_TESTDB_DSN}' AS d (TYPE fabricator);
+
+# Force the catalog to CONNECT and cache its profile before the SET, so this cannot pass by the resolution
+# merely having been deferred — under the old code the mode was fixed by exactly this statement.
+query I con_a
+SELECT count(*) FROM fabricator_server_info('d') WHERE property = 'supports_mars';
+----
+1
+
+query TT con_a
+SELECT property, value FROM fabricator_server_info('d')
+WHERE property IN ('supports_mars', 'mars_enabled') ORDER BY property;
+----
+mars_enabled	true
+supports_mars	true
+
+statement ok con_a
+SET mssql_mars = 'false';
+
+# THE HEADLINE: the already-connected catalog now reports the new mode.
+query TT con_a
+SELECT property, value FROM fabricator_server_info('d')
+WHERE property IN ('supports_mars', 'mars_enabled') ORDER BY property;
+----
+mars_enabled	false
+supports_mars	true
+
+# ═════════════════════════════════════════════════════════════════════════════════════════════════
+# §2  TWO SESSIONS, ONE CATALOG, DIFFERENT MODES — impossible before, and the point of the change.
+# ═════════════════════════════════════════════════════════════════════════════════════════════════
+#
+# con_b shares the SAME attached catalog (an ATTACH is database-level, so there is exactly one
+# SqlServerCatalog object behind both) and has set nothing, so it must still see the engine default. If the
+# mode were still catalog-state, con_a's SET above would have changed this answer too.
+
+query TT con_b
+SELECT property, value FROM fabricator_server_info('d')
+WHERE property IN ('supports_mars', 'mars_enabled') ORDER BY property;
+----
+mars_enabled	true
+supports_mars	true
+
+# …and back the other way, to show the two are independent rather than con_b merely being "first".
+statement ok con_b
+SET mssql_mars = 'false';
+
+query T con_b
+SELECT value FROM fabricator_server_info('d') WHERE property = 'mars_enabled';
+----
+false
+
+statement ok con_a
+RESET mssql_mars;
+
+# ⚠ RESET at session scope LATCHES "unset" rather than falling back to the global layer (DuckDB's own
+# behaviour for extension settings — see verify_setting_scope §6), and unset means `auto`, which is what the
+# engine supports. So con_a returns to MARS-on while con_b keeps its own explicit false.
+query T con_a
+SELECT value FROM fabricator_server_info('d') WHERE property = 'mars_enabled';
+----
+true
+
+query T con_b
+SELECT value FROM fabricator_server_info('d') WHERE property = 'mars_enabled';
+----
+false
+
+# ═════════════════════════════════════════════════════════════════════════════════════════════════
+# §3  THE MODE STILL DRIVES REAL ROUTING, not just the diagnostic row.
+# ═════════════════════════════════════════════════════════════════════════════════════════════════
+#
+# ⚠ Without this the suite would pin a REPORTING string and nothing else — `mars_enabled` could be read
+# straight from the setting and every assertion above would still pass while connections kept using the
+# cached mode.
+#
+# The observable is READ-YOUR-WRITES on a same-catalog self-insert inside one transaction, and it is a true
+# A/B: the two sessions share ONE attached catalog and run BYTE-IDENTICAL statements against their own
+# tables, differing only in `mssql_mars`. `mssql_materialize` defaults to whatever MARS is, so
+#   • MARS on  ⇒ the scan is drained onto the transaction's pinned connection ⇒ it sees the uncommitted
+#     200 rows ⇒ 400;
+#   • MARS off ⇒ it streams POOLED at SNAPSHOT ⇒ it sees committed state, which is empty ⇒ 200.
+# Under the old catalog-wide mode these two could not differ at all.
+#
+# ⚠ The 200 is an ASSERTION OF ABSENCE (no read-your-writes) and is only meaningful beside the 400 — which
+# is why both legs are here rather than just the interesting one.
+
+statement ok con_a
+CREATE OR REPLACE TABLE d.dbo.mdyn_a_src AS SELECT i AS a, ('v' || i::VARCHAR) AS b FROM range(200) t(i);
+
+statement ok con_a
+CREATE OR REPLACE TABLE d.dbo.mdyn_a_dst AS SELECT * FROM d.dbo.mdyn_a_src WHERE 1 = 0;
+
+statement ok con_a
+BEGIN;
+
+statement ok con_a
+INSERT INTO d.dbo.mdyn_a_dst SELECT * FROM d.dbo.mdyn_a_src;
+
+statement ok con_a
+INSERT INTO d.dbo.mdyn_a_dst SELECT * FROM d.dbo.mdyn_a_dst;
+
+statement ok con_a
+COMMIT;
+
+# con_a: MARS on (nothing set) ⇒ the self-insert's scan sees this transaction's own uncommitted rows.
+query I con_a
+SELECT count(*) FROM d.dbo.mdyn_a_dst;
+----
+400
+
+statement ok con_b
+SET mssql_mars = 'false';
+
+statement ok con_b
+CREATE OR REPLACE TABLE d.dbo.mdyn_b_src AS SELECT i AS a, ('v' || i::VARCHAR) AS b FROM range(200) t(i);
+
+statement ok con_b
+CREATE OR REPLACE TABLE d.dbo.mdyn_b_dst AS SELECT * FROM d.dbo.mdyn_b_src WHERE 1 = 0;
+
+statement ok con_b
+BEGIN;
+
+statement ok con_b
+INSERT INTO d.dbo.mdyn_b_dst SELECT * FROM d.dbo.mdyn_b_src;
+
+statement ok con_b
+INSERT INTO d.dbo.mdyn_b_dst SELECT * FROM d.dbo.mdyn_b_dst;
+
+statement ok con_b
+COMMIT;
+
+# con_b: MARS off ON THE SAME CATALOG ⇒ the self-insert's scan reads committed state, which is still empty.
+query I con_b
+SELECT count(*) FROM d.dbo.mdyn_b_dst;
+----
+200
+
+statement ok con_a
+DROP TABLE d.dbo.mdyn_a_dst;
+
+statement ok con_a
+DROP TABLE d.dbo.mdyn_a_src;
+
+statement ok con_b
+DROP TABLE d.dbo.mdyn_b_dst;
+
+statement ok con_b
+DROP TABLE d.dbo.mdyn_b_src;
+
+statement ok con_b
+RESET mssql_mars;
+
+# ═════════════════════════════════════════════════════════════════════════════════════════════════
+# §4  AN INVALID VALUE IS STILL REFUSED — and now at the STATEMENT that uses it.
+# ═════════════════════════════════════════════════════════════════════════════════════════════════
+#
+# The value is validated where it is resolved, which used to be the catalog's first connect. Resolving per
+# connection moves the error to the first statement that opens one; it must still be refused, not silently
+# treated as `auto`.
+
+statement ok con_a
+SET mssql_mars = 'bogus';
+
+statement error con_a
+SELECT value FROM fabricator_server_info('d') WHERE property = 'mars_enabled';
+----
+invalid mssql_mars
+
+statement ok con_a
+RESET mssql_mars;
+
+query T con_a
+SELECT value FROM fabricator_server_info('d') WHERE property = 'mars_enabled';
+----
+true

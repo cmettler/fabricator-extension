@@ -3008,7 +3008,7 @@ void FabricatorSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &inf
 	}
 	auto &context = *transaction.context;
 	FabricatorSetActiveTxn(handle_, context); // every ALTER below joins this txn's connection
-	fabricator::SetActiveOpener(reinterpret_cast<FabricatorHandle>(&context)); // host-FS opener for a Delta-catalog ALTER
+	fabricator::SetActiveOpener(reinterpret_cast<FabricatorHandle>(&context), fabricator::SessionKeyFor(&context)); // host-FS opener for a Delta-catalog ALTER
 	auto &table_info = info.Cast<AlterTableInfo>();
 	const string &table = table_info.name;
 

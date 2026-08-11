@@ -1,10 +1,13 @@
-# ABI history — prior versions v16–v67
+# ABI history — prior versions v16–v68
 
 > Moved VERBATIM out of `CLAUDE.md` on 2026-07-29 (conservative split — see the commit message).
 > Append-only as-built history; the live summary + pointers stay in `CLAUDE.md`.
 > Paths/links inside are REPO-ROOT-relative (the text was written for `CLAUDE.md`).
 > The CURRENT version + the bump rule stay in `CLAUDE.md` §C ABI contract.
 
+- **Prior: ABI v68** (v68 = **`generate_table_sql`** — the SQL-GENERATING table function surface; see the
+  sqlgen bullet in `CLAUDE.md` "Next up" and [macros-and-sqlgen-functions.md](macros-and-sqlgen-functions.md)
+  §2. Full text stayed in `CLAUDE.md` as the then-current version and moved here when v69 landed.)
 - **Prior: ABI v67** (v67 = **`options_json`** — `create_table` + `begin_bulk` each gained a
   nullable `const char *options_json` carrying the `CREATE TABLE [AS] ... WITH (key='value', ...)` clause
   as a flat JSON object of STRING values (`fabricator::TableOptionsArg` — constants only, one CAST level

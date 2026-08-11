@@ -104,20 +104,83 @@ struct SettingSlot {
 static SettingSlot g_setting_slots[FABRICATOR_MAX_SETTINGS];
 static size_t g_setting_count = 0;
 
+// The scope our options are REGISTERED with (AddExtensionOption's `default_scope`), and therefore the scope
+// an unqualified `SET fabricator_x = …` resolves to. It is DuckDB's own default for extension options; it is
+// named here because the trampoline below has to resolve SetScope::AUTOMATIC the same way DuckDB does, and
+// the two must not drift.
+static constexpr SetScope FABRICATOR_SETTING_DEFAULT_SCOPE = SetScope::SESSION;
+
+// The lifetime hook for a session's settings. The SESSION KEY is a ClientContext ADDRESS, so leaving entries
+// behind is not merely a leak: a later connection allocated at the same address would INHERIT a dead one's
+// settings — a silent wrong answer, and one that would show up only under connection churn (a dbt run), i.e.
+// exactly where it is hardest to attribute.
+//
+// A `ClientContextState` registered on the context is held by it for its whole life, so this object's
+// DESTRUCTOR is the connection-close signal — there is no explicit close callback to hook. It is registered
+// LAZILY, on the first session-scoped SET, so a connection that never sets anything costs nothing.
+class FabricatorSessionSettingsState : public ClientContextState {
+public:
+	explicit FabricatorSessionSettingsState(int64_t session) : session_(session) {
+	}
+	~FabricatorSessionSettingsState() override {
+		try {
+			fabricator::ClearSessionSettings(session_);
+		} catch (...) {
+			// A destructor must not throw, and a store that can no longer be reached has nothing to clear.
+		}
+	}
+
+private:
+	int64_t session_;
+};
+
+// Key under which the state is registered on the ClientContext. Namespaced so it cannot collide with
+// DuckDB's own or another extension's.
+static constexpr const char *FABRICATOR_SESSION_STATE_KEY = "fabricator_session_settings";
+
 // One set-callback per slot: validates an optional minimum (parity with the former RequireAtLeastOne), then
 // best-effort pushes the new value to the managed store. DuckDB has already cast `value` to the option type.
+//
+// ⚠ THE SCOPE IS LOAD-BEARING AND WAS DISCARDED UNTIL ABI v69, WHICH WAS A DATA BUG RATHER THAN A MISSING
+// FEATURE. MEASURED: `SET mssql_mars='false'` in DuckDB connection A made a same-catalog CTAS in connection
+// B — which set nothing — return 10 rows instead of 15, the control (same script, no SET) returning 15. So a
+// setting applied in one connection changed the DATA another connection saw. DuckDB stores the value
+// per-connection on ITS side already (default_scope = SESSION, `client_config.user_settings`); only this push
+// was process-wide. The practical consequence: configuring ONE dbt model via a pre-hook could not work — the
+// value leaked to models running concurrently on other threads.
+//
+// ⚠ SET AND RESET HAND US THE SCOPE DIFFERENTLY, and only one of them can be AUTOMATIC.
+// `PhysicalSet::SetExtensionVariable` calls us with the RAW scope and resolves AUTOMATIC afterwards, while
+// `PhysicalReset::ResetExtensionVariable` resolves it BEFORE calling us. So we must resolve AUTOMATIC
+// ourselves, and must resolve it to the same thing DuckDB will.
 template <size_t I>
-static void SettingTrampoline(ClientContext &, SetScope, Value &value) {
+static void SettingTrampoline(ClientContext &context, SetScope scope, Value &value) {
 	const SettingSlot &slot = g_setting_slots[I];
 	if (slot.has_min && !value.IsNull() && value.GetValue<int64_t>() < slot.min_value) {
 		throw InvalidInputException("fabricator: %s must be >= %lld", slot.name, (long long)slot.min_value);
 	}
+	if (scope == SetScope::AUTOMATIC) {
+		scope = FABRICATOR_SETTING_DEFAULT_SCOPE;
+	}
+	// GLOBAL writes the process-wide layer (key 0); anything else is this connection's own.
+	// ⚠ A RESET at session scope pushes the option's DEFAULT into the session layer rather than deleting the
+	// session entry — which shadows a `SET GLOBAL` value instead of falling back to it. That looks wrong and
+	// is exactly what DuckDB does one line later (`client_config.user_settings.SetUserSetting(idx, default)`),
+	// so matching it keeps our view and DuckDB's `duckdb_settings()` view of the same setting in agreement.
+	int64_t session = scope == SetScope::GLOBAL ? 0 : fabricator::SessionKeyFor(&context);
+	if (session != 0 && context.registered_state) {
+		// Arm the cleanup BEFORE the write, so a session entry can never exist without the state that
+		// reclaims it. GetOrCreate is keyed and locked, so repeated SETs on one connection register exactly
+		// one — the cost is per connection, not per setting.
+		context.registered_state->GetOrCreate<FabricatorSessionSettingsState>(FABRICATOR_SESSION_STATE_KEY,
+		                                                                      session);
+	}
 	try {
 		if (value.IsNull()) {
-			fabricator::SetSetting(slot.provider, slot.name, nullptr);
+			fabricator::SetSetting(slot.provider, slot.name, nullptr, session);
 		} else {
 			string rendered = value.ToString();
-			fabricator::SetSetting(slot.provider, slot.name, rendered.c_str());
+			fabricator::SetSetting(slot.provider, slot.name, rendered.c_str(), session);
 		}
 	} catch (...) {
 		// Best-effort: a managed-store hiccup must not fail the user's SET.
@@ -183,12 +246,17 @@ static void RegisterProviderSettings(ExtensionLoader &loader) {
 			g_setting_slots[slot].has_min = !min.empty();
 			g_setting_slots[slot].min_value = min.empty() ? 0 : std::stoll(min);
 
-			config.AddExtensionOption(name, desc, lt, default_value, g_setting_trampolines[slot]);
+			// The scope is passed EXPLICITLY although it is also DuckDB's default for extension options, so
+			// that it and the trampoline's AUTOMATIC resolution read from one constant and cannot drift.
+			config.AddExtensionOption(name, desc, lt, default_value, g_setting_trampolines[slot],
+			                          FABRICATOR_SETTING_DEFAULT_SCOPE);
 
-			// Seed the managed store with the default so reads see it before any SET.
+			// Seed the managed store with the default so reads see it before any SET. Session 0: a
+			// registration default belongs to every connection, not to whichever one happened to load the
+			// extension — and load-time here has no user connection to attribute it to anyway.
 			if (!def.empty()) {
 				try {
-					fabricator::SetSetting(provider, name, def.c_str());
+					fabricator::SetSetting(provider, name, def.c_str(), 0);
 				} catch (...) {
 				}
 			}
@@ -498,7 +566,8 @@ static void FabricatorExecFunction(DataChunk &args, ExpressionState &state, Vect
 			                       /*join_only=*/true);
 			// Host-FS opener for a raw exec against a host-FS provider (the Delta catalog's OPTIMIZE/VACUUM read +
 			// write the _delta_log/data through DuckDB's FileSystem). No-op for SQL Server / delta-rs (they ignore it).
-			fabricator::SetActiveOpener(reinterpret_cast<FabricatorHandle>(&context));
+			fabricator::SetActiveOpener(reinterpret_cast<FabricatorHandle>(&context),
+			                            fabricator::SessionKeyFor(&context));
 			result_data[i] = fabricator::ExecuteDml(handle, StringValue::Get(sql_value), &schema_may_change);
 		} catch (...) {
 			if (owns) {

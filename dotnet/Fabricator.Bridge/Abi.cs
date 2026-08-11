@@ -157,8 +157,8 @@ public unsafe struct FabricatorVTable
     // int32 list_settings(ArrowArrayStream* out, char** err)
     public delegate* unmanaged[Cdecl]<CArrowArrayStream*, byte**, int> ListSettings;
 
-    // int32 set_setting(const char* provider, const char* name, const char* value, char** err)
-    public delegate* unmanaged[Cdecl]<byte*, byte*, byte*, byte**, int> SetSetting;
+    // int32 set_setting(int64 session, const char* provider, const char* name, const char* value, char** err)
+    public delegate* unmanaged[Cdecl]<long, byte*, byte*, byte*, byte**, int> SetSetting;
 
     // int32 set_active_txn(void* handle, int64 txn_id, int32 join_only, char** err)
     public delegate* unmanaged[Cdecl]<nint, long, int, byte**, int> SetActiveTxn;
@@ -181,10 +181,13 @@ public unsafe struct FabricatorVTable
     // global functions (metadata: name/kind/param_count/return_type), enumerated once at extension load.
     public delegate* unmanaged[Cdecl]<CArrowArrayStream*, byte**, int> ListGlobalFunctions;
 
-    // int32 set_active_opener(void* opener, char** err) — record the calling operator's ClientContext as the
-    // active host-FS opener (per-thread ambient) so a global host-FS table function (a lakehouse reader)
-    // resolves DuckDB secrets when reading through the host FileSystem. NULL clears it. Mirrors SetActiveTxn.
-    public delegate* unmanaged[Cdecl]<nint, byte**, int> SetActiveOpener;
+    // int32 set_active_opener(void* opener, int64 session, char** err) — record the calling operator's
+    // ClientContext as the active host-FS opener (per-thread ambient) so a global host-FS table function (a
+    // lakehouse reader) resolves DuckDB secrets when reading through the host FileSystem. NULL clears it.
+    // Mirrors SetActiveTxn. `session` (ABI v69) is the DuckDB connection whose session-scoped provider
+    // settings apply — NOT always the opener: the commit flush and rollback pass their own short-lived
+    // connection as the opener while keeping the USER's connection as the session.
+    public delegate* unmanaged[Cdecl]<nint, long, byte**, int> SetActiveOpener;
 
     // onelake:// FileSystem forward callbacks (Phase-3): the C++ onelake FS subsystem forwards read ops here to
     // the managed Azure DataLake SDK. cred_json = the azure secret fields the host resolved from the opener.
@@ -229,6 +232,10 @@ public unsafe struct FabricatorVTable
     //                          ArrowArrayStream* args, char** out_sql, char** err)
     public delegate* unmanaged[Cdecl]<nint, byte*, byte*, byte*, CArrowArrayStream*, byte**, byte**, int>
         GenerateTableSql;
+
+    // int32 clear_session_settings(int64 session, char** err) (v69) — drop a closed DuckDB connection's
+    // session-scoped settings. Appended at the vtable end so no earlier slot shifts.
+    public delegate* unmanaged[Cdecl]<long, byte**, int> ClearSessionSettings;
 }
 
 /// <summary>

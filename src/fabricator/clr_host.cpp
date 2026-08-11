@@ -932,16 +932,33 @@ void ListSecretFields(ArrowArrayStream &out) {
 }
 
 // `value` is the rendered setting value (nullptr => unset/reset). Pushes into the managed
-// ProviderSettingsStore so providers read it in C#.
-void SetSetting(const std::string &provider, const std::string &name, const char *value) {
+// ProviderSettingsStore so providers read it in C#, at `session` scope (0 => the global layer).
+void SetSetting(const std::string &provider, const std::string &name, const char *value, int64_t session) {
 	const FabricatorVTable &vt = GetBridge();
 	if (!vt.set_setting) {
 		throw duckdb::IOException("Fabricator: bridge does not provide set_setting");
 	}
 	char *err = nullptr;
-	int32_t rc = vt.set_setting(provider.c_str(), name.c_str(), value, &err);
+	int32_t rc = vt.set_setting(session, provider.c_str(), name.c_str(), value, &err);
 	if (rc != FABRICATOR_OK) {
 		ThrowManagedError(vt, err, "Fabricator: set_setting failed");
+	}
+}
+
+// Runs from a ClientContextState DESTRUCTOR, so it must never throw and must tolerate a bridge that is gone
+// or was never booted. Leaving the entry behind is the failure it guards against, but a throw here would be
+// worse: it would terminate the process during connection teardown.
+void ClearSessionSettings(int64_t session) noexcept {
+	try {
+		const FabricatorVTable &vt = GetBridge();
+		if (!vt.clear_session_settings) {
+			return; // older/partial bridge
+		}
+		char *err = nullptr;
+		if (vt.clear_session_settings(session, &err) != FABRICATOR_OK && err && vt.free_error) {
+			vt.free_error(err);
+		}
+	} catch (...) {
 	}
 }
 
@@ -1448,13 +1465,13 @@ std::string FsSpike(FabricatorHandle opener, const std::string &path) {
 	return result;
 }
 
-void SetActiveOpener(FabricatorHandle opener) {
+void SetActiveOpener(FabricatorHandle opener, int64_t session) {
 	const FabricatorVTable &vt = GetBridge();
 	if (!vt.set_active_opener) {
 		return; // older/partial bridge: host-FS opener routing simply not active
 	}
 	char *err = nullptr;
-	int32_t rc = vt.set_active_opener(opener, &err);
+	int32_t rc = vt.set_active_opener(opener, session, &err);
 	if (rc != FABRICATOR_OK && err) {
 		// Best-effort: a failure to set the ambient must not abort the statement; free the message.
 		if (vt.free_error) {

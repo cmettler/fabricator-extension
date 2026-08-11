@@ -68,6 +68,15 @@
     -->
     <Compile Include="..\Fabricator.Bridge\OneLakeStagingLocation.cs"
              Link="Linked\OneLakeStagingLocation.cs" />
+    <!--
+      The provider-settings store. Admissible because its closure is the BCL (ConcurrentDictionary +
+      AsyncLocal). Worth testing here rather than only through SQL: the session layer's edges — session 0
+      meaning GLOBAL, a null session value shadowing as UNSET, ClearSession being idempotent for a session
+      that never set anything — are each one line to get wrong and invisible from SQL until a dbt run leaks
+      one model's setting into another's.
+    -->
+    <Compile Include="..\Fabricator.Abstractions\ProviderSettings.cs"
+             Link="Linked\ProviderSettings.cs" />
   </ItemGroup>
 
 </Project>

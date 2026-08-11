@@ -58,18 +58,34 @@ ErrorData FabricatorTransactionManager::CommitTransaction(ClientContext &context
 		// secret manager requires an active one (httpfs S3 fails with "ActiveTransaction called without
 		// active transaction") — so the flush gets its OWN short-lived connection + transaction as the
 		// opener. Local paths need no secrets; SQL Server / DAX ignore the opener entirely.
+		//
+		// ⚠ THE SESSION IS THE USER'S CONTEXT, NOT THE FLUSH CONNECTION'S — this is the one place where the
+		// opener and the settings session can differ, and it is why the session is a parameter rather than
+		// something the managed side derives from the opener. The settings that govern a flush-time write
+		// (delta_write_options, copy_into_staging, the parquet tuning) were SET on the user's connection;
+		// keying them by the flush connection would resolve against one that has set nothing.
+		//
+		// ⚠ REASONED, NOT MEASURED — say so rather than implying a gate exists. Passing the flush
+		// connection's key here instead is a mutant that SURVIVES every shape that could be constructed for
+		// it: the eager-write buffer and the transaction hoist moved essentially every tuning-sensitive
+		// write to STATEMENT time, where the session is trivially correct. Even the one branch that still
+		// retains batches until COMMIT (identity/iceberg, or a pending ALTER) resolved correctly under the
+		// mutant. So this is correct-by-construction insurance against a write moving back onto the flush
+		// path, not a fix for an observed defect — and `verify_setting_scope` §5 pins the flush path's write
+		// tuning WITHOUT being able to distinguish which session supplied it.
 		Connection flush_conn(db.GetDatabase());
 		flush_conn.BeginTransaction();
-		fabricator::SetActiveOpener(reinterpret_cast<FabricatorHandle>(flush_conn.context.get()));
+		const int64_t user_session = fabricator::SessionKeyFor(&context);
+		fabricator::SetActiveOpener(reinterpret_cast<FabricatorHandle>(flush_conn.context.get()), user_session);
 		try {
 			fabricator::CommitTransaction(handle_);
 		} catch (...) {
-			fabricator::SetActiveOpener(reinterpret_cast<FabricatorHandle>(&context));
+			fabricator::SetActiveOpener(reinterpret_cast<FabricatorHandle>(&context), user_session);
 			flush_conn.Rollback();
 			throw;
 		}
 		// The flush connection was only an opener (secret lookups + FS IO) — nothing of its own to commit.
-		fabricator::SetActiveOpener(reinterpret_cast<FabricatorHandle>(&context));
+		fabricator::SetActiveOpener(reinterpret_cast<FabricatorHandle>(&context), user_session);
 		flush_conn.Rollback();
 	} catch (std::exception &ex) {
 		return ErrorData(ex);
@@ -79,6 +95,17 @@ ErrorData FabricatorTransactionManager::CommitTransaction(ClientContext &context
 
 void FabricatorTransactionManager::RollbackTransaction(Transaction &transaction) {
 	auto txn_id = transaction.Cast<FabricatorTransaction>().txn_id_;
+	// ⚠ BOTH of these must be read BEFORE the erase: `transactions` OWNS the FabricatorTransaction
+	// (unique_ptr), so erasing DESTROYS it and every later use of `transaction` is a use-after-free. That is
+	// why txn_id was already hoisted; the settings session has to come along for the same reason.
+	// `Transaction::context` is DuckDB's weak_ptr to the connection that opened the transaction — the one
+	// whose session-scoped settings govern this rollback. A connection already torn down yields 0, i.e. the
+	// global layer: the safe fallback, since a discard reads no write tuning today and resolving against the
+	// WRONG session would be worse than resolving against none.
+	int64_t user_session = 0;
+	if (auto originating = transaction.context.lock()) {
+		user_session = fabricator::SessionKeyFor(originating.get());
+	}
 	{
 		lock_guard<mutex> lock(transaction_lock);
 		transactions.erase(transaction);
@@ -94,20 +121,22 @@ void FabricatorTransactionManager::RollbackTransaction(Transaction &transaction)
 		// requires an ACTIVE transaction. The caller's is already gone by the time TransactionManager gets
 		// here — and unlike CommitTransaction, this override is handed NO ClientContext at all, so there is
 		// nothing to restore to afterwards and the opener is cleared to 0 instead of left dangling.
+		// (`user_session` — the originating connection's settings scope — was captured above, before the
+		// erase destroyed the transaction.)
 		Connection rollback_conn(db.GetDatabase());
 		rollback_conn.BeginTransaction();
-		fabricator::SetActiveOpener(reinterpret_cast<FabricatorHandle>(rollback_conn.context.get()));
+		fabricator::SetActiveOpener(reinterpret_cast<FabricatorHandle>(rollback_conn.context.get()), user_session);
 		try {
 			fabricator::RollbackTransaction(handle_);
 		} catch (...) {
 		}
 		// Clear BEFORE the connection dies: a handle to a destroyed context is the very hazard above.
-		fabricator::SetActiveOpener(0);
+		fabricator::SetActiveOpener(0, 0);
 		rollback_conn.Rollback();
 	} catch (...) {
 		// best-effort: never throw out of rollback
 		try {
-			fabricator::SetActiveOpener(0);
+			fabricator::SetActiveOpener(0, 0);
 		} catch (...) {
 		}
 	}

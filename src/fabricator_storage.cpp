@@ -208,6 +208,15 @@ static unique_ptr<Catalog> FabricatorAttach(optional_ptr<StorageExtensionInfo> s
 	// wrap the underlying driver/network error so the cause is clear (and so a later
 	// catalog query is never the first place a bad connection surfaces).
 	try {
+		// ⚠ NO SetActiveOpener HERE, AND THAT IS CHECKED RATHER THAN ASSUMED (ABI v69). It looks like the
+		// settings session ought to be established before open_catalog — `mssql_mars` is resolved once, for
+		// the catalog's life, and a fresh connection's `SET mssql_mars='false'; ATTACH …` would silently
+		// produce a MARS-ON catalog if the resolution read the wrong session. It does not: `OpenCatalog`
+		// only CONSTRUCTS the catalog (no connect, no EnsureProfile), and the metadata calls that follow
+		// establish the session themselves via FabricatorSetActiveTxn. MEASURED with a mutant — adding the
+		// call changes nothing, `mars_enabled` is `false` either way (verify_mars_off_same_catalog §0).
+		// The gap was inferred from this file not containing the call, without checking whether a CALLEE
+		// made it — the backwards-reasoning error this project keeps re-learning.
 		// The provider-owned options (schema_filter / table_filter / isolation_level / …) ride options_json
 		// into the managed side; a bad filter regex now surfaces here as the managed open error.
 		auto handle = fabricator::OpenCatalog(connection_string, provider, options_json);

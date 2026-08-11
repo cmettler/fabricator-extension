@@ -47,6 +47,12 @@ internal sealed class BulkSession
             FullMode = BoundedChannelFullMode.Wait,
         });
         var reader = _channel.Reader;
+        // Captured HERE, on the host's calling thread, where the ambient is still live — the consumer runs on
+        // a pool thread that inherits nothing. Unlike the txn id and the opener it is not an argument of
+        // begin_bulk: the host set it via set_active_opener immediately before this call, and reading it here
+        // is what makes a session-scoped write setting (delta_write_options, copy_into_staging, the parquet
+        // tuning) reach the load that a SET in this connection was meant to configure.
+        long session = ProviderSettingsStore.CurrentSession;
         _consumer = Task.Run(() =>
         {
             // Re-establish the per-thread ambients on the consumer thread (it's a different thread than
@@ -55,6 +61,7 @@ internal sealed class BulkSession
             // through DuckDB's FileSystem). The opener's ClientContext stays valid until complete_bulk returns.
             AmbientTransaction.Current = txnId;
             AmbientOpener.Current = opener;
+            ProviderSettingsStore.CurrentSession = session;
             try
             {
                 // ⚠ WAIT FOR THE FIRST BATCH (or end-of-stream) BEFORE TOUCHING THE BACKEND. `BulkInsert`

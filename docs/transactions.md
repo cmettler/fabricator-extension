@@ -1033,6 +1033,26 @@ Fabric with nothing set, and row 1 is the shipped configuration on box.
 - **scans may OVERLAP** — two scans of ONE statement can run concurrently (they are on different pooled
   connections) rather than being serialised onto one.
 
+**⚠ THE TWO-CATALOG ESCAPE HATCH — attach the TARGET as a second catalog and the scan is never marked at
+all.** `MarkSinkOnOwnScans` matches bind-data type **plus catalog identity**, so a scan of catalog A feeding a
+sink in catalog B is not marked: it streams, on catalog B's own connections, and no drain/collision question
+arises. It costs nothing and works today, so it is worth knowing — the duckdb-mysql community suggests the
+same shape.
+
+⚠ But it is an ESCAPE HATCH, not a design to build on, and the costs are real:
+- **No cross-catalog atomicity or read-your-writes** — two catalogs are two server transactions. The same
+  trade as `materialize=false`, paid in configuration instead of a setting.
+- **Two connection pools per database**, multiplied by `dbt --threads N`.
+- **⚠ MEASURED FOOTGUN: two attaches of ONE database each keep their OWN catalog cache**, so a table created
+  through the first is invisible to a cache the second populated earlier. That is not theoretical — it made
+  `verify_read_isolation` alternate pass/fail until its ATTACH order was fixed, and read-from-A/write-to-B is
+  exactly the shape that trips it.
+- ⚠ **The premise may not hold for the provider it came from.** `MaterializePostgresScans` /
+  `MaterializeMySQLScans` match the function NAME, so they materialise every scan of their type INCLUDING one
+  from a different attached database — under which the trick would not dodge materialisation there at all.
+  Ours works only because our matching is stricter. Unverified against their source; do not repeat the claim
+  about mysql without checking.
+
 **⚠ NOTHING IN THIS TABLE BUYS CROSS-STATEMENT STABILITY** — that is `mssql_read_isolation`'s job alone (§5.8),
 and row 7 shows it cannot be combined with a same-catalog write today. So a dbt model that must both write and
 read a stable view across several statements has no configuration here that delivers both.
@@ -1105,9 +1125,19 @@ the MARS-off shape specifically, not by general breakage). ⚠ Its §1 MARS-ON c
 without it §2–§4 would pass equally if same-catalog read+write had stopped working entirely, and it is what
 pins that read-your-writes is still there where MARS exists.
 
-⚠ **`SET mssql_mars` MUST PRECEDE THE ATTACH** — the value is resolved once, when the catalog first connects.
-Writing the gate with the SET after the ATTACH silently produced a MARS-ON catalog and a vacuously passing
-§2/§4; that ordering is now part of the suite.
+⚠ **`SET mssql_mars` USED TO HAVE TO PRECEDE THE ATTACH** — the value was resolved once, when the catalog
+first connected, so a later SET was a silent no-op. Writing the gate with the SET after the ATTACH produced
+a MARS-ON catalog and a vacuously passing §2/§4. **No longer true since change B (2026-08-11): the mode is
+resolved PER CONNECTION at open time**, from the opening session, so a SET applies to connections opened
+after it and two DuckDB connections on one attached catalog can differ. A transaction's pinned connection
+keeps the mode it was opened with. Gate `verify_mars_dynamic` (44, service tier).
+
+⚠ **A `SET` therefore cannot give two CATALOGS different modes any more** — it covers the whole DuckDB
+connection, so the last value set governs every catalog attached in it. That is what the per-catalog **`mars`
+ATTACH option** is for (`SET ?? ATTACH option ?? auto`), and `verify_mars_off_same_catalog` now uses it with
+no `SET` at all. The regression was caught by that suite's §0, which asserts each catalog's resolved mode via
+`fabricator_server_info`'s `mars_enabled` rather than assuming it: written the old way, its `m_on` "MARS ON
+control" was silently running with MARS off.
 
 **⚠ MARS IS THE WHOLE STORY: A PINNED SCAN FEEDING A SAME-CATALOG BULK WRITE IS BROKEN WHENEVER MARS IS
 OFF — ON ANY ENGINE.** The bulk's consumer task calls `WriteToServer` as soon as it starts, so the scan's

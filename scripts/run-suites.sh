@@ -126,7 +126,11 @@ case "$TIER" in
         # FLUSH. It is the one suite the runner gives a forced env var (see the case below), because the
         # grouping's threshold is 64 MiB of Arrow data and nothing else here comes near it Ã¢ÂÂ without this
         # suite the grouped path has NO coverage at all, at either tier.
-        : "${MIN_SUITES:=67}"
+        # 68 runs since 2026-08-11: verify_setting_scope (30) pins that provider settings honour DuckDB's
+        # SetScope (ABI v69) — a `SET` in one connection must not reach another. Before v69 that leak was a
+        # DATA bug, not a config wart: `SET mssql_mars='false'` in one connection changed the row count a
+        # CTAS in ANOTHER connection produced (10 vs 15).
+        : "${MIN_SUITES:=68}"
         # 5656 since 2026-08-02: verify_delta_catalog_transactions 943 -> 944 Ã¢ÂÂ ROLLBACK now RECLAIMS the
         # data files the transaction eagerly wrote (EW #52's DiscardDataFilesAsync) instead of leaving them
         # for VACUUM. +2, not +1: that suite is one of the DOUBLED ones below, so an assertion added to it
@@ -238,7 +242,8 @@ case "$TIER" in
         # (onlyAddFiles && !dependsOnFiles), so `INSERT INTO t SELECT ... FROM t` is NOT blind despite
         # emitting only AddFiles — the dbt anti-join shape, where a wrong `true` makes another engine skip a
         # check it owes. Mutation-tested by claiming blind regardless of reads; dies at exactly that row.
-        : "${MIN_ASSERTIONS:=6891}"
+        # 6921 since 2026-08-11: verify_setting_scope (+30) — see the MIN_SUITES note above.
+        : "${MIN_ASSERTIONS:=6921}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh
@@ -256,7 +261,10 @@ case "$TIER" in
         # DuckDB transaction, so successive statements share one view). Service-only: it needs a real SQL
         # Server, and its load-bearing observable is a REFUSAL that only exists against one (with MARS off,
         # a self-written table is unreadable unless the read joined the transaction).
-        : "${MIN_SUITES:=49}"
+        # 50 runs since 2026-08-11: verify_mars_dynamic (44) pins that `mssql_mars` is resolved PER
+        # CONNECTION at open time rather than once per catalog — so a `SET` after the ATTACH takes effect,
+        # and two DuckDB connections sharing ONE attached catalog can use different modes.
+        : "${MIN_SUITES:=50}"
         # 1424 since 2026-08-01: verify_exec_invalidate_cache 10 -> 21, for the OUT-OF-BAND DROP path Ã¢ÂÂ the
         # catalog's self-heal, documented in CLAUDE.md and until now covered by NOTHING. The service tier ran
         # 44/44 green while that path was broken, which is why the section exists. It must run with
@@ -316,7 +324,11 @@ case "$TIER" in
         # 1837 since 2026-08-10: verify_mssql_s3_polybase 252 -> 263 — an INSERT ... SELECT into an EXTERNAL
         # table from the same catalog, the shape whose scan the host marks. Every earlier external INSERT in
         # that suite is INSERT ... VALUES, which has no scan, so the mark was entirely uncovered there.
-        : "${MIN_ASSERTIONS:=1957}"
+        # 1961 since 2026-08-11: verify_mars_off_same_catalog 96 -> 98 (a §0 that asserts the SET actually
+        # reached each catalog, via the new fabricator_server_info `mars_enabled` row — every other section
+        # of that suite passes VACUOUSLY on a MARS-ON catalog, and nothing in SQL could tell before).
+        # 2005 since 2026-08-11: verify_mars_dynamic (+44) — see the MIN_SUITES note above.
+        : "${MIN_ASSERTIONS:=2005}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

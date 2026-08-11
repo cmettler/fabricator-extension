@@ -34,20 +34,53 @@ require-env MSSQL_TESTDB_DSN
 # SNAPSHOT — so it never shares the connection with the load. The cost is read-your-writes on the
 # scanned table, accepted deliberately for a bulk path and pinned in §4.
 
-# ⚠ `SET mssql_mars` MUST PRECEDE THE ATTACH — the value is resolved once, when the catalog first
-# connects, and a later SET does not reach an existing attach. Writing this test with the SET after the
-# ATTACH silently produced a MARS-ON catalog and a vacuously passing §2/§4.
+# ⚠ THE MODE IS A PER-CATALOG **ATTACH OPTION** HERE, AND IT HAS TO BE — a `SET` cannot express this suite
+# any more. Until 2026-08-11 MARS was frozen per catalog at its first connect, so `SET` before each ATTACH
+# was how you got two catalogs on different modes; now it is resolved PER CONNECTION from the session
+# (`verify_mars_dynamic`), under which those two attaches would be IDENTICAL and whichever value the session
+# held last would govern both. Written the old way, this suite's §1 "MARS ON control" silently ran with MARS
+# OFF — caught by §0, which is exactly what that section exists for.
+#
+# The `mars` ATTACH option was added with that change to keep the per-catalog form expressible. No `SET`
+# appears in this suite: a SET outranks the option (as it does for materialize / read_isolation), so one
+# would flatten both catalogs again.
 statement ok
-SET mssql_mars='auto';
+ATTACH '${MSSQL_TESTDB_DSN}' AS m_on (TYPE fabricator, mars 'auto');
 
 statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS m_on (TYPE fabricator);
+ATTACH '${MSSQL_TESTDB_DSN}' AS m_off (TYPE fabricator, mars 'false');
 
-statement ok
-SET mssql_mars='false';
+# ═════════════════════════════════════════════════════════════════════════════════════════════════
+# §0  THE SETTING ACTUALLY REACHED EACH CATALOG — the assertion this suite spent its life without.
+# ═════════════════════════════════════════════════════════════════════════════════════════════════
+#
+# ⚠ EVERY SECTION BELOW CAN PASS VACUOUSLY IF `SET mssql_mars='false'` DID NOT REACH `m_off`, because a
+# MARS-ON catalog satisfies the "it works" assertions too — the header above already warns that writing the
+# SET/ATTACH order wrong "silently produced a MARS-ON catalog and a vacuously passing suite", and until
+# `mars_enabled` was added to fabricator_server_info() there was NO observable that could tell.
+#
+# It matters more since ABI v69 made settings SESSION-scoped, because "did my SET reach this catalog?" now
+# has a second way to go wrong (the wrong session, not just the wrong order). ⚠ It does NOT today —
+# `open_catalog` merely constructs the catalog, and the metadata calls that follow establish the session
+# themselves — but that was established with a mutant rather than assumed, and this section is what would
+# catch it changing.
+#
+# `supports_mars` is the SERVER's capability and stays true on box for both — which is exactly why it
+# cannot serve as this check, and why the pair is asserted together.
 
-statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS m_off (TYPE fabricator);
+query TT
+SELECT property, value FROM fabricator_server_info('m_on')
+WHERE property IN ('supports_mars', 'mars_enabled') ORDER BY property;
+----
+mars_enabled	true
+supports_mars	true
+
+query TT
+SELECT property, value FROM fabricator_server_info('m_off')
+WHERE property IN ('supports_mars', 'mars_enabled') ORDER BY property;
+----
+mars_enabled	false
+supports_mars	true
 
 # ═════════════════════════════════════════════════════════════════════════════════════════════════
 # §1  MARS ON — the shipped box behaviour. POSITIVE CONTROL for everything below.
@@ -214,11 +247,10 @@ SELECT count(*) FROM m_off.dbo.mf_ryw;
 # Fabric, where the default is always false, `read_isolation` would have been unusable outright.
 # A DEFAULT IS NOT A REQUEST — the check now tests what the user supplied, not what resolved.
 
+# ⚠ `mars 'false'` as an ATTACH option, NOT a SET: a SET would apply to m_on and m_off as well (it outranks
+# the option and is not per catalog), which would undo §1's control and every assertion that rests on it.
 statement ok
-SET mssql_mars='false';
-
-statement ok
-ATTACH '${MSSQL_TESTDB_DSN}' AS r_iso (TYPE fabricator, read_isolation 'snapshot');
+ATTACH '${MSSQL_TESTDB_DSN}' AS r_iso (TYPE fabricator, read_isolation 'snapshot', mars 'false');
 
 statement ok
 CREATE OR REPLACE TABLE r_iso.dbo.ri_src AS SELECT i AS a FROM range(200) t(i);

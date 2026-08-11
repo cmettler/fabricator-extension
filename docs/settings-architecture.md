@@ -123,12 +123,176 @@ lazy registration → `SET` before first use fails with "unknown setting" — wo
 
 ### 5.2 Catalog/provider scope vs session-local
 
+> **⚠ SUPERSEDED 2026-08-11 — BUILT as ABI v69. The recommendation below ("accept it") was WRONG, and the
+> deferred alternative it names in its last sentence is exactly what shipped. Kept verbatim because the
+> shape of the error is the reusable part: the trade-off was assessed as a *configuration ergonomics*
+> question, and it was a *correctness* one. See §5.3.**
+
 Today the value is read from the *operation's* `ClientContext`, so `SET SESSION` is honored per-connection.
 The push model makes provider settings effectively global (per-provider, with per-catalog ATTACH overrides).
 For connection *configuration* (isolation, varchar length, MARS mode) that is fine and arguably more
 intuitive — but it is a real semantic change. **Recommended: accept it** for config settings. If true
 session-local is ever needed, key the `SettingsStore` by a session token pushed with each operation
 (deferred — adds the per-operation threading this design avoids).
+
+### 5.3 Scoped settings — BUILT (ABI v69, 2026-08-11)
+
+**The measurement that settled it.** `SET mssql_mars='false'` in DuckDB connection A made a same-catalog
+CTAS in connection B — which set nothing — return **10** rows instead of **15**; the control (same script,
+no `SET`) returned 15. A setting applied in one connection changed the **data another connection saw**. So
+this was never "config ergonomics": §5.2's own example list (*"isolation, varchar length, MARS mode"*) names
+MARS, and MARS is precisely the one whose leak changes an answer, because it selects the scan's connection
+routing and thus whether a write is visible to a later read.
+
+**The practical consequence that motivated the fix**: configuring ONE dbt model via a pre-hook could not
+work. The value leaks to models building concurrently on other threads, and with no scoping at all it also
+persists to every later model even at `--threads 1`.
+
+**What DuckDB was already doing.** Extension options registered with `AddExtensionOption` default to
+`SetScope::SESSION`, and DuckDB stores the value per-connection in `client_config.user_settings`. So an
+unqualified `SET` was *already* session-scoped on DuckDB's side; only our push was process-wide, because the
+trampoline's signature is `(ClientContext &, SetScope, Value &)` and we discarded the first two arguments.
+
+**The design.**
+
+| layer | key | written by |
+|---|---|---|
+| session | the setting connection's `ClientContext` address (`fabricator::SessionKeyFor`) | an unqualified `SET` (AUTOMATIC → SESSION) |
+| global | `0` | `SET GLOBAL`, and every registration default |
+
+`ProviderSettingsStore.GetString` resolves **session ?? global**, and the typed getters go through it so
+they cannot diverge. The read path learns the session from `ProviderSettingsStore.CurrentSession`, an
+`AsyncLocal<long>` mirroring `AmbientOpener`.
+
+**⚠ The session is NOT the host-FS opener, and that is why it is a separate ABI parameter rather than
+something the managed side derives.** They are set at the same moments (so `set_active_opener` carries both,
+which is what stops them drifting), but the commit flush and the rollback deliberately open their *own*
+short-lived connection and pass ITS context as the opener — the user's transaction is already ending and the
+secret manager needs an active one. Keying settings off that connection would resolve a flush-time write
+against a connection that has set nothing.
+
+- ⚠ **That separation is REASONED, NOT MEASURED.** Deriving the session from the flush connection is a
+  mutant that **survives** every shape that could be constructed for it: the eager-write buffer and the
+  transaction hoist moved essentially every tuning-sensitive write to STATEMENT time, where the session is
+  trivially correct — a buffered `INSERT`, a `CREATE OR REPLACE … AS SELECT` inside `BEGIN`/`COMMIT`, and
+  even a CDF table's `_change_data` files were all measured correct under the mutant. Treat it as
+  correct-by-construction insurance against a write moving back onto the flush path, not as a fix for an
+  observed defect.
+- ⚠ **The rollback's session must be read BEFORE `transactions.erase()`** — that map OWNS the
+  `FabricatorTransaction`, so erasing destroys it and any later use of the reference is a use-after-free.
+  It comes from `Transaction::context`, DuckDB's `weak_ptr` to the originating connection; a connection
+  already torn down yields 0 (the global layer), which is the safe fallback.
+
+**⚠ Lifetime is correctness, not housekeeping.** The session key is a `ClientContext` **address**, so an
+entry left behind can be inherited by a later connection the allocator happens to place at the same address
+— a silent wrong answer surfacing only under connection churn (a dbt run), where it is hardest to attribute.
+A `FabricatorSessionSettingsState : ClientContextState` is registered on the context at the first
+session-scoped `SET` (lazily, so a connection that never sets anything costs nothing); a
+`ClientContextState` is held for the context's whole life, so its **destructor** is the connection-close
+signal — there is no explicit close callback to hook. It calls `clear_session_settings`.
+
+**⚠ `RESET` at session scope LATCHES "unset" — it does not fall back to the global value.** MEASURED with
+DuckDB's own vocabulary: after `RESET delta_write_options`, `current_setting('delta_write_options')` reports
+NULL, and it *still* reports NULL after a subsequent `SET GLOBAL … = gzip` in the same connection. That is
+DuckDB's behaviour (`PhysicalReset::ResetExtensionVariable` stores the option's DEFAULT as the connection's
+own value), so we match it deliberately — which keeps our resolution and `current_setting`'s answer in
+agreement, the property that matters when a user diagnoses a write by reading the setting back.
+
+**⚠ `SET` and `RESET` hand the callback the scope DIFFERENTLY.** `PhysicalSet::SetExtensionVariable` calls
+it with the RAW scope and resolves `AUTOMATIC` *afterwards*; `PhysicalReset::ResetExtensionVariable`
+resolves it *before* calling. So the trampoline must resolve `AUTOMATIC` itself, and to the same value
+DuckDB will — hence `FABRICATOR_SETTING_DEFAULT_SCOPE`, passed explicitly to `AddExtensionOption` as well
+so the two readings come from one constant.
+
+**Gates.** `test/verify_setting_scope.test` (**30**, hermetic) pins it with `delta_write_options`
+compression as the observable — the setting's effect is written into the parquet files, so it is read back
+with `parquet_metadata` rather than inferred. Mutation-tested: restoring the pre-v69 behaviour (discard the
+scope, always write the global layer) kills it at exactly the §1 assertion, with the symptom the leak
+produces (ZSTD where SNAPPY is expected). Tier-0 `ProviderSettingsScopeTests` adds 9 offline cases over the
+store's layering. ⚠ The §1 **positive control** is load-bearing: without it the "con_b writes SNAPPY"
+assertion would pass equally if the setting had stopped working, or stopped reaching the writer, entirely.
+
+**⚠ Found while gating it, and NOT fixed here:** on `native_write`, a flush-path parked-batch write comes
+out SNAPPY regardless of `delta_write_options` — the write spec does not reach DuckDB's COPY on the FLUSH
+path specifically (the statement-time native writes DO honour it). Measured on the one shape that still
+retains batches until COMMIT (an IDENTITY table's buffered INSERT): codec engine ZSTD, native engine SNAPPY.
+It is a pre-existing gap in the same family as the write-options plumbing items in `CLAUDE.md`, unrelated to
+scoping, and is why §5 of the gate is pinned on the codec engine.
+
+**⚠ A GAP I "FOUND" IN THE ATTACH PATH DID NOT EXIST, and the mutant is what settled it.** `mssql_mars` is
+resolved once per catalog and `fabricator_storage.cpp` establishes no session before `open_catalog`, so a
+fresh connection's `SET mssql_mars='false'; ATTACH …` looked like it would read the GLOBAL layer and
+silently produce a MARS-ON catalog. It does not: `OpenCatalog` merely CONSTRUCTS the catalog (no connect, no
+`EnsureProfile`), and the metadata calls that follow establish the session themselves via
+`FabricatorSetActiveTxn`. Adding the call changed nothing — `mars_enabled` is `false` either way. **The
+error was inferring a gap from one FILE not containing a call, without checking whether a CALLEE made it**
+— the same backwards-reasoning this project has recorded before. The fix was reverted; what survives is the
+observable it needed:
+
+- **`fabricator_server_info()` gained `mars_enabled`** — the value THIS catalog resolved, beside the
+  server's `supports_mars` capability. Until now nothing in SQL could distinguish them, which is precisely
+  why `verify_mars_off_same_catalog` could pass vacuously (its own header warns that a wrong SET/ATTACH
+  order "silently produced a MARS-ON catalog and a vacuously passing suite" — with no assertion able to
+  tell). That suite's new §0 asserts the pair for both catalogs; `verify_server_profile`'s property count
+  goes 14 → 15.
+
+### 5.4 Per-connection MARS — BUILT (change B, 2026-08-11, C#-only)
+
+`mssql_mars` was the **last setting still baked at first connect**; every other one is already read at use
+time, which is what made §5.3 sufficient for them and made this a one-setting job.
+
+Two things were wrong, and the second is the one that mattered:
+
+1. A `SET mssql_mars` after the ATTACH was a **silent no-op** — the README had to say "set it before
+   ATTACH", and nothing could show you that you had failed to.
+2. **An ATTACH is DATABASE-level**, so one `SqlServerCatalog` is shared by every DuckDB connection — even a
+   correctly-ordered SET applied to all of them.
+
+`EnsureProfile` still detects the SERVER profile once (it describes the server) but now builds **both**
+connection strings; `OpenConnection` picks per open from `EffectiveMars()`, which reads the current session.
+Two stable strings rather than one rebuilt per open, because **SqlClient pools by connection string** — a
+pair gives two pools, not a pool per open.
+
+**⚠ The routing must ask about the connection in play, not about the session.** `TxnState.MarsEnabled`
+records what the PINNED connection was opened with, and the routing/self-block sites read it (`TxnMars()`);
+"may this scan reuse the pinned connection?" is a question about that connection. A fresh resolve could send
+a scan onto a no-MARS pinned connection — limitation 1.15's unbounded hang, not an error.
+
+- ⚠ **Defensive, not gated.** The mutant SURVIVES, necessarily: a DuckDB transaction belongs to ONE
+  connection, so the answers differ only if that session changes `mssql_mars` between pinning and the scan
+  — meaningless as a request, and its failure mode is a hang, so a gate would be a test that hangs rather
+  than fails.
+
+`fabricator_server_info`'s `mars_enabled` is now **session-dependent** — two connections on one catalog can
+report different values, which is the feature. An invalid value is refused at the first statement that opens
+a connection rather than at ATTACH, because validation lives where the value is resolved and that moved.
+
+**⚠ It removed a capability, and the gate caught it — a new `mars` ATTACH option restores it.** Freezing the
+mode per catalog was what made `SET; ATTACH; SET; ATTACH` produce two catalogs on different modes. Under a
+session-scoped resolve those two attaches are identical, and whichever value the session holds last governs
+both: `verify_mars_off_same_catalog` §0 failed because its `m_on` "MARS ON control" was silently running
+with MARS off. So the per-catalog form is now explicit —
+`ATTACH … (TYPE fabricator, mars 'auto'|'true'|'false')`, precedence `SET ?? ATTACH option ?? auto`, the
+same shape as every other behaviour option here.
+
+> **A capability that exists only as a side effect of caching disappears when you fix the caching, and
+> nothing about the change announces it.** This was visible only because §0 had been added hours earlier for
+> an unrelated reason (the vacuous-pass hole). A suite that merely "still passes" would have hidden it.
+
+**Gate** `test/verify_mars_dynamic.test` (**44**, service tier), mutation-tested: re-introducing the
+per-catalog cache kills it at §1's post-ATTACH SET. §3 is the load-bearing section — a true A/B where two
+sessions on ONE attached catalog run byte-identical statements and differ only in `mssql_mars`, giving
+**400** (MARS on ⇒ drained onto the pinned connection ⇒ read-your-writes) vs **200** (MARS off ⇒ pooled at
+SNAPSHOT ⇒ committed state only). Without it the suite would pin a reporting string while connections kept
+using a cached mode.
+
+**⚠ Scoping is necessary, not sufficient, for per-model configuration.**
+[consumption-monitoring.md](consumption-monitoring.md) §2.4c measured **3 distinct connections serving 4
+models** — dbt-duckdb reuses connections, so a pre-hook's `SET` persists to the next model on that
+connection. A+B remove the CONCURRENT leak and the permanent one; a genuinely per-model setting also needs a
+post-hook `RESET`. Making MARS a
+per-connection decision is a separate change (B), deliberately sequenced *after* this one: doing it first
+would have upgraded today's harmless no-op into a live cross-model leak.
 
 ## 6. ABI impact (a net simplification)
 

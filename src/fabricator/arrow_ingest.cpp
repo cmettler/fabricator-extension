@@ -183,7 +183,7 @@ void PopulateReturnSchema(ClientContext &context, ArrowStreamBindData &bind_data
 	// request (no projection/filter) => the provider reports the full column set.
 	// Set the active host-FS opener (this context) so a global host-FS table function (a lakehouse reader)
 	// can resolve DuckDB secrets while reading its schema; SQL/compute factories ignore it.
-	SetActiveOpener(reinterpret_cast<FabricatorHandle>(&context));
+	SetActiveOpener(reinterpret_cast<FabricatorHandle>(&context), SessionKeyFor(&context));
 	ArrowArrayStream schema_stream {};
 	if (bind_data.schema_factory) {
 		// The bound object can describe itself — ask it instead of executing it. See `schema_factory`.
@@ -900,7 +900,7 @@ unique_ptr<GlobalTableFunctionState> ArrowStreamInitGlobal(ClientContext &contex
 	// Set the active host-FS opener (this execution's context) so a global host-FS table function (a
 	// lakehouse reader) resolves DuckDB secrets while reading its data through the host FileSystem; SQL
 	// scans ignore it. The factory runs synchronously on this thread, so the per-thread ambient governs it.
-	SetActiveOpener(reinterpret_cast<FabricatorHandle>(&context));
+	SetActiveOpener(reinterpret_cast<FabricatorHandle>(&context), SessionKeyFor(&context));
 	bind_data.factory(request, gstate->stream);
 	gstate->stream_initialized = true;
 

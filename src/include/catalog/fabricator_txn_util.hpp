@@ -23,7 +23,7 @@ namespace duckdb {
 // scan init; this helper covers the other connection-using callsites (DML/DDL/exchange/collector).
 inline void FabricatorSetActiveTxn(FabricatorHandle handle, ClientContext &context) {
 	fabricator::SetActiveTxn(handle, (int64_t)MetaTransaction::Get(context).global_transaction_id);
-	fabricator::SetActiveOpener(reinterpret_cast<FabricatorHandle>(&context));
+	fabricator::SetActiveOpener(reinterpret_cast<FabricatorHandle>(&context), fabricator::SessionKeyFor(&context));
 }
 
 } // namespace duckdb

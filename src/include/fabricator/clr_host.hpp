@@ -63,7 +63,23 @@ std::string FsSpike(FabricatorHandle opener, const std::string &path);
 // can resolve DuckDB secrets when reading through the host FileSystem callbacks. The host calls this
 // IMMEDIATELY before each table-function bind + execution (same thread, synchronous); `opener` is valid only
 // for the call it precedes. Best-effort (mirrors SetActiveTxn). See docs/global-functions.md §host-FS.
-void SetActiveOpener(FabricatorHandle opener);
+//
+// `session` records which DuckDB connection's SESSION-SCOPED provider settings apply (see SessionKeyFor).
+// It has NO default on purpose: every call site must answer "whose settings?", because the two sites where
+// the answer differs from the opener — the commit flush and the rollback, which open their own connection —
+// are exactly the ones that would otherwise resolve a write against a connection that has set nothing.
+void SetActiveOpener(FabricatorHandle opener, int64_t session);
+
+// The SESSION KEY for provider settings: the address of a DuckDB ClientContext, i.e. ONE KEY PER DuckDB
+// CONNECTION (a Connection owns its context for its whole life, so the key is stable across that
+// connection's statements and unique while it lives). 0 means "no session" and resolves to the GLOBAL layer.
+//
+// ⚠ It is an ADDRESS, so it is only meaningful while that connection is alive — which is why the managed
+// store must be told when one closes, or a later connection landing on the same address would inherit a dead
+// one's settings.
+inline int64_t SessionKeyFor(const void *client_context) {
+	return static_cast<int64_t>(reinterpret_cast<uintptr_t>(client_context));
+}
 
 // Ambient named-source registry (data-in by name). OpenNamedInput fills `out` with a fresh Arrow stream for
 // the registered source `name` (throws if none); NamedInputExists reports whether a source is registered
@@ -182,9 +198,15 @@ void GetMetadata(FabricatorHandle handle, int32_t kind, const std::string &arg1,
 // Provider-declared settings (see docs/settings-architecture.md). ListSettings fills `out` with ALL
 // registered providers' declared settings (six string columns: provider, name, type, default, description,
 // min); the host registers each as a DuckDB extension option at load. SetSetting pushes a setting's value
-// (nullptr => unset) into the managed ProviderSettingsStore.
+// (nullptr => unset) into the managed ProviderSettingsStore, at `session` scope (0 = global; see
+// SessionKeyFor).
 void ListSettings(ArrowArrayStream &out);
-void SetSetting(const std::string &provider, const std::string &name, const char *value);
+void SetSetting(const std::string &provider, const std::string &name, const char *value, int64_t session);
+
+// Drops every session-scoped setting for `session` — called when the owning DuckDB connection closes, so a
+// later connection reusing that ADDRESS cannot inherit a dead one's settings. Best-effort and never throws:
+// it runs from a destructor.
+void ClearSessionSettings(int64_t session) noexcept;
 
 // Load-time global (connection-free) functions (see docs/global-functions.md). Fills `out` with the
 // provider-union of global functions (metadata columns: name, kind, param_count, return_type); the host

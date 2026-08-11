@@ -38,9 +38,10 @@ table_type='DELTA') AS …` writes the data + auto-provisions the external table
 has no native equivalent for (it cannot INSERT into an S3 external table, and cannot write Delta at all).
 See [SQL Server external tables on S3](#sql-server-external-tables-on-s3).
 
-> Project knowledge & build notes for contributors live in [`CLAUDE.md`](CLAUDE.md), the full
-> warehouse design in [`docs/warehouse-support.md`](docs/warehouse-support.md), and the Delta catalog
-> design in [`docs/delta-catalog.md`](docs/delta-catalog.md).
+> Design notes live under [`docs/`](docs/) — the full warehouse design in
+> [`docs/warehouse-support.md`](docs/warehouse-support.md), the Delta catalog design in
+> [`docs/delta-catalog.md`](docs/delta-catalog.md), and what does *not* work (measured) in
+> [`docs/known-limitations.md`](docs/known-limitations.md).
 
 ## Feature Status
 
@@ -225,6 +226,11 @@ ATTACH 'Server=...;Database=...' AS mssql
 -- Per-catalog opt-out of buffering a scan of the catalog being written (see mssql_materialize).
 -- Keeps INSERT INTO t SELECT ... FROM t STREAMING; needs ALLOW_SNAPSHOT_ISOLATION on the database.
 ATTACH 'Server=...;Database=...' AS mssql (TYPE fabricator, materialize false);
+
+-- Per-catalog MARS mode: auto (default, the engine's capability) | true | false.
+-- Use this rather than SET mssql_mars when two catalogs must differ — a SET applies to the whole
+-- DuckDB connection, so it would govern every catalog attached in it.
+ATTACH 'Server=...;Database=...' AS mssql (TYPE fabricator, mars 'false');
 ```
 
 On a **Fabric** SQL endpoint the catalog also gains a `fabric` schema of platform functions, which need no
@@ -300,7 +306,8 @@ ATTACH '' AS wh (TYPE fabricator, SECRET fab);
 
 SELECT property, value FROM fabricator_server_info('wh');
 -- engine_edition=11, supports_mars=false, has_nvarchar=false, has_datetimeoffset=false,
--- max_datetime2_scale=6, is_utf8_collation=true, is_binary_collation=true, default_write_isolation=snapshot
+-- max_datetime2_scale=6, is_utf8_collation=true, is_binary_collation=true, default_write_isolation=snapshot,
+-- mars_enabled=false
 ```
 
 What the profile drives automatically:
@@ -717,6 +724,16 @@ The detected server capability profile for an attached catalog (edition, version
 derived flags: `supports_mars`, `has_nvarchar`, `has_datetimeoffset`, `max_datetime2_scale`,
 `has_native_json`, `is_utf8_collation`, `is_binary_collation`, `default_write_isolation`, …). See
 [Microsoft Fabric & Synapse](#microsoft-fabric--synapse-warehouse).
+
+Plus one row that is **not** a server property: **`mars_enabled`** — whether *this catalog* actually uses
+MARS, i.e. `supports_mars` combined with `mssql_mars` / the `mars` ATTACH option. Since that is resolved
+once, at the catalog's first connection, it is the way to confirm a `SET mssql_mars=…` was in force early
+enough to take effect:
+
+```sql
+SELECT property, value FROM fabricator_server_info('db')
+WHERE property IN ('supports_mars', 'mars_enabled');
+```
 
 ### `db.dbo.fabricator_session_tag(key, value) -> TABLE` (SQL Server / Fabric)
 
@@ -1368,9 +1385,28 @@ extension but are currently no-ops (the C# backend uses `SqlBulkCopy` and SqlCli
 extension's batching/pooling/TDS knobs don't apply). The Delta provider adds the `delta_write_options` JSON
 setting (see [Partitioning & write tuning](#partitioning--write-tuning)).
 
+**Scope.** A plain `SET` applies to the **connection that issues it** and is invisible to other connections
+— so a tool that builds several models in parallel (dbt at `--threads > 1`) can configure one of them
+without affecting the ones running alongside it. Use `SET GLOBAL` to change the value for every connection,
+and `RESET` / `RESET GLOBAL` to undo the respective layer. A session value outranks a global one.
+
+> ⚠ **Per-connection is not the same as per-model.** dbt-duckdb reuses connections across models (measured:
+> 3 connections serving 4 models), so a `SET` in one model's pre-hook stays in force for the next model that
+> happens to run on that connection. If you want a setting to apply to one model only, `RESET` it in a
+> post-hook.
+
+> ⚠ `RESET` does **not** fall back to the global value — it sets *this connection* back to the setting's own
+> default, so a later `SET GLOBAL` will not reach a connection that has reset. (This is DuckDB's behaviour
+> for extension settings, not ours; `SELECT current_setting('<name>')` reports what the connection will
+> actually use.)
+>
+Every `mssql_*` setting is read when it is **used**, so a `SET` applies from the next statement — including
+`mssql_mars`, which is resolved each time a connection is opened. The exception is a connection already in
+use: a transaction's pinned connection keeps the MARS mode it was opened with for that transaction's life.
+
 | Setting | Status | Description |
 |---------|--------|-------------|
-| `mssql_mars` | **Active** | MARS mode: `auto` (default, per engine — off for Fabric/Synapse) \| `true` \| `false`. Resolved once at first connection — set **before** ATTACH. ⚠ Forcing `false` on **box SQL Server**: a scan of a table the open transaction has already written cannot run (it would deadlock against its own transaction) and is **refused with a message naming the remedies** — enable `READ_COMMITTED_SNAPSHOT` on the database, turn MARS back on, or COMMIT first. Reads of other tables are unaffected, as are Fabric/Synapse. See [known-limitations.md](docs/known-limitations.md) 1.15 |
+| `mssql_mars` | **Active** | MARS mode: `auto` (default, per engine — off for Fabric/Synapse) \| `true` \| `false`. Resolved **per connection, when it is opened**, so it applies to connections this catalog opens after the `SET` — no need to set it before `ATTACH`, and two DuckDB connections sharing one attached catalog can use different modes. A transaction's pinned connection keeps the mode it was opened with. Confirm with `SELECT value FROM fabricator_server_info('<cat>') WHERE property = 'mars_enabled'`. Because a `SET` covers the whole DuckDB connection, use the per-catalog **`mars` ATTACH option** when two catalogs must differ (a `SET` outranks it). ⚠ Forcing `false` on **box SQL Server**: a scan of a table the open transaction has already written cannot run (it would deadlock against its own transaction) and is **refused with a message naming the remedies** — enable `READ_COMMITTED_SNAPSHOT` on the database, turn MARS back on, or COMMIT first. Reads of other tables are unaffected, as are Fabric/Synapse. See [known-limitations.md](docs/known-limitations.md) 1.15 |
 | `mssql_materialize` | **Active** | Buffer a scan that reads the **same catalog** a statement writes to, before the write starts. **Defaults to whatever MARS is** — `true` where MARS is available (box, Azure SQL), `false` where it is not (Fabric, Synapse, or `mssql_mars='false'`), because buffering pins the scan onto the write connection and without MARS the scan and the bulk load cannot share it (the statement fails, variously, as `MultipleActiveResultSets`, `already an open DataReader`, or a 30 s timeout that kills the transaction). With it `false` the scan streams from a pooled connection at SNAPSHOT and therefore does **not** see rows the same transaction wrote. Required on MARS engines — without it `INSERT INTO t SELECT … FROM t` fails at scale with `595`; it is also what gives read-your-writes for that scan on Fabric/Synapse. Set `false` to keep it **streaming** instead: needs `ALLOW_SNAPSHOT_ISOLATION` on the database, and the scan then reads a committed snapshot. Overrides the per-catalog `materialize` ATTACH option |
 | `mssql_command_timeout` | **Active** | `SqlCommand.CommandTimeout` (seconds) for scans / DML / bulk; **default `0` = infinite**. Server-enforced per round-trip; overrides the per-catalog `command_timeout` ATTACH option |
 | `mssql_default_varchar_length` | **Active** | Length `n` for created text columns (`NVARCHAR(n)`/`VARCHAR(n)`); unset ⇒ `MAX`. Needed for indexable string keys |
@@ -2387,7 +2423,12 @@ Add `-DOVERRIDE_GIT_DESCRIBE=v1.5.5` if you need the loadable to declare its Duc
 loading into an official DuckDB build (the shallow clone has no tag context, so it otherwise
 reports `v0.0.1` and the official engine rejects it).
 
-(`CLAUDE.md` has the full from-a-fresh-clone quickstart + prerequisites.)
+**Prerequisites**, all needed before the configure step above: **Visual Studio 18** (or its Build Tools) with
+the C++ workload — the toolset this links against; the **.NET SDK 10** (the managed projects target
+`net10.0;net8.0`, and `publish-managed.ps1` needs the 10 SDK); **CMake ≥ 3.21 and Ninja**; **vcpkg**,
+bootstrapped with `VCPKG_ROOT` set (it supplies the OpenSSL + curl that the statically linked `httpfs`
+needs); and **PowerShell 7 (`pwsh`)** to run the managed publish. On Linux/macOS the same list applies minus
+Visual Studio, with `x64-linux`/`arm64-osx` as the vcpkg triplet.
 
 Produces `build/release/extension/fabricator/fabricator.duckdb_extension` and a `build/release/duckdb.exe`
 that already embeds the extension (no `LOAD` needed). The bridge is located via `FABRICATOR_MANAGED_DIR`,
@@ -2419,7 +2460,7 @@ dotnet/Fabricator.AnalysisServices/  Power BI / DAX (ADOMD) backend — PROVIDER
 engineered-wood/             in-tree submodule: pure-C# Delta/Parquet library (the delta provider's log layer)
 scripts/publish-managed.ps1  self-contained publish of the bridge + .NET runtime
 test/                        verify_*.test + mssqlcompat/ (regenerated from the native extension)
-CMakeLists.txt, Makefile, extension_config.cmake, CLAUDE.md
+CMakeLists.txt, Makefile, extension_config.cmake
 ```
 
 ## License

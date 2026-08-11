@@ -85,7 +85,7 @@ unique_ptr<GlobalSinkState> FabricatorPhysicalInsert::GetGlobalSinkState(ClientC
 		stream->get_schema(stream, &schema);
 		// Set the host-FS opener so a host-FS provider (the Delta catalog) can write through DuckDB's
 		// FileSystem; the managed begin_bulk captures it + re-establishes it on the bulk consumer thread.
-		fabricator::SetActiveOpener(reinterpret_cast<FabricatorHandle>(&context));
+		fabricator::SetActiveOpener(reinterpret_cast<FabricatorHandle>(&context), fabricator::SessionKeyFor(&context));
 		gstate->bulk_session = fabricator::BeginBulk(handle_, target_.schema_name, target_.table_name,
 		                                           /*create_table=*/false, /*replace=*/false,
 		                                           /*check_constraints=*/true,

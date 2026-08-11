@@ -150,7 +150,7 @@ public:
 		}
 		// The managed side reads the _delta_log through the host FileSystem; give it the calling operator's
 		// ClientContext as the opener (secret resolution for OneLake), mirroring the global host-FS readers.
-		SetActiveOpener(reinterpret_cast<FabricatorHandle>(&context));
+		SetActiveOpener(reinterpret_cast<FabricatorHandle>(&context), SessionKeyFor(&context));
 		auto json = DeltaListFiles(paths[0], ""); // "" push filter (file pruning is a later slice)
 		auto entries = ParseFileList(json);
 		vector<OpenFileInfo> files;

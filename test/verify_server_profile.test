@@ -9,11 +9,14 @@ require-env MSSQL_TESTDB_DSN
 statement ok
 ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE fabricator);
 
-# One (property, value) row per profile field.
+# One (property, value) row per profile field, plus `mars_enabled` — which is NOT a profile field but the
+# value this CATALOG resolved (capability ∧ the mssql_mars setting/ATTACH option). The pair is the point:
+# `supports_mars` alone cannot show that a `SET mssql_mars='false'` reached the catalog, which is what let
+# verify_mars_off_same_catalog pass vacuously.
 query I
 SELECT count(*) FROM fabricator_server_info('db');
 ----
-14
+15
 
 # Detected raw values for the test SQL Server 2025 (box, Developer edition).
 query I
