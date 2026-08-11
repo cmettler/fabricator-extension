@@ -123,7 +123,12 @@ for f in FILES:
 # An unreferenced doc is not wrong, but it is undiscoverable — and undiscoverable is how a doc rots unnoticed.
 # Empirically: when this check was written, ALL FIVE docs whose last substantive edit was the 2026-07-15
 # rename were unreferenced, and 11 docs were missing from the index entirely.
-if os.path.exists('CLAUDE.md'):
+#
+# ⚠ CLAUDE.md IS UNTRACKED SINCE 2026-08-11 (local-only agent memory), so THIS CHECK DOES NOT RUN IN CI —
+# only on a machine that has the file. It is announced rather than skipped in silence: a check that quietly
+# stops running is worse than one that was never written, because the green tick still implies it ran.
+skipped_index = not os.path.exists('CLAUDE.md')
+if not skipped_index:
     claude = open('CLAUDE.md', encoding='utf-8', errors='replace').read()
     for d in sorted(glob.glob('docs/*.md')):
         if os.path.basename(d) not in claude:
@@ -133,6 +138,8 @@ for line in FAIL:
     print(f'  FAIL  {line}')
 if skipped_sub:
     print(f'  note  {skipped_sub} path claim(s) skipped: submodule(s) not checked out ({", ".join(MISSING)})')
+if skipped_index:
+    print('  note  doc-index check skipped: CLAUDE.md not present (it is untracked — local-only agent memory)')
 print()
 print(f'checked {len(FILES)} markdown files')
 if FAIL:

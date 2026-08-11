@@ -66,3 +66,18 @@ docker/certs/openssl.cnf
 
 # Fabricator debug logs (FABRICATOR_LOG_FILE)
 *.fablog
+
+# Agent project memory — local only (user decision, 2026-08-11). It is dense internal working notes rather
+# than anything a reader of this repo wants, so it is kept OUT of the published tree.
+#
+# ⚠ ANCHORED (leading slash) ON PURPOSE: an unanchored `CLAUDE.md` would also ignore one in any subdirectory,
+# and per-directory agent memory is a thing this repo may want to track later.
+#
+# ⚠ IT WAS TRACKED UNTIL NOW, so ignoring alone would have done nothing — it was untracked with
+# `git rm --cached CLAUDE.md`, which stages its removal. Two consequences worth knowing:
+#   * the file is NOT removed from HISTORY — every earlier commit still shows it;
+#   * it no longer syncs between machines, which is what its own header said keeping it in the repo was for.
+#     Anyone working on a second checkout needs to bring it across by hand.
+# `scripts/check-docs.sh` already guards its two CLAUDE.md reads with os.path.exists, so a clone without it
+# still passes rather than failing on a missing file.
+/CLAUDE.md

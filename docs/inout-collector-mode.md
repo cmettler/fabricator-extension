@@ -5,7 +5,8 @@
 > Power BI Desktop model), **lifting its old single-chunk ≤2048-row cap** (a 5000-row injected table now
 > evaluates fine). A *second* table-in-out execution shape alongside the Phase 6 streaming exchange: a binding
 > that **collects all input, emits nothing until input EOF, then emits its full output**. The streaming
-> exchange ([the Phase 6 work](../CLAUDE.md)) is **untouched** — the two modes coexist, picked by a discovery
+> exchange (the Phase 6 work — [abi-history.md](abi-history.md) v28/v31) is **untouched** — the two modes
+> coexist, picked by a discovery
 > `kind`. Reuses the v28 exchange ABI verbatim (no bump).
 >
 > **As-built notes** (where the build refined the sketch below):
@@ -84,7 +85,8 @@ collected result out of `function_final`.
 
 **But it fires per UNION branch**, and `PhysicalUnion::BuildPipelines` can run branches **sequentially** — so
 branch 1's `function_final` would emit (and commit/teardown) before branch 2 runs → **lost rows**. This is the
-identical premature-finish trap already rejected for the in-out finish counter (see the 4g notes in CLAUDE.md).
+identical premature-finish trap already rejected for the in-out finish counter (see the 4g notes in
+[custom-functions-design.md](custom-functions-design.md) §11.1).
 So native-final collector is sound **only** when input is a single, non-UNION pipeline — too fragile as the
 general signal. The injected single-shot `OperatorFinalize` (fires **once**, sink-level, after *all* branches)
 is the correct "all input done" signal — which is exactly what the Sink+Source `Finalize` gives us.
