@@ -243,7 +243,11 @@ case "$TIER" in
         # emitting only AddFiles — the dbt anti-join shape, where a wrong `true` makes another engine skip a
         # check it owes. Mutation-tested by claiming blind regardless of reads; dies at exactly that row.
         # 6921 since 2026-08-11: verify_setting_scope (+30) — see the MIN_SUITES note above.
-        : "${MIN_ASSERTIONS:=6921}"
+        # 6929 since 2026-08-11: verify_with_options (+8) — the held table's NATIVE writer now gets the write
+        # spec too. The pre-existing section next to it REQUIRES the codec engine (under native_write DuckDB's
+        # COPY writes the bytes, so engineered-wood's options never apply), which is exactly why the native
+        # half was asserted nowhere and was broken.
+        : "${MIN_ASSERTIONS:=6929}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

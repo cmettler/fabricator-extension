@@ -357,10 +357,53 @@ update_postimage	100
 update_preimage	100
 
 statement ok
+DETACH lake9;
+
+# ---- …AND THE SAME HELD TABLE ON THE **NATIVE** ENGINE ----
+# ⚠ THE SECTION ABOVE COULD NOT CATCH THIS, AND SAYS SO IN ITS OWN COMMENT: it needs the CODEC engine,
+# because under native_write DuckDB's COPY writes the bytes and engineered-wood's ParquetWriteOptions never
+# apply. So the held table's NATIVE half was asserted NOWHERE, and it was broken — the spec reached
+# DeltaWriter.Options (the EW half) while NativeParquetDataFileWriter was still constructed without it.
+# MEASURED before the fix: codec ZSTD, native SNAPPY, same statements. Fixing "half the writers" is
+# invisible to a gate pinned on the half that works.
+#
+# ⚠ THE TABLE MUST HAVE AN IDENTITY COLUMN. The eager-write buffer writes almost everything at STATEMENT
+# time, where a different (already correct) code path applies the spec. The one branch that still RETAINS
+# batches until COMMIT — and so writes them through the HELD table — is identity/iceberg or a pending
+# ALTER. Without the identity column this section passes with the bug fully present.
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/optspecnat' AS lake9n
+  (TYPE fabricator, PROVIDER 'delta', native_read true, native_write true);
+
+statement ok
+CREATE TABLE lake9n.main.ident (id BIGINT AS (0), v BIGINT);
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO lake9n.main.ident (v) SELECT i FROM range(2000) t(i);
+
+statement ok
+COMMIT;
+
+query I
+SELECT DISTINCT compression FROM parquet_metadata('${FABRICATOR_DELTA_WRITE_DIR}/optspecnat/ident/*.parquet')
+WHERE compression <> '';
+----
+ZSTD
+
+# The rows are all there — a write-options change must not alter what the transaction wrote.
+query I
+SELECT count(*) FROM lake9n.main.ident;
+----
+2000
+
+statement ok
 RESET delta_write_options;
 
 statement ok
-DETACH lake9;
+DETACH lake9n;
 
 # ============================================================================
 # THE REWRITE PATHS HONOUR THE WRITE SPEC — the merge-on-read UPDATE's post-image file and OPTIMIZE's

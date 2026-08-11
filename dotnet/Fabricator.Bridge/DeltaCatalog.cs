@@ -4213,16 +4213,30 @@ public sealed class DeltaCatalog : IBackendCatalog
             return held;
         }
         var fs = TableFileSystems.Create(opener, tablePath);
-        var dataFileWriter = _nativeWrite && NativeParquetDataFileWriter.Available
-            ? new NativeParquetDataFileWriter(tablePath)
-            : null;
         // ⚠ THE WRITE SPEC IS LOAD-BEARING HERE AND USED TO BE OMITTED, which made every file this table
         // writes — the CDF change files, and the parked batches the flush writes — silently ignore the user's
         // `delta_write_options` (compression / row_group_size / bloom_filter_columns) and fall back to
         // snappy / 122880 / none. MEASURED on the codec engine with compression 'zstd': the CTAS data files
         // came out ZSTD and the change files SNAPPY, in the same table.
+        var spec = ResolveWriteSpec(null, null, tablePath);
+        // ⚠ AND IT MUST REACH **BOTH** WRITERS — passing it only to DeltaWriter.Options below fixes the CODEC
+        // engine and leaves the DEFAULT one broken, which is exactly how it shipped. `Options` configures
+        // engineered-wood's ParquetWriteOptions; under `native_write` the bytes are written by DuckDB's COPY
+        // through NativeParquetDataFileWriter, which never consults them and takes the spec HERE.
+        // MEASURED, identity table (the one shape whose batches are still written by the FLUSH), buffered
+        // INSERT under compression 'zstd': codec ZSTD, native SNAPPY. The comment above says "measured on the
+        // codec engine" — the earlier fix was verified on the engine where half of it was sufficient.
+        //
+        // ⚠ THIS IS THE FOURTH SITE OF ONE DEFECT. The 2026-08-07 pass found it, wrote up "threading the spec
+        // into the EW open was necessary and NOT sufficient", and fixed the three DeltaReader constructions —
+        // this one was not in that sweep. When a fix is "add the argument the constructor already accepts",
+        // grep every construction of it, not the ones the bug was reported against:
+        //   grep -rn "new NativeParquetDataFileWriter(" dotnet/
+        var dataFileWriter = _nativeWrite && NativeParquetDataFileWriter.Available
+            ? new NativeParquetDataFileWriter(tablePath, spec)
+            : null;
         pending.HeldTable = await EngineeredWood.DeltaLake.Table.DeltaTable
-            .OpenAsync(fs, DeltaWriter.Options(ResolveWriteSpec(null, null, tablePath), dataFileWriter), token)
+            .OpenAsync(fs, DeltaWriter.Options(spec, dataFileWriter), token)
             .ConfigureAwait(false);
         return pending.HeldTable;
     }

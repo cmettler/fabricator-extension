@@ -212,12 +212,26 @@ produces (ZSTD where SNAPPY is expected). Tier-0 `ProviderSettingsScopeTests` ad
 store's layering. ⚠ The §1 **positive control** is load-bearing: without it the "con_b writes SNAPPY"
 assertion would pass equally if the setting had stopped working, or stopped reaching the writer, entirely.
 
-**⚠ Found while gating it, and NOT fixed here:** on `native_write`, a flush-path parked-batch write comes
-out SNAPPY regardless of `delta_write_options` — the write spec does not reach DuckDB's COPY on the FLUSH
-path specifically (the statement-time native writes DO honour it). Measured on the one shape that still
-retains batches until COMMIT (an IDENTITY table's buffered INSERT): codec engine ZSTD, native engine SNAPPY.
-It is a pre-existing gap in the same family as the write-options plumbing items in `CLAUDE.md`, unrelated to
-scoping, and is why §5 of the gate is pinned on the codec engine.
+**⚠ Found while gating it, unrelated to scoping — fixed the same day, and it was the FOURTH site of one
+defect.** On `native_write` a flush-path parked-batch write came out SNAPPY regardless of
+`delta_write_options`, while statement-time native writes honoured it. Measured on the one shape that still
+retains batches until COMMIT (an IDENTITY table's buffered INSERT): codec ZSTD, native SNAPPY.
+
+`EnsureHeldTableAsync` *did* pass the spec — to `DeltaWriter.Options(...)`, which configures
+engineered-wood's `ParquetWriteOptions`, which is why the codec engine worked. Under `native_write` the bytes
+come from DuckDB's COPY through `NativeParquetDataFileWriter`, which never reads those options and takes the
+spec as a **constructor** argument; it was constructed with the path alone.
+
+The 2026-08-07 pass had already diagnosed exactly this ("threading the spec into the EW open was necessary
+and NOT sufficient") and fixed the three `DeltaReader` constructions plus `DeltaGlobalTableFunction` — this
+one was not in that sweep. **When the fix is "pass the argument the constructor already accepts", grep every
+construction, not the sites the bug was reported against.**
+
+⚠ The gate beside it could not have caught this, and its own comment says why: it *requires* the codec
+engine, because under `native_write` engineered-wood's options never apply. So the native half was asserted
+nowhere. **Fixing half the writers is invisible to a gate pinned on the half that works.**
+`verify_with_options` 199 → **207** adds the native leg (mutation-tested; needs an IDENTITY column, since
+that is the only branch still writing through the held table).
 
 **⚠ A GAP I "FOUND" IN THE ATTACH PATH DID NOT EXIST, and the mutant is what settled it.** `mssql_mars` is
 resolved once per catalog and `fabricator_storage.cpp` establishes no session before `open_catalog`, so a
