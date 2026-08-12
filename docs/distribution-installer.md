@@ -278,6 +278,20 @@ step-2 friendly version error. Artifact matrix = duckdb-versions we support × p
 build (today: windows_amd64, linux_amd64; osx blocked on a core C++ build, not on this
 design) × 2 SKUs.
 
+**AS BUILT (2026-08-12) — `distribution.yml` ships FOUR of those six cells, not all of them,
+and the asymmetry is deliberate rather than pending work.** windows_amd64 Standalone /
+linux_amd64 Standard / **linux_amd64 Standalone** / osx_arm64 Standalone. (The osx line above
+is stale: the core builds and the artifact has been green in CI since 2026-07-26.)
+- Linux is the only platform carrying both, because there the SKUs serve different MACHINES: a
+  Fabric notebook image already has .NET 8 (Standard, ~40 MB, and the SKU validated there),
+  while a bare container or linux dev box may have none — and there the Standard artifact does
+  not degrade gracefully, it fails at LOAD inside hostfxr resolution. Windows and macOS are
+  developer machines by assumption, so Standalone alone is defensible.
+- ⚠ **A new SKU cell is safe ONLY because the job name and the artifact name both interpolate
+  the SKU.** Two matrix entries sharing an OS is otherwise a silent collision: the second
+  upload overwrites the first, and the release then carries a Standard-named asset holding
+  Standalone bytes. Check both names before adding a fifth cell.
+
 Hosting: direct download (GitHub releases) and/or a custom extension repository
 (`INSTALL fabricator FROM '<url>'` — repo layout `<base>/<duckdb-version>/<platform>/
 fabricator.duckdb_extension.gz`), both of which serve exactly this matrix. Community-repo

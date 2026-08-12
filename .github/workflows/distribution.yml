@@ -60,9 +60,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # SKU per platform, matching how the artifacts were validated by hand: a dev box should not
-          # need .NET installed (self-contained, ~61 MB), while Fabric notebooks already ship .NET 8,
-          # so the framework-dependent build is both smaller and the relevant one there (~40 MB).
+          # ONE SKU per platform EXCEPT linux, which ships both. A dev box should not need .NET
+          # installed (self-contained, ~61 MB), while Fabric notebooks already ship .NET 8, so the
+          # framework-dependent build is both smaller and the relevant one there (~40 MB).
           - os: windows-latest
             platform: windows_amd64
             rid: win-x64
@@ -75,6 +75,19 @@ jobs:
             triplet: x64-linux
             sku: Standard
             managed_mode: Framework
+          # Linux is the ONE platform that ships BOTH SKUs, because on linux the two audiences are
+          # genuinely different machines: a Fabric notebook image already has .NET 8 (Standard is
+          # smaller and is the SKU validated there), while a bare container or a linux dev box may have
+          # no .NET at all — and there the Standard artifact does not degrade gracefully, it fails at
+          # LOAD in hostfxr resolution. Neither SKU substitutes for the other, so this is two assets
+          # rather than a choice. The README has advertised "two flavours per platform" from the start;
+          # this closes the half of that promise that costs one extra job.
+          - os: ubuntu-latest
+            platform: linux_amd64
+            rid: linux-x64
+            triplet: x64-linux
+            sku: Standalone
+            managed_mode: SelfContained
           # macOS takes the Standalone SKU for the same reason Windows does: it is a developer machine,
           # not a Fabric notebook, so shipping the runtime beats requiring a .NET install. See the header
           # for what a green macOS run does and does NOT prove (Gatekeeper and signing are out of scope).
