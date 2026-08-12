@@ -1625,8 +1625,8 @@ Enabling `Debug` also logs every T-SQL statement, which is verbose on a busy ses
 
 `PROVIDER 'delta'` attaches a **Delta Lake** root as a read-write DuckDB catalog. Each subdirectory with a
 `_delta_log/` is a table; data I/O goes through DuckDB's `FileSystem` (so `azure`/`httpfs` + DuckDB secrets
-work), and the Delta log layer is the pure-C# [engineered-wood](https://github.com/cmettler/engineered-wood)
-library (an in-tree submodule).
+work), and the Delta log layer is the pure-C#
+[engineered-wood](https://github.com/clast-project/engineered-wood) library (an in-tree submodule).
 
 **The two spellings pick different defaults, and that is the only difference between them.**
 `PROVIDER 'delta'` — the name to use — defaults `native_read`/`native_write` **on**: DuckDB reads and
@@ -1828,7 +1828,7 @@ principal wins even if `PROVIDER` says something else:
 | Per-table `WITH (…)` — Delta properties / feature-flag overrides / write tuning stamped in the CREATE commit | ✅ |
 | `native_write` / `native_read` — DuckDB's own Parquet reader/writer for data files (EW keeps the `_delta_log`) | ✅ |
 | VARIANT columns; `set_tblproperties` / `tblproperties`; `OPTIMIZE` / `VACUUM` maintenance | ✅ |
-| Concurrent writers: OCC retry (append/CTAS) + **row-level concurrency** (disjoint-row DML on DV tables); S3 multi-writer via a secret | ✅ |
+| Concurrent writers: OCC retry (a blind append / CTAS — an append that READ the table surfaces the conflict instead, see below) + **row-level concurrency** (disjoint-row DML on DV tables); S3 multi-writer via a secret | ✅ |
 | Concurrent writers on **OneLake**, many processes appending to ONE table — no lost writes (measured: 96 concurrent commits, all landed), but a losing writer can occasionally surface an error rather than retrying transparently, so retry the statement | ⚠ |
 
 > **Partition values are escaped the way Spark escapes them**, so a value containing `/ : = % ? * " ' #` or a
@@ -1993,6 +1993,15 @@ un-commit. Read the recorded version back and decide whether the batch still nee
 > holds for `ALTER TABLE … ADD COLUMN`: rows written before the column exists read it as `NULL`, which is
 > what Delta schema evolution means. It is `UPDATE` / `DELETE` inside `BEGIN … COMMIT` that hold a pinned
 > snapshot and can therefore be invalidated.
+>
+> **⚠ An `INSERT` that READ the table is the exception, and it changed on 2026-08-12.** Inside
+> `BEGIN … COMMIT`, a statement like `INSERT INTO t SELECT max(id) + 1 FROM t` computes its rows *from* the
+> table, so if a concurrent writer commits first the statement now **fails and must be re-run** rather than
+> quietly landing. It used to retry — and the retry re-committed the rows already computed, i.e. a value
+> derived from the old `max`, with no error. Re-running is the only thing that can recompute them.
+> A transaction that merely `SELECT`ed the table before appending is treated the same way, because Delta
+> defines "blind append" over the whole transaction rather than over one statement. Autocommit `INSERT`s
+> are unaffected and still retry.
 
 > ### What `VACUUM` does and does not touch
 >
@@ -2403,9 +2412,10 @@ git submodule update --init          # NOT --recursive — see engineered-wood b
   `shallow = true` so the checkout stays small. Neither has a `branch =` line, so
   `git submodule update --remote` can't silently move the pin to an unreleased tip; bump them by
   checking out a new SHA and committing the gitlink.
-- **`engineered-wood`** — the pure-C# Delta/Parquet library (pinned to the
-  [`cmettler/engineered-wood`](https://github.com/cmettler/engineered-wood) fork), referenced in-tree by
-  `Fabricator.Bridge`. **This is why the init must be non-recursive:** it has a nested
+- **`engineered-wood`** — the pure-C# Delta/Parquet library, referenced in-tree by `Fabricator.Bridge`.
+  Pinned to **upstream [`clast-project/engineered-wood`](https://github.com/clast-project/engineered-wood)**
+  since 2026-08-12: fabricator used to carry a small patch set on a fork branch, and every patch has landed
+  upstream, so there is nothing left to fork. **This is why the init must be non-recursive:** it has a nested
   `parquet-testing` submodule holding ~½ GB of Apache test data that the build does not need.
 - **`DuckDB.ExtensionKit`** — the MIT NativeAOT extension toolkit
   ([`Giorgi/DuckDB.ExtensionKit`](https://github.com/Giorgi/DuckDB.ExtensionKit)). Needed ONLY to build
@@ -2487,4 +2497,4 @@ CMakeLists.txt, Makefile, extension_config.cmake
 
 Bundled submodules keep their own licenses (all MIT): [DuckDB](https://github.com/duckdb/duckdb),
 [extension-ci-tools](https://github.com/duckdb/extension-ci-tools), and
-[engineered-wood](https://github.com/cmettler/engineered-wood).
+[engineered-wood](https://github.com/clast-project/engineered-wood).

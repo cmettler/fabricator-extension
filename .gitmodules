@@ -1,7 +1,20 @@
+# The Delta engine. Pinned to ORIGINAL UPSTREAM as of 2026-08-12: the patch set is EMPTY, so there is
+# no fork branch left to carry and the url points at clast-project rather than the cmettler fork. That
+# was the branch model's stated goal ("run on original upstream engineered-wood"), not a shortcut — see
+# docs/ew-master-migration.md §THE 2026-08-12 PIN ONTO UPSTREAM.
+#
+# ⚠ TO OFFER A PATCH AGAIN you need the fork back as a push target, because this url is read-only to us:
+#     git -C engineered-wood remote add fork https://github.com/cmettler/engineered-wood.git
+# Carry the patch on a `fabricator-patches-v<n>` branch there, push it, and point url+branch at the fork
+# for as long as the set is non-empty — a pin nobody can fetch breaks every clone, and release tags pin
+# EW shas forever. Cut such a branch FRESH off upstream/main; the old v1/v2/v3 lineages are dead.
+#
+# ⚠ `branch = main` matters ONLY to `git submodule update --remote`, which would move the pin to the
+# CURRENT upstream tip. An ordinary `git submodule update` uses the recorded sha. Bump deliberately.
 [submodule "engineered-wood"]
 	path = engineered-wood
-	url = https://github.com/cmettler/engineered-wood.git
-	branch = fabricator-patches-v3
+	url = https://github.com/clast-project/engineered-wood.git
+	branch = main
 [submodule "DuckDB.ExtensionKit"]
 	path = DuckDB.ExtensionKit
 	url = https://github.com/Giorgi/DuckDB.ExtensionKit.git

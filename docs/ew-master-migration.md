@@ -3034,3 +3034,119 @@ blind claims where one is true.
 
 Offer draft (not yet sent): the argument is upstream's own, from `DeltaTransaction.IsBlindAppend` and #125's
 interop measurement.
+
+## THE 2026-08-12 PIN ONTO UPSTREAM — the fork branch is GONE, the submodule points at clast-project
+
+The 2026-08-11 bump cut `fabricator-patches-v3` off `upstream/main` carrying ONE patch. That patch is now
+upstream (#137), so the set is empty **again**, and this time there was nothing left to put on a branch:
+the submodule `url` moved from the `cmettler` fork to **`https://github.com/clast-project/engineered-wood`**
+with `branch = main`, pin **`9d204d7`**. This is the branch model's stated goal in its final form — not
+"a small patch set on top of upstream" but *upstream*.
+
+⚠ **Getting back is one command, and `.gitmodules` records it**: `git remote add fork …`, carry the patch on
+a FRESH `fabricator-patches-v<n>` off `upstream/main`, push it, and point `url`+`branch` at the fork for as
+long as the set is non-empty. A pin nobody can fetch breaks every clone, and release tags pin EW shas forever.
+
+### 1. The patch is subsumed — established by CONTENT, at six surface points
+
+`upstream/main` = `9d204d7`, **14 commits** past `154f800`. Ours was `6dec2b4`, +37/−13 in `DeltaTable.cs`,
+landed as **#137 (`d382aa1`)** — authored by us, merged by upstream. Verified against
+`git show upstream/main:src/EngineeredWood.DeltaLake.Table/DeltaTable.cs` rather than against the PR state:
+
+| our hunk | upstream |
+|---|---|
+| `WriteAsync(…, bool? isBlindAppend = null)` (public, batches) | :4810, forwarded :4812 |
+| `WriteCoreAsync(…, bool? isBlindAppend = null)` | :4849, forwarded :4873 |
+| `CommitWriteAsync(…, bool? isBlindAppend = null)` | :5279 |
+| the `isBlindAppend: true` hardcode replaced by the parameter | :5320 |
+| the overwrite branch KEEPS its hardcoded `false` | :5329 |
+| the `IEnumerable` overload threads it | :7967, :7975 |
+
+**Upstream extended it TWICE, and the first extension fixes a corruption our own patch made reachable.**
+- **#143 (`bafc38e`)** — `rebaseSafe: isBlindAppend != false` (:5319). Ours passed `rebaseSafe: true`
+  unconditionally, so `CommitOccAsync` would rebase a collision and re-commit the staged actions verbatim —
+  *"valid precisely because nothing the commit read or removed was touched"*, which is exactly what a caller
+  passing `false` has just denied. For `INSERT INTO t SELECT max(id)+1 FROM t`: scan, compute, declare false,
+  a concurrent append lands, no conflict against `ReadSet.Blind`, rebase, commit a row derived from the OLD
+  max. No error, wrong row. Upstream's words: *"worse than the bug #137 fixes, which only misled other
+  engines — this one corrupts our own table."*
+- **#144 (`a69870b`)** — `InferBlindAppend` now reads a `cdc` action as POSITIVE evidence of a read. Every
+  other clause it had reads an ABSENCE, so *"nothing here says it read"* had become *"it did not read"*. It
+  fires on the one shape that emits `add` + `cdc` and no `remove`: an insert-only MERGE on a CDF table,
+  measured against delta-rs 1.6.2. Affects only commits that declare NOTHING, so not ours — but it is the
+  fallback we rely on when READING another engine's log.
+
+### 2. The compile cost was ZERO — and that is precisely when a bump looks finished and is not
+
+14 commits, `dotnet build dotnet/Fabricator.Bridge -c Release`: **0 errors, 8 warnings — the same 4
+pre-existing ones × 2 TFMs**, no new. The 2026-08-11 bump cost one new `ITableFileSystem` member; this one
+cost nothing. Per that bump's own lesson the tier was run anyway, and §4 is what it was worth.
+
+### 3. What the other 13 commits are
+
+- **Five are the Spark expression work continuing** (#129/#130/#132/#134/#141, plus #135 docs) under
+  `EngineeredWood.Expressions/`. We consume only `Expressions.Predicate`. No impact.
+- **Four are CONSTRAINT ENFORCEMENT, and they turn a refusal into a capability** — #136 evaluates CHECK
+  constraints and column invariants, #138 computes generated columns, #139 re-validates an UPDATE's
+  post-image and recomputes generated columns, #140 lets a host commit a constrained table by declaring
+  `constraintsEnforcedByCaller`. Before these, EW refused every table that had one.
+  - ⚠ **No behaviour change for us, and the reason is the default.** `constraintsEnforcedByCaller` defaults
+    to `false`, so *"a host that says nothing gets the refusal it got before"*. Our commit paths say nothing.
+  - ⚠ **`SupportsExternalDataFileCommit` STOPPED LYING, and we read it in five places.** #140 found it
+    reported `true` for a constrained table while the commit refused — sending a caller off to write files
+    it could not then commit, the orphan its own docs promise to prevent. It is now `false` there, so our
+    five consumers take their fallback instead. **UNTESTED HERE** — no suite builds a constrained table
+    (fabricator never creates one: CHECK on CREATE is deliberately unsupported) — but the direction is the
+    safe one, and it is a real capability gap now worth reconsidering: we could opt in and let a constrained
+    Spark-authored table be writable.
+- **One is #145**, a docs fix (net472 is Windows-only to RUN, not to build).
+
+### 4. WHAT THE BUMP EXPOSED IN OUR CODE: we were throwing away the signal #143 added
+
+⚠ **`FlushDeferredFilesAsync` and `DeltaGlobalTableFunction.WriteAsync` both caught EVERY
+`DeltaConflictException` and replayed.** #143 makes a declared-`false` append surface as
+`RebaseUnsafe` / `ConflictRecovery.Replan` — *"rebuild these actions, do not re-commit them"* — and both
+loops swallowed it, reopened at latest, and re-committed **the same already-written data files**. Nothing in
+either loop can recompute a row; the rows were computed by DuckDB before the call. So the corruption #143
+closed one layer down was reopened one layer up, for `BEGIN; INSERT INTO t SELECT max(id)+1 FROM t; COMMIT;`.
+
+- **NOT introduced by the bump — pre-existing, and invisible before it.** EW used to rebase internally and
+  commit the same stale rows with no signal at all. What the bump adds is the exception; what we added is
+  listening to it.
+- Fix: `when (attempt < maxAttempts && isBlindAppend != false)` on both catches.
+- ⚠ **Null still retries, deliberately.** It means the caller said NOTHING — autocommit records no reads —
+  not that it read. Same permissive reading of absence as the flag itself.
+- ⚠ **It costs the reopen that clears a concurrent `metaData` conflict** (§4b.1) for this one shape. Accepted:
+  reopening and replaying a read-dependent append is wrong for a metadata conflict too, so the alternative
+  was a silent wrong answer rather than a loud one.
+- ⚠ **The read set is PER TABLE, not per transaction** (`_byTxn[txn][tablePath]`, *"the pushed predicate of
+  every in-transaction scan of THIS table"*), so reading an unrelated table does NOT disable this append's
+  retry. It IS over-broad in the conservative direction within one table — `BEGIN; SELECT * FROM t;
+  INSERT INTO t VALUES (1); COMMIT;` declares false and loses the retry although the VALUES rows depend on
+  nothing. That over-application is Delta's own: `isBlindAppend` is defined on the TRANSACTION
+  (`readPredicates.isEmpty && readFiles.isEmpty`), so matching the spec here costs a spurious conflict and
+  narrowing it would cost a wrong row.
+- ⚠ **REASONED, NOT MEASURED.** sqllogictest drives connections sequentially, so no suite can produce the
+  concurrent commit, and the window is microseconds — a multi-process rig would need many trials. What IS
+  gated is that it changes nothing without contention. To measure it later: `scratchpad/s3_race.sh`'s shape
+  against MinIO with a NAMED secret (a local Windows root is not multi-writer safe, §8.5), one writer running
+  the anti-join insert inside BEGIN/COMMIT.
+
+**Two comments went stale in the same place, and both justified a live line with a dead mechanism.** Both
+said EW *"claims `true` on our behalf unless told otherwise"* — the #125 hardcode our own #137 deleted. The
+line is still right and the reason is now #143's, so both were rewritten rather than removed: a comment that
+explains a line by a mechanism that no longer exists is how a correct line gets deleted later.
+
+### 5. Gates
+
+Run in TWO passes on purpose, so the bump and the fix are separately attributable — the first pass ran
+against the managed dir published BEFORE §4's edits:
+
+| pass | what it isolates | result |
+|---|---|---|
+| bump only (`9d204d7`, no retry guard) | 14 upstream commits are behaviour-preserving | hermetic **69/69 — 6993** |
+| bump + retry guard | the guard is inert without contention | hermetic **69/69 — 6993** |
+
+Both **byte-identical to the pre-bump tier**, which is the whole claim. `verify_delta_catalog_transactions`
+holds at **1040 per leg** — §42's declaration pins (v2 `true`, v3 `false`, autocommit absent) pass against
+upstream's re-cut, which is the content check §1 asks for expressed as a test rather than as a diff.

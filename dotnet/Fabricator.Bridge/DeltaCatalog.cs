@@ -2914,10 +2914,14 @@ public sealed class DeltaCatalog : IBackendCatalog
                     // The SAME declaration as the Files branch above, for the same reason — this is the
                     // parked-batch path (identity / iceberg / pending-ALTER, and every write on the CODEC
                     // engine), and it lands in engineered-wood's WriteAsync rather than in
-                    // CommitDataFilesAsync. ⚠ Passing it is not optional: since the isBlindAppend feature
-                    // landed upstream, WriteAsync's plain-append branch claims `true` on the caller's behalf
-                    // unless told otherwise, so an autocommit `INSERT INTO t SELECT … FROM t` would record a
-                    // blind-append claim for a statement that read the target — the unsafe direction.
+                    // CommitDataFilesAsync. ⚠ Passing it is STILL not optional, though the reason CHANGED on
+                    // 2026-08-12 and the old one is worth not re-deriving: #125 made WriteAsync's plain-append
+                    // branch hardcode `true` on the caller's behalf, so passing this was what stopped an
+                    // `INSERT INTO t SELECT … FROM t` recording a blind claim. Our #137 landed upstream and
+                    // replaced that hardcode with this very parameter, defaulting to NULL — so silence no
+                    // longer records a lie. What passing `false` buys NOW is the other half, from #143: a
+                    // declared-false append is no longer rebase-safe, so a collision surfaces instead of
+                    // silently re-committing rows computed against a moved snapshot.
                     bool? batchBlind = wasExplicit ? !pending.HasReads : null;
                     long v = DeltaWriter.Write(
                         opener, kv.Key, pending.BatchSchema!, pending.Batches, DeltaWriteMode.Append, default,
@@ -3101,8 +3105,9 @@ public sealed class DeltaCatalog : IBackendCatalog
         }
     }
 
-    // Commits transaction-deferred streamed files as ONE Delta commit, with the standard OCC retry
-    // (appends are snapshot-independent, so reopening at the new latest and re-committing is safe).
+    // Commits transaction-deferred streamed files as ONE Delta commit, with the standard OCC retry —
+    // but ONLY where reopening at the new latest and re-committing is actually safe, which is exactly
+    // where this append did not READ. See the `isBlindAppend != false` guard on the catch below.
     private long FlushDeferredFiles(nint opener, string tablePath,
                                     System.Collections.Generic.IReadOnlyList<EngineeredWood.DeltaLake.Table.WrittenDataFile> files,
                                     bool? isBlindAppend)
@@ -3130,7 +3135,24 @@ public sealed class DeltaCatalog : IBackendCatalog
                         isBlindAppend: isBlindAppend)
                     .ConfigureAwait(false);
             }
-            catch (EngineeredWood.DeltaLake.DeltaConflictException) when (attempt < maxAttempts)
+            // ⚠ `isBlindAppend != false` IS A CORRECTNESS GUARD, NOT A TUNING KNOB — retrying a
+            // read-dependent append REPLAYS rows computed against a snapshot that has since moved.
+            // The actions here are already-written data files, so "retry" can only re-commit the SAME
+            // bytes; nothing in this loop can recompute them. For `INSERT INTO t SELECT max(id)+1 FROM t`
+            // inside BEGIN/COMMIT that means: a concurrent append lands, we reopen, we commit a row
+            // derived from the OLD max, and the statement SUCCEEDS. Wrong row, no error.
+            // engineered-wood #143 closed exactly this one layer down (a declared-false append is no
+            // longer rebase-safe there, surfacing as RebaseUnsafe/Replan = "rebuild, do not replay"), and
+            // swallowing that here would have reopened it one layer up. Only the caller — the DuckDB
+            // statement — can replan, so the conflict must reach it.
+            // ⚠ Null still retries, deliberately: it means the caller said NOTHING (autocommit records no
+            // reads), not that it read. Same permissive reading of absence as the flag itself.
+            // ⚠ REASONED, NOT MEASURED — sqllogictest drives connections sequentially, so no suite can
+            // produce the concurrent commit this guards against; the window is microseconds, so even a
+            // multi-process rig would need many trials. What IS gated is that it changes nothing without
+            // contention: the whole hermetic tier passes with it in.
+            catch (EngineeredWood.DeltaLake.DeltaConflictException)
+                when (attempt < maxAttempts && isBlindAppend != false)
             {
                 // ⚠ THIS LOOP IS NOT REDUNDANT WITH EW's OWN, AND THE DIFFERENCE IS THE REOPEN.
                 // CommitDataFilesAsync retries internally (LogCommitRequest.MaxAttempts + a rebase handler),

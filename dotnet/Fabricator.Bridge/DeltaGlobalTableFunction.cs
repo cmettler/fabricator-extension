@@ -608,9 +608,12 @@ internal static class DeltaWriter
 
     // Optimistic-concurrency retry bound for commits. A concurrent writer that commits our target version
     // first makes engineered-wood throw DeltaConflictException; we reopen (picking up the new latest version)
-    // and retry. Safe for append/overwrite/create — the data doesn't depend on the conflicting commit. Rowid
-    // DELETE/UPDATE do NOT retry (their absolute positions are tied to the scanned snapshot — a concurrent
-    // change invalidates them; DeltaReader surfaces a clear conflict error instead).
+    // and retry. Safe for create, for overwrite, and for an append THAT READ NOTHING — the data doesn't
+    // depend on the conflicting commit. ⚠ NOT safe for an append that declared `isBlindAppend: false`: its
+    // rows were computed FROM the table, so replaying them re-commits values derived from a snapshot that
+    // has moved (the guard on the catch). Rowid DELETE/UPDATE do NOT retry either (their absolute positions
+    // are tied to the scanned snapshot — a concurrent change invalidates them; DeltaReader surfaces a clear
+    // conflict error instead), which is the same rule: retry only what does not depend on what it read.
     internal const int MaxCommitAttempts = 16;
 
     /// <summary>Opens-or-creates the Delta table at <paramref name="path"/> and writes <paramref name="batches"/>
@@ -730,17 +733,29 @@ internal static class DeltaWriter
                         // ⚠ isBlindAppend is ONLY meaningful on the plain-append branch — engineered-wood
                         // ignores it for the overwrite family, which declares FALSE from its own read of
                         // the active-file set. Passing our claim here is what keeps the CODEC engine's
-                        // autocommit appends honest: without it EW claims `true` on our behalf, and an
-                        // `INSERT INTO t SELECT … FROM t` reaches this call as an ordinary Append.
+                        // autocommit appends honest. ⚠ The MECHANISM changed on 2026-08-12: EW used to claim
+                        // `true` on our behalf (#125's hardcode), and our #137 landed upstream replacing it
+                        // with this parameter, defaulting to NULL — so silence is now merely silent, not a
+                        // lie. Passing it still matters, for #143's half: a declared-false append stops
+                        // being rebase-safe, so a collision surfaces instead of replaying stale rows.
                         : await table.WriteAsync(batches, mode, ct, repartitionTo: repartitionTo,
                                                  isBlindAppend: isBlindAppend)
                             .ConfigureAwait(false);
                 Log.LogInformation("delta write {Path}: committed v{Version}", path, version);
                 return version;
             }
-            catch (EngineeredWood.DeltaLake.DeltaConflictException) when (attempt < MaxCommitAttempts)
+            // ⚠ `isBlindAppend != false` IS A CORRECTNESS GUARD — see the twin in
+            // DeltaCatalog.FlushDeferredFilesAsync for the full argument. Short form: retrying re-writes
+            // the SAME in-memory batches, and those rows were computed by DuckDB before this call, so a
+            // retry replays values derived from a snapshot that has since moved. engineered-wood #143
+            // stopped rebasing a declared-false append for that reason; the conflict has to reach the
+            // statement, which is the only thing that can recompute. Null keeps retrying (the caller said
+            // nothing, which is not the same as "read something"), and so does the overwrite family, whose
+            // claim EW derives from its own read of the active-file set.
+            catch (EngineeredWood.DeltaLake.DeltaConflictException)
+                when (attempt < MaxCommitAttempts && isBlindAppend != false)
             {
-                // Concurrent writer took our version — reopen + retry (append/overwrite is snapshot-independent).
+                // Concurrent writer took our version — reopen + retry.
             }
             finally
             {

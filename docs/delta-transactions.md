@@ -1107,10 +1107,13 @@ OSS Delta **knows** the enum value — it is the **table-property validator** th
       > read nothing and `false` when it did; autocommit still declares nothing, deliberately, because
       > scan-time read recording is gated on the transaction being explicit. Since the engineered-wood bump
       > onto `upstream/main`, EW ALSO writes the field for commits it drives itself — and its plain-append
-      > path claimed `true` on our behalf, which the `fabricator-patches-v3` patch reverses (a host that
-      > scanned the table and staged the result made a read EW never saw). See
-      > [ew-master-migration.md](ew-master-migration.md) §THE 2026-08-11 BUMP §4. The measurement below
-      > stands as the reason the field matters; only the "we emit nothing" premise has moved.
+      > path claimed `true` on our behalf, which our patch reverses (a host that scanned the table and
+      > staged the result made a read EW never saw). **That patch is UPSTREAM as of 2026-08-12 (#137), so
+      > there is no `fabricator-patches-v<n>` branch any more** — and upstream extended it with #143, which
+      > makes a declared-`false` append non-rebase-safe, i.e. the claim now governs the RETRY and not only
+      > the record. See [ew-master-migration.md](ew-master-migration.md) §THE 2026-08-12 PIN ONTO UPSTREAM.
+      > The measurement below stands as the reason the field matters; only the "we emit nothing" premise
+      > has moved.
 
       **Both abort.** The relaxation exists (link 1) and the property does select the level (link 2),
       but it buys our appends nothing — because the exemption applies only to files from a commit
