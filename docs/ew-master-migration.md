@@ -3086,19 +3086,11 @@ cost nothing. Per that bump's own lesson the tier was run anyway, and §4 is wha
 
 - **Five are the Spark expression work continuing** (#129/#130/#132/#134/#141, plus #135 docs) under
   `EngineeredWood.Expressions/`. We consume only `Expressions.Predicate`. No impact.
-- **Four are CONSTRAINT ENFORCEMENT, and they turn a refusal into a capability** — #136 evaluates CHECK
-  constraints and column invariants, #138 computes generated columns, #139 re-validates an UPDATE's
-  post-image and recomputes generated columns, #140 lets a host commit a constrained table by declaring
-  `constraintsEnforcedByCaller`. Before these, EW refused every table that had one.
-  - ⚠ **No behaviour change for us, and the reason is the default.** `constraintsEnforcedByCaller` defaults
-    to `false`, so *"a host that says nothing gets the refusal it got before"*. Our commit paths say nothing.
-  - ⚠ **`SupportsExternalDataFileCommit` STOPPED LYING, and we read it in five places.** #140 found it
-    reported `true` for a constrained table while the commit refused — sending a caller off to write files
-    it could not then commit, the orphan its own docs promise to prevent. It is now `false` there, so our
-    five consumers take their fallback instead. **UNTESTED HERE** — no suite builds a constrained table
-    (fabricator never creates one: CHECK on CREATE is deliberately unsupported) — but the direction is the
-    safe one, and it is a real capability gap now worth reconsidering: we could opt in and let a constrained
-    Spark-authored table be writable.
+- **Four are CONSTRAINT ENFORCEMENT** — #136 evaluates CHECK constraints and column invariants, #138
+  computes generated columns, #139 re-validates an UPDATE's post-image, #140 lets a host commit a
+  constrained table by declaring `constraintsEnforcedByCaller`. Before these, EW refused every write to a
+  table that had one. **See §6 — this needed measuring, and the two things I wrote before measuring were
+  both wrong.**
 - **One is #145**, a docs fix (net472 is Windows-only to RUN, not to build).
 
 ### 4. WHAT THE BUMP EXPOSED IN OUR CODE: we were throwing away the signal #143 added
@@ -3150,3 +3142,90 @@ against the managed dir published BEFORE §4's edits:
 Both **byte-identical to the pre-bump tier**, which is the whole claim. `verify_delta_catalog_transactions`
 holds at **1040 per leg** — §42's declaration pins (v2 `true`, v3 `false`, autocommit absent) pass against
 upstream's re-cut, which is the content check §1 asks for expressed as a test rather than as a diff.
+
+### 6. `SupportsExternalDataFileCommit` — what the constraint commits actually changed for us
+
+I wrote this up twice before measuring it and was wrong both times: first *"nothing changes for us"* (the
+`constraintsEnforcedByCaller` opt-in defaults to false, so our commit paths get the refusal they got
+before), then *"a capability gain worth revisiting"*. The truth is narrower than the second and much larger
+than the first. **Measured on a table declaring `delta.constraints.pos = 'id > 0'`, on BOTH table shapes
+(deletion vectors on — the default — and `deletion_vectors false, column_mapping 'none'`), identical
+results:**
+
+| statement | result |
+|---|---|
+| `INSERT` satisfying | **works** |
+| `INSERT` violating | refused BY EVALUATION — *"CHECK constraint 'delta.constraints.pos' (id > 0) is violated by a row being written. No data was committed."* |
+| `UPDATE` | **REFUSED**, even when the post-image satisfies the constraint — *"…this write path cannot evaluate it against the rows; write rejected."* |
+| `DELETE` | **REFUSED** likewise, though a delete has no post-image to check at all |
+| `CREATE OR REPLACE` | works, and **copies the declaration forward** |
+
+⇒ **a constrained Delta table is INSERT-ONLY through fabricator.** Before the bump it was fully unwritable
+(`HonorWriterFeatures` threw for any `delta.constraints.*` key), so this is a real gain — just not the one
+"constraint enforcement landed" suggests.
+
+**The mechanism is the property, and it is a fallback gate rather than a check of ours.** #140 found
+`SupportsExternalDataFileCommit` reporting `true` for a constrained table while the commit refused — sending
+a caller off to write files it could not then commit, the orphan its own docs promise to prevent. It is now
+`false` there. We read it in FIVE places, all fallback gates, so an INSERT is steered off the streaming
+external-commit path onto engineered-wood's `WriteAsync`, where the rows exist to be checked. Our
+UPDATE/DELETE are COMPOSED from file-level staging APIs (`StageDataFilesAsync` / `CommitDataFilesAsync`)
+which are handed FINISHED FILES, so engineered-wood refuses them rather than commit unvalidated.
+
+⚠ **THE `created_by` PROBE DOES NOT DISCRIMINATE — I ran it and nearly recorded its answer.** Comparing a
+constrained table's data files against an unconstrained twin's, both report `DuckDB`: under `native_write`
+BOTH paths hand the file writing to DuckDB's COPY, and only the COMMIT differs. The discriminator is the
+Debug log — `delta stream-write … deferred 1 file(s) … to the transaction commit` (external commit) versus
+`delta write … mode=Append rows=1 batches=1 writer=native-duckdb` (`WriteAsync`) — captured on one catalog
+with an unconstrained control taking identical statements. **The file WRITER is not the COMMIT PATH.**
+
+#### 6a. It was a ONE-WAY DOOR, and that is the part that had to be fixed
+
+`fabricator_delta_set_tblproperties` commits through `CommitDataFilesAsync` with an **EMPTY file list** plus
+a `metaData` extra action. engineered-wood applies its constraint refusal to the CALL rather than to the
+rows, so a constrained table rejected **every property edit — including the one that removes the
+constraint**. MEASURED: the unset failed with *"this write path cannot evaluate it against the rows"*, and
+the only escape from our side was DROP + re-create, since a `CREATE OR REPLACE` copies the declaration
+forward (also measured).
+
+Fixed by passing `constraintsEnforcedByCaller: true` on the **two metadata-only commits** (`SET
+TBLPROPERTIES` and the partitioned `SET`/`RESET SORTED BY`), where the claim is **VACUOUSLY TRUE**: the file
+list is `Array.Empty`, so no rows are written and nothing can violate anything.
+
+⚠ **Legitimate ONLY while the file list is empty.** On a call that writes files this would be a claim we
+cannot support, and a wrong one poisons the table for every later reader — engineered-wood spells the
+parameter as an assertion for exactly that reason. The two sites are the only `CommitDataFilesAsync` calls
+in the Bridge passing `Array.Empty<WrittenDataFile>()`; that is a checkable property, not a convention.
+
+#### 6b. Gate and controls
+
+`verify_delta_tblproperties` §8, **102 → 132**, on the DEFAULT table shape (a constrained-table gate on a
+non-default shape would be testing the wrong user).
+
+- **The unconstrained twin is the load-bearing control**: an identical table taking identical statements.
+  Without it every refusal would pass equally if negative ids had stopped being writable, or if UPDATE and
+  DELETE had broken on this provider altogether.
+- **The violating-INSERT assertion is the fix's positive control**, which is why it sits BEFORE the unset:
+  the property is declared through the very call that now asserts enforcement, so a leak of the vacuous
+  assertion into the row-writing paths would show up there as an accepted violating row.
+- **Mutation-tested**: reverting `constraintsEnforcedByCaller` to `false` survives **124 assertions** and
+  dies at exactly the unset.
+- ⚠ The property assertion is FILTERED to the constraint key — the default attach declares deletion-vector,
+  row-tracking and column-mapping properties beside it, and a first version asserting the whole list failed
+  for that reason alone.
+
+#### 6c. Two upstream observations, both from one root
+
+The refusal keys on the CALL rather than on whether rows exist. So:
+
+1. **A commit writing ZERO data files cannot violate a row constraint.** Ours is now papered over by an
+   honest assertion, but every host that edits table properties this way hits the same wall, and the
+   consequence — an unremovable constraint — is severe out of proportion to the cause.
+2. **A DELETE produces no post-image either.** Neither the deletion-vector form (which writes no rows at
+   all) nor the copy-on-write form (whose survivors were already in the table) can introduce a violating
+   row.
+
+The UPDATE refusal is right in general. But our composed path HOLDS the post-image batches before it writes
+files, so a public way to evaluate a table's constraints against batches — engineered-wood has
+`DeltaConstraintEnforcer`, `internal` — would let us assert honestly instead of being refused. That is the
+shape of a self-contained offer: it needs nothing of ours, and it is what the seam already does one layer up.

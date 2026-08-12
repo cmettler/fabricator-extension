@@ -1782,6 +1782,33 @@ principal wins even if `PROVIDER` says something else:
 > `s3://` with a named secret (above), or a POSIX filesystem — Linux/macOS local paths get a real `O_EXCL`
 > and are multi-process safe.
 
+> ### ⚠ A table with CHECK constraints is INSERT-only here
+>
+> Delta stores a CHECK constraint as a `delta.constraints.<name>` table property, and Spark writes them with
+> `ALTER TABLE … ADD CONSTRAINT`. fabricator can **append** to such a table, and the constraint is genuinely
+> enforced — a violating row is rejected and nothing is committed:
+>
+> ```
+> INSERT INTO lake.main.t VALUES (-5);
+> -- IO Error: CHECK constraint 'delta.constraints.pos' (id > 0) is violated by a row being written.
+> --   No data was committed.
+> ```
+>
+> But `UPDATE` and `DELETE` on such a table are **refused** ("this write path cannot evaluate it against the
+> rows"), including an `UPDATE` whose result would satisfy the constraint and a `DELETE`, which cannot
+> violate one at all. The reason is that those two are built from a lower-level Delta API that is handed
+> finished files rather than rows, so the engine has nothing to check and declines rather than commit
+> unchecked data. Do those statements from Spark, or drop the constraint first:
+>
+> ```sql
+> SELECT * FROM fabricator_delta_set_tblproperties('lake', 'main.t', '{"delta.constraints.pos":null}');
+> ```
+>
+> The same applies to a column invariant (`delta.invariants`) and to generated columns. Note
+> `CREATE OR REPLACE TABLE` is **not** an escape — it replaces the data and carries the declaration forward.
+> fabricator does not create constrained tables itself (`CREATE TABLE … CHECK (…)` is unsupported), so this
+> is about tables another engine wrote.
+
 > ### ⚠ Creating a table AND filling it is two commits, not one
 >
 > `CREATE TABLE t AS SELECT …` writes **two** Delta versions — v0 the schema (an *empty* table), v1 the

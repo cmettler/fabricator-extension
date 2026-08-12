@@ -448,3 +448,156 @@ SELECT count(*) FROM lr.main.t;
 
 statement ok
 DETACH lr;
+
+# ---- Slice 8: delta.constraints.* — a constrained table is INSERT-ONLY, and the INSERT is ENFORCED ----
+#
+# NEW BEHAVIOUR, arrived with the 2026-08-12 engineered-wood pin onto upstream (#136/#138/#139/#140), and
+# gated here because it arrived SILENTLY — nothing on our side asked for it, so nothing on our side would
+# notice it regressing. engineered-wood used to REFUSE EVERY write to a table declaring delta.constraints.*
+# or delta.invariants ("which this writer cannot evaluate; write rejected"); it now parses and evaluates
+# them. What that buys US is narrower than "such tables are writable", and the boundary is the point:
+#
+#     INSERT   works, and a violating row is refused by EVALUATION
+#     UPDATE   REFUSED outright — even when the post-image would satisfy the constraint
+#     DELETE   REFUSED outright — even though a delete has no post-image to check at all
+#
+# ⚠ THE MECHANISM IS NOT "our code checks constraints". `SupportsExternalDataFileCommit` reports false for a
+# constrained table, which steers an INSERT off the streaming external-commit path onto engineered-wood's
+# WriteAsync, where the rows exist to be checked. Our UPDATE/DELETE are COMPOSED from file-level staging
+# APIs (StageDataFilesAsync / CommitDataFilesAsync) which are handed finished files and have no rows to
+# check, so engineered-wood refuses them rather than commit unvalidated — the honest answer, and the safe
+# direction. Lifting it needs either `constraintsEnforcedByCaller` (a claim we cannot honestly make today)
+# or a public way to evaluate a table's constraints against batches we hold.
+#
+# ⚠ WE CANNOT CREATE A CHECK CONSTRAINT — `CREATE TABLE … CHECK (…)` is deliberately unsupported — so the
+# declaration goes in the way DELTA ITSELF stores one: a `delta.constraints.<name>` property holding the SQL
+# expression. That is exactly the shape a Spark-authored table arrives with, which is the case this serves.
+#
+# ⚠ MEASURED ON BOTH TABLE SHAPES, pinned on ONE: identical results with deletion vectors ON (the default,
+# used here) and with `deletion_vectors false, column_mapping 'none'` — so the copy-on-write and
+# merge-on-read DML paths are refused alike, and this is not a property of the DV configuration.
+#
+# ⚠ WHAT THIS DOES *NOT* ASSERT: which write path served the insert. That divergence is visible only in the
+# Debug log (`delta stream-write … deferred` vs `delta write … mode=Append`). The parquet `created_by` does
+# NOT discriminate — under native_write BOTH paths hand the file writing to DuckDB's COPY — which is worth
+# stating because it looks like it would.
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/ckcon' AS ck (TYPE fabricator, PROVIDER 'delta');
+
+statement ok
+CREATE TABLE ck.main.t AS SELECT i AS id FROM range(1, 6) t(i);
+
+# POSITIVE CONTROL, and it is the load-bearing half: an IDENTICAL table with NO constraint, taking the
+# IDENTICAL statements. Without it every refusal below would pass equally if negative ids had simply
+# stopped being writable, or if UPDATE/DELETE had broken on this provider altogether.
+statement ok
+CREATE TABLE ck.main.free AS SELECT i AS id FROM range(1, 6) t(i);
+
+statement ok
+SELECT * FROM fabricator_delta_set_tblproperties('ck', 'main.t', '{"delta.constraints.pos":"id > 0"}');
+
+# ⚠ FILTERED to the constraint key on purpose: this attach takes the DEFAULT feature set, so the table
+# already declares deletion-vector / row-tracking / column-mapping properties beside it.
+query II
+SELECT property, value FROM fabricator_delta_tblproperties('ck', 'main.t')
+WHERE property = 'delta.constraints.pos';
+----
+delta.constraints.pos	id > 0
+
+# INSERT: a satisfying row lands.
+statement ok
+INSERT INTO ck.main.t VALUES (10);
+
+query I
+SELECT count(*) FROM ck.main.t;
+----
+6
+
+# INSERT: a violating row is refused, and the message names the constraint AND its expression.
+statement error
+INSERT INTO ck.main.t VALUES (-5);
+----
+is violated by a row being written
+
+# ⚠ THE REFUSAL MUST HAVE COMMITTED NOTHING — a rejected write that still landed its file would be worse
+# than no enforcement at all, because the table would then hold a row every later reader trusts.
+query II
+SELECT count(*), count(*) FILTER (WHERE id < 0) FROM ck.main.t;
+----
+6	0
+
+# The control takes the same row happily, so the refusal above is the CONSTRAINT talking.
+statement ok
+INSERT INTO ck.main.free VALUES (-5);
+
+query I
+SELECT count(*) FILTER (WHERE id < 0) FROM ck.main.free;
+----
+1
+
+# UPDATE: refused, and NOT because the post-image is bad — this one is perfectly legal.
+statement error
+UPDATE ck.main.t SET id = 11 WHERE id = 10;
+----
+cannot evaluate it against the rows
+
+query II
+SELECT count(*) FILTER (WHERE id = 10), count(*) FILTER (WHERE id = 11) FROM ck.main.t;
+----
+1	0
+
+# DELETE: refused too, though a delete has no post-image a constraint could be checked against.
+statement error
+DELETE FROM ck.main.t WHERE id = 1;
+----
+cannot evaluate it against the rows
+
+query I
+SELECT count(*) FROM ck.main.t;
+----
+6
+
+# The control's UPDATE and DELETE both work, which is what makes the two refusals attributable.
+statement ok
+UPDATE ck.main.free SET id = 111 WHERE id = 1;
+
+statement ok
+DELETE FROM ck.main.free WHERE id = 2;
+
+query II
+SELECT count(*) FILTER (WHERE id = 111), count(*) FILTER (WHERE id = 2) FROM ck.main.free;
+----
+1	0
+
+# ⚠ THE UNSET IS A REGRESSION GATE FOR A TRAP THIS WORK FOUND AND CLOSED: the declaration used to be a
+# ONE-WAY DOOR. `set_tblproperties` commits through CommitDataFilesAsync with an EMPTY file list, and
+# engineered-wood applies its constraint refusal to the CALL rather than to the rows — so a table declaring
+# delta.constraints.* rejected EVERY property edit, including the one that would remove the constraint.
+# MEASURED before the fix: this exact statement failed with "this write path cannot evaluate it against the
+# rows", and the only escape from our side was DROP + re-create (CREATE OR REPLACE does NOT help — measured:
+# it replaces the data and COPIES THE DECLARATION FORWARD). Fixed by passing constraintsEnforcedByCaller on
+# the two metadata-only commits, where the claim is VACUOUSLY true because no rows are written.
+#
+# ⚠ The violating-INSERT refusal above is that fix's POSITIVE CONTROL, and it is why it sits earlier in this
+# section: the property was declared through the very call that now asserts enforcement, so if the vacuous
+# assertion had leaked into the row-writing paths, that INSERT would have been accepted.
+statement ok
+SELECT * FROM fabricator_delta_set_tblproperties('ck', 'main.t', '{"delta.constraints.pos":null}');
+
+statement ok
+UPDATE ck.main.t SET id = 11 WHERE id = 10;
+
+statement ok
+DELETE FROM ck.main.t WHERE id = 1;
+
+statement ok
+INSERT INTO ck.main.t VALUES (-5);
+
+query III
+SELECT count(*), count(*) FILTER (WHERE id = 11), count(*) FILTER (WHERE id < 0) FROM ck.main.t;
+----
+6	1	1
+
+statement ok
+DETACH ck;

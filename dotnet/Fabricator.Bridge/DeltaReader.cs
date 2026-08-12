@@ -119,7 +119,19 @@ internal static class DeltaReader
             return await table.CommitDataFilesAsync(
                 System.Array.Empty<WrittenDataFile>(), DeltaWriteMode.Append,
                 extraActions: new DeltaAction[] { metaData },
-                expectedVersion: snapshot.Version, operation: "SET TBLPROPERTIES").ConfigureAwait(false);
+                expectedVersion: snapshot.Version, operation: "SET TBLPROPERTIES",
+                // ⚠ VACUOUSLY TRUE, AND THAT IS THE WHOLE JUSTIFICATION — the file list is
+                // Array.Empty, so this commit writes NO ROWS and there is nothing a CHECK constraint,
+                // an invariant or a generation expression could be violated by. engineered-wood applies
+                // its refusal to the CALL rather than to the rows, so without this a table declaring
+                // delta.constraints.* rejects every property edit — including the one that would REMOVE
+                // the constraint. MEASURED before fixing: `set_tblproperties('…', '{"delta.constraints.
+                // pos": null}')` failed with "this write path cannot evaluate it against the rows",
+                // i.e. the declaration was a ONE-WAY DOOR and the only escape was DROP + re-create.
+                // ⚠ Legitimate ONLY while the file list is empty. Passing this on a call that writes
+                // files would be a claim we cannot support, and a wrong one poisons the table for every
+                // later reader.
+                constraintsEnforcedByCaller: true).ConfigureAwait(false);
         }
         finally
         {
@@ -175,7 +187,14 @@ internal static class DeltaReader
                     System.Array.Empty<WrittenDataFile>(), DeltaWriteMode.Append,
                     cancellationToken: ct, extraActions: new DeltaAction[] { metaData },
                     expectedVersion: snapshot.Version,
-                    operation: canonical.Count > 0 ? "SET SORTED BY" : "RESET SORTED BY")
+                    operation: canonical.Count > 0 ? "SET SORTED BY" : "RESET SORTED BY",
+                    // Vacuously true — empty file list, so no rows exist to violate anything. Same
+                    // argument as the SET TBLPROPERTIES commit above, which carries the full note.
+                    // ⚠ Only THIS branch needs it: the non-partitioned branch below goes through
+                    // SetClusteringColumnsAsync, which does not run the write-time expression check at
+                    // all (verified — SET SORTED BY on a non-partitioned constrained table already
+                    // worked). So the two spellings agree rather than one being an oversight.
+                    constraintsEnforcedByCaller: true)
                     .ConfigureAwait(false);
             }
             return await table.SetClusteringColumnsAsync(

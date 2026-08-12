@@ -258,7 +258,14 @@ case "$TIER" in
         # codec engine and nothing on the native one, both safe. Pinning the old exact five-row table pinned
         # an ENGINE rather than a behaviour, which an engine-doubled suite cannot do; it now pins the
         # declarations plus the SAFETY PROPERTY (no version except the genuinely blind one claims blind).
-        : "${MIN_ASSERTIONS:=6981}"
+        # 7023 since 2026-08-12: verify_delta_tblproperties (+30) — the §8 constraint gate. A Delta table
+        # declaring delta.constraints.* turned out to be INSERT-ONLY here (the INSERT is enforced by
+        # evaluation; UPDATE and DELETE are refused), which arrived SILENTLY with the engineered-wood pin
+        # onto upstream — nothing on our side asked for it, so nothing on our side would have noticed it
+        # regressing. Its unset assertion doubles as the regression gate for the ONE-WAY DOOR that pass
+        # closed: a constrained table used to reject every property edit, including the one removing the
+        # constraint. ⚠ The unconstrained twin taking identical statements is the load-bearing control.
+        : "${MIN_ASSERTIONS:=7023}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh
