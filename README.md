@@ -2029,6 +2029,14 @@ un-commit. Read the recorded version back and decide whether the batch still nee
 > A transaction that merely `SELECT`ed the table before appending is treated the same way, because Delta
 > defines "blind append" over the whole transaction rather than over one statement. Autocommit `INSERT`s
 > are unaffected and still retry.
+>
+> **⚠ And a transaction that CHANGES the schema or properties gives up its own exemption (2026-08-13).**
+> A plain append normally commutes with whatever else lands in the window. But if *your* transaction also
+> carries an `ALTER TABLE`, a `fabricator_delta_set_tblproperties`, or an insert into an `IDENTITY` table
+> (which records a high-water mark), it can now conflict with someone else's concurrent append. The reason
+> is that an append written against the old schema need not still be valid under your new one, so the
+> exemption is withdrawn — this is what Delta itself does at `write_serializable`, the default here. Retry
+> the transaction, or do the schema edit on its own.
 
 > ### What `VACUUM` does and does not touch
 >

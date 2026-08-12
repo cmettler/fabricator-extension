@@ -3229,3 +3229,66 @@ The UPDATE refusal is right in general. But our composed path HOLDS the post-ima
 files, so a public way to evaluate a table's constraints against batches — engineered-wood has
 `DeltaConstraintEnforcer`, `internal` — would let us assert honestly instead of being refused. That is the
 shape of a self-contained offer: it needs nothing of ours, and it is what the seam already does one layer up.
+
+### 7. The 2026-08-13 follow-on — `9d204d7 → 2c51cd7`, two commits
+
+Pulled the day after the pin. Compile cost ZERO again (0 errors, the same 8 pre-existing warnings), and the
+patch set is still empty — `git diff upstream/main HEAD -- src/` is silent, and HEAD *is* `upstream/main`.
+
+#### 7a. #146 (`b00bde5`) closes a divergence THIS FILE'S OWNER RECORDED AND NEVER CHASED
+
+CLAUDE.md carried it as a loose end beside the isBlindAppend work:
+
+> Second, smaller divergence: Delta's WriteSerializable branch is guarded by
+> `!currentTransactionInfo.metadataChanged` … EW's `examineAdds = isolation == Serializable ||
+> !concurrentIsBlindAppend` has no such guard. Not investigated; note it before offering the reading half
+> upstream as "Delta-equivalent".
+
+Upstream implemented exactly that third term. Delta's gate:
+
+```scala
+case WriteSerializable if !currentTransactionInfo.metadataChanged => winningCommitSummary.changedDataAddedFiles
+case Serializable | WriteSerializable => winningCommitSummary.changedDataAddedFiles ++ blindAppendAddedFiles
+```
+
+⚠ **IT BITES US, because the catalog default is `write_serializable` again** (reversed 2026-08-11). A
+transaction of OURS carrying a `metaData` action — a buffered ALTER, an identity append fusing its
+high-water mark, `set_tblproperties`/`SET SORTED BY`, a CREATE — now conflicts with a concurrent blind
+append where it used to commute. Safe direction and Delta parity, so this is a correctness gain, not a
+regression to work around.
+
+⚠ **Invisible to every suite**, for the reason that keeps recurring here: sqllogictest drives connections
+sequentially, so no gate can produce the concurrent commit. Both tiers being byte-identical is evidence the
+change is inert WITHOUT contention, and evidence of nothing else.
+
+⚠ **METADATA only, NOT protocol** — upstream checked against the `v4.0.0` tag rather than assuming. Delta's
+`metadataChanged` is `newMetadata.nonEmpty`, assigned by a loop whose only case is `case m: Metadata`, and no
+separate protocol term feeds the gate. Issue #126 had proposed deriving it from "a MetadataAction or
+ProtocolAction", which would have been STRICTER than Delta — a transaction merely enabling a table feature
+would start conflicting with concurrent appends. Worth keeping: erring strict is still erring.
+
+⚠ **Derived from the actions, not declared — the OPPOSITE of `isBlindAppend`, and the distinction is the
+reusable part.** Whether a commit carries a `Metadata` action is fully visible in what is about to be
+written, so the library can and should derive it. Blind-append is a property of the transaction's READS,
+which the actions do not record, so that one must be told. Two adjacent terms of one gate, with opposite
+answers to "may the library work this out itself?".
+
+`ConflictChecker.CheckAsync` swapped `ISet<string> plannedRemovePaths` for the full
+`IReadOnlyList<DeltaAction> currentActions` (removes are now read off the actions, post-rebase). No compile
+impact here — we call `CommitDataFilesAsync` / `WriteAsync` / `DeltaTransaction.CommitAsync`, never the
+checker.
+
+#### 7b. #147 ships XML documentation, and 1.1 MB of it lands in OUR payload
+
+Six `EngineeredWood.*.xml` files now appear in the published managed directory, which is what the
+single-file distribution artifact packs. Beside the 768 KB of `.pdb` already there that is ~1.6% of a 118 MB
+self-contained payload.
+
+FLAGGED, NOT FIXED. `<AllowedReferenceRelatedFileExtensions>none</AllowedReferenceRelatedFileExtensions>`
+in `Fabricator.Bridge.csproj` drops reference-related `.xml` and `.pdb` in one line, but it changes what
+ships, and a packaging change does not belong in a dependency bump — the same rule this journal applies to
+behaviour changes. Do it as its own commit, against the distribution smoke tests.
+
+#### 7c. Gates
+
+Hermetic **69/69 — 7023** and service **50/50 — 2028**, both byte-identical to the run against `9d204d7`.
