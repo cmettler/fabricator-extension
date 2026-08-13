@@ -271,7 +271,14 @@ case "$TIER" in
         # delta_simple is a plain table, so all 36 original assertions passed with the bug fully present.
         # Each new shape is asserted THREE ways (catalog / delta_scan / native_scan) so "they agree" cannot be
         # satisfied by a reader that has stopped returning rows.
-        : "${MIN_ASSERTIONS:=7046}"
+        # 7076 since 2026-08-13: verify_delta_native_scan (+30) — projection pushdown for both path-based
+        # Delta readers. ⚠ The load-bearing case is the REVERSE-ORDER projection: wrapper and binding resolve
+        # the column list through ONE ProjectionPlan which orders by the DECLARED schema, because
+        # engineered-wood emits in schema order whatever order it is asked in. Ordering by the request agrees
+        # with the declaration for almost every query and disagrees exactly out of schema order — where the
+        # failure is SIGSEGV, not a wrong answer. Mutation-tested: the request-order mutant crashes there
+        # after 67 assertions pass.
+        : "${MIN_ASSERTIONS:=7076}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

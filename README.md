@@ -822,9 +822,10 @@ SELECT * FROM fabricator_delta_native_scan('abfss://ws@onelake.dfs.fabric.micros
 ```
 
 Both functions read the Delta log the same way — deletion vectors, partition columns, column mapping and
-schema evolution are all applied — and both leave column projection to DuckDB above the scan, so neither
-prunes columns inside the parquet read. Which is faster depends on the table and the storage; measure rather
-than assume.
+schema evolution are all applied — and both **prune columns**: naming three columns of forty reads three,
+and `COUNT(*)` reads one. Filters are used to skip whole files and row groups (by partition value and by
+column statistics), and DuckDB re-applies the predicate above the scan, so the answer is exact either way.
+Which of the two is faster depends on the table and the storage; measure rather than assume.
 
 ### Provider macros
 

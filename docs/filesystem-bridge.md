@@ -128,12 +128,21 @@ skipping, byte-order-sound) — all green. The Apache.Arrow version is aligned (
   needed). engineered-wood never re-applies per row, and DuckDB re-applies above the scan, so the result is a
   correct superset. `test/verify_delta.test` (60 — incl. `=`/`IN`/`AND`-range pushed, and string `=`/`>`/`<>`
   correctly NOT pushed but still filtered by DuckDB).
-- **Column projection into the Parquet read — still deferred**: engineered-wood's `ReadAllAsync(columns, …)`
-  can read only the requested columns, but the shared `BindingBoundTable` wraps the result stream with the
-  binding's FULL `OutputSchema`, so returning a projected column SUBSET mismatches the declared schema
-  (arrow_ingest SIGSEGV). DuckDB still projects columns above the scan (by name), so this only forfeits the
-  Parquet column-read I/O savings, never correctness. Doing it needs a pushdown-native `IBoundTable` that
-  declares the projected schema (like the bespoke `SqlServerTableValuedFunction`) — a small follow-up.
+- **Column projection into the Parquet read — DONE 2026-08-13.** It was deferred because the shared
+  `BindingBoundTable` wrapped the result stream with the binding's FULL `OutputSchema`, so a projected SUBSET
+  mismatched the declaration (arrow_ingest SIGSEGV). The fix needed no "pushdown-native `IBoundTable`" as
+  predicted here: the WRAPPER holds both the full schema and the spec, so it declares the projected schema
+  itself and the bindings resolve their column list through the same `ProjectionPlan`.
+  - ⚠ What actually blocked it was a NAME, not the plumbing: one `SupportsPushdown` flag conflated "already
+    filtered" with "only the requested columns". Both Delta readers must answer FALSE to the first
+    (engineered-wood prunes files/row-groups then never re-checks per row ⇒ superset), which switched the
+    projection off with it. Split into `SupportsFilterPushdown` / `SupportsProjectionPushdown` first.
+  - MEASURED 40 cols × 200k rows: ~40% faster on the native reader for 1-of-40, ~17% on the codec one, and
+    `COUNT(*)` dropped from reading 40 columns to 1 (DuckDB pushes ONE column for it, not zero — read off the
+    reader's own log, contradicting the prediction that an empty list would force a full read).
+  - ⚠ The projected ORDER is the declared schema's, and that is required rather than tidy: engineered-wood
+    emits in SCHEMA order whatever order it is asked in, so request-ordering crashes on any out-of-schema-order
+    query. Mutation-tested.
 
 ## Next (a real lakehouse provider — not built)
 

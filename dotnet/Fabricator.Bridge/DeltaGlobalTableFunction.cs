@@ -70,9 +70,10 @@ public sealed class DeltaGlobalTableFunction : ITableFunction
         // answer rather than a missed optimisation.
         public bool SupportsFilterPushdown => false;
 
-        // Not claimed either, but for a different reason — a seam limitation, not a semantic one. See the
-        // note in Execute: BindingBoundTable declares the stream with the binding's FULL OutputSchema.
-        public bool SupportsProjectionPushdown => false;
+        // Claimed since 2026-08-13: engineered-wood reads ONLY the requested columns, and BindingBoundTable
+        // now declares the projected schema (it resolves it with the same ProjectionPlan used below, so the
+        // batches and the declaration cannot disagree). Exact by nature — there is no "superset of columns".
+        public bool SupportsProjectionPushdown => true;
 
         public IAsyncEnumerable<RecordBatch> Execute(TableFunctionScan scan, CancellationToken ct = default)
         {
@@ -88,12 +89,12 @@ public sealed class DeltaGlobalTableFunction : ITableFunction
             var filter = spec?.Filter is { } node
                 ? new DeltaFilterBuilder(ReadValues(scan.FilterValues)).Build(node)
                 : null;
-            // Column PROJECTION is intentionally NOT pushed into engineered-wood here: the shared
-            // BindingBoundTable wraps this stream with the binding's FULL OutputSchema, so returning a
-            // projected column subset would mismatch the declared schema (arrow_ingest SIGSEGV). DuckDB still
-            // projects columns above the scan (by name). True column-pruning into the Parquet read would need
-            // a pushdown-native bound table that declares the projected schema — see docs/filesystem-bridge.md.
-            return DeltaReader.Stream(opener, _path, columns: null, filter, ct);
+            // Column PROJECTION: engineered-wood reads only these from the Parquet. ProjectionPlan returns
+            // null when everything must be read — nothing pushed, an EMPTY list (the COUNT(*) shape: a
+            // zero-field schema is not expressible across the Arrow C interface), or a name this binding does
+            // not declare — and null means "all columns", which is what `columns: null` already meant.
+            var columns = ProjectionPlan.Columns(_schema, spec?.Columns);
+            return DeltaReader.Stream(opener, _path, columns, filter, ct);
         }
 
         private static IReadOnlyList<object?> ReadValues(IArrowArrayStream? filterValues)
@@ -199,11 +200,12 @@ public sealed class DeltaNativeScanFunction : ITableFunction
 
         public Schema OutputSchema => _schema;
 
-        // Same two answers as fabricator_delta_scan above, for the same two reasons: the filter is pushed
-        // for file / row-group skipping but the result is a superset, and the projection is blocked by the
-        // seam rather than by the reader (DeltaNativeReader projects perfectly well — see Execute).
+        // The filter is pushed for file / row-group skipping but the result is a superset, so it stays
+        // unclaimed (see fabricator_delta_scan above for the full argument). The PROJECTION is claimed:
+        // DeltaNativeReader names exactly the requested columns in its generated SQL, so DuckDB prunes them
+        // inside the Parquet read.
         public bool SupportsFilterPushdown => false;
-        public bool SupportsProjectionPushdown => false;
+        public bool SupportsProjectionPushdown => true;
 
         public IAsyncEnumerable<RecordBatch> Execute(TableFunctionScan scan, CancellationToken ct = default)
         {
@@ -232,9 +234,21 @@ public sealed class DeltaNativeScanFunction : ITableFunction
             // the identical limitation for the identical reason; lifting it needs a bound table that
             // declares the PROJECTED schema.
             var spec = scan.Spec;
-            var pushed = spec is null
+            // ⚠ Columns are re-resolved through ProjectionPlan rather than forwarded verbatim: it drops the
+            // shapes that must read everything and, crucially, fixes the ORDER to the declared schema's —
+            // DeltaNativeReader emits in the order it is handed, and BindingBoundTable declares in that same
+            // order. Forwarding spec.Columns as given would let the two disagree whenever DuckDB asks for
+            // columns out of schema order.
+            var columns = spec is null ? null : ProjectionPlan.Columns(_schema, spec.Columns);
+            var pushed = spec is null && columns is null
                 ? null
-                : new ScanSpec { Filter = spec.Filter, NativeFilter = spec.NativeFilter, At = spec.At };
+                : new ScanSpec
+                {
+                    Columns = columns is null ? null : new System.Collections.Generic.List<string>(columns),
+                    Filter = spec?.Filter,
+                    NativeFilter = spec?.NativeFilter,
+                    At = spec?.At,
+                };
             var stream = DeltaNativeReader.Read(
                 AmbientOpener.Current, _path, _schema, pushed, FilterConstants.Read(scan.FilterValues),
                 unit: null, value: null);

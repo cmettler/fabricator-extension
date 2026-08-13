@@ -141,3 +141,83 @@ SELECT count(*), sum(v) FROM fabricator_delta_native_scan('${FABRICATOR_DELTA_WR
 
 statement ok
 DETACH ns;
+
+# ---- Projection pushdown: the batches must match the DECLARED schema, and the rows must not change ----
+#
+# Both path-based readers prune columns as of 2026-08-13. The risk this section covers is NOT "too many
+# columns read" (invisible from SQL, and only a performance question) but the declaration going out of step
+# with what is emitted: BindingBoundTable declares the stream's schema and arrow_ingest trusts it, so a
+# mismatch reads past the end of the batch — SIGSEGV, not an error message.
+#
+# ⚠ THE REVERSE-ORDER CASE IS THE LOAD-BEARING ONE. Wrapper and binding resolve the column list through the
+# SAME ProjectionPlan, which orders by the DECLARED schema rather than by the request. Ordering by the
+# request instead would agree with the declaration for almost every query — and disagree exactly when DuckDB
+# asks out of schema order, which is what this asks for.
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/proj' AS pj (TYPE fabricator, PROVIDER 'delta');
+
+statement ok
+CREATE TABLE pj.main.t AS SELECT i AS id, i * 2 AS v, 'n' || i AS name FROM range(1, 6) t(i);
+
+# A deletion vector, so every assertion below also proves the projection did not cost the DV.
+statement ok
+DELETE FROM pj.main.t WHERE id = 2;
+
+# ONE column, and the narrowest kind of read there is.
+query I
+SELECT sum(id) FROM fabricator_delta_native_scan('${FABRICATOR_DELTA_WRITE_DIR}/proj/t');
+----
+13
+
+query I
+SELECT sum(v) FROM fabricator_delta_scan('${FABRICATOR_DELTA_WRITE_DIR}/proj/t');
+----
+26
+
+# REVERSE of the declared order (schema is id, v, name).
+query III
+SELECT name, v, id FROM fabricator_delta_native_scan('${FABRICATOR_DELTA_WRITE_DIR}/proj/t') ORDER BY id LIMIT 1;
+----
+n1	2	1
+
+query III
+SELECT name, v, id FROM fabricator_delta_scan('${FABRICATOR_DELTA_WRITE_DIR}/proj/t') ORDER BY id LIMIT 1;
+----
+n1	2	1
+
+# A middle column alone — neither first nor last, so an off-by-one in the resolver shows up as wrong VALUES
+# rather than as a missing column.
+query I
+SELECT list(v ORDER BY v) FROM fabricator_delta_native_scan('${FABRICATOR_DELTA_WRITE_DIR}/proj/t');
+----
+[2, 6, 8, 10]
+
+query I
+SELECT list(v ORDER BY v) FROM fabricator_delta_scan('${FABRICATOR_DELTA_WRITE_DIR}/proj/t');
+----
+[2, 6, 8, 10]
+
+# Projection AND filter together: the filter is pushed for skipping but NOT claimed, so DuckDB re-applies —
+# the answer must be exact even though the reader may hand back a superset.
+query II
+SELECT count(*), sum(id) FROM fabricator_delta_native_scan('${FABRICATOR_DELTA_WRITE_DIR}/proj/t') WHERE id > 3;
+----
+2	9
+
+query II
+SELECT count(*), sum(id) FROM fabricator_delta_scan('${FABRICATOR_DELTA_WRITE_DIR}/proj/t') WHERE id > 3;
+----
+2	9
+
+# SELECT * must still deliver every column, in declaration order.
+query III
+SELECT * FROM fabricator_delta_native_scan('${FABRICATOR_DELTA_WRITE_DIR}/proj/t') ORDER BY id;
+----
+1	2	n1
+3	6	n3
+4	8	n4
+5	10	n5
+
+statement ok
+DETACH pj;

@@ -25,9 +25,20 @@ public sealed class BindingBoundTable : IBoundTable
     public Schema OutputSchema => _binding.OutputSchema;
     public bool MapResultByName => _supportsPushdown;
 
-    public IArrowArrayStream Execute(string? specJson, IArrowArrayStream? filterValues) =>
-        new AsyncEnumerableArrowStream(
-            _binding.OutputSchema, _binding.Execute(new TableFunctionScan(specJson, filterValues)));
+    public IArrowArrayStream Execute(string? specJson, IArrowArrayStream? filterValues)
+    {
+        var scan = new TableFunctionScan(specJson, filterValues);
+        // ⚠ THE DECLARED SCHEMA IS THE CONTRACT WITH arrow_ingest, AND IT USED TO BE UNCONDITIONALLY THE FULL
+        // ONE — which is what made projection pushdown impossible for every binding behind this wrapper, the
+        // two path-based Delta readers included. A binding that emitted a subset would have mismatched the
+        // declaration, and the host does not error on that: it reads columns that are not there (SIGSEGV).
+        // So the projection is honoured HERE, where both the full schema and the spec are in hand, rather
+        // than by adding a per-scan schema to the binding interface.
+        var schema = _binding.SupportsProjectionPushdown
+            ? ProjectionPlan.Schema(_binding.OutputSchema, scan.Spec?.Columns)
+            : _binding.OutputSchema;
+        return new AsyncEnumerableArrowStream(schema, _binding.Execute(scan));
+    }
 
     public void Dispose() => _binding.Dispose();
 }
