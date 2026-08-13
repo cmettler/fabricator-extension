@@ -1637,6 +1637,32 @@ public sealed class DeltaCatalog : IBackendCatalog
             schemaName, tableName, _pushdownMode, spec?.NativeFilter ?? "<none>",
             spec is null ? "<null>" : (spec.Columns is null ? "no-cols" : $"cols={spec.Columns.Count}"));
         var filterVals = ReadFilterValues(filterValues);
+        // THE BIND-TIME SCHEMA PROBE reads no rows, so it must not pay for any: it describes the table and
+        // returns an EMPTY stream. `PopulateReturnSchema` calls get_schema and releases without ever pulling
+        // a batch, so the body below is never enumerated.
+        //
+        // ⚠ MEASURED on a Fabric lakehouse table at v1850 (89 active files, 1851 commits, 18 checkpoints at
+        // interval 100): the probe cost 85 s of a 291 s `SELECT three columns … LIMIT 1` that reads its row
+        // in 2 — 47 s LISTING every active file and 38 s BUILDING a `read_parquet` over all 24 columns, for
+        // a stream nobody reads. The schema open it KEEPS (26 s here) is not waste: it is the pin seed.
+        //
+        // ⚠ IT STILL SEEDS THE SNAPSHOT PIN, and that is load-bearing rather than leftover. The probe runs in
+        // the statement's own transaction, so whichever open happens first decides the version; if the probe
+        // described the table at latest and seeded nothing, a concurrent ALTER landing between bind and
+        // execute would give the plan one schema and the scan another — the shape arrow_ingest reads past the
+        // end of. Seeding here keeps schema and rows on ONE version exactly as before (the real scan then
+        // consults the pin instead of opening at latest), which is the invariant
+        // `verify_delta_autocommit_pin` exists to hold and the reason fabricator_table_entry.cpp routes this
+        // through the scan at all.
+        // ⚠ `spec.SchemaOnly` ONLY — deliberately NOT `spec is null`, although the pin/read-set block below
+        // treats a null spec as a probe too. Those are different claims: skipping the read set is harmless
+        // for a caller that turns out to want rows, whereas returning an EMPTY stream to one would silently
+        // lose them. The host's probe always says `{"schema_only":true}` (fabricator_table_entry.cpp), so
+        // nothing is given up by refusing to infer.
+        if (spec?.SchemaOnly == true)
+        {
+            return SchemaProbe(opener, path, spec);
+        }
         if (_pushdownMode == PushdownMode.None && spec is not null)
         {
             // Pure fallback: consume no filters at all — DuckDB applies everything above the scan.
@@ -1654,9 +1680,9 @@ public sealed class DeltaCatalog : IBackendCatalog
         // scans read committed history, not the transaction's snapshot — excluded. Under SERIALIZABLE the
         // first read also pins the transaction's base version (the rebase walks pin+1..latest; without a
         // pin an append-only transaction's reads would have no base to check against).
-        // ⚠ THE BIND-TIME SCHEMA PROBE MUST BE EXCLUDED — it asks what the columns are, it does not read
-        // rows, and recording it would both pollute the read set and (via PinVersion below) cost an extra
-        // `_delta_log` open through ResolveVersionAsOf.
+        // ⚠ THE BIND-TIME SCHEMA PROBE IS ALREADY GONE by the time we get here (it returned above) — it asks
+        // what the columns are, it does not read rows, and recording it would both pollute the read set and
+        // (via PinVersion below) cost an extra `_delta_log` open through ResolveVersionAsOf.
         //
         // It used to be identified IMPLICITLY as `spec == null`, on the reasoning that "every real scan
         // carries a spec with at least its projected columns". That was fragile in both directions and it
@@ -1665,8 +1691,7 @@ public sealed class DeltaCatalog : IBackendCatalog
         // it as the retired as-of resolver reappearing. The test is now EXPLICIT — a probe says so — and a
         // null spec still counts as one for callers that send none.
         long scanTxn = AmbientTransaction.Current;
-        bool schemaProbe = spec is null || spec.SchemaOnly;
-        if (!schemaProbe && scanTxn != 0 && spec!.At is null && _txnBuffer.IsExplicit(scanTxn))
+        if (spec is not null && scanTxn != 0 && spec.At is null && _txnBuffer.IsExplicit(scanTxn))
         {
             var readPending = _txnBuffer.GetOrCreate(scanTxn, path);
             if (filter is null)
@@ -1964,6 +1989,112 @@ public sealed class DeltaCatalog : IBackendCatalog
         return (names, new Schema(fields, fullSchema.Metadata));
     }
 
+    /// <summary>
+    /// The bind-time schema probe: describe the table and produce NO rows. Resolves the snapshot by exactly
+    /// the same precedence the two real read paths use — explicit AT &gt; a pending buffered ALTER's schema &gt;
+    /// the transaction's pinned version &gt; latest (seeding the pin) — so the schema the plan is built against
+    /// is the schema the scan will read.
+    /// </summary>
+    /// <remarks>
+    /// ⚠ ONE resolution serves BOTH engines on purpose. <see cref="ScanNative"/> and <see cref="ScanCodec"/>
+    /// derive <c>userSchema</c> from the same three sources in the same order; they diverge only in how they
+    /// DECODE rows, and this reads none. Branching on <c>_nativeRead</c> here would duplicate the precedence
+    /// rule in a third place for no observable difference.
+    ///
+    /// ⚠ The projection is handled although a probe carries none today (<c>{"schema_only":true}</c> has no
+    /// column list, so <see cref="ProjectFor"/> returns the full schema and the rowid is not requested).
+    /// Written generally because a probe that ever DID carry one must describe what it asked for, and a
+    /// schema that silently ignores the request is the mismatch class this whole path exists to avoid.
+    /// </remarks>
+    private IArrowArrayStream SchemaProbe(nint opener, string path, ScanSpec? spec)
+    {
+        var pending = spec?.At is null ? _txnBuffer.Get(AmbientTransaction.Current, path) : null;
+        Schema userSchema;
+        if (spec?.At is { } at)
+        {
+            userSchema = DeltaReader.GetSchemaAt(opener, path, at.Unit, at.Value); // committed history
+        }
+        else if (pending?.PendingArrowSchema is { } pendingArrow)
+        {
+            userSchema = pendingArrow; // a pending buffered ALTER wins, as it does on both read paths
+        }
+        else
+        {
+            long txn = AmbientTransaction.Current;
+            long? pinned = pending?.PinnedVersion ?? (txn != 0 ? SnapshotPinning.TryGetPinned(txn, path) : null);
+            if (pinned is { } v)
+            {
+                userSchema = DeltaReader.GetSchemaAt(opener, path, "version",
+                    v.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            }
+            else
+            {
+                // ZERO-EXTRA-IO SNAPSHOT PIN, the same trick the two read paths use: this open reads latest
+                // anyway, so recording the version it saw costs nothing and every later reference in the
+                // statement/transaction reads AT it. PinVersion's GetOrAdd never overwrites, so a concurrent
+                // seeder wins harmlessly.
+                userSchema = DeltaReader.GetSchemaAndVersion(opener, path, out long latest);
+                if (txn != 0)
+                {
+                    long seeded = SnapshotPinning.PinVersion(txn, path, _ => latest, System.DateTime.UtcNow);
+                    _log.LogDebug("delta probe pin {Path} -> v{Version}", path, seeded);
+                }
+            }
+        }
+        var (_, projected) = ProjectFor(userSchema, spec);
+        bool wantRowId = spec?.Columns is { } cols && cols.Contains(RowIdColumn);
+        var outSchema = wantRowId ? SchemaWithRowId(projected) : projected;
+        _log.LogDebug("delta schema probe {Path}: {Count} columns, no rows read", path, outSchema.FieldsList.Count);
+        return new AsyncEnumerableArrowStream(outSchema, NoBatches());
+    }
+
+    private static async System.Collections.Generic.IAsyncEnumerable<RecordBatch> NoBatches()
+    {
+        await Task.CompletedTask.ConfigureAwait(false);
+        yield break;
+    }
+
+    /// <summary>
+    /// TEMPORARY (env-gated, <c>FABRICATOR_DELTA_PROBE_CHECK=1</c>): does the schema
+    /// <see cref="SchemaProbe"/> derives from the Delta schema MATCH the one the native reader advertises?
+    /// </summary>
+    /// <remarks>
+    /// The native reader does NOT trust <c>userSchema</c> — <c>DeltaNativeReader.ProbeSchema</c> runs a
+    /// <c>LIMIT 0</c> against a real data file and advertises DuckDB's own types, falling back to the
+    /// userSchema-derived form only when the table has no file to probe. If those two ever disagree, the
+    /// bind-time schema and the executed batches disagree, which is the read-past-the-end (SIGSEGV) class —
+    /// so the short-circuit is only sound if they are the same, and that has to be MEASURED, not assumed.
+    /// </remarks>
+    // Read ONCE, like the Fabricator.Memory marks gate on ILogger.IsEnabled: this sits on every scan, and an
+    // environment lookup per scan is exactly the cost the probe exists to avoid adding.
+    private static readonly bool ProbeCheckEnabled =
+        System.Environment.GetEnvironmentVariable("FABRICATOR_DELTA_PROBE_CHECK") == "1";
+
+    private void ProbeSchemaSelfCheck(string path, Schema advertised, Schema userSchema, ScanSpec? spec)
+    {
+        if (!ProbeCheckEnabled)
+        {
+            return;
+        }
+        var (_, projected) = ProjectFor(userSchema, spec);
+        bool wantRowId = spec?.Columns is { } cols && cols.Contains(RowIdColumn);
+        var derived = wantRowId ? SchemaWithRowId(projected) : projected;
+        // SORTED by name on purpose: the question is TYPE fidelity, which is what makes the short-circuit
+        // sound or unsound. Column ORDER is a separate and already-settled matter — arrow_ingest maps by
+        // name, and the probe's own order (no projection => userSchema order) is what defines the plan's.
+        static string Render(Schema s) =>
+            string.Join(",", s.FieldsList.Select(f => $"{f.Name}:{f.DataType}").OrderBy(x => x, System.StringComparer.Ordinal));
+        string a = Render(advertised), d = Render(derived);
+        if (!string.Equals(a, d, System.StringComparison.Ordinal))
+        {
+            _log.LogWarning("PROBE-CHECK MISMATCH {Path}\n  advertised={A}\n  derived   ={D}", path, a, d);
+        }
+        else
+        {
+            _log.LogInformation("PROBE-CHECK ok {Path} ({Count} cols)", path, advertised.FieldsList.Count);
+        }
+    }
+
     // Native read (native_read true): resolve the snapshot (explicit AT > per-transaction pinned version >
     // latest), then let DuckDB's read_parquet decode the files via DeltaNativeReader. Pinning gives a consistent
     // cut across a multi-table query (all implicit-AT scans in one DuckDB transaction pin to the same instant).
@@ -2048,6 +2179,7 @@ public sealed class DeltaCatalog : IBackendCatalog
                                             pendingFiles: pendingNative?.Files,
                                             pendingDeletes: pendingNative?.DeletedByOrdinal,
                                             pendingSchema: pendingNative?.PendingDeltaSchema);
+        ProbeSchemaSelfCheck(path, native.Schema, userSchema, spec);
         if (pendingNative is not { Batches.Count: > 0 })
         {
             return native;
@@ -2186,6 +2318,7 @@ public sealed class DeltaCatalog : IBackendCatalog
                            IReadOnlyList<string>? sortColumns, string? schemaMode, bool partitionOverwrite,
                            string? optionsJson)
     {
+        InvalidateReadCache();
         var opener = Opener();
         _log.LogInformation("delta bulk {Schema}.{Table}: create={Create} replace={Replace} native_write={Native} partition_overwrite={PartOw}",
             schemaName, tableName, createTable, replace, _nativeWrite, partitionOverwrite);
@@ -2751,6 +2884,7 @@ public sealed class DeltaCatalog : IBackendCatalog
                             IReadOnlyList<string>? partitionColumns, IReadOnlyList<string>? sortColumns,
                             IReadOnlyList<string>? identityColumns, string? optionsJson)
     {
+        InvalidateReadCache();
         RejectFunctionSchemaDdl(schemaName, $"CREATE TABLE {tableName}");
         // Commit 0 itself is metadata-only, but a variant table is unusable without the native paths — fail
         // the CREATE up front with the actionable ATTACH-option error rather than at the first INSERT/SELECT.
@@ -2823,6 +2957,7 @@ public sealed class DeltaCatalog : IBackendCatalog
     /// Otherwise a no-op: OneLake schemas mirror the lakehouse, and the flat layout has only "main".</summary>
     public void CreateSchema(string s, bool ie)
     {
+        InvalidateReadCache();
         if (_schemas && OneLake() is null && !string.Equals(s, MainSchema, System.StringComparison.Ordinal))
         {
             HostFs.CreateDir(Opener(), _root + "/" + s); // recursive mkdir; idempotent
@@ -2854,6 +2989,7 @@ public sealed class DeltaCatalog : IBackendCatalog
         // starts seeing a concurrent writer's commits mid-transaction — snapshot isolation silently broken.
         // Releasing per transaction makes the panic path unreachable in normal operation.
         SnapshotPinning.Release(txnId);
+        DeltaTableCache.Release(txnId);
         // ⚠ CAPTURED BEFORE Remove, which CLEARS the explicit marker along with the buffer. Read after it,
         // this is always false and the blind-append declaration below silently degrades to "say nothing" —
         // green, and quietly never emitting the flag it exists to emit. Same ordering fact as §4b.3.
@@ -2959,6 +3095,7 @@ public sealed class DeltaCatalog : IBackendCatalog
     {
         long txnId = AmbientTransaction.Current;
         SnapshotPinning.Release(txnId); // see CommitTransaction — unconditional, before the early return
+        DeltaTableCache.Release(txnId);
         var tables = _txnBuffer.Remove(txnId);
         if (tables is null)
         {
@@ -4354,6 +4491,7 @@ public sealed class DeltaCatalog : IBackendCatalog
     /// <paramref name="ifExists"/> is satisfied either way.</summary>
     public void DropTable(string schemaName, string tableName, bool ifExists)
     {
+        InvalidateReadCache();
         _tableConfigCache.TryRemove(TablePath(schemaName, tableName), out _);
         long dropTxn = AmbientTransaction.Current;
         // CREATE + DROP inside one transaction still CANCELS OUT for the buffer — but the table IS on storage
@@ -4484,6 +4622,7 @@ public sealed class DeltaCatalog : IBackendCatalog
 
     public long ExecuteDelete(string schemaName, string tableName, IArrowArrayStream keys)
     {
+        InvalidateReadCache();
         var opener = Opener();
         var ids = CollectRowIds(keys);
         if (ids.Count == 0)
@@ -4537,8 +4676,27 @@ public sealed class DeltaCatalog : IBackendCatalog
     // <table> is '<schema>.<table>' (schema defaults to 'main'; qualify on a schema-enabled lakehouse). Returns
     // the affected count (VACUUM = files deleted; OPTIMIZE = 0). Important under DV-default: DVs + merge-on-read
     // append small files accumulate, so OPTIMIZE consolidates them (and materializes DV deletions).
+    /// <summary>
+    /// Drops this transaction's cached OPEN read tables (<see cref="DeltaTableCache"/>). Called at the head
+    /// of every MUTATING entry point.
+    /// </summary>
+    /// <remarks>
+    /// ⚠ Deliberately COARSE — it drops the whole transaction's cache rather than one path. Over-invalidating
+    /// costs a single re-open; under-invalidating is a silently stale read, and the set of operations that
+    /// commit IMMEDIATELY (bypassing the transaction buffer: CREATE OR REPLACE, DROP, OPTIMIZE, VACUUM, an
+    /// identity create, a partition overwrite) is a list that has to stay in sync as new ones are added.
+    /// Keying on "this call can change something" instead of on "this call is one of those six" removes that
+    /// maintenance liability.
+    /// <para>Note the ordinary staleness question is already answered by the snapshot PIN: within a
+    /// transaction every pinned read resolves to one version anyway, so a cached table cannot make a read
+    /// older than the pin already makes it. This guards the paths that do NOT consult the pin — chiefly the
+    /// bind-time column fetch, which reads latest.</para>
+    /// </remarks>
+    private static void InvalidateReadCache() => DeltaTableCache.Release(AmbientTransaction.Current);
+
     public long ExecuteNonQuery(string sql)
     {
+        InvalidateReadCache();
         var text = (sql ?? string.Empty).Trim();
         var tokens = text.Split(new[] { ' ', '\t', '\r', '\n' }, System.StringSplitOptions.RemoveEmptyEntries);
         if (tokens.Length < 2)
@@ -4741,6 +4899,7 @@ public sealed class DeltaCatalog : IBackendCatalog
 
     public long ExecuteUpdate(string schemaName, string tableName, int setColumnCount, IArrowArrayStream data)
     {
+        InvalidateReadCache();
         var opener = Opener();
         var path = TablePath(schemaName, tableName);
 
@@ -4919,6 +5078,7 @@ public sealed class DeltaCatalog : IBackendCatalog
     /// schemas mirror the lakehouse; the flat layout has only "main").</summary>
     public void DropSchema(string s, bool ie)
     {
+        InvalidateReadCache();
         if (_schemas && OneLake() is null)
         {
             if (string.Equals(s, MainSchema, System.StringComparison.Ordinal))
@@ -4984,6 +5144,7 @@ public sealed class DeltaCatalog : IBackendCatalog
 
     public void AlterTable(int k, string s, string t, string? a1, string? a2, Field? c, int f)
     {
+        InvalidateReadCache();
         // VARIANT: `c` arrives from the C ABI in TRANSPORT form (a BINARY field carrying the
         // ew.variant_transport marker), and every consumer of it below hands it to engineered-wood. Convert
         // once, here, at the boundary. This is the path the variant suite pins for ADD COLUMN: the marker is

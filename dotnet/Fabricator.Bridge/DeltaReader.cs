@@ -319,12 +319,49 @@ internal static class DeltaReader
         EngineeredWood.DeltaLake.Schema.StructType? schemaOverride = null)
         => ListNativeScanFilesAsync(opener, path, unit, value, prune, log, schemaOverride).GetAwaiter().GetResult();
 
+    /// <summary>
+    /// Opens a table for a READ, reusing the one this transaction already has open when there is one
+    /// (<see cref="DeltaTableCache"/>). Returns whether the result is SHARED — a shared table must NOT be
+    /// disposed by the borrower, because engineered-wood's <c>Dispose</c> latches <c>_disposed</c> and the
+    /// next reader would then throw.
+    /// </summary>
+    /// <remarks>
+    /// ⚠ READ PATHS ONLY. Sharing is sound only because no engineered-wood read path assigns
+    /// <c>_currentSnapshot</c>; a writer must open its own, which the commit flush independently requires so
+    /// its conflict range stays empty (<c>verify_delta_catalog_transactions</c> §41). All four callers pass
+    /// the identical <c>DeltaWriter.Options()</c> — a site whose options differ (a reader/writer seam, a
+    /// write spec) must NOT join this cache, since the options are baked into the table at construction.
+    /// </remarks>
+    private static async Task<(DeltaTableCache.OpenTable Open, bool Shared)> OpenForReadAsync(
+        nint opener, string path)
+    {
+        long txn = AmbientTransaction.Current;
+        if (DeltaTableCache.TryGet(txn, path) is { } hit)
+        {
+            return (hit, true);
+        }
+        // A MISS is the thing worth logging, because each one is a whole `_delta_log` replay (~20-27 s on the
+        // profiled Fabric table). The txn id is on the line because reuse is scoped to it: two misses for one
+        // table in one statement mean the crossings ran under DIFFERENT transaction ids, which is a host-side
+        // question and not a cache bug. txn 0 is never cached at all.
+        DmlLog.LogDebug("delta table open {Path} (txn={Txn}) — cache miss", path, txn);
+        // outlivesThisCall: the filesystem must not capture the host opener when it is about to be cached.
+        var fs = TableFileSystems.Create(opener, path, outlivesThisCall: txn != 0);
+        var table = await DeltaTable.OpenAsync(fs, DeltaWriter.Options()).ConfigureAwait(false);
+        // A concurrent opener may have won; take the winner so "one table per (txn, path)" holds. Ours is
+        // then orphaned to the GC, which costs nothing — Dispose only sets a flag.
+        // ⚠ `Shared` comes from Publish, NOT from `txn != 0`: the cache DECLINES past its per-transaction
+        // table cap (catalog enumeration), and a declined entry is ours to dispose exactly as before.
+        var (entry, cached) = DeltaTableCache.Publish(txn, path, new DeltaTableCache.OpenTable(table, fs));
+        return (entry, cached);
+    }
+
     private static async Task<NativeScanList> ListNativeScanFilesAsync(
         nint opener, string path, string? unit, string? value, Predicate? prune, ILogger log,
         EngineeredWood.DeltaLake.Schema.StructType? schemaOverride)
     {
-        var fs = TableFileSystems.Create(opener, path);
-        var table = await DeltaTable.OpenAsync(fs, DeltaWriter.Options()).ConfigureAwait(false);
+        var (open, shared) = await OpenForReadAsync(opener, path).ConfigureAwait(false);
+        var (table, fs) = (open.Table, open.Fs);
         try
         {
             var snap = unit is null
@@ -334,7 +371,10 @@ internal static class DeltaReader
         }
         finally
         {
-            await table.DisposeAsync().ConfigureAwait(false);
+            if (!shared)
+            {
+                await table.DisposeAsync().ConfigureAwait(false);
+            }
         }
     }
 
@@ -530,17 +570,16 @@ internal static class DeltaReader
 
     private static async Task<Schema> GetSchemaAsync(nint opener, string path)
     {
-        var fs = TableFileSystems.Create(opener, path);
-        var table = await DeltaTable.OpenAsync(fs, DeltaWriter.Options()).ConfigureAwait(false);
+        var (open, shared) = await OpenForReadAsync(opener, path).ConfigureAwait(false);
         try
         {
             // Variant fields cross the C ABI in the ew.variant_transport LEAF-binary transport form (EW
             // master advertises the canonical VariantType) — align the bind schema with the batches.
-            return VariantMarker.ToTransportSchema(table.ArrowSchema);
+            return VariantMarker.ToTransportSchema(open.Table.ArrowSchema);
         }
         finally
         {
-            await table.DisposeAsync().ConfigureAwait(false);
+            if (!shared) { await open.Table.DisposeAsync().ConfigureAwait(false); }
         }
     }
 
@@ -588,19 +627,18 @@ internal static class DeltaReader
 
     private static async Task<(Schema Schema, bool RowTracking)> GetSchemaAndRowTrackingAsync(nint opener, string path)
     {
-        var fs = TableFileSystems.Create(opener, path);
-        var table = await DeltaTable.OpenAsync(fs, DeltaWriter.Options()).ConfigureAwait(false);
+        var (open, shared) = await OpenForReadAsync(opener, path).ConfigureAwait(false);
         try
         {
-            var cfg = table.CurrentSnapshot.Metadata.Configuration;
+            var cfg = open.Table.CurrentSnapshot.Metadata.Configuration;
             bool rowTracking = cfg is not null
                 && cfg.TryGetValue("delta.enableRowTracking", out var v)
                 && string.Equals(v, "true", System.StringComparison.OrdinalIgnoreCase);
-            return (VariantMarker.ToTransportSchema(table.ArrowSchema), rowTracking);
+            return (VariantMarker.ToTransportSchema(open.Table.ArrowSchema), rowTracking);
         }
         finally
         {
-            await table.DisposeAsync().ConfigureAwait(false);
+            if (!shared) { await open.Table.DisposeAsync().ConfigureAwait(false); }
         }
     }
 
@@ -618,15 +656,14 @@ internal static class DeltaReader
 
     private static async Task<(Schema Schema, long Version)> GetSchemaAndVersionAsync(nint opener, string path)
     {
-        var fs = TableFileSystems.Create(opener, path);
-        var table = await DeltaTable.OpenAsync(fs, DeltaWriter.Options()).ConfigureAwait(false);
+        var (open, shared) = await OpenForReadAsync(opener, path).ConfigureAwait(false);
         try
         {
-            return (VariantMarker.ToTransportSchema(table.ArrowSchema), table.CurrentSnapshot.Version);
+            return (VariantMarker.ToTransportSchema(open.Table.ArrowSchema), open.Table.CurrentSnapshot.Version);
         }
         finally
         {
-            await table.DisposeAsync().ConfigureAwait(false);
+            if (!shared) { await open.Table.DisposeAsync().ConfigureAwait(false); }
         }
     }
 
@@ -1234,16 +1271,15 @@ internal static class DeltaReader
 
     private static async Task<Schema> GetSchemaAtAsync(nint opener, string path, string unit, string value)
     {
-        var fs = TableFileSystems.Create(opener, path);
-        var table = await DeltaTable.OpenAsync(fs, DeltaWriter.Options()).ConfigureAwait(false);
+        var (open, shared) = await OpenForReadAsync(opener, path).ConfigureAwait(false);
         try
         {
-            var snap = await ResolveSnapshotAsync(table, unit, value, default).ConfigureAwait(false);
+            var snap = await ResolveSnapshotAsync(open.Table, unit, value, default).ConfigureAwait(false);
             return VariantMarker.ToTransportSchema(snap.ArrowSchema);
         }
         finally
         {
-            await table.DisposeAsync().ConfigureAwait(false);
+            if (!shared) { await open.Table.DisposeAsync().ConfigureAwait(false); }
         }
     }
 
@@ -1506,6 +1542,30 @@ internal static class DeltaReader
         if (string.Equals(unit, "version", System.StringComparison.OrdinalIgnoreCase))
         {
             long version = long.Parse(value, System.Globalization.CultureInfo.InvariantCulture);
+            // ⚠ THE REQUESTED VERSION IS USUALLY THE ONE WE ALREADY HOLD, and rebuilding it is a WHOLE second
+            // log replay. Every caller here opened the table first, and `OpenAsync` builds at LATEST; the
+            // snapshot pin is SEEDED from exactly such an open, so on the ordinary read path
+            // (`ScanNative`/`ScanCodec` pin at latest, then every later reference reads AT that pin) the two
+            // versions are the SAME and the second build is pure waste.
+            //
+            // Provably equivalent rather than merely usually right: `SnapshotBuilder.BuildAsync` computes
+            // `targetVersion = atVersion ?? listing.LatestVersion`, so with `atVersion == LatestVersion` the
+            // two calls select the same checkpoint and replay the same commit range. A Delta version is
+            // immutable, so a concurrent commit landing in between changes the fresh listing's LATEST but not
+            // the replay up to v.
+            //
+            // ⚠ AND IT IS UPSTREAM'S OWN RULE, not an invention here: engineered-wood's `ResolveReadSnapshot`
+            // is `options.AtVersion is { } v && v != CurrentSnapshot.Version ? null : CurrentSnapshot`. Our
+            // `Stream*At` paths already got it for free by passing `AtVersion` into `ReadAsync`; this method
+            // is the one place that duplicated the resolution WITHOUT it.
+            //
+            // MEASURED on a Fabric lakehouse table at v1850 (1851 commits, 18 checkpoints at interval 100):
+            // an open at latest cost ~26 s and an "at v1850" open ~48 s — the pin was roughly DOUBLING the
+            // cost of every open it exists to make consistent.
+            if (table.CurrentSnapshot is { } current && current.Version == version)
+            {
+                return current;
+            }
             return await table.GetSnapshotAtVersionAsync(version, ct).ConfigureAwait(false);
         }
         if (string.Equals(unit, "timestamp", System.StringComparison.OrdinalIgnoreCase))

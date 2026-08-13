@@ -10,11 +10,19 @@
 #              READING the pin.
 #
 #              WHAT IS ASSERTED, and why this shape: the seeding branch runs at most ONCE per (txn, table)
-#              because ScanTable consults the pin before ScanCodec is called, so the number of "delta codec
-#              pin" log lines IS the sharing property -- exactly one however many times the statement names
-#              the table. Unfixed, the count is 0 (no pin at all in autocommit); with the pin seeded but not
-#              consulted, it is one PER ScanCodec call (4 for a self-join: a bind probe + an execution per
-#              reference). So == 1 distinguishes the fix from both failure modes.
+#              because ScanTable consults the pin before either read path is called, so the number of
+#              "delta % pin" log lines IS the sharing property -- exactly one however many times the
+#              statement names the table. Unfixed, the count is 0 (no pin at all in autocommit); with the pin
+#              seeded but not consulted, it is one PER scan call (4 for a self-join: a bind probe + an
+#              execution per reference). So == 1 distinguishes the fix from both failure modes.
+#
+#              ⚠ THE PATTERN IS DELIBERATELY WIDE ('delta % pin'), matching whichever site seeded --
+#              "codec" / "native" / "probe". It used to name 'delta codec pin', which was the SITE standing
+#              in for the property; once the bind-time schema probe stopped running a full scan it became the
+#              seeding site for both engines and the narrow pattern asserted the implementation rather than
+#              the behaviour. The wide pattern still separates all three outcomes (0 / 1 / 4), so nothing is
+#              given up. What the pin lines can no longer witness is WHICH ENGINE served the scan -- sections
+#              8 and 11 assert that directly on the reader's own line instead.
 #              The remaining half -- that reading AT a pinned version yields that version's data -- is NOT
 #              re-proven here: it is the same GetSchemaAt/StreamAt machinery the explicit-transaction snapshot
 #              sections of verify_delta_catalog_transactions already cover. A concurrent commit cannot be
@@ -75,7 +83,7 @@ SELECT sum(v) FROM lake.main.one;
 
 query I
 SELECT count(*) FROM duckdb_logs
-WHERE type = 'Fabricator.Delta' AND message LIKE 'delta codec pin %/one -> v%';
+WHERE type = 'Fabricator.Delta' AND message LIKE 'delta % pin %/one -> v%';
 ----
 1
 
@@ -90,7 +98,7 @@ SELECT sum(a.v) FROM lake.main.selfj a JOIN lake.main.selfj b ON a.id = b.id;
 
 query I
 SELECT count(*) FROM duckdb_logs
-WHERE type = 'Fabricator.Delta' AND message LIKE 'delta codec pin %/selfj -> v%';
+WHERE type = 'Fabricator.Delta' AND message LIKE 'delta % pin %/selfj -> v%';
 ----
 1
 
@@ -106,7 +114,7 @@ SELECT sum(a.v) FROM lake.main.three a
 
 query I
 SELECT count(*) FROM duckdb_logs
-WHERE type = 'Fabricator.Delta' AND message LIKE 'delta codec pin %/three -> v%';
+WHERE type = 'Fabricator.Delta' AND message LIKE 'delta % pin %/three -> v%';
 ----
 1
 
@@ -120,7 +128,7 @@ SELECT sum(v) FROM (SELECT v FROM lake.main.unio UNION ALL SELECT v FROM lake.ma
 
 query I
 SELECT count(*) FROM duckdb_logs
-WHERE type = 'Fabricator.Delta' AND message LIKE 'delta codec pin %/unio -> v%';
+WHERE type = 'Fabricator.Delta' AND message LIKE 'delta % pin %/unio -> v%';
 ----
 1
 
@@ -137,7 +145,7 @@ WHERE a.v > (SELECT min(b.v) FROM lake.main.corr b WHERE b.id <> a.id);
 
 query I
 SELECT count(*) FROM duckdb_logs
-WHERE type = 'Fabricator.Delta' AND message LIKE 'delta codec pin %/corr -> v%';
+WHERE type = 'Fabricator.Delta' AND message LIKE 'delta % pin %/corr -> v%';
 ----
 1
 
@@ -150,7 +158,7 @@ INSERT INTO lake.main.instgt SELECT a.id + 100, a.v FROM lake.main.instgt a JOIN
 
 query I
 SELECT count(*) FROM duckdb_logs
-WHERE type = 'Fabricator.Delta' AND message LIKE 'delta codec pin %/instgt -> v%';
+WHERE type = 'Fabricator.Delta' AND message LIKE 'delta % pin %/instgt -> v%';
 ----
 1
 
@@ -211,6 +219,17 @@ SELECT count(*) FROM duckdb_logs
 WHERE type = 'Fabricator.Delta' AND message LIKE 'delta codec pin %/nat -> v%';
 ----
 0
+
+# ⚠ THAT ZERO NEEDS A POSITIVE CONTROL, and it did not have one. Since the bind-time schema probe seeds the
+# pin (it opens at latest anyway), the pin exists before either read path runs, so ScanCodec's seeding branch
+# is unreachable here whether or not this catalog is native — the zero above would hold even for a catalog
+# that had been wrongly routed through the codec reader. Assert the engine DIRECTLY instead, on the reader's
+# own line, which no pin refactor can make vacuous.
+query I
+SELECT count(*) > 0 FROM duckdb_logs
+WHERE type = 'Fabricator.Delta.Native' AND message LIKE 'delta native scan %/nat:%';
+----
+true
 
 # ---------------------------------------------------------------------------------------------------------
 # 9. AT x THE SHARED PIN. Dropping the IsExplicit gate made non-AT references SHARE one version; an explicit
@@ -363,17 +382,24 @@ SELECT sum(a.v) FROM nlake.main.npin a JOIN nlake.main.npin b ON a.id = b.id;
 # no pin at all would give zero and lose the consistent cut this exists to provide.
 query I
 SELECT count(*) FROM duckdb_logs
-WHERE type = 'Fabricator.Delta' AND message LIKE 'delta native pin %/npin -> v%';
+WHERE type = 'Fabricator.Delta' AND message LIKE 'delta % pin %/npin -> v%';
 ----
 1
 
-# And the codec's message is NOT emitted here -- the two paths seed their own pins, so a regression that
-# routed a native catalog through the codec seeding would show up as this count moving off zero.
+# And the codec's message is NOT emitted here. ⚠ Since the bind probe seeds the pin, that zero no longer
+# discriminates on its own (see the note in section 8) — it is kept because a codec pin appearing here would
+# still be a real regression, and paired with the direct engine control below.
 query I
 SELECT count(*) FROM duckdb_logs
 WHERE type = 'Fabricator.Delta' AND message LIKE 'delta codec pin %/npin -> v%';
 ----
 0
+
+query I
+SELECT count(*) > 0 FROM duckdb_logs
+WHERE type = 'Fabricator.Delta.Native' AND message LIKE 'delta native scan %/npin:%';
+----
+true
 
 # The retired resolver logged unconditionally in BOTH its success and catch branches, so the absence of its
 # message is proof the extra open is gone rather than merely quiet. Covers every table in this suite.

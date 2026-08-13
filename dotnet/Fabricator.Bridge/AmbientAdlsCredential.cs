@@ -46,7 +46,27 @@ internal static class TableFileSystems
         FabricatorLog.CreateLogger("Fabricator.Delta.Fs");
 
     public static EngineeredWood.IO.ITableFileSystem Create(nint opener, string path)
+        => Create(opener, path, outlivesThisCall: false);
+
+    /// <summary>
+    /// <paramref name="outlivesThisCall"/>: the filesystem will be held by something cached across ABI calls
+    /// (<see cref="DeltaTableCache"/>), so it must NOT capture the host opener.
+    /// </summary>
+    /// <remarks>
+    /// ⚠ The opener is a <c>ClientContext*</c> valid only for the call that handed it to us.
+    /// <c>DuckDbTableFileSystem.Opener</c> prefers the <c>AmbientOpener</c> and keeps the constructed value
+    /// as a fallback — safe, as its own comment says, "because no object outlives its call today", and
+    /// "load-bearing the moment something is cached". Passing 0 makes the ambient the ONLY source, so a
+    /// context the AsyncLocal did not flow into fails loudly instead of driving IO through a dangling
+    /// pointer — a use-after-free that neither Windows nor glibc would necessarily fault on (the asymmetry
+    /// that hid the late <c>ArrowProducer</c> release everywhere except macOS).
+    /// </remarks>
+    public static EngineeredWood.IO.ITableFileSystem Create(nint opener, string path, bool outlivesThisCall)
     {
+        if (outlivesThisCall)
+        {
+            opener = 0;
+        }
         var adls = AmbientAdlsCredential.Current;
         if (adls is not null && AdlsPath.IsAdlsGen2(path))
         {
