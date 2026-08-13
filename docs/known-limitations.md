@@ -146,6 +146,36 @@ valid only on a table reference in a `FROM`. That matters here — an AT entry c
 `ColumnList` against a live table handle, so a write through one would be silent corruption. The useful shape
 does work: `CREATE TABLE restored AS SELECT * FROM t AT (VERSION => 1)`.
 
+### 1.z The materialized ROW-TRACKING columns carry NO parquet field id — in OSS Delta too (measured)
+
+MEASURED on Fabric Spark 4.1.1.5.5 (delta-spark), row tracking + column mapping `id`, after an `UPDATE`. The
+contrast is INSIDE ONE FILE, which is what makes it conclusive:
+
+```
+part-00000-8c2f0d75….snappy.parquet          ← the UPDATE's post-image file
+  col-7e449cc7-…               field_id: 1
+  col-da059730-…               field_id: 2
+  _row-id-col-93fe8e5c-…       field_id: null
+  _row-commit-version-col-…    field_id: null
+```
+
+**Why**: column mapping stamps `delta.columnMapping.id`/`.physicalName` into each **schema field's** metadata,
+but the materialized row-tracking columns are not schema fields at all — they are hidden physical columns
+named by the table PROPERTIES `delta.rowTracking.materializedRowIdColumnName` /
+`…materializedRowCommitVersionColumnName`, generated UUID-suffixed at enablement and resolved BY NAME. In
+`id` mode ids are allocated from `delta.columnMapping.maxColumnId` and recorded in the schema, so a non-schema
+column has nowhere for one to live. Note the two naming schemes visible above — `col-<guid>` (mapping) beside
+`_row-id-col-<guid>` (property).
+
+⚠ **Only 1 of the 3 files carries them.** A rewrite MATERIALISES the ids it must preserve; plain appends do
+not. So a probe of an append-only table measures an absence, not an answer — the `UPDATE` is load-bearing.
+
+**Consequence**: `read_parquet(schema = map {<field id>: …})` is unusable on ANY row-tracking Delta table,
+whoever wrote it — not a quirk of engineered-wood's writer. That makes `union_by_name` the only correct
+choice for the full batched form (see `DeltaNativeReader.BatchPlan`), and it strengthens the DuckDB report in
+[duckdb-upstream-issues.md](duckdb-upstream-issues.md) §1: the `No default expression in FieldId Map`
+assertion is reachable from a Spark-written table, not only from ours.
+
 ### 1.y ⚠ Fabric Warehouse time travel CANNOT span a schema change — a provider limit, not ours
 
 MEASURED live 2026-08-13. `OPTION (FOR TIMESTAMP AS OF …)` at an instant before an `ALTER` is refused by the

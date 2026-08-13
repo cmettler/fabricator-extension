@@ -14,7 +14,7 @@ see §2, which is exactly that case and was nearly filed as a DuckDB bug.
 
 ## 1. `INTERNAL Error: No default expression in FieldId Map` — field-id `schema` + `file_row_number`
 
-**Status: reproduced on stock 1.5.5. Ready to file.**
+**Status: reproduced on stock 1.5.5 AND ROOT-CAUSED in the source (§ below). Ready to file.**
 
 `read_parquet`'s `schema` parameter with **INTEGER** keys puts the reader in `BY_FIELD_ID` mode. Combined
 with `file_row_number => true`, it raises an internal assertion whenever the *file* contains at least one
@@ -44,6 +44,143 @@ field-id-less column**. Note `filename` is *not* affected, though it is the same
 worth mentioning in the issue, since it suggests the missing default is specific to how `file_row_number`
 is materialised.
 
+### Root cause — located, and it explains every control above
+
+All in `src/common/multi_file/`. Two facts combine.
+
+**(1) Virtual columns carry a hardcoded, Iceberg-reserved field id** (`multi_file_reader.hpp`):
+
+```cpp
+// Reserved field id used for the "_file" field according to the iceberg spec (used for file_row_number)
+static constexpr int32_t ORDINAL_FIELD_ID  = 2147483645;
+// Reserved field id used for the "_pos" field according to the iceberg spec (used for file_row_number)
+static constexpr int32_t FILENAME_FIELD_ID = 2147483646;
+```
+
+That is where the `"2147483645"` in the name-keyed error comes from — it is `ORDINAL_FIELD_ID`, not a stray
+sentinel, and a name-keyed map stringifies it and hunts for a parquet column with that literal name.
+
+**(2) `FieldIdMapper` assumes every mapped column HAS an identifier** (`multi_file_column_mapper.cpp`):
+
+```cpp
+FieldIdMapper(const vector<MultiFileColumnDefinition> &columns) {
+    ...
+    if (column.identifier.IsNull()) {
+        // Extra columns at the end will not have a field_id
+        break;                                    // ← the column is never added to field_id_map
+    }
+optional_idx Find(const MultiFileColumnDefinition &column) const override {
+    D_ASSERT(!column.identifier.IsNull());        // ← DEBUG ONLY; release falls through
+    ...                                           //    → not found
+static unique_ptr<Expression> GetDefault(const MultiFileColumnDefinition &column) {
+    auto &default_val = column.default_expression;
+    if (!default_val) {
+        throw InternalException("No default expression in FieldId Map");
+    }
+```
+
+So an identifier-less column is **skipped while building the map**, then **not found** during resolution,
+then has **no default** to fall back on — and throws. The `D_ASSERT` shows the code knows this case is not
+supposed to reach `Find`; in a release build it does.
+
+**Why `filename` escapes it** — the control that looked arbitrary is exactly predicted
+(`MultiFileReader::GetConstantVirtualColumn`):
+
+```cpp
+if (column_id == COLUMN_IDENTIFIER_EMPTY || column_id == COLUMN_IDENTIFIER_FILENAME) {
+    return make_uniq<BoundConstantExpression>(Value(type));
+}
+return nullptr;
+```
+
+`filename` is CONSTANT per file, so it is answered with a constant expression and never enters the
+Find/GetDefault path at all. `file_row_number` varies per row, gets `nullptr`, and goes down the path that
+throws. Every one of the four control outcomes follows from these three fragments.
+
+**⚠ WHICH column fails — MEASURED, because the source alone reads ambiguously.** It is the VIRTUAL column,
+not a file column lacking a field id. Four probes on the fixture above (`a` has field id 1, `b` has none):
+
+| declared map | `file_row_number => true`? | result |
+|---|---|---|
+| `{1: a}` | yes | `INTERNAL Error` |
+| `{1: a, 2147483645: rn}` | **no** | **OK** — `rn` is NULL |
+| `{1: a, 2147483645: rn}` | yes | `INTERNAL Error` |
+| `{1: a, 2147483646: fn}` | no | OK — `fn` is NULL |
+
+The same map is fine WITHOUT the option and throws WITH it, so the map's contents are not the trigger. And a
+declared-but-absent column resolves cleanly through its own `default_value`, so a column missing from the
+file is not the trigger either. What throws is the global column the OPTION appends, which no `schema` entry
+can give a default to — declaring it by its reserved id does not attach one (the id is used internally to
+identify the virtual column, it is not an input contract; DuckDB just treats it as an ordinary field id,
+finds nothing, and NULL-fills), and declaring it under the option's own name is refused as
+`Binder Error: table "read_parquet" has duplicate column name "file_row_number"`.
+
+**Fix shape:** give the virtual column a default expression, or have `GetDefaultExpression` handle a virtual
+column instead of assuming a user-supplied default. ⚠ Falling through to NAME matching would NOT help — the
+column does not exist in the file under any name. Separately, `FieldIdMapper`'s `break` is worth questioning
+on its own: it stops at the FIRST identifier-less column, so any real column after it is dropped from the map
+too.
+
+### ⚠ Nor does Delta's ICEBERG COMPAT mode — checked because Iceberg is where the reserved id comes from
+
+The obvious way the "Delta cannot provide a field id" claim could be too strong: Iceberg reserves
+`2147483540` for `_row_id` (that is where `MultiFileReader::ROW_ID_FIELD_ID` comes from, and DuckLake stamps
+it), and `delta.enableIcebergCompatV1/V2` exist precisely to make a Delta table's parquet consumable as
+Iceberg. So does IcebergCompat assign it? MEASURED on Fabric Spark 4.1.1.5.5 — **no**:
+
+| table | user columns | materialized row-id column |
+|---|---|---|
+| `icebergCompatV2` + rowTracking | field_id 1, 2 | **null** |
+| `icebergCompatV1` + rowTracking | field_id 1, 2 | **null** |
+| `icebergCompatV2` alone (control) | field_id 1, 2 | column absent — nothing to materialise |
+| rowTracking alone (control) | field_id 1, 2 | **null** |
+
+The user columns carry ids under IcebergCompat, so the field-id machinery is active; the row-tracking columns
+carry none anyway. Consistent with the structural reason — the column is not a schema field, IcebergCompat
+validates the SCHEMA, and the schema never mentions it.
+
+⚠ **Two attempts at this measured nothing, and the controls are what showed it.** IcebergCompat REFUSES any
+table carrying the `deletionVectors` table feature (`DELTA_ICEBERG_COMPAT_VIOLATION.
+DELETION_VECTORS_SHOULD_BE_DISABLED`), DVs are ON BY DEFAULT on Fabric, and setting
+`delta.enableDeletionVectors = 'false'` in `TBLPROPERTIES` is NOT enough — the validation checks the
+protocol FEATURE, so it must be disabled at the session default
+(`spark.databricks.delta.properties.defaults.enableDeletionVectors`) so the feature is never added. Without
+the "icebergCompat ALONE" control, the refusal read as "row tracking and IcebergCompat are incompatible",
+which is false.
+
+⚠ **Note the consequence for scope**: IcebergCompat and deletion vectors are MUTUALLY EXCLUSIVE, DVs are on
+by default, and DVs are the whole reason our batched reader needs `file_row_number`. So even had the answer
+gone the other way, it would have exempted only tables we do not read this way.
+
+### ⚠ DuckLake — DuckDB's OWN format — does NOT trip this, and that is worth stating accurately
+
+Tempting to write "DuckDB's own lakehouse format breaks its own reader". It does not. MEASURED locally
+(`ducklake` on 1.5.5, a 5000-row table with `DATA_INLINING_ROW_LIMIT 0` and an `UPDATE` to force a rewrite):
+
+| file | columns | field_id |
+|---|---|---|
+| plain append | `id`, `v` | 1, 2 |
+| UPDATE post-image | `id`, `v`, **`_ducklake_internal_row_id`** | 1, 2, **2147483540** |
+| delete file | `file_path`, `pos` | 2147483646, 2147483645 |
+
+`2147483540` is `MultiFileReader::ROW_ID_FIELD_ID`; the delete file's pair are `FILENAME_FIELD_ID` and
+`ORDINAL_FIELD_ID`. So the reserved-id range is DuckDB's INTENDED mechanism for columns outside the user
+schema, and DuckLake uses it consistently — it never emits an identifier-less column, so the field-id path's
+assumption holds for it.
+
+**That is the sharp version of the report**: the field-id mapping assumes a property only DuckLake
+guarantees. Delta cannot provide it — the protocol names row-tracking columns through table PROPERTIES, so
+they are not schema fields and there is nowhere for an id to live (measured for delta-spark, above).
+
+⚠ **And DuckLake's row id is a DIFFERENT mechanism from the failing one, which supports the attribution
+above rather than contradicting it.** `_ducklake_internal_row_id` is a REAL column IN THE FILE carrying a
+reserved id, so `Find` succeeds and no default is ever needed. `file_row_number => true` appends a column
+present in NO file, so `Find` must fail and the absent default is the defect.
+
+⚠ **The two symptoms reported here are ONE gap seen from both ends**: DuckDB gives virtual columns a
+reserved field id, and assumes every column in a field-id mapping has an identifier. A name-keyed map trips
+the first assumption; a field-id-keyed map over a file with an identifier-less column trips the second.
+
 ### ⚠ Severity is higher than "a query fails": it INVALIDATES THE DATABASE
 
 The assertion is not contained. After it fires, the next unrelated query on the same connection returns:
@@ -60,6 +197,17 @@ query. That is the sentence to lead the issue with.
 
 Delta row-tracking columns (`__delta_row_id`, `__delta_row_commit_version`) are **materialized columns and
 are not column-mapped**, so they carry no field id — while every other column of a column-mapped table does.
+
+⚠ **AND THAT IS TRUE OF EVERY DELTA WRITER, NOT JUST OURS — MEASURED 2026-08-13** on Fabric Spark
+4.1.1.5.5 (delta-spark), row tracking + column mapping `id`, after an `UPDATE`. The contrast is inside ONE
+file: the two user columns carry `field_id` 1 and 2, and `_row-id-col-<guid>` /
+`_row-commit-version-col-<guid>` beside them carry **null**. It is structural rather than an oversight —
+the Delta protocol names those columns through the table PROPERTIES
+`delta.rowTracking.materializedRowIdColumnName` / `…RowCommitVersionColumnName` and resolves them BY
+NAME, so they are not schema fields and there is nowhere for a `maxColumnId`-allocated id to live.
+
+⇒ **the assertion is reachable from a SPARK-written table**, which is worth stating in the issue: it is
+not one implementation's unusual output, it is what the Delta spec requires of everyone.
 Row tracking is on by default for tables we create, and every merge-on-read post-image file contains that
 column. So the field-id route is unusable on the *default* table shape, which is why
 `DeltaNativeReader.BatchPlan`'s full form uses `union_by_name` + an explicit alias projection instead of the
