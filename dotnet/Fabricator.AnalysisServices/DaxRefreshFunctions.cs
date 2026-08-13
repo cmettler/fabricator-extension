@@ -257,7 +257,8 @@ internal abstract class DaxRefreshBase : ICatalogTableFunction
 
         public Schema OutputSchema => ResultColumns;
 
-        public bool SupportsPushdown => false;
+        public bool SupportsFilterPushdown => false;
+        public bool SupportsProjectionPushdown => false;
 
         public IAsyncEnumerable<RecordBatch> Execute(TableFunctionScan scan, CancellationToken ct = default)
         {

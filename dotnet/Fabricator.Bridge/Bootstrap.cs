@@ -1237,7 +1237,7 @@ public static unsafe class Bootstrap
             // Export the binding's output schema as a zero-row stream so the host can read return types.
             CArrowArrayStreamExporter.ExportArrayStream(
                 new InMemoryArrayStream(bound.OutputSchema, System.Array.Empty<RecordBatch>()), outSchema);
-            *supportsPushdown = bound.SupportsPushdown ? 1 : 0;
+            *supportsPushdown = bound.MapResultByName ? 1 : 0;
             *outBinding = Handles.Alloc(bound);
             return FabricatorStatus.Ok;
         }

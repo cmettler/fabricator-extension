@@ -679,7 +679,8 @@ internal sealed class CfColumnsFunction : ICatalogTableFunction
         }
 
         public Schema OutputSchema { get; }
-        public bool SupportsPushdown => false;
+        public bool SupportsFilterPushdown => false;
+        public bool SupportsProjectionPushdown => false;
 
         // Dispose eagerly in a plain method, then delegate — see the lifetime note in StaticTableFunction.Execute.
         public IAsyncEnumerable<RecordBatch> Execute(TableFunctionScan scan, CancellationToken ct = default)
@@ -1317,7 +1318,8 @@ internal sealed class GfSeqFunction : ITableFunction
             new Field("squared", Int32Type.Default, nullable: false),
         }, metadata: null);
 
-        public bool SupportsPushdown => false;
+        public bool SupportsFilterPushdown => false;
+        public bool SupportsProjectionPushdown => false;
 
         // Dispose eagerly in a plain method, then delegate — see the lifetime note in StaticTableFunction.Execute.
         // (This is the exact shape that aborted on macOS: a deferred dispose released the host's filter-values
@@ -1374,7 +1376,8 @@ internal sealed class GfColumnsFunction : ITableFunction
         }
 
         public Schema OutputSchema { get; }
-        public bool SupportsPushdown => false;
+        public bool SupportsFilterPushdown => false;
+        public bool SupportsProjectionPushdown => false;
 
         // Dispose eagerly in a plain method, then delegate — see the lifetime note in StaticTableFunction.Execute.
         public IAsyncEnumerable<RecordBatch> Execute(TableFunctionScan scan, CancellationToken ct = default)

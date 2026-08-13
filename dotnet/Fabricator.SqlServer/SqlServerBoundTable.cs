@@ -27,7 +27,7 @@ internal sealed class TvfBoundTable : IBoundTable
     }
 
     public Schema OutputSchema => _tvf.OutputSchema;
-    public bool SupportsPushdown => true;
+    public bool MapResultByName => true;
 
     public IArrowArrayStream Execute(string? specJson, IArrowArrayStream? filterValues) =>
         _tvf.ExecuteScan(_args, specJson, filterValues); // reads _args (does not consume it)

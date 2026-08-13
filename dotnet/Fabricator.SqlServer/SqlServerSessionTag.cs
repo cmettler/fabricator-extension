@@ -130,7 +130,8 @@ internal sealed class SqlServerSessionTagFunction : ICatalogTableFunction
 
         public Schema OutputSchema => Columns;
 
-        public bool SupportsPushdown => false;
+        public bool SupportsFilterPushdown => false;
+        public bool SupportsProjectionPushdown => false;
 
         public IAsyncEnumerable<RecordBatch> Execute(TableFunctionScan scan, CancellationToken ct = default)
         {

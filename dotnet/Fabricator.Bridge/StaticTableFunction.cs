@@ -19,7 +19,11 @@ public abstract class StaticTableFunction : ICatalogTableFunction
     /// <summary>The fixed result columns (names + Arrow types).</summary>
     public abstract Schema OutputSchema { get; }
 
-    public virtual bool SupportsPushdown => false; // pure C#: no SQL to push into; DuckDB re-applies above the scan
+    // Pure C#: no SQL to push into, so neither half is claimed and DuckDB re-applies both above the scan.
+    // Virtual because a subclass CAN honour them — but only by actually filtering / projecting its own rows;
+    // see the guarantees on IArrowTableFunctionBinding.
+    public virtual bool SupportsFilterPushdown => false;
+    public virtual bool SupportsProjectionPushdown => false;
 
     /// <summary>Produces the result rows for one call (<paramref name="args"/> = the 1-row constant args),
     /// streamed asynchronously — implement as an async iterator (a synchronous generator just yields).</summary>
@@ -39,7 +43,8 @@ public abstract class StaticTableFunction : ICatalogTableFunction
         }
 
         public Schema OutputSchema => _fn.OutputSchema;
-        public bool SupportsPushdown => _fn.SupportsPushdown;
+        public bool SupportsFilterPushdown => _fn.SupportsFilterPushdown;
+        public bool SupportsProjectionPushdown => _fn.SupportsProjectionPushdown;
 
         // NOTE (lifetime, applies to every binding that ignores pushed filters): dispose FilterValues here,
         // in a PLAIN method — never inside an `async IAsyncEnumerable` body. An async-iterator body does not

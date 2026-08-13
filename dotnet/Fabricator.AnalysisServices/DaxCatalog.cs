@@ -696,7 +696,10 @@ internal sealed class DaxCatalog : IBackendCatalog
         }
 
         public Schema OutputSchema { get; }
-        public bool SupportsPushdown => false;
+        // IBoundTable, not a binding: this is the host's projection MAPPING. False = map positionally, which
+        // is right here — daxeval returns whatever columns the DAX query produced, so there is no declared
+        // schema to match names against.
+        public bool MapResultByName => false;
 
         public IArrowArrayStream Execute(string? specJson, IArrowArrayStream? filterValues)
         {

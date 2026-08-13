@@ -64,11 +64,15 @@ public sealed class DeltaGlobalTableFunction : ITableFunction
 
         public Schema OutputSchema => _schema;
 
-        // engineered-wood honors the projection (reads only the requested columns) and pushes the filter into
-        // file + row-group skipping; it does NOT re-apply the predicate per row, so the result is a SUPERSET —
-        // DuckDB re-applies the projection (by name) + every filter above the scan. (The host already maps the
-        // result columns by name regardless of this flag for a global table function.)
-        public bool SupportsPushdown => false;
+        // ⚠ THE FILTER IS PUSHED AND STILL NOT CLAIMED, and that is the distinction the two flags exist to
+        // express. engineered-wood prunes FILES and ROW GROUPS by the predicate and then never re-checks per
+        // row, so the result is a SUPERSET — claiming it would tell DuckDB not to re-apply, which is a wrong
+        // answer rather than a missed optimisation.
+        public bool SupportsFilterPushdown => false;
+
+        // Not claimed either, but for a different reason — a seam limitation, not a semantic one. See the
+        // note in Execute: BindingBoundTable declares the stream with the binding's FULL OutputSchema.
+        public bool SupportsProjectionPushdown => false;
 
         public IAsyncEnumerable<RecordBatch> Execute(TableFunctionScan scan, CancellationToken ct = default)
         {
@@ -195,9 +199,11 @@ public sealed class DeltaNativeScanFunction : ITableFunction
 
         public Schema OutputSchema => _schema;
 
-        // DuckDB re-applies projection + filter above the scan. The FILTER is still pushed below (file and
-        // row-group skipping); the PROJECTION deliberately is not — see the note in Execute.
-        public bool SupportsPushdown => false;
+        // Same two answers as fabricator_delta_scan above, for the same two reasons: the filter is pushed
+        // for file / row-group skipping but the result is a superset, and the projection is blocked by the
+        // seam rather than by the reader (DeltaNativeReader projects perfectly well — see Execute).
+        public bool SupportsFilterPushdown => false;
+        public bool SupportsProjectionPushdown => false;
 
         public IAsyncEnumerable<RecordBatch> Execute(TableFunctionScan scan, CancellationToken ct = default)
         {
@@ -305,7 +311,8 @@ public sealed class DeltaWriteDemoFunction : ITableFunction
         }
 
         public Schema OutputSchema => _schema;
-        public bool SupportsPushdown => false;
+        public bool SupportsFilterPushdown => false;
+        public bool SupportsProjectionPushdown => false;
 
         public IAsyncEnumerable<RecordBatch> Execute(TableFunctionScan scan, CancellationToken ct = default)
         {

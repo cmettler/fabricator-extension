@@ -23,7 +23,7 @@ public sealed class BindingBoundTable : IBoundTable
     }
 
     public Schema OutputSchema => _binding.OutputSchema;
-    public bool SupportsPushdown => _supportsPushdown;
+    public bool MapResultByName => _supportsPushdown;
 
     public IArrowArrayStream Execute(string? specJson, IArrowArrayStream? filterValues) =>
         new AsyncEnumerableArrowStream(

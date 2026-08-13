@@ -74,16 +74,46 @@ public interface IArrowTableFunctionBinding : System.IDisposable
     Schema OutputSchema { get; }
 
     /// <summary>
-    /// Whether projection + filter pushdown in <see cref="Execute"/>'s <see cref="TableFunctionScan"/> are
-    /// honored at the source (true for an inline SQL TVF) or must be re-applied by DuckDB above the scan
-    /// (false for a pure-C# function or a stored procedure, which can't be inline-wrapped).
+    /// Whether the rows this binding yields are already FILTERED by the pushed predicate, so DuckDB need not
+    /// re-apply it.
     /// </summary>
-    bool SupportsPushdown { get; }
+    /// <remarks>
+    /// ⚠ THIS IS A GUARANTEE ABOUT THE RESULT, NOT A STATEMENT THAT THE FILTER WAS LOOKED AT. A binding may
+    /// push the predicate downward for file / row-group SKIPPING and still return a SUPERSET — engineered-wood
+    /// does exactly that (it prunes files and row groups, then never re-checks per row), so
+    /// <c>fabricator_delta_scan</c> pushes the filter AND answers <c>false</c> here. Answering <c>true</c>
+    /// without filtering every row is a WRONG ANSWER, not a missed optimisation: DuckDB will not re-apply.
+    /// </remarks>
+    bool SupportsFilterPushdown { get; }
+
+    /// <summary>
+    /// Whether the batches this binding yields contain ONLY the columns the scan asked for, in which case the
+    /// host maps them onto the declared schema BY NAME.
+    /// </summary>
+    /// <remarks>
+    /// <para>⚠ ALSO A GUARANTEE ABOUT THE RESULT. A binding answering <c>true</c> must emit exactly the
+    /// projected set for THIS scan — the batches and the stream's declared schema have to agree, or the host
+    /// ingests columns that are not there (arrow_ingest reads past the end: SIGSEGV, not an error).</para>
+    /// <para>⚠ Separate from <see cref="SupportsFilterPushdown"/> ON PURPOSE. They were ONE flag until
+    /// 2026-08-13, which made the two Delta readers unable to prune columns: both push the filter and neither
+    /// can promise a filtered result, so the single flag had to be <c>false</c> — and that also switched off
+    /// the projection, which they could have honoured. One axis was hostage to the other.</para>
+    /// <para>⚠ NOTHING READS EITHER FLAG YET — say so rather than let the next reader assume otherwise. The
+    /// wrappers (<c>GlobalFunctions</c>, <c>CatalogFunctionSet</c>) pass a LITERAL <c>true</c> for
+    /// <see cref="IBoundTable.MapResultByName"/> and never consult the binding, and
+    /// <c>BindingBoundTable.Execute</c> declares its stream with the binding's FULL
+    /// <see cref="OutputSchema"/>. Honouring <see cref="SupportsProjectionPushdown"/> means letting the
+    /// binding declare the schema it will actually emit FOR THIS SCAN; until then these two are a vocabulary
+    /// for saying what a binding guarantees, not yet a switch that changes what the host does.</para>
+    /// </remarks>
+    bool SupportsProjectionPushdown { get; }
 
     /// <summary>
     /// Produces the result rows, streamed asynchronously. <paramref name="scan"/> carries the projection +
-    /// filter pushdown request; a binding that returns <see cref="SupportsPushdown"/> == false ignores it
-    /// (DuckDB re-applies). Yield lazily (an async iterator) to stream large results without buffering — the
+    /// filter pushdown request; each half may be ignored independently, and DuckDB re-applies whichever the
+    /// binding does not claim (see <see cref="SupportsFilterPushdown"/> /
+    /// <see cref="SupportsProjectionPushdown"/>). ⚠ A binding may still USE the filter for skipping while
+    /// claiming neither. Yield lazily (an async iterator) to stream large results without buffering — the
     /// host pulls one batch at a time.
     /// </summary>
     IAsyncEnumerable<RecordBatch> Execute(TableFunctionScan scan, CancellationToken ct = default);

@@ -158,22 +158,35 @@ public interface IBackend
 /// <summary>
 /// A bound table-function call (Phase 5 session model): resolves its output schema once and runs the scan
 /// possibly many times (once per execution). For a discovered SQL Server TVF the scan pushes projection +
-/// filter into the SELECT (<see cref="SupportsPushdown"/> = true); a stored proc / custom function returns
-/// its full result and DuckDB projects + filters above the scan. Disposed via the host's table_close.
+/// filter into the SELECT; a stored proc returns its full result positionally and DuckDB projects + filters
+/// above the scan. Disposed via the host's table_close.
 /// </summary>
 public interface IBoundTable : IDisposable
 {
     /// <summary>The function's output columns (may depend on the bound constant args).</summary>
     Schema OutputSchema { get; }
 
-    /// <summary>True if <see cref="Execute"/> honors the pushdown spec (a discovered TVF); false otherwise.</summary>
-    bool SupportsPushdown { get; }
+    /// <summary>
+    /// Whether the host maps this scan's result columns BY NAME (true) or POSITIONALLY (false). It is the
+    /// <c>supports_pushdown</c> argument of the <c>table_bind</c> ABI entry.
+    /// </summary>
+    /// <remarks>
+    /// ⚠ RENAMED FROM <c>SupportsPushdown</c> ON 2026-08-13 BECAUSE THAT NAME DESCRIBED NEITHER SIDE
+    /// HONESTLY. It never meant "the spec was honoured" — the ABI comment has always defined it as the
+    /// host's projection MAPPING, and a custom function returning its FULL result answers <c>true</c>. Only
+    /// by-name mapping makes a projected subset ingestible at all, so this is the enabling condition for
+    /// <see cref="IArrowTableFunctionBinding.SupportsProjectionPushdown"/> rather than the same question:
+    /// true here + false there is the ordinary case (map by name, but every column is present).
+    /// </remarks>
+    bool MapResultByName { get; }
 
     /// <summary>
     /// Runs the scan. <paramref name="specJson"/> (null => SELECT *) + <paramref name="filterValues"/>
-    /// (null => no filter) carry projection + filter pushdown, honored only when <see cref="SupportsPushdown"/>
-    /// is true. Returns the result rows; the stream owns the provider connection (released by the host at
-    /// scan teardown).
+    /// (null => no filter) carry projection + filter pushdown. What is honoured is the implementation's own
+    /// business — DuckDB re-applies both regardless unless the underlying binding claims them (see
+    /// <see cref="IArrowTableFunctionBinding.SupportsFilterPushdown"/> /
+    /// <see cref="IArrowTableFunctionBinding.SupportsProjectionPushdown"/>). Returns the result rows; the
+    /// stream owns the provider connection (released by the host at scan teardown).
     /// </summary>
     IArrowArrayStream Execute(string? specJson, IArrowArrayStream? filterValues);
 }

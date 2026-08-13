@@ -91,7 +91,8 @@ internal sealed class SqlServerProcedure : ICatalogTableFunction
         public Schema OutputSchema { get; }
 
         // A proc's EXEC isn't inline-wrappable, so DuckDB re-applies projection (by name) + filters above the scan.
-        public bool SupportsPushdown => false;
+        public bool SupportsFilterPushdown => false;
+        public bool SupportsProjectionPushdown => false;
 
         // Dispose eagerly in a plain method, then delegate — see the lifetime note in StaticTableFunction.Execute.
         public IAsyncEnumerable<RecordBatch> Execute(TableFunctionScan scan, CancellationToken ct = default)
