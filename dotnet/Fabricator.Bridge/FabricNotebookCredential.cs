@@ -41,18 +41,38 @@ public sealed class FabricNotebookCredential : TokenCredential
     // notebookutils' configs.get(key) mirrors spark-conf keys into MSNOTEBOOKUTILS_<KEY with . -> _> env vars.
     private const string WorkloadEndpointEnv = "MSNOTEBOOKUTILS_TRIDENT_LAKEHOUSE_TOKENSERVICE_ENDPOINT";
     private const string SessionTokenEnv = "MSNOTEBOOKUTILS_TRIDENT_SESSION_TOKEN";
+    // The spark conf key the env var above MIRRORS. Present in .trident-context on Spark compute, where
+    // the env var is not — see IsAvailable.
+    private const string SessionTokenConfKey = "trident.session.token";
 
     private static readonly HttpClient Http = new() { Timeout = TimeSpan.FromSeconds(30) };
     private static readonly TimeSpan RefreshBuffer = TimeSpan.FromMinutes(5);
 
     private readonly ConcurrentDictionary<string, AccessToken> _cache = new(StringComparer.OrdinalIgnoreCase);
 
-    /// <summary>True on Fabric notebook/Spark compute: the token-service URL env var only exists there, and
-    /// the notebookutils-mirrored session token env (set by the runtime's notebookutils bootstrap) must be
-    /// present — the tokenservice.config.json token alone does NOT validate (see ReadSessionToken).</summary>
+    /// <summary>True on Fabric notebook/Spark compute — we can name the token service AND hold a session
+    /// token to authenticate to it.
+    /// <para>⚠ THIS USED TO TEST TWO ENV VARS AND THAT MADE IT PYTHON-NOTEBOOK-ONLY. Measured live
+    /// 2026-08-13 on a Fabric PySpark session (Spark 4.1.1.5.5, kernel confirmed): <b>all four
+    /// <c>AZURE_FABRIC_*</c> / <c>MSNOTEBOOKUTILS_*</c> variables are MISSING</b>, and
+    /// <c>notebookutils</c> does not even expose <c>configs</c> there — so `IsAvailable` was false, the
+    /// caller fell through to <c>DefaultAzureCredential</c>, and a secretless `abfss://` ATTACH died with
+    /// its whole "no credential source" chain. The env vars are a PYTHON-runtime mirror, not the
+    /// platform's own contract.</para>
+    /// <para>Everything needed is present on Spark, in the two files this class ALREADY reads: the same
+    /// <c>trident.session.token</c> the env var mirrors lives in <c>.trident-context</c>, and the token
+    /// service endpoint is in <c>tokenservice.config.json</c>. So this asks the QUESTION (can I name the
+    /// service, do I hold a session token?) instead of testing one accidental spelling of the answer.</para>
+    /// <para>⚠ The config file's OWN <c>sessionToken</c> is deliberately NOT accepted here, only in
+    /// <see cref="ReadSessionToken"/> as a last resort. That is MEASURED, not deference to the older
+    /// comment that claimed it: minting with it against the live service returns <b>401
+    /// SignedPayloadValidationException</b> while the <c>.trident-context</c> token returns 200, in the
+    /// same session, seconds apart. Letting it satisfy availability would flip the selection and then fail
+    /// at MINT time, trading a clear "no credential" error for a confusing one.</para></summary>
     public static bool IsAvailable =>
-        !string.IsNullOrEmpty(Environment.GetEnvironmentVariable(TokenServiceUrlEnv)) &&
-        !string.IsNullOrEmpty(Environment.GetEnvironmentVariable(SessionTokenEnv));
+        !string.IsNullOrEmpty(TokenServiceUrl()) &&
+        (!string.IsNullOrEmpty(Environment.GetEnvironmentVariable(SessionTokenEnv)) ||
+         !string.IsNullOrEmpty(TridentConfValue(SessionTokenConfKey)));
 
     public override AccessToken GetToken(TokenRequestContext requestContext, CancellationToken cancellationToken)
         => GetTokenAsync(requestContext, cancellationToken).AsTask().GetAwaiter().GetResult();
@@ -83,8 +103,10 @@ public sealed class FabricNotebookCredential : TokenCredential
 
     private static async Task<AccessToken> MintAsync(string resource, CancellationToken ct)
     {
-        var baseUrl = Environment.GetEnvironmentVariable(TokenServiceUrlEnv)
-            ?? throw new InvalidOperationException("FabricNotebookCredential: AZURE_FABRIC_TOKEN_SERVICE_URL is not set");
+        var baseUrl = TokenServiceUrl()
+            ?? throw new InvalidOperationException(
+                "FabricNotebookCredential: no token service endpoint (neither AZURE_FABRIC_TOKEN_SERVICE_URL "
+                + "nor tokenServiceEndpoint in " + ConfigPath + ")");
         var sessionToken = ReadSessionToken()
             ?? throw new InvalidOperationException("FabricNotebookCredential: no Fabric session token found");
 
@@ -132,8 +154,26 @@ public sealed class FabricNotebookCredential : TokenCredential
     // The spark-conf session token (trident.session.token, mirrored env) is the one the token service
     // validates; the tokenservice.config.json sessionToken is a DIFFERENT (cluster-level) token that fails
     // with SignedPayloadValidationException — proven by request ablation on the live runtime (2026-07-14).
+    /// <summary>The session token presented to the token service as <c>x-ms-partner-token</c>.
+    /// Python compute mirrors it into an env var; SPARK compute does not, and carries the same value under
+    /// its spark-conf key in <c>.trident-context</c> (measured — see <see cref="IsAvailable"/>). The
+    /// config file's own token is a LAST resort and does not satisfy availability.</summary>
     private static string? ReadSessionToken()
-        => Environment.GetEnvironmentVariable(SessionTokenEnv) ?? ReadConfigValue("sessionToken");
+        => Environment.GetEnvironmentVariable(SessionTokenEnv)
+           ?? TridentConfValue(SessionTokenConfKey)
+           ?? ReadConfigValue("sessionToken");
+
+    /// <summary>Where to mint tokens. The env var exists on PYTHON compute only; on Spark it is composed
+    /// from the two files — see <see cref="FabricTokenServiceUrl"/> for why the config file's
+    /// <c>tokenServiceEndpoint</c> is NOT the endpoint (it is the bare origin, and using it directly 404s).
+    /// MEASURED live 2026-08-13 on PySpark: the composed URL is byte-identical to the env var a Python
+    /// kernel on the same capacity carries, and mints 200 for the storage, Fabric and SQL audiences.</summary>
+    private static string? TokenServiceUrl()
+        => Environment.GetEnvironmentVariable(TokenServiceUrlEnv)
+           ?? FabricTokenServiceUrl.Compose(
+                  ReadConfigValue("tokenServiceEndpoint"),
+                  Environment.GetEnvironmentVariable(WorkloadEndpointEnv)
+                      ?? TridentConfValue("trident.lakehouse.tokenservice.endpoint"));
 
     private static string? ReadConfigValue(string property)
     {

@@ -175,11 +175,12 @@ jobs:
       # A floor, not an equality — adding tests must not break CI, losing them must.
       - name: Assert the suite actually ran
         env:
-          # 155 cases today (theories expand): the variable-library format, the Fabric SQL endpoint
+          # 167 cases today (theories expand): the variable-library format, the Fabric SQL endpoint
           # host/connstr derivation, the persisted Delta parquet tuning (fabricator.parquet.*), the
-          # COPY INTO staging location, and the SESSION layer of ProviderSettingsStore (ABI v69's scoped
-          # SET). Nothing here is platform-skipped, so Total is the same on both runners.
-          EXPECTED_MINIMUM: 155
+          # COPY INTO staging location, the SESSION layer of ProviderSettingsStore (ABI v69's scoped
+          # SET), and the Fabric TOKEN-SERVICE URL composition that makes the ambient credential work on
+          # PySpark. Nothing here is platform-skipped, so Total is the same on both runners.
+          EXPECTED_MINIMUM: 167
         run: |
           total=$(grep -oE 'Total:[[:space:]]+[0-9]+' bridge-test-output.txt | grep -oE '[0-9]+' | head -1)
           if [ -z "$total" ]; then

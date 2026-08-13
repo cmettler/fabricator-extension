@@ -1688,6 +1688,9 @@ ATTACH 'abfss://<workspaceId>@onelake.dfs.fabric.microsoft.com/<itemId>/Tables' 
 
 `READ_ONLY false` is required on the URI form — DuckDB forces a remote ATTACH read-only otherwise.
 
+Both **Python** and **PySpark** notebooks are supported; the ambient token is the notebook's own identity
+either way, so nothing about the ATTACH changes between them.
+
 **A secret is optional, and only needed to use a DIFFERENT identity than the notebook's.** When you do want
 one, these are the shapes that work — the fields are authoritative, so an explicitly configured service
 principal wins even if `PROVIDER` says something else:

@@ -77,6 +77,16 @@
     -->
     <Compile Include="..\Fabricator.Abstractions\ProviderSettings.cs"
              Link="Linked\ProviderSettings.cs" />
+    <!--
+      The Fabric token-service URL composition. Admissible because it is pure string slicing (it exists
+      SPLIT OUT of FabricNotebookCredential, which pulls in Azure.Core, precisely so it can be tested here).
+      Worth pinning offline for the same reason as FabricSqlEndpointHost: the shape is UNDOCUMENTED, read
+      off a live runtime, and the one part that looks like a formatting detail — the DOUBLED slash in
+      .../automatic//token — is what the service 404s without. A live Fabric run costs minutes and a Spark
+      session; this costs milliseconds and catches the case a URI parser would normalise away.
+    -->
+    <Compile Include="..\Fabricator.Bridge\FabricTokenServiceUrl.cs"
+             Link="Linked\FabricTokenServiceUrl.cs" />
   </ItemGroup>
 
 </Project>
