@@ -68,6 +68,19 @@
 > heavier follow-up; slice-1 delivers the headline native-read win (tuned decode + parallelism + caching) with
 > near-zero risk. Below is the full design.
 
+> **⚠ SUPERSEDED 2026-08-13 — READ THIS BEFORE THE PARAGRAPH BELOW.** The pre-spike's "first slice: plain
+> tables" caveat was not a limitation you could opt into: `fabricator_delta_native_scan` shipped in the
+> GLOBAL function registry, so any user could call it, and on a table with a **deletion vector** it returned
+> the deleted rows. MEASURED — 10 rows, a DV delete of 3, and it returned all ten (ids 1..10, sum 55) while
+> the catalog and `fabricator_delta_scan` both returned 7 / 49, silently. A DV records the deletion in the
+> LOG and leaves the parquet untouched, so a file list plus `read_parquet` cannot see it. The function now
+> delegates to `DeltaNativeReader` — the reader an ATTACH catalog uses under `native_read`, where all the
+> follow-up slices actually landed — so DVs, partition columns, column mapping and schema evolution are all
+> applied, and it is a genuine counterpart to `fabricator_delta_scan` rather than a spike. Gate:
+> `verify_delta_native_scan.test` 36 → **59**, mutation-tested (restoring the old query survives 44
+> assertions and dies at the DV one). ⚠ Neither function pushes the PROJECTION — `BindingBoundTable`
+> declares the binding's full `OutputSchema` at bind, so a projected subset would mismatch it.
+>
 > **Phase-A pre-spike DONE (2026-07-03):** `fabricator_delta_native_scan(path)` — engineered-wood lists the EXACT
 > active data files + schema (`DeltaReader.GetActiveFileUris`, the `add` set, NOT a glob), and DuckDB's **native
 > parquet reader** reads them via `read_parquet([...])` run on the host engine (`Host.Query`/host_query). Matches

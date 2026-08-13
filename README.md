@@ -77,7 +77,7 @@ See [SQL Server external tables on S3](#sql-server-external-tables-on-s3).
 | **Tx** | BEGIN / COMMIT / ROLLBACK (connection pinning, read-your-writes) | ✅ |
 | **Functions** | `fabricator_query`, `fabricator_exec`, `fabricator_refresh_cache`, `fabricator_invalidate_cache`, `fabricator_version` | ✅ |
 | | `fabricator_functions(catalog)` — list discovered routines | ✅ |
-| | `fabricator_delta_scan(path)` — read a Delta table by path, no ATTACH | ✅ |
+| | `fabricator_delta_scan(path)` / `fabricator_delta_native_scan(path)` — read a Delta table by path, no ATTACH (C# reader / DuckDB's parquet reader) | ✅ |
 | | `fabricator_host_query(sql)` — run a query on DuckDB itself (inherits your search path + `TimeZone`) | ✅ |
 | **Macros** | Provider **global** macros — bare `fn(...)` / `FROM fn(...)`, every database, no ATTACH | ✅ |
 | | Provider **catalog-bound** macros → `db.schema.m(...)` (namespaced per catalog; expanded by the binder) | ✅ |
@@ -811,6 +811,20 @@ SELECT * FROM fabricator_delta_scan('abfss://ws@onelake.dfs.fabric.microsoft.com
 
 Filesystem credentials come from DuckDB secrets exactly as for `read_parquet`. For a whole folder of tables,
 plus writes and DML, ATTACH the [Delta provider](#delta-lake-provider) instead.
+
+### `fabricator_delta_native_scan(path) -> TABLE`
+
+The same read with **DuckDB's own parquet reader** instead of the C# one — same argument, same rows, so it
+is a drop-in swap when you want DuckDB's reader and its external file cache:
+
+```sql
+SELECT * FROM fabricator_delta_native_scan('abfss://ws@onelake.dfs.fabric.microsoft.com/LH.Lakehouse/Tables/t');
+```
+
+Both functions read the Delta log the same way — deletion vectors, partition columns, column mapping and
+schema evolution are all applied — and both leave column projection to DuckDB above the scan, so neither
+prunes columns inside the parquet read. Which is faster depends on the table and the storage; measure rather
+than assume.
 
 ### Provider macros
 

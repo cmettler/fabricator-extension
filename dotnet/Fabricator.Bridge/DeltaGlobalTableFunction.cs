@@ -93,10 +93,24 @@ public sealed class DeltaGlobalTableFunction : ITableFunction
         }
 
         private static IReadOnlyList<object?> ReadValues(IArrowArrayStream? filterValues)
-            => ReadValuesAsync(filterValues).GetAwaiter().GetResult();
+            => FilterConstants.Read(filterValues);
 
-        private static async Task<IReadOnlyList<object?>> ReadValuesAsync(IArrowArrayStream? filterValues)
-        {
+        public void Dispose() { }
+    }
+}
+
+/// <summary>
+/// Reads a pushdown filter's typed constants out of the host's side stream. Shared by the two global Delta
+/// readers — <c>fabricator_delta_scan</c> and <c>fabricator_delta_native_scan</c> — which both push the
+/// FILTER (file / row-group skipping) and both leave the projection to DuckDB.
+/// </summary>
+internal static class FilterConstants
+{
+    public static IReadOnlyList<object?> Read(IArrowArrayStream? filterValues)
+        => ReadAsync(filterValues).GetAwaiter().GetResult();
+
+    private static async Task<IReadOnlyList<object?>> ReadAsync(IArrowArrayStream? filterValues)
+    {
             if (filterValues is null)
             {
                 return System.Array.Empty<object?>();
@@ -122,24 +136,31 @@ public sealed class DeltaGlobalTableFunction : ITableFunction
                 }
                 return values;
             }
-        }
-
-        public void Dispose() { }
     }
 }
 
 /// <summary>
-/// <c>fabricator_delta_native_scan(path)</c> — the native-read pre-spike (docs/multifile-delta.md Phase A):
-/// engineered-wood supplies the EXACT active data-file list + schema (the log/snapshot layer), and DuckDB's
-/// <b>native parquet reader</b> reads the files via <c>read_parquet([...])</c> run on the host engine
-/// (<see cref="Host.Query"/>) — so the read gets DuckDB's tuned reader + <c>ExternalFileCache</c> (over the
-/// <c>onelake://</c> subsystem for OneLake) instead of engineered-wood's C# parquet reader. Contrast
-/// <see cref="DeltaGlobalTableFunction"/> (<c>fabricator_delta_scan</c>), which reads the data in C#.
+/// <c>fabricator_delta_native_scan(path)</c> — read a Delta table by path with <b>DuckDB's own parquet
+/// reader</b>, so the read gets its tuned reader + <c>ExternalFileCache</c> (over the <c>onelake://</c>
+/// subsystem for OneLake). The exact counterpart of <see cref="DeltaGlobalTableFunction"/>
+/// (<c>fabricator_delta_scan</c>), which reads the same table with engineered-wood's C# parquet reader:
+/// same argument, same result, different engine below.
 ///
-/// <para>First slice — plain tables: no deletion vectors, no partition columns, no pushdown (DuckDB projects +
-/// filters above the scan). DV/partition/pushdown + folding into the ATTACH catalog are follow-up slices.
-/// Credential-free where the log lives on a local/host-FS path; OneLake needs the ambient credential for the
-/// log read (works from the ATTACH catalog path — a later slice).</para>
+/// <para>⚠ IT WAS A PHASE-A SPIKE UNTIL 2026-08-13 AND IT SERVED DELETED ROWS. It ran
+/// <c>SELECT * FROM read_parquet([&lt;active files&gt;])</c> over a file list resolved at bind, which is
+/// enough to read a plain table and nothing else: a deletion vector records the deletion in the LOG and
+/// leaves the parquet untouched, so every deleted row came back. MEASURED on the DEFAULT table shape —
+/// 10 rows, a DV delete of 3, and this returned all ten while the catalog and <c>fabricator_delta_scan</c>
+/// both returned 7. It now delegates to <see cref="DeltaNativeReader"/>, the reader an ATTACH catalog uses
+/// under <c>native_read</c>, which resolves files AND their deletion vectors from one snapshot and handles
+/// partition columns, column mapping and schema evolution.</para>
+///
+/// <para>⚠ Pushdown: the FILTER is pushed (file / row-group skipping), the PROJECTION is not —
+/// <see cref="BindingBoundTable"/> declares the binding's full <c>OutputSchema</c> at bind, so a projected
+/// subset would mismatch it. <c>fabricator_delta_scan</c> carries the identical limitation for the identical
+/// reason; lifting it needs a bound table that declares the projected schema.</para>
+///
+/// <para>Credential-free where the log lives on a local/host-FS path; OneLake needs the ambient credential.</para>
 /// </summary>
 public sealed class DeltaNativeScanFunction : ITableFunction
 {
@@ -154,34 +175,63 @@ public sealed class DeltaNativeScanFunction : ITableFunction
         AmbientAdlsCredential.Current = null;
         var opener = AmbientOpener.Current;
         var schema = DeltaReader.GetSchema(opener, path);              // engineered-wood: the log → schema
-        var files = DeltaReader.GetActiveFileUris(opener, path);      // engineered-wood: the exact active file set
-        return new NativeBinding(schema, files);
+        // ⚠ The active-file LIST is no longer resolved here. It used to be, and reading it at bind was part
+        // of what made this serve deleted rows: a list of file URIs carries no deletion vector, so whatever
+        // consumed it could only read whole files. DeltaNativeReader resolves the files AND their DVs
+        // together at execute time, from one snapshot.
+        return new NativeBinding(path, schema);
     }
 
     private sealed class NativeBinding : IArrowTableFunctionBinding
     {
+        private readonly string _path;
         private readonly Schema _schema;
-        private readonly IReadOnlyList<string> _files;
 
-        public NativeBinding(Schema schema, IReadOnlyList<string> files)
+        public NativeBinding(string path, Schema schema)
         {
+            _path = path;
             _schema = schema;
-            _files = files;
         }
 
         public Schema OutputSchema => _schema;
-        public bool SupportsPushdown => false; // DuckDB projects + filters above the read_parquet scan
+
+        // DuckDB re-applies projection + filter above the scan. The FILTER is still pushed below (file and
+        // row-group skipping); the PROJECTION deliberately is not — see the note in Execute.
+        public bool SupportsPushdown => false;
 
         public IAsyncEnumerable<RecordBatch> Execute(TableFunctionScan scan, CancellationToken ct = default)
         {
-            if (_files.Count == 0)
-            {
-                return EmptyStream();
-            }
-            // Read the EXACT active files through the host's native parquet reader (cached; over onelake:// for
-            // OneLake). A fresh host connection runs this (Host.Query) — reentrancy-safe by design.
-            var list = string.Join(",", _files.Select(f => "'" + f.Replace("'", "''") + "'"));
-            var stream = Host.Query($"SELECT * FROM read_parquet([{list}])");
+            // Connection-free global reader → clear any stale Fabric credential left on this (reused)
+            // execution thread by a prior catalog op, exactly as Bind does: the FS factory must take the
+            // host-FS (duckdb-azure) path, not the direct-SDK OneLake filesystem.
+            AmbientAdlsCredential.Current = null;
+            // ⚠ THIS USED TO BE `Host.Query("SELECT * FROM read_parquet([<active files>])")`, WHICH SERVED
+            // DELETED ROWS. MEASURED 2026-08-13 on the DEFAULT table shape (deletion_vectors is on by
+            // default): 10 rows, DELETE of 3 via a deletion vector, and this function returned all ten —
+            // ids [1..10], sum 55, where the catalog and fabricator_delta_scan both returned 7 / 49. Silent,
+            // no error. A DV records the deletion in the LOG and leaves the parquet file untouched, so any
+            // reader that goes straight to the bytes reports rows the table no longer contains.
+            //
+            // It now routes through DeltaNativeReader — the same reader the ATTACH catalog uses under
+            // native_read — which applies the deletion vector, reconstructs partition columns from the log
+            // (rather than relying on DuckDB's hive auto-detection of the directory layout) and handles
+            // column mapping and schema evolution. That is also the honest fix for the "plain tables only"
+            // caveat this spike shipped with: the follow-up slices all went into that class.
+            //
+            // ⚠ THE PROJECTION IS NOT PUSHED, and that is a constraint of this seam rather than of the
+            // reader. BindingBoundTable wraps the stream with the binding's FULL OutputSchema, fixed at bind
+            // before DuckDB knows what it wants, so emitting a projected subset mismatches the declared
+            // schema (arrow_ingest reads past the end — SIGSEGV). Passing no Columns makes the reader
+            // resolve the full schema, which is what OutputSchema promises. fabricator_delta_scan carries
+            // the identical limitation for the identical reason; lifting it needs a bound table that
+            // declares the PROJECTED schema.
+            var spec = scan.Spec;
+            var pushed = spec is null
+                ? null
+                : new ScanSpec { Filter = spec.Filter, NativeFilter = spec.NativeFilter, At = spec.At };
+            var stream = DeltaNativeReader.Read(
+                AmbientOpener.Current, _path, _schema, pushed, FilterConstants.Read(scan.FilterValues),
+                unit: null, value: null);
             return Drain(stream, ct);
         }
 

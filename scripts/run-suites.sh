@@ -265,7 +265,13 @@ case "$TIER" in
         # regressing. Its unset assertion doubles as the regression gate for the ONE-WAY DOOR that pass
         # closed: a constrained table used to reject every property edit, including the one removing the
         # constraint. ⚠ The unconstrained twin taking identical statements is the load-bearing control.
-        : "${MIN_ASSERTIONS:=7023}"
+        # 7046 since 2026-08-13: verify_delta_native_scan (+23) — the DV / partitioned / column-mapped
+        # shapes. fabricator_delta_native_scan was SERVING DELETED ROWS (measured: 10 rows where the catalog
+        # and fabricator_delta_scan both returned 7), and the pre-existing fixture could not have caught it —
+        # delta_simple is a plain table, so all 36 original assertions passed with the bug fully present.
+        # Each new shape is asserted THREE ways (catalog / delta_scan / native_scan) so "they agree" cannot be
+        # satisfied by a reader that has stopped returning rows.
+        : "${MIN_ASSERTIONS:=7046}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

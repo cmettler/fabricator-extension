@@ -51,3 +51,93 @@ query I
 SELECT sum(amount) FROM fabricator_delta_native_scan('${FABRICATOR_DELTA_DIR}') WHERE name = 'row_2';
 ----
 3.0
+
+# ---- Deletion vectors, partitions, column mapping: it must AGREE with the other two readers ----
+#
+# ⚠ THIS SECTION EXISTS BECAUSE THE FUNCTION SERVED DELETED ROWS. Until 2026-08-13 it ran
+# `SELECT * FROM read_parquet([<active files>])` over a file list resolved at bind, which reads a plain
+# table correctly and nothing else: a deletion vector records the deletion in the LOG and leaves the parquet
+# untouched. MEASURED before the fix — 10 rows, a DV delete of 3, and this returned all ten (ids 1..10,
+# sum 55) while the catalog and fabricator_delta_scan both returned 7 / 49. Silent, no error.
+#
+# ⚠ THE FIXTURE ABOVE CANNOT CATCH THIS and that is why it did not: delta_simple is a plain table with no
+# DV, so every assertion before this point passes with the bug fully present. The shapes have to be BUILT.
+#
+# ⚠ THE THREE-WAY COMPARISON IS THE POINT, not the literal counts: the catalog read and fabricator_delta_scan
+# are independent readers of the same table, so "all three agree" cannot be satisfied by a reader that has
+# simply stopped returning rows. Each section asserts the literal too, so a common-mode failure is caught.
+
+require-env FABRICATOR_DELTA_WRITE_DIR
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/ns' AS ns (TYPE fabricator, PROVIDER 'delta');
+
+statement ok
+CREATE TABLE ns.main.dv AS SELECT i AS id, i * 10 AS v FROM range(1, 11) t(i);
+
+statement ok
+DELETE FROM ns.main.dv WHERE id <= 3;
+
+# POSITIVE CONTROL: the delete really wrote a deletion vector rather than rewriting the file. Without this
+# the section could pass for the wrong reason — a copy-on-write rewrite leaves no DV to ignore.
+query I
+SELECT count(*) > 0 FROM read_text('${FABRICATOR_DELTA_WRITE_DIR}/ns/dv/_delta_log/*.json')
+WHERE content LIKE '%deletionVector%';
+----
+true
+
+query II
+SELECT count(*), sum(id) FROM ns.main.dv;
+----
+7	49
+
+query II
+SELECT count(*), sum(id) FROM fabricator_delta_scan('${FABRICATOR_DELTA_WRITE_DIR}/ns/dv');
+----
+7	49
+
+# The regression assertion. Before the fix: 10 / 55.
+query II
+SELECT count(*), sum(id) FROM fabricator_delta_native_scan('${FABRICATOR_DELTA_WRITE_DIR}/ns/dv');
+----
+7	49
+
+# ...and the surviving ids, so a wrong count is attributable to the deleted rows rather than to a miscount.
+query I
+SELECT list(id ORDER BY id) FROM fabricator_delta_native_scan('${FABRICATOR_DELTA_WRITE_DIR}/ns/dv');
+----
+[4, 5, 6, 7, 8, 9, 10]
+
+# A PARTITIONED table. ⚠ This one WORKED before the fix, by accident: the spike passed no hive_partitioning
+# flag, so DuckDB auto-detected the `part=a/` directory layout and reconstructed the column from the path.
+# It is asserted now because the fix changes HOW the value is produced — DeltaNativeReader takes partition
+# values from the log and turns hive auto-detection OFF deliberately (an `x=y` directory anywhere in a
+# table's path would otherwise inject a phantom column).
+statement ok
+SET delta_write_options='{"partition_by":["part"]}';
+
+statement ok
+CREATE TABLE ns.main.pt AS SELECT i AS id, CASE WHEN i % 2 = 0 THEN 'a' ELSE 'b' END AS part FROM range(1, 7) t(i);
+
+statement ok
+RESET delta_write_options;
+
+query III
+SELECT count(*), count(DISTINCT part), sum(id) FROM ns.main.pt;
+----
+6	2	21
+
+query III
+SELECT count(*), count(DISTINCT part), sum(id) FROM fabricator_delta_native_scan('${FABRICATOR_DELTA_WRITE_DIR}/ns/pt');
+----
+6	2	21
+
+# Column mapping is ON by default, so the data files store PHYSICAL names (col-<uuid>). A reader that goes
+# straight to the parquet without consulting the log would surface those, or nothing.
+query II
+SELECT count(*), sum(v) FROM fabricator_delta_native_scan('${FABRICATOR_DELTA_WRITE_DIR}/ns/dv');
+----
+7	490
+
+statement ok
+DETACH ns;
