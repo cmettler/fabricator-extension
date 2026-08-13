@@ -657,6 +657,21 @@ static string RenderLiveFilters(const ArrowStreamBindData &bind_data, TableFunct
 	return sql;
 }
 
+string BuildSchemaOnlySpec(const string &at_unit, const string &at_value) {
+	string json = "{\"schema_only\":true";
+	// Mirrors the "at" encoding BuildScanSpec emits below, EXACTLY — same key, same escaping. The describe
+	// and the scan must name the same version or the plan is built against a schema the scan will not return.
+	if (!at_unit.empty()) {
+		json += ",\"at\":{\"unit\":";
+		JsonEscape(at_unit, json);
+		json += ",\"value\":";
+		JsonEscape(at_value, json);
+		json += "}";
+	}
+	json += "}";
+	return json;
+}
+
 static string BuildScanSpec(const ArrowStreamBindData &bind_data, const vector<column_t> &output_column_ids,
                             const string &live_filter_sql, const string &live_filter_json) {
 	vector<string> cols;

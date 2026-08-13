@@ -219,6 +219,19 @@ struct ArrowStreamBindData : public duckdb::TableFunctionData {
 // (LogicalGet::GetTable()); enables UPDATE/DELETE on catalog tables.
 duckdb::BindInfo ArrowStreamGetBindInfo(const duckdb::optional_ptr<duckdb::FunctionData> bind_data);
 
+// The spec_json for a SCHEMA-ONLY describe: `{"schema_only":true}` plus the AT clause when the reference is
+// a time-travel one, so the table is described AS OF the requested version rather than at latest.
+//
+// ⚠ IT MUST CARRY THE AT CLAUSE. Two consumers depend on that and they must agree: the bind-time probe
+// (PopulateReturnSchema) and the AT-aware catalog entry (FabricatorSchemaEntry::GetOrCreateEntry), whose
+// ColumnList is what `SELECT *` expands from. If either describes a different version than the scan reads,
+// DuckDB projects a column the as-of data does not have — see docs/known-limitations.md §1.x, where fixing
+// only one of them turned a clean binder error into a database-invalidating assertion.
+//
+// Lives here so the JSON escaping stays in ONE place, next to the identical encoding BuildScanSpec emits for
+// the real scan.
+duckdb::string BuildSchemaOnlySpec(const duckdb::string &at_unit, const duckdb::string &at_value);
+
 // Discovers the result schema by producing a stream, reading its schema, and
 // releasing it. Fills `return_types`/`names` and bind_data.arrow_table.
 void PopulateReturnSchema(duckdb::ClientContext &context, ArrowStreamBindData &bind_data,

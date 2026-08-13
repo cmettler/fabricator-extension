@@ -15,6 +15,7 @@
 
 namespace duckdb {
 
+class BoundAtClause;
 class DBConfig;
 class ExtensionLoader;
 
@@ -123,7 +124,17 @@ public:
 	void Alter(CatalogTransaction transaction, AlterInfo &info) override;
 
 private:
-	optional_ptr<CatalogEntry> GetOrCreateEntry(ClientContext &context, const string &table_name);
+	//! Materializes (and caches) the catalog entry for a table. `at` is the reference's time-travel clause:
+	//! null => the ordinary LATEST entry; set => an entry whose ColumnList is the schema AS OF that version,
+	//! which is what `SELECT *` expands against.
+	//!
+	//! ⚠ AT entries live in their OWN map, never in entries_. Both Scan() overloads must not see them:
+	//! the context-taking one iterates table_types_ (names) and so cannot, but the context-free one walks
+	//! entries_ DIRECTLY and would enumerate them — a second row per time-travelled table in
+	//! duckdb_tables()/information_schema.tables. Time travel is a property of a table REFERENCE, not of
+	//! the catalog, so the listing must keep showing one row per table at latest.
+	optional_ptr<CatalogEntry> GetOrCreateEntry(ClientContext &context, const string &table_name,
+	                                            optional_ptr<BoundAtClause> at = nullptr);
 	optional_ptr<CatalogEntry> GetOrCreateScalarFunction(ClientContext &context, const string &func_name);
 	optional_ptr<CatalogEntry> GetOrCreateTableFunction(ClientContext &context, const string &func_name);
 	//! Materializes a provider-authored SQL-GENERATING table function (v68): a bind_replace-only table
@@ -162,6 +173,12 @@ private:
 	case_insensitive_map_t<string> macros_;            // catalog-bound macro name -> its CREATE MACRO statement
 	mutex entry_lock_;
 	case_insensitive_map_t<unique_ptr<FabricatorTableEntry>> entries_;
+	// Time-travel entries, keyed name+unit+value (see AtEntryKey). Separate from entries_ so no enumeration
+	// path can reach them (see GetOrCreateEntry). Cleared by the same invalidation hooks as entries_:
+	// a VERSION-keyed entry is immutable and clearing it is merely wasteful, but a TIMESTAMP-keyed one is
+	// NOT — `AT (TIMESTAMP => '2999-01-01')` resolves to latest-as-of-that-instant, which moves as commits
+	// land — so one rule covers both rather than two that can drift.
+	case_insensitive_map_t<unique_ptr<FabricatorTableEntry>> at_entries_;
 	case_insensitive_map_t<unique_ptr<ScalarFunctionCatalogEntry>> function_entries_;
 	case_insensitive_map_t<unique_ptr<TableFunctionCatalogEntry>> table_function_entries_;
 	case_insensitive_map_t<unique_ptr<AggregateFunctionCatalogEntry>> aggregate_function_entries_;

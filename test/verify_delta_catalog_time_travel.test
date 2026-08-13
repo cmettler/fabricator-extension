@@ -157,3 +157,117 @@ SELECT count(*) FROM ict.main.t AT (VERSION => 1);
 
 statement ok
 DETACH ict;
+
+# ---------------------------------------------------------------------------------------------------------
+# TIME TRAVEL ACROSS A SCHEMA CHANGE. Every other section builds its history from INSERTs alone, so all
+# versions share ONE schema — which is why this suite passed for months while `AT (VERSION => n)` over an
+# ALTERed table was broken, and why the ADD COLUMN below is the whole point of this section.
+#
+# It took TWO layers, and fixing only the first made things WORSE (docs/known-limitations.md §1.x):
+#   1. the bind-time schema PROBE sent a hardcoded `{"schema_only":true}` carrying no AT, and was built
+#      before the clause was recorded at all -> the plan was typed at LATEST;
+#   2. `SELECT *` expands from the CATALOG ENTRY, whose ColumnList also came from latest. With only (1)
+#      fixed, a 3-column expansion met a 2-column scan and DuckDB raised
+#      "INTERNAL Error: Vector::Reference used on vector of different type", which INVALIDATES THE DATABASE.
+#
+# ⚠ PLACED LAST ON PURPOSE: a regression here is fatal to the connection, so every later assertion in the
+# file would die with "FATAL Error: database has been invalidated" rather than reporting its own result.
+# ---------------------------------------------------------------------------------------------------------
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/catalogtt_evo' AS evo (TYPE fabricator, PROVIDER 'delta', READ_ONLY false);
+
+statement ok
+CREATE TABLE evo.main.t AS SELECT i AS id, i * 2 AS v FROM range(3) r(i);
+
+# v1 = the CREATE's data. Adding a column AFTER it makes v1's schema NARROWER than latest.
+statement ok
+ALTER TABLE evo.main.t ADD COLUMN extra INTEGER;
+
+# LATEST: three columns; no file carries `extra`, so it reads NULL.
+query III
+SELECT id, v, extra FROM evo.main.t ORDER BY id;
+----
+0	0	NULL
+1	2	NULL
+2	4	NULL
+
+# AS OF v1: `SELECT *` must expand to the TWO columns that existed then. This is the assertion both layers
+# exist for — with (2) missing it is not a wrong answer but a fatal internal error.
+query II
+SELECT * FROM evo.main.t AT (VERSION => 1) ORDER BY id;
+----
+0	0
+1	2
+2	4
+
+# An explicit column list as of v1 — the shape layer (1) alone already fixed. Kept as the control that
+# distinguishes "both layers work" from "only the probe was fixed".
+query II
+SELECT id, v FROM evo.main.t AT (VERSION => 1) ORDER BY id;
+----
+0	0
+1	2
+2	4
+
+# Naming the post-ALTER column AS OF v1 is a clean binder error: the entry now describes v1, where it does
+# not exist. Asserts the as-of column set is really NARROWER rather than latest-with-NULLs.
+statement error
+SELECT extra FROM evo.main.t AT (VERSION => 1);
+----
+
+# ⚠ THE AT ENTRY MUST NOT LEAK INTO THE CATALOG LISTING. Time travel is a property of a table REFERENCE, not
+# of the catalog, so enumeration keeps showing ONE `t` at the LATEST schema however many versions were
+# queried above. The context-free Scan() overload walks the entry map directly, which is exactly why AT
+# entries live in their own map — without that separation this reports two rows.
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'evo' AND table_name = 't';
+----
+1
+
+query I
+SELECT count(*) FROM duckdb_columns() WHERE database_name = 'evo' AND table_name = 't';
+----
+3
+
+# ⚠ A RENAME, NOT JUST AN ADD — and this section exists because the ADD COLUMN case above CANNOT SEE
+# layer (1). ADD COLUMN appends, so v1's schema is a PREFIX of latest and the two agree positionally on the
+# columns that matter; mutation-testing showed a build with the probe's AT clause REMOVED passing everything
+# above. A RENAME makes the as-of schema disagree by NAME rather than by length, which is what the probe is
+# for: with it disabled the scan asks the v1 parquet for the NEW name and fails with
+#     Binder Error: Referenced column "renamed" not found in FROM clause
+# So this section pins layer (1); the ADD COLUMN one above pins layer (2).
+statement ok
+CREATE TABLE evo.main.r AS SELECT i AS id, i * 2 AS v FROM range(3) tbl(i);
+
+statement ok
+ALTER TABLE evo.main.r RENAME COLUMN v TO renamed;
+
+query II
+SELECT id, renamed FROM evo.main.r ORDER BY id;
+----
+0	0
+1	2
+2	4
+
+# AS OF v1 the column is still `v` — the as-of schema differs from latest by NAME, not by length.
+query II
+SELECT * FROM evo.main.r AT (VERSION => 1) ORDER BY id;
+----
+0	0
+1	2
+2	4
+
+query II
+SELECT id, v FROM evo.main.r AT (VERSION => 1) ORDER BY id;
+----
+0	0
+1	2
+2	4
+
+# And the NEW name must not resolve as of a version that predates the rename.
+statement error
+SELECT renamed FROM evo.main.r AT (VERSION => 1);
+----
+
+statement ok
+DETACH evo;

@@ -327,4 +327,21 @@ void FetchTableColumns(ClientContext &context, FabricatorHandle handle, const st
 	fabricator::PopulateReturnSchema(context, bind_data, types, names);
 }
 
+void FetchTableColumnsAt(ClientContext &context, FabricatorHandle handle, const string &schema_name,
+                         const string &table_name, const string &at_unit, const string &at_value,
+                         vector<string> &names, vector<LogicalType> &types) {
+	// The scan asked for SCHEMA ONLY, plus the AT clause: a zero-row stream whose Arrow schema describes the
+	// table AS OF that version. Same shape as FetchTableColumns above, but sourced from the scan because the
+	// COLUMNS metadata stream has nowhere to carry an AT — and because the scan is the very thing whose
+	// return schema this ColumnList has to agree with.
+	fabricator::ArrowStreamBindData bind_data;
+	auto spec = fabricator::BuildSchemaOnlySpec(at_unit, at_value);
+	bind_data.factory = [handle, schema_name, table_name, spec](const fabricator::ArrowScanRequest &,
+	                                                            ArrowArrayStream &out) {
+		fabricator::ScanTable(handle, schema_name, table_name, spec.c_str(), nullptr, out);
+	};
+	FabricatorSetActiveTxn(handle, context);
+	fabricator::PopulateReturnSchema(context, bind_data, types, names);
+}
+
 } // namespace duckdb

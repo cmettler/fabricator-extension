@@ -110,6 +110,61 @@ storage and has NOT been read through the attach.
 ⚠ **A green multi-writer run with ZERO collisions measures nothing** — it is indistinguishable from writers that
 happened to serialize. Check the retry/collision count before believing one.
 
+### 1.x Delta time travel across a schema change — FIXED 2026-08-13 (kept: the shape of the failure)
+
+`SELECT * FROM t AT (VERSION => n)` over a table whose schema changed after *n* used to raise
+`Binder Error: Referenced column "extra" not found in FROM clause`. **Fixed**; recorded because the fix took
+two layers and fixing one alone was measurably WORSE than the bug.
+
+- **Layer 1 — the bind-time schema probe.** `schema_factory` sent a hardcoded `{"schema_only":true}` carrying
+  no AT, and was built ~20 lines BEFORE the clause was recorded on the bind data, so the plan was typed at
+  LATEST. Now `BuildSchemaOnlySpec(at_unit, at_value)`, with the `at_clause` block moved above it.
+- **Layer 2 — the catalog entry.** `SELECT *` expands from the TABLE ENTRY, whose `ColumnList` also came from
+  latest. `LookupEntry` now passes `GetAtClause()` to `GetOrCreateEntry`, which builds an entry whose columns
+  are the as-of schema, sourced from the SCAN (schema-only + AT) so the entry and that scan's return schema
+  come from ONE describe and cannot disagree.
+
+⚠ **Layer 1 alone turned a clean binder error into `INTERNAL Error: Vector::Reference used on vector of
+different type` followed by `FATAL Error: database has been invalidated`** — a 3-column expansion meeting a
+2-column scan. That half-fix was built, measured and reverted before the second layer existed. A recoverable
+error is worth more than a partial fix.
+
+⚠ **AT entries live in their OWN map, never in `entries_`.** The context-taking `Scan()` iterates
+`table_types_` (names) and so cannot see them, but the **context-free `Scan(CatalogType, callback)` overload
+walks `entries_` DIRECTLY** and would enumerate them — a second row per time-travelled table in
+`duckdb_tables()`/`information_schema.tables`. Time travel is a property of a table REFERENCE, not of the
+catalog. Gated.
+
+⚠ **`ADD COLUMN` CANNOT TEST LAYER 1** — it appends, so the as-of schema is a PREFIX of latest and the two
+agree positionally. A build with the probe's AT removed passed the whole ADD-COLUMN gate. `RENAME COLUMN` is
+what separates them (the as-of schema differs by NAME, not length), so the suite pins **ADD → layer 2,
+RENAME → layer 1**, each mutation-tested at its own section. `verify_delta_catalog_time_travel` 49 → **98**.
+
+**Write paths cannot reach an AT entry**, and that is DuckDB's grammar rather than a check of ours: `ALTER`,
+`INSERT`, `UPDATE` and `DELETE` with an `AT` clause on the target are all **parser errors**, since `AT` is
+valid only on a table reference in a `FROM`. That matters here — an AT entry carries a historical
+`ColumnList` against a live table handle, so a write through one would be silent corruption. The useful shape
+does work: `CREATE TABLE restored AS SELECT * FROM t AT (VERSION => 1)`.
+
+### 1.y ⚠ Fabric Warehouse time travel CANNOT span a schema change — a provider limit, not ours
+
+MEASURED live 2026-08-13. `OPTION (FOR TIMESTAMP AS OF …)` at an instant before an `ALTER` is refused by the
+server:
+
+```
+12516: The TIMESTAMP in the query (2026-08-13T17:21:19.110) is before the object was last changed
+(with ALTER). Specify a TIMESTAMP at or after the last ALTER time (2026-08-13T17:21:25.143).
+```
+
+So Fabric never returns an as-of schema that differs from current — it declines instead. Nothing to fix on
+our side, and it is why §1.x is a DELTA-only concern.
+
+⚠ **box / Azure SQL temporal is different again and also needs nothing**: SQL Server keeps the history
+table's schema identical to the current one and propagates `ALTER` to it, so `FOR SYSTEM_TIME AS OF` can only
+ever return the CURRENT shape (older rows read NULL for a later-added column). Three providers, three
+behaviours — which is why the entry takes its columns from the provider's own as-of describe rather than from
+any rule in the host.
+
 ---
 
 ## 2. Claimed but NOT measured — treat as unproven

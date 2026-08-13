@@ -12,6 +12,7 @@
 #include "catalog/fabricator_metadata.hpp"
 #include "catalog/fabricator_txn_util.hpp"
 #include "duckdb/common/arrow/arrow_appender.hpp"
+#include "duckdb/planner/tableref/bound_at_clause.hpp"
 #include "duckdb/common/arrow/arrow_converter.hpp"
 #include "duckdb/common/enums/operator_result_type.hpp"
 #include "duckdb/common/exception.hpp"
@@ -81,6 +82,25 @@ static void RetireErase(MAP &cache, const string &key, vector<unique_ptr<Catalog
 	}
 }
 
+// Evicts every TIME-TRAVEL entry for one table. at_entries_ is keyed name+US+unit+US+value, so a
+// name-scoped eviction has to match the name PART — RetireErase on the bare name would never hit.
+// Called wherever the LATEST entry is evicted: whatever made that stale (a REPLACE, an ALTER, a DROP,
+// a self-heal) can equally have invalidated an as-of view of the same table.
+template <class MAP>
+static void RetireAtEntriesFor(MAP &cache, const string &table_name,
+                               vector<unique_ptr<CatalogEntry>> &graveyard) {
+	for (auto it = cache.begin(); it != cache.end();) {
+		auto sep = it->first.find('\x1f');
+		if (sep != string::npos && StringUtil::CIEquals(it->first.substr(0, sep), table_name)) {
+			graveyard.push_back(std::move(it->second));
+			it = cache.erase(it);
+		} else {
+			++it;
+		}
+	}
+}
+
+
 template <class MAP>
 static void RetireAll(MAP &cache, vector<unique_ptr<CatalogEntry>> &graveyard) {
 	for (auto &kv : cache) {
@@ -107,6 +127,7 @@ void FabricatorSchemaEntry::AddTable(const string &table_name, const string &tab
 	table_types_[table_name] = table_type;
 	// Drop any cached entry so the schema is re-fetched (e.g. after CREATE OR REPLACE).
 	RetireErase(entries_, table_name, retired_entries_);
+	RetireAtEntriesFor(at_entries_, table_name, retired_entries_);
 }
 
 void FabricatorSchemaEntry::AddScalarFunction(const string &func_name) {
@@ -181,6 +202,9 @@ void FabricatorSchemaEntry::InvalidateEntryCache() {
 	// entries so the next access re-fetches columns/rowid/return types from the (now committed) server state.
 	lock_guard<mutex> lock(entry_lock_);
 	RetireAll(entries_, retired_entries_);
+	// Time-travel entries go too. A VERSION-keyed one is immutable so dropping it is merely wasteful, but
+	// a TIMESTAMP-keyed one is not (a far-future instant resolves to a moving latest) — one rule for both.
+	RetireAll(at_entries_, retired_entries_);
 	RetireAll(function_entries_, retired_entries_);
 	RetireAll(table_function_entries_, retired_entries_);
 	RetireAll(aggregate_function_entries_, retired_entries_);
@@ -196,17 +220,44 @@ void FabricatorSchemaEntry::InvalidateMatching(const std::function<bool(const st
 	// self-heals (its column re-fetch fails -> GetOrCreateEntry evicts it). Everything else stays warm.
 	lock_guard<mutex> lock(entry_lock_);
 	RetireMatching(entries_, matches, retired_entries_);
+	// ⚠ at_entries_ is keyed name+US+unit+US+value, so the caller's NAME predicate must be applied to the
+	// name PART. Passing the composite key straight to `matches` would silently match nothing and leave a
+	// time-travel entry describing a table that has since been ALTERed.
+	RetireMatching(at_entries_,
+	               [&](const string &key) { return matches(key.substr(0, key.find('\x1f'))); },
+	               retired_entries_);
 	RetireMatching(function_entries_, matches, retired_entries_);
 	RetireMatching(table_function_entries_, matches, retired_entries_);
 	RetireMatching(aggregate_function_entries_, matches, retired_entries_);
 	RetireMatching(macro_entries_, matches, retired_entries_);
 }
 
-optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateEntry(ClientContext &context, const string &table_name) {
+// The cache key for a time-travel entry. US separators (0x1f) cannot occur in a SQL identifier or in the
+// AT clause's rendered value, so no (name, unit, value) triple can collide with another.
+static string AtEntryKey(const string &table_name, const string &unit, const string &value) {
+	return table_name + "\x1f" + unit + "\x1f" + value;
+}
+
+optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateEntry(ClientContext &context, const string &table_name,
+                                                                 optional_ptr<BoundAtClause> at) {
 	lock_guard<mutex> lock(entry_lock_);
-	auto cached = entries_.find(table_name);
-	if (cached != entries_.end()) {
-		return cached->second.get();
+	// A time-travel reference resolves against its OWN map: the entry it needs describes the table as of
+	// that version, and putting it in entries_ would both shadow the latest one and leak into the
+	// context-free Scan() overload, which walks entries_ directly.
+	string at_unit, at_value, at_key;
+	if (at) {
+		at_unit = at->Unit();
+		at_value = at->GetValue().ToString();
+		at_key = AtEntryKey(table_name, at_unit, at_value);
+		auto at_cached = at_entries_.find(at_key);
+		if (at_cached != at_entries_.end()) {
+			return at_cached->second.get();
+		}
+	} else {
+		auto cached = entries_.find(table_name);
+		if (cached != entries_.end()) {
+			return cached->second.get();
+		}
 	}
 	auto type_it = table_types_.find(table_name);
 	if (type_it == table_types_.end() && !catalog.Cast<FabricatorCatalog>().HasObjectFilter()) {
@@ -222,7 +273,11 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateEntry(ClientContext
 	vector<string> names;
 	vector<LogicalType> types;
 	try {
-		FetchTableColumns(context, handle_, name, table_name, names, types);
+		if (at) {
+			FetchTableColumnsAt(context, handle_, name, table_name, at_unit, at_value, names, types);
+		} else {
+			FetchTableColumns(context, handle_, name, table_name, names, types);
+		}
 	} catch (fabricator::ObjectNotFoundException &) {
 		// The discovered name is stale — the table no longer exists on the server
 		// (e.g. dropped out-of-band via fabricator_exec). Treat it as not-found so
@@ -237,6 +292,8 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateEntry(ClientContext
 		// leads to a missing commit file.
 		table_types_.erase(table_name);
 		RetireErase(entries_, table_name, retired_entries_);
+		RetireAtEntriesFor(at_entries_, table_name, retired_entries_);
+	RetireAtEntriesFor(at_entries_, table_name, retired_entries_);
 		return nullptr;
 	}
 
@@ -311,7 +368,11 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateEntry(ClientContext
 	                                           std::move(rowid_type), std::move(virtual_rowid_columns),
 	                                           std::move(provider_virtual_columns));
 	auto &ref = *entry;
-	entries_[table_name] = std::move(entry);
+	if (at) {
+		at_entries_[at_key] = std::move(entry);
+	} else {
+		entries_[table_name] = std::move(entry);
+	}
 	return &ref;
 }
 
@@ -2580,7 +2641,9 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::LookupEntry(CatalogTransaction
 	}
 	auto type = lookup_info.GetCatalogType();
 	if (type == CatalogType::TABLE_ENTRY) {
-		return GetOrCreateEntry(*transaction.context, lookup_info.GetEntryName());
+		// The AT clause rides the lookup: a time-travel reference needs an entry whose ColumnList is the
+		// schema AS OF that version, because `SELECT *` expands from the ENTRY, not from the scan.
+		return GetOrCreateEntry(*transaction.context, lookup_info.GetEntryName(), lookup_info.GetAtClause());
 	}
 	if (type == CatalogType::SCALAR_FUNCTION_ENTRY) {
 		// DuckDB stores scalar/aggregate/macro functions in one namespace and resolves a function call by
@@ -2971,6 +3034,7 @@ void FabricatorSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
 	lock_guard<mutex> lock(entry_lock_);
 	table_types_.erase(info.name);
 	RetireErase(entries_, info.name, retired_entries_);
+	RetireAtEntriesFor(at_entries_, info.name, retired_entries_);
 }
 // A nested-field path as a JSON array of segments (["s","inner","f"]) — segment names may contain dots,
 // so a joined string would be ambiguous. Consumed by the provider's field-evolution alter kinds.
@@ -3027,6 +3091,7 @@ void FabricatorSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &inf
 		{
 			lock_guard<mutex> lock(entry_lock_);
 			RetireErase(entries_, t, retired_entries_);
+			RetireAtEntriesFor(at_entries_, t, retired_entries_);
 		}
 		try {
 			GetOrCreateEntry(context, t); // eager re-fetch on this txn's connection (no Sch-M self-block)
@@ -3044,8 +3109,10 @@ void FabricatorSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &inf
 		string type = it != table_types_.end() ? it->second : string("BASE TABLE");
 		table_types_.erase(table);
 		RetireErase(entries_, table, retired_entries_);
+	RetireAtEntriesFor(at_entries_, table, retired_entries_);
 		table_types_[rt.new_table_name] = type;
 		RetireErase(entries_, rt.new_table_name, retired_entries_);
+	RetireAtEntriesFor(at_entries_, rt.new_table_name, retired_entries_);
 		break;
 	}
 	case AlterTableType::RENAME_COLUMN: {

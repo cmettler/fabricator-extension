@@ -788,6 +788,17 @@ TableFunction FabricatorTableEntry::BuildScanFunction(ClientContext &context, un
 	data->factory = [handle, schema_name, table_name](const fabricator::ArrowScanRequest &req, ArrowArrayStream &out) {
 		fabricator::ScanTable(handle, schema_name, table_name, req.spec_json, req.filter_values, out);
 	};
+	// Time travel: record `FROM t AT (...)` (a bind-time constant) so the scan spec carries it to the
+	// provider (SQL Server: FOR SYSTEM_TIME AS OF for "timestamp"; "version" is rejected managed-side).
+	if (at_clause) {
+		data->at_unit = at_clause->Unit();
+		data->at_value = at_clause->GetValue().ToString();
+	}
+
+	// ⚠ THE BLOCK ABOVE MUST STAY ABOVE the schema_factory below, which bakes the AT clause into the probe
+	// spec. It used to sit ~20 lines further down, so the probe was built while at_unit was still empty and
+	// a time-travel reference was described at LATEST. See docs/known-limitations.md §1.x.
+
 	// Describe the table WITHOUT reading it: the same scan call, asked for schema only. Without this the
 	// bind below ran the scan factory with an empty request — an unfiltered `SELECT *` the server begins
 	// executing before we cancel it — purely to learn column types.
@@ -799,8 +810,14 @@ TableFunction FabricatorTableEntry::BuildScanFunction(ClientContext &context, un
 	// verify_delta_autocommit_pin, whose whole subject is that one statement gets ONE cut. Asking the scan
 	// keeps provider routing, native-vs-codec selection and pin seeding identical to a real scan; the only
 	// thing that changes is that no rows are produced.
-	data->schema_factory = [handle, schema_name, table_name](ArrowArrayStream &out) {
-		fabricator::ScanTable(handle, schema_name, table_name, "{\"schema_only\":true}", nullptr, out);
+	//
+	// ⚠ AND IT MUST DESCRIBE THE REQUESTED VERSION, not latest — the AT clause rides the probe spec.
+	// The catalog ENTRY this scan belongs to was built from the SAME describe (see
+	// FabricatorSchemaEntry::GetOrCreateEntry), so `SELECT *`'s column list and this scan's return
+	// schema come from one source and cannot disagree.
+	string probe_spec = fabricator::BuildSchemaOnlySpec(data->at_unit, data->at_value);
+	data->schema_factory = [handle, schema_name, table_name, probe_spec](ArrowArrayStream &out) {
+		fabricator::ScanTable(handle, schema_name, table_name, probe_spec.c_str(), nullptr, out);
 	};
 	data->push_projection = true; // push the projected column list (and later, filters) to SQL
 	// String-keyed ORDER BY may be pushed only under a binary database collation (byte-order sort ==
@@ -827,13 +844,6 @@ TableFunction FabricatorTableEntry::BuildScanFunction(ClientContext &context, un
 	data->provider_virtual_columns = provider_virtual_columns_; // stable __delta_row_id / _commit_version
 	data->rowid_type = rowid_type_;
 	data->table = this; // lets LogicalGet::GetTable() resolve (UPDATE/DELETE)
-
-	// Time travel: record `FROM t AT (...)` (a bind-time constant) so the scan spec carries it to the
-	// provider (SQL Server: FOR SYSTEM_TIME AS OF for "timestamp"; "version" is rejected managed-side).
-	if (at_clause) {
-		data->at_unit = at_clause->Unit();
-		data->at_value = at_clause->GetValue().ToString();
-	}
 
 	bind_data = std::move(data);
 

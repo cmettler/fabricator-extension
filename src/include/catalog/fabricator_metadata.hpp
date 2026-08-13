@@ -105,6 +105,22 @@ void FetchFunctionOutputSchema(ClientContext &context, FabricatorHandle handle, 
 void FetchTableColumns(ClientContext &context, FabricatorHandle handle, const string &schema_name,
                        const string &table_name, vector<string> &names, vector<LogicalType> &types);
 
+//! The same, AS OF a time-travel reference's version/timestamp — the column set a
+//! `FROM t AT (VERSION => n)` reference must expand `SELECT *` against.
+//!
+//! ⚠ It asks the SCAN (schema-only spec + the AT clause), not the COLUMNS metadata stream, for two reasons.
+//! The metadata stream has nowhere to carry an AT; and asking the scan means the catalog entry's ColumnList
+//! and that scan's own return schema come from ONE describe, so they cannot disagree — which is the exact
+//! failure documented in docs/known-limitations.md §1.x.
+//!
+//! ⚠ ABSENCE IS NOT CLASSIFIED ON THIS PATH. `GetMetadata` maps the provider's NOT_FOUND status to
+//! ObjectNotFoundException; `ScanTable` does not, so a missing table surfaces as the provider's own error
+//! rather than "table does not exist". The caller checks the discovered NAME list first, which is what
+//! answers the ordinary case; the gap is reachable only under an ATTACH object filter.
+void FetchTableColumnsAt(ClientContext &context, FabricatorHandle handle, const string &schema_name,
+                         const string &table_name, const string &at_unit, const string &at_value,
+                         vector<string> &names, vector<LogicalType> &types);
+
 //! Discovers the row-identity columns for a table, in key order: the primary
 //! key if present, else the unique index with the fewest columns. Returns empty
 //! if the table has no PK or unique index.
