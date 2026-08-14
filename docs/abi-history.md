@@ -1,9 +1,24 @@
-# ABI history — prior versions v16–v70
+# ABI history — prior versions v16–v71
 
 > Moved VERBATIM out of `CLAUDE.md` on 2026-07-29 (conservative split — see the commit message).
 > Append-only as-built history; the live summary + pointers stay in `CLAUDE.md`.
 > Paths/links inside are REPO-ROOT-relative (the text was written for `CLAUDE.md`).
 > The CURRENT version + the bump rule stay in `CLAUDE.md` §C ABI contract.
+
+## v71 (2026-08-14) — `get_capabilities`: the catalog capability doc
+
+ONE appended vtable entry returning ONE flat JSON object of the catalog's host-consumed capability
+booleans (`exact_filter_pushdown`, `is_binary_collation`; ABSENT key = false), read once at ATTACH from
+`LoadCatalog`. Slice 3 of the catalog/table abstraction: it killed the ServerInfo grep — the old
+`FetchExactFilterPushdown`/`FetchBinaryCollation` read the diagnostic kind-7 (property, value) stream
+TWICE and string-matched it on both sides. Kind 7 stayed, diagnostic-only (`fabricator_server_info()`).
+Managed: `IBackendCatalog.CapabilitiesJson`, a DIM returning `"{}"` so a provider with nothing to assert
+declares nothing; SqlServer and Delta override it FROM THE SAME FIELDS their diagnostic rows read, so the
+two surfaces cannot drift. ⚠ Deliberately NOT part of `open_catalog`'s result although the design doc
+first sketched it there: `open_catalog` must stay connection-free (the measured mutant note in
+`fabricator_storage.cpp`), while SQL Server needs a CONNECTION to answer (collation detection) — at
+`LoadCatalog` the ambients are established and this path always paid the first connection anyway.
+(At v72 the kind-7 stream itself became the dedicated `catalog_server_info` entry, still diagnostic-only.)
 
 ## ⚠ RENAME, 2026-08-14 — `table_bind`/`table_execute`/`table_close` are now `tablefn_*`. NO ABI BUMP.
 

@@ -675,20 +675,69 @@ int64_t ExecuteUpdate(FabricatorHandle handle, const std::string &schema, const 
 	return affected;
 }
 
-void GetMetadata(FabricatorHandle handle, int32_t kind, const std::string &arg1, const std::string &arg2,
-                 ArrowArrayStream &out) {
+// Shared body of the five catalog_* discovery wrappers.
+static void CatalogList(FabricatorHandle handle, ArrowArrayStream &out, const char *what,
+                        int32_t (*entry)(FabricatorHandle, ArrowArrayStream *, char **)) {
 	const FabricatorVTable &vt = GetBridge();
-	if (!vt.get_metadata) {
-		throw duckdb::IOException("Fabricator: bridge does not provide get_metadata");
+	if (!entry) {
+		throw duckdb::IOException("Fabricator: bridge does not provide %s", what);
 	}
 	char *err = nullptr;
-	int32_t rc = vt.get_metadata(handle, kind, arg1.empty() ? nullptr : arg1.c_str(),
-	                             arg2.empty() ? nullptr : arg2.c_str(), &out, &err);
+	int32_t rc = entry(handle, &out, &err);
+	if (rc != FABRICATOR_OK) {
+		ThrowManagedError(vt, err, std::string("Fabricator: ") + what + " failed");
+	}
+}
+
+void CatalogSchemas(FabricatorHandle handle, ArrowArrayStream &out) {
+	CatalogList(handle, out, "catalog_schemas", GetBridge().catalog_schemas);
+}
+
+void CatalogTables(FabricatorHandle handle, ArrowArrayStream &out) {
+	CatalogList(handle, out, "catalog_tables", GetBridge().catalog_tables);
+}
+
+void CatalogFunctions(FabricatorHandle handle, ArrowArrayStream &out) {
+	CatalogList(handle, out, "catalog_functions", GetBridge().catalog_functions);
+}
+
+void CatalogMacros(FabricatorHandle handle, ArrowArrayStream &out) {
+	CatalogList(handle, out, "catalog_macros", GetBridge().catalog_macros);
+}
+
+void CatalogServerInfo(FabricatorHandle handle, ArrowArrayStream &out) {
+	CatalogList(handle, out, "catalog_server_info", GetBridge().catalog_server_info);
+}
+
+FabricatorHandle TableOpen(FabricatorHandle handle, const std::string &schema, const std::string &table,
+                           const std::string &at_unit, const std::string &at_value) {
+	const FabricatorVTable &vt = GetBridge();
+	if (!vt.table_open) {
+		throw duckdb::IOException("Fabricator: bridge does not provide table_open");
+	}
+	char *err = nullptr;
+	FabricatorHandle out_table = nullptr;
+	int32_t rc = vt.table_open(handle, schema.c_str(), table.c_str(), at_unit.empty() ? nullptr : at_unit.c_str(),
+	                           at_value.empty() ? nullptr : at_value.c_str(), &out_table, &err);
+	if (rc != FABRICATOR_OK) {
+		ThrowManagedError(vt, err, "Fabricator: table_open failed");
+	}
+	return out_table;
+}
+
+void TableSchema(FabricatorHandle table, ArrowArrayStream &out) {
+	const FabricatorVTable &vt = GetBridge();
+	if (!vt.table_schema) {
+		throw duckdb::IOException("Fabricator: bridge does not provide table_schema");
+	}
+	char *err = nullptr;
+	int32_t rc = vt.table_schema(table, &out, &err);
 	if (rc == FABRICATOR_NOT_FOUND) {
-		// ABSENCE, kept distinct from failure all the way to the catalog. The status has existed in abi.h
-		// since the beginning and was never produced or consumed; wiring it is what lets the entry
-		// materialization stop treating every unreadable table as a deleted one.
-		std::string message = "Fabricator: get_metadata failed";
+		// ABSENCE, kept distinct from failure all the way to the catalog (the old get_metadata kind-2
+		// contract, unchanged): only a provider that has ESTABLISHED absence answers this status, so the
+		// entry materialization can treat it as "the table is gone" without erasing a table whose data is
+		// intact but merely unreadable.
+		std::string message = "Fabricator: table_schema failed";
 		if (err) {
 			message += ": ";
 			message += err;
@@ -699,7 +748,60 @@ void GetMetadata(FabricatorHandle handle, int32_t kind, const std::string &arg1,
 		throw ObjectNotFoundException(message);
 	}
 	if (rc != FABRICATOR_OK) {
-		ThrowManagedError(vt, err, "Fabricator: get_metadata failed");
+		ThrowManagedError(vt, err, "Fabricator: table_schema failed");
+	}
+}
+
+void TableInfo(FabricatorHandle table, ArrowArrayStream &out) {
+	const FabricatorVTable &vt = GetBridge();
+	if (!vt.table_info) {
+		throw duckdb::IOException("Fabricator: bridge does not provide table_info");
+	}
+	char *err = nullptr;
+	int32_t rc = vt.table_info(table, &out, &err);
+	if (rc != FABRICATOR_OK) {
+		ThrowManagedError(vt, err, "Fabricator: table_info failed");
+	}
+}
+
+void TableStats(FabricatorHandle table, ArrowArrayStream &out) {
+	const FabricatorVTable &vt = GetBridge();
+	if (!vt.table_stats) {
+		throw duckdb::IOException("Fabricator: bridge does not provide table_stats");
+	}
+	char *err = nullptr;
+	int32_t rc = vt.table_stats(table, &out, &err);
+	if (rc != FABRICATOR_OK) {
+		ThrowManagedError(vt, err, "Fabricator: table_stats failed");
+	}
+}
+
+void TableScan(FabricatorHandle table, const std::string &spec_json, ArrowArrayStream *filter_values,
+               ArrowArrayStream &out) {
+	const FabricatorVTable &vt = GetBridge();
+	if (!vt.table_scan) {
+		throw duckdb::IOException("Fabricator: bridge does not provide table_scan");
+	}
+	char *err = nullptr;
+	const char *spec = spec_json.empty() ? nullptr : spec_json.c_str();
+	int32_t rc = vt.table_scan(table, spec, filter_values, &out, &err);
+	if (rc != FABRICATOR_OK) {
+		ThrowManagedError(vt, err, "Fabricator: table_scan failed");
+	}
+}
+
+void TableClose(FabricatorHandle table) noexcept {
+	// Best-effort by contract: runs from the entry destructor at catalog teardown, where a managed call
+	// must never throw. Frees the managed GCHandle, nothing more.
+	if (!table) {
+		return;
+	}
+	try {
+		const FabricatorVTable &vt = GetBridge();
+		if (vt.table_close) {
+			vt.table_close(table);
+		}
+	} catch (...) { // NOLINT: teardown must not throw (GetBridge throws if the bridge never booted)
 	}
 }
 
@@ -1253,20 +1355,6 @@ void AggFinalizeSpill(FabricatorHandle session, ArrowArray &states, ArrowArraySt
 	int32_t rc = vt.agg_finalize_spill(session, &states, &out, &err);
 	if (rc != FABRICATOR_OK) {
 		ThrowManagedError(vt, err, "Fabricator: agg_finalize_spill failed");
-	}
-}
-
-void ScanTable(FabricatorHandle handle, const std::string &schema, const std::string &table, const std::string &spec_json,
-               ArrowArrayStream *filter_values, ArrowArrayStream &out) {
-	const FabricatorVTable &vt = GetBridge();
-	if (!vt.scan_table) {
-		throw duckdb::IOException("Fabricator: bridge does not provide scan_table");
-	}
-	char *err = nullptr;
-	const char *spec = spec_json.empty() ? nullptr : spec_json.c_str();
-	int32_t rc = vt.scan_table(handle, schema.c_str(), table.c_str(), spec, filter_values, &out, &err);
-	if (rc != FABRICATOR_OK) {
-		ThrowManagedError(vt, err, "Fabricator: scan_table failed");
 	}
 }
 

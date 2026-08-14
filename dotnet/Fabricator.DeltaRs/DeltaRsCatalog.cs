@@ -12,12 +12,15 @@ using DeltaLake.Extensions;
 using DeltaLake.Interfaces;
 using DeltaLake.Kernel.Core;
 using DeltaLake.Table;
+// delta-dotnet's per-table handle collides by NAME with the object model's Fabricator.Bridge.ITable
+// (the table_* session's surface) — alias the delta-rs one; ours stays fully qualified below.
+using DrsTable = DeltaLake.Interfaces.ITable;
 
 namespace Fabricator.DeltaRs;
 
 /// <summary>
 /// A Delta Lake catalog over delta-rs (delta-dotnet). delta-dotnet is single-table (<see cref="IEngine"/> +
-/// <see cref="ITable"/>), so this class supplies the catalog layer: discovery (local FS in v1), per-table
+/// <see cref="DrsTable"/>), so this class supplies the catalog layer: discovery (local FS in v1), per-table
 /// open, and the mapping of each <see cref="IBackendCatalog"/> operation to a delta-dotnet call. delta-rs does
 /// its own object_store IO, so — unlike the engineered-wood provider — this does NOT use the host-FS bridge.
 ///
@@ -130,39 +133,109 @@ public sealed class DeltaRsCatalog : IBackendCatalog
         return _root + "/" + rel;
     }
 
-    private ITable Open(string schema, string table, ulong? version = null) =>
+    private DrsTable Open(string schema, string table, ulong? version = null) =>
         Run(_engine.LoadTableAsync(
             new TableOptions { TableLocation = TableUri(schema, table), StorageOptions = _storage, Version = version },
             default));
 
     // ---- metadata ----
 
-    public IArrowArrayStream GetMetadata(int kind, string? schema, string? table) => kind switch
+    // ── catalog discovery (the five dedicated list members — ABI v72). The per-TABLE questions live on the
+    // typed ITable members (the definition/bound table below), reached through the host's table_* session.
+
+    // CatalogSchemaNames, not SchemaNames: the advertised set includes the `delta` function namespace
+    // (snapshots/changes are catalog-bound functions — the same mechanism as the engineered-wood
+    // provider; the host drops a declared function whose schema it did not register).
+    public IArrowArrayStream GetSchemas() => SingleColumn("schema_name", CatalogSchemaNames());
+
+    public IArrowArrayStream GetTables() => TablesStream();
+
+    // The delta.* function declarations (cat.delta.snapshots / cat.delta.changes). Built in memory —
+    // nothing is discovered; the set is what this provider declares.
+    public IArrowArrayStream GetFunctions() => FunctionsMetadata.Stream(Functions.Declarations(SchemaNames));
+
+    public IArrowArrayStream GetMacros() => EmptyTable("schema", "name", "create_sql");
+
+    public IArrowArrayStream GetServerInfo() => EmptyTable("property", "value");
+
+    private static IArrowArrayStream EmptyTable(params string[] columns)
     {
-        // CatalogSchemaNames, not SchemaNames: the advertised set includes the `delta` function namespace
-        // (snapshots/changes are catalog-bound functions now — the same mechanism as the engineered-wood
-        // provider; the host drops a declared function whose schema it did not register).
-        MetadataKind.Schemas => SingleColumn("schema_name", CatalogSchemaNames()),
-        MetadataKind.Tables => TablesStream(),
-        MetadataKind.Columns => ColumnsStream(schema!, table!),
-        // Rowid = ALL columns (a full-row identity). delta-rs has no low-level position/remove API, so DELETE/
-        // UPDATE run as a record-batch MERGE matching the scanned rows on every column (NULL-safe). This is
-        // sound because a WHERE can't distinguish identical rows, so DuckDB's rowid set is always a complete
-        // equivalence class. See docs/delta-rs-provider.md "The DML crux".
-        MetadataKind.RowId => SingleColumn("name", RowIdColumns(schema!, table!)),
-        // The delta.* function declarations (cat.delta.snapshots / cat.delta.changes). Built in memory —
-        // nothing is discovered; the set is what this provider declares.
-        MetadataKind.Functions => FunctionsMetadata.Stream(Functions.Declarations(SchemaNames)),
-        // No provider virtual columns (stable row-tracking virtuals are an engineeredwooddelta feature).
-        MetadataKind.VirtualColumns => new InMemoryArrayStream(
-            new Schema(new[]
+        var builder = new Schema.Builder();
+        foreach (var c in columns)
+        {
+            builder.Field(new Field(c, StringType.Default, nullable: true));
+        }
+        return new InMemoryArrayStream(builder.Build(), System.Array.Empty<RecordBatch>());
+    }
+
+    /// <summary>The delta-rs <see cref="ITableDefinition"/> — transaction-free in this provider (the
+    /// default <c>ResolveTransaction</c> answers null, so every bind is transient and caller-owned).</summary>
+    public ITableDefinition GetTable(string schemaName, string tableName) =>
+        new DeltaRsTableDefinition(this, schemaName, tableName);
+
+    private sealed class DeltaRsTableDefinition : ITableDefinition
+    {
+        private readonly DeltaRsCatalog _catalog;
+
+        internal DeltaRsTableDefinition(DeltaRsCatalog catalog, string schemaName, string tableName)
+        {
+            _catalog = catalog;
+            SchemaName = schemaName;
+            TableName = tableName;
+        }
+
+        public string SchemaName { get; }
+        public string TableName { get; }
+
+        // The AT clause is carried per the interface; the SCHEMA answer deliberately ignores it (delta-rs
+        // loads the snapshot per scan, and the scan spec's own AT is what selects the version there —
+        // matching the pre-4d transport, where the columns fetch had no AT channel on this provider).
+        public Fabricator.Bridge.ITable Bind(ITransaction? transaction, TableAt? at = null) =>
+            new DeltaRsBoundTable(_catalog, this);
+    }
+
+    private sealed class DeltaRsBoundTable : Fabricator.Bridge.ITable
+    {
+        private readonly DeltaRsCatalog _catalog;
+        private readonly DeltaRsTableDefinition _definition;
+
+        internal DeltaRsBoundTable(DeltaRsCatalog catalog, DeltaRsTableDefinition definition)
+        {
+            _catalog = catalog;
+            _definition = definition;
+        }
+
+        public Schema Schema
+        {
+            get
             {
-                new Field("name", StringType.Default, nullable: true),
-                new Field("type", StringType.Default, nullable: true),
-            }, metadata: null),
-            System.Array.Empty<RecordBatch>()),
-        _ => SingleColumn("name", System.Array.Empty<string>()),
-    };
+                using var t = _catalog.Open(_definition.SchemaName, _definition.TableName);
+                return t.Schema();
+            }
+        }
+
+        /// <summary>Rowid = ALL columns (a full-row identity). delta-rs has no low-level position/remove
+        /// API, so DELETE/UPDATE run as a record-batch MERGE matching the scanned rows on every column
+        /// (NULL-safe). This is sound because a WHERE can't distinguish identical rows, so DuckDB's rowid
+        /// set is always a complete equivalence class. See docs/delta-rs-provider.md "The DML crux".</summary>
+        public IReadOnlyList<string> RowIdColumns() =>
+            _catalog.RowIdColumns(_definition.SchemaName, _definition.TableName);
+
+        /// <summary>No provider virtual columns (stable row-tracking virtuals are an engineeredwooddelta
+        /// feature).</summary>
+        public IReadOnlyList<VirtualColumn> VirtualColumns() => System.Array.Empty<VirtualColumn>();
+
+        public long? ApproximateRowCount() => null;
+
+        public IReadOnlyList<NdvEntry> ColumnNdv() => System.Array.Empty<NdvEntry>();
+
+        public IArrowArrayStream Scan(string? specJson, IArrowArrayStream? filterValues) =>
+            _catalog.ScanTable(_definition.SchemaName, _definition.TableName, specJson, filterValues);
+
+        public void Dispose()
+        {
+        }
+    }
 
     private IReadOnlyList<string> SchemaNames()
     {
@@ -200,13 +273,6 @@ public sealed class DeltaRsCatalog : IBackendCatalog
             typeCol.Add("BASE TABLE");
         }
         return ThreeColumn("schema_name", schemaCol, "table_name", nameCol, "table_type", typeCol);
-    }
-
-    private IArrowArrayStream ColumnsStream(string schema, string table)
-    {
-        using var t = Open(schema, table);
-        // A zero-row stream whose SCHEMA describes the table's columns.
-        return new InMemoryArrayStream(t.Schema(), System.Array.Empty<RecordBatch>());
     }
 
     /// <summary>Table discovery: OneLake → the Unity Catalog REST API (paginated); local FS → subdirs
@@ -485,8 +551,8 @@ public sealed class DeltaRsCatalog : IBackendCatalog
         // Create the table only if it doesn't exist yet (empty, schema-only + CDF config/partitions), then
         // write. An existing table with createTable=true (COPY default / CTAS-replace) is OVERWRITTEN, not an
         // error — the previous ErrorIfExists broke COPY into an existing table.
-        ITable? existing = TryOpen(schemaName, tableName);
-        ITable table;
+        DrsTable? existing = TryOpen(schemaName, tableName);
+        DrsTable table;
         bool overwrite;
         if (existing is null)
         {
@@ -537,7 +603,7 @@ public sealed class DeltaRsCatalog : IBackendCatalog
     }
 
     /// <summary>Opens the table if it exists, else null (a table-not-found error becomes "does not exist").</summary>
-    private ITable? TryOpen(string schemaName, string tableName)
+    private DrsTable? TryOpen(string schemaName, string tableName)
     {
         try
         {

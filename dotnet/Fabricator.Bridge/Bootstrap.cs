@@ -57,7 +57,7 @@ public static unsafe class Bootstrap
             return new InMemoryArrayStream(schema, new[] { batch });
         });
 
-        vtable->AbiVersion = 71;
+        vtable->AbiVersion = 72;
         vtable->OpenCatalog = &OpenCatalog;
         vtable->CloseCatalog = &CloseCatalog;
         vtable->ExecuteQuery = &ExecuteQuery;
@@ -66,8 +66,6 @@ public static unsafe class Bootstrap
         vtable->BulkInsert = &BulkInsert;
         vtable->ExecuteDelete = &ExecuteDelete;
         vtable->ExecuteUpdate = &ExecuteUpdate;
-        vtable->GetMetadata = &GetMetadata;
-        vtable->ScanTable = &ScanTable;
         vtable->CreateTable = &CreateTable;
         vtable->DropTable = &DropTable;
         vtable->CreateSchema = &CreateSchema;
@@ -123,6 +121,17 @@ public static unsafe class Bootstrap
         vtable->GenerateTableSql = &GenerateTableSql;
         vtable->ClearSessionSettings = &ClearSessionSettings;
         vtable->GetCapabilities = &GetCapabilities;
+        vtable->CatalogSchemas = &CatalogSchemas;
+        vtable->CatalogTables = &CatalogTables;
+        vtable->CatalogFunctions = &CatalogFunctions;
+        vtable->CatalogMacros = &CatalogMacros;
+        vtable->CatalogServerInfo = &CatalogServerInfo;
+        vtable->TableOpen = &TableOpen;
+        vtable->TableSchema = &TableSchema;
+        vtable->TableInfo = &TableInfo;
+        vtable->TableStats = &TableStats;
+        vtable->TableScan = &TableScan;
+        vtable->TableClose = &TableClose;
         return FabricatorStatus.Ok;
     }
 
@@ -328,9 +337,12 @@ public static unsafe class Bootstrap
         }
     }
 
-    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static int GetMetadata(nint handle, int kind, byte* arg1, byte* arg2, CArrowArrayStream* outStream,
-                                   byte** err)
+    // ---- catalog discovery + the table session (ABI v72 — get_metadata/scan_table's replacement) --------
+
+    /// <summary>Shared body of the five catalog_* discovery exports: resolve the catalog, export the
+    /// member's stream.</summary>
+    private static int CatalogList(nint handle, CArrowArrayStream* outStream, byte** err, string what,
+                                   Func<IBackendCatalog, IArrowArrayStream> member)
     {
         try
         {
@@ -340,12 +352,80 @@ public static unsafe class Bootstrap
             }
             var catalog = Handles.Resolve<IBackendCatalog>(handle)
                           ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
-            var a1 = Marshal.PtrToStringUTF8((nint)arg1);
-            var a2 = Marshal.PtrToStringUTF8((nint)arg2);
-            BridgeLog.LogDebug("abi get_metadata: kind={Kind} arg1={A1} arg2={A2}", kind, a1, a2);
+            BridgeLog.LogDebug("abi {What}", what);
+            CArrowArrayStreamExporter.ExportArrayStream(member(catalog), outStream);
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
 
-            IArrowArrayStream stream = catalog.GetMetadata(kind, a1, a2);
-            CArrowArrayStreamExporter.ExportArrayStream(stream, outStream);
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int CatalogSchemas(nint handle, CArrowArrayStream* outStream, byte** err) =>
+        CatalogList(handle, outStream, err, "catalog_schemas", c => c.GetSchemas());
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int CatalogTables(nint handle, CArrowArrayStream* outStream, byte** err) =>
+        CatalogList(handle, outStream, err, "catalog_tables", c => c.GetTables());
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int CatalogFunctions(nint handle, CArrowArrayStream* outStream, byte** err) =>
+        CatalogList(handle, outStream, err, "catalog_functions", c => c.GetFunctions());
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int CatalogMacros(nint handle, CArrowArrayStream* outStream, byte** err) =>
+        CatalogList(handle, outStream, err, "catalog_macros", c => c.GetMacros());
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int CatalogServerInfo(nint handle, CArrowArrayStream* outStream, byte** err) =>
+        CatalogList(handle, outStream, err, "catalog_server_info", c => c.GetServerInfo());
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int TableOpen(nint handle, byte* schema, byte* table, byte* atUnit, byte* atValue,
+                                 nint* outTable, byte** err)
+    {
+        try
+        {
+            if (outTable is null)
+            {
+                return FabricatorStatus.InvalidArgument;
+            }
+            var catalog = Handles.Resolve<IBackendCatalog>(handle)
+                          ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
+            var schemaName = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
+            var tableName = Marshal.PtrToStringUTF8((nint)table) ?? string.Empty;
+            var unit = Marshal.PtrToStringUTF8((nint)atUnit);
+            var value = Marshal.PtrToStringUTF8((nint)atValue);
+            TableAt? at = string.IsNullOrEmpty(unit) ? null : new TableAt(unit!, value ?? string.Empty);
+            BridgeLog.LogDebug("abi table_open: {Schema}.{Table} at={At}", schemaName, tableName, unit);
+
+            // No IO and no absence probe here: the handle wraps the DEFINITION (+ the reference's AT), and
+            // absence is established by table_schema — the first actual read — exactly where the old kind-2
+            // classified it. Opening cheap is load-bearing: enumeration materializes every table.
+            var session = new TableSession(catalog, catalog.GetTable(schemaName, tableName), at);
+            *outTable = Handles.Alloc(session);
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int TableSchema(nint table, CArrowArrayStream* outStream, byte** err)
+    {
+        try
+        {
+            if (outStream is null || Handles.Resolve<TableSession>(table) is not { } session)
+            {
+                return FabricatorStatus.InvalidArgument;
+            }
+            CArrowArrayStreamExporter.ExportArrayStream(session.SchemaStream(), outStream);
             return FabricatorStatus.Ok;
         }
         catch (ObjectNotFoundException ex)
@@ -365,28 +445,15 @@ public static unsafe class Bootstrap
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static int ScanTable(nint handle, byte* schema, byte* table, byte* specJson,
-                                 CArrowArrayStream* filterValues, CArrowArrayStream* outStream, byte** err)
+    private static int TableInfo(nint table, CArrowArrayStream* outStream, byte** err)
     {
         try
         {
-            if (outStream is null)
+            if (outStream is null || Handles.Resolve<TableSession>(table) is not { } session)
             {
                 return FabricatorStatus.InvalidArgument;
             }
-            var catalog = Handles.Resolve<IBackendCatalog>(handle)
-                          ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
-            var schemaName = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
-            var tableName = Marshal.PtrToStringUTF8((nint)table) ?? string.Empty;
-            var spec = Marshal.PtrToStringUTF8((nint)specJson); // null => full SELECT *
-
-            // Import the typed constant values (if any) the filter tree references.
-            IArrowArrayStream? values = filterValues is null
-                ? null
-                : CArrowArrayStreamImporter.ImportArrayStream(filterValues);
-
-            IArrowArrayStream stream = catalog.ScanTable(schemaName, tableName, spec, values);
-            CArrowArrayStreamExporter.ExportArrayStream(stream, outStream);
+            CArrowArrayStreamExporter.ExportArrayStream(session.InfoStream(), outStream);
             return FabricatorStatus.Ok;
         }
         catch (Exception ex)
@@ -394,6 +461,60 @@ public static unsafe class Bootstrap
             SetError(err, ex);
             return FabricatorStatus.Error;
         }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int TableStats(nint table, CArrowArrayStream* outStream, byte** err)
+    {
+        try
+        {
+            if (outStream is null || Handles.Resolve<TableSession>(table) is not { } session)
+            {
+                return FabricatorStatus.InvalidArgument;
+            }
+            CArrowArrayStreamExporter.ExportArrayStream(session.StatsStream(), outStream);
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int TableScan(nint table, byte* specJson, CArrowArrayStream* filterValues,
+                                 CArrowArrayStream* outStream, byte** err)
+    {
+        try
+        {
+            if (outStream is null || Handles.Resolve<TableSession>(table) is not { } session)
+            {
+                return FabricatorStatus.InvalidArgument;
+            }
+            var spec = Marshal.PtrToStringUTF8((nint)specJson); // null => full SELECT *
+
+            // Import the typed constant values (if any) the filter tree references.
+            IArrowArrayStream? values = filterValues is null
+                ? null
+                : CArrowArrayStreamImporter.ImportArrayStream(filterValues);
+
+            CArrowArrayStreamExporter.ExportArrayStream(session.Scan(spec, values), outStream);
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static void TableClose(nint table)
+    {
+        // A definition handle holds no provider resources — this frees the GCHandle. Best-effort by
+        // contract (the C++ entry destructor calls it during catalog teardown).
+        Handles.Free(table);
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]

@@ -266,18 +266,30 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateEntry(ClientContext
 	}
 	// A miss WITH an object filter active is ambiguous: the discovered list is a filtered subset, so this may
 	// be a real table the filter merely excluded from ENUMERATION. The filter bounds enumeration, not targeted
-	// access — so fetch by name. A genuine absence throws in FetchTableColumns below and is treated as
+	// access — so fetch by name. A genuine absence throws in FetchTableSchema below and is treated as
 	// not-found. The entry is cached in entries_ (fast repeat access) but NOT added to table_types_, so it
 	// stays out of enumeration (SHOW TABLES / full refresh keep the filtered view).
+
+	// Open the table SESSION first (ABI v72): a cheap handle around the stateless definition (+ the AT
+	// clause, which is part of the handle's identity — the AT entry's schema answer is the provider's own
+	// as-of describe). Every crossing below rides it; the ENTRY takes ownership at construction, and this
+	// guard closes it on every earlier exit (absence, a failed fetch) — TableClose is noexcept.
+	struct TableHandleGuard {
+		FabricatorHandle handle;
+		~TableHandleGuard() {
+			fabricator::TableClose(handle);
+		}
+		FabricatorHandle Release() {
+			auto h = handle;
+			handle = nullptr;
+			return h;
+		}
+	} table_guard {fabricator::TableOpen(handle_, name, table_name, at_unit, at_value)};
 
 	vector<string> names;
 	vector<LogicalType> types;
 	try {
-		if (at) {
-			FetchTableColumnsAt(context, handle_, name, table_name, at_unit, at_value, names, types);
-		} else {
-			FetchTableColumns(context, handle_, name, table_name, names, types);
-		}
+		FetchTableSchema(context, handle_, table_guard.handle, names, types);
 	} catch (fabricator::ObjectNotFoundException &) {
 		// The discovered name is stale — the table no longer exists on the server
 		// (e.g. dropped out-of-band via fabricator_exec). Treat it as not-found so
@@ -293,7 +305,6 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateEntry(ClientContext
 		table_types_.erase(table_name);
 		RetireErase(entries_, table_name, retired_entries_);
 		RetireAtEntriesFor(at_entries_, table_name, retired_entries_);
-	RetireAtEntriesFor(at_entries_, table_name, retired_entries_);
 		return nullptr;
 	}
 
@@ -302,8 +313,11 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateEntry(ClientContext
 		info.columns.AddColumn(ColumnDefinition(names[i], types[i]));
 	}
 
+	// Row identity + provider virtual columns — ONE table_info crossing (was kinds 3 + 12).
+	auto identity = FetchTableInfo(table_guard.handle);
+
 	// Resolve row-identity columns (PK / smallest unique index) to column indices.
-	auto rowid_names = FetchRowIdColumns(handle_, name, table_name);
+	auto &rowid_names = identity.rowid_columns;
 	vector<idx_t> rowid_indices;
 	for (auto &rowid_name : rowid_names) {
 		for (idx_t i = 0; i < names.size(); i++) {
@@ -345,10 +359,9 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateEntry(ClientContext
 
 	// Provider-declared VIRTUAL columns (queryable by name, excluded from SELECT *) — e.g. the Delta
 	// catalog's stable __delta_row_id / __delta_row_commit_version on row-tracking tables under
-	// native_read. Best-effort (empty for providers without the metadata kind); an unknown declared
-	// type is skipped rather than guessed.
+	// native_read. An unknown declared type is skipped rather than guessed.
 	vector<std::pair<string, LogicalType>> provider_virtual_columns;
-	for (auto &vc : FetchVirtualColumns(handle_, name, table_name)) {
+	for (auto &vc : identity.virtual_columns) {
 		LogicalType vt;
 		if (vc.second == "BIGINT") {
 			vt = LogicalType::BIGINT;
@@ -364,8 +377,9 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateEntry(ClientContext
 		provider_virtual_columns.emplace_back(vc.first, std::move(vt));
 	}
 
-	auto entry = make_uniq<FabricatorTableEntry>(catalog, *this, info, handle_, std::move(rowid_indices),
-	                                           std::move(rowid_type), std::move(virtual_rowid_columns),
+	auto entry = make_uniq<FabricatorTableEntry>(catalog, *this, info, table_guard.Release(),
+	                                           std::move(rowid_indices), std::move(rowid_type),
+	                                           std::move(virtual_rowid_columns),
 	                                           std::move(provider_virtual_columns));
 	auto &ref = *entry;
 	if (at) {

@@ -94,7 +94,7 @@ vector<vector<string>> ReadStringTable(ArrowArrayStream &stream, idx_t expected_
 vector<string> DiscoverSchemas(FabricatorHandle handle) {
 	ArrowArrayStream stream;
 	std::memset(&stream, 0, sizeof(stream));
-	fabricator::GetMetadata(handle, FABRICATOR_META_SCHEMAS, "", "", stream);
+	fabricator::CatalogSchemas(handle, stream);
 	auto rows = ReadStringTable(stream, 1);
 	return rows[0];
 }
@@ -139,7 +139,7 @@ FabricatorCapabilities FetchCapabilities(FabricatorHandle handle) {
 vector<FabricatorTableInfo> DiscoverTables(FabricatorHandle handle) {
 	ArrowArrayStream stream;
 	std::memset(&stream, 0, sizeof(stream));
-	fabricator::GetMetadata(handle, FABRICATOR_META_TABLES, "", "", stream);
+	fabricator::CatalogTables(handle, stream);
 	auto rows = ReadStringTable(stream, 3);
 
 	vector<FabricatorTableInfo> tables;
@@ -152,7 +152,7 @@ vector<FabricatorTableInfo> DiscoverTables(FabricatorHandle handle) {
 vector<FabricatorFunctionInfo> DiscoverFunctions(FabricatorHandle handle) {
 	ArrowArrayStream stream;
 	std::memset(&stream, 0, sizeof(stream));
-	fabricator::GetMetadata(handle, FABRICATOR_META_FUNCTIONS, "", "", stream);
+	fabricator::CatalogFunctions(handle, stream);
 	// Columns: schema_name, name, kind, [param_count (int), return_type]. We read only
 	// the first three string columns here; the trailing columns are ignored.
 	auto rows = ReadStringTable(stream, 3);
@@ -164,15 +164,16 @@ vector<FabricatorFunctionInfo> DiscoverFunctions(FabricatorHandle handle) {
 }
 
 vector<FabricatorMacroInfo> DiscoverCatalogMacros(FabricatorHandle handle) {
-	// Best-effort BY CONTRACT (see the header): declaring catalog macros is optional, and a provider that does
-	// not serve the kind answers with an error (SqlServerCatalog's default arm throws) or an unrelated empty
-	// table (the Delta/DAX catalogs' `_ =>` fallback). Swallowing here keeps every caller free of its own guard
-	// and matches how the GLOBAL macro registration degrades — a macro problem must never block an ATTACH.
+	// Best-effort BY CONTRACT (see the header): declaring catalog macros is optional. Swallowing here keeps
+	// every caller free of its own guard and matches how the GLOBAL macro registration degrades — a macro
+	// problem must never block an ATTACH. (Since ABI v72 every provider implements the dedicated entry with
+	// a declared 3-column shape, so the old unknown-kind fallback shapes are gone; the guard stays for a
+	// genuinely failing provider.)
 	vector<FabricatorMacroInfo> macros;
 	try {
 		ArrowArrayStream stream;
 		std::memset(&stream, 0, sizeof(stream));
-		fabricator::GetMetadata(handle, FABRICATOR_META_CATALOG_MACROS, "", "", stream);
+		fabricator::CatalogMacros(handle, stream);
 		// Columns: schema, name, create_sql.
 		auto rows = ReadStringTable(stream, 3);
 		for (idx_t i = 0; i < rows[0].size(); i++) {
@@ -248,103 +249,106 @@ void FetchFunctionOutputSchema(ClientContext &context, FabricatorHandle handle, 
 	fabricator::ReadArrowSchema(context, schema, types, names);
 }
 
-vector<string> FetchRowIdColumns(FabricatorHandle handle, const string &schema_name, const string &table_name) {
-	// The managed side picks the PK (else the smallest unique index) and returns
-	// its columns in key order.
-	ArrowArrayStream stream;
-	std::memset(&stream, 0, sizeof(stream));
-	fabricator::GetMetadata(handle, FABRICATOR_META_ROWID, schema_name, table_name, stream);
-	auto rows = ReadStringTable(stream, 1);
-	return rows[0];
-}
-
-vector<std::pair<string, string>> FetchVirtualColumns(FabricatorHandle handle, const string &schema_name,
-                                                      const string &table_name) {
-	// Best-effort: a provider that doesn't implement the kind (or returns an unexpected shape) simply
-	// contributes no virtual columns — never fail entry materialization over this.
-	vector<std::pair<string, string>> result;
-	try {
-		ArrowArrayStream stream;
-		std::memset(&stream, 0, sizeof(stream));
-		fabricator::GetMetadata(handle, FABRICATOR_META_VIRTUAL_COLUMNS, schema_name, table_name, stream);
-		auto rows = ReadStringTable(stream, 2); // name, type-text
-		for (idx_t i = 0; i < rows[0].size(); i++) {
-			result.emplace_back(rows[0][i], rows[1][i]);
-		}
-	} catch (...) {
-		result.clear();
-	}
-	return result;
-}
-
-int64_t FetchRowCount(FabricatorHandle handle, const string &schema_name, const string &table_name) {
-	// Approximate row count from partition stats (cheap metadata read); -1 if unknown.
-	ArrowArrayStream stream;
-	std::memset(&stream, 0, sizeof(stream));
-	fabricator::GetMetadata(handle, FABRICATOR_META_ROWCOUNT, schema_name, table_name, stream);
-	auto rows = ReadStringTable(stream, 1);
-	if (rows.empty() || rows[0].empty()) {
-		return -1;
-	}
-	try {
-		return std::stoll(rows[0][0]);
-	} catch (...) {
-		return -1;
-	}
-}
-
-std::unordered_map<string, int64_t> FetchColumnNdv(FabricatorHandle handle, const string &schema_name,
-                                                   const string &table_name) {
-	// Two columns: column name, NDV (as text). Columns without a leading-key stat are
-	// simply absent (=> unknown). Errors (e.g. permissions) bubble up; the caller may
-	// swallow them — NDV is an optimizer hint, not required for correctness.
-	ArrowArrayStream stream;
-	std::memset(&stream, 0, sizeof(stream));
-	fabricator::GetMetadata(handle, FABRICATOR_META_COLUMN_NDV, schema_name, table_name, stream);
-	auto rows = ReadStringTable(stream, 2);
-	std::unordered_map<string, int64_t> result;
-	if (rows.size() < 2) {
-		return result;
-	}
-	for (idx_t i = 0; i < rows[0].size() && i < rows[1].size(); i++) {
-		try {
-			result[rows[0][i]] = std::stoll(rows[1][i]);
-		} catch (...) {
-			// skip unparseable rows
-		}
-	}
-	return result;
-}
-
-void FetchTableColumns(ClientContext &context, FabricatorHandle handle, const string &schema_name,
-                       const string &table_name, vector<string> &names, vector<LogicalType> &types) {
-	// The COLUMNS metadata stream carries zero rows; its Arrow schema describes
-	// the table's columns, from which DuckDB infers the LogicalTypes.
+void FetchTableSchema(ClientContext &context, FabricatorHandle catalog_handle, FabricatorHandle table_handle,
+                      vector<string> &names, vector<LogicalType> &types) {
+	// The table_schema stream carries zero rows; its Arrow schema describes the table's columns, from which
+	// DuckDB infers the LogicalTypes (PopulateReturnSchema — the one import path, incl. extension types).
 	fabricator::ArrowStreamBindData bind_data;
-	bind_data.factory = [handle, schema_name, table_name](const fabricator::ArrowScanRequest &, ArrowArrayStream &out) {
-		fabricator::GetMetadata(handle, FABRICATOR_META_COLUMNS, schema_name, table_name, out);
+	bind_data.factory = [table_handle](const fabricator::ArrowScanRequest &, ArrowArrayStream &out) {
+		fabricator::TableSchema(table_handle, out);
 	};
 	// Read-your-writes: re-fetching a just-created table's columns (to build its catalog entry) inside an
-	// explicit transaction must see the uncommitted CREATE, so key the metadata read to the active txn.
-	FabricatorSetActiveTxn(handle, context);
+	// explicit transaction must see the uncommitted CREATE, so key the read to the active txn — the session
+	// binds against this ambient (a table opened WITH an AT clause then answers the AS-OF layout).
+	FabricatorSetActiveTxn(catalog_handle, context);
 	fabricator::PopulateReturnSchema(context, bind_data, types, names);
 }
 
-void FetchTableColumnsAt(ClientContext &context, FabricatorHandle handle, const string &schema_name,
-                         const string &table_name, const string &at_unit, const string &at_value,
-                         vector<string> &names, vector<LogicalType> &types) {
-	// The scan asked for SCHEMA ONLY, plus the AT clause: a zero-row stream whose Arrow schema describes the
-	// table AS OF that version. Same shape as FetchTableColumns above, but sourced from the scan because the
-	// COLUMNS metadata stream has nowhere to carry an AT — and because the scan is the very thing whose
-	// return schema this ColumnList has to agree with.
-	fabricator::ArrowStreamBindData bind_data;
-	auto spec = fabricator::BuildSchemaOnlySpec(at_unit, at_value);
-	bind_data.factory = [handle, schema_name, table_name, spec](const fabricator::ArrowScanRequest &,
-	                                                            ArrowArrayStream &out) {
-		fabricator::ScanTable(handle, schema_name, table_name, spec.c_str(), nullptr, out);
-	};
-	FabricatorSetActiveTxn(handle, context);
-	fabricator::PopulateReturnSchema(context, bind_data, types, names);
+FabricatorTableRowIdentity FetchTableInfo(FabricatorHandle table_handle) {
+	ArrowArrayStream stream;
+	std::memset(&stream, 0, sizeof(stream));
+	fabricator::TableInfo(table_handle, stream);
+	auto rows = ReadStringTable(stream, 3); // role, name, type
+	FabricatorTableRowIdentity result;
+	for (idx_t i = 0; i < rows[0].size(); i++) {
+		if (rows[0][i] == "rowid") {
+			result.rowid_columns.push_back(rows[1][i]);
+		} else if (rows[0][i] == "virtual") {
+			result.virtual_columns.emplace_back(rows[1][i], rows[2][i]);
+		}
+		// An unknown role is skipped rather than refused: additive roles must stay additive (the same
+		// forward-compat rule as an unknown ATTACH option).
+	}
+	return result;
+}
+
+// Reads an int64 value from one column array of an Arrow record batch (validity bitmap honoured; a NULL
+// reads as `fallback`).
+static int64_t GetInt64(const ArrowArray &column, int64_t row, int64_t fallback) {
+	int64_t i = column.offset + row;
+	if (column.buffers[0]) {
+		auto validity = reinterpret_cast<const uint8_t *>(column.buffers[0]);
+		if (!(validity[i / 8] & (1u << (i % 8)))) {
+			return fallback;
+		}
+	}
+	return reinterpret_cast<const int64_t *>(column.buffers[1])[i];
+}
+
+FabricatorTableStats FetchTableStats(FabricatorHandle table_handle) {
+	// (stat, column, value:int64) — the value column is TYPED (the old kinds 4/5 crossed numbers as text),
+	// so this needs its own reader beside the all-UTF-8 ReadStringTable.
+	ArrowArrayStream stream;
+	std::memset(&stream, 0, sizeof(stream));
+	fabricator::TableStats(table_handle, stream);
+
+	FabricatorTableStats result;
+	ArrowSchema schema;
+	std::memset(&schema, 0, sizeof(schema));
+	if (stream.get_schema(&stream, &schema) != 0) {
+		if (stream.release) {
+			stream.release(&stream);
+		}
+		throw IOException("fabricator: failed to read table_stats schema");
+	}
+	if (schema.release) {
+		schema.release(&schema);
+	}
+	for (;;) {
+		ArrowArray batch;
+		std::memset(&batch, 0, sizeof(batch));
+		if (stream.get_next(&stream, &batch) != 0) {
+			if (stream.release) {
+				stream.release(&stream);
+			}
+			throw IOException("fabricator: failed to read table_stats batch");
+		}
+		if (!batch.release) {
+			break; // end of stream
+		}
+		if (batch.length > 0 && batch.n_children < 3) {
+			batch.release(&batch);
+			if (stream.release) {
+				stream.release(&stream);
+			}
+			throw IOException("fabricator: table_stats batch has %lld columns, expected 3",
+			                  static_cast<long long>(batch.n_children));
+		}
+		for (int64_t row = 0; row < batch.length; row++) {
+			auto stat = GetUtf8(*batch.children[0], row);
+			if (stat == "row_count") {
+				result.row_count = GetInt64(*batch.children[2], row, -1);
+			} else if (stat == "ndv") {
+				result.column_ndv[GetUtf8(*batch.children[1], row)] = GetInt64(*batch.children[2], row, -1);
+			}
+			// Unknown stat names are skipped — additive stats must stay additive.
+		}
+		batch.release(&batch);
+	}
+	if (stream.release) {
+		stream.release(&stream);
+	}
+	return result;
 }
 
 } // namespace duckdb

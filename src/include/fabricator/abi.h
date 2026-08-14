@@ -90,46 +90,13 @@ typedef enum {
 // Opaque handle to a managed catalog/connection (a GCHandle id on the C# side).
 typedef void *FabricatorHandle;
 
-// -----------------------------------------------------------------------------
-// Metadata kinds requested via FabricatorVTable::get_metadata. The managed side
-// owns all provider SQL; the result is always an Arrow stream. For SCHEMAS /
-// TABLES / ROWID the columns are UTF-8 strings (read with ReadStringTable); for
-// COLUMNS the stream carries zero rows and its *schema* describes the table's
-// columns (so DuckDB's Arrow->LogicalType inference is reused, no C++ mapping).
-// -----------------------------------------------------------------------------
-typedef enum {
-	FABRICATOR_META_SCHEMAS = 0, // one column: user schema names
-	FABRICATOR_META_TABLES = 1,  // three columns: schema, table, type ("BASE TABLE"|"VIEW")
-	FABRICATOR_META_COLUMNS = 2, // zero rows; schema = the table's column layout
-	FABRICATOR_META_ROWID = 3,   // one column: row-identity column names, in key order
-	FABRICATOR_META_ROWCOUNT = 4, // one column, one row: approximate table row count (as text)
-	FABRICATOR_META_COLUMN_NDV = 5, // two columns: column name, distinct-value estimate (NDV, as text)
-	FABRICATOR_META_FUNCTIONS = 6,  // discovered routines: schema, name, kind, param_count, return_type
-	FABRICATOR_META_SERVER_INFO = 7, // two columns: property, value — the detected server capability profile
-	// Kinds 8-11 and 13-14 (SNAPSHOTS / CHANGES / TXN_VERSION / SET_TXN_VERSION / TBLPROPERTIES /
-	// SET_TBLPROPERTIES) are DELETED (ABI v70): Delta features that wore C++-registered function fronts
-	// (fabricator_delta_*) with string-packed payloads. They are catalog-bound functions in the `delta`
-	// schema now — cat.delta.snapshots('s.t') etc., declared by the Delta providers with TYPED args
-	// (Fabricator.Bridge/DeltaFunctions.cs). The gaps stay unassigned so a stale peer's kind cannot
-	// silently alias a new one.
-	FABRICATOR_META_VIRTUAL_COLUMNS = 12, // provider-declared VIRTUAL columns for a table (arg1 = schema,
-	                                    // arg2 = table): two string columns (name, type-text). The host
-	                                    // registers them as queryable-by-name virtual columns (not in
-	                                    // SELECT *). Delta: __delta_row_id / __delta_row_commit_version
-	                                    // (stable row tracking) under native_read + enableRowTracking;
-	                                    // others: empty. Additive, no ABI bump; fetch is best-effort.
-	FABRICATOR_META_CATALOG_MACROS = 15, // provider-declared CATALOG-BOUND DuckDB macros: three string columns
-	                                    // (schema, name, create_sql) where create_sql is one complete CREATE
-	                                    // MACRO statement, parsed by DuckDB's OWN parser host-side. Bound into
-	                                    // the ATTACHed catalog's schema, so they resolve as db.schema.m(...).
-	                                    // Deliberately its own KIND rather than a column on _FUNCTIONS: that
-	                                    // stream is built as provider SQL and executed on the server (see
-	                                    // SqlServerCatalog.FunctionsMetadataSql), and a macro body is a purely
-	                                    // LOCAL declaration — it must not be embedded in a T-SQL literal, sent
-	                                    // to the server and read back, nor vanish when the server is
-	                                    // unreachable. Adding a kind is additive => no ABI bump. Fetch is
-	                                    // best-effort: a provider that does not serve it registers no macros.
-} FabricatorMetadataKind;
+// (FabricatorMetadataKind and its get_metadata entry were DELETED at ABI v72. Catalog discovery has
+// dedicated typed entries — catalog_schemas / catalog_tables / catalog_functions / catalog_macros /
+// catalog_server_info, each keeping the column layout its kind carried, minus the kind int and the
+// per-provider unknown-kind fallback shapes (the 1-column empty table behind the ReadStringTable OOB
+// hazard). The per-table kinds (COLUMNS/ROWID/ROWCOUNT/COLUMN_NDV/VIRTUAL_COLUMNS) live on the table_*
+// session at the end of the vtable, over the managed ITable object model. Kind history, incl. the v70
+// deletion of 8-11/13-14, is in docs/abi-history.md.)
 
 // -----------------------------------------------------------------------------
 // ALTER TABLE variants passed to FabricatorVTable::alter_table. The managed side
@@ -182,7 +149,7 @@ typedef struct FabricatorVTable {
 	// passes every ATTACH option EXCEPT the two it must handle itself before the provider is resolved —
 	// PROVIDER (selects the backend) and SECRET (resolved to a connstr) — so the provider-agnostic core
 	// names no provider-specific option. The managed side parses the keys it knows (e.g. SQL Server applies
-	// schema_filter/table_filter in get_metadata and stores isolation_level for table-in-out sessions). See
+	// schema_filter/table_filter in catalog discovery and stores isolation_level for table-in-out sessions). See
 	// docs/provider-extensibility.md §3.
 	int32_t (*open_catalog)(const char *provider, const char *conn, const char *options_json,
 	                        FabricatorHandle *out_handle, char **err);
@@ -225,25 +192,9 @@ typedef struct FabricatorVTable {
 	int32_t (*execute_update)(FabricatorHandle handle, const char *schema, const char *table, int32_t set_count,
 	                          struct ArrowArrayStream *data, int64_t *affected, char **err);
 
-	// Discover provider metadata. `kind` is an FabricatorMetadataKind; `arg1`/`arg2`
-	// carry the schema/table name when the kind needs them (NULL otherwise). The
-	// result is exported into *out as an Arrow stream (see FabricatorMetadataKind).
-	// Keeps all provider catalog SQL (sys.*, PK/unique-index discovery) in C#.
-	int32_t (*get_metadata)(FabricatorHandle handle, int32_t kind, const char *arg1, const char *arg2,
-	                        struct ArrowArrayStream *out, char **err);
-
-	// Scan a table: the managed side builds the provider SELECT and exports the
-	// rows into *out as an Arrow stream. Keeps the read-path SQL in C#.
-	//
-	// `spec_json` (nullable) carries pushdown info as a small JSON document:
-	//   { "columns": ["a","b"],          // projection; absent/empty => SELECT *
-	//     "filter":  <predicate-tree> }   // WHERE; absent/null => no filter
-	// Predicate-tree nodes reference constants by index into `filter_values`.
-	// `filter_values` (nullable) is a one-batch Arrow stream whose columns are the
-	// typed constant values the filter tree refers to (column i == value index i).
-	// Both null/empty => a plain full-table scan (back-compat).
-	int32_t (*scan_table)(FabricatorHandle handle, const char *schema, const char *table, const char *spec_json,
-	                      struct ArrowArrayStream *filter_values, struct ArrowArrayStream *out, char **err);
+	// (get_metadata / scan_table were removed at ABI v72 — replaced by the dedicated catalog_* discovery
+	//  entries and the table_* session at the end of this struct. Removing mid-struct slots shifts every
+	//  later field, which the abi_version check makes loud — the v30/v31/v47 precedent.)
 
 	// DDL: create a table. `columns` is a zero-row Arrow stream whose schema
 	// describes the columns; a non-nullable field => NOT NULL. `if_not_exists`
@@ -819,6 +770,79 @@ typedef struct FabricatorVTable {
 	// *out_json is an owned UTF-8 string freed via free_error (the build_connection_string convention).
 	// Best-effort on the host side: any failure leaves every capability off (the safe defaults).
 	int32_t (*get_capabilities)(FabricatorHandle handle, char **out_json, char **err);
+
+	// -------------------------------------------------------------------------
+	// Catalog discovery (ABI v72) — the dedicated typed LIST entries that replaced get_metadata's 16-kind
+	// multiplexer (docs/catalog-table-abstraction.md §2.4). Arrow streams stay the carrier — the right tool
+	// for lists — with each entry keeping the column layout its old kind carried; what died is the kind int,
+	// the per-provider unknown-kind fallback shapes, and (below) the name-pair-per-call table transport.
+	// All UTF-8 columns, read host-side with ReadStringTable.
+	// -------------------------------------------------------------------------
+	// One column: the user schema names (schema_filter applied provider-side; a Delta/Fabric catalog also
+	// advertises its function namespaces here — `delta`, `fabric`).
+	int32_t (*catalog_schemas)(FabricatorHandle handle, struct ArrowArrayStream *out, char **err);
+	// Three columns: schema, table, type ("BASE TABLE"|"VIEW"). schema_filter/table_filter applied
+	// provider-side (they bound ENUMERATION only, never targeted access).
+	int32_t (*catalog_tables)(FabricatorHandle handle, struct ArrowArrayStream *out, char **err);
+	// Five columns: schema, name, kind, param_count, return_type (the host reads the first three).
+	int32_t (*catalog_functions)(FabricatorHandle handle, struct ArrowArrayStream *out, char **err);
+	// Three columns: schema, name, create_sql — provider-declared CATALOG-BOUND DuckDB macros, each
+	// create_sql one complete CREATE MACRO statement parsed by DuckDB's OWN parser host-side and bound into
+	// the ATTACHed catalog's schema (db.schema.m(...)). A purely LOCAL declaration — never embedded in
+	// provider SQL, never dependent on server reachability. Fetch is best-effort host-side.
+	int32_t (*catalog_macros)(FabricatorHandle handle, struct ArrowArrayStream *out, char **err);
+	// Two columns: property, value — the detected capability profile, DIAGNOSTIC ONLY (the
+	// fabricator_server_info() table function). The host consumes get_capabilities (v71) instead; nothing
+	// greps these rows any more.
+	int32_t (*catalog_server_info)(FabricatorHandle handle, struct ArrowArrayStream *out, char **err);
+
+	// -------------------------------------------------------------------------
+	// The TABLE session (ABI v72) — mirrors tablefn_* (session entries = <noun>_<verb>), replacing the
+	// per-table metadata kinds (COLUMNS/ROWID/ROWCOUNT/COLUMN_NDV/VIRTUAL_COLUMNS) and scan_table.
+	//
+	// The handle wraps the table DEFINITION (+ the reference's AT clause), deliberately NOT a binding: the
+	// C++ catalog entry is shared across transactions while per-(table × txn) state lives on the managed
+	// bound table, so EVERY call below re-binds the definition against the CURRENT ambient transaction
+	// (set_active_txn stays the transport — the §6 lazy-bind default). A definition holds no state, which is
+	// what makes the handle's lifetime trivial: the entry keeps it for its whole life (incl. the
+	// retire-don't-destroy graveyard) and it cannot go stale — staleness is governed by the binding layer,
+	// which the per-transaction invalidation already owns. table_close in the entry DESTRUCTOR (teardown),
+	// best-effort: it frees a GCHandle, nothing more.
+	// -------------------------------------------------------------------------
+	// Resolve (schema, table) to a table-session handle. `at_unit`/`at_value` (NULL/empty => none) carry the
+	// reference's AT clause — part of the handle's IDENTITY, matching the C++ side where AT entries live in
+	// their own map (time travel is a property of a reference). NO IO and NO absence probe: absence is
+	// established by table_schema, the first actual read — same contract as the old kind-2, one entry over.
+	// Cheap opening is load-bearing: catalog enumeration materializes every table.
+	int32_t (*table_open)(FabricatorHandle handle, const char *schema, const char *table, const char *at_unit,
+	                      const char *at_value, FabricatorHandle *out_table, char **err);
+	// The table's column layout: a ZERO-ROW stream whose Arrow schema is the answer — the kind-2 carrier
+	// kept deliberately (PopulateReturnSchema is the proven import path incl. VARIANT extension types; a
+	// bare ArrowSchema would fork the type conversion for zero gain). Binds against the ambient txn, so a
+	// buffered CREATE/ALTER's pending shape wins over storage (read-your-writes — the caller sets the
+	// ambient first, exactly as the old FetchTableColumns did). Returns FABRICATOR_NOT_FOUND for ESTABLISHED
+	// absence (Delta: no commit in the log; SQL Server: error 208) — never for a table that merely could not
+	// be read.
+	int32_t (*table_schema)(FabricatorHandle table, struct ArrowArrayStream *out, char **err);
+	// Row identity + provider virtual columns, ONE crossing (was kinds 3 + 12): three UTF-8 columns
+	// (role, name, type) — role 'rowid' rows carry the row-identity column names in key order (type empty);
+	// role 'virtual' rows carry provider virtual columns with their DuckDB type text.
+	int32_t (*table_info)(FabricatorHandle table, struct ArrowArrayStream *out, char **err);
+	// Optimizer statistics, ONE crossing (was kinds 4 + 5), with a TYPED int64 value column (the old kinds
+	// crossed numbers as text): (stat, column, value) — one 'row_count' row when known (absent = unknown;
+	// column empty), one 'ndv' row per column with a distinct-count estimate. LAZY BY CONTRACT: called at
+	// first scan, never at entry materialization, and deliberately NOT folded into table_info — bundling
+	// would put the stats queries on the enumeration path. The warehouse never-issue-a-swallowable-statement
+	// rule lives inside the providers (null/empty answers, no probe).
+	int32_t (*table_stats)(FabricatorHandle table, struct ArrowArrayStream *out, char **err);
+	// Scan the table — scan_table minus the name pair; `spec_json`/`filter_values` exactly as before
+	// (projection, filter tree + typed constants, TOP/ORDER, schema_only, and the AT clause, which still
+	// rides the spec for the scan itself — the handle's AT selects the SCHEMA answer above).
+	int32_t (*table_scan)(FabricatorHandle table, const char *spec_json, struct ArrowArrayStream *filter_values,
+	                      struct ArrowArrayStream *out, char **err);
+	// Release a handle from table_open. Idempotent; safe with NULL. Best-effort (entry teardown must not
+	// throw) — frees the managed GCHandle, nothing more.
+	void (*table_close)(FabricatorHandle table);
 } FabricatorVTable;
 
 // -----------------------------------------------------------------------------
@@ -935,7 +959,7 @@ typedef struct FabricatorHostServices {
 // state blob is this many bytes + a 4-byte length prefix). Serialize() must fit within it.
 #define FABRICATOR_AGG_SPILL_CAP 1024
 
-#define FABRICATOR_ABI_VERSION 71
+#define FABRICATOR_ABI_VERSION 72
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(FabricatorVTable) as seen

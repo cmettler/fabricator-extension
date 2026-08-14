@@ -2300,120 +2300,47 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         return stream.Schema;
     }
 
-    // Metadata reads use ExecuteMetadataQuery (read-your-writes: routed through the pinned write connection
-    // when one exists, regardless of MARS) so a table/columns just created in this transaction are visible —
+    // ── catalog discovery (the five dedicated list members — ABI v72; the kind multiplexer is gone). All
+    // use ExecuteMetadataQuery (read-your-writes: routed through the pinned write connection when one
+    // exists, regardless of MARS) so a table/columns just created in this transaction are visible —
     // otherwise the self-healing cache would evict a freshly CREATEd table on a non-MARS engine (Fabric).
-    public IArrowArrayStream GetMetadata(int kind, string? schema, string? table) => kind switch
-    {
-        // schema_filter/table_filter (ATTACH options) are applied here so discovery sees only matches —
-        // the provider owns its filtering (the C++ core no longer knows these option names). No filter set =>
-        // stream the query directly (no materialization).
-        MetadataKind.Schemas => SchemasMetadata(),
-        MetadataKind.Tables => _schemaFilter is null && _tableFilter is null
-                                   ? ExecuteMetadataQuery(TablesSql)
-                                   : FilteredTables(),
-        // The per-TABLE kinds route through the OBJECT MODEL since slice 4c: the ambient-bound ITable
-        // (SqlServerTable.cs) resolves the typed answer and these arms re-encode it into the streams the
-        // current transport carries — slice 4d's table_* session retires the re-encoding. The stream shapes
-        // are rebuilt exactly the way SchemasMetadata/FilteredTables already rebuild theirs.
-        // Zero-row result whose Arrow schema describes the table's columns; the
-        // C++ host reads that schema to learn the DuckDB column types.
-        MetadataKind.Columns => new InMemoryArrayStream(
-            BindAmbient(Require(schema, table).schema, Require(schema, table).table).Schema,
-            System.Array.Empty<RecordBatch>()),
-        MetadataKind.RowId => NameStream(
-            BindAmbient(Require(schema, table).schema, Require(schema, table).table).RowIdColumns()),
-        // Both statistics members answer null/empty on a warehouse engine (inside the typed cores), for the
-        // same reason as the external-table probe above: Fabric/Synapse do not support
-        // sys.dm_db_partition_stats or sys.dm_db_stats_histogram ("DMV ... is not supported"), and on Fabric
-        // a failed statement ABORTS AN OPEN TRANSACTION — so an optional, best-effort statistics query was
-        // able to poison a user's transaction. Statistics are costing-only (never pruning), so returning
-        // "unknown" costs an optimizer hint and nothing else.
-        MetadataKind.RowCount => RowCountStream(
-            BindAmbient(Require(schema, table).schema, Require(schema, table).table).ApproximateRowCount()),
-        MetadataKind.ColumnNdv => NdvStream(
-            BindAmbient(Require(schema, table).schema, Require(schema, table).table).ColumnNdv()),
-        MetadataKind.Functions => _functionFilter is null
-            ? ExecuteMetadataQuery(FunctionsMetadataSql())
-            : FilteredFunctions(),
-        // The detected capability profile as (property, value) rows — the fabricator_server_info() diagnostic.
-        // Built from the in-memory profile (not a re-query), so it surfaces the derived flags.
-        MetadataKind.ServerInfo => ServerInfoStream(),
-        // No provider virtual columns (the Delta catalog's stable row-tracking pair has no SQL analog).
-        MetadataKind.VirtualColumns => EmptyStringTable("name", "type"),
-        // Provider-declared CATALOG-BOUND macros (schema, name, create_sql) — bound by the host into this
-        // catalog's schemas as db.schema.m(...). Note this deliberately does NOT go through
-        // FunctionsMetadataSql: a macro body is a local declaration, so embedding it in a T-SQL literal to send
-        // to the server and read back would be pure waste, and would make the declaration depend on server
-        // reachability. Gated by schema_filter host-side (a macro whose schema was not registered is dropped).
-        MetadataKind.CatalogMacros => CatalogMacroMetadata.Stream(CustomFunctions.CatalogMacros),
-        _ => throw new ArgumentOutOfRangeException(nameof(kind), kind, "fabricator: unknown metadata kind"),
-    };
-
-    // ── re-encoders: the bound table's TYPED answers back into the transport's string streams ────────────
-    // (Slice 4c. The typed members — SqlServerTable.cs — are primary; the ABSENCE contract lives on
-    // ColumnsSchemaCore there: the host turns ObjectNotFoundException into "this table no longer exists"
-    // — dropping the entry AND the name, so IF NOT EXISTS / OR REPLACE behave after an out-of-band DROP —
-    // and SQL Server establishes absence from ERROR NUMBER 208 alone ("Invalid object name", which also
-    // covers an object this principal may not SEE — reported identically by the server on purpose). Every
-    // other error keeps its own message instead of being read as a missing table.)
+    // The per-TABLE questions do not live here at all any more: they are the typed ITable members
+    // (SqlServerTable.cs), reached through the host's table_* session. The 4c re-encoders
+    // (NameStream/RowCountStream/NdvStream) died with the transport they encoded for; the ABSENCE contract
+    // (error 208 → ObjectNotFoundException) lives on ColumnsSchemaCore.
 
     /// <summary>SQL Server error 208, "Invalid object name" — the server's own statement that the object is
     /// not there (or not visible to this principal, which it reports identically on purpose).</summary>
     internal const int InvalidObjectNameError = 208;
 
-    private static IArrowArrayStream NameStream(IReadOnlyList<string> names)
-    {
-        var s = new Schema(new[] { new Field("name", StringType.Default, nullable: false) }, metadata: null);
-        var b = new StringArray.Builder();
-        foreach (var n in names)
-        {
-            b.Append(n);
-        }
-        return new InMemoryArrayStream(s, new[] { new RecordBatch(s, new IArrowArray[] { b.Build() }, names.Count) });
-    }
+    // schema_filter/table_filter (ATTACH options) are applied here so discovery sees only matches —
+    // the provider owns its filtering (the C++ core does not know these option names). No filter set =>
+    // stream the query directly (no materialization).
+    public IArrowArrayStream GetSchemas() => SchemasMetadata();
 
-    // One "n" cell, digits as text (the shape the old live RowCountSql stream carried); null = the
-    // provider surfaces none = the zero-row form the warehouse arm always answered.
-    private static IArrowArrayStream RowCountStream(long? rowCount)
-    {
-        if (rowCount is not { } n)
-        {
-            return EmptyStringTable("n");
-        }
-        var s = new Schema(new[] { new Field("n", StringType.Default, nullable: true) }, metadata: null);
-        var b = new StringArray.Builder();
-        b.Append(n.ToString(System.Globalization.CultureInfo.InvariantCulture));
-        return new InMemoryArrayStream(s, new[] { new RecordBatch(s, new IArrowArray[] { b.Build() }, 1) });
-    }
+    public IArrowArrayStream GetTables() => _schemaFilter is null && _tableFilter is null
+        ? ExecuteMetadataQuery(TablesSql)
+        : FilteredTables();
 
-    private static IArrowArrayStream NdvStream(IReadOnlyList<NdvEntry> entries)
-    {
-        var s = new Schema(new[]
-        {
-            new Field("column_name", StringType.Default, nullable: true),
-            new Field("ndv", StringType.Default, nullable: true),
-        }, metadata: null);
-        var cols = new StringArray.Builder();
-        var ndvs = new StringArray.Builder();
-        foreach (var e in entries)
-        {
-            cols.Append(e.ColumnName);
-            ndvs.Append(e.Ndv.ToString(System.Globalization.CultureInfo.InvariantCulture));
-        }
-        return new InMemoryArrayStream(
-            s, new[] { new RecordBatch(s, new IArrowArray[] { cols.Build(), ndvs.Build() }, entries.Count) });
-    }
+    public IArrowArrayStream GetFunctions() => _functionFilter is null
+        ? ExecuteMetadataQuery(FunctionsMetadataSql())
+        : FilteredFunctions();
 
-    private static IArrowArrayStream EmptyStringTable(params string[] columns)
-    {
-        var builder = new Schema.Builder();
-        foreach (var c in columns)
-        {
-            builder.Field(new Field(c, StringType.Default, nullable: true));
-        }
-        return new InMemoryArrayStream(builder.Build(), System.Array.Empty<RecordBatch>());
-    }
+    // Provider-declared CATALOG-BOUND macros (schema, name, create_sql) — bound by the host into this
+    // catalog's schemas as db.schema.m(...). Note this deliberately does NOT go through
+    // FunctionsMetadataSql: a macro body is a local declaration, so embedding it in a T-SQL literal to send
+    // to the server and read back would be pure waste, and would make the declaration depend on server
+    // reachability. Gated by schema_filter host-side (a macro whose schema was not registered is dropped).
+    public IArrowArrayStream GetMacros() => CatalogMacroMetadata.Stream(CustomFunctions.CatalogMacros);
+
+    // The detected capability profile as (property, value) rows — the fabricator_server_info() diagnostic.
+    // Built from the in-memory profile (not a re-query), so it surfaces the derived flags.
+    public IArrowArrayStream GetServerInfo() => ServerInfoStream();
+
+    /// <summary>Ambient-transaction resolution for a table BIND: an EXISTING transaction only (TryGet) —
+    /// lazy creation preserved exactly, an autocommit metadata read allocates nothing (the first write /
+    /// read-isolation pin still GetOrCreates through its own paths).</summary>
+    public ITransaction? ResolveTransaction(long txnId) => txnId != 0 ? _txns.TryGet(txnId) : null;
 
     // The host-consumed capability doc (ABI v71, read once at ATTACH). Derived from the SAME Profile field
     // the diagnostic ServerInfoStream row reads, so the two surfaces cannot drift. Accessing Profile detects
@@ -4171,15 +4098,6 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
 
     private static string ObjectLiteral(string schemaName, string tableName) =>
         "N'" + (schemaName + "." + tableName).Replace("'", "''") + "'";
-
-    private static (string schema, string table) Require(string? schema, string? table)
-    {
-        if (string.IsNullOrEmpty(schema) || string.IsNullOrEmpty(table))
-        {
-            throw new ArgumentException("fabricator: metadata kind requires schema and table names");
-        }
-        return (schema, table);
-    }
 
     // User schemas only (exclude system / fixed database roles).
     private const string SchemasSql =

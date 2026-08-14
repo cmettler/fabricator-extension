@@ -208,14 +208,54 @@ public interface IBackendCatalog : IDisposable
     string CapabilitiesJson => "{}";
 
     /// <summary>
-    /// The definition of one table — identity + the <see cref="ITableDefinition.Bind"/> factory (slice 4c,
-    /// docs/catalog-table-abstraction.md §2.2/§2.3). Cheap and transient in the current transport (the
-    /// provider's own metadata/scan adapters create one per crossing); slice 4d's <c>table_open</c> gives it
-    /// the C++ entry's lifetime. Default-throwing so a provider still on the plain
-    /// <see cref="GetMetadata"/> arms (DAX / DeltaRs / Stub) needs no code until its conversion.
+    /// The definition of one table — identity + the <see cref="ITableDefinition.Bind"/> factory
+    /// (docs/catalog-table-abstraction.md §2.2/§2.3). Cheap and stateless: since slice 4d the C++ catalog
+    /// entry holds one behind a <c>table_open</c> handle for the entry's lifetime, and every
+    /// <c>table_*</c> call binds it against the CURRENT ambient transaction (the handle is the DEFINITION,
+    /// never a binding — §6's lazy-bind default), so the handle itself cannot go stale.
     /// </summary>
-    ITableDefinition GetTable(string schemaName, string tableName) =>
-        throw new NotSupportedException("provider: table definitions not implemented for this provider yet");
+    ITableDefinition GetTable(string schemaName, string tableName);
+
+    /// <summary>
+    /// Resolves a DuckDB transaction id (the <c>set_active_txn</c> ambient) to this catalog's
+    /// <see cref="ITransaction"/> for a table BIND — the table session's one question per call. The
+    /// semantics are each provider's OWN ambient-resolution rules and deliberately differ: SQL Server
+    /// answers only an EXISTING transaction (lazy creation preserved — an autocommit metadata read
+    /// allocates nothing), while Delta GET-OR-CREATES (the first read-path crossing is a legitimate
+    /// creator, or an autocommit schema open would never share its pin/open and the 195-of-291-seconds
+    /// redundant-replay shape would return). Default null = a transaction-free provider (DAX / DeltaRs /
+    /// Stub); the resulting bind is transient and caller-owned per the <see cref="ITable"/> contract.
+    /// </summary>
+    ITransaction? ResolveTransaction(long txnId) => null;
+
+    /// <summary>
+    /// Catalog discovery — the schema names, one UTF-8 column (<c>schema_name</c>). Since ABI v72 these
+    /// five list members ARE the discovery surface (dedicated <c>catalog_*</c> entries); the old
+    /// <c>GetMetadata(kind, …)</c> multiplexer is gone, and with it the inconsistent unknown-kind
+    /// fallbacks (SqlServer threw, Delta answered a 1-column empty table — the shape behind the
+    /// <c>ReadStringTable</c> OOB hazard the macros pass had to guard).
+    /// </summary>
+    IArrowArrayStream GetSchemas();
+
+    /// <summary>Catalog discovery — the tables, three UTF-8 columns: schema, table,
+    /// type (<c>"BASE TABLE"|"VIEW"</c>). <c>schema_filter</c>/<c>table_filter</c> are applied here,
+    /// provider-side (they bound ENUMERATION only, never targeted access).</summary>
+    IArrowArrayStream GetTables();
+
+    /// <summary>Discovered/declared routines: schema, name, kind, param_count, return_type (the host reads
+    /// the first three).</summary>
+    IArrowArrayStream GetFunctions();
+
+    /// <summary>Provider-declared CATALOG-BOUND DuckDB macros: schema, name, create_sql — each
+    /// create_sql one complete CREATE MACRO statement the HOST parses with DuckDB's own parser and binds
+    /// into the ATTACHed catalog's schema. A purely LOCAL declaration (never round-tripped through
+    /// provider SQL — see docs/macros-and-sqlgen-functions.md §1.4). Empty = no macros.</summary>
+    IArrowArrayStream GetMacros();
+
+    /// <summary>The detected capability profile as DIAGNOSTIC (property, value) rows — the
+    /// <c>fabricator_server_info()</c> table function's source. The HOST consumes
+    /// <see cref="CapabilitiesJson"/> instead (ABI v71); nothing greps these rows any more.</summary>
+    IArrowArrayStream GetServerInfo();
 
     /// <summary>Execute a query and return its result as an Arrow stream.</summary>
     IArrowArrayStream ExecuteQuery(string sql);
@@ -269,22 +309,14 @@ public interface IBackendCatalog : IDisposable
     long ExecuteUpdate(string schemaName, string tableName, int setColumnCount, IArrowArrayStream data);
 
     /// <summary>
-    /// Discovers catalog metadata as an Arrow stream. <paramref name="kind"/> is a
-    /// <see cref="MetadataKind"/>; <paramref name="schema"/>/<paramref name="table"/>
-    /// are supplied when the kind needs them. The backend owns all provider SQL
-    /// (e.g. <c>sys.*</c>, primary-key / unique-index discovery). For
-    /// <see cref="MetadataKind.Columns"/> the stream carries zero rows and its
-    /// schema describes the table's columns.
-    /// </summary>
-    IArrowArrayStream GetMetadata(int kind, string? schema, string? table);
-
-    /// <summary>
-    /// Scans a table, returning its rows as an Arrow stream. The backend builds
-    /// the provider SELECT (keeping read-path SQL out of the C++ host).
-    /// <paramref name="specJson"/> (null => SELECT *) carries projection + filter
-    /// pushdown: <c>{ "columns": [...], "filter": &lt;tree&gt; }</c>. Filter-tree
-    /// constants are referenced by index into <paramref name="filterValues"/>, a
-    /// one-batch Arrow stream of the typed constant values (null => no filter).
+    /// Scans a table bound against the AMBIENT transaction — a C#-INTERNAL convenience over the object
+    /// model (each provider's implementation is one line: bind ambient, <see cref="ITable.Scan"/>).
+    /// The ABI does not call this any more: since v72 scans cross as <c>table_scan</c> on a table-session
+    /// handle, which resolves the identical ambient bind. Kept for in-bridge callers that hold only a
+    /// catalog + names (e.g. the external-table DML routing's identity-resolution scan).
+    /// <paramref name="specJson"/> (null => SELECT *) carries projection + filter pushdown:
+    /// <c>{ "columns": [...], "filter": &lt;tree&gt; }</c>; filter-tree constants are referenced by index
+    /// into <paramref name="filterValues"/>, a one-batch Arrow stream of the typed constants.
     /// </summary>
     IArrowArrayStream ScanTable(string schemaName, string tableName, string? specJson, IArrowArrayStream? filterValues);
 

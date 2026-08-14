@@ -7,7 +7,7 @@
 // Arrow boundary in this process transparently as ONE self-delimiting binary value per row — the
 // parquet-variant metadata bytes immediately followed by the value bytes — tagged with
 // ARROW:extension:name. Export (bulk INSERT / CTAS / COPY appenders, host-query result streams,
-// create-table schemas) AND import (scan ingest, the catalog bind schema via FetchTableColumns,
+// create-table schemas) AND import (scan ingest, the catalog bind schema via FetchTableSchema,
 // host-query input streams) resolve through DuckDB's own ArrowTypeExtension machinery, so no
 // per-operator pre-casts are needed anywhere.
 //

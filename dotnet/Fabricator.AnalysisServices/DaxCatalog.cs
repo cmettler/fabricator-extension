@@ -116,24 +116,81 @@ internal sealed class DaxCatalog : IBackendCatalog
         throw new NotSupportedException($"dax provider: unknown system table '{table}'");
     }
 
-    public IArrowArrayStream GetMetadata(int kind, string? schema, string? table) => kind switch
+    // ── catalog discovery (the five dedicated list members — ABI v72). The per-TABLE questions live on the
+    // typed ITable members (the definition/bound table at the end of this file), reached through the host's
+    // table_* session.
+
+    // Schemas = the model name(s) + the "system" schema (curated $SYSTEM DMVs).
+    public IArrowArrayStream GetSchemas() => SingleColumn("schema_name", new[] { _modelName, SystemSchema });
+
+    // Tables = the model's tables (TMSCHEMA_TABLES) + the curated system DMVs.
+    public IArrowArrayStream GetTables() => DiscoverTables();
+
+    // Functions (under the model schema): the three BESPOKE ones, plus whatever the catalog's
+    // CatalogFunctionSet holds (the XMLA/TMSL refresh functions). The bespoke three keep their hand-written
+    // declarations because their kinds — 'proc', 'collector', 'inout' — are dispatched by name below rather
+    // than through the set; everything registered in the set declares itself.
+    public IArrowArrayStream GetFunctions() => FunctionsMetadata.Stream(BespokeDeclarations());
+
+    // No catalog-bound macros and no capability profile on this provider — empty streams, declared shapes.
+    public IArrowArrayStream GetMacros() => EmptyStringTable("schema", "name", "create_sql");
+
+    public IArrowArrayStream GetServerInfo() => EmptyStringTable("property", "value");
+
+    /// <summary>The DAX <see cref="ITableDefinition"/> — read-only, transaction-free (the default
+    /// <c>ResolveTransaction</c> answers null, so every bind is transient and caller-owned).</summary>
+    public ITableDefinition GetTable(string schemaName, string tableName) =>
+        new DaxTableDefinition(this, schemaName, tableName);
+
+    private sealed class DaxTableDefinition : ITableDefinition
     {
-        // Schemas = the model name(s) + the "system" schema (curated $SYSTEM DMVs).
-        MetadataKind.Schemas => SingleColumn("schema_name", new[] { _modelName, SystemSchema }),
-        // Tables = the model's tables (TMSCHEMA_TABLES) + the curated system DMVs.
-        MetadataKind.Tables => DiscoverTables(),
-        // Columns = a zero-row stream whose SCHEMA describes the table's columns (the no-describe approach;
-        // real engine types). Model: EVALUATE TOPN(0,'T'); system: bare SELECT * FROM $SYSTEM.<dmv>.
-        MetadataKind.Columns => DiscoverColumns(schema, table!),
-        // Functions (under the model schema): the three BESPOKE ones, plus whatever the catalog's
-        // CatalogFunctionSet holds (the XMLA/TMSL refresh functions). The bespoke three keep their hand-written
-        // declarations because their kinds — 'proc', 'collector', 'inout' — are dispatched by name below rather
-        // than through the set; everything registered in the set declares itself.
-        MetadataKind.Functions => FunctionsMetadata.Stream(BespokeDeclarations()),
-        MetadataKind.ServerInfo => EmptyStringTable("property", "value"),
-        MetadataKind.VirtualColumns => EmptyStringTable("name", "type"),
-        _ => EmptyStringTable("name"),
-    };
+        private readonly DaxCatalog _catalog;
+
+        internal DaxTableDefinition(DaxCatalog catalog, string schemaName, string tableName)
+        {
+            _catalog = catalog;
+            SchemaName = schemaName;
+            TableName = tableName;
+        }
+
+        public string SchemaName { get; }
+        public string TableName { get; }
+
+        // The AT clause is carried per the interface but has no DAX meaning; the scan spec's own AT
+        // handling (rejected provider-side) is what surfaces the refusal.
+        public ITable Bind(ITransaction? transaction, TableAt? at = null) => new DaxBoundTable(_catalog, this);
+    }
+
+    /// <summary>The THIN DAX bound table: no rowid (read-only provider), no virtual columns, no stats —
+    /// schema + scan delegate to the catalog's existing cores.</summary>
+    private sealed class DaxBoundTable : ITable
+    {
+        private readonly DaxCatalog _catalog;
+        private readonly DaxTableDefinition _definition;
+
+        internal DaxBoundTable(DaxCatalog catalog, DaxTableDefinition definition)
+        {
+            _catalog = catalog;
+            _definition = definition;
+        }
+
+        public Schema Schema => _catalog.ColumnsSchemaCore(_definition.SchemaName, _definition.TableName);
+
+        public IReadOnlyList<string> RowIdColumns() => System.Array.Empty<string>();
+
+        public IReadOnlyList<VirtualColumn> VirtualColumns() => System.Array.Empty<VirtualColumn>();
+
+        public long? ApproximateRowCount() => null;
+
+        public IReadOnlyList<NdvEntry> ColumnNdv() => System.Array.Empty<NdvEntry>();
+
+        public IArrowArrayStream Scan(string? specJson, IArrowArrayStream? filterValues) =>
+            _catalog.ScanTable(_definition.SchemaName, _definition.TableName, specJson, filterValues);
+
+        public void Dispose()
+        {
+        }
+    }
 
     // The three bespoke function declarations ++ the catalog function set's. daxeval is a 'proc' (not 'table')
     // so its args register as NAMED parameters — it takes an optional `params` arg alongside `expression`, which
@@ -187,7 +244,7 @@ internal sealed class DaxCatalog : IBackendCatalog
         => name.StartsWith("LocalDateTable_", StringComparison.OrdinalIgnoreCase)
         || name.StartsWith("DateTableTemplate_", StringComparison.OrdinalIgnoreCase);
 
-    private IArrowArrayStream DiscoverColumns(string? schema, string table)
+    private Schema ColumnsSchemaCore(string? schema, string table)
     {
         // Model: EVALUATE TOPN(0,'T') returns the data columns (no internal RowNumber) with engine types.
         // System: a bare SELECT * FROM $SYSTEM.<dmv> — GetSchemaTable reads NO rows, so it's cheap even
@@ -198,8 +255,7 @@ internal sealed class DaxCatalog : IBackendCatalog
         using var cmd = _conn.CreateCommand();
         cmd.CommandText = cmdText;
         using var r = cmd.ExecuteReader();
-        var arrowSchema = ArrowSchemaFromReader(r);
-        return new InMemoryArrayStream(arrowSchema, System.Array.Empty<RecordBatch>());
+        return ArrowSchemaFromReader(r);
     }
 
     /// <summary>Builds the Arrow schema for a DAX result set from the reader's schema table — de-bracketed

@@ -1,4 +1,4 @@
-# The catalog/table abstraction — design for retiring `get_metadata` (slices 1a/1b/2/3 + 4a/4b/4c BUILT; 4d/5 open)
+# The catalog/table abstraction — design for retiring `get_metadata` (ALL slices 1a/1b/2/3 + 4a–4d BUILT; 5 open)
 
 > Written 2026-08-14 after the user's review: *"I don't like the getmetadata functions … there should be no
 > provider-specific function defined in C++, all must live in the providers … an abstraction similar to
@@ -539,8 +539,71 @@ the same table the code evaluates.
          pin 75 / rename 27 / txn_version 65 / row_level_concurrency 93 / time_travel 98 / alter 116 /
          row_tracking_virtual 299 / column_mapping 251 all identical; hermetic + service tiers identical
          to baseline (the behaviour-preservation claim).
-     - **4d — the `table_*` ABI session** (§2.4) + DELETE `get_metadata` + kinds 0-7/12/15 — the one
-       C++-touching bump, last, when the C# objects it transports already exist and are gated.
+     - **4d — the `table_*` ABI session + DELETE `get_metadata` + `scan_table`. BUILT — 2026-08-15
+       (ABI v72, breaking, no aliases — the one C++-touching bump, taken last as planned, when the C#
+       objects it transports already existed and were gated).** `get_metadata`, `scan_table` and the
+       `FabricatorMetadataKind` enum are GONE from the vtable (mid-struct removal, the v30/v31/v47
+       precedent — the version check makes a stale pair loud); managed, `IBackendCatalog.GetMetadata` and
+       the C# `MetadataKind` are gone with them. As built, with the letter re-derived against the tree in
+       FOUR places (the standing lesson, applied a fourth time):
+       - **`table_open` is LAZY and absence stays at the first read.** §2.4's sketch put NOT_FOUND on
+         `table_open`; §6's lazy-bind option ("the handle is the DEFINITION, each call resolves the
+         ambient txn's binding") is what was built, and it decides the rest: the handle wraps
+         (definition, AT) with NO IO and NO probe — cheap opening is load-bearing because enumeration
+         materializes every table — so absence classifies at `table_schema`, exactly where the old kind-2
+         classified it (same contract, same call count). It also makes the handle's LIFETIME trivial: a
+         definition is stateless (4c), so an entry keeping its handle through the retire-don't-destroy
+         graveyard cannot serve anything stale — staleness is governed by the binding layer, which
+         per-transaction invalidation already owns. The new `IBackendCatalog.ResolveTransaction(txnId)`
+         DIM is the one question the session asks per call, and its per-provider semantics are the
+         providers' own ambient rules (SqlServer TryGet — lazy creation preserved; Delta GetOrCreate —
+         without it an autocommit schema open would never share its pin/open and the
+         195-of-291-seconds shape would return; DAX/DeltaRs/Stub null).
+       - **NO JSON — `table_info` is an Arrow stream with a DECLARED shape** ((role, name, type); the
+         design said "ONE typed JSON doc"). Decided by the loadable's LINK surface, checked before
+         building: yyjson is vendored in duckdb_static (`duckdb_yyjson`) but its symbols are not
+         `DUCKDB_API`-exported, so a loadable extension cannot call it on Windows; and a hand-rolled
+         parser over user-controlled identifier strings is the `ReadCapabilityFlag` hack without its
+         safety argument (that one is safe only because our own serializer emits bare booleans). The
+         SUBSTANCE — declared columns instead of kind ints, and typed values — survives: `table_stats`
+         carries an INT64 value column where kinds 4/5 crossed numbers as text.
+       - **Stats are a SEPARATE lazy entry, not part of the info doc** — bundling them would move the
+         stats queries onto entry materialization, i.e. the enumeration path (§3 items 5/7). Entry
+         materialization = open + schema + info (2 IO crossings, was 3); stats = 1 at first scan (was 2),
+         one `stats_fetched_` flag on the entry filling row count + NDV together.
+       - **`table_schema` keeps the zero-row-stream carrier** (the design mocked it as "trickery"):
+         PopulateReturnSchema is the ONE proven import path incl. VARIANT extension types, and a bare
+         ArrowSchema would fork the type conversion for zero gain. The AT clause is part of the handle's
+         identity (the C++ AT entries' own-map fact, object-model form), so an AT handle's schema is the
+         provider's as-of describe — Delta's `GetSchemaAt` (the SAME call `ScanCore`'s schema-only probe
+         makes, so the entry's ColumnList and the scan's return schema still come from one resolution —
+         the §1.x contract); SqlServer's definition deliberately ignores it (4c's recorded decision:
+         box/Azure temporal history keeps the current shape, Fabric refuses time travel across DDL — the
+         refusal now surfaces at the scan's own schema probe in the same bind, one call later). The
+         bind-time schema PROBE stays on the SCAN path untouched (`table_scan` with the schema-only
+         spec) — the pin-seeding/native-vs-codec note in `fabricator_table_entry.cpp` demands it.
+       - **Catalog discovery**: five dedicated entries (`catalog_schemas`/`catalog_tables`/
+         `catalog_functions`/`catalog_macros`/`catalog_server_info`), each keeping its old kind's column
+         layout; every provider now implements all five with DECLARED shapes, so the per-provider
+         unknown-kind fallbacks (the 1-column empty table behind the `ReadStringTable` OOB hazard) are
+         gone. `catalog_server_info` stays diagnostic-only (the host consumes v71's `get_capabilities`).
+       - **DAX / DeltaRs / Stub gained thin `ITable` implementations** (read-only: schema + scan, empty
+         rowid/virtual/stats) — each an afternoon's worth, which was the design's stated test. ⚠ DeltaRs
+         needed a `using DrsTable = DeltaLake.Interfaces.ITable;` alias — delta-dotnet's own per-table
+         handle collides by NAME with the object model's `ITable`.
+       - **`IBackendCatalog.ScanTable` deliberately SURVIVES as a C#-internal member** (the ABI entry
+         died): it is the one-line ambient-bind convenience the external-table DML routing's
+         identity-resolution scan needs, and each provider's implementation is an adapter over the
+         object model. What 4d did NOT do — deliberately, and recorded rather than implied: the DML
+         entries (`execute_delete`/`execute_update`/`begin_bulk`/`alter_table`/`create_table`…) keep
+         their name-pair transport. §2.4's sketch lists `table_delete`/`table_update`/`table_alter`;
+         nothing forces them (they never rode `get_metadata`, and the C# side already resolves per-txn
+         state ambiently), so re-pointing them at table handles is follow-on work with its own risk
+         budget, not part of retiring the multiplexer.
+       - Gates: hermetic **69/69 — 7193** and service **50/50 — 2028**, both IDENTICAL to the 4c baseline
+         (the behaviour-preservation claim — the transport changed, no answer may move); smoke incl. a
+         rowid UPDATE and `AT (VERSION => 1)` through the new session. DeltaRs + DAX compile-verified
+         (their suites are outside CI / manual, as always).
 5. Sweep: delete `ReadStringTable`'s multi-column string protocol where nothing uses it any more.
 
 ## 6. Honest costs and open questions

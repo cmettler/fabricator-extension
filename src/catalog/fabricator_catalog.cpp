@@ -37,7 +37,7 @@
 
 namespace duckdb {
 
-// schema_filter / table_filter are now applied provider-side (the managed get_metadata returns only matching
+// schema_filter / table_filter are now applied provider-side (the managed discovery entries return only matching
 // schemas/tables — see docs/provider-extensibility.md §3), so the catalog registers everything it discovers.
 
 FabricatorCatalog::FabricatorCatalog(AttachedDatabase &db, string internal_name, FabricatorHandle handle, string db_path)

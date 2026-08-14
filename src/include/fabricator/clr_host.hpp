@@ -193,12 +193,28 @@ public:
 	}
 };
 
-// Discover provider metadata. `kind` is an FabricatorMetadataKind; `arg1`/`arg2`
-// are the schema/table name when the kind needs them (empty otherwise). Fills
-// `out` with the resulting Arrow stream. All provider catalog SQL lives in C#.
-// Throws ObjectNotFoundException when the provider reports the object as absent.
-void GetMetadata(FabricatorHandle handle, int32_t kind, const std::string &arg1, const std::string &arg2,
-                 ArrowArrayStream &out);
+// Catalog discovery (ABI v72 — get_metadata's replacement; see abi.h for each entry's column layout).
+// All provider catalog SQL lives in C#.
+void CatalogSchemas(FabricatorHandle handle, ArrowArrayStream &out);
+void CatalogTables(FabricatorHandle handle, ArrowArrayStream &out);
+void CatalogFunctions(FabricatorHandle handle, ArrowArrayStream &out);
+void CatalogMacros(FabricatorHandle handle, ArrowArrayStream &out);
+void CatalogServerInfo(FabricatorHandle handle, ArrowArrayStream &out);
+
+// The table session (ABI v72; see abi.h for the full contract). TableOpen resolves (schema, table[, AT])
+// to a session handle — no IO, no absence probe. TableSchema fills a ZERO-ROW stream whose Arrow schema is
+// the column layout and throws ObjectNotFoundException when the provider reports the table absent (the
+// old kind-2 contract, one entry over). TableInfo = (role, name, type) rowid + virtual columns; TableStats
+// = (stat, column, value:int64) row_count + NDV, lazy. TableScan = the old ScanTable minus the name pair.
+// TableClose is best-effort and never throws (it runs from the entry destructor at teardown).
+FabricatorHandle TableOpen(FabricatorHandle handle, const std::string &schema, const std::string &table,
+                           const std::string &at_unit = "", const std::string &at_value = "");
+void TableSchema(FabricatorHandle table, ArrowArrayStream &out);
+void TableInfo(FabricatorHandle table, ArrowArrayStream &out);
+void TableStats(FabricatorHandle table, ArrowArrayStream &out);
+void TableScan(FabricatorHandle table, const std::string &spec_json, ArrowArrayStream *filter_values,
+               ArrowArrayStream &out);
+void TableClose(FabricatorHandle table) noexcept;
 
 // Provider-declared settings (see docs/settings-architecture.md). ListSettings fills `out` with ALL
 // registered providers' declared settings (six string columns: provider, name, type, default, description,
@@ -223,12 +239,6 @@ void ListGlobalFunctions(ArrowArrayStream &out);
 // providers' secret types + fields (five string columns: provider, secret_type, name, type, redact); the
 // host registers one DuckDB secret type per distinct secret_type at load.
 void ListSecretFields(ArrowArrayStream &out);
-
-// Scan a table; fills `out` with the rows as an Arrow stream. `spec_json` (empty
-// => none) carries projection + filter pushdown; `filter_values` (nullable) is a
-// one-batch Arrow stream of the typed constants the filter tree references.
-void ScanTable(FabricatorHandle handle, const std::string &schema, const std::string &table, const std::string &spec_json,
-               ArrowArrayStream *filter_values, ArrowArrayStream &out);
 
 // DDL: create a table whose columns are described by the (zero-row) `columns`
 // Arrow stream — a non-nullable field becomes NOT NULL. `pk_columns` /

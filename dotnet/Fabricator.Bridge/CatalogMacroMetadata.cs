@@ -6,7 +6,7 @@ using Apache.Arrow.Types;
 namespace Fabricator.Bridge;
 
 /// <summary>
-/// Builds the <c>MetadataKind.CatalogMacros</c> (kind 15) stream: three UTF-8 columns
+/// Builds the <c>catalog_macros</c> discovery stream (was metadata kind 15 before ABI v72): three UTF-8 columns
 /// (<c>schema</c>, <c>name</c>, <c>create_sql</c>) the host reads to bind provider-declared macros into an
 /// ATTACHed catalog's schemas.
 ///

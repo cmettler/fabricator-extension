@@ -41,14 +41,65 @@ public sealed class StubBackend : IBackend
 
         public long ExecuteNonQuery(string sql) => 0;
 
-        public IArrowArrayStream GetMetadata(int kind, string? schema, string? table) => kind switch
+        public IArrowArrayStream GetSchemas() => EmptyStringTable("schema_name");
+
+        public IArrowArrayStream GetTables() => EmptyStringTable("schema_name", "table_name", "table_type");
+
+        public IArrowArrayStream GetFunctions() =>
+            EmptyStringTable("schema_name", "name", "kind", "param_count", "return_type");
+
+        public IArrowArrayStream GetMacros() => EmptyStringTable("schema", "name", "create_sql");
+
+        public IArrowArrayStream GetServerInfo() => EmptyStringTable("property", "value");
+
+        public ITableDefinition GetTable(string schemaName, string tableName) =>
+            new StubTableDefinition(this, schemaName, tableName);
+
+        private sealed class StubTableDefinition : ITableDefinition
         {
-            MetadataKind.Tables => EmptyStringTable("schema_name", "table_name", "table_type"),
-            // Zero-row stream whose schema describes the (stub) table columns.
-            MetadataKind.Columns => new InMemoryArrayStream(ScanSchema(), System.Array.Empty<RecordBatch>()),
-            MetadataKind.VirtualColumns => EmptyStringTable("name", "type"),
-            _ => EmptyStringTable("name"),
-        };
+            private readonly StubCatalog _catalog;
+
+            internal StubTableDefinition(StubCatalog catalog, string schemaName, string tableName)
+            {
+                _catalog = catalog;
+                SchemaName = schemaName;
+                TableName = tableName;
+            }
+
+            public string SchemaName { get; }
+            public string TableName { get; }
+
+            public ITable Bind(ITransaction? transaction, TableAt? at = null) => new StubBoundTable(_catalog, this);
+        }
+
+        private sealed class StubBoundTable : ITable
+        {
+            private readonly StubCatalog _catalog;
+            private readonly StubTableDefinition _definition;
+
+            internal StubBoundTable(StubCatalog catalog, StubTableDefinition definition)
+            {
+                _catalog = catalog;
+                _definition = definition;
+            }
+
+            public Schema Schema => ScanSchema();
+
+            public IReadOnlyList<string> RowIdColumns() => System.Array.Empty<string>();
+
+            public IReadOnlyList<VirtualColumn> VirtualColumns() => System.Array.Empty<VirtualColumn>();
+
+            public long? ApproximateRowCount() => null;
+
+            public IReadOnlyList<NdvEntry> ColumnNdv() => System.Array.Empty<NdvEntry>();
+
+            public IArrowArrayStream Scan(string? specJson, IArrowArrayStream? filterValues) =>
+                _catalog.ScanTable(_definition.SchemaName, _definition.TableName, specJson, filterValues);
+
+            public void Dispose()
+            {
+            }
+        }
 
         public IArrowArrayStream ScanTable(string schemaName, string tableName, string? specJson,
                                            IArrowArrayStream? filterValues) =>

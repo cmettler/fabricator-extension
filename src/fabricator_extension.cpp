@@ -352,7 +352,7 @@ static unique_ptr<FunctionData> FunctionsBind(ClientContext &context, TableFunct
 	bind_data->handle = ResolveConnection(context, connection, bind_data->owns_handle);
 	auto handle = bind_data->handle;
 	bind_data->factory = [handle](const fabricator::ArrowScanRequest &, ArrowArrayStream &out) {
-		fabricator::GetMetadata(handle, FABRICATOR_META_FUNCTIONS, "", "", out);
+		fabricator::CatalogFunctions(handle, out);
 	};
 
 	fabricator::PopulateReturnSchema(context, *bind_data, return_types, names);
@@ -371,7 +371,7 @@ static unique_ptr<FunctionData> ServerInfoBind(ClientContext &context, TableFunc
 	bind_data->handle = ResolveConnection(context, connection, bind_data->owns_handle);
 	auto handle = bind_data->handle;
 	bind_data->factory = [handle](const fabricator::ArrowScanRequest &, ArrowArrayStream &out) {
-		fabricator::GetMetadata(handle, FABRICATOR_META_SERVER_INFO, "", "", out);
+		fabricator::CatalogServerInfo(handle, out);
 	};
 
 	fabricator::PopulateReturnSchema(context, *bind_data, return_types, names);

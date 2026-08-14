@@ -6,7 +6,7 @@ using Apache.Arrow.Types;
 namespace Fabricator.Bridge;
 
 /// <summary>
-/// Builds the <c>MetadataKind.Functions</c> (kind 6) discovery stream IN MEMORY, for a provider that has no SQL
+/// Builds the <c>catalog_functions</c> discovery stream (was metadata kind 6 before ABI v72) IN MEMORY, for a provider that has no SQL
 /// engine to assemble it with.
 ///
 /// <para>The SQL-Server catalog produces this same stream as T-SQL executed on the server (its discovered

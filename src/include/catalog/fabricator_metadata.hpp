@@ -29,7 +29,7 @@ vector<vector<string>> ReadStringTable(ArrowArrayStream &stream, idx_t expected_
 vector<string> DiscoverSchemas(FabricatorHandle handle);
 
 //! The host-consumed capability flags for an open catalog (ABI v71, `get_capabilities`) — the typed
-//! replacement for grepping the diagnostic FABRICATOR_META_SERVER_INFO (property, value) stream. An
+//! replacement for grepping the diagnostic catalog_server_info (property, value) stream. An
 //! absent key in the provider's JSON means false, so every flag defaults to the safe direction.
 struct FabricatorCapabilities {
 	//! The database collation sorts strings by byte value (_BIN/_BIN2), matching DuckDB, so string-keyed
@@ -69,7 +69,7 @@ struct FabricatorMacroInfo {
 	string create_sql;
 };
 
-//! Discovers provider-declared catalog-bound macros (FABRICATOR_META_CATALOG_MACROS). Never throws: a provider
+//! Discovers provider-declared catalog-bound macros (catalog_macros). Never throws: a provider
 //! that does not serve the kind simply declares none, so the caller does not need its own guard.
 vector<FabricatorMacroInfo> DiscoverCatalogMacros(FabricatorHandle handle);
 
@@ -106,49 +106,46 @@ LogicalType FetchFunctionReturnType(ClientContext &context, FabricatorHandle han
 void FetchFunctionOutputSchema(ClientContext &context, FabricatorHandle handle, const string &schema_name,
                                const string &func_name, vector<string> &names, vector<LogicalType> &types);
 
-//! Resolves a table's column names + DuckDB types from the Arrow schema of the
-//! COLUMNS metadata stream (a zero-row result; reuses the C# type mapping, no
-//! duplicate type logic in C++).
-void FetchTableColumns(ClientContext &context, FabricatorHandle handle, const string &schema_name,
-                       const string &table_name, vector<string> &names, vector<LogicalType> &types);
+//! Resolves a table's column names + DuckDB types from the table session's `table_schema` stream (a
+//! zero-row result whose Arrow schema is the answer; reuses the C# type mapping, no duplicate type logic
+//! in C++). `catalog_handle` keys the read to the ACTIVE transaction (read-your-writes: a just-created
+//! table's columns must be visible inside its own transaction); `table_handle` is the session from
+//! fabricator::TableOpen — when it was opened WITH an AT clause this describes the table AS OF that
+//! version (the column set a `FROM t AT (VERSION => n)` reference expands `SELECT *` against; the
+//! provider's own as-of describe, per docs/known-limitations.md §1.x).
+//! Throws fabricator::ObjectNotFoundException when the provider ESTABLISHES the table as absent.
+void FetchTableSchema(ClientContext &context, FabricatorHandle catalog_handle, FabricatorHandle table_handle,
+                      vector<string> &names, vector<LogicalType> &types);
 
-//! The same, AS OF a time-travel reference's version/timestamp — the column set a
-//! `FROM t AT (VERSION => n)` reference must expand `SELECT *` against.
-//!
-//! ⚠ It asks the SCAN (schema-only spec + the AT clause), not the COLUMNS metadata stream, for two reasons.
-//! The metadata stream has nowhere to carry an AT; and asking the scan means the catalog entry's ColumnList
-//! and that scan's own return schema come from ONE describe, so they cannot disagree — which is the exact
-//! failure documented in docs/known-limitations.md §1.x.
-//!
-//! ⚠ ABSENCE IS NOT CLASSIFIED ON THIS PATH. `GetMetadata` maps the provider's NOT_FOUND status to
-//! ObjectNotFoundException; `ScanTable` does not, so a missing table surfaces as the provider's own error
-//! rather than "table does not exist". The caller checks the discovered NAME list first, which is what
-//! answers the ordinary case; the gap is reachable only under an ATTACH object filter.
-void FetchTableColumnsAt(ClientContext &context, FabricatorHandle handle, const string &schema_name,
-                         const string &table_name, const string &at_unit, const string &at_value,
-                         vector<string> &names, vector<LogicalType> &types);
+//! The row-identity + provider-virtual-column halves of the `table_info` crossing (ONE crossing — the old
+//! kinds 3 + 12).
+struct FabricatorTableRowIdentity {
+	//! Row-identity column names in key order (PK / smallest unique index / IDENTITY / a provider virtual
+	//! rowid). Empty => no rowid, UPDATE/DELETE unavailable.
+	vector<string> rowid_columns;
+	//! Provider-declared VIRTUAL columns (name, DuckDB-type-text) — queryable by name, not in SELECT *.
+	vector<std::pair<string, string>> virtual_columns;
+};
 
-//! Discovers the row-identity columns for a table, in key order: the primary
-//! key if present, else the unique index with the fewest columns. Returns empty
-//! if the table has no PK or unique index.
-vector<string> FetchRowIdColumns(FabricatorHandle handle, const string &schema_name, const string &table_name);
+//! Reads the table's row identity + virtual columns from the session's `table_info` stream. Errors bubble
+//! (the rowid half was always load-bearing for entry materialization); note this means a provider failure
+//! in the VIRTUAL half now fails materialization too, where the old kind-12 fetch was silently best-effort —
+//! acceptable because the reachable set is empty (the providers resolve the flag from state the schema
+//! fetch on the same ambient binding already cached).
+FabricatorTableRowIdentity FetchTableInfo(FabricatorHandle table_handle);
 
-//! Provider-declared VIRTUAL columns for a table: (name, type-text) pairs the provider serves as
-//! queryable-by-name virtual columns (not part of SELECT *) — e.g. the Delta catalog's stable
-//! row-tracking __delta_row_id / __delta_row_commit_version. Best-effort: any failure (a provider
-//! without the metadata kind) returns empty.
-vector<std::pair<string, string>> FetchVirtualColumns(FabricatorHandle handle, const string &schema_name,
-                                                      const string &table_name);
+//! The optimizer-statistics half of the table session (`table_stats` — the old kinds 4 + 5, ONE crossing,
+//! typed int64 values). Lazy by contract: called at first scan, never at entry materialization.
+struct FabricatorTableStats {
+	//! Approximate row count; -1 = unknown (a view, no stats, or a provider that surfaces none).
+	int64_t row_count = -1;
+	//! Per-column distinct-value estimates keyed by column name; absent = unknown. Costing only (never
+	//! pruning), so approximate/stale values are safe.
+	std::unordered_map<string, int64_t> column_ndv;
+};
 
-//! Approximate table row count (from partition stats) for the optimizer's
-//! cardinality estimate. Returns -1 if unknown (e.g. a view or no stats).
-int64_t FetchRowCount(FabricatorHandle handle, const string &schema_name, const string &table_name);
-
-//! Per-column distinct-value estimate (NDV) from existing statistics, keyed by
-//! column name. Only columns that are a leading stat key appear; others are absent
-//! (=> unknown). Used solely for selectivity estimation (never pruning), so an
-//! approximate/stale value is safe.
-std::unordered_map<string, int64_t> FetchColumnNdv(FabricatorHandle handle, const string &schema_name,
-                                                   const string &table_name);
+//! Reads both statistics from the session's `table_stats` stream. Errors bubble; the caller treats the
+//! whole fetch as best-effort (a stats failure must not break the scan).
+FabricatorTableStats FetchTableStats(FabricatorHandle table_handle);
 
 } // namespace duckdb

@@ -151,7 +151,7 @@ internal sealed class DeltaTransaction : ITransaction
     /// <remarks>
     /// ⚠ THIS BOUND EXISTS FOR CATALOG ENUMERATION, which is the one shape where the reuse is pure cost.
     /// <c>information_schema.tables</c> / <c>duckdb_tables()</c> materialise EVERY table, one
-    /// <c>MetadataKind.Columns</c> crossing each, so without a cap one statement would retain a
+    /// <c>table_schema</c> crossing each, so without a cap one statement would retain a
     /// <c>Snapshot</c> per table — and a snapshot holds <c>ActiveFiles</c>, an <c>AddFile</c> per data file
     /// carrying its <c>Stats</c> JSON (min/max per column), partition values and tags. Enumeration touches
     /// each table exactly ONCE, so all of that retention buys no reuse at all, and it lands on the path

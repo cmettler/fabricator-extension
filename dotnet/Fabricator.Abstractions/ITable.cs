@@ -25,11 +25,11 @@ public readonly record struct NdvEntry(string ColumnName, long Ndv);
 /// grammar gives a table reference — the AT clause.
 /// </summary>
 /// <remarks>
-/// In the current (pre-<c>table_*</c>-session) ABI transport a definition is TRANSIENT: the provider creates
-/// one per <c>GetMetadata</c>/<c>ScanTable</c> crossing, and it holds NO cached state — statefulness that has
-/// a lifetime lives on the BOUND table (per transaction) or on the provider's existing entry caches. Slice 4d
-/// gives definitions the lifetime of the C++ catalog entry (retire-don't-destroy graveyard), which is when
-/// caching on them becomes sound.
+/// Since the <c>table_*</c> session (ABI v72) a definition lives for the C++ catalog entry's lifetime behind
+/// a <c>table_open</c> handle (retire-don't-destroy graveyard), and every session call re-binds it against
+/// the CURRENT ambient transaction. It still holds NO cached state — that is what makes the long-lived
+/// handle trivially safe: statefulness with a lifetime lives on the BOUND table (per transaction) or on the
+/// provider's existing entry caches, both of which the per-transaction invalidation already owns.
 /// </remarks>
 public interface ITableDefinition
 {
@@ -78,9 +78,10 @@ public interface ITableDefinition
 /// </remarks>
 public interface ITable : IDisposable
 {
-    /// <summary>The table's columns as an Arrow schema — typed, replacing the zero-row-stream trick of
-    /// <c>MetadataKind.Columns</c>. A buffered transaction's pending CREATE/ALTER shape wins over storage;
-    /// absence throws <see cref="ObjectNotFoundException"/> (established, never inferred). May do IO.</summary>
+    /// <summary>The table's columns as an Arrow schema — typed (the <c>table_schema</c> entry re-encodes it
+    /// as a zero-row stream only at the ABI edge, for the host's proven import path). A buffered
+    /// transaction's pending CREATE/ALTER shape wins over storage; absence throws
+    /// <see cref="ObjectNotFoundException"/> (established, never inferred). May do IO.</summary>
     Schema Schema { get; }
 
     /// <summary>The row-identity column names (PK / unique index / IDENTITY / a provider virtual rowid),

@@ -25,10 +25,15 @@ void FabricatorComplexFilterPushdown(ClientContext &context, LogicalGet &get, Fu
 
 class FabricatorTableEntry : public TableCatalogEntry {
 public:
-	FabricatorTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateTableInfo &info, FabricatorHandle handle,
-	                   vector<idx_t> rowid_columns, LogicalType rowid_type,
+	//! `table_handle` is the managed TABLE-SESSION handle (ABI v72 `table_open`) this entry OWNS for its
+	//! whole life — released by the destructor (`table_close`, best-effort). It wraps the stateless table
+	//! DEFINITION (+ the AT clause for a time-travel entry), never a binding: every table_* call re-binds
+	//! against the ambient transaction, so keeping it across the retire-don't-destroy graveyard is safe.
+	FabricatorTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateTableInfo &info,
+	                   FabricatorHandle table_handle, vector<idx_t> rowid_columns, LogicalType rowid_type,
 	                   vector<string> virtual_rowid_columns = {},
 	                   vector<std::pair<string, LogicalType>> provider_virtual_columns = {});
+	~FabricatorTableEntry() override;
 
 	//! Produces a table scan that streams `SELECT * FROM [schema].[table]` from
 	//! SQL Server as Arrow into DuckDB.
@@ -71,7 +76,8 @@ private:
 	TableFunction BuildScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data,
 	                                optional_ptr<BoundAtClause> at_clause);
 
-	FabricatorHandle handle_;
+	//! The owned table-session handle (see the constructor note). Never null for a live entry.
+	FabricatorHandle table_handle_;
 	//! Indices (in table column order) of the rowid/PK columns; empty => no rowid.
 	vector<idx_t> rowid_columns_;
 	//! Virtual rowid source column names (provider-supplied, not in the user schema); empty => none.
@@ -82,14 +88,15 @@ private:
 	vector<std::pair<string, LogicalType>> provider_virtual_columns_;
 	//! rowid type: scalar (single column) or STRUCT (compound key).
 	LogicalType rowid_type_;
-	//! Lazily-fetched approximate row count for the optimizer (-2 = not yet fetched,
-	//! -1 = unknown). Cached for the entry's lifetime (refreshed by RefreshCache).
-	int64_t row_count_ = -2;
+	//! Lazily-fetched approximate row count for the optimizer (-1 = unknown). Cached for the entry's
+	//! lifetime (refreshed by RefreshCache, which rebuilds the entry).
+	int64_t row_count_ = -1;
 	//! Lazily-fetched per-column NDV (distinct count) keyed by column name; columns
-	//! absent => unknown. Cached for the entry's lifetime. `ndv_fetched_` guards the
-	//! one-time fetch (the map may legitimately be empty).
+	//! absent => unknown. Cached for the entry's lifetime.
 	std::unordered_map<string, int64_t> column_ndv_;
-	bool ndv_fetched_ = false;
+	//! Guards the ONE lazy `table_stats` crossing that fills both fields above (was two crossings —
+	//! kinds 4 + 5 — with a flag each). The map may legitimately stay empty.
+	bool stats_fetched_ = false;
 };
 
 } // namespace duckdb

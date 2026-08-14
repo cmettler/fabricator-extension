@@ -21,7 +21,7 @@ public:
 	~FabricatorCatalog() override;
 
 	//! Discovers schemas + tables from SQL Server (called once at attach time).
-	//! schema_filter / table_filter (ATTACH options) are applied provider-side now (get_metadata returns
+	//! schema_filter / table_filter (ATTACH options) are applied provider-side now (catalog discovery returns
 	//! only matches — docs/provider-extensibility.md §3), so this registers everything it discovers.
 	void LoadCatalog(ClientContext &context);
 

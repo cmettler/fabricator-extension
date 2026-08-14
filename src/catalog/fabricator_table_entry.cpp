@@ -608,12 +608,20 @@ void FabricatorComplexFilterPushdown(ClientContext &context, LogicalGet &get, Fu
 }
 
 FabricatorTableEntry::FabricatorTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateTableInfo &info,
-                                       FabricatorHandle handle, vector<idx_t> rowid_columns, LogicalType rowid_type,
-                                       vector<string> virtual_rowid_columns,
+                                       FabricatorHandle table_handle, vector<idx_t> rowid_columns,
+                                       LogicalType rowid_type, vector<string> virtual_rowid_columns,
                                        vector<std::pair<string, LogicalType>> provider_virtual_columns)
-    : TableCatalogEntry(catalog, schema, info), handle_(handle), rowid_columns_(std::move(rowid_columns)),
-      virtual_rowid_columns_(std::move(virtual_rowid_columns)),
+    : TableCatalogEntry(catalog, schema, info), table_handle_(table_handle),
+      rowid_columns_(std::move(rowid_columns)), virtual_rowid_columns_(std::move(virtual_rowid_columns)),
       provider_virtual_columns_(std::move(provider_virtual_columns)), rowid_type_(std::move(rowid_type)) {
+}
+
+FabricatorTableEntry::~FabricatorTableEntry() {
+	// Runs at catalog teardown for LIVE and RETIRED entries alike (the retire-don't-destroy graveyard keeps
+	// evicted entries alive precisely so in-flight binds — whose factories capture table_handle_ by value —
+	// stay valid). TableClose is noexcept + best-effort: it frees a managed GCHandle around a stateless
+	// definition, so a bridge that is already gone loses nothing.
+	fabricator::TableClose(table_handle_);
 }
 
 // NOTE on struct filters under exact mode (filter_pushdown=true): a `WHERE (s).a = 5` becomes an
@@ -759,34 +767,29 @@ TableFunction FabricatorTableEntry::GetScanFunction(ClientContext &context, uniq
 TableFunction FabricatorTableEntry::BuildScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data,
                                                     optional_ptr<BoundAtClause> at_clause) {
 	auto data = make_uniq<fabricator::ArrowStreamBindData>();
-	auto handle = handle_;
+	auto table_handle = table_handle_;
 	// The managed side builds the provider SELECT for the whole table.
 	string schema_name = schema.name;
 	string table_name = name;
 
-	// Approximate row count for the optimizer (fetched once, cached on the entry).
-	// A stats failure (e.g. missing VIEW DATABASE STATE) must not break the scan.
-	if (row_count_ == -2) {
+	// Optimizer statistics — row count + per-column NDV in ONE lazy table_stats crossing (fetched once,
+	// cached on the entry). Best-effort: a stats failure (e.g. missing VIEW DATABASE STATE) must not break
+	// the scan; it just leaves the estimates unknown.
+	if (!stats_fetched_) {
+		stats_fetched_ = true;
 		try {
-			row_count_ = FetchRowCount(handle_, schema_name, table_name);
+			auto stats = FetchTableStats(table_handle_);
+			row_count_ = stats.row_count;
+			column_ndv_ = std::move(stats.column_ndv);
 		} catch (...) {
 			row_count_ = -1;
+			column_ndv_.clear();
 		}
 	}
 	data->row_count = row_count_;
 
-	// Per-column NDV for selectivity (fetched once, cached). Best-effort: a stats
-	// failure leaves all columns unknown. Aligned to the column order by name.
-	if (!ndv_fetched_) {
-		ndv_fetched_ = true;
-		try {
-			column_ndv_ = FetchColumnNdv(handle_, schema_name, table_name);
-		} catch (...) {
-			column_ndv_.clear();
-		}
-	}
-	data->factory = [handle, schema_name, table_name](const fabricator::ArrowScanRequest &req, ArrowArrayStream &out) {
-		fabricator::ScanTable(handle, schema_name, table_name, req.spec_json, req.filter_values, out);
+	data->factory = [table_handle](const fabricator::ArrowScanRequest &req, ArrowArrayStream &out) {
+		fabricator::TableScan(table_handle, req.spec_json, req.filter_values, out);
 	};
 	// Time travel: record `FROM t AT (...)` (a bind-time constant) so the scan spec carries it to the
 	// provider (SQL Server: FOR SYSTEM_TIME AS OF for "timestamp"; "version" is rejected managed-side).
@@ -816,8 +819,8 @@ TableFunction FabricatorTableEntry::BuildScanFunction(ClientContext &context, un
 	// FabricatorSchemaEntry::GetOrCreateEntry), so `SELECT *`'s column list and this scan's return
 	// schema come from one source and cannot disagree.
 	string probe_spec = fabricator::BuildSchemaOnlySpec(data->at_unit, data->at_value);
-	data->schema_factory = [handle, schema_name, table_name, probe_spec](ArrowArrayStream &out) {
-		fabricator::ScanTable(handle, schema_name, table_name, probe_spec.c_str(), nullptr, out);
+	data->schema_factory = [table_handle, probe_spec](ArrowArrayStream &out) {
+		fabricator::TableScan(table_handle, probe_spec.c_str(), nullptr, out);
 	};
 	data->push_projection = true; // push the projected column list (and later, filters) to SQL
 	// String-keyed ORDER BY may be pushed only under a binary database collation (byte-order sort ==

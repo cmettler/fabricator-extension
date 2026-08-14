@@ -38,12 +38,10 @@ public unsafe struct FabricatorVTable
     // int32 execute_update(void* handle, const char* schema, const char* table, int32 set_count, ArrowArrayStream* data, int64* affected, char** err)
     public delegate* unmanaged[Cdecl]<nint, byte*, byte*, int, CArrowArrayStream*, long*, byte**, int> ExecuteUpdate;
 
-    // int32 get_metadata(void* handle, int32 kind, const char* arg1, const char* arg2, ArrowArrayStream* out, char** err)
-    public delegate* unmanaged[Cdecl]<nint, int, byte*, byte*, CArrowArrayStream*, byte**, int> GetMetadata;
-
-    // int32 scan_table(void* handle, const char* schema, const char* table, const char* spec_json,
-    //                  ArrowArrayStream* filter_values, ArrowArrayStream* out, char** err)
-    public delegate* unmanaged[Cdecl]<nint, byte*, byte*, byte*, CArrowArrayStream*, CArrowArrayStream*, byte**, int> ScanTable;
+    // (get_metadata / scan_table were removed at ABI v72 — the 16-kind multiplexer and the name-pair scan
+    //  are replaced by the dedicated catalog_* discovery entries and the table_* session at the end of this
+    //  struct. Removing mid-struct slots shifts every later field, which the abi_version check makes loud —
+    //  the v30/v31/v47 precedent.)
 
     // int32 create_table(void* handle, const char* schema, const char* table, ArrowArrayStream* columns,
     //                    int32 if_not_exists, const char* pk_columns, const char* unique_columns,
@@ -242,6 +240,41 @@ public unsafe struct FabricatorVTable
     // replacement for the host grepping the diagnostic kind-7 (property, value) stream. Appended at the
     // vtable end so no earlier slot shifts.
     public delegate* unmanaged[Cdecl]<nint, byte**, byte**, int> GetCapabilities;
+
+    // ---- catalog discovery (ABI v72) — the dedicated typed LIST entries that replaced get_metadata's
+    // kind multiplexer. Arrow streams stay the carrier (the right tool for lists); what died is the kind
+    // int, the per-provider `_ =>` fallback shapes, and the name-pair-per-call transport for tables.
+    // int32 catalog_schemas(void* handle, ArrowArrayStream* out, char** err) — 1 utf8 col: schema_name
+    public delegate* unmanaged[Cdecl]<nint, CArrowArrayStream*, byte**, int> CatalogSchemas;
+    // int32 catalog_tables(void* handle, ArrowArrayStream* out, char** err) — 3 utf8: schema, table, type
+    public delegate* unmanaged[Cdecl]<nint, CArrowArrayStream*, byte**, int> CatalogTables;
+    // int32 catalog_functions(void* handle, ArrowArrayStream* out, char** err) — 5: schema, name, kind,
+    // param_count, return_type (the host reads the first three)
+    public delegate* unmanaged[Cdecl]<nint, CArrowArrayStream*, byte**, int> CatalogFunctions;
+    // int32 catalog_macros(void* handle, ArrowArrayStream* out, char** err) — 3 utf8: schema, name, create_sql
+    public delegate* unmanaged[Cdecl]<nint, CArrowArrayStream*, byte**, int> CatalogMacros;
+    // int32 catalog_server_info(void* handle, ArrowArrayStream* out, char** err) — 2 utf8: property, value.
+    // DIAGNOSTIC only (fabricator_server_info()); the host consumes get_capabilities (v71) instead.
+    public delegate* unmanaged[Cdecl]<nint, CArrowArrayStream*, byte**, int> CatalogServerInfo;
+
+    // ---- the table session (ABI v72) — mirrors tablefn_*; see abi.h for the full contract.
+    // int32 table_open(void* handle, const char* schema, const char* table, const char* at_unit,
+    //                  const char* at_value, void** out_table, char** err)
+    public delegate* unmanaged[Cdecl]<nint, byte*, byte*, byte*, byte*, nint*, byte**, int> TableOpen;
+    // int32 table_schema(void* table, ArrowArrayStream* out, char** err) — zero-row stream whose SCHEMA is
+    // the table's column layout; NOT_FOUND status = established absence.
+    public delegate* unmanaged[Cdecl]<nint, CArrowArrayStream*, byte**, int> TableSchema;
+    // int32 table_info(void* table, ArrowArrayStream* out, char** err) — 3 utf8: role('rowid'|'virtual'),
+    // name, type (empty for rowid rows; rowid rows in key order).
+    public delegate* unmanaged[Cdecl]<nint, CArrowArrayStream*, byte**, int> TableInfo;
+    // int32 table_stats(void* table, ArrowArrayStream* out, char** err) — stat:utf8('row_count'|'ndv'),
+    // column:utf8, value:int64. Lazy by design (never called during enumeration).
+    public delegate* unmanaged[Cdecl]<nint, CArrowArrayStream*, byte**, int> TableStats;
+    // int32 table_scan(void* table, const char* spec_json, ArrowArrayStream* filter_values,
+    //                  ArrowArrayStream* out, char** err)
+    public delegate* unmanaged[Cdecl]<nint, byte*, CArrowArrayStream*, CArrowArrayStream*, byte**, int> TableScan;
+    // void table_close(void* table)
+    public delegate* unmanaged[Cdecl]<nint, void> TableClose;
 }
 
 /// <summary>
@@ -341,39 +374,10 @@ public static class AlterKind
     public const int FlagIfExists = 1;
 }
 
-/// <summary>
-/// Mirrors <c>FabricatorMetadataKind</c> in abi.h: the kind of catalog metadata
-/// requested through <c>get_metadata</c>.
-/// </summary>
-public static class MetadataKind
-{
-    public const int Schemas = 0;
-    public const int Tables = 1;
-    public const int Columns = 2;
-    public const int RowId = 3;
-    public const int RowCount = 4;
-    public const int ColumnNdv = 5;
-    public const int Functions = 6;
-    public const int ServerInfo = 7;
-    // Kinds 8-11 and 13-14 (Snapshots / Changes / TxnVersion / SetTxnVersion / TblProperties /
-    // SetTblProperties) are DELETED (ABI v70): they were Delta features wearing C++-registered function fronts
-    // with string-packed payloads, and are now catalog-bound functions in the `delta` schema —
-    // cat.delta.snapshots('s.t') etc., declared by the Delta providers with TYPED args (see DeltaFunctions).
-    // The gaps stay unassigned so an old loadable's kind cannot silently alias a new one.
-    // Provider-declared VIRTUAL columns for a table (arg1=schema, arg2=table): two string columns
-    // (name, type-text). Registered by the host as queryable-by-name virtual columns (NOT part of
-    // SELECT *). Delta (native_read + delta.enableRowTracking only): __delta_row_id +
-    // __delta_row_commit_version (both BIGINT — the STABLE row-tracking id/version, unlike the
-    // transient _metadata.row_id rowid). Other providers: empty.
-    public const int VirtualColumns = 12;
-    // Provider-declared CATALOG-BOUND DuckDB macros: three string columns (schema, name, create_sql), each
-    // create_sql one complete CREATE MACRO statement that the HOST parses with DuckDB's own parser and binds
-    // into the ATTACHed catalog's schema (resolved as db.schema.m(...)). Deliberately NOT a column on
-    // Functions: that stream is provider SQL executed on the SERVER, and a macro body is a purely local
-    // declaration that must not round-trip through it. Best-effort — a provider that does not serve this kind
-    // simply has no catalog macros. See docs/macros-and-sqlgen-functions.md §1.4.
-    public const int CatalogMacros = 15;
-}
+// (MetadataKind was deleted at ABI v72 together with get_metadata itself: catalog discovery has dedicated
+//  typed entries (CatalogSchemas/Tables/Functions/Macros/ServerInfo — the shapes those kinds carried keep
+//  their column layouts, minus the kind int), and the per-table kinds live on the table_* session over the
+//  ITable object model. Kind history, incl. the v70 deletion of 8-11/13-14, is in docs/abi-history.md.)
 
 internal static class FabricatorStatus
 {

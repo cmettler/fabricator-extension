@@ -124,7 +124,7 @@ struct ArrowStreamBindData : public duckdb::TableFunctionData {
 
 	//! OPTIONAL schema-only producer, used by PopulateReturnSchema INSTEAD of running `factory` with an
 	//! empty request. Set it when the bound object can DESCRIBE itself more cheaply than by being executed
-	//! — a catalog table can (FABRICATOR_META_COLUMNS is a zero-row stream whose Arrow schema IS the column
+	//! — a catalog table can (table_schema is a zero-row stream whose Arrow schema IS the column
 	//! layout); `fabricator_query(sql)`, a host query and a global table function cannot, so they leave it
 	//! null and keep the run-it-and-read-its-schema default.
 	//!

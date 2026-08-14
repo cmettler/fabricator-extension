@@ -1009,64 +1009,41 @@ public sealed class DeltaCatalog : IBackendCatalog
     public string CapabilitiesJson
         => _pushdownMode == PushdownMode.Exact ? "{\"exact_filter_pushdown\":true}" : "{}";
 
-    public IArrowArrayStream GetMetadata(int kind, string? schema, string? table) => kind switch
-    {
-        // CatalogSchemaNames, not SchemaNames: the advertised set includes the `fabric` function namespace on a
-        // OneLake root. See CatalogSchemaNames for why the two lists must stay separate.
-        MetadataKind.Schemas => SingleColumn("schema_name", CatalogSchemaNames()),
-        MetadataKind.Tables => DiscoverTables(),
-        // The per-TABLE kinds route through the OBJECT MODEL since slice 4c: the ambient-bound ITable
-        // resolves Schema/rowid/virtual columns (the typed members are primary; these arms only re-encode
-        // into the streams the current transport carries — slice 4d's table_* session retires them).
-        // Columns = a zero-row stream whose SCHEMA describes the table's columns (engineered-wood's Delta schema).
-        MetadataKind.Columns => new InMemoryArrayStream(
-            BindAmbient(schema!, table!).Schema, System.Array.Empty<RecordBatch>()),
-        // RowId: always surface the virtual _metadata.row_id — a TRANSIENT (file, position) rowid computed at
-        // scan time (no row-tracking feature needed; works on ANY Delta table). Enables UPDATE/DELETE
-        // (rowid-based, mirrors the SQL Server backend); DELETE is copy-on-write (plain add/remove).
-        MetadataKind.RowId => SingleColumn("name", BindAmbient(schema!, table!).RowIdColumns()),
-        // Provider virtual columns: the STABLE row-tracking id + commit version as queryable-by-name virtual
-        // columns (__delta_row_id / __delta_row_commit_version — the Delta materialized-column names; excluded
-        // from SELECT *). native_read + delta.enableRowTracking tables only — the native reader derives them
-        // per file (COALESCE(materialized, baseRowId + file_row_number) / defaultRowCommitVersion).
-        MetadataKind.VirtualColumns => VirtualColumnsStream(BindAmbient(schema!, table!)),
-        // Snapshots / changes / tblproperties / transaction versions are NOT metadata kinds any more — they are
-        // catalog-bound functions in the `delta` schema (cat.delta.snapshots('s.t') …), declared by
-        // BuildFunctionSet with TYPED arguments. The old kinds 8-11/13-14 and their C++ fronts are deleted.
-        // DIAGNOSTIC capability rows (property, value) for fabricator_server_info() — since ABI v71 the HOST
-        // reads CapabilitiesJson instead (same _pushdownMode source, so the two cannot drift).
-        // `exact_filter_pushdown` = whether the host may set filter_pushdown=true on this catalog's scans —
-        // governed by the pushdown_filters mode: EXACT mode applies the erased TableFilterSet 1:1
-        // (read_parquet WHERE under native_read; HostBatchFilter per batch on the codec path); None/Static
-        // keep filter_pushdown=false so DuckDB re-applies everything.
-        MetadataKind.ServerInfo => TwoColumn(
-            "property", new[] { "exact_filter_pushdown" },
-            "value", new[] { _pushdownMode == PushdownMode.Exact ? "true" : "false" }),
-        // Provider-declared CATALOG-BOUND macros (schema, name, create_sql), bound by the host into this
-        // catalog's schemas as db.schema.m(...). Local declarations — nothing here touches storage, which is
-        // exactly why they ride their own metadata kind instead of a SQL discovery stream.
-        MetadataKind.CatalogMacros => CatalogMacroMetadata.Stream(ExpandCatalogMacroSchemas()),
-        // Provider-declared CATALOG-BOUND custom functions (schema_name, name, kind). Built IN MEMORY —
-        // unlike SqlServerCatalog, this provider has no SQL engine to assemble a discovery query with, and
-        // nothing here is discovered anyway: the set is what the provider declares. `__all__` expands across
-        // discovered schemas (lazily — an empty set costs no schema enumeration, which on OneLake is I/O).
-        MetadataKind.Functions => FunctionsMetadata.Stream(Functions.Declarations(SchemaNames)),
-        // No row-count/NDV stats surfaced.
-        _ => EmptyStringTable("name"),
-    };
+    // ── catalog discovery (the five dedicated list members — ABI v72; the kind multiplexer is gone). The
+    // per-TABLE questions live on the typed ITable members (DeltaBoundTable), reached through the host's
+    // table_* session — the 4c re-encoding arms died with the transport they encoded for.
 
-    // The bound table's typed VirtualColumns() answer re-encoded as the transport's (name, type) stream.
-    // Schema resolution (DeltaBoundTable.Schema — the column fetch that ALWAYS precedes this in the host's
-    // entry materialization) caches the row-tracking flag on the SAME bound object, so this normally costs
-    // no extra _delta_log read (the OneLake enumeration concern) — per (txn, table) since 4c, where the old
-    // catalog-wide _rowTrackingByPath was never invalidated and so went silently stale on a property change.
-    private static IArrowArrayStream VirtualColumnsStream(DeltaBoundTable bound)
-    {
-        var cols = bound.VirtualColumns();
-        return TwoColumn(
-            "name", cols.Select(c => c.Name).ToArray(),
-            "type", cols.Select(c => c.DuckDbType).ToArray());
-    }
+    // CatalogSchemaNames, not SchemaNames: the advertised set includes the `delta` (and, on a OneLake root,
+    // `fabric`) function namespace. See CatalogSchemaNames for why the two lists must stay separate.
+    public IArrowArrayStream GetSchemas() => SingleColumn("schema_name", CatalogSchemaNames());
+
+    public IArrowArrayStream GetTables() => DiscoverTables();
+
+    // Provider-declared CATALOG-BOUND custom functions (schema_name, name, kind). Built IN MEMORY —
+    // unlike SqlServerCatalog, this provider has no SQL engine to assemble a discovery query with, and
+    // nothing here is discovered anyway: the set is what the provider declares. `__all__` expands across
+    // discovered schemas (lazily — an empty set costs no schema enumeration, which on OneLake is I/O).
+    public IArrowArrayStream GetFunctions() => FunctionsMetadata.Stream(Functions.Declarations(SchemaNames));
+
+    // Provider-declared CATALOG-BOUND macros (schema, name, create_sql), bound by the host into this
+    // catalog's schemas as db.schema.m(...). Local declarations — nothing here touches storage, which is
+    // exactly why they ride their own discovery entry instead of a SQL discovery stream.
+    public IArrowArrayStream GetMacros() => CatalogMacroMetadata.Stream(ExpandCatalogMacroSchemas());
+
+    // DIAGNOSTIC capability rows (property, value) for fabricator_server_info() — since ABI v71 the HOST
+    // reads CapabilitiesJson instead (same _pushdownMode source, so the two cannot drift).
+    // `exact_filter_pushdown` = whether the host may set filter_pushdown=true on this catalog's scans —
+    // governed by the pushdown_filters mode: EXACT mode applies the erased TableFilterSet 1:1
+    // (read_parquet WHERE under native_read; HostBatchFilter per batch on the codec path); None/Static
+    // keep filter_pushdown=false so DuckDB re-applies everything.
+    public IArrowArrayStream GetServerInfo() => TwoColumn(
+        "property", new[] { "exact_filter_pushdown" },
+        "value", new[] { _pushdownMode == PushdownMode.Exact ? "true" : "false" });
+
+    /// <summary>Ambient-transaction resolution for a table BIND: GET-OR-CREATE (the <see cref="AmbientTxn"/>
+    /// semantics — the first read-path crossing is a legitimate creator, or an autocommit schema open would
+    /// never share its pin/open and the 195-of-291-seconds redundant-replay shape would return).</summary>
+    public ITransaction? ResolveTransaction(long txnId) => txnId != 0 ? _txns.GetOrCreate(txnId) : null;
 
     /// <summary>The commit history behind <c>cat.delta.snapshots('schema.table')</c>
     /// (version, timestamp, operation, operation_parameters).</summary>
@@ -5443,10 +5420,4 @@ public sealed class DeltaCatalog : IBackendCatalog
             new[] { new RecordBatch(schema, new[] { Build(c0), Build(c1), Build(c2) }, c0.Count) });
     }
 
-    private static IArrowArrayStream EmptyStringTable(params string[] columns)
-    {
-        var builder = new Schema.Builder();
-        foreach (var c in columns) { builder.Field(new Field(c, StringType.Default, nullable: true)); }
-        return new InMemoryArrayStream(builder.Build(), System.Array.Empty<RecordBatch>());
-    }
 }
