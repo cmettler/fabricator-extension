@@ -50,7 +50,7 @@ internal static class TableFileSystems
 
     /// <summary>
     /// <paramref name="outlivesThisCall"/>: the filesystem will be held by something cached across ABI calls
-    /// (<see cref="DeltaTxnScope"/>), so it must NOT capture the host opener.
+    /// (a shared open on a <see cref="DeltaBoundTable"/>), so it must NOT capture the host opener.
     /// </summary>
     /// <remarks>
     /// ⚠ The opener is a <c>ClientContext*</c> valid only for the call that handed it to us.

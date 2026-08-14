@@ -207,6 +207,16 @@ public interface IBackendCatalog : IDisposable
     /// </summary>
     string CapabilitiesJson => "{}";
 
+    /// <summary>
+    /// The definition of one table — identity + the <see cref="ITableDefinition.Bind"/> factory (slice 4c,
+    /// docs/catalog-table-abstraction.md §2.2/§2.3). Cheap and transient in the current transport (the
+    /// provider's own metadata/scan adapters create one per crossing); slice 4d's <c>table_open</c> gives it
+    /// the C++ entry's lifetime. Default-throwing so a provider still on the plain
+    /// <see cref="GetMetadata"/> arms (DAX / DeltaRs / Stub) needs no code until its conversion.
+    /// </summary>
+    ITableDefinition GetTable(string schemaName, string tableName) =>
+        throw new NotSupportedException("provider: table definitions not implemented for this provider yet");
+
     /// <summary>Execute a query and return its result as an Arrow stream.</summary>
     IArrowArrayStream ExecuteQuery(string sql);
 

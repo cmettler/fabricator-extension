@@ -1,4 +1,4 @@
-# The catalog/table abstraction — design for retiring `get_metadata` (slices 1a/1b/2/3 + 4a/4b BUILT; 4c–4d/5 open)
+# The catalog/table abstraction — design for retiring `get_metadata` (slices 1a/1b/2/3 + 4a/4b/4c BUILT; 4d/5 open)
 
 > Written 2026-08-14 after the user's review: *"I don't like the getmetadata functions … there should be no
 > provider-specific function defined in C++, all must live in the providers … an abstraction similar to
@@ -468,9 +468,77 @@ the same table the code evaluates.
        there is NO old-vs-new behavioural kill to gate; the gate that carries 4b is the pin-unification
        one above. **Lesson, same as slice 3's open_catalog deviation: a hazard write-up must name the
        GUARDS between the mechanism and the user before claiming a user-visible exposure.**
-     - **4c — `ITableDefinition`/`ITable.Bind(txn, at?)` in C#** — the §2.2/§2.3 object model, entry
-       materialization reads `Schema`/`Info` off the definition, `PendingAppends` dissolves into the
-       Delta bound table, SqlServer's bound table stays thin (borrows the transaction's connection).
+     - **4c — `ITableDefinition`/`ITable.Bind(txn, at?)` in C#. BUILT — 2026-08-14 (C#-only,
+       behaviour-preserving; both tiers identical).** The §2.2/§2.3 object model, with the letter
+       re-derived against the tree (the standing lesson) in three places:
+       - **No `TableInfo` bag — the info members are LAZY METHODS on `ITable`** (`RowIdColumns()`,
+         `VirtualColumns()`, `ApproximateRowCount()`, `ColumnNdv()`). The kinds are SEPARATE crossings in
+         the current transport, so an eagerly-computed Info object would MOVE cost between them (kind 3
+         paying for the stats queries), and the lazy alternative — a bag of `Func<>`s — is a worse spelling
+         of methods. 4d's `table_info` JSON composes from the calls when the host asks once.
+       - **Definitions are TRANSIENT and stateless in this transport** — one per metadata/scan crossing,
+         nothing cached on them (a definition cache would ADD staleness surface that does not exist today).
+         4d gives them the C++ entry's lifetime, which is when caching there becomes sound. The Delta
+         definition's `Bind(txn, null)` memoizes on the transaction — `DeltaTransaction.GetOrCreate` IS the
+         memoization; SqlServer's binds are always fresh (nothing worth memoizing — the interface permits,
+         not demands). An AT bind is always a fresh caller-owned instance.
+       - **Schema resolution is deliberately UN-MEMOIZED on the binding** (stated on the interface): it
+         consults the transaction's pending CREATE/ALTER shape first, then storage via the shared open —
+         memoizing would serve a same-transaction mutation a stale shape.
+       - **Delta as built**: `PendingAppends` MOVED verbatim out of `DeltaTxnBuffer` and became
+         `DeltaBoundTable : ITable`, absorbing the PIN (4b's delegating property collapsed into a plain
+         field — one store, no delegation) and the shared OPEN (a field + `TryGetOpen`/`PublishOpen`/
+         `DropOpen`). `DeltaTxnScope` is DELETED: the pin instant and the open-retention cap
+         (`MaxOpenTablesPerTxn` = 32, still decline-don't-evict) moved to `DeltaTransaction`, and
+         `RenamePin` died STRUCTURALLY — the pin rides the re-keyed object. `DeltaTxnBuffer` is now only
+         the static stream/disposal helpers. The reader threading retyped:
+         `DeltaTxnScope? scope` → `DeltaBoundTable? bound` on the five read entry points +
+         `DeltaNativeReader.Read`; a transient binding declines retention itself (`CanRetainOpen`) and
+         behaves exactly like null.
+       - **The per-transaction map now holds READ-ONLY bindings** (every read's `ReadBound(path)` creates
+         one where the old scope kept them in side maps) ⇒ the commit/rollback loops skip footprint-less
+         entries (`HasTxnFootprint` — deliberately GENEROUS, naming every pre-4c field incl. the
+         `Serializable`/`CdfEnabled` probe caches, so only entries the read cache alone created can skip;
+         keeps the rollback log line meaning "a table this transaction touched with WORK").
+       - **⚠ THE dbt TMP-SWAP CAUGHT THREE DEFECTS IN THE FIRST FULL GATE RUN
+         (`verify_delta_catalog_transactions` §38) — all three are consequences of unifying the read cache
+         into the buffer map, and none was visible to the compiler:**
+         1. The created-table RENAME re-key COLLIDES with the departed table's read-cache entry at the
+            target path (the swap READS the target name earlier in the same transaction — its entry
+            materialization binds it). Fix: `RenameTable` EVICTS a footprint-less target — its pin/open
+            describe the table just renamed AWAY from the path — and still refuses (buffer restored) when
+            the target has pending work.
+         2. The moved binding's own shared OPEN was opened over the OLD path's filesystem — carrying it to
+            the new key serves reads "No Delta table found". 4b never re-keyed the open map (the open was
+            silently orphaned there); `RenameTable` now drops it explicitly. The PIN stays: a version
+            number resolved against the log that now lives AT the new path.
+         3. `SetNames` was FIRST-WINS, so the post-swap scan of `m` ran as `m__dbt_tmp` — the ABI passed
+            the right name and the binding re-derived the wrong one, opening a folder the swap had renamed
+            away. Overwrite is consistent by construction (Bind derives the path FROM the names it sets).
+            **Found by instrumenting, not reasoning**: one Debug fablog showed `delta scan main.m__dbt_tmp`
+            for a query naming `m` — the third speculation-free diagnosis this migration owes to a log line.
+       - **SqlServer as built**: typed cores (`ColumnsSchemaCore`/`RowIdColumnsCore`/`RowCountCore`/
+         `ColumnNdvCore`) in a new `SqlServerTable.cs` partial; the definition/bound-table classes are
+         NESTED in the catalog because `SqlServerTransaction` is a private nested class. Kinds 2/3/4/5
+         re-encode the typed answers (`NameStream`/`RowCountStream`/`NdvStream`) — the substitution of a
+         live SQL stream by a rebuilt string table is exactly what `SchemasMetadata`/`FilteredTables`
+         already do, so both shapes were shipping before. The warehouse stats gating moved INSIDE the
+         typed cores: the never-issue-a-swallowable-statement rule now lives on the ANSWER (null/empty),
+         not on the transport arm. Kind 2 materializes the schema and releases the zero-row probe's
+         connection immediately (was: held until the host released the stream) — invisible from SQL.
+       - **`_rowTrackingByPath` dissolved into a per-(txn, table) `RowTracking` field on the binding.** The
+         catalog-wide cache was NEVER invalidated — a `delta.enableRowTracking` change made it silently
+         stale for the catalog's lifetime. Per-transaction re-resolution is normally free (kind 2 fills it
+         through the same binding kind 12 reads, and a fresh transaction's resolve rides the shared open).
+       - The kind-2 ABSENCE contract (§3 item 2) moved onto the typed members unchanged: Delta's
+         `DeltaBoundTable.Schema` establishes no-commit-in-log, SqlServer's `ColumnsSchemaCore` classifies
+         error 208 — both still `ObjectNotFoundException`.
+       - DAX/DeltaRs deliberately untouched: `IBackendCatalog.GetTable` is a throwing DIM until their
+         conversion (they stay on plain `GetMetadata` arms, which 4c does not change for them).
+       - Gates: `verify_delta_catalog_transactions` 1040 (the suite that caught all three swap defects),
+         pin 75 / rename 27 / txn_version 65 / row_level_concurrency 93 / time_travel 98 / alter 116 /
+         row_tracking_virtual 299 / column_mapping 251 all identical; hermetic + service tiers identical
+         to baseline (the behaviour-preservation claim).
      - **4d — the `table_*` ABI session** (§2.4) + DELETE `get_metadata` + kinds 0-7/12/15 — the one
        C++-touching bump, last, when the C# objects it transports already exist and are gated.
 5. Sweep: delete `ReadStringTable`'s multi-column string protocol where nothing uses it any more.

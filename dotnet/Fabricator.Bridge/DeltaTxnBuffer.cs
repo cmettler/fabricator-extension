@@ -13,16 +13,17 @@ namespace Fabricator.Bridge;
 
 /// <summary>
 /// Per-DuckDB-transaction APPEND buffering for the Delta provider — the explicit-transaction support.
-/// Plain appends (INSERT / COPY append) buffer here instead of committing per statement; the catalog's
+/// Plain appends (INSERT / COPY append) buffer instead of committing per statement; the catalog's
 /// <c>CommitTransaction</c> flushes each table's buffer as ONE atomic Delta commit and
 /// <c>RollbackTransaction</c> discards it (uncommitted data files are invisible orphans — vacuum's job,
 /// exactly Spark's shape). DuckDB wraps EVERY statement in a transaction, so in autocommit the flush fires
 /// at statement end and behavior is identical to per-statement commits; only explicit
 /// <c>BEGIN … COMMIT/ROLLBACK</c> changes semantics (atomic multi-INSERT, rollback undoes).
 ///
-/// <para>Since slice 4b (docs/catalog-table-abstraction.md §5) this class is the per-table buffer SHAPE
-/// (<see cref="PendingAppends"/>) plus its static stream helpers; the per-transaction BOOKKEEPING it used
-/// to carry — the (txnId → tables) outer map and the separate explicit-mark set — lives on
+/// <para>Since slice 4c (docs/catalog-table-abstraction.md §5) this class is only the STATIC STREAM/DISPOSAL
+/// HELPERS: the per-table buffer shape it used to declare (<c>PendingAppends</c>) is
+/// <see cref="DeltaBoundTable"/> — the table-bound-to-a-transaction object, which also absorbed the snapshot
+/// pin and the open-table reuse — and the per-transaction bookkeeping lives on
 /// <see cref="DeltaTransaction"/>, one object per transaction in the catalog's
 /// <see cref="TransactionManager{T}"/>.</para>
 ///
@@ -40,152 +41,6 @@ namespace Fabricator.Bridge;
 /// </summary>
 internal static class DeltaTxnBuffer
 {
-    internal sealed class PendingAppends
-    {
-        /// <summary>The owning transaction and this buffer's table path — what lets
-        /// <see cref="PinnedVersion"/> delegate to the ONE pin store. <c>Path</c> is mutable for the
-        /// created-table RENAME re-key (<see cref="DeltaTransaction.RenameTable"/>).</summary>
-        internal PendingAppends(DeltaTransaction owner, string path)
-        {
-            Owner = owner;
-            Path = path;
-        }
-
-        internal DeltaTransaction Owner { get; }
-        internal string Path { get; set; }
-
-        public Schema? BatchSchema;
-        public List<RecordBatch> Batches { get; } = new();
-        public List<WrittenDataFile> Files { get; } = new();
-        public long Rows;
-
-        // ---- Buffered DML (slice 2, explicit transactions only) ----
-        // Deleted ABSOLUTE row positions per PINNED-snapshot file ordinal (transient-rowid encoding). A
-        // buffered UPDATE contributes its old rows here + its post-image rows to Batches. Flushed as
-        // deletion-vector remove/add actions fused into the ONE commit; validity is tied to PinnedVersion
-        // (the flush conflict-aborts if the table moved).
-        public Dictionary<int, HashSet<long>> DeletedByOrdinal { get; } = new();
-
-        /// <summary>
-        /// The transaction's snapshot pin for THIS table — a delegating view over the transaction scope's
-        /// ONE pin store (slice 4b's pin unification). This used to be a FIELD, i.e. a SECOND store that
-        /// shadowed the scope's pins on every path a sequential suite reaches — which is exactly why slice
-        /// 1b's InvalidateTables-keeps-pins mutant SURVIVED. Every reader and every <c>??=</c> seed now
-        /// goes through the scope, so the pin has one owner and the releases' asymmetry is gated
-        /// (verify_delta_autocommit_pin §12).
-        /// <para>The setter is FIRST-WINS (<see cref="DeltaTxnScope.SetPinIfAbsent"/>), matching both the
-        /// old field's exclusively-<c>??=</c> call sites and PinVersion's GetOrAdd — a pin, once taken,
-        /// is never moved within a transaction.</para>
-        /// </summary>
-        public long? PinnedVersion
-        {
-            get => Owner.Scope.TryGetPinned(Path);
-            set
-            {
-                if (value is { } v)
-                {
-                    Owner.Scope.SetPinIfAbsent(Path, v);
-                }
-            }
-        }
-        // The table's effective isolation (delta.isolationLevel): true = Serializable, false = WriteSerializable
-        // (our catalog default when the property is absent — NOT "the Spark default", which is measured to be
-        // Serializable; see DeltaCatalog._serializable). Read once per (txn, table) and cached — the OCC
-        // conflict check + row-level relaxation at flush honor the TABLE's property, not a catalog-wide flag.
-        public bool? Serializable;
-        public bool HasAppend;
-        public bool HasDelete;
-        public bool HasUpdate;
-
-        // ---- Buffered ALTER ADD COLUMN (slice 3, explicit transactions only) ----
-        // The pending schema change: the metaData (+ merged protocol-upgrade) action fuses into the ONE
-        // commit at flush; reads/binds mid-transaction overlay PendingArrowSchema (missing columns
-        // backfilled as typed NULLs); writes run schema-overridden with PendingDeltaSchema (whose added
-        // columns already carry their column-mapping ids/physical names). Chained adds compose (each
-        // computes against the previous pending metadata).
-        public EngineeredWood.DeltaLake.Actions.MetadataAction? PendingMetadata;
-        public EngineeredWood.DeltaLake.Actions.ProtocolAction? PendingProtocol;
-        public EngineeredWood.DeltaLake.Schema.StructType? PendingDeltaSchema;
-        public Schema? PendingArrowSchema;
-        public bool HasAlter;
-        // RENAME overlay map: pending (new) TOP-LEVEL name -> the COMMITTED name the data is stored under
-        // (composed across chained renames; a renamed pending-ADDed column has no entry — its committed
-        // read is a NULL backfill either way). AlterOps tracks the buffered kinds for commitInfo.operation.
-        public Dictionary<string, string> RenameMap { get; } = new(StringComparer.Ordinal);
-        public HashSet<string> AlterOps { get; } = new(StringComparer.Ordinal);
-
-        // ---- CREATE TABLE / CTAS inside an explicit transaction (hoist slice 5) ----
-        // ⚠ THIS FLAG CHANGED MEANING. It was `PendingCreate` — "the create has not happened yet", the
-        // table existing ONLY in this buffer until the flush created it. The create is now IMMEDIATE (the
-        // same path an autocommit CREATE takes), so what the buffer needs to remember is the opposite fact:
-        // that THIS transaction is the one that created the table, which is the only thing entitling
-        // ROLLBACK to drop it. Everything else the deferred create carried (the parked schema, partition and
-        // sort columns, WITH options, the pre-assigned column-mapping schema) went with it — the table
-        // itself now holds all of that.
-        //
-        // The trade, accepted deliberately (docs/delta-transaction-hoist.md §3): v0 is visible to other
-        // sessions for the transaction's life, and a ROLLBACK whose drop fails leaves an empty table behind.
-        // What it buys: DELETE/UPDATE on a table created in the same transaction (both used to throw
-        // NotSupportedException), the streaming native write for such a table, and the CDF probe.
-        public bool CreatedInTxn;
-
-        // ---- CDF capture (CDF tables in explicit transactions) ----
-        // _change_data files are written at STATEMENT time (the rows are in hand: appended batches,
-        // read-back deleted rows, update pre/post images) and — since hoist slice 1b+2 — their actions are
-        // staged straight into HeldTxn rather than parked here. Because a commit carrying ANY cdc action is
-        // read cdc-ONLY by the CDF reader (inference disabled), EVERY buffered statement on a CDF table
-        // writes its cdc counterpart, inserts included. CdfEnabled caches the per-(txn, table) probe.
-        public bool? CdfEnabled;
-
-        // ---- Eager identity appends (chained high-water marks) ----
-        // Identity values are GENERATED at statement time from the pinned snapshot's HWM (chained here
-        // across the transaction's statements) and baked into the eagerly-written files; the flush
-        // commits the final marks as the fused commit's metaData. A concurrent identity-consuming
-        // commit necessarily carries its own metaData action -> the rebase metadata check aborts us
-        // (Spark's concurrent-identity policy), so baked values never land on a moved HWM.
-        public Dictionary<string, long> PendingIdentityHwm { get; } = new(StringComparer.Ordinal);
-
-        // ---- APPLICATION TRANSACTION versions (Delta `txn` action — idempotent appends) ----
-        // appId -> (version to commit, expected previous version — null = "must not exist yet").
-        // Parked by delta.set_transaction_version; the flush validates the CAS against the LATEST
-        // snapshot and emits one `txn` action per app in the SAME fused commit.
-        public Dictionary<string, (long Version, long? Expected)> AppTxnVersions { get; } =
-            new(System.StringComparer.Ordinal);
-
-        // ---- The EW transaction machinery, OWNED BY THIS ENTRY rather than by the flush's scope ----
-        // (hoist slice 1a — docs/delta-transaction-hoist.md). The flush used to open the table and
-        // `await using` the transaction inside one method, so both died with the call. Parking them here
-        // moves their LIFETIME to the (DuckDB txn, table) pair, which is the prerequisite for staging at
-        // statement time instead of at COMMIT.
-        //
-        // ⚠ Holding a DeltaTable across ABI calls is only safe because of 142b350: the host-FS opener is a
-        // ClientContext* valid for ONE call, and DuckDbTableFileSystem now reads AmbientOpener.Current
-        // first rather than the value captured at construction. That fix's own comment predicted this
-        // ("becomes load-bearing the moment something is cached"). All three ITableFileSystem
-        // implementations were checked; see the doc's feasibility table.
-        //
-        // ⚠ DISPOSE txn BEFORE table — the transaction's cleanup needs the table's filesystem. The flush
-        // expressed that by declaring the `await using` inside the try; here it is DisposeHeld's ordering.
-        public EngineeredWood.DeltaLake.Table.DeltaTable? HeldTable;
-        public EngineeredWood.DeltaLake.Table.DeltaTransaction? HeldTxn;
-
-        // CreatedInTxn counts as "something pending" for the same reason PendingCreate did, but for a
-        // DIFFERENT effect: not "there is a create to perform" but "there is a table this transaction owns",
-        // which ROLLBACK must reach in order to drop it. Drop it from this list and a CREATE-only
-        // transaction's rollback would find no entry and silently leave the table behind.
-        public bool HasAny => Rows > 0 || DeletedByOrdinal.Count > 0 || PendingMetadata is not null
-                              || CreatedInTxn || AppTxnVersions.Count > 0;
-
-        // ---- READ SET (Spark ConflictChecker parity, for the logical rebase at COMMIT) ----
-        // The PUSHED predicate of every in-transaction scan of this table — a superset of the rows the
-        // scan actually consumed (DuckDB applies any unpushed residue above the scan, but the source only
-        // returned rows matching the pushed part) — or ReadWholeTable when a scan had no pushable filter.
-        // Deliberately NOT part of HasAny: a read-only entry must not trip pending-changes guards, and
-        // Get() must keep returning null for it (no overlay). Only recorded in EXPLICIT transactions.
-        public List<EngineeredWood.Expressions.Predicate> ReadPredicates { get; } = new();
-        public bool ReadWholeTable;
-        public bool HasReads => ReadWholeTable || ReadPredicates.Count > 0;
-    }
 
     private static readonly Microsoft.Extensions.Logging.ILogger Log =
         FabricatorLog.CreateLogger("Fabricator.Delta");
@@ -208,7 +63,7 @@ internal static class DeltaTxnBuffer
     /// <para>Never throws: it runs from finally blocks that may already be carrying the user's real error;
     /// a cleanup failure must not replace it.</para>
     /// </summary>
-    public static void DisposeHeld(PendingAppends pending)
+    public static void DisposeHeld(DeltaBoundTable pending)
     {
         var txn = pending.HeldTxn;
         var table = pending.HeldTable;
@@ -234,7 +89,7 @@ internal static class DeltaTxnBuffer
     }
 
     /// <summary>Disposes buffered batches (rollback / after flush).</summary>
-    public static void DisposeBatches(PendingAppends pending)
+    public static void DisposeBatches(DeltaBoundTable pending)
     {
         foreach (var b in pending.Batches)
         {
@@ -250,7 +105,7 @@ internal static class DeltaTxnBuffer
     /// ids only need scan-local uniqueness).
     /// </summary>
     public static async IAsyncEnumerable<RecordBatch> ProjectPending(
-        PendingAppends pending, Schema target, string rowIdColumn, long rowIdOrdinalBase,
+        DeltaBoundTable pending, Schema target, string rowIdColumn, long rowIdOrdinalBase,
         [EnumeratorCancellation] CancellationToken ct = default)
     {
         long position = 0;

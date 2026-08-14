@@ -2312,21 +2312,27 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         MetadataKind.Tables => _schemaFilter is null && _tableFilter is null
                                    ? ExecuteMetadataQuery(TablesSql)
                                    : FilteredTables(),
+        // The per-TABLE kinds route through the OBJECT MODEL since slice 4c: the ambient-bound ITable
+        // (SqlServerTable.cs) resolves the typed answer and these arms re-encode it into the streams the
+        // current transport carries — slice 4d's table_* session retires the re-encoding. The stream shapes
+        // are rebuilt exactly the way SchemasMetadata/FilteredTables already rebuild theirs.
         // Zero-row result whose Arrow schema describes the table's columns; the
         // C++ host reads that schema to learn the DuckDB column types.
-        MetadataKind.Columns => ColumnsMetadata(Require(schema, table).schema, Require(schema, table).table),
-        MetadataKind.RowId => RowIdMetadata(Require(schema, table).schema, Require(schema, table).table),
-        // Both statistics reads are SKIPPED on a warehouse engine, for the same reason as the external-table
-        // probe above: Fabric/Synapse do not support sys.dm_db_partition_stats or sys.dm_db_stats_histogram
-        // ("DMV ... is not supported"), and on Fabric a failed statement ABORTS AN OPEN TRANSACTION — so an
-        // optional, best-effort statistics query was able to poison a user's transaction. Statistics are
-        // costing-only (never pruning), so returning "unknown" costs an optimizer hint and nothing else.
-        MetadataKind.RowCount => Profile.IsWarehouse
-            ? EmptyStringTable("n")
-            : ExecuteMetadataQuery(RowCountSql(Require(schema, table).schema, Require(schema, table).table)),
-        MetadataKind.ColumnNdv => Profile.IsWarehouse
-            ? EmptyStringTable("column_name", "ndv")
-            : ExecuteMetadataQuery(ColumnNdvSql(Require(schema, table).schema, Require(schema, table).table)),
+        MetadataKind.Columns => new InMemoryArrayStream(
+            BindAmbient(Require(schema, table).schema, Require(schema, table).table).Schema,
+            System.Array.Empty<RecordBatch>()),
+        MetadataKind.RowId => NameStream(
+            BindAmbient(Require(schema, table).schema, Require(schema, table).table).RowIdColumns()),
+        // Both statistics members answer null/empty on a warehouse engine (inside the typed cores), for the
+        // same reason as the external-table probe above: Fabric/Synapse do not support
+        // sys.dm_db_partition_stats or sys.dm_db_stats_histogram ("DMV ... is not supported"), and on Fabric
+        // a failed statement ABORTS AN OPEN TRANSACTION — so an optional, best-effort statistics query was
+        // able to poison a user's transaction. Statistics are costing-only (never pruning), so returning
+        // "unknown" costs an optimizer hint and nothing else.
+        MetadataKind.RowCount => RowCountStream(
+            BindAmbient(Require(schema, table).schema, Require(schema, table).table).ApproximateRowCount()),
+        MetadataKind.ColumnNdv => NdvStream(
+            BindAmbient(Require(schema, table).schema, Require(schema, table).table).ColumnNdv()),
         MetadataKind.Functions => _functionFilter is null
             ? ExecuteMetadataQuery(FunctionsMetadataSql())
             : FilteredFunctions(),
@@ -2344,53 +2350,59 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         _ => throw new ArgumentOutOfRangeException(nameof(kind), kind, "fabricator: unknown metadata kind"),
     };
 
-    /// <summary>
-    /// The table's columns, as a zero-row stream whose Arrow schema is the answer — and, when the object is
-    /// gone, an <see cref="ObjectNotFoundException"/> rather than the raw provider error.
-    ///
-    /// <para>The host turns ABSENCE into "this table no longer exists": it drops the catalog entry and the
-    /// name, so <c>CREATE TABLE IF NOT EXISTS</c> / <c>OR REPLACE</c> behave correctly after a DROP issued
-    /// out of band (via <c>fabricator_exec</c>, or by another session). It used to infer that from ANY
-    /// failure here, which meant an unreadable table was erased just as readily as a deleted one; now the
-    /// provider has to say so, and this is where SQL Server says it.</para>
-    ///
-    /// <para>Established from the ERROR NUMBER, not the message: <b>208</b> is SQL Server's "Invalid object
-    /// name". Note it also covers an object the principal may not SEE — SQL Server reports 208 rather than a
-    /// permission error, deliberately, so as not to leak existence. Treating that as absence is exactly what
-    /// this path did before, so the semantics are unchanged; every OTHER error number now keeps its own
-    /// message instead of being reported as a missing table.</para>
-    /// </summary>
-    private IArrowArrayStream ColumnsMetadata(string schemaName, string tableName)
-    {
-        try
-        {
-            return ExecuteMetadataQuery(
-                $"SELECT * FROM {Quote(schemaName)}.{Quote(tableName)} WHERE 1 = 0");
-        }
-        catch (Microsoft.Data.SqlClient.SqlException ex) when (ex.Number == InvalidObjectNameError)
-        {
-            throw new ObjectNotFoundException("table", $"{schemaName}.{tableName}", ex);
-        }
-    }
+    // ── re-encoders: the bound table's TYPED answers back into the transport's string streams ────────────
+    // (Slice 4c. The typed members — SqlServerTable.cs — are primary; the ABSENCE contract lives on
+    // ColumnsSchemaCore there: the host turns ObjectNotFoundException into "this table no longer exists"
+    // — dropping the entry AND the name, so IF NOT EXISTS / OR REPLACE behave after an out-of-band DROP —
+    // and SQL Server establishes absence from ERROR NUMBER 208 alone ("Invalid object name", which also
+    // covers an object this principal may not SEE — reported identically by the server on purpose). Every
+    // other error keeps its own message instead of being read as a missing table.)
 
     /// <summary>SQL Server error 208, "Invalid object name" — the server's own statement that the object is
     /// not there (or not visible to this principal, which it reports identically on purpose).</summary>
-    private const int InvalidObjectNameError = 208;
+    internal const int InvalidObjectNameError = 208;
 
-    // slice D: a detected external DELTA table with a Delta IDENTITY column advertises THAT column as its
-    // rowid (an external table has no PK/UNIQUE/IDENTITY SQL-side, so RowIdSql finds nothing) — the scan
-    // reads it as a normal column through PolyBase, and ExecuteDelete/ExecuteUpdate resolve the values back
-    // to transient rowids on the Delta side. Everything else keeps the standard PK/unique/identity discovery.
-    private IArrowArrayStream RowIdMetadata(string schemaName, string tableName)
+    private static IArrowArrayStream NameStream(IReadOnlyList<string> names)
     {
-        if (DetectExternalTable(schemaName, tableName) is { IdentityColumn: { } idCol })
+        var s = new Schema(new[] { new Field("name", StringType.Default, nullable: false) }, metadata: null);
+        var b = new StringArray.Builder();
+        foreach (var n in names)
         {
-            var s = new Schema(new[] { new Field("name", StringType.Default, nullable: false) }, metadata: null);
-            var names = new StringArray.Builder();
-            names.Append(idCol);
-            return new InMemoryArrayStream(s, new[] { new RecordBatch(s, new IArrowArray[] { names.Build() }, 1) });
+            b.Append(n);
         }
-        return ExecuteMetadataQuery(RowIdSql(schemaName, tableName, Profile));
+        return new InMemoryArrayStream(s, new[] { new RecordBatch(s, new IArrowArray[] { b.Build() }, names.Count) });
+    }
+
+    // One "n" cell, digits as text (the shape the old live RowCountSql stream carried); null = the
+    // provider surfaces none = the zero-row form the warehouse arm always answered.
+    private static IArrowArrayStream RowCountStream(long? rowCount)
+    {
+        if (rowCount is not { } n)
+        {
+            return EmptyStringTable("n");
+        }
+        var s = new Schema(new[] { new Field("n", StringType.Default, nullable: true) }, metadata: null);
+        var b = new StringArray.Builder();
+        b.Append(n.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        return new InMemoryArrayStream(s, new[] { new RecordBatch(s, new IArrowArray[] { b.Build() }, 1) });
+    }
+
+    private static IArrowArrayStream NdvStream(IReadOnlyList<NdvEntry> entries)
+    {
+        var s = new Schema(new[]
+        {
+            new Field("column_name", StringType.Default, nullable: true),
+            new Field("ndv", StringType.Default, nullable: true),
+        }, metadata: null);
+        var cols = new StringArray.Builder();
+        var ndvs = new StringArray.Builder();
+        foreach (var e in entries)
+        {
+            cols.Append(e.ColumnName);
+            ndvs.Append(e.Ndv.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        }
+        return new InMemoryArrayStream(
+            s, new[] { new RecordBatch(s, new IArrowArray[] { cols.Build(), ndvs.Build() }, entries.Count) });
     }
 
     private static IArrowArrayStream EmptyStringTable(params string[] columns)
@@ -2713,8 +2725,16 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
                "WHERE p.object_id = OBJECT_ID(" + objectLiteral + ") AND p.index_id IN (0, 1)";
     }
 
+    // Slice 4c: ScanTable is the transport ADAPTER onto the object model — the scan is ITable.Scan on the
+    // ambient-bound (thin) table, which delegates back to ScanTableCore. The connection ROUTING stays
+    // ambient inside ScanFromSource (pinned/pooled/drained/snapshot — SqlServerScanRoute's business);
+    // slice 4d aligns it with the binding's transaction when the ABI carries table handles.
     public IArrowArrayStream ScanTable(string schemaName, string tableName, string? specJson,
-                                       IArrowArrayStream? filterValues)
+                                       IArrowArrayStream? filterValues) =>
+        BindAmbient(schemaName, tableName).Scan(specJson, filterValues);
+
+    internal IArrowArrayStream ScanTableCore(string schemaName, string tableName, string? specJson,
+                                             IArrowArrayStream? filterValues)
     {
         var qualified = $"{Quote(schemaName)}.{Quote(tableName)}";
         return ScanFromSource(qualified, System.Array.Empty<SqlParameter>(), specJson, filterValues,

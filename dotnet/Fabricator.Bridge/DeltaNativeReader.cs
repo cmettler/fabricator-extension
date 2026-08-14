@@ -75,16 +75,16 @@ internal static class DeltaNativeReader
 
     /// <summary>Builds the Arrow stream for a native Delta scan. <paramref name="unit"/>/<paramref name="value"/>
     /// = the resolved time-travel/pinned snapshot ("version"/"timestamp"), or null for latest.
-    /// <paramref name="scope"/> = the transaction's read scope for the listing's table open (threaded by the
-    /// catalog — this class is static and cannot reach the per-catalog manager; a global-function caller
-    /// passes none and the listing open is owned + disposed, the pre-cache behaviour).</summary>
+    /// <paramref name="bound"/> = the transaction's bound table for the listing's table open reuse (threaded
+    /// by the catalog — this class is static and cannot reach the per-catalog manager; a global-function
+    /// caller passes none and the listing open is owned + disposed, the pre-cache behaviour).</summary>
     public static IArrowArrayStream Read(
         nint opener, string path, Schema userSchema, ScanSpec? spec,
         IReadOnlyList<object?> filterValues, string? unit, string? value,
         IReadOnlyList<EngineeredWood.DeltaLake.Table.WrittenDataFile>? pendingFiles = null,
         IReadOnlyDictionary<int, HashSet<long>>? pendingDeletes = null,
         EngineeredWood.DeltaLake.Schema.StructType? pendingSchema = null,
-        DeltaTxnScope? scope = null)
+        DeltaBoundTable? bound = null)
     {
         bool wantRowId = spec?.Columns is { } c0 && c0.Contains(RowIdColumn);
         var dataCols = spec?.Columns is { Count: > 0 } cols
@@ -135,7 +135,7 @@ internal static class DeltaNativeReader
             : spec?.Filter is { } node2 ? DeltaSqlFilter.ToWhere(node2, filterValues) : null;
 
         var listing = DeltaReader.ListNativeScanFiles(opener, path, unit, value, prune, Log,
-                                                      schemaOverride: pendingSchema, scope: scope);
+                                                      schemaOverride: pendingSchema, bound: bound);
         if (pendingFiles is { Count: > 0 })
         {
             // Read-your-writes: this transaction's streamed-but-uncommitted files join the per-file loop
