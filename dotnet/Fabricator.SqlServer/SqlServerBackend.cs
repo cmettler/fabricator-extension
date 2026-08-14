@@ -1705,133 +1705,37 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     public IArrowArrayStream ExecuteQuery(string sql, IReadOnlyList<SqlParameter>? parameters, bool readYourWrites,
                                           bool materialize, bool snapshotRead)
     {
-        // Inside a transaction that has a pinned connection (a write has happened), read on that connection
-        // so the query sees uncommitted changes (read-your-writes). Borrowed: the stream must not dispose the
-        // connection. For a data SCAN this is gated on MARS — an open scan reader and the transaction's DML
-        // can only coexist on one connection under MARS, so with MARS off (Fabric/Synapse, or mssql_mars=false)
-        // scans take a fresh pooled connection (documented warehouse trade-off — docs/transactions.md §5.1).
-        // A METADATA read (readYourWrites) is exempt from the MARS gate: it fully drains immediately (no held
-        // reader), and on MARS-off the pinned connection never carries a concurrent scan reader, so reusing it
-        // is safe — and REQUIRED so a just-created table's metadata is visible (else the self-healing cache
-        // would evict the table the CREATE just made; see FabricatorSchemaEntry::CreateTable).
-        SqlConnection? pinned = null;
-        SqlTransaction? pinnedTransaction = null;
+        // ALL routing lives in RouteScan (SqlServerScanRoute.cs) — the rules, their measured whys, and the
+        // refusals. This method is the EXECUTION of whatever route came back. Borrowed pin: the stream must
+        // not dispose the transaction's connection.
         long txnId = AmbientTransaction.Current;
-        // OPT-IN (mssql_read_isolation): CREATE the pin for a read, so a transaction that has not written
-        // still has a server-side transaction for the level to apply to. Without this the block below finds no
-        // state at all and the read goes pooled — which is why the level alone was never enough.
-        //
-        // ⚠ NOT for a snapshotRead scan: that is mssql_materialize=false explicitly asking for a POOLED read
-        // outside the transaction, the opposite request. Refused rather than silently resolved (below).
-        // ⚠ NOT in autocommit (txnId == 0): there is no transaction to be stable across.
-        //
-        // ⚠ AND ONLY WHEN THE FALSE WAS ASKED FOR — `MaterializeExplicitlyFalse`, not `!ResolveMaterialize()`.
-        // Since `mssql_materialize` began DEFAULTING to MARS (2026-08-10), a no-MARS engine resolves it to
-        // false with nobody having requested anything, so testing the RESOLVED value made this refusal fire
-        // for every user who set `mssql_read_isolation` alone — a hard error on Fabric/Synapse, where the
-        // default is always false. MEASURED on box with `mssql_mars='false'`: 3 of 3 runs refused. The whole
-        // premise of the message below is that BOTH are active requests; a default is not a request.
-        if (snapshotRead && txnId != 0 && MaterializeExplicitlyFalse() &&
-            !string.IsNullOrEmpty(ResolveReadIsolation()))
-        {
-            // Both are ACTIVE requests and they contradict: one asks for every read to be inside the
-            // transaction, the other for this particular read to be outside it on a pooled connection. Honouring
-            // either silently would give the statement a view the user did not ask for, so refuse and let them
-            // pick. (mssql_materialize=false only ever marks a same-catalog read+write scan, so this cannot
-            // fire on an ordinary SELECT.)
-            throw new InvalidOperationException(
-                "fabricator: mssql_materialize=false and mssql_read_isolation contradict each other. The first " +
-                "keeps a scan of the table being written STREAMING on a POOLED connection outside this " +
-                "transaction; the second puts every read INSIDE it so they share one view. This scan cannot do " +
-                "both. Either unset mssql_read_isolation, or leave mssql_materialize at its default (true), " +
-                "which buffers that scan onto the transaction's own connection.");
-        }
-        // Non-null only on the no-MARS read_isolation path: serializes execute+drain on the shared pinned
-        // connection (see below). Never taken on the default path, so ordinary routing is unaffected.
-        object? execGate = null;
-        bool optedMars = false; // the read_isolation pin's own connection mode; only read under readIsolationPin
-        bool readIsolationPin = txnId != 0 && !snapshotRead && !string.IsNullOrEmpty(ResolveReadIsolation());
-        if (readIsolationPin)
-        {
-            var opted = EnsureTxnConnection(txnId);
-            lock (opted)
-            {
-                // ⚠ SET DIRECTLY rather than left to the gate below, and that is not style. Routing it
-                // through `materialize` would couple this to a condition three lines away: if that gate ever
-                // stopped admitting the read, the scan would go POOLED while EnsureScanCannotSelfBlock had
-                // already exempted it — and a pooled read against this transaction's own uncommitted writes
-                // with MARS off is the UNBOUNDED HANG of limitation 1.15, not an error. Exempting a check
-                // must be paid for by guaranteeing the condition it checked for.
-                pinned = opted.Connection;
-                pinnedTransaction = opted.Transaction;
-                optedMars = opted.MarsEnabled; // this connection's own mode, read with the fields it describes
-            }
-            if (!optedMars)
-            {
-                // With MARS off the pinned connection admits ONE reader at a time, so BOTH halves are needed
-                // and draining alone is NOT enough — measured: two scalar subqueries over one table start in
-                // the same millisecond on two threads, so the second ExecuteReader lands while the first is
-                // still draining ("The connection does not support MultipleActiveResultSets"). The drain
-                // bounds how long a reader is open; the gate stops two from being open at once.
-                //
-                // This is the cost the opt-in trades streaming for on a no-MARS engine (Fabric/Synapse):
-                // transaction-scoped consistency and streaming multi-ref reads are mutually exclusive there,
-                // and it picks consistency.
-                materialize = true;
-                execGate = opted.ExecGate;
-            }
-        }
-        if (!readIsolationPin && txnId != 0 && _txns.TryGetValue(txnId, out var state))
-        {
-            lock (state)
-            {
-                // `materialize` joins the MARS/metadata exemptions for the same reason they qualify: the
-                // reader is drained before this call returns, so the pinned connection never carries a
-                // concurrent scan reader. That is what restores READ-YOUR-WRITES on a no-MARS engine
-                // (Fabric/Synapse), where an ordinary scan is routed to a pooled connection and therefore
-                // sees only committed state.
-                // ⚠ state.MarsEnabled, NOT a freshly resolved value: this decides whether the scan may reuse
-                // THIS pinned connection, and only the mode it was opened with answers that.
-                //
-                // ⚠ DEFENSIVE, NOT GATED — say so rather than implying a test covers it. Re-resolving here
-                // is a mutant that SURVIVES the suite, and necessarily: a transaction belongs to ONE DuckDB
-                // connection, so the two answers can differ only if that session changes `mssql_mars`
-                // BETWEEN pinning the connection and this scan. That is meaningless as a request, and the
-                // failure it would cause (a scan sent to a no-MARS pinned connection) is limitation 1.15's
-                // unbounded HANG — so a gate for it would be a test that hangs rather than fails, which is
-                // worse than none.
-                if (state.Connection is not null && !snapshotRead &&
-                    (state.MarsEnabled || readYourWrites || materialize))
-                {
-                    pinned = state.Connection;
-                    pinnedTransaction = state.Transaction;
-                }
-            }
-        }
+        var route = RouteScan(readYourWrites, materialize, snapshotRead, txnId);
         if (Log.IsEnabled(LogLevel.Debug))
         {
-            Log.LogDebug("query [{Conn}{RYW} txn={Txn} params={P}]: {Sql}",
-                pinned is not null ? "pinned" : "pooled", readYourWrites ? " ryw" : "", txnId,
-                parameters?.Count ?? 0, Trunc(sql));
+            Log.LogDebug("query [{Conn}{RYW} txn={Txn} params={P} route={Route}]: {Sql}",
+                route.Pinned is not null ? "pinned" : "pooled", readYourWrites ? " ryw" : "", txnId,
+                parameters?.Count ?? 0, route.Reason, Trunc(sql));
         }
         // A DATA scan can run long (slow ExecuteReader, big row set) — wire a query-interrupt scope so Ctrl+C /
         // timeout cancels the async SqlClient calls. A METADATA read (readYourWrites) is short + happens at
         // bind/catalog time (no live scan context to poll), so it stays uncancelled. See docs/cancellation.md.
         var interrupt = readYourWrites ? null : new InterruptScope(AmbientOpener.Current);
         var token = interrupt?.Token ?? default;
-        if (pinned is not null)
+        if (route.Pinned is not null)
         {
-            // execGate is non-null only on the no-MARS read_isolation path, where `materialize` is forced
-            // true — so the gate is released with the reader already drained and closed, never held across a
-            // stream the caller is still pulling from.
-            if (execGate is not null)
+            // The gate is non-null only on the no-MARS read_isolation route, where Drain is forced true — so
+            // it is released with the reader already drained and closed, never held across a stream the
+            // caller is still pulling from.
+            if (route.ExecGate is not null)
             {
-                lock (execGate)
+                lock (route.ExecGate)
                 {
-                    return RunPinned(pinned, pinnedTransaction, sql, parameters, materialize, interrupt, token);
+                    return RunPinned(route.Pinned, route.PinnedTransaction, sql, parameters, route.Drain,
+                                     interrupt, token);
                 }
             }
-            return RunPinned(pinned, pinnedTransaction, sql, parameters, materialize, interrupt, token);
+            return RunPinned(route.Pinned, route.PinnedTransaction, sql, parameters, route.Drain, interrupt,
+                             token);
         }
 
         SqlConnection? connection = null;
@@ -1840,7 +1744,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         {
             connection = OpenConnection();
             connection.OpenAsync(token).GetAwaiter().GetResult();
-            if (snapshotRead)
+            if (route.Snapshot)
             {
                 // PRECONDITION FIRST, and deliberately not a try/catch around the read. SET TRANSACTION
                 // ISOLATION LEVEL SNAPSHOT SUCCEEDS on a database that disallows it — SQL Server only raises
@@ -1867,7 +1771,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
             var reader = command.ExecuteReaderAsync(token).GetAwaiter().GetResult();
             IArrowArrayStream pooledStream =
                 new DbDataReaderArrowStream(connection, command, reader, interrupt: interrupt);
-            return materialize ? DrainToMemory(pooledStream) : pooledStream;
+            return route.Drain ? DrainToMemory(pooledStream) : pooledStream;
         }
         catch
         {

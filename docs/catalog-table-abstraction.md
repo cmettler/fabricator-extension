@@ -306,6 +306,18 @@ the same table the code evaluates.
    of one type instead of three dictionaries. Delta's half retires `SnapshotPinning` + `DeltaTableCache`
    into the bound-table objects. De-risks everything after (every later slice touches scan paths; better to
    touch them once they are legible). Gates: the existing routing/transaction suites, unchanged counts.
+   - **1a (the router) is BUILT — 2026-08-14.** `SqlServerScanRoute.cs` (a partial half of
+     `SqlServerCatalog` — ⚠ note `SqlServerBackend.cs` holds TWO classes and the routing lives on the
+     CATALOG one), rules transcribed with their measured whys, `ExecuteQuery` 115 lines → a `RouteScan`
+     call, and the Debug line gained `route=<reason>` (verified live: `route=pooled`, `route=pin (MARS)`).
+   - **1b (Delta) scoping facts, read before writing it:** (a) `SnapshotPinning` and `DeltaTableCache` are
+     STATIC and process-global — per-txn state living outside any catalog instance, keyed only by
+     (txnId, path); folding them into owned objects also fixes that. (b) The blast radius is 21 call sites
+     (18 in `DeltaCatalog`, 3 in `DeltaReader`) — but `DeltaReader` is a STATIC class, so the bound object
+     must be PASSED into its entry points rather than resolved there, the same threading shape as the
+     write-spec saga. (c) ⚠ The natural name `DeltaTransaction` COLLIDES with engineered-wood's own
+     `DeltaTransaction`, which the same files import — pick another (`DeltaTxn`, `DeltaTxnScope`) or every
+     file needs an alias.
 2. **The `delta.*` namespace + delete kinds 8–14 and the eight C++ registrations** — breaking SQL surface;
    rewrite the consuming suites (`verify_delta_catalog_snapshots`, `verify_delta_txn_version`,
    `verify_delta_tblproperties`, `verify_delta_catalog_changes`) to the new spellings. Also banks the
