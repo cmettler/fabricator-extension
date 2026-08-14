@@ -31,7 +31,7 @@ SELECT count(*) FROM lake.main.s1;
 
 # the spec is persisted as a table property (JSON array)
 query T
-SELECT value FROM fabricator_delta_tblproperties('lake', 'main.s1') WHERE property = 'fabricator.sortedBy';
+SELECT value FROM lake.delta.tblproperties('main.s1') WHERE property = 'fabricator.sortedBy';
 ----
 ["grp","id"]
 
@@ -78,7 +78,7 @@ SELECT count(*) FROM o WHERE pg IS NOT NULL AND (pg > grp OR (pg = grp AND pi > 
 # ============================================================================
 
 statement ok
-SELECT * FROM fabricator_delta_set_tblproperties('lake', 'main.s1', '{"fabricator.sortedBy":null}');
+SELECT * FROM lake.delta.set_tblproperties('main.s1', '{"fabricator.sortedBy":null}');
 
 statement ok
 INSERT INTO lake.main.s1 VALUES (99, 5, -1), (1, 3, -1), (50, 7, -1);
@@ -108,7 +108,7 @@ CREATE TABLE clake.main.c1 SORTED BY (id) AS
 SELECT (r * 91) % 1000 AS id, r AS payload FROM range(3000) t(r);
 
 query T
-SELECT value FROM fabricator_delta_tblproperties('clake', 'main.c1') WHERE property = 'fabricator.sortedBy';
+SELECT value FROM clake.delta.tblproperties('main.c1') WHERE property = 'fabricator.sortedBy';
 ----
 ["id"]
 
@@ -128,7 +128,7 @@ statement ok
 CREATE TABLE clake.main.c2 (grp BIGINT, v VARCHAR) SORTED BY (grp);
 
 query T
-SELECT value FROM fabricator_delta_tblproperties('clake', 'main.c2') WHERE property = 'fabricator.sortedBy';
+SELECT value FROM clake.delta.tblproperties('main.c2') WHERE property = 'fabricator.sortedBy';
 ----
 ["grp"]
 
@@ -158,7 +158,7 @@ statement ok
 COMMIT;
 
 query T
-SELECT value FROM fabricator_delta_tblproperties('clake', 'main.c3') WHERE property = 'fabricator.sortedBy';
+SELECT value FROM clake.delta.tblproperties('main.c3') WHERE property = 'fabricator.sortedBy';
 ----
 ["id"]
 

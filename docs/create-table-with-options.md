@@ -37,7 +37,7 @@ AS SELECT …;   -- writes Delta to S3 client-side + provisions the SQL external
   gain a `string? optionsJson`; Delta write tuning resolves in `DeltaCatalog.ResolveWriteSpec`
   (`DeltaCatalog.cs:450` — precedence today: ATTACH defaults < `delta_write_options` session setting);
   Delta table config stamps in `DeltaWriter.CreateConfig`; per-table property DDL already exists
-  (`fabricator_delta_set_tblproperties`, metadata kinds 13/14).
+  (`delta.set_tblproperties` — a catalog-bound function since ABI v70; it rode metadata kinds 13/14 until then).
 - **SQL Server external tables are read-only for SQL Server itself** (no INSERT into an S3 external
   table; CETAS can export parquet/CSV but can NEVER write Delta). External tables appear in
   `sys.tables` with `is_external = 1` (so our existing discovery/scan already lists + reads them);
@@ -65,7 +65,7 @@ Built 2026-07-19 as planned, plus three findings the build surfaced:
   not help), but Delta config keys are case-sensitive. Well-known `delta.*`/`fabricator.*` keys are
   re-cased C#-side from a canonical list (`DeltaWithOptions.CanonicalKeys` — isolationLevel,
   targetFileSize, appendOnly, retention/durations, dataSkipping*, parquet.compression.codec, …);
-  arbitrary mixed-case custom keys must use `fabricator_delta_set_tblproperties` (JSON preserves case).
+  arbitrary mixed-case custom keys must use `delta.set_tblproperties` (JSON preserves case).
 - **Boolean literals arrive as postgres `'t'/'f'`** (a bare `true` parses as `CAST('t' AS BOOLEAN)` and
   the constant extraction unwraps one CAST level) — the bool parser accepts them.
 - **Pre-existing gap closed en route: the native_write COPY paths carried NO write tuning** —
@@ -131,7 +131,7 @@ recognize (SQL Server starts recognizing keys in slice B; DAX is read-only anywa
 
 Compression/row-group pinned via `parquet_metadata()` on the written file; per-table
 `deletion_vectors=false, column_mapping='none'` override pinned via the commit protocol shape (in a
-DV-default catalog); TBLPROPERTIES read back via `fabricator_delta_tblproperties` (one commit total);
+DV-default catalog); TBLPROPERTIES read back via `delta.tblproperties` (one commit total);
 precedence over `delta_write_options`; guards (unknown key, `delta.enable*` pointer, non-constant
 value, `location` on delta, SQL Server unknown key). Regression: partition 54 / sorted_by 30 /
 tblproperties 42 / native_write 147 / copy_format 109.

@@ -19,41 +19,41 @@ CREATE TABLE lake.main.t AS SELECT i AS id FROM range(3) t(i);
 
 # a fresh plain table has no delta.* properties
 query I
-SELECT count(*) FROM fabricator_delta_tblproperties('lake', 'main.t');
+SELECT count(*) FROM lake.delta.tblproperties('main.t');
 ----
 0
 
 # SET two properties -> one metaData commit; the applied rows are echoed
 query TT
-SELECT property, value FROM fabricator_delta_set_tblproperties('lake', 'main.t', '{"delta.isolationLevel":"Serializable","custom.owner":"cm"}') ORDER BY 1;
+SELECT property, value FROM lake.delta.set_tblproperties('main.t', '{"delta.isolationLevel":"Serializable","custom.owner":"cm"}') ORDER BY 1;
 ----
 custom.owner	cm
 delta.isolationLevel	Serializable
 
 # read back
 query TT
-SELECT property, value FROM fabricator_delta_tblproperties('lake', 'main.t') ORDER BY 1;
+SELECT property, value FROM lake.delta.tblproperties('main.t') ORDER BY 1;
 ----
 custom.owner	cm
 delta.isolationLevel	Serializable
 
 # UNSET (null value) removes the key
 statement ok
-SELECT * FROM fabricator_delta_set_tblproperties('lake', 'main.t', '{"custom.owner":null}');
+SELECT * FROM lake.delta.set_tblproperties('main.t', '{"custom.owner":null}');
 
 query T
-SELECT value FROM fabricator_delta_tblproperties('lake', 'main.t') WHERE property = 'delta.isolationLevel';
+SELECT value FROM lake.delta.tblproperties('main.t') WHERE property = 'delta.isolationLevel';
 ----
 Serializable
 
 query I
-SELECT count(*) FROM fabricator_delta_tblproperties('lake', 'main.t') WHERE property = 'custom.owner';
+SELECT count(*) FROM lake.delta.tblproperties('main.t') WHERE property = 'custom.owner';
 ----
 0
 
 # feature-enabling keys are rejected (need a protocol upgrade at CREATE)
 statement error
-SELECT * FROM fabricator_delta_set_tblproperties('lake', 'main.t', '{"delta.enableChangeDataFeed":"true"}');
+SELECT * FROM lake.delta.set_tblproperties('main.t', '{"delta.enableChangeDataFeed":"true"}');
 ----
 enables a table FEATURE
 
@@ -65,7 +65,7 @@ statement ok
 ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/tp' AS lake2 (TYPE fabricator, PROVIDER 'delta');
 
 query T
-SELECT value FROM fabricator_delta_tblproperties('lake2', 'main.t') WHERE property = 'delta.isolationLevel';
+SELECT value FROM lake2.delta.tblproperties('main.t') WHERE property = 'delta.isolationLevel';
 ----
 Serializable
 
@@ -86,7 +86,7 @@ CREATE TABLE db.main.t AS SELECT i AS id, 'x' AS name FROM range(10) t(i);
 
 # make the table Serializable via the generic setter (the catalog stays write_serializable default)
 statement ok
-SELECT * FROM fabricator_delta_set_tblproperties('db', 'main.t', '{"delta.isolationLevel":"Serializable"}');
+SELECT * FROM db.delta.set_tblproperties('main.t', '{"delta.isolationLevel":"Serializable"}');
 
 statement ok con1
 BEGIN;
@@ -114,7 +114,7 @@ SELECT count(*) FROM db.main.t WHERE id = 1;
 # Now UNSET the property -> the table falls back to the catalog default (write_serializable): the same
 # matching concurrent append COMMUTES (the commit rebases on top of it), no conflict.
 statement ok
-SELECT * FROM fabricator_delta_set_tblproperties('db', 'main.t', '{"delta.isolationLevel":null}');
+SELECT * FROM db.delta.set_tblproperties('main.t', '{"delta.isolationLevel":null}');
 
 statement ok con1
 BEGIN;
@@ -155,7 +155,7 @@ statement ok
 CREATE TABLE sc.main.t AS SELECT i AS id FROM range(3) t(i);
 
 query I
-SELECT count(*) FROM fabricator_delta_tblproperties('sc', 'main.t') WHERE property = 'delta.isolationLevel';
+SELECT count(*) FROM sc.delta.tblproperties('main.t') WHERE property = 'delta.isolationLevel';
 ----
 0
 
@@ -170,7 +170,7 @@ statement ok
 CREATE TABLE dc.main.t AS SELECT i AS id FROM range(3) t(i);
 
 query I
-SELECT count(*) FROM fabricator_delta_tblproperties('dc', 'main.t') WHERE property = 'delta.isolationLevel';
+SELECT count(*) FROM dc.delta.tblproperties('main.t') WHERE property = 'delta.isolationLevel';
 ----
 0
 
@@ -181,7 +181,7 @@ statement ok
 CREATE TABLE dc.main.ws WITH ("delta.isolationLevel"='WriteSerializable') AS SELECT 1 AS id;
 
 query T
-SELECT value FROM fabricator_delta_tblproperties('dc', 'main.ws') WHERE property = 'delta.isolationLevel';
+SELECT value FROM dc.delta.tblproperties('main.ws') WHERE property = 'delta.isolationLevel';
 ----
 WriteSerializable
 
@@ -214,7 +214,7 @@ CREATE TABLE dflt.main.t AS SELECT i AS id, 'x' AS name FROM range(10) t(i);
 # No property was stamped — not by the default and not by anything else — so the level really does come from
 # the catalog default. This is also the assertion that pins "a CREATE never bakes the catalog's level in".
 query I
-SELECT count(*) FROM fabricator_delta_tblproperties('dflt', 'main.t') WHERE property = 'delta.isolationLevel';
+SELECT count(*) FROM dflt.delta.tblproperties('main.t') WHERE property = 'delta.isolationLevel';
 ----
 0
 
@@ -235,7 +235,7 @@ COMMIT;
 # that matters for cross-engine work: Fabric Spark commits at Serializable and its DDL cannot set
 # WriteSerializable, so a table shared with it wants this property rather than an ATTACH option.
 statement ok
-SELECT * FROM fabricator_delta_set_tblproperties('dflt', 'main.t', '{"delta.isolationLevel":"Serializable"}');
+SELECT * FROM dflt.delta.set_tblproperties('main.t', '{"delta.isolationLevel":"Serializable"}');
 
 statement ok con1
 BEGIN;
@@ -263,7 +263,7 @@ statement ok
 CREATE TABLE strict.main.t AS SELECT i AS id, 'x' AS name FROM range(10) t(i);
 
 query I
-SELECT count(*) FROM fabricator_delta_tblproperties('strict', 'main.t') WHERE property = 'delta.isolationLevel';
+SELECT count(*) FROM strict.delta.tblproperties('main.t') WHERE property = 'delta.isolationLevel';
 ----
 0
 
@@ -311,7 +311,7 @@ CREATE TABLE ck.main.plain AS SELECT 1 AS id;
 
 # The declaration really is on the table (not silently dropped at CREATE).
 query I
-SELECT count(*) FROM fabricator_delta_tblproperties('ck', 'main.declared')
+SELECT count(*) FROM ck.delta.tblproperties('main.declared')
 WHERE property = 'delta.checkpointInterval' AND value = '25';
 ----
 1
@@ -495,12 +495,12 @@ statement ok
 CREATE TABLE ck.main.free AS SELECT i AS id FROM range(1, 6) t(i);
 
 statement ok
-SELECT * FROM fabricator_delta_set_tblproperties('ck', 'main.t', '{"delta.constraints.pos":"id > 0"}');
+SELECT * FROM ck.delta.set_tblproperties('main.t', '{"delta.constraints.pos":"id > 0"}');
 
 # ⚠ FILTERED to the constraint key on purpose: this attach takes the DEFAULT feature set, so the table
 # already declares deletion-vector / row-tracking / column-mapping properties beside it.
 query II
-SELECT property, value FROM fabricator_delta_tblproperties('ck', 'main.t')
+SELECT property, value FROM ck.delta.tblproperties('main.t')
 WHERE property = 'delta.constraints.pos';
 ----
 delta.constraints.pos	id > 0
@@ -583,7 +583,7 @@ SELECT count(*) FILTER (WHERE id = 111), count(*) FILTER (WHERE id = 2) FROM ck.
 # section: the property was declared through the very call that now asserts enforcement, so if the vacuous
 # assertion had leaked into the row-writing paths, that INSERT would have been accepted.
 statement ok
-SELECT * FROM fabricator_delta_set_tblproperties('ck', 'main.t', '{"delta.constraints.pos":null}');
+SELECT * FROM ck.delta.set_tblproperties('main.t', '{"delta.constraints.pos":null}');
 
 statement ok
 UPDATE ck.main.t SET id = 11 WHERE id = 10;

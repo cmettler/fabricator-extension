@@ -235,13 +235,13 @@ SELECT id, __delta_row_id FROM lake4.main.cd WHERE id = 1;
 1	1
 
 query TIT
-SELECT _change_type, id, s FROM fabricator_delta_changes('lake4', 'main.cd', 2) ORDER BY _change_type;
+SELECT _change_type, id, s FROM lake4.delta.changes('main.cd', starting_version := 2) ORDER BY _change_type;
 ----
 update_postimage	1	mor
 update_preimage	1	v1
 
 query TI
-SELECT _change_type, count(*) FROM fabricator_delta_changes('lake4', 'main.cd', 0) GROUP BY _change_type ORDER BY _change_type;
+SELECT _change_type, count(*) FROM lake4.delta.changes('main.cd', starting_version := 0) GROUP BY _change_type ORDER BY _change_type;
 ----
 insert	4
 update_postimage	1
@@ -268,7 +268,7 @@ SELECT id, __delta_row_id FROM lake4.main.cdp WHERE id = 1;
 1	2
 
 query TTIT
-SELECT _change_type, region, id, s FROM fabricator_delta_changes('lake4', 'main.cdp', 2) ORDER BY _change_type;
+SELECT _change_type, region, id, s FROM lake4.delta.changes('main.cdp', starting_version := 2) ORDER BY _change_type;
 ----
 update_postimage	EU	1	mor
 update_preimage	EU	1	v1
@@ -278,7 +278,7 @@ statement ok
 UPDATE lake4.main.cdp SET region = 'APAC' WHERE id = 3;
 
 query TTI
-SELECT _change_type, region, id FROM fabricator_delta_changes('lake4', 'main.cdp', 3) ORDER BY _change_type;
+SELECT _change_type, region, id FROM lake4.delta.changes('main.cdp', starting_version := 3) ORDER BY _change_type;
 ----
 update_postimage	APAC	3
 update_preimage	EU	3
@@ -305,7 +305,7 @@ statement ok
 COMMIT;
 
 query TTIT
-SELECT _change_type, region, id, s FROM fabricator_delta_changes('lake4', 'main.cdp', 4) ORDER BY _change_type, id;
+SELECT _change_type, region, id, s FROM lake4.delta.changes('main.cdp', starting_version := 4) ORDER BY _change_type, id;
 ----
 delete	US	0	v0
 insert	US	20	v20

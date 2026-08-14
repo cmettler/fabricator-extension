@@ -46,6 +46,21 @@ internal static class FabricArgs
         };
     }
 
+    /// <summary>A TIMESTAMP argument as a UTC <see cref="System.DateTime"/>. DuckDB's plain TIMESTAMP carries no
+    /// zone; it is read as UTC — the same convention the AT clause and the Delta commit timestamps use.</summary>
+    internal static System.DateTime? Ts(RecordBatch? args, int col, int row = 0)
+    {
+        if (args is null || col >= args.ColumnCount || row >= args.Length)
+        {
+            return null;
+        }
+        return args.Column(col) switch
+        {
+            TimestampArray ts => ts.GetTimestamp(row)?.UtcDateTime,
+            _ => null,
+        };
+    }
+
     internal static long? Int(RecordBatch? args, int col, int row = 0)
     {
         if (args is null || col >= args.ColumnCount || row >= args.Length)

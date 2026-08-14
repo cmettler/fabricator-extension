@@ -31,13 +31,13 @@ INSERT INTO lake.main.t VALUES (3);
 
 # 4 commits: v0 (CREATE) + 3 INSERTs.
 query I
-SELECT count(*) FROM fabricator_delta_snapshots('lake', 'main.t');
+SELECT count(*) FROM lake.delta.snapshots('main.t');
 ----
 4
 
 # The version column is the full 0..3 history.
 query I
-SELECT version FROM fabricator_delta_snapshots('lake', 'main.t') ORDER BY version;
+SELECT version FROM lake.delta.snapshots('main.t') ORDER BY version;
 ----
 0
 1
@@ -46,19 +46,19 @@ SELECT version FROM fabricator_delta_snapshots('lake', 'main.t') ORDER BY versio
 
 # A bare table name resolves to "main" on a flat catalog.
 query I
-SELECT count(*) FROM fabricator_delta_snapshots('lake', 't');
+SELECT count(*) FROM lake.delta.snapshots('t');
 ----
 4
 
 # commitInfo is written on EVERY commit (default), so plain tables get operation + timestamp on all versions.
 query I
-SELECT count(*) FROM fabricator_delta_snapshots('lake', 't') WHERE timestamp IS NOT NULL AND operation IS NOT NULL;
+SELECT count(*) FROM lake.delta.snapshots('t') WHERE timestamp IS NOT NULL AND operation IS NOT NULL;
 ----
 4
 
 # v0 is the CREATE TABLE commit; the rest are WRITEs.
 query IT
-SELECT version, operation FROM fabricator_delta_snapshots('lake', 't') ORDER BY version;
+SELECT version, operation FROM lake.delta.snapshots('t') ORDER BY version;
 ----
 0	CREATE TABLE
 1	WRITE
@@ -80,13 +80,13 @@ INSERT INTO ict.main.t VALUES (2);
 
 # All commits have a timestamp (v0 CREATE TABLE + the CTAS data write + the INSERT).
 query I
-SELECT count(*) FROM fabricator_delta_snapshots('ict', 'main.t') WHERE timestamp IS NOT NULL;
+SELECT count(*) FROM ict.delta.snapshots('main.t') WHERE timestamp IS NOT NULL;
 ----
 3
 
 # The two data commits are WRITEs (v0 is CREATE TABLE).
 query I
-SELECT count(*) FROM fabricator_delta_snapshots('ict', 'main.t') WHERE operation = 'WRITE';
+SELECT count(*) FROM ict.delta.snapshots('main.t') WHERE operation = 'WRITE';
 ----
 2
 
@@ -94,7 +94,7 @@ SELECT count(*) FROM fabricator_delta_snapshots('ict', 'main.t') WHERE operation
 query I
 SELECT count(*) FROM (
   SELECT version, timestamp, lag(timestamp) OVER (ORDER BY version) AS prev
-  FROM fabricator_delta_snapshots('ict', 'main.t')
+  FROM ict.delta.snapshots('main.t')
 ) WHERE timestamp IS NOT NULL AND prev IS NOT NULL AND timestamp < prev;
 ----
 0

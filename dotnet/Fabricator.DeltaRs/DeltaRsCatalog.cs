@@ -139,7 +139,10 @@ public sealed class DeltaRsCatalog : IBackendCatalog
 
     public IArrowArrayStream GetMetadata(int kind, string? schema, string? table) => kind switch
     {
-        MetadataKind.Schemas => SingleColumn("schema_name", SchemaNames()),
+        // CatalogSchemaNames, not SchemaNames: the advertised set includes the `delta` function namespace
+        // (snapshots/changes are catalog-bound functions now — the same mechanism as the engineered-wood
+        // provider; the host drops a declared function whose schema it did not register).
+        MetadataKind.Schemas => SingleColumn("schema_name", CatalogSchemaNames()),
         MetadataKind.Tables => TablesStream(),
         MetadataKind.Columns => ColumnsStream(schema!, table!),
         // Rowid = ALL columns (a full-row identity). delta-rs has no low-level position/remove API, so DELETE/
@@ -147,8 +150,9 @@ public sealed class DeltaRsCatalog : IBackendCatalog
         // sound because a WHERE can't distinguish identical rows, so DuckDB's rowid set is always a complete
         // equivalence class. See docs/delta-rs-provider.md "The DML crux".
         MetadataKind.RowId => SingleColumn("name", RowIdColumns(schema!, table!)),
-        MetadataKind.Snapshots => SnapshotsStream(schema, table),
-        MetadataKind.Changes => ChangesStream(schema, table),
+        // The delta.* function declarations (cat.delta.snapshots / cat.delta.changes). Built in memory —
+        // nothing is discovered; the set is what this provider declares.
+        MetadataKind.Functions => FunctionsMetadata.Stream(Functions.Declarations(SchemaNames)),
         // No provider virtual columns (stable row-tracking virtuals are an engineeredwooddelta feature).
         MetadataKind.VirtualColumns => new InMemoryArrayStream(
             new Schema(new[]
@@ -168,6 +172,20 @@ public sealed class DeltaRsCatalog : IBackendCatalog
             set.Add(s);
         }
         return set.ToList();
+    }
+
+    /// <summary>The ADVERTISED schemas: the data schemas plus the <c>delta</c> function namespace. Distinct
+    /// from <see cref="SchemaNames"/> for the same reason as the engineered-wood provider — the host drops a
+    /// declared function whose schema it did not register, and a <c>__all__</c> expansion (none here today)
+    /// must never include a function namespace.</summary>
+    private IReadOnlyList<string> CatalogSchemaNames()
+    {
+        var all = new List<string>(SchemaNames());
+        if (!all.Contains(DeltaFunctions.SchemaName, StringComparer.OrdinalIgnoreCase))
+        {
+            all.Add(DeltaFunctions.SchemaName);
+        }
+        return all;
     }
 
     private IArrowArrayStream TablesStream()
@@ -536,6 +554,13 @@ public sealed class DeltaRsCatalog : IBackendCatalog
                             IReadOnlyList<string>? sortColumns, IReadOnlyList<string>? identityColumns,
                             string? optionsJson)
     {
+        if (string.Equals(schemaName, DeltaFunctions.SchemaName, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new NotSupportedException(
+                $"CREATE TABLE {tableName}: '{DeltaFunctions.SchemaName}' is this catalog's Delta FUNCTION "
+                + "namespace (delta.snapshots / delta.changes), not a storage schema. Create the table in a "
+                + "data schema instead.");
+        }
         if (!string.IsNullOrEmpty(optionsJson))
         {
             throw new NotSupportedException(
@@ -618,14 +643,19 @@ public sealed class DeltaRsCatalog : IBackendCatalog
 
     // ---- snapshots (history) + change data feed ----
 
-    private IArrowArrayStream SnapshotsStream(string? schema, string? table)
+    // Split a 'schema.table' reference (first dot; bare name => "main"). The delta.* function surface hands
+    // the reference through whole — resolution is this provider's.
+    private static (string Schema, string Table) SplitRef(string tableRef)
     {
-        if (string.IsNullOrEmpty(table))
-        {
-            throw new ArgumentException("delta-rs snapshots: a table name is required (catalog, 'schema.table').");
-        }
-        var resolvedSchema = string.IsNullOrEmpty(schema) ? MainSchema : schema!;
-        using var t = Open(resolvedSchema, table!);
+        int dot = tableRef.IndexOf('.');
+        return dot >= 0 ? (tableRef.Substring(0, dot), tableRef.Substring(dot + 1)) : (MainSchema, tableRef);
+    }
+
+    // cat.delta.snapshots('schema.table') — the commit history.
+    private IArrowArrayStream SnapshotsCore(string tableRef)
+    {
+        var (resolvedSchema, table) = SplitRef(tableRef);
+        using var t = Open(resolvedSchema, table);
         var history = Run(t.HistoryAsync(null, default));   // null => all commits
         ulong current = t.Version() ?? (ulong)Math.Max(0, history.Length - 1);
 
@@ -667,27 +697,22 @@ public sealed class DeltaRsCatalog : IBackendCatalog
         return new InMemoryArrayStream(schemaOut, new[] { batch });
     }
 
-    private IArrowArrayStream ChangesStream(string? tableRef, string? range)
+    // cat.delta.changes('schema.table', starting_version := …[, ending_version := …]) — the Change Data Feed.
+    // Version bounds only:
+    // delta-dotnet's TableChangesOptions takes versions, and timestamp resolution would need a history walk
+    // this provider has no cheap form of — refused cleanly rather than approximated.
+    private IArrowArrayStream ChangesCore(string tableRef, long? fromV, long? toV, DateTime? fromTs, DateTime? toTs)
     {
-        if (string.IsNullOrEmpty(tableRef))
+        if (fromTs is not null || toTs is not null)
         {
-            throw new ArgumentException("delta-rs changes: a table is required (catalog, 'schema.table', from, to).");
+            throw new NotSupportedException(
+                "deltars provider: delta.changes timestamp bounds (starting_timestamp/ending_timestamp) are not "
+                + "supported — use version bounds (starting_version := / ending_version :=), or the "
+                + "engineeredwooddelta provider.");
         }
-        string schema = MainSchema, table = tableRef!;
-        int dot = tableRef!.IndexOf('.');
-        if (dot >= 0)
-        {
-            schema = tableRef.Substring(0, dot);
-            table = tableRef.Substring(dot + 1);
-        }
-        ulong from = 0;
-        ulong? to = null;
-        if (!string.IsNullOrEmpty(range))
-        {
-            var parts = range!.Split(':');
-            if (parts.Length > 0 && ulong.TryParse(parts[0], out var f)) { from = f; }
-            if (parts.Length > 1 && ulong.TryParse(parts[1], out var tv)) { to = tv; }
-        }
+        var (schema, table) = SplitRef(tableRef);
+        ulong from = (ulong)Math.Max(0, fromV ?? 0);
+        ulong? to = toV is { } tv and >= 0 ? (ulong)tv : null;
 
         using var t = Open(schema, table);
         var options = new TableChangesOptions(from) { EndVersion = to };
@@ -981,11 +1006,22 @@ public sealed class DeltaRsCatalog : IBackendCatalog
     public IArrowArrayStream InsertReturning(string s, string t, IArrowArrayStream r) =>
         throw Unsupported("INSERT ... RETURNING");
 
-    public Schema GetFunctionParamSchema(string s, string f) => throw NoFunctions();
+    // ---- catalog-bound functions: the delta.* namespace only (snapshots + changes) ---------------------
+    private CatalogFunctionSet Functions => _functions ??= new CatalogFunctionSet(tables: new ICatalogTableFunction[]
+    {
+        new DeltaSnapshotsFunction(SnapshotsCore),
+        new DeltaChangesFunction(ChangesCore),
+    });
+    private CatalogFunctionSet? _functions;
+
+    public Schema GetFunctionParamSchema(string s, string f) =>
+        Functions.ParamSchema(s, f) ?? throw NoFunctions();
     public Schema GetFunctionReturnSchema(string s, string f) => throw NoFunctions();
     public IArrowArrayStream ExecuteScalar(string s, string f, IArrowArrayStream a) => throw NoFunctions();
-    public Schema GetFunctionOutputSchema(string s, string f, RecordBatch? a = null) => throw NoFunctions();
-    public IBoundTableFunction TableFnBind(string s, string f, RecordBatch? a) => throw NoFunctions();
+    public Schema GetFunctionOutputSchema(string s, string f, RecordBatch? a = null) =>
+        Functions.OutputSchema(s, f, a) ?? throw NoFunctions();
+    public IBoundTableFunction TableFnBind(string s, string f, RecordBatch? a) =>
+        Functions.TableFnBind(s, f, a) ?? throw NoFunctions();
     public IInOutBinding InOutBind(string s, string f, RecordBatch? a, Schema inputSchema) => throw NoFunctions();
     public IAggregateSession AggOpen(string s, string f) => throw NoFunctions();
 

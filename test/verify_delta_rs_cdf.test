@@ -30,7 +30,7 @@ DELETE FROM lake.main.t WHERE id = 2;
 # Full change feed from version 1: the 3 CTAS inserts (v1), the insert (v2), the delete (v3).
 query TITI
 SELECT _change_type, id, name, _commit_version
-FROM fabricator_delta_changes('lake', 'main.t', 1)
+FROM lake.delta.changes('main.t', starting_version := 1)
 ORDER BY _commit_version, id;
 ----
 insert	1	a	1
@@ -41,13 +41,13 @@ delete	2	b	3
 
 # Bounded range [2, 2]: only the v2 insert.
 query TI
-SELECT _change_type, id FROM fabricator_delta_changes('lake', 'main.t', 2, 2) ORDER BY id;
+SELECT _change_type, id FROM lake.delta.changes('main.t', starting_version := 2, ending_version := 2) ORDER BY id;
 ----
 insert	4
 
 # Change-type breakdown across the whole feed.
 query TI
-SELECT _change_type, count(*) FROM fabricator_delta_changes('lake', 'main.t', 1) GROUP BY _change_type ORDER BY _change_type;
+SELECT _change_type, count(*) FROM lake.delta.changes('main.t', starting_version := 1) GROUP BY _change_type ORDER BY _change_type;
 ----
 delete	1
 insert	4

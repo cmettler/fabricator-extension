@@ -49,7 +49,7 @@ INSERT INTO lake.main.t VALUES (1, 'pre');
 
 # Baseline: v0 CREATE + v1 WRITE.
 query I
-SELECT count(*) FROM fabricator_delta_snapshots('lake', 't');
+SELECT count(*) FROM lake.delta.snapshots('t');
 ----
 2
 
@@ -94,7 +94,7 @@ SELECT count(*) FROM lake.main.t;
 
 # ...as ONE new Delta commit (2 snapshots before, exactly 3 after — not 5).
 query I
-SELECT count(*) FROM fabricator_delta_snapshots('lake', 't');
+SELECT count(*) FROM lake.delta.snapshots('t');
 ----
 3
 
@@ -118,7 +118,7 @@ SELECT count(*) FROM lake.main.t;
 5
 
 query I
-SELECT count(*) FROM fabricator_delta_snapshots('lake', 't');
+SELECT count(*) FROM lake.delta.snapshots('t');
 ----
 3
 
@@ -156,7 +156,7 @@ SELECT count(*) FROM lake.main.t;
 5
 
 query I
-SELECT count(*) FROM fabricator_delta_snapshots('lake', 't');
+SELECT count(*) FROM lake.delta.snapshots('t');
 ----
 3
 
@@ -187,12 +187,12 @@ SELECT id, name FROM lake.main.t ORDER BY id;
 
 # Exactly ONE new Delta commit for both DELETEs, with operation DELETE.
 query I
-SELECT count(*) FROM fabricator_delta_snapshots('lake', 't');
+SELECT count(*) FROM lake.delta.snapshots('t');
 ----
 4
 
 query T
-SELECT operation FROM fabricator_delta_snapshots('lake', 't') ORDER BY version DESC LIMIT 1;
+SELECT operation FROM lake.delta.snapshots('t') ORDER BY version DESC LIMIT 1;
 ----
 DELETE
 
@@ -237,12 +237,12 @@ SELECT id, name FROM lake.main.t ORDER BY id;
 
 # One commit for both UPDATEs, operation UPDATE.
 query I
-SELECT count(*) FROM fabricator_delta_snapshots('lake', 't');
+SELECT count(*) FROM lake.delta.snapshots('t');
 ----
 5
 
 query T
-SELECT operation FROM fabricator_delta_snapshots('lake', 't') ORDER BY version DESC LIMIT 1;
+SELECT operation FROM lake.delta.snapshots('t') ORDER BY version DESC LIMIT 1;
 ----
 UPDATE
 
@@ -271,7 +271,7 @@ pre
 # ============================================================================
 
 query I
-SELECT count(*) FROM fabricator_delta_snapshots('lake', 't');
+SELECT count(*) FROM lake.delta.snapshots('t');
 ----
 5
 
@@ -307,12 +307,12 @@ SELECT id, name FROM lake.main.t ORDER BY id;
 
 # ONE commit for all three statements, operation TRANSACTION (mixed kinds).
 query I
-SELECT count(*) FROM fabricator_delta_snapshots('lake', 't');
+SELECT count(*) FROM lake.delta.snapshots('t');
 ----
 6
 
 query T
-SELECT operation FROM fabricator_delta_snapshots('lake', 't') ORDER BY version DESC LIMIT 1;
+SELECT operation FROM lake.delta.snapshots('t') ORDER BY version DESC LIMIT 1;
 ----
 TRANSACTION
 
@@ -860,7 +860,7 @@ upd
 
 # CREATE (v0) + seed INSERT (v1) + ONE fused transaction commit (v2).
 query I
-SELECT count(*) FROM fabricator_delta_snapshots('nlake', 'nt');
+SELECT count(*) FROM nlake.delta.snapshots('nt');
 ----
 3
 
@@ -947,7 +947,7 @@ SELECT id, name FROM rlake.main.rt ORDER BY id;
 
 # CREATE + seed + one fused commit.
 query I
-SELECT count(*) FROM fabricator_delta_snapshots('rlake', 'rt');
+SELECT count(*) FROM rlake.delta.snapshots('rt');
 ----
 3
 
@@ -962,7 +962,7 @@ statement ok
 ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txn_codec' AS alake (TYPE fabricator, PROVIDER '${DELTA_PROVIDER}');
 
 query I
-SELECT count(*) FROM fabricator_delta_snapshots('alake', 'u');
+SELECT count(*) FROM alake.delta.snapshots('u');
 ----
 2
 
@@ -970,7 +970,7 @@ statement ok
 INSERT INTO alake.main.u VALUES (40);
 
 query I
-SELECT count(*) FROM fabricator_delta_snapshots('alake', 'u');
+SELECT count(*) FROM alake.delta.snapshots('u');
 ----
 3
 
@@ -979,12 +979,12 @@ statement ok
 DELETE FROM alake.main.u WHERE v = 10;
 
 query I
-SELECT count(*) FROM fabricator_delta_snapshots('alake', 'u');
+SELECT count(*) FROM alake.delta.snapshots('u');
 ----
 4
 
 query T
-SELECT operation FROM fabricator_delta_snapshots('alake', 'u') ORDER BY version DESC LIMIT 1;
+SELECT operation FROM alake.delta.snapshots('u') ORDER BY version DESC LIMIT 1;
 ----
 DELETE
 
@@ -1010,7 +1010,7 @@ statement ok
 INSERT INTO dlake.main.a VALUES (1, 'x'), (2, 'y');
 
 query I
-SELECT count(*) FROM fabricator_delta_snapshots('dlake', 'a');
+SELECT count(*) FROM dlake.delta.snapshots('a');
 ----
 2
 
@@ -1057,12 +1057,12 @@ SELECT id, name, extra FROM dlake.main.a ORDER BY id;
 
 # ALTER + INSERT + DELETE all landed as ONE Delta commit (metaData + add + DV actions).
 query I
-SELECT count(*) FROM fabricator_delta_snapshots('dlake', 'a');
+SELECT count(*) FROM dlake.delta.snapshots('a');
 ----
 3
 
 query T
-SELECT operation FROM fabricator_delta_snapshots('dlake', 'a') ORDER BY version DESC LIMIT 1;
+SELECT operation FROM dlake.delta.snapshots('a') ORDER BY version DESC LIMIT 1;
 ----
 TRANSACTION
 
@@ -1100,7 +1100,7 @@ SELECT count(*) FROM dlake.main.a;
 2
 
 query I
-SELECT count(*) FROM fabricator_delta_snapshots('dlake', 'a');
+SELECT count(*) FROM dlake.delta.snapshots('a');
 ----
 3
 
@@ -1143,7 +1143,7 @@ SELECT id, c1, c2 FROM dlake.main.a ORDER BY id;
 
 # Still ONE commit for both ALTERs + INSERT + UPDATE.
 query I
-SELECT count(*) FROM fabricator_delta_snapshots('dlake', 'a');
+SELECT count(*) FROM dlake.delta.snapshots('a');
 ----
 4
 
@@ -1251,7 +1251,7 @@ SELECT id, name, score FROM xlake.main.xt ORDER BY id;
 
 # CREATE + seed + one fused ALTER+INSERT+DELETE commit.
 query I
-SELECT count(*) FROM fabricator_delta_snapshots('xlake', 'xt');
+SELECT count(*) FROM xlake.delta.snapshots('xt');
 ----
 3
 
@@ -1308,12 +1308,12 @@ SELECT id, title FROM elake.main.r ORDER BY id;
 
 # CREATE + seed + ONE fused RENAME+INSERT+DELETE commit.
 query I
-SELECT count(*) FROM fabricator_delta_snapshots('elake', 'r');
+SELECT count(*) FROM elake.delta.snapshots('r');
 ----
 3
 
 query T
-SELECT operation FROM fabricator_delta_snapshots('elake', 'r') ORDER BY version DESC LIMIT 1;
+SELECT operation FROM elake.delta.snapshots('r') ORDER BY version DESC LIMIT 1;
 ----
 TRANSACTION
 
@@ -1393,12 +1393,12 @@ SELECT title FROM elake.main.r;
 title
 
 query I
-SELECT count(*) FROM fabricator_delta_snapshots('elake', 'r');
+SELECT count(*) FROM elake.delta.snapshots('r');
 ----
 4
 
 query T
-SELECT operation FROM fabricator_delta_snapshots('elake', 'r') ORDER BY version DESC LIMIT 1;
+SELECT operation FROM elake.delta.snapshots('r') ORDER BY version DESC LIMIT 1;
 ----
 DROP COLUMNS
 
@@ -1440,12 +1440,12 @@ SELECT id, y, z FROM elake.main.r ORDER BY id;
 5	7	zz
 
 query I
-SELECT count(*) FROM fabricator_delta_snapshots('elake', 'r');
+SELECT count(*) FROM elake.delta.snapshots('r');
 ----
 5
 
 query T
-SELECT operation FROM fabricator_delta_snapshots('elake', 'r') ORDER BY version DESC LIMIT 1;
+SELECT operation FROM elake.delta.snapshots('r') ORDER BY version DESC LIMIT 1;
 ----
 TRANSACTION
 
@@ -1494,12 +1494,12 @@ SELECT id, (s).a, (s).c FROM elake.main.n ORDER BY id;
 
 # CREATE + seed + ONE fused nested-ALTERs+INSERT commit.
 query I
-SELECT count(*) FROM fabricator_delta_snapshots('elake', 'n');
+SELECT count(*) FROM elake.delta.snapshots('n');
 ----
 3
 
 query T
-SELECT operation FROM fabricator_delta_snapshots('elake', 'n') ORDER BY version DESC LIMIT 1;
+SELECT operation FROM elake.delta.snapshots('n') ORDER BY version DESC LIMIT 1;
 ----
 TRANSACTION
 
@@ -1610,7 +1610,7 @@ SELECT id, name FROM flake.main.c ORDER BY id;
 
 # The flush wrote today's CTAS shape: v0 CREATE TABLE + ONE WRITE for all buffered inserts.
 query I
-SELECT count(*) FROM fabricator_delta_snapshots('flake', 'c');
+SELECT count(*) FROM flake.delta.snapshots('c');
 ----
 2
 
@@ -1689,7 +1689,7 @@ SELECT max(id) FROM flake2.main.e;
 
 # CTAS rows + the extra INSERT flushed as ONE data commit.
 query I
-SELECT count(*) FROM fabricator_delta_snapshots('flake2', 'e');
+SELECT count(*) FROM flake2.delta.snapshots('e');
 ----
 2
 
@@ -1863,7 +1863,7 @@ SELECT count(*) FROM flake2.main.h;
 0
 
 query I
-SELECT count(*) FROM fabricator_delta_snapshots('flake2', 'h');
+SELECT count(*) FROM flake2.delta.snapshots('h');
 ----
 1
 
@@ -1890,7 +1890,7 @@ SELECT count(*) FROM flake2.main.pt WHERE region = 'US';
 2
 
 query I
-SELECT count(*) FROM fabricator_delta_snapshots('flake2', 'pt');
+SELECT count(*) FROM flake2.delta.snapshots('pt');
 ----
 2
 
@@ -1937,7 +1937,7 @@ SELECT count(*) FROM nl2.main.nc;
 500
 
 query I
-SELECT count(*) FROM fabricator_delta_snapshots('nl2', 'nc');
+SELECT count(*) FROM nl2.delta.snapshots('nc');
 ----
 2
 
@@ -2132,7 +2132,7 @@ SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/txn_native/bt/_delta_lo
 # The one commit that exists is the CREATE and nothing else — exactly one version in the log, so the
 # streamed parquet above is referenced by no commit yet.
 query I
-SELECT count(*) FROM fabricator_delta_snapshots('eb', 'bt');
+SELECT count(*) FROM eb.delta.snapshots('bt');
 ----
 1
 
@@ -2183,7 +2183,7 @@ SELECT v FROM eb.main.bt WHERE id = 5000;
 extra
 
 query I
-SELECT count(*) FROM fabricator_delta_snapshots('eb', 'bt');
+SELECT count(*) FROM eb.delta.snapshots('bt');
 ----
 2
 
@@ -2396,14 +2396,14 @@ SELECT id, v FROM cf.main.t ORDER BY id;
 
 # ONE fused commit (create=0, seed=1, txn=2)
 query I
-SELECT count(*) FROM fabricator_delta_snapshots('cf', 't');
+SELECT count(*) FROM cf.delta.snapshots('t');
 ----
 3
 
 # the fused version's feed: 2 inserts + 1 delete + update pre/post — exact, nothing inferred
 query TII
 SELECT _change_type, count(*), min(id)
-FROM fabricator_delta_changes('cf', 't', 2, 2)
+FROM cf.delta.changes('t', starting_version := 2, ending_version := 2)
 GROUP BY _change_type ORDER BY _change_type;
 ----
 delete	1	2
@@ -2413,18 +2413,18 @@ update_preimage	1	1
 
 # update images carry the right values
 query T
-SELECT v FROM fabricator_delta_changes('cf', 't', 2, 2) WHERE _change_type = 'update_preimage';
+SELECT v FROM cf.delta.changes('t', starting_version := 2, ending_version := 2) WHERE _change_type = 'update_preimage';
 ----
 a
 
 query T
-SELECT v FROM fabricator_delta_changes('cf', 't', 2, 2) WHERE _change_type = 'update_postimage';
+SELECT v FROM cf.delta.changes('t', starting_version := 2, ending_version := 2) WHERE _change_type = 'update_postimage';
 ----
 A
 
 # the seed autocommit insert stays inference-based and intact
 query TI
-SELECT _change_type, count(*) FROM fabricator_delta_changes('cf', 't', 1, 1) GROUP BY _change_type;
+SELECT _change_type, count(*) FROM cf.delta.changes('t', starting_version := 1, ending_version := 1) GROUP BY _change_type;
 ----
 insert	3
 
@@ -2439,7 +2439,7 @@ statement ok
 COMMIT;
 
 query TI
-SELECT _change_type, count(*) FROM fabricator_delta_changes('cf', 't', 3, 3) GROUP BY _change_type;
+SELECT _change_type, count(*) FROM cf.delta.changes('t', starting_version := 3, ending_version := 3) GROUP BY _change_type;
 ----
 insert	1
 
@@ -2550,7 +2550,7 @@ SELECT count(DISTINCT id) FROM idl.main.t;
 6
 
 query I
-SELECT count(*) FROM fabricator_delta_snapshots('idl', 't');
+SELECT count(*) FROM idl.delta.snapshots('t');
 ----
 3
 
@@ -2585,7 +2585,7 @@ SELECT count(*) FROM idl.main.t;
 7
 
 query I
-SELECT count(*) FROM fabricator_delta_snapshots('idl', 't');
+SELECT count(*) FROM idl.delta.snapshots('t');
 ----
 4
 
@@ -2784,7 +2784,7 @@ SELECT id, v FROM sd.main.t ORDER BY id;
 19	pending19
 
 query I
-SELECT count(*) FROM fabricator_delta_snapshots('sd', 't');
+SELECT count(*) FROM sd.delta.snapshots('t');
 ----
 3
 
@@ -3024,7 +3024,7 @@ SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/txn_partctas/pt/_delta_
 1
 
 query I
-SELECT count(*) FROM fabricator_delta_snapshots('pc', 'pt');
+SELECT count(*) FROM pc.delta.snapshots('pt');
 ----
 1
 
@@ -3227,7 +3227,7 @@ INSERT INTO mdc.main.t VALUES (200);
 
 # lands a metaData INSIDE con1's window — con1 has already written its data file and pinned its snapshot
 statement ok con2
-SELECT * FROM fabricator_delta_set_tblproperties('mdc', 'main.t', '{"custom.a":"1"}');
+SELECT * FROM mdc.delta.set_tblproperties('main.t', '{"custom.a":"1"}');
 
 statement ok con1
 COMMIT;
@@ -3260,7 +3260,7 @@ statement ok con1
 DELETE FROM mdc.main.t WHERE id = 2;
 
 statement ok con2
-SELECT * FROM fabricator_delta_set_tblproperties('mdc', 'main.t', '{"custom.b":"2"}');
+SELECT * FROM mdc.delta.set_tblproperties('main.t', '{"custom.b":"2"}');
 
 # The message names the RULE rather than the version, so this assertion survives a section being added
 # above it — the ORDERING is pinned by the version ladder below instead, which is the stronger check.
@@ -3285,7 +3285,7 @@ SELECT count(*) FROM mdc.main.t WHERE id = 2;
 # COMMIT); and v6 being LAST proves the refused DML wrote nothing at all — a conflict that still committed
 # something would be a worse bug than the one this pins.
 query II
-SELECT version, operation FROM fabricator_delta_snapshots('mdc', 'main.t') ORDER BY version;
+SELECT version, operation FROM mdc.delta.snapshots('main.t') ORDER BY version;
 ----
 0	CREATE TABLE
 1	WRITE
@@ -3329,7 +3329,7 @@ SELECT id, extra FROM mdc.main.t2 ORDER BY id;
 100	NULL
 
 query II
-SELECT version, operation FROM fabricator_delta_snapshots('mdc', 'main.t2') ORDER BY version;
+SELECT version, operation FROM mdc.delta.snapshots('main.t2') ORDER BY version;
 ----
 0	CREATE TABLE
 1	WRITE

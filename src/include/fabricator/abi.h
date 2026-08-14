@@ -106,29 +106,18 @@ typedef enum {
 	FABRICATOR_META_COLUMN_NDV = 5, // two columns: column name, distinct-value estimate (NDV, as text)
 	FABRICATOR_META_FUNCTIONS = 6,  // discovered routines: schema, name, kind, param_count, return_type
 	FABRICATOR_META_SERVER_INFO = 7, // two columns: property, value — the detected server capability profile
-	FABRICATOR_META_SNAPSHOTS = 8,   // Delta only: a table's commit history (version, timestamp, operation,
-	                               // operation_parameters); arg1 = schema, arg2 = table
-	FABRICATOR_META_CHANGES = 9,     // Delta only: the Change Data Feed; arg1 = 'schema.table' ref,
-	                               // arg2 = "from:to" version range (to empty => latest)
-	FABRICATOR_META_TXN_VERSION = 10,     // Delta only: latest application-transaction (`txn`) version for an
-	                                    // app id; arg1 = 'schema.table' ref, arg2 = app_id. 1 row:
-	                                    // (app_id, version — NULL when never set). Additive, no ABI bump.
-	FABRICATOR_META_SET_TXN_VERSION = 11, // Delta only: PARK an application-transaction version on the current
-	                                    // explicit transaction (CAS + `txn` action at COMMIT — idempotent
-	                                    // appends). arg1 = 'schema.table' ref, arg2 = "app\nversion\nexpected"
-	                                    // (expected empty = must-not-exist). Additive, no ABI bump.
+	// Kinds 8-11 and 13-14 (SNAPSHOTS / CHANGES / TXN_VERSION / SET_TXN_VERSION / TBLPROPERTIES /
+	// SET_TBLPROPERTIES) are DELETED (ABI v70): Delta features that wore C++-registered function fronts
+	// (fabricator_delta_*) with string-packed payloads. They are catalog-bound functions in the `delta`
+	// schema now — cat.delta.snapshots('s.t') etc., declared by the Delta providers with TYPED args
+	// (Fabricator.Bridge/DeltaFunctions.cs). The gaps stay unassigned so a stale peer's kind cannot
+	// silently alias a new one.
 	FABRICATOR_META_VIRTUAL_COLUMNS = 12, // provider-declared VIRTUAL columns for a table (arg1 = schema,
 	                                    // arg2 = table): two string columns (name, type-text). The host
 	                                    // registers them as queryable-by-name virtual columns (not in
 	                                    // SELECT *). Delta: __delta_row_id / __delta_row_commit_version
 	                                    // (stable row tracking) under native_read + enableRowTracking;
 	                                    // others: empty. Additive, no ABI bump; fetch is best-effort.
-	FABRICATOR_META_TBLPROPERTIES = 13,     // Delta only: a table's delta.* properties as (property, value)
-	                                    // rows. arg1 = 'schema.table' ref. fabricator_delta_tblproperties(...).
-	FABRICATOR_META_SET_TBLPROPERTIES = 14, // Delta only: SET/UNSET table properties via a metaData commit.
-	                                    // arg1 = 'schema.table' ref, arg2 = JSON object of property->value
-	                                    // (null value = UNSET). fabricator_delta_set_tblproperties(...).
-	                                    // Additive, no ABI bump.
 	FABRICATOR_META_CATALOG_MACROS = 15, // provider-declared CATALOG-BOUND DuckDB macros: three string columns
 	                                    // (schema, name, create_sql) where create_sql is one complete CREATE
 	                                    // MACRO statement, parsed by DuckDB's OWN parser host-side. Bound into
@@ -919,7 +908,7 @@ typedef struct FabricatorHostServices {
 // state blob is this many bytes + a 4-byte length prefix). Serialize() must fit within it.
 #define FABRICATOR_AGG_SPILL_CAP 1024
 
-#define FABRICATOR_ABI_VERSION 69
+#define FABRICATOR_ABI_VERSION 70
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(FabricatorVTable) as seen

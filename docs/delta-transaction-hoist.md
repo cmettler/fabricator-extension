@@ -207,7 +207,7 @@ Consequences, both of which matter beyond slice 1a:
        `CdfReader` is all-or-nothing PER VERSION (`if (cdcFiles.Count > 0)` … `else` infer from add/remove),
        so a dropped insert-`cdc` simply hands the version back to inference, which reports the same rows,
        types, versions and timestamps. The one column that WOULD differ — row identity — is not projected by
-       `fabricator_delta_changes` at all, so no SQL query can tell the two apart. A gate written anyway would
+       `delta.changes` at all, so no SQL query can tell the two apart. A gate written anyway would
        have passed for a reason unrelated to what it claimed to check.
        - It is still the right change: it becomes observable the moment identity is passed (§6) or exposed,
          and "the actions I staged reach the commit" is not a property to leave resting on inference.
@@ -437,13 +437,13 @@ column at all. Both now answered, and they point opposite ways:
   it outright and has NOT been run.
 
 ⇒ **The defect is REAL in the bytes and currently LATENT in every shipping consumer**: Spark's
-`table_changes()` does not project identity, and neither does our own `fabricator_delta_changes`. Note the
+`table_changes()` does not project identity, and neither does our own `delta.changes`. Note the
 irony — EW's `CdfReader` *can* emit them (`EmitRowTracking` / `EmittedRowIdName`) and `StageChangeDataAsync`
 *can* accept them, so the capability exists at both ends and nothing in between asks. It becomes observable
 the moment anyone projects identity on a change feed, which is also when the wrong bytes would be believed.
 So: fix it, but as a fidelity task, not as a live-impact one — and do NOT describe it as user-visible today.
 
-- ⚠ **Any gate for it must assert the PARQUET, not the SQL.** `fabricator_delta_changes` projects only
+- ⚠ **Any gate for it must assert the PARQUET, not the SQL.** `delta.changes` projects only
   `id, val, _change_type, _commit_version, _commit_timestamp` — no identity column — so a SQL-level
   assertion cannot see the bug or its fix. Read `__delta_row_id` out of `_change_data/*.parquet` with
   `read_parquet`, which is how it was found.

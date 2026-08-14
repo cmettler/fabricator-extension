@@ -633,7 +633,7 @@ internal static class DeltaWriter
         //
         // The durable, per-table, visible-in-the-SQL route is unchanged:
         // CREATE TABLE ... WITH ("delta.isolationLevel"='WriteSerializable') or
-        // fabricator_delta_set_tblproperties. Spark HONORS such a value even though its own DDL refuses to
+        // delta.set_tblproperties. Spark HONORS such a value even though its own DDL refuses to
         // set it (measured 2026-07-31). docs/delta-transactions.md §10.6a.
         if (deletionVectors)
         {

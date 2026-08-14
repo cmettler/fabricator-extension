@@ -82,7 +82,7 @@ SELECT v::VARCHAR FROM lake.main.vt WHERE id = 6;
 
 # ---- feature declaration: the variantType reader+writer feature rides commit 0 ----
 query I
-SELECT count(*) FROM fabricator_delta_snapshots('lake', 'vt');
+SELECT count(*) FROM lake.delta.snapshots('vt');
 ----
 3
 

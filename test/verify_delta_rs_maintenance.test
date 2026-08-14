@@ -50,7 +50,7 @@ SELECT count(*) FROM lake.main.t;
 
 # OPTIMIZE is recorded in the commit history.
 query T
-SELECT operation FROM fabricator_delta_snapshots('lake', 'main.t') WHERE operation = 'OPTIMIZE';
+SELECT operation FROM lake.delta.snapshots('main.t') WHERE operation = 'OPTIMIZE';
 ----
 OPTIMIZE
 

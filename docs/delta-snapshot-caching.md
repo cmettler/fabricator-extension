@@ -416,7 +416,7 @@ examined. With a latest base that range is EMPTY and the append commits; with a 
 the transaction the range contains the property edit and **the append is refused**.
 
 MEASURED both ways on both engine legs (`verify_delta_catalog_transactions` §41): a buffered `INSERT` whose
-window contains a `fabricator_delta_set_tblproperties` commits, while a buffered `DELETE` — whose held
+window contains a `delta.set_tblproperties` commits, while a buffered `DELETE` — whose held
 `DeltaTransaction` IS pinned at statement time — conflicts with *"Concurrent commit N changed the table
 metadata."* Same table, same isolation, same property edit; the only difference is where the base came from.
 

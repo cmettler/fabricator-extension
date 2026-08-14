@@ -1,4 +1,4 @@
-# The catalog/table abstraction — design for retiring `get_metadata` (DESIGN ONLY, nothing built)
+# The catalog/table abstraction — design for retiring `get_metadata` (slices 1a/1b/2 BUILT, 3–5 open)
 
 > Written 2026-08-14 after the user's review: *"I don't like the getmetadata functions … there should be no
 > provider-specific function defined in C++, all must live in the providers … an abstraction similar to
@@ -68,14 +68,20 @@ function namespace** on every Delta catalog (exactly the `fabric` schema mechani
 
 ```sql
 SELECT * FROM lake.delta.snapshots('dbo.t');
-SELECT * FROM lake.delta.changes('dbo.t', 5);            -- named params: to := 9, and later
-                                                          -- from_ts := TIMESTAMP '…' (the deferred
-                                                          -- timestamp-bounds item becomes C#-ONLY)
+SELECT * FROM lake.delta.changes('dbo.t', starting_version := 5 [, ending_version := 9]);
+SELECT * FROM lake.delta.changes('dbo.t', starting_timestamp := TIMESTAMP '…');  -- the deferred
+                                                          -- timestamp-bounds item, banked C#-ONLY
 SELECT * FROM lake.delta.tblproperties('dbo.t');
 SELECT * FROM lake.delta.set_tblproperties('dbo.t', '…');
 SELECT * FROM lake.delta.get_transaction_version('dbo.t', 'app');
-SELECT * FROM lake.delta.set_transaction_version('dbo.t', 'app', 5 [, expected]);
+SELECT * FROM lake.delta.set_transaction_version('dbo.t', 'app', 5 [, expected := 4]);
 ```
+
+⚠ The bounds are NOT `from :=`/`to :=` — both are RESERVED WORDS, and a named parameter that is one is a
+PARSER error that reads as a broken function (the `offset :=` lesson). The Spark option vocabulary
+(`starting_version`/`ending_version`/`starting_timestamp`/`ending_timestamp`) is reserved-word-safe and
+carries Delta's boundary semantics in its own names (starting = first at-or-after, ending = last at-or-before).
+This doc's first draft wrote `from :=` and would not have bound.
 
 Then DELETE: kinds 8–14, the eight C++ registrations, their seven bind functions in
 `fabricator_extension.cpp`, and every provider's arms for those kinds. **Breaking, no aliases** (the
@@ -331,6 +337,35 @@ the same table the code evaluates.
    rewrite the consuming suites (`verify_delta_catalog_snapshots`, `verify_delta_txn_version`,
    `verify_delta_tblproperties`, `verify_delta_catalog_changes`) to the new spellings. Also banks the
    timestamp-bounds feature as C#-only.
+   - **BUILT — 2026-08-14 (ABI v70).** As-built notes that differ from or sharpen the design:
+     - **Kind 12 (VirtualColumns) is NOT deleted** — §1's "kinds 8–14" was imprecise: 12 is category A
+       (entry materialization) and lives until slice 4's `table_info`. Deleted: 8, 9, 10, 11, 13, 14, with
+       the gaps left unassigned so a stale peer's kind cannot silently alias a new one.
+     - **The bump to v70 is deliberate although no signature changed**: kind REMOVAL is the inverse of the
+       additive no-bump rule — a stale loadable would send kind 8 and get the provider's empty-table
+       fallback, i.e. silently wrong rather than loudly mismatched.
+     - **The function classes are SHARED and delegate-parameterized** (`Fabricator.Bridge/DeltaFunctions.cs`),
+       so DeltaRs declares `delta.snapshots`/`delta.changes` from the same six classes — which forced them
+       `public` (DeltaRs is a separate assembly; no InternalsVisibleTo). DeltaRs gained function hosting for
+       the first time (a `CatalogFunctionSet` + three ABI members off it).
+     - **Two binding shapes, and the split is the §2.1 side-effect rule made concrete**
+       (`StreamTableBinding`): FIXED schema + execution-deferred core for anything side-effecting or
+       fixed-shape (both `set_*`, `tblproperties`, `get_transaction_version` — matching the old C++'s
+       deliberate no-probe binds), and a bind-time PEEKED stream only for the two whose output schema
+       depends on the table (`snapshots`, `changes` — the cost the old schema probe already paid).
+     - **⚠ The bounds are `starting_version`/`ending_version`/`starting_timestamp`/`ending_timestamp`, NOT
+       `from`/`to`** — both reserved words; a named parameter that is one is a PARSER error (caught before
+       shipping; the doc's own §2.1 first draft had it wrong).
+     - Timestamp bounds resolve in `DeltaReader.GetChangesBounded` — deliberately NOT on
+       `ResolveVersionAsOf`, whose fall-back-to-latest is right for snapshot PINNING and silently wrong for
+       a feed bound. Out-of-history bounds yield an EMPTY feed, never an error.
+     - The `delta` schema is advertised by `CatalogSchemaNames` on EVERY Delta attach (vs `fabric`'s
+       OneLake gate) and refused for DDL by the same `RejectFunctionSchemaDdl`; the fixed row schemas are
+       single instances shared by declaration and batches (`AppTxnSchema`/`PropertiesSchema`) so they
+       cannot drift.
+     - Gates: hermetic tier (all 22 consuming suites rewritten; `verify_delta_catalog_changes` +16 for the
+       timestamp bounds incl. the version-equivalence assertion, `verify_delta_catalog_functions` §8 +17
+       for the namespace advertisement / declarations / DDL refusal) + service tier.
 3. **`open_catalog` capability JSON** — kills the ServerInfo grep; small ABI bump.
 4. **The `table_*` session** — the big one: `ITable` in Abstractions, four providers, the C++ entry/DML
    operators re-pointed at table handles, `get_metadata` deleted. One ABI bump for the whole slice.

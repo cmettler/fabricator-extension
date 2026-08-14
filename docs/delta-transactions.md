@@ -131,7 +131,7 @@ equivalent):
 | RENAME TABLE | immediate (physical folder move) — **except** a pending-created table, which re-keys the buffer + moves the eagerly-streamed files (the dbt tmp-swap case) | |
 | CREATE OR REPLACE, DROP, OPTIMIZE, VACUUM | **immediate**, never buffered; rejected with "uncommitted buffered changes" if the table has pending changes | replace removes are snapshot-coupled; DROP/VACUUM are physical |
 | CDF tables (any DML/append) | the statement's `_change_data` files are written eagerly (split per partition, partition columns excluded from the bytes) and the cdc actions parked — **including plain inserts** (a commit carrying any cdc action is read cdc-only, so appends fused with DML would otherwise vanish from the feed) | DML-after-buffered-ALTER on CDF rejected; identity×CDF in a txn rejected |
-| `fabricator_delta_set_transaction_version(…)` | parks the app-transaction version; flush CASes it against the latest snapshot and emits the spec `txn` action atomically with the fused commit (idempotent-append protection) | requires an explicit transaction |
+| `delta.set_transaction_version(…)` | parks the app-transaction version; flush CASes it against the latest snapshot and emits the spec `txn` action atomically with the fused commit (idempotent-append protection) | requires an explicit transaction |
 
 A statement error **aborts the whole DuckDB transaction** (standard DuckDB behavior); the buffer is
 discarded on rollback.
@@ -630,11 +630,11 @@ like any concurrent commit; delta-rs gets native S3 conditional-put with
 
 Plain OCC cannot protect a *retried batch whose first attempt actually committed*
 (crash-after-commit). Use Delta **application transactions**:
-`CALL fabricator_delta_set_transaction_version(catalog, 'schema.table', app_id, version [, expected_previous])`
+`SELECT * FROM <catalog>.delta.set_transaction_version('schema.table', app_id, version [, expected := previous])`
 inside the explicit transaction — the flush compare-and-swaps against the latest snapshot's
 `AppTransactions` on every retry attempt and emits the spec `txn` action atomically with the fused
 commit; a duplicate retry fails the CAS ("transaction version conflict") instead of duplicating
-data. Read the committed high-water mark with `fabricator_delta_get_transaction_version(…)`.
+data. Read the committed high-water mark with `<catalog>.delta.get_transaction_version(…)`.
 
 ### 8.3 S3 without a NAMED secret — MEASURED 2026-08-02 (it had only been INFERRED), and it is worse than the caveat said
 
@@ -1069,7 +1069,7 @@ OSS Delta **knows** the enum value — it is the **table-property validator** th
    commits; on the unstamped one, `Serializable`. The only input that differed was the property, so
    Spark is reading it and committing at it. (In both, our own commits show a blank in that column —
    consequence 2.) Caveat: such a table's isolation is no longer manageable **from Spark** (its ALTER
-   rejects every value except `Serializable`) — change it with `fabricator_delta_set_tblproperties`.
+   rejects every value except `Serializable`) — change it with `delta.set_tblproperties`.
 
    **Does the level actually change Spark's conflict behaviour, or is it just recorded?** Two of the
    three links are now established from primary sources; the third is inferred.
@@ -1224,14 +1224,14 @@ Declaring a level is now explicit and per-table:
 
 ```sql
 CREATE TABLE lake.main.t WITH ("delta.isolationLevel"='WriteSerializable') AS SELECT …;
-SELECT * FROM fabricator_delta_set_tblproperties('lake', 'main.t',
+SELECT * FROM lake.delta.set_tblproperties('main.t',
                                                  '{"delta.isolationLevel":"WriteSerializable"}');
 ```
 
 That is the spelling to use when another engine must honour the looser level, and it works: Fabric
 Spark refuses to *set* `WriteSerializable` via its own DDL but **honours** it when it is already on the
 table (both measured). Trade-off: such a table's level then cannot be changed *from* Spark — use
-`fabricator_delta_set_tblproperties`.
+`delta.set_tblproperties`.
 
 Gate: `verify_delta_tblproperties` (58) pins the default itself, that neither level auto-stamps, and
 that the explicit `WITH` still lands in commit-0. It has to pin the default directly, because every

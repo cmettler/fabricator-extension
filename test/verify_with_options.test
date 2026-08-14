@@ -138,7 +138,7 @@ AS SELECT 1 AS id;
 
 # the well-known key is re-cased to its spec spelling (DuckDB's parser lowercases WITH keys)
 query II
-SELECT property, value FROM fabricator_delta_tblproperties('lake', 'main.proptest')
+SELECT property, value FROM lake.delta.tblproperties('main.proptest')
 WHERE property IN ('delta.isolationLevel', 'fabricator.mytag') ORDER BY 1;
 ----
 delta.isolationLevel	Serializable
@@ -182,7 +182,7 @@ WHERE content LIKE '%deletionVectors%' OR content LIKE '%columnMapping%';
 0
 
 query II
-SELECT property, value FROM fabricator_delta_tblproperties('lake', 'main.txnopt')
+SELECT property, value FROM lake.delta.tblproperties('main.txnopt')
 WHERE property = 'delta.isolationLevel' ORDER BY 1;
 ----
 delta.isolationLevel	Serializable
@@ -350,7 +350,7 @@ ZSTD
 
 # The feed itself is still correct — a write-options change must not alter what the UPDATE recorded.
 query II
-SELECT _change_type, count(*) FROM fabricator_delta_changes('lake9', 'main.t', 2)
+SELECT _change_type, count(*) FROM lake9.delta.changes('main.t', starting_version := 2)
 WHERE _change_type LIKE 'update_%' GROUP BY 1 ORDER BY 1;
 ----
 update_postimage	100
@@ -577,7 +577,7 @@ statement ok
 CREATE OR REPLACE TABLE lake.main.persist WITH (parquet_compression='zstd') AS SELECT i::BIGINT AS id FROM range(2000) r(i);
 
 query II
-SELECT property, value FROM fabricator_delta_tblproperties('lake', 'main.persist')
+SELECT property, value FROM lake.delta.tblproperties('main.persist')
 WHERE property LIKE 'fabricator.parquet.%' ORDER BY property;
 ----
 fabricator.parquet.compression	zstd
@@ -666,7 +666,7 @@ statement ok
 CREATE OR REPLACE TABLE lake.main.persist AS SELECT i::BIGINT AS id FROM range(100) r(i);
 
 query II
-SELECT property, value FROM fabricator_delta_tblproperties('lake', 'main.persist')
+SELECT property, value FROM lake.delta.tblproperties('main.persist')
 WHERE property LIKE 'fabricator.parquet.%' ORDER BY property;
 ----
 fabricator.parquet.compression	zstd
@@ -685,7 +685,7 @@ statement ok
 CREATE OR REPLACE TABLE lake.main.allkeys WITH (parquet_compression='zstd', parquet_row_group_size=4096, parquet_version='V2', parquet_dictionary_size_limit=512) AS SELECT i::BIGINT AS id FROM range(100) r(i);
 
 query II
-SELECT property, value FROM fabricator_delta_tblproperties('lake', 'main.allkeys')
+SELECT property, value FROM lake.delta.tblproperties('main.allkeys')
 WHERE property LIKE 'fabricator.parquet.%' ORDER BY property;
 ----
 fabricator.parquet.compression	zstd
@@ -732,7 +732,7 @@ DETACH lakec;
 # well-formed option this engine cannot honour is correct; swallowing an UNPARSEABLE one is not.
 
 statement ok
-SELECT count(*) FROM fabricator_delta_set_tblproperties('lake', 'main.allkeys', '{"fabricator.parquet.row_group_size":"lots"}');
+SELECT count(*) FROM lake.delta.set_tblproperties('main.allkeys', '{"fabricator.parquet.row_group_size":"lots"}');
 
 statement error
 INSERT INTO lake.main.allkeys SELECT 999::BIGINT;
@@ -748,7 +748,7 @@ fabricator.parquet.row_group_size
 
 # ...and it is recoverable from SQL, which is what makes refusing acceptable rather than a trap.
 statement ok
-SELECT count(*) FROM fabricator_delta_set_tblproperties('lake', 'main.allkeys', '{"fabricator.parquet.row_group_size":"4096"}');
+SELECT count(*) FROM lake.delta.set_tblproperties('main.allkeys', '{"fabricator.parquet.row_group_size":"4096"}');
 
 statement ok
 INSERT INTO lake.main.allkeys SELECT 999::BIGINT;
@@ -776,7 +776,7 @@ statement ok
 RESET preserve_insertion_order;
 
 query II
-SELECT property, value FROM fabricator_delta_tblproperties('lake', 'main.rgb')
+SELECT property, value FROM lake.delta.tblproperties('main.rgb')
 WHERE property LIKE 'fabricator.parquet.%' ORDER BY property;
 ----
 fabricator.parquet.row_group_size_bytes	1048576
@@ -858,7 +858,7 @@ SELECT count(*) FROM (
 
 # It persists like the rest of the tuning.
 query II
-SELECT property, value FROM fabricator_delta_tblproperties('lv', 'main.hi')
+SELECT property, value FROM lv.delta.tblproperties('main.hi')
 WHERE property = 'fabricator.parquet.compression_level';
 ----
 fabricator.parquet.compression_level	19
@@ -897,7 +897,7 @@ SELECT CASE WHEN (SELECT sum(bloom_filter_length) FROM parquet_metadata('${FABRI
 1
 
 query II
-SELECT property, value FROM fabricator_delta_tblproperties('lv', 'main.b1')
+SELECT property, value FROM lv.delta.tblproperties('main.b1')
 WHERE property = 'fabricator.parquet.bloom_filter_false_positive_ratio';
 ----
 fabricator.parquet.bloom_filter_false_positive_ratio	0.3

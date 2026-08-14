@@ -278,7 +278,17 @@ case "$TIER" in
         # with the declaration for almost every query and disagrees exactly out of schema order — where the
         # failure is SIGSEGV, not a wrong answer. Mutation-tested: the request-order mutant crashes there
         # after 67 assertions pass.
-        : "${MIN_ASSERTIONS:=7076}"
+        # 7185 since 2026-08-14, from a green tier run (⚠ 7152 - 7076 = 76 of the gap predates this — the
+        # batched-read routing gate (+25), verify_delta_catalog_time_travel 49 -> 98 and the DeltaTxnScope
+        # autocommit-pin repoints raised the actual without raising the floor; closed here like the earlier
+        # lags). The +33 of this change: verify_delta_catalog_changes 73 -> 89 — the delta.changes TIMESTAMP
+        # bounds (ABI v70, the delta.* namespace), pinned as ts≡version EQUIVALENCE plus both out-of-history
+        # directions as EMPTY feeds plus the three mutual-exclusion refusals, because an off-by-one in
+        # "first version at-or-after" is invisible without the equivalence assertion — and
+        # verify_delta_catalog_functions 28 -> 45, §8: the `delta` FUNCTION schema is ADVERTISED on a LOCAL
+        # attach (the host silently drops functions in an unadvertised schema — the measured fabric-schema
+        # failure shape), all six functions declared as table functions, and DDL into the namespace refused.
+        : "${MIN_ASSERTIONS:=7185}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh
@@ -369,7 +379,11 @@ case "$TIER" in
         # both legs take the same route and the section stops varying with MARS at all — mars_dynamic §3 was
         # the load-bearing one, and re-pinning its 200 to 400 would have left it asserting nothing. Both now
         # discriminate on observables `materialize` cannot reach.
-        : "${MIN_ASSERTIONS:=2024}"
+        # 2028 since 2026-08-14, from a green tier run: the 4-assertion lag predates this change (the tier
+        # measured 2028 for both slice-1 gates already; the floor was not raised then). The delta.*
+        # namespace rewrite (ABI v70) changed only SPELLINGS on this tier — verify_delta_catalog_s3 and
+        # friends kept their exact counts, which is the behaviour-preservation claim.
+        : "${MIN_ASSERTIONS:=2028}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

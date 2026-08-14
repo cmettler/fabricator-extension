@@ -304,7 +304,7 @@ SELECT fabricator_exec('rs', 'OPTIMIZE main.t');
 # The compaction really committed — asserted, because a no-op OPTIMIZE would leave nothing to rebase
 # across and the COMMIT below would then prove nothing.
 query T con2
-SELECT operation FROM fabricator_delta_snapshots('rs', 't') WHERE version = 4;
+SELECT operation FROM rs.delta.snapshots('t') WHERE version = 4;
 ----
 OPTIMIZE
 

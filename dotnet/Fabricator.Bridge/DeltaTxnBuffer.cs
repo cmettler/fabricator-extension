@@ -106,7 +106,7 @@ internal sealed class DeltaTxnBuffer
 
         // ---- APPLICATION TRANSACTION versions (Delta `txn` action — idempotent appends) ----
         // appId -> (version to commit, expected previous version — null = "must not exist yet").
-        // Parked by fabricator_delta_set_transaction_version; the flush validates the CAS against the LATEST
+        // Parked by delta.set_transaction_version; the flush validates the CAS against the LATEST
         // snapshot and emits one `txn` action per app in the SAME fused commit.
         public Dictionary<string, (long Version, long? Expected)> AppTxnVersions { get; } =
             new(System.StringComparer.Ordinal);

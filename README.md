@@ -1536,7 +1536,7 @@ SELECT fabricator_exec('lake', 'OPTIMIZE main.t');               -- ZSTD (so com
 That is what makes it worth configuring a dbt model once instead of re-stating the tuning on every
 incremental run — and it means a table written zstd stays zstd when someone else compacts it. The keys are
 stored in the Delta table configuration as `fabricator.parquet.*`, visible via
-`fabricator_delta_tblproperties`.
+`<catalog>.delta.tblproperties('<schema.>table')`.
 
 **Precedence, lowest first: ATTACH default < `SET delta_write_options` < the table's property < the
 statement's `WITH`.** The property outranks the session setting deliberately — it is a property *of the
@@ -1546,8 +1546,7 @@ remains the per-statement escape hatch.
 ⚠ A `CREATE OR REPLACE` **inherits** the declaration and cannot **change** it: its `WITH` applies to that
 statement's write only. (Same as every create flag — `deletion_vectors` and friends are also fixed at
 creation.) To change a declaration, use
-`SELECT * FROM fabricator_delta_set_tblproperties('lake', 'main.t',
-'{"fabricator.parquet.compression":"gzip"}')` (a table function, so it needs the `FROM`).
+`SELECT * FROM lake.delta.set_tblproperties('main.t', '{"fabricator.parquet.compression":"gzip"}')` (a table function, so it needs the `FROM`).
 A bare `CREATE TABLE ... WITH (<tuning>)` with no `AS SELECT` is still refused — there is no write for it to
 apply to.
 
@@ -1837,7 +1836,7 @@ principal wins even if `PROVIDER` says something else:
 > unchecked data. Do those statements from Spark, or drop the constraint first:
 >
 > ```sql
-> SELECT * FROM fabricator_delta_set_tblproperties('lake', 'main.t', '{"delta.constraints.pos":null}');
+> SELECT * FROM lake.delta.set_tblproperties('main.t', '{"delta.constraints.pos":null}');
 > ```
 >
 > The same applies to a column invariant (`delta.invariants`) and to generated columns. Note
@@ -1881,9 +1880,9 @@ principal wins even if `PROVIDER` says something else:
 | `DROP TABLE`, `ALTER TABLE … ADD COLUMN`, `RENAME TABLE` (local + OneLake) | ✅ |
 | Multi-schema: `schemas true` (local/S3 `<root>/<schema>/<table>`); schema-enabled OneLake lakehouses | ✅ |
 | Time travel: `FROM t AT (VERSION => n)` and `AT (TIMESTAMP => ts)` | ✅ |
-| Snapshots/history: `fabricator_delta_snapshots('<catalog>', '<schema.>table')` | ✅ |
-| **Exactly-once appends** (Delta application transactions / Spark `txnAppId`): `fabricator_delta_set_transaction_version` + `_get_transaction_version` | ✅ |
-| **Change Data Feed**: `change_data_feed true` + `fabricator_delta_changes('<catalog>', '<schema.>table', from[, to])` | ✅ |
+| Snapshots/history: `<catalog>.delta.snapshots('<schema.>table')` | ✅ |
+| **Exactly-once appends** (Delta application transactions / Spark `txnAppId`): `<catalog>.delta.set_transaction_version` + `.get_transaction_version` | ✅ |
+| **Change Data Feed**: `change_data_feed true` + `<catalog>.delta.changes('<schema.>table', starting_version := n, ...)` — version OR timestamp bounds | ✅ |
 | **Partitioning**: native `CREATE TABLE … PARTITIONED BY (cols)` (or the `delta_write_options` setting) → Hive `col=value/` layout | ✅ |
 
 | **Write tuning**: compression / row-group size / bloom filters via ATTACH options, the `delta_write_options` setting, or per-table `WITH (…)` | ✅ |
@@ -1908,22 +1907,34 @@ principal wins even if `PROVIDER` says something else:
 ```sql
 -- Time travel + history
 SELECT * FROM lake.main.t AT (VERSION => 3);
-SELECT version, operation, timestamp FROM fabricator_delta_snapshots('lake', 'main.t') ORDER BY version;
+SELECT version, operation, timestamp FROM lake.delta.snapshots('main.t') ORDER BY version;
 
 -- Change Data Feed (enable per catalog at ATTACH, then read the row-level feed)
 ATTACH '/lake/root' AS cdf (TYPE fabricator, PROVIDER 'delta', change_data_feed true);
 CREATE TABLE cdf.main.t AS SELECT * FROM (VALUES (1,'a'),(2,'b')) v(id,val);
 DELETE FROM cdf.main.t WHERE id = 2;
 SELECT _change_type, id, val, _commit_version, _commit_timestamp
-  FROM fabricator_delta_changes('cdf', 'main.t', 0);     -- to omitted => latest
+  FROM cdf.delta.changes('main.t', starting_version := 0);   -- ending_version omitted => latest
 -- insert/insert (v1), delete (v2): each row tagged with its commit version + timestamp (epoch ms)
+
+-- Or bound the feed by TIME instead of version (UTC): starting_timestamp = the first version committed
+-- AT OR AFTER that instant, ending_timestamp = the last AT OR BEFORE it (Spark's starting/endingTimestamp
+-- semantics). A bound past either end of the history yields an EMPTY feed, never an error.
+SELECT _change_type, id, val
+  FROM cdf.delta.changes('main.t', starting_timestamp := TIMESTAMP '2026-08-14 00:00:00');
 ```
+
+> The `delta.*` functions are catalog-bound: they live in a synthetic `delta` schema every Delta attach
+> advertises (`snapshots`, `changes`, `tblproperties`, `set_tblproperties`, `get_transaction_version`,
+> `set_transaction_version`), always addressed through the catalog — `lake.delta.snapshots('main.t')`.
+> Before 2026-08-14 they were global functions taking the catalog name as their first argument
+> (`fabricator_delta_snapshots('lake', 'main.t')`); those spellings are **gone**, no aliases.
 
 > **Caveat if you also use `row_tracking true` and read the feed from another engine.** An `INSERT` run
 > inside an explicit `BEGIN … COMMIT` writes a `_change_data` file whose row-id columns are **NULL**, where
 > the same `INSERT` in autocommit records no change file at all and a reader derives real row ids from the
 > data file. The rows, change types, commit versions and timestamps are identical either way — and
-> `fabricator_delta_changes` never projects row identity — so this is invisible through DuckDB and matters
+> `delta.changes` never projects row identity — so this is invisible through DuckDB and matters
 > only to a reader that consumes the row-identity columns a change file carries. Measured, being fixed;
 > details in [docs/delta-transaction-hoist.md](docs/delta-transaction-hoist.md) §6.
 
@@ -1992,10 +2003,10 @@ A producer that may be replayed (a retried job, a restarted stream) records how 
 record commits **atomically with the data**, so there is no window in which one exists without the other.
 This is Delta's `txn` action — the same mechanism as Spark's `txnAppId`/`txnVersion` and duckdb-delta's.
 
-`fabricator_delta_set_transaction_version(catalog, '<schema.>table', app_id, version [, expected_previous])`
+`<catalog>.delta.set_transaction_version('<schema.>table', app_id, version [, expected := previous])`
 **parks** the version on the current transaction; at `COMMIT` it is compared-and-swapped against the
 latest snapshot. It therefore **requires an explicit `BEGIN … COMMIT`** — that is what makes the swap
-atomic with the write. Omit `expected_previous` to mean *"the table must record nothing for this
+atomic with the write. Omit `expected` to mean *"the table must record nothing for this
 producer yet"* (a first batch); pass it to chain batch to batch.
 
 ```sql
@@ -2003,23 +2014,23 @@ ATTACH '/lake/root' AS lake (TYPE fabricator, PROVIDER 'delta');
 CREATE TABLE lake.main.t (id INTEGER);
 
 BEGIN;
-CALL fabricator_delta_set_transaction_version('lake', 't', 'loader', 1);
+SELECT * FROM lake.delta.set_transaction_version('t', 'loader', 1);
 INSERT INTO lake.main.t VALUES (1), (2);
 COMMIT;                                   -- data + the txn action, one version
 
-SELECT * FROM fabricator_delta_get_transaction_version('lake', 't', 'loader');
+SELECT * FROM lake.delta.get_transaction_version('t', 'loader');
 -- loader  1
 
 -- A REPLAY of that same batch fails the compare-and-set instead of duplicating the rows:
 BEGIN;
-CALL fabricator_delta_set_transaction_version('lake', 't', 'loader', 1);
+SELECT * FROM lake.delta.set_transaction_version('t', 'loader', 1);
 INSERT INTO lake.main.t VALUES (1), (2);
 COMMIT;                                   -- error: transaction version conflict … for 'loader'
                                           -- the table still holds 2 rows
 
 -- The next batch states the version it expects to be at:
 BEGIN;
-CALL fabricator_delta_set_transaction_version('lake', 't', 'loader', 2, 1);
+SELECT * FROM lake.delta.set_transaction_version('t', 'loader', 2, expected := 1);
 INSERT INTO lake.main.t VALUES (3);
 COMMIT;
 ```
@@ -2038,7 +2049,7 @@ un-commit. Read the recorded version back and decide whether the batch still nee
 > DELETE FROM lake.main.t WHERE id = 2;
 >
 > -- connection 2, before connection 1 commits
-> SELECT * FROM fabricator_delta_set_tblproperties('lake', 'main.t', '{"custom.k":"v"}');
+> SELECT * FROM lake.delta.set_tblproperties('main.t', '{"custom.k":"v"}');
 >
 > -- connection 1
 > COMMIT;
@@ -2068,7 +2079,7 @@ un-commit. Read the recorded version back and decide whether the batch still nee
 >
 > **⚠ And a transaction that CHANGES the schema or properties gives up its own exemption (2026-08-13).**
 > A plain append normally commutes with whatever else lands in the window. But if *your* transaction also
-> carries an `ALTER TABLE`, a `fabricator_delta_set_tblproperties`, or an insert into an `IDENTITY` table
+> carries an `ALTER TABLE`, a `delta.set_tblproperties`, or an insert into an `IDENTITY` table
 > (which records a high-water mark), it can now conflict with someone else's concurrent append. The reason
 > is that an append written against the old schema need not still be valid under your new one, so the
 > exemption is withdrawn — this is what Delta itself does at `write_serializable`, the default here. Retry
@@ -2335,7 +2346,7 @@ CREATE TABLE lake.main.t WITH ("delta.isolationLevel"='Serializable', "fabricato
 > - `delta.isolationLevel` — a table's own level outranks the catalog's `isolation_level`. ⚠ **The catalog's
 >   level is never written into a table** — not the default, and not an explicit `isolation_level` on the
 >   ATTACH. It governs how *this* attach's transactions behave; only `WITH (…)` or
->   `fabricator_delta_set_tblproperties` makes a durable declaration other engines can read. That matters
+>   `delta.set_tblproperties` makes a durable declaration other engines can read. That matters
 >   because silence does **not** mean agreement: a table declaring nothing is read as `Serializable` by
 >   Spark and as `WriteSerializable` by us, so if you rely on row-level concurrency across engines, declare
 >   it on the table.

@@ -27,7 +27,7 @@ namespace Fabricator.Bridge;
 /// otherwise, and it is correct rather than degraded, so it is not a warning).</para>
 ///
 /// <para><b>⚠ Ignoring a well-formed-but-unhonourable option is correct; swallowing an UNPARSEABLE one is
-/// not.</b> <c>fabricator_delta_set_tblproperties</c> can write arbitrary <c>fabricator.*</c> keys, so someone
+/// not.</b> <c>delta.set_tblproperties</c> can write arbitrary <c>fabricator.*</c> keys, so someone
 /// WILL hand-set a garbage value. <see cref="Parse"/> therefore THROWS on a malformed value, naming the key and
 /// what was expected. That is not in tension with the paragraph above: the two cases are "this engine cannot do
 /// what you asked" (ignore) and "nobody could do what you asked" (refuse).</para>
@@ -128,7 +128,7 @@ internal sealed record ParquetTuning(
         {
             throw new ArgumentException(
                 $"Delta table property \"{key}\" has the value '{s}', which is not a positive whole number. "
-                + "Fix it with fabricator_delta_set_tblproperties, or unset it.");
+                + "Fix it with delta.set_tblproperties, or unset it.");
         }
         return v;
     }
@@ -140,7 +140,7 @@ internal sealed record ParquetTuning(
         {
             throw new ArgumentException(
                 $"Delta table property \"{key}\" has the value '{s}', which is not a positive whole number. "
-                + "Fix it with fabricator_delta_set_tblproperties, or unset it.");
+                + "Fix it with delta.set_tblproperties, or unset it.");
         }
         return v;
     }
@@ -156,7 +156,7 @@ internal sealed record ParquetTuning(
         {
             throw new ArgumentException(
                 $"Delta table property \"{key}\" has the value '{s}', which is not a false-positive rate "
-                + "between 0 and 1 (exclusive). Fix it with fabricator_delta_set_tblproperties, or unset it.");
+                + "between 0 and 1 (exclusive). Fix it with delta.set_tblproperties, or unset it.");
         }
         return v;
     }

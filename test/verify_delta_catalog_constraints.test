@@ -232,6 +232,6 @@ SELECT count(*) FROM w.main.txn;
 # the CTAS data write is one WRITE version; the two INSERTs in BEGIN..COMMIT flushed as ONE more;
 # the rolled-back INSERT wrote nothing
 query I
-SELECT count(*) FROM fabricator_delta_snapshots('w', 'txn') WHERE operation = 'WRITE';
+SELECT count(*) FROM w.delta.snapshots('txn') WHERE operation = 'WRITE';
 ----
 2

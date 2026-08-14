@@ -11,7 +11,7 @@ namespace Fabricator.Bridge.Tests;
 /// What these tests are FOR, beyond coverage: the property is written by a CREATE and read back by an INSERT /
 /// UPDATE post-image / OPTIMIZE, possibly in a different process by a different engine, so the round trip is
 /// the contract. And the malformed-value cases are reachable from SQL only through
-/// <c>fabricator_delta_set_tblproperties</c>, so covering them at the SQL tier would cost a service-tier round
+/// <c>delta.set_tblproperties</c>, so covering them at the SQL tier would cost a service-tier round
 /// trip each — while the whole class of "a garbage value must be REFUSED, whereas an unhonourable one must be
 /// IGNORED" is decided entirely in this file.
 /// </remarks>

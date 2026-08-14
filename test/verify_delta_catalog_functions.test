@@ -182,3 +182,47 @@ true
 
 statement ok
 DETACH lake;
+
+# ---- 8. the `delta` FUNCTION NAMESPACE — declared on EVERY Delta attach (local included) --------------------
+# The delta.* functions replaced the C++-registered fabricator_delta_* fronts (metadata kinds 8-11/13-14,
+# deleted at ABI v70). Three properties pinned, each a distinct failure shape:
+#   (a) the schema is ADVERTISED — the host drops a declared function whose schema it did not register, so a
+#       regression in CatalogSchemaNames makes all six functions vanish with NO error (measured for `fabric`:
+#       the ATTACH succeeds and the call fails as "Table Function ... does not exist");
+#   (b) all six functions are declared IN it, as table functions;
+#   (c) DDL into it is REFUSED — a CREATE TABLE there would make a real delta/ folder that the NEXT attach
+#       discovers as a data schema, silently un-separating the namespace.
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/fnroot2' AS dns (TYPE fabricator, PROVIDER 'delta');
+
+query I
+SELECT count(*) FROM duckdb_schemas() WHERE database_name = 'dns' AND schema_name = 'delta';
+----
+1
+
+query II
+SELECT function_name, function_type FROM duckdb_functions()
+WHERE database_name = 'dns' AND schema_name = 'delta'
+ORDER BY function_name;
+----
+changes	table
+get_transaction_version	table
+set_tblproperties	table
+set_transaction_version	table
+snapshots	table
+tblproperties	table
+
+# One of them actually EXECUTES against this catalog (the empty root discovers no tables, so an unknown table
+# is the honest probe — the function is reachable and resolves the reference, then reports absence).
+statement error
+SELECT * FROM dns.delta.snapshots('main.nosuch');
+----
+
+statement error
+CREATE TABLE dns.delta.t (x INTEGER);
+----
+<REGEX>:.*FUNCTION namespace.*
+
+statement ok
+DETACH dns;

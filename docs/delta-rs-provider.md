@@ -23,8 +23,8 @@ end on Windows via `test/verify_delta_rs.test` (25 assertions) and a live shell 
   table→create; `SCHEMA_MODE 'overwrite'` adopts the incoming schema (SchemaMode::Overwrite), `'merge'` appends
   + unions new source columns, old rows NULL (SchemaMode::Merge — see below)); **DELETE + UPDATE** (rowid →
   record-batch MERGE, see below); **time travel** (`AT (VERSION => n)`,
-  via QueryAsync, see below); **snapshots** (`fabricator_delta_snapshots` → `HistoryAsync`); **Change Data Feed**
-  (`change_data_feed` option + `fabricator_delta_changes`, see below); **maintenance** (OPTIMIZE / Z-ORDER /
+  via QueryAsync, see below); **snapshots** (`<catalog>.delta.snapshots` → `HistoryAsync`); **Change Data Feed**
+  (`change_data_feed` option + `<catalog>.delta.changes`, see below); **maintenance** (OPTIMIZE / Z-ORDER /
   VACUUM / CHECKPOINT, see below); re-attach durability. Tests: `verify_delta_rs.test` (56) +
   `_maintenance` (12) + `_pushdown` (27) + `_cdf` (31) + `_time_travel` (39) + `_copy` (29) + `_alter` (47). No regression to
   the engineered-wood provider.
@@ -38,7 +38,7 @@ end on Windows via `test/verify_delta_rs.test` (25 assertions) and a live shell 
   is our empty CREATE commit anyway). **TIMESTAMP travel works too** (`LoadDateTimeAsync` resolves the version
   as of the instant): `now()`/future → the latest snapshot, an instant before commit-0 → the empty v0.
 - **Change Data Feed**: `ATTACH '(… change_data_feed true)'` enables `delta.enableChangeDataFeed` on tables
-  created in the catalog; read the row-level feed via `fabricator_delta_changes('<catalog>', '<schema.>table',
+  created in the catalog; read the row-level feed via `<catalog>.delta.changes('<schema.>table', starting_version := n
   from [, to])` → `QueryTableChangesAsync` (`_change_type` / `_commit_version` / `_commit_timestamp`).
 - **Maintenance** (delta-rs ops engineered-wood lacks) via a small command dialect on
   `fabricator_exec('<catalog>', '<cmd>')` (implemented in `ExecuteNonQuery`, C#-only, no ABI/C++ change):
@@ -246,8 +246,8 @@ its two native DLLs (the +240 MB cost). A net10 host referencing the net9.0 asse
 | `ScanTable(specJson, filterValues)` | `QueryAsync(SelectQuery "SELECT <cols> FROM t WHERE <pred>")` → `IAsyncEnumerable<RecordBatch>` | ✅ streaming + **file/stats-skipping pushdown** via DataFusion; translate our `FilterNode`→SQL WHERE. (`ReadAsArrowTableAsync` materializes the whole table — only for small/whole reads) |
 | `BulkInsert` (create/replace/append) | `CreateTableAsync` + `InsertAsync(SaveMode.Append/Overwrite)`; `InsertAsync(IArrowArrayStream)` streams; `MaxRowsPerGroup` tuning | ✅ clean; **standard-compliant writes** (kills the Fabric/Spark read-compat battles) |
 | time travel (`spec.At`) | `LoadTableAsync{Version=n}` / `LoadDateTimeAsync(ts)` | ✅ native **version and timestamp** |
-| `fabricator_delta_snapshots` | `HistoryAsync(limit)` → `CommitInfo[]` (operation, params, timestamp, isolation, blind-append) | ✅ richer than ours |
-| `fabricator_delta_changes` (CDF) | `QueryTableChangesAsync(start, end)` → `_change_type`/`_commit_version`/`_commit_timestamp` | ✅ native |
+| `delta.snapshots` | `HistoryAsync(limit)` → `CommitInfo[]` (operation, params, timestamp, isolation, blind-append) | ✅ richer than ours |
+| `delta.changes` (CDF) | `QueryTableChangesAsync(start, end)` → `_change_type`/`_commit_version`/`_commit_timestamp` | ✅ native |
 | **`ExecuteDelete(keys)`** | `DeleteAsync(predicate)` — no rowid/position API | ⚠️ **mismatch — see below** |
 | **`ExecuteUpdate(setCols, data)`** | `UpdateAsync(sqlString)` — no rowid/position API | ⚠️ **mismatch** |
 | `AlterTable(AddColumn)` | *no add-column API* (only `InsertOptions.OverwriteSchema` on a write) | ❌ **regresses** vs engineered-wood's `AddColumnAsync` |

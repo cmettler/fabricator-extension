@@ -204,7 +204,7 @@ public sealed class DeltaCatalog : IBackendCatalog
     // to a version (engineered-wood reads inCommitTimestamp, not commit-file mtime). VERSION travel works without it.
     private readonly bool _inCommitTimestampsOnCreate;
     // ATTACH option `change_data_feed true`: tables CREATED here enable delta.enableChangeDataFeed, so DELETE/UPDATE
-    // write _change_data files and fabricator_delta_changes(...) returns a correct row-level change feed.
+    // write _change_data files and delta.changes(...) returns a correct row-level change feed.
     private readonly bool _changeDataFeedOnCreate;
     // ATTACH option `schemas true`: a NON-OneLake root (local/S3/plain-ADLS) uses a two-level
     // <root>/<schema>/<table> layout so DuckDB schemas other than "main" map to subfolders (discovery, CREATE,
@@ -450,7 +450,7 @@ public sealed class DeltaCatalog : IBackendCatalog
     // isolation for an EXISTING table's conflict check is the table's OWN delta.isolationLevel property
     // (see PendingSerializable) — so our writer conforms to the guarantee the table advertises, uniform with
     // Spark/other writers (the whole reason Delta makes isolation a TABLE property). Change a table's level
-    // with fabricator_delta_set_tblproperties. Autocommit single-statement DML still uses this catalog default
+    // with delta.set_tblproperties. Autocommit single-statement DML still uses this catalog default
     // for its row-level-retry resilience knob (a documented minor divergence; multi-statement serializability
     // — where it matters — is honored per-table below).
     private readonly bool _serializable;
@@ -975,16 +975,9 @@ public sealed class DeltaCatalog : IBackendCatalog
         // from SELECT *). native_read + delta.enableRowTracking tables only — the native reader derives them
         // per file (COALESCE(materialized, baseRowId + file_row_number) / defaultRowCommitVersion).
         MetadataKind.VirtualColumns => VirtualColumnsStream(TablePath(schema!, table!)),
-        // Snapshots/history (fabricator_delta_snapshots): arg1=schema, arg2=table. Schema is required on a
-        // schema-enabled lakehouse; defaults to "main" on a flat catalog.
-        MetadataKind.Snapshots => SnapshotsStream(schema, table),
-        MetadataKind.TxnVersion => TxnVersionStream(schema, table),
-        MetadataKind.SetTxnVersion => SetTxnVersionStream(schema, table),
-        // fabricator_delta_tblproperties / _set_tblproperties: read / set the table's delta.* properties.
-        MetadataKind.TblProperties => TblPropertiesStream(schema),
-        MetadataKind.SetTblProperties => SetTblPropertiesStream(schema, table),
-        // Change Data Feed (fabricator_delta_changes): arg1 = 'schema.table' ref, arg2 = "from:to" (to empty => latest).
-        MetadataKind.Changes => ChangesStream(schema, table),
+        // Snapshots / changes / tblproperties / transaction versions are NOT metadata kinds any more — they are
+        // catalog-bound functions in the `delta` schema (cat.delta.snapshots('s.t') …), declared by
+        // BuildFunctionSet with TYPED arguments. The old kinds 8-11/13-14 and their C++ fronts are deleted.
         // Capability profile (property, value). `exact_filter_pushdown` = whether the host may set
         // filter_pushdown=true on this catalog's scans — governed by the pushdown_filters mode: EXACT mode
         // applies the erased TableFilterSet 1:1 (read_parquet WHERE under native_read; HostBatchFilter per
@@ -1061,75 +1054,19 @@ public sealed class DeltaCatalog : IBackendCatalog
             : TwoColumn("name", System.Array.Empty<string>(), "type", System.Array.Empty<string>());
     }
 
-    /// <summary>The commit history of <paramref name="schema"/>.<paramref name="table"/> as an Arrow stream
-    /// (version, timestamp, operation, operation_parameters). <paramref name="schema"/> is required on a
-    /// schema-enabled lakehouse (the table path needs it); on a flat catalog an empty schema defaults to "main".</summary>
-    private IArrowArrayStream SnapshotsStream(string? schema, string? table)
-    {
-        if (string.IsNullOrEmpty(table))
-        {
-            throw new System.ArgumentException("delta snapshots: a table name is required (catalog, 'schema.table').");
-        }
-        string resolvedSchema;
-        if (!string.IsNullOrEmpty(schema))
-        {
-            resolvedSchema = schema!;
-        }
-        else if (SchemaLayout)
-        {
-            throw new System.InvalidOperationException(
-                "delta snapshots: a schema is required on a schema-enabled lakehouse — use 'schema.table'.");
-        }
-        else
-        {
-            resolvedSchema = MainSchema;
-        }
-        return DeltaReader.GetSnapshots(Opener(), TablePath(resolvedSchema, table!));
-    }
+    /// <summary>The commit history behind <c>cat.delta.snapshots('schema.table')</c>
+    /// (version, timestamp, operation, operation_parameters).</summary>
+    private IArrowArrayStream SnapshotsCore(string tableRef) =>
+        DeltaReader.GetSnapshots(Opener(), ResolveTableRefPath(tableRef, "delta.snapshots"));
 
-    /// <summary>Change Data Feed of a table. <paramref name="tableRef"/> = '&lt;schema.&gt;table' (schema required
-    /// on a schema-enabled lakehouse, default "main" on a flat catalog); <paramref name="range"/> = "from:to"
-    /// (empty "to" =&gt; latest). Returns the row-level change feed for [from, to].</summary>
-    private IArrowArrayStream ChangesStream(string? tableRef, string? range)
-    {
-        if (string.IsNullOrEmpty(tableRef))
-        {
-            throw new System.ArgumentException("delta changes: a table is required (catalog, 'schema.table', from, to).");
-        }
-        // Split '<schema>.<table>' (first dot). A bare name => no schema (resolved below).
-        string? schema = null;
-        string table = tableRef!;
-        int dot = tableRef!.IndexOf('.');
-        if (dot >= 0)
-        {
-            schema = tableRef.Substring(0, dot);
-            table = tableRef.Substring(dot + 1);
-        }
-        string resolvedSchema;
-        if (!string.IsNullOrEmpty(schema))
-        {
-            resolvedSchema = schema!;
-        }
-        else if (SchemaLayout)
-        {
-            throw new System.InvalidOperationException(
-                "delta changes: a schema is required on a schema-enabled lakehouse — use 'schema.table'.");
-        }
-        else
-        {
-            resolvedSchema = MainSchema;
-        }
-
-        // Parse "from:to" — to empty/absent => latest (-1).
-        long from = 0, to = -1;
-        if (!string.IsNullOrEmpty(range))
-        {
-            var parts = range!.Split(':');
-            if (parts.Length > 0 && long.TryParse(parts[0], out var f)) { from = f; }
-            if (parts.Length > 1 && long.TryParse(parts[1], out var t)) { to = t; }
-        }
-        return DeltaReader.GetChanges(Opener(), TablePath(resolvedSchema, table), from, to);
-    }
+    /// <summary>The Change Data Feed behind <c>cat.delta.changes('schema.table', from := …)</c>. Bound
+    /// mutual-exclusion is validated by the function surface; timestamp bounds resolve in
+    /// <see cref="DeltaReader.GetChangesBounded"/> (from_ts = first version at-or-after, to_ts = last
+    /// at-or-before, empty feed past either end of the history).</summary>
+    private IArrowArrayStream ChangesCore(
+        string tableRef, long? from, long? to, System.DateTime? fromTs, System.DateTime? toTs) =>
+        DeltaReader.GetChangesBounded(
+            Opener(), ResolveTableRefPath(tableRef, "delta.changes"), from, to, fromTs, toTs);
 
     // Resolve a '<schema>.<table>' reference (schema mandatory on a schema-enabled lakehouse, defaults to
     // "main" on a flat catalog) to the table's folder path. Shared by the txn-version functions.
@@ -1164,42 +1101,31 @@ public sealed class DeltaCatalog : IBackendCatalog
         return TablePath(resolvedSchema, table);
     }
 
-    // fabricator_delta_get_transaction_version: the latest `txn`-action version for an app id — the Delta
-    // idempotent-append high-water mark. 1 row: (app_id, version — NULL when the app never committed one).
-    private IArrowArrayStream TxnVersionStream(string? tableRef, string? appId)
+    // cat.delta.get_transaction_version('schema.table', 'app'): the latest `txn`-action version for an app id —
+    // the Delta idempotent-append high-water mark. 1 row: (app_id, version — NULL when the app never committed
+    // one).
+    private IArrowArrayStream GetTxnVersionCore(string tableRef, string appId)
     {
-        if (string.IsNullOrEmpty(appId))
-        {
-            throw new System.ArgumentException("delta transaction version: an app_id is required.");
-        }
-        var path = ResolveTableRefPath(tableRef, "delta transaction version");
-        long? version = DeltaReader.GetAppTransactionVersion(Opener(), path, appId!);
-        return AppTxnRow(appId!, version);
+        var path = ResolveTableRefPath(tableRef, "delta.get_transaction_version");
+        long? version = DeltaReader.GetAppTransactionVersion(Opener(), path, appId);
+        return AppTxnRow(appId, version);
     }
 
-    // fabricator_delta_set_transaction_version: PARK an application-transaction version on the current
-    // explicit transaction. At COMMIT the flush compares-and-swaps it against the LATEST snapshot's
-    // AppTransactions (expected null = "must not exist yet") and emits the `txn` action ATOMICALLY with the
-    // transaction's fused commit — a retried batch whose first attempt landed then FAILS the CAS instead of
-    // duplicating data (Delta's exactly-once mechanism; duckdb-delta / Spark txnAppId parity).
-    private IArrowArrayStream SetTxnVersionStream(string? tableRef, string? payload)
+    // cat.delta.set_transaction_version('schema.table', 'app', version [, expected := …]): PARK an
+    // application-transaction version on the current explicit transaction. At COMMIT the flush
+    // compares-and-swaps it against the LATEST snapshot's AppTransactions (expected null = "must not exist
+    // yet" — never "do not check") and emits the `txn` action ATOMICALLY with the transaction's fused commit —
+    // a retried batch whose first attempt landed then FAILS the CAS instead of duplicating data (Delta's
+    // exactly-once mechanism; duckdb-delta / Spark txnAppId parity). Runs at EXECUTION, where
+    // ArrowStreamInitGlobal has established the ambient transaction id.
+    private IArrowArrayStream SetTxnVersionCore(string tableRef, string appId, long version, long? expected)
     {
-        var path = ResolveTableRefPath(tableRef, "delta set transaction version");
-        var parts = (payload ?? string.Empty).Split('\n');
-        if (parts.Length < 2 || string.IsNullOrEmpty(parts[0]) || !long.TryParse(parts[1], out var version))
-        {
-            throw new System.ArgumentException(
-                "delta set transaction version: app_id and version are required.");
-        }
-        string appId = parts[0];
-        long? expected = parts.Length > 2 && parts[2].Length > 0 && long.TryParse(parts[2], out var e)
-            ? e
-            : null;
+        var path = ResolveTableRefPath(tableRef, "delta.set_transaction_version");
         long txnId = AmbientTransaction.Current;
         if (txnId == 0 || !_txnBuffer.IsExplicit(txnId))
         {
             throw new System.InvalidOperationException(
-                "delta set transaction version: requires an explicit transaction (BEGIN … COMMIT) — the "
+                "delta.set_transaction_version: requires an explicit transaction (BEGIN … COMMIT) — the "
                 + "version is compared-and-swapped atomically with the transaction's commit.");
         }
         var pending = _txnBuffer.GetOrCreate(txnId, path);
@@ -1215,37 +1141,37 @@ public sealed class DeltaCatalog : IBackendCatalog
         return AppTxnRow(appId, version);
     }
 
-    private static IArrowArrayStream AppTxnRow(string appId, long? version)
-    {
-        var schema = new Schema(new[]
-        {
-            new Field("app_id", StringType.Default, nullable: false),
-            new Field("version", Int64Type.Default, nullable: true),
-        }, null);
-        var apps = new StringArray.Builder();
-        apps.Append(appId);
-        var versions = new Int64Array.Builder();
-        if (version is { } v)
-        {
-            versions.Append(v);
-        }
-        else
-        {
-            versions.AppendNull();
-        }
-        return new InMemoryArrayStream(schema,
-            new[] { new RecordBatch(schema, new IArrowArray[] { apps.Build(), versions.Build() }, 1) });
-    }
+    // The (app_id, version) row both transaction-version functions return — built against the SAME schema the
+    // function surface declares (DeltaFunctions.AppTxnSchema), so declaration and batches cannot drift.
+    private static IArrowArrayStream AppTxnRow(string appId, long? version) =>
+        new InMemoryArrayStream(DeltaFunctions.AppTxnSchema, new[] { DeltaFunctions.AppTxnRow(appId, version) });
 
-    // fabricator_delta_tblproperties(catalog, 'schema.table'): the table's delta.* properties as (property,
-    // value) rows, sorted by key.
-    private IArrowArrayStream TblPropertiesStream(string? tableRef)
+    // cat.delta.tblproperties('schema.table'): the table's delta.* properties as (property, value) rows,
+    // sorted by key.
+    private IArrowArrayStream TblPropertiesCore(string tableRef)
     {
-        var path = ResolveTableRefPath(tableRef, "delta tblproperties");
+        var path = ResolveTableRefPath(tableRef, "delta.tblproperties");
         var props = DeltaReader.GetTableProperties(Opener(), path);
         var keys = props.Keys.OrderBy(k => k, System.StringComparer.Ordinal).ToArray();
         var vals = keys.Select(k => props[k]).ToArray();
-        return TwoColumn("property", keys, "value", vals);
+        return PropertiesRows(keys, vals);
+    }
+
+    // (property, value) rows against the schema the delta.tblproperties/set_tblproperties surface declares
+    // (DeltaFunctions.PropertiesSchema) — one schema instance for declaration and batches.
+    private static IArrowArrayStream PropertiesRows(IReadOnlyList<string> keys, IReadOnlyList<string?> vals)
+    {
+        var k = new StringArray.Builder();
+        var v = new StringArray.Builder();
+        for (int i = 0; i < keys.Count; i++)
+        {
+            k.Append(keys[i]);
+            if (vals[i] is { } s) { v.Append(s); } else { v.AppendNull(); }
+        }
+        return new InMemoryArrayStream(DeltaFunctions.PropertiesSchema, new[]
+        {
+            new RecordBatch(DeltaFunctions.PropertiesSchema, new IArrowArray[] { k.Build(), v.Build() }, keys.Count),
+        });
     }
 
     // Table-FEATURE properties: enabling these requires a protocol upgrade (reader/writer feature + supporting
@@ -1257,32 +1183,33 @@ public sealed class DeltaCatalog : IBackendCatalog
         "delta.enableInCommitTimestamps", "delta.columnMapping.mode",
     };
 
-    // fabricator_delta_set_tblproperties(catalog, 'schema.table', properties): SET/UNSET delta.* properties via
-    // ONE metaData commit. `properties` is a JSON object {"delta.isolationLevel":"Serializable", …} (a null
-    // value UNSETs). Commits IMMEDIATELY (like OPTIMIZE/VACUUM) — an administrative metadata change, not part
-    // of a surrounding DuckDB transaction. Feature-enabling keys are rejected (set at CREATE).
-    private IArrowArrayStream SetTblPropertiesStream(string? tableRef, string? propsJson)
+    // cat.delta.set_tblproperties('schema.table', properties): SET/UNSET delta.* properties via ONE metaData
+    // commit. `properties` is a JSON object {"delta.isolationLevel":"Serializable", …} (a null value UNSETs).
+    // Commits IMMEDIATELY (like OPTIMIZE/VACUUM) — an administrative metadata change, not part of a
+    // surrounding DuckDB transaction. Feature-enabling keys are rejected (set at CREATE). Runs at EXECUTION,
+    // never at bind (the binding defers the core — see StreamTableBinding).
+    private IArrowArrayStream SetTblPropertiesCore(string tableRef, string propsJson)
     {
-        var path = ResolveTableRefPath(tableRef, "delta set tblproperties");
+        var path = ResolveTableRefPath(tableRef, "delta.set_tblproperties");
         if (string.IsNullOrWhiteSpace(propsJson))
         {
             throw new System.ArgumentException(
-                "delta set tblproperties: a JSON object of property->value is required, e.g. "
+                "delta.set_tblproperties: a JSON object of property->value is required, e.g. "
                 + "'{\"delta.isolationLevel\":\"Serializable\"}'.");
         }
         var updates = new List<KeyValuePair<string, string?>>();
-        using (var doc = System.Text.Json.JsonDocument.Parse(propsJson!))
+        using (var doc = System.Text.Json.JsonDocument.Parse(propsJson))
         {
             if (doc.RootElement.ValueKind != System.Text.Json.JsonValueKind.Object)
             {
-                throw new System.ArgumentException("delta set tblproperties: properties must be a JSON object.");
+                throw new System.ArgumentException("delta.set_tblproperties: properties must be a JSON object.");
             }
             foreach (var p in doc.RootElement.EnumerateObject())
             {
                 if (FeatureProperties.Contains(p.Name))
                 {
                     throw new System.NotSupportedException(
-                        $"delta set tblproperties: '{p.Name}' enables a table FEATURE that needs a protocol "
+                        $"delta.set_tblproperties: '{p.Name}' enables a table FEATURE that needs a protocol "
                         + "upgrade — set it at CREATE via the ATTACH option (deletion_vectors / row_tracking / "
                         + "change_data_feed / column_mapping), not on an existing table.");
                 }
@@ -1297,7 +1224,7 @@ public sealed class DeltaCatalog : IBackendCatalog
         }
         if (updates.Count == 0)
         {
-            throw new System.ArgumentException("delta set tblproperties: no properties given.");
+            throw new System.ArgumentException("delta.set_tblproperties: no properties given.");
         }
         long version = DeltaReader.SetTableProperties(Opener(), path, updates);
         // Any config-derived property may have changed — fabricator.sortedBy AND the fabricator.parquet.*
@@ -1307,7 +1234,7 @@ public sealed class DeltaCatalog : IBackendCatalog
             path, updates.Count, version);
         var keys = updates.Select(u => u.Key).ToArray();
         var vals = updates.Select(u => u.Value ?? "<unset>").ToArray();
-        return TwoColumn("property", keys, "value", vals);
+        return PropertiesRows(keys, vals);
     }
 
     // The table's WHOLE Delta configuration per table path, read ONCE per catalog instance (every read is a
@@ -1428,41 +1355,33 @@ public sealed class DeltaCatalog : IBackendCatalog
     }
 
     /// <summary>
-    /// The schemas this catalog ADVERTISES: the discovered DATA schemas plus, on a OneLake root, the
-    /// <c>fabric</c> function namespace.
+    /// Refuses DDL that would put a TABLE into a FUNCTION namespace (<c>delta</c> everywhere; <c>fabric</c> on
+    /// a OneLake root).
     /// </summary>
     /// <remarks>
-    /// <para>Deliberately distinct from <see cref="SchemaNames"/>, and the split is load-bearing in BOTH
-    /// directions:</para>
-    /// <list type="bullet">
-    ///   <item>The host drops a declared function whose schema it did not register
-    ///   (<c>FabricatorCatalog::LoadCatalog</c>), so WITHOUT this the entire Fabric function set would silently
-    ///   cease to exist — no error, just ~50 missing functions.</item>
-    ///   <item>Conversely <see cref="SchemaNames"/> must NOT include it, because that list is what the
-    ///   <c>__all__</c> sentinel expands over: adding <c>fabric</c> there would re-declare the provider's
-    ///   macros and <c>fab_delta_info</c> inside it, which is the per-schema duplication that moving the Fabric
-    ///   functions out of <c>__all__</c> exists to remove.</item>
-    /// </list>
-    /// <para>Gated on the SAME condition as the registration in <see cref="BuildFunctionSet"/> — a local or S3
-    /// Delta attach registers no Fabric functions and so must advertise no <c>fabric</c> schema, or it would
-    /// gain a permanently empty one.</para>
-    /// </remarks>
-    /// <summary>
-    /// Refuses DDL that would put a TABLE into the <c>fabric</c> function namespace.
-    /// </summary>
-    /// <remarks>
-    /// <para>The schema is synthetic — declared by this provider to host functions, backed by no storage — but
-    /// the host cannot know that and will happily route <c>CREATE TABLE cat.fabric.t</c> here, which would
-    /// create a real Delta table in a <c>fabric/</c> folder. Nothing would break immediately; the damage is that
-    /// on the next ATTACH <c>fabric</c> is ALSO discovered as a data schema, so a namespace deliberately
-    /// separated from the user's tables quietly stops being separate, and the folder now has to be cleaned up by
+    /// <para>The schemas are synthetic — declared by this provider to host functions, backed by no storage —
+    /// but the host cannot know that and will happily route <c>CREATE TABLE cat.delta.t</c> here, which would
+    /// create a real Delta table in a <c>delta/</c> folder. Nothing would break immediately; the damage is that
+    /// on the next ATTACH the name is ALSO discovered as a data schema, so a namespace deliberately separated
+    /// from the user's tables quietly stops being separate, and the folder now has to be cleaned up by
     /// hand.</para>
-    /// <para>Refusing costs one comparison and names the fix. It applies only where the synthetic schema exists
-    /// (a OneLake root) — elsewhere <c>fabric</c> is an ordinary name a user is entitled to use for their own
-    /// data, and forbidding it there would be inventing a reserved word.</para>
+    /// <para>Refusing costs one comparison and names the fix. Each refusal applies only where its synthetic
+    /// schema exists — elsewhere the name is an ordinary one a user is entitled to use for their own data, and
+    /// forbidding it there would be inventing a reserved word (which is why <c>fabric</c> stays
+    /// OneLake-gated while <c>delta</c>, registered on every attach, is refused on every attach).</para>
     /// </remarks>
     private void RejectFunctionSchemaDdl(string schemaName, string what)
     {
+        // `delta` exists on EVERY Delta catalog (the delta.* functions are registered unconditionally);
+        // `fabric` only on a OneLake root — each refusal gated on the SAME condition as its registration,
+        // because where the synthetic schema does not exist the name is an ordinary one a user may take.
+        if (string.Equals(schemaName, DeltaFunctions.SchemaName, System.StringComparison.OrdinalIgnoreCase))
+        {
+            throw new System.NotSupportedException(
+                $"{what}: '{DeltaFunctions.SchemaName}' is this catalog's Delta FUNCTION namespace "
+                + "(delta.snapshots / delta.changes / …), not a storage schema — it holds no tables and is "
+                + "backed by no folder. Create the table in a data schema instead.");
+        }
         if (FabricLakehouse.IsOneLake(_root)
             && string.Equals(schemaName, FabricApiFunctions.SchemaName, System.StringComparison.OrdinalIgnoreCase))
         {
@@ -1473,20 +1392,42 @@ public sealed class DeltaCatalog : IBackendCatalog
         }
     }
 
+    /// <summary>
+    /// The schemas this catalog ADVERTISES: the discovered DATA schemas plus the <c>delta</c> function
+    /// namespace (every attach) and, on a OneLake root, the <c>fabric</c> one.
+    /// </summary>
+    /// <remarks>
+    /// <para>Deliberately distinct from <see cref="SchemaNames"/>, and the split is load-bearing in BOTH
+    /// directions:</para>
+    /// <list type="bullet">
+    ///   <item>The host drops a declared function whose schema it did not register
+    ///   (<c>FabricatorCatalog::LoadCatalog</c>), so WITHOUT this the delta/Fabric function sets would silently
+    ///   cease to exist — no error, just missing functions.</item>
+    ///   <item>Conversely <see cref="SchemaNames"/> must NOT include them, because that list is what the
+    ///   <c>__all__</c> sentinel expands over: adding <c>delta</c>/<c>fabric</c> there would re-declare the
+    ///   provider's macros and <c>fab_delta_info</c> inside them, which is the per-schema duplication that
+    ///   moving the Fabric functions out of <c>__all__</c> exists to remove.</item>
+    /// </list>
+    /// <para>Each name is gated on the SAME condition as its registration in <see cref="BuildFunctionSet"/> —
+    /// the delta.* functions exist on every attach, the Fabric ones only on OneLake (a local or S3 attach
+    /// registering no Fabric functions must advertise no <c>fabric</c> schema, or it would gain a permanently
+    /// empty one).</para>
+    /// </remarks>
     private IReadOnlyList<string> CatalogSchemaNames()
     {
         var data = SchemaNames();
-        if (!FabricLakehouse.IsOneLake(_root))
-        {
-            return data;
-        }
-        var all = new List<string>(data.Count + 1);
+        var all = new List<string>(data.Count + 2);
         all.AddRange(data);
-        // Defensive: a DATA schema literally called "fabric" would otherwise be listed twice, and a duplicate
-        // schema name is a host-side ensure_schema collision rather than a merge. Case-INSENSITIVE on purpose:
-        // DuckDB resolves schema names that way, so a lakehouse schema named "Fabric" collides just as hard
-        // (and this matches RejectFunctionSchemaDdl and the SqlServer side, which must agree on the answer).
-        if (!all.Contains(FabricApiFunctions.SchemaName, System.StringComparer.OrdinalIgnoreCase))
+        // Defensive: a DATA schema literally called "delta"/"fabric" would otherwise be listed twice, and a
+        // duplicate schema name is a host-side ensure_schema collision rather than a merge. Case-INSENSITIVE on
+        // purpose: DuckDB resolves schema names that way, so a lakehouse schema named "Fabric" collides just as
+        // hard (and this matches RejectFunctionSchemaDdl and the SqlServer side, which must agree on the answer).
+        if (!all.Contains(DeltaFunctions.SchemaName, System.StringComparer.OrdinalIgnoreCase))
+        {
+            all.Add(DeltaFunctions.SchemaName);
+        }
+        if (FabricLakehouse.IsOneLake(_root)
+            && !all.Contains(FabricApiFunctions.SchemaName, System.StringComparer.OrdinalIgnoreCase))
         {
             all.Add(FabricApiFunctions.SchemaName);
         }
@@ -2371,7 +2312,7 @@ public sealed class DeltaCatalog : IBackendCatalog
         // create-time configuration is applied at v0 and engineered-wood's OpenOrCreateAsync returns early for
         // an existing table. That is not specific to the parquet keys — it is equally true of every create flag
         // (deletion_vectors / column_mapping / row_tracking / change_data_feed) and of the `delta.*` WITH
-        // properties beside them. `fabricator_delta_set_tblproperties` is what changes a declaration.
+        // properties beside them. `delta.set_tblproperties` is what changes a declaration.
         //
         // A brand-new table needs no special case: it does not exist, so the read finds nothing — and a MISS IS
         // NOT CACHED (see TableConfig), which is what makes the CREATE's own declaration visible to the very
@@ -4287,7 +4228,7 @@ public sealed class DeltaCatalog : IBackendCatalog
             foreach (var kv in pending.AppTxnVersions)
             {
                 // BEHAVIOUR-PRESERVING mapping onto EW's precondition union. Our documented contract for
-                // fabricator_delta_set_transaction_version is "no expected version" == "this producer must
+                // delta.set_transaction_version is "no expected version" == "this producer must
                 // have recorded NOTHING yet" — which is Absent, NOT the union's None. Getting that wrong is
                 // silent and costly: None writes UNCONDITIONALLY, so a replayed first batch would commit a
                 // second time and rewrite the recorded version with the same value, leaving nothing in the
@@ -4367,7 +4308,7 @@ public sealed class DeltaCatalog : IBackendCatalog
             catch (EngineeredWood.DeltaLake.Table.AppTransactionPreconditionException ex)
             {
                 // The idempotent-producer CAS refused: this batch is already in the table. Reported in OUR
-                // documented vocabulary (fabricator_delta_set_transaction_version's contract) with EW's
+                // documented vocabulary (delta.set_transaction_version's contract) with EW's
                 // explanation kept, because the two say different useful things — ours names the mechanism
                 // the user invoked, EW's says why retrying is the wrong response. Identified by TYPE, not by
                 // message text: a string match here would relabel unrelated commit failures.
@@ -5380,6 +5321,14 @@ public sealed class DeltaCatalog : IBackendCatalog
                 new KeyValuePair<string, string>("native_write", _nativeWrite ? "true" : "false"),
                 new KeyValuePair<string, string>("onelake", FabricLakehouse.IsOneLake(_root) ? "true" : "false"),
             }),
+            // The `delta` function namespace — every Delta catalog, every root kind. These replaced the
+            // C++-registered fabricator_delta_* fronts and metadata kinds 8-11/13-14 (see DeltaFunctions).
+            new DeltaSnapshotsFunction(SnapshotsCore),
+            new DeltaChangesFunction(ChangesCore),
+            new DeltaTblPropertiesFunction(TblPropertiesCore),
+            new DeltaSetTblPropertiesFunction(SetTblPropertiesCore),
+            new DeltaGetTxnVersionFunction(GetTxnVersionCore),
+            new DeltaSetTxnVersionFunction(SetTxnVersionCore),
         };
         // Fabric REST API functions are registered ONLY on a OneLake root: off Fabric they have no workspace,
         // no item and no REST credential, so advertising them would put functions in the catalog that can only

@@ -86,7 +86,7 @@ SELECT __delta_row_id FROM lake.main.c1 WHERE grp = 4242;
 # the commit is a REWRITE: operation OPTIMIZE, dataChange=false on removes AND adds, clusteringProvider
 # tagged on the add (the OSS Spark "liquid" value)
 query I
-SELECT count(*) FROM fabricator_delta_snapshots('lake', 'main.c1') WHERE operation = 'OPTIMIZE';
+SELECT count(*) FROM lake.delta.snapshots('main.c1') WHERE operation = 'OPTIMIZE';
 ----
 1
 
@@ -126,8 +126,8 @@ SELECT fabricator_exec('lake', 'OPTIMIZE main.c1');
 
 query II
 SELECT count(*) FILTER (WHERE operation = 'OPTIMIZE'),
-       count(*) FILTER (WHERE operation = 'OPTIMIZE' AND version = (SELECT max(version) FROM fabricator_delta_snapshots('lake', 'main.c1')))
-FROM fabricator_delta_snapshots('lake', 'main.c1');
+       count(*) FILTER (WHERE operation = 'OPTIMIZE' AND version = (SELECT max(version) FROM lake.delta.snapshots('main.c1')))
+FROM lake.delta.snapshots('main.c1');
 ----
 1	1
 
@@ -187,7 +187,7 @@ statement ok
 INSERT INTO lake.main.c3 SELECT (r * 13) % 500, r FROM range(2000, 4000) t(r);
 
 statement ok
-SELECT * FROM fabricator_delta_set_tblproperties('lake', 'main.c3', '{"fabricator.sortedBy":"[\"k\"]"}');
+SELECT * FROM lake.delta.set_tblproperties('main.c3', '{"fabricator.sortedBy":"[\"k\"]"}');
 
 query I
 SELECT fabricator_exec('lake', 'OPTIMIZE main.c3');
@@ -266,7 +266,7 @@ SELECT count(*) FROM o WHERE p IS NOT NULL AND p > id;
 # the rewrite commit: OPTIMIZE operation, dataChange=false — but NO clusteringProvider
 # (no liquid declaration exists for partitioned tables)
 query I
-SELECT count(*) FROM fabricator_delta_snapshots('lake', 'main.p1') WHERE operation = 'OPTIMIZE';
+SELECT count(*) FROM lake.delta.snapshots('main.p1') WHERE operation = 'OPTIMIZE';
 ----
 1
 
@@ -322,7 +322,7 @@ statement ok
 INSERT INTO lake.main.m1 SELECT (r * 17) % 40000, 'y' || r FROM range(40000, 80000) t(r);
 
 statement ok
-SELECT * FROM fabricator_delta_set_tblproperties('lake', 'main.m1', '{"delta.targetFileSize":"100kb"}');
+SELECT * FROM lake.delta.set_tblproperties('main.m1', '{"delta.targetFileSize":"100kb"}');
 
 query I
 SELECT fabricator_exec('lake', 'OPTIMIZE main.m1');
@@ -378,7 +378,7 @@ INSERT INTO lake.main.z1 SELECT (r * 91) % 9000, r FROM range(6000, 9000) t(r);
 
 # a tiny cube threshold so a one-file cube counts STABLE (observable incremental exclusion)
 statement ok
-SELECT * FROM fabricator_delta_set_tblproperties('lake', 'main.z1', '{"fabricator.targetCubeSize":"1kb"}');
+SELECT * FROM lake.delta.set_tblproperties('main.z1', '{"fabricator.targetCubeSize":"1kb"}');
 
 query I
 SELECT fabricator_exec('lake', 'OPTIMIZE main.z1');
@@ -417,7 +417,7 @@ SELECT count(*), count(DISTINCT rowid >> 40) FROM lake.main.z1;
 15000	2
 
 query I
-SELECT count(*) FROM fabricator_delta_snapshots('lake', 'main.z1') WHERE operation = 'OPTIMIZE';
+SELECT count(*) FROM lake.delta.snapshots('main.z1') WHERE operation = 'OPTIMIZE';
 ----
 2
 
@@ -435,7 +435,7 @@ SELECT fabricator_exec('lake', 'OPTIMIZE main.z1');
 0
 
 query I
-SELECT count(*) FROM fabricator_delta_snapshots('lake', 'main.z1') WHERE operation = 'OPTIMIZE';
+SELECT count(*) FROM lake.delta.snapshots('main.z1') WHERE operation = 'OPTIMIZE';
 ----
 2
 
@@ -451,7 +451,7 @@ SELECT count(*), count(DISTINCT rowid >> 40) FROM lake.main.z1;
 15000	1
 
 query I
-SELECT count(*) FROM fabricator_delta_snapshots('lake', 'main.z1') WHERE operation = 'OPTIMIZE';
+SELECT count(*) FROM lake.delta.snapshots('main.z1') WHERE operation = 'OPTIMIZE';
 ----
 3
 
@@ -467,7 +467,7 @@ statement ok
 INSERT INTO lake.main.z2 SELECT (r * 91) % 4000, r FROM range(4000, 8000) t(r);
 
 statement ok
-SELECT * FROM fabricator_delta_set_tblproperties('lake', 'main.z2', '{"fabricator.sortedBy":"[\"id\"]","fabricator.targetCubeSize":"1kb"}');
+SELECT * FROM lake.delta.set_tblproperties('main.z2', '{"fabricator.sortedBy":"[\"id\"]","fabricator.targetCubeSize":"1kb"}');
 
 query I
 SELECT fabricator_exec('lake', 'OPTIMIZE main.z2');
@@ -480,7 +480,7 @@ SELECT count(*), count(DISTINCT rowid >> 40) FROM lake.main.z2;
 8000	1
 
 statement ok
-SELECT * FROM fabricator_delta_set_tblproperties('lake', 'main.z2', '{"fabricator.sortedBy":"[\"payload\"]"}');
+SELECT * FROM lake.delta.set_tblproperties('main.z2', '{"fabricator.sortedBy":"[\"payload\"]"}');
 
 statement ok
 INSERT INTO lake.main.z2 SELECT (r * 91) % 4000, r FROM range(8000, 9000) t(r);
@@ -520,7 +520,7 @@ statement ok
 ALTER TABLE lake.main.a1 SET SORTED BY (id);
 
 query T
-SELECT value FROM fabricator_delta_tblproperties('lake', 'main.a1') WHERE property = 'fabricator.sortedBy';
+SELECT value FROM lake.delta.tblproperties('main.a1') WHERE property = 'fabricator.sortedBy';
 ----
 ["id"]
 
@@ -531,7 +531,7 @@ WHERE content LIKE '%delta.clustering%' AND content LIKE '%"operation":"SET SORT
 1
 
 statement ok
-SELECT * FROM fabricator_delta_set_tblproperties('lake', 'main.a1', '{"fabricator.targetCubeSize":"1kb"}');
+SELECT * FROM lake.delta.set_tblproperties('main.a1', '{"fabricator.targetCubeSize":"1kb"}');
 
 query I
 SELECT fabricator_exec('lake', 'OPTIMIZE main.a1');
@@ -579,7 +579,7 @@ statement ok
 ALTER TABLE lake.main.a1 RESET SORTED BY;
 
 query I
-SELECT count(*) FROM fabricator_delta_tblproperties('lake', 'main.a1') WHERE property = 'fabricator.sortedBy';
+SELECT count(*) FROM lake.delta.tblproperties('main.a1') WHERE property = 'fabricator.sortedBy';
 ----
 0
 
@@ -607,7 +607,7 @@ statement ok
 ALTER TABLE lake.main.p1 SET SORTED BY (id);
 
 query T
-SELECT value FROM fabricator_delta_tblproperties('lake', 'main.p1') WHERE property = 'fabricator.sortedBy';
+SELECT value FROM lake.delta.tblproperties('main.p1') WHERE property = 'fabricator.sortedBy';
 ----
 ["id"]
 

@@ -25,7 +25,7 @@ CREATE TABLE lake.main.t (id INTEGER);
 # ----------------------------------------------------------------------------
 
 query TI
-SELECT * FROM fabricator_delta_get_transaction_version('lake', 't', 'loader');
+SELECT * FROM lake.delta.get_transaction_version('t', 'loader');
 ----
 loader	NULL
 
@@ -34,7 +34,7 @@ loader	NULL
 # ----------------------------------------------------------------------------
 
 statement error
-CALL fabricator_delta_set_transaction_version('lake', 't', 'loader', 1);
+SELECT * FROM lake.delta.set_transaction_version('t', 'loader', 1);
 ----
 requires an explicit transaction
 
@@ -46,7 +46,7 @@ statement ok
 BEGIN;
 
 query TI
-CALL fabricator_delta_set_transaction_version('lake', 't', 'loader', 1);
+SELECT * FROM lake.delta.set_transaction_version('t', 'loader', 1);
 ----
 loader	1
 
@@ -57,7 +57,7 @@ statement ok
 COMMIT;
 
 query TI
-SELECT * FROM fabricator_delta_get_transaction_version('lake', 't', 'loader');
+SELECT * FROM lake.delta.get_transaction_version('t', 'loader');
 ----
 loader	1
 
@@ -74,7 +74,7 @@ statement ok
 BEGIN;
 
 statement ok
-CALL fabricator_delta_set_transaction_version('lake', 't', 'loader', 1);
+SELECT * FROM lake.delta.set_transaction_version('t', 'loader', 1);
 
 statement ok
 INSERT INTO lake.main.t VALUES (1), (2);
@@ -97,7 +97,7 @@ statement ok
 BEGIN;
 
 statement ok
-CALL fabricator_delta_set_transaction_version('lake', 't', 'loader', 2, 1);
+SELECT * FROM lake.delta.set_transaction_version('t', 'loader', 2, expected := 1);
 
 statement ok
 INSERT INTO lake.main.t VALUES (3);
@@ -106,7 +106,7 @@ statement ok
 COMMIT;
 
 query TI
-SELECT * FROM fabricator_delta_get_transaction_version('lake', 't', 'loader');
+SELECT * FROM lake.delta.get_transaction_version('t', 'loader');
 ----
 loader	2
 
@@ -120,7 +120,7 @@ statement ok
 BEGIN;
 
 statement ok
-CALL fabricator_delta_set_transaction_version('lake', 't', 'loader', 5, 3);
+SELECT * FROM lake.delta.set_transaction_version('t', 'loader', 5, expected := 3);
 
 statement error
 COMMIT;
@@ -135,7 +135,7 @@ statement ok con1
 BEGIN;
 
 statement ok con1
-CALL fabricator_delta_set_transaction_version('lake', 't', 'job2', 1);
+SELECT * FROM lake.delta.set_transaction_version('t', 'job2', 1);
 
 statement ok con1
 INSERT INTO lake.main.t VALUES (100);
@@ -145,7 +145,7 @@ statement ok con2
 BEGIN;
 
 statement ok con2
-CALL fabricator_delta_set_transaction_version('lake', 't', 'job2', 1);
+SELECT * FROM lake.delta.set_transaction_version('t', 'job2', 1);
 
 statement ok con2
 INSERT INTO lake.main.t VALUES (100);
@@ -166,12 +166,12 @@ SELECT count(*) FROM lake.main.t WHERE id = 100;
 
 # distinct app ids are independent
 query TI
-SELECT * FROM fabricator_delta_get_transaction_version('lake', 't', 'job2');
+SELECT * FROM lake.delta.get_transaction_version('t', 'job2');
 ----
 job2	1
 
 query TI
-SELECT * FROM fabricator_delta_get_transaction_version('lake', 't', 'loader');
+SELECT * FROM lake.delta.get_transaction_version('t', 'loader');
 ----
 loader	2
 
@@ -183,13 +183,13 @@ statement ok
 BEGIN;
 
 statement ok
-CALL fabricator_delta_set_transaction_version('lake', 't', 'loader', 3, 2);
+SELECT * FROM lake.delta.set_transaction_version('t', 'loader', 3, expected := 2);
 
 statement ok
 ROLLBACK;
 
 query TI
-SELECT * FROM fabricator_delta_get_transaction_version('lake', 't', 'loader');
+SELECT * FROM lake.delta.get_transaction_version('t', 'loader');
 ----
 loader	2
 
@@ -204,7 +204,7 @@ statement ok
 ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/txnver' AS lake2 (TYPE fabricator, PROVIDER 'delta');
 
 query TI
-SELECT * FROM fabricator_delta_get_transaction_version('lake2', 't', 'loader');
+SELECT * FROM lake2.delta.get_transaction_version('t', 'loader');
 ----
 loader	2
 
@@ -239,7 +239,7 @@ statement ok
 BEGIN;
 
 statement ok
-CALL fabricator_delta_set_transaction_version('orph', 't', 'loader', 5);
+SELECT * FROM orph.delta.set_transaction_version('t', 'loader', 5);
 
 statement ok
 INSERT INTO orph.main.t VALUES (999999);
@@ -262,7 +262,7 @@ DELETE FROM orph.main.t WHERE id % 3 = 0;
 
 # the SAME version again, with the Absent precondition — refused at commit
 statement ok
-CALL fabricator_delta_set_transaction_version('orph', 't', 'loader', 5);
+SELECT * FROM orph.delta.set_transaction_version('t', 'loader', 5);
 
 statement error
 COMMIT;

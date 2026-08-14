@@ -42,7 +42,7 @@ US	2	30
 
 # One commit for the swap (v0 CREATE, v1 initial, v2 partition overwrite).
 query I
-SELECT count(*) FROM fabricator_delta_snapshots('lake', 'main.sales');
+SELECT count(*) FROM lake.delta.snapshots('main.sales');
 ----
 3
 

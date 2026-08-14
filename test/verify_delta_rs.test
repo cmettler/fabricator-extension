@@ -53,7 +53,7 @@ SELECT id, name FROM lake.main.t AT (VERSION => 1) ORDER BY id;
 
 # Snapshots / commit history (fabricator_delta_snapshots), oldest first (before the DML commits).
 query IT
-SELECT version, operation FROM fabricator_delta_snapshots('lake', 'main.t') ORDER BY version;
+SELECT version, operation FROM lake.delta.snapshots('main.t') ORDER BY version;
 ----
 0	CREATE TABLE
 1	WRITE

@@ -213,7 +213,7 @@ CDF stays entirely a `_delta_log`/`_change_data` concern; native write only chan
 - **UPDATE:** two change rows per matched row — pre-image (`update_preimage`, from the old file) and post-image
   (`update_postimage`, the new values) — each a native `COPY` with the literal `_change_type` column added.
   Reuse the same `<updates_input>` join as §5.
-- **Read side** (`fabricator_delta_changes`) is done and unchanged. The `_commit_version`/`_commit_timestamp`
+- **Read side** (`delta.changes`) is done and unchanged. The `_commit_version`/`_commit_timestamp`
   come from the always-on `commitInfo` (already emitted).
 - **Guard:** CDF capture only when `delta.enableChangeDataFeed` (the `change_data_feed true` catalog option),
   same as today; `DropVirtualRowId` before writing the change file so schemas match (the SIGSEGV fix stays

@@ -30,7 +30,7 @@ statement ok
 CREATE TABLE lake.main.t AS SELECT i AS id, i * 2 AS a, 'p' || i AS b FROM range(1, 6001) AS r(i);
 
 query I
-SELECT max(version) FROM fabricator_delta_snapshots('lake', 't');
+SELECT max(version) FROM lake.delta.snapshots('t');
 ----
 1
 
@@ -54,7 +54,7 @@ SELECT id, a, b FROM lake.main.t WHERE id IN (1, 2049, 4097, 6000) ORDER BY id;
 # ⚠ THE LOAD-BEARING ASSERTION: ONE new version, not one per group. Grouping changes WHEN data files are
 # written, never how many times the statement commits.
 query I
-SELECT max(version) FROM fabricator_delta_snapshots('lake', 't');
+SELECT max(version) FROM lake.delta.snapshots('t');
 ----
 2
 
@@ -73,7 +73,7 @@ SELECT count(*) FROM lake.main.t;
 6000
 
 query I
-SELECT max(version) FROM fabricator_delta_snapshots('lake', 't');
+SELECT max(version) FROM lake.delta.snapshots('t');
 ----
 3
 
@@ -109,7 +109,7 @@ SELECT count(*), sum(a) FROM lake2.main.t;
 
 # CREATE (v0) + data (v1) + the fused UPDATE (v2) — the buffered UPDATE's groups are ONE commit.
 query I
-SELECT max(version) FROM fabricator_delta_snapshots('lake2', 't');
+SELECT max(version) FROM lake2.delta.snapshots('t');
 ----
 2
 
@@ -151,7 +151,7 @@ UPDATE lake3.main.t SET a = a + 100 WHERE id > 0;
 # One pre-image and one post-image per updated row, all at the SAME version.
 query III
 SELECT _change_type, count(*), count(DISTINCT _commit_version)
-FROM fabricator_delta_changes('lake3', 'main.t', 2)
+FROM lake3.delta.changes('main.t', starting_version := 2)
 WHERE _change_type LIKE 'update_%'
 GROUP BY _change_type ORDER BY _change_type;
 ----
@@ -161,8 +161,8 @@ update_preimage	6000	1
 # The pair joins row for row with exactly the applied delta — nothing lost or duplicated at a boundary.
 query II
 SELECT count(*), sum(post.a - pre.a)
-FROM (SELECT id, a FROM fabricator_delta_changes('lake3', 'main.t', 2) WHERE _change_type = 'update_preimage') pre
-JOIN (SELECT id, a FROM fabricator_delta_changes('lake3', 'main.t', 2) WHERE _change_type = 'update_postimage') post
+FROM (SELECT id, a FROM lake3.delta.changes('main.t', starting_version := 2) WHERE _change_type = 'update_preimage') pre
+JOIN (SELECT id, a FROM lake3.delta.changes('main.t', starting_version := 2) WHERE _change_type = 'update_postimage') post
   USING (id);
 ----
 6000	600000

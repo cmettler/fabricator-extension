@@ -105,12 +105,12 @@ updated
 # ---- snapshots/history over S3 ----
 # CREATE OR REPLACE = v0 CREATE + v1 WRITE on a fresh table (a re-run adds versions — assert shape only).
 query I
-SELECT count(*) >= 4 FROM fabricator_delta_snapshots('s3lake', 't');
+SELECT count(*) >= 4 FROM s3lake.delta.snapshots('t');
 ----
 true
 
 query T
-SELECT operation FROM fabricator_delta_snapshots('s3lake', 't') ORDER BY version DESC LIMIT 1;
+SELECT operation FROM s3lake.delta.snapshots('t') ORDER BY version DESC LIMIT 1;
 ----
 UPDATE
 
@@ -315,7 +315,7 @@ UPDATE s3cdf.main.f SET name = 'upd' WHERE id = 3;
 
 query TIIT
 SELECT _change_type, _commit_version, id, name
-FROM fabricator_delta_changes('s3cdf', 'f', 0) ORDER BY _commit_version, _change_type, id;
+FROM s3cdf.delta.changes('f', starting_version := 0) ORDER BY _commit_version, _change_type, id;
 ----
 insert	1	1	a
 insert	1	2	b
@@ -433,7 +433,7 @@ upd
 
 # persistent bucket, re-runnable suite: assert growth, not an absolute count
 query I
-SELECT count(*) >= 3 FROM fabricator_delta_snapshots('ccs', 't');
+SELECT count(*) >= 3 FROM ccs.delta.snapshots('t');
 ----
 true
 

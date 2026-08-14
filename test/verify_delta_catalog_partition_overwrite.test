@@ -36,7 +36,7 @@ US	1	600
 
 # ONE commit for the whole swap (v0 CREATE, v1 initial CTAS, v2 the partition overwrite).
 query I
-SELECT count(*) FROM fabricator_delta_snapshots('lake', 'main.sales');
+SELECT count(*) FROM lake.delta.snapshots('main.sales');
 ----
 3
 
@@ -106,7 +106,7 @@ COPY (SELECT * FROM (VALUES (5,'EU',500)) AS t(id,region,amt))
 TO 'cdf.main.sales' (FORMAT mssql, CREATE_TABLE false, PARTITION_OVERWRITE true);
 
 query TITI
-SELECT _change_type, id, region, amt FROM fabricator_delta_changes('cdf', 'main.sales', 2, 2)
+SELECT _change_type, id, region, amt FROM cdf.delta.changes('main.sales', starting_version := 2, ending_version := 2)
 ORDER BY _change_type, id;
 ----
 delete	2	EU	20
@@ -126,7 +126,7 @@ COPY (SELECT * FROM (VALUES (8,'APAC',800)) AS t(id,region,amt))
 TO 'cdf.main.sales' (FORMAT mssql, CREATE_TABLE false, PARTITION_OVERWRITE true);
 
 query TITI
-SELECT _change_type, id, region, amt FROM fabricator_delta_changes('cdf', 'main.sales', 5, 5)
+SELECT _change_type, id, region, amt FROM cdf.delta.changes('main.sales', starting_version := 5, ending_version := 5)
 ORDER BY _change_type, id;
 ----
 delete	7	APAC	70

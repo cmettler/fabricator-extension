@@ -216,7 +216,7 @@ internal sealed record DeltaWithOptions
                         // TransformTableOptions — quoting does not help), but Delta config keys are
                         // case-sensitive — re-case the well-known keys to their spec spelling. An unknown
                         // key stays as given (all-lowercase); for a case-sensitive CUSTOM key use
-                        // fabricator_delta_set_tblproperties (its JSON preserves case).
+                        // delta.set_tblproperties (its JSON preserves case).
                         props[CanonicalPropertyKey(key)] = value;
                         break;
                     }
@@ -285,7 +285,7 @@ internal sealed record DeltaWithOptions
 
     // One spelling per feature: the delta.enable*/delta.columnMapping.* property spellings need
     // protocol-declaration wiring the explicit WITH keys already have — reject with the pointer
-    // (mirrors the fabricator_delta_set_tblproperties guard). fabricator.sortedBy has a native clause.
+    // (mirrors the delta.set_tblproperties guard). fabricator.sortedBy has a native clause.
     private static void GuardPropertyKey(string key)
     {
         // ⚠ `delta.enable*` is a PREFIX, not a category: it matches every property that happens to start

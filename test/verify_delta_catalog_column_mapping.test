@@ -390,7 +390,7 @@ SELECT id, s.a FROM nc.main.t;
 2	20
 
 query TIIT
-SELECT _change_type, id, s.a, s.b FROM fabricator_delta_changes('nc', 'main.t', 1, 3)
+SELECT _change_type, id, s.a, s.b FROM nc.delta.changes('main.t', starting_version := 1, ending_version := 3)
 ORDER BY _commit_version, _change_type, id;
 ----
 insert	1	10	x

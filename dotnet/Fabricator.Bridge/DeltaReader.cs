@@ -65,7 +65,7 @@ internal static class DeltaReader
     }
 
     /// <summary>The table's Delta properties (<c>metaData.configuration</c> — the <c>delta.*</c> keys), a copy
-    /// (empty when none). Backs <c>fabricator_delta_tblproperties</c>.</summary>
+    /// (empty when none). Backs <c>delta.tblproperties</c>.</summary>
     public static IReadOnlyDictionary<string, string> GetTableProperties(nint opener, string path)
         => GetTablePropertiesAsync(opener, path).GetAwaiter().GetResult();
 
@@ -88,7 +88,7 @@ internal static class DeltaReader
 
     /// <summary>SET/UNSET table properties as ONE metaData commit (merges <paramref name="updates"/> into the
     /// current <c>configuration</c>; a null value UNSETs the key). Returns the new commit version. Backs
-    /// <c>fabricator_delta_set_tblproperties</c>. Pure config change — no protocol upgrade (the caller rejects
+    /// <c>delta.set_tblproperties</c>. Pure config change — no protocol upgrade (the caller rejects
     /// feature-enabling keys); the merged metaData rides <c>extraActions</c> exactly like a buffered ALTER.</summary>
     public static long SetTableProperties(nint opener, string path, IReadOnlyList<KeyValuePair<string, string?>> updates)
         => SetTablePropertiesAsync(opener, path, updates).GetAwaiter().GetResult();
@@ -1443,6 +1443,109 @@ internal static class DeltaReader
         {
             await table.DisposeAsync().ConfigureAwait(false);
         }
+    }
+
+    /// <summary>
+    /// The Change Data Feed with TYPED bounds (the <c>delta.changes</c> surface): version bounds pass through
+    /// untouched; a TIMESTAMP bound resolves against the commit history — <paramref name="fromTs"/> = the FIRST
+    /// version committed AT OR AFTER that instant (Delta's <c>startingTimestamp</c>), <paramref name="toTs"/> =
+    /// the LAST version committed AT OR BEFORE it (<c>endingTimestamp</c>, the as-of rule). A timestamp bound
+    /// past the applicable end of the history yields an EMPTY feed (deterministic, and safe under concurrent
+    /// commits) rather than an error. Mutual-exclusion validation is the function surface's job; this assumes a
+    /// resolvable starting bound exists.
+    /// </summary>
+    /// <remarks>
+    /// ⚠ Deliberately NOT built on <see cref="ResolveVersionAsOf"/>: that resolver serves snapshot PINNING,
+    /// where "cannot resolve ⇒ fall back to latest" is the right degradation — for a FEED BOUND the same
+    /// fallback would silently change which rows return. A commit with no timestamp at all refuses timestamp
+    /// bounds outright, naming the version-bound spelling as the way out.
+    /// </remarks>
+    public static IArrowArrayStream GetChangesBounded(
+        nint opener, string path, long? from, long? to, DateTime? fromTs, DateTime? toTs)
+    {
+        long toV = to ?? -1;
+        if (fromTs is null && toTs is null)
+        {
+            return GetChanges(opener, path, from ?? 0, toV);
+        }
+        var history = CollectVersionTimes(opener, path).GetAwaiter().GetResult();
+        long fromV;
+        if (fromTs is { } f)
+        {
+            long? first = null;
+            foreach (var (v, ts) in history)
+            {
+                if (ts is null)
+                {
+                    throw new InvalidOperationException(
+                        $"delta.changes: version {v} of this table carries no commit timestamp, so timestamp "
+                        + "bounds cannot be resolved — use version bounds (starting_version := / ending_version :=).");
+                }
+                if (ts >= f && (first is null || v < first))
+                {
+                    first = v;
+                }
+            }
+            if (first is null)
+            {
+                // from_ts is after the last commit: nothing has happened at-or-after it.
+                return new InMemoryArrayStream(EmptyChangeSchema(opener, path), System.Array.Empty<RecordBatch>());
+            }
+            fromV = first.Value;
+        }
+        else
+        {
+            fromV = from!.Value;
+        }
+        if (toTs is { } t)
+        {
+            long? last = null;
+            foreach (var (v, ts) in history)
+            {
+                if (ts is null)
+                {
+                    throw new InvalidOperationException(
+                        $"delta.changes: version {v} of this table carries no commit timestamp, so timestamp "
+                        + "bounds cannot be resolved — use version bounds (starting_version := / ending_version :=).");
+                }
+                if (ts <= t && (last is null || v > last))
+                {
+                    last = v;
+                }
+            }
+            if (last is null)
+            {
+                // to_ts is before the first commit: nothing existed at-or-before it.
+                return new InMemoryArrayStream(EmptyChangeSchema(opener, path), System.Array.Empty<RecordBatch>());
+            }
+            toV = last.Value;
+        }
+        if (toV >= 0 && fromV > toV)
+        {
+            return new InMemoryArrayStream(EmptyChangeSchema(opener, path), System.Array.Empty<RecordBatch>());
+        }
+        return GetChanges(opener, path, fromV, toV);
+    }
+
+    private static async Task<List<(long Version, DateTime? Ts)>> CollectVersionTimes(nint opener, string path)
+    {
+        var fs = TableFileSystems.Create(opener, path);
+        var table = await DeltaTable.OpenAsync(fs, DeltaWriter.Options()).ConfigureAwait(false);
+        var rows = new List<(long, DateTime?)>();
+        try
+        {
+            await foreach (var h in table.GetHistoryAsync().ConfigureAwait(false))
+            {
+                rows.Add((h.Version, h.TimestampMs is { } ms
+                    ? DateTimeOffset.FromUnixTimeMilliseconds(ms).UtcDateTime
+                    : null));
+            }
+        }
+        finally
+        {
+            await table.DisposeAsync().ConfigureAwait(false);
+        }
+        return rows;
     }
 
     /// <summary>Schema for an empty change feed (no changes in range): the table columns ++ the 3 CDF columns.</summary>

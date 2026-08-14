@@ -349,35 +349,17 @@ public static class MetadataKind
     public const int ColumnNdv = 5;
     public const int Functions = 6;
     public const int ServerInfo = 7;
-    // Delta only: a table's commit history (version, timestamp, operation, operation_parameters). arg1=schema,
-    // arg2=table. Surfaced by the fabricator_delta_snapshots(catalog, 'schema.table') table function.
-    public const int Snapshots = 8;
-    // Delta only: the Change Data Feed (table cols ++ _change_type/_commit_version/_commit_timestamp). arg1 =
-    // 'schema.table' ref, arg2 = "from:to" (to empty => latest). Surfaced by fabricator_delta_changes(...).
-    public const int Changes = 9;
-    // Delta only: the latest APPLICATION TRANSACTION version for an app id (the `txn` action — idempotent
-    // appends). arg1 = 'schema.table' ref, arg2 = app_id. Returns 1 row (app_id VARCHAR, version BIGINT —
-    // NULL when never set). Surfaced by fabricator_delta_get_transaction_version(...).
-    public const int TxnVersion = 10;
-    // Delta only: PARK an application-transaction version on the CURRENT explicit transaction (compared-and-
-    // swapped + committed atomically with the transaction's fused commit at COMMIT). arg1 = 'schema.table'
-    // ref, arg2 = "app_id\nversion\nexpected" (expected empty = must-not-exist). Returns the echoed row.
-    // Surfaced by fabricator_delta_set_transaction_version(...).
-    public const int SetTxnVersion = 11;
+    // Kinds 8-11 and 13-14 (Snapshots / Changes / TxnVersion / SetTxnVersion / TblProperties /
+    // SetTblProperties) are DELETED (ABI v70): they were Delta features wearing C++-registered function fronts
+    // with string-packed payloads, and are now catalog-bound functions in the `delta` schema —
+    // cat.delta.snapshots('s.t') etc., declared by the Delta providers with TYPED args (see DeltaFunctions).
+    // The gaps stay unassigned so an old loadable's kind cannot silently alias a new one.
     // Provider-declared VIRTUAL columns for a table (arg1=schema, arg2=table): two string columns
     // (name, type-text). Registered by the host as queryable-by-name virtual columns (NOT part of
     // SELECT *). Delta (native_read + delta.enableRowTracking only): __delta_row_id +
     // __delta_row_commit_version (both BIGINT — the STABLE row-tracking id/version, unlike the
     // transient _metadata.row_id rowid). Other providers: empty.
     public const int VirtualColumns = 12;
-    // Delta only: a table's delta.* properties as (property, value) rows. arg1 = 'schema.table' ref.
-    // Surfaced by fabricator_delta_tblproperties(catalog, 'schema.table').
-    public const int TblProperties = 13;
-    // Delta only: SET/UNSET table properties via a metaData commit (merged configuration). arg1 =
-    // 'schema.table' ref, arg2 = a JSON object property->value (a null value UNSETs the key). Feature-
-    // enabling keys (delta.enable*, columnMapping.mode) are rejected — those need a protocol upgrade at
-    // CREATE. Surfaced by fabricator_delta_set_tblproperties(catalog, 'schema.table', properties).
-    public const int SetTblProperties = 14;
     // Provider-declared CATALOG-BOUND DuckDB macros: three string columns (schema, name, create_sql), each
     // create_sql one complete CREATE MACRO statement that the HOST parses with DuckDB's own parser and binds
     // into the ATTACHed catalog's schema (resolved as db.schema.m(...)). Deliberately NOT a column on

@@ -260,7 +260,7 @@ COMMIT;
 
 query IIII
 SELECT _change_type, id, v, _commit_version
-FROM fabricator_delta_changes('lake', 'main.cdf', 2) ORDER BY _change_type, id;
+FROM lake.delta.changes('main.cdf', starting_version := 2) ORDER BY _change_type, id;
 ----
 insert	9	900	2
 update_postimage	3	300	2
@@ -475,7 +475,7 @@ MERGE INTO lake.main.cdftwo USING (VALUES (2, 0), (3, 300), (9, 900)) s(id, v) O
 # TWO row-addressing actions (DELETE + UPDATE) => fused => every row at version 2, including the insert's.
 query IIII
 SELECT _change_type, id, v, _commit_version
-FROM fabricator_delta_changes('lake', 'main.cdftwo', 2) ORDER BY _commit_version, _change_type, id;
+FROM lake.delta.changes('main.cdftwo', starting_version := 2) ORDER BY _commit_version, _change_type, id;
 ----
 delete	2	20	2
 insert	9	900	2
@@ -483,7 +483,7 @@ update_postimage	3	300	2
 update_preimage	3	30	2
 
 query I
-SELECT count(DISTINCT _commit_version) FROM fabricator_delta_changes('lake', 'main.cdftwo', 2);
+SELECT count(DISTINCT _commit_version) FROM lake.delta.changes('main.cdftwo', starting_version := 2);
 ----
 1
 
@@ -500,14 +500,14 @@ MERGE INTO lake.main.cdfone USING (VALUES (3, 300), (9, 900)) s(id, v) ON cdfone
 # BEGIN..COMMIT to get one.
 query IIII
 SELECT _change_type, id, v, _commit_version
-FROM fabricator_delta_changes('lake', 'main.cdfone', 2) ORDER BY _commit_version, _change_type, id;
+FROM lake.delta.changes('main.cdfone', starting_version := 2) ORDER BY _commit_version, _change_type, id;
 ----
 update_postimage	3	300	2
 update_preimage	3	30	2
 insert	9	900	3
 
 query I
-SELECT count(DISTINCT _commit_version) FROM fabricator_delta_changes('lake', 'main.cdfone', 2);
+SELECT count(DISTINCT _commit_version) FROM lake.delta.changes('main.cdfone', starting_version := 2);
 ----
 2
 
@@ -539,7 +539,7 @@ statement ok
 COMMIT;
 
 query IT
-SELECT version, operation FROM fabricator_delta_snapshots('lake', 'main.oplbl') ORDER BY version;
+SELECT version, operation FROM lake.delta.snapshots('main.oplbl') ORDER BY version;
 ----
 0	CREATE TABLE
 1	WRITE
@@ -561,7 +561,7 @@ MERGE INTO lake.main.oplbla USING (VALUES (2, 0), (3, 333), (9, 999)) s(id, v) O
 # either way. The label is what a foreign reader keys on, so it is asserted rather than inferred from
 # the commit count.
 query IT
-SELECT version, operation FROM fabricator_delta_snapshots('lake', 'main.oplbla') ORDER BY version;
+SELECT version, operation FROM lake.delta.snapshots('main.oplbla') ORDER BY version;
 ----
 0	CREATE TABLE
 1	WRITE
@@ -582,7 +582,7 @@ MERGE INTO lake.main.oplbl1 USING (VALUES (3, 333), (9, 999)) s(id, v) ON oplbl1
 # This is the other side of the boundary — and the reason a consumer cannot rely on seeing TRANSACTION
 # for every merge, only for one carrying two or more UPDATE/DELETE actions.
 query IT
-SELECT version, operation FROM fabricator_delta_snapshots('lake', 'main.oplbl1') ORDER BY version;
+SELECT version, operation FROM lake.delta.snapshots('main.oplbl1') ORDER BY version;
 ----
 0	CREATE TABLE
 1	WRITE

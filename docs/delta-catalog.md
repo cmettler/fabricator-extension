@@ -432,7 +432,7 @@ addition (a put-if-absent commit-write) or our own commit step that calls a put-
      lakehouses with time-travel on, plus local/S3 + delta-rs/Spark; on a Fabric lakehouse without the setting use
      plain tables (VERSION travel). A commit-file mtime path (timestamp travel on plain tables, no writer-v7) is a
      lower-priority option. VERSION travel is universal. `verify_delta_catalog_time_travel.test` (47).
-     **SNAPSHOTS / history — DONE: `fabricator_delta_snapshots('<catalog>', '<schema.>table')`** (DuckLake-style
+     **SNAPSHOTS / history — DONE: `<catalog>.delta.snapshots('<schema.>table')`** (DuckLake-style
      view). Catalog NAME (not a path; resolved to its handle, reusing the catalog's `TablePath`) + schema-qualified
      table (schema mandatory on schema-enabled, defaults to `main` flat). Returns `(version, timestamp, operation,
      operation_parameters)` from the `_delta_log` (engineered-wood `GetHistoryAsync`). New `MetadataKind.Snapshots`
@@ -451,7 +451,8 @@ addition (a put-if-absent commit-write) or our own commit step that calls a put-
      (writer-v7). INSERT/DELETE/UPDATE capture CDC change files: blind appends infer naturally; the rowid
      copy-on-write DELETE/UPDATE + DV-delete paths emit `_change_data/*.parquet` (Delete / UpdatePreimage /
      UpdatePostimage) — they already read the changed rows for the rewrite, so capture is essentially free.
-     **Read** via **`fabricator_delta_changes('<catalog>', '<schema.>table', from [, to])`** (2 overloads; `to`
+     **Read** via **`<catalog>.delta.changes('<schema.>table', starting_version := n [, ending_version := m])`**
+     (or `starting_timestamp`/`ending_timestamp`; the ending bound
      omitted/-1 ⇒ latest): the row-level feed with `_change_type` ++ `_commit_version BIGINT` ++
      `_commit_timestamp BIGINT` (epoch ms). New `MetadataKind.Changes=9` (additive, **no ABI bump**); C++
      `ChangesBind` mirrors `SnapshotsBind` (arg2 = `"from:to"`). **Two read-path fixes:** (1) the rowid-DML CDC
