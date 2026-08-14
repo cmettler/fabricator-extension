@@ -1466,6 +1466,24 @@ locally, but is worth re-checking on remote storage.
 Partitioned tables are batched as well — the partition value is not stored in the data files, so it travels
 alongside them and is applied in the same query.
 
+**On remote storage, which columns you select can dominate the query.** A scan takes one of two batched
+forms. The cheap one *declares* the schema up front and so never opens a parquet footer; the other one
+discovers the schema from the files, which costs one remote read per file before a single row is returned.
+Measured on a Fabric lakehouse table with 89 active files, same query, same data: **0.5 s versus 34 s** —
+enough to take a `SELECT … LIMIT 1` on that table from 77 s to 47 s.
+
+A scan takes the cheap form when it needs no row *position*: a plain `SELECT` of ordinary columns from a
+table none of whose files carry a deletion vector. It takes the expensive one for `UPDATE`/`DELETE`, for a
+table where **any** file carries a deletion vector (one is enough to send the whole scan there), and — the
+surprising case — for **any query that selects a partition column**, including `SELECT *` on a partitioned
+table, because the partition value lives in the log rather than in the files and has to be matched back to
+the file each row came from.
+
+So on a wide partitioned table over OneLake or S3, prefer naming the columns you need over `SELECT *`. On
+local storage the difference is negligible, since opening a footer is nearly free. `OPTIMIZE` helps both
+forms, because both costs scale with the number of active files — and on a heavily-deleted table it also
+clears the deletion vectors, which moves ordinary reads back onto the cheap form.
+
 ### Text columns on SQL Server: VARCHAR vs NVARCHAR
 
 A DuckDB `VARCHAR` is UTF-8. Which SQL Server type that becomes is decided **per connection, from the

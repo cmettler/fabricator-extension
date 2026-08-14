@@ -83,6 +83,17 @@ public interface ITableFunctionBinding : System.IDisposable
     /// does exactly that (it prunes files and row groups, then never re-checks per row), so
     /// <c>fabricator_delta_scan</c> pushes the filter AND answers <c>false</c> here. Answering <c>true</c>
     /// without filtering every row is a WRONG ANSWER, not a missed optimisation: DuckDB will not re-apply.
+    /// <para>⚠ <b>NOTHING READS THIS FLAG TODAY</b> — every binding declares it and no host code consults it,
+    /// so a binding answering <c>true</c> would gain nothing and a binding answering <c>false</c> loses
+    /// nothing. It is vocabulary for stating a guarantee, not yet a switch. ⚠ Do NOT read that as "so the
+    /// value does not matter": the day it is wired, a <c>true</c> written carelessly becomes silently dropped
+    /// rows. Its sibling <see cref="SupportsProjectionPushdown"/> IS read, so the two are not in the same
+    /// state — that asymmetry is the whole reason they were split.</para>
+    /// <para>Wiring it means having the host stop re-applying the predicate for a claiming binding, which on
+    /// the CATALOG side is the <c>filter_pushdown = true</c> decision made from the provider's own
+    /// <c>exact_filter_pushdown</c> capability (<c>fabricator_table_entry.cpp</c> /
+    /// <c>FetchExactFilterPushdown</c>) — i.e. this flag is the table-FUNCTION analogue of a mechanism that
+    /// already exists one layer over. Reuse that shape rather than inventing a second one.</para>
     /// </remarks>
     bool SupportsFilterPushdown { get; }
 
@@ -98,13 +109,19 @@ public interface ITableFunctionBinding : System.IDisposable
     /// 2026-08-13, which made the two Delta readers unable to prune columns: both push the filter and neither
     /// can promise a filtered result, so the single flag had to be <c>false</c> — and that also switched off
     /// the projection, which they could have honoured. One axis was hostage to the other.</para>
-    /// <para>⚠ NOTHING READS EITHER FLAG YET — say so rather than let the next reader assume otherwise. The
-    /// wrappers (<c>GlobalFunctions</c>, <c>CatalogFunctionSet</c>) pass a LITERAL <c>true</c> for
-    /// <see cref="IBoundTableFunction.MapResultByName"/> and never consult the binding, and
-    /// <c>BindingBoundTableFunction.Execute</c> declares its stream with the binding's FULL
-    /// <see cref="OutputSchema"/>. Honouring <see cref="SupportsProjectionPushdown"/> means letting the
-    /// binding declare the schema it will actually emit FOR THIS SCAN; until then these two are a vocabulary
-    /// for saying what a binding guarantees, not yet a switch that changes what the host does.</para>
+    /// <para><b>THIS one IS read — at exactly ONE site</b>, <c>BindingBoundTableFunction.Execute</c>, which
+    /// narrows the DECLARED stream schema to the requested columns when it is true and hands over the full
+    /// <see cref="OutputSchema"/> when it is false. That is the whole switch: the declaration is the contract
+    /// with <c>arrow_ingest</c>, so declaring the projected set is what makes emitting the projected set legal.
+    /// ⚠ Its sibling <see cref="SupportsFilterPushdown"/> is read NOWHERE (see its own remarks), and
+    /// <see cref="IBoundTableFunction.MapResultByName"/> is a THIRD question that no binding is consulted
+    /// about — the four <c>BindingBoundTableFunction</c> call sites pass a literal. Do not read the three as
+    /// one mechanism.</para>
+    /// <para>⚠ A comment here used to read <i>"NOTHING READS EITHER FLAG YET"</i>. That was accurate when the
+    /// flags were split and went stale the moment the projection was wired, which is the failure this file
+    /// keeps recording: a stale justification stops the next reader looking. <b>The claim is one grep</b>
+    /// (<c>grep -rn "SupportsProjectionPushdown" dotnet/ --include=*.cs</c> minus declarations and doc
+    /// comments) — re-run it before trusting this paragraph rather than after being surprised by it.</para>
     /// </remarks>
     bool SupportsProjectionPushdown { get; }
 

@@ -248,8 +248,13 @@ internal static class DeltaNativeReader
     /// <item><b>A per-file predicate cannot be expressed</b> — the deletion vector's prunable bound, the rowid's
     /// position range, the row-tracking condition. Those are pruning, not correctness (DuckDB re-applies every
     /// predicate above the scan), but forfeiting them is the opposite of the point, so a scan that has one keeps
-    /// the loop. The deletion vector is the one that is decided PER FILE: DV-carrying files go to the loop and
-    /// keep their bound while the rest batch, so a merge-heavy table still collapses its clean files.</item>
+    /// the loop. The deletion vector is the one that is decided PER FILE — DV-carrying files go to the loop and
+    /// keep their bound while the rest batch — but ⚠ that split is the PLAIN form's, and since the preference
+    /// was reversed (2026-08-14) a mixed table normally never reaches it: the plain plan is preferred only when
+    /// it serves EVERY file, so one deletion vector sends the whole scan to <see cref="TryFullForm"/>, which
+    /// covers DV files itself and forfeits the bound for all of them. The split is reachable only when the full
+    /// form also declines. Whether that is the right call is storage-dependent and open — see
+    /// <see cref="Build"/>.</item>
     /// </list>
     /// <para><b>What retires case 2 (and it is a concrete upstream change, not a hope):</b> duckdb/duckdb
     /// <b>#24407</b> — "extend the <c>schema</c> option to support NESTED schema definitions", by Tishj, OPEN
@@ -340,18 +345,68 @@ internal static class DeltaNativeReader
                     wantsTracking = true;
                 }
             }
+            // ⚠ THE PLAIN FORM IS TRIED FIRST, and it is not merely a preference — it is strictly cheaper to
+            // ATTEMPT. TryPlainForm is pure string work; TryFullForm issues PresentNames, a
+            // `parquet_schema([every file])` query, which on remote storage is an O(files) FOOTER read.
+            // MEASURED on 89 remote files (each variant in its own process, so no footer cache is shared):
+            // PresentNames 20.50 s, then the full form's own bind-time `LIMIT 0` schema probe another 20.66 s —
+            // against 0.49 s for the plain form's probe, 42x, because a declared `schema` map needs no footer at
+            // all. On the profiled Fabric query that pair is 34 s of 77. Before this the expensive-to-attempt
+            // form was the one tried first, and it SUCCEEDS on the commonest shape (a plain projection over
+            // DV-free files with no rowid), so the cheap form was unreachable exactly where it wins most.
+            var plain = TryPlainForm(listing, dataCols, wantRowId, wantsTracking, where, min);
+            if (plain is not null && plain.LoopFiles.Count == 0)
+            {
+                return plain;
+            }
             if (listing.Files.Count >= min)
             {
-                // The FULL form first: field-id keys, so `filename` + `file_row_number` compose and the rowid,
-                // the deletion vectors and the partition values all fit in ONE call. It covers every file,
-                // deletion vectors included.
+                // The FULL form: `union_by_name` + `filename`/`file_row_number`, so the rowid, the deletion
+                // vectors, the partition values and row tracking all fit in ONE call covering EVERY file.
+                // Reached when the plain form declined outright, or when it would serve only PART of the scan.
+                // ⚠ THE MIXED CASE (some files DV-carrying) DELIBERATELY KEEPS THIS FORM, and the reason is that
+                // the answer is STORAGE-DEPENDENT and unmeasured. Remotely, looping D DV files costs ~D x 230 ms
+                // (each looped file pays ResolveFileMapping, a footer read) against the full form's 2 x N x
+                // 230 ms, so plain wins for any D < 2N — i.e. always. LOCALLY a footer is ~free and the loop's
+                // ~1.9 ms/file host-query overhead dominates, so the single call wins. Do not generalise the
+                // remote numbers into this case without measuring it.
                 var full = TryFullForm(listing, dataCols, wantRowId, where);
                 if (full is not null)
                 {
                     return full;
                 }
             }
-            // Fall back to the PLAIN form, which cannot express any of that (see case 1) but needs no field ids.
+            // Neither serves everything: the partial plain plan (its DV-free files batched, the rest looped) is
+            // still better than no plan, and is exactly what this returned before the preference was reversed.
+            return plain;
+        }
+
+        /// <summary>
+        /// The PLAIN single-call form: <c>read_parquet([DV-free files], schema = map {&lt;physical name&gt;: …})</c>.
+        /// Declares the schema rather than discovering it, so it reads NO parquet footer at bind — the property
+        /// that makes it 42x cheaper to probe than <see cref="TryFullForm"/> on remote storage (0.49 s vs 20.66 s
+        /// over 89 files). It is PARTIAL BY DESIGN: DV-carrying files go to the loop and keep their prunable
+        /// bound, so a merge-heavy table still collapses its clean files.
+        /// <para>Cannot express anything needing a row POSITION — the transient rowid, a deletion vector, the
+        /// derived row-tracking ids — because those need <c>file_row_number</c>, which a VARCHAR-keyed map
+        /// refuses (case 1 in the class remarks). Nor a PROJECTED partition column: <c>schema</c> is refused
+        /// together with <c>hive_partitioning</c>.</para>
+        /// <para>⚠ It passes NO <c>hive_partitioning</c> flag where the full form disables it explicitly, and
+        /// that is safe rather than an oversight: MEASURED on a table whose files really do live under
+        /// <c>edwYear=2012/edwMonth=10/</c>, <c>DESCRIBE SELECT *</c> under the schema map returns exactly the
+        /// declared columns — a declared <c>schema</c> SUPPRESSES hive auto-detection, so no phantom column is
+        /// injected. ⚠ The zero-column (<c>COUNT(*)</c>) branch declares no map at all and is therefore still
+        /// exposed to auto-detection; it selects a constant, so an injected column is unreferenced — untested
+        /// rather than safe.</para>
+        /// <para>⚠ It CASTs to the DECLARED Delta type where the full form takes each file's STORED type, so on a
+        /// type-widened table the two forms would advertise different types (<c>typeWidening</c> is untested —
+        /// see the tail of the class remarks). Conversely it HANDLES structs where the full form declines, so
+        /// preferring it is not uniformly a narrowing.</para>
+        /// </summary>
+        private static BatchPlan? TryPlainForm(
+            DeltaReader.NativeScanList listing, IReadOnlyList<string> dataCols, bool wantRowId, bool wantsTracking,
+            string? where, int min)
+        {
             if (wantRowId || wantsTracking)
             {
                 return null;
@@ -1485,9 +1540,16 @@ internal static class DeltaNativeReader
     {
         if (batch is not null)
         {
-            // Probe the BATCH's own SQL: it is the one query that must agree with the advertised schema, and
-            // probing it costs no footer read (the whole point of the `schema` map) where the per-file probe
-            // below pays ResolveFileMapping.
+            // Probe the BATCH's own SQL: it is the one query that must agree with the advertised schema.
+            // ⚠ WHAT THIS COSTS DEPENDS ENTIRELY ON WHICH FORM WAS CHOSEN, and a comment here used to claim
+            // "no footer read (the whole point of the `schema` map)" for both — true of the plain form,
+            // MEASURED FALSE of the full one. Over 89 remote files, cold: plain-form probe 0.49 s (the schema
+            // is DECLARED, so nothing is opened) vs full-form probe 20.66 s, on top of the 20.50 s PresentNames
+            // already spent building that SQL. Reversing BatchPlan.Build's preference is what moved the common
+            // read onto the cheap side; the expensive side remains for rowid / DML / deletion-vector shapes,
+            // where it is the biggest single span left on a remote scan (see CLAUDE.md, "fuse ProbeSchema with
+            // the real query" — the LIMIT 0 is a duplicate bind, since Host.Query exposes .Schema without
+            // fetching a row).
             using var bs = batch.Query(" LIMIT 0");
             DropViews(batch.ViewNames);
             return listing.MappedSchema is { } bms

@@ -221,6 +221,30 @@ A snapshot cache (§5) would collapse the four opens to one: **~85 s**.
 remote parquet FOOTER reads (89 files here), so no amount of log caching touches it. Separate item, separate
 key.
 
+### 0.4 That residual is GONE for ordinary reads — 2026-08-14, and it was a ROUTING bug, not a cost
+
+**MEASURED live on the same query: 77.19 → 46.72 s (−39%), the `LIMIT 0` span 34.4 → 0.50 s.** The probe was
+never inherently expensive; it was expensive because `BatchPlan.Build` tried the **full** `read_parquet`
+form first and that form succeeds on an ordinary projection, so the **plain** `schema`-map form — which
+DECLARES the schema and therefore opens NO footer — was unreachable exactly where it wins. Reversing the
+preference (build the plain plan first, prefer it iff it serves every file) is the whole fix; C#-only, no
+ABI, no engineered-wood change. Full record: CLAUDE.md, "THE NATIVE READER PREFERRED THE EXPENSIVE OF ITS
+THREE `read_parquet` PATHS".
+
+⚠ **It does NOT retire this document's own item, and the split matters.** The span this removed was the
+FOOTER cost; the four `_delta_log` opens §0.3 counts are untouched, and after the fix the profiled query's
+dominant term is the **26 s log replay**, i.e. squarely §5's subject. If anything the case for a snapshot
+cache is now *cleaner*, because the footer term no longer masks it.
+
+⚠ **Two costs above survive for DML and for any table carrying a deletion vector**, which cannot take the
+plain form: those still pay `PresentNames` (20.5 s) plus the full form's own probe (20.66 s). The two open
+follow-ons — fusing `ProbeSchema` into the real query, and asking ONE file instead of all of them in
+`PresentNames` — are aimed there and are unbuilt.
+
+⚠ **When re-measuring this query, read the replay span out of the log before comparing totals.** A first
+after-run reported 59.15 s and was worthless: its replay was 39.4 s against the baseline's 26 s, so the two
+totals differed in two variables. `ATTACH` alone varied 3 / 4.7 / 22.3 s across three runs on this table.
+
 ⚠ **None of this is a Delta-log-length problem you can fix by caching either**: a single build of this log
 costs ~26 s, and `LogCleanup` (shipped) bounds the log only for tables whose `delta.logRetentionDuration`
 has passed. The user-side levers remain `delta.checkpointInterval` (100 → 10 shortens the replay tail),
