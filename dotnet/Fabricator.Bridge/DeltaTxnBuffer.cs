@@ -7,6 +7,7 @@ using System.Threading.Tasks;
 using Apache.Arrow;
 using Apache.Arrow.Ipc;
 using EngineeredWood.DeltaLake.Table;
+using Microsoft.Extensions.Logging;
 
 namespace Fabricator.Bridge;
 
@@ -18,6 +19,12 @@ namespace Fabricator.Bridge;
 /// exactly Spark's shape). DuckDB wraps EVERY statement in a transaction, so in autocommit the flush fires
 /// at statement end and behavior is identical to per-statement commits; only explicit
 /// <c>BEGIN … COMMIT/ROLLBACK</c> changes semantics (atomic multi-INSERT, rollback undoes).
+///
+/// <para>Since slice 4b (docs/catalog-table-abstraction.md §5) this class is the per-table buffer SHAPE
+/// (<see cref="PendingAppends"/>) plus its static stream helpers; the per-transaction BOOKKEEPING it used
+/// to carry — the (txnId → tables) outer map and the separate explicit-mark set — lives on
+/// <see cref="DeltaTransaction"/>, one object per transaction in the catalog's
+/// <see cref="TransactionManager{T}"/>.</para>
 ///
 /// <para>EAGER-WRITE model: in explicit transactions the DATA is always written to storage at statement
 /// time (streamed COPY under native_write, per-statement WriteDataFilesAsync otherwise) and the buffer
@@ -31,10 +38,22 @@ namespace Fabricator.Bridge;
 /// Atomicity is PER TABLE: Delta has no cross-table transaction, so a multi-table COMMIT writes one
 /// Delta commit per table, sequentially.</para>
 /// </summary>
-internal sealed class DeltaTxnBuffer
+internal static class DeltaTxnBuffer
 {
     internal sealed class PendingAppends
     {
+        /// <summary>The owning transaction and this buffer's table path — what lets
+        /// <see cref="PinnedVersion"/> delegate to the ONE pin store. <c>Path</c> is mutable for the
+        /// created-table RENAME re-key (<see cref="DeltaTransaction.RenameTable"/>).</summary>
+        internal PendingAppends(DeltaTransaction owner, string path)
+        {
+            Owner = owner;
+            Path = path;
+        }
+
+        internal DeltaTransaction Owner { get; }
+        internal string Path { get; set; }
+
         public Schema? BatchSchema;
         public List<RecordBatch> Batches { get; } = new();
         public List<WrittenDataFile> Files { get; } = new();
@@ -46,7 +65,29 @@ internal sealed class DeltaTxnBuffer
         // deletion-vector remove/add actions fused into the ONE commit; validity is tied to PinnedVersion
         // (the flush conflict-aborts if the table moved).
         public Dictionary<int, HashSet<long>> DeletedByOrdinal { get; } = new();
-        public long? PinnedVersion;
+
+        /// <summary>
+        /// The transaction's snapshot pin for THIS table — a delegating view over the transaction scope's
+        /// ONE pin store (slice 4b's pin unification). This used to be a FIELD, i.e. a SECOND store that
+        /// shadowed the scope's pins on every path a sequential suite reaches — which is exactly why slice
+        /// 1b's InvalidateTables-keeps-pins mutant SURVIVED. Every reader and every <c>??=</c> seed now
+        /// goes through the scope, so the pin has one owner and the releases' asymmetry is gated
+        /// (verify_delta_autocommit_pin §12).
+        /// <para>The setter is FIRST-WINS (<see cref="DeltaTxnScope.SetPinIfAbsent"/>), matching both the
+        /// old field's exclusively-<c>??=</c> call sites and PinVersion's GetOrAdd — a pin, once taken,
+        /// is never moved within a transaction.</para>
+        /// </summary>
+        public long? PinnedVersion
+        {
+            get => Owner.Scope.TryGetPinned(Path);
+            set
+            {
+                if (value is { } v)
+                {
+                    Owner.Scope.SetPinIfAbsent(Path, v);
+                }
+            }
+        }
         // The table's effective isolation (delta.isolationLevel): true = Serializable, false = WriteSerializable
         // (our catalog default when the property is absent — NOT "the Spark default", which is measured to be
         // Serializable; see DeltaCatalog._serializable). Read once per (txn, table) and cached — the OCC
@@ -146,60 +187,50 @@ internal sealed class DeltaTxnBuffer
         public bool HasReads => ReadWholeTable || ReadPredicates.Count > 0;
     }
 
-    private readonly ConcurrentDictionary<long, ConcurrentDictionary<string, PendingAppends>> _byTxn = new();
-    // Explicit (user BEGIN..COMMIT) transaction ids, marked by BeginTransaction(v60). DML buffers only in
-    // explicit transactions; autocommit keeps the direct per-statement paths.
-    private readonly ConcurrentDictionary<long, byte> _explicit = new();
+    private static readonly Microsoft.Extensions.Logging.ILogger Log =
+        FabricatorLog.CreateLogger("Fabricator.Delta");
 
-    public void MarkExplicit(long txnId)
+    /// <summary>
+    /// Disposes the buffer entry's held EW transaction and table, <b>transaction first</b> — its cleanup
+    /// needs the table's filesystem. Runs on EVERY exit from a (DuckDB txn, table)'s life: commit,
+    /// rollback, an exception out of the flush, and the catalog-teardown Drain sweep (which is why it
+    /// lives here beside <see cref="DisposeBatches"/> rather than on the catalog). Idempotent — the fields
+    /// are nulled before the disposals run.
+    ///
+    /// <para>Disposing the transaction is what ABORTS it, which is the reclamation the flush used to get
+    /// from <c>await using</c>: a flush that does not commit takes back what EW's own writers staged during
+    /// it — measured, a buffered DELETE whose commit is refused otherwise leaves a
+    /// <c>deletion_vector_*.bin</c>, because <c>StageRowDeletesAsync</c> writes the vector at STAGING time,
+    /// before the precondition is judged. After a SUCCESSFUL commit the abort is a no-op (EW #49 empties
+    /// the ledger the instant the commit json is durable) — which is also why this is only safe from #49
+    /// onward.</para>
+    ///
+    /// <para>Never throws: it runs from finally blocks that may already be carrying the user's real error;
+    /// a cleanup failure must not replace it.</para>
+    /// </summary>
+    public static void DisposeHeld(PendingAppends pending)
     {
-        if (txnId != 0)
+        var txn = pending.HeldTxn;
+        var table = pending.HeldTable;
+        pending.HeldTxn = null;
+        pending.HeldTable = null;
+        if (txn is not null)
         {
-            _explicit.TryAdd(txnId, 0);
+            try { txn.DisposeAsync().GetAwaiter().GetResult(); }
+            catch (System.Exception ex)
+            {
+                Log.LogWarning("delta held transaction dispose failed ({Reason}) — staged files may remain "
+                                + "as orphans for VACUUM", ex.Message);
+            }
         }
-    }
-
-    public bool IsExplicit(long txnId) => txnId != 0 && _explicit.ContainsKey(txnId);
-
-    public PendingAppends GetOrCreate(long txnId, string tablePath)
-    {
-        var tables = _byTxn.GetOrAdd(txnId, _ => new ConcurrentDictionary<string, PendingAppends>(StringComparer.Ordinal));
-        return tables.GetOrAdd(tablePath, _ => new PendingAppends());
-    }
-
-    public PendingAppends? Get(long txnId, string tablePath)
-        => _byTxn.TryGetValue(txnId, out var tables) && tables.TryGetValue(tablePath, out var p) && p.HasAny
-            ? p
-            : null;
-
-    public bool HasPending(long txnId, string tablePath) => Get(txnId, tablePath) is not null;
-
-    /// <summary>Re-keys ONE table's buffer under a new path (RENAME TABLE of a table CREATED in the same
-    /// transaction — dbt's tmp-swap shape; the caller moves any eagerly-written files). False when the
-    /// old path has no buffer or the new path already has one.</summary>
-    public bool RenameTable(long txnId, string oldPath, string newPath)
-    {
-        return _byTxn.TryGetValue(txnId, out var tables)
-               && tables.TryRemove(oldPath, out var p)
-               && tables.TryAdd(newPath, p);
-    }
-
-    /// <summary>Discards ONE table's buffer (a CREATE + DROP inside the same transaction cancels out —
-    /// nothing ever touched storage).</summary>
-    public void RemoveTable(long txnId, string tablePath)
-    {
-        if (_byTxn.TryGetValue(txnId, out var tables) && tables.TryRemove(tablePath, out var p))
+        if (table is not null)
         {
-            DisposeBatches(p);
+            try { table.DisposeAsync().GetAwaiter().GetResult(); }
+            catch (System.Exception ex)
+            {
+                Log.LogWarning("delta held table dispose failed ({Reason})", ex.Message);
+            }
         }
-    }
-
-    /// <summary>Removes and returns the transaction's whole buffer set (null when none); also clears the
-    /// explicit-transaction mark.</summary>
-    public ConcurrentDictionary<string, PendingAppends>? Remove(long txnId)
-    {
-        _explicit.TryRemove(txnId, out _);
-        return _byTxn.TryRemove(txnId, out var tables) ? tables : null;
     }
 
     /// <summary>Disposes buffered batches (rollback / after flush).</summary>

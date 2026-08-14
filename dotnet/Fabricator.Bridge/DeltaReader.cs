@@ -316,14 +316,15 @@ internal static class DeltaReader
     /// stats/partitions can't match), and resolves each surviving file's deletion-vector positions.</summary>
     public static NativeScanList ListNativeScanFiles(
         nint opener, string path, string? unit, string? value, Predicate? prune, ILogger log,
-        EngineeredWood.DeltaLake.Schema.StructType? schemaOverride = null)
-        => ListNativeScanFilesAsync(opener, path, unit, value, prune, log, schemaOverride).GetAwaiter().GetResult();
+        EngineeredWood.DeltaLake.Schema.StructType? schemaOverride = null, DeltaTxnScope? scope = null)
+        => ListNativeScanFilesAsync(opener, path, unit, value, prune, log, schemaOverride, scope)
+            .GetAwaiter().GetResult();
 
     /// <summary>
-    /// Opens a table for a READ, reusing the one this transaction already has open when there is one
-    /// (<see cref="DeltaTxnScope"/>). Returns whether the result is SHARED — a shared table must NOT be
-    /// disposed by the borrower, because engineered-wood's <c>Dispose</c> latches <c>_disposed</c> and the
-    /// next reader would then throw.
+    /// Opens a table for a READ, reusing the one <paramref name="scope"/>'s transaction already has open
+    /// when there is one (<see cref="DeltaTxnScope"/>). Returns whether the result is SHARED — a shared
+    /// table must NOT be disposed by the borrower, because engineered-wood's <c>Dispose</c> latches
+    /// <c>_disposed</c> and the next reader would then throw.
     /// </summary>
     /// <remarks>
     /// ⚠ READ PATHS ONLY. Sharing is sound only because no engineered-wood read path assigns
@@ -331,36 +332,46 @@ internal static class DeltaReader
     /// its conflict range stays empty (<c>verify_delta_catalog_transactions</c> §41). All four callers pass
     /// the identical <c>DeltaWriter.Options()</c> — a site whose options differ (a reader/writer seam, a
     /// write spec) must NOT join this cache, since the options are baked into the table at construction.
+    /// <para>⚠ THE SCOPE IS A PARAMETER, NOT AN AMBIENT (slice 4b): this class is static while the scope is
+    /// per-catalog state (owned by the catalog's <see cref="DeltaTransaction"/>), so the catalog threads it
+    /// in — the write-spec-saga shape. A null scope means "no reuse": the caller owns what it opens and
+    /// disposes it, the pre-cache behaviour. That is what a path-based global function or an
+    /// ExternalTableRouting schema probe now gets — the old static registry cached their opens under the
+    /// ambient id and, with no catalog to release that id, LEAKED the entry until the 4096 panic clear.</para>
     /// </remarks>
     private static async Task<(DeltaTxnScope.OpenTable Open, bool Shared)> OpenForReadAsync(
-        nint opener, string path)
+        nint opener, string path, DeltaTxnScope? scope)
     {
-        long txn = AmbientTransaction.Current;
-        if (DeltaTxnScope.TryGetTable(txn, path) is { } hit)
+        if (scope?.TryGetTable(path) is { } hit)
         {
             return (hit, true);
         }
         // A MISS is the thing worth logging, because each one is a whole `_delta_log` replay (~20-27 s on the
         // profiled Fabric table). The txn id is on the line because reuse is scoped to it: two misses for one
         // table in one statement mean the crossings ran under DIFFERENT transaction ids, which is a host-side
-        // question and not a cache bug. txn 0 is never cached at all.
-        DmlLog.LogDebug("delta table open {Path} (txn={Txn}) — cache miss", path, txn);
+        // question and not a cache bug. txn 0 = no scope, never cached at all.
+        DmlLog.LogDebug("delta table open {Path} (txn={Txn}) — cache miss", path, scope?.OwnerId ?? 0);
         // outlivesThisCall: the filesystem must not capture the host opener when it is about to be cached.
-        var fs = TableFileSystems.Create(opener, path, outlivesThisCall: txn != 0);
+        var fs = TableFileSystems.Create(opener, path, outlivesThisCall: scope is not null);
         var table = await DeltaTable.OpenAsync(fs, DeltaWriter.Options()).ConfigureAwait(false);
+        if (scope is null)
+        {
+            return (new DeltaTxnScope.OpenTable(table, fs), false);
+        }
         // A concurrent opener may have won; take the winner so "one table per (txn, path)" holds. Ours is
         // then orphaned to the GC, which costs nothing — Dispose only sets a flag.
-        // ⚠ `Shared` comes from Publish, NOT from `txn != 0`: the cache DECLINES past its per-transaction
-        // table cap (catalog enumeration), and a declined entry is ours to dispose exactly as before.
-        var (entry, cached) = DeltaTxnScope.PublishTable(txn, path, new DeltaTxnScope.OpenTable(table, fs));
+        // ⚠ `Shared` comes from Publish, NOT from `scope is not null`: the cache DECLINES past its
+        // per-transaction table cap (catalog enumeration), and a declined entry is ours to dispose exactly
+        // as before.
+        var (entry, cached) = scope.PublishTable(path, new DeltaTxnScope.OpenTable(table, fs));
         return (entry, cached);
     }
 
     private static async Task<NativeScanList> ListNativeScanFilesAsync(
         nint opener, string path, string? unit, string? value, Predicate? prune, ILogger log,
-        EngineeredWood.DeltaLake.Schema.StructType? schemaOverride)
+        EngineeredWood.DeltaLake.Schema.StructType? schemaOverride, DeltaTxnScope? scope)
     {
-        var (open, shared) = await OpenForReadAsync(opener, path).ConfigureAwait(false);
+        var (open, shared) = await OpenForReadAsync(opener, path, scope).ConfigureAwait(false);
         var (table, fs) = (open.Table, open.Fs);
         try
         {
@@ -565,12 +576,12 @@ internal static class DeltaReader
 
     /// <summary>Opens the Delta table at <paramref name="path"/> and returns its Arrow schema only (no data
     /// read). Used at table-function bind. <paramref name="opener"/> = the calling operator's ClientContext.</summary>
-    public static Schema GetSchema(nint opener, string path)
-        => GetSchemaAsync(opener, path).GetAwaiter().GetResult();
+    public static Schema GetSchema(nint opener, string path, DeltaTxnScope? scope = null)
+        => GetSchemaAsync(opener, path, scope).GetAwaiter().GetResult();
 
-    private static async Task<Schema> GetSchemaAsync(nint opener, string path)
+    private static async Task<Schema> GetSchemaAsync(nint opener, string path, DeltaTxnScope? scope)
     {
-        var (open, shared) = await OpenForReadAsync(opener, path).ConfigureAwait(false);
+        var (open, shared) = await OpenForReadAsync(opener, path, scope).ConfigureAwait(false);
         try
         {
             // Variant fields cross the C ABI in the ew.variant_transport LEAF-binary transport form (EW
@@ -586,9 +597,10 @@ internal static class DeltaReader
     /// <summary>Like <see cref="GetSchema"/> but also reports whether <c>delta.enableRowTracking</c> is set —
     /// in the SAME table open, so the catalog's column fetch can cache the flag for the (immediately
     /// following) virtual-columns metadata fetch without a second <c>_delta_log</c> read (OneLake cost).</summary>
-    public static Schema GetSchemaAndRowTracking(nint opener, string path, out bool rowTracking)
+    public static Schema GetSchemaAndRowTracking(nint opener, string path, out bool rowTracking,
+                                                 DeltaTxnScope? scope = null)
     {
-        var (schema, rt) = GetSchemaAndRowTrackingAsync(opener, path).GetAwaiter().GetResult();
+        var (schema, rt) = GetSchemaAndRowTrackingAsync(opener, path, scope).GetAwaiter().GetResult();
         rowTracking = rt;
         return schema;
     }
@@ -625,9 +637,10 @@ internal static class DeltaReader
         }
     }
 
-    private static async Task<(Schema Schema, bool RowTracking)> GetSchemaAndRowTrackingAsync(nint opener, string path)
+    private static async Task<(Schema Schema, bool RowTracking)> GetSchemaAndRowTrackingAsync(
+        nint opener, string path, DeltaTxnScope? scope)
     {
-        var (open, shared) = await OpenForReadAsync(opener, path).ConfigureAwait(false);
+        var (open, shared) = await OpenForReadAsync(opener, path, scope).ConfigureAwait(false);
         try
         {
             var cfg = open.Table.CurrentSnapshot.Metadata.Configuration;
@@ -647,16 +660,18 @@ internal static class DeltaReader
     /// same statement at <b>zero extra IO</b> (the alternative, <see cref="ResolveVersionAsOf"/>, costs its own
     /// <c>_delta_log</c> open). Same reasoning as <see cref="GetSchemaAndRowTracking"/>: the value is already in
     /// hand, so asking for it separately would be a second read of the log we just replayed.</summary>
-    public static Schema GetSchemaAndVersion(nint opener, string path, out long version)
+    public static Schema GetSchemaAndVersion(nint opener, string path, out long version,
+                                             DeltaTxnScope? scope = null)
     {
-        var (schema, v) = GetSchemaAndVersionAsync(opener, path).GetAwaiter().GetResult();
+        var (schema, v) = GetSchemaAndVersionAsync(opener, path, scope).GetAwaiter().GetResult();
         version = v;
         return schema;
     }
 
-    private static async Task<(Schema Schema, long Version)> GetSchemaAndVersionAsync(nint opener, string path)
+    private static async Task<(Schema Schema, long Version)> GetSchemaAndVersionAsync(
+        nint opener, string path, DeltaTxnScope? scope)
     {
-        var (open, shared) = await OpenForReadAsync(opener, path).ConfigureAwait(false);
+        var (open, shared) = await OpenForReadAsync(opener, path, scope).ConfigureAwait(false);
         try
         {
             return (VariantMarker.ToTransportSchema(open.Table.ArrowSchema), open.Table.CurrentSnapshot.Version);
@@ -1266,12 +1281,14 @@ internal static class DeltaReader
     /// <summary>Time travel — the Arrow schema of the table AS OF a version/timestamp (the schema can differ from
     /// the latest, e.g. before an ADD COLUMN). <paramref name="unit"/> is "version" or "timestamp" (the DuckDB
     /// <c>AT</c> clause unit); <paramref name="value"/> is the BIGINT version or a parseable timestamp.</summary>
-    public static Schema GetSchemaAt(nint opener, string path, string unit, string value)
-        => GetSchemaAtAsync(opener, path, unit, value).GetAwaiter().GetResult();
+    public static Schema GetSchemaAt(nint opener, string path, string unit, string value,
+                                     DeltaTxnScope? scope = null)
+        => GetSchemaAtAsync(opener, path, unit, value, scope).GetAwaiter().GetResult();
 
-    private static async Task<Schema> GetSchemaAtAsync(nint opener, string path, string unit, string value)
+    private static async Task<Schema> GetSchemaAtAsync(nint opener, string path, string unit, string value,
+                                                       DeltaTxnScope? scope)
     {
-        var (open, shared) = await OpenForReadAsync(opener, path).ConfigureAwait(false);
+        var (open, shared) = await OpenForReadAsync(opener, path, scope).ConfigureAwait(false);
         try
         {
             var snap = await ResolveSnapshotAsync(open.Table, unit, value, default).ConfigureAwait(false);

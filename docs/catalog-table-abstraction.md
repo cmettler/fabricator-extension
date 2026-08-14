@@ -1,4 +1,4 @@
-# The catalog/table abstraction — design for retiring `get_metadata` (slices 1a/1b/2/3 + 4a BUILT; 4b–4d/5 open)
+# The catalog/table abstraction — design for retiring `get_metadata` (slices 1a/1b/2/3 + 4a/4b BUILT; 4c–4d/5 open)
 
 > Written 2026-08-14 after the user's review: *"I don't like the getmetadata functions … there should be no
 > provider-specific function defined in C++, all must live in the providers … an abstraction similar to
@@ -333,6 +333,8 @@ the same table the code evaluates.
      buffered DML, so wherever a sequential suite could observe a re-pin, the buffer answers first; the
      exposed shape needs a concurrent commit mid-transaction. ⇒ the full ITransaction slice must UNIFY the
      pin into one owner — until then any "the pin survives X" claim has to be checked against BOTH stores.
+     **CLOSED BY 4b (2026-08-14): `PinnedVersion` is now a delegating property over the scope's one pin
+     store, and the identical mutant dies at verify_delta_autocommit_pin §12 — see item 4's 4b notes.**
    - **1b scoping facts kept for the full slice:** `DeltaReader` is STATIC, so the bound object must be
      PASSED into its entry points rather than resolved there (the write-spec-saga threading shape); and
      ⚠ the natural name `DeltaTransaction` COLLIDES with engineered-wood's own class — hence `DeltaTxnScope`.
@@ -415,22 +417,57 @@ the same table the code evaluates.
        GetOrCreates). Delta is deliberately NOT converted here — see 4b's reason. Gates: the routing
        suites (verify_read_isolation/mars_dynamic/mars_off_same_catalog/read_write_same_catalog) at
        identical counts; both tiers identical.
-     - **4b — Delta's conversion + the bound-table threading.** DeltaTxnBuffer's outer map + `_explicit` +
-       the STATIC `DeltaTxnScope` registry become a per-catalog manager of Delta transactions whose bound
-       tables subsume `PendingAppends` + the scope's pins/tables — the §2.3 table. ⚠ It cannot be done
-       per-catalog without THREADING: `DeltaReader.OpenForReadAsync` is STATIC and reaches the scope
-       statically (the 1b scoping fact), so the bound object must be passed into its entry points (the
-       write-spec-saga shape). This is also where the DOUBLE-STORED PIN unifies
-       (`PendingAppends.PinnedVersion` vs the scope's pins — §5 item 1b's surviving mutant).
-     - **⚠ A PRE-EXISTING CROSS-CATALOG HAZARD 4b FIXES STRUCTURALLY, recorded here because 4a must NOT
-       accidentally "fix" half of it (REASONED, NOT MEASURED — no suite constructs the shape):**
-       `ExternalTableRouting`'s TRANSIENT Delta catalogs call `CommitTransaction()` under the USER's
-       ambient txn id, and `DeltaCatalog.CommitTransaction` runs `DeltaTxnScope.Release(txnId)`
-       unconditionally FIRST — on the process-global STATIC registry. So an external-table INSERT inside
-       an explicit transaction drops an ATTACHED Delta catalog's pins for the same txn id; the next read
-       re-pins at latest, i.e. repeatable read silently degrades mid-transaction. Needs explicit txn +
-       attached Delta catalog + external-table write in one txn. Per-catalog state makes it structurally
-       impossible; fixing it is a behaviour CHANGE (safe direction) and belongs to 4b with its own gate.
+     - **4b — Delta's conversion + the read-scope threading. BUILT — 2026-08-14 (C#-only,
+       behaviour-preserving; both tiers identical + verify_delta_autocommit_pin 67 → 75).** As built:
+       `DeltaTransaction : ITransaction` (new file) owns the (path → `PendingAppends`) map, the
+       explicit-BEGIN mark, AND a per-transaction `DeltaTxnScope` INSTANCE (pins + open-table reuse — the
+       static registry is GONE, its 4096 panic-clear bound with it); `DeltaCatalog` holds a
+       `TransactionManager<DeltaTransaction>` like SqlServer's. `DeltaTxnBuffer` shrank to the
+       `PendingAppends` shape + the static stream helpers (and gained `DisposeHeld`, moved from the
+       catalog so `DeltaTransaction.Complete` and the teardown `Drain` sweep can reach it —
+       `DeltaCatalog.Dispose` now sweeps, where a detach with a transaction in flight used to leak into
+       the static registry).
+       - **The THREADING, as predicted (the write-spec-saga shape):** the five `DeltaReader` read entry
+         points (`GetSchema`/`GetSchemaAndVersion`/`GetSchemaAndRowTracking`/`GetSchemaAt`/
+         `ListNativeScanFiles`) and `DeltaNativeReader.Read` take an optional `DeltaTxnScope? scope`;
+         the catalog passes `ReadScope()` (GetOrCreate on the ambient id — the old registry's `For()`
+         creation semantics, without which an autocommit schema open would never cache and the
+         195-of-291-seconds shape would return). ⚠ Defaulted null ON PURPOSE for the catalog-less
+         callers (`DeltaGlobalTableFunction`, `ExternalTableRouting`'s schema probe): they open
+         untracked and dispose their own — which also FIXES a leak, since the old registry cached their
+         opens under an ambient id no catalog ever released. Cost: a global-function statement no longer
+         shares one open across its bind/execute crossings (bind ran with txn 0 and never cached anyway,
+         so the loss is marginal).
+       - **THE PIN UNIFICATION, one owner without rewriting 25 sites:** `PendingAppends.PinnedVersion`
+         became a DELEGATING PROPERTY over `Owner.Scope` (get = `TryGetPinned(Path)`, set = first-wins
+         `SetPinIfAbsent` — sound because every historical assignment was `??=`). The entry carries
+         `Owner` + a mutable `Path`; `DeltaTransaction.RenameTable` re-keys BOTH the entry and the pin
+         (`Scope.RenamePin`) — without the pin re-key the dbt tmp-swap's flush would lose its rebase
+         base. Post-`Remove` flush code keeps working because the property reads the REMOVED (alive)
+         object's scope, not the manager.
+       - **CommitTransaction's three-step ordering dance is GONE**: one `_txns.Remove` drops pins +
+         tables + buffers atomically, and `wasExplicit` is read off the removed OBJECT — the
+         read-state-after-remove hazard is unrepresentable, which is what ITransaction is for.
+       - **The releases' asymmetry (InvalidateTables keeps pins) is now GATED** —
+         verify_delta_autocommit_pin §12: explicit txn, scan, DROP of an unrelated table, re-scan ⇒
+         exactly ONE `delta % pin` line for the table. **Mutation-tested: the exact mutant that SURVIVED
+         the whole tier in 1b (pins cleared with the tables) now dies at §12's count after 72 pass.**
+         Sequentially the VALUE cannot discriminate (a re-pin lands on the same version); the line count
+         is the property, the suite's own long-standing pattern.
+     - **⚠ THE CROSS-CATALOG HAZARD: FIXED STRUCTURALLY, AND ITS RECORDED SHAPE WAS WRONG — corrected
+       2026-08-14 while building 4b.** The entry below claimed the exposure was "an external-table INSERT
+       inside an explicit transaction". **That shape is UNREACHABLE through SQL**: slice 4a's
+       `IsExplicitTxn` guards REFUSE every external-table storage write inside an explicit transaction
+       (`ExternalTableInsert`, `GuardExternalDml`, CETAS-with-location — three throw sites, read in the
+       code, not reasoned). What the static registry actually exposed was narrower: (a) the AUTOCOMMIT
+       shape — the transient catalog's `Release` dropped the STATEMENT's pins mid-statement, but by then
+       the source scans have finished and nothing re-reads, so no wrong answer was constructible; and
+       (b) cross-catalog OPEN-TABLE sharing by path (a transient catalog reusing an attached catalog's
+       open — harmless, since neither disposes). ⇒ the fix is real (per-catalog state makes the whole
+       class unrepresentable — a transient `CommitTransaction()` now touches only its OWN manager) but
+       there is NO old-vs-new behavioural kill to gate; the gate that carries 4b is the pin-unification
+       one above. **Lesson, same as slice 3's open_catalog deviation: a hazard write-up must name the
+       GUARDS between the mechanism and the user before claiming a user-visible exposure.**
      - **4c — `ITableDefinition`/`ITable.Bind(txn, at?)` in C#** — the §2.2/§2.3 object model, entry
        materialization reads `Schema`/`Info` off the definition, `PendingAppends` dissolves into the
        Delta bound table, SqlServer's bound table stays thin (borrows the transaction's connection).

@@ -261,17 +261,40 @@ public sealed class DeltaCatalog : IBackendCatalog
     private enum PushdownMode { None, Static, Exact }
     private readonly PushdownMode _pushdownMode;
 
-    // Explicit-transaction APPEND buffering (see DeltaTxnBuffer): plain appends park here per DuckDB
-    // transaction and flush as ONE Delta commit per table at CommitTransaction; RollbackTransaction
-    // discards. In autocommit the flush fires at statement end = today's per-statement commit.
-    private readonly DeltaTxnBuffer _txnBuffer = new();
+    // THIS CATALOG's transactions (slice 4b): one DeltaTransaction per DuckDB transaction that touched this
+    // catalog, holding the append/DML buffers (see DeltaTxnBuffer.PendingAppends), the explicit-BEGIN mark,
+    // and the read scope (snapshot pins + open-table reuse — was the process-global static DeltaTxnScope
+    // registry). Buffers flush as ONE Delta commit per table at CommitTransaction; RollbackTransaction
+    // discards. In autocommit the flush fires at statement end = today's per-statement commit. PER CATALOG
+    // on purpose: a transient catalog (ExternalTableRouting) committing under the user's ambient id can no
+    // longer release an ATTACHED catalog's pins for the same DuckDB transaction.
+    private readonly TransactionManager<DeltaTransaction> _txns = new(id => new DeltaTransaction(id));
+
+    /// <summary>The transaction object for <paramref name="txnId"/> IF it exists — read-only consultation
+    /// (never creates; txn 0 = "no transaction" is never tracked).</summary>
+    private DeltaTransaction? TryTxn(long txnId) => txnId != 0 ? _txns.TryGet(txnId) : null;
+
+    /// <summary>Is <paramref name="txnId"/> an explicit user BEGIN..COMMIT transaction? False for
+    /// autocommit (including txn 0). Reads the flag off the live transaction object.</summary>
+    private bool IsExplicitTxn(long txnId) => txnId != 0 && _txns.TryGet(txnId) is { IsExplicit: true };
+
+    /// <summary>The ambient transaction's READ scope for the DeltaReader/DeltaNativeReader entry points —
+    /// pins + open-table reuse. CREATES the transaction object (like the old static registry's For(): the
+    /// first read-path crossing is a legitimate creator, or an autocommit statement's schema open would
+    /// never cache and the 195-of-291-seconds redundant-replay shape would return). Null when no
+    /// transaction is ambient — the callee then opens untracked and the caller owns the disposal.</summary>
+    private DeltaTxnScope? ReadScope()
+    {
+        long t = AmbientTransaction.Current;
+        return t != 0 ? _txns.GetOrCreate(t).Scope : null;
+    }
 
     // Append-only transactions (slice 1): any non-append operation on a table that already has buffered
     // inserts in the CURRENT transaction is rejected — its snapshot-coupled actions (rowid DML, replace,
     // DDL, maintenance) would not see / would misorder against the pending rows.
     private void ThrowIfPendingAppends(string tablePath, string operation)
     {
-        if (_txnBuffer.HasPending(AmbientTransaction.Current, tablePath))
+        if (TryTxn(AmbientTransaction.Current)?.HasPending(tablePath) == true)
         {
             throw new System.NotSupportedException(
                 $"delta: {operation} on a table with uncommitted buffered changes in this transaction is "
@@ -1015,7 +1038,7 @@ public sealed class DeltaCatalog : IBackendCatalog
     // table open that also caches the row-tracking flag for VirtualColumnsStream.
     private Schema ColumnsSchema(string path)
     {
-        if (_txnBuffer.Get(AmbientTransaction.Current, path)?.PendingArrowSchema is { } pendingSchema)
+        if (TryTxn(AmbientTransaction.Current)?.Get(path)?.PendingArrowSchema is { } pendingSchema)
         {
             return pendingSchema;
         }
@@ -1023,7 +1046,7 @@ public sealed class DeltaCatalog : IBackendCatalog
         bool rowTracking;
         try
         {
-            schema = DeltaReader.GetSchemaAndRowTracking(Opener(), path, out rowTracking);
+            schema = DeltaReader.GetSchemaAndRowTracking(Opener(), path, out rowTracking, ReadScope());
         }
         catch (System.Exception ex)
         {
@@ -1052,7 +1075,7 @@ public sealed class DeltaCatalog : IBackendCatalog
         bool rowTracking = false;
         if (_nativeRead && !_rowTrackingByPath.TryGetValue(path, out rowTracking))
         {
-            DeltaReader.GetSchemaAndRowTracking(Opener(), path, out rowTracking);
+            DeltaReader.GetSchemaAndRowTracking(Opener(), path, out rowTracking, ReadScope());
             _rowTrackingByPath[path] = rowTracking;
         }
         return _nativeRead && rowTracking
@@ -1130,18 +1153,18 @@ public sealed class DeltaCatalog : IBackendCatalog
     {
         var path = ResolveTableRefPath(tableRef, "delta.set_transaction_version");
         long txnId = AmbientTransaction.Current;
-        if (txnId == 0 || !_txnBuffer.IsExplicit(txnId))
+        if (!IsExplicitTxn(txnId))
         {
             throw new System.InvalidOperationException(
                 "delta.set_transaction_version: requires an explicit transaction (BEGIN … COMMIT) — the "
                 + "version is compared-and-swapped atomically with the transaction's commit.");
         }
-        var pending = _txnBuffer.GetOrCreate(txnId, path);
+        var txn = _txns.GetOrCreate(txnId);
+        var pending = txn.GetOrCreate(path);
         // Pin the transaction's base version (like any read) so the flush has a rebase base even for an
         // otherwise append-only transaction.
-        pending.PinnedVersion ??= DeltaTxnScope.TryGetPinned(txnId, path)
-            ?? DeltaTxnScope.PinVersion(txnId, path,
-                inst => DeltaReader.ResolveVersionAsOf(Opener(), path, inst, _log), System.DateTime.UtcNow);
+        pending.PinnedVersion ??= txn.Scope.PinVersion(path,
+            inst => DeltaReader.ResolveVersionAsOf(Opener(), path, inst, _log), System.DateTime.UtcNow);
         pending.AppTxnVersions[appId] = (version, expected);
         _log.LogInformation(
             "delta txn {Txn} set app-transaction {Path}: app='{App}' version={Version} expected={Expected}",
@@ -1640,9 +1663,10 @@ public sealed class DeltaCatalog : IBackendCatalog
         // it as the retired as-of resolver reappearing. The test is now EXPLICIT — a probe says so — and a
         // null spec still counts as one for callers that send none.
         long scanTxn = AmbientTransaction.Current;
-        if (spec is not null && scanTxn != 0 && spec.At is null && _txnBuffer.IsExplicit(scanTxn))
+        if (spec is not null && scanTxn != 0 && spec.At is null && IsExplicitTxn(scanTxn))
         {
-            var readPending = _txnBuffer.GetOrCreate(scanTxn, path);
+            var scanTxnObj = _txns.GetOrCreate(scanTxn);
+            var readPending = scanTxnObj.GetOrCreate(path);
             if (filter is null)
             {
                 readPending.ReadWholeTable = true;
@@ -1658,9 +1682,8 @@ public sealed class DeltaCatalog : IBackendCatalog
             // COMMIT conflict check. Since hoist slice 5 a table created in
             // this transaction is on storage like any other, so there is no create case to exclude.
             {
-                readPending.PinnedVersion ??= DeltaTxnScope.TryGetPinned(scanTxn, path)
-                    ?? DeltaTxnScope.PinVersion(scanTxn, path,
-                        inst => DeltaReader.ResolveVersionAsOf(opener, path, inst, _log), System.DateTime.UtcNow);
+                readPending.PinnedVersion ??= scanTxnObj.Scope.PinVersion(path,
+                    inst => DeltaReader.ResolveVersionAsOf(opener, path, inst, _log), System.DateTime.UtcNow);
             }
         }
 
@@ -1681,7 +1704,7 @@ public sealed class DeltaCatalog : IBackendCatalog
         // which only does timestamp via FOR SYSTEM_TIME AS OF).
         if (spec?.At is { } at)
         {
-            var atSchema = DeltaReader.GetSchemaAt(opener, path, at.Unit, at.Value);
+            var atSchema = DeltaReader.GetSchemaAt(opener, path, at.Unit, at.Value, ReadScope());
             var (atProjCols, atProjected) = ProjectFor(atSchema, spec);
             // DuckDB may still request the virtual rowid for a time-travel scan (its count(*)-via-rowid
             // optimization). Produce it (version-aware transient rowid) so the stream matches what DuckDB asked
@@ -1704,7 +1727,7 @@ public sealed class DeltaCatalog : IBackendCatalog
         }
 
         // Read-your-writes: overlay this transaction's buffered changes onto the scan.
-        var pendingScan = _txnBuffer.Get(AmbientTransaction.Current, path);
+        var pendingScan = TryTxn(AmbientTransaction.Current)?.Get(path);
         if (pendingScan is { Files.Count: > 0 })
         {
             // native_write catalog read mid-transaction: the buffered appends are STREAMED FILES (not
@@ -1729,7 +1752,7 @@ public sealed class DeltaCatalog : IBackendCatalog
             // latest independently and possibly straddling a concurrent commit. Reading the pin BEFORE the
             // schema fetch matters: it makes the schema and the data come from the same version, which
             // seeding alone would not guarantee if a concurrent ALTER landed in between.
-            pinnedRead = DeltaTxnScope.TryGetPinned(scanTxn, path);
+            pinnedRead = TryTxn(scanTxn)?.Scope.TryGetPinned(path);
         }
         string? pinnedReadValue = pinnedRead?.ToString(System.Globalization.CultureInfo.InvariantCulture);
         return ScanCodec(opener, path, spec, filter, pendingScan, pinnedReadValue);
@@ -1775,12 +1798,12 @@ public sealed class DeltaCatalog : IBackendCatalog
             // The explicit-transaction pin is instant-resolved (so a multi-table query gets ONE cut) and is
             // already set by the time we are called — PinVersion's GetOrAdd therefore never overwrites it,
             // and a concurrent seeder wins the race harmlessly (we then read at ITS version).
-            userSchema = DeltaReader.GetSchemaAndVersion(opener, path, out long latest);
+            userSchema = DeltaReader.GetSchemaAndVersion(opener, path, out long latest, ReadScope());
             long pinTxn = AmbientTransaction.Current;
             if (pinTxn != 0)
             {
-                pinnedReadValue = DeltaTxnScope
-                    .PinVersion(pinTxn, path, _ => latest, System.DateTime.UtcNow)
+                pinnedReadValue = _txns.GetOrCreate(pinTxn).Scope
+                    .PinVersion(path, _ => latest, System.DateTime.UtcNow)
                     .ToString(System.Globalization.CultureInfo.InvariantCulture);
                 // Logged because this branch runs at most ONCE per (txn, table) — ScanTable consults the pin
                 // before calling us — so the line count IS the sharing assertion: one line however many times
@@ -1790,7 +1813,7 @@ public sealed class DeltaCatalog : IBackendCatalog
         }
         else
         {
-            userSchema = DeltaReader.GetSchemaAt(opener, path, "version", pinnedReadValue);
+            userSchema = DeltaReader.GetSchemaAt(opener, path, "version", pinnedReadValue, ReadScope());
         }
         var (projCols, projected) = ProjectFor(userSchema, spec);
         bool reconcile = pending?.PendingMetadata is not null;
@@ -1852,8 +1875,8 @@ public sealed class DeltaCatalog : IBackendCatalog
             return null;
         }
         var committed = pinnedReadValue is null
-            ? DeltaReader.GetSchema(opener, path)
-            : DeltaReader.GetSchemaAt(opener, path, "version", pinnedReadValue);
+            ? DeltaReader.GetSchema(opener, path, ReadScope())
+            : DeltaReader.GetSchemaAt(opener, path, "version", pinnedReadValue, ReadScope());
         var keep = new List<string>();
         foreach (var pc in projCols)
         {
@@ -1957,11 +1980,11 @@ public sealed class DeltaCatalog : IBackendCatalog
     /// </remarks>
     private IArrowArrayStream SchemaProbe(nint opener, string path, ScanSpec? spec)
     {
-        var pending = spec?.At is null ? _txnBuffer.Get(AmbientTransaction.Current, path) : null;
+        var pending = spec?.At is null ? TryTxn(AmbientTransaction.Current)?.Get(path) : null;
         Schema userSchema;
         if (spec?.At is { } at)
         {
-            userSchema = DeltaReader.GetSchemaAt(opener, path, at.Unit, at.Value); // committed history
+            userSchema = DeltaReader.GetSchemaAt(opener, path, at.Unit, at.Value, ReadScope()); // committed history
         }
         else if (pending?.PendingArrowSchema is { } pendingArrow)
         {
@@ -1970,11 +1993,11 @@ public sealed class DeltaCatalog : IBackendCatalog
         else
         {
             long txn = AmbientTransaction.Current;
-            long? pinned = pending?.PinnedVersion ?? (txn != 0 ? DeltaTxnScope.TryGetPinned(txn, path) : null);
+            long? pinned = pending?.PinnedVersion ?? TryTxn(txn)?.Scope.TryGetPinned(path);
             if (pinned is { } v)
             {
                 userSchema = DeltaReader.GetSchemaAt(opener, path, "version",
-                    v.ToString(System.Globalization.CultureInfo.InvariantCulture));
+                    v.ToString(System.Globalization.CultureInfo.InvariantCulture), ReadScope());
             }
             else
             {
@@ -1982,10 +2005,10 @@ public sealed class DeltaCatalog : IBackendCatalog
                 // anyway, so recording the version it saw costs nothing and every later reference in the
                 // statement/transaction reads AT it. PinVersion's GetOrAdd never overwrites, so a concurrent
                 // seeder wins harmlessly.
-                userSchema = DeltaReader.GetSchemaAndVersion(opener, path, out long latest);
+                userSchema = DeltaReader.GetSchemaAndVersion(opener, path, out long latest, ReadScope());
                 if (txn != 0)
                 {
-                    long seeded = DeltaTxnScope.PinVersion(txn, path, _ => latest, System.DateTime.UtcNow);
+                    long seeded = _txns.GetOrCreate(txn).Scope.PinVersion(path, _ => latest, System.DateTime.UtcNow);
                     _log.LogDebug("delta probe pin {Path} -> v{Version}", path, seeded);
                 }
             }
@@ -2051,7 +2074,7 @@ public sealed class DeltaCatalog : IBackendCatalog
     {
         string? unit = null, value = null;
         bool seedPinFromSchemaOpen = false;
-        var pendingNative = spec?.At is null ? _txnBuffer.Get(AmbientTransaction.Current, path) : null;
+        var pendingNative = spec?.At is null ? TryTxn(AmbientTransaction.Current)?.Get(path) : null;
         if (spec?.At is { } at)
         {
             unit = at.Unit;
@@ -2073,7 +2096,7 @@ public sealed class DeltaCatalog : IBackendCatalog
                 // the instant-resolved explicit-transaction pin) is consulted FIRST — reading it before the
                 // schema fetch below is what makes schema and data come from ONE version, which seeding
                 // alone would not guarantee if a concurrent ALTER landed in between.
-                if (DeltaTxnScope.TryGetPinned(txn, path) is { } already)
+                if (TryTxn(txn)?.Scope.TryGetPinned(path) is { } already)
                 {
                     unit = "version";
                     value = already.ToString(System.Globalization.CultureInfo.InvariantCulture);
@@ -2094,7 +2117,7 @@ public sealed class DeltaCatalog : IBackendCatalog
         Schema userSchema;
         if (spec?.At is not null)
         {
-            userSchema = DeltaReader.GetSchemaAt(opener, path, unit!, value!); // committed history
+            userSchema = DeltaReader.GetSchemaAt(opener, path, unit!, value!, ReadScope()); // committed history
         }
         else if (pendingNative?.PendingArrowSchema is { } pendingArrow)
         {
@@ -2107,9 +2130,9 @@ public sealed class DeltaCatalog : IBackendCatalog
             // instead of opening at latest independently and possibly straddling a concurrent commit.
             // PinVersion's GetOrAdd never overwrites, so a concurrent seeder wins harmlessly (we then read
             // at ITS version, which is equally consistent).
-            userSchema = DeltaReader.GetSchemaAndVersion(opener, path, out long latest);
+            userSchema = DeltaReader.GetSchemaAndVersion(opener, path, out long latest, ReadScope());
             long pinTxn = AmbientTransaction.Current;
-            long pinned = DeltaTxnScope.PinVersion(pinTxn, path, _ => latest, System.DateTime.UtcNow);
+            long pinned = _txns.GetOrCreate(pinTxn).Scope.PinVersion(path, _ => latest, System.DateTime.UtcNow);
             unit = "version";
             value = pinned.ToString(System.Globalization.CultureInfo.InvariantCulture);
             _log.LogDebug("delta native pin {Path} -> v{Version}", path, value);
@@ -2117,8 +2140,8 @@ public sealed class DeltaCatalog : IBackendCatalog
         else
         {
             userSchema = unit is null
-                ? DeltaReader.GetSchema(opener, path)
-                : DeltaReader.GetSchemaAt(opener, path, unit, value!);
+                ? DeltaReader.GetSchema(opener, path, ReadScope())
+                : DeltaReader.GetSchemaAt(opener, path, unit, value!, ReadScope());
         }
         // Read-your-writes: overlay this transaction's buffered appends. Streamed pending FILES join the
         // per-file loop (presence probe + WHERE apply per file); collect-path pending BATCHES concatenate
@@ -2127,7 +2150,8 @@ public sealed class DeltaCatalog : IBackendCatalog
         var native = DeltaNativeReader.Read(opener, path, userSchema, spec, filterVals, unit, value,
                                             pendingFiles: pendingNative?.Files,
                                             pendingDeletes: pendingNative?.DeletedByOrdinal,
-                                            pendingSchema: pendingNative?.PendingDeltaSchema);
+                                            pendingSchema: pendingNative?.PendingDeltaSchema,
+                                            scope: ReadScope());
         ProbeSchemaSelfCheck(path, native.Schema, userSchema, spec);
         if (pendingNative is not { Batches.Count: > 0 })
         {
@@ -2346,9 +2370,9 @@ public sealed class DeltaCatalog : IBackendCatalog
         // (verify_delta_catalog_transactions:1687): create + an IMMEDIATE overwrite commit + the later
         // INSERT's flush. So the immediate create is performed here too — schema only — and the data then
         // buffers like any append.
-        bool createdHere = _txnBuffer.Get(txnId, tablePath) is { CreatedInTxn: true };
+        bool createdHere = TryTxn(txnId)?.Get(tablePath) is { CreatedInTxn: true };
         if (!createdHere && createTable && !replace && !partitionOverwrite
-            && _txnBuffer.IsExplicit(txnId) && !TableExists(tablePath))
+            && IsExplicitTxn(txnId) && !TableExists(tablePath))
         {
             DeltaWriter.Create(opener, tablePath, data.Schema, default,
                                deletionVectors: flags.DeletionVectors,
@@ -2357,7 +2381,7 @@ public sealed class DeltaCatalog : IBackendCatalog
                                rowTracking: flags.RowTracking,
                                spec: spec, columnMapping: flags.ColumnMapping,
                                serializable: _serializable, sortedBy: sortColumns);
-            _txnBuffer.GetOrCreate(txnId, tablePath).CreatedInTxn = true;
+            _txns.GetOrCreate(txnId).GetOrCreate(tablePath).CreatedInTxn = true;
             createdHere = true;
             _log.LogInformation(
                 "delta txn {Txn} created {Schema}.{Table} for CTAS (rollback will drop it)",
@@ -2453,7 +2477,7 @@ public sealed class DeltaCatalog : IBackendCatalog
             }
             if (!same)
             {
-                if (_txnBuffer.IsExplicit(txnId))
+                if (IsExplicitTxn(txnId))
                 {
                     throw new System.NotSupportedException(
                         "delta: changing SORTED_COLUMNS inside an explicit transaction is not supported "
@@ -2490,20 +2514,20 @@ public sealed class DeltaCatalog : IBackendCatalog
         }
         else
         {
-            var pending = _txnBuffer.GetOrCreate(txnId, tablePath);
+            var pending = _txns.GetOrCreate(txnId).GetOrCreate(tablePath);
             pending.HasAppend = true;
             // slice C2: on a CDF table EVERY buffered statement writes its cdc counterpart (a commit
             // carrying any cdc action is read cdc-ONLY — inference is disabled — so appends fused with
             // DML would otherwise vanish from the feed). Probed once per (txn, table); partitioned CDF
             // stays on inference (its appends commit cdc-less and its DML is rejected, so commits are
             // never mixed). Insert-cdc needs the batches in hand -> CDF appends skip the streamed path.
-            if (_txnBuffer.IsExplicit(txnId) && pending.CdfEnabled is null)
+            if (IsExplicitTxn(txnId) && pending.CdfEnabled is null)
             {
                 var prof = DeltaReader.GetTxnDmlProfile(opener, tablePath);
                 pending.CdfEnabled = prof.CdfEnabled && prof.SupportsExternalCommit;
                 if (pending.CdfEnabled == true)
                 {
-                    pending.PinnedVersion ??= DeltaTxnScope.TryGetPinned(txnId, tablePath) ?? prof.Version;
+                    pending.PinnedVersion ??= prof.Version;
                 }
             }
             bool cdfAppend = pending.CdfEnabled == true;
@@ -2547,7 +2571,7 @@ public sealed class DeltaCatalog : IBackendCatalog
                 // A pending ALTER also forces collection, for a different reason: the data must not commit
                 // before the schema it was written against.
             }
-            if (!tryStream || pending.PendingMetadata is not null || _txnBuffer.IsExplicit(txnId))
+            if (!tryStream || pending.PendingMetadata is not null || IsExplicitTxn(txnId))
             {
                 var (bschema, bbatches, brows) = DeltaWriter.Materialize(data, default);
                 // ⚠ HOIST SLICE 5 deleted the pending-created IDENTITY pre-generation that stood here. It
@@ -2565,7 +2589,7 @@ public sealed class DeltaCatalog : IBackendCatalog
                 // slice C1: in an EXPLICIT transaction the statement's batches become a data file NOW
                 // (memory caps at one statement); autocommit keeps the batch park (flushes at statement
                 // end anyway — byte-identical to per-statement commits).
-                if (_txnBuffer.IsExplicit(txnId)
+                if (IsExplicitTxn(txnId)
                     && TryEagerWriteBatches(opener, tablePath, pending, bbatches, tableName))
                 {
                     foreach (var b in bbatches)
@@ -2861,7 +2885,7 @@ public sealed class DeltaCatalog : IBackendCatalog
         // Setting it first would let a FAILED create leave a transaction believing it owns a table it never
         // made, and ROLLBACK would then drop whatever happens to be at that path — someone else's table.
         long createTxn = AmbientTransaction.Current;
-        bool markCreated = _txnBuffer.IsExplicit(createTxn)
+        bool markCreated = IsExplicitTxn(createTxn)
                            && !TableExists(TablePath(schemaName, tableName));
         ThrowIfPendingAppends(TablePath(schemaName, tableName), "CREATE (OR REPLACE) TABLE");
         // sortColumns (native SORTED BY): persisted as fabricator.sortedBy — every append then re-applies
@@ -2895,7 +2919,7 @@ public sealed class DeltaCatalog : IBackendCatalog
         if (markCreated)
         {
             // The create landed, so the transaction now owns this table and ROLLBACK may drop it.
-            _txnBuffer.GetOrCreate(createTxn, TablePath(schemaName, tableName)).CreatedInTxn = true;
+            _txns.GetOrCreate(createTxn).GetOrCreate(TablePath(schemaName, tableName)).CreatedInTxn = true;
             _log.LogInformation("delta txn {Txn} created {Schema}.{Table} (rollback will drop it)",
                 createTxn, schemaName, tableName);
         }
@@ -2912,14 +2936,16 @@ public sealed class DeltaCatalog : IBackendCatalog
             HostFs.CreateDir(Opener(), _root + "/" + s); // recursive mkdir; idempotent
         }
     }
-    // Buffers are created lazily on the first buffered append; the explicit flag (v60) is recorded so
-    // DELETE/UPDATE know whether to BUFFER (explicit BEGIN..COMMIT — atomic, snapshot-isolated) or run the
-    // direct per-statement paths (autocommit — unchanged behavior, incl. CDF capture + copy-on-write).
+    // Buffers are created lazily on the first buffered append; the explicit flag (v60) is recorded on the
+    // transaction object so DELETE/UPDATE know whether to BUFFER (explicit BEGIN..COMMIT — atomic,
+    // snapshot-isolated) or run the direct per-statement paths (autocommit — unchanged behavior, incl. CDF
+    // capture + copy-on-write).
     public void BeginTransaction(bool isExplicit)
     {
-        if (isExplicit)
+        long txnId = AmbientTransaction.Current;
+        if (isExplicit && txnId != 0)
         {
-            _txnBuffer.MarkExplicit(AmbientTransaction.Current);
+            _txns.GetOrCreate(txnId).IsExplicit = true;
         }
     }
 
@@ -2929,26 +2955,21 @@ public sealed class DeltaCatalog : IBackendCatalog
     public void CommitTransaction()
     {
         long txnId = AmbientTransaction.Current;
-        // Release the transaction's snapshot pins FIRST, and unconditionally — a READ-ONLY transaction has
-        // no buffered tables and returns just below, yet it pinned a version for every table it scanned.
-        // Nothing called Release before this, so the ONLY reclamation was InstantFor's panic
-        // `Txns.Clear()` at 4096 entries; since one autocommit statement is one transaction id, that
-        // threshold is reached routinely and the clear wipes the pins of transactions still IN FLIGHT.
-        // An explicit transaction whose pin vanished then re-captures a NEW instant on its next scan and
-        // starts seeing a concurrent writer's commits mid-transaction — snapshot isolation silently broken.
-        // Releasing per transaction makes the panic path unreachable in normal operation.
-        DeltaTxnScope.Release(txnId);
-        // ⚠ CAPTURED BEFORE Remove, which CLEARS the explicit marker along with the buffer. Read after it,
-        // this is always false and the blind-append declaration below silently degrades to "say nothing" —
-        // green, and quietly never emitting the flag it exists to emit. Same ordering fact as §4b.3.
-        bool wasExplicit = _txnBuffer.IsExplicit(txnId);
-        var tables = _txnBuffer.Remove(txnId);
-        if (tables is null)
+        // ONE removal drops everything the transaction owned — buffers, snapshot pins AND the open-table
+        // reuse — where the predecessor had to remember TWO releases in the right order (the scope
+        // unconditionally FIRST, because a read-only transaction had pins but no buffer; the explicit flag
+        // captured BEFORE Remove, because Remove cleared it — the read-state-after-remove bug class, found
+        // twice). The flag now lives ON the removed object, so reading it after removal is safe by
+        // construction; that is what ITransaction is for. Removal-before-completion also means nothing can
+        // resolve this transaction while the flush below runs (the manager's ordering contract).
+        var txn = _txns.Remove(txnId);
+        if (txn is null)
         {
             return;
         }
+        bool wasExplicit = txn.IsExplicit;
         var opener = Opener();
-        foreach (var kv in tables)
+        foreach (var kv in txn.Tables)
         {
             var pending = kv.Value;
             try
@@ -3025,7 +3046,7 @@ public sealed class DeltaCatalog : IBackendCatalog
                 // Held table/transaction first: disposing the transaction is the ABORT that reclaims what
                 // EW staged during a flush that did not commit, and this finally is the only path that runs
                 // when the flush THREW — which is exactly what the flush's `await using` used to cover.
-                DisposeHeld(pending);
+                DeltaTxnBuffer.DisposeHeld(pending);
                 DeltaTxnBuffer.DisposeBatches(pending);
             }
         }
@@ -3042,20 +3063,21 @@ public sealed class DeltaCatalog : IBackendCatalog
     public void RollbackTransaction()
     {
         long txnId = AmbientTransaction.Current;
-        DeltaTxnScope.Release(txnId); // see CommitTransaction — unconditional, before the early return
-        var tables = _txnBuffer.Remove(txnId);
-        if (tables is null)
+        // One removal, like CommitTransaction's: pins, open tables and buffers leave together with the
+        // transaction object.
+        var txn = _txns.Remove(txnId);
+        if (txn is null)
         {
             return;
         }
-        foreach (var kv in tables)
+        foreach (var kv in txn.Tables)
         {
             // Abort + release the held EW transaction/table before reclaiming our own eagerly-written files:
             // the abort takes back what EW's OWN writers staged (a deletion vector, a CDF file), which is a
             // disjoint set from the host-written data files DiscardBufferedFiles names. In slice 1a nothing
             // is held on this path — the flush is the only creator and it never ran — so this is inert here
             // and becomes load-bearing at 1b.
-            DisposeHeld(kv.Value);
+            DeltaTxnBuffer.DisposeHeld(kv.Value);
             int reclaimed = DiscardBufferedFiles(kv.Key, kv.Value);
             _log.LogInformation(
                 "delta txn {Txn} rollback {Path}: discarded {Rows} buffered row(s), reclaimed {Reclaimed} of "
@@ -3138,7 +3160,7 @@ public sealed class DeltaCatalog : IBackendCatalog
     /// contributing any to <c>pending.Files</c> at all. And the case that looks most like it — a commit
     /// that becomes DURABLE and then throws, the window upstream's <c>LogCommitRequest.OnCommitDurable</c>
     /// exists to close — CANNOT arrive here either: <c>CommitTransaction</c> calls
-    /// <c>_txnBuffer.Remove(txnId)</c> BEFORE it flushes, so a throw out of the flush leaves
+    /// <c>_txns.Remove(txnId)</c> BEFORE it flushes, so a throw out of the flush leaves
     /// <c>RollbackTransaction</c> nothing to discard. That ordering, not this guard, is what protects us
     /// there. Kept anyway because the guard above is already defensive for the same reason, and a defensive
     /// branch that describes the wrong outcome is worse than none. See
@@ -3272,14 +3294,14 @@ public sealed class DeltaCatalog : IBackendCatalog
     private DeltaTxnBuffer.PendingAppends BeginSchemaChange(long txnId, string path,
                                                             in DeltaReader.TxnDmlProfile profile)
     {
-        var pending = _txnBuffer.GetOrCreate(txnId, path);
+        var pending = _txns.GetOrCreate(txnId).GetOrCreate(path);
         if (pending.Rows > 0 || pending.DeletedByOrdinal.Count > 0)
         {
             throw new System.NotSupportedException(
                 "delta: ALTER TABLE after buffered data changes in this transaction is not supported — "
                 + "COMMIT first (or run the schema changes BEFORE the data statements).");
         }
-        pending.PinnedVersion ??= DeltaTxnScope.TryGetPinned(txnId, path) ?? profile.Version;
+        pending.PinnedVersion ??= profile.Version;
         return pending;
     }
 
@@ -3304,7 +3326,7 @@ public sealed class DeltaCatalog : IBackendCatalog
         var profile = DeltaReader.GetTxnDmlProfile(opener, path);
         var pending = BeginSchemaChange(txnId, path, profile);
         // IF NOT EXISTS against the effective (pending ?? committed) schema.
-        var baseArrow = pending.PendingArrowSchema ?? DeltaReader.GetSchema(opener, path);
+        var baseArrow = pending.PendingArrowSchema ?? DeltaReader.GetSchema(opener, path, ReadScope());
         foreach (var existing in baseArrow.FieldsList)
         {
             if (string.Equals(existing.Name, column.Name, System.StringComparison.Ordinal))
@@ -3344,7 +3366,7 @@ public sealed class DeltaCatalog : IBackendCatalog
         }
         // Rename-map composition (pending name -> committed name), only when the origin is a real
         // committed column (a renamed pending-ADDed column reads as NULL backfill either way).
-        var committed = DeltaReader.GetSchema(opener, path);
+        var committed = DeltaReader.GetSchema(opener, path, ReadScope());
         string origin = pending.RenameMap.TryGetValue(oldName, out var o) ? o : oldName;
         pending.RenameMap.Remove(oldName);
         foreach (var fl in committed.FieldsList)
@@ -3574,14 +3596,14 @@ public sealed class DeltaCatalog : IBackendCatalog
         var delOpener = Opener();
         var profile = DeltaReader.GetTxnDmlProfile(delOpener, path);
         EnsureBufferedDmlEligible(profile, forUpdate ? "UPDATE" : "DELETE", forUpdate);
-        var pending = _txnBuffer.GetOrCreate(txnId, path);
+        var pending = _txns.GetOrCreate(txnId).GetOrCreate(path);
         if (profile.CdfEnabled && pending.PendingMetadata is not null)
         {
             throw new System.NotSupportedException(
                 "delta: DML on a Change-Data-Feed table cannot follow a buffered ALTER in the same "
                 + "transaction — COMMIT the ALTER first.");
         }
-        pending.PinnedVersion ??= DeltaTxnScope.TryGetPinned(txnId, path) ?? profile.Version;
+        pending.PinnedVersion ??= profile.Version;
         if (profile.CdfEnabled && !forUpdate && ids.Count > 0)
         {
             // slice C2: the deleted rows' CONTENT goes into an eager _change_data file (the position set
@@ -3669,8 +3691,8 @@ public sealed class DeltaCatalog : IBackendCatalog
                     + "the inserts first.");
             }
         }
-        var pending = _txnBuffer.GetOrCreate(txnId, path);
-        pending.PinnedVersion ??= DeltaTxnScope.TryGetPinned(txnId, path) ?? profile.Version;
+        var pending = _txns.GetOrCreate(txnId).GetOrCreate(path);
+        pending.PinnedVersion ??= profile.Version;
 
         var fields = userSchema.FieldsList;
         // Pending ALTER: the read-back batches carry only the COMMITTED columns — reconcile each to the
@@ -4402,30 +4424,7 @@ public sealed class DeltaCatalog : IBackendCatalog
     /// <para><b>Never throws.</b> This runs in a finally, on the path where the caller may already be
     /// carrying the user's real error; a cleanup failure must not replace it.</para>
     /// </summary>
-    private void DisposeHeld(DeltaTxnBuffer.PendingAppends pending)
-    {
-        var txn = pending.HeldTxn;
-        var table = pending.HeldTable;
-        pending.HeldTxn = null;
-        pending.HeldTable = null;
-        if (txn is not null)
-        {
-            try { txn.DisposeAsync().GetAwaiter().GetResult(); }
-            catch (System.Exception ex)
-            {
-                _log.LogWarning("delta held transaction dispose failed ({Reason}) — staged files may remain "
-                                + "as orphans for VACUUM", ex.Message);
-            }
-        }
-        if (table is not null)
-        {
-            try { table.DisposeAsync().GetAwaiter().GetResult(); }
-            catch (System.Exception ex)
-            {
-                _log.LogWarning("delta held table dispose failed ({Reason})", ex.Message);
-            }
-        }
-    }
+    // (DisposeHeld moved to DeltaTxnBuffer in slice 4b — DeltaTransaction.Complete needs it too.)
 
     // ---- still unsupported in this slice ----
     private static NotSupportedException Unsupported(string what) =>
@@ -4451,11 +4450,11 @@ public sealed class DeltaCatalog : IBackendCatalog
         // version removed the entry UNCONDITIONALLY and BEFORE the guard, which made
         // `BEGIN; DELETE …; DROP TABLE …;` SUCCEED — the guard found nothing left to complain about. Caught by
         // verify_delta_catalog_transactions:339, which exists for exactly that shape.
-        if (_txnBuffer.Get(dropTxn, TablePath(schemaName, tableName)) is { CreatedInTxn: true } created)
+        if (TryTxn(dropTxn)?.Get(TablePath(schemaName, tableName)) is { CreatedInTxn: true } created)
         {
-            DisposeHeld(created);
+            DeltaTxnBuffer.DisposeHeld(created);
             DeltaTxnBuffer.DisposeBatches(created);
-            _txnBuffer.RemoveTable(dropTxn, TablePath(schemaName, tableName));
+            TryTxn(dropTxn)?.RemoveTable(TablePath(schemaName, tableName));
         }
         ThrowIfPendingAppends(TablePath(schemaName, tableName), "DROP TABLE");
         _log.LogInformation("delta drop table {Schema}.{Table} (adls={Adls})",
@@ -4581,7 +4580,7 @@ public sealed class DeltaCatalog : IBackendCatalog
         // version — and commit it fused with the transaction's other changes at COMMIT (atomic, rollback-able,
         // conflict-aborted if a concurrent writer moves the table). Autocommit keeps the direct per-statement
         // paths below (incl. copy-on-write and CDF capture).
-        if (_txnBuffer.IsExplicit(AmbientTransaction.Current))
+        if (IsExplicitTxn(AmbientTransaction.Current))
         {
             return BufferDeleteRows(AmbientTransaction.Current, path, schemaName, tableName, ids, forUpdate: false);
         }
@@ -4640,7 +4639,7 @@ public sealed class DeltaCatalog : IBackendCatalog
     /// older than the pin already makes it. This guards the paths that do NOT consult the pin — chiefly the
     /// bind-time column fetch, which reads latest.</para>
     /// </remarks>
-    private static void InvalidateReadCache() => DeltaTxnScope.InvalidateTables(AmbientTransaction.Current);
+    private void InvalidateReadCache() => TryTxn(AmbientTransaction.Current)?.Scope.InvalidateTables();
 
     public long ExecuteNonQuery(string sql)
     {
@@ -4864,8 +4863,8 @@ public sealed class DeltaCatalog : IBackendCatalog
 
         // 2. Map SET column names -> user-schema column indices (case-insensitive). A pending buffered
         // ALTER's schema wins (the post-image rows must carry the added columns; autocommit has no pending).
-        var userSchema = _txnBuffer.Get(AmbientTransaction.Current, path)?.PendingArrowSchema
-            ?? DeltaReader.GetSchema(opener, path);
+        var userSchema = TryTxn(AmbientTransaction.Current)?.Get(path)?.PendingArrowSchema
+            ?? DeltaReader.GetSchema(opener, path, ReadScope());
         var fields = userSchema.FieldsList;
         var setSlotByColumn = new int[fields.Count];
         var setSlotField = new Field[setColNames.Count]; // the canonical user field for each SET slot
@@ -4903,7 +4902,7 @@ public sealed class DeltaCatalog : IBackendCatalog
         // positions, the post-image rows (read back at the pinned base, SET values substituted) become
         // pending appends; both flush fused into ONE commit at COMMIT. Autocommit keeps the direct
         // copy-on-write / merge-on-read paths below.
-        if (_txnBuffer.IsExplicit(AmbientTransaction.Current))
+        if (IsExplicitTxn(AmbientTransaction.Current))
         {
             return BufferUpdateRows(AmbientTransaction.Current, path, schemaName, tableName,
                                     updates, setSlotByColumn, userSchema);
@@ -5106,7 +5105,7 @@ public sealed class DeltaCatalog : IBackendCatalog
         // and RENAME TABLE stay immediate (a nested rename would need a per-level name map in the read
         // overlay; a table rename is a physical folder move).
         long alterTxn = AmbientTransaction.Current;
-        if (_txnBuffer.IsExplicit(alterTxn)
+        if (IsExplicitTxn(alterTxn)
             && (k == AlterKind.AddColumn || k == AlterKind.RenameColumn || k == AlterKind.DropColumn
                 || k == AlterKind.AddField || k == AlterKind.DropField))
         {
@@ -5164,19 +5163,19 @@ public sealed class DeltaCatalog : IBackendCatalog
         // The pending-appends guard must therefore be SKIPPED for this case (buffered rows are expected);
         // it still applies to every other ALTER and to a table this transaction did not create.
         if (k == AlterKind.RenameTable
-            && _txnBuffer.Get(alterTxn, TablePath(s, t)) is { CreatedInTxn: true } renCreated)
+            && TryTxn(alterTxn)?.Get(TablePath(s, t)) is { CreatedInTxn: true } renCreated)
         {
             string renTo = a1 ?? throw new System.InvalidOperationException(
                 "delta RENAME TABLE requires a new table name.");
             string renNew = TablePath(s, renTo);
-            if (_txnBuffer.HasPending(alterTxn, renNew) || TableExists(renNew))
+            if (TryTxn(alterTxn)?.HasPending(renNew) == true || TableExists(renNew))
             {
                 throw new System.InvalidOperationException(
                     $"delta RENAME TABLE: '{renTo}' already exists.");
             }
-            DisposeHeld(renCreated);
+            DeltaTxnBuffer.DisposeHeld(renCreated);
             RenameTableFolder(TablePath(s, t), renNew);
-            if (!_txnBuffer.RenameTable(alterTxn, TablePath(s, t), renNew))
+            if (TryTxn(alterTxn)?.RenameTable(TablePath(s, t), renNew) != true)
             {
                 throw new System.InvalidOperationException(
                     $"delta RENAME TABLE: the transaction's buffer entry for '{t}' could not be re-keyed.");
@@ -5380,7 +5379,19 @@ public sealed class DeltaCatalog : IBackendCatalog
     private static NotSupportedException NoFunction(string schema, string func) =>
         new($"delta provider: no catalog function '{schema}.{func}'.");
 
-    public void Dispose() { }
+    // Catalog teardown (DETACH, or a transient ExternalTableRouting/COPY catalog's finally): sweep any
+    // transactions still in the manager — their held EW transactions abort and their buffered batches
+    // release. Ordinary lifecycles never leave one behind (the host commits/rolls back every transaction
+    // that touched the catalog); this covers a detach with a transaction in flight, which under the old
+    // STATIC registry simply leaked until the 4096-entry panic clear.
+    public void Dispose()
+    {
+        foreach (var txn in _txns.Drain())
+        {
+            try { txn.Complete(commit: false); }
+            catch { /* teardown backstop — never let cleanup throw */ }
+        }
+    }
 
     // ---- Arrow metadata-stream helpers (mirror DaxCatalog) ----
     private static IArrowArrayStream SingleColumn(string name, IReadOnlyList<string> values)

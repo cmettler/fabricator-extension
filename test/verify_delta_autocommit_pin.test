@@ -409,6 +409,55 @@ WHERE type = 'Fabricator.Delta' AND message LIKE 'delta snapshot pin:%as-of%';
 ----
 0
 
+# ---------------------------------------------------------------------------------------------------------
+# 12. THE PINS SURVIVE A MUTATING ENTRY POINT MID-TRANSACTION — the releases' asymmetry, gated for the first
+#     time. Every mutating catalog entry (CREATE OR REPLACE, DROP, OPTIMIZE, VACUUM, ...) drops the
+#     transaction's held OPEN TABLES (InvalidateReadCache) but must KEEP its snapshot PINS: the pin is the
+#     transaction's repeatable-read contract, and a transaction that mutated something must still re-read an
+#     unrelated table at the version it first read.
+#
+#     WHY THIS IS ASSERTABLE ONLY SINCE THE 4b PIN UNIFICATION: the pin used to be DOUBLE-STORED —
+#     PendingAppends.PinnedVersion on the transaction buffer shadowed the scope's pins on every path a
+#     sequential suite reaches, so a mutant that collapsed the two releases SURVIVED the whole tier
+#     (slice 1b's recorded surviving mutant). With ONE pin store, dropping the pins alongside the tables
+#     makes the re-read RE-SEED (a second 'delta % pin' line for the table); keeping them leaves the count at
+#     one. The VALUE cannot discriminate sequentially (no concurrent writer, so a re-pin lands on the same
+#     version) — the line count is the property, exactly as in sections 1-6.
+# ---------------------------------------------------------------------------------------------------------
+statement ok
+CREATE TABLE lake.main.pinkeep AS SELECT i AS id, i * 2 AS v FROM range(6) tbl(i);
+
+statement ok
+CREATE TABLE lake.main.pinvictim AS SELECT 1 AS x;
+
+statement ok
+BEGIN;
+
+query I
+SELECT sum(v) FROM lake.main.pinkeep;
+----
+30
+
+# A mutating entry point mid-transaction: DROP of an UNRELATED table (immediate by design; it calls
+# InvalidateReadCache, which drops the transaction's open tables — and, under the mutant, its pins).
+statement ok
+DROP TABLE lake.main.pinvictim;
+
+# The re-read must be served from the SURVIVING pin: no second resolution, no second pin line.
+query I
+SELECT sum(v) FROM lake.main.pinkeep;
+----
+30
+
+statement ok
+COMMIT;
+
+query I
+SELECT count(*) FROM duckdb_logs
+WHERE type = 'Fabricator.Delta' AND message LIKE 'delta % pin %/pinkeep -> v%';
+----
+1
+
 statement ok
 DETACH nlake;
 
