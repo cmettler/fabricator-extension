@@ -310,14 +310,23 @@ the same table the code evaluates.
      `SqlServerCatalog` — ⚠ note `SqlServerBackend.cs` holds TWO classes and the routing lives on the
      CATALOG one), rules transcribed with their measured whys, `ExecuteQuery` 115 lines → a `RouteScan`
      call, and the Debug line gained `route=<reason>` (verified live: `route=pooled`, `route=pin (MARS)`).
-   - **1b (Delta) scoping facts, read before writing it:** (a) `SnapshotPinning` and `DeltaTableCache` are
-     STATIC and process-global — per-txn state living outside any catalog instance, keyed only by
-     (txnId, path); folding them into owned objects also fixes that. (b) The blast radius is 21 call sites
-     (18 in `DeltaCatalog`, 3 in `DeltaReader`) — but `DeltaReader` is a STATIC class, so the bound object
-     must be PASSED into its entry points rather than resolved there, the same threading shape as the
-     write-spec saga. (c) ⚠ The natural name `DeltaTransaction` COLLIDES with engineered-wood's own
-     `DeltaTransaction`, which the same files import — pick another (`DeltaTxn`, `DeltaTxnScope`) or every
-     file needs an alias.
+   - **1b (incremental) is BUILT — 2026-08-14.** `DeltaTxnScope` merges `SnapshotPinning` +
+     `DeltaTableCache` into one per-transaction object behind static accessors (both statics DELETED); one
+     commit/rollback `Release` replaces the paired calls. Two subtleties the merge had to preserve, both
+     found by transcription discipline rather than tests: the pin INSTANT is captured lazily at the first
+     `PinVersion` (a scope created by a table publish must not move the point-in-time, nor put a clock read
+     on a path that had none), and **the two releases are DIFFERENT — `InvalidateTables` (the mutating entry
+     points) keeps the PINS**, because the pin is the repeatable-read contract. Gates: hermetic
+     **69/69 — 7152 identical** + service tier.
+   - **⚠ THE RELEASE ASYMMETRY IS DEFENSIVE, NOT GATED — the collapse-both mutant SURVIVES, and the reason
+     is a finding in its own right: THE PIN IS DOUBLE-STORED.** `PendingAppends.PinnedVersion` on the txn
+     buffer (untouched by `InvalidateTables`) carries the version for every explicit-txn read and every
+     buffered DML, so wherever a sequential suite could observe a re-pin, the buffer answers first; the
+     exposed shape needs a concurrent commit mid-transaction. ⇒ the full ITransaction slice must UNIFY the
+     pin into one owner — until then any "the pin survives X" claim has to be checked against BOTH stores.
+   - **1b scoping facts kept for the full slice:** `DeltaReader` is STATIC, so the bound object must be
+     PASSED into its entry points rather than resolved there (the write-spec-saga threading shape); and
+     ⚠ the natural name `DeltaTransaction` COLLIDES with engineered-wood's own class — hence `DeltaTxnScope`.
 2. **The `delta.*` namespace + delete kinds 8–14 and the eight C++ registrations** — breaking SQL surface;
    rewrite the consuming suites (`verify_delta_catalog_snapshots`, `verify_delta_txn_version`,
    `verify_delta_tblproperties`, `verify_delta_catalog_changes`) to the new spellings. Also banks the

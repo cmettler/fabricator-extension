@@ -1205,8 +1205,8 @@ public sealed class DeltaCatalog : IBackendCatalog
         var pending = _txnBuffer.GetOrCreate(txnId, path);
         // Pin the transaction's base version (like any read) so the flush has a rebase base even for an
         // otherwise append-only transaction.
-        pending.PinnedVersion ??= SnapshotPinning.TryGetPinned(txnId, path)
-            ?? SnapshotPinning.PinVersion(txnId, path,
+        pending.PinnedVersion ??= DeltaTxnScope.TryGetPinned(txnId, path)
+            ?? DeltaTxnScope.PinVersion(txnId, path,
                 inst => DeltaReader.ResolveVersionAsOf(Opener(), path, inst, _log), System.DateTime.UtcNow);
         pending.AppTxnVersions[appId] = (version, expected);
         _log.LogInformation(
@@ -1703,14 +1703,14 @@ public sealed class DeltaCatalog : IBackendCatalog
                 readPending.ReadPredicates.Add(filter);
             }
             // SNAPSHOT ISOLATION for reads (default): the transaction's FIRST scan captures one UTC
-            // instant (SnapshotPinning, per txn) and each table resolves it to a version on first touch —
+            // instant (the DeltaTxnScope pins, per txn) and each table resolves it to a version on first touch —
             // every scan in the transaction then reads that consistent cut (the codec branch below routes
             // through the AT-version streams; the native path already did). Also the rebase base for the
             // COMMIT conflict check. Since hoist slice 5 a table created in
             // this transaction is on storage like any other, so there is no create case to exclude.
             {
-                readPending.PinnedVersion ??= SnapshotPinning.TryGetPinned(scanTxn, path)
-                    ?? SnapshotPinning.PinVersion(scanTxn, path,
+                readPending.PinnedVersion ??= DeltaTxnScope.TryGetPinned(scanTxn, path)
+                    ?? DeltaTxnScope.PinVersion(scanTxn, path,
                         inst => DeltaReader.ResolveVersionAsOf(opener, path, inst, _log), System.DateTime.UtcNow);
             }
         }
@@ -1766,7 +1766,7 @@ public sealed class DeltaCatalog : IBackendCatalog
         }
         // SNAPSHOT ISOLATION (default): inside an explicit transaction, plain codec reads run AT the
         // transaction's pinned version — the instant captured at the transaction's FIRST scan, resolved to
-        // a version per table (SnapshotPinning; recorded above, but also consulted directly since a
+        // a version per table (the DeltaTxnScope pins; recorded above, but also consulted directly since a
         // read-only buffer entry is invisible through Get()). A concurrent writer's commits are therefore
         // NOT visible mid-transaction; autocommit statements keep reading latest (a single codec statement
         // is one snapshot anyway). The buffer pin (DML/ALTER) has priority — same source, same value.
@@ -1780,7 +1780,7 @@ public sealed class DeltaCatalog : IBackendCatalog
             // latest independently and possibly straddling a concurrent commit. Reading the pin BEFORE the
             // schema fetch matters: it makes the schema and the data come from the same version, which
             // seeding alone would not guarantee if a concurrent ALTER landed in between.
-            pinnedRead = SnapshotPinning.TryGetPinned(scanTxn, path);
+            pinnedRead = DeltaTxnScope.TryGetPinned(scanTxn, path);
         }
         string? pinnedReadValue = pinnedRead?.ToString(System.Globalization.CultureInfo.InvariantCulture);
         return ScanCodec(opener, path, spec, filter, pendingScan, pinnedReadValue);
@@ -1830,7 +1830,7 @@ public sealed class DeltaCatalog : IBackendCatalog
             long pinTxn = AmbientTransaction.Current;
             if (pinTxn != 0)
             {
-                pinnedReadValue = SnapshotPinning
+                pinnedReadValue = DeltaTxnScope
                     .PinVersion(pinTxn, path, _ => latest, System.DateTime.UtcNow)
                     .ToString(System.Globalization.CultureInfo.InvariantCulture);
                 // Logged because this branch runs at most ONCE per (txn, table) — ScanTable consults the pin
@@ -2021,7 +2021,7 @@ public sealed class DeltaCatalog : IBackendCatalog
         else
         {
             long txn = AmbientTransaction.Current;
-            long? pinned = pending?.PinnedVersion ?? (txn != 0 ? SnapshotPinning.TryGetPinned(txn, path) : null);
+            long? pinned = pending?.PinnedVersion ?? (txn != 0 ? DeltaTxnScope.TryGetPinned(txn, path) : null);
             if (pinned is { } v)
             {
                 userSchema = DeltaReader.GetSchemaAt(opener, path, "version",
@@ -2036,7 +2036,7 @@ public sealed class DeltaCatalog : IBackendCatalog
                 userSchema = DeltaReader.GetSchemaAndVersion(opener, path, out long latest);
                 if (txn != 0)
                 {
-                    long seeded = SnapshotPinning.PinVersion(txn, path, _ => latest, System.DateTime.UtcNow);
+                    long seeded = DeltaTxnScope.PinVersion(txn, path, _ => latest, System.DateTime.UtcNow);
                     _log.LogDebug("delta probe pin {Path} -> v{Version}", path, seeded);
                 }
             }
@@ -2124,7 +2124,7 @@ public sealed class DeltaCatalog : IBackendCatalog
                 // the instant-resolved explicit-transaction pin) is consulted FIRST — reading it before the
                 // schema fetch below is what makes schema and data come from ONE version, which seeding
                 // alone would not guarantee if a concurrent ALTER landed in between.
-                if (SnapshotPinning.TryGetPinned(txn, path) is { } already)
+                if (DeltaTxnScope.TryGetPinned(txn, path) is { } already)
                 {
                     unit = "version";
                     value = already.ToString(System.Globalization.CultureInfo.InvariantCulture);
@@ -2160,7 +2160,7 @@ public sealed class DeltaCatalog : IBackendCatalog
             // at ITS version, which is equally consistent).
             userSchema = DeltaReader.GetSchemaAndVersion(opener, path, out long latest);
             long pinTxn = AmbientTransaction.Current;
-            long pinned = SnapshotPinning.PinVersion(pinTxn, path, _ => latest, System.DateTime.UtcNow);
+            long pinned = DeltaTxnScope.PinVersion(pinTxn, path, _ => latest, System.DateTime.UtcNow);
             unit = "version";
             value = pinned.ToString(System.Globalization.CultureInfo.InvariantCulture);
             _log.LogDebug("delta native pin {Path} -> v{Version}", path, value);
@@ -2554,7 +2554,7 @@ public sealed class DeltaCatalog : IBackendCatalog
                 pending.CdfEnabled = prof.CdfEnabled && prof.SupportsExternalCommit;
                 if (pending.CdfEnabled == true)
                 {
-                    pending.PinnedVersion ??= SnapshotPinning.TryGetPinned(txnId, tablePath) ?? prof.Version;
+                    pending.PinnedVersion ??= DeltaTxnScope.TryGetPinned(txnId, tablePath) ?? prof.Version;
                 }
             }
             bool cdfAppend = pending.CdfEnabled == true;
@@ -2988,8 +2988,7 @@ public sealed class DeltaCatalog : IBackendCatalog
         // An explicit transaction whose pin vanished then re-captures a NEW instant on its next scan and
         // starts seeing a concurrent writer's commits mid-transaction — snapshot isolation silently broken.
         // Releasing per transaction makes the panic path unreachable in normal operation.
-        SnapshotPinning.Release(txnId);
-        DeltaTableCache.Release(txnId);
+        DeltaTxnScope.Release(txnId);
         // ⚠ CAPTURED BEFORE Remove, which CLEARS the explicit marker along with the buffer. Read after it,
         // this is always false and the blind-append declaration below silently degrades to "say nothing" —
         // green, and quietly never emitting the flag it exists to emit. Same ordering fact as §4b.3.
@@ -3094,8 +3093,7 @@ public sealed class DeltaCatalog : IBackendCatalog
     public void RollbackTransaction()
     {
         long txnId = AmbientTransaction.Current;
-        SnapshotPinning.Release(txnId); // see CommitTransaction — unconditional, before the early return
-        DeltaTableCache.Release(txnId);
+        DeltaTxnScope.Release(txnId); // see CommitTransaction — unconditional, before the early return
         var tables = _txnBuffer.Remove(txnId);
         if (tables is null)
         {
@@ -3332,7 +3330,7 @@ public sealed class DeltaCatalog : IBackendCatalog
                 "delta: ALTER TABLE after buffered data changes in this transaction is not supported — "
                 + "COMMIT first (or run the schema changes BEFORE the data statements).");
         }
-        pending.PinnedVersion ??= SnapshotPinning.TryGetPinned(txnId, path) ?? profile.Version;
+        pending.PinnedVersion ??= DeltaTxnScope.TryGetPinned(txnId, path) ?? profile.Version;
         return pending;
     }
 
@@ -3620,7 +3618,7 @@ public sealed class DeltaCatalog : IBackendCatalog
 
     // Buffers a DELETE (or an UPDATE's old-row half): decode each transient rowid into (pinned-snapshot file
     // ordinal, absolute position) and accumulate per file. The pin is the version the DML's scan read
-    // (SnapshotPinning on native_read; else the current version — the flush conflict-aborts if it moved).
+    // (the DeltaTxnScope pin on native_read; else the current version — the flush conflict-aborts if it moved).
     private long BufferDeleteRows(long txnId, string path, string schemaName, string tableName,
                                   IReadOnlyCollection<long> ids, bool forUpdate)
     {
@@ -3634,7 +3632,7 @@ public sealed class DeltaCatalog : IBackendCatalog
                 "delta: DML on a Change-Data-Feed table cannot follow a buffered ALTER in the same "
                 + "transaction — COMMIT the ALTER first.");
         }
-        pending.PinnedVersion ??= SnapshotPinning.TryGetPinned(txnId, path) ?? profile.Version;
+        pending.PinnedVersion ??= DeltaTxnScope.TryGetPinned(txnId, path) ?? profile.Version;
         if (profile.CdfEnabled && !forUpdate && ids.Count > 0)
         {
             // slice C2: the deleted rows' CONTENT goes into an eager _change_data file (the position set
@@ -3723,7 +3721,7 @@ public sealed class DeltaCatalog : IBackendCatalog
             }
         }
         var pending = _txnBuffer.GetOrCreate(txnId, path);
-        pending.PinnedVersion ??= SnapshotPinning.TryGetPinned(txnId, path) ?? profile.Version;
+        pending.PinnedVersion ??= DeltaTxnScope.TryGetPinned(txnId, path) ?? profile.Version;
 
         var fields = userSchema.FieldsList;
         // Pending ALTER: the read-back batches carry only the COMMITTED columns — reconcile each to the
@@ -4677,8 +4675,9 @@ public sealed class DeltaCatalog : IBackendCatalog
     // the affected count (VACUUM = files deleted; OPTIMIZE = 0). Important under DV-default: DVs + merge-on-read
     // append small files accumulate, so OPTIMIZE consolidates them (and materializes DV deletions).
     /// <summary>
-    /// Drops this transaction's cached OPEN read tables (<see cref="DeltaTableCache"/>). Called at the head
-    /// of every MUTATING entry point.
+    /// Drops this transaction's held OPEN read tables (<see cref="DeltaTxnScope.InvalidateTables"/> — the
+    /// TABLES-only release; the snapshot PINS deliberately survive, see the scope's remarks). Called at the
+    /// head of every MUTATING entry point.
     /// </summary>
     /// <remarks>
     /// ⚠ Deliberately COARSE — it drops the whole transaction's cache rather than one path. Over-invalidating
@@ -4692,7 +4691,7 @@ public sealed class DeltaCatalog : IBackendCatalog
     /// older than the pin already makes it. This guards the paths that do NOT consult the pin — chiefly the
     /// bind-time column fetch, which reads latest.</para>
     /// </remarks>
-    private static void InvalidateReadCache() => DeltaTableCache.Release(AmbientTransaction.Current);
+    private static void InvalidateReadCache() => DeltaTxnScope.InvalidateTables(AmbientTransaction.Current);
 
     public long ExecuteNonQuery(string sql)
     {

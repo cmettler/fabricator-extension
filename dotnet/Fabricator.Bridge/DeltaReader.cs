@@ -321,7 +321,7 @@ internal static class DeltaReader
 
     /// <summary>
     /// Opens a table for a READ, reusing the one this transaction already has open when there is one
-    /// (<see cref="DeltaTableCache"/>). Returns whether the result is SHARED — a shared table must NOT be
+    /// (<see cref="DeltaTxnScope"/>). Returns whether the result is SHARED — a shared table must NOT be
     /// disposed by the borrower, because engineered-wood's <c>Dispose</c> latches <c>_disposed</c> and the
     /// next reader would then throw.
     /// </summary>
@@ -332,11 +332,11 @@ internal static class DeltaReader
     /// the identical <c>DeltaWriter.Options()</c> — a site whose options differ (a reader/writer seam, a
     /// write spec) must NOT join this cache, since the options are baked into the table at construction.
     /// </remarks>
-    private static async Task<(DeltaTableCache.OpenTable Open, bool Shared)> OpenForReadAsync(
+    private static async Task<(DeltaTxnScope.OpenTable Open, bool Shared)> OpenForReadAsync(
         nint opener, string path)
     {
         long txn = AmbientTransaction.Current;
-        if (DeltaTableCache.TryGet(txn, path) is { } hit)
+        if (DeltaTxnScope.TryGetTable(txn, path) is { } hit)
         {
             return (hit, true);
         }
@@ -352,7 +352,7 @@ internal static class DeltaReader
         // then orphaned to the GC, which costs nothing — Dispose only sets a flag.
         // ⚠ `Shared` comes from Publish, NOT from `txn != 0`: the cache DECLINES past its per-transaction
         // table cap (catalog enumeration), and a declined entry is ours to dispose exactly as before.
-        var (entry, cached) = DeltaTableCache.Publish(txn, path, new DeltaTableCache.OpenTable(table, fs));
+        var (entry, cached) = DeltaTxnScope.PublishTable(txn, path, new DeltaTxnScope.OpenTable(table, fs));
         return (entry, cached);
     }
 
