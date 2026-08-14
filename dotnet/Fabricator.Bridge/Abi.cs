@@ -236,6 +236,12 @@ public unsafe struct FabricatorVTable
     // int32 clear_session_settings(int64 session, char** err) (v69) — drop a closed DuckDB connection's
     // session-scoped settings. Appended at the vtable end so no earlier slot shifts.
     public delegate* unmanaged[Cdecl]<long, byte**, int> ClearSessionSettings;
+
+    // int32 get_capabilities(void* handle, char** out_json, char** err) (v71) — ONE flat JSON object of
+    // the catalog's host-consumed capability booleans (absent key = false), read once at ATTACH. The typed
+    // replacement for the host grepping the diagnostic kind-7 (property, value) stream. Appended at the
+    // vtable end so no earlier slot shifts.
+    public delegate* unmanaged[Cdecl]<nint, byte**, byte**, int> GetCapabilities;
 }
 
 /// <summary>

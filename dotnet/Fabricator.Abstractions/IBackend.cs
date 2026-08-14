@@ -194,6 +194,19 @@ public interface IBoundTableFunction : IDisposable
 /// <summary>An opened connection/catalog. Disposed when the native side closes the handle.</summary>
 public interface IBackendCatalog : IDisposable
 {
+    /// <summary>
+    /// The catalog's capability doc (ABI v71): ONE flat JSON object of boolean flags the HOST consumes,
+    /// read once at ATTACH — an ABSENT key means false, so a provider emits only the flags it can assert
+    /// and this default ("{}") is the correct answer for a provider with nothing to claim. Keys the host
+    /// reads today: <c>exact_filter_pushdown</c> (pushed table filters are applied EXACTLY, never a
+    /// superset => the scan may advertise filter_pushdown=true) and <c>is_binary_collation</c> (the
+    /// database collation sorts strings by byte value == DuckDB => string-keyed TopN pushdown). Each
+    /// override must derive its answer from the SAME source as its diagnostic ServerInfo rows so the two
+    /// surfaces cannot drift. May open a connection (called after the ambients are established, not from
+    /// open_catalog).
+    /// </summary>
+    string CapabilitiesJson => "{}";
+
     /// <summary>Execute a query and return its result as an Arrow stream.</summary>
     IArrowArrayStream ExecuteQuery(string sql);
 

@@ -1,4 +1,4 @@
-# The catalog/table abstraction — design for retiring `get_metadata` (slices 1a/1b/2 BUILT, 3–5 open)
+# The catalog/table abstraction — design for retiring `get_metadata` (slices 1a/1b/2/3 BUILT, 4–5 open)
 
 > Written 2026-08-14 after the user's review: *"I don't like the getmetadata functions … there should be no
 > provider-specific function defined in C++, all must live in the providers … an abstraction similar to
@@ -24,7 +24,7 @@ fall into three categories that have nothing to do with each other:
 | 4 RowCount | approximate count | **a number as text** |
 | 5 ColumnNdv | per-column NDV | numbers as text |
 | 6 Functions | discovered routines | 5-column string table |
-| 7 ServerInfo | capability profile | **(property, value) strings, string-matched on BOTH sides** (`FetchExactFilterPushdown` greps for `"exact_filter_pushdown"`, `FetchBinaryCollation` for `"is_binary_collation"`) |
+| 7 ServerInfo | capability profile | ~~(property, value) strings, string-matched on BOTH sides~~ **the capability half RETIRED by slice 3 (ABI v71 `get_capabilities`)** — kind 7 is now diagnostic-only (`fabricator_server_info()`), the host never reads it |
 | 12 VirtualColumns | provider virtual columns | string table |
 | 15 CatalogMacros | provider-declared macros | 3-column string table |
 
@@ -238,6 +238,9 @@ Catalog-level discovery keeps Arrow streams (right tool for LISTS) but as **dedi
 `catalog_schemas`, `catalog_tables` — with declared schemas, not kind ints. `ServerInfo`'s capability half
 (`exact_filter_pushdown`, `is_binary_collation`) moves into **`open_catalog`'s result** as one JSON doc read
 once at ATTACH, killing the grep-a-string-table pattern; the diagnostic table function keeps its own path.
+*(⚠ As built (slice 3, ABI v71) the carrier is a dedicated `get_capabilities` entry called from
+`LoadCatalog`, NOT `open_catalog`'s result — the letter would have forced a connection inside
+`open_catalog`; see §5 item 3.)*
 `get_metadata` is then **deleted** — one bump, no aliases, no compat arms.
 
 C++-side lifetime: the table handle lives on `FabricatorTableEntry` and follows the existing
@@ -367,6 +370,32 @@ the same table the code evaluates.
        timestamp bounds incl. the version-equivalence assertion, `verify_delta_catalog_functions` §8 +17
        for the namespace advertisement / declarations / DDL refusal) + service tier.
 3. **`open_catalog` capability JSON** — kills the ServerInfo grep; small ABI bump.
+   - **BUILT — 2026-08-14 (ABI v71), with ONE deviation from this doc's letter: the JSON does NOT ride
+     `open_catalog`'s result — it is a dedicated appended entry `get_capabilities(handle, out_json, err)`,
+     called from `LoadCatalog` exactly where the two greps sat.** The letter would have forced SQL Server
+     to CONNECT inside `open_catalog` (it cannot answer `is_binary_collation` without detecting the
+     collation), breaking a MEASURED invariant the mutant note in `fabricator_storage.cpp` depends on
+     (open_catalog is connection-free; the settings/opener ambients are established only by the calls
+     after it). At `LoadCatalog` the ambients are up and the first connection was always paid on this
+     path — the old `FetchBinaryCollation` triggered the identical profile detection. Same substance
+     (one typed doc, read once at ATTACH, grep dead), safer carrier. The kind-12 imprecision in slice 2
+     and this are the same lesson: re-derive the design's letter against the tree before building it.
+   - Contract: ONE flat JSON object of booleans; an ABSENT key means false, so a provider emits only what
+     it can assert and the `IBackendCatalog.CapabilitiesJson` DIM (`"{}"`) is the correct answer for
+     DAX/DeltaRs/Stub with no per-provider code. SqlServer answers `is_binary_collation` from
+     `Profile.IsBinaryCollation`, Delta answers `exact_filter_pushdown` from `_pushdownMode == Exact` —
+     each the SAME field its diagnostic ServerInfo rows read, so the two surfaces cannot drift.
+   - Kind 7 STAYS, diagnostic-only: `fabricator_server_info()` keeps its (property, value) rows untouched
+     (`verify_server_profile` still pins all 15), and the host never reads them again. C++ deleted:
+     `FetchBinaryCollation` + `FetchExactFilterPushdown` (the two extra kind-7 stream reads per ATTACH);
+     added: `FetchCapabilities` → `FabricatorCapabilities{string_order_pushable, exact_filter_pushdown}`,
+     best-effort at the call site as before (a failed crossing leaves both off).
+   - Gates: no new suite — the capability EFFECTS were already pinned and now run through the new path:
+     `verify_delta_catalog_dynamic_filter` (the pushed join filter must appear in the per-file
+     `read_parquet` SQL via duckdb_logs) and `verify_collation_pushdown` (the pushed `TOP + ORDER BY
+     [name]` must appear in `dm_exec_query_stats`). **Mutation-tested**: forcing Delta's doc to `{}` dies
+     at exactly the dynamic-filter log assertion (line 66) after the 18 correctness assertions pass —
+     correctness is indistinguishable either way, which is why the mechanism assertion is the gate.
 4. **The `table_*` session** — the big one: `ITable` in Abstractions, four providers, the C++ entry/DML
    operators re-pointed at table handles, `get_metadata` deleted. One ABI bump for the whole slice.
 5. Sweep: delete `ReadStringTable`'s multi-column string protocol where nothing uses it any more.

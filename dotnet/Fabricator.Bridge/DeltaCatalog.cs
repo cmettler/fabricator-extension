@@ -957,6 +957,12 @@ public sealed class DeltaCatalog : IBackendCatalog
     private string TablePath(string schema, string table) =>
         SchemaLayout ? _root + "/" + schema + "/" + table : _root + "/" + table;
 
+    // The host-consumed capability doc (ABI v71, read once at ATTACH). Derived from the SAME _pushdownMode
+    // the diagnostic ServerInfo row reads, so the two surfaces cannot drift. `is_binary_collation` is
+    // deliberately absent (= false): there is no server collation here, and DuckDB's own sort handles TopN.
+    public string CapabilitiesJson
+        => _pushdownMode == PushdownMode.Exact ? "{\"exact_filter_pushdown\":true}" : "{}";
+
     public IArrowArrayStream GetMetadata(int kind, string? schema, string? table) => kind switch
     {
         // CatalogSchemaNames, not SchemaNames: the advertised set includes the `fabric` function namespace on a
@@ -978,10 +984,12 @@ public sealed class DeltaCatalog : IBackendCatalog
         // Snapshots / changes / tblproperties / transaction versions are NOT metadata kinds any more — they are
         // catalog-bound functions in the `delta` schema (cat.delta.snapshots('s.t') …), declared by
         // BuildFunctionSet with TYPED arguments. The old kinds 8-11/13-14 and their C++ fronts are deleted.
-        // Capability profile (property, value). `exact_filter_pushdown` = whether the host may set
-        // filter_pushdown=true on this catalog's scans — governed by the pushdown_filters mode: EXACT mode
-        // applies the erased TableFilterSet 1:1 (read_parquet WHERE under native_read; HostBatchFilter per
-        // batch on the codec path); None/Static keep filter_pushdown=false so DuckDB re-applies everything.
+        // DIAGNOSTIC capability rows (property, value) for fabricator_server_info() — since ABI v71 the HOST
+        // reads CapabilitiesJson instead (same _pushdownMode source, so the two cannot drift).
+        // `exact_filter_pushdown` = whether the host may set filter_pushdown=true on this catalog's scans —
+        // governed by the pushdown_filters mode: EXACT mode applies the erased TableFilterSet 1:1
+        // (read_parquet WHERE under native_read; HostBatchFilter per batch on the codec path); None/Static
+        // keep filter_pushdown=false so DuckDB re-applies everything.
         MetadataKind.ServerInfo => TwoColumn(
             "property", new[] { "exact_filter_pushdown" },
             "value", new[] { _pushdownMode == PushdownMode.Exact ? "true" : "false" }),

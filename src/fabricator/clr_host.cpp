@@ -571,6 +571,24 @@ std::string BuildConnectionString(const std::string &provider, const std::string
 	return result;
 }
 
+std::string GetCapabilities(FabricatorHandle handle) {
+	const FabricatorVTable &vt = GetBridge();
+	if (!vt.get_capabilities) {
+		throw duckdb::IOException("Fabricator: bridge does not provide get_capabilities");
+	}
+	char *out_json = nullptr;
+	char *err = nullptr;
+	int32_t rc = vt.get_capabilities(handle, &out_json, &err);
+	if (rc != FABRICATOR_OK) {
+		ThrowManagedError(vt, err, "Fabricator: get_capabilities failed");
+	}
+	std::string result = out_json ? out_json : "";
+	if (out_json && vt.free_error) {
+		vt.free_error(out_json); // owned UTF-8, freed like an error string
+	}
+	return result;
+}
+
 void CloseCatalog(FabricatorHandle handle) {
 	if (!handle) {
 		return;

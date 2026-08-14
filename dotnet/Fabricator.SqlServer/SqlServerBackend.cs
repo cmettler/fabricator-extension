@@ -2378,6 +2378,14 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         return new InMemoryArrayStream(builder.Build(), System.Array.Empty<RecordBatch>());
     }
 
+    // The host-consumed capability doc (ABI v71, read once at ATTACH). Derived from the SAME Profile field
+    // the diagnostic ServerInfoStream row reads, so the two surfaces cannot drift. Accessing Profile detects
+    // it on first use — the first connection this path always paid (the old host-side FetchBinaryCollation
+    // triggered the identical detection through the kind-7 stream). `exact_filter_pushdown` is deliberately
+    // absent (= false): this provider's filter pushdown is best-effort/superset and DuckDB must re-apply.
+    public string CapabilitiesJson
+        => $"{{\"is_binary_collation\":{(Profile.IsBinaryCollation ? "true" : "false")}}}";
+
     // Builds a two-column (property, value) stream from the detected ServerProfile. Accessing Profile
     // detects it (via the non-MARS probe) on first use; for an attached catalog it is already cached.
     private IArrowArrayStream ServerInfoStream()

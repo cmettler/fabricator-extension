@@ -56,20 +56,18 @@ void FabricatorCatalog::LoadCatalog(ClientContext &context) {
 	// opener (secret resolution). Harmless for SQL/DAX (they ignore the opener ambient).
 	FabricatorSetActiveTxn(handle_, context);
 
-	// Detect the database collation's sort semantics once (binary => SQL Server's byte-order string sort
-	// matches DuckDB, so string-keyed ORDER BY+LIMIT can be pushed). Best-effort: a failure leaves it off.
+	// The catalog's capability doc, read ONCE here (ABI v71): `is_binary_collation` => SQL Server's
+	// byte-order string sort matches DuckDB, so string-keyed ORDER BY+LIMIT can be pushed;
+	// `exact_filter_pushdown` => the provider applies pushed filters exactly, so the scan may advertise
+	// filter_pushdown=true (DuckDB then delivers runtime dynamic/join filters) — true only for the Delta
+	// catalog in Exact pushdown mode; see docs/multifile-delta.md §"Batch 2". Best-effort: a failed
+	// crossing leaves every capability off (the safe defaults — pushdown stays superset-and-re-apply).
 	try {
-		string_order_pushable_ = FetchBinaryCollation(handle_);
+		auto caps = FetchCapabilities(handle_);
+		string_order_pushable_ = caps.string_order_pushable;
+		exact_filter_pushdown_ = caps.exact_filter_pushdown;
 	} catch (...) {
 		string_order_pushable_ = false;
-	}
-
-	// Whether the provider applies pushed filters exactly => the scan may advertise filter_pushdown=true (so
-	// DuckDB delivers runtime dynamic/join filters). True only for the Delta native_read catalog; default off
-	// keeps the safe superset model for SQL Server / DAX / non-native Delta. See docs/multifile-delta.md §"Batch 2".
-	try {
-		exact_filter_pushdown_ = FetchExactFilterPushdown(handle_);
-	} catch (...) {
 		exact_filter_pushdown_ = false;
 	}
 

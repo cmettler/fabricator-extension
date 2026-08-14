@@ -57,7 +57,7 @@ public static unsafe class Bootstrap
             return new InMemoryArrayStream(schema, new[] { batch });
         });
 
-        vtable->AbiVersion = 70;
+        vtable->AbiVersion = 71;
         vtable->OpenCatalog = &OpenCatalog;
         vtable->CloseCatalog = &CloseCatalog;
         vtable->ExecuteQuery = &ExecuteQuery;
@@ -122,6 +122,7 @@ public static unsafe class Bootstrap
         vtable->OneLakeMove = &OneLakeMove;
         vtable->GenerateTableSql = &GenerateTableSql;
         vtable->ClearSessionSettings = &ClearSessionSettings;
+        vtable->GetCapabilities = &GetCapabilities;
         return FabricatorStatus.Ok;
     }
 
@@ -157,6 +158,31 @@ public static unsafe class Bootstrap
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
     private static void CloseCatalog(nint handle) => Handles.Free(handle);
+
+    // v71: the catalog's capability doc — one flat JSON object of booleans (absent key = false), read once
+    // at ATTACH from LoadCatalog. The provider answers via IBackendCatalog.CapabilitiesJson (DIM "{}"), so a
+    // provider with nothing to assert declares nothing. Replaces the host's grep of the diagnostic kind-7
+    // (property, value) stream; that stream stays, as the fabricator_server_info() diagnostic only.
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int GetCapabilities(nint handle, byte** outJson, byte** err)
+    {
+        try
+        {
+            if (outJson is null)
+            {
+                return FabricatorStatus.InvalidArgument;
+            }
+            var catalog = Handles.Resolve<IBackendCatalog>(handle)
+                          ?? throw new InvalidOperationException("get_capabilities: invalid catalog handle");
+            *outJson = (byte*)Marshal.StringToCoTaskMemUTF8(catalog.CapabilitiesJson); // host frees via free_error
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
     private static int ExecuteQuery(nint handle, byte* sql, CArrowArrayStream* outStream, byte** err)

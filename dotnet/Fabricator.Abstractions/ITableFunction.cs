@@ -91,9 +91,10 @@ public interface ITableFunctionBinding : System.IDisposable
     /// state — that asymmetry is the whole reason they were split.</para>
     /// <para>Wiring it means having the host stop re-applying the predicate for a claiming binding, which on
     /// the CATALOG side is the <c>filter_pushdown = true</c> decision made from the provider's own
-    /// <c>exact_filter_pushdown</c> capability (<c>fabricator_table_entry.cpp</c> /
-    /// <c>FetchExactFilterPushdown</c>) — i.e. this flag is the table-FUNCTION analogue of a mechanism that
-    /// already exists one layer over. Reuse that shape rather than inventing a second one.</para>
+    /// <c>exact_filter_pushdown</c> capability (<c>fabricator_table_entry.cpp</c>; declared via
+    /// <c>IBackendCatalog.CapabilitiesJson</c> since ABI v71) — i.e. this flag is the table-FUNCTION
+    /// analogue of a mechanism that already exists one layer over. Reuse that shape rather than inventing
+    /// a second one.</para>
     /// </remarks>
     bool SupportsFilterPushdown { get; }
 

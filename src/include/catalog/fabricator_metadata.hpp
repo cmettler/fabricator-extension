@@ -28,16 +28,23 @@ vector<vector<string>> ReadStringTable(ArrowArrayStream &stream, idx_t expected_
 //! Discovers user schemas in the attached SQL Server database.
 vector<string> DiscoverSchemas(FabricatorHandle handle);
 
-//! Whether the connected database's collation is binary (_BIN/_BIN2), read from the detected server
-//! profile (FABRICATOR_META_SERVER_INFO). A binary collation sorts strings by byte value, matching DuckDB,
-//! so string-keyed ORDER BY+LIMIT can be pushed down safely. Best-effort: false on any failure.
-bool FetchBinaryCollation(FabricatorHandle handle);
+//! The host-consumed capability flags for an open catalog (ABI v71, `get_capabilities`) — the typed
+//! replacement for grepping the diagnostic FABRICATOR_META_SERVER_INFO (property, value) stream. An
+//! absent key in the provider's JSON means false, so every flag defaults to the safe direction.
+struct FabricatorCapabilities {
+	//! The database collation sorts strings by byte value (_BIN/_BIN2), matching DuckDB, so string-keyed
+	//! ORDER BY+LIMIT can be pushed down safely. SQL Server only today.
+	bool string_order_pushable = false;
+	//! The provider applies pushed filters EXACTLY (never a superset) => the host may set
+	//! `filter_pushdown = true` on the scan (so DuckDB delivers runtime dynamic/join filters and stops
+	//! re-applying the pushed ones). Currently true only for the Delta catalog in Exact pushdown mode.
+	bool exact_filter_pushdown = false;
+};
 
-//! Whether the provider applies pushed filters EXACTLY (read from FABRICATOR_META_SERVER_INFO's
-//! `exact_filter_pushdown` property). True => the host may set `filter_pushdown = true` on the scan (so
-//! DuckDB delivers runtime dynamic/join filters and stops re-applying the pushed ones). Currently true only
-//! for the Delta native_read catalog. Best-effort: false on any failure (the safe default).
-bool FetchExactFilterPushdown(FabricatorHandle handle);
+//! Reads the catalog's capability doc (one flat JSON object of booleans). Called once at ATTACH
+//! (LoadCatalog). Throws on a failed crossing — the caller keeps the old best-effort behaviour by
+//! catching and leaving every capability off.
+FabricatorCapabilities FetchCapabilities(FabricatorHandle handle);
 
 //! Discovers user tables + views across all schemas.
 vector<FabricatorTableInfo> DiscoverTables(FabricatorHandle handle);

@@ -99,38 +99,41 @@ vector<string> DiscoverSchemas(FabricatorHandle handle) {
 	return rows[0];
 }
 
-bool FetchBinaryCollation(FabricatorHandle handle) {
-	// Read the detected server profile (property, value rows) and look for the binary-collation flag.
-	// A binary (_BIN/_BIN2) database collation sorts strings by byte value — identical to DuckDB — so a
-	// pushed SQL TOP+ORDER BY on a string column matches DuckDB's ordering. Best-effort: any failure or a
-	// missing row => false (string ORDER BY pushdown stays off, the safe default).
-	ArrowArrayStream stream;
-	std::memset(&stream, 0, sizeof(stream));
-	fabricator::GetMetadata(handle, FABRICATOR_META_SERVER_INFO, "", "", stream);
-	auto rows = ReadStringTable(stream, 2); // property, value
-	for (idx_t i = 0; i < rows[0].size(); i++) {
-		if (rows[0][i] == "is_binary_collation") {
-			return rows[1][i] == "true";
-		}
+// True iff `json` (a flat JSON object OUR bridge serialized — values are bare booleans, so the key text
+// cannot appear inside a value) carries `"key": true`. Absent key / anything else => false, the safe
+// direction for every capability. Deliberately not a JSON parser: the producer is Bootstrap's own
+// System.Text.Json serialization of a Dictionary<string, bool>, so the token after the colon is exactly
+// `true` or `false`.
+static bool ReadCapabilityFlag(const string &json, const char *key) {
+	string needle = string("\"") + key + "\"";
+	size_t pos = json.find(needle);
+	if (pos == string::npos) {
+		return false;
 	}
-	return false;
+	pos += needle.size();
+	while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t' || json[pos] == '\n' || json[pos] == '\r')) {
+		pos++;
+	}
+	if (pos >= json.size() || json[pos] != ':') {
+		return false;
+	}
+	pos++;
+	while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t' || json[pos] == '\n' || json[pos] == '\r')) {
+		pos++;
+	}
+	return json.compare(pos, 4, "true") == 0;
 }
 
-bool FetchExactFilterPushdown(FabricatorHandle handle) {
-	// Read the provider profile and look for the `exact_filter_pushdown` flag: TRUE => the provider applies
-	// pushed table filters exactly (currently the Delta native_read catalog, which reads via read_parquet on
-	// the host DuckDB), so the host may set filter_pushdown=true. Best-effort: any failure / missing row =>
-	// false (filter_pushdown stays off — the safe superset-and-DuckDB-re-applies default).
-	ArrowArrayStream stream;
-	std::memset(&stream, 0, sizeof(stream));
-	fabricator::GetMetadata(handle, FABRICATOR_META_SERVER_INFO, "", "", stream);
-	auto rows = ReadStringTable(stream, 2); // property, value
-	for (idx_t i = 0; i < rows[0].size(); i++) {
-		if (rows[0][i] == "exact_filter_pushdown") {
-			return rows[1][i] == "true";
-		}
-	}
-	return false;
+FabricatorCapabilities FetchCapabilities(FabricatorHandle handle) {
+	// ONE typed crossing (ABI v71) replaces the old pattern of grepping the diagnostic kind-7
+	// (property, value) stream twice — see abi.h `get_capabilities` for the contract and for why this is
+	// deliberately NOT part of open_catalog's result (open_catalog must stay connection-free; a provider
+	// may need a connection to answer, and here the txn/opener ambients are already established).
+	auto json = fabricator::GetCapabilities(handle);
+	FabricatorCapabilities caps;
+	caps.string_order_pushable = ReadCapabilityFlag(json, "is_binary_collation");
+	caps.exact_filter_pushdown = ReadCapabilityFlag(json, "exact_filter_pushdown");
+	return caps;
 }
 
 vector<FabricatorTableInfo> DiscoverTables(FabricatorHandle handle) {

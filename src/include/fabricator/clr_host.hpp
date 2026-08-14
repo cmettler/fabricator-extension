@@ -148,6 +148,11 @@ FabricatorHandle OpenCatalog(const std::string &connection_string, const std::st
 std::string BuildConnectionString(const std::string &provider, const std::string &secret_type,
                                   const std::string &fields_json, const std::string &base_connstr = "");
 
+// The catalog's capability doc (ABI v71): one flat JSON object of boolean capability flags — an absent
+// key means false. Read once at ATTACH (LoadCatalog). See abi.h `get_capabilities` for the contract and
+// why this is not part of open_catalog's result.
+std::string GetCapabilities(FabricatorHandle handle);
+
 // Close a handle previously returned by OpenCatalog. Safe with nullptr.
 void CloseCatalog(FabricatorHandle handle);
 

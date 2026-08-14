@@ -1,4 +1,4 @@
-# ABI history — prior versions v16–v68
+# ABI history — prior versions v16–v70
 
 > Moved VERBATIM out of `CLAUDE.md` on 2026-07-29 (conservative split — see the commit message).
 > Append-only as-built history; the live summary + pointers stay in `CLAUDE.md`.
@@ -85,6 +85,22 @@ keep the rest).
 ⚠ **RESIDUAL:** `FabricTableBinding` (the `FabricApi` base class) still reads like DuckDB's `TableBinding`
 and would be `FabricTableFunctionBinding` under this convention.
 
+- **Prior: ABI v70** (v70, 2026-08-14 = **METADATA KINDS 8-11/13-14 DELETED** — the Delta features that wore
+  C++-registered `fabricator_delta_*` fronts became catalog-bound `delta.*` functions (slice 2 of the
+  catalog/table abstraction, [catalog-table-abstraction.md](catalog-table-abstraction.md) §5 item 2). ⚠ No
+  vtable entry or signature changed; the bump exists because kind REMOVAL is the inverse of the additive
+  no-bump rule — a stale loadable would send kind 8 and get the provider's empty-table fallback, silently
+  wrong, where a version mismatch fails loudly at boot. Kind 12 VirtualColumns and 15 CatalogMacros keep
+  their numbers; the gaps stay unassigned so a stale peer's kind cannot silently alias a new one. Full text
+  stayed in `CLAUDE.md` as the then-current version and moved here when v71 landed.)
+- **Prior: ABI v69** (v69 = **SCOPED SETTINGS** — provider settings honour DuckDB's `SetScope`. `set_setting`
+  gained a LEADING `int64_t session` (0 = the GLOBAL layer — a `SET GLOBAL`, and every registration
+  default — non-zero = the SESSION layer, keyed by the setting connection's `ClientContext` address via
+  `fabricator::SessionKeyFor`); `set_active_opener` gained a `int64_t session` beside the opener; and ONE
+  appended entry `clear_session_settings(session)` reclaims a closed connection's values. Managed:
+  `ProviderSettingsStore` grew a session layer resolving **session ?? global**, plus a `CurrentSession`
+  AsyncLocal mirroring `AmbientOpener`. See the scoped-SET entry in `CLAUDE.md` "Next up" and
+  [settings-architecture.md](settings-architecture.md) §5.3.)
 - **Prior: ABI v68** (v68 = **`generate_table_sql`** — the SQL-GENERATING table function surface; see the
   sqlgen bullet in `CLAUDE.md` "Next up" and [macros-and-sqlgen-functions.md](macros-and-sqlgen-functions.md)
   §2. Full text stayed in `CLAUDE.md` as the then-current version and moved here when v69 landed.)

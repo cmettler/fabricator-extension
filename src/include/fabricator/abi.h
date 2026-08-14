@@ -792,6 +792,33 @@ typedef struct FabricatorVTable {
 	// attribute. Must be idempotent and cheap for a session that never set anything: the host arms the
 	// cleanup once per connection, not once per setting.
 	int32_t (*clear_session_settings)(int64_t session, char **err);
+
+	// -------------------------------------------------------------------------
+	// Catalog capability doc (ABI v71). Appended at the vtable end so no earlier slot shifts.
+	// -------------------------------------------------------------------------
+	// get_capabilities: ONE flat JSON object of the capability flags the HOST consumes for this catalog,
+	// read once at ATTACH (from LoadCatalog, with the txn/opener ambient already established). It replaces
+	// the old pattern of grepping the diagnostic get_metadata kind-7 (property, value) stream for
+	// "exact_filter_pushdown" / "is_binary_collation" — a display surface string-matched on both sides.
+	// Kind 7 STAYS, but as a diagnostic only (the fabricator_server_info() table function); the host never
+	// reads it again.
+	//
+	// ⚠ Deliberately NOT part of open_catalog's result, although the design doc first sketched it there:
+	// open_catalog must stay connection-free (measured — see the mutant note in fabricator_storage.cpp),
+	// while a provider may need a CONNECTION to answer (SQL Server detects the database collation). At
+	// LoadCatalog time the session/opener ambients are established and the first connection was always paid
+	// on this path anyway (the old FetchBinaryCollation triggered profile detection).
+	//
+	// Contract: a flat JSON object whose values are booleans; an ABSENT key means false (each provider
+	// emits only the flags it can assert). Keys the host reads today:
+	//   "exact_filter_pushdown"  — pushed table filters are applied EXACTLY (never a superset) => the scan
+	//                              may advertise filter_pushdown=true so DuckDB delivers dynamic/join
+	//                              filters (the Delta catalog in Exact pushdown mode).
+	//   "is_binary_collation"    — the database collation sorts strings by byte value == DuckDB's order =>
+	//                              string-keyed TopN (ORDER BY+LIMIT) may be pushed (SQL Server _BIN/_BIN2).
+	// *out_json is an owned UTF-8 string freed via free_error (the build_connection_string convention).
+	// Best-effort on the host side: any failure leaves every capability off (the safe defaults).
+	int32_t (*get_capabilities)(FabricatorHandle handle, char **out_json, char **err);
 } FabricatorVTable;
 
 // -----------------------------------------------------------------------------
@@ -908,7 +935,7 @@ typedef struct FabricatorHostServices {
 // state blob is this many bytes + a 4-byte length prefix). Serialize() must fit within it.
 #define FABRICATOR_AGG_SPILL_CAP 1024
 
-#define FABRICATOR_ABI_VERSION 70
+#define FABRICATOR_ABI_VERSION 71
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(FabricatorVTable) as seen
