@@ -66,10 +66,10 @@ public sealed class StubBackend : IBackend
         public Schema GetFunctionOutputSchema(string schemaName, string functionName, RecordBatch? args = null) =>
             new Schema(new[] { new Field("result", StringType.Default, nullable: true) }, null);
 
-        public IBoundTable TableBind(string schemaName, string functionName, RecordBatch? args) =>
+        public IBoundTableFunction TableFnBind(string schemaName, string functionName, RecordBatch? args) =>
             throw new NotSupportedException("stub backend has no table functions");
 
-        public IArrowInOutBinding InOutBind(string schemaName, string functionName, RecordBatch? args, Schema inputSchema) =>
+        public IInOutBinding InOutBind(string schemaName, string functionName, RecordBatch? args, Schema inputSchema) =>
             throw new NotSupportedException("stub backend has no table-in-out functions");
 
         public IAggregateSession AggOpen(string schemaName, string functionName) =>

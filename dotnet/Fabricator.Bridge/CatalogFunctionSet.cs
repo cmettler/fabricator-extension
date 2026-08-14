@@ -227,11 +227,12 @@ public sealed class CatalogFunctionSet
 
     /// <summary>
     /// Binds a table function for one execution. <c>supportsPushdown: true</c> means the host maps the full
-    /// result BY NAME (the flag is projection mapping, NOT SQL pushdown — see <see cref="BindingBoundTable"/>).
+    /// result BY NAME (the flag is projection mapping, NOT SQL pushdown — see
+    /// <see cref="BindingBoundTableFunction"/>).
     /// </summary>
-    public IBoundTable? TableBind(string schema, string func, RecordBatch? args) =>
+    public IBoundTableFunction? TableFnBind(string schema, string func, RecordBatch? args) =>
         TryTable(schema, func, out var fn)
-            ? new BindingBoundTable(fn.Bind(args!), supportsPushdown: true)
+            ? new BindingBoundTableFunction(fn.Bind(args!), supportsPushdown: true)
             : null;
 
     /// <summary>
@@ -248,7 +249,7 @@ public sealed class CatalogFunctionSet
     /// name is not ours. A caller that honours isolation applies it to the returned binding itself — the level
     /// is provider state, not something this set knows.
     /// </summary>
-    public IArrowInOutBinding? InOutBind(string schema, string func, RecordBatch? args, Schema inputSchema)
+    public IInOutBinding? InOutBind(string schema, string func, RecordBatch? args, Schema inputSchema)
     {
         if (TryCollector(schema, func, out var collector))
         {

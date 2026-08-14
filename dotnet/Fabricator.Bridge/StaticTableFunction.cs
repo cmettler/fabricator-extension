@@ -21,7 +21,7 @@ public abstract class StaticTableFunction : ICatalogTableFunction
 
     // Pure C#: no SQL to push into, so neither half is claimed and DuckDB re-applies both above the scan.
     // Virtual because a subclass CAN honour them — but only by actually filtering / projecting its own rows;
-    // see the guarantees on IArrowTableFunctionBinding.
+    // see the guarantees on ITableFunctionBinding.
     public virtual bool SupportsFilterPushdown => false;
     public virtual bool SupportsProjectionPushdown => false;
 
@@ -29,9 +29,9 @@ public abstract class StaticTableFunction : ICatalogTableFunction
     /// streamed asynchronously — implement as an async iterator (a synchronous generator just yields).</summary>
     public abstract IAsyncEnumerable<RecordBatch> Invoke(RecordBatch args, CancellationToken ct = default);
 
-    public IArrowTableFunctionBinding Bind(RecordBatch args) => new Binding(this, args);
+    public ITableFunctionBinding Bind(RecordBatch args) => new Binding(this, args);
 
-    private sealed class Binding : IArrowTableFunctionBinding
+    private sealed class Binding : ITableFunctionBinding
     {
         private readonly StaticTableFunction _fn;
         private readonly RecordBatch _args;

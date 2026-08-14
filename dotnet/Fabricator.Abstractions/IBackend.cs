@@ -159,23 +159,23 @@ public interface IBackend
 /// A bound table-function call (Phase 5 session model): resolves its output schema once and runs the scan
 /// possibly many times (once per execution). For a discovered SQL Server TVF the scan pushes projection +
 /// filter into the SELECT; a stored proc returns its full result positionally and DuckDB projects + filters
-/// above the scan. Disposed via the host's table_close.
+/// above the scan. Disposed via the host's tablefn_close.
 /// </summary>
-public interface IBoundTable : IDisposable
+public interface IBoundTableFunction : IDisposable
 {
     /// <summary>The function's output columns (may depend on the bound constant args).</summary>
     Schema OutputSchema { get; }
 
     /// <summary>
     /// Whether the host maps this scan's result columns BY NAME (true) or POSITIONALLY (false). It is the
-    /// <c>supports_pushdown</c> argument of the <c>table_bind</c> ABI entry.
+    /// <c>supports_pushdown</c> argument of the <c>tablefn_bind</c> ABI entry.
     /// </summary>
     /// <remarks>
     /// ⚠ RENAMED FROM <c>SupportsPushdown</c> ON 2026-08-13 BECAUSE THAT NAME DESCRIBED NEITHER SIDE
     /// HONESTLY. It never meant "the spec was honoured" — the ABI comment has always defined it as the
     /// host's projection MAPPING, and a custom function returning its FULL result answers <c>true</c>. Only
     /// by-name mapping makes a projected subset ingestible at all, so this is the enabling condition for
-    /// <see cref="IArrowTableFunctionBinding.SupportsProjectionPushdown"/> rather than the same question:
+    /// <see cref="ITableFunctionBinding.SupportsProjectionPushdown"/> rather than the same question:
     /// true here + false there is the ordinary case (map by name, but every column is present).
     /// </remarks>
     bool MapResultByName { get; }
@@ -184,8 +184,8 @@ public interface IBoundTable : IDisposable
     /// Runs the scan. <paramref name="specJson"/> (null => SELECT *) + <paramref name="filterValues"/>
     /// (null => no filter) carry projection + filter pushdown. What is honoured is the implementation's own
     /// business — DuckDB re-applies both regardless unless the underlying binding claims them (see
-    /// <see cref="IArrowTableFunctionBinding.SupportsFilterPushdown"/> /
-    /// <see cref="IArrowTableFunctionBinding.SupportsProjectionPushdown"/>). Returns the result rows; the
+    /// <see cref="ITableFunctionBinding.SupportsFilterPushdown"/> /
+    /// <see cref="ITableFunctionBinding.SupportsProjectionPushdown"/>). Returns the result rows; the
     /// stream owns the provider connection (released by the host at scan teardown).
     /// </summary>
     IArrowArrayStream Execute(string? specJson, IArrowArrayStream? filterValues);
@@ -291,23 +291,24 @@ public interface IBackendCatalog : IDisposable
     /// <summary>
     /// Binds one table-function call (Phase 5 session model — the successor to the removed
     /// <c>execute_table</c>/<c>execute_proc</c>). <paramref name="args"/> (nullable) is a 1-row batch of the
-    /// constant call arguments. Returns an <see cref="IBoundTable"/> whose <see cref="IBoundTable.OutputSchema"/>
+    /// constant call arguments. Returns an <see cref="IBoundTableFunction"/> whose
+    /// <see cref="IBoundTableFunction.OutputSchema"/>
     /// is the function's output columns (a custom function's may depend on the args) and which executes the
     /// scan (possibly many times); the managed side classifies the function (discovered TVF / stored proc /
-    /// custom). The binding is reused across (prepared) re-executions and disposed via the host's table_close.
+    /// custom). The binding is reused across (prepared) re-executions and disposed via the host's tablefn_close.
     /// </summary>
-    IBoundTable TableBind(string schemaName, string functionName, RecordBatch? args);
+    IBoundTableFunction TableFnBind(string schemaName, string functionName, RecordBatch? args);
 
     /// <summary>
     /// Binds one streaming table-in-out call (Phase 6 exchange path) for every <c>_each</c> form.
     /// <paramref name="args"/> (nullable) is a 1-row batch of the constant "cost" arguments;
     /// <paramref name="inputSchema"/> is the input table's schema. Returns a binding whose
-    /// <see cref="IArrowInOutBinding.OutputSchema"/> is the full output (input echo ++ the function's own
+    /// <see cref="IInOutBinding.OutputSchema"/> is the full output (input echo ++ the function's own
     /// columns) and whose <c>DoExchange</c> streams the transform — a discovered TVF (CROSS APPLY on a
     /// read-only connection), a stored proc (per-row EXEC on DuckDB's pinned write transaction), or a custom
     /// C# in-out. The gate-based exchange operator drives it.
     /// </summary>
-    IArrowInOutBinding InOutBind(string schemaName, string functionName, RecordBatch? args, Schema inputSchema);
+    IInOutBinding InOutBind(string schemaName, string functionName, RecordBatch? args, Schema inputSchema);
 
     /// <summary>
     /// Generates the replacement SQL for one call of a catalog-bound SQL-generating table function

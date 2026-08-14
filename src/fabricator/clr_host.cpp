@@ -1015,7 +1015,7 @@ void GetFunctionOutputSchema(FabricatorHandle handle, const std::string &schema,
 }
 
 // (ExecuteTable / ExecuteProc were removed at ABI v30 — superseded by the table-function session
-//  TableBind / TableExecute / TableClose below.)
+//  TableFnBind / TableFnExecute / TableFnClose below.)
 
 // (The 4g table-in-out push wrappers InOutOpen/InOutPush/InOutFinish/InOutAbort were removed at ABI v31 —
 //  every `_each` form now runs on the streaming exchange: InOutBind/InOutExchangeOpen/InOutBindClose below.)
@@ -1066,47 +1066,47 @@ void InOutBindClose(FabricatorHandle binding) {
 	}
 }
 
-FabricatorHandle TableBind(FabricatorHandle handle, const std::string &schema, const std::string &func,
+FabricatorHandle TableFnBind(FabricatorHandle handle, const std::string &schema, const std::string &func,
                          ArrowArrayStream *args, ArrowArrayStream &out_schema, bool &supports_pushdown) {
 	const FabricatorVTable &vt = GetBridge();
-	if (!vt.table_bind) {
-		throw duckdb::IOException("Fabricator: bridge does not provide table_bind");
+	if (!vt.tablefn_bind) {
+		throw duckdb::IOException("Fabricator: bridge does not provide tablefn_bind");
 	}
 	FabricatorHandle binding = nullptr;
 	int32_t pushdown = 0;
 	char *err = nullptr;
-	int32_t rc = vt.table_bind(handle, schema.c_str(), func.c_str(), args, &out_schema, &pushdown, &binding, &err);
+	int32_t rc = vt.tablefn_bind(handle, schema.c_str(), func.c_str(), args, &out_schema, &pushdown, &binding, &err);
 	if (rc != FABRICATOR_OK) {
-		ThrowManagedError(vt, err, "Fabricator: table_bind failed");
+		ThrowManagedError(vt, err, "Fabricator: tablefn_bind failed");
 	}
 	supports_pushdown = pushdown != 0;
 	return binding;
 }
 
-void TableExecute(FabricatorHandle binding, const std::string &spec_json, ArrowArrayStream *filter_values,
+void TableFnExecute(FabricatorHandle binding, const std::string &spec_json, ArrowArrayStream *filter_values,
                   ArrowArrayStream &out) {
 	const FabricatorVTable &vt = GetBridge();
-	if (!vt.table_execute) {
-		throw duckdb::IOException("Fabricator: bridge does not provide table_execute");
+	if (!vt.tablefn_execute) {
+		throw duckdb::IOException("Fabricator: bridge does not provide tablefn_execute");
 	}
 	char *err = nullptr;
 	const char *spec = spec_json.empty() ? nullptr : spec_json.c_str();
-	int32_t rc = vt.table_execute(binding, spec, filter_values, &out, &err);
+	int32_t rc = vt.tablefn_execute(binding, spec, filter_values, &out, &err);
 	if (rc != FABRICATOR_OK) {
-		ThrowManagedError(vt, err, "Fabricator: table_execute failed");
+		ThrowManagedError(vt, err, "Fabricator: tablefn_execute failed");
 	}
 }
 
-void TableClose(FabricatorHandle binding) {
+void TableFnClose(FabricatorHandle binding) {
 	if (!binding) {
 		return;
 	}
 	const FabricatorVTable &vt = GetBridge();
-	if (!vt.table_close) {
+	if (!vt.tablefn_close) {
 		return;
 	}
 	char *err = nullptr;
-	int32_t rc = vt.table_close(binding, &err);
+	int32_t rc = vt.tablefn_close(binding, &err);
 	if (rc != FABRICATOR_OK) {
 		// Best-effort cleanup; swallow + free the managed error message.
 		if (err && vt.free_error) {

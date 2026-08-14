@@ -1,7 +1,7 @@
 # Parallel partitioned reads (ConnectorX-style) — design idea, DEFERRED
 
 > Status: **design note only — nothing built.** Captures supporting ConnectorX-style `partition_on` /
-> `partition_num` parallel reads in `fabricator_query` + custom `IArrowTableFunction`s. Builds on the existing
+> `partition_num` parallel reads in `fabricator_query` + custom `ITableFunction`s. Builds on the existing
 > arrow scan + the `daxeval` named-parameter pattern. No ABI change for the simple form (A); the full
 > core-utilization form (B) needs a parallel multi-stream scan.
 
@@ -33,7 +33,7 @@ IAsyncEnumerable<IAsyncEnumerable<RecordBatch>> Execute(TableFunctionScan scan, 
 ```
 
 A single-partition function is just the trivial case (one inner). To avoid breaking existing
-`IArrowTableFunction`s, expose this as an **opt-in** (a sibling method / `IArrowPartitionedTableFunction`, or a
+`ITableFunction`s, expose this as an **opt-in** (a sibling method / `IArrowPartitionedTableFunction`, or a
 `Partitions` property) — `StaticTableFunction` / `cf_*` stay on the single-stream `Execute`.
 
 ## Two architectures (A is easy; B is the one that fixes core usage)
@@ -88,7 +88,7 @@ for the ConnectorX-compatible numeric case) generalizes cleanly.
 
 ## Fitting it into `fabricator_query`
 
-`fabricator_query` is the raw-query path (C++ `QueryBind` → C# scan), not an `IArrowTableFunction`. Add two
+`fabricator_query` is the raw-query path (C++ `QueryBind` → C# scan), not an `ITableFunction`. Add two
 **optional NAMED parameters** (the `daxeval` pattern — named ⇒ optional, doesn't break the 2-arg call):
 
 ```sql
@@ -136,7 +136,7 @@ Absent the params → today's single query.
 2. **Form B** (parallel multi-stream scan, N streams → N scan threads) — the one that delivers the
    core-utilization win the `UNION ALL` experience points to. Build it when ingest/pipeline parallelism (not
    just fetch latency) is the bottleneck. It's the larger piece (parallel scan state + per-partition stream
-   marshaling), and it generalizes: a custom `IArrowTableFunction` returning `IAsyncEnumerable<IAsyncEnumerable
+   marshaling), and it generalizes: a custom `ITableFunction` returning `IAsyncEnumerable<IAsyncEnumerable
    <RecordBatch>>` would feed the same N-thread scan.
 
 **Net:** A is a cheap latency win; B is the structural one that makes DuckDB actually use the cores (the

@@ -433,7 +433,7 @@ typedef struct FabricatorVTable {
 	                                      struct ArrowArrayStream *args, struct ArrowSchema *out, char **err);
 
 	// (execute_table / execute_proc were removed at ABI v30 — superseded by the table-function session
-	//  table_bind / table_execute / table_close at the end of this struct.)
+	//  tablefn_bind / tablefn_execute / tablefn_close at the end of this struct.)
 
 	// (The 4g table-in-out PUSH entries inout_open/inout_push/inout_finish/inout_abort were removed at ABI
 	//  v31 — every `_each` form now runs on the streaming exchange below: inout_bind/inout_exchange_open/
@@ -553,9 +553,9 @@ typedef struct FabricatorVTable {
 
 	// -------------------------------------------------------------------------
 	// Table-function session (Phase 5). The session-handle successor to the
-	// stateless execute_table / execute_proc (removed at v30): table_bind resolves
+	// stateless execute_table / execute_proc (removed at v30): tablefn_bind resolves
 	// a per-PLAN binding (output schema + whether it accepts pushdown) once; that
-	// binding is reused by table_execute for each execution (the result stream owns
+	// binding is reused by tablefn_execute for each execution (the result stream owns
 	// its own provider connection, released by the host's arrow scan at teardown —
 	// no separate close). Unifies discovered TVFs (pushdown), stored procs (no
 	// pushdown) and custom C# table functions behind one path; the managed side
@@ -568,15 +568,15 @@ typedef struct FabricatorVTable {
 	// zero-row Arrow stream whose schema = the function's output columns (a custom
 	// function's MAY depend on `args`) — read it for the DuckDB return types, then
 	// release it. *supports_pushdown drives the host's projection mapping — the managed side
-	// calls it IBoundTable.MapResultByName, which is what it has always meant (renamed there
+	// calls it IBoundTableFunction.MapResultByName, which is what it has always meant (renamed there
 	// 2026-08-13; the ABI parameter keeps its name so no rebuild is forced for a spelling).
 	// 1 = map result
 	// columns by NAME — a discovered TVF (pushes the projection + filter into the SELECT)
 	// or a custom function (returns its full result, mapped by name); 0 = a stored proc
 	// (full result, projected positionally + filtered above the scan). *out_binding
-	// receives an opaque binding handle, reused by table_execute across (prepared)
-	// re-executions and freed via table_close.
-	int32_t (*table_bind)(FabricatorHandle handle, const char *schema, const char *func,
+	// receives an opaque binding handle, reused by tablefn_execute across (prepared)
+	// re-executions and freed via tablefn_close.
+	int32_t (*tablefn_bind)(FabricatorHandle handle, const char *schema, const char *func,
 	                      struct ArrowArrayStream *args, struct ArrowArrayStream *out_schema,
 	                      int32_t *supports_pushdown, FabricatorHandle *out_binding, char **err);
 
@@ -586,12 +586,12 @@ typedef struct FabricatorVTable {
 	// re-applies above the scan). *out receives the result rows (its stream owns the
 	// provider connection, released by the host at scan teardown). Called once per
 	// execution; the binding may be executed repeatedly.
-	int32_t (*table_execute)(FabricatorHandle binding, const char *spec_json,
+	int32_t (*tablefn_execute)(FabricatorHandle binding, const char *spec_json,
 	                         struct ArrowArrayStream *filter_values, struct ArrowArrayStream *out, char **err);
 
-	// Release a binding handle from table_bind. Idempotent; safe with nullptr.
+	// Release a binding handle from tablefn_bind. Idempotent; safe with nullptr.
 	// Best-effort (bind-data teardown must not throw).
-	int32_t (*table_close)(FabricatorHandle binding, char **err);
+	int32_t (*tablefn_close)(FabricatorHandle binding, char **err);
 
 	// -------------------------------------------------------------------------
 	// Provider-declared settings (Phase: settings refactor; see docs/settings-architecture.md).
@@ -660,7 +660,7 @@ typedef struct FabricatorVTable {
 
 	// (delta_schema / delta_scan were removed at ABI v47 — the Delta reader is now a connection-free GLOBAL
 	//  host-FS table function (kind='table' enumerated by list_global_functions), dispatched through the v29
-	//  table-session path (table_bind / table_execute) with the active host-FS opener set via set_active_opener
+	//  table-session path (tablefn_bind / tablefn_execute) with the active host-FS opener set via set_active_opener
 	//  below. So a managed lakehouse reader needs NO bespoke C++/ABI — see docs/global-functions.md §host-FS.)
 
 	// -------------------------------------------------------------------------
@@ -690,8 +690,8 @@ typedef struct FabricatorVTable {
 	// Active host-FS opener (for connection-free GLOBAL host-FS table functions — lakehouse readers like
 	// Delta/Iceberg). A global host-FS table reader does its IO through DuckDB's FileSystem (the
 	// FabricatorHostServices fs_* callbacks), which needs the calling operator's FileOpener/ClientContext to
-	// resolve DuckDB secrets (az://, s3://, …). That context isn't an argument of the generic table_bind /
-	// table_execute path, so — mirroring set_active_txn — the host records it in a per-thread ambient
+	// resolve DuckDB secrets (az://, s3://, …). That context isn't an argument of the generic tablefn_bind /
+	// tablefn_execute path, so — mirroring set_active_txn — the host records it in a per-thread ambient
 	// IMMEDIATELY before each table-function bind + execution (same thread, synchronous), and the managed
 	// host-FS binding reads it. `opener` is the operator's ClientContext (reinterpret_cast to a handle), valid
 	// only for the duration of the call it precedes; NULL clears it. SQL/compute table functions ignore it.

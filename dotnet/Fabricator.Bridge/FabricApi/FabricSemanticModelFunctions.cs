@@ -65,7 +65,7 @@ internal sealed class FabricSemanticModelsFunction : ICatalogTableFunction
     public Schema NamedParameters { get; } =
         new Schema(new[] { FabricApiFunctions.Str("workspace") }, null);
 
-    public IArrowTableFunctionBinding Bind(RecordBatch args) => new Binding(_api, FabricArgs.Str(args, 0));
+    public ITableFunctionBinding Bind(RecordBatch args) => new Binding(_api, FabricArgs.Str(args, 0));
 
     private sealed class Binding : FabricTableBinding
     {
@@ -162,7 +162,7 @@ internal sealed class FabricRefreshSemanticModelFunction : ICatalogTableFunction
         FabricApiFunctions.Str("workspace"),
     }, null);
 
-    public IArrowTableFunctionBinding Bind(RecordBatch args) => new Binding(_api, args);
+    public ITableFunctionBinding Bind(RecordBatch args) => new Binding(_api, args);
 
     private sealed class Binding : FabricTableBinding
     {
@@ -296,7 +296,7 @@ internal sealed class FabricSemanticModelRefreshesFunction : ICatalogTableFuncti
         FabricApiFunctions.Str("workspace"),
     }, null);
 
-    public IArrowTableFunctionBinding Bind(RecordBatch args) =>
+    public ITableFunctionBinding Bind(RecordBatch args) =>
         new Binding(_api, FabricArgs.Str(args, 0), FabricArgs.Int(args, 1), FabricArgs.Str(args, 2));
 
     private sealed class Binding : FabricTableBinding

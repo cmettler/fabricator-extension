@@ -792,7 +792,7 @@ static string BuildScanSpec(const ArrowStreamBindData &bind_data, const vector<c
 
 // Materializes the filter constants as a one-row Arrow batch (column i == value i),
 // so the provider can build a parameterized WHERE with exact types. The returned producer must outlive the
-// CONSUMER's use of the stream, which outlasts the scan_table/table_execute call: the managed side may hold
+// CONSUMER's use of the stream, which outlasts the scan_table/tablefn_execute call: the managed side may hold
 // the imported stream and release it lazily (see ArrowStreamGlobalState::filter_value_producer). Callers must
 // therefore keep it for the whole scan — never as a local scoped to the factory call.
 static unique_ptr<fabricator::ArrowProducer> BuildFilterValues(ClientContext &context, const vector<Value> &consts) {

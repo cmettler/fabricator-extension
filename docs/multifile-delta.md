@@ -78,7 +78,7 @@
 > follow-up slices actually landed — so DVs, partition columns, column mapping and schema evolution are all
 > applied, and it is a genuine counterpart to `fabricator_delta_scan` rather than a spike. Gate:
 > `verify_delta_native_scan.test` 36 → **59**, mutation-tested (restoring the old query survives 44
-> assertions and dies at the DV one). ⚠ Neither function pushes the PROJECTION — `BindingBoundTable`
+> assertions and dies at the DV one). ⚠ Neither function pushes the PROJECTION — `BindingBoundTableFunction`
 > declares the binding's full `OutputSchema` at bind, so a projected subset would mismatch it.
 >
 > **Phase-A pre-spike DONE (2026-07-03):** `fabricator_delta_native_scan(path)` — engineered-wood lists the EXACT

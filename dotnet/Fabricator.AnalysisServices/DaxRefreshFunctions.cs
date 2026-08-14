@@ -213,10 +213,10 @@ internal abstract class DaxRefreshBase : ICatalogTableFunction
         new Field("duration_ms", Int64Type.Default, nullable: true),
     }, null);
 
-    public IArrowTableFunctionBinding Bind(RecordBatch args)
+    public ITableFunctionBinding Bind(RecordBatch args)
     {
         // Extract every declared argument WHILE THE BATCH IS VALID: the host disposes the stream it was
-        // imported from when table_bind returns, so a binding holding the batch would read freed buffers.
+        // imported from when tablefn_bind returns, so a binding holding the batch would read freed buffers.
         int n = Parameters.FieldsList.Count + NamedParameters.FieldsList.Count;
         var values = new string?[n];
         for (int i = 0; i < n; i++)
@@ -244,7 +244,7 @@ internal abstract class DaxRefreshBase : ICatalogTableFunction
         };
     }
 
-    private sealed class Binding : IArrowTableFunctionBinding
+    private sealed class Binding : ITableFunctionBinding
     {
         private readonly DaxRefreshBase _fn;
         private readonly string?[] _args;

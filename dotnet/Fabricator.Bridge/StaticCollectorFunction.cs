@@ -42,9 +42,9 @@ public abstract class StaticCollectorFunction : ICatalogCollectorTableFunction
     public abstract IAsyncEnumerable<RecordBatch> Collect(
         IAsyncEnumerable<RecordBatch> allInput, CancellationToken ct = default);
 
-    public IArrowCollectorBinding Bind(RecordBatch? args, Schema inputSchema) => new Binding(this);
+    public ICollectorBinding Bind(RecordBatch? args, Schema inputSchema) => new Binding(this);
 
-    private sealed class Binding : IArrowCollectorBinding
+    private sealed class Binding : ICollectorBinding
     {
         private readonly StaticCollectorFunction _fn;
 

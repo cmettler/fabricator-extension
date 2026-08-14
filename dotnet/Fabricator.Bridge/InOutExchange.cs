@@ -5,7 +5,7 @@ using Apache.Arrow.Types;
 namespace Fabricator.Bridge;
 
 /// <summary>
-/// The framework "pump": exposes an <see cref="IArrowInOutBinding"/>'s <c>DoExchange</c> as a pull-based Arrow
+/// The framework "pump": exposes an <see cref="IInOutBinding"/>'s <c>DoExchange</c> as a pull-based Arrow
 /// output stream for the C++ exchange operator. The host pulls this stream synchronously (the Arrow C-stream
 /// exporter blocks on <see cref="ReadNextRecordBatchAsync"/>); each pull drives <c>DoExchange</c> one step. The
 /// input stream is the host-exported input (one chunk per gate tenure, null at EOF), wrapped as an
@@ -13,12 +13,12 @@ namespace Fabricator.Bridge;
 /// </summary>
 internal sealed class InOutExchangeStream : IArrowArrayStream
 {
-    private readonly IArrowInOutBinding _binding;
+    private readonly IInOutBinding _binding;
     private readonly IArrowArrayStream _input;   // imported from C++; owned + released here
     private readonly IAsyncEnumerator<RecordBatch> _out;
     private bool _disposed;
 
-    public InOutExchangeStream(IArrowInOutBinding binding, IArrowArrayStream input)
+    public InOutExchangeStream(IInOutBinding binding, IArrowArrayStream input)
     {
         // The SQL isolation (if any) was already resolved + set on the binding at bind time (InOutBind), so
         // there is nothing isolation-related to do here. See docs/provider-extensibility.md §3.

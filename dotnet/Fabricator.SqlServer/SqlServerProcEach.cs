@@ -26,7 +26,7 @@ namespace Fabricator.SqlServer;
 // result-set columns; the echo is produced server-side (INSERT the proc's result set into a table variable,
 // then SELECT the input values + the captured rows). Result-set procs only -- an OUTPUT-param-only proc errors.
 // A top-level internal class (like SqlServerTvfEach), holding a SqlServerCatalog and reaching its internals.
-internal sealed class SqlServerProcEach : IArrowInOutBinding
+internal sealed class SqlServerProcEach : IInOutBinding
 {
     private readonly SqlServerCatalog _owner;
     private readonly string _qualified;        // [schema].[proc]

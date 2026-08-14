@@ -283,9 +283,9 @@ internal sealed class CfMedianFunction : ICatalogAggregateFunction
     public string Name => "cf_median";
     public Schema Parameters => new(new[] { new Field("x", DoubleType.Default, nullable: true) }, metadata: null);
     public Field Result => new("median", DoubleType.Default, nullable: true);
-    public IArrowAggregateState CreateState() => new State();
+    public IAggregateState CreateState() => new State();
 
-    private sealed class State : IArrowAggregateState
+    private sealed class State : IAggregateState
     {
         private readonly List<double> _values = new();
 
@@ -302,7 +302,7 @@ internal sealed class CfMedianFunction : ICatalogAggregateFunction
         }
 
         // Combine for a holistic aggregate = merge the collections (NOT an arithmetic fold).
-        public void Combine(IArrowAggregateState source) => _values.AddRange(((State)source)._values);
+        public void Combine(IAggregateState source) => _values.AddRange(((State)source)._values);
 
         public object? Finalize()
         {
@@ -327,9 +327,9 @@ internal sealed class CfProductFunction : ICatalogAggregateFunction
     public string Name => "cf_product";
     public Schema Parameters => new(new[] { new Field("x", Int64Type.Default, nullable: true) }, metadata: null);
     public Field Result => new("product", Int64Type.Default, nullable: true);
-    public IArrowAggregateState CreateState() => new State();
+    public IAggregateState CreateState() => new State();
 
-    private sealed class State : IArrowAggregateState
+    private sealed class State : IAggregateState
     {
         private bool _any;
         private long _product = 1;
@@ -348,7 +348,7 @@ internal sealed class CfProductFunction : ICatalogAggregateFunction
             }
         }
 
-        public void Combine(IArrowAggregateState source)
+        public void Combine(IAggregateState source)
         {
             var s = (State)source;
             if (s._any)
@@ -370,9 +370,9 @@ internal sealed class CfBitOrFunction : ICatalogAggregateFunction
     public string Name => "cf_bit_or";
     public Schema Parameters => new(new[] { new Field("x", Int64Type.Default, nullable: true) }, metadata: null);
     public Field Result => new("bit_or", Int64Type.Default, nullable: true);
-    public IArrowAggregateState CreateState() => new State();
+    public IAggregateState CreateState() => new State();
 
-    private sealed class State : IArrowAggregateState
+    private sealed class State : IAggregateState
     {
         private bool _any;
         private long _acc;
@@ -391,7 +391,7 @@ internal sealed class CfBitOrFunction : ICatalogAggregateFunction
             }
         }
 
-        public void Combine(IArrowAggregateState source)
+        public void Combine(IAggregateState source)
         {
             var s = (State)source;
             if (s._any)
@@ -416,9 +416,9 @@ internal sealed class CfSumSpillFunction : ICatalogAggregateFunction
     public Schema Parameters => new(new[] { new Field("x", Int64Type.Default, nullable: true) }, metadata: null);
     public Field Result => new("sum", Int64Type.Default, nullable: true);
     public bool SupportsSpill => true;
-    public IArrowAggregateState CreateState() => new State();
+    public IAggregateState CreateState() => new State();
 
-    private sealed class State : IArrowAggregateState
+    private sealed class State : IAggregateState
     {
         private bool _any;
         private long _sum;
@@ -437,7 +437,7 @@ internal sealed class CfSumSpillFunction : ICatalogAggregateFunction
             }
         }
 
-        public void Combine(IArrowAggregateState source)
+        public void Combine(IAggregateState source)
         {
             var s = (State)source;
             if (s._any)
@@ -657,14 +657,14 @@ internal sealed class CfColumnsFunction : ICatalogTableFunction
     public string Name => "cf_columns";
     public Schema Parameters => new(new[] { new Field("n", Int32Type.Default, nullable: true) }, metadata: null);
 
-    public IArrowTableFunctionBinding Bind(RecordBatch args)
+    public ITableFunctionBinding Bind(RecordBatch args)
     {
         var a = (Int32Array)args.Column(0);
         int n = args.Length > 0 && !a.IsNull(0) ? a.Values[0] : 0;
         return new Binding(n);
     }
 
-    private sealed class Binding : IArrowTableFunctionBinding
+    private sealed class Binding : ITableFunctionBinding
     {
         private readonly int _n;
         public Binding(int n)
@@ -904,9 +904,9 @@ internal sealed class GfTagFunction : IInOutFunction
     {
         Params.TableInput("input", new Field("n", Int32Type.Default, nullable: true)),
     }, metadata: null);
-    public IArrowInOutBinding Bind(RecordBatch? args, Schema inputSchema) => new Binding();
+    public IInOutBinding Bind(RecordBatch? args, Schema inputSchema) => new Binding();
 
-    private sealed class Binding : IArrowInOutBinding
+    private sealed class Binding : IInOutBinding
     {
         public Schema OutputSchema => new(new[]
         {
@@ -962,7 +962,7 @@ internal sealed class GfMixFunction : IInOutFunction
         Params.Named("bias", Int32Type.Default),
     }, metadata: null);
 
-    public IArrowInOutBinding Bind(RecordBatch? args, Schema inputSchema)
+    public IInOutBinding Bind(RecordBatch? args, Schema inputSchema)
     {
         // Read BY POSITION over the declared order, skipping the table input (it carries no value). An
         // omitted named argument arrives as a typed NULL, which is the documented "omitted == explicit NULL".
@@ -985,7 +985,7 @@ internal sealed class GfMixFunction : IInOutFunction
         return null;
     }
 
-    private sealed class Binding : IArrowInOutBinding
+    private sealed class Binding : IInOutBinding
     {
         private readonly int _factor;
         private readonly int _offset;
@@ -1036,9 +1036,9 @@ internal sealed class GfCollectSumFunction : ICollectorTableFunction
     {
         Params.TableInput("input", new Field("n", Int32Type.Default, nullable: true)),
     }, metadata: null);
-    public IArrowCollectorBinding Bind(RecordBatch? args, Schema inputSchema) => new Binding();
+    public ICollectorBinding Bind(RecordBatch? args, Schema inputSchema) => new Binding();
 
-    private sealed class Binding : IArrowCollectorBinding
+    private sealed class Binding : ICollectorBinding
     {
         public Schema OutputSchema => new(new[]
         {
@@ -1265,7 +1265,7 @@ internal sealed class GfSqlSeqFunction : ISqlTableFunction
 
 // GLOBAL table (connection-free): fabricator_seq(n) -> rows (value, squared) for value = 1..n, no ATTACH.
 // Fixed output schema. Implements the base ITableFunction (no SchemaName); registered at load on the v29
-// table-session path (handle-0 table_bind). See docs/global-functions.md.
+// table-session path (handle-0 tablefn_bind). See docs/global-functions.md.
 internal sealed class GfSeqFunction : ITableFunction
 {
     // The canonical signature: ONE schema, each field flagged with its style. Explicit so this class
@@ -1288,7 +1288,7 @@ internal sealed class GfSeqFunction : ITableFunction
     public Schema NamedParameters =>
         new(new[] { new Field("start", Int32Type.Default, nullable: true) }, metadata: null);
 
-    public IArrowTableFunctionBinding Bind(RecordBatch args)
+    public ITableFunctionBinding Bind(RecordBatch args)
     {
         var a = (Int32Array)args.Column(0);
         int n = args.Length > 0 && !a.IsNull(0) ? a.Values[0] : 0;
@@ -1301,7 +1301,7 @@ internal sealed class GfSeqFunction : ITableFunction
         return new Binding(n, start);
     }
 
-    private sealed class Binding : IArrowTableFunctionBinding
+    private sealed class Binding : ITableFunctionBinding
     {
         private readonly int _n;
         private readonly int _start;
@@ -1350,21 +1350,21 @@ internal sealed class GfSeqFunction : ITableFunction
 
 // GLOBAL table with ARG-DEPENDENT output schema (connection-free): fabricator_columns(n) -> a single row with n
 // INT columns c1..cn (c_i = i). The output COLUMN SET depends on the constant arg n — resolved at bind via the
-// handle-0 table_bind (the v29 session), proving arg-dependent global table schemas. No ATTACH. The global
+// handle-0 tablefn_bind (the v29 session), proving arg-dependent global table schemas. No ATTACH. The global
 // analog of cf_columns.
 internal sealed class GfColumnsFunction : ITableFunction
 {
     public string Name => "fabricator_columns";
     public Schema Parameters => new(new[] { new Field("n", Int32Type.Default, nullable: true) }, metadata: null);
 
-    public IArrowTableFunctionBinding Bind(RecordBatch args)
+    public ITableFunctionBinding Bind(RecordBatch args)
     {
         var a = (Int32Array)args.Column(0);
         int n = args.Length > 0 && !a.IsNull(0) ? a.Values[0] : 0;
         return new Binding(n);
     }
 
-    private sealed class Binding : IArrowTableFunctionBinding
+    private sealed class Binding : ITableFunctionBinding
     {
         private readonly int _n;
         public Binding(int n)
@@ -1407,9 +1407,9 @@ internal sealed class GfProductFunction : IAggregateFunction
     public string Name => "fabricator_product";
     public Schema Parameters => new(new[] { new Field("x", Int64Type.Default, nullable: true) }, metadata: null);
     public Field Result => new("product", Int64Type.Default, nullable: true);
-    public IArrowAggregateState CreateState() => new State();
+    public IAggregateState CreateState() => new State();
 
-    private sealed class State : IArrowAggregateState
+    private sealed class State : IAggregateState
     {
         private bool _any;
         private long _product = 1;
@@ -1425,7 +1425,7 @@ internal sealed class GfProductFunction : IAggregateFunction
             }
         }
 
-        public void Combine(IArrowAggregateState source)
+        public void Combine(IAggregateState source)
         {
             var s = (State)source;
             if (s._any) { _product *= s._product; _any = true; }

@@ -76,9 +76,9 @@ internal sealed class SqlServerSessionTagFunction : ICatalogTableFunction
         new Field("tag_value", StringType.Default, nullable: true),
     }, null);
 
-    public IArrowTableFunctionBinding Bind(RecordBatch args)
+    public ITableFunctionBinding Bind(RecordBatch args)
     {
-        // Read the arguments HERE: the stream they were imported from is disposed when table_bind returns, so a
+        // Read the arguments HERE: the stream they were imported from is disposed when tablefn_bind returns, so a
         // binding that kept the batch would read freed Arrow buffers at execution time.
         var key = Arg(args, 0);
         var value = Arg(args, 1);
@@ -113,7 +113,7 @@ internal sealed class SqlServerSessionTagFunction : ICatalogTableFunction
             ? null
             : ArrowValueReader.ReadScalar(args.Column(col), 0)?.ToString();
 
-    private sealed class Binding : IArrowTableFunctionBinding
+    private sealed class Binding : ITableFunctionBinding
     {
         private readonly SqlServerCatalog _catalog;
         private readonly string _key;

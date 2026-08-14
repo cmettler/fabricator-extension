@@ -10,10 +10,10 @@
 > `kind`. Reuses the v28 exchange ABI verbatim (no bump).
 >
 > **As-built notes** (where the build refined the sketch below):
-> - **C# author API** (`Fabricator.Bridge`): `IArrowCollectorTableFunction` (`SchemaName`/`Name`/`Parameters`/
->   `Bind(args, inputSchema)`) + `IArrowCollectorBinding` (`OutputSchema` + `Collect(allInput, ct)`), plus a
+> - **C# author API** (`Fabricator.Bridge`): `ICollectorTableFunction` (`SchemaName`/`Name`/`Parameters`/
+>   `Bind(args, inputSchema)`) + `ICollectorBinding` (`OutputSchema` + `Collect(allInput, ct)`), plus a
 >   `StaticCollectorFunction` fixed-schema base. A public `CollectorInOutBinding` adapter wraps an
->   `IArrowCollectorBinding` as an `IArrowInOutBinding` (`DoExchange = Collect`) so it flows through the existing
+>   `ICollectorBinding` as an `IInOutBinding` (`DoExchange = Collect`) so it flows through the existing
 >   `inout_bind`/`inout_exchange_open` marshaling + `InOutExchangeStream` pump **with no ABI change**. Registry
 >   `CustomCollector`; `InOutBind` checks it first; `FunctionsMetadataSql` emits `kind='collector'`.
 > - **C++** (`fabricator_schema_entry.cpp`): a dedicated `FabricatorCollector*` operator — the in-out `Execute`
@@ -35,7 +35,7 @@
 
 ## Motivation
 
-The streaming exchange (`IArrowInOutFunction.DoExchange`) emits output **interleaved** with input, per chunk,
+The streaming exchange (`IInOutFunction.DoExchange`) emits output **interleaved** with input, per chunk,
 under a single-slot gate. That is correct for high-fan-out (`_each`) functions but **cannot express a
 whole-table transform** — one whose output depends on having seen *all* input rows (inject the full input as a
 DAX `DATATABLE`, a lookup/dimension table, sort/dedup the whole input, collect TMDL fragments and apply once).
@@ -94,14 +94,14 @@ is the correct "all input done" signal — which is exactly what the Sink+Source
 ## Scope of the build
 
 **New:**
-- **C# `IArrowCollectorTableFunction`** + its binding:
+- **C# `ICollectorTableFunction`** + its binding:
   ```csharp
-  public interface IArrowCollectorTableFunction {
+  public interface ICollectorTableFunction {
       string SchemaName { get; } string Name { get; }
       Schema Parameters { get; }                                   // CONSTANT (non-table) "cost" args
-      IArrowCollectorBinding Bind(RecordBatch args, Schema inputSchema);
+      ICollectorBinding Bind(RecordBatch args, Schema inputSchema);
   }
-  public interface IArrowCollectorBinding : IDisposable {
+  public interface ICollectorBinding : IDisposable {
       Schema OutputSchema { get; }                                 // MAY depend on args AND inputSchema
       // allInput yields EVERY input batch (Sink drains the child fully); ends at real input EOF.
       // The returned enumerable is the FULL output (Source phase). No sentinel — input EOF and
@@ -109,7 +109,7 @@ is the correct "all input done" signal — which is exactly what the Sink+Source
       IAsyncEnumerable<RecordBatch> Collect(IAsyncEnumerable<RecordBatch> allInput, CancellationToken ct = default);
   }
   ```
-  A `StaticCollectorFunction` base (fixed `OutputSchema`) keeps simple cases one-liners. `IArrowInOutIsolation`
+  A `StaticCollectorFunction` base (fixed `OutputSchema`) keeps simple cases one-liners. `IInOutIsolation`
   still applies for SQL-backed collectors (one read txn at the configured level).
 - **A new C++ Sink+Source operator** (the pipeline breaker): Sink buffers all input chunks (pushed into the
   exchange input slot), the single sink-level `Finalize` flips to source mode, Source `GetData` emits the
@@ -119,7 +119,7 @@ is the correct "all input done" signal — which is exactly what the Sink+Source
 - **`kind='collector'`** discovery tag → routes registration to the new operator (additive, no bump).
 
 **Untouched:**
-- The entire streaming `DoExchange` path — `IArrowInOutFunction`/`IArrowInOutBinding`, the gate, the per-chunk
+- The entire streaming `DoExchange` path — `IInOutFunction`/`IInOutBinding`, the gate, the per-chunk
   sentinel, the `FabricatorExchange*` operator. The two modes coexist, selected by `kind`.
 
 **Reused AS-IS — no new ABI:**
@@ -169,12 +169,12 @@ spill in C# (out of scope; the streaming exchange is the input-bounded path by d
 
 ## Build (done)
 
-1. C# `IArrowCollectorTableFunction`/`IArrowCollectorBinding` + `StaticCollectorFunction`; classified in
+1. C# `ICollectorTableFunction`/`ICollectorBinding` + `StaticCollectorFunction`; classified in
    `InOutBind`; demo `cf_collect` (no SQL object). **DONE.**
 2. C++ Sink+Source operator; `kind='collector'` registration routed to it (additive `kind`, no ABI bump). **DONE.**
 3. Reuse `inout_bind`/`inout_exchange_open`/`inout_bind_close` verbatim. **DONE.**
 4. **Migrated `daxevaltable` to the collector** (dropped its single-chunk cap). **DONE** — `daxevaltable` is now
-   `kind='collector'`, `DaxEvalTableBinding : IArrowCollectorBinding` reads the whole input into one DATATABLE
+   `kind='collector'`, `DaxEvalTableBinding : ICollectorBinding` reads the whole input into one DATATABLE
    and evaluates once; validated live against Power BI Desktop with a 5000-row injected table (was capped at
    2048). `daxeach` stays a streaming `kind='inout'` (per-row).
 5. Tests: `verify_collector.test` (40 — whole-table total, 5000-row multi-chunk, **sequential-UNION at
@@ -186,4 +186,4 @@ spill in C# (out of scope; the streaming exchange is the input-bounded path by d
 The collector scaffold is now reusable for other whole-table needs as they arise: a sort/dedup-the-input
 function, or the **`apply_tmdl_agg`-style** table-valued collector (collect TMDL fragments → one atomic apply at
 Finalize, the effect-once safety this shape gives). Build those when motivated — each is a new
-`IArrowCollectorTableFunction` (or DAX/SqlServer binding), no C++/ABI change.
+`ICollectorTableFunction` (or DAX/SqlServer binding), no C++/ABI change.

@@ -45,7 +45,7 @@ internal sealed class DeltaCatalogInfoFunction : ICatalogTableFunction
 
     // Position 0 is the first NamedParameters field (Parameters is empty here); an omitted named argument
     // arrives as NULL.
-    public IArrowTableFunctionBinding Bind(RecordBatch args) =>
+    public ITableFunctionBinding Bind(RecordBatch args) =>
         new Binding(_facts, FabricArgs.Str(args, 0));
 
     private sealed class Binding : FabricTableBinding

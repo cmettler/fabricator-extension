@@ -424,8 +424,8 @@ aggregates do not use the `IArrowFunction` scalar/table contract.)
 Implemented option (b). The sketch above was largely right (handle-in-blob, scattered grouped `update`); the
 concrete build settled these points:
 
-- **C# authoring** = `IArrowAggregateFunction` (`SchemaName`/`Name`/`Parameters`/`Result`/`CreateState()`) +
-  `IArrowAggregateState` (`Update(RecordBatch)` / `Combine(IArrowAggregateState source)` /
+- **C# authoring** = `IAggregateFunction` (`SchemaName`/`Name`/`Parameters`/`Result`/`CreateState()`) +
+  `IAggregateState` (`Update(RecordBatch)` / `Combine(IAggregateState source)` /
   **`object? Finalize()`** — a boxed scalar, null = SQL NULL; the session builds the typed result column). Demos:
   `dbo.cf_product`, `dbo.cf_bit_or`. Always provider-authored (no SQL Server aggregate to discover); surfaced via
   the custom-function metadata `UNION ALL` as `kind='aggregate'` → C++ `AddAggregateFunction` → an
@@ -456,9 +456,9 @@ concrete build settled these points:
   marshaled bridge, so it's deliberately omitted. Because the window paths churn many transient states, the
   **destructor IS wired** (`agg_destroy`) to bound the C# map (the GROUP-BY-only design could have skipped it).
 
-- **Disk-spill is opt-in per aggregate** (`IArrowAggregateFunction.SupportsSpill`, ABI v26). The default
+- **Disk-spill is opt-in per aggregate** (`IAggregateFunction.SupportsSpill`, ABI v26). The default
   (fast) mode keeps the live accumulator in C# behind an id — bounded by managed memory, no spill. Setting
-  `SupportsSpill=true` (+ `IArrowAggregateState.Serialize()`/`Load()`) switches to **bytes-in-blob mode**: the
+  `SupportsSpill=true` (+ `IAggregateState.Serialize()`/`Load()`) switches to **bytes-in-blob mode**: the
   per-group state is serialized into DuckDB's fixed, pointer-free state blob
   (`[uint32 len][byte data[FABRICATOR_AGG_SPILL_CAP = 1 KB]]`), so DuckDB's external GROUP BY spills it to disk
   under memory pressure. The cost is (de)serialization on every update/combine/finalize, and a 1 KB cap on the
@@ -678,12 +678,12 @@ discovered `kind='table'` (procs excluded — per-row procs are a later layer), 
 discoverable. A *real* SQL Server function literally named `…_each` shadows the alias (the real name is
 matched first). The in-out bind's `function_info.func` is the **base** TVF name (the CROSS APPLY target).
 
-**Custom C#-authored table-in-out — DONE.** *(Reworked in Phase 6 → now `IArrowInOutFunction`, or the
+**Custom C#-authored table-in-out — DONE.** *(Reworked in Phase 6 → now `IInOutFunction`, or the
 `StaticInOutFunction` convenience base, on the gate-based streaming exchange; the author writes `DoExchange`
-(yielding a per-input sentinel), not `Process`/`Finish`, and there is one `IArrowInOutFunction` registry. See
+(yielding a per-input sentinel), not `Process`/`Finish`, and there is one `IInOutFunction` registry. See
 CLAUDE.md "Streaming table-in-out exchange (Phase 6)". The original 4g push design is recorded below.)*
 Original (push) design (`IArrowTableInOutFunction`, the in-out analog of 4e
-`ICatalogScalarFunction` / 4f `IArrowTableFunction`): a pure-C# in-out (streaming transform / running aggregate
+`ICatalogScalarFunction` / 4f `ITableFunction`): a pure-C# in-out (streaming transform / running aggregate
 / whole-table summary) authored in the provider, dispatched through the *same* session machinery as the TVF
 CROSS APPLY. `Process(chunk)`/`Finish()` are invoked serially per session (no locking needed), and the
 function declares its **full** output schema (no input echo, unlike `_each`). Surfaced as `kind='inout'`;

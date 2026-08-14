@@ -44,11 +44,11 @@ public abstract class StaticInOutFunction : ICatalogInOutFunction
     public abstract IAsyncEnumerable<RecordBatch> DoExchange(
         IAsyncEnumerable<RecordBatch> input, CancellationToken ct = default);
 
-    public IArrowInOutBinding Bind(RecordBatch? args, Schema inputSchema) => new Binding(this);
+    public IInOutBinding Bind(RecordBatch? args, Schema inputSchema) => new Binding(this);
 
     // Thin per-call binding: a fixed output schema + forwards DoExchange to the function (a fresh enumerator
     // per exchange). The function holds no per-exchange state, so it is safely reused across re-executions.
-    private sealed class Binding : IArrowInOutBinding
+    private sealed class Binding : IInOutBinding
     {
         private readonly StaticInOutFunction _fn;
 

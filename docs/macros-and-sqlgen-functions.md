@@ -325,7 +325,7 @@ Consequences that make this attractive for fabricator:
   native DuckDB plan over whatever the SQL references — including our own catalog scans, which then
   receive the full existing pushdown machinery (projection/filter/TopN into SQL Server, Delta file
   + row-group pruning, parallelism, join reordering). This is the structural advantage over the
-  v29 table session (`table_bind`/`table_execute`), where results stream through C# as an opaque
+  v29 table session (`tablefn_bind`/`tablefn_execute`), where results stream through C# as an opaque
   Arrow source.
 - **Arg-dependent output schemas are free.** The schema falls out of binding the generated SQL — C#
   declares no output schema at all (contrast `ITableFunction.Bind`'s `OutputSchema`).

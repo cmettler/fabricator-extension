@@ -6,7 +6,7 @@ namespace Fabricator.Bridge;
 /// Delta/Iceberg/…) to resolve DuckDB secrets while reading through the host <c>FileSystem</c> callbacks
 /// (<see cref="HostFs"/>). az://, s3://, https:// + DuckDB secrets all resolve off this opener.
 ///
-/// The generic table-function path (<c>table_bind</c> / <c>table_execute</c>) carries no <c>ClientContext</c>
+/// The generic table-function path (<c>tablefn_bind</c> / <c>tablefn_execute</c>) carries no <c>ClientContext</c>
 /// argument (SQL/compute functions don't need one), so — mirroring <see cref="AmbientTransaction"/> — the host
 /// records the opener via the <c>set_active_opener</c> ABI entry IMMEDIATELY before each table-function bind +
 /// execution, on the SAME thread (the calls are synchronous). The host-FS binding reads it in

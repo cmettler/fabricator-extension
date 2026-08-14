@@ -634,13 +634,13 @@ internal sealed class DaxCatalog : IBackendCatalog
                ?? throw NoFunction(schemaName, functionName);
     }
 
-    public IBoundTable TableBind(string schemaName, string functionName, RecordBatch? args)
+    public IBoundTableFunction TableFnBind(string schemaName, string functionName, RecordBatch? args)
     {
         if (IsDaxEval(functionName))
         {
-            return new DaxEvalBoundTable(this, DaxEvalExpression(args), DaxParams(args));
+            return new DaxEvalBoundTableFunction(this, DaxEvalExpression(args), DaxParams(args));
         }
-        return Functions.TableBind(schemaName, functionName, args)
+        return Functions.TableFnBind(schemaName, functionName, args)
                ?? throw NoFunction(schemaName, functionName);
     }
 
@@ -658,13 +658,13 @@ internal sealed class DaxCatalog : IBackendCatalog
     private static NotSupportedException NoFunction(string schema, string func) =>
         new($"dax provider: no catalog function '{schema}.{func}'.");
 
-    public IArrowInOutBinding InOutBind(string schemaName, string functionName, RecordBatch? args, Schema inputSchema)
+    public IInOutBinding InOutBind(string schemaName, string functionName, RecordBatch? args, Schema inputSchema)
     {
         // args carries the named "expression" param (1-row, column 0); inputSchema = the input table.
         if (IsDaxEvalTable(functionName))
         {
             // daxevaltable is a COLLECTOR (registered kind='collector'): the C++ Sink+Source operator buffers
-            // ALL input then calls inout_exchange_open once. Wrap the collector binding as an IArrowInOutBinding
+            // ALL input then calls inout_exchange_open once. Wrap the collector binding as an IInOutBinding
             // (CollectorInOutBinding adapter) so it flows through the shared exchange marshaling. No single-chunk
             // cap — DaxEvalTableBinding now reads the whole input into one DATATABLE.
             return new CollectorInOutBinding(new DaxEvalTableBinding(this, DaxEvalExpression(args), inputSchema));
@@ -680,13 +680,13 @@ internal sealed class DaxCatalog : IBackendCatalog
     /// <summary>A bound <c>daxeval(expression)</c> call: the output schema is resolved once (at bind, via a
     /// row-less GetSchemaTable probe), and each <see cref="Execute"/> re-runs the DAX and streams the result.
     /// No pushdown (an arbitrary DAX query can't be wrapped) — DuckDB projects/filters above the scan.</summary>
-    private sealed class DaxEvalBoundTable : IBoundTable
+    private sealed class DaxEvalBoundTableFunction : IBoundTableFunction
     {
         private readonly DaxCatalog _catalog;
         private readonly string _dax;
         private readonly IReadOnlyList<KeyValuePair<string, object?>> _params;
 
-        public DaxEvalBoundTable(DaxCatalog catalog, string dax,
+        public DaxEvalBoundTableFunction(DaxCatalog catalog, string dax,
                                  IReadOnlyList<KeyValuePair<string, object?>> daxParams)
         {
             _catalog = catalog;
@@ -696,7 +696,7 @@ internal sealed class DaxCatalog : IBackendCatalog
         }
 
         public Schema OutputSchema { get; }
-        // IBoundTable, not a binding: this is the host's projection MAPPING. False = map positionally, which
+        // IBoundTableFunction, not a binding: this is the host's projection MAPPING. False = map positionally, which
         // is right here — daxeval returns whatever columns the DAX query produced, so there is no declared
         // schema to match names against.
         public bool MapResultByName => false;

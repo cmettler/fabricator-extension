@@ -3,7 +3,7 @@
 > Status: **BUILT + verified for ALL FIVE kinds** — global **scalar** (ABI v46 `list_global_functions` +
 > handle-0 dispatch; `fabricator_render`, Fluid/Liquid), **in-out + collector** (`fabricator_tag` +
 > `fabricator_collect_sum`, handle-0 `inout_bind`), **table** (`fabricator_seq` fixed + `fabricator_columns`
-> ARG-DEPENDENT schema, handle-0 `table_bind` / v29 session), AND **aggregate** (`fabricator_product`, handle-0
+> ARG-DEPENDENT schema, handle-0 `tablefn_bind` / v29 session), AND **aggregate** (`fabricator_product`, handle-0
 > `agg_open`; GROUP BY / parallel / OVER all work). All resolve as a bare `fn(...)` with NO ATTACH —
 > `test/verify_global_functions.test` (63). **The host-FS table sub-case is now DONE too (ABI v47)** — a global
 > table reader that does secret-backed IO through DuckDB's FileSystem (lakehouse readers like Delta). It needed
@@ -22,7 +22,7 @@
 > collector — through **one mechanism** (`list_global_functions` + a handle-0 `*_bind` marker reusing the
 > existing scalar / v29 table-session / v28 exchange-collector ABIs). Only **one sub-case is deferred**: a global
 > *table* fn that needs the **host-FS opener** (secret-backed lakehouse readers like delta) — it wants an opener
-> arg on `table_bind`; delta stays bespoke until a 2nd such reader lands. See the summary in CLAUDE.md +
+> arg on `tablefn_bind`; delta stays bespoke until a 2nd such reader lands. See the summary in CLAUDE.md +
 > [docs/provider-extensibility.md](provider-extensibility.md), [docs/delta-catalog.md](delta-catalog.md).
 
 ## Why / the defining property
@@ -48,11 +48,11 @@ needs the **host-FS opener** for IO — which is the single axis that splits "bu
 |---|---|---|---|---|
 | **scalar** | fixed (decl) | none | `get_function_*_schema` + `execute_scalar` | **slice 1** — template engine |
 | **in-out / collector** (pure-C#) | from cost args + input schema, via `inout_bind` | none (transforms its input) | `inout_bind` + `inout_exchange_open` + `inout_bind_close` (v28) | **slice 2** — clean, no opener |
-| **table** (compute / connstr) | arg-dependent, via `table_bind` | none | `table_bind` + `table_execute` + `table_close` (v29) | **slice 3** — clean |
-| **table** (host-FS reader, e.g. delta) | arg-dependent, via `table_bind` | **needs the host-FS opener (ClientContext + secrets)** | as above **+ an opener arg on `table_bind`** | **deferred** — delta stays bespoke until then |
+| **table** (compute / connstr) | arg-dependent, via `tablefn_bind` | none | `tablefn_bind` + `tablefn_execute` + `tablefn_close` (v29) | **slice 3** — clean |
+| **table** (host-FS reader, e.g. delta) | arg-dependent, via `tablefn_bind` | **needs the host-FS opener (ClientContext + secrets)** | as above **+ an opener arg on `tablefn_bind`** | **deferred** — delta stays bespoke until then |
 
 **Key point: global table + in-out add ZERO new ABI entries beyond the scalar plan.** The arg-dependent output
-schema (wrinkle 1) is *already solved* by the v27/v29 `table_bind`(args→schema) and v28 `inout_bind`(args+input
+schema (wrinkle 1) is *already solved* by the v27/v29 `tablefn_bind`(args→schema) and v28 `inout_bind`(args+input
 schema→schema) sessions — we just call them with the handle-0 marker. Only the *host-FS-opener* split (wrinkle
 2) remains, and it bites **one** sub-case (secret-backed FS readers like delta), not the others.
 
@@ -111,7 +111,7 @@ already anticipated it — "the existing `execute_scalar` with a handle-less mar
   done as the first slice-1 step — it touches `IArrowScalarFunction.cs` + its implementors (the `Cf*` scalar
   demos, `SqlServerScalarFunction`, `SqlServerBackend`'s `CustomScalar`/`ResolveScalar`/the three scalar
   handlers); DAX has no scalar functions so it's untouched. Gate: `verify_scalar_functions` /
-  `verify_custom_functions` stay green. (The same base/derived split would extend to `IArrowTableFunction`/
+  `verify_custom_functions` stay green. (The same base/derived split would extend to `ITableFunction`/
   in-out when global *table* functions eventually land — YAGNI until then.)
 - **Declaration**: `IBackend.GlobalScalarFunctions` (new property, default empty) — like `IBackend.Settings` /
   `SecretFields`. Each provider contributes its globals; the **Bridge `BackendRegistry` unions them** (plus an
@@ -151,27 +151,27 @@ Extract a schema-free base per kind; the existing `IArrow*` interface becomes th
 ```csharp
 public interface ITableFunction {                               // global table fn
     string Name { get; } Schema Parameters { get; }
-    IArrowTableFunctionBinding Bind(RecordBatch args);          // arg-dependent OutputSchema + Execute
+    ITableFunctionBinding Bind(RecordBatch args);          // arg-dependent OutputSchema + Execute
 }
-public interface ICatalogTableFunction : ITableFunction { string SchemaName { get; } }   // was IArrowTableFunction
+public interface ICatalogTableFunction : ITableFunction { string SchemaName { get; } }   // was ITableFunction
 
 public interface IInOutFunction {                               // global in-out (streaming exchange)
     string Name { get; } Schema Parameters { get; }   // incl. the Params.TableInput field
-    IArrowInOutBinding Bind(RecordBatch? args, Schema inputSchema);
+    IInOutBinding Bind(RecordBatch? args, Schema inputSchema);
 }
-public interface ICatalogInOutFunction : IInOutFunction { string SchemaName { get; } }   // was IArrowInOutFunction
+public interface ICatalogInOutFunction : IInOutFunction { string SchemaName { get; } }   // was IInOutFunction
 
 public interface ICollectorTableFunction {                      // global collector (pipeline breaker)
     string Name { get; } Schema Parameters { get; }   // incl. the Params.TableInput field
-    IArrowCollectorBinding Bind(RecordBatch? args, Schema inputSchema);
+    ICollectorBinding Bind(RecordBatch? args, Schema inputSchema);
 }
-public interface ICatalogCollectorTableFunction : ICollectorTableFunction { string SchemaName { get; } }  // was IArrowCollectorTableFunction
+public interface ICatalogCollectorTableFunction : ICollectorTableFunction { string SchemaName { get; } }  // was ICollectorTableFunction
 ```
 
 Globals declare `IBackend.GlobalTableFunctions` / `GlobalInOutFunctions` / `GlobalCollectorFunctions`
 (`IReadOnlyList<ITableFunction>` etc., default empty), unioned by `BackendRegistry` into per-kind global
-registries keyed by name. The `Binding` types (`IArrowTableFunctionBinding`, `IArrowInOutBinding`,
-`IArrowCollectorBinding`) are **unchanged** — they already carry no schema-name. Behavior-preserving renames,
+registries keyed by name. The `Binding` types (`ITableFunctionBinding`, `IInOutBinding`,
+`ICollectorBinding`) are **unchanged** — they already carry no schema-name. Behavior-preserving renames,
 same gate (the function `verify_*` suites green).
 
 ### Registration at load + handle-0 reuse (no new ABI)
@@ -181,8 +181,8 @@ discovery does), all dispatching with the **handle-0 marker** at *bind* time:
 
 - **table** → build a `TableFunction(name, arg_types, ArrowStreamScan, GlobalTableBind, …)` where `arg_types` =
   `get_function_param_schema(0,"",name)` (positional) and `GlobalTableBind` marshals `input.inputs` →
-  `table_bind(0,"",name,args,&binding)` → output schema + a **concrete binding handle**; the scan factory calls
-  `table_execute(binding,spec,filter,out)`; teardown `table_close(binding)`. Reuses the v29 session + the
+  `tablefn_bind(0,"",name,args,&binding)` → output schema + a **concrete binding handle**; the scan factory calls
+  `tablefn_execute(binding,spec,filter,out)`; teardown `tablefn_close(binding)`. Reuses the v29 session + the
   existing `arrow_ingest` scan verbatim.
 - **in-out** → register the `{LogicalType::TABLE}` **exchange** operator (the same `FabricatorExchange*` used by
   `_each`/custom in-out) under the bare name; its bind marshals the input schema + cost named-params →
@@ -191,9 +191,9 @@ discovery does), all dispatching with the **handle-0 marker** at *bind* time:
   `inout_bind(0,…)` (collectors reuse the inout_bind/exchange ABI); the operator streams the output as built.
 
 In every case only the **bind** entry takes the handle-0 marker (→ C# routes to the global registry by name);
-the binding handle it returns is a real, resolvable handle, so `table_execute`/`table_close` /
+the binding handle it returns is a real, resolvable handle, so `tablefn_execute`/`tablefn_close` /
 `inout_exchange_open`/`inout_bind_close` are unchanged. **So global table + in-out cost zero new vtable entries**
-— just extend the handle-0 branch (added for scalar) to `table_bind` and `inout_bind`, and have C++
+— just extend the handle-0 branch (added for scalar) to `tablefn_bind` and `inout_bind`, and have C++
 `RegisterFabricatorGlobalFunctions` branch on `kind` to register the right operator.
 
 ### Host-FS global table functions (DONE, ABI v47)
@@ -202,7 +202,7 @@ A global table reader doing secret-backed IO through DuckDB's FileSystem (lakeho
 Iceberg/Lance next). The mechanism, built on the existing `kind='table'` global path:
 
 - **The opener** (the calling operator's `ClientContext`, which resolves DuckDB secrets for `az://`/`s3://`/…)
-  is not an argument of the generic `table_bind`/`table_execute`. So — exactly like `set_active_txn` for the
+  is not an argument of the generic `tablefn_bind`/`tablefn_execute`. So — exactly like `set_active_txn` for the
   transaction id — the host records it in a **per-thread ambient** via one appended ABI entry
   `set_active_opener(opener)`, set in the two shared arrow-scan hooks (`PopulateReturnSchema` at bind,
   `ArrowStreamInitGlobal` at execute) right next to the existing `set_active_txn` call. The managed
@@ -222,13 +222,13 @@ Iceberg/Lance next). The mechanism, built on the existing `kind='table'` global 
   skipping** (`DeltaFilterBuilder` → `EngineeredWood.Expressions.Predicate`; the superset-safe policy is in the
   shared C++ `FilterSerializer` gated on `string_order_pushable`, which `DeltaGlobalTableFunction` declares
   `true` (Parquet stats are byte-ordered like DuckDB's default), so all comparisons + `IN` push incl. strings;
-  DuckDB re-applies). Column projection into the Parquet read stays deferred (the shared `BindingBoundTable` wraps the stream with
+  DuckDB re-applies). Column projection into the Parquet read stays deferred (the shared `BindingBoundTableFunction` wraps the stream with
   the full output schema, so a projected subset would mismatch it — DuckDB projects above the scan instead).
   See docs/filesystem-bridge.md §"Streaming + filter pushdown".
 
 ### The opener wrinkle — where it bit, and how it was resolved (historical)
 
-`table_bind`/`table_execute` (and `inout_bind`) pass a **handle** to C#; a catalog fn uses that handle's
+`tablefn_bind`/`tablefn_execute` (and `inout_bind`) pass a **handle** to C#; a catalog fn uses that handle's
 `SqlConnection`. A global fn has handle 0 — fine for:
 - **pure-compute** table fns (generators, transforms) and **all pure-C# in-out/collector** globals (they
   transform their *input table*, no external IO) — **no opener needed**;
@@ -236,10 +236,10 @@ Iceberg/Lance next). The mechanism, built on the existing `kind='table'` global 
 
 It bites exactly one sub-case: a **host-FS reader** (delta/iceberg/parquet over `az://`/`s3://` with **DuckDB
 secrets**), which needs the host `FileSystem` opened against a `ClientContext` for secret resolution — and the
-v29 `table_bind`/`table_execute` path doesn't thread a `ClientContext`/opener to C#. The filesystem bridge
+v29 `tablefn_bind`/`tablefn_execute` path doesn't thread a `ClientContext`/opener to C#. The filesystem bridge
 (`FabricatorHostServices` fs callbacks, v40/v41) gives C# host IO, but secret-backed opens need the right context.
-**Resolved (ABI v47):** rather than an opener *param* on `table_bind`/`table_execute` (which would touch every
-catalog/proc/custom callsite + churn `IArrowTableFunctionBinding.Execute`), the opener is threaded as a
+**Resolved (ABI v47):** rather than an opener *param* on `tablefn_bind`/`tablefn_execute` (which would touch every
+catalog/proc/custom callsite + churn `ITableFunctionBinding.Execute`), the opener is threaded as a
 **per-thread ambient** — one appended entry `set_active_opener(opener)` set in the shared `PopulateReturnSchema`
 + `ArrowStreamInitGlobal` hooks (beside `set_active_txn`), read by the host-FS binding from
 `AmbientOpener.Current`. SQL fns ignore it; the v29 session is otherwise untouched. Delta migrated onto it
@@ -351,7 +351,7 @@ effectful halves, exactly as deliberated.
   {'name':'x'})` → `Hi x`; vectorized over `range()`; NULL handling; the JSON-string param form; resolves on a
   bare loaded extension (no catalog); a collision test if two providers declare the same global name. Later
   slices add: a global **table** fn (`SELECT * FROM fabricator_gen(3)`) proving arg-dependent output schema via
-  `table_bind` with no catalog; a global **in-out** (`SELECT * FROM fabricator_xform((SELECT …))`) and **collector**
+  `tablefn_bind` with no catalog; a global **in-out** (`SELECT * FROM fabricator_xform((SELECT …))`) and **collector**
   proving the exchange/Sink+Source operators run handle-0 with no ATTACH.
 - Build: VS18 vcvars `--target unittest shell`; `publish-managed.ps1`. ABI bumped → rebuild **both** from one
   commit (exact-match ABI).
@@ -372,13 +372,13 @@ built once in slice 1; each later slice just extends the handle-0 branch to one 
    exchange/collector operators by `kind` at load (handle 0). **No opener** (they transform their input). Demos
    `fabricator_tag` (streaming) + `fabricator_collect_sum` (collector); `test/verify_global_functions.test`. Enables
    the effectful global *apply* half (e.g. an `fabricator_apply_tmdl` collector).
-3. **Global table (compute / connstr) — DONE**: the `ITableFunction` base rename; `table_bind` handle-0 →
-   `GlobalFunctions.ResolveTable` (wraps the arg-dependent binding in the now-Bridge `BindingBoundTable`);
+3. **Global table (compute / connstr) — DONE**: the `ITableFunction` base rename; `tablefn_bind` handle-0 →
+   `GlobalFunctions.ResolveTable` (wraps the arg-dependent binding in the now-Bridge `BindingBoundTableFunction`);
    `RegisterFabricatorGlobalFunctions` registers `kind='table'` on the v29 session at load (handle 0, projection +
    best-effort filter pushdown). The handle-0 `get_function_param_schema` became kind-agnostic
    (`GlobalFunctions.ParamSchema`). Demos `fabricator_seq` (fixed schema) + `fabricator_columns` (ARG-DEPENDENT
    schema). No opener. `test/verify_global_functions.test`.
-4. **Global aggregate (UDAF) — DONE**: the `IAggregateFunction` base rename (`IArrowAggregateFunction` →
+4. **Global aggregate (UDAF) — DONE**: the `IAggregateFunction` base rename (`IAggregateFunction` →
    `ICatalogAggregateFunction`); `AggSessionImpl` moved to the Bridge as the public `AggregateSession` (shared by
    catalog + global); `agg_open` handle-0 → `GlobalFunctions.ResolveAggregate`; the handle-0
    `get_function_param_schema`/`get_function_return_schema` cover the aggregate kind (`ParamSchema`/`ReturnField`);
@@ -390,7 +390,7 @@ built once in slice 1; each later slice just extends the handle-0 branch to one 
    the C# binding via **one appended ABI entry `set_active_opener`** — a per-thread ambient (`AmbientOpener`,
    mirroring `set_active_txn`) the host sets in the shared table bind/init hooks (`PopulateReturnSchema` +
    `ArrowStreamInitGlobal`), read by the host-FS binding in `Bind` (schema) + `Execute` (data; materialized
-   while the opener is valid). NO opener *param* on `table_bind`/`table_execute` and NO new operator — the v29
+   while the opener is valid). NO opener *param* on `tablefn_bind`/`tablefn_execute` and NO new operator — the v29
    table session is reused verbatim. `fabricator_delta_scan` migrated to a pure-C# global host-FS `ITableFunction`
    (`DeltaGlobalTableFunction`, declared in `CustomFunctions.GlobalTable`); the bespoke `fabricator_delta.cpp` +
    the `delta_schema`/`delta_scan` ABI were removed. So a new lakehouse format (Iceberg/Lance/…) = a pure-C#

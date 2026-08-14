@@ -6,7 +6,7 @@ namespace Fabricator.Bridge;
 /// <summary>
 /// A provider-authored custom table function, implemented in C# over Arrow. Mirrors DuckDB's bind→execute:
 /// <see cref="Bind"/> receives the constant call arguments and returns a per-call
-/// <see cref="IArrowTableFunctionBinding"/> whose output schema MAY depend on those arguments (e.g. a
+/// <see cref="ITableFunctionBinding"/> whose output schema MAY depend on those arguments (e.g. a
 /// generic <c>query(sql)</c> or a function whose column set follows a parameter). Surfaced into every
 /// attached catalog and resolved as <c>SELECT * FROM db.SchemaName.Name(args)</c> through the same
 /// table-function path as a discovered TVF — the catalog dispatches to the binding instead of generating SQL.
@@ -50,7 +50,7 @@ public interface ITableFunction
     /// argument values (positional, matching <see cref="Parameters"/>). Returns a per-call binding carrying
     /// the resolved output schema + any state. Mirrors DuckDB's bind.
     /// </summary>
-    IArrowTableFunctionBinding Bind(RecordBatch args);
+    ITableFunctionBinding Bind(RecordBatch args);
 }
 
 /// <summary>A catalog-bound custom table function (attach-time scope) — <see cref="ITableFunction"/> plus the
@@ -68,7 +68,7 @@ public interface ICatalogTableFunction : ITableFunction
 /// <see cref="Execute"/> result must be a self-contained stream (owning any resources it needs) — the
 /// binding is disposed as soon as the scan's stream has been handed off.
 /// </summary>
-public interface IArrowTableFunctionBinding : System.IDisposable
+public interface ITableFunctionBinding : System.IDisposable
 {
     /// <summary>The result columns (names + Arrow types), resolved for this call's arguments.</summary>
     Schema OutputSchema { get; }
@@ -100,8 +100,8 @@ public interface IArrowTableFunctionBinding : System.IDisposable
     /// the projection, which they could have honoured. One axis was hostage to the other.</para>
     /// <para>⚠ NOTHING READS EITHER FLAG YET — say so rather than let the next reader assume otherwise. The
     /// wrappers (<c>GlobalFunctions</c>, <c>CatalogFunctionSet</c>) pass a LITERAL <c>true</c> for
-    /// <see cref="IBoundTable.MapResultByName"/> and never consult the binding, and
-    /// <c>BindingBoundTable.Execute</c> declares its stream with the binding's FULL
+    /// <see cref="IBoundTableFunction.MapResultByName"/> and never consult the binding, and
+    /// <c>BindingBoundTableFunction.Execute</c> declares its stream with the binding's FULL
     /// <see cref="OutputSchema"/>. Honouring <see cref="SupportsProjectionPushdown"/> means letting the
     /// binding declare the schema it will actually emit FOR THIS SCAN; until then these two are a vocabulary
     /// for saying what a binding guarantees, not yet a switch that changes what the host does.</para>
@@ -120,7 +120,7 @@ public interface IArrowTableFunctionBinding : System.IDisposable
 }
 
 /// <summary>
-/// The projection + filter pushdown request handed to <see cref="IArrowTableFunctionBinding.Execute"/>.
+/// The projection + filter pushdown request handed to <see cref="ITableFunctionBinding.Execute"/>.
 /// <see cref="SpecJson"/> (null =&gt; SELECT *) is <c>{ "columns": [...], "filter": &lt;tree&gt; }</c>; the
 /// filter tree references typed constants by index into <see cref="FilterValues"/> (null =&gt; no filter).
 /// Same shape as the table-scan pushdown; a pure-C# binding ignores both.

@@ -58,7 +58,7 @@ proven code path.
 > **Update (ABI v47): `fabricator_delta_scan` is now a connection-free GLOBAL host-FS table function, not a
 > bespoke C++ table function.** The bespoke `fabricator_delta.cpp` + the `delta_schema`/`delta_scan` vtable entries
 > were removed; delta is a pure-C# global `ITableFunction` (`DeltaGlobalTableFunction`, declared in
-> `CustomFunctions.GlobalTable`) dispatched through the v29 table session (`table_bind`/`table_execute`). The
+> `CustomFunctions.GlobalTable`) dispatched through the v29 table session (`tablefn_bind`/`tablefn_execute`). The
 > only new plumbing is the opener: a global host-FS reader needs the calling operator's `ClientContext` (for
 > DuckDB secret resolution) at bind + execute, threaded via a per-thread ambient (`AmbientOpener`, mirroring
 > `set_active_txn`) the host sets with the appended `set_active_opener` ABI entry. So a NEW lakehouse format
@@ -129,8 +129,8 @@ skipping, byte-order-sound) — all green. The Apache.Arrow version is aligned (
   correct superset. `test/verify_delta.test` (60 — incl. `=`/`IN`/`AND`-range pushed, and string `=`/`>`/`<>`
   correctly NOT pushed but still filtered by DuckDB).
 - **Column projection into the Parquet read — DONE 2026-08-13.** It was deferred because the shared
-  `BindingBoundTable` wrapped the result stream with the binding's FULL `OutputSchema`, so a projected SUBSET
-  mismatched the declaration (arrow_ingest SIGSEGV). The fix needed no "pushdown-native `IBoundTable`" as
+  `BindingBoundTableFunction` wrapped the result stream with the binding's FULL `OutputSchema`, so a projected SUBSET
+  mismatched the declaration (arrow_ingest SIGSEGV). The fix needed no "pushdown-native `IBoundTableFunction`" as
   predicted here: the WRAPPER holds both the full schema and the spec, so it declares the projected schema
   itself and the bindings resolve their column list through the same `ProjectionPlan`.
   - ⚠ What actually blocked it was a NAME, not the plumbing: one `SupportsPushdown` flag conflated "already

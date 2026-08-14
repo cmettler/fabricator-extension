@@ -14,7 +14,7 @@ namespace Fabricator.Bridge;
 /// blob as a mere <c>int64</c> id; the real per-group accumulator lives here in C#, behind that id (see
 /// <see cref="IAggregateSession"/>). DuckDB chooses a fresh accumulator per group via
 /// <see cref="CreateState"/>; partial states from parallel threads are merged via
-/// <see cref="IArrowAggregateState.Combine"/>.
+/// <see cref="IAggregateState.Combine"/>.
 /// </summary>
 public interface IAggregateFunction
 {
@@ -32,12 +32,12 @@ public interface IAggregateFunction
     /// (and once per partial state during parallel/windowed aggregation). The returned object must be
     /// independent (no shared mutable state across groups).
     /// </summary>
-    IArrowAggregateState CreateState();
+    IAggregateState CreateState();
 
     /// <summary>
     /// Opt-in: when <c>true</c>, the aggregate runs in <em>spillable</em> mode — the per-group state is
-    /// serialized into DuckDB's fixed-size, pointer-free state blob (via <see cref="IArrowAggregateState.Serialize"/>
-    /// / <see cref="IArrowAggregateState.Load"/>) so DuckDB's out-of-core <c>GROUP BY</c> can spill it to disk.
+    /// serialized into DuckDB's fixed-size, pointer-free state blob (via <see cref="IAggregateState.Serialize"/>
+    /// / <see cref="IAggregateState.Load"/>) so DuckDB's out-of-core <c>GROUP BY</c> can spill it to disk.
     /// This trades per-call (de)serialization cost for bounded memory at high group cardinality, and requires
     /// the serialized state to fit a fixed cap (1&nbsp;KB). Leave <c>false</c> (the default) for the fast
     /// in-memory path, which keeps a live accumulator per group and cannot spill.
@@ -60,7 +60,7 @@ public interface ICatalogAggregateFunction : IAggregateFunction
 /// no internal locking. A brand-new instance must finalize to the "empty group" value (e.g. NULL or 0) —
 /// DuckDB may finalize a state that was never updated.
 /// </summary>
-public interface IArrowAggregateState
+public interface IAggregateState
 {
     /// <summary>
     /// Folds one batch of argument rows into this accumulator. <paramref name="args"/> carries the columns
@@ -71,7 +71,7 @@ public interface IArrowAggregateState
     void Update(RecordBatch args);
 
     /// <summary>Merges another partial accumulator (the same function's state) into this one.</summary>
-    void Combine(IArrowAggregateState source);
+    void Combine(IAggregateState source);
 
     /// <summary>This group's single result value (boxed; <c>null</c> = SQL NULL), typed per
     /// <see cref="IAggregateFunction.Result"/>.</summary>

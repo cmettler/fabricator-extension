@@ -38,7 +38,7 @@ public sealed class DeltaGlobalTableFunction : ITableFunction
     // skipping (the C++ FilterSerializer honors this; DuckDB re-applies regardless).
     public bool StringOrderPushable => true;
 
-    public IArrowTableFunctionBinding Bind(RecordBatch args)
+    public ITableFunctionBinding Bind(RecordBatch args)
     {
         var path = ((StringArray)args.Column(0)).GetString(0)
                    ?? throw new System.ArgumentException("fabricator_delta_scan: path must not be NULL");
@@ -51,7 +51,7 @@ public sealed class DeltaGlobalTableFunction : ITableFunction
         return new DeltaBinding(path, schema);
     }
 
-    private sealed class DeltaBinding : IArrowTableFunctionBinding
+    private sealed class DeltaBinding : ITableFunctionBinding
     {
         private readonly string _path;
         private readonly Schema _schema;
@@ -70,7 +70,7 @@ public sealed class DeltaGlobalTableFunction : ITableFunction
         // answer rather than a missed optimisation.
         public bool SupportsFilterPushdown => false;
 
-        // Claimed since 2026-08-13: engineered-wood reads ONLY the requested columns, and BindingBoundTable
+        // Claimed since 2026-08-13: engineered-wood reads ONLY the requested columns, and BindingBoundTableFunction
         // now declares the projected schema (it resolves it with the same ProjectionPlan used below, so the
         // batches and the declaration cannot disagree). Exact by nature — there is no "superset of columns".
         public bool SupportsProjectionPushdown => true;
@@ -161,7 +161,7 @@ internal static class FilterConstants
 /// partition columns, column mapping and schema evolution.</para>
 ///
 /// <para>⚠ Pushdown: the FILTER is pushed (file / row-group skipping), the PROJECTION is not —
-/// <see cref="BindingBoundTable"/> declares the binding's full <c>OutputSchema</c> at bind, so a projected
+/// <see cref="BindingBoundTableFunction"/> declares the binding's full <c>OutputSchema</c> at bind, so a projected
 /// subset would mismatch it. <c>fabricator_delta_scan</c> carries the identical limitation for the identical
 /// reason; lifting it needs a bound table that declares the projected schema.</para>
 ///
@@ -172,7 +172,7 @@ public sealed class DeltaNativeScanFunction : ITableFunction
     public string Name => "fabricator_delta_native_scan";
     public Schema Parameters => new Schema(new[] { new Field("path", StringType.Default, nullable: false) }, null);
 
-    public IArrowTableFunctionBinding Bind(RecordBatch args)
+    public ITableFunctionBinding Bind(RecordBatch args)
     {
         var path = ((StringArray)args.Column(0)).GetString(0)
                    ?? throw new System.ArgumentException("fabricator_delta_native_scan: path must not be NULL");
@@ -187,7 +187,7 @@ public sealed class DeltaNativeScanFunction : ITableFunction
         return new NativeBinding(path, schema);
     }
 
-    private sealed class NativeBinding : IArrowTableFunctionBinding
+    private sealed class NativeBinding : ITableFunctionBinding
     {
         private readonly string _path;
         private readonly Schema _schema;
@@ -227,7 +227,7 @@ public sealed class DeltaNativeScanFunction : ITableFunction
             // caveat this spike shipped with: the follow-up slices all went into that class.
             //
             // ⚠ THE PROJECTION IS NOT PUSHED, and that is a constraint of this seam rather than of the
-            // reader. BindingBoundTable wraps the stream with the binding's FULL OutputSchema, fixed at bind
+            // reader. BindingBoundTableFunction wraps the stream with the binding's FULL OutputSchema, fixed at bind
             // before DuckDB knows what it wants, so emitting a projected subset mismatches the declared
             // schema (arrow_ingest reads past the end — SIGSEGV). Passing no Columns makes the reader
             // resolve the full schema, which is what OutputSchema promises. fabricator_delta_scan carries
@@ -236,7 +236,7 @@ public sealed class DeltaNativeScanFunction : ITableFunction
             var spec = scan.Spec;
             // ⚠ Columns are re-resolved through ProjectionPlan rather than forwarded verbatim: it drops the
             // shapes that must read everything and, crucially, fixes the ORDER to the declared schema's —
-            // DeltaNativeReader emits in the order it is handed, and BindingBoundTable declares in that same
+            // DeltaNativeReader emits in the order it is handed, and BindingBoundTableFunction declares in that same
             // order. Forwarding spec.Columns as given would let the two disagree whenever DuckDB asks for
             // columns out of schema order.
             var columns = spec is null ? null : ProjectionPlan.Columns(_schema, spec.Columns);
@@ -301,7 +301,7 @@ public sealed class DeltaWriteDemoFunction : ITableFunction
     public Schema Parameters { get; } =
         new Schema(new[] { new Field("path", StringType.Default, nullable: false) }, metadata: null);
 
-    public IArrowTableFunctionBinding Bind(RecordBatch args)
+    public ITableFunctionBinding Bind(RecordBatch args)
     {
         var path = ((StringArray)args.Column(0)).GetString(0)
                    ?? throw new System.ArgumentException("fabricator_delta_write_demo: path must not be NULL");
@@ -313,7 +313,7 @@ public sealed class DeltaWriteDemoFunction : ITableFunction
         return new WriteBinding(path, outSchema);
     }
 
-    private sealed class WriteBinding : IArrowTableFunctionBinding
+    private sealed class WriteBinding : ITableFunctionBinding
     {
         private readonly string _path;
         private readonly Schema _schema;
@@ -1661,7 +1661,7 @@ public sealed class DeltaWriteCollectorFunction : ICollectorTableFunction
         Params.Named("path", StringType.Default),
     }, metadata: null);
 
-    public IArrowCollectorBinding Bind(RecordBatch? args, Schema inputSchema)
+    public ICollectorBinding Bind(RecordBatch? args, Schema inputSchema)
     {
         var path = ReadPath(args);
         return new WriteCollectorBinding(path, inputSchema);
@@ -1683,7 +1683,7 @@ public sealed class DeltaWriteCollectorFunction : ICollectorTableFunction
         throw new System.ArgumentException("fabricator_delta_write: the 'path' argument is required");
     }
 
-    private sealed class WriteCollectorBinding : IArrowCollectorBinding
+    private sealed class WriteCollectorBinding : ICollectorBinding
     {
         private readonly string _path;
         private readonly Schema _inputSchema;

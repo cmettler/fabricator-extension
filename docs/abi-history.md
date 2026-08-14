@@ -5,6 +5,86 @@
 > Paths/links inside are REPO-ROOT-relative (the text was written for `CLAUDE.md`).
 > The CURRENT version + the bump rule stay in `CLAUDE.md` §C ABI contract.
 
+## ⚠ RENAME, 2026-08-14 — `table_bind`/`table_execute`/`table_close` are now `tablefn_*`. NO ABI BUMP.
+
+**Grepping this file for the OLD names will find nothing — they were rewritten throughout, deliberately, so
+that a search for a name lands on live code rather than on history alone. This section is the only record
+that they ever had different names.**
+
+| old | new |
+|---|---|
+| `table_bind` / `table_execute` / `table_close` | `tablefn_bind` / `tablefn_execute` / `tablefn_close` |
+| C++ `fabricator::TableBind` / `TableExecute` / `TableClose`, `TableBindState` | `TableFnBind` / `TableFnExecute` / `TableFnClose`, `TableFnBindState` |
+| C# `IBoundTable`, `BindingBoundTable`, `TvfBoundTable`, `DaxEvalBoundTable` | `IBoundTableFunction`, `BindingBoundTableFunction`, `TvfBoundTableFunction`, `DaxEvalBoundTableFunction` |
+| C# `IArrowTableFunctionBinding` | `ITableFunctionBinding` |
+
+**WHY — the word order was already right and the NOUN was wrong.** The vtable has a consistent convention:
+one-shot entries are `verb_noun` (`execute_query`, `execute_scalar`, `scan_table`, `create_table`,
+`alter_table`) and session entries are `<function kind>_verb` (`agg_open/update/combine/finalize/close`,
+`inout_bind/exchange_open/bind_close`). This trio followed the session convention correctly — but `table_`
+was the ONE session prefix whose noun is ALSO a first-class ABI noun with four entries of its own, so
+`table_execute` read as "execute a table" while its neighbour `scan_table` is the entry that actually does
+that. **The confusion is not hypothetical: a catalog table scan (`lake.dbo.his`) goes through `scan_table`
+and has NO C# bind object at all — its bind state is the C++ `ArrowStreamBindData` — while `table_bind`
+served only table FUNCTIONS.** Mistaking the two invites hanging per-statement state on a path that never
+sees a catalog table; the per-transaction caches (`DeltaTableCache`, `SnapshotPinning`) exist precisely
+because `scan_table` has nowhere to put it.
+
+**NO BUMP, and that is the rule applied rather than an exemption.** `CLAUDE.md`'s rule is bump on *adding an
+entry* or *changing a signature*; a rename is neither. The vtable is positional in memory, so renaming a
+struct member changes no layout, ordinal or signature — a stale loadable against a fresh bridge and the
+reverse both keep working, unlike the usual C++-touching change. Bumping would have forced a rebuild on
+everyone to no purpose.
+
+⚠ **It was safe to do wholesale because it is COMPILER-ENFORCED end to end** — every name is a struct member
+or a type, never string-dispatched, so nothing can silently half-land (contrast the `fabric_` → `fabric.`
+schema rename, which was grep-driven and needed three token classes protected by hand). The two hazards
+were both mechanical: DuckDB's own `TableBinding` must NOT be caught by a `TableBind` pattern (use a word
+boundary — it survives at `fabricator_table_entry.cpp:903` and `arrow_ingest.hpp:50`), and a `grep -rl`
+across `dotnet/` sweeps `bin/`/`obj/`, so a `sed -i` over its output rewrites BUILD-OUTPUT DLLs. They are
+gitignored and regenerable, but delete them afterwards rather than letting a corrupted one be picked up.
+
+## The `IArrow*` un-prefixing, finished in the same pass (2026-08-14, C#-only, no ABI involvement)
+
+**It did not invent a convention — it finished one that had been half-applied for months.** The FUNCTION
+interfaces in `Fabricator.Abstractions` were ALREADY unprefixed (`IScalarFunction`, `IAggregateFunction`,
+`IInOutFunction`, `ICollectorTableFunction`, `ISqlTableFunction`) — an earlier pass renamed the TYPES and
+left the FILES, and `docs/global-functions.md` still records one of those moves in flight
+(*"`ICatalogScalarFunction : IScalarFunction` // RENAME of `IArrowScalarFunction`"*). What remained was the
+BINDING/state family and three stale filenames:
+
+| old | new |
+|---|---|
+| `IArrowCollectorBinding` / `IArrowInOutBinding` / `IArrowInOutIsolation` / `IArrowAggregateState` | `ICollectorBinding` / `IInOutBinding` / `IInOutIsolation` / `IAggregateState` |
+| files `IArrowAggregateFunction.cs` / `IArrowInOutFunction.cs` / `IArrowCollectorTableFunction.cs` / `IArrowTableFunction.cs` | `IAggregateFunction.cs` / `IInOutFunction.cs` / `ICollectorTableFunction.cs` / `ITableFunction.cs` |
+
+⇒ **the only `IArrow*` names left in the tree are Apache Arrow's own** (`IArrowArray`,
+`IArrowArrayBuilder`, `IArrowArrayStream`, `IArrowType`), which is now a usable invariant: an `IArrow`
+prefix means the type is theirs, not ours. Historical design docs still name `IArrowFunction`,
+`IArrowScalarFunction` and `IArrowTableInOutFunction` — deliberately NOT swept, because those passages
+document the earlier renames themselves.
+
+⚠ **IT IS A BREAKING CHANGE FOR PLUGIN AUTHORS** and no aliases were kept, consistent with the Fabricator
+rename's precedent. `Fabricator.Abstractions` is the contract assembly a plugin compiles against, so an
+out-of-tree plugin implementing `IArrowInOutBinding` no longer builds; the fix is mechanical (drop `IArrow`,
+keep the rest).
+- ⚠ **AND NOTHING IN THE REPO TESTS THAT — do not read the green `Fabricator.SamplePlugin` build as
+  evidence.** The sample plugin implements exactly `IBackend` and `IScalarFunction`, NEITHER of which was
+  renamed, so it compiles unchanged whatever happens to the binding/state types. Its gate
+  `verify_plugin` (10 assertions) is a single scalar function, so the plugin SPI's in-out, collector and
+  aggregate surface has NO out-of-tree coverage at all. What the rename IS covered by is the 78 in-tree
+  uses across Bridge / SqlServer / AnalysisServices / DeltaRs — same-solution consumers, which the compiler
+  fixes for you and a plugin author's does not.
+
+⚠ **The README named THREE interfaces that never existed** — `IArrowTableFunction`, `IArrowInOutFunction`,
+`IArrowAggregateFunction` — instructing users to implement FILE names. Corrected to the catalog interfaces
+`CustomFunctions.cs` itself documents (`ICatalogTableFunction` / `ICatalogInOutFunction` /
+`ICatalogAggregateFunction`). It had been wrong since those files were written, and it is exactly the drift
+`CLAUDE.md`'s keep-the-README-in-sync rule exists to catch: the audience least able to spot it.
+
+⚠ **RESIDUAL:** `FabricTableBinding` (the `FabricApi` base class) still reads like DuckDB's `TableBinding`
+and would be `FabricTableFunctionBinding` under this convention.
+
 - **Prior: ABI v68** (v68 = **`generate_table_sql`** — the SQL-GENERATING table function surface; see the
   sqlgen bullet in `CLAUDE.md` "Next up" and [macros-and-sqlgen-functions.md](macros-and-sqlgen-functions.md)
   §2. Full text stayed in `CLAUDE.md` as the then-current version and moved here when v69 landed.)
@@ -2196,7 +2276,7 @@
   table-function session; they had been unused in C++ since v29, so this is the cleanup. NOTE: that too was a
   **mid-struct** removal (between `get_function_output_schema` and the inout entries), so it shifted every later
   entry's offset — `abi.h` + `Abi.cs` field order must stay in exact sync. v29 appended the three
-  **table-function session** entries `table_bind`/`table_execute`/`table_close` — the session-handle
+  **table-function session** entries `tablefn_bind`/`tablefn_execute`/`tablefn_close` — the session-handle
   successor to `execute_table`/`execute_proc`; see the "Table-function session — DONE" bullet under
   "Function-abstraction refactor (Phase 5)".
   v28 appended the three streaming table-in-out **exchange** entries `inout_bind`/

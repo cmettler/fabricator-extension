@@ -97,9 +97,9 @@ public static unsafe class Bootstrap
         vtable->InOutBind = &InOutBind;
         vtable->InOutExchangeOpen = &InOutExchangeOpen;
         vtable->InOutBindClose = &InOutBindClose;
-        vtable->TableBind = &TableBind;
-        vtable->TableExecute = &TableExecute;
-        vtable->TableClose = &TableClose;
+        vtable->TableFnBind = &TableFnBind;
+        vtable->TableFnExecute = &TableFnExecute;
+        vtable->TableFnClose = &TableFnClose;
         vtable->ListSettings = &ListSettings;
         vtable->SetSetting = &SetSetting;
         vtable->SetActiveTxn = &SetActiveTxn;
@@ -1124,7 +1124,7 @@ public static unsafe class Bootstrap
     }
 
     // (ExecuteTable / ExecuteProc handlers were removed at ABI v30 — superseded by the table-function
-    //  session TableBind / TableExecute / TableClose.)
+    //  session TableFnBind / TableFnExecute / TableFnClose.)
 
     // (The 4g table-in-out push handlers InOutOpen/InOutPush/InOutFinish/InOutAbort were removed at ABI v31 —
     //  every `_each` form now runs on the streaming exchange: InOutBind / InOutExchangeOpen / InOutBindClose.)
@@ -1149,7 +1149,7 @@ public static unsafe class Bootstrap
             }
             var f = Marshal.PtrToStringUTF8((nint)func) ?? string.Empty;
             // handle == 0 => a connection-free GLOBAL in-out / collector: resolve from the global registry by
-            // name (a collector is wrapped as an IArrowInOutBinding). Else the catalog path.
+            // name (a collector is wrapped as an IInOutBinding). Else the catalog path.
             var binding = handle == 0
                 ? GlobalFunctions.ResolveInOut(f, argsBatch, inSchema)
                 : (Handles.Resolve<IBackendCatalog>(handle) ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty))
@@ -1177,7 +1177,7 @@ public static unsafe class Bootstrap
             {
                 return FabricatorStatus.InvalidArgument;
             }
-            var b = Handles.Resolve<IArrowInOutBinding>(binding);
+            var b = Handles.Resolve<IInOutBinding>(binding);
             if (b is null)
             {
                 return FabricatorStatus.InvalidArgument;
@@ -1200,7 +1200,7 @@ public static unsafe class Bootstrap
     {
         try
         {
-            Handles.Resolve<IArrowInOutBinding>(binding)?.Dispose(); // idempotent
+            Handles.Resolve<IInOutBinding>(binding)?.Dispose(); // idempotent
             Handles.Free(binding);
             return FabricatorStatus.Ok;
         }
@@ -1212,7 +1212,7 @@ public static unsafe class Bootstrap
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static int TableBind(nint handle, byte* schema, byte* func, CArrowArrayStream* args,
+    private static int TableFnBind(nint handle, byte* schema, byte* func, CArrowArrayStream* args,
                                  CArrowArrayStream* outSchema, int* supportsPushdown, nint* outBinding, byte** err)
     {
         try
@@ -1233,7 +1233,7 @@ public static unsafe class Bootstrap
             var bound = handle == 0
                 ? GlobalFunctions.ResolveTable(f, argsBatch)
                 : (Handles.Resolve<IBackendCatalog>(handle) ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty))
-                    .TableBind(Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty, f, argsBatch);
+                    .TableFnBind(Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty, f, argsBatch);
             // Export the binding's output schema as a zero-row stream so the host can read return types.
             CArrowArrayStreamExporter.ExportArrayStream(
                 new InMemoryArrayStream(bound.OutputSchema, System.Array.Empty<RecordBatch>()), outSchema);
@@ -1249,7 +1249,7 @@ public static unsafe class Bootstrap
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static int TableExecute(nint binding, byte* specJson, CArrowArrayStream* filterValues,
+    private static int TableFnExecute(nint binding, byte* specJson, CArrowArrayStream* filterValues,
                                     CArrowArrayStream* outStream, byte** err)
     {
         try
@@ -1258,7 +1258,7 @@ public static unsafe class Bootstrap
             {
                 return FabricatorStatus.InvalidArgument;
             }
-            var bound = Handles.Resolve<IBoundTable>(binding);
+            var bound = Handles.Resolve<IBoundTableFunction>(binding);
             if (bound is null)
             {
                 return FabricatorStatus.InvalidArgument;
@@ -1277,11 +1277,11 @@ public static unsafe class Bootstrap
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static int TableClose(nint binding, byte** err)
+    private static int TableFnClose(nint binding, byte** err)
     {
         try
         {
-            Handles.Resolve<IBoundTable>(binding)?.Dispose(); // idempotent
+            Handles.Resolve<IBoundTableFunction>(binding)?.Dispose(); // idempotent
             Handles.Free(binding);
             return FabricatorStatus.Ok;
         }

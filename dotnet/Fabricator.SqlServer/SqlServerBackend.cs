@@ -4004,30 +4004,30 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         return procBinding.OutputSchema;
     }
 
-    // Phase 5 session model: bind a table-function call into an IBoundTable (the host then runs it via
-    // table_execute and frees it via table_close). Classifies the function the same way
+    // Phase 5 session model: bind a table-function call into an IBoundTableFunction (the host then runs it via
+    // tablefn_execute and frees it via tablefn_close). Classifies the function the same way
     // GetFunctionOutputSchema does — a custom (pure-C#) table function, else a discovered TVF (its result
     // columns are in ROUTINE_COLUMNS; pushdown), else a stored proc (no pushdown). The binding resolves the
     // output schema once and is reused across (prepared) re-executions.
-    public IBoundTable TableBind(string schemaName, string functionName, RecordBatch? args)
+    public IBoundTableFunction TableFnBind(string schemaName, string functionName, RecordBatch? args)
     {
         // supportsPushdown = !is_proc (preserves the prior push_projection): a custom function maps its full
         // result by NAME (true); a discovered TVF pushes the projection into SQL (true); a stored proc is
         // projected positionally above the scan (false).
         if (SqlServerSessionTagFunction.Is(functionName))
         {
-            return new BindingBoundTable(SessionTag.Bind(args!), supportsPushdown: true);
+            return new BindingBoundTableFunction(SessionTag.Bind(args!), supportsPushdown: true);
         }
-        var custom = Functions.TableBind(schemaName, functionName, args);
+        var custom = Functions.TableFnBind(schemaName, functionName, args);
         if (custom is not null)
         {
             return custom;
         }
         if (FunctionOutputColumns(schemaName, functionName).Count > 0)
         {
-            return new TvfBoundTable(new SqlServerTableValuedFunction(this, schemaName, functionName), args!);
+            return new TvfBoundTableFunction(new SqlServerTableValuedFunction(this, schemaName, functionName), args!);
         }
-        return new BindingBoundTable(new SqlServerProcedure(this, schemaName, functionName).Bind(args!), supportsPushdown: false);
+        return new BindingBoundTableFunction(new SqlServerProcedure(this, schemaName, functionName).Bind(args!), supportsPushdown: false);
     }
 
     // Phase 6 streaming-exchange bind for every `_each` form. A custom C# in-out (ICatalogInOutFunction —
@@ -4035,7 +4035,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     // read-only connection (SqlServerTvfEach); a stored-proc `_each` EXECs once per input row on DuckDB's
     // pinned write transaction (SqlServerProcEach). Proc vs TVF is classified the same way as elsewhere — a
     // TVF has result columns in ROUTINE_COLUMNS, a proc doesn't.
-    public IArrowInOutBinding InOutBind(string schemaName, string functionName, RecordBatch? args, Schema inputSchema)
+    public IInOutBinding InOutBind(string schemaName, string functionName, RecordBatch? args, Schema inputSchema)
     {
         // A custom COLLECTOR (pipeline breaker) is tried before a streaming in-out inside the set: the host
         // registered it on the Sink+Source collector operator (kind='collector'), which feeds a NON-gated
@@ -4048,12 +4048,12 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         var binding = Functions.InOutBind(schemaName, functionName, args, inputSchema)
                       ?? (FunctionOutputColumns(schemaName, routine).Count > 0
                           ? new SqlServerTvfEach(this, schemaName, routine, inputSchema)
-                          : (IArrowInOutBinding)new SqlServerProcEach(this, schemaName, routine, inputSchema));
+                          : (IInOutBinding)new SqlServerProcEach(this, schemaName, routine, inputSchema));
         // Resolve the SQL isolation for this in-out call and set it on the binding (if it honors isolation):
         // a SET mssql_isolation_level (pushed to the provider settings store) overrides this catalog's ATTACH
         // isolation_level default; pure-C# / proc bindings ignore it. Replaces the former C++
         // ResolveInOutIsolation + inout_exchange_open's isolation arg (docs/provider-extensibility.md §3).
-        if (binding is IArrowInOutIsolation iso)
+        if (binding is IInOutIsolation iso)
         {
             var setLevel = ProviderSettingsStore.Instance.GetString(SqlServerBackend.ProviderName, "mssql_isolation_level");
             iso.IsolationLevel = string.IsNullOrEmpty(setLevel) ? _isolationLevel : setLevel;

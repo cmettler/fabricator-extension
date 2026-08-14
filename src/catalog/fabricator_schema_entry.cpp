@@ -1157,21 +1157,21 @@ struct FabricatorTableFunctionInfo : public TableFunctionInfo {
 	bool string_order_pushable = false;
 };
 
-// Per-plan binding handle for the session-model table functions (table_bind / table_execute / table_close).
+// Per-plan binding handle for the session-model table functions (tablefn_bind / tablefn_execute / tablefn_close).
 // Held (refcounted) on the bind data's scan factory; its destructor frees the managed binding at plan
-// teardown. The per-execution provider connection lives in table_execute's result stream (released by the
-// arrow scan at teardown), so the binding itself holds no connection — table_close is metadata cleanup.
-struct TableBindState {
+// teardown. The per-execution provider connection lives in tablefn_execute's result stream (released by the
+// arrow scan at teardown), so the binding itself holds no connection — tablefn_close is metadata cleanup.
+struct TableFnBindState {
 	FabricatorHandle binding = nullptr;
 	bool supports_pushdown = false;
-	~TableBindState() {
-		fabricator::TableClose(binding);
+	~TableFnBindState() {
+		fabricator::TableFnClose(binding);
 	}
 };
 
-// Bind a catalog-bound TVF / proc / custom table function (Phase 5 session model): table_bind resolves the
-// output schema (return types) + pushdown + an opaque binding, then a scan factory runs table_execute over
-// that binding per execution (which streams the result rows). See TableBindState + abi.h.
+// Bind a catalog-bound TVF / proc / custom table function (Phase 5 session model): tablefn_bind resolves the
+// output schema (return types) + pushdown + an opaque binding, then a scan factory runs tablefn_execute over
+// that binding per execution (which streams the result rows). See TableFnBindState + abi.h.
 unique_ptr<FunctionData> FabricatorTableFunctionBind(ClientContext &context, TableFunctionBindInput &input,
                                                    vector<LogicalType> &return_types, vector<string> &names) {
 	auto &info = input.info->Cast<FabricatorTableFunctionInfo>();
@@ -1269,12 +1269,12 @@ unique_ptr<FunctionData> FabricatorTableFunctionBind(ClientContext &context, Tab
 		return appender.Finalize();
 	};
 
-	// 1) Bind the call (Phase 5 session model): table_bind resolves the output schema (-> return types),
+	// 1) Bind the call (Phase 5 session model): tablefn_bind resolves the output schema (-> return types),
 	//    whether the host should push the projection, and an opaque binding handle reused by every execution.
 	//    The managed side classifies the function (TVF / proc / custom), so the host no longer branches on
 	//    is_proc here (is_proc above is only the named-vs-positional arg marshaling). The binding is freed at
-	//    plan teardown via the refcounted TableBindState captured on the scan factory.
-	auto bind_state = make_shared_ptr<TableBindState>();
+	//    plan teardown via the refcounted TableFnBindState captured on the scan factory.
+	auto bind_state = make_shared_ptr<TableFnBindState>();
 	bind_data->factory = [handle, schema_name, func_name, arg_types, arg_names, properties, marshal_args,
 	                      bind_state](const fabricator::ArrowScanRequest &, ArrowArrayStream &out) {
 		if (arg_types.empty()) {
@@ -1284,7 +1284,7 @@ unique_ptr<FunctionData> FabricatorTableFunctionBind(ClientContext &context, Tab
 			// ArgumentNullException on 'fields'), so marshaling one fails the bind with an error that names
 			// nothing recognizable. Keeping this branch is what makes zero-argument table functions work,
 			// which is the shape a catalog-bound function that infers everything from its ATTACH wants.
-			bind_state->binding = fabricator::TableBind(handle, schema_name, func_name, nullptr, out,
+			bind_state->binding = fabricator::TableFnBind(handle, schema_name, func_name, nullptr, out,
 			                                          bind_state->supports_pushdown);
 			return;
 		}
@@ -1292,15 +1292,15 @@ unique_ptr<FunctionData> FabricatorTableFunctionBind(ClientContext &context, Tab
 		fabricator::ArrowProducer producer(arg_types, arg_names, properties);
 		producer.AddBatch(array);
 		producer.Finish();
-		bind_state->binding = fabricator::TableBind(handle, schema_name, func_name, producer.Stream(), out,
+		bind_state->binding = fabricator::TableFnBind(handle, schema_name, func_name, producer.Stream(), out,
 		                                          bind_state->supports_pushdown);
 	};
 	fabricator::PopulateReturnSchema(context, *bind_data, return_types, names);
 
-	// 2) Scan factory: table_execute over the bound binding (per execution). spec_json/filter_values push
+	// 2) Scan factory: tablefn_execute over the bound binding (per execution). spec_json/filter_values push
 	//    projection + filter into the SELECT when the binding supports it (a discovered TVF); else ignored.
 	bind_data->factory = [bind_state](const fabricator::ArrowScanRequest &req, ArrowArrayStream &out) {
-		fabricator::TableExecute(bind_state->binding, req.spec_json, req.filter_values, out);
+		fabricator::TableFnExecute(bind_state->binding, req.spec_json, req.filter_values, out);
 	};
 	bind_data->push_projection = bind_state->supports_pushdown;
 	return std::move(bind_data);
@@ -2293,8 +2293,8 @@ void RegisterFabricatorGlobalFunctions(ExtensionLoader &loader) {
 				loader.RegisterFunction(fn);
 			} else if (kind == "table") {
 				// A connection-free table function: positional args + the v29 table-session bind/scan, with
-				// handle = 0 so table_bind resolves the binding against the C# global registry by name. Output
-				// schema is arg-dependent (resolved per-call at table_bind). Mirrors GetOrCreateTableFunction's
+				// handle = 0 so tablefn_bind resolves the binding against the C# global registry by name. Output
+				// schema is arg-dependent (resolved per-call at tablefn_bind). Mirrors GetOrCreateTableFunction's
 				// non-proc branch (projection + best-effort filter pushdown; the binding decides honoring).
 				vector<string> arg_names;
 				vector<LogicalType> arg_types;

@@ -851,7 +851,7 @@
   `SqlServerTableValuedFunction.cs` `eb6c34e`). The inline TVF/proc SQL moved out of `SqlServerCatalog`
   into top-level `internal` wrappers (like `SqlServerScalarFunction`/`SqlServerTvfEach`), so
   `ExecuteTable` + `GetFunctionOutputSchema` are now **thin custom/TVF/proc dispatchers**. **Two
-  asymmetric shapes** (a real finding, not laziness): `SqlServerProcedure : IArrowTableFunction` (proc
+  asymmetric shapes** (a real finding, not laziness): `SqlServerProcedure : ITableFunction` (proc
   EXEC has no pushdown → full batches match the bind-time `OutputSchema`, so the `IAsyncEnumerable` +
   `AsyncEnumerableArrowStream` shape is correct); `SqlServerTableValuedFunction` is a **bespoke** wrapper
   (`OutputSchema` property + `ExecuteScan` returning the stream **directly**) — a pushdown source is
@@ -859,8 +859,8 @@
   the projected batches and must NOT be re-wrapped with the full schema (doing so crashed `arrow_ingest`
   with SIGSEGV on `SELECT sq FROM tf_ms(4)`). `ProcResultColumns`/`ProcOutputParams`/`FunctionOutputColumns`/
   `ScanFromSource` widened to `internal`. The **table-function session ABI v29** (`c2e452f`+`1f9fe96`) then
-  unified the dispatch under `IBoundTable` (`table_bind`/`table_execute`/`table_close`); see the Phase 5
-  section. The bespoke TVF could now fold into `IArrowTableFunction` (`table_execute` returns a stream) but
+  unified the dispatch under `IBoundTableFunction` (`tablefn_bind`/`tablefn_execute`/`tablefn_close`); see the Phase 5
+  section. The bespoke TVF could now fold into `ITableFunction` (`tablefn_execute` returns a stream) but
   needn't — the dispatch is already unified.
 
 - **Load-time global functions = the 4th provider-self-description capability** (**ALL FIVE kinds DONE — global
@@ -890,9 +890,9 @@
   `bind_data.string_order_pushable`; no ABI bump.
   The predicate drives the Delta file pruner `ReadAllAsync(columns, filter)` AND per-file Parquet row-group
   pruning via `ParquetReadOptions.Filter` on a per-scan `DeltaTableOptions` — no engineered-wood change). Column
-  PROJECTION into the Parquet read stays deferred: the shared `BindingBoundTable` wraps the result stream with
+  PROJECTION into the Parquet read stays deferred: the shared `BindingBoundTableFunction` wraps the result stream with
   the binding's FULL `OutputSchema`, so a projected subset mismatches it (arrow_ingest SIGSEGV) — DuckDB projects
-  above the scan instead (a pushdown-native `IBoundTable` would be needed; small follow-up). See
+  above the scan instead (a pushdown-native `IBoundTableFunction` would be needed; small follow-up). See
   docs/filesystem-bridge.md §"Streaming + filter pushdown".
   Connection-free, ATTACH-free functions registered at `Extension::Load`
   via `loader.RegisterFunction`. **Slice 1 built + verified**: `list_global_functions` enumerates the
@@ -909,10 +909,10 @@
   collector). **Full plan: [docs/global-functions.md](docs/global-functions.md)** — covers **all four kinds** (scalar / table
   / in-out / collector) through **one mechanism**: +1 ABI entry `list_global_functions` (enumerate the
   provider-union at load) + a **`handle==0` marker** on the existing *bind* entries (`get_function_*_schema` +
-  `execute_scalar`; `table_bind`; `inout_bind`) so the per-call binding resolves against a global registry — the
-  returned binding handle is concrete, so `table_execute`/`inout_exchange_open`/etc. are unchanged. **Global
+  `execute_scalar`; `tablefn_bind`; `inout_bind`) so the per-call binding resolves against a global registry — the
+  returned binding handle is concrete, so `tablefn_execute`/`inout_exchange_open`/etc. are unchanged. **Global
   table + in-out cost ZERO new ABI beyond the scalar entry** (arg-dependent output schema is already solved by the
-  v29 `table_bind` / v28 `inout_bind` sessions). C# = a base/derived interface split per kind (`IScalarFunction`
+  v29 `tablefn_bind` / v28 `inout_bind` sessions). C# = a base/derived interface split per kind (`IScalarFunction`
   + `ICatalogScalarFunction` [rename of `IArrowScalarFunction`], same for `ITableFunction`/`IInOutFunction`/
   `ICollectorTableFunction`) + `IBackend.GlobalScalarFunctions`/`GlobalTableFunctions`/`GlobalInOutFunctions`/
   `GlobalCollectorFunctions`; C++ `RegisterFabricatorGlobalFunctions` branches on `kind` at load →
@@ -920,15 +920,15 @@
   (Liquid, secure-by-default); (2) in-out/collector **DONE** (pure-C#, **no opener**; demos `fabricator_tag`
   streaming + `fabricator_collect_sum` collector; `inout_bind` handle-0 → C# global registry; reuses the v28
   exchange ABI, no bump — enables the effectful global *apply* half, e.g. `fabricator_apply_tmdl` collector);
-  (3) compute/connstr table **DONE** (`table_bind` handle-0 → `GlobalFunctions.ResolveTable` over the v29
+  (3) compute/connstr table **DONE** (`tablefn_bind` handle-0 → `GlobalFunctions.ResolveTable` over the v29
   session; the handle-0 `get_function_param_schema` is kind-agnostic via `GlobalFunctions.ParamSchema`;
-  `BindingBoundTable` moved to the Bridge; demos `fabricator_seq` fixed-schema + `fabricator_columns` arg-dependent
+  `BindingBoundTableFunction` moved to the Bridge; demos `fabricator_seq` fixed-schema + `fabricator_columns` arg-dependent
   schema); (4) aggregate **DONE** (`IAggregateFunction` base + `ICatalogAggregateFunction`; `AggSessionImpl` →
   the Bridge as public `AggregateSession` shared by catalog+global; `agg_open` handle-0 →
   `GlobalFunctions.ResolveAggregate`; `ParamSchema`/`ReturnField` kind-agnostic; shared
   `BuildFabricatorAggregateFunction`; reuses the v25/v26 `agg_*` ABI; demo `fabricator_product` — GROUP BY/parallel/
   OVER); (5) **deferred** host-FS table (secret-backed readers like delta) — needs an **opener arg** on
-  `table_bind`, delta stays bespoke until a 2nd such reader.
+  `tablefn_bind`, delta stays bespoke until a 2nd such reader.
   Composes with TMDL = render-via-(global)scalar then apply-via-(global)table/collector. The rest of this bullet
   is the original table-case detail.
   Today provider functions are **attach-time catalog-bound** (4e/4f/4g — resolved as `db.schema.fn`, dispatched
@@ -947,8 +947,8 @@
   `fabricator_delta.cpp`) — proof the scope exists. **Two wrinkles found while scoping the generic build (why it's
   deferred until a 2nd lakehouse format/provider lands, not justified by one function):** (1) **arg-dependent
   output schema** — a global table fn's columns depend on its args (delta's schema comes from the `path`), so the
-  generic registration must use the v27/v29 `table_bind`(args→schema+binding) shape, not the no-arg
-  `get_function_output_schema`; (2) **the opener vs SQL-connection split** — `table_bind`/`table_execute` pass the
+  generic registration must use the v27/v29 `tablefn_bind`(args→schema+binding) shape, not the no-arg
+  `get_function_output_schema`; (2) **the opener vs SQL-connection split** — `tablefn_bind`/`tablefn_execute` pass the
   **catalog handle** to C# (SQL fns use the catalog's `SqlConnection`), but `fabricator_delta_scan` needs the
   **host-FS opener (ClientContext)** for IO, which that path doesn't thread through. So **"build the generic
   global path" and "migrate delta onto it" are separable**: the generic path is cleanest for connection/
@@ -1180,7 +1180,7 @@
   `DaxCatalog.SystemTables`; bare `SELECT * FROM $SYSTEM.<dmv>`, no pushdown; metadata/scan branch on the
   `system` schema; 14 DMVs validated live), **`daxeval(expression := …, params := …)` function** (slice 4 +
   param binding — under the model schema; evaluates an arbitrary DAX `EVALUATE`/`DEFINE…EVALUATE` query,
-  output schema resolved at bind via `GetSchemaTable` no-describe, `DaxEvalBoundTable`, `SupportsPushdown=false`,
+  output schema resolved at bind via `GetSchemaTable` no-describe, `DaxEvalBoundTableFunction`, `SupportsPushdown=false`,
   streams; validated ROW/COUNTROWS/SUMMARIZECOLUMNS/full-table. **Registered `kind='proc'`** (not `'table'`)
   so args are NAMED params — that's what allows the optional `params` arg without breaking the no-arg call.
   **`params` accepts EITHER a DuckDB `STRUCT` (`{'a':40,'b':2}`, preferred — type-safe, no quoting) OR a
@@ -1216,15 +1216,15 @@ use the `fabricator` bucket — `docker-compose.yml` was renamed too, so the Min
   (validated live to 5000 rows). **The collector table-in-out (pipeline breaker) is BUILT + verified**: a
   second in-out execution shape (a Sink+Source: collect all input, emit at input-EOF) that coexists with the
   streaming exchange, picked by a new additive `kind='collector'`; reuses the v28
-  `inout_bind`/`inout_exchange_open` ABI as-is (no bump). C# `IArrowCollectorTableFunction`/
-  `IArrowCollectorBinding` (+ `StaticCollectorFunction` base, the `CollectorInOutBinding` adapter); C++
+  `inout_bind`/`inout_exchange_open` ABI as-is (no bump). C# `ICollectorTableFunction`/
+  `ICollectorBinding` (+ `StaticCollectorFunction` base, the `CollectorInOutBinding` adapter); C++
   `FabricatorCollector*` (in-out `Execute` buffers input into an `ArrowProducer` on the refcounted holder; the
   injected `FabricatorCollectorPhysical` Sink+Source opens the exchange at Finalize and **streams** the C# output
   — the Source pulls the `ArrowStreamReader` a vector-slice at a time, so **input is fully buffered (inherent)
   but output is never materialized**). SqlServer demo `dbo.cf_collect` (`test/verify_collector.test`, 40 —
   whole-table total, 5000-row multi-chunk, sequential-UNION threads=1, empty, NULLs, prepared re-exec; +50k-row
   streamed-output smoke). **`daxevaltable` migrated onto it**
-  (`DaxEvalTableBinding : IArrowCollectorBinding`, `kind='collector'`; reads the whole input into one DATATABLE
+  (`DaxEvalTableBinding : ICollectorBinding`, `kind='collector'`; reads the whole input into one DATATABLE
   → no 2048 cap; `daxeach` stays streaming `inout`) — validated live against Power BI Desktop
   (`test/verify_dax.test`, 29). In-out regression green: custom 89 / table_inout 63 /
   proc_inout 31 / isolation 17) + **`daxeach(<input>, expression := …)` in-out** (slice 5b — per-input-row
@@ -1376,7 +1376,7 @@ use the `fabricator` bucket — `docker-compose.yml` was renamed too, so the Min
   copy (different, non-assignable `IBackend` → 0 backends). The loader skips host-context-loaded assemblies (the
   shared set) + a `Resolving` hook probes plugin dirs for private deps. **Plugins must align their full
   dependency closure with the host (Apache.Arrow always)** — no version isolation without ALC. **The contract
-  assembly `Fabricator.Abstractions` is extracted** (the `I*Function`/`IBackend`/`IBoundTable`/`IAggregateSession`
+  assembly `Fabricator.Abstractions` is extracted** (the `I*Function`/`IBackend`/`IBoundTableFunction`/`IAggregateSession`
   interfaces + `ProviderSetting`/`SecretField`/`TableFunctionScan`/`ScanSpec`/`FilterNode`, kept in the
   `Fabricator.Bridge` namespace — assembly split only, zero source churn; Bridge references it, the
   ABI/marshaling/`BackendRegistry`/Static-bases/adapters stay in Bridge). `Fabricator.SamplePlugin` references
@@ -1451,8 +1451,8 @@ v29 table-function session, and the v30 removal of the dead `execute_table`/`exe
   or the wrapper as the base `IScalarFunction`, so `ExecuteScalar`/param/return-schema dispatch through ONE path. The
   chunked `SELECT [s].[f](@..) UNION ALL` (≤2100-param cap) moved into the wrapper's single-batch `Invoke`; the
   per-cap sub-queries merge into one column via a typed builder (no `ArrowArrayConcatenator`). C#-only, no ABI.
-- **Table `Bind` — DONE** (`feat(table)`, commit `85de4df`, **ABI v27**): `IArrowTableFunction.Bind(RecordBatch
-  args) → IArrowTableFunctionBinding { OutputSchema; SupportsPushdown; Execute(TableFunctionScan) }` — a custom
+- **Table `Bind` — DONE** (`feat(table)`, commit `85de4df`, **ABI v27**): `ITableFunction.Bind(RecordBatch
+  args) → ITableFunctionBinding { OutputSchema; SupportsPushdown; Execute(TableFunctionScan) }` — a custom
   TVF's **output schema may depend on its constant args** (the gap before: a static `OutputSchema` property).
   `get_function_output_schema` gained a nullable `args` 1-row stream (the C++ table bind marshals the args once
   for both the output-schema resolution and the scan; the in-out `_each` base lookup passes null). A
@@ -1463,32 +1463,32 @@ v29 table-function session, and the v30 removal of the dead `execute_table`/`exe
   `GetFunctionOutputSchema` branches + `FunctionOutputColumns`/`ProcResultColumns`/`ProcOutputParams`/
   `ScanFromSource`, the last four widened to `internal`) moved into top-level `internal` wrappers, leaving
   `ExecuteTable` + `GetFunctionOutputSchema` as **thin custom/TVF/proc dispatchers**. `SqlServerProcedure :
-  IArrowTableFunction` (proc EXEC has no pushdown → full batches match the bind-time `OutputSchema`, so the
+  ITableFunction` (proc EXEC has no pushdown → full batches match the bind-time `OutputSchema`, so the
   `IAsyncEnumerable`/`AsyncEnumerableArrowStream` shape is correct); but `SqlServerTableValuedFunction` is a
   **bespoke** wrapper (`OutputSchema` property + `ExecuteScan` → the `ScanFromSource` stream **returned
   directly**) — a pushdown source is stream-native, its stream schema IS the PROJECTED schema (matching the
   projected batches; re-wrapping it with the full schema crashed `arrow_ingest` — SIGSEGV on a column-subset
   projection `SELECT sq FROM tf_ms(4)`). C#-only (`execute_table`/`execute_proc` unchanged). Verified: full
   function suite green.
-- **Table-function session — DONE** (ABI v29: `c2e452f` surface + `1f9fe96` C++ rewire): `table_bind`
+- **Table-function session — DONE** (ABI v29: `c2e452f` surface + `1f9fe96` C++ rewire): `tablefn_bind`
   (resolve a per-plan binding → output schema/return types + `supports_pushdown` + an opaque handle) /
-  `table_execute` (run the scan, per execution) / `table_close` (free the binding at plan teardown), the
+  `tablefn_execute` (run the scan, per execution) / `tablefn_close` (free the binding at plan teardown), the
   session-handle successor to `get_function_output_schema`+`execute_table`/`execute_proc` in the table scan.
-  C++ `FabricatorTableFunctionBind` uses them; the `is_proc` **execute** branch is gone (`table_execute`
-  unifies TVF/proc/custom — C# `SqlServerCatalog.TableBind` classifies + returns an `IBoundTable`:
-  `TvfBoundTable` (SQL pushdown) or `BindingBoundTable` (proc positional / custom by-name)). `push_projection`
+  C++ `FabricatorTableFunctionBind` uses them; the `is_proc` **execute** branch is gone (`tablefn_execute`
+  unifies TVF/proc/custom — C# `SqlServerCatalog.TableFnBind` classifies + returns an `IBoundTableFunction`:
+  `TvfBoundTableFunction` (SQL pushdown) or `BindingBoundTableFunction` (proc positional / custom by-name)). `push_projection`
   = the binding's `supports_pushdown` (= `!is_proc`, behavior-preserving; `is_proc` survives only for the
   named-vs-positional arg marshaling). The binding is **reused across (prepared) re-executions** — proven by
   a `PREPARE`/`EXECUTE`-twice test (R2); `SqlServerTableValuedFunction.ExecuteScan` no longer consumes its
-  args, and the per-execution connection lives in `table_execute`'s stream (released by the arrow scan), so
-  the refcounted `TableBindState` only frees binding metadata at teardown (no `arrow_ingest` hook needed).
+  args, and the per-execution connection lives in `tablefn_execute`'s stream (released by the arrow scan), so
+  the refcounted `TableFnBindState` only frees binding metadata at teardown (no `arrow_ingest` hook needed).
 - **`execute_table`/`execute_proc` removed — DONE** (ABI v30, `8e2a194`): unused in C++ since v29, so the 2
   vtable entries + their `clr_host` wrappers + the Bootstrap handlers/assignments + the `Abi.cs` delegates +
   the `IBackendCatalog`/`StubBackend`/`SqlServerCatalog` methods are gone. A **mid-struct** removal (shifts
   every later entry's offset), so `abi.h` + `Abi.cs` field order stay in exact sync; the function suite is
   the alignment gate. **Optional remaining**: fold the bespoke `SqlServerTableValuedFunction` into
-  `IArrowTableFunction` now that `table_execute` returns a stream (organizational — the dispatch is already
-  unified under `IBoundTable`). Full design: the plan file's "Phase 5".
+  `ITableFunction` now that `tablefn_execute` returns a stream (organizational — the dispatch is already
+  unified under `IBoundTableFunction`). Full design: the plan file's "Phase 5".
 - **Verified**: inline TVF (`tf_nums(3)`→1,2,3), multi-column (`tf_pair(7,'hi')`), multi-statement
   (`tf_ms`→squares), and aggregation over a TVF. **Pushdown proven via the plan cache**: the statement that
   reached SQL Server was `SELECT [id],[name],[salary] FROM [dbo].[tf_emp](@a0) WHERE [id] <> @p0` (column
@@ -1539,8 +1539,8 @@ v29 table-function session, and the v30 removal of the dead `execute_table`/`exe
 - Beyond functions *discovered* from SQL Server, a provider can **author custom functions in C#**:
   - **4e scalar** — `ICatalogScalarFunction` (Bridge, derives the base `IScalarFunction`) = `SchemaName`/`Name`/`Parameters`(arg fields)/
     `Result`(field)/`Invoke(RecordBatch)→IArrowArray`. Demo `CustomFunctions.Scalar`: `dbo.cf_add(a,b)=a+b`.
-  - **4f table** — `IArrowTableFunction` (Bridge) = `SchemaName`/`Name`/`Parameters` + `Bind(args) →
-    IArrowTableFunctionBinding` (`OutputSchema` + `IAsyncEnumerable<RecordBatch> Execute(scan, ct)` — args = the
+  - **4f table** — `ITableFunction` (Bridge) = `SchemaName`/`Name`/`Parameters` + `Bind(args) →
+    ITableFunctionBinding` (`OutputSchema` + `IAsyncEnumerable<RecordBatch> Execute(scan, ct)` — args = the
     1-row positional call args; yields result batches **async/lazily**, streamed to the host via
     `AsyncEnumerableArrowStream`). Fixed-schema functions derive from `StaticTableFunction` (override
     `OutputSchema` + `IAsyncEnumerable<RecordBatch> Invoke(args, ct)`). Demos `CustomFunctions.Table`:
@@ -1612,12 +1612,12 @@ v29 table-function session, and the v30 removal of the dead `execute_table`/`exe
   parallel `UNION ALL` (coherent), `WHERE`, `ORDER BY`+`LIMIT`, aggregate, empty, multi-column, large
   50-row `BIGINT`→`INT` (sub-chunking + type round-trip), error mid-stream + recovery.
 - **Custom C#-authored in-out (4g-custom)** — *unified in Phase 6: the per-chunk `Process` shape below is now
-  the `StaticInOutFunction` base under the single `IArrowInOutFunction`, and runs on the streaming exchange
+  the `StaticInOutFunction` base under the single `IInOutFunction`, and runs on the streaming exchange
   (`InOutBind`), not the push `CustomInOutSessionImpl`/`InOutOpen` described here. See "Streaming table-in-out
   exchange (Phase 6)". The per-chunk semantics are unchanged; the original push wiring below is historical.*
   Original (push) design: `IArrowTableInOutFunction` (Bridge) =
   `SchemaName`/`Name`/`InputSchema`/`OutputSchema` + `IEnumerable<RecordBatch> Process(chunk)` (the in-out
-  analog of 4e `ICatalogScalarFunction` / 4f `IArrowTableFunction`). A pure-C# **per-chunk streaming**
+  analog of 4e `ICatalogScalarFunction` / 4f `ITableFunction`). A pure-C# **per-chunk streaming**
   table-in-out (no SQL object) that may keep mutable state across chunks (running aggregate — `Process` is
   invoked serially per session) and declares its **full** output (no input echo). There is no emit-at-end
   hook (a whole-table aggregate is a pipeline breaker, not a streaming in-out). Surfaced via
@@ -1630,7 +1630,7 @@ v29 table-function session, and the v30 removal of the dead `execute_table`/`exe
   `test/verify_custom_functions.test`.
 - **Per-row stored procs (4g-proc → now on the exchange, `9056eae`)**: a discovered proc also gets `_each`
   (C++ `AddTableFunction` registers the alias for procs too; a proc can't be inline-CROSS-APPLY'd, so it's
-  EXEC'd per input row). **Now on the streaming exchange** (`SqlServerProcEach : IArrowInOutBinding`, resolved
+  EXEC'd per input row). **Now on the streaming exchange** (`SqlServerProcEach : IInOutBinding`, resolved
   by `InOutBind` — proc vs TVF classified by ROUTINE_COLUMNS): `DoExchange` runs, per input row, `DECLARE @t
   TABLE(<proc result>); INSERT @t EXEC [s].[p] @param=@p,…; SELECT <echoed input>, t.* FROM @t;` on **DuckDB's
   pinned connection/`_txn`** (`BeginWrite`) — echo is server-side (output = input cols ++ proc result cols),
@@ -1655,7 +1655,7 @@ fully retired). No per-chunk materialization: output streams via two pull-based 
 a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` (operator + custom), `330d2c7`
 (discovered TVF), `9056eae` (proc). Design + the 6.0 spike: the plan file's "Phase 6".
 - **Three bindings, one `DoExchange` shape** (resolved by `InOutBind`, which classifies custom / TVF / proc):
-  a custom C# in-out (`IArrowInOutFunction`); a discovered TVF `_each` (`SqlServerTvfEach` — per-row CROSS
+  a custom C# in-out (`IInOutFunction`); a discovered TVF `_each` (`SqlServerTvfEach` — per-row CROSS
   APPLY on its **own read-only** connection at the configured isolation); a stored-proc `_each`
   (`SqlServerProcEach` — per-row `EXEC` on **DuckDB's pinned write** connection (`BeginWrite`), no commit/
   dispose, so the proc's writes commit/roll back with DuckDB's COMMIT/ROLLBACK). The gate (`MaxThreads=1`)
@@ -1663,12 +1663,12 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   read-your-writes + ROLLBACK) holds — verified by `verify_proc_inout`. The 4g push operator (`FabricatorInOut*`)
   + the `inout_open`/`push`/`finish`/`abort` ABI + `IInOutSession`/`InOutOpen` were **removed at ABI v31**
   (`49e6d94`); the exchange is the only in-out path.
-- **Author API** (`IArrowInOutBinding`, Bridge): `Schema OutputSchema` + `IAsyncEnumerable<RecordBatch>
+- **Author API** (`IInOutBinding`, Bridge): `Schema OutputSchema` + `IAsyncEnumerable<RecordBatch>
   DoExchange(IAsyncEnumerable<RecordBatch> input, ct)`. `input` yields one batch per DuckDB input chunk; the
   returned enumerable maps to the operator contract — non-empty = HAVE_MORE_OUTPUT, **length-0 = the
   per-input sentinel (NEED_MORE_INPUT)**, end-of-enumerable = FINISHED. **The author yields the sentinel** (the
   decision after the 6.0 spike — a free-form `DoExchange` is incompatible with the single-slot gate unless the
-  author delimits per chunk; the framework can't inject it without deadlocking). `IArrowInOutIsolation` is the
+  author delimits per chunk; the framework can't inject it without deadlocking). `IInOutIsolation` is the
   optional SQL-isolation hook (the framework sets it before `DoExchange`; pure-C# bindings ignore it).
 - **ABI v28** (`abi.h`): `inout_bind(handle, schema, func, args, input_schema, out_schema, out_binding)` resolves
   the FULL output schema (input echo ++ the function's own columns) in C# + returns a binding handle (reused
@@ -1679,13 +1679,13 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
 - **C# pump** (`InOutExchange.cs`, Bridge): `InOutExchangeStream` exposes `DoExchange` as a pull-based
   `IArrowArrayStream` — the Arrow C-stream exporter blocks on `ReadNextRecordBatchAsync` (sync-over-async; the
   hostfxr CLR has no `SynchronizationContext`, so `GetResult` can't deadlock — proven by the 6.0 spike).
-  Custom authors implement **one** interface, `IArrowInOutFunction.Bind(args,inputSchema) →
-  IArrowInOutBinding` (registry `CustomInOut`, resolved by `InOutBind`): the author writes `DoExchange` —
+  Custom authors implement **one** interface, `IInOutFunction.Bind(args,inputSchema) →
+  IInOutBinding` (registry `CustomInOut`, resolved by `InOutBind`): the author writes `DoExchange` —
   reads the input stream, yields output batches, and yields a length-0 sentinel after each input chunk, with
   cross-chunk state in `DoExchange` locals (a fresh enumerator runs per exchange, so state never leaks across
   re-executions). For a FIXED output schema, derive from the convenience base **`StaticInOutFunction`**
   (override `OutputSchema` + `DoExchange`; the base supplies the `Bind`→binding wiring) — it is to
-  `IArrowInOutFunction` what `StaticTableFunction` is to `IArrowTableFunction`. Demos `cf_tag` (stateless),
+  `IInOutFunction` what `StaticTableFunction` is to `ITableFunction`. Demos `cf_tag` (stateless),
   `cf_running_sum` (cumulative-sum local), `cf_exchange` (row-index local) all use it. `SqlServerTvfEach`
   (`SqlServerTvfEach.cs`) runs the per-row CROSS APPLY inside `DoExchange` on one pinned connection +
   transaction (the streaming successor to the deleted `InOutSessionImpl`). `InOutExchange.EmptyBatch` builds
@@ -1706,14 +1706,14 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   binding (`SqlServerTvfEach` read-only conn / `SqlServerProcEach` DuckDB's pinned write conn).
 - **Verified**: `verify_custom_functions` (73 — incl. parallel UNION ALL + a `threads=1` sequential-union case,
   the schedule a premature-finish bug would drop rows on); `verify_table_inout` (63, TVF now on the exchange);
-  `verify_inout_isolation` (17, via `IArrowInOutIsolation`); `verify_proc_inout` (31, push, unregressed). Full
+  `verify_inout_isolation` (17, via `IInOutIsolation`); `verify_proc_inout` (31, push, unregressed). Full
   suite 20/20.
 
 ### Callable aggregate functions (4h — custom C# UDAF)
 - **Scope**: provider-authored aggregates in C# (there are no SQL Server aggregates to discover), attach-time +
   catalog-bound (`db.dbo.cf_agg(x)`), usable in `GROUP BY`, parallel aggregation, and window (`OVER`) contexts.
-  Authored via Bridge `IArrowAggregateFunction` (`SchemaName`/`Name`/`Parameters`/`Result`/`CreateState()`) +
-  `IArrowAggregateState` (`Update(RecordBatch)`/`Combine(other)`/`object? Finalize()`). Demos
+  Authored via Bridge `IAggregateFunction` (`SchemaName`/`Name`/`Parameters`/`Result`/`CreateState()`) +
+  `IAggregateState` (`Update(RecordBatch)`/`Combine(other)`/`object? Finalize()`). Demos
   `CustomFunctions.Aggregate`: `dbo.cf_product` (numeric product) + `dbo.cf_bit_or` (bitwise OR fold).
 - **State model (the crux)**: DuckDB's aggregate model is *state-vectorized* — it owns a contiguous array of
   fixed-size state blobs and drives reduction through `state_size`/`initialize`/`update`/`simple_update`/
@@ -1753,8 +1753,8 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   `LookupEntry(SCALAR_FUNCTION_ENTRY)` **falls back to the aggregate** (plus an explicit `AGGREGATE_FUNCTION_ENTRY`
   branch). Discovery routes `kind=='aggregate'` → `AddAggregateFunction`.
 - **Opt-in disk-spill (`SupportsSpill`, ABI v26)**: by default the state lives in C# (fast, bounded by managed
-  memory, no spill). A provider can instead set `IArrowAggregateFunction.SupportsSpill=true` (+ implement
-  `IArrowAggregateState.Serialize()`/`Load()`) → **bytes-in-blob mode**: the per-group state is serialized into
+  memory, no spill). A provider can instead set `IAggregateFunction.SupportsSpill=true` (+ implement
+  `IAggregateState.Serialize()`/`Load()`) → **bytes-in-blob mode**: the per-group state is serialized into
   DuckDB's fixed, pointer-free state blob (`[uint32 len][byte data[FABRICATOR_AGG_SPILL_CAP=1 KB]]`) so DuckDB's
   external GROUP BY spills it to disk under memory pressure. Surfaced as `kind='aggregate_spill'`; `state_size`/
   `initialize` (sentinel len, no C# call) and update/combine/finalize/destroy all branch on the `spillable`

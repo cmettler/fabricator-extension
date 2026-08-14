@@ -120,7 +120,7 @@ internal sealed class FabricTableMaintenanceFunction : ICatalogTableFunction
         FabricApiFunctions.Str("item"),
     }, null);
 
-    public IArrowTableFunctionBinding Bind(RecordBatch args) => new Binding(_api, args);
+    public ITableFunctionBinding Bind(RecordBatch args) => new Binding(_api, args);
 
     private sealed class Binding : FabricTableBinding
     {
@@ -243,7 +243,7 @@ internal sealed class FabricRunJobFunction : ICatalogTableFunction
         FabricApiFunctions.Str("item_type"),
     }, null);
 
-    public IArrowTableFunctionBinding Bind(RecordBatch args) => new Binding(_api, args);
+    public ITableFunctionBinding Bind(RecordBatch args) => new Binding(_api, args);
 
     private sealed class Binding : FabricTableBinding
     {
@@ -320,7 +320,7 @@ internal sealed class FabricJobStatusFunction : ICatalogTableFunction
         FabricApiFunctions.Str("item_type"),
     }, null);
 
-    public IArrowTableFunctionBinding Bind(RecordBatch args) => new Binding(_api, args);
+    public ITableFunctionBinding Bind(RecordBatch args) => new Binding(_api, args);
 
     private sealed class Binding : FabricTableBinding
     {
@@ -400,7 +400,7 @@ internal sealed class FabricJobInstancesFunction : ICatalogTableFunction
         FabricApiFunctions.Str("item_type"),
     }, null);
 
-    public IArrowTableFunctionBinding Bind(RecordBatch args) => new Binding(_api, args);
+    public ITableFunctionBinding Bind(RecordBatch args) => new Binding(_api, args);
 
     private sealed class Binding : FabricTableBinding
     {
@@ -594,7 +594,7 @@ internal sealed class FabricResetShortcutCacheFunction : ICatalogTableFunction
     public Schema NamedParameters { get; } =
         new Schema(new[] { FabricApiFunctions.Str("workspace") }, null);
 
-    public IArrowTableFunctionBinding Bind(RecordBatch args) => new Binding(_api, FabricArgs.Str(args, 0));
+    public ITableFunctionBinding Bind(RecordBatch args) => new Binding(_api, FabricArgs.Str(args, 0));
 
     private sealed class Binding : FabricTableBinding
     {
@@ -644,7 +644,7 @@ internal sealed class FabricOperationStatusFunction : ICatalogTableFunction
 
     public Schema Parameters { get; } = new Schema(new[] { FabricApiFunctions.Str("operation_id") }, null);
 
-    public IArrowTableFunctionBinding Bind(RecordBatch args) => new Binding(_api, FabricArgs.Str(args, 0));
+    public ITableFunctionBinding Bind(RecordBatch args) => new Binding(_api, FabricArgs.Str(args, 0));
 
     private sealed class Binding : FabricTableBinding
     {
@@ -734,7 +734,7 @@ internal sealed class FabricLakehouseTablesFunction : ICatalogTableFunction
         FabricApiFunctions.Str("item"),
     }, null);
 
-    public IArrowTableFunctionBinding Bind(RecordBatch args) =>
+    public ITableFunctionBinding Bind(RecordBatch args) =>
         new Binding(_api, FabricArgs.Str(args, 0), FabricArgs.Str(args, 1));
 
     private sealed class Binding : FabricTableBinding

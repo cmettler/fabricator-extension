@@ -55,7 +55,7 @@ internal sealed class FabricRunNotebookFunction : ICatalogTableFunction
         FabricApiFunctions.Str("workspace"),
     }, null);
 
-    public IArrowTableFunctionBinding Bind(RecordBatch args) => new Binding(_api, args);
+    public ITableFunctionBinding Bind(RecordBatch args) => new Binding(_api, args);
 
     private sealed class Binding : FabricTableBinding
     {

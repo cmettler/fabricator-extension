@@ -102,7 +102,7 @@ public unsafe struct FabricatorVTable
     public delegate* unmanaged[Cdecl]<nint, byte*, byte*, CArrowArrayStream*, CArrowSchema*, byte**, int> GetFunctionOutputSchema;
 
     // (execute_table / execute_proc were removed at ABI v30 — superseded by the table-function session
-    //  table_bind / table_execute / table_close below.)
+    //  tablefn_bind / tablefn_execute / tablefn_close below.)
 
     // (inout_open / inout_push / inout_finish / inout_abort were removed at ABI v31 — every `_each` form now
     //  runs on the streaming exchange: inout_bind / inout_exchange_open / inout_bind_close below.)
@@ -144,15 +144,15 @@ public unsafe struct FabricatorVTable
     // int32 inout_bind_close(void* binding, char** err)
     public delegate* unmanaged[Cdecl]<nint, byte**, int> InOutBindClose;
 
-    // int32 table_bind(void* handle, const char* schema, const char* func, ArrowArrayStream* args /*nullable*/,
+    // int32 tablefn_bind(void* handle, const char* schema, const char* func, ArrowArrayStream* args /*nullable*/,
     //                  ArrowArrayStream* out_schema, int* supports_pushdown, void** out_binding, char** err)
-    public delegate* unmanaged[Cdecl]<nint, byte*, byte*, CArrowArrayStream*, CArrowArrayStream*, int*, nint*, byte**, int> TableBind;
+    public delegate* unmanaged[Cdecl]<nint, byte*, byte*, CArrowArrayStream*, CArrowArrayStream*, int*, nint*, byte**, int> TableFnBind;
 
-    // int32 table_execute(void* binding, const char* spec_json, ArrowArrayStream* filter_values, ArrowArrayStream* out, char** err)
-    public delegate* unmanaged[Cdecl]<nint, byte*, CArrowArrayStream*, CArrowArrayStream*, byte**, int> TableExecute;
+    // int32 tablefn_execute(void* binding, const char* spec_json, ArrowArrayStream* filter_values, ArrowArrayStream* out, char** err)
+    public delegate* unmanaged[Cdecl]<nint, byte*, CArrowArrayStream*, CArrowArrayStream*, byte**, int> TableFnExecute;
 
-    // int32 table_close(void* binding, char** err)
-    public delegate* unmanaged[Cdecl]<nint, byte**, int> TableClose;
+    // int32 tablefn_close(void* binding, char** err)
+    public delegate* unmanaged[Cdecl]<nint, byte**, int> TableFnClose;
 
     // int32 list_settings(ArrowArrayStream* out, char** err)
     public delegate* unmanaged[Cdecl]<CArrowArrayStream*, byte**, int> ListSettings;

@@ -76,10 +76,10 @@ internal abstract class FabricRowsFunction : ICatalogTableFunction
     /// Extracts the arguments HERE, while the batch is valid, rather than holding it.
     /// </summary>
     /// <remarks>
-    /// The args batch is imported from a stream the ABI handler disposes when <c>table_bind</c> returns, so a
+    /// The args batch is imported from a stream the ABI handler disposes when <c>tablefn_bind</c> returns, so a
     /// binding that kept a reference would be reading freed Arrow buffers at execution time.
     /// </remarks>
-    public IArrowTableFunctionBinding Bind(RecordBatch args)
+    public ITableFunctionBinding Bind(RecordBatch args)
     {
         int n = Parameters.FieldsList.Count + NamedParameters.FieldsList.Count;
         var values = new string?[n];

@@ -985,8 +985,8 @@ public sealed class DeltaRsCatalog : IBackendCatalog
     public Schema GetFunctionReturnSchema(string s, string f) => throw NoFunctions();
     public IArrowArrayStream ExecuteScalar(string s, string f, IArrowArrayStream a) => throw NoFunctions();
     public Schema GetFunctionOutputSchema(string s, string f, RecordBatch? a = null) => throw NoFunctions();
-    public IBoundTable TableBind(string s, string f, RecordBatch? a) => throw NoFunctions();
-    public IArrowInOutBinding InOutBind(string s, string f, RecordBatch? a, Schema inputSchema) => throw NoFunctions();
+    public IBoundTableFunction TableFnBind(string s, string f, RecordBatch? a) => throw NoFunctions();
+    public IInOutBinding InOutBind(string s, string f, RecordBatch? a, Schema inputSchema) => throw NoFunctions();
     public IAggregateSession AggOpen(string s, string f) => throw NoFunctions();
 
     public void Dispose() => _engine.Dispose();

@@ -16,9 +16,9 @@ not C++:
 | semantic model = catalog; models→schemas, tables, columns | `IBackend.OpenCatalog` + `IBackendCatalog.GetMetadata` (DMV queries) → the C++ catalog core |
 | table scan → `EVALUATE SELECTCOLUMNS('T', …)` | `IBackendCatalog.ScanTable` (projection pushdown; filter best-effort/skip) |
 | `AdomdDataReader` → Arrow | `AdomdDataReader : DbDataReader` → the bridge's `DbDataReaderArrowStream` + a DAX→Arrow type map |
-| `daxeval(expr, params)` | `IArrowTableFunction.Bind(args)` (the no-describe schema resolution → the v27 binding model) |
-| `daxevaltable(expr, <table>)` (DATATABLE inject) | `IArrowInOutFunction.DoExchange` (Phase 6 exchange) |
-| `daxapply(expr, <table>)` (per-row params) | `IArrowInOutFunction.DoExchange` (per-row bind) |
+| `daxeval(expr, params)` | `ITableFunction.Bind(args)` (the no-describe schema resolution → the v27 binding model) |
+| `daxevaltable(expr, <table>)` (DATATABLE inject) | `IInOutFunction.DoExchange` (Phase 6 exchange) |
+| `daxapply(expr, <table>)` (per-row params) | `IInOutFunction.DoExchange` (per-row bind) |
 | connstr/auth, settings, secret fields | the provider-self-description family (v33/v37/v38) |
 
 So the C++ core, the function machinery, and the provider plumbing are reused verbatim — **no ABI change**
@@ -163,7 +163,7 @@ which caps at 19.84.1) loads in net10 (win-x64), connects to local PBI Desktop, 
    Registered via `GetMetadata(Functions)` with **`kind='proc'`** (not `'table'`) so its args register as
    **named parameters** — that's what lets it take an *optional* second arg without breaking the no-arg call.
    `GetFunctionParamSchema` returns `expression VARCHAR` (required) + `params VARCHAR` (optional). The C++
-   table-session path calls `TableBind(schema, func, args)` → `DaxEvalBoundTable`: **bind** resolves the
+   table-session path calls `TableFnBind(schema, func, args)` → `DaxEvalBoundTableFunction`: **bind** resolves the
    output schema by executing the query + `GetSchemaTable` (no rows fetched — the no-describe approach;
    arg-dependent, the columns follow the DAX); **`Execute`** re-runs the query and streams via `DaxArrowStream`.
    `SupportsPushdown = false` (an arbitrary DAX query can't be wrapped — DuckDB projects/filters/aggregates

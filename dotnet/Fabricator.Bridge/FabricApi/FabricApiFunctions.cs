@@ -192,7 +192,7 @@ public static class FabricApiFunctions
 /// use-after-free (it aborts on macOS, silently corrupts elsewhere). Same contract as
 /// <see cref="StaticTableFunction"/>.
 /// </remarks>
-internal abstract class FabricTableBinding : IArrowTableFunctionBinding
+internal abstract class FabricTableBinding : ITableFunctionBinding
 {
     public abstract Schema OutputSchema { get; }
 
@@ -278,7 +278,7 @@ internal sealed class FabricRefreshSqlEndpointFunction : ICatalogTableFunction
         FabricApiFunctions.Str("item"),
     }, null);
 
-    public IArrowTableFunctionBinding Bind(RecordBatch args) => new Binding(_api, args);
+    public ITableFunctionBinding Bind(RecordBatch args) => new Binding(_api, args);
 
     private sealed class Binding : FabricTableBinding
     {
@@ -593,7 +593,7 @@ internal sealed class FabricListShortcutsFunction : ICatalogTableFunction
         FabricApiFunctions.Str("item"),
     }, null);
 
-    public IArrowTableFunctionBinding Bind(RecordBatch args) =>
+    public ITableFunctionBinding Bind(RecordBatch args) =>
         new Binding(_api, FabricArgs.Str(args, 0), FabricArgs.Str(args, 1), FabricArgs.Str(args, 2));
 
     private sealed class Binding : FabricTableBinding

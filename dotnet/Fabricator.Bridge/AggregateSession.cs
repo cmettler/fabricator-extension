@@ -9,7 +9,7 @@ namespace Fabricator.Bridge;
 
 /// <summary>
 /// The provider-agnostic session for a custom aggregate (UDAF) — maps DuckDB's per-group <c>int64</c> state
-/// ids to live C# accumulators (<see cref="IArrowAggregateState"/>). The C++ aggregate callbacks marshal
+/// ids to live C# accumulators (<see cref="IAggregateState"/>). The C++ aggregate callbacks marshal
 /// <c>[id ++ args]</c> (update), <c>[target_id, source_id]</c> (combine), and <c>[id]</c> (finalize/destroy)
 /// over the <c>agg_*</c> ABI; this routes them. A given id is touched by one thread at a time (DuckDB
 /// partitions per thread; combine is partition-disjoint), so a <see cref="ConcurrentDictionary{TKey,TValue}"/>
@@ -21,7 +21,7 @@ public sealed class AggregateSession : IAggregateSession
 {
     private readonly IAggregateFunction _fn;
     private readonly Schema _updateSchema;
-    private readonly ConcurrentDictionary<long, IArrowAggregateState> _states = new();
+    private readonly ConcurrentDictionary<long, IAggregateState> _states = new();
 
     public AggregateSession(IAggregateFunction fn)
     {
@@ -36,7 +36,7 @@ public sealed class AggregateSession : IAggregateSession
 
     public Schema UpdateSchema => _updateSchema;
 
-    private IArrowAggregateState StateFor(long id) => _states.GetOrAdd(id, _ => _fn.CreateState());
+    private IAggregateState StateFor(long id) => _states.GetOrAdd(id, _ => _fn.CreateState());
 
     public void Update(RecordBatch idPlusArgs)
     {
@@ -49,7 +49,7 @@ public sealed class AggregateSession : IAggregateSession
     // Groups the [key ++ args] batch by column 0 and folds each group's rows into stateFor(key).Update(...).
     // Shared by the fast Update (key = state id) and UpdateSpill (key = group slot). Does NOT dispose the
     // batch (the caller owns it).
-    private void GroupAndApply(RecordBatch keyPlusArgs, Func<long, IArrowAggregateState> stateFor)
+    private void GroupAndApply(RecordBatch keyPlusArgs, Func<long, IAggregateState> stateFor)
     {
         int rows = keyPlusArgs.Length;
         if (rows == 0)
@@ -161,7 +161,7 @@ public sealed class AggregateSession : IAggregateSession
     private static readonly Schema StateSchema =
         new(new[] { new Field("state", BinaryType.Default, nullable: true) }, null);
 
-    private IArrowAggregateState LoadOrFresh(BinaryArray states, int i)
+    private IAggregateState LoadOrFresh(BinaryArray states, int i)
     {
         var s = _fn.CreateState();
         if (!states.IsNull(i))
@@ -171,7 +171,7 @@ public sealed class AggregateSession : IAggregateSession
         return s;
     }
 
-    private static IArrowArrayStream StateStream(IReadOnlyList<IArrowAggregateState> states)
+    private static IArrowArrayStream StateStream(IReadOnlyList<IAggregateState> states)
     {
         var b = new BinaryArray.Builder().Reserve(states.Count);
         foreach (var s in states)
@@ -189,7 +189,7 @@ public sealed class AggregateSession : IAggregateSession
         {
             var statesArr = (BinaryArray)groupStates.Column(0);
             int g = groupStates.Length;
-            var states = new IArrowAggregateState[g];
+            var states = new IAggregateState[g];
             for (int i = 0; i < g; i++)
             {
                 states[i] = LoadOrFresh(statesArr, i);
@@ -207,7 +207,7 @@ public sealed class AggregateSession : IAggregateSession
         {
             var tArr = (BinaryArray)targetStates.Column(0);
             int g = targetStates.Length;
-            var targets = new IArrowAggregateState[g];
+            var targets = new IAggregateState[g];
             for (int i = 0; i < g; i++)
             {
                 targets[i] = LoadOrFresh(tArr, i);

@@ -8,13 +8,13 @@ namespace Fabricator.Bridge;
 /// answer <c>SupportsProjectionPushdown</c> = true.
 /// </summary>
 /// <remarks>
-/// <para><b>ONE resolver, used twice on purpose.</b> <see cref="BindingBoundTable"/> declares the stream's
+/// <para><b>ONE resolver, used twice on purpose.</b> <see cref="BindingBoundTableFunction"/> declares the stream's
 /// schema with it and the binding builds its read with it, so the batches and the declared schema cannot
 /// disagree — and a disagreement is not an error here, it is <c>arrow_ingest</c> reading past the end
 /// (SIGSEGV). Two independent derivations of "which columns, in what order" would be one edit away from
 /// that at all times.</para>
 /// <para>⚠ THE ORDER IS THE DECLARED SCHEMA'S, NOT THE REQUEST'S, AND THAT IS REQUIRED RATHER THAN TIDY —
-/// MEASURED. DuckDB maps these results by name (<see cref="IBoundTable.MapResultByName"/>), so the request's
+/// MEASURED. DuckDB maps these results by name (<see cref="IBoundTableFunction.MapResultByName"/>), so the request's
 /// order does not bind the result; but <b>engineered-wood emits in SCHEMA order whatever order it is asked
 /// in</b>. Ordering by the request therefore makes the declaration disagree with the batches for any query
 /// that asks out of schema order — and the failure is not a wrong answer, it is

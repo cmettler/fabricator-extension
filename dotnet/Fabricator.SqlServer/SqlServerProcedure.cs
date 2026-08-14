@@ -45,9 +45,9 @@ internal sealed class SqlServerProcedure : ICatalogTableFunction
         }
     }
 
-    public IArrowTableFunctionBinding Bind(RecordBatch args) => new Binding(_owner, _schema, _func, args);
+    public ITableFunctionBinding Bind(RecordBatch args) => new Binding(_owner, _schema, _func, args);
 
-    private sealed class Binding : IArrowTableFunctionBinding
+    private sealed class Binding : ITableFunctionBinding
     {
         private readonly SqlServerCatalog _owner;
         private readonly string _schema;

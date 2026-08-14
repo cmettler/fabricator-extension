@@ -141,7 +141,7 @@ internal static class FabricSessionFunctions
             FabricApiFunctions.Bool("all_workspaces"),
         }, null);
 
-        public IArrowTableFunctionBinding Bind(RecordBatch args) => new Binding(_api, args);
+        public ITableFunctionBinding Bind(RecordBatch args) => new Binding(_api, args);
 
         private sealed class Binding : FabricTableBinding
         {

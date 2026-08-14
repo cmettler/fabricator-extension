@@ -52,12 +52,13 @@ public static class GlobalFunctions
     /// <summary>All declared global table functions, for <c>list_global_functions</c>.</summary>
     public static IReadOnlyCollection<ITableFunction> AllTables() => (IReadOnlyCollection<ITableFunction>)TableMap.Value.Values;
 
-    /// <summary>Bind a global table function by name (the handle-0 table_bind path) → an IBoundTable. Wraps the
-    /// arg-dependent binding in a <see cref="BindingBoundTable"/> (by-name projection mapping, like a custom
-    /// table function); DuckDB re-applies filters above the scan.</summary>
-    public static IBoundTable ResolveTable(string name, RecordBatch? args) =>
+    /// <summary>Bind a global table function by name (the handle-0 tablefn_bind path) → an
+    /// IBoundTableFunction. Wraps the arg-dependent binding in a <see cref="BindingBoundTableFunction"/>
+    /// (by-name projection mapping, like a custom table function); DuckDB re-applies filters above the
+    /// scan.</summary>
+    public static IBoundTableFunction ResolveTable(string name, RecordBatch? args) =>
         TableMap.Value.TryGetValue(name, out var t)
-            ? new BindingBoundTable(t.Bind(args!), supportsPushdown: true)
+            ? new BindingBoundTableFunction(t.Bind(args!), supportsPushdown: true)
             : throw new ArgumentException($"fabricator: no global table function '{name}'");
 
     /// <summary>All declared global aggregate functions, for <c>list_global_functions</c>.</summary>
@@ -124,7 +125,7 @@ public static class GlobalFunctions
 
     /// <summary>Bind a global in-out OR collector by name (the handle-0 inout_bind path). A collector is wrapped
     /// in a <see cref="CollectorInOutBinding"/> so it flows through the shared exchange marshaling.</summary>
-    public static IArrowInOutBinding ResolveInOut(string name, RecordBatch? args, Schema inputSchema)
+    public static IInOutBinding ResolveInOut(string name, RecordBatch? args, Schema inputSchema)
     {
         if (InOutMap.Value.TryGetValue(name, out var io))
         {

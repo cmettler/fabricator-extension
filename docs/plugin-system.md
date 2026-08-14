@@ -40,7 +40,7 @@ not Native AOT (ALC exists) and not loading .NET Framework 4.x assemblies (CoreC
 ## The crux — Apache.Arrow MUST be shared (the whole boundary hinges on this)
 
 Every cross-boundary call traffics **Apache.Arrow** types: `IScalarFunction.Parameters → Schema`,
-`Invoke(RecordBatch) → IArrowArray`, `IArrowTableFunctionBinding.Execute → IArrowArrayStream`, and the bridge's
+`Invoke(RecordBatch) → IArrowArray`, `ITableFunctionBinding.Execute → IArrowArrayStream`, and the bridge's
 C-ABI marshaling (`CArrowArrayStreamExporter`/`Importer`, `CArrowSchemaExporter`) all operate on `Apache.Arrow`
 types. **Types from different ALCs are not assignable.** So if a plugin loaded its own `Apache.Arrow`, its
 `RecordBatch` would be a *different type* than the bridge's and every `Invoke`/`Bind`/export would throw
@@ -57,9 +57,9 @@ Therefore:
 ## The shared boundary for fabricator
 
 Extract a thin **`Fabricator.Abstractions`** assembly = the interfaces + the Arrow-typed contract POCOs
-(`IBackend`, `IBackendCatalog`, `IScalarFunction`/`ICatalog*`, `ITableFunction`/`IArrowTableFunctionBinding`,
-`IInOutFunction`, `ICollectorTableFunction`, `IAggregateFunction`/`IArrowAggregateState`/`IAggregateSession`,
-`ProviderSetting`, `SecretField`, `TableFunctionScan`, `ScanSpec`, `FilterNode`, `IBoundTable`, …). Shared
+(`IBackend`, `IBackendCatalog`, `IScalarFunction`/`ICatalog*`, `ITableFunction`/`ITableFunctionBinding`,
+`IInOutFunction`, `ICollectorTableFunction`, `IAggregateFunction`/`IAggregateState`/`IAggregateSession`,
+`ProviderSetting`, `SecretField`, `TableFunctionScan`, `ScanSpec`, `FilterNode`, `IBoundTableFunction`, …). Shared
 (default context). `Fabricator.Bridge` references it and keeps the ABI/marshaling/`Bootstrap`/`GlobalFunctions`/
 `BackendRegistry` (also default context — it's the hostfxr entry assembly). A plugin references **only**
 `Fabricator.Abstractions` + `Apache.Arrow` (both host-provided, NOT copied into the plugin dir) + its own private
@@ -154,7 +154,7 @@ discipline (and the restrictions collectible ALCs impose). We never unload a plu
    discovery. Plugins reference `Fabricator.Bridge` directly (no `Abstractions` needed without ALC — everything is
    one context). Sample plugin + `verify_plugin.test`. **Plugins must align their full dependency closure with
    the host** (Apache.Arrow always; every other shared dep too — there is no version isolation without ALC).
-2. **Extract `Fabricator.Abstractions` — DONE** — the contract surface (the `I*Function`/`IBackend`/`IBoundTable`/
+2. **Extract `Fabricator.Abstractions` — DONE** — the contract surface (the `I*Function`/`IBackend`/`IBoundTableFunction`/
    `IAggregateSession` interfaces + `ProviderSetting`/`SecretField`/`TableFunctionScan`/`ScanSpec`/`FilterNode`)
    is now a separate assembly, **kept in the `Fabricator.Bridge` namespace** (assembly split only — zero source
    churn). `Fabricator.Bridge` references it (the ABI/marshaling/`Bootstrap`/`BackendRegistry`/Static-bases/

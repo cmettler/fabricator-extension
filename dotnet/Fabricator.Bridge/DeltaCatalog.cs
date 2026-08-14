@@ -5410,10 +5410,10 @@ public sealed class DeltaCatalog : IBackendCatalog
     public Schema GetFunctionOutputSchema(string s, string f, RecordBatch? a = null) =>
         Functions.OutputSchema(s, f, a) ?? throw NoFunction(s, f);
 
-    public IBoundTable TableBind(string s, string f, RecordBatch? a) =>
-        Functions.TableBind(s, f, a) ?? throw NoFunction(s, f);
+    public IBoundTableFunction TableFnBind(string s, string f, RecordBatch? a) =>
+        Functions.TableFnBind(s, f, a) ?? throw NoFunction(s, f);
 
-    public IArrowInOutBinding InOutBind(string s, string f, RecordBatch? a, Schema input) => throw NoFunctions();
+    public IInOutBinding InOutBind(string s, string f, RecordBatch? a, Schema input) => throw NoFunctions();
     public IAggregateSession AggOpen(string s, string f) => throw NoFunctions();
 
     private static NotSupportedException NoFunctions() => new("delta provider: no catalog functions.");

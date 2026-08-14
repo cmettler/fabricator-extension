@@ -1327,8 +1327,8 @@ SELECT sum, diff, return_value FROM mssql.dbo.usp_addsub(a := 10, b := 3);   -- 
 ### Custom (provider-authored) functions
 
 You can author functions in **C#** (no SQL Server object needed) and they surface into every attached
-catalog like discovered ones. Implement `ICatalogScalarFunction`, `IArrowTableFunction`,
-`IArrowInOutFunction`, or `IArrowAggregateFunction` (in `Fabricator.Bridge`) and register them in
+catalog like discovered ones. Implement `ICatalogScalarFunction`, `ICatalogTableFunction`,
+`ICatalogInOutFunction`, or `ICatalogAggregateFunction` (in `Fabricator.Bridge`) and register them in
 `CustomFunctions` — each receives an Arrow `RecordBatch` and returns Arrow, fully vectorized.
 
 ### Table-in-out (`fn_each`)
@@ -1358,13 +1358,13 @@ SELECT * FROM mssql.dbo.usp_process_each((SELECT id FROM mssql.dbo.queue));
 - **Stored-proc writes are transactional:** the per-row `EXEC`s run on DuckDB's transaction, so they
   commit/roll back with DuckDB — atomic in autocommit *and* inside an explicit `BEGIN … COMMIT/ROLLBACK`
   (a row failure mid-stream rolls back the whole statement).
-- Custom C#-authored in-out functions (`IArrowInOutFunction`, or the fixed-schema `StaticInOutFunction`
+- Custom C#-authored in-out functions (`ICatalogInOutFunction`, or the fixed-schema `StaticInOutFunction`
   base) are called by their **bare name** (e.g. `db.dbo.cf_tag(<table>)`, not `_each`) and stream on the same
   gate-based exchange; the author's `DoExchange` reads the input and yields output + a per-input sentinel.
 
 ### Custom aggregates (UDAF)
 
-Provider-authored aggregate functions written in C# (`IArrowAggregateFunction`) are registered as DuckDB
+Provider-authored aggregate functions written in C# (`ICatalogAggregateFunction`) are registered as DuckDB
 aggregates and usable wherever DuckDB allows one — `GROUP BY`, parallel aggregation, and window (`OVER`)
 contexts — over **any** data (local or remote). They reduce in C#; there need be no SQL Server object.
 
