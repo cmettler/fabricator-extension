@@ -135,7 +135,7 @@ public sealed partial class SqlServerCatalog
         // connection and this scan. That is meaningless as a request, and the failure it would cause (a scan
         // sent to a no-MARS pinned connection) is limitation 1.15's unbounded HANG — so a gate for it would
         // be a test that hangs rather than fails, which is worse than none.
-        if (txnId != 0 && _txns.TryGetValue(txnId, out var state))
+        if (txnId != 0 && _txns.TryGet(txnId) is { } state)
         {
             lock (state)
             {

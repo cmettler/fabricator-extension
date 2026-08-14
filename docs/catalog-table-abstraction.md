@@ -1,4 +1,4 @@
-# The catalog/table abstraction — design for retiring `get_metadata` (slices 1a/1b/2/3 BUILT, 4–5 open)
+# The catalog/table abstraction — design for retiring `get_metadata` (slices 1a/1b/2/3 + 4a BUILT; 4b–4d/5 open)
 
 > Written 2026-08-14 after the user's review: *"I don't like the getmetadata functions … there should be no
 > provider-specific function defined in C++, all must live in the providers … an abstraction similar to
@@ -398,6 +398,44 @@ the same table the code evaluates.
      correctness is indistinguishable either way, which is why the mechanism assertion is the gate.
 4. **The `table_*` session** — the big one: `ITable` in Abstractions, four providers, the C++ entry/DML
    operators re-pointed at table handles, `get_metadata` deleted. One ABI bump for the whole slice.
+   - **SUB-SLICED 2026-08-14 (scoped against the tree, not the sketch), each green + committed before the
+     next. §2.3's "C#-only and behaviour-preserving initially" is the through-line: 4a–4c change no ABI.**
+     - **4a — `ITransaction` + the host-side manager, SQL SERVER ONLY (C#-only, behaviour-preserving).
+       BUILT — 2026-08-14.** As-built: both types live in `Fabricator.Abstractions` (namespace
+       `Fabricator.Bridge`, like the rest of the contract assembly — `ProviderSettingsStore` set the
+       precedent for mechanism classes there); `Complete` nulls its fields after disposal so the
+       teardown `Drain` sweep cannot double-commit; the manager's factory rides its constructor so
+       `GetOrCreate(id)` stays one argument. Original scope, all of it as planned:
+       `ITransaction { Id, IsExplicit, Complete(commit), Dispose }` in Abstractions; a small
+       `TransactionManager<T>` in the Bridge (txnId → T; GetOrCreate/TryGet/Remove/Drain);
+       `TxnState` → `SqlServerTransaction : ITransaction`, ABSORBING `_explicitTxns` (its 7 sites become
+       an `IsExplicit` field read — one dictionary instead of two, and the explicit mark finally lives ON
+       the transaction). Lazy-creation semantics preserved exactly: autocommit statements still allocate
+       NOTHING (Begin creates the object only for an explicit txn; the first write/read-pin still
+       GetOrCreates). Delta is deliberately NOT converted here — see 4b's reason. Gates: the routing
+       suites (verify_read_isolation/mars_dynamic/mars_off_same_catalog/read_write_same_catalog) at
+       identical counts; both tiers identical.
+     - **4b — Delta's conversion + the bound-table threading.** DeltaTxnBuffer's outer map + `_explicit` +
+       the STATIC `DeltaTxnScope` registry become a per-catalog manager of Delta transactions whose bound
+       tables subsume `PendingAppends` + the scope's pins/tables — the §2.3 table. ⚠ It cannot be done
+       per-catalog without THREADING: `DeltaReader.OpenForReadAsync` is STATIC and reaches the scope
+       statically (the 1b scoping fact), so the bound object must be passed into its entry points (the
+       write-spec-saga shape). This is also where the DOUBLE-STORED PIN unifies
+       (`PendingAppends.PinnedVersion` vs the scope's pins — §5 item 1b's surviving mutant).
+     - **⚠ A PRE-EXISTING CROSS-CATALOG HAZARD 4b FIXES STRUCTURALLY, recorded here because 4a must NOT
+       accidentally "fix" half of it (REASONED, NOT MEASURED — no suite constructs the shape):**
+       `ExternalTableRouting`'s TRANSIENT Delta catalogs call `CommitTransaction()` under the USER's
+       ambient txn id, and `DeltaCatalog.CommitTransaction` runs `DeltaTxnScope.Release(txnId)`
+       unconditionally FIRST — on the process-global STATIC registry. So an external-table INSERT inside
+       an explicit transaction drops an ATTACHED Delta catalog's pins for the same txn id; the next read
+       re-pins at latest, i.e. repeatable read silently degrades mid-transaction. Needs explicit txn +
+       attached Delta catalog + external-table write in one txn. Per-catalog state makes it structurally
+       impossible; fixing it is a behaviour CHANGE (safe direction) and belongs to 4b with its own gate.
+     - **4c — `ITableDefinition`/`ITable.Bind(txn, at?)` in C#** — the §2.2/§2.3 object model, entry
+       materialization reads `Schema`/`Info` off the definition, `PendingAppends` dissolves into the
+       Delta bound table, SqlServer's bound table stays thin (borrows the transaction's connection).
+     - **4d — the `table_*` ABI session** (§2.4) + DELETE `get_metadata` + kinds 0-7/12/15 — the one
+       C++-touching bump, last, when the C# objects it transports already exist and are gated.
 5. Sweep: delete `ReadStringTable`'s multi-column string protocol where nothing uses it any more.
 
 ## 6. Honest costs and open questions

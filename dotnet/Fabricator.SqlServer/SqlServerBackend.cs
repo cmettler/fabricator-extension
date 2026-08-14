@@ -930,7 +930,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     private bool TxnMars()
     {
         long txnId = AmbientTransaction.Current;
-        if (txnId != 0 && _txns.TryGetValue(txnId, out var state))
+        if (txnId != 0 && _txns.TryGet(txnId) is { } state)
         {
             lock (state)
             {
@@ -1006,7 +1006,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     /// <summary>
     /// Opens a connection on the profile-aware string, reporting which MARS mode it got. The opening SESSION
     /// decides (see <see cref="EffectiveMars"/>); a transaction's PINNED connection records the answer in
-    /// <see cref="TxnState.MarsEnabled"/> so the routing keeps asking about the connection in play.
+    /// <see cref="SqlServerTransaction.MarsEnabled"/> so the routing keeps asking about the connection in play.
     /// </summary>
     private SqlConnection OpenConnection(out bool marsEnabled)
     {
@@ -1024,8 +1024,22 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     // transaction's connection (read-your-writes); reads with no active transaction take a fresh pooled
     // connection. Matches the native mssql-extension's per-MSSQLTransaction connection model. See
     // docs/transaction-concurrency.md.
-    private sealed class TxnState
+    private sealed class SqlServerTransaction : ITransaction
     {
+        public SqlServerTransaction(long id) => Id = id;
+
+        public long Id { get; }
+
+        /// <summary>
+        /// Explicit user BEGIN..COMMIT (v60 is_explicit; the ambient id is set by set_active_txn right
+        /// before begin_transaction). Consulted by the external-table INSERT/DML routing and the session
+        /// tag: a storage-side write commits its own Delta commit / parquet PUT and cannot roll back with
+        /// the SQL catalog's transaction, so it is rejected inside an explicit transaction (autocommit
+        /// only). Was a second id-keyed dictionary (`_explicitTxns`) before slice 4a put it ON the
+        /// transaction.
+        /// </summary>
+        public bool IsExplicit { get; set; }
+
         public SqlConnection? Connection;
         public SqlTransaction? Transaction;
 
@@ -1056,6 +1070,38 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         /// instance lock guards short field reads that must not queue behind one.
         /// </summary>
         public readonly object ExecGate = new();
+
+        /// <summary>
+        /// Commit/roll back the provider transaction (no-op if no write ever pinned one) and release the
+        /// connection. Called once, after removal from the manager; fields are nulled so a later
+        /// best-effort <see cref="Dispose"/> (catalog teardown) cannot double-commit.
+        /// </summary>
+        public void Complete(bool commit)
+        {
+            try
+            {
+                if (Transaction is not null)
+                {
+                    if (commit)
+                    {
+                        Transaction.Commit();
+                    }
+                    else
+                    {
+                        Transaction.Rollback();
+                    }
+                }
+            }
+            finally
+            {
+                Transaction?.Dispose();
+                Connection?.Dispose();
+                Transaction = null;
+                Connection = null;
+            }
+        }
+
+        public void Dispose() => Complete(commit: false);
     }
 
     /// <summary>Records that the ambient transaction has written <paramref name="tableName"/>, so a later
@@ -1072,12 +1118,12 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         {
             return;
         }
-        // ⚠ GetOrAdd, NOT TryGetValue: every caller records BEFORE its BeginWrite(), so on the transaction's
+        // ⚠ GetOrCreate, NOT TryGet: every caller records BEFORE its BeginWrite(), so on the transaction's
         // FIRST write no state exists yet and a lookup would silently record nothing — the tracking would be
-        // dead for exactly the write that creates the hazard. BeginWrite's own GetOrAdd then finds this
+        // dead for exactly the write that creates the hazard. BeginWrite's own GetOrCreate then finds this
         // entry and fills in the connection; a state with a null Connection is already handled everywhere
         // (the routing and the check both test it).
-        var state = _txns.GetOrAdd(txnId, _ => new TxnState());
+        var state = _txns.GetOrCreate(txnId);
         var key = $"{Quote(schemaName)}.{Quote(tableName)}";
         lock (state)
         {
@@ -1085,26 +1131,22 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         }
     }
 
-    private readonly System.Collections.Concurrent.ConcurrentDictionary<long, TxnState> _txns = new();
+    private readonly TransactionManager<SqlServerTransaction> _txns = new(id => new SqlServerTransaction(id));
 
     // Per catalog, because the function pins THIS catalog's transaction connection. Lazy so a catalog that
     // never calls it pays nothing.
     private SqlServerSessionTagFunction SessionTag => _sessionTag ??= new SqlServerSessionTagFunction(this);
     private SqlServerSessionTagFunction? _sessionTag;
 
-    // Explicit user BEGIN..COMMIT transaction ids (v60 is_explicit; the ambient id is set by set_active_txn
-    // right before begin_transaction). Consulted by the external-table INSERT routing: a storage-side write
-    // commits its own Delta commit / parquet PUT and cannot roll back with the SQL catalog's transaction,
-    // so it is rejected inside an explicit transaction (autocommit only).
-    private readonly System.Collections.Concurrent.ConcurrentDictionary<long, byte> _explicitTxns = new();
-
     // The connection + provider transaction are pinned lazily on the first write (BeginWrite), keyed by the
-    // ambient transaction id; begin only records explicitness. A read-only transaction never creates state.
+    // ambient transaction id; begin only records explicitness — an explicit BEGIN creates the (empty)
+    // transaction object to carry the flag, an autocommit statement creates nothing. A read-only autocommit
+    // transaction therefore still never allocates state.
     public void BeginTransaction(bool isExplicit)
     {
         if (isExplicit && AmbientTransaction.Current != 0)
         {
-            _explicitTxns[AmbientTransaction.Current] = 1;
+            _txns.GetOrCreate(AmbientTransaction.Current).IsExplicit = true;
         }
     }
 
@@ -1114,31 +1156,14 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
 
     private void EndTransaction(long txnId, bool commit)
     {
-        _explicitTxns.TryRemove(txnId, out _);
-        if (!_txns.TryRemove(txnId, out var state))
-        {
-            return; // no write happened in this transaction (or already finished)
-        }
-        try
-        {
-            if (state.Transaction is not null)
-            {
-                if (commit)
-                {
-                    state.Transaction.Commit();
-                }
-                else
-                {
-                    state.Transaction.Rollback();
-                }
-            }
-        }
-        finally
-        {
-            state.Transaction?.Dispose();
-            state.Connection?.Dispose();
-        }
+        // Remove BEFORE Complete — the manager's ordering contract (nothing can resolve a transaction that
+        // is mid-completion, the read-state-after-remove class of bug made structural).
+        _txns.Remove(txnId)?.Complete(commit);
     }
+
+    /// <summary>Is <paramref name="txnId"/> an explicit user BEGIN..COMMIT transaction? False for
+    /// autocommit (including txn 0). Reads the flag off the live transaction object.</summary>
+    private bool IsExplicitTxn(long txnId) => txnId != 0 && _txns.TryGet(txnId) is { IsExplicit: true };
 
     // Returns a connection for a write. When a DuckDB transaction is active (ambient id != 0) it is that
     // transaction's pinned connection (opened + provider-transaction started on first use), owns=false so
@@ -1154,7 +1179,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
             // DuckDB-managed write is in flight) — then the exec is atomic with the transaction and sees its
             // uncommitted writes. Otherwise autocommit on a fresh connection without creating persistent
             // state (nothing would ever commit it — see AmbientTransaction.JoinOnly).
-            if (_txns.TryGetValue(txnId, out var existing))
+            if (_txns.TryGet(txnId) is { } existing)
             {
                 lock (existing)
                 {
@@ -1188,9 +1213,9 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     // the first READ. That is the substantive half of the opt-in: before it, a read-only transaction had no
     // server-side transaction at all, so there was nothing for an isolation level to apply to and no amount of
     // level-setting could have given cross-statement stability.
-    private TxnState EnsureTxnConnection(long txnId)
+    private SqlServerTransaction EnsureTxnConnection(long txnId)
     {
-        var state = _txns.GetOrAdd(txnId, _ => new TxnState());
+        var state = _txns.GetOrCreate(txnId);
         // One thread at a time touches a given transaction (DuckDB serializes a transaction's statements), so
         // locking the single state is enough; distinct transactions use distinct states.
         lock (state)
@@ -1230,7 +1255,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     /// </summary>
     /// <remarks>
     /// <para>The call goes through <see cref="BeginWrite"/> WITHOUT the join-only restriction, so it PINS the
-    /// transaction's connection (creating the <see cref="TxnState"/> if the transaction has not written yet).
+    /// transaction's connection (creating the <see cref="SqlServerTransaction"/> if the transaction has not written yet).
     /// That is the point: everything the transaction does afterwards reuses that connection, so the tag applies
     /// to the actual work rather than to a pooled connection that was handed straight back.</para>
     /// <para>Rejected outside an explicit transaction on purpose. In autocommit the pin is committed and released
@@ -1242,7 +1267,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     internal RecordBatch SetSessionTag(string key, string? value)
     {
         long txnId = AmbientTransaction.Current;
-        if (txnId == 0 || !_explicitTxns.ContainsKey(txnId))
+        if (!IsExplicitTxn(txnId))
         {
             throw new NotSupportedException(
                 $"{SqlServerSessionTagFunction.FunctionName}: must be called inside an explicit transaction "
@@ -1656,7 +1681,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     }
 
     // The pinned-connection half of ExecuteQuery, extracted only so the no-MARS read_isolation path can wrap
-    // the WHOLE execute+drain in one lock (see TxnState.ExecGate). Behaviour is identical to the inline form
+    // the WHOLE execute+drain in one lock (see SqlServerTransaction.ExecGate). Behaviour is identical to the inline form
     // it replaced.
     private IArrowArrayStream RunPinned(SqlConnection pinned, SqlTransaction? pinnedTransaction, string sql,
                                         IReadOnlyList<SqlParameter>? parameters, bool materialize,
@@ -1853,7 +1878,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
                     "CREATE OR REPLACE with WITH (location=...) is not supported — DROP the external "
                     + "table first (the storage data is kept; delete/replace it explicitly).");
             }
-            if (_explicitTxns.ContainsKey(txnId))
+            if (IsExplicitTxn(txnId))
             {
                 throw new NotSupportedException(
                     "CREATE TABLE ... WITH (location=...) writes directly to storage and cannot roll back "
@@ -2733,7 +2758,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     {
         schemaChanged = false;
         long txnId = AmbientTransaction.Current;
-        if (txnId == 0 || !_txns.TryGetValue(txnId, out var state))
+        if (txnId == 0 || _txns.TryGet(txnId) is not { } state)
         {
             return false; // nothing pinned => no uncommitted work of ours
         }
@@ -3074,7 +3099,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     // explicit DuckDB transaction can't wrap it.
     private void GuardExternalDml(string schemaName, string tableName, string verb)
     {
-        if (_explicitTxns.ContainsKey(AmbientTransaction.Current))
+        if (IsExplicitTxn(AmbientTransaction.Current))
         {
             throw new NotSupportedException(
                 $"{verb} external table {schemaName}.{tableName} writes directly to its storage (its own "
@@ -3086,7 +3111,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     private long ExternalTableInsert(ExternalTableInfo ext, string schemaName, string tableName,
                                      IArrowArrayStream data, bool checkConstraints, long txnId)
     {
-        if (_explicitTxns.ContainsKey(txnId))
+        if (IsExplicitTxn(txnId))
         {
             throw new NotSupportedException(
                 $"INSERT into external table {schemaName}.{tableName} writes directly to its storage "
@@ -3361,7 +3386,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
                     "PRIMARY KEY / UNIQUE / DEFAULT cannot be combined with WITH (location=...) — "
                     + "external tables carry no constraints (the IDENTITY marker IS supported).");
             }
-            if (_explicitTxns.ContainsKey(AmbientTransaction.Current))
+            if (IsExplicitTxn(AmbientTransaction.Current))
             {
                 throw new NotSupportedException(
                     "CREATE TABLE ... WITH (location=...) writes directly to storage and cannot roll back "
@@ -4521,13 +4546,13 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
 
     public void Dispose()
     {
-        // Roll back and release any still-open transactions (e.g. on DETACH mid-txn).
-        // ConcurrentDictionary enumeration tolerates the concurrent removals EndTransaction does.
-        foreach (var kvp in _txns)
+        // Roll back and release any still-open transactions (e.g. on DETACH mid-txn). Drain unregisters
+        // first, so a concurrent EndTransaction cannot complete the same instance twice.
+        foreach (var txn in _txns.Drain())
         {
             try
             {
-                EndTransaction(kvp.Key, commit: false);
+                txn.Complete(commit: false);
             }
             catch
             {
