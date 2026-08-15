@@ -824,17 +824,21 @@ typedef struct FabricatorVTable {
 	// absence (Delta: no commit in the log; SQL Server: error 208) — never for a table that merely could not
 	// be read.
 	int32_t (*table_schema)(FabricatorHandle table, struct ArrowArrayStream *out, char **err);
-	// Row identity + provider virtual columns, ONE crossing (was kinds 3 + 12): three UTF-8 columns
-	// (role, name, type) — role 'rowid' rows carry the row-identity column names in key order (type empty);
-	// role 'virtual' rows carry provider virtual columns with their DuckDB type text.
-	int32_t (*table_info)(FabricatorHandle table, struct ArrowArrayStream *out, char **err);
-	// Optimizer statistics, ONE crossing (was kinds 4 + 5), with a TYPED int64 value column (the old kinds
-	// crossed numbers as text): (stat, column, value) — one 'row_count' row when known (absent = unknown;
-	// column empty), one 'ndv' row per column with a distinct-count estimate. LAZY BY CONTRACT: called at
-	// first scan, never at entry materialization, and deliberately NOT folded into table_info — bundling
-	// would put the stats queries on the enumeration path. The warehouse never-issue-a-swallowable-statement
-	// rule lives inside the providers (null/empty answers, no probe).
-	int32_t (*table_stats)(FabricatorHandle table, struct ArrowArrayStream *out, char **err);
+	// Row identity + provider virtual columns, ONE crossing (was kinds 3 + 12), as ONE typed JSON doc
+	// (v73; the v72 intermediate carried an Arrow stream):
+	//   {"rowid":["a","b",...], "virtual":[{"name":"...","type":"<DuckDB type text>"}, ...]}
+	// Both arrays always present (empty ok); rowid names in key order. *out_json is owned UTF-8, freed via
+	// free_error (the get_capabilities convention). Parsed host-side with yyjson — OUR OWN vcpkg copy, not
+	// DuckDB's vendored one, whose `duckdb_yyjson`-namespaced symbols are not DUCKDB_API-exported and so
+	// cannot be resolved by a loadable extension (see CMakeLists.txt).
+	int32_t (*table_info)(FabricatorHandle table, char **out_json, char **err);
+	// Optimizer statistics, ONE crossing (was kinds 4 + 5, numbers as text), as ONE typed JSON doc (v73):
+	//   {"row_count":N, "ndv":{"<column>":N, ...}}
+	// row_count ABSENT = unknown; ndv always an object (may be empty). LAZY BY CONTRACT: called at first
+	// scan, never at entry materialization, and deliberately NOT folded into table_info — bundling would put
+	// the stats queries on the enumeration path. The warehouse never-issue-a-swallowable-statement rule
+	// lives inside the providers (null/empty answers, no probe). *out_json owned UTF-8, freed via free_error.
+	int32_t (*table_stats)(FabricatorHandle table, char **out_json, char **err);
 	// Scan the table — scan_table minus the name pair; `spec_json`/`filter_values` exactly as before
 	// (projection, filter tree + typed constants, TOP/ORDER, schema_only, and the AT clause, which still
 	// rides the spec for the scan itself — the handle's AT selects the SCHEMA answer above).
@@ -959,7 +963,7 @@ typedef struct FabricatorHostServices {
 // state blob is this many bytes + a 4-byte length prefix). Serialize() must fit within it.
 #define FABRICATOR_AGG_SPILL_CAP 1024
 
-#define FABRICATOR_ABI_VERSION 72
+#define FABRICATOR_ABI_VERSION 73
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(FabricatorVTable) as seen

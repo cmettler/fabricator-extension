@@ -264,12 +264,13 @@ public unsafe struct FabricatorVTable
     // int32 table_schema(void* table, ArrowArrayStream* out, char** err) — zero-row stream whose SCHEMA is
     // the table's column layout; NOT_FOUND status = established absence.
     public delegate* unmanaged[Cdecl]<nint, CArrowArrayStream*, byte**, int> TableSchema;
-    // int32 table_info(void* table, ArrowArrayStream* out, char** err) — 3 utf8: role('rowid'|'virtual'),
-    // name, type (empty for rowid rows; rowid rows in key order).
-    public delegate* unmanaged[Cdecl]<nint, CArrowArrayStream*, byte**, int> TableInfo;
-    // int32 table_stats(void* table, ArrowArrayStream* out, char** err) — stat:utf8('row_count'|'ndv'),
-    // column:utf8, value:int64. Lazy by design (never called during enumeration).
-    public delegate* unmanaged[Cdecl]<nint, CArrowArrayStream*, byte**, int> TableStats;
+    // int32 table_info(void* table, char** out_json, char** err) (v73) — ONE typed JSON doc:
+    // {"rowid":[...], "virtual":[{"name":..,"type":..}, ...]}; owned UTF-8, host frees via free_error.
+    public delegate* unmanaged[Cdecl]<nint, byte**, byte**, int> TableInfo;
+    // int32 table_stats(void* table, char** out_json, char** err) (v73) — ONE typed JSON doc:
+    // {"row_count":N, "ndv":{"col":N, ...}}; row_count absent = unknown. Lazy by design (never called
+    // during enumeration). Owned UTF-8, host frees via free_error.
+    public delegate* unmanaged[Cdecl]<nint, byte**, byte**, int> TableStats;
     // int32 table_scan(void* table, const char* spec_json, ArrowArrayStream* filter_values,
     //                  ArrowArrayStream* out, char** err)
     public delegate* unmanaged[Cdecl]<nint, byte*, CArrowArrayStream*, CArrowArrayStream*, byte**, int> TableScan;

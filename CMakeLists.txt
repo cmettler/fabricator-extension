@@ -44,6 +44,16 @@ build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 target_link_libraries(${EXTENSION_NAME} ${CMAKE_DL_LIBS})
 target_link_libraries(${LOADABLE_EXTENSION_NAME} ${CMAKE_DL_LIBS})
 
+# yyjson (vcpkg) — the JSON parser for the ABI's JSON-shaped crossings (table_info / table_stats /
+# get_capabilities). ⚠ Deliberately OUR OWN copy, not DuckDB's vendored one: duckdb_static carries yyjson
+# inside the C++ namespace `duckdb_yyjson` with none of it DUCKDB_API-exported, so a LOADABLE extension
+# cannot resolve those symbols against the host binary. The vcpkg build exports the plain C `yyjson_*`
+# names, so the two copies cannot collide in the static build either. Requires `vcpkg install yyjson`
+# (same triplet as openssl/curl) — see CLAUDE.md §Build & test and the CI workflows' vcpkg lines.
+find_package(yyjson CONFIG REQUIRED)
+target_link_libraries(${EXTENSION_NAME} yyjson::yyjson)
+target_link_libraries(${LOADABLE_EXTENSION_NAME} yyjson::yyjson)
+
 # macOS ONLY: export the SECOND entry point too.
 #
 # src/fabricator_extension.cpp defines two entries — `fabricator_duckdb_cpp_init` and

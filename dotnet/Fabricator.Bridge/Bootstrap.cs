@@ -57,7 +57,7 @@ public static unsafe class Bootstrap
             return new InMemoryArrayStream(schema, new[] { batch });
         });
 
-        vtable->AbiVersion = 72;
+        vtable->AbiVersion = 73;
         vtable->OpenCatalog = &OpenCatalog;
         vtable->CloseCatalog = &CloseCatalog;
         vtable->ExecuteQuery = &ExecuteQuery;
@@ -445,15 +445,15 @@ public static unsafe class Bootstrap
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static int TableInfo(nint table, CArrowArrayStream* outStream, byte** err)
+    private static int TableInfo(nint table, byte** outJson, byte** err)
     {
         try
         {
-            if (outStream is null || Handles.Resolve<TableSession>(table) is not { } session)
+            if (outJson is null || Handles.Resolve<TableSession>(table) is not { } session)
             {
                 return FabricatorStatus.InvalidArgument;
             }
-            CArrowArrayStreamExporter.ExportArrayStream(session.InfoStream(), outStream);
+            *outJson = (byte*)Marshal.StringToCoTaskMemUTF8(session.InfoJson()); // host frees via free_error
             return FabricatorStatus.Ok;
         }
         catch (Exception ex)
@@ -464,15 +464,15 @@ public static unsafe class Bootstrap
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static int TableStats(nint table, CArrowArrayStream* outStream, byte** err)
+    private static int TableStats(nint table, byte** outJson, byte** err)
     {
         try
         {
-            if (outStream is null || Handles.Resolve<TableSession>(table) is not { } session)
+            if (outJson is null || Handles.Resolve<TableSession>(table) is not { } session)
             {
                 return FabricatorStatus.InvalidArgument;
             }
-            CArrowArrayStreamExporter.ExportArrayStream(session.StatsStream(), outStream);
+            *outJson = (byte*)Marshal.StringToCoTaskMemUTF8(session.StatsJson()); // host frees via free_error
             return FabricatorStatus.Ok;
         }
         catch (Exception ex)

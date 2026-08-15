@@ -752,28 +752,33 @@ void TableSchema(FabricatorHandle table, ArrowArrayStream &out) {
 	}
 }
 
-void TableInfo(FabricatorHandle table, ArrowArrayStream &out) {
+// Shared body of the two JSON-returning table-session wrappers (the GetCapabilities string-ownership
+// convention: owned UTF-8, freed via free_error).
+static std::string TableJsonDoc(FabricatorHandle table, const char *what,
+                                int32_t (*entry)(FabricatorHandle, char **, char **)) {
 	const FabricatorVTable &vt = GetBridge();
-	if (!vt.table_info) {
-		throw duckdb::IOException("Fabricator: bridge does not provide table_info");
+	if (!entry) {
+		throw duckdb::IOException("Fabricator: bridge does not provide %s", what);
 	}
+	char *out_json = nullptr;
 	char *err = nullptr;
-	int32_t rc = vt.table_info(table, &out, &err);
+	int32_t rc = entry(table, &out_json, &err);
 	if (rc != FABRICATOR_OK) {
-		ThrowManagedError(vt, err, "Fabricator: table_info failed");
+		ThrowManagedError(vt, err, std::string("Fabricator: ") + what + " failed");
 	}
+	std::string result = out_json ? out_json : "";
+	if (out_json && vt.free_error) {
+		vt.free_error(out_json);
+	}
+	return result;
 }
 
-void TableStats(FabricatorHandle table, ArrowArrayStream &out) {
-	const FabricatorVTable &vt = GetBridge();
-	if (!vt.table_stats) {
-		throw duckdb::IOException("Fabricator: bridge does not provide table_stats");
-	}
-	char *err = nullptr;
-	int32_t rc = vt.table_stats(table, &out, &err);
-	if (rc != FABRICATOR_OK) {
-		ThrowManagedError(vt, err, "Fabricator: table_stats failed");
-	}
+std::string TableInfo(FabricatorHandle table) {
+	return TableJsonDoc(table, "table_info", GetBridge().table_info);
+}
+
+std::string TableStats(FabricatorHandle table) {
+	return TableJsonDoc(table, "table_stats", GetBridge().table_stats);
 }
 
 void TableScan(FabricatorHandle table, const std::string &spec_json, ArrowArrayStream *filter_values,

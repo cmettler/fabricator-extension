@@ -70,7 +70,7 @@ runs:
         cmake --version | head -1
         ninja --version
 
-    - name: Install vcpkg dependencies (OpenSSL + curl for the statically linked httpfs)
+    - name: Install vcpkg dependencies (OpenSSL + curl for the statically linked httpfs; yyjson for the ABI's JSON crossings)
       shell: bash
       env:
         # DuckDB's public read-only binary cache; without it OpenSSL is rebuilt from source every run.
@@ -88,7 +88,9 @@ runs:
         # kept as a guard: vcpkg infers manifest mode from the CURRENT DIRECTORY, and a manifest
         # reappearing at the repo root would make it refuse these package arguments outright.
         cd "$RUNNER_TEMP"
-        "$vcpkg" install "openssl:${{ inputs.triplet }}" "curl:${{ inputs.triplet }}"
+        # yyjson: OUR OWN JSON parser for the v73 ABI crossings (table_info/table_stats/get_capabilities) —
+        # DuckDB's vendored copy is namespaced + not DUCKDB_API-exported, so a loadable cannot link it.
+        "$vcpkg" install "openssl:${{ inputs.triplet }}" "curl:${{ inputs.triplet }}" "yyjson:${{ inputs.triplet }}"
 
     - name: Export the MSVC environment
       if: runner.os == 'Windows'

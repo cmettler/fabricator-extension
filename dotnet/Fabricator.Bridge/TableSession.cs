@@ -1,7 +1,9 @@
 using System;
+using System.IO;
+using System.Text;
+using System.Text.Json;
 using Apache.Arrow;
 using Apache.Arrow.Ipc;
-using Apache.Arrow.Types;
 
 namespace Fabricator.Bridge;
 
@@ -59,76 +61,64 @@ internal sealed class TableSession
     internal IArrowArrayStream SchemaStream() =>
         With(t => (IArrowArrayStream)new InMemoryArrayStream(t.Schema, System.Array.Empty<RecordBatch>()));
 
-    /// <summary>The <c>table_info</c> answer — (role, name, type), all UTF-8: one <c>role='rowid'</c> row
-    /// per row-identity column (key order, type empty), one <c>role='virtual'</c> row per provider virtual
-    /// column (type = the declared DuckDB type text). Provider-agnostic re-encoding of the two typed
-    /// <see cref="ITable"/> members; the stats members deliberately do NOT ride along (they stay a separate
-    /// lazy entry so entry materialization — i.e. catalog ENUMERATION — never pays a stats query).</summary>
-    internal IArrowArrayStream InfoStream() => With(t =>
+    /// <summary>The <c>table_info</c> answer — ONE typed JSON doc (ABI v73):
+    /// <c>{"rowid":[...], "virtual":[{"name":..,"type":..}, ...]}</c>, rowid names in key order, both
+    /// arrays always present. Provider-agnostic re-encoding of the two typed <see cref="ITable"/> members,
+    /// written with <see cref="Utf8JsonWriter"/> so user-controlled identifiers are escaped properly (the
+    /// host parses with a real parser, yyjson — never the string-find shortcut, which is safe only for
+    /// docs whose values are bare booleans). The stats members deliberately do NOT ride along (they stay a
+    /// separate lazy entry so entry materialization — i.e. catalog ENUMERATION — never pays a stats
+    /// query).</summary>
+    internal string InfoJson() => With(t =>
     {
-        var schema = new Schema(new[]
+        using var buffer = new MemoryStream();
+        using (var json = new Utf8JsonWriter(buffer))
         {
-            new Field("role", StringType.Default, nullable: false),
-            new Field("name", StringType.Default, nullable: false),
-            new Field("type", StringType.Default, nullable: true),
-        }, metadata: null);
-        var roles = new StringArray.Builder();
-        var names = new StringArray.Builder();
-        var types = new StringArray.Builder();
-        int rows = 0;
-        foreach (var column in t.RowIdColumns())
-        {
-            roles.Append("rowid");
-            names.Append(column);
-            types.Append(string.Empty);
-            rows++;
+            json.WriteStartObject();
+            json.WriteStartArray("rowid");
+            foreach (var column in t.RowIdColumns())
+            {
+                json.WriteStringValue(column);
+            }
+            json.WriteEndArray();
+            json.WriteStartArray("virtual");
+            foreach (var vc in t.VirtualColumns())
+            {
+                json.WriteStartObject();
+                json.WriteString("name", vc.Name);
+                json.WriteString("type", vc.DuckDbType);
+                json.WriteEndObject();
+            }
+            json.WriteEndArray();
+            json.WriteEndObject();
         }
-        foreach (var vc in t.VirtualColumns())
-        {
-            roles.Append("virtual");
-            names.Append(vc.Name);
-            types.Append(vc.DuckDbType);
-            rows++;
-        }
-        var batch = new RecordBatch(schema, new IArrowArray[] { roles.Build(), names.Build(), types.Build() }, rows);
-        return (IArrowArrayStream)new InMemoryArrayStream(schema, new[] { batch });
+        return Encoding.UTF8.GetString(buffer.ToArray());
     });
 
-    /// <summary>The <c>table_stats</c> answer — (stat, column, value): a typed INT64 value column at last
-    /// (the old kinds 4/5 crossed numbers as text). One <c>stat='row_count'</c> row when the provider
-    /// surfaces one (absent = unknown), one <c>stat='ndv'</c> row per column with a distinct-count
-    /// estimate. Lazy BY CONTRACT: the host calls this at first scan, never at entry materialization, and
-    /// the warehouse never-issue-a-swallowable-statement rule lives inside the providers' typed cores
-    /// (null/empty answers, no probe).</summary>
-    internal IArrowArrayStream StatsStream() => With(t =>
+    /// <summary>The <c>table_stats</c> answer — ONE typed JSON doc (ABI v73):
+    /// <c>{"row_count":N, "ndv":{"col":N, ...}}</c>; <c>row_count</c> ABSENT means unknown (the old kinds
+    /// 4/5 crossed these numbers as text). Lazy BY CONTRACT: the host calls this at first scan, never at
+    /// entry materialization, and the warehouse never-issue-a-swallowable-statement rule lives inside the
+    /// providers' typed cores (null/empty answers, no probe).</summary>
+    internal string StatsJson() => With(t =>
     {
-        var schema = new Schema(new[]
+        using var buffer = new MemoryStream();
+        using (var json = new Utf8JsonWriter(buffer))
         {
-            new Field("stat", StringType.Default, nullable: false),
-            new Field("column", StringType.Default, nullable: false),
-            new Field("value", Int64Type.Default, nullable: false),
-        }, metadata: null);
-        var stats = new StringArray.Builder();
-        var columns = new StringArray.Builder();
-        var values = new Int64Array.Builder();
-        int rows = 0;
-        if (t.ApproximateRowCount() is { } rowCount)
-        {
-            stats.Append("row_count");
-            columns.Append(string.Empty);
-            values.Append(rowCount);
-            rows++;
+            json.WriteStartObject();
+            if (t.ApproximateRowCount() is { } rowCount)
+            {
+                json.WriteNumber("row_count", rowCount);
+            }
+            json.WriteStartObject("ndv");
+            foreach (var e in t.ColumnNdv())
+            {
+                json.WriteNumber(e.ColumnName, e.Ndv);
+            }
+            json.WriteEndObject();
+            json.WriteEndObject();
         }
-        foreach (var e in t.ColumnNdv())
-        {
-            stats.Append("ndv");
-            columns.Append(e.ColumnName);
-            values.Append(e.Ndv);
-            rows++;
-        }
-        var batch = new RecordBatch(schema, new IArrowArray[] { stats.Build(), columns.Build(), values.Build() },
-                                    rows);
-        return (IArrowArrayStream)new InMemoryArrayStream(schema, new[] { batch });
+        return Encoding.UTF8.GetString(buffer.ToArray());
     });
 
     /// <summary>The <c>table_scan</c> answer. The returned stream MAY outlive a caller-owned binding —

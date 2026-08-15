@@ -9,6 +9,10 @@
 #include "duckdb/common/arrow/schema_metadata.hpp"
 #include "duckdb/common/exception.hpp"
 
+// yyjson (vcpkg) — OUR OWN copy, deliberately not DuckDB's vendored `duckdb_yyjson` (namespaced,
+// not DUCKDB_API-exported, so a loadable extension could not resolve it). See CMakeLists.txt.
+#include <yyjson.h>
+
 #include <cstdint>
 #include <cstring>
 
@@ -99,40 +103,40 @@ vector<string> DiscoverSchemas(FabricatorHandle handle) {
 	return rows[0];
 }
 
-// True iff `json` (a flat JSON object OUR bridge serialized — values are bare booleans, so the key text
-// cannot appear inside a value) carries `"key": true`. Absent key / anything else => false, the safe
-// direction for every capability. Deliberately not a JSON parser: the producer is Bootstrap's own
-// System.Text.Json serialization of a Dictionary<string, bool>, so the token after the colon is exactly
-// `true` or `false`.
-static bool ReadCapabilityFlag(const string &json, const char *key) {
-	string needle = string("\"") + key + "\"";
-	size_t pos = json.find(needle);
-	if (pos == string::npos) {
-		return false;
+// RAII over a parsed yyjson document (yyjson_doc_free tolerates null).
+namespace {
+struct YyjsonDocGuard {
+	yyjson_doc *doc;
+	explicit YyjsonDocGuard(const string &json) : doc(yyjson_read(json.data(), json.size(), 0)) {
 	}
-	pos += needle.size();
-	while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t' || json[pos] == '\n' || json[pos] == '\r')) {
-		pos++;
+	~YyjsonDocGuard() {
+		yyjson_doc_free(doc);
 	}
-	if (pos >= json.size() || json[pos] != ':') {
-		return false;
+	//! The document root when it is an OBJECT, else null.
+	yyjson_val *Root() const {
+		auto root = doc ? yyjson_doc_get_root(doc) : nullptr;
+		return root && yyjson_is_obj(root) ? root : nullptr;
 	}
-	pos++;
-	while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t' || json[pos] == '\n' || json[pos] == '\r')) {
-		pos++;
-	}
-	return json.compare(pos, 4, "true") == 0;
-}
+};
+} // namespace
 
 FabricatorCapabilities FetchCapabilities(FabricatorHandle handle) {
 	// ONE typed crossing (ABI v71) replaces the old pattern of grepping the diagnostic kind-7
 	// (property, value) stream twice — see abi.h `get_capabilities` for the contract and for why this is
 	// deliberately NOT part of open_catalog's result (open_catalog must stay connection-free; a provider
 	// may need a connection to answer, and here the txn/opener ambients are already established).
+	//
+	// Parsed with yyjson since v73 — this used to be a string-find shortcut (`ReadCapabilityFlag`) that was
+	// safe only by a producer-side argument (every value a bare boolean, so key text could not appear inside
+	// a value); a real parser retires the caveat class, not just the instance. Absent key / non-boolean /
+	// malformed doc all read as false — the safe direction for every capability.
 	auto json = fabricator::GetCapabilities(handle);
+	YyjsonDocGuard guard(json);
 	FabricatorCapabilities caps;
-	caps.string_order_pushable = ReadCapabilityFlag(json, "is_binary_collation");
-	caps.exact_filter_pushdown = ReadCapabilityFlag(json, "exact_filter_pushdown");
+	if (auto *root = guard.Root()) {
+		caps.string_order_pushable = yyjson_get_bool(yyjson_obj_get(root, "is_binary_collation"));
+		caps.exact_filter_pushdown = yyjson_get_bool(yyjson_obj_get(root, "exact_filter_pushdown"));
+	}
 	return caps;
 }
 
@@ -265,88 +269,60 @@ void FetchTableSchema(ClientContext &context, FabricatorHandle catalog_handle, F
 }
 
 FabricatorTableRowIdentity FetchTableInfo(FabricatorHandle table_handle) {
-	ArrowArrayStream stream;
-	std::memset(&stream, 0, sizeof(stream));
-	fabricator::TableInfo(table_handle, stream);
-	auto rows = ReadStringTable(stream, 3); // role, name, type
+	// {"rowid":["a",...], "virtual":[{"name":"...","type":"..."}, ...]} — see abi.h table_info. The
+	// producer is TableSession.InfoJson (Utf8JsonWriter, proper escaping), so a malformed doc is a BUG,
+	// not an input condition — refused loudly rather than read as an empty answer (a silently-empty rowid
+	// would quietly disable UPDATE/DELETE on the table). Unknown keys are skipped: additive fields must
+	// stay additive (the same forward-compat rule as an unknown ATTACH option).
+	auto json = fabricator::TableInfo(table_handle);
+	YyjsonDocGuard guard(json);
+	auto *root = guard.Root();
+	if (!root) {
+		throw IOException("fabricator: table_info returned malformed JSON: %s", json);
+	}
 	FabricatorTableRowIdentity result;
-	for (idx_t i = 0; i < rows[0].size(); i++) {
-		if (rows[0][i] == "rowid") {
-			result.rowid_columns.push_back(rows[1][i]);
-		} else if (rows[0][i] == "virtual") {
-			result.virtual_columns.emplace_back(rows[1][i], rows[2][i]);
+	size_t idx, max;
+	yyjson_val *item;
+	// Hoisted out of the foreach macros, which evaluate their container argument more than once.
+	auto *rowid_arr = yyjson_obj_get(root, "rowid");
+	auto *virtual_arr = yyjson_obj_get(root, "virtual");
+	yyjson_arr_foreach(rowid_arr, idx, max, item) {
+		if (yyjson_is_str(item)) {
+			result.rowid_columns.emplace_back(yyjson_get_str(item), yyjson_get_len(item));
 		}
-		// An unknown role is skipped rather than refused: additive roles must stay additive (the same
-		// forward-compat rule as an unknown ATTACH option).
+	}
+	yyjson_arr_foreach(virtual_arr, idx, max, item) {
+		auto *name = yyjson_obj_get(item, "name");
+		auto *type = yyjson_obj_get(item, "type");
+		if (yyjson_is_str(name) && yyjson_is_str(type)) {
+			result.virtual_columns.emplace_back(string(yyjson_get_str(name), yyjson_get_len(name)),
+			                                    string(yyjson_get_str(type), yyjson_get_len(type)));
+		}
 	}
 	return result;
 }
 
-// Reads an int64 value from one column array of an Arrow record batch (validity bitmap honoured; a NULL
-// reads as `fallback`).
-static int64_t GetInt64(const ArrowArray &column, int64_t row, int64_t fallback) {
-	int64_t i = column.offset + row;
-	if (column.buffers[0]) {
-		auto validity = reinterpret_cast<const uint8_t *>(column.buffers[0]);
-		if (!(validity[i / 8] & (1u << (i % 8)))) {
-			return fallback;
-		}
-	}
-	return reinterpret_cast<const int64_t *>(column.buffers[1])[i];
-}
-
 FabricatorTableStats FetchTableStats(FabricatorHandle table_handle) {
-	// (stat, column, value:int64) — the value column is TYPED (the old kinds 4/5 crossed numbers as text),
-	// so this needs its own reader beside the all-UTF-8 ReadStringTable.
-	ArrowArrayStream stream;
-	std::memset(&stream, 0, sizeof(stream));
-	fabricator::TableStats(table_handle, stream);
-
+	// {"row_count":N, "ndv":{"<column>":N, ...}} — see abi.h table_stats. row_count ABSENT = unknown
+	// (stays -1); the values are TYPED JSON numbers (the old kinds 4/5 crossed them as text).
+	auto json = fabricator::TableStats(table_handle);
+	YyjsonDocGuard guard(json);
+	auto *root = guard.Root();
+	if (!root) {
+		throw IOException("fabricator: table_stats returned malformed JSON: %s", json);
+	}
 	FabricatorTableStats result;
-	ArrowSchema schema;
-	std::memset(&schema, 0, sizeof(schema));
-	if (stream.get_schema(&stream, &schema) != 0) {
-		if (stream.release) {
-			stream.release(&stream);
-		}
-		throw IOException("fabricator: failed to read table_stats schema");
+	auto *row_count = yyjson_obj_get(root, "row_count");
+	if (yyjson_is_int(row_count)) {
+		result.row_count = yyjson_get_sint(row_count);
 	}
-	if (schema.release) {
-		schema.release(&schema);
-	}
-	for (;;) {
-		ArrowArray batch;
-		std::memset(&batch, 0, sizeof(batch));
-		if (stream.get_next(&stream, &batch) != 0) {
-			if (stream.release) {
-				stream.release(&stream);
-			}
-			throw IOException("fabricator: failed to read table_stats batch");
+	size_t idx, max;
+	yyjson_val *key, *val;
+	auto *ndv_obj = yyjson_obj_get(root, "ndv"); // hoisted: the foreach macro multi-evaluates its argument
+	yyjson_obj_foreach(ndv_obj, idx, max, key, val) {
+		if (yyjson_is_int(val)) {
+			result.column_ndv[string(yyjson_get_str(key), yyjson_get_len(key))] = yyjson_get_sint(val);
 		}
-		if (!batch.release) {
-			break; // end of stream
-		}
-		if (batch.length > 0 && batch.n_children < 3) {
-			batch.release(&batch);
-			if (stream.release) {
-				stream.release(&stream);
-			}
-			throw IOException("fabricator: table_stats batch has %lld columns, expected 3",
-			                  static_cast<long long>(batch.n_children));
-		}
-		for (int64_t row = 0; row < batch.length; row++) {
-			auto stat = GetUtf8(*batch.children[0], row);
-			if (stat == "row_count") {
-				result.row_count = GetInt64(*batch.children[2], row, -1);
-			} else if (stat == "ndv") {
-				result.column_ndv[GetUtf8(*batch.children[1], row)] = GetInt64(*batch.children[2], row, -1);
-			}
-			// Unknown stat names are skipped — additive stats must stay additive.
-		}
-		batch.release(&batch);
-	}
-	if (stream.release) {
-		stream.release(&stream);
 	}
 	return result;
 }

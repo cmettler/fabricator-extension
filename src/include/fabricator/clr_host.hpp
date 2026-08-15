@@ -201,17 +201,18 @@ void CatalogFunctions(FabricatorHandle handle, ArrowArrayStream &out);
 void CatalogMacros(FabricatorHandle handle, ArrowArrayStream &out);
 void CatalogServerInfo(FabricatorHandle handle, ArrowArrayStream &out);
 
-// The table session (ABI v72; see abi.h for the full contract). TableOpen resolves (schema, table[, AT])
-// to a session handle — no IO, no absence probe. TableSchema fills a ZERO-ROW stream whose Arrow schema is
-// the column layout and throws ObjectNotFoundException when the provider reports the table absent (the
-// old kind-2 contract, one entry over). TableInfo = (role, name, type) rowid + virtual columns; TableStats
-// = (stat, column, value:int64) row_count + NDV, lazy. TableScan = the old ScanTable minus the name pair.
-// TableClose is best-effort and never throws (it runs from the entry destructor at teardown).
+// The table session (ABI v72/v73; see abi.h for the full contract). TableOpen resolves (schema, table[,
+// AT]) to a session handle — no IO, no absence probe. TableSchema fills a ZERO-ROW stream whose Arrow
+// schema is the column layout and throws ObjectNotFoundException when the provider reports the table
+// absent (the old kind-2 contract, one entry over). TableInfo/TableStats return the JSON docs (v73 —
+// {"rowid":[...],"virtual":[...]} / {"row_count":N,"ndv":{...}}), parsed by the caller with yyjson.
+// TableScan = the old ScanTable minus the name pair. TableClose is best-effort and never throws (it runs
+// from the entry destructor at teardown).
 FabricatorHandle TableOpen(FabricatorHandle handle, const std::string &schema, const std::string &table,
                            const std::string &at_unit = "", const std::string &at_value = "");
 void TableSchema(FabricatorHandle table, ArrowArrayStream &out);
-void TableInfo(FabricatorHandle table, ArrowArrayStream &out);
-void TableStats(FabricatorHandle table, ArrowArrayStream &out);
+std::string TableInfo(FabricatorHandle table);
+std::string TableStats(FabricatorHandle table);
 void TableScan(FabricatorHandle table, const std::string &spec_json, ArrowArrayStream *filter_values,
                ArrowArrayStream &out);
 void TableClose(FabricatorHandle table) noexcept;

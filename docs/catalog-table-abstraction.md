@@ -559,14 +559,24 @@ the same table the code evaluates.
          providers' own ambient rules (SqlServer TryGet — lazy creation preserved; Delta GetOrCreate —
          without it an autocommit schema open would never share its pin/open and the
          195-of-291-seconds shape would return; DAX/DeltaRs/Stub null).
-       - **NO JSON — `table_info` is an Arrow stream with a DECLARED shape** ((role, name, type); the
-         design said "ONE typed JSON doc"). Decided by the loadable's LINK surface, checked before
-         building: yyjson is vendored in duckdb_static (`duckdb_yyjson`) but its symbols are not
-         `DUCKDB_API`-exported, so a loadable extension cannot call it on Windows; and a hand-rolled
-         parser over user-controlled identifier strings is the `ReadCapabilityFlag` hack without its
-         safety argument (that one is safe only because our own serializer emits bare booleans). The
-         SUBSTANCE — declared columns instead of kind ints, and typed values — survives: `table_stats`
-         carries an INT64 value column where kinds 4/5 crossed numbers as text.
+       - **JSON after all — `table_info`/`table_stats` are the design's ONE-typed-doc letter, via OUR OWN
+         vcpkg yyjson (v73, same day). ⚠ The v72 intermediate shipped them as Arrow streams on a
+         justification that did NOT survive review, and the correction is worth recording verbatim.** The
+         recorded reason was "yyjson is vendored in duckdb_static but not `DUCKDB_API`-exported, so a
+         loadable cannot link it" — TRUE of the VENDORED copy and an overclaim about JSON: the user
+         pointed out vcpkg, and the extension simply carries its own yyjson (plain C `yyjson_*` symbols;
+         DuckDB's copy is C++-namespaced `duckdb_yyjson`, so the static build gets no clash either). What
+         the impossibility claim actually was: a dependency-cost choice wearing a link-surface argument.
+         As built (ABI v73): `table_info` = `{"rowid":[...],"virtual":[{"name":..,"type":..}]}`,
+         `table_stats` = `{"row_count":N,"ndv":{...}}` (absent row_count = unknown; typed JSON numbers
+         where kinds 4/5 crossed text), both `char**` owned-UTF-8 crossings on the `get_capabilities`
+         convention, written with `Utf8JsonWriter` (proper escaping for user-controlled identifiers) and
+         parsed with yyjson. **The rework's biggest win is elsewhere: `ReadCapabilityFlag` — the
+         `get_capabilities` string-find hack, safe only by a producer-side bare-booleans argument — is
+         RETIRED for real parsing**, removing the caveat class rather than the instance. Cost accepted:
+         `yyjson` joins the vcpkg install line — ONE line, because all three build tiers share
+         `.github/actions/build-extension` — plus the quickstart/WSL docs; a platform missing it fails at
+         `find_package(yyjson CONFIG REQUIRED)`, loudly, at configure.
        - **Stats are a SEPARATE lazy entry, not part of the info doc** — bundling them would move the
          stats queries onto entry materialization, i.e. the enumeration path (§3 items 5/7). Entry
          materialization = open + schema + info (2 IO crossings, was 3); stats = 1 at first scan (was 2),
