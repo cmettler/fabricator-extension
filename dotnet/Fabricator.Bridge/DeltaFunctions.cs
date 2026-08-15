@@ -50,6 +50,12 @@ public static class DeltaFunctions
         new Field("value", StringType.Default, nullable: true),
     }, null);
 
+    /// <summary>The fixed one-column row <c>delta.checkpoint</c> returns: the version checkpointed.</summary>
+    public static readonly Schema CheckpointSchema = new(new[]
+    {
+        new Field("version", Int64Type.Default, nullable: false),
+    }, null);
+
     /// <summary>One (app_id, version) batch against <see cref="AppTxnSchema"/>.</summary>
     public static RecordBatch AppTxnRow(string appId, long? version)
     {
@@ -208,6 +214,40 @@ public sealed class DeltaSetTblPropertiesFunction : ICatalogTableFunction
                 "delta.set_tblproperties: a JSON object of property->value is required, e.g. "
                 + "'{\"delta.isolationLevel\":\"Serializable\"}'.");
         return new StreamTableBinding(DeltaFunctions.PropertiesSchema, () => _set(table, properties));
+    }
+}
+
+/// <summary><c>cat.delta.checkpoint('schema.table')</c> — write a checkpoint for the table's CURRENT
+/// version NOW, instead of waiting for a commit to land on a <c>delta.checkpointInterval</c> multiple.
+/// Returns the version checkpointed. Runs at EXECUTION, immediately (an administrative action, like
+/// OPTIMIZE/VACUUM — never part of a surrounding DuckDB transaction).</summary>
+/// <remarks>
+/// The use cases are engineered-wood's own (<c>DeltaTable.CheckpointAsync</c>): a checkpoint at a moment the
+/// caller knows to be good — after a bulk load, after an OPTIMIZE, before handing the table to another
+/// engine — which is what bounds the next reader's log replay. ⚠ It ALSO runs log cleanup, deleting commits
+/// the new checkpoint covers that are older than the table's <c>delta.logRetentionDuration</c> (exactly as an
+/// automatic checkpoint does; <c>delta.enableExpiredLogCleanup = 'false'</c> opts a table out). Not free —
+/// it materialises the whole active-file set — and idempotent in effect but not in cost.
+/// </remarks>
+public sealed class DeltaCheckpointFunction : ICatalogTableFunction
+{
+    private readonly Func<string, IArrowArrayStream> _checkpoint;
+
+    public DeltaCheckpointFunction(Func<string, IArrowArrayStream> checkpoint) => _checkpoint = checkpoint;
+
+    public string SchemaName => DeltaFunctions.SchemaName;
+    public string Name => "checkpoint";
+
+    public Schema Parameters { get; } = new(new[]
+    {
+        Params.Positional("table", StringType.Default, nullable: false),
+    }, null);
+
+    public ITableFunctionBinding Bind(RecordBatch args)
+    {
+        var table = FabricArgs.Str(args, 0)
+            ?? throw new ArgumentException("delta.checkpoint: a table is required ('schema.table').");
+        return new StreamTableBinding(DeltaFunctions.CheckpointSchema, () => _checkpoint(table));
     }
 }
 

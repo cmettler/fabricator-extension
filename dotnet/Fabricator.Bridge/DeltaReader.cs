@@ -93,6 +93,28 @@ internal static class DeltaReader
     public static long SetTableProperties(nint opener, string path, IReadOnlyList<KeyValuePair<string, string?>> updates)
         => SetTablePropertiesAsync(opener, path, updates).GetAwaiter().GetResult();
 
+    /// <summary>Writes a checkpoint for the table's CURRENT version (engineered-wood's
+    /// <c>DeltaTable.CheckpointAsync</c> — the table's own ParquetWriteOptions/CheckpointFormat, and log
+    /// cleanup runs after it exactly as on an automatic checkpoint). Returns the version checkpointed.
+    /// Opens FRESH deliberately: a checkpoint of a stale cached snapshot would silently checkpoint an old
+    /// version — the caller asked for "now".</summary>
+    public static long Checkpoint(nint opener, string path)
+        => CheckpointAsync(opener, path).GetAwaiter().GetResult();
+
+    private static async Task<long> CheckpointAsync(nint opener, string path)
+    {
+        var fs = TableFileSystems.Create(opener, path);
+        var table = await DeltaTable.OpenAsync(fs, DeltaWriter.Options()).ConfigureAwait(false);
+        try
+        {
+            return await table.CheckpointAsync().ConfigureAwait(false);
+        }
+        finally
+        {
+            await table.DisposeAsync().ConfigureAwait(false);
+        }
+    }
+
     private static async Task<long> SetTablePropertiesAsync(
         nint opener, string path, IReadOnlyList<KeyValuePair<string, string?>> updates)
     {

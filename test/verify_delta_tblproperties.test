@@ -601,3 +601,82 @@ SELECT count(*), count(*) FILTER (WHERE id = 11), count(*) FILTER (WHERE id < 0)
 
 statement ok
 DETACH ck;
+
+# ============================================================================
+# 9. MANUAL CHECKPOINT — cat.delta.checkpoint('schema.table') writes one for the CURRENT version NOW
+#    (engineered-wood's DeltaTable.CheckpointAsync), instead of waiting for a commit to land on a
+#    delta.checkpointInterval multiple. The direct lever on the next reader's log-replay cost.
+#    The DANGEROUS direction is pinned by the RE-ATTACH read: a malformed checkpoint does not fail the
+#    call, it makes the table unreadable for the NEXT reader (which replays via _last_checkpoint) — so
+#    "the file appeared" without "a fresh attach still reads it" would gate nothing that matters.
+# ============================================================================
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/manualck' AS mck (TYPE fabricator, PROVIDER 'delta');
+
+statement ok
+CREATE TABLE mck.main.t (id BIGINT);
+
+statement ok
+INSERT INTO mck.main.t VALUES (1);
+
+statement ok
+INSERT INTO mck.main.t VALUES (2);
+
+statement ok
+INSERT INTO mck.main.t VALUES (3);
+
+# Below the default interval (10), so no AUTOMATIC checkpoint exists — the control that makes the next
+# assertion attributable to the call rather than to a commit landing on a multiple.
+query I
+SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/manualck/t/_delta_log/*.checkpoint.parquet');
+----
+0
+
+# Returns the version checkpointed: v3 (CREATE = v0, three single-statement INSERTs).
+query I
+SELECT * FROM mck.delta.checkpoint('main.t');
+----
+3
+
+query I
+SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/manualck/t/_delta_log/*.checkpoint.parquet');
+----
+1
+
+# A FRESH attach replays THROUGH the new checkpoint and still reads every row.
+statement ok
+DETACH mck;
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/manualck' AS mck (TYPE fabricator, PROVIDER 'delta');
+
+query II
+SELECT count(*), sum(id) FROM mck.main.t;
+----
+3	6
+
+# Idempotent in effect (a classic checkpoint overwrites one fixed path with identical content): same
+# version back, still exactly one checkpoint file.
+query I
+SELECT * FROM mck.delta.checkpoint('main.t');
+----
+3
+
+query I
+SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/manualck/t/_delta_log/*.checkpoint.parquet');
+----
+1
+
+# And a write AFTER the manual checkpoint commits and reads normally (the checkpoint is a reader
+# accelerator, never a barrier).
+statement ok
+INSERT INTO mck.main.t VALUES (4);
+
+query II
+SELECT count(*), sum(id) FROM mck.main.t;
+----
+4	10
+
+statement ok
+DETACH mck;

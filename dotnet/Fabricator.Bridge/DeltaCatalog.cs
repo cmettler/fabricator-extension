@@ -1165,6 +1165,24 @@ public sealed class DeltaCatalog : IBackendCatalog
         });
     }
 
+    // cat.delta.checkpoint('schema.table'): write a checkpoint for the table's CURRENT version now, instead
+    // of waiting for a commit to land on a checkpointInterval multiple — the direct lever on the next
+    // reader's log-replay cost (the profiled OneLake table's dominant span). Immediate and administrative
+    // (like OPTIMIZE/VACUUM); engineered-wood also runs log cleanup after it, exactly as on an automatic
+    // checkpoint. Runs at EXECUTION, never at bind (the binding defers the core — see StreamTableBinding).
+    private IArrowArrayStream CheckpointCore(string tableRef)
+    {
+        var path = ResolveTableRefPath(tableRef, "delta.checkpoint");
+        long version = DeltaReader.Checkpoint(Opener(), path);
+        _log.LogInformation("delta checkpoint {Path}: v{Version}", path, version);
+        var v = new Int64Array.Builder();
+        v.Append(version);
+        return new InMemoryArrayStream(DeltaFunctions.CheckpointSchema, new[]
+        {
+            new RecordBatch(DeltaFunctions.CheckpointSchema, new IArrowArray[] { v.Build() }, 1),
+        });
+    }
+
     // Table-FEATURE properties: enabling these requires a protocol upgrade (reader/writer feature + supporting
     // metadata), so they can't be flipped by a plain metaData commit on an existing table — they're set at
     // CREATE via the ATTACH option. A set_tblproperties attempt on one is rejected with a clear pointer.
@@ -5316,6 +5334,7 @@ public sealed class DeltaCatalog : IBackendCatalog
             new DeltaChangesFunction(ChangesCore),
             new DeltaTblPropertiesFunction(TblPropertiesCore),
             new DeltaSetTblPropertiesFunction(SetTblPropertiesCore),
+            new DeltaCheckpointFunction(CheckpointCore),
             new DeltaGetTxnVersionFunction(GetTxnVersionCore),
             new DeltaSetTxnVersionFunction(SetTxnVersionCore),
         };

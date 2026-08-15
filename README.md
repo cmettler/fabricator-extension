@@ -1925,10 +1925,20 @@ SELECT _change_type, id, val
 ```
 
 > The `delta.*` functions are catalog-bound: they live in a synthetic `delta` schema every Delta attach
-> advertises (`snapshots`, `changes`, `tblproperties`, `set_tblproperties`, `get_transaction_version`,
-> `set_transaction_version`), always addressed through the catalog — `lake.delta.snapshots('main.t')`.
-> Before 2026-08-14 they were global functions taking the catalog name as their first argument
-> (`fabricator_delta_snapshots('lake', 'main.t')`); those spellings are **gone**, no aliases.
+> advertises (`snapshots`, `changes`, `tblproperties`, `set_tblproperties`, `checkpoint`,
+> `get_transaction_version`, `set_transaction_version`), always addressed through the catalog —
+> `lake.delta.snapshots('main.t')`. Before 2026-08-14 they were global functions taking the catalog name as
+> their first argument (`fabricator_delta_snapshots('lake', 'main.t')`); those spellings are **gone**, no
+> aliases.
+
+**Manual checkpoint.** `SELECT * FROM lake.delta.checkpoint('main.t')` writes a checkpoint for the table's
+current version *now* — instead of waiting for a commit to land on a `delta.checkpointInterval` multiple —
+and returns the version checkpointed. A checkpoint is what bounds the next reader's log replay, so the
+natural moments are after a bulk load or an `OPTIMIZE`, or before handing the table to another engine. Notes:
+it also runs log cleanup (commits the checkpoint covers that are older than `delta.logRetentionDuration` are
+deleted, exactly as an automatic checkpoint would; set `delta.enableExpiredLogCleanup` to `'false'` on the
+table to keep them), it is not free (it materialises the whole active-file set), and running it per commit
+just pays for checkpointing twice.
 
 > **Caveat if you also use `row_tracking true` and read the feed from another engine.** An `INSERT` run
 > inside an explicit `BEGIN … COMMIT` writes a `_change_data` file whose row-id columns are **NULL**, where
