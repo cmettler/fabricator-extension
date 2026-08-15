@@ -8,6 +8,7 @@ using Azure.Core;
 using Azure.Identity;
 using Azure.Storage.Files.DataLake;
 using Azure.Storage.Files.DataLake.Models;
+using Microsoft.Extensions.Logging;
 
 namespace Fabricator.Bridge;
 
@@ -27,6 +28,13 @@ namespace Fabricator.Bridge;
 internal static class OneLakeForwardFs
 {
     private const string OneLakeHost = "onelake.dfs.fabric.microsoft.com";
+
+    // Per-IO Debug lines (open + ranged read). They exist to make remote-scan attribution measurable — the
+    // "why does read_parquet([N files]) pay ~all footers before its first row" puzzle needs the open/read
+    // TIMELINE (sequential vs burst, files touched before first data read), and nothing logged per IO before.
+    // Chatty by nature, so Debug-gated like the per-file scan lines; ⚠ never compute log arguments before the
+    // IsEnabled check on the Read path — it runs once per HTTP GET.
+    private static readonly ILogger Log = FabricatorLog.CreateLogger("Fabricator.OneLake.Fs");
 
     /// <summary>An open read handle: the file client + its length (fetched once at open, cached C++-side too).</summary>
     internal sealed class Handle
@@ -76,9 +84,17 @@ internal static class OneLakeForwardFs
         var client = FsClient(fs, Cred(credJson)).GetFileClient(p);
         if (knownSize >= 0)
         {
+            if (Log.IsEnabled(LogLevel.Debug))
+            {
+                Log.LogDebug("onelake open {Path} size={Size} (known, no IO)", p, knownSize);
+            }
             return (new Handle { Client = client, Length = knownSize }, knownSize, null, -1);
         }
         var props = client.GetPropertiesAsync().GetAwaiter().GetResult().Value;
+        if (Log.IsEnabled(LogLevel.Debug))
+        {
+            Log.LogDebug("onelake open {Path} size={Size} (props fetched)", p, props.ContentLength);
+        }
         return (new Handle { Client = client, Length = props.ContentLength }, props.ContentLength,
                 props.ETag.ToString(), props.LastModified.ToUnixTimeMilliseconds());
     }
@@ -90,6 +106,10 @@ internal static class OneLakeForwardFs
         if (dest.Length == 0)
         {
             return;
+        }
+        if (Log.IsEnabled(LogLevel.Debug))
+        {
+            Log.LogDebug("onelake read {Path} off={Off} len={Len}", h.Client.Path, location, dest.Length);
         }
         Response<FileDownloadInfo> resp = h.Client
             .ReadAsync(new DataLakeFileReadOptions { Range = new HttpRange(location, dest.Length) })
@@ -122,11 +142,35 @@ internal static class OneLakeForwardFs
         // segment (it does NOT cross '/') — so `Tables/t/*.parquet` matches the data files at the table root
         // but NOT `Tables/t/_delta_log/0000.json` (that has an extra '/'), and the .parquet suffix is enforced.
         int star = p.IndexOf('*');
+        if (star < 0)
+        {
+            // ⚠ A LITERAL path is ECHOED with ZERO IO — matching httpfs's own literal-glob behaviour, and it
+            // is a MEASURED fix, not tidiness. This used to fall through to the recursive directory LIST
+            // below and filter `name == p`: one remote LIST per literal path. DuckDB's multi-file scan globs
+            // EVERY input path when its lazy file list expands at scan init, so the Delta native reader's
+            // batched read_parquet([89 files]) paid 89 sequential LISTs ≈ 21.4 s on live OneLake before its
+            // FIRST byte of parquet IO — the span misattributed as an "execution-phase footer sweep" until
+            // the per-IO log lines showed 2 opens / 2 reads total under LIMIT 1 and a 21 s IO-silent gap.
+            // (It also explains the 2026-08-14 probe pair: LIMIT 0 = 0.49 s never expands the list; LIMIT 1
+            // = 15.15 s does.) The costs this trades: a missing file now errors at OPEN (a 404) instead of
+            // globbing empty — the honest outcome for a path the Delta snapshot listed; and the echo carries
+            // no extended_info, so a file that is actually OPENED pays one properties fetch there — the same
+            // round trip the LIST cost, now paid only for files the scan touches instead of every file named.
+            if (Log.IsEnabled(LogLevel.Debug))
+            {
+                Log.LogDebug("onelake glob {Path} (literal, echoed — no IO)", p);
+            }
+            return $"[{{\"path\":\"onelake://{fs}/{p.Replace("\"", "\\\"")}\"}}]";
+        }
         string beforeStar = star >= 0 ? p.Substring(0, star) : p;
         string afterStar = star >= 0 ? p.Substring(star + 1) : string.Empty;
         int slash = beforeStar.LastIndexOf('/');
         string dir = slash >= 0 ? beforeStar.Substring(0, slash) : string.Empty;
 
+        if (Log.IsEnabled(LogLevel.Debug))
+        {
+            Log.LogDebug("onelake glob {Pattern} (listing {Dir})", p, dir);
+        }
         var client = FsClient(fs, Cred(credJson));
         var sb = new StringBuilder("[");
         bool firstItem = true;
@@ -196,6 +240,10 @@ internal static class OneLakeForwardFs
     public static bool Exists(string path, string? credJson)
     {
         var (fs, p) = Parse(path);
+        if (Log.IsEnabled(LogLevel.Debug))
+        {
+            Log.LogDebug("onelake exists {Path}", p);
+        }
         var client = FsClient(fs, Cred(credJson)).GetFileClient(p);
         try
         {
