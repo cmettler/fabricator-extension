@@ -86,6 +86,23 @@ public interface ITableBinding : IDisposable
 
     /// <summary>The row-identity column names (PK / unique index / IDENTITY / a provider virtual rowid),
     /// empty when the table has none (UPDATE/DELETE then unavailable). May do IO.</summary>
+    /// <remarks>
+    /// <para><b>Resolution rules</b> — the host resolves each name CASE-INSENSITIVELY against
+    /// <see cref="Schema"/>, and <see cref="VirtualColumns"/> plays no part. The names must either ALL
+    /// resolve to schema columns — a REAL rowid, typed FROM the schema (the column's own type, or a STRUCT
+    /// of the key columns when compound; the scan fetches them as ordinary columns and packs the struct
+    /// host-side, so the provider's result set never carries a composite) — or ALL be absent from it — a
+    /// provider-VIRTUAL rowid, whose name the scan spec forwards verbatim for the provider's OWN reader to
+    /// recognize and synthesize. A MIXED resolution silently DISABLES the rowid (a partial key addresses
+    /// the wrong rows, which is worse than no key); the provider gets no signal, so treat a mixed list as a
+    /// declaration bug, never a fallback.</para>
+    /// <para>⚠ <b>The host types a virtual rowid BIGINT per component.</b> That is a host-side assumption
+    /// (<c>fabricator_schema_entry.cpp</c>) matching the one existing virtual-rowid provider — Delta's
+    /// packed <c>(fileOrdinal &lt;&lt; 40) | position</c> — not a declared type: <c>table_info</c> carries
+    /// no type channel for it. A non-BIGINT virtual identity would be silently mistyped (the
+    /// ingestion-mismatch failure class, not a clean error); the day one is needed, extend the rowid
+    /// entries from <c>"name"</c> to <c>{"name","type"}</c> — additive JSON, unknown-key-safe.</para>
+    /// </remarks>
     IReadOnlyList<string> RowIdColumns();
 
     /// <summary>Provider virtual columns (queryable by name, excluded from <c>SELECT *</c>); empty when
