@@ -117,7 +117,7 @@ internal sealed class DaxCatalog : IBackendCatalog
     }
 
     // ── catalog discovery (the five dedicated list members — ABI v72). The per-TABLE questions live on the
-    // typed ITable members (the definition/bound table at the end of this file), reached through the host's
+    // typed ITableBinding members (the definition/bound table at the end of this file), reached through the host's
     // table_* session.
 
     // Schemas = the model name(s) + the "system" schema (curated $SYSTEM DMVs).
@@ -137,12 +137,12 @@ internal sealed class DaxCatalog : IBackendCatalog
 
     public IArrowArrayStream GetServerInfo() => EmptyStringTable("property", "value");
 
-    /// <summary>The DAX <see cref="ITableDefinition"/> — read-only, transaction-free (the default
+    /// <summary>The DAX <see cref="ITable"/> — read-only, transaction-free (the default
     /// <c>ResolveTransaction</c> answers null, so every bind is transient and caller-owned).</summary>
-    public ITableDefinition GetTable(string schemaName, string tableName) =>
+    public ITable GetTable(string schemaName, string tableName) =>
         new DaxTableDefinition(this, schemaName, tableName);
 
-    private sealed class DaxTableDefinition : ITableDefinition
+    private sealed class DaxTableDefinition : ITable
     {
         private readonly DaxCatalog _catalog;
 
@@ -158,17 +158,17 @@ internal sealed class DaxCatalog : IBackendCatalog
 
         // The AT clause is carried per the interface but has no DAX meaning; the scan spec's own AT
         // handling (rejected provider-side) is what surfaces the refusal.
-        public ITable Bind(ITransaction? transaction, TableAt? at = null) => new DaxBoundTable(_catalog, this);
+        public ITableBinding Bind(ITransaction? transaction, TableAt? at = null) => new DaxTableBinding(_catalog, this);
     }
 
     /// <summary>The THIN DAX bound table: no rowid (read-only provider), no virtual columns, no stats —
     /// schema + scan delegate to the catalog's existing cores.</summary>
-    private sealed class DaxBoundTable : ITable
+    private sealed class DaxTableBinding : ITableBinding
     {
         private readonly DaxCatalog _catalog;
         private readonly DaxTableDefinition _definition;
 
-        internal DaxBoundTable(DaxCatalog catalog, DaxTableDefinition definition)
+        internal DaxTableBinding(DaxCatalog catalog, DaxTableDefinition definition)
         {
             _catalog = catalog;
             _definition = definition;

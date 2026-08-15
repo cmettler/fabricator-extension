@@ -22,7 +22,7 @@ namespace Fabricator.Bridge;
 ///
 /// <para>Since slice 4c (docs/catalog-table-abstraction.md §5) this class is only the STATIC STREAM/DISPOSAL
 /// HELPERS: the per-table buffer shape it used to declare (<c>PendingAppends</c>) is
-/// <see cref="DeltaBoundTable"/> — the table-bound-to-a-transaction object, which also absorbed the snapshot
+/// <see cref="DeltaTableBinding"/> — the table-bound-to-a-transaction object, which also absorbed the snapshot
 /// pin and the open-table reuse — and the per-transaction bookkeeping lives on
 /// <see cref="DeltaTransaction"/>, one object per transaction in the catalog's
 /// <see cref="TransactionManager{T}"/>.</para>
@@ -63,7 +63,7 @@ internal static class DeltaTxnBuffer
     /// <para>Never throws: it runs from finally blocks that may already be carrying the user's real error;
     /// a cleanup failure must not replace it.</para>
     /// </summary>
-    public static void DisposeHeld(DeltaBoundTable pending)
+    public static void DisposeHeld(DeltaTableBinding pending)
     {
         var txn = pending.HeldTxn;
         var table = pending.HeldTable;
@@ -89,7 +89,7 @@ internal static class DeltaTxnBuffer
     }
 
     /// <summary>Disposes buffered batches (rollback / after flush).</summary>
-    public static void DisposeBatches(DeltaBoundTable pending)
+    public static void DisposeBatches(DeltaTableBinding pending)
     {
         foreach (var b in pending.Batches)
         {
@@ -105,7 +105,7 @@ internal static class DeltaTxnBuffer
     /// ids only need scan-local uniqueness).
     /// </summary>
     public static async IAsyncEnumerable<RecordBatch> ProjectPending(
-        DeltaBoundTable pending, Schema target, string rowIdColumn, long rowIdOrdinalBase,
+        DeltaTableBinding pending, Schema target, string rowIdColumn, long rowIdOrdinalBase,
         [EnumeratorCancellation] CancellationToken ct = default)
     {
         long position = 0;

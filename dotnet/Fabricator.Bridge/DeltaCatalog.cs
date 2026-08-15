@@ -266,7 +266,7 @@ public sealed class DeltaCatalog : IBackendCatalog
     private readonly PushdownMode _pushdownMode;
 
     // THIS CATALOG's transactions (slices 4b/4c): one DeltaTransaction per DuckDB transaction that touched
-    // this catalog, holding one DeltaBoundTable per table — the append/DML buffers, the explicit-BEGIN
+    // this catalog, holding one DeltaTableBinding per table — the append/DML buffers, the explicit-BEGIN
     // mark, the snapshot pin and the open-table reuse in ONE object per (txn, table) (was: the txn buffer's
     // outer map + the process-global static DeltaTxnScope registry). Buffers flush as ONE Delta commit per
     // table at CommitTransaction; RollbackTransaction discards. In autocommit the flush fires at statement
@@ -298,18 +298,18 @@ public sealed class DeltaCatalog : IBackendCatalog
     /// threads into the static DeltaReader/DeltaNativeReader entry points for pin + open-table reuse
     /// (replacing 4b's scope threading; the bound table IS the read scope since 4c). Null when no
     /// transaction is ambient — the callee then opens untracked and the caller owns the disposal.</summary>
-    internal DeltaBoundTable? ReadBound(string path) => AmbientTxn()?.GetOrCreate(path);
+    internal DeltaTableBinding? ReadBound(string path) => AmbientTxn()?.GetOrCreate(path);
 
-    /// <summary>The Delta <see cref="ITableDefinition"/> — transient in the current transport (see the
+    /// <summary>The Delta <see cref="ITable"/> — transient in the current transport (see the
     /// interface remarks); <see cref="DeltaTableDefinition.Bind"/> memoizes on the transaction.</summary>
-    public ITableDefinition GetTable(string schemaName, string tableName) =>
+    public ITable GetTable(string schemaName, string tableName) =>
         new DeltaTableDefinition(this, schemaName, tableName);
 
     /// <summary>Binds (schema, table) against the AMBIENT transaction — the metadata/scan adapters' path
     /// onto the object model. Ambient txn 0 (a genuinely transaction-free context) yields a transient
     /// caller-owned binding, matching the old null-scope behaviour.</summary>
-    private DeltaBoundTable BindAmbient(string schemaName, string tableName) =>
-        (DeltaBoundTable)GetTable(schemaName, tableName).Bind(AmbientTxn(), at: null);
+    private DeltaTableBinding BindAmbient(string schemaName, string tableName) =>
+        (DeltaTableBinding)GetTable(schemaName, tableName).Bind(AmbientTxn(), at: null);
 
     // Append-only transactions (slice 1): any non-append operation on a table that already has buffered
     // inserts in the CURRENT transaction is rejected — its snapshot-coupled actions (rowid DML, replace,
@@ -524,7 +524,7 @@ public sealed class DeltaCatalog : IBackendCatalog
 
     // As EffectiveSerializable, read once and cached on the buffer (isolation is stable within a
     // transaction). Used by the flush's OCC check + row-level relaxation.
-    private bool PendingSerializable(DeltaBoundTable pending, string path)
+    private bool PendingSerializable(DeltaTableBinding pending, string path)
     {
         if (pending.Serializable is { } cached)
         {
@@ -1010,7 +1010,7 @@ public sealed class DeltaCatalog : IBackendCatalog
         => _pushdownMode == PushdownMode.Exact ? "{\"exact_filter_pushdown\":true}" : "{}";
 
     // ── catalog discovery (the five dedicated list members — ABI v72; the kind multiplexer is gone). The
-    // per-TABLE questions live on the typed ITable members (DeltaBoundTable), reached through the host's
+    // per-TABLE questions live on the typed ITableBinding members (DeltaTableBinding), reached through the host's
     // table_* session — the 4c re-encoding arms died with the transport they encoded for.
 
     // CatalogSchemaNames, not SchemaNames: the advertised set includes the `delta` (and, on a OneLake root,
@@ -1557,7 +1557,7 @@ public sealed class DeltaCatalog : IBackendCatalog
     }
 
     // Slice 4c: ScanTable is the transport ADAPTER onto the object model — the scan itself is
-    // ITable.Scan on the ambient-bound table (which delegates to ScanCore below; the catalog keeps the
+    // ITableBinding.Scan on the ambient-bound table (which delegates to ScanCore below; the catalog keeps the
     // body because it owns the opener, the engine flags and the overlays). One binding serves N scans
     // with different specs — BIND IS STATE, SCAN IS REQUEST, so the spec/filters stay per-call.
     public IArrowArrayStream ScanTable(string schemaName, string tableName, string? specJson,
@@ -1739,7 +1739,7 @@ public sealed class DeltaCatalog : IBackendCatalog
     // table, with the ordinal spaces kept disjoint by construction.
     private IArrowArrayStream ScanCodec(nint opener, string path, ScanSpec? spec,
                                         EngineeredWood.Expressions.Predicate? filter,
-                                        DeltaBoundTable? pending, string? pinnedReadValue)
+                                        DeltaTableBinding? pending, string? pinnedReadValue)
     {
         // Buffered DML forces the rowid stream: positions decode against the PINNED version's ordinals
         // (BufferDeleteRows guarantees PinnedVersion is set whenever DeletedByOrdinal is non-empty).
@@ -1834,7 +1834,7 @@ public sealed class DeltaCatalog : IBackendCatalog
     // columns), dropping pending-only columns (added — nothing to read; the reconcile backfills NULLs).
     private IReadOnlyList<string>? TranslateProjectionToCommitted(
         IReadOnlyList<string>? projCols, nint opener, string path, string? pinnedReadValue,
-        DeltaBoundTable pending)
+        DeltaTableBinding pending)
     {
         if (projCols is null)
         {
@@ -2846,7 +2846,7 @@ public sealed class DeltaCatalog : IBackendCatalog
         // ⚠ HOIST SLICE 5: a CREATE inside an explicit transaction is now IMMEDIATE — it takes the very
         // same path an autocommit CREATE takes, below. The buffered form is gone (it used to park the
         // schema here and have the flush create the table at COMMIT). The transaction records only that it
-        // OWNS the table, so ROLLBACK may drop it; see DeltaBoundTable.CreatedInTxn for the
+        // OWNS the table, so ROLLBACK may drop it; see DeltaTableBinding.CreatedInTxn for the
         // trade this accepts and what it buys.
         //
         // ⚠ THE ORDER IS LOAD-BEARING: the mark is set only AFTER the create below has actually landed.
@@ -3148,7 +3148,7 @@ public sealed class DeltaCatalog : IBackendCatalog
     /// branch that describes the wrong outcome is worse than none. See
     /// docs/ew-upstream-0.3.0-analysis.md §4b.3.</para>
     /// </summary>
-    private int DiscardBufferedFiles(string tablePath, DeltaBoundTable pending)
+    private int DiscardBufferedFiles(string tablePath, DeltaTableBinding pending)
     {
         if (pending.Files.Count == 0)
         {
@@ -3273,7 +3273,7 @@ public sealed class DeltaCatalog : IBackendCatalog
     // run schema-overridden; changing the schema under already-buffered rows/post-images is unsupported).
     // Shared start of every buffered schema change: guard the order rule (ALTERs before the transaction's
     // data statements — buffered rows/post-images were built under the pre-ALTER schema) and pin the base.
-    private DeltaBoundTable BeginSchemaChange(long txnId, string path,
+    private DeltaTableBinding BeginSchemaChange(long txnId, string path,
                                                             in DeltaReader.TxnDmlProfile profile)
     {
         var pending = _txns.GetOrCreate(txnId).GetOrCreate(path);
@@ -3287,7 +3287,7 @@ public sealed class DeltaCatalog : IBackendCatalog
         return pending;
     }
 
-    private void StoreSchemaChange(DeltaBoundTable pending,
+    private void StoreSchemaChange(DeltaTableBinding pending,
                                    in EngineeredWood.DeltaLake.Table.DeltaTable.DeferredSchemaChange change,
                                    string op)
     {
@@ -3480,7 +3480,7 @@ public sealed class DeltaCatalog : IBackendCatalog
     }
 
     // The rename map inverted for the read direction (committed name -> pending name).
-    private static IReadOnlyDictionary<string, string>? CommittedToPending(DeltaBoundTable pending)
+    private static IReadOnlyDictionary<string, string>? CommittedToPending(DeltaTableBinding pending)
     {
         if (pending.RenameMap.Count == 0)
         {
@@ -3892,11 +3892,11 @@ public sealed class DeltaCatalog : IBackendCatalog
     // transaction's single commit; ROLLBACK leaves them as invisible orphans). The plural
     // WriteChangeDataFilesAsync splits per partition (data-file convention), so partitioned CDF tables
     // work too.
-    private void WriteCdcFiles(nint opener, string tablePath, DeltaBoundTable pending,
+    private void WriteCdcFiles(nint opener, string tablePath, DeltaTableBinding pending,
                                IEnumerable<RecordBatch> rows, string changeType)
         => WriteCdcFilesAsync(opener, tablePath, pending, rows, changeType).GetAwaiter().GetResult();
 
-    private async Task WriteCdcFilesAsync(nint opener, string tablePath, DeltaBoundTable pending,
+    private async Task WriteCdcFilesAsync(nint opener, string tablePath, DeltaTableBinding pending,
                                IEnumerable<RecordBatch> rows, string changeType)
     {
         // Cancel a slow buffered-statement CDC write on interrupt (opener fresh from the DML operator).
@@ -3979,13 +3979,13 @@ public sealed class DeltaCatalog : IBackendCatalog
     // behavior, and what the flush's own WriteDataFilesAsync batch path already produces); the
     // materialized column is an override for rows whose ORIGINAL ids must survive a rewrite
     // (compaction / merge-on-read post-images), not a requirement for new rows.
-    private bool TryEagerWriteBatches(nint opener, string tablePath, DeltaBoundTable pending,
+    private bool TryEagerWriteBatches(nint opener, string tablePath, DeltaTableBinding pending,
                                       IReadOnlyList<RecordBatch> batches, string tableName,
                                       IReadOnlyList<long?>? materializedRowIds = null)
         => TryEagerWriteBatchesAsync(opener, tablePath, pending, batches, tableName, materializedRowIds)
             .GetAwaiter().GetResult();
 
-    private async Task<bool> TryEagerWriteBatchesAsync(nint opener, string tablePath, DeltaBoundTable pending,
+    private async Task<bool> TryEagerWriteBatchesAsync(nint opener, string tablePath, DeltaTableBinding pending,
                                       IReadOnlyList<RecordBatch> batches, string tableName,
                                       IReadOnlyList<long?>? materializedRowIds)
     {
@@ -4053,11 +4053,11 @@ public sealed class DeltaCatalog : IBackendCatalog
     // the deletion-vector actions, and commit EVERYTHING as one atomic Delta commit. No retry — the DV
     // positions are snapshot-coupled.
     private void FlushDmlTransaction(nint opener, string tablePath, long txnId,
-                                     DeltaBoundTable pending)
+                                     DeltaTableBinding pending)
         => FlushDmlTransactionAsync(opener, tablePath, txnId, pending).GetAwaiter().GetResult();
 
     private async Task FlushDmlTransactionAsync(nint opener, string tablePath, long txnId,
-                                     DeltaBoundTable pending)
+                                     DeltaTableBinding pending)
     {
         // Cancel the DML-commit phase on interrupt (a slow buffered write over OneLake/S3, or a spinning
         // OCC/rebase retry loop against a busy concurrent writer). SAFE: a cancel before the log commit lands
@@ -4342,7 +4342,7 @@ public sealed class DeltaCatalog : IBackendCatalog
     /// parks it on the buffer entry (hoist slice 1a). Idempotent: a second call returns the held one.
     /// </summary>
     private async Task<EngineeredWood.DeltaLake.Table.DeltaTable> EnsureHeldTableAsync(
-        nint opener, string tablePath, DeltaBoundTable pending,
+        nint opener, string tablePath, DeltaTableBinding pending,
         System.Threading.CancellationToken token)
     {
         if (pending.HeldTable is { } held)
@@ -4384,7 +4384,7 @@ public sealed class DeltaCatalog : IBackendCatalog
     /// the point of the hoist: every later statement stages into the same transaction against the same base.
     /// </summary>
     private static EngineeredWood.DeltaLake.Table.DeltaTransaction EnsureHeldTxn(
-        DeltaBoundTable pending, EngineeredWood.DeltaLake.Table.DeltaTable table,
+        DeltaTableBinding pending, EngineeredWood.DeltaLake.Table.DeltaTable table,
         EngineeredWood.DeltaLake.Snapshot.Snapshot pinnedSnap, bool tableSer)
         => pending.HeldTxn ??= table.StartTransaction(pinnedSnap,
             tableSer

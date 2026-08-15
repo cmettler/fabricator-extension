@@ -7,9 +7,9 @@ using EngineeredWood.DeltaLake.Table;
 
 namespace Fabricator.Bridge;
 
-/// <summary>The Delta provider's <see cref="ITableDefinition"/> — identity + the bind factory, transient in
+/// <summary>The Delta provider's <see cref="ITable"/> — identity + the bind factory, transient in
 /// the current transport (created per metadata/scan crossing by <see cref="DeltaCatalog.GetTable"/>).</summary>
-internal sealed class DeltaTableDefinition : ITableDefinition
+internal sealed class DeltaTableDefinition : ITable
 {
     private readonly DeltaCatalog _catalog;
 
@@ -25,12 +25,12 @@ internal sealed class DeltaTableDefinition : ITableDefinition
 
     /// <summary>
     /// A plain bind against a live <see cref="DeltaTransaction"/> is MEMOIZED — it returns the
-    /// transaction's one <see cref="DeltaBoundTable"/> for the path (which is also the append buffer, the
+    /// transaction's one <see cref="DeltaTableBinding"/> for the path (which is also the append buffer, the
     /// snapshot pin and the open-table reuse: §2.3's "PendingAppends + the DeltaTableCache entry + the
     /// SnapshotPinning pin, unified"). An AT bind or a transaction-free bind is a fresh caller-owned
     /// instance — time travel is a property of the reference.
     /// </summary>
-    public ITable Bind(ITransaction? transaction, TableAt? at = null)
+    public ITableBinding Bind(ITransaction? transaction, TableAt? at = null)
     {
         string path = _catalog.TablePath(SchemaName, TableName);
         if (at is null && transaction is DeltaTransaction dt)
@@ -39,7 +39,7 @@ internal sealed class DeltaTableDefinition : ITableDefinition
             bound.SetNames(SchemaName, TableName);
             return bound;
         }
-        return new DeltaBoundTable(_catalog, SchemaName, TableName, path, at);
+        return new DeltaTableBinding(_catalog, SchemaName, TableName, path, at);
     }
 }
 
@@ -65,12 +65,12 @@ internal sealed class DeltaTableDefinition : ITableDefinition
 /// replay the <c>_delta_log</c> ONCE (measured: 195 s of 291 s in redundant snapshot builds on a Fabric
 /// table at v1850) — see the sharing rules on <see cref="TryGetOpen"/>.</para>
 /// </summary>
-internal sealed class DeltaBoundTable : ITable
+internal sealed class DeltaTableBinding : ITableBinding
 {
     /// <summary>Memoized form: created by <see cref="DeltaTransaction.GetOrCreate"/>; the catalog comes from
     /// the owner. <c>Path</c> is mutable for the created-table RENAME re-key
     /// (<see cref="DeltaTransaction.RenameTable"/>) — the PIN re-keys with the object now, structurally.</summary>
-    internal DeltaBoundTable(DeltaTransaction owner, string path)
+    internal DeltaTableBinding(DeltaTransaction owner, string path)
     {
         Owner = owner;
         Path = path;
@@ -78,7 +78,7 @@ internal sealed class DeltaBoundTable : ITable
 
     /// <summary>Transient form: an AT bind or a transaction-free bind (<see cref="DeltaTableDefinition.Bind"/>).
     /// Holds no buffer anything can flush and never retains an open (see <see cref="CanRetainOpen"/>).</summary>
-    internal DeltaBoundTable(DeltaCatalog catalog, string schemaName, string tableName, string path, TableAt? at)
+    internal DeltaTableBinding(DeltaCatalog catalog, string schemaName, string tableName, string path, TableAt? at)
     {
         _catalog = catalog;
         SchemaName = schemaName;
@@ -352,7 +352,7 @@ internal sealed class DeltaBoundTable : ITable
         }
     }
 
-    // ── schema/info resolution (the ITable read surface) ────────────────────────────────────────────────
+    // ── schema/info resolution (the ITableBinding read surface) ────────────────────────────────────────────────
 
     /// <summary>The table's row-tracking flag, cached from the last schema resolution so the
     /// virtual-columns answer normally costs no extra <c>_delta_log</c> read (the columns fetch always

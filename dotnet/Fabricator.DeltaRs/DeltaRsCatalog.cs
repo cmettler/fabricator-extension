@@ -13,7 +13,8 @@ using DeltaLake.Interfaces;
 using DeltaLake.Kernel.Core;
 using DeltaLake.Table;
 // delta-dotnet's per-table handle collides by NAME with the object model's Fabricator.Bridge.ITable
-// (the table_* session's surface) — alias the delta-rs one; ours stays fully qualified below.
+// (since the ITableBinding rename that is the table DEFINITION, what GetTable returns) — alias the
+// delta-rs one; ours stays fully qualified below.
 using DrsTable = DeltaLake.Interfaces.ITable;
 
 namespace Fabricator.DeltaRs;
@@ -141,7 +142,8 @@ public sealed class DeltaRsCatalog : IBackendCatalog
     // ---- metadata ----
 
     // ── catalog discovery (the five dedicated list members — ABI v72). The per-TABLE questions live on the
-    // typed ITable members (the definition/bound table below), reached through the host's table_* session.
+    // typed ITable/ITableBinding members (the definition/binding below), reached through the host's
+    // table_* session.
 
     // CatalogSchemaNames, not SchemaNames: the advertised set includes the `delta` function namespace
     // (snapshots/changes are catalog-bound functions — the same mechanism as the engineered-wood
@@ -168,12 +170,12 @@ public sealed class DeltaRsCatalog : IBackendCatalog
         return new InMemoryArrayStream(builder.Build(), System.Array.Empty<RecordBatch>());
     }
 
-    /// <summary>The delta-rs <see cref="ITableDefinition"/> — transaction-free in this provider (the
+    /// <summary>The delta-rs <see cref="Fabricator.Bridge.ITable"/> — transaction-free in this provider (the
     /// default <c>ResolveTransaction</c> answers null, so every bind is transient and caller-owned).</summary>
-    public ITableDefinition GetTable(string schemaName, string tableName) =>
+    public Fabricator.Bridge.ITable GetTable(string schemaName, string tableName) =>
         new DeltaRsTableDefinition(this, schemaName, tableName);
 
-    private sealed class DeltaRsTableDefinition : ITableDefinition
+    private sealed class DeltaRsTableDefinition : Fabricator.Bridge.ITable
     {
         private readonly DeltaRsCatalog _catalog;
 
@@ -190,16 +192,16 @@ public sealed class DeltaRsCatalog : IBackendCatalog
         // The AT clause is carried per the interface; the SCHEMA answer deliberately ignores it (delta-rs
         // loads the snapshot per scan, and the scan spec's own AT is what selects the version there —
         // matching the pre-4d transport, where the columns fetch had no AT channel on this provider).
-        public Fabricator.Bridge.ITable Bind(ITransaction? transaction, TableAt? at = null) =>
-            new DeltaRsBoundTable(_catalog, this);
+        public ITableBinding Bind(ITransaction? transaction, TableAt? at = null) =>
+            new DeltaRsTableBinding(_catalog, this);
     }
 
-    private sealed class DeltaRsBoundTable : Fabricator.Bridge.ITable
+    private sealed class DeltaRsTableBinding : ITableBinding
     {
         private readonly DeltaRsCatalog _catalog;
         private readonly DeltaRsTableDefinition _definition;
 
-        internal DeltaRsBoundTable(DeltaRsCatalog catalog, DeltaRsTableDefinition definition)
+        internal DeltaRsTableBinding(DeltaRsCatalog catalog, DeltaRsTableDefinition definition)
         {
             _catalog = catalog;
             _definition = definition;

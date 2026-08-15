@@ -316,13 +316,13 @@ internal static class DeltaReader
     /// stats/partitions can't match), and resolves each surviving file's deletion-vector positions.</summary>
     public static NativeScanList ListNativeScanFiles(
         nint opener, string path, string? unit, string? value, Predicate? prune, ILogger log,
-        EngineeredWood.DeltaLake.Schema.StructType? schemaOverride = null, DeltaBoundTable? bound = null)
+        EngineeredWood.DeltaLake.Schema.StructType? schemaOverride = null, DeltaTableBinding? bound = null)
         => ListNativeScanFilesAsync(opener, path, unit, value, prune, log, schemaOverride, bound)
             .GetAwaiter().GetResult();
 
     /// <summary>
     /// Opens a table for a READ, reusing the one <paramref name="bound"/>'s transaction already has open
-    /// when there is one (the shared open lives ON the <see cref="DeltaBoundTable"/> since 4c). Returns
+    /// when there is one (the shared open lives ON the <see cref="DeltaTableBinding"/> since 4c). Returns
     /// whether the result is SHARED — a shared table must NOT be disposed by the borrower, because
     /// engineered-wood's <c>Dispose</c> latches <c>_disposed</c> and the next reader would then throw.
     /// </summary>
@@ -339,10 +339,10 @@ internal static class DeltaReader
     /// function or an ExternalTableRouting schema probe gets — the old static registry cached their opens
     /// under the ambient id and, with no catalog to release that id, LEAKED the entry until the 4096 panic
     /// clear. A TRANSIENT binding (an AT bind, or a transaction-free bind) declines retention itself
-    /// (<see cref="DeltaBoundTable.CanRetainOpen"/>) and behaves exactly like null here.</para>
+    /// (<see cref="DeltaTableBinding.CanRetainOpen"/>) and behaves exactly like null here.</para>
     /// </remarks>
-    private static async Task<(DeltaBoundTable.OpenTable Open, bool Shared)> OpenForReadAsync(
-        nint opener, string path, DeltaBoundTable? bound)
+    private static async Task<(DeltaTableBinding.OpenTable Open, bool Shared)> OpenForReadAsync(
+        nint opener, string path, DeltaTableBinding? bound)
     {
         if (bound?.TryGetOpen() is { } hit)
         {
@@ -359,20 +359,20 @@ internal static class DeltaReader
         var table = await DeltaTable.OpenAsync(fs, DeltaWriter.Options()).ConfigureAwait(false);
         if (!retainable)
         {
-            return (new DeltaBoundTable.OpenTable(table, fs), false);
+            return (new DeltaTableBinding.OpenTable(table, fs), false);
         }
         // A concurrent opener may have won; take the winner so "one table per (txn, path)" holds. Ours is
         // then orphaned to the GC, which costs nothing — Dispose only sets a flag.
         // ⚠ `Shared` comes from Publish, NOT from retainability alone: the binding DECLINES past its
         // transaction's open cap (catalog enumeration), and a declined entry is ours to dispose exactly
         // as before.
-        var (entry, cached) = bound!.PublishOpen(new DeltaBoundTable.OpenTable(table, fs));
+        var (entry, cached) = bound!.PublishOpen(new DeltaTableBinding.OpenTable(table, fs));
         return (entry, cached);
     }
 
     private static async Task<NativeScanList> ListNativeScanFilesAsync(
         nint opener, string path, string? unit, string? value, Predicate? prune, ILogger log,
-        EngineeredWood.DeltaLake.Schema.StructType? schemaOverride, DeltaBoundTable? bound)
+        EngineeredWood.DeltaLake.Schema.StructType? schemaOverride, DeltaTableBinding? bound)
     {
         var (open, shared) = await OpenForReadAsync(opener, path, bound).ConfigureAwait(false);
         var (table, fs) = (open.Table, open.Fs);
@@ -579,10 +579,10 @@ internal static class DeltaReader
 
     /// <summary>Opens the Delta table at <paramref name="path"/> and returns its Arrow schema only (no data
     /// read). Used at table-function bind. <paramref name="opener"/> = the calling operator's ClientContext.</summary>
-    public static Schema GetSchema(nint opener, string path, DeltaBoundTable? bound = null)
+    public static Schema GetSchema(nint opener, string path, DeltaTableBinding? bound = null)
         => GetSchemaAsync(opener, path, bound).GetAwaiter().GetResult();
 
-    private static async Task<Schema> GetSchemaAsync(nint opener, string path, DeltaBoundTable? bound)
+    private static async Task<Schema> GetSchemaAsync(nint opener, string path, DeltaTableBinding? bound)
     {
         var (open, shared) = await OpenForReadAsync(opener, path, bound).ConfigureAwait(false);
         try
@@ -601,7 +601,7 @@ internal static class DeltaReader
     /// in the SAME table open, so the catalog's column fetch can cache the flag for the (immediately
     /// following) virtual-columns metadata fetch without a second <c>_delta_log</c> read (OneLake cost).</summary>
     public static Schema GetSchemaAndRowTracking(nint opener, string path, out bool rowTracking,
-                                                 DeltaBoundTable? bound = null)
+                                                 DeltaTableBinding? bound = null)
     {
         var (schema, rt) = GetSchemaAndRowTrackingAsync(opener, path, bound).GetAwaiter().GetResult();
         rowTracking = rt;
@@ -641,7 +641,7 @@ internal static class DeltaReader
     }
 
     private static async Task<(Schema Schema, bool RowTracking)> GetSchemaAndRowTrackingAsync(
-        nint opener, string path, DeltaBoundTable? bound)
+        nint opener, string path, DeltaTableBinding? bound)
     {
         var (open, shared) = await OpenForReadAsync(opener, path, bound).ConfigureAwait(false);
         try
@@ -664,7 +664,7 @@ internal static class DeltaReader
     /// <c>_delta_log</c> open). Same reasoning as <see cref="GetSchemaAndRowTracking"/>: the value is already in
     /// hand, so asking for it separately would be a second read of the log we just replayed.</summary>
     public static Schema GetSchemaAndVersion(nint opener, string path, out long version,
-                                             DeltaBoundTable? bound = null)
+                                             DeltaTableBinding? bound = null)
     {
         var (schema, v) = GetSchemaAndVersionAsync(opener, path, bound).GetAwaiter().GetResult();
         version = v;
@@ -672,7 +672,7 @@ internal static class DeltaReader
     }
 
     private static async Task<(Schema Schema, long Version)> GetSchemaAndVersionAsync(
-        nint opener, string path, DeltaBoundTable? bound)
+        nint opener, string path, DeltaTableBinding? bound)
     {
         var (open, shared) = await OpenForReadAsync(opener, path, bound).ConfigureAwait(false);
         try
@@ -1285,11 +1285,11 @@ internal static class DeltaReader
     /// the latest, e.g. before an ADD COLUMN). <paramref name="unit"/> is "version" or "timestamp" (the DuckDB
     /// <c>AT</c> clause unit); <paramref name="value"/> is the BIGINT version or a parseable timestamp.</summary>
     public static Schema GetSchemaAt(nint opener, string path, string unit, string value,
-                                     DeltaBoundTable? bound = null)
+                                     DeltaTableBinding? bound = null)
         => GetSchemaAtAsync(opener, path, unit, value, bound).GetAwaiter().GetResult();
 
     private static async Task<Schema> GetSchemaAtAsync(nint opener, string path, string unit, string value,
-                                                       DeltaBoundTable? bound)
+                                                       DeltaTableBinding? bound)
     {
         var (open, shared) = await OpenForReadAsync(opener, path, bound).ConfigureAwait(false);
         try

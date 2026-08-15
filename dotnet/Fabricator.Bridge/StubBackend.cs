@@ -52,10 +52,10 @@ public sealed class StubBackend : IBackend
 
         public IArrowArrayStream GetServerInfo() => EmptyStringTable("property", "value");
 
-        public ITableDefinition GetTable(string schemaName, string tableName) =>
+        public ITable GetTable(string schemaName, string tableName) =>
             new StubTableDefinition(this, schemaName, tableName);
 
-        private sealed class StubTableDefinition : ITableDefinition
+        private sealed class StubTableDefinition : ITable
         {
             private readonly StubCatalog _catalog;
 
@@ -69,15 +69,15 @@ public sealed class StubBackend : IBackend
             public string SchemaName { get; }
             public string TableName { get; }
 
-            public ITable Bind(ITransaction? transaction, TableAt? at = null) => new StubBoundTable(_catalog, this);
+            public ITableBinding Bind(ITransaction? transaction, TableAt? at = null) => new StubTableBinding(_catalog, this);
         }
 
-        private sealed class StubBoundTable : ITable
+        private sealed class StubTableBinding : ITableBinding
         {
             private readonly StubCatalog _catalog;
             private readonly StubTableDefinition _definition;
 
-            internal StubBoundTable(StubCatalog catalog, StubTableDefinition definition)
+            internal StubTableBinding(StubCatalog catalog, StubTableDefinition definition)
             {
                 _catalog = catalog;
                 _definition = definition;

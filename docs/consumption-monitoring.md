@@ -338,6 +338,17 @@ this analysis actually ends up recommending for dbt.
 by `verify_session_tag` — and is useful for scripted single-connection work. It is the dbt-at-concurrency case
 that it does not safely serve.
 
+⚠ **A second data point for the ambient/txn-id suspicion (2026-08-15, observed once, NOT diagnosed):**
+`verify_session_tag` itself FAILED once inside a full service-tier run — the call at its §7 (directly inside a
+`BEGIN;`) was refused with the function's own *"must be called inside an explicit transaction"*, thrown from the
+lazy FIRST-BATCH pull ("failed to read next batch from stream"). It passed standalone at its full 25 assertions
+immediately after, and the full tier re-run was 50/50 green — on a tree whose only change was a masking-proven
+mechanical rename, so the code under test was not the variable. The box was under heavy load that run (the
+hermetic tier took ~2× its normal wall clock). Consistent with `IsExplicitTxn(AmbientTransaction.Current)`
+reading an EMPTY ambient on whichever worker thread pulled the function's stream first — i.e. the same
+ambient-keying family as the dbt unreliability above, now seen OUTSIDE dbt. One observation; recorded so the
+next occurrence is a pattern rather than a surprise.
+
 ### 2.5 What Fabric tags on its own — MEASURED, unexpected
 
 Every session shows two statements we do **not** issue (grepped the whole repo to be sure):

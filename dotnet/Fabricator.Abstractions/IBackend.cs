@@ -208,13 +208,13 @@ public interface IBackendCatalog : IDisposable
     string CapabilitiesJson => "{}";
 
     /// <summary>
-    /// The definition of one table — identity + the <see cref="ITableDefinition.Bind"/> factory
+    /// The definition of one table — identity + the <see cref="ITable.Bind"/> factory
     /// (docs/catalog-table-abstraction.md §2.2/§2.3). Cheap and stateless: since slice 4d the C++ catalog
     /// entry holds one behind a <c>table_open</c> handle for the entry's lifetime, and every
     /// <c>table_*</c> call binds it against the CURRENT ambient transaction (the handle is the DEFINITION,
     /// never a binding — §6's lazy-bind default), so the handle itself cannot go stale.
     /// </summary>
-    ITableDefinition GetTable(string schemaName, string tableName);
+    ITable GetTable(string schemaName, string tableName);
 
     /// <summary>
     /// Resolves a DuckDB transaction id (the <c>set_active_txn</c> ambient) to this catalog's
@@ -224,7 +224,7 @@ public interface IBackendCatalog : IDisposable
     /// allocates nothing), while Delta GET-OR-CREATES (the first read-path crossing is a legitimate
     /// creator, or an autocommit schema open would never share its pin/open and the 195-of-291-seconds
     /// redundant-replay shape would return). Default null = a transaction-free provider (DAX / DeltaRs /
-    /// Stub); the resulting bind is transient and caller-owned per the <see cref="ITable"/> contract.
+    /// Stub); the resulting bind is transient and caller-owned per the <see cref="ITableBinding"/> contract.
     /// </summary>
     ITransaction? ResolveTransaction(long txnId) => null;
 
@@ -310,7 +310,7 @@ public interface IBackendCatalog : IDisposable
 
     /// <summary>
     /// Scans a table bound against the AMBIENT transaction — a C#-INTERNAL convenience over the object
-    /// model (each provider's implementation is one line: bind ambient, <see cref="ITable.Scan"/>).
+    /// model (each provider's implementation is one line: bind ambient, <see cref="ITableBinding.Scan"/>).
     /// The ABI does not call this any more: since v72 scans cross as <c>table_scan</c> on a table-session
     /// handle, which resolves the identical ambient bind. Kept for in-bridge callers that hold only a
     /// catalog + names (e.g. the external-table DML routing's identity-resolution scan).

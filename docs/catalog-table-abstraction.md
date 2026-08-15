@@ -643,6 +643,51 @@ the same table the code evaluates.
      not `//` comments returns EMPTY, so no gate can move — the masking check, plus a full rebuild and the
      hermetic tier at identical counts anyway (the standing C++-change gate).
 
+### The `ITable`/`ITableBinding` rename (2026-08-15, user-directed — C#-only, no ABI, breaking for plugin authors)
+
+The object model shipped with the short name on the WRONG half: `ITableDefinition` → `ITable`(bound),
+although `ITable.cs`'s own doc claimed "the deliberate `ITableFunction` symmetry" and the user's original
+framing coined "an ITable" for the `ITableFunction`-analog — the DEFINITION. Renamed to complete the
+symmetry the doc asserted:
+
+| role | table functions | tables (before) | tables (now) |
+|---|---|---|---|
+| shared definition | `ITableFunction` | `ITableDefinition` | **`ITable`** |
+| bound object | `ITableFunctionBinding` | `ITable` | **`ITableBinding`** |
+
+Concrete classes rode along (`DeltaBoundTable` → `DeltaTableBinding` + its file, same for
+SqlServer/DAX/DeltaRs/Stub) — leaving `*BoundTable` classes implementing `ITableBinding` would have
+reproduced the half-applied-convention state the `IArrow*` sweep existed to fix. The `*TableDefinition`
+concrete names deliberately STAY (`DeltaTable : ITable` would collide with engineered-wood's `DeltaTable`).
+`IBoundTable` was deliberately NOT used for the bound half — that name existed until the `tablefn_*` rename
+(it became `IBoundTableFunction`), and resurrecting it for a different concept would poison history greps.
+⚠ `DeltaRsCatalog.cs` was HAND-edited, excluded from the mechanical pass: it contains
+`DeltaLake.Interfaces.ITable` (delta-dotnet's OWN type), which a word-boundary substitution would have
+corrupted; the `DrsTable` alias + our fully-qualified `Fabricator.Bridge.ITable` (now the definition) stay.
+Mechanical-change proof: the diff outside that one file, with the three rename rules applied to its removed
+lines, is byte-identical to its added lines. §5 items above this note predate the rename and keep the old
+names — they are as-built records of their own moment.
+
+**Settled in the same pass (user question): `Bind(txn, at?)` must NOT take a scan spec / filter values,
+and the reason is DuckDB's own timeline, read from source rather than recalled.** (1) At BIND
+(`duckdb/src/planner/binder/tableref/bind_basetableref.cpp:160-268`) the `LogicalGet` is constructed with
+ALL columns and NO filters — the WHERE clause has not even been resolved against the table reference yet,
+so there is nothing to pass. (2) STATIC filters + projection arrive at OPTIMIZATION
+(`optimizer/pushdown/pushdown_get.cpp:61-70`, `pushdown_complex_filter` mutating the bind data — where our
+C++ already stashes them — plus RemoveUnusedColumns). (3) DYNAMIC/JOIN filters arrive only at EXECUTION:
+the optimizer attaches an EMPTY `DynamicTableFilterSet` (`join_filter_pushdown_optimizer.cpp:262-267`) that
+the hash join's build side fills at runtime, merged into the final filter set at scan GLOBAL-INIT
+(`physical_table_scan.cpp:35-36`). Our `table_scan` crossing fires from `ArrowStreamInitGlobal` — stage
+(3) — so `spec_json`+`filter_values` already carry the complete spec at the EARLIEST moment it exists
+anywhere. And structurally the binding is memoized per (transaction × table), serving N scans with
+DIFFERENT specs (a self-join is one binding, two scans, two filter sets; a prepared statement re-executes
+one plan with fresh dynamic filters each run) — the interface's "BIND IS STATE, SCAN IS REQUEST" remark is
+the contract. A provider that wants to act on the spec "at bind" already does: `Scan(spec, filterValues)`
+on the binding IS the per-scan bind, and Delta prunes its file list there today. The one genuinely earlier
+stage a provider could ever exploit is (2)'s static filters at plan time — the only plausible use is
+filter-aware CARDINALITY, which would be an extension of the `table_stats` crossing, not of `Bind`; noted
+so the option is not lost, nothing motivates it today.
+
 ## 6. Honest costs and open questions
 
 - **Scale**: slice 4 touches every provider, every DML operator, the entry materialization, and the

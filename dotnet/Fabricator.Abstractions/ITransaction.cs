@@ -5,7 +5,7 @@ namespace Fabricator.Bridge;
 /// carried per-thread via <c>AmbientTransaction</c>/<c>set_active_txn</c>). Slice 4a of the catalog/table
 /// abstraction (docs/catalog-table-abstraction.md §2.3/§5): the object that used to be "a dictionary value
 /// keyed by long" — SQL Server's pinned connection state, and (in a later slice) the Delta txn buffer entry.
-/// Owned by a per-catalog <see cref="TransactionManager{T}"/>; a bound <c>ITable</c> (a later slice) will be
+/// Owned by a per-catalog <see cref="TransactionManager{T}"/>; a bound <c>ITableBinding</c> (a later slice) will be
 /// owned by its transaction, so release becomes disposal rather than a cache sweep.
 /// </summary>
 /// <remarks>

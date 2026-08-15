@@ -14,15 +14,15 @@ namespace Fabricator.SqlServer;
 // carries, and slice 4d's table_* session retires the re-encoding.
 public sealed partial class SqlServerCatalog
 {
-    /// <summary>The SQL Server <see cref="ITableDefinition"/> — transient in the current transport (see
+    /// <summary>The SQL Server <see cref="ITable"/> — transient in the current transport (see
     /// the interface remarks; nothing is cached on it, so it cannot go stale).</summary>
-    public ITableDefinition GetTable(string schemaName, string tableName) =>
+    public ITable GetTable(string schemaName, string tableName) =>
         new SqlServerTableDefinition(this, schemaName, tableName);
 
     /// <summary>Binds (schema, table) against the AMBIENT transaction — the metadata/scan adapters' path
     /// onto the object model.</summary>
-    private SqlServerBoundTable BindAmbient(string schemaName, string tableName) =>
-        (SqlServerBoundTable)GetTable(schemaName, tableName)
+    private SqlServerTableBinding BindAmbient(string schemaName, string tableName) =>
+        (SqlServerTableBinding)GetTable(schemaName, tableName)
             .Bind(AmbientTransaction.Current is var t && t != 0 ? _txns.TryGet(t) : null, at: null);
 
     // ── the typed cores the bound table delegates to (the catalog owns connections + profile) ───────────
@@ -107,7 +107,7 @@ public sealed partial class SqlServerCatalog
     // Nested (not top-level) so they can name the private nested SqlServerTransaction.
 
     /// <summary>The SQL Server table definition — identity only (see the file remarks).</summary>
-    private sealed class SqlServerTableDefinition : ITableDefinition
+    private sealed class SqlServerTableDefinition : ITable
     {
         private readonly SqlServerCatalog _catalog;
 
@@ -126,15 +126,15 @@ public sealed partial class SqlServerCatalog
         /// not change the SCHEMA answer on this provider: box/Azure temporal history keeps the current shape
         /// and Fabric refuses time travel across DDL (measured — docs/known-limitations.md §1.x/§1.y), which
         /// is exactly why the as-of describe is per PROVIDER.</summary>
-        public ITable Bind(ITransaction? transaction, TableAt? at = null) =>
-            new SqlServerBoundTable(_catalog, this, transaction as SqlServerTransaction, at);
+        public ITableBinding Bind(ITransaction? transaction, TableAt? at = null) =>
+            new SqlServerTableBinding(_catalog, this, transaction as SqlServerTransaction, at);
     }
 
     /// <summary>The THIN SQL Server bound table: borrows the transaction's connection through the catalog's
     /// ambient scan routing (SqlServerScanRoute — pinned/pooled/drained/snapshot stays the routing's
     /// business) and delegates every resolution to the catalog's typed cores. Caller-owned; holds nothing
     /// to dispose.</summary>
-    private sealed class SqlServerBoundTable : ITable
+    private sealed class SqlServerTableBinding : ITableBinding
     {
         private readonly SqlServerCatalog _catalog;
         private readonly SqlServerTableDefinition _definition;
@@ -144,7 +144,7 @@ public sealed partial class SqlServerCatalog
         private readonly SqlServerTransaction? _transaction;
         private readonly TableAt? _at;
 
-        internal SqlServerBoundTable(SqlServerCatalog catalog, SqlServerTableDefinition definition,
+        internal SqlServerTableBinding(SqlServerCatalog catalog, SqlServerTableDefinition definition,
                                      SqlServerTransaction? transaction, TableAt? at)
         {
             _catalog = catalog;

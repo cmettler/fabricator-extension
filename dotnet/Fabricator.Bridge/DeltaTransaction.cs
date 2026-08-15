@@ -10,9 +10,9 @@ namespace Fabricator.Bridge;
 /// §5): ONE owner for what used to live in three id-keyed stores — <c>DeltaTxnBuffer</c>'s outer
 /// (txnId → tables) map, its separate <c>_explicit</c> mark set, and the process-global STATIC
 /// <c>DeltaTxnScope</c> registry (pins + open tables). Since 4c the per-table value is a
-/// <see cref="DeltaBoundTable"/> — the buffered actions, the snapshot pin AND the shared open in ONE object
+/// <see cref="DeltaTableBinding"/> — the buffered actions, the snapshot pin AND the shared open in ONE object
 /// per (transaction, table), which is §2.3's "the bound table is memoized on the transaction" made literal:
-/// <see cref="GetOrCreate"/> IS <see cref="ITableDefinition.Bind"/>'s memoization. Held per catalog in a
+/// <see cref="GetOrCreate"/> IS <see cref="ITable.Bind"/>'s memoization. Held per catalog in a
 /// <see cref="TransactionManager{T}"/>, so a TRANSIENT catalog (ExternalTableRouting) committing under the
 /// user's ambient transaction id structurally CANNOT touch an attached catalog's state for the same id —
 /// the cross-catalog hazard the static registry carried.
@@ -34,7 +34,7 @@ internal sealed class DeltaTransaction : ITransaction
 
     public long Id { get; }
 
-    /// <summary>The owning catalog — how a memoized <see cref="DeltaBoundTable"/> reaches the opener, the
+    /// <summary>The owning catalog — how a memoized <see cref="DeltaTableBinding"/> reaches the opener, the
     /// scan core and the engine flags (a bound table is (definition × transaction), and both halves are
     /// per-catalog).</summary>
     internal DeltaCatalog Catalog { get; }
@@ -43,27 +43,27 @@ internal sealed class DeltaTransaction : ITransaction
     /// buffers only in explicit transactions; autocommit keeps the direct per-statement paths.</summary>
     public bool IsExplicit { get; set; }
 
-    private readonly ConcurrentDictionary<string, DeltaBoundTable> _tables = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, DeltaTableBinding> _tables = new(StringComparer.Ordinal);
 
     /// <summary>The per-table bound objects, for the commit/rollback loops. Live view — enumerate after the
     /// transaction left the manager (the flush does), when nothing can mutate it. ⚠ Since 4c this also holds
     /// READ-ONLY bindings (pin/open-cache only) — the loops skip those via
-    /// <see cref="DeltaBoundTable.HasTxnFootprint"/>.</summary>
-    public ICollection<KeyValuePair<string, DeltaBoundTable>> Tables => _tables;
+    /// <see cref="DeltaTableBinding.HasTxnFootprint"/>.</summary>
+    public ICollection<KeyValuePair<string, DeltaTableBinding>> Tables => _tables;
 
     /// <summary>The transaction's bound table for <paramref name="tablePath"/> — the memoization behind
     /// <see cref="DeltaTableDefinition.Bind"/> and every buffered-write/read-cache touch.</summary>
-    public DeltaBoundTable GetOrCreate(string tablePath)
-        => _tables.GetOrAdd(tablePath, p => new DeltaBoundTable(this, p));
+    public DeltaTableBinding GetOrCreate(string tablePath)
+        => _tables.GetOrAdd(tablePath, p => new DeltaTableBinding(this, p));
 
     /// <summary>The bound table when it exists, WITHOUT creating one and WITHOUT the
     /// <see cref="Get"/> pending-work filter — the read paths peek at pins this way.</summary>
-    public DeltaBoundTable? Peek(string tablePath)
+    public DeltaTableBinding? Peek(string tablePath)
         => _tables.TryGetValue(tablePath, out var p) ? p : null;
 
     /// <summary>The table's buffer when it has PENDING WORK, else null — a read-only entry (read set /
     /// pins / open cache) is deliberately invisible here, so pending-changes guards don't trip on reads.</summary>
-    public DeltaBoundTable? Get(string tablePath)
+    public DeltaTableBinding? Get(string tablePath)
         => _tables.TryGetValue(tablePath, out var p) && p.HasAny ? p : null;
 
     public bool HasPending(string tablePath) => Get(tablePath) is not null;
@@ -123,7 +123,7 @@ internal sealed class DeltaTransaction : ITransaction
     // ── the pinned instant (moved from DeltaTxnScope, 4c) ───────────────────────────────────────────────
 
     /// <summary>The UTC instant the pins resolve against — captured at the transaction's FIRST
-    /// <see cref="DeltaBoundTable.PinVersion"/>. ⚠ LAZY on purpose: the transaction object exists from an
+    /// <see cref="DeltaTableBinding.PinVersion"/>. ⚠ LAZY on purpose: the transaction object exists from an
     /// explicit BEGIN or a table publish, and capturing the instant THERE would silently move the
     /// point-in-time the pins mean (and put a clock read on a path that never had one).</summary>
     private DateTime? _instantUtc;

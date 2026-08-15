@@ -378,7 +378,7 @@ public static class AlterKind
 // (MetadataKind was deleted at ABI v72 together with get_metadata itself: catalog discovery has dedicated
 //  typed entries (CatalogSchemas/Tables/Functions/Macros/ServerInfo — the shapes those kinds carried keep
 //  their column layouts, minus the kind int), and the per-table kinds live on the table_* session over the
-//  ITable object model. Kind history, incl. the v70 deletion of 8-11/13-14, is in docs/abi-history.md.)
+//  ITableBinding object model. Kind history, incl. the v70 deletion of 8-11/13-14, is in docs/abi-history.md.)
 
 internal static class FabricatorStatus
 {

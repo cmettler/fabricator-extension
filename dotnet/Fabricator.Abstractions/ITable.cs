@@ -31,7 +31,7 @@ public readonly record struct NdvEntry(string ColumnName, long Ndv);
 /// handle trivially safe: statefulness with a lifetime lives on the BOUND table (per transaction) or on the
 /// provider's existing entry caches, both of which the per-transaction invalidation already owns.
 /// </remarks>
-public interface ITableDefinition
+public interface ITable
 {
     string SchemaName { get; }
     string TableName { get; }
@@ -50,7 +50,7 @@ public interface ITableDefinition
     /// <see cref="TransactionManager{T}"/>); a provider downcasts. Null = a genuinely transaction-free
     /// context (a global function), matching the ambient-id-0 convention.</para>
     /// </remarks>
-    ITable Bind(ITransaction? transaction, TableAt? at = null);
+    ITableBinding Bind(ITransaction? transaction, TableAt? at = null);
 }
 
 /// <summary>
@@ -76,7 +76,7 @@ public interface ITableDefinition
 /// the warehouse engines MUST answer null/empty rather than probe (a failed best-effort statement aborts an
 /// open Fabric transaction).</para>
 /// </remarks>
-public interface ITable : IDisposable
+public interface ITableBinding : IDisposable
 {
     /// <summary>The table's columns as an Arrow schema — typed (the <c>table_schema</c> entry re-encodes it
     /// as a zero-row stream only at the ABI edge, for the host's proven import path). A buffered

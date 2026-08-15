@@ -2304,7 +2304,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     // use ExecuteMetadataQuery (read-your-writes: routed through the pinned write connection when one
     // exists, regardless of MARS) so a table/columns just created in this transaction are visible —
     // otherwise the self-healing cache would evict a freshly CREATEd table on a non-MARS engine (Fabric).
-    // The per-TABLE questions do not live here at all any more: they are the typed ITable members
+    // The per-TABLE questions do not live here at all any more: they are the typed ITableBinding members
     // (SqlServerTable.cs), reached through the host's table_* session. The 4c re-encoders
     // (NameStream/RowCountStream/NdvStream) died with the transport they encoded for; the ABSENCE contract
     // (error 208 → ObjectNotFoundException) lives on ColumnsSchemaCore.
@@ -2652,7 +2652,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
                "WHERE p.object_id = OBJECT_ID(" + objectLiteral + ") AND p.index_id IN (0, 1)";
     }
 
-    // Slice 4c: ScanTable is the transport ADAPTER onto the object model — the scan is ITable.Scan on the
+    // Slice 4c: ScanTable is the transport ADAPTER onto the object model — the scan is ITableBinding.Scan on the
     // ambient-bound (thin) table, which delegates back to ScanTableCore. The connection ROUTING stays
     // ambient inside ScanFromSource (pinned/pooled/drained/snapshot — SqlServerScanRoute's business);
     // slice 4d aligns it with the binding's transaction when the ABI carries table handles.

@@ -10,7 +10,7 @@ namespace Fabricator.Bridge;
 /// <summary>
 /// The managed side of one <c>table_open</c> handle (ABI v72, docs/catalog-table-abstraction.md §2.4).
 /// Wraps the table DEFINITION (+ the reference's AT clause) — deliberately NOT a binding: the C++ catalog
-/// entry is shared across transactions while a bound <see cref="ITable"/> is per-(table × transaction), so
+/// entry is shared across transactions while a bound <see cref="ITableBinding"/> is per-(table × transaction), so
 /// every call re-binds against the CURRENT ambient transaction (§6's lazy-bind default — "the handle is the
 /// DEFINITION, and each call resolves the ambient txn's binding; ambient stays the transport"). That is what
 /// makes the handle's lifetime trivial: a definition holds no state, so a handle kept open in the entry
@@ -20,10 +20,10 @@ namespace Fabricator.Bridge;
 internal sealed class TableSession
 {
     private readonly IBackendCatalog _catalog;
-    private readonly ITableDefinition _definition;
+    private readonly ITable _definition;
     private readonly TableAt? _at;
 
-    internal TableSession(IBackendCatalog catalog, ITableDefinition definition, TableAt? at)
+    internal TableSession(IBackendCatalog catalog, ITable definition, TableAt? at)
     {
         _catalog = catalog;
         _definition = definition;
@@ -32,10 +32,10 @@ internal sealed class TableSession
 
     /// <summary>
     /// Binds against the current ambient transaction and runs <paramref name="body"/>, disposing the
-    /// binding afterwards when it is CALLER-OWNED per the <see cref="ITable"/> ownership rule (no
+    /// binding afterwards when it is CALLER-OWNED per the <see cref="ITableBinding"/> ownership rule (no
     /// transaction, or an AT bind — a memoized transaction-owned binding is never disposed here).
     /// </summary>
-    private T With<T>(Func<ITable, T> body)
+    private T With<T>(Func<ITableBinding, T> body)
     {
         var txn = _catalog.ResolveTransaction(AmbientTransaction.Current);
         var bound = _definition.Bind(txn, _at);
@@ -63,7 +63,7 @@ internal sealed class TableSession
 
     /// <summary>The <c>table_info</c> answer — ONE typed JSON doc (ABI v73):
     /// <c>{"rowid":[...], "virtual":[{"name":..,"type":..}, ...]}</c>, rowid names in key order, both
-    /// arrays always present. Provider-agnostic re-encoding of the two typed <see cref="ITable"/> members,
+    /// arrays always present. Provider-agnostic re-encoding of the two typed <see cref="ITableBinding"/> members,
     /// written with <see cref="Utf8JsonWriter"/> so user-controlled identifiers are escaped properly (the
     /// host parses with a real parser, yyjson — never the string-find shortcut, which is safe only for
     /// docs whose values are bare booleans). The stats members deliberately do NOT ride along (they stay a
@@ -122,7 +122,7 @@ internal sealed class TableSession
     });
 
     /// <summary>The <c>table_scan</c> answer. The returned stream MAY outlive a caller-owned binding —
-    /// sound because every provider's <see cref="ITable.Scan"/> delegates by identity into the catalog and
+    /// sound because every provider's <see cref="ITableBinding.Scan"/> delegates by identity into the catalog and
     /// the stream owns its own resources (stated on the interface); the AT clause still rides
     /// <paramref name="specJson"/> for the scan itself (the host's BuildScanSpec, unchanged — the session's
     /// AT matters to <see cref="SchemaStream"/>, where the as-of column layout is resolved).</summary>

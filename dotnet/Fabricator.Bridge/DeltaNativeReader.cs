@@ -84,7 +84,7 @@ internal static class DeltaNativeReader
         IReadOnlyList<EngineeredWood.DeltaLake.Table.WrittenDataFile>? pendingFiles = null,
         IReadOnlyDictionary<int, HashSet<long>>? pendingDeletes = null,
         EngineeredWood.DeltaLake.Schema.StructType? pendingSchema = null,
-        DeltaBoundTable? bound = null)
+        DeltaTableBinding? bound = null)
     {
         bool wantRowId = spec?.Columns is { } c0 && c0.Contains(RowIdColumn);
         var dataCols = spec?.Columns is { Count: > 0 } cols
