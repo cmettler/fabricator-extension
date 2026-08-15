@@ -66,13 +66,15 @@ vector<vector<string>> ReadStringTable(ArrowArrayStream &stream, idx_t expected_
 		if (!batch.release) {
 			break; // end of stream
 		}
-		// The column count is CHECKED before dereferencing children[], not assumed. A provider answering a
-		// metadata kind it does not implement returns some other shape — the Delta/DAX catalogs' `_ =>` arm is a
-		// ONE-column empty table, which is what a Delta catalog gives for FUNCTIONS — so reading children[1..]
-		// of that would be out of bounds. Checked per BATCH rather than on the schema on purpose: a zero-row
-		// stream carries nothing to read, so its width is immaterial, and several callers legitimately rely on
-		// that (DiscoverFunctions asks for 3 columns and a Delta catalog answers with 1 and no rows). Only a
-		// batch that actually HAS rows must be wide enough.
+		// The column count is CHECKED before dereferencing children[], not assumed — a mis-shaped provider
+		// batch must fail as a message, not as an out-of-bounds read. `>=` rather than `==` because several
+		// streams are deliberately WIDER than the host reads (catalog_functions carries 5 columns and
+		// DiscoverFunctions reads 3; list_global_functions carries 6 and its caller reads 4). Checked per
+		// BATCH rather than on the schema on purpose: a zero-row batch carries nothing to read, so its width
+		// is immaterial. Since ABI v72 nothing in-tree exercises that leniency (every list entry has ONE
+		// declared shape — the unknown-kind fallback arms this guard was written against are deleted), but it
+		// stays: it costs nothing, and it keeps a plugin backend that answers an optional surface (macros)
+		// with a minimal empty stream attachable instead of failing over rows that do not exist.
 		if (batch.length > 0 && batch.n_children < static_cast<int64_t>(expected_cols)) {
 			batch.release(&batch);
 			if (stream.release) {

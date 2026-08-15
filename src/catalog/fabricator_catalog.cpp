@@ -129,9 +129,10 @@ void FabricatorCatalog::LoadCatalog(ClientContext &context) {
 			schema.AddAggregateFunction(func.name, /*spillable=*/true);
 		}
 	}
-	// Provider-declared CATALOG-BOUND macros. Their own metadata kind, NOT a column on the functions stream:
-	// that stream is provider SQL run on the server, and a macro body is a purely local declaration. Same
-	// schema rule as functions (only a schema registered above), so an ATTACH schema_filter gates macros too.
+	// Provider-declared CATALOG-BOUND macros. Their own dedicated entry (catalog_macros), NOT a column on the
+	// functions stream: that stream is provider SQL run on the server, and a macro body is a purely local
+	// declaration. Same schema rule as functions (only a schema registered above), so an ATTACH
+	// schema_filter gates macros too.
 	// DiscoverCatalogMacros never throws — declaring macros is optional.
 	for (auto &macro : DiscoverCatalogMacros(handle_)) {
 		auto sit = schemas_.find(macro.schema_name);
@@ -231,9 +232,10 @@ void FabricatorCatalog::RefreshCache(ClientContext &context) {
 			schema.AddAggregateFunction(func.name, /*spillable=*/true);
 		}
 	}
-	// Provider-declared CATALOG-BOUND macros. Their own metadata kind, NOT a column on the functions stream:
-	// that stream is provider SQL run on the server, and a macro body is a purely local declaration. Same
-	// schema rule as functions (only a schema registered above), so an ATTACH schema_filter gates macros too.
+	// Provider-declared CATALOG-BOUND macros. Their own dedicated entry (catalog_macros), NOT a column on the
+	// functions stream: that stream is provider SQL run on the server, and a macro body is a purely local
+	// declaration. Same schema rule as functions (only a schema registered above), so an ATTACH
+	// schema_filter gates macros too.
 	// DiscoverCatalogMacros never throws — declaring macros is optional.
 	for (auto &macro : DiscoverCatalogMacros(handle_)) {
 		auto sit = schemas_.find(macro.schema_name);

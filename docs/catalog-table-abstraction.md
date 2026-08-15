@@ -1,4 +1,4 @@
-# The catalog/table abstraction — design for retiring `get_metadata` (ALL slices 1a/1b/2/3 + 4a–4d BUILT; 5 open)
+# The catalog/table abstraction — design for retiring `get_metadata` (COMPLETE — every slice 1a/1b/2/3 + 4a–4d + 5 BUILT)
 
 > Written 2026-08-14 after the user's review: *"I don't like the getmetadata functions … there should be no
 > provider-specific function defined in C++, all must live in the providers … an abstraction similar to
@@ -615,6 +615,33 @@ the same table the code evaluates.
          rowid UPDATE and `AT (VERSION => 1)` through the new session. DeltaRs + DAX compile-verified
          (their suites are outside CI / manual, as always).
 5. Sweep: delete `ReadStringTable`'s multi-column string protocol where nothing uses it any more.
+   - **DONE (2026-08-15) — and the deletion component turned out to be ZERO, so the sweep is guard/comment
+     hygiene rather than code removal.** Re-derived against the post-v73 tree: `ReadStringTable` has SEVEN
+     consumers and every one is legitimate — the four discovery lists (`DiscoverSchemas` 1 col /
+     `DiscoverTables` 3 / `DiscoverFunctions` 3 of 5 / `DiscoverCatalogMacros` 3) plus three load-time
+     Bridge streams that never rode the multiplexer at all (`ListSettings` 6, `ListSecretFields` 5,
+     `ListGlobalFunctions` 4 of 6). Two of those are DELIBERATELY wider than the host reads, which is why
+     the width check is `>=`, not `==`.
+   - **What WAS dead: the width guard's justification, not the guard.** The per-batch check's comment cited
+     the deleted unknown-kind fallback arms verbatim ("the Delta/DAX catalogs' `_ =>` arm is a ONE-column
+     empty table … a Delta catalog answers with 1 and no rows") — since 4d every provider implements all
+     five list entries with DECLARED full-width shapes even when empty (verified across SqlServer / Delta /
+     DAX / DeltaRs / Stub: Macros is 3 columns everywhere, ServerInfo 2, Functions 5). Rewritten to the
+     current truth: the check is the OOB protection for a mis-shaped provider batch; the zero-row leniency
+     is no longer exercised in-tree.
+   - **The zero-row leniency STAYS, deliberately — tightening it would be an UNTESTABLE behaviour change.**
+     No in-tree producer can trip a schema-width check any more, so no gate could distinguish tightened
+     from not; the only party it could ever affect is an out-of-tree plugin backend answering an optional
+     surface (macros) with a minimal empty stream, and failing that ATTACH over rows that do not exist buys
+     nothing. Same verdict as the macros pass recorded ("that leniency is load-bearing"), now for the
+     narrower reason that survives v72.
+   - Also swept: the two "their own metadata kind" phrasings in `fabricator_catalog.cpp` (now "their own
+     dedicated entry (catalog_macros)") and three pre-provider-era "SQL Server" doc comments on the
+     provider-generic discovery helpers in `fabricator_metadata.hpp`. The `get_metadata` references left in
+     `abi.h`/`clr_host.cpp` are deliberate historical tombstones, not staleness.
+   - **Comment-only by proof, not by belief**: `git diff -U0 -- src/` filtered to changed lines that are
+     not `//` comments returns EMPTY, so no gate can move — the masking check, plus a full rebuild and the
+     hermetic tier at identical counts anyway (the standing C++-change gate).
 
 ## 6. Honest costs and open questions
 

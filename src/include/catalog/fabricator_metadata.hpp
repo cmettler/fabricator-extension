@@ -14,7 +14,7 @@
 
 namespace duckdb {
 
-//! A discovered SQL Server table (or view).
+//! A discovered table (or view) — any provider, via catalog_tables.
 struct FabricatorTableInfo {
 	string schema_name;
 	string table_name;
@@ -25,7 +25,7 @@ struct FabricatorTableInfo {
 //! Consumes and releases the stream. Returns rows[r][c].
 vector<vector<string>> ReadStringTable(ArrowArrayStream &stream, idx_t expected_cols);
 
-//! Discovers user schemas in the attached SQL Server database.
+//! Discovers the attached catalog's schemas (catalog_schemas) — every provider, not just SQL Server.
 vector<string> DiscoverSchemas(FabricatorHandle handle);
 
 //! The host-consumed capability flags for an open catalog (ABI v71, `get_capabilities`) — the typed
@@ -49,7 +49,7 @@ FabricatorCapabilities FetchCapabilities(FabricatorHandle handle);
 //! Discovers user tables + views across all schemas.
 vector<FabricatorTableInfo> DiscoverTables(FabricatorHandle handle);
 
-//! A discovered SQL Server routine (function or procedure).
+//! A discovered routine (function or procedure) — any provider, via catalog_functions.
 struct FabricatorFunctionInfo {
 	string schema_name;
 	string name;
