@@ -681,9 +681,11 @@ true
 #      tables off the plain form entirely would leave 10a passing.
 #      ⚠ The reverse direction is pinned right after it, and it is a REAL RESIDUAL rather than a
 #      tidiness note: projecting a partition column KEEPS the full form, so `SELECT *` on a partitioned
-#      table still pays the sweeps. There is no way around it — the value is absent from the data files,
-#      so reaching it needs a per-file join key (`filename`), which a VARCHAR-keyed map refuses (case 1),
-#      and `schema` is refused together with `hive_partitioning` outright.
+#      table still pays the sweeps. The value is absent from the data files, so reaching it needs a
+#      per-file join key (`filename`) — and ⚠ `filename => true` DOES compose with the VARCHAR-keyed map
+#      (measured 2026-08-15; an earlier version of this note claimed it refused), so the residual is
+#      UNIMPLEMENTED rather than blocked: the fix is the full form's per-file constants join brought over
+#      to the plain form. (`schema` + `hive_partitioning` together stay refused outright.)
 #      ⚠ Its own table, NOT §6's `parts`: that one is UPDATEd and DELETEd from, so by here it carries a
 #      DELETION VECTOR — which routes to the full form for a reason that has nothing to do with
 #      partitioning and would make this section prove the opposite of what it says.
@@ -711,6 +713,146 @@ WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native batch%'
   AND message LIKE '%rparts%' AND message LIKE '%union_by_name%';
 ----
 true
+
+# ============================================================================
+# 11. THE PUSHED BARE LIMIT REACHES THE GENERATED SQL (2026-08-15). Before this, `ScanSpec.Top` was
+#     consumed by SqlServerBackend alone: a `LIMIT 1` over a Delta table read every file and discarded
+#     the rows above the scan (~25 s of a 71 s statement on the profiled 89-file remote table — and with
+#     the plain form's DECLARED schema, footers are read at execution, so the limit also caps how many
+#     files are OPENED at all). Now the suffix is appended to the batch query and to each per-file query
+#     (a per-file LIMIT is a SUPERSET — each file capped at n, DuckDB re-limits above).
+#     The observable is the generated SQL through the same Debug lines as §10, plus the scan Info line's
+#     new `top=` field — a row-count assertion passes either way, since DuckDB re-limits. Each LIMIT
+#     value below is UNIQUE to its statement so the accumulated log cannot satisfy an assertion with an
+#     earlier statement's line.
+#     ⚠ EVERY SHAPE HERE WAS PROBED BEFORE BEING PINNED, because the first draft asserted a plan that
+#     does not exist: `count(*) FROM (SELECT id FROM t LIMIT n)` is NOT a batched projection scan — the
+#     optimizer turns it into the count-via-rowid plan (`cols=[] rowid=True`), which LOOPS per file. That
+#     accident is kept below as the LOOP leg's fixture. A bare projection under LIMIT must return
+#     order-independent VALUES to be assertable (`id IS NOT NULL`), since a bare LIMIT's rows are
+#     arbitrary.
+#     ⚠ The two NEGATIVE controls are the load-bearing half, and each carries a POSITIVE witness so it
+#     cannot hold vacuously:
+#       - a FILTERED limit must NOT push — arrow_ingest emits "top" only when the scan carries no filter
+#         (a best-effort filter's superset plus an early limit could starve real matches); witnessed by
+#         the scan line showing the filter WITH `top=-`;
+#       - TopN must not become a bare LIMIT — TryPushTopN pushes top+order_by TOGETHER, this reader
+#         applies no ORDER BY, and an unordered LIMIT is an arbitrary subset that DuckDB's kept TopN
+#         above cannot repair (silently WRONG rows, not slow ones); witnessed by `top=6` arriving while
+#         no generated SQL carries LIMIT 6. ⚠ The key must be `ASC NULLS FIRST`: with DuckDB's default
+#         NULLS LAST, NullOrderCompatible declines the push and `top=-` arrives — the gate under test
+#         would be unreachable and the section would pin nothing (probed both ways).
+# ============================================================================
+
+# 11a. Plain form carries the limit (schema-map SQL ends in it), and the spec carried top=3.
+query I
+SELECT id IS NOT NULL FROM b.main.route_plain LIMIT 3;
+----
+true
+true
+true
+
+query I
+SELECT count(*) > 0 FROM duckdb_logs
+WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native batch%'
+  AND message LIKE '%route_plain%' AND message LIKE '%schema = map%' AND message LIKE '%LIMIT 3%';
+----
+true
+
+query I
+SELECT count(*) > 0 FROM duckdb_logs
+WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native scan%'
+  AND message LIKE '%route_plain%' AND message LIKE '%top=3%';
+----
+true
+
+# 11b. Full form carries it too (the DV anti-join query, union_by_name).
+query I
+SELECT id IS NOT NULL FROM b.main.route_dv LIMIT 5;
+----
+true
+true
+true
+true
+true
+
+query I
+SELECT count(*) > 0 FROM duckdb_logs
+WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native batch%'
+  AND message LIKE '%route_dv%' AND message LIKE '%union_by_name%' AND message LIKE '%LIMIT 5%';
+----
+true
+
+# 11c. The PER-FILE LOOP carries it as well — via the count-via-rowid plan (see the header), which
+#      declines both batch forms (`rowid=True`) and loops every file. Only the FIRST file's Debug line is
+#      deterministic (the statement can end before later files are scheduled), so assert > 0, never a
+#      count.
+query I
+SELECT count(*) FROM (SELECT id FROM b.main.route_plain LIMIT 9) t;
+----
+9
+
+query I
+SELECT count(*) > 0 FROM duckdb_logs
+WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native file%'
+  AND message LIKE '%route_plain%' AND message LIKE '%LIMIT 9%';
+----
+true
+
+query I
+SELECT count(*) > 0 FROM duckdb_logs
+WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native scan%'
+  AND message LIKE '%route_plain%' AND message LIKE '%rowid=True%' AND message LIKE '%top=9%';
+----
+true
+
+# 11d. NEGATIVE: a filter suppresses the pushed limit (the host-side arrow_ingest gate, pinned end to
+#      end). The positive witness: the scan ran WITH the filter and top=- (the host never emitted it).
+query I
+SELECT count(*) FROM (SELECT id FROM b.main.route_plain WHERE id > 5 LIMIT 4) t;
+----
+4
+
+query I
+SELECT count(*) > 0 FROM duckdb_logs
+WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native scan%'
+  AND message LIKE '%route_plain%' AND message LIKE '%where=["id">5]%' AND message LIKE '%top=-%';
+----
+true
+
+query I
+SELECT count(*) FROM duckdb_logs
+WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native%'
+  AND message LIKE '%route_plain%' AND message LIKE '%LIMIT 4%';
+----
+0
+
+# 11e. NEGATIVE: TopN (top + order_by pushed together) must not become a bare LIMIT. The positive
+#      witness: top=6 ARRIVED at the reader — so the zero below is the reader's OrderBy gate declining,
+#      not the push never happening. The row assertion is exact BECAUSE it is ordered.
+query I
+SELECT id FROM b.main.route_plain ORDER BY id ASC NULLS FIRST LIMIT 6;
+----
+0
+1
+2
+3
+4
+5
+
+query I
+SELECT count(*) > 0 FROM duckdb_logs
+WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native scan%'
+  AND message LIKE '%route_plain%' AND message LIKE '%top=6%';
+----
+true
+
+query I
+SELECT count(*) FROM duckdb_logs
+WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native%'
+  AND message LIKE '%LIMIT 6%';
+----
+0
 
 statement ok
 CALL disable_logging();

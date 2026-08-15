@@ -134,6 +134,22 @@ internal static class DeltaNativeReader
             ? spec!.NativeFilter
             : spec?.Filter is { } node2 ? DeltaSqlFilter.ToWhere(node2, filterValues) : null;
 
+        // Bare-LIMIT pushdown (ScanSpec.Top): appended to every generated query, so a `LIMIT 1` stops the
+        // read instead of scanning all N files and discarding above the scan (with the plain form's DECLARED
+        // schema, footer reads are deferred to execution, so the limit also caps how many files are OPENED at
+        // all — the ~25 s -> ~1 s shape on the profiled 89-file remote table). Safe by the HOST's own gate:
+        // arrow_ingest emits "top" only when the scan carries NO filter, static or dynamic, because a
+        // best-effort filter's superset plus an early limit could starve real matches. Gated here on ORDER BY
+        // being absent as well — TryPushTopN pushes top+order_by TOGETHER for non-string keys, and a TopN's
+        // limit without its order is an arbitrary subset that DuckDB's kept TopN above cannot repair (it
+        // re-sorts whatever arrives; the missing rows are simply gone). Applying the ORDER BY too would be
+        // TopN pushdown for this reader — a separate enhancement, not smuggled into a LIMIT fix. Per looped
+        // file the limit is a SUPERSET (each file capped at n; DuckDB re-limits above), the same contract as
+        // every other best-effort pushdown here.
+        string? topSuffix = spec?.Top is { } topN && topN >= 0 && spec.OrderBy is not { Count: > 0 }
+            ? " LIMIT " + topN.ToString(CultureInfo.InvariantCulture)
+            : null;
+
         var listing = DeltaReader.ListNativeScanFiles(opener, path, unit, value, prune, Log,
                                                       schemaOverride: pendingSchema, bound: bound);
         if (pendingFiles is { Count: > 0 })
@@ -189,14 +205,15 @@ internal static class DeltaNativeReader
         int prefetch = Prefetch();
 
         Log.LogInformation(
-            "delta native scan {Path}: v{Version} files={Files} batched={Batched} cols=[{Cols}] rowid={RowId} where=[{Where}] prefetch={Prefetch} colmap={Map}",
+            "delta native scan {Path}: v{Version} files={Files} batched={Batched} cols=[{Cols}] rowid={RowId} where=[{Where}] top={Top} prefetch={Prefetch} colmap={Map}",
             path, listing.Version, listing.Files.Count, batch?.Files.Count ?? 0, string.Join(",", dataCols),
-            wantRowId, where ?? "", prefetch,
+            wantRowId, where ?? "", spec?.Top?.ToString(CultureInfo.InvariantCulture) ?? "-", prefetch,
             listing.LogicalToPhysical is not null ? "name" : listing.LogicalToFieldId is not null ? "id" : "none");
 
         return new AsyncEnumerableArrowStream(
             schema,
-            StreamFiles(listing, loopFiles, batch, dataCols, wantRowId, where, prefetch, rowIdFilter, trackingFilter));
+            StreamFiles(listing, loopFiles, batch, dataCols, wantRowId, where, prefetch, rowIdFilter,
+                        trackingFilter, topSuffix));
     }
 
     /// <summary>
@@ -221,13 +238,17 @@ internal static class DeltaNativeReader
     /// <para><b>⚠ The gates below are not caution, they are measured limits.</b> Each one is a shape where a
     /// single call is either refused or — worse — silently wrong:</para>
     /// <list type="number">
-    /// <item><b>Virtual columns force field-id keys.</b> <c>filename</c> / <c>file_row_number</c> compose with
-    /// an INTEGER-keyed map but FAIL with a VARCHAR-keyed one (<c>Invalid Input Error: … column "2147483645" …
-    /// could not be found</c> — the virtual column's sentinel id resolved by name). Everything needing a
-    /// position (the transient rowid, a deletion vector, a derived row-tracking id) needs
-    /// <c>file_row_number</c>, so those shapes stay on the loop here. And field-id keys are not a free
-    /// substitute: a file carrying NO parquet field ids raises <c>INTERNAL Error: No default expression in
-    /// FieldId Map</c>, and name mode does not require a writer to stamp them.</item>
+    /// <item><b><c>file_row_number</c> forces field-id keys — and ⚠ <c>filename</c> does NOT share that limit,
+    /// which an earlier version of this note wrongly claimed.</b> <c>file_row_number</c> composes with an
+    /// INTEGER-keyed map but FAILS with a VARCHAR-keyed one (<c>Invalid Input Error: … column "2147483645" …
+    /// could not be found</c> — its sentinel id resolved by name). <c>filename</c> composes with the
+    /// VARCHAR-keyed map fine (MEASURED 2026-08-15; it is constant per file, answered by
+    /// <c>GetConstantVirtualColumn</c> before the column-mapping path — the same reason it escapes the
+    /// field-id assertion). So everything needing a row POSITION (the transient rowid, a deletion vector, a
+    /// derived row-tracking id) stays on the loop here, but a per-file-CONSTANT join keyed on
+    /// <c>filename</c> is available under this form. And field-id keys are not a free substitute for the
+    /// position shapes: a file carrying NO parquet field ids raises <c>INTERNAL Error: No default expression
+    /// in FieldId Map</c>, and name mode does not require a writer to stamp them.</item>
     /// <item><b>ID-mode column mapping is a CONTRACT gate, and the honest statement of it is narrower than it
     /// first looks.</b> This path resolves columns by NAME (the map key), while id mode's contract is that a
     /// reader matches by FIELD ID and the stored name is <i>not</i> authoritative — a legacy engineered-wood
@@ -247,8 +268,11 @@ internal static class DeltaNativeReader
     /// NAME mode needs no such gate: there the physical name IS authoritative and stable across renames, which
     /// is the reason the mode exists.</item>
     /// <item><b>Partition values are per file and absent from the data files</b>, so a single call would
-    /// backfill them as <c>default_value</c> NULL. Reaching them needs a <c>filename</c> join, which needs case
-    /// 1's field-id keys.</item>
+    /// backfill them as <c>default_value</c> NULL. Reaching them needs a <c>filename</c> join — which case 1
+    /// now records as AVAILABLE under the VARCHAR map (<c>filename => true</c> composes; measured
+    /// 2026-08-15), so this gate is UNIMPLEMENTED rather than blocked: the fix is the full form's per-file
+    /// constants input joined on <c>filename</c>, brought over to this form. Until built, a projected
+    /// partition column still declines here.</item>
     /// <item><b>A per-file predicate cannot be expressed</b> — the deletion vector's prunable bound, the rowid's
     /// position range, the row-tracking condition. Those are pruning, not correctness (DuckDB re-applies every
     /// predicate above the scan), but forfeiting them is the opposite of the point, so a scan that has one keeps
@@ -1600,7 +1624,7 @@ internal static class DeltaNativeReader
         DeltaReader.NativeScanList listing, IReadOnlyList<DeltaReader.NativeScanFile> loopFiles,
         BatchPlan? batch, IReadOnlyList<string> dataCols, bool wantRowId, string? where,
         int prefetch, DeltaRowIdFilter? rowIdFilter = null, DeltaRowTrackingFilter? trackingFilter = null,
-        [EnumeratorCancellation] CancellationToken ct = default)
+        string? topSuffix = null, [EnumeratorCancellation] CancellationToken ct = default)
     {
         if (loopFiles.Count == 0 && batch is null)
         {
@@ -1646,12 +1670,13 @@ internal static class DeltaNativeReader
                     // The batched files as ONE query, alongside (not before) the loop's — it takes a prefetch
                     // slot like any other unit of work, so a table with both kinds still overlaps them.
                     await sem.WaitAsync(ct).ConfigureAwait(false);
-                    Log.LogDebug("delta native batch: {Sql}", batch.Sql);
+                    Log.LogDebug("delta native batch: {Sql}",
+                                 topSuffix is null ? batch.Sql : batch.Sql + topSuffix);
                     tasks.Add(Task.Run(async () =>
                     {
                         try
                         {
-                            await DrainAsync(batch.Query()).ConfigureAwait(false);
+                            await DrainAsync(batch.Query(topSuffix)).ConfigureAwait(false);
                         }
                         finally
                         {
@@ -1690,6 +1715,10 @@ internal static class DeltaNativeReader
                                               fm, listing.TableSchema,
                                               listing.PartitionColumns, rowIdFilter?.PositionCondition(file.Ordinal),
                                               trackingCond, dvView: dvView);
+                            if (topSuffix is not null)
+                            {
+                                sql += topSuffix;
+                            }
                             Log.LogDebug("delta native file: {Sql}", sql);
                             try
                             {
