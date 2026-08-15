@@ -25,11 +25,13 @@ namespace Fabricator.DeltaRs;
 /// open, and the mapping of each <see cref="IBackendCatalog"/> operation to a delta-dotnet call. delta-rs does
 /// its own object_store IO, so — unlike the engineered-wood provider — this does NOT use the host-FS bridge.
 ///
-/// v1 scope: read (scan, streamed via DataFusion), CREATE/INSERT/CTAS/COPY (append/overwrite), metadata
-/// (schemas/tables/columns), time travel (version + timestamp), snapshots (history), change data feed.
-/// DEFERRED: UPDATE/DELETE (delta-rs's predicate/SQL DML doesn't map to DuckDB's rowid model — no low-level
-/// remove/position API; see docs/delta-rs-provider.md "The DML crux"), ALTER (no add-column API), functions.
-/// Cloud discovery (abfss/s3) is deferred — v1 discovers local roots only.
+/// Scope: read (scan, streamed via DataFusion), CREATE/INSERT/CTAS/COPY (append/overwrite), metadata
+/// (schemas/tables/columns), time travel (version + timestamp), snapshots (history), change data feed,
+/// DELETE/UPDATE (rowid = ALL columns, a full-row identity, executed as a NULL-safe record-batch MERGE —
+/// always copy-on-write, never deletion vectors; see docs/delta-rs-provider.md "The DML crux"), ALTER ADD
+/// COLUMN (0-row merge-append) + local RENAME TABLE, the delta.* catalog-bound functions, and OneLake
+/// (live-validated). DEFERRED: RENAME/DROP COLUMN + ALTER TYPE (need column mapping / a rewrite), S3 /
+/// plain-ADLS discovery, OneLake RENAME TABLE + schema DDL, and a first-class user-facing MERGE surface.
 /// </summary>
 public sealed class DeltaRsCatalog : IBackendCatalog
 {
