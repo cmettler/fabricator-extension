@@ -881,6 +881,13 @@ true
 
 # 11b. The UNION form carries it too — appended AFTER the last branch, so it limits the WHOLE union,
 #      not one branch (a per-branch cap would also be superset-safe, but whole-union is exact).
+#      ⚠ THIS SECTION IS ALSO THE GATE FOR THE BATCH QUERY'S OWNERSHIP HAND-OFF, which is not obvious from
+#      what it asserts. A pushed LIMIT makes the consumer stop reading EARLY, and the pump is not joined on
+#      teardown — so it keeps draining in the background while the scan stream is disposed. If anything ever
+#      releases the pre-opened batch query from the consumer side (see BatchQueryOwner.Claim), that frees a
+#      DuckDB result the pump is still reading: MEASURED as STATUS_HEAP_CORRUPTION (0xC0000374), a silent
+#      process death here with no assertion output and no stack. A bound deletion vector is what makes it
+#      reproduce reliably, which is why it lands on this section and not on §11a's plain form.
 query I
 SELECT id IS NOT NULL FROM b.main.route_dv LIMIT 5;
 ----

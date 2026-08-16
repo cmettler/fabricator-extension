@@ -229,8 +229,42 @@ internal static class DeltaNativeReader
         var batch = BatchPlan.Build(listing, dataCols, wantRowId, where, rowIdFilter, trackingFilter,
                                     hasTop: bareLimit);
         var loopFiles = batch?.LoopFiles ?? listing.Files;
-        var schema = ProbeSchema(listing, userSchema, dataCols, wantRowId, batch);
-        int prefetch = Prefetch();
+
+        // THE BATCH QUERY IS OPENED ONCE, HERE — its schema is this scan's advertised schema AND its rows are
+        // the ones the pump drains. It used to be bound TWICE: a throwaway `LIMIT 0` to learn the schema, then
+        // the real query inside the pump. That second bind is free for the plain form (its schema is DECLARED,
+        // so nothing is opened) and is the single most expensive span on a remote FULL-form scan — MEASURED
+        // 20.66 s over 89 remote files, on top of the 20.50 s PresentNames already spent building the same SQL.
+        // Nothing had to be added to make one open enough: `Host.Query` returns a lazily-streaming result whose
+        // `.Schema` is available before a single row is fetched.
+        // ⚠ It also collapses the bound Arrow INPUTS from two constructions to one — which is exactly the
+        // reason BatchPlan.Inputs is a FACTORY ("the probe must not consume the streams the real scan needs").
+        // That reason is now gone; the factory is kept because it is harmless, not because it is still needed.
+        // ⚠ The open is no longer gated by the pump's prefetch semaphore, only the DRAIN is. Immaterial: the
+        // result is lazy, so opening it starts a bind, not a read.
+        IArrowArrayStream? batchStream = null;
+        BatchQueryOwner? batchOwner = null;
+        if (batch is not null)
+        {
+            Log.LogDebug("delta native batch: {Sql}", batch.Statement(topSuffix));
+            batchStream = batch.Query(topSuffix);
+            batchOwner = new BatchQueryOwner(batchStream, batch.ViewNames);
+        }
+
+        Schema schema;
+        int prefetch;
+        try
+        {
+            schema = ProbeSchema(listing, userSchema, dataCols, wantRowId, batch, batchStream);
+            prefetch = Prefetch();
+        }
+        catch
+        {
+            // Everything between the open and handing ownership to the returned stream must release it —
+            // after this point the AsyncEnumerableArrowStream owns it, before it nobody would.
+            batchOwner?.Dispose();
+            throw;
+        }
 
         // `top` is what the HOST pushed; `sort` is what this reader did with the order that came with it, and
         // the three values are deliberately distinct: the rendered clause, `declined` (an order arrived but
@@ -244,10 +278,87 @@ internal static class DeltaNativeReader
             orderClause?.Trim() ?? (hasOrder ? "declined" : "-"), prefetch,
             listing.LogicalToPhysical is not null ? "name" : listing.LogicalToFieldId is not null ? "id" : "none");
 
+        // The owner is the FALLBACK release for the pre-opened batch query: it acts only if nothing ever
+        // enumerates this stream, because the pump CLAIMS the query the moment it starts. See
+        // BatchQueryOwner for why that hand-off is not optional.
         return new AsyncEnumerableArrowStream(
             schema,
-            StreamFiles(listing, loopFiles, batch, dataCols, wantRowId, where, prefetch, rowIdFilter,
-                        trackingFilter, topSuffix));
+            StreamFiles(listing, loopFiles, batch, batchStream, batchOwner, dataCols, wantRowId, where,
+                        prefetch, rowIdFilter, trackingFilter, topSuffix),
+            owner: batchOwner);
+    }
+
+    /// <summary>
+    /// Owns the pre-opened batch query — its DuckDB result stream and the bound-input views it registered —
+    /// under a strict HAND-OFF: the pump <see cref="Claim"/>s it as it starts, and from that moment the pump
+    /// is the only thing that may release it. The public <see cref="Dispose"/> (called by the scan stream's
+    /// own teardown) therefore acts ONLY in the one case the pump cannot cover — nothing ever enumerated the
+    /// stream, so the iterator body never ran and no <c>finally</c> of its exists to run either.
+    ///
+    /// <para><b>⚠ THE HAND-OFF IS NOT BOOKKEEPING — WITHOUT IT THIS CRASHES THE PROCESS, and it did.</b> The
+    /// pump is NOT joined on teardown: <c>StreamFiles</c> awaits it only after its <c>await foreach</c> runs
+    /// to completion, so a consumer that stops early — which is exactly what a pushed <c>LIMIT</c> produces —
+    /// abandons a pump that keeps draining in the background. A consumer-side release then frees the DuckDB
+    /// result while that pump is inside <c>ReadNextRecordBatchAsync</c>: a use-after-free, and it presents as
+    /// a silent process death with no error and no stack. MEASURED: `verify_delta_batched_read` died at the
+    /// first union-form scan under a pushed `LIMIT 5`, and passed 295/295 with the consumer-side release
+    /// removed. An <c>Interlocked</c> "release once" is NOT sufficient — releasing once is still releasing
+    /// while another thread reads.</para>
+    ///
+    /// <para>⚠ What this deliberately does NOT change: on early abandonment the orphaned pump releases the
+    /// query whenever it finishes, and if the bounded channel fills first it never does. That leak is
+    /// PRE-EXISTING and shared with every per-file query on the same path — the fix is to join the pump on
+    /// teardown (cancel, drain, await), which is a teardown redesign and not something to smuggle into a
+    /// bind-count optimization. The rule here is only that this class must not make it a CRASH.</para>
+    ///
+    /// <para>⚠ The views are dropped AFTER the stream, never with it: they are that query's bound inputs, and
+    /// they are NOT temporary views — see <see cref="NextViewName"/>.</para>
+    /// </summary>
+    private sealed class BatchQueryOwner : IDisposable
+    {
+        private IArrowArrayStream? _stream;
+        private readonly IReadOnlyList<string> _views;
+        private int _claimed;
+
+        internal BatchQueryOwner(IArrowArrayStream stream, IReadOnlyList<string> views)
+        {
+            _stream = stream;
+            _views = views;
+        }
+
+        /// <summary>Taken by the pump before it reads a single batch. Safe without further synchronization
+        /// because the consumer cannot be disposing concurrently: it is blocked inside the very
+        /// <c>MoveNextAsync</c> that started the iterator body.</summary>
+        internal void Claim() => Volatile.Write(ref _claimed, 1);
+
+        /// <summary>The pump's release, at the end of its drain — unconditional, since it is the owner.</summary>
+        internal void ReleaseFromPump() => ReleaseCore();
+
+        /// <summary>The scan stream's teardown release. A no-op once claimed: see the class remarks.</summary>
+        public void Dispose()
+        {
+            if (Volatile.Read(ref _claimed) == 0)
+            {
+                ReleaseCore();
+            }
+        }
+
+        private void ReleaseCore()
+        {
+            var s = Interlocked.Exchange(ref _stream, null);
+            if (s is null)
+            {
+                return;
+            }
+            try
+            {
+                s.Dispose();
+            }
+            finally
+            {
+                DropViews(_views);
+            }
+        }
     }
 
     /// <summary>
@@ -356,8 +467,12 @@ internal static class DeltaNativeReader
         internal IReadOnlyList<DeltaReader.NativeScanFile> LoopFiles { get; }
 
         /// <summary>Builds the bound Arrow inputs the SQL references (deletion vectors, per-file metadata), or
-        /// null when it references none. A FACTORY rather than a list because each is single-use: the schema
-        /// probe runs the same SQL with <c>LIMIT 0</c> and must not consume the streams the real scan needs.</summary>
+        /// null when it references none.
+        /// <para>⚠ A FACTORY rather than a list, and the reason it was one is GONE: the schema used to come
+        /// from a second <c>LIMIT 0</c> bind of this same SQL, which would have consumed the single-use
+        /// streams the real scan needed. Since 2026-08-16 the query is opened ONCE (see
+        /// <see cref="DeltaNativeReader.Read"/>) and this is called exactly once per plan. It stays a factory
+        /// because it is harmless and keeps a second call correct — not because anything still needs it.</para></summary>
         internal Func<IReadOnlyList<(string, IArrowArrayStream)>>? Inputs { get; }
 
         /// <summary>The bound-input view names this plan registers, dropped once its query has been drained
@@ -1791,25 +1906,24 @@ internal static class DeltaNativeReader
     // Advertises the EXACT read_parquet output schema (probed via LIMIT 0 over any active file), so the streamed
     // batches match by type. With no files, derives it from the user schema (+ the rowid field).
     private static Schema ProbeSchema(DeltaReader.NativeScanList listing, Schema userSchema,
-                                      IReadOnlyList<string> dataCols, bool wantRowId, BatchPlan? batch)
+                                      IReadOnlyList<string> dataCols, bool wantRowId, BatchPlan? batch,
+                                      IArrowArrayStream? batchStream)
     {
-        if (batch is not null)
+        if (batch is not null && batchStream is not null)
         {
-            // Probe the BATCH's own SQL: it is the one query that must agree with the advertised schema.
-            // ⚠ WHAT THIS COSTS DEPENDS ENTIRELY ON WHICH FORM WAS CHOSEN, and a comment here used to claim
+            // NO QUERY OF ITS OWN: the batch's REAL result stream was opened in Read and its schema is read
+            // straight off it. That is what makes the advertised schema and the rows come from ONE bind, which
+            // they must — and until 2026-08-16 they came from two, the extra one being a throwaway `LIMIT 0`.
+            // ⚠ WHAT THAT COST DEPENDED ENTIRELY ON WHICH FORM WAS CHOSEN, and a comment here once claimed
             // "no footer read (the whole point of the `schema` map)" for both — true of the plain form,
-            // MEASURED FALSE of the full one. Over 89 remote files, cold: plain-form probe 0.49 s (the schema
-            // is DECLARED, so nothing is opened) vs full-form probe 20.66 s, on top of the 20.50 s PresentNames
-            // already spent building that SQL. Reversing BatchPlan.Build's preference is what moved the common
-            // read onto the cheap side; the expensive side remains for rowid / DML / deletion-vector shapes,
-            // where it is the biggest single span left on a remote scan (see CLAUDE.md, "fuse ProbeSchema with
-            // the real query" — the LIMIT 0 is a duplicate bind, since Host.Query exposes .Schema without
-            // fetching a row).
-            using var bs = batch.Query(" LIMIT 0");
-            DropViews(batch.ViewNames);
+            // MEASURED FALSE of the full one: over 89 remote files, cold, the plain-form probe was 0.49 s (the
+            // schema is DECLARED, so nothing is opened) against 20.66 s for the full form's, on top of the
+            // 20.50 s PresentNames already spent building the same SQL. Reversing BatchPlan.Build's preference
+            // moved the common read onto the cheap side; this removes the duplicate bind from the expensive
+            // one, which is the rowid / DML / deletion-vector shapes.
             return listing.MappedSchema is { } bms
-                ? ArrowColumnMappingRename.RenameSchema(bs.Schema, bms, toPhysical: false)
-                : bs.Schema;
+                ? ArrowColumnMappingRename.RenameSchema(batchStream.Schema, bms, toPhysical: false)
+                : batchStream.Schema;
         }
         if (listing.AnyUri is { } probe)
         {
@@ -1849,14 +1963,21 @@ internal static class DeltaNativeReader
 
     private static async IAsyncEnumerable<RecordBatch> StreamFiles(
         DeltaReader.NativeScanList listing, IReadOnlyList<DeltaReader.NativeScanFile> loopFiles,
-        BatchPlan? batch, IReadOnlyList<string> dataCols, bool wantRowId, string? where,
+        BatchPlan? batch, IArrowArrayStream? batchStream, BatchQueryOwner? batchOwner,
+        IReadOnlyList<string> dataCols, bool wantRowId, string? where,
         int prefetch, DeltaRowIdFilter? rowIdFilter = null, DeltaRowTrackingFilter? trackingFilter = null,
         string? topSuffix = null, [EnumeratorCancellation] CancellationToken ct = default)
     {
-        if (loopFiles.Count == 0 && batch is null)
+        if (loopFiles.Count == 0 && batchStream is null)
         {
             yield break;
         }
+        // ⚠ CLAIM HERE, and specifically NOT inside the pump: this runs synchronously within the first
+        // MoveNextAsync (an async iterator body executes up to its first await on the caller's thread), so it
+        // strictly precedes any chance the consumer has to tear down. Claiming inside the pump would race a
+        // consumer that abandons the scan before the pump task is even scheduled — which is the exact
+        // use-after-free BatchQueryOwner exists to prevent, reintroduced one line lower.
+        batchOwner?.Claim();
         // Bounded channel + a semaphore-gated pump: up to `prefetch` files fetched concurrently (default 1 =
         // sequential). Order across files is not preserved (DuckDB re-applies ORDER BY above the scan); the rowid
         // is per-file-correct regardless of read order.
@@ -1868,12 +1989,16 @@ internal static class DeltaNativeReader
         var writer = channel.Writer;
         // Drains one query's batches into the channel, restoring nested logical names on the way (the top level
         // is already logical — the per-file SELECT aliases it, the batch's `schema` map renames it).
-        async Task DrainAsync(IArrowArrayStream stream)
+        // `release` is the disposal owner, passed separately because the two callers own their stream
+        // differently: a per-file query is created here and owns itself, while the batch stream was opened in
+        // Read (its schema is the scan's advertised schema) and is released through BatchQueryOwner instead —
+        // hence the null.
+        async Task DrainAsync(IArrowArrayStream stream, IDisposable? release)
         {
-            using var s = stream;
+            using var release_ = release;
             while (true)
             {
-                var b = await s.ReadNextRecordBatchAsync(ct).ConfigureAwait(false);
+                var b = await stream.ReadNextRecordBatchAsync(ct).ConfigureAwait(false);
                 if (b is null)
                 {
                     break;
@@ -1892,21 +2017,24 @@ internal static class DeltaNativeReader
             var tasks = new List<Task>(loopFiles.Count + 1);
             try
             {
-                if (batch is not null)
+                if (batchStream is not null && batchOwner is not null)
                 {
-                    // The batched files as ONE query, alongside (not before) the loop's — it takes a prefetch
-                    // slot like any other unit of work, so a table with both kinds still overlaps them.
+                    // The batched files as ONE query, alongside (not before) the loop's — its DRAIN takes a
+                    // prefetch slot like any other unit of work, so a table with both kinds still overlaps
+                    // them. The query itself was opened (and logged) in Read, because its schema is what the
+                    // scan advertised; only the rows are pulled here.
                     await sem.WaitAsync(ct).ConfigureAwait(false);
-                    Log.LogDebug("delta native batch: {Sql}", batch.Statement(topSuffix));
                     tasks.Add(Task.Run(async () =>
                     {
                         try
                         {
-                            await DrainAsync(batch.Query(topSuffix)).ConfigureAwait(false);
+                            await DrainAsync(batchStream, null).ConfigureAwait(false);
                         }
                         finally
                         {
-                            DropViews(batch.ViewNames);
+                            // The pump owns the query (it claimed it above): it disposes the stream and drops
+                            // that query's bound-input views, in that order.
+                            batchOwner.ReleaseFromPump();
                             sem.Release();
                         }
                     }, ct));
@@ -1948,7 +2076,9 @@ internal static class DeltaNativeReader
                             Log.LogDebug("delta native file: {Sql}", sql);
                             try
                             {
-                                await DrainAsync(QueryFile(sql, file, dvView)).ConfigureAwait(false);
+                                // A per-file query owns its own stream — created and released right here.
+                                var fs = QueryFile(sql, file, dvView);
+                                await DrainAsync(fs, fs).ConfigureAwait(false);
                             }
                             finally
                             {
