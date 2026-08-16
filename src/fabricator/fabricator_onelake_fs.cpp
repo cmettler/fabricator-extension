@@ -321,7 +321,15 @@ public:
 				int64_t modified_ms = ExtractJsonInt(obj, "last_modified");
 				std::string etag;
 				bool has_etag = ExtractJsonString(obj, "etag", etag) && !etag.empty();
-				if (size >= 0 || modified_ms >= 0 || has_etag) {
+				// The managed side marks an entry it KNOWS to be immutable (a Delta data file, whose size
+				// it seeded from the snapshot). That becomes DuckDB's per-file cache-validation override
+				// (ExternalFileCacheUtil::GetCacheValidationMode) — duckdb-iceberg's own pattern for files
+				// that are never modified. Load-bearing beside the seeded size, not decoration: a seeded
+				// open carries NO etag while a listing-fed open of the same file carries a REAL one, and
+				// ExternalFileCache::IsValid compares tags whenever either side has one — mixed identity
+				// would silently drop and re-read cached ranges. NO_VALIDATION removes the comparison.
+				bool immutable = obj.find("\"immutable\":true") != std::string::npos;
+				if (size >= 0 || modified_ms >= 0 || has_etag || immutable) {
 					info.extended_info = make_shared_ptr<ExtendedOpenFileInfo>();
 					if (size >= 0) {
 						info.extended_info->options["file_size"] = Value::UBIGINT((uint64_t)size);
@@ -332,6 +340,9 @@ public:
 					}
 					if (has_etag) {
 						info.extended_info->options["etag"] = Value(etag);
+					}
+					if (immutable) {
+						info.extended_info->options["validate_external_file_cache"] = Value::BOOLEAN(false);
 					}
 				}
 				result.push_back(std::move(info));

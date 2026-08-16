@@ -133,6 +133,34 @@ internal static class OneLakeForwardFs
     public static string Glob(string pattern, string? credJson)
         => GlobAsync(pattern, credJson).GetAwaiter().GetResult();
 
+    /// <summary>Path → size side table consulted by the literal-glob ECHO, so an echoed entry can carry the
+    /// size the echo's zero-IO contract otherwise forfeits — the C++ side turns it into
+    /// <c>extended_info["file_size"]</c> and <c>OpenFileExtended</c> then SKIPS the per-file properties
+    /// round trip entirely (the measured ~2–5 props-opens per scanned file). Seeded by
+    /// <c>DeltaNativeReader</c> from the snapshot's AddFiles — the size is part of the Delta COMMIT, and a
+    /// Delta data file is immutable (UUID-named, never overwritten in place), so a seeded size cannot go
+    /// stale; the same immutability argument duckdb-iceberg's multi-file reader makes when it stamps
+    /// <c>validate_external_file_cache=false</c> + dummy etag/mtime on its OpenFileInfos. ⚠ Fed ONLY by the
+    /// Delta reader for its own data files — a generic caller must not seed paths whose content can change,
+    /// since a wrong size here reads past the end or truncates silently. Keys are the URI text EXACTLY as
+    /// it appears in the generated SQL (DuckDB passes list entries to Glob verbatim — the filename-echo
+    /// finding), so lookup is byte-identical by construction. Bounded: the table clears wholesale at the
+    /// cap, degrading to the props fetch, never to a wrong answer.</summary>
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, long> KnownSizes =
+        new(System.StringComparer.Ordinal);
+
+    private const int KnownSizesCap = 65536;
+
+    /// <summary>Records a known immutable-file size for the literal-glob echo (see <see cref="KnownSizes"/>).</summary>
+    public static void SeedKnownSize(string uri, long size)
+    {
+        if (KnownSizes.Count >= KnownSizesCap)
+        {
+            KnownSizes.Clear();
+        }
+        KnownSizes[uri] = size;
+    }
+
     // Async so `await foreach` drives the AsyncPageable correctly (blocking the enumerator per-item with
     // GetAwaiter().GetResult() throws NotSupportedException under the hostfxr CLR); we block once, at the top.
     private static async System.Threading.Tasks.Task<string> GlobAsync(string pattern, string? credJson)
@@ -154,13 +182,26 @@ internal static class OneLakeForwardFs
             // (It also explains the 2026-08-14 probe pair: LIMIT 0 = 0.49 s never expands the list; LIMIT 1
             // = 15.15 s does.) The costs this trades: a missing file now errors at OPEN (a 404) instead of
             // globbing empty — the honest outcome for a path the Delta snapshot listed; and the echo carries
-            // no extended_info, so a file that is actually OPENED pays one properties fetch there — the same
-            // round trip the LIST cost, now paid only for files the scan touches instead of every file named.
+            // no extended_info, so a file that is actually OPENED pays one properties fetch there — UNLESS
+            // the Delta reader seeded its snapshot size into KnownSizes, in which case the echo carries it
+            // and OpenFileExtended skips the fetch too (still zero IO here either way).
+            // A seeded entry also declares itself IMMUTABLE — the C++ Glob turns that into the per-file
+            // `validate_external_file_cache = false` open option (duckdb-iceberg's own pattern for files
+            // that are never modified). Without it, ExternalFileCache::IsValid compares VERSION TAGS
+            // whenever EITHER side has one (external_file_cache.cpp:116), and our opens have MIXED
+            // identity — listing-fed/bare opens carry a real etag, seeded echo opens an empty one — so a
+            // range cached under the real etag would be judged INVALID by the next seeded open and
+            // silently dropped + re-read. NO_VALIDATION removes the comparison and states the truth: a
+            // Delta data file cannot change under its cached ranges.
+            bool known = KnownSizes.TryGetValue(pattern, out long knownSize);
             if (Log.IsEnabled(LogLevel.Debug))
             {
-                Log.LogDebug("onelake glob {Path} (literal, echoed — no IO)", p);
+                Log.LogDebug("onelake glob {Path} (literal, echoed — no IO{Sized})", p,
+                             known ? ", size seeded" : "");
             }
-            return $"[{{\"path\":\"onelake://{fs}/{p.Replace("\"", "\\\"")}\"}}]";
+            return known
+                ? $"[{{\"path\":\"onelake://{fs}/{p.Replace("\"", "\\\"")}\",\"size\":{knownSize.ToString(System.Globalization.CultureInfo.InvariantCulture)},\"immutable\":true}}]"
+                : $"[{{\"path\":\"onelake://{fs}/{p.Replace("\"", "\\\"")}\"}}]";
         }
         string beforeStar = star >= 0 ? p.Substring(0, star) : p;
         string afterStar = star >= 0 ? p.Substring(star + 1) : string.Empty;

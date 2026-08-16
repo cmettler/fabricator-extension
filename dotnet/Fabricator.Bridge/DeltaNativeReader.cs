@@ -197,6 +197,21 @@ internal static class DeltaNativeReader
                 listing = WithFiles(listing, kept);
             }
         }
+        // Seed the onelake VFS's path→size side table from the snapshot's AddFiles, so the literal-glob
+        // echo can carry each file's size and DuckDB's OpenFileExtended skips the per-file properties
+        // round trip (the measured ~2–5 props-opens per scanned file). Sound because a Delta data file is
+        // IMMUTABLE (UUID-named, never overwritten in place) and the size is part of the commit — the same
+        // argument duckdb-iceberg's multi-file reader makes when it stamps its OpenFileInfos
+        // (validate_external_file_cache=false + dummy identity). Pending (uncommitted) files carry no
+        // SizeBytes and are skipped; only this reader feeds the table, so the generic VFS never learns a
+        // size for a path whose content could change.
+        foreach (var f in listing.Files)
+        {
+            if (f.SizeBytes is { } sz && sz > 0 && f.Uri.StartsWith("onelake://", StringComparison.Ordinal))
+            {
+                OneLakeForwardFs.SeedKnownSize(f.Uri, sz);
+            }
+        }
         // Collapse the DV-free files into ONE read_parquet([…]) where that is expressible (see BatchPlan.Build);
         // whatever is left keeps the per-file loop unchanged.
         var batch = BatchPlan.Build(listing, dataCols, wantRowId, where, rowIdFilter, trackingFilter,
@@ -555,22 +570,24 @@ internal static class DeltaNativeReader
         /// union's measured marginal cost is ~0.4 ms/branch against the loop's ~1.9 ms/file), and one
         /// <c>LIMIT</c>/early-stop boundary instead of D+1.</para>
         /// <para><b>⚠ ON A REMOTE ROOT IT IS GATED to scans carrying a pushed bare LIMIT — because of a
-        /// measured EXECUTION anomaly of our own path, not of the form.</b> Live A/B on OneLake
-        /// <c>lake.dbo.frag</c> (200 files, 2 DV), same minutes, all through the extension: union full-scan
-        /// <b>120.4 s</b> (cold; 85.1 s cache-warm) against the full form's <b>17.7 s</b> — while the
-        /// BYTE-EQUIVALENT plain-branch SQL pasted RAW into duckdb.exe runs in <b>6.3 s</b>. The per-IO
-        /// instruments attribute it exactly: per-file opens at EXECUTION through a host query cost
-        /// ~120–212 ms each, SERIAL (fablog gap analysis: 808 evenly spaced ops ≈ the whole 110 s window),
-        /// where the full form's ops cost ~29 ms — same VFS, same op class. The plain/union form defers all
-        /// per-file IO to execution and so eats that per-op cost N times; the full form pays its footers at
-        /// bind on a cheaper path and its execution reads land in DuckDB's ExternalFileCache. The anomaly is
-        /// the same lead CLAUDE.md records as the 180 ms-vs-3 ms SDK asymmetry (measure-first item of the
-        /// HTTP-shim ladder); when it is fixed, this gate should fall.</para>
+        /// measured EXECUTION anomaly of our own path, not of the form.</b> Live A/Bs on OneLake
+        /// <c>lake.dbo.frag</c> (200 files, 2 DV), all through the extension: union full-scan <b>120.4 s</b>
+        /// against the full form's <b>17.7 s</b> — while the BYTE-EQUIVALENT plain-branch SQL pasted RAW
+        /// into duckdb.exe runs in <b>6.3 s</b>. The anomaly has TWO measured terms. (1) Per-file props
+        /// fetches at execution — RETIRED by the seeded-size echo + the per-file
+        /// <c>validate_external_file_cache=false</c> declaration (see <c>OneLakeForwardFs.SeedKnownSize</c>),
+        /// which took the union's cold scan 120.4 → 44.7 s and the FULL form's 17.7 → <b>4.7 s</b>.
+        /// (2) A residual CPU term in the union-shaped query's execution through the host-query fetch:
+        /// with IDENTICAL IO (200 zero-IO opens + 200 reads each), the cold union burns <b>42.6 s of user
+        /// CPU against the full form's ~2.9 s</b> — 44.7 s vs 4.7 s wall on the same table in the same
+        /// minutes. Cache-warm the union is fine (1.6 s), so the burn sits in the cold union execution
+        /// itself; unattributed (the raw run proves the SQL shape is innocent), and until it is found the
+        /// gate stands.</para>
         /// <para><b>The LIMIT exception is measured, not hoped:</b> with a pushed bare LIMIT the union stops
-        /// after a handful of opens (frag <c>LIMIT 1</c>: 10 opens, <b>3.65 s</b>) where the full form must
-        /// pay BOTH O(N) sweeps before its first row — the profiled-query shape, and the reason the gate is
-        /// not a flat remote refusal. Local roots take the union unconditionally (~10 ms/op there; the raw
-        /// A/B and the loop-vs-union marginals both favour it).</para>
+        /// after a handful of opens (frag <c>LIMIT 1</c>: 10 opens, <b>3.65–3.8 s</b>) where the full form
+        /// must pay BOTH O(N) sweeps before its first row — the profiled-query shape, and the reason the
+        /// gate is not a flat remote refusal. Local roots take the union unconditionally (~10 ms/op there;
+        /// the raw A/B and the loop-vs-union marginals both favour it).</para>
         /// <para><b>Eligibility is exactly the plain form's</b> — this is only called on its PARTIAL result, so
         /// no rowid, no row tracking, no projected partition column, no id mode, every column renderable. Each
         /// DV branch additionally needs its footer probe and typed-NULL rendering to succeed; any failure
