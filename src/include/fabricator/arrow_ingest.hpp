@@ -160,17 +160,28 @@ struct ArrowStreamBindData : public duckdb::TableFunctionData {
 	//! returns a superset, so TOP before exact filtering could drop rows). Set by the
 	//! optimizer extension; DuckDB keeps its own LIMIT, so this is purely a hint.
 	int64_t top_n = -1;
-	//! ORDER BY pushdown: a JSON array `[{"col":"c","desc":bool}]`. Set by the
-	//! optimizer only when ALL order keys have SQL-Server-compatible NULL ordering, there is no pushed
-	//! filter, and every key is either non-string OR string under a binary collation
-	//! (`string_order_pushable`); paired with top_n (TopN). Empty => none. DuckDB keeps its TopN, so this
-	//! is a hint.
+	//! ORDER BY pushdown: a JSON array `[{"col":"c","desc":bool,"nulls_first":bool}]`. Set by the
+	//! optimizer only when there is no pushed filter, every key is a plain column that is either non-string
+	//! OR string under a binary collation (`string_order_pushable`), and each key's NULL placement is either
+	//! the provider's own convention or renderable by it (`null_order_expressible`); paired with top_n
+	//! (TopN). Empty => none. DuckDB keeps its TopN, so this is a hint.
+	//! ⚠ `nulls_first` is the RESOLVED placement (DBConfig::ResolveNullOrder), never the parsed modifier —
+	//! a bare `ORDER BY x` carries no modifier and resolves from `default_null_order`, so emitting the raw
+	//! one would describe a different order than DuckDB's own TopN applies above the scan.
 	duckdb::string order_by_json;
 
 	//! Whether string-keyed ORDER BY may be pushed: true only when the catalog's database collation is
 	//! binary (_BIN/_BIN2), so SQL Server's byte-order string sort matches DuckDB. Set at scan bind from
 	//! the catalog (FabricatorCatalog::StringOrderPushable). Read by the optimizer's TopN pushdown.
+	//! ⚠ For the Delta reader it is true UNCONDITIONALLY and for a stronger reason than a lucky collation:
+	//! the generated SQL is executed BY DuckDB, so the comparator that picks the top-n IS the comparator of
+	//! the TopN kept above the scan. Same flag, same meaning ("this source orders strings as DuckDB does").
 	bool string_order_pushable = false;
+
+	//! Whether the provider renders a pushed key's NULL placement (`NULLS FIRST`/`NULLS LAST`) rather than
+	//! owning one fixed convention. Set at scan bind from FabricatorCatalog::NullOrderExpressible; read by
+	//! the optimizer's TopN pushdown to skip the SQL-Server-shaped `NullOrderCompatible` gate.
+	bool null_order_expressible = false;
 
 	//! Time travel (DuckDB `FROM t AT (...)`), set at bind for a catalog table reference. `at_unit` is the
 	//! unit ("timestamp"/"version"); `at_value` is the constant rendered as a string. Empty `at_unit` => no

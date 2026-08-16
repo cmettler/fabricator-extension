@@ -396,9 +396,17 @@ SELECT * FROM mssql.dbo.events ORDER BY id DESC LIMIT 10;
 still filtered correctly. Pushed shapes: `=`, `<>`, `<`, `<=`, `>`, `>=`, `IS [NOT] DISTINCT FROM`,
 `IS [NOT] NULL`, `IN`, `BETWEEN`, `AND`/`OR`. `VARCHAR` predicates push only `=` / `IN` /
 `IS NOT DISTINCT FROM` (SQL Server collation is a looser superset; ordering comparisons stay local).
-**TopN** is pushed only when all order keys are non-string and NULL-ordering-compatible (SQL Server
-ASC = NULLS FIRST, DESC = NULLS LAST), and there is no pushed filter; the DuckDB sort node is kept, so
-results are always correct.
+**TopN** is pushed only when there is no pushed filter and every order key is safe for the target. On
+**SQL Server** that means a non-string key (or any key under a binary collation) whose NULL ordering
+matches the server's fixed convention (ASC = NULLS FIRST, DESC = NULLS LAST) — T-SQL cannot spell the
+other one. On **Delta** every key qualifies, including strings and any NULL placement, because the
+generated SQL is executed by DuckDB itself (see [Delta](#delta-lake-catalog-provider-delta)). Either way
+the DuckDB sort node is kept, so results are always correct.
+
+One thing that quietly turns TopN pushdown *off* (on any provider): ordering by a **collated** key —
+an explicit `COLLATE`, or a session `SET default_collation` to anything other than binary. DuckDB then
+sorts by a rule the pushed-down query would not reproduce, so the key is left local. The answer is
+unchanged; only the row-trimming optimization is lost.
 
 The optimizer also receives each table's approximate **row count** (from partition stats) and
 **per-column NDV** (distinct-value estimate) for better join ordering. Min/max bounds are intentionally
@@ -1875,6 +1883,7 @@ principal wins even if `PROVIDER` says something else:
 |---------|--------|
 | Discover tables — local (`System.IO`), S3 (host-FS glob), OneLake (Fabric Unity Catalog REST API) | ✅ (generic non-OneLake ADLS not supported — duckdb-azure glob #174) |
 | Streaming scan + filter pushdown (Delta file pruning + Parquet row-group skipping) | ✅ |
+| `LIMIT` and `ORDER BY … LIMIT` (TopN) pushed into the scan — any key type, any NULL placement | ✅ |
 | `CREATE TABLE` / `INSERT` / CTAS / COPY (streaming bulk via the standard write path) | ✅ |
 | `DELETE` / `UPDATE` — rowid deletion-vectors / merge-on-read (default) or copy-on-write (`deletion_vectors false`) | ✅ |
 | `DROP TABLE`, `ALTER TABLE … ADD COLUMN`, `RENAME TABLE` (local + OneLake) | ✅ |

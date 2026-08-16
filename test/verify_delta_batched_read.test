@@ -847,17 +847,14 @@ true
 #     accident is kept below as the LOOP leg's fixture. A bare projection under LIMIT must return
 #     order-independent VALUES to be assertable (`id IS NOT NULL`), since a bare LIMIT's rows are
 #     arbitrary.
-#     ⚠ The two NEGATIVE controls are the load-bearing half, and each carries a POSITIVE witness so it
-#     cannot hold vacuously:
-#       - a FILTERED limit must NOT push — arrow_ingest emits "top" only when the scan carries no filter
-#         (a best-effort filter's superset plus an early limit could starve real matches); witnessed by
-#         the scan line showing the filter WITH `top=-`;
-#       - TopN must not become a bare LIMIT — TryPushTopN pushes top+order_by TOGETHER, this reader
-#         applies no ORDER BY, and an unordered LIMIT is an arbitrary subset that DuckDB's kept TopN
-#         above cannot repair (silently WRONG rows, not slow ones); witnessed by `top=6` arriving while
-#         no generated SQL carries LIMIT 6. ⚠ The key must be `ASC NULLS FIRST`: with DuckDB's default
-#         NULLS LAST, NullOrderCompatible declines the push and `top=-` arrives — the gate under test
-#         would be unreachable and the section would pin nothing (probed both ways).
+#     ⚠ The NEGATIVE control (§11d) is the load-bearing half and carries a POSITIVE witness so it cannot
+#     hold vacuously: a FILTERED limit must NOT push — arrow_ingest emits "top" only when the scan carries
+#     no filter (a best-effort filter's superset plus an early limit could starve real matches) —
+#     witnessed by the scan line showing the filter WITH `top=-`.
+#     ⚠ This section is about the BARE limit only. A limit arriving WITH an order is TopN pushdown and
+#     lives in §12; until 2026-08-16 it was a second negative here (the reader declined it, since an
+#     unordered limit trims arbitrary rows), and that expectation is now inverted — the two must be read
+#     and edited together.
 # ============================================================================
 
 # 11a. Plain form carries the limit (schema-map SQL ends in it), and the spec carried top=3.
@@ -962,13 +959,52 @@ WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native%'
 ----
 0
 
-# 11e. NEGATIVE: TopN (top + order_by pushed together) must not become a bare LIMIT. The positive
-#      witness: top=6 ARRIVED at the reader — so the zero below is the reader's OrderBy gate declining,
-#      not the push never happening. The row assertion is exact BECAUSE it is ordered.
+# ============================================================================
+# 12. TOPN PUSHDOWN — THE PUSHED ORDER BY IS RENDERED TOO (2026-08-16). Until this, `TryPushTopN` sent
+#     `top` and `order_by` as a PAIR and this reader used NEITHER: it declined the limit whenever an
+#     order came with it, because a limit applied without its order is an arbitrary subset that the TopN
+#     DuckDB keeps above the scan cannot repair — it re-sorts whatever arrives, and the rows it needed
+#     are simply gone. Now the order is rendered into the generated SQL, which is executed BY DuckDB, so
+#     the comparator picking the top-n IS that kept TopN's comparator.
+#     TWO capabilities had to be declared before any of this could fire (DeltaCatalog.CapabilitiesJson),
+#     and each is pinned by its own leg below:
+#       - `is_binary_collation` — string keys were refused OUTRIGHT (§12d);
+#       - `null_order_expressible` — without it the SQL-Server-shaped NullOrderCompatible gate rejects
+#         ASC + NULLS LAST, which is DuckDB's DEFAULT, so `ORDER BY x LIMIT n` on a NULLABLE column —
+#         the shape people actually write — never pushed at all (§12a). Delta CTAS columns are nullable
+#         (verified in the metaData schemaString), so this is the ordinary case, not a corner.
+#     ⚠ THE ROW ASSERTIONS ARE THE LOAD-BEARING HALF, unlike §10/§11 where the answer is form-independent
+#     and only the routing could regress. Here a pushdown that renders the limit and drops or mis-renders
+#     the order returns the WRONG ROWS, not slow ones. So every leg pins exact ORDERED values over a
+#     MULTI-FILE table, where a per-file or per-branch cap under the wrong order provably loses the true
+#     top-n — on a single-file table it could not.
+#     ⚠ `topn` carries actual NULLs, which `route_plain` does not: null PLACEMENT is unobservable in the
+#     rows of a table that has none, so §12b would pin nothing against that fixture.
+#     ⚠ THE PER-FILE LOOP LEG IS VERIFIED BY PROBE, NOT PINNED, and saying so is the honest form: at this
+#     suite's thresholds no TopN shape reaches the loop (it is reached by a rowid-only projection or a
+#     per-file predicate, and a predicate suppresses `top` at the host — §11d). It cannot regress on its
+#     own, because the loop appends the SAME `topSuffix` string, built once, that the batch legs assert.
+# ============================================================================
+
+statement ok
+CREATE TABLE b.main.topn AS
+  SELECT CASE WHEN i % 10 = 0 THEN NULL ELSE i END::BIGINT AS id, ('t' || i)::VARCHAR AS s FROM range(50) r(i);
+
+statement ok
+INSERT INTO b.main.topn
+  SELECT CASE WHEN i % 10 = 0 THEN NULL ELSE i END::BIGINT, ('t' || i)::VARCHAR FROM range(50, 100) r(i);
+
+statement ok
+INSERT INTO b.main.topn
+  SELECT CASE WHEN i % 10 = 0 THEN NULL ELSE i END::BIGINT, ('t' || i)::VARCHAR FROM range(100, 150) r(i);
+
+# 12a. THE HEADLINE SHAPE: a bare `ORDER BY id LIMIT n` on a nullable column. Before the
+#      `null_order_expressible` capability the host declined this outright (`top=-`), so the reader never
+#      saw it; now it arrives AND is rendered with the RESOLVED placement, not the parsed one — there is
+#      no modifier in the SQL text to copy.
 query I
-SELECT id FROM b.main.route_plain ORDER BY id ASC NULLS FIRST LIMIT 6;
+SELECT id FROM b.main.topn ORDER BY id LIMIT 5;
 ----
-0
 1
 2
 3
@@ -978,16 +1014,151 @@ SELECT id FROM b.main.route_plain ORDER BY id ASC NULLS FIRST LIMIT 6;
 query I
 SELECT count(*) > 0 FROM duckdb_logs
 WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native scan%'
-  AND message LIKE '%route_plain%' AND message LIKE '%top=6%';
+  AND message LIKE '%topn%' AND message LIKE '%top=5%'
+  AND message LIKE '%sort=[ORDER BY "id" ASC NULLS LAST]%';
 ----
 true
 
 query I
+SELECT count(*) > 0 FROM duckdb_logs
+WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native batch%'
+  AND message LIKE '%topn%' AND message LIKE '%schema = map%'
+  AND message LIKE '%ORDER BY "id" ASC NULLS LAST LIMIT 5%';
+----
+true
+
+# 12b. NULL PLACEMENT IS RENDERED, not left to the inner statement's own default. The inner query runs on
+#      its OWN connection, where `default_null_order` would resolve ASC to NULLS LAST — so dropping the
+#      rendering returns ids 1..5 here instead of the NULLs the outer TopN asked for, and the kept TopN
+#      cannot recover rows that never arrived. `id IS NULL` is what makes that visible in one column.
+query I
+SELECT id IS NULL FROM b.main.topn ORDER BY id ASC NULLS FIRST LIMIT 5;
+----
+true
+true
+true
+true
+true
+
+query I
+SELECT count(*) > 0 FROM duckdb_logs
+WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native batch%'
+  AND message LIKE '%topn%' AND message LIKE '%ORDER BY "id" ASC NULLS FIRST LIMIT 5%';
+----
+true
+
+# 12c. DESC, and a multi-key order in the same statement — every key must be rendered, since the provider
+#      ordering by a PREFIX of the keys would trim on a coarser order than DuckDB's.
+query II
+SELECT id, s FROM b.main.topn ORDER BY id DESC, s ASC LIMIT 3;
+----
+149	t149
+148	t148
+147	t147
+
+query I
+SELECT count(*) > 0 FROM duckdb_logs
+WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native batch%'
+  AND message LIKE '%topn%'
+  AND message LIKE '%ORDER BY "id" DESC NULLS LAST, "s" ASC NULLS LAST LIMIT 3%';
+----
+true
+
+# 12d. A STRING key — refused outright before `is_binary_collation` was declared. It is safe here for a
+#      stronger reason than the flag's SQL-Server-shaped name suggests: the sort runs inside DuckDB, so
+#      there is no second engine whose collation could disagree.
+query I
+SELECT s FROM b.main.topn ORDER BY s DESC LIMIT 4;
+----
+t99
+t98
+t97
+t96
+
+query I
+SELECT count(*) > 0 FROM duckdb_logs
+WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native batch%'
+  AND message LIKE '%topn%' AND message LIKE '%ORDER BY "s" DESC NULLS LAST LIMIT 4%';
+----
+true
+
+# 12e. The UNION form carries the pair as well, appended after the LAST branch — which binds to the WHOLE
+#      union, not to that branch (probed directly: `SELECT 1 UNION ALL SELECT 2 ORDER BY x DESC LIMIT 1`
+#      returns one row, 2). route_dv's live ids start at 8 (0..7 and 10..12 are deleted), so these values
+#      also re-assert that the deletion vector still applies underneath the ordering.
+query I
+SELECT id FROM b.main.route_dv ORDER BY id LIMIT 4;
+----
+8
+9
+13
+14
+
+query I
+SELECT count(*) > 0 FROM duckdb_logs
+WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native batch%'
+  AND message LIKE '%route_dv%' AND message LIKE '% UNION ALL %'
+  AND message LIKE '%ORDER BY "id" ASC NULLS LAST LIMIT 4%';
+----
+true
+
+# 12f. ...and the FULL form (union_by_name), reached by projecting the rowid beside the ordered column.
+#      ⚠ The rowid must be REFERENCED in the output, not merely selected in the subquery: the optimizer
+#      prunes an unused column, and with it the very thing that routes this to the full form — written
+#      that way the section passed its row assertion while silently pinning the union form again.
+query II
+SELECT r >= 0, id FROM (SELECT rowid AS r, id FROM b.main.route_dv ORDER BY id DESC LIMIT 3) t;
+----
+true	149
+true	148
+true	147
+
+query I
+SELECT count(*) > 0 FROM duckdb_logs
+WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native batch%'
+  AND message LIKE '%route_dv%' AND message LIKE '%union_by_name%'
+  AND message LIKE '%ORDER BY "id" DESC NULLS LAST LIMIT 3%';
+----
+true
+
+# 12g. NEGATIVE: a COLLATED key declines the whole pushdown — order AND limit, since dropping only the
+#      order would leave a bare limit trimming arbitrary rows. Nothing here checks a collation by name:
+#      DuckDB wraps a collated ORDER BY key in a function at bind (ExpressionBinder::PushCollation), so
+#      the host's "must be a plain column reference" test declines it without knowing why. The same
+#      mechanism covers TIME_TZ and INTERVAL keys, which are wrapped by the same hook.
+#      §12d is its POSITIVE CONTROL: the byte-identical query one collation setting away DOES push, so
+#      the zero below cannot pass by string keys having quietly stopped working.
+statement ok
+SET default_collation='nocase';
+
+query I
+SELECT s FROM b.main.topn ORDER BY s DESC LIMIT 8;
+----
+t99
+t98
+t97
+t96
+t95
+t94
+t93
+t92
+
+statement ok
+RESET default_collation;
+
+query I
 SELECT count(*) FROM duckdb_logs
 WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native%'
-  AND message LIKE '%LIMIT 6%';
+  AND message LIKE '%topn%' AND message LIKE '%LIMIT 8%';
 ----
 0
+
+query I
+SELECT count(*) > 0 FROM duckdb_logs
+WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native scan%'
+  AND message LIKE '%topn%' AND message LIKE '%top=- sort=[-]%';
+----
+true
 
 statement ok
 CALL disable_logging();

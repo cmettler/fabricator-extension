@@ -116,15 +116,27 @@ bool ResolveOrderColumn(const Expression &expr, LogicalGet &get, LogicalProjecti
 	return true;
 }
 
-// SQL Server orders NULLs FIRST for ASC and LAST for DESC. We may only push an order
-// key whose effective NULL ordering matches that (or whose column is NOT NULL).
-bool NullOrderCompatible(ClientContext &context, OrderType type, OrderByNullType null_order, bool nullable) {
+// The RESOLVED null placement of an order key: a bare `ORDER BY x` carries no modifier, so the answer
+// comes from `default_null_order` (DuckDB's default is NULLS LAST for ASC). Every consumer below wants the
+// resolved value, never the parsed one — describing the key by its modifier would push an order DuckDB's
+// own TopN does not apply, and the pushed LIMIT would then trim the wrong rows.
+bool ResolvedNullsFirst(ClientContext &context, OrderType type, OrderByNullType null_order) {
+	return DBConfig::GetConfig(context).ResolveNullOrder(context, type, null_order) == OrderByNullType::NULLS_FIRST;
+}
+
+// SQL Server orders NULLs FIRST for ASC and LAST for DESC, and T-SQL cannot spell the other one — so for a
+// provider with that fixed convention we may only push a key whose effective NULL ordering already matches
+// (or whose column is NOT NULL). A provider that RENDERS the placement instead (`null_order_expressible` —
+// the Delta reader, whose ORDER BY is executed by DuckDB) is handed the resolved value and needs no gate.
+//
+// ⚠ The gate is not a corner case: DuckDB's default is NULLS LAST for ASC, so under it EVERY bare
+// `ORDER BY x LIMIT n` on a NULLABLE column is declined. That is why a provider must declare the capability
+// for TopN pushdown to fire on the shape people actually write.
+bool NullOrderCompatible(bool nulls_first, OrderType type, bool nullable) {
 	if (!nullable) {
 		return true;
 	}
-	auto resolved = DBConfig::GetConfig(context).ResolveNullOrder(context, type, null_order);
-	return type == OrderType::ASCENDING ? resolved == OrderByNullType::NULLS_FIRST
-	                                     : resolved == OrderByNullType::NULLS_LAST;
+	return type == OrderType::ASCENDING ? nulls_first : !nulls_first;
 }
 
 // LIMIT n (constant, no/zero offset) over a fabricator scan -> SELECT TOP (n).
@@ -152,10 +164,20 @@ void TryPushLimit(LogicalOperator &op) {
 	    static_cast<int64_t>(limit.limit_val.GetConstantValue());
 }
 
-// TopN (ORDER BY + LIMIT, fused by the built-in TOP_N optimizer) over a fabricator
-// scan -> SELECT TOP (n) ... ORDER BY ... — but only when ALL order keys are plain
-// non-string columns with compatible NULL ordering and there is no pushed filter.
-// The LogicalTopN is kept, so DuckDB re-sorts/limits; pushing only trims wire rows.
+// TopN (ORDER BY + LIMIT, fused by the built-in TOP_N optimizer) over a fabricator scan -> the provider's
+// own top-n (`SELECT TOP (n) … ORDER BY …` on SQL Server; `ORDER BY … LIMIT n` in the Delta reader's
+// generated SQL) — but only when there is no pushed filter and EVERY key is a plain column whose ordering
+// the provider reproduces exactly. The LogicalTopN is KEPT, so DuckDB re-sorts and re-limits; pushing only
+// trims wire rows. That is what makes an over-broad push merely wasteful and a WRONG one silently lossy:
+// rows the provider trimmed never arrive, and the kept TopN cannot re-select what it never saw.
+//
+// ⚠ `ResolveOrderColumn`'s "must be a plain column reference" test does more work than it looks, and it is
+// load-bearing for exactly this: DuckDB pushes a COLLATION onto every ORDER BY key at bind
+// (bind_select_node.cpp -> ExpressionBinder::PushCollation), replacing the expression with a function call
+// whenever the key's comparison is not the naive one — an explicit `COLLATE`, a session `default_collation`
+// other than binary/c/posix, and also TIME_TZ and INTERVAL keys (`timetz_byte_comparable`,
+// `normalized_interval`). All of those therefore arrive as BOUND_FUNCTION and are declined here, without
+// this file having to enumerate them.
 void TryPushTopN(ClientContext &context, LogicalOperator &op) {
 	if (op.type != LogicalOperatorType::LOGICAL_TOP_N) {
 		return;
@@ -179,18 +201,20 @@ void TryPushTopN(ClientContext &context, LogicalOperator &op) {
 		string name;
 		bool nullable = true;
 		bool is_string = true;
-		// Require EVERY key to be a plain, non-string, NULL-order-compatible column —
-		// a prefix-only push + TOP would let SQL pick the wrong top-n.
+		// Require EVERY key to resolve — a prefix-only push plus a limit would let the provider pick the
+		// wrong top-n (it would order by fewer keys than DuckDB and trim on that).
 		if (!ResolveOrderColumn(*o.expression, *match.get, match.proj, bind_data, name, nullable, is_string)) {
 			return;
 		}
 		if (is_string && !bind_data.string_order_pushable) {
-			// String ordering is collation-dependent: SQL Server's sort may differ from DuckDB's, so a
-			// pushed TOP+ORDER BY could trim the wrong rows. Push it only under a binary database
-			// collation (byte-order sort == DuckDB), detected at LoadCatalog. Otherwise keep it off.
+			// String ordering is collation-dependent, so a pushed top-n could trim the wrong rows unless the
+			// source orders strings as DuckDB does. Declared per catalog at LoadCatalog: SQL Server asserts
+			// it under a binary database collation (byte-order sort == DuckDB); the Delta reader asserts it
+			// unconditionally, because its ORDER BY is executed BY DuckDB.
 			return;
 		}
-		if (!NullOrderCompatible(context, o.type, o.null_order, nullable)) {
+		bool nulls_first = ResolvedNullsFirst(context, o.type, o.null_order);
+		if (!bind_data.null_order_expressible && !NullOrderCompatible(nulls_first, o.type, nullable)) {
 			return;
 		}
 		if (i) {
@@ -200,6 +224,8 @@ void TryPushTopN(ClientContext &context, LogicalOperator &op) {
 		JsonStr(name, order_json);
 		order_json += ",\"desc\":";
 		order_json += o.type == OrderType::DESCENDING ? "true" : "false";
+		order_json += ",\"nulls_first\":";
+		order_json += nulls_first ? "true" : "false";
 		order_json += "}";
 	}
 	order_json += "]";

@@ -138,6 +138,7 @@ FabricatorCapabilities FetchCapabilities(FabricatorHandle handle) {
 	if (auto *root = guard.Root()) {
 		caps.string_order_pushable = yyjson_get_bool(yyjson_obj_get(root, "is_binary_collation"));
 		caps.exact_filter_pushdown = yyjson_get_bool(yyjson_obj_get(root, "exact_filter_pushdown"));
+		caps.null_order_expressible = yyjson_get_bool(yyjson_obj_get(root, "null_order_expressible"));
 	}
 	return caps;
 }

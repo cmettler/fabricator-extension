@@ -119,7 +119,7 @@ public sealed class ScanSpec
         string.IsNullOrWhiteSpace(json) ? null : JsonSerializer.Deserialize<ScanSpec>(json, Options);
 }
 
-/// <summary>One ORDER BY key: a column name + direction.</summary>
+/// <summary>One ORDER BY key: a column name + direction + the resolved NULL placement.</summary>
 public sealed class OrderKey
 {
     [JsonPropertyName("col")]
@@ -127,6 +127,24 @@ public sealed class OrderKey
 
     [JsonPropertyName("desc")]
     public bool Desc { get; set; }
+
+    /// <summary>
+    /// Where NULLs sort for this key — the value DuckDB RESOLVED (a bare <c>ORDER BY x</c> carries no
+    /// modifier and takes it from <c>default_null_order</c>, whose default is NULLS LAST for ASC), not the
+    /// modifier the user wrote. A provider that renders it must render THIS, or it applies a different
+    /// order than the TopN DuckDB keeps above the scan and its pushed limit trims the wrong rows.
+    ///
+    /// <para>Only meaningful to a provider declaring <c>null_order_expressible</c> in its capability doc
+    /// (today: Delta, whose ORDER BY is executed by DuckDB). A provider with ONE built-in convention —
+    /// SQL Server, where T-SQL cannot spell NULLS FIRST/LAST — ignores it, and is safe doing so because
+    /// the host then only sends keys already matching that convention (<c>NullOrderCompatible</c>).</para>
+    ///
+    /// <para>⚠ Defaults to false when absent, which reads as NULLS LAST. That is the harmless direction
+    /// for the providers above (one ignores the field; the other always receives it explicitly), but a NEW
+    /// provider that renders it must not treat the default as "unspecified".</para>
+    /// </summary>
+    [JsonPropertyName("nulls_first")]
+    public bool NullsFirst { get; set; }
 }
 
 /// <summary>A DuckDB <c>AT (...)</c> time-travel clause: a unit ("timestamp" / "version") + the constant

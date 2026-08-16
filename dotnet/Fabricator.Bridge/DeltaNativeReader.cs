@@ -134,21 +134,33 @@ internal static class DeltaNativeReader
             ? spec!.NativeFilter
             : spec?.Filter is { } node2 ? DeltaSqlFilter.ToWhere(node2, filterValues) : null;
 
-        // Bare-LIMIT pushdown (ScanSpec.Top): appended to every generated query, so a `LIMIT 1` stops the
-        // read instead of scanning all N files and discarding above the scan (with the plain form's DECLARED
-        // schema, footer reads are deferred to execution, so the limit also caps how many files are OPENED at
-        // all — the ~25 s -> ~1 s shape on the profiled 89-file remote table). Safe by the HOST's own gate:
-        // arrow_ingest emits "top" only when the scan carries NO filter, static or dynamic, because a
-        // best-effort filter's superset plus an early limit could starve real matches. Gated here on ORDER BY
-        // being absent as well — TryPushTopN pushes top+order_by TOGETHER for non-string keys, and a TopN's
-        // limit without its order is an arbitrary subset that DuckDB's kept TopN above cannot repair (it
-        // re-sorts whatever arrives; the missing rows are simply gone). Applying the ORDER BY too would be
-        // TopN pushdown for this reader — a separate enhancement, not smuggled into a LIMIT fix. Per looped
-        // file the limit is a SUPERSET (each file capped at n; DuckDB re-limits above), the same contract as
-        // every other best-effort pushdown here.
-        string? topSuffix = spec?.Top is { } topN && topN >= 0 && spec.OrderBy is not { Count: > 0 }
-            ? " LIMIT " + topN.ToString(CultureInfo.InvariantCulture)
+        // LIMIT / TopN pushdown (ScanSpec.Top + ScanSpec.OrderBy): suffixed onto every generated query, so a
+        // `LIMIT 1` stops the read instead of scanning all N files and discarding above the scan (with the
+        // plain form's DECLARED schema, footer reads are deferred to execution, so the limit also caps how
+        // many files are OPENED at all — the ~25 s -> ~1 s shape on the profiled 89-file remote table).
+        //
+        // Safe by the HOST's own gate: arrow_ingest emits "top" only when the scan carries NO filter, static
+        // or dynamic, because a best-effort filter's superset plus an early limit could starve real matches.
+        //
+        // ⚠ THE ORDER AND THE LIMIT TRAVEL TOGETHER OR NEITHER TRAVELS. TryPushTopN pushes top+order_by as a
+        // pair, and a TopN's limit applied WITHOUT its order is an arbitrary subset that the TopN DuckDB
+        // keeps above the scan cannot repair — it re-sorts whatever arrives, and the rows it needed are
+        // simply gone. So an unrenderable order (a key this scan does not project) must decline the LIMIT
+        // too, not just the ORDER BY. Both halves are best-effort in the usual sense: per looped file, and
+        // per union branch, the pair is a SUPERSET of the global answer (each file's local top-n contains
+        // that file's members of the global top-n), and DuckDB re-selects above.
+        long? pushedTop = spec?.Top is { } t && t >= 0 ? t : null;
+        bool hasOrder = spec?.OrderBy is { Count: > 0 };
+        string? orderClause = pushedTop is not null && hasOrder ? RenderOrderBy(spec!.OrderBy!, dataCols) : null;
+        string? topSuffix = pushedTop is { } topN && (!hasOrder || orderClause is not null)
+            ? (orderClause ?? "") + " LIMIT " + topN.ToString(CultureInfo.InvariantCulture)
             : null;
+        // ⚠ The union form's REMOTE gate keeps its measured meaning: a BARE limit. That measurement (frag
+        // `LIMIT 1` = 3.65 s / 10 opens) rests on the limit bounding how much each branch READS, which is
+        // true of a bare limit and false once an ORDER BY sits above the union — a TopN must see every row
+        // before it can emit one. Widening the gate to TopN scans would extend a remote route to a shape it
+        // was never measured on; those keep the full form.
+        bool bareLimit = topSuffix is not null && !hasOrder;
 
         var listing = DeltaReader.ListNativeScanFiles(opener, path, unit, value, prune, Log,
                                                       schemaOverride: pendingSchema, bound: bound);
@@ -215,15 +227,21 @@ internal static class DeltaNativeReader
         // Collapse the DV-free files into ONE read_parquet([…]) where that is expressible (see BatchPlan.Build);
         // whatever is left keeps the per-file loop unchanged.
         var batch = BatchPlan.Build(listing, dataCols, wantRowId, where, rowIdFilter, trackingFilter,
-                                    hasTop: topSuffix is not null);
+                                    hasTop: bareLimit);
         var loopFiles = batch?.LoopFiles ?? listing.Files;
         var schema = ProbeSchema(listing, userSchema, dataCols, wantRowId, batch);
         int prefetch = Prefetch();
 
+        // `top` is what the HOST pushed; `sort` is what this reader did with the order that came with it, and
+        // the three values are deliberately distinct: the rendered clause, `declined` (an order arrived but
+        // no clause could be built, so the LIMIT was dropped too), or `-` (no order pushed — a bare limit).
+        // Collapsing the middle case into `-` would make a declined TopN indistinguishable from a bare LIMIT,
+        // which is the one confusion a gate here has to be able to resolve.
         Log.LogInformation(
-            "delta native scan {Path}: v{Version} files={Files} batched={Batched} cols=[{Cols}] rowid={RowId} where=[{Where}] top={Top} prefetch={Prefetch} colmap={Map}",
+            "delta native scan {Path}: v{Version} files={Files} batched={Batched} cols=[{Cols}] rowid={RowId} where=[{Where}] top={Top} sort=[{Sort}] prefetch={Prefetch} colmap={Map}",
             path, listing.Version, listing.Files.Count, batch?.Files.Count ?? 0, string.Join(",", dataCols),
-            wantRowId, where ?? "", spec?.Top?.ToString(CultureInfo.InvariantCulture) ?? "-", prefetch,
+            wantRowId, where ?? "", spec?.Top?.ToString(CultureInfo.InvariantCulture) ?? "-",
+            orderClause?.Trim() ?? (hasOrder ? "declined" : "-"), prefetch,
             listing.LogicalToPhysical is not null ? "name" : listing.LogicalToFieldId is not null ? "id" : "none");
 
         return new AsyncEnumerableArrowStream(
@@ -351,9 +369,13 @@ internal static class DeltaNativeReader
         /// <c>preserve_insertion_order=false</c>.
         /// <para><b>⚠ THE SET IS WHAT MAKES THE UNION FORM VIABLE ON REMOTE STORAGE, and it is a
         /// CORRECTNESS-NEUTRAL declaration here rather than a tuning knob.</b> This reader's contract is
-        /// already that row order across files is not preserved (DuckDB re-applies any <c>ORDER BY</c>
-        /// above the scan, and a bare <c>LIMIT</c> is only ever pushed when the spec carries NO order —
-        /// see the <c>topSuffix</c> gate), so declaring it costs nothing we were promising.</para>
+        /// already that row order across files is not preserved — DuckDB re-applies its own TopN above the
+        /// scan, which is equally what makes a PUSHED <c>ORDER BY</c> a hint rather than a promise — so
+        /// declaring it costs nothing we were promising.</para>
+        /// <para>⚠ On a statement that DOES carry a pushed <c>ORDER BY</c> the setting is INERT, because an
+        /// explicit order yields <c>FIXED_ORDER</c> and short-circuits before it is read. That is consistent
+        /// rather than a hole: the stall it defends against is remote, and the union form's remote gate
+        /// admits only BARE-limit scans, so a remote union never carries one.</para>
         /// <para>What it buys, MEASURED on live OneLake (frag, the minimal union through
         /// <c>fabricator_host_query</c>, same process): <b>94.5 s → 7.5 s</b>. Mechanism, from DuckDB's
         /// source: with the default TRUE, <c>PhysicalResultCollector::GetResultCollector</c> takes an
@@ -2239,4 +2261,49 @@ internal static class DeltaNativeReader
     }
 
     private static string Quote(string col) => "\"" + col.Replace("\"", "\"\"") + "\"";
+
+    /// <summary>
+    /// Renders the pushed ORDER BY keys as a SQL clause for the generated queries, or <c>null</c> when any
+    /// key cannot be named — which declines the pushed LIMIT with it (see the caller: order and limit travel
+    /// together or neither travels).
+    ///
+    /// <para>Every key is spelled out in full — direction AND null placement — rather than relying on
+    /// defaults, because the inner query is a SEPARATE statement on its own connection: a default resolved
+    /// there (<c>default_null_order</c> is a session setting) need not be the one DuckDB resolved for the
+    /// TopN it keeps above this scan, and a disagreement silently trims the wrong rows.</para>
+    ///
+    /// <para><b>Why the order is safe to push at all, which is a stronger claim here than for a foreign
+    /// engine:</b> this SQL is executed BY DuckDB, so the comparator ordering the rows IS the comparator of
+    /// that kept TopN. The host has already refused every key whose comparison is not the naive one —
+    /// DuckDB wraps a collated key (explicit <c>COLLATE</c>, or a session <c>default_collation</c> other
+    /// than binary), and equally a TIME_TZ or INTERVAL key, in a function at bind time, so those arrive as
+    /// expressions and <c>ResolveOrderColumn</c> declines them.</para>
+    ///
+    /// <para>⚠ The key must be one of THIS scan's projected columns. It normally is — the host resolves each
+    /// key through the scan's own column ids, so an ordered column is a scanned column — but the check is
+    /// what keeps that an assumption we verify rather than one we inherit: the generated SQL can only name
+    /// what it selects, and a missing key would otherwise be a binder error at execution instead of a
+    /// declined pushdown here. It also covers the shapes that project nothing at all (the
+    /// <c>COUNT(*)</c> branch selects a constant).</para>
+    /// </summary>
+    private static string? RenderOrderBy(IReadOnlyList<OrderKey> keys, IReadOnlyList<string> dataCols)
+    {
+        var sb = new StringBuilder(" ORDER BY ");
+        for (int i = 0; i < keys.Count; i++)
+        {
+            var k = keys[i];
+            if (string.IsNullOrEmpty(k.Col) || !dataCols.Contains(k.Col, StringComparer.Ordinal))
+            {
+                return null;
+            }
+            if (i > 0)
+            {
+                sb.Append(", ");
+            }
+            sb.Append(Quote(k.Col))
+              .Append(k.Desc ? " DESC" : " ASC")
+              .Append(k.NullsFirst ? " NULLS FIRST" : " NULLS LAST");
+        }
+        return sb.ToString();
+    }
 }

@@ -63,6 +63,16 @@ public:
 		return exact_filter_pushdown_;
 	}
 
+	//! Whether a pushed ORDER BY key may carry ANY resolved NULL placement, because the provider renders it
+	//! (`NULLS FIRST` / `NULLS LAST`) rather than owning a fixed convention. False keeps
+	//! `fabricator_optimizer.cpp`'s `NullOrderCompatible` gate, which encodes SQL Server's built-in order
+	//! (NULLs first for ASC, last for DESC) — T-SQL cannot spell the other one. True for the Delta reader,
+	//! whose ORDER BY is executed BY DuckDB. Without it the COMMON shape does not push at all: DuckDB's
+	//! default null order is NULLS LAST for ASC, so `ORDER BY x LIMIT n` on a NULLABLE column is declined.
+	bool NullOrderExpressible() const {
+		return null_order_expressible_;
+	}
+
 	//! Whether an ATTACH object filter (schema_filter / table_filter / function_filter) is active. When set,
 	//! the discovered name list (per schema) is a FILTERED SUBSET, so a targeted lookup miss is ambiguous —
 	//! it may be a real object the filter merely excluded from ENUMERATION. The filter bounds enumeration
@@ -143,6 +153,7 @@ private:
 	//! Whether the database collation is binary (detected at LoadCatalog) => string ORDER BY is pushable.
 	bool has_object_filter_ = false;
 	bool string_order_pushable_ = false;
+	bool null_order_expressible_ = false;
 	//! Whether the provider applies pushed filters exactly (detected at LoadCatalog) => filter_pushdown=true
 	//! is safe on the scan (currently: Delta native_read only). See ExactFilterPushdown().
 	bool exact_filter_pushdown_ = false;

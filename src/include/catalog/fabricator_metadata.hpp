@@ -39,6 +39,12 @@ struct FabricatorCapabilities {
 	//! `filter_pushdown = true` on the scan (so DuckDB delivers runtime dynamic/join filters and stops
 	//! re-applying the pushed ones). Currently true only for the Delta catalog in Exact pushdown mode.
 	bool exact_filter_pushdown = false;
+	//! The provider can RENDER an arbitrary NULL placement for a pushed ORDER BY key, so the host may hand
+	//! it the resolved `nulls_first` per key instead of checking the key against a fixed server convention.
+	//! False (the default) means the provider has ONE built-in convention — T-SQL has no NULLS FIRST/LAST,
+	//! and SQL Server orders NULLs first for ASC / last for DESC — so `NullOrderCompatible` must gate the
+	//! push. True for the Delta reader, whose ORDER BY is executed BY DuckDB, which spells both.
+	bool null_order_expressible = false;
 };
 
 //! Reads the catalog's capability doc (one flat JSON object of booleans). Called once at ATTACH

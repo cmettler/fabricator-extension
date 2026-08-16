@@ -2878,7 +2878,12 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         var top = spec?.Top is long n and >= 0 ? $"TOP ({n}) " : "";
 
         // ORDER BY pushdown (paired with TOP for TopN). The host only sets this for
-        // safe keys (non-string, NULL-order compatible, no filter); DuckDB re-sorts.
+        // safe keys (strings only under a binary collation, NULL-order compatible, no filter); DuckDB
+        // re-sorts. ⚠ OrderKey.NullsFirst is deliberately NOT rendered: T-SQL cannot spell NULLS
+        // FIRST/LAST, which is exactly why this provider does not declare `null_order_expressible` — so the
+        // host has already filtered the keys down to ones matching SQL Server's built-in convention
+        // (NULLs first for ASC, last for DESC). Reading the field here would be redundant; rendering it
+        // would be a syntax error.
         var orderBy = spec?.OrderBy is { Count: > 0 } keys
             ? " ORDER BY " + string.Join(", ", keys.Select(k => $"{Quote(k.Col)}{(k.Desc ? " DESC" : " ASC")}"))
             : "";

@@ -333,6 +333,20 @@ store). Verified: `test/verify_columnstore.test`.
   `TryPushTopN` gate becomes `is_string && !string_order_pushable`. Verified:
   `test/verify_collation_pushdown.test` (binary DB → pushed) + `test/verify_orderby_pushdown.test`
   (CI_AS box → not pushed, both correct).
+  - **⚠ THE FLAG IS NOT SQL-SERVER-SPECIFIC, though its JSON key `is_binary_collation` reads that way —
+    since 2026-08-16 the Delta reader declares it too.** What it really asks is *"does this source order
+    strings the way DuckDB does"*: for a foreign engine that is conditional on collation, for Delta it is
+    unconditionally yes, because the generated SQL is executed BY DuckDB. Do not "narrow" the flag back to
+    a collation concept — and note the same declaration also lets the C++ `FilterSerializer` emit string
+    RANGE comparisons for Delta file/row-group pruning, which `DeltaFilterBuilder`'s own doc had assumed
+    all along while the flag that makes it true was withheld.
+  - **A SECOND, INDEPENDENT gate had to be lifted for Delta: `NullOrderCompatible`.** It encodes SQL
+    Server's FIXED convention (NULLs first for ASC, last for DESC) because T-SQL cannot spell the other
+    one — so it is right here and wrong for a provider that renders `NULLS FIRST`/`NULLS LAST` itself.
+    The new capability `null_order_expressible` (absent = false, so SQL Server is untouched) skips it and
+    hands the provider the RESOLVED placement per key. ⚠ It is not an edge case: DuckDB's default null
+    order is NULLS LAST for ASC, so without it a bare `ORDER BY x LIMIT n` on a NULLABLE column — the
+    shape people actually write — is declined outright.
 
 ### The no-universal-winner reality
 

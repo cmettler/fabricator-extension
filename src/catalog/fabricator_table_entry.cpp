@@ -824,8 +824,12 @@ TableFunction FabricatorTableEntry::BuildScanFunction(ClientContext &context, un
 	};
 	data->push_projection = true; // push the projected column list (and later, filters) to SQL
 	// String-keyed ORDER BY may be pushed only under a binary database collation (byte-order sort ==
-	// DuckDB); the optimizer's TopN pushdown reads this. Detected once at LoadCatalog.
-	data->string_order_pushable = ParentCatalog().Cast<FabricatorCatalog>().StringOrderPushable();
+	// DuckDB); the optimizer's TopN pushdown reads this. Detected once at LoadCatalog. Its sibling says
+	// whether this provider can RENDER a key's NULL placement instead of owning a fixed convention — both
+	// are read by the same TopN pushdown, so they are set together.
+	auto &parent_catalog = ParentCatalog().Cast<FabricatorCatalog>();
+	data->string_order_pushable = parent_catalog.StringOrderPushable();
+	data->null_order_expressible = parent_catalog.NullOrderExpressible();
 
 	// Build the Arrow column converters + verify the result schema.
 	vector<LogicalType> return_types;

@@ -166,6 +166,7 @@ unique_ptr<FunctionData> ArrowStreamBindData::Copy() const {
 	copy->top_n = top_n;
 	copy->order_by_json = order_by_json;
 	copy->string_order_pushable = string_order_pushable;
+	copy->null_order_expressible = null_order_expressible;
 	copy->at_unit = at_unit;
 	copy->at_value = at_value;
 	copy->rowid_source_columns = rowid_source_columns;

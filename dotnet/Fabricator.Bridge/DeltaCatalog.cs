@@ -1003,11 +1003,33 @@ public sealed class DeltaCatalog : IBackendCatalog
     internal string TablePath(string schema, string table) =>
         SchemaLayout ? _root + "/" + schema + "/" + table : _root + "/" + table;
 
-    // The host-consumed capability doc (ABI v71, read once at ATTACH). Derived from the SAME _pushdownMode
-    // the diagnostic ServerInfo row reads, so the two surfaces cannot drift. `is_binary_collation` is
-    // deliberately absent (= false): there is no server collation here, and DuckDB's own sort handles TopN.
+    // The host-consumed capability doc (ABI v71, read once at ATTACH). `exact_filter_pushdown` is derived
+    // from the SAME _pushdownMode the diagnostic ServerInfo row reads, so the two surfaces cannot drift.
+    //
+    // The two SORT capabilities are declared UNCONDITIONALLY, and for one reason that covers both: this
+    // provider's ORDER BY is rendered into SQL that DuckDB itself executes (the native reader's
+    // read_parquet queries), so the comparator picking a pushed top-n IS the comparator of the TopN DuckDB
+    // keeps above the scan. There is no second engine whose sort could disagree.
+    //   • `is_binary_collation` — a SQL-Server-shaped NAME for a provider-agnostic question ("does this
+    //     source order strings as DuckDB does"). For a foreign engine the answer is conditional on its
+    //     collation; here it is unconditionally yes, for every type. Delta corroborates rather than
+    //     decides it: the protocol carries no per-column collation, and the stats a pruner compares are
+    //     binary-truncated UTF-8 — which is also what DeltaFilterBuilder's own doc has always ASSUMED,
+    //     while this doc withheld the flag that makes it true.
+    //   • `null_order_expressible` — DuckDB spells NULLS FIRST/LAST, so the reader renders the resolved
+    //     placement per key instead of being held to one fixed convention. Without it the shape people
+    //     actually write does not push at all: DuckDB's default is NULLS LAST for ASC, which is the exact
+    //     case the host's SQL-Server-shaped gate rejects on a nullable column.
+    //
+    // ⚠ Declared for the CODEC engine too, and that is safe by the standing pushdown contract rather than
+    // by luck: the codec path consumes neither `top` nor `order_by`, and ignoring a pushed hint is always
+    // correct because DuckDB re-applies its own TopN. What must never happen is a provider honouring the
+    // LIMIT while dropping the ORDER BY — the reader's own gate is what prevents that (see
+    // DeltaNativeReader's suffix construction), not this declaration.
     public string CapabilitiesJson
-        => _pushdownMode == PushdownMode.Exact ? "{\"exact_filter_pushdown\":true}" : "{}";
+        => _pushdownMode == PushdownMode.Exact
+            ? "{\"exact_filter_pushdown\":true,\"is_binary_collation\":true,\"null_order_expressible\":true}"
+            : "{\"is_binary_collation\":true,\"null_order_expressible\":true}";
 
     // ── catalog discovery (the five dedicated list members — ABI v72; the kind multiplexer is gone). The
     // per-TABLE questions live on the typed ITableBinding members (DeltaTableBinding), reached through the host's

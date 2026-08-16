@@ -66,9 +66,11 @@ void FabricatorCatalog::LoadCatalog(ClientContext &context) {
 		auto caps = FetchCapabilities(handle_);
 		string_order_pushable_ = caps.string_order_pushable;
 		exact_filter_pushdown_ = caps.exact_filter_pushdown;
+		null_order_expressible_ = caps.null_order_expressible;
 	} catch (...) {
 		string_order_pushable_ = false;
 		exact_filter_pushdown_ = false;
+		null_order_expressible_ = false;
 	}
 
 	auto ensure_schema = [&](const string &schema_name) -> FabricatorSchemaEntry & {
