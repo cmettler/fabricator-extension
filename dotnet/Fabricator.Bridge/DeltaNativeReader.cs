@@ -577,11 +577,16 @@ internal static class DeltaNativeReader
         /// fetches at execution — RETIRED by the seeded-size echo + the per-file
         /// <c>validate_external_file_cache=false</c> declaration (see <c>OneLakeForwardFs.SeedKnownSize</c>),
         /// which took the union's cold scan 120.4 → 44.7 s and the FULL form's 17.7 → <b>4.7 s</b>.
-        /// (2) A residual CPU term in the union-shaped query's execution through the host-query fetch:
-        /// with IDENTICAL IO (200 zero-IO opens + 200 reads each), the cold union burns <b>42.6 s of user
-        /// CPU against the full form's ~2.9 s</b> — 44.7 s vs 4.7 s wall on the same table in the same
-        /// minutes. Cache-warm the union is fine (1.6 s), so the burn sits in the cold union execution
-        /// itself; unattributed (the raw run proves the SQL shape is innocent), and until it is found the
+        /// (2) A DuckDB SCHEDULING pathology: STREAMING result × PhysicalUnion × threads&gt;1 × a slow
+        /// filesystem. Bisected through <c>fabricator_host_query</c> (the identical inner-query machinery,
+        /// nothing of ours above it): the 198-file plain branch ALONE runs in 7.0 s, and adding ONE
+        /// CONSTANT branch — <c>UNION ALL SELECT CAST(0 AS BIGINT)</c>, no CTE, no second file — takes it
+        /// to <b>111.2 s</b>; the same at <c>SET threads=1</c> collapses to <b>6.0 s</b>; and
+        /// <c>EXPLAIN ANALYZE</c> of the slow shape reports <b>Total Time: 3.38 s of operator work inside
+        /// a 114 s statement</b> — the missing ~110 s is spent BETWEEN tasks in the scheduler (observed
+        /// both as spin, 102 s user CPU, and as idle wait, 4.5 s user, depending on the run). Locally
+        /// every op is instant so the gap never opens (0.17 s). Upstream-shaped; the full form dodges it
+        /// by being a single source operator. Until it is fixed or the host query can side-step it, the
         /// gate stands.</para>
         /// <para><b>The LIMIT exception is measured, not hoped:</b> with a pushed bare LIMIT the union stops
         /// after a handful of opens (frag <c>LIMIT 1</c>: 10 opens, <b>3.65–3.8 s</b>) where the full form
