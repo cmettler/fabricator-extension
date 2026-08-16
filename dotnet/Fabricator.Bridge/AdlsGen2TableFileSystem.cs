@@ -39,6 +39,13 @@ namespace Fabricator.Bridge;
 /// </summary>
 internal sealed class AdlsGen2TableFileSystem : ITableFileSystem
 {
+    // Per-IO Debug lines, the log-side twin of OneLakeForwardFs's (Fabricator.OneLake.Fs): this filesystem
+    // carries the Delta LOG traffic (listings, commit JSONs, checkpoint parquet), and a table open that costs
+    // seconds was unattributable without the IO timeline — the 2026-08-16 fixture showed a ~15 s open WITH a
+    // fresh checkpoint in place, which no hypothesis survived until the reads were visible. Debug-gated;
+    // never compute log arguments before the IsEnabled check on per-IO paths.
+    private static readonly Microsoft.Extensions.Logging.ILogger IoLog =
+        FabricatorLog.CreateLogger("Fabricator.Adls.Fs");
     private readonly DataLakeFileSystemClient _fs;
     private readonly string _rootUnderFs; // path of the table root within the filesystem (e.g. "lh.Lakehouse/Tables/t")
 
@@ -124,6 +131,11 @@ internal sealed class AdlsGen2TableFileSystem : ITableFileSystem
             : (dirRel.Length == 0 ? _rootUnderFs : _rootUnderFs + "/" + dirRel);
         string fullPrefixUnderFs = Resolve(prefix);
 
+        if (IoLog.IsEnabled(Microsoft.Extensions.Logging.LogLevel.Debug))
+        {
+            Microsoft.Extensions.Logging.LoggerExtensions.LogDebug(
+                IoLog, "adls list {Dir} (prefix {Prefix})", dirUnderFs, prefix);
+        }
         AsyncPageable<PathItem> pages;
         try
         {
@@ -173,15 +185,35 @@ internal sealed class AdlsGen2TableFileSystem : ITableFileSystem
         }
     }
 
+    /// <summary>Files at or below this are downloaded WHOLE on the first ranged read and served from memory.
+    /// ⚠ MEASURED before adding it (2026-08-16): engineered-wood's parquet reader consumed a 25 KB checkpoint
+    /// parquet as 63 SEQUENTIAL ranged GETs of 8–7096 bytes at ~180 ms each ≈ 12 s — footer length, footer,
+    /// then every column chunk as its own HTTP round trip — which was the whole "log replay" span of a table
+    /// open on OneLake once the listing and commit reads were instrumented and exonerated. One
+    /// ReadContentAsync fetches the same bytes in ~0.2 s. 16 MB covers every checkpoint parquet seen so far
+    /// while keeping the transient buffer bounded; a larger file keeps true ranged reads (a column-pruned
+    /// read of a big file should not download all of it).</summary>
+    private const long BufferedReadMax = 16 * 1024 * 1024;
+
     public async ValueTask<IRandomAccessFile> OpenReadAsync(string path, CancellationToken cancellationToken = default)
     {
+        if (IoLog.IsEnabled(Microsoft.Extensions.Logging.LogLevel.Debug))
+        {
+            Microsoft.Extensions.Logging.LoggerExtensions.LogDebug(IoLog, "adls open {Path}", path);
+        }
         var file = File(path);
         long length = (await file.GetPropertiesAsync(cancellationToken: cancellationToken).ConfigureAwait(false)).Value.ContentLength;
-        return new OneLakeRandomAccessFile(file, length);
+        return new OneLakeRandomAccessFile(file, length, buffered: length <= BufferedReadMax);
     }
 
     public async ValueTask<bool> ExistsAsync(string path, CancellationToken cancellationToken = default)
-        => (await File(path).ExistsAsync(cancellationToken).ConfigureAwait(false)).Value;
+    {
+        if (IoLog.IsEnabled(Microsoft.Extensions.Logging.LogLevel.Debug))
+        {
+            Microsoft.Extensions.Logging.LoggerExtensions.LogDebug(IoLog, "adls exists {Path}", path);
+        }
+        return (await File(path).ExistsAsync(cancellationToken).ConfigureAwait(false)).Value;
+    }
 
     /// <summary>
     /// Reads a whole small file in ONE request (<c>ReadContentAsync</c>).
@@ -204,6 +236,10 @@ internal sealed class AdlsGen2TableFileSystem : ITableFileSystem
     /// </remarks>
     public async ValueTask<byte[]> ReadAllBytesAsync(string path, CancellationToken cancellationToken = default)
     {
+        if (IoLog.IsEnabled(Microsoft.Extensions.Logging.LogLevel.Debug))
+        {
+            Microsoft.Extensions.Logging.LoggerExtensions.LogDebug(IoLog, "adls read-all {Path}", path);
+        }
         var file = File(path);
         var content = await file.ReadContentAsync(cancellationToken).ConfigureAwait(false);
         return content.Value.Content.ToArray();
@@ -295,13 +331,23 @@ internal sealed class AdlsGen2TableFileSystem : ITableFileSystem
 /// <summary>Offset-addressed read handle over a OneLake file (Azure DataLake), using range GETs.</summary>
 internal sealed class OneLakeRandomAccessFile : IRandomAccessFile
 {
+    // Same per-IO Debug category as the owning filesystem: these ranged reads are how the CHECKPOINT
+    // PARQUET is consumed (engineered-wood's parquet reader over this handle), and they were the ONE
+    // uninstrumented method left when the 2026-08-16 fixture showed ~13 s between the checkpoint open and
+    // the first scan work with nothing logged in between.
+    private static readonly Microsoft.Extensions.Logging.ILogger IoLog =
+        FabricatorLog.CreateLogger("Fabricator.Adls.Fs");
+
     private readonly DataLakeFileClient _file;
     private readonly long _length;
+    private readonly bool _buffered;
+    private byte[]? _buffer; // the whole file, downloaded lazily on the first read when _buffered
 
-    public OneLakeRandomAccessFile(DataLakeFileClient file, long length)
+    public OneLakeRandomAccessFile(DataLakeFileClient file, long length, bool buffered = false)
     {
         _file = file;
         _length = length;
+        _buffered = buffered;
     }
 
     public ValueTask<long> GetLengthAsync(CancellationToken cancellationToken = default)
@@ -313,6 +359,40 @@ internal sealed class OneLakeRandomAccessFile : IRandomAccessFile
         if (range.Length == 0)
         {
             return owner;
+        }
+        if (_buffered)
+        {
+            // Small file: ONE download on the first read, every range served from memory afterwards. Lazy so
+            // an open that never reads costs nothing; benign race — two first reads download twice, last
+            // assignment wins, both correct (the file is immutable for the handle's life either way, and the
+            // consumers here are Delta log/checkpoint objects, which are never overwritten in place except
+            // _last_checkpoint — read via ReadAllBytesAsync, not this handle).
+            if (_buffer is null)
+            {
+                if (IoLog.IsEnabled(Microsoft.Extensions.Logging.LogLevel.Debug))
+                {
+                    Microsoft.Extensions.Logging.LoggerExtensions.LogDebug(
+                        IoLog, "adls read {Path} (whole file, {Len} bytes, buffered)", _file.Path, _length);
+                }
+                var whole = await _file.ReadContentAsync(cancellationToken).ConfigureAwait(false);
+                _buffer = whole.Value.Content.ToArray();
+            }
+            int n0 = (int)Math.Min(range.Length, Math.Max(0, _buffer.Length - range.Offset));
+            if (n0 > 0)
+            {
+                new ReadOnlySpan<byte>(_buffer, (int)range.Offset, n0).CopyTo(owner.Array);
+            }
+            if (n0 < range.Length)
+            {
+                throw new IOException(
+                    $"onelake buffered read: short read ({n0}/{range.Length}) at offset {range.Offset}");
+            }
+            return owner;
+        }
+        if (IoLog.IsEnabled(Microsoft.Extensions.Logging.LogLevel.Debug))
+        {
+            Microsoft.Extensions.Logging.LoggerExtensions.LogDebug(
+                IoLog, "adls read {Path} off={Off} len={Len}", _file.Path, range.Offset, range.Length);
         }
         Response<FileDownloadInfo> resp = await _file
             .ReadAsync(new DataLakeFileReadOptions { Range = new HttpRange(range.Offset, range.Length) }, cancellationToken)
