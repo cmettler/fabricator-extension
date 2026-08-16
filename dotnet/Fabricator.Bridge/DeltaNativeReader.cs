@@ -346,10 +346,39 @@ internal static class DeltaNativeReader
         /// (they are NOT temporary views — see <see cref="NextViewName"/>).</summary>
         internal IReadOnlyList<string> ViewNames { get; }
 
+        /// <summary>
+        /// The statement this plan runs: the SQL, optionally suffixed, behind a SESSION-scoped
+        /// <c>preserve_insertion_order=false</c>.
+        /// <para><b>⚠ THE SET IS WHAT MAKES THE UNION FORM VIABLE ON REMOTE STORAGE, and it is a
+        /// CORRECTNESS-NEUTRAL declaration here rather than a tuning knob.</b> This reader's contract is
+        /// already that row order across files is not preserved (DuckDB re-applies any <c>ORDER BY</c>
+        /// above the scan, and a bare <c>LIMIT</c> is only ever pushed when the spec carries NO order —
+        /// see the <c>topSuffix</c> gate), so declaring it costs nothing we were promising.</para>
+        /// <para>What it buys, MEASURED on live OneLake (frag, the minimal union through
+        /// <c>fabricator_host_query</c>, same process): <b>94.5 s → 7.5 s</b>. Mechanism, from DuckDB's
+        /// source: with the default TRUE, <c>PhysicalResultCollector::GetResultCollector</c> takes an
+        /// order-preserving branch for this plan (no <c>ORDER BY</c> ⇒ <c>INSERTION_ORDER</c> ⇒ the
+        /// setting decides, <c>plan_insert.cpp:47</c>); with FALSE it takes
+        /// <c>PhysicalBufferedCollector(parallel=true)</c> and the streaming × PhysicalUnion stall
+        /// documented on <see cref="TryUnionForm"/> does not occur.</para>
+        /// <para>⚠ <b>SESSION scope is load-bearing and was VERIFIED, not assumed</b> — the setting's
+        /// declared target is <c>GLOBAL_DEFAULT</c> (a bare <c>SET</c> would change the whole database,
+        /// including the user's own connections), but <c>SET SESSION</c> is accepted and confined: after
+        /// the inner query ran with it, the outer connection still reported <c>true</c>. Our host query
+        /// opens a FRESH connection per call, so the blast radius is exactly this statement.</para>
+        /// <para>⚠ It rides HERE, on the batched plan's own statement — deliberately NOT in
+        /// <c>MakeHostQueryStream</c>, which is shared with the USER-FACING <c>fabricator_host_query</c>
+        /// table function (whose caller's result order is theirs, not ours) and with the sort/COPY paths.
+        /// Those are unaffected in any case — an explicit <c>ORDER BY</c> yields <c>FIXED_ORDER</c>, which
+        /// short-circuits before the setting is read — but narrow is the point.</para>
+        /// </summary>
+        internal string Statement(string? suffix = null)
+            => "SET SESSION preserve_insertion_order=false; " + (suffix is null ? Sql : Sql + suffix);
+
         /// <summary>Runs this plan, binding its inputs.</summary>
         internal IArrowArrayStream Query(string? suffix = null)
         {
-            string sql = suffix is null ? Sql : Sql + suffix;
+            string sql = Statement(suffix);
             return Inputs is null ? Host.Query(sql) : Host.Query(sql, Inputs());
         }
 
@@ -585,9 +614,16 @@ internal static class DeltaNativeReader
         /// <c>EXPLAIN ANALYZE</c> of the slow shape reports <b>Total Time: 3.38 s of operator work inside
         /// a 114 s statement</b> — the missing ~110 s is spent BETWEEN tasks in the scheduler (observed
         /// both as spin, 102 s user CPU, and as idle wait, 4.5 s user, depending on the run). Locally
-        /// every op is instant so the gap never opens (0.17 s). Upstream-shaped; the full form dodges it
-        /// by being a single source operator. Until it is fixed or the host query can side-step it, the
-        /// gate stands.</para>
+        /// every op is instant so the gap never opens (0.17 s); the full form dodges it by being a single
+        /// source operator.
+        /// <b>⚠ IT IS NOW LARGELY DEFUSED by the SESSION-scoped <c>preserve_insertion_order=false</c> every
+        /// batched statement carries (see <see cref="Statement"/>)</b> — the same minimal union goes
+        /// 94.5 s → 7.5 s, and the real remote union scan 44.7 s → 13.7 s cold. <b>The gate still stands,
+        /// for a different and much smaller reason:</b> with the SET applied to BOTH forms and measured in
+        /// one window per order, the union is <b>13.7 s cold / ~1.05 s warm</b> against the full form's
+        /// <b>3.9 s cold / ~1.53 s warm</b> — the union now WINS warm but still loses cold by ~3.5x, and a
+        /// first-touch scan pays cold. So this is a ranking, no longer a pathology; revisit if the cold
+        /// residue is ever attributed (it is not the props fetches — those are zero on both forms).</para>
         /// <para><b>The LIMIT exception is measured, not hoped:</b> with a pushed bare LIMIT the union stops
         /// after a handful of opens (frag <c>LIMIT 1</c>: 10 opens, <b>3.65–3.8 s</b>) where the full form
         /// must pay BOTH O(N) sweeps before its first row — the profiled-query shape, and the reason the
@@ -1839,8 +1875,7 @@ internal static class DeltaNativeReader
                     // The batched files as ONE query, alongside (not before) the loop's — it takes a prefetch
                     // slot like any other unit of work, so a table with both kinds still overlaps them.
                     await sem.WaitAsync(ct).ConfigureAwait(false);
-                    Log.LogDebug("delta native batch: {Sql}",
-                                 topSuffix is null ? batch.Sql : batch.Sql + topSuffix);
+                    Log.LogDebug("delta native batch: {Sql}", batch.Statement(topSuffix));
                     tasks.Add(Task.Run(async () =>
                     {
                         try
