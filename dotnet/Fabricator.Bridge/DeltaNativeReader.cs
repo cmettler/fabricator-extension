@@ -593,6 +593,16 @@ internal static class DeltaNativeReader
         /// must pay BOTH O(N) sweeps before its first row — the profiled-query shape, and the reason the
         /// gate is not a flat remote refusal. Local roots take the union unconditionally (~10 ms/op there;
         /// the raw A/B and the loop-vs-union marginals both favour it).</para>
+        /// <para><b>⚠ THE PRE-UNION ROUTE IS NOT A BETTER REMOTE FALLBACK — MEASURED AND REJECTED
+        /// (2026-08-16).</b> "Plain batch + per-file loop for the DV files" (what this shipped before the
+        /// union, and the one alternative that both keeps the cheap declared-schema bind AND cannot hit the
+        /// scheduling pathology, since each of its 1+D queries has a single source) was probed by making
+        /// <see cref="TryFullForm"/> decline whenever a partial plain plan exists. Same-window A/B on frag,
+        /// BOTH orders, rowid projection as the in-process discriminator: pre-union <b>5.91 s cold</b> /
+        /// ~0.87 s warm against the full form's <b>4.71 s cold</b> / ~0.97 s warm. It is ~25% WORSE cold
+        /// (3 host queries, and D per-file footer probes serialized at prefetch=1) and indistinguishable
+        /// warm. So the remote-unlimited fallback stays the full form. ⚠ Measured on ONE shape — 200 tiny
+        /// files, D=2; a table with many DV files pays D queries here and the balance could move.</para>
         /// <para><b>Eligibility is exactly the plain form's</b> — this is only called on its PARTIAL result, so
         /// no rowid, no row tracking, no projected partition column, no id mode, every column renderable. Each
         /// DV branch additionally needs its footer probe and typed-NULL rendering to succeed; any failure
