@@ -199,7 +199,8 @@ internal static class DeltaNativeReader
         }
         // Collapse the DV-free files into ONE read_parquet([…]) where that is expressible (see BatchPlan.Build);
         // whatever is left keeps the per-file loop unchanged.
-        var batch = BatchPlan.Build(listing, dataCols, wantRowId, where, rowIdFilter, trackingFilter);
+        var batch = BatchPlan.Build(listing, dataCols, wantRowId, where, rowIdFilter, trackingFilter,
+                                    hasTop: topSuffix is not null);
         var loopFiles = batch?.LoopFiles ?? listing.Files;
         var schema = ProbeSchema(listing, userSchema, dataCols, wantRowId, batch);
         int prefetch = Prefetch();
@@ -273,16 +274,18 @@ internal static class DeltaNativeReader
     /// 2026-08-15), so this gate is UNIMPLEMENTED rather than blocked: the fix is the full form's per-file
     /// constants input joined on <c>filename</c>, brought over to this form. Until built, a projected
     /// partition column still declines here.</item>
-    /// <item><b>A per-file predicate cannot be expressed</b> — the deletion vector's prunable bound, the rowid's
-    /// position range, the row-tracking condition. Those are pruning, not correctness (DuckDB re-applies every
-    /// predicate above the scan), but forfeiting them is the opposite of the point, so a scan that has one keeps
-    /// the loop. The deletion vector is the one that is decided PER FILE — DV-carrying files go to the loop and
-    /// keep their bound while the rest batch — but ⚠ that split is the PLAIN form's, and since the preference
-    /// was reversed (2026-08-14) a mixed table normally never reaches it: the plain plan is preferred only when
-    /// it serves EVERY file, so one deletion vector sends the whole scan to <see cref="TryFullForm"/>, which
-    /// covers DV files itself and forfeits the bound for all of them. The split is reachable only when the full
-    /// form also declines. Whether that is the right call is storage-dependent and open — see
-    /// <see cref="Build"/>.</item>
+    /// <item><b>A per-file predicate cannot be expressed IN ONE SELECT</b> — the deletion vector's prunable
+    /// bound, the rowid's position range, the row-tracking condition. Those are pruning, not correctness
+    /// (DuckDB re-applies every predicate above the scan), but forfeiting them is the opposite of the point.
+    /// The deletion vector is the one decided PER FILE, and since 2026-08-16 a mixed table takes
+    /// <see cref="TryUnionForm"/>: the plain branch over the clean files <c>UNION ALL</c> one
+    /// <see cref="FileSql"/> branch per DV file, each branch KEEPING its prunable bound — a per-file predicate
+    /// is inexpressible in one SELECT and perfectly expressible in one BRANCH. ⚠ On a REMOTE root only a scan
+    /// carrying a pushed bare LIMIT takes it (a measured per-op execution anomaly of the host-query path —
+    /// TryUnionForm's remarks carry the numbers); the rowid/tracking fast-path filters stay on the loop
+    /// (excluded one gate earlier). The old behaviour — one deletion vector sending the whole scan to
+    /// <see cref="TryFullForm"/>, which forfeits the bound for every file and pays its two O(N) footer
+    /// sweeps — remains the remote-unlimited route and the fallback when a union branch cannot be built.</item>
     /// </list>
     /// <para><b>What retires case 2 (and it is a concrete upstream change, not a hope):</b> duckdb/duckdb
     /// <b>#24407</b> — "extend the <c>schema</c> option to support NESTED schema definitions", by Tishj, OPEN
@@ -348,10 +351,11 @@ internal static class DeltaNativeReader
         }
 
         /// <summary>Returns the plan, or null when this scan's shape is not expressible as one call (every
-        /// reason is a numbered case in the class remarks).</summary>
+        /// reason is a numbered case in the class remarks). <paramref name="hasTop"/> = a bare LIMIT was
+        /// pushed (consumed by the union form's remote gate — see <see cref="TryUnionForm"/>).</summary>
         internal static BatchPlan? Build(
             DeltaReader.NativeScanList listing, IReadOnlyList<string> dataCols, bool wantRowId, string? where,
-            DeltaRowIdFilter? rowIdFilter, DeltaRowTrackingFilter? trackingFilter)
+            DeltaRowIdFilter? rowIdFilter, DeltaRowTrackingFilter? trackingFilter, bool hasTop = false)
         {
             int min = MinFiles();
             if (min == 0 || listing.Files.Count == 0)
@@ -383,21 +387,31 @@ internal static class DeltaNativeReader
             // form was the one tried first, and it SUCCEEDS on the commonest shape (a plain projection over
             // DV-free files with no rowid), so the cheap form was unreachable exactly where it wins most.
             var plain = TryPlainForm(listing, dataCols, wantRowId, wantsTracking, where, min);
-            if (plain is not null && plain.LoopFiles.Count == 0)
+            if (plain is not null)
             {
-                return plain;
+                if (plain.LoopFiles.Count == 0)
+                {
+                    return plain;
+                }
+                // THE MIXED CASE (some files DV-carrying): the plain form serves the clean files and its
+                // LoopFiles are EXACTLY the DV files (TryPlainForm splits on nothing else), so compose ONE
+                // query — the plain branch UNION ALL one FileSql branch per DV file. Each DV branch pays one
+                // footer probe (D of them, against the full form's TWO O(N) footer sweeps), and it RESTORES
+                // the deletion vector's prunable bound, which the full form structurally forfeits (one WHERE
+                // cannot carry a per-file range, but one BRANCH can). ⚠ REMOTELY it is gated — see
+                // TryUnionForm's remarks for the measured execution anomaly that forces that.
+                var mixed = TryUnionForm(plain, listing, dataCols, where, hasTop);
+                if (mixed is not null)
+                {
+                    return mixed;
+                }
             }
             if (listing.Files.Count >= min)
             {
                 // The FULL form: `union_by_name` + `filename`/`file_row_number`, so the rowid, the deletion
                 // vectors, the partition values and row tracking all fit in ONE call covering EVERY file.
-                // Reached when the plain form declined outright, or when it would serve only PART of the scan.
-                // ⚠ THE MIXED CASE (some files DV-carrying) DELIBERATELY KEEPS THIS FORM, and the reason is that
-                // the answer is STORAGE-DEPENDENT and unmeasured. Remotely, looping D DV files costs ~D x 230 ms
-                // (each looped file pays ResolveFileMapping, a footer read) against the full form's 2 x N x
-                // 230 ms, so plain wins for any D < 2N — i.e. always. LOCALLY a footer is ~free and the loop's
-                // ~1.9 ms/file host-query overhead dominates, so the single call wins. Do not generalise the
-                // remote numbers into this case without measuring it.
+                // Reached when the plain form declined outright (rowid / row tracking / a projected partition
+                // column), or when a mixed table's union branch could not be built.
                 var full = TryFullForm(listing, dataCols, wantRowId, where);
                 if (full is not null)
                 {
@@ -413,8 +427,9 @@ internal static class DeltaNativeReader
         /// The PLAIN single-call form: <c>read_parquet([DV-free files], schema = map {&lt;physical name&gt;: …})</c>.
         /// Declares the schema rather than discovering it, so it reads NO parquet footer at bind — the property
         /// that makes it 42x cheaper to probe than <see cref="TryFullForm"/> on remote storage (0.49 s vs 20.66 s
-        /// over 89 files). It is PARTIAL BY DESIGN: DV-carrying files go to the loop and keep their prunable
-        /// bound, so a merge-heavy table still collapses its clean files.
+        /// over 89 files). It is PARTIAL BY DESIGN: DV-carrying files land in <c>LoopFiles</c>, which
+        /// <see cref="Build"/> first offers to <see cref="TryUnionForm"/> (one query, per-DV-file branches
+        /// keeping their prunable bound) and only failing that leaves on the per-file loop.
         /// <para>Cannot express anything needing a row POSITION — the transient rowid, a deletion vector, the
         /// derived row-tracking ids — because those need <c>file_row_number</c>, which a VARCHAR-keyed map
         /// refuses (case 1 in the class remarks). Nor a PROJECTED partition column: <c>schema</c> is refused
@@ -525,6 +540,118 @@ internal static class DeltaNativeReader
                 sb.Append(" WHERE ").Append(where);
             }
             return new BatchPlan(sb.ToString(), batchFiles, loopFiles);
+        }
+
+        /// <summary>
+        /// The UNION form for a MIXED table: the partial plain plan's own SQL over the clean files,
+        /// <c>UNION ALL</c> one per-file branch (the loop's <see cref="FileSql"/>, verbatim machinery) for each
+        /// deletion-vector file — ONE query covering everything, with no <c>union_by_name</c> and no
+        /// <c>PresentNames</c> sweep.
+        /// <para><b>Why it beats both alternatives it replaced.</b> Against the FULL form: that one pays TWO
+        /// O(N) parquet-footer sweeps at bind (PresentNames + the <c>LIMIT 0</c> probe — 41 s cold on 89 remote
+        /// files) where this pays exactly D single-file footer probes (D = DV files, normally a handful from
+        /// recent DML), and it FORFEITS the deletion vector's prunable bound where a per-file BRANCH keeps it
+        /// (<see cref="DvRangeCondition"/>). Against the plain+loop split: one host query instead of 1+D (the
+        /// union's measured marginal cost is ~0.4 ms/branch against the loop's ~1.9 ms/file), and one
+        /// <c>LIMIT</c>/early-stop boundary instead of D+1.</para>
+        /// <para><b>⚠ ON A REMOTE ROOT IT IS GATED to scans carrying a pushed bare LIMIT — because of a
+        /// measured EXECUTION anomaly of our own path, not of the form.</b> Live A/B on OneLake
+        /// <c>lake.dbo.frag</c> (200 files, 2 DV), same minutes, all through the extension: union full-scan
+        /// <b>120.4 s</b> (cold; 85.1 s cache-warm) against the full form's <b>17.7 s</b> — while the
+        /// BYTE-EQUIVALENT plain-branch SQL pasted RAW into duckdb.exe runs in <b>6.3 s</b>. The per-IO
+        /// instruments attribute it exactly: per-file opens at EXECUTION through a host query cost
+        /// ~120–212 ms each, SERIAL (fablog gap analysis: 808 evenly spaced ops ≈ the whole 110 s window),
+        /// where the full form's ops cost ~29 ms — same VFS, same op class. The plain/union form defers all
+        /// per-file IO to execution and so eats that per-op cost N times; the full form pays its footers at
+        /// bind on a cheaper path and its execution reads land in DuckDB's ExternalFileCache. The anomaly is
+        /// the same lead CLAUDE.md records as the 180 ms-vs-3 ms SDK asymmetry (measure-first item of the
+        /// HTTP-shim ladder); when it is fixed, this gate should fall.</para>
+        /// <para><b>The LIMIT exception is measured, not hoped:</b> with a pushed bare LIMIT the union stops
+        /// after a handful of opens (frag <c>LIMIT 1</c>: 10 opens, <b>3.65 s</b>) where the full form must
+        /// pay BOTH O(N) sweeps before its first row — the profiled-query shape, and the reason the gate is
+        /// not a flat remote refusal. Local roots take the union unconditionally (~10 ms/op there; the raw
+        /// A/B and the loop-vs-union marginals both favour it).</para>
+        /// <para><b>Eligibility is exactly the plain form's</b> — this is only called on its PARTIAL result, so
+        /// no rowid, no row tracking, no projected partition column, no id mode, every column renderable. Each
+        /// DV branch additionally needs its footer probe and typed-NULL rendering to succeed; any failure
+        /// falls back to <see cref="TryFullForm"/> (the pre-2026-08-16 route), never to a worse answer.</para>
+        /// <para><b>The struct-interior union hazard does NOT apply here</b> (the one
+        /// <see cref="FullTableSql"/> documents): every branch projects LOGICAL names — the plain branch via
+        /// the map's <c>'name'</c> rename + <see cref="LogicalStructExpr"/>, the DV branches via FileSql's
+        /// aliases + RebuildExpr — so the branches agree on names at every level BY CONSTRUCTION, and in name
+        /// mode physical names are file-independent so the rebuilt interiors agree too.</para>
+        /// <para><b>Deletion vectors cross ONCE:</b> vectors above <see cref="DvLiteralMax"/> ride a single
+        /// shared <c>(fn, pos)</c> input (<see cref="FileDvStream"/> over just those files) wrapped in a
+        /// <c>WITH __fab_d AS MATERIALIZED</c> CTE — materialization is what makes several branches scanning
+        /// one single-use stream sound (each branch anti-joins its own filename slice, the fn a LITERAL since
+        /// a branch knows its file, so no <c>filename => true</c> is needed). Small vectors stay inline
+        /// literals and never touch the CTE. ⚠ Both CTE columns are read by every referencing branch
+        /// (<c>fn</c> in the literal comparison, <c>pos</c> in the anti-join), which is the bound-input
+        /// non-prefix-projection invariant (docs/duckdb-upstream-issues.md §2).</para>
+        /// </summary>
+        private static BatchPlan? TryUnionForm(
+            BatchPlan plain, DeltaReader.NativeScanList listing, IReadOnlyList<string> dataCols, string? where,
+            bool hasTop)
+        {
+            // The remote gate (see remarks). A scheme separator marks a remote root (onelake://, s3://,
+            // abfss://, …); a local path (drive letter or /) has none.
+            if (!hasTop && listing.Files[0].Uri.Contains("://", StringComparison.Ordinal))
+            {
+                return null;
+            }
+            var dvFiles = plain.LoopFiles;
+            var boundFiles = new List<DeltaReader.NativeScanFile>();
+            foreach (var f in dvFiles)
+            {
+                if (BindDv(f.Dv))
+                {
+                    boundFiles.Add(f);
+                }
+            }
+            string dvView = NextViewName(DvViewName);
+            var sb = new StringBuilder();
+            if (boundFiles.Count > 0)
+            {
+                sb.Append($"WITH __fab_d AS MATERIALIZED (SELECT * FROM {Quote(dvView)}) ");
+            }
+            sb.Append(plain.Sql);
+            foreach (var f in dvFiles)
+            {
+                string branch;
+                try
+                {
+                    // The footer probe (presence/stored names for THIS file) — the D-probes cost stated in the
+                    // remarks. Skipped for the zero-column (COUNT(*)) shape: FileSql dereferences the mapping
+                    // only per data column, and probing D footers to count rows would be the full form's
+                    // mistake in miniature.
+                    var fm = dataCols.Count == 0 ? default : ResolveFileMapping(listing, f.Uri);
+                    branch = FileSql(dataCols, wantRowId: false, where, f, fm, listing.TableSchema,
+                                     listing.PartitionColumns,
+                                     dvView: BindDv(f.Dv) ? "__fab_d" : null, dvFn: f.Uri);
+                }
+                catch (Exception ex)
+                {
+                    // A failed probe or an unrenderable typed-NULL backfill: decline the whole form (the
+                    // PresentNames precedent — never guess at presence) and let Build fall back to the full
+                    // form, whose own machinery answers or declines for itself.
+                    Log.LogDebug("delta native union form declined at {Uri}: {Msg}", f.Uri, ex.Message);
+                    return null;
+                }
+                sb.Append(" UNION ALL ").Append(branch);
+            }
+            Func<IReadOnlyList<(string, IArrowArrayStream)>>? inputs = null;
+            IReadOnlyList<string>? viewNames = null;
+            if (boundFiles.Count > 0)
+            {
+                var bound = boundFiles;
+                inputs = () => new (string, IArrowArrayStream)[]
+                {
+                    (dvView, new SingleScanArrowStream(FileDvStream(bound), dvView)),
+                };
+                viewNames = new[] { dvView };
+            }
+            return new BatchPlan(sb.ToString(), listing.Files,
+                                 System.Array.Empty<DeltaReader.NativeScanFile>(), inputs, viewNames);
         }
 
         /// <summary>
@@ -1183,13 +1310,17 @@ internal static class DeltaNativeReader
     /// null to always inline them as literals. See <see cref="DvCondition"/> — a caller that passes a name
     /// MUST bind that input whenever <see cref="BindDv"/> is true for the file, and the two decisions read
     /// the same predicate so they cannot drift.</param>
+    /// <param name="dvFn">Set (to this file's URI) when <paramref name="dvView"/> names a SHARED
+    /// <c>(fn, pos)</c> input rather than a per-file positions one — the union form, where several branches
+    /// of ONE query each anti-join their own filename slice.</param>
     private static string FileSql(IReadOnlyList<string> dataCols, bool wantRowId, string? where,
                                   DeltaReader.NativeScanFile f, FileMapping fm,
                                   DeltaSchema.StructType? tableSchema,
                                   IReadOnlyList<string>? partitionCols = null,
                                   string? rowIdCond = null,
                                   string? innerCond = null,
-                                  string? dvView = null)
+                                  string? dvView = null,
+                                  string? dvFn = null)
     {
         // Per-column projection over THIS file's actual layout:
         //   • column mapping: alias the stored PHYSICAL name to the logical one; a mapped STRUCT whose shape
@@ -1304,7 +1435,7 @@ internal static class DeltaNativeReader
         }
         if (f.Dv.Length > 0)
         {
-            conds.Add(DvCondition(f.Dv, dvView));
+            conds.Add(DvCondition(f.Dv, dvView, dvFn));
             // ...plus a PRUNABLE bound on the same vector. Exactness comes from the condition above; this
             // conjunct exists purely so DuckDB's parquet reader can skip whole row groups (see
             // DvRangeCondition).
@@ -1406,10 +1537,16 @@ internal static class DeltaNativeReader
     private static bool BindDv(long[] dv) => dv.Length > DvLiteralMax;
 
     /// <summary>The DV exclusion predicate: an anti-join against the bound input for a large vector, else the
-    /// inline literal list.</summary>
-    private static string DvCondition(long[] dv, string? dvView) =>
+    /// inline literal list. <paramref name="dvFn"/> selects the input's SHAPE: null means a per-file input
+    /// carrying positions only (the loop's <see cref="DvStream"/>, one query per file so no discrimination is
+    /// needed); a file URI means a SHARED <c>(fn, pos)</c> input (<see cref="FileDvStream"/>) that several
+    /// branches of ONE query slice by filename — the union form, where each branch knows its own file as a
+    /// literal so no <c>filename => true</c> virtual column is needed.</summary>
+    private static string DvCondition(long[] dv, string? dvView, string? dvFn = null) =>
         dvView is not null && BindDv(dv)
-            ? $"NOT EXISTS (SELECT 1 FROM {dvView} d WHERE d.pos = file_row_number)"
+            ? dvFn is null
+                ? $"NOT EXISTS (SELECT 1 FROM {dvView} d WHERE d.pos = file_row_number)"
+                : $"NOT EXISTS (SELECT 1 FROM {dvView} d WHERE d.fn = '{dvFn.Replace("'", "''")}' AND d.pos = file_row_number)"
             : $"file_row_number NOT IN ({string.Join(",", dv.Select(p => p.ToString(CultureInfo.InvariantCulture)))})";
 
     /// <summary>

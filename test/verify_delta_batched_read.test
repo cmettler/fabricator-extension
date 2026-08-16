@@ -7,10 +7,11 @@
 #              answers the batch must reproduce (schema evolution, name-mode column mapping incl. a RENAMEd NESTED
 #              field, a pushed struct-member predicate, COUNT(*)) AND that every gated shape still works: deletion
 #              vectors, the transient rowid / DML, partition columns, row-tracking virtual columns, id-mode mapping.
-#              §10 pins WHICH of the two batched forms a scan takes — the only thing a suite can assert there,
-#              since both forms are correct and a row assertion would pass either way. It matters because the
-#              plain (`schema` map) form declares its schema and opens NO parquet footer while the full
-#              (`union_by_name`) form opens one per file: 0.5 s vs 34 s on a live 89-file Fabric table.
+#              §10 pins WHICH of the three batched forms a scan takes — the only thing a suite can assert there,
+#              since all forms are correct and a row assertion would pass either way. It matters because the
+#              plain (`schema` map) form declares its schema and opens NO parquet footer, the UNION form (mixed
+#              tables: the plain branch UNION ALL per-DV-file branches) opens exactly D, and the full
+#              (`union_by_name`) form opens one per file TWICE: 0.5 s vs 34 s on a live 89-file Fabric table.
 #              Set FABRICATOR_DELTA_WRITE_DIR. Local FS.
 # group: [fabricator]
 
@@ -172,11 +173,12 @@ SELECT id FROM nm.main.nested WHERE (s).renamed = 31;
 3
 
 # ============================================================================
-# 4. DELETION VECTORS — batched: every file's vector crosses as ONE bound (filename, pos)
-#    input, excluded by a single anti-join inside the one query. If that input were lost,
-#    or scanned twice (it is single-use), the deleted rows would come back, so this is the
-#    section that catches it. The plain fallback form instead SPLITS DV files off to the
-#    per-file loop, and this section covers that route too.
+# 4. DELETION VECTORS — batched. A mixed table takes the UNION form (2026-08-16): the plain
+#    branch over the clean files UNION ALL one branch per DV file, small vectors inline, large
+#    ones anti-joined against ONE shared bound (fn, pos) input through a MATERIALIZED CTE. The
+#    rowid/full form still crosses every vector as one bound input too. If either input were
+#    lost, or scanned twice (it is single-use), the deleted rows would come back, so this is
+#    the section that catches the resurrection whichever form routes.
 # ============================================================================
 
 statement ok
@@ -609,8 +611,9 @@ statement ok
 INSERT INTO b.main.route_plain SELECT i::BIGINT, ('r' || i)::VARCHAR FROM range(100, 150) r(i);
 
 # A DV-carrying table: three files, then a DELETE touching rows of ONE of them. The plain form can serve
-# the two clean files only, so this is the MIXED case — which deliberately keeps the full form, since
-# whether looping D files beats one call over N is storage-dependent and unmeasured.
+# the two clean files only, so this is the MIXED case — since 2026-08-16 it takes the UNION form: the
+# plain `schema = map` branch over the clean files UNION ALL one per-file branch per DV file, each branch
+# keeping its prunable DV bound. One query, no `union_by_name`, no O(N) footer sweep.
 statement ok
 CREATE TABLE b.main.route_dv AS SELECT i::BIGINT AS id, ('r' || i)::VARCHAR AS s FROM range(50) r(i);
 
@@ -659,9 +662,13 @@ WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native batch%'
 ----
 0
 
-# 10b. THE POSITIVE CONTROL, and it is the load-bearing half: a deletion vector still routes to the full
-#      form. Without it, "route_plain took the plain form" would pass just as well if the full form had
-#      stopped being reachable at all — i.e. if the batch had silently become plain-or-nothing.
+# 10b. THE MIXED (DV) CASE TAKES THE UNION FORM (2026-08-16): `schema = map` for the clean files plus
+#      ` UNION ALL ` per-DV-file branches, in ONE query, keeping every branch's prunable DV bound where
+#      the full form forfeits it. ⚠ LOCAL ROOTS ONLY (this suite is local FS, so the union fires here);
+#      on a remote root the union is gated to pushed-bare-LIMIT scans, because per-file EXECUTION opens
+#      through a host query measured 120-212 ms each SERIAL against the full form's ~29 ms — a 120.4 s vs
+#      17.7 s full-scan A/B on the OneLake frag fixture, while the identical SQL runs RAW in 6.3 s. The
+#      anomaly is the extension's execution path, not the form; TryUnionForm's remarks carry the record.
 query II
 SELECT count(*), sum(id) FROM b.main.route_dv;
 ----
@@ -670,7 +677,116 @@ SELECT count(*), sum(id) FROM b.main.route_dv;
 query I
 SELECT count(*) > 0 FROM duckdb_logs
 WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native batch%'
+  AND message LIKE '%route_dv%' AND message LIKE '%schema = map%' AND message LIKE '% UNION ALL %';
+----
+true
+
+# ...and NOT the full form. This is the assertion the reversed-preference mutant dies at — a plan that
+# still sent one deletion vector's whole scan to `union_by_name` would pass every row assertion above.
+query I
+SELECT count(*) FROM duckdb_logs
+WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native batch%'
   AND message LIKE '%route_dv%' AND message LIKE '%union_by_name%';
+----
+0
+
+# The DV branch keeps its PRUNABLE BOUND — the thing the full form structurally forfeits (one WHERE
+# cannot carry a per-file range; one branch can). The 10,11,12 delete leaves no leading/trailing dense
+# run, so make one: delete a PREFIX of the first file, and the branch must carry file_row_number >= …
+# alongside the exact exclusion. Only the generated SQL can witness this — the rows are identical
+# either way, which is the whole reason DvRangeCondition's own doc says "read the plan, do not re-time".
+statement ok
+DELETE FROM b.main.route_dv WHERE id < 8;
+
+query II
+SELECT count(*), sum(id) FROM b.main.route_dv;
+----
+139	11114
+
+query I
+SELECT count(*) > 0 FROM duckdb_logs
+WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native batch%'
+  AND message LIKE '%route_dv%' AND message LIKE '% UNION ALL %'
+  AND message LIKE '%file_row_number >= 8%';
+----
+true
+
+# That second DELETE made the vector 11 positions (0..7 + 10,11,12), past the DvLiteralMax inline
+# boundary — so the branch anti-joins the shared bound (fn, pos) input through the MATERIALIZED
+# __fab_d CTE, sliced by its own filename LITERAL (no filename => true needed: a branch knows its file).
+query I
+SELECT count(*) > 0 FROM duckdb_logs
+WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native batch%'
+  AND message LIKE '%route_dv%' AND message LIKE '%__fab_d AS MATERIALIZED%'
+  AND message LIKE '%d.fn = %' AND message LIKE '%d.pos = file_row_number%';
+----
+true
+
+# The bound input's view was dropped after the drain — the union form registers a catalog-level
+# (non-temporary) view exactly like the full form, so a leak here would outlive the connection.
+query I
+SELECT count(*) FROM duckdb_views() WHERE view_name LIKE '\_\_fab%' ESCAPE '\';
+----
+0
+
+# THE FULL FORM'S OWN POSITIVE CONTROL: it must still be reachable, or every plain/union assertion
+# above would pass equally if the batch had silently become plain-or-nothing. A projected ROWID is a
+# shape neither the plain nor the union form serves (file_row_number under a name-keyed map), so it
+# routes to `union_by_name` — on this very table, so the pattern filters stay honest.
+query III
+SELECT count(*), max(id), min(rowid) >= 0 FROM b.main.route_dv;
+----
+139	149	true
+
+query I
+SELECT count(*) > 0 FROM duckdb_logs
+WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native batch%'
+  AND message LIKE '%route_dv%' AND message LIKE '%union_by_name%';
+----
+true
+
+# TWO bound-DV files, DIFFERENT dead positions — the shape that kills a branch anti-joining the shared
+# (fn, pos) input WITHOUT its filename slice: an unsliced branch excludes the OTHER file's positions
+# too, so file 1's live ids 10..15 (file 2's dead positions) and file 2's live ids 50..57 (file 1's
+# dead positions) would vanish. Only exact values catch that; the routing assertions cannot.
+# ⚠ Its OWN 4-file table (2 clean survive), NOT route_dv — a third DV file there would leave one clean
+# file and re-route the scan to the full form at the shipped MIN_FILES default of 2, making everything
+# after it assert the wrong form. This suite runs at BOTH thresholds; 2 clean files union under both.
+# ⚠ Named rdvx, not route_dv2: the §10b/§11 log patterns match '%route_dv%' by substring.
+statement ok
+CREATE TABLE b.main.rdvx AS SELECT i::BIGINT AS id FROM range(50) r(i);
+
+statement ok
+INSERT INTO b.main.rdvx SELECT i::BIGINT FROM range(50, 100) r(i);
+
+statement ok
+INSERT INTO b.main.rdvx SELECT i::BIGINT FROM range(100, 150) r(i);
+
+statement ok
+INSERT INTO b.main.rdvx SELECT i::BIGINT FROM range(150, 200) r(i);
+
+statement ok
+DELETE FROM b.main.rdvx WHERE id < 8;
+
+statement ok
+DELETE FROM b.main.rdvx WHERE id BETWEEN 60 AND 65;
+
+query II
+SELECT count(*), sum(id) FROM b.main.rdvx;
+----
+186	19497
+
+# The rows an unsliced branch would wrongly exclude, plus the union routing as the positive control
+# that this section exercised the mechanism it claims to.
+query I
+SELECT count(*) FROM b.main.rdvx WHERE id IN (10, 11, 12, 13, 14, 15, 50, 51, 52, 53);
+----
+10
+
+query I
+SELECT count(*) > 0 FROM duckdb_logs
+WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native batch%'
+  AND message LIKE '%rdvx%' AND message LIKE '% UNION ALL %' AND message LIKE '%__fab_d AS MATERIALIZED%';
 ----
 true
 
@@ -766,7 +882,8 @@ WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native scan%'
 ----
 true
 
-# 11b. Full form carries it too (the DV anti-join query, union_by_name).
+# 11b. The UNION form carries it too — appended AFTER the last branch, so it limits the WHOLE union,
+#      not one branch (a per-branch cap would also be superset-safe, but whole-union is exact).
 query I
 SELECT id IS NOT NULL FROM b.main.route_dv LIMIT 5;
 ----
@@ -775,6 +892,24 @@ true
 true
 true
 true
+
+query I
+SELECT count(*) > 0 FROM duckdb_logs
+WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native batch%'
+  AND message LIKE '%route_dv%' AND message LIKE '% UNION ALL %' AND message LIKE '%LIMIT 5%';
+----
+true
+
+# ...and the FULL form (union_by_name) as well, reached via a projected rowid beside a data column
+# (probed: cols=[rowid,id] top=5 routes there; a rowid-ONLY projection would loop instead).
+query II
+SELECT r >= 0, id IS NOT NULL FROM (SELECT rowid AS r, id FROM b.main.route_dv LIMIT 5) t;
+----
+true	true
+true	true
+true	true
+true	true
+true	true
 
 query I
 SELECT count(*) > 0 FROM duckdb_logs
