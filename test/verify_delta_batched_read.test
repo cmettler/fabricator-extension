@@ -1167,5 +1167,107 @@ WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native scan%'
 ----
 true
 
+# ============================================================================
+# 13. THE PRESENCE PROBE ASKS ONE FILE (2026-08-17). The FULL form must know which stored names exist in
+#     SOME file, because `union_by_name` can only produce a column at least one file carries. That was a
+#     `parquet_schema([EVERY file])`, i.e. an O(files) FOOTER sweep — MEASURED 20.50 s over 89 remote files
+#     at ~230 ms each, and the larger half of that form's bind cost. But "is this name present" is answered
+#     the moment ONE file has it, so the newest file is probed first and the sweep runs only when that file
+#     does not carry everything the caller will look up. Correctness cannot turn on the guess: a name found
+#     in one file IS present, and anything else falls back.
+#     ⚠ The routing is invisible in the ROWS by construction — both paths compute the same presence set, so
+#     an answer assertion cannot distinguish them. The observable is the Debug line, which carries the
+#     probed file's URI precisely so a gate can scope it to a table.
+# ============================================================================
+
+# 13a. Uniform schema across 3 files: the newest carries everything, so one file answers.
+#      ⚠ TWO shape requirements, and BOTH were found by the section failing against them. The rowid must be
+#      PROJECTED but never FILTERED — a rowid predicate makes BatchPlan decline both batch forms and loop.
+#      And a DATA column must be genuinely USED (`sum(id)`), because a rowid-only projection is the
+#      count-via-rowid plan (`cols=[] rowid=True`), which the full form declines outright — written without
+#      it this asserted a presence probe that never ran.
+query III
+SELECT count(*), count(DISTINCT r), sum(id) FROM (SELECT rowid AS r, id FROM b.main.route_plain) t;
+----
+150	150	11175
+
+query I
+SELECT count(*) > 0 FROM duckdb_logs
+WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native present%'
+  AND message LIKE '%route_plain%' AND message LIKE '%one file of 3 answered%';
+----
+true
+
+# 13b. A column ADDED after every existing file was written: no file carries it, so the newest cannot
+#      answer and the sweep runs. The column still reads as a typed NULL — the backfill union_by_name needs.
+statement ok
+CREATE TABLE b.main.pnadd AS SELECT i::BIGINT AS id FROM range(20) r(i);
+
+statement ok
+INSERT INTO b.main.pnadd SELECT i::BIGINT FROM range(20, 40) r(i);
+
+statement ok
+ALTER TABLE b.main.pnadd ADD COLUMN extra BIGINT;
+
+query III
+SELECT count(*), count(extra), count(DISTINCT r) FROM (SELECT rowid AS r, id, extra FROM b.main.pnadd) t;
+----
+40	0	40
+
+query I
+SELECT count(*) > 0 FROM duckdb_logs
+WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native present%'
+  AND message LIKE '%pnadd%' AND message LIKE '%full sweep%';
+----
+true
+
+# 13c. ⚠ THE SECTION THAT MAKES THE FAST PATH SAFE, and the only one whose failure is a WRONG ANSWER rather
+#      than a slower one. The full form has TWO consumers of the presence set: the data columns above, and
+#      the row-tracking COALESCE — `present` decides whether a materialized __delta_row_id is READ or a new
+#      id is DERIVED from baseRowId + file_row_number. A materialized column is written by a REWRITE and not
+#      by a plain append, so on a table like this one it lives in SOME file and not others; answering
+#      "absent" from one file that lacks it silently derives new ids for rows that already have real ones.
+#      So a scan projecting a row-tracking column DECLINES the fast path outright and sweeps.
+#      MEASURED with a one-file answer allowed here: the 5 rewritten rows came back as ids
+#      [20, 21, 22, 23, 24] instead of their original [0, 1, 2, 3, 4], range 0..34 -> 5..34.
+#      ⚠ The whole table still had 30 rows and 30 DISTINCT non-null ids under that mutant — distinctness is
+#      NOT what row tracking promises, so a count/distinct assertion passes straight through the bug. Only a
+#      rewritten row's id STABILITY catches it, which is why the second query below exists.
+#      ⚠ THE ROUTING ASSERTION IS WHY THE RULE IS "DECLINE" RATHER THAN "QUERY THE TRACKING NAMES TOO". The
+#      latter is equally SOUND, but it leaves the routing to depend on which file holds the highest ordinal —
+#      engineered-wood's active-file order, NOT commit recency — and that was MEASURED to differ between
+#      sessions on this very fixture (swept once, fast-pathed the next). Declining makes both the behaviour
+#      and this gate deterministic; the cost is nil, since the full form's usual callers (rowid/DML,
+#      deletion vectors, partitions) project no tracking column at all.
+#      ⚠ §6b does NOT cover this: its UPDATE is the LAST write there, so whichever file answers carries the
+#      materialized column anyway.
+statement ok
+CREATE TABLE b.main.trkmix AS SELECT i::BIGINT AS id, i::BIGINT AS v FROM range(20) r(i);
+
+statement ok
+UPDATE b.main.trkmix SET v = v + 1000 WHERE id < 5;
+
+statement ok
+INSERT INTO b.main.trkmix SELECT i::BIGINT, i::BIGINT FROM range(20, 30) r(i);
+
+query III
+SELECT count(*), count(DISTINCT __delta_row_id), count(*) FILTER (WHERE __delta_row_id IS NULL)
+FROM b.main.trkmix;
+----
+30	30	0
+
+# THE KILL: the five rewritten rows keep the ids they were born with.
+query III
+SELECT count(*), min(__delta_row_id), max(__delta_row_id) FROM b.main.trkmix WHERE v >= 1000;
+----
+5	0	4
+
+query I
+SELECT count(*) > 0 FROM duckdb_logs
+WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native present%'
+  AND message LIKE '%trkmix%' AND message LIKE '%full sweep%';
+----
+true
+
 statement ok
 CALL disable_logging();

@@ -995,8 +995,35 @@ internal static class DeltaNativeReader
             // is how `WHERE extra IS NULL` broke on a table whose other six files predate `extra`. So the
             // columns present across the LIST are resolved up front and the rest become typed NULLs — the
             // backfill the `schema` map's default_value would have given. parquet_schema takes the whole list, so
-            // this is one query per scan, never one per file.
-            var present = PresentNames(files);
+            // this is one query per scan, never one per file — and since 2026-08-17 usually over ONE file, see
+            // PresentNames.
+            // ⚠ `present` HAS TWO CONSUMERS, and the second is read 50 lines further down: it decides the
+            // data columns' NULL-backfill here AND whether a materialized row-tracking column gets its
+            // COALESCE below. A materialized column is written by a REWRITE and not by a plain append, so on
+            // a row-tracking table it routinely lives in SOME file and not others — and reading it as absent
+            // silently derives new row ids for rows that already have materialized ones, i.e. a rewritten row
+            // loses the identity row tracking exists to preserve (MEASURED: ids [20,21,22,23,24] where
+            // [0,1,2,3,4] belong).
+            //
+            // A one-file probe cannot be trusted to settle that, so when a row-tracking virtual column is
+            // projected the fast path is DECLINED OUTRIGHT (null `queried` = sweep). Passing the tracking
+            // names in `queried` instead would also be SOUND — the early exit requires every queried name to
+            // be present — but it would make the routing depend on WHICH file happens to hold the highest
+            // ordinal, which is engineered-wood's active-file order and not commit recency. That is
+            // unpredictable in exactly the case where being wrong is a wrong ANSWER, and it makes the
+            // behaviour untestable: the same fixture swept in one session and took the fast path in another.
+            // The cost is nil in practice — the full form's common users are the rowid/DML, deletion-vector
+            // and partition shapes, none of which project a tracking column.
+            List<string>? queried = null;
+            if (trackingCols.Count == 0)
+            {
+                queried = new List<string>(wanted.Count);
+                foreach (var w in wanted)
+                {
+                    queried.Add(w.Stored);
+                }
+            }
+            var present = PresentNames(files, queried);
             if (present is null)
             {
                 return null;
@@ -1153,9 +1180,78 @@ internal static class DeltaNativeReader
     internal const string MetaViewName = "__fab_files";
 
 
-    // The set of stored column names present in AT LEAST ONE of these files, from a single parquet_schema over
-    // the whole list. Null when the query fails (fall back rather than guess at presence).
-    private static HashSet<string>? PresentNames(IReadOnlyList<DeltaReader.NativeScanFile> files)
+    /// <summary>
+    /// The set of stored column names present in AT LEAST ONE of these files — the question
+    /// <c>union_by_name</c> forces, since it can only produce a column SOME file in the list carries.
+    /// Null when the query fails (fall back rather than guess at presence).
+    ///
+    /// <para><b>It asks ONE file first.</b> A full <c>parquet_schema([every file])</c> reads every FOOTER,
+    /// which on remote storage is the dominant cost of building the full form — MEASURED 20.50 s over 89
+    /// remote files at ~230 ms each. But the caller only ever asks "is this name present", and a name found
+    /// in one file is present, full stop. So probing the single newest file answers the whole question
+    /// whenever that file carries every name the caller will look up; otherwise the full sweep runs and
+    /// nothing is lost but one small probe.</para>
+    ///
+    /// <para><b>⚠ `queried` MUST list every name the caller will look up, and getting that wrong is a SILENT
+    /// WRONG ANSWER rather than a missed optimization.</b> The early exit is sound only because a name IN the
+    /// one-file set is guaranteed present in the full set too; a name ABSENT from it proves nothing. So if a
+    /// caller later consults a name that was not in `queried`, this can answer "absent" where the sweep would
+    /// have said "present". <b>Pass <c>null</c> to decline the fast path entirely</b> — which is what a
+    /// caller should do rather than reason its way to a list it is not sure is complete.</para>
+    ///
+    /// <para>⚠ "Newest" is the highest <c>Ordinal</c>, which is engineered-wood's active-file ordering and
+    /// NOT a guaranteed recency order — MEASURED: the same three-file fixture put the rewritten file last in
+    /// one session and the appended file last in another. That is fine for a HIT RATE (it is still the right
+    /// thing to guess at: files differ in schema exactly when a column was ADDED, and the files carrying an
+    /// added column are the later ones) and is precisely why the decision must never be load-bearing for an
+    /// ANSWER — see the caller's row-tracking note.</para>
+    /// </summary>
+    private static HashSet<string>? PresentNames(
+        IReadOnlyList<DeltaReader.NativeScanFile> files, IReadOnlyList<string>? queried)
+    {
+        if (queried is not null && files.Count > 1)
+        {
+            var newest = files[0];
+            for (int i = 1; i < files.Count; i++)
+            {
+                if (files[i].Ordinal > newest.Ordinal)
+                {
+                    newest = files[i];
+                }
+            }
+            var one = QueryPresentNames(new[] { newest });
+            if (one is not null && AllPresent(queried, one))
+            {
+                // The URI is what makes this line SCOPEABLE from a gate — it carries the table folder, and
+                // nothing else in the message identifies which scan decided what.
+                Log.LogDebug("delta native present: one file of {Count} answered {Names} names ({Uri})",
+                             files.Count, queried.Count, newest.Uri);
+                return one;
+            }
+            Log.LogDebug("delta native present: full sweep of {Count} files ({Uri})", files.Count, newest.Uri);
+            return QueryPresentNames(files);
+        }
+        if (files.Count > 1)
+        {
+            Log.LogDebug("delta native present: full sweep of {Count} files ({Uri})", files.Count, files[0].Uri);
+        }
+        return QueryPresentNames(files);
+    }
+
+    private static bool AllPresent(IReadOnlyList<string> queried, HashSet<string> present)
+    {
+        for (int i = 0; i < queried.Count; i++)
+        {
+            if (!present.Contains(queried[i]))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // One `parquet_schema` over the given files: the DISTINCT stored names across all of them.
+    private static HashSet<string>? QueryPresentNames(IReadOnlyList<DeltaReader.NativeScanFile> files)
     {
         var sb = new StringBuilder("SELECT DISTINCT name FROM parquet_schema([");
         for (int i = 0; i < files.Count; i++)
