@@ -3469,88 +3469,91 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         ExecuteNonQuery((ifExists ? "DROP SCHEMA IF EXISTS " : "DROP SCHEMA ") + Quote(schemaName));
     }
 
-    public void AlterTable(int alterKind, string schemaName, string tableName, string? arg1, string? arg2,
-                           Field? column, int flags)
+    public void AlterTable(AlterTableSpec spec, string schemaName, string tableName, Field? column)
     {
         RecordTouch(schemaName, tableName, schemaChanged: true);
         string qualified = Quote(schemaName) + "." + Quote(tableName);
-        bool ifFlag = (flags & AlterKind.FlagIfExists) != 0;
-        Log.LogDebug("ddl alter [txn={Txn}] {Table}: kind={Kind} arg1={A1} arg2={A2}",
-                     AmbientTransaction.Current, qualified, alterKind, arg1, arg2);
-        switch (alterKind)
+        Log.LogDebug("ddl alter [txn={Txn}] {Table}: kind={Kind} column={Column} new_name={NewName}",
+                     AmbientTransaction.Current, qualified, AlterTableSpec.WireName(spec.Kind), spec.Column,
+                     spec.NewName);
+        switch (spec.Kind)
         {
-            case AlterKind.RenameTable:
+            case AlterTableKind.RenameTable:
                 // sp_rename: @objname may be schema-qualified; @newname must NOT be.
                 ExecuteNonQuery($"EXEC sp_rename N'{(Quote(schemaName) + "." + Quote(tableName)).Replace("'", "''")}', " +
-                                $"N'{RequireArg(arg1, "new table name").Replace("'", "''")}'");
+                                $"N'{spec.RequireNewName().Replace("'", "''")}'");
                 break;
-            case AlterKind.RenameColumn:
+            case AlterTableKind.RenameColumn:
                 ExecuteNonQuery(
-                    $"EXEC sp_rename N'{(Quote(schemaName) + "." + Quote(tableName) + "." + Quote(RequireArg(arg1, "old column"))).Replace("'", "''")}', " +
-                    $"N'{RequireArg(arg2, "new column").Replace("'", "''")}', 'COLUMN'");
+                    $"EXEC sp_rename N'{(Quote(schemaName) + "." + Quote(tableName) + "." + Quote(spec.RequireColumn())).Replace("'", "''")}', " +
+                    $"N'{spec.RequireNewName().Replace("'", "''")}', 'COLUMN'");
                 break;
-            case AlterKind.AddColumn:
+            case AlterTableKind.AddColumn:
             {
                 var field = RequireField(column, "added column");
-                string colDef = Quote(RequireArg(arg1, "column name")) + " " + MapArrowToSqlType(field.DataType, Profile) +
+                string name = spec.RequireColumn();
+                string colDef = Quote(name) + " " + MapArrowToSqlType(field.DataType, Profile) +
                                 (field.IsNullable ? " NULL" : " NOT NULL");
                 string add = $"ALTER TABLE {qualified} ADD {colDef}";
-                ExecuteNonQuery(ifFlag
-                    ? $"IF COL_LENGTH({ObjectLiteral(schemaName, tableName)}, N'{RequireArg(arg1, "column name").Replace("'", "''")}') IS NULL " +
+                ExecuteNonQuery(spec.Guard
+                    ? $"IF COL_LENGTH({ObjectLiteral(schemaName, tableName)}, N'{name.Replace("'", "''")}') IS NULL " +
                       $"EXEC('{add.Replace("'", "''")}')"
                     : add);
                 break;
             }
-            case AlterKind.DropColumn:
-                ExecuteNonQuery($"ALTER TABLE {qualified} DROP COLUMN {(ifFlag ? "IF EXISTS " : string.Empty)}" +
-                                Quote(RequireArg(arg1, "column name")));
+            case AlterTableKind.DropColumn:
+                ExecuteNonQuery($"ALTER TABLE {qualified} DROP COLUMN {(spec.Guard ? "IF EXISTS " : string.Empty)}" +
+                                Quote(spec.RequireColumn()));
                 break;
-            case AlterKind.ColumnType:
+            case AlterTableKind.ColumnType:
             {
                 // SQL Server defaults an ALTER COLUMN with no NULL/NOT NULL to NULLable,
                 // so restate the column's current nullability explicitly.
-                string col = RequireArg(arg1, "column name");
+                string col = spec.RequireColumn();
                 bool nullable = ColumnIsNullable(schemaName, tableName, col);
                 ExecuteNonQuery($"ALTER TABLE {qualified} ALTER COLUMN {Quote(col)} " +
                                 MapArrowToSqlType(RequireField(column, "column type").DataType, Profile) +
                                 (nullable ? " NULL" : " NOT NULL"));
                 break;
             }
-            case AlterKind.SetNotNull:
-            case AlterKind.DropNotNull:
+            case AlterTableKind.SetNotNull:
+            case AlterTableKind.DropNotNull:
             {
                 // SQL Server ALTER COLUMN must restate the type; reconstruct the
                 // column's current type from the catalog and toggle nullability.
-                string col = RequireArg(arg1, "column name");
+                string col = spec.RequireColumn();
                 string type = ColumnTypeInfo(schemaName, tableName, col).fullType;
                 ExecuteNonQuery($"ALTER TABLE {qualified} ALTER COLUMN {Quote(col)} {type} " +
-                                (alterKind == AlterKind.SetNotNull ? "NOT NULL" : "NULL"));
+                                (spec.Kind == AlterTableKind.SetNotNull ? "NOT NULL" : "NULL"));
                 break;
             }
-            case AlterKind.SetDefault:
+            case AlterTableKind.SetDefault:
             {
                 // SQL Server defaults are named constraints: replace any existing one.
-                string col = RequireArg(arg1, "column name");
+                string col = spec.RequireColumn();
                 using var connection = OpenConnection();
                 connection.Open();
                 DropColumnDefault(connection, schemaName, tableName, col);
                 string dataType = ColumnTypeInfo(schemaName, tableName, col).dataType;
-                string literal = RenderDefaultBySqlType(dataType, DecodeDefaultArg(arg2));
+                // spec.DefaultLiteral is null exactly for DEFAULT NULL — the doc's `default` key is required
+                // by this kind, so null here is a value and never "unset".
+                string literal = RenderDefaultBySqlType(dataType, spec.DefaultLiteral);
                 using var cmd = connection.CreateCommand();
                 cmd.CommandText = $"ALTER TABLE {qualified} ADD DEFAULT ({literal}) FOR {Quote(col)}";
                 cmd.ExecuteNonQuery();
                 break;
             }
-            case AlterKind.DropDefault:
+            case AlterTableKind.DropDefault:
             {
-                string col = RequireArg(arg1, "column name");
+                string col = spec.RequireColumn();
                 using var connection = OpenConnection();
                 connection.Open();
                 DropColumnDefault(connection, schemaName, tableName, col);
                 break;
             }
             default:
-                throw new ArgumentOutOfRangeException(nameof(alterKind), alterKind, "fabricator: unknown alter kind");
+                throw new ArgumentOutOfRangeException(nameof(spec), AlterTableSpec.WireName(spec.Kind),
+                                                      "fabricator: unsupported ALTER TABLE kind on SQL Server");
         }
     }
 
@@ -4032,19 +4035,9 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         }
     }
 
-    // Decodes the SET DEFAULT arg2: "-" => DEFAULT NULL; "b"+base64 => literal text.
-    private static string? DecodeDefaultArg(string? arg2)
-    {
-        if (arg2 == "-")
-        {
-            return null;
-        }
-        if (arg2 is not null && arg2.StartsWith('b'))
-        {
-            return System.Text.Encoding.UTF8.GetString(Convert.FromBase64String(arg2.Substring(1)));
-        }
-        throw new ArgumentException("fabricator: SET DEFAULT requires a literal value");
-    }
+    // (DecodeDefaultArg died at ABI v74: the "-" / "b"+base64 encoding existed ONLY because a C string
+    //  cannot tell an empty literal from an absent one. The doc's `default` key is a JSON string or JSON
+    //  null, which spells both natively — AlterTableSpec.DefaultLiteral is what this decoded to.)
 
     // Renders a literal DEFAULT, quoting by the column's SQL data type.
     private static string RenderDefaultBySqlType(string dataType, string? value)
@@ -4095,9 +4088,9 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         return !string.Equals(result, "NO", StringComparison.OrdinalIgnoreCase);
     }
 
-    private static string RequireArg(string? value, string what) =>
-        string.IsNullOrEmpty(value) ? throw new ArgumentException($"fabricator: ALTER TABLE missing {what}") : value;
-
+    // (RequireArg died with the positional arg1/arg2 — AlterTableSpec's Require* accessors name the missing
+    //  FIELD of the doc, which is what a malformed request is actually missing. RequireField stays: the
+    //  TYPE CHANNEL is a separate Arrow stream, not part of the doc.)
     private static Field RequireField(Field? field, string what) =>
         field ?? throw new ArgumentException($"fabricator: ALTER TABLE missing {what}");
 

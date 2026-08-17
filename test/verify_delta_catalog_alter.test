@@ -125,3 +125,64 @@ not supported
 
 statement ok
 DETACH lake2;
+
+# ============================================================================
+# ALTER carriers that are IDENTIFIERS: they must survive whatever a quoted DuckDB name contains.
+#
+# ⚠ This is REGRESSION protection created by ABI v74, not a pre-existing property. Before it, a column
+# name crossed as a RAW C string (alter_table's arg1/arg2) where no escaping question arose; now it rides
+# a JSON doc, so every identifier the host sends is escaped by the renderer and un-escaped by the parser.
+# Getting that wrong would be silent for ordinary names and wrong for exactly these — a tab is a control
+# character (invalid raw inside a JSON string), and quote/backslash are the two the doc's own delimiters
+# are made of. The sibling carriers are pinned where they live: `columns` in verify_delta_sorted_by,
+# `path` in verify_delta_catalog_nested_alter.
+# ============================================================================
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/alterescape' AS esc (TYPE fabricator, PROVIDER 'delta');
+
+statement ok
+CREATE TABLE esc.main.t (id INTEGER);
+
+# ADD COLUMN: the name crosses in the doc AND on the type channel's Arrow field — both must agree, or the
+# column is added under one spelling and addressed by the other.
+statement ok
+ALTER TABLE esc.main.t ADD COLUMN "a	b" INTEGER;
+
+statement ok
+ALTER TABLE esc.main.t ADD COLUMN "q""uote" INTEGER;
+
+statement ok
+INSERT INTO esc.main.t VALUES (1, 10, 100);
+
+query III
+SELECT id, "a	b", "q""uote" FROM esc.main.t;
+----
+1	10	100
+
+# RENAME COLUMN carries the awkward name on BOTH sides of the doc (column + new_name).
+statement ok
+ALTER TABLE esc.main.t RENAME COLUMN "a	b" TO "back\slash";
+
+query II
+SELECT id, "back\slash" FROM esc.main.t;
+----
+1	10
+
+# …and the old spelling is genuinely gone, so the rename addressed the column it named rather than
+# silently creating a second one.
+statement error
+SELECT "a	b" FROM esc.main.t;
+----
+not found
+
+statement ok
+ALTER TABLE esc.main.t DROP COLUMN "q""uote";
+
+query II
+SELECT id, "back\slash" FROM esc.main.t;
+----
+1	10
+
+statement ok
+DETACH esc;

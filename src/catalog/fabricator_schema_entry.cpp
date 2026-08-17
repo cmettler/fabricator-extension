@@ -3050,32 +3050,11 @@ void FabricatorSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
 	RetireErase(entries_, info.name, retired_entries_);
 	RetireAtEntriesFor(at_entries_, info.name, retired_entries_);
 }
-// A nested-field path as a JSON array of segments (["s","inner","f"]) — segment names may contain dots,
-// so a joined string would be ambiguous. Consumed by the provider's field-evolution alter kinds.
-static string JsonPathArray(const vector<string> &path) {
-	string json = "[";
-	for (idx_t i = 0; i < path.size(); i++) {
-		if (i) {
-			json += ',';
-		}
-		json += '"';
-		for (char c : path[i]) {
-			switch (c) {
-			case '"':
-				json += "\\\"";
-				break;
-			case '\\':
-				json += "\\\\";
-				break;
-			default:
-				json += c;
-			}
-		}
-		json += '"';
-	}
-	json += ']';
-	return json;
-}
+// (The hand-rolled JsonPathArray helper died with ABI v74: FabricatorRenderAlterJson owns every string in
+//  the request now. It escaped only `"` and `\`, so a legal DuckDB identifier carrying a control character
+//  — `"a<TAB>b"` — produced invalid JSON and the ALTER failed inside the managed parser, naming a byte
+//  position rather than the column. Field paths are still ARRAYS of segments, for the reason it gave: a
+//  segment name may contain dots.)
 
 void FabricatorSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 	if (info.type != AlterType::ALTER_TABLE) {
@@ -3114,108 +3093,101 @@ void FabricatorSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &inf
 		}
 	};
 
+	// The switch below only DESCRIBES the request (ABI v74) — it issues nothing. That is what the typed doc
+	// bought: with alter_kind + arg1 + arg2 + flags each meaning something different per kind, every branch
+	// had to spell its own crossing, so the fourteen calls were fourteen chances to mis-order a carrier.
+	// Now there is ONE crossing and ONE piece of cache bookkeeping, both stated once, below.
+	FabricatorAlterRequest request;
+	// The TYPE CHANNEL for the three kinds that carry a new column/field type. Function-scoped because the
+	// stream must stay alive until the crossing; nullptr for every other kind.
+	unique_ptr<fabricator::ArrowProducer> column_type;
+	auto carry_type = [&](const LogicalType &type, const string &column_name) {
+		vector<LogicalType> types {type};
+		vector<string> names {column_name};
+		column_type = make_uniq<fabricator::ArrowProducer>(types, names, fabricator::BoundaryClientProperties(context));
+		column_type->Finish();
+	};
+
 	switch (table_info.alter_table_type) {
 	case AlterTableType::RENAME_TABLE: {
 		auto &rt = table_info.Cast<RenameTableInfo>();
-		fabricator::AlterTable(handle_, name, table, FABRICATOR_ALTER_RENAME_TABLE, rt.new_table_name, "", nullptr, 0);
-		lock_guard<mutex> lock(entry_lock_);
-		auto it = table_types_.find(table);
-		string type = it != table_types_.end() ? it->second : string("BASE TABLE");
-		table_types_.erase(table);
-		RetireErase(entries_, table, retired_entries_);
-	RetireAtEntriesFor(at_entries_, table, retired_entries_);
-		table_types_[rt.new_table_name] = type;
-		RetireErase(entries_, rt.new_table_name, retired_entries_);
-	RetireAtEntriesFor(at_entries_, rt.new_table_name, retired_entries_);
+		request.kind = "rename_table";
+		request.new_name = rt.new_table_name;
 		break;
 	}
 	case AlterTableType::RENAME_COLUMN: {
 		auto &rc = table_info.Cast<RenameColumnInfo>();
-		fabricator::AlterTable(handle_, name, table, FABRICATOR_ALTER_RENAME_COLUMN, rc.old_name, rc.new_name, nullptr, 0);
-		refresh(table);
+		request.kind = "rename_column";
+		request.column = rc.old_name;
+		request.new_name = rc.new_name;
 		break;
 	}
 	case AlterTableType::ADD_COLUMN: {
 		auto &ac = table_info.Cast<AddColumnInfo>();
-		int32_t flags = ac.if_column_not_exists ? FABRICATOR_ALTER_FLAG_IF_EXISTS : 0;
-		// Carry the new column's type as a single-field zero-row Arrow stream.
-		vector<LogicalType> types {ac.new_column.Type()};
-		vector<string> names {ac.new_column.Name()};
-		fabricator::ArrowProducer producer(types, names, fabricator::BoundaryClientProperties(context));
-		producer.Finish();
-		fabricator::AlterTable(handle_, name, table, FABRICATOR_ALTER_ADD_COLUMN, ac.new_column.Name(), "",
-		                     producer.Stream(), flags);
-		refresh(table);
+		request.kind = "add_column";
+		request.column = ac.new_column.Name();
+		request.guard = ac.if_column_not_exists;
+		carry_type(ac.new_column.Type(), ac.new_column.Name());
 		break;
 	}
 	case AlterTableType::REMOVE_COLUMN: {
 		auto &rc = table_info.Cast<RemoveColumnInfo>();
-		int32_t flags = rc.if_column_exists ? FABRICATOR_ALTER_FLAG_IF_EXISTS : 0;
-		fabricator::AlterTable(handle_, name, table, FABRICATOR_ALTER_DROP_COLUMN, rc.removed_column, "", nullptr, flags);
-		refresh(table);
+		request.kind = "drop_column";
+		request.column = rc.removed_column;
+		request.guard = rc.if_column_exists;
 		break;
 	}
 	case AlterTableType::ALTER_COLUMN_TYPE: {
 		auto &ct = table_info.Cast<ChangeColumnTypeInfo>();
-		vector<LogicalType> types {ct.target_type};
-		vector<string> names {ct.column_name};
-		fabricator::ArrowProducer producer(types, names, fabricator::BoundaryClientProperties(context));
-		producer.Finish();
-		fabricator::AlterTable(handle_, name, table, FABRICATOR_ALTER_COLUMN_TYPE, ct.column_name, "", producer.Stream(),
-		                     0);
-		refresh(table);
+		request.kind = "column_type";
+		request.column = ct.column_name;
+		carry_type(ct.target_type, ct.column_name);
 		break;
 	}
 	case AlterTableType::ADD_FIELD: {
-		// `ALTER TABLE t ADD COLUMN s.f <type>` — add a field INSIDE a nested struct. The containing
-		// struct's path crosses as a JSON array (segments may contain dots); the new field's name + type
-		// travel as the single-field zero-row Arrow stream, exactly like ADD_COLUMN.
+		// `ALTER TABLE t ADD COLUMN s.f <type>` — add a field INSIDE a nested struct. `path` is the
+		// CONTAINING struct's; the new field's name + type ride the type channel, exactly like ADD_COLUMN.
 		auto &af = table_info.Cast<AddFieldInfo>();
-		int32_t flags = af.if_field_not_exists ? FABRICATOR_ALTER_FLAG_IF_EXISTS : 0;
-		vector<LogicalType> types {af.new_field.Type()};
-		vector<string> names {af.new_field.Name()};
-		fabricator::ArrowProducer producer(types, names, fabricator::BoundaryClientProperties(context));
-		producer.Finish();
-		fabricator::AlterTable(handle_, name, table, FABRICATOR_ALTER_ADD_FIELD, JsonPathArray(af.column_path), "",
-		                     producer.Stream(), flags);
-		refresh(table);
+		request.kind = "add_field";
+		request.path = af.column_path;
+		request.guard = af.if_field_not_exists;
+		carry_type(af.new_field.Type(), af.new_field.Name());
 		break;
 	}
 	case AlterTableType::REMOVE_FIELD: {
 		auto &rf = table_info.Cast<RemoveFieldInfo>();
-		int32_t flags = rf.if_column_exists ? FABRICATOR_ALTER_FLAG_IF_EXISTS : 0;
-		fabricator::AlterTable(handle_, name, table, FABRICATOR_ALTER_DROP_FIELD, JsonPathArray(rf.column_path), "",
-		                     nullptr, flags);
-		refresh(table);
+		request.kind = "drop_field";
+		request.path = rf.column_path;
+		request.guard = rf.if_column_exists;
 		break;
 	}
 	case AlterTableType::RENAME_FIELD: {
 		auto &rf = table_info.Cast<RenameFieldInfo>();
-		fabricator::AlterTable(handle_, name, table, FABRICATOR_ALTER_RENAME_FIELD, JsonPathArray(rf.column_path),
-		                     rf.new_name, nullptr, 0);
-		refresh(table);
+		request.kind = "rename_field";
+		request.path = rf.column_path;
+		request.new_name = rf.new_name;
 		break;
 	}
 	case AlterTableType::SET_NOT_NULL: {
 		auto &sn = table_info.Cast<SetNotNullInfo>();
-		fabricator::AlterTable(handle_, name, table, FABRICATOR_ALTER_SET_NOT_NULL, sn.column_name, "", nullptr, 0);
-		refresh(table);
+		request.kind = "set_not_null";
+		request.column = sn.column_name;
 		break;
 	}
 	case AlterTableType::DROP_NOT_NULL: {
 		auto &dn = table_info.Cast<DropNotNullInfo>();
-		fabricator::AlterTable(handle_, name, table, FABRICATOR_ALTER_DROP_NOT_NULL, dn.column_name, "", nullptr, 0);
-		refresh(table);
+		request.kind = "drop_not_null";
+		request.column = dn.column_name;
 		break;
 	}
 	case AlterTableType::SET_DEFAULT: {
 		auto &sd = table_info.Cast<SetDefaultInfo>();
+		request.column = sd.column_name;
 		if (!sd.expression) {
-			// DROP DEFAULT (no expression).
-			fabricator::AlterTable(handle_, name, table, FABRICATOR_ALTER_DROP_DEFAULT, sd.column_name, "", nullptr, 0);
-			refresh(table);
+			request.kind = "drop_default"; // DROP DEFAULT is SET DEFAULT with no expression
 			break;
 		}
+		request.kind = "set_default";
 		// Only literal defaults: unwrap one CAST (booleans parse as CAST(... AS BOOLEAN)).
 		const ParsedExpression *expr = sd.expression.get();
 		if (expr->type == ExpressionType::OPERATOR_CAST) {
@@ -3225,24 +3197,22 @@ void FabricatorSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &inf
 			throw NotImplementedException("fabricator: only literal column DEFAULTs are supported");
 		}
 		auto &val = expr->Cast<ConstantExpression>().value;
-		// arg2: "-" for DEFAULT NULL, else "b"+base64(value-text) (the "b" keeps
-		// it non-empty so empty-string literals survive the ABI).
-		string arg2;
-		if (val.IsNull()) {
-			arg2 = "-";
-		} else {
-			string text = val.ToString();
-			arg2 = "b" + Blob::ToBase64(string_t(text.c_str(), (uint32_t)text.size()));
+		// The "default" key carries the literal's TEXT, JSON null for DEFAULT NULL. The old arg2 spelled
+		// those two states "-" and "b"+base64(text) — the base64 existed ONLY so an empty-string literal
+		// stayed distinguishable from an absent C string, which a JSON string does natively.
+		request.has_default = true;
+		request.default_is_null = val.IsNull();
+		if (!request.default_is_null) {
+			request.default_literal = val.ToString();
 		}
-		fabricator::AlterTable(handle_, name, table, FABRICATOR_ALTER_SET_DEFAULT, sd.column_name, arg2, nullptr, 0);
-		refresh(table);
 		break;
 	}
 	case AlterTableType::SET_SORTED_BY: {
 		// ALTER TABLE t SET SORTED BY (a, b) / RESET SORTED BY (empty orders). Clustering has no sort
 		// direction — only plain (implicitly ascending) column names are accepted.
 		auto &ss = table_info.Cast<SetSortedByInfo>();
-		vector<string> cols;
+		request.kind = "set_sorted_by";
+		request.has_columns = true; // an EMPTY list is the RESET spelling, not an absent one
 		for (auto &order : ss.orders) {
 			if (order.type == OrderType::DESCENDING) {
 				throw NotImplementedException(
@@ -3251,31 +3221,55 @@ void FabricatorSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &inf
 			if (!order.expression || order.expression->type != ExpressionType::COLUMN_REF) {
 				throw NotImplementedException("fabricator: SET SORTED BY accepts plain column names only");
 			}
-			cols.push_back(order.expression->Cast<ColumnRefExpression>().GetColumnName());
+			request.columns.push_back(order.expression->Cast<ColumnRefExpression>().GetColumnName());
 		}
-		fabricator::AlterTable(handle_, name, table, FABRICATOR_ALTER_SET_SORTED_BY, JsonPathArray(cols), "",
-		                       nullptr, 0);
-		refresh(table);
 		break;
 	}
 	case AlterTableType::SET_PARTITIONED_BY: {
 		// Crossed so the provider errors meaningfully (Delta: repartitioning needs a full rewrite —
 		// COPY ... MODE 'overwrite' + PARTITION_COLUMNS; SQL Server/DAX: unsupported).
 		auto &sp = table_info.Cast<SetPartitionedByInfo>();
-		vector<string> cols;
+		request.kind = "set_partitioned_by";
+		request.has_columns = true;
 		for (auto &key : sp.partition_keys) {
 			if (!key || key->type != ExpressionType::COLUMN_REF) {
 				throw NotImplementedException("fabricator: SET PARTITIONED BY accepts plain column names only");
 			}
-			cols.push_back(key->Cast<ColumnRefExpression>().GetColumnName());
+			request.columns.push_back(key->Cast<ColumnRefExpression>().GetColumnName());
 		}
-		fabricator::AlterTable(handle_, name, table, FABRICATOR_ALTER_SET_PARTITIONED_BY, JsonPathArray(cols),
-		                       "", nullptr, 0);
-		refresh(table);
 		break;
 	}
 	default:
 		throw NotImplementedException("fabricator: this ALTER TABLE variant is not supported yet");
+	}
+
+	// The table-session handle replaces the (schema, table) pair the old alter_table carried. Resolving it
+	// here costs NO extra crossing: Catalog::Alter looked this very entry up moments ago to decide whether
+	// to dispatch at all (catalog.cpp — it returns early when the lookup misses), so this is a cache hit on
+	// the entry DuckDB just materialized. Resolved AFTER the switch so a variant that throws never
+	// materializes anything.
+	auto alter_entry = GetOrCreateEntry(context, table);
+	if (!alter_entry) {
+		throw CatalogException("fabricator: ALTER TABLE: table \"%s\" does not exist", table);
+	}
+	fabricator::TableAlter(alter_entry->Cast<FabricatorTableEntry>().TableHandle(),
+	                       FabricatorRenderAlterJson(request), column_type ? column_type->Stream() : nullptr);
+
+	if (table_info.alter_table_type == AlterTableType::RENAME_TABLE) {
+		// A rename MOVES the entry rather than refreshing it: the name list is re-keyed and both names are
+		// evicted (the old one is gone, the new one may shadow a stale entry).
+		auto &rt = table_info.Cast<RenameTableInfo>();
+		lock_guard<mutex> lock(entry_lock_);
+		auto it = table_types_.find(table);
+		string type = it != table_types_.end() ? it->second : string("BASE TABLE");
+		table_types_.erase(table);
+		RetireErase(entries_, table, retired_entries_);
+		RetireAtEntriesFor(at_entries_, table, retired_entries_);
+		table_types_[rt.new_table_name] = type;
+		RetireErase(entries_, rt.new_table_name, retired_entries_);
+		RetireAtEntriesFor(at_entries_, rt.new_table_name, retired_entries_);
+	} else {
+		refresh(table);
 	}
 }
 

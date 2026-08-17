@@ -58,9 +58,7 @@ public unsafe struct FabricatorVTable
     // int32 drop_schema(void* handle, const char* schema, int32 if_exists, char** err)
     public delegate* unmanaged[Cdecl]<nint, byte*, int, byte**, int> DropSchema;
 
-    // int32 alter_table(void* handle, const char* schema, const char* table, int32 alter_kind,
-    //                   const char* arg1, const char* arg2, ArrowArrayStream* column, int32 flags, char** err)
-    public delegate* unmanaged[Cdecl]<nint, byte*, byte*, int, byte*, byte*, CArrowArrayStream*, int, byte**, int> AlterTable;
+    // (alter_table was removed at ABI v74 — it is TableAlter on the table session, at the end of this struct.)
 
     // int32 begin/commit/rollback_transaction(void* handle, char** err)
     public delegate* unmanaged[Cdecl]<nint, int, byte**, int> BeginTransaction;
@@ -274,6 +272,10 @@ public unsafe struct FabricatorVTable
     // int32 table_scan(void* table, const char* spec_json, ArrowArrayStream* filter_values,
     //                  ArrowArrayStream* out, char** err)
     public delegate* unmanaged[Cdecl]<nint, byte*, CArrowArrayStream*, CArrowArrayStream*, byte**, int> TableScan;
+    // int32 table_alter(void* table, const char* alter_json, ArrowArrayStream* column, char** err) (v74) —
+    // ONE typed doc naming its variant (see AlterTableSpec / abi.h), plus the `column` TYPE CHANNEL, which
+    // stays an Arrow field because a VARIANT rides field METADATA no type name could carry.
+    public delegate* unmanaged[Cdecl]<nint, byte*, CArrowArrayStream*, byte**, int> TableAlter;
     // void table_close(void* table)
     public delegate* unmanaged[Cdecl]<nint, void> TableClose;
 }
@@ -347,33 +349,9 @@ public unsafe struct FabricatorHostInputs
     public CArrowArrayStream** Streams; // Count Arrow streams (parallel to Names)
 }
 
-/// <summary>Mirrors <c>FabricatorAlterKind</c> in abi.h.</summary>
-public static class AlterKind
-{
-    public const int RenameTable = 0;
-    public const int RenameColumn = 1;
-    public const int AddColumn = 2;
-    public const int DropColumn = 3;
-    public const int ColumnType = 4;
-    public const int SetNotNull = 5;
-    public const int DropNotNull = 6;
-    public const int SetDefault = 7;
-    public const int DropDefault = 8;
-
-    // Nested STRUCT-field evolution (`ALTER TABLE t ADD/DROP/RENAME COLUMN s.f ...`). The field path
-    // crosses in a1 as a JSON array of segments (names may contain dots).
-    public const int AddField = 9;     // a1 = the CONTAINING struct's path; `column` = the new field
-    public const int DropField = 10;   // a1 = the field's full path
-    public const int RenameField = 11; // a1 = the field's full path; a2 = the new name
-
-    // ALTER TABLE t SET SORTED BY (a, b) / RESET SORTED BY — clustering re-key; a1 = JSON array of
-    // column names ([] = RESET). SET/RESET PARTITIONED BY crosses too (providers error meaningfully).
-    public const int SetSortedBy = 12;
-    public const int SetPartitionedBy = 13;
-
-    /// <summary>flags bit 0: the if-(not-)exists guard.</summary>
-    public const int FlagIfExists = 1;
-}
+// (AlterKind was deleted at ABI v74 with alter_table itself. Its fourteen ints are now the "kind" strings
+//  of the table_alter doc, and the flags bit is the doc's own if_not_exists / if_exists key — parsed once
+//  into the typed AlterTableSpec (Fabricator.Abstractions) instead of read positionally by each provider.)
 
 // (MetadataKind was deleted at ABI v72 together with get_metadata itself: catalog discovery has dedicated
 //  typed entries (CatalogSchemas/Tables/Functions/Macros/ServerInfo — the shapes those kinds carried keep

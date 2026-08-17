@@ -14,6 +14,7 @@
 #include <yyjson.h>
 
 #include <cstdint>
+#include <cstdlib> // free() — yyjson_mut_write's buffer, allocated by the default allocator
 #include <cstring>
 
 namespace duckdb {
@@ -328,6 +329,81 @@ FabricatorTableStats FetchTableStats(FabricatorHandle table_handle) {
 		}
 	}
 	return result;
+}
+
+string FabricatorRenderAlterJson(const FabricatorAlterRequest &request) {
+	// The ONE place the host WRITES an ABI JSON doc (table_info/table_stats/get_capabilities all flow the
+	// other way), so it is also the one place that needs yyjson's mutable API. Every string below is a
+	// user-controlled identifier or literal, which is exactly why this is a real writer and not
+	// concatenation — see the header note on what the hand-rolled predecessor got wrong.
+	//
+	// ⚠ yyjson_mut_strncpy, NOT yyjson_mut_strn: the plain form does NOT copy (its own doc says so) and
+	// would leave every value pointing into `request`. That happens to be safe today — the doc dies at this
+	// function's end, `request` is the caller's — but it is a lifetime coupling nothing states at the call
+	// site, so a later render-from-a-temporary would be a use-after-free rather than a compile error. The
+	// copies are a handful of identifiers. KEYS are string literals (static storage), so the non-copying
+	// yyjson_mut_obj_add_* key handling is correct for them.
+	struct MutDocGuard {
+		yyjson_mut_doc *doc;
+		MutDocGuard() : doc(yyjson_mut_doc_new(nullptr)) {
+			if (!doc) {
+				throw IOException("fabricator: could not allocate the ALTER TABLE request document");
+			}
+		}
+		~MutDocGuard() {
+			yyjson_mut_doc_free(doc);
+		}
+	} guard;
+	auto *doc = guard.doc;
+	auto *root = yyjson_mut_obj(doc);
+	yyjson_mut_doc_set_root(doc, root);
+
+	auto add_str = [&](const char *key, const string &value) {
+		yyjson_mut_obj_add_val(doc, root, key, yyjson_mut_strncpy(doc, value.c_str(), value.size()));
+	};
+	auto add_arr = [&](const char *key, const vector<string> &values) {
+		auto *arr = yyjson_mut_arr(doc);
+		for (auto &value : values) {
+			yyjson_mut_arr_append(arr, yyjson_mut_strncpy(doc, value.c_str(), value.size()));
+		}
+		yyjson_mut_obj_add_val(doc, root, key, arr);
+	};
+
+	add_str("kind", request.kind);
+	if (!request.column.empty()) {
+		add_str("column", request.column);
+	}
+	if (!request.new_name.empty()) {
+		add_str("new_name", request.new_name);
+	}
+	if (!request.path.empty()) {
+		add_arr("path", request.path);
+	}
+	if (request.has_columns) {
+		add_arr("columns", request.columns);
+	}
+	if (request.guard) {
+		// The kind decides the SPELLING: the ADD kinds guard on absence, the DROP kinds on presence. Two
+		// honest keys rather than one overloaded flag bit — a doc that says "if_exists" on an ADD would be
+		// the very ambiguity this crossing exists to remove.
+		bool adds = request.kind == "add_column" || request.kind == "add_field";
+		yyjson_mut_obj_add_bool(doc, root, adds ? "if_not_exists" : "if_exists", true);
+	}
+	if (request.has_default) {
+		if (request.default_is_null) {
+			yyjson_mut_obj_add_null(doc, root, "default");
+		} else {
+			add_str("default", request.default_literal);
+		}
+	}
+
+	char *rendered = yyjson_mut_write(doc, 0, nullptr);
+	if (!rendered) {
+		throw IOException("fabricator: could not render the ALTER TABLE request for kind '%s'", request.kind);
+	}
+	string json(rendered);
+	free(rendered); // yyjson_mut_write allocates with the default allocator
+	return json;
 }
 
 } // namespace duckdb

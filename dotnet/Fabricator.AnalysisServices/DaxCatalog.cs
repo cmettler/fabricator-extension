@@ -787,8 +787,7 @@ internal sealed class DaxCatalog : IBackendCatalog
     public void DropTable(string schemaName, string tableName, bool ifExists) => throw ReadOnly();
     public void CreateSchema(string schemaName, bool ifNotExists) => throw ReadOnly();
     public void DropSchema(string schemaName, bool ifExists) => throw ReadOnly();
-    public void AlterTable(int alterKind, string schemaName, string tableName, string? arg1, string? arg2,
-                           Field? column, int flags) => throw ReadOnly();
+    public void AlterTable(AlterTableSpec spec, string schemaName, string tableName, Field? column) => throw ReadOnly();
 
     // Transactions: ADOMD/DAX is read-only — accept BEGIN/COMMIT/ROLLBACK as no-ops so a wrapping
     // DuckDB transaction over read-only DAX queries doesn't fail.

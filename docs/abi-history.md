@@ -1,9 +1,72 @@
-# ABI history — prior versions v16–v71
+# ABI history — prior versions v16–v74
 
 > Moved VERBATIM out of `CLAUDE.md` on 2026-07-29 (conservative split — see the commit message).
 > Append-only as-built history; the live summary + pointers stay in `CLAUDE.md`.
 > Paths/links inside are REPO-ROOT-relative (the text was written for `CLAUDE.md`).
 > The CURRENT version + the bump rule stay in `CLAUDE.md` §C ABI contract.
+>
+> ⚠ **v72 and v73 are NOT in this file** — they are the catalog/table abstraction's own slices, recorded
+> where their design is, in [catalog-table-abstraction.md](catalog-table-abstraction.md) §5 item 4d
+> (v72: `get_metadata` + `scan_table` + the kind enum deleted, replaced by five typed `catalog_*` discovery
+> entries and the `table_*` session; v73: `table_info`/`table_stats` re-carried as ONE typed JSON doc each,
+> parsed with our own vcpkg yyjson, retiring the `ReadCapabilityFlag` string-find). v74 below is the
+> follow-on that finished the same job for ALTER.
+
+## v74 (2026-08-17) — `table_alter`: ALTER TABLE stops being five positional carriers
+
+`alter_table` was the worst-shaped entry left in the vtable, and the last of the ORIGINAL DDL surface to
+carry a name pair. It took an `alter_kind` int plus `arg1`, `arg2`, a `flags` bitfield and an optional
+Arrow `column` stream, and **every one of those meant something different per kind**: `arg1` was a new
+table name, or a column name, or a JSON array of path segments, or a JSON array of column names; `arg2`
+was a new column name, or `"-"`/`"b"+base64(text)` for a DEFAULT; `flags` bit 0 was `IF NOT EXISTS` on the
+ADD kinds and `IF EXISTS` on the DROP kinds. Nothing in the signature said which, so fourteen call sites
+each spelled their own crossing and fourteen provider branches each re-derived the meaning.
+
+It is now ONE entry on the v72 TABLE SESSION taking ONE typed JSON doc that NAMES ITS VARIANT and carries
+only that variant's fields — the v73 `table_info`/`table_stats` pattern with the direction REVERSED (this
+is the only ABI doc the HOST writes). The fourteen kind ints survive as the doc's `"kind"` strings, listed
+in full on `table_alter` in `abi.h`.
+
+**The two axes are independent, and both were taken.**
+- **Name pair → the table handle.** Sound HERE and not for `create_table` / `begin_bulk`, because an ALTER
+  always targets an EXISTING table — there is no "the object does not exist yet" asymmetry to work around.
+  It costs no extra crossing: `Catalog::Alter` (`duckdb/src/catalog/catalog.cpp`) looks the entry up
+  itself before dispatching and returns early when the lookup misses, so `FabricatorSchemaEntry::Alter`
+  resolves a cache hit on an entry DuckDB materialized moments earlier. New accessor
+  `FabricatorTableEntry::TableHandle()`.
+- **Kind + args + flags → one typed doc.** Rendered host-side by `FabricatorRenderAlterJson` (yyjson's
+  MUTABLE api — the first place the host writes JSON rather than parsing it), parsed bridge-side into
+  `AlterTableSpec` (`Fabricator.Abstractions`, `System.Text.Json`).
+
+**⚠ The `column` Arrow stream stayed, and must.** It is the TYPE CHANNEL for `add_column` / `column_type` /
+`add_field`, and a VARIANT column is identified by Arrow field METADATA (`VariantMarker` /
+`ew.variant_transport`) that a DuckDB type NAME cannot carry — folding types into the doc as text would
+silently regress exactly the extension-type shapes.
+
+**What the doc dissolved, beyond the ambiguity.** `arg2`'s `"-"` / `"b"`+base64 encoding for SET DEFAULT
+existed ONLY because a C string cannot tell an EMPTY literal from an ABSENT one; the doc's `default` key
+is a JSON string or JSON null, which spells both natively, so `DecodeDefaultArg` is gone. `JsonPathArray`
+(C++) and `ParseJsonPath` (C#) are gone — the renderer owns escaping and the spec arrives parsed.
+SqlServer's `RequireArg` is gone, replaced by `AlterTableSpec.Require*`, which name the missing FIELD of
+the doc rather than a positional argument. And `DeltaCatalog.AlterTable`'s buffered-DML branch had its
+kind list written TWICE (once in an `if`, once in the `switch` inside it); it is now one switch, which
+cannot disagree with itself.
+
+**⚠ IT FIXED A REAL DEFECT, AND CREATED A REGRESSION RISK IN THE SAME MOVE — say both.** The hand-rolled
+`JsonPathArray` escaped `"` and `\` and nothing else, so a legal DuckDB identifier containing a CONTROL
+character (`"a<TAB>b"`, via a quoted name) produced invalid JSON: measured against the pre-change build,
+`ALTER TABLE t SET SORTED BY ("a<TAB>b")` failed with *"'0x09' is invalid within a JSON string … Path:
+$[0] | BytePositionInLine: 3"* — a message about the transport, naming nothing the user typed. Loud, never
+silent, so nothing was corrupted. **But the same change puts identifiers that never touched JSON before —
+a column name, a new name — INTO the doc**, so correct escaping became load-bearing for carriers that
+previously could not care. Both halves are gated, and the gates were mutation-tested by re-inserting the
+old two-character escape: `verify_delta_catalog_alter` (116 → 132) dies at its tab-named ADD COLUMN after
+118 assertions pass, `verify_delta_sorted_by` (30 → 40) at its `SET SORTED BY` after 32, and
+`verify_delta_catalog_nested_alter` (100 → 127) at its nested RENAME after 113. ⚠ The nested suite dies at
+the RENAME and not the earlier ADD, correctly: an ADD FIELD's path names the CONTAINING struct while the
+new field's own name rides the type channel, so the first control character to cross IN THE DOC there is
+the rename's. Tier-0 `Fabricator.Bridge.Tests` +50 (146 → 196) over the parse itself — admissible because
+`AlterTableSpec`'s closure is the BCL, which is a consequence of the type NOT being in the doc.
 
 ## v71 (2026-08-14) — `get_capabilities`: the catalog capability doc
 

@@ -154,4 +154,39 @@ struct FabricatorTableStats {
 //! whole fetch as best-effort (a stats failure must not break the scan).
 FabricatorTableStats FetchTableStats(FabricatorHandle table_handle);
 
+//! One ALTER TABLE request for the `table_alter` crossing (ABI v74) — the C++ mirror of the managed
+//! `AlterTableSpec`. Deliberately one struct with a `kind` rather than a variant hierarchy: each kind fills
+//! only its own fields, and the renderer emits only what was filled, so the doc on the wire names its
+//! variant and carries nothing else (the whole point of retiring alter_kind + arg1/arg2/flags, where every
+//! carrier meant something different per kind). Keep the field set in step with AlterTableSpec.cs.
+struct FabricatorAlterRequest {
+	//! The doc's "kind" — one of the names listed on table_alter in abi.h.
+	string kind;
+	//! Target column name (top-level kinds). Empty => the key is omitted.
+	string column;
+	//! Rename target: the new table / column / field name. Empty => omitted.
+	string new_name;
+	//! Nested-field path as SEGMENTS — a field name may contain dots, so a joined string is ambiguous.
+	//! Empty => omitted (a field path always has at least one segment).
+	vector<string> path;
+	//! SET SORTED BY / SET PARTITIONED BY column list. Guarded by `has_columns` because an EMPTY list is
+	//! meaningful there (it is the RESET spelling) and must be told apart from "this kind has no list".
+	vector<string> columns;
+	bool has_columns = false;
+	//! The statement's if-(not-)exists guard. Rendered under the key its kind defines — "if_not_exists" for
+	//! the ADD kinds, "if_exists" for the DROP kinds — and omitted entirely when false.
+	bool guard = false;
+	//! SET DEFAULT only: emit the (required) "default" key. `default_is_null` distinguishes DEFAULT NULL
+	//! from a literal, which is the distinction the old arg2 encoded as "-" vs "b"+base64(text).
+	bool has_default = false;
+	bool default_is_null = false;
+	string default_literal;
+};
+
+//! Renders a `FabricatorAlterRequest` as the `table_alter` JSON doc. Uses yyjson's mutable API rather than
+//! string concatenation so identifiers are escaped CORRECTLY: the hand-rolled builder this replaced escaped
+//! only `"` and `\`, so a legal DuckDB identifier containing a control character (e.g. a tab, via a quoted
+//! name) produced invalid JSON and the ALTER failed with a parser message about byte positions.
+string FabricatorRenderAlterJson(const FabricatorAlterRequest &request);
+
 } // namespace duckdb

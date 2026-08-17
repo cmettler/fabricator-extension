@@ -98,37 +98,11 @@ typedef void *FabricatorHandle;
 // session at the end of the vtable, over the managed ITable object model. Kind history, incl. the v70
 // deletion of 8-11/13-14, is in docs/abi-history.md.)
 
-// -----------------------------------------------------------------------------
-// ALTER TABLE variants passed to FabricatorVTable::alter_table. The managed side
-// generates the provider DDL. `arg1`/`arg2` carry names; for ADD_COLUMN /
-// COLUMN_TYPE the new column's type travels as a single-field zero-row Arrow
-// schema in the `column` stream. `flags` bit 0 is the if-(not-)exists guard.
-// -----------------------------------------------------------------------------
-typedef enum {
-	FABRICATOR_ALTER_RENAME_TABLE = 0,  // arg1 = new table name
-	FABRICATOR_ALTER_RENAME_COLUMN = 1, // arg1 = old column name, arg2 = new column name
-	FABRICATOR_ALTER_ADD_COLUMN = 2,    // arg1 = column name; `column` carries its type; flag0 = if_not_exists
-	FABRICATOR_ALTER_DROP_COLUMN = 3,   // arg1 = column name; flag0 = if_exists
-	FABRICATOR_ALTER_COLUMN_TYPE = 4,   // arg1 = column name; `column` carries the new type
-	FABRICATOR_ALTER_SET_NOT_NULL = 5,  // arg1 = column name (managed side restates the current type)
-	FABRICATOR_ALTER_DROP_NOT_NULL = 6, // arg1 = column name
-	FABRICATOR_ALTER_SET_DEFAULT = 7,   // arg1 = column name; arg2 = "-" (DEFAULT NULL) or "b"+base64(literal)
-	FABRICATOR_ALTER_DROP_DEFAULT = 8,  // arg1 = column name
-	// Nested STRUCT-field evolution (DuckDB `ALTER TABLE t ADD/DROP/RENAME COLUMN s.f ...`). Field paths
-	// cross as a JSON array of segments (names may contain dots). Additive enum values — no ABI bump.
-	FABRICATOR_ALTER_ADD_FIELD = 9,     // arg1 = JSON path of the CONTAINING struct; `column` carries the new
-	                                  // field (name + type); flag0 = if_not_exists
-	FABRICATOR_ALTER_DROP_FIELD = 10,   // arg1 = JSON full path of the field; flag0 = if_exists
-	FABRICATOR_ALTER_RENAME_FIELD = 11, // arg1 = JSON full path of the field; arg2 = new field name
-
-	// ALTER TABLE t SET SORTED BY (a, b) / RESET SORTED BY — declares/re-keys/removes the table's
-	// clustering (Delta: the delta.clustering domain + the fabricator.sortedBy ordered-write property).
-	// SET/RESET PARTITIONED BY crosses too so each provider errors meaningfully (none supports it yet).
-	FABRICATOR_ALTER_SET_SORTED_BY = 12,      // arg1 = JSON array of column names ([] = RESET)
-	FABRICATOR_ALTER_SET_PARTITIONED_BY = 13, // arg1 = JSON array of column names ([] = RESET)
-} FabricatorAlterKind;
-
-#define FABRICATOR_ALTER_FLAG_IF_EXISTS 1
+// (FabricatorAlterKind, FABRICATOR_ALTER_FLAG_IF_EXISTS and the alter_table entry were DELETED at ABI
+// v74. The kind int plus its four overloaded carriers — arg1/arg2/flags, each meaning something different
+// per kind — became ONE typed JSON doc on the table_alter session entry at the end of this struct; the
+// `column` Arrow stream stayed, because it is the TYPE CHANNEL and a doc cannot carry an Arrow extension
+// type. The kind names survive as the doc's "kind" strings, listed on table_alter.)
 
 // -----------------------------------------------------------------------------
 // The vtable. The managed Bootstrap.Initialize fills this struct in place. New
@@ -236,14 +210,8 @@ typedef struct FabricatorVTable {
 	// DDL: drop a schema. `if_exists` suppresses the error when it is absent.
 	int32_t (*drop_schema)(FabricatorHandle handle, const char *schema, int32_t if_exists, char **err);
 
-	// DDL: alter a table. `alter_kind` is an FabricatorAlterKind; `arg1`/`arg2` are
-	// names (per kind). For ADD_COLUMN / COLUMN_TYPE the new column's type travels
-	// as a single-field zero-row Arrow schema in `column` (NULL otherwise; the
-	// managed side consumes/releases it when present). `flags` bit 0 is the
-	// if-(not-)exists guard. The managed side generates the provider ALTER.
-	int32_t (*alter_table)(FabricatorHandle handle, const char *schema, const char *table, int32_t alter_kind,
-	                       const char *arg1, const char *arg2, struct ArrowArrayStream *column, int32_t flags,
-	                       char **err);
+	// (alter_table was removed at ABI v74 — replaced by table_alter at the end of this struct, over the
+	//  table session's handle and one typed JSON doc.)
 
 	// Transaction boundaries for a catalog handle. begin_transaction enters
 	// transaction mode (the managed side pins a connection + provider transaction
@@ -844,6 +812,42 @@ typedef struct FabricatorVTable {
 	// rides the spec for the scan itself — the handle's AT selects the SCHEMA answer above).
 	int32_t (*table_scan)(FabricatorHandle table, const char *spec_json, struct ArrowArrayStream *filter_values,
 	                      struct ArrowArrayStream *out, char **err);
+	// DDL: ALTER TABLE (ABI v74 — the old alter_table's kind int + arg1 + arg2 + flags, each overloaded per
+	// kind, collapsed into ONE typed doc). The name pair is gone because the handle carries the identity:
+	// sound HERE and not for create_table / begin_bulk, since an ALTER always targets an EXISTING table, so
+	// there is no "the object does not exist yet" asymmetry to work around. Like every other session entry
+	// this re-binds against the AMBIENT transaction, which is what lets a provider BUFFER the alter into an
+	// open transaction (Delta's schema-evolution kinds) rather than committing it on its own.
+	//
+	// `alter_json` names its variant and carries ONLY that variant's fields — the v73 table_info/table_stats
+	// pattern with the direction reversed (the HOST writes it, with yyjson's mutable API; the managed side
+	// parses it with System.Text.Json). Absent optional key => false/none:
+	//   {"kind":"rename_table",       "new_name":"t2"}
+	//   {"kind":"rename_column",      "column":"a", "new_name":"b"}
+	//   {"kind":"add_column",         "column":"c" [,"if_not_exists":true]}          + `column`
+	//   {"kind":"drop_column",        "column":"c" [,"if_exists":true]}
+	//   {"kind":"column_type",        "column":"c"}                                  + `column`
+	//   {"kind":"set_not_null",       "column":"c"}
+	//   {"kind":"drop_not_null",      "column":"c"}
+	//   {"kind":"set_default",        "column":"c", "default":<string|null>}
+	//   {"kind":"drop_default",       "column":"c"}
+	//   {"kind":"add_field",          "path":["s","inner"] [,"if_not_exists":true]}  + `column`
+	//   {"kind":"drop_field",         "path":["s","inner","f"] [,"if_exists":true]}
+	//   {"kind":"rename_field",       "path":["s","inner","f"], "new_name":"g"}
+	//   {"kind":"set_sorted_by",      "columns":["a","b"]}   ([] = RESET)
+	//   {"kind":"set_partitioned_by", "columns":["a","b"]}   ([] = RESET)
+	// `path` is an ARRAY of segments rather than a joined string because a field name may contain dots.
+	// "default" is REQUIRED by set_default and carries the literal's TEXT, with JSON null for DEFAULT NULL —
+	// the two states the old arg2 encoded as "-" / "b"+base64(literal), a hack that existed only because a
+	// C string cannot distinguish empty from absent.
+	//
+	// ⚠ `column` STAYS a separate Arrow stream and must NOT fold into the doc: it is the TYPE CHANNEL for
+	// the ADD_COLUMN / COLUMN_TYPE / ADD_FIELD kinds, and a VARIANT column rides an Arrow field-metadata
+	// marker (VariantMarker / "ew.variant_transport") that a DuckDB type NAME cannot carry — rendering types
+	// as text would silently regress exactly the extension-type shapes. NULL for every other kind; the
+	// managed side consumes/releases it when present.
+	int32_t (*table_alter)(FabricatorHandle table, const char *alter_json, struct ArrowArrayStream *column,
+	                       char **err);
 	// Release a handle from table_open. Idempotent; safe with NULL. Best-effort (entry teardown must not
 	// throw) — frees the managed GCHandle, nothing more.
 	void (*table_close)(FabricatorHandle table);
@@ -963,7 +967,7 @@ typedef struct FabricatorHostServices {
 // state blob is this many bytes + a 4-byte length prefix). Serialize() must fit within it.
 #define FABRICATOR_AGG_SPILL_CAP 1024
 
-#define FABRICATOR_ABI_VERSION 73
+#define FABRICATOR_ABI_VERSION 74
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(FabricatorVTable) as seen

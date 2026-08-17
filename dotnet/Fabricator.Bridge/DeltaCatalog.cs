@@ -3376,7 +3376,7 @@ public sealed class DeltaCatalog : IBackendCatalog
     }
 
     private void BufferAddColumn(long txnId, string path, string schemaName, string tableName,
-                                 Field column, int flags)
+                                 Field column, bool ifNotExists)
     {
         var opener = Opener();
         var profile = DeltaReader.GetTxnDmlProfile(opener, path);
@@ -3387,7 +3387,7 @@ public sealed class DeltaCatalog : IBackendCatalog
         {
             if (string.Equals(existing.Name, column.Name, System.StringComparison.Ordinal))
             {
-                if ((flags & 1) != 0)
+                if (ifNotExists)
                 {
                     return; // IF NOT EXISTS — no-op
                 }
@@ -5145,7 +5145,7 @@ public sealed class DeltaCatalog : IBackendCatalog
         }
     }
 
-    public void AlterTable(int k, string s, string t, string? a1, string? a2, Field? c, int f)
+    public void AlterTable(AlterTableSpec spec, string s, string t, Field? c)
     {
         InvalidateReadCache();
         // VARIANT: `c` arrives from the C ABI in TRANSPORT form (a BINARY field carrying the
@@ -5161,46 +5161,40 @@ public sealed class DeltaCatalog : IBackendCatalog
         // and RENAME TABLE stay immediate (a nested rename would need a per-level name map in the read
         // overlay; a table rename is a physical folder move).
         long alterTxn = AmbientTransaction.Current;
-        if (IsExplicitTxn(alterTxn)
-            && (k == AlterKind.AddColumn || k == AlterKind.RenameColumn || k == AlterKind.DropColumn
-                || k == AlterKind.AddField || k == AlterKind.DropField))
+        if (IsExplicitTxn(alterTxn))
         {
             var alterPath = TablePath(s, t);
-            switch (k)
+            switch (spec.Kind)
             {
-                case AlterKind.AddColumn:
+                case AlterTableKind.AddColumn:
                 {
                     var col0 = c ?? throw new System.InvalidOperationException(
                         "delta ADD COLUMN requires a column definition.");
-                    string name0 = a1 ?? col0.Name;
+                    string name0 = spec.Column ?? col0.Name;
                     var field0 = string.Equals(name0, col0.Name, System.StringComparison.Ordinal)
                         ? col0
                         : new Field(name0, col0.DataType, col0.IsNullable);
-                    BufferAddColumn(alterTxn, alterPath, s, t, field0, f);
+                    BufferAddColumn(alterTxn, alterPath, s, t, field0, spec.Guard);
                     return;
                 }
-                case AlterKind.RenameColumn:
-                    BufferRenameColumn(alterTxn, alterPath, s, t,
-                        a1 ?? throw new System.InvalidOperationException(
-                            "delta RENAME COLUMN requires the old column name."),
-                        a2 ?? throw new System.InvalidOperationException(
-                            "delta RENAME COLUMN requires the new column name."));
+                case AlterTableKind.RenameColumn:
+                    BufferRenameColumn(alterTxn, alterPath, s, t, spec.RequireColumn(), spec.RequireNewName());
                     return;
-                case AlterKind.DropColumn:
-                    BufferDropColumn(alterTxn, alterPath, s, t,
-                        a1 ?? throw new System.InvalidOperationException(
-                            "delta DROP COLUMN requires the column name."));
+                case AlterTableKind.DropColumn:
+                    BufferDropColumn(alterTxn, alterPath, s, t, spec.RequireColumn());
                     return;
-                case AlterKind.AddField:
-                    BufferAddField(alterTxn, alterPath, s, t,
-                        ParseJsonPath(a1, "ADD COLUMN (nested field)"),
+                case AlterTableKind.AddField:
+                    BufferAddField(alterTxn, alterPath, s, t, spec.RequirePath(),
                         c ?? throw new System.InvalidOperationException(
                             "delta ADD COLUMN (nested field) requires a field definition."));
                     return;
-                case AlterKind.DropField:
-                    BufferDropField(alterTxn, alterPath, s, t,
-                        ParseJsonPath(a1, "DROP COLUMN (nested field)"));
+                case AlterTableKind.DropField:
+                    BufferDropField(alterTxn, alterPath, s, t, spec.RequirePath());
                     return;
+                // Every other kind falls through to the immediate path below. Nested RENAME FIELD and
+                // RENAME TABLE stay immediate deliberately (see the note above); the rest have no buffered
+                // form. This used to be a kind list repeated in the `if` and again in the switch — one
+                // switch cannot disagree with itself.
             }
         }
         // RENAME TABLE of a table CREATED in this transaction — dbt's table materialization, and the shape
@@ -5218,11 +5212,10 @@ public sealed class DeltaCatalog : IBackendCatalog
         //      and their filesystem would keep writing there after the folder moved.
         // The pending-appends guard must therefore be SKIPPED for this case (buffered rows are expected);
         // it still applies to every other ALTER and to a table this transaction did not create.
-        if (k == AlterKind.RenameTable
+        if (spec.Kind == AlterTableKind.RenameTable
             && TryTxn(alterTxn)?.Get(TablePath(s, t)) is { CreatedInTxn: true } renCreated)
         {
-            string renTo = a1 ?? throw new System.InvalidOperationException(
-                "delta RENAME TABLE requires a new table name.");
+            string renTo = spec.RequireNewName();
             string renNew = TablePath(s, renTo);
             if (TryTxn(alterTxn)?.HasPending(renNew) == true || TableExists(renNew))
             {
@@ -5242,71 +5235,62 @@ public sealed class DeltaCatalog : IBackendCatalog
             return;
         }
         ThrowIfPendingAppends(TablePath(s, t), "ALTER TABLE");
-        _log.LogInformation("delta alter {Schema}.{Table}: kind={Kind} arg={Arg}", s, t, k, a1);
-        switch (k)
+        _log.LogInformation("delta alter {Schema}.{Table}: kind={Kind} column={Column}", s, t,
+                            AlterTableSpec.WireName(spec.Kind), spec.Column);
+        switch (spec.Kind)
         {
-            case AlterKind.AddColumn:
+            case AlterTableKind.AddColumn:
             {
                 var col = c ?? throw new System.InvalidOperationException(
                     "delta ADD COLUMN requires a column definition.");
-                string name = a1 ?? col.Name;
+                string name = spec.Column ?? col.Name;
                 var field = string.Equals(name, col.Name, System.StringComparison.Ordinal)
                     ? col
                     : new Field(name, col.DataType, col.IsNullable);
                 DeltaReader.AddColumn(Opener(), TablePath(s, t), field, default);
                 return;
             }
-            case AlterKind.RenameColumn:
+            case AlterTableKind.RenameColumn:
             {
-                // a1 = old column name, a2 = new column name (C++ RenameColumnInfo). Metadata-only commit on a
-                // column-mapping table (the field keeps its physicalName + columnMapping.id); EW rejects a plain
-                // table (which would need a full rewrite). Opener threaded for the host-FS log write.
-                string oldCol = a1 ?? throw new System.InvalidOperationException(
-                    "delta RENAME COLUMN requires the old column name.");
-                string newCol = a2 ?? throw new System.InvalidOperationException(
-                    "delta RENAME COLUMN requires the new column name.");
-                DeltaReader.RenameColumn(Opener(), TablePath(s, t), oldCol, newCol, default);
+                // Metadata-only commit on a column-mapping table (the field keeps its physicalName +
+                // columnMapping.id); EW rejects a plain table (which would need a full rewrite). Opener
+                // threaded for the host-FS log write.
+                DeltaReader.RenameColumn(Opener(), TablePath(s, t), spec.RequireColumn(), spec.RequireNewName(),
+                                         default);
                 return;
             }
-            case AlterKind.DropColumn:
+            case AlterTableKind.DropColumn:
             {
-                // a1 = column name. Metadata-only commit on a column-mapping table (old files keep the physical
-                // column; readers reconcile it away); EW rejects a plain table (would need a full rewrite).
-                string dropCol = a1 ?? throw new System.InvalidOperationException(
-                    "delta DROP COLUMN requires the column name.");
-                DeltaReader.DropColumn(Opener(), TablePath(s, t), dropCol, default);
+                // Metadata-only commit on a column-mapping table (old files keep the physical column; readers
+                // reconcile it away); EW rejects a plain table (would need a full rewrite).
+                DeltaReader.DropColumn(Opener(), TablePath(s, t), spec.RequireColumn(), default);
                 return;
             }
-            case AlterKind.AddField:
+            case AlterTableKind.AddField:
             {
-                // a1 = JSON path of the CONTAINING struct; `c` = the new field (metadata-only commit;
-                // old files backfill NULL on read via the recursive schema-evolution reconcile).
+                // `path` = the CONTAINING struct; `c` = the new field (metadata-only commit; old files
+                // backfill NULL on read via the recursive schema-evolution reconcile).
                 var col = c ?? throw new System.InvalidOperationException(
                     "delta ADD COLUMN (nested field) requires a field definition.");
-                var container = ParseJsonPath(a1, "ADD COLUMN (nested field)");
-                DeltaReader.AddField(Opener(), TablePath(s, t), container, col, default);
+                DeltaReader.AddField(Opener(), TablePath(s, t), spec.RequirePath(), col, default);
                 return;
             }
-            case AlterKind.RenameField:
+            case AlterTableKind.RenameField:
             {
-                // a1 = JSON full path of the field; a2 = the new name (requires column mapping).
-                var fieldPath = ParseJsonPath(a1, "RENAME COLUMN (nested field)");
-                string newFieldName = a2 ?? throw new System.InvalidOperationException(
-                    "delta RENAME COLUMN (nested field) requires the new name.");
-                DeltaReader.RenameField(Opener(), TablePath(s, t), fieldPath, newFieldName, default);
+                // `path` = the field's full path (requires column mapping).
+                DeltaReader.RenameField(Opener(), TablePath(s, t), spec.RequirePath(), spec.RequireNewName(),
+                                        default);
                 return;
             }
-            case AlterKind.DropField:
+            case AlterTableKind.DropField:
             {
-                // a1 = JSON full path of the field (requires column mapping; readers reconcile old files).
-                var fieldPath = ParseJsonPath(a1, "DROP COLUMN (nested field)");
-                DeltaReader.DropField(Opener(), TablePath(s, t), fieldPath, default);
+                // `path` = the field's full path (requires column mapping; readers reconcile old files).
+                DeltaReader.DropField(Opener(), TablePath(s, t), spec.RequirePath(), default);
                 return;
             }
-            case AlterKind.RenameTable:
+            case AlterTableKind.RenameTable:
             {
-                string newName = a1 ?? throw new System.InvalidOperationException(
-                    "delta RENAME TABLE requires a new table name.");
+                string newName = spec.RequireNewName();
                 // The table folder (incl. _delta_log) is moved; the schema is unchanged (RENAME TABLE renames
                 // within the same schema). SECRET-routed abfss:// (OneLake or a plain ADLS Gen2 account) → DFS
                 // atomic rename (Azure MoveFile is unimplemented); SECRET-routed s3:// → SDK server-side
@@ -5318,21 +5302,19 @@ public sealed class DeltaCatalog : IBackendCatalog
                 _tableConfigCache.TryRemove(TablePath(s, newName), out _);
                 return;
             }
-            case AlterKind.SetSortedBy:
+            case AlterTableKind.SetSortedBy:
             {
-                // ALTER TABLE t SET SORTED BY (a, b) / RESET SORTED BY — a1 = JSON array ([] = RESET).
+                // ALTER TABLE t SET SORTED BY (a, b) / RESET SORTED BY — `columns` ([] = RESET; the doc
+                // distinguishes an empty list from an absent one, which the old string arg could not).
                 // ONE metadata commit updates the fabricator.sortedBy ordered-write property AND
                 // (unpartitioned) the delta.clustering declaration — the ALTER CLUSTER BY analog; a
                 // partitioned table takes the property only (clustering + partitioning are mutually
                 // exclusive). Immediate/administrative, like set_tblproperties.
-                IReadOnlyList<string> sortCols = string.IsNullOrEmpty(a1)
-                    ? []
-                    : System.Text.Json.JsonSerializer.Deserialize<List<string>>(a1!) ?? [];
-                DeltaReader.SetSortedBy(Opener(), TablePath(s, t), sortCols, default);
+                DeltaReader.SetSortedBy(Opener(), TablePath(s, t), spec.RequireColumns(), default);
                 _tableConfigCache.TryRemove(TablePath(s, t), out _); // the config changed — re-read on next write
                 return;
             }
-            case AlterKind.SetPartitionedBy:
+            case AlterTableKind.SetPartitionedBy:
                 throw Unsupported(
                     "SET/RESET PARTITIONED BY — changing a Delta table's partitioning requires a full "
                     + "rewrite: COPY the data to the table's path with (FORMAT delta, MODE 'overwrite', "
@@ -5343,20 +5325,8 @@ public sealed class DeltaCatalog : IBackendCatalog
         }
     }
 
-    // A nested-field path from the host: a JSON array of segments (["s","inner","f"] — names may contain dots).
-    private static IReadOnlyList<string> ParseJsonPath(string? json, string operation)
-    {
-        if (string.IsNullOrEmpty(json))
-        {
-            throw new System.InvalidOperationException($"delta {operation} requires a field path.");
-        }
-        var segments = System.Text.Json.JsonSerializer.Deserialize<List<string>>(json!);
-        if (segments is not { Count: > 0 })
-        {
-            throw new System.InvalidOperationException($"delta {operation}: invalid field path '{json}'.");
-        }
-        return segments;
-    }
+    // (ParseJsonPath died at ABI v74 — the field path arrives already parsed, as AlterTableSpec.Path, and
+    //  AlterTableSpec.RequirePath() carries the "a path has at least one segment" check it used to make.)
 
     // ---- catalog-bound custom functions -------------------------------------------------------------
     // The scalar + table kinds are hosted (see Functions); in-out and aggregates deliberately are not — no

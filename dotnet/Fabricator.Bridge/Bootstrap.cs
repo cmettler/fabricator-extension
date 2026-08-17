@@ -57,7 +57,7 @@ public static unsafe class Bootstrap
             return new InMemoryArrayStream(schema, new[] { batch });
         });
 
-        vtable->AbiVersion = 73;
+        vtable->AbiVersion = 74;
         vtable->OpenCatalog = &OpenCatalog;
         vtable->CloseCatalog = &CloseCatalog;
         vtable->ExecuteQuery = &ExecuteQuery;
@@ -70,7 +70,6 @@ public static unsafe class Bootstrap
         vtable->DropTable = &DropTable;
         vtable->CreateSchema = &CreateSchema;
         vtable->DropSchema = &DropSchema;
-        vtable->AlterTable = &AlterTable;
         vtable->BeginTransaction = &BeginTransaction;
         vtable->CommitTransaction = &CommitTransaction;
         vtable->RollbackTransaction = &RollbackTransaction;
@@ -131,6 +130,7 @@ public static unsafe class Bootstrap
         vtable->TableInfo = &TableInfo;
         vtable->TableStats = &TableStats;
         vtable->TableScan = &TableScan;
+        vtable->TableAlter = &TableAlter;
         vtable->TableClose = &TableClose;
         return FabricatorStatus.Ok;
     }
@@ -510,6 +510,36 @@ public static unsafe class Bootstrap
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int TableAlter(nint table, byte* alterJson, CArrowArrayStream* column, byte** err)
+    {
+        try
+        {
+            if (alterJson is null || Handles.Resolve<TableSession>(table) is not { } session)
+            {
+                return FabricatorStatus.InvalidArgument;
+            }
+            var spec = AlterTableSpec.Parse(Marshal.PtrToStringUTF8((nint)alterJson)!);
+
+            // The TYPE CHANNEL: add_column / column_type / add_field carry the new column's or field's type
+            // as a one-field zero-row schema. It stays an Arrow field rather than folding into the doc
+            // because a VARIANT is identified by field METADATA, which no type name could carry.
+            Field? columnField = null;
+            if (column is not null)
+            {
+                using var stream = CArrowArrayStreamImporter.ImportArrayStream(column);
+                columnField = stream.Schema.FieldsList.Count > 0 ? stream.Schema.FieldsList[0] : null;
+            }
+            session.Alter(spec, columnField);
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
     private static void TableClose(nint table)
     {
         // A definition handle holds no provider resources — this frees the GCHandle. Best-effort by
@@ -600,36 +630,6 @@ public static unsafe class Bootstrap
                           ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
             var schemaName = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
             catalog.DropSchema(schemaName, ifExists != 0);
-            return FabricatorStatus.Ok;
-        }
-        catch (Exception ex)
-        {
-            SetError(err, ex);
-            return FabricatorStatus.Error;
-        }
-    }
-
-    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static int AlterTable(nint handle, byte* schema, byte* table, int alterKind, byte* arg1, byte* arg2,
-                                  CArrowArrayStream* column, int flags, byte** err)
-    {
-        try
-        {
-            var catalog = Handles.Resolve<IBackendCatalog>(handle)
-                          ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
-            var schemaName = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
-            var tableName = Marshal.PtrToStringUTF8((nint)table) ?? string.Empty;
-            var a1 = Marshal.PtrToStringUTF8((nint)arg1);
-            var a2 = Marshal.PtrToStringUTF8((nint)arg2);
-
-            // ADD_COLUMN / COLUMN_TYPE carry the new column's type as a one-field schema.
-            Field? columnField = null;
-            if (column is not null)
-            {
-                using var stream = CArrowArrayStreamImporter.ImportArrayStream(column);
-                columnField = stream.Schema.FieldsList.Count > 0 ? stream.Schema.FieldsList[0] : null;
-            }
-            catalog.AlterTable(alterKind, schemaName, tableName, a1, a2, columnField, flags);
             return FabricatorStatus.Ok;
         }
         catch (Exception ex)

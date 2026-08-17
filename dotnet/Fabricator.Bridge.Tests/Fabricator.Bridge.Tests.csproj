@@ -87,6 +87,17 @@
     -->
     <Compile Include="..\Fabricator.Bridge\FabricTokenServiceUrl.cs"
              Link="Linked\FabricTokenServiceUrl.cs" />
+    <!--
+      The table_alter request doc (ABI v74). Admissible because the spec is a plain record over
+      System.Text.Json — the new column's TYPE deliberately does not live in it (it rides beside the doc as
+      an Arrow field, since a VARIANT is identified by field metadata), which is exactly what keeps the
+      closure the BCL. Worth pinning offline: this is the one ABI doc the HOST writes and the bridge reads,
+      so nothing but a full build exercises the pair, and the states that matter are the ones a wrong parse
+      makes silent — set_default's JSON null (DEFAULT NULL) versus an absent key, and an EMPTY `columns`
+      array, which is the RESET spelling and must not read as "no list".
+    -->
+    <Compile Include="..\Fabricator.Abstractions\AlterTableSpec.cs"
+             Link="Linked\AlterTableSpec.cs" />
   </ItemGroup>
 
 </Project>

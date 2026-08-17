@@ -51,6 +51,14 @@ public:
 	virtual_column_map_t GetVirtualColumns() const override;
 	vector<column_t> GetRowIdColumns() const override;
 
+	//! The owned table-session handle (ABI v72 `table_open`), for the session entries a CALLER drives rather
+	//! than this entry — today only `table_alter`, which FabricatorSchemaEntry::Alter reaches through the
+	//! entry DuckDB itself just resolved. Never null for a live entry; valid for the entry's whole life,
+	//! graveyard included, because it wraps the stateless DEFINITION.
+	FabricatorHandle TableHandle() const {
+		return table_handle_;
+	}
+
 	bool HasRowId() const {
 		return !rowid_columns_.empty() || !virtual_rowid_columns_.empty();
 	}

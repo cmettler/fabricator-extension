@@ -196,3 +196,65 @@ DETACH lake;
 
 statement ok
 DETACH clake;
+
+# ============================================================================
+# 8. the `columns` carrier is IDENTIFIERS — and this is the one that was BROKEN before ABI v74.
+#
+# The list used to be built by a hand-rolled JSON writer that escaped only `"` and `\`; a control
+# character — a tab, entirely legal in a quoted DuckDB identifier — produced invalid JSON, and the ALTER
+# failed inside the managed parser naming a byte position rather than the column. The doc is written with
+# a real JSON writer now.
+#
+# The load-bearing assertion is the NEGATIVE one: SET SORTED BY RESOLVES the name against the schema, so
+# an unknown column errors. That is what proves the name arrived INTACT rather than merely arrived —
+# without it, a mangled name that happened to be accepted would pass just as well. The ordered-write check
+# beside it is the positive half: it needs the name to reach the WRITER, not just the validator.
+#
+# ⚠ Every INSERT here comes AFTER the SET SORTED BY. A row written before it is legitimately unordered, so
+# a table seeded first fails this check with the feature working perfectly — which is how the first draft
+# of this section failed.
+# ============================================================================
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/sorted_escape' AS elake (TYPE fabricator, PROVIDER 'delta');
+
+statement ok
+CREATE TABLE elake.main.t ("a	b" INTEGER, v INTEGER);
+
+statement ok
+ALTER TABLE elake.main.t SET SORTED BY ("a	b");
+
+# The declaration reached the WRITER: each appended file lands ordered by the tab-named column.
+statement ok
+INSERT INTO elake.main.t SELECT (r * 7) % 100, r FROM range(0, 200) t(r);
+
+statement ok
+INSERT INTO elake.main.t SELECT (r * 13) % 100, r FROM range(200, 400) t(r);
+
+query I
+WITH o AS (
+    SELECT "a	b" AS k, lag("a	b") OVER (PARTITION BY rowid >> 40 ORDER BY rowid) AS pk FROM elake.main.t
+)
+SELECT count(*) FROM o WHERE pk IS NOT NULL AND pk > k;
+----
+0
+
+# The negative control: a name that is NOT in the schema is refused, so the accepted one was RESOLVED
+# rather than waved through. Note it differs from the real column by one BYTE — space for tab — which is
+# precisely the difference a broken escape would erase.
+statement error
+ALTER TABLE elake.main.t SET SORTED BY ("a b");
+----
+is not a column of the table
+
+# RESET is the EMPTY list, which the doc tells apart from an absent one.
+statement ok
+ALTER TABLE elake.main.t RESET SORTED BY;
+
+query I
+SELECT count(*) FROM elake.main.t;
+----
+400
+
+statement ok
+DETACH elake;

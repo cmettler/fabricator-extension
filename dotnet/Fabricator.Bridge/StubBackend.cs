@@ -145,8 +145,7 @@ public sealed class StubBackend : IBackend
         {
         }
 
-        public void AlterTable(int alterKind, string schemaName, string tableName, string? arg1, string? arg2,
-                               Field? column, int flags)
+        public void AlterTable(AlterTableSpec spec, string schemaName, string tableName, Field? column)
         {
         }
 

@@ -259,3 +259,69 @@ query I
 SELECT count(*) FROM w.main.t WHERE extra2 IS NULL;
 ----
 5
+
+# ============================================================================
+# The `path` carrier is IDENTIFIERS, and it is an ARRAY for a reason: a field name may contain DOTS, so a
+# joined string could not say whether "a.b" is one segment or two. That predates ABI v74 and survives it.
+#
+# What v74 changed is who escapes them. The hand-rolled builder this replaced handled `"` and `\` and
+# nothing else, so a control character in a segment produced invalid JSON and the ALTER died inside the
+# managed parser naming a byte position. Both properties are pinned together here because they fail the
+# same way — a path that arrives as the wrong segments addresses the wrong field, or none.
+#
+# ⚠ The struct keeps a plain `keep` field throughout, and that is load-bearing rather than decoration:
+# dropping the only member the OLD files share leaves the read reconcile with no overlap at all, which is
+# the documented "fully disjoint children" cast error — a pre-existing limitation this section would
+# otherwise trip over while appearing to be about escaping.
+# ============================================================================
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/nestedescape' AS esc (TYPE fabricator, PROVIDER 'delta');
+
+statement ok
+CREATE TABLE esc.main.t (id INTEGER, "s.dotted" STRUCT("in	ner" INTEGER, keep INTEGER));
+
+statement ok
+INSERT INTO esc.main.t VALUES (1, {'in	ner': 10, 'keep': 1});
+
+# ADD a field inside a struct whose OWN name contains a dot, beside a sibling whose name contains a tab.
+statement ok
+ALTER TABLE esc.main.t ADD COLUMN "s.dotted"."new	field" VARCHAR;
+
+statement ok
+INSERT INTO esc.main.t VALUES (2, {'in	ner': 20, 'keep': 2, 'new	field': 'v'});
+
+query IIII
+SELECT id, ("s.dotted")."in	ner", ("s.dotted").keep, ("s.dotted")."new	field" FROM esc.main.t ORDER BY id;
+----
+1	10	1	NULL
+2	20	2	v
+
+# RENAME carries the path AND a new name; the path must still resolve after the add above.
+statement ok
+ALTER TABLE esc.main.t RENAME COLUMN "s.dotted"."new	field" TO "re named";
+
+query II
+SELECT id, ("s.dotted")."re named" FROM esc.main.t ORDER BY id;
+----
+1	NULL
+2	v
+
+# The negative control: a path whose LAST segment differs from the real one by a single byte — space for
+# tab — must not resolve. Without it, a mangled path that happened to be accepted would pass too.
+statement error
+ALTER TABLE esc.main.t DROP COLUMN "s.dotted"."in ner";
+----
+in ner
+
+statement ok
+ALTER TABLE esc.main.t DROP COLUMN "s.dotted"."in	ner";
+
+query III
+SELECT id, ("s.dotted").keep, ("s.dotted")."re named" FROM esc.main.t ORDER BY id;
+----
+1	1	NULL
+2	2	v
+
+statement ok
+DETACH esc;

@@ -918,16 +918,15 @@ public sealed class DeltaRsCatalog : IBackendCatalog
     // old rows read NULL, no data written). Works on every backend (object_store), no engineered-wood IO seam
     // and no delta-rs Rust amendment. RENAME TABLE moves the table folder (local only for now). Other kinds
     // (RENAME/DROP COLUMN, ALTER TYPE) need column mapping / a rewrite → clean error.
-    public void AlterTable(int alterKind, string schemaName, string tableName, string? arg1, string? arg2,
-                           Field? column, int flags)
+    public void AlterTable(AlterTableSpec spec, string schemaName, string tableName, Field? column)
     {
-        switch (alterKind)
+        switch (spec.Kind)
         {
-            case AlterKind.AddColumn:
+            case AlterTableKind.AddColumn:
             {
                 var col = column ?? throw new InvalidOperationException(
                     "delta-rs ADD COLUMN requires a column definition.");
-                string name = string.IsNullOrEmpty(arg1) ? col.Name : arg1!;
+                string name = spec.Column ?? col.Name;
                 using var t = Open(schemaName, tableName);
                 var current = t.Schema();
                 var fields = new List<Field>(current.FieldsList) { new Field(name, col.DataType, nullable: true) };
@@ -943,10 +942,9 @@ public sealed class DeltaRsCatalog : IBackendCatalog
                     new InsertOptions { SaveMode = SaveMode.Append, OverwriteSchema = false }, default));
                 return;
             }
-            case AlterKind.RenameTable:
+            case AlterTableKind.RenameTable:
             {
-                string newName = arg1 ?? throw new InvalidOperationException(
-                    "delta-rs RENAME TABLE requires a new table name.");
+                string newName = spec.RequireNewName();
                 if (!RootIsLocal)
                 {
                     throw Unsupported("RENAME TABLE on a non-local delta-rs catalog (cloud rename deferred)");

@@ -452,12 +452,16 @@ public interface IBackendCatalog : IDisposable
     IArrowArrayStream InsertReturning(string schemaName, string tableName, IArrowArrayStream rows);
 
     /// <summary>
-    /// Alters a table. <paramref name="alterKind"/> is an <see cref="AlterKind"/>;
-    /// <paramref name="arg1"/>/<paramref name="arg2"/> are names (per kind). For
-    /// <see cref="AlterKind.AddColumn"/> / <see cref="AlterKind.ColumnType"/> the
-    /// new column's type is carried by <paramref name="column"/>. <paramref name="flags"/>
-    /// bit 0 (<see cref="AlterKind.FlagIfExists"/>) is the if-(not-)exists guard.
+    /// Alters a table. <paramref name="spec"/> is the typed request parsed from the <c>table_alter</c> doc;
+    /// <paramref name="column"/> carries the new column's/field's TYPE for the three kinds that add or
+    /// change one (<see cref="AlterTableKind.AddColumn"/> / <see cref="AlterTableKind.ColumnType"/> /
+    /// <see cref="AlterTableKind.AddField"/>), and is null otherwise.
     /// </summary>
-    void AlterTable(int alterKind, string schemaName, string tableName, string? arg1, string? arg2, Field? column,
-                    int flags);
+    /// <remarks>
+    /// Still name-based although its ABI entry is now handle-based: the ALTER is CATALOG work — provider
+    /// caches, the transaction buffer, the touch record — so the session hands the names down rather than
+    /// the providers reimplementing it per bound table. What the v74 handle bought is the doc, not a
+    /// relocation of the implementation.
+    /// </remarks>
+    void AlterTable(AlterTableSpec spec, string schemaName, string tableName, Field? column);
 }

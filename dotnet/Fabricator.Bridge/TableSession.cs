@@ -128,4 +128,14 @@ internal sealed class TableSession
     /// AT matters to <see cref="SchemaStream"/>, where the as-of column layout is resolved).</summary>
     internal IArrowArrayStream Scan(string? specJson, IArrowArrayStream? filterValues) =>
         With(t => t.Scan(specJson, filterValues));
+
+    /// <summary>The <c>table_alter</c> action (ABI v74). Deliberately does NOT go through
+    /// <see cref="With"/>: an ALTER is CATALOG work — provider caches, the transaction buffer, the DDL touch
+    /// record — so it is dispatched on the catalog with the definition's names, and binding a table first
+    /// would resolve a shape the statement is about to invalidate. What the handle bought is the identity
+    /// (no name pair on the wire) and the typed doc, not a relocation of the work: the providers read the
+    /// AMBIENT transaction themselves, which is how Delta buffers a schema-evolution ALTER into an open
+    /// transaction rather than committing it alone.</summary>
+    internal void Alter(AlterTableSpec spec, Field? column) =>
+        _catalog.AlterTable(spec, _definition.SchemaName, _definition.TableName, column);
 }

@@ -309,7 +309,12 @@ case "$TIER" in
         # cardinality it never had — it alters PLANS, and the plan-sensitive suites (the batched-read
         # routing gates, merge_into, subplan_dedup) reporting their exact prior counts is what says no
         # answer and no routing followed the estimates.
-        : "${MIN_ASSERTIONS:=7505}"
+        # 7558 since 2026-08-17, from a green tier run: 7505 + exactly the 53 assertions ABI v74 added
+        # (verify_delta_catalog_alter 116 -> 132, verify_delta_sorted_by 30 -> 40,
+        # verify_delta_catalog_nested_alter 100 -> 127), so NO other suite moved. That is the claim that
+        # matters for replacing alter_table's kind int + arg1/arg2/flags with one typed JSON doc: it is a
+        # TRANSPORT change, so every ALTER answer must be identical.
+        : "${MIN_ASSERTIONS:=7558}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

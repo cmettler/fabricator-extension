@@ -234,6 +234,12 @@ table_alter(table, alter_json)                     // one struct instead of (kin
 table_close(table)
 ```
 
+*(⚠ As built (ABI v74, 2026-08-17) `table_alter` is `table_alter(table, alter_json, column, err)` — the
+`column` Arrow stream stays BESIDE the doc rather than folding into it, because it is the TYPE CHANNEL and
+a VARIANT rides Arrow field metadata no type name can carry. The other DML entries listed above are still
+name-based; see §5 item 4d's note. Full as-built:
+[abi-history.md](abi-history.md) §v74.)*
+
 Catalog-level discovery keeps Arrow streams (right tool for LISTS) but as **dedicated typed entries** —
 `catalog_schemas`, `catalog_tables` — with declared schemas, not kind ints. `ServerInfo`'s capability half
 (`exact_filter_pushdown`, `is_binary_collation`) moves into **`open_catalog`'s result** as one JSON doc read
@@ -623,6 +629,14 @@ the same table the code evaluates.
          nothing forces them (they never rode `get_metadata`, and the C# side already resolves per-txn
          state ambiently), so re-pointing them at table handles is follow-on work with its own risk
          budget, not part of retiring the multiplexer.
+         - **`table_alter` was TAKEN as that follow-on (ABI v74, 2026-08-17)** — the tamest of the DML
+           entries (no background thread, no bulk session) and the one whose ARGUMENTS were the real
+           problem: a kind int plus `arg1`/`arg2`/`flags`, each meaning something different per kind.
+           Both axes landed — the handle AND one typed JSON doc — and the `column` Arrow stream stayed
+           beside it as the type channel. `execute_delete`/`execute_update`/`begin_bulk`/`create_table`
+           are still name-based; unlike ALTER they carry no overloaded carriers, so the doc half buys
+           them nothing and only the handle half would remain. Full as-built:
+           [abi-history.md](abi-history.md) §v74.
        - Gates: hermetic **69/69 — 7193** and service **50/50 — 2028**, both IDENTICAL to the 4c baseline
          (the behaviour-preservation claim — the transport changed, no answer may move); smoke incl. a
          rowid UPDATE and `AT (VERSION => 1)` through the new session. DeltaRs + DAX compile-verified

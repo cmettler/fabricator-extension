@@ -795,6 +795,18 @@ void TableScan(FabricatorHandle table, const std::string &spec_json, ArrowArrayS
 	}
 }
 
+void TableAlter(FabricatorHandle table, const std::string &alter_json, ArrowArrayStream *column) {
+	const FabricatorVTable &vt = GetBridge();
+	if (!vt.table_alter) {
+		throw duckdb::IOException("Fabricator: bridge does not provide table_alter");
+	}
+	char *err = nullptr;
+	int32_t rc = vt.table_alter(table, alter_json.c_str(), column, &err);
+	if (rc != FABRICATOR_OK) {
+		ThrowManagedError(vt, err, "Fabricator: table_alter failed");
+	}
+}
+
 void TableClose(FabricatorHandle table) noexcept {
 	// Best-effort by contract: runs from the entry destructor at catalog teardown, where a managed call
 	// must never throw. Frees the managed GCHandle, nothing more.
@@ -1421,20 +1433,7 @@ void DropSchema(FabricatorHandle handle, const std::string &schema, bool if_exis
 	}
 }
 
-void AlterTable(FabricatorHandle handle, const std::string &schema, const std::string &table, int32_t alter_kind,
-                const std::string &arg1, const std::string &arg2, ArrowArrayStream *column, int32_t flags) {
-	const FabricatorVTable &vt = GetBridge();
-	if (!vt.alter_table) {
-		throw duckdb::IOException("Fabricator: bridge does not provide alter_table");
-	}
-	char *err = nullptr;
-	int32_t rc = vt.alter_table(handle, schema.c_str(), table.c_str(), alter_kind,
-	                            arg1.empty() ? nullptr : arg1.c_str(), arg2.empty() ? nullptr : arg2.c_str(), column,
-	                            flags, &err);
-	if (rc != FABRICATOR_OK) {
-		ThrowManagedError(vt, err, "Fabricator: alter_table failed");
-	}
-}
+// (AlterTable was replaced at ABI v74 by TableAlter, defined with the other table-session wrappers.)
 
 void BeginTransaction(FabricatorHandle handle, bool is_explicit) {
 	const FabricatorVTable &vt = GetBridge();
