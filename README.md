@@ -1471,26 +1471,32 @@ input and are excluded by a single anti-join. Measured on 100 files that all car
 some parquet row-group skipping on a heavily-deleted file — which measured as no wall-clock difference
 locally, but is worth re-checking on remote storage.
 
-Partitioned tables are batched as well — the partition value is not stored in the data files, so it travels
-alongside them and is applied in the same query.
+Partitioned tables are batched as well. A partition value is not stored in the data files at all — the log
+is the authoritative source — so it travels alongside them and is matched back to the file each row came
+from, in the same query.
 
-**On remote storage, which columns you select can dominate the query.** A scan takes one of two batched
-forms. The cheap one *declares* the schema up front and so never opens a parquet footer; the other one
-discovers the schema from the files, which costs one remote read per file before a single row is returned.
-Measured on a Fabric lakehouse table with 89 active files, same query, same data: **0.5 s versus 34 s** —
-enough to take a `SELECT … LIMIT 1` on that table from 77 s to 47 s.
+**On remote storage, which columns you select can dominate the query.** What decides it is whether the scan
+needs a row *position*, because that is the one thing only the file can supply:
 
-A scan takes the cheap form when it needs no row *position*: a plain `SELECT` of ordinary columns from a
-table none of whose files carry a deletion vector. It takes the expensive one for `UPDATE`/`DELETE`, for a
-table where **any** file carries a deletion vector (one is enough to send the whole scan there), and — the
-surprising case — for **any query that selects a partition column**, including `SELECT *` on a partitioned
-table, because the partition value lives in the log rather than in the files and has to be matched back to
-the file each row came from.
+| you select | what the scan does | parquet footers opened |
+|---|---|---|
+| only partition columns (`SELECT p, count(*)`) | answers from the log alone | **none** |
+| ordinary columns, no deletion vector in play | *declares* the schema up front | **none** |
+| ordinary columns, some files carry deletion vectors | the clean files as above, one extra branch per deleted file | one per *deleted* file |
+| anything needing a row position — `UPDATE`/`DELETE`, the row-tracking columns | *discovers* the schema from the files | **one per file, before the first row** |
 
-So on a wide partitioned table over OneLake or S3, prefer naming the columns you need over `SELECT *`. On
-local storage the difference is negligible, since opening a footer is nearly free. `OPTIMIZE` helps both
-forms, because both costs scale with the number of active files — and on a heavily-deleted table it also
-clears the deletion vectors, which moves ordinary reads back onto the cheap form.
+The gap between declaring and discovering is the one to know about: measured on a Fabric lakehouse table
+with 89 active files, same query, same data, **0.5 s versus 34 s** — enough to take a `SELECT … LIMIT 1` on
+that table from 77 s to 47 s.
+
+Selecting a partition column is *not* one of the expensive cases, and neither is `SELECT *` on a partitioned
+table. (It was until 2026-08-17, and this section said so.) On remote storage a table where **any** file
+carries a deletion vector still sends ordinary reads to the discovering form unless the query pushes a plain
+`LIMIT`; locally it does not.
+
+On local storage none of this matters much, since opening a footer is nearly free. `OPTIMIZE` helps every
+form, because their costs scale with the number of active files — and on a heavily-deleted table it also
+clears the deletion vectors, which moves remote reads back onto the cheap form.
 
 ### Text columns on SQL Server: VARCHAR vs NVARCHAR
 

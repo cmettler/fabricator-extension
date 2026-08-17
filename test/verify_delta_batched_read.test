@@ -1335,5 +1335,185 @@ WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native batch%'
 ----
 true
 
+# ============================================================================
+# 15. THE PARTITION-ONLY FORM — a projection of ONLY partition columns opens NO DATA FILE AT ALL.
+#     Both halves of the answer are in the log: each file's partitionValues, and how many rows it
+#     contributes (stats.numRecords less the deletion vector's cardinality). Before 2026-08-17 this shape
+#     declined at BOTH other forms' "nothing to read from the files" guards and fell to the per-file loop —
+#     TWO host queries per file (an uncached footer probe it needs nothing from, then a data query whose
+#     only job is to produce the right NUMBER of rows), serial at the default prefetch.
+#     ⚠ THE OBSERVABLE CANNOT BE THE TABLE NAME, unlike every other section here: the synthesized SQL names
+#     no file and no table (that IS the feature), so it is keyed on the unique partition-column name each
+#     fixture below declares, plus one GLOBAL invariant — no synthesized query anywhere in this suite names
+#     a parquet file.
+#     ⚠ The routing control is a SAME-TABLE A/B (§15a): one query projecting only the partition column, one
+#     adding a data column, differing in nothing else. Without it "the synthesis fired" would pass equally
+#     if the plain form had stopped working and everything had fallen here.
+#     ⚠ §15b and §15e are the value-bearing kills; §15a's row counts are form-independent and would pass
+#     from the loop too.
+# ============================================================================
+
+statement ok
+CREATE TABLE b.main.ponly (id BIGINT, pzone VARCHAR) PARTITIONED BY (pzone);
+
+statement ok
+INSERT INTO b.main.ponly SELECT i, 'z' || (i % 3) FROM range(30) r(i);
+
+statement ok
+INSERT INTO b.main.ponly SELECT i, 'z' || (i % 3) FROM range(30, 60) r(i);
+
+# 15a. The A/B. Same table, same session; only the projection differs.
+query II
+SELECT pzone, count(*) FROM b.main.ponly GROUP BY pzone ORDER BY pzone;
+----
+z0	20
+z1	20
+z2	20
+
+# The partition-only projection is served from the log — a correlated range() over the per-file counts.
+query I
+SELECT count(*) > 0 FROM duckdb_logs
+WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native batch%'
+  AND message LIKE '%AS "pzone"%' AND message LIKE '%range(__fab_f."row_count")%';
+----
+true
+
+# The control: adding ONE data column puts the very same table back on the plain form, which DOES read the
+# files and joins the log's constants on `filename` for the partition value (§10c's mechanism).
+query III
+SELECT pzone, count(*), sum(id) FROM b.main.ponly GROUP BY pzone ORDER BY pzone;
+----
+z0	20	570
+z1	20	590
+z2	20	610
+
+query I
+SELECT count(*) > 0 FROM duckdb_logs
+WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native batch%'
+  AND message LIKE '%ponly%' AND message LIKE '%schema = map%' AND message LIKE '%CAST(__fab_f.%';
+----
+true
+
+# THE GLOBAL INVARIANT: a synthesized query never names a data file. Needs no table scoping — if the form
+# ever starts reading parquet, it has stopped being this form.
+query I
+SELECT count(*) FROM duckdb_logs
+WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native batch%'
+  AND message LIKE '%range(__fab_f."row_count")%' AND message LIKE '%read_parquet%';
+----
+0
+
+# 15b. DELETION VECTORS need no branch here — every surviving row of a file carries the same partition
+#      values, so a DV changes only HOW MANY rows to emit. That is a subtraction, and this is its kill: 7
+#      rows deleted from d0 must leave 13, not 20.
+statement ok
+CREATE TABLE b.main.podv (id BIGINT, pdvz VARCHAR) PARTITIONED BY (pdvz);
+
+statement ok
+INSERT INTO b.main.podv SELECT i, 'd' || (i % 3) FROM range(30) r(i);
+
+statement ok
+INSERT INTO b.main.podv SELECT i, 'd' || (i % 3) FROM range(30, 60) r(i);
+
+statement ok
+DELETE FROM b.main.podv WHERE id IN (0, 3, 6, 9, 12, 15, 18);
+
+query II
+SELECT pdvz, count(*) FROM b.main.podv GROUP BY pdvz ORDER BY pdvz;
+----
+d0	13
+d1	20
+d2	20
+
+query I
+SELECT count(*) > 0 FROM duckdb_logs
+WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native batch%'
+  AND message LIKE '%AS "pdvz"%' AND message LIKE '%range(__fab_f."row_count")%';
+----
+true
+
+# 15c. Several partition columns of DIFFERENT types, one of them NULL. The bound values are raw VARCHAR and
+#      the declared type is applied in SQL, so a mis-ordered p0/p1 would land a value in the wrong column.
+statement ok
+CREATE TABLE b.main.pomc (id BIGINT, pma VARCHAR, pmb INTEGER) PARTITIONED BY (pma, pmb);
+
+statement ok
+INSERT INTO b.main.pomc VALUES (1,'x',10),(2,'x',10),(3,'y',20),(4,NULL,30),(5,NULL,30);
+
+query III
+SELECT pma, pmb, count(*) FROM b.main.pomc GROUP BY pma, pmb ORDER BY pma NULLS LAST, pmb;
+----
+x	10	2
+y	20	1
+NULL	30	2
+
+query I
+SELECT count(*) > 0 FROM duckdb_logs
+WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native batch%'
+  AND message LIKE '%AS "pma"%' AND message LIKE '%AS "pmb"%'
+  AND message LIKE '%range(__fab_f."row_count")%';
+----
+true
+
+# 15d. ID-MODE column mapping, which BOTH other batched forms decline outright (a name-keyed `schema` map is
+#      unsound against a file we did not write). This form resolves no stored name and opens no file, so it
+#      serves it — a capability gain, not an oversight of that gate.
+statement ok
+CREATE TABLE im.main.poid (id BIGINT, pidz VARCHAR) PARTITIONED BY (pidz);
+
+statement ok
+INSERT INTO im.main.poid SELECT i, 'q' || (i % 3) FROM range(30) r(i);
+
+statement ok
+INSERT INTO im.main.poid SELECT i, 'q' || (i % 3) FROM range(30, 60) r(i);
+
+query II
+SELECT pidz, count(*) FROM im.main.poid GROUP BY pidz ORDER BY pidz;
+----
+q0	20
+q1	20
+q2	20
+
+query I
+SELECT count(*) > 0 FROM duckdb_logs
+WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native batch%'
+  AND message LIKE '%AS "pidz"%' AND message LIKE '%range(__fab_f."row_count")%';
+----
+true
+
+# 15e. THE NO-STATS SPLIT, and it is reachable rather than theoretical: a PENDING (uncommitted) file inside
+#      an explicit transaction carries no stats at all, so its count cannot come from the log and it keeps
+#      the per-file loop while the six committed files are synthesized. A form that batched it anyway would
+#      emit ZERO rows for it — the z9 group would VANISH, not merely be short.
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO b.main.ponly SELECT i, 'z9' FROM range(5) r(i);
+
+query II
+SELECT pzone, count(*) FROM b.main.ponly GROUP BY pzone ORDER BY pzone;
+----
+z0	20
+z1	20
+z2	20
+z9	5
+
+# 6 committed files synthesized, the 1 pending file looped — the split itself.
+query I
+SELECT count(*) > 0 FROM duckdb_logs
+WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native scan%'
+  AND message LIKE '%ponly%' AND message LIKE '%files=7 batched=6%' AND message LIKE '%cols=[pzone]%';
+----
+true
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM b.main.ponly;
+----
+60
+
 statement ok
 CALL disable_logging();

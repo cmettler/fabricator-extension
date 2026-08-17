@@ -412,12 +412,14 @@ internal static class DeltaNativeReader
     /// id-matching is unsound for files we did not write, not because a reachable bug was reproduced.</para>
     /// NAME mode needs no such gate: there the physical name IS authoritative and stable across renames, which
     /// is the reason the mode exists.</item>
-    /// <item><b>Partition values are per file and absent from the data files</b>, so a single call would
-    /// backfill them as <c>default_value</c> NULL. Reaching them needs a <c>filename</c> join — which case 1
-    /// now records as AVAILABLE under the VARCHAR map (<c>filename => true</c> composes; measured
-    /// 2026-08-15), so this gate is UNIMPLEMENTED rather than blocked: the fix is the full form's per-file
-    /// constants input joined on <c>filename</c>, brought over to this form. Until built, a projected
-    /// partition column still declines here.</item>
+    /// <item><b>Partition values are per file and absent from the data files</b>, so a declared <c>schema</c>
+    /// entry would just backfill them as <c>default_value</c> NULL. <b>CLOSED 2026-08-17 — this is no longer a
+    /// gate in either direction.</b> A projection naming a partition column ALONGSIDE data columns takes the
+    /// plain form, its value arriving from the log's per-file constants joined on <c>filename</c> (which case 1
+    /// records as composing with the VARCHAR map); a projection of ONLY partition columns takes
+    /// <see cref="BatchPlan.TryPartitionOnlyForm"/> and opens no file at all, since the log carries both the
+    /// values and the surviving row count. What stays refused is <c>hive_partitioning</c> beside <c>schema</c>,
+    /// which nothing here wants: the log is authoritative and the paths stay opaque.</item>
     /// <item><b>A per-file predicate cannot be expressed IN ONE SELECT</b> — the deletion vector's prunable
     /// bound, the rowid's position range, the row-tracking condition. Those are pruning, not correctness
     /// (DuckDB re-applies every predicate above the scan), but forfeiting them is the opposite of the point.
@@ -558,6 +560,15 @@ internal static class DeltaNativeReader
                     wantsTracking = true;
                 }
             }
+            // THE CHEAPEST FORM OF ALL goes first: a projection of ONLY partition columns needs no data file,
+            // because the values and the surviving row COUNT are both in the log. Its applicability is DISJOINT
+            // from every other form (they all decline this shape at their own "nothing to read from the files"
+            // guard), so the order is about not doing the work twice, not about precedence.
+            var partitionOnly = TryPartitionOnlyForm(listing, dataCols, wantRowId, wantsTracking, where, min);
+            if (partitionOnly is not null)
+            {
+                return partitionOnly;
+            }
             // ⚠ THE PLAIN FORM IS TRIED FIRST, and it is not merely a preference — it is strictly cheaper to
             // ATTEMPT. TryPlainForm is pure string work; TryFullForm issues PresentNames, a
             // `parquet_schema([every file])` query, which on remote storage is an O(files) FOOTER read.
@@ -613,8 +624,12 @@ internal static class DeltaNativeReader
         /// keeping their prunable bound) and only failing that leaves on the per-file loop.
         /// <para>Cannot express anything needing a row POSITION — the transient rowid, a deletion vector, the
         /// derived row-tracking ids — because those need <c>file_row_number</c>, which a VARCHAR-keyed map
-        /// refuses (case 1 in the class remarks). Nor a PROJECTED partition column: <c>schema</c> is refused
-        /// together with <c>hive_partitioning</c>.</para>
+        /// refuses (case 1 in the class remarks). A PROJECTED partition column it DOES serve (since
+        /// 2026-08-17): not through the map, which cannot describe a value no file contains, but through the
+        /// log's per-file constants joined on <c>filename</c> — <c>filename => true</c> composes with the
+        /// VARCHAR map where <c>file_row_number</c> does not, which is exactly why deletion vectors still need
+        /// their own branches. A projection of ONLY partition columns declines here and is served one form
+        /// earlier by <see cref="TryPartitionOnlyForm"/>, which reads no file whatsoever.</para>
         /// <para>⚠ It passes NO <c>hive_partitioning</c> flag where the full form disables it explicitly, and
         /// that is safe rather than an oversight: MEASURED on a table whose files really do live under
         /// <c>edwYear=2012/edwMonth=10/</c>, <c>DESCRIBE SELECT *</c> under the schema map returns exactly the
@@ -662,6 +677,110 @@ internal static class DeltaNativeReader
             };
             return new BatchPlan("WITH " + p.MetaCte + " " + p.CoreSql, p.BatchFiles, p.LoopFiles,
                                  inputs, new[] { view });
+        }
+
+        /// <summary>
+        /// The PARTITION-ONLY form: when every projected column is a partition column, <b>no data file is read
+        /// at all</b>. Both halves of the answer are in the log — the per-file <c>partitionValues</c> and, via
+        /// <see cref="LiveRowCount"/>, how many rows that file contributes — so the plan is one bound input of
+        /// one row per file, expanded by a correlated <c>range(row_count)</c>.
+        /// <para><b>What it replaces.</b> This shape declined at BOTH other forms' matching guards, for the same
+        /// honest reason (a <c>schema</c> map with nothing to declare; the full form's <c>entries.Count == 0</c>),
+        /// and fell to the per-file loop — <b>2 host queries per file, SERIAL at the default prefetch of 1</b>:
+        /// an UNCACHED <c>parquet_schema</c> footer probe (which this shape needs nothing from) and then a data
+        /// query whose only job is to produce the right NUMBER of rows. MEASURED on an 8-file table: 16 host
+        /// queries and <c>batched=0</c>, against one query and zero parquet IO here.</para>
+        /// <para>⚠ <b>DELETION VECTORS NEED NO BRANCH HERE, which is the one place this form is structurally
+        /// simpler than the others rather than just cheaper.</b> Every surviving row of a file carries the SAME
+        /// partition values, so a DV changes only HOW MANY rows to emit — a subtraction, not a per-row anti-join.
+        /// That is why this form covers a mixed table in one query where <see cref="TryUnionForm"/> needs a
+        /// branch per DV file.</para>
+        /// <para>⚠ <b>ID-mode column mapping is likewise irrelevant here, and that is a genuine capability gain
+        /// rather than an oversight of the gate the other forms carry.</b> Their id-mode gate exists because a
+        /// name-keyed <c>schema</c> map may silently miss a column in a file we did not write; this form resolves
+        /// no stored name and opens no file. The partition-value lookup is the log's own dual physical/logical
+        /// key match (<see cref="LookupPartitionValue"/>), which id mode satisfies — <c>physicalName</c> metadata
+        /// is present in id mode exactly as in name mode.</para>
+        /// <para>⚠ A file whose add carries NO stats keeps the loop (see <see cref="LiveRowCount"/>), so this is
+        /// PARTIAL by the same design as the plain form — the split is per file, not all-or-nothing.</para>
+        /// <para>⚠ It deliberately does NOT take the zero-column (<c>COUNT(*)</c>) shape, though the same
+        /// synthesis would serve it: that already batches into ONE query
+        /// (<c>SELECT 1 FROM read_parquet([…])</c>), so the win there is N footer reads rather than 2N host
+        /// queries, and it is a behaviour change on the single most-travelled shape in the reader. Worth
+        /// measuring on its own; not smuggled in here.</para>
+        /// </summary>
+        private static BatchPlan? TryPartitionOnlyForm(
+            DeltaReader.NativeScanList listing, IReadOnlyList<string> dataCols, bool wantRowId, bool wantsTracking,
+            string? where, int min)
+        {
+            // A row POSITION is the one thing the log cannot supply per row: the transient rowid and the
+            // row-tracking ids both need file_row_number, which exists only in the file.
+            if (wantRowId || wantsTracking || dataCols.Count == 0
+                || listing.PartitionColumns.Count == 0 || listing.TableSchema is null)
+            {
+                return null;
+            }
+            var inner = new List<string>(dataCols.Count);
+            for (int i = 0; i < dataCols.Count; i++)
+            {
+                string c = dataCols[i];
+                if (!ContainsName(listing.PartitionColumns, c))
+                {
+                    return null; // a real column is projected: a form that reads the files has to serve it
+                }
+                var field = FindField(listing.TableSchema, c);
+                if (field is null)
+                {
+                    return null;
+                }
+                string ptype;
+                try
+                {
+                    ptype = TypeText(field.Type);
+                }
+                catch (NotSupportedException)
+                {
+                    return null;
+                }
+                // The SAME fragment the plain and full forms emit for a partition column, with the same
+                // TypeText — the bound value is raw VARCHAR and the declared type is applied in SQL.
+                inner.Add($"CAST(__fab_f.{Quote("p" + i.ToString(CultureInfo.InvariantCulture))} AS {ptype}) "
+                          + $"AS {Quote(c)}");
+            }
+            var batchFiles = new List<DeltaReader.NativeScanFile>(listing.Files.Count);
+            var loopFiles = new List<DeltaReader.NativeScanFile>();
+            foreach (var f in listing.Files)
+            {
+                (LiveRowCount(f) is not null ? batchFiles : loopFiles).Add(f);
+            }
+            if (batchFiles.Count < min)
+            {
+                return null;
+            }
+            string view = NextViewName(MetaViewName);
+            // MATERIALIZED for the standing reason: the bound view is a SINGLE-USE stream, so anything that
+            // scanned it twice would fail loudly (SingleScanArrowStream) rather than quietly — and the CTE
+            // costs one row per file.
+            var sb = new StringBuilder("WITH __fab_f AS MATERIALIZED (SELECT * FROM ")
+                .Append(Quote(view)).Append(") SELECT ")
+                .Append(string.Join(", ", dataCols.Select(Quote)))
+                .Append(" FROM (SELECT ").Append(string.Join(", ", inner))
+                .Append(" FROM __fab_f, range(__fab_f.").Append(Quote("row_count")).Append("))");
+            // The WHERE binds logical names against the projection above it, exactly as the other forms do. It
+            // can only reference projected columns, and every projected column here is a partition column.
+            if (!string.IsNullOrEmpty(where))
+            {
+                sb.Append(" WHERE ").Append(where);
+            }
+            var files = batchFiles;
+            var partCols = dataCols;   // p0..pn are indexed by PROJECTION order, matching `inner` above
+            Func<IReadOnlyList<(string, IArrowArrayStream)>> inputs = () => new (string, IArrowArrayStream)[]
+            {
+                (view, new SingleScanArrowStream(
+                    MetaStream(files, partCols, listing, withFileOrdinal: false, withRowCount: true,
+                               withFileName: false), view)),
+            };
+            return new BatchPlan(sb.ToString(), batchFiles, loopFiles, inputs, new[] { view });
         }
 
         private static BatchPlan? TryPlainForm(
@@ -780,8 +899,10 @@ internal static class DeltaNativeReader
             {
                 // Every projected column was a partition column: there is nothing to read from the files, so a
                 // `schema` map would be empty and this form has no work to declare. Same shape the full form
-                // declines (its `entries.Count == 0` guard) — the answer is derivable from the log alone, which
-                // neither form attempts. Falls to the per-file loop.
+                // declines (its `entries.Count == 0` guard), and the honest reason in both cases is that the
+                // answer is derivable from the LOG alone — which is what TryPartitionOnlyForm does, one form
+                // earlier in Build. Reaching HERE therefore means that form declined too (a file with no stats,
+                // a type it could not render), so the per-file loop is the correct fallback.
                 return null;
             }
             string projection = string.Join(", ", dataCols.Select(Quote));
@@ -1107,7 +1228,10 @@ internal static class DeltaNativeReader
             }
             if (entries.Count == 0 && trackingCols.Count == 0)
             {
-                return null; // every requested column was a partition column: nothing to read from the files
+                // Every requested column was a partition column: nothing to read from the files. Served by
+                // TryPartitionOnlyForm (tried first in Build, from the log alone); reaching here means that
+                // form declined for its own reasons, so the loop answers.
+                return null;
             }
             var files = listing.Files;
             // ⚠ ONE presence query for the whole scan, and it is REQUIRED, not an optimisation.
@@ -1473,12 +1597,13 @@ internal static class DeltaNativeReader
     private static IArrowArrayStream MetaStream(
         IReadOnlyList<DeltaReader.NativeScanFile> files, IReadOnlyList<string> partitionCols,
         DeltaReader.NativeScanList listing, bool withFileOrdinal, bool withBaseRowId = false,
-        bool withCommitVersion = false)
+        bool withCommitVersion = false, bool withRowCount = false, bool withFileName = true)
     {
         var fn = new StringArray.Builder();
         var ord = new Int64Array.Builder();
         var baseRowId = new Int64Array.Builder();
         var commitVersion = new Int64Array.Builder();
+        var rowCount = new Int64Array.Builder();
         var parts = new StringArray.Builder[partitionCols.Count];
         for (int i = 0; i < parts.Length; i++)
         {
@@ -1504,6 +1629,10 @@ internal static class DeltaNativeReader
             {
                 commitVersion.AppendNull();
             }
+            // NOT nullable and never a fallback: TryPartitionOnlyForm is the only caller that asks for it and
+            // it has already routed every file whose count is underivable to the LOOP, so a 0 here would be a
+            // silently short answer rather than a missing value.
+            rowCount.Append(LiveRowCount(f) ?? 0L);
             for (int i = 0; i < parts.Length; i++)
             {
                 var field = FindField(listing.TableSchema, partitionCols[i]);
@@ -1519,11 +1648,15 @@ internal static class DeltaNativeReader
                 }
             }
         }
-        var fields = new List<Field>(2 + parts.Length)
+        var fields = new List<Field>(2 + parts.Length);
+        var arrays = new List<IArrowArray>(2 + parts.Length);
+        // ⚠ Even the FILENAME is conditional, for the invariant below: the partition-only form joins nothing
+        // (its rows come from the log alone), so it reads no `fn` and must not be handed one.
+        if (withFileName)
         {
-            new Field("fn", StringType.Default, nullable: false),
-        };
-        var arrays = new List<IArrowArray>(2 + parts.Length) { fn.Build() };
+            fields.Add(new Field("fn", StringType.Default, nullable: false));
+            arrays.Add(fn.Build());
+        }
         if (withFileOrdinal)
         {
             fields.Add(new Field("file_ord", Int64Type.Default, nullable: false));
@@ -1542,6 +1675,11 @@ internal static class DeltaNativeReader
             fields.Add(new Field("commit_version", Int64Type.Default, nullable: true));
             arrays.Add(commitVersion.Build());
         }
+        if (withRowCount)
+        {
+            fields.Add(new Field("row_count", Int64Type.Default, nullable: false));
+            arrays.Add(rowCount.Build());
+        }
         for (int i = 0; i < parts.Length; i++)
         {
             fields.Add(new Field("p" + i.ToString(CultureInfo.InvariantCulture), StringType.Default, nullable: true));
@@ -1549,6 +1687,29 @@ internal static class DeltaNativeReader
         }
         var schema = new Schema(fields, null);
         return new InMemoryArrayStream(schema, new[] { new RecordBatch(schema, arrays, files.Count) });
+    }
+
+    /// <summary>The file's SURVIVING row count derived from the LOG alone — the add action's
+    /// <c>stats.numRecords</c> less the deletion vector's cardinality — or null when the log cannot answer.
+    /// <para>⚠ <b>ONE definition on purpose: <see cref="BatchPlan.TryPartitionOnlyForm"/> decides WHICH files a
+    /// count can be synthesized for and <see cref="MetaStream"/> emits the counts, and a disagreement between
+    /// those two would be a silently short or long answer.</b> Null in exactly two cases, both of which send the
+    /// file to the per-file loop where the parquet footer is the authority: an add carrying NO stats (external
+    /// writers may omit them — they are optional in the Delta protocol), and a count that would come out
+    /// NEGATIVE, which means the log contradicts itself and is the one place guessing is worse than reading.</para>
+    /// <para>⚠ <b>It TRUSTS the writer's declared count</b>, which is the same contract Delta's own
+    /// <c>count(*)</c> optimization rests on — a lying <c>numRecords</c> yields a wrong row count here exactly
+    /// as it does in Spark. The deletion-vector half needs no such trust: <c>Dv</c> is the materialized set of
+    /// deleted POSITIONS (unique by construction — it is decoded from the roaring bitmap), so its length IS the
+    /// cardinality rather than a second declared number.</para></summary>
+    private static long? LiveRowCount(DeltaReader.NativeScanFile f)
+    {
+        if (f.NumRecords is not { } n)
+        {
+            return null;
+        }
+        long live = n - f.Dv.LongLength;
+        return live >= 0 ? live : null;
     }
 
     // The PHYSICAL (in-file) name of a top-level or nested field under NAME-mode column mapping: the declared
