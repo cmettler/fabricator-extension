@@ -795,13 +795,13 @@ true
 #      three non-partition columns of a table whose files sit under edwYear=…/edwMonth=…, and it was
 #      paying the full form's two footer sweeps for nothing. Without this assertion, gating partitioned
 #      tables off the plain form entirely would leave 10a passing.
-#      ⚠ The reverse direction is pinned right after it, and it is a REAL RESIDUAL rather than a
-#      tidiness note: projecting a partition column KEEPS the full form, so `SELECT *` on a partitioned
-#      table still pays the sweeps. The value is absent from the data files, so reaching it needs a
-#      per-file join key (`filename`) — and ⚠ `filename => true` DOES compose with the VARCHAR-keyed map
-#      (measured 2026-08-15; an earlier version of this note claimed it refused), so the residual is
-#      UNIMPLEMENTED rather than blocked: the fix is the full form's per-file constants join brought over
-#      to the plain form. (`schema` + `hive_partitioning` together stay refused outright.)
+#      ⚠ SINCE 2026-08-17 PROJECTING A PARTITION COLUMN ALSO TAKES THE PLAIN FORM, and the assertion
+#      right after this one used to pin the OPPOSITE — it is the residual, now closed. The value is absent
+#      from the data files, so it comes from the log's per-file constants joined on `filename`: the same
+#      fragment the full form emits (`CAST(__fab_f."p0" AS <declared>)`, same TypeText), lifted into the
+#      schema-map form, which `filename => true` permits (`file_row_number` is what a VARCHAR-keyed map
+#      refuses, which is why deletion vectors still need their own branches). `schema` +
+#      `hive_partitioning` together stay refused outright, and hive auto-detection is never relied on.
 #      ⚠ Its own table, NOT §6's `parts`: that one is UPDATEd and DELETEd from, so by here it carries a
 #      DELETION VECTOR — which routes to the full form for a reason that has nothing to do with
 #      partitioning and would make this section prove the opposite of what it says.
@@ -817,7 +817,10 @@ WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native batch%'
 ----
 true
 
-# Projecting the partition column (the filter forces it into the projection) keeps the full form.
+# Projecting the partition column (the filter forces it into the projection) ALSO takes the plain form
+# now, carrying the value through the joined per-file constants input rather than reading a file for it.
+# ⚠ The row assertion is what makes this more than a routing claim: the value arrives from the LOG, so a
+# broken join reads it as NULL and `WHERE p = 'p1'` returns nothing rather than failing loudly.
 query II
 SELECT count(*), sum(id) FROM b.main.rparts WHERE p = 'p1';
 ----
@@ -826,9 +829,19 @@ SELECT count(*), sum(id) FROM b.main.rparts WHERE p = 'p1';
 query I
 SELECT count(*) > 0 FROM duckdb_logs
 WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native batch%'
-  AND message LIKE '%rparts%' AND message LIKE '%union_by_name%';
+  AND message LIKE '%rparts%' AND message LIKE '%schema = map%'
+  AND message LIKE '%__fab_f.%' AND message LIKE '%filename => true%';
 ----
 true
+
+# ...and NO scan of this table falls back to the full form any more — the assertion this replaced pinned
+# exactly that, so its absence is the closed residual.
+query I
+SELECT count(*) FROM duckdb_logs
+WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native batch%'
+  AND message LIKE '%rparts%' AND message LIKE '%union_by_name%';
+----
+0
 
 # ============================================================================
 # 11. THE PUSHED BARE LIMIT REACHES THE GENERATED SQL (2026-08-15). Before this, `ScanSpec.Top` was
@@ -1266,6 +1279,59 @@ query I
 SELECT count(*) > 0 FROM duckdb_logs
 WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native present%'
   AND message LIKE '%trkmix%' AND message LIKE '%full sweep%';
+----
+true
+
+# ============================================================================
+# 14. A PARTITIONED TABLE WITH A DELETION VECTOR — the union form and the partition join in ONE query
+#     (2026-08-17). Closing §10c's residual gave the plain form a per-file constants CTE, and the union
+#     form already had one of its own for bound deletion vectors. They must be MERGED into a single
+#     `WITH`, because a second `WITH` nested inside the union does not parse — so this is the one shape
+#     where the two features can break each other, and neither §10b nor §10c reaches it.
+#     ⚠ The two branches produce the partition value by DIFFERENT means and must still agree: the plain
+#     branch JOINS the log's constants on `filename`, while each DV branch INLINES its own file's value as
+#     a literal (`CAST('q0' AS VARCHAR)`) — a per-file constant needs no join. They share the same
+#     TypeText, which is what makes the UNION ALL line up.
+#     ⚠ The per-partition aggregates are the load-bearing assertion, not the routing: a broken join reads
+#     the partition value as NULL rather than failing, so the rows would simply vanish from their group.
+# ============================================================================
+
+statement ok
+CREATE TABLE b.main.pjoin (id BIGINT, v BIGINT, p VARCHAR) PARTITIONED BY (p);
+
+statement ok
+INSERT INTO b.main.pjoin SELECT i, i, 'q' || (i % 3) FROM range(30) r(i);
+
+statement ok
+INSERT INTO b.main.pjoin SELECT i, i, 'q' || (i % 3) FROM range(30, 60) r(i);
+
+# 7 deleted rows, all in the q0 file of the FIRST insert => a BOUND deletion vector (> DvLiteralMax) on
+# exactly one file, so the union carries __fab_d as well as __fab_f.
+statement ok
+DELETE FROM b.main.pjoin WHERE id IN (0, 3, 6, 9, 12, 15, 18);
+
+query III
+SELECT p, count(*), sum(id) FROM b.main.pjoin GROUP BY p ORDER BY p;
+----
+q0	13	507
+q1	20	590
+q2	20	610
+
+# ONE `WITH` carrying BOTH CTEs, over a union — the merge this section exists for.
+query I
+SELECT count(*) > 0 FROM duckdb_logs
+WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native batch%'
+  AND message LIKE '%pjoin%' AND message LIKE '%__fab_f AS MATERIALIZED%'
+  AND message LIKE '%__fab_d AS MATERIALIZED%' AND message LIKE '% UNION ALL %';
+----
+true
+
+# The DV branch inlines its own partition value; the plain branch joins for it. Both spellings present in
+# the same statement is what proves the two mechanisms coexist rather than one having taken over.
+query I
+SELECT count(*) > 0 FROM duckdb_logs
+WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native batch%'
+  AND message LIKE '%pjoin%' AND message LIKE '%CAST(__fab_f.%' AND message LIKE '%CAST(''q0'' AS%';
 ----
 true
 

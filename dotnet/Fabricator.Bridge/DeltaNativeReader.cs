@@ -567,12 +567,12 @@ internal static class DeltaNativeReader
             // all. On the profiled Fabric query that pair is 34 s of 77. Before this the expensive-to-attempt
             // form was the one tried first, and it SUCCEEDS on the commonest shape (a plain projection over
             // DV-free files with no rowid), so the cheap form was unreachable exactly where it wins most.
-            var plain = TryPlainForm(listing, dataCols, wantRowId, wantsTracking, where, min);
+            var plain = TryPlainParts(listing, dataCols, wantRowId, wantsTracking, where, min);
             if (plain is not null)
             {
                 if (plain.LoopFiles.Count == 0)
                 {
-                    return plain;
+                    return PlainPlan(plain, listing);
                 }
                 // THE MIXED CASE (some files DV-carrying): the plain form serves the clean files and its
                 // LoopFiles are EXACTLY the DV files (TryPlainForm splits on nothing else), so compose ONE
@@ -601,7 +601,7 @@ internal static class DeltaNativeReader
             }
             // Neither serves everything: the partial plain plan (its DV-free files batched, the rest looped) is
             // still better than no plan, and is exactly what this returned before the preference was reversed.
-            return plain;
+            return plain is null ? null : PlainPlan(plain, listing);
         }
 
         /// <summary>
@@ -627,7 +627,52 @@ internal static class DeltaNativeReader
         /// see the tail of the class remarks). Conversely it HANDLES structs where the full form declines, so
         /// preferring it is not uniformly a narrowing.</para>
         /// </summary>
+        /// <summary>
+        /// The plain form's pieces, kept SEPARABLE rather than pre-assembled into one SQL string, because
+        /// <see cref="TryUnionForm"/> puts this SELECT inside a union that has a <c>WITH</c> of its own — and
+        /// two <c>WITH</c> prefixes cannot nest. Both consumers therefore assemble the prefix themselves:
+        /// <see cref="PlainPlan"/> for the standalone form, the union for the merged one.
+        /// </summary>
+        private sealed class PlainParts
+        {
+            internal string CoreSql = "";                 // the SELECT, with NO WITH prefix
+            internal string? MetaCte;                     // the per-file constants CTE, when partitions are read
+            internal string? MetaView;                    // its bound-input view name
+            internal IReadOnlyList<string> PartCols = System.Array.Empty<string>();
+            internal List<DeltaReader.NativeScanFile> BatchFiles = new();
+            internal List<DeltaReader.NativeScanFile> LoopFiles = new();
+        }
+
+        /// <summary>Wraps <see cref="PlainParts"/> into a standalone plan: its own <c>WITH</c>, its own bound
+        /// input. ⚠ The meta stream is built over BATCH files only — the join matches filenames in the
+        /// <c>read_parquet</c> list, and a row for a looped file would be a bound value nothing reads.</summary>
+        private static BatchPlan PlainPlan(PlainParts p, DeltaReader.NativeScanList listing)
+        {
+            if (p.MetaCte is null || p.MetaView is null)
+            {
+                return new BatchPlan(p.CoreSql, p.BatchFiles, p.LoopFiles);
+            }
+            string view = p.MetaView;
+            var files = p.BatchFiles;
+            var partCols = p.PartCols;
+            Func<IReadOnlyList<(string, IArrowArrayStream)>> inputs = () => new (string, IArrowArrayStream)[]
+            {
+                (view, new SingleScanArrowStream(
+                    MetaStream(files, partCols, listing, withFileOrdinal: false), view)),
+            };
+            return new BatchPlan("WITH " + p.MetaCte + " " + p.CoreSql, p.BatchFiles, p.LoopFiles,
+                                 inputs, new[] { view });
+        }
+
         private static BatchPlan? TryPlainForm(
+            DeltaReader.NativeScanList listing, IReadOnlyList<string> dataCols, bool wantRowId, bool wantsTracking,
+            string? where, int min)
+        {
+            var parts = TryPlainParts(listing, dataCols, wantRowId, wantsTracking, where, min);
+            return parts is null ? null : PlainPlan(parts, listing);
+        }
+
+        private static PlainParts? TryPlainParts(
             DeltaReader.NativeScanList listing, IReadOnlyList<string> dataCols, bool wantRowId, bool wantsTracking,
             string? where, int min)
         {
@@ -660,7 +705,7 @@ internal static class DeltaNativeReader
                     return null;
                 }
                 sb.Append("1 FROM ").Append(source).Append(')');
-                return new BatchPlan(sb.ToString(), batchFiles, loopFiles);
+                return new PlainParts { CoreSql = sb.ToString(), BatchFiles = batchFiles, LoopFiles = loopFiles };
             }
 
             if (listing.TableSchema is null || listing.LogicalToFieldId is not null)
@@ -676,17 +721,38 @@ internal static class DeltaNativeReader
             bool nameMapped = listing.LogicalToPhysical is not null || listing.MappedSchema is not null;
             var entries = new List<string>(dataCols.Count);
             var inner = new List<string>(dataCols.Count);
+            var partCols = new List<string>();
             bool needsInner = false;
             foreach (var c in dataCols)
             {
-                if (listing.PartitionColumns.Count > 0 && ContainsName(listing.PartitionColumns, c))
-                {
-                    return null; // case 3
-                }
                 var field = FindField(listing.TableSchema, c);
                 if (field is null)
                 {
                     return null; // unknown column: let the loop's own resolution answer for it
+                }
+                if (listing.PartitionColumns.Count > 0 && ContainsName(listing.PartitionColumns, c))
+                {
+                    // A partition value is ABSENT from the data files — the log's per-file partitionValues is
+                    // the authoritative source — so it cannot ride the schema map (a declared entry would
+                    // just backfill NULL, and would collide with the name this projects). It comes from the
+                    // bound per-file constants input instead, joined on `filename`, exactly as the full form
+                    // does it: the SAME fragment, the same TypeText, so a union of the two still aligns.
+                    // ⚠ This is why `filename => true` is added below and NOT `file_row_number` — the latter
+                    // is refused by a VARCHAR-keyed schema map (its sentinel id resolves by name), which is
+                    // what keeps deletion vectors on their own branches.
+                    string ptype;
+                    try
+                    {
+                        ptype = TypeText(field.Type);
+                    }
+                    catch (NotSupportedException)
+                    {
+                        return null;
+                    }
+                    inner.Add($"CAST(__fab_f.{Quote("p" + partCols.Count)} AS {ptype}) AS {Quote(c)}");
+                    partCols.Add(c);
+                    needsInner = true;
+                    continue;
                 }
                 string stored = nameMapped ? PhysicalName(field) : field.Name;
                 string type;
@@ -710,8 +776,28 @@ internal static class DeltaNativeReader
                 inner.Add(rebuilt is null ? Quote(c) : $"{rebuilt} AS {Quote(c)}");
                 needsInner |= rebuilt is not null;
             }
+            if (entries.Count == 0)
+            {
+                // Every projected column was a partition column: there is nothing to read from the files, so a
+                // `schema` map would be empty and this form has no work to declare. Same shape the full form
+                // declines (its `entries.Count == 0` guard) — the answer is derivable from the log alone, which
+                // neither form attempts. Falls to the per-file loop.
+                return null;
+            }
             string projection = string.Join(", ", dataCols.Select(Quote));
-            string scan = source + ", schema = map {" + string.Join(", ", entries) + "})";
+            string scan = source + ", schema = map {" + string.Join(", ", entries) + "}"
+                        + (partCols.Count > 0 ? ", filename => true" : "") + ")";
+            string? metaCte = null;
+            string? metaView = null;
+            if (partCols.Count > 0)
+            {
+                // MATERIALIZED for the same reason as the full form's: the view is a SINGLE-USE stream, so a
+                // second scan of it would silently contribute nothing.
+                metaView = NextViewName(MetaViewName);
+                metaCte = $"__fab_f AS MATERIALIZED (SELECT * FROM {Quote(metaView)})";
+                // INNER join on the exact URI string we listed — `filename` echoes it verbatim.
+                scan += " __fab_rp JOIN __fab_f ON __fab_f.fn = __fab_rp.filename";
+            }
             // The WHERE goes ABOVE the rebuild so it binds logical names at every level (the per-file path's
             // outer-WHERE contract).
             sb.Append(projection).Append(" FROM ")
@@ -720,7 +806,15 @@ internal static class DeltaNativeReader
             {
                 sb.Append(" WHERE ").Append(where);
             }
-            return new BatchPlan(sb.ToString(), batchFiles, loopFiles);
+            return new PlainParts
+            {
+                CoreSql = sb.ToString(),
+                MetaCte = metaCte,
+                MetaView = metaView,
+                PartCols = partCols,
+                BatchFiles = batchFiles,
+                LoopFiles = loopFiles,
+            };
         }
 
         /// <summary>
@@ -795,7 +889,7 @@ internal static class DeltaNativeReader
         /// non-prefix-projection invariant (docs/duckdb-upstream-issues.md §2).</para>
         /// </summary>
         private static BatchPlan? TryUnionForm(
-            BatchPlan plain, DeltaReader.NativeScanList listing, IReadOnlyList<string> dataCols, string? where,
+            PlainParts plain, DeltaReader.NativeScanList listing, IReadOnlyList<string> dataCols, string? where,
             bool hasTop)
         {
             // The remote gate (see remarks). A scheme separator marks a remote root (onelake://, s3://,
@@ -815,11 +909,23 @@ internal static class DeltaNativeReader
             }
             string dvView = NextViewName(DvViewName);
             var sb = new StringBuilder();
+            // ONE `WITH` for the whole union: the plain branch's per-file constants CTE (present when it reads
+            // a partition column) and this form's deletion-vector CTE are MERGED, never nested — a second
+            // WITH inside the union would not parse.
+            var ctes = new List<string>(2);
+            if (plain.MetaCte is not null)
+            {
+                ctes.Add(plain.MetaCte);
+            }
             if (boundFiles.Count > 0)
             {
-                sb.Append($"WITH __fab_d AS MATERIALIZED (SELECT * FROM {Quote(dvView)}) ");
+                ctes.Add($"__fab_d AS MATERIALIZED (SELECT * FROM {Quote(dvView)})");
             }
-            sb.Append(plain.Sql);
+            if (ctes.Count > 0)
+            {
+                sb.Append("WITH ").Append(string.Join(", ", ctes)).Append(' ');
+            }
+            sb.Append(plain.CoreSql);
             foreach (var f in dvFiles)
             {
                 string branch;
@@ -846,14 +952,30 @@ internal static class DeltaNativeReader
             }
             Func<IReadOnlyList<(string, IArrowArrayStream)>>? inputs = null;
             IReadOnlyList<string>? viewNames = null;
-            if (boundFiles.Count > 0)
+            var names = new List<string>(2);
+            if (plain.MetaView is not null) { names.Add(plain.MetaView); }
+            if (boundFiles.Count > 0) { names.Add(dvView); }
+            if (names.Count > 0)
             {
                 var bound = boundFiles;
-                inputs = () => new (string, IArrowArrayStream)[]
+                var metaView = plain.MetaView;
+                var metaFiles = plain.BatchFiles;   // the plain BRANCH's files — the only ones its join matches
+                var partCols = plain.PartCols;
+                inputs = () =>
                 {
-                    (dvView, new SingleScanArrowStream(FileDvStream(bound), dvView)),
+                    var list = new List<(string, IArrowArrayStream)>(2);
+                    if (metaView is not null)
+                    {
+                        list.Add((metaView, new SingleScanArrowStream(
+                            MetaStream(metaFiles, partCols, listing, withFileOrdinal: false), metaView)));
+                    }
+                    if (bound.Count > 0)
+                    {
+                        list.Add((dvView, new SingleScanArrowStream(FileDvStream(bound), dvView)));
+                    }
+                    return list;
                 };
-                viewNames = new[] { dvView };
+                viewNames = names;
             }
             return new BatchPlan(sb.ToString(), listing.Files,
                                  System.Array.Empty<DeltaReader.NativeScanFile>(), inputs, viewNames);
