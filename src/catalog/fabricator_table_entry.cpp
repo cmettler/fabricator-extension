@@ -8,6 +8,7 @@
 #include "fabricator/clr_host.hpp"
 #include "catalog/fabricator_catalog.hpp"
 #include "catalog/fabricator_metadata.hpp"
+#include "catalog/fabricator_txn_util.hpp"
 #include "duckdb/catalog/entry_lookup_info.hpp"
 #include "duckdb/common/column_index.hpp"
 #include "duckdb/common/serializer/deserializer.hpp"
@@ -817,9 +818,28 @@ TableFunction FabricatorTableEntry::BuildScanFunction(ClientContext &context, un
 	// Optimizer statistics — row count + per-column NDV in ONE lazy table_stats crossing (fetched once,
 	// cached on the entry). Best-effort: a stats failure (e.g. missing VIEW DATABASE STATE) must not break
 	// the scan; it just leaves the estimates unknown.
+	//
+	// ⚠ THE AMBIENTS ARE ESTABLISHED FIRST, AND THAT IS CORRECTNESS RATHER THAN CONVENTION-FOLLOWING.
+	// This crossing was answerable from provider state alone until the Delta row count started summing the
+	// LOG: SQL Server reads its stats DMVs over the transaction's CONNECTION, and the Delta provider simply
+	// reported nothing. Answering it now OPENS THE TABLE, which reaches the host FileSystem through the
+	// OPENER — and with none set the managed side falls back to whatever `ClientContext *` it last saw,
+	// which is a DANGLING POINTER once that connection is gone. MEASURED: `verify_delta_catalog_transactions`
+	// on the codec engine crashed 5 runs in 6 with `0xC0000005` inside `HostFs.Glob`, and 0 in 6 with the
+	// row count reverted to reporting nothing — which is what identifies the IO, not the statistic, as the
+	// requirement. It is exactly the hazard `DuckDbTableFileSystem` records against its own cached-opener
+	// fallback ("safe because no object outlives its call today; load-bearing the moment something is
+	// cached"), and the same one that made RollbackTransaction set an opener once rollback began doing IO.
+	//
+	// The PAIR (FabricatorSetActiveTxn sets both) rather than the opener alone: the crash only proves the
+	// opener is needed, but `table_stats` is a CONNECTION-using call on SQL Server, so leaving the txn
+	// ambient at whatever a previous statement left is the same latent class — a stats fetch routed onto
+	// another transaction's connection. Both spellings measure clean here (statistics 27, the codec
+	// transactions leg 6/6); this one closes both holes rather than the one that happened to crash.
 	if (!stats_fetched_) {
 		stats_fetched_ = true;
 		try {
+			FabricatorSetActiveTxn(catalog.Cast<FabricatorCatalog>().GetHandle(), context);
 			auto stats = FetchTableStats(table_handle_);
 			row_count_ = stats.row_count;
 			column_ndv_ = std::move(stats.column_ndv);
