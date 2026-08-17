@@ -438,11 +438,27 @@ internal sealed class DeltaTableBinding : ITableBinding
     }
 
     /// <inheritdoc/>
-    /// <remarks>No row-count statistics surfaced (a snapshot COULD sum file stats, but nothing consumes it
-    /// yet and enumeration must stay cheap — §3 item 5).</remarks>
-    public long? ApproximateRowCount() => null;
+    /// <remarks>
+    /// Summed from the LOG — every <c>add</c> carries <c>stats.numRecords</c> and every deletion vector its
+    /// own <c>cardinality</c> — so it opens no data file and reads no DV file. It is EXACT despite the
+    /// interface's name, because the log is the authority on which rows are live; null when any active file's
+    /// writer declared no count (see <see cref="DeltaReader.GetRowCount"/> for why that is all-or-nothing).
+    /// <para>⚠ THIS RETURNED NULL UNTIL 2026-08-17, and the comment that stood here justified it with
+    /// "nothing consumes it yet and enumeration must stay cheap". BOTH halves were wrong. The consumer had
+    /// existed all along — <c>FabricatorScanCardinality</c> hands the row count to the optimizer as
+    /// <c>NodeStatistics</c>, and the SQL Server provider had been feeding it since the callback was written —
+    /// so every Delta table was planned with NO cardinality estimate. And enumeration never asks: the host
+    /// fetches stats lazily in <c>BuildScanFunction</c>, for a table it is about to scan, whose open the
+    /// transaction's shared cache then serves.</para>
+    /// <para>An AT binding counts AS OF its own version, like every other member here.</para>
+    /// </remarks>
+    public long? ApproximateRowCount() =>
+        DeltaReader.GetRowCount(Catalog.Opener(), Path, _at?.Unit, _at?.Value, Catalog.ReadBound(Path));
 
     /// <inheritdoc/>
+    /// <remarks>Empty, and unlike the row count above this one is a genuine ABSENCE rather than an omission:
+    /// a Delta <c>add</c>'s stats carry min / max / nullCount per column but NO distinct-value estimate, so
+    /// there is nothing in the log to report. Producing one would mean reading the data.</remarks>
     public IReadOnlyList<NdvEntry> ColumnNdv() => System.Array.Empty<NdvEntry>();
 
     /// <inheritdoc/>

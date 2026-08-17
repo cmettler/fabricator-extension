@@ -140,7 +140,11 @@ case "$TIER" in
         # `_delta_log` instead of an EMPTY COMMITTED TABLE behind a statement the user saw fail. Its §3 gate
         # injects the failure with `error()` mid-stream — which is what turned limitation 1.5's residue from
         # "reasoned, not measured" into measured, in both directions.
-        : "${MIN_SUITES:=70}"
+        # 71 runs since 2026-08-17: verify_delta_statistics (27) pins that the Delta catalog reports a ROW
+        # COUNT to the optimizer at all. It returned null until then, so every Delta table was planned with
+        # no cardinality while the consumer (FabricatorScanCardinality -> NodeStatistics) had existed all
+        # along and SQL Server had been feeding it — the mutant's EXPLAIN carries no estimate line whatever.
+        : "${MIN_SUITES:=71}"
         # 5656 since 2026-08-02: verify_delta_catalog_transactions 943 -> 944 Ã¢ÂÂ ROLLBACK now RECLAIMS the
         # data files the transaction eagerly wrote (EW #52's DiscardDataFilesAsync) instead of leaving them
         # for VACUUM. +2, not +1: that suite is one of the DOUBLED ones below, so an assertion added to it
@@ -300,7 +304,12 @@ case "$TIER" in
         # large in silence). The +60 of this change is verify_delta_ctas_ordering, and NOTHING ELSE MOVED:
         # every other suite reported its exact prior count, which is the behaviour-preservation claim for a
         # change that reorders two writes without altering any answer.
-        : "${MIN_ASSERTIONS:=7478}"
+        # 7505 since 2026-08-17, from a green tier run: 7478 + exactly verify_delta_statistics' 27, so NO
+        # other suite moved. That is the load-bearing number for a change that hands the optimizer a
+        # cardinality it never had — it alters PLANS, and the plan-sensitive suites (the batched-read
+        # routing gates, merge_into, subplan_dedup) reporting their exact prior counts is what says no
+        # answer and no routing followed the estimates.
+        : "${MIN_ASSERTIONS:=7505}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

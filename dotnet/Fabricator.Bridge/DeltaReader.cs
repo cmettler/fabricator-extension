@@ -1303,6 +1303,62 @@ internal static class DeltaReader
         }
     }
 
+    /// <summary>
+    /// The table's live row count, summed from the LOG: every <c>add</c> carries <c>stats.numRecords</c> and
+    /// every deletion vector carries its own <c>cardinality</c>, so this opens no data file and reads no
+    /// deletion-vector file. <paramref name="unit"/>/<paramref name="value"/> time-travel exactly as
+    /// <see cref="GetSchemaAt"/> does (null = latest).
+    /// </summary>
+    /// <returns>
+    /// The count, or <b>null</b> when it cannot be established. Null is ALL-OR-NOTHING: one active file whose
+    /// writer recorded no <c>numRecords</c> makes the whole answer unknown, rather than a silent under-count.
+    /// That is Delta's own rule for its log-answered <c>count(*)</c>, and the reason to follow it here is that
+    /// the consumer is the PLANNER — an estimate that is wrong by an unknown amount steers join ordering worse
+    /// than no estimate at all, which DuckDB already handles (a null cardinality is its normal "unknown").
+    /// </returns>
+    /// <remarks>
+    /// ⚠ EXACT, despite the <c>ApproximateRowCount</c> surface it feeds: the Delta log is the authority on
+    /// which rows are live, so this is the same arithmetic <c>DeltaNativeReader.LiveRowCount</c> uses to
+    /// SYNTHESIZE rows for a partition-only scan — measured against ground truth there on live Fabric tables
+    /// (89 files ⇒ 659,278; a 200-file table with deletion vectors ⇒ 9,968). What is trusted is
+    /// <c>numRecords</c>, the writer's declared count; the DV term is a cardinality the descriptor states.
+    /// <para>⚠ It costs a snapshot, which on remote storage is the log replay (seconds on OneLake) — and it is
+    /// free in practice because the host fetches stats LAZILY from <c>BuildScanFunction</c>, i.e. only for a
+    /// table about to be scanned, whose open the transaction's shared cache then serves. It is NOT called
+    /// during catalog enumeration.</para>
+    /// </remarks>
+    public static long? GetRowCount(nint opener, string path, string? unit, string? value,
+                                    DeltaTableBinding? bound = null)
+        => GetRowCountAsync(opener, path, unit, value, bound).GetAwaiter().GetResult();
+
+    private static async Task<long?> GetRowCountAsync(nint opener, string path, string? unit, string? value,
+                                                      DeltaTableBinding? bound)
+    {
+        var (open, shared) = await OpenForReadAsync(opener, path, bound).ConfigureAwait(false);
+        try
+        {
+            var snap = unit is not null && value is not null
+                ? await ResolveSnapshotAsync(open.Table, unit, value, default).ConfigureAwait(false)
+                : open.Table.CurrentSnapshot;
+            long total = 0;
+            foreach (var add in snap.ActiveFiles.Values)
+            {
+                if (add.GetNumRecords() is not { } records)
+                {
+                    return null;   // one undeclared file ⇒ the table's count is unknown, not approximate
+                }
+                // The DV states its own cardinality, so the count never needs the vector's POSITIONS — which
+                // is what keeps this free of per-DV-file IO.
+                total += records - (add.DeletionVector?.Cardinality ?? 0);
+            }
+            return total >= 0 ? total : null;
+        }
+        finally
+        {
+            if (!shared) { await open.Table.DisposeAsync().ConfigureAwait(false); }
+        }
+    }
+
     /// <summary>Time travel — the Arrow schema of the table AS OF a version/timestamp (the schema can differ from
     /// the latest, e.g. before an ADD COLUMN). <paramref name="unit"/> is "version" or "timestamp" (the DuckDB
     /// <c>AT</c> clause unit); <paramref name="value"/> is the BIGINT version or a parseable timestamp.</summary>

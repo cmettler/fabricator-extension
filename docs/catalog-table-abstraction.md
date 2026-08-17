@@ -581,6 +581,19 @@ the same table the code evaluates.
          stats queries onto entry materialization, i.e. the enumeration path (§3 items 5/7). Entry
          materialization = open + schema + info (2 IO crossings, was 3); stats = 1 at first scan (was 2),
          one `stats_fetched_` flag on the entry filling row count + NDV together.
+         - **⚠ THAT LAZINESS IS WHAT MADE THE DELTA ROW COUNT AFFORDABLE — filled in 2026-08-17, and until
+           then the Delta provider returned NULL for it.** Its comment justified the null with "nothing
+           consumes it yet and enumeration must stay cheap — §3 item 5", and **both halves were wrong**:
+           the consumer had existed all along (`FabricatorScanCardinality` → `NodeStatistics`, which the
+           SQL Server provider had been feeding since the callback was written, so every Delta table was
+           planned with NO cardinality at all), and item 5 is about ENUMERATION, which never asks for
+           stats — this entry is precisely what keeps it off that path. It now sums `numRecords` per
+           active file minus each deletion vector's stated cardinality, so it reads no data file and no DV
+           file, and it is EXACT rather than approximate because the log is the authority on live rows.
+           NDV stays empty and that IS a genuine absence: a Delta `add` records min/max/nullCount per
+           column but no distinct count. Gate `verify_delta_statistics` (27), two mutants.
+           **The reusable lesson: a stub whose comment says "nothing consumes this yet" is a claim about a
+           CONSUMER, and it ages the moment someone wires one — check the consumer, not the comment.**
        - **`table_schema` keeps the zero-row-stream carrier** (the design mocked it as "trickery"):
          PopulateReturnSchema is the ONE proven import path incl. VARIANT extension types, and a bare
          ArrowSchema would fork the type conversion for zero gain. The AT clause is part of the handle's

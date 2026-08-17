@@ -412,6 +412,11 @@ The optimizer also receives each table's approximate **row count** (from partiti
 **per-column NDV** (distinct-value estimate) for better join ordering. Min/max bounds are intentionally
 *not* reported (DuckDB would prune filters on them, and SQL Server stats are sampled/stale).
 
+The Delta provider feeds the same channel from a different source: its row count is **summed from the
+transaction log** — each file's recorded `numRecords` minus each deletion vector's stated cardinality — so
+it costs no data-file read and is exact rather than sampled. It reports no NDV, because a Delta `add`
+records min/max and null counts per column but no distinct-value estimate.
+
 ### Row identity (`rowid`)
 
 Tables with a primary key (or unique index) expose a virtual `rowid` (scalar for a single key column,
@@ -1896,6 +1901,7 @@ principal wins even if `PROVIDER` says something else:
 | Discover tables — local (`System.IO`), S3 (host-FS glob), OneLake (Fabric Unity Catalog REST API) | ✅ (generic non-OneLake ADLS not supported — duckdb-azure glob #174) |
 | Streaming scan + filter pushdown (Delta file pruning + Parquet row-group skipping) | ✅ |
 | `LIMIT` and `ORDER BY … LIMIT` (TopN) pushed into the scan — any key type, any NULL placement | ✅ |
+| Statistics → optimizer: **row count summed from the log** (`numRecords` per file minus each deletion vector's cardinality — no data file or DV file is read, and it is exact) | ✅ (no per-column NDV — a Delta `add` records min/max/nullCount but no distinct count) |
 | `CREATE TABLE` / `INSERT` / CTAS / COPY (streaming bulk via the standard write path) | ✅ |
 | `DELETE` / `UPDATE` — rowid deletion-vectors / merge-on-read (default) or copy-on-write (`deletion_vectors false`) | ✅ |
 | `DROP TABLE`, `ALTER TABLE … ADD COLUMN`, `RENAME TABLE` (local + OneLake) | ✅ |

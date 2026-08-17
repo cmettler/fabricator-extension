@@ -1,0 +1,144 @@
+# name: test/verify_delta_statistics.test
+# description: The Delta catalog reports a table's ROW COUNT to the DuckDB optimizer. It is summed from the
+#              LOG — every `add` carries stats.numRecords and every deletion vector its own cardinality — so
+#              it opens no data file and reads no DV file, and it is EXACT rather than approximate because the
+#              log is the authority on which rows are live. Until 2026-08-17 the provider returned null, so
+#              EVERY Delta table was planned with no cardinality at all while the consumer
+#              (FabricatorScanCardinality -> NodeStatistics) had existed all along and the SQL Server provider
+#              had been feeding it. Asserted through `EXPLAIN (FORMAT json)`'s "Estimated Cardinality", which
+#              is the only place the estimate is observable — it never changes an ANSWER, so no row assertion
+#              can see it. Set FABRICATOR_DELTA_WRITE_DIR. Local FS.
+# group: [fabricator]
+
+require fabricator
+
+require parquet
+
+require-env FABRICATOR_DELTA_WRITE_DIR
+
+# ============================================================================
+# 1. THE COUNT REACHES THE PLANNER, AND IT IS EXACT.
+#    Two commits (CTAS + INSERT) so the sum really is over several `add`s rather than one.
+# ============================================================================
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/st' AS s (TYPE fabricator, PROVIDER 'delta');
+
+statement ok
+CREATE TABLE s.main.t AS SELECT i::BIGINT AS id, (i % 10)::BIGINT AS k FROM range(1000) r(i);
+
+statement ok
+INSERT INTO s.main.t SELECT i::BIGINT, (i % 10)::BIGINT FROM range(1000, 1500) r(i);
+
+query I
+SELECT count(*) FROM s.main.t;
+----
+1500
+
+query II
+EXPLAIN (FORMAT json) SELECT * FROM s.main.t;
+----
+physical_plan	<REGEX>:.*"Estimated Cardinality": "1500".*
+
+# ============================================================================
+# 2. A DELETION VECTOR IS SUBTRACTED — the count is LIVE rows, not written rows.
+#
+#    ⚠ Through a FRESH ATTACH, and that is not incidental: the host fetches a table's stats ONCE per catalog
+#    entry (BuildScanFunction's stats_fetched_ latch) and a DML does not evict the entry, so within one
+#    session the estimate stays at its first value. Same as the SQL Server provider, and harmless — this
+#    feeds costing only, never an answer — but a section written without the re-attach would assert the
+#    STALE number and pass for the wrong reason.
+# ============================================================================
+
+statement ok
+DELETE FROM s.main.t WHERE id < 200;
+
+query I
+SELECT count(*) FROM s.main.t;
+----
+1300
+
+statement ok
+DETACH s;
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/st' AS s2 (TYPE fabricator, PROVIDER 'delta');
+
+query II
+EXPLAIN (FORMAT json) SELECT * FROM s2.main.t;
+----
+physical_plan	<REGEX>:.*"Estimated Cardinality": "1300".*
+
+# The deletion vector really is what makes the difference, and this is the control that says so: the DELETE
+# rewrote NOTHING — still exactly the two data files the CTAS and the INSERT wrote — so their `add`s still
+# declare 1500 rows between them and only the DV's cardinality can account for the drop to 1300. Without it
+# the section above would pass equally on a table that had been rewritten copy-on-write, which exercises none
+# of the subtraction. ⚠ The vector itself is INLINE at this size (Delta stores a small one in the log rather
+# than as a `deletion_vector_*.bin`), so looking for a DV FILE here finds nothing and proves nothing.
+query I
+SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/st/t/*.parquet');
+----
+2
+
+# ============================================================================
+# 3. TIME TRAVEL COUNTS AS OF ITS OWN VERSION — an AT binding answers for the snapshot it names, like every
+#    other member of the read surface. v1 is the CTAS's data (1000 rows), before the INSERT and the DELETE.
+# ============================================================================
+
+query II
+EXPLAIN (FORMAT json) SELECT * FROM s2.main.t AT (VERSION => 1);
+----
+physical_plan	<REGEX>:.*"Estimated Cardinality": "1000".*
+
+# ============================================================================
+# 4. WHAT IT IS FOR: join ordering. Both sides carry an estimate, so the planner can tell a 50-row table from
+#    a 20 000-row one. Before this change NEITHER scan reported anything and the estimates were absent from
+#    the plan entirely — which is exactly what the mutant reproduces.
+# ============================================================================
+
+statement ok
+CREATE TABLE s2.main.big AS SELECT i::BIGINT AS id, (i % 50)::BIGINT AS k FROM range(20000) r(i);
+
+statement ok
+CREATE TABLE s2.main.small AS SELECT i::BIGINT AS k, ('n' || i)::VARCHAR AS nm FROM range(50) r(i);
+
+query II
+EXPLAIN (FORMAT json) SELECT count(*) FROM s2.main.big b JOIN s2.main.small sm ON b.k = sm.k;
+----
+physical_plan	<REGEX>:.*"Estimated Cardinality": "20000".*
+
+query II
+EXPLAIN (FORMAT json) SELECT count(*) FROM s2.main.big b JOIN s2.main.small sm ON b.k = sm.k;
+----
+physical_plan	<REGEX>:.*"Estimated Cardinality": "50".*
+
+# The join's own estimate follows from them, which is the property the optimizer actually consumes: with the
+# 50-row side on the build it expects the 20 000-row side's cardinality out of the join. An absent estimate
+# gives DuckDB's default guess instead, and no assertion here would hold.
+query II
+EXPLAIN (FORMAT json) SELECT count(*) FROM s2.main.big b JOIN s2.main.small sm ON b.k = sm.k;
+----
+physical_plan	<REGEX>:.*"name": "HASH_JOIN".*
+
+# The rows themselves must be unaffected — a statistics change that moved an ANSWER would be a defect, and
+# this is the only assertion in the suite that could catch one.
+query II
+SELECT count(*), sum(b.id) FROM s2.main.big b JOIN s2.main.small sm ON b.k = sm.k;
+----
+20000	199990000
+
+# ============================================================================
+# 5. NDV IS EMPTY, AND DELIBERATELY SO — unlike the row count this is a genuine ABSENCE: a Delta `add`'s
+#    stats carry min / max / nullCount per column but no distinct-value estimate, so there is nothing in the
+#    log to report and producing one would mean reading the data.
+#
+#    Pinned INDIRECTLY, because nothing exposes NDV itself: an equality filter on a column with no NDV falls
+#    to DuckDB's DEFAULT selectivity of 20%, so 20 000 rows estimate 4 000. The column really has 50 distinct
+#    values, so the day someone reports NDV this becomes 400 and the section fails — which is the point. It
+#    also re-proves that the filtered estimate is DERIVED from our row count rather than guessed outright.
+# ============================================================================
+
+query II
+EXPLAIN (FORMAT json) SELECT * FROM s2.main.big WHERE k = 7;
+----
+physical_plan	<REGEX>:.*"Estimated Cardinality": "4000".*
