@@ -2623,6 +2623,40 @@ public sealed class DeltaCatalog : IBackendCatalog
             }
         }
 
+        // AUTOCOMMIT CTAS ON A TABLE THAT DOES NOT EXIST: write the data files BEFORE touching the log, then
+        // create + commit. A CREATE-plus-data is two versions either way — what this moves is WHERE a failure
+        // lands. The ordinary path below commits v0 (an empty table) and only then runs the COPY, so a failed
+        // data write leaves an empty committed table behind a statement the user saw fail; reordered, the COPY
+        // precedes any log write and a failure leaves nothing discoverable — MEASURED both ways (limitation 1.5
+        // in docs/known-limitations.md). It is native_write only, so the CODEC engine keeps the old ordering;
+        // that is not the divergence the plan predicted, because the codec materializes the whole stream before
+        // creating and so is clean on a source failure anyway. Its remaining cost (a failed COPY leaves orphan
+        // parquet in a log-less folder) and the concurrent-create guard are on TryCreateFilesFirst.
+        //
+        // The cheap tests come FIRST so a plain INSERT — createTable=false — never pays the TableExists probe.
+        // An EXPLICIT transaction is excluded because it already writes files ahead of its commit (the buffer),
+        // and its CREATE is immediate by hoist slice 5, so there is nothing here to reorder.
+        if (_nativeWrite && (createTable || replace) && !IsExplicitTxn(txnId) && !partitionOverwrite
+            && spec?.SchemaMode != DeltaSchemaMode.Merge && spec?.ReplaceWhere is not { Count: > 0 }
+            && !TableExists(tablePath))
+        {
+            var createdVersion = DeltaWriter.TryCreateFilesFirst(
+                opener, tablePath, data, mode,
+                deletionVectors: flags.DeletionVectors,
+                inCommitTimestamps: flags.InCommitTimestamps,
+                changeDataFeed: flags.ChangeDataFeed,
+                rowTracking: flags.RowTracking,
+                spec: spec, out var createdRows,
+                columnMapping: flags.ColumnMapping, serializable: _serializable, sortedBy: sortColumns);
+            if (createdVersion is not null)
+            {
+                _log.LogInformation(
+                    "delta bulk {Schema}.{Table}: created from {Rows} row(s) — data files written before the log",
+                    schemaName, tableName, createdRows);
+                return createdRows;
+            }
+        }
+
         // native_write: STREAM straight to DuckDB's parquet writer (bounded memory — important for a Fabric
         // notebook). TryWriteStreaming returns null (WITHOUT consuming `data`) for cases the single-file streaming
         // commit can't represent (partitioned+mapping / replace_where / schema_mode=merge / mapping-replace with a

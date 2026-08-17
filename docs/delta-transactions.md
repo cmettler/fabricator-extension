@@ -434,25 +434,43 @@ actual reason it is acceptable where a folder delete is not. It becomes availabl
 below, because then the folder is not a table yet: nothing can be discovered at a path with no `_delta_log`,
 and a competing CREATE races on commit-0 (a put-if-absent) rather than on our bytes.
 
-**The cheap improvement that does NOT need upstream, still not built:** reorder the autocommit CTAS to write
-the data files FIRST and create+commit afterwards — the shape `TryStreamCreateFiles` already implements for
-the buffered path (it writes parquet into a log-less folder and the flush creates after). A data-write failure
-would then precede any commit, leaving nothing behind, and the only remaining window is between two adjacent
-log writes with no data movement in between. It would NOT reduce the version count.
-- **⚠ An earlier version of this paragraph said it "is non-partitioned-only today". That is WRONG** — the
-  restriction belongs to `TryWriteStreamingCoreAsync` (the open-table streaming write), NOT to
+**✅ THE CHEAP IMPROVEMENT IS BUILT — 2026-08-17, C#-only, no ABI.** The autocommit CTAS writes its data files
+FIRST and creates+commits afterwards (`DeltaWriter.TryCreateFilesFirst`, called from `DeltaCatalog.BulkInsert`
+ahead of the ordinary `native_write` streaming path). It does **not** reduce the version count — that needs the
+upstream API change below — and the remaining window is between two adjacent log writes with no data movement
+in between. Gate `verify_delta_ctas_ordering` (57, hermetic), two mutants each killed at its own section.
+- **THE MEASUREMENT, and it is what turns the row below from reasoned into measured.** A mid-stream source
+  failure injected with `error()` at row 1.9M of 2M, three runs per leg, the reorder as the only variable:
+  **create-first leaves `_delta_log/…0.json` — an empty COMMITTED table — 3/3; files-first leaves 0 commit
+  files 3/3**, and a fresh ATTACH then discovers no table (`duckdb_tables()` = 0, a direct reference errors
+  "does not exist"). The orphan parquet stays, unreferenced, in a folder with no log.
+- It reuses **`TryStreamCreateFiles`, which had been DEAD CODE since hoist slice 5** deleted the buffered-CTAS
+  branch that called it — the primitive the plan pointed at had outlived its only caller, so this gave it one
+  rather than writing a second copy. ⚠ Which also means the sentence above about "the shape it already
+  implements for the buffered path" described a path that no longer existed.
+- **⚠ An earlier version of this paragraph said the reorder "is non-partitioned-only today". That is WRONG** —
+  the restriction belongs to `TryWriteStreamingCoreAsync` (the open-table streaming write), NOT to
   `TryStreamCreateFiles`, which partitions via `RunCopyPartitioned` (one DuckDB `COPY … PARTITION_BY`).
-  Measured: a buffered partitioned CTAS writes through DuckDB into a Hive layout with `_delta_log` untouched
-  until the flush. So the reorder would cover partitioned CTAS too — it is not a simple-case-only mitigation.
-- What it genuinely would NOT cover is the **codec** provider (`engineeredwooddelta`), which has no DuckDB
-  writer to stage files with. ⚠ That would make the two engines DIVERGE on failure semantics where today they
-  agree — worth stating in the slice that takes it.
+  Confirmed as built: a partitioned CTAS reorders and lands its Hive layout in one COPY (gate §1).
+- **⚠⚠ AND THE PREDICTED ENGINE DIVERGENCE DOES NOT EXIST — the paragraph below used to assert it, and
+  measuring refuted it.** It read: *"what it genuinely would NOT cover is the codec provider, which has no
+  DuckDB writer to stage files with ⇒ that would make the two engines DIVERGE on failure semantics where today
+  they agree."* The premise was that the codec path creates first. **It does not**: it MATERIALIZES the whole
+  stream (`DeltaWriter.Materialize`) and only then calls `Write`, so a mid-stream source failure fails before
+  any create. Measured on the same injection, 3/3: the codec leaves **no folder at all**. So the change makes
+  the engines CONVERGE, not diverge. ⚠ Shape-specific, and the gate says so rather than claiming more: on a
+  STORAGE failure the order reverses again, since the codec's create precedes its file writes while ours now
+  follows them — there the reordered native path is the SAFER of the two.
+- What it declines: a table whose create would need engineered-wood's own writer (IcebergCompat, an identity
+  column, a declared CHECK constraint / invariant / generated column — `SupportsExternalDataFileCommit`'s three
+  conditions, evaluated on the inputs the create is about to be handed, since there is no snapshot yet). Only
+  the constraint branch is reachable from SQL and only it is gated; the other two are defensive.
 
 | | consequence |
 |---|---|
 | single writer | harmless — a millisecond window, correct end state |
 | concurrent reader (Spark, delta-rs) | can observe an existing **EMPTY** table mid-flush |
-| the v1 write FAILS | **an empty committed table is left behind by a transaction the user saw fail** — the inverse of every other flush path, where a failure leaves nothing. Reasoned from the measured shape, NOT itself measured (injecting the failure was not attempted) |
+| the v1 write FAILS | **FIXED for the autocommit `native_write` CTAS on 2026-08-17** — the data files are written before any commit, so a failure leaves a log-less folder rather than an empty committed table (MEASURED both ways, see above). Unchanged for an explicit transaction (its create is immediate by design, §7.2) and for the codec engine, which is nonetheless clean on a source failure because it materializes first |
 
 **Why it is this way, and what would fix it.** Not a protocol limit and not a decision — an EW API-shape limit:
 `StartTransaction` is an INSTANCE method on `DeltaTable`, and `DeltaTable.OpenAsync` reads `_delta_log`, so there is

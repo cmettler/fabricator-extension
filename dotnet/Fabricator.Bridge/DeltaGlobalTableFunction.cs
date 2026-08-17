@@ -945,6 +945,205 @@ internal static class DeltaWriter
     }
 
     /// <summary>
+    /// AUTOCOMMIT CTAS, REORDERED: write the data files FIRST into the not-yet-existing table folder, then
+    /// create and commit. Returns the committed version, or <c>null</c> — with <paramref name="data"/>
+    /// UNCONSUMED — when the reorder does not apply and the caller must take the ordinary create-then-write
+    /// path (<see cref="TryWriteStreaming"/>).
+    /// </summary>
+    /// <remarks>
+    /// <para><b>What it buys.</b> A CREATE-plus-data lands as TWO versions either way (v0 = protocol+metaData,
+    /// v1 = the data) — engineered-wood has no API that publishes both at once for a host holding its own data
+    /// plane, so this does NOT reduce the version count. What it moves is the FAILURE: today the long,
+    /// failure-prone part (DuckDB's COPY over the network, disk, permissions) runs AFTER v0 is committed, so a
+    /// data-write failure leaves **an empty committed table behind a statement the user saw fail** — the
+    /// inverse of every other write path, where a failure leaves nothing. Reordered, the COPY precedes any log
+    /// write, and the residual window is between two ADJACENT log writes with no data movement in between.
+    /// See docs/known-limitations.md 1.5 and docs/delta-transactions.md §7.1.</para>
+    /// <para><b>⚠ THE PREDICTED ENGINE DIVERGENCE DOES NOT EXIST, AND IT POINTS THE OTHER WAY — MEASURED.</b>
+    /// The plan for this change (docs/delta-transactions.md §7.1) warned that being native_write-only would make
+    /// the engines diverge on failure semantics "where today they agree", because the codec provider has no
+    /// DuckDB writer to stage files with. That assumed the codec path creates first; it does not. It
+    /// MATERIALIZES the whole stream (<see cref="Materialize"/>) and only then calls <see cref="Write"/>, so a
+    /// mid-stream source failure there fails before any create. Measured on a 2M-row CTAS failing at row 1.9M,
+    /// 3 runs each: codec leaves NO FOLDER AT ALL, native-before leaves <c>_delta_log/…0.json</c> (an empty
+    /// COMMITTED table), native-after leaves an unreferenced parquet and no log. So this makes native CONVERGE
+    /// on the codec's behaviour rather than diverge from it. The residue that does differ: native leaves orphan
+    /// BYTES (they were already on storage) where the codec leaves none — and on a STORAGE failure the order
+    /// reverses again, since the codec's create precedes its file writes while ours now follows them.</para>
+    /// <para><b>⚠ A failed COPY leaves orphan parquet in a folder with NO <c>_delta_log</c></b>, which is not a
+    /// table to any reader (nothing is discoverable there) and is strictly better than the empty committed
+    /// table it replaces: a retry writes fresh GUID-named files and references only its own. Deleting them by
+    /// name is the natural follow-on and is deliberately NOT done here — it is a separate decision from
+    /// reordering, and the shape that is NOT acceptable (a version-checked delete of v0) is argued out in
+    /// docs/delta-transactions.md §7.1.</para>
+    /// <para><b>⚠ Only for a table that does not exist yet.</b> The caller establishes that; this method then
+    /// assigns the column mapping ITSELF (physical names are random GUIDs — see
+    /// <see cref="TryStreamCreateFiles"/>) and hands the same schema to the create as
+    /// <c>preAssignedSchema</c>, which is the case that parameter exists for. If another writer creates the
+    /// table in the window between the caller's check and our create, <c>OpenOrCreateAsync</c> OPENS theirs and
+    /// ignores our pre-assigned schema — so the layout is re-checked before committing and a mismatch THROWS
+    /// rather than committing files whose columns would read all-NULL.</para>
+    /// </remarks>
+    public static long? TryCreateFilesFirst(
+        nint opener, string path, IArrowArrayStream data, DeltaWriteMode mode,
+        bool deletionVectors, bool inCommitTimestamps, bool changeDataFeed, bool rowTracking,
+        DeltaWriteSpec? spec, out long rowsWritten,
+        EngineeredWood.DeltaLake.Schema.ColumnMappingMode columnMapping,
+        bool serializable, IReadOnlyList<string>? sortedBy)
+    {
+        rowsWritten = 0;
+        if (!NativeParquetDataFileWriter.Available)
+        {
+            return null;
+        }
+        // VARIANT: the SCHEMA crosses into engineered-wood and must be canonical (a transport marker reaching
+        // EW maps to Delta `binary`, durably and silently — the worst failure in the variant surface). The
+        // STREAM stays transport all the way to DuckDB's COPY inside TryStreamCreateFiles.
+        var ewSchema = VariantMarker.ToCanonicalSchema(data.Schema);
+        var config = CreateConfig(deletionVectors, rowTracking, inCommitTimestamps, changeDataFeed,
+                                  serializable, sortedBy, spec?.CreateProperties);
+        // The table this create WOULD produce must be one engineered-wood lets an outside writer commit files
+        // into. The open-table path answers that from `table.SupportsExternalDataFileCommit` AFTER opening;
+        // here there is no table yet, so the same three conditions are evaluated on the exact inputs the create
+        // is about to be given. Declining is always safe — it is today's path, with the stream untouched.
+        if (NeedsOwnWriterOnCreate(ewSchema, config))
+        {
+            return null;
+        }
+        var files = TryStreamCreateFiles(opener, path, data, columnMapping, out rowsWritten,
+                                         out var assigned, spec?.PartitionColumns, spec);
+        if (files is null)
+        {
+            return null;   // streaming unavailable — `data` untouched for the caller's fallback
+        }
+        // ⚠ FROM HERE `data` IS CONSUMED AND THE BYTES ARE ON STORAGE: every remaining path must commit or
+        // throw, never return null (a null would send the caller down a second write path over an exhausted
+        // stream, silently producing an empty table).
+        return CreateAndCommitFilesAsync(opener, path, ewSchema, config, files, assigned, mode, spec,
+                                         columnMapping, sortedBy).GetAwaiter().GetResult();
+    }
+
+    /// <summary>
+    /// The create+commit half of <see cref="TryCreateFilesFirst"/>: two adjacent log writes over files that
+    /// are already on storage.
+    /// </summary>
+    private static async Task<long> CreateAndCommitFilesAsync(
+        nint opener, string path, Schema ewSchema, IReadOnlyDictionary<string, string>? config,
+        List<WrittenDataFile> files, EngineeredWood.DeltaLake.Schema.StructType? assigned,
+        DeltaWriteMode mode, DeltaWriteSpec? spec,
+        EngineeredWood.DeltaLake.Schema.ColumnMappingMode columnMapping,
+        IReadOnlyList<string>? sortedBy)
+    {
+        var fs = TableFileSystems.Create(opener, path);
+        var table = await DeltaTable.OpenOrCreateAsync(
+            fs, ewSchema, Options(spec),
+            partitionColumns: spec?.PartitionColumns,
+            clusteringColumns: spec?.PartitionColumns is { Count: > 0 } ? null : sortedBy,
+            columnMappingMode: columnMapping,
+            configuration: config,
+            cancellationToken: default,
+            preAssignedSchema: assigned).ConfigureAwait(false);
+        try
+        {
+            EnsurePreAssignedLayoutAdopted(table, assigned, path);
+            // The SAME mode the ordinary path would have committed, so the commitInfo this statement records is
+            // unchanged by the reorder. On a table this call just created an Overwrite removes nothing (there
+            // are no active files), so the two readings agree.
+            long version = await table.CommitDataFilesAsync(
+                files, mode, dynamicPartitionOverwrite: false,
+                cancellationToken: default).ConfigureAwait(false);
+            Log.LogInformation(
+                "delta create-then-commit {Path}: committed v{Version} files={Files} (files written BEFORE the log)",
+                path, version, files.Count);
+            return version;
+        }
+        finally
+        {
+            await table.DisposeAsync().ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// Whether the table a create with these inputs would produce needs engineered-wood's own writer, i.e.
+    /// would report <c>SupportsExternalDataFileCommit == false</c>. Mirrors that property's three conditions
+    /// (<c>IsIcebergCompat</c>, an identity column, <c>WriteTimeExpressions.Declares</c>) read from the
+    /// configuration and schema the create is about to be handed instead of from a snapshot that does not
+    /// exist yet. Erring toward TRUE only costs the reorder.
+    /// </summary>
+    private static bool NeedsOwnWriterOnCreate(Schema arrowSchema, IReadOnlyDictionary<string, string>? config)
+    {
+        if (EngineeredWood.DeltaLake.Schema.IcebergCompat.GetVersion(config)
+            != EngineeredWood.DeltaLake.Schema.IcebergCompatVersion.None)
+        {
+            return true;
+        }
+        if (config is not null)
+        {
+            foreach (var key in config.Keys)
+            {
+                // DeltaConstraintEnforcer.Declares' own prefix test.
+                if (key.StartsWith("delta.constraints.", System.StringComparison.Ordinal))
+                {
+                    return true;
+                }
+            }
+        }
+        // Invariants / generated columns ride FIELD metadata, which the Arrow schema carries verbatim into the
+        // Delta one — the same top-level fields DeltaConstraintEnforcer/DeltaGeneratedColumns walk.
+        foreach (var f in arrowSchema.FieldsList)
+        {
+            if (f.Metadata is { } md
+                && (md.ContainsKey("delta.invariants") || md.ContainsKey("delta.generationExpression")))
+            {
+                return true;
+            }
+        }
+        var delta = EngineeredWood.DeltaLake.Schema.SchemaConverter.FromArrowSchema(arrowSchema);
+        foreach (var f in delta.Fields)
+        {
+            if (EngineeredWood.DeltaLake.Schema.IdentityColumn.GetConfig(f) is not null)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Guards the one way the reorder can corrupt: our files were written under physical names WE assigned, so
+    /// if <c>OpenOrCreateAsync</c> opened a table someone else created concurrently (which ignores
+    /// <c>preAssignedSchema</c> by design, so a crashed CTAS can be retried) those names may name nothing in
+    /// its schema and every column would read NULL. Refuse instead — the bytes stay as invisible orphans.
+    /// </summary>
+    private static void EnsurePreAssignedLayoutAdopted(
+        DeltaTable table, EngineeredWood.DeltaLake.Schema.StructType? assigned, string path)
+    {
+        if (assigned is null)
+        {
+            return;   // no mapping was assigned ⇒ the files carry logical names, which any create reproduces
+        }
+        var live = table.CurrentSnapshot.Schema;
+        bool same = live.Fields.Count == assigned.Fields.Count;
+        for (int i = 0; same && i < assigned.Fields.Count; i++)
+        {
+            same = string.Equals(
+                EngineeredWood.DeltaLake.Schema.ColumnMapping.GetPhysicalName(
+                    live.Fields[i], EngineeredWood.DeltaLake.Schema.ColumnMappingMode.Name),
+                EngineeredWood.DeltaLake.Schema.ColumnMapping.GetPhysicalName(
+                    assigned.Fields[i], EngineeredWood.DeltaLake.Schema.ColumnMappingMode.Name),
+                System.StringComparison.Ordinal);
+        }
+        if (!same)
+        {
+            throw new System.InvalidOperationException(
+                $"delta: the table at '{path}' was created concurrently while this CREATE ... AS SELECT was "
+                + "writing its data files, and its column-mapping physical names differ from the ones those "
+                + "files were written under — refusing to commit them (they would read as all-NULL columns). "
+                + "The written files are unreferenced; re-run the statement.");
+        }
+    }
+
+    /// <summary>
     /// Rejects Arrow timestamp units that have no faithful Delta encoding. Delta timestamps are MICROSECOND,
     /// and parquet has only MILLIS/MICROS/NANOS — so a SECOND-unit column would be stored unchanged under a
     /// micros annotation and read back a million times too small, and a NANOSECOND column cannot be stored

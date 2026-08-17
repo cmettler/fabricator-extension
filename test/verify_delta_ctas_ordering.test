@@ -1,0 +1,296 @@
+# name: test/verify_delta_ctas_ordering.test
+# description: An AUTOCOMMIT CTAS on a table that does not exist writes its DATA FILES BEFORE it touches the
+#              `_delta_log` (DeltaWriter.TryCreateFilesFirst). A CREATE-plus-data is TWO versions either way —
+#              engineered-wood has no API publishing both at once for a host with its own data plane — so what
+#              this moves is WHERE a failure lands. Create-first meant the long, failure-prone part (DuckDB's
+#              COPY over network/disk/permissions) ran AFTER commit-0, leaving an empty COMMITTED table behind
+#              a statement the user saw fail; files-first leaves a folder with no `_delta_log`, which is not a
+#              table to any reader. §3 is the gate: an injected mid-stream failure, then a FRESH attach seeing
+#              nothing. ⚠ §4 pins that the CODEC engine is clean here TOO — the plan for this change predicted
+#              the engines would DIVERGE on failure semantics and the measurement says the opposite (the codec
+#              materializes the whole stream before creating), so the change makes them CONVERGE.
+#              Limitation 1.5 in docs/known-limitations.md; docs/delta-transactions.md §7.1.
+#              Set FABRICATOR_DELTA_WRITE_DIR. Local FS.
+# group: [fabricator]
+
+require fabricator
+
+require parquet
+
+require-env FABRICATOR_DELTA_WRITE_DIR
+
+# ============================================================================
+# 1. THE HAPPY PATH IS UNCHANGED — the reorder must move no answer.
+# ============================================================================
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/co' AS n (TYPE fabricator, PROVIDER 'delta');
+
+statement ok
+CREATE TABLE n.main.plain AS SELECT i::BIGINT AS id, ('v' || i)::VARCHAR AS s FROM range(50) r(i);
+
+query III
+SELECT count(*), sum(id), count(DISTINCT s) FROM n.main.plain;
+----
+50	1225	50
+
+# Two versions, as before: v0 = protocol+metaData, v1 = the data. The reorder does NOT collapse them, and
+# saying so here stops a future reader from expecting it to.
+query I
+SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/co/plain/_delta_log/*.json');
+----
+2
+
+# A PARTITIONED CTAS reorders too — the restriction that keeps the open-table streaming write to a single
+# file belongs to TryWriteStreamingCoreAsync, not to the create path, which partitions via one
+# COPY … PARTITION_BY. Three partitions, so this is the Hive-layout shape and not a one-file scan.
+statement ok
+CREATE TABLE n.main.parts PARTITIONED BY (pz) AS SELECT i::BIGINT AS id, (i % 3)::BIGINT AS pz FROM range(30) r(i);
+
+query II
+SELECT pz, count(*) FROM n.main.parts GROUP BY pz ORDER BY pz;
+----
+0	10
+1	10
+2	10
+
+# Column mapping is ASSIGNED BEFORE THE FILES on this path (physical names are random GUIDs, so a create
+# that minted fresh ones would orphan every file already written) and handed to the create verbatim as
+# `preAssignedSchema`. A mismatch does not error — it reads every column as NULL — so assert VALUES.
+statement ok
+CREATE TABLE n.main.idm WITH (column_mapping='id') AS SELECT i::BIGINT AS k, ('w' || i)::VARCHAR AS w FROM range(20) r(i);
+
+query IIII
+SELECT count(*), sum(k), count(w), max(w) FROM n.main.idm;
+----
+20	190	20	w9
+
+# A ZERO-ROW CTAS lands ONE commit, not two: the COPY produces a file, the plan references none of it (an
+# unreferenced empty file would be an orphan), and committing no adds over a table with no active files is a
+# no-op. So the table exists, is empty, and v1 never happens. Pinned because this is the one shape where the
+# reorder could differ from the ordinary path without any answer changing — both make the SAME
+# CommitDataFilesAsync call against the same fresh table, so they cannot, and this is what keeps it that way.
+# ⚠ The discarded COPY output does stay on disk as an orphan; that is RunCopy's pre-existing behaviour and is
+# deliberately not asserted here, so fixing it does not have to touch this suite.
+statement ok
+CREATE TABLE n.main.nought AS SELECT i::BIGINT AS id FROM range(0) r(i);
+
+query I
+SELECT count(*) FROM n.main.nought;
+----
+0
+
+query I
+SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/co/nought/_delta_log/*.json');
+----
+1
+
+# ============================================================================
+# 2. ROUTING — which shapes take the reorder. Observable only in the log: every form is CORRECT, so a row
+#    assertion passes either way (the same reason verify_delta_batched_read §10 exists).
+# ============================================================================
+
+statement ok
+CALL enable_logging(level := 'debug', storage := 'memory');
+
+# 2a. A fresh CTAS reorders.
+statement ok
+CREATE TABLE n.main.r1 AS SELECT i::BIGINT AS id FROM range(10) r(i);
+
+query I
+SELECT count(*) > 0 FROM duckdb_logs
+WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%create-then-commit%' AND message LIKE '%/r1:%';
+----
+true
+
+# 2b. CREATE OR REPLACE over a table that does NOT exist is a create, so it reorders as well.
+statement ok
+CREATE OR REPLACE TABLE n.main.r2 AS SELECT i::BIGINT AS id FROM range(10) r(i);
+
+query I
+SELECT count(*) FROM duckdb_logs
+WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%create-then-commit%' AND message LIKE '%/r2:%';
+----
+1
+
+# 2c. …but a REPLACE over an EXISTING table does NOT: there is a table to overwrite, so the removes are
+#     snapshot-coupled and the ordinary create-or-open path owns it. STILL 1 — the replace below added no
+#     second line. This is the control: without it §2a/2b would pass equally if the reorder had swallowed
+#     every write shape, and counting exactly is what makes it discriminate (the first line is still there).
+statement ok
+CREATE OR REPLACE TABLE n.main.r2 AS SELECT i::BIGINT AS id, 1::BIGINT AS extra FROM range(10) r(i);
+
+query I
+SELECT count(*) FROM duckdb_logs
+WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%create-then-commit%' AND message LIKE '%/r2:%';
+----
+1
+
+query II
+SELECT count(*), sum(extra) FROM n.main.r2;
+----
+10	10
+
+# 2d. A plain INSERT is untouched — it never reaches the create path and must not pay its TableExists probe.
+statement ok
+INSERT INTO n.main.r1 SELECT i::BIGINT FROM range(10, 20) r(i);
+
+query II
+SELECT count(*), sum(id) FROM n.main.r1;
+----
+20	190
+
+statement ok
+CALL disable_logging();
+
+# ============================================================================
+# 3. THE GATE — an injected MID-STREAM failure leaves NO TABLE.
+#
+#    50 000 rows failing at 47 500 is sized so the writer is genuinely reached before the error (measured:
+#    the folder and its parquet appear 3/3 at this size, i.e. under the pre-change ordering commit-0 would
+#    already have landed). A smaller injection can fail before the bulk consumer starts at all, which leaves
+#    nothing under EITHER ordering and would make this section pass vacuously.
+# ============================================================================
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/cofail' AS f (TYPE fabricator, PROVIDER 'delta');
+
+statement error
+CREATE TABLE f.main.boom AS
+  SELECT CASE WHEN i = 47500 THEN error('injected') ELSE (i::VARCHAR) END AS s FROM range(50000) r(i);
+----
+injected
+
+# NOT ONE commit file. Under create-first this is 1 — an empty committed table produced by a statement that
+# failed. This is the assertion the whole change exists for.
+query I
+SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/cofail/boom/_delta_log/*.json');
+----
+0
+
+# And it is invisible rather than merely uncommitted: a FRESH attach discovers no table, because discovery
+# requires a `_delta_log` and the folder has none. (The written parquet stays as an unreferenced orphan —
+# deliberately not deleted here; see TryCreateFilesFirst's remarks.)
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/cofail' AS f2 (TYPE fabricator, PROVIDER 'delta');
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'f2';
+----
+0
+
+statement error
+SELECT count(*) FROM f2.main.boom;
+----
+does not exist
+
+# The path is not poisoned: the same statement, run again without the injection, creates the table normally
+# over the orphan. A retry writing fresh GUID-named files and referencing only its own is what makes
+# leaving the orphan acceptable.
+statement ok
+CREATE TABLE f.main.boom AS SELECT i::BIGINT AS id FROM range(5) r(i);
+
+query II
+SELECT count(*), sum(id) FROM f.main.boom;
+----
+5	10
+
+# ============================================================================
+# 4. THE CODEC ENGINE IS CLEAN HERE TOO — and this section exists because the PLAN FOR THIS CHANGE PREDICTED
+#    THE OPPOSITE. It warned that a native_write-only reorder would make the engines "DIVERGE on failure
+#    semantics where today they agree", reasoning that the codec provider has no DuckDB writer to stage files
+#    with and so keeps creating first. It does not create first: it MATERIALIZES the whole stream and only then
+#    creates, so a mid-stream source failure fails before any create. Measured 3/3 at 2M rows — the codec left
+#    no folder at all, where native-before left commit-0. The change therefore makes the two CONVERGE.
+#
+#    ⚠ Convergence is shape-specific and this section does not claim more: on a STORAGE failure the order
+#    reverses again (the codec's create precedes its file writes, ours now follows them).
+# ============================================================================
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/cocodec' AS c (TYPE fabricator, PROVIDER 'engineeredwooddelta');
+
+statement error
+CREATE TABLE c.main.boom AS
+  SELECT CASE WHEN i = 47500 THEN error('injected') ELSE (i::VARCHAR) END AS s FROM range(50000) r(i);
+----
+injected
+
+query I
+SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/cocodec/boom/_delta_log/*.json');
+----
+0
+
+# The codec's own happy path is unaffected — it still creates FIRST and then writes, which is the ordering
+# this change deliberately did not touch. Pinned via the log so a future "make both engines match" edit has
+# to come here and say so.
+statement ok
+CALL enable_logging(level := 'debug', storage := 'memory');
+
+statement ok
+CREATE TABLE c.main.ok AS SELECT i::BIGINT AS id FROM range(10) r(i);
+
+query I
+SELECT count(*) FROM duckdb_logs
+WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%create-then-commit%' AND message LIKE '%/ok:%';
+----
+0
+
+query I
+SELECT count(*) > 0 FROM duckdb_logs
+WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta write%' AND message LIKE '%/ok:%';
+----
+true
+
+query II
+SELECT count(*), sum(id) FROM c.main.ok;
+----
+10	45
+
+statement ok
+CALL disable_logging();
+
+# ============================================================================
+# 5. THE REORDER DECLINES WHEN THE TABLE IT WOULD CREATE NEEDS ENGINEERED-WOOD'S OWN WRITER.
+#
+#    The open-table path reads that off `table.SupportsExternalDataFileCommit` AFTER opening; the create path
+#    has no table yet, so NeedsOwnWriterOnCreate evaluates the same three conditions (IcebergCompat, an
+#    identity column, WriteTimeExpressions) on the very configuration and schema the create is about to be
+#    handed. Declining costs only the reorder.
+#
+#    ⚠ Exactly ONE of the three is reachable from SQL and so is the only one gated: a declared CHECK
+#    constraint. IcebergCompat is refused earlier by the WITH-key guard ("feature-enabling properties need a
+#    protocol declaration"), and an identity column cannot be declared on a CTAS at all — both branches are
+#    defensive, and saying so beats implying coverage. Getting this wrong is not a silent wrong answer:
+#    without the check the files would be written and then REFUSED by CommitDataFilesAsync, so the mutant
+#    fails loudly (which is what §5 asserts by the statement simply succeeding).
+# ============================================================================
+
+statement ok
+CALL enable_logging(level := 'debug', storage := 'memory');
+
+statement ok
+CREATE TABLE n.main.ck WITH ("delta.constraints.positive"='id > 0') AS SELECT i::BIGINT AS id FROM range(1, 5) r(i);
+
+query II
+SELECT count(*), sum(id) FROM n.main.ck;
+----
+4	10
+
+query I
+SELECT count(*) FROM duckdb_logs
+WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%create-then-commit%' AND message LIKE '%/ck:%';
+----
+0
+
+statement ok
+CALL disable_logging();
+
+# The POSITIVE CONTROL, and it is load-bearing: without it the assertion above would pass equally if the
+# constraint had never been recorded — a table declaring nothing would decline nothing. A violating row must
+# be refused BY EVALUATION, which is engineered-wood's own writer doing the work this branch exists to leave
+# to it.
+statement error
+INSERT INTO n.main.ck VALUES (0);
+----
+constraint

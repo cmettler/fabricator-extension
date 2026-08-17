@@ -135,7 +135,12 @@ case "$TIER" in
         # OPENS. It exists because the engineered-wood bump onto upstream/main made partition-directory
         # escaping depend on what the filesystem declares it cannot hold, and nothing here covered that in
         # either direction — no partition value in any other suite contains a Win32-sensitive character.
-        : "${MIN_SUITES:=69}"
+        # 70 runs since 2026-08-17: verify_delta_ctas_ordering (60) pins that an autocommit CTAS writes its
+        # DATA FILES BEFORE it touches the _delta_log, so a failed data write leaves a folder with no
+        # `_delta_log` instead of an EMPTY COMMITTED TABLE behind a statement the user saw fail. Its §3 gate
+        # injects the failure with `error()` mid-stream — which is what turned limitation 1.5's residue from
+        # "reasoned, not measured" into measured, in both directions.
+        : "${MIN_SUITES:=70}"
         # 5656 since 2026-08-02: verify_delta_catalog_transactions 943 -> 944 Ã¢ÂÂ ROLLBACK now RECLAIMS the
         # data files the transaction eagerly wrote (EW #52's DiscardDataFilesAsync) instead of leaving them
         # for VACUUM. +2, not +1: that suite is one of the DOUBLED ones below, so an assertion added to it
@@ -288,7 +293,14 @@ case "$TIER" in
         # verify_delta_catalog_functions 28 -> 45, §8: the `delta` FUNCTION schema is ADVERTISED on a LOCAL
         # attach (the host silently drops functions in an unadvertised schema — the measured fabric-schema
         # failure shape), all six functions declared as table functions, and DDL into the namespace refused.
-        : "${MIN_ASSERTIONS:=7185}"
+        # 7478 since 2026-08-17, from a green tier run of 7475 plus the 3 assertions added to the new suite
+        # right after it (⚠ 7418 - 7185 = 233 of the gap PREDATES this — the partition-only batched form
+        # (+67) and the PresentNames / TopN / union-form gates raised the actual without raising the floor;
+        # closed here like the earlier lags, since a floor 233 below the actual tolerates a regression that
+        # large in silence). The +60 of this change is verify_delta_ctas_ordering, and NOTHING ELSE MOVED:
+        # every other suite reported its exact prior count, which is the behaviour-preservation claim for a
+        # change that reorders two writes without altering any answer.
+        : "${MIN_ASSERTIONS:=7478}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

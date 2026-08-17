@@ -1868,19 +1868,25 @@ principal wins even if `PROVIDER` says something else:
 > t/_delta_log/00000000000000000001.json   commitInfo operation=WRITE, add
 > ```
 >
-> Two things follow. A **concurrent reader** (Spark, delta-rs) can open the table between the commits and
-> see it *empty*. And if the data write **fails**, the empty table stays — a statement you saw fail has
-> still created something.
+> One thing follows for readers: a **concurrent reader** (Spark, delta-rs) can open the table between the
+> two commits and see it *empty*.
 >
-> In practice the failures you are likely to hit are refused *before* the table is created, because the
-> schema must convert to Delta types first — e.g. a `TIMESTAMP_NS` or `INTERVAL` column errors and leaves
-> nothing behind. What is exposed is a *storage* failure during the write (permissions, disk full,
-> network).
+> **A failed CTAS no longer leaves that empty table behind (since 2026-08-17).** The data files are now
+> written *before* anything touches the log, so a failure during the write leaves a folder with no
+> `_delta_log` — not a table to any reader — and simply re-running the statement works. Schema failures
+> were already refused before the create (a `TIMESTAMP_NS` or `INTERVAL` column errors and leaves nothing),
+> so what this covers is the *storage* half: permissions, disk full, network. The window that remains is
+> between the two adjacent log writes, with no data movement in between.
 >
-> **⚠ Recover with `CREATE OR REPLACE TABLE … AS SELECT` (or `DROP TABLE` then create) — a plain re-run
-> does not.** Once the table exists, a plain `CREATE TABLE t AS SELECT …` is refused with
-> *"Table with name t already exists!"*, and `CREATE TABLE IF NOT EXISTS` leaves the empty table by
-> definition. Only `CREATE OR REPLACE` overwrites it.
+> ⚠ Two shapes keep the old ordering and can still leave an empty table if their write fails:
+> `BEGIN; CREATE TABLE t (…); …` (a `CREATE` inside a transaction is immediate by design — see below) and
+> `PROVIDER 'engineeredwooddelta'`. The codec engine is nonetheless safe against a failing *source* query,
+> because it buffers the whole result before creating anything.
+>
+> **⚠ If you do end up with an empty table, recover with `CREATE OR REPLACE TABLE … AS SELECT` (or
+> `DROP TABLE` then create) — a plain re-run does not.** Once the table exists, a plain
+> `CREATE TABLE t AS SELECT …` is refused with *"Table with name t already exists!"*, and
+> `CREATE TABLE IF NOT EXISTS` leaves the empty table by definition. Only `CREATE OR REPLACE` overwrites it.
 >
 > This is a Delta-writer API limitation, not a Delta format one — the format allows a single commit that
 > both creates the table and adds data.
