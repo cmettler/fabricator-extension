@@ -9,8 +9,8 @@ behaviour**, plus diagnostics for those. It is **NOT an exhaustive list of the e
 per-area docs in the index own theirs (SQL Server type mapping, DAX, Fabric API coverage, the distribution
 SKUs…). **Absence from this page does not mean "no limitation".**
 
-**How to know what DOES work.** The test tiers, not this page. `scripts/run-suites.sh hermetic` (67 runs /
-6895 assertions) and `service` (46 / 1779) are the standing answer, and they fail on a skip, so a green run
+**How to know what DOES work.** The test tiers, not this page. `scripts/run-suites.sh hermetic` (70 runs /
+7478 assertions) and `service` (50 / 2028) are the standing answer, and they fail on a skip, so a green run
 means the suites genuinely ran. ⚠ Those numbers go stale; the FLOORS in `scripts/run-suites.sh` are the
 authority, and its comments record what each raise bought. Anything they cover works on the substrates they cover — which is
 **single-writer** local plus, in the service tier, real SQL Server and MinIO.
@@ -25,7 +25,7 @@ authority, and its comments record what each raise bought. Anything they cover w
 | 1.2 | Same shape on **`s3://` with no NAMED secret** | 8 of 48 commits landed, 40 silently lost ([delta-transactions.md](delta-transactions.md) §8.3) |
 | 1.3 | Same shape on **`abfss://` with no NAMED secret** | 41 of 48 landed, six of the seven losses silent (§8.4) |
 | 1.4 | **`fabricator_fs_write_probe` can report the commit guard as WORKING when it tested nothing** — it fails in the UNSAFE direction | Aimed at a path whose parent does not exist, `exclusive_create_existing_fails` reads `true` ("put-if-absent works") because the exclusive open threw for a MISSING DIRECTORY. Confirm `create_directory` and `write_create` are both `true` before believing the verdict. §8.5a |
-| 1.5 | **A CREATE-plus-data is NOT atomic — it lands as TWO versions, in a transaction AND in plain autocommit.** v0 = `protocol`+`metaData` (an EMPTY table), v1 = the data. So a concurrent reader can observe the empty table, and **a failure of the data write leaves an empty committed table behind a statement the user saw fail** | `_delta_log` inspected directly for both shapes: `BEGIN; CREATE; INSERT; COMMIT` (via `FlushCreateTransactionAsync`) and a plain **autocommit `CREATE TABLE … AS SELECT`** (via `DeltaWriter.WriteAsync` → `OpenOrCreateAsync` then `table.WriteAsync`). §7.1. Not a protocol limit — Delta permits `protocol`+`metaData`+`add` in v0 — but an engineered-wood API-shape one: `StartTransaction` and `CommitDataFilesAsync` are both INSTANCE methods, so "a transaction that creates its table" is inexpressible |
+| 1.5 | **A CREATE-plus-data is NOT atomic — it lands as TWO versions, in a transaction AND in plain autocommit.** v0 = `protocol`+`metaData` (an EMPTY table), v1 = the data, so a concurrent reader can observe the empty table. ⚠ **THE FAILURE HALF OF THIS ROW WAS FIXED ON 2026-08-17 and the row said otherwise until then** — it used to read "a failure of the data write leaves an empty committed table behind a statement the user saw fail", which is no longer true of the shape it was written about | `_delta_log` inspected directly for both shapes: `BEGIN; CREATE; INSERT; COMMIT` (via `FlushCreateTransactionAsync`) and a plain **autocommit `CREATE TABLE … AS SELECT`**. §7.1. Not a protocol limit — Delta permits `protocol`+`metaData`+`add` in v0 — but an engineered-wood API-shape one: `StartTransaction` and `CommitDataFilesAsync` are both INSTANCE methods, so "a transaction that creates its table" is inexpressible, which is why the VERSION COUNT is unchanged. **What changed is the ORDER**: an autocommit CTAS on `native_write` (the `PROVIDER 'delta'` default) now writes its data files BEFORE touching the log (`DeltaWriter.TryCreateFilesFirst`), so a failed data write leaves a folder with no `_delta_log` — not a table to any reader — instead of an empty committed one. MEASURED both ways, 3 runs each, one variable: 2M-row CTAS failing at row 1.9M ⇒ before **1 commit file**, after **0**. Residual window: the two ADJACENT log writes, with no data movement between them. Gate `verify_delta_ctas_ordering` §3 |
 | 1.6 | **`CREATE TABLE IF NOT EXISTS t AS SELECT …` leaves 1.5's empty table** — correct per its own semantics, but it means the `IF NOT EXISTS` spelling never recovers the orphan | The working recoveries are `CREATE OR REPLACE TABLE … AS SELECT` and a `DROP TABLE` + CREATE. A **plain** `CREATE TABLE … AS SELECT` no longer keeps the old data silently — it now ERRORS (see the note below), so it does not recover the orphan either, but it says so |
 | 1.8 | **A `CREATE TABLE` inside `BEGIN … COMMIT` is IMMEDIATE, so a concurrent session sees an EMPTY table for the transaction's life, and a ROLLBACK whose drop FAILS leaves that empty table behind.** Accepted deliberately (it buys ALTER + DELETE on a table created in the same transaction, both of which used to throw) | Pinned by `verify_delta_catalog_transactions` §28/§30 (v0 present mid-transaction, one version, no data commit) and by the rollback sections (folder gone afterwards, with a positive control that it existed first). The drop is best effort BY DESIGN — rollback is already the failure path — and a failure is logged naming the path. ⚠ It can also lose a concurrent writer's rows if someone INSERTed while the table was visible. Rationale + the six build corrections: [delta-transaction-hoist.md](delta-transaction-hoist.md) §3, §4.3 |
 | 1.7 | **A change feed built from a BUFFERED append carries NULL row identity, where the same statement in AUTOCOMMIT carries real ids.** The two paths disagree: autocommit writes NO `cdc` action for an append and lets the reader infer it from the `add` (which carries `baseRowId`/`defaultRowCommitVersion`); the buffered path writes a `_change_data` file whose `__delta_row_id` / `__delta_row_commit_version` are **NULL**, and a present `cdc` file SUPPRESSES the inference | `_delta_log` + the change parquet inspected directly on a `change_data_feed true, row_tracking true` catalog: three autocommit `INSERT`s ⇒ `cdc=0` each; `BEGIN; INSERT; COMMIT` ⇒ `cdc=1` with both identity columns NULL beside an `add` carrying `baseRowId:0`, `defaultRowCommitVersion:1`. **Invisible from SQL** — `delta.changes` projects only `id, val, _change_type, _commit_version, _commit_timestamp`, so no query distinguishes them. It is a file-layer fidelity gap and **currently LATENT in every shipping consumer**: Delta's `CDCReader.cdcReadSchema` (read at `v4.0.0`) returns the LOGICAL schema plus exactly `_change_type`/`_commit_version`/`_commit_timestamp`, and the materialized row-tracking columns are hidden physical columns named through configuration keys, so `table_changes()` cannot surface them; our own `delta.changes` does not project them either. ⚠ It is also UNRECOVERABLE rather than merely absent — a `cdc` action carries no `baseRowId`, so a reader has nothing to compute from once a change file exists for that version (inference works only via the `AddFile`). ⇒ fix it as a fidelity task; do NOT describe it as user-visible today. Fix + the trap in the seemingly cheaper alternative: [delta-transaction-hoist.md](delta-transaction-hoist.md) §6 |
@@ -41,27 +41,39 @@ authority, and its comments record what each raise bought. Anything they cover w
 | 1.19 | **A Delta table declaring `delta.constraints.*` (or a column invariant, or a generated column) is INSERT-ONLY through fabricator: `UPDATE` and `DELETE` are REFUSED.** The `INSERT` half works and is genuinely ENFORCED — a violating row is rejected and nothing is committed. This is an IMPROVEMENT on what came before (such a table used to reject every write, including appends), not a regression; the case it serves is a **Spark-authored** table, since `CREATE TABLE … CHECK (…)` is deliberately unsupported here | Measured 2026-08-12 on BOTH table shapes (deletion vectors on — the default — and `deletion_vectors false, column_mapping 'none'`) with an unconstrained twin as the control: satisfying `INSERT` lands; violating `INSERT` fails with *"CHECK constraint 'delta.constraints.pos' (id > 0) is violated by a row being written. No data was committed."*; `UPDATE` **and** `DELETE` fail with *"…this write path cannot evaluate it against the rows; write rejected."* — the `UPDATE` even when its post-image satisfies the constraint, the `DELETE` although it has no post-image at all. **Cause:** engineered-wood's `SupportsExternalDataFileCommit` reports false for such a table, which steers an INSERT onto its own `WriteAsync` where rows exist to be checked; our UPDATE/DELETE are COMPOSED from file-level staging APIs that are handed FINISHED FILES, so it refuses rather than commit unvalidated — the safe direction. ⚠ `CREATE OR REPLACE` works and **copies the declaration forward**, so it is not an escape. **Workaround:** do the UPDATE/DELETE from Spark, or drop the constraint first (see below). Gate: `verify_delta_tblproperties` §8. Full record: [ew-master-migration.md](ew-master-migration.md) §THE 2026-08-12 PIN ONTO UPSTREAM §6 |
 | 1.11 | **`UPDATE … SET col = DEFAULT` is REFUSED** (all providers) — write the default value explicitly | It used to CORRUPT rather than refuse, which is why the refusal is gated rather than merely noted. The operator reads each SET value out of the child chunk at the position the bound expression names; a `DEFAULT` contributes NO column to the binder's projection, so the old positional read shifted every later SET value by one. **Measured before the fix** on `(a BIGINT DEFAULT 99, b BIGINT, c INTEGER)`: `SET a = DEFAULT, b = 5` SUCCEEDED and committed `a=5, b=0` (b got the rowid) where the correct answer is `a=99, b=5`; where the shifted types differ instead, it raised an INTERNAL error and **fatally invalidated the database**. Gate: `verify_delta_catalog_update.test` (the refusal, that the refused statement changed nothing, and a positive control that ordinary multi-column UPDATE still works), mutation-tested |
 
-**On 1.5 — what protects you today, and it is structural rather than luck.** Every REACHABLE failure fires
-BEFORE v0, because the Arrow→Delta **schema conversion is a precondition of the create** (`OpenOrCreateAsync` cannot
-be called without a Delta schema). Two measured, both leaving NO table behind: a `TIMESTAMP_NS` column and an
-`INTERVAL` column. What remains exposed is a failure of the DATA write or its commit — storage error, permission,
-disk full, network — which has no compensation. **That residue is reasoned, not measured**; injecting it was not
-attempted. A commit CONFLICT is handled properly by the retry loop.
+**On 1.5 — what protects you today.** Two mechanisms now, and the second was built on 2026-08-17.
 
-**⚠ The orphan is UNCONDITIONAL once v0 lands, and we do NOT compensate.** Both paths put the create outside
-the guarded region (autocommit's `OpenOrCreateAsync` precedes its `try`; the buffered flush's
-`DeltaWriter.Create` precedes its own) and both `finally` blocks only DISPOSE. Only a commit CONFLICT is
-handled, by retrying. `RollbackTransaction` reclaims DATA FILES and cannot help — `DiscardBufferedFiles`
-opens the table to do its work, so it presupposes the table exists. **A version-checked delete is not the
-fix**: measured 2026-08-04, deleting v0 under a concurrent v1 makes the table unreadable (*"Delta log is
-incomplete: version 0 is missing …"*), and deleting the whole FOLDER destroys the other writer's data
-irreversibly. ⚠ The objection is AUTHORITY, not atomicity — `DROP TABLE` is the same unconditional recursive
-folder delete and we ship it, so "a recursive delete can partially complete" rules nothing out. What separates
-them is consent: DROP destroys a table the USER NAMED, with the user present, and re-running it finishes a
-partial one; the compensation would infer destruction from a failure WE caused, with a third-party victim who
-ran only an `INSERT`. The safe primitive is deleting the files you WROTE by name (`DiscardDataFilesAsync`,
-which refuses anything a fresh log references) — that needs no authority beyond our own write — and it is
-available only after the write-files-first reordering, when the folder is not yet a table. Detail + the reorder's real scope: [delta-transactions.md](delta-transactions.md) §7.1.
+**(a) Structural, and it was always the stronger half.** Every reachable SCHEMA failure fires BEFORE v0, because
+the Arrow→Delta conversion is a *precondition* of the create (`OpenOrCreateAsync` cannot be called without a Delta
+schema). Two measured, both leaving no table behind: a `TIMESTAMP_NS` column and an `INTERVAL` column.
+
+**(b) The DATA write now precedes the log — the residue (a) could not cover.** An autocommit CTAS on
+`native_write` writes its parquet first and creates+commits after (`DeltaWriter.TryCreateFilesFirst`), so a
+storage / permission / disk-full / network failure during the write leaves a folder with **no `_delta_log`**,
+which is not a table to any reader. **This residue used to be "reasoned, not measured — injecting it was not
+attempted"; it is now MEASURED in both directions** by injecting a mid-stream source failure (`error()` at row
+1.9M of 2M), 3 runs each: create-first left **1 commit file** (the empty committed table), files-first leaves
+**0**, and a fresh ATTACH discovers nothing. Gate `verify_delta_ctas_ordering` §3.
+
+**What is left, and what it is NOT.** The window is now between the two ADJACENT log writes (create, then commit)
+with no data movement in between, and it is unchanged for the two paths (b) does not cover: an EXPLICIT
+transaction (its create is immediate by design — row 1.8) and the CODEC engine. ⚠ **The codec engine is
+nonetheless clean on a SOURCE failure** — measured, and it refutes what the plan for (b) predicted: it
+materializes the whole stream before creating, so it leaves no folder at all. See §7.1.
+
+**⚠ Once v0 lands we still do NOT compensate, and that is deliberate.** Only a commit CONFLICT is handled, by
+retrying. `RollbackTransaction` reclaims DATA FILES and cannot help — `DiscardBufferedFiles` opens the table to
+do its work, so it presupposes the table exists. **A version-checked delete is not the fix**: measured
+2026-08-04, deleting v0 under a concurrent v1 makes the table unreadable (*"Delta log is incomplete: version 0 is
+missing …"*), and deleting the whole FOLDER destroys the other writer's data irreversibly. ⚠ The objection is
+AUTHORITY, not atomicity — `DROP TABLE` is the same unconditional recursive folder delete and we ship it, so "a
+recursive delete can partially complete" rules nothing out. What separates them is consent: DROP destroys a table
+the USER NAMED, with the user present, and re-running it finishes a partial one; the compensation would infer
+destruction from a failure WE caused, with a third-party victim who ran only an `INSERT`. The safe primitive is
+deleting the files you WROTE by name (`DiscardDataFilesAsync`, which refuses anything a fresh log references) —
+that needs no authority beyond our own write — and (b) is what makes it available, since the folder is no longer
+a table when the write fails. **Not built: the orphan parquet is left in place**, which a retry simply ignores
+(fresh GUID names, and only its own files are referenced). Detail: [delta-transactions.md](delta-transactions.md) §7.1.
 
 **FIXED 2026-08-04, and it was BROADER than the row that used to sit here — the shared C++ layer never
 checked `ERROR_ON_CONFLICT` at all.** A plain create reached the provider as an ordinary create, so
@@ -202,7 +214,7 @@ any rule in the host.
 | # | claim | why it is unproven, and what would settle it |
 |---|---|---|
 | 2.1 | **Row-level reconciliation now applies to the autocommit merge-on-read UPDATE** (it previously had none — the retired path compare-and-set on `expectedVersion`, which also disables the OCC retry loop) | MECHANISM-level only: this path now makes the same staging calls the buffered path makes, and those ARE covered (`verify_delta_row_level_concurrency` §3/§5/§8). No observation of two autocommit UPDATEs composing exists. Unreachable in-process (sqllogictest runs connections sequentially, so an autocommit statement has no window) AND unreachable on a Windows local root (limitation 1.1 swamps it). Needs OneLake, S3-with-secret, or POSIX local: `scratchpad/mor_update_race.sh`, which is an A/B against the pre-change build so a single green leg cannot be mistaken for a measurement |
-| 2.2 | **The whole-table read declaration is WITHHELD whenever the transaction stages row-level deletes, while the justification is row-locality** — so `BEGIN; SELECT avg(x) FROM t; DELETE FROM t WHERE x > 42; COMMIT;` is exempted although the row-level validation covers only the REMOVED rows, not a threshold derived from a whole-table read | Reasoned from the source, never executed. ⚠ **The MECHANISM changed on 2026-08-07 and the exposure did not**: this used to be a 66-line engineered-wood patch (`ExemptRowLevelFromWholeTableRead`) setting a flag unconditionally; it is now `DeltaCatalog.cs:4085` deciding host-side whether to call `DeclareWholeTableRead()` at all — upstream's own stated position, and code we own rather than a patch on someone else's library. **INERT under our default** either way: the exemption is gated on the table not being serializable, and the catalog default has been `serializable` since 2026-08-01 ⇒ it applies only when `write_serializable` is explicitly chosen. Settling it means building that shape as a suite section under `write_serializable` with a concurrent remove. Fixing it needs PROVENANCE on the flag (a DML's own scan vs an arbitrary SELECT), which the buffer does not carry |
+| 2.2 | **The whole-table read declaration is WITHHELD whenever the transaction stages row-level deletes, while the justification is row-locality** — so `BEGIN; SELECT avg(x) FROM t; DELETE FROM t WHERE x > 42; COMMIT;` is exempted although the row-level validation covers only the REMOVED rows, not a threshold derived from a whole-table read | Reasoned from the source, never executed. ⚠ **The MECHANISM changed on 2026-08-07 and the exposure did not**: this used to be a 66-line engineered-wood patch (`ExemptRowLevelFromWholeTableRead`) setting a flag unconditionally; it is now `DeltaCatalog.cs:4085` deciding host-side whether to call `DeclareWholeTableRead()` at all — upstream's own stated position, and code we own rather than a patch on someone else's library. **⚠ LIVE under our default, and this row said INERT until 2026-08-17** — the exemption is gated on the table not being serializable, and **the catalog default was reversed BACK to `write_serializable` on 2026-08-11** (`DeltaCatalog.cs:393`; §4), so it now applies unless a table property or ATTACH option opts out. It was genuinely inert only for the ten days the 2026-08-01 flip held. Settling it means building that shape as a suite section with a concurrent remove. Fixing it needs PROVENANCE on the flag (a DML's own scan vs an arbitrary SELECT), which the buffer does not carry |
 | 2.3 | The narrowing that came with the merge-on-read migration: validation now also runs `RejectRowTrackingWrite`, so a table with row tracking ON but its materialized column names ABSENT is REFUSED where it previously proceeded with fresh ids (silently reassigning row identity) | Reachable only via a foreign writer that produces a spec-invalid table; no suite constructs one. The refusal is the better answer, but it IS a behaviour change |
 
 ---
@@ -222,17 +234,28 @@ any rule in the host.
 
 ---
 
-## 4. `write_serializable` — inert by default, and what it would take to trust
+## 4. `write_serializable` — the DEFAULT again since 2026-08-11, and what it would take to trust
 
-**The catalog default is `serializable` (since 2026-08-01), and the recorded reason is not the whole reason.**
-CLAUDE.md justifies the flip on PARITY ("the old default made us the weaker writer than Fabric Spark on any table
-that declares no level"). True, but falsifiable — someone could establish parity another way and flip back.
-**The author's actual reason was that it was not clear `WriteSerializable` functions 100%** (stated 2026-08-04),
-which is the stronger and more durable justification, and §2.2 has since produced concrete evidence for it. Record
-both; do not undo the flip on the parity argument alone.
+**⚠ THIS SECTION SAID "INERT BY DEFAULT" UNTIL 2026-08-17 AND THAT WAS STALE BY SIX DAYS — read the correction
+before anything else in it.** The 2026-08-01 flip to `serializable` was **REVERSED on 2026-08-11 by user
+decision**, so `write_serializable` is the catalog default again (`DeltaCatalog.cs:393`, which carries the
+reversal note; §1.14 of this page had already been written against the restored default while this section still
+claimed the opposite — the page contradicted itself). Everything below was written as "dead code you can ignore"
+and is **live on every Delta catalog that does not opt out**.
 
-**One fact collapses most of the confusion in this area:** every isolation-related mechanism below is
-**`write_serializable`-only**, so all of it is dead under the default.
+**Both reasons for the original flip still stand, and the reversal did not refute either.** It was justified on
+PARITY (the old default made us the weaker writer than Fabric Spark on any table declaring no level, so the
+effective guarantee depended on which engine wrote last) and, more durably, on **the author's stated doubt that
+`WriteSerializable` functions 100%** (2026-08-04), for which §2.2 has since produced concrete evidence. What the
+reversal changed is **which side of the trade-off we take**, not whether the doubt was resolved: row-level
+concurrency is a `write_serializable`-ONLY relaxation, so under `serializable` concurrent disjoint-row DML on one
+file conflicts instead of composing, and that capability was judged worth more than the parity. A table's own
+`delta.isolationLevel` still outranks the catalog, and `isolation_level 'serializable'` on the ATTACH restores
+the aligned-with-Spark behaviour.
+
+**One fact still collapses most of the confusion in this area:** every isolation-related mechanism below is
+**`write_serializable`-only** — which now means *active by default* rather than dead, and it is exactly why the
+open items 4.2–4.5 matter rather than being theoretical.
 
 ```
 ConflictChecker:  examineAdds = (isolation == Serializable) || !concurrentIsBlindAppend
@@ -242,9 +265,9 @@ ExemptRowLevelFromWholeTableRead:  gated on isolationLevel != Serializable
 
 | mechanism | protects | direction | active under |
 |---|---|---|---|
-| `ExemptRowLevelFromWholeTableRead` | OUR concurrent row-level DML from aborting on a whole-table read declaration | inward (our decisions) | write_serializable only |
-| `isBlindAppend` **reading** half (shipped) | US from wrongly skipping a check another engine declared we owe | inward | write_serializable only |
-| `isBlindAppend` **writing** half (**BUILT 2026-08-08**) | OTHER engines from aborting against our appends | outward (Spark's decisions) | write_serializable only; **explicit transactions only** — autocommit declares nothing |
+| `ExemptRowLevelFromWholeTableRead` | OUR concurrent row-level DML from aborting on a whole-table read declaration | inward (our decisions) | write_serializable only ⇒ **on by default** |
+| `isBlindAppend` **reading** half (shipped) | US from wrongly skipping a check another engine declared we owe | inward | write_serializable only ⇒ **on by default** |
+| `isBlindAppend` **writing** half (**BUILT 2026-08-08**) | OTHER engines from aborting against our appends | outward (Spark's decisions) | write_serializable only ⇒ on by default, but **explicit transactions only** — autocommit declares nothing (§4.2) |
 
 **⚠ Two things people get wrong here.** (1) `isBlindAppend` never "allows concurrent appends" — two appends never
 conflict at ANY level, because the check asks whether a concurrent add matches *my read predicates* and an appender
@@ -254,9 +277,11 @@ ignored. Its only purpose is the `WriteSerializable` branch — which OSS Delta 
 because its property validator REFUSES to set that level (measured on Fabric Spark 4.1.1; upstream PR #24 found the
 same on delta-spark 4.0.0). It is reachable only on a table stamped by Databricks — or by us.
 
-**Consequence worth stating plainly: row-level concurrency is SHIPPED BUT OFF.** It is a `WriteSerializable`-only
-relaxation, so under the default, concurrent disjoint-row DML on one file CONFLICTS rather than composing. The
-capability exists and nobody gets it without opting into the level we do not yet trust.
+**Consequence worth stating plainly, and it INVERTED on 2026-08-11: row-level concurrency is SHIPPED AND ON.**
+It is a `WriteSerializable`-only relaxation and `write_serializable` is the default again, so concurrent
+disjoint-row DML on one file COMPOSES rather than conflicting — for every user, without anyone opting in. That is
+the capability the reversal was for; it is also why the unproven parts below are exposure rather than trivia.
+`isolation_level 'serializable'` on the ATTACH, or `delta.isolationLevel` on the table, turns it back off.
 
 ### What "working correctly" would require — five items, and the first two are what create value
 
@@ -266,11 +291,12 @@ capability exists and nobody gets it without opting into the level we do not yet
 | 4.2 | autocommit read-tracking, or truthful omission | the writing half is only reliable inside `BEGIN…COMMIT`, where reads are staged. In autocommit nothing is recorded, so `INSERT … SELECT FROM t` (read) is indistinguishable from `INSERT … VALUES` (blind). Asymmetry rule: staged reads may DOWNGRADE a declared `true` to `false`, never the reverse |
 | 4.3 | fix the unconditional exemption (§2.2) | we currently relax more than we justify; that cannot ship as a guarantee |
 | 4.4 | real-concurrency test of the AUTOCOMMIT row-level path | untestable in-process, and **impossible on a Windows local root** (§1.1). Needs OneLake or S3-with-a-named-secret |
-| 4.5 | settle the `metadataChanged` divergence | Delta guards its WriteSerializable branch with `!currentTransactionInfo.metadataChanged`; EW's `examineAdds` has no such condition. Never investigated |
+| 4.5 | ~~settle the `metadataChanged` divergence~~ **CLOSED UPSTREAM 2026-08-13** by engineered-wood **#146**, which gave `ExamineConcurrentAdds` Delta's third term — a transaction that itself changes metadata now examines concurrent blind appends instead of exempting them | Delta guards its WriteSerializable branch with `!currentTransactionInfo.metadataChanged` and EW's `examineAdds` had no such condition. Now aligned; it TIGHTENS us, and since the default is `write_serializable` again it is live. ⚠ REASONED, NOT MEASURED — sqllogictest cannot produce a concurrent commit. §1.14 |
 
-4.1–4.2 change what a user can observe; 4.3–4.5 are what let us *claim* it. Do not harden a guarantee nobody can
-yet observe — 4.1 first, and its gate is the existing `sparkprobe conflict <Level>` A/B (whose method note says to
-PROVE the overlap window, never assume it: four earlier runs were void and each void looked like a clean pass).
+4.1–4.2 change what a user can observe; 4.3–4.4 are what let us *claim* it. Do not harden a guarantee nobody can
+yet observe — with 4.1 and 4.5 closed, **4.2 is the head of the queue**, and the gate for the observable half is
+the existing `sparkprobe conflict <Level>` A/B (whose method note says to PROVE the overlap window, never assume
+it: four earlier runs were void and each void looked like a clean pass).
 
 **⚠ Two caveats before investing.** (a) dbt's usual shape is one model → one table, so `--threads N` writes to N
 DIFFERENT tables and never contends; the benefit lands on shared-table workloads (several pipelines on one table,
