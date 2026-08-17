@@ -634,6 +634,18 @@ FabricatorTableEntry::~FabricatorTableEntry() {
 
 // Cardinality callback: hands the optimizer the table's approximate row count so
 // join ordering has a real estimate. Unknown (-1) => no statistics reported.
+//
+// ⚠ THE ONE-ARG NodeStatistics IS LOAD-BEARING, NOT SHORTHAND. It sets
+// has_max_cardinality = FALSE, so what we publish is an ESTIMATE and never a hard upper
+// bound. That is the entire reason a stale or plain wrong row count cannot change an
+// answer, and every other statistic here is withheld on the strength of it (see below).
+// The two-arg form would claim `max_cardinality`, which IS consumed as a bound
+// (read_file.cpp sets it from a file count; propagate_join multiplies maxima) — so a
+// table whose real count exceeds ours would then be a wrong-answer bug. Never use it:
+// our counts are read once and cached for the entry's lifetime, and on Delta they
+// describe the COMMITTED snapshot while a scan may return that plus this transaction's
+// buffered writes. Measured: a table created inside a transaction reports cardinality 0
+// while count(*) correctly returns 5 — the worst estimate reachable, right answer.
 static unique_ptr<NodeStatistics> FabricatorScanCardinality(ClientContext &context, const FunctionData *bind_data_p) {
 	auto &bind_data = bind_data_p->Cast<fabricator::ArrowStreamBindData>();
 	if (bind_data.row_count < 0) {
@@ -642,11 +654,41 @@ static unique_ptr<NodeStatistics> FabricatorScanCardinality(ClientContext &conte
 	return make_uniq<NodeStatistics>(static_cast<idx_t>(bind_data.row_count));
 }
 
-// Per-column statistics callback: reports ONLY the distinct-value estimate (NDV) for
-// the optimizer's selectivity. min/max is deliberately left UNKNOWN (CreateUnknown):
-// DuckDB prunes filters on min/max (FILTER_ALWAYS_FALSE), and SQL Server's sampled,
-// possibly-stale stats are not exact bounds on a live table — so reporting them could
-// drop rows. NDV only affects cardinality estimation, never correctness.
+// Per-column statistics callback: reports ONLY the distinct-value estimate (NDV) for the
+// optimizer's selectivity — like the row count it feeds estimation alone (the join-order
+// denominators in cardinality_estimator.cpp), never correctness.
+//
+// ⚠ min/max STAYS UNKNOWN (CreateUnknown), AND THE REASON THIS COMMENT USED TO GIVE WAS
+// THE WRONG ONE — a decision settled 2026-08-17 after it was examined properly. It said
+// "SQL Server's sampled, possibly-stale stats are not exact bounds on a live table", which
+// is provider-specific and invites exactly the wrong inference: that a provider whose
+// stats ARE exact bounds may report them. Delta's are — engineered-wood widens a truncated
+// string max by incrementing it and OMITS the stat when it cannot, and our own
+// DeltaFilePruner already SKIPS FILES on those bounds, which is correctness-bearing. So
+// "the source is imprecise" does not hold, and is not why we withhold them. The real
+// reasons are ours, and they apply to EVERY provider:
+//
+//   1. THE BOUNDS AND THE ROWS COME FROM DIFFERENT PLACES. EW's pruner is sound because
+//      its stats and its rows are the same snapshot. This callback sits ABOVE our
+//      read-your-own-writes overlay, so a bound read from the committed log does not
+//      cover a transaction's buffered rows. Measured: committed x in [1,100], then
+//      BEGIN; INSERT (1000); SELECT ... WHERE x > 500 correctly returns 1 row — a
+//      reported [1,100] would make that FILTER_ALWAYS_FALSE and return 0.
+//   2. STATS ARE LATCHED PER ENTRY FOR THE SESSION (stats_fetched_) and no DML evicts
+//      them, so bounds outlive the write that invalidated them — needing no transaction
+//      at all. Measured: after a COMMITTED autocommit INSERT VALUES (1000), the entry
+//      still reports the old count. On SQL Server the writer can be another PROCESS, so
+//      the window is unbounded and unobservable.
+//   3. THE SHARPEST CONSUMER IS NOT FILTER PRUNING. CanUsePerfectHashAggregate
+//      (plan_aggregate.cpp) requires NumericStats::HasMinMax and SIZES A HASH TABLE from
+//      Max - Min, so bounds put every integer GROUP BY column on that path, where too
+//      narrow is worse than a mis-decided filter. `CreateUnknown` is the `return false`
+//      that keeps us out.
+//
+// Reporting them would therefore require stats invalidation on DML plus bounds that cover
+// pending writes — provider-agnostic prerequisites, not a follow-on line. Withholding is
+// always safe; the cost is only plan quality. Do not add min/max without revisiting all
+// three. Full record: CLAUDE.md, the Delta row-count entry.
 static unique_ptr<BaseStatistics> FabricatorScanStatistics(ClientContext &context, const FunctionData *bind_data_p,
                                                          column_t column_index) {
 	auto &bind_data = bind_data_p->Cast<fabricator::ArrowStreamBindData>();
