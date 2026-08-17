@@ -417,6 +417,20 @@ transaction log** — each file's recorded `numRecords` minus each deletion vect
 it costs no data-file read and is exact rather than sampled. It reports no NDV, because a Delta `add`
 records min/max and null counts per column but no distinct-value estimate.
 
+> **⚠ Statistics are read once per table and cached for the catalog entry's lifetime**, on every provider.
+> They are fetched lazily, the first time a table is *scanned* (never during catalog enumeration), and
+> nothing re-reads them afterwards — not your own DML, and certainly not another process's. So after a bulk
+> load, a large external `INSERT`, or a `UPDATE STATISTICS` elsewhere, plans in an existing session are
+> still costed against the numbers from the first scan.
+>
+> This affects **plan quality only, never your results**: what is reported is an *estimate* — the row count
+> is never given to DuckDB as an upper bound, and min/max are deliberately not reported at all — so a stale
+> value can pick a worse join order but cannot drop or duplicate a row.
+>
+> To refresh them, invalidate the entry: `SELECT fabricator_refresh_cache('<catalog>')`, or the scoped
+> `SELECT fabricator_invalidate_cache('<catalog>', '<regex>')` when you know which tables changed. Both
+> rebuild the catalog entry, and the next scan re-reads its statistics.
+
 ### Row identity (`rowid`)
 
 Tables with a primary key (or unique index) expose a virtual `rowid` (scalar for a single key column,
