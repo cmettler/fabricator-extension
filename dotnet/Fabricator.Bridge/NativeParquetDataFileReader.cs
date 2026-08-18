@@ -65,13 +65,27 @@ internal sealed class NativeParquetDataFileReader : IDataFileReader
         Log.LogDebug("delta native file read: {Sql}", sql);
 
         using var stream = Host.Query(sql);
+        // Batch sizes at this seam are worth tracing: the RecordBatch coming out of the host query is BOTH
+        // the morsel a parallel scan hands one thread AND — because engineered-wood writes one parquet file
+        // per input batch — the file granularity of anything that writes what it reads (compaction). One
+        // DataChunk per batch means STANDARD_VECTOR_SIZE rows; see the note on HostQueryGetNext.
+        long batchCount = 0, totalRows = 0, minRows = long.MaxValue, maxRows = 0;
         while (true)
         {
             var rb = await stream.ReadNextRecordBatchAsync(cancellationToken).ConfigureAwait(false);
             if (rb is null)
             {
+                Log.LogDebug(
+                    "delta native file read: {Rel} yielded {Batches} batch(es), {Rows} rows (min={Min} max={Max}) "
+                    + "— STREAMED, never materialized (this method is an async iterator)",
+                    rel, batchCount, totalRows, batchCount == 0 ? 0 : minRows, maxRows);
                 break;
             }
+            batchCount++;
+            totalRows += rb.Length;
+            minRows = Math.Min(minRows, rb.Length);
+            maxRows = Math.Max(maxRows, rb.Length);
+            Log.LogTrace("delta native file read: batch {N} rows={Rows}", batchCount, rb.Length);
             // DuckDB hands a VARIANT column across as the ew.variant_transport LEAF BLOB (the type extension
             // in fabricator_variant.cpp), but engineered-wood's read pipeline expects the physical layout the
             // Delta spec requires: VariantColumnCoercion THROWS on a BinaryArray whose schema says variant.

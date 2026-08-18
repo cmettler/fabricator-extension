@@ -1,4 +1,5 @@
 using System;
+using System.Runtime.CompilerServices;
 using System.Globalization;
 using System.IO;
 using System.Text.Json;
@@ -56,7 +57,7 @@ internal sealed class NativeParquetDataFileWriter : IDataFileWriter
         // batches engineered-wood already annotated with `PARQUET:field_id` (via SetParquetFieldIds); DuckDB's
         // COPY does NOT read Arrow field metadata, so lift those ids into an explicit FIELD_IDS clause — else
         // the native-written file would lose its field ids and an id-mode reader couldn't map it.
-        var e = batches.GetAsyncEnumerator(cancellationToken);
+        var e = CountBatches(batches, relativePath, Log, cancellationToken).GetAsyncEnumerator(cancellationToken);
         RecordBatch first;
         try
         {
@@ -92,6 +93,28 @@ internal sealed class NativeParquetDataFileWriter : IDataFileWriter
 
     // Re-chains the peeked first batch ahead of the remaining enumerator; the finally disposes the
     // enumerator (running the source enumerable's own finally) at drain or stream teardown.
+    /// <summary>Counts what EW actually hands the writer, so the reader-side and writer-side batch shapes can
+    /// be compared in one log: if they match, engineered-wood passed batches through and the pipeline
+    /// streamed; if the writer sees ONE batch where the reader produced many, EW materialized in between.
+    /// Note a batch is also a FILE for the engineered-wood writer, so this count is the file count too.</summary>
+    private static async IAsyncEnumerable<RecordBatch> CountBatches(
+        IAsyncEnumerable<RecordBatch> batches, string relativePath, ILogger log,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        long n = 0, rows = 0, min = long.MaxValue, max = 0;
+        await foreach (var b in batches.WithCancellation(cancellationToken).ConfigureAwait(false))
+        {
+            n++;
+            rows += b.Length;
+            min = Math.Min(min, b.Length);
+            max = Math.Max(max, b.Length);
+            log.LogTrace("delta native write: batch {N} rows={Rows}", n, b.Length);
+            yield return b;
+        }
+        log.LogDebug("delta native write: {Rel} consumed {Batches} batch(es), {Rows} rows (min={Min} max={Max})",
+                     relativePath, n, rows, n == 0 ? 0 : min, max);
+    }
+
     private static async IAsyncEnumerable<RecordBatch> FirstThenRest(
         RecordBatch first, IAsyncEnumerator<RecordBatch> rest)
     {

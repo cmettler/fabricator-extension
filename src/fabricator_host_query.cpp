@@ -77,6 +77,13 @@ struct HostQueryStream {
 	vector<LogicalType> types;
 	vector<string> names;
 	string last_error;
+	//! The stream has seen its EOF. Load-bearing ONLY when batches accumulate several chunks: a Fetch that
+	//! returns null also CLOSES the streaming result, so a later Fetch throws ("closed pending query result")
+	//! rather than returning null again. In one-chunk mode that EOF is the value get_next returns, so the
+	//! consumer never calls back; accumulating swallows it mid-batch and the consumer legitimately calls once
+	//! more. DuckDB's own multi-chunk batching guards the same way (ChunkScanState::Finished /
+	//! QueryResultChunkScanState::InternalLoad's `if (!stream_result.IsOpen()) return true;`).
+	bool finished = false;
 	ArrowArrayStream stream {};
 };
 
@@ -91,15 +98,63 @@ int HostQueryGetNext(ArrowArrayStream *stream, ArrowArray *out) {
 	auto *st = static_cast<HostQueryStream *>(stream->private_data);
 	std::memset(out, 0, sizeof(*out));
 	try {
+		if (st->finished) {
+			return 0; // EOF already seen (mid-batch, while accumulating) — never re-Fetch a closed result
+		}
 		auto chunk = st->result->Fetch(); // next DataChunk, lazily; null at end. A streaming result can
 		                                   // surface a RUNTIME error here (vs at SendQuery) — caught below.
 		if (!chunk || chunk->size() == 0) {
+			st->finished = true;
 			return 0; // EOF — a zeroed (released) ArrowArray is the end marker
 		}
 		auto props = fabricator::BoundaryClientProperties(*st->conn->context);
 		auto extension_types = ArrowTypeExtensionData::GetExtensionTypes(*st->conn->context, st->types);
-		ArrowAppender appender(st->types, chunk->size(), props, extension_types);
-		appender.Append(*chunk, 0, chunk->size(), chunk->size());
+		// A batch accumulates chunks up to DuckDB's own MORSEL size, because the exported RecordBatch IS the
+		// morsel of a parallel Arrow scan (arrow_ingest's GetNextBatch hands one batch to one thread, exactly
+		// as DuckDB's ArrowScanParallelStateNext does). One DataChunk per batch made that morsel
+		// STANDARD_VECTOR_SIZE: measured on a 6M-row scan, 2929 batches of exactly 2048 rows plus a 1408
+		// tail, against 49 row groups of 122880 for the same data read natively — 60x more morsels, each
+		// paying a mutex acquisition, an Arrow import and converter setup.
+		//
+		// MEASURED (6M rows, CPU-bound GROUP BY, median of 3): 0.864s at one chunk / 1 thread, 0.689s from
+		// batching alone, 0.640s from threads alone, 0.592s from both. The two overlap rather than add —
+		// both attack the same per-batch cost. Row-group-sized batches also run far more PREDICTABLY (a 1.7%
+		// spread across reps vs 10% at one chunk), there being much less lock contention to jitter.
+		//
+		// ⚠⚠ DEFAULT IS ONE CHUNK, AND THE REASON IS NOT PERFORMANCE — A BATCH IS ALSO A FILE.
+		// engineered-wood writes ONE PARQUET FILE PER INPUT BATCH, and this stream feeds WRITERS as well as
+		// scans (the OPTIMIZE recluster's ORDER BY, sorted-by writes). Defaulting to a row group therefore
+		// silently changed physical file LAYOUT: verify_delta_clustered_optimize's OPTIMIZE collapsed 80000
+		// rows into ONE file where the suite asserts several, so `delta.targetFileSize` stopped being
+		// honoured. MEASURED — default(122880): 1 failed; 0 (one chunk): 147 passed.
+		//
+		// So the batch target must be scoped to the CONSUMER, which this entry cannot see: a scan wants big
+		// morsels, a writer wants its own file granularity. Plumbing it needs a parameter on host_query (an
+		// ABI change), so the win is deferred rather than taken here. What it is worth, measured on a 6M-row
+		// CPU-bound GROUP BY (median of 3): 0.864s -> 0.689s single-threaded from batching alone.
+		// The env var stays as the experiment hook that produced those numbers.
+		static const idx_t target_rows = []() -> idx_t {
+			const char *env = std::getenv("FABRICATOR_HOST_QUERY_BATCH_ROWS");
+			if (!env || !*env) {
+				return 0; // one chunk per batch — never change this without scoping it per consumer
+			}
+			auto n = std::atoll(env);
+			return n > 0 ? (idx_t)n : 0;
+		}();
+		ArrowAppender appender(st->types, target_rows > 0 ? target_rows : chunk->size(), props, extension_types);
+		idx_t appended = 0;
+		while (true) {
+			appender.Append(*chunk, 0, chunk->size(), chunk->size());
+			appended += chunk->size();
+			if (target_rows == 0 || appended >= target_rows) {
+				break; // one-chunk mode, or the target is met
+			}
+			chunk = st->result->Fetch(); // EOF leaves nothing unappended — every fetched chunk is appended above
+			if (!chunk || chunk->size() == 0) {
+				st->finished = true; // this batch is short; the NEXT get_next must not Fetch the closed result
+				break;
+			}
+		}
 		*out = appender.Finalize();
 		return 0;
 	} catch (std::exception &e) {
