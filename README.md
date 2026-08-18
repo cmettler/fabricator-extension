@@ -400,7 +400,7 @@ still filtered correctly. Pushed shapes: `=`, `<>`, `<`, `<=`, `>`, `>=`, `IS [N
 **SQL Server** that means a non-string key (or any key under a binary collation) whose NULL ordering
 matches the server's fixed convention (ASC = NULLS FIRST, DESC = NULLS LAST) — T-SQL cannot spell the
 other one. On **Delta** every key qualifies, including strings and any NULL placement, because the
-generated SQL is executed by DuckDB itself (see [Delta](#delta-lake-catalog-provider-delta)). Either way
+generated SQL is executed by DuckDB itself (see [Delta Lake provider](#delta-lake-provider)). Either way
 the DuckDB sort node is kept, so results are always correct.
 
 One thing that quietly turns TopN pushdown *off* (on any provider): ordering by a **collated** key —

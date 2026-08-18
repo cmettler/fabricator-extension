@@ -1,9 +1,13 @@
 # Plugin system (third-party backends + global functions)
 
-> Status: **default-context SPI BUILT + verified; ALC isolation DEFERRED.** A plugin (a folder of managed
-> assemblies) dropped into an **`FABRICATOR_PLUGIN_DIR`** folder is discovered at load, its `IBackend`(s)
+> Status: **default-context SPI + scan report + INSTALLER all BUILT and verified; ALC isolation and
+> UNINSTALL DEFERRED.** A plugin (a folder of managed assemblies) under a plugin root — `FABRICATOR_PLUGIN_DIR`
+> if set, else `~/.duckdb/fabricator/plugins`, searched RECURSIVELY — is discovered at load, its `IBackend`(s)
 > registered, and its **global functions** surfaced as a bare `fn(...)` with NO ATTACH — verified end-to-end
-> (`Fabricator.SamplePlugin`'s `plug_greet`, `test/verify_plugin.test`). Loaded into the **default (non-isolated)**
+> (`Fabricator.SamplePlugin`'s `plug_greet`, `test/verify_plugin.test`). `fabricator_plugins()` reports what the
+> scan looked at and why it refused anything; `fabricator_install_plugin()` unpacks an archive into a root and
+> makes its PROVIDER usable in the SAME session (`test/verify_plugin_install.test`). Loaded into the **default
+> (non-isolated)**
 > context for now; per-plugin `AssemblyLoadContext` **isolation** (for conflicting transitive deps) is the
 > deferred upgrade — a loader-internal swap, no contract change. The contract assembly **`Fabricator.Abstractions`
 > is extracted** (a plugin references it + Apache.Arrow only — see recommendation #2). Builds on `BackendRegistry` +
@@ -18,7 +22,9 @@
 > splits `FABRICATOR_PLUGIN_DIR` (comma list of dirs), installs a `Resolving` hook on the host context (probes the
 > plugin dirs for a plugin's private transitive deps), skips assemblies already loaded in the host context (the
 > shared set — `Fabricator.Bridge`, `Apache.Arrow`, built-in providers — so a plugin-dir copy of the bridge isn't
-> reflected + its `StubBackend` re-registered), and `LoadFromAssemblyPath`s the rest into the host context,
+> reflected + its `StubBackend` re-registered; ⚠ MINUS what the scan itself loaded from a plugin
+> directory, or a RE-scan would report every plugin as `shared` and drop it — see the three re-scan hazards
+> under the installer), and `LoadFromAssemblyPath`s the rest into the host context,
 > reflecting for `IBackend`. The scan runs inside `Discover()` (first `BackendRegistry.All()`, at load — before
 > the `list_global_functions` union), so a plugin's global functions register with **no ABI/C++ change**. No-op
 > Sample: `dotnet/Fabricator.SamplePlugin` (a catalog-less `IBackend` whose
@@ -27,7 +33,8 @@
 ## The 2026-08-18 pass: a DEFAULT root, a RECURSIVE search, and a scan that says what it did
 
 Three changes, all C#-only, no ABI. Together they are the prerequisite for a plugin INSTALLER (see
-[the installer sketch](#installing-a-plugin--sketch-not-built) below) rather than features in their own right.
+[the installer section](#installing-a-plugin--built-2026-08-18-fabricator_install_plugin) below) rather than
+features in their own right.
 
 - **A default root: `~/.duckdb/fabricator/plugins`.** Before this the scan RETURNED IMMEDIATELY when
   `FABRICATOR_PLUGIN_DIR` was unset, so there was nowhere to install to. `FABRICATOR_PLUGIN_DIR` still wins,
