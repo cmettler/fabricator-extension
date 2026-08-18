@@ -149,7 +149,10 @@ case "$TIER" in
         # verify_delta_mfr_dv (23) with it. It was NOT dead code — registered, deletion-vector correct and
         # green in both tiers — but absent from the README, i.e. a spike that shipped by accident. Removing
         # it also deletes the last core->Delta coupling in the C++ layer.
-        : "${MIN_SUITES:=69}"
+        # 70 runs since 2026-08-18: verify_delta_clustered_optimize gains a SECOND leg at an accumulated
+        # host-query batch size (see ACCUMULATED below) — the only gate on batch size no longer dictating
+        # Delta file size, which is what the BudgetedStream boundary split delivers.
+        : "${MIN_SUITES:=70}"
         # 5656 since 2026-08-02: verify_delta_catalog_transactions 943 -> 944 Ã¢ÂÂ ROLLBACK now RECLAIMS the
         # data files the transaction eagerly wrote (EW #52's DiscardDataFilesAsync) instead of leaving them
         # for VACUUM. +2, not +1: that suite is one of the DOUBLED ones below, so an assertion added to it
@@ -323,7 +326,9 @@ case "$TIER" in
         # so NO surviving suite moved. That equality is the whole claim for a removal — the production Delta
         # read path is the managed DeltaNativeReader and never crossed delta_list_files, so deleting the
         # spike must change no other answer.
-        : "${MIN_ASSERTIONS:=7499}"
+        # 7646 since 2026-08-18: 7499 + exactly the 147 of the clustered-optimize accumulated leg, so no
+        # other suite moved — the claim for a change that alters how the clustered rewrite CUTS FILES.
+        : "${MIN_ASSERTIONS:=7646}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh
@@ -512,7 +517,19 @@ test/verify_merge_into.test'
         ;;
 esac
 
-entries=$(printf '%s\n' "$suites" | sed 's/$/\tdelta/')
+# A THIRD field: the host-query batch size that leg runs at (empty = the shipped default, one DataChunk).
+# ONE suite gets a second leg at an ACCUMULATED batch size, and it is the only gate on the property that
+# BudgetedStream splitting exists to deliver: batch size must no longer dictate Delta file size. Before the
+# split this exact configuration FAILED verify_delta_clustered_optimize after 70 assertions — an oversized
+# batch could only be cut BETWEEN batches, so delta.targetFileSize became unenforceable and an OPTIMIZE
+# collapsed 80000 rows into ONE file. Both legs must pass: the default leg is the control, since "the
+# accumulated leg passes" would be equally true of a build where accumulation had stopped working.
+case "$TIER" in
+    hermetic) ACCUMULATED='test/verify_delta_clustered_optimize.test' ;;
+    *)        ACCUMULATED='' ;;
+esac
+
+entries=$(printf '%s\n' "$suites" | sed 's/$/\tdelta\t/')
 while read -r d; do
     [ -z "$d" ] && continue
     # Guard against the doubled list drifting away from the selected set: a rename or a
@@ -522,9 +539,20 @@ while read -r d; do
         exit 1
     fi
     entries="$entries
-$(printf '%s\tengineeredwooddelta' "$d")"
+$(printf '%s\tengineeredwooddelta\t' "$d")"
 done <<EOF
 $DOUBLED
+EOF
+while read -r a; do
+    [ -z "$a" ] && continue
+    if ! printf '%s\n' "$suites" | grep -qxF "$a"; then
+        echo "ERROR: accumulated-leg suite '$a' is not in the $TIER set (renamed or reclassified?)." >&2
+        exit 1
+    fi
+    entries="$entries
+$(printf '%s\tdelta\t122880' "$a")"
+done <<EOF
+$ACCUMULATED
 EOF
 
 expected=$(printf '%s\n' "$entries" | wc -l | tr -d ' ')
@@ -548,15 +576,25 @@ if command -v git >/dev/null 2>&1 && git rev-parse --git-dir >/dev/null 2>&1; th
     fixtures_before=$(git status --porcelain --untracked-files=all -- test/fixtures 2>/dev/null)
 fi
 
-while IFS="$(printf '\t')" read -r suite provider; do
+while IFS="$(printf '\t')" read -r suite provider batchrows; do
     [ -z "$suite" ] && continue
     scratch=$(mktemp -d)
     export FABRICATOR_DELTA_WRITE_DIR="$scratch"
     export DELTA_PROVIDER="${provider:-delta}"
 
+    # The accumulated leg (see ACCUMULATED above). The unset is load-bearing the same way as the two
+    # thresholds below: a value left in the developer's shell would otherwise accumulate for EVERY suite,
+    # so the run would not be testing the shipped default anywhere.
+    if [ -n "$batchrows" ]; then
+        export FABRICATOR_HOST_QUERY_BATCH_ROWS="$batchrows"
+    else
+        unset FABRICATOR_HOST_QUERY_BATCH_ROWS
+    fi
+
     # Only label the non-default leg, so the common output stays as it was.
     label="$suite"
     [ "$DELTA_PROVIDER" != 'delta' ] && label="$suite [$DELTA_PROVIDER]"
+    [ -n "$batchrows" ] && label="$suite [batch=$batchrows]"
 
     # THE UPDATE POST-IMAGE GROUPING NEEDS ITS THRESHOLD FORCED, or it ships with ZERO coverage.
     # DeltaReader.UpdateGroupBytes defaults to 64 MiB of Arrow data before an UPDATE's post-images are

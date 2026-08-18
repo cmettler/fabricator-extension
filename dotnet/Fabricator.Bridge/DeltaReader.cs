@@ -2340,19 +2340,41 @@ internal static class DeltaReader
             {
                 long rowsPerFile = Math.Max(1024, (long)((double)targetBytes * estRows / estBytes));
                 using var src = HostFs.Query(source, ct: token);
-                while (true)
+                // The next file's first batch: the tail the previous file's budget cut off, or a fresh pull
+                // when the cut fell on a batch boundary. Threading it through the loop rather than pulling
+                // unconditionally is what lets a file end mid-batch — see BudgetedStream's remarks.
+                //
+                // ⚠ IT IS A BOX, NOT A LOCAL, AND THAT IS NOT A STYLE CHOICE. A stream bound as a
+                // host-query input is RELEASED when the query finishes, and the release runs its Dispose — so
+                // a BudgetedStream is already dead by the time RunCopy RETURNS. Parking the tail on the stream
+                // and reading it afterwards silently got null, and the rows it held were dropped: MEASURED as
+                // 79364 of 80000 rows surviving a targetFileSize-driven multi-file rewrite, exit 0.
+                var carry = new BatchCarry
                 {
-                    var first = src.ReadNextRecordBatchAsync(token).AsTask().GetAwaiter().GetResult();
-                    if (first is null)
+                    Batch = src.ReadNextRecordBatchAsync(token).AsTask().GetAwaiter().GetResult(),
+                };
+                try
+                {
+                    while (carry.Batch is { } first)
                     {
-                        break;
+                        carry.Batch = null; // ownership moves to the stream: it emits it or disposes it
+                        string chunkRel = $"{dir}{Guid.NewGuid():N}.parquet";
+                        // The `using` is the EXCEPTION path only — on success the host query has already
+                        // released (and so disposed) the stream before RunCopy returns, and this second
+                        // Dispose is a no-op. It covers a throw before the stream is ever bound, which
+                        // would otherwise strand `first`.
+                        using var chunk = new BudgetedStream(src, first, rowsPerFile, carry, token);
+                        var one = NativeParquetDataFileWriter.RunCopy(
+                            root, chunkRel, chunk, token, statsSchema, fieldIdsSpec: fieldIdsSpec);
+                        copied.Add(new NativeParquetDataFileWriter.CopiedFile(
+                            chunkRel, one.Rows, one.Size, null, one.Stats));
+                        carry.Batch ??= src.ReadNextRecordBatchAsync(token).AsTask().GetAwaiter().GetResult();
                     }
-                    string chunkRel = $"{dir}{Guid.NewGuid():N}.parquet";
-                    using var chunk = new BudgetedStream(src, first, rowsPerFile, token);
-                    var one = NativeParquetDataFileWriter.RunCopy(
-                        root, chunkRel, chunk, token, statsSchema, fieldIdsSpec: fieldIdsSpec);
-                    copied.Add(new NativeParquetDataFileWriter.CopiedFile(
-                        chunkRel, one.Rows, one.Size, null, one.Stats));
+                }
+                finally
+                {
+                    carry.Batch?.Dispose(); // only reachable if the rewrite threw mid-stream
+                    carry.Batch = null;
                 }
             }
             foreach (var cf in copied)
@@ -2504,22 +2526,46 @@ internal static class DeltaReader
     }
 
     // One output file's slice of the shared sorted stream: yields `first`, then keeps pulling the SOURCE
-    // until the cumulative row count reaches the budget (cut at batch boundaries — no slicing, so an
-    // imported batch is never split across lifetimes). Does NOT own the source; the outer loop pulls the
-    // next file's first batch itself (null = source exhausted).
+    // until the cumulative row count reaches the budget. Does NOT own the source; the outer loop continues
+    // with TakeRemainder() ?? the next pull (null from both = source exhausted).
+    //
+    // ⚠ IT SPLITS THE BOUNDARY BATCH, and that is the whole point of this class rather than an optimisation.
+    // Cutting only BETWEEN batches made the incoming batch size a hard FLOOR on the output file size: a
+    // consumer that can only stop at a batch boundary cannot produce a file smaller than one batch, so
+    // `delta.targetFileSize` became UNENFORCEABLE the moment anything upstream accumulated bigger batches
+    // (measured: with the scan handing over 122880-row batches, a clustered OPTIMIZE collapsed 80000 rows
+    // into ONE file and verify_delta_clustered_optimize failed). Raising batch size could then only COARSEN
+    // layout, never refine it — a coupling between two unrelated knobs, resolved here rather than by
+    // constraining the producer.
+    //
+    // The split costs ONE ArrowCompute.Take of the boundary batch per output file — a gather, so new buffers,
+    // but type-agnostic including nested and extension types (the property that matters: a VARIANT column
+    // must survive this, and a hand-rolled per-type slice would not). Only the boundary batch is copied;
+    // every other batch is passed through untouched. Against a file whose target is 128 MiB, one batch of
+    // ≤122880 rows is noise.
+    //
+    // ⚠ ONE CASE IS QUADRATIC, and it is worth knowing rather than discovering: a batch several times the
+    // budget is re-split once per file, and each split copies the WHOLE remaining tail (Take gathers; Arrow
+    // has no type-agnostic zero-copy slice). A 122880-row batch against a 12182-row budget copies ~10 tails
+    // averaging 60k rows. Unreachable at the shipped default (batches are one DataChunk, so at most one split
+    // each) and bounded even when reached — but it is the reason NOT to "just raise the batch size" while a
+    // small delta.targetFileSize is in force.
     private sealed class BudgetedStream : IArrowArrayStream
     {
         private readonly IArrowArrayStream _src;
         private readonly long _budget;
+        private readonly BatchCarry _carry;
         private readonly CancellationToken _ct;
         private RecordBatch? _first;
         private long _rows;
 
-        public BudgetedStream(IArrowArrayStream src, RecordBatch first, long budget, CancellationToken ct)
+        public BudgetedStream(
+            IArrowArrayStream src, RecordBatch first, long budget, BatchCarry carry, CancellationToken ct)
         {
             _src = src;
             _first = first;
             _budget = budget;
+            _carry = carry;
             _ct = ct;
         }
 
@@ -2530,26 +2576,60 @@ internal static class DeltaReader
             if (_first is { } f)
             {
                 _first = null;
-                _rows = f.Length;
-                return new ValueTask<RecordBatch?>(f);
+                return new ValueTask<RecordBatch?>(Admit(f));
             }
             if (_rows >= _budget)
             {
                 return new ValueTask<RecordBatch?>((RecordBatch?)null);
             }
             var next = _src.ReadNextRecordBatchAsync(_ct).AsTask().GetAwaiter().GetResult();
-            if (next is not null)
-            {
-                _rows += next.Length;
-            }
-            return new ValueTask<RecordBatch?>(next);
+            return new ValueTask<RecordBatch?>(next is null ? null : Admit(next));
         }
 
+        // Emit as much of `batch` as the budget still allows. Under budget: the whole batch, untouched (the
+        // common case — no copy). Over: the head goes out and the tail is parked for the next file. The
+        // caller of a stream owns the batches it is handed, so a batch we do NOT emit is ours to dispose.
+        private RecordBatch Admit(RecordBatch batch)
+        {
+            long room = _budget - _rows;
+            if (batch.Length <= room)
+            {
+                _rows += batch.Length;
+                return batch;
+            }
+            int head = (int)room; // room < batch.Length <= int.MaxValue, and room > 0 (checked by the caller)
+            var idx = new int[batch.Length];
+            for (int i = 0; i < idx.Length; i++)
+            {
+                idx[i] = i;
+            }
+            var schema = _src.Schema;
+            var headBatch = EngineeredWood.Arrow.ArrowCompute.Take(
+                batch, schema, new ReadOnlySpan<int>(idx, 0, head));
+            // Into the CALLER's box — this object may be disposed before the caller looks again.
+            _carry.Batch = EngineeredWood.Arrow.ArrowCompute.Take(
+                batch, schema, new ReadOnlySpan<int>(idx, head, idx.Length - head));
+            batch.Dispose();
+            _rows = _budget;
+            return headBatch;
+        }
+
+        // ⚠ Runs when the host query RELEASES this stream, i.e. inside RunCopy, not at a scope the
+        // rewrite loop controls. It must therefore free ONLY what this object still owns: `_first` if the
+        // query never pulled it. The tail lives in the loop's BatchCarry precisely so it survives this.
         public void Dispose()
         {
             _first?.Dispose();
             _first = null;
         }
+    }
+
+    /// <summary>A one-batch mailbox owned by the clustered rewrite loop, into which a
+    /// <see cref="BudgetedStream"/> parks the tail its budget cut off. See the warning at its declaration
+    /// site: the stream is disposed by the host query, so it cannot hold the tail itself.</summary>
+    private sealed class BatchCarry
+    {
+        public RecordBatch? Batch;
     }
 
     /// <summary>Maintenance: VACUUM — deletes data files no longer referenced by the log and older than the
