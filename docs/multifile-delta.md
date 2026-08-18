@@ -1,8 +1,8 @@
 # MultiFileReader + engineered-wood — native-parquet Delta path (DESIGN RECORD; the spike is REMOVED)
 
-> **⚠⚠ READ THIS BEFORE ANYTHING BELOW IT. `fabricator_delta_mfr_scan` NO LONGER EXISTS — it was removed at
+> **⚠⚠ READ THIS BEFORE ANYTHING BELOW IT. `fabricator_delta_mfr_scan` NO LONGER EXISTS — it was removed at <!-- check-docs:ignore (REMOVED at ABI v75; naming it IS the point) -->
 > ABI v75 (2026-08-18, user-directed) together with the `delta_list_files` ABI entry, both its suites
-> (`verify_delta_mfr_scan` 36 + `verify_delta_mfr_dv` 23) and `DeltaReader.ListScanFilesJson`.** Everything
+> (`verify_delta_mfr_scan` 36 + `verify_delta_mfr_dv` 23) and `DeltaReader.ListScanFilesJson`.** Everything <!-- check-docs:ignore (REMOVED at ABI v75; naming it IS the point) -->
 > below describes a spike that WORKED and was never adopted: it was registered, deletion-vector correct and
 > green in both CI tiers, but absent from the README — a spike that shipped by accident, the same pattern as
 > `fabricator_delta_native_scan` except that one was WRONG and this one was correct and covered. Its header
@@ -27,11 +27,11 @@
 
 
 > **Phase-A slice 1a DONE (2026-07-03, ABI v57) — the real MultiFileReader integration:**
-> `fabricator_delta_mfr_scan(path)` clones `parquet_scan` and swaps in `FabricatorDeltaMultiFileReader` (a DuckDB
-> `MultiFileReader`, `src/fabricator/fabricator_delta_mfr.cpp`) whose `CreateFileList` gets the EXACT active files from
+> `fabricator_delta_mfr_scan(path)` clones `parquet_scan` and swaps in `FabricatorDeltaMultiFileReader` (a DuckDB <!-- check-docs:ignore (REMOVED at ABI v75; naming it IS the point) -->
+> `MultiFileReader`, `src/fabricator/fabricator_delta_mfr.cpp`) whose `CreateFileList` gets the EXACT active files from <!-- check-docs:ignore (REMOVED at ABI v75; naming it IS the point) -->
 > engineered-wood (new ABI `delta_list_files` → JSON `[{"path":…}]` → a `SimpleMultiFileList`); DuckDB's **native
 > parquet MultiFileReader** reads them (cached over `onelake://` for OneLake). Matches the C# reader row-for-row
-> (`test/verify_delta_mfr_scan.test`, 36). This is the **C++ foundation** the rest builds on — chosen over
+> (`test/verify_delta_mfr_scan.test`, 36). This is the **C++ foundation** the rest builds on — chosen over <!-- check-docs:ignore (REMOVED at ABI v75; naming it IS the point) -->
 > extending the host_query pre-spike because the MultiFileReader framework is where DV, partition elimination, and
 > dynamic-filter file pruning live (confirmed in duckdb-delta: `DeltaMultiFileList::DynamicFilterPushdown` +
 > `PushdownInternal` prune files by the Delta-log `add` stats — static AND dynamic; partition values from the log
@@ -48,7 +48,7 @@
 > custom `FabricatorDeltaMultiFileList` (per-file DV parallel to the file list), an `InitializeGlobalState` override
 > (so `FinalizeBind` can reach the list), and `FinalizeBind` attaches an `FabricatorDeltaDeleteFilter` (over the
 > sorted deleted positions) to the parquet reader → DuckDB's native read EXCLUDES the deleted rows. Matches the C#
-> reader on a `deletion_vectors true` table (`test/verify_delta_mfr_dv.test`, 23). **Two gotchas:** (1) the parquet
+> reader on a `deletion_vectors true` table (`test/verify_delta_mfr_dv.test`, 23). **Two gotchas:** (1) the parquet <!-- check-docs:ignore (REMOVED at ABI v75; naming it IS the point) -->
 > reader hands `Filter()` an uninitialized `SelectionVector` (`Initialize(nullptr)` → null buffer), so the
 > DeleteFilter MUST `result_sel.Initialize(STANDARD_VECTOR_SIZE)` before writing (else segfault — matches the delta
 > ext); (2) **bare `count(*)` uses the parquet row-group metadata path and does NOT apply the DeleteFilter → it
@@ -56,7 +56,7 @@
 > for the delta reader is a follow-up). No ABI bump.
 >
 > **1c (partition) + 1d (filter pushdown) — LARGELY ALREADY WORK via the inherited parquet_scan (verified 2026-07-03):**
-> because `fabricator_delta_mfr_scan` clones `parquet_scan`, it inherits **filter pushdown** and **hive partitioning**.
+> because `fabricator_delta_mfr_scan` clones `parquet_scan`, it inherits **filter pushdown** and **hive partitioning**. <!-- check-docs:ignore (REMOVED at ABI v75; naming it IS the point) -->
 > (1) **Filters push to the row-group level automatically** — `EXPLAIN … WHERE id>7` shows `Filters: id>7` INSIDE
 > the scan operator (no separate FILTER), so static AND dynamic (join/TopN) filters prune row-groups in the native
 > read with no custom `Complex/DynamicFilterPushdown`. (2) **Partition columns resolve automatically** — engineered-
@@ -456,7 +456,7 @@ later**: partition the file list into N groups, one Arrow stream + per-thread lo
 `MaxThreads = N` — this does NOT touch the rowid/DV/filter design (the ordinal is global-path-sorted regardless
 of which thread reads a file). So we build the single-stream C# reader now and layer multi-lane on later.
 
-**⇒ Target = the pure-C# native reader.** Build the C++ MFR (`fabricator_delta_mfr_scan`, slices 1a/1b, already
+**⇒ Target = the pure-C# native reader.** Build the C++ MFR (`fabricator_delta_mfr_scan`, slices 1a/1b, already <!-- check-docs:ignore (REMOVED at ABI v75; naming it IS the point) -->
 done as a standalone function) only if CPU-bound-local multi-lane Delta scans become a real goal.
 
 ### Concrete plan — C# native catalog reader (supersedes the `native_read` Host.Query slice `9f5ec40`)

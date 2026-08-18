@@ -19,11 +19,11 @@ shifts — the v30/v31/v47/v72 precedent. That is exactly why the version bump m
 loadable paired with a new bridge would read `onelake_remove` where `delta_list_files` used to sit and
 call it with the wrong signature. The bump makes the mismatch loud at boot instead.
 
-**What went, in one commit** (user-directed): `src/fabricator/fabricator_delta_mfr.{cpp,hpp}` +
+**What went, in one commit** (user-directed): `src/fabricator/fabricator_delta_mfr.{cpp,hpp}` + <!-- check-docs:ignore (REMOVED at ABI v75; naming it IS the point) -->
 its `RegisterDeltaMultiFileScan(loader)` call and CMake source entry; the `delta_list_files` slot in
 `abi.h`; `DeltaListFiles` in `clr_host.{hpp,cpp}`, `Abi.cs` and `Bootstrap.cs`;
-`DeltaReader.ListScanFilesJson` + its async core; and both suites (`verify_delta_mfr_scan` 36,
-`verify_delta_mfr_dv` 23). Hermetic floors 71 → **69** and 7558 → **7499**.
+`DeltaReader.ListScanFilesJson` + its async core; and both suites (`verify_delta_mfr_scan` 36, <!-- check-docs:ignore (REMOVED at ABI v75; naming it IS the point) -->
+`verify_delta_mfr_dv` 23). Hermetic floors 71 → **69** and 7558 → **7499**. <!-- check-docs:ignore (REMOVED at ABI v75; naming it IS the point) -->
 
 - **⚠ IT WAS NOT DEAD CODE, and the framing that reached me first ("dead code from a multifile reader we
   only tested but never used") is half right in a way worth recording.** It WAS registered
@@ -36,7 +36,7 @@ its `RegisterDeltaMultiFileScan(loader)` call and CMake source entry; the `delta
 - **The removal is answer-neutral BY CONSTRUCTION, and the floor arithmetic is the claim.** The
   production Delta read path is the managed `DeltaNativeReader`, which builds its own `read_parquet` SQL
   and never crossed this entry; `delta_list_files` had exactly ONE caller
-  (`fabricator_delta_mfr.cpp:154`) and `ListScanFilesJson` exactly one (`Bootstrap.cs`). 7558 − exactly
+  (`fabricator_delta_mfr.cpp:154`) and `ListScanFilesJson` exactly one (`Bootstrap.cs`). 7558 − exactly <!-- check-docs:ignore (REMOVED at ABI v75; naming it IS the point) -->
   59 = 7499 says no surviving suite moved.
 - **It deletes the LAST core→Delta coupling in the C++ layer** — which is the reason to do it before the
   Bridge assembly split rather than after: it removes the coupling outright instead of forcing it to be
@@ -471,21 +471,21 @@ and would be `FabricTableFunctionBinding` under this convention.
   CDF feed incl. the DV edge, guardrails).)
 - **Prior: v58** (v58 = additive `host_log` on `FabricatorHostServices` — forward managed ILogger events into DuckDB internal logging; wired + lockstep-verified + **`duckdb_logs` surfacing CONFIRMED LIVE**: `CALL enable_logging(storage='memory')` then `SELECT * FROM duckdb_logs WHERE type LIKE 'Fabricator%'` shows the events with the ILogger category as `type` [`Fabricator.Delta`/`.Native`] + mapped `log_level`. The earlier 0-rows was two red herrings, not a code bug: the enable form is `CALL enable_logging(...)` not `PRAGMA`, and the **shell** defaults log storage to a console-printing sink [`storage='memory'` is the `unittest`/API default]. The `FABRICATOR_LOG_LEVEL`+`FABRICATOR_LOG_FILE` file sink is the always-on independent trace. **2026-07-16 FIX: `HostLogService` now gates on `Logger::ShouldLog` before `WriteLog`** — `Logger::WriteLog` writes UNCONDITIONALLY (bypasses enabled/level/type config), and the shell's console sink printed EVERY forwarded Debug/Info event (`DEBUG: abi get_metadata …` on each metadata call — first visible when the v66 rebuild gave the shell a working bridge again). Semantics are now DuckDB-native: the shell surfaces Fabricator WARNINGs only (empirically its default config passes WARNING and blocks Info/Debug — e.g. the benign per-ATTACH DAX `TMSCHEMA_PARTITION_SOURCES` probe failure via the central failed-crossing WARN), unittest/API stay silent, and `duckdb_logs` shows what the user enables. **Gotcha: the `.test` duckdb_logs pins on Debug messages (per-file `read_parquet` SQL) must enable with `CALL enable_logging(level := 'debug', storage := 'memory')`** — the default enabled level is INFO (late_materialization / row_tracking_virtual / dynamic_filter updated).)
 - **Prior: v57** (v57 = **`delta_list_files`** — one appended vtable entry for the native-read
-  MultiFileReader path (docs/multifile-delta.md Phase A slice 1a): `fabricator_delta_mfr_scan(path)` clones
-  `parquet_scan` + swaps in `FabricatorDeltaMultiFileReader` (`src/fabricator/fabricator_delta_mfr.cpp`), whose
+  MultiFileReader path (docs/multifile-delta.md Phase A slice 1a): `fabricator_delta_mfr_scan(path)` clones <!-- check-docs:ignore (REMOVED at ABI v75; naming it IS the point) -->
+  `parquet_scan` + swaps in `FabricatorDeltaMultiFileReader` (`src/fabricator/fabricator_delta_mfr.cpp`), whose <!-- check-docs:ignore (REMOVED at ABI v75; naming it IS the point) -->
   `CreateFileList` calls `delta_list_files(path, push_json)` → C# `DeltaReader.ListScanFilesJson` (engineered-wood's
   EXACT active `add` files as JSON `[{"path":<uri>}]`, onelake:// for OneLake) → a `SimpleMultiFileList`; DuckDB's
   **native parquet MultiFileReader** reads them (cached). The C++ MultiFileReader foundation for DV / partition /
   dynamic-filter pushdown (later slices 1b–1e); `parquet` statically linked (extension_config.cmake). Live/local:
-  `test/verify_delta_mfr_scan.test` (36, matches the C# reader). **Slice 1b DONE (deletion vectors, no ABI bump):**
+  `test/verify_delta_mfr_scan.test` (36, matches the C# reader). **Slice 1b DONE (deletion vectors, no ABI bump):** <!-- check-docs:ignore (REMOVED at ABI v75; naming it IS the point) -->
   `delta_list_files` emits per file the deleted row positions (`"dv":[…]`, via engineered-wood's
   `DeletionVectorReader`); C++ gained a custom `FabricatorDeltaMultiFileList` (per-file DV) + `InitializeGlobalState`
   override + `FinalizeBind` attaching an `FabricatorDeltaDeleteFilter` → DuckDB's native read EXCLUDES deleted rows
-  (`test/verify_delta_mfr_dv.test`, 23). Gotchas: the DeleteFilter must `result_sel.Initialize(STANDARD_VECTOR_SIZE)`
+  (`test/verify_delta_mfr_dv.test`, 23). Gotchas: the DeleteFilter must `result_sel.Initialize(STANDARD_VECTOR_SIZE)` <!-- check-docs:ignore (REMOVED at ABI v75; naming it IS the point) -->
   before writing (reader passes a null sel_vector → else segfault); **bare `count(*)` over-counts on a DV table**
   (empty-projection parquet-metadata count path skips the DeleteFilter — use a column scan; follow-up can disable
   it). **1c (partition) + 1d (filter pushdown) LARGELY ALREADY WORK via the inherited parquet_scan (verified):**
-  `fabricator_delta_mfr_scan` clones parquet_scan → inherits **filter pushdown** (EXPLAIN shows `Filters:` INSIDE the
+  `fabricator_delta_mfr_scan` clones parquet_scan → inherits **filter pushdown** (EXPLAIN shows `Filters:` INSIDE the <!-- check-docs:ignore (REMOVED at ABI v75; naming it IS the point) -->
   scan → static + dynamic filters prune row-groups natively, no custom Complex/DynamicFilterPushdown) + **hive
   partitioning** (engineered-wood's `<col>=<value>/` layout → `region` resolves from the path; verified on a
   PARTITIONED BY table). So 1a+1b + inherited features = a nearly complete native read (reader + projection +
@@ -536,7 +536,7 @@ and would be `FabricTableFunctionBinding` under this convention.
   (docs/multifile-delta.md §"Concrete plan"): grow the `native_read` branch into a per-file loop
   (prefetch/bounded-channel ≈ threads) with `file_row_number` rowid/DML + DV + projection + static filter + log
   file-pruning (slice 1, C#-only), optional live-filter host-callback for dynamic pruning (slice 2), multi-lane
-  parallelism (slice 3). Build the C++ `fabricator_delta_mfr_scan` MFR (slices 1a/1b done, standalone) only if
+  parallelism (slice 3). Build the C++ `fabricator_delta_mfr_scan` MFR (slices 1a/1b done, standalone) only if <!-- check-docs:ignore (REMOVED at ABI v75; naming it IS the point) -->
   CPU-bound-local multi-lane becomes a goal. **Slice 1 DONE (2026-07-03, C#-only, no ABI):** `DeltaNativeReader`
   is a **per-file loop** (`FABRICATOR_DELTA_PREFETCH`, default 1 = sequential, >1 = concurrent file fetch) emitting
   per file `SELECT <proj>[, ((ord::BIGINT<<40)|file_row_number) AS "_metadata.row_id"] FROM read_parquet(<file>,
