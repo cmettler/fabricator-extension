@@ -156,47 +156,91 @@ public static class BackendRegistry
     // isolation without ALC.
     private static void ScanPluginDirectories(Dictionary<string, IBackend> map)
     {
-        var dirsEnv = Environment.GetEnvironmentVariable("FABRICATOR_PLUGIN_DIR");
-        if (string.IsNullOrWhiteSpace(dirsEnv))
+        // Every decision below is RECORDED, not just acted on: fabricator_plugins() reads this back. The scan
+        // runs once per process behind the memoized map, so it cannot be replayed on demand — see the remarks
+        // on PluginScanEntry for why silence here was the worst property of the plugin system.
+        var report = new List<PluginScanEntry>();
+        var roots = PluginPaths.ResolveRoots();
+        var existing = new List<string>();
+        foreach (var root in roots)
         {
+            if (!System.IO.Directory.Exists(root))
+            {
+                // Recorded rather than filtered away. A configured-but-absent root is the most common real
+                // cause of "my plugin is not found", and it used to be invisible.
+                report.Add(new PluginScanEntry(root, string.Empty, PluginScanStatus.RootMissing, string.Empty,
+                                               "directory does not exist"));
+                continue;
+            }
+            existing.Add(root);
+        }
+        if (existing.Count == 0)
+        {
+            PluginPaths.SetReport(report);
             return;
         }
-        var dirs = dirsEnv.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-                          .Where(System.IO.Directory.Exists)
-                          .Select(System.IO.Path.GetFullPath)
-                          .ToArray();
         // Load plugins into the BRIDGE's own ALC, not Default: hostfxr loads the bridge into a non-default
         // context, so a plugin must be loaded into that same context for its Fabricator.Bridge / Apache.Arrow
         // references to resolve to the RUNNING bridge (else it binds to a separate copy and its IBackend is a
         // different, non-assignable type). The same ALC's loaded assemblies are the shared set to skip.
         var host = System.Runtime.Loader.AssemblyLoadContext.GetLoadContext(typeof(BackendRegistry).Assembly)
                    ?? System.Runtime.Loader.AssemblyLoadContext.Default;
-        InstallPluginResolver(host, dirs); // so a plugin's private transitive deps resolve from its own folder
+        // The resolver gets every DIRECTORY that holds a candidate, not just the roots: with the recursive
+        // search below, a plugin's private dependencies sit next to it several levels down, and a resolver
+        // pointed only at the root would not find them.
+        var candidatesByRoot = existing.ToDictionary(r => r, PluginPaths.EnumerateCandidates, StringComparer.OrdinalIgnoreCase);
+        var probeDirs = candidatesByRoot.Values
+            .SelectMany(list => list)
+            .Select(System.IO.Path.GetDirectoryName)
+            .Where(d => !string.IsNullOrEmpty(d))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray()!;
+        InstallPluginResolver(host, probeDirs.Length > 0 ? probeDirs : existing.ToArray());
         // Skip assemblies already loaded in the host context (the shared set — Fabricator.Bridge, Apache.Arrow,
         // the built-in providers): reflecting a plugin-dir copy of Fabricator.Bridge would otherwise re-register
         // its StubBackend. So only genuinely-new assemblies (the plugin entry + its private deps) are loaded.
         var loaded = new HashSet<string>(
             host.Assemblies.Select(a => a.GetName().Name).Where(n => n != null)!,
             StringComparer.OrdinalIgnoreCase);
-        foreach (var dir in dirs)
+        foreach (var root in existing)
         {
-            foreach (var dll in System.IO.Directory.GetFiles(dir, "*.dll"))
+            var candidates = candidatesByRoot[root];
+            report.Add(new PluginScanEntry(root, string.Empty, PluginScanStatus.Root, string.Empty,
+                                           $"{candidates.Count} candidate assembly file(s)"));
+            foreach (var dll in candidates)
             {
                 if (loaded.Contains(System.IO.Path.GetFileNameWithoutExtension(dll)))
                 {
-                    continue; // shared/already-loaded — host provides it
+                    report.Add(new PluginScanEntry(root, dll, PluginScanStatus.Shared, string.Empty,
+                                                   "an assembly of this name is already loaded by the host"));
+                    continue;
                 }
                 try
                 {
                     var assembly = host.LoadFromAssemblyPath(System.IO.Path.GetFullPath(dll));
+                    // Count what THIS assembly added, so "loaded" and "loaded but contributed nothing" are
+                    // distinguishable. The second is the ordinary state of a plugin's private dependency and
+                    // must not read as a failure.
+                    var before = new HashSet<IBackend>(map.Values);
                     RegisterBackendsFrom(assembly, map);
+                    var added = map.Values.Distinct().Where(b => !before.Contains(b)).Select(b => b.Name).ToArray();
+                    report.Add(added.Length > 0
+                        ? new PluginScanEntry(root, dll, PluginScanStatus.Loaded, string.Join(",", added),
+                                              $"{added.Length} provider(s)")
+                        : new PluginScanEntry(root, dll, PluginScanStatus.NoBackend, string.Empty,
+                                              "loaded, but declares no IBackend"));
                 }
-                catch
+                catch (Exception ex)
                 {
-                    // Not a plugin entry, or a native/unloadable dll — skip.
+                    // Not a plugin entry, a native dll, or a managed one whose references do not resolve
+                    // against the RUNNING bridge (a different Apache.Arrow major is the classic). Recorded
+                    // with the reason: this row is the whole point of the report.
+                    report.Add(new PluginScanEntry(root, dll, PluginScanStatus.Rejected, string.Empty,
+                                                   $"{ex.GetType().Name}: {ex.Message}"));
                 }
             }
         }
+        PluginPaths.SetReport(report);
     }
 
     private static bool _pluginResolverInstalled;

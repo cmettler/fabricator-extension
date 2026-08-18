@@ -56,3 +56,56 @@ query I
 SELECT plug_greet('after');
 ----
 Hello, after (from plugin)
+
+# ---- fabricator_plugins(): the scan is no longer silent ----
+# Every candidate the scan looked at gets a row with a STATUS and a REASON. This is the gate on the property
+# the plugin system most needed and did not have: ScanPluginDirectories ends each candidate in a catch, so a
+# plugin built against a different Apache.Arrow major, or missing a private dependency, used to be skipped
+# with NO signal — indistinguishable from "it loaded and registered nothing". That distinction is what an
+# installer makes load-bearing, because "install succeeded, nothing happened" becomes the normal failure.
+
+# The configured root was searched, and it reports how many candidates it saw.
+query I
+SELECT count(*) FROM fabricator_plugins() WHERE status = 'root';
+----
+1
+
+# ⚠ THE LOAD-BEARING ASSERTION: the sample plugin is reported as LOADED, with the provider it registered.
+# Its scalar working (above) proves the plugin loaded; only this proves the SCAN can SAY SO — a report that
+# silently recorded nothing would leave every assertion above it passing.
+query II
+SELECT status, provider FROM fabricator_plugins() WHERE provider = 'sampleplugin';
+----
+loaded	sampleplugin
+
+# Every row carries a non-empty reason. A status with no detail is the failure this table exists to prevent
+# — it would answer "what happened" and not "why".
+query I
+SELECT count(*) FROM fabricator_plugins() WHERE detail = '';
+----
+0
+
+# Only known statuses. Pins the vocabulary (PluginScanStatus) so a new state cannot appear unnamed.
+query I
+SELECT count(*) FROM fabricator_plugins()
+WHERE status NOT IN ('root', 'root_missing', 'loaded', 'no_backend', 'shared', 'rejected');
+----
+0
+
+# Internal consistency: every candidate's path sits UNDER the root it was attributed to. Absoluteness itself
+# is pinned offline (PluginPathsTests.Override_paths_are_absolute) — asserting it again through LIKE patterns
+# would be a fragile restatement; this instead pins something only the live scan can get wrong, namely
+# attributing a file to the wrong root once several roots are configured.
+query I
+SELECT count(*) FROM fabricator_plugins() WHERE path <> '' AND position(root in path) <> 1;
+----
+0
+
+# The shared set is REPORTED, not hidden: the bridge's own assemblies sitting in a plugin folder are skipped
+# deliberately (reflecting a plugin-dir copy of Fabricator.Bridge would re-register its StubBackend), and a
+# deliberate skip must be visible or it reads as a plugin that failed. 0 is legitimate here — the sample
+# plugin folder need not contain any — so this asserts the SHAPE holds whenever such rows exist.
+query I
+SELECT count(*) FROM fabricator_plugins() WHERE status = 'shared' AND (path = '' OR detail = '');
+----
+0

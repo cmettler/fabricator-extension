@@ -21,8 +21,100 @@
 > reflected + its `StubBackend` re-registered), and `LoadFromAssemblyPath`s the rest into the host context,
 > reflecting for `IBackend`. The scan runs inside `Discover()` (first `BackendRegistry.All()`, at load — before
 > the `list_global_functions` union), so a plugin's global functions register with **no ABI/C++ change**. No-op
-> when `FABRICATOR_PLUGIN_DIR` is unset. Sample: `dotnet/Fabricator.SamplePlugin` (a catalog-less `IBackend` whose
+> Sample: `dotnet/Fabricator.SamplePlugin` (a catalog-less `IBackend` whose
 > only job is to contribute the global scalar `plug_greet`), built to a folder and pointed at via the env var.
+
+## The 2026-08-18 pass: a DEFAULT root, a RECURSIVE search, and a scan that says what it did
+
+Three changes, all C#-only, no ABI. Together they are the prerequisite for a plugin INSTALLER (see
+[the installer sketch](#installing-a-plugin--sketch-not-built) below) rather than features in their own right.
+
+- **A default root: `~/.duckdb/fabricator/plugins`.** Before this the scan RETURNED IMMEDIATELY when
+  `FABRICATOR_PLUGIN_DIR` was unset, so there was nowhere to install to. `FABRICATOR_PLUGIN_DIR` still wins,
+  and it **REPLACES rather than extends** the default — a rig that narrows the search must actually get a
+  narrow search, or it is not testing what it claims.
+  - **⚠ NOT under the managed directory, and that is a MEASURED hazard rather than taste.** Several
+    projects publish into the managed dir and `dotnet publish` DELETES files its own previous publish wrote
+    whose closure no longer contains them — that is what silently removed five `Microsoft.Data.SqlClient`
+    DLLs from a populated payload on 2026-08-18. A plugin installed there would be wiped by an ordinary
+    `publish-managed.ps1` run, with no error. `~/.duckdb` is also DuckDB's own per-user directory (where
+    `INSTALL` puts extensions), is writable without admin, and is STABLE while the managed dir is not: that
+    one moves between a build tree, `~/.duckdb/extensions/<version>/<platform>/`, and the single-file
+    distribution's cache.
+- **The search is RECURSIVE.** It was `Directory.GetFiles(dir, "*.dll")` — top level only — so a plugin laid
+  out the way an installer writes one (`<root>/<name>/<version>/<platform>/`) was never seen. Candidates are
+  ordered by path, which is not cosmetic: the FIRST provider registered under a name wins, and `Directory`
+  enumeration order is filesystem-dependent, so an unordered scan makes *which plugin wins* a property of the
+  disk rather than of the configuration. The dependency-probing `Resolving` hook now gets every directory
+  holding a candidate, not just the roots — a plugin's private deps sit next to it, several levels down.
+- **`SELECT * FROM fabricator_plugins()`** — one row per root plus one per candidate, with a status and a
+  reason: `root` / `root_missing` / `loaded` / `no_backend` / `shared` / `rejected`.
+
+**⚠ WHY THE DIAGNOSTIC IS THE LOAD-BEARING PART.** The scan ends every candidate in a `catch`, so a plugin
+built against a different `Apache.Arrow` major, or missing a private dependency, was skipped with **no signal
+at all** — and a failing `verify_plugin` is indistinguishable from "the plugin loaded and chose to register
+nothing". Four states used to be one silence, and each now names itself:
+
+| status | means |
+|---|---|
+| `root_missing` | a configured root does not exist — the most common real cause, previously invisible |
+| `rejected` | load or reflection threw; `detail` carries the exception (e.g. `BadImageFormatException`) |
+| `no_backend` | loaded fine, declares no `IBackend` — the ordinary state of a plugin's private dependency, and NOT a failure |
+| `shared` | skipped because the host already has an assembly of that name — deliberate, so it must be visible |
+
+Gates: `verify_plugin` 10 -> **17** (service tier), **mutation-tested** — a scan that records nothing dies at
+assertion 11, i.e. after all ten pre-existing plugin assertions pass, which is the right kill because the
+plugin still WORKS and only the report is silent. Plus **10 tier-0 cases** (`PluginPathsTests`, floor 196 ->
+206) for the two properties SQL structurally cannot reach: the default root is under the real user's home, so
+no hermetic suite may create it, and the override precedence is only observable with the variable UNSET —
+which `verify_plugin` must set.
+
+- ⚠ **A PLUGIN CAN STILL SHADOW A BUILT-IN PROVIDER SILENTLY — found while building the report, NOT fixed,
+  and deliberately out of this pass's scope.** `BackendRegistry.Add` is `map[backend.Name] = backend`, an
+  OVERWRITE, so a plugin whose `IBackend.Name` is `sqlserver` replaces the first-party provider and the scan
+  reports it as an ordinary `loaded` row. Pre-existing behaviour (nothing about this pass changed it) and
+  nobody has hit it, but it is exactly the class of silence `fabricator_plugins()` exists to remove, and the
+  report is the natural place to surface it: the `detail` of a `loaded` row could name any provider name it
+  DISPLACED. Doing it needs a decision this pass did not want to take — whether shadowing should be reported,
+  refused, or allowed as an override mechanism.
+- ⚠ **No cap on the candidate count, deliberately.** A self-contained plugin can carry hundreds of DLLs and
+  most will be `rejected`; a silent truncation would read as "covered everything". Every one gets a row.
+- ⚠ **`Environment.GetFolderPath(SpecialFolder.UserProfile)` does NOT read `%USERPROFILE%` on Windows** — it
+  calls the Win32 shell API. So the empty-profile trick this repo uses to simulate a bare runner does not
+  redirect the default plugin root.
+
+## Installing a plugin — sketch, NOT built
+
+The shape agreed 2026-08-18: a zip carrying `any/` (platform-independent) and `<platform>/` folders named with
+DuckDB's own platform strings (`windows_amd64`, `linux_amd64`, `osx_arm64` — the extension already knows its
+own), plus a manifest declaring name, version, entry assembly and the `Fabricator.Abstractions` version it was
+built against; `fabricator_install_plugin(<zip>)` extracts it under the default root.
+
+**Most of the machinery exists**: `Fabricator.Installer.Core` is the same problem solved for the extension
+itself — `PayloadExtractor` already does zip extraction with a working zip-slip guard, `PayloadManifest`
+already carries the platform string, and there is a `CrossProcessLock` and `Hashing`. It is BCL-only and
+tier-0 tested.
+
+**⚠ THE RELOAD QUESTION SPLITS, and only one half is a problem** — this is what should drive the design:
+
+| a plugin contributes | resolved when | addable mid-session |
+|---|---|---|
+| `IBackend` (`ATTACH ... PROVIDER 'x'`) | at ATTACH, via `BackendRegistry.Resolve` | **yes** — needs only an invalidation of the memoized map |
+| catalog-bound functions | at ATTACH, via that catalog | **yes** — rides on the above |
+| **global functions** | `loader.RegisterFunction` during `Extension::Load()` | **no, by no trick** |
+
+DuckDB permits global registration only during extension load, **has no unload API at all**, and re-`LOAD` of
+a loaded extension is a no-op. `GlobalFunctions`' maps are `Lazy<>` besides — evaluated once per PROCESS — so
+even a second database instance would miss a newly installed plugin's globals.
+
+**⚠ Upgrade and uninstall are the hard part.** `LoadFromAssemblyPath` maps the file, which LOCKS it on
+Windows, and the bridge's ALC (created by hostfxr) is not collectible — so a loaded assembly can never be
+replaced in-process. That forces the UX: install into a version-stamped folder and activate at next start;
+uninstall must mark for deletion rather than delete.
+
+**Security, stated once:** this is arbitrary in-process .NET execution from a SQL-reachable path, unsandboxed.
+DuckDB gates its own unsigned extensions behind `allow_unsigned_extensions`; an installer should do at least
+the same, refuse remote URLs initially, and never auto-install.
 
 ## Why / when
 

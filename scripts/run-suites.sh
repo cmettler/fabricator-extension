@@ -423,7 +423,13 @@ case "$TIER" in
         # measured 2028 for both slice-1 gates already; the floor was not raised then). The delta.*
         # namespace rewrite (ABI v70) changed only SPELLINGS on this tier — verify_delta_catalog_s3 and
         # friends kept their exact counts, which is the behaviour-preservation claim.
-        : "${MIN_ASSERTIONS:=2028}"
+        # 2035 since 2026-08-18: verify_plugin 10 -> 17 for fabricator_plugins(), the diagnostic that makes
+        # the plugin scan report what it looked at and why it rejected something. The scan ends every
+        # candidate in a catch, so an incompatible plugin used to be skipped with NO signal — the state a
+        # plugin INSTALLER would turn into the normal failure mode. Mutation-tested: a scan that records
+        # nothing dies at assertion 11, i.e. AFTER all ten pre-existing plugin assertions pass, which is the
+        # right kill — the plugin still works, only the report is silent.
+        : "${MIN_ASSERTIONS:=2035}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2
@@ -464,7 +470,18 @@ if [ "$TIER" = 'hermetic' ]; then
     # is PROVABLY the hermetic one rather than hermetic by assumption.
     unset MSSQL_TESTDB_DSN MSSQL_TEST_SERVER MSSQL_TEST_CONNECTION_STRING MSSQL_BINCOLL_DSN \
           MSSQL_TESTDB_URI MSSQL_TEST_PASS FABRICATOR_S3_ENDPOINT FABRICATOR_S3_SQL_ENDPOINT \
-          FABRICATOR_DAX_DSN FABRICATOR_PLUGIN_DIR 2>/dev/null || true
+          FABRICATOR_DAX_DSN 2>/dev/null || true
+    # ⚠⚠ FABRICATOR_PLUGIN_DIR IS POINTED AT AN EMPTY DIRECTORY, NOT UNSET, AND THE DIFFERENCE IS THIS
+    # TIER'S DEFINING PROPERTY. Since 2026-08-18 an unset variable falls through to the DEFAULT plugin root
+    # ~/.duckdb/fabricator/plugins, which is MACHINE STATE: a developer (or a CI runner with a cached home)
+    # who happens to have a plugin there would have it loaded into every hermetic suite, and a plugin
+    # contributing a global function changes what duckdb_functions() returns — which several suites count.
+    # Unsetting it would make the tier hermetic BY ASSUMPTION, the exact thing the block above exists to
+    # prevent. The override REPLACES the default rather than extending it (PluginPaths.ResolveRoots), so an
+    # empty directory provably excludes the machine's own plugins.
+    hermetic_plugin_dir=$(mktemp -d)
+    export FABRICATOR_PLUGIN_DIR="$hermetic_plugin_dir"
+    trap 'rm -rf "$hermetic_plugin_dir" 2>/dev/null || true' EXIT
 else
     # Fail fast on a missing variable. Without this the affected suite would merely SKIP, the run
     # would still be green, and the coverage would be silently gone Ã¢ÂÂ the exact failure mode this

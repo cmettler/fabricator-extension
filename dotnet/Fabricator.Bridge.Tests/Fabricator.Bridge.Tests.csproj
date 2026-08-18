@@ -67,6 +67,16 @@
     <Compile Include="..\Fabricator.Bridge\DeltaParquetProperties.cs"
              Link="Linked\DeltaParquetProperties.cs" />
     <!--
+      Where plugin assemblies are looked for, and the scan report vocabulary. Admissible because it is path
+      derivation plus a BCL directory walk. Worth pinning offline for two reasons the SQL tier cannot cover:
+      the DEFAULT root is under the real user's home, so no hermetic suite may create it or assert on its
+      contents; and the override PRECEDENCE (FABRICATOR_PLUGIN_DIR replaces the default rather than extending
+      it) is invisible from SQL — a suite that sets the variable, as verify_plugin must, is by construction
+      not testing what happens when it is unset.
+    -->
+    <Compile Include="..\Fabricator.Bridge\PluginPaths.cs"
+             Link="Linked\PluginPaths.cs" />
+    <!--
       The Fabric Warehouse COPY INTO staging root. Admissible because it is pure string derivation. It is the
       third place in this codebase where one storage account must be named differently by us and by the SQL
       engine, and the first two both shipped a bug in that translation — so the round trip is worth pinning

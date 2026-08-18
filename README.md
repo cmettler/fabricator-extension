@@ -805,6 +805,33 @@ FROM fabricator_query('db',
 Extension version (compatibility shim). `fabricator_managed_dir()` / `fabricator_test_scan('x')` are
 diagnostics for the CoreCLR + Arrow spine.
 
+### `fabricator_plugins() -> TABLE(root, path, status, provider, detail)`
+
+What the plugin scan looked at and what it decided — one row per configured plugin root, plus one per
+candidate assembly under it. This is the first place to look when a plugin does not appear.
+
+```sql
+SELECT status, provider, detail FROM fabricator_plugins() WHERE status <> 'shared';
+```
+
+| `status` | meaning |
+|---|---|
+| `root` | the root was searched; `detail` gives the candidate count |
+| `root_missing` | a configured root does not exist — the most common cause of "my plugin is not found" |
+| `loaded` | loaded and registered `provider` |
+| `no_backend` | loaded, but declares no provider. Normal for a plugin's own dependency — not a failure |
+| `shared` | skipped because the extension already has an assembly of that name (deliberate) |
+| `rejected` | could not be loaded; `detail` carries the reason, e.g. a mismatched Apache Arrow version |
+
+**Where plugins are looked for.** `FABRICATOR_PLUGIN_DIR` (a comma-separated list of directories) if set —
+which **replaces** the default rather than adding to it — otherwise **`~/.duckdb/fabricator/plugins`**. The
+search is recursive, so a plugin may sit in a nested folder such as
+`~/.duckdb/fabricator/plugins/myplugin/1.0.0/windows_amd64/`.
+
+A plugin's global functions are registered while the extension loads, so a plugin added to the folder becomes
+available the **next time** DuckDB loads fabricator — not in the running session. See
+[docs/plugin-system.md](docs/plugin-system.md).
+
 ### `fabricator_host_query(sql) -> TABLE`
 
 Run a query on **DuckDB itself** and stream the result back through the extension. Mostly an internal

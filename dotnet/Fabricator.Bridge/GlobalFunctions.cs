@@ -25,7 +25,8 @@ public static class GlobalFunctions
             LazyThreadSafetyMode.ExecutionAndPublication);
 
     private static readonly Lazy<IReadOnlyDictionary<string, ITableFunction>> TableMap =
-        new(() => Build<ITableFunction>(b => b.GlobalTableFunctions, f => f.Name, "table"),
+        new(() => Build<ITableFunction>(b => b.GlobalTableFunctions, f => f.Name, "table",
+                                        HostGlobalFunctions.TableFunctions),
             LazyThreadSafetyMode.ExecutionAndPublication);
 
     private static readonly Lazy<IReadOnlyDictionary<string, IAggregateFunction>> AggregateMap =
@@ -139,9 +140,21 @@ public static class GlobalFunctions
     }
 
     private static IReadOnlyDictionary<string, T> Build<T>(Func<IBackend, IEnumerable<T>> select,
-                                                           Func<T, string> nameOf, string kind)
+                                                           Func<T, string> nameOf, string kind,
+                                                           IEnumerable<T>? host = null)
     {
         var map = new Dictionary<string, T>(StringComparer.OrdinalIgnoreCase);
+        // HOST functions first (see HostGlobalFunctions): they are diagnostics ABOUT the provider machinery,
+        // so they must exist even when no provider loaded. Going first also means a provider that declares a
+        // colliding name trips the duplicate check below instead of silently shadowing one.
+        foreach (var fn in host ?? Enumerable.Empty<T>())
+        {
+            if (!map.TryAdd(nameOf(fn), fn))
+            {
+                throw new InvalidOperationException(
+                    $"fabricator: duplicate global {kind} function name '{nameOf(fn)}' among host functions");
+            }
+        }
         foreach (var backend in BackendRegistry.All())
         {
             foreach (var fn in select(backend))
