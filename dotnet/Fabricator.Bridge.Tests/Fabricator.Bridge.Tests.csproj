@@ -20,10 +20,16 @@
   <!--
     ⚠ THERE IS NO ProjectReference TO Fabricator.Bridge, AND ADDING ONE WOULD BREAK THIS TIER.
 
-    Fabricator.Bridge project-references engineered-wood (a git SUBMODULE), plus Apache.Arrow, the
-    Fabric SDK, SqlClient, the AWS and Azure SDKs. Referencing it here would make these tests require an
-    initialised submodule and a large restore — and tier 0's whole point is that it runs with no C++, no
-    vcpkg and no submodules, in about two minutes.
+    Referencing it here would make these tests require a large restore — Apache.Arrow, the Fabric SDK and
+    the Azure SDKs — and tier 0's whole point is that it runs with no C++, no vcpkg and no submodules, in
+    about two minutes.
+
+    ⚠ ONE HALF OF THE ORIGINAL REASON IS GONE, so do not quote this as if it still had two. Until
+    2026-08-18 this said Bridge project-references "engineered-wood (a git SUBMODULE)" as well, which was
+    the harder blocker: a submodule is not restorable, it has to be initialised. The assembly split moved
+    the Delta provider — and with it the engineered-wood ProjectReference, AWSSDK.S3 and SqlClient — into
+    Fabricator.Delta, so BRIDGE IS NOW SUBMODULE-FREE. What still stands is the restore cost, which is a
+    speed argument rather than a structural one; a future pass could weigh it on its own merits.
 
     So this project COMPILES SELECTED BRIDGE SOURCE FILES directly. The admission rule is the
     constraint that keeps the tier cheap:
