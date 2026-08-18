@@ -83,7 +83,141 @@ which `verify_plugin` must set.
   calls the Win32 shell API. So the empty-profile trick this repo uses to simulate a bare runner does not
   redirect the default plugin root.
 
-## Installing a plugin — sketch, NOT built
+## Installing a plugin — BUILT 2026-08-18 (`fabricator_install_plugin`)
+
+Steps 2 and 3 of the installer, on top of the scan work above. C#-only, no ABI change. What follows is the
+as-built record; the sketch it replaced is kept below it because every prediction in it held.
+
+### What shipped
+
+- **`BackendRegistry.Invalidate()`** — drops the memoized provider map so the next resolve re-discovers.
+  Ten lines. Everything hard about it is in the three re-scan hazards below.
+- **`fabricator_install_plugin(archive [, root := …] [, replace := …])`** — a table function returning ONE
+  row: `name`, `version`, `platform`, `destination`, `files`, `providers`, `activated`, `detail`.
+- **`fabricator_allow_plugin_install`** — a BOOLEAN setting, default false, gating the above.
+- The archive contract: a `fabricator-plugin.json` manifest at the root plus `any/` and/or
+  `<duckdb platform>/`, merged with the platform overlaying `any/`.
+
+### THE THREE RE-SCAN HAZARDS — this is the part a naive `Invalidate()` gets wrong
+
+`Map()` was `_byName ??= Discover()` and nothing ever cleared it, so **the scan had never run twice in one
+process**. Three things silently depended on that, and none of them fails loudly:
+
+1. **The "shared" skip would have DROPPED every plugin on the second scan.** An assembly cannot be unloaded,
+   so on re-scan the plugins loaded by the first are in `host.Assemblies` — they match the
+   already-loaded-by-the-host skip set, get reported `shared`, and are never registered into the FRESH map.
+   Fixed by subtracting what we ourselves loaded from a plugin directory (`BackendRegistry.PluginLoaded`);
+   `LoadFromAssemblyPath` then returns the already-loaded instance and the provider goes back in. A plugin
+   whose FILES were deleted simply stops being a candidate and drops out — the right answer for an uninstall.
+2. **The dependency resolver CAPTURED its probe directories.** Correct while the scan ran once; wrong the
+   moment a plugin can be installed mid-session, because the new plugin's directory is not in the captured
+   array and its private dependencies would not resolve — surfacing as `rejected` with a
+   `FileNotFoundException` naming a dependency sitting right next to it. The hook is now installed once and
+   reads a field replaced on every scan.
+3. **`_defaultProvider` is deliberately NOT cleared.** It is set from the first provider discovered, so
+   clearing it would let an install re-derive which provider is the default and silently re-point every call
+   site that carries no provider name. An install adds a provider; it must not move the existing ones.
+
+Existing ATTACHed catalogs are unaffected either way — they hold an already-resolved `IBackend` and its
+catalog object, neither reached through the map.
+
+### ⚠⚠ THE BUG THIS FOUND IN MY OWN FUNCTION, WHICH IS THE MOST TRANSFERABLE THING HERE
+
+`fabricator_install_plugin` read the session-scoped opt-in setting **inside its async iterator body**. That
+body runs at the first BATCH PULL — a different ABI crossing from the one that set the ambient, on whatever
+thread DuckDB pulls from. `AmbientOpener` / `ProviderSettingsStore.CurrentSession` are `AsyncLocal` per
+crossing, so the iterator can legitimately see **session 0**, which falls back to the GLOBAL settings layer,
+where the registration default (`false`) sits. An enabled function then reports itself **disabled**.
+
+- **It is NON-DETERMINISTIC, and it passed the first time it was run.** The same suite refused an install at
+  the THIRD call in one build and the FOURTH in another — the two differing only in an unrelated mutant and a
+  stderr probe. A "works on my run" check would have shipped it.
+- **It was found by mutation testing, not by review** — and not by the mutant it was aimed at. The mutant died
+  at the right place for the WRONG REASON ("disabled" rather than a provider mismatch), and chasing that
+  discrepancy instead of banking the kill is what exposed it. **A kill by an unexplained mechanism is not a
+  kill you have understood.**
+- **The fix is the pattern already in the tree**: capture the ambients in `Execute()` — the plain method,
+  which runs inside the crossing that set them — and re-establish them at the top of the iterator.
+  `DeltaGlobalTableFunction` does exactly this, with a comment saying why, and `BulkSession` does it for its
+  background thread.
+- **Standing rule it generalises to: a global table function must read every ambient in `Execute()`.** By
+  execution time the opener, the transaction and the settings session are all gone or arbitrary.
+
+### Decisions worth keeping
+
+- **The layout is FIXED, never inferred.** A flat archive (assemblies at the root) is REFUSED. The
+  alternative needs a rule that recognises a platform directory by NAME, under which an archive shipping only
+  `linux_amd64/` looks flat on Windows and its Linux binaries get installed — a wrong answer, not a missing
+  feature.
+- **The write is STAGE-THEN-MOVE.** Extraction goes to `<root>/.staging/<guid>` and the finished directory is
+  `Directory.Move`d onto `<root>/<name>/<version>`: atomic on one volume, so two processes installing one
+  version race on a put-if-absent instead of interleaving their writes. ⚠ Stated precisely because
+  atomicity claims are where this codebase has been burned before: the refusal is EXACT on Windows
+  (`MoveFileEx` without `MOVEFILE_REPLACE_EXISTING`) and CONDITIONAL on Unix (POSIX `rename` fails with
+  `ENOTEMPTY` only for a NON-EMPTY destination and silently replaces an empty one). It holds here only because
+  a destination is never created any other way than by this same fully-populated rename. Both staging and `.trash` live INSIDE the root to keep the move on one volume, and
+  `EnumerateCandidates` now skips any path segment beginning with `.` so a concurrent scan cannot load a
+  half-extracted plugin. (The ROOT itself may be dotted — the default one is `~/.duckdb/...`.)
+- **`replace := true` MOVES the old directory aside rather than deleting it.** A loaded assembly is locked on
+  Windows: it can be renamed, not removed. Measured — `Directory.Move` of a directory containing a loaded
+  assembly succeeds on Windows.
+- **The entry assembly's presence is checked BEFORE the move.** An archive that installs cleanly and contains
+  no plugin is the exact "install succeeded, nothing happened" failure the scan report exists to remove.
+- **`abstractionsVersion` is recorded and NOT gated on.** Nothing versions `Fabricator.Abstractions` — every
+  assembly is 1.0.0.0 — so a comparison would pass always or fail always, i.e. an untestable flag. The real
+  incompatibility already has an honest report: the scan records it as `rejected` with the exception.
+- **`activated` is read back out of the FRESH scan**, so the row distinguishes "installed" from "installed and
+  usable" rather than assuming them equal — and an install into a root nothing scans says SO, in different
+  words from a plugin that was scanned and declared nothing. The two look identical in the report and mean
+  completely different things.
+- **The platform string is asked of DuckDB** (`pragma_platform()`), never derived from `RuntimeInformation`.
+  The spelling is DuckDB's, so deriving it would be a second implementation free to drift from the one the
+  archive was built against.
+- **The gate is OUR setting, not `allow_unsigned_extensions`.** The latter is nearly always true by the time
+  this extension is loaded at all, so gating on it would gate nothing. Remote URLs are refused outright.
+- **The zip-slip guard is REUSED, not re-written.** `Fabricator.Bridge` project-references
+  `Fabricator.Installer.Core` for `ArchivePath` alone. A security guard is the last thing that should exist
+  twice in one codebase with two chances to drift.
+
+### Gates
+
+- **Tier 0, `PluginPackageTests` +34 (floor 206 → 240)**: the manifest and the merge. These are the rules an
+  end-to-end suite structurally cannot reach — it installs ONE archive, built on the machine running it, for
+  the platform running it, so "another platform's directory is never taken", "an archive carrying nothing for
+  this platform is refused" and "a manifest naming `../..` is refused" have no fixture there. Plus two
+  `PluginPathsTests` for the hidden-segment rule, including that a DOTTED ROOT is still searched (without
+  which the default root would disable discovery out of the box).
+- **`verify_plugin_install.test` (31, service tier)**, run against its OWN empty plugin root — every assertion
+  in it is of the form "this changed", so with the plugin already loaded the before-state assertions fail and
+  the after-state ones would pass with the install doing nothing at all.
+  - **The load-bearing pair**: after the install the ATTACH error CHANGES from *"unknown provider"* to the
+    plugin's own *"global functions only"* (nothing but a re-discovery produces that), while `plug_greet` is
+    STILL absent — the documented half of the split, pinned so a future "improvement" has to reckon with why
+    it cannot be added.
+  - **Mutation-tested, each mutant killed at its own section**: removing `Invalidate()` dies at the install
+    row (`providers` empty, `activated` false) after 9 assertions pass — the files landed, the session did not
+    see them; removing the plugin-loaded subtraction dies at the ATTACH assertion with *"unknown provider"*
+    after 13 pass, INCLUDING the first install's success, which is the right discrimination since that
+    subtraction only becomes load-bearing on the second scan.
+  - ⚠ **Hazard 2 (the resolver's directories) is REASONED, NOT GATED** — the sample plugin has no
+    private dependencies, so no mutant of it dies. Say so rather than implying the three are equally covered.
+- ⚠ **The archive fixture is emitted by the plugin's OWN build** (`PackPluginArchive`, MSBuild's
+  `ZipDirectory`), because `zip` is not present in Git Bash on Windows and a fixture that exists on one
+  platform is a gate that runs on one platform. It stages under `obj/`, not `bin/`: staging in the output
+  directory put a second copy of the plugin under the now-RECURSIVE scan and `verify_plugin` duly reported TWO
+  loaded plugins. Measured, not theorised — that is how the line came to be written.
+
+### What is still NOT built
+
+- **Uninstall.** Needs mark-for-deletion semantics (a loaded assembly cannot be removed) and a decision about
+  what a half-removed plugin looks like to the scan.
+- **A plugin can still SHADOW a built-in provider silently.** `BackendRegistry.Add` is an overwrite, so a
+  plugin naming its `IBackend` `sqlserver` replaces the first-party provider and the scan reports it as an
+  ordinary `loaded` row. Pre-existing; the report is the natural place to name a displaced provider, but the
+  choice between report / refuse / allow-as-override has not been taken.
+- **Signature or checksum verification** of an archive. `Hashing` is there; nothing consumes it here.
+
+## The original sketch — kept because every prediction in it held
 
 The shape agreed 2026-08-18: a zip carrying `any/` (platform-independent) and `<platform>/` folders named with
 DuckDB's own platform strings (`windows_amd64`, `linux_amd64`, `osx_arm64` — the extension already knows its
@@ -260,6 +394,14 @@ discipline (and the restrictions collectible ALCs impose). We never unload a plu
    dependency conflict / a third-party plugin with conflicting managed deps lands** — version-aligned plugins
    gain nothing and pay the cost (per-plugin `deps.json`, the allowlist, the "don't copy the shared set" build
    config, the native-dep caveat). The contract + the plugin packaging do NOT change when isolation is turned on.
+
+4. **The scan report, a default root and a recursive search — DONE** (2026-08-18): `fabricator_plugins()`,
+   `~/.duckdb/fabricator/plugins`, and a search that reaches the nested layout an installer writes. See the
+   2026-08-18 section at the top.
+5. **The installer — DONE** (2026-08-18): `BackendRegistry.Invalidate()` + `fabricator_install_plugin()` +
+   the `fabricator_allow_plugin_install` gate. See the Installing-a-plugin section.
+6. **Uninstall** (NOT built) — needs mark-for-deletion semantics, because a loaded assembly cannot be removed
+   while the process lives, plus a decision on what a half-removed plugin looks like to the scan.
 
 **Net:** the SPI is built and works on our CoreCLR host without ALC — third-party plugins contribute backends +
 global functions today, provided they align their dependency closure with the host (Apache.Arrow always). ALC

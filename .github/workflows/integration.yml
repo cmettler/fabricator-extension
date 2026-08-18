@@ -66,6 +66,10 @@ jobs:
         run: |
           dotnet publish dotnet/Fabricator.SamplePlugin -c Release -f net8.0 -r linux-x64 --nologo
           ls dotnet/Fabricator.SamplePlugin/bin/Release/net8.0/linux-x64/publish/Fabricator.SamplePlugin.dll
+          # verify_plugin_install.test needs the archive as well. Asserted rather than assumed: the packing
+          # target is a build hook, so a rename or a Condition change would silently stop producing it and
+          # the suite would then merely SKIP — green, with the coverage gone.
+          ls dotnet/Fabricator.SamplePlugin/bin/Release/net8.0/linux-x64/Fabricator.SamplePlugin.plugin.zip
 
       - name: Generate the MinIO TLS certificate
         # SQL Server's s3:// connector REFUSES plain HTTP, so MinIO must serve TLS even in tests. The
@@ -102,6 +106,11 @@ jobs:
           FABRICATOR_S3_ENDPOINT: localhost:9000
           FABRICATOR_S3_SQL_ENDPOINT: minio:9000
           FABRICATOR_PLUGIN_DIR: dotnet/Fabricator.SamplePlugin/bin/Release/net8.0/linux-x64/publish
+          # The same plugin as an INSTALLABLE ARCHIVE, emitted by the project's own PackPluginArchive target
+          # (so `dotnet publish` above produces it too — publish runs Build first). It lands in the BUILD
+          # output, not publish/: staging or emitting it inside the directory FABRICATOR_PLUGIN_DIR names
+          # would put a second copy of the plugin under a now-RECURSIVE scan.
+          FABRICATOR_PLUGIN_ZIP: dotnet/Fabricator.SamplePlugin/bin/Release/net8.0/linux-x64/Fabricator.SamplePlugin.plugin.zip
         # The runner asserts nothing skipped, no "No tests ran", and floors on the selected counts —
         # and for this tier it also fails fast if any variable above is missing, since a missing one
         # would otherwise show up merely as a skipped suite in a green run.

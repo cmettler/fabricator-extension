@@ -25,7 +25,136 @@ internal static class HostGlobalFunctions
     public static IEnumerable<ITableFunction> TableFunctions { get; } = new ITableFunction[]
     {
         new PluginsFunction(),
+        new InstallPluginFunction(),
     };
+}
+
+/// <summary>
+/// <c>SELECT * FROM fabricator_install_plugin('&lt;archive.zip&gt;' [, root := …] [, replace := …])</c> —
+/// unpacks a plugin archive into a plugin root and makes its PROVIDER usable in this session.
+/// </summary>
+/// <remarks>
+/// <para>A table function rather than a scalar so it can report what it did — where it landed, how many
+/// files, which providers registered, and whether they registered at all. The whole point of the scan report
+/// is that "installed" and "installed and usable" are different answers, and this row carries both.</para>
+/// <para>⚠ THE INSTALL HAPPENS AT EXECUTION, NEVER AT BIND. <see cref="Bind"/> copies the three argument
+/// values and does nothing else: a bind may run for a statement that is then not executed (or executed
+/// several times), so a side effect there is a side effect nobody asked for. Same rule as the
+/// <c>delta.set_*</c> functions, and the same fixed output schema that makes it possible — the schema does
+/// not depend on the archive, so binding needs to open nothing.</para>
+/// </remarks>
+internal sealed class InstallPluginFunction : ITableFunction
+{
+    public string Name => "fabricator_install_plugin";
+
+    public Schema Parameters { get; } = new(new[]
+    {
+        Params.Positional("archive", StringType.Default),
+        // Which plugin root to install into. Omitted => the first configured root (FABRICATOR_PLUGIN_DIR's
+        // first entry, or the per-user default), i.e. the one the scan searches first.
+        Params.Named("root", StringType.Default),
+        // Re-install the SAME version, moving the existing directory aside. A DIFFERENT version never needs
+        // it: the layout is version-stamped precisely so an upgrade writes beside the running copy.
+        Params.Named("replace", BooleanType.Default),
+    }, metadata: null);
+
+    public ITableFunctionBinding Bind(RecordBatch args)
+    {
+        string archive = ReadString(args, 0) ?? string.Empty;
+        string? root = ReadString(args, 1);
+        bool replace = args.Column(2) is BooleanArray b && b.Length > 0 && !b.IsNull(0) && b.GetValue(0) == true;
+        return new Binding(archive, root, replace);
+    }
+
+    private static string? ReadString(RecordBatch args, int ordinal) =>
+        args.Column(ordinal) is StringArray a && a.Length > 0 && !a.IsNull(0) ? a.GetString(0) : null;
+
+    private sealed class Binding : ITableFunctionBinding
+    {
+        private readonly string _archive;
+        private readonly string? _root;
+        private readonly bool _replace;
+
+        public Binding(string archive, string? root, bool replace)
+        {
+            _archive = archive;
+            _root = root;
+            _replace = replace;
+        }
+
+        public Schema OutputSchema { get; } = new(new[]
+        {
+            new Field("name", StringType.Default, nullable: false),
+            new Field("version", StringType.Default, nullable: false),
+            // DuckDB's own platform string, asked of the engine — the directory of the archive that was taken.
+            new Field("platform", StringType.Default, nullable: false),
+            new Field("destination", StringType.Default, nullable: false),
+            new Field("files", Int64Type.Default, nullable: false),
+            // Comma-separated providers the re-scan registered from it; '' when none did.
+            new Field("providers", StringType.Default, nullable: false),
+            // Whether the plugin is usable NOW. False is a legitimate, informative answer, not an error.
+            new Field("activated", BooleanType.Default, nullable: false),
+            new Field("detail", StringType.Default, nullable: false),
+        }, metadata: null);
+
+        public bool SupportsFilterPushdown => false;
+        public bool SupportsProjectionPushdown => false;
+
+        public void Dispose()
+        {
+        }
+
+        // Dispose the pushed filter values eagerly in a PLAIN method — an async-iterator body does not run
+        // until the first MoveNextAsync, which is the late-release class this repo already paid for once.
+        //
+        // ⚠⚠ AND CAPTURE THE AMBIENTS HERE, FOR THE SAME REASON, WHICH IS NOT A DETAIL: this method runs
+        // INSIDE the crossing that set them (ArrowStreamInitGlobal calls SetActiveOpener and then the factory
+        // synchronously), while the iterator body runs at the first BATCH PULL — a separate crossing, on
+        // whatever thread DuckDB pulls from. AmbientOpener/CurrentSession are AsyncLocal per crossing, so the
+        // iterator can legitimately see 0.
+        // MEASURED, and it is NON-DETERMINISTIC, which is what makes it dangerous: reading the session inside
+        // the iterator, the same suite refused an install as "disabled" at the THIRD call in one build and the
+        // FOURTH in another — because session 0 falls back to the GLOBAL settings layer, where the registration
+        // default (false) sits, so an enabled function silently reports itself disabled. It passed the first
+        // time it was run. Same capture-in-Execute shape as DeltaGlobalTableFunction, and the same reason.
+        public IAsyncEnumerable<RecordBatch> Execute(TableFunctionScan scan, CancellationToken ct = default)
+        {
+            scan.FilterValues?.Dispose();
+            return Rows(AmbientOpener.Current, ProviderSettingsStore.CurrentSession, ct);
+        }
+
+        private async IAsyncEnumerable<RecordBatch> Rows(nint opener, long session,
+                                                         [EnumeratorCancellation] CancellationToken ct)
+        {
+            // Re-establish what Execute captured: the install reads a SESSION-scoped setting (the opt-in) and
+            // asks the host for DuckDB's platform string, and both need this operator's context.
+            AmbientOpener.Current = opener;
+            ProviderSettingsStore.CurrentSession = session;
+            ct.ThrowIfCancellationRequested();
+            var r = await PluginInstall.InstallAsync(_archive, _root, _replace).ConfigureAwait(false);
+            var name = new StringArray.Builder();
+            var version = new StringArray.Builder();
+            var platform = new StringArray.Builder();
+            var destination = new StringArray.Builder();
+            var files = new Int64Array.Builder();
+            var providers = new StringArray.Builder();
+            var activated = new BooleanArray.Builder();
+            var detail = new StringArray.Builder();
+            name.Append(r.Name);
+            version.Append(r.Version);
+            platform.Append(r.Platform);
+            destination.Append(r.Destination);
+            files.Append(r.Files);
+            providers.Append(r.Providers);
+            activated.Append(r.Activated);
+            detail.Append(r.Detail);
+            yield return new RecordBatch(OutputSchema, new IArrowArray[]
+            {
+                name.Build(), version.Build(), platform.Build(), destination.Build(),
+                files.Build(), providers.Build(), activated.Build(), detail.Build(),
+            }, 1);
+        }
+    }
 }
 
 /// <summary>

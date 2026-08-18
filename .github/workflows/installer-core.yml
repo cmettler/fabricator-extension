@@ -175,7 +175,7 @@ jobs:
       # A floor, not an equality — adding tests must not break CI, losing them must.
       - name: Assert the suite actually ran
         env:
-          # 206 cases today (theories expand): the variable-library format, the Fabric SQL endpoint
+          # 240 cases today (theories expand): the variable-library format, the Fabric SQL endpoint
           # host/connstr derivation, the persisted Delta parquet tuning (fabricator.parquet.*), the
           # COPY INTO staging location, the SESSION layer of ProviderSettingsStore (ABI v69's scoped
           # SET), the Fabric TOKEN-SERVICE URL composition that makes the ambient credential work on
@@ -183,9 +183,13 @@ jobs:
           # nothing but a full build exercises the pair), and the plugin ROOT resolution — whose two
           # interesting properties are structurally unreachable from SQL: the default root is under the
           # real user's home (no hermetic suite may create it) and the override precedence is only
-          # observable with FABRICATOR_PLUGIN_DIR unset, which verify_plugin must set. Nothing here is
-          # platform-skipped, so Total is the same on both runners.
-          EXPECTED_MINIMUM: 206
+          # observable with FABRICATOR_PLUGIN_DIR unset, which verify_plugin must set — plus, since the
+          # installer landed, the plugin ARCHIVE contract (manifest + the any//<platform>/ merge), whose
+          # decisive cases have no fixture in SQL at all: an end-to-end suite can install one archive, for
+          # the one platform it is running on, so "another platform's directory is never taken" and "an
+          # archive carrying nothing for this platform is refused" are only reachable here.
+          # Nothing here is platform-skipped, so Total is the same on both runners.
+          EXPECTED_MINIMUM: 240
         run: |
           total=$(grep -oE 'Total:[[:space:]]+[0-9]+' bridge-test-output.txt | grep -oE '[0-9]+' | head -1)
           if [ -z "$total" ]; then

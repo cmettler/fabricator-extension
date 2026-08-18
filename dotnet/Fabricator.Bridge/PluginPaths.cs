@@ -133,12 +133,20 @@ internal static class PluginPaths
     /// <para>No cap on the count, deliberately: a self-contained plugin can carry hundreds of DLLs and most
     /// will be rejected, but a silent truncation would read as "covered everything" — every one of them gets
     /// a row in the report instead.</para>
+    /// <para>⚠ A PATH SEGMENT BEGINNING WITH '.' IS NOT SEARCHED, and this is load-bearing rather than
+    /// tidiness: the installer stages an extraction under <c>&lt;root&gt;/.staging/&lt;guid&gt;</c> and parks
+    /// a replaced version under <c>&lt;root&gt;/.trash/&lt;guid&gt;</c>, both INSIDE the root so the final
+    /// <c>Directory.Move</c> stays on one volume and is therefore atomic. Without this rule a scan running in
+    /// another process could load a half-extracted plugin, or reload one that has just been replaced. It is
+    /// the same hidden-name convention Delta uses for <c>_</c>/<c>.</c> prefixes, applied per segment.</para>
     /// </remarks>
     public static IReadOnlyList<string> EnumerateCandidates(string root)
     {
         try
         {
-            var files = Directory.GetFiles(root, "*.dll", SearchOption.AllDirectories);
+            var files = Directory.GetFiles(root, "*.dll", SearchOption.AllDirectories)
+                                 .Where(f => !HasHiddenSegment(root, f))
+                                 .ToArray();
             Array.Sort(files, StringComparer.OrdinalIgnoreCase);
             return new ReadOnlyCollection<string>(files);
         }
@@ -146,6 +154,31 @@ internal static class PluginPaths
         {
             return Array.Empty<string>();
         }
+    }
+
+    /// <summary>True when any path segment BELOW <paramref name="root"/> starts with '.'. The root itself is
+    /// exempt — a user may legitimately put their plugins under a dotted directory (the DEFAULT root is
+    /// <c>~/.duckdb/...</c>, which is precisely such a path), so only what the installer creates below it is
+    /// hidden.</summary>
+    private static bool HasHiddenSegment(string root, string file)
+    {
+        string relative;
+        try
+        {
+            relative = Path.GetRelativePath(root, file);
+        }
+        catch
+        {
+            return false;
+        }
+        foreach (var segment in relative.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar))
+        {
+            if (segment.Length > 0 && segment[0] == '.')
+            {
+                return true;
+            }
+        }
+        return false;
     }
 
     /// <summary>Replaces the recorded report. Called once, by the scan.</summary>

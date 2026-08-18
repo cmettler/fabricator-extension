@@ -16,6 +16,9 @@
 #                            SEES IT (the two differ: localhost:9000 vs minio:9000)
 #        FABRICATOR_DELTA_WRITE_DIR / FABRICATOR_DELTA_DIR — a scratch dir and the in-repo fixture
 #        FABRICATOR_PLUGIN_DIR — a published Fabricator.SamplePlugin
+#        FABRICATOR_PLUGIN_ZIP — that same plugin as an INSTALLABLE ARCHIVE, emitted by its own build
+#                            (the PackPluginArchive target). Same tier as FABRICATOR_PLUGIN_DIR because it
+#                            comes from the same build step, not because it needs a service.
 #   3. every `require <extension>` it declares is statically linked into the test binary.
 #
 # Rule 3 is what excludes verify_azure_secret (`require azure`, not linked, so it would only ever
@@ -29,7 +32,7 @@ LINKED='fabricator json icu parquet httpfs'
 PROVIDED='MSSQL_TESTDB_DSN MSSQL_TEST_SERVER MSSQL_TEST_CONNECTION_STRING MSSQL_TESTDB_URI
           MSSQL_TEST_PASS MSSQL_BINCOLL_DSN FABRICATOR_S3_ENDPOINT FABRICATOR_S3_SQL_ENDPOINT
           FABRICATOR_DELTA_WRITE_DIR FABRICATOR_DELTA_DIR FABRICATOR_PLUGIN_DIR
-          DELTA_PROVIDER'
+          FABRICATOR_PLUGIN_ZIP DELTA_PROVIDER'
 # DELTA_PROVIDER is not a dependency — it is which Delta engine to run as, a constant string that
 # run-suites.sh sets, running the suites that declare it once per engine. It has to be listed here for
 # the same reason as in the hermetic classifier: an unrecognized require-env disqualifies a suite

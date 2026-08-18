@@ -19,4 +19,11 @@
     </Description>
   </PropertyGroup>
 
+  <ItemGroup>
+    <!-- Fabricator.Bridge's plugin installer reuses ArchivePath — the zip-slip guard — rather than growing a
+         second copy of it. A grant rather than making the type public: this is a dependency boundary, not an
+         API surface, and the same call the reasoning behind Bridge's grant to Fabricator.Delta. -->
+    <InternalsVisibleTo Include="Fabricator.Bridge" />
+  </ItemGroup>
+
 </Project>

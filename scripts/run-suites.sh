@@ -349,7 +349,11 @@ case "$TIER" in
         # 50 runs since 2026-08-11: verify_mars_dynamic (44) pins that `mssql_mars` is resolved PER
         # CONNECTION at open time rather than once per catalog — so a `SET` after the ATTACH takes effect,
         # and two DuckDB connections sharing ONE attached catalog can use different modes.
-        : "${MIN_SUITES:=50}"
+        # 51 runs since 2026-08-18: verify_plugin_install - fabricator_install_plugin() end to end. It is
+        # here rather than in the hermetic tier only because its fixture (the plugin archive) comes from the
+        # same build step as FABRICATOR_PLUGIN_DIR, not because it needs a service; and it is run against its
+        # OWN empty plugin root, because every assertion in it is of the form "this changed".
+        : "${MIN_SUITES:=51}"
         # 1424 since 2026-08-01: verify_exec_invalidate_cache 10 -> 21, for the OUT-OF-BAND DROP path Ã¢ÂÂ the
         # catalog's self-heal, documented in CLAUDE.md and until now covered by NOTHING. The service tier ran
         # 44/44 green while that path was broken, which is why the section exists. It must run with
@@ -429,7 +433,12 @@ case "$TIER" in
         # plugin INSTALLER would turn into the normal failure mode. Mutation-tested: a scan that records
         # nothing dies at assertion 11, i.e. AFTER all ten pre-existing plugin assertions pass, which is the
         # right kill — the plugin still works, only the report is silent.
-        : "${MIN_ASSERTIONS:=2035}"
+        # 2066 since 2026-08-18: verify_plugin_install (31). The load-bearing pair is that after an install
+        # the ATTACH error CHANGES from "unknown provider" to the plugin's own refusal - which only a
+        # re-discovery can produce - while its global function is STILL absent, which is the documented half
+        # of the split (loader.RegisterFunction is permitted only during Extension::Load()). Mutation-tested
+        # with two mutants, each killed at its own section.
+        : "${MIN_ASSERTIONS:=2066}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2
@@ -481,6 +490,10 @@ if [ "$TIER" = 'hermetic' ]; then
     # empty directory provably excludes the machine's own plugins.
     hermetic_plugin_dir=$(mktemp -d)
     export FABRICATOR_PLUGIN_DIR="$hermetic_plugin_dir"
+    # Captured in BOTH tiers: the per-suite case below restores from this unconditionally, and in the
+    # hermetic tier an unset (or empty) value would fall through to the DEFAULT root, i.e. straight back to
+    # the machine state the empty directory above exists to exclude.
+    FABRICATOR_PLUGIN_DIR_REAL="$hermetic_plugin_dir"
     trap 'rm -rf "$hermetic_plugin_dir" 2>/dev/null || true' EXIT
 else
     # Fail fast on a missing variable. Without this the affected suite would merely SKIP, the run
@@ -489,7 +502,7 @@ else
     missing=''
     for v in MSSQL_TESTDB_DSN MSSQL_TEST_SERVER MSSQL_TEST_CONNECTION_STRING MSSQL_TESTDB_URI \
              MSSQL_TEST_PASS MSSQL_BINCOLL_DSN FABRICATOR_S3_ENDPOINT FABRICATOR_S3_SQL_ENDPOINT \
-             FABRICATOR_PLUGIN_DIR; do
+             FABRICATOR_PLUGIN_DIR FABRICATOR_PLUGIN_ZIP; do
         eval "val=\${$v:-}"
         if [ -z "$val" ]; then
             missing="$missing $v"
@@ -500,6 +513,9 @@ else
         echo "       bring up docker/docker-compose.yml and run docker/provision.ps1 first." >&2
         exit 1
     fi
+    # Kept aside because ONE suite (verify_plugin_install) is run against an EMPTY root instead; the loop
+    # below restores this for every other suite. See the case there for why it cannot share.
+    FABRICATOR_PLUGIN_DIR_REAL="$FABRICATOR_PLUGIN_DIR"
 fi
 
 suites=$("$SELECT_CMD")
@@ -640,6 +656,23 @@ while IFS="$(printf '\t')" read -r suite provider batchrows; do
     case "$suite" in
         *verify_delta_batched_read.test) export FABRICATOR_DELTA_BATCH_MIN_FILES=1 ;;
         *) unset FABRICATOR_DELTA_BATCH_MIN_FILES ;;
+    esac
+
+    # ⚠ verify_plugin_install NEEDS AN EMPTY PLUGIN ROOT, and every assertion in it is vacuous without
+    # one. What it proves is that installing an archive makes a provider resolvable IN THAT SESSION, which
+    # is only observable as a CHANGE: "unknown provider" before, the plugin's own error after. Pointed at
+    # the tier's normal FABRICATOR_PLUGIN_DIR the plugin is ALREADY loaded, so the before-state assertions
+    # fail and the after-state ones would have passed with the install doing nothing whatsoever.
+    # The restore is an unconditional else-arm rather than an unset, because every OTHER suite in the tier
+    # - verify_plugin above all - needs the real directory.
+    case "$suite" in
+        *verify_plugin_install.test)
+            install_plugin_dir=$(mktemp -d)
+            export FABRICATOR_PLUGIN_DIR="$install_plugin_dir"
+            ;;
+        *)
+            export FABRICATOR_PLUGIN_DIR="$FABRICATOR_PLUGIN_DIR_REAL"
+            ;;
     esac
 
     output=$("$UNITTEST" --test-dir . "$suite" 2>&1)

@@ -141,6 +141,56 @@ public class PluginPathsTests
         Assert.Empty(PluginPaths.EnumerateCandidates(Path.Combine(Path.GetTempPath(), "fab-absent-" + Guid.NewGuid().ToString("N"))));
     }
 
+    /// <summary>
+    /// A path segment beginning with '.' is not searched. LOAD-BEARING for the installer, not cosmetic: it
+    /// stages an extraction under &lt;root&gt;/.staging/&lt;guid&gt; and parks a replaced version under
+    /// &lt;root&gt;/.trash/&lt;guid&gt;, both INSIDE the root so the publishing Directory.Move stays on one
+    /// volume and is therefore atomic. Without this rule a scan running concurrently in another process could
+    /// load a half-extracted plugin, or reload one that has just been replaced.
+    /// </summary>
+    [Fact]
+    public void Dotted_segments_below_the_root_are_not_candidates()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "fab-hidden-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            Directory.CreateDirectory(Path.Combine(root, ".staging", "abc"));
+            Directory.CreateDirectory(Path.Combine(root, ".trash", "def"));
+            Directory.CreateDirectory(Path.Combine(root, "demo", "1.0.0"));
+            File.WriteAllText(Path.Combine(root, ".staging", "abc", "half.dll"), "x");
+            File.WriteAllText(Path.Combine(root, ".trash", "def", "old.dll"), "x");
+            File.WriteAllText(Path.Combine(root, "demo", "1.0.0", "live.dll"), "x");
+            var found = PluginPaths.EnumerateCandidates(root).Select(Path.GetFileName).ToArray();
+            Assert.Equal(new[] { "live.dll" }, found);
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    /// <summary>
+    /// The ROOT ITSELF may be dotted and must still be searched — the DEFAULT root is
+    /// <c>~/.duckdb/fabricator/plugins</c>, so a rule applied to the whole path rather than to the part below
+    /// the root would disable plugin discovery out of the box.
+    /// </summary>
+    [Fact]
+    public void A_dotted_root_is_still_searched()
+    {
+        string parent = Path.Combine(Path.GetTempPath(), "fab-dotroot-" + Guid.NewGuid().ToString("N"));
+        string root = Path.Combine(parent, ".duckdb", "fabricator", "plugins");
+        try
+        {
+            Directory.CreateDirectory(root);
+            File.WriteAllText(Path.Combine(root, "p.dll"), "x");
+            Assert.Equal(new[] { "p.dll" }, PluginPaths.EnumerateCandidates(root).Select(Path.GetFileName).ToArray());
+        }
+        finally
+        {
+            Directory.Delete(parent, recursive: true);
+        }
+    }
+
     // ---------------------------------------------------------------- the report store
 
     [Fact]

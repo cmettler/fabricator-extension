@@ -39,6 +39,11 @@
     <!-- The stable contract surface (interfaces + Arrow-typed POCOs), split out so plugins can reference a
          minimal shared assembly. Same Fabricator.Bridge namespace — assembly split only. -->
     <ProjectReference Include="..\Fabricator.Abstractions\Fabricator.Abstractions.csproj" />
+    <!-- The plugin installer's archive-path guard. Referenced for ArchivePath alone: it is the zip-slip
+         validation the single-file distribution's extractor already uses, and a security guard is the last
+         thing that should exist twice in one codebase with two chances to drift. Cheap to take — this
+         assembly is BCL-only and AOT-compatible by construction, so it adds no package and no constraint. -->
+    <ProjectReference Include="..\Fabricator.Installer.Core\Fabricator.Installer.Core.csproj" />
     <!-- Fabric REST API: list OneLake lakehouse tables (TablesClient.ListTables) so the Delta folder-as-catalog
          can ATTACH a OneLake root — DuckDB's azure glob can't enumerate a OneLake _delta_log tree (PR #174), so
          OneLake table discovery uses the Fabric API instead of a glob (local/S3/ADLS keep the glob). Auth via the

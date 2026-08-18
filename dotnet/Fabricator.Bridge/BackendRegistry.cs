@@ -20,6 +20,37 @@ public static class BackendRegistry
     private static Dictionary<string, IBackend>? _byName; // name/alias (case-insensitive) -> backend
     private static string? _defaultProvider;              // canonical name of the default backend
 
+    // Simple names of assemblies WE loaded out of a plugin directory. Subtracted from the host's loaded set
+    // when deciding what to skip as "shared" — see ScanPluginDirectories.
+    private static readonly HashSet<string> PluginLoaded = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Drops the memoized provider map so the NEXT resolve re-discovers — the one thing that lets a plugin
+    /// installed during a session be usable in that same session.
+    /// </summary>
+    /// <remarks>
+    /// <para>⚠ THIS REACHES PROVIDERS AND CANNOT REACH GLOBAL FUNCTIONS, and the asymmetry is structural
+    /// rather than an omission. A provider is resolved at ATTACH through <see cref="Resolve"/>, i.e. through
+    /// the map this clears. A global function is registered by <c>loader.RegisterFunction</c>, which DuckDB
+    /// permits only during <c>Extension::Load()</c>; there is no unload API at all, a second <c>LOAD</c> is a
+    /// no-op, and <see cref="GlobalFunctions"/>'s maps are <c>Lazy&lt;&gt;</c> per PROCESS. So an installed
+    /// plugin's provider becomes usable immediately and its global functions appear only at next start —
+    /// which <c>verify_plugin_install</c> pins in BOTH directions.</para>
+    /// <para>⚠ <c>_defaultProvider</c> is deliberately KEPT. It is set from the first provider discovered, so
+    /// clearing it would let an install re-derive which provider is the default — and every call site that
+    /// carries no provider name would silently start going somewhere else. An install must add a provider,
+    /// never re-point the existing ones.</para>
+    /// <para>Existing ATTACHed catalogs are unaffected: they hold an already-resolved <see cref="IBackend"/>
+    /// and its catalog object, neither of which is reached through this map.</para>
+    /// </remarks>
+    public static void Invalidate()
+    {
+        lock (Gate)
+        {
+            _byName = null;
+        }
+    }
+
     /// <summary>
     /// Explicitly registers a backend (e.g. from a host or test) under its name + aliases. The first
     /// registered backend becomes the default unless <c>FABRICATOR_DEFAULT_PROVIDER</c> overrides it.
@@ -193,15 +224,28 @@ public static class BackendRegistry
             .SelectMany(list => list)
             .Select(System.IO.Path.GetDirectoryName)
             .Where(d => !string.IsNullOrEmpty(d))
+            .Select(d => d!)
             .Distinct(StringComparer.OrdinalIgnoreCase)
-            .ToArray()!;
+            .ToArray();
         InstallPluginResolver(host, probeDirs.Length > 0 ? probeDirs : existing.ToArray());
         // Skip assemblies already loaded in the host context (the shared set — Fabricator.Bridge, Apache.Arrow,
         // the built-in providers): reflecting a plugin-dir copy of Fabricator.Bridge would otherwise re-register
         // its StubBackend. So only genuinely-new assemblies (the plugin entry + its private deps) are loaded.
+        //
+        // ⚠ THE SUBTRACTION IS WHAT MAKES Invalidate() WORK, and without it a re-scan would silently LOSE
+        // every plugin. An assembly cannot be unloaded, so on the second scan the plugins loaded by the first
+        // are in host.Assemblies — they would match this skip set, be reported "shared", and never be
+        // registered into the FRESH map. Excluding what we ourselves loaded from a plugin directory keeps
+        // them candidates; LoadFromAssemblyPath then returns the already-loaded instance (cheap) and
+        // RegisterBackendsFrom puts the provider back. A plugin whose FILES were deleted simply stops being
+        // a candidate and drops out of the map, which is the right answer for an uninstall.
         var loaded = new HashSet<string>(
             host.Assemblies.Select(a => a.GetName().Name).Where(n => n != null)!,
             StringComparer.OrdinalIgnoreCase);
+        lock (Gate)
+        {
+            loaded.ExceptWith(PluginLoaded);
+        }
         foreach (var root in existing)
         {
             var candidates = candidatesByRoot[root];
@@ -218,6 +262,14 @@ public static class BackendRegistry
                 try
                 {
                     var assembly = host.LoadFromAssemblyPath(System.IO.Path.GetFullPath(dll));
+                    lock (Gate)
+                    {
+                        var simple = assembly.GetName().Name;
+                        if (simple != null)
+                        {
+                            PluginLoaded.Add(simple);
+                        }
+                    }
                     // Count what THIS assembly added, so "loaded" and "loaded but contributed nothing" are
                     // distinguishable. The second is the ordinary state of a plugin's private dependency and
                     // must not read as a failure.
@@ -244,13 +296,21 @@ public static class BackendRegistry
     }
 
     private static bool _pluginResolverInstalled;
+    private static string[] _pluginProbeDirs = Array.Empty<string>();
 
     // Resolve a plugin's transitive deps from the plugin folders (probing the bridge's own context — no
     // isolation, so first-found wins across plugins; that's the documented trade vs. an ALC per plugin).
+    //
+    // ⚠ THE HOOK IS INSTALLED ONCE AND ITS DIRECTORIES ARE REPLACED ON EVERY SCAN. It used to CAPTURE the
+    // array, which was correct while the scan ran once per process and became wrong the moment Invalidate()
+    // could trigger a second one: a plugin installed mid-session sits in a directory the captured array does
+    // not name, so its private dependencies would not resolve and it would be reported "rejected" with a
+    // FileNotFoundException naming a dependency that is sitting right next to it.
     private static void InstallPluginResolver(System.Runtime.Loader.AssemblyLoadContext host, string[] dirs)
     {
         lock (Gate)
         {
+            System.Threading.Volatile.Write(ref _pluginProbeDirs, dirs);
             if (_pluginResolverInstalled || dirs.Length == 0)
             {
                 return;
@@ -258,7 +318,7 @@ public static class BackendRegistry
             _pluginResolverInstalled = true;
             host.Resolving += (ctx, name) =>
             {
-                foreach (var dir in dirs)
+                foreach (var dir in System.Threading.Volatile.Read(ref _pluginProbeDirs))
                 {
                     var candidate = System.IO.Path.Combine(dir, name.Name + ".dll");
                     if (System.IO.File.Exists(candidate))

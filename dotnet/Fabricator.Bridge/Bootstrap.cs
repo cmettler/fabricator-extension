@@ -1439,23 +1439,35 @@ public static unsafe class Bootstrap
             var desc = new StringArray.Builder();
             var min = new StringArray.Builder();
             int rows = 0;
+            void Emit(string providerName, ProviderSetting s)
+            {
+                provider.Append(providerName);
+                name.Append(s.Name);
+                type.Append(s.Type switch
+                {
+                    ProviderSettingType.Bool => "bool",
+                    ProviderSettingType.Long => "long",
+                    _ => "varchar",
+                });
+                var rendered = RenderSettingValue(s.Default);
+                if (rendered is null) { def.AppendNull(); } else { def.Append(rendered); }
+                desc.Append(s.Description ?? string.Empty);
+                if (s.Min is long m) { min.Append(m.ToString()); } else { min.AppendNull(); }
+                rows++;
+            }
+            // Host settings FIRST, mirroring HostGlobalFunctions: a setting governing the plugin machinery
+            // has to exist when NO provider has loaded, which is exactly the case it is most needed in. The
+            // `provider` column is opaque to the host, so the pseudo-provider name round-trips through
+            // set_setting with no C++ change.
+            foreach (var s in HostSettings.Settings)
+            {
+                Emit(HostSettings.Provider, s);
+            }
             foreach (var backend in BackendRegistry.All())
             {
                 foreach (var s in backend.Settings)
                 {
-                    provider.Append(backend.Name);
-                    name.Append(s.Name);
-                    type.Append(s.Type switch
-                    {
-                        ProviderSettingType.Bool => "bool",
-                        ProviderSettingType.Long => "long",
-                        _ => "varchar",
-                    });
-                    var rendered = RenderSettingValue(s.Default);
-                    if (rendered is null) { def.AppendNull(); } else { def.Append(rendered); }
-                    desc.Append(s.Description ?? string.Empty);
-                    if (s.Min is long m) { min.Append(m.ToString()); } else { min.AppendNull(); }
-                    rows++;
+                    Emit(backend.Name, s);
                 }
             }
             var schema = new Schema(new[]

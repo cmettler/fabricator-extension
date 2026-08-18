@@ -114,6 +114,23 @@
     -->
     <Compile Include="..\Fabricator.Abstractions\AlterTableSpec.cs"
              Link="Linked\AlterTableSpec.cs" />
+    <!--
+      The plugin archive's contract: the manifest and the any/ + <platform>/ merge. Admissible because it is
+      System.Text.Json plus string work — the file I/O and the registry invalidation live next door in
+      PluginInstall.cs, which is exactly why this half exists as its own file. Worth pinning offline rather
+      than only through SQL: an end-to-end suite can install ONE archive on ONE platform, while the rules that
+      matter are what happens to the OTHER platform's directory, to a manifest naming '../..', and to an
+      archive carrying nothing for the platform in hand — none of which is reachable from a fixture built on
+      the machine running it.
+      ArchivePath/InstallerException come along because PluginPackage validates entry paths with the SAME
+      guard the single-file distribution's extractor uses; both are BCL-only, so the admission rule holds.
+    -->
+    <Compile Include="..\Fabricator.Bridge\PluginPackage.cs"
+             Link="Linked\PluginPackage.cs" />
+    <Compile Include="..\Fabricator.Installer.Core\ArchivePath.cs"
+             Link="Linked\ArchivePath.cs" />
+    <Compile Include="..\Fabricator.Installer.Core\InstallerException.cs"
+             Link="Linked\InstallerException.cs" />
   </ItemGroup>
 
 </Project>

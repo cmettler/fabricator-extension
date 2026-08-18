@@ -832,6 +832,62 @@ A plugin's global functions are registered while the extension loads, so a plugi
 available the **next time** DuckDB loads fabricator — not in the running session. See
 [docs/plugin-system.md](docs/plugin-system.md).
 
+### `fabricator_install_plugin(archive [, root := …] [, replace := …]) -> TABLE`
+
+Unpack a plugin archive into a plugin root. The plugin's **provider** becomes usable immediately, in the same
+session; its **global functions** appear at the next start (see the note above — that is a DuckDB constraint,
+not a limitation of the installer).
+
+```sql
+-- Off by default: an installed plugin runs in-process with the extension's privileges.
+SET fabricator_allow_plugin_install = true;
+
+SELECT name, version, destination, files, providers, activated
+FROM fabricator_install_plugin('/tmp/myplugin-1.0.0.zip');
+```
+
+| column | meaning |
+|---|---|
+| `name` / `version` | from the archive's manifest; also the install directory |
+| `platform` | DuckDB's own platform string — which directory of the archive was taken |
+| `destination` | `<root>/<name>/<version>` |
+| `files` | how many files were written |
+| `providers` | providers registered by the re-scan (empty if none) |
+| `activated` | whether the plugin is usable **now** |
+| `detail` | why not, when `activated` is false |
+
+**The archive layout.** A `fabricator-plugin.json` manifest at the root, plus an `any/` directory
+(platform-independent) and/or one named for a DuckDB platform. The install is their merge, with the platform
+directory overlaying `any/`:
+
+```
+fabricator-plugin.json
+any/MyPlugin.dll
+windows_amd64/MyPlugin.Native.dll
+linux_amd64/MyPlugin.Native.so
+```
+
+```json
+{
+  "formatVersion": 1,
+  "name": "myplugin",
+  "version": "1.0.0",
+  "entryAssembly": "MyPlugin.dll",
+  "abstractionsVersion": "1.0.0"
+}
+```
+
+A *flat* archive — assemblies at the root, no directories — is refused rather than guessed at: the alternative
+would be recognising a platform directory by its name, under which an archive shipping only `linux_amd64/`
+would look flat on Windows and its Linux binaries would be installed.
+
+**Upgrades.** The install directory is version-stamped, so a new version is written beside the running one and
+takes effect at the next start; a loaded assembly can never be replaced in place. `replace := true` re-installs
+the **same** version (it moves the old directory aside rather than deleting it, because a locked file can be
+renamed but not removed).
+
+Remote URLs are refused — download the archive first.
+
 ### `fabricator_host_query(sql) -> TABLE`
 
 Run a query on **DuckDB itself** and stream the result back through the extension. Mostly an internal
@@ -1491,6 +1547,14 @@ use: a transaction's pinned connection keeps the MARS mode it was opened with fo
 | `mssql_connection_*`, `mssql_*_timeout`, `mssql_min_connections`, `mssql_connection_cache` | Accepted | No-op (SqlClient pools by connection string) |
 | `mssql_order_pushdown` | Accepted | No-op — TopN is pushed automatically when safe (always-on, not gated) |
 | `mssql_copy_tablock`, `mssql_copy_flush_rows`, `mssql_ctas_use_bcp`, `mssql_convert_varchar_max`, `mssql_catalog_cache_ttl` | Accepted | No-op |
+
+### Host settings
+
+Two things the extension itself owns rather than a provider, so they exist even when no provider has loaded:
+
+| Setting | Status | Description |
+|---------|--------|-------------|
+| `fabricator_allow_plugin_install` | **Active** | Whether `fabricator_install_plugin()` (see [Function Reference](#function-reference)) may write plugin assemblies into a plugin root. **Default `false`**: an installed plugin is loaded into this process and runs with the extension's privileges, so it is opt-in rather than something a SQL statement can arrange on its own. Session-scoped like every other setting, so `RESET` closes it again |
 
 ### Delta read tuning
 

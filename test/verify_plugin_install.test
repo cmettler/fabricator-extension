@@ -1,0 +1,188 @@
+# name: test/verify_plugin_install.test
+# description: fabricator_install_plugin() — unpack a plugin archive into a plugin root and make its PROVIDER
+#              usable in the SAME session, while its global functions remain unreachable until next start.
+#              That asymmetry is the point of the suite: BackendRegistry.Invalidate() can reach a provider and
+#              structurally cannot reach a global function (loader.RegisterFunction is permitted only during
+#              Extension::Load(), DuckDB has no unload API, and GlobalFunctions' maps are Lazy<> per PROCESS).
+#              Needs FABRICATOR_PLUGIN_ZIP (built by Fabricator.SamplePlugin's PackPluginArchive target) and an
+#              EMPTY FABRICATOR_PLUGIN_DIR — run-suites.sh gives this suite its own, because the plugin must
+#              NOT already be loaded or every before/after assertion below is vacuous.
+#              See docs/plugin-system.md.
+# group: [fabricator]
+
+require fabricator
+
+require-env FABRICATOR_PLUGIN_ZIP
+
+require-env FABRICATOR_PLUGIN_DIR
+
+require-env FABRICATOR_DELTA_WRITE_DIR
+
+# ---- §1 the gate ----------------------------------------------------------------------------------------
+# Installing a plugin is arbitrary in-process .NET execution from a path chosen in SQL, so it is opt-in. The
+# setting is declared by the HOST rather than by a provider (HostSettings), because it has to exist when no
+# provider has loaded — which is exactly the situation it matters in.
+
+query I
+SELECT current_setting('fabricator_allow_plugin_install');
+----
+false
+
+statement error
+SELECT * FROM fabricator_install_plugin('${FABRICATOR_PLUGIN_ZIP}');
+----
+fabricator_allow_plugin_install
+
+# ---- §2 the BEFORE controls ----------------------------------------------------------------------------
+# ⚠ THESE ARE WHAT MAKE §3 AND §4 MEAN ANYTHING. Every assertion after the install is of the form "this
+# changed"; without showing the starting state, a suite run against a plugin that happened to be loaded
+# already would pass while proving nothing about the install.
+
+# The provider is UNKNOWN — the registry has never heard of it.
+statement error
+ATTACH 'ignored' AS px (TYPE fabricator, PROVIDER 'sampleplugin');
+----
+unknown provider
+
+# And its global scalar does not exist.
+query I
+SELECT count(*) FROM duckdb_functions() WHERE function_name = 'plug_greet';
+----
+0
+
+# The root is configured and EMPTY: one row for the root, none for any candidate.
+query I
+SELECT count(*) FROM fabricator_plugins() WHERE status <> 'root';
+----
+0
+
+# ---- §3 the install -------------------------------------------------------------------------------------
+
+statement ok
+SET fabricator_allow_plugin_install = true;
+
+# name/version come from the archive's manifest; files is the merged count (this archive ships one assembly
+# under any/); providers + activated are read back out of the FRESH scan, so the row distinguishes
+# "installed" from "installed and usable" rather than assuming them equal.
+query IIIII
+SELECT name, version, files, providers, activated FROM fabricator_install_plugin('${FABRICATOR_PLUGIN_ZIP}');
+----
+sampleplugin	1.0.0	1	sampleplugin	true
+
+# platform and destination are machine-dependent, so they are asserted for SHAPE rather than value: the
+# platform is DuckDB's own (asked of the engine, never derived), and the destination is the version-stamped
+# <root>/<name>/<version> the layout promises.
+query II
+SELECT platform = (SELECT platform FROM pragma_platform()),
+       destination LIKE '%' || 'sampleplugin' || '%' || '1.0.0'
+FROM fabricator_install_plugin('${FABRICATOR_PLUGIN_ZIP}', replace := true);
+----
+true	true
+
+# ---- §4 THE LOAD-BEARING PAIR: what the invalidation reaches, and what it cannot ------------------------
+
+# ⚠ THE PROVIDER IS NOW RESOLVED. The error CHANGED — from "unknown provider" (the registry had no such
+# name) to the plugin's own refusal to open a catalog. Nothing but a re-discovery can produce that, so this
+# is the assertion BackendRegistry.Invalidate() exists for; a version that installed the files and left the
+# memoized map alone would still say "unknown provider" here.
+statement error
+ATTACH 'ignored' AS px (TYPE fabricator, PROVIDER 'sampleplugin');
+----
+global functions only
+
+# ⚠ AND THE GLOBAL FUNCTION IS STILL ABSENT, which is NOT a shortcoming to be fixed later — it is the
+# documented half of the split. Registration is permitted only during Extension::Load(); a second LOAD is a
+# no-op and there is no unload API at all. Pinned so a future "improvement" that appears to add one has to
+# reckon with the reason it cannot.
+query I
+SELECT count(*) FROM duckdb_functions() WHERE function_name = 'plug_greet';
+----
+0
+
+# The plugin's declared MACRO is likewise absent — macros are registered at load from the same walk.
+query I
+SELECT count(*) FROM duckdb_functions() WHERE function_name = 'plug_double';
+----
+0
+
+# ---- §5 the scan report reflects the FRESH scan --------------------------------------------------------
+# fabricator_plugins() reads what the LAST scan recorded, so after an install it must describe the installed
+# copy. A report left over from the boot scan would still show an empty root.
+
+query II
+SELECT status, provider FROM fabricator_plugins() WHERE provider = 'sampleplugin';
+----
+loaded	sampleplugin
+
+# Every row still carries a reason, including the ones the re-scan produced.
+query I
+SELECT count(*) FROM fabricator_plugins() WHERE detail = '';
+----
+0
+
+# The staging and trash directories the install writes are HIDDEN from the scan by their leading dot. Without
+# that, a concurrent scan could load a half-extracted plugin — and here it would simply show up as extra
+# candidate rows.
+query I
+SELECT count(*) FROM fabricator_plugins() WHERE path LIKE '%.staging%' OR path LIKE '%.trash%';
+----
+0
+
+# ---- §6 refusals ----------------------------------------------------------------------------------------
+
+# Re-installing the SAME version without replace is refused rather than overwritten: on Windows a loaded
+# assembly cannot be replaced in place at all, so silently trying would fail deep in the extraction.
+statement error
+SELECT * FROM fabricator_install_plugin('${FABRICATOR_PLUGIN_ZIP}');
+----
+already exists
+
+# A remote source is refused in v1. One SQL statement pulling executable code off the network into this
+# process is a different thing from installing a file the caller already has.
+statement error
+SELECT * FROM fabricator_install_plugin('https://example.invalid/plugin.zip');
+----
+looks like a URL
+
+statement error
+SELECT * FROM fabricator_install_plugin('${FABRICATOR_DELTA_WRITE_DIR}/does-not-exist.zip');
+----
+no such archive
+
+# A file that is not an archive fails as one, naming the file — not as a JSON or a path error further in.
+statement ok
+COPY (SELECT 'this is not a zip' AS a) TO '${FABRICATOR_DELTA_WRITE_DIR}/notazip.zip' (FORMAT csv, HEADER false);
+
+statement error
+SELECT * FROM fabricator_install_plugin('${FABRICATOR_DELTA_WRITE_DIR}/notazip.zip');
+----
+not a readable zip archive
+
+# ---- §7 root := installs elsewhere, and SAYS SO ---------------------------------------------------------
+# Installing into a root nothing scans is legitimate (provisioning another machine, or a root a later
+# FABRICATOR_PLUGIN_DIR will name). What must not happen is reporting it in the same words as a plugin that
+# WAS scanned and registered nothing — the report is empty either way and the two mean different things.
+
+query III
+SELECT providers, activated, detail LIKE '%outside every configured plugin root%'
+FROM fabricator_install_plugin('${FABRICATOR_PLUGIN_ZIP}', root := '${FABRICATOR_DELTA_WRITE_DIR}/elsewhere');
+----
+(empty)	false	true
+
+# The scan is unchanged by that install: still exactly one loaded plugin, the one under the configured root.
+query I
+SELECT count(*) FROM fabricator_plugins() WHERE status = 'loaded';
+----
+1
+
+# ---- §8 the setting is per-session, like every other provider setting ----------------------------------
+# It rides the ordinary settings path (list_settings / set_setting), so RESET restores the refusal. A gate
+# that could only be opened and never closed would be a worse gate.
+
+statement ok
+RESET fabricator_allow_plugin_install;
+
+statement error
+SELECT * FROM fabricator_install_plugin('${FABRICATOR_PLUGIN_ZIP}');
+----
+fabricator_allow_plugin_install

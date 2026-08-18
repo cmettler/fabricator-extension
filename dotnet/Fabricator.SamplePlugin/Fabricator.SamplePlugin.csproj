@@ -19,4 +19,35 @@
     <ProjectReference Include="..\Fabricator.Abstractions\Fabricator.Abstractions.csproj" Private="false" />
   </ItemGroup>
 
+  <!--
+    Also emit the plugin as an INSTALLABLE ARCHIVE, so fabricator_install_plugin() has something real to
+    install in a test. Built here rather than by the test runner because MSBuild's ZipDirectory task is
+    cross-platform and already available, where `zip` is not present in Git Bash on Windows — and a fixture
+    that only exists on one platform is a gate that only runs on one platform.
+
+    The layout IS the contract (PluginPackage): a manifest at the archive root plus an `any/` directory.
+    `any/` rather than a platform directory because this plugin is pure IL — which also means the archive
+    exercises the merge's "platform directory absent" arm, the one a naive implementation gets wrong by
+    requiring both.
+  -->
+  <!-- Condition: AfterTargets="Build" fires on the OUTER multi-targeting build too, where OutputPath is
+       bin\Release\ and no assembly exists. Guarding on TargetFramework confines it to the inner builds. -->
+  <Target Name="PackPluginArchive" AfterTargets="Build" Condition="'$(TargetFramework)' != ''">
+    <PropertyGroup>
+      <!-- Staged under obj/, NOT bin/. verify_plugin points FABRICATOR_PLUGIN_DIR at this project's OUTPUT
+           directory, and since the scan became RECURSIVE anything left there is a candidate: staging in bin/
+           put a second copy of this very assembly under pluginpkg/any/, and the suite duly reported TWO
+           loaded plugins. Measured, not theorised - that is how this line came to be written. -->
+      <PluginStageDir>$(IntermediateOutputPath)pluginpkg\</PluginStageDir>
+      <PluginArchivePath>$(OutputPath)$(AssemblyName).plugin.zip</PluginArchivePath>
+    </PropertyGroup>
+    <RemoveDir Directories="$(PluginStageDir)" />
+    <MakeDir Directories="$(PluginStageDir)any" />
+    <Copy SourceFiles="$(OutputPath)$(AssemblyName).dll" DestinationFolder="$(PluginStageDir)any" />
+    <WriteLinesToFile File="$(PluginStageDir)fabricator-plugin.json" Overwrite="true" WriteOnlyWhenDifferent="false"
+                      Lines="{ &quot;formatVersion&quot;: 1, &quot;name&quot;: &quot;sampleplugin&quot;, &quot;version&quot;: &quot;1.0.0&quot;, &quot;entryAssembly&quot;: &quot;$(AssemblyName).dll&quot;, &quot;abstractionsVersion&quot;: &quot;1.0.0&quot; }" />
+    <Delete Files="$(PluginArchivePath)" />
+    <ZipDirectory SourceDirectory="$(PluginStageDir)" DestinationFile="$(PluginArchivePath)" Overwrite="true" />
+  </Target>
+
 </Project>
