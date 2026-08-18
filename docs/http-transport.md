@@ -1,32 +1,78 @@
 # Routing managed HTTP through DuckDB's httpfs — design, NOT built
 
-> **Status: ANALYSIS ONLY (2026-08-18). Nothing is implemented.** The prize is that a REST-backed provider
-> would stop needing its own credentials, proxy, TLS and retry configuration: it would inherit DuckDB's, which
-> the user has already set up for `httpfs`. The obstacle is that DuckDB's HTTP surface is **synchronous** and
-> .NET's is **asynchronous**, so the whole question is which side blocks and where.
+> **Status: ANALYSIS ONLY (2026-08-18). Nothing is implemented.**
+>
+> **WHO THIS IS FOR: A PLUGIN THAT TALKS TO A REST API.** A third-party plugin (the Sustainalytics one is the
+> first) needs to make HTTPS calls, and today that means it carries its own credential handling, its own TLS
+> and proxy configuration, its own retry policy and its own way of being told a token. The goal is that it
+> carries NONE of that: the host hands it an `HttpClient` already wired to DuckDB's HTTP stack, so
+> authentication is a `CREATE SECRET` the user already knows how to write and the plugin never sees a
+> credential at all.
+>
+> ⚠ **This is NOT about the storage read path.** Remote FILE reads (`abfss://` Delta logs, `s3://` parquet)
+> are a separate problem with separate options and a separate measurement backlog — see §6, which is a
+> POINTER, not a prerequisite.
 
 ## 1. Why this is worth wanting
 
-Every managed provider that talks to a REST API today carries its own copy of a stack the user has already
-configured once for DuckDB:
+A plugin that calls a REST API has to solve, itself, everything in the left column — all of which the user
+has already configured once for DuckDB:
 
-| concern | DuckDB `httpfs` / secrets | what our providers do today |
+| concern | DuckDB `httpfs` / secrets | what a plugin does today |
 |---|---|---|
-| credentials | `CREATE SECRET (TYPE http, …)`, `CREATE SECRET (TYPE azure, …)`, scoped by URL prefix | each provider resolves its own (`FabricCredentialResolver`, `AdlsCredential`, the SqlClient access-token marker, …) |
-| TLS trust | `ca_cert_file`, `enable_curl_server_cert_verification` | ⚠ **does not reach the .NET SDKs at all** — the MinIO self-signed saga is the recorded case |
-| proxy | `http_proxy`, `http_proxy_username/password` | `HttpClient.DefaultProxy`, unconfigured by us |
-| retry | `http_retries`, `http_retry_backoff`, `http_timeout` | per-provider, or none |
-| logging | one place | per-provider |
+| credentials | `CREATE SECRET (TYPE http, …)`, scoped by URL prefix | declares its own `SecretFields`, resolves them itself, assembles its own auth header |
+| TLS trust | `ca_cert_file`, `enable_curl_server_cert_verification` | ⚠ **does not reach a .NET SDK at all** — the MinIO self-signed case is the recorded example |
+| proxy | `http_proxy`, `http_proxy_username/password` | `HttpClient.DefaultProxy`, unconfigured |
+| retry | `http_retries`, `http_retry_backoff`, `http_timeout` | per-plugin, or none |
+| logging | one place | per-plugin |
 
-A provider on this transport gets all of it for free, and the settings surface stays DuckDB's. That is the
-same argument that made the **host filesystem bridge** (`docs/filesystem-bridge.md`) worth building, and it
-already paid there: `DuckDbTableFileSystem` reads through DuckDB, which is why an `abfss://` Delta log
-inherits DuckDB's Azure configuration.
+**The deletion this enables is the point.** A plugin on this transport declares no secret fields for
+authentication and writes no token flow: the user writes `CREATE SECRET (TYPE http, …)` scoped to the API's
+URL prefix and the plugin's calls are authenticated by the host. That is the same argument that made the
+**host filesystem bridge** (`docs/filesystem-bridge.md`) worth building — and it paid there: an `abfss://`
+Delta log inherits DuckDB's Azure configuration because the reads go through DuckDB.
 
-⚠ **It is NOT free of a real cost, stated up front:** DuckDB's `ExternalFileCache` is a VFS-layer cache, so an
-HTTP shim does **not** inherit range caching; and `HTTPUtil` is C++-internal, so this needs new ABI entries
-plus header/stream marshaling. Both are recorded in CLAUDE.md's "expose DuckDB's HTTP stack to C#" note, along
-with the instruction to **measure the cheaper alternatives first** — see §6.
+⚠ **Two costs, stated up front.** DuckDB's `ExternalFileCache` is a VFS-layer cache, so an HTTP shim does
+**not** inherit range caching (irrelevant for a REST call, which is not a file). And `HTTPUtil` is
+C++-internal, so this needs new ABI entries plus header/stream marshaling — see §7, where the gating unknown
+is whether it is reachable from a loadable extension at all.
+
+## 1b. The plugin-facing surface — THE decision to make first
+
+Everything below is mechanics. **The design question that actually matters is what a plugin author writes**,
+because that is the contract we would be committing to in `Fabricator.Abstractions`, and it is the part that
+cannot be changed quietly later.
+
+The shape to aim for is that a plugin never constructs the transport:
+
+```csharp
+public sealed class SustainalyticsBackend : IBackend
+{
+    // Handed in by the host, already wired to DuckDB's HTTP stack and this connection's secrets.
+    public IBackendCatalog OpenCatalog(string connectionString, string optionsJson, IHttpClientFactory http) => ...
+}
+```
+
+Open, and worth settling before any marshaling is written:
+
+- **How does the plugin RECEIVE it?** A new optional parameter on `OpenCatalog` (a default-implementation
+  overload, the pattern `IBackend` already uses for `requestedProvider`), or an ambient the host sets around
+  the crossing, or a property injected at registration. ⚠ An AMBIENT would be the worst of the three here:
+  a plugin's HTTP calls happen at SCAN time, on pool threads, long after the crossing that set it — exactly
+  the `AsyncLocal`-per-crossing trap that made `fabricator_install_plugin` report itself disabled.
+- **Is it an `HttpClient`, an `HttpMessageHandler`, or a factory?** A factory lets the plugin set its own
+  `BaseAddress` and add `DelegatingHandler`s; a bare `HttpClient` is simpler and stops the plugin adding
+  retry policies that fight DuckDB's.
+- **Which secret does a call use?** DuckDB's `TYPE http` secrets are scoped by URL prefix, so the natural
+  answer is "whatever matches the request URI" and the plugin passes nothing. Confirm that scope matching is
+  reachable from where we would call it.
+- **What does a plugin do when the host does NOT provide it** (an older host, or a build without httpfs)? A
+  null factory that the plugin must null-check is a trap; refusing at registration is louder and probably
+  right.
+
+⚠ **This changes the Sustainalytics skeleton.** It currently declares `client_id` / `client_secret` /
+`base_url` as `SecretFields` — which is the right shape for a plugin that authenticates itself, and the wrong
+one if the host authenticates for it. Do not build that plugin's auth until this is settled.
 
 ## 2. The shape: a terminal `HttpMessageHandler`
 
@@ -131,30 +177,29 @@ it will construct and dispose ours periodically. Anything expensive behind it mu
 does NOT own — the `ownsInner` flag pattern. For us the "inner" is the DuckDB opener, whose lifetime belongs
 to the connection, so the handler must **never** dispose it.
 
-## 5. What this would let us delete
+## 5. What this would let a plugin delete
 
-The point is not elegance, it is deleting credential code:
+- **Its entire credential surface.** No `SecretFields`, no token flow, no refresh handling: the user writes
+  `CREATE SECRET (TYPE http, …)` scoped to the API prefix.
+- **Its TLS configuration.** `ca_cert_file` would reach a plugin's HTTP calls, which it does not today.
+- **Its retry and timeout policy**, in favour of DuckDB's, which the user can already tune.
 
-- A REST provider would stop resolving its own credentials — `CREATE SECRET (TYPE http, …)` scoped to the API
-  prefix covers bearer tokens and basic auth.
-- The recorded TLS gap closes: `ca_cert_file` would finally reach a managed provider's HTTP calls, which it
-  does not today (the MinIO self-signed case).
-- ⚠ It does **not** replace the Fabric/Azure credential chain: those mint AAD tokens for specific audiences,
-  which is an identity problem, not a transport one. `FabricCredentialResolver` stays.
+⚠ It does **not** replace the Fabric/Azure credential chain. Those mint AAD tokens for a specific
+AUDIENCE — an identity problem, not a transport one — so `FabricCredentialResolver` stays exactly as it is.
+A plugin needing an AAD token for a first-party Microsoft API is not the case this serves.
 
-## 6. ⚠ Measure these FIRST — the cheaper alternatives, in order
+## 6. NOT a prerequisite: the storage read path is a different problem
 
-CLAUDE.md already records this as the ordering, and it has not been done:
+CLAUDE.md records a "measure these first" list — the unexplained 180 ms-vs-3 ms ranged-read asymmetry, and
+the fact that the existing host-FS bridge already routes reads through DuckDB's stack with zero new ABI.
+**That list is about remote FILE reads and does not gate this.** A REST call has no file, no range request
+and nothing `ExternalFileCache` could serve, so neither alternative applies:
 
-1. **The unexplained 180 ms-vs-3 ms asymmetry.** Sequential ranged `ReadAsync` on one `DataLakeFileClient`
-   cost ~180 ms/request while `ReadContentAsync` on fresh clients cost 2–6 ms. If ranged reads are dropping
-   or renegotiating the connection, an SDK transport tweak wins with none of this work.
-2. **The EXISTING host-FS bridge already routes reads through DuckDB's stack.** `DuckDbTableFileSystem` over
-   `abfss://` gets `ExternalFileCache` and DuckDB's TLS/proxy settings with **zero new ABI**. A hybrid — reads
-   through the host FS, commit primitives through the direct SDK for atomicity — is most of the benefit at a
-   fraction of the cost. For a REST API specifically this does not apply (there is no file), which is exactly
-   why the shim is the *third* option and not the first.
-3. **Only then the shim.**
+- the ranged-read asymmetry is a property of `DataLakeFileClient` reading a blob;
+- the host-FS bridge answers "read this path", which a REST API does not have.
+
+Kept as a pointer only, so the two are not conflated again: they are separate topics, to be addressed
+separately.
 
 ## 7. Open questions to settle before writing code
 
