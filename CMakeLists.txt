@@ -18,6 +18,7 @@ set(EXTENSION_SOURCES
     src/fabricator_storage.cpp
     src/fabricator_fs_spike.cpp
     src/fabricator_host_query.cpp
+    src/fabricator_http.cpp
     src/fabricator_optimizer.cpp
     src/fabricator/clr_host.cpp
     src/fabricator/fabricator_onelake_fs.cpp

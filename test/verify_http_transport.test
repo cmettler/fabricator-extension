@@ -1,0 +1,178 @@
+# name: test/verify_http_transport.test
+# description: fabricator_http_request(...) — a managed HTTP call routed through DuckDB's OWN HTTP stack
+#              (ABI v76 http_request -> HTTPUtil -> httpfs' curl client), so it inherits DuckDB's secrets,
+#              TLS trust, proxy and retry configuration. This is the transport a PLUGIN calling a REST API
+#              is meant to use; the function exists to make it observable from SQL.
+#              Runs against the docker/docker-compose.yml MinIO (test-only creds, HTTPS with a SELF-SIGNED
+#              cert) — deliberately, and not against a public endpoint: the self-signed cert is what turns
+#              "DuckDB's TLS configuration reaches the call" from a claim into a two-legged A/B, and it
+#              keeps the suite off the internet.
+# group: [fabricator]
+
+require fabricator
+
+require httpfs
+
+require-env FABRICATOR_S3_ENDPOINT
+
+# ⚠ httpfs IS A HARD PREREQUISITE OF THE FEATURE, and this suite CANNOT gate that — `require httpfs` above
+# guarantees it is loaded, and our test binaries link it statically anyway, so the unloaded case is
+# unreachable from here. It is real: MEASURED against a stock DuckDB 1.5.5 wheel with only fabricator
+# loaded, every request — GET included — failed with "'https' scheme is not supported", because
+# HTTPUtil::Get returns whatever sits in DBConfig and only httpfs' Load puts a TLS-capable, secret-reading
+# one there. The host now auto-loads httpfs at request time and REFUSES with instructions if it cannot;
+# both legs were measured with the Python wheel, and neither is reachable from sqllogictest.
+
+# ==========================================================================================================
+# §1 THE TLS A/B — the load-bearing section, and the reason this suite is on MinIO.
+#
+# The whole justification for routing managed HTTP through DuckDB is that the call inherits configuration
+# the plugin never sees. Nothing about a successful request demonstrates that; only a setting CHANGING the
+# outcome does. `enable_curl_server_cert_verification` defaults to true, and MinIO's cert is self-signed, so
+# the same statement fails one way and succeeds the other with the setting as the only variable.
+#
+# ⚠ Whichever way this is read, read BOTH legs. "It returned 200" would be equally true of a transport that
+# ignored DuckDB's TLS settings entirely and happened to trust everything.
+# ==========================================================================================================
+
+query I
+SELECT current_setting('enable_curl_server_cert_verification');
+----
+true
+
+# Leg A: verification ON (the default) => the self-signed cert is REFUSED.
+statement error
+SELECT status FROM fabricator_http_request('https://localhost:9000/minio/health/live');
+----
+certificate
+
+# Leg B: the SAME request with verification off => it succeeds. DuckDB's setting governs a call made from C#.
+statement ok
+SET GLOBAL enable_curl_server_cert_verification = false;
+
+query II
+SELECT status, reason FROM fabricator_http_request('https://localhost:9000/minio/health/live');
+----
+200	OK
+
+# ==========================================================================================================
+# §2 THE SECRET A/B — a `TYPE http` secret's fields reach the request, and SCOPE decides which one applies.
+#
+# Same shape as §1 and for the same reason: the credential story is the other half of what this transport
+# buys, and only a secret CHANGING the outcome demonstrates it. `verify_ssl` is used as the observable
+# because it is checkable locally — a bearer token would need a server that echoes headers back, i.e. the
+# internet.
+# ==========================================================================================================
+
+statement ok
+SET GLOBAL enable_curl_server_cert_verification = true;
+
+statement ok
+CREATE SECRET http_here (TYPE http, SCOPE 'https://localhost:9000', VERIFY_SSL false);
+
+# The secret's scope covers this URL => its verify_ssl reaches the request and the self-signed cert passes.
+query I
+SELECT status FROM fabricator_http_request('https://localhost:9000/minio/health/live');
+----
+200
+
+statement ok
+DROP SECRET http_here;
+
+# THE NEGATIVE CONTROL, and it is not decoration: a byte-identical secret scoped ELSEWHERE must NOT apply.
+# Without this leg, §2's success would be equally true of an implementation that applied every http secret
+# it could find regardless of scope — which is a credential LEAK, not a passing test.
+statement ok
+CREATE SECRET http_elsewhere (TYPE http, SCOPE 'https://elsewhere.example', VERIFY_SSL false);
+
+statement error
+SELECT status FROM fabricator_http_request('https://localhost:9000/minio/health/live');
+----
+certificate
+
+statement ok
+DROP SECRET http_elsewhere;
+
+statement ok
+SET GLOBAL enable_curl_server_cert_verification = false;
+
+# ==========================================================================================================
+# §3 An HTTP error status is a ROW, not an exception — a caller has to be able to INSPECT a 401.
+#
+# ⚠ MY FIRST WRITE-UP OF THIS SECTION WAS WRONG AND A MUTANT CAUGHT IT. It said the host's `try_request`
+# flag is what makes a 404 a row; setting that flag FALSE and re-running left this suite at 21/21. The real
+# mechanism is DuckDB's retry loop, which returns any NON-RETRYABLE response directly whatever the flag
+# says — so 404/401/403 were always rows. `try_request` governs only the RETRYABLE set (408, 418, 429, 500,
+# 503, 504 and transport errors), which would otherwise throw after the last attempt.
+# ⚠ So that flag is NOT GATED here: producing an exhausted-retry 500 needs a server that returns one on
+# demand, and neither MinIO nor SQL Server does. Stated rather than papered over — a section that claims to
+# cover a flag it cannot reach is worse than an admitted gap.
+# ==========================================================================================================
+
+query I
+SELECT status >= 400 FROM fabricator_http_request('https://localhost:9000/this-path-does-not-exist');
+----
+true
+
+# ==========================================================================================================
+# §4 A TRANSPORT failure IS an exception — the other side of §3's split, and the distinction .NET callers
+# above an HttpMessageHandler depend on. A name that does not resolve never produced a status.
+# ==========================================================================================================
+
+statement error
+SELECT status FROM fabricator_http_request('https://this-host-does-not-exist-fabricator.invalid/x');
+----
+Could not resolve
+
+# ==========================================================================================================
+# §5 An unsupported METHOD is refused by name.
+#
+# DuckDB's RequestType has exactly GET / PUT / HEAD / DELETE / POST, so PATCH, OPTIONS and TRACE are not
+# expressible through this transport at all. The refusal names the five that are, because the alternative —
+# quietly sending a PATCH as a POST — would corrupt a write while looking like it worked.
+# ==========================================================================================================
+
+statement error
+SELECT status FROM fabricator_http_request('https://localhost:9000/', method := 'PATCH');
+----
+not supported by DuckDB's HTTP layer
+
+# ==========================================================================================================
+# §6 HEAD returns headers and no body, and the response headers arrive intact.
+#
+# Also pins that the response header bag is populated at all: it crosses the ABI as a JSON object and is
+# then split across HttpResponseMessage.Headers and Content.Headers by the handler, which is the one piece
+# of the mapping that silently throws away headers if it is wrong.
+# ==========================================================================================================
+
+query II
+SELECT body_bytes, headers LIKE '%Server%' OR headers LIKE '%server%'
+FROM fabricator_http_request('https://localhost:9000/minio/health/live', method := 'HEAD');
+----
+0	true
+
+# ==========================================================================================================
+# §7 The request carries a caller-supplied header and a body.
+#
+# MinIO does not echo headers, so what is asserted here is that supplying them does not BREAK the request —
+# the echo-based proof needs a server that reflects, and lives outside CI. The value of the section is the
+# body path: a POST's response body arrives through `PostRequestInfo::buffer_out`, NOT through
+# HTTPResponse::body like every other method, so a POST returning content at all is what pins that.
+# ==========================================================================================================
+
+query I
+SELECT status > 0 FROM fabricator_http_request(
+    'https://localhost:9000/', method := 'POST', body := 'hello',
+    headers := '{"Content-Type":"text/plain","X-Fabricator":"probe"}');
+----
+true
+
+query I
+SELECT body_bytes > 0 FROM fabricator_http_request(
+    'https://localhost:9000/', method := 'POST', body := 'hello',
+    headers := '{"Content-Type":"text/plain"}');
+----
+true
+
+statement ok
+SET GLOBAL enable_curl_server_cert_verification = true;

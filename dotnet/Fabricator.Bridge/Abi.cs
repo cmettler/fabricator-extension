@@ -334,6 +334,13 @@ public unsafe struct FabricatorHostServices
     // void host_query_interrupt_free(void* interrupt_handle) — free the handle, exactly once, after any
     // in-flight interrupt callback has been waited out (registration disposed first). Additive (ABI v66).
     public delegate* unmanaged[Cdecl]<void*, void> HostQueryInterruptFree;
+    // int32 http_request(void* opener, const char* method, const char* url, const char* headers_json,
+    //                    const void* body, int64 body_length, char** out_response_json, void** out_body,
+    //                    int64* out_body_length, char** err) — perform an HTTP request through DuckDB's OWN
+    // HTTP stack, so the call inherits the `TYPE http` secret matching the URL, ca_cert_file, http_proxy*,
+    // http_timeout and the retry settings. Wrapped by DuckDbHttpHandler as a .NET HttpMessageHandler.
+    // Additive (ABI v76). See docs/http-transport.md.
+    public delegate* unmanaged[Cdecl]<nint, byte*, byte*, byte*, void*, long, byte**, void**, long*, byte**, int> HttpRequest;
 }
 
 /// <summary>Mirrors <c>FabricatorHostInputs</c> in abi.h — named Arrow streams handed to host_query as data-in

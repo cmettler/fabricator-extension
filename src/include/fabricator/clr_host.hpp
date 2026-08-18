@@ -54,6 +54,14 @@ void SetHostQueryService(HostQueryFn fn, HostQueryInterruptFn interrupt_fn, Host
 using HostLogFn = void (*)(int32_t level, const char *log_type, const char *message);
 void SetHostLog(HostLogFn fn);
 
+// Register the http_request callback (perform an HTTP request through DuckDB's own HTTP stack, so a managed
+// caller inherits its secrets / TLS trust / proxy / retry). Patched onto the shared host-services block at
+// load, like SetHostQueryService. See FabricatorHostServices::http_request in abi.h + docs/http-transport.md.
+using HostHttpFn = int32_t (*)(FabricatorHandle opener, const char *method, const char *url,
+                               const char *headers_json, const void *body, int64_t body_length,
+                               char **out_response_json, void **out_body, int64_t *out_body_length, char **err);
+void SetHostHttpService(HostHttpFn fn);
+
 // SPIKE: ask the managed side to open `path` via the host FileSystem callbacks (using `opener` for secret
 // resolution) and return a short human-readable result (head/tail bytes + size). Proves C#->host FS reads.
 std::string FsSpike(FabricatorHandle opener, const std::string &path);

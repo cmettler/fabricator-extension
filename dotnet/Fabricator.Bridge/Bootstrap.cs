@@ -38,6 +38,12 @@ public static unsafe class Bootstrap
         if (host is not null)
         {
             HostFs.Set(*host);
+            // Fill in the contract assembly's HTTP transport seam (ABI v76), so DuckDbHttpHandler works for
+            // anything referencing Fabricator.Abstractions alone — a plugin above all. ⚠ The ambient opener
+            // is read HERE, per call, not captured: a catalog is database-scoped and outlives the connection
+            // that attached it, so a held ClientContext* would dangle.
+            HostHttpTransport.Send = (method, url, headers, body) =>
+                HostFs.HttpRequest(AmbientOpener.Current, method, url, headers, body);
             // Forward ILogger output into DuckDB's internal logging (duckdb_logs) when the host provides host_log.
             // The file sink (FABRICATOR_LOG_LEVEL/_FILE) stays independent; this adds the engine-log route.
             if (HostFs.CanLog)
@@ -57,7 +63,7 @@ public static unsafe class Bootstrap
             return new InMemoryArrayStream(schema, new[] { batch });
         });
 
-        vtable->AbiVersion = 75;
+        vtable->AbiVersion = 76;
         vtable->OpenCatalog = &OpenCatalog;
         vtable->CloseCatalog = &CloseCatalog;
         vtable->ExecuteQuery = &ExecuteQuery;

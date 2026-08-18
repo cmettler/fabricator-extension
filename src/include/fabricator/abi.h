@@ -956,13 +956,42 @@ typedef struct FabricatorHostServices {
 	// Free the interrupt handle (exactly once, after any in-flight host_query_interrupt has returned —
 	// the managed wrapper orders registration-dispose before this).
 	void (*host_query_interrupt_free)(void *interrupt_handle);
+
+	// Perform an HTTP request through DuckDB's OWN HTTP layer (ABI v76). The point is not the socket — it is
+	// that the request inherits DuckDB's configuration: the `TYPE http` SECRET whose SCOPE matches this URL
+	// (bearer_token / extra_http_headers / proxy / verify_ssl), `ca_cert_file`, `http_proxy*`, `http_timeout`,
+	// `http_retries`/`http_retry_backoff`. A managed component — above all a PLUGIN calling a REST API — thus
+	// stops carrying its own TLS trust, proxy and retry policy. The managed `DuckDbHttpHandler` wraps this as
+	// an ordinary .NET HttpMessageHandler. See docs/http-transport.md.
+	//
+	// `opener` is the calling operator's ClientContext (valid for the duration of the call) — it selects the
+	// HTTPUtil and resolves the secret+settings. `method` is GET|PUT|HEAD|DELETE|POST; DuckDB's RequestType
+	// has no others, so PATCH/OPTIONS/TRACE are REFUSED by name rather than silently mapped onto POST.
+	// `headers_json` is a JSON object {"Name":"value", …} or null.
+	//
+	// ⚠ ONE VALUE PER HEADER NAME, in BOTH directions, and that is DuckDB's model: HTTPHeaders is a
+	// case-insensitive MAP, so a repeated header (Set-Cookie) cannot be carried at all.
+	//
+	// `body`/`body_length` are the request body (nullable; meaningful for PUT/POST). On success:
+	//   *out_response_json = {"status":N,"reason":..,"url":..,"success":bool,"error":..,"headers":{..}}
+	//   *out_body / *out_body_length = the response body as raw bytes (null when empty)
+	// Both are owned by the caller and freed via free_str (which is plain free()). A non-empty "error" is a
+	// TRANSPORT failure (DNS/connect/TLS); an HTTP status the server actually returned — 404, 500 — arrives
+	// as a normal response with a status, never as a non-zero return. A non-zero return means the request
+	// could not be ATTEMPTED (bad method, no context, malformed headers), with *err set.
+	//
+	// ⚠ The response body is FULLY BUFFERED. DuckDB's own HTTPResponse::body is a std::string, so there is
+	// no streaming to inherit; a paging REST reader must page, not stream.
+	int32_t (*http_request)(FabricatorHandle opener, const char *method, const char *url, const char *headers_json,
+	                        const void *body, int64_t body_length, char **out_response_json, void **out_body,
+	                        int64_t *out_body_length, char **err);
 } FabricatorHostServices;
 
 // Max serialized size of a spillable aggregate's per-group state (the inline, pointer-free
 // state blob is this many bytes + a 4-byte length prefix). Serialize() must fit within it.
 #define FABRICATOR_AGG_SPILL_CAP 1024
 
-#define FABRICATOR_ABI_VERSION 75
+#define FABRICATOR_ABI_VERSION 76
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(FabricatorVTable) as seen

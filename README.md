@@ -79,6 +79,7 @@ See [SQL Server external tables on S3](#sql-server-external-tables-on-s3).
 | | `fabricator_functions(catalog)` — list discovered routines | ✅ |
 | | `fabricator_delta_scan(path)` / `fabricator_delta_native_scan(path)` — read a Delta table by path, no ATTACH (C# reader / DuckDB's parquet reader) | ✅ |
 | | `fabricator_host_query(sql)` — run a query on DuckDB itself (inherits your search path + `TimeZone`) | ✅ |
+| | `fabricator_http_request(url, …)` — an HTTP call through DuckDB's own stack (its `TYPE http` secret, TLS trust, proxy, retries) | ✅ |
 | **Macros** | Provider **global** macros — bare `fn(...)` / `FROM fn(...)`, every database, no ATTACH | ✅ |
 | | Provider **catalog-bound** macros → `db.schema.m(...)` (namespaced per catalog; expanded by the binder) | ✅ |
 | | **SQL-generating** table functions — the call is rewritten into SQL at bind time (`kind='table_sql'`) | ✅ |
@@ -917,6 +918,48 @@ restart has usually released the lock.
 
 ⚠ The provider stops resolving, but the code stays in memory until the process exits — nothing can unload it.
 The re-scan simply stops finding a candidate, so it is no longer registered.
+
+### `fabricator_http_request(url [, method := …] [, headers := …] [, body := …]) -> TABLE`
+
+Make an HTTP request through **DuckDB's own HTTP stack**, so it picks up DuckDB's configuration rather than
+.NET's: the `TYPE http` secret whose scope covers the URL, `ca_cert_file`,
+`enable_curl_server_cert_verification`, `http_proxy*`, `http_timeout` and the retry settings.
+
+```sql
+CREATE SECRET api (TYPE http, BEARER_TOKEN 'eyJhbGciOi…', SCOPE 'https://api.example.com');
+
+SELECT status, reason, body
+FROM fabricator_http_request('https://api.example.com/v1/things');
+```
+
+Needs the **`httpfs`** extension — it is what gives DuckDB a TLS-capable HTTP client and the `TYPE http`
+secret reader. It is auto-loaded on the first request; if it is neither loaded nor installable you get a
+message telling you to `INSTALL httpfs; LOAD httpfs;` rather than a confusing scheme error.
+
+Returns one row: `status`, `reason`, `headers` (a JSON object), `body_bytes` and `body`. An HTTP error
+status is a **row**, not an error — a 401 is something you look at — while a transport failure (DNS,
+connect, TLS) raises. `body` is NULL if the response is not valid UTF-8.
+
+It exists mainly to make the transport **observable**: the same path is what a plugin uses for a REST API
+(`DuckDbHttpHandler`, an ordinary .NET `HttpMessageHandler`), and none of the inheritance above is visible
+from inside the plugin. Reach for it first when a plugin's calls come out unauthenticated.
+
+Limits, all inherited from DuckDB's HTTP layer: methods are **GET / PUT / HEAD / DELETE / POST** only (a
+`PATCH` is refused by name rather than sent as something else); **one value per header name** in both
+directions, so repeated headers such as `Set-Cookie` cannot be carried; bodies are fully buffered, so a
+large result must be paged rather than streamed; redirects are followed; responses are **not**
+decompressed, so do not send an `Accept-Encoding` you cannot handle yourself.
+
+⚠ `TYPE http` carries a **static** credential — `BEARER_TOKEN` or `EXTRA_HTTP_HEADERS`. It does not perform
+an OAuth2 client-credentials exchange, and `CLIENT_ID`/`CLIENT_SECRET` are not fields of it. An API using
+OAuth2 needs its own secret type and its own token exchange; the transport still gives it everything else.
+
+⚠ **It is unrestricted, deliberately, and worth knowing about.** Anyone who can run SQL in this session can
+send any of the five methods to any URL, with whatever `TYPE http` secret matches it — including `PUT`,
+`POST` and `DELETE`. That is a step beyond what `httpfs` alone exposes (which reads URLs but does not offer
+arbitrary writes), though it is well within what this extension already permits: `fabricator_exec` runs
+arbitrary SQL on an attached server, and `fabricator_install_plugin` loads code into the process. There is
+no setting gating it today; say so if you want one.
 
 ### `fabricator_host_query(sql) -> TABLE`
 

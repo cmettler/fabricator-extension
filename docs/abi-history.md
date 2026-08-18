@@ -12,6 +12,35 @@
 > parsed with our own vcpkg yyjson, retiring the `ReadCapabilityFlag` string-find). v74 below is the
 > follow-on that finished the same job for ALTER.
 
+## v76 (2026-08-18) — `http_request`: a managed HTTP call routed through DuckDB's own stack
+
+**ADDITIVE**, appended to the END of `FabricatorHostServices` (the reverse-direction block), so nothing
+moved. The bump is required all the same: the managed side rejects a host-services block whose
+`abi_version` does not match, so a mismatched pair is loud at boot rather than reading a garbage slot.
+
+```c
+int32_t (*http_request)(FabricatorHandle opener, const char *method, const char *url, const char *headers_json,
+                        const void *body, int64_t body_length, char **out_response_json, void **out_body,
+                        int64_t *out_body_length, char **err);
+```
+
+The point is not the socket — it is that the request inherits DuckDB's configuration: the `TYPE http`
+SECRET whose SCOPE matches this URL, `ca_cert_file`, `http_proxy*`, `http_timeout`, the retry knobs. So a
+managed component, above all a PLUGIN calling a REST API, stops carrying its own TLS trust and retry
+policy. `DuckDbHttpHandler` wraps it as an ordinary .NET `HttpMessageHandler`.
+
+- **Passing the URL to `InitializeParameters` IS the secret mechanism** — httpfs builds a
+  `KeyValueSecretReader` over the `FileOpenerInfo`'s `file_path`, so scope matching costs us nothing.
+  Mutation-tested: resolving the params with an EMPTY url kills the gate at exactly the secret section
+  after 7 assertions pass, i.e. with the TLS A/B still green — precisely discriminating.
+- **The envelope is ONE typed JSON doc** (`{"status","reason","url","success","error","headers"}`), the
+  v73/v74 pattern, written host-side with yyjson. The BODY crosses as a raw buffer beside it rather than
+  base64 inside it. Both are freed with `free_str`, which is plain `free()`.
+- ⚠ **`FABRICATOR_ABI_VERSION` and `vtable->AbiVersion` both move**, as always.
+
+Full record, incl. the five things building it found and the two measured A/Bs:
+[docs/http-transport.md](http-transport.md).
+
 ## v75 (2026-08-18) — `delta_list_files` DELETED with the MultiFileReader spike it served
 
 **BREAKING, no aliases. One vtable slot REMOVED from the MIDDLE of the struct**, so every later field

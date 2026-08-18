@@ -514,6 +514,11 @@ void SetHostLog(HostLogFn fn) {
 	g_host_services.host_log = fn;
 }
 
+void SetHostHttpService(HostHttpFn fn) {
+	// Patches the http_request field, like SetHostLog. At extension load, before the bridge boots.
+	g_host_services.http_request = fn;
+}
+
 // -----------------------------------------------------------------------------
 // vtable convenience wrappers
 // -----------------------------------------------------------------------------

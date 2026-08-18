@@ -18,6 +18,7 @@
 #include "fabricator_optimizer.hpp"
 #include "fabricator_fs_spike.hpp"
 #include "fabricator_host_query.hpp"
+#include "fabricator_http.hpp"
 #include "fabricator_secret.hpp"
 #include "fabricator_storage.hpp"
 #include "duckdb/function/function_set.hpp"
@@ -495,6 +496,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// C++ registration needed. See docs/global-functions.md §host-FS.
 	// fabricator_host_query(sql) — run a query on a fresh host connection, result as Arrow (reuse DuckDB).
 	RegisterHostQuery(loader);
+	// http_request host service — perform an HTTP request through DuckDB's own HTTP stack, so a managed
+	// caller (above all a PLUGIN calling a REST API) inherits its secrets, TLS trust, proxy and retry
+	// configuration instead of carrying its own. See docs/http-transport.md.
+	RegisterHostHttp(loader);
 	// CREATE SECRET ... (TYPE mssql, host '...', ...) — secret type(s) + fields declared in C#
 	RegisterProviderSecrets(loader);
 	// ATTACH '<connstr>' AS db (TYPE fabricator) — or ATTACH '' (TYPE fabricator, SECRET name)

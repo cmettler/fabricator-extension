@@ -251,6 +251,20 @@ should be something the USER asks for by name rather than something a file appea
 - **Signature or checksum verification** of an archive. `Hashing` is there; nothing consumes it here.
 - **Per-plugin ALC isolation** -- see the sequenced recommendation below. Still correctly deferred.
 
+## HTTP from a plugin — use the host's transport, once you can reach it
+
+A plugin whose backend is a REST API should not carry its own TLS trust, proxy configuration or retry
+policy: `DuckDbHttpHandler` (ABI v76) is an ordinary .NET `HttpMessageHandler` whose transport is DuckDB's
+own HTTP stack, so a call inherits the `TYPE http` secret whose SCOPE covers the URL, `ca_cert_file`,
+`http_proxy*`, `http_timeout` and the retry knobs. Full record: [http-transport.md](http-transport.md).
+
+⚠ **Two things to know before planning around it.** The class lives in `Fabricator.Bridge`, and a plugin
+normally references only `Fabricator.Abstractions` — so it is not on a plugin's compile-time surface yet;
+how the transport is HANDED to a plugin is the open question in that doc's §6. And DuckDB's `TYPE http`
+secret carries a **static** credential only (`BEARER_TOKEN` / `EXTRA_HTTP_HEADERS`); an OAuth2
+client-credentials API still needs its own secret type and its own token exchange, so it gains the
+transport half and not the credential half.
+
 ## The original sketch — kept because every prediction in it held
 
 The shape agreed 2026-08-18: a zip carrying `any/` (platform-independent) and `<platform>/` folders named with

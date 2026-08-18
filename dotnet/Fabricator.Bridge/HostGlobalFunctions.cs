@@ -27,6 +27,7 @@ internal static class HostGlobalFunctions
         new PluginsFunction(),
         new InstallPluginFunction(),
         new UninstallPluginFunction(),
+        new HttpRequestFunction(),
     };
 }
 

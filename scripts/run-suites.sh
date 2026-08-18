@@ -353,7 +353,11 @@ case "$TIER" in
         # here rather than in the hermetic tier only because its fixture (the plugin archive) comes from the
         # same build step as FABRICATOR_PLUGIN_DIR, not because it needs a service; and it is run against its
         # OWN empty plugin root, because every assertion in it is of the form "this changed".
-        : "${MIN_SUITES:=51}"
+        # 52 runs since 2026-08-18: verify_http_transport — a managed HTTP call routed through DuckDB's OWN
+        # HTTP stack (ABI v76). Service tier rather than hermetic ON PURPOSE and not merely because it needs
+        # a server: its two load-bearing sections are A/Bs against MinIO's SELF-SIGNED cert, which is what
+        # turns "DuckDB's TLS configuration and secrets reach the call" from a claim into a measurement.
+        : "${MIN_SUITES:=52}"
         # 1424 since 2026-08-01: verify_exec_invalidate_cache 10 -> 21, for the OUT-OF-BAND DROP path Ã¢ÂÂ the
         # catalog's self-heal, documented in CLAUDE.md and until now covered by NOTHING. The service tier ran
         # 44/44 green while that path was broken, which is why the section exists. It must run with
@@ -444,7 +448,8 @@ case "$TIER" in
         # name. Its load-bearing assertion is the positive control - mssql_mars still registered, i.e. the
         # first-party provider still holds the name; "the plugin was rejected" alone would pass on a build
         # where BOTH were broken.
-        : "${MIN_ASSERTIONS:=2080}"
+        # 2101 since 2026-08-18: 2080 + exactly the 21 of verify_http_transport, so no surviving suite moved.
+        : "${MIN_ASSERTIONS:=2101}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

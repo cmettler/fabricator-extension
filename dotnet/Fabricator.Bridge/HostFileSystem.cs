@@ -420,6 +420,80 @@ internal static unsafe class HostFs
         }
     }
 
+    // ---- HTTP (ABI v76) -----------------------------------------------------------------------------
+    // Perform a request through DuckDB's OWN HTTP stack, so it inherits the `TYPE http` secret whose SCOPE
+    // matches the URL, plus ca_cert_file / http_proxy* / http_timeout / http_retries. Wrapped by
+    // DuckDbHttpHandler as an ordinary .NET HttpMessageHandler. See docs/http-transport.md.
+
+    /// <summary>True once the host registered the http_request callback.</summary>
+    public static bool CanHttp => _set && _h.HttpRequest != null;
+
+    /// <summary>
+    /// Performs one HTTP request through the host. BLOCKS — DuckDB's HTTP layer is synchronous, so the
+    /// caller decides which thread pays (<see cref="DuckDbHttpHandler"/> puts it on the pool). Returns the
+    /// response envelope JSON and the body bytes; a transport failure is reported INSIDE the envelope's
+    /// "error", not as an exception, so a 404 and a DNS failure stay distinguishable.
+    /// </summary>
+    public static (string ResponseJson, byte[]? Body) HttpRequest(nint opener, string method, string url,
+                                                                  string? headersJson, byte[]? body)
+    {
+        if (!CanHttp)
+        {
+            throw new NotSupportedException(
+                "host http_request is unavailable (the extension was loaded by a host that predates ABI v76)");
+        }
+        var methodPtr = Marshal.StringToCoTaskMemUTF8(method);
+        var urlPtr = Marshal.StringToCoTaskMemUTF8(url);
+        var headersPtr = headersJson is null ? 0 : Marshal.StringToCoTaskMemUTF8(headersJson);
+        // Pin rather than copy: the host reads the buffer synchronously and never retains it.
+        var handle = body is null || body.Length == 0
+            ? default
+            : System.Runtime.InteropServices.GCHandle.Alloc(body, System.Runtime.InteropServices.GCHandleType.Pinned);
+        try
+        {
+            byte* err = null;
+            byte* outJson = null;
+            void* outBody = null;
+            long outLen = 0;
+            void* bodyPtr = handle.IsAllocated ? (void*)handle.AddrOfPinnedObject() : null;
+            int rc = _h.HttpRequest(opener, (byte*)methodPtr, (byte*)urlPtr, (byte*)headersPtr, bodyPtr,
+                                    body?.LongLength ?? 0, &outJson, &outBody, &outLen, &err);
+            if (rc != 0)
+            {
+                throw HostError("http_request", err);
+            }
+            var json = Marshal.PtrToStringUTF8((nint)outJson) ?? "{}";
+            if (outJson != null && _h.FreeStr != null)
+            {
+                _h.FreeStr(outJson);
+            }
+            byte[]? responseBody = null;
+            if (outBody != null && outLen > 0)
+            {
+                responseBody = new byte[outLen];
+                Marshal.Copy((nint)outBody, responseBody, 0, checked((int)outLen));
+            }
+            if (outBody != null && _h.FreeStr != null)
+            {
+                _h.FreeStr((byte*)outBody); // free_str is plain free(); the body was malloc'd the same way
+            }
+            return (json, responseBody);
+        }
+        finally
+        {
+            if (handle.IsAllocated)
+            {
+                handle.Free();
+            }
+            if (headersPtr != 0)
+            {
+                Marshal.FreeCoTaskMem(headersPtr);
+            }
+            Marshal.FreeCoTaskMem(urlPtr);
+            Marshal.FreeCoTaskMem(methodPtr);
+        }
+    }
+
     private static Exception HostError(string op, byte* err)
     {
         var msg = Marshal.PtrToStringUTF8((nint)err) ?? string.Empty;
