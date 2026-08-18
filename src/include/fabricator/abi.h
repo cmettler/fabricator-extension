@@ -658,16 +658,11 @@ typedef struct FabricatorVTable {
 	int32_t (*onelake_close_write)(FabricatorHandle file, char **err);
 
 	// -------------------------------------------------------------------------
-	// Delta native-read via DuckDB's MultiFileReader (docs/multifile-delta.md Phase A). The host's
-	// FabricatorDeltaMultiFileReader (a DuckDB MultiFileReader that clones parquet_scan) asks the managed side for
-	// the EXACT active data files of the Delta table at `path` — the snapshot `add` set, NOT a glob — as a JSON
-	// array of objects: [{"path":"<uri>"[, "partitionValues":{..}, "deletionVector":"<base64>", "recordCount":N]}].
-	// Paths are absolute URIs DuckDB's native reader can open (onelake:// for OneLake → native + ExternalFileCache);
-	// the managed side uses the active host-FS opener (set_active_opener) to read the `_delta_log`. DuckDB's parquet
-	// reader then reads the files; partition values + deletion vectors (later slices) attach per file. The `push`
-	// arg carries pushed-down filters as JSON (empty ⇒ none) so the managed side prunes files by the Delta log
-	// stats (static + dynamic filter pushdown); an empty result column of files is valid (everything pruned).
-	int32_t (*delta_list_files)(const char *path, const char *push_json, char **out_json, char **err);
+	// `delta_list_files` lived here from v57 until it was DELETED at v75 together with
+	// `fabricator_delta_mfr_scan`, its only caller (a C++ MultiFileReader spike that shipped registered but
+	// undocumented; the production Delta read path is the managed DeltaNativeReader, which builds its own
+	// read_parquet SQL and never crossed here). Removing a MID-STRUCT slot shifts every later field — the
+	// v30/v31/v47/v72 precedent — so the version bump is what makes a mismatched pair loud at boot.
 
 	// Delete a single onelake:// FILE (DataLakeFileClient.DeleteIfExists — idempotent). Appended at v61 so the
 	// onelake:// FileSystem supports RemoveFile: engineered-wood's commit rename is emulated as
@@ -967,7 +962,7 @@ typedef struct FabricatorHostServices {
 // state blob is this many bytes + a 4-byte length prefix). Serialize() must fit within it.
 #define FABRICATOR_AGG_SPILL_CAP 1024
 
-#define FABRICATOR_ABI_VERSION 74
+#define FABRICATOR_ABI_VERSION 75
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(FabricatorVTable) as seen

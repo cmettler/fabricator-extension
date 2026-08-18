@@ -44,9 +44,12 @@ Facts the design leans on, with the source locations:
   **can export both entry-symbol spellings** so the same bytes load under two filenames.
 - **An extension may LOAD another extension during its own load.** `ExtensionManager::BeginLoad`
   takes a per-extension lock (not a global one) and releases the manager's list lock before
-  loading (`extension_manager.cpp:73-110`); fabricator itself already autoloads `parquet`
-  inside its own registration (`fabricator_delta_mfr.cpp:204`). Chain-loading is a proven,
-  lock-safe pattern.
+  loading (`extension_manager.cpp:73-110`). Chain-loading is a proven, lock-safe pattern.
+  ⚠ The corroborating example this bullet used to cite — fabricator autoloading `parquet`
+  inside its own registration — is GONE (it lived in `fabricator_delta_mfr.cpp`, removed at
+  ABI v75), and fabricator now calls `AutoLoadExtension` NOWHERE. The claim rests on DuckDB's
+  own source above, which is where it always belonged; the installer's chain-load is the only
+  in-tree instance today.
 - **C-ABI (`C_STRUCT`) extensions are DuckDB-version-portable.** Their footer records a
   **C API version**, checked as `major == 1 && minor <= host minor`
   (`extension.cpp:60-78,106-114`) — one binary per platform spans DuckDB releases.
@@ -618,7 +621,8 @@ still needs no configuration.
 2. **The publish output path is not stable across hosts**: a Windows publish lands under
    `bin/x64/Release/...`, a WSL one under `bin/Release/...` (the platform segment appears only when the
    build sets `Platform`). The script probes both instead of assuming.
-3. **The csproj's kit-path guard earned its keep immediately** — the hardcoded `D:epos\...` default is
+3. **The csproj's kit-path guard earned its keep immediately** — the hardcoded `D:
+epos\...` default is
    meaningless in WSL, and the build failed with the actionable message instead of a NuGet
    "project not found". Pass `-p:DuckDBExtensionKitPath=/mnt/d/repos/DuckDB.ExtensionKit`.
 4. **Wheel/interpreter mismatch is a real friction point for the harness**: the cp310 wheel kept in

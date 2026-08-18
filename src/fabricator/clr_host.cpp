@@ -1015,24 +1015,6 @@ void OneLakeCloseWrite(FabricatorHandle file) {
 	}
 }
 
-std::string DeltaListFiles(const std::string &path, const std::string &push_json) {
-	const FabricatorVTable &vt = GetBridge();
-	if (!vt.delta_list_files) {
-		throw duckdb::IOException("Fabricator: bridge does not provide delta_list_files");
-	}
-	char *err = nullptr;
-	char *out_json = nullptr;
-	int32_t rc = vt.delta_list_files(path.c_str(), push_json.c_str(), &out_json, &err);
-	if (rc != FABRICATOR_OK) {
-		ThrowManagedError(vt, err, "Fabricator: delta_list_files failed");
-	}
-	std::string result = out_json ? out_json : "[]";
-	if (out_json && vt.free_error) {
-		vt.free_error(out_json);
-	}
-	return result;
-}
-
 std::string GenerateTableSql(FabricatorHandle handle, const std::string &schema, const std::string &func,
                              const std::string &catalog_name, ArrowArrayStream *args) {
 	const FabricatorVTable &vt = GetBridge();

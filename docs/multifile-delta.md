@@ -1,4 +1,30 @@
-# MultiFileReader + engineered-wood — native-parquet Delta path (design; Phase-A slices BUILDING)
+# MultiFileReader + engineered-wood — native-parquet Delta path (DESIGN RECORD; the spike is REMOVED)
+
+> **⚠⚠ READ THIS BEFORE ANYTHING BELOW IT. `fabricator_delta_mfr_scan` NO LONGER EXISTS — it was removed at
+> ABI v75 (2026-08-18, user-directed) together with the `delta_list_files` ABI entry, both its suites
+> (`verify_delta_mfr_scan` 36 + `verify_delta_mfr_dv` 23) and `DeltaReader.ListScanFilesJson`.** Everything
+> below describes a spike that WORKED and was never adopted: it was registered, deletion-vector correct and
+> green in both CI tiers, but absent from the README — a spike that shipped by accident, the same pattern as
+> `fabricator_delta_native_scan` except that one was WRONG and this one was correct and covered. Its header
+> comment claiming "slice 1a: file list only (no DV / partition / pushdown yet)" was itself stale; DV landed
+> in slice 1b.
+>
+> **The production Delta read path is, and always was, the managed `DeltaNativeReader`** — it builds its own
+> `read_parquet` SQL (four batched forms plus a per-file loop) and never crossed `delta_list_files`. So the
+> removal changes no answer, which is what the floor arithmetic asserts: 7558 - exactly 59 = 7499, no
+> surviving suite moved.
+>
+> **What was given up, stated plainly because it is real.** This was the only working prototype of "form (b)"
+> — a `MultiFileList` carrying `OpenFileInfo`s straight from the Delta snapshot, which is duckdb-iceberg's
+> architecture and the durable shape for a native read path. MEASURED 2026-08-18: native parquet does the same
+> 6M-row aggregate in **0.203 s** against **0.592 s** best-tuned through our Arrow boundary, i.e. form (b) is
+> worth ~3x where batch/thread tuning got 31%. Rebuilding it means rebuilding this file's design, which is why
+> the design survives the code. **"Move it to C# as a custom function" is NOT the fallback** — the entire point
+> is DuckDB's C++ `MultiFileReader` doing the read, and the C# expression of that idea already exists and IS
+> the production path.
+>
+> Read the rest as a design record and a measurement archive, never as a description of shipped behaviour.
+
 
 > **Phase-A slice 1a DONE (2026-07-03, ABI v57) — the real MultiFileReader integration:**
 > `fabricator_delta_mfr_scan(path)` clones `parquet_scan` and swaps in `FabricatorDeltaMultiFileReader` (a DuckDB

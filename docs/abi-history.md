@@ -1,4 +1,4 @@
-# ABI history — prior versions v16–v74
+# ABI history — prior versions v16–v75
 
 > Moved VERBATIM out of `CLAUDE.md` on 2026-07-29 (conservative split — see the commit message).
 > Append-only as-built history; the live summary + pointers stay in `CLAUDE.md`.
@@ -11,6 +11,53 @@
 > entries and the `table_*` session; v73: `table_info`/`table_stats` re-carried as ONE typed JSON doc each,
 > parsed with our own vcpkg yyjson, retiring the `ReadCapabilityFlag` string-find). v74 below is the
 > follow-on that finished the same job for ALTER.
+
+## v75 (2026-08-18) — `delta_list_files` DELETED with the MultiFileReader spike it served
+
+**BREAKING, no aliases. One vtable slot REMOVED from the MIDDLE of the struct**, so every later field
+shifts — the v30/v31/v47/v72 precedent. That is exactly why the version bump matters here: a stale
+loadable paired with a new bridge would read `onelake_remove` where `delta_list_files` used to sit and
+call it with the wrong signature. The bump makes the mismatch loud at boot instead.
+
+**What went, in one commit** (user-directed): `src/fabricator/fabricator_delta_mfr.{cpp,hpp}` +
+its `RegisterDeltaMultiFileScan(loader)` call and CMake source entry; the `delta_list_files` slot in
+`abi.h`; `DeltaListFiles` in `clr_host.{hpp,cpp}`, `Abi.cs` and `Bootstrap.cs`;
+`DeltaReader.ListScanFilesJson` + its async core; and both suites (`verify_delta_mfr_scan` 36,
+`verify_delta_mfr_dv` 23). Hermetic floors 71 → **69** and 7558 → **7499**.
+
+- **⚠ IT WAS NOT DEAD CODE, and the framing that reached me first ("dead code from a multifile reader we
+  only tested but never used") is half right in a way worth recording.** It WAS registered
+  (`loader.RegisterFunction`), WAS deletion-vector correct, and carried **59 assertions green in both CI
+  tiers**. What made it removable is that it is **absent from the README** — a spike that shipped by
+  accident. Same pattern as `fabricator_delta_native_scan`, except that one was WRONG (it served deleted
+  rows for months) and this one was correct and covered. ⚠ Its own header comment said *"Slice 1a: file
+  list only (no DV / partition / pushdown yet)"*, which had been STALE since slice 1b landed DV — so the
+  code understated itself, which is part of how it stayed invisible.
+- **The removal is answer-neutral BY CONSTRUCTION, and the floor arithmetic is the claim.** The
+  production Delta read path is the managed `DeltaNativeReader`, which builds its own `read_parquet` SQL
+  and never crossed this entry; `delta_list_files` had exactly ONE caller
+  (`fabricator_delta_mfr.cpp:154`) and `ListScanFilesJson` exactly one (`Bootstrap.cs`). 7558 − exactly
+  59 = 7499 says no surviving suite moved.
+- **It deletes the LAST core→Delta coupling in the C++ layer** — which is the reason to do it before the
+  Bridge assembly split rather than after: it removes the coupling outright instead of forcing it to be
+  abstracted across a new assembly boundary.
+- **⚠ A SIDE EFFECT NOT IN THE PLAN: fabricator now calls `ExtensionHelper::AutoLoadExtension` NOWHERE.**
+  The only call lived inside this registration (a best-effort `try`/`catch` for `parquet`, whose own
+  comment records that it resolves from DISK and never consults the statically linked set — so on our
+  builds it usually threw and was swallowed). Nothing regresses: query-time `read_parquet` autoloads
+  normally at bind, and the suites that need it already `require parquet` explicitly. But
+  [distribution-installer.md](distribution-installer.md) cited it as the in-tree proof that chain-loading
+  during load is lock-safe, so that citation was re-anchored to DuckDB's own source
+  (`extension_manager.cpp:73-110`), which is where the claim always belonged.
+- **⚠ WHAT IT COSTS, stated once so it is not rediscovered as a surprise.** This was the only working
+  prototype of "form (b)" — a `MultiFileList` carrying `OpenFileInfo`s straight from the snapshot,
+  duckdb-iceberg's shape and the durable form for a native read path. MEASURED 2026-08-18: native parquet
+  does the same 6M-row aggregate in **0.203 s** vs **0.592 s** best-tuned through our Arrow boundary, so
+  form (b) is worth ~3x where the batch/thread tuning of the preceding two commits got 31%. The DESIGN
+  survives in [multifile-delta.md](multifile-delta.md), whose header was rewritten from "Phase-A slices
+  BUILDING" to a removal-aware design record. **"Move it to C# as a custom function" is not the
+  fallback** — the whole point is DuckDB's C++ `MultiFileReader` doing the read, and the C# expression of
+  that idea already exists and IS the production path.
 
 ## v74 (2026-08-17) — `table_alter`: ALTER TABLE stops being five positional carriers
 

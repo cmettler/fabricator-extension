@@ -10,7 +10,6 @@
 
 #include "fabricator/clr_host.hpp"
 #include "fabricator/fabricator_onelake_fs.hpp"
-#include "fabricator/fabricator_delta_mfr.hpp"
 #include "fabricator/fabricator_variant.hpp"
 #include "catalog/fabricator_catalog.hpp"
 #include "catalog/fabricator_metadata.hpp"
@@ -509,7 +508,6 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	RegisterProviderSettings(loader);
 	fabricator::RegisterOneLakeFileSystem(loader.GetDatabaseInstance()); // onelake:// VFS subsystem (docs/filesystem-bridge.md §3)
-	fabricator::RegisterDeltaMultiFileScan(loader); // fabricator_delta_mfr_scan — native Delta read (docs/multifile-delta.md Phase A)
 	RegisterFabricatorGlobalFunctions(loader); // connection-free global functions (docs/global-functions.md)
 	RegisterFabricatorOptimizer(DBConfig::GetConfig(loader.GetDatabaseInstance()));
 	RegisterFabricatorInOutFinalizer(DBConfig::GetConfig(loader.GetDatabaseInstance()));

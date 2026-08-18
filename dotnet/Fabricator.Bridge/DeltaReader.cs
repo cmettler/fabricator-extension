@@ -525,66 +525,6 @@ internal static class DeltaReader
         }
     }
 
-    /// <summary>The active data files of the Delta table as a JSON array of objects <c>[{"path":"&lt;uri&gt;"}]</c>
-    /// for the C++ MultiFileReader (docs/multifile-delta.md Phase A). Slice 1a: paths only (the exact `add` set,
-    /// NOT a glob). Partition values + deletion vectors (later slices) become extra keys on each object; the
-    /// <paramref name="pushJson"/> pushed-filter arg is accepted now and applied for file pruning in a later
-    /// slice. Paths are absolute URIs (onelake:// for OneLake → native + cached).</summary>
-    public static string ListScanFilesJson(nint opener, string path, string? pushJson)
-        => ListScanFilesJsonAsync(opener, path, pushJson).GetAwaiter().GetResult();
-
-    private static async Task<string> ListScanFilesJsonAsync(nint opener, string path, string? pushJson)
-    {
-        var fs = TableFileSystems.Create(opener, path);
-        var table = await DeltaTable.OpenAsync(fs, DeltaWriter.Options()).ConfigureAwait(false);
-        try
-        {
-            var root = ToReadableRoot(path);
-            var dvReader = new EngineeredWood.DeltaLake.DeletionVectors.DeletionVectorReader(fs);
-            var sb = new StringBuilder("[");
-            bool first = true;
-            foreach (var add in table.CurrentSnapshot.ActiveFiles.Values)
-            {
-                if (!first)
-                {
-                    sb.Append(',');
-                }
-                first = false;
-                var uri = root + "/" + EngineeredWood.DeltaLake.DeltaPath.Decode(add.Path).Replace('\\', '/').TrimStart('/');
-                sb.Append("{\"path\":\"").Append(uri.Replace("\\", "\\\\").Replace("\"", "\\\"")).Append('"');
-                // Slice 1b — deletion vectors: resolve the file's DV to the deleted ROW POSITIONS (sorted), so the
-                // C++ MultiFileReader attaches a DeleteFilter and DuckDB's native read excludes them. Positions are
-                // relative to the file (0-based physical order), matching read_parquet's row order.
-                if (add.DeletionVector is not null)
-                {
-                    var deleted = await dvReader.ReadAsync(add.DeletionVector).ConfigureAwait(false);
-                    if (deleted.Count > 0)
-                    {
-                        var sorted = deleted.ToArray();
-                        System.Array.Sort(sorted);
-                        sb.Append(",\"dv\":[");
-                        for (int i = 0; i < sorted.Length; i++)
-                        {
-                            if (i > 0)
-                            {
-                                sb.Append(',');
-                            }
-                            sb.Append(sorted[i]);
-                        }
-                        sb.Append(']');
-                    }
-                }
-                sb.Append('}');
-            }
-            sb.Append(']');
-            return sb.ToString();
-        }
-        finally
-        {
-            await table.DisposeAsync().ConfigureAwait(false);
-        }
-    }
-
     // The table root as a URI DuckDB's native reader can open: an abfss-OneLake root → onelake:// (our VFS
     // subsystem, cached); everything else (local / s3 / already onelake://) passes through unchanged.
     internal static string ToReadableRoot(string path)

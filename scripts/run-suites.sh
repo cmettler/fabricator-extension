@@ -144,7 +144,12 @@ case "$TIER" in
         # COUNT to the optimizer at all. It returned null until then, so every Delta table was planned with
         # no cardinality while the consumer (FabricatorScanCardinality -> NodeStatistics) had existed all
         # along and SQL Server had been feeding it — the mutant's EXPLAIN carries no estimate line whatever.
-        : "${MIN_SUITES:=71}"
+        # 69 runs since 2026-08-18 — a DELIBERATE DECREASE, the only kind this floor accepts: the
+        # fabricator_delta_mfr_scan spike was REMOVED at ABI v75, taking verify_delta_mfr_scan (36) and
+        # verify_delta_mfr_dv (23) with it. It was NOT dead code — registered, deletion-vector correct and
+        # green in both tiers — but absent from the README, i.e. a spike that shipped by accident. Removing
+        # it also deletes the last core->Delta coupling in the C++ layer.
+        : "${MIN_SUITES:=69}"
         # 5656 since 2026-08-02: verify_delta_catalog_transactions 943 -> 944 Ã¢ÂÂ ROLLBACK now RECLAIMS the
         # data files the transaction eagerly wrote (EW #52's DiscardDataFilesAsync) instead of leaving them
         # for VACUUM. +2, not +1: that suite is one of the DOUBLED ones below, so an assertion added to it
@@ -314,7 +319,11 @@ case "$TIER" in
         # verify_delta_catalog_nested_alter 100 -> 127), so NO other suite moved. That is the claim that
         # matters for replacing alter_table's kind int + arg1/arg2/flags with one typed JSON doc: it is a
         # TRANSPORT change, so every ALTER answer must be identical.
-        : "${MIN_ASSERTIONS:=7558}"
+        # 7499 since 2026-08-18: 7558 - exactly the 59 assertions of the two deleted MFR suites (36 + 23),
+        # so NO surviving suite moved. That equality is the whole claim for a removal — the production Delta
+        # read path is the managed DeltaNativeReader and never crossed delta_list_files, so deleting the
+        # spike must change no other answer.
+        : "${MIN_ASSERTIONS:=7499}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

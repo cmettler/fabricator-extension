@@ -114,11 +114,6 @@ void OneLakeRemove(const std::string &path, const std::string &cred_json);
 // MoveFile semantics; backs DuckDB's COPY tmp-file staging, v64). Same-workspace only.
 void OneLakeMove(const std::string &src, const std::string &dest, const std::string &cred_json);
 
-// Delta native-read (MultiFileList): the active data files of the Delta table at `path` as a JSON array
-// [{"path":"<uri>", ...}] (the `add` set, not a glob). `push_json` = pushed filters (empty = none). The
-// managed side reads the _delta_log via the active opener (set via SetActiveOpener before this call).
-std::string DeltaListFiles(const std::string &path, const std::string &push_json);
-
 // SQL-generating table function (v68): generate the replacement SQL for one call. `handle` = 0 + empty
 // `schema`/`catalog_name` => the GLOBAL registry (resolve `func` by name); non-zero => the catalog's
 // registry, with `catalog_name` = the DuckDB ATTACH alias. `args` (nullable — no arguments) is the 1-row
