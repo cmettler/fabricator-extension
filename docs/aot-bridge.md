@@ -143,6 +143,16 @@ internal static class CompiledBackends
 The explicit `new` expressions double as **trim roots** — the linker keeps exactly the
 referenced providers; nothing else survives, which is the point.
 
+> **Update 2026-08-18 — the assembly split made this design STRICTLY easier, and closes the
+> "unchecked" note that hung over it.** When this was written, `DeltaBackend` was the one provider
+> the registry could not discover: it lived inside `Fabricator.Bridge` and was hard-registered by
+> `Add(map, new DeltaBackend())` after the assembly scan, so a generator enumerating *referenced
+> provider assemblies* would have had to special-case it. It is now its own assembly
+> (`Fabricator.Delta`) discovered by name like SqlServer and AnalysisServices, so "exactly the
+> referenced provider set" is now literally true and needs no exception. ⚠ The type name in the
+> sketch above is unchanged and still correct — the split kept the `Fabricator.Bridge` NAMESPACE;
+> only the assembly moved.
+
 ### `BackendRegistry` rework (benefits both SKUs)
 
 ```csharp

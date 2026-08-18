@@ -251,7 +251,7 @@ explicitly** to the filesystem instance (as we already do for DAX `DaxTokenAuth`
    MSI endpoint, but that is assumption, not yet tested. This is the shared entry point step 2's OneLake FS consumes.
 2. **`AdlsGen2TableFileSystem : ITableFileSystem` — DONE + LIVE-VALIDATED on Fabric (2026-07-02).** A full
    read/write filesystem on `Azure.Storage.Files.DataLake`
-   (`dotnet/Fabricator.Bridge/AdlsGen2TableFileSystem.cs`; named `OneLakeDataLakeFileSystem` until 2026-08-02,
+   (`dotnet/Fabricator.Delta/AdlsGen2TableFileSystem.cs`; named `OneLakeDataLakeFileSystem` until 2026-08-02,
    when plain ADLS Gen2 accounts started routing through it too — it had always parsed its endpoint host out
    of the `abfss://` path, so only the SELECTOR was OneLake-specific):
    `ListAsync` (GetPaths, 404→empty), `OpenReadAsync`/`ReadAllBytesAsync` (range GET + OpenRead), `CreateAsync`

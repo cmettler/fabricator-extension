@@ -20,6 +20,9 @@
   <ItemGroup>
     <ProjectReference Include="..\Fabricator.Abstractions\Fabricator.Abstractions.csproj" />
     <ProjectReference Include="..\Fabricator.Bridge\Fabricator.Bridge.csproj" />
+    <!-- The delta-rs provider hosts the shared delta.* catalog functions (DeltaFunctions) and resolves OneLake
+         roots through FabricLakehouse, both of which live with the built-in Delta provider. -->
+    <ProjectReference Include="..\Fabricator.Delta\Fabricator.Delta.csproj" />
     <!-- delta-dotnet (delta-rs + delta-kernel-rs FFI), sibling repo at D:\repos\delta-dotnet. Multi-targets
          net472;net8.0;net9.0; a net10 consumer resolves the net9.0 asset. Building this reference triggers
          delta-dotnet's cargo build of the two native crates (delta_rs_bridge / delta_kernel_ffi). -->

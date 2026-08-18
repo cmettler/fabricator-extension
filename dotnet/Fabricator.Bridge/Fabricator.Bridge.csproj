@@ -17,6 +17,19 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <!-- The Delta provider was carved out of THIS assembly on 2026-08-18 and is one logical unit with it,
+         split for dependency reasons (it is what dragged the engineered-wood submodule + AWSSDK.S3 into
+         Bridge, and therefore what kept tier 0 from referencing Bridge at all). It is NOT an API boundary,
+         so the ~20 host types it uses — HostFs, BoundInput, HostBatchFilter, ParquetTuning, the ambients —
+         stay `internal` rather than being made public just to cross a project file.
+         Deliberately NARROW: this grants exactly one assembly, and only in this direction. Bridge does not
+         reference Fabricator.Delta and must not — BackendRegistry discovers the provider by assembly name.
+         (It departs from the DeltaFunctions precedent, which was made `public` for Fabricator.DeltaRs; that
+         was ONE type crossing to an opt-in provider, where widening the surface was cheaper than a grant.) -->
+    <InternalsVisibleTo Include="Fabricator.Delta" />
+  </ItemGroup>
+
+  <ItemGroup>
     <PackageReference Include="Apache.Arrow" Version="23.0.0" />
     <!-- .NET logging: trace the native Delta reader (per-file queries, applied static/dynamic filters, pruned
          files, snapshot version). Off by default (NullLoggerFactory); env-driven file sink via FABRICATOR_LOG_LEVEL
@@ -39,9 +52,6 @@
          DROP TABLE (DuckDB's azure FileSystem has no RemoveDirectory). The Fabric API is kept only for the
          schema-enabled flag (GetLakehouse.DefaultSchema) + name->GUID resolution. Same SP credential throughout. -->
     <PackageReference Include="Azure.Storage.Files.DataLake" Version="12.21.0" />
-    <!-- S3 conditional-PUT commit rename (multi-writer Delta commits on S3/MinIO; httpfs's
-         exclusive-create is unguarded there) — see S3CommitFileSystem. -->
-    <PackageReference Include="AWSSDK.S3" Version="4.*" />
     <!-- ⚠ Microsoft.Data.SqlClient + Microsoft.Data.SqlClient.Extensions.Azure were declared HERE until
          2026-08-18 and used by NOTHING in this assembly. The only two matches in Bridge source are a comment
          in Bootstrap.cs saying it duck-types the provider error number "rather than reference
@@ -52,12 +62,5 @@
          use SqlClient at all. Do not re-add them here; add them to the assembly that calls them. -->
   </ItemGroup>
 
-  <!-- Lakehouse (Delta) reader: Curt Hagenlocher's engineered-wood (pure C#), IO delegated to DuckDB's
-       FileSystem via the host reverse-callbacks. In-tree git submodule at <repo>/engineered-wood (pinned to
-       the cmettler/engineered-wood fork; Apache.Arrow 23.0.0 aligned, net10.0). Init non-recursively
-       (git submodule update [init] engineered-wood) to skip EW's nested parquet-testing corpus. -->
-  <ItemGroup>
-    <ProjectReference Include="..\..\engineered-wood\src\EngineeredWood.DeltaLake.Table\EngineeredWood.DeltaLake.Table.csproj" />
-  </ItemGroup>
 
 </Project>

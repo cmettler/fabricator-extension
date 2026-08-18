@@ -46,7 +46,7 @@ wrapping, decides the shapes (scalar vs table, parameter and output encoding), a
 **The SDK is already shipped.** `Microsoft.Fabric.Api` (**2.18.0** since 2026-08-02; this section was
 researched against 2.14.0 and its findings re-verified on the new pin — §9i) is a `Fabricator.Bridge`
 PackageReference and is used in production code today:
-[FabricLakehouse.cs](../dotnet/Fabricator.Bridge/FabricLakehouse.cs) calls `GetLakehouse` (schema-enabled
+[FabricLakehouse.cs](../dotnet/Fabricator.Delta/FabricLakehouse.cs) calls `GetLakehouse` (schema-enabled
 flag + `sqlEndpointProperties`), `WorkspacesClient.ListWorkspaces` and `ItemsClient.ListItems`
 (name→GUID resolution), and `TablesClient.ListTables` (the Unity-Catalog alternative is raw HTTP in the
 same file). Dependencies are lean (netstandard2.0; Azure.Core + DiagnosticSource + IdentityModel.Tokens.Jwt
@@ -70,7 +70,7 @@ needed; the raw-HTTP template is `FabricLakehouse.ListTablesViaUnityCatalogAsync
 `scratchpad/fabricnb`'s LRO/job-polling loops).
 
 **The OneLake attach already knows everything a catalog-bound function needs.**
-[DeltaCatalog.cs](../dotnet/Fabricator.Bridge/DeltaCatalog.cs) holds `_root` (the attach URI) and
+[DeltaCatalog.cs](../dotnet/Fabricator.Delta/DeltaCatalog.cs) holds `_root` (the attach URI) and
 `_fabricCredential` (the resolved `TokenCredential`, published per-call to an AsyncLocal), and
 `FabricLakehouse.ParseOneLake(root)` extracts `(workspace, lakehouse)` — names or GUIDs, with
 `ResolveLakehouseId` handling both. So on
@@ -81,7 +81,7 @@ with zero arguments.
 **The function machinery fits, with two gaps.**
 - Global functions: `IBackend.Global*` unioned across backends in
   [GlobalFunctions.cs](../dotnet/Fabricator.Bridge/GlobalFunctions.cs); the Bridge-resident
-  [DeltaGlobalTableFunction.cs](../dotnet/Fabricator.Bridge/DeltaGlobalTableFunction.cs)
+  [DeltaGlobalTableFunction.cs](../dotnet/Fabricator.Delta/DeltaGlobalTableFunction.cs)
   (`fabricator_delta_scan`) is the precedent for declaring a pure-Bridge function through the
   always-present SqlServer backend's [CustomFunctions.cs](../dotnet/Fabricator.SqlServer/CustomFunctions.cs)
   arrays. Table functions get **args at Bind** (arg-dependent output schema is proven by `cf_columns`).
@@ -499,7 +499,7 @@ not, and both were predicted by the "docs lie about SP support" risk row.
 | `FunctionsMetadata` — the kind-6 stream built IN MEMORY | `dotnet/Fabricator.Bridge/FunctionsMetadata.cs` |
 | `CatalogFunctionSet` — provider-agnostic registry + the five ABI members, `__all__` schema sentinel | `dotnet/Fabricator.Bridge/CatalogFunctionSet.cs` |
 | `ArrowSchemaExport` — the empty-parameter-schema export Apache.Arrow cannot do | `dotnet/Fabricator.Bridge/ArrowSchemaExport.cs` |
-| Delta catalog hosting (metadata kind + 5 members, OneLake-gated Fabric registration) | `dotnet/Fabricator.Bridge/DeltaCatalog.cs` |
+| Delta catalog hosting (metadata kind + 5 members, OneLake-gated Fabric registration) | `dotnet/Fabricator.Delta/DeltaCatalog.cs` |
 | `fab_delta_info()` — attach diagnostics + the zero-arg canary | `dotnet/Fabricator.Bridge/DeltaCatalogInfoFunction.cs` |
 | `FabricApiClient` / `FabricApiContext` — SDK wrapper, name→GUID cache, error normalization | `dotnet/Fabricator.Bridge/FabricApi/FabricApiClient.cs` |
 | the P0 functions | `dotnet/Fabricator.Bridge/FabricApi/FabricApiFunctions.cs` |

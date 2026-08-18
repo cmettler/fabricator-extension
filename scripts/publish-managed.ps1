@@ -115,6 +115,14 @@ Publish-Project $appProj "Fabricator.SqlServer"
 $daxProj = Join-Path $PSScriptRoot "../dotnet/Fabricator.AnalysisServices/Fabricator.AnalysisServices.csproj" | Resolve-Path
 Publish-Project $daxProj "Fabricator.AnalysisServices"
 
+# The built-in Delta provider, carved out of Fabricator.Bridge on 2026-08-18. It is a PROJECT REFERENCE of
+# Fabricator.SqlServer (external tables write Delta), so its DLLs already ride in on that publish — this
+# line exists so the payload is correct even if the composition root ever stops referencing it, and so the
+# assembly is named in one obvious place. BackendRegistry discovers it BY NAME, last in the default
+# FABRICATOR_BACKEND_ASSEMBLY list so SqlServer stays the default provider.
+$deltaBuiltinProj = Join-Path $PSScriptRoot "../dotnet/Fabricator.Delta/Fabricator.Delta.csproj" | Resolve-Path
+Publish-Project $deltaBuiltinProj "Fabricator.Delta"
+
 # Optional third provider: Fabricator.DeltaRs (delta-rs via delta-dotnet). Published into the SAME fabricator/
 # dir so the bridge discovers it by assembly name. Brings DeltaLake.dll + the two native Rust DLLs
 # (delta_rs_bridge.dll / delta_kernel_ffi.dll, ~240 MB) — hence opt-in via -IncludeDeltaRs.

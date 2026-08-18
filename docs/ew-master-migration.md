@@ -2277,7 +2277,7 @@ crash only occurs on export to DuckDB, so the Bridge can hold a canonical `Varia
 #### DONE: the READ half has moved (2026-08-04). 649 → 469 insertions.
 
 Built and gated. The Bridge now owns the canonical⇄blob conversion in
-`Fabricator.Bridge/VariantTransport.cs` (~330 lines, one layout each way instead of four) and applies it at
+`Fabricator.Delta/VariantTransport.cs` (~330 lines, one layout each way instead of four) and applies it at
 **three** boundaries — not the two originally planned:
 
 | boundary | direction |

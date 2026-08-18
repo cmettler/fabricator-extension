@@ -103,7 +103,15 @@ public static class BackendRegistry
         {
             // Default to every shipped provider; a missing/unloadable assembly is skipped below, so listing
             // Fabricator.AnalysisServices here is harmless when only the SqlServer provider is published.
-            names = "Fabricator.SqlServer,Fabricator.AnalysisServices,Fabricator.DeltaRs";
+            //
+            // ⚠ ORDER IS LOAD-BEARING, and Fabricator.Delta must stay LAST. Until 2026-08-18 the Delta
+            // provider lived in this assembly and was registered by hand AFTER this loop, with a comment
+            // saying it went there so a scanned provider stayed the default. That was not decoration:
+            // Default() falls through to map.Values.Distinct().First(), i.e. Dictionary INSERTION order, so
+            // whichever provider is registered first becomes the default for every call site that carries no
+            // provider name. Delta is now discovered like the others, so its POSITION IN THIS STRING is what
+            // preserves that — prepend it and SqlServer silently stops being the default.
+            names = "Fabricator.SqlServer,Fabricator.AnalysisServices,Fabricator.DeltaRs,Fabricator.Delta";
         }
         foreach (var assemblyName in names.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
         {
@@ -118,10 +126,6 @@ public static class BackendRegistry
             }
         }
         ScanPluginDirectories(map);
-        // The built-in Delta provider lives in the Bridge (alongside DeltaReader / engineered-wood), so it isn't
-        // found by the assembly scan above — register it explicitly. Added AFTER the scan so a scanned provider
-        // (SqlServer) stays the default; it's just another provider keyed by name "delta".
-        Add(map, new DeltaBackend());
         if (map.Count == 0)
         {
             Add(map, new StubBackend());

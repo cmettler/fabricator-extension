@@ -1,0 +1,57 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Library</OutputType>
+    <!-- ⚠ SAME NAMESPACE AS Fabricator.Bridge, DELIBERATELY. This is an ASSEMBLY split, not a namespace
+         reorganisation (user decision, 2026-08-18: "split by assembly, group by directory, keep the
+         namespace"). It follows the precedent already in the tree — Fabricator.Abstractions is a separate
+         assembly in this same namespace — and it is why the extraction needed no `using` churn across four
+         projects. Do not "tidy" this into Fabricator.Delta.* later without a reason bigger than symmetry. -->
+    <RootNamespace>Fabricator.Bridge</RootNamespace>
+    <AssemblyName>Fabricator.Delta</AssemblyName>
+    <Description>
+      The built-in Delta Lake provider: the folder-as-catalog (DeltaCatalog), both readers (the
+      engineered-wood codec reader and the native read_parquet one), the writer seams, the
+      ITableFileSystem implementations (host FS / ADLS Gen2 / S3 conditional-PUT), and the buffered
+      transaction. Split out of Fabricator.Bridge on 2026-08-18: it was ~53% of that assembly and the
+      only reason Bridge project-referenced the engineered-wood submodule.
+    </Description>
+    <EnableDynamicLoading>true</EnableDynamicLoading>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Apache.Arrow" Version="23.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Logging" Version="9.0.0" />
+    <ProjectReference Include="..\Fabricator.Abstractions\Fabricator.Abstractions.csproj" />
+    <!-- The host: the ABI, the Arrow interop, the function machinery, HostFs (DuckDB's FileSystem over the
+         reverse callbacks) and the onelake:// VFS forwarder. The dependency is one-way — Bridge does NOT
+         reference this project; BackendRegistry discovers DeltaBackend by assembly name, exactly as it
+         already does for the SqlServer and AnalysisServices providers. -->
+    <ProjectReference Include="..\Fabricator.Bridge\Fabricator.Bridge.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Fabric REST API: OneLake lakehouse table discovery (FabricLakehouse) — DuckDB's azure glob cannot
+         enumerate a OneLake _delta_log tree, so the table list comes from the REST catalog. -->
+    <PackageReference Include="Microsoft.Fabric.Api" Version="2.18.0" />
+    <PackageReference Include="Azure.Identity" Version="1.21.0" />
+    <!-- ADLS Gen2 DFS: the Delta LOG filesystem for a credentialed abfss:// root. The direct SDK is what
+         makes the commit CONDITIONAL (put-if-absent / If-None-Match); duckdb-azure's ExclusiveCreate is a
+         client-side existence check and races — measured 41 of 48 commits landing, six losses silent. -->
+    <PackageReference Include="Azure.Storage.Files.DataLake" Version="12.21.0" />
+    <!-- S3: the conditional-PUT commit filesystem (S3CommitFileSystem). Same reason as the ADLS one — the
+         host-FS EXCLUSIVE_CREATE emulation is unguarded on s3, which loses commits SILENTLY. -->
+    <PackageReference Include="AWSSDK.S3" Version="4.*" />
+  </ItemGroup>
+
+  <!-- Lakehouse (Delta) engine: Curt Hagenlocher's engineered-wood (pure C#), IO delegated to DuckDB's
+       FileSystem via the host reverse-callbacks. In-tree git submodule at <repo>/engineered-wood, pinned to
+       clast-project/engineered-wood main with NO patches. Init non-recursively
+       (`git submodule update` with `init` and no `recursive`) to skip EW's nested parquet-testing corpus.
+       ⚠ THIS is the reference the split exists to move: while it sat on Fabricator.Bridge, tier 0's
+       Fabricator.Bridge.Tests could not reference Bridge at all and had to link individual source files. -->
+  <ItemGroup>
+    <ProjectReference Include="..\..\engineered-wood\src\EngineeredWood.DeltaLake.Table\EngineeredWood.DeltaLake.Table.csproj" />
+  </ItemGroup>
+
+</Project>
