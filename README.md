@@ -888,6 +888,36 @@ renamed but not removed).
 
 Remote URLs are refused — download the archive first.
 
+**A plugin may not take a provider name that is already registered.** An `IBackend` declaring `sqlserver`,
+`delta`, `dax` or `deltars` is **refused**, and `fabricator_plugins()` reports it as `rejected` naming both
+what it claimed and who already had it. Registration is a plain overwrite underneath, so without the refusal
+such a plugin would silently replace the first-party provider and every later `ATTACH` would go somewhere you
+did not choose.
+
+### `fabricator_uninstall_plugin(name [, version := …] [, root := …]) -> TABLE`
+
+Takes a plugin out of the scan, and reclaims its files when it can. One row per installed version; omitting
+`version` removes them all.
+
+```sql
+SET fabricator_allow_plugin_install = true;      -- the same switch gates uninstalling
+SELECT name, version, removed, purged, detail FROM fabricator_uninstall_plugin('myplugin');
+```
+
+| column | meaning |
+|---|---|
+| `removed` | it is **out of the scan** — the provider stops resolving immediately. `false` is the only real failure |
+| `purged` | the **files are gone**. `false` is ordinary, not an error — see below |
+
+**Why those are two columns.** An assembly loaded from a file is locked on Windows and the extension's load
+context cannot be unloaded, so a plugin that has been *used* in this process cannot be deleted — but it *can*
+be renamed. Uninstalling moves the version directory into a hidden `.trash` folder under the plugin root,
+which takes it out of the scan at once; the bytes are swept on a later install or uninstall, by which time a
+restart has usually released the lock.
+
+⚠ The provider stops resolving, but the code stays in memory until the process exits — nothing can unload it.
+The re-scan simply stops finding a candidate, so it is no longer registered.
+
 ### `fabricator_host_query(sql) -> TABLE`
 
 Run a query on **DuckDB itself** and stream the result back through the extension. Mostly an internal

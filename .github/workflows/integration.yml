@@ -70,6 +70,11 @@ jobs:
           # target is a build hook, so a rename or a Condition change would silently stop producing it and
           # the suite would then merely SKIP — green, with the coverage gone.
           ls dotnet/Fabricator.SamplePlugin/bin/Release/net8.0/linux-x64/Fabricator.SamplePlugin.plugin.zip
+          # The COLLIDING fixture: an IBackend claiming the first-party name 'sqlserver', which
+          # verify_plugin_install points a second plugin root at to pin that the scan REFUSES it. Its csproj
+          # fixes the output path (no TFM, no RID) precisely so the runner and this line can name it.
+          dotnet build dotnet/Fabricator.CollidingPlugin -c Release --nologo
+          ls build/test-plugins/collide/Fabricator.CollidingPlugin.dll
 
       - name: Generate the MinIO TLS certificate
         # SQL Server's s3:// connector REFUSES plain HTTP, so MinIO must serve TLS even in tests. The

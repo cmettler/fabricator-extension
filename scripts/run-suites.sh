@@ -438,7 +438,13 @@ case "$TIER" in
         # re-discovery can produce - while its global function is STILL absent, which is the documented half
         # of the split (loader.RegisterFunction is permitted only during Extension::Load()). Mutation-tested
         # with two mutants, each killed at its own section.
-        : "${MIN_ASSERTIONS:=2066}"
+        # 2080 since 2026-08-18: verify_plugin_install 31 -> 45 for UNINSTALL and the provider-name
+        # collision REFUSAL. The collision needed a SECOND assembly (Fabricator.CollidingPlugin, pointed at
+        # by a second plugin root) because no manifest or install argument can make two assemblies claim one
+        # name. Its load-bearing assertion is the positive control - mssql_mars still registered, i.e. the
+        # first-party provider still holds the name; "the plugin was rejected" alone would pass on a build
+        # where BOTH were broken.
+        : "${MIN_ASSERTIONS:=2080}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2
@@ -667,8 +673,18 @@ while IFS="$(printf '\t')" read -r suite provider batchrows; do
     # - verify_plugin above all - needs the real directory.
     case "$suite" in
         *verify_plugin_install.test)
+            # TWO roots: an empty one to install into, plus the COLLIDING TEST FIXTURE
+            # (dotnet/Fabricator.CollidingPlugin, an IBackend claiming the first-party name 'sqlserver').
+            # The refusal needs two assemblies claiming one name, which no manifest or install argument can
+            # manufacture - so without this second root that behaviour is unreachable from SQL. Its output
+            # path is FIXED by its csproj precisely so this line needs no TFM or RID in it.
             install_plugin_dir=$(mktemp -d)
-            export FABRICATOR_PLUGIN_DIR="$install_plugin_dir"
+            # RELATIVE on purpose: the managed side resolves a root with Path.GetFullPath against the PROCESS
+            # working directory, and this script cd's to the repo root. An absolute "$PWD/..." is wrong under
+            # Git Bash, where $PWD is an MSYS path (/d/repos/...) that .NET turns into D:\d
+epos\... - which
+            # reports as root_missing rather than failing, i.e. it looks like the fixture simply is not there.
+            export FABRICATOR_PLUGIN_DIR="$install_plugin_dir,build/test-plugins/collide"
             ;;
         *)
             export FABRICATOR_PLUGIN_DIR="$FABRICATOR_PLUGIN_DIR_REAL"

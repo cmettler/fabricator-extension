@@ -214,15 +214,42 @@ where the registration default (`false`) sits. An enabled function then reports 
   directory put a second copy of the plugin under the now-RECURSIVE scan and `verify_plugin` duly reported TWO
   loaded plugins. Measured, not theorised — that is how the line came to be written.
 
+### Uninstall, and the shadowing refusal (BUILT 2026-08-18)
+
+**`fabricator_uninstall_plugin(name [, version := ...] [, root := ...])` MOVES, it does not delete**, and that
+is the mechanism rather than a limitation. A loaded assembly is locked on Windows and the load context is not
+collectible, so a plugin that has been USED cannot be deleted -- but it can be RENAMED. Moving the version
+directory into `<root>/.trash/<guid>` takes it out of the scan immediately (the trash is hidden by its leading
+dot), which is the mark-for-deletion the sketch called for, arrived at without inventing a marker file. The
+bytes go when they can: a best-effort delete now, plus a SWEEP of the whole trash at the start of the next
+install or uninstall -- by which time a restart has usually released the lock.
+
+- **`removed` and `purged` are separate columns because they are separate questions.** Out of the scan
+  (`removed`) is the only real failure when false; bytes reclaimed (`purged`) is ORDINARILY false. One boolean
+  would make the normal outcome look like a failure.
+- ⚠ **The provider stops resolving; the code does not go away.** Nothing can unload the assembly. The
+  guarantee is that the re-scan finds no candidate and does not register it -- worth stating rather than
+  implying the plugin is gone.
+- The sweep runs at install/uninstall only, never on a read path: sweeping during a scan would put filesystem
+  writes on the ATTACH path.
+
+**A plugin may not take a registered provider's name -- REFUSED.** `BackendRegistry.Add` is a plain dictionary
+assignment, so a plugin declaring `IBackend.Name = "sqlserver"` used to REPLACE the first-party provider and be
+reported as an ordinary `loaded` row: every later ATTACH going somewhere the user never chose. Of the three
+options, refusing is the only one that cannot end in a wrong ANSWER; an override mechanism, if ever wanted,
+should be something the USER asks for by name rather than something a file appearing in a directory can do.
+
+- ⚠ Checked BEFORE anything is added, so an assembly whose SECOND backend collides does not leave its first
+  half-registered. The throw rides the scan's existing per-candidate handler, so the plugin is `rejected` with
+  a message naming both sides and every other plugin still loads. Aliases are checked too.
+- **The fixture had to be a second assembly** (`dotnet/Fabricator.CollidingPlugin`): a name collision needs two
+  assemblies claiming one name, and nothing in a manifest, a root or an install argument can manufacture that.
+  It could not live inside `Fabricator.SamplePlugin` either, since the refusal is all-or-nothing per assembly.
+
 ### What is still NOT built
 
-- **Uninstall.** Needs mark-for-deletion semantics (a loaded assembly cannot be removed) and a decision about
-  what a half-removed plugin looks like to the scan.
-- **A plugin can still SHADOW a built-in provider silently.** `BackendRegistry.Add` is an overwrite, so a
-  plugin naming its `IBackend` `sqlserver` replaces the first-party provider and the scan reports it as an
-  ordinary `loaded` row. Pre-existing; the report is the natural place to name a displaced provider, but the
-  choice between report / refuse / allow-as-override has not been taken.
 - **Signature or checksum verification** of an archive. `Hashing` is there; nothing consumes it here.
+- **Per-plugin ALC isolation** -- see the sequenced recommendation below. Still correctly deferred.
 
 ## The original sketch — kept because every prediction in it held
 

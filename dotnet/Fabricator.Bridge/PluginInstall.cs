@@ -9,6 +9,13 @@ using Fabricator.Installer;
 
 namespace Fabricator.Bridge;
 
+/// <summary>What one uninstall did to ONE installed version. A column set of
+/// <c>fabricator_uninstall_plugin()</c>.</summary>
+/// <param name="Removed">False when the directory could not even be moved aside — the only outcome that
+/// leaves the plugin discoverable, and therefore the one a caller has to look at.</param>
+internal sealed record PluginUninstallResult(
+    string Name, string Version, string Path, bool Removed, bool Purged, string Detail);
+
 /// <summary>What one install did. Every field is a column of <c>fabricator_install_plugin()</c>.</summary>
 internal sealed record PluginInstallResult(
     string Name, string Version, string Platform, string Destination,
@@ -77,6 +84,9 @@ internal static class PluginInstall
         string platform = await ResolvePlatformAsync().ConfigureAwait(false);
 
         Directory.CreateDirectory(root);
+        // Reclaim whatever a previous uninstall (or a replace) could not delete while it was loaded. Here
+        // rather than on any read path: this is a moment the user is already managing the root.
+        SweepTrash(root);
         string staging = Path.Combine(root, StagingDirectory, Guid.NewGuid().ToString("n"));
         PluginManifest manifest;
         int written;
@@ -318,7 +328,136 @@ internal static class PluginInstall
                 "for the per-file reason");
     }
 
-    private static void TryDelete(string directory)
+    /// <summary>
+    /// Uninstalls every installed version of <paramref name="name"/>, or one named version.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>IT IS A MOVE, NOT A DELETE, AND THAT IS THE WHOLE MECHANISM.</b> An assembly loaded from a
+    /// file is LOCKED on Windows and the bridge's load context is not collectible, so a plugin that has been
+    /// used in this process CANNOT be deleted. It CAN be renamed. Moving the version directory into
+    /// <c>&lt;root&gt;/.trash/&lt;guid&gt;</c> takes it out of the scan immediately — the trash path is hidden
+    /// from <see cref="PluginPaths.EnumerateCandidates"/> by its leading dot — which is the mark-for-deletion
+    /// the design called for, arrived at without inventing a marker file.</para>
+    /// <para>The bytes then go whenever they can: a best-effort delete right away, and a sweep of the whole
+    /// trash on the next install or uninstall, by which time a restart has usually released the lock. So the
+    /// row reports TWO things and they are not the same question — <c>Removed</c> (is it out of the scan?)
+    /// and <c>Purged</c> (are the bytes gone?). Only the first is a failure when false.</para>
+    /// <para>⚠ The PROVIDER disappears from this session, but the ASSEMBLY does not: it stays loaded, because
+    /// nothing can unload it. What the re-scan does is stop finding a candidate for it, so it is not
+    /// registered into the fresh map — an uninstalled provider stops resolving at ATTACH even though its code
+    /// is still in memory. That is the strongest guarantee available here, and it is worth stating rather
+    /// than implying the code is gone.</para>
+    /// </remarks>
+    public static IReadOnlyList<PluginUninstallResult> Uninstall(string name, string? version, string? rootOverride)
+    {
+        if (!HostSettings.AllowPluginInstall)
+        {
+            throw new InvalidOperationException(
+                $"fabricator_uninstall_plugin is disabled. It removes files under a plugin root from a path " +
+                $"chosen in SQL, so it rides the same opt-in as installing: " +
+                $"SET {HostSettings.AllowPluginInstallName} = true.");
+        }
+        if (string.IsNullOrWhiteSpace(name) || !PluginPackage.IsSafeSegment(name))
+        {
+            throw new ArgumentException(
+                $"fabricator_uninstall_plugin: '{name}' is not a usable plugin name.");
+        }
+        if (version != null && !PluginPackage.IsSafeSegment(version))
+        {
+            throw new ArgumentException(
+                $"fabricator_uninstall_plugin: '{version}' is not a usable version.");
+        }
+        string root = ResolveRoot(rootOverride);
+        SweepTrash(root);
+        string pluginDir = Path.Combine(root, name);
+        if (!Directory.Exists(pluginDir))
+        {
+            throw new InvalidOperationException(
+                $"fabricator_uninstall_plugin: '{name}' is not installed under '{root}'.");
+        }
+        var versions = version is null
+            ? Directory.GetDirectories(pluginDir).Select(Path.GetFileName).Where(v => v is { Length: > 0 })
+                       .OrderBy(v => v, StringComparer.OrdinalIgnoreCase).ToArray()!
+            : new[] { version };
+        var results = new List<PluginUninstallResult>();
+        foreach (var v in versions)
+        {
+            string dir = Path.Combine(pluginDir, v!);
+            if (!Directory.Exists(dir))
+            {
+                throw new InvalidOperationException(
+                    $"fabricator_uninstall_plugin: '{name}' version '{v}' is not installed under '{root}'.");
+            }
+            string trash = Path.Combine(root, TrashDirectory, Guid.NewGuid().ToString("n"));
+            Directory.CreateDirectory(Path.Combine(root, TrashDirectory));
+            try
+            {
+                Directory.Move(dir, trash);
+            }
+            catch (Exception ex)
+            {
+                // The ONE outcome that leaves the plugin discoverable. Reported per version rather than
+                // thrown, so uninstalling several versions does not stop at the first locked one.
+                results.Add(new PluginUninstallResult(name, v!, dir, Removed: false, Purged: false,
+                                                      $"could not move it out of the scan: {ex.Message}"));
+                continue;
+            }
+            bool purged = TryDelete(trash);
+            results.Add(new PluginUninstallResult(
+                name, v!, dir, Removed: true, purged,
+                purged
+                    ? "removed"
+                    : "removed from the scan; the files are held by this process (a loaded assembly cannot be " +
+                      "deleted) and are swept on a later install or uninstall"));
+        }
+        // Leave no empty <root>/<name>/ behind — it would read as an installed plugin with no versions.
+        try
+        {
+            if (Directory.Exists(pluginDir) && Directory.GetFileSystemEntries(pluginDir).Length == 0)
+            {
+                Directory.Delete(pluginDir);
+            }
+        }
+        catch
+        {
+        }
+        BackendRegistry.Invalidate();
+        _ = BackendRegistry.All().Count(); // force the re-scan, so the provider stops resolving NOW
+        return results;
+    }
+
+    /// <summary>
+    /// Best-effort deletion of everything parked in <c>&lt;root&gt;/.trash</c>.
+    /// </summary>
+    /// <remarks>
+    /// Called at the START of an install and an uninstall — i.e. at the moments a user is already managing
+    /// this root, and the moments most likely to follow a restart that released whatever lock kept the bytes
+    /// alive. Never on a read path: sweeping during a scan would put filesystem writes on the ATTACH path.
+    /// Failures are silent BY DESIGN; anything left is inert, since the trash is hidden from the scan.
+    /// </remarks>
+    private static void SweepTrash(string root)
+    {
+        string trash = Path.Combine(root, TrashDirectory);
+        if (!Directory.Exists(trash))
+        {
+            return;
+        }
+        try
+        {
+            foreach (var dir in Directory.GetDirectories(trash))
+            {
+                TryDelete(dir);
+            }
+        }
+        catch
+        {
+        }
+    }
+
+    /// <summary>Best-effort recursive delete. Returns whether the directory is gone — the uninstall path
+    /// needs that answer, because "out of the scan" and "bytes reclaimed" are different questions and a
+    /// loaded assembly makes the second one frequently No.</summary>
+    private static bool TryDelete(string directory)
     {
         try
         {
@@ -326,11 +465,13 @@ internal static class PluginInstall
             {
                 Directory.Delete(directory, recursive: true);
             }
+            return true;
         }
         catch
         {
             // Best effort. A staging or trash directory we cannot remove is inert: both are hidden from the
             // scan by their leading dot, so leaving one costs disk and nothing else.
+            return false;
         }
     }
 }

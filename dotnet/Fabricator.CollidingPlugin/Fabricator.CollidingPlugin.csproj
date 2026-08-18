@@ -1,0 +1,36 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Library</OutputType>
+    <RootNamespace>Fabricator.Bridge</RootNamespace>
+    <AssemblyName>Fabricator.CollidingPlugin</AssemblyName>
+    <!--
+      A TEST FIXTURE, not a shipped plugin: an IBackend that deliberately claims a first-party provider name,
+      so verify_plugin_install can pin that the scan REFUSES it. Without a second assembly the refusal is
+      unreachable from SQL — a provider name collision needs two assemblies claiming one name, and no
+      manifest, root or install argument can manufacture that.
+    -->
+    <Description>Test fixture: a plugin that claims the 'sqlserver' provider name and must be refused.</Description>
+
+    <!--
+      ⚠ ONE TFM AND A FIXED OUTPUT PATH, both to keep the fixture at a path the runner and CI can name
+      without interpolating a TFM or a RID. Directory.Build.props cross-targets net10.0;net8.0 and sets a
+      RID, which would put this at bin/Release/<tfm>/<rid>/ and force every consumer to know both. net8.0
+      because a plugin loads into the bridge's context and net8.0 runs on either SKU.
+    -->
+    <TargetFrameworks></TargetFrameworks>
+    <TargetFramework>net8.0</TargetFramework>
+    <RuntimeIdentifier></RuntimeIdentifier>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <AppendRuntimeIdentifierToOutputPath>false</AppendRuntimeIdentifierToOutputPath>
+    <OutputPath>$(MSBuildThisFileDirectory)..\..\build\test-plugins\collide\</OutputPath>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Host-provided, exactly like a real plugin: binding to the RUNNING bridge's contract is what makes
+         this assembly's IBackend the same type the registry checks against. -->
+    <ProjectReference Include="..\Fabricator.Abstractions\Fabricator.Abstractions.csproj" Private="false" />
+  </ItemGroup>
+
+</Project>

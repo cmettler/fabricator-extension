@@ -26,7 +26,109 @@ internal static class HostGlobalFunctions
     {
         new PluginsFunction(),
         new InstallPluginFunction(),
+        new UninstallPluginFunction(),
     };
+}
+
+/// <summary>
+/// <c>SELECT * FROM fabricator_uninstall_plugin('&lt;name&gt;' [, version := …] [, root := …])</c> — takes a
+/// plugin out of the scan, and reclaims its bytes when it can.
+/// </summary>
+/// <remarks>
+/// One row per installed version it acted on, so uninstalling a plugin with three versions says what happened
+/// to each rather than collapsing to a single boolean. Omitting <c>version</c> removes them ALL — deliberate,
+/// because the common intent is "get rid of this plugin", and the per-version form is there for the case where
+/// it is not.
+/// </remarks>
+internal sealed class UninstallPluginFunction : ITableFunction
+{
+    public string Name => "fabricator_uninstall_plugin";
+
+    public Schema Parameters { get; } = new(new[]
+    {
+        Params.Positional("name", StringType.Default),
+        // Omitted => every installed version.
+        Params.Named("version", StringType.Default),
+        Params.Named("root", StringType.Default),
+    }, metadata: null);
+
+    public ITableFunctionBinding Bind(RecordBatch args) =>
+        new Binding(ReadString(args, 0) ?? string.Empty, ReadString(args, 1), ReadString(args, 2));
+
+    private static string? ReadString(RecordBatch args, int ordinal) =>
+        args.Column(ordinal) is StringArray a && a.Length > 0 && !a.IsNull(0) ? a.GetString(0) : null;
+
+    private sealed class Binding : ITableFunctionBinding
+    {
+        private readonly string _name;
+        private readonly string? _version;
+        private readonly string? _root;
+
+        public Binding(string name, string? version, string? root)
+        {
+            _name = name;
+            _version = version;
+            _root = root;
+        }
+
+        public Schema OutputSchema { get; } = new(new[]
+        {
+            new Field("name", StringType.Default, nullable: false),
+            new Field("version", StringType.Default, nullable: false),
+            new Field("path", StringType.Default, nullable: false),
+            // Out of the scan. FALSE is the only real failure — it means the plugin is still discoverable.
+            new Field("removed", BooleanType.Default, nullable: false),
+            // Bytes reclaimed. FALSE is ORDINARY: a loaded assembly cannot be deleted, so it is swept later.
+            new Field("purged", BooleanType.Default, nullable: false),
+            new Field("detail", StringType.Default, nullable: false),
+        }, metadata: null);
+
+        public bool SupportsFilterPushdown => false;
+        public bool SupportsProjectionPushdown => false;
+
+        public void Dispose()
+        {
+        }
+
+        // Same contract as the installer: dispose in a PLAIN method, and capture the ambients HERE — the
+        // iterator body runs at the first batch pull, a different crossing, where AmbientOpener and the
+        // settings session are gone. Reading the opt-in there would make an enabled function report itself
+        // disabled, non-deterministically. Measured on the install path; not repeated here.
+        public IAsyncEnumerable<RecordBatch> Execute(TableFunctionScan scan, CancellationToken ct = default)
+        {
+            scan.FilterValues?.Dispose();
+            return Rows(AmbientOpener.Current, ProviderSettingsStore.CurrentSession, ct);
+        }
+
+        private async IAsyncEnumerable<RecordBatch> Rows(nint opener, long session,
+                                                        [EnumeratorCancellation] CancellationToken ct)
+        {
+            AmbientOpener.Current = opener;
+            ProviderSettingsStore.CurrentSession = session;
+            ct.ThrowIfCancellationRequested();
+            await Task.CompletedTask;
+            var rows = PluginInstall.Uninstall(_name, _version, _root);
+            var name = new StringArray.Builder();
+            var version = new StringArray.Builder();
+            var path = new StringArray.Builder();
+            var removed = new BooleanArray.Builder();
+            var purged = new BooleanArray.Builder();
+            var detail = new StringArray.Builder();
+            foreach (var r in rows)
+            {
+                name.Append(r.Name);
+                version.Append(r.Version);
+                path.Append(r.Path);
+                removed.Append(r.Removed);
+                purged.Append(r.Purged);
+                detail.Append(r.Detail);
+            }
+            yield return new RecordBatch(OutputSchema, new IArrowArray[]
+            {
+                name.Build(), version.Build(), path.Build(), removed.Build(), purged.Build(), detail.Build(),
+            }, rows.Count);
+        }
+    }
 }
 
 /// <summary>

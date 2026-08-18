@@ -50,11 +50,46 @@ SELECT count(*) FROM duckdb_functions() WHERE function_name = 'plug_greet';
 ----
 0
 
-# The root is configured and EMPTY: one row for the root, none for any candidate.
+# TWO roots are configured: the empty install target, and a directory holding the colliding test fixture
+# (run-suites.sh builds it there). Nothing is LOADED yet, which is what the before-state needs.
 query I
-SELECT count(*) FROM fabricator_plugins() WHERE status <> 'root';
+SELECT count(*) FROM fabricator_plugins() WHERE status = 'root';
+----
+2
+
+query I
+SELECT count(*) FROM fabricator_plugins() WHERE status NOT IN ('root', 'rejected');
 ----
 0
+
+# ---- 2b A PLUGIN MAY NOT TAKE A FIRST-PARTY PROVIDER'S NAME --------------------------------------------
+# Fabricator.CollidingPlugin declares IBackend.Name = 'sqlserver'. BackendRegistry.Add is a plain dictionary
+# assignment, so before this refusal such a plugin SILENTLY REPLACED the first-party provider and the scan
+# reported it as an ordinary `loaded` row -- every later ATTACH going somewhere the user never chose. Refusing
+# is the only one of the three options (report / refuse / allow-as-override) that cannot end in a wrong
+# ANSWER.
+
+query I
+SELECT status FROM fabricator_plugins() WHERE path LIKE '%CollidingPlugin%';
+----
+rejected
+
+# The reason names BOTH sides -- what was claimed, and who already had it. A refusal that only said
+# "rejected" would leave the author guessing at a name they chose deliberately.
+query I
+SELECT detail LIKE '%provider name collision%' AND detail LIKE '%sqlserver%'
+FROM fabricator_plugins() WHERE path LIKE '%CollidingPlugin%';
+----
+true
+
+# THE POSITIVE CONTROL, and it is the assertion that matters. The refusal is worthless if the first-party
+# provider was displaced anyway: mssql_mars is registered at load by walking the backend registry, so its
+# presence proves Fabricator.SqlServer still holds the name. Without this, "the plugin was rejected" would
+# pass equally on a build where BOTH were broken.
+query I
+SELECT count(*) FROM duckdb_settings() WHERE name = 'mssql_mars';
+----
+1
 
 # ---- §3 the install -------------------------------------------------------------------------------------
 
@@ -175,6 +210,55 @@ SELECT count(*) FROM fabricator_plugins() WHERE status = 'loaded';
 ----
 1
 
+# ---- 7b UNINSTALL ---------------------------------------------------------------------------------------
+# It is a MOVE, not a delete: an assembly loaded from a file is LOCKED on Windows and the bridge's load
+# context is not collectible, so a plugin that has been USED in this process cannot be deleted -- but it can
+# be renamed. Moving the version directory into <root>/.trash/<guid> takes it out of the scan at once, which
+# is the mark-for-deletion the design called for, without inventing a marker file.
+
+query III
+SELECT name, version, removed FROM fabricator_uninstall_plugin('sampleplugin');
+----
+sampleplugin	1.0.0	true
+
+# `purged` is deliberately NOT asserted. Whether the BYTES go depends on whether this process still holds the
+# assembly -- which it does, always, once the plugin has registered -- and on the platform's file locking.
+# `removed` (is it out of the scan?) and `purged` (are the bytes gone?) are different questions, only the
+# first is a failure when false, and pinning the second would pin an OS behaviour rather than ours.
+
+# THE PROVIDER STOPS RESOLVING. The assembly is still loaded -- nothing can unload it -- so this is the
+# strongest guarantee available: the re-scan finds no candidate, so it is not registered into the fresh map.
+statement error
+ATTACH 'ignored' AS px2 (TYPE fabricator, PROVIDER 'sampleplugin');
+----
+unknown provider
+
+# And nothing is left under the install root for the scan to find.
+query I
+SELECT count(*) FROM fabricator_plugins() WHERE status = 'loaded';
+----
+0
+
+# The parked directory is hidden from the scan by its leading dot, so it contributes no candidate rows --
+# without which a concurrent scan could reload what was just uninstalled.
+query I
+SELECT count(*) FROM fabricator_plugins() WHERE path LIKE '%.trash%';
+----
+0
+
+# Uninstalling something that is not installed is an error naming the root, not a silent success.
+statement error
+SELECT * FROM fabricator_uninstall_plugin('no-such-plugin');
+----
+is not installed under
+
+# Re-installing after an uninstall works, which is what makes the trash a parking space rather than a
+# tombstone: the version directory is free again.
+query II
+SELECT providers, activated FROM fabricator_install_plugin('${FABRICATOR_PLUGIN_ZIP}');
+----
+sampleplugin	true
+
 # ---- §8 the setting is per-session, like every other provider setting ----------------------------------
 # It rides the ordinary settings path (list_settings / set_setting), so RESET restores the refusal. A gate
 # that could only be opened and never closed would be a worse gate.
@@ -184,5 +268,13 @@ RESET fabricator_allow_plugin_install;
 
 statement error
 SELECT * FROM fabricator_install_plugin('${FABRICATOR_PLUGIN_ZIP}');
+----
+fabricator_allow_plugin_install
+
+# The same switch gates UNINSTALL. One opt-in for "SQL may manage the plugin root" is the right granularity
+# -- a caller who may add executable code has no reason to be denied removing it -- even though the setting's
+# NAME is narrower than that meaning.
+statement error
+SELECT * FROM fabricator_uninstall_plugin('sampleplugin');
 ----
 fabricator_allow_plugin_install

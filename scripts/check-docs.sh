@@ -97,6 +97,62 @@ for f in FILES:
             continue
         FAIL.append(f'{f}: broken link -> {t}')
 
+# --- 2b. #anchors into our own markdown --------------------------------------------------------------------
+# Renaming a HEADING silently breaks every link into it, and until 2026-08-18 nothing here noticed: the
+# section above deliberately strips the fragment, so a link to a heading that no longer exists resolved as
+# long as the FILE did. Two dead ones had accumulated - one created hours earlier by renaming a section in
+# docs/plugin-system.md, and one long-standing in README.md pointing at "#delta-lake-catalog-provider-delta"
+# for a heading that reads "Delta Lake provider".
+#
+# Only links whose destination is a file we already slug are checked, so a fragment into a submodule doc or
+# an external page is left alone rather than guessed at.
+
+def slug(heading):
+    # GitHub's heading anchors: strip inline markup, lowercase, drop punctuation, spaces -> hyphens.
+    h = re.sub(r'`([^`]*)`', r'\1', heading.strip())        # inline code keeps its text
+    h = re.sub(r'\[([^\]]*)\]\([^)]*\)', r'\1', h)          # links keep their text
+    h = re.sub(r'\*', '', h)                                # bold/italic markers
+    # NOT '_': GitHub KEEPS underscores. Stripping them here is a real trap - it slugs
+    # `fabricator_install_plugin` to `fabricatorinstallplugin` and reports a CORRECT anchor as dead.
+    h = h.lower()
+    return ''.join(c if (c.isalnum() or c in '-_') else ('-' if c == ' ' else '') for c in h)
+
+ANCHORS = {}
+for f in FILES:
+    txt = open(f, encoding='utf-8', errors='replace').read()
+    seen, got = {}, set()
+    fenced = False
+    for line in txt.splitlines():
+        if line.lstrip().startswith('```'):
+            fenced = not fenced          # a '#' inside a fence is a comment, not a heading
+            continue
+        if fenced:
+            continue
+        m = re.match(r'^(#{1,6})\s+(.*)$', line)
+        if m:
+            a = slug(m.group(2))
+            n = seen.get(a, 0)
+            seen[a] = n + 1
+            got.add(a if n == 0 else f'{a}-{n}')            # GitHub disambiguates repeats with -1, -2, ...
+    ANCHORS[os.path.normpath(f)] = got
+
+ANCHOR_RE = re.compile(r'\]\((?!https?:|mailto:)([^)#]*)#([A-Za-z0-9\-_]+)\)')
+for f in FILES:
+    txt = open(f, encoding='utf-8', errors='replace').read()
+    base = os.path.dirname(f)
+    for m in ANCHOR_RE.finditer(txt):
+        target, frag = m.group(1).strip(), m.group(2)
+        dest = os.path.normpath(os.path.join(base, target)) if target else os.path.normpath(f)
+        if dest not in ANCHORS or suppressed(txt, m.start()):
+            continue
+        # Inside an inline-code span it is a QUOTED link, not one: these docs discuss links (this very check
+        # exists because two broke, and the write-up quotes both). An odd number of backticks between the
+        # start of the line and the match means we are inside one.
+        if txt.count(chr(96), txt.rfind(chr(10), 0, m.start()) + 1, m.start()) % 2 == 1:
+            continue
+        if frag not in ANCHORS[dest]:
+            FAIL.append(f'{f}: link to a heading that does not exist -> {target or "(this file)"}#{frag}')
+
 # --- 3. verify_*.test suites cited in prose ----------------------------------------------------------------
 # Docs cite suites constantly ("gate verify_x 42"), and a renamed or deleted suite makes a doc actively
 # misleading about what is covered. Three exclusions, each a false positive that would erode trust in the check:

@@ -164,16 +164,64 @@ public static class BackendRegistry
         return map;
     }
 
-    private static void RegisterBackendsFrom(System.Reflection.Assembly assembly, Dictionary<string, IBackend> map)
+    private static void RegisterBackendsFrom(System.Reflection.Assembly assembly, Dictionary<string, IBackend> map,
+                                             bool refuseCollisions = false)
     {
+        var found = new List<IBackend>();
         foreach (var type in assembly.GetTypes())
         {
             if (!type.IsAbstract && typeof(IBackend).IsAssignableFrom(type) &&
                 type.GetConstructor(Type.EmptyTypes) != null)
             {
-                var backend = (IBackend)Activator.CreateInstance(type)!;
-                Add(map, backend);
-                _defaultProvider ??= Environment.GetEnvironmentVariable("FABRICATOR_DEFAULT_PROVIDER") ?? backend.Name;
+                found.Add((IBackend)Activator.CreateInstance(type)!);
+            }
+        }
+        if (refuseCollisions)
+        {
+            // ⚠⚠ A PLUGIN MAY NOT TAKE A NAME THAT IS ALREADY REGISTERED. Add() is a plain overwrite, so
+            // without this a plugin declaring IBackend.Name == "sqlserver" SILENTLY REPLACES the first-party
+            // provider and the scan reports it as an ordinary `loaded` row: every later ATTACH goes somewhere
+            // the user did not choose, with nothing anywhere saying so. Refusing is the only one of the three
+            // options (report / refuse / allow-as-override) that cannot end in a wrong ANSWER; an override
+            // mechanism, if ever wanted, should be something the USER asks for by name rather than something a
+            // file appearing in a directory can do.
+            //
+            // ⚠ CHECKED BEFORE ANYTHING IS ADDED, and that is why `found` is materialised first: an
+            // assembly declaring two backends, the second of which collides, must not leave the first
+            // half-registered. The throw is caught by the scan's per-candidate handler, so the plugin is
+            // reported `rejected` with this message and every OTHER plugin still loads.
+            foreach (var backend in found)
+            {
+                foreach (var name in Names(backend))
+                {
+                    if (map.TryGetValue(name, out var incumbent))
+                    {
+                        throw new InvalidOperationException(
+                            $"plugin provider name collision: '{assembly.GetName().Name}' declares " +
+                            $"'{name}' (via {backend.GetType().FullName}), which is already registered by " +
+                            $"'{incumbent.GetType().Assembly.GetName().Name}' as provider '{incumbent.Name}'. " +
+                            "Rename the plugin's IBackend.Name or its Aliases; a plugin may not replace an " +
+                            "existing provider.");
+                    }
+                }
+            }
+        }
+        foreach (var backend in found)
+        {
+            Add(map, backend);
+            _defaultProvider ??= Environment.GetEnvironmentVariable("FABRICATOR_DEFAULT_PROVIDER") ?? backend.Name;
+        }
+    }
+
+    /// <summary>The keys a backend would occupy: its name plus every non-blank alias.</summary>
+    private static IEnumerable<string> Names(IBackend backend)
+    {
+        yield return backend.Name;
+        foreach (var alias in backend.Aliases)
+        {
+            if (!string.IsNullOrWhiteSpace(alias))
+            {
+                yield return alias;
             }
         }
     }
@@ -274,7 +322,7 @@ public static class BackendRegistry
                     // distinguishable. The second is the ordinary state of a plugin's private dependency and
                     // must not read as a failure.
                     var before = new HashSet<IBackend>(map.Values);
-                    RegisterBackendsFrom(assembly, map);
+                    RegisterBackendsFrom(assembly, map, refuseCollisions: true);
                     var added = map.Values.Distinct().Where(b => !before.Contains(b)).Select(b => b.Name).ToArray();
                     report.Add(added.Length > 0
                         ? new PluginScanEntry(root, dll, PluginScanStatus.Loaded, string.Join(",", added),
