@@ -42,19 +42,14 @@
     <!-- S3 conditional-PUT commit rename (multi-writer Delta commits on S3/MinIO; httpfs's
          exclusive-create is unguarded there) — see S3CommitFileSystem. -->
     <PackageReference Include="AWSSDK.S3" Version="4.*" />
-    <!-- Microsoft.Data.SqlClient: the SQL Server backend (Fabricator.SqlServer) + the DAX SQL-endpoint path. The
-         Delta provider no longer uses it (OneLake discovery moved to the DFS endpoint above). -->
-    <PackageReference Include="Microsoft.Data.SqlClient" Version="7.0.2" />
-    <!-- ⚠ REQUIRED FROM SqlClient 7.0 FOR ENTRA (Azure AD) AUTH — it is not optional for us. 7.0 MOVED the
-         Active Directory authentication providers out of the core package into this one, so every
-         `Authentication=Active Directory ...` connection string (Fabric Warehouse via a service principal, the
-         Fabric SQL endpoint, Azure SQL with Entra, the ambient notebook token path) fails at connect with
-         "Cannot find an authentication provider for 'ActiveDirectoryServicePrincipal'". Version-locked to the
-         core package on purpose: the two ship as a matched pair.
-         ⚠ NO CI TIER CATCHES ITS ABSENCE — the docker rig authenticates with sa/password, so both tiers stay
-         green while every Entra attach is broken. It was found by re-running a live Fabric shape after the
-         6.0.2 -> 7.0.2 bump. -->
-    <PackageReference Include="Microsoft.Data.SqlClient.Extensions.Azure" Version="7.0.2" />
+    <!-- ⚠ Microsoft.Data.SqlClient + Microsoft.Data.SqlClient.Extensions.Azure were declared HERE until
+         2026-08-18 and used by NOTHING in this assembly. The only two matches in Bridge source are a comment
+         in Bootstrap.cs saying it duck-types the provider error number "rather than reference
+         Microsoft.Data.SqlClient", and FabricApi/FabricSqlEndpointHost.cs saying it hand-parses a connection
+         string "to stay BCL-only". The justification the removed comment carried — "the SQL Server backend
+         + the DAX SQL-endpoint path" — was stale in both halves: Fabricator.SqlServer declares BOTH packages
+         itself (that is what puts them in the published payload), and Fabricator.AnalysisServices does not
+         use SqlClient at all. Do not re-add them here; add them to the assembly that calls them. -->
   </ItemGroup>
 
   <!-- Lakehouse (Delta) reader: Curt Hagenlocher's engineered-wood (pure C#), IO delegated to DuckDB's

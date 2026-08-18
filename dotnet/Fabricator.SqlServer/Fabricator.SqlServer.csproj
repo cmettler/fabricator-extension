@@ -19,7 +19,17 @@
     <ProjectReference Include="..\Fabricator.Abstractions\Fabricator.Abstractions.csproj" />
     <ProjectReference Include="..\Fabricator.Bridge\Fabricator.Bridge.csproj" />
     <PackageReference Include="Microsoft.Data.SqlClient" Version="7.0.2" />
-    <!-- Entra auth providers, split out of the core package in SqlClient 7.0 — see Fabricator.Bridge.csproj. -->
+    <!-- ⚠ REQUIRED FROM SqlClient 7.0 FOR ENTRA (Azure AD) AUTH — it is not optional for us. 7.0 MOVED the
+         Active Directory authentication providers out of the core package into this one, so every
+         `Authentication=Active Directory ...` connection string (Fabric Warehouse via a service principal, the
+         Fabric SQL endpoint, Azure SQL with Entra, the ambient notebook token path) fails at connect with
+         "Cannot find an authentication provider for 'ActiveDirectoryServicePrincipal'". Version-locked to the
+         core package on purpose: the two ship as a matched pair.
+         ⚠ NO CI TIER CATCHES ITS ABSENCE — the docker rig authenticates with sa/password, so both tiers stay
+         green while every Entra attach is broken. It was found by re-running a live Fabric shape after the
+         6.0.2 -> 7.0.2 bump.
+         (Text moved here from Fabricator.Bridge.csproj on 2026-08-18, when Bridge stopped declaring these two
+         packages: it used NEITHER, and this warning belongs with the assembly that actually calls them.) -->
     <PackageReference Include="Microsoft.Data.SqlClient.Extensions.Azure" Version="7.0.2" />
   </ItemGroup>
 

@@ -44,7 +44,11 @@ param(
     # delta_rs_bridge.dll / delta_kernel_ffi.dll). Off by default so the normal publish stays lean and
     # doesn't require the delta-dotnet sibling repo + its Rust build. Without it, BackendRegistry simply
     # skips the (absent) Fabricator.DeltaRs assembly.
-    [switch]$IncludeDeltaRs
+    [switch]$IncludeDeltaRs,
+    # Wipe the output dir first. Needed after MOVING a PackageReference between assemblies that publish into
+    # it — see the clean block below for the measurement; the failure is silent and only the service tier
+    # catches it.
+    [switch]$Clean
 )
 
 $ErrorActionPreference = "Stop"
@@ -64,10 +68,26 @@ New-Item -ItemType Directory -Force -Path $ExtensionDir | Out-Null
 # A leftover self-contained runtime in the output dir would make a framework-dependent publish
 # indistinguishable from self-contained (clr_host detects the layout by hostfxr's presence) — and vice
 # versa a stale FDD runtimeconfig would confuse an SC layout. Clean the output dir on a MODE change.
+#
+# ⚠⚠ MODE IS NOT THE ONLY THING THAT NEEDS A CLEAN, AND THE OTHER TRIGGER IS SILENT. Several projects
+# publish into this ONE directory, and `dotnet publish` removes what ITS OWN previous publish wrote and its
+# closure no longer contains. So MOVING A PackageReference BETWEEN ASSEMBLIES deletes those DLLs from an
+# already-populated payload, even though the package is still referenced by another project publishing into
+# the same dir. MEASURED 2026-08-18, dropping the unused Microsoft.Data.SqlClient reference from
+# Fabricator.Bridge: incremental publish left ZERO SqlClient DLLs (Fabricator.AnalysisServices' publish
+# removed the five it had written transitively), while a publish into a FRESH dir kept all five — the
+# reference still lives on Fabricator.SqlServer, which publishes here too.
+#
+# It is invisible where it matters: nothing fails to compile, and the hermetic tier never touches SQL Server,
+# so only the SERVICE tier catches it. Pass -Clean after moving a dependency between assemblies. The clean is
+# not unconditional because a self-contained payload is ~250 MB and the common loop is a C#-only edit.
 $hostfxrLeaf = if ($Rid -like "win-*") { "hostfxr.dll" } elseif ($Rid -like "osx-*") { "libhostfxr.dylib" } else { "libhostfxr.so" }
 if (Test-Path $managedOut) {
     $hasHostfxr = Test-Path (Join-Path $managedOut $hostfxrLeaf)
-    if ($hasHostfxr -ne $selfContained) {
+    if ($Clean) {
+        Write-Host "-Clean — removing $managedOut before publishing"
+        Remove-Item -Recurse -Force $managedOut
+    } elseif ($hasHostfxr -ne $selfContained) {
         Write-Host "Publish mode changed ($(if ($hasHostfxr) {'self-contained'} else {'framework-dependent'}) -> $Mode) — cleaning $managedOut"
         Remove-Item -Recurse -Force $managedOut
     }
