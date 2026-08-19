@@ -99,6 +99,17 @@ public interface IBackend
     IEnumerable<CatalogMacroDefinition> CatalogMacros => System.Array.Empty<CatalogMacroDefinition>();
 
     /// <summary>
+    /// DuckDB VIEWs the provider binds into each ATTACHed catalog's schemas — resolved as an ordinary
+    /// relation <c>db.schema.v</c>. Same local-declaration mechanism as <see cref="CatalogMacros"/> (one
+    /// complete <c>CREATE VIEW</c> statement, DuckDB's own parser, its own metadata entry, no server round
+    /// trip), but with a property a macro cannot have: DuckDB anchors a view body's search path to the
+    /// VIEW's own catalog and schema, so an unqualified reference inside the body finds THIS catalog's
+    /// tables. That makes it the right form for a declaration that must name provider tables — see
+    /// <see cref="ViewDefinition"/>. Empty by default.
+    /// </summary>
+    IEnumerable<ViewDefinition> CatalogViews => System.Array.Empty<ViewDefinition>();
+
+    /// <summary>
     /// Builds a provider connection string from a secret's fields (the host reads the DuckDB secret and
     /// passes its key/values here). Keeps all provider connection-string / auth formatting in the backend —
     /// the C++ side has no knowledge of the provider's connstr dialect. The result is passed to
@@ -251,6 +262,12 @@ public interface IBackendCatalog : IDisposable
     /// into the ATTACHed catalog's schema. A purely LOCAL declaration (never round-tripped through
     /// provider SQL — see docs/macros-and-sqlgen-functions.md §1.4). Empty = no macros.</summary>
     IArrowArrayStream GetMacros();
+
+    /// <summary>Provider-declared CATALOG-BOUND DuckDB views: schema, name, create_sql — each create_sql one
+    /// complete CREATE VIEW statement the HOST parses with DuckDB's own parser and binds into the ATTACHed
+    /// catalog's schema, where it resolves as an ordinary relation. A purely LOCAL declaration, never
+    /// round-tripped through provider SQL. Empty = no views. See docs/macros-and-sqlgen-functions.md §5.</summary>
+    IArrowArrayStream GetViews();
 
     /// <summary>The detected capability profile as DIAGNOSTIC (property, value) rows — the
     /// <c>fabricator_server_info()</c> table function's source. The HOST consumes

@@ -49,6 +49,7 @@ public sealed class StubBackend : IBackend
             EmptyStringTable("schema_name", "name", "kind", "param_count", "return_type");
 
         public IArrowArrayStream GetMacros() => EmptyStringTable("schema", "name", "create_sql");
+        public IArrowArrayStream GetViews() => EmptyStringTable("schema", "name", "create_sql");
 
         public IArrowArrayStream GetServerInfo() => EmptyStringTable("property", "value");
 

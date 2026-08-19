@@ -159,6 +159,7 @@ public sealed class DeltaRsCatalog : IBackendCatalog
     public IArrowArrayStream GetFunctions() => FunctionsMetadata.Stream(Functions.Declarations(SchemaNames));
 
     public IArrowArrayStream GetMacros() => EmptyTable("schema", "name", "create_sql");
+    public IArrowArrayStream GetViews() => EmptyTable("schema", "name", "create_sql");
 
     public IArrowArrayStream GetServerInfo() => EmptyTable("property", "value");
 

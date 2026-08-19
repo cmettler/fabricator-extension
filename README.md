@@ -82,6 +82,7 @@ See [SQL Server external tables on S3](#sql-server-external-tables-on-s3).
 | | `fabricator_http_request(url, …)` — an HTTP call through DuckDB's own stack (its `TYPE http` secret, TLS trust, proxy, retries) | ✅ |
 | **Macros** | Provider **global** macros — bare `fn(...)` / `FROM fn(...)`, every database, no ATTACH | ✅ |
 | | Provider **catalog-bound** macros → `db.schema.m(...)` (namespaced per catalog; expanded by the binder) | ✅ |
+| **Views** | Provider **catalog-bound** views → `db.schema.v` — a real relation, and unlike a macro its body binds against its OWN catalog | ✅ |
 | | **SQL-generating** table functions — the call is rewritten into SQL at bind time (`kind='table_sql'`) | ✅ |
 | **Fabric API** | `refresh_sql_endpoint()` — sync the lakehouse SQL analytics endpoint from SQL (the dbt unblocker) | ✅ OneLake + Fabric SQL attaches |
 | | OneLake **shortcut** create / alter / drop / list, incl. non-OneLake targets via JSON | ✅ OneLake + Fabric SQL attaches |
@@ -1041,6 +1042,28 @@ Both flavours appear in `duckdb_functions()` with `function_type` `macro` or `ta
 > whatever catalog/schema the caller has active — not against the macro's own catalog. Keep bodies
 > self-contained (expressions, or queries over built-ins), and use a SQL-generating table function when the
 > body must reach into its own catalog's tables.
+
+### Provider views
+
+A provider can also ship **views** bound into an attached catalog's schemas. Unlike a macro, a view is a
+**relation**: it shows up in `duckdb_views()` and `duckdb_columns()`, tools that enumerate the catalog find
+it, and it can be used anywhere a table can.
+
+```sql
+ATTACH '/data/lake' AS lake (TYPE fabricator, PROVIDER 'delta');
+SELECT * FROM lake.main.fab_view_info;             -- a declared view
+SELECT view_name FROM duckdb_views() WHERE database_name = 'lake';
+```
+
+> **This is the form to use when the body must read the catalog's own tables.** DuckDB binds a view body
+> against the *view's* catalog and schema, so an unqualified table reference inside it resolves there — which
+> is exactly what the macro note above says a macro body cannot rely on. Nothing is bound until the view is
+> first used, so a body may reference a table that does not exist yet; a missing one is an ordinary binder
+> error at that point, and listing views never resolves anything.
+
+A declared view cannot share a name with a table in the same schema. Both would resolve through the same
+catalog lookup, so rather than silently prefer one, that name is refused with an error naming both sides —
+every other view and table in the catalog keeps working.
 
 ### SQL-generating table functions
 

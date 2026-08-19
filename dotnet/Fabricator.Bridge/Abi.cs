@@ -247,6 +247,8 @@ public unsafe struct FabricatorVTable
     public delegate* unmanaged[Cdecl]<nint, CArrowArrayStream*, byte**, int> CatalogFunctions;
     // int32 catalog_macros(void* handle, ArrowArrayStream* out, char** err) — 3 utf8: schema, name, create_sql
     public delegate* unmanaged[Cdecl]<nint, CArrowArrayStream*, byte**, int> CatalogMacros;
+    // int32 catalog_views(void* handle, ArrowArrayStream* out, char** err) — 3 utf8: schema, name, create_sql
+    public delegate* unmanaged[Cdecl]<nint, CArrowArrayStream*, byte**, int> CatalogViews;
     // int32 catalog_server_info(void* handle, ArrowArrayStream* out, char** err) — 2 utf8: property, value.
     // DIAGNOSTIC only (fabricator_server_info()); the host consumes get_capabilities (v71) instead.
     public delegate* unmanaged[Cdecl]<nint, CArrowArrayStream*, byte**, int> CatalogServerInfo;

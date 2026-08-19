@@ -51,7 +51,9 @@
 #include "duckdb/parser/parsed_data/create_aggregate_function_info.hpp"
 #include "duckdb/catalog/catalog_entry/scalar_macro_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_macro_catalog_entry.hpp"
+#include "duckdb/catalog/catalog_entry/view_catalog_entry.hpp"
 #include "duckdb/parser/parsed_data/create_macro_info.hpp"
+#include "duckdb/parser/parsed_data/create_view_info.hpp"
 #include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
@@ -181,6 +183,25 @@ void FabricatorSchemaEntry::AddMacro(const string &macro_name, const string &cre
 	RetireErase(macro_entries_, macro_name, retired_entries_);
 }
 
+void FabricatorSchemaEntry::AddView(const string &view_name, const string &create_sql) {
+	lock_guard<mutex> lock(entry_lock_);
+	// ⚠ COLLISION IS REFUSED, NOT RESOLVED. A view and a table share ONE lookup (TABLE_ENTRY), so if both
+	// carry this name one of them must win — and either winner is a WRONG ANSWER for whoever wanted the
+	// other. The declaration is dropped and the name recorded, so the lookup can refuse while naming both
+	// sides and the fix. Note the check is only as good as ENUMERATION: an ATTACH table_filter can hide a
+	// table that still exists (filters bound enumeration, never targeted access), in which case the view
+	// wins silently — an accepted limit, since establishing absence would cost a probe per declared view.
+	if (table_types_.find(view_name) != table_types_.end()) {
+		view_collisions_.insert(view_name);
+		views_.erase(view_name);
+		RetireErase(view_entries_, view_name, retired_entries_);
+		return;
+	}
+	views_[view_name] = create_sql;
+	// Drop any cached entry so a re-declared body is re-parsed (e.g. after a cache refresh).
+	RetireErase(view_entries_, view_name, retired_entries_);
+}
+
 void FabricatorSchemaEntry::ClearTables() {
 	lock_guard<mutex> lock(entry_lock_);
 	table_types_.clear();
@@ -192,6 +213,9 @@ void FabricatorSchemaEntry::ClearTables() {
 	custom_collector_functions_.clear();
 	aggregate_functions_.clear();
 	macros_.clear();
+	views_.clear();
+	view_collisions_.clear();
+	RetireAll(view_entries_, retired_entries_);
 	RetireAll(table_function_entries_, retired_entries_);
 	RetireAll(aggregate_function_entries_, retired_entries_);
 	RetireAll(macro_entries_, retired_entries_);
@@ -212,6 +236,11 @@ void FabricatorSchemaEntry::InvalidateEntryCache() {
 	// too, because they are handed out as raw pointers under the same graveyard contract as the rest and it is
 	// cheaper to keep one rule than to reason about an exception.
 	RetireAll(macro_entries_, retired_entries_);
+	// Same reasoning for views — the BODY is a declaration and re-parsing gains nothing, but the entry also
+	// caches a BINDING (ViewCatalogEntry::view_columns, what duckdb_columns()/DESCRIBE report), and that IS
+	// fetched state: it describes the referenced tables' columns as they were. Dropping the entry is the
+	// cheapest way to make a rolled-back or refreshed schema visible there too.
+	RetireAll(view_entries_, retired_entries_);
 }
 
 void FabricatorSchemaEntry::InvalidateMatching(const std::function<bool(const string &)> &matches) {
@@ -230,6 +259,7 @@ void FabricatorSchemaEntry::InvalidateMatching(const std::function<bool(const st
 	RetireMatching(table_function_entries_, matches, retired_entries_);
 	RetireMatching(aggregate_function_entries_, matches, retired_entries_);
 	RetireMatching(macro_entries_, matches, retired_entries_);
+	RetireMatching(view_entries_, matches, retired_entries_);
 }
 
 // The cache key for a time-travel entry. US separators (0x1f) cannot occur in a SQL identifier or in the
@@ -1141,6 +1171,83 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateMacro(ClientContext
 	// entry is cached either way, so the matching lookup finds it without re-parsing, but THIS lookup reports
 	// not-found.
 	return ref.type == want_type ? optional_ptr<CatalogEntry>(&ref) : nullptr;
+}
+
+optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateView(ClientContext &context, const string &view_name) {
+	// Like GetOrCreateMacro this makes NO bridge call — a view body is a declaration the provider handed us
+	// at discovery, so materializing it is a local PARSE.
+	//
+	// ⚠⚠ PARSE ONLY — deliberately NOT CreateViewInfo::FromCreateView, which is the obvious helper and is
+	// wrong here in two ways. It BINDS the body (create_view_info.cpp:93-94), so (a) it would re-enter
+	// LookupEntry -> GetOrCreateEntry -> entry_lock_ on this thread and DEADLOCK on a non-recursive mutex,
+	// and (b) it would make declaration order matter, turning "references an object declared later" from an
+	// ordinary binder error at first use into a materialization failure. Leaving types/names empty is what
+	// constructs the entry UNBOUND (view_catalog_entry.cpp:20-34, `if (!info.types.empty())`); DuckDB then
+	// binds it lazily and calls UpdateBinding on first use.
+	lock_guard<mutex> lock(entry_lock_);
+	auto cached = view_entries_.find(view_name);
+	if (cached != view_entries_.end()) {
+		return cached->second.get();
+	}
+	auto decl = views_.find(view_name);
+	if (decl == views_.end()) {
+		return nullptr;
+	}
+
+	unique_ptr<CatalogEntry> entry;
+	try {
+		// DuckDB's OWN parser owns the CREATE VIEW grammar, so column aliases (`CREATE VIEW v(a,b) AS ...`)
+		// and every SELECT form work without us knowing anything about them. It also fills info->sql with the
+		// statement text (parser.cpp:368), which is what duckdb_views().sql reports.
+		Parser parser(context.GetParserOptions());
+		parser.ParseQuery(decl->second);
+		if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::CREATE_STATEMENT) {
+			throw ParserException("expected a single CREATE VIEW statement");
+		}
+		auto &create = parser.statements[0]->Cast<CreateStatement>();
+		if (create.info->type != CatalogType::VIEW_ENTRY) {
+			throw ParserException("expected CREATE VIEW");
+		}
+		auto info = unique_ptr_cast<CreateInfo, CreateViewInfo>(std::move(create.info));
+		// The declared name must agree with the discovered one — we cache under the DISCOVERED name and hand
+		// the entry straight to the binder, so a mismatch leaves one of the two permanently unreachable.
+		if (!StringUtil::CIEquals(info->view_name, view_name)) {
+			throw ParserException("declared view name '%s' does not match the discovered name '%s'",
+			                      info->view_name, view_name);
+		}
+		// Re-qualified onto THIS catalog + schema, same as a catalog macro.
+		//
+		// ⚠ THIS IS NOT WHAT ANCHORS THE BODY, and a comment here said it was until a mutant refuted it:
+		// removing both lines leaves the whole suite green, §4's decoy included. DuckDB's view binder takes
+		// the search path from `view_catalog_entry.ParentCatalog()` / `ParentSchema().name`
+		// (bind_basetableref.cpp:309-311), and those come from the ViewCatalogEntry CONSTRUCTOR arguments
+		// below — which are this catalog and this schema by construction. The anchoring is free; nothing
+		// here has to arrange it.
+		//
+		// What these two lines DO buy is that the entry describes itself consistently: CreateInfo's
+		// catalog/schema feed GetInfo() / ToSQL() / duckdb_views().sql, so a provider that shipped a
+		// QUALIFIED body would otherwise leave an entry living here while claiming to live somewhere else.
+		info->catalog = catalog.GetName();
+		info->schema = name;
+		// Belt and braces: a parsed CREATE VIEW carries no bound types, and empty types is what selects the
+		// UNBOUND construction path. Stating it means a future parser change cannot quietly bind us.
+		info->types.clear();
+		info->names.clear();
+		entry = make_uniq<ViewCatalogEntry>(catalog, *this, *info);
+	} catch (std::exception &ex) {
+		// SKIP, never block — the macro contract. A broken body must not break enumeration of the whole
+		// schema, and dropping the declaration stops us re-parsing it on every lookup. Note this catches a
+		// PARSE failure only: a body that parses but references something absent fails later, at BIND, with
+		// DuckDB's own error naming the missing object — which is the better message anyway.
+		DUCKDB_LOG_WARNING(context, StringUtil::Format("fabricator: catalog view '%s.%s' skipped: %s", name,
+		                                               view_name, ex.what()));
+		views_.erase(view_name);
+		return nullptr;
+	}
+
+	auto &ref = *entry;
+	view_entries_[view_name] = std::move(entry);
+	return &ref;
 }
 
 namespace {
@@ -2648,13 +2755,47 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateCustomCollectorFunc
 	return &ref;
 }
 
+// Refuses a name the provider declared as a VIEW while also discovering it as a TABLE. Both would resolve
+// through the same TABLE_ENTRY lookup, so serving either one silently hands somebody the object they did not
+// ask for. Erroring is the only outcome that cannot be a wrong ANSWER, and it is recoverable by the party
+// that caused it (the provider renames one). Deliberately NOT refused at ATTACH: one bad declaration must not
+// destroy an otherwise working catalog — the same "skip the item, keep the rest" rule the macro path and the
+// plugin scan both follow.
+void FabricatorSchemaEntry::RefuseViewTableCollision(const string &entry_name) {
+	lock_guard<mutex> lock(entry_lock_);
+	if (view_collisions_.find(entry_name) == view_collisions_.end()) {
+		return;
+	}
+	throw CatalogException(
+	    "fabricator: '%s.%s' is declared as a VIEW by the provider and also discovered as a table — refusing to "
+	    "resolve it, because either answer would silently be the wrong object. The provider must rename one.",
+	    name, entry_name);
+}
+
 optional_ptr<CatalogEntry> FabricatorSchemaEntry::LookupEntry(CatalogTransaction transaction,
                                                             const EntryLookupInfo &lookup_info) {
 	if (!transaction.context) {
 		return nullptr;
 	}
 	auto type = lookup_info.GetCatalogType();
-	if (type == CatalogType::TABLE_ENTRY) {
+	if (type == CatalogType::TABLE_ENTRY || type == CatalogType::VIEW_ENTRY) {
+		// A provider-declared VIEW resolves through the TABLE_ENTRY lookup, not a separate one:
+		// Binder::Bind(BaseTableRef&) asks for TABLE_ENTRY and then switches on the entry's ACTUAL type
+		// (bind_basetableref.cpp — VIEW_ENTRY takes the view branch). VIEW_ENTRY is accepted too for the
+		// paths that ask for the concrete type.
+		//
+		// The AT clause is deliberately NOT consulted for a view: DuckDB PROPAGATES it through the view onto
+		// the body's own references (`view_binder->entry_retriever.SetAtClause(entry_at_clause)`), which is
+		// the right semantics — `FROM v AT (VERSION => n)` time-travels what the view READS. Consuming it
+		// here would instead time-travel the DECLARATION, which has no versions.
+		RefuseViewTableCollision(lookup_info.GetEntryName());
+		auto view = GetOrCreateView(*transaction.context, lookup_info.GetEntryName());
+		if (view) {
+			return view;
+		}
+		if (type == CatalogType::VIEW_ENTRY) {
+			return nullptr; // a discovered table is not a view, whatever the provider calls it
+		}
 		// The AT clause rides the lookup: a time-travel reference needs an entry whose ColumnList is the
 		// schema AS OF that version, because `SELECT *` expands from the ENTRY, not from the scan.
 		return GetOrCreateEntry(*transaction.context, lookup_info.GetEntryName(), lookup_info.GetAtClause());
@@ -2698,15 +2839,57 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::LookupEntry(CatalogTransaction
 	return nullptr;
 }
 
+// Materializes and reports every declared view. Snapshots the names first: GetOrCreateView takes
+// entry_lock_ and may DROP a broken declaration, which would invalidate an iterator over views_.
+//
+// ⚠ Materialization is a pure PARSE and does not bind, so listing views costs nothing per referenced table —
+// which matters on a Delta/OneLake catalog where resolving one would be a _delta_log read.
+// duckdb_columns()/DESCRIBE DO bind (duckdb_columns.cpp:164), but from the CALLBACK, i.e. outside this lock,
+// and they swallow a bind failure into a placeholder column rather than failing the listing.
+void FabricatorSchemaEntry::ScanDeclaredViews(ClientContext &context,
+                                              const std::function<void(CatalogEntry &)> &callback) {
+	vector<string> view_names;
+	{
+		lock_guard<mutex> lock(entry_lock_);
+		for (auto &v : views_) {
+			view_names.push_back(v.first);
+		}
+	}
+	for (auto &v : view_names) {
+		auto catalog_entry = GetOrCreateView(context, v);
+		if (catalog_entry) {
+			callback(*catalog_entry);
+		}
+	}
+}
+
 void FabricatorSchemaEntry::Scan(ClientContext &context, CatalogType type,
                                const std::function<void(CatalogEntry &)> &callback) {
+	if (type == CatalogType::VIEW_ENTRY) {
+		// duckdb_views() scans VIEW_ENTRY. Deliberately views ONLY, where the TABLE_ENTRY scan above reports
+		// both: DuckDB's shared set makes its own VIEW_ENTRY scan yield tables too, but every consumer of
+		// this type filters them out, so answering with the narrower truth loses nothing and cannot mislead
+		// a future consumer that does not filter.
+		ScanDeclaredViews(context, callback);
+		return;
+	}
 	if (type == CatalogType::TABLE_ENTRY) {
+		// ⚠ DECLARED VIEWS ARE REPORTED HERE TOO, and getting this backwards is a silent hole: DuckDB's own
+		// DuckSchemaEntry keeps tables and views in ONE CatalogSet (duck_schema_entry.cpp:386-388), so a
+		// TABLE_ENTRY scan yields both and every consumer filters by the entry's ACTUAL type —
+		// duckdb_tables() skips anything that is not TABLE_ENTRY, duckdb_views() anything that is not
+		// VIEW_ENTRY, and duckdb_columns() (which scans TABLE_ENTRY ALONE, duckdb_columns.cpp:91) handles
+		// both. So omitting views here does not "keep them out of duckdb_tables()" — that filter is the
+		// consumer's job either way — it only makes them INVISIBLE to duckdb_columns(),
+		// information_schema.columns and everything built on them. MEASURED: with views omitted here,
+		// duckdb_columns() reported the catalog's tables and none of its views.
 		for (auto &entry : table_types_) {
 			auto catalog_entry = GetOrCreateEntry(context, entry.first);
 			if (catalog_entry) {
 				callback(*catalog_entry);
 			}
 		}
+		ScanDeclaredViews(context, callback);
 		return;
 	}
 	if (type == CatalogType::SCALAR_FUNCTION_ENTRY) {
@@ -2816,6 +2999,14 @@ void FabricatorSchemaEntry::Scan(CatalogType type, const std::function<void(Cata
 	};
 	if (type == CatalogType::TABLE_ENTRY) {
 		for (auto &entry : entries_) {
+			callback(*entry.second);
+		}
+		// Views too — same reason as the context-taking overload (duckdb_columns() scans TABLE_ENTRY alone).
+		for (auto &entry : view_entries_) {
+			callback(*entry.second);
+		}
+	} else if (type == CatalogType::VIEW_ENTRY) {
+		for (auto &entry : view_entries_) {
 			callback(*entry.second);
 		}
 	} else if (type == CatalogType::SCALAR_FUNCTION_ENTRY) {

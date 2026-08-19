@@ -710,6 +710,10 @@ void CatalogMacros(FabricatorHandle handle, ArrowArrayStream &out) {
 	CatalogList(handle, out, "catalog_macros", GetBridge().catalog_macros);
 }
 
+void CatalogViews(FabricatorHandle handle, ArrowArrayStream &out) {
+	CatalogList(handle, out, "catalog_views", GetBridge().catalog_views);
+}
+
 void CatalogServerInfo(FabricatorHandle handle, ArrowArrayStream &out) {
 	CatalogList(handle, out, "catalog_server_info", GetBridge().catalog_server_info);
 }

@@ -202,6 +202,7 @@ void CatalogSchemas(FabricatorHandle handle, ArrowArrayStream &out);
 void CatalogTables(FabricatorHandle handle, ArrowArrayStream &out);
 void CatalogFunctions(FabricatorHandle handle, ArrowArrayStream &out);
 void CatalogMacros(FabricatorHandle handle, ArrowArrayStream &out);
+void CatalogViews(FabricatorHandle handle, ArrowArrayStream &out);
 void CatalogServerInfo(FabricatorHandle handle, ArrowArrayStream &out);
 
 // The table session (ABI v72/v73; see abi.h for the full contract). TableOpen resolves (schema, table[,

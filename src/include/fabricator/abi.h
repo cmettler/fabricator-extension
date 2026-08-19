@@ -754,6 +754,19 @@ typedef struct FabricatorVTable {
 	// the ATTACHed catalog's schema (db.schema.m(...)). A purely LOCAL declaration — never embedded in
 	// provider SQL, never dependent on server reachability. Fetch is best-effort host-side.
 	int32_t (*catalog_macros)(FabricatorHandle handle, struct ArrowArrayStream *out, char **err);
+	// Three columns: schema, name, create_sql — provider-declared CATALOG-BOUND DuckDB VIEWS, each
+	// create_sql one complete CREATE VIEW statement parsed by DuckDB's OWN parser host-side and bound into
+	// the ATTACHed catalog's schema, resolving as an ordinary relation `db.schema.v`.
+	//
+	// ⚠ A VIEW, unlike a macro, binds its body against ITS OWN catalog + schema (DuckDB's view binder
+	// re-points the search path — bind_basetableref.cpp), so an unqualified reference inside the body
+	// resolves against the catalog the view belongs to rather than the caller's. That is the whole reason
+	// this entry exists beside catalog_macros: it is the only declaration form whose body can name the
+	// provider's own tables without knowing the ATTACH alias.
+	//
+	// Same local-declaration contract as macros: never embedded in provider SQL, never dependent on server
+	// reachability, fetch best-effort host-side. See docs/macros-and-sqlgen-functions.md §5.
+	int32_t (*catalog_views)(FabricatorHandle handle, struct ArrowArrayStream *out, char **err);
 	// Two columns: property, value — the detected capability profile, DIAGNOSTIC ONLY (the
 	// fabricator_server_info() table function). The host consumes get_capabilities (v71) instead; nothing
 	// greps these rows any more.
@@ -991,7 +1004,7 @@ typedef struct FabricatorHostServices {
 // state blob is this many bytes + a 4-byte length prefix). Serialize() must fit within it.
 #define FABRICATOR_AGG_SPILL_CAP 1024
 
-#define FABRICATOR_ABI_VERSION 76
+#define FABRICATOR_ABI_VERSION 77
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(FabricatorVTable) as seen

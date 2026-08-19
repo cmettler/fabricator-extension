@@ -63,7 +63,7 @@ public static unsafe class Bootstrap
             return new InMemoryArrayStream(schema, new[] { batch });
         });
 
-        vtable->AbiVersion = 76;
+        vtable->AbiVersion = 77;
         vtable->OpenCatalog = &OpenCatalog;
         vtable->CloseCatalog = &CloseCatalog;
         vtable->ExecuteQuery = &ExecuteQuery;
@@ -129,6 +129,7 @@ public static unsafe class Bootstrap
         vtable->CatalogTables = &CatalogTables;
         vtable->CatalogFunctions = &CatalogFunctions;
         vtable->CatalogMacros = &CatalogMacros;
+        vtable->CatalogViews = &CatalogViews;
         vtable->CatalogServerInfo = &CatalogServerInfo;
         vtable->TableOpen = &TableOpen;
         vtable->TableSchema = &TableSchema;
@@ -383,6 +384,10 @@ public static unsafe class Bootstrap
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
     private static int CatalogMacros(nint handle, CArrowArrayStream* outStream, byte** err) =>
         CatalogList(handle, outStream, err, "catalog_macros", c => c.GetMacros());
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int CatalogViews(nint handle, CArrowArrayStream* outStream, byte** err) =>
+        CatalogList(handle, outStream, err, "catalog_views", c => c.GetViews());
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
     private static int CatalogServerInfo(nint handle, CArrowArrayStream* outStream, byte** err) =>

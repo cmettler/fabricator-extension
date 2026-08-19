@@ -143,6 +143,17 @@ void FabricatorCatalog::LoadCatalog(ClientContext &context) {
 		}
 		sit->second->AddMacro(macro.name, macro.create_sql);
 	}
+	// Provider-declared CATALOG-BOUND views (catalog_views). Same local-declaration contract and the same
+	// schema rule as macros. ⚠ Registered AFTER the tables so AddView can see the discovered names and
+	// report a collision — see FabricatorSchemaEntry::AddView for why a collision is refused at LOOKUP
+	// rather than here.
+	for (auto &view : DiscoverCatalogViews(handle_)) {
+		auto sit = schemas_.find(view.schema_name);
+		if (sit == schemas_.end()) {
+			continue;
+		}
+		sit->second->AddView(view.name, view.create_sql);
+	}
 }
 
 void FabricatorCatalog::InvalidateAllEntries() {
@@ -245,6 +256,17 @@ void FabricatorCatalog::RefreshCache(ClientContext &context) {
 			continue;
 		}
 		sit->second->AddMacro(macro.name, macro.create_sql);
+	}
+	// Provider-declared CATALOG-BOUND views (catalog_views). Same local-declaration contract and the same
+	// schema rule as macros. ⚠ Registered AFTER the tables so AddView can see the discovered names and
+	// report a collision — see FabricatorSchemaEntry::AddView for why a collision is refused at LOOKUP
+	// rather than here.
+	for (auto &view : DiscoverCatalogViews(handle_)) {
+		auto sit = schemas_.find(view.schema_name);
+		if (sit == schemas_.end()) {
+			continue;
+		}
+		sit->second->AddView(view.name, view.create_sql);
 	}
 }
 

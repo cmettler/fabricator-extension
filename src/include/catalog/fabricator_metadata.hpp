@@ -79,6 +79,23 @@ struct FabricatorMacroInfo {
 //! that does not serve the kind simply declares none, so the caller does not need its own guard.
 vector<FabricatorMacroInfo> DiscoverCatalogMacros(FabricatorHandle handle);
 
+//! A provider-declared CATALOG-BOUND DuckDB view: one complete CREATE VIEW statement to bind into
+//! `schema_name` of the attached catalog. Parsed with DuckDB's OWN parser and re-qualified onto this
+//! catalog's alias + schema_name, exactly like a macro — the DIFFERENCE is what happens at BIND time:
+//! DuckDB anchors a view body's search path to the VIEW's own catalog and schema, so an unqualified table
+//! reference inside `create_sql` resolves against THIS catalog. A macro body does not (it binds in the
+//! CALLER's context), which is why a view is the declaration form for a body that names provider tables.
+struct FabricatorViewInfo {
+	string schema_name;
+	string name;
+	string create_sql;
+};
+
+//! Discovers provider-declared catalog-bound views (catalog_views). Never throws, for the same reason
+//! DiscoverCatalogMacros does not: declaring views is optional and a broken declaration must never block
+//! an ATTACH.
+vector<FabricatorViewInfo> DiscoverCatalogViews(FabricatorHandle handle);
+
 //! How a declared parameter is passed at the call site. Read from the parameter FIELD's metadata
 //! (`fabricator.param_style`); ABSENT => POSITIONAL, so an unflagged schema behaves as it always did.
 //! Mirrors the managed `ParamStyle` (dotnet/Fabricator.Abstractions/ParamStyle.cs) — keep the two in step.

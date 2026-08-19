@@ -85,6 +85,18 @@ public:
 	//! qualified body. See docs/macros-and-sqlgen-functions.md §1.4.
 	void AddMacro(const string &macro_name, const string &create_sql);
 
+	//! Registers a provider-declared CATALOG-BOUND DuckDB view: `create_sql` is one complete CREATE VIEW
+	//! statement, parsed lazily on first lookup by DuckDB's OWN parser and bound into THIS schema, so it
+	//! resolves as an ordinary relation `db.schema.v` — enumerable in duckdb_views() and usable anywhere a
+	//! table is.
+	//!
+	//! ⚠ THE REASON THIS EXISTS BESIDE AddMacro: DuckDB's view binder re-points the search path at the
+	//! VIEW's own catalog + schema (bind_basetableref.cpp), so an UNQUALIFIED reference inside the body
+	//! resolves against THIS catalog. A macro body has no such anchor — it binds in the caller's context —
+	//! which is why a macro that names its own catalog's tables is a silently-wrong-table hazard and a view
+	//! is not. See docs/macros-and-sqlgen-functions.md §5.
+	void AddView(const string &view_name, const string &create_sql);
+
 	//! Drops all cached table + function names and materialized entries (cache refresh).
 	void ClearTables();
 
@@ -162,6 +174,40 @@ private:
 	//! the truthful answer for that lookup.
 	optional_ptr<CatalogEntry> GetOrCreateMacro(ClientContext &context, const string &macro_name, bool want_table);
 
+	//! Materializes a provider-declared catalog-bound view as a ViewCatalogEntry, UNBOUND.
+	//!
+	//! ⚠⚠ IT MUST NOT USE `CreateViewInfo::FromCreateView`, and the reason is the one hazard this whole
+	//! feature has: that helper BINDS the body (create_view_info.cpp:93-94 — `Binder::CreateBinder` then
+	//! `BindCreateViewInfo`). Binding re-enters LookupEntry -> GetOrCreateEntry -> entry_lock_ on the SAME
+	//! thread, and entry_lock_ is not recursive, so materializing a view that way while holding it is a
+	//! DEADLOCK. It also drags declaration order in (a body naming a not-yet-declared object would throw
+	//! at materialization instead of at first use).
+	//!
+	//! So this parses ONLY — the exact shape GetOrCreateMacro uses — and leaves `types`/`names` empty, which
+	//! is what makes ViewCatalogEntry construct itself UNBOUND (view_catalog_entry.cpp:20-34). DuckDB then
+	//! binds it lazily at first use and calls UpdateBinding, which is both correct and cheaper: enumeration
+	//! (duckdb_views()) never forces a bind, so listing views on a Delta/OneLake catalog does not cascade
+	//! into a _delta_log read per referenced table.
+	//!
+	//! ⚠ MEASURED, not reasoned: binding here (an eager BindView inside this method) makes MSVC's std::mutex
+	//! throw `resource deadlock would occur` when the body reaches a catalog macro or table, which the catch
+	//! below turns into a SKIP — so every view whose body touches this catalog vanishes SILENTLY while a
+	//! constant-only one survives, i.e. a smoke test on the trivial view still passes. On glibc the same
+	//! re-lock is UB and typically HANGS instead. Both outcomes are worse than the symptom suggests.
+	//!
+	//! STANDING RULE this establishes: never call anything that BINDS while holding entry_lock_.
+	optional_ptr<CatalogEntry> GetOrCreateView(ClientContext &context, const string &view_name);
+
+	//! Throws if `entry_name` was declared as a view AND discovered as a table (see AddView). Called on the
+	//! TABLE_ENTRY lookup path only — enumeration skips such a name instead, so one bad declaration cannot
+	//! break listing the schema.
+	void RefuseViewTableCollision(const string &entry_name);
+
+	//! Materializes + reports every declared view. Shared by the TABLE_ENTRY and VIEW_ENTRY scans, because
+	//! DuckDB keeps tables and views in ONE catalog set and its consumers filter by the entry's actual type
+	//! (duckdb_columns() scans TABLE_ENTRY alone and handles both).
+	void ScanDeclaredViews(ClientContext &context, const std::function<void(CatalogEntry &)> &callback);
+
 	FabricatorHandle handle_;
 	case_insensitive_map_t<string> table_types_; // table name -> "BASE TABLE" | "VIEW"
 	case_insensitive_set_t scalar_functions_;    // discovered scalar UDF names
@@ -171,6 +217,12 @@ private:
 	case_insensitive_set_t custom_collector_functions_; // provider-authored custom collector (pipeline-breaker) names
 	case_insensitive_map_t<bool> aggregate_functions_; // custom aggregate (UDAF) name -> spillable (4h)
 	case_insensitive_map_t<string> macros_;            // catalog-bound macro name -> its CREATE MACRO statement
+	case_insensitive_map_t<string> views_;             // catalog-bound view name -> its CREATE VIEW statement
+	// Declared view names that COLLIDE with a discovered table name. Views share the TABLE_ENTRY lookup with
+	// tables (bind_basetableref.cpp asks for TABLE_ENTRY and switches on the entry's ACTUAL type), so one of
+	// the two would have to win silently — and a silent shadow is a WRONG ANSWER whichever way it goes.
+	// Neither wins: the name is refused at lookup, naming both sides. See AddView.
+	case_insensitive_set_t view_collisions_;
 	mutex entry_lock_;
 	case_insensitive_map_t<unique_ptr<FabricatorTableEntry>> entries_;
 	// Time-travel entries, keyed name+unit+value (see AtEntryKey). Separate from entries_ so no enumeration
@@ -186,6 +238,9 @@ private:
 	// whether an entry is a ScalarMacroCatalogEntry or a TableMacroCatalogEntry; the kind is recovered from
 	// `type` (MACRO_ENTRY vs TABLE_MACRO_ENTRY) rather than tracked separately.
 	case_insensitive_map_t<unique_ptr<CatalogEntry>> macro_entries_;
+	// Materialized views. Held as the CatalogEntry base for symmetry with macro_entries_ (and because every
+	// path that hands one out wants the base anyway).
+	case_insensitive_map_t<unique_ptr<CatalogEntry>> view_entries_;
 	// GRAVEYARD: evicted entries are RETIRED here, never destroyed mid-session. The lookup paths hand out
 	// RAW pointers that DuckDB's binder holds ACROSS the entry_lock_ (bind -> plan -> execute), so a
 	// concurrent eviction (RollbackTransaction -> InvalidateAllEntries, an ALTER's re-key, a self-heal)

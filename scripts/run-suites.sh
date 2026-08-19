@@ -152,7 +152,10 @@ case "$TIER" in
         # 70 runs since 2026-08-18: verify_delta_clustered_optimize gains a SECOND leg at an accumulated
         # host-query batch size (see ACCUMULATED below) — the only gate on batch size no longer dictating
         # Delta file size, which is what the BudgetedStream boundary split delivers.
-        : "${MIN_SUITES:=70}"
+        # 71 runs since 2026-08-19: verify_views_catalog — provider-declared catalog-bound VIEWS (ABI v77).
+        # Hermetic on purpose although SQL Server declares one too: a view body is a LOCAL declaration on its
+        # own metadata entry, never assembled into provider SQL, so it needs no server.
+        : "${MIN_SUITES:=71}"
         # 5656 since 2026-08-02: verify_delta_catalog_transactions 943 -> 944 Ã¢ÂÂ ROLLBACK now RECLAIMS the
         # data files the transaction eagerly wrote (EW #52's DiscardDataFilesAsync) instead of leaving them
         # for VACUUM. +2, not +1: that suite is one of the DOUBLED ones below, so an assertion added to it
@@ -328,7 +331,11 @@ case "$TIER" in
         # spike must change no other answer.
         # 7646 since 2026-08-18: 7499 + exactly the 147 of the clustered-optimize accumulated leg, so no
         # other suite moved — the claim for a change that alters how the clustered rewrite CUTS FILES.
-        : "${MIN_ASSERTIONS:=7646}"
+        # 7705 since 2026-08-19: 7646 + exactly the 59 of verify_views_catalog, so no other suite moved —
+        # the claim for a change that adds a new CatalogType to the schema entry's lookup and BOTH Scan
+        # overloads. ⚠ Reporting views under the TABLE_ENTRY scan (which duckdb_columns() needs) is the part
+        # that could have disturbed table enumeration, and the unchanged remainder is what says it did not.
+        : "${MIN_ASSERTIONS:=7705}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh
@@ -449,7 +456,14 @@ case "$TIER" in
         # first-party provider still holds the name; "the plugin was rejected" alone would pass on a build
         # where BOTH were broken.
         # 2101 since 2026-08-18: 2080 + exactly the 21 of verify_http_transport, so no surviving suite moved.
-        : "${MIN_ASSERTIONS:=2101}"
+        # 2108 since 2026-08-19: verify_functions 27 -> 34, the SQL Server half of catalog-bound VIEWS. The
+        # mechanism is gated hermetically (verify_views_catalog); what is added here is the one thing that
+        # suite structurally cannot show — a SECOND backend's declarations arriving, into a DISCOVERED schema
+        # rather than through Delta's `__all__` expansion. ⚠ It re-ATTACHes first: the section above it
+        # DETACHes, and without a live catalog the bare-name refusal would assert only that nothing is
+        # attached. Mutation-tested (GetViews serving nothing dies at the first view assertion, after all 28
+        # pre-existing ones pass).
+        : "${MIN_ASSERTIONS:=2108}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

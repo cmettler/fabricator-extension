@@ -147,6 +147,18 @@ internal static class CustomFunctions
             + "CASE WHEN whole IS NULL OR whole = 0 THEN NULL ELSE round(100.0 * part / whole, 2) END"),
     };
 
+    // Catalog-bound VIEWS (ABI v77) — and note the contrast with the macro comment directly above: a VIEW
+    // body IS anchored to this catalog + schema by DuckDB's view binder, so an unqualified table reference
+    // here would resolve against THIS catalog. That is what makes a view, not a macro, the declaration form
+    // for a body that names provider tables. The one below stays self-contained anyway, because a shipped
+    // declaration cannot know which tables a given server has.
+    public static readonly IReadOnlyList<ViewDefinition> CatalogViews = new ViewDefinition[]
+    {
+        // In the discovered `dbo` schema: SELECT * FROM db.dbo.cv_info.
+        new ViewDefinition("dbo", "cv_info",
+            "CREATE VIEW cv_info AS SELECT 'fabricator' AS provider, 'sqlserver' AS kind"),
+    };
+
     public static readonly IReadOnlyList<ICatalogScalarFunction> Scalar = new ICatalogScalarFunction[]
     {
         new CfAddFunction(),

@@ -102,3 +102,44 @@ SELECT fabricator_exec('fdb', 'DROP FUNCTION IF EXISTS dbo.tf_each_probe');
 
 statement ok
 DETACH fdb;
+
+# ── Provider-declared catalog-bound VIEWS reach a SECOND provider ───────────────────────────────
+# verify_views_catalog.test carries the mechanism, hermetically, on the Delta provider. What is
+# asserted HERE is the one thing that suite structurally cannot: that a different backend's
+# declarations arrive too — SqlServerBackend.GetViews, into a DISCOVERED schema (dbo) rather than
+# through Delta's `__all__` sentinel expansion.
+#
+# ⚠ The catalog-bound MACRO beside it (cm_pct) is gated NOWHERE, which is how this gap arose in the
+# first place: a declaration surface that only ever ships on one provider looks covered.
+#
+# ⚠ The section above DETACHes, so this re-attaches. That is not bookkeeping: without a live catalog
+# every assertion below would pass or fail for a reason that has nothing to do with views — the
+# bare-name refusal at the end most of all, which would then merely be asserting that nothing is
+# attached.
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS fdb (TYPE fabricator);
+
+query II
+SELECT schema_name, view_name FROM duckdb_views() WHERE database_name = 'fdb' ORDER BY view_name;
+----
+dbo	cv_info
+
+query II
+SELECT provider, kind FROM fdb.dbo.cv_info;
+----
+fabricator	sqlserver
+
+# It is a VIEW to every catalog surface, not a table — which is what a tool enumerating the catalog
+# reads, and the reason a view is worth more than a zero-argument SQL-generating function.
+query I
+SELECT table_type FROM information_schema.tables WHERE table_catalog = 'fdb' AND table_name = 'cv_info';
+----
+VIEW
+
+# ⚠ NOT callable under its bare name: the assertion that separates catalog-bound from anything
+# registered globally. Without it a regression that put these in the system catalog would pass
+# everything above.
+statement error
+SELECT * FROM cv_info;
+----
+does not exist

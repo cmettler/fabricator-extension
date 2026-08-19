@@ -12,6 +12,40 @@
 > parsed with our own vcpkg yyjson, retiring the `ReadCapabilityFlag` string-find). v74 below is the
 > follow-on that finished the same job for ALTER.
 
+## v77 (2026-08-19) — `catalog_views`: provider-declared catalog-bound VIEWS
+
+**Additive**, one vtable entry beside `catalog_macros`:
+
+```c
+int32_t (*catalog_views)(FabricatorHandle handle, struct ArrowArrayStream *out, char **err);
+```
+
+Three UTF-8 columns — `schema`, `name`, `create_sql` — each `create_sql` one complete `CREATE VIEW`
+statement the HOST parses with DuckDB's own parser and binds into the ATTACHed catalog's schema, where it
+resolves as an ordinary relation `db.schema.v`. Byte-for-byte the same shape as `catalog_macros`, read with
+`ReadStringTable`, fetched best-effort (`DiscoverCatalogViews` never throws — declaring views is optional
+and a broken declaration must never block an ATTACH).
+
+**⚠ The entry is placed mid-struct, beside the other `catalog_*` list entries rather than appended.** That
+shifts every later slot, which is safe only because the version moved with it — a mismatched
+loadable/bridge pair is rejected at boot rather than calling through a wrong signature. Same practice as
+v75's mid-struct removal.
+
+**Why it exists beside `catalog_macros` and is not symmetry.** DuckDB anchors a VIEW body's search path to
+the view's own catalog and schema (`bind_basetableref.cpp:309-311`), so an unqualified table reference
+inside the body resolves against THAT catalog. A macro body has no such anchor — it is expanded in the
+CALLER's context — which is the documented, unfixable hazard of catalog macros. So a view is the only
+declaration form whose body can name the provider's own tables without knowing the ATTACH alias.
+
+Managed side: `ViewDefinition` + `IBackend.CatalogViews` (a DIM, empty by default) in
+`Fabricator.Abstractions`; `IBackendCatalog.GetViews()` (required, mirroring `GetMacros()`);
+`CatalogViewMetadata` in `Fabricator.Bridge`.
+
+Full record, including the two facts the pre-build analysis got wrong and the enumeration defect the build
+produced: [docs/macros-and-sqlgen-functions.md](macros-and-sqlgen-functions.md) §5. Gates
+`test/verify_views_catalog.test` (59, hermetic) + `verify_functions` 27 → 34 (service, the second
+provider).
+
 ## v76 (2026-08-18) — `http_request`: a managed HTTP call routed through DuckDB's own stack
 
 **ADDITIVE**, appended to the END of `FabricatorHostServices` (the reverse-direction block), so nothing

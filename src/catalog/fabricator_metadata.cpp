@@ -196,6 +196,30 @@ vector<FabricatorMacroInfo> DiscoverCatalogMacros(FabricatorHandle handle) {
 	return macros;
 }
 
+vector<FabricatorViewInfo> DiscoverCatalogViews(FabricatorHandle handle) {
+	// Best-effort, exactly as DiscoverCatalogMacros: declaring catalog views is optional, and a provider
+	// problem here must never block an ATTACH. Note this only covers the CROSSING — a view whose BODY is
+	// broken is not detectable here at all (nothing is parsed until first use), so the two failure modes
+	// are handled in different places on purpose.
+	vector<FabricatorViewInfo> views;
+	try {
+		ArrowArrayStream stream;
+		std::memset(&stream, 0, sizeof(stream));
+		fabricator::CatalogViews(handle, stream);
+		// Columns: schema, name, create_sql.
+		auto rows = ReadStringTable(stream, 3);
+		for (idx_t i = 0; i < rows[0].size(); i++) {
+			if (rows[1][i].empty() || rows[2][i].empty()) {
+				continue; // a nameless or bodiless declaration cannot be bound to anything
+			}
+			views.push_back({rows[0][i], rows[1][i], rows[2][i]});
+		}
+	} catch (std::exception &) {
+		views.clear(); // partial reads discarded — all-or-nothing, like the macro set
+	}
+	return views;
+}
+
 void FetchFunctionParamSchema(ClientContext &context, FabricatorHandle handle, const string &schema_name,
                               const string &func_name, vector<string> &names, vector<LogicalType> &types,
                               vector<FabricatorParamStyle> *out_styles) {

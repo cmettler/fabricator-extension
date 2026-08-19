@@ -101,6 +101,36 @@ public sealed class DeltaBackend : IBackend
             "CREATE MACRO fab_numbers(n) AS TABLE SELECT i AS n FROM range(n) t(i)"),
     };
 
+    // Catalog-bound VIEWS (ABI v77). Same local-declaration mechanism as the macros above — and the reason
+    // they are worth having beside them is the one thing a macro cannot do: DuckDB binds a view body against
+    // the VIEW's own catalog and schema, so an UNQUALIFIED reference in a body below resolves HERE. That is
+    // exactly what the macro comment above says a macro body must never rely on.
+    internal static readonly IReadOnlyList<ViewDefinition> DeclaredCatalogViews = new[]
+    {
+        // Self-contained: the always-valid case, and the one that proves a declared view is a RELATION
+        // (enumerable in duckdb_views(), selectable, usable wherever a table is).
+        new ViewDefinition("__all__", "fab_view_info",
+            "CREATE VIEW fab_view_info AS SELECT 'fabricator' AS provider, 'delta' AS kind"),
+        // Reaches a CATALOG-BOUND MACRO declared into the same schema — i.e. the body resolves a name that
+        // exists only inside this catalog. It works because the view binder re-points the entry retriever at
+        // this catalog+schema, which is the whole §5.2 claim, demonstrated on something always present.
+        new ViewDefinition("__all__", "fab_view_numbers",
+            "CREATE VIEW fab_view_numbers AS SELECT n, n * n AS squared FROM fab_numbers(10)"),
+        // ⚠ DELIBERATELY references a table that need not exist. Nothing is bound until the view is USED, so
+        // this declaration is fine at ATTACH, is enumerable, and resolves the moment a table of that name
+        // appears in this catalog's schema — which is both the declaration-order contract and the proof that
+        // an unqualified TABLE reference lands in this catalog rather than the caller's. Until then, using it
+        // is an ordinary binder error naming the missing table.
+        new ViewDefinition("__all__", "fab_view_probe",
+            "CREATE VIEW fab_view_probe AS SELECT * FROM fab_view_source"),
+    };
+
+    /// <summary>
+    /// The provider's catalog views. Same <c>__all__</c> sentinel and the same reason as the macros: a Delta
+    /// root's schema names are folder names, unknown until ATTACH.
+    /// </summary>
+    public IEnumerable<ViewDefinition> CatalogViews => DeclaredCatalogViews;
+
     /// <summary>
     /// The provider's catalog macros. The declarations use the sentinel schema <c>__all__</c>, which
     /// <see cref="DeltaCatalog"/> expands to every schema it discovered — a Delta root's schema names are not
@@ -1051,6 +1081,7 @@ public sealed class DeltaCatalog : IBackendCatalog
     // catalog's schemas as db.schema.m(...). Local declarations — nothing here touches storage, which is
     // exactly why they ride their own discovery entry instead of a SQL discovery stream.
     public IArrowArrayStream GetMacros() => CatalogMacroMetadata.Stream(ExpandCatalogMacroSchemas());
+    public IArrowArrayStream GetViews() => CatalogViewMetadata.Stream(ExpandCatalogViewSchemas());
 
     // DIAGNOSTIC capability rows (property, value) for fabricator_server_info() — since ABI v71 the HOST
     // reads CapabilitiesJson instead (same _pushdownMode source, so the two cannot drift).
@@ -1475,6 +1506,28 @@ public sealed class DeltaCatalog : IBackendCatalog
     /// host drops any whose schema it did not register, which is what makes an ATTACH <c>schema_filter</c> gate
     /// macros too).
     /// </remarks>
+    /// <summary>Same <c>__all__</c> expansion for catalog VIEWS — see <see cref="ExpandCatalogMacroSchemas"/>
+    /// for why the sentinel exists at all.</summary>
+    private IReadOnlyList<ViewDefinition> ExpandCatalogViewSchemas()
+    {
+        var outList = new List<ViewDefinition>();
+        IReadOnlyList<string>? schemas = null;
+        foreach (var v in DeltaBackend.DeclaredCatalogViews)
+        {
+            if (!string.Equals(v.SchemaName, "__all__", System.StringComparison.Ordinal))
+            {
+                outList.Add(v);
+                continue;
+            }
+            schemas ??= SchemaNames();
+            foreach (var s in schemas)
+            {
+                outList.Add(v with { SchemaName = s });
+            }
+        }
+        return outList;
+    }
+
     private IReadOnlyList<CatalogMacroDefinition> ExpandCatalogMacroSchemas()
     {
         var declared = DeltaBackend.DeclaredCatalogMacros;

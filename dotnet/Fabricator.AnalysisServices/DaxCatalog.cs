@@ -134,6 +134,7 @@ internal sealed class DaxCatalog : IBackendCatalog
 
     // No catalog-bound macros and no capability profile on this provider — empty streams, declared shapes.
     public IArrowArrayStream GetMacros() => EmptyStringTable("schema", "name", "create_sql");
+    public IArrowArrayStream GetViews() => EmptyStringTable("schema", "name", "create_sql");
 
     public IArrowArrayStream GetServerInfo() => EmptyStringTable("property", "value");
 

@@ -1,0 +1,271 @@
+# name: test/verify_views_catalog.test
+# description: CATALOG-BOUND provider-declared DuckDB VIEWs (docs/macros-and-sqlgen-functions.md §5, ABI v77).
+#              The provider declares complete CREATE VIEW statements (IBackend.CatalogViews) which the host
+#              parses and binds into the ATTACHed catalog's schemas, so each resolves as an ordinary RELATION
+#              db.schema.v — enumerable, describable, joinable, usable anywhere a table is.
+#
+#              WHY THIS EXISTS BESIDE verify_macros_catalog.test, and it is NOT symmetry. A macro body is
+#              expanded in the CALLER's context, so an unqualified table reference in it resolves against
+#              whatever catalog the caller is in — a silently-wrong-table hazard that catalog macros document
+#              and cannot fix. DuckDB binds a VIEW body against the VIEW's OWN catalog and schema, so the same
+#              reference lands here. §4 is that difference, measured.
+#
+#              WHAT CARRIES THE FEATURE, each with its own failure mode:
+#                (a) §4 THE ANCHORING, with a DECOY. A same-named table in the caller's catalog is what makes
+#                    the section discriminating: without it, "the view returned the lake's rows" is equally
+#                    true of a body bound in the caller's context that happened to find nothing else.
+#                (b) §5 DECLARATION ORDER IS IRRELEVANT, because materialization is a pure PARSE. Pinned in
+#                    both directions — a missing reference is an ordinary binder error at FIRST USE, and the
+#                    same view resolves once the object exists, with no re-attach.
+#                (c) §1 ENUMERATION MUST NOT BIND (column_count IS NULL on a fresh attach). This is what keeps
+#                    listing a catalog's views affordable on Delta/OneLake, where binding one would be a
+#                    _delta_log read per referenced table. A regression here is invisible in every answer.
+#                (d) §6 COLLISION IS REFUSED. A view and a table share ONE catalog lookup, so preferring
+#                    either silently hands somebody the wrong object. The section also pins the POSITIVE
+#                    CONTROL — every other view still resolves — because "the name errored" would be equally
+#                    true of a build where declared views had stopped working entirely.
+#                (e) §3 a body reaching a CATALOG-BOUND MACRO, i.e. a name that exists only inside this
+#                    catalog, which is the §5.2 claim on something always present.
+#
+#              Hermetic: a Delta catalog over FABRICATOR_DELTA_WRITE_DIR. Deliberately not the SQL Server
+#              provider (which declares one too): a view body is a LOCAL declaration on its own metadata
+#              entry, never assembled into provider SQL, so it needs no server — and this suite running with
+#              no service is itself part of that claim.
+# group: [fabricator]
+
+require fabricator
+
+require parquet
+
+require-env FABRICATOR_DELTA_WRITE_DIR
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/views' AS lake (TYPE fabricator, PROVIDER 'delta');
+
+# ==========================================================================================================
+# §1 The declarations arrived as VIEWS, and enumerating them did NOT bind them.
+#
+# ⚠ column_count IS NULL is the whole point of the second query: DuckDB leaves it unset while a view is
+# UNBOUND, and the host materializes a declared view by PARSING only — never through
+# CreateViewInfo::FromCreateView, which binds. Binding here would resolve every referenced table, which on a
+# remote catalog is a metadata read apiece. It must run BEFORE anything else touches a view, since the first
+# USE binds it.
+# ==========================================================================================================
+
+query II
+SELECT schema_name, view_name FROM duckdb_views() WHERE database_name = 'lake' ORDER BY view_name;
+----
+main	fab_view_info
+main	fab_view_numbers
+main	fab_view_probe
+
+query II
+SELECT view_name, column_count IS NULL FROM duckdb_views() WHERE database_name = 'lake' ORDER BY view_name;
+----
+fab_view_info	true
+fab_view_numbers	true
+fab_view_probe	true
+
+# ==========================================================================================================
+# §2 A declared view IS a relation — the property that distinguishes it from a zero-argument SQL-generating
+# table function, which resolves but is not a relation and appears in no catalog listing.
+# ==========================================================================================================
+
+query II
+SELECT provider, kind FROM lake.main.fab_view_info;
+----
+fabricator	delta
+
+# Projection, predicate and aliasing all work because it is bound as an ordinary subquery.
+query I
+SELECT v.kind FROM lake.main.fab_view_info v WHERE v.provider = 'fabricator';
+----
+delta
+
+# ⚠ The BARE name must not resolve: this is the one assertion separating catalog-bound from anything
+# registered globally. Without it a regression that put these in the system catalog would pass every other
+# section here.
+statement error
+SELECT * FROM fab_view_info;
+----
+does not exist
+
+# ==========================================================================================================
+# §3 A body reaches a CATALOG-BOUND MACRO declared into the same schema — a name that exists ONLY inside
+# this catalog, so resolving it proves the body was bound with this catalog's search path rather than the
+# caller's.
+# ==========================================================================================================
+
+query II
+SELECT count(*), sum(squared) FROM lake.main.fab_view_numbers;
+----
+10	285
+
+# ==========================================================================================================
+# §4 ⚠ THE ANCHORING, MEASURED AGAINST A DECOY — the load-bearing section.
+#
+# fab_view_probe's body is "SELECT * FROM fab_view_source", UNQUALIFIED. A table of that name is created in
+# the lake AND an identically-named decoy in the caller's default catalog. A macro body would read the decoy
+# (it binds in the caller's context); a view body must read the lake's.
+#
+# ⚠ Read the decoy as the control. "The view returned the lake's row" would be equally true of a build with
+# no anchoring at all if nothing else of that name existed.
+# ==========================================================================================================
+
+statement ok
+CREATE TABLE lake.main.fab_view_source AS SELECT 1 AS a, 'in-lake' AS src;
+
+statement ok
+CREATE TABLE fab_view_source AS SELECT 99 AS a, 'in-caller' AS src;
+
+query II
+SELECT a, src FROM lake.main.fab_view_probe;
+----
+1	in-lake
+
+# The decoy really is reachable under the bare name — otherwise the assertion above proves nothing about
+# WHICH of two candidates was chosen.
+query II
+SELECT a, src FROM fab_view_source;
+----
+99	in-caller
+
+statement ok
+DROP TABLE fab_view_source;
+
+# ==========================================================================================================
+# §5 DECLARATION ORDER IS IRRELEVANT, in both directions.
+#
+# Nothing is bound until a view is USED, so a body may name an object that does not exist yet. §4 already
+# proved the resolving half (the view was declared at ATTACH, the table created afterwards, no re-attach).
+# This section pins the other half on a SECOND catalog whose table is never created: the failure is an
+# ordinary binder error naming the missing object, not a materialization or ATTACH failure.
+# ==========================================================================================================
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/order' AS lake2 (TYPE fabricator, PROVIDER 'delta');
+
+# The ATTACH succeeded and the view is declared and listed, although its body cannot resolve.
+query I
+SELECT count(*) FROM duckdb_views() WHERE database_name = 'lake2' AND view_name = 'fab_view_probe';
+----
+1
+
+statement error
+SELECT * FROM lake2.main.fab_view_probe;
+----
+fab_view_source
+
+# ⚠ A broken body poisons nothing: the other declared views in the SAME schema still resolve.
+query II
+SELECT provider, kind FROM lake2.main.fab_view_info;
+----
+fabricator	delta
+
+statement ok
+DETACH lake2;
+
+# ==========================================================================================================
+# §6 ⚠ A NAME DECLARED AS A VIEW AND DISCOVERED AS A TABLE IS REFUSED.
+#
+# Both would resolve through the same TABLE_ENTRY lookup, so serving either silently hands the caller the
+# object they did not ask for. The refusal names both sides. A Delta table is written at the colliding path
+# with the catalog UNATTACHED, which is the only way to manufacture the collision from SQL — through an
+# attached catalog the declared view is already in the way.
+# ==========================================================================================================
+
+statement ok
+COPY (SELECT 1 AS a) TO '${FABRICATOR_DELTA_WRITE_DIR}/collide/fab_view_info' (FORMAT delta);
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/collide' AS lake3 (TYPE fabricator, PROVIDER 'delta');
+
+statement error
+SELECT * FROM lake3.main.fab_view_info;
+----
+declared as a VIEW by the provider and also discovered as a table
+
+# The declaration is dropped, so the name is not listed as a view...
+query I
+SELECT count(*) FROM duckdb_views() WHERE database_name = 'lake3' AND view_name = 'fab_view_info';
+----
+0
+
+# ...while the TABLE keeps its place in the catalog listing.
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'lake3' AND table_name = 'fab_view_info';
+----
+1
+
+# ⚠ THE POSITIVE CONTROL, and it is what makes the refusal meaningful: one bad declaration must not take the
+# catalog with it. Every other declared view in that same schema still resolves.
+query I
+SELECT count(*) FROM lake3.main.fab_view_numbers;
+----
+10
+
+statement ok
+DETACH lake3;
+
+# ==========================================================================================================
+# §7 A view participates in the ordinary catalog surfaces — duckdb_columns() and DESCRIBE — which is what a
+# tool enumerating the catalog uses.
+#
+# ⚠ duckdb_columns() scans TABLE_ENTRY ALONE and handles both entry kinds, so a host that reports views only
+# under VIEW_ENTRY makes them invisible here while every other section of this suite still passes. That was
+# a real defect during the build; this is its gate.
+# ==========================================================================================================
+
+query III
+SELECT table_name, column_name, data_type FROM duckdb_columns()
+WHERE database_name = 'lake' AND table_name = 'fab_view_info' ORDER BY column_name;
+----
+fab_view_info	kind	VARCHAR
+fab_view_info	provider	VARCHAR
+
+# The lazily-bound column info of a view over a provider TABLE carries that table's real types.
+query III
+SELECT table_name, column_name, data_type FROM duckdb_columns()
+WHERE database_name = 'lake' AND table_name = 'fab_view_probe' ORDER BY column_name;
+----
+fab_view_probe	a	INTEGER
+fab_view_probe	src	VARCHAR
+
+# A view must NOT be reported as a table, or every tool that lists tables gains a phantom.
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'lake' AND table_name LIKE 'fab_view_%';
+----
+1
+
+# ==========================================================================================================
+# §8 The catalog is read-only for views: DDL against a declared one is refused rather than half-applied.
+# ==========================================================================================================
+
+statement error
+DROP VIEW lake.main.fab_view_info;
+----
+<REGEX>:.*(not supported|read-only|Not implemented).*
+
+statement error
+CREATE VIEW lake.main.some_view AS SELECT 1;
+----
+<REGEX>:.*(not supported|read-only|Not implemented).*
+
+# ==========================================================================================================
+# §9 `information_schema.tables` classifies a declared view as a VIEW, not a BASE TABLE.
+#
+# This is the surface dbt and BI tools actually read, so it is the concrete form of the claim that a view
+# is worth more than a zero-argument SQL-generating function. The real table beside it is the control: a
+# host that reported views under TABLE_ENTRY without DuckDB's consumer-side type filter would put them
+# here as BASE TABLE, which reads as four tables in a catalog that has one.
+# ==========================================================================================================
+
+statement ok
+CREATE TABLE lake.main.iv_t AS SELECT 1 AS a;
+
+query II
+SELECT table_name, table_type FROM information_schema.tables
+WHERE table_catalog = 'lake' AND table_name IN ('fab_view_info', 'iv_t') ORDER BY table_name;
+----
+fab_view_info	VIEW
+iv_t	BASE TABLE

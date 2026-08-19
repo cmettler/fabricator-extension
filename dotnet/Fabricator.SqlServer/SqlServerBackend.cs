@@ -142,6 +142,8 @@ public sealed class SqlServerBackend : IBackend
 
     public IEnumerable<CatalogMacroDefinition> CatalogMacros => CustomFunctions.CatalogMacros;
 
+    public IEnumerable<ViewDefinition> CatalogViews => CustomFunctions.CatalogViews;
+
     public IBackendCatalog OpenCatalog(string connectionString, string optionsJson) =>
         new SqlServerCatalog(connectionString, optionsJson);
 
@@ -2332,6 +2334,8 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     // to the server and read back would be pure waste, and would make the declaration depend on server
     // reachability. Gated by schema_filter host-side (a macro whose schema was not registered is dropped).
     public IArrowArrayStream GetMacros() => CatalogMacroMetadata.Stream(CustomFunctions.CatalogMacros);
+
+    public IArrowArrayStream GetViews() => CatalogViewMetadata.Stream(CustomFunctions.CatalogViews);
 
     // The detected capability profile as (property, value) rows — the fabricator_server_info() diagnostic.
     // Built from the in-memory profile (not a re-query), so it surfaces the derived flags.
