@@ -578,3 +578,92 @@ C ≈ medium (discovery + entry wiring, mostly existing patterns).
 5. **Overload sets for `table_sql`** (same name, several signatures — `query_table` does this via
    `TableFunctionSet`): defer until a concrete need; the named-params + ANY-sentinel machinery
    covers most variance without overloads.
+
+## 5. `ViewDefinition` — a provider-declared VIEW. ANALYSED 2026-08-19, NOTHING BUILT
+
+The catalog-bound counterpart to §1.4's macro: a provider declares one complete `CREATE VIEW …` statement,
+the host binds it into the catalog's schema, and it resolves as an ordinary relation `db.schema.v`. Every
+fact below was read out of DuckDB v1.5.5's source in this session; none is inferred.
+
+### 5.1 Why it is worth more than symmetry with macros
+
+`bind_basetableref.cpp:310` — the view binder anchors the body to the VIEW's own catalog and schema:
+
+```cpp
+GetSearchPath(view_catalog_entry.ParentCatalog(), view_catalog_entry.ParentSchema().name, true);
+view_binder->entry_retriever.SetSearchPath(std::move(view_search_path));
+```
+
+(plus a wildcard `INVALID_SCHEMA` entry meaning "check this catalog whatever schema the reference names").
+
+**That is exactly the hazard §1.4 records for macros and cannot fix** — a macro body is bound in the
+CALLER's context, so an unqualified table reference silently resolves against the caller's catalog. A view
+body does not have that problem, and needs no ATTACH alias threaded in, which is the reason §1.4 hands the
+"body references its own catalog's tables" case to §2's `ISqlTableFunction`. **A `ViewDefinition` closes
+that gap directly.**
+
+⇒ it is SAFER than a catalog macro for this purpose, not merely parallel to it.
+
+### 5.2 What a view body can reach, and it is everything in its own catalog
+
+- **Provider tables (`ITable`)** — YES. The search path lands on `FabricatorSchemaEntry::LookupEntry`
+  (`TABLE_ENTRY`) → `GetOrCreateEntry`, which materialises the table lazily at the binding of whatever
+  statement uses the view.
+- **Catalog-bound macros, scalar UDFs, TVFs, custom 4e/4f functions** — YES, by the SAME mechanism:
+  `ExpressionBinder::BindFunction` (`bind_function_expression.cpp:86`) resolves through `GetCatalogEntry` →
+  the same `entry_retriever` the view binder re-pointed. Table macros and TVFs come through that function's
+  `TABLE_FUNCTION_ENTRY` fallback a few lines below.
+- ⚠ **Keep the body UNQUALIFIED.** Qualifying ANOTHER catalog re-introduces §1.4's problem: the alias is
+  chosen at ATTACH time and a statically-declared body cannot know it.
+
+### 5.3 Dependencies: there is no ordering problem, and the reason is that materialisation is a PURE PARSE
+
+`CreateViewInfo::FromCreateView` parses the statement and rewrites `catalog`/`schema`; it never binds.
+`FromSelect` only calls `ParseSelect`. So `GetOrCreateView` would mirror `GetOrCreateMacro` almost line for
+line — a local parse, no bridge call, nothing resolved. Consequences:
+
+- **Declaration order is irrelevant.** A view may reference a table, macro or function declared later,
+  discovered later, or not existing at all.
+- A missing reference surfaces at FIRST USE as an ordinary binder error naming it.
+- **`duckdb_views()` does NOT force a bind** (`duckdb_views.cpp:142` leaves `column_count` NULL while
+  `view_columns` is unset), so enumerating views does not cascade into materialising every referenced
+  table — which matters on a Delta/OneLake catalog where each materialisation is a `_delta_log` read.
+
+### 5.4 ⚠ The four hazards to settle BEFORE building
+
+1. **⚠ THE DEADLOCK IS DODGED BY DuckDB'S HELPER, NOT BY OUR DESIGN.** `GetOrCreateMacro` holds
+   `entry_lock_` while parsing. Had view materialisation BOUND the body it would re-enter `LookupEntry` →
+   `entry_lock_` on the same thread → deadlock on a non-recursive mutex. `FromCreateView` does not bind, so
+   it is safe — but that is a property of a DuckDB function that could change. **Write the rule down: never
+   call anything that binds while holding `entry_lock_`.**
+2. **Cycle detection covers view→view ONLY.** `Binder::AddBoundView` walks the binder parent chain and
+   throws *"infinite recursion detected"* — keyed on `ViewCatalogEntry`. A view → sqlgen TVF → SQL naming
+   the view would slip past it, because a sqlgen function DISAPPEARS at bind into a subquery (§2). Only
+   reachable if that combination is allowed.
+3. **NAME COLLISION is the one real design decision.** Macros cannot collide (own map, looked up only for
+   macro/table-function types). **Views share the `TABLE_ENTRY` lookup with discovered tables** —
+   `bind_basetableref.cpp` switches on the entry's ACTUAL type — so a declared view named like a discovered
+   table must resolve one way or the other. Following the plugin provider-name decision, REFUSING loudly at
+   declaration is the only option that cannot end in a wrong ANSWER; a silent shadow is how you get one.
+4. **`UpdateBinding` mutates the entry**, and our entries are catalog-lifetime and shared across
+   connections — but it is properly synchronised (atomic load, `bind_lock`, atomic store), so a shared
+   `ViewCatalogEntry` is safe. The body is re-bound per statement, so schema drift under an `ALTER` is
+   picked up rather than cached wrong.
+
+### 5.5 Is it redundant with a zero-argument `ISqlTableFunction`?
+
+Substantively they are close — a sqlgen function is handed the ATTACH alias and vanishes at bind. The
+difference is that **a view is a RELATION**: it appears in `duckdb_views()` / `information_schema.views`,
+dbt and BI tools enumerate it, and it can be referenced anywhere a table can. `FROM cat.s.f()` cannot. That
+visibility is the feature, not the syntax.
+
+### 5.6 Rough shape of the work
+
+`ViewDefinition(SchemaName, Name, CreateSql)` in `Fabricator.Abstractions` mirroring
+`CatalogMacroDefinition`; its own metadata kind (or the macro kind's shape) so it costs no server round
+trip; `FabricatorSchemaEntry::GetOrCreateView` mirroring `GetOrCreateMacro` but calling
+`CreateViewInfo::FromCreateView(context, *this, sql)` and wrapping the result in a `ViewCatalogEntry`;
+`GetOrCreateEntry`'s `TABLE_ENTRY` path consulting the declared views; and `Scan(CatalogType::VIEW_ENTRY)`
+so they are enumerable. ⚠ Mind where the entries LIVE: the AT-clause work found that the context-free
+`Scan(CatalogType, callback)` walks `entries_` DIRECTLY, so the map a declared view sits in decides whether
+it leaks into scans that should not see it.
