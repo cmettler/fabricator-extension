@@ -3035,6 +3035,61 @@ blind claims where one is true.
 Offer draft (not yet sent): the argument is upstream's own, from `DeltaTransaction.IsBlindAppend` and #125's
 interop measurement.
 
+## THE 2026-08-20 BUMP — `2c51cd7 → 3a31d9e`, twelve commits, ALL PARQUET, still zero patches
+
+fast-forward, not a merge). ⚠ TWO of them are SILENT WRITE CORRUPTIONS on paths we use, and one can
+already be in written data.** `git ls-tree HEAD engineered-wood` remains the authority for the pin; this
+prose is not.
+- **⚠⚠ `69ed857` — A NULLABLE COLUMN AUTO-SPLIT ACROSS ROW GROUPS TOOK ITS VALIDITY UNSHIFTED. The bytes
+  on disk were wrong (PyArrow and ParquetSharp read back the same wrong answer), values SHIFTED rather
+  than merely going null, and it bit from the first row-group boundary onward.** Cause: `CopyArray` chose
+  its bitmap branch on `data.NullCount`, and a SLICE whose parent had nulls carries an UNKNOWN (negative)
+  count — so neither `> 0` nor `== 0` held and the fallthrough handed back the ORIGINAL bitmap.
+  - **OUR EXPOSURE, established rather than assumed — DATA FILES ARE SAFE, CHECKPOINTS ARE NOT.** EW's
+    `WriteDataFilesAsync` writes **one parquet file per input BATCH** and our batches are ≤122880 rows
+    (`FABRICATOR_HOST_QUERY_BATCH_ROWS`; ~2048 unaccumulated), so a data file never reaches the 1,000,000
+    `RowGroupMaxRows` default and never auto-splits. **`CheckpointWriter` is the opposite shape**: it
+    builds ONE batch for the whole snapshot (`BuildCheckpointBatch`) and hands it to
+    `ParquetFileWriter.WriteRowGroupAsync`, which auto-splits — and checkpoint columns are heavily
+    nullable by construction (a row is an `add` OR a `remove`, so the other struct is null). ⇒ **any
+    checkpoint of a table with >1M actions written on the CODEC engine was corrupt**, and a corrupt
+    checkpoint is read by every engine.
+  - ⚠ We set `RowGroupMaxRows` in exactly ONE place — `DeltaGlobalTableFunction.cs:511`, 122880 — so
+    EVERYTHING else, checkpoints included, ran at EW's 1M default.
+  - Same class as the two EW parquet bugs we found ourselves (the narrow-int physical-width corruption;
+    the 0-byte snappy payload for an all-null chunk that broke SQL Server reads THROUGH a checkpoint).
+    Three now. **EW's parquet writer is where our silent-corruption history lives** — treat a parquet
+    release note as a data-integrity question, not a dependency bump.
+- **⚠ `cbd0d0f` — FLOAT/DOUBLE DICTIONARY KEYED ON VALUE, NOT BITS, so a column holding both `+0.0` and
+  `-0.0` lost the sign of whichever came second.** Bytes on disk again. `IEquatable<double>.Equals(-0.0,
+  0.0)` is TRUE, which is LOOSER than "the encoded bytes match" — the only equality a dictionary entry may
+  use. Reaches us through `DictionaryEncoder.TryEncodeFixed` on the codec write path. (Its
+  `BufferedParquetWriter` half does NOT: **nothing in EW or our tree references that class**, which also
+  makes `3a31d9e`'s dictionary-statistics fix irrelevant to us.)
+- **Read-path hardening, all "refuse instead of corrupt":** `83c96ca` a nested column whose levels
+  disagree used to hand back a `ListArray` with offsets PAST its child (`[0,1,3]` over two values) as an
+  ordinary array; `8491ba7` four silent integer overflows on an oversized BYTE_ARRAY chunk;
+  `147cd34` a MAP with a key and no value child. These matter for FOREIGN files — the interop direction.
+- **`2cf59fe` — `ParquetWriteOptions.WriteStatistics` (+ a `ColumnWriteStatistics` per-column override and
+  a `GetWriteStatistics` resolver), the same global-plus-map-plus-resolver shape as `ColumnCodecs` /
+  `BloomFilterColumns`.** Not surfaced by us. ⚠ If it ever is, it inherits the bug recorded for
+  `parquet_bloom_filter_columns`: EW matches those per-column maps against the PARQUET path, which on a
+  column-mapped table (the DEFAULT) is the PHYSICAL name, so a logical-name list silently matches nothing.
+- **FSST (5 commits: `5b16915`, `b8a2d48`, `60d16ba`, `8946e76`, `452ebcb`) — NO interop risk for us,
+  because it is opt-in and we never opt in.** `[Experimental("EWPARQUET0003")]`, selected by
+  `ByteArrayEncoding.Fsst`; grep confirms we set no `ByteArrayEncoding` at all. ⚠ **Do NOT enable it, nor
+  ALP:** both are unratified proposals claiming encoding slot 10, EW gives ALP 10 and FSST **11**, and its
+  own commit says files "will not interoperate with an implementation that settles on 10 until the spec
+  picks a winner". Enabling either makes our parquet unreadable by Spark/DuckDB/PyArrow.
+- **Gates: the compile cost was ZERO** (no EW API we call changed — the Bridge built with no new errors);
+  **EW Table.Tests 922/922 × {net10.0, net8.0, net472}** (868 at the previous pin); the new fixes' own
+  tests **114/114**; codec-engine smoke (5000 rows with a nullable string + a double, UPDATE + DELETE)
+  correct; and our hermetic tier at its floor.
+  - ⚠ **EW `Parquet.Tests` reports 119 FAILURES and every one is the uninitialised `parquet-testing`
+    corpus** (`DirectoryNotFoundException: Could not find parquet-testing/data/`), which we deliberately do
+    not init (~½ GB). 818 pass. Verified by reading the failure reason rather than assuming, because "119
+    failed" on a parquet bump is exactly the shape a real regression would take.
+
 ## THE 2026-08-12 PIN ONTO UPSTREAM — the fork branch is GONE, the submodule points at clast-project
 
 The 2026-08-11 bump cut `fabricator-patches-v3` off `upstream/main` carrying ONE patch. That patch is now

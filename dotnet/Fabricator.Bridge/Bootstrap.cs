@@ -395,6 +395,13 @@ public static unsafe class Bootstrap
         try
         {
             var catalog = Handles.Resolve<IBackendCatalog>(handle);
+            if (catalog is null)
+            {
+                // ⚠ Deliberately NOT the CatalogList fallback of opening a fresh catalog: initialising a
+                // DIFFERENT catalog than the host asked about is worse than refusing, and unlike a discovery
+                // read there is no result to approximate. An unresolvable handle here is a host bug.
+                return FabricatorStatus.InvalidArgument;
+            }
             // Logged on the MANAGED side, matching the `abi <entry>` convention of the discovery crossings —
             // and it is what makes the gate meaningful: the host's own line proves only that it CALLED, while
             // this one proves the crossing ARRIVED and the provider's Initialize ran.
