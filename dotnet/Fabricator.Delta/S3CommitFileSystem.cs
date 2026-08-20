@@ -105,6 +105,16 @@ public static class AmbientS3Credential
 /// </summary>
 internal sealed class S3CommitFileSystem : ITableFileSystem
 {
+    // Per-IO Debug lines for the operations this class performs ITSELF, via the AWS SDK. ⚠ Deliberately only
+    // those: everything from ListAsync down DELEGATES to _inner (DuckDbTableFileSystem), which logs to the
+    // SAME `Fabricator.Host.Fs` category — instrumenting the delegating members here would double every line
+    // and make an IO timeline read as twice the traffic. What is genuinely invisible without these is the
+    // CONDITIONAL PUT: it is the Delta commit primitive, it does NOT go through the host filesystem, and
+    // whether it SUCCEEDED or lost the race is the single most important fact in a concurrent-writer
+    // investigation.
+    private static readonly Microsoft.Extensions.Logging.ILogger IoLog =
+        FabricatorLog.CreateLogger("Fabricator.Host.Fs");
+
     private readonly ITableFileSystem _inner;
     private readonly S3CommitCredential _cred;
     private readonly string _bucket;
@@ -191,6 +201,12 @@ internal sealed class S3CommitFileSystem : ITableFileSystem
 
     private static async Task RenameDirectoryAsync(string srcUrl, string dstUrl, S3CommitCredential cred)
     {
+        // O(objects) server-side: ListObjectsV2 + CopyObject per key + batched DeleteObjects. Logged because a
+        // table RENAME (the dbt tmp-swap) is ONE call here and a great deal of traffic underneath.
+        if (IoLog.IsEnabled(Microsoft.Extensions.Logging.LogLevel.Debug))
+        {
+            Microsoft.Extensions.Logging.LoggerExtensions.LogDebug(IoLog, "s3 rename-dir {Src} -> {Dst}", srcUrl, dstUrl);
+        }
         // Cancellable on query interrupt (the opener is set fresh by the ALTER operator).
         using var interrupt = new InterruptScope(AmbientOpener.Current);
         var token = interrupt.Token;
@@ -288,7 +304,19 @@ internal sealed class S3CommitFileSystem : ITableFileSystem
         }
         catch (AmazonS3Exception ex) when (ex.StatusCode == HttpStatusCode.PreconditionFailed)
         {
+            // The commit LOST the race — logged because a retry storm is otherwise indistinguishable from
+            // slow IO, and they call for opposite fixes.
+            if (IoLog.IsEnabled(Microsoft.Extensions.Logging.LogLevel.Debug))
+            {
+                Microsoft.Extensions.Logging.LoggerExtensions.LogDebug(
+                    IoLog, "s3 put-if-absent {Key}: LOST (precondition failed)", Key(path));
+            }
             return false;
+        }
+        if (IoLog.IsEnabled(Microsoft.Extensions.Logging.LogLevel.Debug))
+        {
+            Microsoft.Extensions.Logging.LoggerExtensions.LogDebug(
+                IoLog, "s3 put-if-absent {Key}: won ({Bytes} bytes)", Key(path), data.Length);
         }
         return true;
     }

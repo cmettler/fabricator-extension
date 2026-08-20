@@ -119,6 +119,23 @@ internal sealed unsafe class DuckDbTableFileSystem : ITableFileSystem
         return p.StartsWith(prefix, StringComparison.Ordinal) ? p.Substring(prefix.Length) : p;
     }
 
+    // Per-IO Debug lines, the log-side twin of AdlsGen2TableFileSystem's (Fabricator.Adls.Fs) and
+    // OneLakeForwardFs's (Fabricator.OneLake.Fs). This filesystem was the ONE storage backend with no per-IO
+    // instrument, which is why an `s3://` suite that went from ~30 to ~70 minutes could not be attributed:
+    // the ADLS instrument is exactly what turned the 2026-08-16 OneLake mystery (a ~15 s table open) into a
+    // checkpoint read of ~63 ranged micro-GETs, and nothing equivalent existed here.
+    //
+    // ⚠ IT IS NOT REDUNDANT WITH DuckDB'S OWN `FileSystem` LOG TYPE, which is richer at the byte level —
+    // `SET enabled_log_types='FileSystem'` emits {"fs":"S3FileSystem","path":…,"op":"READ","bytes":…,"pos":…}
+    // per operation and is the better micro-GET detector. What it CANNOT say is which DELTA operation caused
+    // the IO: a log listing, a `_last_checkpoint` probe, a commit replay, a checkpoint read, a data scan or a
+    // commit write all look alike to it. These lines carry that attribution, so the two are read TOGETHER —
+    // DuckDB's for what the IO was, ours for why it happened.
+    //
+    // Debug-gated; never compute log arguments before the IsEnabled check on a per-IO path.
+    internal static readonly Microsoft.Extensions.Logging.ILogger IoLog =
+        FabricatorLog.CreateLogger("Fabricator.Host.Fs");
+
     public async IAsyncEnumerable<TableFileInfo> ListAsync(
         string prefix, [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
@@ -139,7 +156,17 @@ internal sealed unsafe class DuckDbTableFileSystem : ITableFileSystem
         // exactly like `pre*` (also measured) — so this cannot change the shape no Delta caller uses.
         var pattern = _root + "/" + Normalize(prefix) + "**";
         var json = HostFs.Glob(Opener, pattern);
-        foreach (var entry in ParseGlob(json))
+        var globbed = ParseGlob(json);
+        // The COUNT is the point, not just the call: a Delta open's cost is dominated by how many objects the
+        // log listing returns (CLAUDE.md measures ~10 ms per dead commit on S3), and a listing that returns
+        // hundreds is the difference between a fast and a slow open. Logged AFTER the parse so the number is
+        // real rather than a promise.
+        if (IoLog.IsEnabled(Microsoft.Extensions.Logging.LogLevel.Debug))
+        {
+            Microsoft.Extensions.Logging.LoggerExtensions.LogDebug(
+                IoLog, "host list {Pattern} -> {Count} entries", pattern, globbed.Count);
+        }
+        foreach (var entry in globbed)
         {
             cancellationToken.ThrowIfCancellationRequested();
             // The host glob no longer opens each match for its size (an open can DOWNLOAD the blob on a
@@ -175,12 +202,26 @@ internal sealed unsafe class DuckDbTableFileSystem : ITableFileSystem
     public ValueTask<IRandomAccessFile> OpenReadAsync(string path, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        return new ValueTask<IRandomAccessFile>(new DuckDbRandomAccessFile(Opener, Resolve(path)));
+        if (IoLog.IsEnabled(Microsoft.Extensions.Logging.LogLevel.Debug))
+        {
+            Microsoft.Extensions.Logging.LoggerExtensions.LogDebug(IoLog, "host open {Path}", path);
+        }
+
+        // ⚠ BUFFER SMALL FILES ON REMOTE ROOTS ONLY — see DuckDbRandomAccessFile. The ADLS twin needed no
+        // such test because it is remote by construction; this filesystem also serves LOCAL roots (the whole
+        // hermetic tier), where a per-call round trip costs nothing and downloading a whole file to answer a
+        // small ranged read would be pure waste. Same predicate the PathConstraints property uses.
+        return new ValueTask<IRandomAccessFile>(
+            new DuckDbRandomAccessFile(Opener, Resolve(path), bufferSmallFiles: _root.Contains("://")));
     }
 
     public ValueTask<bool> ExistsAsync(string path, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        if (IoLog.IsEnabled(Microsoft.Extensions.Logging.LogLevel.Debug))
+        {
+            Microsoft.Extensions.Logging.LoggerExtensions.LogDebug(IoLog, "host exists {Path}", path);
+        }
         return new ValueTask<bool>(ResolvedExists(Resolve(path)));
     }
 
@@ -209,6 +250,11 @@ internal sealed unsafe class DuckDbTableFileSystem : ITableFileSystem
 
     public ValueTask<byte[]> ReadAllBytesAsync(string path, CancellationToken cancellationToken = default)
     {
+        if (IoLog.IsEnabled(Microsoft.Extensions.Logging.LogLevel.Debug))
+        {
+            Microsoft.Extensions.Logging.LoggerExtensions.LogDebug(IoLog, "host read-all {Path}", path);
+        }
+
         // Bounded reopen-retry for MUTABLE small files (this method's callers: _last_checkpoint +
         // commit JSONs; only _last_checkpoint is overwritten in place). On an object store, DuckDB's
         // httpfs validates the etag recorded at open against the range read — a CONCURRENT writer's
@@ -373,6 +419,11 @@ internal sealed unsafe class DuckDbTableFileSystem : ITableFileSystem
 
     public ValueTask DeleteAsync(string path, CancellationToken cancellationToken = default)
     {
+        if (IoLog.IsEnabled(Microsoft.Extensions.Logging.LogLevel.Debug))
+        {
+            Microsoft.Extensions.Logging.LoggerExtensions.LogDebug(IoLog, "host delete {Path}", path);
+        }
+
         cancellationToken.ThrowIfCancellationRequested();
         HostFs.Remove(Opener, Resolve(path));
         return ValueTask.CompletedTask;
@@ -431,13 +482,40 @@ internal sealed unsafe class DuckDbTableFileSystem : ITableFileSystem
 /// </summary>
 internal sealed unsafe class DuckDbRandomAccessFile : IRandomAccessFile
 {
+    // Same per-IO Debug category as the owning filesystem (Fabricator.Host.Fs). ⚠ THESE RANGED READS ARE THE
+    // ONES THAT MATTER: on the ADLS twin the equivalent method was the LAST uninstrumented one, and it is
+    // where the 2026-08-16 OneLake finding actually lived — a checkpoint parquet consumed as ~63 sequential
+    // ranged GETs of 8-7096 bytes at ~180 ms each, which looked like "13 s of silence" until this line
+    // existed. A burst of small reads at climbing offsets on ONE path is that signature.
+    private static readonly Microsoft.Extensions.Logging.ILogger IoLog = DuckDbTableFileSystem.IoLog;
+
+    /// <summary>Files at or below this are downloaded WHOLE on the first ranged read and served from memory,
+    /// on REMOTE roots only.
+    /// <para>⚠ MEASURED here, not inherited: the per-IO instrument showed a scan of a 4-row table with a
+    /// 218-commit log doing 57 ranged reads of 8-55 bytes each — 17,236 bytes in 57 requests — all on ONE
+    /// ~17 KB checkpoint parquet. That is engineered-wood's parquet reader taking the footer length, the
+    /// footer, then every column chunk as its own round trip. It is the SAME defect, and the same fix, that
+    /// AdlsGen2TableFileSystem got on 2026-08-16 for OneLake (where it was ~63 GETs at ~180 ms ≈ 12 s, the
+    /// whole "log replay" span of a table open) — the fix simply never reached this filesystem, so every
+    /// `s3://` root, and every `abfss://` root WITHOUT a named credential, still paid it.</para>
+    /// <para>⚠ Above the cap, TRUE ranged reads are kept deliberately: a column-pruned read of a big DATA
+    /// file must not download all of it. Below it the round trip dominates the bytes. Note the codec engine
+    /// DOES read data files through this handle, so the cap is a real trade and not only a checkpoint
+    /// optimisation.</para></summary>
+    private const long BufferedReadMax = 16 * 1024 * 1024;
+
     private readonly nint _file;
+    private readonly string _path;
+    private readonly bool _bufferSmallFiles;
+    private byte[]? _buffer; // the whole file, downloaded lazily on the first read when eligible
     private long _length = -1;
     private bool _closed;
 
-    public DuckDbRandomAccessFile(nint opener, string resolvedPath)
+    public DuckDbRandomAccessFile(nint opener, string resolvedPath, bool bufferSmallFiles = false)
     {
         _file = HostFs.OpenRead(opener, resolvedPath);
+        _path = resolvedPath;
+        _bufferSmallFiles = bufferSmallFiles;
     }
 
     public ValueTask<long> GetLengthAsync(CancellationToken cancellationToken = default)
@@ -451,6 +529,44 @@ internal sealed unsafe class DuckDbRandomAccessFile : IRandomAccessFile
 
     public ValueTask<IMemoryOwner<byte>> ReadAsync(FileRange range, CancellationToken cancellationToken = default)
     {
+        if (_bufferSmallFiles && _buffer is null && Eligible())
+        {
+            // A benign race in principle (two first reads would download twice, last assignment wins, both
+            // correct) — and unreachable in practice: a handle is used by one reader. The objects read through
+            // this handle are Delta log/checkpoint/data files, which are never overwritten in place;
+            // `_last_checkpoint`, the one exception, is read via ReadAllBytesAsync rather than a handle.
+            if (IoLog.IsEnabled(Microsoft.Extensions.Logging.LogLevel.Debug))
+            {
+                Microsoft.Extensions.Logging.LoggerExtensions.LogDebug(
+                    IoLog, "host read {Path} (whole file, {Len} bytes, buffered)", _path, _length);
+            }
+            var whole = new byte[_length];
+            if (_length > 0)
+            {
+                fixed (byte* wp = whole)
+                {
+                    HostFs.Read(_file, wp, _length, 0);
+                }
+            }
+            _buffer = whole;
+        }
+        if (_buffer is not null)
+        {
+            // Served from memory: no host call, no log line — the buffered download above is the one IO, and
+            // logging these too would make an IO timeline show traffic that never happened.
+            int avail = (int)Math.Min(range.Length, Math.Max(0, _buffer.Length - range.Offset));
+            var hit = new ExactMemoryOwner(avail);
+            if (avail > 0)
+            {
+                Array.Copy(_buffer, range.Offset, hit.Array, 0, avail);
+            }
+            return new ValueTask<IMemoryOwner<byte>>(hit);
+        }
+        if (IoLog.IsEnabled(Microsoft.Extensions.Logging.LogLevel.Debug))
+        {
+            Microsoft.Extensions.Logging.LoggerExtensions.LogDebug(
+                IoLog, "host read {Path} @{Offset}+{Length}", _path, range.Offset, range.Length);
+        }
         var owner = new ExactMemoryOwner((int)range.Length);
         if (range.Length > 0)
         {
@@ -462,9 +578,28 @@ internal sealed unsafe class DuckDbRandomAccessFile : IRandomAccessFile
         return new ValueTask<IMemoryOwner<byte>>(owner);
     }
 
+    /// <summary>Whether this file is small enough to buffer. Sizing needs no IO — HostFs.Size is
+    /// GetFileSize on the ALREADY-OPEN handle, which httpfs answers from the open, so the check is free.</summary>
+    private bool Eligible()
+    {
+        if (_length < 0)
+        {
+            _length = HostFs.Size(_file);
+        }
+        return _length >= 0 && _length <= BufferedReadMax;
+    }
+
     public ValueTask<IReadOnlyList<IMemoryOwner<byte>>> ReadRangesAsync(
         IReadOnlyList<FileRange> ranges, CancellationToken cancellationToken = default)
     {
+        // Logged as ONE line for the batch as well as per range below: a reader that asks for many ranges in
+        // one call is doing something structurally different from one that loops, and the distinction is
+        // invisible if only the individual reads are visible.
+        if (IoLog.IsEnabled(Microsoft.Extensions.Logging.LogLevel.Debug))
+        {
+            Microsoft.Extensions.Logging.LoggerExtensions.LogDebug(
+                IoLog, "host read-ranges {Path} x{Count}", _path, ranges.Count);
+        }
         var result = new IMemoryOwner<byte>[ranges.Count];
         for (int i = 0; i < ranges.Count; i++)
         {

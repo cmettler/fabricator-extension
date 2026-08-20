@@ -152,6 +152,74 @@ skipping, byte-order-sound) — all green. The Apache.Arrow version is aligned (
 - Watch: don't double-coalesce (httpfs vs engineered-wood's `CoalescingFileReader`); buffer-copy at the
   boundary is network-dominated but measure for many-small-metadata-read patterns.
 
+## Per-IO instrumentation, and the micro-GET fix it found (2026-08-20)
+
+`DuckDbTableFileSystem` was the ONE storage backend with no per-IO instrument —
+`AdlsGen2TableFileSystem` has `Fabricator.Adls.Fs` and `OneLakeForwardFs` has `Fabricator.OneLake.Fs`,
+and the host-FS path (every `s3://` root, every `abfss://` root WITHOUT a named credential, and every
+local root) had nothing. It now logs to **`Fabricator.Host.Fs`**, Debug-gated:
+
+- `DuckDbTableFileSystem` — `list` (with the ENTRY COUNT, since that is what dominates a Delta open),
+  `open`, `exists`, `read-all`, `delete`.
+- `DuckDbRandomAccessFile` — `read {path} @{offset}+{length}` and `read-ranges {path} x{count}`. The
+  ranged reads are the ones that matter; the equivalent method was the last uninstrumented one on the
+  ADLS twin, and it is where the 2026-08-16 OneLake finding actually lived.
+- `S3CommitFileSystem` — only what it does ITSELF via the AWS SDK: the conditional PUT (**won / LOST**,
+  because a retry storm and slow IO are indistinguishable without it and call for opposite fixes) and
+  `rename-dir`. ⚠ Everything from `ListAsync` down DELEGATES to the inner host FS, which logs to the same
+  category; instrumenting those would double every line and make a timeline read as twice the traffic.
+
+### ⚠ It is complementary to DuckDB's OWN logging, not a substitute
+
+```sql
+SET logging_level='TRACE'; SET enabled_log_types='FileSystem,HTTP'; SET enable_logging=true;
+-- {"fs":"S3FileSystem","path":"s3://…","op":"READ","bytes":"974","pos":"0"}
+```
+
+DuckDB's `FileSystem` log type is RICHER at the byte level and is the better micro-GET detector; its
+`HTTP` type gives request/response. What neither can say is which DELTA operation caused the IO — a log
+listing, a `_last_checkpoint` probe, a commit replay, a checkpoint read, a data scan and a commit write
+all look alike. Read them TOGETHER: **DuckDB's for what the IO was, ours for why it happened.** ⚠ These
+entries do NOT land in `duckdb_logs` (its storage defaults to stdout).
+
+### THE DEFECT IT FOUND ON ITS FIRST RUN — the OneLake fix had never reached this filesystem
+
+Scanning a 4-row table with a 218-commit log on `s3://` did **73 IO operations**, of which **57 were
+ranged reads of 8–55 bytes each — 17,236 bytes in 57 requests — all on ONE ~17 KB checkpoint parquet.**
+That is engineered-wood's parquet reader taking the footer length, the footer, then every column chunk
+as its own round trip: byte-for-byte the same defect `AdlsGen2TableFileSystem` fixed on 2026-08-16 with
+`BufferedReadMax = 16 MB` (where it was ~63 GETs at ~180 ms ≈ 12 s, the whole "log replay" span of a
+table open and most of the 291 s → 8.8 s win). **The fix simply never reached the host-FS path.**
+
+`DuckDbRandomAccessFile` now buffers whole files at or below 16 MB on the first ranged read:
+**57 ranged reads → 0, and 73 IO operations → 17.**
+
+- ⚠ **The local win is within noise and the claim is the REQUEST COUNT, not the clock.** MinIO on
+  localhost: 1.43 s → 1.32 s. At the ~180 ms per remote request measured for OneLake, 56 saved round
+  trips is ~10 s per table open. Quote the counts.
+- ⚠ **GATED ON REMOTE ROOTS (`_root.Contains("://")`), which the ADLS twin did not need** because it is
+  remote by construction. This filesystem also serves LOCAL roots — the entire hermetic tier — where a
+  per-call round trip costs nothing and downloading a whole file to answer a small ranged read is pure
+  waste. Control measured: a local root still shows 0 buffered and 4 ranged reads, so local behaviour is
+  unchanged BY CONSTRUCTION rather than by luck.
+- ⚠ Above the cap TRUE ranged reads are kept deliberately: the codec engine DOES read data files through
+  this handle, so a column-pruned read of a big file must not download all of it. The cap is a real
+  trade, not only a checkpoint optimisation.
+
+### ⚠⚠ AND THE INVESTIGATION THAT PROMPTED ALL THIS WAS CHASING A MEASUREMENT ARTIFACT
+
+`verify_delta_catalog_s3` was believed to have degraded from ~30 to ~70 minutes and then to stall. Timed
+properly — `S=$(date +%s); …; echo $(( $(date +%s) - S ))` — it takes **196 s** and passes at its usual
+196 assertions; the whole hermetic tier takes **414 s**. The apparent slowdown came from reading progress
+behind a BACKGROUNDED `sleep`, which does not delay the next tool call, so every "check ten minutes later"
+sampled the same instant. The bucket-accumulation theory, the MinIO health checks and the "CPU rate decay"
+were all analysis of an artifact. **The gap analysis then said so directly: over the suite's whole span the
+largest gap between IO events is 1.2 s and gaps ≥1 s are 1% of it — there is no dead time to find.**
+
+Two things survive from it and are worth keeping: the instrument, and the fix above. Also measured and
+real but small: a 218-commit log costs ~0.6 s per scan of that table (≈2.7 ms per dead commit), which is
+maintenance, not a performance problem.
+
 ## ABI
 
 v40 appended `fs_spike` to the vtable + introduced `FabricatorHostServices` (passed to `Bootstrap.Initialize`,
