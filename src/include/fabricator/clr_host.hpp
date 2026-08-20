@@ -201,6 +201,12 @@ public:
 void CatalogSchemas(FabricatorHandle handle, ArrowArrayStream &out);
 void CatalogTables(FabricatorHandle handle, ArrowArrayStream &out);
 void CatalogFunctions(FabricatorHandle handle, ArrowArrayStream &out);
+// Give the provider its ONE chance to initialise with a live client context (ABI v78) — called from
+// LoadCatalog after the ambients are established and BEFORE any discovery crossing. Optional provider-side
+// (a no-op DIM), but THROWS when the provider fails: init is where "I cannot serve this catalog" belongs,
+// which is why open_catalog (no ambients, construction only) could never be that place.
+void CatalogInit(FabricatorHandle handle);
+
 void CatalogMacros(FabricatorHandle handle, ArrowArrayStream &out);
 void CatalogViews(FabricatorHandle handle, ArrowArrayStream &out);
 void CatalogServerInfo(FabricatorHandle handle, ArrowArrayStream &out);

@@ -246,6 +246,30 @@ public interface IBackendCatalog : IDisposable
     /// fallbacks (SqlServer threw, Delta answered a 1-column empty table — the shape behind the
     /// <c>ReadStringTable</c> OOB hazard the macros pass had to guard).
     /// </summary>
+    /// <summary>
+    /// The provider's one chance to initialise with a LIVE client context. Called at ATTACH, from the host's
+    /// catalog load, immediately after the host-FS opener and settings session are established and BEFORE any
+    /// discovery call below. No-op by default — a provider that needs nothing implements nothing.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>Why it exists.</b> <see cref="IBackend.OpenCatalog(string,string)"/> runs with NO ambients:
+    /// there is no opener and no settings session, because it only CONSTRUCTS the catalog — an invariant the
+    /// host relies on. So a provider whose setup needs a context (connect and detect the engine, resolve a
+    /// secret, probe the root) had nowhere to put it, and had to hang it off whichever discovery call happened
+    /// to run first. The ORDER of those is not part of this contract, so that was luck; this is the
+    /// guarantee.</para>
+    /// <para>⚠ A throw here FAILS THE ATTACH, and that is the point — init is where a provider says it cannot
+    /// serve this catalog. Contrast <see cref="CapabilitiesJson"/>, whose failure is swallowed into safe
+    /// defaults because degraded pushdown is correct, merely slower.</para>
+    /// <para>⚠ Lazy initialisation must NOT be removed in favour of this. A catalog reached through
+    /// <c>fabricator_query</c>/<c>fabricator_exec</c> with a raw connection string, or a transient catalog
+    /// built by <c>COPY … (FORMAT delta)</c>, never goes through the host's catalog load and so never gets
+    /// this call. Treat it as an EAGER, well-placed trigger for init that must remain lazily reachable.</para>
+    /// </remarks>
+    void Initialize()
+    {
+    }
+
     IArrowArrayStream GetSchemas();
 
     /// <summary>Catalog discovery — the tables, three UTF-8 columns: schema, table,

@@ -56,6 +56,19 @@ void FabricatorCatalog::LoadCatalog(ClientContext &context) {
 	// opener (secret resolution). Harmless for SQL/DAX (they ignore the opener ambient).
 	FabricatorSetActiveTxn(handle_, context);
 
+	// The provider's init hook (ABI v78) — FIRST crossing after the ambients, before any discovery. This is
+	// the only place a provider can do setup that needs a client context: open_catalog runs with NO ambients
+	// (it only constructs), so before this hook existed such work had to hang off whichever discovery
+	// crossing ran first — and the order below is not part of the contract. In practice get_capabilities
+	// became the de-facto init hook by accident of being first, which is how SQL Server's first CONNECT came
+	// to happen inside a call documented as reading a doc of booleans.
+	//
+	// ⚠ NOT wrapped in a catch, unlike the capabilities read directly below: an init failure is the provider
+	// declining the catalog, and the ATTACH is where that must surface. FabricatorAttach wraps it into the
+	// "connection validation failed" IOException, so no catalog is created.
+	DUCKDB_LOG_DEBUG(context, "fabricator: catalog_init");
+	fabricator::CatalogInit(handle_);
+
 	// The catalog's capability doc, read ONCE here (ABI v71): `is_binary_collation` => SQL Server's
 	// byte-order string sort matches DuckDB, so string-keyed ORDER BY+LIMIT can be pushed;
 	// `exact_filter_pushdown` => the provider applies pushed filters exactly, so the scan may advertise
@@ -67,10 +80,22 @@ void FabricatorCatalog::LoadCatalog(ClientContext &context) {
 		string_order_pushable_ = caps.string_order_pushable;
 		exact_filter_pushdown_ = caps.exact_filter_pushdown;
 		null_order_expressible_ = caps.null_order_expressible;
-	} catch (...) {
+	} catch (std::exception &ex) {
 		string_order_pushable_ = false;
 		exact_filter_pushdown_ = false;
 		null_order_expressible_ = false;
+		// ⚠ IT WARNS NOW, and the silence was the defect. This catch guards TWO unrelated things: a provider
+		// that cannot answer (fine — defaults are the safe direction, superset-and-re-apply) and a TRANSIENT
+		// failure of whatever the provider needs to answer. The second one used to disable string ORDER BY
+		// pushdown and exact filter pushdown for the CATALOG'S WHOLE LIFE, with no signal anywhere — a
+		// permanent, invisible performance regression from a momentary blip. Deliberately still not fatal:
+		// the defaults are CORRECT, just slower, so turning a degradation into a failed ATTACH would be a
+		// worse trade. Made visible instead of made fatal.
+		DUCKDB_LOG_WARNING(context, StringUtil::Format(
+		                                "fabricator: capability detection failed for catalog '%s' — every "
+		                                "capability is off for this attach (pushdown stays superset-and-"
+		                                "re-apply, string ORDER BY+LIMIT is not pushed): %s",
+		                                GetName(), ex.what()));
 	}
 
 	auto ensure_schema = [&](const string &schema_name) -> FabricatorSchemaEntry & {

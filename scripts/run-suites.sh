@@ -155,7 +155,10 @@ case "$TIER" in
         # 71 runs since 2026-08-19: verify_views_catalog — provider-declared catalog-bound VIEWS (ABI v77).
         # Hermetic on purpose although SQL Server declares one too: a view body is a LOCAL declaration on its
         # own metadata entry, never assembled into provider SQL, so it needs no server.
-        : "${MIN_SUITES:=71}"
+        # 72 runs since 2026-08-20: verify_catalog_init — the provider init hook (ABI v78). Hermetic on the
+        # DELTA provider deliberately, i.e. the one whose Initialize() is a no-op DIM: that is what proves the
+        # hook is wired in the HOST rather than in one provider.
+        : "${MIN_SUITES:=72}"
         # 5656 since 2026-08-02: verify_delta_catalog_transactions 943 -> 944 Ã¢ÂÂ ROLLBACK now RECLAIMS the
         # data files the transaction eagerly wrote (EW #52's DiscardDataFilesAsync) instead of leaving them
         # for VACUUM. +2, not +1: that suite is one of the DOUBLED ones below, so an assertion added to it
@@ -335,7 +338,10 @@ case "$TIER" in
         # the claim for a change that adds a new CatalogType to the schema entry's lookup and BOTH Scan
         # overloads. ⚠ Reporting views under the TABLE_ENTRY scan (which duckdb_columns() needs) is the part
         # that could have disturbed table enumeration, and the unchanged remainder is what says it did not.
-        : "${MIN_ASSERTIONS:=7705}"
+        # 7719 since 2026-08-20: 7705 + exactly the 14 of verify_catalog_init, so no other suite moved —
+        # which is the whole claim for this change: it moves WHERE work happens (SQL Server's first CONNECT
+        # leaves get_capabilities for catalog_init), not WHAT any answer is.
+        : "${MIN_ASSERTIONS:=7719}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

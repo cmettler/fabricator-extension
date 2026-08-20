@@ -12,6 +12,82 @@
 > parsed with our own vcpkg yyjson, retiring the `ReadCapabilityFlag` string-find). v74 below is the
 > follow-on that finished the same job for ALTER.
 
+## v78 (2026-08-20) — `catalog_init`: the provider's ONE chance to initialise with a live client context
+
+**Additive**, one entry beside `get_capabilities`:
+
+```c
+int32_t (*catalog_init)(FabricatorHandle handle, char **err);
+```
+
+Called from `FabricatorCatalog::LoadCatalog` immediately after `FabricatorSetActiveTxn` establishes the
+ambients (txn + host-FS opener + settings session) and **before every discovery crossing**. Managed side:
+`IBackendCatalog.Initialize()`, a **DIM no-op** — a provider that needs nothing implements nothing, and no
+plugin breaks.
+
+**⚠ WHY IT WAS MISSING, and the accident it institutionalised.** `open_catalog` runs with NO ambients,
+because it only CONSTRUCTS the catalog — `fabricator_storage.cpp:211` records that as MEASURED (a mutant
+adding `SetActiveOpener` there changes nothing) and the invariant is what makes the absent ambient safe. So a
+provider whose setup needs a context — connect and detect the engine, resolve a secret, probe a root — had
+nowhere to put it and had to hang it off whichever discovery call ran FIRST. **That order is not part of the
+contract**, so it was luck. In practice `get_capabilities` became the de-facto init hook by being first,
+which is how **SQL Server's first CONNECT ended up inside a call documented as reading a doc of booleans**
+(`CapabilitiesJson` reads `Profile.IsBinaryCollation`, whose getter is `EnsureProfile()`).
+
+**⚠ ITS EXCEPTIONS PROPAGATE, and that is the point of the placement rather than a property of the entry.**
+The call sits ABOVE `DiscoverSchemas` and is wrapped by NOTHING inside `LoadCatalog` — the only `catch`
+there is scoped to the capability read BELOW it, which is what makes the placement safe rather than lucky.
+`FabricatorAttach` then wraps it, so a failing init fails the ATTACH and **creates no catalog**. MEASURED:
+`IO Error: MSSQL connection validation failed: … catalog_init failed: 258: …`, and `duckdb_databases()` has
+no such row.
+
+⚠ **AND THE INJECTED FAULT WAS NOT WHAT I FIRST WROTE DOWN.** This was recorded as "measured with a bad
+password"; error **258** is *"A network-related or instance-specific error … the wait operation timed out"*,
+i.e. an UNREACHABLE SERVER — a rejected credential is **18456 "Login failed for user"**. The docker stack had
+stopped without my noticing, so the probe injected unreachability. **The mechanism claim survives unchanged**
+— `Initialize()` → `EnsureProfile()` → connect → throw → propagate → wrapped → no catalog is the same path
+whatever made the connection fail, and the error text names `catalog_init` either way — but the fault was
+unreachability, and saying "bad password" would be reporting a test that passed for a different reason than
+stated.
+
+⚠ **RE-MEASURED PROPERLY once the stack was back, WITH the reachability control the first probe lacked**:
+leg A attaches with the CORRECT password (so the server is provably reachable, which is what makes leg B
+discriminating), then leg B with a genuinely wrong one against that same server ⇒
+**`catalog_init failed: 18456: Login failed for user 'sa'.`** — 18456, not 258 — and `duckdb_databases()`
+has no such row. Both legs of the failure surface are now measured; the control is the half that was
+missing, not the assertion.
+
+**⚠ AND IT FIXED THE HOLE ONE CALL OVER, which is the part worth carrying forward.** The worry that motivates
+a propagating init — "a bad credential yields a successfully attached, empty catalog" — was NOT reachable
+before, because `DiscoverSchemas` happens not to be one of the swallowing calls (measured on the mutant
+build with the SAME unreachable-server fault: the failure surfaces at `catalog_schemas`, no catalog
+created). The real hole was the capability read:
+
+```cpp
+try { auto caps = FetchCapabilities(handle_); … } catch (...) { /* every capability off */ }
+```
+
+That catch guards TWO unrelated things — a provider that cannot answer (fine: defaults are the safe
+direction, superset-and-re-apply) and a TRANSIENT failure of whatever it needs to answer. The second one
+disabled string `ORDER BY … LIMIT` pushdown and exact filter pushdown **for the catalog's whole life, with
+no signal anywhere**. Now that init owns "the provider cannot serve this catalog", the catch **WARNS**
+naming the catalog and what is off. Deliberately still not fatal: the defaults are CORRECT, merely slower,
+so turning a degradation into a failed ATTACH would be the worse trade. Made visible, not made fatal.
+
+**Gate `test/verify_catalog_init.test` (14, hermetic), mutation-tested** — removing the call dies at the
+first assertion. ⚠ The suite pins the CROSSING ORDER off `duckdb_logs`, because the change moves WHERE work
+happens and not WHAT any answer is: no row assertion can distinguish the two. Two things it records about
+its own instrument: the assertion is on the MANAGED line (`abi catalog_init`) not the host's, since the
+host's proves only that it CALLED; and the comparison is `<=` not `<`, because `duckdb_logs` has no sequence
+column and on Delta (a no-op `Initialize`) init and the first discovery call can share a microsecond — while
+the regression being guarded (the call moving after discovery) lands STRICTLY later and so is still caught.
+
+⚠ **Lazy init must NOT be removed in favour of this.** A catalog reached through `fabricator_query` /
+`fabricator_exec` with a raw connection string, or a transient one built by `COPY … (FORMAT delta)`, never
+goes through `LoadCatalog` and so never receives the call. `SqlServerCatalog.Initialize()` is
+`=> EnsureProfile()` and that method KEEPS its double-checked guard: this is an eager, well-placed trigger,
+not a replacement.
+
 ## v77 (2026-08-19) — `catalog_views`: provider-declared catalog-bound VIEWS
 
 **Additive**, one vtable entry beside `catalog_macros`:

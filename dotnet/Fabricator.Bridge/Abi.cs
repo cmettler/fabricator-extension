@@ -239,6 +239,9 @@ public unsafe struct FabricatorVTable
     // kind multiplexer. Arrow streams stay the carrier (the right tool for lists); what died is the kind
     // int, the per-provider `_ =>` fallback shapes, and the name-pair-per-call transport for tables.
     // int32 catalog_schemas(void* handle, ArrowArrayStream* out, char** err) — 1 utf8 col: schema_name
+    // int32 catalog_init(void* handle, char** err) — the provider's init hook (v78), called with the
+    // ambients live and BEFORE any discovery crossing. A failure FAILS THE ATTACH.
+    public delegate* unmanaged[Cdecl]<nint, byte**, int> CatalogInit;
     public delegate* unmanaged[Cdecl]<nint, CArrowArrayStream*, byte**, int> CatalogSchemas;
     // int32 catalog_tables(void* handle, ArrowArrayStream* out, char** err) — 3 utf8: schema, table, type
     public delegate* unmanaged[Cdecl]<nint, CArrowArrayStream*, byte**, int> CatalogTables;

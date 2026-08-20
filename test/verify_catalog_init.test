@@ -1,0 +1,131 @@
+# name: test/verify_catalog_init.test
+# description: catalog_init (ABI v78) — the provider's init hook, called at ATTACH with the host-FS opener and
+#              settings session LIVE, and BEFORE any discovery crossing.
+#
+#              WHY IT EXISTS. open_catalog runs with NO ambients, because it only CONSTRUCTS the catalog — an
+#              invariant the host depends on (fabricator_storage.cpp:211 records it as measured, not assumed).
+#              So a provider whose setup needs a client context — connect and detect the engine, resolve a
+#              secret, probe a root — had nowhere to put it and had to hang it off whichever discovery call ran
+#              FIRST. That order is not part of the contract, so it was luck. In practice get_capabilities
+#              became the de-facto init hook by accident of being first, which is how SQL Server's first
+#              CONNECT came to happen inside a call documented as reading a doc of booleans.
+#
+#              ⚠ WHAT THIS SUITE CAN AND CANNOT ASSERT, stated rather than implied. The change moves WHERE
+#              work happens, not WHAT any answer is: SQL Server connected inside this same ATTACH statement
+#              before and after, and every row of every other suite is unchanged. So there is no row
+#              assertion that can distinguish the two, and the honest gate is the CROSSING ORDER, read off
+#              duckdb_logs — the same shape verify_delta_rename uses for the engine choice and
+#              verify_delta_autocommit_pin for the pin. A suite claiming more than that would be pinning
+#              nothing.
+#
+#              ⚠ AND THE ASSERTION IS ON THE MANAGED LINE (`abi catalog_init`), NOT the host's
+#              (`fabricator: catalog_init`), deliberately: the host's proves only that it CALLED, while the
+#              managed one proves the crossing ARRIVED and the provider's Initialize() ran. The host line is
+#              asserted too, but only as the ordering anchor.
+#
+#              Hermetic: a Delta catalog over FABRICATOR_DELTA_WRITE_DIR. Deliberately the provider that
+#              implements NOTHING — Initialize() is a no-op DIM there — because that is what proves the hook
+#              is wired in the HOST rather than in one provider, and that a provider needing nothing pays
+#              nothing but the crossing.
+# group: [fabricator]
+
+require fabricator
+
+require-env FABRICATOR_DELTA_WRITE_DIR
+
+statement ok
+SET enable_logging = true;
+
+statement ok
+SET logging_level = 'DEBUG';
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/init' AS lake (TYPE fabricator, PROVIDER 'delta');
+
+# ==========================================================================================================
+# §1 The hook fires, and it reaches MANAGED code.
+# ==========================================================================================================
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE message = 'abi catalog_init';
+----
+1
+
+# Exactly ONCE per ATTACH — it is init, not a per-statement callback. A second attach of the same root is a
+# second catalog and so a second init; that is asserted in §3 rather than here.
+query I
+SELECT count(*) FROM duckdb_logs WHERE message = 'fabricator: catalog_init';
+----
+1
+
+# ==========================================================================================================
+# §2 ⚠ THE ORDERING, which is the whole feature — init must precede EVERY discovery crossing.
+#
+# ⚠ COMPARED WITH <=, NOT <, AND THAT IS NOT A WEAKENING — it is the only form that is both sound and
+# stable. duckdb_logs offers NO sequence column (context_id / scope / connection_id / transaction_id /
+# query_id / thread_id / timestamp / type / log_level / message — I reached first for a `log_id` that does
+# not exist), so order can only be read off `timestamp`, and these crossings happen inside ONE statement
+# microseconds apart: on the Delta provider Initialize() is a no-op, so init and the first discovery call
+# can legitimately land on the same microsecond. A strict `<` would then fail for a reason with nothing to
+# do with the property.
+#
+# And <= still catches the regression this section exists for. The failure mode is "the init call moves
+# after discovery", which puts it STRICTLY LATER — not tied — so <= reports false. A tie is only reachable
+# while the calls are genuinely adjacent, i.e. while the ordering is correct.
+# ==========================================================================================================
+
+# open_catalog (no ambients) → catalog_init (ambients live) → the discovery crossings.
+query I
+SELECT (SELECT min(timestamp) FROM duckdb_logs WHERE message = 'abi catalog_init')
+    >= (SELECT min(timestamp) FROM duckdb_logs WHERE message LIKE 'abi open_catalog%');
+----
+true
+
+query I
+SELECT (SELECT min(timestamp) FROM duckdb_logs WHERE message = 'abi catalog_init')
+    <= (SELECT min(timestamp) FROM duckdb_logs WHERE message = 'abi catalog_schemas');
+----
+true
+
+# ⚠ And before EVERY other discovery crossing, not merely the first one the host happens to make. Without
+# this, reordering the host's discovery sequence could move a crossing above init and §2's first pair would
+# still pass.
+query I
+SELECT (SELECT min(timestamp) FROM duckdb_logs WHERE message = 'abi catalog_init')
+    <= (SELECT min(timestamp) FROM duckdb_logs
+        WHERE message IN ('abi catalog_tables', 'abi catalog_functions', 'abi catalog_macros',
+                          'abi catalog_views'));
+----
+true
+
+# THE POSITIVE CONTROL for all of the above: those discovery crossings really did happen in this attach, so
+# a `true` from the comparisons cannot come from an empty right-hand side.
+query I
+SELECT count(DISTINCT message) FROM duckdb_logs
+WHERE message IN ('abi catalog_schemas', 'abi catalog_tables', 'abi catalog_functions',
+                  'abi catalog_macros', 'abi catalog_views');
+----
+5
+
+# ==========================================================================================================
+# §3 A second ATTACH is a second catalog and so a second init — and the first catalog keeps working, i.e.
+# init is per-catalog rather than per-process or per-connection.
+# ==========================================================================================================
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/init2' AS lake2 (TYPE fabricator, PROVIDER 'delta');
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE message = 'abi catalog_init';
+----
+2
+
+# Both catalogs are usable — a provider that implements no init pays nothing but the crossing.
+query II
+SELECT (SELECT count(*) FROM duckdb_views() WHERE database_name = 'lake'),
+       (SELECT count(*) FROM duckdb_views() WHERE database_name = 'lake2');
+----
+3	3
+
+statement ok
+DETACH lake2;

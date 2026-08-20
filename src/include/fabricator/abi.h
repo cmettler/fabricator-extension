@@ -735,6 +735,24 @@ typedef struct FabricatorVTable {
 	int32_t (*get_capabilities)(FabricatorHandle handle, char **out_json, char **err);
 
 	// -------------------------------------------------------------------------
+	// catalog_init (ABI v78) — the provider's ONE chance to initialise with a live client context, called
+	// from LoadCatalog immediately after the ambients are established and BEFORE any discovery crossing.
+	// -------------------------------------------------------------------------
+	// Optional (a DIM no-op on IBackendCatalog): a provider that needs nothing implements nothing.
+	//
+	// ⚠ WHY IT EXISTS. open_catalog runs with NO ambients — no opener, no settings session — because it only
+	// CONSTRUCTS (that invariant is what makes the missing ambient safe; see fabricator_storage.cpp). So a
+	// provider with context-requiring setup had nowhere to put it and had to hang it off whichever discovery
+	// crossing happened to run first — and the ORDER of those is not part of the contract. In practice
+	// get_capabilities became the de-facto init hook by accident of being first, which is how SQL Server's
+	// first CONNECT ended up inside a call documented as reading a doc of booleans.
+	//
+	// ⚠ DELIBERATELY NOT wrapped in a swallowing catch, unlike get_capabilities below it: an init failure is
+	// the provider saying it cannot serve this catalog, so it must fail the ATTACH with its own message
+	// rather than degrade to defaults.
+	int32_t (*catalog_init)(FabricatorHandle handle, char **err);
+
+	// -------------------------------------------------------------------------
 	// Catalog discovery (ABI v72) — the dedicated typed LIST entries that replaced get_metadata's 16-kind
 	// multiplexer (docs/catalog-table-abstraction.md §2.4). Arrow streams stay the carrier — the right tool
 	// for lists — with each entry keeping the column layout its old kind carried; what died is the kind int,
@@ -1004,7 +1022,7 @@ typedef struct FabricatorHostServices {
 // state blob is this many bytes + a 4-byte length prefix). Serialize() must fit within it.
 #define FABRICATOR_AGG_SPILL_CAP 1024
 
-#define FABRICATOR_ABI_VERSION 77
+#define FABRICATOR_ABI_VERSION 78
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(FabricatorVTable) as seen

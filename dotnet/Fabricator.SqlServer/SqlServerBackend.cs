@@ -2351,6 +2351,22 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     // it on first use — the first connection this path always paid (the old host-side FetchBinaryCollation
     // triggered the identical detection through the kind-7 stream). `exact_filter_pushdown` is deliberately
     // absent (= false): this provider's filter pushdown is best-effort/superset and DuckDB must re-apply.
+    /// <summary>
+    /// ATTACH-time init (ABI v78): connect once and detect the engine profile, HERE, where a failure is
+    /// attributable to the ATTACH rather than to whichever metadata call happened to run first.
+    /// </summary>
+    /// <remarks>
+    /// It costs nothing new — this connection was already paid inside the ATTACH statement, because
+    /// <see cref="CapabilitiesJson"/> reads <c>Profile.IsBinaryCollation</c> and the discovery SQL follows
+    /// immediately. What changes is WHERE it happens and therefore what a failure says.
+    ///
+    /// <para>⚠ <see cref="EnsureProfile"/> KEEPS its double-checked lazy guard and must: a catalog reached
+    /// through <c>fabricator_query</c>/<c>fabricator_exec</c> with a raw connection string never goes through
+    /// the host's catalog load, so it never receives this call. This is an eager trigger, not a replacement.
+    /// </para>
+    /// </remarks>
+    public void Initialize() => EnsureProfile();
+
     public string CapabilitiesJson
         => $"{{\"is_binary_collation\":{(Profile.IsBinaryCollation ? "true" : "false")}}}";
 

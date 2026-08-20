@@ -594,6 +594,20 @@ std::string GetCapabilities(FabricatorHandle handle) {
 	return result;
 }
 
+void CatalogInit(FabricatorHandle handle) {
+	const FabricatorVTable &vt = GetBridge();
+	if (!vt.catalog_init) {
+		return; // older bridge: providers had no init hook, and nothing required one
+	}
+	char *err = nullptr;
+	int32_t rc = vt.catalog_init(handle, &err);
+	if (rc != FABRICATOR_OK) {
+		// THROWS, deliberately — unlike the ambient setters and unlike get_capabilities. Init is the
+		// provider's chance to say it cannot serve this catalog, and the ATTACH is where that belongs.
+		ThrowManagedError(vt, err, "Fabricator: catalog_init failed");
+	}
+}
+
 void CloseCatalog(FabricatorHandle handle) {
 	if (!handle) {
 		return;

@@ -63,7 +63,7 @@ public static unsafe class Bootstrap
             return new InMemoryArrayStream(schema, new[] { batch });
         });
 
-        vtable->AbiVersion = 77;
+        vtable->AbiVersion = 78;
         vtable->OpenCatalog = &OpenCatalog;
         vtable->CloseCatalog = &CloseCatalog;
         vtable->ExecuteQuery = &ExecuteQuery;
@@ -125,6 +125,7 @@ public static unsafe class Bootstrap
         vtable->GenerateTableSql = &GenerateTableSql;
         vtable->ClearSessionSettings = &ClearSessionSettings;
         vtable->GetCapabilities = &GetCapabilities;
+        vtable->CatalogInit = &CatalogInit;
         vtable->CatalogSchemas = &CatalogSchemas;
         vtable->CatalogTables = &CatalogTables;
         vtable->CatalogFunctions = &CatalogFunctions;
@@ -384,6 +385,29 @@ public static unsafe class Bootstrap
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
     private static int CatalogMacros(nint handle, CArrowArrayStream* outStream, byte** err) =>
         CatalogList(handle, outStream, err, "catalog_macros", c => c.GetMacros());
+
+    // The provider init hook (v78). Unlike the CatalogList entries this returns no stream — it exists purely
+    // so a provider can do context-requiring setup at a DEFINED point, and its failure is reported so the
+    // host can fail the ATTACH.
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int CatalogInit(nint handle, byte** err)
+    {
+        try
+        {
+            var catalog = Handles.Resolve<IBackendCatalog>(handle);
+            // Logged on the MANAGED side, matching the `abi <entry>` convention of the discovery crossings —
+            // and it is what makes the gate meaningful: the host's own line proves only that it CALLED, while
+            // this one proves the crossing ARRIVED and the provider's Initialize ran.
+            BridgeLog.LogDebug("abi catalog_init");
+            catalog.Initialize();
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
     private static int CatalogViews(nint handle, CArrowArrayStream* outStream, byte** err) =>
