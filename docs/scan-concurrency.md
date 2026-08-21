@@ -412,6 +412,24 @@ sensible default and doubles as the backpressure knob (capacity x batch size is 
 ⚠ The producer still needs a `Task.Run` pump because our pull is a blocking sync-over-async call; what moves
 into the `AsyncTask` is the WAITING, executed by DuckDB's executor rather than by a worker we are holding.
 
+**⚠ `Execute()` MUST BLOCK, and the thread accounting is the whole reason this fixes anything.** The interrupt
+fires only AFTER it returns — `AsyncExecutionTask::ExecuteTask` is `async_task->Execute(); if
+(counter->IterateAndCheckCounter()) interrupt_state.Callback();` — so "start the IO and return" would reschedule
+the scan into an empty channel and it would return BLOCKED again, i.e. a spin. And the task goes through
+`TaskScheduler::ScheduleTask`, so it runs on the SAME worker pool, not a separate one. ⇒ **today branch A holds
+N workers (one blocked in the pull, N-1 piled on the mutex); afterwards it holds ONE** — its scan task is
+descheduled and only its AsyncTask occupies a worker. The union unblocks not because nothing blocks, but because
+blocking stops being MULTIPLIED by the thread count.
+
+**⚠ WHERE `TaskCompletionSource` BELONGS — cancellation, not the wait.** `ChannelReader.WaitToReadAsync()` is
+already TCS-backed internally and the crossing is this tree's existing sync-over-async convention
+(`AsyncEnumerableArrowStream` does `MoveNextAsync().AsTask().GetAwaiter().GetResult()`), so a TCS layered on top
+of the channel is redundant. What it IS right for is the gap a blocking `Execute()` creates: an uncancellable
+park is exactly [cancellation.md](cancellation.md)'s subject. The wait must take a token driven from DuckDB's
+interrupt (or a TCS the interrupt path can `TrySetCanceled`), and a pump fault must surface as an exception into
+`Execute()` — `ch.Writer.Complete(ex)` carries that. **Without it we would trade a starvation bug for a query
+that cannot be interrupted.**
+
 **⚠ FOUR CAVEATS, all read from source rather than assumed:**
 - `D_ASSERT(data.async_result.HasTasks())` — a BLOCKED carrying no tasks is an assertion failure.
 - If `CanBlock` is false the host converts our BLOCKED into **FINISHED**. Only `FinishProcessing` sets that
