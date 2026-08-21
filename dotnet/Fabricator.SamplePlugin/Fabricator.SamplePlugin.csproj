@@ -5,8 +5,9 @@
     <RootNamespace>Fabricator.SamplePlugin</RootNamespace>
     <AssemblyName>Fabricator.SamplePlugin</AssemblyName>
     <Description>
-      A sample THIRD-PARTY plugin for the fabricator bridge: a connection-free IBackend that contributes a
-      global scalar function (plug_greet). Built to a folder and discovered via FABRICATOR_PLUGIN_DIR; it
+      A sample THIRD-PARTY plugin for the fabricator bridge: a connection-free IBackend that contributes
+      global scalar functions (plug_greet, and plug_sleep — a test instrument that makes a query cost exactly
+      what the caller asks for). Built to a folder and discovered via FABRICATOR_PLUGIN_DIR; it
       references Fabricator.Bridge + Apache.Arrow as HOST-PROVIDED (Private=false, not copied), so at runtime
       they resolve to the bridge's default-context copies. See docs/plugin-system.md.
     </Description>

@@ -469,7 +469,13 @@ case "$TIER" in
         # DETACHes, and without a live catalog the bare-name refusal would assert only that nothing is
         # attached. Mutation-tested (GetViews serving nothing dies at the first view assertion, after all 28
         # pre-existing ones pass).
-        : "${MIN_ASSERTIONS:=2108}"
+        # 2116 since 2026-08-21: verify_plugin 17 -> 25, the sample plugin's plug_sleep — a test INSTRUMENT
+        # rather than a feature (it makes a query's cost a number the test chose; docs/scan-concurrency.md
+        # §6 turns effective parallelism into arithmetic with it). Two of the eight are the ones that could
+        # not be inferred: a NEGATIVE argument is REFUSED, because Thread.Sleep(-1) is Timeout.Infinite and a
+        # hanging suite is worse than a failing one; and the side effect really happens PER ROW, asserted as
+        # a LOWER BOUND on elapsed time, which is the direction a loaded machine can only make more true.
+        : "${MIN_ASSERTIONS:=2116}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

@@ -109,3 +109,49 @@ query I
 SELECT count(*) FROM fabricator_plugins() WHERE status = 'shared' AND (path = '' OR detail = '');
 ----
 0
+
+# ============================================================================
+# plug_sleep — the plugin's TEST INSTRUMENT, not a feature. It blocks its worker thread once PER ROW, which
+# is what lets a test make a query's cost a number the test chose (docs/scan-concurrency.md §6 uses it to
+# turn effective parallelism into arithmetic: rows x millis / wall clock).
+# ============================================================================
+
+# The trivial contract: it returns what it slept, and a NULL row sleeps not at all.
+query II
+SELECT plug_sleep(0), plug_sleep(NULL);
+----
+0	NULL
+
+# ⚠ A NEGATIVE IS REFUSED, and this is the load-bearing assertion of the section. Thread.Sleep(-1) is
+# Timeout.Infinite, so the alternative to refusing is a suite that HANGS — the one failure mode worse than a
+# wrong answer here. Clamping to zero would be worse still: it would hide the caller's arithmetic bug.
+statement error
+SELECT plug_sleep(-1);
+----
+millis must be >= 0
+
+# ⚠ THE SIDE EFFECT REALLY HAPPENS PER ROW, which is the property the whole instrument rests on: a scalar
+# declared CONSISTENT would be FOLDED to a literal at plan time over a constant argument, sleep ONCE during
+# binding, and every parallelism number built on it would be confidently wrong while looking healthy.
+# Asserted as a LOWER BOUND on elapsed time (20 rows x 60 ms = 1.2 s of work, single-threaded), because a
+# lower bound can only be broken by the sleep NOT happening — a loaded machine makes it more true, not less.
+statement ok
+SET threads=1;
+
+statement ok
+CREATE TEMP TABLE plug_sleep_t0 AS SELECT epoch_ms(now()) AS ms;
+
+# ⚠ sum(), not count(): DuckDB PRUNES a projected column no aggregate consumes, so `count(*)` over this would
+# evaluate plug_sleep ZERO times and the section would pass with the instrument entirely broken.
+query I
+SELECT sum(plug_sleep(60)) FROM range(20);
+----
+1200
+
+query I
+SELECT (epoch_ms(now()) - (SELECT ms FROM plug_sleep_t0)) >= 1000;
+----
+true
+
+statement ok
+RESET threads;
