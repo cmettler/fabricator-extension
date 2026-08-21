@@ -446,6 +446,49 @@ Nothing built. ⚠ When it is, the gate is `fabricator_wait`'s `hold_lock` inver
 scan: it is the one shape that distinguishes "workers handed back" from "workers held", deterministically
 enough to pin.
 
+### §5e. IMPLEMENTATION CHECKLIST for whoever builds it (written while the facts were live; nothing done)
+
+**Two invariants that MUST survive, and the design happens to preserve both — say so explicitly, because both
+are correctness rather than performance.**
+1. **The pull stays single-threaded.** Today `gstate.main_mutex` guarantees it; with one pump per scan it is
+   guaranteed BY CONSTRUCTION. That is what keeps a provider's reader (a `SqlDataReader`, an ADOMD reader)
+   touched from one thread only — §2's safety argument, which must not be traded away for throughput.
+2. **`batch_index` stays monotonic in pull order.** The pump assigns it, so it stays a single sequence — which
+   is what the `get_partition_data` declaration (§5) promises and what the batch collector uses to restore
+   order. A per-scan-task counter would break it.
+
+**The ABI shape.** Two entries rather than one, because the fast path must not be able to block: a non-blocking
+`stream_try_next(handle, out_array, out_has)` and a cancellable `stream_wait(handle, timeout_or_token)`. ⚠ Both
+sides of the version must move (`FABRICATOR_ABI_VERSION` in `abi.h` AND `vtable->AbiVersion` in
+`Bootstrap.Initialize`) or the host throws a mismatch at boot — and this is a mid-struct addition if placed
+beside the existing stream entries, so a stale pair must be caught by the version, not by calling through the
+wrong signature.
+
+**⚠⚠ THE HAZARD THAT WILL BITE, and it is this codebase's worst bug class.** A pump that OWNS the stream while
+the consumer abandons EARLY — which is exactly what a pushed `LIMIT` produces — is the
+`BatchQueryOwner.Claim()` shape: releasing the query from the consumer side while the pump is inside a read gave
+`STATUS_HEAP_CORRUPTION` with no assertion output and no stack, and it did NOT reproduce standalone. The
+existing pre-existing leak (an orphaned pump on early abandonment) becomes LOAD-BEARING here, because the pump
+holds the stream rather than merely draining it. Budget the teardown design first, not last: cancel, drain,
+join, and only then release — and expect the failure to present as a crash in an unrelated suite.
+
+**Also required:**
+- `ExecuteTasksSynchronously()` runs `Execute()` INLINE on the scan's own worker (`SYNCHRONOUS` strategy), so
+  the task must be correct there too — including not deadlocking against its own pump.
+- The wait must be CANCELLABLE from DuckDB's interrupt (§5d), or a starvation bug is traded for an
+  uninterruptible query.
+- A pump fault must surface as an exception from the wait (`ch.Writer.Complete(ex)`), not as end-of-stream —
+  silently ending a scan on a provider error is a wrong ANSWER.
+
+**The gate**, and it has to be the shape no existing suite has: two MANAGED scans in one `UNION ALL`, each with
+one blocking morsel, asserting the union costs about ONE branch rather than two. `fabricator_wait`'s
+`hold_lock` provides the deterministic negative control (workers held ⇒ serial). ⚠ It is a TIMING assertion in
+the direction this file otherwise forbids (an upper bound), so it needs a wide margin — assert "well under the
+serial sum", never "close to one branch".
+
+**Both tiers, and the service tier is not optional**: it is the first and only run of this path against a real
+SQL Server, whose single-threaded-reader safety is the invariant above.
+
 **⚠ THE PRACTICAL REFINEMENT, and it is actionable today: it is not "unions do not overlap".** A union of two
 DIFFERENT provider functions overlaps. So a plan that fans out over one function N times is the shape that
 serializes, and the remote union form — whose D branches are all the same per-file read — is exactly that
