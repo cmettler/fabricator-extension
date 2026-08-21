@@ -2436,6 +2436,10 @@ void RegisterFabricatorGlobalFunctions(ExtensionLoader &loader) {
 				}
 				TableFunction tf(fn_name, positional, fabricator::ArrowStreamScan, FabricatorTableFunctionBind,
 				                 fabricator::ArrowStreamInitGlobal, fabricator::ArrowStreamInitLocal);
+				// Declares batch-index support, which is what routes an order-preserving plan to the PARALLEL
+				// PhysicalBufferedBatchCollector instead of the single-threaded PhysicalBufferedCollector.
+				// See ArrowStreamGetPartitionData + docs/scan-concurrency.md.
+				tf.get_partition_data = fabricator::ArrowStreamGetPartitionData;
 				tf.projection_pushdown = true;
 				tf.pushdown_complex_filter = FabricatorComplexFilterPushdown;
 				for (idx_t k = 0; k < arg_names.size(); k++) {
@@ -2584,6 +2588,10 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateTableFunction(Clien
 	}
 	TableFunction tf(func_name, positional, fabricator::ArrowStreamScan, FabricatorTableFunctionBind,
 	                 fabricator::ArrowStreamInitGlobal, fabricator::ArrowStreamInitLocal);
+	// Declares batch-index support, which is what routes an order-preserving plan to the PARALLEL
+	// PhysicalBufferedBatchCollector instead of the single-threaded PhysicalBufferedCollector.
+	// See ArrowStreamGetPartitionData + docs/scan-concurrency.md.
+	tf.get_partition_data = fabricator::ArrowStreamGetPartitionData;
 	tf.projection_pushdown = true;
 	if (is_proc) {
 		for (idx_t i = 0; i < arg_names.size(); i++) {

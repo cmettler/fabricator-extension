@@ -21,6 +21,9 @@ public sealed class SamplePluginBackend : IBackend
     public IEnumerable<IScalarFunction> GlobalScalarFunctions =>
         new IScalarFunction[] { new PlugGreetFunction(), new PlugSleepFunction() };
 
+    public IEnumerable<ITableFunction> GlobalTableFunctions =>
+        new ITableFunction[] { new PlugSlowRangeFunction() };
+
     /// <summary>
     /// Macros a plugin ships — proving the SQL-template path needs no more from a plugin than the function path
     /// (declare; the host parses + registers at load). The second entry is DELIBERATELY MALFORMED: it pins the
@@ -130,5 +133,104 @@ internal sealed class PlugSleepFunction : IScalarFunction
             b.Append(ms);
         }
         return b.Build();
+    }
+}
+
+/// <summary>
+/// The SOURCE-side twin of <see cref="PlugSleepFunction"/>: <c>plug_slow_range(rows, millis)</c> yields
+/// <paramref name="rows"/> rows of a single BIGINT <c>id</c> in 2048-row batches, sleeping <c>millis</c>
+/// before each batch. It exists to put the cost on the other side of the scan boundary, and the pair is what
+/// makes docs/scan-concurrency.md §1 measurable instead of merely read out of the source:
+/// <list type="bullet">
+/// <item>a scalar in the PROJECTION is per-thread work, so it scales with the thread count once the plan's
+/// sink is parallel;</item>
+/// <item>a sleep in this SOURCE is inside <c>get_next</c>, which the host pulls under one mutex — so it must
+/// NOT scale, at any thread count. That is the invariant, not a defect: the pull is serialized precisely so
+/// a provider's reader (a <c>SqlDataReader</c>, say) is never touched from two threads.</item>
+/// </list>
+/// <para>⚠ The same ~15 ms Windows timer floor applies (see <see cref="PlugSleepFunction"/>), so ask for
+/// values well above it. A batch is the unit of sleeping here, not a row, which is what keeps a measurement
+/// affordable — 4 batches x 500 ms is 2 s, where per-row sleeping over the same 8192 rows could not be run
+/// at all.</para>
+/// </summary>
+internal sealed class PlugSlowRangeFunction : ITableFunction
+{
+    internal const int BatchRows = 2048;
+
+    public string Name => "plug_slow_range";
+
+    public Schema Parameters => new(
+        new[]
+        {
+            new Field("rows", Int64Type.Default, nullable: true),
+            new Field("millis", Int64Type.Default, nullable: true),
+        },
+        metadata: null);
+
+    public ITableFunctionBinding Bind(RecordBatch args)
+    {
+        long rows = ReadArg(args, 0);
+        long millis = ReadArg(args, 1);
+        if (rows < 0 || millis < 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(args), "plug_slow_range: rows and millis must both be >= 0.");
+        }
+        return new Binding(rows, millis);
+    }
+
+    private static long ReadArg(RecordBatch args, int i)
+    {
+        var col = (Int64Array)args.Column(i);
+        return col.IsNull(0) ? 0 : col.GetValue(0)!.Value;
+    }
+
+    private sealed class Binding : ITableFunctionBinding
+    {
+        private readonly long _rows;
+        private readonly long _millis;
+
+        internal Binding(long rows, long millis)
+        {
+            _rows = rows;
+            _millis = millis;
+        }
+
+        public Schema OutputSchema =>
+            new(new[] { new Field("id", Int64Type.Default, nullable: false) }, metadata: null);
+
+        // Neither is claimed: this function computes its rows and ignores the pushed spec entirely, so DuckDB
+        // re-applies the filter and maps the full declared schema. Claiming either would be a wrong ANSWER,
+        // not a missed optimisation.
+        public bool SupportsFilterPushdown => false;
+        public bool SupportsProjectionPushdown => false;
+
+        public async IAsyncEnumerable<RecordBatch> Execute(
+            TableFunctionScan scan,
+            [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+        {
+            var schema = OutputSchema;
+            for (long start = 0; start < _rows; start += BatchRows)
+            {
+                ct.ThrowIfCancellationRequested();
+                if (_millis > 0)
+                {
+                    // The cost sits HERE, inside the batch the host is pulling — see the class remarks.
+                    Thread.Sleep((int)Math.Min(_millis, int.MaxValue));
+                }
+                int n = (int)Math.Min(BatchRows, _rows - start);
+                var b = new Int64Array.Builder().Reserve(n);
+                for (int i = 0; i < n; i++)
+                {
+                    b.Append(start + i);
+                }
+                yield return new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+            }
+            await Task.CompletedTask; // the body is synchronous; this keeps it an async iterator
+        }
+
+        public void Dispose()
+        {
+        }
     }
 }

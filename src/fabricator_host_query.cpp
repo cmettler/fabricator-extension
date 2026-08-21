@@ -424,10 +424,18 @@ void RegisterHostQuery(ExtensionLoader &loader) {
 	DBConfig::GetConfig(loader.GetDatabaseInstance()).replacement_scans.emplace_back(NamedSourceReplacement);
 	TableFunction fn("fabricator_host_query", {LogicalType::VARCHAR}, fabricator::ArrowStreamScan, HostQueryBind,
 	                 fabricator::ArrowStreamInitGlobal, fabricator::ArrowStreamInitLocal);
+	// Declares batch-index support, which is what routes an order-preserving plan to the PARALLEL
+	// PhysicalBufferedBatchCollector instead of the single-threaded PhysicalBufferedCollector.
+	// See ArrowStreamGetPartitionData + docs/scan-concurrency.md.
+	fn.get_partition_data = fabricator::ArrowStreamGetPartitionData;
 	loader.RegisterFunction(fn);
 
 	TableFunction scan("fabricator_scan", {LogicalType::VARCHAR}, fabricator::ArrowStreamScan, NamedScanBind,
 	                   fabricator::ArrowStreamInitGlobal, fabricator::ArrowStreamInitLocal);
+	// Declares batch-index support, which is what routes an order-preserving plan to the PARALLEL
+	// PhysicalBufferedBatchCollector instead of the single-threaded PhysicalBufferedCollector.
+	// See ArrowStreamGetPartitionData + docs/scan-concurrency.md.
+	scan.get_partition_data = fabricator::ArrowStreamGetPartitionData;
 	loader.RegisterFunction(scan);
 }
 

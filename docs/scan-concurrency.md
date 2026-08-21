@@ -38,6 +38,12 @@ That is byte-for-byte DuckDB's own arrow scan (`ArrowScanParallelStateNext` in
 `GetNextChunk()`, releases, and each thread converts its own batch). **The `RecordBatch` is therefore the
 morsel**, and everything in §2–§4 follows from that one fact.
 
+**MEASURED, not read out of the source** (§6's instrument, four batches x 500 ms): cost placed in the SOURCE,
+i.e. inside `get_next`, is **2451 ms at threads=1 and 2454 ms at threads=4 — flat**, because the pull holds one
+mutex. The same 2 s of cost placed in the PROJECTION above the scan goes **2425 -> 883 ms**. That is the split,
+and it is an invariant rather than a shortcoming: the serialized pull is exactly what lets a provider's reader
+(a `SqlDataReader`, an ADOMD reader) be touched from one thread only.
+
 What is deliberately still single-threaded, and must stay so:
 
 | path | `MaxThreads()` | why |
@@ -80,6 +86,12 @@ source declaring one thread makes every operator above it single-threaded.** Tha
 - The gate for the change itself was an IDENTITY, not an improvement: both tiers at exactly their prior counts,
   including the plan-sensitive suites (batched-read routing, `merge_into`, subplan dedup) — so no answer and no
   routing followed the extra threads.
+- **⚠⚠ AND FOR TEN WEEKS IT ONLY PAID OFF WHEN A BLOCKING OPERATOR SAT ABOVE THE SCAN.** `Pipeline::Schedule
+  Parallel` tests `!sink->ParallelSink()` FIRST and returns false, falling back to `ScheduleSequentialTask`
+  (ONE task) — so `MaxThreads()` is not merely capped there, it is **never read**. The md5 and `GROUP BY`
+  numbers above were both taken with an AGGREGATE above the scan, whose sink is parallel. For a plan that
+  streams straight to the client the sink IS the result collector, and that one was non-parallel by default:
+  MEASURED at 2694 / 2633 ms for threads 1 / 4 — perfectly flat. §5 is why, and it is fixed.
 
 ---
 
@@ -155,46 +167,95 @@ from a run whose answers were not checked is not a performance number.**
 
 ---
 
-## 5. Above the scan: a streaming result over `UNION ALL` can lose ~100 s in the scheduler
+## 5. ROOT CAUSE: our scans declared no batch index, so the default result collector was single-threaded
 
-The largest concurrency effect measured on this codebase is not in the scan at all. On a remote root, a
-STREAMING result × `PhysicalUnion` × `threads>1` × a slow filesystem stalls. Bisected through
-`fabricator_host_query` (our identical inner-query machinery, nothing of ours above it): a 198-file plain
-branch alone ran in **7.0 s**, and adding ONE CONSTANT branch — `UNION ALL SELECT CAST(0 AS BIGINT)`, no CTE,
-no second file — took it to **111.2 s**; the same at `SET threads=1` collapsed to **6.0 s**; and
-`EXPLAIN ANALYZE` of the slow shape reported **3.38 s of operator work inside a 114 s statement**. Locally
-every op is instant, so the gap never opens (0.17 s).
+**This section used to describe an unattributed "DuckDB scheduling pathology". It is attributed now, the cause
+was OURS, and it is fixed.** The symptom was spectacular: on a remote root, a STREAMING result x
+`PhysicalUnion` x `threads>1` x a slow filesystem stalled. Bisected through `fabricator_host_query` (our
+identical inner-query machinery, nothing of ours above it), a 198-file plain branch alone ran in **7.0 s**, and
+adding ONE CONSTANT branch — `UNION ALL SELECT CAST(0 AS BIGINT)`, no CTE, no second file — took it to
+**111.2 s**; the same at `SET threads=1` collapsed to **6.0 s**; and `EXPLAIN ANALYZE` of the slow shape
+reported **3.38 s of operator work inside a 114 s statement**.
 
-- **It is the PARALLELISM SPLIT, not oversubscription.** `external_threads=2` changed nothing;
-  `threads=16, external_threads=16` (zero internal workers) ran it in 97.0 s at 0.72 s user CPU — pure idle —
-  while `threads=1` (also zero workers, but split 1) ran the same shape in 6.0 s. The only difference between
-  those two is `NumberOfThreads()`, i.e. the pipeline split.
-- **The protocol, read from DuckDB's source rather than guessed:** producers sink into
-  `PhysicalBufferedCollector` → `SimpleBufferedData`
-  ([src/main/buffered_data/simple_buffered_data.cpp](../duckdb/src/main/buffered_data/simple_buffered_data.cpp));
-  a full-buffer producer parks in `blocked_sinks` and is woken only by the consumer. The consumer, when no task
-  is available, enters `Executor::WaitForTask`
-  ([src/parallel/executor.cpp](../duckdb/src/parallel/executor.cpp)) — a **20 ms timed poll** on
-  `task_reschedule`, a condition variable signalled by task RESCHEDULES and **never by a chunk arriving in the
-  buffer** — with an immediate-return (spin) branch when the collector is blocked. Hence the two observed faces
-  of one protocol: spin (102 s user CPU) or idle (4.5 s user), both losing wall clock because nothing wakes the
-  consumer on data arrival. `SET streaming_buffer_size='64MB'` changed nothing, which is what rules out
-  back-pressure as the driver.
-- **Largely defused by `SET SESSION preserve_insertion_order=false`**, which every batched Delta statement now
-  carries (`BatchPlan.Statement`,
-  [dotnet/Fabricator.Delta/DeltaNativeReader.cs](../dotnet/Fabricator.Delta/DeltaNativeReader.cs)): the minimal
-  union went **94.5 s → 7.5 s** and a real remote union scan **44.7 s → 13.7 s** cold. Mechanism:
-  `PhysicalResultCollector::GetResultCollector` branches on `PreserveInsertionOrder`, and for a plan with no
-  `ORDER BY` that is decided by the setting
-  ([src/execution/physical_plan/plan_insert.cpp](../duckdb/src/execution/physical_plan/plan_insert.cpp)).
-  ⚠ It is correctness-NEUTRAL there rather than a tuning knob — that reader's contract is already that row
-  order across files is not preserved — and **SESSION scope is load-bearing and was verified**: the setting's
-  declared target is `GLOBAL_DEFAULT`, so a bare `SET` would change the whole database, including the user's
-  own connections.
-- The upstream patch shape this suggests: `SimpleBufferedData::Append` (or the collector's sink) should signal
-  the consumer's wait. Not filed.
+### The chain, every link read from DuckDB's source
 
----
+1. **`PhysicalTableScan::SupportsPartitioning` is literally `function.get_partition_data != nullptr`**
+   ([src/execution/operator/scan/physical_table_scan.cpp](../duckdb/src/execution/operator/scan/physical_table_scan.cpp)).
+   Setting that callback IS how a source declares batch-index support; there is no other switch.
+2. **No fabricator `TableFunction` set it.** DuckDB's own arrow scan does
+   (`arrow.get_partition_data = ArrowGetPartitionData`), and the body it points at is three lines reading
+   `state.batch_index` off an `ArrowScanLocalState` — **our local state's base class**, whose `batch_index` our
+   `GetNextBatch` has always assigned under the pull mutex. The value was there; the declaration was not.
+3. `AllSourcesSupportBatchIndex()` false ⇒ **`PhysicalPlanGenerator::UseBatchIndex` false**.
+4. So `PhysicalResultCollector::GetResultCollector` fell to its middle branch: order-preserving but no batch
+   index ⇒ **`PhysicalBufferedCollector(parallel = false)`** — a SINGLE-THREADED sink — instead of
+   `PhysicalBufferedBatchCollector`, which is order-preserving AND `ParallelSink() == true`.
+5. **`Pipeline::ScheduleParallel` tests `!sink->ParallelSink()` FIRST and returns false**, falling back to
+   `ScheduleSequentialTask`: one `PipelineTask`. `MaxThreads()` is never even reached (§2).
+6. **`PhysicalUnion::BuildPipelines` also sets `order_matters = true` when `!sink->ParallelSink()`**, so the
+   branch pipelines are created dependency-chained rather than free-running. That is why a union MULTIPLIES it:
+   one serialized pipeline becomes N serialized, chained pipelines.
+7. Each hand-off is then paid at **20 ms granularity**. `Executor::WaitForTask`
+   ([src/parallel/executor.cpp](../duckdb/src/parallel/executor.cpp)) waits on `task_reschedule`, a condition
+   variable signalled by task RESCHEDULES and **never by a chunk arriving in the buffer**; its escape hatch,
+   `ResultCollectorIsBlocked()`, short-circuits on `completed_pipelines + 1 != total_pipelines`, which a union
+   keeps false for most of the statement. So the union takes the timed wait where a single-source plan takes the
+   immediate return — which is also why the same stall was observed as spin (102 s user CPU) in one run and as
+   idle (4.5 s user) in another: two faces of one protocol. `SET streaming_buffer_size='64MB'` changed nothing,
+   which is what ruled out back-pressure as the driver.
+
+### THE FIX: declare `get_partition_data` (2026-08-21)
+
+`ArrowStreamGetPartitionData` in [src/fabricator/arrow_ingest.cpp](../src/fabricator/arrow_ingest.cpp) returns
+`OperatorPartitionData(state.batch_index)`, wired into all nine `ArrowStreamScan` registrations (the catalog
+scan, catalog-bound + global table functions, `fabricator_query`, `_functions`, `_server_info`, `_test_scan`,
+`fabricator_host_query`, `fabricator_scan`). It mirrors `ArrowTableFunction::ArrowGetPartitionData` and refuses
+partition COLUMNS the same way. Sound because the index is assigned in PULL order under the mutex, so ordering
+by it reproduces the order the provider produced — which is exactly what the batch collector uses it for.
+
+**⚠ Two safety questions it would be easy to skip, both checked in DuckDB's source rather than assumed.**
+(a) *Can two branches of a union, each counting from 0, collide?* No — `PipelineExecutor::NextBatch` emits
+`pipeline.base_batch_index + batch_index + 1`, and `MetaPipeline` hands every pipeline a distinct base
+(`next_batch_index++ * BATCH_INCREMENT`), so a source's own counter is a pipeline-relative offset by
+construction. That is also why it does not matter that DuckDB's arrow scan pre-increments from 1 where we
+post-increment from 0. (b) *Can a long scan overflow into the next pipeline's range?* `BATCH_INCREMENT` is
+10^13, so at 2048 rows per batch the overflow point is ~2 x 10^16 rows — and it THROWS
+(`"invalid batch index ... returned by source operator"`) rather than silently reordering.
+
+**MEASURED** (§6's instrument; 8192-row Delta table, one 500 ms sleep per 2048-row morsel, one process per
+cell, `SET threads` the only variable):
+
+| plan | threads=1 | threads=4 BEFORE | threads=4 AFTER |
+|---|---|---|---|
+| `sum(...)` — aggregate sink (parallel already) | 2702 ms | 1177 ms | 1140 ms |
+| `SELECT plug_sleep(...)` — **streaming to client** | 2729 ms | **2633 ms (flat)** | **1197 ms** |
+| `UNION ALL` of two scans, streaming | 5133 ms | — | **1859 ms** (1858 at threads=8) |
+
+**⚠ AND IT MAKES OUR PER-STATEMENT `preserve_insertion_order=false` REDUNDANT ON THIS SHAPE** — the union at
+threads=8 is **1858 ms** by default against **1828 ms** with the SET, i.e. within noise. That setting was the
+symptom treatment: it reached a parallel collector by DISCARDING the order guarantee (route 1,
+`parallel = true`), where declaring the batch index reaches a parallel collector that KEEPS it (route 3). It is
+still applied by `BatchPlan.Statement`
+([dotnet/Fabricator.Delta/DeltaNativeReader.cs](../dotnet/Fabricator.Delta/DeltaNativeReader.cs)) and has NOT
+been removed — see §10 item 1 for what removing it would need.
+
+**⚠ THE ROUTING ITSELF IS NOT GATED, and the reason is worth stating rather than implying coverage.** The
+change moves no row and alters no answer, so no row assertion can see it; and nothing prints the collector —
+`EXPLAIN` does not, and `EXPLAIN ANALYZE` reports only `Total Time`, checked. The only observable is WALL
+CLOCK, and proving parallelism needs an UPPER bound on time, which is precisely the flaky direction (§6's
+assertions are lower bounds for that reason). So what stands behind it is: both tiers at IDENTICAL counts —
+hermetic **72/72 — 7719**, including every plan-sensitive suite at its exact prior number (batched-read routing
+399, subplan dedup 36, statistics 27, `merge_into` 239, clustered optimize 147) — plus the measurements above
+and the source chain. A regression here would be silent and slow, not wrong.
+
+**⚠ WHAT IS NOT YET MEASURED: the remote numbers.** Everything above is local, where the stall never opened on
+its own (0.17 s) and the sleep is a stand-in for slow IO. The live OneLake figures in this section
+(120.4 / 44.7 / 13.7 s, and the union form's remote gate in `TryUnionForm`) all predate the fix and must be
+re-taken before that gate is narrowed or lifted. The mechanism is established; the remote payoff is inferred.
+
+**⚠ The upstream observation survives the fix and is worth reporting**: nothing signals the consumer when a
+chunk lands in the buffer, so `SimpleBufferedData::Append` (or the collector's sink) should notify
+`task_reschedule`. Any source that cannot supply a batch index still pays what we were paying. Not filed.
 
 ## 6. Measuring it: `plug_sleep`, and the traps in measuring at all
 
@@ -235,7 +296,23 @@ split them anyway. **A parallelism example needs a source that parallelizes and 
 out; assert both by measuring the serial leg, never by counting rows.**
 
 Why a sleep beats the md5-per-row probe the §2 numbers were first taken with: its cost does not vary with
-input, machine or build. Gate: [test/verify_plugin.test](../test/verify_plugin.test) (25, service tier).
+input, machine or build. Gate: [test/verify_plugin.test](../test/verify_plugin.test) (38, service tier).
+
+### The SOURCE-side twin, and why the pair is the point
+
+`plug_slow_range(rows, millis)` is a global TABLE function that yields `rows` rows in 2048-row batches, sleeping
+`millis` before each batch — so the cost sits INSIDE `get_next`, on the other side of the scan boundary. The two
+together turn §1's claim into a measurement:
+
+| where the 2 s of cost sits | threads=1 | threads=4 | |
+|---|---|---|---|
+| in the SOURCE (`plug_slow_range(8192, 500)`) | 2451 ms | 2454 ms | **flat — the pull is serialized** |
+| in the PROJECTION over that same source | 2425 ms | 883 ms | scales |
+
+The first row is the invariant, not a defect: one mutex around `get_next` is what lets a provider's reader be
+touched from one thread only (§2). The second row is what proves the §5 fix reaches a global TABLE-FUNCTION
+scan, not merely the catalog table scan — both go through `ArrowStreamScan`, and now both declare the batch
+index.
 
 - **⚠ `sum()`, never `count(*)`.** DuckDB PRUNES a projected column no aggregate consumes, so `count(*)` over
   `plug_sleep(...)` evaluates it **zero** times — the measurement reads as instant parallelism, and the
@@ -325,14 +402,18 @@ per-file ordinal *only* when the rowid expression consumes it.
 
 ## 10. Open, and unmeasured
 
-1. **The batch-size default.** Removing engineered-wood's one-file-per-batch coupling (§3), or adding a
+1. **Can `preserve_insertion_order=false` be dropped now?** §5 measured it redundant on the LOCAL union repro
+   (1858 vs 1828 ms), and removing it would give batched Delta statements their insertion order back. It must
+   not be removed on that alone: the setting was justified by REMOTE numbers taken before the fix, and the
+   union form's remote gate in `TryUnionForm` rests on the same pre-fix measurements. Re-measure live, then
+   decide both together.
+2. **The remote figures in §5 all predate the fix** — 120.4 / 44.7 / 13.7 s, and the "union loses cold by
+   ~3.5x" ranking. Nothing about them is known to still hold.
+3. **The batch-size default** (§3). Removing engineered-wood's one-file-per-batch coupling, or adding a
    consumer parameter to the `host_query` ABI, would let a scan take the measured ~20% while a writer keeps its
    own granularity. Nothing is built.
-2. **The union form's remote gate** is now a RANKING, not a pathology (union 13.7 s cold / ~1.05 s warm against
-   the full form's 3.9 s / ~1.53 s), and the cold residue is UNATTRIBUTED — it is not props fetches, which are
-   zero on both forms.
-3. **`FABRICATOR_DELTA_PREFETCH` stays at 1.** The per-file loop is sequential by default, so a remote scan
+4. **`FABRICATOR_DELTA_PREFETCH` stays at 1.** The per-file loop is sequential by default, so a remote scan
    that falls to it pays N round trips in series. Raising it has never been measured against the current read
    path, and it is what made a fixed-name bound-input view collide (now per-query names).
-4. **The `GROUP BY` regression of §2 is unexplained beyond "merge-bound".** If it ever matters, the lever is
+5. **The `GROUP BY` regression of §2 is unexplained beyond "merge-bound".** If it ever matters, the lever is
    DuckDB's aggregate, not our scan.

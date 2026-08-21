@@ -522,6 +522,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	TableFunction test_scan("fabricator_test_scan", {LogicalType::VARCHAR}, fabricator::ArrowStreamScan, TestScanBind,
 	                        fabricator::ArrowStreamInitGlobal, fabricator::ArrowStreamInitLocal);
+	// Batch-index support, as on every other ArrowStreamScan registration below.
+	test_scan.get_partition_data = fabricator::ArrowStreamGetPartitionData;
 	test_scan.projection_pushdown = true;
 	loader.RegisterFunction(test_scan);
 
@@ -530,18 +532,30 @@ static void LoadInternal(ExtensionLoader &loader) {
 	TableFunction query_fn("fabricator_query", {LogicalType::VARCHAR, LogicalType::VARCHAR},
 	                       fabricator::ArrowStreamScan, QueryBind, fabricator::ArrowStreamInitGlobal,
 	                       fabricator::ArrowStreamInitLocal);
+	// Declares batch-index support, which is what routes an order-preserving plan to the PARALLEL
+	// PhysicalBufferedBatchCollector instead of the single-threaded PhysicalBufferedCollector.
+	// See ArrowStreamGetPartitionData + docs/scan-concurrency.md.
+	query_fn.get_partition_data = fabricator::ArrowStreamGetPartitionData;
 	query_fn.projection_pushdown = true;
 	loader.RegisterFunction(query_fn);
 
 	// fabricator_functions(catalog|connstr) — lists discovered routines (diagnostic).
 	TableFunction functions_fn("fabricator_functions", {LogicalType::VARCHAR}, fabricator::ArrowStreamScan,
 	                           FunctionsBind, fabricator::ArrowStreamInitGlobal, fabricator::ArrowStreamInitLocal);
+	// Declares batch-index support, which is what routes an order-preserving plan to the PARALLEL
+	// PhysicalBufferedBatchCollector instead of the single-threaded PhysicalBufferedCollector.
+	// See ArrowStreamGetPartitionData + docs/scan-concurrency.md.
+	functions_fn.get_partition_data = fabricator::ArrowStreamGetPartitionData;
 	functions_fn.projection_pushdown = true; // arrow_ingest maps requested columns; required (see fabricator_query)
 	loader.RegisterFunction(functions_fn);
 
 	// fabricator_server_info(catalog|connstr) — the detected server capability profile (diagnostic).
 	TableFunction server_info_fn("fabricator_server_info", {LogicalType::VARCHAR}, fabricator::ArrowStreamScan,
 	                             ServerInfoBind, fabricator::ArrowStreamInitGlobal, fabricator::ArrowStreamInitLocal);
+	// Declares batch-index support, which is what routes an order-preserving plan to the PARALLEL
+	// PhysicalBufferedBatchCollector instead of the single-threaded PhysicalBufferedCollector.
+	// See ArrowStreamGetPartitionData + docs/scan-concurrency.md.
+	server_info_fn.get_partition_data = fabricator::ArrowStreamGetPartitionData;
 	server_info_fn.projection_pushdown = true;
 	loader.RegisterFunction(server_info_fn);
 

@@ -155,3 +155,59 @@ true
 
 statement ok
 RESET threads;
+
+# ============================================================================
+# plug_slow_range(rows, millis) — the SOURCE-side twin of plug_sleep. It yields 2048-row batches and sleeps
+# per BATCH, so its cost lands inside get_next, on the other side of the scan boundary. The pair is what
+# makes docs/scan-concurrency.md §1 measurable: cost in the projection scales with threads, cost in the
+# source does NOT, because the host pulls every batch under one mutex. Also the first TABLE function a
+# plugin contributes here, so it pins that a plugin reaches ITableFunction and not just IScalarFunction.
+# ============================================================================
+
+query I
+SELECT function_type FROM duckdb_functions() WHERE function_name = 'plug_slow_range';
+----
+table
+
+query III
+SELECT count(*), min(id), max(id) FROM plug_slow_range(8, 0);
+----
+8	0	7
+
+# ⚠ MORE THAN ONE BATCH, deliberately: the yield loop is per 2048 rows, so a single-batch test would not
+# distinguish a working loop from one that emits its first batch and stops. 5000 crosses two boundaries.
+query III
+SELECT count(*), count(DISTINCT id), sum(id) FROM plug_slow_range(5000, 0);
+----
+5000	5000	12497500
+
+query I
+SELECT count(*) FROM plug_slow_range(0, 0);
+----
+0
+
+# Refused, not clamped — same reasoning as plug_sleep's negative: Thread.Sleep(-1) never returns.
+statement error
+SELECT count(*) FROM plug_slow_range(-1, 0);
+----
+must both be >= 0
+
+statement error
+SELECT count(*) FROM plug_slow_range(8, -5);
+----
+must both be >= 0
+
+# The sleep really happens in the source: 4096 rows = 2 batches x 300 ms. A LOWER BOUND again, so a loaded
+# machine can only make it more true; only the sleep NOT happening can break it.
+statement ok
+CREATE TEMP TABLE plug_range_t0 AS SELECT epoch_ms(now()) AS ms;
+
+query I
+SELECT count(*) FROM plug_slow_range(4096, 300);
+----
+4096
+
+query I
+SELECT (epoch_ms(now()) - (SELECT ms FROM plug_range_t0)) >= 500;
+----
+true

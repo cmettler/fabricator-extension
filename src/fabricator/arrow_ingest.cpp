@@ -91,6 +91,14 @@ struct ArrowStreamGlobalState : public GlobalTableFunctionState {
 		// operator above the scan single-threaded, which is why splitting a source into UNION ALL branches
 		// was observed to improve core usage. MEASURED on a 6M-row CPU-bound GROUP BY: 0.864s -> 0.640s
 		// (median of 3) from this alone, and 0.592s combined with row-group-sized batches.
+		//
+		// ⚠ AND THIS IS ONLY CONSULTED WHEN THE PIPELINE'S SINK IS PARALLEL. Pipeline::ScheduleParallel tests
+		// `!sink->ParallelSink()` FIRST and falls back to ScheduleSequentialTask (ONE task), so for a plan
+		// that streams straight to the client — where the sink IS the result collector — this value used to
+		// be dead: MEASURED 2694ms at threads=1 and 2633ms at threads=4, flat. Both numbers above were taken
+		// with an AGGREGATE above the scan, whose sink is parallel, which is what hid it. Fixed by declaring
+		// batch-index support (ArrowStreamGetPartitionData below) so the plan gets the PARALLEL batch
+		// collector; same shape then measures 2729 -> 1197ms. See docs/scan-concurrency.md §5.
 		return scan_max_threads;
 	}
 };
@@ -1022,6 +1030,16 @@ void ArrowStreamScan(ClientContext &context, TableFunctionInput &data, DataChunk
 
 	lstate.chunk_offset += output_size;
 	output.Verify();
+}
+
+OperatorPartitionData ArrowStreamGetPartitionData(ClientContext &context, TableFunctionGetPartitionInput &input) {
+	// Batch index ONLY. Partition COLUMNS would mean handing back the values of a partitioning key, which this
+	// scan has no notion of; DuckDB's own arrow scan refuses the same way.
+	if (input.partition_info.RequiresPartitionColumns()) {
+		throw InternalException("fabricator: GetPartitionData does not support partition columns");
+	}
+	auto &state = input.local_state->Cast<ArrowStreamLocalState>();
+	return OperatorPartitionData(state.batch_index);
 }
 
 // -----------------------------------------------------------------------------

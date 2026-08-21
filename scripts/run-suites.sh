@@ -475,7 +475,15 @@ case "$TIER" in
         # not be inferred: a NEGATIVE argument is REFUSED, because Thread.Sleep(-1) is Timeout.Infinite and a
         # hanging suite is worse than a failing one; and the side effect really happens PER ROW, asserted as
         # a LOWER BOUND on elapsed time, which is the direction a loaded machine can only make more true.
-        : "${MIN_ASSERTIONS:=2116}"
+        # 2129 since 2026-08-21: verify_plugin 25 -> 38, the sample plugin's plug_slow_range — the SOURCE-side
+        # twin of plug_sleep, whose cost sits INSIDE get_next. The pair is what makes the pull-serialized /
+        # convert-parallel split a measurement rather than a reading of the source, and it is the control that
+        # verified the get_partition_data fix reaches a global TABLE-FUNCTION scan and not only the catalog
+        # scan (docs/scan-concurrency.md §5/§6). Its own assertions: registered as a TABLE function, a
+        # MULTI-batch yield (a single-batch test cannot tell a working loop from one that stops after its
+        # first batch), both negative refusals, and the sleep really happening — a LOWER bound on elapsed
+        # time, the direction a loaded machine can only make more true.
+        : "${MIN_ASSERTIONS:=2129}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

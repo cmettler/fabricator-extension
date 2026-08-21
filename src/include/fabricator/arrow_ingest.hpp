@@ -264,6 +264,17 @@ ArrowStreamInitLocal(duckdb::ExecutionContext &context, duckdb::TableFunctionIni
 
 void ArrowStreamScan(duckdb::ClientContext &context, duckdb::TableFunctionInput &data, duckdb::DataChunk &output);
 
+// Reports the pulled batch's index as this chunk's partition (batch) index. Setting `get_partition_data` is
+// how a source DECLARES batch-index support (PhysicalTableScan::SupportsPartitioning is literally
+// `function.get_partition_data != nullptr`), and that declaration decides which RESULT COLLECTOR a plan gets:
+// without it PhysicalPlanGenerator::UseBatchIndex is false, so an order-preserving plan falls back to
+// PhysicalBufferedCollector(parallel=FALSE) — a SINGLE-THREADED sink, which makes Pipeline::ScheduleParallel
+// bail before it ever reads MaxThreads(). With it, the plan gets PhysicalBufferedBatchCollector, which is
+// order-preserving AND ParallelSink()==true. Mirrors ArrowTableFunction::ArrowGetPartitionData; wire it into
+// every TableFunction that uses ArrowStreamScan.
+duckdb::OperatorPartitionData ArrowStreamGetPartitionData(duckdb::ClientContext &context,
+                                                          duckdb::TableFunctionGetPartitionInput &input);
+
 // Ingests an owned ArrowArrayStream into DuckDB DataChunks (identity column map,
 // no projection/rowid). Used to drive an operator's source from a one-off Arrow
 // result, e.g. the OUTPUT rows of INSERT ... RETURNING. Owns + releases the stream.

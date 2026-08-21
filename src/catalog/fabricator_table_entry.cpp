@@ -921,6 +921,10 @@ TableFunction FabricatorTableEntry::BuildScanFunction(ClientContext &context, un
 	// Both are required, and both must be set for EITHER to be used (FunctionSerializer keys off
 	// HasSerializationCallbacks()). Without them the common-subplan optimizer conflates two scans of
 	// different same-shaped tables — see FabricatorScanSerialize for the full mechanism.
+	// Declares batch-index support, which is what routes an order-preserving plan to the PARALLEL
+	// PhysicalBufferedBatchCollector instead of the single-threaded PhysicalBufferedCollector.
+	// See ArrowStreamGetPartitionData + docs/scan-concurrency.md.
+	function.get_partition_data = fabricator::ArrowStreamGetPartitionData;
 	function.serialize = FabricatorScanSerialize;
 	function.deserialize = FabricatorScanDeserialize;
 	function.projection_pushdown = true;
