@@ -229,7 +229,58 @@ cell, `SET threads` the only variable):
 |---|---|---|---|
 | `sum(...)` — aggregate sink (parallel already) | 2702 ms | 1177 ms | 1140 ms |
 | `SELECT plug_sleep(...)` — **streaming to client** | 2729 ms | **2633 ms (flat)** | **1197 ms** |
-| `UNION ALL` of two scans, streaming | 5133 ms | — | **1859 ms** (1858 at threads=8) |
+| `UNION ALL` of two scans, streaming | 5133 ms | — | 1859 ms (1858 at threads=8) — ⚠ see §5a, this is NOT inter-branch |
+
+### ⚠⚠ §5a. WHAT THE FIX DOES NOT DO: A UNION'S BRANCHES ARE STILL SERIAL, AND THE ROW ABOVE MISLED ME
+
+**Found by the fabricator-quantax plugin session, which repinned to this fix, re-measured, and reported
+"partly fixed, not fully". They were right.** It reproduces on our OWN sample plugin, so it needs no plugin of
+theirs — and the fix's own numbers could not have caught it, because every union cell I measured had the cost
+in a per-row SCALAR, which parallelizes WITHIN a branch:
+
+| shape (`plug_slow_range(4096, 500)` = 2 batches x 500 ms) | threads=4 | threads=8 |
+|---|---|---|
+| ONE branch | 1420 ms | 1416 ms |
+| `UNION ALL` with itself | **2419 ms** | **2421 ms** |
+| the same + `preserve_insertion_order=false` | 2486 ms | 2460 ms |
+
+Perfectly additive: branch B does not start until branch A is exhausted, at any thread count, with or without
+the setting. Their instrumentation shows the pull IS handed around inside a branch (five batches on five
+different threads) and branch B still waits.
+
+**So the 1859 ms in the table above is INTRA-branch parallelism, not inter-branch.** Each of my two branches
+had four sleeping rows spread over four threads (2.0 s -> 0.5 s each) and the two branches then ran
+back-to-back — 0.5 + 0.5 + baseline. I read a real 2.8x as "the union case is fixed" and it was not; a
+source-side cost, which cannot parallelize within a branch, exposes it immediately.
+
+**THE MECHANISM, and it is a direct consequence of the fix rather than something it missed.**
+`PhysicalUnion::BuildPipelines` sets `order_matters` — which makes each union pipeline DEPEND on the previous
+one (`MetaPipeline::CreateUnionPipeline` pushes `current` onto `pipeline_dependencies`) — if ANY of five things
+hold, and **every result collector DuckDB has triggers one of them**:
+
+| collector | how it sets `order_matters` |
+|---|---|
+| `PhysicalBufferedCollector` (either `parallel` value) | `SinkOrderDependent()` returns **true unconditionally** |
+| `PhysicalMaterializedCollector` | same — **true unconditionally** |
+| `PhysicalBufferedBatchCollector` (what this fix selects) | does not override `SinkOrderDependent`, but its `RequiredPartitionInfo()` **is** `BatchIndex()`, which is its own clause |
+
+⇒ the fix swapped the `!sink->ParallelSink()` trigger for the `partition_info.batch_index` trigger. Net effect
+on inter-branch concurrency: **zero, by construction.** And it is not the binder's doing —
+`plan_setop.cpp` constructs `LogicalSetOperation` without the argument, so `allow_out_of_order` DEFAULTS TO
+TRUE for an ordinary `UNION ALL`. The plan says order need not be preserved and the sink overrides it.
+
+**UPSTREAM CANDIDATE, and the sharpest one this area has produced.** `PhysicalBufferedCollector::ParallelSink()`
+returns its `parallel` flag while `SinkOrderDependent()` returns `true` REGARDLESS — so under
+`preserve_insertion_order=false`, where the collector was chosen precisely because order does not matter, it
+still declares itself order-dependent and still serializes the union. `SinkOrderDependent()` following
+`parallel` (and the same for the materialized collector) would make `order_matters` false there and let the
+branches run concurrently. ⚠ NOT verified: it needs a patched `duckdb_static` and a rebuild, and the
+prediction ("the 2486 ms row collapses toward 1420") is exactly the kind this file requires to be measured
+before being believed.
+
+**⚠ Practical consequence for us, until that is settled: our remote union form gets NO inter-branch
+concurrency**, so `TryUnionForm`'s cost model must keep assuming its D deletion-vector branches run
+back-to-back. That is one more reason its remote gate stays where it is (§10).
 
 **⚠ AND IT MAKES OUR PER-STATEMENT `preserve_insertion_order=false` REDUNDANT ON THIS SHAPE** — the union at
 threads=8 is **1858 ms** by default against **1828 ms** with the SET, i.e. within noise. That setting was the
