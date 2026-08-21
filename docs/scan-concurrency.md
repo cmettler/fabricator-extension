@@ -677,6 +677,52 @@ refcounted and the destructor wakes it); the runs are the backstop, because a ra
 Every live OneLake figure in this section predates it, including the one `TryUnionForm`'s remote gate rests
 on (§10) — so that gate stays where it is until the numbers are re-taken.
 
+### §5g. WHAT §5f REACHES, AND WHAT IT DOES NOT: the in-out and collector operators are a DIFFERENT path — and they never had this bug
+
+**Covered, all of it, by one change**: every scan whose rows come from `function.function`, i.e. all nine
+`ArrowStreamScan` registrations — the catalog table scan (the `ITable` path), catalog-bound and global table
+functions, and `fabricator_query` / `fabricator_functions` / `fabricator_server_info` /
+`fabricator_host_query`. One implementation serves all of them, so this is true of **every provider** rather
+than of one.
+
+**NOT covered: the table-in-out exchange and the collector**, which produce rows from `in_out_function` —
+a separate branch of `PhysicalTableScan::GetDataInternal` with a separate blocking mechanism
+(`g_state.BlockSource(guard, input.interrupt_state)`, the interrupt-state parking that sinks use). `scan_wait`
+is not reachable from there at all.
+
+**⚠ AND THEY DO NOT NEED IT, because they cannot have the bug: both declare `MaxThreads() == 1`**
+([src/catalog/fabricator_schema_entry.cpp:1643](../src/catalog/fabricator_schema_entry.cpp) for the exchange,
+`:2014` for the collector — an intra-pipeline cap they hold deliberately, because each has ONE shared holder
+buffer per execution). The starvation §5c measured needs N tasks piling onto one lock; with one task per scan
+there is nothing to pile up. A blocking call there occupies ONE worker, which is the irreducible cost of a
+blocking call rather than a multiplication of it, so a sibling pipeline still gets a worker. **⚠ The corollary
+is the thing to remember: if anyone ever raises either thread count, the §5f fix does NOT come along for free
+— they would need the mechanism ported to the in-out branch first.**
+
+**⚠ A SECOND, NARROWER GAP, ESTABLISHED FROM SOURCE AND NOT DEMONSTRATED: neither declares
+`get_partition_data`** (only the two `ArrowStreamScan` sites do, `:2442` and `:2594`), so such a scan reports
+no batch-index support — and `UseBatchIndex` demands that **every** source support it
+(`plan_insert.cpp:58-68` → `PhysicalOperator::AllSourcesSupportBatchIndex`), which would take a whole
+statement back to §5's single-threaded result collector.
+
+- **⚠⚠ MY TEST OF THAT WAS VOID, AND READING IT AS A REFUTATION WOULD HAVE BEEN THE §6 INSTRUMENT ERROR
+  AGAIN.** A streaming fabricator scan with four sleeping morsels measured 0.62 s with a 1-row `cf_tag`
+  in-out CROSS JOINED into the plan and 0.62–0.70 s without it — no effect. That is not evidence: **a JOIN
+  is a sink, and `GetSources()` walks only the single-child spine** (`physical_operator.cpp:246`; `PhysicalUnion`
+  overrides it precisely because of that), so the walk STOPS at the join and never sees the in-out. The
+  collector choice was irrelevant in both legs for a third reason as well — the scan's sink was the join, and
+  a parallel sink is what §2 shows makes `MaxThreads()` matter at all.
+- ⇒ the reachable shape is an in-out or collector scan **on the spine or in a UNION**, and a union's own
+  branch serialization confounds the clock. So the gap is real in the source and has **no measured victim**;
+  do not fix it on the strength of the reading alone, and do not declare `get_partition_data` for those
+  operators without deciding what a batch index MEANS for them (the exchange emits per input chunk, and
+  `order_matters` reads the sink's requirement, so declaring one can change a union's scheduling too).
+
+**⚠ Both paths still pay §2's ORIGINAL cost, which this work does not touch**: a source declaring one thread
+makes every operator ABOVE it single-threaded. For the exchange and the collector that is the price of their
+shared holder, and it is a deliberate trade rather than an oversight — but it means an expensive projection
+over an in-out's output gets one thread.
+
 ## 6. Measuring it: `plug_sleep`, and the traps in measuring at all
 
 The sample plugin ships **`plug_sleep(millis)`**
