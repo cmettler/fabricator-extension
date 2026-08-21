@@ -311,6 +311,25 @@ still applied by `BatchPlan.Statement`
 ([dotnet/Fabricator.Delta/DeltaNativeReader.cs](../dotnet/Fabricator.Delta/DeltaNativeReader.cs)) and has NOT
 been removed — see §10 item 1 for what removing it would need.
 
+**THE SCALING CURVE, which is the strongest evidence for the fix and better than any single before/after
+ratio.** Same table, per-row scalar cost, one process per cell, baseline (every sleep at 0) **652 ms**
+subtracted:
+
+| work in the pipeline | t=1 | t=2 | t=4 | t=8 |
+|---|---|---|---|---|
+| 4 sleeping rows = 2000 ms | 2014 ms | 1058 ms | **526 ms** | 590 ms |
+| 8 sleeping rows = 4000 ms | 4128 ms | 2035 ms | 1036 ms | **531 ms** |
+
+Textbook 1/N — and **the ceiling MOVES WITH THE ROW COUNT**, which is what makes it a mechanism rather than a
+coincidence: four sleeps cannot use eight threads (590 ms, no better than t=4) and eight sleeps can (531 ms).
+`sum(...)` returns 4000, so every sleep really executed and nothing was pruned.
+
+**⚠ COROLLARY WORTH KNOWING: parallelism is bounded by MORSELS, and a morsel is one `DataChunk` — ≤2048 rows
+at the shipped default (§3).** A 4096-row table therefore has two morsels and cannot use more than two threads
+whatever `SET threads` says. That is the same knob §3 describes from the other side: bigger batches mean fewer,
+coarser morsels, so the two levers trade against each other at small row counts as well as overlapping at
+large ones.
+
 **⚠ THE ROUTING ITSELF IS NOT GATED, and the reason is worth stating rather than implying coverage.** The
 change moves no row and alters no answer, so no row assertion can see it; and nothing prints the collector —
 `EXPLAIN` does not, and `EXPLAIN ANALYZE` reports only `Total Time`, checked. The only observable is WALL
