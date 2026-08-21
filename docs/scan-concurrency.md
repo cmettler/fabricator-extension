@@ -278,6 +278,27 @@ branches run concurrently. ⚠ NOT verified: it needs a patched `duckdb_static` 
 prediction ("the 2486 ms row collapses toward 1420") is exactly the kind this file requires to be measured
 before being believed.
 
+**⚠ NO SINK IS EXEMPT, INCLUDING A CTAS — and checking that caught me making the SAME mistake twice within
+the hour.** Asked what `CREATE TABLE … AS SELECT … UNION ALL …` does, I first measured it with the per-row
+SCALAR and reported DuckDB's own storage sink scaling 2.5x (4834 -> 1928 ms). Re-measured with the SOURCE-side
+cost, which is the instrument that answers this question:
+
+| cost in the SOURCE, `UNION ALL` of two `plug_slow_range(4096,500)` | threads=1 | threads=4 |
+|---|---|---|
+| CTAS -> DuckDB's own storage | 2467 ms | **2503 ms — flat** |
+| the same + `preserve_insertion_order=false` | — | 2419 ms |
+| CTAS -> a fabricator table | 2740 ms | 2751 ms |
+
+DuckDB's `PhysicalBatchInsert` declares `ParallelSink() == true`, so it is not the `!ParallelSink()` clause that
+chains it — it is the same `RequiredPartitionInfo() == BatchIndex()` clause the batch COLLECTOR trips. ⇒ every
+sink in DuckDB that either preserves order or wants batch indices serializes union branches, and that is the
+whole set.
+
+**⚠⚠ THE ERROR PATTERN, named because it recurred immediately after being corrected: a per-row SCALAR measures
+INTRA-branch parallelism, and I twice read its result as a statement about INTER-branch concurrency.** The two
+instruments answer different questions and neither substitutes for the other — see §6, which now says which is
+which.
+
 **⚠ Practical consequence for us, until that is settled: our remote union form gets NO inter-branch
 concurrency**, so `TryUnionForm`'s cost model must keep assuming its D deletion-vector branches run
 back-to-back. That is one more reason its remote gate stays where it is (§10).
@@ -365,6 +386,18 @@ touched from one thread only (§2). The second row is what proves the §5 fix re
 scan, not merely the catalog table scan — both go through `ArrowStreamScan`, and now both declare the batch
 index.
 
+**⚠⚠ WHICH INSTRUMENT ANSWERS WHICH QUESTION — get this wrong and the measurement is confidently misleading,
+as §5a records happening twice:**
+
+| question | instrument | why the other one lies |
+|---|---|---|
+| does the plan give a scan's per-thread work more than one thread? | the **scalar** in the projection | a source-side cost is serialized by our own pull mutex, so it is flat even on a perfectly parallel plan |
+| do a union's BRANCHES overlap? | the **table function** (cost in the source) | a scalar parallelizes WITHIN a branch, so it shows a real speedup while the branches stay strictly serial |
+| is a WRITE sink parallel? | the **scalar**, single source, no union | with a source-side cost nothing can scale, so the comparison cannot discriminate |
+
+That third row is why §7's write-path finding rests on scalar measurements and §5a's union finding rests on
+table-function ones. Neither result transfers to the other question.
+
 - **⚠ `sum()`, never `count(*)`.** DuckDB PRUNES a projected column no aggregate consumes, so `count(*)` over
   `plug_sleep(...)` evaluates it **zero** times — the measurement reads as instant parallelism, and the
   instrument was never called at all. This exact trap has been hit three separate times in this codebase on
@@ -438,6 +471,38 @@ together with the SQL that reads it**; that invariant is why the partition-only 
 per-file ordinal *only* when the rowid expression consumes it.
 
 ---
+
+## 7a. EVERY WRITE INTO A FABRICATOR TABLE IS SINGLE-TASKED
+
+Measured while answering "what does a CTAS from a union do" (2026-08-21), and it is the more consequential half
+of that answer, because a dbt model IS a CTAS. Single source, no union, four morsels x 500 ms of per-row cost —
+so intra-branch parallelism is available to every row of the table and only the SINK differs:
+
+| | threads=1 | threads=4 |
+|---|---|---|
+| streaming to client | 2730 ms | **1227 ms** |
+| `CREATE TABLE … AS` -> DuckDB's own storage | 2678 ms | **1224 ms** |
+| `CREATE TABLE lk.main.x AS` -> a fabricator table | 2919 ms | **2952 ms** |
+| `INSERT INTO lk.main.x SELECT …` | 2954 ms | **3021 ms** |
+
+**So neither §2's `MaxThreads` nor §5's `get_partition_data` reaches any write path.** The cause is ours and our
+own code states it, at [src/dml/fabricator_insert.cpp](../src/dml/fabricator_insert.cpp): *"The sink is serial
+(ParallelSink defaults to false), so no lock is needed and blocking here cannot starve another sink thread."*
+`Pipeline::ScheduleParallel` tests `!sink->ParallelSink()` FIRST, so the whole source pipeline gets one task and
+`MaxThreads()` is never read.
+
+**What lifting it would cost — small edit, real decision.** The concrete blocker is one line on the managed
+side: `BulkSession`'s channel is created `SingleWriter = true`. Flipping that and declaring the sink parallel is
+a few lines, but:
+
+- **batch ORDER becomes nondeterministic across threads.** Fine for a SQL Server bulk load, where rows are
+  unordered — NOT fine for `SORTED BY` / clustered Delta writes, where a host-side sort feeds this very sink and
+  interleaving would destroy the ordering it just produced;
+- **file LAYOUT changes**, because `BudgetedStream` cuts output files at batch boundaries (§3), so which rows
+  land in which parquet file stops being deterministic and `delta.targetFileSize` reasoning goes with it.
+
+The plausible shape is parallel by default with the ordered-write paths opting out, which is a decision to take
+rather than a flag to flip. Nothing is built.
 
 ## 9. What this doc does not cover
 
