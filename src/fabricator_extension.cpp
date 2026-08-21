@@ -17,6 +17,7 @@
 #include "copy/fabricator_copy.hpp"
 #include "fabricator_optimizer.hpp"
 #include "fabricator_fs_spike.hpp"
+#include "fabricator_wait.hpp"
 #include "fabricator_host_query.hpp"
 #include "fabricator_http.hpp"
 #include "fabricator_secret.hpp"
@@ -491,6 +492,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// SPIKE: install the host FileSystem callbacks FIRST (before any bridge boot) + register
 	// fabricator_fs_spike(path). Foundation for a managed lakehouse reader doing secret-backed remote IO.
 	RegisterFsSpike(loader);
+
+	// fabricator_wait(rows, millis) — a pure-DuckDB source with NO Arrow and no bridge, so a scheduling
+	// question can be answered without our own pull mutex as a rival explanation. See fabricator_wait.hpp.
+	RegisterFabricatorWait(loader);
 	// fabricator_delta_scan(path) is now a connection-free GLOBAL host-FS table function (registered by
 	// RegisterFabricatorGlobalFunctions below, dispatched to the managed engineered-wood reader) — no bespoke
 	// C++ registration needed. See docs/global-functions.md §host-FS.

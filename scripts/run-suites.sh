@@ -158,7 +158,7 @@ case "$TIER" in
         # 72 runs since 2026-08-20: verify_catalog_init — the provider init hook (ABI v78). Hermetic on the
         # DELTA provider deliberately, i.e. the one whose Initialize() is a no-op DIM: that is what proves the
         # hook is wired in the HOST rather than in one provider.
-        : "${MIN_SUITES:=72}"
+        : "${MIN_SUITES:=73}"
         # 5656 since 2026-08-02: verify_delta_catalog_transactions 943 -> 944 Ã¢ÂÂ ROLLBACK now RECLAIMS the
         # data files the transaction eagerly wrote (EW #52's DiscardDataFilesAsync) instead of leaving them
         # for VACUUM. +2, not +1: that suite is one of the DOUBLED ones below, so an assertion added to it
@@ -341,7 +341,12 @@ case "$TIER" in
         # 7719 since 2026-08-20: 7705 + exactly the 14 of verify_catalog_init, so no other suite moved —
         # which is the whole claim for this change: it moves WHERE work happens (SQL Server's first CONNECT
         # leaves get_capabilities for catalog_init), not WHAT any answer is.
-        : "${MIN_ASSERTIONS:=7719}"
+        # 7736 since 2026-08-21: verify_wait — fabricator_wait(rows, millis [, threads]), the pure-DuckDB
+        # WAIT source. Hermetic by construction (no Arrow, no bridge, no provider), and gated because a
+        # REGISTERED function is a shipped feature: this tree has already removed one spike that shipped
+        # by accident. ⚠ It pins the CONTRACT, not parallelism — asserting that would need an UPPER bound
+        # on elapsed time, the flaky direction.
+        : "${MIN_ASSERTIONS:=7739}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

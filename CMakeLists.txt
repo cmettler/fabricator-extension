@@ -17,6 +17,7 @@ set(EXTENSION_SOURCES
     src/fabricator_secret.cpp
     src/fabricator_storage.cpp
     src/fabricator_fs_spike.cpp
+    src/fabricator_wait.cpp
     src/fabricator_host_query.cpp
     src/fabricator_http.cpp
     src/fabricator_optimizer.cpp

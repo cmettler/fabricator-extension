@@ -299,6 +299,88 @@ INTRA-branch parallelism, and I twice read its result as a statement about INTER
 instruments answer different questions and neither substitutes for the other — see §6, which now says which is
 which.
 
+### ⚠⚠ §5b. THE `order_matters` EXPLANATION ABOVE IS REFUTED FOR OUR CASE — a pure-C++ control overlaps, and what serializes is TWO CALLS OF THE SAME FUNCTION
+
+`fabricator_wait(rows, millis)` ([src/fabricator_wait.cpp](../src/fabricator_wait.cpp)) was added for exactly
+this: a plain DuckDB table function with **no Arrow, no bridge, no plugin and no pull mutex of ours**, so a
+scheduling answer cannot be blamed on our own machinery. Its sleep is deliberately OUTSIDE its claim lock —
+holding it across the sleep would reproduce the serialization the control exists to rule out.
+
+**Validity first** (a control has to be shown able to produce the positive result): 4 chunks x 500 ms scales
+2434 -> 1351 -> 869 ms at threads 1/2/4. Then, one chunk per branch so ONLY inter-branch concurrency can help,
+2000 ms of work, threads=4, and **distinct arguments in every pair so the common-subplan optimizer cannot
+dedup** (confirmed by `EXPLAIN`: two separate scans, no CTE):
+
+| union of two branches | result |
+|---|---|
+| C++ `fabricator_wait` ∪ C++ `fabricator_wait` | **1352–1388 ms — OVERLAPPED** |
+| C++ `fabricator_wait` ∪ managed `plug_slow_range` | **1412 ms — OVERLAPPED** |
+| managed scan ∪ managed scan (same function) | 2379 ms — serial |
+| managed SCALAR ∪ managed SCALAR (same function, over C++ sources) | 2382 ms — serial |
+| managed SCALAR ∪ managed SCAN (two DIFFERENT functions) | **1380 ms — OVERLAPPED** |
+
+**So `order_matters` is NOT the explanation for the shape we actually hit.** Every cell above uses a `count(*)`
+sink, where `SinkOrderDependent()` is false and `RequiredPartitionInfo()` is empty — `order_matters` is FALSE
+and the branches are free to overlap. The C++ ones do. What does not overlap is **two calls of the SAME
+function**, and two calls of two DIFFERENT functions overlap fine. §5a's mechanism is real DuckDB behaviour for
+a streaming/collector sink and it is NOT what produced the measurements either of us took.
+
+**⚠ Also ruled out, each by measurement rather than by reading:** the declared thread count (`threads := 1 / 2 /
+4 / 20` on the control, all 1350–1381 ms — hence that named parameter exists); `CanSaturateThreads` (a
+2048-row branch has `EstimatedThreadCount() == 1` and a bare scan `ContainsSink() == false`); common-subplan
+dedup (distinct args + `EXPLAIN`); and thread starvation — a stderr trace of the managed sleep shows branch B
+beginning **4 ms after A ends, on a DIFFERENT managed thread**, which is a wait, not a shortage.
+
+### §5c. MECHANISM ESTABLISHED: our pull mutex is held ACROSS the blocking pull while we declare a thread per core
+
+**Two intermediate readings were wrong and are recorded because each was refuted by the next measurement, not
+by argument.** First "`order_matters` chains the branches" (refuted: every cell uses a `count(*)` sink where
+`order_matters` is false, and the C++ control overlaps). Then "two calls of the SAME function serialize"
+(refuted the moment a SECOND managed table function existed: `plug_slow_range ∪ plug_slow_range2` is 2382 ms,
+just as serial as the same-function pair). ⚠ That second wrong turn came from substituting a managed SCALAR
+for the second table function, which is the §6 instrument error again — a scalar is expression evaluation, not
+a scan, so a scalar/scan pair overlapping said nothing about two scans.
+
+**What the trace showed.** Both branches BIND up front; branch B's `Execute` body is not entered until 2 ms
+after branch A's sleep ENDS. So nothing in managed code is waiting — the host never asks B for a batch while A
+is blocked.
+
+**The mechanism, then reproduced in pure C++ with both halves shown NECESSARY.** `GetNextBatch` holds
+`gstate.main_mutex` across the managed pull (correct in itself: one Arrow stream cannot be pulled from two
+threads) while `ArrowStreamInitGlobal` declares `MaxThreads() = NumberOfThreads()`. Branch A therefore launches
+one task per thread: one blocks INSIDE the pull holding the mutex, and the others block ON that mutex — each
+burning a DuckDB worker. Every worker is consumed by branch A, so branch B's task never gets one. Inverting the
+control (`hold_lock`, plus the `threads` override) reproduces it exactly, threads=4, 2000 ms of work:
+
+| control configuration | result |
+|---|---|
+| lock released before the sleep (the control) | 1386 ms — overlapped |
+| `hold_lock := true, threads := 1` | **1338 ms — overlapped** |
+| `hold_lock := true, threads := 4` | **2417 ms — SERIAL** |
+| `hold_lock := true, threads := 20` | 2356 ms — SERIAL |
+| `hold_lock := false, threads := 20` | 1327 ms — overlapped |
+
+**Both conditions are required. Either alone overlaps.**
+
+**⚠⚠ AND THAT MAKES IT A SIDE EFFECT OF §2's OWN FIX.** Before 2026-08-18 `MaxThreads()` returned 1, which is
+the `threads := 1` row — one task per branch, nothing to pile up, branches overlap. So the change that made a
+single scan's per-thread work parallel simultaneously made sibling tasks starve every other pipeline in the
+plan. §2's gate could not have caught it: both tiers were byte-identical, because a sqllogictest suite never
+runs two expensive scans concurrently.
+
+**THE DIRECTION FOR A FIX, and it is DuckDB's own vocabulary rather than a lock change.** A source that cannot
+make progress should hand its worker back, not block on a mutex: `SourceResultType::BLOCKED` exists for
+exactly that, and our scan has no BLOCKED path — it returns rows or end-of-stream. The alternatives are worse:
+`try_lock` + returning zero rows is a WRONG ANSWER (an empty chunk means end-of-scan), and capping
+`MaxThreads()` to 1 would give back §2's measured 1/N. ⚠ Note DuckDB's own arrow scan has the same
+mutex-around-the-pull shape and does not suffer this, because its `GetNextChunk` is an in-memory read that
+does not block for a second — the blocking pull is OUR property, so the fix is ours too. Nothing built.
+
+**⚠ THE PRACTICAL REFINEMENT, and it is actionable today: it is not "unions do not overlap".** A union of two
+DIFFERENT provider functions overlaps. So a plan that fans out over one function N times is the shape that
+serializes, and the remote union form — whose D branches are all the same per-file read — is exactly that
+shape.
+
 **⚠ Practical consequence for us, until that is settled: our remote union form gets NO inter-branch
 concurrency**, so `TryUnionForm`'s cost model must keep assuming its D deletion-vector branches run
 back-to-back. That is one more reason its remote gate stays where it is (§10).

@@ -1,0 +1,96 @@
+# name: test/verify_wait.test
+# description: fabricator_wait(rows, millis [, threads]) — the pure-DuckDB WAIT source. A diagnostic CONTROL
+#              with no Arrow, no bridge and no provider, so a scheduling question can be answered without our
+#              own machinery as a rival explanation. See docs/scan-concurrency.md §5b.
+# group: [fabricator]
+
+require fabricator
+
+# ⚠ WHAT THIS SUITE CANNOT DO, said plainly: it cannot assert that the function PARALLELIZES. That needs an
+# UPPER bound on elapsed time, which is the flaky direction — the same reason §5's routing is ungated. What is
+# pinned here is the function's CONTRACT, so that the control stays trustworthy as an instrument: the right
+# rows, the refusals, and that the sleep really happens (a LOWER bound, which only its absence can break).
+
+query III
+SELECT count(*), min(id), max(id) FROM fabricator_wait(5000, 0);
+----
+5000	0	4999
+
+# Crosses two chunk boundaries (STANDARD_VECTOR_SIZE = 2048), which is what makes it a multi-chunk claim loop
+# rather than a single emission — the ids must be a complete, gapless range.
+query II
+SELECT count(DISTINCT id), sum(id) FROM fabricator_wait(5000, 0);
+----
+5000	12497500
+
+query I
+SELECT count(*) FROM fabricator_wait(0, 0);
+----
+0
+
+query I
+SELECT count(*) FROM fabricator_wait(1, 0);
+----
+1
+
+# The `threads` override exists so the control can vary the ONE plan-level property that differs between it
+# and our Arrow scan (which reports NumberOfThreads()). It must not change the ANSWER.
+query I
+SELECT count(*) FROM fabricator_wait(5000, 0, threads := 8);
+----
+5000
+
+query I
+SELECT count(*) FROM fabricator_wait(5000, 0, threads := 1);
+----
+5000
+
+# Refused rather than clamped, for the same reason as the plugin's wait functions: a negative sleep would
+# never return, and a hanging suite is worse than a failing one.
+statement error
+SELECT count(*) FROM fabricator_wait(-1, 0);
+----
+must both be >= 0
+
+statement error
+SELECT count(*) FROM fabricator_wait(10, -1);
+----
+must both be >= 0
+
+statement error
+SELECT count(*) FROM fabricator_wait(10, 0, threads := -1);
+----
+threads must be >= 0
+
+# The sleep really happens: 3 chunks x 200 ms, asserted as a LOWER bound so only its ABSENCE can break it.
+statement ok
+SET threads=1;
+
+statement ok
+CREATE TEMP TABLE wait_t0 AS SELECT epoch_ms(now()) AS ms;
+
+query I
+SELECT count(*) FROM fabricator_wait(6144, 200);
+----
+6144
+
+query I
+SELECT (epoch_ms(now()) - (SELECT ms FROM wait_t0)) >= 500;
+----
+true
+
+statement ok
+RESET threads;
+
+# ⚠ `hold_lock` INVERTS this control — it holds the claim lock across the sleep, which is the shape our Arrow
+# scan has (docs/scan-concurrency.md §5c). It exists to test a mechanism, so it must keep answering correctly:
+# a wrong ANSWER here would make the instrument useless for the thing it was built for.
+query II
+SELECT count(*), sum(id) FROM fabricator_wait(4096, 0, hold_lock := true);
+----
+4096	8386560
+
+query I
+SELECT count(*) FROM fabricator_wait(4096, 0, hold_lock := true, threads := 4);
+----
+4096

@@ -22,7 +22,7 @@ public sealed class SamplePluginBackend : IBackend
         new IScalarFunction[] { new PlugGreetFunction(), new PlugSleepFunction() };
 
     public IEnumerable<ITableFunction> GlobalTableFunctions =>
-        new ITableFunction[] { new PlugSlowRangeFunction() };
+        new ITableFunction[] { new PlugSlowRangeFunction(), new PlugSlowRange2Function() };
 
     /// <summary>
     /// Macros a plugin ships — proving the SQL-template path needs no more from a plugin than the function path
@@ -153,11 +153,11 @@ internal sealed class PlugSleepFunction : IScalarFunction
 /// affordable — 4 batches x 500 ms is 2 s, where per-row sleeping over the same 8192 rows could not be run
 /// at all.</para>
 /// </summary>
-internal sealed class PlugSlowRangeFunction : ITableFunction
+internal class PlugSlowRangeFunction : ITableFunction
 {
     internal const int BatchRows = 2048;
 
-    public string Name => "plug_slow_range";
+    public virtual string Name => "plug_slow_range";
 
     public Schema Parameters => new(
         new[]
@@ -167,8 +167,17 @@ internal sealed class PlugSlowRangeFunction : ITableFunction
         },
         metadata: null);
 
+    internal static void Trace(string what)
+    {
+        if (Environment.GetEnvironmentVariable("PLUG_TRACE") == "1")
+        {
+            Console.Error.WriteLine($"[{DateTime.UtcNow:HH:mm:ss.fff}] tid={Environment.CurrentManagedThreadId} {what}");
+        }
+    }
+
     public ITableFunctionBinding Bind(RecordBatch args)
     {
+        Trace($"{Name} BIND");
         long rows = ReadArg(args, 0);
         long millis = ReadArg(args, 1);
         if (rows < 0 || millis < 0)
@@ -176,7 +185,7 @@ internal sealed class PlugSlowRangeFunction : ITableFunction
             throw new ArgumentOutOfRangeException(
                 nameof(args), "plug_slow_range: rows and millis must both be >= 0.");
         }
-        return new Binding(rows, millis);
+        return new Binding(rows, millis, $"{Name}({rows})");
     }
 
     private static long ReadArg(RecordBatch args, int i)
@@ -189,11 +198,13 @@ internal sealed class PlugSlowRangeFunction : ITableFunction
     {
         private readonly long _rows;
         private readonly long _millis;
+        private readonly string _tag;
 
-        internal Binding(long rows, long millis)
+        internal Binding(long rows, long millis, string tag = "?")
         {
             _rows = rows;
             _millis = millis;
+            _tag = tag;
         }
 
         public Schema OutputSchema =>
@@ -210,13 +221,16 @@ internal sealed class PlugSlowRangeFunction : ITableFunction
             [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
         {
             var schema = OutputSchema;
+            Trace($"{_tag} EXECUTE-ENTER");
             for (long start = 0; start < _rows; start += BatchRows)
             {
                 ct.ThrowIfCancellationRequested();
                 if (_millis > 0)
                 {
+                    Trace($"{_tag} SLEEP-BEGIN start={start}");
                     // The cost sits HERE, inside the batch the host is pulling — see the class remarks.
                     Thread.Sleep((int)Math.Min(_millis, int.MaxValue));
+                    Trace($"{_tag} SLEEP-END   start={start}");
                 }
                 int n = (int)Math.Min(BatchRows, _rows - start);
                 var b = new Int64Array.Builder().Reserve(n);
@@ -233,4 +247,17 @@ internal sealed class PlugSlowRangeFunction : ITableFunction
         {
         }
     }
+}
+
+/// <summary>
+/// A SECOND, independent table function with identical behaviour and a different NAME —
+/// <c>plug_slow_range2(rows, millis)</c>. It exists for one measurement and would otherwise be pure
+/// duplication: whether two managed table-function scans serialize because they are the SAME function or
+/// because they are both managed scans. That question cannot be answered with one table function, and it must
+/// NOT be answered with a scalar stand-in — a scalar is expression evaluation, not a scan, so it changes the
+/// very thing under test. See docs/scan-concurrency.md §5b.
+/// </summary>
+internal sealed class PlugSlowRange2Function : PlugSlowRangeFunction
+{
+    public override string Name => "plug_slow_range2";
 }
