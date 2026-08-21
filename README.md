@@ -807,6 +807,22 @@ FROM fabricator_query('db',
 Extension version (compatibility shim). `fabricator_managed_dir()` / `fabricator_test_scan('x')` are
 diagnostics for the CoreCLR + Arrow spine.
 
+### `fabricator_wait(rows, millis [, threads := …] [, hold_lock := …] [, async_wait := …]) -> TABLE(id BIGINT)`
+
+A DIAGNOSTIC source: emits `rows` BIGINTs in 2048-row chunks, sleeping `millis` before each chunk. It contains
+no Arrow, no .NET and no provider — so it answers scheduling questions ("does `SET threads` reach this plan?",
+"do these `UNION ALL` branches overlap?") without the extension's own machinery as a rival explanation.
+
+```sql
+SET threads=4;
+SELECT count(*) FROM fabricator_wait(8192, 500);            -- 4 chunks x 500 ms over 4 threads: ~0.5 s
+SELECT count(*) FROM fabricator_wait(8192, 500, threads := 1);  -- the same work serialized: ~2.0 s
+```
+
+`threads` overrides what the scan reports to the planner; `hold_lock` and `async_wait` reproduce and then fix,
+in pure C++, the worker-starvation shape described in [docs/scan-concurrency.md](docs/scan-concurrency.md) §5.
+A negative argument is REFUSED rather than clamped — a sleep that never returns would hang rather than fail.
+
 ### `fabricator_plugins() -> TABLE(root, path, status, provider, detail)`
 
 What the plugin scan looked at and what it decided — one row per configured plugin root, plus one per

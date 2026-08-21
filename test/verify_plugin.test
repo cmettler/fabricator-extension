@@ -211,3 +211,64 @@ query I
 SELECT (epoch_ms(now()) - (SELECT ms FROM plug_range_t0)) >= 500;
 ----
 true
+
+# ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
+# THE UNION OVERLAPS — a scan whose PULL blocks no longer occupies every worker.
+# docs/scan-concurrency.md §5f. This is the gate for the PRODUCTION path (ArrowStreamScan, which every
+# fabricator scan on every provider goes through); `verify_wait`'s async_wait section gates the mechanism
+# hermetically, in pure C++, with no managed code in it at all.
+#
+# ⚠ THE A/B LEVER IS DuckDB's OWN DEBUG SETTING, and that is what makes this a same-binary comparison rather
+# than a remembered number: under SYNCHRONOUS a table function may not return BLOCKED (PhysicalTableScan's
+# ValidateAsyncStrategyResult throws on it), so our scan falls back to parking on the pull lock — i.e. exactly
+# the pre-fix code path. Measured on the box this was written on, three runs each, +/- 0.01: 2.06 s vs 1.03 s.
+#
+# ⚠ TWO different functions on purpose. `plug_slow_range ∪ plug_slow_range2` is what refuted the intermediate
+# reading that "two calls of the SAME function serialize" (§5c) — with one function it would still be true and
+# would prove less.
+
+statement ok
+SET threads=4;
+
+statement ok
+CREATE TEMP TABLE plug_u0 AS SELECT epoch_ms(now()) AS ms;
+
+# 4096 rows = 2 batches x 500 ms = 1000 ms per branch, all of it INSIDE the pull.
+statement ok
+SET debug_physical_table_scan_execution_strategy='SYNCHRONOUS';
+
+query I
+SELECT sum(id) FROM (SELECT * FROM plug_slow_range(4096, 500) UNION ALL SELECT * FROM plug_slow_range2(4096, 500));
+----
+16773120
+
+statement ok
+CREATE TEMP TABLE plug_u1 AS SELECT epoch_ms(now()) AS ms;
+
+statement ok
+SET debug_physical_table_scan_execution_strategy='DEFAULT';
+
+query I
+SELECT sum(id) FROM (SELECT * FROM plug_slow_range(4096, 500) UNION ALL SELECT * FROM plug_slow_range2(4096, 500));
+----
+16773120
+
+statement ok
+CREATE TEMP TABLE plug_u2 AS SELECT epoch_ms(now()) AS ms;
+
+# POSITIVE CONTROL, load-bearing: the serial leg really slept. Without it the ratio below would pass equally
+# on a build where the sleeps had stopped happening.
+query I
+SELECT ((SELECT ms FROM plug_u1) - (SELECT ms FROM plug_u0)) >= 1500;
+----
+true
+
+# THE CLAIM: the branches overlap, so the union costs about ONE of them. True ratio ~0.50, asserted at 0.80.
+query I
+SELECT ((SELECT ms FROM plug_u2) - (SELECT ms FROM plug_u1))
+     < ((SELECT ms FROM plug_u1) - (SELECT ms FROM plug_u0)) * 0.8;
+----
+true
+
+statement ok
+RESET threads;

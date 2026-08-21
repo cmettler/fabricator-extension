@@ -10,6 +10,7 @@
 
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/function/table_function.hpp"
+#include "fabricator/scan_wait.hpp"
 
 #include <chrono>
 #include <thread>
@@ -26,20 +27,33 @@ struct WaitBindData : public TableFunctionData {
 	//! reports NumberOfThreads()), and a control has to be able to vary the variable under test.
 	idx_t declared_threads = 0;
 	//! Hold the claim lock ACROSS the sleep, inverting this control's defining property. It exists to TEST a
-	//! mechanism rather than to be useful: our Arrow scan holds gstate.main_mutex across the managed pull while
-	//! declaring MaxThreads() == NumberOfThreads(), so a branch launches one task per thread — one blocking
-	//! with the lock, the rest piling up on it — which would occupy every worker and starve a sibling union
+	//! mechanism rather than to be useful: our Arrow scan held gstate.main_mutex across the managed pull while
+	//! declaring MaxThreads() == NumberOfThreads(), so a branch launched one task per thread — one blocking
+	//! with the lock, the rest piling up on it — which occupied every worker and starved a sibling union
 	//! branch. Setting this + `threads` reproduces that shape in pure C++; leaving it off is the control.
 	bool hold_lock = false;
+	//! Hand the worker BACK when the claim lock is taken, instead of parking on it: the fix ArrowStreamScan
+	//! now ships (src/include/fabricator/scan_wait.hpp). Meaningful only together with hold_lock — without it
+	//! nothing is held long enough to contend for. So `hold_lock := true` is the broken shape and
+	//! `hold_lock := true, async_wait := true` the fixed one, in ONE binary with no provider, no plugin and
+	//! no network anywhere in the measurement.
+	bool async_wait = false;
 };
 
 struct WaitGlobalState : public GlobalTableFunctionState {
-	//! Row claiming. The lock is held ONLY to claim a range and NEVER across the sleep — see the
-	//! header: holding it over the sleep would make this control reproduce the serialization it
-	//! exists to rule out, and the numbers would look the same.
+	//! Row claiming. With hold_lock the lock spans the sleep (the shape under test); otherwise it is
+	//! released first — see the header: holding it over the sleep would make this control reproduce the
+	//! serialization it exists to rule out, and the numbers would look the same.
 	mutex claim_lock;
 	idx_t next_row = 0;
 	idx_t threads = 1;
+	//! Shared with every parked AsyncTask, because one may outlive this state (a satisfied LIMIT tears the
+	//! query down while a wait is in flight).
+	shared_ptr<fabricator::ScanWaitState> wait_state = make_shared_ptr<fabricator::ScanWaitState>();
+
+	~WaitGlobalState() override {
+		wait_state->Shutdown();
+	}
 
 	idx_t MaxThreads() const override {
 		return threads;
@@ -50,6 +64,8 @@ struct WaitLocalState : public LocalTableFunctionState {
 	//! The chunk this thread most recently emitted, reported as the batch index. Monotonic and
 	//! unique by construction (it is the claimed start divided by the chunk size).
 	idx_t batch_index = 0;
+	//! How long this thread waits before asking again, when it finds the claim lock taken.
+	fabricator::ScanWaitBackoff backoff;
 };
 
 unique_ptr<FunctionData> WaitBind(ClientContext &context, TableFunctionBindInput &input,
@@ -73,6 +89,10 @@ unique_ptr<FunctionData> WaitBind(ClientContext &context, TableFunctionBindInput
 	auto hold = input.named_parameters.find("hold_lock");
 	if (hold != input.named_parameters.end() && !hold->second.IsNull()) {
 		result->hold_lock = hold->second.GetValue<bool>();
+	}
+	auto async_wait = input.named_parameters.find("async_wait");
+	if (async_wait != input.named_parameters.end() && !async_wait->second.IsNull()) {
+		result->async_wait = async_wait->second.GetValue<bool>();
 	}
 	return_types.emplace_back(LogicalType::BIGINT);
 	names.emplace_back("id");
@@ -100,23 +120,41 @@ void WaitFunc(ClientContext &context, TableFunctionInput &data, DataChunk &outpu
 	auto &gstate = data.global_state->Cast<WaitGlobalState>();
 	auto &lstate = data.local_state->Cast<WaitLocalState>();
 
-	// The scope of this optional_ptr IS the experiment: normally the lock is released before the sleep (the
-	// control), and with hold_lock it spans it (the shape our Arrow scan has).
-	unique_ptr<lock_guard<mutex>> held;
-	idx_t start;
-	{
-		lock_guard<mutex> guard(gstate.claim_lock);
-		if (gstate.next_row >= bind_data.rows) {
+	// Read the progress counter BEFORE trying to claim: a holder that finishes in between then makes the
+	// waiter's predicate already true, so a wakeup cannot be lost.
+	auto seen = gstate.wait_state->Generation();
+
+	// The scope of this lock IS the experiment: normally it is released before the sleep (the control), and
+	// with hold_lock it spans it (the shape our Arrow scan had).
+	std::unique_lock<mutex> guard(gstate.claim_lock, std::defer_lock);
+	if (bind_data.async_wait) {
+		if (!guard.try_lock()) {
 			output.SetCardinality(0);
-			return;
+			if (fabricator::BlockUntilProgress(data, gstate.wait_state, seen, lstate.backoff)) {
+				return;
+			}
+			// This call may not block-and-reschedule (the SYNCHRONOUS strategy), so park as before.
+			guard.lock();
 		}
-		start = gstate.next_row;
-		gstate.next_row += STANDARD_VECTOR_SIZE;
+	} else {
+		guard.lock();
 	}
-	if (bind_data.hold_lock) {
-		held = make_uniq<lock_guard<mutex>>(gstate.claim_lock);
+
+	if (gstate.next_row >= bind_data.rows) {
+		output.SetCardinality(0);
+		guard.unlock();
+		gstate.wait_state->Advance();
+		return;
 	}
+	auto start = gstate.next_row;
+	gstate.next_row += STANDARD_VECTOR_SIZE;
 	lstate.batch_index = start / STANDARD_VECTOR_SIZE;
+	lstate.backoff.Reset();
+
+	if (!bind_data.hold_lock) {
+		guard.unlock();
+		gstate.wait_state->Advance();
+	}
 
 	if (bind_data.millis > 0) {
 		// OUTSIDE the lock unless hold_lock was asked for. This line is the control's validity.
@@ -128,6 +166,11 @@ void WaitFunc(ClientContext &context, TableFunctionInput &data, DataChunk &outpu
 	auto ids = FlatVector::GetData<int64_t>(output.data[0]);
 	for (idx_t i = 0; i < count; i++) {
 		ids[i] = NumericCast<int64_t>(start + i);
+	}
+
+	if (guard.owns_lock()) {
+		guard.unlock();
+		gstate.wait_state->Advance();
 	}
 }
 
@@ -151,6 +194,7 @@ void RegisterFabricatorWait(ExtensionLoader &loader) {
 	fn.get_partition_data = WaitGetPartitionData;
 	fn.named_parameters["hold_lock"] = LogicalType::BOOLEAN; // see WaitBindData: inverts the control
 	fn.named_parameters["threads"] = LogicalType::BIGINT; // override what MaxThreads() reports; see WaitBindData
+	fn.named_parameters["async_wait"] = LogicalType::BOOLEAN; // hand the worker back; see WaitBindData
 	loader.RegisterFunction(fn);
 }
 

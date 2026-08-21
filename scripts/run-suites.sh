@@ -346,7 +346,13 @@ case "$TIER" in
         # REGISTERED function is a shipped feature: this tree has already removed one spike that shipped
         # by accident. ⚠ It pins the CONTRACT, not parallelism — asserting that would need an UPPER bound
         # on elapsed time, the flaky direction.
-        : "${MIN_ASSERTIONS:=7739}"
+        # 7750 since 2026-08-21: verify_wait 20 -> 31 for the `async_wait` A/B — the one HERMETIC gate for
+        # the mechanism ArrowStreamScan now ships (a scan that cannot pull hands its worker BACK instead of
+        # parking on the pull lock, so a sibling union branch is no longer starved). ⚠ It is a TIMING
+        # assertion, which this tier otherwise refuses: what makes it acceptable is that it is a RATIO
+        # between two legs of ONE statement shape in ONE process differing in ONE named parameter, with a
+        # LOWER-bound positive control in front of it so it cannot pass vacuously.
+        : "${MIN_ASSERTIONS:=7750}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh
@@ -488,7 +494,12 @@ case "$TIER" in
         # MULTI-batch yield (a single-batch test cannot tell a working loop from one that stops after its
         # first batch), both negative refusals, and the sleep really happening — a LOWER bound on elapsed
         # time, the direction a loaded machine can only make more true.
-        : "${MIN_ASSERTIONS:=2129}"
+        # 2140 since 2026-08-21: verify_plugin 38 -> 49 for the union-overlap gate on the PRODUCTION scan
+        # path. Service tier because it needs the sample plugin's blocking-pull table functions; the
+        # mechanism itself is gated hermetically in verify_wait. Its A/B lever is DuckDB's own
+        # debug_physical_table_scan_execution_strategy, under which BLOCKED is forbidden and our scan falls
+        # back to the pre-fix code path — so both legs run in one process off one binary.
+        : "${MIN_ASSERTIONS:=2140}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

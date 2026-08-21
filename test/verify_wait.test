@@ -94,3 +94,66 @@ query I
 SELECT count(*) FROM fabricator_wait(4096, 0, hold_lock := true, threads := 4);
 ----
 4096
+
+# ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
+# `async_wait` — the mechanism ArrowStreamScan now ships, prototyped here (docs/scan-concurrency.md §5f).
+#
+# ⚠ THIS IS THE ONE HERMETIC GATE FOR THAT MECHANISM, and it is a TIMING assertion, which this file otherwise
+# refuses. What makes it acceptable is that it is a RATIO between two legs of the SAME statement shape in the
+# SAME process, differing in ONE named parameter — so a slow or loaded machine inflates both. The absolute
+# numbers on the box it was written on: serial 2.09 s, async 1.05 s, over three runs each, +/- 0.03.
+#
+# ⚠ THE POSITIVE CONTROL IS THE FIRST ASSERTION AND IT IS LOAD-BEARING: without it, "the async leg is faster"
+# would pass equally on a build where the sleep had stopped happening at all, which is the vacuous-pass shape.
+
+statement ok
+SET threads=4;
+
+# The answer must not depend on the mechanism — a wrong one here would make the instrument worthless.
+query II
+SELECT count(*), sum(id) FROM fabricator_wait(8192, 0, hold_lock := true, threads := 4, async_wait := true);
+----
+8192	33550336
+
+statement ok
+CREATE TEMP TABLE aw_t0 AS SELECT epoch_ms(now()) AS ms;
+
+# hold_lock spans the sleep, so each branch is internally serial (4 chunks x 250 ms = 1000 ms) AND — without
+# async_wait — its losing threads park on the claim lock, occupying every worker: the sibling branch is
+# starved and the union costs BOTH branches.
+query I
+SELECT count(*) FROM (SELECT * FROM fabricator_wait(8192, 250, hold_lock := true, threads := 4)
+                      UNION ALL SELECT * FROM fabricator_wait(8192, 250, hold_lock := true, threads := 4));
+----
+16384
+
+statement ok
+CREATE TEMP TABLE aw_t1 AS SELECT epoch_ms(now()) AS ms;
+
+# Same statement, one parameter added: the losers hand their workers BACK, so the branches overlap and the
+# union costs about ONE branch.
+query I
+SELECT count(*) FROM (SELECT * FROM fabricator_wait(8192, 250, hold_lock := true, threads := 4, async_wait := true)
+                      UNION ALL SELECT * FROM fabricator_wait(8192, 250, hold_lock := true, threads := 4, async_wait := true));
+----
+16384
+
+statement ok
+CREATE TEMP TABLE aw_t2 AS SELECT epoch_ms(now()) AS ms;
+
+# POSITIVE CONTROL: the serial leg really did the work. 2000 ms of sleep, asserted well below at 1500.
+query I
+SELECT ((SELECT ms FROM aw_t1) - (SELECT ms FROM aw_t0)) >= 1500;
+----
+true
+
+# THE CLAIM: handing the worker back overlaps the branches. True ratio ~0.50; asserted at 0.80 so that only a
+# mechanism that has stopped working can fail it.
+query I
+SELECT ((SELECT ms FROM aw_t2) - (SELECT ms FROM aw_t1))
+     < ((SELECT ms FROM aw_t1) - (SELECT ms FROM aw_t0)) * 0.8;
+----
+true
+
+statement ok
+RESET threads;

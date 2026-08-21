@@ -6,6 +6,7 @@
 
 #include "fabricator/arrow_produce.hpp"
 #include "fabricator/clr_host.hpp"
+#include "fabricator/scan_wait.hpp"
 #include "duckdb/common/allocator.hpp"
 #include "duckdb/common/arrow/arrow_appender.hpp"
 #include "duckdb/common/exception.hpp"
@@ -66,7 +67,12 @@ struct ArrowStreamGlobalState : public GlobalTableFunctionState {
 	//! body runs before member destructors), so a dispose triggered BY that release still sees a live producer.
 	unique_ptr<fabricator::ArrowProducer> filter_value_producer;
 
+	//! Shared with every AsyncTask parked on this scan, because one may OUTLIVE this state: the query can
+	//! tear down (a satisfied LIMIT) while a wait is in flight. Shutdown() below wakes whoever is left.
+	shared_ptr<fabricator::ScanWaitState> wait_state = make_shared_ptr<fabricator::ScanWaitState>();
+
 	~ArrowStreamGlobalState() override {
+		wait_state->Shutdown();
 		if (stream_initialized && stream.release) {
 			stream.release(&stream);
 			stream.release = nullptr;
@@ -107,13 +113,53 @@ struct ArrowStreamLocalState : public ArrowScanLocalState {
 	ArrowStreamLocalState(unique_ptr<ArrowArrayWrapper> current_chunk, ClientContext &context)
 	    : ArrowScanLocalState(std::move(current_chunk), context) {
 	}
+
+	//! How long this thread waits before asking again, when it finds another thread mid-pull. Resets on
+	//! every batch it gets, so a fast pull is never waited on and a slow one costs a bounded number of
+	//! wake-ups. See src/include/fabricator/scan_wait.hpp.
+	fabricator::ScanWaitBackoff backoff;
 };
 
-// Pull the next Arrow array batch into the local state. Returns false at EOS.
-bool GetNextBatch(ArrowStreamGlobalState &gstate, ArrowStreamLocalState &lstate) {
-	lock_guard<mutex> lock(gstate.main_mutex);
+enum class BatchPull : uint8_t {
+	//! A batch is in the local state.
+	BATCH,
+	//! The stream is exhausted.
+	END_OF_STREAM,
+	//! Another thread is mid-pull and this call was not allowed to park on the lock.
+	WOULD_BLOCK
+};
+
+//! Releases the pull lock and then announces progress, on EVERY exit including a throw. Announcing is what
+//! wakes the threads that handed their workers back rather than parking on this lock — and it must happen
+//! after the unlock, or they wake into a lock they still cannot take.
+struct AnnounceProgressOnExit {
+	ArrowStreamGlobalState &gstate;
+	std::unique_lock<mutex> &lock;
+
+	~AnnounceProgressOnExit() {
+		if (lock.owns_lock()) {
+			lock.unlock();
+		}
+		gstate.wait_state->Advance();
+	}
+};
+
+// Pull the next Arrow array batch into the local state.
+//
+// ⚠ The pull is SERIALIZED (one Arrow C stream cannot be pulled from two threads) and BLOCKING (it crosses
+// into managed code, which may be waiting on a network read). `park_on_lock` is what keeps those two facts from
+// costing every DuckDB worker: with it false, a thread that loses the lock returns WOULD_BLOCK so the caller
+// can hand its worker back instead of parking here. docs/scan-concurrency.md §5f.
+BatchPull GetNextBatch(ArrowStreamGlobalState &gstate, ArrowStreamLocalState &lstate, bool park_on_lock) {
+	std::unique_lock<mutex> lock(gstate.main_mutex, std::defer_lock);
+	if (park_on_lock) {
+		lock.lock();
+	} else if (!lock.try_lock()) {
+		return BatchPull::WOULD_BLOCK;
+	}
+	AnnounceProgressOnExit announce {gstate, lock};
 	if (gstate.done) {
-		return false;
+		return BatchPull::END_OF_STREAM;
 	}
 
 	auto chunk = make_uniq<ArrowArrayWrapper>();
@@ -126,14 +172,17 @@ bool GetNextBatch(ArrowStreamGlobalState &gstate, ArrowStreamLocalState &lstate)
 	if (!chunk->arrow_array.release) {
 		// End of stream.
 		gstate.done = true;
-		return false;
+		return BatchPull::END_OF_STREAM;
 	}
 
 	lstate.chunk = shared_ptr<ArrowArrayWrapper>(chunk.release());
 	lstate.chunk_offset = 0;
 	lstate.Reset();
+	// Assigned HERE, under the pull lock, so the batch index stays a single sequence in pull order — which is
+	// what ArrowStreamGetPartitionData promises DuckDB and what the batch collector uses to restore order.
 	lstate.batch_index = gstate.batch_index++;
-	return true;
+	lstate.backoff.Reset();
+	return BatchPull::BATCH;
 }
 
 } // namespace
@@ -1002,10 +1051,28 @@ void ArrowStreamScan(ClientContext &context, TableFunctionInput &data, DataChunk
 	auto &gstate = data.global_state->Cast<ArrowStreamGlobalState>();
 	auto &lstate = data.local_state->Cast<ArrowStreamLocalState>();
 
+	// Whether a thread that finds the pull busy must PARK on the lock. True only under the SYNCHRONOUS
+	// table-scan execution strategy, where returning BLOCKED is an InternalException — everywhere else it
+	// hands the worker back instead.
+	const bool park_on_lock = !fabricator::CanReturnBlocked(data);
+
 	while (!lstate.chunk || !lstate.chunk->arrow_array.release ||
 	       lstate.chunk_offset >= (idx_t)lstate.chunk->arrow_array.length) {
-		if (!GetNextBatch(gstate, lstate)) {
+		// Read the progress counter BEFORE discovering the pull is busy: a puller that finishes in between
+		// then makes this thread's wait predicate already true, so a wakeup cannot be lost.
+		auto seen = gstate.wait_state->Generation();
+		auto pulled = GetNextBatch(gstate, lstate, park_on_lock);
+		if (pulled == BatchPull::END_OF_STREAM) {
 			output.SetCardinality(0);
+			return;
+		}
+		if (pulled == BatchPull::WOULD_BLOCK) {
+			// Reachable only when park_on_lock is false, i.e. when a BLOCKED result IS permitted — so the
+			// install below cannot fail. Emit nothing: DuckDB throws on a BLOCKED result carrying rows.
+			output.SetCardinality(0);
+			auto blocked = fabricator::BlockUntilProgress(data, gstate.wait_state, seen, lstate.backoff);
+			D_ASSERT(blocked);
+			(void)blocked;
 			return;
 		}
 	}

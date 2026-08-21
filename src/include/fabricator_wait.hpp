@@ -17,6 +17,12 @@
 // ⚠ THE SLEEP IS OUTSIDE THE CLAIM LOCK, and that is the whole validity of the
 // control: holding the lock across the sleep would reproduce precisely the
 // serialization it exists to rule out, and the result would look identical.
+//
+// Since 2026-08-21 it is also the PROTOTYPE of the fix: `async_wait := true` makes
+// the loser of the claim hand its worker BACK (SourceResultType::BLOCKED + a bounded
+// AsyncTask wait) instead of parking on the mutex, which is exactly what
+// ArrowStreamScan now does. So the mechanism has a hermetic A/B — same binary, same
+// query, one named parameter — with no provider, no plugin and no network in it.
 //===----------------------------------------------------------------------===//
 
 #pragma once

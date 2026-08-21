@@ -25,6 +25,7 @@ set(EXTENSION_SOURCES
     src/fabricator/fabricator_onelake_fs.cpp
     src/fabricator/fabricator_variant.cpp
     src/fabricator/arrow_ingest.cpp
+    src/fabricator/scan_wait.cpp
     src/fabricator/arrow_produce.cpp
     src/catalog/fabricator_metadata.cpp
     src/catalog/fabricator_catalog.cpp

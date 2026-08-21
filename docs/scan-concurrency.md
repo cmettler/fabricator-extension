@@ -3,7 +3,8 @@
 > **Status: CURRENT (2026-08-21). Describes shipped behaviour as of `0.0.11`.**
 >
 > **WHY THIS DOC EXISTS.** The parallel scan (`38189db`) and the batch-size work (`e9f4b13`) were argued in
-> commit messages and code comments, and everything measured since — the streaming × `PhysicalUnion` stall,
+> commit messages and code comments, and everything measured since — the streaming × `PhysicalUnion` stall
+> and the blocking-pull starvation it turned out to be (§5c, fixed in §5f),
 > the batch-is-also-a-file coupling, the thread-invariance of the transient rowid — accumulated in places that
 > answer a different question. This is the one page for *"what happens when a fabricator scan meets
 > `SET threads`"*, because that question now has several interacting answers and two of them are traps.
@@ -30,6 +31,7 @@ The shape is: **the PULL is serialized, the CONVERSION is not.**
 
 ```
 GetNextBatch:    lock(gstate.main_mutex) -> stream.get_next(...) -> hand the batch to the LOCAL state -> unlock
+                 try_lock FAILED         -> return BLOCKED + one bounded AsyncTask wait   (since §5f)
 ArrowStreamScan: (no lock)               -> ArrowToDuckDB(lstate, ...) -> project into the output chunk
 ```
 
@@ -43,6 +45,11 @@ i.e. inside `get_next`, is **2451 ms at threads=1 and 2454 ms at threads=4 — f
 mutex. The same 2 s of cost placed in the PROJECTION above the scan goes **2425 -> 883 ms**. That is the split,
 and it is an invariant rather than a shortcoming: the serialized pull is exactly what lets a provider's reader
 (a `SqlDataReader`, an ADOMD reader) be touched from one thread only.
+
+**⚠ What the serialized pull must NOT do is make the OTHER threads park on it, and until 2026-08-21 it did**
+— which is how one scan came to occupy every DuckDB worker for the length of a blocking remote read and starve
+every sibling pipeline in the plan. The pull is still serialized; the losers now hand their workers back
+(§5c for the measurement, §5f for the fix).
 
 What is deliberately still single-threaded, and must stay so:
 
@@ -233,6 +240,11 @@ cell, `SET threads` the only variable):
 
 ### ⚠⚠ §5a. WHAT THE FIX DOES NOT DO: A UNION'S BRANCHES ARE STILL SERIAL, AND THE ROW ABOVE MISLED ME
 
+**⚠ THE HEADING IS HISTORY AS OF §5f (2026-08-21): a union's branches DO overlap now.** What §5a–§5c
+established — that the `get_partition_data` fix did not touch inter-branch concurrency, and why — is unchanged
+and is what led to the cause; the state of the world it describes is not. `plug_slow_range ∪ plug_slow_range2`
+is 1.03 s where this section measures 2419 ms.
+
 **Found by the fabricator-quantax plugin session, which repinned to this fix, re-measured, and reported
 "partly fixed, not fully". They were right.** It reproduces on our OWN sample plugin, so it needs no plugin of
 theirs — and the fix's own numbers could not have caught it, because every union cell I measured had the cost
@@ -389,6 +401,12 @@ measurement has not been taken.
 
 ### §5d. THE FIX DIRECTION, made concrete: `TableFunctionInput::async_result` + a single-pump channel
 
+**⚠⚠ SUPERSEDED BY §5f — BUILT, AND NOT THIS WAY. Read §5f first.** The mechanism named here is
+right and is what shipped; the ARCHITECTURE is not. Its central claim — that a blocked branch would afterwards
+hold ONE worker — is FALSE (an `AsyncTask` that waits until data arrives holds a worker for exactly as long as
+parking on the mutex did), and with that corrected the managed pump and the two new ABI entries below turn out
+to buy nothing the fix needed. Kept verbatim because the reasoning is where the error is visible.
+
 A source that cannot make progress must hand its worker BACK rather than block on a mutex. Ours has no such
 path — it returns rows or end-of-stream — and the two shortcuts are both wrong: `try_lock` + zero rows is a
 WRONG ANSWER (an empty chunk means end-of-scan) and `MaxThreads() = 1` is priced above. ⚠ DuckDB's own arrow
@@ -447,6 +465,12 @@ scan: it is the one shape that distinguishes "workers handed back" from "workers
 enough to pin.
 
 ### §5e. IMPLEMENTATION CHECKLIST for whoever builds it (written while the facts were live; nothing done)
+
+**⚠⚠ SUPERSEDED BY §5f.** Both invariants named here survive and are worth keeping; the ABI shape, the pump
+and therefore "THE HAZARD THAT WILL BITE" all dissolved once the design stopped introducing a second owner of
+the Arrow stream. The gate shape described at the end is what was built, with one improvement it did not
+anticipate: `debug_physical_table_scan_execution_strategy` makes the PRE-FIX path reachable from SQL, so the
+A/B needs no remembered number.
 
 **Two invariants that MUST survive, and the design happens to preserve both — say so explicitly, because both
 are correctness rather than performance.**
@@ -543,6 +567,116 @@ re-taken before that gate is narrowed or lifted. The mechanism is established; t
 chunk lands in the buffer, so `SimpleBufferedData::Append` (or the collector's sink) should notify
 `task_reschedule`. Any source that cannot supply a batch index still pays what we were paying. Not filed.
 
+### ✅ §5f. BUILT 2026-08-21 — the loser of the pull hands its worker BACK. **AND THE DESIGN ABOVE WAS WRONG IN ITS CENTRAL CLAIM, which is the most useful thing in this section.**
+
+**As built** (`src/include/fabricator/scan_wait.hpp` + `src/fabricator/scan_wait.cpp`, C++-only, **NO ABI
+change and NO managed change**): a thread that finds the pull lock taken no longer parks on it. It reads a
+progress counter, `try_lock`s, and on failure returns `SourceResultType::BLOCKED` carrying ONE `AsyncTask`
+that waits — **for a bounded time** — for that counter to move. The winner pulls exactly as before; only the
+losers behave differently. Shared with `fabricator_wait`'s `async_wait := true`, which prototyped it.
+
+| shape (threads=4, in-session A/B) | old path | new path |
+|---|---|---|
+| **two managed table-function scans unioned, 1000 ms of blocking pull each** | **2.06 s** | **1.03 s** |
+| `fabricator_wait` union, `hold_lock` (pure C++, no managed code at all) | **4.08 s** | **2.05 s** |
+| one local Delta scan, 4 morsels of per-row work | 0.73 s | 0.62 s |
+| two local Delta scans unioned, per-row work | 1.14 s | 1.18 s |
+| 6M-row local Delta aggregate (the overhead check) | 0.96 / 0.86 s | 0.84 / 0.81 s |
+
+Every row is an in-session A/B off ONE binary (see the `SYNCHRONOUS` note below), so "old path" is the code
+this change replaced rather than a number remembered from another day. Two more, measured the other way — the
+`async_wait` parameter toggled inside the new build — say the same thing about overhead from the other side:
+`fabricator_wait(2048000, 0)`, i.e. 1000 chunks of pure contention with no sleep at all, is 0.002 s with the
+old shape and 0.002 s with the new one, and the answers (`count`, `sum(id)`) are identical in every mode.
+
+**⚠⚠ THE CLAIM §5d MADE AND I DID NOT EARN: *"today branch A holds N workers … afterwards it holds ONE"*.
+That is FALSE for any design where the surplus tasks wait until data arrives.** `AsyncExecutionTask::
+ExecuteTask` runs `async_task->Execute()` and fires the interrupt only after it RETURNS, and
+`TaskScheduler` is a FIXED set of OS threads with nothing that compensates for a blocked one
+(`RelaunchThreadsInternal` only ever tracks `requested_thread_count`) — so an AsyncTask parked on a
+condition variable occupies a worker for exactly as long as parking on the mutex did. N blocked scan tasks
+still mean N held workers. **The whole benefit therefore comes from the wait RETURNING EARLY**, i.e.:
+
+- **THE TIMEOUT IS THE MECHANISM, NOT A SAFETY NET.** It is what hands the worker back. Getting this
+  backwards would produce a change that measures identical to no change at all.
+- **THE `notify` IS THE LATENCY FIX, NOT THE MECHANISM.** Without it, a pull that completes in microseconds
+  — every local scan — would cost the losers a full timeout each, which on a fast source is catastrophic.
+  With it, the fast case never waits at all (the last two rows of the table above are the check).
+- Hence the **backoff**: 1 ms doubling to 16 ms, reset the moment a thread gets a batch. A 200 ms remote
+  pull then costs a waiter ~90 wake-ups instead of 200, and a microsecond pull costs zero.
+
+**⇒ THE MANAGED PUMP AND THE TWO NEW ABI ENTRIES OF §5d/§5e WERE NOT NEEDED, and dropping them removed the
+one hazard that section said to budget for first.** The pull still happens on the scan task that won the
+lock, so **nothing new owns the Arrow stream** — the `BatchQueryOwner.Claim()` shape (a pump inside a read
+while an early-abandoning consumer releases the query: `STATUS_HEAP_CORRUPTION`, no assertion output, does
+not reproduce standalone) cannot arise, because there is no pump. A channel would buy PREFETCH, which is a
+separate and still-unbuilt idea; it was never what fixed the starvation.
+
+**Both §5e invariants survive, and by construction rather than by care:**
+1. **The pull stays single-threaded** — it is the same `gstate.main_mutex`, still held across the pull. Only
+   who WAITS for it changed.
+2. **`batch_index` stays monotonic in pull order** — still assigned under that lock, which is what
+   `ArrowStreamGetPartitionData` promises DuckDB and what the batch collector uses to restore order.
+
+**⚠ THE LOST-WAKEUP ORDERING IS LOAD-BEARING: read the generation BEFORE the `try_lock`.** A puller that
+finishes in between then leaves the waiter's predicate already true, so it returns immediately instead of
+sleeping through a change it missed. Releasing the lock and announcing progress is done by one
+`AnnounceProgressOnExit` guard on EVERY exit including a throw, so a failed pull cannot leave waiters
+sleeping on their timeouts.
+
+**⚠ The wait state is REFCOUNTED (`shared_ptr<ScanWaitState>`), because a parked AsyncTask may OUTLIVE the
+scan's global state** — a satisfied LIMIT tears the query down while a wait is in flight. The global state's
+destructor calls `Shutdown()`, which wakes every waiter it leaves behind; the memory is the shared object's,
+so a late wake-up cannot touch a freed mutex. That is the same class of bug as the `ArrowProducer::Release`
+use-after-free (§5's own history) and the same reason it faults on macOS and not here, so it was designed
+out rather than tested for.
+
+**⚠ THE `SYNCHRONOUS` STRATEGY IS THE FALLBACK *AND* THE GATE'S A/B LEVER, which is the nicest thing about
+it.** Under `debug_physical_table_scan_execution_strategy='SYNCHRONOUS'` DuckDB's
+`ValidateAsyncStrategyResult` THROWS on a BLOCKED result, so `CanReturnBlocked` is false and the scan parks
+on the lock exactly as it did before this change. That makes the pre-fix path reachable from SQL, so both
+legs of the measurement run in ONE process off ONE binary — no remembered numbers, no rebuild. Both gates
+are built on it or on `async_wait`, and both were mutation-tested: forcing the park kills
+`verify_plugin` at its ratio assertion after 47 pass (every correctness assertion and the positive control
+first, which is the right kill for a change that moves no rows), and ignoring `async_wait` kills
+`verify_wait` at its own after 29.
+
+**⚠ WHAT IT DOES NOT FIX, measured rather than reasoned: a union whose cost sits DOWNSTREAM of the scan.**
+Two local Delta scans with per-row sleeps are 1.14 s before and 1.18 s after — unchanged, and already
+OPTIMAL (4000 ms of sleep over 4 threads = 1000 ms), because those pulls never block: the cost is in the
+projection. That shape is the collector/`order_matters` axis of §5a, not the pull axis, and this change
+neither helps nor harms it. **The target is a scan whose PULL blocks**, i.e. every remote read.
+
+**⚠ `fabricator_host_query` IS A BAD INSTRUMENT HERE and cost a wrong reading before it was dropped.** Its
+BIND runs the inner query (measured: `EXPLAIN` alone costs a full inner execution), so most of a union's
+wall clock is serial PLAN time by construction, and the inner query's own threads compete with the outer
+query's on the same scheduler. Its A/B came out flat while the CPU told a different story (4.05 s user
+before vs 1.00 s after — the spin stopped), and reading the flat wall clock as "the fix does not work"
+would have been the §6 instrument error yet again. Use `plug_slow_range` (cost inside the pull, one
+scheduler) or `fabricator_wait` (no managed code at all).
+
+**Tiers: hermetic 73/73 — 7750 and service 52/52 — 2140, each exactly its previous floor plus the 11
+assertions of its own new section** — so no other suite moved, which is the whole behaviour-preservation claim
+for a change that touches the scan every provider goes through. The service leg matters beyond regression
+coverage: `verify_delta_catalog_s3` is the only place this path runs against `s3://` URIs, and the SQL Server
+suites are the only place it runs against a real `SqlDataReader`, whose single-threaded-reader safety is
+invariant 1 above.
+
+**⚠ CANCELLATION: the park is BOUNDED, so an interrupt is delayed by at most the backoff cap (16 ms).** That
+is what makes this safe without any of §5d's `TaskCompletionSource` plumbing — the concern that section raised
+("a starvation bug traded for a query that cannot be interrupted") applies to an UNBOUNDED wait, which this is
+not. The scan re-enters and DuckDB's own interrupt check fires on the next call.
+[cancellation.md](cancellation.md) is unchanged by this.
+
+**⚠ EARLY ABANDONMENT (a pushed `LIMIT`) leaves waiters parked, and it is the one path that had to be tried
+rather than reasoned about.** Six runs each of a `LIMIT` over a 20-batch blocking source — plain, unioned, and
+through `fabricator_wait` — return the right rows and exit 0. What carries it is structural (the wait state is
+refcounted and the destructor wakes it); the runs are the backstop, because a race is never proved by passing.
+
+**⚠ STILL UNMEASURED: the remote payoff.** Everything above is local, with a sleep standing in for slow IO.
+Every live OneLake figure in this section predates it, including the one `TryUnionForm`'s remote gate rests
+on (§10) — so that gate stays where it is until the numbers are re-taken.
+
 ## 6. Measuring it: `plug_sleep`, and the traps in measuring at all
 
 The sample plugin ships **`plug_sleep(millis)`**
@@ -608,6 +742,8 @@ as §5a records happening twice:**
 | does the plan give a scan's per-thread work more than one thread? | the **scalar** in the projection | a source-side cost is serialized by our own pull mutex, so it is flat even on a perfectly parallel plan |
 | do a union's BRANCHES overlap? | the **table function** (cost in the source) | a scalar parallelizes WITHIN a branch, so it shows a real speedup while the branches stay strictly serial |
 | is a WRITE sink parallel? | the **scalar**, single source, no union | with a source-side cost nothing can scale, so the comparison cannot discriminate |
+| does a blocking pull still starve siblings? | `fabricator_wait(…, hold_lock := true)` — pure C++ — or `debug_physical_table_scan_execution_strategy` as the A/B lever over a **table function** | the setting reaches OUR scan only, so it isolates the pull path from every other reason a plan might serialize (§5f) |
+| anything about union overlap through `fabricator_host_query` | **NOTHING — do not use it** | its BIND runs the inner query and the inner query's threads share the scheduler, so most of the wall clock is serial plan time by construction (§5f) |
 
 That third row is why §7's write-path finding rests on scalar measurements and §5a's union finding rests on
 table-function ones. Neither result transfers to the other question.
@@ -747,3 +883,10 @@ rather than a flag to flip. Nothing is built.
    path, and it is what made a fixed-name bound-input view collide (now per-query names).
 5. **The `GROUP BY` regression of §2 is unexplained beyond "merge-bound".** If it ever matters, the lever is
    DuckDB's aggregate, not our scan.
+6. **PREFETCH is the idea §5f dropped and did not refute.** One pump running AHEAD of the converters is what
+   would let a slow remote pull overlap with the CPU work above it — the fix only stopped the pull from
+   starving OTHER pipelines. It costs a second owner of the Arrow stream and therefore the whole teardown
+   design §5e budgets for, so it should be taken only once there is a remote measurement asking for it.
+7. **The waiter's backoff bounds (1 ms → 16 ms) are a judgement, not a measurement.** They were chosen so a
+   fast pull never waits (the notify wins) and a 200 ms pull costs ~90 wake-ups; nothing has measured whether
+   a longer cap would be cheaper or a shorter one fairer.
