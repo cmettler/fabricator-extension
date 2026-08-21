@@ -387,13 +387,46 @@ measurement has not been taken.
 
 ⇒ neither constant is right, which is the argument for the real fix below rather than a knob.
 
-**THE DIRECTION FOR A FIX, and it is DuckDB's own vocabulary rather than a lock change.** A source that cannot
-make progress should hand its worker back, not block on a mutex: `SourceResultType::BLOCKED` exists for
-exactly that, and our scan has no BLOCKED path — it returns rows or end-of-stream. The alternatives are worse:
-`try_lock` + returning zero rows is a WRONG ANSWER (an empty chunk means end-of-scan), and capping
-`MaxThreads()` to 1 would give back §2's measured 1/N. ⚠ Note DuckDB's own arrow scan has the same
-mutex-around-the-pull shape and does not suffer this, because its `GetNextChunk` is an in-memory read that
-does not block for a second — the blocking pull is OUR property, so the fix is ours too. Nothing built.
+### §5d. THE FIX DIRECTION, made concrete: `TableFunctionInput::async_result` + a single-pump channel
+
+A source that cannot make progress must hand its worker BACK rather than block on a mutex. Ours has no such
+path — it returns rows or end-of-stream — and the two shortcuts are both wrong: `try_lock` + zero rows is a
+WRONG ANSWER (an empty chunk means end-of-scan) and `MaxThreads() = 1` is priced above. ⚠ DuckDB's own arrow
+scan has the same mutex-around-the-pull shape and does not suffer this, because its `GetNextChunk` is an
+in-memory read that never blocks for a second — **the BLOCKING pull is ours, so the fix is ours.**
+
+**IT IS NOT POLLING, and a TABLE FUNCTION CAN EXPRESS IT.** `InterruptState::Callback()` is a completion
+callback ("perform the callback to indicate the Interrupt is over"), so a blocked task is descheduled — worker
+released — and rescheduled explicitly. The route for a table function is `TableFunctionInput::async_result`
+(1.5.5): set it to `AsyncResult(vector<unique_ptr<AsyncTask>>)`, leave the chunk EMPTY, and
+`PhysicalTableScan::GetDataInternal` calls `ScheduleTasks(input.interrupt_state, context.pipeline->executor)`
+and returns `SourceResultType::BLOCKED`. When `AsyncTask::Execute()` finishes, the interrupt fires and the scan
+is called again.
+
+**THE SHAPE (user-proposed, and it is better than a lock change because it deletes the lock).** ONE pump task
+per scan owns the Arrow stream and writes batches into a bounded channel; the scan callback `TryRead`s. Since
+only the pump ever touches the stream, **`gstate.main_mutex` disappears** — and that mutex being held across
+the pull is the whole defect. N scan tasks are then free to emit concurrently, and a scan that finds the channel
+empty returns BLOCKED with an `AsyncTask` that waits for readability. Channel capacity ≈ thread count is a
+sensible default and doubles as the backpressure knob (capacity x batch size is what it retains).
+⚠ The producer still needs a `Task.Run` pump because our pull is a blocking sync-over-async call; what moves
+into the `AsyncTask` is the WAITING, executed by DuckDB's executor rather than by a worker we are holding.
+
+**⚠ FOUR CAVEATS, all read from source rather than assumed:**
+- `D_ASSERT(data.async_result.HasTasks())` — a BLOCKED carrying no tasks is an assertion failure.
+- If `CanBlock` is false the host converts our BLOCKED into **FINISHED**. Only `FinishProcessing` sets that
+  (the pipeline is already tearing down, e.g. a satisfied LIMIT), so it is benign — but BLOCKED must never be
+  the only route by which rows we still owe would have arrived.
+- `PhysicalTableScanExecutionStrategy::SYNCHRONOUS` takes `ExecuteTasksSynchronously()`, running the task
+  INLINE, so the task must be safe on the calling thread too. `DEFAULT` maps to `TASK_EXECUTOR`.
+- **⚠ WE WOULD BE AN EARLY ADOPTER.** `ValidateAsyncStrategyResult` enforces the contract, but no in-tree table
+  function returns BLOCKED with real tasks: `table_scan.cpp` uses only the non-blocking enum values, and the
+  JSON extension's only use is `AsyncResult::GenerateTestTasks()` behind `DUCKDB_DEBUG_ASYNC_SINK_SOURCE`.
+  There is also a debug SETTING for the strategy, which reads like a mechanism still being shaken out.
+
+Nothing built. ⚠ When it is, the gate is `fabricator_wait`'s `hold_lock` inversion (§5c) run against a MANAGED
+scan: it is the one shape that distinguishes "workers handed back" from "workers held", deterministically
+enough to pin.
 
 **⚠ THE PRACTICAL REFINEMENT, and it is actionable today: it is not "unions do not overlap".** A union of two
 DIFFERENT provider functions overlaps. So a plan that fans out over one function N times is the shape that
