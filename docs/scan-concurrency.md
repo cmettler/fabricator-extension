@@ -368,6 +368,25 @@ single scan's per-thread work parallel simultaneously made sibling tasks starve 
 plan. §2's gate could not have caught it: both tiers were byte-identical, because a sqllogictest suite never
 runs two expensive scans concurrently.
 
+**⚠ `MaxThreads() = 1` DOES FIX THE UNION, AND IT IS THE WRONG FIX — MEASURED BOTH SIDES (2026-08-21,
+user-raised).** Patched temporarily and reverted; threads=4 throughout:
+
+| shape | MaxThreads = NumberOfThreads() (shipped) | MaxThreads = 1 |
+|---|---|---|
+| two managed scans unioned, ONE blocking morsel each | 2382 ms | **1403 ms** — fixed |
+| one Delta scan, 4 morsels of per-row work | **1178 ms** | 2693 ms — flat, §2's win gone |
+| two Delta scans unioned, 4 morsels each | **1859 ms** | 2809 ms — WORSE |
+
+So it is not "a fix with a cost", it is a **shape-dependent trade with no winner**: a constant of 1 wins only
+when each branch holds a SINGLE blocking morsel, i.e. when there is nothing to spread within a branch anyway,
+and loses whenever there is per-row work above the scan — including on the union shape it was supposed to help
+(row 3). **Which of the two our remote reads resemble is not settled**: their cost is the blocking pull, which
+the mutex serializes at either setting, so intra-branch parallelism has little to give and inter-branch overlap
+would put D deletion-vector branches' IO in flight together — but that is REASONING, and the remote
+measurement has not been taken.
+
+⇒ neither constant is right, which is the argument for the real fix below rather than a knob.
+
 **THE DIRECTION FOR A FIX, and it is DuckDB's own vocabulary rather than a lock change.** A source that cannot
 make progress should hand its worker back, not block on a mutex: `SourceResultType::BLOCKED` exists for
 exactly that, and our scan has no BLOCKED path — it returns rows or end-of-stream. The alternatives are worse:
