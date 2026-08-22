@@ -1262,8 +1262,9 @@ PREDICATE (`WHERE md5^8(s) LIKE '0%'`), before and after, threads 1 vs 4:
   Where it would still pay is a shape whose cost sits BELOW the sort, and **COPY**, which is serial by default
   for a reason no reorder buffer removes;
 - `ChannelCapacity = 8` — CLOSED by measurement, see the box below;
-- the remote payoff, where §7b argues this compounds with §2/§5/§5f, is UNMEASURED — as are the
-  staged-vs-drained numbers (14.5–16.1 s vs 16.8–28.9 s, 2026-08-10) that predate all of it.
+- ~~the remote payoff~~ — **MEASURED 2026-08-22 and it is NIL: every remote shape is FLAT in `SET threads`.**
+  The parallel write sink is a LOCAL / CPU-bound win; §7e has the numbers, the reason, and the two void
+  measurements that said 3.7x first.
 
 **⚠ `ChannelCapacity = 8` IS NOT THE CONSTRAINT — MEASURED 2026-08-22, so this stops being an open question.**
 The worry was that a bound of 8 became a TOTAL across N producers rather than one producer's allowance. Two
@@ -1360,6 +1361,57 @@ the price is that an unordered `SELECT` over a fabricator table stops returning 
 bare `LIMIT` starts returning arbitrary rows. If it is ever wanted it should be an OPT-IN — an ATTACH option or
 a per-table provider declaration — never a blanket default, because the semantic claim ("this table has no row
 order") is true of the FORMAT while the stable order is something callers observably rely on.
+
+### ⛔ §7e. THE REMOTE PAYOFF — MEASURED LIVE 2026-08-22 (user-enabled), AND §7b'S COMPOSITIONAL CLAIM IS REFUTED
+
+§7b argued that the parallel write sink is compositional: on a lake→warehouse staged load it would ACTIVATE §2
+(`MaxThreads`), §5 (`get_partition_data`) and §5f (the BLOCKED pull), all three of which are dead on a
+single-tasked write. That was REASONED. Measured against live Fabric — `lake.dbo.his`, 89 files, 659,278 rows —
+**every remote shape is FLAT in `SET threads`:**
+
+| shape | threads=1 | threads=4 | verdict |
+|---|---|---|---|
+| lake → lake, 3 columns (trivial producer work) | 5.93 / 6.23 s | 6.68 / 5.53 s | FLAT |
+| lake → lake, 8 md5 rounds per row (real producer CPU) | 5.56 s | 5.63 / 5.57 s | FLAT |
+| lake → warehouse, STAGED `COPY INTO` | 6.36 / 6.22 s | 7.51 / 6.73 s | FLAT (marginally worse) |
+| lake → warehouse, TDS `SqlBulkCopy` | 39.77 s | 37.93 s | FLAT |
+
+Row counts verified on both warehouse routes (**659,278 landed = source**), so no cell is a fast-because-empty
+artifact.
+
+**WHY, and it is a bound on §7c rather than a defect in it.** Read the CPU column: user CPU is **0.47–3.67 s
+inside a ~6 s wall** on the staged and lake→lake shapes (and 1.2–18.6 s inside a ~38 s TDS wall). These
+statements are latency-bound end to end, so the term a parallel sink reduces — producer CPU — is a small
+fraction of the clock and dividing it by four is invisible. ⚠ Note the threads=4 legs consistently burn MORE
+user CPU for the SAME wall time (staged 0.66 vs 0.83; md5 3.67 vs 0.84; TDS 18.6 vs 1.2): the parallel work IS
+happening, it just does not reach the critical path. §7b's reasoning ("a serial sink serializes the whole
+pipeline, so the win survives an IO-bound sink") is right about the MECHANISM and wrong about the SIZE on these
+shapes — the win is real where producer CPU is a real share of the clock, which is the LOCAL case §7c measured
+(1.6x–2.4x), not the remote one.
+
+**⚠⚠ AND THE FIRST TWO MEASUREMENTS SAID THE OPPOSITE — 3.7x — WHICH IS THE MOST REUSABLE PART.** Order
+"threads=1 then threads=4" gave **22.74 → 6.15 s**, a beautiful 3.7x. Reversing the order INVERTED it
+(threads=4 first **17.60 s**, threads=1 second **5.33 s**), so the variable was RUN POSITION, not threads:
+first-touch against OneLake costs ~12–17 s that the second statement does not pay.
+- **⚠ My "warm-up" was VOID: a `SELECT count(*)` on a Delta table is answered FROM THE LOG** (the
+  partition-only form, §7c's own subject) and never opens a data file. Only
+  `count(c_fund)+count(d_nav)+count(isin)` warms the columns the statement reads.
+- ⇒ **the shape that settles it is INTERLEAVED — 1, 4, 1, 4 after a real warm-up** — because it makes position
+  and thread count separable instead of confounded. A two-cell A/B on a remote store cannot do that, and both
+  orders of one are not enough either: they disagree, which tells you position matters but not by how much.
+
+**THE ONE STRONG POSITIVE, and it supersedes a stale pair of numbers:** on the SAME shape, in the SAME session,
+with row counts verified, **staged `COPY INTO` is ~6x faster than TDS — 6.2–7.5 s versus 37.9–39.8 s.** The
+figures this doc carried (14.5–16.1 vs 16.8–28.9 s, 2026-08-10) were a different shape and only ~1.2x apart;
+they are retired. `mssql_copy_into_staging` is the single biggest lever on a lake→warehouse load, and nothing
+about the parallel sink changes that.
+- ⚠ Also the first live validation of that route in a while (`verify_copy_into_staging`'s positive leg is
+  manual). Setup worth keeping: the staging location must be the GUID form, discovered with
+  `lake.fabric.workspaces()` / `.items()` / `.warehouses()` — the last returns the SQL endpoint connection
+  string, so the whole rig is discoverable from one lakehouse attach.
+
+⇒ **§7c stands, with its scope corrected: the parallel write sink is a LOCAL / CPU-bound win.** Remove
+"unmeasured remote payoff" from the open list — it is measured, and it is nil.
 
 ## 9. What this doc does not cover
 
