@@ -1261,11 +1261,39 @@ PREDICATE (`WHERE md5^8(s) LIKE '0%'`), before and after, threads 1 vs 4:
   already scales (the sort splits the plan), so its remaining prize is the sort→sink pipeline, not the 1.64x.
   Where it would still pay is a shape whose cost sits BELOW the sort, and **COPY**, which is serial by default
   for a reason no reorder buffer removes;
-- `ChannelCapacity = 8` is now a TOTAL across N producers rather than one producer's allowance. Left alone
-  deliberately (the number bounds memory, and the win is the CPU work each producer does between pushes) but
-  never re-priced against a real remote load;
+- `ChannelCapacity = 8` — CLOSED by measurement, see the box below;
 - the remote payoff, where §7b argues this compounds with §2/§5/§5f, is UNMEASURED — as are the
   staged-vs-drained numbers (14.5–16.1 s vs 16.8–28.9 s, 2026-08-10) that predate all of it.
+
+**⚠ `ChannelCapacity = 8` IS NOT THE CONSTRAINT — MEASURED 2026-08-22, so this stops being an open question.**
+The worry was that a bound of 8 became a TOTAL across N producers rather than one producer's allowance. Two
+2 M-row CTAS statements at `threads=4`, capacity the only variable, republished per cell: **8 → 1.87 / 1.26 s,
+32 → 1.79 / 1.30 s, 128 → 1.83 / 1.28 s.** Indistinguishable. The consumer keeps up well enough on this shape
+that a deeper buffer buys nothing, and the number's job is to bound memory — so it stays at 8. ⚠ It is a LOCAL
+shape; a remote consumer is the case that could still want more, and that is part of the unmeasured remote
+payoff rather than a separate question.
+
+**⚠⚠ AND THE CO-TENANT MEASUREMENT — the one that would price the wake — IS BLOCKED BY A PRE-EXISTING,
+UNRELATED DEFECT: the raw loadable SEGFAULTS at `LOAD` inside a stock DuckDB 1.5.5 python wheel.** Worth
+recording loudly because it is not about concurrency at all and it breaks two documented flows (dbt-duckdb and
+the Fabric notebook both load the raw loadable into a stock wheel).
+- **Established, not assumed, that it is not today's work**: `git checkout <pre-change> -- src/`, rebuild, and
+  the crash reproduces identically (exit 139, no output). Restored afterwards.
+- **It is not the CLR boot either**: pointing `FABRICATOR_MANAGED_DIR` at a nonexistent directory STILL
+  segfaults, where that path is documented to fail cleanly with *"failed to load hostfxr"*. So it happens in
+  the extension's own load/registration, before any managed code runs (no `FABRICATOR_LOG_FILE` line appears).
+- **The version-rejection path is intact**: the same artifact against duckdb 1.5.2 gives the clean
+  *"built specifically for DuckDB version 'v1.5.5'"* error, exit 0. So the crash needs a version MATCH, i.e.
+  a load that actually initializes.
+- Unknown: when it broke, and whether the SHIPPED single-file artifact is affected (its smoke test is the
+  dispatch-only distribution tier, which has not run since). ⇒ **check the shipped artifact before assuming
+  users are unaffected**, and bisect from the last known-good flow rather than from this section.
+
+⇒ **THE WAKE THEREFORE STAYS UNBUILT, and the reason is now stronger than "it is a design rather than a
+flag".** Its hazard is latency-only and provably not a deadlock; the measurement that would tell us how much
+latency needs two connections in one process, which is exactly what the crash above prevents. Building an
+ABI entry plus a new lifetime protocol into the write path for an effect nobody can size is the shape this
+repo keeps recording as the source of confident wrong stories.
 
 ## 9. What this doc does not cover
 
