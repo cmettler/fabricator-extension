@@ -1174,6 +1174,33 @@ executes the task itself (`executor.cpp:569-590`). So an inner query progresses 
 every worker parked. The cost is latency for co-tenant statements sharing the scheduler, which went from one
 parked worker to N; the benefit is that a write is no longer single-tasked at all.
 
+**⛔ AND THE WAKE IS NOW DECIDED BY MEASUREMENT RATHER THAN BY CAUTION: DO NOT BUILD IT. Measured 2026-08-22,
+once the environment that had blocked it turned out to be a mirage (see 1.20 — the crash was a locally-compiled
+duckdb-python in the probe venv, not a defect).** Two connections in ONE process: a bulk write into a fabricator
+table on one, a repeated CPU-heavy aggregate on the other, with the write's consumer deliberately SLOW (SQL
+Server over TDS, 400k rows, ~2.4 s) so the channel stays full and sink tasks really do park.
+
+| | co-tenant ALONE | during a fabricator write | write |
+|---|---|---|---|
+| `threads=1` (serial sink — the pre-change path) | 1440 ms | 1599 ms (+11%) | 2.41 s |
+| `threads=20` (parallel sink, N tasks may park) | **156 ms** | **192 ms (+23%)** | 4.99 s |
+
+- **⚠ THE CONTROL IS THE 1440 → 156 ms COLUMN, and without it the whole cell would be worthless**: it is a
+  9.2x speedup from `SET threads`, which is what proves the co-tenant genuinely COMPETES FOR WORKERS. Three
+  earlier attempts did not, and each looked like a clean negative — a `count(*)` over `range()` (executes on
+  the caller's own thread via `Executor::ExecuteTask`, needs no worker at all), then an md5 aggregate over
+  `range()` (**750 ms at threads=1 AND at threads=20** — `range` is a single-threaded source, §6, for the
+  third time in one session). Only a DuckDB NATIVE table gives a parallel co-tenant.
+- ⇒ **a 23% slowdown is ordinary contention between two concurrent statements, not starvation.** If N-1 of 20
+  workers were parked in `Push`, the co-tenant would be ~20x slower, not 1.23x — the channel's capacity-8
+  bound plus a steadily-draining consumer means producers CYCLE through parking rather than all parking at
+  once. The write slows too (2.41 → 4.99 s) when a heavy co-tenant is present, which is the same sharing seen
+  from the other side.
+- ⇒ an ABI entry, a `FabricatorHostServices` addition and a shared-wake lifetime protocol, to recover ~20% of
+  a co-tenant's latency in the one shape that provokes it, is **not worth it**. The item is closed, not
+  deferred. What would reopen it: a measured case where a fabricator write demonstrably stalls another
+  statement rather than merely sharing with it.
+
 **COPY got the same prize through a different door, and a STRICTER gate — for a reason worth recording.**
 `PhysicalCopyToFile::ParallelSink()` is `per_thread_output || partition_output || parallel`, and `parallel`
 comes from the copy FUNCTION's `execution_mode` callback, so `FabricatorCopyExecutionMode` now returns
@@ -1254,7 +1281,8 @@ PREDICATE (`WHERE md5^8(s) LIKE '0%'`), before and after, threads 1 vs 4:
   the same rows.
 
 **Still open here:**
-- the wake above, which is the only thing between this and holding zero workers under backpressure;
+- ~~the wake~~ — **CLOSED 2026-08-22 by measurement, see the box above: the hazard is a 23% co-tenant
+  slowdown, i.e. ordinary contention, not starvation;**
 - **the ORDER-PRESERVING route** — `RequiredPartitionInfo() == BatchIndex()` plus a reorder buffer ahead of the
   channel, gated per plan via the public `PhysicalPlanGenerator::UseBatchIndex` or it is an InternalException
   (`pipeline.cpp:120-124`). ⚠ **Re-priced DOWNWARD by the measurement above**: an explicit `ORDER BY` write
