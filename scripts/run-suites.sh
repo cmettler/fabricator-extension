@@ -352,7 +352,15 @@ case "$TIER" in
         # assertion, which this tier otherwise refuses: what makes it acceptable is that it is a RATIO
         # between two legs of ONE statement shape in ONE process differing in ONE named parameter, with a
         # LOWER-bound positive control in front of it so it cannot pass vacuously.
-        : "${MIN_ASSERTIONS:=7750}"
+        # 7772 since 2026-08-22: verify_delta_catalog_write 43 -> 54, ENGINE-DOUBLED so +11 twice — a
+        # 40000-row (~20 morsel) CTAS and INSERT read THROUGH the catalog, now that the write sinks declare
+        # ParallelSink() true and several DuckDB tasks push into ONE bulk session at once
+        # (docs/scan-concurrency.md §7c). What that can break is the BOOKKEEPING, not a type or a name, so it
+        # is asserted by count + sum(id) + a hash checksum: a batch enqueued twice, dropped, or mis-paired
+        # moves one of the three. ⚠ Its source is a fabricator TABLE and not range(), which is a
+        # single-threaded source — off range the sink gets ONE task however many threads are set, and the
+        # section would pass while exercising nothing.
+        : "${MIN_ASSERTIONS:=7772}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh
@@ -499,7 +507,15 @@ case "$TIER" in
         # mechanism itself is gated hermetically in verify_wait. Its A/B lever is DuckDB's own
         # debug_physical_table_scan_execution_strategy, under which BLOCKED is forbidden and our scan falls
         # back to the pre-fix code path — so both legs run in one process off one binary.
-        : "${MIN_ASSERTIONS:=2140}"
+        # 2157 since 2026-08-22: verify_plugin 49 -> 66 for the parallel WRITE sink - a `SET threads=1` vs
+        # `threads=4` ratio over four plug_sleep morsels feeding a CTAS into a fabricator table
+        # (docs/scan-concurrency.md 7c). The threads=1 leg IS the pre-change path (the plan-time gate
+        # returns false at one thread), so this is a same-binary A/B rather than a remembered number, with
+        # the serial leg own duration as the positive control and both legs row counts asserted - a speed
+        # claim is worthless if the fast leg dropped a batch. It also made this the first plugin suite to
+        # WRITE, which is why it now needs `require parquet`: the sqllogictest runner does not auto-load a
+        # statically linked extension, and without it the Delta write fails inside DuckDB COPY.
+        : "${MIN_ASSERTIONS:=2157}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2
@@ -736,8 +752,7 @@ while IFS="$(printf '\t')" read -r suite provider batchrows; do
             install_plugin_dir=$(mktemp -d)
             # RELATIVE on purpose: the managed side resolves a root with Path.GetFullPath against the PROCESS
             # working directory, and this script cd's to the repo root. An absolute "$PWD/..." is wrong under
-            # Git Bash, where $PWD is an MSYS path (/d/repos/...) that .NET turns into D:\d
-epos\... - which
+            # Git Bash, where $PWD is an MSYS path (/d/repos/...) that .NET turns into a path under D:\d - which
             # reports as root_missing rather than failing, i.e. it looks like the fixture simply is not there.
             export FABRICATOR_PLUGIN_DIR="$install_plugin_dir,build/test-plugins/collide"
             ;;

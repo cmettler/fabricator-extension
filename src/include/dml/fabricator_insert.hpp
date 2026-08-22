@@ -29,6 +29,14 @@ struct FabricatorInsertTarget {
 	//! Set at EXECUTION time (GetGlobalSinkState), never at plan time: a prepared statement's physical plan is
 	//! reused across transactions, so a plan-time mark would apply to the first transaction only.
 	bool force_buffered = false;
+	//! Whether the sink may run on SEVERAL tasks at once. Decided at PLAN time (FabricatorCatalog::PlanInsert)
+	//! and read by ParallelSink(), which DuckDB consults in Pipeline::ScheduleParallel BEFORE it looks at the
+	//! source or MaxThreads() — so false serializes the WHOLE pipeline (the scan, every projection, all of it)
+	//! onto one task, which is what made every write into a fabricator table flat in `SET threads`.
+	//! Default FALSE so a construction site that has not thought about it keeps today's behaviour; the MERGE
+	//! path builds this struct directly and deliberately keeps it (PhysicalMergeInto drives our operators
+	//! manually and shares ONE global sink state across its actions).
+	bool parallel = false;
 };
 
 //! Physical INSERT into SQL Server. Streams input chunks to the bridge as Arrow
@@ -49,6 +57,11 @@ public:
 	}
 	bool IsSource() const override {
 		return true;
+	}
+	//! See FabricatorInsertTarget::parallel. RETURNING is never parallel (the OUTPUT rows would come back in
+	//! an arbitrary order, and its accumulating producer is shared).
+	bool ParallelSink() const override {
+		return target_.parallel;
 	}
 
 	SinkResultType Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const override;

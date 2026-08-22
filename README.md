@@ -617,6 +617,32 @@ false). The target is registered in the catalog (queryable immediately). (This i
 catalog COPY; to write a **Delta** table to a raw path with no ATTACH, use `FORMAT delta` — see
 [`COPY … TO` a Delta path](#copy--to-a-delta-path-no-attach).)
 
+### Write parallelism (`SET threads`)
+
+An `INSERT … SELECT` or `CREATE TABLE … AS SELECT` into a fabricator table uses **all the threads DuckDB is
+configured for** — the scan, the projection and the load run on several tasks at once. Measured on 2 M rows
+with a CPU-heavy projection: 3.5 s at `SET threads=1` against 2.1 s at `threads=4`. (Before 2026-08-22 a write
+was flat in `SET threads`, because the whole pipeline ran on one task.)
+
+Two shapes keep a serial load, deliberately:
+
+- **an explicit `ORDER BY` in the write** — `INSERT INTO t SELECT … ORDER BY x` keeps its rows arriving in
+  order. ⚠ This costs far less than it sounds: only the step that *feeds the load* is single-threaded, while
+  the scan and the projection run in the sort's own pipeline and still use every thread — measured 3.6 s → 1.9 s
+  at threads 1 vs 4 on the same 2 M rows, i.e. essentially the unordered speed. Ordering *declared on the
+  table* (`SORTED BY`, the `fabricator.sortedBy` property, a clustered Delta table) is unaffected either way:
+  the provider applies it after the rows are collected, not by arrival order;
+- **`INSERT … RETURNING`**, whose returned rows would otherwise come back in an arbitrary order.
+
+`COPY … TO` is the exception in the other direction: it is **serial unless you set
+`preserve_insertion_order=false`** (3.4 s → 2.1 s on the same shape). DuckDB tells a copy function only whether
+insertion order must be preserved, not *why*, so a copy cannot distinguish your `ORDER BY` from the default
+setting the way an `INSERT` can — and silently dropping an `ORDER BY` would be the worse trade.
+
+⚠ **What parallel writing costs**: which rows land in which parquet file is no longer deterministic, so a table
+that was getting useful file clustering *incidentally* from its source order stops getting it. That affects
+pruning speed, never correctness. Declare `SORTED BY` if you want a layout, or write with an `ORDER BY`.
+
 ### Type mapping (DuckDB → SQL Server, for CREATE / CTAS / COPY)
 
 The write mapping is **profile-adaptive** — it follows the connected engine's collation, version, and edition:

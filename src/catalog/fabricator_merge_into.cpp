@@ -197,12 +197,18 @@ PhysicalOperator &FabricatorCatalog::PlanMergeInto(ClientContext &context, Physi
 		actions.emplace(condition_entry.first, std::move(planned_actions));
 	}
 
-	// parallel = FALSE, and this is load-bearing rather than conservative. Every action's operator shares ONE
-	// global sink state across the merge, and ours are built for a serial sink: FabricatorPhysicalInsert
-	// streams into a single bulk session (PushBatch blocks for backpressure and takes no lock, documented as
-	// safe only because ParallelSink() is false), so concurrent Sink calls would corrupt that stream. DuckDB's
-	// own DuckCatalog reaches the same answer for a different reason (it disables parallelism as soon as there
-	// are two appends); DuckLake passes true because its per-action operators are parallel-safe. Ours are not.
+	// parallel = FALSE, and this is load-bearing rather than conservative — but ⚠ ONE OF ITS TWO REASONS HAS
+	// EXPIRED and the comment must not keep citing it. The dead one: "PushBatch takes no lock, safe only
+	// because ParallelSink() is false". Our INSERT sink is now parallel-capable (the managed channel is
+	// multi-writer and the session handle is read-only), so a concurrent push no longer corrupts the stream.
+	// The reason that SURVIVES on its own: every action of a merge shares ONE global sink state, and the merge
+	// operator drives our sub-operators MANUALLY (GetGlobalSinkState/Sink/Combine/Finalize called directly on
+	// sliced chunks) rather than as pipelines — so their own ParallelSink() is never consulted here, and the
+	// actions' shared state is what would have to be made safe. Note the INSERT action builds
+	// FabricatorInsertTarget directly and leaves `parallel` at its false default, which is why nothing here
+	// changed. Whether a merge could then go parallel is a SEPARATE decision, not a consequence of this one.
+	// DuckDB's own DuckCatalog reaches false for a third reason (it disables parallelism as soon as there are
+	// two appends); DuckLake passes true because its per-action operators are parallel-safe.
 	auto &result = planner.Make<PhysicalMergeInto>(op.types, std::move(actions), op.row_id_start, op.source_marker,
 	                                               /*parallel=*/false, op.return_chunk);
 	result.children.push_back(plan);

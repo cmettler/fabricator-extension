@@ -112,9 +112,19 @@ SinkResultType FabricatorPhysicalInsert::Sink(ExecutionContext &context, DataChu
 		lock_guard<mutex> guard(gstate.lock);
 		gstate.producer->AddBatch(array);
 	} else {
-		// Stream the batch to the provider. PushBatch blocks for backpressure while
-		// the channel is full. The sink is serial (ParallelSink defaults to false),
-		// so no lock is needed and blocking here cannot starve another sink thread.
+		// Stream the batch to the provider. No lock: `bulk_session` is written once at init and only read
+		// here, and the managed channel behind it is declared multi-writer (BulkSession's SingleWriter is
+		// false), so concurrent pushes are the channel's own contract rather than ours to serialize.
+		//
+		// ⚠ PushBatch BLOCKS for backpressure while the channel is full, and with ParallelSink() true that
+		// parks one DuckDB worker PER SINK TASK rather than one in total. It cannot deadlock — the managed
+		// consumer runs on a .NET pool thread, and a DuckDB query it starts itself (the staged COPY INTO
+		// route) progresses on that same thread because `Executor::ExecuteTask` runs tasks from the calling
+		// thread's own producer queue — but it does starve co-tenant statements sharing the scheduler for
+		// the duration. Handing the worker back needs the sink equivalent of the scan's BLOCKED path, which
+		// is NOT built: `OperatorSinkInput` carries no `async_result`, so a sink can only park via
+		// `BlockSink` and something must then call `UnblockTasks` — and only the managed consumer knows when
+		// space appears. See docs/scan-concurrency.md §7c.
 		fabricator::PushBatch(gstate.bulk_session, array);
 	}
 	return SinkResultType::NEED_MORE_INPUT;

@@ -82,9 +82,10 @@ SinkResultType FabricatorPhysicalCreateTableAs::Sink(ExecutionContext &context, 
 	if (chunk.size() == 0) {
 		return SinkResultType::NEED_MORE_INPUT;
 	}
-	// Convert the chunk to an Arrow array and stream it to the provider. PushBatch
-	// blocks for backpressure while the channel is full; the sink is serial so no
-	// lock is needed.
+	// Convert the chunk to an Arrow array and stream it to the provider. No lock: `bulk_session` is written
+	// once at init and only read here, and the managed channel is declared multi-writer. PushBatch blocks for
+	// backpressure while the channel is full — see the note in fabricator_insert.cpp's Sink for what that
+	// costs once ParallelSink() is true, and docs/scan-concurrency.md §7c.
 	ArrowAppender appender(info_.column_types, chunk.size(), gstate.properties, gstate.extension_types);
 	appender.Append(chunk, 0, chunk.size(), chunk.size());
 	ArrowArray array = appender.Finalize();

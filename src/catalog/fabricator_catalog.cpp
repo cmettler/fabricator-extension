@@ -21,6 +21,7 @@
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
+#include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
@@ -399,6 +400,37 @@ void FabricatorCatalog::MarkSinkOnOwnScans(PhysicalOperator &plan, const string 
 	}
 }
 
+//! Whether a WRITE sink may run on several tasks at once.
+//!
+//! ⚠ THE FLAG GOVERNS THE WHOLE PIPELINE, NOT ONLY THE SINK. `Pipeline::ScheduleParallel` tests
+//! `!sink->ParallelSink()` FIRST — before the source, the intermediate operators or `MaxThreads()` — and falls
+//! through to `ScheduleSequentialTask`. So a serial sink puts the scan, every projection and the sort on ONE
+//! task, which is why every write into a fabricator table used to be flat in `SET threads` while the same work
+//! streaming to the client scaled (docs/scan-concurrency.md §7a: 2919/2952 ms vs 2730 -> 1227 ms).
+static bool FabricatorParallelWrite(ClientContext &context, optional_ptr<PhysicalOperator> plan) {
+	if (!plan) {
+		return false; // INSERT ... VALUES: no source pipeline to parallelize.
+	}
+	if (TaskScheduler::GetScheduler(context).NumberOfThreads() <= 1) {
+		return false;
+	}
+	// ⚠ WE DELIBERATELY DO NOT CONSULT `preserve_insertion_order`, where DuckDB's own PlanInsert does, and the
+	// difference is a property of the TARGET rather than a liberty taken. That setting is about the order of a
+	// RESULT handed to a client, and DuckDB's own inserts must honour it because its storage IS ordered. A
+	// fabricator table has no insertion order to preserve: a scan of it returns rows in whatever order the
+	// provider yields (Delta reads its active files in listing order; a T-SQL SELECT without ORDER BY promises
+	// nothing). So the only ordering that has to survive a write here is one the PLAN states explicitly — which
+	// is exactly FIXED_ORDER, and is what the test below keeps serial.
+	//
+	// What a parallel sink costs even so, stated rather than implied: a table that was getting its file
+	// clustering INCIDENTALLY from source order stops getting it, because the provider cuts output files at
+	// batch boundaries and batches now interleave across tasks. That costs pruning quality, never a wrong
+	// answer. A DECLARED ordering is unaffected — SORTED BY / the `fabricator.sortedBy` property / a clustered
+	// Delta table are imposed by the provider DOWNSTREAM of the channel these tasks feed, so producers
+	// interleaving upstream of it cannot disturb an ordering applied afterwards.
+	return PhysicalPlanGenerator::OrderPreservationRecursive(*plan) != OrderPreservationType::FIXED_ORDER;
+}
+
 PhysicalOperator &FabricatorCatalog::PlanCreateTableAs(ClientContext &context, PhysicalPlanGenerator &planner,
                                                      LogicalCreateTable &op, PhysicalOperator &plan) {
 	auto &create_info = op.info->base->Cast<CreateTableInfo>();
@@ -417,6 +449,7 @@ PhysicalOperator &FabricatorCatalog::PlanCreateTableAs(ClientContext &context, P
 	info.options_json = fabricator::TableOptionsArg(create_info.options);                 // WITH (key='value', ...)
 	info.handle = handle_;
 	info.schema_entry = &op.schema.Cast<FabricatorSchemaEntry>();
+	info.parallel = FabricatorParallelWrite(context, &plan);
 
 	vector<LogicalType> result_types {LogicalType::BIGINT};
 	auto &ctas = planner.Make<FabricatorPhysicalCreateTableAs>(std::move(result_types), op.estimated_cardinality,
@@ -466,6 +499,10 @@ PhysicalOperator &FabricatorCatalog::PlanInsert(ClientContext &context, Physical
 
 	// For RETURNING, the operator emits all table columns (op.types); otherwise a
 	// single rows-affected BIGINT.
+	// RETURNING stays serial: the OUTPUT rows would come back in an arbitrary order, and the accumulating
+	// producer they land in is shared across sink threads.
+	target.parallel = !op.return_chunk && FabricatorParallelWrite(context, plan);
+
 	vector<LogicalType> result_types = op.return_chunk ? op.types : vector<LogicalType> {LogicalType::BIGINT};
 	auto &insert = planner.Make<FabricatorPhysicalInsert>(std::move(result_types), op.estimated_cardinality,
 	                                                    std::move(target), handle_);

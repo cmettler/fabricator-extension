@@ -311,6 +311,29 @@ static unique_ptr<FunctionData> DeltaCopyToBind(ClientContext &context, CopyFunc
 	return std::move(bind_data);
 }
 
+//! Whether a COPY into a fabricator table may sink on several tasks at once. Same prize as the INSERT/CTAS
+//! sinks (a serial sink puts the WHOLE pipeline on one task, docs/scan-concurrency.md §7a), reached through a
+//! different door: PhysicalCopyToFile::ParallelSink() is driven by the copy FUNCTION's execution mode, not by
+//! an override of ours.
+//!
+//! ⚠ THIS GATE IS STRICTLY MORE CONSERVATIVE THAN THE ONE PlanInsert/PlanCreateTableAs USE, and the difference
+//! is forced rather than chosen. Those two inspect the PLAN and go parallel unless it carries an explicit
+//! ordering (FIXED_ORDER), on the grounds that a fabricator table has no insertion order of its own to
+//! preserve. This callback is handed BOOLEANS — and `preserve_insertion_order` is already true for BOTH an
+//! explicit ORDER BY and a merely-default setting, so from in here the two are indistinguishable. Returning
+//! PARALLEL unconditionally would therefore silently ignore `COPY (SELECT … ORDER BY x) TO …`. So COPY stays
+//! serial by default and needs `SET preserve_insertion_order=false` to parallelize, exactly as DuckDB's own
+//! parquet writer does. Lifting it needs the plan, i.e. an upstream signature change.
+static CopyFunctionExecutionMode FabricatorCopyExecutionMode(bool preserve_insertion_order, bool supports_batch_index) {
+	if (!preserve_insertion_order) {
+		return CopyFunctionExecutionMode::PARALLEL_COPY_TO_FILE;
+	}
+	// ⚠ NOT BATCH_COPY_TO_FILE, though `supports_batch_index` may be true: that mode requires prepare_batch /
+	// flush_batch, i.e. the reorder buffer §7b describes and we do not have. Claiming it would be an
+	// InternalException at planning, not a slow write.
+	return CopyFunctionExecutionMode::REGULAR_COPY_TO_FILE;
+}
+
 static unique_ptr<GlobalFunctionData> CopyToInitGlobal(ClientContext &context, FunctionData &bind_data_p,
                                                        const string &file_path) {
 	auto &bind_data = bind_data_p.Cast<FabricatorCopyBindData>();
@@ -423,6 +446,7 @@ void RegisterFabricatorCopyFunction(ExtensionLoader &loader) {
 		function.copy_to_sink = CopyToSink;
 		function.copy_to_combine = CopyToCombine;
 		function.copy_to_finalize = CopyToFinalize;
+		function.execution_mode = FabricatorCopyExecutionMode;
 		function.extension = "fabricator";
 		loader.RegisterFunction(function);
 	}
@@ -437,6 +461,7 @@ void RegisterFabricatorCopyFunction(ExtensionLoader &loader) {
 		function.copy_to_sink = CopyToSink;
 		function.copy_to_combine = CopyToCombine;
 		function.copy_to_finalize = CopyToFinalize;
+		function.execution_mode = FabricatorCopyExecutionMode;
 		function.extension = "fabricator";
 		loader.RegisterFunction(function);
 	}

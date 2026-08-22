@@ -30,6 +30,9 @@ struct FabricatorCtasInfo {
 	FabricatorHandle handle = nullptr;
 	//! Schema entry to register the new table in (so it appears in the catalog).
 	optional_ptr<FabricatorSchemaEntry> schema_entry;
+	//! Whether the sink may run on SEVERAL tasks at once — see FabricatorInsertTarget::parallel for why this
+	//! governs the whole pipeline rather than only the sink. Decided in FabricatorCatalog::PlanCreateTableAs.
+	bool parallel = false;
 };
 
 //! CREATE TABLE [schema].[table] AS SELECT ... — streams the SELECT result as
@@ -50,6 +53,9 @@ public:
 	}
 	bool IsSource() const override {
 		return true;
+	}
+	bool ParallelSink() const override {
+		return info_.parallel;
 	}
 
 	SinkResultType Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const override;

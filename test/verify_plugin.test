@@ -7,7 +7,15 @@
 
 require fabricator
 
+# ⚠ For the parallel-write section at the end, which writes a real Delta table: the data files are written by
+# DuckDB's own COPY, and the sqllogictest runner does NOT auto-load a statically linked extension the way the
+# shell does — so without this the write fails with "Copy Function with name \"parquet\" is not in the
+# catalog". Measured, not anticipated: that is exactly how this suite failed the first time.
+require parquet
+
 require-env FABRICATOR_PLUGIN_DIR
+
+require-env FABRICATOR_DELTA_WRITE_DIR
 
 # The plugin's global scalar resolves on a bare loaded extension — no ATTACH, no first-party involvement.
 query I
@@ -272,3 +280,78 @@ true
 
 statement ok
 RESET threads;
+
+# ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
+# A WRITE INTO A FABRICATOR TABLE SCALES WITH `SET threads`. docs/scan-concurrency.md §7c.
+#
+# Until the write sinks declared ParallelSink() true, `Pipeline::ScheduleParallel` fell through to
+# ScheduleSequentialTask before it ever looked at the source or MaxThreads(), so the ENTIRE pipeline — scan,
+# projection, sink — ran on one task and a write was flat in `SET threads` (measured: 2919/2952 ms at 1 vs 4
+# threads, against 2730 -> 1227 ms for the same work streaming to the client).
+#
+# ⚠ `SET threads=1` IS THE PRE-CHANGE LEG, and that is what makes this a same-binary A/B rather than a
+# remembered number: FabricatorParallelWrite returns false at one thread, so leg A takes exactly the old code
+# path. There is no debug setting for a sink the way there is for a scan (§5f), so this is the only lever.
+#
+# ⚠ THE COST MUST SIT IN THE PROJECTION, ONCE PER MORSEL, AND THE SOURCE MUST BE A FABRICATOR TABLE. A per-ROW
+# sleep is impractical (a morsel is 2048 rows) and `range()` is a single-threaded source (§6), which would cap
+# the pipeline at one task whatever the sink declares — either mistake makes the section measure nothing while
+# passing.
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/plugpw' AS pw (TYPE fabricator, PROVIDER 'delta');
+
+statement ok
+CREATE TABLE pw.main.pw_src AS SELECT i AS id FROM range(8192) t(i);
+
+statement ok
+SET threads=1;
+
+statement ok
+CREATE TEMP TABLE pw_t0 AS SELECT epoch_ms(now()) AS ms;
+
+# 8192 rows = 4 morsels, one 400 ms sleep each => 1600 ms serial, ~400 ms across four tasks.
+statement ok
+CREATE OR REPLACE TABLE pw.main.pw_a AS
+  SELECT id, plug_sleep(CASE WHEN id % 2048 = 0 THEN 400 ELSE 0 END) AS w FROM pw.main.pw_src;
+
+statement ok
+CREATE TEMP TABLE pw_t1 AS SELECT epoch_ms(now()) AS ms;
+
+statement ok
+SET threads=4;
+
+statement ok
+CREATE OR REPLACE TABLE pw.main.pw_b AS
+  SELECT id, plug_sleep(CASE WHEN id % 2048 = 0 THEN 400 ELSE 0 END) AS w FROM pw.main.pw_src;
+
+statement ok
+CREATE TEMP TABLE pw_t2 AS SELECT epoch_ms(now()) AS ms;
+
+# POSITIVE CONTROL, load-bearing: the serial leg really slept its four morsels. Without it the ratio below
+# would pass equally on a build where plug_sleep had stopped sleeping, or the projection had been pruned away.
+query I
+SELECT ((SELECT ms FROM pw_t1) - (SELECT ms FROM pw_t0)) >= 1200;
+----
+true
+
+# THE CLAIM: the four morsels are written by four tasks, so the statement costs about one of them. True ratio
+# ~0.3; asserted at 0.7 so only a sink that has stopped being parallel can fail it.
+query I
+SELECT ((SELECT ms FROM pw_t2) - (SELECT ms FROM pw_t1))
+     < ((SELECT ms FROM pw_t1) - (SELECT ms FROM pw_t0)) * 0.7;
+----
+true
+
+# Both legs wrote every row: the speed claim is worthless if the fast leg dropped a batch.
+query IIII
+SELECT (SELECT count(*) FROM pw.main.pw_a), (SELECT sum(id) FROM pw.main.pw_a),
+       (SELECT count(*) FROM pw.main.pw_b), (SELECT sum(id) FROM pw.main.pw_b);
+----
+8192	33550336	8192	33550336
+
+statement ok
+RESET threads;
+
+statement ok
+DETACH pw;

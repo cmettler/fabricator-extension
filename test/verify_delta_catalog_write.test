@@ -181,3 +181,63 @@ SELECT count(*) FROM lake3.main.freshly;
 
 statement ok
 DETACH lake3;
+
+# ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
+# A PARALLEL WRITE SINK STILL WRITES EVERY ROW ONCE. docs/scan-concurrency.md §7c.
+#
+# Since the sink declares ParallelSink() true (for a plan carrying no explicit ordering), several DuckDB tasks
+# call push_batch on ONE bulk session at the same time. What that can break is not a type or a name but the
+# BOOKKEEPING: a batch enqueued twice, or dropped, or a partially-owned Arrow array double-freed.
+#
+# ⚠ THE SOURCE MUST BE A FABRICATOR TABLE, and that is what makes the section mean anything: `range()` is a
+# SINGLE-THREADED source (docs/scan-concurrency.md §6), so a CTAS straight off it gets ONE source task and
+# therefore one sink task however many threads are configured — the concurrency this section exists to
+# exercise would never occur. `pw_src` is built from range on purpose (it is a plain load) and then READ
+# through the catalog, where the scan declares NumberOfThreads().
+#
+# ⚠ AND IT MUST BE BIG ENOUGH TO SPAN SEVERAL MORSELS. At 2048 rows per chunk, the handful of rows the rest of
+# this suite writes is a single chunk — one push, no concurrency. 40000 rows is ~20.
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/catalogpw' AS pw (TYPE fabricator, PROVIDER '${DELTA_PROVIDER}');
+
+statement ok
+CREATE TABLE pw.main.pw_src AS SELECT i AS id, 'v' || (i % 977) AS s FROM range(40000) t(i);
+
+statement ok
+CREATE TABLE pw.main.pw_ctas AS SELECT id, s FROM pw.main.pw_src;
+
+# Exact count AND a checksum over both columns: a lost or duplicated batch moves the count, a mis-paired one
+# moves the checksum while the count survives.
+query III
+SELECT count(*), sum(id), sum(hash(s)) % 1000000007 FROM pw.main.pw_ctas;
+----
+40000	799980000	934842135
+
+# The CTAS's own answer must equal the source's, which is the comparison that does not depend on the literals
+# above staying correct if the fixture ever changes.
+query I
+SELECT (SELECT count(*) FROM pw.main.pw_ctas) = (SELECT count(*) FROM pw.main.pw_src)
+   AND (SELECT sum(id) FROM pw.main.pw_ctas) = (SELECT sum(id) FROM pw.main.pw_src);
+----
+true
+
+# The INSERT operator is a separate sink class with its own ParallelSink() — appending the same rows must
+# double every aggregate exactly.
+statement ok
+INSERT INTO pw.main.pw_ctas SELECT id, s FROM pw.main.pw_src;
+
+query II
+SELECT count(*), sum(id) FROM pw.main.pw_ctas;
+----
+80000	1599960000
+
+# ⚠ NOT COVERED HERE, said plainly: INSERT ... RETURNING, which is the one write shape deliberately kept
+# SERIAL (the OUTPUT rows would come back in an arbitrary order and the accumulating producer is shared).
+# It is a SQL Server surface — the Delta provider has no OUTPUT INSERTED — so its coverage lives in the
+# service tier, and nothing about it CHANGED: FabricatorInsertTarget::parallel is false whenever
+# op.return_chunk is set. There is also no way to write it here: `FROM (INSERT ... RETURNING ...)` is a
+# Parser Error in DuckDB, so a multi-morsel RETURNING cannot be aggregated in one statement at all.
+
+statement ok
+DETACH pw;

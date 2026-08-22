@@ -18,6 +18,10 @@ internal sealed class BulkSession
     // Batches in flight before the host's push blocks. Each batch is one sink chunk
     // (<= a DuckDB vector). A handful is enough to overlap encoding with the write
     // while keeping memory bounded.
+    // ⚠ It is a TOTAL, not a per-producer allowance: with a parallel sink there are N producers, so each has
+    // less headroom than it did when there was one, plus up to N more batches held by parked producers. Left
+    // at 8 deliberately — the number exists to bound memory, and the parallelism win is the CPU work each
+    // producer does BETWEEN pushes (scan, projection, Arrow encoding), which a small channel does not throttle.
     private const int ChannelCapacity = 8;
 
     private readonly Channel<RecordBatch> _channel;
@@ -43,7 +47,13 @@ internal sealed class BulkSession
         _channel = Channel.CreateBounded<RecordBatch>(new BoundedChannelOptions(ChannelCapacity)
         {
             SingleReader = true,
-            SingleWriter = true,
+            // ⚠ MULTI-WRITER ON PURPOSE, and it is a CONTRACT rather than a tuning choice. The host's write
+            // sinks (FabricatorPhysicalInsert / FabricatorPhysicalCreateTableAs) declare ParallelSink() true
+            // when the plan carries no explicit ordering, so several DuckDB tasks call push_batch — and hence
+            // Push — at the same time. Declaring SingleWriter would tell the channel it may assume otherwise.
+            // ⚠ The reverse is not symmetric: flipping this alone changes NOTHING, because what serializes the
+            // writes is ParallelSink() defaulting to false on the C++ side (docs/scan-concurrency.md §7a).
+            SingleWriter = false,
             FullMode = BoundedChannelFullMode.Wait,
         });
         var reader = _channel.Reader;
@@ -136,6 +146,8 @@ internal sealed class BulkSession
     /// the consumer has already exited (typically because the bulk-copy faulted),
     /// the batch is dropped and disposed — the real error surfaces from
     /// <see cref="Complete"/>. Takes ownership of <paramref name="batch"/>.
+    /// Safe to call CONCURRENTLY (the channel is multi-writer); each call enqueues its own batch, so the
+    /// order batches reach the consumer is the order they were accepted, not the order the sinks produced.
     /// </summary>
     public void Push(RecordBatch batch)
     {
