@@ -1043,9 +1043,21 @@ BLOCKING PULL (user-raised 2026-08-21; REASONED, NOT MEASURED).** On a Fabric wa
 which binds the channel-backed stream into `COPY (SELECT * FROM "…") TO '<dir>' (FORMAT parquet,
 PER_THREAD_OUTPUT true)`.
 
-- **The load gets faster, but not because the pull gets faster** — a pull is an in-memory channel read either
-  way. What changes is the consumer's WORK: parallel parquet encoding to local disk (`PER_THREAD_OUTPUT` makes
-  that COPY's sink parallel) instead of row-by-row TDS to a remote server.
+- **⚠ SEPARATE THE TWO SIDES — the fixes in this doc act on only one of them, and a first version of this
+  bullet ("the mechanism isn't a faster pull") was too narrow (user-corrected).**
+  - **The CONSUMER side is already parallel and none of our work touches it**: that inner `COPY … TO` query has
+    DuckDB's OWN `duckdb_arrow_scan` as its source and a `PER_THREAD_OUTPUT` COPY sink — upstream at both ends.
+    Its speedup over `SqlBulkCopy` is parallel parquet ENCODING to local disk replacing row-by-row TDS, not a
+    faster pull (a pull is an in-memory channel read either way).
+  - **The PRODUCER side is where §2, §5 and §5f are all currently DEAD, and a parallel sink is what switches
+    them on.** For `CREATE TABLE wh.t AS SELECT … FROM lake.t` the outer plan is ONE pipeline — our Delta scan
+    → projection → the bulk sink — and a serial sink makes it ONE TASK, so `MaxThreads()` is never read,
+    `get_partition_data` has nothing to reorder, and **§5f is literally inert: with one task there is no lock
+    contention to hand a worker back from.**
+  - ⇒ **§7b is therefore compositional rather than incremental**: it does not merely parallelise the sink, it
+    ACTIVATES the three read-path fixes on every write. A lake→warehouse staged load is where they compound —
+    the source is a remote Delta scan whose pull genuinely blocks (§5f's exact target) feeding a consumer that
+    is no longer the limit.
 - ⇒ **it shifts the bottleneck ONTO our single-tasked producer**, so this route is the best place to MEASURE
   §7b's payoff rather than an alternative to it. ⚠ The existing staged-vs-drained numbers (14.5–16.1 s vs
   16.8–28.9 s, 2026-08-10) predate the `MaxThreads` fix, §5f and everything here — re-take them.
