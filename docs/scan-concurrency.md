@@ -1201,6 +1201,32 @@ Server over TDS, 400k rows, ~2.4 s) so the channel stays full and sink tasks rea
   deferred. What would reopen it: a measured case where a fabricator write demonstrably stalls another
   statement rather than merely sharing with it.
 
+**⚠ WHERE TO LOOK WHEN WE MOVE TO THE FUTURE DuckDB LINE (user-raised 2026-08-22; checked against a fetched
+`origin/main`, not assumed).** "Closed" above means closed at the CURRENT cost. Main has done substantially
+more async work, and it changes what the wake would cost — though not in the place I first looked:
+
+- **STILL SHUT: `OperatorSinkInput` on main is BYTE-IDENTICAL to 1.5.5** — `global_state`, `local_state`,
+  `interrupt_state`, no `async_result`. So the §5f AsyncTask mechanism is still unreachable from a sink there.
+- **THE SURFACE HAS ROUGHLY DOUBLED**: files touching `async_result` **10 → 19**, files touching
+  `AsyncTask`/`AsyncResult` **17 → 34**, `SinkResultType::BLOCKED` sites **10 → 15**. Every new
+  `async_result` file is READ-side (multi-file read-ahead, base file reader, CSV multi-file, storage
+  row-group / scan-state, buffer manager, `table_function.cpp`) plus two new primitives.
+- **⇒ THE PATTERN THE WAKE ACTUALLY NEEDS ALREADY EXISTS THERE, under another name.**
+  duckdb `main`'s `multi_file_read_ahead.cpp` (under its `src/common/multi_file/`, a file that does NOT exist in our pinned tree) defines `ReadAheadJobCompletion` with
+  **`TryPark(const InterruptState &)`**, `FinishIOTask()` and `WaitForIO()` — park on an interrupt state,
+  complete it from somewhere else. **A SINK HAS an `InterruptState`**, which is exactly the half that is
+  missing today: `BlockSink` parks and nothing wakes it. If that pattern becomes reusable (it is currently
+  internal to read-ahead) the wake loses most of its cost — no new host-services entry, no bespoke
+  shared-wake lifetime protocol.
+- **`CallbackAsyncTask` + `AsyncTask::GetIOSize()` are both NEW** (`GetIOSize` does not exist anywhere in
+  1.5.5). The first would let §5f's own SOURCE-side wait complete on a NOTIFY instead of the 1–16 ms backoff,
+  retiring this doc's "⚠ THE TIMEOUT IS THE MECHANISM" compromise; the second says the scheduler is becoming
+  IO-aware, which is worth knowing before tuning anything about our blocking pulls.
+- **⇒ RE-EVALUATE ALL THREE TOGETHER at the bump, not just the wake**: the wake, §5f's backoff, and §10 item 6
+  (prefetch) — because `multi_file_read_ahead.cpp` IS upstream building prefetch into the multi-file reader,
+  which is the idea §5f dropped and did not refute. ⚠ And re-take the co-tenant cell above: its verdict is a
+  cost/benefit at TODAY's cost, so a cheaper mechanism moves the answer even though the 23% does not.
+
 **COPY got the same prize through a different door, and a STRICTER gate — for a reason worth recording.**
 `PhysicalCopyToFile::ParallelSink()` is `per_thread_output || partition_output || parallel`, and `parallel`
 comes from the copy FUNCTION's `execution_mode` callback, so `FabricatorCopyExecutionMode` now returns
@@ -1487,7 +1513,10 @@ about the parallel sink changes that.
    path, and it is what made a fixed-name bound-input view collide (now per-query names).
 5. **The `GROUP BY` regression of §2 is unexplained beyond "merge-bound".** If it ever matters, the lever is
    DuckDB's aggregate, not our scan.
-6. **PREFETCH is the idea §5f dropped and did not refute.** One pump running AHEAD of the converters is what
+6. **PREFETCH is the idea §5f dropped and did not refute — and UPSTREAM IS BUILDING IT ON `main`**
+   (duckdb `main`'s `multi_file_read_ahead.cpp`, with `ReadAheadJobCompletion` / `ReadAheadIOTask` and an
+   IO-size-aware `AsyncTask::GetIOSize()` that does not exist in 1.5.5). Re-derive this item at the bump rather
+   than building anything now; §7c's reopen box has the details. One pump running AHEAD of the converters is what
    would let a slow remote pull overlap with the CPU work above it — the fix only stopped the pull from
    starving OTHER pipelines. It costs a second owner of the Arrow stream and therefore the whole teardown
    design §5e budgets for, so it should be taken only once there is a remote measurement asking for it.
