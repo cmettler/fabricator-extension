@@ -1035,6 +1035,31 @@ the ordered case does not have to be given up; it needs a reorder buffer ahead o
 - ⚠ **Before §5f our own scans could not have fed such a sink at all**, since `get_partition_data` was
   declared nowhere — so this option is newly available rather than previously overlooked.
 
+
+**⚠ THE STAGED `COPY INTO` ROUTE IS WHERE THIS SHOULD PAY MOST — AND IT HANDS DuckDB'S OWN ARROW SCAN A
+BLOCKING PULL (user-raised 2026-08-21; REASONED, NOT MEASURED).** On a Fabric warehouse with
+`mssql_copy_into_staging`, the consumer is not `SqlBulkCopy` over TDS but
+`HostParquetStaging.WriteDirectory` ([dotnet/Fabricator.Bridge/HostParquetStaging.cs:44](../dotnet/Fabricator.Bridge/HostParquetStaging.cs#L44)),
+which binds the channel-backed stream into `COPY (SELECT * FROM "…") TO '<dir>' (FORMAT parquet,
+PER_THREAD_OUTPUT true)`.
+
+- **The load gets faster, but not because the pull gets faster** — a pull is an in-memory channel read either
+  way. What changes is the consumer's WORK: parallel parquet encoding to local disk (`PER_THREAD_OUTPUT` makes
+  that COPY's sink parallel) instead of row-by-row TDS to a remote server.
+- ⇒ **it shifts the bottleneck ONTO our single-tasked producer**, so this route is the best place to MEASURE
+  §7b's payoff rather than an alternative to it. ⚠ The existing staged-vs-drained numbers (14.5–16.1 s vs
+  16.8–28.9 s, 2026-08-10) predate the `MaxThreads` fix, §5f and everything here — re-take them.
+- **⚠ AND IT QUALIFIES A CLAIM §5d MAKES.** That section says the blocking pull is OURS because *"DuckDB's own
+  arrow scan … does not suffer it because its pull is an in-memory read"*. That is true of a MATERIALIZED Arrow
+  table and FALSE of a channel-backed one: `ChannelArrowStream` blocks whenever the producer is behind, while
+  DuckDB's arrow scan declares `NumberOfThreads()` and serializes its pull under a global mutex — the §5c shape
+  exactly, inside upstream code we cannot apply §5f to. It is live TODAY on this route (the producer is one
+  task, so the channel is often empty) and it SHRINKS once §7b lands (parallel producers keep the channel fed).
+  ⚠ No CI can see it: `verify_copy_into_staging`'s positive leg is manual/live-Fabric.
+- **Upstream-shaped, not filed**: a bound arrow input CAN block, so DuckDB's arrow scan should hand its worker
+  back (or cap threads for a producer-backed stream). A stock repro is a python `RecordBatchReader` that sleeps
+  between batches, unioned with anything — the same shape as `plug_slow_range`.
+
 ## 9. What this doc does not cover
 
 - Connection/transaction concurrency, MARS, read-your-writes, `dbt --threads N`:
