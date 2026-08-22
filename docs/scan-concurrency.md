@@ -1005,13 +1005,35 @@ their exact counts — which is precisely what tests the sort-is-downstream reas
   backpressure — silent on Windows, and the kind of thing a green suite hides. Forcing every `TryWrite` to
   report FULL once before accepting would exercise the retry path deterministically.
 
-**WHAT WOULD MAKE THIS NOT WORTH DOING, so it can be checked early**: if the bulk CONSUMER is the bottleneck
-rather than the producers, parallel producers buy nothing — they would just fill the channel faster and park.
-That is measurable before any of the above: instrument how long the consumer spends inside `BulkInsert` versus
-how long producers spend blocked in `Push`. On a remote target (SQL Server bulk copy, a Delta write to
-OneLake) the consumer plausibly IS the bottleneck, in which case the win is confined to LOCAL writes and the
-honest framing changes from "writes do not scale" to "writes are consumer-bound, and here is the proof".
-**Take that measurement first.**
+**⚠⚠ AND THE CAUSAL FACT THAT MAKES THIS WORTH DOING AT ALL, which an earlier version of this section got
+BACKWARDS (user-raised: "I would assume ParallelSink() == false should keep the pipeline multi threaded until
+pumped into the sink" — it does NOT).** `Pipeline::ScheduleParallel` tests `!sink->ParallelSink()` at
+[pipeline.cpp:103](../duckdb/src/parallel/pipeline.cpp#L103) — BEFORE it looks at the source, the intermediate
+operators or `MaxThreads()` — and falls through to `ScheduleSequentialTask` (`:175`). So a serial sink
+serializes the **whole pipeline**: the scan, every projection, the sort, all of it, on one task. §7a's own
+table is the proof (same source, same per-row work: 1227 ms streaming vs 2952 ms into a fabricator sink).
+
+⇒ **THE "KILL CONDITION" RECORDED HERE EARLIER WAS WRONG.** It said that if the bulk CONSUMER is the
+bottleneck — which for a remote target it always is, it is real IO — parallel producers buy nothing. False:
+the producers are not merely filling a channel, they are doing all of the query's CPU work. Parallelising them
+takes the statement from roughly *CPU + IO* toward *max(CPU/N, IO)*, so the win survives an IO-bound sink and
+is bounded only by whichever side saturates first. The measurement still worth taking is the SPLIT (how much
+of a real write is CPU above the sink vs IO inside it), because that predicts the SIZE of the win — not
+whether there is one.
+
+**⚠ THE ORDER-PRESERVING ROUTE EXISTS, AND §5f IS ITS PREREQUISITE — which we only satisfied on 2026-08-21.**
+DuckDB does NOT protect an ordered write from a sink that declares itself parallel: `ParallelSink()` is a
+virtual on the operator and nothing second-guesses it. What it offers instead is the mechanism its OWN insert
+uses — a sink declaring `RequiredPartitionInfo() == BatchIndex()` receives chunks TAGGED in order even when N
+threads read them, and a sort is fully cooperative about that (`PhysicalOrder` declares
+`ParallelSource() == true`, `SupportsPartitioning(BatchIndex()) == true`, `SourceOrder() == FIXED_ORDER`). So
+the ordered case does not have to be given up; it needs a reorder buffer ahead of the channel.
+- ⚠ **It must be gated PER PLAN or it is an InternalException**: `pipeline.cpp:120-124` throws when a
+  batch-index-requiring sink meets a source that cannot supply one. DuckDB gates its own with the public
+  `PhysicalPlanGenerator::UseBatchIndex(context, plan)` (`plan_insert.cpp:58` — threads > 1 AND every source
+  supports it), and since we build the operator in our own `PlanInsert` we can make the same call there.
+- ⚠ **Before §5f our own scans could not have fed such a sink at all**, since `get_partition_data` was
+  declared nowhere — so this option is newly available rather than previously overlooked.
 
 ## 9. What this doc does not cover
 
