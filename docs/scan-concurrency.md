@@ -1182,7 +1182,7 @@ for an explicit `ORDER BY` **and** for the default setting — indistinguishable
 PARALLEL unconditionally would silently ignore `COPY (SELECT … ORDER BY x) TO …`. So COPY is parallel only when
 `preserve_insertion_order` is off, exactly like DuckDB's own parquet writer, and is therefore SERIAL BY DEFAULT
 where INSERT/CTAS are parallel by default. An inconsistency with a cause; lifting it needs the plan, i.e. an
-upstream signature change. ⚠ `BATCH_COPY_TO_FILE` is NOT claimed even when `supports_batch_index` is true —
+upstream signature change. ⚠⚠ **THAT LAST CLAUSE IS WRONG, corrected the same day in §7d**: the callback cannot discriminate, but `plan_copy_to_file` derives the boolean FROM THE PLAN, so a scan declaring `order_preservation_type = NO_ORDER` would make COPY parallel by default with an explicit `ORDER BY` still winning — the discrimination does not have to happen inside the callback. Not adopted, for a reason that has nothing to do with COPY (§7d). ⚠ `BATCH_COPY_TO_FILE` is NOT claimed even when `supports_batch_index` is true —
 that mode requires `prepare_batch`/`flush_batch`, i.e. the reorder buffer below, and claiming it without them
 throws at planning.
 - **MEASURED, both halves, same shape as the table above** (`COPY (SELECT id, md5^8(s) FROM lk.src) TO '<dir>'
@@ -1294,6 +1294,72 @@ flag".** Its hazard is latency-only and provably not a deadlock; the measurement
 latency needs two connections in one process, which is exactly what the crash above prevents. Building an
 ABI entry plus a new lifetime protocol into the write path for an effect nobody can size is the shape this
 repo keeps recording as the source of confident wrong stories.
+
+### §7d. `TableFunction::order_preservation_type` — ANALYSED + PROBED 2026-08-22 (user-raised), NOT ADOPTED
+
+The knob a scan can use to tell DuckDB "my rows have no order". `OrderPreservationType { NO_ORDER,
+INSERTION_ORDER, FIXED_ORDER }`, defaulting to `INSERTION_ORDER` — and **not one function in DuckDB's own tree
+overrides it**, on 1.5.5 OR on `main` (a fetch of `origin/main` finds exactly ONE assignment in the whole
+repository: the default). Setting it would make us the first.
+
+**THREE readers, feeding TWO mechanisms** (established by grep, not from the names):
+- `PhysicalTableScan::SourceOrder()` and `PhysicalTableInOutFunction::OperatorOrder()` both return it — so the
+  same field governs our catalog/table-function SCANS *and* our table-in-out operators (`_each`, custom in-out,
+  the collector).
+- `PhysicalPlanGenerator::OrderPreservationRecursive` → `PreserveInsertionOrder`, consulted at **five** sites:
+  the result collector, the Arrow collector, `plan_copy_to_file`, `plan_insert`/`plan_create_table`, and
+  `plan_limit`.
+- `Pipeline::IsOrderDependent()`, consulted at **two**: `PhysicalUnion`'s `order_matters` and
+  `PhysicalOperator::OperatorCachingMode`.
+
+**WHAT `NO_ORDER` WOULD BUY, and one item corrects this doc:**
+- **⚠ COPY WOULD BE PARALLEL BY DEFAULT — which means §7c's claim that the COPY gate is "liftable only with the
+  plan, i.e. an upstream signature change" is WRONG.** True of the `execution_mode` callback, which is handed
+  booleans; false as a conclusion, because `plan_copy_to_file` derives `preserve_insertion_order` FROM THE PLAN,
+  so a source declaring its own order semantics decides it. An explicit `ORDER BY` still wins —
+  `OrderPreservationRecursive` short-circuits at the first source and `PhysicalOrder` is a source returning
+  `FIXED_ORDER`. **The discrimination does not have to happen inside the callback.**
+- a parallel `PhysicalStreamingLimit` instead of the batch limit; DuckDB's OWN insert/CTAS reading our scan
+  going parallel-streaming; and our own `preserve_insertion_order=false` SET on batched host queries becoming
+  redundant (§10 item 1).
+- **NOT a union fix.** `NO_ORDER` short-circuits ONE of `order_matters`'s five clauses and the SINK's clause
+  fires regardless (`PhysicalBufferedCollector::SinkOrderDependent()` is unconditionally true; the batch
+  collector trips the `batch_index` clause instead). That confirms §5a's mechanism from the other direction.
+- **On `main` it would buy slightly more, and this is the half worth watching**: `IsOrderDependent` is
+  byte-identical there, but a NEW consumer exists — `PipelineBroadcastExchange` carries an
+  `OrderPreservationType source_order` and derives an `order_mode` (UNORDERED / SEQUENTIAL / BATCH_INDEX) that
+  `PhysicalCTE` consults. So the type is being wired into new scheduling on the future line, and a source
+  declaring `NO_ORDER` will unlock more of it than it does today.
+
+**THE COST, MEASURED — and the first measurement of it was VOID, which is the reusable part.** A single-file
+400k-row table, `threads=8`, one chunk in eight made ~200x heavier so threads finish out of order:
+
+| probe | shipped (`INSERTION_ORDER`) | `NO_ORDER` |
+|---|---|---|
+| `SELECT id FROM (<uneven projection>) WHERE id % 997 = 0 LIMIT 12` | the SAME ascending 12 rows, 4/4 runs | a DIFFERENT, non-ascending 12 rows on EVERY run |
+
+- ⚠ **My first instrument was `md5(string_agg(id, ','))` and it was worthless**: `string_agg` over a parallel
+  aggregate combines partial states in arbitrary order, so BOTH legs varied — for a reason that has nothing to
+  do with the scan. A positional fingerprint has to be an arrival-order observable, not an aggregate.
+- ⚠ **And the hermetic tier is GREEN under `NO_ORDER` — 73/73, 7818, zero failures — which is a VACUOUS PASS,
+  not evidence.** The suites are small and uniform, so the collector happens to emit in order; the adversarial
+  shape above is what shows the order really moves. A tier run must not be used to clear this change.
+
+**IF IT IS EVER EXPOSED TO C#, EXPOSE A BOOLEAN, NOT THE ENUM.** It is expressible per table — `GetScanFunction`
+builds a FRESH `TableFunction` per table REFERENCE, so this is per-bind decidable exactly like the
+`exact_filter_pushdown` follow-on, and it would ride the v73 `table_info` doc. But `FIXED_ORDER` is a TRAP:
+nothing in DuckDB reads it to eliminate a redundant `ORDER BY`, it makes `IsOrderDependent` true (union
+serialization), it forces the order-preserving collector — and, sharpest, **since §7c it would make
+`FabricatorParallelWrite` return FALSE**, so a provider declaring `FIXED_ORDER` would silently serialize every
+write that reads that table. ⚠ Also remember the field is shared with `PhysicalTableInOutFunction`, so a
+per-function declaration would change `_each` output ordering too.
+
+**NOT ADOPTED, and the reason is the shape of the trade rather than the size of it.** The concrete win is
+parallel COPY by default, which already has a one-line user workaround (`SET preserve_insertion_order=false`);
+the price is that an unordered `SELECT` over a fabricator table stops returning rows in a stable order and a
+bare `LIMIT` starts returning arbitrary rows. If it is ever wanted it should be an OPT-IN — an ATTACH option or
+a per-table provider declaration — never a blanket default, because the semantic claim ("this table has no row
+order") is true of the FORMAT while the stable order is something callers observably rely on.
 
 ## 9. What this doc does not cover
 
