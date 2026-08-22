@@ -619,10 +619,20 @@ catalog COPY; to write a **Delta** table to a raw path with no ATTACH, use `FORM
 
 ### Write parallelism (`SET threads`)
 
-An `INSERT … SELECT` or `CREATE TABLE … AS SELECT` into a fabricator table uses **all the threads DuckDB is
-configured for** — the scan, the projection and the load run on several tasks at once. Measured on 2 M rows
-with a CPU-heavy projection: 3.5 s at `SET threads=1` against 2.1 s at `threads=4`. (Before 2026-08-22 a write
-was flat in `SET threads`, because the whole pipeline ran on one task.)
+Writing to a fabricator table uses **all the threads DuckDB is configured for** — the scan, the filter, the
+projection and the load run on several tasks at once. Measured on 2 M rows, `SET threads=1` against
+`threads=4`:
+
+| statement | 1 thread | 4 threads | |
+|---|---|---|---|
+| `CREATE TABLE … AS SELECT` (CPU-heavy projection) | 3.5 s | 2.1 s | 1.6x |
+| `INSERT … SELECT` (same) | 3.3 s | 2.0 s | 1.7x |
+| `DELETE … WHERE <CPU-heavy predicate>` | 3.2 s | 1.4 s | **2.4x** |
+| `UPDATE … SET … WHERE <same>` | 7.2 s | 5.0 s | 1.4x |
+
+(Before 2026-08-22 every one of those was flat in `SET threads`, because the whole pipeline ran on one task.)
+A `DELETE` gains the most because its entire cost is that pipeline; an `UPDATE`'s remainder is the row read-back
+and post-image write, which the provider does once at the end.
 
 Two shapes keep a serial load, deliberately:
 
@@ -633,6 +643,10 @@ Two shapes keep a serial load, deliberately:
   table* (`SORTED BY`, the `fabricator.sortedBy` property, a clustered Delta table) is unaffected either way:
   the provider applies it after the rows are collected, not by arrival order;
 - **`INSERT … RETURNING`**, whose returned rows would otherwise come back in an arbitrary order.
+
+⚠ One behaviour to know about if you write them: an `UPDATE … FROM other` whose join matches the **same target
+row twice** is last-write-wins, and which of the two wins is now arbitrary. It was never a documented order (it
+followed a hash join's probe order), but it used to be stable run to run. The reported row count is unaffected.
 
 `COPY … TO` is the exception in the other direction: it is **serial unless you set
 `preserve_insertion_order=false`** (3.4 s → 2.1 s on the same shape). DuckDB tells a copy function only whether

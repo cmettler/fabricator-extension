@@ -885,7 +885,8 @@ so intra-branch parallelism is available to every row of the table and only the 
 | `CREATE TABLE lk.main.x AS` -> a fabricator table | 2919 ms | **2952 ms** |
 | `INSERT INTO lk.main.x SELECT …` | 2954 ms | **3021 ms** |
 
-**So neither §2's `MaxThreads` nor §5's `get_partition_data` reaches any write path.** The cause is ours and our
+**So neither §2's `MaxThreads` nor §5's `get_partition_data` reaches any write path** — nor, as §7c measured,
+any rowid DELETE or UPDATE, whose scan and filter sit in that same single-tasked pipeline. The cause is ours and our
 own code states it, at [src/dml/fabricator_insert.cpp](../src/dml/fabricator_insert.cpp): *"The sink is serial
 (ParallelSink defaults to false), so no lock is needed and blocking here cannot starve another sink thread."*
 `Pipeline::ScheduleParallel` tests `!sink->ParallelSink()` FIRST, so the whole source pipeline gets one task and
@@ -1196,12 +1197,13 @@ our sub-operators MANUALLY over one shared global sink state, so their `Parallel
 at all — and the INSERT action builds `FabricatorInsertTarget` directly, leaving `parallel` at its false
 default. Whether a merge could then go parallel is a separate decision, not a consequence of this one.
 
-**Gates.** Hermetic `verify_delta_catalog_write` 43 → 54 per engine leg (tier floor 7750 → **7772**, i.e. +11 twice and
-no other suite moved): a 40 000-row (≈20 morsel) CTAS and
+**Gates.** Hermetic `verify_delta_catalog_write` 43 → 54 per engine leg (+11 twice), plus
+`verify_delta_catalog_delete` 28 → 39 and `verify_delta_catalog_update` 84 → 96 for the rowid DML sinks
+(+23 twice) — tier floor 7750 → **7818**, and no other suite moved: a 40 000-row (≈20 morsel) CTAS and
 INSERT read THROUGH the catalog, asserted by count + `sum(id)` + a `hash` checksum, so a batch enqueued twice,
 dropped, or mis-paired moves an assertion. ⚠ Its source must be a fabricator table and not `range()`, which is
 a single-threaded source (§6) — off `range` the sink gets ONE task however many threads are set, and the
-section would pass while exercising nothing. Service `verify_plugin` 49 → 66 (floor 2140 → **2157**): the
+section would pass while exercising nothing. Service `verify_plugin` 49 → 79 (floor 2140 → **2170**): the
 `threads=1` vs `threads=4` ratio over four `plug_sleep` morsels, with the serial leg's own duration as the
 positive control and both legs' row counts asserted (a speed claim is worthless if the fast leg dropped a
 batch).
@@ -1211,20 +1213,47 @@ batch).
   with *"Copy Function with name \"parquet\" is not in the catalog"* — a message about the writer, in a suite
   about plugins. Any suite that starts writing needs that line.
 
-**⚠ UPDATE AND DELETE ARE STILL SERIAL, AND THAT IS NOT AN OMISSION — but note they are structurally READY,
-which is worth knowing before anyone re-derives it.** `FabricatorPhysicalUpdate` / `FabricatorPhysicalDelete`
-sink through `AppendModifyBatch`, whose only shared mutation (`producer->AddBatch`) is already inside
-`gstate.lock`, with the `ArrowAppender` local — so concurrent `Sink` calls would be safe today. Their scan and
-projection are in the SAME pipeline as the sink, so they are single-tasked for exactly the reason INSERT was,
-and the prize is the same shape. What holds DELETE back is nothing (its payload is a SET of rowids, order
-irrelevant); what holds UPDATE back is DETERMINISM: `ExecuteUpdate` keys a dictionary by rowid and is
-LAST-WRITE-WINS, so a plan whose join matches one target row twice (`UPDATE … FROM other`) currently resolves
-in source order and would stop doing so. **DuckDB disables parallelism for precisely that case in its own
-PlanInsert** (*"we have to check that row is not updated twice"*), which is the precedent to follow rather than
-argue with. ⚠ And the prize is UNMEASURED here — take the §7a shape against an UPDATE before deciding.
+**✅ AND THE ROWID DML SINKS FOLLOWED THE SAME DAY — DELETE is the LARGEST ratio of the whole pass.** An
+UPDATE's and a DELETE's scan, filter and rowid append sit in the SAME pipeline as their sink, so they were
+single-tasked for exactly the reason INSERT was. MEASURED on the same 2 M rows with the CPU term in the
+PREDICATE (`WHERE md5^8(s) LIKE '0%'`), before and after, threads 1 vs 4:
+
+| statement | before | after |
+|---|---|---|
+| `DELETE FROM lk.t WHERE md5^8(s) LIKE '0%'` | 3.13 / 3.24 s → 3.28 / 3.38 s (FLAT) | 3.22 s → **1.36 s (2.37x)** |
+| `UPDATE lk.t SET s='x' WHERE md5^8(s) LIKE '0%'` | 7.15 / 7.43 s → 6.99 / 7.16 s (FLAT) | 7.15 s → **5.00 s (1.43x)** |
+
+- The DELETE ratio is the biggest because its whole cost IS that pipeline — the provider writes one deletion
+  vector at Finalize. The UPDATE residue is the merge-on-read read-back plus the post-image write, which
+  happen inside `ExecuteUpdate` at Finalize and are serial by construction.
+- **⚠ THE "BEFORE" UPDATE ROW ALREADY BURNED THE THREADS WITHOUT GETTING ANYTHING: 7.7 s of user CPU at
+  threads=1 against 10.5–12.5 s at threads=4, for the SAME wall clock.** That is the provider-side host
+  queries taking the threads while the statement's own pipeline could not — a shape worth recognising,
+  because "CPU went up and the clock did not move" reads like contention and was really one half of the
+  statement being unable to use what the other half was already paying for.
+- **It was a one-line change because `AppendModifyBatch` ALREADY took `gstate.lock` around its only shared
+  mutation**, with the `ArrowAppender` per-call. That lock is now load-bearing rather than defensive, and its
+  comment says so.
+- **⚠ DuckDB's OWN `PhysicalUpdate` and `PhysicalDelete` declare `ParallelSink()` TRUE UNCONDITIONALLY**
+  (`physical_update.hpp:61`, `physical_delete.hpp:52`) — no order gate, no duplicate-match gate. That is the
+  precedent, and it corrects a caution recorded here hours earlier: the objection below is real but is NOT a
+  reason to serialize, since upstream accepts the same nondeterminism. (Its `ON CONFLICT DO UPDATE` path is
+  the one that serializes, for a different reason — it must DETECT a double update in order to error.)
+- **⚠ THE ONE SEMANTIC CONSEQUENCE, stated rather than buried: a duplicate-match UPDATE's winner becomes
+  nondeterministic.** `ExecuteUpdate` keys its post-image dictionary by rowid and is LAST-WRITE-WINS, so
+  `UPDATE t SET … FROM other` whose join matches one target row twice used to resolve in the order the serial
+  sink saw the batches. That was never a promise — it is a hash join's probe order — but it was stable, and
+  now it is not. The row COUNT such a statement reports (the dictionary's size, not the matched rows) is
+  unchanged.
+- Gates: `verify_delta_catalog_delete` 28 → **39** and `verify_delta_catalog_update` 84 → **96**, both
+  engine-doubled, at ~20 morsels rather than the single chunk the rest of those suites touch. ⚠ The UPDATE one
+  asserts a DERIVED value per row (`s = 'u' || id`), because what a pairing bug produces is a value on the
+  WRONG row, which no count can see. Plus `verify_plugin` 66 → **79** for the DELETE ratio.
+  **Mutation-tested**: forcing the modify flag false dies at exactly that ratio after 74 assertions pass,
+  while BOTH correctness suites stay green — the right kill, since a parallel DELETE and a serial one return
+  the same rows.
 
 **Still open here:**
-- UPDATE / DELETE, per the box above — DELETE looks free, UPDATE needs the duplicate-match question answered;
 - the wake above, which is the only thing between this and holding zero workers under backpressure;
 - **the ORDER-PRESERVING route** — `RequiredPartitionInfo() == BatchIndex()` plus a reorder buffer ahead of the
   channel, gated per plan via the public `PhysicalPlanGenerator::UseBatchIndex` or it is an InternalException

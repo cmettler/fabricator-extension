@@ -64,6 +64,11 @@ struct FabricatorModifyTarget {
 	//! Set at EXECUTION time (GetGlobalSinkState), never at plan time: a prepared statement's physical plan is
 	//! reused across transactions, so a plan-time mark would apply to the first transaction only.
 	bool force_buffered = false;
+	//! Whether the sink may run on SEVERAL tasks at once — see FabricatorInsertTarget::parallel for why the
+	//! flag governs the WHOLE pipeline. Decided in PlanDelete/PlanUpdate; the MERGE path builds this struct
+	//! directly and deliberately leaves it FALSE, because PhysicalMergeInto drives our operators manually over
+	//! one shared global sink state and never consults their ParallelSink() at all.
+	bool parallel = false;
 };
 
 //! DELETE FROM [schema].[table] WHERE <rowid predicates>, batched.
@@ -82,6 +87,9 @@ public:
 	}
 	bool IsSource() const override {
 		return true;
+	}
+	bool ParallelSink() const override {
+		return target_.parallel;
 	}
 
 	SinkResultType Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const override;
@@ -114,6 +122,9 @@ public:
 	}
 	bool IsSource() const override {
 		return true;
+	}
+	bool ParallelSink() const override {
+		return target_.parallel;
 	}
 
 	SinkResultType Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const override;

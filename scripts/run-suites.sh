@@ -360,7 +360,13 @@ case "$TIER" in
         # moves one of the three. ⚠ Its source is a fabricator TABLE and not range(), which is a
         # single-threaded source — off range the sink gets ONE task however many threads are set, and the
         # section would pass while exercising nothing.
-        : "${MIN_ASSERTIONS:=7772}"
+        # 7818 since 2026-08-22: the rowid DML sinks joined the parallel-write work, so
+        # verify_delta_catalog_delete 28 -> 39 and verify_delta_catalog_update 84 -> 96, both
+        # ENGINE-DOUBLED (+23 twice). A DELETE appends rowids and an UPDATE appends (SET values ++ rowid)
+        # into ONE producer from several tasks now, so the sections are ~20 morsels rather than the single
+        # chunk the rest of those suites touch. The UPDATE one asserts a DERIVED value per row
+        # (s = 'u' || id): a concurrency bug there writes a value to the WRONG row, which no count sees.
+        : "${MIN_ASSERTIONS:=7818}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh
@@ -515,7 +521,13 @@ case "$TIER" in
         # claim is worthless if the fast leg dropped a batch. It also made this the first plugin suite to
         # WRITE, which is why it now needs `require parquet`: the sqllogictest runner does not auto-load a
         # statically linked extension, and without it the Delta write fails inside DuckDB COPY.
-        : "${MIN_ASSERTIONS:=2157}"
+        # 2170 since 2026-08-22: verify_plugin 66 -> 79 for the rowid DELETE leg of the same ratio gate.
+        # Worth its own leg because a DELETE is the LARGEST of the write ratios (3.22 -> 1.36 s on 2 M
+        # rows): its whole cost is scan + filter + rowid append, i.e. exactly what the flag unblocks.
+        # Mutation-tested: forcing the modify flag false dies at that ratio after 74 assertions pass,
+        # while BOTH correctness suites stay green - which is the right kill, since a parallel DELETE
+        # and a serial one produce the same rows.
+        : "${MIN_ASSERTIONS:=2170}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

@@ -117,6 +117,10 @@ static void AppendModifyBatch(FabricatorModifyGlobalState &gstate, DataChunk &ch
 	appender.Append(produce, 0, chunk.size(), chunk.size());
 	ArrowArray array = appender.Finalize();
 
+	// ⚠ THIS LOCK IS NOW LOAD-BEARING RATHER THAN DEFENSIVE. Both modify operators declare ParallelSink()
+	// true when the plan carries no explicit ordering, so several DuckDB tasks reach this line at once; the
+	// appender above is per-call and the producer is the only shared thing touched. It was already written
+	// this way, which is why the flag was a one-line change — but do not "simplify" it back.
 	lock_guard<mutex> guard(gstate.lock);
 	gstate.producer->AddBatch(array);
 }

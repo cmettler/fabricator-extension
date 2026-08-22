@@ -558,6 +558,11 @@ PhysicalOperator &FabricatorCatalog::PlanDelete(ClientContext &context, Physical
 	if (!op.expressions.empty() && op.expressions[0]->GetExpressionType() == ExpressionType::BOUND_REF) {
 		target.rowid_child_index = op.expressions[0]->Cast<BoundReferenceExpression>().index;
 	}
+	// DuckDB's OWN PhysicalDelete/PhysicalUpdate declare ParallelSink() == true UNCONDITIONALLY, which is the
+	// precedent here rather than something to argue with; we keep the same plan-time gate as the write sinks so
+	// the four cannot drift. What parallelizes is the scan, the filter and the rowid append — the provider work
+	// happens once at Finalize either way.
+	target.parallel = FabricatorParallelWrite(context, &plan);
 	vector<LogicalType> result_types {LogicalType::BIGINT};
 	auto &del = planner.Make<FabricatorPhysicalDelete>(std::move(result_types), op.estimated_cardinality,
 	                                                 std::move(target), handle_);
@@ -611,6 +616,13 @@ PhysicalOperator &FabricatorCatalog::PlanUpdate(ClientContext &context, Physical
 	}
 	auto target = FabricatorBuildModifyTarget(op.table);
 	FabricatorFillUpdateSetColumns(op.table, op.columns, op.expressions, target);
+	// ⚠ THE ONE THING A PARALLEL UPDATE CHANGES BEYOND SPEED: `ExecuteUpdate` keys its post-image dictionary by
+	// rowid and is LAST-WRITE-WINS, so a plan whose join matches ONE target row twice (`UPDATE … FROM other`)
+	// currently resolves in the order the sink happened to see the batches, and will now resolve in an
+	// arbitrary one. That order was never a promise — it is a hash join's probe order — and DuckDB accepts the
+	// same nondeterminism in its own parallel PhysicalUpdate. (Its ON CONFLICT DO UPDATE path is the one that
+	// serializes, and for a different reason: it must DETECT the double update in order to error.)
+	target.parallel = FabricatorParallelWrite(context, &plan);
 	vector<LogicalType> result_types {LogicalType::BIGINT};
 	auto &upd = planner.Make<FabricatorPhysicalUpdate>(std::move(result_types), op.estimated_cardinality,
 	                                                 std::move(target), handle_);

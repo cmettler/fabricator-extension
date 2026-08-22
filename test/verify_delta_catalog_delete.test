@@ -94,3 +94,50 @@ SELECT count(*) FROM lake2.main.t;
 
 statement ok
 DETACH lake2;
+
+# ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
+# A PARALLEL DELETE SINK STILL COLLECTS EVERY ROWID EXACTLY ONCE. docs/scan-concurrency.md §7c.
+#
+# The DELETE operator declares ParallelSink() true for a plan with no explicit ordering, so several DuckDB
+# tasks append rowid batches into ONE producer at the same time. A rowid appended twice is harmless (the
+# provider deletes a set) but one DROPPED is a row that survives, and one appended from the WRONG chunk
+# position deletes something else — so the assertions are the exact surviving set, not just the count.
+#
+# ⚠ SIZE IS THE POINT: at 2048 rows per chunk, the handful of rows the rest of this suite deletes is a single
+# chunk and therefore a single push. 40000 rows is ~20 morsels.
+# ⚠ AND THE SOURCE MUST BE A FABRICATOR TABLE — the DELETE reads the table it is deleting from, so that holds
+# by construction here, unlike the CTAS case in verify_delta_catalog_write.
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/catalogpd' AS pd (TYPE fabricator, PROVIDER '${DELTA_PROVIDER}');
+
+statement ok
+CREATE TABLE pd.main.t AS SELECT i AS id, 'v' || (i % 977) AS s FROM range(40000) v(i);
+
+statement ok
+DELETE FROM pd.main.t WHERE id % 4 = 1;
+
+# 10000 of 40000 gone, and the survivors are exactly the three residue classes — a dropped rowid would leave
+# a residue-1 row behind, which the second assertion names directly.
+query III
+SELECT count(*), sum(id), count(DISTINCT id) FROM pd.main.t;
+----
+30000	599990000	30000
+
+query I
+SELECT count(*) FROM pd.main.t WHERE id % 4 = 1;
+----
+0
+
+# A second, disjoint pass on the same table: the first DELETE's deletion vector is now in play, so this also
+# covers a parallel scan whose rows are already filtered by a DV.
+statement ok
+DELETE FROM pd.main.t WHERE id % 4 = 2;
+
+query II
+SELECT count(*), sum(id) FROM pd.main.t;
+----
+20000	399990000
+
+statement ok
+DETACH pd;

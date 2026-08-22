@@ -170,3 +170,54 @@ DROP TABLE src;
 
 statement ok
 DETACH lake3;
+
+# ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
+# A PARALLEL UPDATE SINK KEEPS EACH SET VALUE PAIRED WITH ITS OWN ROWID. docs/scan-concurrency.md §7c.
+#
+# The UPDATE operator declares ParallelSink() true for a plan with no explicit ordering, so several DuckDB
+# tasks append (SET values ++ rowid) batches into ONE producer at once. The pairing is built per CHUNK inside
+# AppendModifyBatch, so what a concurrency bug would produce is not a missing row but a value written to the
+# WRONG one — which a count cannot see. Hence the derived-value assertion below: every updated row must carry
+# a string computed from its OWN id.
+#
+# ⚠ SIZE IS THE POINT: at 2048 rows per chunk the rest of this suite updates a single chunk, i.e. one push.
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/catalogpu' AS pu (TYPE fabricator, PROVIDER '${DELTA_PROVIDER}');
+
+statement ok
+CREATE TABLE pu.main.t AS SELECT i AS id, 'v' || (i % 977) AS s FROM range(40000) v(i);
+
+statement ok
+UPDATE pu.main.t SET s = 'u' || id WHERE id % 4 = 1;
+
+# THE PAIRING ASSERTION: an updated row whose value came from another row's id fails here while every count
+# above it still passes.
+query III
+SELECT count(*) FILTER (WHERE s = 'u' || id),
+       count(*) FILTER (WHERE id % 4 = 1 AND s <> 'u' || id),
+       count(*)
+FROM pu.main.t;
+----
+10000	0	40000
+
+# The untouched rows kept their original derived value — the control, without which "10000 rows match" would
+# pass equally on an UPDATE that had rewritten the whole table.
+query I
+SELECT count(*) FROM pu.main.t WHERE id % 4 <> 1 AND s = 'v' || (id % 977);
+----
+30000
+
+# A second pass over the same table, so the first UPDATE's post-image files (and, on the merge-on-read path,
+# its deletion vector) are part of what the parallel scan reads.
+statement ok
+UPDATE pu.main.t SET s = 'w' || id WHERE id % 4 = 2;
+
+query III
+SELECT count(*) FILTER (WHERE s = 'u' || id), count(*) FILTER (WHERE s = 'w' || id), count(*)
+FROM pu.main.t;
+----
+10000	10000	40000
+
+statement ok
+DETACH pu;

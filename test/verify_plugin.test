@@ -350,6 +350,56 @@ SELECT (SELECT count(*) FROM pw.main.pw_a), (SELECT sum(id) FROM pw.main.pw_a),
 ----
 8192	33550336	8192	33550336
 
+# ── and the same for a rowid DELETE, which is a DIFFERENT sink class with its own flag. Worth its own leg
+# because the ratio is the LARGEST of the write paths (measured 3.22 -> 1.36 s on 2 M rows): a DELETE's whole
+# cost is the scan, the filter and the rowid append, so almost all of it is what the flag unblocks — the
+# provider does its work once at Finalize either way.
+
+statement ok
+CREATE TABLE pw.main.pw_d1 AS SELECT * FROM pw.main.pw_src;
+
+statement ok
+CREATE TABLE pw.main.pw_d2 AS SELECT * FROM pw.main.pw_src;
+
+statement ok
+SET threads=1;
+
+statement ok
+CREATE TEMP TABLE pw_t3 AS SELECT epoch_ms(now()) AS ms;
+
+# The sleep is in the PREDICATE, once per morsel, and it selects the four rows it slept on.
+statement ok
+DELETE FROM pw.main.pw_d1 WHERE plug_sleep(CASE WHEN id % 2048 = 0 THEN 400 ELSE 0 END) > 100;
+
+statement ok
+CREATE TEMP TABLE pw_t4 AS SELECT epoch_ms(now()) AS ms;
+
+statement ok
+SET threads=4;
+
+statement ok
+DELETE FROM pw.main.pw_d2 WHERE plug_sleep(CASE WHEN id % 2048 = 0 THEN 400 ELSE 0 END) > 100;
+
+statement ok
+CREATE TEMP TABLE pw_t5 AS SELECT epoch_ms(now()) AS ms;
+
+query I
+SELECT ((SELECT ms FROM pw_t4) - (SELECT ms FROM pw_t3)) >= 1200;
+----
+true
+
+query I
+SELECT ((SELECT ms FROM pw_t5) - (SELECT ms FROM pw_t4))
+     < ((SELECT ms FROM pw_t4) - (SELECT ms FROM pw_t3)) * 0.7;
+----
+true
+
+# Both legs deleted exactly the four rows they slept on — the same reason the CTAS legs assert their counts.
+query II
+SELECT (SELECT count(*) FROM pw.main.pw_d1), (SELECT count(*) FROM pw.main.pw_d2);
+----
+8188	8188
+
 statement ok
 RESET threads;
 
