@@ -887,18 +887,131 @@ own code states it, at [src/dml/fabricator_insert.cpp](../src/dml/fabricator_ins
 `Pipeline::ScheduleParallel` tests `!sink->ParallelSink()` FIRST, so the whole source pipeline gets one task and
 `MaxThreads()` is never read.
 
-**What lifting it would cost — small edit, real decision.** The concrete blocker is one line on the managed
-side: `BulkSession`'s channel is created `SingleWriter = true`. Flipping that and declaring the sink parallel is
-a few lines, but:
+**What lifting it would cost — small edit, real decision. ⚠ And mind which side the CAUSE is on, because the
+obvious reading is backwards.** The decisive line is the C++ one above: `ParallelSink()` is never overridden, so
+it defaults to false. `BulkSession`'s channel being created **`SingleWriter = true`**
+([dotnet/Fabricator.Bridge/BulkSession.cs](../dotnet/Fabricator.Bridge/BulkSession.cs), a
+`BoundedChannelOptions` property) and `PushBatch` taking no lock are CONSEQUENCES of that, not the blocker —
+which matters because flipping `SingleWriter` alone changes nothing, while declaring the sink parallel WITHOUT
+it is a correctness bug: concurrent `Push` calls would violate a contract the channel was told it could rely
+on. Both must move together, and even then:
 
-- **batch ORDER becomes nondeterministic across threads.** Fine for a SQL Server bulk load, where rows are
-  unordered — NOT fine for `SORTED BY` / clustered Delta writes, where a host-side sort feeds this very sink and
-  interleaving would destroy the ordering it just produced;
+- **batch ORDER becomes nondeterministic across threads** — but ⚠ **NOT in the way this doc first claimed, and
+  the correction removes the biggest apparent blocker.** `SORTED BY` / persisted `fabricator.sortedBy` /
+  clustered writes are SAFE: `DeltaCatalog.SortStream` runs a GLOBAL `ORDER BY` in the host engine over the
+  channel-fed stream ([DeltaCatalog.cs:1360](../dotnet/Fabricator.Delta/DeltaCatalog.cs#L1360), applied at
+  `:2388`), i.e. DOWNSTREAM of the channel — so producers interleaving upstream of it cannot disturb an
+  ordering that is imposed afterwards. What IS exposed is the narrower case: an explicit
+  `INSERT … SELECT … ORDER BY x` with NO sort declared on the table, where the user's ordering is carried by
+  ARRIVAL ORDER alone and a parallel sink loses it. That costs file clustering (a documented technique), never
+  a wrong answer — Delta reads are unordered and DuckDB re-applies any `ORDER BY` above the scan;
 - **file LAYOUT changes**, because `BudgetedStream` cuts output files at batch boundaries (§3), so which rows
   land in which parquet file stops being deterministic and `delta.targetFileSize` reasoning goes with it.
 
 The plausible shape is parallel by default with the ordered-write paths opting out, which is a decision to take
 rather than a flag to flip. Nothing is built.
+**⚠ AND FLIPPING IT NEEDS THE §5f TREATMENT ON THE SINK SIDE (raised 2026-08-21; nothing built).** With
+`ParallelSink() == true`, N sink tasks reach `Push` → `WriteAsync(...).GetAwaiter().GetResult()` on a BOUNDED
+channel, and the consumer is ONE pool thread doing the actual load — so whenever the load is slower than the
+producers (a remote bulk write, i.e. the normal case) the channel fills and every DuckDB worker sits inside
+that managed call. That is §5c mirrored, and here blocking is not an edge case but the STEADY STATE: the
+bounded channel exists precisely to apply backpressure.
+
+**⚠ THE SINK CAN DO IT BETTER THAN §5f COULD, and the asymmetry is worth knowing.** `OperatorSinkInput`
+carries `InterruptState &interrupt_state` (`physical_operator_states.hpp:158`) and `GlobalSinkState` already
+derives from `StateWithBlockableTasks` (`:72`) — so `BlockSink(guard, interrupt_state)` PARKS the task and holds
+**no worker at all**, where §5f's `AsyncTask` always occupies one. The source's `function.function` branch is
+handed no interrupt state, which is the whole reason it had to use a task.
+
+The managed half is nearly free, because the channel already offers both primitives: `Writer.TryWrite` is
+synchronous and returns false on a `FullMode.Wait` channel that is full, and `Writer.WaitToWriteAsync()` is the
+exact mirror of the consumer's existing `WaitToReadAsync()`. Two shapes:
+
+- **(a) try-push + park + wake** — a host-service callback the consumer invokes when it drains one. No worker
+  held, no timeout to tune. Needs the managed→host direction (which host services already are).
+- **(b) the §5f shape** — try-push + BLOCKED with a bounded wait (`wait_for_space(timeout)` implemented by
+  `WaitToWriteAsync`). No new callback direction, but holds a worker per blocked task for up to the timeout.
+  A legitimate stepping stone; (a) is reachable on a sink, so stopping at (b) leaves the better mechanism
+  unused.
+
+**⚠ THREE TRAPS, and the first turns an error into a HANG.** (1) `TryWrite`'s `false` is AMBIGUOUS — full, or
+the channel COMPLETED because the consumer faulted; treating both as "would block" parks the sink forever on a
+failed load. Today's `Push` separates them via `_consumerExited` + the `ChannelClosedException` catch, so the
+ABI needs a THREE-way answer (accepted / full / closed), with closed keeping today's behaviour: drop, dispose,
+let the real error surface from `Complete`. (2) A BLOCKED sink gets **the same chunk re-delivered**
+(`remaining_sink_chunk = true`, `pipeline_executor.cpp:104`), so the try-push may take ownership of the Arrow
+array ONLY on acceptance — `Push` currently takes it unconditionally, and its own doc says so. (3)
+`SingleWriter = true` must become false, which is the contract half and worthless alone.
+
+
+
+## 7b. IMPLEMENTATION HANDOFF for the parallel write sink (written 2026-08-21 before starting; NOTHING BUILT)
+
+The goal: `CREATE TABLE lk.t AS SELECT …` and `INSERT INTO lk.t SELECT …` should scale with `SET threads` the
+way a streaming scan now does. §7a is the measurement (both flat: 2919/2952 ms and 2954/3021 ms at threads 1
+vs 4, against 2730 → 1227 ms for the same work streaming to the client) and §7a's bullets are the trade-offs.
+This section is the surface.
+
+**THE SURFACE, verified rather than recalled:**
+
+| what | where |
+|---|---|
+| the sink that must declare itself parallel | `FabricatorPhysicalInsert::Sink` — [src/dml/fabricator_insert.cpp:101](../src/dml/fabricator_insert.cpp#L101); neither this class nor `FabricatorPhysicalCreateTableAs` ([src/dml/fabricator_ctas.cpp:79](../src/dml/fabricator_ctas.cpp#L79)) overrides `ParallelSink()`, so both default to FALSE |
+| the COPY path | `CopyToSink` — [src/copy/fabricator_copy.cpp:357](../src/copy/fabricator_copy.cpp#L357). ⚠ Its parallelism is decided by the COPY function's own flags, NOT by `ParallelSink()`; establish how before assuming it comes along |
+| the blocking call | `BulkSession.Push` — [dotnet/Fabricator.Bridge/BulkSession.cs:144](../dotnet/Fabricator.Bridge/BulkSession.cs#L144), `WriteAsync(...).GetAwaiter().GetResult()` |
+| the contract to flip | `SingleWriter = true` — [BulkSession.cs:45](../dotnet/Fabricator.Bridge/BulkSession.cs#L45), a `BoundedChannelOptions` property. Capacity is `ChannelCapacity = 8` ([:21](../dotnet/Fabricator.Bridge/BulkSession.cs#L21)) — with N producers that is less headroom PER PRODUCER, so re-price it |
+| the ABI entry to join | `push_batch` — [src/include/fabricator/abi.h:291](../src/include/fabricator/abi.h#L291), `clr_host.hpp:322`, `Abi.cs:78`, `Bootstrap.cs` |
+| the coupling to re-derive | `PhysicalMergeInto(parallel=false)` — [src/catalog/fabricator_merge_into.cpp:200-207](../src/catalog/fabricator_merge_into.cpp#L200-L207) |
+
+**ORDER OF WORK.** Do the managed half first: it is independently testable and cannot change behaviour while
+the sink is still serial.
+
+1. **`push_batch_try` (new ABI entry, three-way).** Managed body is `Writer.TryWrite(batch)`. ⚠ **Its `false`
+   is AMBIGUOUS — full, or the channel COMPLETED because the consumer faulted — and collapsing the two turns a
+   failed load into a HANG** (the sink would park forever on an error). Return ACCEPTED / FULL / CLOSED,
+   deriving CLOSED from `_consumerExited` as `Push` does today (`TryWrite` takes no cancellation token, so the
+   check has to be explicit). CLOSED keeps today's behaviour: drop, dispose, let the real error surface from
+   `Complete`.
+2. **⚠ OWNERSHIP ONLY ON ACCEPTANCE.** A BLOCKED sink gets the SAME CHUNK RE-DELIVERED
+   (`remaining_sink_chunk = true`, `pipeline_executor.cpp:104`), and `Push` currently takes ownership
+   unconditionally — its own doc says so. A `FULL` answer that consumed the Arrow array is a double-free on
+   the retry.
+3. **The wait.** Prefer shape (a) of §7a — `BlockSink(guard, input.interrupt_state)` parks the task and holds
+   NO worker, which the source side could not do — with a host-service callback the consumer invokes when it
+   drains one. Shape (b) (`wait_for_space(timeout)` over `WaitToWriteAsync`, a `scan_wait` mirror) is the
+   cheaper stepping stone and holds one worker per blocked task.
+4. **Then flip `ParallelSink()`** on the two operators, and only then look at COPY.
+5. **Re-derive the MERGE comment.** Its `parallel=false` is justified by TWO things, and this work invalidates
+   one: *"PushBatch blocks for backpressure and takes no lock, documented as safe only because ParallelSink()
+   is false"*. The OTHER reason — every action's operator shares ONE global sink state — survives on its own,
+   so MERGE can stay serial; but the comment must say so for the right reason, and whether MERGE could then go
+   parallel is a SEPARATE decision.
+
+
+**THE GATE, and it is in better shape than §5f's was.** The claim is a wall-clock RATIO, but this time the
+correctness half is assertable: rows and values must be identical, and the ordered-write suites must stay at
+their exact counts — which is precisely what tests the sort-is-downstream reasoning above.
+
+- `verify_delta_sorted_by` (30) and `verify_delta_clustered_optimize` (147) are the load-bearing ones: if
+  parallel producers DID disturb a declared ordering, they are what fails.
+- `verify_delta_catalog_write` / `_transactions` (engine-doubled) cover the plain paths; the whole hermetic +
+  service tiers must come back at IDENTICAL counts, since no answer may move.
+- For the speed claim, reuse §7a's shape (single source, no union, per-morsel `plug_sleep`, CTAS into a
+  fabricator table) and the same-process A/B trick §5f used — ⚠ but note there is no equivalent of
+  `debug_physical_table_scan_execution_strategy` for a SINK, so the pre-fix leg is not reachable from SQL.
+  `SET threads=1` vs `threads=4` is the honest A/B here, with the DuckDB-storage CTAS row as the control that
+  the machine really can scale.
+- ⚠ **Mutation-test the ownership rule specifically** (step 2). Its failure mode is a double-free under
+  backpressure — silent on Windows, and the kind of thing a green suite hides. Forcing every `TryWrite` to
+  report FULL once before accepting would exercise the retry path deterministically.
+
+**WHAT WOULD MAKE THIS NOT WORTH DOING, so it can be checked early**: if the bulk CONSUMER is the bottleneck
+rather than the producers, parallel producers buy nothing — they would just fill the channel faster and park.
+That is measurable before any of the above: instrument how long the consumer spends inside `BulkInsert` versus
+how long producers spend blocked in `Push`. On a remote target (SQL Server bulk copy, a Delta write to
+OneLake) the consumer plausibly IS the bottleneck, in which case the win is confined to LOCAL writes and the
+honest framing changes from "writes do not scale" to "writes are consumer-bound, and here is the proof".
+**Take that measurement first.**
 
 ## 9. What this doc does not cover
 
