@@ -1375,7 +1375,24 @@ order") is true of the FORMAT while the stable order is something callers observ
 
 ## 10. Open, and unmeasured
 
-1. **Can `preserve_insertion_order=false` be dropped now?** §5 measured it redundant on the LOCAL union repro
+1. **Can `preserve_insertion_order=false` be dropped now? — there is now a NAMED REASON TO EXPECT NOT, found
+   2026-08-22 (user-raised).** The SET's value was routing away from the SINGLE-THREADED
+   `PhysicalBufferedCollector`, which `GetResultCollector` picks when `UseBatchIndex` is false. The obvious
+   reading — "§5's `get_partition_data` fixed that, so the SET is redundant" — does NOT transfer, because the
+   inner host query does not contain OUR scan: it contains DuckDB's `read_parquet` (which does declare a batch
+   index, via `MultiFileFunction`), `duckdb_arrow_scan` views, and **a `WITH … AS MATERIALIZED` CTE**. And
+   `SupportsPartitioning(BatchIndex())` **DEFAULTS TO FALSE** (`AnyRequired()` is true for `batch_index`), with
+   only FOUR overriders in the whole tree — `PhysicalTableScan`, `PhysicalOrder`, `PhysicalTopN`,
+   `PhysicalWindow`. A materialized-CTE scan (`PhysicalColumnDataScan`) overrides nothing, and
+   `AllSourcesSupportBatchIndex()` requires EVERY source. Both the union form and the partition-join plain form
+   emit exactly those CTEs. ⚠ Two things keep this a mechanism rather than a proof: whether that CTE scan is
+   REACHED depends on plan shape (`GetSources()` walks only the single-child spine, and in the union form the
+   CTEs are join inputs), and LOCALLY the stall does not manifest at all (§5: 1858 vs 1828 ms — unmeasurable
+   either way). ⚠ Scope, checked in source since it decides the blast radius: the setting is `GLOBAL_DEFAULT`
+   ("settable in both scopes but defaults to global"), so a BARE `SET` would change the whole database
+   including the user's own connections — we emit `SET SESSION`, on a fresh connection per call, so it is one
+   statement. Original note follows.
+   **Can `preserve_insertion_order=false` be dropped now?** §5 measured it redundant on the LOCAL union repro
    (1858 vs 1828 ms), and removing it would give batched Delta statements their insertion order back. It must
    not be removed on that alone: the setting was justified by REMOTE numbers taken before the fix, and the
    union form's remote gate in `TryUnionForm` rests on the same pre-fix measurements. Re-measure live, then
