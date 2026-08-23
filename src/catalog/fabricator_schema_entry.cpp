@@ -60,6 +60,8 @@
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/parser/parsed_data/drop_info.hpp"
 #include "duckdb/planner/parsed_data/bound_create_table_info.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
+#include "duckdb/execution/expression_executor.hpp"
 
 #include <atomic>
 #include <cstring>
@@ -428,16 +430,218 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateEntry(ClientContext
 	return &ref;
 }
 
-// Builds a ScalarFunction whose callback marshals the arg chunk to Arrow, runs the UDF over the bridge
-// (ExecuteScalar with `handle` — 0 for a connection-free GLOBAL scalar, where the C# side resolves by name
-// against the global registry), and ingests the single-column result. Shared by catalog-bound scalar UDFs
-// (GetOrCreateScalarFunction) and load-time global scalars (RegisterFabricatorGlobalFunctions).
+// -----------------------------------------------------------------------------
+// Scalar functions (Phase 3 + the ABI v80 bind session). A scalar call is BOUND per call site
+// (scalarfn_bind -> a managed binding) and then EXECUTED per chunk over that binding (scalarfn_execute),
+// mirroring tablefn_bind / tablefn_execute / tablefn_close. Binding buys two things a stateless execute
+// could not express: a result type that depends on the call's constant arguments, and somewhere for the
+// provider to park work done once instead of per chunk.
+// -----------------------------------------------------------------------------
+
+// Identity carried on the ScalarFunction's function_info — the bind callback is a RAW function pointer and
+// cannot capture (the same reason FabricatorAggregateFunctionInfo exists).
+struct FabricatorScalarFunctionInfo : public ScalarFunctionInfo {
+	FabricatorHandle handle = nullptr;
+	string schema;
+	string func;
+	vector<string> arg_names;
+};
+
+// Refcounted holder for the managed scalar binding; its destructor calls scalarfn_close at plan teardown
+// (best-effort, idempotent). Mirrors AggSessionHolder — and it must be REFCOUNTED rather than owned
+// outright, because FunctionData::Copy is called for a bound expression and every copy addresses the SAME
+// managed binding.
+struct ScalarBindingHolder {
+	FabricatorHandle binding = nullptr;
+	~ScalarBindingHolder() {
+		fabricator::ScalarFnClose(binding);
+	}
+};
+
+struct FabricatorScalarBindData : public FunctionData {
+	shared_ptr<ScalarBindingHolder> holder;
+
+	unique_ptr<FunctionData> Copy() const override {
+		auto c = make_uniq<FabricatorScalarBindData>();
+		c->holder = holder;
+		return std::move(c);
+	}
+	bool Equals(const FunctionData &other_p) const override {
+		return holder == other_p.Cast<FabricatorScalarBindData>().holder;
+	}
+};
+
+// Bind one scalar call site: fold whatever arguments are constant, cross them to the provider, adopt the
+// result type it reports, and keep the binding for the exec callback.
+//
+// ⚠ A SCALAR'S ARGUMENTS NEED NOT BE CONSTANT — unlike a table function's, which DuckDB pre-evaluates
+// into TableFunctionBindInput::inputs. Here we are handed argument EXPRESSIONS, so we fold what we can and
+// tell the provider WHICH slots are real via the mask; an unfoldable slot carries a NULL placeholder that
+// must not be mistaken for an explicit NULL literal.
+static unique_ptr<FunctionData> FabricatorScalarBind(ClientContext &context, ScalarFunction &bound_function,
+                                                    vector<unique_ptr<Expression>> &arguments) {
+	auto &info = bound_function.function_info->Cast<FabricatorScalarFunctionInfo>();
+
+	// ⚠⚠ THE AMBIENTS (txn + host-FS opener) ARE DELIBERATELY *NOT* ESTABLISHED HERE, and this is the one
+	// place a scalar bind differs from every other bind in the tree. Do NOT "fix" it by adding
+	// FabricatorSetActiveTxn — that was tried, and it SEGFAULTED the process.
+	//
+	// Every other bind (sqlgen, tablefn, the ALTER paths) is the bind of a statement's OWN source, so pushing
+	// the calling context as the ambient opener is exactly right. A SCALAR binds wherever it is CALLED —
+	// including inside a nested host query that some OUTER operation is running while IT holds the ambient.
+	// The recluster is precisely that shape: OPTIMIZE issues a host query whose ORDER BY calls hilbert_index,
+	// and the outer Delta write keeps doing host-FS IO afterwards. Setting the ambient to the INNER
+	// connection's ClientContext leaves that outer IO resolving a context that is gone — the dangling-opener
+	// use-after-free this codebase has paid for twice before (table_stats, RollbackTransaction).
+	//
+	// MEASURED, with the call as the only variable: verify_delta_clustered_optimize crashed at
+	// `OPTIMIZE main.c1` (exit 127, and 139 — SIGSEGV — on its accumulated leg) with the call present, and
+	// passes 147 assertions without it; a shell repro flipped the same way.
+	//
+	// Nothing needs it today, by construction rather than by luck: a discovered SQL UDF takes the DEFAULT
+	// binding, which resolves nothing at bind (that is what the "declared type stands" sentinel is for), and
+	// every custom scalar we ship is pure compute. If a provider ever does need its connection at bind, the
+	// fix is a MANAGED-side scope that pushes and RESTORES the ambient (the InterruptScope shape) — the host
+	// cannot restore it, because the ambient lives in an AsyncLocal the host can only overwrite.
+
+	vector<LogicalType> arg_types;
+	vector<string> arg_names;
+	vector<Value> arg_values;
+	string arg_constant;
+	for (idx_t i = 0; i < arguments.size(); i++) {
+		auto &arg = *arguments[i];
+		// A still-unresolved prepared-statement parameter can neither be folded nor typed, so the whole bind
+		// must be DEFERRED: PREPARE p AS SELECT f(?) cannot yet know what f returns. This is the mechanism
+		// DuckDB provides for exactly that (getvariable / strptime throw it too); without it the parameter
+		// would silently arrive as an UNKNOWN-typed placeholder and be reported as a runtime slot.
+		if (arg.HasParameter() || arg.return_type.id() == LogicalTypeId::UNKNOWN) {
+			throw ParameterNotResolvedException();
+		}
+		// Marshal as the DECLARED parameter type wherever that is concrete. DuckDB is about to insert
+		// exactly that cast (CastToFunctionArguments runs immediately after this bind returns), so using it
+		// makes the bind's view of an argument AGREE with the batch execute will see, instead of differing by
+		// a cast. It also keeps an untyped NULL literal off the SQLNULL path below: `f(NULL, …)` against a
+		// declared VARCHAR parameter is a VARCHAR null here, exactly as at execute. Where the parameter is
+		// ANY there is no cast, so the expression's own type is what execute sees too.
+		LogicalType marshal_type = arg.return_type;
+		if (i < bound_function.arguments.size() && bound_function.arguments[i].id() != LogicalTypeId::ANY &&
+		    bound_function.arguments[i].id() != LogicalTypeId::INVALID) {
+			marshal_type = bound_function.arguments[i];
+		}
+		bool folded = false;
+		Value value(marshal_type); // NULL placeholder for a runtime expression
+		if (arg.IsFoldable()) {
+			try {
+				value = ExpressionExecutor::EvaluateScalar(context, arg).DefaultCastAs(marshal_type);
+				folded = true;
+			} catch (std::exception &) {
+				// Folding a constant expression can itself fail (1/0), and so can casting it to the declared
+				// type. Neither is a bind failure — DuckDB's own constant-folding rule swallows such errors
+				// and leaves the expression to be evaluated at execution, so we report the slot as runtime
+				// and let the failure surface exactly where it does today.
+				folded = false;
+				value = Value(marshal_type);
+			}
+		}
+		arg_types.push_back(marshal_type);
+		arg_names.push_back(i < info.arg_names.size() ? info.arg_names[i] : "arg" + to_string(i));
+		arg_constant.push_back(folded ? '1' : '0');
+		arg_values.push_back(std::move(value));
+	}
+
+	auto properties = fabricator::BoundaryClientProperties(context);
+	auto holder = make_shared_ptr<ScalarBindingHolder>();
+
+	// The resolved result type arrives as a BARE ArrowSchema, read with ReadArrowSchema — the same carrier
+	// and the same reader the declared-side get_function_return_schema uses, so extension types (VARIANT)
+	// import identically.
+	//
+	// ⚠ NOT tablefn_bind's zero-row STREAM, and the difference is not cosmetic: reading a stream's schema
+	// goes through PopulateReturnSchema, which SETS THE AMBIENT HOST-FS OPENER. A scalar binds wherever it is
+	// called — including inside a host query that is itself doing host-FS IO, e.g. OPTIMIZE's recluster —
+	// where clobbering that ambient killed the process outright (measured: verify_delta_clustered_optimize,
+	// exit 127 with no output, at `OPTIMIZE main.c1`). A table function binds as the statement's own source,
+	// so it never sits underneath someone else's IO.
+	ArrowSchema result_schema {};
+	std::memset(&result_schema, 0, sizeof(result_schema));
+	if (arg_types.empty()) {
+		// Zero-argument scalar: pass NO stream rather than an empty one. A zero-FIELD Arrow schema cannot
+		// cross the C interface in EITHER direction (Apache.Arrow throws on 'fields'), which is the same
+		// reason the exec callback sends a throwaway column and tablefn_bind passes nullptr here.
+		holder->binding = fabricator::ScalarFnBind(info.handle, info.schema, info.func, nullptr,
+		                                           arg_constant, result_schema);
+	} else {
+		DataChunk chunk;
+		chunk.Initialize(Allocator::DefaultAllocator(), arg_types);
+		for (idx_t c = 0; c < arg_values.size(); c++) {
+			chunk.SetValue(c, 0, arg_values[c]);
+		}
+		chunk.SetCardinality(1);
+		auto extension_types = ArrowTypeExtensionData::GetExtensionTypes(context, arg_types);
+		ArrowAppender appender(arg_types, 1, properties, extension_types);
+		appender.Append(chunk, 0, 1, 1);
+		ArrowArray array = appender.Finalize();
+		// ⚠ An Arrow NULL-typed child must report null_count == length, and DuckDB does not set it:
+		// ArrowNullData::Append only bumps row_count and its Finalize only clears n_buffers, so the array
+		// crosses with null_count 0 and Apache.Arrow refuses it ("Length must equal null count"). Only an
+		// ANY-declared parameter can still be SQLNULL here (a concrete one was cast above), which is why
+		// this is reachable at all. Patch it rather than dropping the argument: "you passed an untyped NULL"
+		// is exactly the kind of thing a bind resolving a result type needs to know.
+		for (idx_t c = 0; c < arg_types.size() && (int64_t)c < array.n_children; c++) {
+			if (arg_types[c].id() == LogicalTypeId::SQLNULL && array.children[c]) {
+				array.children[c]->null_count = array.children[c]->length;
+			}
+		}
+		fabricator::ArrowProducer producer(arg_types, arg_names, properties);
+		producer.AddBatch(array);
+		producer.Finish();
+		holder->binding = fabricator::ScalarFnBind(info.handle, info.schema, info.func, producer.Stream(),
+		                                           arg_constant, result_schema);
+	}
+
+	vector<LogicalType> result_types;
+	vector<string> result_names;
+	fabricator::ReadArrowSchema(context, result_schema, result_types, result_names);
+	if (result_types.size() != 1) {
+		throw BinderException("fabricator scalar function \"%s\" bound %llu result columns; exactly one is required",
+		                      info.func, (uint64_t)result_types.size());
+	}
+	// The UNRESOLVED sentinel means "my result is the function's DECLARED type" — which the registered
+	// function already carries, so leaving it alone is the whole handling. That is what lets the default
+	// binding cost NOTHING: it does not have to re-derive (or re-fetch from the server) a type the host
+	// resolved once when it materialized the catalog entry.
+	if (result_types[0].id() != LogicalTypeId::SQLNULL && result_types[0].id() != LogicalTypeId::ANY) {
+		bound_function.SetReturnType(result_types[0]);
+	}
+	if (bound_function.GetReturnType().id() == LogicalTypeId::ANY) {
+		// Neither the declaration nor the bind produced a type. Refuse HERE, naming the function: an
+		// unresolved ANY flowing onward gets no further validation (CheckTemplateTypesResolved guards only
+		// TEMPLATE) and would fail far from its cause.
+		throw BinderException(
+		    "fabricator scalar function \"%s\" declares no return type and its bind did not resolve one",
+		    info.func);
+	}
+
+	auto bind_data = make_uniq<FabricatorScalarBindData>();
+	bind_data->holder = std::move(holder);
+	return std::move(bind_data);
+}
+
+// Builds a ScalarFunction bound per call site by FabricatorScalarBind and executed per chunk over that
+// binding: the callback marshals the arg chunk to Arrow, runs the UDF over the bridge (scalarfn_execute on
+// the binding — which the bind resolved against `handle`, 0 for a connection-free GLOBAL scalar where the C#
+// side resolves by name against the global registry), and ingests the single-column result. Shared by
+// catalog-bound scalar UDFs (GetOrCreateScalarFunction) and load-time global scalars
+// (RegisterFabricatorGlobalFunctions).
+//
+// `return_type` is the function's DECLARED type, used only to register the entry (so catalog listings and
+// overload displays are accurate). SQLNULL there is the UNRESOLVED sentinel => registered as ANY and the
+// bind MUST supply a type. Either way the bind's answer is what the call site uses.
 static ScalarFunction BuildFabricatorScalarFunction(FabricatorHandle handle, const string &schema_name,
                                                   const string &fn_name, vector<LogicalType> arg_types,
                                                   vector<string> arg_names, LogicalType return_type,
                                                   bool is_volatile) {
-	scalar_function_t exec = [handle, schema_name, fn_name, arg_names](
-	                             DataChunk &args, ExpressionState &state, Vector &result) {
+	scalar_function_t exec = [arg_names](DataChunk &args, ExpressionState &state, Vector &result) {
 		auto &ctx = state.GetContext();
 		idx_t row_count = args.size();
 
@@ -484,14 +688,29 @@ static ScalarFunction BuildFabricatorScalarFunction(FabricatorHandle handle, con
 			appender.Append(args, 0, row_count, row_count);
 		}
 		ArrowArray array = appender.Finalize();
+		// ⚠ PRE-EXISTING DEFECT, fixed here rather than worked around: an Arrow NULL-typed child must report
+		// null_count == length, and DuckDB does not set it (ArrowNullData::Append only bumps row_count; its
+		// Finalize only clears n_buffers), so Apache.Arrow refuses the batch with "Length must equal null
+		// count". Reachable whenever an ANY-declared parameter is handed an untyped NULL literal —
+		// `fabricator_render('tpl', NULL)` failed this way long before the bind session existed, and no suite
+		// covered it (the one NULL in the suites sat in a VARCHAR-declared position, which DuckDB casts).
+		for (idx_t c = 0; c < actual_types.size() && (int64_t)c < array.n_children; c++) {
+			if (actual_types[c].id() == LogicalTypeId::SQLNULL && array.children[c]) {
+				array.children[c]->null_count = array.children[c]->length;
+			}
+		}
 
 		fabricator::ArrowProducer producer(actual_types, marshal_names, properties);
 		producer.AddBatch(array);
 		producer.Finish();
 
+		// The binding was resolved once, at bind, and is reused for every chunk. It rides the bound
+		// expression's FunctionData, which is the only channel a non-capturing-identity exec has.
+		auto &func_expr = state.expr.Cast<BoundFunctionExpression>();
+		auto &bind_data = func_expr.bind_info->Cast<FabricatorScalarBindData>();
 		ArrowArrayStream out;
 		std::memset(&out, 0, sizeof(out));
-		fabricator::ExecuteScalar(handle, schema_name, fn_name, *producer.Stream(), out);
+		fabricator::ScalarFnExecute(bind_data.holder->binding, *producer.Stream(), out);
 
 		// Single-column, row_count-row result -> the output vector (matching offsets).
 		fabricator::ArrowStreamReader reader(ctx, out);
@@ -519,8 +738,21 @@ static ScalarFunction BuildFabricatorScalarFunction(FabricatorHandle handle, con
 			t = LogicalType::ANY;
 		}
 	}
-	ScalarFunction fn(sig_types, return_type, exec);
+	// An UNRESOLVED declared return (the SQLNULL sentinel) registers as ANY — the same mapping the
+	// parameters above use for "accept anything", and the placeholder upstream uses for a bind-resolved
+	// return type (getvariable). FabricatorScalarBind then refuses if it is still unresolved after the bind.
+	if (return_type.id() == LogicalTypeId::SQLNULL) {
+		return_type = LogicalType::ANY;
+	}
+	ScalarFunction fn(sig_types, return_type, exec, FabricatorScalarBind);
 	fn.name = fn_name;
+	// Identity for the bind callback, which is a raw function pointer and cannot capture.
+	auto fn_info = make_shared_ptr<FabricatorScalarFunctionInfo>();
+	fn_info->handle = handle;
+	fn_info->schema = schema_name;
+	fn_info->func = fn_name;
+	fn_info->arg_names = arg_names;
+	fn.SetExtraFunctionInfo(std::move(fn_info));
 	// A remote UDF may be non-deterministic / side-effecting (VOLATILE => never folded) — the default. A
 	// function DECLARED pure (fabricator.volatile = "0" on its return field, e.g. hilbert_index / bucket) is
 	// CONSISTENT so constant args fold at plan time (partition pruning on `WHERE b = bucket(8, 'x')` depends
@@ -1044,7 +1276,7 @@ void FabricatorAggregateFinalize(Vector &state, AggregateInputData &aggr_input_d
 } // namespace
 
 // Builds an AggregateFunction whose state-vectorized callbacks marshal per-group int64 ids + Arrow batches to
-// the C# session over the agg_* ABI (ExecuteScalar's aggregate analog). `handle` = 0 for a connection-free
+// the C# session over the agg_* ABI (the scalar session's aggregate analog). `handle` = 0 for a connection-free
 // GLOBAL aggregate (C# resolves by name); `spillable` selects the bytes-in-blob mode (the callbacks branch on
 // the flag). Shared by catalog-bound aggregates (GetOrCreateAggregateFunction) + load-time global aggregates.
 static AggregateFunction BuildFabricatorAggregateFunction(FabricatorHandle handle, const string &schema_name,

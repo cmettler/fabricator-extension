@@ -377,10 +377,13 @@ public interface IBackendCatalog : IDisposable
     Schema GetFunctionReturnSchema(string schemaName, string functionName);
 
     /// <summary>
-    /// Applies a scalar function over an input batch: <paramref name="args"/> columns are the argument
-    /// values (in parameter order); returns one column of per-row results, typed as the return type.
+    /// Binds one scalar-function CALL SITE (ABI v80 — the successor to the removed stateless
+    /// <c>execute_scalar</c>). <paramref name="args"/> carries the call's arguments as seen at bind: PARTIAL
+    /// (only the constant slots are real — consult <see cref="ScalarBindArgs.IsConstant"/>) and PRE-CAST.
+    /// Returns a handle whose binding computes the result column for every chunk and whose result field may
+    /// depend on those arguments (null = the declared type stands). Disposed via <c>scalarfn_close</c>.
     /// </summary>
-    IArrowArrayStream ExecuteScalar(string schemaName, string functionName, IArrowArrayStream args);
+    ScalarBindingHandle ScalarFnBind(string schemaName, string functionName, ScalarBindArgs args);
 
     /// <summary>
     /// The Arrow schema describing a table-returning function's output columns.

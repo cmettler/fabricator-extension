@@ -321,16 +321,69 @@ typedef struct FabricatorVTable {
 	int32_t (*get_function_param_schema)(FabricatorHandle handle, const char *schema, const char *func,
 	                                     struct ArrowSchema *out, char **err);
 
-	// *out receives the Arrow schema whose single field = the scalar function's return type (a bare ArrowSchema).
+	// *out receives the Arrow schema whose single field = the scalar function's DECLARED return type (a bare
+	// ArrowSchema), read once per function when its catalog entry is materialized. A field of Arrow `null`
+	// type is the UNRESOLVED sentinel: the function declares no fixed return type and scalarfn_bind must
+	// supply one per call site. (Same sentinel/meaning as a SQLNULL *parameter*, which registers as ANY.)
+	// The volatility signal rides this field's metadata (fabricator.volatile = "0" => CONSISTENT).
 	int32_t (*get_function_return_schema)(FabricatorHandle handle, const char *schema, const char *func,
 	                                      struct ArrowSchema *out, char **err);
 
-	// Execute a scalar function over an input batch: `args` is an N-row stream whose
-	// columns are the argument values (in param order); *out receives an N-row stream
-	// with a single column = the per-row results (typed as the function's return).
-	// The managed side consumes `args`.
-	int32_t (*execute_scalar)(FabricatorHandle handle, const char *schema, const char *func,
-	                          struct ArrowArrayStream *args, struct ArrowArrayStream *out, char **err);
+	// -------------------------------------------------------------------------
+	// Scalar-function session (ABI v80). The session-handle successor to the
+	// stateless execute_scalar (removed at v80): scalarfn_bind resolves a per-CALL-SITE
+	// binding (result field + any bind state) once; scalarfn_execute reuses that binding
+	// for every chunk. Mirrors tablefn_bind / tablefn_execute / tablefn_close, and exists
+	// for the same two reasons: a result type that depends on the call's constant
+	// arguments, and somewhere to park work done once at bind instead of per chunk.
+	// -------------------------------------------------------------------------
+
+	// Bind one scalar-function call site. `args` (nullable) is a 1-row Arrow stream of the call's arguments,
+	// in param order, consumed by the managed side.
+	//
+	// ⚠ UNLIKE tablefn_bind, THE VALUES ARE PARTIAL. A table function's arguments must be constant; a
+	// scalar's need not be (`f(t.col)` is legal), and DuckDB hands the bind callback argument EXPRESSIONS
+	// rather than values. `arg_constant` is a MASK — one char per argument, '1' = a folded constant whose
+	// value is real, '0' = a runtime expression whose slot holds a NULL PLACEHOLDER (nullable/empty => treat
+	// every argument as runtime). A '0' placeholder is NOT the same as a '1' slot holding an explicit NULL
+	// literal, and a provider that reads a value without consulting the mask will read a placeholder as data.
+	// (The mask is a separate parameter rather than field metadata on `args` deliberately: metadata would
+	// have to out-live the exported schema, which is the Arrow-lifetime hazard this codebase has already
+	// paid for once, and a field may already carry an extension-type marker there.)
+	//
+	// ⚠ THE VALUES ARE ALSO PRE-CAST. DuckDB runs CastToFunctionArguments AFTER the bind callback, so a
+	// literal 1.0 bound to a declared INTEGER parameter arrives here as DOUBLE and arrives at
+	// scalarfn_execute as INTEGER. Bind values are for DECIDING; the execute batch is the authoritative
+	// typed view for COMPUTING.
+	//
+	// *out_schema receives a bare ArrowSchema whose single field is the resolved result — the same carrier
+	// get_function_return_schema uses (NOT tablefn_bind's zero-row stream: a scalar needs one field, and the
+	// stream form would drag in PopulateReturnSchema, which SETS THE AMBIENT HOST-FS OPENER as a side effect
+	// and so cannot run inside a statement that is already doing host-FS IO — measured, see docs/abi-history.md
+	// §v80). A field of Arrow `null` type here is the SAME UNRESOLVED SENTINEL as on the declared side, read
+	// in the other direction: "my result IS the declared type", which the host already holds, so a
+	// fixed-return function costs no work at bind. If BOTH are unresolved the call is refused by name at bind.
+	// *out_binding receives an opaque binding handle, reused by scalarfn_execute for every chunk and freed
+	// via scalarfn_close.
+	int32_t (*scalarfn_bind)(FabricatorHandle handle, const char *schema, const char *func,
+	                         struct ArrowArrayStream *args, const char *arg_constant,
+	                         struct ArrowSchema *out_schema, FabricatorHandle *out_binding, char **err);
+
+	// Execute a bound scalar function over one chunk: `args` is an N-row stream whose columns are the
+	// argument values (in param order, post-cast); *out receives an N-row stream with a single column = the
+	// per-row results, typed as the field the binding reported. The managed side consumes `args`.
+	//
+	// The constant arguments are deliberately REPEATED here rather than being read off the binding: which
+	// arguments are constant is a property of the CALL SITE, so omitting them would make column i stop
+	// meaning parameter i, differently per call site. Uniformity keeps the param schema the single
+	// positional contract. (Cost: a constant column is materialized as N values per chunk — Arrow has no
+	// constant encoding.)
+	int32_t (*scalarfn_execute)(FabricatorHandle binding, struct ArrowArrayStream *args,
+	                            struct ArrowArrayStream *out, char **err);
+
+	// Release a binding handle from scalarfn_bind. Idempotent; safe with nullptr. Best-effort
+	// (bind-data teardown must not throw).
+	int32_t (*scalarfn_close)(FabricatorHandle binding, char **err);
 
 	// *out receives the Arrow schema of a table-returning function's output columns (a bare ArrowSchema).
 	// `args` (nullable) is a 1-row Arrow STREAM of the constant call arguments (in param order; consumed by
@@ -590,8 +643,8 @@ typedef struct FabricatorVTable {
 	// (same shape as the catalog functions metadata; return_type is meaningful for kind='scalar', empty
 	// otherwise). For each, the host fetches the precise Arrow param/return schema via the existing
 	// get_function_param_schema / get_function_return_schema entries with HANDLE = 0 (the global marker; C#
-	// routes a 0 handle to the global registry by name), and dispatches execution via execute_scalar with
-	// handle = 0. So global SCALAR functions add NO execution/schema ABI — only this enumeration entry.
+	// routes a 0 handle to the global registry by name), and binds/dispatches execution via scalarfn_bind
+	// with handle = 0. So global SCALAR functions add NO execution/schema ABI — only this enumeration entry.
 	int32_t (*list_global_functions)(struct ArrowArrayStream *out, char **err);
 
 	// -------------------------------------------------------------------------
@@ -1089,7 +1142,7 @@ typedef struct FabricatorHostServices {
 // state blob is this many bytes + a 4-byte length prefix). Serialize() must fit within it.
 #define FABRICATOR_AGG_SPILL_CAP 1024
 
-#define FABRICATOR_ABI_VERSION 79
+#define FABRICATOR_ABI_VERSION 80
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(FabricatorVTable) as seen

@@ -1,4 +1,4 @@
-# ABI history — prior versions v16–v79
+# ABI history — prior versions v16–v80
 
 > Moved VERBATIM out of `CLAUDE.md` on 2026-07-29 (conservative split — see the commit message).
 > Append-only as-built history; the live summary + pointers stay in `CLAUDE.md`.
@@ -11,6 +11,163 @@
 > entries and the `table_*` session; v73: `table_info`/`table_stats` re-carried as ONE typed JSON doc each,
 > parsed with our own vcpkg yyjson, retiring the `ReadCapabilityFlag` string-find). v74 below is the
 > follow-on that finished the same job for ALTER.
+
+## v80 (2026-08-23) — the `scalarfn_*` session: a scalar's return type resolved at BIND
+
+**BREAKING** (`execute_scalar` REMOVED, three entries in its place — a mid-struct change, so every later slot
+shifts; the version bump is what makes a mismatched loadable/bridge pair loud at boot instead of calling the
+next entry through the wrong signature):
+
+```c
+int32_t (*scalarfn_bind)(handle, schema, func, args, arg_constant, out_schema, out_binding, err);
+int32_t (*scalarfn_execute)(binding, args, out, err);
+int32_t (*scalarfn_close)(binding, err);
+```
+
+**WHY.** A scalar function's return type was fixed at REGISTRATION and nowhere else: the host read
+`get_function_return_schema(handle, schema, func)` — keyed on the NAME alone, no call site, no argument types —
+memoized it on the catalog entry for that entry's LIFE, and passed no bind callback at all, so DuckDB's
+per-call-site bind hook went unused. A provider could therefore not express "my result type depends on this
+call's arguments", and had nowhere to park work done once per call site instead of once per chunk. Table
+functions had had both since v27 (`tablefn_bind` → binding → `tablefn_execute`); this is the same shape for
+scalars, and the user's framing was exactly that: *"scalars should support the bind callback like the table
+functions"*.
+
+**DuckDB fully supports it and always did** — `FunctionBinder::BindScalarFunction` takes the function BY VALUE
+(`function_binder.cpp:645`), hands that per-call-site copy to the bind callback as a non-const reference, and
+re-reads `bound_function.GetReturnType()` AFTER the callback returns (`:678`). `getvariable` is the upstream
+precedent for the exact shape we now use: registered `LogicalType::ANY`, bind folds a constant argument and
+calls `SetReturnType(value.type())`.
+
+**THE OPTIONAL DECLARED TYPE, and why it is not just ergonomics.** `IScalarFunction.Result` became `Field?`.
+Declared ⇒ the catalog entry registers that type (so `duckdb_functions()` and overload displays stay
+accurate); absent ⇒ an Arrow `null`-typed field crosses as the UNRESOLVED SENTINEL, the entry registers as
+`ANY`, and the bind must supply a type or the call is refused BY NAME at bind (an unresolved `ANY` flowing
+onward gets no further validation — `CheckTemplateTypesResolved` guards only `TEMPLATE` — and would fail far
+from its cause).
+
+**⚠ THE SENTINEL IS READ IN BOTH DIRECTIONS, and that is what keeps the common case free.** A binding may
+report `Result = null`, which means *"my result IS the declared type"* — the host already holds it, so it
+simply leaves the registered return type alone. Without that, `StaticScalarBinding` would have had to read
+the definition's `Result` at every call site, and for a discovered SQL Server UDF **that property is a round
+trip to `INFORMATION_SCHEMA`** — turning a fixed-return function into one metadata query per call site to
+re-learn something nobody had forgotten. Measured from the source, not guessed: `FunctionParameters` opens a
+connection and queries every call, and it is not cached.
+
+**⚠ UNLIKE `tablefn_bind`, THE ARGUMENT VALUES ARE PARTIAL — the one place the two sessions genuinely
+differ.** A table function's arguments MUST be constant, and DuckDB pre-evaluates them into
+`TableFunctionBindInput::inputs`; a scalar's need not be (`f(t.col)` is legal) and the bind callback is handed
+argument EXPRESSIONS. So the host folds what it can (`IsFoldable` → `ExpressionExecutor::EvaluateScalar`) and
+passes `arg_constant`, a MASK of one char per argument: `'1'` = a folded constant whose value is real, `'0'` =
+a runtime expression whose slot holds a NULL PLACEHOLDER. **A `'0'` placeholder is indistinguishable from a
+`'1'` slot holding an explicit NULL literal by looking at the value**, so a provider that reads a value
+without consulting the mask reads a placeholder as data.
+
+- **The mask is a separate PARAMETER rather than field metadata on `args`, deliberately.** Metadata would have
+  to out-live the exported schema — the Arrow-lifetime class this codebase has already paid for once (the
+  `ArrowProducer::Release` use-after-free) — and a field may already carry an extension-type marker there.
+- **A folding failure is not a bind failure.** `1/0` is foldable and throws; DuckDB's own constant-folding
+  rule swallows that and leaves the expression to be evaluated at execution, so the slot is reported as
+  runtime and the error surfaces exactly where it does today.
+- **`ParameterNotResolvedException` is required, not defensive.** `PREPARE p AS SELECT f(?)` cannot know what
+  `f` returns until the parameter is bound; both upstream precedents throw it, and without it the parameter
+  arrives as an UNKNOWN-typed placeholder and is silently reported as a runtime slot.
+
+**⚠ BIND SEES PRE-CAST ARGUMENTS — `CastToFunctionArguments` runs AFTER the bind callback**
+(`function_binder.cpp:676` vs `:654`). We narrow that as far as it can be narrowed: an argument is marshaled
+as its DECLARED parameter type wherever that is concrete, since DuckDB is about to insert exactly that cast,
+which makes the bind's view AGREE with the execute batch. Only an `ANY`-declared parameter is left pre-cast,
+because there no cast happens and the expression's own type is what execute sees too. The residual rule
+stands: bind values are for DECIDING, the execute batch is authoritative for COMPUTING.
+
+**⚠⚠ A SCALAR BIND MUST NOT ESTABLISH THE AMBIENTS (txn + host-FS opener), AND THAT IS THE ONE PLACE IT
+DIFFERS FROM EVERY OTHER BIND IN THE TREE. Doing what every other bind does SEGFAULTED THE PROCESS.**
+`FabricatorSetActiveTxn` also calls `SetActiveOpener`, pushing the binding context as the ambient. For sqlgen,
+`tablefn`, and the ALTER paths that is exactly right — each binds its statement's OWN source. A SCALAR binds
+*wherever it is called*, including inside a **nested host query that an OUTER operation is running while that
+outer operation holds the ambient**. OPTIMIZE's recluster is precisely that shape: it issues a host query
+whose `ORDER BY` calls `hilbert_index`, and the outer Delta write keeps doing host-FS IO afterwards — so
+pointing the ambient at the inner connection's `ClientContext` leaves that outer IO resolving a context that
+is gone. The dangling-opener use-after-free this codebase has already paid for twice (`table_stats`,
+`RollbackTransaction`).
+
+Measured with the call as the ONLY variable: `verify_delta_clustered_optimize` died at `OPTIMIZE main.c1` with
+**exit 127, and 139 (SIGSEGV) on its accumulated leg — not one line of output**, no assertion, no stderr; it
+passes **147 assertions** without the call, and a shell repro flipped the same way. Nothing needs the ambients
+today *by construction rather than by luck*: a discovered SQL UDF takes the DEFAULT binding, which resolves
+nothing at bind, and every custom scalar shipped is pure compute. If a provider ever does need its connection
+at bind, the fix is a MANAGED-side push/restore scope (the `InterruptScope` shape) — the host cannot restore
+it, because the ambient is an AsyncLocal the host can only overwrite.
+
+**⚠⚠ AND THE FIRST "CONFIRMATION" OF THIS WAS CONFOUNDED — worth more than the fix.** The result schema also
+crosses as a bare `ArrowSchema` rather than `tablefn_bind`'s zero-row STREAM, because reading a stream's
+schema host-side goes through `PopulateReturnSchema`, which sets the same ambient. That change is right on its
+own merits (simpler, matches what `get_function_return_schema` has always used, same `ReadSchemaColumns` so
+VARIANT imports identically, and it removes a SECOND instance of the hazard) — **but it did not fix the
+crash, and it was written up as though it had.** The evidence was the exit code moving 127 → 1, which looked
+decisive and was caused by an unrelated second bug found later: the null-`Result` deref had silently dropped
+every managed global, so `hilbert_index` no longer existed and the crash was simply *unreachable*. A clean
+error where a crash used to be read as "fixed" when it actually meant "no longer executed".
+
+- **The rule: when a fix changes a failure's SHAPE rather than removing it, ask what else changed.** Exit
+  1-instead-of-127 is not a pass; here it was a different bug masking the first one.
+- **A helper's SIDE EFFECTS are part of its contract.** Nothing in `PopulateReturnSchema`'s name or signature
+  says it mutates a process-wide ambient, and "the proven import path" was proven for callers that own their
+  statement.
+- ⚠ Two wrong repro attempts are worth recording, both from guessing at the mechanism instead of bisecting: a
+  two-key `CREATE TABLE … SORTED BY` (PASSED — the CREATE's sort does not go through the recluster's host
+  query) and `hilbert_index` over window functions (PASSED). The bisect found the statement in minutes; the
+  missing ingredient for the shell repro was the **DELETE** (deletion vectors), without which the recluster
+  takes a different path.
+
+**⚠ A LATENT UPSTREAM INCOMPATIBILITY THIS MADE REACHABLE — on BOTH crossings, and the execute half was
+BROKEN BEFORE ANY OF THIS.** `ArrowNullData::Append` only bumps `row_count` and its `Finalize` only clears
+`n_buffers`, so DuckDB exports an Arrow NULL-typed array with `null_count = 0` — and Apache.Arrow refuses it
+(*"Length must equal null count"*), which is what the Arrow spec requires.
+
+- At BIND it surfaced on `fabricator_render(NULL, '{"a":1}')`, whose first parameter is declared VARCHAR: at
+  bind the untyped NULL literal is still `SQLNULL`, at execute it has been cast. The declared-type marshaling
+  above removes that case entirely.
+- At EXECUTE it is reachable whenever an **`ANY`-declared** parameter is handed an untyped NULL, because such
+  a parameter is never cast — so `fabricator_render('tpl', NULL)` **failed on `HEAD` too**, and had done for
+  as long as the function existed. `CfRenderFunction.Invoke`'s own comment says its column may be *"a
+  NullArray"*, i.e. the author expected it to work. **Nothing covered it**: the one NULL in the suites sat in
+  the VARCHAR-declared position, which DuckDB casts, which is precisely why the ANY position stayed untested.
+- Fixed on both sides by patching `null_count = length` on null-typed children, rather than by dropping or
+  substituting the argument — *"you passed an untyped NULL"* is exactly what a bind resolving a result type
+  needs to know. Verified pre-existing by reading `HEAD`'s marshal (no such patch) before claiming it.
+
+**⚠ THE COMPILER WARNED AND THE BUILD CHECK MISSED IT — `Field Result` → `Field? Result` produced CS8602 at
+two sites, and one of them silently dropped EVERY managed global function.** `Bootstrap`'s
+`list_global_functions` enumeration did `fn.Result.DataType.Name`; one function with a null `Result` throws,
+the whole crossing fails, and the host's registrar registers nothing — so `hilbert_index`, `bucket`,
+`fabricator_render` and the `fabricator_delta_*` family all vanished from `duckdb_functions()` at once, with
+no error anywhere. (The visible symptom was `OPTIMIZE` failing with *"Scalar Function with name
+hilbert_index does not exist!"*, one layer away from the cause — the same shape as the Apache.Arrow
+zero-field `StructType` failure recorded for the unified parameter protocol.) **Nullable warnings ARE the
+finding when a member becomes nullable**: the build was checked with `grep ": error"` and read as clean, and
+`dotnet build` reports nothing on an up-to-date project, so `--no-incremental` is required to see them at all.
+
+**THE CONSTANT ARGUMENTS ARE REPEATED AT EXECUTE**, in full, materialised for every row — not omitted on the
+grounds that the binding already saw them. Which arguments are constant is a property of the CALL SITE, so
+omitting them would make column `i` stop meaning parameter `i`, differently per call site, and
+`args.Column(i)` would silently read the wrong column. Uniformity keeps the parameter schema the single
+positional contract. The cost is real and stated rather than hidden: Arrow has no constant encoding, so a
+constant column is N materialised values per chunk (for VARCHAR, N string copies). The escape, if it is ever
+measured to matter, is a binding-declared opt-out mirroring `SupportsProjectionPushdown` — deliberately NOT
+built, since until a provider is demonstrably hurt it is a flag with no correct use and no honest gate.
+
+Managed: `IScalarFunction.Result` is now `Field?` and `IScalarFunction.Bind(ScalarBindArgs)` is a
+default-interface method returning `StaticScalarBinding` — so a fixed-return function implements NOTHING new.
+New in `Fabricator.Abstractions`: `IScalarFunctionBinding`, `ScalarBindArgs` (carrying `IsConstant`),
+`ScalarBindingHandle` (binding + definition — the definition only for the zero-input fallback that has to
+type an empty result stream). New in `Fabricator.Bridge`: `ScalarBindingRunner`, the single per-chunk loop,
+which replaced THREE copy-pasted copies of it (the global registry, `CatalogFunctionSet`, and
+`SqlServerBackend`), and `ScalarFunctionMetadata.DeclaredReturnField`. `IBackendCatalog.ExecuteScalar` →
+`ScalarFnBind`. C++: `FabricatorScalarBind` + `FabricatorScalarFunctionInfo` (identity for a bind callback
+that is a raw function pointer and cannot capture) + `ScalarBindingHolder` (refcounted, destructor →
+`scalarfn_close`; refcounted because `FunctionData::Copy` means several copies address ONE managed binding) in
+`src/catalog/fabricator_schema_entry.cpp`.
 
 ## v79 (2026-08-22) — the `lateral_*` session: row-mapped (correlated LATERAL) functions
 

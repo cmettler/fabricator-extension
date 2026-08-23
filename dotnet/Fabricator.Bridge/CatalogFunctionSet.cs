@@ -129,7 +129,8 @@ public sealed class CatalogFunctionSet
         }
         foreach (var f in _scalars.Values)
         {
-            Emit(f.SchemaName, f.Name, "scalar", f.Parameters.FieldsList.Count, f.Result.DataType.Name);
+            // "ANY" when the function declares no fixed return type (resolved per call site at scalarfn_bind).
+            Emit(f.SchemaName, f.Name, "scalar", f.Parameters.FieldsList.Count, f.Result?.DataType.Name ?? "ANY");
         }
         foreach (var f in _tables.Values)
         {
@@ -222,7 +223,7 @@ public sealed class CatalogFunctionSet
     {
         if (TryScalar(schema, func, out var fn))
         {
-            return new Schema(new[] { ScalarFunctionMetadata.TagVolatility(fn.Result, fn) }, null);
+            return new Schema(new[] { ScalarFunctionMetadata.DeclaredReturnField(fn) }, null);
         }
         if (TryAggregate(schema, func, out var agg))
         {
@@ -231,9 +232,9 @@ public sealed class CatalogFunctionSet
         return null;
     }
 
-    /// <summary>Runs a scalar over the argument stream. Consumes/disposes <paramref name="args"/>.</summary>
-    public IArrowArrayStream? ExecuteScalar(string schema, string func, IArrowArrayStream args) =>
-        TryScalar(schema, func, out var fn) ? GlobalFunctions.ExecuteScalar(fn, args) : null;
+    /// <summary>Binds a scalar call site, or null when this set declares no such function.</summary>
+    public ScalarBindingHandle? BindScalar(string schema, string func, ScalarBindArgs args) =>
+        TryScalar(schema, func, out var fn) ? new ScalarBindingHandle(fn, fn.Bind(args)) : null;
 
     /// <summary>
     /// Output schema of a table function, resolved from its constant args — this is the whole reason the

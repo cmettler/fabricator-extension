@@ -112,8 +112,8 @@ public sealed class StubBackend : IBackend
         public Schema GetFunctionReturnSchema(string schemaName, string functionName) =>
             new Schema(new[] { new Field("result", StringType.Default, nullable: true) }, null);
 
-        public IArrowArrayStream ExecuteScalar(string schemaName, string functionName, IArrowArrayStream args) =>
-            EmptyStringTable("result");
+        public ScalarBindingHandle ScalarFnBind(string schemaName, string functionName, ScalarBindArgs args) =>
+            throw new NotSupportedException("stub backend: no scalar functions.");
 
         public Schema GetFunctionOutputSchema(string schemaName, string functionName, RecordBatch? args = null) =>
             new Schema(new[] { new Field("result", StringType.Default, nullable: true) }, null);

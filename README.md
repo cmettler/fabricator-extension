@@ -1594,6 +1594,41 @@ catalog like discovered ones. Implement `ICatalogScalarFunction`, `ICatalogTable
 `ICatalogInOutFunction`, or `ICatalogAggregateFunction` (in `Fabricator.Bridge`) and register them in
 `CustomFunctions` — each receives an Arrow `RecordBatch` and returns Arrow, fully vectorized.
 
+#### A scalar's return type can depend on its arguments
+
+A scalar function declares `Field? Result`. Declare it when the return type is fixed (the usual case — a
+discovered SQL Server UDF's return type is metadata) and it is used for the catalog entry, so
+`duckdb_functions()` reports it. Leave it `null` and override `Bind` to resolve the type **per call site**
+from the call's constant arguments, the way `strptime` picks `TIMESTAMP` vs `TIMESTAMP_TZ` from its format
+string:
+
+```csharp
+public Field? Result => null;                     // resolved at bind
+
+public IScalarFunctionBinding Bind(ScalarBindArgs args)
+{
+    // ⚠ Only a CONSTANT argument has a value here — ConstantArray returns null otherwise.
+    var kind = (args.ConstantArray(1) as StringArray)?.GetString(0);
+    return new MyBinding(kind switch { "int" => Int64Type.Default, _ => StringType.Default });
+}
+```
+
+The binding also gives you somewhere to do work **once per call site** instead of once per chunk (parse a
+format string, compile a regex), which the previous stateless model had no room for.
+
+Two rules the compiler cannot enforce:
+
+- **Only constant arguments have values at bind.** A scalar may be called as `f(t.col)`, so
+  `ScalarBindArgs.IsConstant(i)` is the guard; a non-constant slot holds a NULL placeholder that looks
+  exactly like an explicit `NULL` literal. (Table functions differ here — *their* arguments must be
+  constant.)
+- **Bind values are pre-cast; the execute batch is authoritative.** DuckDB applies argument casts after the
+  bind, so a literal `1.0` passed to a declared `INTEGER` parameter is a DOUBLE at bind and an INTEGER at
+  `Invoke`. Use bind values to *decide*, the batch to *compute*.
+
+A binding returning `Result = null` means "the declared type stands" — the cheap answer, and what the default
+binding does, so a fixed-return function implements nothing new.
+
 ### Table-in-out (`fn_each`)
 
 A discovered TVF or stored proc *also* gets a sibling `fn_each(<input table>)` that applies the function

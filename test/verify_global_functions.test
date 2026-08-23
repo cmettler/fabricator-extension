@@ -288,3 +288,120 @@ SELECT n, value FROM fabricator_mix((SELECT * FROM (VALUES (1),(2)) v(n)), 3) OR
 ----
 1	3
 2	6
+
+# ============================================================================================
+# ABI v80 — A SCALAR'S RETURN TYPE RESOLVED AT BIND (docs/abi-history.md §v80)
+#
+# `fabricator_parse(text, type_name)` declares NO fixed return type and resolves one per CALL SITE from
+# the constant `type_name`. ONE registered function, so the pair of typeof() assertions below is the whole
+# feature: a build that fixes the return type at registration CANNOT make them differ, whatever it reports.
+#
+# ⚠ The POSITIVE CONTROL is the fixed-return assertions ABOVE (fabricator_render etc.). Without them
+# "two calls report two types" would pass equally on a build where the declared path had stopped working
+# and everything resolved at bind — and the declared path is what every other scalar in the product uses.
+# ============================================================================================
+
+# The defining property: the same function, two constant type names, two DuckDB types.
+query II
+SELECT typeof(fabricator_parse('42', 'bigint')), typeof(fabricator_parse('42', 'double'));
+----
+BIGINT	DOUBLE
+
+# VARCHAR too, and it must NOT be the accidental answer — see the arithmetic assertions below, which a
+# string result cannot satisfy.
+query I
+SELECT typeof(fabricator_parse('42', 'varchar'));
+----
+VARCHAR
+
+# ⚠ THE TYPE IS REAL, NOT COSMETIC. typeof() alone would pass if the value were still a string carrying a
+# mislabelled type; arithmetic is what proves DuckDB got a genuine BIGINT/DOUBLE it can compute on.
+query II
+SELECT fabricator_parse('42', 'bigint') + 1, fabricator_parse('1.5', 'double') * 2;
+----
+43	3.0
+
+# Vectorised over real rows, with the constant argument repeated in every row of the batch (which is the
+# documented execute-side contract: column i always means parameter i, constant or not).
+query I
+SELECT sum(fabricator_parse(s, 'bigint')) FROM (VALUES ('1'),('2'),('39')) v(s);
+----
+42
+
+# An unparseable value is NULL, not an error — the binding decides the TYPE, the rows decide the values.
+query I
+SELECT fabricator_parse('not a number', 'bigint') IS NULL;
+----
+true
+
+# The type argument must be CONSTANT: the result type is part of the PLAN, so it cannot depend on row data.
+# This is the ScalarBindArgs.IsConstant guard, and the error must name the constraint rather than surfacing
+# as a placeholder being read as data.
+statement error
+SELECT fabricator_parse(s, s) FROM (VALUES ('bigint')) v(s);
+----
+must be a constant
+
+# An unknown type name is refused AT BIND, naming what it got.
+statement error
+SELECT fabricator_parse('42', 'nosuchtype');
+----
+unsupported type_name
+
+# A constant NULL type name is refused too — and this is the case that separates "the slot is constant" from
+# "the slot has a usable value": IsConstant is TRUE here (an explicit NULL literal IS a folded constant), so
+# the binding has to reject the value itself rather than relying on the mask.
+statement error
+SELECT fabricator_parse('42', NULL);
+----
+must not be NULL
+
+# ⚠ AN UNTYPED NULL IN AN *ANY-DECLARED* POSITION. This was BROKEN BEFORE the bind session existed and no
+# suite covered it: DuckDB exports an Arrow null-typed array with null_count = 0 and Apache.Arrow refuses it
+# ("Length must equal null count"), so `fabricator_render('tpl', NULL)` failed at execute. The one NULL the
+# suites did carry (line ~54, the first argument) sits in a VARCHAR-declared position, which DuckDB CASTS —
+# which is exactly why the ANY position stayed untested. It now has to work on BOTH crossings: at bind the
+# literal is still SQLNULL (argument casts run after the bind callback), and at execute it still is, because
+# an ANY parameter is never cast.
+query I
+SELECT fabricator_render('x{{ a }}', NULL);
+----
+x
+
+# duckdb_functions() reports the UNRESOLVED declaration as ANY — the honest answer for a function whose
+# return type does not exist until a call site does.
+query I
+SELECT return_type FROM duckdb_functions() WHERE function_name = 'fabricator_parse';
+----
+ANY
+
+# ⚠ PREPARED STATEMENTS — the ParameterNotResolvedException path, which is a REQUIREMENT and not defensive.
+# A parameter is untyped and unfoldable at PREPARE time, so a bind that resolves its result type from a
+# constant cannot answer yet; throwing that exception is how DuckDB is told to defer. Two shapes:
+#
+#   (a) the VALUE is a parameter, the type name is constant => binds at PREPARE. The `+ 1` is the real
+#       assertion: arithmetic only type-checks if the result really is BIGINT.
+statement ok
+PREPARE p80a AS SELECT fabricator_parse(?, 'bigint') + 1;
+
+query I
+EXECUTE p80a('41');
+----
+42
+
+#   (b) the TYPE NAME itself is a parameter => it cannot be known at PREPARE, and is a folded constant at
+#       EXECUTE. Without the deferral the parameter would arrive UNKNOWN-typed, be reported as a RUNTIME slot,
+#       and the bind would refuse it as "not a constant" — a wrong answer for a value that is knowable by the
+#       time it matters. `typeof` is what proves the type was resolved from the parameter's VALUE.
+statement ok
+PREPARE p80b AS SELECT typeof(fabricator_parse('42', ?));
+
+query I
+EXECUTE p80b('double');
+----
+DOUBLE
+
+query I
+EXECUTE p80b('bigint');
+----
+BIGINT

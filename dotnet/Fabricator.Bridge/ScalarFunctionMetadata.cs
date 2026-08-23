@@ -1,5 +1,6 @@
 using System.Collections.Generic;
 using Apache.Arrow;
+using Apache.Arrow.Types;
 
 namespace Fabricator.Bridge;
 
@@ -19,6 +20,15 @@ public static class ScalarFunctionMetadata
 
     /// <summary>Tags <paramref name="result"/> per the function's <see cref="IScalarFunction.IsVolatile"/>;
     /// a VOLATILE function's field passes through untouched (absent = volatile).</summary>
+    /// <summary>
+    /// The field to report for a function's DECLARED return type: its <see cref="IScalarFunction.Result"/>
+    /// tagged with the volatility marker, or the UNRESOLVED SENTINEL (an Arrow <c>null</c>-typed field) when
+    /// the function declares none. The host registers that sentinel as <c>ANY</c> and then requires the bind
+    /// to resolve a type per call site.
+    /// </summary>
+    public static Field DeclaredReturnField(IScalarFunction fn) =>
+        TagVolatility(fn.Result ?? new Field("result", NullType.Default, nullable: true), fn);
+
     public static Field TagVolatility(Field result, IScalarFunction fn)
     {
         if (fn.IsVolatile)

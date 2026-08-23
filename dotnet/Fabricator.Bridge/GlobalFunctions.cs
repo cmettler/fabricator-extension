@@ -123,7 +123,7 @@ public static class GlobalFunctions
     {
         // A pure scalar's field carries the CONSISTENT tag (fabricator.volatile = "0") so the C++
         // registration folds constants — see ScalarFunctionMetadata.
-        if (ScalarMap.Value.TryGetValue(name, out var s)) { return ScalarFunctionMetadata.TagVolatility(s.Result, s); }
+        if (ScalarMap.Value.TryGetValue(name, out var s)) { return ScalarFunctionMetadata.DeclaredReturnField(s); }
         if (AggregateMap.Value.TryGetValue(name, out var a)) { return a.Result; }
         throw new ArgumentException($"fabricator: global function '{name}' has no scalar return type");
     }
@@ -197,28 +197,11 @@ public static class GlobalFunctions
     private static IReadOnlyDictionary<string, IScalarFunction> BuildScalars() =>
         Build<IScalarFunction>(b => b.GlobalScalarFunctions, f => f.Name, "scalar");
 
-    /// <summary>
-    /// Runs a scalar function over an Arrow argument stream — one output batch per non-empty input batch, the
-    /// result column typed by the function's <see cref="IScalarFunction.Result"/>. Shared by the global
-    /// execute_scalar (handle-0) path; mirrors the catalog scalar loop. Consumes + disposes <paramref name="args"/>.
-    /// </summary>
-    public static IArrowArrayStream ExecuteScalar(IScalarFunction fn, IArrowArrayStream args)
+    /// <summary>Bind a global scalar call site by name (the handle-0 scalarfn_bind path); throws if none is
+    /// registered.</summary>
+    public static ScalarBindingHandle BindScalar(string name, ScalarBindArgs args)
     {
-        using var input = args;
-        var batches = new List<RecordBatch>();
-        Schema? resultSchema = null;
-        RecordBatch? inBatch;
-        while ((inBatch = input.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult()) is not null)
-        {
-            if (inBatch.Length == 0)
-            {
-                continue;
-            }
-            var resultArray = fn.Invoke(inBatch);
-            resultSchema ??= new Schema(new[] { new Field("result", resultArray.Data.DataType, nullable: true) }, null);
-            batches.Add(new RecordBatch(resultSchema, new[] { resultArray }, resultArray.Length));
-        }
-        resultSchema ??= new Schema(new[] { new Field("result", fn.Result.DataType, nullable: true) }, null);
-        return new InMemoryArrayStream(resultSchema, batches);
+        var fn = ResolveScalar(name);
+        return new ScalarBindingHandle(fn, fn.Bind(args));
     }
 }

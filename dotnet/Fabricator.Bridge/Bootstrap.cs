@@ -63,7 +63,7 @@ public static unsafe class Bootstrap
             return new InMemoryArrayStream(schema, new[] { batch });
         });
 
-        vtable->AbiVersion = 79;
+        vtable->AbiVersion = 80;
         vtable->OpenCatalog = &OpenCatalog;
         vtable->CloseCatalog = &CloseCatalog;
         vtable->ExecuteQuery = &ExecuteQuery;
@@ -86,7 +86,9 @@ public static unsafe class Bootstrap
         vtable->BuildConnectionString = &BuildConnectionString;
         vtable->GetFunctionParamSchema = &GetFunctionParamSchema;
         vtable->GetFunctionReturnSchema = &GetFunctionReturnSchema;
-        vtable->ExecuteScalar = &ExecuteScalar;
+        vtable->ScalarFnBind = &ScalarFnBind;
+        vtable->ScalarFnExecute = &ScalarFnExecute;
+        vtable->ScalarFnClose = &ScalarFnClose;
         vtable->GetFunctionOutputSchema = &GetFunctionOutputSchema;
         vtable->AggOpen = &AggOpen;
         vtable->AggUpdate = &AggUpdate;
@@ -1235,9 +1237,63 @@ public static unsafe class Bootstrap
         }
     }
 
+    // -------------------------------------------------------------------------
+    // Scalar-function session (ABI v80) — the successor to the removed stateless execute_scalar. Bind resolves
+    // a per-CALL-SITE binding (result field + any bind state); execute reuses it per chunk; close frees it.
+    // Mirrors TableFnBind / TableFnExecute / TableFnClose.
+    // -------------------------------------------------------------------------
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static int ExecuteScalar(nint handle, byte* schema, byte* func, CArrowArrayStream* args,
-                                     CArrowArrayStream* outStream, byte** err)
+    private static int ScalarFnBind(nint handle, byte* schema, byte* func, CArrowArrayStream* args,
+                                    byte* argConstant, CArrowSchema* outSchema, nint* outBinding, byte** err)
+    {
+        try
+        {
+            if (outSchema is null || outBinding is null)
+            {
+                return FabricatorStatus.InvalidArgument;
+            }
+            // `args` (nullable) is a 1-row stream of the call's arguments, read synchronously below. The values
+            // are PARTIAL: `argConstant` is a mask, one char per argument, '1' = a folded constant whose value
+            // is real, '0' = a runtime expression whose slot holds a NULL placeholder.
+            RecordBatch? argsBatch = null;
+            if (args is not null)
+            {
+                using var argStream = CArrowArrayStreamImporter.ImportArrayStream(args); // we own it
+                argsBatch = argStream.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult();
+            }
+            var mask = Marshal.PtrToStringUTF8((nint)argConstant) ?? string.Empty;
+            var constant = new bool[argsBatch?.ColumnCount ?? 0];
+            for (int i = 0; i < constant.Length && i < mask.Length; i++)
+            {
+                constant[i] = mask[i] == '1';
+            }
+            var bindArgs = new ScalarBindArgs(argsBatch, constant);
+            var f = Marshal.PtrToStringUTF8((nint)func) ?? string.Empty;
+            // handle == 0 => a connection-free GLOBAL scalar: resolve from the global registry by name.
+            var bound = handle == 0
+                ? GlobalFunctions.BindScalar(f, bindArgs)
+                : (Handles.Resolve<IBackendCatalog>(handle) ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty))
+                    .ScalarFnBind(Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty, f, bindArgs);
+            // Export the resolved result as a BARE ArrowSchema — the carrier get_function_return_schema uses.
+            // ⚠ NOT tablefn_bind's zero-row stream: reading a stream's schema host-side goes through
+            // PopulateReturnSchema, which clobbers the ambient host-FS opener, and a scalar binds wherever it is
+            // called — including underneath a statement already doing host-FS IO. A null-typed field here is the
+            // UNRESOLVED sentinel, "the declared type stands"; the host then keeps what it registered.
+            var resultField = bound.ResolvedResult ?? new Field("result", NullType.Default, nullable: true);
+            CArrowSchemaExporter.ExportSchema(new Schema(new[] { resultField }, null), outSchema);
+            *outBinding = Handles.Alloc(bound);
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int ScalarFnExecute(nint binding, CArrowArrayStream* args, CArrowArrayStream* outStream,
+                                       byte** err)
     {
         try
         {
@@ -1245,17 +1301,29 @@ public static unsafe class Bootstrap
             {
                 return FabricatorStatus.InvalidArgument;
             }
-            var f = Marshal.PtrToStringUTF8((nint)func) ?? string.Empty;
-            var argStream = CArrowArrayStreamImporter.ImportArrayStream(args); // we own it
-            if (handle == 0) // global (connection-free) function
+            var bound = Handles.Resolve<ScalarBindingHandle>(binding);
+            if (bound is null)
             {
-                CArrowArrayStreamExporter.ExportArrayStream(
-                    GlobalFunctions.ExecuteScalar(GlobalFunctions.ResolveScalar(f), argStream), outStream);
-                return FabricatorStatus.Ok;
+                return FabricatorStatus.InvalidArgument;
             }
-            var catalog = Handles.Resolve<IBackendCatalog>(handle) ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
-            var s = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
-            CArrowArrayStreamExporter.ExportArrayStream(catalog.ExecuteScalar(s, f, argStream), outStream);
+            var argStream = CArrowArrayStreamImporter.ImportArrayStream(args); // we own it
+            CArrowArrayStreamExporter.ExportArrayStream(ScalarBindingRunner.Execute(bound, argStream), outStream);
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int ScalarFnClose(nint binding, byte** err)
+    {
+        try
+        {
+            Handles.Resolve<ScalarBindingHandle>(binding)?.Dispose(); // idempotent
+            Handles.Free(binding);
             return FabricatorStatus.Ok;
         }
         catch (Exception ex)
@@ -1696,7 +1764,11 @@ public static unsafe class Bootstrap
                 stringOrder.Append("0");
                 body.Append(string.Empty);
                 paramCount.Append(fn.Parameters.FieldsList.Count);
-                returnType.Append(fn.Result.DataType.Name);
+                // "ANY" when the function declares no fixed return type (resolved per call site at
+                // scalarfn_bind). ⚠ Dereferencing fn.Result here without the ?. drops EVERY managed global
+                // function, silently: one throw inside this enumeration fails the whole list_global_functions
+                // crossing, and the host's registrar then has nothing to register.
+                returnType.Append(fn.Result?.DataType.Name ?? "ANY");
                 rows++;
             }
             foreach (var fn in GlobalFunctions.AllInOut())

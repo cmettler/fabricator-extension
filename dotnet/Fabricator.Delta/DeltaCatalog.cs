@@ -5439,8 +5439,8 @@ public sealed class DeltaCatalog : IBackendCatalog
     public Schema GetFunctionReturnSchema(string s, string f) =>
         Functions.ReturnSchema(s, f) ?? throw NoFunction(s, f);
 
-    public IArrowArrayStream ExecuteScalar(string s, string f, IArrowArrayStream a) =>
-        Functions.ExecuteScalar(s, f, a) ?? throw NoFunction(s, f);
+    public ScalarBindingHandle ScalarFnBind(string s, string f, ScalarBindArgs a) =>
+        Functions.BindScalar(s, f, a) ?? throw NoFunction(s, f);
 
     public Schema GetFunctionOutputSchema(string s, string f, RecordBatch? a = null) =>
         Functions.OutputSchema(s, f, a) ?? throw NoFunction(s, f);

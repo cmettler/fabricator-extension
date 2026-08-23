@@ -40,12 +40,32 @@ second registration mechanism.
 
 | Kind | When the output schema is known | How |
 |------|----------------------------------|-----|
-| **Scalar** | Fixed; at most a function of the **argument types** (never runtime values) | Declared return type, or an optional `bind(argTypes) → returnType` for polymorphic ones |
+| **Scalar** | **Bind time**, from the argument types AND the **constant** argument values (never runtime values) | Declared return type, or `Bind(ScalarBindArgs) → binding` — BUILT at ABI v80, see the note below |
 | **Table** | **Bind time**, from the **constant arguments** (TVF/proc args are literals at bind) | `bind(constArgs) → Schema` — for SQL Server this calls `sp_describe_first_result_set` (§6) |
 | **Table-in-out** | Bind time (from the input-table schema + args) | `bind(inputSchema, args) → Schema` (Phase 4) |
 
 So a scalar's output is essentially static (matches the user's intuition); a table function's output is
 **late-bound** and can depend on its parameters — which is exactly what makes mapping a stored proc work.
+
+> **⚠ UPDATED AT ABI v80 (2026-08-23) — the scalar row above was written before the bind session existed and
+> understated the ceiling in one way while being right about the floor.** A scalar's result type IS resolved at
+> BIND, per CALL SITE, and it may depend on a **folded constant VALUE**, not merely on the argument types —
+> `strptime` picking `TIMESTAMP` vs `TIMESTAMP_TZ` from its format string is upstream's own example, and
+> `fabricator_parse(text, type_name)` is ours. "Never runtime values" stays exactly right (a plan-time type
+> cannot depend on row data, and the bind REFUSES a non-constant slot rather than guessing) — a folded literal
+> is simply a third category the original table did not name.
+>
+> Two consequences the table above cannot express, both of which cost something to learn — full record in
+> [abi-history.md](abi-history.md) §v80:
+> - **The declared return type stayed, and is not merely a convenience.** `IScalarFunction.Result` is
+>   `Field?`: declared ⇒ registered on the catalog entry; absent ⇒ the bind must supply one. A binding may
+>   answer "the declared type stands", which is what stops a discovered SQL Server UDF from paying an
+>   `INFORMATION_SCHEMA` round trip at every call site to re-learn a type the host already holds.
+> - **A scalar bind must NOT establish the host ambients**, unlike every other bind in the tree — a scalar
+>   binds wherever it is CALLED, including inside a nested host query an outer operation is running while IT
+>   holds the ambient. Doing what the other binds do SIGSEGVs.
+
+
 
 ## 3. The model: one declaration + bind + execute
 

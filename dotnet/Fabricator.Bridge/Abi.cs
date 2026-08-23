@@ -91,8 +91,18 @@ public unsafe struct FabricatorVTable
     // int32 get_function_return_schema(void* handle, const char* schema, const char* func, ArrowSchema* out, char** err)
     public delegate* unmanaged[Cdecl]<nint, byte*, byte*, CArrowSchema*, byte**, int> GetFunctionReturnSchema;
 
-    // int32 execute_scalar(void* handle, const char* schema, const char* func, ArrowArrayStream* args, ArrowArrayStream* out, char** err)
-    public delegate* unmanaged[Cdecl]<nint, byte*, byte*, CArrowArrayStream*, CArrowArrayStream*, byte**, int> ExecuteScalar;
+    // Scalar-function session (ABI v80) — the successor to the removed stateless execute_scalar.
+    // int32 scalarfn_bind(void* handle, const char* schema, const char* func, ArrowArrayStream* args,
+    //                     const char* arg_constant, ArrowSchema* out_schema, void** out_binding, char** err)
+    // `arg_constant` is a mask, one char per argument: '1' = a folded constant, '0' = a runtime expression
+    // whose slot holds a NULL PLACEHOLDER. A provider MUST consult it before reading a value.
+    public delegate* unmanaged[Cdecl]<nint, byte*, byte*, CArrowArrayStream*, byte*, CArrowSchema*, nint*, byte**, int> ScalarFnBind;
+
+    // int32 scalarfn_execute(void* binding, ArrowArrayStream* args, ArrowArrayStream* out, char** err)
+    public delegate* unmanaged[Cdecl]<nint, CArrowArrayStream*, CArrowArrayStream*, byte**, int> ScalarFnExecute;
+
+    // int32 scalarfn_close(void* binding, char** err)
+    public delegate* unmanaged[Cdecl]<nint, byte**, int> ScalarFnClose;
 
     // int32 get_function_output_schema(void* handle, const char* schema, const char* func, ArrowArrayStream* args, ArrowSchema* out, char** err)
     public delegate* unmanaged[Cdecl]<nint, byte*, byte*, CArrowArrayStream*, CArrowSchema*, byte**, int> GetFunctionOutputSchema;

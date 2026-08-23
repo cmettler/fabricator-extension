@@ -1130,16 +1130,50 @@ void GetFunctionReturnSchema(FabricatorHandle handle, const std::string &schema,
 	}
 }
 
-void ExecuteScalar(FabricatorHandle handle, const std::string &schema, const std::string &func, ArrowArrayStream &args,
-                   ArrowArrayStream &out) {
+FabricatorHandle ScalarFnBind(FabricatorHandle handle, const std::string &schema, const std::string &func,
+                              ArrowArrayStream *args, const std::string &arg_constant,
+                              ArrowSchema &out_schema) {
 	const FabricatorVTable &vt = GetBridge();
-	if (!vt.execute_scalar) {
-		throw duckdb::IOException("Fabricator: bridge does not provide execute_scalar");
+	if (!vt.scalarfn_bind) {
+		throw duckdb::IOException("Fabricator: bridge does not provide scalarfn_bind");
+	}
+	FabricatorHandle binding = nullptr;
+	char *err = nullptr;
+	int32_t rc = vt.scalarfn_bind(handle, schema.c_str(), func.c_str(), args, arg_constant.c_str(), &out_schema,
+	                              &binding, &err);
+	if (rc != FABRICATOR_OK) {
+		ThrowManagedError(vt, err, "Fabricator: scalarfn_bind failed");
+	}
+	return binding;
+}
+
+void ScalarFnExecute(FabricatorHandle binding, ArrowArrayStream &args, ArrowArrayStream &out) {
+	const FabricatorVTable &vt = GetBridge();
+	if (!vt.scalarfn_execute) {
+		throw duckdb::IOException("Fabricator: bridge does not provide scalarfn_execute");
 	}
 	char *err = nullptr;
-	int32_t rc = vt.execute_scalar(handle, schema.c_str(), func.c_str(), &args, &out, &err);
+	int32_t rc = vt.scalarfn_execute(binding, &args, &out, &err);
 	if (rc != FABRICATOR_OK) {
-		ThrowManagedError(vt, err, "Fabricator: execute_scalar failed");
+		ThrowManagedError(vt, err, "Fabricator: scalarfn_execute failed");
+	}
+}
+
+void ScalarFnClose(FabricatorHandle binding) {
+	if (!binding) {
+		return;
+	}
+	const FabricatorVTable &vt = GetBridge();
+	if (!vt.scalarfn_close) {
+		return;
+	}
+	char *err = nullptr;
+	int32_t rc = vt.scalarfn_close(binding, &err);
+	if (rc != FABRICATOR_OK) {
+		// Best-effort cleanup; swallow + free the managed error message.
+		if (err && vt.free_error) {
+			vt.free_error(err);
+		}
 	}
 }
 

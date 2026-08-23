@@ -704,8 +704,8 @@ internal sealed class DaxCatalog : IBackendCatalog
     public Schema GetFunctionReturnSchema(string schemaName, string functionName)
         => Functions.ReturnSchema(schemaName, functionName) ?? throw NoScalar();
 
-    public IArrowArrayStream ExecuteScalar(string schemaName, string functionName, IArrowArrayStream args)
-        => Functions.ExecuteScalar(schemaName, functionName, args) ?? throw NoScalar();
+    public ScalarBindingHandle ScalarFnBind(string schemaName, string functionName, ScalarBindArgs args)
+        => Functions.BindScalar(schemaName, functionName, args) ?? throw NoScalar();
 
     private static NotSupportedException NoScalar() =>
         new("dax provider: no scalar functions.");

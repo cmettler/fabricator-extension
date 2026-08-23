@@ -3756,37 +3756,21 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
 
     // Resolves a scalar function to its IScalarFunction implementation: a provider-authored custom
     // function if registered, else a SqlServerScalarFunction wrapping the discovered SQL UDF. One uniform
-    // dispatch for ExecuteScalar (created on demand — the wrapper just holds the catalog + name). Returns the
-    // base IScalarFunction — execution needs only Invoke/Parameters/Result, not the catalog SchemaName.
+    // dispatch (created on demand — the wrapper just holds the catalog + name). Returns the base
+    // IScalarFunction: binding + execution need only Bind/Invoke/Parameters/Result, not the catalog SchemaName.
     private IScalarFunction ResolveScalar(string schemaName, string functionName) =>
         Functions.TryScalar(schemaName, functionName, out var custom)
             ? custom
             : new SqlServerScalarFunction(this, schemaName, functionName);
 
-    // Executes a scalar function over the input batches by dispatching to the resolved IScalarFunction
-    // (a custom C# function, or a SqlServerScalarFunction wrapping the discovered SQL UDF). Each input batch's
-    // results become one output batch; the result column is typed by the function's result (the C++ side
-    // ingests by position). The SQL UDF's chunking under the ~2100-parameter cap lives in its Invoke.
-    public IArrowArrayStream ExecuteScalar(string schemaName, string functionName, IArrowArrayStream args)
+    // Binds one scalar call site (ABI v80). Both kinds go through IScalarFunction.Bind: a custom C# function
+    // may resolve its result type from the call's constants, and a discovered SQL UDF takes the default
+    // binding, which defers to the DECLARED type — deliberately, since reading SqlServerScalarFunction.Result
+    // is a round trip to INFORMATION_SCHEMA and the host already holds that type from registration.
+    public ScalarBindingHandle ScalarFnBind(string schemaName, string functionName, ScalarBindArgs args)
     {
         var fn = ResolveScalar(schemaName, functionName);
-        using var input = args;
-        var batches = new List<RecordBatch>();
-        Schema? resultSchema = null;
-        RecordBatch? inBatch;
-        while ((inBatch = input.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult()) is not null)
-        {
-            if (inBatch.Length == 0)
-            {
-                continue;
-            }
-            var resultArray = fn.Invoke(inBatch);
-            resultSchema ??= new Schema(new[] { new Field("result", resultArray.Data.DataType, nullable: true) }, null);
-            batches.Add(new RecordBatch(resultSchema, new[] { resultArray }, resultArray.Length));
-        }
-        // No non-empty input → a correctly-typed zero-row stream.
-        resultSchema ??= new Schema(new[] { new Field("result", fn.Result.DataType, nullable: true) }, null);
-        return new InMemoryArrayStream(resultSchema, batches);
+        return new ScalarBindingHandle(fn, fn.Bind(args));
     }
 
     // A table-valued function's output columns from INFORMATION_SCHEMA.ROUTINE_COLUMNS

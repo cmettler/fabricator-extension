@@ -337,15 +337,34 @@ int64_t CompleteBulk(FabricatorHandle session, bool abort);
 void GetFunctionParamSchema(FabricatorHandle handle, const std::string &schema, const std::string &func,
                             ArrowSchema &out);
 
-// Fills `out` with the Arrow schema whose single field = the scalar function's return type.
+// Fills `out` with the Arrow schema whose single field = the scalar function's DECLARED return type. A field
+// of Arrow `null` type is the UNRESOLVED sentinel — scalarfn_bind supplies the type per call site.
 void GetFunctionReturnSchema(FabricatorHandle handle, const std::string &schema, const std::string &func,
                              ArrowSchema &out);
 
-// Execute a scalar function over an input batch: `args` is an N-row stream of the
-// argument columns (in param order; consumed by the managed side); fills `out` with
-// an N-row, single-column stream of the per-row results.
-void ExecuteScalar(FabricatorHandle handle, const std::string &schema, const std::string &func, ArrowArrayStream &args,
-                   ArrowArrayStream &out);
+// ---------------------------------------------------------------------------
+// Scalar-function session (ABI v80) — the successor to the removed stateless ExecuteScalar. ScalarFnBind
+// resolves a per-CALL-SITE binding (result field + bind state); ScalarFnExecute reuses it per chunk;
+// ScalarFnClose frees it. Mirrors TableFnBind / TableFnExecute / TableFnClose.
+// ---------------------------------------------------------------------------
+
+// Bind one scalar call site. `args` (nullable) is a 1-row stream of the call's arguments, PARTIAL and
+// PRE-CAST: the host folds only the constant ones and marks those fields `fabricator.arg_constant`="1" (an
+// unmarked field's value is a meaningless placeholder). Fills `out_schema` (a BARE ArrowSchema, like
+// GetFunctionReturnSchema) with the single resolved result field — Arrow `null` type meaning "the DECLARED
+// type stands". Returns an opaque binding handle (reused by ScalarFnExecute for every chunk; freed via
+// ScalarFnClose).
+FabricatorHandle ScalarFnBind(FabricatorHandle handle, const std::string &schema, const std::string &func,
+                              ArrowArrayStream *args, const std::string &arg_constant,
+                              ArrowSchema &out_schema);
+
+// Execute a bound scalar function over one chunk: `args` is an N-row stream of the argument columns (in
+// param order, post-cast; consumed by the managed side); fills `out` with an N-row, single-column stream of
+// the per-row results.
+void ScalarFnExecute(FabricatorHandle binding, ArrowArrayStream &args, ArrowArrayStream &out);
+
+// Release a binding handle from ScalarFnBind. Idempotent; safe with nullptr. Best-effort (swallows errors).
+void ScalarFnClose(FabricatorHandle binding);
 
 // Fills `out` with the Arrow schema of a table-returning function's output columns. `args` (nullable) is a
 // 1-row Arrow stream of the constant call arguments; a custom table function's output schema may depend on it

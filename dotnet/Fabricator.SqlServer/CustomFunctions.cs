@@ -27,6 +27,11 @@ internal static class CustomFunctions
     public static readonly IReadOnlyList<IScalarFunction> GlobalScalar = new IScalarFunction[]
     {
         new CfRenderFunction(),
+        // fabricator_parse(text, type_name) — parses `text` as the named type, and RETURNS that type: its
+        // result type is resolved at BIND from the constant `type_name`, which is the ABI v80 scalar bind
+        // session's whole point (docs/abi-history.md §v80). The shipped demonstration of the capability, and
+        // the only in-tree scalar whose return type is not fixed at registration.
+        new CfParseFunction(),
         // hilbert_index(coords BIGINT[], bits) — n-dimensional Hilbert-curve position, for liquid-clustering-
         // style ordered writes (ORDER BY hilbert_index(...) rides DuckDB's spilling sort; the write pipeline
         // stays streaming). Provider-agnostic core (lives in the Bridge, like DeltaGlobalTableFunction).
@@ -1815,5 +1820,134 @@ internal sealed class CfLatSplitFunction : ICatalogLateralFunction
         }
 
         public void Dispose() { }
+    }
+}
+
+// GLOBAL scalar (connection-free, no ATTACH): fabricator_parse(text, type_name) -> `text` parsed as the named
+// type. The RESULT TYPE follows the constant `type_name`, resolved per call site in Bind — so
+// `fabricator_parse('42','bigint')` is a BIGINT expression (arithmetic works on it) while
+// `fabricator_parse('42','double')` is a DOUBLE, from ONE registered function. This is the shipped
+// demonstration of the ABI v80 scalar bind session; a build that fixed the return type at registration
+// cannot make those two calls differ.
+//
+// It also shows the two rules a bind-resolving provider must respect: the type argument is only readable
+// when it is CONSTANT (a scalar may be called as f(t.col), unlike a table function), and the parsed type is
+// resolved ONCE per call site rather than per chunk.
+internal sealed class CfParseFunction : IScalarFunction
+{
+    public string Name => "fabricator_parse";
+
+    public Schema Parameters => new(new[]
+    {
+        new Field("text", StringType.Default, nullable: true),
+        new Field("type_name", StringType.Default, nullable: true),
+    }, metadata: null);
+
+    // No fixed return type: it is whatever `type_name` names, so the host registers this function as ANY and
+    // requires Bind to resolve a type per call site.
+    public Field? Result => null;
+
+    // Never called: Bind always returns a CfParseBinding, which carries the resolved type. The interface still
+    // demands it (a fixed-return function implements only Invoke), so it fails loudly rather than silently
+    // computing something untyped.
+    public IArrowArray Invoke(RecordBatch args) =>
+        throw new InvalidOperationException(
+            "fabricator_parse must be executed through its binding (its result type is resolved at bind)");
+
+    public IScalarFunctionBinding Bind(ScalarBindArgs args)
+    {
+        // ⚠ IsConstant, not just "is there a value": a non-constant slot carries a NULL PLACEHOLDER that is
+        // indistinguishable from an explicit NULL literal by looking at the value. Refusing by name here is
+        // the honest answer — the return type is part of the PLAN, so it cannot depend on row data.
+        if (!args.IsConstant(1))
+        {
+            throw new InvalidOperationException(
+                "fabricator_parse: the type_name argument must be a constant (the result type is resolved at " +
+                "bind, so it cannot depend on row values)");
+        }
+        var name = (args.ConstantArray(1) as StringArray)?.GetString(0);
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            throw new InvalidOperationException("fabricator_parse: type_name must not be NULL or empty");
+        }
+        IArrowType type = name.Trim().ToLowerInvariant() switch
+        {
+            "bigint" or "int64" => Int64Type.Default,
+            "double" or "float8" => DoubleType.Default,
+            "varchar" or "text" => StringType.Default,
+            _ => throw new InvalidOperationException(
+                $"fabricator_parse: unsupported type_name '{name}' (expected bigint, double or varchar)"),
+        };
+        return new CfParseBinding(type);
+    }
+}
+
+// The per-call-site binding: it holds the resolved result type, which is exactly the kind of once-per-call-site
+// state the stateless execute_scalar had nowhere to put.
+internal sealed class CfParseBinding : IScalarFunctionBinding
+{
+    private readonly IArrowType _type;
+
+    public CfParseBinding(IArrowType type)
+    {
+        _type = type;
+        Result = new Field("result", type, nullable: true);
+    }
+
+    // A CONCRETE field, not null: this call's result genuinely differs from the (absent) declaration.
+    public Field? Result { get; }
+
+    public IArrowArray Invoke(RecordBatch args)
+    {
+        var text = (StringArray)args.Column(0);
+        // ⚠ Column 1 (type_name) is present and fully materialised here even though the binding already knows
+        // it — see IScalarFunctionBinding.Invoke: which arguments are constant is a call-site property, so the
+        // batch always carries every parameter in declared order.
+        if (_type == Int64Type.Default)
+        {
+            var b = new Int64Array.Builder().Reserve(args.Length);
+            for (int i = 0; i < args.Length; i++)
+            {
+                var v = text.GetString(i);
+                if (v is not null && long.TryParse(v, System.Globalization.NumberStyles.Integer,
+                                                   System.Globalization.CultureInfo.InvariantCulture, out var l))
+                {
+                    b.Append(l);
+                }
+                else
+                {
+                    b.AppendNull();
+                }
+            }
+            return b.Build();
+        }
+        if (_type == DoubleType.Default)
+        {
+            var b = new DoubleArray.Builder().Reserve(args.Length);
+            for (int i = 0; i < args.Length; i++)
+            {
+                var v = text.GetString(i);
+                if (v is not null && double.TryParse(v, System.Globalization.NumberStyles.Float,
+                                                     System.Globalization.CultureInfo.InvariantCulture, out var d))
+                {
+                    b.Append(d);
+                }
+                else
+                {
+                    b.AppendNull();
+                }
+            }
+            return b.Build();
+        }
+        var sb = new StringArray.Builder().Reserve(args.Length);
+        for (int i = 0; i < args.Length; i++)
+        {
+            sb.Append(text.GetString(i));
+        }
+        return sb.Build();
+    }
+
+    public void Dispose()
+    {
     }
 }
