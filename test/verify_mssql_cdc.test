@@ -31,6 +31,8 @@ require fabricator
 
 require-env MSSQL_TESTDB_DSN
 
+require-env MSSQL_BINCOLL_DSN
+
 # ═══ §0  Recover from a previous crashed run ═══════════════════════════════════════════════════════════
 # sp_cdc_disable_db drops EVERY capture instance in the database, so this one statement is a complete
 # teardown. ⚠ Nothing here may name a cdc.* object: a batch that references a nonexistent object fails at
@@ -60,6 +62,9 @@ SELECT fabricator_exec('${MSSQL_TESTDB_DSN}', 'DECLARE @t int = 0; WHILE @t < 10
 
 statement ok
 SELECT fabricator_exec('${MSSQL_TESTDB_DSN}', 'IF OBJECT_ID(''dbo.cdc_probe'') IS NOT NULL DROP TABLE dbo.cdc_probe;');
+
+statement ok
+SELECT fabricator_exec('${MSSQL_TESTDB_DSN}', 'IF OBJECT_ID(''dbo.cdc_setup'') IS NOT NULL DROP TABLE dbo.cdc_setup;');
 
 statement ok
 ATTACH '${MSSQL_TESTDB_DSN}' AS c0 (TYPE fabricator);
@@ -351,6 +356,132 @@ SELECT count(*) FROM c1.cdc.health() WHERE property = 'max_lsn_age_seconds';
 ----
 1
 
+# A catalog on a database with NO CDC, for §14's refusal. It must be a DIFFERENT DATABASE rather than another
+# alias on this one: §4 enabled CDC here, so an alias would see it enabled and the refusal could not fire.
+# ⚠ Reuses the BinCollTest DSN rather than hand-building one from a password variable: sqllogictest only
+# substitutes ${VARS} the file DECLARES via require-env, so an undeclared one is passed through literally and
+# surfaces as `18456 Login failed` — an authentication error for what is really a missing declaration.
+statement ok
+ATTACH '${MSSQL_BINCOLL_DSN}' AS c0_nocdc (TYPE fabricator);
+
+# ═══ §10  SETUP (slice 2): enable_database / enable, and the ABI v81 flag they exist to exercise ═══════
+# ⚠ These four sections are the ONLY coverage of tablefn_execute's schema_may_change out-param. Nothing else
+#   in either tier sets it, so if they go the flag is untested.
+
+query TTT
+SELECT target, changed, detail LIKE '%capture%' FROM c1.cdc.enable_database();
+----
+TestDB	false	true
+
+# Idempotent: it was already enabled by §4's fabricator_exec, so `changed` is false and the call SUCCEEDS.
+# ⚠ `changed` is deliberately separate from success — an idempotent call that found the work already done
+# must not look like a failure (the same distinction the plugin uninstaller draws between removed and purged).
+
+statement ok
+SELECT fabricator_exec('c1', 'IF OBJECT_ID(''dbo.cdc_setup'') IS NOT NULL DROP TABLE dbo.cdc_setup;');
+
+statement ok
+SELECT fabricator_exec('c1', 'CREATE TABLE dbo.cdc_setup(id INT NOT NULL PRIMARY KEY, v NVARCHAR(20) NULL);');
+
+query TT
+SELECT target, changed FROM c1.cdc.enable('dbo.cdc_setup');
+----
+dbo.cdc_setup (dbo_cdc_setup)	true
+
+# ═══ §11  ⚠⚠ THE POINT OF ABI v81: the objects that call created are reachable in the SAME session ═════
+# Without the flag this fails with `Catalog Error: Table with name dbo_cdc_setup_CT does not exist!` —
+# MEASURED before the flag existed. And it is not a cosmetic "un-enumerated" problem: with no ATTACH object
+# filter, a name missing from the catalog's discovered list is treated as GENUINELY ABSENT
+# (fabricator_schema_entry.cpp's lookup gate), so there is no by-name fallback to save it.
+#
+# ⚠ NOTE WHAT IS *NOT* NEEDED HERE: no fabricator_refresh_cache, no re-ATTACH. That absence IS the assertion.
+# The mutants are (a) SchemaMayChange => false and (b) moving the DDL out of the eager part of Execute() into
+# the iterator body — (b) is the subtle one, because the DDL still happens and only the flag is lost.
+
+query I
+SELECT count(*) FROM c1.cdc.dbo_cdc_setup_CT;
+----
+0
+
+# The per-instance TVFs the enable created are registered too — the half that has no by-name fallback at all.
+query I
+SELECT count(*) FROM duckdb_functions() WHERE database_name = 'c1' AND schema_name = 'cdc' AND function_name = 'fn_cdc_get_all_changes_dbo_cdc_setup';
+----
+1
+
+# ═══ §12  enable is idempotent PER CAPTURE INSTANCE, not per table ════════════════════════════════════
+# ⚠ Keying the guard on the table would wrongly refuse a table's legitimate SECOND capture instance (§2.2),
+# which is how a schema change is absorbed. So the same call twice reports changed = false…
+
+query TT
+SELECT target, changed FROM c1.cdc.enable('dbo.cdc_setup');
+----
+dbo.cdc_setup (dbo_cdc_setup)	false
+
+# …while a DIFFERENT instance name on the same table is accepted. This is the positive control for the
+# assertion above: without it, "changed = false" would pass equally on a build that refused every re-enable.
+query TT
+SELECT target, changed FROM c1.cdc.enable('dbo.cdc_setup', capture_instance := 'dbo_cdc_setup_v2');
+----
+dbo.cdc_setup (dbo_cdc_setup_v2)	true
+
+query I
+SELECT count(*) FROM c1.cdc.tables() WHERE source_table = 'cdc_setup';
+----
+2
+
+# ═══ §13  disable, and the flag works in the DESTRUCTIVE direction too ═══════════════════════════════
+
+query TT
+SELECT target, changed FROM c1.cdc.disable('dbo.cdc_setup', capture_instance := 'dbo_cdc_setup_v2');
+----
+dbo.cdc_setup (dbo_cdc_setup_v2)	true
+
+query I
+SELECT count(*) FROM c1.cdc.tables() WHERE source_table = 'cdc_setup';
+----
+1
+
+# ⚠ The v81 flag must fire on a DROP as well, or a dropped change table lingers in the catalog and a scan of
+# it fails against the server instead of being absent. Nothing else in this suite covers that direction.
+statement error
+SELECT count(*) FROM c1.cdc.dbo_cdc_setup_v2_CT;
+----
+does not exist
+
+# Disabling something that is not captured is not an error — it reports changed = false, so a teardown script
+# can run unconditionally.
+query TT
+SELECT target, changed FROM c1.cdc.disable('dbo.nope');
+----
+dbo.nope (all)	false
+
+# ═══ §14  scan(), and what about it is gateable ═══════════════════════════════════════════════════════
+# ⚠⚠ ITS SUCCESS PATH IS DELIBERATELY NOT ASSERTED, and the suite says so rather than implying coverage:
+# sp_cdc_scan contends with the capture job for the database's single log-scan session, so a bare assertion
+# would be flaky (~1 failure in 57 attempts, MEASURED) — and stopping the job first is not an option here,
+# because sp_cdc_stop_job's refusal when the job is not yet running is raised by the Agent proxy, is NOT
+# catchable in T-SQL, and escapes through fabricator_exec as 22022. The translated 22903 message is therefore
+# also ungated: producing it requires winning a race against a live job on demand.
+#
+# What IS deterministic is the refusal on a database with no CDC, which is our own guard.
+statement error
+SELECT * FROM c0_nocdc.cdc.scan();
+----
+change data capture is not enabled on this database
+
+# And that all four setup functions exist as TABLE functions. ⚠ Not `has_side_effects` — that column is NULL
+# for a table function (it is a scalar-volatility concept), so asserting it would assert nothing. The reason
+# these are table functions rather than scalars is that they REPORT: a scalar would have to be VOLATILE to
+# avoid being constant-folded and would still be the wrong shape for a result the caller reads.
+query TT
+SELECT function_name, function_type FROM duckdb_functions() WHERE database_name = 'c1' AND schema_name = 'cdc' AND function_name IN ('enable', 'enable_database', 'disable', 'scan') ORDER BY function_name;
+----
+disable	table
+enable	table
+enable_database	table
+scan	table
+
 # ═══ §9  Teardown — leave NO CDC-enabled table behind ══════════════════════════════════════════════════
 # Load-bearing: the capture job keeps scanning a CDC-enabled database between runs, and the next run's §3
 # would then find max_position() non-NULL and fail for a reason unrelated to the code.
@@ -361,6 +492,9 @@ SELECT fabricator_exec('c1', 'DECLARE @t int = 0; WHILE @t < 10 BEGIN SET @t = @
 
 statement ok
 SELECT fabricator_exec('c1', 'DROP TABLE dbo.cdc_probe;');
+
+statement ok
+SELECT fabricator_exec('c1', 'IF OBJECT_ID(''dbo.cdc_setup'') IS NOT NULL DROP TABLE dbo.cdc_setup;');
 
 # Back to §3's state, which is also the cheapest possible check that the teardown really disabled it.
 query I

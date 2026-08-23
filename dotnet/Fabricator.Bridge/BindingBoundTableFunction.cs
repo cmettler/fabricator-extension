@@ -25,6 +25,13 @@ public sealed class BindingBoundTableFunction : IBoundTableFunction
     public Schema OutputSchema => _binding.OutputSchema;
     public bool MapResultByName => _supportsPushdown;
 
+    /// <summary>
+    /// Forwarded from the wrapped binding (v81). Read by the host the moment <see cref="Execute"/> returns,
+    /// so it reflects whatever the binding's EAGER path decided — which is exactly where a DDL function must
+    /// do its work.
+    /// </summary>
+    public bool SchemaMayChange => _binding.SchemaMayChange;
+
     public IArrowArrayStream Execute(string? specJson, IArrowArrayStream? filterValues)
     {
         var scan = new TableFunctionScan(specJson, filterValues);

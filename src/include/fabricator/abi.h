@@ -547,8 +547,23 @@ typedef struct FabricatorVTable {
 	// re-applies above the scan). *out receives the result rows (its stream owns the
 	// provider connection, released by the host at scan teardown). Called once per
 	// execution; the binding may be executed repeatedly.
+	// *schema_may_change (nullable) reports whether this EXECUTION changed the provider's catalog — a
+	// provider-authored function that performs DDL (the db.cdc.* enable/disable pair) sets it, and the host
+	// then rebuilds its metadata cache. Mirrors execute_dml's out-param of the same name; before ABI v81 a
+	// table function had no way to say this, so its own new objects stayed unreachable for the session.
+	//
+	// ⚠⚠ THE FLAG IS READ WHEN THIS CALL RETURNS, NOT WHEN THE STREAM IS DRAINED. A managed binding whose
+	// side effect lives in an async-iterator body has not run it yet at that moment — an iterator does not
+	// begin until the first batch PULL, a different crossing. So a function that reports through this flag
+	// MUST do its work in the eager part of Execute(). Same rule, and the same failure mode, as the
+	// ambient-capture bug recorded for global table functions.
+	//
+	// ⚠ The host must NOT act on it synchronously here: it is set during a SCAN, and rebuilding the catalog
+	// at that moment retires the very entry the running statement is scanning. The host records it and
+	// refreshes at the next transaction start instead (fabricator_transaction.cpp).
 	int32_t (*tablefn_execute)(FabricatorHandle binding, const char *spec_json,
-	                         struct ArrowArrayStream *filter_values, struct ArrowArrayStream *out, char **err);
+	                         struct ArrowArrayStream *filter_values, struct ArrowArrayStream *out,
+	                         int32_t *schema_may_change, char **err);
 
 	// Release a binding handle from tablefn_bind. Idempotent; safe with nullptr.
 	// Best-effort (bind-data teardown must not throw).
@@ -1142,7 +1157,7 @@ typedef struct FabricatorHostServices {
 // state blob is this many bytes + a 4-byte length prefix). Serialize() must fit within it.
 #define FABRICATOR_AGG_SPILL_CAP 1024
 
-#define FABRICATOR_ABI_VERSION 80
+#define FABRICATOR_ABI_VERSION 81
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(FabricatorVTable) as seen

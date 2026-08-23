@@ -5,6 +5,7 @@
 #pragma once
 
 #include "fabricator/abi.h"
+#include <atomic>
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/case_insensitive_map.hpp"
 #include "duckdb/common/mutex.hpp"
@@ -87,6 +88,33 @@ public:
 		return has_object_filter_;
 	}
 
+	//! Records that a provider function's EXECUTION performed DDL (ABI v81's `tablefn_execute`
+	//! schema_may_change out-flag), so this catalog's metadata cache must be rebuilt before anything binds
+	//! against it again.
+	//!
+	//! ⚠⚠ IT IS DELIBERATELY NOT ACTED ON WHERE IT IS SET. The flag is raised during a SCAN, and
+	//! RefreshCache() calls ClearTables() on every schema — which would RETIRE the very entry the running
+	//! statement is scanning. The graveyard makes that non-fatal rather than a use-after-free, but it is
+	//! needless risk plus a burst of discovery IO in the middle of someone's query. So the refresh happens at
+	//! the next FabricatorTransactionManager::StartTransaction, which is provably outside any bind or scan:
+	//! DuckDB resolves the CatalogTransaction before LookupSchema takes schema_lock_, so nothing this thread
+	//! holds can deadlock against it.
+	//!
+	//! ⚠ Why a deferred rebuild is needed at all rather than nothing: with no ATTACH object filter, a name
+	//! missing from the discovered list is treated as GENUINELY ABSENT (FabricatorSchemaEntry's lookup gate),
+	//! so an object a function just created is not merely un-enumerated — it is UNREACHABLE, with no by-name
+	//! fallback. MEASURED: `cdc.enable` then reading the change table it created gives "Table with name
+	//! dbo_x_CT does not exist!" in the same session.
+	void MarkSchemaMayChange() {
+		schema_may_change_ = true;
+	}
+
+	//! Reads and clears the flag. Atomic exchange because a scan on a DuckDB worker thread may set it while
+	//! another thread starts a transaction; at worst the refresh lands one statement later, never twice.
+	bool ConsumeSchemaMayChange() {
+		return schema_may_change_.exchange(false);
+	}
+
 	//! The catalog-type string identifying an attached catalog as ours (the provider
 	//! identity — becomes generic in the multi-provider rename). Centralized so the
 	//! "is this our catalog?" checks don't repeat the literal.
@@ -152,6 +180,8 @@ private:
 	string db_path_;
 	//! Whether the database collation is binary (detected at LoadCatalog) => string ORDER BY is pushable.
 	bool has_object_filter_ = false;
+	//! Set by MarkSchemaMayChange (a provider function did DDL); consumed at the next transaction start.
+	std::atomic<bool> schema_may_change_ {false};
 	bool string_order_pushable_ = false;
 	bool null_order_expressible_ = false;
 	//! Whether the provider applies pushed filters exactly (detected at LoadCatalog) => filter_pushdown=true

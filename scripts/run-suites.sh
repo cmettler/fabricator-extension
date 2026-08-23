@@ -567,7 +567,13 @@ case "$TIER" in
         # 2295 since 2026-08-23: verify_mssql_cdc 73 (new) + verify_server_profile 15 -> 16 (the supports_cdc
         # capability row) = exactly +74 over 2221, i.e. NO other suite moved — which is the CDC slice's
         # behaviour-preservation claim, and it is exact rather than approximate.
-        : "${MIN_ASSERTIONS:=2295}"
+        # 2327 since 2026-08-24: verify_mssql_cdc 73 -> 105 for the CDC SETUP functions and ABI v81's
+        # tablefn_execute schema_may_change out-flag. ⚠ Those 32 assertions are the ONLY coverage of that ABI
+        # entry in either tier — nothing else sets the flag — and §11 is the load-bearing one: it reads a
+        # change table `cdc.enable` created moments earlier in the SAME session, which is impossible without
+        # the deferred catalog rebuild the flag triggers. Two mutants (never report the DDL; move the DDL out
+        # of Execute() into the iterator body, where the host has already read the flag) both die there.
+        : "${MIN_ASSERTIONS:=2327}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

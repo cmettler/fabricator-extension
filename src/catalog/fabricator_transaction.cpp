@@ -21,6 +21,25 @@ FabricatorTransactionManager::FabricatorTransactionManager(AttachedDatabase &db,
 }
 
 Transaction &FabricatorTransactionManager::StartTransaction(ClientContext &context) {
+	// ABI v81: consume a deferred catalog rebuild requested by a provider function that performed DDL (the
+	// db.cdc.* enable/disable pair). THIS is the safe point — the flag is raised during a SCAN, where a
+	// rebuild would retire the entry the running statement is scanning, whereas here we are provably outside
+	// any bind or scan: DuckDB resolves the CatalogTransaction before LookupSchema takes schema_lock_, so the
+	// path that triggers this holds no catalog lock yet.
+	//
+	// ⚠ Best-effort by design. A failed re-discovery (the server went away between the DDL and now) must not
+	// abort an unrelated statement — the pre-existing stale cache is the same state the user would have had
+	// without the flag, and fabricator_refresh_cache() remains the explicit retry.
+	//
+	// ⚠ It runs BEFORE the transaction is registered below on purpose: RefreshCache calls
+	// FabricatorSetActiveTxn with this context, and the ambient it needs is the CALLER's, not a transaction
+	// this manager has not finished creating.
+	if (db.GetCatalog().Cast<FabricatorCatalog>().ConsumeSchemaMayChange()) {
+		try {
+			db.GetCatalog().Cast<FabricatorCatalog>().RefreshCache(context);
+		} catch (...) {
+		}
+	}
 	auto transaction = make_uniq<FabricatorTransaction>(*this, context);
 	auto &result = *transaction;
 	// Capture the DuckDB transaction id so all of this transaction's writes/reads on the backend key the

@@ -74,6 +74,24 @@ public interface ITableFunctionBinding : System.IDisposable
     Schema OutputSchema { get; }
 
     /// <summary>
+    /// Whether this execution changed the provider's CATALOG — set by a function that performs DDL, so the
+    /// host rebuilds its metadata cache and the objects the call created become reachable. Default
+    /// <c>false</c>: an ordinary reader implements nothing. Forwarded to the ABI as <c>tablefn_execute</c>'s
+    /// <c>schema_may_change</c> (v81).
+    /// </summary>
+    /// <remarks>
+    /// <para>⚠⚠ <b>Set it from the EAGER part of <see cref="Execute"/>, and do the DDL there too.</b> The
+    /// host reads this the moment <c>Execute</c> RETURNS — before a single row is pulled — so work placed in
+    /// an async-iterator body has not happened yet: an iterator does not begin until the first batch pull, a
+    /// different ABI crossing. The failure is silent (the flag reads false, the new objects stay
+    /// unreachable), which is why the rule is stated here rather than left to be discovered.</para>
+    /// <para>⚠ It is read ONCE PER EXECUTION and the host only ever SETS its accumulator, so a binding reused
+    /// across executions (a prepared statement) may report true on one and false on the next without the
+    /// earlier true being lost.</para>
+    /// </remarks>
+    bool SchemaMayChange => false;
+
+    /// <summary>
     /// Whether the rows this binding yields are already FILTERED by the pushed predicate, so DuckDB need not
     /// re-apply it.
     /// </summary>

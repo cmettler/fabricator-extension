@@ -483,7 +483,7 @@ FabricatorHandle TableFnBind(FabricatorHandle handle, const std::string &schema,
 // projection + best-effort filter pushdown (honored only when the binding supports it). Fills `out`
 // with the result rows (its stream owns the provider connection, released by the host at scan teardown).
 void TableFnExecute(FabricatorHandle binding, const std::string &spec_json, ArrowArrayStream *filter_values,
-                  ArrowArrayStream &out);
+                  ArrowArrayStream &out, bool *schema_may_change = nullptr);
 
 // Release a binding handle from TableFnBind. Idempotent; safe with nullptr. Best-effort (swallows errors).
 void TableFnClose(FabricatorHandle binding);

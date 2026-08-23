@@ -1516,6 +1516,14 @@ struct FabricatorTableFunctionInfo : public TableFunctionInfo {
 	// equality is pushed for them. Set true for a byte-ordered global host-FS reader (declared in C#). Copied
 	// onto the scan bind data so FabricatorComplexFilterPushdown's FilterSerializer honors it.
 	bool string_order_pushable = false;
+	// ABI v81: the catalog whose metadata cache a DDL-performing function invalidates. Null for a GLOBAL
+	// function, which belongs to no catalog and therefore has nothing to invalidate.
+	//
+	// ⚠ Lifetime: this info object is owned by the TableFunction on a catalog entry, so it cannot outlive the
+	// catalog — the same scoping that makes carrying `handle` here safe. Deliberately NOT a ClientContext,
+	// which is the recorded dangling-pointer class (a catalog is DATABASE-scoped and outlives the connection
+	// that attached it).
+	FabricatorCatalog *catalog = nullptr;
 };
 
 // Per-plan binding handle for the session-model table functions (tablefn_bind / tablefn_execute / tablefn_close).
@@ -1660,8 +1668,23 @@ unique_ptr<FunctionData> FabricatorTableFunctionBind(ClientContext &context, Tab
 
 	// 2) Scan factory: tablefn_execute over the bound binding (per execution). spec_json/filter_values push
 	//    projection + filter into the SELECT when the binding supports it (a discovered TVF); else ignored.
-	bind_data->factory = [bind_state](const fabricator::ArrowScanRequest &req, ArrowArrayStream &out) {
-		fabricator::TableFnExecute(bind_state->binding, req.spec_json, req.filter_values, out);
+	// ABI v81: a provider function that performs DDL reports it through tablefn_execute's schema_may_change
+	// out-flag, and the catalog RECORDS it for a deferred rebuild. Acting on it here would retire the entry
+	// this very statement is scanning (see FabricatorCatalog::MarkSchemaMayChange); the refresh happens at the
+	// next transaction start instead.
+	//
+	// ⚠ Capturing the catalog by pointer is safe for the same reason capturing `handle` above is: both are
+	// DATABASE-scoped and outlive every plan that can reference them, unlike a ClientContext (whose capture
+	// is the recorded dangling-pointer class). A DETACH invalidates the plans that hold either.
+	auto *catalog_ptr = info.catalog;
+	bind_data->factory = [bind_state, catalog_ptr](const fabricator::ArrowScanRequest &req,
+	                                               ArrowArrayStream &out) {
+		bool schema_may_change = false;
+		fabricator::TableFnExecute(bind_state->binding, req.spec_json, req.filter_values, out,
+		                           &schema_may_change);
+		if (schema_may_change && catalog_ptr) {
+			catalog_ptr->MarkSchemaMayChange();
+		}
 	};
 	bind_data->push_projection = bind_state->supports_pushdown;
 	return std::move(bind_data);
@@ -2891,6 +2914,10 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateTableFunction(Clien
 	fn_info->arg_names = arg_names;
 	fn_info->arg_styles = arg_styles;
 	fn_info->is_proc = is_proc;
+	// ABI v81: this is the ONE registration path whose scans go through tablefn_execute, so it is the one
+	// that can be told "my execution performed DDL". A GLOBAL function belongs to no catalog and leaves this
+	// null; the sqlgen and in-out paths do not use tablefn_execute at all.
+	fn_info->catalog = &catalog.Cast<FabricatorCatalog>();
 	tf.function_info = std::move(fn_info);
 
 	CreateTableFunctionInfo info(std::move(tf));

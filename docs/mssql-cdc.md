@@ -1288,7 +1288,7 @@ next run's `cdc.max_position()` is not NULL where §0 expects it. Disable in tea
 | slice | contents | why this order |
 |---|---|---|
 | **1** | ✅ **BUILT 2026-08-23** — see §13 | read-only, no reader yet, and it makes everything else observable. ⚠ The gate leads: without it every later slice can poison a transaction on a Fabric attach |
-| **2** | `cdc.enable_database` / `enable` / `disable` / `scan` + cache invalidation | after this a table can be captured entirely from SQL — already a shippable increment. ⚠ **The invalidation has an unresolved prerequisite — read §13.4 before starting** |
+| **2** | ✅ **BUILT 2026-08-24 (ABI v81)** — see §14 | after this a table can be captured entirely from SQL — already a shippable increment |
 | **3** | `cdc.changes` — single instance, `images := 'after'`, explicit bounds, **the §2.1 pre-check** | the reader, at its smallest correct size |
 | **4** | `starting_timestamp` / `ending_timestamp`; `images := 'both'` + the mask placeholder | both are additive to the same generator |
 | **5** | `include := 'snapshot'` / `'snapshot+changes'` — the §5.1 two-connection protocol | no longer blocked: §11 item 3 dissolved. Needs a second connection at `IsolationLevel.Snapshot` and `ALLOW_SNAPSHOT_ISOLATION ON`, which the ATTACH can check once |
@@ -1429,7 +1429,8 @@ only visible where it does not — and the population for whom it does not exist
   does — this is how §2 first passed while asserting nothing), and §9 must leave no CDC-enabled table behind
   or the capture job keeps scanning between runs and the next run's §3 fails for an unrelated reason.
 
-### 13.4 ⚠⚠ SLICE 2's PREREQUISITE, found while scoping it: there is NO channel for a managed table function to invalidate the host's catalog cache
+### 13.4 ⚠⚠ SLICE 2's PREREQUISITE — ✅ RESOLVED 2026-08-24 by ABI v81, via the option recommended below.
+The analysis is kept because it is why the entry has the shape it does; §14.1 records what it got wrong.
 
 **§3.5 says every setup function MUST invalidate the cache, and MEASURED that it matters** (enabling capture
 creates a change table and two TVFs that the session cannot see until the cache is rebuilt — the 0 → 2
@@ -1474,3 +1475,86 @@ documented as best-effort-must-not-throw, which is the wrong place to trigger a 
 
 With that refinement (a) is the only option whose correctness is obvious, and the flag it adds is the same
 flag the DML path already has — so it makes the two paths consistent rather than adding a special case.
+
+---
+
+## 14. Slice 2 — AS BUILT (2026-08-24), and the ABI entry it needed
+
+**C++ + C#, ABI v81.** `db.cdc.enable_database()` / `enable(...)` / `disable(...)` / `scan()`, and the
+mechanism that makes their DDL visible. Gate `verify_mssql_cdc` 73 → **105**, two mutants both killed at §11.
+
+### 14.1 §13.4 is RESOLVED, and by the option it recommended
+
+The prerequisite is built: **`tablefn_execute` gained a `schema_may_change` out-param** (full record:
+[abi-history.md](abi-history.md) §v81). What that section could only recommend, this one can state:
+
+- **The refinement it predicted was necessary and is now MUTATION-PROVEN.** Moving the DDL out of the eager
+  part of `Execute()` into the iterator body kills the suite at exactly the same assertion as never setting
+  the flag at all — because the host reads the flag when `tablefn_execute` returns, and an iterator has not
+  begun then. ⚠ The failure is silent in the worst way: the enable SUCCEEDS, its report row is correct, and
+  only the rebuild is lost.
+- **The host does NOT act on the flag where it is set**, which §13.4 did not anticipate. Doing so would
+  retire the entry the running statement is scanning (`RefreshCache` calls `ClearTables()` on every schema).
+  The catalog records it and `FabricatorTransactionManager::StartTransaction` refreshes — provably outside
+  any bind or scan, because DuckDB resolves the `CatalogTransaction` before `LookupSchema` takes
+  `schema_lock_`.
+- **⚠ Option (b) — the no-bump alternative — would have been WORSE than §13.4 judged it.** It was assessed
+  as risky because `RefreshCache` re-enters `entry_lock_`; the deeper problem is that a refresh *at that
+  moment* is wrong wherever it is invoked from, so the alternative was not merely riskier plumbing for the
+  same outcome. The bump bought the ability to DEFER, which is the part that makes it correct.
+
+### 14.2 ⚠⚠ The staleness was WORSE than §3.5 measured, and that is what justified the ABI change
+
+§3.5 recorded a 0 → 2 function count across `fabricator_refresh_cache`. Re-measured while scoping this, in
+one session on one catalog:
+
+| surface, after `cdc.enable` with no refresh | before v81 |
+|---|---|
+| our own `cdc.tables()` | **works** — it queries the server live, so it never went stale |
+| `duckdb_tables()` in the `cdc` schema | stale (the new change table missing) |
+| the new change table **by name** | **`Catalog Error: Table with name dbo_two_CT does not exist!`** |
+| the new per-instance TVF **by name** | **`Catalog Error: Table Function with name fn_cdc_get_all_changes_dbo_three does not exist!`** |
+
+⇒ the objects were **UNREACHABLE**, not merely un-enumerated. The mechanism, read from the source rather than
+guessed: without an ATTACH object filter, `FabricatorSchemaEntry`'s lookup gate treats a name missing from
+the discovered list as genuinely absent and returns before any by-name fetch.
+
+⚠ **That refines a note this project already carries.** `CLAUDE.md` says a table can exist without being in
+the discovered list "because an ATTACH `table_filter` bounds ENUMERATION only and that path fetches BY NAME".
+True — and CONDITIONAL on a filter being set. With no filter there is no by-name path at all, which is
+exactly the configuration almost everyone runs.
+
+After v81, in the same session with no refresh: the change table reads, enumeration goes 0 → 6, and the
+per-instance TVFs go 0 → 2.
+
+### 14.3 Decisions in the surface
+
+- **`changed` is separate from success.** An idempotent call that found the work already done SUCCEEDS and
+  reports `changed = false`; collapsing them would make the ordinary "already enabled" outcome look like a
+  failure. (The distinction the plugin uninstaller draws between `removed` and `purged`.)
+- **`enable`'s idempotence keys on the capture INSTANCE, not the table** — keying on the table would wrongly
+  refuse a table's legitimate second instance, which is how a schema change is absorbed (§2.2). §12 of the
+  suite pins both halves, the second being the positive control: without it, "the same call twice reports
+  false" would pass equally on a build that refused every re-enable.
+- **Every caller-supplied value crosses as a PARAMETER**, never spliced text. These are identifiers and a
+  column list a user types.
+- **There is NO `disable_database()`.** `sp_cdc_disable_db` drops every capture instance in the database at
+  once — a bigger hammer than anything else here, destroying history nothing else on this surface can. An
+  operator who means it has `fabricator_exec`; putting it one word away from `cdc.disable('t')` would invite
+  the wrong one. `cdc.disable` IS offered because it is per-TABLE and named explicitly by the caller, which
+  is the consent line `DROP TABLE` already sits on.
+- **`cdc.scan()` TRANSLATES the log-scan race** rather than passing it through. §10.2's `22903 … sp_replcmds`
+  names nothing a reader would connect to CDC, and §10.2a established that retrying does not help — so the
+  message says to stop the capture job or wait a polling interval, and no retry is attempted. It also reports
+  `schema_may_change = false`: a log scan creates nothing.
+
+### 14.4 What the suite does NOT cover, said rather than implied
+
+- **`cdc.scan()`'s SUCCESS path is not asserted.** It contends with the capture job for the database's single
+  log-scan session (~1 failure in 57, measured), and the obvious mitigation is unavailable: `sp_cdc_stop_job`'s
+  refusal when the job is not yet running is raised by the Agent proxy, is not catchable in T-SQL, and escapes
+  through `fabricator_exec` as `22022` (§10.2a). What IS asserted is its refusal on a non-CDC database, which
+  is our own guard. The translated 22903 message is therefore also ungated — producing it needs winning a race
+  against a live job on demand.
+- **The v81 deferral's explicit-transaction gap is not asserted** — sqllogictest drives connections
+  sequentially, and the gap is about a second statement inside one transaction. Documented in §v81 instead.

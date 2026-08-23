@@ -103,6 +103,7 @@ See [SQL Server external tables on S3](#sql-server-external-tables-on-s3).
 | | — configurable isolation (consistent snapshot per call); per-row procs run in DuckDB's transaction | ✅ |
 | | **Custom C# aggregates** (UDAF) → `db.schema.agg(x)` in `GROUP BY` / parallel / `OVER(…)`; opt-in disk-spill (`SupportsSpill`) | ✅ |
 | **Change data capture** | `db.cdc.tables()` / `max_position()` / `min_position()` / `health()` — inspect SQL Server CDC | ✅ SQL Server only (not Fabric / Synapse) |
+| | `db.cdc.enable_database()` / `enable()` / `disable()` / `scan()` — set capture up from SQL; the catalog refreshes itself | ✅ |
 | | A resumable change-stream reader (`db.cdc.changes(...)`) with a snapshot leg | ❌ designed, not built (`docs/mssql-cdc.md`) |
 | **Monitoring** | `db.dbo.fabricator_session_tag(k, v)` — tag a transaction's connection so Fabric query insights can attribute its cost | ✅ (see dbt caveat) |
 | | `application_name` on the secret → `program_name` on every statement (run-level attribution) | ✅ |
@@ -824,9 +825,24 @@ They live in the catalog's `cdc` schema, so they resolve as `db.cdc.max_position
 | `db.cdc.tables()` | one row per capture **instance** — `source_schema`, `source_table`, `capture_instance`, `start_lsn`, `end_lsn`, `supports_net_changes`, `has_drop_pending`, `role_name`, `index_name`, `filegroup_name`, `create_date`, `index_column_list`, `captured_column_list` |
 | `db.cdc.max_position()` | the current log position (`sys.fn_cdc_get_max_lsn`) as a `BLOB`, or `NULL` |
 | `db.cdc.min_position('<capture instance>' \| '<schema>.<table>')` | the **retention floor** (`sys.fn_cdc_get_min_lsn`) as a `BLOB`, or `NULL` |
+| `db.cdc.enable_database()` | `sys.sp_cdc_enable_db` — idempotent |
+| `db.cdc.enable('<schema>.<table>' [, capture_instance :=] [, columns :=] [, role :=] [, index :=] [, filegroup :=] [, net :=])` | `sys.sp_cdc_enable_table` — idempotent per capture instance |
+| `db.cdc.disable('<schema>.<table>' [, capture_instance :=])` | `sys.sp_cdc_disable_table`; with no instance named, all of that table's |
+| `db.cdc.scan()` | `sys.sp_cdc_scan` — force the capture log scan now (see the ⚠ below) |
 | `db.cdc.health()` | 12 `(property, value)` rows, in this order: `supports_cdc`, `database`, `cdc_enabled`, `captured_instances`, `capture_job`, `capture_polling_interval_seconds`, `cleanup_job`, `cleanup_retention_minutes`, `max_lsn`, `max_lsn_time`, `max_lsn_age_seconds`, `agent_status` |
 
+The four setup functions each return one report row — `target`, `changed`, `detail`. **`changed` is separate
+from success**: a call that found the work already done succeeds and reports `changed = false`, so a setup
+script is safe to re-run.
+
 ```sql
+-- Set capture up from SQL, no sqlcmd needed.
+SELECT * FROM db.cdc.enable_database();
+SELECT * FROM db.cdc.enable('dbo.orders');
+
+-- The objects that created are usable IMMEDIATELY, in the same session — no re-ATTACH, no refresh.
+SELECT * FROM db.cdc.dbo_orders_CT;
+
 -- What is captured, and where the log currently stands?
 SELECT source_table, capture_instance, captured_column_list FROM db.cdc.tables();
 SELECT db.cdc.max_position() AS pos, db.cdc.min_position('dbo.orders') AS retention_floor;
@@ -841,9 +857,20 @@ SELECT * FROM db.cdc.health();
   when it is enabled but the capture job has not run yet. `health()` tells you which. (Calling
   `sys.fn_cdc_get_max_lsn()` yourself in the first case raises `208 Invalid object name
   'cdc.lsn_time_mapping'` — an error about an object you never mentioned, which is why these wrappers exist.)
-- **Enabling capture is a DDL.** `sys.sp_cdc_enable_table` creates a change table and two table functions,
-  and this session's catalog cache will not show them until you call `fabricator_refresh_cache('db')` or
-  re-`ATTACH`.
+- **`cdc.enable` / `cdc.disable` refresh the catalog for you.** Enabling capture is DDL: it creates a change
+  table and two table functions, and until the catalog knows about them they are not merely missing from
+  `duckdb_tables()` — they are unreachable, even by name. These functions report the change and the catalog
+  rebuilds before your next statement, so nothing extra is needed. ⚠ One gap: inside a single explicit
+  `BEGIN … COMMIT`, a later statement in that *same* transaction will not see them; call
+  `fabricator_refresh_cache('db')` if you need that. Enabling capture via raw `fabricator_exec` instead needs
+  the refresh either way.
+- **There is no `disable_database()` on purpose.** `sp_cdc_disable_db` drops every capture instance in the
+  database at once, destroying all recorded history — a bigger hammer than anything else here. Use
+  `fabricator_exec` if you mean it.
+- **⚠ `cdc.scan()` is a maintenance action, not a per-query one.** It forces the capture log scan immediately
+  instead of waiting a polling interval, which costs CPU that belongs to your DBA's budget. It also contends
+  with the capture job for the database's single log-scan session, so it can fail — the error says to stop the
+  capture job for the duration or simply wait. Useful for tests and for a container with no SQL Server Agent.
 - **"Enabled" and "happening" are independent.** `sp_cdc_enable_db` / `sp_cdc_enable_table` both succeed
   with SQL Server Agent stopped, so a table can look captured and never produce a row. That is what
   `health()`'s `agent_status` is for — and it reports `unknown` rather than guessing when the connection

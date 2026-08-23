@@ -154,8 +154,9 @@ public unsafe struct FabricatorVTable
     //                  ArrowArrayStream* out_schema, int* supports_pushdown, void** out_binding, char** err)
     public delegate* unmanaged[Cdecl]<nint, byte*, byte*, CArrowArrayStream*, CArrowArrayStream*, int*, nint*, byte**, int> TableFnBind;
 
-    // int32 tablefn_execute(void* binding, const char* spec_json, ArrowArrayStream* filter_values, ArrowArrayStream* out, char** err)
-    public delegate* unmanaged[Cdecl]<nint, byte*, CArrowArrayStream*, CArrowArrayStream*, byte**, int> TableFnExecute;
+    // int32 tablefn_execute(void* binding, const char* spec_json, ArrowArrayStream* filter_values,
+    //                       ArrowArrayStream* out, int32* schema_may_change, char** err)   [v81]
+    public delegate* unmanaged[Cdecl]<nint, byte*, CArrowArrayStream*, CArrowArrayStream*, int*, byte**, int> TableFnExecute;
 
     // int32 tablefn_close(void* binding, char** err)
     public delegate* unmanaged[Cdecl]<nint, byte**, int> TableFnClose;

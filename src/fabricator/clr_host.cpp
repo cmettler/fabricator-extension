@@ -1334,16 +1334,22 @@ FabricatorHandle TableFnBind(FabricatorHandle handle, const std::string &schema,
 }
 
 void TableFnExecute(FabricatorHandle binding, const std::string &spec_json, ArrowArrayStream *filter_values,
-                  ArrowArrayStream &out) {
+                  ArrowArrayStream &out, bool *schema_may_change) {
 	const FabricatorVTable &vt = GetBridge();
 	if (!vt.tablefn_execute) {
 		throw duckdb::IOException("Fabricator: bridge does not provide tablefn_execute");
 	}
 	char *err = nullptr;
 	const char *spec = spec_json.empty() ? nullptr : spec_json.c_str();
-	int32_t rc = vt.tablefn_execute(binding, spec, filter_values, &out, &err);
+	int32_t changed = 0;
+	int32_t rc = vt.tablefn_execute(binding, spec, filter_values, &out, &changed, &err);
 	if (rc != FABRICATOR_OK) {
 		ThrowManagedError(vt, err, "Fabricator: tablefn_execute failed");
+	}
+	// Only ever SET the caller's flag: several executions can share one accumulator (a prepared statement
+	// re-executed, or one plan with several scans), and a later false must not erase an earlier true.
+	if (schema_may_change && changed != 0) {
+		*schema_may_change = true;
 	}
 }
 

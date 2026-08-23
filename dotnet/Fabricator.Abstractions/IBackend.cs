@@ -198,6 +198,24 @@ public interface IBoundTableFunction : IDisposable
     bool MapResultByName { get; }
 
     /// <summary>
+    /// Whether this EXECUTION changed the provider's catalog — set by a function that performs DDL, so the
+    /// host can rebuild its metadata cache. Default <c>false</c>: an ordinary reader implements nothing.
+    /// </summary>
+    /// <remarks>
+    /// <para>⚠⚠ <b>The host reads this when <see cref="Execute"/> RETURNS, not when the returned stream is
+    /// drained.</b> So the DDL must happen in the EAGER part of Execute(); a side effect inside an
+    /// async-iterator body has not run yet at that moment, because an iterator body does not begin until the
+    /// first batch pull — a different ABI crossing, on whatever thread the host pulls from. That is the same
+    /// trap as reading an ambient in an iterator, and it fails the same silent way: the flag reads false and
+    /// the objects the function just created stay unreachable.</para>
+    /// <para>⚠ Why it matters at all, MEASURED: without an object filter, a name missing from the catalog's
+    /// discovered list is treated as GENUINELY ABSENT (<c>fabricator_schema_entry.cpp</c>'s lookup gate), so
+    /// a table or function created by this call is not merely un-enumerated — it is UNREACHABLE for the rest
+    /// of the session. There is no by-name fallback to save it.</para>
+    /// </remarks>
+    bool SchemaMayChange => false;
+
+    /// <summary>
     /// Runs the scan. <paramref name="specJson"/> (null => SELECT *) + <paramref name="filterValues"/>
     /// (null => no filter) carry projection + filter pushdown. What is honoured is the implementation's own
     /// business — DuckDB re-applies both regardless unless the underlying binding claims them (see

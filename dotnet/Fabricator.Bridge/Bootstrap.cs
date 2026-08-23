@@ -63,7 +63,7 @@ public static unsafe class Bootstrap
             return new InMemoryArrayStream(schema, new[] { batch });
         });
 
-        vtable->AbiVersion = 80;
+        vtable->AbiVersion = 81;
         vtable->OpenCatalog = &OpenCatalog;
         vtable->CloseCatalog = &CloseCatalog;
         vtable->ExecuteQuery = &ExecuteQuery;
@@ -1616,10 +1616,14 @@ public static unsafe class Bootstrap
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
     private static int TableFnExecute(nint binding, byte* specJson, CArrowArrayStream* filterValues,
-                                    CArrowArrayStream* outStream, byte** err)
+                                    CArrowArrayStream* outStream, int* schemaMayChange, byte** err)
     {
         try
         {
+            if (schemaMayChange is not null)
+            {
+                *schemaMayChange = 0;
+            }
             if (outStream is null)
             {
                 return FabricatorStatus.InvalidArgument;
@@ -1632,7 +1636,17 @@ public static unsafe class Bootstrap
             var spec = Marshal.PtrToStringUTF8((nint)specJson); // null => SELECT *
             IArrowArrayStream? filters =
                 filterValues is null ? null : CArrowArrayStreamImporter.ImportArrayStream(filterValues);
-            CArrowArrayStreamExporter.ExportArrayStream(bound.Execute(spec, filters), outStream);
+            var rows = bound.Execute(spec, filters);
+            // ⚠ READ THE FLAG AFTER Execute() RETURNS AND BEFORE THE STREAM IS DRAINED — that ordering is the
+            // whole contract (abi.h §tablefn_execute). A binding whose DDL sits in an async-iterator body has
+            // not run it yet at this point, because an iterator does not begin until the first batch PULL, a
+            // different crossing entirely. So a function reporting through this flag must do its work in the
+            // EAGER part of Execute(), and the host reads what that part decided.
+            if (schemaMayChange is not null && bound.SchemaMayChange)
+            {
+                *schemaMayChange = 1;
+            }
+            CArrowArrayStreamExporter.ExportArrayStream(rows, outStream);
             return FabricatorStatus.Ok;
         }
         catch (Exception ex)

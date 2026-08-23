@@ -1,4 +1,4 @@
-# ABI history — prior versions v16–v80
+# ABI history — prior versions v16–v81
 
 > Moved VERBATIM out of `CLAUDE.md` on 2026-07-29 (conservative split — see the commit message).
 > Append-only as-built history; the live summary + pointers stay in `CLAUDE.md`.
@@ -11,6 +11,93 @@
 > entries and the `table_*` session; v73: `table_info`/`table_stats` re-carried as ONE typed JSON doc each,
 > parsed with our own vcpkg yyjson, retiring the `ReadCapabilityFlag` string-find). v74 below is the
 > follow-on that finished the same job for ALTER.
+
+## v81 (2026-08-24) — `tablefn_execute` reports whether the execution changed the CATALOG
+
+**Signature change on ONE existing entry** (so it needs the bump even though nothing was added or removed —
+the vtable is positional, but a caller compiled against v80 would pass `err` where the flag now sits):
+
+```c
+int32_t (*tablefn_execute)(FabricatorHandle binding, const char *spec_json,
+                         struct ArrowArrayStream *filter_values, struct ArrowArrayStream *out,
+                         int32_t *schema_may_change, char **err);   //  <- new out-param
+```
+
+**WHY.** A provider-authored table function that performs DDL had no way to say so, and the consequence was
+not cosmetic. MEASURED: with no ATTACH object filter, a name missing from the catalog's discovered list is
+treated as GENUINELY ABSENT (`FabricatorSchemaEntry`'s lookup gate short-circuits before any by-name fetch),
+so a table or function such a call created is **unreachable for the rest of the session** — not merely absent
+from `duckdb_tables()`. `db.cdc.enable('dbo.o')` then `SELECT * FROM db.cdc.dbo_o_CT` gave
+`Catalog Error: Table with name dbo_o_CT does not exist!` in the same session, with no by-name fallback to
+save it.
+
+The mechanism that already existed serves `fabricator_exec` ALONE: `execute_dml` has carried a
+`schema_may_change` out-param (set in C# by `SqlDdl.MayChangeSchema`, acted on in
+`fabricator_extension.cpp`) since long before this. So this is the same flag on the other execution path,
+which makes the two paths consistent rather than adding a special case.
+
+**⚠⚠ THE ORDERING IS THE CONTRACT, AND IT IS THE ONLY SUBTLE THING HERE.** The host reads the flag when
+`tablefn_execute` RETURNS — before a single row is pulled — because the managed side reads
+`IBoundTableFunction.SchemaMayChange` immediately after `bound.Execute(...)` and before exporting the stream.
+A binding whose side effect lives in an async-iterator body has **not run it yet** at that moment: an
+iterator does not begin until the first batch PULL, a different ABI crossing, on whatever thread DuckDB pulls
+from. So a function reporting through this flag MUST do its work in the EAGER part of `Execute()`.
+
+⚠ That failure is SILENT and it is worth knowing what it looks like: the DDL still happens and succeeds, the
+function's own report row is correct, and only the cache rebuild is lost. MUTATION-TESTED — moving the work
+into the iterator kills `verify_mssql_cdc` at exactly the same assertion as never setting the flag at all
+(§11, `Catalog Error: Table with name dbo_cdc_setup_CT does not exist!`, after 78 assertions pass).
+
+**⚠⚠ THE HOST MUST NOT ACT ON IT WHERE IT IS SET, and this is the design decision that took the longest to
+reach.** The flag is raised during a SCAN. `FabricatorCatalog::RefreshCache` takes `schema_lock_` and calls
+`ClearTables()` on every schema — which would RETIRE the very entry the running statement is scanning. The
+graveyard (`retired_entries_`) makes that non-fatal rather than a use-after-free, but it is needless risk plus
+a burst of discovery IO in the middle of someone's query. So:
+
+- the scan factory records it: `FabricatorCatalog::MarkSchemaMayChange()` sets an `std::atomic<bool>`;
+- `FabricatorTransactionManager::StartTransaction` consumes it (`ConsumeSchemaMayChange()`, an atomic
+  exchange) and refreshes there.
+
+**Why that point is provably safe, established from DuckDB's source rather than assumed:**
+`FabricatorCatalog::LookupSchema` receives an ALREADY-RESOLVED `CatalogTransaction`, so DuckDB resolves the
+transaction — triggering `StartTransaction` — **before** `schema_lock_` is taken. The path that fires the
+refresh therefore holds no catalog lock of ours, and it is outside every bind and scan.
+
+⚠ The refresh is deliberately best-effort (`try`/`catch(...)`): a failed re-discovery, because the server went
+away between the DDL and now, must not abort an unrelated statement. The pre-existing stale cache is the same
+state the caller would have had without the flag, and `fabricator_refresh_cache()` stays the explicit retry.
+
+⚠ It also runs BEFORE the transaction is registered, because `RefreshCache` calls `FabricatorSetActiveTxn`
+with the CALLER's context — the ambient it needs is not one this manager has not finished creating.
+
+**A KNOWN GAP, stated rather than discovered later:** the refresh lands at the next transaction START, so
+inside ONE explicit transaction a second statement does not see objects an earlier `cdc.enable` in that same
+transaction created. Autocommit — every statement its own transaction — is unaffected, which is every
+scheduler and dbt shape. The gap is narrow and the motivating case is unmotivated: `sp_cdc_enable_table` is
+not transactional in any useful sense, and the change table it creates is empty at that instant anyway.
+`fabricator_refresh_cache()` is the escape.
+
+**Plumbing:**
+
+| side | what |
+|---|---|
+| C++ | `TableFnExecute(..., bool *schema_may_change = nullptr)` — **SET-ONLY**, so several executions sharing one accumulator (a prepared statement re-executed, or one plan with several scans) cannot have an earlier `true` erased by a later `false` |
+| C++ | `FabricatorTableFunctionInfo::catalog` carries the `FabricatorCatalog *`. Null for a GLOBAL function, which belongs to no catalog and has nothing to invalidate. ⚠ Set at exactly ONE registration site (`GetOrCreateTableFunction`) because that is the only path whose scans go through `tablefn_execute` — sqlgen uses `bind_replace`, in-out uses the exchange |
+| C# | `ITableFunctionBinding.SchemaMayChange` (author-facing) and `IBoundTableFunction.SchemaMayChange` (ABI-facing), both DIM `=> false`, forwarded by `BindingBoundTableFunction`. An ordinary reader implements nothing |
+
+⚠ Capturing the catalog by POINTER in the scan factory is safe for the same reason capturing `handle` there
+already was: both are DATABASE-scoped and outlive every plan that can reference them. It is deliberately NOT
+a `ClientContext`, which is this tree's recorded dangling-pointer class (a catalog outlives the connection
+that attached it — the `table_stats` SIGSEGV).
+
+**First consumer:** the four `db.cdc.*` setup functions (`enable_database` / `enable` / `disable`), which is
+also the only coverage of this entry in either tier. ⚠ `cdc.scan()` deliberately reports **false** — a log
+scan moves data into existing change tables and creates nothing, so rebuilding after it would be pure waste
+on the one function here most likely to be called in a loop.
+
+**Gates:** `verify_mssql_cdc` 73 → **105**, two mutants (never set the flag; move the work into the iterator)
+both killed at §11. Behaviour-neutral for everything else: the whole hermetic tier and every other service
+suite unchanged.
 
 ## v80 (2026-08-23) — the `scalarfn_*` session: a scalar's return type resolved at BIND
 

@@ -331,4 +331,161 @@ public sealed partial class SqlServerCatalog
             builder.Append(DateTimeOffset.UnixEpoch.AddTicks(micros.Value * 10));
         }
     }
+
+    // ---- slice 2: the SETUP half ----------------------------------------------------------------------
+
+    /// <summary>
+    /// <c>sys.sp_cdc_enable_db</c>, idempotently. Returns one report row; <c>changed = false</c> when the
+    /// database was already enabled.
+    /// </summary>
+    /// <remarks>
+    /// The guard is not politeness: a setup script that cannot be re-run is a setup script people stop
+    /// trusting. The check and the call are ONE batch, so nothing can change between them.
+    /// </remarks>
+    internal RecordBatch CdcEnableDatabase()
+    {
+        const string sql =
+            "SET NOCOUNT ON; " +
+            "DECLARE @db varchar(128) = CAST(DB_NAME() AS varchar(128)); " +
+            "IF " + SqlServerCdcFunctions.CdcEnabledPredicate + " " +
+            "  SELECT @db AS target, '0' AS changed, " +
+            "         CAST('change data capture was already enabled on this database' AS varchar(400)) AS detail; " +
+            "ELSE BEGIN " +
+            "  EXEC sys.sp_cdc_enable_db; " +
+            "  SELECT @db AS target, '1' AS changed, " +
+            "         CAST('enabled; capture and cleanup jobs created. Enabling is not the same as capturing" +
+            " - use cdc.health() to confirm the agent is running' AS varchar(400)) AS detail; " +
+            "END";
+        return CdcReportFrom(ReadMetadataRows(sql, 3), "cdc.enable_database");
+    }
+
+    /// <summary>
+    /// <c>sys.sp_cdc_enable_table</c> for one source table, idempotently per capture INSTANCE.
+    /// </summary>
+    /// <remarks>
+    /// <para>Every caller-supplied value crosses as a PARAMETER, never spliced text — these are identifiers
+    /// and a column list a user types, which is the one place a wrapper like this must not get clever.</para>
+    /// <para>The idempotence check keys on the capture INSTANCE, not the table, because a table legitimately
+    /// has two of them and "this table is already captured" would wrongly refuse the second. With no
+    /// <c>capture_instance</c> given, SQL Server's default is <c>&lt;schema&gt;_&lt;table&gt;</c>, so the check
+    /// resolves that name first rather than skipping the guard.</para>
+    /// </remarks>
+    internal RecordBatch CdcEnableTable(string schema, string table, string? captureInstance,
+                                       string? columns, string? role, string? index, string? filegroup,
+                                       bool net)
+    {
+        const string sql =
+            "SET NOCOUNT ON; " +
+            "DECLARE @inst sysname = ISNULL(@capture_instance, @schema + N'_' + @table); " +
+            "DECLARE @target varchar(400) = CAST(@schema + N'.' + @table + N' (' + @inst + N')' AS varchar(400)); " +
+            "IF NOT " + SqlServerCdcFunctions.CdcEnabledPredicate + " " +
+            "  THROW 50001, 'cdc.enable: change data capture is not enabled on this database - call " +
+            "cdc.enable_database() first', 1; " +
+            SqlServerCdcFunctions.HelpTableVar + " " +
+            SqlServerCdcFunctions.FillHelpTableVar + " " +
+            "IF EXISTS (SELECT 1 FROM @cdct WHERE capture_instance = @inst) " +
+            "  SELECT @target AS target, '0' AS changed, " +
+            "         CAST('this capture instance already exists' AS varchar(400)) AS detail; " +
+            "ELSE BEGIN " +
+            "  EXEC sys.sp_cdc_enable_table @source_schema = @schema, @source_name = @table, " +
+            "       @capture_instance = @inst, @captured_column_list = @columns, @role_name = @role, " +
+            "       @index_name = @index, @filegroup_name = @filegroup, @supports_net_changes = @net; " +
+            "  SELECT @target AS target, '1' AS changed, " +
+            "         CAST('capture instance created; a change table and two table-valued functions now " +
+            "exist' AS varchar(400)) AS detail; " +
+            "END";
+        return CdcReportFrom(ReadMetadataRows(sql, 3, new[]
+        {
+            new SqlParameter("@schema", schema),
+            new SqlParameter("@table", table),
+            NullableParam("@capture_instance", captureInstance),
+            NullableParam("@columns", columns),
+            NullableParam("@role", role),
+            NullableParam("@index", index),
+            NullableParam("@filegroup", filegroup),
+            new SqlParameter("@net", net ? 1 : 0),
+        }), "cdc.enable");
+    }
+
+    /// <summary>
+    /// <c>sys.sp_cdc_disable_table</c>. With no instance named it passes the procedure's own
+    /// every-instance spelling rather than an invention here.
+    /// </summary>
+    internal RecordBatch CdcDisableTable(string schema, string table, string? captureInstance)
+    {
+        const string sql =
+            "SET NOCOUNT ON; " +
+            "DECLARE @inst sysname = ISNULL(@capture_instance, N'all'); " +
+            "DECLARE @target varchar(400) = CAST(@schema + N'.' + @table + N' (' + @inst + N')' AS varchar(400)); " +
+            SqlServerCdcFunctions.HelpTableVar + " " +
+            SqlServerCdcFunctions.FillHelpTableVar + " " +
+            "IF NOT EXISTS (SELECT 1 FROM @cdct WHERE source_schema = @schema AND source_table = @table " +
+            "               AND (@capture_instance IS NULL OR capture_instance = @capture_instance)) " +
+            "  SELECT @target AS target, '0' AS changed, " +
+            "         CAST('no such capture instance - nothing to disable' AS varchar(400)) AS detail; " +
+            "ELSE BEGIN " +
+            "  EXEC sys.sp_cdc_disable_table @source_schema = @schema, @source_name = @table, " +
+            "       @capture_instance = @inst; " +
+            "  SELECT @target AS target, '1' AS changed, " +
+            "         CAST('capture instance disabled; its change table and recorded history are gone' " +
+            "AS varchar(400)) AS detail; " +
+            "END";
+        return CdcReportFrom(ReadMetadataRows(sql, 3, new[]
+        {
+            new SqlParameter("@schema", schema),
+            new SqlParameter("@table", table),
+            NullableParam("@capture_instance", captureInstance),
+        }), "cdc.disable");
+    }
+
+    /// <summary>
+    /// <c>sys.sp_cdc_scan</c> — force the capture job's log scan now.
+    /// </summary>
+    /// <remarks>
+    /// TRANSLATES THE RACE, because the raw error names nothing a reader would connect to CDC. There is ONE
+    /// log-scan session per database, so a running capture job makes this fail with
+    /// <c>22903 ... already running 'sp_replcmds' ...</c> — MEASURED at roughly 1 attempt in 57, and MEASURED
+    /// to be unfixable by retrying (20 attempts with backoff, all lost, the job confirmed running throughout).
+    /// So no retry is attempted; the message says what to do instead.
+    /// </remarks>
+    internal RecordBatch CdcScan()
+    {
+        const string sql =
+            "SET NOCOUNT ON; " +
+            "IF NOT " + SqlServerCdcFunctions.CdcEnabledPredicate + " " +
+            "  THROW 50002, 'cdc.scan: change data capture is not enabled on this database', 1; " +
+            "EXEC sys.sp_cdc_scan; " +
+            "SELECT CAST(DB_NAME() AS varchar(128)) AS target, '1' AS changed, " +
+            "       CAST('log scan completed' AS varchar(400)) AS detail;";
+        try
+        {
+            return CdcReportFrom(ReadMetadataRows(sql, 3), "cdc.scan");
+        }
+        catch (SqlException ex) when (ex.Number == 22903)
+        {
+            throw new InvalidOperationException(
+                "cdc.scan: the capture job currently holds this database's single log-scan session, so a "
+                + "manual scan cannot run (SQL Server reports it as sp_replcmds already running). Retrying "
+                + "does not help - an actively scanning job can hold that session right through a retry "
+                + "budget. Either stop the capture job for the duration "
+                + "(EXEC sys.sp_cdc_stop_job @job_type='capture'), or wait one polling interval and let the "
+                + "job do it; cdc.health() reports that interval.", ex);
+        }
+    }
+
+    // A nullable string parameter: DBNull rather than null, which SqlClient rejects.
+    private static SqlParameter NullableParam(string name, string? value) =>
+        new(name, (object?)value ?? DBNull.Value);
+
+    // The report row, re-typed from the all-varchar result. A missing row means the batch took a path that
+    // projected nothing, which is a bug HERE rather than a server state — say so, instead of returning an
+    // empty batch the caller would read as "nothing happened".
+    private static RecordBatch CdcReportFrom(List<string?[]> rows, string fn)
+    {
+        if (rows.Count == 0)
+        {
+            throw new InvalidOperationException($"{fn}: the server returned no report row.");
+        }
+        return SqlServerCdcSetup.Report(rows[0][0], rows[0][1] == "1", rows[0][2] ?? string.Empty);
+    }
 }
