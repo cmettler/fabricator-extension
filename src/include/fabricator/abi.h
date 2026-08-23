@@ -877,6 +877,73 @@ typedef struct FabricatorVTable {
 	// Release a handle from table_open. Idempotent; safe with NULL. Best-effort (entry teardown must not
 	// throw) — frees the managed GCHandle, nothing more.
 	void (*table_close)(FabricatorHandle table);
+
+	// -------------------------------------------------------------------------
+	// ROW-MAPPED (correlated LATERAL) table functions — `ILateralTableFunction`, ABI v79.
+	//
+	// The shape a table-in-out CANNOT express. An in-out declares its input as a {TABLE} parameter, so it is
+	// called `f(<relation>)` and the relation must be nameable; a lateral function declares its positional
+	// parameters as REAL VALUE TYPES and no TABLE marker, so DuckDB's binder synthesises the input relation
+	// from whichever arguments are EXPRESSIONS. That is what makes the idiomatic correlated spelling work:
+	//
+	//     SELECT * FROM inputs i, f(i.a, i.b);            -- implicitly correlated (LATERAL)
+	//     SELECT * FROM f(1, 2);                          -- the same bind, literal args
+	//
+	// TWO execution paths share ONE bind and ONE managed contract, which is what makes the batched path
+	// checkable (a kill switch flips between them and the results must be identical):
+	//   * ROW-BY-ROW — DuckDB's own PhysicalTableInOutFunction, which slices the child chunk to cardinality 1
+	//     and stamps the correlated columns itself. One lateral_call per OUTER ROW.
+	//   * BATCHED — our own PhysicalOperator (installed by an OptimizerExtension over the correlated shape),
+	//     which hands the WHOLE input chunk over in one lateral_call and stamps the correlated columns from
+	//     the provenance the callee returns. N calls become ceil(N / 2048).
+	//
+	// ⚠ PROVENANCE IS WHAT MAKES BATCHING SOUND, and it is why this is not the in-out exchange with a
+	// different name. When N input rows produce M output rows the host must know, per output row, WHICH input
+	// row produced it — otherwise it cannot stamp the correlated columns, and 1->N / 1->0 are inexpressible.
+	// It rides the wire as a TRAILING int32 column on every result batch (see lateral_call), so there is one
+	// wire format for both paths; the row-by-row path ignores it (DuckDB stamps) but still validates it.
+	// -------------------------------------------------------------------------
+
+	// Bind one lateral call. `args` (nullable) is a 1-row Arrow stream of the constant NAMED "cost" args
+	// (consumed by the managed side) — a lateral function's POSITIONAL parameters are its per-row input
+	// columns and carry no bind-time value, so they are NOT in `args`; they arrive as `input_schema`, the
+	// Arrow schema of the per-row input (consumed/released). *out_schema receives a zero-row Arrow stream
+	// whose schema = the function's OWN output columns — NOT the input echo an in-out returns, because the
+	// correlated passthrough columns are the HOST's business (DuckDB's projected_input on the row-by-row
+	// path, our own stamping on the batched one). *out_binding receives an opaque binding handle, reused
+	// across executions and per-thread sessions; freed via lateral_bind_close.
+	int32_t (*lateral_bind)(FabricatorHandle handle, const char *schema, const char *func,
+	                        struct ArrowArrayStream *args, struct ArrowSchema *input_schema,
+	                        struct ArrowArrayStream *out_schema, FabricatorHandle *out_binding, char **err);
+
+	// Open one session on a bound binding. SEVERAL sessions may be open at once and that is the point: the
+	// batched operator declares ParallelOperator(), so every pipeline thread gets its own OperatorState and
+	// therefore its own session — no shared mutable state, no gate. (Contrast the in-out exchange, which
+	// permits ONE exchange per binding and serialises parallel branches behind a mutex.)
+	int32_t (*lateral_open)(FabricatorHandle binding, FabricatorHandle *out_session, char **err);
+
+	// ONE batched call. `input` is an N-row Arrow array of the input columns (consumed/released by the
+	// managed side); *out receives a stream of the result, where every batch carries the binding's output
+	// columns PLUS one TRAILING int32 column giving, per output row, the 0-based index of the `input` row
+	// that produced it. M may be 0 (every row filtered), less than N, or far more than N (fan-out) — a
+	// batch bigger than a DuckDB vector is sliced by the host across HAVE_MORE_OUTPUT calls.
+	//
+	// The managed marshaling layer synthesises IDENTITY provenance when the author returned none, and
+	// REFUSES the absent case when M != N (a fan-out or filtering map must say which parent each row has).
+	// The host re-validates the range because it INDEXES with it.
+	//
+	// ⚠ A map owes exactly one response per request: an EMPTY stream means "0 output rows", never
+	// "end of stream" — this is a request/response entry, not a long-lived exchange.
+	int32_t (*lateral_call)(FabricatorHandle session, struct ArrowArray *input, struct ArrowArrayStream *out,
+	                        char **err);
+
+	// Release a session from lateral_open. Idempotent; safe with NULL. Best-effort (per-thread state teardown
+	// must not throw).
+	int32_t (*lateral_close)(FabricatorHandle session, char **err);
+
+	// Release a binding from lateral_bind. Idempotent; safe with NULL. Best-effort (bind-data teardown must
+	// not throw).
+	int32_t (*lateral_bind_close)(FabricatorHandle binding, char **err);
 } FabricatorVTable;
 
 // -----------------------------------------------------------------------------
@@ -1022,7 +1089,7 @@ typedef struct FabricatorHostServices {
 // state blob is this many bytes + a 4-byte length prefix). Serialize() must fit within it.
 #define FABRICATOR_AGG_SPILL_CAP 1024
 
-#define FABRICATOR_ABI_VERSION 78
+#define FABRICATOR_ABI_VERSION 79
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(FabricatorVTable) as seen

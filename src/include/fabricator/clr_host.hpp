@@ -425,6 +425,28 @@ void InOutExchangeOpen(FabricatorHandle binding, ArrowArrayStream &input, ArrowA
 void InOutBindClose(FabricatorHandle binding);
 
 // -----------------------------------------------------------------------------
+// Row-mapped (correlated LATERAL) table functions (ABI v79). See abi.h for the shape and why provenance
+// is what makes the batched path sound.
+// -----------------------------------------------------------------------------
+
+// Bind one lateral call. `args` (nullable) = a 1-row stream of the constant NAMED cost args; `input_schema`
+// = the per-row input columns (consumed). Fills `out_schema` with a zero-row stream whose schema = the
+// function's OWN output columns. Returns an opaque binding handle (freed via LateralBindClose).
+FabricatorHandle LateralBind(FabricatorHandle handle, const std::string &schema, const std::string &func,
+                             ArrowArrayStream *args, ArrowSchema &input_schema, ArrowArrayStream &out_schema);
+
+// Open one per-thread session on a bound binding (several may be open at once).
+FabricatorHandle LateralOpen(FabricatorHandle binding);
+
+// One batched call: `input` = an N-row array of the input columns (consumed). Fills `out` with the result
+// stream, whose batches carry the output columns + a TRAILING int32 provenance column.
+void LateralCall(FabricatorHandle session, ArrowArray &input, ArrowArrayStream &out);
+
+// Release a session / a binding. Both idempotent, nullptr-safe, best-effort (swallow errors).
+void LateralClose(FabricatorHandle session);
+void LateralBindClose(FabricatorHandle binding);
+
+// -----------------------------------------------------------------------------
 // Table-function session (Phase 5). The session-handle successor to ExecuteTable /
 // ExecuteProc: TableFnBind resolves a per-plan binding (output schema + whether it
 // accepts pushdown); TableFnExecute runs it (per execution); TableFnClose frees it. The

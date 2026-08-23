@@ -29,6 +29,7 @@ set(EXTENSION_SOURCES
     src/fabricator/arrow_produce.cpp
     src/catalog/fabricator_metadata.cpp
     src/catalog/fabricator_catalog.cpp
+    src/catalog/fabricator_lateral.cpp
     src/catalog/fabricator_merge_into.cpp
     src/catalog/fabricator_schema_entry.cpp
     src/catalog/fabricator_table_entry.cpp

@@ -12,6 +12,7 @@
 #include "fabricator/fabricator_onelake_fs.hpp"
 #include "fabricator/fabricator_variant.hpp"
 #include "catalog/fabricator_catalog.hpp"
+#include "catalog/fabricator_lateral.hpp"
 #include "catalog/fabricator_metadata.hpp"
 #include "catalog/fabricator_schema_entry.hpp"
 #include "copy/fabricator_copy.hpp"
@@ -521,6 +522,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 	RegisterFabricatorGlobalFunctions(loader); // connection-free global functions (docs/global-functions.md)
 	RegisterFabricatorOptimizer(DBConfig::GetConfig(loader.GetDatabaseInstance()));
 	RegisterFabricatorInOutFinalizer(DBConfig::GetConfig(loader.GetDatabaseInstance()));
+	// The correlated-LATERAL batching rewrite (docs/lateral_unnest_analysis.md). Its own OptimizerExtension
+	// rather than a branch of the in-out walk above: the two match different in_out_function pointers, so they
+	// cannot interact, and keeping them apart means the kill switch cannot accidentally disable the in-out
+	// finalizer (whose EOF signal is not optional).
+	RegisterFabricatorLateralOptimizer(DBConfig::GetConfig(loader.GetDatabaseInstance()));
 	// VARIANT over the Arrow C boundary: registers the arrow.parquet.variant type extension so VARIANT
 	// crosses every export/import path as the tagged transport struct (see fabricator_variant.hpp).
 	fabricator::RegisterFabricatorVariantExtension(loader.GetDatabaseInstance());

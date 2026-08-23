@@ -4,6 +4,14 @@ Status: **design / not yet implemented.** Locks the C++⇄C# contract and the C#
 custom **scalar**, **table**, and (later) **table-in-out** functions, across the one-binary /
 multi-provider architecture (see `CLAUDE.md` → target architecture).
 
+> ⚠ **A KIND THIS DOCUMENT DOES NOT COVER: `lateral`** (`ILateralTableFunction`, built 2026-08-22, ABI v79) —
+> a ROW-MAPPED function called `FROM t, fn(t.a, t.b)`. It is deliberately not a variant of §11's table-in-out:
+> an in-out declares its input as a `{TABLE}` parameter and so can only be called on a relation the caller can
+> NAME, while a lateral function declares its positional parameters as real value types and lets DuckDB
+> synthesise the input relation from the argument EXPRESSIONS. Batching it also needs a PROVENANCE channel
+> (which output row came from which input row) that §11's contract has no reason to carry. Its own record:
+> [lateral_unnest_analysis.md](lateral_unnest_analysis.md) §8.
+
 ## Goals
 
 - Custom **scalar** + **table** functions now; **table-in-out** sketched (Phase 4).

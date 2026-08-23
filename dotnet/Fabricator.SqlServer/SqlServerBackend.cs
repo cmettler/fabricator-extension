@@ -135,6 +135,7 @@ public sealed class SqlServerBackend : IBackend
     public IEnumerable<IScalarFunction> GlobalScalarFunctions => CustomFunctions.GlobalScalar;
     public IEnumerable<IInOutFunction> GlobalInOutFunctions => CustomFunctions.GlobalInOut;
     public IEnumerable<ICollectorTableFunction> GlobalCollectorFunctions => CustomFunctions.GlobalCollector;
+    public IEnumerable<ILateralTableFunction> GlobalLateralFunctions => CustomFunctions.GlobalLateral;
     public IEnumerable<ITableFunction> GlobalTableFunctions => CustomFunctions.GlobalTable;
     public IEnumerable<IAggregateFunction> GlobalAggregateFunctions => CustomFunctions.GlobalAggregate;
     public IEnumerable<ISqlTableFunction> GlobalSqlTableFunctions => CustomFunctions.GlobalSqlTable;
@@ -428,7 +429,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     // is this set on a plain SQL Server and this set plus the fabric_* functions on a Fabric attach.
     private static readonly CatalogFunctionSet CustomFunctionSet = new(
         CustomFunctions.Scalar, CustomFunctions.Table, CustomFunctions.SqlTable, CustomFunctions.InOut,
-        CustomFunctions.Collector, CustomFunctions.Aggregate);
+        CustomFunctions.Lateral, CustomFunctions.Collector, CustomFunctions.Aggregate);
 
     /// <summary>
     /// This catalog's catalog-bound custom functions: the static <see cref="CustomFunctionSet"/> on a plain
@@ -455,7 +456,8 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
             scalars, tables, ResolveApiWorkspace(), ResolveApiItem(),
             _fabricCredFields is null ? null : FabricCredentialResolver.Resolve(_fabricCredFields));
         return new CatalogFunctionSet(scalars, tables, CustomFunctions.SqlTable, CustomFunctions.InOut,
-                                      CustomFunctions.Collector, CustomFunctions.Aggregate);
+                                      CustomFunctions.Lateral, CustomFunctions.Collector,
+                                      CustomFunctions.Aggregate);
     }
 
     /// <summary>
@@ -3972,6 +3974,14 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         }
         return binding;
     }
+
+    // Row-mapped (correlated LATERAL) bind. Only provider-AUTHORED lateral functions exist: a discovered SQL
+    // routine has no row-mapped form to fall back to — its per-row shape is the `_each` in-out above, which
+    // takes a table argument — so an unknown name is an error rather than a fallback.
+    public ILateralBinding LateralBind(string schemaName, string functionName, RecordBatch? args, Schema inputSchema) =>
+        Functions.LateralBind(schemaName, functionName, args, inputSchema)
+        ?? throw new ArgumentException(
+            $"fabricator: '{schemaName}.{functionName}' is not a lateral function");
 
     // 4h custom aggregate (UDAF): open a session mapping DuckDB's per-group int64 state ids to live C#
     // accumulators (IAggregateFunction). Only provider-authored aggregates exist (SQL Server has no

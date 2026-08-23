@@ -405,3 +405,76 @@ RESET threads;
 
 statement ok
 DETACH pw;
+
+# ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
+# A PLUGIN-AUTHORED CORRELATED LATERAL FUNCTION, and the only place the batching win is MEASURED rather than
+# argued. docs/lateral_unnest_analysis.md §8.
+#
+# Two things at once. (1) A plugin can declare one: it references Fabricator.Abstractions and nothing else, so
+# `ILateralTableFunction` must cost it no more than a scalar does — and this is the audience the kind is FOR,
+# since a plugin's callee is typically a REST or model call. (2) `plug_lat_slow(n, millis)` sleeps ONCE PER
+# CALL, which is the only cost batching can amortise, so N distinct outer rows cost N sleeps on DuckDB's
+# row-by-row driver and about ONE on the batched operator.
+#
+# ⚠ threads=1 is required: the correlated plan feeds the operator from a DISTINCT aggregate that emits one
+# chunk per radix partition, so with several threads the 8 rows arrive as several chunks and the ratio moves.
+# ⚠ millis=100 because the Windows sleep floor is the timer tick (~15 ms) — a small value is a lie by 15x.
+# ─────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+statement ok
+SET threads=1;
+
+statement ok
+CREATE TEMP TABLE lat_in AS SELECT CAST(i AS INTEGER) AS n FROM range(8) tt(i);
+
+statement ok
+CREATE TEMP TABLE lat_t0 AS SELECT epoch_ms(now()) AS ms;
+
+statement ok
+SET fabricator_batched_lateral = false;
+
+# The SERIAL leg first, so its own duration is the baseline. `batch_rows = 1` is the mechanism assertion: this
+# leg really did get one input row per call.
+query III
+SELECT count(*), sum(s.squared), max(s.batch_rows) FROM lat_in d, plug_lat_slow(d.n, 100) s;
+----
+8	140	1
+
+statement ok
+CREATE TEMP TABLE lat_t1 AS SELECT epoch_ms(now()) AS ms;
+
+statement ok
+SET fabricator_batched_lateral = true;
+
+# Same answers, and all 8 rows in ONE call.
+query III
+SELECT count(*), sum(s.squared), max(s.batch_rows) FROM lat_in d, plug_lat_slow(d.n, 100) s;
+----
+8	140	8
+
+statement ok
+CREATE TEMP TABLE lat_t2 AS SELECT epoch_ms(now()) AS ms;
+
+# POSITIVE CONTROL, load-bearing: the row-by-row leg really slept eight times. Without it the ratio below
+# would pass equally on a build where the sleeps had stopped happening.
+query I
+SELECT ((SELECT ms FROM lat_t1) - (SELECT ms FROM lat_t0)) >= 700;
+----
+true
+
+# THE CLAIM: one call instead of eight, so the statement costs about ONE sleep. Measured 0.154 s against
+# 0.870 s (5.6x); asserted at 0.5 to leave room for a loaded machine.
+query I
+SELECT ((SELECT ms FROM lat_t2) - (SELECT ms FROM lat_t1))
+     < ((SELECT ms FROM lat_t1) - (SELECT ms FROM lat_t0)) * 0.5;
+----
+true
+
+# The plugin's declaration is advertised like any other function's.
+query II
+SELECT function_type, parameter_types FROM duckdb_functions() WHERE function_name = 'plug_lat_slow';
+----
+table	[INTEGER, INTEGER]
+
+statement ok
+RESET threads;

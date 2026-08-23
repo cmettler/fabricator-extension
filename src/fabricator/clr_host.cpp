@@ -1208,6 +1208,80 @@ void InOutBindClose(FabricatorHandle binding) {
 	}
 }
 
+// -----------------------------------------------------------------------------
+// Row-mapped (correlated LATERAL) table functions (ABI v79).
+// -----------------------------------------------------------------------------
+
+FabricatorHandle LateralBind(FabricatorHandle handle, const std::string &schema, const std::string &func,
+                             ArrowArrayStream *args, ArrowSchema &input_schema, ArrowArrayStream &out_schema) {
+	const FabricatorVTable &vt = GetBridge();
+	if (!vt.lateral_bind) {
+		throw duckdb::IOException("Fabricator: bridge does not provide lateral_bind");
+	}
+	FabricatorHandle binding = nullptr;
+	char *err = nullptr;
+	int32_t rc =
+	    vt.lateral_bind(handle, schema.c_str(), func.c_str(), args, &input_schema, &out_schema, &binding, &err);
+	if (rc != FABRICATOR_OK) {
+		ThrowManagedError(vt, err, "Fabricator: lateral_bind failed");
+	}
+	return binding;
+}
+
+FabricatorHandle LateralOpen(FabricatorHandle binding) {
+	const FabricatorVTable &vt = GetBridge();
+	if (!vt.lateral_open) {
+		throw duckdb::IOException("Fabricator: bridge does not provide lateral_open");
+	}
+	FabricatorHandle session = nullptr;
+	char *err = nullptr;
+	int32_t rc = vt.lateral_open(binding, &session, &err);
+	if (rc != FABRICATOR_OK) {
+		ThrowManagedError(vt, err, "Fabricator: lateral_open failed");
+	}
+	return session;
+}
+
+void LateralCall(FabricatorHandle session, ArrowArray &input, ArrowArrayStream &out) {
+	const FabricatorVTable &vt = GetBridge();
+	if (!vt.lateral_call) {
+		throw duckdb::IOException("Fabricator: bridge does not provide lateral_call");
+	}
+	char *err = nullptr;
+	int32_t rc = vt.lateral_call(session, &input, &out, &err);
+	if (rc != FABRICATOR_OK) {
+		ThrowManagedError(vt, err, "Fabricator: lateral_call failed");
+	}
+}
+
+void LateralClose(FabricatorHandle session) {
+	if (!session) {
+		return;
+	}
+	const FabricatorVTable &vt = GetBridge();
+	if (!vt.lateral_close) {
+		return;
+	}
+	char *err = nullptr;
+	if (vt.lateral_close(session, &err) != FABRICATOR_OK && err && vt.free_error) {
+		vt.free_error(err); // best-effort teardown
+	}
+}
+
+void LateralBindClose(FabricatorHandle binding) {
+	if (!binding) {
+		return;
+	}
+	const FabricatorVTable &vt = GetBridge();
+	if (!vt.lateral_bind_close) {
+		return;
+	}
+	char *err = nullptr;
+	if (vt.lateral_bind_close(binding, &err) != FABRICATOR_OK && err && vt.free_error) {
+		vt.free_error(err); // best-effort teardown
+	}
+}
+
 FabricatorHandle TableFnBind(FabricatorHandle handle, const std::string &schema, const std::string &func,
                          ArrowArrayStream *args, ArrowArrayStream &out_schema, bool &supports_pushdown) {
 	const FabricatorVTable &vt = GetBridge();

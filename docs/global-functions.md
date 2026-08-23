@@ -1,5 +1,14 @@
 # Load-time global functions (connection-free) — plan
 
+> ⚠ **A SIXTH KIND joined the family on 2026-08-22 and is not described below: `lateral`** — a row-mapped
+> (correlated LATERAL) function, `FROM t, fn(t.a, t.b)`. It follows this document's pattern exactly (a
+> `list_global_functions` kind string + a handle-0 `lateral_bind` marker resolving against the C# global
+> registry by name, `GlobalFunctions.ResolveLateral`), so nothing here needed changing — but it does NOT reuse
+> the exchange ABI, because a batched correlated call needs a PROVENANCE channel the in-out path has no reason
+> to carry. Its own record: [lateral_unnest_analysis.md](lateral_unnest_analysis.md) §8 and
+> [abi-history.md](abi-history.md) §v79. Global demos: `fabricator_lat_repeat` / `fabricator_lat_scale` /
+> `fabricator_lat_badorigin`, gated hermetically by `test/verify_lateral.test` (144).
+>
 > Status: **BUILT + verified for ALL FIVE kinds** — global **scalar** (ABI v46 `list_global_functions` +
 > handle-0 dispatch; `fabricator_render`, Fluid/Liquid), **in-out + collector** (`fabricator_tag` +
 > `fabricator_collect_sum`, handle-0 `inout_bind`), **table** (`fabricator_seq` fixed + `fabricator_columns`

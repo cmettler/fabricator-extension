@@ -1,4 +1,4 @@
-# ABI history — prior versions v16–v75
+# ABI history — prior versions v16–v79
 
 > Moved VERBATIM out of `CLAUDE.md` on 2026-07-29 (conservative split — see the commit message).
 > Append-only as-built history; the live summary + pointers stay in `CLAUDE.md`.
@@ -11,6 +11,49 @@
 > entries and the `table_*` session; v73: `table_info`/`table_stats` re-carried as ONE typed JSON doc each,
 > parsed with our own vcpkg yyjson, retiring the `ReadCapabilityFlag` string-find). v74 below is the
 > follow-on that finished the same job for ALTER.
+
+## v79 (2026-08-22) — the `lateral_*` session: row-mapped (correlated LATERAL) functions
+
+**Additive**, five entries appended after `table_close`:
+
+```c
+int32_t (*lateral_bind)(handle, schema, func, args, input_schema, out_schema, out_binding, err);
+int32_t (*lateral_open)(binding, out_session, err);
+int32_t (*lateral_call)(session, input, out, err);
+int32_t (*lateral_close)(session, err);
+int32_t (*lateral_bind_close)(binding, err);
+```
+
+**WHY A NEW SESSION RATHER THAN THE IN-OUT EXCHANGE, which it superficially resembles.** Three differences,
+each of which the exchange cannot express:
+
+1. **PROVENANCE.** When N input rows produce M output rows the host must know, per output row, WHICH input row
+   produced it — otherwise it cannot stamp the correlated columns (`t.x` in
+   `SELECT t.x, f.* FROM t, f(t.a)`) and 1→N / 1→0 are inexpressible. An in-out never has to answer that,
+   because either exactly one row is in flight or there are no correlated columns to stamp. It rides the wire
+   as a TRAILING int32 column on every result batch, so ONE format serves both execution paths.
+2. **SEVERAL SESSIONS AT ONCE.** `inout_exchange_open` permits one exchange per binding and serialises
+   parallel branches behind a C++ gate; the batched lateral operator declares `ParallelOperator()`, so every
+   pipeline thread opens its OWN session and there is no shared mutable state to guard.
+3. **REQUEST/RESPONSE, not a stream.** `lateral_call` answers exactly once per request — an EMPTY result means
+   "these inputs produced nothing", never "end of stream". The exchange's length-0 SENTINEL has no meaning
+   here (the reader skips one rather than reading it as end-of-call).
+
+**⚠ It reuses the in-out ABI for NOTHING, deliberately**, and the reason is the user's own instruction on the
+day it was built: the streaming exchange was hard to get right and every `_each` form in the product runs on
+it. An additive, isolated path cannot regress it — the only shared code is `ArrowStreamReader`, which is
+read-only.
+
+`lateral_bind`'s `out_schema` is the function's OWN output columns — NOT the input echo an in-out returns,
+because the correlated passthrough columns are the HOST's business (DuckDB's `projected_input` on the
+row-by-row path, our own stamping on the batched one).
+
+Managed: `ILateralTableFunction` / `ILateralBinding` / `ILateralSession` / `LateralResult` in
+`Fabricator.Abstractions`, marshaled by `Fabricator.Bridge/LateralExchange.cs`; `IBackend
+.GlobalLateralFunctions` and a throwing-DIM `IBackendCatalog.LateralBind`. Declaration kind `lateral`.
+C++: `src/catalog/fabricator_lateral.{cpp,hpp}` — the bind, the row-by-row `in_out_function`, the batched
+`PhysicalOperator` and the `OptimizerExtension` that installs it. Full as-built + what only building it
+revealed: [lateral_unnest_analysis.md](lateral_unnest_analysis.md) §8.
 
 ## v78 (2026-08-20) — `catalog_init`: the provider's ONE chance to initialise with a live client context
 

@@ -251,6 +251,29 @@ should be something the USER asks for by name rather than something a file appea
 - **Signature or checksum verification** of an archive. `Hashing` is there; nothing consumes it here.
 - **Per-plugin ALC isolation** -- see the sequenced recommendation below. Still correctly deferred.
 
+## A plugin can declare a CORRELATED LATERAL function (2026-08-22, ABI v79)
+
+`ILateralTableFunction` lives in `Fabricator.Abstractions`, so declaring one costs a plugin no more than
+declaring a scalar — and it is the function kind a plugin most often wants, because its callee is typically a
+REST or model call and the whole point is that the WHOLE INPUT CHUNK crosses in one call:
+
+```sql
+SELECT t.id, r.* FROM t, my_plugin_fn(t.a, t.b);   -- one call per ~2048 outer rows, not per row
+```
+
+The sample plugin ships `plug_lat_slow(n, millis)`, which sleeps **once per call**. That is not a demo, it is
+the INSTRUMENT: a per-call cost is the only thing batching can amortise, so `verify_plugin` can assert the win
+as a ratio between two legs of one statement rather than quoting a remembered number — measured **0.870 s
+row-by-row vs 0.154 s batched** for 8 distinct outer rows at 100 ms, with `max(batch_rows)` (1 vs 8) as the
+mechanism assertion. Full record: [lateral_unnest_analysis.md](lateral_unnest_analysis.md) §8.
+
+⚠ Two constraints a plugin author needs before designing one. **A named argument cannot be used in the
+CORRELATED shape** (a DuckDB limitation — [duckdb-upstream-issues.md](duckdb-upstream-issues.md) §5), so
+declare a per-call constant POSITIONALLY. And **the correlated values are DE-DUPLICATED before the call**:
+DuckDB puts a `DISTINCT` under it and re-expands by joining above, so cost scales with distinct argument
+tuples rather than with outer rows — which is usually good news for a network callee, and is the reason a
+performance estimate based on row count will be wrong.
+
 ## HTTP from a plugin — use the host's transport, once you can reach it
 
 A plugin whose backend is a REST API should not carry its own TLS trust, proxy configuration or retry

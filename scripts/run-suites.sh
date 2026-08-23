@@ -158,7 +158,11 @@ case "$TIER" in
         # 72 runs since 2026-08-20: verify_catalog_init — the provider init hook (ABI v78). Hermetic on the
         # DELTA provider deliberately, i.e. the one whose Initialize() is a no-op DIM: that is what proves the
         # hook is wired in the HOST rather than in one provider.
-        : "${MIN_SUITES:=73}"
+        # 73 runs since 2026-08-22: verify_lateral — row-mapped (correlated LATERAL) functions, both
+        # execution paths. Hermetic because the demos are GLOBAL functions: no ATTACH, no connection, so the
+        # host machinery (the optimizer rewrite, the operator, the provenance contract) is provable without a
+        # server. The catalog-bound half rides verify_functions in the service tier.
+        : "${MIN_SUITES:=74}"
         # 5656 since 2026-08-02: verify_delta_catalog_transactions 943 -> 944 Ã¢ÂÂ ROLLBACK now RECLAIMS the
         # data files the transaction eagerly wrote (EW #52's DiscardDataFilesAsync) instead of leaving them
         # for VACUUM. +2, not +1: that suite is one of the DOUBLED ones below, so an assertion added to it
@@ -366,7 +370,19 @@ case "$TIER" in
         # into ONE producer from several tasks now, so the sections are ~20 morsels rather than the single
         # chunk the rest of those suites touch. The UPDATE one asserts a DERIVED value per row
         # (s = 'u' || id): a concurrency bug there writes a value to the WRONG row, which no count sees.
-        : "${MIN_ASSERTIONS:=7818}"
+        # 7986 since 2026-08-22: verify_lateral (168) — the correlated-LATERAL function kind. Its
+        # load-bearing assertions are the REFERENCE ORACLE (both paths' full result sets, EXCEPT in both
+        # directions, at threads=4 over duplicate correlated values) and §5's `batch_rows` proof that the
+        # batched path really batched: result equivalence alone would pass on a build that silently reverted
+        # to one call per row. ⚠ §5's fixture needs ALL-DISTINCT correlated values — decorrelation puts a
+        # DISTINCT aggregate under the operator, so a 97-distinct-value table can never hand it more than 97
+        # rows and the first version of that assertion was unreachable by construction.
+        # rows and the first version of that assertion was unreachable by construction. §13 covers the gather's
+        # real risk surface — a correlated VARCHAR long enough to be HEAP-allocated (an inlined string would
+        # survive a dangling buffer), plus a STRUCT and a LIST, all replicated across drain slices by a 1→N
+        # fan-out; §14 executes a PREPARED statement twice, since the managed binding is reused across
+        # executions while a session is per operator state.
+        : "${MIN_ASSERTIONS:=7986}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh
@@ -527,7 +543,19 @@ case "$TIER" in
         # Mutation-tested: forcing the modify flag false dies at that ratio after 74 assertions pass,
         # while BOTH correctness suites stay green - which is the right kill, since a parallel DELETE
         # and a serial one produce the same rows.
-        : "${MIN_ASSERTIONS:=2170}"
+        # 2203 since 2026-08-22: verify_functions 34 -> 67 for CATALOG-BOUND row-mapped (correlated LATERAL)
+        # functions. The host machinery is gated hermetically (verify_lateral); this is the only place that
+        # proves a CATALOG's `kind='lateral'` declaration arrives and RESOLVES — and it earned its keep
+        # immediately: the declaration was listed by fabricator_functions() and the function still did not
+        # exist, because CatalogFunctionSet.ParamSchema did not answer for the kind and a lateral function
+        # cannot be registered without its positional parameter types.
+        # 2221 since 2026-08-22: verify_plugin 79 -> 97 for a PLUGIN-authored correlated LATERAL function. It
+        # is the only place the batching win is MEASURED rather than argued: plug_lat_slow sleeps ONCE PER
+        # CALL, so 8 distinct outer rows cost 8 sleeps on DuckDB's row-by-row driver and one on the batched
+        # operator (0.870 s vs 0.154 s), with the serial leg's own duration as the positive control and
+        # `max(batch_rows)` (1 vs 8) as the mechanism assertion. ⚠ threads=1 is required — the delim scan
+        # emits one chunk per radix partition, so several threads split the 8 rows and move the ratio.
+        : "${MIN_ASSERTIONS:=2221}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

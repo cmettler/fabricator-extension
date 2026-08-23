@@ -143,3 +143,61 @@ statement error
 SELECT * FROM cv_info;
 ----
 does not exist
+
+# ============================================================================
+# CATALOG-BOUND ROW-MAPPED (correlated LATERAL) functions — `kind='lateral'`, resolved through
+# SqlServerCatalog.LateralBind. The declaration surface for the SECOND provider, gated for the same
+# reason as the views above: the host machinery is proved hermetically by verify_lateral, and this is
+# the only place that proves a CATALOG's declarations arrive and resolve.
+#
+# The spelling is what makes the kind worth having: `FROM t, db.dbo.cf_lat_split(t.txt, ',')` — a
+# table-in-out cannot be written that way at all, because its input is a declared {TABLE} parameter and
+# so must be a relation the caller can name.
+# ============================================================================
+
+query I
+SELECT count(*) FROM duckdb_functions()
+WHERE database_name = 'fdb' AND function_name = 'cf_lat_split' AND function_type = 'table';
+----
+1
+
+statement ok
+CREATE TEMP TABLE lat_src AS SELECT * FROM (VALUES (1, 'a,b,c'), (2, 'x'), (3, NULL)) v(id, txt);
+
+# Fan-out, with the correlated column stamped per emitted fragment — and a NULL row contributing nothing.
+query III
+SELECT s.id, p.part, p.idx FROM lat_src s, fdb.dbo.cf_lat_split(s.txt, ',') p ORDER BY ALL;
+----
+1	a	0
+1	b	1
+1	c	2
+2	x	0
+
+# The literal shape binds the same declaration.
+query II
+SELECT part, idx FROM fdb.dbo.cf_lat_split('p,q', ',') ORDER BY ALL;
+----
+p	0
+q	1
+
+# Both execution paths agree — the reference oracle, on the catalog path this time.
+statement ok
+SET fabricator_batched_lateral = false;
+
+query III
+SELECT s.id, p.part, p.idx FROM lat_src s, fdb.dbo.cf_lat_split(s.txt, ',') p ORDER BY ALL;
+----
+1	a	0
+1	b	1
+1	c	2
+2	x	0
+
+statement ok
+SET fabricator_batched_lateral = true;
+
+# ⚠ NOT callable under its bare name. Without this the assertions above would pass equally if the
+# function had been registered globally, which is a different feature with a different scope.
+statement error
+SELECT * FROM cf_lat_split('a,b', ',');
+----
+does not exist

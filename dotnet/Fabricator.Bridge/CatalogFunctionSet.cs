@@ -36,6 +36,7 @@ public sealed class CatalogFunctionSet
     private readonly Dictionary<string, ICatalogTableFunction> _tables;
     private readonly Dictionary<string, ICatalogSqlTableFunction> _sqlTables;
     private readonly Dictionary<string, ICatalogInOutFunction> _inOut;
+    private readonly Dictionary<string, ICatalogLateralFunction> _laterals;
     private readonly Dictionary<string, ICatalogCollectorTableFunction> _collectors;
     private readonly Dictionary<string, ICatalogAggregateFunction> _aggregates;
 
@@ -44,6 +45,7 @@ public sealed class CatalogFunctionSet
         IEnumerable<ICatalogTableFunction>? tables = null,
         IEnumerable<ICatalogSqlTableFunction>? sqlTables = null,
         IEnumerable<ICatalogInOutFunction>? inOut = null,
+        IEnumerable<ICatalogLateralFunction>? laterals = null,
         IEnumerable<ICatalogCollectorTableFunction>? collectors = null,
         IEnumerable<ICatalogAggregateFunction>? aggregates = null)
     {
@@ -51,6 +53,7 @@ public sealed class CatalogFunctionSet
         _tables = Index(tables);
         _sqlTables = Index(sqlTables);
         _inOut = Index(inOut);
+        _laterals = Index(laterals);
         _collectors = Index(collectors);
         _aggregates = Index(aggregates);
     }
@@ -73,6 +76,7 @@ public sealed class CatalogFunctionSet
         ICatalogTableFunction f => f.SchemaName,
         ICatalogSqlTableFunction f => f.SchemaName,
         ICatalogInOutFunction f => f.SchemaName,
+        ICatalogLateralFunction f => f.SchemaName,
         ICatalogCollectorTableFunction f => f.SchemaName,
         ICatalogAggregateFunction f => f.SchemaName,
         _ => throw new ArgumentException($"not a catalog-bound function: {fn.GetType().Name}"),
@@ -84,6 +88,7 @@ public sealed class CatalogFunctionSet
         ICatalogTableFunction f => f.Name,
         ICatalogSqlTableFunction f => f.Name,
         ICatalogInOutFunction f => f.Name,
+        ICatalogLateralFunction f => f.Name,
         ICatalogCollectorTableFunction f => f.Name,
         ICatalogAggregateFunction f => f.Name,
         _ => throw new ArgumentException($"not a catalog-bound function: {fn.GetType().Name}"),
@@ -92,7 +97,7 @@ public sealed class CatalogFunctionSet
     /// <summary>True when nothing is registered — lets a caller keep its old "no functions" behaviour cheaply.</summary>
     public bool IsEmpty =>
         _scalars.Count == 0 && _tables.Count == 0 && _sqlTables.Count == 0 && _inOut.Count == 0
-        && _collectors.Count == 0 && _aggregates.Count == 0;
+        && _laterals.Count == 0 && _collectors.Count == 0 && _aggregates.Count == 0;
 
     private static string Key(string schema, string name) => $"{schema}.{name}";
 
@@ -138,6 +143,12 @@ public sealed class CatalogFunctionSet
         {
             Emit(f.SchemaName, f.Name, "inout", Params.DeclaredCount(f.Parameters), "");
         }
+        foreach (var f in _laterals.Values)
+        {
+            // DeclaredCount counts positional + named, which for a lateral function is exactly its argument
+            // count: its positional parameters ARE the per-row input columns and each occupies an arg slot.
+            Emit(f.SchemaName, f.Name, "lateral", Params.DeclaredCount(f.Parameters), "");
+        }
         foreach (var f in _collectors.Values)
         {
             Emit(f.SchemaName, f.Name, "collector", Params.DeclaredCount(f.Parameters), "");
@@ -167,6 +178,9 @@ public sealed class CatalogFunctionSet
     public bool TryInOut(string schema, string func, out ICatalogInOutFunction fn) =>
         TryGet(_inOut, schema, func, out fn);
 
+    public bool TryLateral(string schema, string func, out ICatalogLateralFunction fn) =>
+        TryGet(_laterals, schema, func, out fn);
+
     public bool TryCollector(string schema, string func, out ICatalogCollectorTableFunction fn) =>
         TryGet(_collectors, schema, func, out fn);
 
@@ -186,6 +200,16 @@ public sealed class CatalogFunctionSet
         if (TryTable(schema, func, out var t)) { return t.Parameters; }
         if (TryAggregate(schema, func, out var a)) { return a.Parameters; }
         if (TrySqlTable(schema, func, out var g)) { return g.Parameters; }
+        // A lateral function MUST answer here: its positional parameters become the DuckDB argument types, so
+        // without this the host resolves no signature and the declaration silently never becomes a callable
+        // function (measured — `fabricator_functions()` listed it and `db.dbo.fn(...)` said "does not exist").
+        //
+        // ⚠ In-out and collector are NOT in this list, and that is pre-existing rather than deliberate:
+        // GetOrCreateCustomInOutFunction catches the resulting failure and falls back to the bare {TABLE}
+        // signature, which is right for every in-out shipped today (none declares a cost arg on a CATALOG) and
+        // would silently drop one that did. Left alone — adding them here would change how every existing
+        // in-out's signature is built, which is not this change's business.
+        if (TryLateral(schema, func, out var l)) { return l.Parameters; }
         return null;
     }
 
@@ -256,6 +280,21 @@ public sealed class CatalogFunctionSet
             return new CollectorInOutBinding(collector.Bind(args, inputSchema));
         }
         return TryInOut(schema, func, out var fn) ? fn.Bind(args, inputSchema) : null;
+    }
+
+    /// <summary>
+    /// Binds a ROW-MAPPED (correlated LATERAL) call. Null when the name is not ours. Kept separate from
+    /// <see cref="InOutBind"/> on purpose: the two answer different ABI entries and their bindings have
+    /// different contracts (an in-out echoes its input, a lateral function does not).
+    /// </summary>
+    public ILateralBinding? LateralBind(string schema, string func, RecordBatch? args, Schema inputSchema)
+    {
+        if (!TryLateral(schema, func, out var fn))
+        {
+            return null;
+        }
+        Params.Validate(fn.Name, fn.Parameters, allowNamed: true, allowTableInput: false);
+        return fn.Bind(args, inputSchema);
     }
 
     /// <summary>

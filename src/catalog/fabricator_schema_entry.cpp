@@ -9,6 +9,7 @@
 #include "fabricator/arrow_produce.hpp"
 #include "fabricator/clr_host.hpp"
 #include "catalog/fabricator_catalog.hpp"
+#include "catalog/fabricator_lateral.hpp"
 #include "catalog/fabricator_metadata.hpp"
 #include "catalog/fabricator_txn_util.hpp"
 #include "duckdb/common/arrow/arrow_appender.hpp"
@@ -163,6 +164,12 @@ void FabricatorSchemaEntry::AddInOutFunction(const string &func_name) {
 	RetireErase(table_function_entries_, func_name, retired_entries_);
 }
 
+void FabricatorSchemaEntry::AddLateralFunction(const string &func_name) {
+	lock_guard<mutex> lock(entry_lock_);
+	custom_lateral_functions_.insert(func_name);
+	RetireErase(table_function_entries_, func_name, retired_entries_);
+}
+
 void FabricatorSchemaEntry::AddCollectorFunction(const string &func_name) {
 	lock_guard<mutex> lock(entry_lock_);
 	custom_collector_functions_.insert(func_name);
@@ -210,6 +217,7 @@ void FabricatorSchemaEntry::ClearTables() {
 	RetireAll(function_entries_, retired_entries_);
 	table_functions_.clear();
 	custom_inout_functions_.clear();
+	custom_lateral_functions_.clear();
 	custom_collector_functions_.clear();
 	aggregate_functions_.clear();
 	macros_.clear();
@@ -2396,6 +2404,29 @@ void RegisterFabricatorGlobalFunctions(ExtensionLoader &loader) {
 				}
 				tf.function_info = std::move(fn_info);
 				loader.RegisterFunction(tf);
+			} else if (kind == "lateral") {
+				// A connection-free ROW-MAPPED function: its POSITIONAL parameters become real value-typed
+				// ARGUMENTS (which is what lets `f(i.a, i.b)` bind against an outer relation), with handle = 0
+				// so lateral_bind resolves the binding against the C# global registry by name. Mirrors
+				// GetOrCreateLateralFunction — both go through FabricatorMakeLateralFunction.
+				vector<string> arg_names;
+				vector<LogicalType> arg_types;
+				vector<FabricatorParamStyle> arg_styles;
+				try {
+					FetchFunctionParamSchema(context, nullptr, "", fn_name, arg_names, arg_types, &arg_styles);
+				} catch (std::exception &) {
+					continue; // skip a global whose signature can't be resolved
+				}
+				if (arg_names.empty()) {
+					continue; // a lateral function's arguments ARE its input; a zero-arg one is uncallable
+				}
+				try {
+					loader.RegisterFunction(FabricatorMakeLateralFunction(nullptr, "", fn_name, std::move(arg_names),
+					                                                     std::move(arg_types),
+					                                                     std::move(arg_styles)));
+				} catch (std::exception &) {
+					continue; // a bad declaration (e.g. a table-input parameter) must not fail extension load
+				}
 			} else if (kind == "aggregate" || kind == "aggregate_spill") {
 				// A connection-free aggregate (UDAF): same state-vectorized callbacks as a catalog aggregate,
 				// handle = 0 so agg_open resolves the session against the C# global registry by name. Usable in
@@ -2555,6 +2586,10 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateTableFunction(Clien
 		if (custom_collector_functions_.find(func_name) != custom_collector_functions_.end()) {
 			return GetOrCreateCustomCollectorFunction(context, func_name);
 		}
+		// A provider-authored ROW-MAPPED (correlated LATERAL) function, likewise under the bare name.
+		if (custom_lateral_functions_.find(func_name) != custom_lateral_functions_.end()) {
+			return GetOrCreateLateralFunction(context, func_name);
+		}
 		return nullptr;
 	}
 	bool is_proc = kind_it->second;
@@ -2712,6 +2747,39 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateCustomInOutFunction
 	inout.function_info = std::move(fn_info);
 
 	CreateTableFunctionInfo info(std::move(inout));
+	info.catalog = catalog.GetName();
+	info.schema = name;
+	auto entry = make_uniq<TableFunctionCatalogEntry>(catalog, *this, info);
+	auto &ref = *entry;
+	table_function_entries_[func_name] = std::move(entry);
+	return &ref;
+}
+
+// Build the catalog entry for a provider-authored ROW-MAPPED (correlated LATERAL) function. Everything about
+// the TableFunction is built by FabricatorMakeLateralFunction (shared verbatim with the load-time GLOBAL
+// registrar, so the two spellings cannot drift); this only resolves the declared signature and caches the
+// entry. Caller holds entry_lock_.
+optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateLateralFunction(ClientContext &context,
+                                                                            const string &func_name) {
+	vector<string> arg_names;
+	vector<LogicalType> arg_types;
+	vector<FabricatorParamStyle> arg_styles;
+	try {
+		FetchFunctionParamSchema(context, handle_, name, func_name, arg_names, arg_types, &arg_styles);
+	} catch (std::exception &) {
+		// Stale declaration (a cache refresh dropped it) — treat as not-found rather than registering a
+		// function with no arguments, which for a lateral function is uncallable by construction.
+		custom_lateral_functions_.erase(func_name);
+		RetireErase(table_function_entries_, func_name, retired_entries_);
+		return nullptr;
+	}
+	if (arg_names.empty()) {
+		custom_lateral_functions_.erase(func_name);
+		return nullptr;
+	}
+	auto fn = FabricatorMakeLateralFunction(handle_, name, func_name, std::move(arg_names), std::move(arg_types),
+	                                        std::move(arg_styles));
+	CreateTableFunctionInfo info(std::move(fn));
 	info.catalog = catalog.GetName();
 	info.schema = name;
 	auto entry = make_uniq<TableFunctionCatalogEntry>(catalog, *this, info);
@@ -2968,6 +3036,9 @@ void FabricatorSchemaEntry::Scan(ClientContext &context, CatalogType type,
 				names.push_back(fn);
 			}
 			for (auto &fn : custom_collector_functions_) {
+				names.push_back(fn);
+			}
+			for (auto &fn : custom_lateral_functions_) {
 				names.push_back(fn);
 			}
 			// SQL-generating (bind_replace) functions are catalog table functions too — without this they

@@ -498,6 +498,51 @@ the entire hermetic tier, so this constrains *harness design* rather than the sh
 local root cannot host any multi-writer experiment. Fixing it upstream would make local Windows as safe as
 local POSIX for free — the code above `HostFsOpenWrite` needs no change at all.
 
+## 5. A NAMED argument is unusable in the CORRELATED shape of a table-in-out function
+
+**Status: reproduced on our pinned 1.5.5, mechanism read from the source, NOT filed.** It bounds a shipped
+feature (`ILateralTableFunction`, see docs/lateral_unnest_analysis.md §8), so the workaround matters more
+than the report.
+
+`f(t.a, opt := 5)` — a named argument alongside a column argument — does not bind:
+
+```
+Binder Error: No function matches the given name and argument types 'fabricator_lat_scale(INTEGER, INTEGER)'.
+	Candidate functions:
+	fabricator_lat_scale(INTEGER, factor : INTEGER)
+```
+
+The named argument became a POSITIONAL one, so the call's arity no longer matches the declaration. The
+literal-argument form of the SAME function binds and honours it (`f(5, factor := 10)` ⇒ 50).
+
+**Mechanism** (`src/planner/binder/tableref/bind_table_function.cpp:96-102`): `BindTableFunctionParameters`
+tests the bind TYPE first, and for `TABLE_IN_OUT_FUNCTION` it calls `BindTableInTableOutFunction(expressions,
+subquery)` and RETURNS. That helper moves **every** argument expression into a synthesized subquery's SELECT
+list. The named-parameter extraction — the loop below it, whose own comment reads *"hack to make named
+parameters work"* — is never reached, so `opt := 5` is bound as an ordinary comparison expression and becomes
+a phantom input COLUMN. The literal form escapes because all-scalar arguments take the
+`STANDARD_TABLE_FUNCTION` path, where that loop does run.
+
+**A stock, extension-free demonstration of the same sweep** (not a full repro — `unnest` handles `recursive`
+in the parser and declares no table-function named parameters at all, so it would refuse the named form
+anyway):
+
+```sql
+CREATE TABLE t AS SELECT 1 AS id, [[1,2],[3]] AS l;
+SELECT * FROM t, unnest(t.l, recursive := true);
+-- Binder Error: ... 'unnest(INTEGER[][], BOOLEAN)'
+```
+
+The reported argument types are the tell: `recursive := true` arrived as a positional BOOLEAN. A real repro
+needs an extension-registered in-out function that declares a named parameter.
+
+**⚠ THE WORKAROUND IS THE PART THAT MATTERS, and it is not a compromise: declare a per-call constant
+POSITIONALLY.** Under the row-mapped registration every positional slot is runtime data, so a literal written
+at the call site arrives as a CONSTANT INPUT COLUMN — `f(t.a, 2)` works in both shapes, and the callee reads
+the value per call instead of at bind. Measured working (`verify_lateral` §2). What genuinely remains
+unavailable is a named parameter used correlated, i.e. bind-time configuration of a correlated call; the
+default declared in `Bind` still applies there.
+
 ## Not a bug, but pinned here because it wasted time three times
 
 `read_parquet` answers `count(*)` — and `count(<col>)` — from parquet footer metadata without decoding the

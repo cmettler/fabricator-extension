@@ -279,6 +279,24 @@ public unsafe struct FabricatorVTable
     public delegate* unmanaged[Cdecl]<nint, byte*, CArrowArrayStream*, byte**, int> TableAlter;
     // void table_close(void* table)
     public delegate* unmanaged[Cdecl]<nint, void> TableClose;
+
+    // --- row-mapped (correlated LATERAL) table functions, ABI v79 ---
+
+    // int32 lateral_bind(void* handle, const char* schema, const char* func, ArrowArrayStream* args /*nullable*/,
+    //                    ArrowSchema* input_schema, ArrowArrayStream* out_schema, void** out_binding, char** err)
+    public delegate* unmanaged[Cdecl]<nint, byte*, byte*, CArrowArrayStream*, CArrowSchema*, CArrowArrayStream*, nint*, byte**, int> LateralBind;
+
+    // int32 lateral_open(void* binding, void** out_session, char** err)
+    public delegate* unmanaged[Cdecl]<nint, nint*, byte**, int> LateralOpen;
+
+    // int32 lateral_call(void* session, ArrowArray* input, ArrowArrayStream* out, char** err)
+    public delegate* unmanaged[Cdecl]<nint, CArrowArray*, CArrowArrayStream*, byte**, int> LateralCall;
+
+    // int32 lateral_close(void* session, char** err)
+    public delegate* unmanaged[Cdecl]<nint, byte**, int> LateralClose;
+
+    // int32 lateral_bind_close(void* binding, char** err)
+    public delegate* unmanaged[Cdecl]<nint, byte**, int> LateralBindClose;
 }
 
 /// <summary>

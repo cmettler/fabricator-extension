@@ -145,6 +145,11 @@ void FabricatorCatalog::LoadCatalog(ClientContext &context) {
 			// Provider-authored custom table-in-out (4g, pure C#): a {TABLE}-param table function under
 			// the bare name (no scalar-arg scan form, no `_each` alias — it is already in-out).
 			schema.AddInOutFunction(func.name);
+		} else if (func.kind == "lateral") {
+			// Provider-authored ROW-MAPPED (correlated LATERAL) function: its POSITIONAL parameters are real
+			// value types and no {TABLE} marker, so `db.schema.fn(t.a, t.b)` binds against an outer relation.
+			// See catalog/fabricator_lateral.hpp.
+			schema.AddLateralFunction(func.name);
 		} else if (func.kind == "collector") {
 			// Provider-authored custom collector (pipeline breaker, pure C#): a {TABLE}-param table function
 			// routed to the Sink+Source operator — buffers all input, then emits. See docs/inout-collector-mode.md.
@@ -259,6 +264,11 @@ void FabricatorCatalog::RefreshCache(ClientContext &context) {
 			// Provider-authored custom table-in-out (4g, pure C#): a {TABLE}-param table function under
 			// the bare name (no scalar-arg scan form, no `_each` alias — it is already in-out).
 			schema.AddInOutFunction(func.name);
+		} else if (func.kind == "lateral") {
+			// Provider-authored ROW-MAPPED (correlated LATERAL) function: its POSITIONAL parameters are real
+			// value types and no {TABLE} marker, so `db.schema.fn(t.a, t.b)` binds against an outer relation.
+			// See catalog/fabricator_lateral.hpp.
+			schema.AddLateralFunction(func.name);
 		} else if (func.kind == "collector") {
 			// Provider-authored custom collector (pipeline breaker, pure C#): a {TABLE}-param table function
 			// routed to the Sink+Source operator — buffers all input, then emits. See docs/inout-collector-mode.md.

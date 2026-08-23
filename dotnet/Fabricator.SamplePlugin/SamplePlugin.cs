@@ -24,6 +24,9 @@ public sealed class SamplePluginBackend : IBackend
     public IEnumerable<ITableFunction> GlobalTableFunctions =>
         new ITableFunction[] { new PlugSlowRangeFunction(), new PlugSlowRange2Function() };
 
+    public IEnumerable<ILateralTableFunction> GlobalLateralFunctions =>
+        new ILateralTableFunction[] { new PlugLatSlowFunction() };
+
     /// <summary>
     /// Macros a plugin ships — proving the SQL-template path needs no more from a plugin than the function path
     /// (declare; the host parses + registers at load). The second entry is DELIBERATELY MALFORMED: it pins the
@@ -260,4 +263,90 @@ internal class PlugSlowRangeFunction : ITableFunction
 internal sealed class PlugSlowRange2Function : PlugSlowRangeFunction
 {
     public override string Name => "plug_slow_range2";
+}
+
+/// <summary>
+/// A plugin-authored ROW-MAPPED (correlated LATERAL) function, and the INSTRUMENT that makes the batching
+/// claim measurable: <c>plug_lat_slow(n, millis)</c> sleeps <c>millis</c> ONCE PER CALL — not per row — and
+/// returns <c>(squared, batch_rows)</c>, one row per input row.
+/// </summary>
+/// <remarks>
+/// <para>
+/// It exists because a per-CALL cost is the only thing batching can amortise, and it is the shape this
+/// function kind is FOR: a REST call, a model invocation, a per-row query. With it the win stops being an
+/// argument and becomes a ratio between two legs of one suite — N distinct outer rows cost N sleeps on
+/// DuckDB's row-by-row driver and about one on the batched operator.
+/// </para>
+/// <para>
+/// ⚠ It also proves the PLUGIN path: a plugin references <c>Fabricator.Abstractions</c> and nothing else, so
+/// declaring one of these must need no more than declaring a scalar. <c>batch_rows</c> is what the suite reads
+/// to tell the two paths apart without any logging (docs/lateral_unnest_analysis.md §8.4 — duckdb_logs flushes
+/// too lazily to COUNT).
+/// </para>
+/// <para>
+/// ⚠ On Windows the sleep floor is the timer tick, ~15 ms, so a small <c>millis</c> is a lie by an order of
+/// magnitude. Use >= 50. A NEGATIVE argument is refused rather than passed to Thread.Sleep, where -1 means
+/// Timeout.Infinite — in a suite a hang is the one failure worse than a failure.
+/// </para>
+/// </remarks>
+internal sealed class PlugLatSlowFunction : ILateralTableFunction
+{
+    public string Name => "plug_lat_slow";
+
+    // BOTH POSITIONAL — these two ARE the per-row input columns. `millis` is deliberately not a NAMED
+    // parameter: a named argument cannot be written in the CORRELATED call shape at all (a DuckDB limitation,
+    // docs/duckdb-upstream-issues.md §5), so a named cost arg would make this instrument unusable for exactly
+    // the measurement it exists for.
+    public Schema Parameters => new(new[]
+    {
+        Params.Positional("n", Int32Type.Default),
+        Params.Positional("millis", Int32Type.Default),
+    }, metadata: null);
+
+    public ILateralBinding Bind(RecordBatch? args, Schema inputSchema) => new Binding();
+
+    private sealed class Binding : ILateralBinding
+    {
+        public Schema OutputSchema => new(new[]
+        {
+            new Field("squared", Int64Type.Default, nullable: true),
+            new Field("batch_rows", Int32Type.Default, nullable: false),
+        }, metadata: null);
+
+        public ILateralSession Open() => new Session(OutputSchema);
+
+        public void Dispose() { }
+    }
+
+    private sealed class Session : ILateralSession
+    {
+        private readonly Schema _output;
+
+        public Session(Schema output) => _output = output;
+
+        public LateralResult Call(RecordBatch input)
+        {
+            var n = (Int32Array)input.Column(0);
+            var millis = (Int32Array)input.Column(1);
+            int wait = input.Length > 0 && !millis.IsNull(0) ? millis.Values[0] : 0;
+            if (wait < 0)
+            {
+                throw new ArgumentOutOfRangeException(
+                    nameof(input), "plug_lat_slow: millis must be >= 0 (a negative value is Timeout.Infinite).");
+            }
+            Thread.Sleep(wait); // ONCE per call — the whole point
+            var sq = new Int64Array.Builder().Reserve(input.Length);
+            var rows = new Int32Array.Builder().Reserve(input.Length);
+            for (int r = 0; r < input.Length; r++)
+            {
+                if (n.IsNull(r)) { sq.AppendNull(); } else { sq.Append((long)n.Values[r] * n.Values[r]); }
+                rows.Append(input.Length);
+            }
+            // No Origin: exactly one output row per input row, in order (the identity map).
+            return new LateralResult(
+                new RecordBatch(_output, new IArrowArray[] { sq.Build(), rows.Build() }, input.Length));
+        }
+
+        public void Dispose() { }
+    }
 }

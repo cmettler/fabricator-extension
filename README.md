@@ -99,6 +99,7 @@ See [SQL Server external tables on S3](#sql-server-external-tables-on-s3).
 | | Discovered stored procedures → `SELECT * FROM db.schema.proc(name := val)` (named/optional + OUTPUT params) | ✅ |
 | | Custom C#-authored scalar / table / table-in-out functions | ✅ |
 | | **Table-in-out**: `db.schema.fn_each(<input table>)` — apply a TVF (CROSS APPLY) or proc per input row | ✅ |
+| | **Correlated LATERAL**: `FROM t, db.schema.fn(t.a, t.b)` — batched, 1→1/1→0/1→N | ✅ |
 | | — configurable isolation (consistent snapshot per call); per-row procs run in DuckDB's transaction | ✅ |
 | | **Custom C# aggregates** (UDAF) → `db.schema.agg(x)` in `GROUP BY` / parallel / `OVER(…)`; opt-in disk-spill (`SupportsSpill`) | ✅ |
 | **Monitoring** | `db.dbo.fabricator_session_tag(k, v)` — tag a transaction's connection so Fabric query insights can attribute its cost | ✅ (see dbt caveat) |
@@ -1623,6 +1624,45 @@ SELECT * FROM mssql.dbo.usp_process_each((SELECT id FROM mssql.dbo.queue));
 - Custom C#-authored in-out functions (`ICatalogInOutFunction`, or the fixed-schema `StaticInOutFunction`
   base) are called by their **bare name** (e.g. `db.dbo.cf_tag(<table>)`, not `_each`) and stream on the same
   gate-based exchange; the author's `DoExchange` reads the input and yields output + a per-input sentinel.
+
+### Correlated LATERAL functions (`ILateralTableFunction`)
+
+A **row-mapped** function is the shape `fn_each` cannot express: its arguments are ordinary values, so it can
+be written the way you would expect — correlated against an outer relation.
+
+```sql
+-- Split a column into rows, one output row per fragment, with the outer columns carried through:
+SELECT s.id, p.part, p.idx FROM src s, mssql.dbo.cf_lat_split(s.txt, ',') p;
+
+-- The same declaration with literal arguments (no correlation):
+SELECT * FROM mssql.dbo.cf_lat_split('a,b,c', ',');
+
+-- Global (connection-free, no ATTACH):
+SELECT t.id, r.i FROM t, fabricator_lat_repeat(t.n, 3) r;
+```
+
+The mapping may be 1→1, 1→0 (filtering) or 1→N (fan-out), and the outer columns are carried onto every
+emitted row. Author it in C# with `ILateralTableFunction` (`ICatalogLateralFunction` for a catalog-bound one)
+— see [docs/lateral_unnest_analysis.md](docs/lateral_unnest_analysis.md) §8.
+
+**Calls are BATCHED.** The whole input chunk crosses in one call (up to 2048 rows) rather than one call per
+outer row, which is what makes a function whose per-call cost dominates — a REST call, a model invocation, a
+per-row query — usable at all. Measured on 200 000 rows with a trivially cheap callee, i.e. crossing overhead
+alone: **111 calls / 0.03 s** batched against **200 000 calls / 0.90 s** row-by-row.
+
+```sql
+SET fabricator_batched_lateral = false;   -- fall back to DuckDB's row-at-a-time driver
+```
+
+Two things are worth knowing before you author one:
+
+- **The correlated values are DE-DUPLICATED before your function is called.** DuckDB's decorrelation puts a
+  `DISTINCT` under the call and re-expands the result by joining above it, so a 20 000-row table with 97
+  distinct argument tuples costs 97 rows of input, not 20 000. Cost scales with distinct tuples.
+- **A named argument cannot be used in the correlated shape** — `fn(t.a, opt := 5)` does not bind (a DuckDB
+  limitation, [docs/duckdb-upstream-issues.md](docs/duckdb-upstream-issues.md) §5). Declare a per-call
+  constant POSITIONALLY instead: `fn(t.a, 5)` works in both shapes and the value arrives as a constant input
+  column. Named arguments do work with literal arguments.
 
 ### Custom aggregates (UDAF)
 

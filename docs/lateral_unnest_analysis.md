@@ -629,3 +629,155 @@ regression immediately.
 - [ ] Fan-out matrix: 1→1, 1→0, 1→N, N > 2048
 - [ ] Adversarial provenance fixture
 - [ ] Multi-threaded run over a morsel-splittable source
+
+---
+
+## 8. As built in fabricator (2026-08-22)
+
+**BUILT: `ILateralTableFunction`, both execution paths, ABI v79.** C++
+`src/catalog/fabricator_lateral.{cpp,hpp}`; managed
+`dotnet/Fabricator.Abstractions/ILateralTableFunction.cs` + `dotnet/Fabricator.Bridge/LateralExchange.cs`.
+Gates: `verify_lateral` **144** (hermetic, GLOBAL demos — no ATTACH) and `verify_functions` 34 → **67**
+(service, the catalog-bound half). Four mutants, each killed at its own section.
+
+### 8.1 The framing this document does not state, and it is the strongest argument for the work
+
+**We already had the fast path, under an awkward spelling.**
+`PhysicalTableInOutFunction::ExecuteInternal` branches on `if (projected_input.empty())` and THAT branch
+passes the whole chunk to `in_out_function`. Our pre-existing `_each(<input table>)` form takes a `{TABLE}`
+argument, so it is uncorrelated, so `projected_input` is empty — it has always been one call per chunk. What
+was row-by-row was the *idiomatic* spelling. So this is not "make in-out faster"; it is **let users write
+`FROM t, f(t.a, t.b)` and get the speed the awkward spelling already had** — plus a spelling an in-out cannot
+offer at all, since its input must be a relation the caller can NAME.
+
+### 8.2 What the document got right
+
+Everything load-bearing. The API references were all verified against our pinned 1.5.5 and hold:
+`LogicalGet::projected_input`; the row-by-row branch and its `ConstantVector::Reference` +
+`SetCardinality(1)` mechanism; `base_idx = chunk.ColumnCount() - projected_input.size()`; the
+`FinalExecute not supported for project_input` throw; `OptimizerExtension` carrying both hooks. §0.5's
+ASYMMETRY is exactly right and is the single most important fact for the bind: positional arguments do NOT
+arrive in `input.inputs`, they arrive as `input_table_types`, and the literal shape is detected by
+`input_table_names` coming back all-empty.
+
+**§5's Invariant 2 was RIGHT to insist on the scratch-chunk indirection, and for us it is MANDATORY rather
+than optional** — `ArrowStreamReader::Drain` calls `output.Reset()` and writes through `ArrowToDuckDB`, which
+rebinds destination vectors; draining straight into the wide output chunk would clear the correlated columns
+DuckDB had just stamped. We allocate the scratch chunk FRESH per drain and `Reference` its columns out, per
+the document's own advice: a reused chunk's `Reset()` restores the same cached buffers, so the next drain
+would overwrite rows already handed downstream.
+
+**§0.5's named-argument caveat was right and the bug is UNFIXED in 1.5.5.** See
+docs/duckdb-upstream-issues.md §5 for the mechanism; the practical consequence is in §8.4 below.
+
+### 8.3 Where the build diverges
+
+- **The provenance rides the WIRE as a trailing int32 column**, not as a separate out-parameter. One wire
+  format serves both paths (the row-by-row path ignores it — DuckDB stamps — but still validates it, so the
+  two paths agree on what is an ERROR, which is what makes the reference oracle sound).
+- **Validation is SPLIT rather than duplicated.** The managed marshaling layer checks the column count, the
+  provenance LENGTH and the absent-strict rule; the HOST checks the RANGE, because the host is what indexes
+  with it. Checking the range on both sides would have made one of the two dead code — and it would have
+  been the host's, i.e. the one guarding the memory access. (It was written duplicated first; the mutant
+  that removes the host check then survives, which is what exposed it.)
+- **`OperatorOrder()` stays INSERTION_ORDER**, not the document's `NO_ORDER`. Our operator emits rows grouped
+  by input row in input order, so INSERTION_ORDER is TRUE of it; `ParallelOperator()` is what buys
+  cross-morsel parallelism, and `NO_ORDER` has measured costs elsewhere in this tree
+  ([scan-concurrency.md](scan-concurrency.md) §7d — a bare `LIMIT` starts returning arbitrary rows, and since
+  §7c it would also disable the parallel write sink).
+- **Projection pushdown is NOT advertised**, which is §5 Invariant 7's own advice when it will not be
+  thoroughly tested. With `projection_pushdown` false DuckDB never narrows the get, so the callee's batch
+  positions always match the bind-time output schema and the whole class of silent corruption is
+  unreachable. The eligibility check additionally refuses a get whose `projection_ids` are non-empty, so if
+  something ever does narrow one we fall back to the stock path rather than mis-read a column.
+- **No `LogicalExtensionOperator::Serialize` override.** The document says to throw; the inherited
+  implementation does not throw and is what the two existing `Fabricator*FinalizeOperator` nodes use. It
+  matters because DuckDB's common-subplan optimizer hashes operators BY SERIALIZING them — it runs before our
+  `optimize_function`, so our node is never reached, but a throwing Serialize would be a landmine.
+
+### 8.4 What only building it revealed
+
+- **⚠⚠ THE CORRELATED PLAN DE-DUPLICATES BEFORE CALLING US, and every performance claim is bounded by it.**
+  Decorrelation puts a DISTINCT aggregate (the delim scan) under the operator, so the function is called once
+  per distinct correlated TUPLE and the join above re-expands the result. A 20 000-row table with 97 distinct
+  correlated values hands the callee at most 97 rows on EITHER path. This is not a footnote: it means the win
+  scales with distinct tuples, and it invalidated the first version of the batching gate, which asserted
+  `max(batch_rows) > 100` over exactly such a table — unreachable by construction.
+- **The batched call count is NOT `ceil(rows / 2048)`.** The delim scan emits one chunk per radix partition,
+  so chunk sizes depend on the thread count as well: 200 000 all-distinct rows gave **111 calls (1802
+  rows/call)** at default threads, and 16 calls for 5000 rows. The gate asserts a RANGE plus the row-by-row
+  leg's exact `= 1` as its positive control.
+- **The measurement, taken after the fact because it was free:** 200 000 rows, the cheapest possible callee
+  (`n * 2`, so this is CROSSING OVERHEAD ALONE) — batched **0.030–0.075 s / 111 calls**, row-by-row
+  **0.902–1.054 s / 200 000 calls**. ~30x wall clock and ~100x CPU (0.08 s vs 9.7–11.7 s user), i.e. ~5 µs
+  per crossing. §0's gate 2 asks for a 20x gap to justify the work; the crossing overhead alone clears it,
+  and a callee whose per-call cost is a round trip clears it by orders of magnitude.
+- **A named argument cannot be used correlated (upstream), so the guidance is: declare a per-call constant
+  POSITIONALLY.** It then arrives as a constant input column and works in both shapes. What remains
+  unavailable is bind-time configuration OF A CORRELATED CALL.
+- **`duckdb_logs` IS THE WRONG INSTRUMENT for a call count.** It flushes per-thread lazily: a read
+  immediately after a query that made 98 crossings saw **1** entry, and `disable_logging()` does not flush
+  either. §6's "count calls" is best served by making the callee report its own batch size as DATA —
+  `fabricator_lat_scale` returns `batch_rows`, which is deterministic and needs no logging at all. The Debug
+  line stays as a diagnostic.
+- **A whole-chunk 1→0 needs a purpose-built fixture to be gated.** The "never return FINISHED" invariant
+  (§5.5) survives an ordinary filtering test, because a partly-filtered chunk still returns rows. It is
+  killed only by a chunk that is ENTIRELY empty with more chunks behind it — 4000 of 6000 distinct values
+  emitting nothing, **at threads=1**: with several threads each has its own chunk boundaries and the same
+  mutant returned the right answer at threads=4 and 0 at threads=1.
+- **A lateral function must answer `CatalogFunctionSet.ParamSchema`.** Its positional parameters become the
+  DuckDB argument types, so without that the declaration is listed by `fabricator_functions()` and the
+  function still "does not exist" — found by running the catalog gate, which is the whole reason that gate
+  exists (the hermetic demos are global and never touch this path).
+
+### 8.5 Not built
+
+`FinalExecute` (§2b makes it unreachable for a correlated call, and the eligibility check refuses a
+finalize-bearing function defensively); `ParamsToString` runtime counters (Invariant 8 — the string is
+captured before execution, and the per-operator `OperatorState::Finalize` route was not wired); projection
+pushdown (§8.3).
+
+### 8.6 ⛔ A PER-FUNCTION batching flag on `ILateralTableFunction` — considered 2026-08-23, DECLINED
+
+**Mechanically trivial and needs no ABI change**: the bind's `out_schema` already crosses, so a
+`fabricator.batched = "0"` in Arrow schema/field metadata (the `fabricator.volatile` / `fabricator.param_style`
+precedent) could be read into `LateralBindData` and tested in `LateralIsEligible`. ~20 lines. Precedence would
+have to be **AND** — session ∧ function — or `fabricator_batched_lateral` stops being a reference oracle.
+
+**Declined because every reason a function might decline batching dissolves:**
+
+| reason | what actually happens |
+|---|---|
+| the callee cannot compute provenance | then it is 1:1, which batches fine — the framework fills in the identity map |
+| its API takes one item per request | the callee loops internally, which is STRICTLY better than the host looping (no crossing per row) and lets it pipeline its own requests |
+| a 2048-row batch is too much memory | same — the callee slices |
+| its cost is per-ROW, not per-call | then by §0 gate 1 it should not be a lateral function at all (a scalar, or `LIST<STRUCT>` + `UNNEST`) |
+
+**And the one case that looked real is FALSE — measured, because the intuition is backwards.** The hypothesis
+was a `LIMIT` above a fan-out: the row-by-row driver would stop being fed after a few outer rows while a
+batched call has already done 2048 rows of callee work, so an expensive per-row callee would lose badly. On 8
+distinct outer rows sleeping 100 ms per call:
+
+```
+row-by-row, LIMIT 1 : 0.916 s     <- eight sleeps
+row-by-row, no LIMIT: 0.870 s     <- the control: identical, so there is no early exit at all
+batched,    LIMIT 1 : 0.107 s     <- one sleep
+```
+
+There is no early exit to lose: the correlated input is the hash-join **BUILD** side (fed by the delim scan),
+so it is consumed in full whatever sits above. Batching is 8x faster under a `LIMIT` too.
+
+⇒ it would be a flag with **no correct use**, which is the shape this tree has already priced once (the
+per-table `exact_filter_pushdown` follow-on is deferred for exactly this reason — no mutant can kill an
+untestable flag, so no gate can cover it, and it becomes declaration surface a plugin author must reason about
+for nothing).
+
+**THE TRIGGER CONDITION TO WATCH FOR** — the one thing a per-function declaration would genuinely buy — is
+TESTING ERGONOMICS: `fabricator_batched_lateral` is session-wide, so with two lateral functions in one query
+you cannot A/B just one of them.
+
+**And if a real case does appear, the better knob is not a boolean but a MAX BATCH SIZE** (an API with a hard
+per-request limit, or a memory bound). It degrades gracefully — still our operator, still one
+provenance-carrying call per N rows, correlated columns still gathered — where a boolean falls all the way back
+to one call per outer row. It needs a loop over sub-slices of the input chunk, tracking an offset; the
+provenance contract already supports it unchanged.

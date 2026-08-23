@@ -49,6 +49,16 @@ internal static class CustomFunctions
         new GfMixFunction(),
     };
 
+    // Connection-free GLOBAL row-mapped (correlated LATERAL) functions — bare fn(a, b), callable BOTH with
+    // literal args and correlated against an outer relation (FROM t, fn(t.a, t.b)). Implement the base
+    // ILateralTableFunction (no SchemaName). See ILateralTableFunction / catalog/fabricator_lateral.hpp.
+    public static readonly IReadOnlyList<ILateralTableFunction> GlobalLateral = new ILateralTableFunction[]
+    {
+        new GfLatRepeatFunction(),
+        new GfLatScaleFunction(),
+        new GfLatBadOriginFunction(),
+    };
+
     // Connection-free GLOBAL collector (pipeline-breaker) functions — bare fn(<input>), no ATTACH.
     // Implement the base ICollectorTableFunction (no SchemaName).
     public static readonly IReadOnlyList<ICollectorTableFunction> GlobalCollector = new ICollectorTableFunction[]
@@ -192,6 +202,13 @@ internal static class CustomFunctions
         new CfTagFunction(),
         new CfRunningSumFunction(),
         new CfExchangeFunction(),
+    };
+
+    // Catalog-bound row-mapped (correlated LATERAL) functions (ICatalogLateralFunction), singletons —
+    // surfaced as `kind='lateral'` and resolved by SqlServerCatalog.LateralBind. Pure C#, no SQL object.
+    public static readonly IReadOnlyList<ICatalogLateralFunction> Lateral = new ICatalogLateralFunction[]
+    {
+        new CfLatSplitFunction(),
     };
 
     // Aggregate functions (UDAF). The function object is a singleton; CreateState() mints the per-group
@@ -1478,5 +1495,325 @@ internal sealed class CfAddFunction : ICatalogScalarFunction
             }
         }
         return builder.Build();
+    }
+}
+
+// GLOBAL row-mapped (correlated LATERAL) demo, 1->N: fabricator_lat_repeat(n, times) emits `times` rows
+// (n, i) for i = 0 .. times-1. It is the FAN-OUT shape, so it MUST return provenance — without it the host
+// could not tell which outer row each emitted row belongs to, and the correlated columns of
+// `SELECT t.id, r.* FROM t, fabricator_lat_repeat(t.n, 2) r` would be stamped wrong.
+//
+// It also covers 1->0 (times <= 0 or NULL emits nothing for that row) and, with a large `times`, the case
+// where ONE input chunk produces more than a DuckDB vector of output — which is what exercises the host's
+// multi-slice drain.
+internal sealed class GfLatRepeatFunction : ILateralTableFunction
+{
+    public string Name => "fabricator_lat_repeat";
+
+    // Both POSITIONAL — i.e. these two ARE the per-row input columns, and their types are what DuckDB
+    // registers as the function's argument types. Nothing here is a table input.
+    public Schema Parameters => new(new[]
+    {
+        Params.Positional("n", Int32Type.Default),
+        Params.Positional("times", Int32Type.Default),
+    }, metadata: null);
+
+    public ILateralBinding Bind(RecordBatch? args, Schema inputSchema) => new Binding();
+
+    private sealed class Binding : ILateralBinding
+    {
+        public Schema OutputSchema => new(new[]
+        {
+            new Field("n", Int32Type.Default, nullable: true),
+            new Field("i", Int32Type.Default, nullable: true),
+        }, metadata: null);
+
+        public ILateralSession Open() => new Session(OutputSchema);
+
+        public void Dispose() { }
+    }
+
+    private sealed class Session : ILateralSession
+    {
+        private readonly Schema _output;
+
+        public Session(Schema output) => _output = output;
+
+        public LateralResult Call(RecordBatch input)
+        {
+            var n = (Int32Array)input.Column(0);
+            var times = (Int32Array)input.Column(1);
+            var nb = new Int32Array.Builder();
+            var ib = new Int32Array.Builder();
+            var origin = new List<int>();
+            for (int r = 0; r < input.Length; r++)
+            {
+                int count = times.IsNull(r) ? 0 : times.Values[r];
+                for (int k = 0; k < count; k++)
+                {
+                    if (n.IsNull(r)) { nb.AppendNull(); } else { nb.Append(n.Values[r]); }
+                    ib.Append(k);
+                    origin.Add(r); // THE point: which input row produced this output row
+                }
+            }
+            int m = origin.Count;
+            if (m == 0)
+            {
+                return LateralResult.Empty; // every input row filtered out — a legitimate answer, not EOS
+            }
+            return new LateralResult(
+                new RecordBatch(_output, new IArrowArray[] { nb.Build(), ib.Build() }, m), origin.ToArray());
+        }
+
+        public void Dispose() { }
+    }
+}
+
+// GLOBAL lateral demo, 1->1 with NO provenance and a NAMED cost arg:
+// fabricator_lat_scale(n [, factor := k]) -> (scaled, batch_rows). Returning no provenance ASSERTS a 1:1 map,
+// and the framework holds that assertion STRICTLY — a row count differing from the input's is an error, not a
+// guess. The named arg is also the point: a lateral function's positional slots are runtime data, so a named
+// parameter is the ONLY way to configure one at bind time.
+//
+// ⚠ `batch_rows` is what makes BATCHING checkable, and it is DATA rather than a log line: it reports the
+// number of input rows the call that produced this row was handed. On the row-by-row path it is 1 for every
+// row; on the batched path it is the chunk size. Counting Debug log lines was tried first and does not work —
+// duckdb_logs flushes per-thread LAZILY, so a read immediately after the query saw 1 of 98 entries and a
+// count assertion would have been comparing whatever happened to be visible.
+internal sealed class GfLatScaleFunction : ILateralTableFunction
+{
+    public string Name => "fabricator_lat_scale";
+
+    public Schema Parameters => new(new[]
+    {
+        Params.Positional("n", Int32Type.Default),
+        Params.Named("factor", Int32Type.Default),
+    }, metadata: null);
+
+    public ILateralBinding Bind(RecordBatch? args, Schema inputSchema)
+    {
+        // Read the args HERE — the framework owns that batch and its lifetime ends with the bind.
+        int factor = 2;
+        if (args is not null)
+        {
+            for (int i = 0; i < args.ColumnCount; i++)
+            {
+                if (string.Equals(args.Schema.FieldsList[i].Name, "factor", System.StringComparison.OrdinalIgnoreCase)
+                    && args.Column(i) is Int32Array a && a.Length > 0 && !a.IsNull(0))
+                {
+                    factor = a.Values[0];
+                }
+            }
+        }
+        return new Binding(factor);
+    }
+
+    private sealed class Binding : ILateralBinding
+    {
+        private readonly int _factor;
+
+        public Binding(int factor) => _factor = factor;
+
+        public Schema OutputSchema => new(new[]
+        {
+            new Field("scaled", Int32Type.Default, nullable: true),
+            new Field("batch_rows", Int32Type.Default, nullable: false),
+        }, metadata: null);
+
+        public ILateralSession Open() => new Session(OutputSchema, _factor);
+
+        public void Dispose() { }
+    }
+
+    private sealed class Session : ILateralSession
+    {
+        private readonly Schema _output;
+        private readonly int _factor;
+
+        public Session(Schema output, int factor)
+        {
+            _output = output;
+            _factor = factor;
+        }
+
+        public LateralResult Call(RecordBatch input)
+        {
+            var n = (Int32Array)input.Column(0);
+            var b = new Int32Array.Builder().Reserve(input.Length);
+            var rows = new Int32Array.Builder().Reserve(input.Length);
+            for (int r = 0; r < input.Length; r++)
+            {
+                if (n.IsNull(r)) { b.AppendNull(); } else { b.Append(n.Values[r] * _factor); }
+                rows.Append(input.Length); // how many rows THIS call was handed — see the class note
+            }
+            // No Origin: one output row per input row, in order. The framework fills in the identity mapping.
+            return new LateralResult(
+                new RecordBatch(_output, new IArrowArray[] { b.Build(), rows.Build() }, input.Length));
+        }
+
+        public void Dispose() { }
+    }
+}
+
+// GLOBAL lateral FIXTURE for malformed provenance: fabricator_lat_badorigin(n, mode := '…') deliberately
+// returns provenance the framework must refuse. It exists because provenance is used directly as an ARRAY
+// INDEX into the input chunk, so "the callee is adversarial" has to be a tested property rather than a
+// comment — and both refusals must be reachable from SQL, or neither is gated.
+//
+//   mode = 'range'   an index equal to the input row count (one past the end)
+//   mode = 'length'  one provenance index too many
+//   mode = 'missing' a 1->N result with NO provenance at all (the STRICT absent case)
+//   anything else    a correct explicit identity mapping — the POSITIVE CONTROL, without which "it errored"
+//                    would pass equally on a build where the function had simply stopped working
+//
+// ⚠ `mode` is POSITIONAL, not named, and that is forced: a NAMED argument cannot be written in the CORRELATED
+// call shape at all (DuckDB sweeps every argument expression into the input subquery before extracting named
+// parameters — see docs/duckdb-upstream-issues.md), so a named selector would leave the BATCHED path's own
+// validation unreachable from SQL. Positional means it arrives as a constant input column instead, which
+// works in both shapes.
+internal sealed class GfLatBadOriginFunction : ILateralTableFunction
+{
+    public string Name => "fabricator_lat_badorigin";
+
+    public Schema Parameters => new(new[]
+    {
+        Params.Positional("n", Int32Type.Default),
+        Params.Positional("mode", StringType.Default),
+    }, metadata: null);
+
+    public ILateralBinding Bind(RecordBatch? args, Schema inputSchema) => new Binding();
+
+    private sealed class Binding : ILateralBinding
+    {
+        public Schema OutputSchema => new(new[] { new Field("v", Int32Type.Default, nullable: true) },
+                                          metadata: null);
+
+        public ILateralSession Open() => new Session(OutputSchema);
+
+        public void Dispose() { }
+    }
+
+    private sealed class Session : ILateralSession
+    {
+        private readonly Schema _output;
+
+        public Session(Schema output) => _output = output;
+
+        public LateralResult Call(RecordBatch input)
+        {
+            // The mode rides the input as a (constant) column, so it is read per call rather than at bind.
+            var modes = (StringArray)input.Column(1);
+            string _mode = input.Length > 0 && !modes.IsNull(0) ? modes.GetString(0) ?? "ok" : "ok";
+            int rows = _mode == "missing" ? input.Length * 2 : input.Length;
+            var b = new Int32Array.Builder().Reserve(rows);
+            for (int r = 0; r < rows; r++)
+            {
+                b.Append(r);
+            }
+            var batch = new RecordBatch(_output, new IArrowArray[] { b.Build() }, rows);
+            switch (_mode)
+            {
+                case "missing":
+                    return new LateralResult(batch); // 2N rows, no provenance => refused
+                case "length":
+                {
+                    var origin = new int[rows + 1];
+                    return new LateralResult(batch, origin);
+                }
+                case "range":
+                {
+                    var origin = new int[rows];
+                    for (int r = 0; r < rows; r++)
+                    {
+                        origin[r] = input.Length; // one past the last valid index
+                    }
+                    return new LateralResult(batch, origin);
+                }
+                default:
+                {
+                    var origin = new int[rows];
+                    for (int r = 0; r < rows; r++)
+                    {
+                        origin[r] = r;
+                    }
+                    return new LateralResult(batch, origin);
+                }
+            }
+        }
+
+        public void Dispose() { }
+    }
+}
+
+// CATALOG-BOUND lateral demo: dbo.cf_lat_split(text, sep) -> (part, idx), one output row per separated
+// fragment. Resolved as `SELECT t.id, s.* FROM t, db.dbo.cf_lat_split(t.txt, ',') s` — the spelling that made
+// this function kind worth building, and the one an in-out cannot offer (its input is a TABLE parameter, so
+// it can only be called on a relation the caller can name).
+internal sealed class CfLatSplitFunction : ICatalogLateralFunction
+{
+    public string SchemaName => "dbo";
+
+    public string Name => "cf_lat_split";
+
+    public Schema Parameters => new(new[]
+    {
+        Params.Positional("text", StringType.Default),
+        Params.Positional("sep", StringType.Default),
+    }, metadata: null);
+
+    public ILateralBinding Bind(RecordBatch? args, Schema inputSchema) => new Binding();
+
+    private sealed class Binding : ILateralBinding
+    {
+        public Schema OutputSchema => new(new[]
+        {
+            new Field("part", StringType.Default, nullable: true),
+            new Field("idx", Int32Type.Default, nullable: true),
+        }, metadata: null);
+
+        public ILateralSession Open() => new Session(OutputSchema);
+
+        public void Dispose() { }
+    }
+
+    private sealed class Session : ILateralSession
+    {
+        private readonly Schema _output;
+
+        public Session(Schema output) => _output = output;
+
+        public LateralResult Call(RecordBatch input)
+        {
+            var text = (StringArray)input.Column(0);
+            var sep = (StringArray)input.Column(1);
+            var pb = new StringArray.Builder();
+            var ib = new Int32Array.Builder();
+            var origin = new List<int>();
+            for (int r = 0; r < input.Length; r++)
+            {
+                if (text.IsNull(r))
+                {
+                    continue; // a NULL input row contributes nothing (1->0)
+                }
+                var s = text.GetString(r) ?? string.Empty;
+                var d = sep.IsNull(r) ? "," : sep.GetString(r) ?? ",";
+                var parts = d.Length == 0 ? new[] { s } : s.Split(d);
+                for (int k = 0; k < parts.Length; k++)
+                {
+                    pb.Append(parts[k]);
+                    ib.Append(k);
+                    origin.Add(r);
+                }
+            }
+            int m = origin.Count;
+            if (m == 0)
+            {
+                return LateralResult.Empty;
+            }
+            return new LateralResult(
+                new RecordBatch(_output, new IArrowArray[] { pb.Build(), ib.Build() }, m), origin.ToArray());
+        }
+
+        public void Dispose() { }
     }
 }

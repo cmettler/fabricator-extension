@@ -29,6 +29,16 @@ internal static class HostSettings
     /// </remarks>
     public const string AllowPluginInstallName = "fabricator_allow_plugin_install";
 
+    /// <summary>The DuckDB setting that flips a correlated LATERAL call between the BATCHED operator (one
+    /// managed call per input chunk) and DuckDB's own row-by-row driver (one per outer row).</summary>
+    /// <remarks>
+    /// It is a testing instrument as much as an escape hatch. The batched path is installed by a purely
+    /// post-binding rewrite, so both paths share ONE bind — which makes the row-by-row path a REFERENCE
+    /// ORACLE: run the same query with this off and on and the results must be identical (modulo row order,
+    /// which no lateral plan promises). See catalog/fabricator_lateral.hpp.
+    /// </remarks>
+    public const string BatchedLateralName = "fabricator_batched_lateral";
+
     public static IEnumerable<ProviderSetting> Settings { get; } = new[]
     {
         new ProviderSetting(
@@ -38,6 +48,13 @@ internal static class HostSettings
             Description: "Allow fabricator_install_plugin() and fabricator_uninstall_plugin() to manage a " +
                          "plugin root. Off by default: an installed plugin is loaded into this process and " +
                          "runs with the extension's full privileges."),
+        new ProviderSetting(
+            BatchedLateralName,
+            ProviderSettingType.Bool,
+            Default: true,
+            Description: "Batch a correlated LATERAL call over a whole input chunk (one provider call per " +
+                         "~2048 outer rows) instead of DuckDB's row-by-row driver. On by default; turn it " +
+                         "off to fall back to the stock path, which is also the reference oracle for it."),
     };
 
     /// <summary>

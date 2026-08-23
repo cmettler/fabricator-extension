@@ -63,7 +63,7 @@ public static unsafe class Bootstrap
             return new InMemoryArrayStream(schema, new[] { batch });
         });
 
-        vtable->AbiVersion = 78;
+        vtable->AbiVersion = 79;
         vtable->OpenCatalog = &OpenCatalog;
         vtable->CloseCatalog = &CloseCatalog;
         vtable->ExecuteQuery = &ExecuteQuery;
@@ -139,6 +139,11 @@ public static unsafe class Bootstrap
         vtable->TableScan = &TableScan;
         vtable->TableAlter = &TableAlter;
         vtable->TableClose = &TableClose;
+        vtable->LateralBind = &LateralBind;
+        vtable->LateralOpen = &LateralOpen;
+        vtable->LateralCall = &LateralCall;
+        vtable->LateralClose = &LateralClose;
+        vtable->LateralBindClose = &LateralBindClose;
         return FabricatorStatus.Ok;
     }
 
@@ -1379,6 +1384,131 @@ public static unsafe class Bootstrap
         }
     }
 
+    // --- row-mapped (correlated LATERAL) functions, ABI v79. See ILateralTableFunction + LateralExchange. ---
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int LateralBind(nint handle, byte* schema, byte* func, CArrowArrayStream* args,
+                                   CArrowSchema* inputSchema, CArrowArrayStream* outSchema, nint* outBinding,
+                                   byte** err)
+    {
+        try
+        {
+            if (inputSchema is null || outSchema is null || outBinding is null)
+            {
+                return FabricatorStatus.InvalidArgument;
+            }
+            var inSchema = CArrowSchemaImporter.ImportSchema(inputSchema); // takes ownership of the C schema
+            // `args` (nullable) carries the constant NAMED args only — a lateral function's positional
+            // parameters ARE its per-row input columns and have no bind-time value (see abi.h).
+            RecordBatch? argsBatch = null;
+            if (args is not null)
+            {
+                using var argStream = CArrowArrayStreamImporter.ImportArrayStream(args); // we own it
+                argsBatch = argStream.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult();
+            }
+            var f = Marshal.PtrToStringUTF8((nint)func) ?? string.Empty;
+            var binding = handle == 0
+                ? GlobalFunctions.ResolveLateral(f, argsBatch, inSchema)
+                : (Handles.Resolve<IBackendCatalog>(handle) ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty))
+                    .LateralBind(Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty, f, argsBatch, inSchema);
+            var bound = new LateralBindingHandle(binding, f, inSchema);
+            // The host binds its RETURN TYPES from this: the function's own columns, WITHOUT the provenance
+            // column (which is transport, not a result column).
+            CArrowArrayStreamExporter.ExportArrayStream(
+                new InMemoryArrayStream(bound.OutputSchema, System.Array.Empty<RecordBatch>()), outSchema);
+            *outBinding = Handles.Alloc(bound);
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int LateralOpen(nint binding, nint* outSession, byte** err)
+    {
+        try
+        {
+            if (outSession is null)
+            {
+                return FabricatorStatus.InvalidArgument;
+            }
+            var b = Handles.Resolve<LateralBindingHandle>(binding);
+            if (b is null)
+            {
+                return FabricatorStatus.InvalidArgument;
+            }
+            // SEVERAL sessions may be open on one binding at once — the batched operator is parallel, so each
+            // pipeline thread opens its own and nothing is shared.
+            *outSession = Handles.Alloc(b.Open());
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int LateralCall(nint session, CArrowArray* input, CArrowArrayStream* outStream, byte** err)
+    {
+        try
+        {
+            if (input is null || outStream is null)
+            {
+                return FabricatorStatus.InvalidArgument;
+            }
+            var s = Handles.Resolve<LateralSessionRunner>(session);
+            if (s is null)
+            {
+                return FabricatorStatus.InvalidArgument;
+            }
+            var rows = CArrowArrayImporter.ImportRecordBatch(input, s.InputSchema); // takes ownership
+            CArrowArrayStreamExporter.ExportArrayStream(s.Call(rows), outStream);
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int LateralClose(nint session, byte** err)
+    {
+        try
+        {
+            Handles.Resolve<LateralSessionRunner>(session)?.Dispose(); // idempotent
+            Handles.Free(session);
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int LateralBindClose(nint binding, byte** err)
+    {
+        try
+        {
+            Handles.Resolve<LateralBindingHandle>(binding)?.Dispose(); // idempotent
+            Handles.Free(binding);
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
     private static int TableFnBind(nint handle, byte* schema, byte* func, CArrowArrayStream* args,
                                  CArrowArrayStream* outSchema, int* supportsPushdown, nint* outBinding, byte** err)
@@ -1575,6 +1705,18 @@ public static unsafe class Bootstrap
                 kind.Append("inout");
                 stringOrder.Append("0");
                 body.Append(string.Empty);
+                paramCount.Append(Params.DeclaredCount(fn.Parameters));
+                returnType.Append(string.Empty);
+                rows++;
+            }
+            foreach (var fn in GlobalFunctions.AllLaterals())
+            {
+                name.Append(fn.Name);
+                kind.Append("lateral");
+                stringOrder.Append("0");
+                body.Append(string.Empty);
+                // Positional + named: for a lateral function the positional half IS the per-row input, and
+                // each of those occupies a DuckDB argument slot, so the count is its full arity.
                 paramCount.Append(Params.DeclaredCount(fn.Parameters));
                 returnType.Append(string.Empty);
                 rows++;

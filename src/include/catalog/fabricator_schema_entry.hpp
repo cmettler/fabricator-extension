@@ -62,6 +62,12 @@ public:
 	//! its output schema is the function's full declared schema (no input echo).
 	void AddInOutFunction(const string &func_name);
 
+	//! Registers a provider-authored ROW-MAPPED (correlated LATERAL) function (`kind='lateral'`): a table
+	//! function whose POSITIONAL parameters are real VALUE types and which declares no {TABLE} input, so
+	//! `SELECT * FROM t, db.schema.fn(t.a, t.b)` binds against an outer relation — the spelling an in-out
+	//! cannot offer. See catalog/fabricator_lateral.hpp for the two execution paths.
+	void AddLateralFunction(const string &func_name);
+
 	//! Registers a provider-authored custom COLLECTOR table-in-out function (`kind='collector'`): like
 	//! AddInOutFunction, a `{LogicalType::TABLE}`-parameter table function under the bare name, but routed
 	//! to the Sink+Source pipeline-breaker operator (buffers all input, then emits) instead of the streaming
@@ -157,6 +163,9 @@ private:
 	//! Materializes a provider-authored custom table-in-out function (4g): a TABLE-parameter table
 	//! function whose output schema is the function's full declared schema (dispatched in C#).
 	optional_ptr<CatalogEntry> GetOrCreateCustomInOutFunction(ClientContext &context, const string &func_name);
+	//! Materializes a provider-authored ROW-MAPPED (correlated LATERAL) function: a table function with real
+	//! value-typed positional arguments + DuckDB's in_out_function, so it can be called correlated.
+	optional_ptr<CatalogEntry> GetOrCreateLateralFunction(ClientContext &context, const string &func_name);
 	//! Materializes a provider-authored custom COLLECTOR table-in-out function: a TABLE-parameter table
 	//! function routed to the Sink+Source pipeline-breaker operator (buffers all input, then emits).
 	optional_ptr<CatalogEntry> GetOrCreateCustomCollectorFunction(ClientContext &context, const string &func_name);
@@ -214,6 +223,7 @@ private:
 	case_insensitive_map_t<bool> table_functions_; // table-returning routine name -> is_proc (TVF=false)
 	case_insensitive_set_t sql_table_functions_;     // provider-authored SQL-generating (bind_replace) names
 	case_insensitive_set_t custom_inout_functions_;  // provider-authored custom table-in-out names (4g)
+	case_insensitive_set_t custom_lateral_functions_;   // provider-authored row-mapped (correlated LATERAL) names
 	case_insensitive_set_t custom_collector_functions_; // provider-authored custom collector (pipeline-breaker) names
 	case_insensitive_map_t<bool> aggregate_functions_; // custom aggregate (UDAF) name -> spillable (4h)
 	case_insensitive_map_t<string> macros_;            // catalog-bound macro name -> its CREATE MACRO statement

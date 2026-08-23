@@ -1,0 +1,557 @@
+# name: test/verify_lateral.test
+# description: Row-mapped (correlated LATERAL) provider functions — `SELECT t.id, f.* FROM t, my_fn(t.a, t.b)`,
+#              the spelling a table-in-out cannot offer (its input is a declared {TABLE} parameter, so it can
+#              only be called on a relation the caller can NAME). Two execution paths share ONE bind: DuckDB's
+#              own row-by-row driver and our batched operator, which hands a whole input chunk over in one
+#              call and stamps the correlated columns from the PROVENANCE the callee returns. MEASURED on
+#              200 000 rows with the cheapest possible callee (n*2, so this is crossing overhead alone):
+#              111 calls / 0.03 s vs 200 000 calls / 0.90 s — ~30x wall clock, ~100x CPU.
+#              Because the rewrite happens entirely AFTER binding, the two paths are binding-identical and
+#              `fabricator_batched_lateral` is a REFERENCE ORACLE, which is what §3 uses it as.
+#              Global functions only — no ATTACH, no connection. See catalog/fabricator_lateral.hpp.
+# group: [fabricator]
+
+require fabricator
+
+# ============================================================================
+# 1. THE LITERAL SHAPE — the same bind, no correlation. DuckDB plans it as a childless PhysicalTableScan
+#    which re-invokes the callback with the same 1-row constant chunk and stops at 0 rows, so it needs its
+#    own call-once-then-EOS latch. If that latch is wrong the query either loses rows or spins forever.
+# ============================================================================
+
+query II
+SELECT * FROM fabricator_lat_repeat(7, 3) ORDER BY ALL;
+----
+7	0
+7	1
+7	2
+
+# 1->0 in the literal shape: no rows, and the scan must still terminate.
+query I
+SELECT count(*) FROM fabricator_lat_repeat(7, 0);
+----
+0
+
+# A named parameter DOES work here — see §10 for why that is worth pinning separately.
+query I
+SELECT scaled FROM fabricator_lat_scale(5, factor := 10);
+----
+50
+
+# ============================================================================
+# 2. THE CORRELATED SHAPE — the point of the whole function kind. The correlated column (t.id) must be
+#    stamped onto every fanned-out row, which is what provenance exists for.
+# ============================================================================
+
+statement ok
+CREATE TABLE t AS SELECT CAST(i AS INTEGER) AS id, CAST(i * 10 AS INTEGER) AS n,
+                        CAST(i % 3 AS INTEGER) AS times FROM range(4) tt(i);
+
+query III
+SELECT t.id, r.n, r.i FROM t, fabricator_lat_repeat(t.n, t.times) r ORDER BY ALL;
+----
+1	10	0
+2	20	0
+2	20	1
+
+# The explicit LATERAL spelling binds to the same thing.
+query III
+SELECT t.id, r.n, r.i FROM t, LATERAL fabricator_lat_repeat(t.n, t.times) r ORDER BY ALL;
+----
+1	10	0
+2	20	0
+2	20	1
+
+# A literal alongside a column argument: the literal arrives as a CONSTANT input column, which is what makes
+# a per-call constant expressible in the correlated shape at all (§10).
+query II
+SELECT t.id, r.i FROM t, fabricator_lat_repeat(t.n, 2) r WHERE t.id < 2 ORDER BY ALL;
+----
+0	0
+0	1
+1	0
+1	1
+
+# A filter ABOVE the function, and a correlated column it does not project.
+query I
+SELECT count(*) FROM t, fabricator_lat_repeat(t.n, 3) r WHERE r.i = 1 AND t.id > 0;
+----
+3
+
+# ============================================================================
+# 3. THE REFERENCE ORACLE — the highest-value assertion here, and the reason the kill switch exists.
+#
+#    Both paths share one bind, so any disagreement is the batched operator's fault: a mis-stamped correlated
+#    column, a dropped fan-out slice, an off-by-one in the provenance gather. ORDER BY ALL on both sides
+#    because no lateral plan promises row order. Run at threads=4 with DUPLICATE correlated values and a
+#    per-row fan-out of 0..3, so the comparison exercises several concurrent sessions, the 1->0 branch and
+#    multi-row output from one input row at once.
+# ============================================================================
+
+statement ok
+SET threads=4;
+
+statement ok
+CREATE TABLE wide AS SELECT CAST(i AS INTEGER) AS id, CAST(i % 97 AS INTEGER) AS n,
+                           CAST(i % 4 AS INTEGER) AS times FROM range(20000) tt(i);
+
+statement ok
+CREATE TABLE oracle_batched AS
+SELECT w.id, w.n, r.n AS rn, r.i FROM wide w, fabricator_lat_repeat(w.n, w.times) r ORDER BY ALL;
+
+statement ok
+SET fabricator_batched_lateral = false;
+
+statement ok
+CREATE TABLE oracle_rowwise AS
+SELECT w.id, w.n, r.n AS rn, r.i FROM wide w, fabricator_lat_repeat(w.n, w.times) r ORDER BY ALL;
+
+statement ok
+SET fabricator_batched_lateral = true;
+
+# Same cardinality, and set-equal in BOTH directions. One direction alone would miss a duplicated row.
+query IIII
+SELECT (SELECT count(*) FROM oracle_batched), (SELECT count(*) FROM oracle_rowwise),
+       (SELECT count(*) FROM (SELECT * FROM oracle_batched EXCEPT SELECT * FROM oracle_rowwise)),
+       (SELECT count(*) FROM (SELECT * FROM oracle_rowwise EXCEPT SELECT * FROM oracle_batched));
+----
+30000	30000	0	0
+
+# ============================================================================
+# 4. WHICH PATH THE PLAN TOOK. Nothing about the ROWS can tell the two apart (that is the oracle's whole
+#    premise), so the routing needs its own observable — and without it every assertion in this file would
+#    pass on a build where the rewrite never fired.
+# ============================================================================
+
+query II
+EXPLAIN SELECT w.id, r.i FROM wide w, fabricator_lat_repeat(w.n, w.times) r;
+----
+physical_plan	<REGEX>:.*FABRICATOR_LATERAL_BATCHED.*
+
+statement ok
+SET fabricator_batched_lateral = false;
+
+# The kill switch really leaves the stock driver in place — the operator is ABSENT, not merely bypassed.
+query II
+EXPLAIN SELECT w.id, r.i FROM wide w, fabricator_lat_repeat(w.n, w.times) r;
+----
+physical_plan	<!REGEX>:.*FABRICATOR_LATERAL_BATCHED.*
+
+statement ok
+SET fabricator_batched_lateral = true;
+
+# The UNCORRELATED (literal) shape must NOT be rewritten: with no child there is no projected_input, DuckDB's
+# own driver already passes the whole chunk, and our operator has no correlated columns to stamp.
+query II
+EXPLAIN SELECT * FROM fabricator_lat_repeat(7, 3);
+----
+physical_plan	<!REGEX>:.*FABRICATOR_LATERAL_BATCHED.*
+
+# ============================================================================
+# 5. PROOF OF BATCHING. Result equivalence proves correctness and says NOTHING about whether anything was
+#    batched — without this section a regression that silently reverted to per-row calls would pass the whole
+#    file.
+#
+#    The observable is DATA, not a log line: fabricator_lat_scale returns `batch_rows`, the number of input
+#    rows the call that produced that row was handed. ⚠ Counting Debug log lines was tried first and does not
+#    work — duckdb_logs flushes per-thread LAZILY, so a read immediately after the query saw 1 of 98 entries,
+#    and `disable_logging()` does not flush either. A count over it would have asserted whatever happened to
+#    be visible.
+#
+#    ⚠⚠ THE FIXTURE MUST HAVE ALL-DISTINCT CORRELATED VALUES, and that is not a detail: decorrelation puts a
+#    DISTINCT aggregate under our operator (the delim scan), so the function is called once per distinct
+#    correlated TUPLE and the join above re-expands the result. `wide` (n = i % 97) has 97 distinct values, so
+#    it can never hand us more than 97 rows — the first version of this section used it and asserted
+#    `max(batch_rows) > 100`, which is unreachable by construction. It is also why the WIN scales with
+#    distinct tuples rather than with outer rows.
+#
+#    ⚠ The batched bound is a RANGE, not `= ceil(rows/2048)`: the delim scan emits one chunk per radix
+#    partition, so chunk sizes depend on the thread count too. MEASURED at 200 000 all-distinct rows /
+#    default threads: 111 calls, 1802 rows per call, 0.03 s against 0.90 s row-by-row.
+# ============================================================================
+
+statement ok
+CREATE TABLE dist AS SELECT CAST(i AS INTEGER) AS id, CAST(i AS INTEGER) AS n FROM range(20000) tt(i);
+
+statement ok
+SET threads=1;
+
+query III
+SELECT count(*), sum(s.scaled), max(s.batch_rows) > 1000 FROM dist d, fabricator_lat_scale(d.n) s;
+----
+20000	399980000	true
+
+statement ok
+SET fabricator_batched_lateral = false;
+
+# The stock path is EXACTLY one input row per call — the positive control for the bound above, and the thing
+# a silent revert to per-row calls would trip on.
+query III
+SELECT count(*), sum(s.scaled), max(s.batch_rows) FROM dist d, fabricator_lat_scale(d.n) s;
+----
+20000	399980000	1
+
+statement ok
+SET fabricator_batched_lateral = true;
+
+statement ok
+SET threads=4;
+
+# It still batches with SEVERAL threads (each gets its own session), which is where a shared-state bug would
+# show up as a wrong `scaled` value rather than as a crash.
+query III
+SELECT count(*), sum(s.scaled), max(s.batch_rows) > 100 FROM dist d, fabricator_lat_scale(d.n) s;
+----
+20000	399980000	true
+
+# THE DE-DUPLICATION, pinned because it is the single most surprising property of this function kind and it
+# bounds every performance claim: 20 000 outer rows over 97 distinct correlated values cost at most 97 rows of
+# input, whatever the path. A callee with a per-call cost therefore pays per DISTINCT TUPLE.
+query II
+SELECT count(*), max(s.batch_rows) <= 97 FROM wide w, fabricator_lat_scale(w.n) s;
+----
+20000	true
+
+# ============================================================================
+# 6. ONE INPUT CHUNK OVERFLOWING A DUCKDB VECTOR. A fan-out of 5 over 3000 input rows is 15 000 output rows
+#    from ~2 calls, so the operator must slice its result across HAVE_MORE_OUTPUT calls while holding the
+#    provenance — and re-gather the correlated columns from the SAME input chunk each time. This is the case
+#    that exercises the drain branch and the input-size assert together.
+# ============================================================================
+
+statement ok
+SET threads=1;
+
+statement ok
+CREATE TABLE fan AS SELECT CAST(i AS INTEGER) AS id, CAST(i AS INTEGER) AS n FROM range(3000) tt(i);
+
+query III
+SELECT count(*), sum(r.i), sum(f.id) FROM fan f, fabricator_lat_repeat(f.n, 5) r;
+----
+15000	30000	22492500
+
+# The correlated column must be right PER SLICE, not merely present: 5 rows per input id, so every id appears
+# exactly 5 times and the id sum is 5x the table's.
+query II
+SELECT count(DISTINCT f.id), count(*) FROM fan f, fabricator_lat_repeat(f.n, 5) r;
+----
+3000	15000
+
+statement ok
+SET threads=4;
+
+# ============================================================================
+# 7. 1->0 AND NULLS. Three distinct things that all look like "no rows": an empty input, a callee that
+#    filtered every row of a non-empty input, and a callee that is done. Only the last is an error, and the
+#    operator must never answer FINISHED for the other two — doing so truncates the result at the first input
+#    row that produced nothing.
+# ============================================================================
+
+# Every row filtered out (times = 0) — and note rows AFTER it still arrive.
+query I
+SELECT count(*) FROM t, fabricator_lat_repeat(t.n, 0) r;
+----
+0
+
+statement ok
+CREATE TABLE mixed AS SELECT * FROM (VALUES (1, 2), (2, 0), (3, 1), (4, 0), (5, 3)) v(id, times);
+
+query II
+SELECT m.id, r.i FROM mixed m, fabricator_lat_repeat(CAST(m.id AS INTEGER), CAST(m.times AS INTEGER)) r
+ORDER BY ALL;
+----
+1	0
+1	1
+3	0
+5	0
+5	1
+5	2
+
+# The same on the ROW-BY-ROW path, where the 1->0 branch fires per row: FINISHED there would truncate the
+# result at id 2 and lose 3 and 5 entirely.
+statement ok
+SET fabricator_batched_lateral = false;
+
+query II
+SELECT m.id, r.i FROM mixed m, fabricator_lat_repeat(CAST(m.id AS INTEGER), CAST(m.times AS INTEGER)) r
+ORDER BY ALL;
+----
+1	0
+1	1
+3	0
+5	0
+5	1
+5	2
+
+statement ok
+SET fabricator_batched_lateral = true;
+
+# A WHOLE INPUT CHUNK filtered out, with more chunks behind it — the shape that separates "these inputs
+# produced nothing" from "I am finished". 4000 of 6000 distinct correlated values emit nothing, so at least
+# one 2048-row chunk is entirely empty; answering FINISHED there drops every remaining chunk.
+#
+# ⚠ threads=1 is REQUIRED, not tidiness: with several threads each gets its own chunk boundaries and the
+# fully-empty chunk may not be followed by anything on that thread — measured, the same mutant returns the
+# right answer at threads=4 and 0 at threads=1.
+statement ok
+SET threads=1;
+
+statement ok
+CREATE TABLE allfiltered AS
+SELECT CAST(i AS INTEGER) AS n, CAST(CASE WHEN i < 4000 THEN 0 ELSE 1 END AS INTEGER) AS times
+FROM range(6000) tt(i);
+
+query I
+SELECT count(*) FROM allfiltered a, fabricator_lat_repeat(a.n, a.times) r;
+----
+2000
+
+statement ok
+SET threads=4;
+
+# An EMPTY input relation: no calls, no rows, no hang.
+query I
+SELECT count(*) FROM (SELECT * FROM t WHERE id > 1000) e, fabricator_lat_repeat(e.n, 3) r;
+----
+0
+
+# A NULL input value reaches the callee (it is data, not absence) and this demo passes it through.
+query I
+SELECT count(*) FROM (SELECT CAST(NULL AS INTEGER) AS n) z, fabricator_lat_repeat(z.n, 2) r WHERE r.n IS NULL;
+----
+2
+
+# ============================================================================
+# 8. IDENTITY PROVENANCE. A 1:1 callee may return no provenance at all, and the framework fills in the
+#    identity map. That convenience is what makes the STRICT absent rule necessary: a callee that returns a
+#    different row count and no provenance is asserting something false, so it is refused rather than guessed
+#    (§9 'missing').
+# ============================================================================
+
+query II
+SELECT count(*), sum(s.scaled) FROM t, fabricator_lat_scale(t.n) s;
+----
+4	120
+
+# ...and the correlated column still lands on the right row, which is the only thing identity provenance can
+# get wrong.
+query II
+SELECT t.id, s.scaled FROM t, fabricator_lat_scale(t.n) s ORDER BY ALL;
+----
+0	0
+1	20
+2	40
+3	60
+
+# ============================================================================
+# 9. ADVERSARIAL PROVENANCE. These values are used directly as an ARRAY INDEX into the input chunk, so
+#    "the callee is untrusted" has to be a tested property rather than a comment. Each mode is asserted on
+#    BOTH paths, because validation living on only one of them is exactly the asymmetry that makes the
+#    reference oracle in §3 unsound (one path erroring where the other answers is a divergence too).
+#
+#    ⚠ The 'ok' control comes FIRST. Without it every refusal below would pass equally on a build where the
+#    fixture had simply stopped emitting rows.
+# ============================================================================
+
+query I
+SELECT count(*) FROM t, fabricator_lat_badorigin(t.n, 'ok') b;
+----
+4
+
+# Out of range: the HOST refuses, because the host is what indexes with it.
+statement error
+SELECT count(*) FROM t, fabricator_lat_badorigin(t.n, 'range') b;
+----
+outside the input range
+
+# Wrong length: refused by the marshaling layer, which is where the row counts are both known.
+statement error
+SELECT count(*) FROM t, fabricator_lat_badorigin(t.n, 'length') b;
+----
+there must be exactly one per output row
+
+# Absent provenance on an N->M result: refused, never guessed.
+statement error
+SELECT count(*) FROM t, fabricator_lat_badorigin(t.n, 'missing') b;
+----
+no provenance
+
+statement ok
+SET fabricator_batched_lateral = false;
+
+query I
+SELECT count(*) FROM t, fabricator_lat_badorigin(t.n, 'ok') b;
+----
+4
+
+statement error
+SELECT count(*) FROM t, fabricator_lat_badorigin(t.n, 'range') b;
+----
+outside the input range
+
+statement error
+SELECT count(*) FROM t, fabricator_lat_badorigin(t.n, 'length') b;
+----
+there must be exactly one per output row
+
+statement error
+SELECT count(*) FROM t, fabricator_lat_badorigin(t.n, 'missing') b;
+----
+no provenance
+
+statement ok
+SET fabricator_batched_lateral = true;
+
+# ============================================================================
+# 10. THE NAMED-ARGUMENT LIMITATION — UPSTREAM, and pinned in BOTH directions so we notice if DuckDB fixes it.
+#
+#     `f(t.a, opt := 5)` does not bind. DuckDB's BindTableFunctionParameters returns immediately for the
+#     table-in-out bind type, sweeping EVERY argument expression into the input subquery BEFORE the
+#     named-parameter extraction below it ever runs (bind_table_function.cpp:96-102) — so `factor := 10`
+#     becomes a phantom input column and the call's arity no longer matches the declaration. The literal
+#     shape is unaffected because all-scalar arguments take the standard-table-function path instead.
+#
+#     ⇒ THE GUIDANCE, which is what the pin is really protecting: declare a per-call constant POSITIONALLY.
+#     It then arrives as a constant input column and works in both shapes (asserted in §2).
+#     See docs/duckdb-upstream-issues.md.
+# ============================================================================
+
+# Works with literal arguments...
+query I
+SELECT scaled FROM fabricator_lat_scale(5, factor := 10);
+----
+50
+
+# ...and does not bind correlated. The default value is still honoured there (the previous section), so the
+# function is usable either way — only the per-call override is unavailable.
+statement error
+SELECT s.scaled FROM t, fabricator_lat_scale(t.n, factor := 10) s;
+----
+No function matches the given name
+
+# ============================================================================
+# 11. THE FUNCTIONS ARE ADVERTISED. A function that resolves by name but never appears in duckdb_functions()
+#     is invisible to every tool that enumerates (dbt, BI clients, autocomplete).
+# ============================================================================
+
+query I
+SELECT count(*) FROM duckdb_functions()
+WHERE function_name IN ('fabricator_lat_repeat', 'fabricator_lat_scale', 'fabricator_lat_badorigin');
+----
+3
+
+# Registered as TABLE functions (they appear in a FROM clause), with their positional parameters as real
+# argument types — which is precisely what lets the correlated spelling bind.
+query II
+SELECT function_type, parameter_types FROM duckdb_functions()
+WHERE function_name = 'fabricator_lat_repeat';
+----
+table	[INTEGER, INTEGER]
+
+# ============================================================================
+# 12. TWO LATERALS IN ONE QUERY, and one over the output of another — each gets its own binding and its own
+#     per-thread sessions, so nothing is shared between them.
+# ============================================================================
+
+query I
+SELECT count(*) FROM t, fabricator_lat_repeat(t.n, 2) r, fabricator_lat_scale(r.i) s;
+----
+8
+
+query III
+SELECT t.id, r.i, s.scaled FROM t, fabricator_lat_repeat(t.n, 2) r, fabricator_lat_scale(r.i) s
+WHERE t.id = 1 ORDER BY ALL;
+----
+1	0	0
+1	1	2
+
+# ============================================================================
+# 13. NON-FLAT CORRELATED COLUMNS — the gather's real risk surface.
+#
+#     The correlated columns are carried onto the output by a `VectorOperations::Copy` through a selection
+#     vector, which for a VARCHAR must copy the string data into the OUTPUT chunk's own auxiliary buffer: the
+#     input chunk belongs to the child and is recycled as soon as we return. A long string (>12 chars, so it
+#     is heap-allocated rather than inlined in the `string_t`) is what makes that observable — an inlined one
+#     would survive a dangling buffer.
+#
+#     Same for a STRUCT and a LIST, which the generic Copy handles but which no other section here exercises.
+# ============================================================================
+
+statement ok
+SET threads=1;
+
+statement ok
+CREATE TABLE nested AS
+SELECT CAST(i AS INTEGER) AS n,
+       'a-rather-long-string-value-number-' || CAST(i AS VARCHAR) AS long_txt,
+       {'k': i, 'v': 'inner-' || CAST(i AS VARCHAR)} AS st,
+       [i, i * 2, i * 3] AS lst
+FROM range(3000) tt(i);
+
+# Fan-out 3 over 3000 rows: every correlated value is replicated three times ACROSS drain slices, so a
+# dangling string buffer or a mis-gathered child would show up as wrong values rather than as a crash.
+query IIII
+SELECT count(*), count(DISTINCT ne.long_txt), min(ne.long_txt), max(ne.long_txt)
+FROM nested ne, fabricator_lat_repeat(ne.n, 3) r;
+----
+9000	3000	a-rather-long-string-value-number-0	a-rather-long-string-value-number-999
+
+# The STRUCT and the LIST come through per row, matched against the row they belong to — a gather off by one
+# would break the correlation between `n` and its own struct/list, which the equality below catches.
+query III
+SELECT count(*),
+       count(*) FILTER (WHERE ne.st.k = ne.n AND ne.st.v = 'inner-' || CAST(ne.n AS VARCHAR)),
+       count(*) FILTER (WHERE ne.lst[1] = ne.n AND ne.lst[3] = ne.n * 3)
+FROM nested ne, fabricator_lat_repeat(ne.n, 3) r;
+----
+9000	9000	9000
+
+# The oracle again, on these types: the batched gather and DuckDB's own per-row stamping must agree exactly.
+statement ok
+CREATE TABLE nested_batched AS
+SELECT ne.n, ne.long_txt, ne.st, ne.lst, r.i FROM nested ne, fabricator_lat_repeat(ne.n, 3) r ORDER BY ALL;
+
+statement ok
+SET fabricator_batched_lateral = false;
+
+statement ok
+CREATE TABLE nested_rowwise AS
+SELECT ne.n, ne.long_txt, ne.st, ne.lst, r.i FROM nested ne, fabricator_lat_repeat(ne.n, 3) r ORDER BY ALL;
+
+statement ok
+SET fabricator_batched_lateral = true;
+
+query III
+SELECT (SELECT count(*) FROM nested_batched),
+       (SELECT count(*) FROM (SELECT * FROM nested_batched EXCEPT SELECT * FROM nested_rowwise)),
+       (SELECT count(*) FROM (SELECT * FROM nested_rowwise EXCEPT SELECT * FROM nested_batched));
+----
+9000	0	0
+
+statement ok
+SET threads=4;
+
+# ============================================================================
+# 14. A PREPARED STATEMENT EXECUTED TWICE. The managed BINDING is created at bind and reused across
+#     executions (that is what the refcounted holder is for), while a SESSION is per operator state. If the
+#     two were confused — a session closed with the binding, or a binding freed per execution — the second
+#     execution would fail rather than return the same answer.
+# ============================================================================
+
+statement ok
+PREPARE lat_p AS SELECT count(*), sum(r.i) FROM t, fabricator_lat_repeat(t.n, CAST(? AS INTEGER)) r;
+
+query II
+EXECUTE lat_p(2);
+----
+8	4
+
+query II
+EXECUTE lat_p(2);
+----
+8	4
+
+query II
+EXECUTE lat_p(3);
+----
+12	12

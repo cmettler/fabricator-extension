@@ -20,6 +20,10 @@ public static class GlobalFunctions
         new(() => Build<IInOutFunction>(b => b.GlobalInOutFunctions, f => f.Name, "in-out"),
             LazyThreadSafetyMode.ExecutionAndPublication);
 
+    private static readonly Lazy<IReadOnlyDictionary<string, ILateralTableFunction>> LateralMap =
+        new(() => Build<ILateralTableFunction>(b => b.GlobalLateralFunctions, f => f.Name, "lateral"),
+            LazyThreadSafetyMode.ExecutionAndPublication);
+
     private static readonly Lazy<IReadOnlyDictionary<string, ICollectorTableFunction>> CollectorMap =
         new(() => Build<ICollectorTableFunction>(b => b.GlobalCollectorFunctions, f => f.Name, "collector"),
             LazyThreadSafetyMode.ExecutionAndPublication);
@@ -46,6 +50,9 @@ public static class GlobalFunctions
 
     /// <summary>All declared global in-out functions, for <c>list_global_functions</c>.</summary>
     public static IReadOnlyCollection<IInOutFunction> AllInOut() => (IReadOnlyCollection<IInOutFunction>)InOutMap.Value.Values;
+
+    /// <summary>All declared global row-mapped (correlated LATERAL) functions, for <c>list_global_functions</c>.</summary>
+    public static IReadOnlyCollection<ILateralTableFunction> AllLaterals() => (IReadOnlyCollection<ILateralTableFunction>)LateralMap.Value.Values;
 
     /// <summary>All declared global collector functions, for <c>list_global_functions</c>.</summary>
     public static IReadOnlyCollection<ICollectorTableFunction> AllCollectors() => (IReadOnlyCollection<ICollectorTableFunction>)CollectorMap.Value.Values;
@@ -101,6 +108,9 @@ public static class GlobalFunctions
         if (TableMap.Value.TryGetValue(name, out var t)) { return t.Parameters; }
         if (SqlTableMap.Value.TryGetValue(name, out var sq)) { return sq.Parameters; }
         if (AggregateMap.Value.TryGetValue(name, out var a)) { return a.Parameters; }
+        // A lateral function's schema carries BOTH halves: its positional fields become the per-row input
+        // columns (and hence the DuckDB argument types) while its named fields are the constant cost args.
+        if (LateralMap.Value.TryGetValue(name, out var lat)) { return lat.Parameters; }
         // In-out / collector cost args are declared as NAMED parameters (e.g. path := '…'); default empty.
         if (InOutMap.Value.TryGetValue(name, out var io)) { return io.Parameters; }
         if (CollectorMap.Value.TryGetValue(name, out var co)) { return co.Parameters; }
@@ -123,6 +133,21 @@ public static class GlobalFunctions
         ScalarMap.Value.TryGetValue(name, out var fn)
             ? fn
             : throw new ArgumentException($"fabricator: no global scalar function '{name}'");
+
+    /// <summary>Bind a global row-mapped (correlated LATERAL) function by name (the handle-0 lateral_bind
+    /// path); throws if none is registered.</summary>
+    public static ILateralBinding ResolveLateral(string name, RecordBatch? args, Schema inputSchema)
+    {
+        if (!LateralMap.Value.TryGetValue(name, out var fn))
+        {
+            throw new ArgumentException($"fabricator: no global lateral function '{name}'");
+        }
+        // Checked at BIND (once per plan, so free) rather than at registration: a table-input declaration
+        // would build a {TABLE} signature the correlated spelling cannot bind against, i.e. a function nobody
+        // could call the way it was declared. The host refuses it too; this is where the message is best.
+        Params.Validate(fn.Name, fn.Parameters, allowNamed: true, allowTableInput: false);
+        return fn.Bind(args, inputSchema);
+    }
 
     /// <summary>Bind a global in-out OR collector by name (the handle-0 inout_bind path). A collector is wrapped
     /// in a <see cref="CollectorInOutBinding"/> so it flows through the shared exchange marshaling.</summary>
