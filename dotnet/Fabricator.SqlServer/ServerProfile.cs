@@ -50,6 +50,25 @@ internal sealed class ServerProfile
     public bool IsWarehouse => EngineEdition is EditionSynapseDedicated or EditionFabricOrSynapseServerless;
 
     /// <summary>
+    /// Change data capture exists on this engine — the whole <c>db.cdc.*</c> surface is gated on it.
+    /// FALSE for the entire warehouse family: Fabric Warehouse, the Fabric Lakehouse SQL endpoint (both
+    /// edition 11) and Synapse dedicated (6) have no <c>cdc</c> schema, no <c>sp_cdc_enable_db</c>, no
+    /// capture job, and on Fabric no <c>msdb</c> for job metadata to live in. See docs/mssql-cdc.md §0.1.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>⚠ This MUST stay a capability gate and must never become a try/catch probe.</b> On a
+    /// warehouse engine a statement that errors inside an explicit transaction ABORTS the transaction, so a
+    /// swallowed "is CDC here?" probe poisons whatever the caller does next — which is exactly how every dbt
+    /// table model on Fabric came to die at the swap with error 15225 (two best-effort probes whose failures
+    /// were being ignored). docs/warehouse-support.md §6.5: on a warehouse engine, never issue a statement
+    /// whose failure you intend to swallow.</para>
+    /// <para>Azure SQL Database (edition 5) is on the TRUE side and is the interesting middle case: CDC works
+    /// there but there is no SQL Server Agent, so the health surface must degrade rather than report the agent
+    /// as stopped. UNMEASURED — no live Azure SQL Database here (§0.1).</para>
+    /// </remarks>
+    public bool SupportsCdc => !IsWarehouse;
+
+    /// <summary>
     /// Isolation level for the pinned WRITE transaction (BeginWrite). Fabric Warehouse / Lakehouse SQL
     /// endpoint only support SNAPSHOT, so we set it explicitly there; box SQL Server / Azure SQL DB /
     /// Synapse dedicated keep the connection/server default (empty => Unspecified). Synapse dedicated is
@@ -102,6 +121,7 @@ internal sealed class ServerProfile
         ("has_datetimeoffset", Bool(HasDatetimeOffset)),
         ("max_datetime2_scale", MaxDateTime2Scale.ToString()),
         ("has_native_json", Bool(HasNativeJson)),
+        ("supports_cdc", Bool(SupportsCdc)),
         ("is_utf8_collation", Bool(IsUtf8Collation)),
         ("is_binary_collation", Bool(IsBinaryCollation)),
         ("is_case_sensitive", Bool(IsCaseSensitive)),

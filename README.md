@@ -102,6 +102,8 @@ See [SQL Server external tables on S3](#sql-server-external-tables-on-s3).
 | | **Correlated LATERAL**: `FROM t, db.schema.fn(t.a, t.b)` — batched, 1→1/1→0/1→N | ✅ |
 | | — configurable isolation (consistent snapshot per call); per-row procs run in DuckDB's transaction | ✅ |
 | | **Custom C# aggregates** (UDAF) → `db.schema.agg(x)` in `GROUP BY` / parallel / `OVER(…)`; opt-in disk-spill (`SupportsSpill`) | ✅ |
+| **Change data capture** | `db.cdc.tables()` / `max_position()` / `min_position()` / `health()` — inspect SQL Server CDC | ✅ SQL Server only (not Fabric / Synapse) |
+| | A resumable change-stream reader (`db.cdc.changes(...)`) with a snapshot leg | ❌ designed, not built (`docs/mssql-cdc.md`) |
 | **Monitoring** | `db.dbo.fabricator_session_tag(k, v)` — tag a transaction's connection so Fabric query insights can attribute its cost | ✅ (see dbt caveat) |
 | | `application_name` on the secret → `program_name` on every statement (run-level attribution) | ✅ |
 | | Load-time *global* functions (connection-free); proc multi-result-set / `INOUT` params | ❌ deferred |
@@ -792,7 +794,8 @@ case arises.
 
 The detected server capability profile for an attached catalog (edition, version, collation, and the
 derived flags: `supports_mars`, `has_nvarchar`, `has_datetimeoffset`, `max_datetime2_scale`,
-`has_native_json`, `is_utf8_collation`, `is_binary_collation`, `default_write_isolation`, …). See
+`has_native_json`, `supports_cdc`, `is_utf8_collation`, `is_binary_collation`, `default_write_isolation`,
+…). See
 [Microsoft Fabric & Synapse](#microsoft-fabric--synapse-warehouse).
 
 Plus one row that is **not** a server property: **`mars_enabled`** — whether *this catalog* actually uses
@@ -804,6 +807,58 @@ enough to take effect:
 SELECT property, value FROM fabricator_server_info('db')
 WHERE property IN ('supports_mars', 'mars_enabled');
 ```
+
+### `db.cdc.*` — change data capture (SQL Server only)
+
+Inspection functions over SQL Server's [change data
+capture](https://learn.microsoft.com/en-us/sql/relational-databases/track-changes/about-change-data-capture-sql-server).
+They live in the catalog's `cdc` schema, so they resolve as `db.cdc.max_position()` and so on.
+
+> **⚠ SQL Server only.** CDC is a SQL Server engine feature: **Fabric Warehouse, the Fabric Lakehouse SQL
+> endpoint and Synapse dedicated pools do not have it**, and on those engines these functions are not
+> registered at all — `db.cdc.max_position()` reports that it does not exist. Check with
+> `SELECT value FROM fabricator_server_info('db') WHERE property = 'supports_cdc'`.
+
+| function | returns |
+|---|---|
+| `db.cdc.tables()` | one row per capture **instance** — `source_schema`, `source_table`, `capture_instance`, `start_lsn`, `end_lsn`, `supports_net_changes`, `has_drop_pending`, `role_name`, `index_name`, `filegroup_name`, `create_date`, `index_column_list`, `captured_column_list` |
+| `db.cdc.max_position()` | the current log position (`sys.fn_cdc_get_max_lsn`) as a `BLOB`, or `NULL` |
+| `db.cdc.min_position('<capture instance>' \| '<schema>.<table>')` | the **retention floor** (`sys.fn_cdc_get_min_lsn`) as a `BLOB`, or `NULL` |
+| `db.cdc.health()` | 12 `(property, value)` rows, in this order: `supports_cdc`, `database`, `cdc_enabled`, `captured_instances`, `capture_job`, `capture_polling_interval_seconds`, `cleanup_job`, `cleanup_retention_minutes`, `max_lsn`, `max_lsn_time`, `max_lsn_age_seconds`, `agent_status` |
+
+```sql
+-- What is captured, and where the log currently stands?
+SELECT source_table, capture_instance, captured_column_list FROM db.cdc.tables();
+SELECT db.cdc.max_position() AS pos, db.cdc.min_position('dbo.orders') AS retention_floor;
+
+-- Why is nothing arriving?
+SELECT * FROM db.cdc.health();
+```
+
+**Notes that will save you an afternoon:**
+
+- **`NULL` is a state, not an error.** `max_position()` is `NULL` when CDC is not enabled on the database *and*
+  when it is enabled but the capture job has not run yet. `health()` tells you which. (Calling
+  `sys.fn_cdc_get_max_lsn()` yourself in the first case raises `208 Invalid object name
+  'cdc.lsn_time_mapping'` — an error about an object you never mentioned, which is why these wrappers exist.)
+- **Enabling capture is a DDL.** `sys.sp_cdc_enable_table` creates a change table and two table functions,
+  and this session's catalog cache will not show them until you call `fabricator_refresh_cache('db')` or
+  re-`ATTACH`.
+- **"Enabled" and "happening" are independent.** `sp_cdc_enable_db` / `sp_cdc_enable_table` both succeed
+  with SQL Server Agent stopped, so a table can look captured and never produce a row. That is what
+  `health()`'s `agent_status` is for — and it reports `unknown` rather than guessing when the connection
+  lacks `VIEW SERVER STATE`.
+- **`min_position` takes the capture instance OR the table.** A table may have **two** capture instances (how
+  a schema change is absorbed), and their retention floors can differ — so a table name that matches two is
+  refused rather than resolved by picking one. `cdc.tables()` lists the instance names.
+- **`max_lsn_age_seconds` is not lag.** It is the age of the newest *captured* transaction, so on an idle
+  database it grows without bound while capture is perfectly current.
+- SQL Server's own per-instance functions (`cdc.fn_cdc_get_all_changes_<instance>`, and the `_each` per-row
+  form this extension adds for every discovered table function) are ordinary discovered functions and are
+  callable directly.
+
+A first-class reader — one function returning the change stream with a resumable cursor, a snapshot leg and
+retention pre-checks — is designed but not yet built; see `docs/mssql-cdc.md`.
 
 ### `db.dbo.fabricator_session_tag(key, value) -> TABLE` (SQL Server / Fabric)
 

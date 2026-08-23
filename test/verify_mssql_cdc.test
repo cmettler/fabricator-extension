@@ -1,0 +1,374 @@
+# name: test/verify_mssql_cdc.test
+# description: the db.cdc.* surface over SQL Server change data capture — slice 1 (inspection only)
+# group: [fabricator]
+#
+# Slice 1 of docs/mssql-cdc.md: the ServerProfile.SupportsCdc gate, the appended `cdc` schema, and the four
+# read-only functions cdc.tables() / position() / min_position() / health(). No reader yet (slice 3).
+#
+# ⚠ SERVICE TIER — it needs a real SQL Server, and unlike the rest of that tier it also needs SQL SERVER
+#   AGENT (docker-compose sets MSSQL_AGENT_ENABLED=true). §8's agent assertion is the ONLY thing in either
+#   CI tier that would notice a revert of that compose change.
+#
+# ⚠ IT ENABLES AND DISABLES CDC ON TestDB. Section 9's teardown is load-bearing, not tidiness: a
+#   CDC-enabled table left behind keeps the capture job scanning between runs, and §3's "max_position() IS NULL"
+#   would then fail on the NEXT run for a reason that has nothing to do with the code. The idempotent
+#   pre-teardown in §0 is what recovers from a run that died before reaching §9.
+#
+# ⚠ WHAT THIS SUITE DOES *NOT* COVER, said rather than implied. Every item is a degrade-to-unknown fallback
+#   that this rig cannot reach:
+#     * the Azure SQL Database branch of health()'s agent probe (edition 5 — CDC works, no agent, and
+#       sys.dm_server_services does not exist). Needs a live Azure SQL Database; §0.1 of the design note
+#       records it as unmeasured.
+#     * health()'s "no VIEW SERVER STATE" answer — the rig authenticates as `sa`. Same structural blindness
+#       as the SqlClient Entra finding: a least-privilege reader is exercised nowhere here.
+#     * a capture instance whose NAME collides with some table's `schema.table` spelling (min_position's
+#       "matches both kinds" refusal). Arrangeable in principle, and it needs a capture instance deliberately
+#       misnamed; the two-instance refusal in §7 covers the case that actually happens.
+#     * a malformed LSN or timestamp from the server (ParseHex / ParseTimestampMicros returning null) —
+#       SQL Server's CONVERT always renders these well-formed.
+
+require fabricator
+
+require-env MSSQL_TESTDB_DSN
+
+# ═══ §0  Recover from a previous crashed run ═══════════════════════════════════════════════════════════
+# sp_cdc_disable_db drops EVERY capture instance in the database, so this one statement is a complete
+# teardown. ⚠ Nothing here may name a cdc.* object: a batch that references a nonexistent object fails at
+# COMPILE, so an `IF ... cdc.change_tables` guard would break precisely in the case it exists to handle.
+
+# ⚠ THE TEARDOWN MUST RUN BEFORE THE ATTACH, and getting that wrong is how this section first passed while
+# asserting nothing: catalog discovery happens AT attach, so a `c0` attached first reports the objects a
+# previous run left behind whatever the teardown then does. Hence a raw connection string here —
+# fabricator_exec accepts one, so it needs no catalog to exist yet.
+#
+# ⚠⚠ THE RETRY IS NOT DEFENSIVE PADDING — sp_cdc_disable_db CONTENDS FOR THE SINGLE PER-DATABASE LOG-SCAN
+# SESSION and fails hard when the capture job holds it. OBSERVED ONCE in this suite:
+#   22896 sp_cdc_disable_db caught an exception ... 22831 ... 'sys.sp_repldone NULL, NULL, 0, 0, 1, 0, 0'
+#   ... 22912 'sp_repldone failed'
+# That is the same contention docs/mssql-cdc.md §10.2 records for sp_cdc_scan (sp_replcmds), on an operation
+# the design note did not anticipate. ⚠ Could NOT be forced deterministically (0 failures in 5 iterations
+# that enabled, inserted, waited 7 s for the job to be actively scanning, then disabled), so this is
+# insurance against a rare race rather than a fix for a reproducible one.
+#
+# ⚠ And the obvious alternative — stop the capture job first, which is what §10.2 recommends — DOES NOT WORK
+# HERE. MEASURED: when the job is not yet running, sp_cdc_stop_job's refusal is raised by the SQL Server
+# Agent proxy, T-SQL BEGIN TRY/END CATCH does NOT catch it, and it escapes through fabricator_exec as
+# `22022 SqlException`. So it cannot be made tolerant, and the suite enables capture immediately before —
+# exactly the window where the job has not started. The retry needs no such guard.
+statement ok
+SELECT fabricator_exec('${MSSQL_TESTDB_DSN}', 'DECLARE @t int = 0; WHILE @t < 10 BEGIN SET @t = @t + 1; BEGIN TRY IF EXISTS (SELECT 1 FROM sys.databases WHERE database_id = DB_ID() AND is_cdc_enabled = 1) EXEC sys.sp_cdc_disable_db; BREAK; END TRY BEGIN CATCH IF @t >= 10 THROW; WAITFOR DELAY ''00:00:01''; END CATCH END');
+
+statement ok
+SELECT fabricator_exec('${MSSQL_TESTDB_DSN}', 'IF OBJECT_ID(''dbo.cdc_probe'') IS NOT NULL DROP TABLE dbo.cdc_probe;');
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS c0 (TYPE fabricator);
+
+# ═══ §1  The gate is a CAPABILITY, and it is observable ════════════════════════════════════════════════
+# supports_cdc is derived from the profile, never probed. It is surfaced through fabricator_server_info
+# because that is the ONLY thing a user on a warehouse engine can read — there the functions below do not
+# exist at all, which is what makes it impossible to issue a CDC statement on such an engine.
+
+query II
+SELECT property, value FROM fabricator_server_info('c0') WHERE property IN ('is_warehouse', 'supports_cdc') ORDER BY property;
+----
+is_warehouse	false
+supports_cdc	true
+
+# ═══ §2  With CDC NOT enabled the `cdc` schema is APPENDED, so the surface is reachable ════════════════
+# This is the case the append exists for. The host silently DROPS a declared function whose schema it never
+# registered, so without the append the enable functions of slice 2 would be unreachable exactly when they
+# are needed — no error, just missing.
+
+query I
+SELECT count(*) FROM duckdb_schemas() WHERE database_name = 'c0' AND schema_name = 'cdc';
+----
+1
+
+# ⚠ POSITIVE CONTROL for the assertion above: the schema really is SYNTHETIC here — SQL Server has no `cdc`
+# schema yet, so nothing was discovered under it. Without this row, "the schema is present" would pass
+# equally on a build that never appends anything, against a server that happened to have CDC on.
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'c0' AND schema_name = 'cdc';
+----
+0
+
+# ⚠ Filtered to OUR four names on purpose. Once CDC is enabled, SQL Server's own per-instance TVFs also live
+# in this schema — and this provider declares a `<routine>_each` sibling for every discovered TVF that takes
+# parameters, so each capture instance contributes FOUR entries
+# (fn_cdc_get_{all,net}_changes_<inst>{,_each}). An unfiltered count would therefore be a function of how
+# many tables happen to be captured, which is not what this section is about.
+query II
+SELECT function_name, function_type FROM duckdb_functions() WHERE database_name = 'c0' AND schema_name = 'cdc' AND function_name IN ('max_position', 'min_position', 'tables', 'health') ORDER BY function_name;
+----
+health	table
+max_position	scalar
+min_position	scalar
+tables	table
+
+# ═══ §2b  The filters: `cdc` is appended OUTSIDE schema_filter, and function_filter still governs ══════
+# The design states both and nothing asserted either. The split matters because deleting the whole CDC
+# surface when someone narrowed which TABLES they wanted would be a surprising coupling — function_filter is
+# the option that exists for functions, and it is deliberately still honoured here.
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS cf (TYPE fabricator, schema_filter 'nothing_matches_this');
+
+query I
+SELECT count(*) FROM duckdb_schemas() WHERE database_name = 'cf' AND schema_name = 'cdc';
+----
+1
+
+# …and the functions are reachable through it, so the append is not a bare name.
+query I
+SELECT cf.cdc.max_position() IS NULL;
+----
+true
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS ff (TYPE fabricator, function_filter 'nothing_matches_this');
+
+# The schema survives (it is not function-scoped)…
+query I
+SELECT count(*) FROM duckdb_schemas() WHERE database_name = 'ff' AND schema_name = 'cdc';
+----
+1
+
+# …while the FUNCTIONS are filtered out, which is the half a caller can control.
+query I
+SELECT count(*) FROM duckdb_functions() WHERE database_name = 'ff' AND schema_name = 'cdc';
+----
+0
+
+statement ok
+DETACH cf;
+
+statement ok
+DETACH ff;
+
+# ═══ §3  NULL is a STATE, not a failure — and the raw engine function RAISES here ══════════════════════
+
+query I
+SELECT c0.cdc.max_position() IS NULL;
+----
+true
+
+query I
+SELECT count(*) FROM c0.cdc.tables();
+----
+0
+
+query II
+SELECT property, value FROM c0.cdc.health() WHERE property IN ('cdc_enabled', 'captured_instances') ORDER BY property;
+----
+captured_instances	0
+cdc_enabled	false
+
+# ⚠⚠ THE POSITIVE CONTROL THAT MAKES §3 MEAN SOMETHING, and the mutant that kills the whole section: the
+# underlying function does NOT return NULL with CDC disabled, it raises 208 naming `cdc.lsn_time_mapping` —
+# an object the caller never mentioned. Remove the is_cdc_enabled guard from CdcMaxLsn and the three
+# assertions above become this error. Without this row they would be equally true of a server that simply
+# answers NULL, i.e. they would assert nothing about our guard.
+statement error
+SELECT * FROM fabricator_query('${MSSQL_TESTDB_DSN}', 'SELECT sys.fn_cdc_get_max_lsn() AS l');
+----
+Invalid object name 'cdc.lsn_time_mapping'
+
+# The refusal that can ONLY be tested before CDC is enabled: "this database has no CDC" and "this table is
+# not captured" have different remedies, so the message must not conflate them.
+statement error
+SELECT c0.cdc.min_position('dbo.cdc_probe');
+----
+change data capture is not enabled on database
+
+# ═══ §4  Enable CDC and capture a table ═══════════════════════════════════════════════════════════════
+
+statement ok
+SELECT fabricator_exec('c0', 'CREATE TABLE dbo.cdc_probe(id INT NOT NULL PRIMARY KEY, v NVARCHAR(20) NULL);');
+
+statement ok
+SELECT fabricator_exec('c0', 'EXEC sys.sp_cdc_enable_db;');
+
+statement ok
+SELECT fabricator_exec('c0', 'EXEC sys.sp_cdc_enable_table @source_schema=N''dbo'', @source_name=N''cdc_probe'', @role_name=NULL;');
+
+# A FRESH attach, because enabling capture is a DDL that creates objects and this catalog's discovery ran
+# before it. (Making the enable path invalidate the cache itself is slice 2's job — it is what stops a user
+# having to know that enabling capture creates a schema and two table functions.)
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS c1 (TYPE fabricator);
+
+# The `cdc` schema is now REAL, and the append must not advertise a DUPLICATE — the host's ensure_schema
+# treats one as a collision rather than a merge.
+query I
+SELECT count(*) FROM duckdb_schemas() WHERE database_name = 'c1' AND schema_name = 'cdc';
+----
+1
+
+# …and it now holds SQL Server's own metadata tables plus the change table: the discriminator against §2's
+# synthetic case. A floor rather than an exact count, so a future engine adding a metadata table does not
+# fail a suite that is not about that.
+query I
+SELECT count(*) >= 6 FROM duckdb_tables() WHERE database_name = 'c1' AND schema_name = 'cdc';
+----
+true
+
+# ═══ §5  cdc.tables() reports the capture INSTANCE and its captured columns ════════════════════════════
+# One row per capture instance, not per table — a table may have two (§2.2). captured_column_list is how a
+# caller sees which columns are captured, and the column set is fixed at enable time.
+
+query IIII
+SELECT source_schema, source_table, capture_instance, captured_column_list FROM c1.cdc.tables();
+----
+dbo	cdc_probe	dbo_cdc_probe	[id], [v]
+
+# ⚠ THE TYPED COLUMNS ARE THE POINT OF READING THE RESULT AS STRINGS AND RE-TYPING IT, and create_date is
+# the one that would fail SILENTLY: a TimestampArray.Builder built without the declared field defaults to
+# MILLISECOND while the column declares MICROSECOND, and every timestamp then reads as January 1970. That
+# defect shipped across 15 hand-rolled sites once because nobody looked at the times.
+query II
+SELECT octet_length(start_lsn), create_date > TIMESTAMP '2020-01-01' FROM c1.cdc.tables();
+----
+10	true
+
+# end_lsn is NULL even once a newer instance supersedes this one (§2.2) — which is why the instance boundary
+# has to be DERIVED from the newer instance's start_lsn. Pinned so a later change cannot quietly rely on it.
+query I
+SELECT end_lsn IS NULL FROM c1.cdc.tables();
+----
+true
+
+# ═══ §6  min_position resolves BOTH spellings ══════════════════════════════════════════════════════════
+# ⚠⚠ NOTHING HERE MAY DEPEND ON THE FLOOR'S VALUE, and the first version of this section did — it compared
+# two calls with `IS NOT DISTINCT FROM` and FAILED 1 run in 14. The cause is the function's own behaviour,
+# not ours: for an instance enabled in a database whose capture job is already running,
+# fn_cdc_get_min_lsn is NULL until the job scans, and TWO CALLS IN ONE STATEMENT CAN STRADDLE THE
+# NULL→value TRANSITION (measured: `min_position(x) IS NOT DISTINCT FROM min_position(x)` returned FALSE).
+# A `WAITFOR DELAY` would only lengthen the window, not close it.
+#
+# So the resolution is proved by the ERROR BEHAVIOUR instead, which is deterministic at every instant, and
+# §7 completes the proof: the table name succeeds here with one instance, ERRORS naming both once a second
+# exists, and the instance name keeps working throughout. That triple pins both spellings and the
+# table→instances mapping without ever reading a floor.
+
+# Resolves, does not error — and if it has a value at all, that value is a 10-byte LSN. ONE call, so no
+# transition can be straddled; coalesce makes the not-yet-established state pass rather than flake.
+query I
+SELECT coalesce(octet_length(c1.cdc.min_position('dbo.cdc_probe')), 10) = 10;
+----
+true
+
+query I
+SELECT coalesce(octet_length(c1.cdc.min_position('dbo_cdc_probe')), 10) = 10;
+----
+true
+
+statement error
+SELECT c1.cdc.min_position('dbo.nope');
+----
+is not a captured table or capture instance
+
+# ═══ §7  Two capture instances: REFUSED, not resolved by precedence ════════════════════════════════════
+# A second instance is how a schema change is absorbed, and both capture the SAME change concurrently, so
+# reading both double-counts. Their retention floors can also differ — MEASURED (0x…2C00000C980040 vs
+# 0x…2D00000E900043 on one table) — so answering for either one would be a wrong answer, not a shortcut.
+
+statement ok
+SELECT fabricator_exec('c1', 'ALTER TABLE dbo.cdc_probe ADD extra INT NULL;');
+
+statement ok
+SELECT fabricator_exec('c1', 'EXEC sys.sp_cdc_enable_table @source_schema=N''dbo'', @source_name=N''cdc_probe'', @role_name=NULL, @capture_instance=N''dbo_cdc_probe_v2'';');
+
+query I
+SELECT count(*) FROM c1.cdc.tables();
+----
+2
+
+# The newer instance captures the added column; the older one does not. This is what makes the boundary a
+# correctness question rather than bookkeeping.
+query II
+SELECT capture_instance, captured_column_list FROM c1.cdc.tables() ORDER BY capture_instance;
+----
+dbo_cdc_probe	[id], [v]
+dbo_cdc_probe_v2	[id], [v], [extra]
+
+statement error
+SELECT c1.cdc.min_position('dbo.cdc_probe');
+----
+matches 2 capture instances
+
+# ⚠ THE OTHER HALF OF §6's PROOF, and the reason the refusal above is about RESOLUTION rather than about
+# min_position being broken: naming the instance still works while the table name is ambiguous. Between the
+# two, the table→instances mapping and the instance-name path are both pinned, with no floor value read.
+query I
+SELECT coalesce(octet_length(c1.cdc.min_position('dbo_cdc_probe_v2')), 10) = 10;
+----
+true
+
+# ═══ §8  health() answers what a silent pipeline needs ═════════════════════════════════════════════════
+
+query II
+SELECT property, value FROM c1.cdc.health() WHERE property IN ('supports_cdc', 'cdc_enabled', 'captured_instances') ORDER BY property;
+----
+captured_instances	2
+cdc_enabled	true
+supports_cdc	true
+
+# The full row set, pinned by COUNT and ORDER. The README documents these 12 by name, and an unasserted doc
+# claim is a gap — a row added or removed without updating both should fail here rather than quietly drift.
+query I
+SELECT count(*) FROM c1.cdc.health();
+----
+12
+
+# ⚠⚠ THE ONLY ASSERTION IN EITHER CI TIER THAT WOULD NOTICE A REVERT OF `MSSQL_AGENT_ENABLED=true` in
+# docker/docker-compose.yml. sp_cdc_enable_db and sp_cdc_enable_table both SUCCEED with the agent stopped —
+# printing only an informational notice — so "capture is enabled" and "capture is happening" are independent
+# states and the enable path reports success for both. Everything else in this suite passes with the agent
+# off, which is exactly the vacuous-pass hole this row closes.
+query I
+SELECT value FROM c1.cdc.health() WHERE property = 'agent_status';
+----
+Running
+
+# The capture job's polling interval decides how long an un-forced capture takes (~5 s on this rig). Read as
+# "present" rather than as a literal, because it is rig configuration rather than our behaviour.
+query I
+SELECT value IS NOT NULL FROM c1.cdc.health() WHERE property = 'capture_polling_interval_seconds';
+----
+true
+
+# ⚠ The row is `max_lsn_age_seconds`, deliberately NOT `capture_lag_seconds`: it is the AGE of the newest
+# CAPTURED transaction, so on an idle database it grows without bound while capture is perfectly current.
+# Pinned by NAME so the misleading spelling cannot come back.
+query I
+SELECT count(*) FROM c1.cdc.health() WHERE property = 'capture_lag_seconds';
+----
+0
+
+query I
+SELECT count(*) FROM c1.cdc.health() WHERE property = 'max_lsn_age_seconds';
+----
+1
+
+# ═══ §9  Teardown — leave NO CDC-enabled table behind ══════════════════════════════════════════════════
+# Load-bearing: the capture job keeps scanning a CDC-enabled database between runs, and the next run's §3
+# would then find max_position() non-NULL and fail for a reason unrelated to the code.
+
+# Same retry as §0, same reason.
+statement ok
+SELECT fabricator_exec('c1', 'DECLARE @t int = 0; WHILE @t < 10 BEGIN SET @t = @t + 1; BEGIN TRY IF EXISTS (SELECT 1 FROM sys.databases WHERE database_id = DB_ID() AND is_cdc_enabled = 1) EXEC sys.sp_cdc_disable_db; BREAK; END TRY BEGIN CATCH IF @t >= 10 THROW; WAITFOR DELAY ''00:00:01''; END CATCH END');
+
+statement ok
+SELECT fabricator_exec('c1', 'DROP TABLE dbo.cdc_probe;');
+
+# Back to §3's state, which is also the cheapest possible check that the teardown really disabled it.
+query I
+SELECT c1.cdc.max_position() IS NULL;
+----
+true
+
+query I
+SELECT count(*) FROM c1.cdc.tables();
+----
+0

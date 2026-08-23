@@ -446,15 +446,30 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
 
     private CatalogFunctionSet BuildFunctionSet()
     {
-        if (!IsFabricEndpoint(_baseConnectionString))
+        bool fabric = IsFabricEndpoint(_baseConnectionString);
+        // ⚠ The CDC gate reads the PROFILE, so unlike the Fabric gate it is not a pure string test. It costs
+        // no extra round trip in practice: `catalog_init` (ABI v78) runs EnsureProfile() before the first
+        // discovery crossing on every ATTACH path, and a path that reaches here without one is about to open
+        // a connection for the function query anyway.
+        bool cdc = Profile.SupportsCdc;
+        if (!fabric && !cdc)
         {
             return CustomFunctionSet;
         }
         var scalars = new List<ICatalogScalarFunction>(CustomFunctions.Scalar);
         var tables = new List<ICatalogTableFunction>(CustomFunctions.Table);
-        FabricApiFunctions.Register(
-            scalars, tables, ResolveApiWorkspace(), ResolveApiItem(),
-            _fabricCredFields is null ? null : FabricCredentialResolver.Resolve(_fabricCredFields));
+        if (fabric)
+        {
+            FabricApiFunctions.Register(
+                scalars, tables, ResolveApiWorkspace(), ResolveApiItem(),
+                _fabricCredFields is null ? null : FabricCredentialResolver.Resolve(_fabricCredFields));
+        }
+        // The db.cdc.* surface. NOT registered on a warehouse engine, which is what makes it impossible to
+        // issue a CDC statement there — see SqlServerCdcFunctions and docs/mssql-cdc.md §0.1.
+        if (cdc)
+        {
+            SqlServerCdcFunctions.Register(scalars, tables, this);
+        }
         return new CatalogFunctionSet(scalars, tables, CustomFunctions.SqlTable, CustomFunctions.InOut,
                                       CustomFunctions.Lateral, CustomFunctions.Collector,
                                       CustomFunctions.Aggregate);
@@ -2405,10 +2420,14 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
 
     // Reads a metadata query's result rows as strings (small result sets: schema/table discovery). Uses the
     // metadata connection (read-your-writes when in a write transaction), mirroring GetMetadata.
-    private List<string?[]> ReadMetadataRows(string sql, int columnCount)
+    // `parameters` is for the CDC surface, whose queries take a user-supplied source name; the discovery
+    // callers pass none. Read-your-writes either way (it routes through the transaction's pinned connection
+    // when one exists), so `cdc.tables()` sees a capture instance this transaction just enabled.
+    private List<string?[]> ReadMetadataRows(string sql, int columnCount,
+                                             IReadOnlyList<SqlParameter>? parameters = null)
     {
         var rows = new List<string?[]>();
-        using var src = ExecuteMetadataQuery(sql);
+        using var src = ExecuteQuery(sql, parameters, readYourWrites: true);
         while (true)
         {
             var batch = src.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult();
@@ -2458,7 +2477,13 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     private IArrowArrayStream SchemasMetadata()
     {
         bool addFunctionSchema = IsFabricEndpoint(_baseConnectionString);
-        if (_schemaFilter is null && !addFunctionSchema)
+        // ⚠ `cdc` differs from `fabric` in one way that matters: it is a REAL schema that SQL Server creates
+        // on sp_cdc_enable_db, so most of the time the server returns it and this appends nothing. It has to
+        // be appended for the case where it does NOT exist yet — CDC not enabled — because that is exactly
+        // when the enable functions are needed, and the host silently DROPS a declared function whose schema
+        // it never registered. See docs/mssql-cdc.md §3.1.
+        bool addCdcSchema = Profile.SupportsCdc;
+        if (_schemaFilter is null && !addFunctionSchema && !addCdcSchema)
         {
             return ExecuteMetadataQuery(SchemasSql);
         }
@@ -2466,6 +2491,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         var names = new StringArray.Builder();
         int n = 0;
         bool haveFunctionSchema = false;
+        bool haveCdcSchema = false;
         foreach (var row in ReadMetadataRows(SchemasSql, 1))
         {
             if (row[0] is { } name && (_schemaFilter is null || _schemaFilter.IsMatch(name)))
@@ -2474,6 +2500,8 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
                 n++;
                 haveFunctionSchema |= string.Equals(name, FabricApiFunctions.SchemaName,
                                                     StringComparison.OrdinalIgnoreCase);
+                haveCdcSchema |= string.Equals(name, SqlServerCdcFunctions.SchemaName,
+                                               StringComparison.OrdinalIgnoreCase);
             }
         }
         // A real SQL schema actually NAMED "fabric" already covers it; appending would advertise a duplicate,
@@ -2481,6 +2509,15 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         if (addFunctionSchema && !haveFunctionSchema)
         {
             names.Append(FabricApiFunctions.SchemaName);
+            n++;
+        }
+        // Same duplicate rule, and here it fires often: once CDC is enabled the server's own `cdc` schema is
+        // in the list above. ⚠ Also appended OUTSIDE schema_filter, like `fabric`: that filter scopes DATA
+        // discovery, and deleting the whole CDC surface because someone narrowed which tables they wanted
+        // would be a surprising coupling — function_filter is the option that exists for functions.
+        if (addCdcSchema && !haveCdcSchema)
+        {
+            names.Append(SqlServerCdcFunctions.SchemaName);
             n++;
         }
         var batch = new RecordBatch(schema, new IArrowArray[] { names.Build() }, n);

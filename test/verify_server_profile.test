@@ -16,7 +16,7 @@ ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE fabricator);
 query I
 SELECT count(*) FROM fabricator_server_info('db');
 ----
-15
+16
 
 # Detected raw values for the test SQL Server 2025 (box, Developer edition).
 query I
@@ -39,6 +39,15 @@ query T
 SELECT value FROM fabricator_server_info('db') WHERE property = 'is_warehouse';
 ----
 false
+
+# CDC exists on this engine. ⚠ It is derived from the profile and never probed: on a warehouse engine a
+# statement that errors inside an explicit transaction ABORTS it, so a "is CDC here?" probe would reproduce
+# the dbt 15225 defect (docs/warehouse-support.md §6.5). This row is also the ONLY thing a user on such an
+# engine can read about CDC, because the db.cdc.* functions are not registered there at all.
+query T
+SELECT value FROM fabricator_server_info('db') WHERE property = 'supports_cdc';
+----
+true
 
 # Full type system: NVARCHAR + DATETIMEOFFSET present, datetime2 scale 7.
 query T

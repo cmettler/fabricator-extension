@@ -106,6 +106,13 @@ how every dbt table model on Fabric came to die at the swap with `15225` — two
 profile.** §3.5's `cdc.health()` must answer "not supported on this engine" from `IsWarehouse` alone,
 without touching `cdc.*`, `msdb`, or `sys.dm_server_services`.
 
+⚠⚠ **AND THE GATE MUST STAY ON THE PROFILE, NOT ON THE HOSTNAME — the three Fabric products differ.**
+`IsFabricEndpoint` is a HOST test (it is how the `fabric.*` REST functions are enabled), and a future
+"helpful" simplification to `!IsFabricEndpoint` would be WRONG: **Fabric SQL Database is a real SQL Server
+engine and does support CDC**, while a Fabric Warehouse and a Lakehouse SQL endpoint do not. Reading the
+edition gets all three right for free — a Fabric SQL Database attach receives the `fabric.*` functions AND
+`db.cdc.*`; a warehouse or lakehouse endpoint receives the `fabric.*` functions and no CDC.
+
 ⚠ **NOT MEASURED here** — it is user-stated and consistent with the engine's nature; this session had no live
 warehouse to probe, and probing one is precisely the transaction-poisoning act described above. The cheap
 confirmation for whoever has one: `SELECT SERVERPROPERTY('EngineEdition')` (expect 11) and
@@ -231,8 +238,8 @@ disappear for the common case. It is the default this design picks.
 
 | call | measured behaviour |
 |---|---|
-| `sys.fn_cdc_get_max_lsn()` | the highest scanned LSN; **NULL before the capture job has ever run** |
-| `sys.fn_cdc_get_min_lsn('<capture_instance>')` | the retention floor — takes the **capture instance** name, not the table's |
+| `sys.fn_cdc_get_max_lsn()` | the highest scanned LSN; **NULL before the capture job has ever run** — but see the ⚠⚠ below: that is true only once CDC is ENABLED |
+| `sys.fn_cdc_get_min_lsn('<capture_instance>')` | the retention floor — takes the **capture instance** name, not the table's. ⚠ Also transiently NULL; see below |
 | `sys.fn_cdc_increment_lsn(@lsn)` | `0x…05900005` → `0x…05900006`: the next representable LSN. Needed because the TVF's lower bound is **inclusive** |
 | `sys.fn_cdc_map_lsn_to_time(@lsn)` | `2026-08-23 17:12:07.927` — a `datetime`, so **≈3.33 ms resolution, not microseconds** |
 | `sys.fn_cdc_map_time_to_lsn('largest less than or equal', SYSDATETIME())` | returned exactly the max LSN ⇒ **timestamp bounds are available server-side**, so the reader can offer `starting_timestamp` for free |
@@ -240,6 +247,48 @@ disappear for the common case. It is the default this design picks.
 
 ⚠ **The commit timestamp is a `datetime`.** Two transactions inside the same 3.33 ms tick carry the same
 `_commit_timestamp`. It is metadata, never an ordering key — the LSN is the ordering key.
+
+#### 1.6a ⚠⚠ Two NULL findings from building slice 1, and the first one is not NULL at all
+
+**MEASURED 2026-08-23, while building slice 1. Both correct the row above, and both are the §2.1
+misleading-error class in miniature.**
+
+**(a) With CDC NOT enabled on the database, `sys.fn_cdc_get_max_lsn()` does not return NULL — it RAISES:**
+
+```
+Msg 208: Invalid object name 'cdc.lsn_time_mapping'.
+```
+
+…naming an object the caller never mentioned, for a question that has a perfectly good answer ("no position
+exists yet"). Same for `sp_cdc_help_change_data_capture` and `sp_cdc_help_jobs`, which raise the *good*
+message `22901 The database '…' is not enabled for Change Data Capture` — a clear error where "no captured
+tables" is the honest answer. ⇒ **every one of these calls must be guarded on
+`sys.databases.is_cdc_enabled`**, which is what slice 1 does; `cdc.max_position()` then answers NULL and
+`cdc.tables()` zero rows.
+
+⚠ And `OBJECT_ID('sys.sp_cdc_enable_db')` is **NON-NULL even with CDC disabled** (the procs ship in every
+database), so it is *not* a usable "is CDC available" test — which also means §0.1's suggested confirmation
+probe for a warehouse engine is only meaningful there, where the proc genuinely does not exist.
+
+**(b) `sys.fn_cdc_get_min_lsn(<instance>)` is transiently NULL for a NEWLY ENABLED capture instance — and
+the floor is briefly UNKNOWABLE rather than absent.** Reproduced with a discriminator: in a database whose
+capture job is already running, enabling a new instance leaves `fn_cdc_get_min_lsn` answering NULL while
+`cdc.change_tables.start_lsn` for that very instance is **already set** (`0x0000002E000009100034`); ~8 s
+later both agree. So the function is not simply projecting `start_lsn`.
+
+⚠ **My first story for this was refuted by its own control**: in a FRESH database the first
+`sp_cdc_enable_table` returned a non-NULL floor immediately, while `max_lsn` was still NULL. So it is not
+"NULL until the job runs" — it is specific to enabling an instance alongside a live capture session.
+
+⚠⚠ **Consequence for §2.1's pre-check, which is the highest-value line in the feature: a NULL floor must NOT
+be read as "no lower bound".** Reading it that way passes the window straight to the TVF and gets the
+misleading 313. The honest answer is *"the retention floor is not established yet — retry"*. And do not
+substitute `start_lsn`: that would ASSERT a floor the engine declined to state.
+
+⚠ **It is sharper than "transient", and it broke a test: TWO CALLS IN ONE STATEMENT CAN STRADDLE THE
+TRANSITION.** `min_position(x) IS NOT DISTINCT FROM min_position(x)` returned **false** — measured, 1 run in
+14. So no assertion here may depend on the floor's VALUE (a `WAITFOR` only lengthens the window), and
+`verify_mssql_cdc` §6 proves the resolution through the ERROR behaviour instead.
 
 ### 1.7 Two read shapes: all changes, or net changes
 
@@ -539,7 +588,7 @@ That single constraint decides most of the surface:
 - **the window's END must be obtainable independently of the rows**, because a window can legitimately
   return zero rows and the cursor must still advance — otherwise a quiet period leaves the consumer pinned
   at an old position, drifting toward the retention cliff of §1.9 for no reason. Hence a separate
-  `cdc.position()` and the two-step idiom of §3.4;
+  `cdc.max_position()` and the two-step idiom of §3.4;
 - **exactly-once is the consumer's problem, and the design's job is to make it solvable**: a stable
   ordering key, an idempotent shape (net changes), and a cursor that round-trips.
 
@@ -565,7 +614,7 @@ document, and it is what makes the surface small.
 The precedent is exact: the Delta provider already puts its function set in a per-catalog schema —
 `cat.delta.changes(…)`, `cat.delta.snapshots(…)`, `cat.delta.tblproperties(…)` — and the SQL Server backend
 already appends a synthetic `fabric` schema on a Fabric endpoint. So: `db.cdc.changes(…)`,
-`db.cdc.enable(…)`, `db.cdc.position()`.
+`db.cdc.enable(…)`, `db.cdc.max_position()`.
 
 ⚠⚠ **Unlike `delta` and `fabric`, `cdc` is a REAL schema that really holds tables.** MEASURED: it exists
 after `sp_cdc_enable_db`, and our catalog discovers it and all seven of its tables. Three consequences, and
@@ -593,7 +642,7 @@ surprising coupling the `fabric` note warns about.
 ```sql
 FROM db.cdc.changes('dbo.orders'                      -- positional: the SOURCE table
       [, starting_position  := <BLOB>]                -- exclusive lower bound (a previous _position)
-      [, ending_position    := <BLOB>]                -- inclusive upper bound; default = cdc.position()
+      [, ending_position    := <BLOB>]                -- inclusive upper bound; default = cdc.max_position()
       [, starting_timestamp := <TIMESTAMP>]           -- alternative to starting_position
       [, ending_timestamp   := <TIMESTAMP>]
       [, images  := 'after' | 'both']                 -- default 'after'; NO net mode, see §1.7d
@@ -646,13 +695,17 @@ The two-step, which is what the docs should show:
 
 ```sql
 -- 1. take the window end FIRST, and store it whatever the read returns
-CREATE OR REPLACE TEMP TABLE w AS SELECT db.cdc.position() AS pos;
+CREATE OR REPLACE TEMP TABLE w AS SELECT db.cdc.max_position() AS pos;
 
--- 2. read a closed window
-INSERT INTO staging
-SELECT * FROM db.cdc.changes('dbo.orders',
-         starting_position := (SELECT cur FROM my_cursors WHERE tbl='dbo.orders'),
-         ending_position   := (SELECT pos FROM w));
+-- 2. read a closed window. ⚠ The bounds must be LITERALS or PREPARED PARAMETERS — an inline scalar
+--    subquery does NOT bind here (MEASURED, §11 item 6: `Binder Error: Table function cannot contain
+--    subqueries`), even though DuckDB's own `range()` accepts one.
+PREPARE win AS
+  INSERT INTO staging
+  SELECT * FROM db.cdc.changes('dbo.orders', starting_position := ?, ending_position := ?);
+EXECUTE win(
+  (SELECT cur FROM my_cursors WHERE tbl = 'dbo.orders'),   -- a subquery IS fine as an EXECUTE argument
+  (SELECT pos FROM w));
 
 -- 3. advance to the WINDOW END, not to what you saw
 UPDATE my_cursors SET cur = (SELECT pos FROM w) WHERE tbl='dbo.orders';
@@ -662,17 +715,18 @@ UPDATE my_cursors SET cur = (SELECT pos FROM w) WHERE tbl='dbo.orders';
 distinct ways it goes wrong: a `WHERE` clause makes the maximum *seen* lower than the maximum *read*, so the
 next window replays rows already consumed; and an empty window yields NULL, so the cursor never advances —
 harmless for a moment, and a slow walk toward the §1.9 retention cliff. Advancing to the window end is
-correct in both cases, which is why `cdc.position()` exists as its own function rather than being implied.
+correct in both cases, which is why `cdc.max_position()` exists as its own function rather than being implied.
 
 ⚠ `ending_position` is resolved **at bind** when defaulted. For a one-shot query that is exactly right; for
 a **view** or a prepared statement it re-resolves on every bind, so the window moves. Documented rather than
 prevented — a moving window is usually what a view over a change feed *means* — but a durable pipeline
 should pass the bound explicitly, as above.
 
-⚠ Table-function arguments must be constant at bind, so the `(SELECT cur FROM …)` spellings above are
-illustrative of the *pattern*, not necessarily of the syntax: a scalar subquery may not bind there. Settle
-this when slice 3 is written — the fallback is a prepared statement or a macro that splices the literal, and
-it changes the ergonomics of the whole idiom, so it is worth checking early.
+⚠ **SETTLED 2026-08-23 (§11 item 6): an inline scalar subquery does NOT bind as an argument to one of our
+table functions**, so the block above uses a prepared statement — which MEASURED works, and is what a
+scheduler or a dbt macro would use anyway. ⚠ **Whether a subquery is legal as an `EXECUTE` argument is
+NOT measured** (the CDC reader does not exist yet to test it against); if it is not, bind the value in the
+client or splice a literal. The important half — the bounds cannot be an inline subquery — is measured.
 
 ### 3.5 Setup and inspection
 
@@ -682,9 +736,9 @@ it changes the ergonomics of the whole idiom, so it is worth checking early.
 | `db.cdc.enable('dbo.orders' [, capture_instance :=] [, columns :=] [, net :=] [, role :=] [, filegroup :=] [, index :=])` | `sys.sp_cdc_enable_table`. ⚠ **`net` defaults to FALSE**, matching SQL Server — an opt-in for callers who want the net TVF directly, and a **one-way door** (§1.7c) | table fn, one report row |
 | `db.cdc.disable('dbo.orders' [, capture_instance :=])` | `sys.sp_cdc_disable_table` | table fn |
 | `db.cdc.tables()` | `sp_cdc_help_change_data_capture` — MEASURED to return schema, table, capture_instance, start_lsn, end_lsn, supports_net_changes, role, index, create_date, **`captured_column_list`** and `index_column_list` | table fn |
-| `db.cdc.position()` | `sys.fn_cdc_get_max_lsn()` — **NULL when the job has never run** | scalar → `BLOB` |
+| `db.cdc.max_position()` | `sys.fn_cdc_get_max_lsn()` — **NULL when the job has never run**, and NULL rather than 208 when CDC is not enabled (§1.6a) | scalar → `BLOB` |
 | `db.cdc.min_position('dbo.orders')` | `fn_cdc_get_min_lsn(<instance>)` — the retention floor | scalar → `BLOB` |
-| `db.cdc.health()` | agent state, capture/cleanup job config, capture lag (`map_lsn_to_time(max_lsn)` vs now), per-table retention floor | table fn |
+| `db.cdc.health()` | agent state, capture/cleanup job config, and `max_lsn_age_seconds` (`map_lsn_to_time(max_lsn)` vs now). ⚠ NOT called `capture_lag_seconds`, which this table said first and would be a misleading name: it is the AGE of the newest CAPTURED transaction, so on an idle database it grows without bound while capture is perfectly current. It is an upper bound on lag, and a signal only beside known write traffic | table fn |
 | `db.cdc.scan()` | `sys.sp_cdc_scan` | table fn — see the ⚠ below |
 
 **Which fabricator kind, and why:**
@@ -692,7 +746,7 @@ it changes the ergonomics of the whole idiom, so it is worth checking early.
   `delta.set_tblproperties` — which does its work at **execution**, not bind. A table function is not
   constant-folded, so there is no volatility question; a scalar would need `IsVolatile => true` (the default)
   and would still be the wrong shape for something that wants to *report*.
-- `position()` / `min_position()` are **`ICatalogScalarFunction`**, and **must stay VOLATILE** — a
+- `max_position()` / `min_position()` are **`ICatalogScalarFunction`**, and **must stay VOLATILE** — a
   `CONSISTENT` zero-argument scalar folds to a literal at plan time, which for "the current log position"
   is a wrong answer that looks like a cached one.
 
@@ -922,7 +976,7 @@ profile, for a consumer nobody has yet.
 ⚠ One thing that composition does **not** give: transaction ATOMICITY across tables. A window boundary can
 fall inside a transaction that touched two tables, so one table's half arrives in this window and the other's
 in the next. Anyone needing atomic multi-table windows must align bounds on transaction boundaries —
-`cdc.lsn_time_mapping` has the commit LSNs to do it with, and `cdc.position()` already returns one.
+`cdc.lsn_time_mapping` has the commit LSNs to do it with, and `cdc.max_position()` already returns one.
 
 ---
 
@@ -967,7 +1021,7 @@ in the README rather than papering over it.
    change per window — the kind of bug a small test cannot see.
 2. **Pre-check the window against the retention floor** and raise our own error (§2.1). Non-negotiable.
 3. **`fn_cdc_get_max_lsn()` NULL is a STATE, not an error.** MEASURED: it is NULL before the job has ever
-   run, which is the *default* state of a freshly enabled table. `cdc.position()` returns NULL, the reader
+   run, which is the *default* state of a freshly enabled table. `cdc.max_position()` returns NULL, the reader
    returns zero rows, and `cdc.health()` explains why. It must never look like a failure.
 4. **Distinguish "the agent is not running" from "nothing has changed".** Both give NULL. The check is
    `sys.dm_server_services` — MEASURED, and it needs `VIEW SERVER STATE`, which a least-privilege reader may
@@ -992,7 +1046,7 @@ in the README rather than papering over it.
   the user's requirement and it is also what keeps the surface this small.
 - **No follow/tail.** A DuckDB query terminates. A `poll_timeout` that blocks inside a scan would hold a
   connection and a transaction for an unbounded time, against §8.7 — and the caller's loop already does the
-  job with `cdc.position()`.
+  job with `cdc.max_position()`.
 - **No transaction-boundary or DDL event streams.** `cdc.lsn_time_mapping` and `cdc.ddl_history` are
   discovered tables already; anyone who needs them can query them.
 - **No net-changes mode** (§1.7d, user decision) — the collapse is a business-layer transformation: lossy,
@@ -1081,6 +1135,40 @@ not assert it.
 — with the agent disabled there is nothing to stop **and nothing to start**, so the suite could neither
 guarantee determinism nor exercise the realistic path. **Enabling the agent is what buys the control.**
 
+### 10.2a ⚠⚠ TWO CORRECTIONS TO §10.2, both from building slice 1
+
+**(a) `sp_cdc_disable_db` CONTENDS FOR THE SAME LOG-SCAN SESSION, and §10.2 only knew about `sp_cdc_scan`.**
+OBSERVED ONCE in `verify_mssql_cdc`:
+
+```
+22896: sp_cdc_disable_db caught an exception in try block when executing command
+       'sys.sp_cdc_disable_db_internal'. The error returned was 22831: 'Could not update the metadata that
+       indicates database TestDB is not enabled for Change Data Capture. The failure occurred when executing
+       the command 'sys.sp_repldone NULL, NULL, 0, 0, 1, 0, 0'. The error returned was 22912:
+       'sp_repldone failed'.'
+```
+
+`sp_repldone` is the same log-reader machinery as `sp_replcmds`. ⇒ **the rule generalises: the single
+per-database log-scan session is contended by more than `sp_cdc_scan`, and a TEARDOWN can fail on it** —
+which is worse than a failed scan, because it leaves CDC enabled and the capture job scanning between runs.
+
+⚠ **Could NOT be forced deterministically**: 0 failures in 5 iterations that enabled, inserted, waited 7 s so
+the job was actively scanning, then disabled. So the suite carries a 10-attempt retry with a 1 s backoff as
+INSURANCE against a rare race, not as a fix for a reproducible one — and the retry needed 0 attempts in
+every measured run.
+
+**(b) §10.2's own remedy — "stop the capture job first" — CANNOT BE MADE TOLERANT, so it is the wrong tool
+for a teardown.** §10.2 says the stop "is REFUSED if the job has not started yet — wrap it, do not assert
+it." MEASURED: **T-SQL `BEGIN TRY … END CATCH` does NOT catch that refusal** (the SQL Server Agent proxy
+raises it outside the batch's error handling), and it escapes through `fabricator_exec` as
+`22022 SqlException`. So it cannot be wrapped, and the window where it fires — immediately after
+`sp_cdc_enable_table`, before the job starts — is exactly where a suite wants it. The retry in (a) needs no
+guard and is therefore the better shape for teardown.
+
+⚠ This does **not** overturn §10.2 for its own case: stopping the job before `sp_cdc_scan` is still right,
+because there the job is running by construction, so the refusal cannot fire. What changes is that "stop the
+job" is not a general-purpose prelude.
+
 So the shape is: **agent enabled in the rig; the suite stops the capture job for its own database, drives
 `sp_cdc_scan`, and starts the job again only for the one assertion in §10.3.**
 
@@ -1106,11 +1194,11 @@ reason — and it must leave the job **stopped**, or every later section reopens
 
 | § | asserts | why it is not vacuous |
 |---|---|---|
-| 0 | `cdc.position()` is NULL on a freshly enabled table; the reader returns 0 rows and does not error | the **positive control** for §8.3 — without it every later "N rows" could pass on a broken NULL path |
+| 0 | `cdc.max_position()` is NULL on a freshly enabled table; the reader returns 0 rows and does not error | the **positive control** for §8.3 — without it every later "N rows" could pass on a broken NULL path |
 | 1 | **the agent captures with NO manual scan** (§10.3): start the capture job, insert, server-side wait, assert, **stop the job again** | the only guard on `MSSQL_AGENT_ENABLED`. ⚠ Must leave the job STOPPED or every later section reopens the §10.2 race |
 | 2 | enable_database / enable / `cdc.tables()` shows the instance and its captured columns | |
 | 3 | insert/update/delete + `scan` ⇒ exact rows and `_change_type`s for `images := 'after'` and `'both'` | |
-| 4 | `_position` round-trip: read window 1, store `cdc.position()`, more DML, read window 2 ⇒ **no duplicates, no gaps** | the whole feature. Needs the §8.1 boundary to be right |
+| 4 | `_position` round-trip: read window 1, store `cdc.max_position()`, more DML, read window 2 ⇒ **no duplicates, no gaps** | the whole feature. Needs the §8.1 boundary to be right |
 | 5 | the **documented dedupe recipe** (§1.7d) over a replay of the §1.7a scenarios reduces to the expected one-row-per-key result | it is SQL we SHIP to users, so the README rule applies: an untested example is a defect shipped to the least-equipped audience. ⚠ Must include an insert-then-delete key, whose no-op delete is the one place the recipe differs from a server-side collapse |
 | 5b | `images := 'net'` is **refused**, naming §1.7d | pins the decision. Without it, someone re-adds the mode and nothing objects |
 | 6 | an unchanged `nvarchar(max)` reads NULL in the **before** image and its value in the **after** image; the mask distinguishes | pins §1.5 in the measured direction, so a later "fix" cannot silently invert it |
@@ -1128,15 +1216,23 @@ table via `@role_name`, no `VIEW SERVER STATE`) is exercised nowhere. Document t
 imply they are tested.
 
 ⚠ **Each run must leave no CDC-enabled table behind**, or the capture job keeps scanning between runs and the
-next run's `cdc.position()` is not NULL where §0 expects it. Disable in teardown, and do not rely on
+next run's `cdc.max_position()` is not NULL where §0 expects it. Disable in teardown, and do not rely on
 `CREATE OR REPLACE` — enabling capture is a separate act from creating the table.
 
 ---
 
 ## 11. Settle these before building — in this order
 
-1. **`sys.fn_cdc_is_bit_set` / `sys.fn_cdc_get_column_ordinal`** — do they exist and behave as documented?
-   Option A's MAX-column placeholder is emitted SQL that calls them. *Cheap: one query.*
+1. ~~**`sys.fn_cdc_is_bit_set` / `sys.fn_cdc_get_column_ordinal`**~~ **ANSWERED 2026-08-23 — both exist and
+   behave as documented, so §4's Option A keeps its MAX-column placeholder.** MEASURED:
+   `fn_cdc_get_column_ordinal('dbo_o','amount')` = 3, `'notes'` = 4, and **a column that does not exist
+   returns NULL rather than raising** — so the emitted SQL must tolerate a NULL ordinal.
+   `fn_cdc_is_bit_set(ordinal, __$update_mask)` discriminates correctly: for the UPDATE pair (mask `0x04`)
+   `amount` reports 1 and `notes` reports 0.
+   - **⚠ AND THE SAME PROBE CONFIRMS §1.5's TRAP IS DISTINGUISHABLE, which is the point of the placeholder:**
+     op 3 (before) has `notes = NULL` while op 4 (after) has `notes = 'first'`, and the mask says `notes` was
+     NOT changed in both. So "the writer did not record it" is readable from the mask even though the VALUE
+     alone cannot tell it from a genuine NULL.
 2. **What a `LEFT JOIN cdc.lsn_time_mapping` costs** as two catalog scans versus letting SQL Server do it
    inside `fabricator_query`. Decides A versus A2 for the default mode. *Cheap: `EXPLAIN ANALYZE` both.*
 3. ~~**Does `sys.fn_cdc_get_max_lsn()` inside a `SNAPSHOT` transaction return the snapshot-consistent
@@ -1147,11 +1243,39 @@ next run's `cdc.position()` is not NULL where §0 expects it. Disable in teardow
 4. ~~**Does `@supports_net_changes = 1` refuse a table with no PK or unique index**~~ **ANSWERED
    (`Msg 22939`, naming `@index_name` as the escape) and NO LONGER GATING** — §1.7d took net out of our
    surface, so this only affects the opt-in `net := true` at enable time. §1.7c keeps the facts.
-5. **Is `__$command_id` absent from the TVF output?** Only matters if the direct-table read is chosen —
-   it is part of that path's ordering key.
-6. **Can a table-function argument be a scalar subquery?** §3.4's whole idiom depends on how a stored cursor
-   reaches the call. If not, the idiom needs a prepared statement or a macro, and that is an ergonomics
-   decision worth making before the surface is documented.
+5. ~~**Is `__$command_id` absent from the TVF output?**~~ **ANSWERED 2026-08-23 — YES, absent.** MEASURED via
+   `sys.dm_exec_describe_first_result_set` over `fn_cdc_get_all_changes_dbo_o`: exactly **8** columns —
+   `__$start_lsn`, `__$seqval`, `__$operation`, `__$update_mask`, then the source columns. No `__$end_lsn`
+   and no `__$command_id`. The change TABLE has both (§1.2).
+   - **⚠ The useful corollary: `__$command_id` is NOT needed for ordering, so §2.4's 21-byte position is
+     COMPLETE.** Within one `__$start_lsn` the measured `__$seqval`s already order the statements the same
+     way `command_id` does (`0x…1B`/cmd 1 before `0x…1C`/cmd 2), and the TVF — which SQL Server itself orders
+     — has no `command_id` to order by. So a direct-table read MAY add it as a tie-break but does not need
+     it, and the resume tuple stays `(start_lsn, seqval, operation)`.
+6. ~~**Can a table-function argument be a scalar subquery?**~~ **ANSWERED 2026-08-23 — NO for our functions,
+   but a PREPARED PARAMETER works, so §3.4's idiom is fine.** MEASURED, three argument spellings against both
+   a built-in and one of ours:
+
+   | argument | `range(...)` (built-in) | `db.dbo.cf_range(...)` (ours) |
+   |---|---|---|
+   | `3` | 3 rows | 3 rows |
+   | `(SELECT 3)` | 3 rows | **`Binder Error: Table function cannot contain subqueries`** |
+   | `(SELECT n FROM cur)` | 3 rows | same refusal |
+   | `?` + `EXECUTE q(3)` | 3 rows | **3 rows** |
+
+   ⇒ **document the cursor idiom with a prepared statement or a literal, not an inline scalar subquery.** That
+   is what a scheduler, a dbt macro and every client driver use anyway, so the ergonomic cost is close to
+   zero — and §3.4's illustrative `(SELECT cur FROM my_cursors …)` spelling must be corrected before it is
+   published, because it does not bind.
+   - **⚠ THE ASYMMETRY IS REAL BUT ITS CAUSE IS NOT ESTABLISHED — do not write one down.** Both paths appear
+     to go through `TableFunctionBinder` (whose default `clause` is literally `"Table function"`, and whose
+     `ExpressionBinder` base is what refuses subqueries), and `BindTableFunctionParameters` turns a
+     `SubqueryExpression` child into a `LogicalType::TABLE` argument before reaching it — yet `range` folds
+     the subquery to a constant and ours refuses. Reproducer above if it is ever worth filing; it changes
+     nothing about slice 3.
+   - ⚠ Method note: the first run of this A/B printed only the last output line, which was a box border — so
+     "the built-in did not error" was read as "the built-in returned 3". It was re-run printing VALUES. A
+     non-error is not a result.
 7. **The Azure SQL Database middle case** (§0.1). The warehouse question is SETTLED — not supported, gate on
    `ServerProfile.IsWarehouse`, never probe. What remains is edition 5: CDC works, there is no agent, so
    which of `cdc.health()`'s answers are meaningful, and whether `sp_cdc_scan` is permitted. *Needs a live
@@ -1163,8 +1287,8 @@ next run's `cdc.position()` is not NULL where §0 expects it. Disable in teardow
 
 | slice | contents | why this order |
 |---|---|---|
-| **1** | the `ServerProfile.SupportsCdc` gate (§0.1) FIRST; then `cdc` schema appended when absent, `cdc.tables()` / `position()` / `min_position()` / `health()` | read-only, no reader yet, and it makes everything else observable. ⚠ The gate leads: without it every later slice can poison a transaction on a Fabric attach |
-| **2** | `cdc.enable_database` / `enable` / `disable` / `scan` + cache invalidation | after this a table can be captured entirely from SQL — already a shippable increment |
+| **1** | ✅ **BUILT 2026-08-23** — see §13 | read-only, no reader yet, and it makes everything else observable. ⚠ The gate leads: without it every later slice can poison a transaction on a Fabric attach |
+| **2** | `cdc.enable_database` / `enable` / `disable` / `scan` + cache invalidation | after this a table can be captured entirely from SQL — already a shippable increment. ⚠ **The invalidation has an unresolved prerequisite — read §13.4 before starting** |
 | **3** | `cdc.changes` — single instance, `images := 'after'`, explicit bounds, **the §2.1 pre-check** | the reader, at its smallest correct size |
 | **4** | `starting_timestamp` / `ending_timestamp`; `images := 'both'` + the mask placeholder | both are additive to the same generator |
 | **5** | `include := 'snapshot'` / `'snapshot+changes'` — the §5.1 two-connection protocol | no longer blocked: §11 item 3 dissolved. Needs a second connection at `IsolationLevel.Snapshot` and `ALLOW_SNAPSHOT_ISOLATION ON`, which the ATTACH can check once |
@@ -1176,3 +1300,177 @@ recipe over slice 3.
 
 Slices 1–3 are the whole story for a consumer who can run one statement per window, which is every dbt and
 scheduler user. Everything after 3 is a shape, not a capability.
+
+---
+
+## 13. Slice 1 — AS BUILT (2026-08-23)
+
+**C#-only, no ABI change, no C++.** Gate `test/verify_mssql_cdc.test` (**73**, service tier) +
+`verify_server_profile` 15 → **16**; three mutants, each killed at its own section; the suite ran **25/25**
+consecutively before being accepted (its first version failed 1 in 14 — see §6's note).
+
+**Service tier 52 → 53 runs and 2221 → 2295 assertions, i.e. EXACTLY +1 run and +74** (73 new + the one
+`supports_cdc` row) ⇒ **no other suite moved**, which is the behaviour-preservation claim and it is exact
+rather than approximate. That run also closes the open item the rig change shipped with: the
+`MSSQL_AGENT_ENABLED=true` compose change had only ever been spot-checked on 5 suites, and the full tier is
+now green with it.
+
+| what | where |
+|---|---|
+| the capability gate | `ServerProfile.SupportsCdc => !IsWarehouse`, surfaced as the `supports_cdc` row of `fabricator_server_info()` |
+| `cdc` appended when absent | `SqlServerCatalog.SchemasMetadata` |
+| registration | `SqlServerCdcFunctions.Register`, called from `BuildFunctionSet` only when `SupportsCdc` |
+| the four functions | `dotnet/Fabricator.SqlServer/SqlServerCdc.cs` |
+| the T-SQL + Arrow conversion | `dotnet/Fabricator.SqlServer/SqlServerCdcCatalog.cs` (a `partial` of `SqlServerCatalog`) |
+
+### 13.1 The one design decision that departs from this document
+
+**§0.1 asks `cdc.health()` to answer *"not supported on this engine"* from `IsWarehouse` alone. It does not
+exist there at all instead** — the functions are registered only when `SupportsCdc`, and the `cdc` schema is
+appended only then.
+
+Why the absence is the stronger form of the same requirement: it makes "never issue a CDC statement on a
+warehouse engine" true **by construction** rather than by a guard someone could later delete, and it keeps a
+phantom `cdc` schema out of `duckdb_schemas()` on every Fabric catalog — a durable, enumerable artifact that
+BI tools would list for a feature that can never work there. The cost is that the error becomes DuckDB's own
+*"does not exist"* rather than a sentence naming the engine. That cost is paid back through the one surface
+that DOES exist on every engine: the `supports_cdc` row, which `verify_server_profile` now asserts.
+
+### 13.1a ⚠⚠ `position()` SHIPPED AS `max_position()` — the design's name collides with a DuckDB built-in, and it is the ABSENT case that suffers
+
+**MEASURED while verifying §13.1's own claim, which is how it was found.** §13.1 says the cost of making the
+surface ABSENT on a warehouse is "DuckDB's own *does not exist*". For the table functions that is exactly what
+happens (`Catalog Error: Table Function with name health does not exist!`). For the scalar it was **not**:
+
+```
+SELECT w.cdc.position();          -> Binder Error: Referenced table "w" not found!
+SELECT w.cdc.min_position('x');   -> Catalog Error: Scalar Function with name min_position does not exist!
+SELECT w.cdc.nosuchthing();       -> Catalog Error: Scalar Function with name nosuchthing does not exist!
+SELECT w.dbo.position();          -> Binder Error: Referenced table "w" not found!     <- schema EXISTS
+```
+
+⇒ **the NAME is the cause, not the missing schema** — `position` is a DuckDB BUILT-IN scalar
+(`duckdb_functions()` has it in `system`), and a qualified call to a nonexistent `<cat>.<schema>.position()`
+reports a missing TABLE, pointing at the ATTACH alias instead of at the function. The last line is the
+discriminator: the same bad error on a schema that exists.
+
+**That case is not hypothetical — it is precisely what a Fabric Warehouse or Synapse user hits**, because the
+whole surface is absent there by design. So the one population guaranteed to meet this error would have been
+sent to check their catalog name, their credentials and their ATTACH before ever suspecting the engine.
+
+⇒ shipped as **`max_position()`**, which also repairs an asymmetry the design note had: `position()` beside
+`min_position()` was an odd pair, and `min_position` / `max_position` maps one-to-one onto
+`fn_cdc_get_min_lsn` / `fn_cdc_get_max_lsn`. No alias is kept — nothing had shipped.
+
+**VERIFIED AFTER THE RENAME on a simulated warehouse (`SupportsCdc` forced false), all four entry points:**
+
+```
+SELECT w.cdc.max_position();        -> Catalog Error: Scalar Function with name max_position does not exist!
+SELECT w.cdc.min_position('dbo.t'); -> Catalog Error: Scalar Function with name min_position does not exist!
+SELECT * FROM w.cdc.tables();       -> Catalog Error: Table Function with name tables does not exist!
+SELECT * FROM w.cdc.health();       -> Catalog Error: Table Function with name health does not exist!
+fabricator_server_info -> supports_cdc = false
+```
+
+So §13.1's claim — "the cost is DuckDB's own *does not exist*" — is now TRUE for the whole surface. Before
+the rename it was true for three of four, and false for the one a user would reach for first.
+
+⚠ **The general lesson, and it is the reason this is written up rather than quietly fixed: a name that
+collides with a host built-in is a liability in the ABSENT case, which is the case naming reviews never look
+at.** Qualified resolution works perfectly when the function EXISTS (73 assertions say so); the defect is
+only visible where it does not — and the population for whom it does not exist is the whole warehouse family.
+
+### 13.2 What the build established that reading could not
+
+1. **§1.6a(a)** — `fn_cdc_get_max_lsn()` RAISES 208 with CDC disabled; it does not return NULL. Every CDC
+   call is now guarded on `is_cdc_enabled`, and the suite's §3 carries that raw error as its POSITIVE
+   CONTROL, so the three "NULL is a state" assertions are about our guard rather than about SQL Server being
+   lenient.
+2. **§1.6a(b)** — `fn_cdc_get_min_lsn` is transiently NULL for a newly enabled instance *while its
+   `start_lsn` is already set*, and two calls in one statement can straddle the transition. This is the fact
+   the reader's retention pre-check must not get wrong.
+3. **§10.2a** — `sp_cdc_disable_db` contends for the log-scan session, and `sp_cdc_stop_job`'s refusal cannot
+   be caught in T-SQL.
+4. **A zero-argument catalog SCALAR works, and the mechanism was already there** —
+   `fabricator_schema_entry.cpp`'s `BuildFabricatorScalarFunction` marshals a throwaway
+   `__fabricator_rows` column because Apache.Arrow cannot import a zero-FIELD schema, so the row count still
+   crosses. `cdc.max_position()` is the first zero-argument catalog scalar in the tree; it needed no new
+   plumbing.
+5. **SQL Server's own per-instance TVFs get `_each` siblings.** Once CDC is enabled, each capture instance
+   contributes FOUR entries to the `cdc` schema
+   (`fn_cdc_get_{all,net}_changes_<inst>` and `…_each`), because this provider declares a `<routine>_each`
+   for every discovered TVF that takes parameters. Not a defect — a per-row `CROSS APPLY` over
+   `fn_cdc_get_all_changes` is meaningful — but it means any assertion counting functions in that schema must
+   be scoped to our four names, or it becomes a function of how many tables happen to be captured.
+
+### 13.3 Choices worth knowing before extending it
+
+- **`INSERT INTO @tablevar EXEC sys.sp_cdc_help_change_data_capture`**, with the MEASURED 15-column shape
+  declared in `SqlServerCdcFunctions.HelpTableVar`. The proc rather than `cdc.change_tables` because it
+  applies the capture instance's `@role_name` permission filtering, which is security logic not worth
+  reimplementing; a table VARIABLE rather than `#temp` because it is batch-scoped and so cannot be left
+  behind on a pooled connection. ⚠ A future engine adding a column to that proc breaks this loudly.
+- **Results are read as all-`varchar` and re-typed in C#** (`ReadMetadataRows`, this catalog's own metadata
+  idiom). It costs a hex parse for the LSNs and buys an output schema that cannot drift from whatever the
+  type mapper does with `binary(10)` / `bit` / `datetime` — and since the schema is resolved at BIND, one
+  crossing before the rows, a drift would corrupt rather than fail.
+- **`min_position` resolves a capture-instance name OR a `schema.table` name, both EXACTLY**, and REFUSES
+  when the name matches both kinds or the table has two instances (§2.2) — naming what it matched. Two
+  instances of one table can have different floors (MEASURED: `0x…2C00000C980040` vs `0x…2D00000E900043`), so
+  picking one would be a wrong answer rather than a shortcut.
+- **`health()` is (property, value)** like `fabricator_server_info()`, because the answers are of mixed grain
+  (server, database, job) and mixed type. Its agent probe is a SEPARATE round trip that the main batch must
+  not so much as mention: a batch referencing a nonexistent object fails at COMPILE, so on Azure SQL
+  Database — no `sys.dm_server_services`, but CDC does work — one batch would take the whole surface down.
+  It is skipped there by EDITION, and the permission is *asked about* with `HAS_PERMS_BY_NAME` rather than
+  tried, so a reader without `VIEW SERVER STATE` gets `unknown` and never `Stopped`.
+- **The suite's teardown ordering is load-bearing twice over**: it must run BEFORE the `ATTACH` (discovery
+  happens at attach, so a catalog opened first reports a previous run's leftovers whatever the teardown then
+  does — this is how §2 first passed while asserting nothing), and §9 must leave no CDC-enabled table behind
+  or the capture job keeps scanning between runs and the next run's §3 fails for an unrelated reason.
+
+### 13.4 ⚠⚠ SLICE 2's PREREQUISITE, found while scoping it: there is NO channel for a managed table function to invalidate the host's catalog cache
+
+**§3.5 says every setup function MUST invalidate the cache, and MEASURED that it matters** (enabling capture
+creates a change table and two TVFs that the session cannot see until the cache is rebuilt — the 0 → 2
+measurement). What was not established is *how a managed function does that*, and the answer today is: it
+cannot.
+
+**The mechanism that exists serves `fabricator_exec` ALONE.** The ABI's `execute_dml` carries an out-param
+`schema_may_change` (set in C# by `SqlDdl.MayChangeSchema`), and `FabricatorExecFunction`
+(`src/fabricator_extension.cpp:443`) acts on it — gated on the `mssql_exec_invalidate_cache` setting AND on
+the first argument having named an attached catalog. **The table-function path (`tablefn_bind` /
+`tablefn_execute`) has no such out-channel**, so an `ICatalogTableFunction` that performs DDL has no way to
+say so.
+
+Three candidate answers, with what each costs:
+
+| option | shape | cost |
+|---|---|---|
+| **(a) an ABI out-flag on the table-function execute path**, mirroring `execute_dml`'s | a provider-authored function reports "my execution changed the catalog"; the host refreshes | **an ABI bump (v81)**. Additive, small, and it GENERALISES — any provider function doing DDL gets it, not just CDC. The recommended one |
+| (b) put the ATTACH ALIAS in the options JSON, then `Host.Query("SELECT fabricator_refresh_cache('<alias>')")` from inside the function | no ABI bump — the options JSON is free-form, the `"materialize":true` precedent | ⚠ **RE-ENTRANCY RISK, unmeasured.** `RefreshCache` takes `entry_lock_`, and this would take it while EXECUTING a table function bound in that same catalog. The tree already records a hard rule about `entry_lock_` re-entry (a view body that binds under it throws `resource deadlock would occur` on MSVC and HANGS on glibc). Would need measuring before it could be trusted |
+| (c) report-and-tell-the-user | the report row names `fabricator_refresh_cache` | free, and §3.5 argues against it: *"a user should not have to know that enabling capture is a DDL"* |
+
+⚠ The ATTACH alias is genuinely absent from the managed side today: `fabricator_storage.cpp` has it
+(`const string &name`) but puts only user-supplied ATTACH options into `options_json`. So (b) needs that
+one-line addition before it is even expressible — which is worth knowing because it is ALSO what any future
+"a provider function needs to name its own catalog" feature would need.
+
+**Recommendation: (a)** — with one refinement that the naive version gets WRONG:
+
+⚠⚠ **`tablefn_execute` fills an out STREAM, and our binding's rows come from an ASYNC ITERATOR — whose body
+does not begin until the host's first BATCH PULL, a different ABI crossing.** So an out-flag set inside the
+iterator would be read by the host BEFORE the DDL had run. That is the same trap `CLAUDE.md` records as a
+standing rule from the `fabricator_install_plugin` bug: *a global table function must read every ambient in
+`Execute()`, never in the iterator* — here it applies to a WRITE rather than a read, in the same place.
+
+⇒ **the setup functions must do their work in `Execute()` (the plain method) and yield an already-built
+batch.** Then `tablefn_execute`'s out-flag is set before it returns and the host can act on it. That is also
+better for a DDL function on its own merits: the side effect happens exactly once, at a defined point, on the
+thread the host established the ambients on — instead of at whatever moment DuckDB happens to pull.
+
+⚠ Do NOT put the flag on `tablefn_close` instead: that runs at scan teardown from a destructor-ish path
+documented as best-effort-must-not-throw, which is the wrong place to trigger a catalog rebuild.
+
+With that refinement (a) is the only option whose correctness is obvious, and the flag it adds is the same
+flag the DML path already has — so it makes the two paths consistent rather than adding a special case.

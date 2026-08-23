@@ -382,7 +382,11 @@ case "$TIER" in
         # survive a dangling buffer), plus a STRUCT and a LIST, all replicated across drain slices by a 1→N
         # fan-out; §14 executes a PREPARED statement twice, since the managed binding is reused across
         # executions while a session is per operator state.
-        : "${MIN_ASSERTIONS:=7986}"
+        # 8003 since 2026-08-23: NOT from the CDC slice (that is SqlServer-only and adds nothing here) — the
+        # ABI v80 scalar-bind commit took verify_global_functions 101 -> 118 and did not bump this floor, so
+        # the tree ran 17 assertions above it for a day. Surfaced by the CDC slice's hermetic run coming out
+        # at 8003 against a floor of 7986 and the delta not being attributable to the change under test.
+        : "${MIN_ASSERTIONS:=8003}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh
@@ -411,7 +415,12 @@ case "$TIER" in
         # HTTP stack (ABI v76). Service tier rather than hermetic ON PURPOSE and not merely because it needs
         # a server: its two load-bearing sections are A/Bs against MinIO's SELF-SIGNED cert, which is what
         # turns "DuckDB's TLS configuration and secrets reach the call" from a claim into a measurement.
-        : "${MIN_SUITES:=52}"
+        # 53 runs since 2026-08-23: verify_mssql_cdc — the db.cdc.* surface (slice 1 of docs/mssql-cdc.md).
+        # Service tier by necessity, and it is the ONE suite in either tier that also needs SQL SERVER AGENT
+        # (docker-compose sets MSSQL_AGENT_ENABLED=true): its agent_status assertion is the only thing that
+        # would notice a revert of that compose change, because sp_cdc_enable_db/_table both SUCCEED with the
+        # agent stopped and every other assertion in the suite passes with it off.
+        : "${MIN_SUITES:=53}"
         # 1424 since 2026-08-01: verify_exec_invalidate_cache 10 -> 21, for the OUT-OF-BAND DROP path Ã¢ÂÂ the
         # catalog's self-heal, documented in CLAUDE.md and until now covered by NOTHING. The service tier ran
         # 44/44 green while that path was broken, which is why the section exists. It must run with
@@ -555,7 +564,10 @@ case "$TIER" in
         # operator (0.870 s vs 0.154 s), with the serial leg's own duration as the positive control and
         # `max(batch_rows)` (1 vs 8) as the mechanism assertion. ⚠ threads=1 is required — the delim scan
         # emits one chunk per radix partition, so several threads split the 8 rows and move the ratio.
-        : "${MIN_ASSERTIONS:=2221}"
+        # 2295 since 2026-08-23: verify_mssql_cdc 73 (new) + verify_server_profile 15 -> 16 (the supports_cdc
+        # capability row) = exactly +74 over 2221, i.e. NO other suite moved — which is the CDC slice's
+        # behaviour-preservation claim, and it is exact rather than approximate.
+        : "${MIN_ASSERTIONS:=2295}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2
