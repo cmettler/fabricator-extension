@@ -41,6 +41,10 @@ services:
     environment:
       - ACCEPT_EULA=Y
       - MSSQL_SA_PASSWORD=Arrow_Net_123!
+      # SQL Server Agent runs the CDC capture + cleanup jobs. Without it `sp_cdc_enable_table` still
+      # succeeds (printing "SQLServerAgent is not currently running") but NOTHING is ever captured, so a
+      # CDC test would pass vacuously against empty change tables. See docs/mssql-cdc.md §10.
+      - MSSQL_AGENT_ENABLED=true
     volumes:
       - mssql-data:/var/opt/mssql
       # CA trust for the MinIO self-signed cert (SQL Server on Linux reads this folder at startup).
