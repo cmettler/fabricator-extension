@@ -500,9 +500,11 @@ local POSIX for free — the code above `HostFsOpenWrite` needs no change at all
 
 ## 5. A NAMED argument is unusable in the CORRELATED shape of a table-in-out function
 
-**Status: reproduced on our pinned 1.5.5, mechanism read from the source, NOT filed.** It bounds a shipped
-feature (`ILateralTableFunction`, see docs/lateral_unnest_analysis.md §8), so the workaround matters more
-than the report.
+**Status: reproduced on our pinned 1.5.5, mechanism read from the source, NOT filed. ⚠ CHECKED AGAINST
+UPSTREAM `main` @ `044a04a7` (2026-08-23): STILL PRESENT.** It bounds a shipped feature
+(`ILateralTableFunction`, see docs/lateral_unnest_analysis.md §8), so the workaround matters more than the
+report. **Decision (user, 2026-08-23): WAIT for an upstream fix rather than build a host-side one** — see
+§5.1 for what was declined and why waiting is cheap.
 
 `f(t.a, opt := 5)` — a named argument alongside a column argument — does not bind:
 
@@ -542,6 +544,62 @@ at the call site arrives as a CONSTANT INPUT COLUMN — `f(t.a, 2)` works in bot
 the value per call instead of at bind. Measured working (`verify_lateral` §2). What genuinely remains
 unavailable is a named parameter used correlated, i.e. bind-time configuration of a correlated call; the
 default declared in `Bind` still applies there.
+
+### 5.1 Re-checked against upstream `main`, and the decision to wait (2026-08-23)
+
+**NOT FIXED on `main` @ `044a04a7`.** The early return is byte-identical to our pin:
+
+```cpp
+auto bind_type = GetTableFunctionBindType(table_function, expressions);
+if (bind_type == TableFunctionBindType::TABLE_IN_OUT_FUNCTION) {
+    BindTableInTableOutFunction(expressions, subquery);   // sweeps EVERY expression
+    arguments = subquery.types;
+    return true;                                          // <- the named-param loop is never reached
+}
+bool seen_subquery = false;
+```
+
+⚠ **The file MOVED a lot and none of it is the fix, which is why this needed a diff rather than a glance:**
+97 insertions / 62 deletions between the pin and `main`, all API churn —
+`GetFunctionReferenceByOffset` → `GetFunctionByOffset`, `.arguments` → `.GetArguments()`,
+`can_contain_nulls = true` → `SetCanContainNulls(true)`, `string parameter_name` → `Identifier`, includes
+shuffled. A "the file changed, so maybe it is fixed" reading would have been wrong in both directions.
+
+⚠ **`GetTableFunctionBindType` was checked TOO, because that is the other place a fix could hide** — a
+change there could route the named form down the `STANDARD_TABLE_FUNCTION` path where the extraction loop
+does run. Its logic is unchanged (only the same accessor renames): a lateral has `in_out_function` set and
+no TABLE parameter, so a call with one non-scalar argument still classifies as `TABLE_IN_OUT_FUNCTION`.
+
+**Reproduce the check without touching the submodule's working tree** (ours carries unrelated local edits):
+
+```bash
+git -C duckdb fetch --depth 1 origin main
+git -C duckdb diff HEAD FETCH_HEAD -- src/planner/binder/tableref/bind_table_function.cpp
+git -C duckdb show FETCH_HEAD:src/planner/binder/tableref/bind_table_function.cpp
+```
+
+`fetch` + `show` only add objects and read a remote ref — no checkout, no pin move.
+
+**WHAT WAS DECLINED, and it is worth recording because it is buildable:** a new declared `Params.Literal`
+style meaning "this positional slot is a per-call constant". The host would lift the value from row 0 of the
+first chunk, hand it to the session, and DROP that column from the batch so the callee's input matches its
+declared per-row inputs. Sound — a swept literal is constant in every row, and the correlated plan
+de-duplicates by distinct tuple so it cannot vary. **Its limit is what killed it: the value still would not
+be available at BIND**, so it cannot drive an output schema, which is most of the reason to want a declared
+constant at all.
+
+⚠ **AND THE SCALAR TRICK IS NOT AVAILABLE HERE — the difference is upstream's, not ours.** ABI v80's scalar
+bind folds constants because it receives argument EXPRESSIONS. `TableFunctionBindInput` carries only
+`vector<Value> inputs`, `named_parameter_map_t named_parameters` and the input-table types/names — **no
+expressions**. By the time `LateralBind` runs, DuckDB has already rewritten the positional arguments into a
+relation and we see just its SCHEMA. There is nothing to fold.
+
+⚠ **"Wait for upstream" is load-bearing on someone else filing it, since WE have not** (see the status line).
+The code path's own comment reads *"hack to make named parameters work"*, so nobody is guarding it. Waiting
+is cheap — the positional-constant idiom above is gated and works — but it is waiting, not scheduling. The
+cheap move if that ever matters: file it. We have the reproduction, the file and line, and a one-line fix
+direction (run the named-parameter extraction BEFORE the in-out sweep), which is the self-contained,
+needs-nothing-of-ours shape CLAUDE.md records as making an offer land.
 
 ## Not a bug, but pinned here because it wasted time three times
 
