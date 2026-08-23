@@ -479,3 +479,219 @@ global functions today, provided they align their dependency closure with the ho
 isolation is a non-breaking later upgrade to the loader, worth turning on only when a genuine dep conflict
 appears; the must-fix for that day is the explicit shared-name allowlist in `Load` (the resolver would otherwise
 isolate Apache.Arrow and break every Arrow-typed call).
+
+---
+
+## Appendix — the `CLAUDE.md` entry, moved verbatim (2026-08-23)
+
+> The working record of the scan/report/installer/uninstall work, in the order it happened, with the
+> reasoning and the traps. `CLAUDE.md` keeps the standing rules (the ambient-in-iterator bug, the
+> three re-scan hazards, the default root's location, candidate ordering).
+
+- **THE PLUGIN SCAN STOPPED BEING SILENT, GAINED A DEFAULT ROOT, AND SEARCHES RECURSIVELY — BUILT
+  2026-08-18 (C#-only, no ABI). Step 1 of a plugin INSTALLER the user is designing; the installer itself is
+  NOT built.** Full record + the installer sketch: [docs/plugin-system.md](docs/plugin-system.md).
+  - **Three changes.** (a) A DEFAULT root `~/.duckdb/fabricator/plugins` — the scan used to RETURN
+    IMMEDIATELY when `FABRICATOR_PLUGIN_DIR` was unset, so there was nowhere to install to;
+    `FABRICATOR_PLUGIN_DIR` still wins and **REPLACES rather than extends** it. (b) The search is
+    RECURSIVE — it was `Directory.GetFiles(dir, "*.dll")`, TOP LEVEL ONLY, so a plugin laid out the way an
+    installer writes one (`<root>/<name>/<version>/<platform>/`) was never seen. (c)
+    **`SELECT * FROM fabricator_plugins()`** — one row per root plus one per candidate, with a status and a
+    reason.
+  - **⚠⚠ THE DIAGNOSTIC IS THE LOAD-BEARING PART, and the reason is a property this file already
+    records: `ScanPluginDirectories` ends every candidate in a `catch`, so a plugin built against a
+    different `Apache.Arrow` major or missing a private dep was skipped with NO SIGNAL — and a failing
+    `verify_plugin` is indistinguishable from "it loaded and registered nothing".** FOUR distinct states
+    were one silence, each now named: `root_missing` (a configured root does not exist — the commonest real
+    cause, and previously the scan FILTERED such roots away), `rejected` (+ the exception message),
+    `no_backend` (loaded, declares no `IBackend` — the ordinary state of a plugin's private DEPENDENCY, so
+    it must not read as failure), `shared` (skipped because the host has that assembly — deliberate, so it
+    must be visible). Verified live: a garbage `*.dll` beside a working plugin now reports
+    `BadImageFormatException` **and the plugin still loads**.
+  - **⚠ THE DEFAULT ROOT IS DELIBERATELY NOT UNDER THE MANAGED DIR — a MEASURED hazard, not taste.**
+    `dotnet publish` deletes files its own previous publish wrote whose closure no longer contains them, which
+    is what silently removed five SqlClient DLLs hours earlier the same day; a plugin installed there would be
+    wiped by an ordinary `publish-managed.ps1` run with no error. `~/.duckdb` is DuckDB's own per-user dir, is
+    writable without admin, and is STABLE while the managed dir is not (build tree vs
+    `~/.duckdb/extensions/<v>/<platform>/` vs the single-file cache vs `FABRICATOR_MANAGED_DIR`).
+  - **⚠ CANDIDATE ORDER IS LOAD-BEARING**: the FIRST provider registered under a name wins and
+    `Directory` enumeration order is filesystem-dependent, so the candidates are sorted by path — otherwise
+    *which plugin wins* is a property of the disk rather than of the configuration. And **no cap on the
+    count**, deliberately: a self-contained plugin can carry hundreds of DLLs, most `rejected`, and a silent
+    truncation would read as "covered everything".
+  - **⚠ `Environment.GetFolderPath(SpecialFolder.UserProfile)` DOES NOT READ `%USERPROFILE%` on Windows** —
+    it calls the Win32 shell API. So the empty-profile trick this file records for simulating a bare runner
+    does NOT redirect the default plugin root; a test that relies on it is measuring the developer's real home.
+  - **⚠ GLOBAL FUNCTIONS ARE BACKEND-CONTRIBUTED, so a diagnostic ABOUT the provider machinery had nowhere
+    to live.** `GlobalFunctions.Build` walks `BackendRegistry.All()`; a question like "which providers were
+    found, and why not this one" must still be answerable when the answer is "none loaded". New
+    `HostGlobalFunctions` is merged FIRST into the map, so a provider declaring a colliding name trips the
+    existing duplicate-name error instead of silently shadowing a diagnostic.
+  - **THE RELOAD QUESTION SPLITS, and this is what should drive the installer design** (established from
+    source, not assumed): an `IBackend` provider and its catalog-bound functions resolve at ATTACH via
+    `BackendRegistry.Resolve` -> the memoized `_byName`, so install-and-use in ONE session needs only an
+    invalidation (there is none today). **Global functions cannot be added mid-session by any trick** —
+    `loader.RegisterFunction` is permitted only during `Extension::Load()`, **DuckDB has NO unload API at
+    all** (grepped), re-`LOAD` is a no-op, and `GlobalFunctions`' maps are `Lazy<>` per PROCESS so even a
+    second database instance would miss them.
+  - **⚠ UPGRADE/UNINSTALL IS THE HARD PART**: `LoadFromAssemblyPath` maps the file, which LOCKS it on
+    Windows, and the bridge's ALC (hostfxr-created) is not collectible — so a loaded assembly can never be
+    replaced in-process. Install must write a version-stamped folder and activate at next start; uninstall
+    must mark-for-deletion. **Reuse `Fabricator.Installer.Core`**: `PayloadExtractor` already does zip
+    extraction with a working zip-slip guard, `PayloadManifest` already carries DuckDB's platform string, and
+    there is a `CrossProcessLock` + `Hashing` — BCL-only and tier-0 tested.
+  - **⚠⚠ THE DEFAULT ROOT BROKE THE HERMETIC TIER'S DEFINING PROPERTY, AND I CAUGHT IT ONLY BY ASKING
+    WHAT AN UNSET VARIABLE NOW MEANS.** `run-suites.sh` UNSET `FABRICATOR_PLUGIN_DIR` for the hermetic tier —
+    which, the moment a default root exists, means *"scan the developer's home"*, i.e. MACHINE STATE, in a
+    tier whose own comment says the clearing exists so the set is "PROVABLY hermetic rather than hermetic by
+    assumption". A plugin contributing a global function changes what `duckdb_functions()` returns, which
+    several suites count. It now points at an EMPTY `mktemp -d` (trap-cleaned) instead — which is exactly what
+    the replace-not-extend precedence buys.
+    - **MEASURED, with a true A/B rather than reasoned**: a plugin placed in the REAL
+      `~/.duckdb/fabricator/plugins`, same binary run twice, only the variable differing — **unset ⇒ 2 plugin
+      functions visible in `duckdb_functions()`; empty dir ⇒ 0.** (Home directory cleaned up afterwards.) The
+      tier passing at 7646 alone would have proved nothing: it is equally true of a machine with no plugins.
+  - **⚠ A PLUGIN CAN STILL SHADOW A BUILT-IN PROVIDER SILENTLY — found while building the report, NOT
+    fixed.** `BackendRegistry.Add` is `map[backend.Name] = backend`, an OVERWRITE, so a plugin whose
+    `IBackend.Name` is `sqlserver` REPLACES the first-party provider and the scan reports it as an ordinary
+    `loaded` row. Pre-existing (nothing in this pass changed it) and nobody has hit it, but it is the same
+    class of silence the report exists to remove, and the report is the natural place: a `loaded` row's
+    `detail` could name any provider it DISPLACED. Left alone because it needs a decision this pass did not
+    want to take — report, refuse, or allow as a deliberate override mechanism.
+  - Gates: `verify_plugin` 10 -> **17** (service tier, floor 2028 -> 2035), **mutation-tested** — a scan that
+    records nothing dies at assertion 11, i.e. AFTER all ten pre-existing plugin assertions pass, which is
+    the right kill (the plugin still works; only the report is silent). Plus tier-0 `PluginPathsTests` **+10**
+    (floor 196 -> **206**) for the two properties SQL structurally cannot reach: the default root is under the
+    REAL user's home so no hermetic suite may create it, and the override precedence is only observable with
+    the variable UNSET — which `verify_plugin` must set. Tiers: hermetic **70/70 — 7646** (unchanged, correct:
+    `verify_plugin` is service-tier) and service **50/50 — 2035**.
+  - **STEPS 2 AND 3 ARE BUILT — 2026-08-18, C#-only, no ABI. `BackendRegistry.Invalidate()` +
+    `fabricator_install_plugin(archive [, root := …] [, replace := …])` + the `fabricator_allow_plugin_install`
+    setting. Full as-built: [docs/plugin-system.md](docs/plugin-system.md) §Installing a plugin.** A plugin
+    installed mid-session becomes usable as a PROVIDER immediately; its GLOBAL functions still appear only at
+    next start, and the suite pins BOTH halves.
+    - **⚠⚠ THE MOST VALUABLE THING HERE IS A BUG IT FOUND IN THE NEW FUNCTION ITSELF, and the way it was
+      found: a mutant died at the RIGHT PLACE for the WRONG REASON, and chasing that instead of banking the
+      kill is what exposed it.** `fabricator_install_plugin` read the session-scoped opt-in INSIDE its async
+      iterator body — which runs at the first BATCH PULL, a different ABI crossing from the one that set the
+      ambient, on whatever thread DuckDB pulls from. `AmbientOpener`/`ProviderSettingsStore.CurrentSession` are
+      `AsyncLocal` PER CROSSING, so the iterator legitimately saw **session 0**, which falls back to the GLOBAL
+      settings layer where the registration default `false` sits ⇒ **an enabled function reported itself
+      disabled**. NON-DETERMINISTIC (the same suite refused at the THIRD call in one build and the FOURTH in
+      another) and **it passed the first time it was run**.
+      - Fixed with the pattern already in the tree: capture the ambients in `Execute()` — the plain method,
+        which runs inside the crossing that set them — and re-establish them at the top of the iterator.
+        `DeltaGlobalTableFunction` does exactly this with a comment saying why; `BulkSession` does it for its
+        background thread.
+      - **STANDING RULE: a global table function must read EVERY ambient in `Execute()`, never in the
+        iterator.** By execution time the opener, the transaction and the settings session are all gone or
+        arbitrary.
+    - **⚠⚠ A NAIVE `Invalidate()` IS WRONG IN THREE WAYS, because the scan had NEVER run twice in one
+      process and three things silently depended on that.** (1) The "shared" skip would have **dropped every
+      plugin on the second scan** — an assembly cannot be unloaded, so the plugins loaded by the first scan are
+      in `host.Assemblies`, match the skip set, get reported `shared`, and never re-register into the FRESH
+      map; fixed by subtracting what we ourselves loaded (`PluginLoaded`). A plugin whose FILES were deleted
+      then simply stops being a candidate, which is the right answer for an uninstall. (2) The dependency
+      resolver **CAPTURED** its probe directories, so a plugin installed mid-session would fail to resolve its
+      private deps and be reported `rejected` with a `FileNotFoundException` naming a file sitting next to it;
+      the hook is now installed once and reads a field replaced per scan. (3) **`_defaultProvider` is
+      deliberately NOT cleared** — it is set from the first provider discovered, so clearing it would let an
+      install silently re-point every call site that carries no provider name.
+    - **The gate is OUR OWN setting, not `allow_unsigned_extensions`** — that one is nearly always true by the
+      time this extension is loaded at all, so gating on it would gate nothing. New `HostSettings` mirrors
+      `HostGlobalFunctions`: settings the HOST declares, crossing under the pseudo-provider name
+      `fabricator`, which needs **no C++ change** because the host round-trips the provider column opaquely.
+    - **THE LAYOUT IS FIXED, NEVER INFERRED**: `fabricator-plugin.json` at the archive root plus `any/` and/or
+      `<duckdb platform>/`, merged with the platform overlaying `any/`. A FLAT archive is REFUSED — accepting
+      it needs a rule that recognises a platform directory by NAME, under which an archive shipping only
+      `linux_amd64/` looks flat on Windows and its Linux binaries get installed. A wrong answer, not a missing
+      feature.
+    - **The write is STAGE-THEN-MOVE**: extract to `<root>/.staging/<guid>`, then `Directory.Move` onto
+      `<root>/<name>/<version>` — atomic on one volume, so concurrent installers race on a put-if-absent
+      instead of interleaving. ⚠ Say that precisely rather than claiming atomicity outright, since
+      atomicity claims are where this codebase has been burned before: the refusal is EXACT on Windows
+      (`MoveFileEx` without `MOVEFILE_REPLACE_EXISTING`) and CONDITIONAL on Unix (POSIX `rename` fails with
+      `ENOTEMPTY` only for a NON-EMPTY destination and silently replaces an empty one) — it holds only because
+      a destination is never created any way other than by this same fully-populated rename.
+      Both `.staging` and `.trash` live INSIDE the
+      root to keep the move on one volume, and `EnumerateCandidates` now skips any path segment starting with
+      `.` (the ROOT itself may be dotted — the default one is `~/.duckdb/…`). `replace := true` MOVES the old
+      directory aside rather than deleting it: a loaded assembly is LOCKED on Windows and can be renamed but
+      not removed — measured, `Directory.Move` of a directory holding a loaded assembly succeeds there.
+    - **`activated` is read back out of the FRESH scan**, so one row separates "installed" from "installed and
+      usable"; an install into a root nothing scans says so in DIFFERENT WORDS from a plugin that was scanned
+      and declared nothing (the report is empty either way and they mean opposite things). The platform string
+      is asked of DuckDB (`pragma_platform()`), never derived — the spelling is DuckDB's.
+    - **`abstractionsVersion` is recorded and NOT gated on**: nothing versions `Fabricator.Abstractions`, so a
+      comparison would pass always or fail always — an untestable flag. The real incompatibility already has
+      an honest report (`rejected` + the exception).
+    - **The zip-slip guard is REUSED**: Bridge now project-references `Fabricator.Installer.Core` for
+      `ArchivePath` alone (InternalsVisibleTo, the `Fabricator.Delta` precedent). A security guard is the last
+      thing that should exist twice with two chances to drift.
+    - Gates: tier-0 `PluginPackageTests` **+34 (floor 206 → 240)** for the rules an end-to-end suite
+      structurally cannot reach (it installs ONE archive, for the ONE platform running it), plus two
+      `PluginPathsTests` for the hidden-segment rule incl. **a dotted ROOT still being searched** — without
+      which the default root would disable discovery out of the box. New `verify_plugin_install.test`
+      (**31**, service tier) run against its OWN empty plugin root, since every assertion in it is of the form
+      "this changed". **Mutation-tested, each mutant killed at its own section**: no `Invalidate()` dies at the
+      install row (`providers` empty, `activated` false) after 9 pass — the files landed, the session did not
+      see them; no `PluginLoaded` subtraction dies at the ATTACH assertion with *"unknown provider"* after 13
+      pass INCLUDING the first install's success, which is the right discrimination. ⚠ Hazard (2) is
+      REASONED, NOT GATED — the sample plugin has no private dependencies, so no mutant of it dies.
+      Tiers: hermetic **70/70 — 7646 (identical to baseline)** and service **51/51 — 2066 (2035 + exactly the 31 new assertions)**.
+      **ALL FOUR CI WORKFLOWS GREEN on `db59dc2`** — tier 0 (the 240 floor, both TFMs × Windows and Linux),
+      tier 1 on **all three platforms**, tier 2 (`verify_plugin_install` + the archive fixture on Linux) and
+      docs. That closes the one thing the local run could not settle: a brand-new `ProjectReference` plus an
+      MSBuild `ZipDirectory` target is exactly the shape that trips off Windows.
+    - **⚠ THE FIXTURE BROKE `verify_plugin`, and the cause is the recursion working.** The archive is
+      emitted by the plugin's OWN build (`PackPluginArchive`, MSBuild `ZipDirectory` — `zip` is absent from Git
+      Bash on Windows and a fixture that exists on one platform is a gate that runs on one platform). Staged in
+      `bin/`, it put a SECOND copy of the plugin under the now-recursive scan and the suite reported TWO loaded
+      plugins. It stages under `obj/` now.
+  - **UNINSTALL + THE SHADOWING REFUSAL — BUILT 2026-08-18 (C#-only, no ABI), user-directed.**
+    - **`fabricator_uninstall_plugin(name [, version := …] [, root := …])` IS A MOVE, NOT A DELETE, and that
+      is the whole mechanism.** An assembly loaded from a file is LOCKED on Windows and the bridge's load
+      context is not collectible, so a plugin that has been USED cannot be deleted — but it CAN be renamed.
+      Moving the version directory into `<root>/.trash/<guid>` takes it out of the scan at once, which is the
+      mark-for-deletion the design called for **without inventing a marker file**. The bytes go when they can:
+      a best-effort delete now, plus a SWEEP of the whole trash at the start of the next install or uninstall.
+      - **The row reports TWO things and they are different questions**: `removed` (out of the scan — the only
+        real failure when false) and `purged` (bytes gone — ordinarily FALSE, because this process still
+        holds the assembly). Collapsing them into one boolean would make the normal outcome look like a
+        failure. `purged` is deliberately NOT asserted in the suite: it would pin an OS behaviour, not ours.
+      - ⚠ **The PROVIDER stops resolving; the CODE does not go away.** Nothing can unload the assembly, so
+        the guarantee is that the re-scan finds no candidate and does not register it. Say that rather than
+        implying the plugin is gone.
+      - The sweep runs at install/uninstall only, never on a read path — sweeping during a scan would put
+        filesystem writes on the ATTACH path.
+    - **A PLUGIN MAY NOT TAKE A REGISTERED PROVIDER'S NAME — REFUSED (user decision, 2026-08-18).** `Add` is
+      a plain dictionary assignment, so a plugin declaring `IBackend.Name = "sqlserver"` used to REPLACE the
+      first-party provider and be reported as an ordinary `loaded` row. Of report / refuse / allow-as-override,
+      refusing is the only one that cannot end in a wrong ANSWER; an override, if ever wanted, should be
+      something the USER asks for by name rather than something a file appearing in a directory can do.
+      - ⚠ **Checked BEFORE anything is added** — the backends are materialised first, so an assembly whose
+        SECOND backend collides does not leave its first half-registered. The throw rides the scan's existing
+        per-candidate handler, so the plugin is `rejected` with a message naming BOTH sides and every other
+        plugin still loads.
+      - Aliases are checked too, not just `Name`.
+    - **The fixture is a SECOND ASSEMBLY and had to be** (`dotnet/Fabricator.CollidingPlugin`): a name
+      collision needs two assemblies claiming one name, which no manifest, root or install argument can
+      manufacture. It cannot live inside `Fabricator.SamplePlugin` either — the refusal is all-or-nothing per
+      assembly, so that plugin would stop registering and `verify_plugin` would fail. ⚠ Its csproj FIXES
+      the output path (`build/test-plugins/collide`, no TFM, no RID) so the runner and CI can name it, and the
+      runner passes it as a RELATIVE root: `$PWD` under Git Bash is an MSYS path that .NET turns into
+      `D:\d\repos\...`, which reports as `root_missing` rather than failing — it looks like the fixture is
+      simply absent.
+    - Gates: `verify_plugin_install` 31 -> **45**, **mutation-tested, each mutant killed at its own section**:
+      allowing the collision dies at the before-state count after 5 pass (the plugin shows as `loaded`);
+      dropping the uninstall re-scan dies at the post-uninstall "unknown provider" after 36 pass. ⚠ The
+      collision section's LOAD-BEARING assertion is the positive control — `mssql_mars` still registered,
+      i.e. `Fabricator.SqlServer` still holds the name; "the plugin was rejected" alone would pass on a build
+      where BOTH were broken.
+    - ⚠ **The setting's NAME is now narrower than its meaning**: `fabricator_allow_plugin_install` also
+      gates uninstall. One opt-in for "SQL may manage the plugin root" is the right granularity — a caller who
+      may add executable code has no reason to be denied removing it — but the name says install. Left
+      deliberately rather than renamed in the same breath as adding the second consumer.
+    - **STILL NOT BUILT**: archive signature/checksum verification (`Hashing` exists in
+      `Fabricator.Installer.Core` and nothing consumes it here).
+

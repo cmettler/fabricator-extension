@@ -3347,3 +3347,504 @@ behaviour changes. Do it as its own commit, against the distribution smoke tests
 #### 7c. Gates
 
 Hermetic **69/69 — 7023** and service **50/50 — 2028**, both byte-identical to the run against `9d204d7`.
+
+---
+
+## Appendix — the `CLAUDE.md` EW subsections, moved verbatim (2026-08-23)
+
+> These four subsections each declared themselves HISTORY, superseded by the "we now run on
+> ORIGINAL upstream engineered-wood, zero patches" box that stays in `CLAUDE.md`. They are the
+> per-bump record — the retired `fabricator-patches-v3` set, the clast-master re-pin, and the
+> 2026-08-01 / 2026-08-02 bumps — kept in full because the standing rules distilled from them
+> (run the surface audit FIRST; a compiling Bridge is not a migrated one; a fix whose
+> justification names a fallback must verify the fallback exists) were each paid for once.
+
+### ⚠ THE PATCH SET RETIRED — 2026-08-11, branch `fabricator-patches-v3` off `upstream/main` (`154f800`). HISTORY — superseded by the box above.
+
+**Every one of the seven patches described below is UPSTREAM.** The bump was therefore not a merge but a
+`git checkout -b fabricator-patches-v3 upstream/main` — the branch model's stated goal, reached. Full record
+(commit-by-commit, with the semantic check that each re-cut kept the part that mattered):
+[docs/ew-master-migration.md](docs/ew-master-migration.md) §THE 2026-08-11 BUMP.
+- Landed: **#125** isBlindAppend (both halves) / **#121** vacuum below the root / **#112**
+  `logRetentionDuration` / **#110** `checkpointInterval` declared / **#108** the interval's second trigger.
+  Upstream then EXTENDED two of them — #125 measured delta-spark's real flag across five commit shapes, and
+  **#116 fixed a gap in our `LogCleanup`** (V2 sidecars, and Spark's `<version>.crc`, which we never saw).
+- **What v3 carries is ONE new patch, +37/−13 in `DeltaTable.cs`:** `WriteAsync` must not claim
+  `isBlindAppend` on its caller's behalf. #125 hardcoded `true` for any plain append, which is a claim only
+  the caller can make — MEASURED: an autocommit `INSERT INTO t SELECT max(id)+1 FROM t` on the codec engine
+  recorded `true`, the unsafe direction, for exactly the shape #125's own interop tier singled out. Upstream's
+  own `DeltaTransaction.IsBlindAppend` doc says the library cannot derive this for a host with its own data
+  plane; `WriteAsync` is that surface. OFFER-READY, argument is upstream's own.
+- **The whole compile cost of 22 upstream commits was ONE new `ITableFileSystem` member** —
+  `PathNameConstraints PathConstraints` — on our three filesystems. Its only consumer is the Hive
+  partition-directory name, and under the default spelling only the Win32 flag is read at all. New gate
+  `test/verify_delta_partition_escaping.test` (**56**, hermetic), because the escaping change was covered by
+  nothing in either direction; ⚠ it asserts the ROUND TRIP, never the spelling, since the right name is
+  platform-dependent and sqllogictest cannot branch on the platform.
+- ⚠ **The regression was found by RUNNING THE TIER, not by reading the diff** — `DeltaTable`'s public method
+  surface is unchanged and the Bridge compiled after three one-line additions, which is exactly the state in
+  which a bump looks finished.
+
+### THE EW CLAST-MASTER RE-PIN (2026-07-22 — HISTORY as of 2026-08-11, see the box above; full record: [docs/ew-master-migration.md](docs/ew-master-migration.md))
+
+The engineered-wood submodule pin moved from our long-lived fork lineage (`99e2c3a`) onto
+**clast-project/engineered-wood master (`e48f449`, Curt's PR#4-parity landing) + the additive
+`fabricator-patches` branch** (7 commits, pushed to the cmettler fork, pin `7fecc2b`;
+`.gitmodules` `branch = fabricator-patches`). The strategy: fabricator-specific needs live as a
+SMALL upstreamable patch set ON TOP of clast master — never a fork again — so future EW bumps are
+merge-upstream-into-fabricator-patches + re-pin. **⚠ That upstream branch is now
+`upstream/main`, NOT `master`** — upstream renamed it (`8caf8d8`) and the stale `upstream/master`
+remote-tracking ref still resolves, so a merge of it silently lands on an abandoned branch.
+~~**Current pin: `1422ce6`**~~ (⚠ the line here went stale THREE times — **`git ls-tree HEAD
+engineered-wood` is the authority, this prose is not**. The live pin is `9d204d7` on
+clast-project/`main`, with NO patches; see the box at the top of "Next up").
+**Patch set MEASURED 2026-08-08 (`git diff upstream/main --shortstat -- src/`): +448 / −30 across SEVEN
+files** — `DeltaTable.cs`, `VacuumExecutor`, `ConflictChecker`, `LogCleanup` (new), `LogCommitter`,
+`LogCommitRequest`, `InCommitTimestamp`. It was 4 files / +175 on 2026-08-04 and +867 across 8 on 2026-08-03; the variant
+transport was ~60% of that and has left entirely (§THE UPSTREAM STRATEGY).
+- **⚠ THE PATCH SET GREW ON PURPOSE, and every new line is OFFER-READY rather than divergence.** Three of
+  the five files are the 2026-08-08 work, each open upstream as a draft the same day it was written:
+  [#92](https://github.com/clast-project/engineered-wood/pull/92) `VacuumExecutor` (**fixes #54**),
+  [#93](https://github.com/clast-project/engineered-wood/pull/93) `LogCleanup` + `LogCommitter`
+  (`delta.logRetentionDuration`), [#94](https://github.com/clast-project/engineered-wood/pull/94) the
+  `DeltaTable` checkpoint-interval hunk. With #90/#91 that is **five drafts covering the whole patch set** —
+  i.e. if all land, the branch retires. That is the branch model's stated goal, not an accident of timing.
+- **⚠ Two of the three are things WE NEED, which is what makes them offerable rather than favours to ask.**
+  The vacuum rule is REQUIRED by our own recursion fix (without it VACUUM deletes other engines' sidecars);
+  `checkpointInterval` is a property we advertise in the `WITH` surface. `logRetentionDuration` is the one
+  that is purely a spec gap — and it is the one upstream's own comments already point at.
+- **⚠ THE MERGE-ON-READ UPDATE LEFT EW (2026-08-03) — the audit's "DO NOT MOVE IT TO THE BRIDGE" verdict was
+  WRONG and is reversed. Full record: [docs/ew-master-migration.md](docs/ew-master-migration.md) §THE
+  `*BySelection*` QUESTION.** `UpdateBySelectionViaVectorsAsync` + `BuildInlineDeletionVectorsAsync` (218 lines)
+  are GONE; the Bridge now COMPOSES the same effect from PUBLIC, UPSTREAM API —
+  `ReadRowsAsync(RowSelection, …)` + `WriteDataFilesAsync(…, materializedRowIds:)` +
+  `DeltaTransaction.StageRowDeletesAsync`/`StageDataFilesAsync`/`StageChangeDataAsync` + `CommitAsync`. The
+  error to not repeat: the audit asked whether the METHOD BODY could be RELOCATED (which does need EW's
+  `internal` DV core) instead of whether the EFFECT could be COMPOSED — and `StageRowDeletesAsync` is a PUBLIC
+  door onto exactly that core. The **buffered path already did it this way**, so autocommit was the outlier.
+  Gains, because the retired method CAS'd on `expectedVersion`: the OCC retry loop was *disabled* by that
+  argument, no DV edits were recorded (⇒ **no row-level reconciliation on this path at all**), and the table's
+  own `delta.isolationLevel` was ignored — now honoured via a shared `DeltaReader.EffectiveSerializable` that
+  `DeltaCatalog` delegates to, resolved from the config the path already reads (no extra `_delta_log` LIST).
+  ⚠ The concurrency gain is a MECHANISM claim, NOT measured — see the substrate finding below.
+  ~~**`WriteChangeDataFilesAsync` (45 lines) STAYS for now**~~: **DELETED 2026-08-04 by the hoist** — the
+  buffered CDF path now calls `StageChangeDataAsync` at statement time, so its second consumer is gone.
+  ⚠ The grep lesson still stands, and applied at deletion time too: a grep of EW alone called it
+  self-contained; **the second consumer was in the Bridge — grep both trees.**
+  - **`StageChangeDataAsync` does not fit the buffered path** (asked 2026-08-03) — ⚠ **SUPERSEDED
+    2026-08-04: it fits, and all three reasons below were CONSEQUENCES OF OUR OWN BUFFERING rather than
+    properties of the API.** The hoist created the transaction at statement time, which dissolved reason 1;
+    reason 2 was backwards (`StageChangeDataAsync` writes the parquet IMMEDIATELY, so rows were never going
+    to be held — and the hoist holds LESS, since `PendingCdc` is gone); reason 3 dissolved with the parking
+    structure it names. Kept verbatim because the SHAPE of the error is the reusable part: three defensible
+    objections, each true about the code as it stood, none about the API.
+    [docs/delta-transaction-hoist.md](docs/delta-transaction-hoist.md) §2. Original text: it is a method ON
+    `DeltaTransaction` and the buffered path has none at statement time (created at FLUSH,
+    `DeltaCatalog.cs:3653`); and deferring the call to flush would hold the pre/post-image ROWS in memory until
+    COMMIT, which eager CDC capture (slice C2) exists to avoid. It also RETURNS NOTHING — `StageInternal` files
+    the actions into that transaction — while we need the `CdcFile` list back to park on `pending.PendingCdc`.
+    - **⚠ A THIRD REASON RECORDED HERE WAS FALSE, exposed by asking "would an OCC retry rewrite the CDF
+      parquets?" (answer: NO).** It claimed an early transaction "fights the flush's OCC retry, which reopens at
+      latest". **`FlushDmlTransactionAsync` has NO retry loop** — the retry is inside `txn.CommitAsync`, which
+      re-rebases from the ORIGINAL staged actions and never re-runs staging (`DeltaCatalog.cs:3777`). The false
+      reason described a hand-rolled loop that moved into EW, and came from mistaking the OTHER retry loop
+      (`:2720`, around `CommitDataFilesAsync`) for the flush's. ⇒ an early-created, long-lived transaction per
+      (txn, table) COULD use `StageChangeDataAsync`; that is an ARCHITECTURAL change (one open EW transaction per
+      table for the DuckDB transaction's life, each pinning a snapshot, all aborted on ROLLBACK), not an
+      impossibility. **Frame the offer as "the smallest change that preserves the current architecture."**
+  - ⚠ **And EW's own autocommit DML does NOT use `StageChangeDataAsync` either** — `DeleteRowsAsync`/
+    `UpdateRowsAsync`/appends call the internal `ChangeDataFeed.CdfWriter.WriteAsync` DIRECTLY (7 sites) and fuse
+    the actions into their own commit; `StageChangeDataAsync` is HOST-facing (its only in-EW use is its own body,
+    `DeltaTransaction.cs:499`). The one autocommit path using it is OURS. Don't state those as one mechanism.
+  - ~~**THE OFFER: make the internal PLURAL public — upstream already HAS it.**~~ **RETIRED 2026-08-04, NEVER
+    SENT — the hoist deleted the thing it existed to serve.** `WriteChangeDataFilesForAsync`
+    (`internal`) IS the partition-splitting plural that `StageChangeDataAsync` calls, so our 45 lines were a
+    public duplicate of it; the offer was to expose a public overload without its `internal WrittenFileLedger?`
+    param. With CDF staging into a statement-time transaction, the Bridge calls `StageChangeDataAsync` directly
+    and **our duplicate is gone** (see the hoist entry under "Next up"). Nothing about the offer was wrong — it
+    stopped being needed, which is the cheapest way to retire a patch and the same outcome as `RowUpdateMode`.
+    Two facts from it are still live and worth keeping: it takes `rowIds`/`rowCommitVersions`, i.e. **the CDF
+    identity our feed still leaves NULL** (now MEASURED and worse than "NULL" — the buffered and autocommit
+    paths DIVERGE, [docs/delta-transaction-hoist.md](docs/delta-transaction-hoist.md) §6); and ⚠ **do not
+    hand-roll the partition split** — the risk is Delta's partition-value STRING ENCODING matching what EW
+    writes for data files, and the Bridge only ever READS those values from `RETURN_STATS.partition_keys`,
+    never formats them. (This had already superseded an earlier recommendation to make `PartitionUtils` public.)
+  Gates: hermetic **63/63 — 5686** (byte-identical to pre-change ⇒ behaviour-preserving), EW Table.Tests
+  **877 → 872** (exactly the 5 tests of the retired member). **`RowUpdateMode` is SOLVED BY REMOVAL and is OFF the
+  offer list** — no divergence left for it to retire and no need for it, so do NOT bring it; spending credibility on
+  a request we do not need weakens the ones we do.
+- **⚠ LOCAL WINDOWS ROOTS ARE NOT MULTI-WRITER SAFE — measured 2026-08-03, INDEPENDENT of the above, found while
+  trying to measure it ([docs/delta-transactions.md](docs/delta-transactions.md) §8.5).**
+  `fabricator_fs_write_probe` on `D:\` reports `EXCLUSIVE_CREATE` **succeeding on an existing file** AND
+  `MoveFile` **overwriting** its target ⇒ neither commit primitive is conditional. Measured: 6 writers × 3
+  autocommit INSERTs × 50 rows ⇒ **400 of 900 rows landed, 500 silently lost, every writer exited 0** — the
+  secretless-S3 shape. Second symptom on the same cause: a concurrent reader parses a commit **mid-write**
+  (`BytePositionInLine: 9` is the length of `{"remove"`), so a log re-read fails with torn JSON rather than a
+  conflict. The §8 table's "Local POSIX" row was never wrong — `O_EXCL` is a POSIX guarantee — but nothing said
+  anything about Windows and "local" reads as covering it. **Consequence: a local Windows root cannot host any
+  multi-writer experiment** (the substrate swamps both legs of an A/B); use OneLake/abfss, S3 with a NAMED
+  secret, or WSL. Single-writer behaviour is unaffected (the whole hermetic tier is green).
+  - **⚠ ROOT-CAUSED 2026-08-08 — IT IS A DuckDB BUG, NOT A WINDOWS LIMITATION AND NOT OUR MAPPING. Ready to
+    file: [docs/duckdb-upstream-issues.md](docs/duckdb-upstream-issues.md) §4.** `FileOpenFlags::ExclusiveCreate()`
+    is read in **exactly ONE place in all of DuckDB** — `local_file_system.cpp:370-371`, in the **POSIX** branch
+    (`open_flags |= O_EXCL`). The Windows `OpenFile` (`:1069-1075`) consults only `CreateFileIfNotExists()` →
+    `OPEN_ALWAYS` and `OverwriteExistingFile()` → `CREATE_ALWAYS`; **`CREATE_NEW` — the Win32 disposition that
+    fails with `ERROR_FILE_EXISTS`, i.e. exactly this primitive — appears NOWHERE in the file.** The flag is
+    silently dropped, the open falls to `OPEN_ALWAYS` ("open, creating if absent"), and that is what the probe
+    reports. ⚠ **§8.5's own guess ("no `CREATE_NEW` … on Windows") read as *the platform lacks it* and was
+    wrong** — a plausible cause written into a doc gets read later as a finding.
+    - Easy to miss because DuckDB has **two** names containing `CREATE_NEW` with OPPOSITE meanings: the C API's
+      `DUCKDB_FILE_FLAG_CREATE_NEW` = exclusive, the internal `FILE_FLAGS_FILE_CREATE_NEW` = TRUNCATE. So the
+      Windows branch looks complete while handling the wrong one.
+    - Easy to believe because the flag is **public surface** (`Verify()` asserts its combination rules;
+      `duckdb_file_system_open` exposes it) with **ZERO internal DuckDB callers** — no upstream test can reach
+      it, so the gap is invisible to everyone except extensions. That also means a stock **C-API** repro is
+      possible (not yet written) and the fix carries no regression risk for DuckDB proper.
+    - Fix is ~3 lines and ORDER-SENSITIVE (test `ExclusiveCreate()` FIRST → `CREATE_NEW`; `Verify()` requires
+      `FILE_CREATE` alongside, so every legal caller sets both and testing the other first preserves the bug).
+      It would make local Windows as safe as local POSIX **with no change on our side** — hence a local
+      workaround (write-temp-then-publish) is deliberately NOT built: it duplicates a fix one layer down.
+  - **⚠ AND `fabricator_fs_write_probe` HAS A FALSE-POSITIVE MODE — FOUND, NOT FIXED (§8.5a).** Aimed at a path
+    whose parent does not exist, `exclusive_create_existing_fails` reports **`true` ("put-if-absent works")**
+    because the exclusive open threw for a MISSING DIRECTORY — the verdict is recorded as "it threw"
+    (`fabricator_fs_spike.cpp:534`) without checking that the file exists at all. It fails in the UNSAFE
+    direction. `create_directory` and `file_exists` likewise report `ok=true` while their own detail says they
+    failed (`run()` records ok = "did not throw", and those two RETURN a failure message instead of throwing).
+    Fix is small (gate the verdict on `FileExists`, make the two steps throw on their invariant) and was
+    deliberately NOT taken in a C#-only pass. **Found by running the README example verbatim** — the
+    "run the README's SQL before committing it" rule paying for itself. Until fixed: confirm `create_directory`
+    and `write_create` are both `true` before believing the verdict.
+**`MetadataPredicate` (182 lines) is GONE** — the
+predicate lowering was unreachable from a rowid-keyed host (its job is to PRODUCE the `RowSelection` we
+already hold), so it cost divergence for a path we can never take; removing it does not foreclose OFFERING
+it, since `offer/*` branches cut off `upstream/main` and history keeps the file. What the patches carry: the **`DeltaTable.PlanFiles`
+planning API** (proposed to Curt 2026-07-25, endorsed, and BUILT by us 2026-07-26 — it REPLACED the
+earlier `DeltaFilePruner`-public patch, which is retired; full record in the `PlanFiles` subsection below);
+create-time `configuration`/`preAssignedSchema`/`materializedRowIds` params; rowid read-back
+`rowIdsOut` correlation + derived-id fallback + CoW CDF capture + partition-aware cdc writes +
+DV-aware CDF inference; schema-evolved compaction fixes; the **narrow-int parquet write-corruption
+fix** (1-/2-byte Arrow arrays reinterpreted at the 4-byte physical width — silent corruption,
+pre-existing, upstream-candidate); pass-through source-field relabel fixes (WidenBatch/
+BackfillMissingColumns); and the **variant TRANSPORT** (`SchemaConverter.VariantTransportExtensionName
+= "ew.variant_transport"`, `VariantTransport` blob⇄`VariantArray` at EW's host boundary,
+`DeltaTableOptions.VariantTransportBlob` — EW's INTERNAL model is now the canonical
+`arrow.parquet.variant` `VariantType`; the Bridge sets the option in `DeltaWriter.Options()` and
+converts advertised schemas via `VariantMarker.ToTransportSchema`). Bridge-side migration:
+`IDataFileRewriter` retired (EW owns rewrite semantics; only the encoding seams remain), UPDATE on
+the host-join `UpdateByRowIdsAsync(RecordBatch)` + a composed merge-on-read (`MergeOnReadUpdateAsync`
+in DeltaReader), decimal widening via `DecimalOutput=Decimal128` read option, writer seam
+`IAsyncEnumerable`. **Capability gain: pure-codec variant REWRITES work** (the fork gated them);
+**the one capability regression is CLOSED (2026-07-23, EW-only on fabricator-patches): buffered DML
+through a concurrent OPTIMIZE/rewrite now REMAPS again** — clast master already shipped the full
+stable-id remap (`RemapRowLevelDeletesAsync`, its "Layer 3 (B)", serving autocommit +
+`DeltaTransaction`); the buffered surface's `RebaseDvDmlActionsAsync` just threw on a vanished path.
+Now it collects rewritten-away touched paths as `DeleteDvEdit`s and routes them through that SAME
+remap (row tracking required — without it the clean rewrite conflict remains; the remap's new-file DV
+pairs keep their own baseRowId, no HWM impact; the fork's bespoke `RemapRowsAcrossRewriteAsync` stays
+retired). No Bridge/ABI change. EW BufferedTransactionTests +3 (Table.Tests 421);
+`verify_delta_row_level_concurrency` back at the fork-era 70 (§5 buffered DELETE + §8 buffered UPDATE
+compose through OPTIMIZE; §9 = precise "row-level conflict"); regression transactions 941 /
+row_tracking_virtual 299 / optimize 40 / dv_default 58 / update 63 / delete 28 green. This closes
+PR #4's "Known follow-up". Original migration validation: 49/49 delta suites at
+full counts (variant now 144), EW suites green, and the LIVE OneLake/Spark round-trip incl. row-id
+parity both directions + Spark decoding codec-written variant. **Fork-era EW notes below this point
+are HISTORICAL** — they describe the retired fork lineage; the mechanisms survive but live in the
+fabricator-patches shapes above.
+
+### THE 2026-08-02 BUMP — DONE, pin `3b95599` (full record: [docs/ew-master-migration.md](docs/ew-master-migration.md) §THE 2026-08-02 BUMP)
+
+Eight upstream commits the day after the last bump — **#40, #41, #43, #46, #48, #49, #50, and #39 which is
+OURS, merged.** Five conflicted files, every one exactly where one of our three superseded patches sat;
+nothing else conflicted. Three of the eight ARE our offers taken and re-cut, so **the conflicts were the
+cost of being ABSORBED, not of having diverged** — the branch model paying out. Gates: EW Table.Tests
+**875/875 × {net10.0, net8.0, net472}**, hermetic **63/63 — 5640**, service **44/44 — 1424**.
+
+- **#43 supersedes our #37 and subsumes #38**: `expectedPrevious`/`requireAbsent` become the
+  `AppTransactionPrecondition` union. **⚠ `Expected is null` maps to `Absent`, NOT the union's `None`** —
+  both compile, and `None` writes unconditionally, so a replayed first batch of
+  `fabricator_delta_set_transaction_version` would commit TWICE and rewrite the recorded version with the
+  same value, leaving nothing in the table to say so. The default is the dangerous answer.
+- **#48 deleted `sourceRowTrackingOut`**; both row identities now arrive as COLUMNS via `DeltaRowMetadata`.
+  Ask for `RowTracking` ONLY when the table has it — the column form is REFUSED where the out-param quietly
+  returned nulls. Our gate is `TxnDmlProfile.MaterializeRowIds`; that alignment is now load-bearing.
+- **#50 refuses a write carrying an undeclared column.** It does not fire on us: the Bridge asks for
+  metadata columns in three places, two of which are scans feeding DuckDB and the third strips.
+- **#46 + #49 give `DeltaTransaction` `AbortAsync`/`IAsyncDisposable` and make the six auto-committing
+  paths collect their own orphans.** ⚠ **#49 also closed a data-destruction window #46 opened** (a commit
+  that landed but threw could have its live files deleted), so adopting `await using` on our buffered flush
+  is safe only from #49 onward — **deliberately NOT taken in this bump**, since "rollback leaves invisible
+  orphans for VACUUM" is documented behaviour and a bump is the wrong place to change behaviour.
+- **#41 cuts `_delta_log` walks per snapshot build from four to one** — which re-prices the
+  [delta-snapshot-caching](docs/delta-snapshot-caching.md) decision gate downward. Its "4 constructions per
+  statement" was 16 listings and is now 4; **any future measurement must be retaken against this pin.**
+
+### THE 2026-08-01 BUMP — DONE, onto **`upstream/main`** (full record: [docs/ew-master-migration.md](docs/ew-master-migration.md) §THIRD ATTEMPT)
+
+The pin moved from `7fecc2b` onto upstream's #15 slices (#18–#22) **plus the four commits that landed the
+same day** (#24, #25, #32, #33, #35). The mechanical part went as measured — the read/DML overload families
+collapsed into `ReadAsync(DeltaReadOptions)` / `DeleteRowsAsync(RowSelection, RowDeleteMode)` /
+`UpdateRowsAsync(RowSelection, …)`, and `DeltaTransaction`'s `Stage*` split into `Stage*`/`Require*`/
+`Declare*` **by RETRY CONTRACT**, so each call had to be re-classified rather than renamed
+(`StageReadPredicate`→`DeclareRead`, `StageWholeTableRead`→`DeclareWholeTableRead`,
+`StageAppTransaction`→`RequireAppTransaction`, `SetOperation`→the `Operation` property). Gates:
+EW Table.Tests **828/828 on net8.0 AND net472**, DeltaLake.Tests 248, hermetic **63/63 / 5639**.
+
+**Five things this cost real time, none of them in the measurement:**
+
+1. **`upstream/master` IS STALE — the live branch is `upstream/main`** (`8caf8d8` renamed it). A merge of
+   `master` lands on a branch upstream has moved off, and `upstream/HEAD -> upstream/master` still resolves
+   locally, which is what makes it quiet. **`git fetch upstream` and read `upstream/main`.**
+2. **The merge SILENTLY DROPPED one of our patches** — `UpdateBySelectionViaVectorsAsync`, the merge-on-read
+   UPDATE (upstream has NO DV mode for UPDATE; it always rewrites). Found by tripping over it, and the
+   reflex fix would have converted five MoR tests into copy-on-write tests. **Run the surface audit FIRST:**
+   diff the public surface of the pre-merge `DeltaTable` against the merged one, then classify each absent
+   method by whether it was in the MERGE BASE — that separates upstream's consolidation from our losses
+   (14 absent → 10 upstream's, 3 ours-with-a-successor, 1 lost). Command in the doc.
+3. **Building the Bridge is what finds the host's needs; reading the diff is not.** Two consolidations
+   dropped things only a caller notices → additive patches: a **`DeltaRowMetadata` parameter on
+   `ReadRowsAsync`** and `AppTransactionPreconditionException`.
+   - **⚠ And the first one was the WRONG SHAPE at first, which one question exposed.** I added a bespoke
+     `rowAddressesOut` out-param; `DeltaRowMetadata.RowAddress` had been a first-class metadata kind all
+     along, emitting exactly that packed address as a COLUMN on `ReadAsync`/`ReadChangesAsync`. The
+     address was never missing from the library — it was missing from ONE read, which already stood out by
+     carrying a bespoke `sourceRowTrackingOut` duplicating `DeltaRowMetadata.RowTracking`. **Standing rule:
+     before adding a parameter, read the enum/options type the neighbouring methods already accept.** The
+     out-param compiled, passed, and was defensible in isolation; it was wrong only relative to a
+     convention one file away.
+4. **A COMPILING Bridge is not a migrated one.** Upstream documents `RequireAppTransaction`'s
+   `expectedPrevious: null` as "do not check" where our `fabricator_delta_set_transaction_version` means
+   "must not exist yet" — a replayed first batch would have gone from a failed CAS to an unconditional
+   write, **duplicating data** on a user-facing exactly-once mechanism (fixed by an additive
+   `requireAbsent`). And our loud unresolvable-ordinal error is right for every DML path and WRONG for the
+   CDF read-back. Both survived the compiler; the suites caught them.
+5. **`ExemptRowLevelFromWholeTableRead` was wired LAST and nothing failed until it was.**
+   `verify_delta_row_level_concurrency` §11 was written before the migration for exactly that reason
+   (82 → 93). **`DeclareFilesRead` (#25) does NOT retire it** — declaring the files a scan touched drops the
+   APPEND rule, which is the phantom-row protection `serializable` (our default) exists for.
+   - **⚠ AND `DeclareWholeTableRead` DOES NOT REPLACE IT EITHER — that one is UPSTREAM and ours NARROWS it**
+     (upstream's own doc calls the narrowing a downstream proposal it has not implemented). They are a pair.
+     **OFFER OUR PROPERTY AS-IS**: it is NOT an API inconsistency but a **DEPARTURE** from Delta's
+     `concurrentDeleteRead` rule (honoured at BOTH levels by Delta and EW; Spark gates only `concurrentAppend` on
+     the level), and it is already the *"explicit per-transaction opt-in rather than an inference"* shape upstream
+     said it would require. **A `DeclareWholeTableRead(forAppends:, forRemoves:)` "facet split" was proposed here
+     and is RETRACTED** (2026-08-03): writing the call site showed we cannot make the judgment it hands us
+     (`ReadWholeTable` is set by ANY unfiltered scan, `DeltaCatalog.cs:1412`), and `forRemoves: false` is precisely
+     the *"claim on a host's behalf that it read less than it declared"* upstream objected to. It was the reframe
+     pass's own caveat violated — a semantics request dressed as an inconsistency.
+   - **⚠ OVER-BROAD OPT-IN IN WHAT WE SHIP (reasoned, NOT measured, untested) — but INERT UNDER OUR DEFAULT.**
+     The Bridge sets the opt-in **UNCONDITIONALLY** (`DeltaCatalog.cs:3775`) while the departure is justified by
+     ROW-LOCALITY. EW's gate is three-way (`DeltaTable.cs:2404`):
+     `exempt && rowLevel && isolationLevel != Serializable` — and since the 2026-08-01 flip our default IS
+     `serializable`, so the flag is **ignored by default**; do not call this broken out of the box. It bites only
+     on `write_serializable` (ATTACH option or table property) plus a txn staging DV deletes, where
+     `BEGIN; SELECT avg(x) FROM t; DELETE FROM t WHERE x > 42; COMMIT;` gets exempted although the row-level
+     validation covers only the REMOVED rows, not a threshold derived from a whole-table read. Fixing it needs
+     provenance on `ReadWholeTable` (DML's own scan vs an arbitrary SELECT), which the buffer lacks today — a
+     behaviour change with its own test, deliberately not folded into the merge-on-read work.
+
+**⚠ OUR `_last_checkpoint` OFFER WAS MERGED (#32) AND THEN CORRECTED TWICE — ours is retired, upstream's is
+in.** #33 found the `Exists` probe ran BEFORE the try (so the fix did not fix the case it was written for)
+and that guarding root kind + field PRESENCE misses field TYPE and the nested `v2Checkpoint`; one try/catch
+around the whole read-and-decode replaces all six guards. #35 is the important one: **the argument both
+fixes rested on — "a reader can always recover by listing the log" — was never implemented.** Nothing
+listed the log; `SnapshotBuilder` read a null hint as `replayFrom = 0`. Once Delta's metadata cleanup
+removes the subsumed commits, replay rebuilds nothing and the table is **UNREADABLE** (measured: *"Table
+has no metadata action"*), which is squarely the OneLake shape we were fixing for. **Standing lesson: a fix
+whose justification names a fallback must verify the fallback exists.**
+
+Also: **#24 independently CONFIRMS our live isolation measurement** — delta-spark 4.0.0 rejects
+`delta.isolationLevel='WriteSerializable'`; it is a Databricks extension and OSS Delta has one level, which
+is what we found against Fabric Spark 4.1.1 by another route. It further found EW and Delta agree on the
+OUTCOME and disagree on the LABEL (Delta reports `ConcurrentAppend` where EW reports
+`ConcurrentDeleteRead`).
+
+**⚠ #36 came in on the same bump and carries TWO USER-VISIBLE behaviour changes** (*"a replay that skipped
+a version said nothing about it"* — the follow-on to #35). `SnapshotBuilder` used to apply whatever commits
+it happened to find, skipping a missing or unreadable version **in silence** (once via a literal
+`catch { /* Skip missing commits */ }`) while still labelling the result with the target version. Both
+replay paths now demand contiguous coverage and name the first hole.
+- **`AT (VERSION => n)` PAST THE END OF THE LOG now ERRORS** (*"Delta log is incomplete: version 3 is
+  missing or unreadable and no checkpoint covers it"*) where it used to return the **newest** snapshot under
+  the requested label — so a stale pin or an off-by-one silently got real rows for a version that does not
+  exist. **Measured, then pinned** (`verify_delta_catalog_time_travel` 48 → 49); nothing asserted either
+  answer before, so it could have flipped back unnoticed in either direction.
+- **A transient READ FAILURE of a commit is now a HOLE, not a skip.** **MEASURED LIVE on OneLake
+  (2026-08-01) — no spurious failures.** 16 writers × 20 commits: **19 OCC retries** (so the commit guard
+  was genuinely under test), 320/320 commits, 320 groups, no short groups, all writers clean, all exited on
+  their own. ⚠ **8 × 12 and 10 × 15 both produced ZERO retries that day** and are therefore NOT measurements
+  of this — the harness's own void condition ("must be > 0, else the writers serialized and the guard was
+  never under test"). Contention varies run to run; **check the retry count before believing a green.**
+  (The pre-fix "8 × 12 reproducibly broke writers" line elsewhere in the docs describes the state BEFORE the
+  `_last_checkpoint` and 412 fixes — the same table records 96/96 clean after them, so a clean 8 × 12 today
+  is the documented behaviour, not a lost baseline.)
+- `ListCheckpointVersionsAsync` is deleted upstream, and his message says *"Confirmed absent from
+  fabricator before removing"* — checked, and true (only compiled EW DLLs match; no source call site).
+  **Upstream is checking our tree before removing API.**
+
+**The bump-by-bump journal** (every EW pin move, `PlanFiles`, the path-keyed DV DML, the `_metadata`
+surface, the variant-transport decision + shredding split, the `DeltaTransaction` flush migration, and
+the `TransientRowAddress` analysis) **moved verbatim to
+[docs/ew-master-migration.md](docs/ew-master-migration.md) §Appendix — read it BEFORE the next EW bump
+or upstream offer.** Standing rules distilled there and still binding: merge `upstream/main` (NOT `master` — renamed) into
+fabricator-patches (fast-forward pins, NEVER force-push — release tags pin EW shas); after taking a
+method wholesale from upstream, diff it against upstream and demand byte-identity (the auto-merged
+duplicate-statement trap); only the net472 leg proves a change offerable; check `git log -S` before
+assuming upstream reimplemented us (it may be convergence); read the DOC hunks of a conflict, not just
+commit subjects.
+
+
+---
+
+## Appendix 2 — THE UPSTREAM STRATEGY as `CLAUDE.md` carried it, moved verbatim (2026-08-23)
+
+> The goal was reached in its strongest form (we run on ORIGINAL upstream, zero patches), so every
+> item on the offer list below LANDED and the whole section is the record of how each was ARGUED
+> rather than work outstanding. Kept in full because three things in it are still live guidance:
+> what makes an offer land, why the variant transport is OURS-BY-DESIGN and must never be offered,
+> and the `LogCleanup` measurement discipline (a negative result needs a control that would have
+> produced a positive).
+
+### THE UPSTREAM STRATEGY (user goal, 2026-08-04 — full plan: [docs/ew-master-migration.md](docs/ew-master-migration.md) §THE STRATEGY)
+
+Goal: run on **ORIGINAL upstream engineered-wood** with our needs met by high-probability PRs; maintain our own only
+if that is impossible, and then **make our amendments clear IN THE CODE**.
+- **THE VARIANT TRANSPORT HAS LEFT EW — DONE 2026-08-04, BOTH DIRECTIONS. Patch set 867 → **221 insertions
+  across 4 files**, with ZERO variant divergence.** It was 60% of the patch and is OURS-BY-DESIGN (never offer
+  it) — it just did not have to live in EW. The patch **replaced** upstream's `VariantColumnCoercion.Coerce`
+  instead of running after it, which is why it had to normalise FOUR layouts (canonical / shredded / bare struct
+  from an unannotated file / seam blob) keyed off the Delta schema. Letting `Coerce` run UNPATCHED and converting
+  **canonical ⇄ blob in the BRIDGE** is one layout each way, detected by Arrow TYPE rather than by consulting the
+  Delta schema. The C-interface crash never applied at that seam: EW hands us in-process .NET objects, so we hold
+  a canonical `VariantArray` and flatten only on export. **This also supersedes an earlier note saying zero-patch
+  was "gated on DuckDB #24157" — it never was.** What remains in EW: `ConflictChecker` 42 (offer-ready),
+  `DeltaTable` 183, `DeltaTransaction` 26, `DeltaFilePruner` 4.
+  - **READ half:** `Fabricator.Delta/VariantTransport.cs` owns canonical⇄blob at **THREE** boundaries — the 5
+    `DeltaReader` read exits (canonical→blob), the native-read seam (blob→canonical), and
+    **`NativeParquetDataFileWriter`** (canonical→blob). ⚠ **The third was not in the plan; the variant suite
+    caught it** at the OPTIMIZE section — the native writer feeds DuckDB's `COPY`, so it needs flattening too,
+    **including the PEEKED batch whose schema builds the COPY** (converting only the stream would describe the
+    file with a variant struct and then feed it blobs).
+  - **WRITE half:** new `VariantMarker.ToCanonicalSchema`/`ToCanonicalField` + a list overload of
+    `ToCanonical`. **Three FUNNELS** (`DeltaWriter.WriteAsync` schema+batches — which also covers the
+    `OverwritePartitions`/`DynamicOverwrite`/`WriteAsync` trio inside it; `DeltaWriter.CreateAsync` schema;
+    `DeltaCatalog.AlterTable`'s `Field?`, covering ADD COLUMN/FIELD buffered *and* immediate) plus per-site
+    conversions for the CDF/`WriteDataFiles`/`UpdateRows`/`StageChangeData` calls, and **SCHEMA-ONLY** conversion
+    where the STREAM must stay transport for DuckDB's COPY (`TryStreamCreateFiles`, `TryWriteStreamingCoreAsync`,
+    the four `FromArrowSchema` calls).
+    - **⚠ ONE funnel is right at `DeltaWriter.WriteAsync` and was WRONG at `BulkInsert`** — the difference is
+      SINK COUNT, not depth. `WriteAsync` has one sink: its `native_write` variant reaches DuckDB's COPY
+      *through* EW (`NativeParquetDataFileWriter` flattens back itself). **The ingest-funnel design was built and
+      REVERTED — do not retry it**: that stream has TWO sinks with opposite needs (codec wants canonical,
+      `native_write` hands the SAME stream back to `COPY` via `TryStreamCreateFiles`, wanting the blob). Symptom
+      `complete_bulk failed: … INTERNAL Error: Attempted to access index 2 within vector of size 2` — the COPY,
+      naming neither variants nor EW. It needed FOUR compensating conversions; needing that many to keep one
+      funnel honest is the signal it is in the wrong place.
+    - **⚠ THE 13-SITE ENUMERATION IN THE PLAN WAS INCOMPLETE, and the missed ones were the dangerous kind.** A
+      grep of the CALLEE side (`OpenOrCreateAsync|SetSchemaAsync|AddColumnAsync|AddFieldAsync|ComputeAdd*|
+      MergeSchemaAsync|Write*Async|Stage*Async|UpdateRowsAsync|ToDeltaField`) found **four more**: the STREAMING
+      native-write path's `OpenOrCreateAsync` and its **two** `SetSchemaAsync(data.Schema)`, plus the
+      copy-on-write `UpdateRowsAsync`. Three of the four hand EW a SCHEMA — the durable-corruption class below.
+      **Enumerate by grepping the callee, never by listing call sites from memory.**
+    - **⚠ The failure mode, restated because it is the worst in the variant surface:** with the `SchemaConverter`
+      patch gone, a transport-marked field reaching EW maps to Delta **`binary`**, and a `metaData` commit is not
+      revisable — a CREATE/CTAS/ADD COLUMN would record the wrong type DURABLY and SILENTLY, surfacing far away
+      as an insert that cannot convert VARIANT to BLOB.
+    - **⚠ The green intermediate CANNOT prove completeness** (the EW patch is still there to cover a missed
+      site) — it separates "my conversions are right" from "the deletion broke something". Only the
+      patch-removed run tests completeness. Both were run: variant **157** each time.
+    - **⚠ Each of the four EW codec sites carried a SECOND `StripAnnotation`** that existed ONLY to undo the
+      annotation `ToVariantArrays` re-introduced (upstream already strips on `physicalBatch` before the writer
+      branch). The revert deletes both lines. **Read the surrounding upstream hunk, not just the line you added.**
+    - **⚠ Latent, noted in `NativeParquetDataFileWriter`:** the canonical→transport conversion assumes
+      `EmitVariantLogicalType` stays TRUE (its default; nothing of ours sets it). With it FALSE, EW's own
+      `StripAnnotation` flattens the `VariantArray` to a bare struct BEFORE our writer sees it — indistinguishable
+      from an ordinary struct — so the conversion would silently not fire and the COPY would write a struct
+      instead of a parquet VARIANT. Unreachable today; the fix would be to pass the Delta schema in.
+    - **One site the plan listed that must NOT be converted:** `ExternalTableRouting.cs`'s `Materialize(data)` —
+      its batches go back INTO `DeltaCatalog.ExecuteUpdate`, the same dialect boundary as the C ABI. Only that
+      file's `FromArrowSchema` needed the wrap.
+  - ⚠ **The marker string is still `ew.variant_transport`, and the name now LIES** — engineered-wood knows
+    nothing about it; the constant is `VariantMarker.ExtensionName`, ours alone. Renaming it is safe in principle
+    (it is an in-memory discriminator that never persists — the Delta schema records `variant` and the parquet
+    file carries the canonical annotation) but it must change in LOCKSTEP with the C++ ArrowTypeExtension
+    registration in `src/fabricator/fabricator_variant.cpp`, so it is a C++-touching rename, deliberately not
+    bundled into this pass.
+  - Gates: EW Table.Tests **868 × {net10.0, net8.0, net472}** (871 − exactly the 3 deleted transport tests; the
+    one whose SUBJECT is EW's — shred-on-write/reassemble-on-read — is already covered by upstream's own
+    `Interop/VariantShreddingInteropTests`, so adapting it would have duplicated upstream rather than preserved
+    ours), hermetic **63/63 — 5686** AND service **44/44 — 1458**, both byte-identical to baseline, variant **157**. ⚠ Runtime cost is one extra
+    materialisation per batch on variant tables — UNMEASURED; and the live Spark/kernel round trip has NOT been
+    re-run since.
+- **⚠ THE WHOLE OFFER LIST BELOW IS SETTLED AS OF 2026-08-11 — every item LANDED, and the patch set is empty.
+  Read the list as the record of how they were argued, not as work outstanding.** The branch is now
+  `fabricator-patches-v3`, cut fresh off `upstream/main`, carrying ONE patch that did not exist when this list
+  was written (`WriteAsync` must not claim `isBlindAppend` for its caller — see the box above §THE EW
+  CLAST-MASTER RE-PIN). **The marking convention below is what made the audit cheap and stays in force.**
+- **Sequencing: offering and building are NOT sequential** — the branch model does both, proved by the 2026-08-02
+  bump (three of eight upstream commits were our own offers coming back re-cut) and settled by 2026-08-11, when
+  all of them had landed. Stay on the current `fabricator-patches-v<n>` and
+  keep building. **Pull ONE thing forward: MARK the amendments** (`// [FABRICATOR-PATCH: OFFER-READY | OFFERED #n |
+  OURS-BY-DESIGN]` + why + what retires it). `DeltaTable.cs` alone has **27 unmarked hunks**; today "is this ours?"
+  is answerable only by `git diff upstream/main`. Marking needs nobody's agreement and turns the eventual
+  fork-vs-upstream decision into a grep.
+- **Offer order** (probability × independence): ~~(1) public overload of `WriteChangeDataFilesForAsync`~~ —
+  **RETIRED 2026-08-04, NEVER SENT, and this is the branch model working rather than a change of mind.** The
+  hoist made `StageChangeDataAsync` callable at statement time, so our 45-line public duplicate is DELETED and
+  there is nothing left for the overload to serve. The lesson generalises: an offer that exists to work around
+  our OWN architecture should be re-derived after each architectural slice, because the cheapest way to retire
+  a patch is to stop needing it — cf. `RowUpdateMode`, solved by removal. Full record:
+  [docs/delta-transaction-hoist.md](docs/delta-transaction-hoist.md) §2. So the live list is:
+  (1) `ConflictChecker` isBlindAppend — 42 lines, internal, 7 tests, but
+  present BOTH shapes; (2) `ExemptRowLevelFromWholeTableRead` — **only after the §2.2 fix**, and pitched as a
+  DEPARTURE not an inconsistency; (3) a transaction that can CREATE a table — a design conversation; and
+  **(4) LOG CLEANUP — BUILT 2026-08-08 (user-asked), so this is now an OFFER-READY PATCH rather than a gap
+  to report.** engineered-wood accepted and stored `delta.logRetentionDuration`, never read it, and never
+  deleted a commit a checkpoint subsumed. New `LogCleanup` (`EngineeredWood.DeltaLake/Log/LogCleanup.cs`),
+  called from `LogCommitter` immediately after a checkpoint is written — Delta's own trigger point, and the
+  one that bounds the cost to once per `CheckpointInterval` rather than a listing per commit.
+  - Delta's rule, both halves required: a checkpoint must exist AFTER the file AND it must be older than
+    `now - logRetentionDuration`. No `_last_checkpoint` ⇒ deletes NOTHING. Deletion is a contiguous PREFIX,
+    because replay demands unbroken coverage and a HOLE reads as corruption (upstream #36 made that loud).
+  - **⚠ IT EXPOSED A SHIPPED FAKE, and this is the part worth carrying forward.** `DuckDbTableFileSystem`
+    reported a HARDCODED `DateTimeOffset.UnixEpoch` as every file's modification time. Nothing read it, so
+    nothing noticed — and the first thing to read it deletes by AGE, under which every commit looks 56 years
+    old and a 30-day retention collects one written a second ago. Fixed on both sides (`HostFsGlob` now
+    emits `last_modified` from `extended_info`, exactly as it already did for `file_size`; the managed side
+    maps an absent value to a sentinel), **plus a guard in `LogCleanup` that declines the whole pass when
+    any file cannot be dated** — unknown must stay unknown rather than default to a date. ⚠ C++-TOUCHING, so
+    it needed the full rebuild.
+  - **⚠ THE ADJUSTMENT ANCHOR.** Delta presents commit timestamps as strictly increasing, adjusting a file
+    not newer than its predecessor. A reader doing time-travel-BY-TIMESTAMP depends on that anchor, so
+    deleting it changes which version a timestamp query answers with. Ours is immune (in-commit timestamps,
+    read from the actions) but a Delta reader is not, so the cut walks BACK over the chain the first
+    SURVIVOR depends on — retaining the chain, not the whole log.
+  - Gates: `LogCleanupTests` **+13 (364 → 377 × {net10.0, net8.0, net472})**, three mutants each killed at
+    its own test; `verify_delta_tblproperties` 84 → **94**, which pins the DANGEROUS direction (a commit
+    inside the window is never collected) because that is what a tier can assert deterministically. ⚠ The
+    POSITIVE is timing-dependent and is NOT in CI — it lives in the EW tests via an injected clock, plus a
+    hand-run end-to-end check (7 commits, a 3 s wait past a 2 s horizon, **v0–v6 collected, 4 survivors,
+    table still reads all 10 rows**).
+  - ⚠ **`netstandard2.0` has no `DateTimeOffset.UnixEpoch`** — this assembly still targets it for the net472
+    leg, and only the all-TFM run catches it. Spell the epoch out.
+  - **THE MEASUREMENT (this is what settles it — the two greps below do not):** two local tables, 26 commits
+    each, two checkpoints each; one with `delta.logRetentionDuration = 'interval 1 seconds'`, one with the
+    property unset. **28 commit JSONs vs 27** — the difference being only the extra `set_tblproperties`
+    commit. With a one-second horizon and a checkpoint at v20, an implemented cleanup would have reclaimed
+    ~20 files. Nothing was reclaimed, and the property changed nothing.
+  - Corroborating, and the stronger of the two static reads: **`IntervalParser`'s ONLY call site is
+    `DeltaTable.DeletedFileRetention`**, which reads `delta.deletedFileRetentionDuration` — the VACUUM knob
+    for DATA files. The parser whose doc comment names `logRetentionDuration` is wired only to the other one.
+  - ⚠ **MY FIRST TWO ARGUMENTS FOR THIS WERE BOTH INADEQUATE, and the sequence is the point.** (a) A
+    BACKWARDS GREP for `Cleanup*` / `DeleteAsync`-on-a-log-path — the very search pattern this file records as
+    having produced a wrong "we never reach `CommitOccAsync`" conclusion; a cleanup under an unguessed name
+    would not appear. (b) Observing `lake/t` go 148 → 151 across an OPTIMIZE + VACUUM — which **does not
+    discriminate**, because Delta's default retention is 30 DAYS and every file in the rig is minutes old, so
+    a correct implementation would have done nothing either. Only forcing the horizon to one second separates
+    the hypotheses. **A negative result needs a control that would have produced a positive.**
+  - Cost, MEASURED: ~10 ms per dead commit file per scan on S3, so an hourly dbt model adds ~90 s of pure
+    metadata to every scan after a year. The offer needs nothing of ours, is self-contained, and is what the
+    spec already says should happen — the three properties that make an offer land. **Never**
+  offer the variant transport.
+- **Decision gate:** drop the branch for a `PackageReference` when the patch set is variant-transport-only AND
+  #24157 is fixed. Until then the branch is correct, not a failure.
+

@@ -1528,3 +1528,637 @@ about the parallel sink changes that.
 9. **The waiter's backoff bounds (1 ms → 16 ms) are a judgement, not a measurement.** They were chosen so a
    fast pull never waits (the notify wins) and a 200 ms pull costs ~90 wake-ups; nothing has measured whether
    a longer cap would be cheaper or a shorter one fairer.
+
+---
+
+## Appendix — the `CLAUDE.md` concurrency entries, moved verbatim (2026-08-23)
+
+> `CLAUDE.md` now carries a compressed entry pointing at this file. These are the original
+> entries in full — the `PhysicalUnion` stall root-cause chain, the parallel write sink, the
+> `order_preservation_type` analysis, the handoff, the `MaxThreads` fix and the instrument work —
+> kept verbatim so nothing depends on my summary being complete. Where a fact appears in both,
+> the sections above are the organised version and this is the working record.
+
+- **⚠⚠ THE "PhysicalUnion SCHEDULER STALL" IS ROOT-CAUSED, AND THE CAUSE WAS OURS: NOT ONE FABRICATOR
+  `TableFunction` DECLARED BATCH-INDEX SUPPORT, SO EVERY ORDER-PRESERVING PLAN GOT A SINGLE-THREADED RESULT
+  COLLECTOR. FIXED 2026-08-21 (C++, no ABI — a new `get_partition_data` callback on all NINE `ArrowStreamScan`
+  registrations). Full chain + numbers: [docs/scan-concurrency.md](docs/scan-concurrency.md) §5.**
+  - **THE CHAIN, every link read from DuckDB's source.** `PhysicalTableScan::SupportsPartitioning` is
+    literally `function.get_partition_data != nullptr`; none of ours set it (DuckDB's OWN arrow scan does, and
+    its body just reads `state.batch_index` off `ArrowScanLocalState` — **our local state's base class**, whose
+    `batch_index` `GetNextBatch` has always assigned under the pull mutex, so the VALUE was there and only the
+    DECLARATION was missing) ⇒ `AllSourcesSupportBatchIndex()` false ⇒ `UseBatchIndex` false ⇒
+    `GetResultCollector` falls to **`PhysicalBufferedCollector(parallel=false)`** instead of
+    `PhysicalBufferedBatchCollector` (which is order-preserving AND `ParallelSink()==true`) ⇒
+    **`Pipeline::ScheduleParallel` tests `!sink->ParallelSink()` FIRST and returns false**, so ONE task per
+    pipeline and `MaxThreads()` is NEVER READ ⇒ and `PhysicalUnion::BuildPipelines` ALSO sets
+    `order_matters=true` off the same flag, chaining the branch pipelines. Each hand-off is then paid at the
+    20 ms `task_reschedule` poll, a CV signalled only by task RESCHEDULES and never by a chunk arriving.
+  - **⚠⚠ SO THE 2026-08-18 `MaxThreads` FIX ONLY EVER PAID OFF UNDER A BLOCKING OPERATOR — and its own
+    measurements hid that, because both were taken with an AGGREGATE above the scan** (a parallel sink). For a
+    plan streaming straight to the client the sink IS the result collector: **MEASURED 2694 ms at threads=1 and
+    2633 ms at threads=4 — perfectly flat.** After the fix: **2729 -> 1197 ms.** A union of two such scans:
+    **5133 -> 1859 ms** (1858 at threads=8).
+  - **⚠ IT MAKES `preserve_insertion_order=false` REDUNDANT ON THE LOCAL REPRO — 1858 ms by default vs 1828 ms
+    with the SET — but it has NOT been removed.** That setting reached a parallel collector by DISCARDING the
+    order guarantee (route 1); the batch index reaches one that KEEPS it (route 3). ⚠ Its justification, and
+    `TryUnionForm`'s remote gate, both rest on REMOTE numbers taken BEFORE this fix (120.4 / 44.7 / 13.7 s) —
+    **every one of those is now of unknown validity.** Re-measure live before narrowing the gate or dropping
+    the SET; decide the two together.
+  - **⚠ THE METHOD IS THE REUSABLE PART: I derived the chain from the source, PREDICTED that a streaming-sink
+    plan would not scale, and only then measured it.** The prediction is what made the finding attributable —
+    a bare before/after on the union alone would have shown a speedup with no explanation, which is how the
+    stall spent a week filed as an upstream scheduling pathology.
+  - ⚠ Same SHAPE as the `MaxThreads` bug: DuckDB's arrow scan declares a capability, ours did not, and the
+    consequence was LATENCY rather than a wrong answer — so nothing failed and both tiers stayed green.
+  - **⚠⚠ CORRECTION, SAME DAY, FOUND BY THE fabricator-quantax PLUGIN SESSION: A UNION'S BRANCHES ARE STILL
+    SERIAL, AND MY UNION NUMBER WAS A MISREADING.** (⚠ *"still serial"* was true until 2026-08-21 — see the ✅
+    entry below; the analysis here is what led to the cause and stands, the state of the world does not.) They repinned to `b96454a`, re-measured and reported
+    *"partly fixed, not fully"*. Verified here on OUR OWN sample plugin: `plug_slow_range(4096,500)` alone
+    **1420 ms**, `UNION ALL` with itself **2419 ms** — perfectly additive at threads 4 AND 8, and
+    `preserve_insertion_order=false` does not help (2486 ms). ⇒ the commit's **5133 → 1859 ms** union row is
+    INTRA-branch parallelism (four sleeping rows over four threads inside each branch, then the branches
+    back-to-back), NOT inter-branch. **A per-row SCALAR cost cannot expose this; only a cost in the SOURCE
+    can** — which is why their wait TABLE function found it and my `plug_sleep` cells could not.
+  - **THE MECHANISM IS A CONSEQUENCE OF THE FIX, not something it overlooked.**
+    `PhysicalUnion::BuildPipelines` sets `order_matters` (⇒ `CreateUnionPipeline` pushes a DEPENDENCY on the
+    previous branch) if any of five things hold, and **every collector DuckDB has trips one**:
+    `PhysicalBufferedCollector` and `PhysicalMaterializedCollector` both return `SinkOrderDependent() == true`
+    **UNCONDITIONALLY**, and `PhysicalBufferedBatchCollector` — what this fix selects — instead trips the
+    `partition_info.batch_index` clause. So the fix swapped `!ParallelSink()` for `batch_index`: **net effect
+    on inter-branch concurrency ZERO, by construction.** Not the binder's doing either — `plan_setop.cpp`
+    omits the argument, so `allow_out_of_order` DEFAULTS TO TRUE for a plain `UNION ALL`; the plan says order
+    need not be preserved and the SINK overrides it.
+  - **⚠⚠ MECHANISM ESTABLISHED 2026-08-21, AND IT IS OURS — NOT `order_matters`, AND IT IS A SIDE EFFECT OF
+    THE `MaxThreads` FIX ITSELF. New pure-C++ control `fabricator_wait(rows, millis [, threads, hold_lock])`
+    (`src/fabricator_wait.cpp`, gate `verify_wait` 20) has NO Arrow, no bridge, no plugin — so a scheduling
+    answer cannot be blamed on our machinery.** `GetNextBatch` holds `gstate.main_mutex` ACROSS the managed
+    pull (right in itself — one Arrow stream cannot be pulled from two threads) while `ArrowStreamInitGlobal`
+    declares `MaxThreads() = NumberOfThreads()`. Branch A therefore launches one task per thread: one blocks
+    INSIDE the pull holding the mutex, the rest block ON it, and each burns a DuckDB worker — so every worker
+    is consumed by branch A and branch B never gets one. **Reproduced in pure C++ with both halves shown
+    NECESSARY** (threads=4, 2000 ms of work): control 1386 ms overlapped / `hold_lock + threads:=1` **1338
+    overlapped** / `hold_lock + threads:=4` **2417 SERIAL** / `hold_lock + threads:=20` 2356 SERIAL /
+    `threads:=20` alone 1327 overlapped.
+    - **⇒ BEFORE 2026-08-18 `MaxThreads()` RETURNED 1, which is the overlapping row — so union branches DID
+      overlap and the fix that made a single scan parallel simultaneously made its sibling tasks starve every
+      other pipeline.** Neither tier could catch it: sqllogictest never runs two expensive scans concurrently.
+    - **⚠ `MaxThreads() = 1` FIXES THE UNION AND IS THE WRONG FIX — BOTH SIDES MEASURED (user-raised), patched
+      temporarily and reverted.** threads=4: two managed scans unioned with ONE blocking morsel each
+      **2382 → 1403 ms (fixed)**; one Delta scan with 4 morsels of per-row work **1178 → 2693 (flat, §2's win
+      gone)**; two Delta scans unioned with 4 morsels each **1859 → 2809 — WORSE**, i.e. it loses on the very
+      union shape it was meant to help. A constant of 1 wins ONLY when a branch holds a single blocking morsel.
+      ⚠ Whether our REMOTE reads resemble that is REASONED, not measured (their cost is the blocking pull, which
+      the mutex serializes either way, so inter-branch overlap would put D branches' IO in flight together).
+      ⇒ neither constant is right, which is the argument for BLOCKED rather than a knob.
+    - **✅ BUILT 2026-08-21 (C++-only, NO ABI change, no managed change) — the loser of the pull hands its
+      worker BACK, and the union overlaps. Full record: [docs/scan-concurrency.md](docs/scan-concurrency.md)
+      §5f.** `try_lock` on the pull mutex; on failure the scan returns `SourceResultType::BLOCKED` carrying ONE
+      `AsyncTask` that waits a BOUNDED time for a generation counter to move (`src/fabricator/scan_wait.cpp`,
+      shared with `fabricator_wait`'s new `async_wait` parameter, which prototyped it in pure C++ first).
+      MEASURED in-session: two managed table-function scans unioned **2.06 s → 1.03 s**; the pure-C++ control
+      **4.08 → 2.05**; a 6M-row local aggregate **0.96/0.86 → 0.84/0.81** (no overhead on the fast path).
+      - **⚠⚠ THE PLANNED DESIGN'S CENTRAL CLAIM WAS FALSE, and finding that is what made the fix small.** The
+        recorded plan said a blocked branch would afterwards hold ONE worker. It would not:
+        `AsyncExecutionTask::ExecuteTask` fires the interrupt only AFTER `Execute()` returns, and
+        `TaskScheduler` is a fixed set of OS threads with nothing compensating for a blocked one — so an
+        AsyncTask that waits UNTIL DATA ARRIVES holds a worker exactly as long as parking on the mutex did.
+        **⇒ THE TIMEOUT IS THE MECHANISM, NOT A SAFETY NET**; the condition-variable notify exists only so the
+        fast case (every local pull) pays no latency for it. Backoff 1 ms → 16 ms, reset on progress.
+      - **⇒ THE MANAGED PUMP AND THE TWO NEW ABI ENTRIES WERE NOT NEEDED, which dissolved the hazard the plan
+        said to budget for first.** The pull still happens on the scan task that won the lock, so NOTHING new
+        owns the Arrow stream and the `BatchQueryOwner.Claim()` shape (a pump inside a read while an
+        early-abandoning consumer releases the query — `STATUS_HEAP_CORRUPTION`, no stack, not reproducible
+        standalone) cannot arise. A channel would buy PREFETCH, which is a different and still-unbuilt idea.
+      - Both invariants hold BY CONSTRUCTION: the pull is still single-threaded (same mutex, still held across
+        it — only who WAITS changed) and `batch_index` is still assigned under it, which is what
+        `get_partition_data` promises DuckDB.
+      - ⚠ The wait state is `shared_ptr`'d because a parked task may OUTLIVE the scan's global state (a
+        satisfied LIMIT tears the query down mid-wait); the destructor's `Shutdown()` wakes whoever is left.
+        Same class as the `ArrowProducer::Release` use-after-free, designed out rather than tested for.
+      - ⚠ **THE LOST-WAKEUP ORDER IS LOAD-BEARING: read the generation BEFORE the `try_lock`**, and announce
+        progress from a scope guard on EVERY exit including a throw.
+      - **⚠ `debug_physical_table_scan_execution_strategy='SYNCHRONOUS'` MAKES THE PRE-FIX PATH REACHABLE FROM
+        SQL** (it forbids BLOCKED, so our scan falls back to parking), which is what lets both gates be a RATIO
+        between two legs of one statement in one process off one binary — no remembered numbers.
+      - Gates: `verify_wait` 20 → **31** (hermetic, the mechanism, via `async_wait`) and `verify_plugin` 38 →
+        **49** (service, the PRODUCTION scan path, via the strategy setting); floors 7739 → **7750** and
+        2129 → **2140**. **Both mutation-tested**: forcing the park kills `verify_plugin` at its ratio
+        assertion after 47 pass, ignoring `async_wait` kills `verify_wait` after 29. ⚠ Each has a LOWER-bound
+        positive control in front of the ratio, without which "the fixed leg is faster" would pass equally on a
+        build where the sleeps had stopped happening.
+      - **⚠ WHAT IT DOES NOT FIX, measured: a union whose cost is DOWNSTREAM of the scan** (two local Delta
+        scans with per-row sleeps: 1.14 → 1.18 s, unchanged and already optimal). That is the collector /
+        `order_matters` axis, not the pull axis. The target is a scan whose PULL blocks, i.e. every remote read
+        — and **the remote payoff is still UNMEASURED**, so `TryUnionForm`'s remote gate stays put.
+      - **⚠ `fabricator_host_query` IS A BAD INSTRUMENT for this and produced a flat reading I nearly believed**
+        — its BIND runs the inner query (`EXPLAIN` alone costs a full inner execution) and the inner query's
+        threads share the scheduler, so most of a union's wall clock is serial plan time. Its CPU told the real
+        story (4.05 s user before vs 1.00 s after). Use `plug_slow_range` or `fabricator_wait`.
+    - **THE FIX DIRECTION IS DuckDB'S OWN VOCABULARY:** a source that cannot progress must hand its worker
+      back via `SourceResultType::BLOCKED`, which our scan has no path for (it returns rows or EOF).
+      ⚠ `try_lock` + zero rows is a WRONG ANSWER (empty chunk == end of scan) and capping `MaxThreads()` to 1
+      gives back §2's measured 1/N. DuckDB's own arrow scan has the same mutex shape and does not suffer it
+      because its pull is an in-memory read — **the BLOCKING pull is ours, so the fix is ours.** ~~Nothing
+      built.~~ BUILT — see the ✅ entry above, which also corrects this bullet's thread accounting.
+      - **§5g — WHAT THE FIX REACHES (2026-08-21, user-asked; docs §5g).** Covered: every scan whose rows come
+        from `function.function`, i.e. all nine `ArrowStreamScan` registrations (the `ITable` catalog scan,
+        catalog-bound + global table functions, `fabricator_query`/`_functions`/`_server_info`/`host_query`) —
+        one implementation, so every provider. **NOT covered: the table-in-out exchange and the collector**,
+        which produce rows from `in_out_function`, a separate branch of `GetDataInternal` with a separate
+        blocking mechanism (`BlockSource` + interrupt-state parking) that `scan_wait` cannot reach.
+        - **⚠ AND THEY CANNOT HAVE THE BUG: both declare `MaxThreads() == 1`** (`fabricator_schema_entry.cpp`
+          :1643 exchange, :2014 collector — one shared holder buffer per execution). The pile-up needs N tasks
+          on one lock; one task per scan holds ONE worker, which is a blocking call's irreducible cost, not a
+          multiplication of it. **⚠ Corollary: raising either thread count does NOT inherit the fix.**
+        - **⚠ A SECOND GAP, from source and NOT demonstrated: neither declares `get_partition_data`** (only
+          the two ArrowStreamScan sites, :2442/:2594), and `UseBatchIndex` demands EVERY source support it
+          (`plan_insert.cpp:58-68`) — so such a scan would take a whole statement back to §5's single-threaded
+          collector. **⚠⚠ MY TEST OF IT WAS VOID: a 1-row `cf_tag` in-out CROSS JOINED into a sleeping-morsel
+          streaming scan changed nothing (0.62 s either way) — because a JOIN is a sink and `GetSources()`
+          walks only the single-child spine (`physical_operator.cpp:246`; `PhysicalUnion` overrides it for
+          exactly that reason), so the walk never reached the in-out.** Reachable only on the spine or in a
+          UNION, whose own branch serialization confounds the clock ⇒ no measured victim, do not fix on the
+          reading alone.
+        - ⚠ Both paths still pay §2's ORIGINAL cost (a one-thread source makes everything above it
+          single-threaded) — the price of their shared holder, untouched by this work.
+      - **⛔ DECIDED NOT TO DO (2026-08-21, user-raised: "would it make sense to call SetActiveOpener/txn in
+        GetNextBatch before `stream.get_next`?") — NO, and the reason is not cost.** (a) The paths that need
+        the opener during a pull **already thread it as an explicit PARAMETER**, captured once in `Execute`
+        (`DeltaGlobalTableFunction` :84/:181/:1909 → `DeltaReader.GetSchema(opener, …)`, `HostFs.*(opener,
+        …)`), so nothing there reads the ambient at pull time. (b) **It cannot reach the background pump** —
+        `AmbientOpener`/`AmbientTransaction`/`ProviderSettingsStore.CurrentSession` are `AsyncLocal`, which
+        flows by `ExecutionContext` CAPTURED AT `Task.Run` TIME, and `StreamFiles`' pump captured its context
+        in an EARLIER crossing ⇒ the rule ("read every ambient in `Execute`") and the explicit threading would
+        both have to stay anyway. So the proposal makes the FORBIDDEN pattern work rather than fixing a bug,
+        at one or two native→managed transitions PER BATCH on the hottest path (today: zero).
+        - **The one genuine argument FOR it, kept because it names the condition that would flip this:** §8's
+          own rule is resolve-per-use for POINTERS, and `ArrowStreamScan` holds a LIVE `ClientContext &` — so
+          per-pull is strictly fresher than any capture AND is the only reliable placement (a worker thread's
+          AsyncLocal can be clobbered by an unrelated crossing between pulls, so per-local-state does not
+          work). If a pull path ever needs the host FS without a threaded opener, this is where it goes.
+        - ⚠ It would also be a SILENT behaviour change on a hot path: code seeing session 0 during a pull
+          resolves settings from the GLOBAL layer and would start resolving from the SESSION layer, and
+          `DuckDbTableFileSystem`'s cached-opener fallback would stop failing loudly. Neither is gated.
+        - **Cheaper answer if the footgun is what bothers us**: make it structurally impossible managed-side —
+          have the stream factory REQUIRE the opener as a constructor argument instead of letting anything read
+          `AmbientOpener.Current` late. Costs nothing per batch and covers the pump too.
+    - **⚠ TWO INTERMEDIATE READINGS OF MINE WERE WRONG, each refuted by the next measurement:** (a)
+      "`order_matters` chains the branches" — every cell uses a `count(*)` sink where it is FALSE, and the C++
+      control overlaps; (b) "two calls of the SAME function serialize" — refuted the moment a SECOND managed
+      table function existed (`plug_slow_range ∪ plug_slow_range2` = 2382 ms, as serial as the same-function
+      pair). **(b) came from substituting a managed SCALAR for the missing second table function — the §6
+      instrument error again, and the user called it out.** A scalar is expression evaluation, not a scan.
+  - **⚠ UPSTREAM CANDIDATE, the sharpest this area has produced (NOT verified — needs a patched
+    `duckdb_static`):** `PhysicalBufferedCollector::ParallelSink()` returns its `parallel` flag while
+    `SinkOrderDependent()` returns `true` regardless — so under `preserve_insertion_order=false`, where the
+    collector was chosen BECAUSE order does not matter, it still declares order-dependence and still
+    serializes the union. Making `SinkOrderDependent()` follow `parallel` should let the branches overlap;
+    the prediction to measure is the 2486 ms row collapsing toward 1420.
+  - ⚠ **Consequence for us meanwhile: the remote union form gets NO inter-branch concurrency**, so
+    `TryUnionForm`'s cost model must keep assuming its D deletion-vector branches run back-to-back — one more
+    reason its remote gate stays put.
+  - **⚠⚠ AND I MADE THE SAME MISREADING A SECOND TIME WITHIN THE HOUR, on the user's question "what happens
+    with CTAS … UNION ALL". First answer, measured with the per-row SCALAR: DuckDB's own storage sink scales
+    2.5x (4834 → 1928 ms). Re-measured with the SOURCE-side cost after the user asked whether I had used the
+    wait TABLE function: 2467 / 2503 ms — FLAT.** DuckDB's `PhysicalBatchInsert` declares
+    `ParallelSink() == true`, so what chains it is the SAME `RequiredPartitionInfo() == BatchIndex()` clause
+    the batch collector trips. ⇒ **NO sink in DuckDB is exempt** — every one that preserves order or wants
+    batch indices serializes union branches, result collectors and CTAS alike, and
+    `preserve_insertion_order=false` does not help (2419 ms).
+  - **⚠⚠ THE ERROR PATTERN, named because it recurred immediately after being corrected: a per-row SCALAR
+    measures INTRA-branch parallelism, and twice I read its result as a statement about INTER-branch
+    concurrency.** The instrument table now lives in [docs/scan-concurrency.md](docs/scan-concurrency.md) §6:
+    scalar → "does per-thread work get threads"; table function → "do union BRANCHES overlap"; scalar +
+    single source + no union → "is the WRITE sink parallel". **None of the three transfers to the others**,
+    and a wrong pick produces a confident wrong answer rather than a null result.
+  - **⚠⚠ THE FINDING THAT SURVIVED IT, and it is the bigger one because a dbt model IS a CTAS: EVERY WRITE
+    INTO A FABRICATOR TABLE IS SINGLE-TASKED.** Isolated with a single source and NO union, per-row cost, so
+    only the sink differs: streaming **2730 → 1227 ms**, CTAS→DuckDB **2678 → 1224**, CTAS→fabricator
+    **2919 → 2952 (FLAT)**, INSERT→fabricator **2954 → 3021 (FLAT)**. ⇒ neither the `MaxThreads` fix nor
+    `get_partition_data` reaches ANY write path. Cause is ours and our own comment states it
+    (`src/dml/fabricator_insert.cpp`: *"The sink is serial (ParallelSink defaults to false), so no lock is
+    needed"*), and `ScheduleParallel` tests that flag FIRST.
+    - **The blocker is ONE managed line — `BulkSession`'s channel is `SingleWriter = true`** — and flipping it
+      is NOT free: batch ORDER becomes nondeterministic across threads, which is fine for a SQL Server bulk
+      load and WRONG for `SORTED BY`/clustered Delta writes (a host-side sort feeds this very sink), and file
+      LAYOUT stops being deterministic because `BudgetedStream` cuts files at batch boundaries. Parallel by
+      default with the ordered-write paths opting out is the plausible shape — a decision, not a flag flip.
+      Recorded as docs/scan-concurrency.md §7a. **Nothing built.**
+  - **⚠ TWO SAFETY QUESTIONS, checked in DuckDB's source rather than assumed.** (a) Two union branches each
+    counting from 0 CANNOT collide: `PipelineExecutor::NextBatch` emits `pipeline.base_batch_index +
+    batch_index + 1` and `MetaPipeline` gives every pipeline a distinct base, so a source's counter is a
+    pipeline-RELATIVE offset by construction — which is also why our post-increment-from-0 and DuckDB's
+    pre-increment-from-1 are equivalent. (b) Overflowing into the next pipeline's range needs ~2e16 rows
+    (`BATCH_INCREMENT` is 1e13) and THROWS rather than silently reordering.
+  - **⚠ THE ROUTING ITSELF IS NOT GATED, and the suite says so rather than implying coverage.** No row moves,
+    and NOTHING prints the collector (`EXPLAIN` does not; `EXPLAIN ANALYZE` reports only `Total Time` —
+    checked). The only observable is wall clock, and proving parallelism needs an UPPER bound on time, the
+    flaky direction. What stands behind it: both tiers IDENTICAL — hermetic **72/72 — 7719** with every
+    plan-sensitive suite at its exact prior count (batched_read 399, subplan_dedup 36, statistics 27,
+    merge_into 239, clustered_optimize 147) — plus the measurements and the source chain. A regression here
+    would be silent and SLOW, never wrong.
+  - **The upstream observation SURVIVES the fix**: nothing signals the consumer when a chunk lands in the
+    buffer, so any source that cannot supply a batch index still pays what we were paying.
+    `SimpleBufferedData::Append` should notify `task_reschedule`. Not filed.
+- **✅ THE PARALLEL WRITE SINK — BUILT 2026-08-22 (C++ + one managed line, NO ABI change), user-directed. Full
+  record: [docs/scan-concurrency.md](docs/scan-concurrency.md) §7c.** `FabricatorPhysicalInsert`,
+  `FabricatorPhysicalCreateTableAs` and (same day) `FabricatorPhysicalDelete` / `FabricatorPhysicalUpdate`
+  override `ParallelSink()`, decided at plan time by ONE `FabricatorParallelWrite` so the four cannot drift;
+  `BulkSession`'s channel is `SingleWriter = false`; COPY gets an `execution_mode` callback. MEASURED, 2M rows + 8 md5 rounds, `SET threads` the only variable, with a CTAS
+  into DuckDB's OWN storage as the control that the machine scales: **CTAS 3.49 → 2.13 s (1.64x)**,
+  **INSERT 3.29 → 1.98 s (1.66x)**, control 2.70 → 1.04 (2.60x). The gap to the control is the sink's own
+  consumer (~1.1 s of local parquet on one pool thread), i.e. §7b's predicted CPU/IO split, not a residue of
+  serialization.
+  - **⚠ THE GATE IGNORES `preserve_insertion_order`, where DuckDB's own `PlanInsert` does not — and that is a
+    property of the TARGET rather than a liberty.** The setting is about the order of a RESULT handed to a
+    client and DuckDB's inserts must honour it because its storage IS ordered; a fabricator table has no
+    insertion order of its own (a scan returns rows in whatever order the provider yields). So the only
+    ordering that must survive is one the PLAN states — `OrderPreservationRecursive(*plan) != FIXED_ORDER`,
+    plus `threads > 1` and `!returning`. Cost, stated rather than implied: a table getting file clustering
+    INCIDENTALLY from source order stops getting it (pruning quality, never a wrong answer). A DECLARED sort
+    is untouched — §7a's correction paying off, since `SortStream` sorts DOWNSTREAM of the channel.
+  - **⚠⚠ AN EXPLICIT `ORDER BY` WRITE LOSES ALMOST NOTHING BY STAYING SERIAL, AND MY OWN README SENTENCE
+    ("at the cost of one task") WAS WRONG UNTIL I MEASURED IT.** A sort SPLITS the plan: `PhysicalOrder` is a
+    blocking sink that declares `ParallelSink()` TRUE, so the scan and the projection live in their own
+    parallel pipeline and only the sort→our-sink pipeline is serialized by us. MEASURED **3.62 → 1.90 s**,
+    within noise of the unordered 2.13. ⇒ **the reorder-buffer / `RequiredPartitionInfo() == BatchIndex()`
+    route is RE-PRICED DOWNWARD** — it would buy the residue of a cheap pipeline, not the 1.64x. Do not build
+    it on the assumption that ordered writes are slow.
+  - **⚠ THE HANDOFF'S OWN "stepping stone" DOES NOT EXIST FOR A SINK.** §7a offered shape (b) — try-push,
+    return BLOCKED, wait with a timeout, a `scan_wait` mirror. `OperatorSinkInput` carries NO `async_result`,
+    so §5f's AsyncTask mechanism is unreachable from a sink; the only route is `BlockSink`, woken by nothing
+    until someone holding the same lock calls `UnblockTasks`, and only the MANAGED consumer knows when space
+    appears. ⇒ it needs a managed→host wake (a `FabricatorHostServices` entry + a shared wake object with a
+    cleared-at-teardown gstate pointer), which is a design, not a flag — so **steps 1–2 of the handoff
+    (`push_batch_try` + ownership-on-acceptance) were deliberately NOT built: without the wake they are dead
+    code carrying their own ownership hazard.**
+  - **⚠ AND `BlockSink` RETURNS `FINISHED` WHEN `can_block` IS FALSE** (`interrupt.hpp:104`), which tells the
+    pipeline to STOP FEEDING THE SINK — so a sink treating "BlockSink returned" as "I am blocked" drops the
+    rest of its input SILENTLY. Check `CanBlock(guard)` first and fall back to the blocking push.
+  - **⚠ THE PARKED WORKERS CANNOT DEADLOCK, established from DuckDB's source rather than assumed** — which is
+    what makes shipping without the wake defensible. The bulk consumer is a .NET pool thread, never a DuckDB
+    worker; and the one shape that looked like a cycle (the staged `COPY INTO` route, whose consumer runs a
+    DuckDB query of its own) is safe because `Executor::ExecuteTask` fetches from the CALLING thread's own
+    producer queue and executes the task itself (`executor.cpp:569-590`). The cost is co-tenant latency: one
+    parked worker became N.
+  - **COPY got the same prize through a different door and a STRICTER gate, and BOTH halves are measured.**
+    `PhysicalCopyToFile::ParallelSink()` reads the copy FUNCTION's `execution_mode`, and that callback is
+    handed BOOLEANS — `preserve_insertion_order` is already true for an explicit `ORDER BY` *and* for the
+    default setting, indistinguishable from inside. So COPY is parallel only when the setting is off (exactly
+    DuckDB's parquet writer), i.e. **serial by default where INSERT/CTAS are parallel by default** — an
+    inconsistency with a cause, liftable only with the plan. MEASURED: order-preserving **3.21/3.38 s FLAT**
+    (the control that says the gate is the setting), setting off **3.41 → 2.07 s**. ⚠ `BATCH_COPY_TO_FILE` is
+    NOT claimed even where `supports_batch_index` holds — it needs `prepare_batch`/`flush_batch`, i.e. the
+    unbuilt reorder buffer, and claiming it without them throws at planning.
+  - **The MERGE comment was re-derived and one of its two reasons is DEAD**: "PushBatch takes no lock, safe
+    only because ParallelSink() is false" no longer holds. What survives alone: `PhysicalMergeInto` drives our
+    sub-operators MANUALLY over ONE shared global sink state, so their `ParallelSink()` is never consulted
+    there — and the merge's INSERT action builds `FabricatorInsertTarget` directly, leaving `parallel` at its
+    false default. Whether MERGE could go parallel is a separate decision.
+  - Gates: hermetic **73/73 — 7818** (floor 7750 → 7818: `verify_delta_catalog_write` 43 → 54 plus
+    `_delete` 28 → 39 and `_update` 84 → 96, all ENGINE-DOUBLED, and no other suite moved) and service **52/52 — 2170** (`verify_plugin` 49 → **79**, floor 2140 → 2170). ⚠ The
+    parallel-write section made `verify_plugin` the FIRST plugin suite to WRITE, and it failed on the first
+    tier run for the reason already recorded twice here: **no `require parquet`** — the sqllogictest runner
+    does not auto-load a statically linked extension the way the shell does, so the Delta write died inside
+    DuckDB's COPY with a message about the writer inside a suite about plugins. ⚠ The
+    hermetic section's source must be a fabricator TABLE, not `range()` — a single-threaded source (§6) gives
+    the sink ONE task however many threads are set, and the section would pass while exercising nothing; and
+    it needs ≥ a few morsels, since the handful of rows the rest of that suite writes is one chunk and one
+    push. ⚠ `SET threads=1` IS the pre-change leg (the gate returns false at one thread), so the service
+    ratio is a same-binary A/B — §7b had recorded that no such lever existed for a sink.
+  - **⚠⚠ AN EXPLICIT `ORDER BY` WRITE STILL SCALES, so the reorder-buffer route is RE-PRICED DOWNWARD** — see
+    the box above; and **incidentally the runner had a real bug this pass surfaced: a COMMENT in
+    `run-suites.sh` was SPLIT BY A LITERAL NEWLINE**, so its second half (`epos\... - which`) was EXECUTED and
+    printed `epos...: command not found` on every service-tier run that reached `verify_plugin_install`. Noise
+    nobody had chased; joined.
+  - **✅ THE ROWID DML SINKS FOLLOWED THE SAME DAY, and DELETE is the LARGEST ratio of the pass.** Their scan,
+    filter and rowid append sit in the SAME pipeline as the sink. MEASURED before/after on 2 M rows with the
+    CPU term in the PREDICATE: **DELETE 3.2 s flat → 3.22 → 1.36 s (2.37x)**, **UPDATE 7.2 s flat →
+    7.15 → 5.00 s (1.43x)**. DELETE gains most because its whole cost IS that pipeline (the provider writes one
+    deletion vector at Finalize); the UPDATE residue is the read-back + post-image write inside
+    `ExecuteUpdate`, serial by construction.
+    - **⚠ THE PRE-FLIP UPDATE ALREADY BURNED THE THREADS FOR NOTHING — 7.7 s user CPU at threads=1 vs
+      10.5–12.5 s at threads=4 for the SAME wall clock.** That is the provider-side host queries taking threads
+      while the statement's own pipeline could not; "CPU up, clock flat" read like contention and was really one
+      half paying for what the other half could not use.
+    - One line, because `AppendModifyBatch` ALREADY locked its only shared mutation — that lock is now
+      load-bearing rather than defensive, and its comment says so.
+    - **⚠ MY RECORDED CAUTION HERE WAS OVER-CAUTIOUS AND THE PRECEDENT SETTLES IT: DuckDB's OWN
+      `PhysicalUpdate` and `PhysicalDelete` declare `ParallelSink()` TRUE UNCONDITIONALLY** — no order gate, no
+      duplicate-match gate (`physical_update.hpp:61`, `physical_delete.hpp:52`). The `ON CONFLICT DO UPDATE`
+      serialization I cited is the INSERT operator, and it serializes to DETECT the double update in order to
+      ERROR, which is a different thing. ⚠ The consequence is still real and now documented: a duplicate-match
+      `UPDATE … FROM other` is last-write-wins and which write wins becomes arbitrary (it followed a hash
+      join's probe order, so it was never a promise — but it was stable).
+    - Gates: `verify_delta_catalog_delete` 28 → **39**, `verify_delta_catalog_update` 84 → **96** (both
+      engine-doubled, ~20 morsels; the UPDATE one asserts a DERIVED value per row because a pairing bug writes
+      to the WRONG row, which no count sees), `verify_plugin` 66 → **79**. **Mutation-tested**: forcing the
+      modify flag false dies at exactly the DELETE ratio after 74 pass while BOTH correctness suites stay
+      green — the right kill, since a parallel DELETE returns the same rows.
+  - **⚠ `ChannelCapacity = 8` IS NOT THE CONSTRAINT — MEASURED 2026-08-22, so it stops being an open
+    question.** Two 2 M-row CTAS statements at threads=4, capacity the only variable (republished per cell):
+    **8 → 1.87/1.26 s, 32 → 1.79/1.30 s, 128 → 1.83/1.28 s** — indistinguishable. Stays at 8; its job is to
+    bound memory. ⚠ LOCAL shape only; a remote consumer is part of the unmeasured remote payoff.
+  - **⚠⚠ THE `LOAD` CRASH THAT BLOCKED THIS WAS NEVER REAL — WITHDRAWN 2026-08-22, and the sequence of my own
+    errors is the lesson.** I probed with a venv, hit a segfault, recorded it as limitation 1.20, narrowed it
+    twice on CI evidence, and only BOUNDING it showed there was no defect: the probe venv had duckdb
+    pip-installed **from a local source tree** (`direct_url.json` = `file:///.../scratchpad/pyduck`, a
+    `project(duckdb_python)` checkout) — 41,451,008 bytes against the official wheel's 37,374,464, and
+    `Requires-Python >=3.11` against `>=3.10`. A version MATCH with an ABI MISMATCH crashes at load. In a
+    FRESH venv holding only the official `duckdb==1.5.5`, **both the CI-built artifact and our local loadable
+    load and report `0.0.11`**. ⚠ **Before recording a defect seen locally, verify the environment is the one
+    users have.** (`pyarrow` was tested and exonerated; dbt-duckdb and the notebook flow are unaffected.)
+  - **⛔ SO THE WAKE IS NOW DECIDED BY MEASUREMENT, AND THE ANSWER IS: DO NOT BUILD IT.** Two connections in
+    ONE process, the write's consumer deliberately SLOW (SQL Server over TDS, 400k rows, ~2.4 s) so sink tasks
+    really park: the co-tenant goes **1440 → 1599 ms (+11%) at threads=1** and **156 → 192 ms (+23%) at
+    threads=20**, with the write itself 2.41 → 4.99 s when a heavy co-tenant is present. That is ordinary
+    contention — if N-1 of 20 workers were parked in `Push` it would be ~20x, not 1.23x (capacity 8 plus a
+    draining consumer means producers CYCLE through parking rather than all parking at once).
+    - **⚠ THE CONTROL IS WHAT MAKES THE CELL MEAN ANYTHING: 1440 → 156 ms alone is a 9.2x speedup from `SET
+      threads`, proving the co-tenant COMPETES FOR WORKERS.** Three earlier probes did not and each looked
+      like a clean negative: a `count(*)` over `range()` (runs on the caller's own thread via
+      `Executor::ExecuteTask`, needs no worker) and an md5 aggregate over `range()` (**750 ms at threads=1 AND
+      at threads=20** — `range` is a single-threaded source, §6, for the THIRD time in one session). Only a
+      DuckDB NATIVE table gives a parallel co-tenant.
+    - ⇒ an ABI entry + a host-services addition + a shared-wake lifetime protocol, to recover ~20% of a
+      co-tenant's latency in the one shape that provokes it, is not worth it. **CLOSED, not deferred.** What
+      would reopen it: a measured case where a fabricator write STALLS another statement rather than sharing
+      with it.
+    - **⚠ AND RE-EVALUATE IT AT THE DuckDB 2.0 / `main` BUMP (user-raised) — "closed" means closed AT TODAY'S
+      COST, and main has done substantially more async work. CHECKED against a fetched `origin/main`, not
+      assumed.** Still shut: `OperatorSinkInput` there is BYTE-IDENTICAL (no `async_result`). But the surface
+      roughly DOUBLED — files touching `async_result` **10 → 19**, `AsyncTask`/`AsyncResult` **17 → 34**,
+      `SinkResultType::BLOCKED` sites **10 → 15** — and **the pattern the wake needs already exists there
+      under another name**: main's `multi_file_read_ahead.cpp` has `ReadAheadJobCompletion` with
+      **`TryPark(const InterruptState &)`** / `FinishIOTask()` / `WaitForIO()`, i.e. park-on-an-interrupt-state
+      and complete-from-elsewhere — and a SINK HAS an `InterruptState`. If that becomes reusable, the wake
+      needs no host-services entry and no bespoke lifetime protocol. Also new there: `CallbackAsyncTask` and
+      **`AsyncTask::GetIOSize()`** (absent from 1.5.5 entirely), the first of which would let §5f's own
+      source-side wait complete on a NOTIFY instead of its 1–16 ms backoff. ⇒ at the bump, re-derive the wake,
+      §5f's backoff and §10 item 6 (prefetch — which main is BUILDING, in that same read-ahead file) TOGETHER,
+      and re-take the co-tenant cell, since a cheaper mechanism moves the verdict even though the 23% does not.
+  - **⛔ THE REMOTE PAYOFF IS MEASURED (live Fabric, 2026-08-22, user-enabled) AND IT IS NIL — §7b's
+    compositional claim is REFUTED. Full record: [docs/scan-concurrency.md](docs/scan-concurrency.md) §7e.**
+    `lake.dbo.his`, 89 files, 659,278 rows, row counts verified on both warehouse routes. EVERY remote shape
+    is FLAT in `SET threads`: lake→lake 3 columns **5.93/6.23 vs 6.68/5.53 s**; lake→lake with 8 md5 rounds
+    **5.56 vs 5.63/5.57**; lake→warehouse STAGED **6.36/6.22 vs 7.51/6.73**; lake→warehouse TDS
+    **39.77 vs 37.93**.
+    - **WHY, and it BOUNDS §7c rather than breaking it**: user CPU is 0.47–3.67 s inside a ~6 s wall (1.2–18.6
+      inside ~38 s on TDS), so these statements are latency-bound and the term a parallel sink reduces is a
+      small share of the clock. ⚠ The threads=4 legs consistently burn MORE CPU for the SAME wall time — the
+      parallel work happens, it just never reaches the critical path. §7b was right about the MECHANISM and
+      wrong about the SIZE remotely; the 1.6x–2.4x local wins stand.
+    - **⚠⚠ THE FIRST TWO RUNS SAID 3.7x AND BOTH WERE VOID — the reusable part.** "threads=1 then 4" gave
+      22.74 → 6.15 s; REVERSING it inverted the result (4 first 17.60, 1 second 5.33), so the variable was RUN
+      POSITION — OneLake first-touch costs ~12–17 s the second statement does not pay. ⚠ And my warm-up was
+      void: **`SELECT count(*)` on a Delta table is answered FROM THE LOG** and opens no data file; only
+      `count(<each column read>)` warms it. ⇒ the settling shape is INTERLEAVED **1,4,1,4 after a real
+      warm-up**, because two cells on a remote store cannot separate position from the variable, and two
+      ORDERS only prove that position matters.
+    - **THE ONE STRONG POSITIVE, superseding a stale pair: staged `COPY INTO` is ~6x faster than TDS** —
+      6.2–7.5 s vs 37.9–39.8 s, same shape, same session, counts verified. The recorded 14.5–16.1 vs
+      16.8–28.9 s (2026-08-10) was a different shape and only ~1.2x apart; retired. `mssql_copy_into_staging`
+      is the biggest lever on a lake→warehouse load and the parallel sink changes nothing about that. ⚠ Also
+      the first live validation of that route in a while; the staging location must be the GUID form, and the
+      whole rig is discoverable from one lakehouse attach via `lake.fabric.workspaces()` / `.items()` /
+      `.warehouses()` (the last returns the SQL endpoint connstr).
+
+- **⛔ `TableFunction::order_preservation_type` — ANALYSED + PROBED 2026-08-22 (user-raised), NOT ADOPTED. Full
+  record: [docs/scan-concurrency.md](docs/scan-concurrency.md) §7d.** The knob a scan uses to tell DuckDB "my
+  rows have no order". Default `INSERTION_ORDER`, and **not one function in DuckDB's own tree overrides it, on
+  1.5.5 OR on `main`** (a fetch of `origin/main` finds exactly ONE assignment: the default) — we would be first.
+  - **⚠ IT CORRECTS §7c: "the COPY gate is liftable only with an upstream signature change" IS WRONG.** True of
+    the `execution_mode` callback (it is handed booleans) and false as a conclusion — `plan_copy_to_file`
+    derives `preserve_insertion_order` FROM THE PLAN, so a scan declaring `NO_ORDER` makes COPY parallel by
+    default while an explicit `ORDER BY` still wins (`OrderPreservationRecursive` short-circuits at the first
+    source; `PhysicalOrder` is a source returning FIXED_ORDER). The discrimination need not happen in the
+    callback.
+  - Three readers → two mechanisms: `PhysicalTableScan::SourceOrder` AND
+    `PhysicalTableInOutFunction::OperatorOrder` (so the same field governs our SCANS *and* our in-out
+    operators), feeding `PreserveInsertionOrder` (5 sites: both collectors, copy, insert/CTAS, limit) and
+    `Pipeline::IsOrderDependent` (2: union `order_matters`, operator caching).
+  - **NOT a union fix** — `NO_ORDER` short-circuits ONE of five `order_matters` clauses and the SINK's fires
+    regardless. Confirms §5a from the other direction.
+  - **⚠ THE USER'S INSTINCT ABOUT `main` IS RIGHT IN DIRECTION**: semantics there are identical
+    (`IsOrderDependent` byte-identical, still only the default assignment) but there is a NEW consumer —
+    `PipelineBroadcastExchange` carries a `source_order` and derives an `order_mode` (UNORDERED / SEQUENTIAL /
+    BATCH_INDEX) that `PhysicalCTE` consults. The type is being wired into new scheduling on the future line.
+  - **THE COST, MEASURED — and the first instrument was VOID.** 400k rows, one file, threads=8, one chunk in
+    eight ~200x heavier: `SELECT id FROM (<uneven projection>) WHERE id % 997 = 0 LIMIT 12` returns the SAME
+    ascending 12 rows 4/4 on the shipped build and a DIFFERENT non-ascending 12 on EVERY run under `NO_ORDER`.
+    ⚠ My first probe was `md5(string_agg(id,','))`, which varies on BOTH legs because a parallel aggregate
+    combines partial states in arbitrary order — a positional fingerprint must be an ARRIVAL-ORDER observable,
+    never an aggregate. ⚠⚠ **And the hermetic tier is GREEN under it (73/73 — 7818, zero failures), which is a
+    VACUOUS PASS**: the suites are small and uniform so the collector happens to emit in order. Do not clear
+    this change with a tier run.
+  - **If ever exposed to C#, expose a BOOLEAN, not the enum.** Per-table is expressible (`GetScanFunction`
+    builds a FRESH TableFunction per table REFERENCE, so it is per-bind decidable like the
+    `exact_filter_pushdown` follow-on, riding the v73 `table_info` doc) — but `FIXED_ORDER` is a TRAP: nothing
+    reads it to eliminate a redundant `ORDER BY`, it makes `IsOrderDependent` true, and **since §7c it would
+    make `FabricatorParallelWrite` return FALSE**, silently serializing every write that reads that table.
+  - **Not adopted because of the SHAPE of the trade**: the concrete win is parallel COPY by default, which
+    already has a one-line workaround (`SET preserve_insertion_order=false`), against an unordered `SELECT`
+    losing its stable order and a bare `LIMIT` returning arbitrary rows. If ever wanted: an OPT-IN (ATTACH
+    option / per-table declaration), never a blanket default.
+
+- **⏭ HISTORY — the handoff for the parallel write sink, BUILT 2026-08-22 (see the ✅ entry above). Every prediction in it held except two, both corrected there: THE PARALLEL WRITE SINK — every write into a fabricator
+  table is single-tasked. Full implementation surface, order of work, gates and kill condition:
+  [docs/scan-concurrency.md](docs/scan-concurrency.md) §7b (read §7a first for the measurement).**
+  MEASURED (§7a): CTAS→fabricator **2919 / 2952 ms** and INSERT **2954 / 3021 ms** at threads 1 vs 4 — FLAT —
+  against **2730 → 1227 ms** for the same work streaming to the client. Neither the `MaxThreads` fix nor
+  `get_partition_data` nor §5f reaches any write path.
+  - **⚠ THE CAUSE IS C++, NOT THE CHANNEL, and the obvious reading is backwards.** `ParallelSink()` is never
+    overridden on `FabricatorPhysicalInsert` (`src/dml/fabricator_insert.cpp:101`) or
+    `FabricatorPhysicalCreateTableAs` (`fabricator_ctas.cpp:79`), so it defaults to FALSE and
+    `Pipeline::ScheduleParallel` tests `!sink->ParallelSink()` FIRST — one task for the whole source pipeline.
+    `BulkSession`'s `SingleWriter = true` (a `BoundedChannelOptions` property, `BulkSession.cs:45`) and the
+    lock-free `Push` are CONSEQUENCES: flipping `SingleWriter` alone changes nothing, and flipping
+    `ParallelSink` without it is a correctness bug.
+  - **⚠ IT NEEDS THE §5f TREATMENT ON THE SINK SIDE, and the sink can do it BETTER than the source could.**
+    With N sink tasks on a bounded channel whose consumer is ONE pool thread, a slow load fills the channel and
+    every worker parks inside `Push` — §5c mirrored, and here it is the STEADY STATE (the bound IS the
+    backpressure). But `OperatorSinkInput` carries `interrupt_state` and `GlobalSinkState` already derives from
+    `StateWithBlockableTasks`, so `BlockSink` parks a task holding **NO worker** — which `ArrowStreamScan`
+    could not do (its branch is handed no interrupt state, hence the AsyncTask).
+  - **The channel already has both primitives** (user-raised): `Writer.TryWrite` is synchronous and returns
+    false when a `FullMode.Wait` channel is full, and `Writer.WaitToWriteAsync()` mirrors the consumer's
+    existing `WaitToReadAsync()` (`BulkSession.cs:94`). So shape (b) — a `scan_wait` mirror — needs no new
+    host-service direction at all; shape (a) (park + a managed→host wake) holds zero workers and is the target.
+  - **⚠ THREE TRAPS, the first turning an error into a HANG:** `TryWrite`'s `false` conflates FULL with
+    CHANNEL-COMPLETED (consumer faulted) ⇒ the entry needs a THREE-way answer or a failed load parks forever;
+    a BLOCKED sink gets the SAME CHUNK RE-DELIVERED (`remaining_sink_chunk = true`) ⇒ take ownership of the
+    Arrow array ONLY on acceptance, where `Push` takes it unconditionally today; and `ChannelCapacity = 8` is
+    less headroom PER PRODUCER once there are N.
+  - **⚠ A CLAIM OF MINE IN §7a WAS WRONG AND THE CORRECTION REMOVES THE BIGGEST APPARENT BLOCKER.** It said a
+    parallel sink would destroy `SORTED BY` / clustered writes because "a host-side sort feeds this very sink".
+    It does not: `DeltaCatalog.SortStream` (`:1360`, applied at `:2388`) runs a GLOBAL host-engine `ORDER BY`
+    over the channel-fed stream, i.e. DOWNSTREAM of the channel — producers interleaving upstream cannot
+    disturb an ordering imposed afterwards. What IS exposed is narrower: an explicit `INSERT … ORDER BY x` with
+    no sort DECLARED on the table, where arrival order is the only carrier. Costs file clustering, never a
+    wrong answer.
+  - **⚠⚠ A "KILL CONDITION" I RECORDED HERE WAS WRONG (user-raised, corrected 2026-08-21): "if the consumer is
+    the bottleneck, parallel producers buy nothing".** FALSE, and the reason is the causal fact that makes the
+    whole item worth doing: **`ParallelSink() == false` serializes the WHOLE PIPELINE, not just the sink** —
+    `Pipeline::ScheduleParallel` tests `!sink->ParallelSink()` at `pipeline.cpp:103`, BEFORE the source, the
+    operators or `MaxThreads()`, and falls to `ScheduleSequentialTask` (`:175`). So the producers are not
+    merely filling a channel, they are doing ALL of the query's CPU work on one task. Parallelising them takes
+    a statement from ~*CPU + IO* toward *max(CPU/N, IO)*, so the win SURVIVES an IO-bound sink (which a remote
+    target always is). Measure the CPU/IO SPLIT to predict the SIZE of the win, not whether there is one.
+  - **⚠ THE ORDER-PRESERVING ROUTE EXISTS AND §5f IS ITS PREREQUISITE — newly available, not overlooked.**
+    DuckDB does NOT protect an ordered write from a sink that declares itself parallel (`ParallelSink()` is a
+    virtual nothing second-guesses). What it offers is the mechanism its OWN insert uses: a sink declaring
+    `RequiredPartitionInfo() == BatchIndex()` gets chunks TAGGED in order even under N readers, and
+    `PhysicalOrder` cooperates fully (`ParallelSource()` true, `SupportsPartitioning(BatchIndex())` true,
+    `SourceOrder() == FIXED_ORDER`). Needs a reorder buffer ahead of the channel. ⚠ **Gate it PER PLAN or it
+    is an InternalException** (`pipeline.cpp:120-124` throws when such a sink meets a source that cannot supply
+    one) — DuckDB gates its own with the public `PhysicalPlanGenerator::UseBatchIndex(context, plan)`
+    (`plan_insert.cpp:58`), and we build the operator in our own `PlanInsert`, so we can call it there. ⚠ Before
+    §5f our scans declared `get_partition_data` NOWHERE, so this option did not exist for us at all.
+  - **⚠ THE STAGED `COPY INTO` ROUTE IS WHERE THIS PAYS MOST, AND IT HANDS DuckDB'S OWN ARROW SCAN A BLOCKING
+    PULL (user-raised 2026-08-21; REASONED, NOT MEASURED — docs §7b).** With `mssql_copy_into_staging` the
+    consumer is `HostParquetStaging.WriteDirectory` (`HostParquetStaging.cs:44`), which binds the
+    channel-backed stream into `COPY (SELECT * FROM …) TO '<dir>' (FORMAT parquet, PER_THREAD_OUTPUT true)`.
+    ⚠ **SEPARATE THE TWO SIDES (user-corrected):** the CONSUMER side is already parallel and none of our work
+    touches it (DuckDB's own arrow scan + a `PER_THREAD_OUTPUT` COPY sink, upstream both ends) — its speedup
+    over TDS is parallel parquet ENCODING, not a faster pull. **The PRODUCER side is where §2, §5 and §5f are
+    all currently DEAD**: a CTAS from a fabricator table is ONE pipeline, a serial sink makes it ONE TASK, so
+    `MaxThreads()` is never read, `get_partition_data` has nothing to reorder, and **§5f is INERT — one task
+    means no lock contention to hand a worker back from.** ⇒ **§7b is COMPOSITIONAL: it activates the three
+    read-path fixes on every write**, and a lake→warehouse staged load is where they compound (a remote Delta
+    scan whose pull blocks, feeding a consumer that is no longer the limit). This is the route to MEASURE it on. ⚠ The staged-vs-drained numbers
+    (14.5–16.1 vs 16.8–28.9 s, 2026-08-10) predate the MaxThreads fix and §5f — re-take them.
+    - **⚠ It QUALIFIES §5d's claim that the blocking pull is OURS** ("DuckDB's own arrow scan does not suffer
+      it because its pull is an in-memory read"): true of a MATERIALIZED Arrow table, FALSE of a channel-backed
+      one. `ChannelArrowStream` blocks when the producer is behind while DuckDB's arrow scan declares
+      `NumberOfThreads()` and serializes under a global mutex — the §5c shape inside upstream code we cannot
+      apply §5f to. Live TODAY on this route (one producer task ⇒ often-empty channel), self-shrinking once
+      §7b lands. ⚠ No CI sees it: `verify_copy_into_staging`'s positive leg is manual/live-Fabric.
+    - Upstream-shaped, not filed: a bound arrow input CAN block, so DuckDB's arrow scan should hand its worker
+      back or cap threads for a producer-backed stream. Stock repro: a python `RecordBatchReader` that sleeps.
+  - ⚠ `PhysicalMergeInto(parallel=false)` (`fabricator_merge_into.cpp:200-207`) cites `Push`'s lock-freedom as
+    one of its TWO reasons; this work invalidates that one. The other (every action shares ONE global sink
+    state) survives, so MERGE stays serial — but the comment must then say so for the right reason.
+- **SCAN CONCURRENCY HAS A DOC AND A MEASURING INSTRUMENT — BUILT 2026-08-21 (docs + the sample plugin;
+  C#-only, no ABI), user-directed. [docs/scan-concurrency.md](docs/scan-concurrency.md); gate
+  `verify_plugin` 17 -> 38 (service tier, floor 2108 -> 2129).** The parallel-scan work was argued only in
+  `38189db`/`e9f4b13` and in code comments, and **CLAUDE.md is UNTRACKED** — so every measured fact about
+  `SET threads` on a fabricator scan lived on one machine. The doc consolidates: the pull-serialized /
+  convert-parallel shape, `MaxThreads` in BOTH directions, the batch-is-also-a-file coupling, the streaming x
+  `PhysicalUnion` scheduler stall, and the two invariants a parallel pull imposes (§8).
+  - **NEW `plug_sleep(millis)` in `Fabricator.SamplePlugin`** — a global scalar that blocks its worker once
+    per ROW. It is an INSTRUMENT, not a feature: it makes a query's cost a number the caller chose, so
+    effective parallelism is arithmetic instead of an inference, and it is the reproducible target for
+    [docs/cancellation.md](docs/cancellation.md) (a query parked inside one long-blocking managed call).
+    A NEGATIVE argument is REFUSED because `Thread.Sleep(-1)` is `Timeout.Infinite` — in a suite a hang is
+    the one failure worse than a failure — and there is deliberately NO cap, since capping would make it
+    stop being the thing under test.
+  - **⚠⚠ MY FIRST EXAMPLE IN THE DOC WAS AN ARITHMETIC PREDICTION AND MEASURING IT KILLED IT — TWICE OVER.**
+    I wrote `SELECT sum(plug_sleep(50)) FROM range(80)` as "~4.0 s serial, ~0.5 s at threads=8". MEASURED:
+    **5306 ms at threads=1 and 5366 ms at threads=8** — 80 rows are ONE chunk, and `range` would not have
+    split them anyway (the identical one-sleep-per-morsel expression over `range(8192)` shows 2408/2366/2381
+    ms at threads 1/2/4, i.e. `range` is a SINGLE-THREADED source). The working shape is one sleep per
+    MORSEL over a FABRICATOR table: 8192 rows = 4 morsels, `CASE WHEN id % 2048 = 0 THEN 500 ELSE 0 END` ⇒
+    **threads=1 2650/2678 ms, threads=4 1137/1102 ms against a 589/599 ms all-sleeps-zero baseline**, i.e. a
+    sleep term of ~2060 ms -> ~505 ms = exactly 4x. **The `range` leg is the control that attributes it to
+    the scan declaring threads and to nothing else.**
+  - **⚠ ON WINDOWS THE SLEEP FLOOR IS THE TIMER TICK, ~15 ms — MEASURED (100 rows at `plug_sleep(1)` cost
+    1913 ms against a 343 ms baseline).** So a small argument is a lie by 15x, and per-ROW sleeping is
+    impractical as a scan probe at all: a morsel is 2048 rows, so even 1 ms per row is ~31 s per morsel.
+    Deliberately NOT worked around — raising the resolution is a process-wide `timeBeginPeriod`, which a
+    test helper has no business calling on its host's behalf.
+  - **⚠ `sum()`, NEVER `count(*)`, and the suite says so** — DuckDB PRUNES a projected column no aggregate
+    consumes, so `count(*)` over `plug_sleep(...)` evaluates it ZERO times and the measurement reads as
+    instant parallelism with the instrument never called. Third distinct appearance of that trap here.
+  - ⚠ It must stay VOLATILE (the `IScalarFunction.IsVolatile` default): a CONSISTENT scalar over a constant
+    argument FOLDS at plan time, sleeping once during binding and never again.
+  - **`plug_slow_range(rows, millis)` IS THE SOURCE-SIDE TWIN (added the same day)** — a global TABLE function
+    yielding 2048-row batches and sleeping per BATCH, so the cost sits INSIDE `get_next`. The PAIR is what turns
+    §1's pull-serialized/convert-parallel claim into a measurement instead of a reading of the source: cost in
+    the SOURCE is **2451 vs 2454 ms at threads 1 vs 4 — FLAT**, the same cost in the PROJECTION over that same
+    source is **2425 -> 883 ms**. The flat row is the INVARIANT (one mutex around `get_next` is what lets a
+    provider's reader be touched from one thread only), and the scaling row is what proves the `get_partition_data`
+    fix reaches a global table-function scan and not merely the catalog table scan.
+  - Gate assertions: the trivial contract, the negative REFUSAL, and the side effect happening PER ROW —
+    pinned as a LOWER BOUND on elapsed time (20 rows x 60 ms single-threaded, asserted >= 1000 ms), which is
+    the direction a loaded machine can only make more true. `verify_plugin_install` unchanged at 45 (the
+    archive it installs changed; that suite asserts names, not counts).
+
+
+- **A FABRICATOR SCAN NOW USES EVERY THREAD — `MaxThreads()` WAS HARDCODED TO 1, WHICH MADE THE WHOLE
+  PIPELINE ABOVE IT SERIAL (2026-08-18, C++-only, no ABI; `38189db` + `e9f4b13`).** MEASURED, 6M rows,
+  median of 3, `SET threads` the only variable: **CPU-bound (md5/row) 1.42 s → 0.73 s (~1.95x)**.
+  - **The old justification was TRUE and its conclusion too strong**: *"a single Arrow C stream is consumed
+    serially"* is right about `get_next` — but DuckDB's OWN arrow scan declares `NumberOfThreads()` and
+    serializes only the PULL (`ArrowScanParallelStateNext`: mutex → `GetNextChunk()` → **release**, then each
+    thread converts ITS batch, `arrow.cpp:112/116`). Our `GetNextBatch` was already that exact shape, so the
+    **RecordBatch was already the morsel** and only the return value forced serial. What 1 cost was the
+    PIPELINE — a one-thread source makes every operator above it single-threaded, which is what the
+    `UNION ALL` core-saturation trick was hand-working-around.
+  - **`SET threads` IS the knob and needs NO plumbing**: `ThreadsSetting` has `SetGlobal`/`ResetGlobal` and
+    **no `SetLocal`** (`SET SESSION threads=4` ⇒ *"option \"threads\" cannot be set locally"*), so the host
+    query's fresh connection shares the `TaskScheduler`. Captured at `InitGlobal` — `MaxThreads()` gets no
+    context.
+  - **⚠ NOT A WIN ON EVERY SHAPE, AND THE FIRST SHAPE I MEASURED SAID IT WAS A LOSS.** A 50k-group GROUP BY
+    **regresses ~11% at 20 threads** (parallel hash-aggregate merge > the split saves). Stopping there would
+    have concluded threading was a wash; the CPU-heavy shape is what showed 2x. Both real — the aggregate is
+    merge-bound, not scan-bound.
+  - **⚠ SQL Server is safe ONLY because the pull stays serialized** — a `SqlDataReader` is touched exclusively
+    inside `get_next`, under `gstate.main_mutex`; what parallelizes is the Arrow→DuckDB CONVERSION. That was
+    reasoning, so it was gated: the **service tier is the first run of parallel scans against SQL Server**.
+  - **THE EXPORTED BATCH IS THE MORSEL, AND IT WAS VECTOR-SIZED.** Instrumented: **2929 batches of exactly
+    2048 rows + a 1408 tail** for 6M rows, against **49 row groups of 122880** natively (the file's OWN ratio
+    — confirmed 48×122880 + 101760) ⇒ **60x more morsels**, each paying a mutex acquisition + Arrow import +
+    converter setup. Accumulating chunks is worth (6M, CPU-bound GROUP BY, median 3): one-chunk/1t 0.864 s →
+    32768/1t 0.689 s → one-chunk/8t 0.640 s → 32768/8t 0.592 s. **The two levers OVERLAP rather than add**
+    (same overhead), and big batches run far more PREDICTABLY (1.7% spread vs 10%).
+  - **⚠⚠ ACCUMULATION IS DEFAULTED OFF BECAUSE A BATCH IS ALSO A FILE — and "hardcode it to the morsel size"
+    is therefore WRONG.** The host-query stream feeds WRITERS too, and the clustered rewrite cuts files with
+    **`BudgetedStream` (`DeltaReader.cs:2573`)**, which emits its first batch UNCONDITIONALLY then stops at
+    `_rows >= _budget` — it can only cut BETWEEN batches, so **the batch size is a hard FLOOR on file size**.
+    Raising it can only COARSEN layout, never refine it: `delta.targetFileSize` became unenforceable and
+    `verify_delta_clustered_optimize`'s OPTIMIZE collapsed 80000 rows into ONE file. MEASURED —
+    default(122880): **1 failed** after 70 pass; 0 (one chunk): **147 passed**.
+    - **✅ THE FIX IS BUILT — 2026-08-18 (C#-only, no ABI), and it is NOT an ABI parameter: `BudgetedStream`
+      now SPLITS a batch at the budget** with `EngineeredWood.Arrow.ArrowCompute.Take` (1 copy of the
+      BOUNDARY batch only, type-agnostic incl. nested/extension — the property that matters, since a VARIANT
+      column must survive it and a hand-rolled per-type slice would not). The floor is GONE and batch size is
+      now a pure scan-side question on this path. GATE, and it is a true A/B on the one shape that used to
+      break: `verify_delta_clustered_optimize` at `FABRICATOR_HOST_QUERY_BATCH_ROWS=122880` went **1 failed
+      after 70 pass → 147 passed**, with the default leg unchanged at 147.
+      - **THE ACCUMULATED LEG IS NOW PERMANENT IN `run-suites.sh` — a THIRD field on the entry list beside
+        the existing engine doubling (`ACCUMULATED`), floors 69/7499 → 70/7646.** Without it NOTHING asserts
+        the property and the regression is invisible: both legs return the RIGHT ROWS and differ only in
+        LAYOUT, so every other suite stays green while `delta.targetFileSize` silently stops being
+        enforceable. ⚠ The DEFAULT leg is the control — "the accumulated leg passes" would be equally true
+        of a build where accumulation had stopped working, which is the same vacuous-pass shape this file
+        keeps recording.
+      - **⚠⚠ THE FIRST VERSION SILENTLY LOST 636 ROWS, AND THE OWNERSHIP FACT BEHIND IT IS THE REUSABLE
+        PART: A STREAM BOUND AS A HOST-QUERY INPUT IS RELEASED — AND THEREFORE `Dispose()`d — WHEN THE QUERY
+        FINISHES, i.e. INSIDE `RunCopy`, BEFORE IT RETURNS.** So parking the cut-off tail on the stream and
+        reading it back afterwards got null every time, and those rows were dropped. MEASURED: **79364 of
+        80000 rows**, exit 0, `count(*)` short by exactly the 7 tails. Fixed by putting the tail in a
+        `BatchCarry` box the REWRITE LOOP owns; the stream's `Dispose` now frees only `_first`.
+      - **⚠ IT PRESENTED AS A LAYOUT BUG AND WAS A DATA-LOSS BUG.** Both legs failed identically at the same
+        assertion, which reads as "the split changed file layout"; the probe line (`emitted == budget` on
+        every file, `rem` always null) is what showed the tails were being manufactured and then destroyed.
+        6 × 12182 + 6272 = 79364 — arithmetic matching the observed count is what attributed it. **Instrument
+        the seam, do not reason about the ownership model.**
+      - ⚠ A SECOND coupling SURVIVES: EW's `WriteDataFilesAsync` writes **one parquet file per input batch**,
+        so on the CODEC engine batch size still sets file size. ⇒ **accumulation stays defaulted OFF** — this
+        fix removes one of the two reasons, not both. Decide whether the codec coupling is harmful (it may be
+        what `targetFileSize` wants) before flipping the default or adding a consumer parameter.
+  - **⚠ THE FIRST SWEEP REPORTED A 4x SPEEDUP THAT WAS EVERY QUERY FAILING** (~0.2 s/cell — the best number
+    of the day — all dying with *"Attempting to execute an unsuccessful or closed pending query result"*). A
+    `Fetch()` returning null also **CLOSES** the streaming result, so consuming that EOF mid-batch made the
+    NEXT `get_next` throw; unreachable in one-chunk mode, where the EOF IS the returned value. Fixed with a
+    `finished` flag — DuckDB guards identically (`QueryResultChunkScanState::InternalLoad`'s
+    `if (!stream_result.IsOpen()) return true;`), and reading their implementation is what found it.
+    **Correctness is now asserted on every cell rather than inferred from the timing.**
+  - **THE OPTIMIZE PIPELINE STREAMS — MEASURED, not assumed** (new Debug logging at BOTH ends of the EW seam,
+    reader summary + writer counter, per-batch at Trace, positioned so one log diffs them): 4 files × 10
+    batches in, **40 batches out, identical min=1568 max=2048** ⇒ engineered-wood passes batches through and
+    materializes NOTHING. The file collapse was the writer's cut granularity, never buffering.
+  - Gates: hermetic **71/71 — 7558** AND service **50/50 — 2028**, both IDENTICAL to baseline — the whole
+    claim for a change that alters PLANS on every provider.
+

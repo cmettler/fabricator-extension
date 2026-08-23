@@ -734,3 +734,270 @@ so the option is not lost, nothing motivates it today.
 - **What deliberately does NOT move**: `fabricator_query`/`fabricator_exec`/`fabricator_refresh_cache`/
   `fabricator_version`/`fabricator_managed_dir`, the storage/secret/COPY/settings registrations — provider-
   agnostic host surface, correctly in C++.
+
+---
+
+## Appendix — the `CLAUDE.md` entry, moved verbatim (2026-08-23)
+
+> The per-slice as-built record as it was carried in `CLAUDE.md`, kept because several slices' findings
+> (the double-stored pin, the dbt tmp-swap defects, the v72→v73 JSON reversal) are recorded there in a
+> different order from §5's. `CLAUDE.md` keeps a short pointer plus the follow-ons that are still open.
+
+- **THE CATALOG/TABLE ABSTRACTION: RETIRE `get_metadata` — ✅ COMPLETE 2026-08-15 (user-directed, 2026-08-14;
+  **every slice 1a/1b/2/3 + 4a/4b/4c/4d + 5 BUILT** — nothing remains). The design and every scoping fact live in
+  [docs/catalog-table-abstraction.md](docs/catalog-table-abstraction.md) — READ IT FIRST, especially §3
+  (the eight load-bearing subtleties) and §5 (the migration order + per-slice as-built notes).** The user's
+  framing: no provider-specific function defined in C++; an `ITable` like `ITableFunction` but binding a
+  TRANSACTION (+ the AT clause) instead of args; clean breaks, no compat layers; state owned where it belongs.
+  - **DONE: slice 1a** (`bd00295`) — the SQL Server connection router. `RouteScan` in
+    `SqlServerScanRoute.cs` (⚠ a partial of `SqlServerCatalog`, NOT `SqlServerBackend` — the file holds TWO
+    classes), four named routes, `route=<reason>` in the `query [...]` Debug line. Gated: 6 routing suites +
+    service tier 50/50 — 2028.
+  - **DONE: slice 1b** (`965bfd6`) — `DeltaTxnScope` merges `SnapshotPinning` + `DeltaTableCache` (both
+    DELETED) into one per-txn object; ONE commit/rollback release. ⚠ Two preserved subtleties: the pin
+    instant is LAZY at first `PinVersion`, and `InvalidateTables` (mutating entry points) keeps the PINS —
+    repeatable read. Gated: hermetic 69/69 — 7152 + service 50/50 — 2028, both identical to baseline.
+    - **⚠ THE PIN IS DOUBLE-STORED — the session's key finding, found by a mutant that SURVIVED when it
+      should have died.** `PendingAppends.PinnedVersion` on the txn buffer shadows the scope's pins on every
+      path a sequential suite reaches, so the release asymmetry is DEFENSIVE, NOT GATED. The ITransaction
+      slice must unify the pin into ONE owner; until then check BOTH stores before claiming pin behaviour.
+      **CLOSED BY 4b** — one pin store, and the identical mutant now dies (see the 4b entry below).
+  - **DONE: slice 2 (2026-08-14, ABI v70, BREAKING no aliases) — the `delta.*` catalog-bound function
+    namespace.** `fabricator_delta_snapshots('cat','s.t')` → `cat.delta.snapshots('s.t')` etc.; metadata
+    kinds 8-11/13-14 DELETED (⚠ kind 12 VirtualColumns is category A and STAYS until slice 4's
+    `table_info` — the design's "kinds 8–14" was imprecise), the eight C++ registrations + six bind fns
+    deleted from `fabricator_extension.cpp`. Six shared delegate-parameterized function classes in
+    `Fabricator.Bridge/DeltaFunctions.cs` (public — DeltaRs is a separate assembly, no InternalsVisibleTo),
+    instantiated by DeltaCatalog (all six) AND DeltaRsCatalog (snapshots+changes, its FIRST function
+    hosting). Full as-built notes: the design doc §5 item 2.
+    - **⚠ THE BOUNDS ARE `starting_version`/`ending_version`/`starting_timestamp`/`ending_timestamp`, NOT
+      `from`/`to`** — both are RESERVED WORDS and a named parameter that is one is a PARSER error (the
+      `offset :=` lesson, caught before shipping; the design doc's own example had it wrong). Spark's
+      option vocabulary, which also carries the boundary semantics in its names: starting = FIRST version
+      at-or-after (Delta's startingTimestamp), ending = LAST at-or-before. Out-of-history timestamp bounds
+      ⇒ EMPTY feed, never an error; resolution in `DeltaReader.GetChangesBounded`, deliberately NOT on
+      `ResolveVersionAsOf` (its fall-back-to-latest is right for snapshot pinning, silently wrong for a
+      feed bound).
+    - **Side effects at EXECUTION only** (`StreamTableBinding`, two shapes): fixed-schema deferred core
+      for set_*/tblproperties/get_transaction_version (matching the old C++'s deliberate no-probe binds),
+      bind-time peeked stream only for snapshots/changes (table-dependent schema — the cost the old
+      schema probe already paid). The bind runs with the opener ambient but NO txn ambient
+      (arrow_ingest establishes the txn only at InitGlobal), and `CatalogFunctionSet.OutputSchema`
+      binds-and-disposes without executing.
+    - **v70 although no signature changed**: kind REMOVAL is the inverse of the additive no-bump rule — a
+      stale loadable would send kind 8 and get the provider's empty-table fallback, i.e. silently wrong;
+      the bump makes the mismatch loud at boot.
+    - Gates: 22 suites rewritten (scripted regex over the regular shapes; `CALL` forms →
+      `SELECT * FROM`); `verify_delta_catalog_changes` 73 → **89** (timestamp bounds incl. the ts≡version
+      equivalence + both empty directions + three mutual-exclusion refusals);
+      `verify_delta_catalog_functions` 28 → **45** (§8: `delta` schema advertised on a LOCAL attach, all
+      six declared, DDL refused). ⚠ The 3 deltars suites are rewritten but COMPILE-VERIFIED ONLY (opt-in
+      payload, outside CI).
+  - **DONE: slice 3 (2026-08-14, ABI v71) — the capability JSON.** ONE appended entry
+    `get_capabilities(handle, out_json, err)` → `IBackendCatalog.CapabilitiesJson` (DIM `"{}"`;
+    absent key = false) kills the ServerInfo grep: `FetchExactFilterPushdown`/`FetchBinaryCollation` are
+    DELETED and `LoadCatalog` reads one `FetchCapabilities` doc. Kind 7 stays, diagnostic-only
+    (`fabricator_server_info` unchanged, `verify_server_profile` still 15 properties).
+    - **⚠ DEVIATION FROM THE DESIGN'S LETTER, recorded in the design doc §5 item 3**: NOT on
+      `open_catalog`'s result — that would force SQL Server to CONNECT inside `open_catalog` (collation
+      detection), breaking the measured connection-free invariant `fabricator_storage.cpp`'s mutant note
+      depends on. Called from `LoadCatalog` where the greps sat: ambients established, first connection
+      always paid there. Same substance (one typed doc, read once at ATTACH), safer carrier.
+    - Providers derive the JSON from the SAME fields their diagnostic rows read (SqlServer
+      `Profile.IsBinaryCollation`, Delta `_pushdownMode == Exact`) so the surfaces cannot drift;
+      DAX/DeltaRs/Stub ride the DIM with zero code.
+    - Gated by the EXISTING effect suites now running through the new path
+      (`verify_delta_catalog_dynamic_filter` — pushed join filter visible in the per-file `read_parquet`
+      SQL; `verify_collation_pushdown` — pushed `TOP + ORDER BY [name]` visible in `dm_exec_query_stats`).
+      **Mutation-tested**: Delta's doc forced to `{}` dies at exactly the dynamic-filter log assertion
+      after all 18 correctness assertions pass — correctness is identical either way, so the mechanism
+      assertion is the gate.
+  - **SLICE 4 IS SUB-SLICED (4a–4d, each green + committed; the plan with per-sub-slice reasoning is the
+    design doc §5 item 4).** 4a–4c are C#-only per §2.3's "ABI transport unchanged initially"; 4d is the
+    one C++ bump (the `table_*` session + DELETE `get_metadata`).
+    - **DONE: 4a (2026-08-14, C#-only, behaviour-preserving) — `ITransaction` +
+      `TransactionManager<T>`** (both in Fabricator.Abstractions, namespace `Fabricator.Bridge` like the
+      rest of the contract assembly); SQL Server's `TxnState` → `SqlServerTransaction : ITransaction`,
+      ABSORBING `_explicitTxns` (its 7 read sites — session tag, CETAS `location=`, the external-table
+      guards — became one `IsExplicit` field read via `IsExplicitTxn`). Removal-before-completion is the
+      manager's ordering contract (the read-state-after-remove bug class, found twice, made structural).
+      Lazy creation preserved exactly: autocommit statements allocate nothing. Gates: the five
+      routing/explicit-txn suites at identical counts + both tiers identical to baseline.
+    - **DONE: 4b (2026-08-14, C#-only, behaviour-preserving) — Delta's conversion + the read-scope
+      threading.** New `DeltaTransaction : ITransaction` owns the (path → `PendingAppends`) map, the
+      explicit mark AND a per-transaction `DeltaTxnScope` INSTANCE (the static registry + its 4096
+      panic-clear are GONE); `DeltaCatalog` holds a `TransactionManager<DeltaTransaction>`.
+      `CommitTransaction`'s three-ordering dance (Release-first / wasExplicit-before-Remove) collapsed
+      into ONE `Remove` + reading the flag off the removed object. The five `DeltaReader` read entry
+      points + `DeltaNativeReader.Read` take an optional `DeltaTxnScope? scope` (the catalog passes
+      `ReadScope()`; catalog-less callers default null = own-and-dispose, which also FIXED the
+      global-function registry leak). Full as-built notes: the design doc §5 item 4.
+      - **THE PIN IS UNIFIED**: `PendingAppends.PinnedVersion` is a delegating property over the scope's
+        ONE store (setter first-wins — every historical assignment was `??=`); the entry carries
+        `Owner`+`Path`, and the created-table RENAME re-keys the PIN too (`Scope.RenamePin` — without it
+        the dbt tmp-swap's flush loses its rebase base). **The 1b surviving mutant now DIES**:
+        `verify_delta_autocommit_pin` §12 (67 → **75**) pins pins-survive-mutation via the pin-line
+        count; the collapse-both mutant fails at exactly §12 after 72 pass.
+      - **⚠ THE CROSS-CATALOG HAZARD WAS MIS-SHAPED IN THE PLAN — corrected in the design doc.** Its
+        "explicit txn + external-table write" shape is UNREACHABLE: 4a's `IsExplicitTxn` guards refuse
+        every external-table storage write inside an explicit transaction (three throw sites). The fix
+        is still real (a transient catalog's `CommitTransaction()` now touches only its OWN manager) but
+        it is structural-only — no behavioural kill exists to gate, and claiming one would have been the
+        design doc's own "name the guards before claiming an exposure" lesson violated.
+      - Gates: pin suite 75 (mutation-tested), rename 27 / txn_version 65 / row_level_concurrency 93
+        identical, hermetic 69/69 — 7193 (7185 + exactly the 8 new §12 assertions) + service
+        50/50 — 2028 identical.
+    - **DONE: 4c (2026-08-14, C#-only, behaviour-preserving) — `ITableDefinition`/`ITable.Bind(txn, at?)`.**
+      New `Fabricator.Abstractions/ITable.cs` (+ `TableAt`/`VirtualColumn`/`NdvEntry`; `GetTable` is a
+      throwing DIM on `IBackendCatalog` so DAX/DeltaRs stay untouched until 4d). `PendingAppends` moved
+      verbatim out of `DeltaTxnBuffer` and became **`DeltaBoundTable : ITable`**, absorbing the PIN (4b's
+      delegating property collapsed to a plain field — one store, no delegation) and the shared OPEN;
+      `DeltaTxnScope` is DELETED (instant + open cap moved to `DeltaTransaction`; `RenamePin` died
+      structurally — the pin rides the re-keyed object). Reader threading retyped `DeltaTxnScope? scope` →
+      `DeltaBoundTable? bound` on the five read entry points + `DeltaNativeReader.Read`. SqlServer: typed
+      cores + NESTED definition/thin bound table (`SqlServerTransaction` is a private nested class); kinds
+      2/3/4/5 re-encode typed answers (the `SchemasMetadata`/`FilteredTables` rebuilt-stream precedent);
+      warehouse stats gating moved INSIDE the typed cores. `_rowTrackingByPath` dissolved into a per-(txn,
+      table) `RowTracking` field — the catalog-wide cache was NEVER invalidated (silently stale on a
+      property change). Deviation from the design's letter, recorded in §5 item 4c: **no `TableInfo` bag —
+      lazy METHODS on ITable** (an eager Info object would move per-kind costs; a bag of Funcs is a worse
+      spelling), and definitions are TRANSIENT/stateless until 4d gives them the C++ entry's lifetime.
+      - **⚠ THE dbt TMP-SWAP CAUGHT THREE DEFECTS IN THE FIRST FULL GATE RUN** (transactions §38) — all
+        consequences of the read cache joining the buffer map, none visible to the compiler: (1) the RENAME
+        re-key collides with the departed table's read-cache entry at the target path → evict when
+        footprint-less (its pin/open describe the table renamed AWAY), refuse-with-buffer-restored
+        otherwise; (2) the moved binding's shared OPEN was over the OLD path's filesystem → dropped at
+        re-key (4b silently orphaned it by never re-keying the open map; the PIN stays — a version number
+        against the log now AT the new path); (3) `SetNames` was first-wins, so the post-swap scan of `m`
+        ran as `m__dbt_tmp` and opened a renamed-away folder — overwrite is consistent by construction
+        (Bind derives the path FROM the names it sets). Diagnosed from ONE Debug fablog line
+        (`delta scan main.m__dbt_tmp` for a query naming `m`) — instrument, don't speculate.
+      - The per-txn map now holds READ-ONLY bindings ⇒ commit/rollback loops skip footprint-less entries
+        (`HasTxnFootprint`, deliberately generous — only pure read-cache entries skip, the rollback log
+        line keeps its meaning).
+      - Gates: transactions 1040 / pin 75 / rename 27 / txn_version 65 / row_level 93 / time_travel 98 /
+        alter 116 / row_tracking_virtual 299 / column_mapping 251 identical; both tiers identical
+        (hermetic 69/69 — 7193, service 50/50 — 2028).
+    - **DONE: 4d (2026-08-15, ABI v72, BREAKING no aliases — the one C++-touching bump, taken last as
+      planned) — the `table_*` session; `get_metadata` + `scan_table` + the kind enum are GONE.** Catalog
+      discovery = five dedicated typed entries (`catalog_schemas`/`_tables`/`_functions`/`_macros`/
+      `_server_info`, each keeping its kind's column layout — the unknown-kind fallback shapes behind the
+      `ReadStringTable` OOB hazard are gone); per-table = `table_open/schema/info/stats/scan/close` over
+      the 4c object model, with the handle owned by the C++ ENTRY for its life (released in the new
+      destructor — graveyard-safe BECAUSE the handle wraps the stateless DEFINITION and every call
+      re-binds against the ambient txn via the new `ResolveTransaction(txnId)` DIM: SqlServer TryGet,
+      Delta GetOrCreate, others null). Entry materialization 3 IO crossings → 2 (open+schema+info); stats
+      2 → 1, typed, still lazy at first scan. DAX/DeltaRs/Stub gained thin read-only `ITable`s
+      (⚠ DeltaRs needs a `DrsTable` alias — delta-dotnet's own `ITable` collides by name).
+      `table_open` is LAZY with absence still classified at `table_schema` (§6's lazy-bind default —
+      cheap opens are what keep enumeration affordable). The DML entries deliberately KEEP their
+      name-pair transport (they never rode `get_metadata`; re-pointing them is follow-on work, not part
+      of retiring the multiplexer). `IBackendCatalog.ScanTable` survives as a C#-internal ambient-bind
+      convenience (ExternalTableRouting). Gates: hermetic 69/69 — 7193 + service 50/50 — 2028, both
+      identical to the 4c baseline; smoke incl. rowid UPDATE + `AT (VERSION => 1)` through the new session.
+    - **⚠ AND v72's "NO JSON" DEVIATION DID NOT SURVIVE REVIEW — CORRECTED THE SAME DAY BY v73 (the
+      user: yyjson could come from vcpkg).** The recorded justification ("yyjson is in duckdb_static but
+      not `DUCKDB_API`-exported — a loadable cannot link it") was TRUE of the VENDORED copy and an
+      overclaim about JSON: the extension simply carries its OWN vcpkg yyjson (plain C `yyjson_*`
+      symbols; DuckDB's copy is C++-namespaced `duckdb_yyjson`, so no clash in the static build either).
+      v73 re-carries `table_info`/`table_stats` as the design's ONE-typed-JSON-doc letter (`char**`
+      crossings, `Utf8JsonWriter` producer, yyjson parser) and — the bigger win — **retires
+      `ReadCapabilityFlag`**, the get_capabilities string-find hack whose safety rested on a
+      producer-side bare-booleans argument. A deviation justified by an impossibility that was really a
+      dependency-cost choice: name the cost, don't dress it as a limit. Full record: the design doc §5
+      item 4d's rewritten first deviation bullet.
+    - **DONE: slice 5 (2026-08-15, comment-only — proven by the masking check: the src/ diff filtered to
+      non-`//` changed lines is EMPTY).** The re-derivation found the deletion component was ZERO —
+      `ReadStringTable`'s seven consumers are all legitimate (the four discovery lists at 1/3/3-of-5/3
+      columns plus `ListSettings` 6 / `ListSecretFields` 5 / `ListGlobalFunctions` 4-of-6, which never rode
+      the multiplexer), and two streams are DELIBERATELY wider than read, which is what the `>=` serves.
+      What was dead was the width guard's JUSTIFICATION: its comment cited the deleted unknown-kind `_ =>`
+      fallback arms verbatim. Rewritten to the current truth; the zero-row leniency STAYS deliberately —
+      no in-tree producer can trip a tightened check any more, so tightening would be an UNTESTABLE
+      behaviour change whose only reachable effect is failing a plugin's ATTACH over an empty optional
+      stream. Also swept: the two "their own metadata kind" phrasings in `fabricator_catalog.cpp` and three
+      pre-provider-era "SQL Server" doc comments on the provider-generic discovery helpers. The
+      `get_metadata` mentions left in `abi.h`/`clr_host.cpp` are deliberate historical tombstones. Full
+      record: the design doc §5 item 5.
+    - **THE `ITable`/`ITableBinding` RENAME (2026-08-15, user-directed — C#-only, no ABI, breaking for
+      plugin authors, no aliases).** The short name had landed on the WRONG half of the pair:
+      `ITableDefinition` → **`ITable`** (the shared definition, completing the `ITableFunction` symmetry the
+      doc always claimed and the user's original "an ITable" framing meant) and the bound object `ITable` →
+      **`ITableBinding`** (mirroring `ITableFunctionBinding`). Concretes rode along (`DeltaBoundTable` →
+      `DeltaTableBinding` + file rename, same for SqlServer/DAX/DeltaRs/Stub); `*TableDefinition` concrete
+      names STAY (`DeltaTable` would collide with engineered-wood's). ⚠ `IBoundTable` deliberately NOT
+      reused (a retired name — it became `IBoundTableFunction`); ⚠ `DeltaRsCatalog.cs` hand-edited outside
+      the mechanical pass because `DeltaLake.Interfaces.ITable` (delta-dotnet's own type) would have been
+      corrupted by a word-boundary substitution. Proven mechanical by the masking check; full record: the
+      design doc's rename section under §5. En route SETTLED (from DuckDB's source, cited in the design
+      doc): `Bind(txn, at?)` must NOT take a scan spec — the spec does not EXIST at bind time
+      (`bind_basetableref.cpp` builds LogicalGet with all columns and no filters; statics arrive at
+      optimization via `pushdown_complex_filter`, dynamic/join filters only at scan global-init,
+      `physical_table_scan.cpp:35`), our `table_scan` crossing already fires at global-init so it carries
+      the COMPLETE spec at the earliest moment it exists, and the binding is memoized per (txn × table)
+      serving N scans with DIFFERENT specs (self-join; prepared-statement re-execution) — "BIND IS STATE,
+      SCAN IS REQUEST" stays the contract.
+    - **FOLLOW-ON, recorded from the 2026-08-15 design Q&A (user-agreed, NOTHING BUILT): per-table /
+      per-column EXACT filter pushdown.** `exact_filter_pushdown` is catalog-grain today
+      (`FabricatorCatalog::exact_filter_pushdown_` → `fabricator_table_entry.cpp:871`), which is too coarse
+      the day a catalog hosts a table that cannot apply filters exactly. ⚠ Only the EXACT flag is
+      correctness-bearing — best-effort pushdown never erases, and projection is per-table optional by
+      construction (the scan maps result columns BY NAME, `arrow_ingest.cpp:851`), so "a table supporting
+      no pushdown at all" needs NO new flag. Two seams when it is needed, both verified against source:
+      (a) an optional per-table `"exact_filter_pushdown"` key in `table_info` defaulting to the catalog
+      capability — right timing, since `GetScanFunction` builds a FRESH TableFunction per table-REFERENCE
+      bind (the flag is already per-bind decidable for catalog tables); (b) **`TableFunction.
+      supports_pushdown_type` (1.5.5, `plan_get.cpp:101-145`)** — consulted at physical planning WITH THE
+      BIND DATA per column; a declined column's filter is ERASED from the TableFilterSet and rebuilt as an
+      explicit Filter above the scan (projection extended to keep the column). That is the bind-time,
+      column-grain retraction the flag itself lacks — DuckDB's own arrow scan uses it (`arrow.cpp:341`).
+      Dynamic/join filters do NOT consult it, which is safe (the join re-evaluates its condition; only
+      STATIC table filters can drop rows). ⚠ For REGISTERED (global) functions the flag is fixed at
+      registration and the bind cannot flip it (`bind_table_function.cpp:289` copies the resolved function
+      value) — so `supports_pushdown_type` is the ONLY route to safe exact pushdown there, and the day
+      `ITableFunctionBinding.SupportsFilterPushdown` gets wired (⚠ it is UNREAD VOCABULARY today — its own
+      doc says so; only `SupportsProjectionPushdown`/`MapResultByName` are consumed) this hook is the
+      DuckDB-side shape that can honor a per-binding answer. Deferred until a non-uniform table exists —
+      shipping it now would be an untestable flag (the same objection as tightening the ReadStringTable
+      guard).
+    - **✅ BUILT 2026-08-17 (ABI v74, BREAKING, no aliases) — `table_alter(table, alter_json, column, err)`.
+      BOTH axes landed exactly as scoped below, and the `column` stream stayed beside the doc as predicted.
+      Full as-built: [docs/abi-history.md](docs/abi-history.md) §v74. What the scoping did NOT anticipate:**
+      - **The old hand-rolled `JsonPathArray` was BROKEN and this fixed it.** It escaped `"` and `\` only,
+        so a legal DuckDB identifier carrying a CONTROL character produced invalid JSON — MEASURED against
+        the pre-change build, `SET SORTED BY ("a<TAB>b")` failed with *"'0x09' is invalid within a JSON
+        string … BytePositionInLine: 3"*. Loud, never silent.
+      - **⚠ AND IT CREATED THE MIRROR RISK: identifiers that never touched JSON before now do.** A column
+        name / new name crossed as a RAW C string in `arg1`/`arg2`, where escaping could not arise; in the
+        doc it can. Hence yyjson's MUTABLE writer host-side rather than another hand-rolled one — the first
+        place the host WRITES an ABI JSON doc (`FabricatorRenderAlterJson`). Both halves gated + mutation-
+        tested (alter 116→132, sorted_by 30→40, nested_alter 100→127; tier-0 146→196).
+      - **⚠ `yyjson_mut_strn` does NOT copy** (its own doc says so) — use `yyjson_mut_strncpy`. Getting
+        that from the header rather than the name is the rule; the values would otherwise point into the
+        request struct, safe here only because the doc dies first.
+      - The base64 `SET DEFAULT` hack, `JsonPathArray`, `ParseJsonPath`, SqlServer's `RequireArg` and
+        Delta's DOUBLED buffered-kind list are all GONE with it.
+      Original scoping, kept because every prediction in it held: Today's `alter_table` is the worst-shaped ABI entry left:
+      name-pair transport plus FIVE positional carriers (`alter_kind` int, `arg1`, `arg2`, an optional
+      zero-row Arrow `column` stream, `flags` bit 0 = if-(not-)exists), every kind overloading their
+      meanings. The cleanup has TWO INDEPENDENT axes: (a) name pair → the v72 TABLE HANDLE (sound for ALTER
+      — it always targets an EXISTING table, so the create-shaped asymmetry that keeps `create_table`/CTAS
+      `begin_bulk` name-based does not apply); (b) the kind/args/flags → ONE typed JSON doc, the exact v73
+      pattern (`Utf8JsonWriter` producer, yyjson parser — both already on both sides). ⚠ THE ONE CARRIER
+      THAT MUST NOT FOLD INTO THE JSON: the `column` stream (ADD_COLUMN / COLUMN_TYPE's new-column type).
+      It is the TYPE CHANNEL — a VARIANT ADD COLUMN rides the Arrow field-metadata marker
+      (`VariantMarker`/`ew.variant_transport`), which a DuckDB-type-NAME string cannot carry; rendering
+      types as text would be a silent type-channel regression on exactly the extension-type shapes. Keep
+      the stream BESIDE the JSON (nullable, as today). Signature change ⇒ ABI bump, breaking, no aliases;
+      DML-path risk budget per the 4d note (though ALTER is the tamest of the DML entries — no background
+      thread, no bulk session). Full context: the design doc §2.4 sketch + §5 item 4d's "did NOT do" note.
+      frees a table function's args batch. It is marshaled into a STACK-LOCAL ArrowProducer
+      (`fabricator_schema_entry.cpp:1305`), pulled SYNCHRONOUSLY inside `tablefn_bind`
+      (`Bootstrap.cs:1372-1377`), and the pull MOVES ownership (`arrow_produce.cpp:217`) — the producer's
+      destructor frees only what was never pulled. Retention is relied on: `TvfBoundTableFunction` stores
+      `_args` across executions and disposes it in its own Dispose. The "freed after the batch is
+      consumed; do not retain" note is `ICollectorTableFunction.cs:23` — the COLLECTOR's per-input-CHUNK
+      contract, a different path. ⚠ Open doc gap: `ITableFunction.Bind(RecordBatch args)` states no
+      ownership; the de-facto contract is THE BINDING OWNS ARGS (retain freely, dispose with the
+      binding) — worth a sentence when that file is next touched.
+

@@ -781,3 +781,164 @@ per-request limit, or a memory bound). It degrades gracefully — still our oper
 provenance-carrying call per N rows, correlated columns still gathered — where a boolean falls all the way back
 to one call per outer row. It needs a loop over sub-slices of the input chunk, tracking an offset; the
 provenance contract already supports it unchanged.
+
+---
+
+## Appendix — the `CLAUDE.md` entry, moved verbatim (2026-08-23)
+
+> §8 above is the as-built record. This is the entry `CLAUDE.md` carried alongside it — the scoping
+> bullets, the declined per-function flag, and the corrections — moved here to bound that file.
+
+- **`ILateralTableFunction` — BATCHED CORRELATED LATERAL. ✅ BUILT 2026-08-22 (ABI v79, ADDITIVE; C++ + C#),
+  user-directed. Gates: `verify_lateral` **168** (hermetic) + `verify_functions` 34 → **67** and
+  `verify_plugin` 79 → **97** (service); tiers **74/74 — 7986** and **52/52 — 2221** LOCALLY, both exactly the
+  old floor plus the new assertions, so NO other suite moved. Four mutants, each killed at its own section.
+  Committed + pushed as **`cea3921`**; **CI tier 1 GREEN ON ALL THREE PLATFORMS** (run `32632791345`,
+  `verify_lateral` 168 + `ALL GREEN` on each of linux_amd64 / windows_amd64 / osx_arm64, read from the job
+  logs rather than the status tick). ⚠ **osx_arm64 is the leg that mattered and it is worth knowing WHY it
+  was in doubt**: this change's riskiest construct is the freshly-allocated scratch `DataChunk` whose columns
+  are `Reference`d into the output and kept alive only by buffer refcount — the same Arrow-LIFETIME class as
+  the `ArrowProducer::Release` use-after-free, which faulted ONLY on macOS because Apple's pthread validates a
+  destroyed mutex where glibc and Windows do not. So a green Windows run would have proven nothing about it,
+  and any future fault there should suspect that chunk's lifetime first. Full as-built:
+  [docs/lateral_unnest_analysis.md](docs/lateral_unnest_analysis.md) §8; ABI:
+  [docs/abi-history.md](docs/abi-history.md) §v79. THE SCOPING BULLETS BELOW ARE THE RECORD OF HOW IT WAS
+  ARGUED — every API claim in them held; the two predictions that did NOT are corrected here.**
+  - **MEASURED, 200 000 rows, the CHEAPEST POSSIBLE callee (`n * 2`), so this is CROSSING OVERHEAD ALONE:
+    batched 0.030–0.075 s / 111 calls vs row-by-row 0.902–1.054 s / 200 000 calls — ~30x wall clock and
+    ~100x CPU (0.08 s vs 9.7–11.7 s user), i.e. ~5 µs per crossing.** §0's gate 2 asks for a 20x gap; the
+    crossing overhead alone clears it, so the "measure `c` first" step the user waived was not needed to
+    justify the work — the number arrived for free afterwards.
+  - **⚠⚠ THE FINDING THAT BOUNDS EVERY CLAIM, AND NOTHING IN THE DESIGN NOTE MENTIONS IT: THE CORRELATED PLAN
+    DE-DUPLICATES BEFORE THE FUNCTION IS CALLED.** Decorrelation puts a DISTINCT aggregate (the delim scan)
+    under the operator and the join above re-expands, so the callee is invoked once per distinct correlated
+    TUPLE — a 20 000-row table with 97 distinct argument values hands it at most 97 rows on EITHER path. Cost
+    and win both scale with DISTINCT TUPLES, not with outer rows. It also invalidated the first version of the
+    batching gate, which asserted `max(batch_rows) > 100` over exactly such a table: unreachable by
+    construction, and it FAILED rather than passing vacuously only because the observable is a real value.
+  - **⚠ THE CALL COUNT IS NOT `ceil(rows/2048)` — so the design note's own assertion cannot be written.** The
+    delim scan emits one chunk per radix partition, so chunk size depends on the THREAD COUNT too: 111 calls
+    for 200 000 rows at default threads, 16 for 5000. The gate asserts a RANGE, with the row-by-row leg's
+    exact `= 1` as its positive control.
+  - **⚠ `duckdb_logs` IS THE WRONG INSTRUMENT FOR A CALL COUNT, and this is reusable well beyond here.** It
+    flushes per-thread LAZILY: a read immediately after a query that made 98 crossings saw **1** entry, and
+    `disable_logging()` does not flush either. Two versions of the gate were written on it and both measured
+    whatever happened to be visible (one passed for the wrong reason at 98 == the PREVIOUS leg's count). The
+    fix is to make the callee report its own batch size as DATA — `fabricator_lat_scale` returns
+    `batch_rows` — which is deterministic and needs no logging. **Existing suites' `count(*) > 0` log
+    assertions are fine; a COUNT over log lines is not.**
+  - **⚠ A NAMED ARGUMENT CANNOT BE USED IN THE CORRELATED SHAPE — UPSTREAM, UNFIXED IN 1.5.5, and the design
+    note predicted it.** `f(t.a, opt := 5)` does not bind: `BindTableFunctionParameters` tests the bind TYPE
+    first and for `TABLE_IN_OUT_FUNCTION` sweeps EVERY argument expression into the input subquery before the
+    named-parameter extraction below it runs, so the named arg becomes a phantom input column and the arity
+    stops matching. The literal shape is unaffected (all-scalar args take the standard path). **THE GUIDANCE:
+    declare a per-call constant POSITIONALLY** — it arrives as a constant input column and works in both
+    shapes; what stays unavailable is bind-time configuration OF a correlated call. Report-ready:
+    [docs/duckdb-upstream-issues.md](docs/duckdb-upstream-issues.md) §5.
+  - **⚠ "NEVER RETURN FINISHED" SURVIVES AN ORDINARY FILTERING TEST, so its gate is purpose-built.** A partly
+    filtered chunk still returns rows; the invariant is killed only by a chunk that is ENTIRELY empty with
+    more chunks behind it (4000 of 6000 distinct values emitting nothing) **at threads=1** — measured, the
+    same mutant returns the RIGHT answer at threads=4, because each thread's chunk boundaries differ.
+  - **⚠ THE VALIDATION SPLIT, arrived at by a mutant SURVIVING.** Range validation was written on BOTH sides;
+    removing the host's then changed nothing, which is the definition of dead code — and it would have been
+    the copy guarding the memory access. Now: the managed shim checks the column count, the provenance LENGTH
+    and the absent-strict rule (what it alone knows cheaply); the HOST checks the RANGE, because the host is
+    what INDEXES with it.
+  - **⚠ ONE PRE-EXISTING GAP FOUND AND DELIBERATELY NOT FIXED: `CatalogFunctionSet.ParamSchema` answers for
+    scalar/table/aggregate/table_sql and NOT for in-out/collector.** A lateral function had to be added there
+    (its positional parameters ARE the DuckDB argument types, so without it the declaration is listed by
+    `fabricator_functions()` and the function still "does not exist" — measured). The in-out omission is
+    survivable only because `GetOrCreateCustomInOutFunction` CATCHES the failure and falls back to the bare
+    `{TABLE}` signature, which is right for every in-out shipped today and would silently DROP a declared cost
+    arg on a CATALOG-bound one. Left alone: fixing it changes how every existing in-out's signature is built.
+  - **THE WIN IS MEASURED IN CI, not merely argued, and the instrument is a PLUGIN function — which proves the
+    audience path at the same time.** `plug_lat_slow(n, millis)` (Fabricator.SamplePlugin) sleeps ONCE PER
+    CALL, which is the only cost batching can amortise and the shape this kind is FOR (a REST or model call).
+    `verify_plugin`'s new section runs 8 distinct outer rows at millis=100 on both paths in one process:
+    **0.870 s / `max(batch_rows)=1` row-by-row vs 0.154 s / `max(batch_rows)=8` batched**, with the serial
+    leg's own duration as the positive control and both legs' answers asserted (a speed claim is worthless if
+    the fast leg dropped a row). ⚠ threads=1 is REQUIRED — the delim scan emits one chunk per radix partition,
+    so several threads split the 8 rows and move the ratio. ⚠ A plugin references `Fabricator.Abstractions`
+    and nothing else, so this also establishes that declaring a lateral costs a plugin no more than declaring
+    a scalar.
+  - **⛔ A PER-FUNCTION batching flag on `ILateralTableFunction` — asked 2026-08-23, DECLINED, and the
+    measurement is what settles it (docs §8.6).** It is mechanically trivial (schema metadata on the bind's
+    out_schema, the `fabricator.volatile` precedent, no ABI change, precedence AND so the oracle survives) and
+    every reason to want it dissolves: a callee that cannot compute provenance is 1:1 and batches fine; a
+    one-item-per-request API loops internally, which BEATS the host looping; a memory bound slices the same
+    way; and a per-ROW cost means it should have been a scalar per §0 gate 1. **⚠ The one case that looked real
+    is FALSE and I had it backwards** — a `LIMIT` above a fan-out does NOT let the row-by-row driver exit
+    early, because the correlated input is the hash-join BUILD side and is consumed in full either way:
+    8 distinct rows × 100 ms ⇒ **row-by-row 0.916 s with `LIMIT 1` vs 0.870 s without it (identical) vs 0.107 s
+    batched**. So it would be a flag with NO CORRECT USE — the untestable-flag shape this file already prices
+    at the per-table `exact_filter_pushdown` follow-on. ⚠ The trigger condition to watch for is TESTING
+    ERGONOMICS (the setting is session-wide, so two lateral functions in one query cannot be A/B'd
+    separately), and the better knob if one ever appears is a MAX BATCH SIZE, not a boolean — it degrades to
+    N-row calls through our own operator instead of falling back to one call per row.
+  - **The one thing the build did NOT reuse, deliberately, per the user's instruction:** anything of the
+    streaming in-out exchange. Five additive ABI entries and a separate `src/catalog/fabricator_lateral.cpp`;
+    the only shared code is the read-only `ArrowStreamReader`. The exchange could not have served it anyway —
+    it permits ONE exchange per binding (serialising parallel branches behind a gate) where the batched
+    operator wants a session per thread, and it has no provenance channel.
+  - **⚠ `OperatorOrder()` stays INSERTION_ORDER, NOT the note's `NO_ORDER`** — our operator emits rows grouped
+    by input row in input order, so INSERTION_ORDER is TRUE of it, and `ParallelOperator()` is what buys
+    cross-morsel parallelism. §7d already measured what `NO_ORDER` costs (a bare `LIMIT` returns arbitrary
+    rows; since §7c it would also disable the parallel write sink). Consequence: the suite's `ORDER BY ALL` is
+    still mandatory, but because the PLAN does not promise order, not because we declared it away.
+  - **⚠ The design note says its DuckDB API references are UNVERIFIED. Every load-bearing one was verified
+    against our pinned 1.5.5 while building this and they ALL HOLD — the list is below, so do not re-derive
+    them.**
+  - **⚠⚠ THE FRAMING THE DOC DOES NOT SPELL OUT FOR OUR CASE, and it is the whole point: WE ALREADY HAVE THE
+    FAST PATH, UNDER AN AWKWARD SPELLING.** `PhysicalTableInOutFunction::ExecuteInternal` branches on
+    `if (projected_input.empty())` (`physical_tableinout_function.cpp:87`) and that branch passes the WHOLE
+    input chunk to `in_out_function`. The non-empty branch is explicitly commented *"when project_input is set
+    we execute the input function row-by-row"* and does `ConstantVector::Reference(...)` + `SetCardinality(1)`
+    per outer row. ⇒ our `_each(<input table>)` form (a TABLE argument, so NO correlation, so
+    `projected_input` EMPTY) is **already one call per chunk** — that is why 4g works per-chunk — while the
+    IDIOMATIC `SELECT * FROM inputs i, fn(i.a, i.b)` is row-by-row. **So this feature is not "make in-out
+    faster", it is "let users write the spelling they expect and get the speed we already have".** State it
+    that way; it changes how the work is justified and it is the strongest argument for doing it.
+  - **VERIFIED AGAINST OUR PIN (all of these hold — banked so a future session does not repeat it):**
+    `LogicalGet::projected_input` exists (`logical_get.hpp:54`); the row-by-row branch and its mechanism as
+    above; **`base_idx = chunk.ColumnCount() - projected_input.size()`** (`:120`) — exactly Invariant 2's
+    arithmetic; **`throw InternalException("FinalExecute not supported for project_input")`** (`:163`), which
+    is §2(b)'s refusal, plus `plan_get.cpp:86` *"LogicalGet::project_input can only be set for table-in-out
+    functions"*; `OperatorState::Finalize(const PhysicalOperator &, ExecutionContext &)`
+    (`physical_operator_states.hpp:36`) for Invariant 8; and `OptimizerExtension` carries BOTH
+    `optimize_function` and `pre_optimize_function` (`optimizer_extension.hpp:40/44`).
+  - **⚠ THE SCAFFOLDING IS NOT NOVEL — WE HAVE THE THREE-PIECE PATTERN TWICE IN-TREE.** `FabricatorInOutOptimize`
+    (`src/catalog/fabricator_schema_entry.cpp:2310`, registered `:2317-2319`) is an `OptimizerExtension` that
+    already wraps in-out `LogicalGet`s in `LogicalExtensionOperator`s — `FabricatorExchangeFinalizeOperator`
+    (`:1952`) and `FabricatorCollectorFinalizeOperator` (`:2248`) — each building a
+    `PhysicalOperatorType::EXTENSION` operator. `src/fabricator_optimizer.cpp:236` is a second
+    `OptimizerExtension`. Copy those shapes rather than inventing one; the 4g-finalize entry in this file
+    records why that hook fires exactly once, which is the same reasoning the new operator needs.
+  - **THE MANAGED SIDE IS WHERE THE NEW CONTRACT LIVES: provenance.** §2(a) — when we send N rows and get M
+    back, the callee must return an M-length array of INPUT-ROW INDICES, or the correlated columns cannot be
+    stamped and 1→N / 1→0 are impossible. Make it **additive and optional** in the in-out protocol: absent ⇒
+    identity 1→1, and make the absent case **STRICT** (absent + `M != N` is an ERROR, never a guess). That is
+    the one genuinely new piece of ABI surface; everything else reuses `inout_open`/`push`/`abort`.
+  - **APPLY §0'S GATES BEFORE WRITING ANYTHING.** Gate 1: a 1→1 callee wants a SCALAR and a bounded 1→N wants
+    `LIST<STRUCT>` + `UNNEST` — both batched by construction, neither needs any of this. Gate 2: measure the
+    per-call overhead `c` against per-row work `w`; the doc's own bar is that a 1.5x gap does not justify it
+    and a 20x gap does. ⚠ **For OUR providers `c` is a SQL Server round trip**, so the SQL-Server `_each` and
+    any plugin whose callee is a network or model call pass gate 2 easily — but a pure-C# `cf_*` in-out
+    (`cf_running_sum`) does NOT, and building for it would be the untestable-flag mistake this file records.
+  - **THREE RISKS THAT ARE OURS SPECIFICALLY, not the doc's:** (a) Invariant 2's REBIND trap — our Arrow→
+    DataChunk conversion is exactly the "zero-copy handoff that rebinds destination buffers" the doc warns
+    about, so the scratch-`DataChunk`-then-`Reference` indirection is probably MANDATORY for us rather than
+    optional; check `arrow_ingest`'s write target before assuming otherwise. (b) Invariant 7 — we DO advertise
+    `projection_pushdown` on scan paths, so decide explicitly whether the new operator advertises it, and the
+    doc's advice is DON'T unless it is thoroughly tested (an off-by-one there reads a callee column into a
+    correlated slot: wrong data, no error). (c) **The ambient rule** ([docs/scan-concurrency.md](docs/scan-concurrency.md)
+    §8): a per-chunk managed call must establish the opener/txn the way the existing in-out path does — read
+    every ambient in the crossing that sets them, never later.
+  - **THE GATE PREDICTION HELD IN SUBSTANCE AND MOVED IN EVERY DETAIL — the kill switch IS a reference
+    oracle, and that is what `verify_lateral` §3 is** (both paths' full result sets, `EXCEPT` in BOTH
+    directions, at threads=4 over DUPLICATE correlated values with a per-row fan-out of 0..3). What changed:
+    the home is a NEW HERMETIC suite, not `verify_table_inout`/`verify_custom_functions` — the demos are
+    GLOBAL functions, so no ATTACH and no server is needed, and the catalog-bound half rides `verify_functions`
+    in the service tier. The call-count assertion could not be written as `== ceil(rows/2048)` (see the
+    de-duplication finding above) and is a `batch_rows` value rather than a log count. `ORDER BY ALL` is still
+    mandatory — because the PLAN promises no order, not because we declared `NO_ORDER`.
+

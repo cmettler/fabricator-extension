@@ -1467,3 +1467,161 @@ propagates out → fails the statement → DuckDB rolls it back. This is the pro
 - **Pins are write-created, read-reused.** A reused pin is always inside the live `SqlTransaction`.
 - **MARS for the pinned connection; serialization (gate) for the exchange connection.**
 - **One attached DB written per transaction** (DuckDB's `MetaTransaction::ModifyDatabase`).
+
+---
+
+## Appendix — the same-catalog CTAS-in-a-transaction failure, `CLAUDE.md` entry moved verbatim (2026-08-23)
+
+> The pinned-connection race and everything measured about it, incl. the bulk deferral that fixed
+> it and the two reversals of my own conclusions. §5.6a above is the settings x engine x statement
+> matrix; this is the narrative. `CLAUDE.md` keeps the reproduction recipe and the standing rule.
+
+- **⚠ CTAS WITH A SAME-CATALOG SOURCE INSIDE AN EXPLICIT TRANSACTION IS BROKEN ON FABRIC — PRE-EXISTING,
+  FOUND 2026-08-10, NOT FIXED.** `BEGIN; INSERT INTO wh.t …; CREATE TABLE wh.u AS SELECT … FROM wh.t; COMMIT;`
+  dies after ~30 s with `Execution Timeout Expired` or an SSL/TLS handshake failure, and the aborted
+  transaction then reports the far less helpful `208: Invalid object name`.
+  - **Cause, from the Debug log — a race on the PINNED connection, with MARS off:**
+    `19.442 query [pinned txn=10]: SELECT [a] FROM [dbo].[ci_ryw]` then
+    `19.454 bulk ddl [txn=10 own=False]: … CREATE TABLE [dbo].[ci_ryw_copy]` — 12 ms apart, SAME connection.
+    The sink's DDL runs on the bulk's BACKGROUND thread while the scan's `ExecuteReader` is still open on
+    that connection. **The drain cannot help**: the collision is at `ExecuteReader` time, before there is
+    anything drained.
+  - **⚠ IT IS NOT THE `COPY INTO` WORK AND NOT THE SqlClient BUMP — established by CONTROLS, not by
+    reasoning.** The identical shape with NO `copy_into_staging` (plain `SqlBulkCopy`) fails the same way, and
+    both failure modes appear on 6.0.2 AND 7.0.2. ⚠ A first pass here reported "7.0.2 fixed the TLS error"
+    off ONE run; the control run on 7.0.2 then produced four handshake failures. **One trial of a
+    timing-dependent failure is not a measurement** — the same rule this file already records for the pinned
+    intra-statement read.
+  - **⚠ FULLY MAPPED 2026-08-10 — the settings × engine × statement matrix is
+    [docs/transactions.md](docs/transactions.md) §5.6a (11 rows, every one measured live). Three findings
+    there change how this should be read:**
+    - **MARS IS THE WHOLE STORY: a PINNED scan feeding a same-catalog bulk write is broken whenever MARS is
+      OFF, on ANY engine.** The bulk's consumer calls `WriteToServer` as soon as it starts, so the scan's
+      reader and the load hold the pinned connection CONCURRENTLY by construction; MARS is what lets them
+      coexist. Box with `mssql_mars='false'` fails **0 of 8**; Fabric has no MARS and fails the same way.
+      ⇒ **`SET mssql_mars='false'` REPRODUCES IT ON BOX in under a second with 15 rows** — so this is a
+      service-tier gate, and its absence is why the hazard had only ever been seen on Fabric.
+      - ⚠ **I FIRST RECORDED THE OPPOSITE OFF ONE RUN.** Row 2 went into the matrix as ✅ ("box drains in
+        ~1 ms and wins the race"), with a whole latency-race model on top. The byte-identical script then
+        gave 0/8, ~1 success in a dozen. The mechanism IS a race — box just does not reliably win it either,
+        and the single green run was the rare outcome promoted to a fact. **A flaky failure sampled once is
+        indistinguishable from a pass.**
+    - **CTAS AND INSERT DIVERGE ON IDENTICAL SETTINGS** — the CTAS's scan logs `pooled`, the INSERT's logs
+      `pinned`, because the routing turns on whether the transaction's connection EXISTS YET when the scan
+      starts and the two operators initialise their sink in a different order relative to the source. So a
+      marked scan pins or pools by statement KIND, which no setting expresses.
+    - **`read_isolation='snapshot'` DOES NOT RESCUE IT (measured) — it makes it worse**, since its whole job
+      is to route the read onto the transaction's connection, which is exactly what must not happen while a
+      bulk holds it. Do not offer it as the remedy here.
+  - **✅ THE BULK DEFERRAL (2026-08-10): `WriteToServer` NO LONGER ACQUIRES BEFORE IT HAS DATA — and it made
+    read-your-writes REACHABLE without MARS, which this file twice recorded as impossible.**
+    `BulkSession`'s consumer called `BulkInsert` immediately, and `SqlBulkCopy.WriteToServer` holds the
+    connection for the WHOLE load including the time it is only waiting for rows — so the load owned the
+    connection before the scan had asked for one. It now waits for the first batch OR end-of-stream, making
+    the acquisition order deterministic: **the load always acquires SECOND.**
+    - **⚠ THE FAILURE WAS AT ACQUISITION, NOT RELEASE.** The scan releases fine (eagerly at end of result
+      set). Whoever asks SECOND is refused, and which one varies: measured BOTH directions — *"There is
+      already an open DataReader"* (scan second) and *"does not support MultipleActiveResultSets"* (load
+      second), plus a 30 s timeout where the loser waits. Two of my explanations before this were wrong.
+    - **MEASURED: `mssql_mars='false'` + explicit `mssql_materialize='true'` went 0 of 8 → 8 of 8, with
+      READ-YOUR-WRITES RESTORED** (CTAS 15 vs the pooled default's 10; scan `pinned`, drain count 1). The
+      DEFAULT is unchanged — streaming still wins on speed and memory — so this makes read-your-writes
+      OPT-IN rather than impossible.
+    - **⚠ THE WAIT IS "BATCH **OR** COMPLETION", NEVER "BATCH"** — a zero-row source completes the channel
+      without ever writing, so waiting for a batch alone hangs forever on a shape that still has to CREATE
+      the table. Verified: empty CTAS/INSERT/COPY all return immediately. ⚠ No cancellation token belongs
+      there either: `_consumerExited` is cancelled by the consumer's own `finally` so it can never fire
+      while waiting; interrupt and abort FAULT the channel, which makes the wait throw into that same
+      `finally`.
+    - Gates: hermetic **67/67 — 6895** and service **49/49**, both byte-identical to pre-change ⇒
+      behaviour-preserving for EVERY provider (`BulkSession` is provider-agnostic, so Delta runs through it).
+      §6 of the gate pins the unlocked configuration, **mutation-tested 4 of 4** at exactly the §6a INSERT.
+      ⚠ §6 uses 200 rows not 15 ON PURPOSE — the failure is a race a small scan sometimes wins, and a gate
+      that fails only sometimes is worse than none.
+  - **⚠ REVERSED 2026-08-11 (user decision): `mssql_materialize` DEFAULTS TO A FLAT `true` AGAIN
+    (`set ?? _materialize ?? true`) — AND IT IS NOT A REGRESSION, THOUGH I ASSERTED THREE TIMES THAT IT WAS.**
+    The error is the reusable part: the 0-of-8 numbers below predate **the bulk deferral, which landed the
+    same day**, and I kept re-deriving "no MARS ⇒ draining deadlocks" from them without re-measuring. The
+    user asked *"mars is auto, right?"* and one probe settled it.
+    - **MEASURED under the new default on a `mars 'false'` catalog: the same-catalog INSERT and CTAS both
+      run clean, and the read-your-writes probe returns 15, not 10.** So the flat default makes the
+      drained+pinned route — which the deferral fixed and which
+      `verify_mars_off_same_catalog` §6 already pinned as *"A SUPPORTED CONFIGURATION, NOT AN ACCIDENT"* —
+      the default on EVERY engine, with read-your-writes everywhere.
+    - **The real trade is DRAIN vs STREAM, not safety**: the whole source is buffered in memory with no
+      spill, and a same-catalog 1M-row CTAS on Fabric measured ~27% more CPU and 484 MB more allocation
+      drained than streamed. `SET mssql_materialize='false'` buys the streaming back and gives up
+      read-your-writes.
+    - ⚠ **Consequence for the suite: §2/§3 PASS unchanged and only §4 fails** — the section asserting
+      read-your-writes is ABSENT. That cost no longer exists at the default, so §4 was re-pinned rather
+      than worked around. Predicting which sections would move was wrong too; running it took one minute.
+  - **✅ 2026-08-10: `mssql_materialize` DEFAULTED TO MARS** — `set ?? _materialize ?? _marsEnabled`,
+    where it used to be a flat `?? true`. On a MARS engine nothing changes (drained + pinned, read-your-writes
+    intact); without MARS the marked scan takes the SNAPSHOT-READ route — pooled, at SNAPSHOT — so it never
+    shares the connection with the load. **MEASURED: box went 0 of 8 → 8 of 8, and the three Fabric shapes
+    that failed (autocommit INSERT, explicit-txn CTAS, explicit-txn INSERT) all pass with 0 errors.**
+    - **⚠ FALSE MEANS SNAPSHOT-READ, NOT PLAIN POOLED, and that is what makes it safe.** Returning false from
+      `SinkRequiresDrainedScan` instead — neither drained NOR snapshot-read — gives a READ COMMITTED pooled
+      read, which `EnsureScanCannotSelfBlock` REFUSES: a hang traded for a refusal, not a fix.
+    - **⚠ IT FOLLOWS MARS RATHER THAN BEING UNCONDITIONAL** because the route needs snapshot isolation, and
+      the engines that lack MARS (Fabric/Synapse) are exactly the ones that have it by construction. Forcing
+      `mssql_mars='false'` on a box database without ALLOW_SNAPSHOT_ISOLATION yields a clear error from the
+      isolation SET, not a hang — and that is opt-in twice over.
+    - **Cost: read-your-writes on the scanned table**, accepted deliberately (bulk movement does not need to
+      observe its own uncommitted rows). It removes nothing that worked — every configuration that would have
+      delivered it without MARS is one of the shapes that deadlocked.
+    - **⚠ ROW 7 FIXED IN THE SAME PASS — AND FIXING IT REMOVED A REGRESSION THE MARS DEFAULT HAD JUST
+      INTRODUCED (found by testing row 7 on box, 3 of 3).** `mssql_materialize=false` + `mssql_read_isolation`
+      is refused as contradictory, which is right when BOTH are active requests — but that check tested the
+      RESOLVED value, and once `materialize` defaulted to MARS it resolved false with nobody asking. So the
+      refusal fired for every no-MARS user who set `read_isolation` ALONE, i.e. it would have made the option
+      unusable on Fabric outright. Now it tests what the USER supplied (`MaterializeExplicitlyFalse`), and
+      row 7 then falls through to the pooled snapshot route by itself, because `readIsolationPin` already
+      required `!snapshotRead`. **Standing lesson: a rule phrased "the user set X" must test what the USER
+      SUPPLIED, not what the resolver returned — the day the default changes, it silently starts applying to
+      everybody.**
+      - `read_isolation` still pins ORDINARY reads; only a MARKED scan is exempt. Both halves gated in §5,
+        and the ordinary-read control is load-bearing: without it the write assertion would pass equally if
+        the option had simply been disabled. Mutation-tested — restoring the resolved-value check kills it
+        2 of 2 at exactly the §5 INSERT, with §1–§4 passing first.
+    - Gate `test/verify_mars_off_same_catalog.test` (**90**, service tier), **mutation-tested: restoring the
+      flat `?? true` kills it 3 of 3 at exactly the §2 INSERT**, with the §1 MARS-ON control passing first.
+      ⚠ **`SET mssql_mars` USED TO HAVE TO PRECEDE THE ATTACH** (resolved once at first connect) — writing
+      the gate the other way round silently produced a MARS-ON catalog and a vacuously passing suite.
+      **Superseded 2026-08-11 by change B: the mode is resolved PER CONNECTION at open time.** The ordering
+      stays in the suite as the clearest way to open two catalogs under two modes, and its §0 now ASSERTS
+      the difference instead of relying on it.
+  - **⚠ `SET mssql_materialize='false'` MAKES IT RUN — AND SILENTLY CHANGES THE ANSWER. MEASURED.** It sends
+    the marked scan down the `snapshotRead` route (pooled at SNAPSHOT) instead of drain-and-pin, so the scan
+    and the sink's DDL stop sharing a connection: **0 failures, every query `pooled`, transaction committed**
+    where the same script otherwise hangs 30 s and dies. But the CTAS then reads COMMITTED state, so the
+    transaction's own 5 uncommitted rows are invisible — **10 rows landed where 15 were expected.**
+    ⇒ a legitimate workaround where read-your-writes is not needed, and NOT a fix: it trades a loud hang for
+    a quiet wrong answer, which on this shape is the worse of the two.
+  - **⚠ THE "REAL FIX" — HOISTING THE SINK'S DDL INTO `begin_bulk` — WAS BUILT, MEASURED AND REVERTED
+    (2026-08-10, user-asked). IT WORKS AND IS STILL NET-NEGATIVE. Do not rebuild it without reading this.**
+    A `PrepareBulkTarget` DIM on `IBackendCatalog` (default no-op, so only SQL Server was affected) ran the
+    DROP/CREATE synchronously in `BulkSession`'s constructor — i.e. inside `begin_bulk`, which DuckDB calls
+    when it builds the sink's global state — and then asked the consumer for `createTable:false,
+    replace:false`.
+    - **The ordering premise was CORRECT and is now measured**: the log went from `scan 19.442 → ddl 19.454`
+      to `ddl 15.101 → scan 15.368`. Sink-state construction really does precede source-state construction,
+      and the 30 s `Execution Timeout` became an immediate, self-explanatory
+      *"There is already an open DataReader associated with this Connection"*.
+    - **⚠ AND IT BROKE A SHAPE THAT WORKED, through a side effect nothing in the design predicted.**
+      `PrepareBulkTarget` must call `BeginWrite()` to get the transaction's connection — which MATERIALISES
+      that connection EARLIER than before. A marked scan then finds a connection to pin to where it
+      previously found none and went POOLED; and a PINNED scan cannot coexist with `SqlBulkCopy` on the same
+      connection without MARS. **MEASURED with the hoist as the only variable**: autocommit same-catalog CTAS
+      on Fabric ⇒ hoist ON *"The connection does not support MultipleActiveResultSets"*, scan `pinned`;
+      hoist OFF ⇒ **10 rows, scan `pooled`**.
+    - **⇒ the scan's ROUTING is a hidden dependency of when the connection is first opened**, which is not
+      visible from the call site and is exactly the kind of coupling a "pure ordering fix" is assumed not to
+      have. Any future attempt must either avoid `BeginWrite()` in the prepare step (but the DDL must share
+      the transaction, or create+load stop being atomic) or make a marked scan decline to pin while a bulk
+      session holds the connection.
+    - **The shape has a working answer already: the staged `COPY INTO` path**, which never meets the hazard —
+      its scan streams POOLED and its load is a separate statement issued after the scan has finished. The
+      plain `SqlBulkCopy` path on a no-MARS engine remains broken inside an explicit transaction, and
+      `SET mssql_materialize='false'` remains its workaround (measured above).
+

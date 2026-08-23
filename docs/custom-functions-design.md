@@ -709,3 +709,391 @@ custom C#-authored in-out (`test/verify_custom_functions.test`) → per-row stor
 `OperatorFinalize` "in-out finished" cleanup signal (`OptimizerExtension` + `LogicalExtensionOperator` +
 pass-through `PhysicalOperator`, fires once even above a UNION). Possible future: OUTPUT-param-only proc
 `_each`, multi-result-set procs, an `OperatorExtension` so in-out plans can be serialized/deserialized.
+
+---
+
+## 12. The UNIFIED PARAMETER PROTOCOL (2026-08-02) — as built
+
+> **Moved verbatim out of `CLAUDE.md` (2026-08-23).** This is the record of the refactor that replaced
+> the split `Parameters` + `NamedParameters` (+ a third `InputSchema` on the in-out/collector kinds) with
+> ONE parameter schema whose every field carries its STYLE in Arrow field metadata. `CLAUDE.md` keeps a
+> short pointer plus the rules that generalise; the reasoning, the traps and the two shipped defects it
+> exposed are here.
+
+- **THE UNIFIED PARAMETER PROTOCOL — DONE 2026-08-02 (behaviour-preserving; no ABI bump).** A function now
+  declares **ONE parameter schema** whose every field carries its STYLE in Arrow field metadata
+  (`fabricator.param_style` = `named` | `table`; ABSENT ⇒ positional). This replaced a split
+  `Parameters` + `NamedParameters` pair plus a third `InputSchema` on the in-out/collector kinds.
+  `dotnet/Fabricator.Abstractions/ParamStyle.cs` (`ParamStyle` / `Params`) is the whole protocol; C++ reads it
+  as `FabricatorParamStyle` (`FetchFunctionParamSchema`'s `out_styles`, replacing `vector<bool> arg_is_named`).
+  - **Why**: the split forced every consumer to reconstruct one ordering rule ("positions are `Parameters` ++
+    `NamedParameters`"), and a host that got the NULL substitution off by one would corrupt a POSITIONAL value
+    rather than error. With one schema, position IS declaration order and that bug cannot be written.
+  - **⚠ BOTH ordering rules are DuckDB's, not ours** — verified in `bind_table_function.cpp`: *"Unnamed
+    parameters cannot come after named parameters"* and *"Table function can have at most one subquery
+    parameter"*. `Params.Validate` moves those from CALL time to DECLARATION time. Named on a SCALAR is a
+    declaration ERROR (DuckDB `ScalarFunction` has no named-parameter concept), never silently ignored.
+  - **⚠ A table input is POSITIONAL-ONLY, and that is forced**: the binder's named-parameter path sets the
+    argument name and the subquery branch then ignores it, so `f(t := (SELECT …))` silently binds as THE
+    positional table arg. It MAY sit between positionals — DuckDB pushes a placeholder for the subquery slot
+    (`parameters.emplace_back()`), so later positions keep their index. Its declared `StructType` is carried
+    for US only: DuckDB registers `{LogicalType::TABLE}` and never sees it, so any schema validation is a
+    BIND-TIME check of our own (not built).
+  - `param_count` is **derived** (`Params.DeclaredCount`), excluding the table input so the number keeps
+    meaning "arguments you pass a value for". It is not host-read at all (registration reads 3 columns) but IS
+    user-visible via `fabricator_functions()`. Retired: `SqlGen.ParamSchema` + the `fabricator.named` tag.
+  - **⚠ THE COMPILER FINDS ALMOST NONE OF THIS.** Removing an interface member leaves `override`s of a
+    BASE-CLASS member compiling happily as DEAD CODE — ~25 declarations would have silently stopped being
+    read. The gate is a GREP (zero live `fabricator.named`), not a green build. 18 classes that hold the two
+    halves apart keep their shorthand via an EXPLICIT interface implementation
+    (`Schema ITableFunction.Parameters => Params.Combine(...)`); consequence to know: reading `Parameters` off
+    a CONCRETE subclass yields only the positional half.
+  - **⚠ Do NOT script structural edits to C#.** A brace-matching insertion loop ran away (no damage — it never
+    reached its write). A single-pass anchored insertion with an explicit class→interface map is the safe form.
+  - **POSITIONAL and/or NAMED constant args now work on an IN-OUT / COLLECTOR too, not just named** (user
+    requirement, 2026-08-02). The old bind marshalled `input.named_parameters` ALONE, which was fine only
+    while cost args were named BY CONVENTION; the moment one could be declared positional, the signature
+    accepted `f((SELECT …), 3)` and the 3 was **silently dropped before reaching C#** — a half-offered
+    capability, worse than refusing it. `FabricatorMarshalInOutArgs` now walks the DECLARED order:
+    TABLE_INPUT consumes its reserved slot and emits nothing (DuckDB pushes a placeholder Value for the
+    subquery, so skipping the slot would shift every later positional), POSITIONAL takes the next
+    `input.inputs` value, NAMED takes the supplied value or a typed NULL. Demo + gate: the global
+    `fabricator_mix(<input>, factor, bias := k)`.
+    - ⚠ **A named parameter must not be a DuckDB RESERVED WORD** — the demo first used `offset :=` and the
+      call was a *parser* error, which reads as a broken function rather than a bad name.
+  - **⚠ TWO DEFECTS THAT BOTH TIERS COULD NOT SEE, found by reading `duckdb_functions()` directly.** (1) With
+    the input table a declared parameter but the host still tagging every declared parameter as named, `input`
+    LEAKED into in-out/collector signatures as `input := STRUCT(…)`; an extra OPTIONAL named parameter breaks
+    no call, so nothing failed. (2) For in-out/collector the OLD `Parameters` meant *named cost args*, so
+    unflagged fields silently became POSITIONAL and `fabricator_delta_write(…, path := '…')` stopped binding.
+    Both are now gated by asserting the SIGNATURE itself (verify_global_functions), which is the only thing
+    that can catch "accepts an argument the implementation never receives".
+  - **⚠ Apache.Arrow 23 cannot even CONSTRUCT `new StructType(empty)`** — `ArgumentNullException('fields')` on
+    a non-null EMPTY list, so the message names the wrong problem. It fires in a STATIC FIELD INITIALIZER,
+    taking down `CustomFunctions` and, through `ListGlobalFunctions`, silently dropping every global function
+    registered after it — the visible symptom was an unrelated table function "not existing". Hence
+    `Params.TableInput` uses a scalar placeholder when no columns are declared. This extends the known
+    zero-field hostility one step earlier than export/import.
+  - Gates: hermetic **63/63 — 5685** and service **44/44 — 1458**. The protocol refactor alone was
+    5664/1446 — IDENTICAL to pre-refactor, which is the behaviour-preservation claim; the rest is the new
+    signature/mixed-arg and `_each` coverage.
+  - **THE SQL SERVER BINDING — BUILT + LIVE-VALIDATED 2026-08-02 (§9h). This closes §8's "largest remaining
+    gap in reach", and building it found TWO SHIPPED BUGS.** The whole set was bound to a OneLake **Delta**
+    attach, so a dbt project on a Fabric **Warehouse** over T-SQL could not call even
+    `refresh_sql_endpoint`. Now: `ATTACH 'Server=<ep>.datawarehouse.fabric.microsoft.com;Database=LH'
+    AS w (TYPE fabricator, SECRET fabric_sp)` → `w.fabric.refresh_sql_endpoint()` (the two ATTACH options this
+    originally required are now INFERRED and renamed — §9n below).
+    **No ABI and no C++ change** — `fabricator_storage.cpp` already forwards unknown ATTACH options as JSON.
+    - **The recorded diagnosis ("credential plumbing") was the SMALLER half.** The real blocker: the function
+      context held the OneLake **ROOT** and parsed workspace+item out of it, so the set was structurally
+      unreachable from any other provider. ⚠ **The reason recorded here — "a Fabric SQL connstr supplies
+      neither, its host is an opaque per-workspace routing GUID" — is FALSE, corrected 2026-08-03 (§9n):** the
+      host's second base32 label IS the workspace GUID and `Database` IS the item. The refactor was still
+      needed; only that justification was wrong. Context is now `(Workspace, Item, Credential)`, each provider supplying the pair its
+      own way. `Root` had exactly two uses, both in `FabricApiClient`.
+    - Credential rides a connstr marker (`;FabricatorFabricCred=`), the mechanism already proven by
+      `AccessTokenKeyword` + `FabricatorDeltaCred`. **⚠ ORDER IS LOAD-BEARING** — the access-token marker means
+      "everything after me is the token", so this one is appended AFTER and stripped BEFORE it.
+    - **⚠ A pre-minted `access_token` is deliberately NOT carried** (SQL audience ≠ `api.fabric.microsoft.com`
+      ⇒ guaranteed 401); carrying nothing falls through to the ambient chain, which works on and off Fabric.
+      **`azure_tenant_id` — declared in `SecretFields` since the beginning, consumed by nothing — is now
+      load-bearing**: SqlClient infers the tenant from the server, `ClientSecretCredential` cannot.
+    - **⚠ The gate is the HOST (`*.fabric.microsoft.com`), NOT `ServerProfile.IsWarehouse`** — `EngineEdition
+      == 11` also means **Synapse serverless**, and `IsWarehouse` would force profile detection (a connection)
+      at ATTACH just to decide registration.
+    - **⚠ BUG 1 (pre-existing): `lakehouses()` and `warehouses()` THREW ON EVERY CALL.** The
+      `workspace :=` pass added the `args[0]` read to every catalog-bound table function but the declaration to
+      all except these two; the base sizes the args array from the declared count ⇒ `IndexOutOfRangeException`,
+      total not partial. It landed one day AFTER both were live-validated, and their only gate is live.
+    - **⚠ BUG 2 (pre-existing): EVERY timestamp on the hand-rolled functions read as JANUARY 1970** — 15 sites
+      / 5 files incl. the flagship refresh, all four job functions, the notebook runner, both semantic-model
+      functions. `new TimestampArray.Builder()` **defaults to MILLISECOND** while the columns declare
+      MICROSECOND; nothing reports the mismatch, so the host faithfully reads a number 1000× too small. It
+      survived live validation of every affected function because each was checked for status/ids and **nobody
+      looked at the times**. Functions on `FabricRowBuilder` were immune (it builds FROM the declared field);
+      the fix gives the rest that property via one shared `TsType`/`TsBuilder()`.
+    - `__all__` is now IMPLEMENTED on SqlServer (`ExpandAllSchemas`, lazy + `schema_filter`-aware), superseding
+      §9g's "rejected loudly" — that was correct only while nothing used the sentinel.
+    - Gate `verify_functions` 13 → **15** (negative control + a `cf_*` POSITIVE control, mutation-tested); the
+      positive live path is manual, like `verify_dax`.
+  - **VARIABLE LIBRARIES — 10 functions BUILT + LIVE-VALIDATED end to end (2026-08-03), §9j.** Fabric's
+    per-environment config item (default value set + alternative sets, exactly one ACTIVE, flipped per stage by
+    a deployment pipeline). Reads: `variable_libraries` / `variables(lib, value_set := …)` /
+    `variable_value_sets` / the scalar `variable(lib, name)`. Writes:
+    `create_variable_library` / `set_variable` / `set_variables_json` /
+    `set_variable_override` / `set_active_value_set` / `drop_variable_library`. No new
+    dependency — the pinned 2.18.0 SDK already carries `FabricClient.VariableLibrary.Items`.
+    - **Why it earns its place: an `ItemReference` variable stores exactly `{workspaceId, itemId}`, which is what
+      our own `workspace :=` / `item :=` overrides consume.** Proven live:
+      `refresh_sql_endpoint(item := variable('cfg','target') ->> 'itemId')` refreshed the real
+      lakehouse's 21 tables. So a dbt project reads its target from the library instead of hardcoding it.
+    - **⚠ There is NO effective-value API** — the typed model stops at `ActiveValueSetName` and every value lives
+      in the item DEFINITION as base64 parts, so resolution is ours (decode `variables.json`, overlay
+      `valueSets/<name>.json` by name). Same shape as `notebook_parameters`.
+    - **⚠ The definition API is WHOLE-DOCUMENT and has no ETag.** A write that sends only the part it changed
+      DELETES the value sets and settings, so every setter reads all parts and writes all parts back — and that
+      read-modify-write is LAST-WRITER-WINS. `set_variables_json` is the single-call declarative
+      alternative (it also REPLACES, so an omitted variable is removed).
+    - **⚠ Reads and writes are LONG-RUNNING OPERATIONS: the 13-step live script took 7m39s** for ~15 definition
+      operations. Two `variable()` calls in one SELECT list are two reads — the "no cache across calls"
+      decision is right for configuration but not cheap.
+    - **`variable` is declared CONSISTENT and that is load-bearing** — our scalar default is VOLATILE, and
+      a volatile function is never folded, so the default would cost one LRO PER ROW.
+      `BoundFunctionExpression::IsFoldable()` is exactly `stability != VOLATILE`. (As a table-function argument
+      it is evaluated once regardless: `bind_table_function.cpp` checks only `IsScalar()` then calls
+      `EvaluateScalar(…, allow_unfoldable: true)` at bind.) Consequence: a PREPARED statement bakes the value in.
+      Conversely **every WRITE function must stay VOLATILE** or it may run at bind, once for N rows, or be elided.
+    - **⚠ CREATION is refused for a service principal** (`FeatureNotAvailable`), contradicting the docs' *"the
+      variable library REST APIs support service principals"* — same as `ResetShortcutCache`, same error code as
+      notebook creation. **Scope settled by measurement, not inference:** a library created by another identity
+      is then fully driveable by the SP (definition GET/PUT, properties update, list all permitted) ⇒ principal-
+      scoped and specific to creation, exactly like notebooks. **The error names the wrong cause** — the feature
+      IS available. So creating the library is a one-time human action; everything after automates.
+    - **⚠ Microsoft's docs contradict themselves in FOUR places, each a silent wrong answer if guessed**: the
+      value-set folder is spelled both `valueSets\…` and `valueSet/…` (we read either + normalize `\`, write
+      plural); `type` casing is unstable (`"String"` beside `"boolean"`) so types pass through VERBATIM; the REST
+      page's type table OMITS `Guid` and `ConnectionReference` (so no closed enum — an unknown type parses as
+      JSON, falling back to string, with the service as the validating backstop); and **`VariableOverride.value`
+      is typed `String` and that is wrong** — mutation-testing showed it breaks **Integer** too, not just the
+      object types. Variable names are NOT case sensitive, so both the read overlay and the write upsert match
+      that way (otherwise an upsert appends a second entry and invalidates the library).
+    - **⚠ THE DEFECT LIVE VALIDATION FOUND, and why the offline test could not:**
+      `JsonElement.GetRawText()` returns the raw SOURCE SPAN, so a pretty-printed object value arrived in a SQL
+      column as `{\r\n        "workspaceId": …}`. It is a READ-side bug (the portal or a git sync may indent, so
+      normalizing belongs on read) fixed by re-serializing through a `Utf8JsonWriter`. **The offline round trip
+      was blind to it because `ToJsonString()` emits compact JSON — the harness was reading back its own
+      formatting convention. A round trip only tests the shapes you generate.**
+    - Coverage: the live lifecycle incl. three negative controls (unknown value set, undeclared override,
+      mistyped value) each erroring with the library left unchanged — plus **`dotnet/Fabricator.Bridge.Tests`,
+      THE FIRST TEST PROJECT FOR BRIDGE LOGIC** (2026-08-03): 47 cases × {net10.0, net8.0} in ~100 ms over the
+      format, incl. the write→read round trip, the pretty-printed case, and a named test per documentation
+      contradiction. **Mutation-tested with three mutants, each killed at exactly its own tests** (folder
+      spelling → 6; the docs' `value: String` → 4, incl. Integer; `Render`→`GetRawText` → 2).
+      - **⚠ It has NO `ProjectReference` to `Fabricator.Bridge`, and adding one would BREAK TIER 0** — the Bridge
+        project-references **engineered-wood (a submodule)** plus Arrow/Fabric SDK/SqlClient/AWS/Azure, and tier
+        0's defining property is needing no C++, no vcpkg and no submodules. It **compiles selected Bridge source
+        files directly**, admission rule: *a file belongs there only if its closure is the BCL*. A forcing
+        function, not a workaround — it rewards keeping parsing/resolution/rendering out of the Arrow/SDK
+        boundary, which is why `FabricVariableLibraryFormat.cs` was split out in the first place.
+      - **WIRED INTO TIER 0** as a SECOND JOB (`bridge`) in `installer-core.yml`, floor 47, both TFMs × both
+        OSes. Three things about that wiring are deliberate and easy to undo by accident:
+        - **A separate job, not another step** — the count tripwire reads the FIRST `Total:` in its output file
+          (`head -1`), so a second `dotnet test` piped into the same file would leave this project's floor
+          silently unchecked. A tripwire that looks armed and is not.
+        - **The path filter lists `dotnet/Fabricator.Bridge/**`, not the individual linked file** — filtering the
+          one file would silently stop covering the next one someone links, the same failure as the
+          submodule-pointer omission (a filter that misses the change the gate exists to guard).
+        - **Both OSes**, because the format code normalises PATH SEPARATORS and asserts on CRLF in stored JSON;
+          pinning that on one platform is how an accidental `Path.DirectorySeparatorChar` /
+          `Environment.NewLine` dependency hides.
+        ⚠ The workflow is still NAMED `installer-core` for a historical reason only (renaming it renames every
+        status check) — read it as "tier 0", not "the installer".
+  - **SPARK SESSIONS — `sessions([workspace := …])` BUILT + LIVE-VALIDATED (2026-08-03), §9k.** 27
+    columns over the WORKSPACE-scoped `Spark.LivySessions.ListLivySessions(workspaceId)` — so, unlike
+    `job_instances(item)`, it answers "what is on the Spark compute" with **no item argument and one
+    request**. No ABI/C++ change, no new dependency. It is the Spark half in DETAIL (queued vs running time,
+    runtime version, attempt number, `spark_application_id`, high-concurrency — none of which a job instance
+    carries), not a better job list: job instances still cover Pipeline/Dataflow/TableMaintenance, which never
+    appear as sessions.
+    - **⚠ TWO CLAIMS I WROTE FIRST AND THE DATA FALSIFIED.** (1) "Interactive sessions have no job instance" —
+      wrong: all 115 sessions carried a `job_instance_id`, and a spot-checked one WAS in that notebook's
+      `job_instances` history, so it is a real join key. (2) **`JupyterSession` does NOT mean
+      "interactive"** — every one observed was created by the RunNotebook JOB api with nobody clicking; the
+      value names the session KIND (a Jupyter kernel), not its trigger. Whether a portal-driven session lacks a
+      job instance is **UNVERIFIED** (no such session existed in the data) — do not restate it either way.
+    - **⚠ The SAME work is labelled differently in TWO columns.** One identical `job_instance_id` reads
+      `job_type='JupyterSession'`/`state='Succeeded'` as a session and `job_type='RunNotebook'`/
+      `status='Completed'` as a job instance ⇒ a predicate carried across matches NOTHING. Values pass through
+      VERBATIM (normalising would hide which API answered; both are extensible enums that can grow).
+    - **⚠ THE SQL VALUES ARE NOT THE SDK MEMBER NAMES**: the member is `NotStarted`, the column says
+      **`Not Started` — with a space** (captured live), while `InProgress` has none ⇒ a predicate derived by
+      reading the enum is wrong. Observed: `Not Started`/`InProgress`/`Succeeded`; `Failed`/`Cancelled`/
+      `Unknown` are declared but their SPELLING IS UNCONFIRMED. Also **casing differs across columns of the SAME
+      ROW** — `item_type` is lower-case (`notebook`) while `job_type`/`state` are PascalCase. And `submitter`
+      (display name) was EMPTY on all 115 rows while `submitter_id` was populated on all 115 — group by the id.
+    - **⚠ ALL 34 FIELDS SHIP — and a WRONG CONCLUSION OF MINE IS RECORDED HERE ON PURPOSE.** The seven
+      ALLOCATION columns (driver/executor cores+memory, num_executors, dynamic allocation ×2) were NULL in all
+      116 observed sessions and I first DROPPED them, claiming "the list endpoint never populates them". Wrong.
+      NULL across finished sessions was correctly rejected as insufficient ("only reported while running"
+      explained it equally well), so a session was manufactured (`run_notebook(…, wait_seconds := 0)`) and polled
+      to `InProgress` — still NULL. That kills the LIFECYCLE explanation and says NOTHING about the structural
+      one, **because the variable that actually differed is session KIND**: by `runtime_version` the history is
+      `jupyter1.0`/`JupyterSession` (Python notebook runs) plus `2.0`/`SparkSession`+`SparkBatch` (SYSTEM-managed
+      `Lakehouse Operations`/`Table Maintenance`) — **no user-authored PySpark session at all**, the only kind
+      carrying a real executor allocation. A NULL there means "this workload has no Spark allocation", i.e.
+      information. PySpark population is EXPECTED but UNVERIFIED here. **Standing lesson: eliminating one rival
+      explanation is not eliminating all of them — name the variables you did NOT control before generalising
+      from a negative result.** (`executor_cores` is VARCHAR because the SDK types it `object`.)
+      **The manufactured session was still worth it — it is the POSITIVE CONTROL for the headline feature**:
+      every prior row was `Succeeded`, so the function had never once been observed doing what it exists for;
+      polling showed `InProgress` with `running_seconds` 26→53.
+    - **⚠ Live cell OUTPUT is an API absence, not a gap to fill**: `spark_application_id`/`resource_uri` are
+      POINTERS, and the whole SDK assembly has no log-fetching method. This gets you to the session, not inside it.
+    - **`Duration` is a `{value, unit}` PAIR, not a TimeSpan** — a CLASS (absent-able) whose `TimeUnit` is an
+      Azure EXTENSIBLE enum (Seconds/Minutes/Hours/Days). Normalised to seconds as DOUBLE, compared against the
+      TYPED members (a rename is then a compile error), and an **unknown unit yields NULL, not the raw number**:
+      a column mixing seconds with minutes makes every `ORDER BY` wrong, and wrong is worse than absent. ⚠ It
+      also collides by name with `Apache.Arrow.Types.TimeUnit` — hence the alias.
+    - **`FabricRowBuilder.EndRow()` now VERIFIES every column got exactly one value** and names those that did
+      not. Identity there is a bare INDEX and this function writes 27, so the off-by-one the class exists to
+      prevent was one edit away; a skipped column used to surface as a length mismatch deep in `RecordBatch`
+      construction, or — two skips in different rows — as a batch that builds fine with values in the WRONG
+      rows. All 7 pre-existing sites were audited against their declared counts FIRST (all correct), so the
+      guard changed nothing. Also gained DOUBLE support. Hermetic **63/63 — 5685** (unchanged ⇒
+      behaviour-preserving; `fab_delta_info` is what exercises the shared builder offline). The function itself
+      is live-only, like `verify_dax`.
+  - **ATTACH OPTIONS INFERRED + RENAMED `API_WORKSPACE`/`API_ITEM` — DONE 2026-08-03 (breaking), §9n.** A Fabric
+    SQL attach now needs NO Fabric-specific option: `ATTACH 'Server=<ep>…;Database=MyLH' AS w (TYPE fabricator,
+    SECRET fabric_sp)`.
+    - **⚠ THE ENDPOINT HOST IS NOT OPAQUE — this file said it was, and that was FALSE.**
+      `<base32(cluster GUID)>-<base32(WORKSPACE GUID)>.datawarehouse.fabric.microsoft.com`: 26 unpadded
+      lower-case RFC-4648 base32 chars per label = 130 bits carrying a 16-byte GUID, and the **second** label
+      decodes **little-endian** (.NET `Guid.ToByteArray()` order) to exactly the workspace id. Established by:
+      all 3 lakehouses AND a warehouse in one workspace returning a BYTE-IDENTICAL host while their own
+      `sql_endpoint_id`s matched neither label ⇒ label 2 = workspace, label 1 = a workspace-level SQL cluster.
+      The **item** needs no decoding — on a Fabric SQL endpoint `Database` IS the item.
+    - **Live proof is DISCRIMINATING, not just "rows came back"**: two attaches differing ONLY in `Database`,
+      same server, no options ⇒ `LH` **21** tables vs `LH2` **0**; and `API_ITEM 'LH2'` on the `LH` attach ⇒ 0,
+      so an override still outranks the default.
+    - **⚠ The inference must NEVER GUESS.** The encoding is UNDOCUMENTED, one tenant, one region ⇒
+      `WorkspaceIdFromHost` returns **null** on any doubt (wrong suffix / label count / label length / a char
+      outside the base32 alphabet) and the caller falls back to demanding the option. A WRONG workspace id would
+      aim REST calls at a different workspace the identity may well have access to, so silence is the only
+      acceptable failure. The enumerate-and-match fallback (list workspaces → compare each item's endpoint
+      connstr to this host) is **deliberately NOT built**: O(workspaces × items) REST calls AT ATTACH to convert
+      a clear error into a slow success, on the one path whose defining property is costing no round trip.
+    - **Why RENAMED and not merely optional**: `WORKSPACE`/`ITEM` read as if they selected the ATTACH TARGET.
+      They do not — they scope the `fabric.*` functions only, and two attaches differing solely in `ITEM` expose
+      IDENTICAL tables (the option is invisible until a function runs). **⚠ The old names now ERROR rather than
+      being ignored, and that guard is load-bearing**: unknown ATTACH keys are dropped for forward-compat, so
+      leaving them unhandled would silently fall back to the inferred default — redirecting a refresh at the
+      `Database` item instead of the named one, with no message. Verified live.
+    - **The OneLake side ALREADY did this — no work needed.** `ParseOneLake` takes the container as the workspace
+      and the first segment as the item, and BOTH resolvers short-circuit on `Guid.TryParse`, so a **pure-GUID
+      root costs ZERO resolution calls** (verified live: 21 tables + `fabric.sessions()` 116).
+    - **Which identifiers the APIs accept** (easy to assume wrongly): the Fabric REST API is **GUID-ONLY** —
+      every SDK method takes `Guid workspaceId`/`Guid itemId`. Accepting a NAME is purely our convenience layer
+      (`ResolveWorkspace`/`ResolveItem` list + display-name match, cached per catalog in `_idCache`), so a name
+      costs one listing on first use and a GUID costs none.
+    - **Gate: `Fabricator.Bridge.Tests` 47 → 85, tier-0 floor raised.** `FabricSqlEndpointHost` is BCL-only BY
+      DESIGN — it hand-rolls the base32 decode (the BCL has none) and the connstr parse instead of using
+      `SqlConnectionStringBuilder` — so the undocumented part is testable OFFLINE. **It paid for itself
+      immediately: the tests failed on first run and caught a real bug** (the label extraction took the substring
+      after the LAST dot, yielding `datawarehouse` instead of the encoded pair).
+  - **JOB-INSTANCE FAN-OUT — DONE 2026-08-03 (breaking on ONE parameter), §9m.**
+    `fabric.job_instances([item := …] [, item_type := …])`: omitting `item` fans out over every item of
+    `item_type`, one `ListItemJobInstances` per item, with `item_name`/`item_id` APPENDED (appended, not
+    prepended — D4 keeps `SELECT *` additive). Live: `'Notebook'` → 53 runs across 2 notebooks; `'Lakehouse'` →
+    LivySession 47 / TableLoad 9 / TableMaintenance 7.
+    - **⚠ `item` moved POSITIONAL → NAMED and HAD to**: DuckDB arity is fixed, so a positional parameter cannot
+      be omitted, and omitting it is what selects fan-out. Shipped in the SAME breaking window as §9l so callers
+      migrate once.
+    - **Why here and not in `sessions()`**: sessions are already workspace-scoped in one request but Spark-ONLY;
+      job instances cover every item kind and the API is strictly per-item, so enumerating items is the only way
+      to ask "what ran in this workspace". The two CROSS-VALIDATED — the lakehouse fan-out's `LivySession` = 47
+      is exactly the 47 `Session Livy Run` rows `sessions()` reports.
+    - **Two deliberate refusals**: omitting BOTH `item` and `item_type` ERRORS rather than sweeping the workspace
+      (unbounded × per-principal throttle), and there is **no `max_items` cap** — a cap would under-report while
+      looking complete. One item's failure fails the whole statement, on purpose (a partial result that looks
+      complete is worse). Cost is stated in the error, not hidden.
+    - **⚠ A job instance's `StartTimeUtc`/`EndTimeUtc` are ISO STRINGS** (a Livy session's are `DateTimeOffset`)
+      ⇒ `FabricRowBuilder.Iso`, not `.Ts`. The compiler catches it. Binding moved to `FabricRowBuilder` (10 cols).
+    - **THE SECOND AXIS — `sessions(all_workspaces := true)` — ALSO DONE (2026-08-03).** The job fan-out
+      enumerates ITEMS inside one workspace; this enumerates WORKSPACES (one `ListWorkspaces` + one
+      `ListLivySessions` each) and appends `workspace_name`/`workspace_id`. Mutually exclusive with
+      `workspace :=` (errors — naming one workspace and asking for all is contradictory). `all_workspaces` is a
+      REAL `BooleanType` read via `FabricArgs.Bool`, safe because this binding reads args individually — the
+      "BOOLEAN named parameter silently reads NULL" hazard is specific to `FabricRowsFunction`.
+      - **⚠ THE MULTI-WORKSPACE AGGREGATION IS UNVERIFIED — the tenant exposes exactly ONE workspace to this SP**,
+        so a fan-out result is INDISTINGUISHABLE from the single-workspace one. Do not read a green run as
+        coverage; a second workspace is the only thing that settles combining/attribution/paging.
+      - **What IS proven is that the fan-out PATH executes, via a constructed discriminator** rather than a row
+        count: attach by a **GUID** root so the single-workspace default carries no name ⇒ `sessions()` gives
+        `workspace_name = NULL` while `sessions(all_workspaces := true)` gives `Test`, which could ONLY come from
+        `ListWorkspaces`. (Hence `workspace_name` is NULL in single mode on a GUID default — same rule as the job
+        fan-out's `item_name`: echo what the caller knows, never pay for a listing to restate it.)
+      - A per-workspace failure fails the WHOLE statement (consistent with the item fan-out). **Unvalidated for
+        the interesting case** — "can see a workspace but cannot list its sessions" has never been observed here.
+        If that proves common the answer is an `error` COLUMN, not a silent skip.
+    - **§9m carries the FAN-OUT VERDICT for every other candidate.** The deciding pattern: fan out when the
+      per-item call is a cheap LIST; REFUSE when it is a long-running definition read. So
+      `semantic_model_refreshes` (over `semantic_models()`) — **dropped from the recommendation by the user
+      2026-08-03: not needed** — then `mirroring_status`/`mirrored_tables`, `data_access_roles`, the
+      deployment-pipeline trio, `list_shortcuts`; **`git_status` over WORKSPACES is DEFERRED (user, 2026-08-03)
+      until a git-connected workspace exists to test against** — writing it blind would ship an untested
+      promotion surface, the same reason P3 is "wired but NOT live"; and `notebook_parameters` + `variables` are
+      **NO** — each is a ~20 s LRO, so fanning out multiplies a multi-minute operation behind a call site that
+      looks cheap.
+  - **THE `fabric` SCHEMA — DONE 2026-08-03 (BREAKING, no aliases), §9l.** `dbo.fabric_sessions()` →
+    **`fabric.sessions()`**: one dedicated schema, the `fabric_` prefix dropped from all **51** functions.
+    C#-only — no ABI, no C++ change. Why: the `__all__` sentinel declares each function once PER DISCOVERED
+    SCHEMA, so on `dbo`+`dbt` the set rendered as **102** rows in `duckdb_functions()` (measured **51** after);
+    and it separates a DATA schema discovered from storage from a FUNCTION namespace the provider declares.
+    - **⚠ IT IS NOT A RENAME — it is a catalog-structure change.** `fabricator_catalog.cpp:99` SILENTLY SKIPS a
+      declared function whose schema the provider did not DISCOVER (`if (sit == schemas_.end()) continue;`) —
+      deliberately, since that is how ATTACH `schema_filter` reaches functions. So the schema must be ADVERTISED
+      by each hosting provider, gated on the SAME condition as the registration:
+      `DeltaCatalog.CatalogSchemaNames()` (gate `IsOneLake`) and `SqlServerBackend.SchemasMetadata()` (gate
+      `IsFabricEndpoint`). **MUTATION-TESTED because "silently" is the claim**: with the Delta gate reverted the
+      ATTACH still SUCCEEDED with no error or warning, `duckdb_functions()` showed 0 in `fabric`, and the call
+      failed as *"Table Function with name sessions does not exist! Did you mean main.seq_scan?"* — pointing
+      nowhere near the cause.
+    - **⚠ The name must NOT join the `__all__` EXPANSION list** — that list means "every DATA schema", and
+      feeding `fabric` in would re-declare the provider macros + `fab_delta_info` inside it, restoring the very
+      duplication this removes. Hence `CatalogSchemaNames()` is SEPARATE from `SchemaNames()`, and
+      `ExpandAllSchemas()` still reads `SchemasSql` directly. The two lists look redundant and are not.
+    - `fabric` is deliberately EXEMPT from `schema_filter` on both providers (that option scopes DATA discovery;
+      deleting the whole Fabric API because someone narrowed their tables would be a surprising coupling —
+      `function_filter` is the option for functions). DDL into it is REFUSED
+      (`DeltaCatalog.RejectFunctionSchemaDdl`), because `CREATE TABLE cat.fabric.t` would otherwise create a
+      real `fabric/` folder that the NEXT attach discovers as a data schema — the namespace quietly stops being
+      separate. Only where the synthetic schema exists; elsewhere `fabric` is a name a user may legitimately use.
+    - **⚠ TWO NEGATIVE CONTROLS WERE ABOUT TO GO VACUOUSLY GREEN**: `verify_delta_catalog_functions` §4 and
+      `verify_functions` both asserted `function_name LIKE 'fabric\_%'` = 0, which after the rename matches
+      NOTHING whether or not the set is registered. Both now key on `schema_name='fabric'`; the Delta suite also
+      asserts the SCHEMA is absent, and THAT is the load-bearing one — mutating the `IsOneLake` gate leaves the
+      function-count assertion passing (a local root registers nothing to leak) and is caught only by the schema
+      assertion (verified: the mutant failed at exactly that line). 27 → **28**.
+    - **Rename mechanics worth reusing: the substitution is NOT `s/fabric_//g`.** Three token classes had to be
+      protected first — **`fabric_sp`** (the SECRET in every example; stripping gives `sp` and breaks every
+      snippet), **`fabric_*`** (the GLOB in prose; a blind strip leaves a meaningless bare `` `*` `` — it became
+      `fabric.*`), and **`<cat>.dbo.fabric_<fn>`** (33 qualified call sites in the README, 12 in docs; stripping
+      only the prefix leaves `<cat>.dbo.<fn>`, wrong in a way that still LOOKS right). The glob was found because
+      the occurrence COUNT disagreed by one with the number of function references — **an arithmetic disagreement
+      between two ways of counting is what caught it**, not review.
+    - Gates: hermetic **63/63 — 5686**; live end-to-end (`fabric` beside `dbo`/`dbt`, 51 functions ×1 each, a
+      table fn, a named-parameter call, a scalar, and the DDL refusal).
+  - Output shape rule (D4): typed flat columns + one raw-JSON column for polymorphic parts; **no STRUCT
+    wrapping** (adding a column is additive for `SELECT *`; adding a struct FIELD changes a column's type
+    and breaks bound views), no JSON-only. Every `table`-kind function also gets a dead `_each` sibling —
+    pre-existing host behaviour, shared with SqlServer's custom table functions.
+  A table function that sets neither `serialize` nor `deserialize` still takes part in DuckDB's
+  **common-subplan optimizer** (1.5.4+), which dedups subplans by SERIALIZING each operator and hashing
+  the bytes. `FunctionSerializer::Serialize` writes only name+arguments in that case and **does not
+  throw**, so `fabricator_scan`'s signature carried NO table identity — ours lives in
+  `ArrowStreamBindData`. `LogicalGet::Serialize` does contribute returned_types/names/filters, and
+  `common_subplan_optimizer.cpp:120` canonicalizes `table_index` to 0 before hashing ⇒ **two scans of
+  DIFFERENT tables that share a schema hashed IDENTICALLY**, one was materialized as a CTE, and both
+  consumers read the FIRST table's rows. `ArrowStreamBindData::Equals` was correct all along and is
+  never consulted — the optimizer compares BYTES, not `FunctionData::Equals`. That is the whole trap.
+  - Found by reading **hugr-lab/mssql-extension#211** (same defect, same fix) and checking whether we
+    had it. We did, on **every provider** — one `FabricatorTableEntry` / one `fabricator_scan` serves
+    SQL Server, Delta and DAX; reproduced on the first two, and DAX reaches the identical path via
+    `DaxCatalog.ScanTable`. DAX was arguably the most exposed in practice: it is read-only and the
+    failing shapes are pure read shapes (a measure over table A vs table B).
+  - **Affected shapes** (all silent): identical aggregate subplans over two same-schema tables — a
+    `UNION ALL` of aggregates, or two scalar subqueries. **Unaffected:** joins / EXCEPT / INTERSECT /
+    plain unions of rows (bare gets are not materialized), differing column names or types (they ARE in
+    the signature), same-table-different-filter (the differing `Filter` child changes the subplan
+    signature — safe by plan shape, not by design), and every global/discovered function (their args
+    ride in `parameters`, which IS serialized).
+  - **Fix**: `FabricatorScanSerialize` writes catalog/schema/table **plus the pushed spec**
+    (`filter_json`+constants, `native_filter_sql`, `top_n`, `order_by_json`, `at_unit`/`at_value`) so
+    two differently-pushed scans of ONE table cannot collapse either; identical scans still dedup, which
+    for a remote provider is a real win. Gate `verify_delta_subplan_dedup` (36), mutation-tested.
+  - **`PRAGMA verify_serializer` does NOT work on a fabricator catalog scan, and never did.**
+    `LogicalGet::Deserialize` calls `FunctionSerializer::DeserializeBase` UNCONDITIONALLY (before it
+    checks has_serialize), resolving the function BY NAME against `TABLE_FUNCTION_ENTRY`; the catalog
+    scan is handed out by `GetScanFunction` and is not a registered catalog function ⇒ "Failed to find
+    function fabricator_scan()". So `FabricatorScanDeserialize` is UNREACHABLE — and must still exist,
+    because `Serialize` only emits bind data when BOTH callbacks are set. Do not "clean it up".

@@ -1302,3 +1302,162 @@ The `deltars` provider has **no transaction buffer**: every statement is its own
 regardless of `BEGIN..COMMIT`, ROLLBACK does not undo them, DELETE/UPDATE are copy-on-write MERGEs
 (never DVs), and snapshot pinning does not apply. Use `engineeredwooddelta` when you need
 transactional semantics.
+
+---
+
+## Appendix — `isBlindAppend`, the `CLAUDE.md` entry moved verbatim (2026-08-23)
+
+> Both halves: the READING half (we now consume the flag and no longer infer it from action
+> shape) and the WRITING half, built 2026-08-08. `CLAUDE.md` keeps the interop consequence and
+> the two divergences from Delta.
+
+- **⚠ CROSS-ENGINE GAP MEASURED (2026-08-01). The READING half is now FIXED; the WRITING half is still
+  OPEN — we do not emit `commitInfo.isBlindAppend`, so a Fabric Spark transaction ABORTS against our
+  concurrent append whatever the table declares.** Full record:
+  [docs/delta-transactions.md](docs/delta-transactions.md) §10.6 +
+  [docs/ew-master-migration.md](docs/ew-master-migration.md) §isBlindAppend §4a.
+  - **✅ THE WRITE HALF IS BUILT (2026-08-08, user-asked) — WE NOW EMIT `commitInfo.isBlindAppend`, and the
+    blocker below was resolved by making the claim EXPLICIT rather than derived.** The obstacle was real:
+    `CommitDataFilesAsync` hardcodes `Reads = ReadSet.Blind`, so sourcing the flag from the read set (which
+    is what upstream #88 decision 1 proposes) would have stamped `true` on every silent caller. The fix is
+    not to source it from `Reads` at all — a DEFAULTED `ReadSet.Blind` means *"this caller said nothing"*,
+    not *"this caller declares it read nothing"*, and writing a spec field off a default turns every silent
+    caller into an assertive one. So `LogCommitRequest.IsBlindAppend` is a `bool?` the caller STATES, and
+    `CommitDataFilesAsync` takes it as a parameter. **Three states, and `null` writes NO FIELD.**
+    - **MEASURED end to end under `write_serializable`** (`verify_delta_catalog_transactions` §42): buffered
+      blind append ⇒ **`true`**; buffered `INSERT INTO t SELECT … FROM t` ⇒ **`false`**; autocommit ⇒
+      **absent**. Mutation-tested by claiming blind regardless of reads — dies at exactly the anti-join row.
+    - **⚠ THE `false` ROW IS THE LOAD-BEARING ONE.** Delta's definition is CONJUNCTIVE —
+      `onlyAddFiles && !dependsOnFiles` — and it computes `onlyAddFiles` separately then pointedly does not
+      use it alone. So the anti-join incremental shape emits only AddFiles and is still NOT blind. A wrong
+      `true` there is the UNSAFE direction: another engine SKIPS a check it owes.
+    - **⚠ AUTOCOMMIT DECLARES NOTHING, deliberately, and that is a REMAINING GAP not a design choice to
+      admire.** Scan-time read recording is gated on `_txnBuffer.IsExplicit`, so autocommit records nothing
+      and an append there is indistinguishable from the anti-join shape. Absent ⇒ Delta reads "not blind" ⇒
+      spurious aborts, which is the safe direction. Closing it means extending read recording to autocommit
+      — ours, not upstream's, and not done.
+    - **⚠ A BUG THE FIRST VERSION HAD, found by measuring rather than by review: `_txnBuffer.Remove(txnId)`
+      CLEARS the explicit marker, and `CommitTransaction` calls it BEFORE the flush.** Reading
+      `IsExplicit` after it is always false, so the declaration silently degraded to "say nothing" — green,
+      and quietly never emitting the flag it exists to emit. Captured before `Remove` now. Same ordering
+      fact as §4b.3.
+    - **⚠ AND THE BUFFER'S OWN PATH SPLIT ALREADY SEPARATES THE TWO CASES**, which is why this is small: an
+      append that READ routes to the DML flush (which declares its reads to engineered-wood directly) and
+      only a genuinely blind one reaches `FlushDeferredFiles`. The `false` branch is reachable because
+      `PendingSerializable` sends a read-then-append back down the deferred path under `write_serializable`
+      — the one level where the flag matters at all.
+    - **⚠ SCOPE, unchanged and worth restating: this changes NOTHING under `serializable`** (Delta examines
+      blind appends there by design) and Fabric Spark's DDL refuses to SET `write_serializable`, so the
+      tables it helps are ones WE stamped.
+  - **The ORIGINAL blocker, kept because the reasoning is the reusable part:** The line below ("cleared to build") settled whether emitting the flag would HELP; it did not
+    ask whether we could emit it TRUTHFULLY. We cannot, on the path that matters. `CommitDataFilesAsync`
+    hardcodes `Reads = ReadSet.Blind` and **takes no read-set parameter**, and our buffered append flush goes
+    straight through it — so sourcing the flag from the request (which is what upstream issue #88 decision 1
+    proposes) would stamp `isBlindAppend: true` on `INSERT INTO t SELECT … FROM t …`, the anti-join
+    incremental shape this same entry names as **the DECIDING SHAPE**. A wrong `true` is the UNSAFE
+    direction — other engines then SKIP a check they should run — i.e. we would create in the WRITE
+    direction exactly the defect we fixed in the read direction.
+    - We do record reads (`DeltaCatalog.cs:1620`, a predicate per scan or `ReadWholeTable`), but only when
+      `_txnBuffer.IsExplicit` — **autocommit records nothing** — and even inside a transaction the APPEND
+      flush holds no `DeltaTransaction` to declare into, so those reads are collected and DISCARDED. Only
+      the DML flush declares them.
+    - ⇒ the ask on #88 is **"`CommitDataFilesAsync` must accept a `ReadSet`"** plus **"a DEFAULTED
+      `ReadSet.Blind` means the caller said nothing, not that it declared blind"** — writing a spec field
+      off a default turns every silent caller into an assertive one. Full reasoning:
+      [docs/ew-upstream-0.3.0-analysis.md](docs/ew-upstream-0.3.0-analysis.md) §#88.
+    - **⚠ A read set would NOT also buy our appends `concurrentDeleteRead` protection**, and it is worth not
+      conflating them: §4b.2 established the append flush opens FRESH at COMMIT, so its concurrent range is
+      empty and no rule runs whatever it declares. The flag is about what this transaction READ; the check
+      needs a base the concurrent commits sit after. ⚠ **No SQL-level test separates the two** — the window
+      between our open and our write is microseconds, so such a probe returns "no conflict" under either
+      cause. Do not write one and read its green as evidence.
+    - **The gap therefore stays OPEN deliberately.** Spurious Spark aborts are a performance complaint;
+      silently skipped conflict checks in another engine lose data.
+  - **The FIRST obstacle was cleared, and that part stands: the write half's scope is narrower than "fixes the aborts".** The blocking
+    uncertainty was upstream PR #24's report that a whole-table read declaration conflicts even with a blind
+    append; **reading `ConflictChecker.scala` at the `v4.2.0` tag REFUTES that for WriteSerializable** — with
+    the flag set, `changedDataAddedFiles` is `Seq()`, and that EMPTY list is what the predicate check runs on,
+    so how broad the reader's declaration was cannot matter. It is applied one step EARLIER than the predicate
+    comparison, not dodged. ⇒ **the planned prunable-predicate experiment is MOOT and was not run.** Emitting
+    the flag would make Spark COMMIT on a `WriteSerializable` table and would change NOTHING on a
+    `Serializable` one (blind appends are examined there by design — that abort is correct). Both halves of
+    that prediction match the live A/B exactly. Since Fabric Spark's DDL refuses to SET `WriteSerializable`,
+    the tables this helps are ones WE stamped — Spark honours a stamped value, it just cannot write one.
+  - Live A/B on Fabric Spark 4.1.1.5.5 / **Delta-Lake 4.2.0** (`ConflictChecker.scala` re-read at the `v4.2.0`
+    TAG — the Fabric build, not master): 200M-row table, Spark `DELETE … WHERE id % 7 = 3`, our append committed
+    inside the window. `Serializable` ⇒ Spark ABORTS (`DELTA_CONCURRENT_APPEND`, naming our v8). `WriteSerializable`
+    ⇒ Spark ABORTS TOO (naming our v23). Overlap PROVEN both times by Spark naming the concurrent version.
+  - Cause, from Delta's source: `blindAppendAddedFiles = if (commitInfo.flatMap(_.isBlindAppend).getOrElse(false))
+    addedFiles else Seq()`. An ABSENT flag = "not blind" ⇒ our appends land in `changedDataAddedFiles`, which is
+    checked under BOTH levels. Confirmed three ways: the source; our commitInfo on disk (operation/engineInfo/
+    operationParameters only); and Spark's `DESCRIBE HISTORY` showing `isBlindAppend` True for ITS blind append
+    and blank for ours.
+  - **UPSTREAM OFFER — MERGED as #32 (`12b0d39`), then CORRECTED TWICE by upstream; OURS IS RETIRED.**
+    #33 found the `Exists` probe ran BEFORE the `try` (so it did not fix the case it was written for) and
+    that guarding root kind + field PRESENCE misses field TYPE and the nested `v2Checkpoint`; one try/catch
+    around the whole read-and-decode replaces all six guards. #35 then found **the argument both fixes
+    rested on was never implemented** — nothing listed the log, so after Delta's metadata cleanup a
+    hint-less read makes the table UNREADABLE, not merely slow. Full account:
+    [docs/ew-master-migration.md](docs/ew-master-migration.md) §1. The host-side one-request read stays
+    ours. And to settle the worry directly: **EW has NOT lost WriteSerializable support** —
+    `StartTransaction` still defaults to it and `ConflictChecker` still implements the relaxation; what is
+    missing is interop plumbing, not semantics.
+    - **Writing the offer PROPERLY found a second bug**, because it needed an EW-level suite (upstream cannot
+      run our sqllogictest): valid JSON that is not an OBJECT still threw, since `TryGetProperty` raises
+      `InvalidOperationException` rather than returning false on a non-object root. Ported back; our suite is
+      39 (§6). It also corrected an over-claim — `data.Length == 0` kills no test (`Parse("")` already raises
+      `JsonException`), so it is documented as a fast path, not a load-bearing guard.
+  - **The READING half was wrong too, in the OPPOSITE (unsafe) direction — FIXED 2026-08-01 (EW-only).**
+    `ConflictChecker.IsBlindAppend` INFERRED blind-append from action shape ("only AddFiles"), so another
+    engine's `INSERT … SELECT` from the same table — only adds, but it READ — was treated as blind and we
+    skipped a check we owe. It now CONSUMES `commitInfo.isBlindAppend` when present and falls back to the
+    inference (`InferBlindAppend`, unchanged) only when absent; a non-boolean counts as absent. Three
+    non-obvious parts: the declaration outranks the inference in BOTH directions (each has a test); ABSENT
+    keeps meaning "infer", since almost every commit in the wild omits the flag and defaulting to
+    "not blind" would conflict on ordinary appends; and a **round-trip test** proves the flag survives
+    `TransactionLog.ReadCommitAsync` — without it the verdict tests would be pinning dead code. No model
+    change needed (`CommitInfo.Values` already keeps arbitrary keys). Mutation-tested; Table.Tests 727.
+    - **⚠ "FIXED" MEANS FIXED FOR *DECLARED* COMMITS ONLY — we still DIVERGE FROM DELTA on the absent case, in
+      the weaker direction (established 2026-08-03 by re-reading `ConflictChecker.scala` at `v4.2.0`).** Delta is
+      `isBlindAppendOption.getOrElse(false)`: **absent ⇒ NOT blind**, so those adds stay in
+      `changedDataAddedFiles` and ARE examined even under WriteSerializable. Delta even computes
+      `onlyAddFiles = actions.collect{case f: FileAction => f}.forall(_.isInstanceOf[AddFile])` and **pointedly
+      does NOT use it** for blind-append — so our fallback is precisely the inference Delta declined to make.
+      Ours is a deliberate back-compat choice (EW emits no flag itself, so `getOrElse(false)` would make
+      ordinary EW-to-EW concurrent appends start conflicting), NOT a claim of parity. Do not describe the
+      reading half as "matching Delta".
+    - ~~Second, smaller divergence: Delta's WriteSerializable branch is guarded by
+      `!currentTransactionInfo.metadataChanged`…~~ **CLOSED UPSTREAM 2026-08-13 by #146 (`b00bde5`), which is
+      the divergence this line recorded and never chased.** `ExamineConcurrentAdds` now has Delta's THIRD
+      term — under `write_serializable` a transaction that itself changes the metadata falls through to the
+      Serializable branch and examines concurrent blind appends too. **It bites US, because our catalog
+      default is `write_serializable` again**: a transaction carrying a `metaData` action — a buffered ALTER,
+      an identity append fusing its high-water mark, `set_tblproperties`, a CREATE — now conflicts with a
+      concurrent blind append where it used to commute. Safe direction, Delta parity, and invisible to every
+      suite (sqllogictest is sequential). ⚠ Upstream checked METADATA only, NOT protocol, against the
+      `v4.0.0` tag: Delta's `metadataChanged` is `newMetadata.nonEmpty` and a `Protocol` action never sets
+      it, so including protocol — which issue #126 proposed — would have been STRICTER than Delta and made a
+      transaction merely enabling a table feature start conflicting.
+  - **The fix must be TRUTHFUL:** Delta's definition is "the transaction READ NOTHING"
+    (`readPredicates.isEmpty && readFiles.isEmpty`), NOT "the commit contains only adds" — deriving it from
+    action shape would mark `INSERT … SELECT` from the same table as blind, and a wrong `true` makes other
+    engines SKIP a check they should run (the unsafe direction).
+    - **⚠ THE DECIDING SHAPE is `INSERT INTO t SELECT … FROM t …`** — an anti-join insert ("insert only rows
+      not already there"), i.e. the standard dbt-incremental/dedupe pattern, so the COMMON case not an exotic
+      one. It READS the target ⇒ not blind, yet emits **only AddFiles** ⇒ every action-shape derivation calls
+      it blind. That is both why the reading half needed fixing and the trap the writing half must avoid.
+    - **⚠ Whether we can derive the flag depends on AUTOCOMMIT vs EXPLICIT — measured, and it narrows the
+      problem** (`DeltaCatalog.cs:1232`, gated on `_txnBuffer.IsExplicit(scanTxn)`): inside `BEGIN…COMMIT` a
+      scan DOES stage a predicate / `StageWholeTableRead`, so EW's read set is non-empty and a derivation
+      would correctly say "not blind"; in **autocommit nothing is recorded at all**, so the anti-join insert
+      is indistinguishable from `INSERT … VALUES` and deriving would emit the lie. ⇒ derive on the
+      buffered/explicit path; for autocommit either extend the (same, currently-gated) scan-time recording, or
+      OMIT the field — today's behaviour, which costs only spurious aborts. Keep the asymmetry either way: a
+      declaration may be DOWNGRADED to "not blind" by staged reads, never UPGRADED to "blind" by their absence.
+  - **⚠ METHOD: this experiment was VOID FOUR TIMES and each void looked like a clean "no conflict".** The
+    window must be PROVEN (Spark naming the concurrent version, or `readVersion` ordering), never assumed. What
+    kept failing was OUR end — the append needed ~20 s (process start + CLR + ATTACH discovery), most of the
+    DELETE's life. What finally worked: PRE-ATTACH the writer so firing costs only the commit, and make the
+    DELETE genuinely expensive (a ~200-row delete finished in <17 s; `id % 7 = 3` rewrites nearly every file).
+    Re-creating the table did NOT help — the warmth that matters is the SPARK CLUSTER's, so whichever leg runs
+    second is fast; each level needs its own run in the cold first slot (`sparkprobe conflict <Level>`).
