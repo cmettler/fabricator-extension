@@ -1,8 +1,14 @@
-# Log-based change capture for SQL Server — slices 1 + 2 BUILT, the reader redesigned
+# Log-based change capture for SQL Server — slices 1 + 2 + 3 BUILT
 
-> **Status: slices 1 (§13) and 2 (§14) are BUILT and gated. The READER is design only, and it was
-> REDESIGNED on 2026-08-24 — read §15 FIRST: it supersedes §4's recommendation and most of §7, and it
-> corrects three things this document previously asserted.**
+> **Status: slices 1 (§13), 2 (§14) and 3 — THE READER (§16) — are BUILT and gated.**
+>
+> **⚠ READ §16 FIRST for what shipped**, and §15 for the design it was built from. §15 supersedes §4's
+> recommendation and most of §7 and corrects three things this document previously asserted; §16 corrects
+> two more — §3.4's cursor idiom does not run as printed, and §15.7's "the first call always returns zero
+> rows" is false in an already-capturing database.
+>
+> **What remains** is slices 4–9 of §15.12: hidden capture-instance names, name-alignment across a schema
+> change, the two-instance boundary, the snapshot leg, and the timestamp bounds.
 >
 > ⚠ The original header read *"DESIGN ONLY, 2026-08-23. No code, no ABI, no gate."* — true when written,
 > and superseded by slice 2's ABI v81.
@@ -705,6 +711,11 @@ logic and its "the before event was not followed by an after event" failure mode
 
 ### 3.4 ⚠ The cursor idiom, and why `max(_position)` alone is a trap
 
+> **⚠⚠ THE BLOCK BELOW DOES NOT RUN AS PRINTED — SUPERSEDED BY §16.2 (2026-08-24).** A subquery is refused
+> as an `EXECUTE` argument as well as as a table-function argument, so the middle step never bound; and
+> there IS a pure-SQL idiom, which §16.2 gives. It is left here because the reasoning around it — take the
+> end first, advance to the window end — is unchanged and is the part that matters.
+
 The two-step, which is what the docs should show:
 
 ```sql
@@ -718,7 +729,7 @@ PREPARE win AS
   INSERT INTO staging
   SELECT * FROM db.cdc.changes('dbo.orders', starting_position := ?, ending_position := ?);
 EXECUTE win(
-  (SELECT cur FROM my_cursors WHERE tbl = 'dbo.orders'),   -- a subquery IS fine as an EXECUTE argument
+  (SELECT cur FROM my_cursors WHERE tbl = 'dbo.orders'),   -- ⚠ REFUSED — see §16.2
   (SELECT pos FROM w));
 
 -- 3. advance to the WINDOW END, not to what you saw
@@ -737,10 +748,11 @@ prevented — a moving window is usually what a view over a change feed *means* 
 should pass the bound explicitly, as above.
 
 ⚠ **SETTLED 2026-08-23 (§11 item 6): an inline scalar subquery does NOT bind as an argument to one of our
-table functions**, so the block above uses a prepared statement — which MEASURED works, and is what a
-scheduler or a dbt macro would use anyway. ⚠ **Whether a subquery is legal as an `EXECUTE` argument is
-NOT measured** (the CDC reader does not exist yet to test it against); if it is not, bind the value in the
-client or splice a literal. The important half — the bounds cannot be an inline subquery — is measured.
+table functions.** ⚠⚠ **AND THE OTHER HALF IS NOW MEASURED TOO (2026-08-24, §16.2): a subquery is NOT legal
+as an `EXECUTE` argument either.** This paragraph shipped that as unmeasured with a guess attached; the
+guess was the wrong way round. What DOES work is a scalar FUNCTION CALL as an `EXECUTE` argument, and —
+better, because it reads the cursor out of a TABLE — `SET VARIABLE` plus `getvariable()`. So a resumable
+pipeline IS expressible in pure SQL after all, which is what this section had concluded was unavailable.
 
 ### 3.5 Setup and inspection
 
@@ -1697,7 +1709,11 @@ because a rename with no gate is a rename that can quietly come undone.
 
 ## 15. THE 2026-08-24 REDESIGN — user-directed, and it SUPERSEDES §4's recommendation and most of §7
 
-**Nothing is built. This is the design slice 3 should be built from**, and where it disagrees with §4, §7,
+> **⚠ SLICE 3 IS NOW BUILT — see §16 for what shipped, and for the five things building it established that
+> reading this section could not (one of which, §15.7's "the first call always returns zero rows", it
+> REFUTES).**
+
+**This is the design slice 3 was built from**, and where it disagrees with §4, §7,
 §11 or §12 it wins. Those sections are left intact because the reasoning that produced them is still worth
 reading, and because two of the things they got wrong were findable only by measuring.
 
@@ -2040,7 +2056,7 @@ The user's question. What the reader can do about it, now that §15.6 has the ma
 |---|---|---|
 | **1** | ✅ BUILT — §13 | inspection first |
 | **2** | ✅ BUILT — §14 | setup from SQL |
-| **3** | **the reader**: `ICatalogTableFunction`, C#-owned connection, ONE capture instance, `images := 'after'`, explicit bounds, source-derived schema, the §2.1 pre-check, the 21-byte cursor | the smallest correct reader. §15.1/§15.2/§15.7 |
+| **3** | ✅ **BUILT 2026-08-24 — §16.** The reader: `ICatalogTableFunction`, C#-owned connection, ONE capture instance, `images := 'after'`, explicit bounds, the §2.1 pre-check, the 21-byte cursor | the smallest correct reader. §15.1/§15.2/§15.7 |
 | **4** | generated hidden instance name + the EP ownership marker + `enable := true` deferred to execute | makes the surface "easy to use"; independent of 5–7. §15.4/§15.5/§15.7 |
 | **5** | name-alignment with widening + `_capture_instance` | buys slice 7 nearly free. §15.8 |
 | **6** | DDL detection in-window; `on_schema_change := 'error'` | loud before it is clever. §15.11 |
@@ -2056,11 +2072,12 @@ from §15.9: `resync` is the preferred answer to schema drift, and it CANNOT be 
 
 - **How long the capture job takes to apply a `required_column_update`** — that is the width of the window
   where declared and actual types disagree, and it decides whether "fail loudly at execute" is a rare event
-  or a routine annoyance. The single most useful number left.
+  or a routine annoyance. The single most useful number left. ⚠ Slice 3 SHIPPED the loud failure (§16.4
+  item 1) and it is UNGATED for exactly this reason: no suite can arrange the race.
 - Whether an in-flight TVF read really blocks `sp_cdc_disable_table` (§15.11).
 - The Azure SQL Database middle case (§11 item 7) — unchanged.
 
-### 15.14 ⚠ A SHIPPED DEFECT FOUND ON THE WAY: `cdc.tables()` reports a bogus `index_column_list`
+### 15.14 ⚠ A SHIPPED DEFECT FOUND ON THE WAY: `cdc.tables()` reports a bogus `index_column_list` — ✅ FIXED 2026-08-24 (§16.7)
 
 MEASURED through the exact table-variable path `SqlServerCdcCatalog` uses: the **all-tables** form of
 `sp_cdc_help_change_data_capture` leaks the PREVIOUS row's `index_column_list` onto a row that has no index.
@@ -2074,3 +2091,217 @@ dbo_plain  | [id] | <NULL>          <-- no index, yet [id] is reported
 Called for that one table the proc returns NULL correctly. Fix is one line — null `index_column_list` when
 `index_name IS NULL` — plus an assertion in `verify_mssql_cdc` §3, since nothing currently covers a capture
 instance with no index. Not a reader concern; it is in slice 1's shipped surface.
+
+---
+
+## 16. Slice 3 — THE READER, AS BUILT (2026-08-24)
+
+Built from §15. `db.cdc.changes(...)` is a marshaled `ICatalogTableFunction` over SQL Server's generated
+per-instance TVF, with C#-owned connections, one capture instance, `images := 'after'`, explicit bounds, the
+§2.1 retention pre-check and the 21-byte resume position of §2.4. Gate: `verify_mssql_cdc` **105 → 182**
+(service tier), three mutants, each killed at its own assertion.
+
+```sql
+FROM db.cdc.changes('dbo.orders'
+      [, starting_position := <BLOB>]     -- EXCLUSIVE lower bound: a 10-byte LSN or a 21-byte _position
+      [, ending_position   := <BLOB>]     -- INCLUSIVE upper bound; default cdc.max_position()
+      [, capture_instance  := '<name>']   -- required when a table has two (§2.2)
+      [, images            := 'after']    -- the only value this release accepts
+      [, commit_timestamp  := false])     -- opt-in; see §11 item 2
+```
+
+Output: `_change_type`, `_position`, `_commit_lsn`, `_seq_val`, `_operation`, optionally
+`_commit_timestamp`, then the captured source columns.
+
+### 16.1 How it resolves, in two round trips at bind and one at execute
+
+**Bind.** One metadata batch through `sp_cdc_help_change_data_capture` resolves `source` (a `schema.table`
+name OR a capture-instance name) to exactly one instance and brings back the SOURCE table's per-column
+nullability in the same result; two matches are REFUSED naming both. Then one **DESCRIBE** —
+`CommandBehavior.SchemaOnly` over the very statement the reader is about to run, with `c.*` so the captured
+column NAMES are what is being learned — supplies the types through `SqlArrowMapping.ToArrowField`, the same
+call the read itself makes. `DescribeQuery` gained a parameterized overload for this; the parameter VALUES
+are never evaluated but the parameters must be DECLARED or SQL Server cannot compile what it is describing.
+
+⚠ The four TVF metadata columns are asserted BY NAME (`__$start_lsn`, `__$seqval`, `__$operation`,
+`__$update_mask`) rather than assumed to be first. The alternative to that check is reading four metadata
+columns as DATA and shifting every source column by one, silently.
+
+**Execute.** One short metadata read resolves `fn_cdc_get_min_lsn(<instance>)` and `fn_cdc_get_max_lsn()`,
+the pre-check runs, and the change read streams.
+
+The composed statement, with the cursor folded in as a WHERE clause:
+
+```sql
+SELECT CASE c.[__$operation] WHEN 1 THEN 'delete' … END AS [_change_type],
+       c.[__$start_lsn] + c.[__$seqval] + CONVERT(binary(1), c.[__$operation]) AS [_position],
+       c.[__$start_lsn] AS [_commit_lsn], c.[__$seqval] AS [_seq_val], c.[__$operation] AS [_operation],
+       c.[id], c.[customer], …
+FROM cdc.[fn_cdc_get_all_changes_dbo_orders](@from_lsn, @to_lsn, @row_filter) AS c
+WHERE (c.[__$start_lsn] > @cur_lsn OR (c.[__$start_lsn] = @cur_lsn AND (c.[__$seqval] > @cur_seq
+       OR (c.[__$seqval] = @cur_seq AND c.[__$operation] > @cur_op))))
+```
+
+**⚠ MEASURED that the position concatenation is exactly 21 bytes and that the operation byte is the LOW byte
+of the `int`** — `0x…02` for an insert, `0x…04` for an update after-image, `0x…01` for a delete. The gate
+pins the ENCODING rather than describing it: `_position = _commit_lsn || _seq_val || '\x04'::BLOB`.
+
+**⚠ The window is resolved at EXECUTE, not at bind** (§15.7), which is also what fixes §3.4's determinism
+complaint about a defaulted `ending_position`.
+
+**⚠ The change read runs POOLED, and unlike every other read on this surface that is the CORRECT answer
+rather than a compromise.** Read-your-writes buys a change reader nothing: the capture job populates the
+change table ASYNCHRONOUSLY from COMMITTED log records, so a transaction's own uncommitted writes are not
+there to be seen on any connection. Routing onto the pinned connection would only hold a long streaming
+reader open on the write connection — the outstanding-result-set hazard (595 on a no-MARS engine). The
+window resolution deliberately goes the other way, because a capture instance enabled in this transaction IS
+visible to it.
+
+**⚠ No `ORDER BY` is emitted, deliberately.** The change table's clustered index is
+`(__$start_lsn, __$command_id, __$seqval, __$operation)` (MEASURED, §15.2) so ordering by our 3-tuple would
+insert a real SORT rather than ride the index, and DuckDB does not promise to preserve a table function's row
+order through its pipeline anyway. Every row carries its own `_position`; `ORDER BY _position` is the
+documented and correct way to ask for order.
+
+### 16.2 ⚠⚠ THE CURSOR IDIOM, CORRECTED — and there IS a pure-SQL one
+
+**This supersedes §3.4's code block, which does not run as printed.** Three spellings, all MEASURED
+2026-08-24 against the built reader:
+
+| spelling | result |
+|---|---|
+| `changes(…, starting_position := (SELECT … ))` | **`Binder Error: Table function cannot contain subqueries`** — already known (§11 item 6) |
+| `EXECUTE q((SELECT … ))` | **`Invalid Input Error: Only scalar parameters, named parameters or NULL supported for EXECUTE`** — NEW, and it CLOSES the "NOT measured" note §3.4 shipped with. §3.4's own example uses exactly this and is wrong |
+| `EXECUTE q(db.cdc.max_position())` | **works** — a scalar FUNCTION CALL is a legal EXECUTE argument where a subquery is not |
+| `SET VARIABLE cur = (SELECT … );` then `changes(…, starting_position := getvariable('cur'))` | **works** — and this is the one that reads the cursor OUT OF A TABLE |
+
+⇒ the idiom to publish:
+
+```sql
+-- 1. take the window end FIRST, and store it whatever the read returns
+SET VARIABLE cdc_end = (SELECT db.cdc.max_position());
+
+-- 2. read a closed window, resuming from the cursor your own table holds
+SET VARIABLE cdc_cur = (SELECT cur FROM my_cursors WHERE tbl = 'dbo.orders');
+INSERT INTO staging
+SELECT * FROM db.cdc.changes('dbo.orders',
+                             starting_position := getvariable('cdc_cur'),
+                             ending_position   := getvariable('cdc_end'));
+
+-- 3. advance to the WINDOW END, not to what you saw
+UPDATE my_cursors SET cur = getvariable('cdc_end') WHERE tbl = 'dbo.orders';
+```
+
+`SET VARIABLE` accepts a subquery; `getvariable()` is a function call at the call site, so neither refusal
+applies. **That makes a resumable pipeline expressible in pure SQL — no client, no prepared statement, no
+spliced literal** — which is what §2.3 said the whole surface exists for and what §3.4 had concluded was
+unavailable.
+
+⚠ **BOTH bound LENGTHS are legal on both sides, and that is a requirement rather than a convenience.** The
+idiom above stores a 10-byte LSN while a row's own `_position` is 21 bytes; accepting only one would break
+the idiom the docs teach. A 10-byte lower bound is exclusive AT LSN GRANULARITY, which is exactly right —
+the previous window ended at that LSN INCLUSIVE. The 21-byte form is what resumes mid-transaction: the gate
+inserts three rows in one statement, so they share one `start_lsn`, and resuming after the FIRST of them
+must leave the other two — which no 10-byte cursor can express.
+
+### 16.3 The pre-check, as built
+
+Every refusal names the cause, the value and the way out, because the alternative is §15.3's placeholder
+error that names none of them:
+
+| condition | answer |
+|---|---|
+| `starting_position` below `fn_cdc_get_min_lsn` | ERROR: *"is BELOW the retention floor … THIS READ WOULD HAVE SILENTLY SKIPPED THEM"*, with both LSNs and the remedy |
+| `ending_position` above `fn_cdc_get_max_lsn` | ERROR naming the watermark and the two-step idiom |
+| floor is NULL | ERROR: *"not established yet"* — never read as "no lower bound" (§2.1) |
+| watermark is NULL, end DEFAULTED | **zero rows**, no error — the ordinary state of a freshly enabled instance |
+| watermark is NULL, end SUPPLIED | ERROR — a bound that cannot exist is worth answering |
+| `from > to` | **zero rows**, no error |
+| bound length ∉ {10, 21} | ERROR at BIND — the earliest point the value exists |
+
+**⚠ Mutant 1 dies at exactly the below-floor assertion, AND ITS ACTUAL RESULT IS THE RAW 313** — *"An
+insufficient number of arguments were supplied for the procedure or function
+cdc.fn_cdc_get_all_changes_ ... ."* on a call with three arguments. That is the best evidence in this
+document that the pre-check is the feature rather than a nicety.
+
+### 16.4 ⚠⚠ FIVE THINGS THE BUILD ESTABLISHED THAT READING COULD NOT
+
+1. **`IArrowType.Equals` IS REFERENCE EQUALITY, and using it made the schema check fire on every
+   well-formed read.** Apache.Arrow does not override `Equals` on its type classes, so two separately
+   constructed `Decimal128Type(18,4)` instances — one from the describe crossing, one from the execute
+   crossing — are unequal. The first smoke test refused its own correct read with *"declared 'amount'
+   decimal128 … arrived as 'amount' decimal128"*, a message comparing two identical renderings. Fixed with
+   a structural comparer, and the message now renders precision/scale — `IArrowType.Name` prints
+   `decimal(9,2)` and `decimal(18,4)` identically as `decimal128`, which is precisely the difference the
+   check exists to report. ⚠ A singleton such as `StringType.Default` would have masked it; a DECIMAL column
+   in the probe is what exposed it.
+
+2. **DuckDB DROPS the declared nullability, so the source-vs-change-table split of §1.2 and §3.3 is
+   UNASSERTABLE.** MEASURED in all three directions reachable from SQL — `DESCRIBE` over the function, a
+   `CREATE TABLE AS` from it, and `duckdb_columns()` over that table — every column reports nullable,
+   including `_change_type`, which the reader declares NOT NULL. The reader still declares source
+   nullability (it is the honest answer and it rides the round trip that resolves the capture instance
+   anyway) and the gate SAYS SO rather than implying coverage. It becomes load-bearing when
+   `images := 'both'` arrives, where an op-3 before-image can carry NULL for an unrecorded MAX column and
+   the claim has to be relaxed.
+
+3. **⚠ §15.7's *"the first call after an auto-enable always returns zero rows"* is WRONG in an
+   already-capturing database.** MEASURED: a table enabled in a database whose capture job is already
+   running has a NULL FLOOR — not merely a NULL watermark — because `fn_cdc_get_min_lsn` is NULL for up to
+   one polling interval (the effect `CdcMinLsn` recorded on 2026-08-23 with a discriminator). So the reader
+   answers *"the retention floor … is not established yet — retry"* rather than zero rows, and reads
+   cleanly once the job scans. §15.7's sentence holds only for the FIRST instance in a freshly CDC-enabled
+   database, where the watermark is the thing that is NULL. Slice 4's `enable := true` has to expect the
+   retry, not silence.
+
+4. **⚠ The inverted-window branch is NARROWER than its own comment claimed, and a SURVIVING MUTANT is what
+   showed it.** Disabling the `from > to` short-circuit left the suite GREEN. A caught-up polling consumer
+   passes its cursor with the end DEFAULTED, so `from == to` (the watermark) — which the TVF accepts, and
+   whose rows the exclusive predicate removes in SQL. Reaching `from > to` needs an EXPLICIT
+   `ending_position` below the cursor. Gated with exactly that shape
+   (`starting_position := max_position(), ending_position := min_position(...)`), after which the mutant
+   dies with the raw 313.
+
+5. **A DESCRIBE of the reader's own statement works, parameters and all.** MEASURED through
+   `sp_describe_first_result_set` with `@params` and then through SqlClient's `SchemaOnly`: the CASE
+   expression describes as `varchar(16)`, the concatenation as `binary(21)`, the LEFT JOIN's
+   `tran_end_time` as `datetime`, and the TVF's own four metadata columns come first in the documented
+   order followed by the captured source columns.
+
+### 16.5 Choices worth knowing before extending it
+
+- **`images` is DECLARED although only its default is implemented.** A caller who writes the mode they read
+  about gets a sentence rather than DuckDB's "invalid named parameter", and the two refusals are
+  deliberately different: `'both'` is *not built yet*, `'net'` is *not a value this reader will ever have*
+  (§1.7d). It also pins the vocabulary now rather than inventing it later.
+- **No `max_rows`, though §3.2 lists it.** A truncated read breaks the cursor idiom — the caller would have
+  to advance to `max(_position)` rather than to the window end, which is exactly the trap §3.4 exists to
+  warn about. It belongs with a story about resuming a PARTIAL window, not with the smallest correct reader.
+- **`_update_mask` is not emitted.** In `'after'` mode the after-image is the truth, so the mask is not
+  needed for correctness; it arrives with `images := 'both'`, where it is the only way to read a NULL
+  correctly.
+- **The DESCRIBE opens its OWN short-lived connection** (`DescribeQuery`'s documented behaviour), so a
+  capture instance enabled inside an UNCOMMITTED transaction cannot be described. The error says so — and
+  the shape is harmless, because a change captured by that same transaction would not be readable either:
+  the capture job reads COMMITTED log records.
+
+### 16.6 What the gate does NOT cover, said rather than implied
+
+- **The declared nullability** — invisible from SQL in every direction (§16.4 item 2).
+- **A captured column's TYPE changing between bind and execute** (§15.6). The check exists and is reasoned
+  from a measurement, but producing the race needs the capture job to apply a `required_column_update`
+  inside one statement's lifetime, which no suite can arrange. §15.13's open number is exactly this window's
+  width.
+- **A source table dropped out from under a capture instance**, where the nullability join returns nothing
+  and every source column degrades to nullable — the safe direction, unasserted.
+- **Two capture instances read as ONE stream across the boundary** — that is slice 7, and until it exists
+  the refusal in §19 of the suite is the whole behaviour.
+- **Permissions.** The rig is `sa`, so the `@role_name` filtering that makes
+  `sp_cdc_help_change_data_capture` the right resolution path is exercised nowhere.
+
+### 16.7 §15.14's defect is FIXED
+
+`cdc.tables()` no longer reports a bogus `index_column_list` for a capture instance with no index — the
+column is nulled when `index_name IS NULL`. Gated with an index-less instance beside an indexed one; the
+indexed row is the positive control AND what makes the mutant die, since the leak copies the PREVIOUS row's
+value. ⚠ The probe table is named to sort LAST for that reason.

@@ -1,9 +1,10 @@
 # name: test/verify_mssql_cdc.test
-# description: the db.cdc.* surface over SQL Server change data capture — slice 1 (inspection only)
+# description: the db.cdc.* surface over SQL Server change data capture — slices 1-3 (inspect, set up, read)
 # group: [fabricator]
 #
-# Slice 1 of docs/mssql-cdc.md: the ServerProfile.SupportsCdc gate, the appended `cdc` schema, and the four
-# read-only functions cdc.tables() / position() / min_position() / health(). No reader yet (slice 3).
+# Slices 1-3 of docs/mssql-cdc.md: the ServerProfile.SupportsCdc gate, the appended `cdc` schema, the four
+# read-only functions (§1-§8), the four setup functions and the ABI v81 flag they exercise (§10-§14), and
+# THE READER, cdc.changes (§15-§21).
 #
 # ⚠ SERVICE TIER — it needs a real SQL Server, and unlike the rest of that tier it also needs SQL SERVER
 #   AGENT (docker-compose sets MSSQL_AGENT_ENABLED=true). §8's agent assertion is the ONLY thing in either
@@ -26,6 +27,16 @@
 #       misnamed; the two-instance refusal in §7 covers the case that actually happens.
 #     * a malformed LSN or timestamp from the server (ParseHex / ParseTimestampMicros returning null) —
 #       SQL Server's CONVERT always renders these well-formed.
+#     * THE READER'S DECLARED NULLABILITY. cdc.changes takes each source column's nullability from the
+#       SOURCE table, because the change table reports a NOT NULL primary key as nullable (§1.2) — and
+#       MEASURED 2026-08-24 that DuckDB DROPS the declaration in every direction reachable from SQL:
+#       DESCRIBE over the function, a CTAS from it, and duckdb_columns() over that table all report every
+#       column nullable, including _change_type, which is declared NOT NULL. §16 records it; nothing here
+#       can assert it, and §16's DESCRIBE section says so rather than implying it does.
+#     * A CAPTURED COLUMN'S TYPE CHANGING BETWEEN BIND AND EXECUTE. The reader refuses loudly rather than
+#       converting — SQL Server's capture job propagates an ALTER COLUMN to the change table
+#       ASYNCHRONOUSLY (§15.6, MEASURED) — but producing the race needs the job to act inside one
+#       statement's lifetime, which no suite can arrange. §15.13's one open number is that window's width.
 
 require fabricator
 
@@ -65,6 +76,9 @@ SELECT fabricator_exec('${MSSQL_TESTDB_DSN}', 'IF OBJECT_ID(''dbo.cdc_probe'') I
 
 statement ok
 SELECT fabricator_exec('${MSSQL_TESTDB_DSN}', 'IF OBJECT_ID(''dbo.cdc_setup'') IS NOT NULL DROP TABLE dbo.cdc_setup;');
+
+statement ok
+SELECT fabricator_exec('${MSSQL_TESTDB_DSN}', 'IF OBJECT_ID(''dbo.cdc_zz_noidx'') IS NOT NULL DROP TABLE dbo.cdc_zz_noidx;');
 
 statement ok
 ATTACH '${MSSQL_TESTDB_DSN}' AS c0 (TYPE fabricator);
@@ -486,6 +500,278 @@ disable	table
 enable	table
 enable_database	table
 
+# ═══ §15  THE READER (slice 3) — cdc.changes over one capture instance ════════════════════════════════
+# docs/mssql-cdc.md §15. It reads SQL Server's generated TVF, never the change table: `is_ms_shipped` splits
+# the schema (the seven metadata tables, the four placeholders AND the change table are 1; the per-instance
+# TVFs are the only 0s), and the TVF VALIDATES its window where a direct table read silently returns
+# whatever survived.
+
+statement ok
+SELECT fabricator_exec('c1', 'INSERT INTO dbo.cdc_setup VALUES (1, N''a''), (2, N''b''), (3, N''c'');');
+
+statement ok
+SELECT fabricator_exec('c1', 'UPDATE dbo.cdc_setup SET v = N''B'' WHERE id = 2;');
+
+statement ok
+SELECT fabricator_exec('c1', 'DELETE FROM dbo.cdc_setup WHERE id = 3;');
+
+# ⚠⚠ CAPTURE IS ASYNCHRONOUS, so the suite WAITS rather than forcing a scan. cdc.capture_now() contends with
+# the capture job for the database's single log-scan session (~1 failure in 57, MEASURED) and §14 records why
+# stopping the job first is not available here — so forcing would make this section flaky in exactly the way
+# the wait does not. ~5 s on this rig (§8's polling interval), bounded at 60.
+#
+# ⚠ It waits for BOTH the rows AND the watermark. A row in the change table is not readable until
+# fn_cdc_get_max_lsn() covers it, because that watermark is this reader's default window END — waiting only
+# for COUNT would leave a race whose symptom is a SHORT READ, i.e. a wrong answer rather than a failure.
+#
+# ⚠ The UPDATE writes TWO change rows (op 3 before-image + op 4 after-image) while the reader returns ONE, so
+# the change table reaches 6 where cdc.changes() reports 5. That asymmetry IS the 'after' mode.
+statement ok
+SELECT fabricator_exec('c1', 'DECLARE @i int = 0; WHILE @i < 60 AND NOT EXISTS (SELECT 1 FROM cdc.dbo_cdc_setup_CT HAVING COUNT(*) >= 6 AND MAX(__$start_lsn) <= sys.fn_cdc_get_max_lsn()) BEGIN WAITFOR DELAY ''00:00:01''; SET @i = @i + 1; END');
+
+# The whole point of the feature, in one assertion. ⚠ `_change_type` deliberately reuses the DELTA
+# change-feed spellings, so a consumer that already handles a Delta CDF handles this unchanged — which is
+# also why op 3 and op 4 are two rows rather than one wide before/after row.
+#
+# ⚠ THE DELETE ROW CARRIES THE DELETED VALUES (v = 'c', not NULL). Worth pinning: a consumer building a
+# tombstone needs the key, and a reader emitting NULLs there would look plausible.
+query TIT
+SELECT _change_type, id, v FROM c1.cdc.changes('dbo.cdc_setup') ORDER BY _position;
+----
+insert	1	a
+insert	2	b
+insert	3	c
+update_postimage	2	B
+delete	3	c
+
+# The 21-byte resume position of §2.4 — start_lsn(10) ‖ seqval(10) ‖ operation(1) — whose lexicographic order
+# IS the change order, which is what makes the ORDER BY above correct and the consumer's cursor ONE column.
+query II
+SELECT DISTINCT octet_length(_position), octet_length(_commit_lsn) FROM c1.cdc.changes('dbo.cdc_setup');
+----
+21	10
+
+# ⚠ THE ENCODING ITSELF, pinned rather than described. An UPDATE pair shares a seqval and differs only in the
+# operation, which is why the position is a 3-tuple and not (start_lsn, seqval) — so the last byte carrying
+# the operation code is load-bearing, and this is the assertion that would fail if it were dropped or moved.
+query I
+SELECT DISTINCT _position = _commit_lsn || _seq_val || '\x04'::BLOB FROM c1.cdc.changes('dbo.cdc_setup') WHERE _change_type = 'update_postimage';
+----
+true
+
+# ═══ §16  The DECLARED schema — captured types from a DESCRIBE of the read itself ═════════════════════
+# The types come from CommandBehavior.SchemaOnly over the very statement the reader runs, through the same
+# SqlArrowMapping.ToArrowField the read itself uses — so bind and execute cannot disagree through a
+# hand-written type table. `id INTEGER` and `v VARCHAR` are the SOURCE column types arriving unchanged.
+
+query TT
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM c1.cdc.changes('dbo.cdc_setup'));
+----
+_change_type	VARCHAR
+_position	BLOB
+_commit_lsn	BLOB
+_seq_val	BLOB
+_operation	INTEGER
+id	INTEGER
+v	VARCHAR
+
+# ⚠⚠ WHAT THIS SECTION CANNOT ASSERT, said rather than implied: the reader declares each source column's
+# nullability from the SOURCE table (§1.2 — `id INT NOT NULL PRIMARY KEY` is MEASURED NULLABLE in the change
+# table, so taking it from there would report every column as optional). MEASURED 2026-08-24 that DuckDB
+# DROPS the declaration in every direction reachable from SQL: DESCRIBE over the function, a CTAS from it and
+# duckdb_columns() over that table ALL report `YES`/true for every column, including _change_type, which is
+# declared NOT NULL. So the honest declaration costs nothing (it rides the same round trip that resolves the
+# capture instance) and no assertion can see it. It becomes load-bearing when images := 'both' arrives, where
+# an op-3 before-image can carry NULL for an unrecorded MAX column and the claim has to be relaxed.
+
+# ═══ §17  The CURSOR — exclusive, and both bound lengths are legal ════════════════════════════════════
+# §3.4's documented idiom stores cdc.max_position() (a 10-byte LSN) while a row carries a 21-byte _position,
+# so both have to be accepted. The 10-byte form is exclusive AT LSN GRANULARITY, which is right because the
+# previous window ended at that LSN INCLUSIVE.
+#
+# ⚠⚠ THREE SPELLINGS, AND ONLY TWO OF THEM BIND — MEASURED 2026-08-24, and this CORRECTS the idiom §3.4
+# prints. An inline scalar subquery is refused as a table-function argument (§11 item 6, already known) AND
+# refused as an EXECUTE argument (NEW — §3.4 shipped that half as "NOT measured"). What DOES work is a
+# scalar FUNCTION CALL as an EXECUTE argument, and — better, because it reads the cursor out of a TABLE —
+# SET VARIABLE plus getvariable(), which is a function call rather than a subquery at the call site.
+
+statement error
+SELECT count(*) FROM c1.cdc.changes('dbo.cdc_setup', starting_position := (SELECT min(_position) FROM c1.cdc.changes('dbo.cdc_setup')));
+----
+Table function cannot contain subqueries
+
+statement ok
+PREPARE cdc_win AS SELECT count(*) AS n FROM c1.cdc.changes('dbo.cdc_setup', starting_position := ?);
+
+statement error
+EXECUTE cdc_win((SELECT min(_position) FROM c1.cdc.changes('dbo.cdc_setup')));
+----
+Only scalar parameters, named parameters or NULL supported for EXECUTE
+
+# ⚠⚠ THE 21-BYTE PATH, and the ONLY spelling that can express it from pure SQL. The three inserts share ONE
+# start_lsn, so resuming after the FIRST of them must leave the other two — which a 10-byte LSN cursor
+# cannot say. That is the entire reason the position is 21 bytes rather than 10.
+statement ok
+SET VARIABLE cdc_cur = (SELECT min(_position) FROM c1.cdc.changes('dbo.cdc_setup'));
+
+query I
+SELECT octet_length(getvariable('cdc_cur'));
+----
+21
+
+query TI
+SELECT _change_type, id FROM c1.cdc.changes('dbo.cdc_setup', starting_position := getvariable('cdc_cur')) ORDER BY _position;
+----
+insert	2
+insert	3
+update_postimage	2
+delete	3
+
+# ⚠ AN EXHAUSTED WINDOW IS NOT AN ERROR, and this is the assertion that says so. A polling consumer whose
+# cursor sits at the window end reaches it on every quiet tick; the TVF itself answers an inverted window
+# with the unattributable 313 of §18, so declining to call it is what keeps that error off a normal path.
+# ⚠ A scalar function call IS legal as an EXECUTE argument where a subquery is not — MEASURED just above.
+query I
+EXECUTE cdc_win(c1.cdc.max_position());
+----
+0
+
+# ⚠ THE POSITIVE CONTROL for the row above: the SAME prepared statement with a 10-byte cursor at the
+# retention floor returns every change. Without it, "0" would pass equally on a build where the reader had
+# stopped returning rows at all.
+query I
+EXECUTE cdc_win(c1.cdc.min_position('dbo_cdc_setup'));
+----
+5
+
+# ⚠⚠ AN INVERTED WINDOW IS EMPTY, NOT AN ERROR — and this needs an EXPLICIT ending_position below the cursor,
+# which is the ONLY shape that reaches that branch. Getting it wrong is recorded on the code: the branch was
+# first written up as the ordinary "consumer has caught up" case, and a SURVIVING MUTANT showed that a
+# caught-up consumer produces from == to (the watermark), whose rows the exclusive predicate removes in SQL.
+# Without the short-circuit this is the unattributable 313 again, on a caller who merely asked for a window
+# with nothing in it.
+statement ok
+PREPARE cdc_inverted AS SELECT count(*) AS n FROM c1.cdc.changes('dbo.cdc_setup', starting_position := ?, ending_position := ?);
+
+query I
+EXECUTE cdc_inverted(c1.cdc.max_position(), c1.cdc.min_position('dbo_cdc_setup'));
+----
+0
+
+# ═══ §18  The PRE-CHECK (§2.1) — the highest-value code in this feature ═══════════════════════════════
+# ⚠⚠ WHAT IT REPLACES. MEASURED, three ways, all IDENTICAL: a from_lsn below the retention floor, a to_lsn
+# above the capture watermark, and an inverted window ALL raise
+#   Msg 313: An insufficient number of arguments were supplied for the procedure or function
+#            cdc.fn_cdc_get_all_changes_ ... .
+# with three arguments supplied — and the " ... " is the LITERAL name of a placeholder function SQL Server
+# calls deliberately to force that error (§15.3). So the message is the same for every capture instance and
+# every cause, and can never be attributed. A pipeline that has LOST DATA is told to look at its call site.
+
+# The one that matters: a cursor below the floor means changes have been purged, and reading anyway would
+# SILENTLY SKIP them. ⚠ The message must name the LOSS, not the bound.
+statement error
+SELECT count(*) FROM c1.cdc.changes('dbo.cdc_setup', starting_position := '\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'::BLOB);
+----
+BELOW the retention floor
+
+statement error
+SELECT count(*) FROM c1.cdc.changes('dbo.cdc_setup', starting_position := '\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'::BLOB);
+----
+WOULD HAVE SILENTLY SKIPPED
+
+statement error
+SELECT count(*) FROM c1.cdc.changes('dbo.cdc_setup', ending_position := '\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF'::BLOB);
+----
+above the capture watermark
+
+# A bound of the wrong LENGTH is refused at BIND — the earliest point the value exists, since these are
+# constant arguments, so a typo costs no server round trip.
+statement error
+SELECT count(*) FROM c1.cdc.changes('dbo.cdc_setup', starting_position := '\x01\x02'::BLOB);
+----
+it must be either a 10-byte log sequence number
+
+# ═══ §19  Refusals that are decisions, not gaps ══════════════════════════════════════════════════════
+
+# Two capture instances on one table BOTH capture every change in their overlap window (§2.2, MEASURED), so
+# answering for either is a wrong ANSWER rather than a shortcut. dbo.cdc_probe has had two since §7.
+statement error
+SELECT count(*) FROM c1.cdc.changes('dbo.cdc_probe');
+----
+matches 2 capture instances
+
+# …and naming one resolves it. The positive control for the refusal: without it the error above would pass
+# equally on a build that refused every read.
+query I
+SELECT count(*) FROM c1.cdc.changes('dbo.cdc_probe', capture_instance := 'dbo_cdc_probe');
+----
+0
+
+statement error
+SELECT count(*) FROM c1.cdc.changes('dbo.no_such_table');
+----
+is not a captured table or capture instance
+
+# ⚠ `images` is DECLARED although this release implements only its default, so a caller who writes the mode
+# they read about in the docs gets a sentence rather than DuckDB's "invalid named parameter". The two
+# refusals are deliberately DIFFERENT: 'both' is not built, while 'net' is not a value this reader will ever
+# have (§1.7d — the collapse is lossy, unresumable, and reproducible in one line of DuckDB with a
+# MEASURED-identical outcome).
+statement error
+SELECT count(*) FROM c1.cdc.changes('dbo.cdc_setup', images := 'both');
+----
+is not implemented yet
+
+statement error
+SELECT count(*) FROM c1.cdc.changes('dbo.cdc_setup', images := 'net');
+----
+is not a value
+
+# ═══ §20  _commit_timestamp is an OPT-IN, and that is forced ═════════════════════════════════════════
+# ⚠⚠ MEASURED (§11 item 2): DuckDB does NOT eliminate an unused LEFT JOIN — not even against a PRIMARY KEY —
+# so "emit cdc.lsn_time_mapping always and let projection pushdown prune it" would make EVERY caller pay a
+# second scan for a column most never select. It is the only output column needing that join, and it is
+# metadata rather than an ordering key (datetime, ~3.33 ms), so omitting it by default loses nothing
+# structural.
+
+query I
+SELECT count(*) FROM (DESCRIBE SELECT * FROM c1.cdc.changes('dbo.cdc_setup')) WHERE column_name = '_commit_timestamp';
+----
+0
+
+query II
+SELECT count(*), count(_commit_timestamp) FROM c1.cdc.changes('dbo.cdc_setup', commit_timestamp := true);
+----
+5	5
+
+# ═══ §21  cdc.changes is a TABLE function, and cdc.tables() no longer invents an index ════════════════
+
+query TT
+SELECT function_name, function_type FROM duckdb_functions() WHERE database_name = 'c1' AND schema_name = 'cdc' AND function_name = 'changes';
+----
+changes	table
+
+# ⚠⚠ A SHIPPED DEFECT FOUND WHILE BUILDING THE READER (docs §15.14), fixed here. MEASURED through the exact
+# table-variable path SqlServerCdcCatalog uses: the ALL-TABLES form of sp_cdc_help_change_data_capture LEAKS
+# the PREVIOUS row's index_column_list onto a row whose index_name is NULL, so a capture instance with no
+# index was reported as having one. Called for that single table the proc answers NULL correctly, which is
+# what attributes it to the proc rather than to us.
+statement ok
+SELECT fabricator_exec('c1', 'IF OBJECT_ID(''dbo.cdc_zz_noidx'') IS NOT NULL DROP TABLE dbo.cdc_zz_noidx; CREATE TABLE dbo.cdc_zz_noidx(a INT NULL, b NVARCHAR(10) NULL);');
+
+statement ok
+SELECT target, changed FROM c1.cdc.enable('dbo.cdc_zz_noidx');
+
+# ⚠ THE INDEXED ROW BESIDE IT IS THE POSITIVE CONTROL, and it is also what makes the mutant DIE: the leak
+# copies the PREVIOUS row's value, so an index-less instance emitted first would read NULL even unfixed. The
+# table is named to sort last for that reason. The index NAME is auto-generated, so it is asserted as
+# present rather than by value.
+query TTT
+SELECT source_table, index_name IS NOT NULL, index_column_list FROM c1.cdc.tables() WHERE source_table IN ('cdc_setup', 'cdc_zz_noidx') ORDER BY source_table;
+----
+cdc_setup	true	[id]
+cdc_zz_noidx	false	NULL
+
 # ═══ §9  Teardown — leave NO CDC-enabled table behind ══════════════════════════════════════════════════
 # Load-bearing: the capture job keeps scanning a CDC-enabled database between runs, and the next run's §3
 # would then find max_position() non-NULL and fail for a reason unrelated to the code.
@@ -499,6 +785,9 @@ SELECT fabricator_exec('c1', 'DROP TABLE dbo.cdc_probe;');
 
 statement ok
 SELECT fabricator_exec('c1', 'IF OBJECT_ID(''dbo.cdc_setup'') IS NOT NULL DROP TABLE dbo.cdc_setup;');
+
+statement ok
+SELECT fabricator_exec('c1', 'IF OBJECT_ID(''dbo.cdc_zz_noidx'') IS NOT NULL DROP TABLE dbo.cdc_zz_noidx;');
 
 # Back to §3's state, which is also the cheapest possible check that the teardown really disabled it.
 query I

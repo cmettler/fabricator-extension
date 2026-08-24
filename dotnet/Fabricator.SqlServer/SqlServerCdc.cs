@@ -73,6 +73,7 @@ internal static class SqlServerCdcFunctions
         scalars.Add(new CdcMinPositionFunction(catalog));
         tables.Add(new CdcTablesFunction(catalog));
         tables.Add(new CdcHealthFunction(catalog));
+        tables.Add(new CdcChangesFunction(catalog));
         SqlServerCdcSetup.Register(tables, catalog);
     }
 

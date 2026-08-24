@@ -581,7 +581,20 @@ case "$TIER" in
         # restoring the eager stream dies at §1 with "Expected 1, Actual 2", i.e. the doubled INSERT itself.
         # +7 later the same day for §8, which gates the AMBIENT CAPTURE the deferral needs: the pre-fix build
         # reports @@TRANCOUNT = 0 inside a transaction (pooled connection) where the fixed one reports 1.
-        : "${MIN_ASSERTIONS:=2361}"
+        # 2438 since 2026-08-24: verify_mssql_cdc 105 -> 182 for THE READER, cdc.changes (slice 3) - exactly
+        # +77 over 2361, i.e. NO other suite moved. Its section 18 is the load-bearing part, the retention
+        # pre-check, and the mutant that disables it does not merely fail: it fails WITH the raw
+        # `Msg 313 ... cdc.fn_cdc_get_all_changes_ ... .` on a call that supplied three arguments, which is
+        # the unattributable message the whole function exists to replace.
+        # /!\ Section 15 WAITS up to 60 s for the capture job rather than forcing a scan - cdc.capture_now()
+        # contends for the database's single log-scan session (~1 failure in 57, MEASURED) and section 14
+        # records why stopping the job first is not available there. It waits for the WATERMARK as well as
+        # the rows, because a change row is not readable until fn_cdc_get_max_lsn() covers it: waiting only
+        # for COUNT leaves a race whose symptom is a SHORT READ, i.e. a wrong answer rather than a failure.
+        # /!\ A third mutant SURVIVED at first (drop the inverted-window short-circuit) and is what narrowed
+        # that branch: a caught-up consumer produces from == to, not from > to. It is now gated with the only
+        # shape that reaches it - an explicit ending_position BELOW the cursor.
+        : "${MIN_ASSERTIONS:=2438}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

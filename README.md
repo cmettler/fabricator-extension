@@ -103,8 +103,9 @@ See [SQL Server external tables on S3](#sql-server-external-tables-on-s3).
 | | — configurable isolation (consistent snapshot per call); per-row procs run in DuckDB's transaction | ✅ |
 | | **Custom C# aggregates** (UDAF) → `db.schema.agg(x)` in `GROUP BY` / parallel / `OVER(…)`; opt-in disk-spill (`SupportsSpill`) | ✅ |
 | **Change data capture** | `db.cdc.tables()` / `max_position()` / `min_position()` / `health()` — inspect SQL Server CDC | ✅ SQL Server only (not Fabric / Synapse) |
-| | `db.cdc.enable_database()` / `enable()` / `disable()` / `scan()` — set capture up from SQL; the catalog refreshes itself | ✅ |
-| | A resumable change-stream reader (`db.cdc.changes(...)`) with a snapshot leg | ❌ designed, not built (`docs/mssql-cdc.md`) |
+| | `db.cdc.enable_database()` / `enable()` / `disable()` / `capture_now()` — set capture up from SQL; the catalog refreshes itself | ✅ |
+| | `db.cdc.changes(...)` — a resumable change-stream reader with a 21-byte cursor and a retention pre-check | ✅ |
+| | An initial-snapshot leg (`include := 'snapshot+changes'`), before-images, timestamp bounds | ❌ designed, not built (`docs/mssql-cdc.md` §15.12) |
 | **Monitoring** | `db.dbo.fabricator_session_tag(k, v)` — tag a transaction's connection so Fabric query insights can attribute its cost | ✅ (see dbt caveat) |
 | | `application_name` on the secret → `program_name` on every statement (run-level attribution) | ✅ |
 | | Load-time *global* functions (connection-free); proc multi-result-set / `INOUT` params | ❌ deferred |
@@ -834,9 +835,10 @@ WHERE property IN ('supports_mars', 'mars_enabled');
 
 ### `db.cdc.*` — change data capture (SQL Server only)
 
-Inspection functions over SQL Server's [change data
-capture](https://learn.microsoft.com/en-us/sql/relational-databases/track-changes/about-change-data-capture-sql-server).
-They live in the catalog's `cdc` schema, so they resolve as `db.cdc.max_position()` and so on.
+Set capture up, inspect it, and READ the change stream — over SQL Server's [change data
+capture](https://learn.microsoft.com/en-us/sql/relational-databases/track-changes/about-change-data-capture-sql-server),
+with no message queue anywhere in it. They live in the catalog's `cdc` schema, so they resolve as
+`db.cdc.changes('dbo.orders')` and so on.
 
 > **⚠ SQL Server only.** CDC is a SQL Server engine feature: **Fabric Warehouse, the Fabric Lakehouse SQL
 > endpoint and Synapse dedicated pools do not have it**, and on those engines these functions are not
@@ -852,6 +854,7 @@ They live in the catalog's `cdc` schema, so they resolve as `db.cdc.max_position
 | `db.cdc.enable('<schema>.<table>' [, capture_instance :=] [, columns :=] [, role :=] [, index :=] [, filegroup :=] [, net :=])` | `sys.sp_cdc_enable_table` — idempotent per capture instance |
 | `db.cdc.disable('<schema>.<table>' [, capture_instance :=])` | `sys.sp_cdc_disable_table`; with no instance named, all of that table's |
 | `db.cdc.capture_now()` | `sys.sp_cdc_scan` — force the capture log scan now (see the ⚠ below) |
+| `db.cdc.changes('<schema>.<table>' \| '<capture instance>' [, starting_position :=] [, ending_position :=] [, capture_instance :=] [, images :=] [, commit_timestamp :=])` | the change stream — see below |
 | `db.cdc.health()` | 12 `(property, value)` rows, in this order: `supports_cdc`, `database`, `cdc_enabled`, `captured_instances`, `capture_job`, `capture_polling_interval_seconds`, `cleanup_job`, `cleanup_retention_minutes`, `max_lsn`, `max_lsn_time`, `max_lsn_age_seconds`, `agent_status` |
 
 The four setup functions each return one report row — `target`, `changed`, `detail`. **`changed` is separate
@@ -908,8 +911,75 @@ SELECT * FROM db.cdc.health();
   form this extension adds for every discovered table function) are ordinary discovered functions and are
   callable directly.
 
-A first-class reader — one function returning the change stream with a resumable cursor, a snapshot leg and
-retention pre-checks — is designed but not yet built; see `docs/mssql-cdc.md`.
+#### Reading the change stream — `db.cdc.changes(...)`
+
+```sql
+FROM db.cdc.changes('dbo.orders'                    -- a <schema>.<table> or a capture-instance name
+      [, starting_position := <BLOB>]               -- EXCLUSIVE lower bound: a 10-byte LSN or a 21-byte _position
+      [, ending_position   := <BLOB>]               -- INCLUSIVE upper bound; default db.cdc.max_position()
+      [, capture_instance  := '<name>']             -- required when a table has two
+      [, images            := 'after']              -- the only value this release accepts
+      [, commit_timestamp  := false])               -- opt-in, see below
+```
+
+| column | type | |
+|---|---|---|
+| `_change_type` | `VARCHAR` | `insert` / `update_postimage` / `delete` — the same spellings the Delta change feed uses, so a consumer that handles one handles the other |
+| `_position` | `BLOB(21)` | the resume token: `start_lsn ‖ seqval ‖ operation`, whose byte order **is** the change order |
+| `_commit_lsn` | `BLOB(10)` | every row of one transaction shares it |
+| `_seq_val` | `BLOB(10)` | |
+| `_operation` | `INTEGER` | SQL Server's raw code (1 delete, 2 insert, 4 update after-image) |
+| `_commit_timestamp` | `TIMESTAMP` | only with `commit_timestamp := true` |
+| …source columns… | as the source table | a `delete` row carries the **deleted** values |
+
+**The resumable idiom.** Take the window END first, read a closed window, then advance the cursor to that
+end — never to `max(_position)` of what came back, which is lower than what you read whenever you filtered
+and `NULL` whenever the window was empty:
+
+```sql
+-- 1. the window end, taken BEFORE the read and stored whatever the read returns
+SET VARIABLE cdc_end = (SELECT db.cdc.max_position());
+
+-- 2. a closed window, resuming from your own cursor
+SET VARIABLE cdc_cur = (SELECT cur FROM my_cursors WHERE tbl = 'dbo.orders');
+INSERT INTO staging
+SELECT * FROM db.cdc.changes('dbo.orders',
+                             starting_position := getvariable('cdc_cur'),
+                             ending_position   := getvariable('cdc_end'));
+
+-- 3. advance to the WINDOW END
+UPDATE my_cursors SET cur = getvariable('cdc_end') WHERE tbl = 'dbo.orders';
+```
+
+> **⚠ `SET VARIABLE` + `getvariable()` is not a stylistic choice — it is the only spelling that binds.** An
+> inline scalar subquery is refused as a table-function argument (`Binder Error: Table function cannot
+> contain subqueries`) **and** as an `EXECUTE` argument (`Only scalar parameters, named parameters or NULL
+> supported for EXECUTE`). A scalar *function call* is fine in an `EXECUTE`, so
+> `EXECUTE q(db.cdc.max_position())` works too.
+
+**Notes:**
+
+- **An empty window is empty, not an error.** A cursor sitting at the window end returns zero rows; so does a
+  capture instance the job has not scanned yet.
+- **⚠ A cursor below the retention floor is refused, loudly, and that is the point of the function.** SQL
+  Server answers every bad window — a purged cursor, a bound above the watermark, an inverted window, even a
+  misspelled option — with the *same* message: `Msg 313: An insufficient number of arguments were supplied
+  for the procedure or function cdc.fn_cdc_get_all_changes_ ... .` on a call with three arguments. It names
+  neither the cause nor your table (the `...` is a real placeholder object SQL Server calls to raise it), and
+  it sends you to inspect a call site while the real news is that **your pipeline has lost data**. This
+  function checks the window itself and says so.
+- **An `UPDATE` produces ONE row** (the after-image). SQL Server records two — a before-image and an
+  after-image — and `images := 'both'` will surface the pair; this release reads after-images only.
+- **`commit_timestamp` is opt-in because it costs a join.** It is the only column that needs
+  `cdc.lsn_time_mapping`, DuckDB will not eliminate that join when nothing selects from it, and the value is
+  a `datetime` (~3.33 ms) — metadata, never an ordering key. `_position` is the ordering key.
+- **A table with two capture instances is refused, not resolved.** Both capture every change in the overlap
+  window, so reading either silently double-counts or drops; name one with `capture_instance :=`.
+- **Ordering is yours.** Rows arrive in no promised order; `ORDER BY _position` is correct replay order, and
+  `_position` values compare as unsigned bytes so `min()`/`max()` work.
+- **Not built yet** (`docs/mssql-cdc.md` §15.12): the initial-snapshot leg (`include := 'snapshot+changes'`),
+  `images := 'both'`, timestamp bounds, hidden capture-instance names, and reading across a two-instance
+  schema-change boundary.
 
 ### `db.dbo.fabricator_session_tag(key, value) -> TABLE` (SQL Server / Fabric)
 

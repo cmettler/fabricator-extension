@@ -1424,7 +1424,18 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     /// Server family member honours, and where a particular statement cannot be described the catch below
     /// already yields the fallback. So there is no capability question to answer and no probe to swallow.</para>
     /// </remarks>
-    public Schema? DescribeQuery(string sql)
+    public Schema? DescribeQuery(string sql) => DescribeQuery(sql, null);
+
+    /// <summary>
+    /// As <see cref="DescribeQuery(string)"/>, for a PARAMETERIZED statement.
+    /// </summary>
+    /// <remarks>
+    /// ⚠ The parameter VALUES are irrelevant — nothing executes — but the parameters must still be declared,
+    /// or SQL Server cannot compile the statement it is being asked to describe. The CDC reader is the caller:
+    /// it describes the very TVF call it is about to run, bounds and all, so the schema it reports at bind and
+    /// the columns it reads at execute come from one SQL text through one mapping.
+    /// </remarks>
+    public Schema? DescribeQuery(string sql, IReadOnlyList<SqlParameter>? parameters)
     {
         try
         {
@@ -1434,6 +1445,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
             command.CommandText = sql;
             command.CommandType = CommandType.Text;
             command.CommandTimeout = ResolveCommandTimeout();
+            AddParameters(command, parameters);
             using var reader = command.ExecuteReader(CommandBehavior.SchemaOnly);
             var columns = reader.GetColumnSchema();
             if (columns.Count == 0)
