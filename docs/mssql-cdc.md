@@ -836,8 +836,12 @@ phase we need is expressible in generated SQL, and it inherits pushdown and para
 give up. The three things A cannot do — cross-table ordering, following, and read-time error translation —
 are respectively out of scope (§6), out of scope (§9), and better done at bind anyway (§2.1).
 
-⚠ **A's viability rests on two UNVERIFIED facts** (`fn_cdc_is_bit_set`, and how a `LEFT JOIN` to
-`lsn_time_mapping` costs across two catalog scans). Settle §11 items 1–2 before committing.
+⚠ **A's viability rested on two UNVERIFIED facts. One is now settled and it changes the emitted SQL above:
+the `LEFT JOIN` must be CONDITIONAL, because DuckDB does not eliminate it when nothing selects
+`_commit_timestamp` — MEASURED, and not even a `PRIMARY KEY` on the right side changes that (§11 item 2).**
+So the join belongs behind something `GenerateSql` can see (a named parameter), and the default window read
+is a single change-table scan. `fn_cdc_is_bit_set` (§11 item 1, needed only for `images := 'both'`) is still
+unverified.
 
 ---
 
@@ -1233,8 +1237,40 @@ next run's `cdc.max_position()` is not NULL where §0 expects it. Disable in tea
      op 3 (before) has `notes = NULL` while op 4 (after) has `notes = 'first'`, and the mask says `notes` was
      NOT changed in both. So "the writer did not record it" is readable from the mask even though the VALUE
      alone cannot tell it from a genuine NULL.
-2. **What a `LEFT JOIN cdc.lsn_time_mapping` costs** as two catalog scans versus letting SQL Server do it
-   inside `fabricator_query`. Decides A versus A2 for the default mode. *Cheap: `EXPLAIN ANALYZE` both.*
+2. ~~**What a `LEFT JOIN cdc.lsn_time_mapping` costs** as two catalog scans versus letting SQL Server do it
+   inside `fabricator_query`.~~ **LARGELY DISSOLVED, 2026-08-24 — the join is needed for ONE OUTPUT COLUMN and
+   should not be emitted unless that column is asked for.** What remains to measure is only the cost of the
+   opt-in path, which by definition nobody pays by default.
+
+   **Where the join is needed at all, stated plainly: only `_commit_timestamp`.** The change table's eight
+   columns (§1.2) carry no time — `__$start_lsn`, `__$seqval`, `__$operation`, `__$update_mask`,
+   `__$command_id` and the captured source columns — so `cdc.lsn_time_mapping` is the only place a commit
+   time exists (`tran_end_time`, keyed by `start_lsn`, one row per captured transaction). Every other output
+   column of §6's contract comes from the change table itself, and the WINDOW never needs the join either:
+   bounds are LSNs, and a timestamp bound is resolved server-side by `sys.fn_cdc_map_time_to_lsn` at bind
+   (§1.6), not by joining.
+
+   ⚠ **And it is metadata, not an ordering key** (§1.6: `datetime`, ~3.33 ms, so two transactions in one tick
+   share a value). So a reader that omits it loses nothing structural — which is exactly what makes leaving it
+   out of the default emission defensible rather than a gap.
+
+   ⚠⚠ **MEASURED 2026-08-24: DuckDB will NOT eliminate the join for you, and a PRIMARY KEY does not help.**
+   `EXPLAIN SELECT ct.v FROM ct LEFT JOIN ltm ON ltm.k = ct.k` keeps a `HASH_JOIN` with a full scan of the
+   right side even though nothing selects from it — and it keeps it whether or not the right side declares
+   `PRIMARY KEY (k)`. So "emit the join always and let projection pushdown prune it" **does not work**: the
+   cost is paid by every caller, on both scans, whether or not they want a timestamp. (Our catalog advertises
+   no uniqueness anyway — `GetStorageInfo` reports none, which is why `ON CONFLICT` is refused — so there was
+   never a route to the elimination even in principle.)
+
+   ⇒ **Design consequence for slice 3: `_commit_timestamp` must be requested by something `GenerateSql` can
+   see** — a named parameter, not a projection — because the emitter runs at bind and the projection is
+   applied to the subquery afterwards. Then the default window read is ONE catalog scan of one change table,
+   and the two-scan question only arises for the caller who asked for commit times.
+
+   ⚠ It does **not** re-open A versus A2: that fork was settled by two other measurements (a catalog scan of
+   a change table PUSHES the LSN range down into the T-SQL, and `fabricator_query` used to execute its SQL
+   twice — since fixed). The join was the last "unverified fact" behind A's viability, and this narrows it to
+   an opt-in path rather than the default one.
 3. ~~**Does `sys.fn_cdc_get_max_lsn()` inside a `SNAPSHOT` transaction return the snapshot-consistent
    position?**~~ **DISSOLVED, not answered (user-directed, 2026-08-23).** §5's two-connection protocol reads
    P0 on an ordinary connection under TABLOCKX, so nothing depends on how that function behaves inside a
