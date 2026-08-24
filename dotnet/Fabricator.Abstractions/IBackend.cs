@@ -325,6 +325,31 @@ public interface IBackendCatalog : IDisposable
     /// <summary>Execute a query and return its result as an Arrow stream.</summary>
     IArrowArrayStream ExecuteQuery(string sql);
 
+    /// <summary>
+    /// Reports what <see cref="ExecuteQuery"/> would return, WITHOUT executing it — or <c>null</c> when this
+    /// provider cannot describe this statement, in which case the caller executes instead.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>Why it exists.</b> <c>fabricator_query</c> is a DuckDB TABLE function, so the host needs the
+    /// column types at BIND and obtains them by asking the scan for a stream and reading its schema. Without a
+    /// describe that probe is a full execution, and the caller's SQL therefore runs TWICE — MEASURED: an
+    /// <c>INSERT</c> put through <c>fabricator_query</c> inserted two rows.</para>
+    /// <para>⚠ <b>Return <c>null</c>, do not throw, for "I cannot describe THIS statement."</b> The two are
+    /// different answers and the caller treats them differently: null falls back to executing (today's
+    /// behaviour, no worse), while an exception propagates — which is right for a genuine problem with the
+    /// SQL, since reporting a syntax error or a missing object at BIND beats discovering it mid-scan.</para>
+    /// <para>⚠⚠ <b>The schema returned here MUST match what an execution would produce.</b> The host reports
+    /// it to DuckDB before any row arrives, so a disagreement is a schema mismatch, not a wrong estimate — the
+    /// <c>duckdb_arrow_scan</c> class. The safe way to satisfy that is to derive BOTH answers through the same
+    /// mapping from the same kind of metadata, which is what the SQL Server implementation does
+    /// (<c>CommandBehavior.SchemaOnly</c> plus the very <c>SqlArrowMapping.ToArrowField</c> the reader uses).
+    /// A provider that derives its describe some other way is taking a real risk and should return null
+    /// instead.</para>
+    /// <para>The default returns null, so a provider that has no describe facility — Delta, DAX, delta-rs —
+    /// implements nothing and behaves exactly as before.</para>
+    /// </remarks>
+    Schema? DescribeQuery(string sql) => null;
+
     /// <summary>Execute a non-query statement (DML/DDL); returns rows affected.</summary>
     long ExecuteNonQuery(string sql);
 

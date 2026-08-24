@@ -220,7 +220,22 @@ public static unsafe class Bootstrap
                           ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
             var query = Marshal.PtrToStringUTF8((nint)sql) ?? string.Empty;
 
-            IArrowArrayStream stream = catalog.ExecuteQuery(query);
+            // ⚠ DESCRIBE-THEN-EXECUTE, and it is a FIX rather than an optimisation. The host's bind-time
+            // schema probe (arrow_ingest's PopulateReturnSchema) calls this entry, reads get_schema and
+            // releases — then the scan calls it again for rows. Handing back an eagerly-executed stream
+            // therefore ran the caller's SQL TWICE: MEASURED, an INSERT through fabricator_query inserted two
+            // rows where the same statement through fabricator_exec inserted one.
+            //
+            // DescribedArrowStream defers: get_schema asks the provider to DESCRIBE (no execution), and only
+            // a row pull executes. A provider that cannot describe the statement returns null and the stream
+            // executes to answer the schema, keeping that stream for the rows — i.e. the unsupported case is
+            // exactly the old behaviour rather than a failure.
+            //
+            // ⚠ Scoped to THIS entry on purpose. The provider's own internal reads call catalog.ExecuteQuery
+            // directly in C# and want rows immediately; wrapping those would add a describe round trip that
+            // nothing consumes.
+            IArrowArrayStream stream =
+                new DescribedArrowStream(() => catalog.DescribeQuery(query), () => catalog.ExecuteQuery(query));
             CArrowArrayStreamExporter.ExportArrayStream(stream, outStream);
             return FabricatorStatus.Ok;
         }

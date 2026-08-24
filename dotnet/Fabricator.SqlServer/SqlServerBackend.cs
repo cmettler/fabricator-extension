@@ -1394,6 +1394,72 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
                                1);
     }
 
+    /// <summary>
+    /// The result schema of <paramref name="sql"/> without executing it, via
+    /// <c>CommandBehavior.SchemaOnly</c>. Null when SQL Server cannot describe the statement.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>⚠⚠ THE SAFETY PROPERTY IS THAT BOTH ANSWERS COME FROM ONE MAPPING.</b> The schema is built
+    /// from <c>reader.GetColumnSchema()</c> through <see cref="Fabricator.Bridge.Conversion.SqlArrowMapping.ToArrowField"/> — the identical
+    /// call <see cref="DbDataReaderArrowStream"/>'s constructor makes on the real execution. So describe and
+    /// execute cannot disagree because of a hand-written type table; they can only disagree if SQL Server
+    /// itself describes a statement differently from how it runs it. That is what makes reporting this schema
+    /// to DuckDB at BIND acceptable (a disagreement would be the <c>duckdb_arrow_scan</c> mismatch class, not
+    /// a bad estimate).</para>
+    /// <para><b>MEASURED that a describe does not execute:</b> <c>sp_describe_first_result_set</c> over
+    /// <c>INSERT INTO t VALUES (1); SELECT 1 AS x, CAST(2 AS BIGINT) AS y</c> left the table EMPTY and reported
+    /// both columns with correct types and nullability. <c>SchemaOnly</c> is the SqlClient spelling of the same
+    /// thing, and it is preferred here over calling the sp ourselves because it yields a
+    /// <c>DbColumn</c> collection — the input the reader's own mapping already takes — instead of a
+    /// <c>system_type_name</c> string that would need a second, divergeable type table.</para>
+    /// <para>⚠ NULL, not an exception, for "cannot describe": SQL Server refuses to describe some shapes
+    /// (dynamic SQL, certain temp-table dependencies, a batch with no result set), and those must keep working
+    /// by falling back to execution. A statement that is genuinely BROKEN still throws, and surfacing that at
+    /// bind is better than mid-scan.</para>
+    /// <para>⚠ Deliberately its OWN short-lived connection rather than the transaction's pinned one. A
+    /// describe is metadata, it must not materialise a write connection as a side effect of BINDING (the
+    /// recorded hazard: a scan's routing depends on whether the pinned connection exists yet), and holding a
+    /// reader open across the host's bind would be the outstanding-result-set problem for no gain.</para>
+    /// <para>⚠ NOT gated on <c>ServerProfile</c>: <c>SchemaOnly</c> is a client-side behaviour that every SQL
+    /// Server family member honours, and where a particular statement cannot be described the catch below
+    /// already yields the fallback. So there is no capability question to answer and no probe to swallow.</para>
+    /// </remarks>
+    public Schema? DescribeQuery(string sql)
+    {
+        try
+        {
+            using var connection = OpenConnection();
+            connection.Open();
+            using var command = connection.CreateCommand();
+            command.CommandText = sql;
+            command.CommandType = CommandType.Text;
+            command.CommandTimeout = ResolveCommandTimeout();
+            using var reader = command.ExecuteReader(CommandBehavior.SchemaOnly);
+            var columns = reader.GetColumnSchema();
+            if (columns.Count == 0)
+            {
+                // No result set to describe (a bare INSERT, a DDL batch). Returning null rather than an empty
+                // schema matters: an empty schema is a CLAIM about the result, and a zero-column Arrow stream
+                // cannot cross the boundary anyway.
+                return null;
+            }
+            var fields = new Field[columns.Count];
+            for (int i = 0; i < columns.Count; i++)
+            {
+                fields[i] = Fabricator.Bridge.Conversion.SqlArrowMapping.ToArrowField(columns[i]);
+            }
+            return new Schema(fields, metadata: null);
+        }
+        catch (Exception ex)
+        {
+            // "I cannot describe THIS statement" — fall back to executing, which is what happened before this
+            // method existed. Logged rather than silent, because a describe that always fails turns the fix
+            // into a no-op and nothing else would say so.
+            Log.LogDebug(ex, "describe_query: could not describe without executing; falling back to execution");
+            return null;
+        }
+    }
+
     public IArrowArrayStream ExecuteQuery(string sql) => ExecuteQuery(sql, null);
 
     public IArrowArrayStream ExecuteQuery(string sql, IReadOnlyList<SqlParameter>? parameters) =>

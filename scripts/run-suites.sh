@@ -420,7 +420,11 @@ case "$TIER" in
         # (docker-compose sets MSSQL_AGENT_ENABLED=true): its agent_status assertion is the only thing that
         # would notice a revert of that compose change, because sp_cdc_enable_db/_table both SUCCEED with the
         # agent stopped and every other assertion in the suite passes with it off.
-        : "${MIN_SUITES:=53}"
+        # 54 runs since 2026-08-24: verify_raw_query — fabricator_query / fabricator_exec semantics. It exists
+        # because NOTHING owned those two functions: 29 suites USE fabricator_query and none was about it,
+        # which is how it shipped executing every statement TWICE with no assertion noticing. Only a COUNTING
+        # assertion can see that; every "the rows are right" test passes either way.
+        : "${MIN_SUITES:=54}"
         # 1424 since 2026-08-01: verify_exec_invalidate_cache 10 -> 21, for the OUT-OF-BAND DROP path Ã¢ÂÂ the
         # catalog's self-heal, documented in CLAUDE.md and until now covered by NOTHING. The service tier ran
         # 44/44 green while that path was broken, which is why the section exists. It must run with
@@ -573,7 +577,9 @@ case "$TIER" in
         # change table `cdc.enable` created moments earlier in the SAME session, which is impossible without
         # the deferred catalog rebuild the flag triggers. Two mutants (never report the DDL; move the DDL out
         # of Execute() into the iterator body, where the host has already read the flag) both die there.
-        : "${MIN_ASSERTIONS:=2327}"
+        # 2354 since 2026-08-24: verify_raw_query 27, gating the describe-then-execute fix. Mutation-tested —
+        # restoring the eager stream dies at §1 with "Expected 1, Actual 2", i.e. the doubled INSERT itself.
+        : "${MIN_ASSERTIONS:=2354}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

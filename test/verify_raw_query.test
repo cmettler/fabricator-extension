@@ -1,0 +1,146 @@
+# name: test/verify_raw_query.test
+# description: fabricator_query / fabricator_exec semantics — above all, that a raw query runs ONCE
+# group: [fabricator]
+#
+# ⚠ THIS SUITE EXISTS BECAUSE NOTHING OWNED THESE TWO FUNCTIONS. 29 suites USE fabricator_query; none was
+#   about it, which is how it shipped executing every statement TWICE without a single assertion noticing.
+#
+# Service tier — it needs a real SQL Server.
+
+require fabricator
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS q (TYPE fabricator);
+
+statement ok
+SELECT fabricator_exec('q', 'IF OBJECT_ID(''dbo.rq_probe'') IS NOT NULL DROP TABLE dbo.rq_probe; CREATE TABLE dbo.rq_probe(n INT);');
+
+# ═══ §1  ⚠⚠ A RAW QUERY RUNS ONCE. This is the whole suite. ════════════════════════════════════════════
+# fabricator_query is a TABLE function, so DuckDB needs its column types at BIND — and the host gets them by
+# asking the scan for a stream and reading its schema (arrow_ingest's PopulateReturnSchema), then asks again
+# for rows. Since the SQL Server stream can only be built around an ALREADY-EXECUTED reader, that probe WAS a
+# full execution: this section measured **2** before the fix.
+#
+# The fix is a describe-then-execute stream (DescribedArrowStream + IBackendCatalog.DescribeQuery): get_schema
+# describes via CommandBehavior.SchemaOnly, only a row pull executes.
+#
+# ⚠ A counting assertion is the only thing that can see this. Every "the rows are right" test in the tree
+# passes either way, which is exactly why it went unnoticed — a doubled SELECT returns the same rows.
+
+statement ok
+SELECT * FROM fabricator_query('q', 'INSERT INTO dbo.rq_probe VALUES (1); SELECT 1 AS x');
+
+query I
+SELECT n FROM fabricator_query('q', 'SELECT COUNT(*) AS n FROM dbo.rq_probe');
+----
+1
+
+# ⚠ POSITIVE CONTROL: the statement really did run — so the assertion above is "exactly once", not "never".
+# Without this row, a build whose bind-time probe silently swallowed the whole statement would also pass.
+query I
+SELECT n FROM fabricator_query('q', 'SELECT SUM(n) AS n FROM dbo.rq_probe');
+----
+1
+
+# ═══ §2  The same statement through fabricator_exec — one execution, and it REPORTS the count ══════════
+# The contrast is the point: exec is the right tool for a write, and it always was. What changed is that
+# query is no longer silently worse.
+
+statement ok
+SELECT fabricator_exec('q', 'TRUNCATE TABLE dbo.rq_probe;');
+
+query I
+SELECT fabricator_exec('q', 'INSERT INTO dbo.rq_probe VALUES (7);');
+----
+1
+
+query I
+SELECT n FROM fabricator_query('q', 'SELECT COUNT(*) AS n FROM dbo.rq_probe');
+----
+1
+
+# ═══ §3  The described schema must MATCH what execution returns ═══════════════════════════════════════
+# ⚠⚠ THE DANGEROUS DIRECTION, and the reason this section exists. The host reports the described schema to
+# DuckDB BEFORE any row arrives, so a describe that disagreed with the execution would be a schema mismatch —
+# the duckdb_arrow_scan class, which SEGFAULTS rather than erroring. What makes that unlikely is construction
+# rather than care: both answers are built by SqlArrowMapping.ToArrowField from a DbColumn, so the describe
+# and the execute paths run the SAME mapping. This section is the check that they in fact agree.
+
+# ⚠ `FROM (DESCRIBE …)` rather than a bare DESCRIBE: the bare form returns SIX columns (null/key/default/
+# extra as well), and this section is about two of them.
+query TT
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM fabricator_query('q', 'SELECT CAST(1 AS INT) AS i, CAST(2.5 AS DECIMAL(9,2)) AS d, CAST(''hi'' AS VARCHAR(8)) AS s, CAST(NULL AS DATETIME2(3)) AS t'));
+----
+i	INTEGER
+d	DECIMAL(9,2)
+s	VARCHAR
+t	TIMESTAMP
+
+# …and the VALUES arrive under exactly those types.
+query IRTT
+SELECT * FROM fabricator_query('q', 'SELECT CAST(1 AS INT) AS i, CAST(2.5 AS DECIMAL(9,2)) AS d, CAST(''hi'' AS VARCHAR(8)) AS s, CAST(NULL AS DATETIME2(3)) AS t');
+----
+1	2.50	hi	NULL
+
+# ═══ §4  Statements SQL Server cannot describe still work — the fallback ══════════════════════════════
+# sp_describe_first_result_set cannot handle every shape. A batch that creates and reads a temp table is the
+# one MEASURED to fall back here, and falling back means executing to learn the schema — i.e. exactly the old
+# behaviour for that shape, which is why it is a fallback and not a failure.
+#
+# ⚠ Its double execution is deliberately NOT asserted: constructing a statement that both defeats the
+# describe AND has a countable persistent side effect is contrived, and pinning a limitation with a contrived
+# probe is worse than naming it. §1 is what catches a regression that made EVERYTHING fall back.
+
+query I
+SELECT a FROM fabricator_query('q', 'SELECT * INTO #rq_t FROM (SELECT 42 AS a) s; SELECT a FROM #rq_t');
+----
+42
+
+# Dynamic SQL, a DECLARE prologue and a UNION are all describable — measured, so they take the single-
+# execution path. Pinned because they are the shapes most likely to be assumed unsupported.
+query I
+SELECT z FROM fabricator_query('q', 'EXEC sp_executesql N''SELECT 7 AS z''');
+----
+7
+
+query I
+SELECT v FROM fabricator_query('q', 'DECLARE @i INT = 3; SELECT @i AS v');
+----
+3
+
+# ═══ §5  A genuinely broken statement fails at BIND, with SQL Server's own message ════════════════════
+# ⚠ This is a BEHAVIOUR CHANGE worth pinning rather than a side effect: the describe surfaces the real error
+# one phase earlier than the execution used to. Reporting "Invalid column name" while binding beats
+# discovering it mid-scan, and the message is the server's, not ours.
+
+statement error
+SELECT * FROM fabricator_query('q', 'SELECT nosuchcolumn FROM dbo.rq_probe');
+----
+Invalid column name 'nosuchcolumn'
+
+# ⚠ A describe FAILURE must not be confused with "cannot describe": only the provider's explicit null falls
+# back to executing. If an exception were swallowed instead, the statement above would run, fail at scan time,
+# and this assertion would still pass — but every genuinely broken query would cost a wasted execution first.
+# Nothing else distinguishes the two, so the message text is load-bearing here.
+
+# ═══ §6  Zero-row and no-result-set shapes ═══════════════════════════════════════════════════════════
+
+query I
+SELECT count(*) FROM fabricator_query('q', 'SELECT 1 AS a WHERE 1 = 0');
+----
+0
+
+# A batch with NO result set at all: the describe reports no columns, which is not a schema — it is the
+# absence of one — so DescribeQuery returns null and the execute path answers. A zero-COLUMN Arrow stream
+# cannot cross the boundary, so this is expected to fail rather than return nothing.
+statement error
+SELECT * FROM fabricator_query('q', 'UPDATE dbo.rq_probe SET n = n');
+----
+<REGEX>:.*(schema|column|field).*
+
+# ═══ §7  Teardown ════════════════════════════════════════════════════════════════════════════════════
+
+statement ok
+SELECT fabricator_exec('q', 'DROP TABLE dbo.rq_probe;');

@@ -741,6 +741,16 @@ SELECT id, name FROM fabricator_query('Server=...;Database=...', 'SELECT id, nam
 SELECT * FROM fabricator_query('mssql', 'SELECT id, name FROM dbo.people');   -- attached catalog
 ```
 
+**Use `fabricator_exec` for anything that writes.** `fabricator_query` is a table function, so DuckDB needs
+its column types before it can plan — which the SQL Server provider answers with a *describe*
+(`sp_describe_first_result_set`, no execution). A few statement shapes cannot be described (a batch that
+creates and reads a temp table is the one we've measured), and those fall back to executing once to learn the
+schema and once for the rows. So a side-effecting statement put through `fabricator_query` may run **twice**;
+put through `fabricator_exec` it runs once and tells you how many rows it touched.
+
+⚠ A broken query now fails while *binding*, with SQL Server's own message (`Invalid column name 'x'`) — one
+phase earlier than before.
+
 ### `fabricator_exec(context, sql) -> BIGINT`
 
 Execute arbitrary T-SQL (DDL/DML/EXEC); returns rows affected (0 for DDL / no-row statements).
@@ -756,6 +766,15 @@ value = aggregate rows affected). `GO` is **not** supported — it's a sqlcmd/SS
 ```sql
 SELECT fabricator_exec('mssql', 'CREATE TABLE dbo.t (id int); INSERT INTO dbo.t VALUES (1),(2)');
 ```
+
+
+⚠ **Inside an explicit `BEGIN … COMMIT`, whether this joins the transaction depends on whether something
+already wrote.** `fabricator_exec` joins the transaction's pinned provider connection only if one *already
+exists* — i.e. only if a DuckDB-managed write has pinned it. Otherwise it autocommits on its own connection,
+because a raw string-target exec never triggers the catalog's transaction lifecycle and nothing would ever
+commit that connection. If you need a statement to be reliably part of the transaction, make sure the
+transaction has written first, or use a purpose-built function (`db.dbo.fabricator_session_tag()` exists for
+exactly this reason).
 
 ### `fabricator_refresh_cache(catalog)` / `fabricator_invalidate_cache(catalog [, schema [, table]])`
 
