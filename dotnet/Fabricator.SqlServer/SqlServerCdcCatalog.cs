@@ -448,23 +448,23 @@ public sealed partial class SqlServerCatalog
     /// to be unfixable by retrying (20 attempts with backoff, all lost, the job confirmed running throughout).
     /// So no retry is attempted; the message says what to do instead.
     /// </remarks>
-    internal RecordBatch CdcScan()
+    internal RecordBatch CdcCaptureNow()
     {
         const string sql =
             "SET NOCOUNT ON; " +
             "IF NOT " + SqlServerCdcFunctions.CdcEnabledPredicate + " " +
-            "  THROW 50002, 'cdc.scan: change data capture is not enabled on this database', 1; " +
+            "  THROW 50002, 'cdc.capture_now: change data capture is not enabled on this database', 1; " +
             "EXEC sys.sp_cdc_scan; " +
             "SELECT CAST(DB_NAME() AS varchar(128)) AS target, '1' AS changed, " +
             "       CAST('log scan completed' AS varchar(400)) AS detail;";
         try
         {
-            return CdcReportFrom(ReadMetadataRows(sql, 3), "cdc.scan");
+            return CdcReportFrom(ReadMetadataRows(sql, 3), "cdc.capture_now");
         }
         catch (SqlException ex) when (ex.Number == 22903)
         {
             throw new InvalidOperationException(
-                "cdc.scan: the capture job currently holds this database's single log-scan session, so a "
+                "cdc.capture_now: the capture job currently holds this database's single log-scan session, so a "
                 + "manual scan cannot run (SQL Server reports it as sp_replcmds already running). Retrying "
                 + "does not help - an actively scanning job can hold that session right through a retry "
                 + "budget. Either stop the capture job for the duration "

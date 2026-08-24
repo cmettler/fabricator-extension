@@ -11,7 +11,7 @@ namespace Fabricator.SqlServer;
 
 /// <summary>
 /// The <c>db.cdc.*</c> SETUP functions — slice 2 of docs/mssql-cdc.md: <c>enable_database()</c>,
-/// <c>enable(...)</c>, <c>disable(...)</c> and <c>scan()</c>. Each does its work at EXECUTION and returns one
+/// <c>enable(...)</c>, <c>disable(...)</c> and <c>capture_now()</c>. Each does its work at EXECUTION and returns one
 /// report row.
 /// </summary>
 /// <remarks>
@@ -42,7 +42,7 @@ internal static class SqlServerCdcSetup
         tables.Add(new CdcEnableDatabaseFunction(catalog));
         tables.Add(new CdcEnableFunction(catalog));
         tables.Add(new CdcDisableFunction(catalog));
-        tables.Add(new CdcScanFunction(catalog));
+        tables.Add(new CdcCaptureNowFunction(catalog));
     }
 
     /// <summary>
@@ -246,7 +246,7 @@ internal sealed class CdcDisableFunction : ICatalogTableFunction
 }
 
 /// <summary>
-/// <c>db.cdc.scan()</c> — <c>sys.sp_cdc_scan</c>, forcing the capture job's log scan to run now instead of
+/// <c>db.cdc.capture_now()</c> — <c>sys.sp_cdc_scan</c>, forcing the capture job's log scan to run now instead of
 /// waiting a polling interval.
 /// </summary>
 /// <remarks>
@@ -264,21 +264,29 @@ internal sealed class CdcDisableFunction : ICatalogTableFunction
 /// <para>⚠ It reports <c>SchemaMayChange = false</c>: a log scan moves data into existing change tables and
 /// creates nothing. Rebuilding the catalog after it would be pure waste on the one function here most likely
 /// to be called in a loop.</para>
+/// <para>⚠ <b>DO NOT RENAME IT BACK TO <c>scan</c> to match <c>sp_cdc_scan</c>.</b> It shipped as
+/// <c>cdc.scan()</c> for one day and the first person to read the function list — the user — took it for the
+/// READER ("so scan will be the one to get a snapshot leg + the changes?"). That is the obvious reading in a
+/// namespace whose whole point is reading changes, and it is the reading that gets expensive once
+/// <c>cdc.changes()</c> sits beside it: a caller who wants rows and finds a function called <c>scan</c> will
+/// call it in a loop, which is exactly the load decision the ⚠ above says they probably do not intend. The
+/// underlying proc keeps its own name in the SQL and in every comment, so "scan" in this file means SQL
+/// Server's procedure and nothing else.</para>
 /// </remarks>
-internal sealed class CdcScanFunction : ICatalogTableFunction
+internal sealed class CdcCaptureNowFunction : ICatalogTableFunction
 {
     private readonly SqlServerCatalog _catalog;
 
-    internal CdcScanFunction(SqlServerCatalog catalog) => _catalog = catalog;
+    internal CdcCaptureNowFunction(SqlServerCatalog catalog) => _catalog = catalog;
 
     public string SchemaName => SqlServerCdcFunctions.SchemaName;
 
-    public string Name => "scan";
+    public string Name => "capture_now";
 
     public Schema Parameters { get; } = new(System.Array.Empty<Field>(), metadata: null);
 
     public ITableFunctionBinding Bind(RecordBatch args) =>
-        new CdcSetupBinding(() => _catalog.CdcScan(), schemaMayChange: false);
+        new CdcSetupBinding(() => _catalog.CdcCaptureNow(), schemaMayChange: false);
 }
 
 /// <summary>

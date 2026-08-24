@@ -456,7 +456,7 @@ SELECT target, changed FROM c1.cdc.disable('dbo.nope');
 ----
 dbo.nope (all)	false
 
-# ═══ §14  scan(), and what about it is gateable ═══════════════════════════════════════════════════════
+# ═══ §14  capture_now(), and what about it is gateable ═══════════════════════════════════════════════
 # ⚠⚠ ITS SUCCESS PATH IS DELIBERATELY NOT ASSERTED, and the suite says so rather than implying coverage:
 # sp_cdc_scan contends with the capture job for the database's single log-scan session, so a bare assertion
 # would be flaky (~1 failure in 57 attempts, MEASURED) — and stopping the job first is not an option here,
@@ -464,9 +464,13 @@ dbo.nope (all)	false
 # catchable in T-SQL, and escapes through fabricator_exec as 22022. The translated 22903 message is therefore
 # also ungated: producing it requires winning a race against a live job on demand.
 #
+# ⚠ The NAME is gated here too, incidentally but usefully: it shipped as cdc.scan() for one day and the first
+# person to read the function list took it for the READER. The `function_name IN (...)` assertion below is what
+# would fail if it ever drifted back, and the reasoning is on CdcCaptureNowFunction.
+#
 # What IS deterministic is the refusal on a database with no CDC, which is our own guard.
 statement error
-SELECT * FROM c0_nocdc.cdc.scan();
+SELECT * FROM c0_nocdc.cdc.capture_now();
 ----
 change data capture is not enabled on this database
 
@@ -475,12 +479,12 @@ change data capture is not enabled on this database
 # these are table functions rather than scalars is that they REPORT: a scalar would have to be VOLATILE to
 # avoid being constant-folded and would still be the wrong shape for a result the caller reads.
 query TT
-SELECT function_name, function_type FROM duckdb_functions() WHERE database_name = 'c1' AND schema_name = 'cdc' AND function_name IN ('enable', 'enable_database', 'disable', 'scan') ORDER BY function_name;
+SELECT function_name, function_type FROM duckdb_functions() WHERE database_name = 'c1' AND schema_name = 'cdc' AND function_name IN ('enable', 'enable_database', 'disable', 'capture_now') ORDER BY function_name;
 ----
+capture_now	table
 disable	table
 enable	table
 enable_database	table
-scan	table
 
 # ═══ §9  Teardown — leave NO CDC-enabled table behind ══════════════════════════════════════════════════
 # Load-bearing: the capture job keeps scanning a CDC-enabled database between runs, and the next run's §3

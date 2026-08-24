@@ -851,7 +851,7 @@ They live in the catalog's `cdc` schema, so they resolve as `db.cdc.max_position
 | `db.cdc.enable_database()` | `sys.sp_cdc_enable_db` — idempotent |
 | `db.cdc.enable('<schema>.<table>' [, capture_instance :=] [, columns :=] [, role :=] [, index :=] [, filegroup :=] [, net :=])` | `sys.sp_cdc_enable_table` — idempotent per capture instance |
 | `db.cdc.disable('<schema>.<table>' [, capture_instance :=])` | `sys.sp_cdc_disable_table`; with no instance named, all of that table's |
-| `db.cdc.scan()` | `sys.sp_cdc_scan` — force the capture log scan now (see the ⚠ below) |
+| `db.cdc.capture_now()` | `sys.sp_cdc_scan` — force the capture log scan now (see the ⚠ below) |
 | `db.cdc.health()` | 12 `(property, value)` rows, in this order: `supports_cdc`, `database`, `cdc_enabled`, `captured_instances`, `capture_job`, `capture_polling_interval_seconds`, `cleanup_job`, `cleanup_retention_minutes`, `max_lsn`, `max_lsn_time`, `max_lsn_age_seconds`, `agent_status` |
 
 The four setup functions each return one report row — `target`, `changed`, `detail`. **`changed` is separate
@@ -890,10 +890,11 @@ SELECT * FROM db.cdc.health();
 - **There is no `disable_database()` on purpose.** `sp_cdc_disable_db` drops every capture instance in the
   database at once, destroying all recorded history — a bigger hammer than anything else here. Use
   `fabricator_exec` if you mean it.
-- **⚠ `cdc.scan()` is a maintenance action, not a per-query one.** It forces the capture log scan immediately
-  instead of waiting a polling interval, which costs CPU that belongs to your DBA's budget. It also contends
-  with the capture job for the database's single log-scan session, so it can fail — the error says to stop the
-  capture job for the duration or simply wait. Useful for tests and for a container with no SQL Server Agent.
+- **⚠ `cdc.capture_now()` is a maintenance action, not a per-query one.** It forces the capture log scan
+  immediately instead of waiting a polling interval, which costs CPU that belongs to your DBA's budget. It
+  also contends with the capture job for the database's single log-scan session, so it can fail — the error
+  says to stop the capture job for the duration or simply wait. Useful for tests and for a container with no
+  SQL Server Agent. It does **not** read anything: it moves changes into the change tables, and nothing out.
 - **"Enabled" and "happening" are independent.** `sp_cdc_enable_db` / `sp_cdc_enable_table` both succeed
   with SQL Server Agent stopped, so a table can look captured and never produce a row. That is what
   `health()`'s `agent_status` is for — and it reports `unknown` rather than guessing when the connection

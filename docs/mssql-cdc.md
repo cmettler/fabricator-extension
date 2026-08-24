@@ -739,7 +739,7 @@ client or splice a literal. The important half — the bounds cannot be an inlin
 | `db.cdc.max_position()` | `sys.fn_cdc_get_max_lsn()` — **NULL when the job has never run**, and NULL rather than 208 when CDC is not enabled (§1.6a) | scalar → `BLOB` |
 | `db.cdc.min_position('dbo.orders')` | `fn_cdc_get_min_lsn(<instance>)` — the retention floor | scalar → `BLOB` |
 | `db.cdc.health()` | agent state, capture/cleanup job config, and `max_lsn_age_seconds` (`map_lsn_to_time(max_lsn)` vs now). ⚠ NOT called `capture_lag_seconds`, which this table said first and would be a misleading name: it is the AGE of the newest CAPTURED transaction, so on an idle database it grows without bound while capture is perfectly current. It is an upper bound on lag, and a signal only beside known write traffic | table fn |
-| `db.cdc.scan()` | `sys.sp_cdc_scan` | table fn — see the ⚠ below |
+| `db.cdc.capture_now()` | `sys.sp_cdc_scan` | table fn — see the ⚠ below. ⚠ It was `cdc.scan()` for one day; §14.5 records why the name had to move |
 
 **Which fabricator kind, and why:**
 - the setup functions are **`ICatalogTableFunction`** returning one report row, following
@@ -763,7 +763,7 @@ Enabling capture **creates objects** (a change table and two TVFs), and the sess
 the cache is rebuilt. `cdc.enable`/`disable` must call the invalidation themselves — a user should not have
 to know that enabling capture is a DDL.
 
-⚠ **`db.cdc.scan()` is a deliberate judgement call, not an oversight.** Forcing a log scan is a
+⚠ **`db.cdc.capture_now()` is a deliberate judgement call, not an oversight.** Forcing a log scan is a
 maintenance action a caller should not normally take, and shipping it invites someone to call it per query
 — which is a CPU load decision that belongs to the DBA (§1.8). But it is also exactly what makes the gate
 deterministic (§10) and what unblocks a container with no agent. Ship it, name the cost in its own error
@@ -1543,14 +1543,14 @@ per-instance TVFs go 0 → 2.
   operator who means it has `fabricator_exec`; putting it one word away from `cdc.disable('t')` would invite
   the wrong one. `cdc.disable` IS offered because it is per-TABLE and named explicitly by the caller, which
   is the consent line `DROP TABLE` already sits on.
-- **`cdc.scan()` TRANSLATES the log-scan race** rather than passing it through. §10.2's `22903 … sp_replcmds`
+- **`cdc.capture_now()` TRANSLATES the log-scan race** rather than passing it through. §10.2's `22903 … sp_replcmds`
   names nothing a reader would connect to CDC, and §10.2a established that retrying does not help — so the
   message says to stop the capture job or wait a polling interval, and no retry is attempted. It also reports
   `schema_may_change = false`: a log scan creates nothing.
 
 ### 14.4 What the suite does NOT cover, said rather than implied
 
-- **`cdc.scan()`'s SUCCESS path is not asserted.** It contends with the capture job for the database's single
+- **`cdc.capture_now()`'s SUCCESS path is not asserted.** It contends with the capture job for the database's single
   log-scan session (~1 failure in 57, measured), and the obvious mitigation is unavailable: `sp_cdc_stop_job`'s
   refusal when the job is not yet running is raised by the Agent proxy, is not catchable in T-SQL, and escapes
   through `fabricator_exec` as `22022` (§10.2a). What IS asserted is its refusal on a non-CDC database, which
@@ -1558,3 +1558,26 @@ per-instance TVFs go 0 → 2.
   against a live job on demand.
 - **The v81 deferral's explicit-transaction gap is not asserted** — sqllogictest drives connections
   sequentially, and the gap is about a second statement inside one transaction. Documented in §v81 instead.
+
+### 14.5 ⚠ `cdc.scan()` → `cdc.capture_now()` — the rename, and why the obvious name was wrong
+
+**It shipped as `cdc.scan()` and the very first person to read the function list took it for the READER**
+(user, on being shown the eight functions: *"so scan will be the one to get a snapshot leg + the changes?"*).
+Renamed to **`cdc.capture_now()`** on their instruction, 2026-08-24 — a pure rename, no behaviour change.
+
+The mistake worth learning from is that the old name was **faithful to the wrong thing**. It named the
+underlying procedure (`sys.sp_cdc_scan`) rather than what a caller of *this* surface gets, and in a namespace
+whose entire purpose is reading changes, "scan" is a reading verb — DuckDB's own vocabulary has `read_parquet`
+and `parquet_scan` as synonyms, so a `scan` that returns no data contradicts the surrounding idiom rather than
+merely being terse.
+
+⚠ **It gets EXPENSIVE at slice 3, which is why it was worth doing before `changes()` lands.** The two would
+sit adjacent in the same schema, a caller wanting rows would find the shorter, more familiar-looking name
+first, and calling it in a loop is precisely the per-query CPU decision §3.5 says it must not invite. A wrong
+name next to the right one is worse than a wrong name alone.
+
+⚠ **Do not "simplify" it back to match the procedure.** The proc keeps its own name everywhere it is
+mentioned — in the T-SQL, in the error text, in every comment — so the invariant now is: **"scan" in the CDC
+code means SQL Server's procedure, never a fabricator function.** The reasoning lives on
+`CdcCaptureNowFunction`, and the suite pins the name (`verify_mssql_cdc` §14's `function_name IN (...)`),
+because a rename with no gate is a rename that can quietly come undone.

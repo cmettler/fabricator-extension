@@ -91,9 +91,10 @@ a `ClientContext`, which is this tree's recorded dangling-pointer class (a catal
 that attached it — the `table_stats` SIGSEGV).
 
 **First consumer:** the four `db.cdc.*` setup functions (`enable_database` / `enable` / `disable`), which is
-also the only coverage of this entry in either tier. ⚠ `cdc.scan()` deliberately reports **false** — a log
-scan moves data into existing change tables and creates nothing, so rebuilding after it would be pure waste
-on the one function here most likely to be called in a loop.
+also the only coverage of this entry in either tier. ⚠ `cdc.capture_now()` (named `cdc.scan()` when this entry
+was written — renamed 2026-08-24, docs/mssql-cdc.md §14.5) deliberately reports **false**: a log scan moves
+data into existing change tables and creates nothing, so rebuilding after it would be pure waste on the one
+function here most likely to be called in a loop.
 
 **Gates:** `verify_mssql_cdc` 73 → **105**, two mutants (never set the flag; move the work into the iterator)
 both killed at §11. Behaviour-neutral for everything else: the whole hermetic tier and every other service
