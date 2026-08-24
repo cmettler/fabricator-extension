@@ -604,7 +604,19 @@ case "$TIER" in
         # /!\ The 100-character-table rows are the DEFECT the generated name removes (Msg 22927 naming a
         # capture instance the user never chose), and the table's own LENGTH beside them is the positive
         # control: without it they would pass on any table at all.
-        : "${MIN_ASSERTIONS:=2495}"
+        # 2524 since 2026-08-25: verify_mssql_cdc 239 -> 268 for slice 5 - _capture_instance on every row and
+        # the in-window DDL check (on_schema_change). Exactly +29 over 2495, i.e. NO other suite moved.
+        # /!\ The POSITIVE CONTROL is the load-bearing row: a window with NO DDL in it reads normally under
+        # the DEFAULT mode. Without it, "a DDL inside the window is refused" would pass equally on a build
+        # that refused every read, or on one where cdc.ddl_history could not be queried at all.
+        # /!\ And the mutant that drops the `ddl_lsn > @from AND ddl_lsn <= @to` predicate - checking the
+        # table's whole DDL history instead of the WINDOW - dies at "a read that STARTS after the DDL is
+        # clean again", which is the row that keeps the check from reading as "this table is poisoned
+        # forever".
+        # /!\ §19's positive control needed on_schema_change := 'ignore' when this landed: §7 alters
+        # dbo.cdc_probe while dbo_cdc_probe is capturing, so a DDL genuinely sits inside that window. That
+        # is the check working, not a workaround.
+        : "${MIN_ASSERTIONS:=2524}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2
