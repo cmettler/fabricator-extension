@@ -1,6 +1,11 @@
-# Log-based change capture for SQL Server — DESIGN (nothing built)
+# Log-based change capture for SQL Server — slices 1 + 2 BUILT, the reader redesigned
 
-> **Status: DESIGN ONLY, 2026-08-23. No code, no ABI, no gate.**
+> **Status: slices 1 (§13) and 2 (§14) are BUILT and gated. The READER is design only, and it was
+> REDESIGNED on 2026-08-24 — read §15 FIRST: it supersedes §4's recommendation and most of §7, and it
+> corrects three things this document previously asserted.**
+>
+> ⚠ The original header read *"DESIGN ONLY, 2026-08-23. No code, no ABI, no gate."* — true when written,
+> and superseded by slice 2's ABI v81.
 >
 > **The ask (user, 2026-08-23):** change data capture for SQL Server, with **no message queue** anywhere in
 > it. A small set of *very usable* table/scalar functions that both **set capture up** and **return the
@@ -11,8 +16,10 @@
 > (`mcr.microsoft.com/mssql/server:2025-latest`, SQL Server 2025) in a throwaway `CdcProbe` database, and
 > through this extension's own `duckdb.exe` where the claim is about us. The probe database was **dropped**
 > and the rig verified back to its original seven databases. Facts read from SQL Server's documented
-> contract but **not** run here are tagged ⚠ **UNVERIFIED** — and §11 lists the ones worth settling before
-> any of this is built, because two of them decide which implementation to pick.
+> contract but **not** run here are tagged ⚠ **UNVERIFIED**. ⚠ §11's items are now all ANSWERED; what
+> remains open is §15.13. The 2026-08-24 measurements in §15 were run the same way, in a throwaway
+> `cdcprobe` database dropped afterwards, with the rig verified back to zero CDC-enabled databases and zero
+> capture jobs.
 
 ---
 
@@ -542,6 +549,13 @@ retention window and **has lost data**.
 and the remedy (re-snapshot). This is the single highest-value line of code in the whole feature, and
 nothing else in this design is worth building without it.
 
+⚠⚠ **AND THE " ... " ABOVE IS NOT AN ELISION — IT IS THE OBJECT'S LITERAL NAME (MEASURED 2026-08-24,
+§15.3).** Every CDC-enabled database carries four placeholder functions, two of them named
+`fn_cdc_get_all_changes_...` and `fn_cdc_get_all_changes_ ... `, and `sys.fn_cdc_check_parameters` calls
+them deliberately to *"Force error 313"*. So the message is IDENTICAL for every capture instance and
+every cause — and it can never be parsed or attributed. That raises the pre-check above what this
+paragraph claims for it: it is the ONLY channel by which a user can learn what went wrong.
+
 ⚠ **The direct change-table read does NOT validate at all.** MEASURED: the same absurd bounds
 (`0x00…00` to `0xFF…FF`) returned all 5 rows from `cdc.dbo_orders_CT`. Permissive where the TVF is strict —
 which is a §4 trade-off, not a bug: silently returning what survives is *worse* than 313 for a pipeline that
@@ -831,6 +845,11 @@ streaming, the ordering and the resumption.
 
 ### Recommendation
 
+> **⚠⚠ SUPERSEDED 2026-08-24 by §15.1 — the reader is OPTION B (marshaled C#), not A.** The paragraph
+> below is kept because its reasoning is sound and because a THIRD option it never enumerated — the
+> generated TVFs are DISCOVERED catalog functions — nearly won on exactly these grounds. What killed
+> A is not pushdown but §5: the two-connection snapshot protocol is inexpressible in generated SQL.
+
 **Build A (with A2 for the net modes). Keep B in reserve for §6 only.** A is a fraction of the code, every
 phase we need is expressible in generated SQL, and it inherits pushdown and parallelism that B would have to
 give up. The three things A cannot do — cross-table ordering, following, and read-time error translation —
@@ -856,7 +875,7 @@ also *better* than the established practice it was checked against — see §5.4
 A (ordinary connection)                        B (snapshot connection)
 --------------------------------------------   ------------------------------------
 1  BEGIN TRAN
-   SELECT ... FROM t WITH (TABLOCKX)           <- writers frozen, unversioned readers blocked
+   SELECT ... FROM t WITH (TABLOCK, HOLDLOCK)  <- writers frozen, READERS UNAFFECTED (see 5.2a)
 2  EXEC sys.sp_cdc_scan                        <- capture catches up (see 5.3)
 3  P0 = sys.fn_cdc_get_max_lsn()               <- the handoff position
 4                                              SET TRANSACTION ISOLATION LEVEL SNAPSHOT
@@ -907,6 +926,46 @@ touches DATA, not at `BEGIN TRANSACTION`.** So B must issue a real read against 
 window; otherwise the snapshot is taken after the release and can miss writes. (Independent corroboration:
 the established implementation's multi-connection snapshot pool executes a throwaway first query on every
 pooled connection for exactly this reason.)
+
+### 5.2a ⚠ THE HINT IS `TABLOCK, HOLDLOCK` — NOT `TABLOCKX` (user-raised, MEASURED 2026-08-24)
+
+The protocol above was written with `TABLOCKX` and it is stronger than the job requires. The user's point:
+**`TABLOCK` is a SHARED lock and is STATEMENT-scoped, so it must be combined with `HOLDLOCK` to survive to
+end of transaction; `TABLOCKX` is an EXCLUSIVE lock and is transaction-scoped by nature.** Both halves
+MEASURED, by asking `sys.dm_tran_locks` from a LATER statement in the same transaction:
+
+| hint | lock on the table, seen by the NEXT statement |
+|---|---|
+| `TABLOCK, HOLDLOCK` | **`OBJECT / S / GRANT`** — held |
+| `TABLOCK` alone | **none** — released at end of statement |
+| `TABLOCKX` | `OBJECT / X / GRANT` — held |
+
+⇒ `TABLOCK` alone is unusable here: steps 2 and 3 are SEPARATE STATEMENTS, so the window would be
+unprotected before `sp_cdc_scan` even ran.
+
+**And the shared lock is SUFFICIENT, because the only thing the protocol must prevent is a WRITE committing
+inside the window.** MEASURED in ONE batch, with the lock state asserted before and after so nothing rests
+on wall clock between calls:
+
+```
+foreign lock on dbo.o: S      <- control, before
+READER: 2 rows                <- a READ COMMITTED reader is NOT blocked   (TABLOCKX blocks it: 5.2)
+sp_cdc_scan under S: OK       <- step 2 still works under the shared lock
+WRITER: 1222                  <- a writer IS blocked
+foreign lock still held: S    <- control, after: all four ran inside the window
+```
+
+A SNAPSHOT pin also succeeds under it, which follows a fortiori from §5.2 (it already succeeds under the
+stronger X lock) and was re-measured anyway.
+
+⇒ **use `WITH (TABLOCK, HOLDLOCK)`.** It freezes writers exactly as `TABLOCKX` does while leaving ordinary
+readers alone, so the protocol's blast radius shrinks from "everyone touching this table" to "writers only",
+for the seconds the pin takes. §5.2's measurements were taken with `TABLOCKX` and remain valid — what
+changes is the hint we ship, not any claim about the handoff.
+
+⚠ `HOLDLOCK` is the `SERIALIZABLE` hint under another name. If connection A were already SERIALIZABLE,
+`TABLOCK` alone would hold to end of transaction — but say both, because the isolation level of a connection
+we did not open is not a thing to depend on.
 
 ### 5.3 ⚠⚠ `fn_cdc_get_max_lsn()` is the CAPTURE WATERMARK, not the log head — hence step 2
 
@@ -985,6 +1044,12 @@ in the next. Anyone needing atomic multi-table windows must align bounds on tran
 ---
 
 ## 7. Schema evolution — the hard part
+
+> **⚠⚠ LARGELY SUPERSEDED 2026-08-24 by §15.6 / §15.9 / §15.11, and one premise of this section is
+> WRONG.** The change table's schema is NOT fixed for the life of the instance — an `ALTER COLUMN
+> <type>` IS propagated, asynchronously, by the capture job. A captured COLUMN also cannot be renamed
+> at all (SQL Server refuses it), and the refuse/project/stop trilemma below is resolved differently:
+> project to the union WITH a `_capture_instance` column, and prefer a resync. Read §15.6 first.
 
 MEASURED facts to design against (§2.2): at most two capture instances; both capture concurrently; the
 older one's stop position is **not recorded** and must be derived from the newer one's `start_lsn`; the two
@@ -1227,6 +1292,9 @@ next run's `cdc.max_position()` is not NULL where §0 expects it. Disable in tea
 
 ## 11. Settle these before building — in this order
 
+> **⚠ Items 1–6 are ANSWERED. What is still open is in §15.13**, and the most useful number left is
+> one this list never contained: how long the capture job takes to apply a `required_column_update`.
+
 1. ~~**`sys.fn_cdc_is_bit_set` / `sys.fn_cdc_get_column_ordinal`**~~ **ANSWERED 2026-08-23 — both exist and
    behave as documented, so §4's Option A keeps its MAX-column placeholder.** MEASURED:
    `fn_cdc_get_column_ordinal('dbo_o','amount')` = 3, `'notes'` = 4, and **a column that does not exist
@@ -1320,6 +1388,9 @@ next run's `cdc.max_position()` is not NULL where §0 expects it. Disable in tea
 ---
 
 ## 12. Slices, if this is built
+
+> **⚠ SUPERSEDED 2026-08-24 by §15.12**, which reorders 5–8 (the snapshot leg has to precede the
+> schema-drift resync that now depends on it) and adds the hidden-instance-name and alignment slices.
 
 | slice | contents | why this order |
 |---|---|---|
@@ -1446,6 +1517,10 @@ only visible where it does not — and the population for whom it does not exist
   applies the capture instance's `@role_name` permission filtering, which is security logic not worth
   reimplementing; a table VARIABLE rather than `#temp` because it is batch-scoped and so cannot be left
   behind on a pooled connection. ⚠ A future engine adding a column to that proc breaks this loudly.
+  - **⚠ IT SHIPPED A WRONG ANSWER, found 2026-08-24 — see §15.14.** The ALL-TABLES form of that proc
+    LEAKS the previous row's `index_column_list` onto a row whose `index_name` is NULL; called for that
+    one table it returns NULL correctly. So `cdc.tables()` reports an index column list for a capture
+    instance that has no index. One-line fix, plus the assertion §3 does not currently carry.
 - **Results are read as all-`varchar` and re-typed in C#** (`ReadMetadataRows`, this catalog's own metadata
   idiom). It costs a hex parse for the LSNs and buys an output schema that cannot drift from whatever the
   type mapper does with `binary(10)` / `bit` / `datetime` — and since the schema is resolved at BIND, one
@@ -1617,3 +1692,385 @@ mentioned — in the T-SQL, in the error text, in every comment — so the invar
 code means SQL Server's procedure, never a fabricator function.** The reasoning lives on
 `CdcCaptureNowFunction`, and the suite pins the name (`verify_mssql_cdc` §14's `function_name IN (...)`),
 because a rename with no gate is a rename that can quietly come undone.
+
+---
+
+## 15. THE 2026-08-24 REDESIGN — user-directed, and it SUPERSEDES §4's recommendation and most of §7
+
+**Nothing is built. This is the design slice 3 should be built from**, and where it disagrees with §4, §7,
+§11 or §12 it wins. Those sections are left intact because the reasoning that produced them is still worth
+reading, and because two of the things they got wrong were findable only by measuring.
+
+The user's framing, which is the requirement the rest of this section serves: *"at the start of the cdc
+design i mentioned i want an easy to use cdc"*. Every decision below trades a knob for a measurement.
+
+**⚠⚠ THREE CORRECTIONS UP FRONT, because each reverses something this document asserted:**
+
+1. **§4's Option A is DEAD.** The reader is marshaled C# (§4's Option B), not a SQL rewrite — §15.1.
+2. **The change table is not the interface; the TVF is** — and SQL Server says so in metadata — §15.2.
+3. **⚠⚠ "The change table's schema is frozen at capture-instance creation" is FALSE for a TYPE change**
+   (§15.6). It was asserted as a reassurance during this very redesign, and the measurement inverts it: an
+   `ALTER COLUMN <type>` IS propagated, asynchronously, by the capture job.
+
+### 15.1 The reader is marshaled C#, and the DuckDB catalog is not in its path
+
+**User-directed: *"don't rely on the duckdb catalog to access the sql server cdc functions"*.** Right, for a
+reason §4 only half-recorded: routing the reader through DISCOVERED objects makes it fail when an ATTACH
+`table_filter`/`schema_filter` hides them, and makes every `cdc.enable` require a catalog rebuild before the
+reader can see what it just created — which is the whole reason ABI v81 exists.
+
+**⚠ A THIRD OPTION EXISTED THAT §4 NEVER ENUMERATED, AND IT ALMOST WON.** The generated TVFs are DISCOVERED
+catalog table functions — §3.5's own `0 → 2` measurement is exactly that fact, sitting here unread. So
+`bind_replace` could emit `FROM db.cdc.fn_cdc_get_all_changes_x(...)` and keep every advantage §4 attributes
+to Option A. MEASURED against the rig, all four:
+
+- binds and returns the right rows with **BLOB bounds**;
+- **projection pushes down** — `SELECT [__$operation], [id], [customer], [amount] FROM [cdc].[fn_...](@a0, @a1, @a2)`;
+- **filters push down on top of it** — `... (@a0,@a1,@a2) WHERE ([__$operation] = @p0 AND [id] > @p1)`, five params;
+- **op 3 is absent** from `'all'`, so `images := 'after'` costs nothing.
+
+**It dies on none of those grounds: the §5 snapshot protocol cannot be expressed in generated SQL.** TABLOCKX
+on connection A while connection B pins a SNAPSHOT view, then A releases, is two connections at different
+isolation levels with a lock spanning a specific window. One connection cannot do it — locks are held to end
+of transaction, so a single connection holds the TABLOCKX for the WHOLE snapshot read, the opposite of
+§5.2's entire point. ⇒ **`ICatalogTableFunction` with C#-owned connections.**
+
+**What that costs, stated rather than buried:** projection and filter pushdown into the change read. It is
+acceptable *here* because the window IS the filter and the TVF is already bounded by its arguments; a user's
+extra `WHERE customer = 'acme'` is a secondary filter over an already-bounded window. What it buys: the
+two-connection protocol, read-time error translation, and §6's k-way merge if that is ever wanted.
+
+⚠ `fabricator_query` / `fabricator_exec` keep the setup functions and any single-statement metadata lookup —
+they are the right tool there and are already used that way. They are NOT the reader.
+
+### 15.2 The TVF, never the change table — and the metadata says so
+
+§4's Option A sketch read `cdc.<instance>_CT` directly, and §2.1 recorded the consequence as an accepted
+trade-off. Two measurements say otherwise:
+
+- **`is_ms_shipped` splits the schema.** MEASURED: the seven metadata tables, the four placeholder functions
+  AND **the change table itself** are `is_ms_shipped = 1`; the generated per-instance TVFs are the ONLY
+  objects in the `cdc` schema with `is_ms_shipped = 0`. That is the product stating, in metadata, which of
+  the two it considers yours.
+- **The TVF validates and the table does not.** A below-floor `from_lsn` through the TVF raises 313; the same
+  bounds read straight from the change table return whatever survived, silently.
+
+**Corollary: `is_ms_shipped = 0` is the cheapest enumeration of the generated functions**, and it cannot
+catch the placeholders:
+
+```sql
+SELECT name FROM sys.objects
+WHERE schema_id = SCHEMA_ID('cdc') AND type = 'IF' AND is_ms_shipped = 0;
+```
+
+**⚠ The TVF body also PROVES three things this document had inferred.** MEASURED via `OBJECT_DEFINITION`:
+
+```sql
+from [cdc].[dbo_o_CT] t with (nolock)
+where (lower(rtrim(ltrim(@row_filter_option))) = 'all')
+  and ([sys].[fn_cdc_check_parameters](N'dbo_o', @from_lsn, @to_lsn, ..., 0) = 1)
+  and (t.__$operation = 1 or t.__$operation = 2 or t.__$operation = 4)
+  and (t.__$start_lsn <= @to_lsn) and (t.__$start_lsn >= @from_lsn)
+```
+
+1. It is an **inline** TVF, which is why predicates pushed on top of it fold in.
+2. Its window predicate is `__$start_lsn` BETWEEN the two arguments — **no seqval or operation
+   granularity** — which is what forces the exclusive cursor to be applied locally (§2.4's 21-byte position).
+3. `__$command_id` and `__$end_lsn` are not in the select list: §11 item 5 proven from the definition rather
+   than from a `describe`.
+
+**⚠ NOLOCK is in the body, and it is benign for one specific reason.** The table hint overrides the
+transaction's isolation level, so a SNAPSHOT pin does nothing for the changes leg. It does not need to: the
+upper bound is `fn_cdc_get_max_lsn()`, which the capture job advances only after committing its batch, so
+everything at or below the watermark is committed. **The window is the guarantee, not the isolation.**
+
+**⚠ And the change table's own clustered index is `(__$start_lsn, __$command_id, __$seqval, __$operation)`** —
+MEASURED, UNIQUE, on every change table. So §6's direct-read ordering tuple is the PHYSICAL order, and the
+TVF's range predicate is a clustered index SEEK. Nothing else in this document had established that.
+
+### 15.3 ⚠⚠ The 313 message names a PLACEHOLDER OBJECT, and the " ... " is LITERAL
+
+§2.1 renders the error as `cdc.fn_cdc_get_all_changes_ ... .` and every reader of this document — including
+its author — took the ellipsis for an abbreviation of the instance name. **It is the object's real name.**
+MEASURED: every CDC-enabled database contains four placeholder functions; `LEN` plus UTF-16 hex confirm two
+of them are `fn_cdc_get_all_changes_...` (26 chars) and `fn_cdc_get_all_changes_ ... ` (27, with the spaces).
+`sys.fn_cdc_check_parameters` says why in its own comments:
+
+```sql
+-- Force error 229 execute permission denied on all changes dummy
+if exists(select * from cdc.[fn_cdc_get_all_changes_...](0X00, 0X01, 'all')) return 0
+...
+-- Force error 313 -- Insufficient number of arguments
+select @val = sys.fn_cdc_all_changes_range_error()
+```
+
+⇒ **the message is IDENTICAL for every capture instance and every cause** — below floor, above max, NULL
+bound, *and a misspelled `@row_filter_option`*. It cannot be parsed or attributed. That raises §2.1's
+pre-check above the value §2.1 itself claimed: it is not a nicety, it is the only channel by which a user
+can ever learn what went wrong.
+
+**⚠ SQL Server's own boolean validator cannot be borrowed.** MEASURED: `sys.fn_cdc_is_range_valid` and
+`sys.fn_cdc_has_select_access` are internal — `Msg 4121`, and they do not appear in `sys.all_objects`.
+`sys.fn_cdc_check_parameters` IS callable and returns 1 for a valid window, but validates an invalid one by
+THROWING that same 313. So the pre-check stays hand-rolled against `fn_cdc_get_min_lsn` / `fn_cdc_get_max_lsn`.
+
+### 15.4 The capture instance name is GENERATED and HIDDEN — and it removes a defect
+
+**User-directed**, and the measurements turn it from an ergonomic preference into a fix.
+
+- **The limit is exactly 100 characters**, enforced by `sp_cdc_verify_capture_instance`: `Msg 22927 …
+  exceeds the length limit of 100 characters`. 100 is accepted and yields a TVF name of **123**
+  (`fn_cdc_get_all_changes_` is 23, `sysname` is 128) — so SQL Server already sized its own limit against
+  the prefix, with five to spare. The arithmetic worry is real and already handled upstream of us.
+- **⚠⚠ THE DEFECT: THE DEFAULT NAME IS REFUSED FOR A LONG TABLE.** With no `@capture_instance`,
+  `sp_cdc_enable_table` builds `<schema>_<table>`; MEASURED, a 100-character table in `dbo` produces
+  `dbo_tttt…` = 104 and the SAME `Msg 22927`. So today's `cdc.enable('dbo.<long name>')` fails with an error
+  about a name the user never chose, and the only escape is the very knob we want to hide.
+
+⇒ **generate `fab_<16 hex of a hash of schema.table>`** (20 chars) plus a one-character discriminator for the
+second instance (§2.2 caps it at two). Deterministic base ⇒ re-enabling the same table computes the same
+name, so "is this already ours?" is a lookup rather than a scan.
+
+**⚠ A derived name is guaranteed to go stale; an opaque one cannot.** MEASURED (§15.6): a table rename is
+ALLOWED and CDC follows it, so `dbo_o` — SQL Server's own default — permanently misnames a table now called
+`orders2`. `fab_<hash>` never claimed to mean anything.
+
+⚠ The instance name stays user-VISIBLE in `cdc.tables()`. That is fine and already anticipated: slice 1's
+`min_position(...)` accepts EITHER a capture-instance name or `schema.table` and refuses ambiguity, so a
+user with opaque names passes the table name, which already works.
+
+### 15.5 An extended property marks the instance as OURS — but it is not the resolution
+
+**User-directed: set an extended property on the TVF naming the source table, and have `cdc.changes`
+enumerate TVFs and match on it.** MEASURED as working, on both carriers:
+
+```sql
+EXEC sys.sp_addextendedproperty @name=N'fabricator_source', @value=N'dbo.ep',
+     @level0type=N'SCHEMA',@level0name=N'cdc',@level1type=N'FUNCTION',@level1name=N'fn_cdc_get_all_changes_fab_ep';
+-- and the enumeration returns exactly:  cdc.fn_cdc_get_all_changes_fab_ep | dbo.ep
+```
+
+An EP can also be set on the change table (`@level1type = 'TABLE'`), and both are dropped with their object.
+
+**⚠ THE CORRECTION: the EP must be the OWNERSHIP MARKER, not the mapping.** MEASURED (§15.6): after
+`sp_rename 'dbo.o', 'orders2'`, `cdc.change_tables.source_object_id` resolves to **`orders2`** while the EP
+text still says `dbo.o`. So:
+
+| carrier | job |
+|---|---|
+| **EP presence** | "this instance is ours" — which no built-in metadata can express, and which is exactly what is needed once the names are opaque (§15.4) |
+| **EP value** | provenance: the name the user typed, for diagnostics and `cdc.tables()` |
+| **`source_object_id`** | **the resolution** — it follows a rename, so it is what answers "which instance serves `dbo.orders2`?" |
+
+⚠ `sp_cdc_enable_table` and `sp_addextendedproperty` are two statements. If the EP write fails we own an
+UNMARKED instance. Run both in one transaction; the fallback (treat unmarked as ours) silently adopts a
+DBA's instance and must not be the design.
+
+### 15.6 ⚠⚠ THE SCHEMA CORRECTION — the change table is NOT frozen, and rename cannot happen
+
+The DDL matrix, every row MEASURED:
+
+| source DDL | change table | detector |
+|---|---|---|
+| `ADD COLUMN` | **not propagated** — never captured by this instance | `cdc.ddl_history` |
+| `DROP COLUMN` | **not propagated** — the column stays, new rows read NULL | `cdc.ddl_history` |
+| **`ALTER COLUMN <type>`** | **PROPAGATED, ASYNCHRONOUSLY, by the capture job** | `ddl_history.required_column_update = 1` |
+| `sp_rename` a captured COLUMN | **REFUSED by SQL Server** | n/a — it cannot happen |
+| `sp_rename` the TABLE | allowed; CDC follows it via `source_object_id` | — |
+
+**The type case, in full, because it reverses the reassurance:**
+
+```
+ALTER TABLE dbo.o ALTER COLUMN customer NVARCHAR(50) -> NVARCHAR(200)
+ALTER TABLE dbo.o ALTER COLUMN amt DECIMAL(9,2)      -> DECIMAL(18,4)
+
+cdc.fab_o_CT immediately after :  customer nvarchar(100 bytes)   amt decimal(9,2)
+cdc.fab_o_CT after the job ran :  customer nvarchar(400 bytes)   amt decimal(18,4)
+```
+
+`cdc.ddl_history` flags both `required_column_update = 1`, an insert of a 200-character value and
+`123456789.1234` landed intact, and `sys.dm_cdc_errors` stayed empty. ⇒ **the CT schema CAN change under a
+running read**, and the earlier "frozen at creation" claim held only because the first `sys.columns` read
+happened before the capture job processed the DDL.
+
+**⚠ WHERE THAT BITES IS NARROW AND WORTH KNOWING PRECISELY.** Our read mapping sends `nvarchar(n)` to a
+length-agnostic Arrow `string`, so a widened string is harmless. `Decimal128Type` carries precision and
+scale. **So the hazard is numeric precision/scale (and temporal scale), not strings**: declaring
+`decimal(9,2)` at bind and receiving `123456789.1234` at execute is a conversion failure or a silent
+corruption. Rule: declare the WIDER of (source, captured) per column, and if the CT type has moved by
+execute, **fail loudly rather than convert**.
+
+**⚠ THE RENAME FINDINGS, because they close the nastiest case and validate §15.5:**
+
+```
+EXEC sp_rename 'dbo.o.customer', 'client', 'COLUMN';
+Msg 4928: Cannot alter column 'customer' because it is 'REPLICATED'.
+```
+
+CDC marks captured columns with the replication flag, so data captured under a name we no longer declare is
+**impossible**. ⚠ Note the asymmetry: `DROP COLUMN` on a captured column IS allowed (the CT keeps it, new
+rows read NULL) while `sp_rename` is refused.
+
+A TABLE rename is allowed, capture continues across it (a post-rename insert was captured), the TVF keeps
+working, and `source_object_id` resolves to the new name — which is the measurement behind §15.5's split.
+
+### 15.7 The output schema is SOURCE-DERIVED, so the enable can DEFER to execute
+
+**User-directed, and it removes the one objection that had looked unavoidable.** Earlier analysis concluded
+that `enable := true` must run at BIND because the output schema comes from the change table, which does not
+exist until enable — and therefore that `EXPLAIN`, `DESCRIBE` and `CREATE VIEW` would perform DDL.
+
+Deriving the declared schema from the SOURCE table plus the four known TVF metadata columns
+(`__$start_lsn`, `__$seqval`, `__$operation`, `__$update_mask`) dissolves that: bind needs no change table,
+so the enable moves to `Execute()` and bind is side-effect-free again.
+
+**It is correct by construction for a fresh enable.** MEASURED: a default `sp_cdc_enable_table` captures
+every source column (`id,customer,amt`), so at the instant we enable, captured == source.
+
+⚠ **Two things move to Execute with it, and both are real:**
+- **Window resolution.** No instance ⇒ no floor, and `max_lsn` may be NULL. Incidentally this FIXES §3.4's
+  determinism complaint about defaulting `ending_position` at bind.
+- **The §2.1 retention pre-check**, whose error now arrives mid-stream. Under a C#-owned reader we translate
+  it either way, so what is lost is earliness — a good trade against enabling CDC from an `EXPLAIN`.
+
+⚠ **When the instance DOES exist at bind, prefer the CAPTURED set** (authoritative for what the TVF returns)
+unioned with source-only columns. Source-derived is the right answer specifically for the not-yet-enabled
+case.
+
+⚠ The first call after an auto-enable **always returns zero rows** — the instance's `start_lsn` is now and
+`max_lsn` is NULL until the capture job scans. Document it as priming the pump; `include := 'snapshot+changes'`
+is the answer for "I want data now", and it composes with auto-enable exactly.
+
+### 15.8 Alignment by NAME, and who does the widening
+
+The declared schema and the TVF's actual columns are aligned BY NAME, missing columns NULL-filled. MEASURED
+in DuckDB, since the user's point was that `UNION ALL BY NAME` would give the widening for free:
+
+```
+DECIMAL(9,2) u DECIMAL(18,4)  ->  DECIMAL(18,4)      -- widened; 1.2300 and 123456789.1234 both intact
+column in one branch only     ->  present, NULL-filled, keeps its own type
+INTEGER u VARCHAR             ->  VARCHAR            -- coerced SILENTLY, not refused
+```
+
+**True — but the free widening is only available if the alignment happens in DuckDB SQL**, and §15.1 puts the
+reader in C#. Two shapes:
+
+| | |
+|---|---|
+| **(a) two mechanisms** | SQL form for changes-only, C# when a snapshot leg is requested |
+| **(b) one mechanism** | C# everywhere, widen ourselves — **RECOMMENDED** |
+
+(b) because the set of types where "wider" is meaningful in our mapping is small: DECIMAL (max precision,
+max scale) and integer promotion; strings and binaries are already length-agnostic in Arrow. A
+`WidenArrowType(a, b)` helper buys one reader and one schema-resolution path, where (a) buys two that must
+be kept in agreement — the divergence shape this codebase has been bitten by before.
+
+⚠ **The third line is a caution, not a feature**: on a genuine type conflict DuckDB coerces to VARCHAR rather
+than erroring, so "the union failed" can never be used as a drift detector.
+
+**⚠ THE ALIGNMENT MACHINERY IS ALSO §7's TWO-INSTANCE MERGE.** Old instance for `[from, B)`, new for
+`[B, to]`, aligned by name into one declared schema. Building it for schema drift makes slice 6 nearly free.
+
+**⚠ BUT IT NEEDS `_capture_instance` OR IT REINTRODUCES §7's OBJECTION.** A NULL for a column that did not
+exist yet is indistinguishable from a genuine NULL. Emitting the instance per row makes it decidable — the
+consumer can tell "this row predates the column" from "this row had no value" — and that is what makes
+projecting to the union acceptable where §7 said refuse.
+
+### 15.9 `on_schema_change` — resync by default, fill as an option, NULL as the floor
+
+**User decision, and the ordering is right: NULL is also a claim we cannot support.** It asserts the column
+had no value, when the truth is that we never captured it.
+
+| mode | behaviour | verdict |
+|---|---|---|
+| `resync` | new capture instance + a fresh snapshot leg (§5), then changes from its `start_lsn` | **DEFAULT when `enable := true`.** Coherent: the snapshot is a consistent point in time and the handoff is MEASURED exactly-once |
+| `fill` | added columns read from the SOURCE by key, for rows after the adding DDL | opt-in only, and name the semantics: values are as of NOW, not as of the change |
+| `null` | NULL + `_capture_instance` | the floor — honest and decidable, never silent |
+| `error` | refuse, naming the boundary | **DEFAULT when the instance is NOT ours** |
+
+**⚠ `resync` may only be the default when WE own the capture instance.** Creating an instance and taking a
+full-table snapshot on a DBA's configuration is a heavy, privileged act that must not happen implicitly —
+which gives §15.5's ownership marker a second job.
+
+**⚠ What `fill` costs, so the option is chosen with open eyes** (this is why it is not the default): it
+produces a TORN ROW — captured columns as of LSN L, the looked-up column as of now — and since the added
+column is not captured, **no later change event ever corrects it**. It also needs a key, so it is impossible
+for exactly the tables that most need help (no PK and no unique index is a legitimate configuration,
+MEASURED), and it adds a read of the LIVE source table to what was a capture-layer-only read.
+
+### 15.10 The lock is `TABLOCK, HOLDLOCK`, and only for the snapshot leg
+
+⚠ **The hint changed too — see §5.2a.** `TABLOCKX` is stronger than the job needs: MEASURED, a shared
+table lock held with `HOLDLOCK` blocks a writer (`Msg 1222`) while a READ COMMITTED reader passes and
+`sp_cdc_scan` still runs, so the protocol stops blocking readers it never needed to block. ⚠ And `TABLOCK`
+without `HOLDLOCK` is STATEMENT-scoped — measured gone by the next statement — so it cannot span steps 2–3.
+
+For `include := 'changes'` a lock buys **nothing**: the change table is append-only and the LSN window fully
+determines the result. Taking a table lock on every `cdc.changes()` would block writers on the source table
+for the duration of bind — including on an `EXPLAIN`. That is a regression, not a safety measure.
+
+It would not buy the schema guarantee either: TABLOCKX on `dbo.orders` does not protect the CDC metadata.
+
+⇒ default path: resolve window and schema, no lock, no pinned connection. `snapshot+changes`: the §5
+two-connection protocol, and only there.
+
+### 15.11 Third-party DDL inside a running window
+
+The user's question. What the reader can do about it, now that §15.6 has the matrix:
+
+- **Detect it at bind (or at window resolution).** `cdc.ddl_history` carries `ddl_lsn`, so "did a DDL land
+  inside my window?" is one predicate, and `ddl_command` gives the text to put in the message.
+  `required_column_update = 1` narrows it further to "a captured column's TYPE changed inside this window".
+- **Only ADD COLUMN needs a new instance.** Type changes pass through (§15.6); a DROP leaves the column
+  returning NULL and a source-derived declaration simply stops projecting it.
+  ⚠ One case that looks like an ADD and is not: **drop-then-re-add with a different type** — the CT still
+  holds the old column under the same name, so name-alignment collides two types and §15.8's measurement
+  says DuckDB would coerce both to VARCHAR rather than complain.
+- **⚠ At most TWO capture instances** (`Msg 22962`, MEASURED §2.2), so auto-re-enable is NOT repeatable: the
+  second drift must first `disable` the oldest, which **destroys its unread history**. Safe only once the
+  caller's cursor is past the boundary, which we cannot know ⇒ dropping the old instance must be opt-in.
+- **Two residual hazards, REASONED not measured**: an in-flight read holds Sch-S on the change table, so a
+  concurrent `sp_cdc_disable_table` should block rather than pull the object out from under us (§8.7 assumes
+  this); and the **cleanup job can purge below the floor mid-read**, which with NOLOCK would silently shorten
+  a window whose `from_lsn` sits near the retention edge. The pre-check narrows that to a race, not to zero.
+
+### 15.12 The revised slice table
+
+| slice | contents | why this order |
+|---|---|---|
+| **1** | ✅ BUILT — §13 | inspection first |
+| **2** | ✅ BUILT — §14 | setup from SQL |
+| **3** | **the reader**: `ICatalogTableFunction`, C#-owned connection, ONE capture instance, `images := 'after'`, explicit bounds, source-derived schema, the §2.1 pre-check, the 21-byte cursor | the smallest correct reader. §15.1/§15.2/§15.7 |
+| **4** | generated hidden instance name + the EP ownership marker + `enable := true` deferred to execute | makes the surface "easy to use"; independent of 5–7. §15.4/§15.5/§15.7 |
+| **5** | name-alignment with widening + `_capture_instance` | buys slice 7 nearly free. §15.8 |
+| **6** | DDL detection in-window; `on_schema_change := 'error'` | loud before it is clever. §15.11 |
+| **7** | the two-instance boundary: derive `B`, split the window, `UNION ALL` by name | needs 3 and 5 |
+| **8** | `include := 'snapshot'` / `'snapshot+changes'` (§5), then `on_schema_change := 'resync'` | the resync story needs the snapshot leg first |
+| **9** | `starting_timestamp` / `ending_timestamp`; `images := 'both'` + the mask placeholder | additive to the same reader |
+| — | ~~`on_schema_change := 'fill'`~~ | last, if ever — §15.9 records why |
+
+⚠ The old §12 ordering put the snapshot leg at 5 and the two-instance boundary at 6. The reordering follows
+from §15.9: `resync` is the preferred answer to schema drift, and it CANNOT be built before the snapshot leg.
+
+### 15.13 Still unmeasured
+
+- **How long the capture job takes to apply a `required_column_update`** — that is the width of the window
+  where declared and actual types disagree, and it decides whether "fail loudly at execute" is a rare event
+  or a routine annoyance. The single most useful number left.
+- Whether an in-flight TVF read really blocks `sp_cdc_disable_table` (§15.11).
+- The Azure SQL Database middle case (§11 item 7) — unchanged.
+
+### 15.14 ⚠ A SHIPPED DEFECT FOUND ON THE WAY: `cdc.tables()` reports a bogus `index_column_list`
+
+MEASURED through the exact table-variable path `SqlServerCdcCatalog` uses: the **all-tables** form of
+`sp_cdc_help_change_data_capture` leaks the PREVIOUS row's `index_column_list` onto a row that has no index.
+
+```
+dbo_o      | [id] | PK__o__3213E83FEE57FF32
+dbo_o_v2   | [id] | PK__o__3213E83FEE57FF32
+dbo_plain  | [id] | <NULL>          <-- no index, yet [id] is reported
+```
+
+Called for that one table the proc returns NULL correctly. Fix is one line — null `index_column_list` when
+`index_name IS NULL` — plus an assertion in `verify_mssql_cdc` §3, since nothing currently covers a capture
+instance with no index. Not a reader concern; it is in slice 1's shipped surface.
