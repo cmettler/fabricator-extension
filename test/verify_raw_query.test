@@ -140,7 +140,62 @@ SELECT * FROM fabricator_query('q', 'UPDATE dbo.rq_probe SET n = n');
 ----
 <REGEX>:.*(schema|column|field).*
 
+# ═══ §8  ⚠⚠ THE DEFERRAL MUST NOT LOSE THE TRANSACTION — the regression the describe fix shipped ══════
+# The §1 fix defers the execution from the execute_query crossing to the first row PULL, and the ambients
+# (AmbientTransaction / CurrentSession / AmbientOpener) are AsyncLocal PER CROSSING. The first version did not
+# carry them across, so catalog.ExecuteQuery saw txn 0, found no pinned connection, and ran the caller's SQL on
+# a POOLED one — i.e. OUTSIDE the user's transaction.
+#
+# ⚠ IT FAILS BY RETURNING THE WRONG ANSWER, NOT BY ERRORING. verify_session_tag caught it (its cross-call tag
+# read went NULL), but nothing in THIS suite did, and this suite is the one that owns the deferral. The
+# consequence is bigger than a tag: a fabricator_query inside a transaction silently reads COMMITTED state, so
+# read-your-writes is gone for every raw query.
+#
+# ⚠ @@TRANCOUNT is the instrument on purpose: it is LOCK-FREE. The obvious probe — read a row this transaction
+# has inserted — would BLOCK on the uncommitted row's lock when run on a pooled connection under READ
+# COMMITTED, so a regression would HANG the suite instead of failing it (limitation 1.15). A test that hangs on
+# regression is worse than no test.
+
+# ⚠ ITS OWN TABLE, CREATED THROUGH THE CATALOG — not `rq_probe`, and this is not tidiness. `rq_probe` is
+# created by `fabricator_exec`, i.e. by raw SQL the catalog never learns about (`mssql_exec_invalidate_cache`
+# is off by default), so it is MEASURED absent from `duckdb_tables()` 3/3 after its own CREATE. A
+# catalog-level `INSERT INTO q.dbo.rq_probe` therefore depends on the table having been DISCOVERED at ATTACH
+# — which is true only if a PREVIOUS run left it behind. Written that way the section ALTERNATED pass/fail
+# (fail, pass, fail, pass — a failing run never reaches the teardown, so the next run finds the leftover and
+# passes), which is the exact signature verify_read_isolation once had. A catalog CREATE registers its entry
+# directly and needs no discovery.
+statement ok
+CREATE OR REPLACE TABLE q.dbo.rq_pin (n INTEGER);
+
+statement ok
+BEGIN;
+
+# The write is what PINS the connection (BeginWrite) — without it there is no pinned connection to find and
+# both legs would legitimately read 0.
+statement ok
+INSERT INTO q.dbo.rq_pin VALUES (99);
+
+# MEASURED A/B, the deferral being the only variable: without the ambient capture this returns 0, with it 1.
+query I
+SELECT t FROM fabricator_query('q', 'SELECT @@TRANCOUNT AS t');
+----
+1
+
+statement ok
+ROLLBACK;
+
+# ⚠ THE CONTROL, and it is what stops the assertion above from passing for the wrong reason: in AUTOCOMMIT
+# there is no transaction to join, so 0 is correct. Without this row, "1" would be equally satisfied by a build
+# that had started reporting a constant, or one that wrapped every raw query in a transaction of its own.
+query I
+SELECT t FROM fabricator_query('q', 'SELECT @@TRANCOUNT AS t');
+----
+0
+
 # ═══ §7  Teardown ════════════════════════════════════════════════════════════════════════════════════
+
+statement ok
+DROP TABLE q.dbo.rq_pin;
 
 statement ok
 SELECT fabricator_exec('q', 'DROP TABLE dbo.rq_probe;');

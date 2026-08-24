@@ -751,6 +751,10 @@ put through `fabricator_exec` it runs once and tells you how many rows it touche
 ⚠ A broken query now fails while *binding*, with SQL Server's own message (`Invalid column name 'x'`) — one
 phase earlier than before.
 
+⚠ Inside an explicit `BEGIN … COMMIT`, `fabricator_query` **does** run on the transaction's connection once
+one exists, so it sees the transaction's own uncommitted writes. Note the asymmetry with `fabricator_exec`
+below, which joins only if a write has already pinned that connection.
+
 ### `fabricator_exec(context, sql) -> BIGINT`
 
 Execute arbitrary T-SQL (DDL/DML/EXEC); returns rows affected (0 for DDL / no-row statements).

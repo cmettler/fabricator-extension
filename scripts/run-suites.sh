@@ -577,9 +577,11 @@ case "$TIER" in
         # change table `cdc.enable` created moments earlier in the SAME session, which is impossible without
         # the deferred catalog rebuild the flag triggers. Two mutants (never report the DDL; move the DDL out
         # of Execute() into the iterator body, where the host has already read the flag) both die there.
-        # 2354 since 2026-08-24: verify_raw_query 27, gating the describe-then-execute fix. Mutation-tested —
+        # 2361 since 2026-08-24: verify_raw_query 34, gating the describe-then-execute fix. Mutation-tested —
         # restoring the eager stream dies at §1 with "Expected 1, Actual 2", i.e. the doubled INSERT itself.
-        : "${MIN_ASSERTIONS:=2354}"
+        # +7 later the same day for §8, which gates the AMBIENT CAPTURE the deferral needs: the pre-fix build
+        # reports @@TRANCOUNT = 0 inside a transaction (pooled connection) where the fixed one reports 1.
+        : "${MIN_ASSERTIONS:=2361}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

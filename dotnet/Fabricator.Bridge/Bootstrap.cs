@@ -234,8 +234,36 @@ public static unsafe class Bootstrap
             // ⚠ Scoped to THIS entry on purpose. The provider's own internal reads call catalog.ExecuteQuery
             // directly in C# and want rows immediately; wrapping those would add a describe round trip that
             // nothing consumes.
-            IArrowArrayStream stream =
-                new DescribedArrowStream(() => catalog.DescribeQuery(query), () => catalog.ExecuteQuery(query));
+            //
+            // ⚠⚠ CAPTURE THE AMBIENTS HERE AND RE-ESTABLISH THEM IN BOTH LAMBDAS — this is not defensive, it
+            // is what makes the deferral legal, and OMITTING IT WAS A REGRESSION THE SUITES CAUGHT.
+            // AmbientTransaction / CurrentSession / AmbientOpener are AsyncLocal PER CROSSING. Deferring the
+            // execution from this crossing to the first get_next moves it to a crossing where nothing has set
+            // them, so catalog.ExecuteQuery saw txn 0, found no pinned connection, and ran the caller's SQL on
+            // a POOLED one. MEASURED: verify_session_tag's "a different call in the same transaction sees the
+            // tag" assertion returned NULL — and the read-your-writes consequence is bigger than the tag,
+            // since a fabricator_query inside a transaction would silently read the COMMITTED state.
+            //
+            // ⚠ It fails by returning the WRONG ANSWER, not by erroring, and it is the standing rule this repo
+            // already paid for once (fabricator_install_plugin read a session-scoped opt-in inside an async
+            // iterator and non-deterministically saw session 0). The rule: A LAZY BODY MUST BE HANDED THE
+            // AMBIENTS ITS CROSSING CAPTURED — never read them where it runs.
+            long txnId = AmbientTransaction.Current;
+            long settingsSession = ProviderSettingsStore.CurrentSession;
+            nint opener = AmbientOpener.Current;
+
+            void Restore()
+            {
+                AmbientTransaction.Current = txnId;
+                ProviderSettingsStore.CurrentSession = settingsSession;
+                AmbientOpener.Current = opener;
+            }
+
+            // Both halves need them: the describe resolves its command timeout from the session settings, and
+            // the execution needs the transaction to find the pinned connection.
+            IArrowArrayStream stream = new DescribedArrowStream(
+                () => { Restore(); return catalog.DescribeQuery(query); },
+                () => { Restore(); return catalog.ExecuteQuery(query); });
             CArrowArrayStreamExporter.ExportArrayStream(stream, outStream);
             return FabricatorStatus.Ok;
         }
