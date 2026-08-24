@@ -103,8 +103,8 @@ See [SQL Server external tables on S3](#sql-server-external-tables-on-s3).
 | | — configurable isolation (consistent snapshot per call); per-row procs run in DuckDB's transaction | ✅ |
 | | **Custom C# aggregates** (UDAF) → `db.schema.agg(x)` in `GROUP BY` / parallel / `OVER(…)`; opt-in disk-spill (`SupportsSpill`) | ✅ |
 | **Change data capture** | `db.cdc.tables()` / `max_position()` / `min_position()` / `health()` — inspect SQL Server CDC | ✅ SQL Server only (not Fabric / Synapse) |
-| | `db.cdc.enable_database()` / `enable()` / `disable()` / `capture_now()` — set capture up from SQL; the catalog refreshes itself | ✅ |
-| | `db.cdc.changes(...)` — a resumable change-stream reader with a 21-byte cursor and a retention pre-check | ✅ |
+| | `db.cdc.enable_database()` / `enable()` / `disable()` / `capture_now()` — set capture up from SQL, with a generated capture-instance name; the catalog refreshes itself | ✅ |
+| | `db.cdc.changes(...)` — a resumable change-stream reader with a 21-byte cursor, a retention pre-check and `enable := true` | ✅ |
 | | An initial-snapshot leg (`include := 'snapshot+changes'`), before-images, timestamp bounds | ❌ designed, not built (`docs/mssql-cdc.md` §15.12) |
 | **Monitoring** | `db.dbo.fabricator_session_tag(k, v)` — tag a transaction's connection so Fabric query insights can attribute its cost | ✅ (see dbt caveat) |
 | | `application_name` on the secret → `program_name` on every statement (run-level attribution) | ✅ |
@@ -847,14 +847,14 @@ with no message queue anywhere in it. They live in the catalog's `cdc` schema, s
 
 | function | returns |
 |---|---|
-| `db.cdc.tables()` | one row per capture **instance** — `source_schema`, `source_table`, `capture_instance`, `start_lsn`, `end_lsn`, `supports_net_changes`, `has_drop_pending`, `role_name`, `index_name`, `filegroup_name`, `create_date`, `index_column_list`, `captured_column_list` |
+| `db.cdc.tables()` | one row per capture **instance** — `source_schema`, `source_table`, `capture_instance`, `start_lsn`, `end_lsn`, `supports_net_changes`, `has_drop_pending`, `role_name`, `index_name`, `filegroup_name`, `create_date`, `index_column_list`, `captured_column_list`, `fabricator_source` (non-NULL ⇒ this extension created the instance) |
 | `db.cdc.max_position()` | the current log position (`sys.fn_cdc_get_max_lsn`) as a `BLOB`, or `NULL` |
 | `db.cdc.min_position('<capture instance>' \| '<schema>.<table>')` | the **retention floor** (`sys.fn_cdc_get_min_lsn`) as a `BLOB`, or `NULL` |
 | `db.cdc.enable_database()` | `sys.sp_cdc_enable_db` — idempotent |
-| `db.cdc.enable('<schema>.<table>' [, capture_instance :=] [, columns :=] [, role :=] [, index :=] [, filegroup :=] [, net :=])` | `sys.sp_cdc_enable_table` — idempotent per capture instance |
+| `db.cdc.enable('<schema>.<table>' [, capture_instance :=] [, columns :=] [, role :=] [, index :=] [, filegroup :=] [, net :=])` | `sys.sp_cdc_enable_table`. With no `capture_instance` it generates one (`fab_…`) and is idempotent **per table**; with one, per instance |
 | `db.cdc.disable('<schema>.<table>' [, capture_instance :=])` | `sys.sp_cdc_disable_table`; with no instance named, all of that table's |
 | `db.cdc.capture_now()` | `sys.sp_cdc_scan` — force the capture log scan now (see the ⚠ below) |
-| `db.cdc.changes('<schema>.<table>' \| '<capture instance>' [, starting_position :=] [, ending_position :=] [, capture_instance :=] [, images :=] [, commit_timestamp :=])` | the change stream — see below |
+| `db.cdc.changes('<schema>.<table>' \| '<capture instance>' [, starting_position :=] [, ending_position :=] [, capture_instance :=] [, images :=] [, commit_timestamp :=] [, enable :=])` | the change stream — see below |
 | `db.cdc.health()` | 12 `(property, value)` rows, in this order: `supports_cdc`, `database`, `cdc_enabled`, `captured_instances`, `capture_job`, `capture_polling_interval_seconds`, `cleanup_job`, `cleanup_retention_minutes`, `max_lsn`, `max_lsn_time`, `max_lsn_age_seconds`, `agent_status` |
 
 The four setup functions each return one report row — `target`, `changed`, `detail`. **`changed` is separate
@@ -866,11 +866,12 @@ script is safe to re-run.
 SELECT * FROM db.cdc.enable_database();
 SELECT * FROM db.cdc.enable('dbo.orders');
 
--- The objects that created are usable IMMEDIATELY, in the same session — no re-ATTACH, no refresh.
-SELECT * FROM db.cdc.dbo_orders_CT;
+-- …then read the changes. The objects the enable created are usable IMMEDIATELY, in the same session —
+-- no re-ATTACH, no refresh.
+SELECT * FROM db.cdc.changes('dbo.orders');
 
 -- What is captured, and where the log currently stands?
-SELECT source_table, capture_instance, captured_column_list FROM db.cdc.tables();
+SELECT source_table, capture_instance, fabricator_source FROM db.cdc.tables();
 SELECT db.cdc.max_position() AS pos, db.cdc.min_position('dbo.orders') AS retention_floor;
 
 -- Why is nothing arriving?
@@ -902,6 +903,18 @@ SELECT * FROM db.cdc.health();
   with SQL Server Agent stopped, so a table can look captured and never produce a row. That is what
   `health()`'s `agent_status` is for — and it reports `unknown` rather than guessing when the connection
   lacks `VIEW SERVER STATE`.
+- **Capture-instance names are generated and you never need to type one.** `cdc.enable('dbo.orders')` creates
+  `fab_<16 hex>` — 20 characters whatever your table is called, which also fixes a real failure: SQL Server's
+  own default is `<schema>_<table>`, the limit is 100 characters, and a long table name therefore failed with
+  `Msg 22927` about a name you never chose. Pass `capture_instance :=` if you want to name one yourself.
+  `cdc.tables()` lists them, and everything else takes the TABLE name.
+- **`cdc.enable` on an already-captured table is a no-op, and that is deliberate.** It reports
+  `changed = false` and names the existing instance rather than adding a second — a table with two capture
+  instances makes `cdc.changes` ambiguous, and it refuses rather than picking one. An explicit
+  `capture_instance :=` is how you deliberately create the second (that is how a schema change is absorbed).
+- **`fabricator_source` in `cdc.tables()` tells you which instances this extension created.** It is an
+  extended property written atomically with the enable; `NULL` means someone else made that instance, and
+  nothing here will manage it for you.
 - **`min_position` takes the capture instance OR the table.** A table may have **two** capture instances (how
   a schema change is absorbed), and their retention floors can differ — so a table name that matches two is
   refused rather than resolved by picking one. `cdc.tables()` lists the instance names.
@@ -919,7 +932,8 @@ FROM db.cdc.changes('dbo.orders'                    -- a <schema>.<table> or a c
       [, ending_position   := <BLOB>]               -- INCLUSIVE upper bound; default db.cdc.max_position()
       [, capture_instance  := '<name>']             -- required when a table has two
       [, images            := 'after']              -- the only value this release accepts
-      [, commit_timestamp  := false])               -- opt-in, see below
+      [, commit_timestamp  := false]                -- opt-in, see below
+      [, enable            := false])               -- capture the table on first read
 ```
 
 | column | type | |
@@ -977,9 +991,15 @@ UPDATE my_cursors SET cur = getvariable('cdc_end') WHERE tbl = 'dbo.orders';
   window, so reading either silently double-counts or drops; name one with `capture_instance :=`.
 - **Ordering is yours.** Rows arrive in no promised order; `ORDER BY _position` is correct replay order, and
   `_position` values compare as unsigned bytes so `min()`/`max()` work.
+- **`enable := true` captures the table on first read**, so a pipeline needs no separate setup step. The DDL
+  happens when the query RUNS, never when it is planned — `EXPLAIN`, `DESCRIBE` and `CREATE VIEW` over it
+  capture nothing, because the output schema is derived from the source table.
+  - ⚠ **It does not backfill.** Capture starts at the moment of the enable, so rows written before it are
+    invisible and the very first read returns **zero rows** — not an error, because that is a fact rather
+    than a guess. An initial-snapshot leg is not built yet.
+  - ⚠ It is idempotent: on an already-captured table it is a no-op and the changes simply arrive.
 - **Not built yet** (`docs/mssql-cdc.md` §15.12): the initial-snapshot leg (`include := 'snapshot+changes'`),
-  `images := 'both'`, timestamp bounds, hidden capture-instance names, and reading across a two-instance
-  schema-change boundary.
+  `images := 'both'`, timestamp bounds, and reading across a two-instance schema-change boundary.
 
 ### `db.dbo.fabricator_session_tag(key, value) -> TABLE` (SQL Server / Fabric)
 

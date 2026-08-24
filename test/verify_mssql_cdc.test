@@ -4,7 +4,8 @@
 #
 # Slices 1-3 of docs/mssql-cdc.md: the ServerProfile.SupportsCdc gate, the appended `cdc` schema, the four
 # read-only functions (§1-§8), the four setup functions and the ABI v81 flag they exercise (§10-§14), and
-# THE READER, cdc.changes (§15-§21).
+# THE READER, cdc.changes (§15-§21), and slice 4 - the generated capture-instance name, the ownership
+# marker and enable := true (§22-§25).
 #
 # ⚠ SERVICE TIER — it needs a real SQL Server, and unlike the rest of that tier it also needs SQL SERVER
 #   AGENT (docker-compose sets MSSQL_AGENT_ENABLED=true). §8's agent assertion is the ONLY thing in either
@@ -79,6 +80,9 @@ SELECT fabricator_exec('${MSSQL_TESTDB_DSN}', 'IF OBJECT_ID(''dbo.cdc_setup'') I
 
 statement ok
 SELECT fabricator_exec('${MSSQL_TESTDB_DSN}', 'IF OBJECT_ID(''dbo.cdc_zz_noidx'') IS NOT NULL DROP TABLE dbo.cdc_zz_noidx;');
+
+statement ok
+SELECT fabricator_exec('${MSSQL_TESTDB_DSN}', 'IF OBJECT_ID(''dbo.cdc_gen'') IS NOT NULL DROP TABLE dbo.cdc_gen; IF OBJECT_ID(''dbo.cdc_own'') IS NOT NULL DROP TABLE dbo.cdc_own; IF OBJECT_ID(''dbo.cdc_auto'') IS NOT NULL DROP TABLE dbo.cdc_auto; IF OBJECT_ID(''dbo.gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg'') IS NOT NULL DROP TABLE dbo.gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg;');
 
 statement ok
 ATTACH '${MSSQL_TESTDB_DSN}' AS c0 (TYPE fabricator);
@@ -397,8 +401,13 @@ SELECT fabricator_exec('c1', 'IF OBJECT_ID(''dbo.cdc_setup'') IS NOT NULL DROP T
 statement ok
 SELECT fabricator_exec('c1', 'CREATE TABLE dbo.cdc_setup(id INT NOT NULL PRIMARY KEY, v NVARCHAR(20) NULL);');
 
+# ⚠ AN EXPLICIT capture_instance HERE, deliberately: §11 and §17 name the objects this call creates
+# (cdc.dbo_cdc_setup_CT, fn_cdc_get_all_changes_dbo_cdc_setup, min_position('dbo_cdc_setup')), and a DEFAULT
+# enable now generates an OPAQUE name (fab_<16 hex>) that no assertion can spell. The generated default has
+# its own coverage in §22-§25; what §10-§13 are about is the ABI v81 catalog rebuild, which naming does not
+# touch.
 query TT
-SELECT target, changed FROM c1.cdc.enable('dbo.cdc_setup');
+SELECT target, changed FROM c1.cdc.enable('dbo.cdc_setup', capture_instance := 'dbo_cdc_setup');
 ----
 dbo.cdc_setup (dbo_cdc_setup)	true
 
@@ -423,12 +432,15 @@ SELECT count(*) FROM duckdb_functions() WHERE database_name = 'c1' AND schema_na
 ----
 1
 
-# ═══ §12  enable is idempotent PER CAPTURE INSTANCE, not per table ════════════════════════════════════
-# ⚠ Keying the guard on the table would wrongly refuse a table's legitimate SECOND capture instance (§2.2),
-# which is how a schema change is absorbed. So the same call twice reports changed = false…
+# ═══ §12  A NAMED enable is idempotent per capture INSTANCE ═══════════════════════════════════════════
+# ⚠⚠ THAT IS THE *NAMED* HALF ONLY, and the distinction is a correctness one (§23 has the other half). With
+# an explicit capture_instance the guard keys on the INSTANCE, because refusing a table's legitimate SECOND
+# instance would break the way a schema change is absorbed (§2.2). With NO capture_instance it keys on the
+# TABLE — a default enable that silently added a second instance would make cdc.changes ambiguous for that
+# table, which the reader refuses rather than resolving.
 
 query TT
-SELECT target, changed FROM c1.cdc.enable('dbo.cdc_setup');
+SELECT target, changed FROM c1.cdc.enable('dbo.cdc_setup', capture_instance := 'dbo_cdc_setup');
 ----
 dbo.cdc_setup (dbo_cdc_setup)	false
 
@@ -772,6 +784,215 @@ SELECT source_table, index_name IS NOT NULL, index_column_list FROM c1.cdc.table
 cdc_setup	true	[id]
 cdc_zz_noidx	false	NULL
 
+# ═══ §22  The capture-instance name is GENERATED and HIDDEN (slice 4) ════════════════════════════════
+# docs §15.4. A default cdc.enable no longer takes SQL Server's <schema>_<table>; it takes fab_<16 hex of a
+# hash of schema.table> — 20 characters, whatever the table is called.
+
+statement ok
+SELECT fabricator_exec('c1', 'IF OBJECT_ID(''dbo.cdc_gen'') IS NOT NULL DROP TABLE dbo.cdc_gen; CREATE TABLE dbo.cdc_gen(id INT NOT NULL PRIMARY KEY, v NVARCHAR(20) NULL);');
+
+query TT
+SELECT changed, target LIKE 'dbo.cdc_gen (fab_%)' FROM c1.cdc.enable('dbo.cdc_gen');
+----
+true	true
+
+query IT
+SELECT length(capture_instance), regexp_matches(capture_instance, '^fab_[0-9a-f]{16}$') FROM c1.cdc.tables() WHERE source_table = 'cdc_gen';
+----
+20	true
+
+# The name is DETERMINISTIC — disable and re-enable the same table and it comes back identical.
+# ⚠ WHAT THIS DOES *NOT* COVER, said rather than implied: the reason the generator is SHA-256 rather than
+# string.GetHashCode() is that .NET randomizes string hash codes PER PROCESS. Within one process GetHashCode
+# is stable, so this assertion would pass on that build too; catching it needs two processes, which
+# sqllogictest does not give. What it does catch is a generator that is not a function of the name at all —
+# a GUID, a timestamp, a counter.
+statement ok
+SET VARIABLE cdc_gen_name = (SELECT capture_instance FROM c1.cdc.tables() WHERE source_table = 'cdc_gen');
+
+statement ok
+SELECT changed FROM c1.cdc.disable('dbo.cdc_gen');
+
+statement ok
+SELECT changed FROM c1.cdc.enable('dbo.cdc_gen');
+
+query I
+SELECT capture_instance = getvariable('cdc_gen_name') FROM c1.cdc.tables() WHERE source_table = 'cdc_gen';
+----
+true
+
+# ⚠⚠ THE DEFECT THIS REMOVES, and it is the reason the generated name is a fix rather than a preference.
+# MEASURED: sp_cdc_enable_table's own default is <schema>_<table>, the limit is exactly 100 characters, and
+# a 100-character table in dbo therefore produces a 104-character name and
+#   Msg 22927 ... exceeds the length limit of 100 characters
+# — so cdc.enable failed naming a capture instance the user never chose, and the only escape was the very
+# knob this hides. The same table enables fine with a generated name.
+statement ok
+SELECT fabricator_exec('c1', 'IF OBJECT_ID(''dbo.gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg'') IS NOT NULL DROP TABLE dbo.gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg; CREATE TABLE dbo.gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg(id INT NOT NULL PRIMARY KEY);');
+
+query I
+SELECT changed FROM c1.cdc.enable('dbo.gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg');
+----
+true
+
+# ⚠ THE POSITIVE CONTROL that the table really is at the limit — without it the row above would pass on any
+# table at all, and the defect it stands for is specifically about LENGTH.
+query II
+SELECT length(source_table), length(capture_instance) FROM c1.cdc.tables() WHERE source_table LIKE 'gggg%';
+----
+100	20
+
+# ═══ §23  A DEFAULT enable keys on the TABLE — because the reader refuses an ambiguous one ════════════
+# ⚠⚠ THIS IS THE CORRECTNESS HALF OF §12. A bare cdc.enable that silently added a table's SECOND capture
+# instance would make cdc.changes('<that table>') AMBIGUOUS, and the reader refuses rather than picking one
+# (§2.2: both instances capture every change in the overlap window, so either answer is wrong). So the
+# default enable's question is "is this table captured?", not "does this name exist?".
+
+query TT
+SELECT changed, target LIKE 'dbo.cdc_gen (fab_%)' FROM c1.cdc.enable('dbo.cdc_gen');
+----
+false	true
+
+query I
+SELECT count(*) FROM c1.cdc.tables() WHERE source_table = 'cdc_gen';
+----
+1
+
+# …and a DIFFERENT SPELLING of the same table is still that one instance. The generated name is derived from
+# the string as typed — deliberately, because normalising case would collide two genuinely different tables
+# on a case-SENSITIVE collation — so this row is what proves idempotence keys on the TABLE, not on the name.
+query TT
+SELECT changed, target LIKE 'DBO.CDC_GEN (fab_%)' FROM c1.cdc.enable('DBO.CDC_GEN');
+----
+false	true
+
+query I
+SELECT count(*) FROM c1.cdc.tables() WHERE source_table = 'cdc_gen';
+----
+1
+
+# ⚠ THE POSITIVE CONTROL: an EXPLICIT capture_instance still creates the second, which is how a schema change
+# is absorbed. Without it, "changed = false" above would pass equally on a build that refused every enable.
+query TT
+SELECT target, changed FROM c1.cdc.enable('dbo.cdc_gen', capture_instance := 'cdc_gen_v2');
+----
+dbo.cdc_gen (cdc_gen_v2)	true
+
+# …and NOW the reader refuses that table, which is exactly what the default enable exists to avoid.
+statement error
+SELECT count(*) FROM c1.cdc.changes('dbo.cdc_gen');
+----
+matches 2 capture instances
+
+statement ok
+SELECT target, changed FROM c1.cdc.disable('dbo.cdc_gen', capture_instance := 'cdc_gen_v2');
+
+# ═══ §24  The OWNERSHIP MARKER — presence answers "ours?", value is provenance ════════════════════════
+# docs §15.5. An extended property named fabricator_source on the instance's fn_cdc_get_all_changes_*
+# function, written in the SAME TRANSACTION as the enable. MEASURED that the transaction is load-bearing: in
+# autocommit WITHOUT one, the enable SURVIVES a failed marker write and we would own an instance we cannot
+# recognise; with one, the enable is rolled back.
+#
+# ⚠ It is NOT the resolution: a table rename is allowed and CDC follows it via source_object_id while this
+# text goes stale (MEASURED, §15.6). Resolve by table; read this for "may we manage it?", which is what
+# slice 8's resync will need.
+
+query TT
+SELECT source_table, fabricator_source FROM c1.cdc.tables() WHERE source_table = 'cdc_gen';
+----
+cdc_gen	dbo.cdc_gen
+
+# ⚠ THE COLUMN COUNT, for the same reason §8 counts health()'s rows: the README lists these 14 by name, and
+# an unasserted doc claim is a gap. FOUR of them — supports_net_changes, has_drop_pending, role_name,
+# filegroup_name — are pinned NOWHERE else in this suite, so without this row a silent removal would reach
+# users with nothing failing here.
+query I
+SELECT count(*) FROM (DESCRIBE SELECT * FROM c1.cdc.tables());
+----
+14
+
+# ⚠⚠ THE NULL CASE IS THE LOAD-BEARING ONE. An instance created OUTSIDE this extension has no marker, and
+# without this row "the marker is set" would pass equally on a build that returned a constant. There is
+# deliberately no fallback that treats an unmarked instance as ours — that would silently adopt a DBA's
+# capture instance, which slice 8 would then be entitled to drop and re-create.
+statement ok
+SELECT fabricator_exec('c1', 'IF OBJECT_ID(''dbo.cdc_own'') IS NOT NULL DROP TABLE dbo.cdc_own; CREATE TABLE dbo.cdc_own(id INT NOT NULL PRIMARY KEY); EXEC sys.sp_cdc_enable_table @source_schema=N''dbo'', @source_name=N''cdc_own'', @role_name=NULL;');
+
+query TT
+SELECT source_table, fabricator_source IS NULL FROM c1.cdc.tables() WHERE source_table = 'cdc_own';
+----
+cdc_own	true
+
+# ═══ §25  enable := true — the DDL is at EXECUTE, so BIND stays side-effect-free ══════════════════════
+# docs §15.7. Deriving the declared schema from the SOURCE table is what makes this affordable: earlier
+# analysis had concluded the enable must run at BIND (the schema comes from the change table, which does not
+# exist yet), which would make EXPLAIN, DESCRIBE and CREATE VIEW perform DDL.
+
+statement ok
+SELECT fabricator_exec('c1', 'IF OBJECT_ID(''dbo.cdc_auto'') IS NOT NULL DROP TABLE dbo.cdc_auto; CREATE TABLE dbo.cdc_auto(id INT NOT NULL PRIMARY KEY, v NVARCHAR(20) NULL); INSERT INTO dbo.cdc_auto VALUES (1, N''before'');');
+
+# Without the flag, the refusal names the option rather than leaving the caller to find it.
+statement error
+SELECT count(*) FROM c1.cdc.changes('dbo.cdc_auto');
+----
+pass enable := true to capture it on first read
+
+# ⚠⚠ THE ASSERTION THIS SECTION EXISTS FOR: a DESCRIBE resolves the whole output schema from the SOURCE and
+# captures NOTHING. The columns are the source's, arriving through the same expression shape the real
+# statement uses — so the deferred declaration cannot drift from what the TVF will return.
+query TT
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM c1.cdc.changes('dbo.cdc_auto', enable := true));
+----
+_change_type	VARCHAR
+_position	BLOB
+_commit_lsn	BLOB
+_seq_val	BLOB
+_operation	INTEGER
+id	INTEGER
+v	VARCHAR
+
+query I
+SELECT count(*) FROM c1.cdc.tables() WHERE source_table = 'cdc_auto';
+----
+0
+
+# EXECUTE creates it — with the generated name and the marker, because it goes through the same enable.
+# ⚠ AND THE FIRST READ IS ZERO ROWS, NOT AN ERROR. For an instance we did NOT just create, a NULL retention
+# floor is genuinely unknowable and says so; for one created microseconds ago, start_lsn is now and
+# "nothing is readable yet" is a FACT rather than a guess.
+query I
+SELECT count(*) FROM c1.cdc.changes('dbo.cdc_auto', enable := true);
+----
+0
+
+query TT
+SELECT count(*), max(fabricator_source) FROM c1.cdc.tables() WHERE source_table = 'cdc_auto';
+----
+1	dbo.cdc_auto
+
+# ⚠ IT DOES NOT BACKFILL, and that has to be asserted rather than discovered. Capture starts at the enable's
+# start_lsn, so the row inserted BEFORE it is invisible — an initial snapshot leg is a later slice (§15.12
+# item 8). This is the assertion a user who expected a full table would fail on.
+statement ok
+SELECT fabricator_exec('c1', 'INSERT INTO dbo.cdc_auto VALUES (2, N''after'');');
+
+# The same wait as §15, with the change table named through the instance the enable generated — which is why
+# it is built here rather than written as a literal.
+statement ok
+SELECT fabricator_exec('c1', 'DECLARE @i int = 0; WHILE @i < 60 AND NOT EXISTS (SELECT 1 FROM cdc.' || (SELECT capture_instance FROM c1.cdc.tables() WHERE source_table = 'cdc_auto') || '_CT HAVING COUNT(*) >= 1 AND MAX(__$start_lsn) <= sys.fn_cdc_get_max_lsn()) BEGIN WAITFOR DELAY ''00:00:01''; SET @i = @i + 1; END');
+
+# The second read on an already-captured table: enable := true is a no-op and the changes arrive. Only the
+# post-enable row is here — id 1 predates capture.
+query TIT
+SELECT _change_type, id, v FROM c1.cdc.changes('dbo.cdc_auto', enable := true) ORDER BY _position;
+----
+insert	2	after
+
+query I
+SELECT count(*) FROM c1.cdc.tables() WHERE source_table = 'cdc_auto';
+----
+1
+
 # ═══ §9  Teardown — leave NO CDC-enabled table behind ══════════════════════════════════════════════════
 # Load-bearing: the capture job keeps scanning a CDC-enabled database between runs, and the next run's §3
 # would then find max_position() non-NULL and fail for a reason unrelated to the code.
@@ -788,6 +1009,9 @@ SELECT fabricator_exec('c1', 'IF OBJECT_ID(''dbo.cdc_setup'') IS NOT NULL DROP T
 
 statement ok
 SELECT fabricator_exec('c1', 'IF OBJECT_ID(''dbo.cdc_zz_noidx'') IS NOT NULL DROP TABLE dbo.cdc_zz_noidx;');
+
+statement ok
+SELECT fabricator_exec('c1', 'IF OBJECT_ID(''dbo.cdc_gen'') IS NOT NULL DROP TABLE dbo.cdc_gen; IF OBJECT_ID(''dbo.cdc_own'') IS NOT NULL DROP TABLE dbo.cdc_own; IF OBJECT_ID(''dbo.cdc_auto'') IS NOT NULL DROP TABLE dbo.cdc_auto; IF OBJECT_ID(''dbo.gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg'') IS NOT NULL DROP TABLE dbo.gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg;');
 
 # Back to §3's state, which is also the cheapest possible check that the teardown really disabled it.
 query I

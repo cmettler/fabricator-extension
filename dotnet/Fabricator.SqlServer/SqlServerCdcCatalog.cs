@@ -162,9 +162,11 @@ public sealed partial class SqlServerCatalog
             // it to the proc rather than to us. index_name is the discriminator SQL Server does report
             // correctly.
             "CASE WHEN index_name IS NULL THEN NULL ELSE CAST(index_column_list AS varchar(max)) END, " +
-            "CAST(captured_column_list AS varchar(max)) " +
-            "FROM @cdct ORDER BY source_schema, source_table, capture_instance;";
-        var rows = ReadMetadataRows(sql, 13);
+            "CAST(captured_column_list AS varchar(max)), " +
+            SqlServerCdcFunctions.OwnerLookupSql + " " +
+            // Aliased `c` because the owner lookup correlates on c.capture_instance.
+            "FROM @cdct AS c ORDER BY source_schema, source_table, capture_instance;";
+        var rows = ReadMetadataRows(sql, 14);
 
         var schemas = new StringArray.Builder();
         var tables = new StringArray.Builder();
@@ -179,6 +181,7 @@ public sealed partial class SqlServerCatalog
         var created = new TimestampArray.Builder((TimestampType)CdcTablesFunction.Columns.GetFieldByName("create_date").DataType);
         var indexCols = new StringArray.Builder();
         var capturedCols = new StringArray.Builder();
+        var owner = new StringArray.Builder();
 
         foreach (var row in rows)
         {
@@ -195,12 +198,13 @@ public sealed partial class SqlServerCatalog
             AppendMicros(created, row[10]);
             indexCols.Append(row[11]);
             capturedCols.Append(row[12]);
+            owner.Append(row[13]);
         }
         return new RecordBatch(CdcTablesFunction.Columns, new IArrowArray[]
         {
             schemas.Build(), tables.Build(), instances.Build(), startLsn.Build(), endLsn.Build(),
             net.Build(), dropPending.Build(), role.Build(), index.Build(), filegroup.Build(),
-            created.Build(), indexCols.Build(), capturedCols.Build(),
+            created.Build(), indexCols.Build(), capturedCols.Build(), owner.Build(),
         }, rows.Count);
     }
 
@@ -371,15 +375,41 @@ public sealed partial class SqlServerCatalog
     }
 
     /// <summary>
-    /// <c>sys.sp_cdc_enable_table</c> for one source table, idempotently per capture INSTANCE.
+    /// <c>sys.sp_cdc_enable_table</c> for one source table, with a GENERATED capture-instance name and an
+    /// extended property marking the instance as ours.
     /// </summary>
     /// <remarks>
     /// <para>Every caller-supplied value crosses as a PARAMETER, never spliced text — these are identifiers
     /// and a column list a user types, which is the one place a wrapper like this must not get clever.</para>
-    /// <para>The idempotence check keys on the capture INSTANCE, not the table, because a table legitimately
-    /// has two of them and "this table is already captured" would wrongly refuse the second. With no
-    /// <c>capture_instance</c> given, SQL Server's default is <c>&lt;schema&gt;_&lt;table&gt;</c>, so the check
-    /// resolves that name first rather than skipping the guard.</para>
+    /// <para><b>⚠⚠ THE IDEMPOTENCE CHECK MOVED FROM THE INSTANCE TO THE TABLE, and that is a correctness fix
+    /// rather than ergonomics.</b> It used to key on the capture INSTANCE, on the reasoning that a table
+    /// legitimately has two and refusing the second would be wrong. True of an EXPLICITLY named second
+    /// instance — which is still how you ask for one — but fatal as a DEFAULT: a bare <c>cdc.enable</c> that
+    /// silently added a second instance would make <c>cdc.changes('&lt;that table&gt;')</c> AMBIGUOUS, and the
+    /// reader refuses an ambiguous source rather than picking one (§2.2: both instances capture every change
+    /// in their overlap window, so either answer is wrong). So the default enable's question is "is this
+    /// table captured?", and the explicit one's is still "does this instance exist?".</para>
+    /// <para><b>⚠ It reports what EXISTS, not what it would have created.</b> With opaque generated names a
+    /// bare "already captured" would leave the caller with no way to name the instance they now have, so the
+    /// report row carries the existing instance — whoever created it.</para>
+    /// <para><b>⚠⚠ THE MARKER AND THE ENABLE ARE ONE TRANSACTION, and all three states are MEASURED
+    /// (docs §16b).</b> <c>sp_cdc_enable_table</c> and <c>sp_addextendedproperty</c> are two statements, and
+    /// §15.5's warning — a failed marker leaves an instance we own but cannot recognise — is real:</para>
+    /// <list type="bullet">
+    ///   <item>autocommit, plain batch: the enable <b>SURVIVES</b> a failed marker write, unmarked. The
+    ///     outcome to avoid.</item>
+    ///   <item>autocommit + our own <c>BEGIN/COMMIT</c>: the enable is <b>ROLLED BACK</b>. Atomic — what
+    ///     this does.</item>
+    ///   <item>inside an AMBIENT transaction, via a savepoint: <b>unusable</b>. The marker's error kills the
+    ///     whole transaction before a <c>CATCH</c> can act (<c>XACT_STATE() = 0</c>, <c>@@TRANCOUNT = 0</c>),
+    ///     so there is nothing left to roll back TO. Hence <c>IF @@TRANCOUNT = 0</c>: we open a transaction
+    ///     only when we are the outermost, and when nested we inherit one whose destruction is at least
+    ///     LOUD rather than leaving an unmarked instance behind.</item>
+    /// </list>
+    /// <para>⚠ The marker's VALUE is the resolved <c>schema.table</c> rather than the raw argument the caller
+    /// typed. §15.5 says "the name the user typed"; a caller may type a bare <c>orders</c>, and a listing
+    /// wants the qualified name. It is PROVENANCE either way — <b>never the resolution</b>, because a table
+    /// rename leaves it stale while <c>source_object_id</c> follows (MEASURED, §15.6).</para>
     /// </remarks>
     internal RecordBatch CdcEnableTable(string schema, string table, string? captureInstance,
                                        string? columns, string? role, string? index, string? filegroup,
@@ -387,29 +417,52 @@ public sealed partial class SqlServerCatalog
     {
         const string sql =
             "SET NOCOUNT ON; " +
-            "DECLARE @inst sysname = ISNULL(@capture_instance, @schema + N'_' + @table); " +
-            "DECLARE @target varchar(400) = CAST(@schema + N'.' + @table + N' (' + @inst + N')' AS varchar(400)); " +
+            "DECLARE @inst sysname = ISNULL(@capture_instance, @generated); " +
             "IF NOT " + SqlServerCdcFunctions.CdcEnabledPredicate + " " +
             "  THROW 50001, 'cdc.enable: change data capture is not enabled on this database - call " +
             "cdc.enable_database() first', 1; " +
             SqlServerCdcFunctions.HelpTableVar + " " +
             SqlServerCdcFunctions.FillHelpTableVar + " " +
-            "IF EXISTS (SELECT 1 FROM @cdct WHERE capture_instance = @inst) " +
-            "  SELECT @target AS target, '0' AS changed, " +
-            "         CAST('this capture instance already exists' AS varchar(400)) AS detail; " +
+            // The existing instance, if any: keyed on the TABLE for a default enable and on the NAME for an
+            // explicit one. See the remarks - the difference is what keeps cdc.changes unambiguous.
+            "DECLARE @existing sysname = NULL; " +
+            "IF @capture_instance IS NULL " +
+            "  SELECT TOP 1 @existing = capture_instance FROM @cdct " +
+            "   WHERE source_schema = @schema AND source_table = @table ORDER BY capture_instance; " +
+            "ELSE " +
+            "  SELECT TOP 1 @existing = capture_instance FROM @cdct WHERE capture_instance = @inst; " +
+            "IF @existing IS NOT NULL " +
+            "  SELECT CAST(@schema + N'.' + @table + N' (' + @existing + N')' AS varchar(400)) AS target, " +
+            "         '0' AS changed, " +
+            "         CAST(CASE WHEN @capture_instance IS NULL " +
+            "                   THEN 'this table is already captured by that instance' " +
+            "                   ELSE 'this capture instance already exists' END AS varchar(400)) AS detail; " +
             "ELSE BEGIN " +
+            "  DECLARE @own bit = CASE WHEN @@TRANCOUNT = 0 THEN 1 ELSE 0 END; " +
+            "  IF @own = 1 BEGIN TRANSACTION; " +
             "  EXEC sys.sp_cdc_enable_table @source_schema = @schema, @source_name = @table, " +
             "       @capture_instance = @inst, @captured_column_list = @columns, @role_name = @role, " +
             "       @index_name = @index, @filegroup_name = @filegroup, @supports_net_changes = @net; " +
-            "  SELECT @target AS target, '1' AS changed, " +
+            // The ownership marker. On the TVF rather than the change table because the TVF is the object the
+            // reader uses and the only is_ms_shipped = 0 object the enable creates (§15.2).
+            "  DECLARE @tvf sysname = N'fn_cdc_get_all_changes_' + @inst; " +
+            "  EXEC sys.sp_addextendedproperty @name = N'" + SqlServerCdcFunctions.OwnerProperty + "', " +
+            "       @value = @label, @level0type = N'SCHEMA', @level0name = N'cdc', " +
+            "       @level1type = N'FUNCTION', @level1name = @tvf; " +
+            "  IF @own = 1 COMMIT TRANSACTION; " +
+            "  SELECT CAST(@schema + N'.' + @table + N' (' + @inst + N')' AS varchar(400)) AS target, " +
+            "         '1' AS changed, " +
             "         CAST('capture instance created; a change table and two table-valued functions now " +
             "exist' AS varchar(400)) AS detail; " +
             "END";
+        string generated = SqlServerCdcSetup.GenerateCaptureInstance(schema, table);
         return CdcReportFrom(ReadMetadataRows(sql, 3, new[]
         {
             new SqlParameter("@schema", schema),
             new SqlParameter("@table", table),
             NullableParam("@capture_instance", captureInstance),
+            new SqlParameter("@generated", generated),
+            new SqlParameter("@label", schema + "." + table),
             NullableParam("@columns", columns),
             NullableParam("@role", role),
             NullableParam("@index", index),
@@ -502,29 +555,61 @@ public sealed partial class SqlServerCatalog
 
     // ---- slice 3: the READER --------------------------------------------------------------------------
 
-    /// <summary>The five metadata columns every read emits, plus the opt-in sixth.</summary>
-    private const string CdcChangeTypeSql =
-        "CASE c.[__$operation] WHEN 1 THEN 'delete' WHEN 2 THEN 'insert' WHEN 3 THEN 'update_preimage' "
-        + "WHEN 4 THEN 'update_postimage' WHEN 5 THEN 'upsert' "
-        // ⚠ An ELSE rather than an implicit NULL. The five codes are SQL Server's documented set, so this
-        // branch is unreachable today — but an unknown operation surfacing as its own NUMBER is recoverable,
-        // while one surfacing as a NULL _change_type is a row a consumer would silently mis-handle.
-        + "ELSE CONVERT(varchar(16), c.[__$operation]) END AS [_change_type]";
-
     /// <summary>
-    /// <c>start_lsn ‖ seqval ‖ operation</c> as ONE 21-byte value (§2.4), whose lexicographic order IS the
-    /// change order — so <c>ORDER BY _position</c> replays correctly and <c>max(_position)</c> resumes
-    /// correctly, with the consumer's cursor one BLOB rather than three columns and the §1.3 predicate.
+    /// The metadata select list every read emits, written ONCE over three caller-supplied expressions.
     /// </summary>
     /// <remarks>
-    /// MEASURED against the rig: the concatenation is 21 bytes and the operation byte is the low byte of the
-    /// <c>int</c> (<c>0x…02</c> for an insert, <c>0x…04</c> for an update after-image, <c>0x…01</c> for a
-    /// delete). ⚠ <c>__$command_id</c> is deliberately NOT in it: the TVF does not return that column at all
-    /// (§11 item 5, MEASURED — exactly 8 columns), and within one <c>__$start_lsn</c> the seqvals already
-    /// order statements the way command_id does. The tuple is COMPLETE without it.
+    /// <para><b>⚠⚠ THE PARAMETERISATION IS THE SAFETY PROPERTY, not a tidy-up.</b> Two statements are
+    /// described: the REAL one over a capture instance's TVF, and — for <c>enable := true</c> over a table
+    /// that is not captured yet (§15.7) — a SYNTHETIC one over the SOURCE table, whose metadata columns must
+    /// declare EXACTLY the same Arrow types or the deferred declaration would be a lie DuckDB acts on.
+    /// Writing the CASE and the concatenation once makes them the same expression rather than two that agree
+    /// today. MEASURED: both describe as <c>varchar(16)</c>, <c>binary(21)</c>, <c>binary(10)</c>,
+    /// <c>binary(10)</c>, <c>int</c>, <c>datetime</c>.</para>
+    /// <para><b><c>_position</c> is <c>start_lsn ‖ seqval ‖ operation</c> as ONE 21-byte value</b> (§2.4),
+    /// whose lexicographic order IS the change order — so <c>ORDER BY _position</c> replays correctly and
+    /// <c>max(_position)</c> resumes correctly, with the consumer's cursor one BLOB rather than three columns
+    /// and the §1.3 predicate. MEASURED: the concatenation is 21 bytes and the operation byte is the LOW byte
+    /// of the <c>int</c> (<c>0x…02</c> insert, <c>0x…04</c> update after-image, <c>0x…01</c> delete).
+    /// ⚠ <c>__$command_id</c> is deliberately NOT in it: the TVF does not return that column at all (§11
+    /// item 5, MEASURED — exactly 8 columns), and within one <c>__$start_lsn</c> the seqvals already order
+    /// statements the way command_id does. The tuple is COMPLETE without it.</para>
+    /// <para>⚠ The CASE has an ELSE rather than an implicit NULL. The five codes are SQL Server's documented
+    /// set, so the branch is unreachable today — but an unknown operation surfacing as its own NUMBER is
+    /// recoverable, while one surfacing as a NULL <c>_change_type</c> is a row a consumer mis-handles
+    /// silently.</para>
     /// </remarks>
-    private const string CdcPositionSql =
-        "c.[__$start_lsn] + c.[__$seqval] + CONVERT(binary(1), c.[__$operation]) AS [_position]";
+    private static string CdcMetadataSelectList(string op, string lsn, string seq, string? commitTime)
+    {
+        var sb = new System.Text.StringBuilder();
+        sb.Append("CASE ").Append(op)
+          .Append(" WHEN 1 THEN 'delete' WHEN 2 THEN 'insert' WHEN 3 THEN 'update_preimage' ")
+          .Append("WHEN 4 THEN 'update_postimage' WHEN 5 THEN 'upsert' ELSE CONVERT(varchar(16), ")
+          .Append(op).Append(") END AS [_change_type]")
+          .Append(", ").Append(lsn).Append(" + ").Append(seq).Append(" + CONVERT(binary(1), ").Append(op)
+          .Append(") AS [_position]")
+          .Append(", ").Append(lsn).Append(" AS [_commit_lsn]")
+          .Append(", ").Append(seq).Append(" AS [_seq_val]")
+          .Append(", ").Append(op).Append(" AS [_operation]");
+        if (commitTime is not null)
+        {
+            sb.Append(", ").Append(commitTime).Append(" AS [_commit_timestamp]");
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>The metadata list over a capture instance's TVF, aliased <c>c</c> (and <c>m</c> for the join).</summary>
+    private static string CdcRealMetadataSelectList(bool commitTimestamp) =>
+        CdcMetadataSelectList("c.[__$operation]", "c.[__$start_lsn]", "c.[__$seqval]",
+                              commitTimestamp ? "m.[tran_end_time]" : null);
+
+    /// <summary>
+    /// The metadata list over NOTHING — literals of the same types — for describing a not-yet-captured
+    /// table's output schema (§15.7).
+    /// </summary>
+    private static string CdcSyntheticMetadataSelectList(bool commitTimestamp) =>
+        CdcMetadataSelectList("CONVERT(int, 0)", "CONVERT(binary(10), 0)", "CONVERT(binary(10), 0)",
+                              commitTimestamp ? "CONVERT(datetime, NULL)" : null);
 
     /// <summary>
     /// Resolves the capture instance, describes the statement it will run, and declares the output schema.
@@ -547,7 +632,7 @@ public sealed partial class SqlServerCatalog
     /// rather than reading <c>sys.columns</c> is what keeps the declaration equal to what arrives.</para>
     /// </remarks>
     internal CdcChangesPlan CdcBindChanges(string source, string? captureInstance, bool commitTimestamp,
-                                           byte[]? startingPosition, byte[]? endingPosition)
+                                           bool enable, byte[]? startingPosition, byte[]? endingPosition)
     {
         const string sql =
             "SET NOCOUNT ON; " +
@@ -571,6 +656,12 @@ public sealed partial class SqlServerCatalog
             new SqlParameter("@source", source),
             NullableParam("@capture_instance", captureInstance),
         });
+        if (rows.Count == 0 && enable && captureInstance is null)
+        {
+            // enable := true over a table nobody has captured. Declare from the SOURCE and defer the DDL to
+            // execute (§15.7) — bind must stay side-effect-free, or an EXPLAIN would capture a table.
+            return CdcDeclareDeferred(source, commitTimestamp, startingPosition, endingPosition);
+        }
         if (rows.Count == 0)
         {
             // ⚠ Which of the two it is decides where the reader goes next, so the message must not conflate
@@ -582,7 +673,8 @@ public sealed partial class SqlServerCatalog
                       + $"'{database}'"
                       + (captureInstance is null ? string.Empty : $" under capture instance '{captureInstance}'")
                       + ". SELECT * FROM <catalog>.cdc.tables() lists what is captured; "
-                      + "<catalog>.cdc.enable('<schema>.<table>') captures it."
+                      + "<catalog>.cdc.enable('<schema>.<table>') captures it, or pass enable := true to "
+                      + "capture it on first read."
                     : "cdc.changes: change data capture is not enabled on database "
                       + $"'{database}'. Call <catalog>.cdc.enable_database() first, then cdc.enable(...).");
         }
@@ -633,8 +725,88 @@ public sealed partial class SqlServerCatalog
                 + "transaction would not be readable either, because the capture job reads COMMITTED log "
                 + "records. Commit first, then read.");
         }
-        return CdcDeclare(described, instance, rows[0][1] ?? "dbo", rows[0][2] ?? source, nullability,
-                          commitTimestamp, tvf, startingPosition, endingPosition);
+        return CdcDeclare(described, source, captureInstance, instance, rows[0][1] ?? "dbo",
+                          rows[0][2] ?? source, nullability, commitTimestamp, tvf, startingPosition,
+                          endingPosition);
+    }
+
+
+    /// <summary>
+    /// The DEFERRED declaration: <c>enable := true</c> over a table that is not captured yet. The output
+    /// schema comes from the SOURCE table; the capture instance does not exist until
+    /// <see cref="CdcEnableAndResolve"/> runs at execute.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>⚠⚠ THIS IS WHAT MAKES <c>enable := true</c> AFFORDABLE AT ALL (§15.7).</b> Earlier analysis
+    /// concluded the enable had to happen at BIND, because the output schema comes from the change table and
+    /// the change table does not exist until the enable — which would have made <c>EXPLAIN</c>,
+    /// <c>DESCRIBE</c> and <c>CREATE VIEW</c> perform DDL. Deriving the declaration from the SOURCE dissolves
+    /// that, and it is correct BY CONSTRUCTION for a fresh enable: a default <c>sp_cdc_enable_table</c>
+    /// captures every source column, so at the instant we enable, captured == source (MEASURED).</para>
+    /// <para><b>⚠ The metadata columns are described, not assumed</b>, from literals of the same types
+    /// through <see cref="CdcMetadataSelectList"/> — the SAME expression shape the real statement uses, so
+    /// the two cannot drift. MEASURED identical: <c>varchar(16)</c>, <c>binary(21)</c>, <c>binary(10)</c>,
+    /// <c>binary(10)</c>, <c>int</c>, <c>datetime</c>.</para>
+    /// <para>⚠ EVERY source column is declared NULLABLE here, and that is not laziness: at bind we do not
+    /// know which columns the enable will capture (a caller can reach this path on a table someone captures
+    /// PARTIALLY between our bind and our execute), and a NOT NULL claim we cannot keep is the one direction
+    /// that turns into a wrong answer. The arrival check at execute is what pins the rest.</para>
+    /// <para>⚠ It refuses a source that is not a TABLE. <c>enable := true</c> cannot conjure a capture
+    /// instance from an instance NAME, and reporting "not captured" for a typo would send the caller looking
+    /// in the wrong place.</para>
+    /// </remarks>
+    private CdcChangesPlan CdcDeclareDeferred(string source, bool commitTimestamp, byte[]? startingPosition,
+                                              byte[]? endingPosition)
+    {
+        var (schema, table) = SqlServerCdcSetup.SplitSource(source, "cdc.changes");
+        string qualified = Quote(schema) + "." + Quote(table);
+        string describeSql = "SELECT " + CdcSyntheticMetadataSelectList(commitTimestamp)
+                             + ", s.* FROM " + qualified + " AS s";
+        var described = DescribeQuery(describeSql);
+        if (described is null)
+        {
+            throw new ArgumentException(
+                $"cdc.changes: enable := true was asked for, but '{schema}.{table}' could not be described - "
+                + "it is not a table this connection can read. Change data capture is enabled per TABLE, so "
+                + "the source has to be one; a capture-instance name cannot be enabled.");
+        }
+        int meta = commitTimestamp ? 6 : 5;
+        var fields = new List<Field>(described.FieldsList.Count);
+        for (int i = 0; i < described.FieldsList.Count; i++)
+        {
+            var f = described.FieldsList[i];
+            bool derived = i < meta && !(commitTimestamp && i == meta - 1);
+            fields.Add(new Field(f.Name, f.DataType, nullable: !derived));
+        }
+        return new CdcChangesPlan(source, explicitInstance: null, commitTimestamp,
+                                  new Schema(fields, metadata: null), startingPosition, endingPosition);
+    }
+
+    /// <summary>
+    /// Runs the deferred <c>enable := true</c> and resolves the plan. Returns the resolved plan and whether
+    /// THIS call created the capture instance.
+    /// </summary>
+    /// <remarks>
+    /// <para>⚠ It goes through <see cref="CdcEnableTable"/> rather than issuing its own DDL, so it inherits
+    /// the generated capture-instance name, the ownership marker and the atomic transaction — and, crucially,
+    /// the idempotence: a table someone captured between our bind and our execute is reported
+    /// <c>changed = false</c> and simply read.</para>
+    /// <para>⚠ The DECLARED schema is NOT replaced by the resolved one. Bind already told DuckDB what the
+    /// columns are; the resolved plan supplies only the capture instance and the statement. If the two
+    /// disagree — a table captured PARTIALLY by someone else in that window — the arrival check fails
+    /// loudly, which is the honest outcome and the only one that cannot corrupt a result.</para>
+    /// </remarks>
+    internal (CdcChangesPlan Plan, bool Created) CdcEnableAndResolve(CdcChangesPlan plan)
+    {
+        var (schema, table) = SqlServerCdcSetup.SplitSource(plan.Source, "cdc.changes");
+        using var report = CdcEnableTable(schema, table, captureInstance: null, columns: null, role: null,
+                                          index: null, filegroup: null, net: false);
+        bool created = report.Length > 0 && ((BooleanArray)report.Column(1)).GetValue(0) == true;
+        Log.LogDebug("cdc changes {Source}: enable := true {Outcome}", plan.Source,
+                     created ? "created a capture instance" : "found the table already captured");
+        var resolved = CdcBindChanges(plan.Source, plan.ExplicitInstance, plan.CommitTimestamp, enable: false,
+                                      plan.StartingPosition, plan.EndingPosition);
+        return (resolved, created);
     }
 
     /// <summary>
@@ -647,8 +819,9 @@ public sealed partial class SqlServerCatalog
     /// changed that, the alternative to this check is reading four metadata columns as DATA and shifting
     /// every source column by one — silently.
     /// </remarks>
-    private static CdcChangesPlan CdcDeclare(Schema described, string instance, string sourceSchema,
-                                             string sourceTable, IReadOnlyDictionary<string, bool> nullability,
+    private static CdcChangesPlan CdcDeclare(Schema described, string source, string? explicitInstance,
+                                             string instance, string sourceSchema, string sourceTable,
+                                             IReadOnlyDictionary<string, bool> nullability,
                                              bool commitTimestamp, string tvf,
                                              byte[]? startingPosition, byte[]? endingPosition)
     {
@@ -697,8 +870,10 @@ public sealed partial class SqlServerCatalog
                      + " FROM " + tvf + "(@from_lsn, @to_lsn, @row_filter) AS c"
                      + (commitTimestamp ? CdcCommitTimeJoinSql : string.Empty)
                      + CdcCursorPredicateSql(startingPosition, endingPosition);
-        return new CdcChangesPlan(instance, sourceSchema, sourceTable, new Schema(fields, metadata: null), sql,
-                                  startingPosition, endingPosition);
+        return new CdcChangesPlan(source, explicitInstance, commitTimestamp,
+                                  new Schema(fields, metadata: null), startingPosition, endingPosition,
+                                  captureInstance: instance, sourceSchema: sourceSchema,
+                                  sourceTable: sourceTable, sql: sql);
     }
 
     /// <summary>
@@ -712,15 +887,7 @@ public sealed partial class SqlServerCatalog
 
     private static string CdcChangesSelectList(bool commitTimestamp, IReadOnlyList<string>? sourceColumns)
     {
-        var sb = new System.Text.StringBuilder();
-        sb.Append(CdcChangeTypeSql).Append(", ").Append(CdcPositionSql)
-          .Append(", c.[__$start_lsn] AS [_commit_lsn]")
-          .Append(", c.[__$seqval] AS [_seq_val]")
-          .Append(", c.[__$operation] AS [_operation]");
-        if (commitTimestamp)
-        {
-            sb.Append(", m.[tran_end_time] AS [_commit_timestamp]");
-        }
+        var sb = new System.Text.StringBuilder(CdcRealMetadataSelectList(commitTimestamp));
         if (sourceColumns is null)
         {
             sb.Append(", c.*");
@@ -818,8 +985,9 @@ public sealed partial class SqlServerCatalog
     /// the pump"). But when the CALLER supplied an upper bound it becomes an error, because a bound that
     /// cannot exist is a question worth answering rather than silently emptying.</para>
     /// </remarks>
-    internal CdcWindow CdcResolveWindow(CdcChangesPlan plan)
+    internal CdcWindow CdcResolveWindow(CdcChangesPlan plan, bool justCreated = false)
     {
+        string instance = CdcRequireResolved(plan).Instance;
         const string sql =
             "SET NOCOUNT ON; " +
             "DECLARE @en varchar(1) = CASE WHEN " + SqlServerCdcFunctions.CdcEnabledPredicate
@@ -836,7 +1004,7 @@ public sealed partial class SqlServerCatalog
         // readYourWrites: a capture instance enabled earlier in THIS transaction must be visible here, and
         // this is a short metadata read that holds no reader open. ⚠ The streaming read below deliberately
         // does NOT do that - see CdcExecuteChanges.
-        var rows = ReadMetadataRows(sql, 3, new[] { new SqlParameter("@inst", plan.CaptureInstance) });
+        var rows = ReadMetadataRows(sql, 3, new[] { new SqlParameter("@inst", instance) });
         if (rows.Count == 0 || rows[0][0] != "1")
         {
             throw new InvalidOperationException(
@@ -846,6 +1014,16 @@ public sealed partial class SqlServerCatalog
         }
         byte[]? minLsn = SqlServerCdcFunctions.ParseHex(rows[0][1]);
         byte[]? maxLsn = SqlServerCdcFunctions.ParseHex(rows[0][2]);
+        if (minLsn is null && justCreated)
+        {
+            // ⚠ NOT the retry error, and the difference is a FACT rather than a kindness: we created this
+            // capture instance microseconds ago, so its start_lsn is now and nothing before it was captured.
+            // The readable set is EMPTY, which is an answer we can give — where for an instance we did NOT
+            // create, a NULL floor is genuinely unknowable and must say so.
+            Log.LogDebug("cdc changes {Source} ({Instance}): capture instance just created - empty window",
+                         plan.SourceName, plan.CaptureInstance);
+            return CdcWindow.Empty;
+        }
         if (minLsn is null)
         {
             throw new InvalidOperationException(
@@ -970,6 +1148,22 @@ public sealed partial class SqlServerCatalog
                 Value = CdcChangesPlan.OpOf(ending),
             });
         }
-        return ExecuteQuery(plan.Sql, parameters, readYourWrites: false);
+        return ExecuteQuery(CdcRequireResolved(plan).Sql, parameters, readYourWrites: false);
+    }
+
+    /// <summary>
+    /// The capture instance and statement of a RESOLVED plan. A deferred plan reaching here is a bug in this
+    /// file — <c>CdcEnableAndResolve</c> runs before either caller — so it says so rather than dereferencing
+    /// a null and reporting something further away.
+    /// </summary>
+    private static (string Instance, string Sql) CdcRequireResolved(CdcChangesPlan plan)
+    {
+        if (plan.CaptureInstance is not { } instance || plan.Sql is not { } sql)
+        {
+            throw new InvalidOperationException(
+                $"cdc.changes: internal - the plan for '{plan.Source}' was never resolved to a capture "
+                + "instance. enable := true defers that to execution; reaching a read without it is a bug.");
+        }
+        return (instance, sql);
     }
 }

@@ -99,6 +99,30 @@ internal static class SqlServerCdcFunctions
         "filegroup_name sysname NULL, create_date datetime, index_column_list nvarchar(max) NULL, " +
         "captured_column_list nvarchar(max) NULL);";
 
+    /// <summary>
+    /// The extended property that marks a capture instance as created by THIS extension. Set on the
+    /// instance's <c>fn_cdc_get_all_changes_*</c> function; its VALUE is the resolved <c>schema.table</c>.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>⚠ PRESENCE is the ownership answer; the VALUE is provenance; NEITHER is the resolution.</b>
+    /// MEASURED (§15.6): a table rename is allowed and CDC follows it via <c>source_object_id</c>, while this
+    /// text goes stale — so an instance whose marker reads <c>dbo.o</c> may serve a table now called
+    /// <c>dbo.orders2</c>. Resolve by table, read this for "may we manage it?".</para>
+    /// <para>⚠ There is no fallback that treats an UNMARKED instance as ours: that would silently adopt a
+    /// DBA's capture instance, which slice 8's <c>resync</c> would then be entitled to drop and re-create.
+    /// Unmarked means "not ours", full stop.</para>
+    /// </remarks>
+    internal const string OwnerProperty = "fabricator_source";
+
+    /// <summary>
+    /// A capture instance's owner marker, as a correlated subquery over <c>sys.extended_properties</c>.
+    /// Joins on the instance's TVF, which is what <see cref="OwnerProperty"/> is set on.
+    /// </summary>
+    internal const string OwnerLookupSql =
+        "(SELECT CONVERT(varchar(400), ep.value) FROM sys.extended_properties ep " +
+        " WHERE ep.class = 1 AND ep.minor_id = 0 AND ep.name = '" + OwnerProperty + "' " +
+        "   AND ep.major_id = OBJECT_ID('cdc.fn_cdc_get_all_changes_' + c.capture_instance))";
+
     /// <summary>Fills <c>@cdct</c> — or leaves it EMPTY when CDC is not enabled, instead of raising 22901.</summary>
     internal const string FillHelpTableVar =
         "IF " + CdcEnabledPredicate + " INSERT INTO @cdct EXEC sys.sp_cdc_help_change_data_capture;";
@@ -333,6 +357,10 @@ internal sealed class CdcTablesFunction : ICatalogTableFunction
         new Field("create_date", new TimestampType(TimeUnit.Microsecond, (string?)null), nullable: true),
         new Field("index_column_list", StringType.Default, nullable: true),
         new Field("captured_column_list", StringType.Default, nullable: true),
+        // ⚠ NULL means "not created by this extension", which is a different statement from "unknown". The
+        // marker is written in the SAME TRANSACTION as the enable (MEASURED atomic), so an instance we
+        // created and failed to mark does not exist - there is no third state to represent.
+        new Field(SqlServerCdcFunctions.OwnerProperty, StringType.Default, nullable: true),
     }, metadata: null);
 
     public ITableFunctionBinding Bind(RecordBatch args) => new CdcRowsBinding(Columns, _catalog.CdcTables);

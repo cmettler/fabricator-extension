@@ -594,7 +594,17 @@ case "$TIER" in
         # /!\ A third mutant SURVIVED at first (drop the inverted-window short-circuit) and is what narrowed
         # that branch: a caught-up consumer produces from == to, not from > to. It is now gated with the only
         # shape that reaches it - an explicit ending_position BELOW the cursor.
-        : "${MIN_ASSERTIONS:=2438}"
+        # 2495 since 2026-08-24: verify_mssql_cdc 182 -> 239 for slice 4 - the GENERATED capture-instance
+        # name, the ownership marker and enable := true. Exactly +57 over 2438, i.e. NO other suite moved.
+        # /!\ The section that matters most is the one whose row looks redundant: enabling the SAME table
+        # twice reports changed = false on BOTH a table-keyed and a name-keyed build, so the discriminating
+        # assertion is a DIFFERENT SPELLING of it (DBO.CDC_GEN after dbo.cdc_gen). A name-keyed build hashes
+        # that differently and creates the table's SECOND capture instance, which makes cdc.changes refuse
+        # that table outright - the reason the default had to move off the name in the first place.
+        # /!\ The 100-character-table rows are the DEFECT the generated name removes (Msg 22927 naming a
+        # capture instance the user never chose), and the table's own LENGTH beside them is the positive
+        # control: without it they would pass on any table at all.
+        : "${MIN_ASSERTIONS:=2495}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

@@ -108,6 +108,53 @@ internal static class SqlServerCdcSetup
     /// </summary>
     internal static string Lit(string? value) =>
         value is null ? "NULL" : "N'" + value.Replace("'", "''") + "'";
+
+    /// <summary>The prefix every capture instance this extension creates carries.</summary>
+    internal const string GeneratedInstancePrefix = "fab_";
+
+    /// <summary>
+    /// The capture-instance name a default <c>cdc.enable</c> creates: <c>fab_</c> plus 16 hex characters
+    /// derived from <c>schema.table</c> — 20 characters, whatever the table is called.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>⚠⚠ IT REMOVES A DEFECT, not just a knob (docs §15.4).</b> With no
+    /// <c>@capture_instance</c>, <c>sp_cdc_enable_table</c> builds <c>&lt;schema&gt;_&lt;table&gt;</c>, and
+    /// the limit is exactly 100 characters. MEASURED against the rig: a 100-character table in <c>dbo</c>
+    /// produces a 104-character name and <c>Msg 22927 … exceeds the length limit of 100 characters</c> — so
+    /// <c>cdc.enable</c> failed with an error about a name the user never chose, and the only escape was the
+    /// very knob this hides. The same table with a generated name enables fine, MEASURED.</para>
+    /// <para><b>⚠⚠ SHA-256, NEVER <c>string.GetHashCode()</c>.</b> .NET randomizes string hash codes PER
+    /// PROCESS, so a GetHashCode-derived name would differ on every run — the exact opposite of the
+    /// determinism this exists for, and it would fail in a way that looks like a caching bug.</para>
+    /// <para><b>⚠ The input is NOT lower-cased, deliberately.</b> Normalising case would make two genuinely
+    /// different tables on a case-SENSITIVE collation (<c>dbo.Orders</c> and <c>dbo.orders</c>) collide on
+    /// one instance name, and the second enable would then fail naming a name the caller never chose — the
+    /// very defect above, reintroduced. Nothing is lost: idempotence keys on the TABLE, not on this name
+    /// (see <c>CdcEnableTable</c>), so two spellings of one table cannot produce two instances.</para>
+    /// <para><b>⚠ An opaque name cannot go stale, and a derived one does.</b> MEASURED (§15.6): a table
+    /// rename is ALLOWED and CDC follows it, so SQL Server's own <c>dbo_o</c> permanently misnames a table
+    /// now called <c>orders2</c>. <c>fab_&lt;hash&gt;</c> never claimed to mean anything.</para>
+    /// <para>⚠ 16 hex characters is 64 bits. A collision would need two tables whose names hash the same,
+    /// and the consequence would be a refusal (<c>this capture instance already exists</c>) rather than a
+    /// wrong answer — SQL Server enforces uniqueness. It is not a correctness boundary.</para>
+    /// <para>⚠ There is deliberately NO second-instance discriminator yet. §2.2 caps a table at two
+    /// instances, and nothing in this release creates the second by itself: a default enable REFUSES to add
+    /// one (it would make <c>cdc.changes</c> ambiguous for that table), and an explicit
+    /// <c>capture_instance :=</c> names it. Slice 8's <c>resync</c> is what will need one, and it should
+    /// choose the shape then rather than inherit a guess.</para>
+    /// </remarks>
+    internal static string GenerateCaptureInstance(string schema, string table)
+    {
+        byte[] hash = System.Security.Cryptography.SHA256.HashData(
+            Encoding.UTF8.GetBytes(schema + "." + table));
+        var name = new StringBuilder(20);
+        name.Append(GeneratedInstancePrefix);
+        for (int i = 0; i < 8; i++)
+        {
+            name.Append(hash[i].ToString("x2", System.Globalization.CultureInfo.InvariantCulture));
+        }
+        return name.ToString();
+    }
 }
 
 /// <summary>

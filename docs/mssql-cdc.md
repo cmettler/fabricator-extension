@@ -1,14 +1,14 @@
-# Log-based change capture for SQL Server — slices 1 + 2 + 3 BUILT
+# Log-based change capture for SQL Server — slices 1 + 2 + 3 + 4 BUILT
 
-> **Status: slices 1 (§13), 2 (§14) and 3 — THE READER (§16) — are BUILT and gated.**
+> **Status: slices 1 (§13), 2 (§14), 3 — THE READER (§16) — and 4 (§17) are BUILT and gated.**
 >
 > **⚠ READ §16 FIRST for what shipped**, and §15 for the design it was built from. §15 supersedes §4's
 > recommendation and most of §7 and corrects three things this document previously asserted; §16 corrects
 > two more — §3.4's cursor idiom does not run as printed, and §15.7's "the first call always returns zero
 > rows" is false in an already-capturing database.
 >
-> **What remains** is slices 4–9 of §15.12: hidden capture-instance names, name-alignment across a schema
-> change, the two-instance boundary, the snapshot leg, and the timestamp bounds.
+> **What remains** is slices 5–9 of §15.12: name-alignment across a schema change, DDL detection in the
+> window, the two-instance boundary, the snapshot leg, and the timestamp bounds.
 >
 > ⚠ The original header read *"DESIGN ONLY, 2026-08-23. No code, no ABI, no gate."* — true when written,
 > and superseded by slice 2's ABI v81.
@@ -2057,7 +2057,7 @@ The user's question. What the reader can do about it, now that §15.6 has the ma
 | **1** | ✅ BUILT — §13 | inspection first |
 | **2** | ✅ BUILT — §14 | setup from SQL |
 | **3** | ✅ **BUILT 2026-08-24 — §16.** The reader: `ICatalogTableFunction`, C#-owned connection, ONE capture instance, `images := 'after'`, explicit bounds, the §2.1 pre-check, the 21-byte cursor | the smallest correct reader. §15.1/§15.2/§15.7 |
-| **4** | generated hidden instance name + the EP ownership marker + `enable := true` deferred to execute | makes the surface "easy to use"; independent of 5–7. §15.4/§15.5/§15.7 |
+| **4** | ✅ **BUILT 2026-08-24 — §17.** Generated hidden instance name + the EP ownership marker + `enable := true` deferred to execute | makes the surface "easy to use"; independent of 5–7. §15.4/§15.5/§15.7 |
 | **5** | name-alignment with widening + `_capture_instance` | buys slice 7 nearly free. §15.8 |
 | **6** | DDL detection in-window; `on_schema_change := 'error'` | loud before it is clever. §15.11 |
 | **7** | the two-instance boundary: derive `B`, split the window, `UNION ALL` by name | needs 3 and 5 |
@@ -2305,3 +2305,155 @@ document that the pre-check is the feature rather than a nicety.
 column is nulled when `index_name IS NULL`. Gated with an index-less instance beside an indexed one; the
 indexed row is the positive control AND what makes the mutant die, since the leak copies the PREVIOUS row's
 value. ⚠ The probe table is named to sort LAST for that reason.
+
+---
+
+## 17. Slice 4 — THE HIDDEN INSTANCE NAME, THE OWNERSHIP MARKER AND `enable := true`, AS BUILT (2026-08-24)
+
+Built from §15.4, §15.5 and §15.7. C#-only, no ABI change. Gate: `verify_mssql_cdc` **182 → 239**, four
+mutants, each killed at its own assertion.
+
+```sql
+-- capture a table without ever naming a capture instance
+SELECT * FROM db.cdc.enable('dbo.orders');       -- -> dbo.orders (fab_61a00e766c20381c)
+
+-- …or let the first read do it
+FROM db.cdc.changes('dbo.orders', enable := true);
+```
+
+### 17.1 The name is generated, and it removes a defect
+
+`fab_` plus 16 hex characters of SHA-256 over `schema.table` — **20 characters, whatever the table is
+called**.
+
+**⚠⚠ THE DEFECT, MEASURED both ways.** `sp_cdc_enable_table`'s own default is `<schema>_<table>` and the
+limit is exactly 100 characters, so a 100-character table in `dbo` produces a 104-character name and
+`Msg 22927 … exceeds the length limit of 100 characters` — `cdc.enable` failing with an error about a name
+the user never chose, whose only escape was the very knob we wanted to hide. The same table enables fine
+with a generated name. Both legs are gated (§22), with the table's own length as the positive control:
+without it, the passing row would prove nothing about LENGTH.
+
+**⚠⚠ SHA-256, NEVER `string.GetHashCode()`.** .NET randomizes string hash codes PER PROCESS, so a
+GetHashCode-derived name would differ on every run — the opposite of the determinism this exists for, and it
+would present as a caching bug. ⚠ The gate cannot catch that specific mistake: within ONE process
+`GetHashCode` is stable, and sqllogictest gives one process. What it does catch is a generator that is not a
+function of the name at all (a GUID, a timestamp, a counter), by disabling and re-enabling and demanding the
+same name back.
+
+**⚠ The input is NOT lower-cased, deliberately.** Normalising case would make two genuinely different tables
+on a case-SENSITIVE collation (`dbo.Orders`, `dbo.orders`) collide on one instance name, and the second
+enable would then fail naming a name the caller never chose — the defect above, reintroduced. Nothing is
+lost, because idempotence keys on the TABLE (§17.3), so two spellings of one table cannot produce two
+instances — which the gate asserts directly.
+
+**⚠ An opaque name cannot go stale and a derived one does.** MEASURED (§15.6): a table rename is allowed and
+CDC follows it, so SQL Server's own `dbo_o` permanently misnames a table now called `orders2`.
+`fab_<hash>` never claimed to mean anything.
+
+**⚠ There is NO second-instance discriminator yet**, though §15.4 anticipated one. Nothing in this release
+creates a second instance by itself — a default enable refuses to (§17.3) and an explicit
+`capture_instance :=` names it — so the shape would be a guess. Slice 8's `resync` is what will need one and
+should choose it then.
+
+### 17.2 The ownership marker, and the transaction it needs
+
+An extended property `fabricator_source` on the instance's `fn_cdc_get_all_changes_*` function, valued with
+the resolved `schema.table`. Surfaced as a new `cdc.tables()` column of the same name: **non-NULL means the
+instance was created by this extension**.
+
+| carrier | job |
+|---|---|
+| **presence** | "this instance is ours" — no built-in metadata expresses it, and it is what makes the opaque names safe to manage |
+| **value** | provenance, for diagnostics and `cdc.tables()` |
+| **`source_object_id`** | **the resolution** — it follows a rename where the marker text goes stale (MEASURED, §15.6) |
+
+**⚠⚠ THE PAIR IS ONE TRANSACTION, and all three states are MEASURED** — §15.5 warned that a failed marker
+write leaves an instance we own but cannot recognise, and the warning is real:
+
+| context | on a failed marker write |
+|---|---|
+| autocommit, plain batch | the enable **SURVIVES** unmarked — the outcome to avoid |
+| autocommit + our own `BEGIN/COMMIT` | the enable is **ROLLED BACK** — atomic, and what ships |
+| inside an AMBIENT transaction, via a savepoint | **unusable** — the marker's error kills the whole transaction before a `CATCH` can act (`XACT_STATE() = 0`, `@@TRANCOUNT = 0`), so there is nothing to roll back TO |
+
+⇒ `IF @@TRANCOUNT = 0 BEGIN TRANSACTION`. We open one only when we are outermost; nested, we inherit a
+transaction whose destruction is at least LOUD rather than leaving an unmarked instance behind.
+
+**⚠ There is deliberately no fallback that treats an UNMARKED instance as ours.** That would silently adopt a
+DBA's capture instance, which slice 8's `resync` would then be entitled to drop and re-create. Unmarked means
+"not ours", full stop — and the gate's load-bearing row is the NULL one, since "the marker is set" would
+otherwise pass on a build returning a constant.
+
+### 17.3 ⚠⚠ A DEFAULT enable keys on the TABLE, and that is a CORRECTNESS fix
+
+The guard used to key on the capture INSTANCE, reasoning that a table legitimately has two and refusing the
+second would be wrong. True of an explicitly named second instance — still how you ask for one — and fatal
+as a DEFAULT: **a bare `cdc.enable` that silently added a second instance would make
+`cdc.changes('<that table>')` AMBIGUOUS**, and the reader refuses an ambiguous source rather than picking one
+(§2.2 — both instances capture every change in the overlap window, so either answer is wrong).
+
+So the default enable's question is *"is this table captured?"* and the explicit one's is still *"does this
+instance exist?"*. It reports what EXISTS rather than what it would have created: with opaque names, a bare
+"already captured" would leave the caller unable to name the instance they now have.
+
+⚠ The gate's discriminating row is the **different spelling** (`DBO.CDC_GEN` after `dbo.cdc_gen`): a
+name-keyed build computes a different hash and creates a second instance, so that is where the mutant dies.
+The plain repeat passes on both builds, because the same spelling hashes the same.
+
+### 17.4 `enable := true` — the DDL is at EXECUTE, so bind stays side-effect-free
+
+**⚠⚠ THE OBJECTION IT DISSOLVES (§15.7).** Earlier analysis concluded the enable had to run at BIND, because
+the output schema comes from the change table and the change table does not exist until the enable — which
+would make `EXPLAIN`, `DESCRIBE` and `CREATE VIEW` perform DDL. Deriving the declaration from the SOURCE
+dissolves it, and it is correct by construction for a fresh enable: a default `sp_cdc_enable_table` captures
+every source column, so at the instant we enable, captured == source.
+
+**How the deferred declaration is built without the change table:** describe
+
+```sql
+SELECT <the metadata list over LITERALS of the same types>, s.* FROM [dbo].[orders] AS s
+```
+
+⚠ **The metadata expressions are written ONCE** (`CdcMetadataSelectList`, parameterised on the operation and
+the two LSN expressions) and rendered twice — over `c.[__$operation]` for the real statement and over
+`CONVERT(int, 0)` for this one. That is what makes the two declarations the same expression rather than two
+that agree today. MEASURED identical: `varchar(16)`, `binary(21)`, `binary(10)`, `binary(10)`, `int`,
+`datetime`.
+
+⚠ Every source column is declared NULLABLE on this path. At bind we do not know which columns the enable
+will capture — a caller can reach it on a table someone captures PARTIALLY between our bind and our execute —
+and a NOT NULL claim we cannot keep is the one direction that becomes a wrong answer. The execute-time
+arrival check pins the rest.
+
+**⚠ THE FIRST READ IS ZERO ROWS, NOT AN ERROR — and §15.7's own prediction of this was wrong for a different
+reason (§16.4 item 3).** For an instance we did NOT create, a NULL retention floor is genuinely unknowable
+and the reader says so. For one created microseconds ago, `start_lsn` is now and "nothing is readable yet" is
+a FACT. So the resolution carries a `justCreated` flag and answers empty.
+
+**⚠ IT DOES NOT BACKFILL, and the gate asserts it.** Capture starts at the enable's `start_lsn`, so rows
+written before it are invisible. A user who expected a full table gets silence, which is why it is an
+assertion rather than a sentence in prose — the initial-snapshot leg is §15.12 item 8.
+
+⚠ It reports `SchemaMayChange` only when the enable actually ran, set in the EAGER part of `Execute` — the
+host reads that flag the moment `tablefn_execute` returns, so a DDL placed in the iterator body would happen
+with the flag already read as false.
+
+### 17.5 What the gate does NOT cover
+
+- **Cross-process hash determinism** (§17.1) — one process, so the `GetHashCode` mistake specifically is
+  invisible.
+- **The marker's atomicity.** All three transaction states are MEASURED by hand, but forcing
+  `sp_addextendedproperty` to fail from SQL requires a deliberately broken call that the shipped code cannot
+  make.
+- **A 64-bit hash collision.** Its consequence would be a refusal (`this capture instance already exists`)
+  rather than a wrong answer, since SQL Server enforces uniqueness — it is not a correctness boundary.
+- **Permissions.** The rig is `sa`; `sp_addextendedproperty` needs `ALTER` on the object, which is
+  unexercised.
+- **⚠ `enable := true` INSIDE AN EXPLICIT TRANSACTION.** The enable runs on the transaction's PINNED
+  connection (read-your-writes) while the change READ runs POOLED (§16.1 — a change reader gains nothing
+  from read-your-writes and a streaming reader on the write connection is the 595 hazard). So an uncommitted
+  enable creates a TVF the read's connection cannot see. **REASONED unreachable rather than guarded**: the
+  capture job cannot scan an uncommitted transaction, so `fn_cdc_get_min_lsn` is NULL for that instance, and
+  the window resolution answers "just created ⇒ empty" on the first call and "floor not established ⇒ retry"
+  on any later one — neither of which executes the read. The chain is three links long, which is exactly why
+  it is written down rather than trusted silently. Committing first makes all of it moot.

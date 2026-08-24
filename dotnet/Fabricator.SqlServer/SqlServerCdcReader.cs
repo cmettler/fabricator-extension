@@ -68,6 +68,13 @@ internal sealed class CdcChangesFunction : ICatalogTableFunction
     /// not even with a PRIMARY KEY on the right side — so "emit it always and let projection pushdown prune
     /// it" would make every caller pay two scans. The emitter runs at bind; a projection is applied after it.
     /// </para>
+    /// <para><b>⚠⚠ <c>enable := true</c> CAPTURES THE TABLE IF IT IS NOT CAPTURED, and the DDL happens at
+    /// EXECUTE, not at bind (§15.7).</b> That is what keeps <c>EXPLAIN</c>, <c>DESCRIBE</c> and
+    /// <c>CREATE VIEW</c> side-effect-free, and it is affordable only because the declared schema can be
+    /// derived from the SOURCE table: a default <c>sp_cdc_enable_table</c> captures every source column, so
+    /// at the instant we enable, captured == source (MEASURED). ⚠ It is a real DDL — it creates a change
+    /// table and two table-valued functions — so a call that performs it reports
+    /// <see cref="ITableFunctionBinding.SchemaMayChange"/> like the setup functions do.</para>
     /// <para>⚠ NO <c>max_rows</c> in slice 3, though §3.2 lists it. A truncated read breaks the cursor idiom:
     /// the caller must then advance to <c>max(_position)</c> rather than to the window end, which is exactly
     /// the trap §3.4 exists to warn about. It belongs with a story about resuming a partial window, not with
@@ -81,6 +88,7 @@ internal sealed class CdcChangesFunction : ICatalogTableFunction
         Params.Named("capture_instance", StringType.Default),
         Params.Named("images", StringType.Default),
         Params.Named("commit_timestamp", BooleanType.Default),
+        Params.Named("enable", BooleanType.Default),
     }, metadata: null);
 
     public ITableFunctionBinding Bind(RecordBatch args)
@@ -92,6 +100,7 @@ internal sealed class CdcChangesFunction : ICatalogTableFunction
         string? instance = CdcEnableFunction.Str(args, 3);
         string images = CdcEnableFunction.Str(args, 4) ?? CdcChangesPlan.ImagesAfter;
         bool commitTimestamp = CdcEnableFunction.Bool(args, 5) ?? false;
+        bool enable = CdcEnableFunction.Bool(args, 6) ?? false;
 
         if (string.IsNullOrWhiteSpace(source))
         {
@@ -103,7 +112,7 @@ internal sealed class CdcChangesFunction : ICatalogTableFunction
         ValidateImages(images);
         return new CdcChangesBinding(
             _catalog,
-            _catalog.CdcBindChanges(source!, instance, commitTimestamp,
+            _catalog.CdcBindChanges(source!, instance, commitTimestamp, enable,
                                     CdcChangesPlan.ValidatePosition(startingPosition, "starting_position"),
                                     CdcChangesPlan.ValidatePosition(endingPosition, "ending_position")));
     }
@@ -157,9 +166,14 @@ internal sealed class CdcChangesPlan
 
     internal const int PositionBytes = 21;
 
-    internal CdcChangesPlan(string captureInstance, string sourceSchema, string sourceTable, Schema output,
-                            string sql, byte[]? startingPosition, byte[]? endingPosition)
+    internal CdcChangesPlan(string source, string? explicitInstance, bool commitTimestamp, Schema output,
+                            byte[]? startingPosition, byte[]? endingPosition,
+                            string? captureInstance = null, string? sourceSchema = null,
+                            string? sourceTable = null, string? sql = null)
     {
+        Source = source;
+        ExplicitInstance = explicitInstance;
+        CommitTimestamp = commitTimestamp;
         CaptureInstance = captureInstance;
         SourceSchema = sourceSchema;
         SourceTable = sourceTable;
@@ -169,23 +183,40 @@ internal sealed class CdcChangesPlan
         EndingPosition = endingPosition;
     }
 
-    internal string CaptureInstance { get; }
+    /// <summary>What the caller named — kept so a DEFERRED plan can re-resolve itself at execute.</summary>
+    internal string Source { get; }
 
-    internal string SourceSchema { get; }
+    internal string? ExplicitInstance { get; }
 
-    internal string SourceTable { get; }
+    internal bool CommitTimestamp { get; }
 
     /// <summary>
-    /// <c>schema.table</c> — what the CALLER named, for the diagnostic log. ⚠ Worth keeping beside the
-    /// capture instance rather than logging the instance alone: slice 4 makes instance names opaque
-    /// (<c>fab_&lt;hash&gt;</c>), at which point a line naming only the instance tells an operator nothing.
+    /// Null on a DEFERRED plan — <c>enable := true</c> over a table that is not captured yet, where the
+    /// declared schema came from the SOURCE and the instance does not exist until execute (§15.7).
     /// </summary>
-    internal string SourceName => SourceSchema + "." + SourceTable;
+    internal string? CaptureInstance { get; }
+
+    internal string? SourceSchema { get; }
+
+    internal string? SourceTable { get; }
+
+    /// <summary>True once a capture instance is known and <see cref="Sql"/> is built.</summary>
+    internal bool IsResolved => CaptureInstance is not null;
+
+    /// <summary>
+    /// <c>schema.table</c> for the diagnostic log. ⚠ Worth keeping beside the capture instance rather than
+    /// logging the instance alone: a default enable now generates an OPAQUE name (<c>fab_&lt;hash&gt;</c>),
+    /// at which point a line naming only the instance tells an operator nothing.
+    /// </summary>
+    internal string SourceName => SourceSchema is null ? Source : SourceSchema + "." + SourceTable;
 
     internal Schema Output { get; }
 
-    /// <summary>The statement to execute, with the cursor predicate already folded in.</summary>
-    internal string Sql { get; }
+    /// <summary>
+    /// The statement to execute, with the cursor predicate already folded in. Null while
+    /// <see cref="IsResolved"/> is false.
+    /// </summary>
+    internal string? Sql { get; }
 
     internal byte[]? StartingPosition { get; }
 
@@ -316,18 +347,32 @@ internal sealed class CdcWindow
 internal sealed class CdcChangesBinding : ITableFunctionBinding
 {
     private readonly SqlServerCatalog _catalog;
-    private readonly CdcChangesPlan _plan;
+    private readonly Schema _declared;
     private readonly long _txnId;
+    private CdcChangesPlan _plan;
     private IArrowArrayStream? _stream;
+    private bool _enabled;
 
     internal CdcChangesBinding(SqlServerCatalog catalog, CdcChangesPlan plan)
     {
         _catalog = catalog;
         _plan = plan;
+        // ⚠ The DECLARED schema is fixed at BIND and never re-derived, even when the capture instance is
+        // created at execute. It is the contract with arrow_ingest, and the arrival check below is what
+        // proves the source-derived declaration matched what the TVF really returns.
+        _declared = plan.Output;
         _txnId = AmbientTransaction.Current;
     }
 
-    public Schema OutputSchema => _plan.Output;
+    public Schema OutputSchema => _declared;
+
+    /// <summary>
+    /// True only when THIS execution created a capture instance. ⚠ It is set in the EAGER part of
+    /// <see cref="Execute"/>, because the host reads it the moment <c>tablefn_execute</c> returns — an
+    /// async-iterator body has not begun by then, so a DDL placed there would happen with the flag already
+    /// read as false and the catalog never rebuilt.
+    /// </summary>
+    public bool SchemaMayChange => _enabled;
 
     /// <summary>
     /// False, and it is the honest answer rather than a gap: this binding hands DuckDB every column of the
@@ -347,9 +392,18 @@ internal sealed class CdcChangesBinding : ITableFunctionBinding
         {
             AmbientTransaction.Current = _txnId;
         }
+        // ⚠ THE DEFERRED ENABLE, and it belongs HERE for two independent reasons: bind must stay
+        // side-effect-free (an EXPLAIN must not capture a table), and SchemaMayChange is read the moment
+        // this method returns.
+        bool justCreated = false;
+        if (!_plan.IsResolved)
+        {
+            (_plan, justCreated) = _catalog.CdcEnableAndResolve(_plan);
+            _enabled |= justCreated;
+        }
         // EAGERLY: the pre-check's whole job is to replace the unattributable 313 with a sentence, and an
         // error raised here fails the statement instead of arriving mid-scan.
-        var window = _catalog.CdcResolveWindow(_plan);
+        var window = _catalog.CdcResolveWindow(_plan, justCreated);
         if (window.IsEmpty)
         {
             return Empty();
@@ -359,7 +413,7 @@ internal sealed class CdcChangesBinding : ITableFunctionBinding
         {
             // Also EAGERLY: a type that moved under us must fail the STATEMENT, not arrive as a mid-scan
             // "failed to read next batch from stream" wrapping our sentence.
-            CheckArrivedSchema(_plan.Output, stream.Schema);
+            CheckArrivedSchema(_declared, stream.Schema);
         }
         catch
         {
