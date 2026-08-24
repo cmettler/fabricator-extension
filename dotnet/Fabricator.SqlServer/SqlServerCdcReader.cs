@@ -89,6 +89,7 @@ internal sealed class CdcChangesFunction : ICatalogTableFunction
         Params.Named("images", StringType.Default),
         Params.Named("commit_timestamp", BooleanType.Default),
         Params.Named("enable", BooleanType.Default),
+        Params.Named("on_schema_change", StringType.Default),
     }, metadata: null);
 
     public ITableFunctionBinding Bind(RecordBatch args)
@@ -101,6 +102,7 @@ internal sealed class CdcChangesFunction : ICatalogTableFunction
         string images = CdcEnableFunction.Str(args, 4) ?? CdcChangesPlan.ImagesAfter;
         bool commitTimestamp = CdcEnableFunction.Bool(args, 5) ?? false;
         bool enable = CdcEnableFunction.Bool(args, 6) ?? false;
+        string onSchemaChange = CdcEnableFunction.Str(args, 7) ?? CdcChangesPlan.OnSchemaChangeError;
 
         if (string.IsNullOrWhiteSpace(source))
         {
@@ -110,9 +112,10 @@ internal sealed class CdcChangesFunction : ICatalogTableFunction
                 + "lists what is captured.");
         }
         ValidateImages(images);
+        ValidateOnSchemaChange(onSchemaChange);
         return new CdcChangesBinding(
             _catalog,
-            _catalog.CdcBindChanges(source!, instance, commitTimestamp, enable,
+            _catalog.CdcBindChanges(source!, instance, commitTimestamp, enable, onSchemaChange,
                                     CdcChangesPlan.ValidatePosition(startingPosition, "starting_position"),
                                     CdcChangesPlan.ValidatePosition(endingPosition, "ending_position")));
     }
@@ -140,6 +143,36 @@ internal sealed class CdcChangesFunction : ICatalogTableFunction
                   + "'after' (one row per change: insert, update_postimage, delete).");
     }
 
+    /// <summary>
+    /// Accepts <c>'error'</c> (the default) and <c>'ignore'</c>; names the modes that are designed but not
+    /// built rather than calling them invalid.
+    /// </summary>
+    /// <remarks>
+    /// ⚠ <c>resync</c> is §15.9's PREFERRED answer to schema drift and cannot exist before the snapshot leg
+    /// — it re-captures and re-snapshots, which is a heavy privileged act. <c>fill</c> and <c>null</c> both
+    /// need the two-instance alignment of §15.8. Refusing them BY NAME is what stops a caller reading the
+    /// design note and concluding the reader is broken.
+    /// </remarks>
+    private static void ValidateOnSchemaChange(string mode)
+    {
+        if (string.Equals(mode, CdcChangesPlan.OnSchemaChangeError, StringComparison.OrdinalIgnoreCase)
+            || string.Equals(mode, CdcChangesPlan.OnSchemaChangeIgnore, StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+        bool designed = string.Equals(mode, "resync", StringComparison.OrdinalIgnoreCase)
+                        || string.Equals(mode, "fill", StringComparison.OrdinalIgnoreCase)
+                        || string.Equals(mode, "null", StringComparison.OrdinalIgnoreCase);
+        throw new ArgumentException(
+            designed
+                ? $"cdc.changes: on_schema_change := '{mode}' is designed but not implemented yet - this "
+                  + "release offers 'error' (refuse when a DDL landed inside the window, the default) and "
+                  + "'ignore' (read anyway). 'resync' needs the initial-snapshot leg; 'fill' and 'null' need "
+                  + "the two-instance alignment."
+                : $"cdc.changes: on_schema_change := '{mode}' is not a value - this release accepts 'error' "
+                  + "(the default) and 'ignore'.");
+    }
+
     private static byte[]? Blob(RecordBatch? args, int col)
     {
         if (args is null || col >= args.ColumnCount || args.Length == 0)
@@ -158,6 +191,20 @@ internal sealed class CdcChangesPlan
 {
     internal const string ImagesAfter = "after";
 
+    /// <summary>Refuse the read when a DDL landed inside the window — the DEFAULT.</summary>
+    /// <remarks>
+    /// <b>⚠ LOUD BEFORE CLEVER (§15.11), and it is a deliberate trade.</b> The check costs ONE extra round
+    /// trip per non-empty read, and a window containing a DDL is uncommon for a polling consumer and normal
+    /// for a first read over a long retention window. Silence is the worse failure here: a column ADDED
+    /// mid-window is not captured, so the read simply omits it and a pipeline loses a field without anything
+    /// failing. A caller who has decided they do not care passes <c>'ignore'</c>, which also buys the round
+    /// trip back.
+    /// </remarks>
+    internal const string OnSchemaChangeError = "error";
+
+    /// <summary>Read anyway, and skip the check (and its round trip).</summary>
+    internal const string OnSchemaChangeIgnore = "ignore";
+
     /// <summary>The TVF's <c>@row_filter_option</c> for <see cref="ImagesAfter"/>. Excludes op 3 for free.</summary>
     internal const string RowFilterAll = "all";
 
@@ -166,7 +213,8 @@ internal sealed class CdcChangesPlan
 
     internal const int PositionBytes = 21;
 
-    internal CdcChangesPlan(string source, string? explicitInstance, bool commitTimestamp, Schema output,
+    internal CdcChangesPlan(string source, string? explicitInstance, bool commitTimestamp,
+                            string onSchemaChange, Schema output,
                             byte[]? startingPosition, byte[]? endingPosition,
                             string? captureInstance = null, string? sourceSchema = null,
                             string? sourceTable = null, string? sql = null)
@@ -174,6 +222,7 @@ internal sealed class CdcChangesPlan
         Source = source;
         ExplicitInstance = explicitInstance;
         CommitTimestamp = commitTimestamp;
+        OnSchemaChange = onSchemaChange;
         CaptureInstance = captureInstance;
         SourceSchema = sourceSchema;
         SourceTable = sourceTable;
@@ -189,6 +238,12 @@ internal sealed class CdcChangesPlan
     internal string? ExplicitInstance { get; }
 
     internal bool CommitTimestamp { get; }
+
+    internal string OnSchemaChange { get; }
+
+    /// <summary>Whether this read checks for a DDL inside its window before returning rows.</summary>
+    internal bool ChecksSchemaDrift =>
+        !string.Equals(OnSchemaChange, OnSchemaChangeIgnore, StringComparison.OrdinalIgnoreCase);
 
     /// <summary>
     /// Null on a DEFERRED plan — <c>enable := true</c> over a table that is not captured yet, where the
@@ -408,6 +463,9 @@ internal sealed class CdcChangesBinding : ITableFunctionBinding
         {
             return Empty();
         }
+        // EAGERLY too, and BEFORE the read: refusing after rows have started arriving would leave a consumer
+        // holding a partial window it has no way to distinguish from a complete one.
+        _catalog.CdcCheckSchemaDrift(_plan, window);
         var stream = _catalog.CdcExecuteChanges(_plan, window);
         try
         {

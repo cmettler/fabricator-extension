@@ -590,13 +590,19 @@ public sealed partial class SqlServerCatalog
           .Append(") AS [_position]")
           .Append(", ").Append(lsn).Append(" AS [_commit_lsn]")
           .Append(", ").Append(seq).Append(" AS [_seq_val]")
-          .Append(", ").Append(op).Append(" AS [_operation]");
+          .Append(", ").Append(op).Append(" AS [_operation]")
+          // ⚠ A PARAMETER, not the instance name spliced in — it is a sysname from server metadata, so
+          // splicing would be safe in practice and wrong in principle, and this costs nothing.
+          .Append(", CONVERT(varchar(128), @inst_name) AS [_capture_instance]");
         if (commitTime is not null)
         {
             sb.Append(", ").Append(commitTime).Append(" AS [_commit_timestamp]");
         }
         return sb.ToString();
     }
+
+    /// <summary>The number of metadata columns a read emits before the captured source columns.</summary>
+    private static int CdcMetadataColumnCount(bool commitTimestamp) => commitTimestamp ? 7 : 6;
 
     /// <summary>The metadata list over a capture instance's TVF, aliased <c>c</c> (and <c>m</c> for the join).</summary>
     private static string CdcRealMetadataSelectList(bool commitTimestamp) =>
@@ -632,7 +638,8 @@ public sealed partial class SqlServerCatalog
     /// rather than reading <c>sys.columns</c> is what keeps the declaration equal to what arrives.</para>
     /// </remarks>
     internal CdcChangesPlan CdcBindChanges(string source, string? captureInstance, bool commitTimestamp,
-                                           bool enable, byte[]? startingPosition, byte[]? endingPosition)
+                                           bool enable, string onSchemaChange, byte[]? startingPosition,
+                                           byte[]? endingPosition)
     {
         const string sql =
             "SET NOCOUNT ON; " +
@@ -660,7 +667,7 @@ public sealed partial class SqlServerCatalog
         {
             // enable := true over a table nobody has captured. Declare from the SOURCE and defer the DDL to
             // execute (§15.7) — bind must stay side-effect-free, or an EXPLAIN would capture a table.
-            return CdcDeclareDeferred(source, commitTimestamp, startingPosition, endingPosition);
+            return CdcDeclareDeferred(source, commitTimestamp, onSchemaChange, startingPosition, endingPosition);
         }
         if (rows.Count == 0)
         {
@@ -726,8 +733,8 @@ public sealed partial class SqlServerCatalog
                 + "records. Commit first, then read.");
         }
         return CdcDeclare(described, source, captureInstance, instance, rows[0][1] ?? "dbo",
-                          rows[0][2] ?? source, nullability, commitTimestamp, tvf, startingPosition,
-                          endingPosition);
+                          rows[0][2] ?? source, nullability, commitTimestamp, onSchemaChange, tvf,
+                          startingPosition, endingPosition);
     }
 
 
@@ -755,14 +762,17 @@ public sealed partial class SqlServerCatalog
     /// instance from an instance NAME, and reporting "not captured" for a typo would send the caller looking
     /// in the wrong place.</para>
     /// </remarks>
-    private CdcChangesPlan CdcDeclareDeferred(string source, bool commitTimestamp, byte[]? startingPosition,
-                                              byte[]? endingPosition)
+    private CdcChangesPlan CdcDeclareDeferred(string source, bool commitTimestamp, string onSchemaChange,
+                                              byte[]? startingPosition, byte[]? endingPosition)
     {
         var (schema, table) = SqlServerCdcSetup.SplitSource(source, "cdc.changes");
         string qualified = Quote(schema) + "." + Quote(table);
         string describeSql = "SELECT " + CdcSyntheticMetadataSelectList(commitTimestamp)
                              + ", s.* FROM " + qualified + " AS s";
-        var described = DescribeQuery(describeSql);
+        // ⚠ The same parameter list as the real describe: the synthetic statement uses only @inst_name, and
+        // the rest are declared-but-unused, which sp_executesql accepts. Passing one list keeps the two
+        // describes from drifting in the one place they could.
+        var described = DescribeQuery(describeSql, CdcDescribeParameters());
         if (described is null)
         {
             throw new ArgumentException(
@@ -770,7 +780,7 @@ public sealed partial class SqlServerCatalog
                 + "it is not a table this connection can read. Change data capture is enabled per TABLE, so "
                 + "the source has to be one; a capture-instance name cannot be enabled.");
         }
-        int meta = commitTimestamp ? 6 : 5;
+        int meta = CdcMetadataColumnCount(commitTimestamp);
         var fields = new List<Field>(described.FieldsList.Count);
         for (int i = 0; i < described.FieldsList.Count; i++)
         {
@@ -778,7 +788,7 @@ public sealed partial class SqlServerCatalog
             bool derived = i < meta && !(commitTimestamp && i == meta - 1);
             fields.Add(new Field(f.Name, f.DataType, nullable: !derived));
         }
-        return new CdcChangesPlan(source, explicitInstance: null, commitTimestamp,
+        return new CdcChangesPlan(source, explicitInstance: null, commitTimestamp, onSchemaChange,
                                   new Schema(fields, metadata: null), startingPosition, endingPosition);
     }
 
@@ -805,7 +815,7 @@ public sealed partial class SqlServerCatalog
         Log.LogDebug("cdc changes {Source}: enable := true {Outcome}", plan.Source,
                      created ? "created a capture instance" : "found the table already captured");
         var resolved = CdcBindChanges(plan.Source, plan.ExplicitInstance, plan.CommitTimestamp, enable: false,
-                                      plan.StartingPosition, plan.EndingPosition);
+                                      plan.OnSchemaChange, plan.StartingPosition, plan.EndingPosition);
         return (resolved, created);
     }
 
@@ -822,10 +832,10 @@ public sealed partial class SqlServerCatalog
     private static CdcChangesPlan CdcDeclare(Schema described, string source, string? explicitInstance,
                                              string instance, string sourceSchema, string sourceTable,
                                              IReadOnlyDictionary<string, bool> nullability,
-                                             bool commitTimestamp, string tvf,
+                                             bool commitTimestamp, string onSchemaChange, string tvf,
                                              byte[]? startingPosition, byte[]? endingPosition)
     {
-        int meta = commitTimestamp ? 6 : 5;
+        int meta = CdcMetadataColumnCount(commitTimestamp);
         string[] expected = { "__$start_lsn", "__$seqval", "__$operation", "__$update_mask" };
         if (described.FieldsList.Count < meta + expected.Length)
         {
@@ -870,7 +880,7 @@ public sealed partial class SqlServerCatalog
                      + " FROM " + tvf + "(@from_lsn, @to_lsn, @row_filter) AS c"
                      + (commitTimestamp ? CdcCommitTimeJoinSql : string.Empty)
                      + CdcCursorPredicateSql(startingPosition, endingPosition);
-        return new CdcChangesPlan(source, explicitInstance, commitTimestamp,
+        return new CdcChangesPlan(source, explicitInstance, commitTimestamp, onSchemaChange,
                                   new Schema(fields, metadata: null), startingPosition, endingPosition,
                                   captureInstance: instance, sourceSchema: sourceSchema,
                                   sourceTable: sourceTable, sql: sql);
@@ -956,6 +966,7 @@ public sealed partial class SqlServerCatalog
         {
             Value = CdcChangesPlan.RowFilterAll,
         },
+        new SqlParameter("@inst_name", System.Data.SqlDbType.VarChar, 128) { Value = string.Empty },
     };
 
     // binary(10), matching the TVF's own parameter types and the change table's columns. Declared rather
@@ -1101,6 +1112,77 @@ public sealed partial class SqlServerCatalog
         return new CdcWindow(fromLsn, toLsn, plan.StartingPosition, plan.EndingPosition);
     }
 
+
+    /// <summary>
+    /// Refuses the read when a DDL landed INSIDE the window — <c>on_schema_change := 'error'</c>, the
+    /// default. Does nothing under <c>'ignore'</c>.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>⚠⚠ WHAT IT CATCHES, and why silence is the worse failure (§15.11).</b> MEASURED against the
+    /// rig, all three DDL kinds land in <c>cdc.ddl_history</c> with an <c>ddl_lsn</c> directly comparable to
+    /// the window bounds, and <c>required_column_update = 1</c> for exactly one of them:</para>
+    /// <list type="bullet">
+    ///   <item><b>ADD COLUMN</b> (<c>required_column_update = 0</c>) — NOT captured by this instance, so the
+    ///     read simply OMITS it. A pipeline loses a field and nothing fails. This is the case the check
+    ///     exists for.</item>
+    ///   <item><b>ALTER COLUMN &lt;type&gt;</b> (<c>required_column_update = 1</c>) — propagated to the
+    ///     change table ASYNCHRONOUSLY (§15.6), so the type declared at bind may already be stale. The
+    ///     arrival check catches it once the capture job has acted; this catches it BEFORE.</item>
+    ///   <item><b>DROP COLUMN</b> (<c>0</c>) — the column stays in the change table and reads NULL from
+    ///     that point, which is the mildest of the three and still a shape change worth naming.</item>
+    /// </list>
+    /// <para><b>⚠ IT COSTS ITS OWN ROUND TRIP, and that is forced rather than lazy.</b> It cannot join the
+    /// window-resolution batch: that batch has to survive CDC being DISABLED between bind and execute (it
+    /// carries the guard for exactly that), and a batch REFERENCING <c>cdc.ddl_history</c> fails at COMPILE
+    /// when the schema is gone — turning a precise message into <c>Invalid object name</c>. So the check is
+    /// its own statement, taken only when the window is non-empty and the mode is not <c>'ignore'</c>.</para>
+    /// <para>⚠ The range is <c>(from, to]</c>: strictly after the cursor, through the window end — the same
+    /// half-open span the rows themselves come from. A DDL at exactly <c>from</c> was already reflected in
+    /// whatever the previous read declared.</para>
+    /// <para>⚠ It reports the FIRST DDL and the COUNT rather than all of them. The remedy is the same
+    /// whichever one it is, and a message that grows with the table's history stops being read.</para>
+    /// </remarks>
+    internal void CdcCheckSchemaDrift(CdcChangesPlan plan, CdcWindow window)
+    {
+        if (!plan.ChecksSchemaDrift || window.IsEmpty)
+        {
+            return;
+        }
+        const string sql =
+            "SET NOCOUNT ON; " +
+            "SELECT CAST(COUNT(*) AS varchar(16)) AS ddl_count, " +
+            "       CONVERT(varchar(30), MIN(d.ddl_lsn), 1) AS first_lsn, " +
+            "       CAST(MAX(CAST(d.required_column_update AS int)) AS varchar(1)) AS any_type_change, " +
+            "       CAST(MIN(LEFT(d.ddl_command, 300)) AS varchar(300)) AS first_command " +
+            "FROM cdc.ddl_history AS d " +
+            "JOIN cdc.change_tables AS ct ON ct.source_object_id = d.source_object_id " +
+            "WHERE ct.capture_instance = @inst AND d.ddl_lsn > @from_lsn AND d.ddl_lsn <= @to_lsn;";
+        var rows = ReadMetadataRows(sql, 4, new[]
+        {
+            new SqlParameter("@inst", CdcRequireResolved(plan).Instance),
+            CdcBinaryParam("@from_lsn", window.FromLsn),
+            CdcBinaryParam("@to_lsn", window.ToLsn),
+        });
+        if (rows.Count == 0 || rows[0][0] == "0")
+        {
+            return;
+        }
+        int count = int.TryParse(rows[0][0], System.Globalization.NumberStyles.Integer,
+                                 System.Globalization.CultureInfo.InvariantCulture, out int n) ? n : 1;
+        bool typeChange = rows[0][2] == "1";
+        throw new InvalidOperationException(
+            $"cdc.changes: {count} schema change{(count == 1 ? string.Empty : "s")} landed INSIDE this "
+            + $"window on '{plan.SourceName}' - the columns this read declared may not describe all of it. "
+            + $"The first is at {rows[0][1] ?? "?"}: {rows[0][3] ?? "(command not recorded)"}. "
+            + (typeChange
+                ? "At least one changed a CAPTURED column's TYPE, which SQL Server propagates to the change "
+                  + "table asynchronously, so the declared types may already be stale. "
+                : "A column ADDED after capture began is NOT captured, so this read would simply omit it; a "
+                  + "DROPPED one stays in the change table and reads NULL from that point. ")
+            + "Read up to the change and re-bind (a fresh statement re-reads the schema), or pass "
+            + "on_schema_change := 'ignore' to read anyway.");
+    }
+
     /// <summary>Runs the change read and streams it.</summary>
     /// <remarks>
     /// <para><b>⚠ POOLED, not the transaction's pinned connection — and unlike every other read on this
@@ -1126,6 +1208,7 @@ public sealed partial class SqlServerCatalog
             CdcBinaryParam("@from_lsn", window.FromLsn),
             CdcBinaryParam("@to_lsn", window.ToLsn),
             new("@row_filter", System.Data.SqlDbType.NVarChar, 30) { Value = CdcChangesPlan.RowFilterAll },
+            new("@inst_name", System.Data.SqlDbType.VarChar, 128) { Value = CdcRequireResolved(plan).Instance },
         };
         if (window.StartingPosition is { } starting)
         {

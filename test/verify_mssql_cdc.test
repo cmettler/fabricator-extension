@@ -4,8 +4,8 @@
 #
 # Slices 1-3 of docs/mssql-cdc.md: the ServerProfile.SupportsCdc gate, the appended `cdc` schema, the four
 # read-only functions (§1-§8), the four setup functions and the ABI v81 flag they exercise (§10-§14), and
-# THE READER, cdc.changes (§15-§21), and slice 4 - the generated capture-instance name, the ownership
-# marker and enable := true (§22-§25).
+# THE READER, cdc.changes (§15-§21), slice 4 - the generated capture-instance name, the ownership marker
+# and enable := true (§22-§25) - and slice 5, _capture_instance and the in-window DDL check (§26-§27).
 #
 # ⚠ SERVICE TIER — it needs a real SQL Server, and unlike the rest of that tier it also needs SQL SERVER
 #   AGENT (docker-compose sets MSSQL_AGENT_ENABLED=true). §8's agent assertion is the ONLY thing in either
@@ -82,7 +82,7 @@ statement ok
 SELECT fabricator_exec('${MSSQL_TESTDB_DSN}', 'IF OBJECT_ID(''dbo.cdc_zz_noidx'') IS NOT NULL DROP TABLE dbo.cdc_zz_noidx;');
 
 statement ok
-SELECT fabricator_exec('${MSSQL_TESTDB_DSN}', 'IF OBJECT_ID(''dbo.cdc_gen'') IS NOT NULL DROP TABLE dbo.cdc_gen; IF OBJECT_ID(''dbo.cdc_own'') IS NOT NULL DROP TABLE dbo.cdc_own; IF OBJECT_ID(''dbo.cdc_auto'') IS NOT NULL DROP TABLE dbo.cdc_auto; IF OBJECT_ID(''dbo.gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg'') IS NOT NULL DROP TABLE dbo.gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg;');
+SELECT fabricator_exec('${MSSQL_TESTDB_DSN}', 'IF OBJECT_ID(''dbo.cdc_gen'') IS NOT NULL DROP TABLE dbo.cdc_gen; IF OBJECT_ID(''dbo.cdc_own'') IS NOT NULL DROP TABLE dbo.cdc_own; IF OBJECT_ID(''dbo.cdc_auto'') IS NOT NULL DROP TABLE dbo.cdc_auto; IF OBJECT_ID(''dbo.cdc_ddl'') IS NOT NULL DROP TABLE dbo.cdc_ddl; IF OBJECT_ID(''dbo.gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg'') IS NOT NULL DROP TABLE dbo.gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg;');
 
 statement ok
 ATTACH '${MSSQL_TESTDB_DSN}' AS c0 (TYPE fabricator);
@@ -584,6 +584,7 @@ _position	BLOB
 _commit_lsn	BLOB
 _seq_val	BLOB
 _operation	INTEGER
+_capture_instance	VARCHAR
 id	INTEGER
 v	VARCHAR
 
@@ -714,8 +715,14 @@ matches 2 capture instances
 
 # …and naming one resolves it. The positive control for the refusal: without it the error above would pass
 # equally on a build that refused every read.
+#
+# ⚠ on_schema_change := 'ignore' is REQUIRED here and the reason is instructive: §7 ran
+# `ALTER TABLE dbo.cdc_probe ADD extra INT NULL` while dbo_cdc_probe was capturing, so a DDL sits INSIDE
+# this instance's window and the DEFAULT check (§27) refuses it. That is the check working — the added
+# column really is absent from what this instance captures — and it is why the row needs the opt-out rather
+# than a different table.
 query I
-SELECT count(*) FROM c1.cdc.changes('dbo.cdc_probe', capture_instance := 'dbo_cdc_probe');
+SELECT count(*) FROM c1.cdc.changes('dbo.cdc_probe', capture_instance := 'dbo_cdc_probe', on_schema_change := 'ignore');
 ----
 0
 
@@ -948,6 +955,7 @@ _position	BLOB
 _commit_lsn	BLOB
 _seq_val	BLOB
 _operation	INTEGER
+_capture_instance	VARCHAR
 id	INTEGER
 v	VARCHAR
 
@@ -993,6 +1001,116 @@ SELECT count(*) FROM c1.cdc.tables() WHERE source_table = 'cdc_auto';
 ----
 1
 
+# ═══ §26  _capture_instance is on every row (slice 5) ════════════════════════════════════════════════
+# docs §15.8. It is emitted ALWAYS rather than behind a flag, and adding it NOW is the point: an output
+# column added later breaks every `INSERT INTO staging SELECT * FROM cdc.changes(...)` in existence, and the
+# reader is two days old.
+#
+# ⚠ WHAT IT IS FOR is slice 7, not this slice. When a read spans a capture-instance BOUNDARY, a NULL in a
+# column that did not exist in the older instance is indistinguishable from a genuine NULL — unless the row
+# says which instance produced it. With ONE instance it is constant, which is exactly why the alignment and
+# NULL-fill machinery §15.12 put in this slice was DEFERRED to the one where it can be decided.
+
+# ⚠ Its POSITION in the declared schema is pinned by §16, not repeated here — one expectation block for the
+# column list, so the two cannot drift.
+query TI
+SELECT DISTINCT _capture_instance, count(*) OVER () FROM c1.cdc.changes('dbo.cdc_setup');
+----
+dbo_cdc_setup	5
+
+# ═══ §27  on_schema_change — a DDL inside the window is LOUD by default ═══════════════════════════════
+# docs §15.11. MEASURED that all three DDL kinds land in cdc.ddl_history with an ddl_lsn directly comparable
+# to the window bounds, and that required_column_update is 1 for exactly the type change.
+#
+# ⚠⚠ THE CASE IT EXISTS FOR IS THE SILENT ONE: a column ADDED after capture began is NOT captured, so the
+# read simply OMITS it and a pipeline loses a field with nothing failing. A DROP leaves the column reading
+# NULL; an ALTER COLUMN <type> is propagated to the change table ASYNCHRONOUSLY, so the type declared at bind
+# may already be stale.
+
+statement ok
+SELECT fabricator_exec('c1', 'IF OBJECT_ID(''dbo.cdc_ddl'') IS NOT NULL DROP TABLE dbo.cdc_ddl; CREATE TABLE dbo.cdc_ddl(id INT NOT NULL PRIMARY KEY, v NVARCHAR(20) NULL);');
+
+statement ok
+SELECT target, changed FROM c1.cdc.enable('dbo.cdc_ddl');
+
+statement ok
+SELECT fabricator_exec('c1', 'INSERT INTO dbo.cdc_ddl VALUES (1, N''one'');');
+
+statement ok
+SELECT fabricator_exec('c1', 'DECLARE @i int = 0; WHILE @i < 60 AND NOT EXISTS (SELECT 1 FROM cdc.' || (SELECT capture_instance FROM c1.cdc.tables() WHERE source_table = 'cdc_ddl') || '_CT HAVING COUNT(*) >= 1 AND MAX(__$start_lsn) <= sys.fn_cdc_get_max_lsn()) BEGIN WAITFOR DELAY ''00:00:01''; SET @i = @i + 1; END');
+
+# ⚠⚠ THE POSITIVE CONTROL, AND IT IS THE LOAD-BEARING HALF OF THIS SECTION. With no DDL in the window the
+# DEFAULT mode reads normally — without this row, "the check refuses" would pass equally on a build that
+# refused every read, or on one where cdc.ddl_history simply could not be queried.
+query TI
+SELECT _change_type, id FROM c1.cdc.changes('dbo.cdc_ddl');
+----
+insert	1
+
+# Now put a DDL inside the window and read again.
+# ⚠ TWO calls, not one batch: T-SQL compiles a batch up front, so an INSERT naming a column the SAME batch
+# just added fails with `207: Invalid column name`. Nothing to do with CDC — it is what a `GO` is for.
+statement ok
+SELECT fabricator_exec('c1', 'ALTER TABLE dbo.cdc_ddl ADD extra INT NULL;');
+
+statement ok
+SELECT fabricator_exec('c1', 'INSERT INTO dbo.cdc_ddl (id, v, extra) VALUES (2, N''two'', 9);');
+
+statement ok
+SELECT fabricator_exec('c1', 'DECLARE @i int = 0; WHILE @i < 60 AND NOT EXISTS (SELECT 1 FROM cdc.' || (SELECT capture_instance FROM c1.cdc.tables() WHERE source_table = 'cdc_ddl') || '_CT HAVING COUNT(*) >= 2 AND MAX(__$start_lsn) <= sys.fn_cdc_get_max_lsn()) BEGIN WAITFOR DELAY ''00:00:01''; SET @i = @i + 1; END');
+
+statement error
+SELECT count(*) FROM c1.cdc.changes('dbo.cdc_ddl');
+----
+schema change
+
+# The message names the STATEMENT, not just that something happened — the remedy depends on which DDL it
+# was, and a caller cannot look it up without the text.
+statement error
+SELECT count(*) FROM c1.cdc.changes('dbo.cdc_ddl');
+----
+ALTER TABLE dbo.cdc_ddl ADD extra INT NULL
+
+# 'ignore' reads anyway. ⚠ The added column is ABSENT from the result — that is not a bug, it is precisely
+# what the refusal was warning about: sp_cdc_enable_table fixed the captured set when the instance was
+# created, so `extra` is not in the change table and no read of this instance can produce it.
+query TIT
+SELECT _change_type, id, v FROM c1.cdc.changes('dbo.cdc_ddl', on_schema_change := 'ignore') ORDER BY _position;
+----
+insert	1	one
+insert	2	two
+
+query I
+SELECT count(*) FROM (DESCRIBE SELECT * FROM c1.cdc.changes('dbo.cdc_ddl', on_schema_change := 'ignore')) WHERE column_name = 'extra';
+----
+0
+
+# ⚠ AND THE WINDOW IS WHAT MATTERS, NOT THE TABLE'S HISTORY: a read that STARTS after the DDL is clean
+# again, because the shape it declares describes all of what it returns. Without this row the check would be
+# indistinguishable from "this table is poisoned forever".
+statement ok
+SET VARIABLE cdc_ddl_end = (SELECT c1.cdc.max_position());
+
+statement ok
+PREPARE cdc_after_ddl AS SELECT count(*) AS n FROM c1.cdc.changes('dbo.cdc_ddl', starting_position := ?);
+
+query I
+EXECUTE cdc_after_ddl(getvariable('cdc_ddl_end'));
+----
+0
+
+# The modes that are DESIGNED but not built are refused BY NAME, so a reader of the design note is told
+# which slice they are waiting for rather than being told their spelling is wrong.
+statement error
+SELECT count(*) FROM c1.cdc.changes('dbo.cdc_ddl', on_schema_change := 'resync');
+----
+designed but not implemented yet
+
+statement error
+SELECT count(*) FROM c1.cdc.changes('dbo.cdc_ddl', on_schema_change := 'nonsense');
+----
+is not a value
+
 # ═══ §9  Teardown — leave NO CDC-enabled table behind ══════════════════════════════════════════════════
 # Load-bearing: the capture job keeps scanning a CDC-enabled database between runs, and the next run's §3
 # would then find max_position() non-NULL and fail for a reason unrelated to the code.
@@ -1011,7 +1129,7 @@ statement ok
 SELECT fabricator_exec('c1', 'IF OBJECT_ID(''dbo.cdc_zz_noidx'') IS NOT NULL DROP TABLE dbo.cdc_zz_noidx;');
 
 statement ok
-SELECT fabricator_exec('c1', 'IF OBJECT_ID(''dbo.cdc_gen'') IS NOT NULL DROP TABLE dbo.cdc_gen; IF OBJECT_ID(''dbo.cdc_own'') IS NOT NULL DROP TABLE dbo.cdc_own; IF OBJECT_ID(''dbo.cdc_auto'') IS NOT NULL DROP TABLE dbo.cdc_auto; IF OBJECT_ID(''dbo.gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg'') IS NOT NULL DROP TABLE dbo.gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg;');
+SELECT fabricator_exec('c1', 'IF OBJECT_ID(''dbo.cdc_gen'') IS NOT NULL DROP TABLE dbo.cdc_gen; IF OBJECT_ID(''dbo.cdc_own'') IS NOT NULL DROP TABLE dbo.cdc_own; IF OBJECT_ID(''dbo.cdc_auto'') IS NOT NULL DROP TABLE dbo.cdc_auto; IF OBJECT_ID(''dbo.cdc_ddl'') IS NOT NULL DROP TABLE dbo.cdc_ddl; IF OBJECT_ID(''dbo.gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg'') IS NOT NULL DROP TABLE dbo.gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg;');
 
 # Back to §3's state, which is also the cheapest possible check that the teardown really disabled it.
 query I

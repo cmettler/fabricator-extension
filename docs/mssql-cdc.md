@@ -1,14 +1,15 @@
-# Log-based change capture for SQL Server — slices 1 + 2 + 3 + 4 BUILT
+# Log-based change capture for SQL Server — slices 1 + 2 + 3 + 4 + 5 BUILT
 
-> **Status: slices 1 (§13), 2 (§14), 3 — THE READER (§16) — and 4 (§17) are BUILT and gated.**
+> **Status: slices 1 (§13), 2 (§14), 3 — THE READER (§16) — 4 (§17) and 5 (§18) are BUILT and gated.**
 >
 > **⚠ READ §16 FIRST for what shipped**, and §15 for the design it was built from. §15 supersedes §4's
 > recommendation and most of §7 and corrects three things this document previously asserted; §16 corrects
 > two more — §3.4's cursor idiom does not run as printed, and §15.7's "the first call always returns zero
 > rows" is false in an already-capturing database.
 >
-> **What remains** is slices 5–9 of §15.12: name-alignment across a schema change, DDL detection in the
-> window, the two-instance boundary, the snapshot leg, and the timestamp bounds.
+> **What remains** is the two-instance boundary (with the name-alignment and widening §18.1 deferred into
+> it), the snapshot leg, `images := 'both'` and the timestamp bounds. ⚠ §18.1 records why slice 5 was
+> re-scoped and slice 6 partly absorbed — read it before trusting §15.12's ordering.
 >
 > ⚠ The original header read *"DESIGN ONLY, 2026-08-23. No code, no ABI, no gate."* — true when written,
 > and superseded by slice 2's ABI v81.
@@ -2058,9 +2059,9 @@ The user's question. What the reader can do about it, now that §15.6 has the ma
 | **2** | ✅ BUILT — §14 | setup from SQL |
 | **3** | ✅ **BUILT 2026-08-24 — §16.** The reader: `ICatalogTableFunction`, C#-owned connection, ONE capture instance, `images := 'after'`, explicit bounds, the §2.1 pre-check, the 21-byte cursor | the smallest correct reader. §15.1/§15.2/§15.7 |
 | **4** | ✅ **BUILT 2026-08-24 — §17.** Generated hidden instance name + the EP ownership marker + `enable := true` deferred to execute | makes the surface "easy to use"; independent of 5–7. §15.4/§15.5/§15.7 |
-| **5** | name-alignment with widening + `_capture_instance` | buys slice 7 nearly free. §15.8 |
-| **6** | DDL detection in-window; `on_schema_change := 'error'` | loud before it is clever. §15.11 |
-| **7** | the two-instance boundary: derive `B`, split the window, `UNION ALL` by name | needs 3 and 5 |
+| **5** | ✅ **PARTLY BUILT 2026-08-25 — §18.** `_capture_instance` shipped; name-alignment and widening DEFERRED into slice 7 (§18.1 says why), and slice 6's DDL detection pulled forward | buys slice 7 nearly free. §15.8 |
+| **6** | ✅ **BUILT 2026-08-25 — §18.3**, pulled forward into slice 5. `on_schema_change := 'error'` (default) / `'ignore'` | loud before it is clever. §15.11 |
+| **7** | the two-instance boundary: derive `B`, split the window, `UNION ALL` by name — **plus the name-alignment and `WidenArrowType` deferred from slice 5** | needs 3 and 5 |
 | **8** | `include := 'snapshot'` / `'snapshot+changes'` (§5), then `on_schema_change := 'resync'` | the resync story needs the snapshot leg first |
 | **9** | `starting_timestamp` / `ending_timestamp`; `images := 'both'` + the mask placeholder | additive to the same reader |
 | — | ~~`on_schema_change := 'fill'`~~ | last, if ever — §15.9 records why |
@@ -2323,7 +2324,7 @@ FROM db.cdc.changes('dbo.orders', enable := true);
 
 ### 17.1 The name is generated, and it removes a defect
 
-`fab_` plus 16 hex characters of SHA-256 over `schema.table` — **20 characters, whatever the table is
+`fab_` plus 16 hex characters of MD5 over `schema.table` — **20 characters, whatever the table is
 called**.
 
 **⚠⚠ THE DEFECT, MEASURED both ways.** `sp_cdc_enable_table`'s own default is `<schema>_<table>` and the
@@ -2333,12 +2334,23 @@ the user never chose, whose only escape was the very knob we wanted to hide. The
 with a generated name. Both legs are gated (§22), with the table's own length as the positive control:
 without it, the passing row would prove nothing about LENGTH.
 
-**⚠⚠ SHA-256, NEVER `string.GetHashCode()`.** .NET randomizes string hash codes PER PROCESS, so a
-GetHashCode-derived name would differ on every run — the opposite of the determinism this exists for, and it
+**⚠⚠ ANY STABLE DIGEST WILL DO — but NEVER `string.GetHashCode()`.** .NET randomizes string hash codes PER
+PROCESS, so a GetHashCode-derived name would differ on every run — the opposite of the determinism this exists for, and it
 would present as a caching bug. ⚠ The gate cannot catch that specific mistake: within ONE process
 `GetHashCode` is stable, and sqllogictest gives one process. What it does catch is a generator that is not a
 function of the name at all (a GUID, a timestamp, a counter), by disabling and re-enabling and demanding the
 same name back.
+
+**MD5 rather than SHA-256 (user, 2026-08-25), and why it is a free choice is worth stating**: this is a
+NAME, not a security boundary. Nothing authenticates or authorises on it, only 64 of its bits are kept, and
+a collision costs a REFUSAL (`this capture instance already exists`) rather than a wrong answer, because SQL
+Server enforces instance-name uniqueness.
+
+**⚠ CHANGING THE DIGEST IS SAFE, and that falls out of §17.3 rather than luck.** Idempotence keys on the
+TABLE, so the generated name is computed only when CREATING — a table already captured under a name from a
+different digest is still found, reported and read. No migration, no orphan. ⚠ The corollary is a standing
+rule: **never PARSE the name to recover the table.** `cdc.tables()` and the `fabricator_source` marker are
+the mapping.
 
 **⚠ The input is NOT lower-cased, deliberately.** Normalising case would make two genuinely different tables
 on a case-SENSITIVE collation (`dbo.Orders`, `dbo.orders`) collide on one instance name, and the second
@@ -2457,3 +2469,87 @@ with the flag already read as false.
   the window resolution answers "just created ⇒ empty" on the first call and "floor not established ⇒ retry"
   on any later one — neither of which executes the read. The chain is three links long, which is exactly why
   it is written down rather than trusted silently. Committing first makes all of it moot.
+
+---
+
+## 18. Slice 5 — `_capture_instance` AND THE IN-WINDOW DDL CHECK, AS BUILT (2026-08-25)
+
+C#-only, no ABI change. Gate: `verify_mssql_cdc` **239 → 268**, two mutants, each killed at its own
+assertion.
+
+```sql
+FROM db.cdc.changes('dbo.orders'
+      …
+      [, on_schema_change := 'error'])   -- 'error' (default) | 'ignore'
+```
+
+### 18.1 ⚠⚠ THE SLICE WAS RE-SCOPED, and the reasons are the useful part
+
+§15.12 defined slice 5 as *"name-alignment with widening + `_capture_instance`"*. Only one of those three
+was built, and one of slice 6's was pulled forward:
+
+| §15.12 | what happened | why |
+|---|---|---|
+| `_capture_instance` | **BUILT** | an output column added LATER breaks every `INSERT INTO staging SELECT * FROM cdc.changes(…)` in existence. The reader was two days old; this was the cheapest moment it will ever be |
+| name-alignment + NULL-fill | **DEFERRED to slice 7** | with ONE instance it would replace a LOUD failure with a silently all-NULL column — and §15.9's own reasoning says NULL asserts *"this row had no value"* when the truth is *"we never captured it"*. It is decidable only when `_capture_instance` VARIES, which needs two instances |
+| `WidenArrowType` | **DEFERRED to slice 7** | no caller. Widening unifies TWO declared schemas at bind; with one describe there is nothing to unify, and building it now would be an untestable helper |
+| — | **slice 6's DDL detection PULLED FORWARD** | cheap, independent, and it delivers the signal slice 5 was meant to make decidable: *the shape I declared may not describe this whole window* |
+
+**The transferable point: an "infrastructure" slice whose only visible behaviour is a REGRESSION is not
+ready to be built.** NULL-filling here would have been strictly worse than the failure it replaced, and the
+slice list could not see that because it was written before the reader existed to make the failure loud.
+
+### 18.2 `_capture_instance`
+
+Emitted on EVERY row, always, between `_operation` and the optional `_commit_timestamp`. It is the instance
+name as a constant, passed as a PARAMETER rather than spliced (it is a `sysname` from server metadata, so
+splicing would be safe in practice and wrong in principle, and the parameter costs nothing).
+
+⚠ With one instance it is constant and decides nothing — its job starts at slice 7. It ships now purely
+because adding an output column is a breaking change and this was the cheapest moment.
+
+### 18.3 The in-window DDL check
+
+At execute, after the window is resolved and BEFORE any row is read, `cdc.ddl_history` is asked whether a
+DDL landed in `(from, to]`. If one did, the read is REFUSED, naming the count, the first command, its LSN
+and whether any of them changed a captured column's TYPE.
+
+**⚠⚠ THE CASE IT EXISTS FOR IS THE SILENT ONE.** MEASURED, all three kinds land in `cdc.ddl_history` with an
+`ddl_lsn` directly comparable to the window bounds, and `required_column_update = 1` for exactly one:
+
+```
+0x0000002D000006280001  rcu=0  ALTER TABLE dbo.t ADD c INT NULL
+0x0000002D00000630000E  rcu=1  ALTER TABLE dbo.t ALTER COLUMN a NVARCHAR(200)
+0x0000002D000006380011  rcu=0  ALTER TABLE dbo.t DROP COLUMN b
+```
+
+- **ADD COLUMN** — NOT captured by this instance, so the read simply OMITS it. **A pipeline loses a field
+  and nothing fails.** This is the one that justifies a default of `error`.
+- **ALTER COLUMN &lt;type&gt;** — propagated to the change table ASYNCHRONOUSLY (§15.6), so the type declared
+  at bind may already be stale. §16's arrival check catches it once the capture job has acted; this catches
+  it before.
+- **DROP COLUMN** — the column stays in the change table and reads NULL from that point. The mildest, and
+  still a shape change worth naming.
+
+**⚠ THE DEFAULT IS `error`, AND IT COSTS A ROUND TRIP.** Loud before clever (§15.11): a window containing a
+DDL is uncommon for a polling consumer and normal for a first read over a long retention window, and silence
+is the worse failure. `'ignore'` reads anyway and buys the round trip back.
+
+**⚠ IT CANNOT SHARE THE WINDOW-RESOLUTION BATCH, and that is forced rather than lazy.** That batch has to
+survive CDC being DISABLED between bind and execute — it carries the guard for exactly that — and a batch
+REFERENCING `cdc.ddl_history` fails at COMPILE when the schema is gone, turning a precise message into
+`Invalid object name`. Same fact the suite's §0 teardown is built around.
+
+**⚠ THE RANGE IS THE POINT, AND A MUTANT PROVES IT.** Dropping the `ddl_lsn > @from AND ddl_lsn <= @to`
+predicate — checking the table's whole DDL history instead — leaves the suite failing at *"a read that
+STARTS after the DDL is clean again"*. Without the window scope the check would read as "this table is
+poisoned forever", which no consumer could act on.
+
+### 18.4 What the gate does NOT cover
+
+- **The round-trip cost.** Nothing measures it; it is one small metadata query on a read that already makes
+  two.
+- **A DDL landing between the check and the read.** The check is a snapshot, not a lock — a DDL committed in
+  that microsecond window is missed, and §16's arrival check is what stands behind it for the type case.
+- **`resync` / `fill` / `null`.** Refused BY NAME so a reader of §15.9 is told which slice they are waiting
+  for rather than that their spelling is wrong.

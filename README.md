@@ -104,7 +104,7 @@ See [SQL Server external tables on S3](#sql-server-external-tables-on-s3).
 | | **Custom C# aggregates** (UDAF) → `db.schema.agg(x)` in `GROUP BY` / parallel / `OVER(…)`; opt-in disk-spill (`SupportsSpill`) | ✅ |
 | **Change data capture** | `db.cdc.tables()` / `max_position()` / `min_position()` / `health()` — inspect SQL Server CDC | ✅ SQL Server only (not Fabric / Synapse) |
 | | `db.cdc.enable_database()` / `enable()` / `disable()` / `capture_now()` — set capture up from SQL, with a generated capture-instance name; the catalog refreshes itself | ✅ |
-| | `db.cdc.changes(...)` — a resumable change-stream reader with a 21-byte cursor, a retention pre-check and `enable := true` | ✅ |
+| | `db.cdc.changes(...)` — a resumable change-stream reader with a 21-byte cursor, a retention pre-check, `enable := true` and an in-window schema-change check | ✅ |
 | | An initial-snapshot leg (`include := 'snapshot+changes'`), before-images, timestamp bounds | ❌ designed, not built (`docs/mssql-cdc.md` §15.12) |
 | **Monitoring** | `db.dbo.fabricator_session_tag(k, v)` — tag a transaction's connection so Fabric query insights can attribute its cost | ✅ (see dbt caveat) |
 | | `application_name` on the secret → `program_name` on every statement (run-level attribution) | ✅ |
@@ -854,7 +854,7 @@ with no message queue anywhere in it. They live in the catalog's `cdc` schema, s
 | `db.cdc.enable('<schema>.<table>' [, capture_instance :=] [, columns :=] [, role :=] [, index :=] [, filegroup :=] [, net :=])` | `sys.sp_cdc_enable_table`. With no `capture_instance` it generates one (`fab_…`) and is idempotent **per table**; with one, per instance |
 | `db.cdc.disable('<schema>.<table>' [, capture_instance :=])` | `sys.sp_cdc_disable_table`; with no instance named, all of that table's |
 | `db.cdc.capture_now()` | `sys.sp_cdc_scan` — force the capture log scan now (see the ⚠ below) |
-| `db.cdc.changes('<schema>.<table>' \| '<capture instance>' [, starting_position :=] [, ending_position :=] [, capture_instance :=] [, images :=] [, commit_timestamp :=] [, enable :=])` | the change stream — see below |
+| `db.cdc.changes('<schema>.<table>' \| '<capture instance>' [, starting_position :=] [, ending_position :=] [, capture_instance :=] [, images :=] [, commit_timestamp :=] [, enable :=] [, on_schema_change :=])` | the change stream — see below |
 | `db.cdc.health()` | 12 `(property, value)` rows, in this order: `supports_cdc`, `database`, `cdc_enabled`, `captured_instances`, `capture_job`, `capture_polling_interval_seconds`, `cleanup_job`, `cleanup_retention_minutes`, `max_lsn`, `max_lsn_time`, `max_lsn_age_seconds`, `agent_status` |
 
 The four setup functions each return one report row — `target`, `changed`, `detail`. **`changed` is separate
@@ -933,7 +933,8 @@ FROM db.cdc.changes('dbo.orders'                    -- a <schema>.<table> or a c
       [, capture_instance  := '<name>']             -- required when a table has two
       [, images            := 'after']              -- the only value this release accepts
       [, commit_timestamp  := false]                -- opt-in, see below
-      [, enable            := false])               -- capture the table on first read
+      [, enable            := false]                -- capture the table on first read
+      [, on_schema_change  := 'error'])             -- 'error' (default) | 'ignore'
 ```
 
 | column | type | |
@@ -943,6 +944,7 @@ FROM db.cdc.changes('dbo.orders'                    -- a <schema>.<table> or a c
 | `_commit_lsn` | `BLOB(10)` | every row of one transaction shares it |
 | `_seq_val` | `BLOB(10)` | |
 | `_operation` | `INTEGER` | SQL Server's raw code (1 delete, 2 insert, 4 update after-image) |
+| `_capture_instance` | `VARCHAR` | which capture instance produced the row |
 | `_commit_timestamp` | `TIMESTAMP` | only with `commit_timestamp := true` |
 | …source columns… | as the source table | a `delete` row carries the **deleted** values |
 
@@ -982,6 +984,12 @@ UPDATE my_cursors SET cur = getvariable('cdc_end') WHERE tbl = 'dbo.orders';
   neither the cause nor your table (the `...` is a real placeholder object SQL Server calls to raise it), and
   it sends you to inspect a call site while the real news is that **your pipeline has lost data**. This
   function checks the window itself and says so.
+- **⚠ A schema change inside your window is refused by default, and that is the point.** If someone runs
+  `ALTER TABLE … ADD` while your window is open, the new column is **not captured** — the read would simply
+  omit it and your pipeline would lose a field with nothing failing. `cdc.changes` checks
+  `cdc.ddl_history` before returning rows and refuses, naming the statement and its LSN. Read up to the
+  change and re-bind, or pass `on_schema_change := 'ignore'` to read anyway (which also saves the check's
+  round trip). A window that *starts after* the change is clean again.
 - **An `UPDATE` produces ONE row** (the after-image). SQL Server records two — a before-image and an
   after-image — and `images := 'both'` will surface the pair; this release reads after-images only.
 - **`commit_timestamp` is opt-in because it costs a join.** It is the only column that needs

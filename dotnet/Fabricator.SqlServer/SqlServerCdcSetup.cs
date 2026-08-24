@@ -123,9 +123,17 @@ internal static class SqlServerCdcSetup
     /// produces a 104-character name and <c>Msg 22927 … exceeds the length limit of 100 characters</c> — so
     /// <c>cdc.enable</c> failed with an error about a name the user never chose, and the only escape was the
     /// very knob this hides. The same table with a generated name enables fine, MEASURED.</para>
-    /// <para><b>⚠⚠ SHA-256, NEVER <c>string.GetHashCode()</c>.</b> .NET randomizes string hash codes PER
-    /// PROCESS, so a GetHashCode-derived name would differ on every run — the exact opposite of the
-    /// determinism this exists for, and it would fail in a way that looks like a caching bug.</para>
+    /// <para><b>⚠⚠ ANY STABLE DIGEST WILL DO — but NEVER <c>string.GetHashCode()</c>.</b> .NET randomizes
+    /// string hash codes PER PROCESS, so a GetHashCode-derived name would differ on every run — the exact
+    /// opposite of the determinism this exists for, and it would fail in a way that looks like a caching
+    /// bug. MD5 is used because this is a NAME, not a security boundary: nothing authenticates or
+    /// authorises on it, a collision costs a refusal rather than a wrong answer (SQL Server enforces
+    /// instance-name uniqueness), and 64 of its bits are all that is kept.</para>
+    /// <para><b>⚠ CHANGING THE ALGORITHM IS SAFE, and that is a property of §17.3 rather than luck.</b>
+    /// Idempotence keys on the TABLE, not on this name — the generated name is used only when CREATING —
+    /// so a table already captured under a name from a different digest is still found, reported and read.
+    /// There is no migration and no orphan. (It also means the name must never be parsed to recover the
+    /// table: <c>cdc.tables()</c> and the <c>fabricator_source</c> marker are what map back.)</para>
     /// <para><b>⚠ The input is NOT lower-cased, deliberately.</b> Normalising case would make two genuinely
     /// different tables on a case-SENSITIVE collation (<c>dbo.Orders</c> and <c>dbo.orders</c>) collide on
     /// one instance name, and the second enable would then fail naming a name the caller never chose — the
@@ -145,7 +153,7 @@ internal static class SqlServerCdcSetup
     /// </remarks>
     internal static string GenerateCaptureInstance(string schema, string table)
     {
-        byte[] hash = System.Security.Cryptography.SHA256.HashData(
+        byte[] hash = System.Security.Cryptography.MD5.HashData(
             Encoding.UTF8.GetBytes(schema + "." + table));
         var name = new StringBuilder(20);
         name.Append(GeneratedInstancePrefix);
