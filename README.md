@@ -3096,6 +3096,16 @@ CREATE TABLE lake.main.t WITH ("delta.isolationLevel"='Serializable', "fabricato
 >   honoured since 2026-08-08; before that `_delta_log` grew for the life of the table. Cleanup runs after a
 >   checkpoint, deletes only commits that checkpoint covers, and never touches a file inside the window. Set
 >   `delta.enableExpiredLogCleanup = false` to switch it off.
+>
+> **Version checksums (since 2026-08-25).** Every commit is now followed by a `_delta_log/<version>.crc`
+> summarising the table at that version — file count, byte size, metadata, protocol and the live
+> transaction / domain sets — so a reader can learn a version's size without replaying the log, and an
+> engine maintaining table state incrementally can notice its view has drifted from the log's. This is what
+> the Delta protocol says a writer SHOULD do and what delta-spark already did, so on a table you write from
+> both engines the set is now complete instead of covering only Spark's versions. They cost one extra small
+> write per commit and are reclaimed by the same log cleanup as the commits they describe. There is no
+> switch to turn them off — a missing checksum is always safe, so one is written only when the state being
+> named is exactly the state at that version, and failing to write one never fails the commit.
 
 Keys: `parquet_compression` / `parquet_row_group_size` / `parquet_bloom_filter_columns`; `deletion_vectors`
 / `column_mapping` / `row_tracking` / `change_data_feed` / `in_commit_timestamps`; any quoted `delta.*` /

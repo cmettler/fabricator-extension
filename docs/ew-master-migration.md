@@ -3035,6 +3035,249 @@ blind claims where one is true.
 Offer draft (not yet sent): the argument is upstream's own, from `DeltaTransaction.IsBlindAppend` and #125's
 interop measurement.
 
+## THE 2026-08-25 BUMP — `3a31d9e → bab9a89`, THIRTY-NINE commits, still ZERO patches
+
+A fast-forward, not a merge. The user's framing was *"most parquet fixes and a few delta"* and the shape is
+`git log`'s: 8 ALP, 8 other parquet, 9 expressions, 5 delta, 4 io/cloud, 5 ci/test/bridge. **What that
+framing understates is the delta five** — between them they add a FILE TO EVERY COMMIT, a new conflict
+class, and a protocol declaration — **and what it overstates is the parquet count**, because 8 of the 16
+are ALP, which we never opt into.
+
+**Compile cost ZERO** — `Fabricator.Delta` is the only project referencing EW and it built with **0 errors**
+and 8 warnings, all pre-existing and none EW-shaped (two `ManagedIdentityCredential` obsolescences, two AWS
+`FallbackCredentialsFactory`, one CS8604 of our own, each × 2 TFMs). No EW API we call changed signature.
+
+### ⚠⚠ THE HEADLINE: WE NOW WRITE A `.crc` BESIDE EVERY COMMIT, BY DEFAULT
+
+`f54b269` adds `DeltaTableOptions.WriteVersionChecksums`, **defaulting to true**, so every commit is
+followed by a `_delta_log/<version>.crc` summarising the table state at the version it landed on. MEASURED
+on a fresh table — twelve commits, twelve `.crc` files, v0 included, and the NATIVE provider does it too, so
+it is not scoped to the codec engine:
+
+```
+00000000000000000000.crc   00000000000000000010.checkpoint.parquet
+00000000000000000000.json  00000000000000000010.crc
+…                          _last_checkpoint
+```
+
+- **NOTHING OF OURS TRIPS OVER IT, checked rather than hoped.** Our object-store discovery globs
+  `*/_delta_log/*.json` (a `.crc` does not match); the local fast path tests `Directory.Exists(_delta_log)`;
+  VACUUM's hidden-name rule excludes `_delta_log` wholesale because it begins `_`. And **`LogCleanup`
+  already reclaimed `.crc` files before this bump** — it learned to during the retention work, back when
+  its own doc comment said *"nothing here writes one"*; this commit's only change there is deleting that
+  sentence. So they do not grow without bound.
+- **THE COST IS ONE EXTRA CREATE-IF-ABSENT REQUEST PER COMMIT, and that is not free where we care.** On
+  OneLake a request is ~180 ms (measured under the host-FS instrument) and on `s3://` the same per-request
+  cost is what the micro-GET fix was about. It is a WRITE-path cost, so it lands on the buffered flush and
+  on every eager-write statement, never on reads.
+- **Left ON, deliberately.** PROTOCOL.md says writers SHOULD produce one, delta-spark writes one by default
+  and delta-kernel-rs's documented post-commit pattern writes one — so turning it off would make us the odd
+  writer on a shared table, which is the exact condition the feature exists to end (a table we and Spark
+  write in turn had checksums only for Spark's versions, so a divergence introduced across OURS was
+  invisible). `WriteVersionChecksums = false` is one init-only property away if a remote-write measurement
+  ever argues for it.
+
+### ⚠⚠ AND IT EXPOSED A COERCION IN **OUR** CHECKPOINTS — a fourth entry in the silent-corruption ledger
+
+`CheckpointWriter` coerced four optional fields when building the checkpoint parquet — `m.Name ?? ""`,
+`m.Description ?? ""`, `m.CreatedTime ?? 0`, `t.LastUpdated ?? 0` — so **the same table read back
+differently depending on whether a reader used the log or the checkpoint**: `name: null` from one,
+`name: ""` from the other. Nothing could see it, because nothing compared the two.
+
+**A version checksum IS that comparison**, and delta-spark's `computedState` fails the WHOLE READ when they
+differ — `DELTA_STATE_RECOVER_ERROR`, *"Did you manually delete files in the _delta_log directory?"*, which
+names nothing that is actually wrong — and upstream saw it surface as a **600 s hang** rather than a fast
+failure.
+
+- **OUR EXPOSURE IS REAL AND IT IS TRANSITIONAL. Established by reading the file, not by reasoning:** a
+  `.crc` we now write records `"metadata"` with **no `name` and no `description` key at all** — measured
+  verbatim — because we never set either. `createdTime` IS present, so the divergence is bounded to those
+  two of the four coerced fields. So a table carrying a PRE-bump checkpoint (which coerced them to
+  `""`) and a POST-bump checksum is exactly the disagreeing pair. The coercion is fixed, so every checkpoint
+  written from here on is correct, and the window closes at each table's next checkpoint — default interval
+  10 commits.
+- **The general lesson is upstream's and worth keeping: a second independent copy of the same state is what
+  finds a round-trip coercion, so expect a new summary file to expose old ones.** Three of the four earlier
+  entries in our parquet-corruption ledger were found the same way — by something else reading the bytes.
+
+### ⚠⚠ `ARROW:schema` IS NOW WRITTEN INTO EVERY EW-WRITTEN FILE, CHECKPOINTS INCLUDED
+
+`56ad9d7` adds `ParquetWriteOptions.WriteArrowSchema`, **default true**, recording the Arrow schema in the
+footer under `ARROW:schema` — the convention PyArrow and Polars use, and what lets a
+`timestamp[us, tz=America/New_York]` or a `timestamp[s]` survive a round trip at all. MEASURED present in
+both an EW-written data file and the `.checkpoint.parquet`.
+
+**⚠ MEASURED, and the size number is the one worth carrying: it is a FIXED PER-FILE cost, so it is noise on
+a large file and material on a small one.** On a two-column table the entry is **480 bytes in a 949-byte
+data file — half of it** — and **4568 bytes on the checkpoint**, where it is the ONLY footer key. EW writes
+ONE PARQUET FILE PER INPUT BATCH, so a table built from single-row `INSERT … VALUES` statements is exactly
+the shape that pays it repeatedly; the cost scales with COLUMN COUNT, not row count. ⚠ DuckDB's own parquet
+reader reads both the checkpoint and the data files unchanged (13 actions, 2010 rows), so the addition is
+benign for the reader we ship with — which is evidence about DuckDB and says nothing about SQL Server.
+
+**⚠ Checkpoints are written by EW ON EVERY ENGINE, `native_write` included** — so this is not scoped to the
+codec provider, and CHECKPOINT CONTENT IS WHERE OUR SQL-SERVER INTEROP HAS BROKEN BEFORE (the 0-byte snappy
+payload for an all-null chunk broke *every* SQL Server read that crossed an EW checkpoint). The gate is
+`verify_mssql_s3_polybase` in the service tier, which is why this bump is not believable on the hermetic
+tier alone.
+
+### The five delta commits, and which of them reach us
+
+- **`95aa633` — OPTIMIZE, the seven metadata-only schema changes, `SetClusteringColumnsAsync`,
+  `SetDomainMetadataAsync` and `RemoveDomainMetadataAsync` now commit through `LogCommitter` and REBASE.**
+  Each used to compute `snapshot.Version + 1`, make ONE attempt and propagate the collision — so a single
+  concurrent append failed an ALTER TABLE, or threw away an OPTIMIZE that had already rewritten its whole
+  candidate set. **We call two of the five** (`SetClusteringColumnsAsync` from `SET SORTED BY`,
+  `CompactAsync` from OPTIMIZE), and neither of our call sites is a retry loop — they translate a conflict
+  into `ConcurrentModification("SET SORTED BY")` or let it propagate — so the win is that those catches now
+  fire far less often. **Nothing of ours double-retries**: our two OCC loops (`FlushDeferredFilesAsync`,
+  `DeltaGlobalTableFunction.WriteAsync`) wrap neither call.
+- **`ConflictType.DomainMetadataChanged` is NEW, and its row-tracking EXEMPTION is load-bearing FOR US.**
+  Every commit that adds files to a row-tracking table advances `delta.rowTracking`, and our default table
+  has row tracking ON — measured on BOTH the codec and the NATIVE provider, whose v0 protocols are byte-for-
+  byte identical, and the `.crc` above carries
+  `{"domain":"delta.rowTracking","configuration":"{\"rowIdHighWaterMark\":2009}"}`. Without the exemption
+  two ordinary concurrent appends to one of our tables would conflict on a domain neither writer named.
+  Upstream included it, matching delta-spark's `checkIfDomainMetadataConflict`; if it ever regresses the
+  symptom is spurious conflicts on plain concurrent INSERTs.
+- **`7376d96` — the `domainMetadata` writer feature is now declared by the commit that writes a domain.**
+  ⚠ Its stated cost — *"the FIRST domain written to a table is now a protocol change too, so two writers
+  racing to it no longer both land"* — **does not reach us**: our default create already declares
+  `domainMetadata` in `writerFeatures` at v0 (measured), so there is no first-domain upgrade to race. Nor
+  does the "fourth site" it fixes (a host staging a `domainMetadata` through `StageActions`): our one
+  `StageActions` call stages **only** `protocol` and `metaData`.
+- **`515c8ce` — checksum VALIDATION, and it cannot regress a read**: nothing is served out of a checksum,
+  nothing is on by default, and nothing throws. A disagreement reports; it does not decide.
+- **`455f4e4`** — `ConflictChecker` stops returning shared mutable empty collections. Hygiene.
+
+### The parquet and expressions changes, sorted by whether they can reach us
+
+- **⚠ `a684678` — PRUNING ACTED ON LOSSY COMPARISONS, so a row group holding a match could be SKIPPED.**
+  `StatisticsEvaluator.SafeCompare` caught values that could not be compared but not values that compared
+  LOSSILY, and a lossy widening does not throw — it returns a confident answer about the ROUNDED values.
+  Measured upstream on `9007199254740993` (2^53+1): `b > 9007199254740992.0` ⇒ `AlwaysFalse`, row group
+  skipped, **row lost with no error anywhere**. **It reaches us**: `DeltaFilePruner` calls
+  `StatisticsEvaluator.Evaluate`. Reachability is narrow rather than nil — DuckDB normally casts a literal
+  to the column's type at bind, so the exposed shape is an integer or decimal column against a
+  floating-point constant that survives that — but the direction is the dangerous one, and this is a FIX we
+  inherit rather than a risk we take on.
+- **`657930d` — a TIMESTAMP annotation on a non-INT64 physical type read as plausible-looking wrong dates**,
+  and the deprecated `min`/`max` were emitted for FLBA columns compared unsigned-lexicographically. Both are
+  latent until an Arrow timestamp can map to FLBA(12); they matter for FOREIGN files, the interop direction.
+- **`1f271f5`** nested leaves filtered by the first leaf's levels; **`89fccee`** INT96 read as a timestamp;
+  **`d2912af`** a zero-row table keeps its columns; **`7c37306`** fixed-size lists are now WRITTEN (they
+  were refused outright) as ordinary three-level lists — a capability GAIN, and no suite of ours pinned the
+  refusal (checked); **`6d6ad44`** an adjusted timestamp's zone is named `UTC` rather than `+00:00`, a
+  read-path SPELLING change that no suite pins (checked).
+- **`037c0e4` does NOT reach us** — it needs `ByteArrayOutputKind.ViewType`, and we ask for view columns
+  nowhere.
+- **THE EIGHT ALP COMMITS DO NOT REACH US, for the reason the last bump recorded about FSST**: it is opt-in
+  via `ByteArrayEncoding`, and we set no `ByteArrayEncoding` at all (grepped). ⚠ **Still do not enable ALP
+  or FSST** — both are unratified proposals contesting encoding slot 10, so enabling either makes our
+  parquet unreadable by Spark/DuckDB/PyArrow. Two of the eight (`d81983f`, `78bbcb0`) are *"ALP wrote pages
+  larger than PLAIN"*, a good reminder that the encoding is still settling.
+- **THE FOUR CLOUD-BACKEND COMMITS DO NOT REACH US EITHER, and one grep established that rather than a
+  guess**: `Fabricator.Delta` project-references `EngineeredWood.DeltaLake.Table` and nothing else, so EW's
+  own `S3TableFileSystem` / `GcsTableFileSystem` / Azure backends are not in our closure — we use our own
+  `S3CommitFileSystem` and `AdlsGen2TableFileSystem`. ⚠ Note what we therefore never inherited:
+  `S3TableFileSystem.ListAsync` threw `EntryPointNotFoundException` on **net472**, every time, so no .NET
+  Framework host could list an S3 table at all — and our Bridge is `net10.0;net8.0`.
+
+### ⚠⚠ EW Table.Tests: `922/922` BECAME `841 passed / 113 SKIPPED`, AND THAT IS AN HONESTY FIX, NOT A REGRESSION
+
+`8fc2d66` and `aa90d86` reclassify tiers that cannot run in this environment from **Passed** to **Skipped**.
+The suite GREW (922 → 954 total); what fell is the number reported as passing.
+
+**Verified rather than assumed, because "81 fewer passing on a bump" is exactly the shape a real regression
+takes**: all **113** skips are under `EngineeredWood.DeltaLake.Table.Tests.Interop.*` — the delta-spark /
+delta-rs tier, which needs pyspark installed — counted with
+`grep -c "^  Skipped EngineeredWood.DeltaLake.Table.Tests.Interop\."`, which returns exactly 113.
+**0 failed, on all three TFMs** (net10.0, net8.0, net472).
+
+⚠ The uncomfortable corollary: **the previous bump's "922/922 × 3 TFMs" was partly a vacuous pass** — those
+interop tests were reported green while never executing. Upstream fixing that is this file's own
+methodology arriving from the other direction.
+
+
+### Gates
+
+| gate | result |
+|---|---|
+| compile cost | **0 errors**, 8 warnings, all pre-existing and none EW-shaped |
+| EW `DeltaLake.Tests` (log / conflict / checksum — where the five delta commits land) | **575 / 575, 0 skipped, × {net10.0, net8.0, net472}** |
+| EW `DeltaLake.Table.Tests` | **841 passed / 0 failed / 113 skipped × 3 TFMs** — see above for why the skips are honest |
+| codec-engine smoke (5000 rows, nullable string + double, UPDATE + DELETE) | correct — 4992 rows, 10 updated |
+| fabricator hermetic | **74 / 74 — 8003 ALL GREEN**, IDENTICAL to the previous pin |
+| fabricator service | **54 / 54 — 2992 ALL GREEN**, IDENTICAL to the previous pin |
+
+**`DeltaLake.Tests` is the load-bearing one here and `Table.Tests` is not**, which is the opposite of the
+last bump: this bump's delta work is in the log layer, and that suite has **zero skips**, so its 575 is a
+real pass rather than a partly-reclassified one.
+
+**Identical fabricator counts are the behaviour-neutrality claim** — the same signal the bump checklist
+asks for. What they do NOT cover is stated rather than implied: no suite writes a table large enough for a
+checkpoint to auto-split, no suite reads one of our checkpoints from delta-spark, and nothing in either tier
+can observe the extra `.crc` request's cost on a remote root. The checkpoint-coercion window is therefore
+REASONED from the file contents, not measured end to end against Spark.
+
+
+### ⚠⚠ LIVE FABRIC VALIDATION (2026-08-25, user-directed) — and it is the gate the tiers cannot be
+
+Neither CI tier writes to OneLake or is read by a foreign engine, so the two things this bump changes about
+what we WRITE — a `.crc` per commit and `ARROW:schema` in every file including checkpoints — were untested
+by everything above. Run against the live tenant:
+
+| leg | result |
+|---|---|
+| dbt `lakehouse` target, single 200k-row CTAS to OneLake Delta | **PASS**, 5.86 s |
+| dbt `lakehouse` target, `load_a…d` at `--threads 4` (4 × 200k concurrent CTAS, and a re-run so it also takes the table-swap RENAME path) | **PASS=4/4**, 13.1 s |
+| `.crc` really lands on a remote root | **yes** — globbed on OneLake, one per version |
+| **Fabric's OWN SQL analytics endpoint reading those four tables** | **800,000 rows**, and `sum(doubled)` = 39,999,800,000 — the exact closed-form answer |
+| **Fabric's own engine reading a table THROUGH a checkpoint written by the new EW** | **59 rows / sum 30810, exact** |
+
+**⚠⚠ THE CHECKPOINT LEG IS THE ONE THAT MATTERS, because it is the shape that has broken before.** A
+checkpoint carries `ARROW:schema` now (4568 bytes of it), and the last time checkpoint CONTENT changed under
+us — EW's 0-byte snappy payload for an all-null column chunk — **every SQL Server read that crossed a
+checkpoint failed**. So a table was driven past the interval on OneLake (v0…v10, checkpoint present, `.crc`
+at every version) and read back by Fabric. It reads.
+
+**⚠⚠ AND THE FIRST ANSWER WAS WRONG IN A WAY THAT LOOKS EXACTLY LIKE CORRUPTION — 55 rows / 18720 against a
+truth of 59 / 30810.** That is the Lakehouse SQL endpoint's asynchronous metadata sync, i.e. a
+stale-but-CONSISTENT snapshot at v5, and it **converged to the exact truth after 45 s**. Reported at the
+first reading it would have been a false alarm about a data-integrity bug; taken as "probably lag" without
+waiting it would have been an unearned pass. **Poll to convergence and say which reading you took** — the
+numbers are in the table above because both were measured.
+
+### ⚠ The Fabric WAREHOUSE half failed — PRE-EXISTING, not EW’s, and FIXED separately the same day
+
+`dbt run --target fabric` dies before building any model:
+
+```
+IO Error: Fabricator: table_schema failed: 15871:  'managed_delta_table_forks' is not supported.
+```
+
+**Split by hand, and the split is the evidence:** ATTACH succeeds; `fabricator_query` against the warehouse
+answers (`SELECT COUNT(*) FROM sys.tables` ⇒ 52); a TARGETED read `w.dbo.load_a` returns **200,000**; only
+`duckdb_tables()` — full catalog ENUMERATION — fails. dbt introspects before it builds, so it never reaches
+a model.
+
+**Three independent grounds that this is not the bump**, none of which is "it looks unrelated":
+1. **The record**: CLAUDE.md has carried this exact error string since **2026-08-09**, sixteen days and two
+   EW pins earlier, with its own note that it "deserves its own pass".
+2. **The path**: it fails in `table_schema` on a **SqlServer** catalog over TDS. `managed_delta_table_forks`
+   is a Fabric-internal object and 15871 is the SERVER refusing a query — nothing engineered-wood does can
+   change which T-SQL the SQL Server provider sends.
+3. **The control, which was running at the time**: the service tier does full catalog enumeration against
+   box SQL Server in dozens of suites and came back **54/54 — 2992**. Same code, same call, different server.
+
+**✅ AND IT WAS THEN CHASED AND FIXED THE SAME DAY, IN ITS OWN COMMIT — the cause was OURS, not Fabric's.**
+`TablesSql` had no schema predicate while `SchemasSql` one line above it had one, so the `sys` schema's
+seven Fabric-internal views were enumerated and one of them cannot be described. `dbt run --target fabric
+--threads 4` is now **PASS=4/4 in 49 s**, which it has never been. Full record: CLAUDE.md §"CATALOG
+DISCOVERY ENUMERATED SCHEMAS IT HAD ALREADY EXCLUDED". ⚠ It is deliberately NOT part of this bump — it is a
+SqlServer-provider defect that the bump's Fabric validation merely walked into, and mixing it in would make
+the pin's behaviour-neutrality claim untestable.
+
 ## THE 2026-08-20 BUMP — `2c51cd7 → 3a31d9e`, twelve commits, ALL PARQUET, still zero patches
 
 fast-forward, not a merge). ⚠ TWO of them are SILENT WRITE CORRUPTIONS on paths we use, and one can
