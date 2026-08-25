@@ -45,7 +45,8 @@ public sealed partial class SqlServerCatalog
     /// <c>mssql_read_isolation</c> opt-in's documented job (a READ creates the pin, else a transaction that
     /// has not written has no server-side transaction for the level to apply to), not router sloppiness.
     /// </summary>
-    private ScanRoute RouteScan(bool readYourWrites, bool materialize, bool snapshotRead, long txnId)
+    private ScanRoute RouteScan(bool readYourWrites, bool materialize, bool snapshotRead, long txnId,
+                                bool pooledOnly = false)
     {
         // ── Rule 1: the CONTRADICTION refusal ─────────────────────────────────────────────────────────────
         // ⚠ ONLY WHEN THE FALSE WAS ASKED FOR — `MaterializeExplicitlyFalse`, not `!ResolveMaterialize()`.
@@ -68,6 +69,33 @@ public sealed partial class SqlServerCatalog
                 "transaction; the second puts every read INSIDE it so they share one view. This scan cannot do " +
                 "both. Either unset mssql_read_isolation, or leave mssql_materialize at its default (true), " +
                 "which buffers that scan onto the transaction's own connection.");
+        }
+
+        // ── Rule 1b: POOLED-ONLY — the caller states that this read can never want the transaction ────────
+        // ⚠⚠ IT IS A PROPERTY OF THE READER, NOT A PREFERENCE, and only one reader has it today:
+        // `cdc.changes`. The capture job populates a change table ASYNCHRONOUSLY from COMMITTED log records,
+        // so a change this transaction just made is not there yet on ANY connection — read-your-writes buys a
+        // change reader NOTHING, on the pinned connection or off it. The pin is therefore pure cost, and
+        // MEASURED cost in both directions:
+        //   • rule 3 (MARS on, the transaction has written) pinned the change read onto the WRITE connection
+        //     as a long STREAMING reader — the 595 hazard exactly ("Bulk Insert with another outstanding
+        //     result set"), for a benefit that does not exist;
+        //   • rule 2 (mssql_read_isolation, MARS off) pinned it AND DRAINED it, buffering an entire change
+        //     window into memory and taking the ExecGate, again for nothing.
+        // MEASURED before the flag existed, same statement, from the route log: autocommit `route=pooled`,
+        // and inside a transaction that had written the source `route=pin (MARS)`.
+        //
+        // ⚠ It introduces no self-block hazard, and that is established rather than hoped: `DescribeQuery`
+        // already opens its OWN pooled connection unconditionally, so `cdc.changes` cannot even BIND unless
+        // the change table is visible to a pooled connection. A capture instance enabled in an uncommitted
+        // transaction fails there first, with a sentence that says so.
+        //
+        // ⚠ It is deliberately NOT applied to the WINDOW resolution, which goes the other way for a real
+        // reason: a capture instance enabled in THIS transaction IS visible to it, and the window has to see
+        // it. That read is `readYourWrites: true` and keeps rule 3.
+        if (pooledOnly)
+        {
+            return new ScanRoute(null, null, null, Drain: false, Snapshot: false, "pooled (reader opts out)");
         }
 
         // ── Rule 2: the READ-ISOLATION PIN (mssql_read_isolation opt-in) ──────────────────────────────────

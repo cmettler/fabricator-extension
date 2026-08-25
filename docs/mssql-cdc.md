@@ -995,9 +995,15 @@ moments before the lock may not be captured yet, so `max_lsn` sits *below* it. T
 held.** Note the failure direction without it is duplication, never loss — so an idempotent sink is
 unaffected either way, and this step is what buys exactly-once for everyone else.
 
-⚠ It inherits §10.2's race: the scan is refused with `Msg 22903` if the capture job holds the log-scan
-session. Stop the job, or retry — but a retry can lose 20 times in a row (measured), so on a busy server the
-honest fallback is to skip step 2 and document at-least-once.
+⚠⚠ **SUPERSEDED BY §20.2 — this step is NOT AVAILABLE at all when the capture job runs in its DEFAULT
+continuous mode, which is not "a busy server" but every ordinary one.** The paragraph below read: *"it
+inherits §10.2's race … stop the job, or retry — but a retry can lose 20 times in a row (measured), so on a
+busy server the honest fallback is to skip step 2 and document at-least-once."* MEASURED 2026-08-25: **150
+attempts over 61 seconds, zero successes**, and the holder identified as the capture job sitting in its
+`WAITFOR` INSIDE `sp_cdc_scan` — `continuous = 1` is one long-lived invocation that loops internally, so it
+holds `sp_replcmds` even while idle. There is no window to retry into. The conclusion the old paragraph
+reached is the one that ships (one attempt, then at-least-once, said out loud); what was wrong is the picture
+of a race that a retry or a quiet moment could win.
 
 ### 5.4 What this improves on, and the one thing it costs
 
@@ -1219,6 +1225,12 @@ not assert it.
 guarantee determinism nor exercise the realistic path. **Enabling the agent is what buys the control.**
 
 ### 10.2a ⚠⚠ TWO CORRECTIONS TO §10.2, both from building slice 1
+
+> **⚠ AND A THIRD, from building slice 8 (§20.2): the "~1 failure in 57" below is the rate for a probe that
+> COMPETES with the job for one scan, not the rate for a caller who needs the scan to SUCCEED.** Under the
+> lock, measured over 150 consecutive attempts, `sp_cdc_scan` succeeded **zero** times while the continuous
+> capture job was running, and succeeded in 3 ms once it was stopped. Read the number below as "the suite's
+> forced scan occasionally loses", never as "a retry will get through".
 
 **(a) `sp_cdc_disable_db` CONTENDS FOR THE SAME LOG-SCAN SESSION, and §10.2 only knew about `sp_cdc_scan`.**
 OBSERVED ONCE in `verify_mssql_cdc`:
@@ -2072,9 +2084,16 @@ The user's question. What the reader can do about it, now that §15.6 has the ma
 | **5** | ✅ **PARTLY BUILT 2026-08-25 — §18.** `_capture_instance` shipped; name-alignment and widening DEFERRED into slice 7 (§18.1 says why), and slice 6's DDL detection pulled forward | buys slice 7 nearly free. §15.8 |
 | **6** | ✅ **BUILT 2026-08-25 — §18.3**, pulled forward into slice 5. `on_schema_change := 'error'` (default) / `'ignore'` | loud before it is clever. §15.11 |
 | **7** | ✅ **BUILT 2026-08-25 — §19.** The two-instance boundary: derive the split, partition the window, `UNION ALL` by name. It also retires BOTH items deferred from slice 5 — the name-alignment is BUILT, and `WidenArrowType` is **DISSOLVED** (§19.2: the union is in T-SQL, and the helper's stated rule was measurably wrong AND has no reachable case) | needed 3 and 5 |
-| **8** | `include := 'snapshot'` / `'snapshot+changes'` (§5), then `on_schema_change := 'resync'` | the resync story needs the snapshot leg first |
+| **8** | ✅ **BUILT 2026-08-25 — §20.** `include := 'snapshot'` / `'snapshot+changes'`: §5's two-connection protocol, the handoff position on every baseline row, and the refusals a snapshot needs. ⚠ **`on_schema_change := 'resync'` is NOT in it** — see the note below | the resync story needs the snapshot leg first |
+| **8b** | `on_schema_change := 'resync'` — a new capture instance plus a fresh snapshot leg on drift | now unblocked. ⚠ §15.11's constraint governs it: at most TWO instances, so re-enabling is not repeatable and the second drift must DISABLE the oldest, destroying its unread history. That must be opt-in, which makes it a decision rather than a mode |
 | **9** | `starting_timestamp` / `ending_timestamp`; `images := 'both'` + the mask placeholder | additive to the same reader |
 | — | ~~`on_schema_change := 'fill'`~~ | last, if ever — §15.9 records why |
+
+⚠ **Slice 8 shipped the snapshot leg WITHOUT `resync`, and the split is deliberate rather than a shortfall.**
+The leg is one coherent thing with its own protocol, its own refusals and its own guarantee; `resync` is a
+POLICY on top of it that destroys history in a way only an operator can authorise (§15.11). Bundling them
+would have meant shipping a heavy privileged default in the same commit as the mechanism it rests on — the
+same reason §15.9 records for `resync` being permitted only over an instance WE own.
 
 ⚠ The old §12 ordering put the snapshot leg at 5 and the two-instance boundary at 6. The reordering follows
 from §15.9: `resync` is the preferred answer to schema drift, and it CANNOT be built before the snapshot leg.
@@ -2789,3 +2808,350 @@ boundary.
   only through a source string matching both as an instance name and as a table name.
 - **The decimal widening itself.** §19.2 establishes it has no reachable case between two instances, so
   there is nothing to assert; what IS asserted is that the aligned column keeps its own type.
+
+## 20. Slice 8 — THE INITIAL-SNAPSHOT LEG, AS BUILT (2026-08-25)
+
+C#-only, no ABI change. Gate: `verify_mssql_cdc` **351 → 460**, five mutants, each killed at its own
+assertion; 3/3 green re-runs. Built from §5's two-connection protocol — **and the protocol's step 2 turned
+out to be unavailable in the configuration everybody runs, which re-scopes what this leg can promise (§20.2).**
+
+```sql
+-- the whole table as of one consistent instant, with a position to resume from
+FROM db.cdc.changes('dbo.orders', include := 'snapshot')
+
+-- …and the changes after it, in one stream, with no gap and no duplicate between the halves
+FROM db.cdc.changes('dbo.orders', include := 'snapshot+changes')
+
+-- the flagship: capture a table nobody has captured AND read what is already in it
+FROM db.cdc.changes('dbo.orders', enable := true, include := 'snapshot+changes')
+```
+
+**What it is for.** A change stream can only ever say what CHANGED. A consumer starting from an empty sink
+needs the state that was already there — and needs to join the stream at a position where nothing is missed
+and nothing arrives twice. This is that handoff, and until now the reader had no answer for "start from
+nothing" at all.
+
+### 20.1 The protocol, as built and as measured
+
+`SqlServerCatalog.CdcOpenSnapshot` runs §5.1 verbatim, two connections, and returns
+`(handoff, snapshot stream)`:
+
+| step | connection A (ordinary) | connection B (snapshot) |
+|---|---|---|
+| 1 | `BEGIN TRAN`; `SELECT TOP (1) 1 FROM t WITH (TABLOCK, HOLDLOCK)` | |
+| 2 | `EXEC sys.sp_cdc_scan` — **best effort, see §20.2** | |
+| 3 | `P0 = sys.fn_cdc_get_max_lsn()` | |
+| 4 | | `BeginTransaction(Snapshot)`; `SELECT TOP (1) 1 FROM t` |
+| 5 | `COMMIT` — the lock is gone | |
+| 6 | | the real read, streaming, at leisure |
+
+Re-measured end to end on the rig, with all the controls firing:
+
+```
+locks held by A, seen from the NEXT statement    OBJECT / S / GRANT
+a writer INSERTing inside the window             BLOCKED           <- the freeze is real
+B's pin under the lock                           OK
+B sees                                           2 rows
+A COMMITs; a writer INSERTs id=3 and UPDATEs id=1
+B re-reads in the SAME transaction               2 rows, v of id=1 unchanged   <- the view held
+committed table state                            3 rows
+the stream from P0 exclusive                     exactly 2 rows: insert id=3, update id=1
+```
+
+- **`TOP (1)` is the lock statement, and it is enough** — including on an EMPTY table, where "there is
+  nothing to read" could plausibly have let the optimiser skip the scan and the lock with it (measured: the
+  lock is granted on `dbo.e` with no rows, and a writer is blocked). A `COUNT(*)` would have spent the whole
+  freeze reading rows nobody wants.
+- **`TOP (1) 1` is also enough to PIN B's view.** §5.2 measured the pin with a real read; the cheap form was
+  re-measured because SNAPSHOT fixes its view at the first statement that touches DATA, not at
+  `BEGIN TRANSACTION`, and it was not obvious that a one-row probe counts as touching data. It does.
+- **`BeginTransaction(IsolationLevel.Snapshot)`, never a `SET` after a `BEGIN`** — §5.5's engine rule:
+  SNAPSHOT is the one level SQL Server refuses to switch into mid-transaction.
+
+### 20.2 ⚠⚠ STEP 2 IS UNAVAILABLE UNDER A CONTINUOUS CAPTURE JOB, WHICH IS THE DEFAULT — so the guarantee is at-least-once unless the operator arranges otherwise
+
+This is the measurement that changed the slice. §5.3 presents `EXEC sys.sp_cdc_scan` under the lock as the
+step that upgrades the handoff from at-least-once to exactly-once, and §10.2a records it as a race we lose
+about **1 time in 57**. Both are too optimistic about the configuration that actually ships.
+
+```
+under the lock, 6 trials x 25 attempts, 400 ms apart:
+  trial 1: gave up after 25 attempts, 10237 ms, last error 22903
+  trial 2: gave up after 25 attempts, 10234 ms, last error 22903
+  …
+  trial 6: gave up after 25 attempts, 10252 ms, last error 22903
+=> 150 attempts over 61 seconds, ZERO successes
+```
+
+**The holder was identified rather than guessed**, which is what makes this a finding:
+
+```
+session_id=71 | program_name=SQLAgent - TSQL JobStep (Job 0x35F4… : Step 2)
+              | status=running | command=WAITFOR
+              | txt=create procedure [sys].[sp_cdc_scan] …
+```
+
+⇒ **`continuous = 1` means ONE long-lived `sp_cdc_scan` invocation that loops internally, so the job holds
+`sp_replcmds` the whole time — including while it sits in its `WAITFOR` between polls.** It is not a race
+with a window we can wait for; there is no window.
+
+**And the positive control, without which the above is just a broken probe:** with the capture job STOPPED,
+the identical call under the identical lock succeeds in **3 ms**. (Trials 1–2 after the stop still failed —
+the stop is asynchronous — which is worth knowing before writing a gate around it.)
+
+**What ships, and why:**
+
+- **ONE attempt, never a retry loop.** Retrying was measured to be pure waste, and it would spend that time
+  holding a table lock, which is the one thing §5.2 says this protocol must not do.
+- **A failure does not fail the read.** It logs at **Warning** — which reaches `duckdb_logs`, so which of the
+  two guarantees a given read got is answerable in SQL after the fact rather than only in a comment.
+- **The attempt is still worth making**: it costs 2 ms and it SUCCEEDS wherever the job is not continuous,
+  which includes **Azure SQL Database (no SQL Agent at all)** and any database whose job an operator stopped.
+- ⇒ **exactly-once when the scan runs, at-least-once otherwise; never loss, in either case.** The failure
+  direction is a DUPLICATE for the transactions inside the capture lag — their rows are in the snapshot and
+  their change rows are above the handoff. §5.4 records that the established practice for this handoff is
+  at-least-once *unconditionally*, so the degraded case is the industry default rather than something below
+  it.
+
+**⚠ A failing `sp_cdc_scan` does NOT poison the transaction, and that had to be established** — the opposite
+would have made the whole protocol unbuildable, since the lock would be gone before P0 was read. After the
+22903: `XACT_STATE() = 1`, `@@TRANCOUNT = 1`, the OBJECT/S lock still granted, and a concurrent writer still
+blocked. (§17.2 measured a *different* statement failure killing an ambient transaction outright, which is
+why this was worth measuring rather than assuming.)
+
+### 20.3 The handoff position, and the 0xFF padding that is not decoration
+
+Every snapshot row carries the SAME `_position`: the handoff, as **`P0 ‖ 0xFF × 11`** — 21 bytes, the shape
+of every other `_position`.
+
+**Why the padding is `0xFF` and not zero.** P0 is the capture WATERMARK at the pin, so every change *at* it
+is already in the snapshot and must not be re-delivered. The cursor predicate is
+`lsn > cur OR (lsn = cur AND (seq > cur_seq OR (seq = cur_seq AND op > cur_op)))`, so padding with zeros
+would ADMIT every row at that LSN — one duplicate per transaction in the handoff instant. `0xFF` makes both
+tails unsatisfiable, which is exactly "everything at or below this LSN has been delivered".
+
+**MEASURED, and it is the gate's discriminator** — the same LSN, two paddings, on a fixture whose last
+captured transaction is its own DELETE:
+
+```
+starting_position := <handoff, 0xFF-padded>   ->  0 rows
+starting_position := <same LSN, 0-padded>     ->  1 row: delete id=2
+```
+
+The second is the duplicate the padding prevents, and it is a row the snapshot has already accounted for.
+Without it, "0 rows" would pass equally on a build whose resume had stopped working altogether.
+
+⚠ It is a SYNTHETIC position — no change row has `seqval = 0xFF…FF`. That is fine and it is what a handoff
+needs: §2.3 records that the cursor must be DATA the caller can store and hand back, and this round-trips
+through `starting_position` unchanged. It is a CURSOR, not a row identity.
+
+⚠ **The padding and the changes half's cursor predicate are two halves of ONE guarantee, and the gate kills
+either alone.** Removing the padding and removing the predicate produce the IDENTICAL symptom (mutants A and
+B both die at the same assertion, with the same extra row) — which is the useful part: neither is redundant
+with the other, unlike the deliberately-redundant pair §19.4 records.
+
+### 20.4 What a snapshot row says, column by column
+
+Every column is individually true rather than convenient:
+
+| column | snapshot row | why |
+|---|---|---|
+| `_change_type` | **`insert`** | §3.3 chose the Delta change-feed vocabulary so a consumer that already handles a Delta CDF handles this one unchanged — and Delta's own answer to "how do you spell the baseline" is `insert` (a CDF read from version 0 returns exactly that) |
+| `_position` | **the handoff** | §20.3. One value for the whole leg: it is not a per-row position, there is no change row behind it |
+| `_commit_lsn` | `NULL` | a snapshot row is STATE, not an event — it has no commit |
+| `_seq_val` | `NULL` | and no sequence within one |
+| `_operation` | **2** | the raw form of `_change_type`; a second vocabulary would be a thing to learn for nothing |
+| `_capture_instance` | **`NULL`** | **the DISCRIMINATOR** — it came from the SOURCE table, not from a capture instance |
+| `_commit_timestamp` | `NULL` | no commit ⇒ no commit time |
+
+**⚠ `_capture_instance IS NULL` is the rule for "this is a baseline row".** A change row's value is a
+parameter that is never null, so the test is exact — one rule, no new column, and it re-uses the column
+slice 5 shipped to make provenance readable (§18.2). Ordering still works because `ORDER BY _position` is
+the documented key (§2.4) and every snapshot row's position sorts below every change row's.
+
+**⚠⚠ The metadata literals need TWO explicit `CONVERT`s, and MEASURED: without them the declared schema
+DIFFERS from the change read's and the arrival check refuses every snapshot.**
+
+```
+                     real change read        naive snapshot literal
+_change_type         varchar(16)             varchar(6)      <- the CASE folds over a constant operation
+_position            binary(21)              varbinary(21)   <- binary + binary is varbinary
+```
+
+Both are re-stated as `CONVERT(varchar(16), 'insert')` and `CONVERT(binary(21), @handoff)`, after which the
+two lists describe identically column for column. The snapshot list still goes through the SAME
+`CdcMetadataSelectList` as the change read, so the column NAMES, ORDER and COUNT come from one place; only
+those two of the seven expressions differ, which is the part that genuinely cannot be shared.
+
+**⚠ The DECLARED nullability widens for a snapshot leg**, and the declaration has to say so:
+`_commit_lsn`, `_seq_val` and `_capture_instance` become nullable. It survives today only because DuckDB
+DROPS a table function's declared nullability (§16.4 item 2) — which makes a false declaration invisible
+rather than harmless.
+
+### 20.5 What it refuses, and why each refusal is not a gap
+
+- **`starting_position` beside any snapshot** — refused at BIND. A snapshot IS the starting point. The two
+  readings a combination could have are both wrong: a snapshot of the CURRENT table paired with an OLD cursor
+  delivers every change between them twice, and one paired with a cursor AHEAD of it silently loses what lies
+  between. The caller who has a cursor wants `include := 'changes'`; the caller who wants to start over takes
+  the handoff out of the rows.
+- **`ending_position` with `'snapshot'` alone** — a snapshot is one instant, not a window, so there is no
+  upper bound to apply. It IS accepted with `'snapshot+changes'`, where it bounds the changes half (gated,
+  as the control that keeps the first refusal narrow).
+- **A captured column that no longer exists on the SOURCE** — refused at BIND, naming the column. A DROP
+  COLUMN on a captured table is permitted and leaves the change table's column in place reading NULL
+  (§15.6), so the declaration — which is the CAPTURED set — can name a column `SELECT` cannot resolve.
+  ⚠ NULL-filling is not available either: §19.3 MEASURED that a bare `NULL` takes its type from the OTHER
+  branch of a union, and the snapshot statement has no other branch, so it would describe as `int` and fail
+  the arrival check anyway. Filling it properly means rendering the captured column's SQL type by hand,
+  which is the type table this feature has twice avoided building.
+  **Mutant C makes the case for the refusal**: without it the read dies with `Msg 207 Invalid column name
+  'v'` — an error naming a column the caller never wrote.
+- **A transaction that has written the source table** — refused at EXECUTE.
+  **⚠⚠ Unconditional, unlike the pooled-scan hazard next door, and the three escapes that make THAT one safe
+  do not apply here.** That check stands down under MARS, under `mssql_read_isolation` and under RCSI. None
+  helps a `TABLOCK`: the protocol MUST take its lock on a connection of its own, because the lock's whole
+  point is to be released by a COMMIT whose timing we control, and committing the caller's transaction is not
+  ours to do — and a lock REQUEST is not a read, so row versioning does not exempt it.
+  **⚠ MEASURED: without the guard this HANGS, it does not fail.** `mssql_command_timeout` defaults to 0
+  (infinite), so the lock request waits forever for a lock only the caller can release. The mutant ran past
+  ten minutes. ⇒ **the gate's section sets `mssql_command_timeout = 10` so that a regression FAILS instead of
+  stalling the tier** — a suite that hangs on regression is worse than no suite.
+
+### 20.6 ⚠⚠ THE PRE-EXISTING DEFECT THIS FOUND: snapshot isolation LEAKS THROUGH THE CONNECTION POOL
+
+Building the leg turned up a bug that is **not** in the leg, is **not** CDC-specific, and had shipped: a
+connection put into SNAPSHOT and then released comes back out of the pool **still at SNAPSHOT**.
+
+MEASURED with `Max Pool Size=1`, so the next open is provably the same physical connection, reading
+`sys.dm_exec_sessions.transaction_isolation_level` at each step:
+
+```
+before                                 ReadCommitted   <- the pool starts clean; this is what makes the rest mean something
+inside the snapshot transaction        Snapshot
+same connection after COMMIT           Snapshot        <- session-scoped: the level outlives the transaction
+next open from the pool                Snapshot        <- THE LEAK
+next open after an explicit restore    ReadCommitted   <- the fix
+bare SET, next open from the pool      Snapshot        <- BOTH spellings, and this is the shipped one
+```
+
+**⚠ The shipped `mssql_materialize=false` route uses the bare `SET`, and its own comment asserted the
+opposite:** *"pooled connections are recycled and `sp_reset_connection` puts the isolation level back to the
+default"*. It does not. That comment's CONCLUSION was still right — set the level on every such open rather
+than once — so nothing downstream of it was wrong; what the wrong reason hid is that the level travels the
+OTHER way too, out of our read and into whatever runs next on that connection.
+
+**What the leak costs, stated rather than implied.** Mostly it is invisible: a later READ at SNAPSHOT
+returns the same rows a READ COMMITTED one would, only versioned. What is not invisible is **a DDL inside an
+explicit transaction, which SQL Server refuses outright** — `Msg 3964, "this DDL statement is not allowed
+inside a snapshot isolation transaction"`. That is how it was found: `cdc.changes(enable := true,
+include := 'snapshot+changes')` failed on its own `sp_cdc_enable_table`, several statements after the
+snapshot leg that had leaked the level.
+
+**Fixed in BOTH places** by one class, `SqlServerSnapshotStream`, which owns the connection and restores
+`READ COMMITTED` before releasing it — the CDC snapshot leg and the pre-existing `snapshotRead` path.
+Fixing only the new one would have been the half-fix this project keeps recording: an identical leak two
+functions away, invisible to a gate pinned on the half that works.
+
+⚠ **A weaker probe nearly gave the wrong reading.** The obvious check — "run a DDL on the reused connection"
+— came back **OK in both directions**, because a DDL is only refused *inside an explicit transaction* and the
+probe ran it in autocommit. The session-level readings are the measurement; the DDL probe is not.
+
+⚠ Restoring to READ COMMITTED is right HERE and would not be everywhere: it is SQL Server's own default, and
+this class only ever wraps a connection WE set to SNAPSHOT for one read — never a transaction's pinned
+connection, whose level the caller chose and which is not returned to the pool mid-transaction.
+
+### 20.7 The handoff clamp, and the shape it exists for
+
+The changes half starts from `max(handoff, the instance's retention floor)`, and the clamp fires ONLY on the
+handoff path.
+
+**Why it is needed:** the handoff is the DATABASE-wide capture watermark, while the floor is THIS capture
+instance's earliest readable position — so a freshly enabled instance legitimately starts ABOVE the
+watermark. Refusing there (which is what a plain `starting_position` below the floor does, and correctly)
+would refuse exactly the shape `enable := true, include := 'snapshot+changes'` exists to serve.
+
+**Nothing is skipped by it:** what lies between them is history this instance never captured, and the
+SNAPSHOT already carries the state it produced. The cursor predicate then excludes nothing — every row the
+TVF can return is above the handoff — so the TVF's own inclusive floor governs.
+
+⚠ **The stated limitation:** a change that committed after the pin but before the instance's `start_lsn` is
+unreadable. It is unreadable by construction rather than by our choice — no reader of that instance can ever
+see it — and the window is the microseconds between enabling capture and the pin.
+
+### 20.8 ⚠ An EMPTY table hands back no cursor — the one sharp edge of `'snapshot'` alone
+
+The documented idiom takes the handoff OUT OF THE ROWS. An empty table produces no rows, so
+`SET VARIABLE cur = (SELECT DISTINCT _position FROM … include := 'snapshot')` yields **NULL** — and
+`starting_position := NULL` means "absent", not "error", so the next read starts at the RETENTION FLOOR and
+replays the table's whole captured history. Redundant rather than wrong (the table was empty at the pin, so
+the replay nets to nothing), but it is §3.4's trap wearing a new hat.
+
+- **`include := 'snapshot+changes'` does not have it** — there the handoff never leaves the reader. That is
+  the form to reach for, and the README says so.
+- If `'snapshot'` alone is what you want, take `cdc.max_position()` **before** the read as the fallback
+  cursor. It is monotonic, so it is ≤ the handoff: at worst a small replay, never a skip.
+- Gated (§29g), which also puts the only assertion on the lock over an EMPTY table — "there is nothing to
+  read" could plausibly have let the optimiser drop the scan and the `TABLOCK` with it.
+
+### 20.9 Cancellation
+
+The snapshot READ gets an `InterruptScope` like every other data scan (docs/cancellation.md) — it is the one
+statement in the protocol that can run long, which is the whole point of releasing the lock before it starts.
+
+⚠ The five short statements inside the lock window deliberately do NOT get one: the honest response to an
+interrupt there is to finish and release, not to abandon a held table lock.
+
+### 20.10 ⚠⚠ The change read now opts OUT of the transaction's connection — and it was not already doing so
+
+User-raised while slice 8 was being built: *"we don't need this for cdc.changes, shouldn't we just use a
+pooled connection?"* Correct, and sharper than it sounds — §16.5 recorded the change read as running pooled,
+and **that was only true in autocommit**.
+
+**MEASURED from the route log, the identical statement, before any change:**
+
+```
+autocommit                                        route=pooled
+inside a transaction that had written the source  route=pin (MARS)      <- rule 3
+```
+
+and under `mssql_read_isolation` with MARS off, rule 2 pinned it **and DRAINED it** — buffering an entire
+change window into memory and taking the `ExecGate`.
+
+**The pin buys a change reader nothing**, and the reason is structural rather than incidental: the capture
+job populates a change table ASYNCHRONOUSLY from COMMITTED log records, so a change this transaction just
+made is not in it yet on ANY connection. What it costs is real in both directions — a long STREAMING change
+reader on the transaction's WRITE connection is the 595 hazard exactly, and the read_isolation route's drain
+is an unbounded in-memory buffer for a read that never needed it.
+
+⇒ `RouteScan` gained **rule 1b, `pooledOnly`** — a property of the READER, not a preference, with exactly one
+caller today. Gated at §29h, with the pinned WINDOW resolution as the positive control (in autocommit there
+is no pin to decline, so "the read was pooled" would otherwise pass on a build where the opt-out did
+nothing), plus an assertion that no pinned line carries the change read's `__$operation` fingerprint.
+
+- **⚠ It introduces no self-block hazard, and that is established rather than hoped.** `DescribeQuery` opens
+  its OWN pooled connection unconditionally, so `cdc.changes` cannot even BIND unless the change table is
+  visible to a pooled connection. A capture instance enabled in an uncommitted transaction fails there
+  first, with a sentence that says so.
+- **⚠ Only the change READ opts out.** The WINDOW resolution keeps the pin, because a capture instance
+  enabled in THIS transaction IS visible to it and the window has to see it. Both halves are asserted.
+- **⚠ THE TRANSFERABLE MISTAKE: an argument name is not a route.** The old note was written from the call
+  site's `readYourWrites: false` without checking what `RouteScan` does with it — and that argument is one
+  input to four rules, two of which pin regardless. Read the router, or log the route.
+
+### 20.11 What the gate does NOT cover, said rather than implied
+
+- **The exactly-once path.** It needs the capture job STOPPED, which is a database-wide operator action; a
+  suite that stopped it would change behaviour for every other suite in the tier and would flip its own
+  result depending on rig state. §20.2's measurements are what stands behind it.
+- **A non-empty changes half within ONE statement.** It needs a writer to commit AND be captured between the
+  pin and the window resolution, and sqllogictest drives connections sequentially. What IS gated is the
+  handoff itself: the resume from a stored handoff delivers exactly the changes that came after, with none of
+  the snapshot's rows replayed — which is the property the two halves are composed to give.
+- **The at-least-once WARNING's text.** Whether it fires depends on whether the capture job is running
+  continuously, which is rig state an operator can change; a test that flips with an operator action is worse
+  than none.
+- **The two-connection protocol as such.** No row can show that a table lock was taken, released, and that a
+  view was pinned inside the window. §20.1's measurements are the evidence; the suite pins the ANSWERS.
+
+---

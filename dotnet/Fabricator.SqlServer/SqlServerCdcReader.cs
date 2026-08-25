@@ -90,6 +90,7 @@ internal sealed class CdcChangesFunction : ICatalogTableFunction
         Params.Named("commit_timestamp", BooleanType.Default),
         Params.Named("enable", BooleanType.Default),
         Params.Named("on_schema_change", StringType.Default),
+        Params.Named("include", StringType.Default),
     }, metadata: null);
 
     public ITableFunctionBinding Bind(RecordBatch args)
@@ -103,6 +104,7 @@ internal sealed class CdcChangesFunction : ICatalogTableFunction
         bool commitTimestamp = CdcEnableFunction.Bool(args, 5) ?? false;
         bool enable = CdcEnableFunction.Bool(args, 6) ?? false;
         string onSchemaChange = CdcEnableFunction.Str(args, 7) ?? CdcChangesPlan.OnSchemaChangeError;
+        string include = CdcEnableFunction.Str(args, 8) ?? CdcChangesPlan.IncludeChanges;
 
         if (string.IsNullOrWhiteSpace(source))
         {
@@ -113,11 +115,77 @@ internal sealed class CdcChangesFunction : ICatalogTableFunction
         }
         ValidateImages(images);
         ValidateOnSchemaChange(onSchemaChange);
+        include = NormalizeInclude(include);
+        ValidateBoundsAgainstInclude(include, startingPosition, endingPosition);
         return new CdcChangesBinding(
             _catalog,
-            _catalog.CdcBindChanges(source!, instance, commitTimestamp, enable, onSchemaChange,
+            _catalog.CdcBindChanges(source!, instance, commitTimestamp, enable, onSchemaChange, include,
                                     CdcChangesPlan.ValidatePosition(startingPosition, "starting_position"),
                                     CdcChangesPlan.ValidatePosition(endingPosition, "ending_position")));
+    }
+
+    /// <summary>
+    /// Accepts the three <c>include</c> shapes case-insensitively and returns the canonical spelling.
+    /// </summary>
+    private static string NormalizeInclude(string include)
+    {
+        foreach (string known in new[]
+                 {
+                     CdcChangesPlan.IncludeChanges,
+                     CdcChangesPlan.IncludeSnapshot,
+                     CdcChangesPlan.IncludeSnapshotChanges,
+                 })
+        {
+            if (string.Equals(include, known, StringComparison.OrdinalIgnoreCase))
+            {
+                return known;
+            }
+        }
+        throw new ArgumentException(
+            $"cdc.changes: include := '{include}' is not a value - this release accepts 'changes' (the "
+            + "default: the captured change rows in a window), 'snapshot' (the whole table as of a "
+            + "consistent instant, with one handoff position) and 'snapshot+changes' (both, in that order, "
+            + "with no gap and no duplicate between them).");
+    }
+
+    /// <summary>
+    /// ⚠ A snapshot IS the starting point, so asking for one AND a cursor is a contradiction rather than a
+    /// combination — and it is refused rather than resolved.
+    /// </summary>
+    /// <remarks>
+    /// <para>Reading the two together could only mean one of two things, and neither is what anybody wants:
+    /// a snapshot of the CURRENT table paired with changes from an OLD cursor delivers every change between
+    /// them TWICE, and a snapshot paired with a cursor AHEAD of it silently loses the changes in between.
+    /// The caller who has a cursor wants <c>include := 'changes'</c>; the caller who wants to start over
+    /// wants the snapshot and takes its handoff position from the rows it returns.</para>
+    /// <para>⚠ <c>ending_position</c> is refused for <c>'snapshot'</c> alone for a different reason: a
+    /// snapshot has no window to bound. It IS accepted with <c>'snapshot+changes'</c>, where it bounds the
+    /// changes half.</para>
+    /// </remarks>
+    private static void ValidateBoundsAgainstInclude(string include, byte[]? startingPosition,
+                                                     byte[]? endingPosition)
+    {
+        if (string.Equals(include, CdcChangesPlan.IncludeChanges, StringComparison.Ordinal))
+        {
+            return;
+        }
+        if (startingPosition is not null)
+        {
+            throw new ArgumentException(
+                $"cdc.changes: include := '{include}' cannot be combined with starting_position - a snapshot "
+                + "IS the starting point, so a cursor beside it would either replay every change since that "
+                + "cursor (it is already in the snapshot) or skip the ones before it. Read the snapshot "
+                + "without a cursor and resume from the _position its rows carry, or drop the snapshot and "
+                + "read include := 'changes' from your cursor.");
+        }
+        if (endingPosition is not null
+            && string.Equals(include, CdcChangesPlan.IncludeSnapshot, StringComparison.Ordinal))
+        {
+            throw new ArgumentException(
+                "cdc.changes: include := 'snapshot' cannot be combined with ending_position - a snapshot is "
+                + "the table as of one instant, not a window, so there is no upper bound to apply. Use "
+                + "include := 'snapshot+changes', where ending_position bounds the changes half.");
+        }
     }
 
     /// <summary>
@@ -208,30 +276,84 @@ internal sealed class CdcChangesPlan
     /// <summary>The TVF's <c>@row_filter_option</c> for <see cref="ImagesAfter"/>. Excludes op 3 for free.</summary>
     internal const string RowFilterAll = "all";
 
+    /// <summary>The captured change rows in a window — the default, and everything before slice 8.</summary>
+    internal const string IncludeChanges = "changes";
+
+    /// <summary>The whole table as of one consistent instant, with the handoff position on every row.</summary>
+    internal const string IncludeSnapshot = "snapshot";
+
+    /// <summary>The snapshot, then the changes after it — §5's two-connection protocol.</summary>
+    internal const string IncludeSnapshotChanges = "snapshot+changes";
+
     /// <summary>An LSN is 10 bytes; a <c>_position</c> is <c>start_lsn ‖ seqval ‖ operation</c> = 21 (§2.4).</summary>
     internal const int LsnBytes = 10;
 
     internal const int PositionBytes = 21;
 
     internal CdcChangesPlan(string source, string? explicitInstance, bool commitTimestamp,
-                            string onSchemaChange, Schema output,
+                            string onSchemaChange, string include, Schema output,
                             byte[]? startingPosition, byte[]? endingPosition,
                             string? captureInstance = null, string? sourceSchema = null,
                             string? sourceTable = null, string? sql = null,
-                            string? secondInstance = null)
+                            string? secondInstance = null, string? snapshotSql = null)
     {
         Source = source;
         ExplicitInstance = explicitInstance;
         CommitTimestamp = commitTimestamp;
         OnSchemaChange = onSchemaChange;
+        Include = include;
         CaptureInstance = captureInstance;
         SecondInstance = secondInstance;
         SourceSchema = sourceSchema;
         SourceTable = sourceTable;
         Output = output;
         Sql = sql;
+        SnapshotSql = snapshotSql;
         StartingPosition = startingPosition;
         EndingPosition = endingPosition;
+    }
+
+    /// <summary>Which halves this read delivers — <c>changes</c>, <c>snapshot</c> or both (§5).</summary>
+    internal string Include { get; }
+
+    /// <summary>True when this read takes an initial snapshot of the SOURCE table.</summary>
+    internal bool HasSnapshot => !string.Equals(Include, IncludeChanges, StringComparison.Ordinal);
+
+    /// <summary>True when this read delivers captured change rows.</summary>
+    internal bool HasChanges => !string.Equals(Include, IncludeSnapshot, StringComparison.Ordinal);
+
+    /// <summary>
+    /// The SELECT over the SOURCE table that the snapshot leg streams, with the metadata columns rendered as
+    /// literals so it produces the SAME declared schema as the change read. Null unless
+    /// <see cref="HasSnapshot"/>.
+    /// </summary>
+    internal string? SnapshotSql { get; }
+
+    /// <summary>
+    /// The 21-byte <c>_position</c> a snapshot row carries: the handoff LSN with every following byte
+    /// <c>0xFF</c>, i.e. "past everything at this LSN".
+    /// </summary>
+    /// <remarks>
+    /// <para><b>⚠⚠ THE PADDING IS 0xFF AND IT MUST NOT BE ZERO.</b> The handoff LSN is the capture
+    /// watermark at the pin, so every change AT it is already in the snapshot and must NOT be re-delivered.
+    /// Our cursor predicate is <c>lsn &gt; cur OR (lsn = cur AND (seq &gt; cur_seq OR (seq = cur_seq AND op
+    /// &gt; cur_op)))</c>, so a zero-padded position would ADMIT every row at that LSN — a duplicate per
+    /// transaction in the handoff instant. Padding with <c>0xFF</c> makes both tails unsatisfiable, which is
+    /// exactly "everything at or below this LSN has been delivered".</para>
+    /// <para>⚠ It is a SYNTHETIC position: no change row has <c>seqval = 0xFF…FF</c>. That is fine and it is
+    /// what a handoff needs — it is a CURSOR, not a row identity, and §2.3 records that the cursor must be
+    /// DATA the caller can store and hand back. It round-trips through <c>starting_position</c> unchanged.
+    /// </para>
+    /// </remarks>
+    internal static byte[] HandoffPosition(byte[] lsn)
+    {
+        var position = new byte[PositionBytes];
+        System.Array.Copy(lsn, position, LsnBytes);
+        for (int i = LsnBytes; i < PositionBytes; i++)
+        {
+            position[i] = 0xFF;
+        }
+        return position;
     }
 
     /// <summary>What the caller named — kept so a DEFERRED plan can re-resolve itself at execute.</summary>
@@ -466,6 +588,7 @@ internal sealed class CdcChangesBinding : ITableFunctionBinding
     private readonly long _txnId;
     private CdcChangesPlan _plan;
     private IArrowArrayStream? _stream;
+    private IArrowArrayStream? _snapshot;
     private bool _enabled;
 
     internal CdcChangesBinding(SqlServerCatalog catalog, CdcChangesPlan plan)
@@ -516,17 +639,63 @@ internal sealed class CdcChangesBinding : ITableFunctionBinding
             (_plan, justCreated) = _catalog.CdcEnableAndResolve(_plan);
             _enabled |= justCreated;
         }
+        // ⚠⚠ THE SNAPSHOT LEG RUNS FIRST AND EVERYTHING AFTER IT DEPENDS ON ITS RESULT — the handoff
+        // position is chosen INSIDE the lock window, so the change half's lower bound does not exist until
+        // this has run. It is also the only part of this method that takes a lock on the source table, and
+        // it has released it by the time it returns (§5.2).
+        byte[]? handoff = null;
+        if (_plan.HasSnapshot)
+        {
+            (handoff, _snapshot) = _catalog.CdcOpenSnapshot(_plan);
+            try
+            {
+                CheckArrivedSchema(_declared, _snapshot.Schema);
+            }
+            catch
+            {
+                Dispose();
+                throw;
+            }
+            if (!_plan.HasChanges)
+            {
+                var only = _snapshot;
+                return Stream(only);
+            }
+        }
         // EAGERLY: the pre-check's whole job is to replace the unattributable 313 with a sentence, and an
         // error raised here fails the statement instead of arriving mid-scan.
-        var window = _catalog.CdcResolveWindow(_plan, justCreated);
+        CdcWindow window;
+        try
+        {
+            window = _catalog.CdcResolveWindow(_plan, justCreated, handoff);
+            if (!window.IsEmpty)
+            {
+                // EAGERLY too, and BEFORE the read: refusing after rows have started arriving would leave a
+                // consumer holding a partial window it has no way to distinguish from a complete one.
+                _catalog.CdcCheckSchemaDrift(_plan, window);
+            }
+        }
+        catch
+        {
+            Dispose();
+            throw;
+        }
         if (window.IsEmpty)
         {
-            return Empty();
+            // ⚠ On a snapshot+changes read this is the ORDINARY quiet case, not a dead end: nothing has
+            // changed since the pin, so the snapshot alone IS the answer.
+            return _snapshot is { } snapshotOnly ? Stream(snapshotOnly) : Empty();
         }
-        // EAGERLY too, and BEFORE the read: refusing after rows have started arriving would leave a consumer
-        // holding a partial window it has no way to distinguish from a complete one.
-        _catalog.CdcCheckSchemaDrift(_plan, window);
-        var stream = _catalog.CdcExecuteChanges(_plan, window);
+        IArrowArrayStream stream;
+        try
+        {
+            stream = _catalog.CdcExecuteChanges(_plan, window);
+        }
+        catch
+        {
+            Dispose();
+            throw;
+        }
         try
         {
             // Also EAGERLY: a type that moved under us must fail the STATEMENT, not arrive as a mid-scan
@@ -536,6 +705,7 @@ internal sealed class CdcChangesBinding : ITableFunctionBinding
         catch
         {
             stream.Dispose();
+            Dispose();
             throw;
         }
         // ⚠ THE BINDING OWNS IT, and that is not belt-and-braces. The stream is opened HERE, eagerly, while
@@ -545,13 +715,36 @@ internal sealed class CdcChangesBinding : ITableFunctionBinding
         // connection open until the GC finalized them. The iterator still disposes on the ordinary path;
         // Release() is idempotent, so both firing is correct.
         _stream = stream;
-        return Stream(stream);
+        return _snapshot is { } first ? Stream(first, stream) : Stream(stream);
     }
 
     private static async IAsyncEnumerable<RecordBatch> Empty()
     {
         await System.Threading.Tasks.Task.CompletedTask;
         yield break;
+    }
+
+    /// <summary>
+    /// The two legs of an <c>include := 'snapshot+changes'</c> read, in order and as ONE stream.
+    /// </summary>
+    /// <remarks>
+    /// <para>⚠ ORDER IS SEMANTIC, not presentation. The snapshot is the state as of the handoff and the
+    /// changes are what happened after it, so a consumer applying the rows in the order they arrive converges
+    /// on the current state. Reversed, a delete followed by its own baseline row would resurrect it.</para>
+    /// <para>⚠ Both legs are already open when this begins: every check that can refuse the read has run, so
+    /// nothing here can fail after the first batch has been handed over.</para>
+    /// </remarks>
+    private static async IAsyncEnumerable<RecordBatch> Stream(IArrowArrayStream first,
+                                                              IArrowArrayStream second)
+    {
+        await foreach (var batch in Stream(first).ConfigureAwait(false))
+        {
+            yield return batch;
+        }
+        await foreach (var batch in Stream(second).ConfigureAwait(false))
+        {
+            yield return batch;
+        }
     }
 
     /// <summary>
@@ -692,8 +885,20 @@ internal sealed class CdcChangesBinding : ITableFunctionBinding
     /// </summary>
     public void Dispose()
     {
+        // ⚠ The SNAPSHOT leg is released too, and it matters more than the change leg does: it holds an open
+        // SNAPSHOT transaction, so leaving it to the GC would keep a tempdb version store alive for a read
+        // nobody is consuming.
+        var snapshot = _snapshot;
+        _snapshot = null;
         var stream = _stream;
         _stream = null;
-        stream?.Dispose();
+        try
+        {
+            snapshot?.Dispose();
+        }
+        finally
+        {
+            stream?.Dispose();
+        }
     }
 }

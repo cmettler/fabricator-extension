@@ -1825,13 +1825,13 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     // the ALTER to run. That is a documented prerequisite of the setting, and a loud failure rather than a
     // silent one — which is also what keeps the reader from ever seeing the rows the write is producing.
     public IArrowArrayStream ExecuteQuery(string sql, IReadOnlyList<SqlParameter>? parameters, bool readYourWrites,
-                                          bool materialize, bool snapshotRead)
+                                          bool materialize, bool snapshotRead, bool pooledOnly = false)
     {
         // ALL routing lives in RouteScan (SqlServerScanRoute.cs) — the rules, their measured whys, and the
         // refusals. This method is the EXECUTION of whatever route came back. Borrowed pin: the stream must
         // not dispose the transaction's connection.
         long txnId = AmbientTransaction.Current;
-        var route = RouteScan(readYourWrites, materialize, snapshotRead, txnId);
+        var route = RouteScan(readYourWrites, materialize, snapshotRead, txnId, pooledOnly);
         if (Log.IsEnabled(LogLevel.Debug))
         {
             Log.LogDebug("query [{Conn}{RYW} txn={Txn} params={P} route={Route}]: {Sql}",
@@ -1877,9 +1877,17 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
                 EnsureSnapshotIsolationAllowed(connection);
 
                 // Session-scoped, so it governs the implicit transaction this SELECT runs in. Set on every
-                // such open rather than once: pooled connections are recycled and sp_reset_connection puts
-                // the isolation level back to the default, so assuming it persists would silently give us a
-                // READ COMMITTED reader — the shape measured to HANG (unbounded lock wait, no error).
+                // such open rather than once, because assuming it persists would silently give us a READ
+                // COMMITTED reader — the shape measured to HANG (unbounded lock wait, no error).
+                //
+                // ⚠⚠ THE REASON THIS COMMENT USED TO GIVE FOR THAT WAS WRONG, AND THE WRONGNESS HID A LEAK.
+                // It said sp_reset_connection "puts the isolation level back to the default". MEASURED
+                // 2026-08-25 with Max Pool Size=1, so the next open is provably the same physical
+                // connection: it does NOT — a connection released from here comes back out of the pool
+                // STILL AT SNAPSHOT. The conclusion above survives (setting it every time is right either
+                // way); what it hid is that the level travels the OTHER way too, out of this read and into
+                // whatever runs next on that connection. Mostly invisible, until a DDL inside an explicit
+                // transaction meets it and SQL Server refuses with Msg 3964. Hence the wrapper below.
                 using var iso = connection.CreateCommand();
                 iso.CommandText = "SET TRANSACTION ISOLATION LEVEL SNAPSHOT";
                 iso.CommandType = CommandType.Text;
@@ -1891,8 +1899,14 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
             command.CommandTimeout = ResolveCommandTimeout();
             AddParameters(command, parameters);
             var reader = command.ExecuteReaderAsync(token).GetAwaiter().GetResult();
-            IArrowArrayStream pooledStream =
-                new DbDataReaderArrowStream(connection, command, reader, interrupt: interrupt);
+            IArrowArrayStream pooledStream = route.Snapshot
+                // ⚠ The wrapper owns the connection so it can restore the isolation level before the pool
+                // gets it back; ownsConnection: false is what hands that responsibility over.
+                ? new SqlServerSnapshotStream(
+                    new DbDataReaderArrowStream(connection, command, reader, ownsConnection: false,
+                                                interrupt: interrupt),
+                    connection)
+                : new DbDataReaderArrowStream(connection, command, reader, interrupt: interrupt);
             return route.Drain ? DrainToMemory(pooledStream) : pooledStream;
         }
         catch

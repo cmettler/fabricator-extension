@@ -6,7 +6,8 @@
 # read-only functions (§1-§8), the four setup functions and the ABI v81 flag they exercise (§10-§14), and
 # THE READER, cdc.changes (§15-§21), slice 4 - the generated capture-instance name, the ownership marker
 # and enable := true (§22-§25) - slice 5, _capture_instance and the in-window DDL check (§26-§27) - and
-# slice 7, the two-instance boundary read as ONE stream (§28).
+# slice 7, the two-instance boundary read as ONE stream (§28) - and slice 8, the initial-snapshot leg
+# and the handoff it hands back (§29).
 #
 # ⚠ SERVICE TIER — it needs a real SQL Server, and unlike the rest of that tier it also needs SQL SERVER
 #   AGENT (docker-compose sets MSSQL_AGENT_ENABLED=true). §8's agent assertion is the ONLY thing in either
@@ -81,6 +82,9 @@ SELECT fabricator_exec('${MSSQL_TESTDB_DSN}', 'IF OBJECT_ID(''dbo.cdc_setup'') I
 
 statement ok
 SELECT fabricator_exec('${MSSQL_TESTDB_DSN}', 'IF OBJECT_ID(''dbo.cdc_zz_noidx'') IS NOT NULL DROP TABLE dbo.cdc_zz_noidx;');
+
+statement ok
+SELECT fabricator_exec('${MSSQL_TESTDB_DSN}', 'IF OBJECT_ID(''dbo.cdc_snap'') IS NOT NULL DROP TABLE dbo.cdc_snap; IF OBJECT_ID(''dbo.cdc_seed'') IS NOT NULL DROP TABLE dbo.cdc_seed; IF OBJECT_ID(''dbo.cdc_void'') IS NOT NULL DROP TABLE dbo.cdc_void;');
 
 statement ok
 SELECT fabricator_exec('${MSSQL_TESTDB_DSN}', 'IF OBJECT_ID(''dbo.cdc_gen'') IS NOT NULL DROP TABLE dbo.cdc_gen; IF OBJECT_ID(''dbo.cdc_own'') IS NOT NULL DROP TABLE dbo.cdc_own; IF OBJECT_ID(''dbo.cdc_auto'') IS NOT NULL DROP TABLE dbo.cdc_auto; IF OBJECT_ID(''dbo.cdc_ddl'') IS NOT NULL DROP TABLE dbo.cdc_ddl; IF OBJECT_ID(''dbo.gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg'') IS NOT NULL DROP TABLE dbo.gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg;');
@@ -1368,6 +1372,399 @@ SELECT count(*) FROM c1.cdc.changes('dbo.cdc_conf', capture_instance := 'conf_v2
 ----
 0
 
+# ═══ §29  THE INITIAL-SNAPSHOT LEG — include := 'snapshot' / 'snapshot+changes' (slice 8) ══════════════
+# docs §20, built from §5's two-connection protocol. A change stream can only say what CHANGED, so a consumer
+# starting from an empty sink needs the state that was already there AND a position to join the stream at with
+# no gap and no overlap. Connection A takes a SHARED table lock (writers frozen, readers unaffected) and reads
+# the handoff position; connection B pins a SNAPSHOT view inside that window; A commits, and B then reads the
+# whole table at leisure from a view fixed at the instant the lock was held.
+
+statement ok
+SELECT fabricator_exec('c1', 'IF OBJECT_ID(''dbo.cdc_snap'') IS NOT NULL DROP TABLE dbo.cdc_snap; CREATE TABLE dbo.cdc_snap(id INT NOT NULL PRIMARY KEY, v NVARCHAR(20) NULL, amt DECIMAL(9,2) NULL);');
+
+statement ok
+SELECT fabricator_exec('c1', 'INSERT INTO dbo.cdc_snap (id, v, amt) VALUES (1, N''one'', 1.50), (2, N''two'', 2.50), (3, N''three'', 3.50);');
+
+statement ok
+SELECT target, changed FROM c1.cdc.enable('dbo.cdc_snap', capture_instance := 'snap_v1');
+
+# ⚠ The FLOOR wait, and it is the one §1.6a's finding demands rather than the row wait §28 needs. This
+# instance is enabled in an already-capturing database, so fn_cdc_get_min_lsn is transiently NULL for up to a
+# polling interval — and a NULL floor is a REFUSAL, not a low bound, so without this the first read here
+# intermittently reports "the retention floor ... is not established yet". There is nothing to wait for in the
+# change table: these rows were inserted BEFORE the enable, so CDC never captured them. That is the point —
+# the snapshot is how a consumer gets them at all.
+statement ok
+SELECT fabricator_exec('c1', 'DECLARE @i int = 0; WHILE @i < 60 AND sys.fn_cdc_get_min_lsn(''snap_v1'') IS NULL BEGIN WAITFOR DELAY ''00:00:01''; SET @i = @i + 1; END');
+
+# ⚠⚠ THE DECLARED SHAPE IS THE CHANGE READ'S, COLUMN FOR COLUMN — that is what "one stream" MEANS, and it is
+# not free: MEASURED 2026-08-25, the obvious spellings of the snapshot's metadata literals describe
+# DIFFERENTLY (a CASE over a constant operation folds to varchar(6) where the real list gives varchar(16),
+# and binary + binary gives varbinary(21) rather than binary(21)), so both are re-stated with an explicit
+# CONVERT. Without them the arrival check refuses every snapshot — loudly, but every one.
+query TT
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM c1.cdc.changes('dbo.cdc_snap', include := 'snapshot'));
+----
+_change_type	VARCHAR
+_position	BLOB
+_commit_lsn	BLOB
+_seq_val	BLOB
+_operation	INTEGER
+_capture_instance	VARCHAR
+id	INTEGER
+v	VARCHAR
+amt	DECIMAL(9,2)
+
+# ⚠ THE BASELINE ROWS, and every metadata column is individually true rather than convenient. `insert` reuses
+# the Delta change-feed spelling §3.3 chose so a consumer that already handles a Delta CDF handles this one
+# unchanged — and Delta's own answer to "how do you spell the baseline" is `insert` too. _commit_lsn and
+# _seq_val are NULL because a snapshot row is STATE, not an event: it has no commit and no sequence within
+# one.
+query TIIITT
+SELECT _change_type, _operation, _commit_lsn IS NULL, _seq_val IS NULL, id, v
+  FROM c1.cdc.changes('dbo.cdc_snap', include := 'snapshot') ORDER BY id;
+----
+insert	2	true	true	1	one
+insert	2	true	true	2	two
+insert	2	true	true	3	three
+
+# ⚠⚠ _capture_instance IS THE DISCRIMINATOR, and it is NULL here for a reason rather than by omission: this
+# row came from the SOURCE table, not from a capture instance. A change row's value is a parameter that is
+# never null, so `_capture_instance IS NULL` is exactly "this is a baseline row" — one rule, no new column,
+# and it re-uses the column slice 5 shipped to make provenance readable.
+query II
+SELECT count(*), count(_capture_instance) FROM c1.cdc.changes('dbo.cdc_snap', include := 'snapshot');
+----
+3	0
+
+# ⚠ ONE handoff for the whole leg. It is not a per-row position — there is no change row behind it — it is
+# the single instant the whole snapshot is as of.
+query II
+SELECT count(DISTINCT _position), max(octet_length(_position)) FROM c1.cdc.changes('dbo.cdc_snap', include := 'snapshot');
+----
+1	21
+
+# On a quiet table the two halves are the baseline and nothing: the changes leg's window is empty because
+# nothing has committed since the pin. That is the ORDINARY case, not a dead end.
+query III
+SELECT count(*), count(*) FILTER (_capture_instance IS NULL), count(*) FILTER (_capture_instance IS NOT NULL)
+  FROM c1.cdc.changes('dbo.cdc_snap', include := 'snapshot+changes');
+----
+3	3	0
+
+# ═══ §29a  The handoff is a real cursor: resume from it and get exactly what came after ════════════════
+
+statement ok
+SET VARIABLE cdc_snap_h = (SELECT DISTINCT _position FROM c1.cdc.changes('dbo.cdc_snap', include := 'snapshot'));
+
+statement ok
+SELECT fabricator_exec('c1', 'INSERT INTO dbo.cdc_snap (id, v, amt) VALUES (4, N''four'', 4.50); UPDATE dbo.cdc_snap SET v = N''ONE'' WHERE id = 1; DELETE FROM dbo.cdc_snap WHERE id = 2;');
+
+statement ok
+SELECT fabricator_exec('c1', 'DECLARE @i int = 0; WHILE @i < 60 AND NOT EXISTS (SELECT 1 FROM cdc.snap_v1_CT HAVING COUNT(*) >= 4 AND MAX(__$start_lsn) <= sys.fn_cdc_get_max_lsn()) BEGIN WAITFOR DELAY ''00:00:01''; SET @i = @i + 1; END');
+
+# ⚠⚠ THE LOAD-BEARING ASSERTION OF THE WHOLE SLICE. The snapshot said what the table WAS; resuming from the
+# position its rows carried delivers exactly what happened after, with none of the three rows the snapshot
+# already carried replayed. Gap and overlap are both visible here: a handoff that were too LOW would replay
+# the original inserts, one too HIGH would drop one of these three.
+query TIT
+SELECT _change_type, id, coalesce(v, '<null>') FROM c1.cdc.changes('dbo.cdc_snap', starting_position := getvariable('cdc_snap_h')) ORDER BY _position;
+----
+insert	4	four
+update_postimage	1	ONE
+delete	2	two
+
+# And a snapshot taken NOW is the table as it now is, with nothing after it — the same shape as before the
+# mutations, which is what makes the pair meaningful rather than a single lucky read.
+query III
+SELECT count(*), count(*) FILTER (_capture_instance IS NULL), count(*) FILTER (_capture_instance IS NOT NULL)
+  FROM c1.cdc.changes('dbo.cdc_snap', include := 'snapshot+changes');
+----
+3	3	0
+
+# ═══ §29b  The 0xFF padding, and the duplicate it prevents ════════════════════════════════════════════
+# ⚠⚠ The handoff LSN is the capture WATERMARK, so every change AT it is already in the snapshot. Our cursor
+# predicate is `lsn > cur OR (lsn = cur AND (seq > cur_seq OR (seq = cur_seq AND op > cur_op)))`, so the
+# 21-byte position has to make both tails unsatisfiable — padding the LSN with 0xFF rather than with zeros.
+
+statement ok
+SET VARIABLE cdc_snap_h2 = (SELECT DISTINCT _position FROM c1.cdc.changes('dbo.cdc_snap', include := 'snapshot'));
+
+# It really is the watermark with eleven 0xFF bytes after it, not some other value that happens to work.
+query I
+SELECT getvariable('cdc_snap_h2') = (c1.cdc.max_position() || '\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF'::BLOB);
+----
+true
+
+# Nothing at or below it is delivered again.
+query I
+SELECT count(*) FROM c1.cdc.changes('dbo.cdc_snap', starting_position := getvariable('cdc_snap_h2'));
+----
+0
+
+# ⚠⚠ AND THE CONTROL THAT MAKES THAT MEAN SOMETHING — without it, "0 rows" would pass equally on a build
+# whose resume had stopped working altogether. The SAME LSN padded with ZEROS admits every row at the
+# watermark, which is exactly one row here: the DELETE, the last transaction the capture job recorded. That
+# is the duplicate the padding exists to prevent, and it is a row the snapshot has ALREADY accounted for.
+statement ok
+SET VARIABLE cdc_snap_z = (SELECT c1.cdc.max_position() || '\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'::BLOB);
+
+query TI
+SELECT _change_type, id FROM c1.cdc.changes('dbo.cdc_snap', starting_position := getvariable('cdc_snap_z'));
+----
+delete	2
+
+# ═══ §29c  A snapshot IS the starting point, so a cursor beside it is refused ══════════════════════════
+# Neither reading is what anybody wants: a snapshot of the CURRENT table paired with an OLD cursor delivers
+# every change between them twice, and one paired with a cursor AHEAD of it silently loses what lies between.
+
+statement error
+SELECT 1 FROM c1.cdc.changes('dbo.cdc_snap', include := 'snapshot', starting_position := getvariable('cdc_snap_h2'));
+----
+cannot be combined with starting_position
+
+statement error
+SELECT 1 FROM c1.cdc.changes('dbo.cdc_snap', include := 'snapshot+changes', starting_position := getvariable('cdc_snap_h2'));
+----
+cannot be combined with starting_position
+
+# ⚠ ending_position is refused for a DIFFERENT reason and only for the snapshot alone: a snapshot is the table
+# as of one instant, not a window, so there is no upper bound to apply.
+statement error
+SELECT 1 FROM c1.cdc.changes('dbo.cdc_snap', include := 'snapshot', ending_position := c1.cdc.max_position());
+----
+cannot be combined with ending_position
+
+# …and the control: with the changes half present it IS accepted, because there it bounds that half.
+query I
+SELECT count(*) FROM c1.cdc.changes('dbo.cdc_snap', include := 'snapshot+changes', ending_position := c1.cdc.max_position());
+----
+3
+
+statement error
+SELECT 1 FROM c1.cdc.changes('dbo.cdc_snap', include := 'bogus');
+----
+include := 'bogus' is not a value
+
+# Case-insensitive, like every other vocabulary in this surface.
+query I
+SELECT count(*) FROM c1.cdc.changes('dbo.cdc_snap', include := 'SNAPSHOT');
+----
+3
+
+# ═══ §29d  A captured column dropped from the source is REFUSED, not NULL-filled ═══════════════════════
+# ⚠ The case is real rather than defensive: §28's cdc_span had `v` DROPPED, and a DROP COLUMN leaves the
+# change table's column in place reading NULL. So the declaration — which is the CAPTURED set — names a
+# column SELECT cannot resolve on the source. NULL-filling it is not available either: §19.3 MEASURED that a
+# bare NULL takes its type from the OTHER branch of a union, and the snapshot statement has no other branch,
+# so it would describe as int and fail the arrival check anyway.
+
+statement error
+SELECT 1 FROM c1.cdc.changes('dbo.cdc_span', include := 'snapshot');
+----
+captured column 'v' no longer exists on the source table
+
+# ⚠ THE CONTROL, and it is what keeps the refusal narrow: the same table still reads its CHANGES. Without
+# this row the error above would pass equally on a build that had refused every read of cdc_span.
+query I
+SELECT count(*) FROM c1.cdc.changes('dbo.cdc_span', on_schema_change := 'ignore');
+----
+4
+
+# ⚠⚠ AND PUTTING THE COLUMN BACK MAKES THE SAME TABLE SNAPSHOTTABLE — the same fixture, one DDL apart, which
+# is what shows the refusal is about the SOURCE rather than about two-instance tables. It also exercises the
+# UNION path's snapshot statement, which is a different composition from the one-instance path: the columns
+# are the ALIGNED set of both instances. Note `v` now has VALUES here where the change stream reports it as
+# not captured — the snapshot reads the SOURCE, and that is the whole point of it.
+statement ok
+SELECT fabricator_exec('c1', 'ALTER TABLE dbo.cdc_span ADD v NVARCHAR(20) NULL;');
+
+statement ok
+SELECT fabricator_exec('c1', 'UPDATE dbo.cdc_span SET v = N''back'';');
+
+query TIIT
+SELECT _change_type, id, amt, coalesce(region, '<null>') FROM c1.cdc.changes('dbo.cdc_span', include := 'snapshot') ORDER BY id;
+----
+insert	1	9.99	<null>
+insert	2	2.50	<null>
+insert	3	3.50	eu
+
+# ═══ §29e  A transaction that has written the source cannot snapshot it ═══════════════════════════════
+# ⚠⚠ UNCONDITIONAL, unlike the pooled-scan hazard next door — the three escapes that make THAT one safe do
+# not apply. The protocol MUST take its lock on a connection of its own, because the lock's whole point is to
+# be released by a COMMIT whose timing we control, and committing the caller's transaction is not ours to do.
+# A lock REQUEST is not a read either, so row versioning does not exempt it. The request would wait on locks
+# only this transaction can release, which never returns — a hang rather than an error, which is why it is
+# refused up front.
+
+# ⚠⚠ THE COMMAND TIMEOUT IS PART OF THE TEST, not setup noise. Without the guard this read does not
+# FAIL, it HANGS: mssql_command_timeout defaults to 0 (infinite), so the lock request waits forever for a
+# lock only this transaction can release. A suite that hangs on regression is worse than no suite, so this
+# section bounds the wait — a build that loses the guard then fails here in ten seconds with a timeout
+# instead of stalling the tier. (MEASURED: the mutant with the guard removed ran past ten minutes.)
+statement ok
+SET mssql_command_timeout = 10;
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO c1.dbo.cdc_snap VALUES (9, 'nine', 9.5);
+
+statement error
+SELECT 1 FROM c1.cdc.changes('dbo.cdc_snap', include := 'snapshot');
+----
+this transaction has uncommitted writes to it
+
+statement ok
+ROLLBACK;
+
+statement ok
+RESET mssql_command_timeout;
+
+# ⚠ The refusal is at EXECUTE, and it has to be: bind must stay side-effect-free, and whether a transaction
+# holds locks is not a property of the statement. So the ROLLBACK above is what makes this read work again —
+# and the row it inserted is gone, which is the control proving the rollback really happened.
+query I
+SELECT count(*) FROM c1.cdc.changes('dbo.cdc_snap', include := 'snapshot');
+----
+3
+
+# ═══ §29f  enable := true + snapshot — capture a table and read its contents in ONE statement ══════════
+# The shape the two features exist for together: a table nobody has captured becomes a captured table AND
+# hands back everything already in it, with a position to keep going from.
+
+statement ok
+SELECT fabricator_exec('c1', 'IF OBJECT_ID(''dbo.cdc_seed'') IS NOT NULL DROP TABLE dbo.cdc_seed; CREATE TABLE dbo.cdc_seed(id INT NOT NULL PRIMARY KEY, v NVARCHAR(20) NULL);');
+
+statement ok
+SELECT fabricator_exec('c1', 'INSERT INTO dbo.cdc_seed (id, v) VALUES (1, N''x''), (2, N''y'');');
+
+# ⚠ BIND STAYS SIDE-EFFECT-FREE, and a snapshot leg does not change that: DESCRIBE resolves the whole shape
+# and captures NOTHING. Without this row the section below could not distinguish "enable ran at execute" from
+# "enable ran at bind and execute found it already captured".
+statement ok
+DESCRIBE SELECT * FROM c1.cdc.changes('dbo.cdc_seed', enable := true, include := 'snapshot+changes');
+
+query I
+SELECT count(*) FROM c1.cdc.tables() WHERE source_table = 'cdc_seed';
+----
+0
+
+query TIT
+SELECT _change_type, id, v FROM c1.cdc.changes('dbo.cdc_seed', enable := true, include := 'snapshot+changes') ORDER BY id;
+----
+insert	1	x
+insert	2	y
+
+query I
+SELECT count(*) FROM c1.cdc.tables() WHERE source_table = 'cdc_seed';
+----
+1
+
+# ⚠ It exercised the handoff CLAMP, which no row can show: the handoff is the DATABASE-wide capture watermark
+# while the instance created microseconds earlier starts ABOVE it, so the changes half's lower bound is the
+# instance's own floor rather than the handoff. Refusing there — which is what a plain starting_position
+# below the floor does — would have refused exactly this shape.
+
+# ═══ §29g  An EMPTY table snapshots to nothing — and therefore hands back no cursor ════════════════════
+# ⚠⚠ The one sharp edge of `include := 'snapshot'` ALONE, and it is worth pinning because the documented
+# idiom takes the handoff OUT OF THE ROWS. No rows means no handoff, so `SET VARIABLE cur = (SELECT DISTINCT
+# _position FROM …)` yields NULL, and `starting_position := NULL` is "absent" rather than an error — the next
+# read then starts at the RETENTION FLOOR and replays the table's whole captured history. Redundant rather
+# than wrong (the table was empty at the pin, so the replay nets to nothing), but it is the §3.4 trap wearing
+# a new hat. `include := 'snapshot+changes'` does not have it: there the handoff never leaves the reader.
+
+statement ok
+SELECT fabricator_exec('c1', 'IF OBJECT_ID(''dbo.cdc_void'') IS NOT NULL DROP TABLE dbo.cdc_void; CREATE TABLE dbo.cdc_void(id INT NOT NULL PRIMARY KEY);');
+
+statement ok
+SELECT target, changed FROM c1.cdc.enable('dbo.cdc_void', capture_instance := 'void_v1');
+
+statement ok
+SELECT fabricator_exec('c1', 'DECLARE @i int = 0; WHILE @i < 60 AND sys.fn_cdc_get_min_lsn(''void_v1'') IS NULL BEGIN WAITFOR DELAY ''00:00:01''; SET @i = @i + 1; END');
+
+# ⚠ It also exercises the lock on an EMPTY table, which nothing else here does: "there is nothing to read"
+# could plausibly have let the optimiser drop the scan and the TABLOCK with it. It does not (measured
+# separately: the lock is granted and a writer is blocked), and this read completing is the observable half.
+query I
+SELECT count(*) FROM c1.cdc.changes('dbo.cdc_void', include := 'snapshot');
+----
+0
+
+# The handoff is NULL, which is the trap stated as an assertion rather than as prose.
+query I
+SELECT (SELECT DISTINCT _position FROM c1.cdc.changes('dbo.cdc_void', include := 'snapshot')) IS NULL;
+----
+true
+
+# …and 'snapshot+changes' over the same empty table is simply empty, with no cursor for the caller to get
+# wrong. That is the form to reach for.
+query I
+SELECT count(*) FROM c1.cdc.changes('dbo.cdc_void', include := 'snapshot+changes');
+----
+0
+
+# ═══ §29h  The change read never joins the transaction — user-raised, and it was NOT already true ══════
+# ⚠⚠ `cdc.changes` was pooled in the COMMON case and pinned inside an explicit transaction that had written
+# the source (rule 3, MARS) or under mssql_read_isolation (rule 2, where it was also DRAINED). MEASURED from
+# the route log before the fix: the identical statement logged `route=pooled` in autocommit and
+# `route=pin (MARS)` inside such a transaction.
+#
+# It buys NOTHING: the capture job populates a change table ASYNCHRONOUSLY from COMMITTED log records, so a
+# change this transaction just made is not in it yet on ANY connection. What it cost is real — a long
+# STREAMING change reader on the transaction's WRITE connection is the 595 hazard, and the read_isolation
+# route buffered a whole change window into memory. So the reader opts out.
+#
+# ⚠ Only the change READ opts out. The WINDOW resolution deliberately keeps the pin, because a capture
+# instance enabled in THIS transaction IS visible to it and the window has to see it.
+
+statement ok
+SET enable_logging = true;
+
+statement ok
+SET logging_level = 'DEBUG';
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO c1.dbo.cdc_snap VALUES (7, 'seven', 7.5);
+
+query I
+SELECT count(*) > 0 FROM c1.cdc.changes('dbo.cdc_snap');
+----
+true
+
+statement ok
+COMMIT;
+
+# The change read declined the pin.
+query I
+SELECT count(*) > 0 FROM duckdb_logs
+WHERE message LIKE 'query [pooled%reader opts out%' AND message LIKE '%__$operation%';
+----
+true
+
+# ⚠⚠ THE POSITIVE CONTROL, and without it the row above is vacuous: in autocommit there is no pin to
+# decline, so "the read was pooled" would pass on a build where the opt-out did nothing. This asserts the
+# transaction really did have a pinned connection at that moment — the window resolution used it.
+query I
+SELECT count(*) > 0 FROM duckdb_logs WHERE message LIKE 'query [pinned%';
+----
+true
+
+# …and the change read is not among the pinned ones. `__$operation` is the change read's fingerprint: it is
+# the first thing its SELECT list mentions, well inside the 400-char log truncation.
+query I
+SELECT count(*) FROM duckdb_logs
+WHERE message LIKE 'query [pinned%' AND message LIKE '%__$operation%';
+----
+0
+
+statement ok
+SET enable_logging = false;
+
 # ═══ §9  Teardown — leave NO CDC-enabled table behind ══════════════════════════════════════════════════
 # Load-bearing: the capture job keeps scanning a CDC-enabled database between runs, and the next run's §3
 # would then find max_position() non-NULL and fail for a reason unrelated to the code.
@@ -1386,7 +1783,7 @@ statement ok
 SELECT fabricator_exec('c1', 'IF OBJECT_ID(''dbo.cdc_zz_noidx'') IS NOT NULL DROP TABLE dbo.cdc_zz_noidx;');
 
 statement ok
-SELECT fabricator_exec('c1', 'IF OBJECT_ID(''dbo.cdc_span'') IS NOT NULL DROP TABLE dbo.cdc_span; IF OBJECT_ID(''dbo.cdc_conf'') IS NOT NULL DROP TABLE dbo.cdc_conf;');
+SELECT fabricator_exec('c1', 'IF OBJECT_ID(''dbo.cdc_span'') IS NOT NULL DROP TABLE dbo.cdc_span; IF OBJECT_ID(''dbo.cdc_conf'') IS NOT NULL DROP TABLE dbo.cdc_conf; IF OBJECT_ID(''dbo.cdc_snap'') IS NOT NULL DROP TABLE dbo.cdc_snap; IF OBJECT_ID(''dbo.cdc_seed'') IS NOT NULL DROP TABLE dbo.cdc_seed; IF OBJECT_ID(''dbo.cdc_void'') IS NOT NULL DROP TABLE dbo.cdc_void;');
 
 statement ok
 SELECT fabricator_exec('c1', 'IF OBJECT_ID(''dbo.cdc_gen'') IS NOT NULL DROP TABLE dbo.cdc_gen; IF OBJECT_ID(''dbo.cdc_own'') IS NOT NULL DROP TABLE dbo.cdc_own; IF OBJECT_ID(''dbo.cdc_auto'') IS NOT NULL DROP TABLE dbo.cdc_auto; IF OBJECT_ID(''dbo.cdc_ddl'') IS NOT NULL DROP TABLE dbo.cdc_ddl; IF OBJECT_ID(''dbo.gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg'') IS NOT NULL DROP TABLE dbo.gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg;');

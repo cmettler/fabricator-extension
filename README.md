@@ -105,7 +105,8 @@ See [SQL Server external tables on S3](#sql-server-external-tables-on-s3).
 | **Change data capture** | `db.cdc.tables()` / `max_position()` / `min_position()` / `health()` — inspect SQL Server CDC | ✅ SQL Server only (not Fabric / Synapse) |
 | | `db.cdc.enable_database()` / `enable()` / `disable()` / `capture_now()` — set capture up from SQL, with a generated capture-instance name; the catalog refreshes itself | ✅ |
 | | `db.cdc.changes(...)` — a resumable change-stream reader with a 21-byte cursor, a retention pre-check, `enable := true`, an in-window schema-change check, and a table's two capture instances read as ONE stream across the boundary | ✅ |
-| | An initial-snapshot leg (`include := 'snapshot+changes'`), before-images, timestamp bounds | ❌ designed, not built (`docs/mssql-cdc.md` §15.12) |
+| | `include := 'snapshot'` / `'snapshot+changes'` — the whole table as of one consistent instant, then the changes after it, with no gap between the halves | ✅ |
+| | Before-images (`images := 'both'`), timestamp bounds, `on_schema_change := 'resync'` | ❌ designed, not built (`docs/mssql-cdc.md` §15.12) |
 | **Monitoring** | `db.dbo.fabricator_session_tag(k, v)` — tag a transaction's connection so Fabric query insights can attribute its cost | ✅ (see dbt caveat) |
 | | `application_name` on the secret → `program_name` on every statement (run-level attribution) | ✅ |
 | | Load-time *global* functions (connection-free); proc multi-result-set / `INOUT` params | ❌ deferred |
@@ -854,7 +855,7 @@ with no message queue anywhere in it. They live in the catalog's `cdc` schema, s
 | `db.cdc.enable('<schema>.<table>' [, capture_instance :=] [, columns :=] [, role :=] [, index :=] [, filegroup :=] [, net :=])` | `sys.sp_cdc_enable_table`. With no `capture_instance` it generates one (`fab_…`) and is idempotent **per table**; with one, per instance |
 | `db.cdc.disable('<schema>.<table>' [, capture_instance :=])` | `sys.sp_cdc_disable_table`; with no instance named, all of that table's |
 | `db.cdc.capture_now()` | `sys.sp_cdc_scan` — force the capture log scan now (see the ⚠ below) |
-| `db.cdc.changes('<schema>.<table>' \| '<capture instance>' [, starting_position :=] [, ending_position :=] [, capture_instance :=] [, images :=] [, commit_timestamp :=] [, enable :=] [, on_schema_change :=])` | the change stream — see below |
+| `db.cdc.changes('<schema>.<table>' \| '<capture instance>' [, starting_position :=] [, ending_position :=] [, capture_instance :=] [, images :=] [, commit_timestamp :=] [, enable :=] [, on_schema_change :=] [, include :=])` | the change stream, and optionally an initial snapshot before it — see below |
 | `db.cdc.health()` | 12 `(property, value)` rows, in this order: `supports_cdc`, `database`, `cdc_enabled`, `captured_instances`, `capture_job`, `capture_polling_interval_seconds`, `cleanup_job`, `cleanup_retention_minutes`, `max_lsn`, `max_lsn_time`, `max_lsn_age_seconds`, `agent_status` |
 
 The four setup functions each return one report row — `target`, `changed`, `detail`. **`changed` is separate
@@ -937,7 +938,8 @@ FROM db.cdc.changes('dbo.orders'                    -- a <schema>.<table> or a c
       [, images            := 'after']              -- the only value this release accepts
       [, commit_timestamp  := false]                -- opt-in, see below
       [, enable            := false]                -- capture the table on first read
-      [, on_schema_change  := 'error'])             -- 'error' (default) | 'ignore'
+      [, on_schema_change  := 'error']              -- 'error' (default) | 'ignore'
+      [, include           := 'changes'])           -- 'changes' (default) | 'snapshot' | 'snapshot+changes'
 ```
 
 | column | type | |
@@ -947,7 +949,7 @@ FROM db.cdc.changes('dbo.orders'                    -- a <schema>.<table> or a c
 | `_commit_lsn` | `BLOB(10)` | every row of one transaction shares it |
 | `_seq_val` | `BLOB(10)` | |
 | `_operation` | `INTEGER` | SQL Server's raw code (1 delete, 2 insert, 4 update after-image) |
-| `_capture_instance` | `VARCHAR` | which capture instance produced the row — what makes a `NULL` in a source column decidable when a table has two (see the note below) |
+| `_capture_instance` | `VARCHAR` | which capture instance produced the row — what makes a `NULL` in a source column decidable when a table has two (see the note below). **`NULL` means a `include := 'snapshot'` baseline row**, read from the source rather than from a capture instance |
 | `_commit_timestamp` | `TIMESTAMP` | only with `commit_timestamp := true` |
 | …source columns… | as the source table | a `delete` row carries the **deleted** values |
 
@@ -1027,11 +1029,67 @@ UPDATE my_cursors SET cur = getvariable('cdc_end') WHERE tbl = 'dbo.orders';
   happens when the query RUNS, never when it is planned — `EXPLAIN`, `DESCRIBE` and `CREATE VIEW` over it
   capture nothing, because the output schema is derived from the source table.
   - ⚠ **It does not backfill.** Capture starts at the moment of the enable, so rows written before it are
-    invisible and the very first read returns **zero rows** — not an error, because that is a fact rather
-    than a guess. An initial-snapshot leg is not built yet.
+    invisible and an `include := 'changes'` read returns **zero rows** — not an error, because that is a fact
+    rather than a guess. Pair it with `include := 'snapshot+changes'` to get what is already in the table.
   - ⚠ It is idempotent: on an already-captured table it is a no-op and the changes simply arrive.
-- **Not built yet** (`docs/mssql-cdc.md` §15.12): the initial-snapshot leg (`include := 'snapshot+changes'`),
-  `images := 'both'`, timestamp bounds, and reading across a two-instance schema-change boundary.
+
+#### Starting from nothing — `include := 'snapshot'` and `'snapshot+changes'`
+
+A change stream can only tell you what CHANGED. To fill an empty sink you also need the state that was
+already there, joined to the stream at a position where nothing is missed and nothing arrives twice:
+
+```sql
+-- capture the table AND read everything already in it, in one statement
+FROM db.cdc.changes('dbo.orders', enable := true, include := 'snapshot+changes');
+
+-- or take the baseline alone and keep its handoff for the poller
+SET VARIABLE cdc_cur = (SELECT DISTINCT _position
+                        FROM db.cdc.changes('dbo.orders', include := 'snapshot'));
+```
+
+Baseline rows arrive **first**, then the changes after them. A baseline row has `_change_type = 'insert'`
+(the Delta change-feed spelling, so an existing consumer needs no new branch) and **`_capture_instance IS
+NULL`** — that is how you tell a baseline row from a change. Its `_commit_lsn`, `_seq_val` and
+`_commit_timestamp` are `NULL`, because a baseline row is state rather than an event. Every baseline row
+carries the **same** `_position`: the handoff, which is what you resume from.
+
+How it works, and what it costs: one connection takes a **shared** table lock on the source — writers are
+frozen, ordinary readers are not — reads the handoff position, and a second connection pins a `SNAPSHOT`
+view inside that window. The lock is then released, and the table is read at leisure from the pinned view.
+The freeze lasts milliseconds, not the length of the read.
+
+> **⚠ It needs `ALLOW_SNAPSHOT_ISOLATION ON` for the database.** Without it the read refuses and names the
+> `ALTER DATABASE` to run. `READ_COMMITTED_SNAPSHOT` is *not* required.
+
+**Exactly-once, or at-least-once, and you can tell which.** The capture job is asynchronous, so a
+transaction that committed just before the lock may not be captured yet — its rows would be in the baseline
+*and* above the handoff, i.e. delivered twice. Closing that gap needs `sys.sp_cdc_scan` to run inside the
+lock window, and **the capture job holds the log-scan session continuously while it is running**, so on a
+database with a running capture job that call is refused and the read is at-least-once. It says so at
+`WARNING` level (visible in `duckdb_logs`), it never loses a row, and it is the guarantee the usual tools for
+this handoff give unconditionally. Stop the capture job (`sys.sp_cdc_stop_job`) if the duplicates matter.
+
+**What it refuses, and why:**
+
+- **`starting_position` beside a snapshot** — a snapshot *is* the starting point. A cursor next to it either
+  replays everything since that cursor or skips what came before it; neither is what anyone means.
+- **`ending_position` with `'snapshot'` alone** — a snapshot is one instant, not a window. It *is* accepted
+  with `'snapshot+changes'`, where it bounds the changes half.
+- **A captured column that no longer exists on the source.** A snapshot reads the source table, so a column
+  dropped from it has no value to read, while the change table keeps the column and reads `NULL`. Read
+  `include := 'changes'`, or capture the table afresh.
+- **A transaction that has written the table you are snapshotting.** The lock would wait for locks only your
+  own transaction can release. `COMMIT` or `ROLLBACK` first, or read `include := 'changes'`, which takes no
+  lock.
+
+> **⚠ An EMPTY table snapshots to no rows, and therefore to no handoff.** `SELECT DISTINCT _position FROM …`
+> is then `NULL`, and a `NULL` cursor means "no lower bound" rather than an error — so the next read starts
+> at the retention floor and replays. Prefer `include := 'snapshot+changes'`, where the handoff never leaves
+> the reader; if you do take the baseline alone, fall back to `db.cdc.max_position()` taken **before** the
+> read, which is at worst a small replay and never a skip.
+
+- **Not built yet** (`docs/mssql-cdc.md` §15.12): `images := 'both'`, timestamp bounds, and
+  `on_schema_change := 'resync'` (a new capture instance plus a fresh snapshot on schema drift).
 
 ### `db.dbo.fabricator_session_tag(key, value) -> TABLE` (SQL Server / Fabric)
 
