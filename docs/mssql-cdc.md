@@ -672,8 +672,26 @@ FROM db.cdc.changes('dbo.orders'                      -- positional: the SOURCE 
       [, images  := 'after' | 'both']                 -- default 'after'; NO net mode, see §1.7d
       [, include := 'changes' | 'snapshot' | 'snapshot+changes']  -- default 'changes'
       [, capture_instance := '<name>']                -- default: resolved per window (§7)
-      [, max_rows := <BIGINT>])
+      [, on_schema_change := 'error' | 'ignore' | 'resync' | 'null' | 'fill'])   -- §22, §27
 ```
+
+> **⚠⚠ `max_rows` IS WITHDRAWN — 2026-08-25, user-raised (*"i don't see a reason for max_rows?"*), and they
+> were right.** It sat in this signature from the first draft and was never built. It adds NO capability:
+> the "stop early" case is DuckDB's own `LIMIT`, and bounded, RESUMABLE pagination already works today with
+> `LIMIT` + `ORDER BY _position` + a cursor taken from `max(_position)` — MEASURED end to end over 25
+> changes: pages of 10, 10, 5 and then 0, ids 1-10, 11-20, 21-25, no gap and no duplicate, and the empty
+> page yields a NULL cursor that correctly says "do not advance". The README teaches that recipe.
+>
+> It would also have been WORSE than the recipe it replaces, for a reason already recorded at §11 item 5: a
+> row count can SPLIT A TRANSACTION, so `max_rows` would have to round down to a transaction boundary to be
+> coherent — at which point it does not return the number of rows its name promises. The same caveat applies
+> to the `LIMIT` recipe and is the caller's to make (the 21-byte cursor resumes mid-transaction EXACTLY, so
+> nothing is lost; a consumer needing whole transactions extends to a `_commit_lsn` boundary), but there it
+> is visible rather than hidden inside a parameter.
+>
+> ⚠ And a truncated result is INDISTINGUISHABLE from a complete one: a consumer cannot tell "that is all
+> there was" from "that is all you asked for" without a second signal, which a row-count parameter would
+> have had to invent.
 
 **Naming is not free here and the tree already paid for it.** `starting_*`/`ending_*` rather than `from`/`to`
 because **`from` and `to` are reserved words and a named parameter that is one is a PARSER error** that
@@ -1120,8 +1138,10 @@ in the README rather than papering over it.
    rather than *not running*.
 5. **Never emit an unpaired before image.** With `images := 'both'`, op 3 without a following op 4 means the
    window boundary split the pair. Prevented by making the window an LSN range (a transaction's rows share
-   `start_lsn`), but `max_rows` can still split one ⇒ `max_rows` must round down to a transaction boundary,
-   or be documented as "may split an update pair".
+   `start_lsn`). ⚠ Any ROW-COUNT bound can still split one — which is part of why `max_rows` was WITHDRAWN
+   (§3.2) rather than built: it would have had to round down to a transaction boundary to be coherent, and
+   then it would not return the number of rows its name promises. The `LIMIT` recipe that replaces it has
+   the same property, visibly and in the caller's hands.
 6. **Read-only replica**: capture cannot run on a replica, and a read there must use `SNAPSHOT` isolation
    and commit its read transaction each pass or it never sees new capture metadata. Out of scope for the
    first slice, but do not design it out.
@@ -2309,9 +2329,12 @@ document that the pre-check is the feature rather than a nicety.
   is built. What survives is why the vocabulary was pinned before the mode existed: `'net'` is refused as an
   unknown value and deliberately never NAMED, because naming it would advertise a mode this reader has
   decided not to have (§1.7d).
-- **No `max_rows`, though §3.2 lists it.** A truncated read breaks the cursor idiom — the caller would have
-  to advance to `max(_position)` rather than to the window end, which is exactly the trap §3.4 exists to
-  warn about. It belongs with a story about resuming a PARTIAL window, not with the smallest correct reader.
+- ~~**No `max_rows`, though §3.2 lists it.**~~ **WITHDRAWN 2026-08-25 — §3.2 has the reasoning.** It was
+  never built and is no longer advertised: `LIMIT` + `ORDER BY _position` + `max(_position)` is the same
+  thing, measured, and it keeps the transaction-splitting caveat where the caller can see it. ⚠ The original
+  objection here — that advancing to `max(_position)` is §3.4's trap — is TOO STRONG and worth correcting:
+  that trap is about advancing to a LOWER position than you read when a predicate filtered, which causes a
+  REPLAY (duplicates), never a skip. For an unfiltered ordered page it is exactly right.
 - **`_update_mask` is emitted ONLY under `images := 'both'`** (§21.3). In `'after'` mode the after-image is
   the truth, so the mask is not needed for correctness; under `'both'` it is the only way to read a NULL
   correctly, and §21.4 has the decoding recipe plus the multi-byte trap that makes the obvious one wrong.

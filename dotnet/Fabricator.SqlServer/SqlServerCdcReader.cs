@@ -75,10 +75,12 @@ internal sealed class CdcChangesFunction : ICatalogTableFunction
     /// at the instant we enable, captured == source (MEASURED). ⚠ It is a real DDL — it creates a change
     /// table and two table-valued functions — so a call that performs it reports
     /// <see cref="ITableFunctionBinding.SchemaMayChange"/> like the setup functions do.</para>
-    /// <para>⚠ NO <c>max_rows</c> in slice 3, though §3.2 lists it. A truncated read breaks the cursor idiom:
-    /// the caller must then advance to <c>max(_position)</c> rather than to the window end, which is exactly
-    /// the trap §3.4 exists to warn about. It belongs with a story about resuming a partial window, not with
-    /// the smallest correct reader.</para>
+    /// <para><b>⚠ NO <c>max_rows</c> — WITHDRAWN 2026-08-25 rather than deferred (§3.2).</b> It adds no
+    /// capability: "stop early" is DuckDB's own <c>LIMIT</c>, and bounded RESUMABLE pagination is
+    /// <c>LIMIT</c> + <c>ORDER BY _position</c> + a cursor from <c>max(_position)</c>, MEASURED end to end.
+    /// It would also be worse than that recipe — a row count can SPLIT A TRANSACTION (§11 item 5), so it
+    /// would have to round down to a transaction boundary and then would not return the number of rows its
+    /// name promises. The recipe has the same caveat, visibly and in the caller's hands.</para>
     /// </remarks>
     public Schema Parameters { get; } = new(new[]
     {

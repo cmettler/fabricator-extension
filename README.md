@@ -1017,6 +1017,25 @@ UPDATE my_cursors SET cur = getvariable('cdc_end') WHERE tbl = 'dbo.orders';
   refused rather than swallowed.
 - **An `UPDATE` produces ONE row by default** (the after-image); `images := 'both'` surfaces the pair as
   `update_preimage` + `update_postimage` and adds `_update_mask` — see below.
+- **To bound how much you take in one pass, use `LIMIT` — there is no `max_rows` and there will not be
+  one.** `LIMIT` + `ORDER BY _position` + a cursor taken from `max(_position)` is a complete resumable
+  pagination, with no gap and no duplicate between pages:
+
+  ```sql
+  SET VARIABLE cur = <your stored cursor>;   -- or db.cdc.min_position('<instance>') to start
+  CREATE OR REPLACE TEMP TABLE page AS
+    SELECT * FROM db.cdc.changes('dbo.orders', starting_position := getvariable('cur'))
+    ORDER BY _position LIMIT 10000;
+  -- …consume `page`, then advance. An EMPTY page gives NULL: do not advance, you are caught up.
+  SET VARIABLE cur = coalesce((SELECT max(_position) FROM page), getvariable('cur'));
+  ```
+
+  ⚠ A row-count bound can land **mid-transaction**. Nothing is lost — the 21-byte cursor resumes exactly —
+  but a consumer that needs whole transactions should extend the page to a `_commit_lsn` boundary rather
+  than cutting at the row count. That caveat is why a built-in `max_rows` would have been worse than this:
+  it would have had to round down to a transaction boundary and then not return the number of rows its name
+  promises.
+
 - **Wall-clock bounds are INCLUSIVE, and a `_position` is not — that asymmetry is deliberate.** A
   `_position` is a resume token, so the row it names has already been read and the bound is EXCLUSIVE; a
   timestamp is an instant you have read nothing of, so `starting_timestamp` means *at or after*, and
