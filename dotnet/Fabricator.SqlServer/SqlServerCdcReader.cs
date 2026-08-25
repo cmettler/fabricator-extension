@@ -217,13 +217,15 @@ internal sealed class CdcChangesPlan
                             string onSchemaChange, Schema output,
                             byte[]? startingPosition, byte[]? endingPosition,
                             string? captureInstance = null, string? sourceSchema = null,
-                            string? sourceTable = null, string? sql = null)
+                            string? sourceTable = null, string? sql = null,
+                            string? secondInstance = null)
     {
         Source = source;
         ExplicitInstance = explicitInstance;
         CommitTimestamp = commitTimestamp;
         OnSchemaChange = onSchemaChange;
         CaptureInstance = captureInstance;
+        SecondInstance = secondInstance;
         SourceSchema = sourceSchema;
         SourceTable = sourceTable;
         Output = output;
@@ -250,6 +252,23 @@ internal sealed class CdcChangesPlan
     /// declared schema came from the SOURCE and the instance does not exist until execute (§15.7).
     /// </summary>
     internal string? CaptureInstance { get; }
+
+    /// <summary>
+    /// The NEWER capture instance when this read spans a two-instance boundary (slice 7, §19); null for the
+    /// ordinary one-instance read. <see cref="CaptureInstance"/> is then the OLDER one.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>⚠⚠ THE ORDER IS THE CONTRACT, not a label.</b> The split is the NEWER instance's retention
+    /// floor and the partition is "older strictly below it, newer at or above it", so swapping the two would
+    /// read the newer instance for the range only the older one covers — and the newer one does not have those
+    /// rows, so the result would be SHORT rather than wrong-looking. They are ordered by <c>start_lsn</c>
+    /// (the semantic discriminator: a second instance's <c>start_lsn</c> IS the boundary) with
+    /// <c>create_date</c> as the tiebreak, because the cleanup job raises BOTH floors and they converge.</para>
+    /// </remarks>
+    internal string? SecondInstance { get; }
+
+    /// <summary>True when this read unions two capture instances across their boundary.</summary>
+    internal bool IsUnion => SecondInstance is not null;
 
     internal string? SourceSchema { get; }
 
@@ -344,6 +363,31 @@ internal sealed class CdcChangesPlan
         return a.Length.CompareTo(b.Length);
     }
 
+    /// <summary>
+    /// Whether an LSN is all zero bytes — which is what SQL Server answers for a capture instance it does not
+    /// know, and it is NOT a harmless sentinel.
+    /// </summary>
+    /// <remarks>
+    /// <b>⚠⚠ MEASURED 2026-08-25: <c>sys.fn_cdc_get_min_lsn(&lt;unknown&gt;)</c> and
+    /// <c>sys.fn_cdc_get_min_lsn(NULL)</c> both return <c>0x0000000000000000000</c>, NOT NULL.</b> Zero is a
+    /// well-formed LSN that compares BELOW every real one, so it passes the retention pre-check trivially and
+    /// hands the window to the TVF — the misleading 313 that §2.1 exists to prevent. On the two-instance path
+    /// it is worse than misleading: a zero SPLIT puts every row in the newer leg and SILENTLY DROPS every
+    /// pre-boundary change. It is distinguishable from the genuinely transient NULL floor of §1.6a, so the two
+    /// get different answers.
+    /// </remarks>
+    internal static bool IsZeroLsn(byte[] value)
+    {
+        foreach (byte b in value)
+        {
+            if (b != 0)
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
     internal static string Hex(byte[] value)
     {
         var sb = new StringBuilder(2 + (value.Length * 2));
@@ -359,12 +403,14 @@ internal sealed class CdcChangesPlan
 /// <summary>The window one execution reads, after the §2.1 pre-check has passed.</summary>
 internal sealed class CdcWindow
 {
-    internal CdcWindow(byte[] fromLsn, byte[] toLsn, byte[]? startingPosition, byte[]? endingPosition)
+    internal CdcWindow(byte[] fromLsn, byte[] toLsn, byte[]? startingPosition, byte[]? endingPosition,
+                       byte[]? split = null)
     {
         FromLsn = fromLsn;
         ToLsn = toLsn;
         StartingPosition = startingPosition;
         EndingPosition = endingPosition;
+        Split = split;
     }
 
     internal byte[] FromLsn { get; }
@@ -374,6 +420,20 @@ internal sealed class CdcWindow
     internal byte[]? StartingPosition { get; }
 
     internal byte[]? EndingPosition { get; }
+
+    /// <summary>
+    /// The boundary between two capture instances — the NEWER one's retention floor — on a union read; null
+    /// on the ordinary one-instance read.
+    /// </summary>
+    /// <remarks>
+    /// <b>⚠⚠ IT IS DERIVED, because SQL Server does not record it.</b> MEASURED (§2.2, re-confirmed
+    /// 2026-08-25): <c>cdc.change_tables.end_lsn</c> is NULL for BOTH instances, so the older one's stop
+    /// position exists nowhere and has to be computed as the newer one's start. Using
+    /// <c>fn_cdc_get_min_lsn</c> rather than <c>change_tables.start_lsn</c> is deliberate and buys retention
+    /// correctness for free: the cleanup job RAISES that floor as it purges, and the purged range is exactly
+    /// the range the newer instance can no longer answer for — which the older instance still covers.
+    /// </remarks>
+    internal byte[]? Split { get; }
 
     /// <summary>
     /// The window that reads nothing, without touching the server. ⚠ It is a legitimate STATE, not a failure:

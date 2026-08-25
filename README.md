@@ -104,7 +104,7 @@ See [SQL Server external tables on S3](#sql-server-external-tables-on-s3).
 | | **Custom C# aggregates** (UDAF) → `db.schema.agg(x)` in `GROUP BY` / parallel / `OVER(…)`; opt-in disk-spill (`SupportsSpill`) | ✅ |
 | **Change data capture** | `db.cdc.tables()` / `max_position()` / `min_position()` / `health()` — inspect SQL Server CDC | ✅ SQL Server only (not Fabric / Synapse) |
 | | `db.cdc.enable_database()` / `enable()` / `disable()` / `capture_now()` — set capture up from SQL, with a generated capture-instance name; the catalog refreshes itself | ✅ |
-| | `db.cdc.changes(...)` — a resumable change-stream reader with a 21-byte cursor, a retention pre-check, `enable := true` and an in-window schema-change check | ✅ |
+| | `db.cdc.changes(...)` — a resumable change-stream reader with a 21-byte cursor, a retention pre-check, `enable := true`, an in-window schema-change check, and a table's two capture instances read as ONE stream across the boundary | ✅ |
 | | An initial-snapshot leg (`include := 'snapshot+changes'`), before-images, timestamp bounds | ❌ designed, not built (`docs/mssql-cdc.md` §15.12) |
 | **Monitoring** | `db.dbo.fabricator_session_tag(k, v)` — tag a transaction's connection so Fabric query insights can attribute its cost | ✅ (see dbt caveat) |
 | | `application_name` on the secret → `program_name` on every statement (run-level attribution) | ✅ |
@@ -849,7 +849,7 @@ with no message queue anywhere in it. They live in the catalog's `cdc` schema, s
 |---|---|
 | `db.cdc.tables()` | one row per capture **instance** — `source_schema`, `source_table`, `capture_instance`, `start_lsn`, `end_lsn`, `supports_net_changes`, `has_drop_pending`, `role_name`, `index_name`, `filegroup_name`, `create_date`, `index_column_list`, `captured_column_list`, `fabricator_source` (non-NULL ⇒ this extension created the instance) |
 | `db.cdc.max_position()` | the current log position (`sys.fn_cdc_get_max_lsn`) as a `BLOB`, or `NULL` |
-| `db.cdc.min_position('<capture instance>' \| '<schema>.<table>')` | the **retention floor** (`sys.fn_cdc_get_min_lsn`) as a `BLOB`, or `NULL` |
+| `db.cdc.min_position('<capture instance>' \| '<schema>.<table>')` | the **retention floor** (`sys.fn_cdc_get_min_lsn`) as a `BLOB`, or `NULL`. For a table with two capture instances, the floor of the range `cdc.changes` can read — i.e. the older instance's |
 | `db.cdc.enable_database()` | `sys.sp_cdc_enable_db` — idempotent |
 | `db.cdc.enable('<schema>.<table>' [, capture_instance :=] [, columns :=] [, role :=] [, index :=] [, filegroup :=] [, net :=])` | `sys.sp_cdc_enable_table`. With no `capture_instance` it generates one (`fab_…`) and is idempotent **per table**; with one, per instance |
 | `db.cdc.disable('<schema>.<table>' [, capture_instance :=])` | `sys.sp_cdc_disable_table`; with no instance named, all of that table's |
@@ -909,15 +909,18 @@ SELECT * FROM db.cdc.health();
   `Msg 22927` about a name you never chose. Pass `capture_instance :=` if you want to name one yourself.
   `cdc.tables()` lists them, and everything else takes the TABLE name.
 - **`cdc.enable` on an already-captured table is a no-op, and that is deliberate.** It reports
-  `changed = false` and names the existing instance rather than adding a second — a table with two capture
-  instances makes `cdc.changes` ambiguous, and it refuses rather than picking one. An explicit
-  `capture_instance :=` is how you deliberately create the second (that is how a schema change is absorbed).
+  `changed = false` and names the existing instance rather than adding a second. A second instance is a real
+  change to what `cdc.changes` returns for that table — the declared columns become the union of both, and
+  rows start carrying different `_capture_instance` values — and that is not something a bare `enable` should
+  do silently. An explicit `capture_instance :=` is how you deliberately create the second (that is how a
+  schema change is absorbed).
 - **`fabricator_source` in `cdc.tables()` tells you which instances this extension created.** It is an
   extended property written atomically with the enable; `NULL` means someone else made that instance, and
   nothing here will manage it for you.
 - **`min_position` takes the capture instance OR the table.** A table may have **two** capture instances (how
-  a schema change is absorbed), and their retention floors can differ — so a table name that matches two is
-  refused rather than resolved by picking one. `cdc.tables()` lists the instance names.
+  a schema change is absorbed) and their retention floors can differ; for a table name it reports the **older**
+  one's, which is where the range `cdc.changes` reads begins. If either floor is momentarily unknown the
+  answer is `NULL` rather than the other one. `cdc.tables()` lists the instance names.
 - **`max_lsn_age_seconds` is not lag.** It is the age of the newest *captured* transaction, so on an idle
   database it grows without bound while capture is perfectly current.
 - SQL Server's own per-instance functions (`cdc.fn_cdc_get_all_changes_<instance>`, and the `_each` per-row
@@ -930,7 +933,7 @@ SELECT * FROM db.cdc.health();
 FROM db.cdc.changes('dbo.orders'                    -- a <schema>.<table> or a capture-instance name
       [, starting_position := <BLOB>]               -- EXCLUSIVE lower bound: a 10-byte LSN or a 21-byte _position
       [, ending_position   := <BLOB>]               -- INCLUSIVE upper bound; default db.cdc.max_position()
-      [, capture_instance  := '<name>']             -- required when a table has two
+      [, capture_instance  := '<name>']             -- read ONE instance of a table that has two
       [, images            := 'after']              -- the only value this release accepts
       [, commit_timestamp  := false]                -- opt-in, see below
       [, enable            := false]                -- capture the table on first read
@@ -944,7 +947,7 @@ FROM db.cdc.changes('dbo.orders'                    -- a <schema>.<table> or a c
 | `_commit_lsn` | `BLOB(10)` | every row of one transaction shares it |
 | `_seq_val` | `BLOB(10)` | |
 | `_operation` | `INTEGER` | SQL Server's raw code (1 delete, 2 insert, 4 update after-image) |
-| `_capture_instance` | `VARCHAR` | which capture instance produced the row |
+| `_capture_instance` | `VARCHAR` | which capture instance produced the row — what makes a `NULL` in a source column decidable when a table has two (see the note below) |
 | `_commit_timestamp` | `TIMESTAMP` | only with `commit_timestamp := true` |
 | …source columns… | as the source table | a `delete` row carries the **deleted** values |
 
@@ -995,8 +998,29 @@ UPDATE my_cursors SET cur = getvariable('cdc_end') WHERE tbl = 'dbo.orders';
 - **`commit_timestamp` is opt-in because it costs a join.** It is the only column that needs
   `cdc.lsn_time_mapping`, DuckDB will not eliminate that join when nothing selects from it, and the value is
   a `datetime` (~3.33 ms) — metadata, never an ordering key. `_position` is the ordering key.
-- **A table with two capture instances is refused, not resolved.** Both capture every change in the overlap
-  window, so reading either silently double-counts or drops; name one with `capture_instance :=`.
+- **⚠⚠ A table with two capture instances reads as ONE stream, and the `NULL`s in it mean two different
+  things.** A second instance is how a schema change is absorbed: the older one keeps the old column set, the
+  newer one has the new one, and **both capture every change** from the moment the newer exists — so reading
+  both naively would return every later change twice. `cdc.changes` splits the window at the boundary (the
+  newer instance's retention floor, which SQL Server records nowhere else) and reads each side once. The
+  declared columns are the **union** of both instances, by name: the newer instance's columns first, then any
+  the older one alone has, with missing ones `NULL`-filled.
+
+  **Read `_capture_instance` before you read a `NULL`.** A `NULL` in a column the row's instance did not
+  capture means *"this predates the column"*; the same `NULL` on a row from the instance that does capture it
+  means the value really was `NULL`. Nothing else can tell you which.
+
+  Two consequences worth knowing:
+  - **A schema change *below* the boundary does not trigger `on_schema_change`.** The second instance exists
+    because of it, and the union already carries both shapes. One issued *after* the newest instance still
+    refuses — nobody re-captured for that one.
+  - **A column dropped and re-added with a different type is refused**, naming both types and both instances.
+    It is the only way two instances can disagree on a type (an `ALTER COLUMN` is propagated to both), and a
+    union would coerce one era to the other's type — silently, wherever the values happen to convert. Read
+    each instance on its own with `capture_instance :=`.
+
+  ⚠ For up to one polling interval after you create a second instance, the boundary does not exist yet and
+  the read says so and asks you to retry. `capture_instance :=` works immediately.
 - **Ordering is yours.** Rows arrive in no promised order; `ORDER BY _position` is correct replay order, and
   `_position` values compare as unsigned bytes so `min()`/`max()` work.
 - **`enable := true` captures the table on first read**, so a pipeline needs no separate setup step. The DDL

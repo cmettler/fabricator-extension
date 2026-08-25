@@ -616,7 +616,24 @@ case "$TIER" in
         # /!\ §19's positive control needed on_schema_change := 'ignore' when this landed: §7 alters
         # dbo.cdc_probe while dbo_cdc_probe is capturing, so a DDL genuinely sits inside that window. That
         # is the check working, not a workaround.
-        : "${MIN_ASSERTIONS:=2524}"
+        # 2607 since 2026-08-25: verify_mssql_cdc 268 -> 351 for slice 7 - the TWO-INSTANCE BOUNDARY read as
+        # ONE stream. Exactly +83 over 2524, i.e. NO other suite moved.
+        # /!\ A ROW COUNT CANNOT DISCRIMINATE THIS ONE, and that is the trap the section is built around: the
+        # OLDER capture instance never stops capturing, so reading it alone returns EVERY row - the same four -
+        # just without the column only the newer one has. The load-bearing assertion is on VALUES that no
+        # single instance can produce together (`v` from the older, `region` from the newer, in one result).
+        # /!\ The mutant that removes BOTH halves of the partition - the `< @split` predicate and the clamp on
+        # the older leg's TVF window - dies with "Expected 4 rows, but got 6": the DOUBLE COUNT that §2.2
+        # MEASURED both instances make possible. Removing either half ALONE survives, because in this fixture
+        # each covers the other; that redundancy is deliberate, since the failure it guards is a silent wrong
+        # answer.
+        # /!\ Deriving the boundary wrong (the older floor instead of the newer's) and never excusing an
+        # absorbed DDL BOTH die at §19's `cdc.changes('dbo.cdc_probe')` = 0, 161 assertions in - a two-instance
+        # read whose boundary is wrong stops absorbing the very DDL the second instance exists for.
+        # /!\ The floor waits are not politeness: fn_cdc_get_min_lsn is transiently NULL for a newly enabled
+        # instance (§1.6a) and that value IS the boundary, so without them the section intermittently gets
+        # "the boundary ... is not established yet" instead of rows.
+        : "${MIN_ASSERTIONS:=2607}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

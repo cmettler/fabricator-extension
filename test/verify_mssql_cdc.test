@@ -5,7 +5,8 @@
 # Slices 1-3 of docs/mssql-cdc.md: the ServerProfile.SupportsCdc gate, the appended `cdc` schema, the four
 # read-only functions (§1-§8), the four setup functions and the ABI v81 flag they exercise (§10-§14), and
 # THE READER, cdc.changes (§15-§21), slice 4 - the generated capture-instance name, the ownership marker
-# and enable := true (§22-§25) - and slice 5, _capture_instance and the in-window DDL check (§26-§27).
+# and enable := true (§22-§25) - slice 5, _capture_instance and the in-window DDL check (§26-§27) - and
+# slice 7, the two-instance boundary read as ONE stream (§28).
 #
 # ⚠ SERVICE TIER — it needs a real SQL Server, and unlike the rest of that tier it also needs SQL SERVER
 #   AGENT (docker-compose sets MSSQL_AGENT_ENABLED=true). §8's agent assertion is the ONLY thing in either
@@ -291,7 +292,7 @@ SELECT c1.cdc.min_position('dbo.nope');
 ----
 is not a captured table or capture instance
 
-# ═══ §7  Two capture instances: REFUSED, not resolved by precedence ════════════════════════════════════
+# ═══ §7  Two capture instances: the fixture, and what resolution owes them ═════════════════════════
 # A second instance is how a schema change is absorbed, and both capture the SAME change concurrently, so
 # reading both double-counts. Their retention floors can also differ — MEASURED (0x…2C00000C980040 vs
 # 0x…2D00000E900043 on one table) — so answering for either one would be a wrong answer, not a shortcut.
@@ -315,14 +316,20 @@ SELECT capture_instance, captured_column_list FROM c1.cdc.tables() ORDER BY capt
 dbo_cdc_probe	[id], [v]
 dbo_cdc_probe_v2	[id], [v], [extra]
 
-statement error
-SELECT c1.cdc.min_position('dbo.cdc_probe');
+# ⚠ SINCE SLICE 7 THIS ANSWERS rather than refusing, and the answer is the OLDER instance's floor — the start
+# of the range cdc.changes now reads as one stream across the boundary (§28). While the reader refused the
+# same source, "the floor of what?" genuinely had no answer; now it does, and a caller who follows the
+# retention error's own advice with the string they passed to cdc.changes gets a position rather than a
+# lecture.
+query I
+SELECT coalesce(octet_length(c1.cdc.min_position('dbo.cdc_probe')), 10) = 10;
 ----
-matches 2 capture instances
+true
 
-# ⚠ THE OTHER HALF OF §6's PROOF, and the reason the refusal above is about RESOLUTION rather than about
-# min_position being broken: naming the instance still works while the table name is ambiguous. Between the
-# two, the table→instances mapping and the instance-name path are both pinned, with no floor value read.
+# ⚠ THE OTHER HALF OF §6's PROOF: naming the instance resolves the same way the table name does. Between the
+# two, the table→instances mapping and the instance-name path are both pinned, with no floor VALUE read —
+# §1.6a MEASURED that two calls in one statement can straddle the transient-NULL transition, so no assertion
+# here may depend on what the floor is.
 query I
 SELECT coalesce(octet_length(c1.cdc.min_position('dbo_cdc_probe_v2')), 10) = 10;
 ----
@@ -706,15 +713,25 @@ it must be either a 10-byte log sequence number
 
 # ═══ §19  Refusals that are decisions, not gaps ══════════════════════════════════════════════════════
 
-# Two capture instances on one table BOTH capture every change in their overlap window (§2.2, MEASURED), so
-# answering for either is a wrong ANSWER rather than a shortcut. dbo.cdc_probe has had two since §7.
-statement error
+# ⚠ THIS WAS A REFUSAL UNTIL SLICE 7 and is now a read: two capture instances on one table BOTH capture every
+# change in their overlap window (§2.2, MEASURED), so the reader splits the window at the boundary instead of
+# picking one. dbo.cdc_probe has had two since §7, and the ALTER that motivated the second one is BELOW the
+# boundary, so the DEFAULT on_schema_change reads it — the absorption rule, on a fixture built for the old
+# refusal. §28 is where the boundary itself is pinned; this row only proves the refusal is gone.
+query I
 SELECT count(*) FROM c1.cdc.changes('dbo.cdc_probe');
 ----
-matches 2 capture instances
+0
 
-# …and naming one resolves it. The positive control for the refusal: without it the error above would pass
-# equally on a build that refused every read.
+# …and the shape is the union of both instances: `extra` exists only in dbo_cdc_probe_v2 and is NULL-filled
+# for anything the older one answers.
+query I
+SELECT count(*) FROM (DESCRIBE SELECT * FROM c1.cdc.changes('dbo.cdc_probe')) WHERE column_name = 'extra';
+----
+1
+
+# …and naming one instance still reads THAT ONE alone, which is the escape for everything the union cannot
+# represent.
 #
 # ⚠ on_schema_change := 'ignore' is REQUIRED here and the reason is instructive: §7 ran
 # `ALTER TABLE dbo.cdc_probe ADD extra INT NULL` while dbo_cdc_probe was capturing, so a DDL sits INSIDE
@@ -885,11 +902,20 @@ SELECT target, changed FROM c1.cdc.enable('dbo.cdc_gen', capture_instance := 'cd
 ----
 dbo.cdc_gen (cdc_gen_v2)	true
 
-# …and NOW the reader refuses that table, which is exactly what the default enable exists to avoid.
-statement error
-SELECT count(*) FROM c1.cdc.changes('dbo.cdc_gen');
+# ⚠ SINCE SLICE 7 the reader no longer REFUSES that table — it splits the window at the boundary and reads
+# both instances as one stream (§28). That does not weaken the table-keyed default, it STRENGTHENS it: a bare
+# enable that silently added a second instance used to make cdc.changes('<that table>') fail LOUDLY, and
+# would now silently change its declared shape and the provenance of its rows instead. The loud symptom was
+# the one worth keeping.
+# ⚠ Asserted through DESCRIBE, which BINDS without executing. cdc_gen_v2 is seconds old, and the boundary a
+# two-instance READ splits on is the newer instance's retention floor — §1.6a MEASURED that this is
+# transiently NULL, so an execute here would intermittently answer "not established yet" instead. That
+# refusal is deliberate: substituting cdc.change_tables.start_lsn would be right only until the cleanup job
+# has run, after which it would send the newer leg a range that instance no longer holds — a SHORT read.
+query I
+SELECT count(*) > 0 FROM (DESCRIBE SELECT * FROM c1.cdc.changes('dbo.cdc_gen'));
 ----
-matches 2 capture instances
+true
 
 statement ok
 SELECT target, changed FROM c1.cdc.disable('dbo.cdc_gen', capture_instance := 'cdc_gen_v2');
@@ -1111,6 +1137,237 @@ SELECT count(*) FROM c1.cdc.changes('dbo.cdc_ddl', on_schema_change := 'nonsense
 ----
 is not a value
 
+# ═══ §28  THE TWO-INSTANCE BOUNDARY — one stream across it (slice 7) ══════════════════════════════════
+# docs §19. A second capture instance is how a schema change is absorbed, and §2.2 MEASURED that BOTH
+# instances capture every change in their overlap window — so a reader must pick ONE per LSN range and switch
+# at a boundary SQL Server records NOWHERE (cdc.change_tables.end_lsn is NULL for both, re-confirmed
+# 2026-08-25). The boundary is DERIVED as the newer instance's retention floor, which is also what keeps it
+# correct under cleanup: that floor RISES as the cleanup job purges, and the purged range is exactly the range
+# the newer instance can no longer answer for — while the older one still covers it.
+
+statement ok
+SELECT fabricator_exec('c1', 'IF OBJECT_ID(''dbo.cdc_span'') IS NOT NULL DROP TABLE dbo.cdc_span; CREATE TABLE dbo.cdc_span(id INT NOT NULL PRIMARY KEY, v NVARCHAR(20) NULL, amt DECIMAL(9,2) NULL);');
+
+statement ok
+SELECT target, changed FROM c1.cdc.enable('dbo.cdc_span', capture_instance := 'span_v1');
+
+statement ok
+SELECT fabricator_exec('c1', 'INSERT INTO dbo.cdc_span (id, v, amt) VALUES (1, N''one'', 1.50), (2, N''two'', 2.50);');
+
+# ⚠ Wait for the WATERMARK as well as the rows: a row is not readable until fn_cdc_get_max_lsn() covers it, so
+# waiting only for COUNT leaves a race whose symptom is a SHORT READ — a wrong answer rather than a failure.
+statement ok
+SELECT fabricator_exec('c1', 'DECLARE @i int = 0; WHILE @i < 60 AND NOT EXISTS (SELECT 1 FROM cdc.span_v1_CT HAVING COUNT(*) >= 2 AND MAX(__$start_lsn) <= sys.fn_cdc_get_max_lsn()) BEGIN WAITFOR DELAY ''00:00:01''; SET @i = @i + 1; END');
+
+# The two DDLs the second instance exists for — one ADD and one DROP, so alignment is exercised in BOTH
+# directions: `region` ends up in the newer instance only, `v` in the older only.
+statement ok
+SELECT fabricator_exec('c1', 'ALTER TABLE dbo.cdc_span ADD region VARCHAR(10) NULL;');
+
+statement ok
+SELECT fabricator_exec('c1', 'ALTER TABLE dbo.cdc_span DROP COLUMN v;');
+
+statement ok
+SELECT target, changed FROM c1.cdc.enable('dbo.cdc_span', capture_instance := 'span_v2');
+
+statement ok
+SELECT fabricator_exec('c1', 'INSERT INTO dbo.cdc_span (id, amt, region) VALUES (3, 3.50, ''eu''); UPDATE dbo.cdc_span SET amt = 9.99 WHERE id = 1;');
+
+# ⚠⚠ THE FLOOR WAIT IS LOAD-BEARING AND IT IS NOT THE SAME AS THE ROW WAIT. §1.6a MEASURED that
+# fn_cdc_get_min_lsn is transiently NULL for an instance enabled in an already-capturing database — and that
+# floor IS the boundary this section splits on, so without this wait the first read below intermittently gets
+# "the boundary … is not established yet" instead of rows. The CT wants 3 rows: the insert, and the update's
+# pre- AND post-image (the TVF returns only the post-image under images := 'after', the change table holds
+# both).
+statement ok
+SELECT fabricator_exec('c1', 'DECLARE @i int = 0; WHILE @i < 60 AND (sys.fn_cdc_get_min_lsn(''span_v2'') IS NULL OR NOT EXISTS (SELECT 1 FROM cdc.span_v2_CT HAVING COUNT(*) >= 3 AND MAX(__$start_lsn) <= sys.fn_cdc_get_max_lsn())) BEGIN WAITFOR DELAY ''00:00:01''; SET @i = @i + 1; END');
+
+# ⚠⚠ THE DECLARED SHAPE: the NEWER instance's captured columns first, then the columns only the OLDER one
+# has. The newer set is the table's CURRENT shape and the one a consumer keeps seeing once the older instance
+# is gone, so `SELECT *` is stable in the direction that matters; a dropped column is history and is appended.
+query TT
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM c1.cdc.changes('dbo.cdc_span'));
+----
+_change_type	VARCHAR
+_position	BLOB
+_commit_lsn	BLOB
+_seq_val	BLOB
+_operation	INTEGER
+_capture_instance	VARCHAR
+id	INTEGER
+amt	DECIMAL(9,2)
+region	VARCHAR
+v	VARCHAR
+
+# ⚠⚠ AND THE DEFAULT MODE READS IT — no on_schema_change opt-out anywhere in this section until the last
+# rows. Two DDLs sit inside this window and §27's check refuses a window containing one, but they are BELOW
+# the boundary, which is where a DDL is ABSORBED: the second capture instance exists BECAUSE of them, the
+# union carries both shapes, and _capture_instance tells the two eras apart. A DDL AFTER the newest instance
+# is a different thing entirely, and it is asserted at the end of this section.
+query TTIT
+SELECT _change_type, _capture_instance, id, coalesce(v, '<not captured>') FROM c1.cdc.changes('dbo.cdc_span') ORDER BY _position;
+----
+insert	span_v1	1	one
+insert	span_v1	2	two
+insert	span_v2	3	<not captured>
+update_postimage	span_v2	1	<not captured>
+
+# ⚠⚠ THE DISCRIMINATING ASSERTION, AND A ROW COUNT IS NOT ONE. MEASURED: the OLDER instance never stops
+# capturing, so reading IT alone returns every row — the same four — just without `region`; the newer alone
+# returns two, without `v`. Only the union can produce `v = 'one'` (captured by span_v1 only) and
+# `region = 'eu'` (captured by span_v2 only) in ONE result, so this is the row that a build reading either
+# instance alone cannot pass.
+query TT
+SELECT max(v), max(region) FROM c1.cdc.changes('dbo.cdc_span');
+----
+two	eu
+
+# ⚠ AND NOTHING IS COUNTED TWICE. Both instances capture every change in the overlap window (§2.2), so a
+# reader that let both legs see one LSN returns it twice — a failure completely invisible to the shape
+# assertions above.
+query II
+SELECT count(*), count(DISTINCT _position) FROM c1.cdc.changes('dbo.cdc_span');
+----
+4	4
+
+# The positive control for both: each instance ALONE. ⚠ The older one returns the SAME ROW COUNT as the
+# union, which is exactly why the assertion above is on values rather than on a count.
+# ⚠ on_schema_change := 'ignore' is required here and it is the check working: a SINGLE-instance read has no
+# boundary, so nothing absorbs the two DDLs and they sit inside its window.
+query II
+SELECT (SELECT count(*) FROM c1.cdc.changes('dbo.cdc_span', capture_instance := 'span_v1', on_schema_change := 'ignore')),
+       (SELECT count(*) FROM c1.cdc.changes('dbo.cdc_span', capture_instance := 'span_v2', on_schema_change := 'ignore'));
+----
+4	2
+
+# ⚠⚠ THE NULL IS DECIDABLE, WHICH IS THE WHOLE REASON _capture_instance SHIPPED IN SLICE 5 BEFORE IT DECIDED
+# ANYTHING. `region` is NULL on both span_v1 rows because that instance never captured the column, and NULL on
+# ONE span_v2 row because the value really is NULL. Same NULL, two different meanings, and the instance column
+# is what separates them — without it §7's "refuse" would still be the only honest answer.
+query TI
+SELECT _capture_instance, count(*) FROM c1.cdc.changes('dbo.cdc_span') WHERE region IS NULL GROUP BY 1 ORDER BY 1;
+----
+span_v1	2
+span_v2	1
+
+# min_position on the TABLE name answers again — it was a refusal until this slice, because "the floor of
+# what?" had no answer while cdc.changes refused the same source. The union's readable range starts at the
+# OLDER instance's floor.
+# ⚠ Safe from §1.6a's transient NULL only because it runs AFTER the reads above: a read that resolved the
+# split proves the newer floor is established, and a floor never goes back to NULL.
+query I
+SELECT c1.cdc.min_position('dbo.cdc_span') = c1.cdc.min_position('span_v1');
+----
+true
+
+# ⚠⚠ THE DEGENERATE WINDOWS, and they are what the CLAMPED TVF arguments exist for. The statement is composed
+# once at BIND while the window is resolved at EXECUTE, so both legs are always in it — and a leg with nothing
+# to read must still be handed a LEGAL window, because the TVF answers an inverted one with the
+# unattributable 313 (§2.1). Below the boundary the newer leg is handed (split, split) and its rows are
+# removed by `<= @win_to`; at or above it the older leg is handed a one-LSN window and `< @split` removes
+# everything it returns. MEASURED both directions.
+statement ok
+SET VARIABLE span_first = (SELECT min(_position) FROM c1.cdc.changes('dbo.cdc_span'));
+
+query TI
+SELECT _capture_instance, count(*) FROM c1.cdc.changes('dbo.cdc_span', ending_position := getvariable('span_first')) GROUP BY 1 ORDER BY 1;
+----
+span_v1	1
+
+statement ok
+SET VARIABLE span_boundary = (SELECT c1.cdc.min_position('span_v2'));
+
+query TI
+SELECT _capture_instance, count(*) FROM c1.cdc.changes('dbo.cdc_span', starting_position := getvariable('span_boundary')) GROUP BY 1 ORDER BY 1;
+----
+span_v2	2
+
+# ⚠⚠ A DDL AFTER THE NEWEST INSTANCE IS *NOT* ABSORBED — nobody re-captured for it — so the check fires
+# again. This is the discriminating half of the absorption rule: without it, "the absorbed DDLs do not
+# refuse" would be equally satisfied by a build that had simply stopped checking on two-instance reads.
+statement ok
+SELECT fabricator_exec('c1', 'ALTER TABLE dbo.cdc_span ADD later_col INT NULL;');
+
+# ⚠ Waiting for the ddl_history ROW, not for a row count: cdc.ddl_history is populated by the capture job
+# ASYNCHRONOUSLY too (MEASURED — an ADD was still absent from it seconds after the DML that followed it had
+# been captured), so a read taken too early finds nothing and the section would pass for the wrong reason.
+# The wait doubles as the watermark guarantee: the job cannot have recorded the DDL without scanning past it.
+statement ok
+SELECT fabricator_exec('c1', 'DECLARE @i int = 0; WHILE @i < 60 AND NOT EXISTS (SELECT 1 FROM cdc.ddl_history d JOIN cdc.change_tables ct ON ct.source_object_id = d.source_object_id WHERE ct.capture_instance = ''span_v2'' AND d.ddl_command LIKE ''%later_col%'') BEGIN WAITFOR DELAY ''00:00:01''; SET @i = @i + 1; END');
+
+statement error
+SELECT count(*) FROM c1.cdc.changes('dbo.cdc_span');
+----
+later_col
+
+# ⚠ And the message says which side of the boundary it is talking about, because on a two-instance read the
+# obvious reading of "a schema change landed inside this window" is the one that produced the second
+# instance — which is precisely the one NOT being reported.
+statement error
+SELECT count(*) FROM c1.cdc.changes('dbo.cdc_span');
+----
+these landed after it
+
+# 'ignore' reads it anyway, and the count is unchanged — an ALTER adds no rows. The absorbed DDLs stay
+# absorbed under 'ignore' too; the mode governs the check, not the boundary.
+query I
+SELECT count(*) FROM c1.cdc.changes('dbo.cdc_span', on_schema_change := 'ignore');
+----
+4
+
+# ⚠ commit_timestamp composes with the boundary, and nothing else in this suite exercises the pair. The
+# LEFT JOIN onto cdc.lsn_time_mapping is emitted PER LEG with its own alias, because a join inside a
+# UNION ALL belongs to one branch — there is nothing shared to hoist. Counting the column as well as the
+# rows is what makes this an assertion rather than a smoke test: a join that missed would leave the
+# timestamp NULL while the row count stayed right.
+query TII
+SELECT _capture_instance, count(*), count(_commit_timestamp) FROM c1.cdc.changes('dbo.cdc_span', commit_timestamp := true, on_schema_change := 'ignore') GROUP BY 1 ORDER BY 1;
+----
+span_v1	2	2
+span_v2	2	2
+
+# ⚠⚠ A GENUINE TYPE CONFLICT IS REFUSED AT BIND, AND IT IS THE ONLY WAY TWO INSTANCES OF ONE TABLE CAN
+# DISAGREE ON A COLUMN'S TYPE. MEASURED 2026-08-25: an ALTER COLUMN <type> is propagated by the capture job to
+# BOTH change tables (~2 s on the rig), so they CONVERGE — which is also why the WidenArrowType helper §15.8
+# recommended turned out to have no reachable case at all. A column DROPPED and RE-ADDED with a different type
+# is the exception: the older instance keeps the old type forever. Left to SQL Server the union coerces by
+# precedence (MEASURED: varchar ∪ int describes as int) and dies mid-scan on the first unconvertible VALUE —
+# so it is silent for exactly as long as the historical text happens to look like the new type.
+statement ok
+SELECT fabricator_exec('c1', 'IF OBJECT_ID(''dbo.cdc_conf'') IS NOT NULL DROP TABLE dbo.cdc_conf; CREATE TABLE dbo.cdc_conf(id INT NOT NULL PRIMARY KEY, note VARCHAR(20) NULL);');
+
+statement ok
+SELECT target, changed FROM c1.cdc.enable('dbo.cdc_conf', capture_instance := 'conf_v1');
+
+statement ok
+SELECT fabricator_exec('c1', 'ALTER TABLE dbo.cdc_conf DROP COLUMN note;');
+
+statement ok
+SELECT fabricator_exec('c1', 'ALTER TABLE dbo.cdc_conf ADD note INT NULL;');
+
+statement ok
+SELECT target, changed FROM c1.cdc.enable('dbo.cdc_conf', capture_instance := 'conf_v2');
+
+# ⚠⚠ THE FLOOR WAIT GOES *BEFORE* THE REFUSAL, and mutation-testing is what showed why. The refusal fires
+# at BIND, so it does not need the floor — but a build WITHOUT it gets as far as EXECUTE, where conf_v2's
+# transiently NULL floor (§1.6a) raises a completely unrelated error. The assertion still failed, for the
+# wrong reason. With the wait in front, a build that stops refusing succeeds and the row fails with "Query
+# unexpectedly succeeded", which is the outcome that names the defect.
+statement ok
+SELECT fabricator_exec('c1', 'DECLARE @i int = 0; WHILE @i < 60 AND sys.fn_cdc_get_min_lsn(''conf_v2'') IS NULL BEGIN WAITFOR DELAY ''00:00:01''; SET @i = @i + 1; END');
+
+statement error
+SELECT count(*) FROM c1.cdc.changes('dbo.cdc_conf');
+----
+captured as varchar by 'conf_v1' and as int by 'conf_v2'
+
+# …and naming one instance still reads it. The positive control for the refusal: without it, the error above
+# would pass equally on a build that had refused every read of this table.
+query I
+SELECT count(*) FROM c1.cdc.changes('dbo.cdc_conf', capture_instance := 'conf_v2');
+----
+0
+
 # ═══ §9  Teardown — leave NO CDC-enabled table behind ══════════════════════════════════════════════════
 # Load-bearing: the capture job keeps scanning a CDC-enabled database between runs, and the next run's §3
 # would then find max_position() non-NULL and fail for a reason unrelated to the code.
@@ -1127,6 +1384,9 @@ SELECT fabricator_exec('c1', 'IF OBJECT_ID(''dbo.cdc_setup'') IS NOT NULL DROP T
 
 statement ok
 SELECT fabricator_exec('c1', 'IF OBJECT_ID(''dbo.cdc_zz_noidx'') IS NOT NULL DROP TABLE dbo.cdc_zz_noidx;');
+
+statement ok
+SELECT fabricator_exec('c1', 'IF OBJECT_ID(''dbo.cdc_span'') IS NOT NULL DROP TABLE dbo.cdc_span; IF OBJECT_ID(''dbo.cdc_conf'') IS NOT NULL DROP TABLE dbo.cdc_conf;');
 
 statement ok
 SELECT fabricator_exec('c1', 'IF OBJECT_ID(''dbo.cdc_gen'') IS NOT NULL DROP TABLE dbo.cdc_gen; IF OBJECT_ID(''dbo.cdc_own'') IS NOT NULL DROP TABLE dbo.cdc_own; IF OBJECT_ID(''dbo.cdc_auto'') IS NOT NULL DROP TABLE dbo.cdc_auto; IF OBJECT_ID(''dbo.cdc_ddl'') IS NOT NULL DROP TABLE dbo.cdc_ddl; IF OBJECT_ID(''dbo.gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg'') IS NOT NULL DROP TABLE dbo.gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg;');

@@ -593,7 +593,8 @@ dbo_orders_v2  0 -> 1 row
 ```
 
 ⇒ a reader that reads both instances **double-counts every change in the overlap window**. It must pick one
-per LSN range and switch at the boundary.
+per LSN range and switch at the boundary. ✅ BUILT as slice 7 — §19, where the double count is what mutant E
+produces ("Expected 4 rows, but got 6").
 
 ⚠⚠ **And the boundary is not recorded anywhere.** MEASURED: `cdc.change_tables.end_lsn` is **NULL for both
 instances**. The old instance's stop position must be *derived* as the new instance's `start_lsn`
@@ -1081,7 +1082,7 @@ explicit:
 
 | | behaviour | verdict |
 |---|---|---|
-| **refuse** | error naming both instances and the boundary position, telling the caller to read up to `B`, then from `B` | **RECOMMENDED default** — loud, and the remedy is one position the message can hand over |
+| **refuse** | error naming both instances and the boundary position, telling the caller to read up to `B`, then from `B` | ~~RECOMMENDED default~~ — **SHIPPED as slices 3-6 and REPLACED by slice 7 (§19)**: with `_capture_instance` on every row the middle option stops fabricating data, because a NULL becomes decidable |
 | **project to the newer schema** | new columns read NULL for pre-boundary rows | tempting and **wrong by default**: NULL is indistinguishable from a genuine NULL, so it silently fabricates data |
 | **stop at the boundary** | return rows up to `B` and no more | attractive — the caller's loop advances and re-binds against the new schema — but the caller cannot tell a short window from an exhausted one without comparing to `ending_position` |
 
@@ -1982,6 +1983,15 @@ max scale) and integer promotion; strings and binaries are already length-agnost
 `WidenArrowType(a, b)` helper buys one reader and one schema-resolution path, where (a) buys two that must
 be kept in agreement — the divergence shape this codebase has been bitten by before.
 
+> **⚠⚠ SUPERSEDED BY §19.2, AND THE RULE IN THE PARAGRAPH ABOVE IS WRONG.** There is a THIRD shape this
+> analysis missed: the reader GENERATES T-SQL, so the alignment can happen on the SERVER — one statement,
+> one describe, one stream, and SQL Server's own type precedence does the widening. MEASURED,
+> `decimal(9,0) ∪ decimal(5,4)` is `decimal(13,4)`, not the `decimal(9,4)` that "max precision, max scale"
+> gives — at which a nine-integral-digit value overflows. And the helper has **no reachable case** anyway:
+> an `ALTER COLUMN <type>` is propagated to BOTH change tables so the instances converge, a column captured
+> by one instance is NULL-filled, and a drop-and-re-add is a CONFLICT rather than a widening. Read §19.2
+> before reviving any of this.
+
 ⚠ **The third line is a caution, not a feature**: on a genuine type conflict DuckDB coerces to VARCHAR rather
 than erroring, so "the union failed" can never be used as a drift detector.
 
@@ -2061,7 +2071,7 @@ The user's question. What the reader can do about it, now that §15.6 has the ma
 | **4** | ✅ **BUILT 2026-08-24 — §17.** Generated hidden instance name + the EP ownership marker + `enable := true` deferred to execute | makes the surface "easy to use"; independent of 5–7. §15.4/§15.5/§15.7 |
 | **5** | ✅ **PARTLY BUILT 2026-08-25 — §18.** `_capture_instance` shipped; name-alignment and widening DEFERRED into slice 7 (§18.1 says why), and slice 6's DDL detection pulled forward | buys slice 7 nearly free. §15.8 |
 | **6** | ✅ **BUILT 2026-08-25 — §18.3**, pulled forward into slice 5. `on_schema_change := 'error'` (default) / `'ignore'` | loud before it is clever. §15.11 |
-| **7** | the two-instance boundary: derive `B`, split the window, `UNION ALL` by name — **plus the name-alignment and `WidenArrowType` deferred from slice 5** | needs 3 and 5 |
+| **7** | ✅ **BUILT 2026-08-25 — §19.** The two-instance boundary: derive the split, partition the window, `UNION ALL` by name. It also retires BOTH items deferred from slice 5 — the name-alignment is BUILT, and `WidenArrowType` is **DISSOLVED** (§19.2: the union is in T-SQL, and the helper's stated rule was measurably wrong AND has no reachable case) | needed 3 and 5 |
 | **8** | `include := 'snapshot'` / `'snapshot+changes'` (§5), then `on_schema_change := 'resync'` | the resync story needs the snapshot leg first |
 | **9** | `starting_timestamp` / `ending_timestamp`; `images := 'both'` + the mask placeholder | additive to the same reader |
 | — | ~~`on_schema_change := 'fill'`~~ | last, if ever — §15.9 records why |
@@ -2553,3 +2563,229 @@ poisoned forever", which no consumer could act on.
   that microsecond window is missed, and §16's arrival check is what stands behind it for the type case.
 - **`resync` / `fill` / `null`.** Refused BY NAME so a reader of §15.9 is told which slice they are waiting
   for rather than that their spelling is wrong.
+
+---
+
+## 19. Slice 7 — THE TWO-INSTANCE BOUNDARY, AS BUILT (2026-08-25)
+
+C#-only, no ABI change. Gate: `verify_mssql_cdc` **268 → 351**, five mutants, each killed at its own
+assertion; 3/3 green re-runs. This is the last slice §15.12 scheduled before the snapshot leg, and it also **retires both items
+§18.1 deferred out of slice 5** — the name-alignment (BUILT, below) and `WidenArrowType` (**DISSOLVED**, §19.2).
+
+```sql
+-- a table with two capture instances now reads as ONE stream, with no new syntax
+FROM db.cdc.changes('dbo.orders')
+-- …and naming one still reads that one alone, which is the escape for what the union cannot represent
+FROM db.cdc.changes('dbo.orders', capture_instance := 'dbo_orders')
+```
+
+### 19.1 The boundary is DERIVED, and from the floor rather than from `start_lsn`
+
+§2.2 measured that `cdc.change_tables.end_lsn` is **NULL for both instances**, so the older one's stop
+position exists nowhere and must be computed. Re-confirmed 2026-08-25 on a fresh two-instance probe, along
+with the double capture that makes it matter: one INSERT produced a row in **both** change tables.
+
+The split is **`sys.fn_cdc_get_min_lsn(<newer instance>)`**, and choosing that over
+`cdc.change_tables.start_lsn` is what makes it correct under cleanup rather than merely correct today. The
+two are EQUAL for a fresh instance (measured: both `0x0000002D00000B30003E`), and they diverge once the
+cleanup job runs — it RAISES the floor as it purges, and the purged range is exactly the range the newer
+instance can no longer answer for, while the older instance still covers it. Splitting on `start_lsn` would
+hand that range to a leg that no longer holds it: a **short read**, silent.
+
+- **Older leg** reads strictly below the split, **newer leg** at or above it. Every LSN is covered exactly
+  once, so double-counting is unrepresentable rather than merely avoided.
+- The instances are ordered by `start_lsn`, tie-broken by `create_date` then name. `start_lsn` is the
+  semantic discriminator (a second instance's `start_lsn` IS the boundary); the tie-break is real, because
+  cleanup raises BOTH floors and they converge.
+- ⚠ **Getting the order backwards is not a cosmetic bug**: the newer instance does not hold the
+  pre-boundary rows, so a swapped pair returns a SHORT result rather than a wrong-looking one. Mutant B.
+
+### 19.2 ⚠⚠ The union is in T-SQL — and that DISSOLVED `WidenArrowType`, whose stated rule was WRONG
+
+§15.8 weighed two shapes — "align in DuckDB SQL and get the widening free" versus "align in C# and widen
+ourselves" — and recommended the second, because §15.1 puts the reader in C#. **There is a third it did not
+consider: we already GENERATE T-SQL**, so the alignment can happen on the server, where SQL Server's own
+data-type precedence does the widening. One statement, one describe, one stream, no C#-side batch surgery.
+
+**And the helper §15.8 specified would have been wrong.** MEASURED 2026-08-25:
+
+```
+decimal(9,2) ∪ decimal(18,4)  ->  decimal(18,4)     -- as §15.8 expected
+decimal(9,0) ∪ decimal(5,4)   ->  decimal(13,4)     -- NOT the decimal(9,4) its rule gives
+```
+
+Thirteen is `max(integral digits) + max(scale)`. §15.8's "max precision, max scale" yields `decimal(9,4)`,
+which holds five integral digits — so a nine-integral-digit value from the first branch **OVERFLOWS**. The
+helper would have silently lost data on a shape SQL Server gets right for free.
+
+**⚠⚠ AND IT HAS NO REACHABLE CASE AT ALL, which is a stronger statement than "no caller yet".** Two
+instances of one table can differ on a column's type in exactly one way, and it is not a widening:
+
+| how the two could differ | what actually happens |
+|---|---|
+| an `ALTER COLUMN <type>` between the enables | **they CONVERGE** — MEASURED, the capture job propagates it to BOTH change tables (~2 s on the rig), so `decimal(9,2)`/`decimal(9,2)` became `decimal(18,4)`/`decimal(18,4)` |
+| a column captured by only ONE instance | nothing to unify — it is NULL-filled from the other leg |
+| a column DROPPED and RE-ADDED with a different type (§15.11) | a genuine **CONFLICT**, not a widening — refused, §19.5 |
+
+⇒ the transient window while the capture job propagates is the only moment the two legs' types differ, both
+are the same TYPE NAME, and SQL Server's union widens to the wider one. Correct, for free, and there is
+nothing left for a helper to do.
+
+**⚠ One silent case is accepted and said out loud.** Where SQL Server's rules cannot represent the union of
+two decimals within 38 digits it TRUNCATES the scale. That is the same answer any T-SQL user gets from a
+`UNION ALL`, which is what makes it defensible; a hand-rolled rule would have been ours to get wrong, and
+the measurement above says which way that goes.
+
+### 19.3 Alignment by NAME, and the bare `NULL` that removes all the type rendering
+
+**⚠⚠ A BARE `NULL` IN ONE UNION BRANCH TAKES THE OTHER BRANCH'S TYPE — MEASURED**, and it is the finding
+that keeps this path free of SQL type-name rendering entirely:
+
+```
+SELECT CAST('hello' AS varchar(50)) AS b  UNION ALL  SELECT NULL AS b     ->  b is varchar(50)
+```
+
+…not `int`, which is what a bare `SELECT NULL` gives on its own and which would have made the *other* branch
+fail to convert. So a column only one instance captures is filled with the literal `NULL` and still arrives
+correctly typed. Without this, the leg builder would have needed the full `sys.types` → `varchar(n)` /
+`decimal(p,s)` / `datetime2(n)` rendering, with a quoting problem at the end of it.
+
+- **COLUMN ORDER: the newer instance's captured columns first, then columns only the older one has.** The
+  newer set is the table's current shape and the one a consumer keeps seeing once the older instance is
+  gone, so `SELECT *` is stable in the direction that matters; a dropped column is history and is appended.
+- **The captured sets come from `cdc.captured_columns`, not from parsing `captured_column_list`.** The help
+  proc already returns `[id], [v], [extra]` — a string that escapes a `]` in a column name by doubling it,
+  so parsing it is a quoting problem with a silent wrong answer at the end. ⚠ And `column_ordinal` is the
+  CHANGE TABLE's order, which is what the TVF returns after its four metadata columns — not the source
+  table's `column_id`.
+- **A column captured by only ONE instance is declared NULLABLE whatever `sys.columns` says.** It is
+  NULL-filled for the other leg by construction, so a NOT NULL claim would be one the result violates on
+  every pre-boundary row.
+- **⚠⚠ AND THE NULL IS DECIDABLE ONLY BECAUSE `_capture_instance` SHIPPED IN SLICE 5.** `region` NULL on a
+  span_v1 row means *"that instance never captured the column"*; `region` NULL on a span_v2 row means the
+  value really is NULL. Same NULL, two meanings — and without the instance column §7's *refuse* would still
+  be the only honest answer. This is the slice §18.2 was buying.
+
+### 19.4 One statement, built at BIND, for every position of the window
+
+The window is resolved at EXECUTE (§15.7) but the statement is composed at BIND, so **both legs are always
+in it** — including when the caller's whole window sits on one side of the boundary. The TVF answers an
+inverted window with the unattributable 313 (§2.1), so a leg with nothing to read cannot simply be handed a
+backwards range. Two mechanisms, deliberately redundant:
+
+| | |
+|---|---|
+| **clamped TVF arguments** | older leg `(from, max(from, min(to, split)))`, newer leg `(max(from, split), max(that, to))`. Always a legal window; the clamp can only ever WIDEN a degenerate leg |
+| **explicit predicates** | older `< @split`; newer `>= @split AND <= @win_to`. These are the partition, and they hold whatever the arguments are |
+
+MEASURED both degenerate directions through the built reader: a window entirely below the boundary returns
+only older-instance rows (the newer leg is handed `(split, split)` and its rows are removed by `<= @win_to`),
+and a window at or above it returns only newer-instance rows.
+
+**⚠ The redundancy is why the gate can only kill the removal of BOTH.** In the fixture each half covers the
+other, so mutating either alone survives; removing both produces **"Expected 4 rows, but got 6"** — the
+double count itself. The redundancy is deliberate: the failure it guards is a silent wrong answer, and belt
+and braces is the right posture for one.
+
+### 19.5 A DDL at or below the boundary is ABSORBED
+
+§18.3's check refuses a read whose window contains a DDL. On a two-instance read its lower bound becomes
+`max(from, split)`: **the second capture instance exists BECAUSE of the DDL that motivated it**, so the union
+already carries both shapes and `_capture_instance` tells the eras apart. Refusing there would refuse exactly
+the window this slice was built to serve.
+
+MEASURED, on one table: the `ADD region` and `DROP note` that motivated the second instance land BELOW its
+`start_lsn`; an `ADD extra` issued afterwards lands ABOVE it and still refuses. Both halves are gated, and
+the refusal's message now says which side of the boundary it is talking about — on a two-instance read the
+obvious reading of *"a schema change landed inside this window"* is the one that produced the second
+instance, i.e. precisely the one NOT being reported.
+
+**⚠ `cdc.ddl_history` holds ONE ROW PER (DDL × capture instance)** — MEASURED, with two instances every DDL
+appears twice, INCLUDING DDLs that predate the newer instance, which SQL Server back-fills onto it. Counting
+rows would report *"2 schema changes"* for one ALTER, so the query is `DISTINCT`. ⚠ And the command is taken
+with `TOP 1 ORDER BY ddl_lsn` rather than `MIN(ddl_command)`: MIN picks the alphabetically first statement,
+which need not be the one at `MIN(ddl_lsn)` — harmless while a window held one DDL, and wrong by construction
+for the windows this slice creates.
+
+**⚠ `cdc.ddl_history` IS POPULATED ASYNCHRONOUSLY TOO**, and it lags the change rows: an `ADD` was still
+absent from it seconds after the DML that followed it had been captured. A gate for the unabsorbed case must
+wait for the ddl_history ROW, not for a row count, or it passes for the wrong reason. That wait doubles as
+the watermark guarantee — the job cannot have recorded the DDL without scanning past it.
+
+### 19.6 A genuine type conflict is REFUSED at bind, and it costs nothing
+
+Per §19.2 the only way two instances disagree on a type is a drop-and-re-add. MEASURED end to end: a column
+dropped as `varchar(20)` and re-added as `int` really does leave the older instance holding `varchar(20)`,
+the union describes it as `int` by precedence, and the read dies mid-scan with
+
+```
+Conversion failed when converting the varchar value 'text-value' to data type int.
+```
+
+**⚠ THAT IS NOT GOOD ENOUGH, AND THE REASON IS THE SILENT HALF: the conversion error fires on an
+unconvertible VALUE, not on the conflict.** A column whose historical text happens to be numeric converts
+quietly, and the two eras silently stop meaning the same thing. So the conflict is caught at BIND by
+comparing the captured type NAMES, which came back with the column names at no extra cost. A difference
+WITHIN one type name (`varchar(20)` vs `varchar(50)`, `decimal(9,2)` vs `decimal(18,4)`) is a widening SQL
+Server performs correctly and is deliberately allowed through.
+
+### 19.7 ⚠⚠ `fn_cdc_get_min_lsn` answers ZERO, not NULL, for an instance it does not know
+
+MEASURED 2026-08-25, and it is a trap with two different consequences:
+
+```
+sys.fn_cdc_get_min_lsn(NULL)                ->  0x0000000000000000000
+sys.fn_cdc_get_min_lsn('no_such_instance')  ->  0x0000000000000000000
+sys.fn_cdc_get_min_lsn('t_v1')              ->  0x0000002C00000C980040
+```
+
+Zero is a well-formed LSN that compares BELOW every real one:
+
+- **as a FLOOR**, it passes the §2.1 retention pre-check trivially and hands the window to the TVF — the
+  misleading 313 again, for a capture instance that was DISABLED between bind and execute. Guarded now on
+  BOTH paths, one-instance included; it is a small pre-existing hole this slice's measurement exposed.
+- **as a SPLIT it is far worse**: every row would fall in the newer leg, which does not hold the
+  pre-boundary changes, so the read comes back SHORT with nothing failing.
+
+It is distinguishable from the genuinely transient NULL floor of §1.6a, so the two get different answers —
+"retry" for NULL, "SQL Server no longer knows this instance" for zero. ⚠ It is also why the window batch
+APPENDS its split column rather than always selecting one: passing NULL for a second instance that does not
+exist would read back zero rather than NULL, i.e. a value that must be ignored on pain of silent data loss.
+
+**⚠ The transient NULL is a real, user-visible window**: for up to one polling interval after a second
+instance is enabled, a two-instance read answers *"the boundary … is not established yet — retry"* rather
+than rows. Substituting `cdc.change_tables.start_lsn` there would work only until the cleanup job has run
+(§19.1), so the refusal stands. The gate carries floor waits for exactly this, and one assertion is made
+through `DESCRIBE` — which BINDS without executing — for the same reason.
+
+### 19.8 `cdc.min_position('<table>')` answers again
+
+It refused a source matching two instances, and rightly so while `cdc.changes` refused the same source:
+*"the floor of what?"* had no answer. Now it does — the union's readable range starts at the OLDER
+instance's floor — so it reports the MINIMUM of the two. ⚠ **Unknown wins over min**: if either floor is
+NULL the answer is NULL, because reporting the other would ASSERT a lower bound above the true one, which is
+the substitution `CdcMinLsn`'s own remarks refuse to make for one instance. The mixed case (a string
+matching both as an instance name and as a table name) still refuses — that is an ambiguous QUESTION, not a
+boundary.
+
+### 19.9 What the gate does NOT cover, said rather than implied
+
+- **The cleanup-correctness argument for splitting on the floor rather than `start_lsn`** (§19.1). Producing
+  it needs the cleanup job to purge, which needs a retention horizon to pass; the two values are equal in
+  any suite that can run in a minute, so the mutant survives. REASONED from `fn_cdc_get_min_lsn`'s
+  documented behaviour and from the measurement that the two agree before cleanup.
+- **The zero-LSN guards** (§19.7). Reaching them needs a capture instance to vanish between one statement's
+  bind and its execute, which no suite can arrange.
+- **The boundary-above-the-watermark guard.** Found by walking the clamp rather than by a failure: the newer
+  leg's TVF accepts only a window inside `[split, max_lsn]`, so when the boundary sits ABOVE the watermark
+  there is no legal call to make and every clamp that keeps the legs partitioned produces an inverted or
+  below-floor one — the 313 again. §1.6a says the floor is NULL in exactly that window, so the retry branch
+  fires first and this is REASONED unreachable. It is guarded anyway: "reasoned unreachable" is the argument
+  that has already been wrong twice in this feature, and the cost of being wrong here is precisely the
+  unattributable message the pre-check exists to prevent.
+- **Either half of the partition alone** (§19.4) — each covers the other in a fixture with no row at exactly
+  the split LSN, and no statement can place one there.
+- **A third capture instance.** SQL Server caps a table at two (Msg 22962), so the >2 branch is reachable
+  only through a source string matching both as an instance name and as a table name.
+- **The decimal widening itself.** §19.2 establishes it has no reachable case between two instances, so
+  there is nothing to assert; what IS asserted is that the aligned column keeps its own type.

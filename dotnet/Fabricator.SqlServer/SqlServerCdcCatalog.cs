@@ -105,6 +105,26 @@ public sealed partial class SqlServerCatalog
             {
                 mixed |= !string.Equals(rows[i][1], rows[0][1], StringComparison.Ordinal);
             }
+            // ⚠⚠ TWO INSTANCES OF ONE TABLE NOW HAVE AN ANSWER, and it is the answer cdc.changes acts on
+            // (slice 7): the union's readable range starts at the OLDER instance's floor, because the older
+            // instance is what covers everything below the boundary. Reporting the MINIMUM says exactly that.
+            // ⚠ It was a refusal until slice 7, and rightly so — while cdc.changes refused the same source,
+            // "the floor of what?" had no answer. Now it does, and leaving the refusal here would mean a
+            // caller who follows the retention error's own advice with the string they passed to
+            // cdc.changes gets told to go away.
+            if (!mixed && rows.Count == 2 && rows[0][1] == "0")
+            {
+                byte[]? first = SqlServerCdcFunctions.ParseHex(rows[0][2]);
+                byte[]? second = SqlServerCdcFunctions.ParseHex(rows[1][2]);
+                // ⚠ UNKNOWN WINS OVER MIN. A NULL floor is transiently unknowable (§1.6a), not absent, and
+                // reporting the other instance's floor would ASSERT a lower bound above the true one — the
+                // same substitution CdcMinLsn's own remarks refuse to make for one instance.
+                if (first is null || second is null)
+                {
+                    return null;
+                }
+                return CdcChangesPlan.CompareLsn(first, second) <= 0 ? first : second;
+            }
             var names = new List<string>(rows.Count);
             foreach (var row in rows)
             {
@@ -114,8 +134,7 @@ public sealed partial class SqlServerCatalog
                 $"cdc.min_position: '{source}' matches {rows.Count} capture instances "
                 + $"({string.Join(", ", names)})"
                 + (mixed ? " — as both a capture-instance name and a source table name" : string.Empty)
-                + ". Two capture instances of one table can have different retention floors, so name the "
-                + "instance explicitly; SELECT * FROM <catalog>.cdc.tables() lists them.");
+                + ". Name the instance explicitly; SELECT * FROM <catalog>.cdc.tables() lists them.");
         }
         return SqlServerCdcFunctions.ParseHex(rows[0][2]);
     }
@@ -579,7 +598,8 @@ public sealed partial class SqlServerCatalog
     /// recoverable, while one surfacing as a NULL <c>_change_type</c> is a row a consumer mis-handles
     /// silently.</para>
     /// </remarks>
-    private static string CdcMetadataSelectList(string op, string lsn, string seq, string? commitTime)
+    private static string CdcMetadataSelectList(string op, string lsn, string seq, string? commitTime,
+                                               string instParam = "@inst_name")
     {
         var sb = new System.Text.StringBuilder();
         sb.Append("CASE ").Append(op)
@@ -593,7 +613,7 @@ public sealed partial class SqlServerCatalog
           .Append(", ").Append(op).Append(" AS [_operation]")
           // ⚠ A PARAMETER, not the instance name spliced in — it is a sysname from server metadata, so
           // splicing would be safe in practice and wrong in principle, and this costs nothing.
-          .Append(", CONVERT(varchar(128), @inst_name) AS [_capture_instance]");
+          .Append(", CONVERT(varchar(128), ").Append(instParam).Append(") AS [_capture_instance]");
         if (commitTime is not null)
         {
             sb.Append(", ").Append(commitTime).Append(" AS [_commit_timestamp]");
@@ -605,9 +625,9 @@ public sealed partial class SqlServerCatalog
     private static int CdcMetadataColumnCount(bool commitTimestamp) => commitTimestamp ? 7 : 6;
 
     /// <summary>The metadata list over a capture instance's TVF, aliased <c>c</c> (and <c>m</c> for the join).</summary>
-    private static string CdcRealMetadataSelectList(bool commitTimestamp) =>
+    private static string CdcRealMetadataSelectList(bool commitTimestamp, string instParam = "@inst_name") =>
         CdcMetadataSelectList("c.[__$operation]", "c.[__$start_lsn]", "c.[__$seqval]",
-                              commitTimestamp ? "m.[tran_end_time]" : null);
+                              commitTimestamp ? "m.[tran_end_time]" : null, instParam);
 
     /// <summary>
     /// The metadata list over NOTHING — literals of the same types — for describing a not-yet-captured
@@ -656,7 +676,11 @@ public sealed partial class SqlServerCatalog
             "FROM @cdct m LEFT JOIN sys.columns c ON c.object_id = m.source_object_id " +
             "WHERE (m.capture_instance = @source OR (m.source_schema + '.' + m.source_table) = @source) " +
             "AND (@capture_instance IS NULL OR m.capture_instance = @capture_instance) " +
-            "ORDER BY m.capture_instance, c.column_id;";
+            // ⚠ ORDERED BY start_lsn, NOT by name. When two instances match, the FIRST is the older one and
+            // that ordering is the contract the union read rests on (§19): the boundary IS the newer
+            // instance's start_lsn. create_date breaks the tie the cleanup job can produce by raising both
+            // floors onto the same value; the name breaks a tie nothing can produce, so the order is total.
+            "ORDER BY m.start_lsn, m.create_date, m.capture_instance, c.column_id;";
 
         var rows = ReadMetadataRows(sql, 5, new[]
         {
@@ -686,13 +710,12 @@ public sealed partial class SqlServerCatalog
                       + $"'{database}'. Call <catalog>.cdc.enable_database() first, then cdc.enable(...).");
         }
 
-        string instance = rows[0][0] ?? string.Empty;
         var nullability = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
         var matched = new List<string>();
         foreach (var row in rows)
         {
             string name = row[0] ?? string.Empty;
-            if (!string.Equals(name, instance, StringComparison.Ordinal) && !matched.Contains(name))
+            if (!matched.Contains(name))
             {
                 matched.Add(name);
             }
@@ -701,18 +724,24 @@ public sealed partial class SqlServerCatalog
                 nullability[column] = row[4] != "0";
             }
         }
-        if (matched.Count > 0)
+        string instance = matched[0];
+        if (matched.Count > 2)
         {
-            // ⚠ REFUSED, not resolved by precedence. A table has at most TWO capture instances (§2.2) and
-            // BOTH capture every change in the overlap window, so answering for one of them silently
-            // DOUBLE-COUNTS or silently drops, depending which. Picking the newer would also be wrong at the
-            // boundary, which is a whole slice (§15.12 item 7) and not a tie-break.
-            matched.Insert(0, instance);
+            // ⚠ UNREACHABLE through SQL Server, which caps a table at TWO capture instances (Msg 22962,
+            // MEASURED §2.2) — so this can only mean the source string matched as an instance NAME and as a
+            // table name at once, which is an ambiguous QUESTION rather than a boundary to resolve.
             throw new ArgumentException(
                 $"cdc.changes: '{source}' matches {matched.Count} capture instances "
-                + $"({string.Join(", ", matched)}). Both capture every change in their overlap window, so "
-                + "reading one is not a default this function may pick for you - name it with "
-                + "capture_instance := '<name>'. SELECT * FROM <catalog>.cdc.tables() lists them.");
+                + $"({string.Join(", ", matched)}), which SQL Server does not allow for one table - so the "
+                + "source string must be matching both as a capture-instance name and as a table name. Name "
+                + "the instance with capture_instance := '<name>'; SELECT * FROM <catalog>.cdc.tables() "
+                + "lists them.");
+        }
+        if (matched.Count == 2)
+        {
+            return CdcDeclareUnion(source, captureInstance, matched, rows[0][1] ?? "dbo",
+                                   rows[0][2] ?? source, nullability, commitTimestamp, onSchemaChange,
+                                   startingPosition, endingPosition);
         }
 
         // The DESCRIBE, over the statement this reader is about to run. `c.*` rather than a column list
@@ -791,6 +820,286 @@ public sealed partial class SqlServerCatalog
         return new CdcChangesPlan(source, explicitInstance: null, commitTimestamp, onSchemaChange,
                                   new Schema(fields, metadata: null), startingPosition, endingPosition);
     }
+
+    /// <summary>
+    /// Declares and builds a read that spans a TWO-CAPTURE-INSTANCE boundary (slice 7, §19): the older
+    /// instance below the boundary, the newer one at or above it, aligned by NAME into one output schema.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>⚠⚠ THE UNION IS IN T-SQL, AND THAT DISSOLVED THE <c>WidenArrowType</c> HELPER §15.8
+    /// RECOMMENDED — whose stated rule was WRONG.</b> §15.8 weighed two shapes, "align in DuckDB SQL and get
+    /// the widening free" against "align in C# and widen ourselves", and recommended the second because the
+    /// reader is marshaled. There is a THIRD it did not consider: we already GENERATE T-SQL, so the alignment
+    /// can happen on the server, where SQL Server's own type-precedence rules do the widening. MEASURED
+    /// 2026-08-25: <c>decimal(9,2) ∪ decimal(18,4) → decimal(18,4)</c>, as §15.8 expected — but
+    /// <c>decimal(9,0) ∪ decimal(5,4) → decimal(13,4)</c>, NOT the <c>decimal(9,4)</c> that §15.8's
+    /// "max precision, max scale" gives. Thirteen is <c>max(integral digits) + max(scale)</c>, and it is the
+    /// correct answer: at <c>decimal(9,4)</c> a nine-integral-digit value from the first branch OVERFLOWS. So
+    /// the helper this slice inherited would have been built to a rule that silently loses data, and the
+    /// server does it right for free.</para>
+    /// <para><b>⚠⚠ A BARE <c>NULL</c> IN ONE BRANCH TAKES THE OTHER BRANCH'S TYPE — MEASURED, and it is what
+    /// removes the last reason to render SQL type names.</b> <c>SELECT NULL AS b UNION ALL SELECT
+    /// CAST('x' AS varchar(50))</c> describes <c>b</c> as <c>varchar(50)</c>, not as <c>int</c> (which is what
+    /// a bare <c>SELECT NULL</c> outside a union gives, and which would have made the OTHER branch fail to
+    /// convert). So a column only one instance captures is filled with the literal <c>NULL</c> and still
+    /// arrives correctly typed.</para>
+    /// <para><b>⚠ ONE SILENT CASE IS ACCEPTED AND SAID OUT LOUD:</b> where SQL Server's own rules cannot
+    /// represent the union of two decimals within 38 digits it TRUNCATES the scale, and where two branches
+    /// have unrelated types (a column dropped and re-added with a different type, §15.11) it CONVERTS by
+    /// precedence rather than refusing — an unconvertible value then fails at read time with SQL Server's own
+    /// conversion error, loudly. That is the same answer any T-SQL user gets from a <c>UNION ALL</c>, which is
+    /// what makes it defensible; a hand-rolled rule would have been ours to get wrong.</para>
+    /// <para><b>⚠ COLUMN ORDER: the NEWER instance's captured columns first, then columns only the OLDER one
+    /// has.</b> The newer set is the table's CURRENT shape and the one a consumer keeps seeing once the older
+    /// instance is gone, so putting it first makes <c>SELECT *</c> stable in the direction that matters; a
+    /// dropped column is history and is appended.</para>
+    /// <para><b>⚠ A column captured by only ONE instance is declared NULLABLE whatever the source says.</b> It
+    /// is NULL-filled for the other leg's rows by construction, so a NOT NULL claim taken from
+    /// <c>sys.columns</c> would be a claim the result violates on every pre-boundary row.</para>
+    /// </remarks>
+    private CdcChangesPlan CdcDeclareUnion(string source, string? explicitInstance,
+                                           IReadOnlyList<string> instances, string sourceSchema,
+                                           string sourceTable, IReadOnlyDictionary<string, bool> nullability,
+                                           bool commitTimestamp, string onSchemaChange,
+                                           byte[]? startingPosition, byte[]? endingPosition)
+    {
+        string older = instances[0];
+        string newer = instances[1];
+        var capturedTypes = new Dictionary<string, Dictionary<string, string>>(StringComparer.Ordinal);
+        var captured = CdcCapturedColumns(older, newer, capturedTypes);
+        if (!captured.TryGetValue(older, out var olderColumns) || olderColumns.Count == 0
+            || !captured.TryGetValue(newer, out var newerColumns) || newerColumns.Count == 0)
+        {
+            throw new InvalidOperationException(
+                $"cdc.changes: '{source}' has two capture instances ('{older}', '{newer}') but "
+                + "cdc.captured_columns does not list the captured set of both. Change data capture may be "
+                + "mid-reconfiguration; re-run the statement, or name one instance with "
+                + "capture_instance := '<name>'.");
+        }
+
+        var newerSet = new HashSet<string>(newerColumns, StringComparer.Ordinal);
+        var olderSet = new HashSet<string>(olderColumns, StringComparer.Ordinal);
+        var aligned = new List<string>(newerColumns);
+        foreach (string column in olderColumns)
+        {
+            if (!newerSet.Contains(column))
+            {
+                aligned.Add(column);
+            }
+        }
+
+        // ⚠⚠ A GENUINE TYPE CONFLICT IS REFUSED HERE, AT BIND, AND IT COSTS NOTHING EXTRA — the captured type
+        // NAMES came back with the column names above. MEASURED 2026-08-25: a column DROPPED and RE-ADDED
+        // with a different type (§15.11's pathological case, and the only way two instances of one table can
+        // disagree — an ALTER COLUMN type is propagated to BOTH change tables) really does produce
+        // varchar(20) in the older instance and int in the newer, the UNION describes it as int by SQL
+        // Server's precedence, and the read then dies MID-SCAN with
+        // "Conversion failed when converting the varchar value 'text-value' to data type int".
+        // ⚠ THE REASON THAT IS NOT GOOD ENOUGH IS THE SILENT HALF: the conversion error fires on an
+        // unconvertible VALUE, not on the conflict, so a column whose historical text happens to be numeric
+        // converts quietly and the two eras silently stop meaning the same thing. Comparing type NAMES
+        // catches the conflict itself; a difference WITHIN one type name (varchar(20) vs varchar(50),
+        // decimal(9,2) vs decimal(18,4)) is a widening SQL Server performs correctly and is deliberately
+        // allowed through.
+        foreach (string column in aligned)
+        {
+            if (!olderSet.Contains(column) || !newerSet.Contains(column))
+            {
+                continue;
+            }
+            string olderType = capturedTypes[older][column];
+            string newerType = capturedTypes[newer][column];
+            if (!string.Equals(olderType, newerType, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new ArgumentException(
+                    $"cdc.changes: '{source}' cannot be read across its capture-instance boundary because "
+                    + $"column '{column}' is captured as {olderType} by '{older}' and as {newerType} by "
+                    + $"'{newer}'. One column cannot be both, so a union of the two would coerce one era to "
+                    + "the other's type - silently where the values happen to convert. Read each instance on "
+                    + "its own with capture_instance := '<name>'.");
+            }
+        }
+
+        // ⚠ The DESCRIBE form carries NO WHERE clause at all — the same shortcut the one-instance path takes.
+        // A predicate cannot change a column's type, and leaving it out means the describe needs neither the
+        // cursor parameters nor the split, which do not exist until execute.
+        string describeSql = CdcUnionSql(older, newer, aligned, olderSet, newerSet, commitTimestamp,
+                                         startingPosition: null, endingPosition: null, executable: false);
+        var described = DescribeQuery(describeSql, CdcUnionDescribeParameters());
+        if (described is null)
+        {
+            throw new InvalidOperationException(
+                $"cdc.changes: SQL Server could not describe the union of capture instances '{older}' and "
+                + $"'{newer}' for '{source}'. Name one of them with capture_instance := '<name>' to read it "
+                + "alone; SELECT * FROM <catalog>.cdc.tables() lists them.");
+        }
+        int meta = CdcMetadataColumnCount(commitTimestamp);
+        if (described.FieldsList.Count != meta + aligned.Count)
+        {
+            throw new InvalidOperationException(
+                $"cdc.changes: the two-instance read of '{source}' described "
+                + $"{described.FieldsList.Count} columns where {meta + aligned.Count} were composed. Change "
+                + "data capture may be mid-reconfiguration; re-run the statement.");
+        }
+
+        var fields = new List<Field>(described.FieldsList.Count);
+        for (int i = 0; i < meta; i++)
+        {
+            var f = described.FieldsList[i];
+            bool isCommitTime = commitTimestamp && i == meta - 1;
+            fields.Add(new Field(f.Name, f.DataType, nullable: isCommitTime));
+        }
+        for (int i = meta; i < described.FieldsList.Count; i++)
+        {
+            var f = described.FieldsList[i];
+            string column = aligned[i - meta];
+            bool both = olderSet.Contains(column) && newerSet.Contains(column);
+            fields.Add(new Field(f.Name, f.DataType,
+                                 nullable: !both
+                                           || !nullability.TryGetValue(column, out bool isNullable)
+                                           || isNullable));
+        }
+
+        string sql = CdcUnionSql(older, newer, aligned, olderSet, newerSet, commitTimestamp,
+                                 startingPosition, endingPosition, executable: true);
+        Log.LogDebug("cdc changes {Source}: two capture instances - {Older} below the boundary, {Newer} at "
+                     + "or above it, {Columns} aligned columns", source, older, newer, aligned.Count);
+        return new CdcChangesPlan(source, explicitInstance, commitTimestamp, onSchemaChange,
+                                  new Schema(fields, metadata: null), startingPosition, endingPosition,
+                                  captureInstance: older, sourceSchema: sourceSchema,
+                                  sourceTable: sourceTable, sql: sql, secondInstance: newer);
+    }
+
+    /// <summary>
+    /// The captured column names of two capture instances, each in change-table order.
+    /// </summary>
+    /// <remarks>
+    /// ⚠ From <c>cdc.captured_columns</c> rather than by parsing <c>captured_column_list</c>, which
+    /// <c>sp_cdc_help_change_data_capture</c> already returns as <c>[id], [v], [extra]</c>: that string
+    /// escapes a <c>]</c> in a column name by doubling it, so parsing it is a quoting problem with a silent
+    /// wrong answer at the end of it. ⚠ And <c>column_ordinal</c> is the CHANGE TABLE's order (MEASURED),
+    /// which is what the TVF returns after its four metadata columns — not the source table's
+    /// <c>column_id</c>.
+    /// </remarks>
+    private Dictionary<string, List<string>> CdcCapturedColumns(
+        string older, string newer, Dictionary<string, Dictionary<string, string>> types)
+    {
+        const string sql =
+            "SET NOCOUNT ON; " +
+            "SELECT CAST(ct.capture_instance AS varchar(128)) AS capture_instance, " +
+            "CAST(cc.column_name AS varchar(128)) AS column_name, " +
+            "CAST(cc.column_type AS varchar(128)) AS column_type " +
+            "FROM cdc.captured_columns AS cc " +
+            "JOIN cdc.change_tables AS ct ON ct.object_id = cc.object_id " +
+            "WHERE ct.capture_instance = @older OR ct.capture_instance = @newer " +
+            "ORDER BY ct.capture_instance, cc.column_ordinal;";
+        var rows = ReadMetadataRows(sql, 3, new[]
+        {
+            new SqlParameter("@older", older),
+            new SqlParameter("@newer", newer),
+        });
+        var result = new Dictionary<string, List<string>>(StringComparer.Ordinal);
+        foreach (var row in rows)
+        {
+            if (row[0] is not { } instance || row[1] is not { } column)
+            {
+                continue;
+            }
+            if (!result.TryGetValue(instance, out var columns))
+            {
+                columns = new List<string>();
+                result[instance] = columns;
+                types[instance] = new Dictionary<string, string>(StringComparer.Ordinal);
+            }
+            columns.Add(column);
+            types[instance][column] = row[2] ?? "?";
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// The two-leg <c>UNION ALL</c>: the older instance strictly BELOW the boundary, the newer one AT OR
+    /// ABOVE it.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>⚠⚠ THE TWO PREDICATES ARE THE PARTITION, and they are what makes double-counting
+    /// UNREPRESENTABLE.</b> MEASURED (§2.2, re-confirmed 2026-08-25): both instances capture EVERY change in
+    /// their overlap window — one INSERT produced a row in each — so a reader that let both legs see one LSN
+    /// would return it twice. <c>&lt; @split</c> and <c>&gt;= @split</c> cover every LSN exactly once
+    /// whatever the TVF arguments are, which is why they are stated explicitly rather than left implicit in
+    /// those arguments: an argument is a performance bound, a predicate is the correctness one.</para>
+    /// <para><b>⚠ <c>&lt;= @win_to</c> ON THE NEWER LEG IS NOT REDUNDANT.</b> The TVF arguments are CLAMPED so
+    /// they are always a legal window (see <see cref="CdcExecuteChanges"/>), and the clamp can only widen the
+    /// newer leg — when the caller's whole window sits BELOW the boundary that leg is handed
+    /// <c>(split, split)</c>, and would otherwise return rows the caller did not ask for. The older leg needs
+    /// no such term: its clamp can only ever hand back rows at or above the split, which <c>&lt; @split</c>
+    /// removes.</para>
+    /// <para>⚠ The <c>_commit_timestamp</c> LEFT JOIN is per LEG, each with its own <c>m</c> alias — a join in
+    /// a <c>UNION ALL</c> belongs to one branch, so there is nothing shared to hoist.</para>
+    /// </remarks>
+    private static string CdcUnionSql(string older, string newer, IReadOnlyList<string> aligned,
+                                      ISet<string> olderSet, ISet<string> newerSet, bool commitTimestamp,
+                                      byte[]? startingPosition, byte[]? endingPosition, bool executable)
+    {
+        var cursor = executable ? CdcCursorTerms(startingPosition, endingPosition) : new List<string>();
+        var olderTerms = new List<string>(cursor);
+        var newerTerms = new List<string>(cursor);
+        if (executable)
+        {
+            olderTerms.Add("c.[__$start_lsn] < @split");
+            newerTerms.Add("c.[__$start_lsn] >= @split");
+            newerTerms.Add("c.[__$start_lsn] <= @win_to");
+        }
+        return CdcUnionLegSql(older, "@inst_a", "@from_a", "@to_a", aligned, olderSet, commitTimestamp,
+                              olderTerms)
+               + " UNION ALL "
+               + CdcUnionLegSql(newer, "@inst_b", "@from_b", "@to_b", aligned, newerSet, commitTimestamp,
+                                newerTerms);
+    }
+
+    private static string CdcUnionLegSql(string instance, string instParam, string fromParam, string toParam,
+                                         IReadOnlyList<string> aligned, ISet<string> captures,
+                                         bool commitTimestamp, IReadOnlyList<string> terms)
+    {
+        var sb = new System.Text.StringBuilder("SELECT ");
+        sb.Append(CdcRealMetadataSelectList(commitTimestamp, instParam));
+        foreach (string column in aligned)
+        {
+            // ⚠ A BARE `NULL`, never a CONVERT: MEASURED that it adopts the other branch's type through the
+            // UNION ALL, which is what keeps this path free of SQL type-name rendering entirely.
+            sb.Append(", ").Append(captures.Contains(column) ? "c." + Quote(column) : "NULL")
+              .Append(" AS ").Append(Quote(column));
+        }
+        sb.Append(" FROM cdc.").Append(Quote("fn_cdc_get_all_changes_" + instance))
+          .Append('(').Append(fromParam).Append(", ").Append(toParam).Append(", @row_filter) AS c");
+        if (commitTimestamp)
+        {
+            sb.Append(CdcCommitTimeJoinSql);
+        }
+        if (terms.Count > 0)
+        {
+            sb.Append(" WHERE ").Append(string.Join(" AND ", terms));
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// Placeholder values for the two-leg DESCRIBE. ⚠ Never evaluated, but every parameter the statement
+    /// mentions must be DECLARED or SQL Server cannot compile what it is describing.
+    /// </summary>
+    private static SqlParameter[] CdcUnionDescribeParameters() => new[]
+    {
+        CdcBinaryParam("@from_a", new byte[CdcChangesPlan.LsnBytes]),
+        CdcBinaryParam("@to_a", new byte[CdcChangesPlan.LsnBytes]),
+        CdcBinaryParam("@from_b", new byte[CdcChangesPlan.LsnBytes]),
+        CdcBinaryParam("@to_b", new byte[CdcChangesPlan.LsnBytes]),
+        new SqlParameter("@row_filter", System.Data.SqlDbType.NVarChar, 30)
+        {
+            Value = CdcChangesPlan.RowFilterAll,
+        },
+        new SqlParameter("@inst_a", System.Data.SqlDbType.VarChar, 128) { Value = string.Empty },
+        new SqlParameter("@inst_b", System.Data.SqlDbType.VarChar, 128) { Value = string.Empty },
+    };
 
     /// <summary>
     /// Runs the deferred <c>enable := true</c> and resolves the plan. Returns the resolved plan and whether
@@ -928,6 +1237,25 @@ public sealed partial class SqlServerCatalog
     /// </remarks>
     private static string CdcCursorPredicateSql(byte[]? startingPosition, byte[]? endingPosition)
     {
+        var terms = CdcCursorTerms(startingPosition, endingPosition);
+        // ⚠ No ORDER BY, deliberately. The change table's clustered index is
+        // (__$start_lsn, __$command_id, __$seqval, __$operation) — MEASURED, §15.2 — so ordering by our
+        // 3-tuple would insert a real SORT rather than ride the index, and DuckDB does not promise to
+        // preserve a table function's row order through its pipeline anyway. Every row carries its own
+        // _position; `ORDER BY _position` is the documented and correct way to ask for order (§2.4).
+        return terms.Count == 0 ? string.Empty : " WHERE " + string.Join(" AND ", terms);
+    }
+
+    /// <summary>
+    /// The cursor bounds as WHERE terms, so the two-leg union read can put them on BOTH legs.
+    /// </summary>
+    /// <remarks>
+    /// ⚠ A leg of the union carries the SAME cursor terms as the other one. They are a filter on the
+    /// caller's window, not on which instance answers for it — the split is what does that — so omitting them
+    /// from either leg would return rows before the caller's cursor.
+    /// </remarks>
+    private static List<string> CdcCursorTerms(byte[]? startingPosition, byte[]? endingPosition)
+    {
         var terms = new List<string>(2);
         if (startingPosition is { Length: CdcChangesPlan.PositionBytes })
         {
@@ -945,12 +1273,7 @@ public sealed partial class SqlServerCatalog
                       + "(c.[__$seqval] < @end_seq OR (c.[__$seqval] = @end_seq AND "
                       + "c.[__$operation] <= @end_op))))");
         }
-        // ⚠ No ORDER BY, deliberately. The change table's clustered index is
-        // (__$start_lsn, __$command_id, __$seqval, __$operation) — MEASURED, §15.2 — so ordering by our
-        // 3-tuple would insert a real SORT rather than ride the index, and DuckDB does not promise to
-        // preserve a table function's row order through its pipeline anyway. Every row carries its own
-        // _position; `ORDER BY _position` is the documented and correct way to ask for order (§2.4).
-        return terms.Count == 0 ? string.Empty : " WHERE " + string.Join(" AND ", terms);
+        return terms;
     }
 
     /// <summary>
@@ -976,6 +1299,32 @@ public sealed partial class SqlServerCatalog
         new(name, System.Data.SqlDbType.Binary, CdcChangesPlan.LsnBytes) { Value = value };
 
     /// <summary>
+    /// The window-resolution batch: the retention floor, the capture watermark, and — on a two-instance read
+    /// — the boundary the window is split on.
+    /// </summary>
+    /// <remarks>
+    /// <para>⚠ IF/ELSE rather than CASE, for the reason <see cref="CdcMaxLsn"/> records: with CDC disabled
+    /// these functions raise 208 naming <c>cdc.lsn_time_mapping</c>, and SQL Server does not guarantee an
+    /// unevaluated CASE branch. Both branches project the same varchar columns.</para>
+    /// <para>⚠ The split column is APPENDED rather than always present, so the one-instance statement is
+    /// byte-identical to what it was before slice 7. The alternative — one shape, passing NULL for the second
+    /// instance — reads back <c>0x0000000000000000000</c> rather than NULL (MEASURED), i.e. a value that must
+    /// be ignored on pain of silently dropping every pre-boundary row.</para>
+    /// </remarks>
+    private static string CdcWindowSql(bool union) =>
+        "SET NOCOUNT ON; " +
+        "DECLARE @en varchar(1) = CASE WHEN " + SqlServerCdcFunctions.CdcEnabledPredicate
+        + " THEN '1' ELSE '0' END; " +
+        "IF @en = '1' " +
+        "  SELECT @en AS enabled, CONVERT(varchar(30), sys.fn_cdc_get_min_lsn(@inst), 1) AS min_lsn, " +
+        "         CONVERT(varchar(30), sys.fn_cdc_get_max_lsn(), 1) AS max_lsn"
+        + (union ? ", CONVERT(varchar(30), sys.fn_cdc_get_min_lsn(@inst2), 1) AS split" : string.Empty)
+        + "; " +
+        "ELSE SELECT @en AS enabled, CAST(NULL AS varchar(30)) AS min_lsn, " +
+        "            CAST(NULL AS varchar(30)) AS max_lsn"
+        + (union ? ", CAST(NULL AS varchar(30)) AS split" : string.Empty) + ";";
+
+    /// <summary>
     /// Resolves the read window and runs THE PRE-CHECK — the highest-value line in this feature (§2.1).
     /// </summary>
     /// <remarks>
@@ -999,23 +1348,17 @@ public sealed partial class SqlServerCatalog
     internal CdcWindow CdcResolveWindow(CdcChangesPlan plan, bool justCreated = false)
     {
         string instance = CdcRequireResolved(plan).Instance;
-        const string sql =
-            "SET NOCOUNT ON; " +
-            "DECLARE @en varchar(1) = CASE WHEN " + SqlServerCdcFunctions.CdcEnabledPredicate
-            + " THEN '1' ELSE '0' END; " +
-            // ⚠ IF/ELSE rather than CASE, for the reason CdcMaxLsn records: with CDC disabled these functions
-            // raise 208 naming cdc.lsn_time_mapping, and SQL Server does not guarantee an unevaluated CASE
-            // branch. Both branches project the same three varchar columns.
-            "IF @en = '1' " +
-            "  SELECT @en AS enabled, CONVERT(varchar(30), sys.fn_cdc_get_min_lsn(@inst), 1) AS min_lsn, " +
-            "         CONVERT(varchar(30), sys.fn_cdc_get_max_lsn(), 1) AS max_lsn; " +
-            "ELSE SELECT @en AS enabled, CAST(NULL AS varchar(30)) AS min_lsn, " +
-            "            CAST(NULL AS varchar(30)) AS max_lsn;";
+        string sql = CdcWindowSql(plan.IsUnion);
+        var windowParameters = new List<SqlParameter> { new("@inst", instance) };
+        if (plan.SecondInstance is { } secondInstance)
+        {
+            windowParameters.Add(new SqlParameter("@inst2", secondInstance));
+        }
 
         // readYourWrites: a capture instance enabled earlier in THIS transaction must be visible here, and
         // this is a short metadata read that holds no reader open. ⚠ The streaming read below deliberately
         // does NOT do that - see CdcExecuteChanges.
-        var rows = ReadMetadataRows(sql, 3, new[] { new SqlParameter("@inst", instance) });
+        var rows = ReadMetadataRows(sql, plan.IsUnion ? 4 : 3, windowParameters);
         if (rows.Count == 0 || rows[0][0] != "1")
         {
             throw new InvalidOperationException(
@@ -1025,6 +1368,65 @@ public sealed partial class SqlServerCatalog
         }
         byte[]? minLsn = SqlServerCdcFunctions.ParseHex(rows[0][1]);
         byte[]? maxLsn = SqlServerCdcFunctions.ParseHex(rows[0][2]);
+        // ⚠⚠ A ZERO FLOOR IS "SQL SERVER DOES NOT KNOW THIS CAPTURE INSTANCE", NOT A LOW BOUND — MEASURED
+        // 2026-08-25: fn_cdc_get_min_lsn returns 0x0000000000000000000 for an unknown name (and for NULL),
+        // never NULL. Zero compares below every real LSN, so it passes the retention check below trivially
+        // and hands the window to the TVF: the unattributable 313 again, for an instance that was DISABLED
+        // between this statement's bind and its execute. It is distinguishable from the transient NULL floor
+        // of §1.6a, so the two get different answers.
+        if (minLsn is not null && CdcChangesPlan.IsZeroLsn(minLsn))
+        {
+            throw new InvalidOperationException(
+                $"cdc.changes: SQL Server no longer knows capture instance '{plan.CaptureInstance}' - it "
+                + "reports a retention floor of zero, which is what it answers for an instance that does not "
+                + "exist. It did exist when this statement was bound, so something disabled it in between. "
+                + "SELECT * FROM <catalog>.cdc.tables() reports what is captured now.");
+        }
+        byte[]? split = null;
+        if (plan.IsUnion)
+        {
+            split = SqlServerCdcFunctions.ParseHex(rows[0][3]);
+            if (split is null)
+            {
+                throw new InvalidOperationException(
+                    $"cdc.changes: the boundary between capture instances '{plan.CaptureInstance}' and "
+                    + $"'{plan.SecondInstance}' is not established yet - SQL Server answered NULL for the "
+                    + "newer instance's retention floor, which is the value this read splits the window on "
+                    + "(it is transiently NULL for up to one polling interval after an instance is enabled). "
+                    + "Retry, or name one instance with capture_instance := '<name>'.");
+            }
+            if (CdcChangesPlan.IsZeroLsn(split))
+            {
+                // ⚠⚠ THE DANGEROUS ONE. A zero split puts EVERY row in the newer leg, and the newer
+                // instance does not have the pre-boundary changes - so the read would come back SHORT with
+                // nothing failing. Refusing is the only answer that cannot lose rows silently.
+                throw new InvalidOperationException(
+                    $"cdc.changes: SQL Server no longer knows capture instance '{plan.SecondInstance}' - it "
+                    + "reports a retention floor of zero, which is what it answers for an instance that does "
+                    + "not exist. That value is the boundary this read splits on, so continuing would return "
+                    + "only the newer instance's rows and silently omit everything before the boundary.");
+            }
+            // ⚠⚠ THE ONE REMAINING WAY THIS READ COULD REACH THE 313 IT EXISTS TO REPLACE, found by walking
+            // the clamp rather than by a failure. The newer leg's TVF only accepts a window inside
+            // [split, max_lsn], because split IS that instance's floor - so when the BOUNDARY sits above the
+            // capture watermark there is no legal window to hand it at all, and every clamp that keeps the
+            // two legs partitioned produces an inverted or below-floor call. It means the capture job has
+            // not scanned since the newer instance was enabled.
+            // ⚠ REASONED UNREACHABLE, and guarded anyway: §1.6a MEASURED that a just-enabled instance
+            // answers a NULL floor in exactly that window, so the branch above fires first. "Reasoned
+            // unreachable" is precisely the argument that has been wrong before in this feature, and the
+            // cost of being wrong here is the unattributable message the whole pre-check exists to prevent.
+            if (maxLsn is not null && CdcChangesPlan.CompareLsn(split, maxLsn) > 0)
+            {
+                throw new InvalidOperationException(
+                    $"cdc.changes: the boundary between capture instances '{plan.CaptureInstance}' and "
+                    + $"'{plan.SecondInstance}' is {CdcChangesPlan.Hex(split)}, above the capture watermark "
+                    + $"{CdcChangesPlan.Hex(maxLsn)} - the capture job has not scanned since the newer "
+                    + "instance was enabled, so there is nothing on its side of the boundary to read yet. "
+                    + "Retry in one polling interval (cdc.health() reports it), or read the older instance "
+                    + $"alone with capture_instance := '{plan.CaptureInstance}'.");
+            }
+        }
         if (minLsn is null && justCreated)
         {
             // ⚠ NOT the retry error, and the difference is a FACT rather than a kindness: we created this
@@ -1107,9 +1509,10 @@ public sealed partial class SqlServerCatalog
                          CdcChangesPlan.Hex(toLsn));
             return CdcWindow.Empty;
         }
-        Log.LogDebug("cdc changes {Source} ({Instance}): window {From} .. {To}", plan.SourceName,
-                     plan.CaptureInstance, CdcChangesPlan.Hex(fromLsn), CdcChangesPlan.Hex(toLsn));
-        return new CdcWindow(fromLsn, toLsn, plan.StartingPosition, plan.EndingPosition);
+        Log.LogDebug("cdc changes {Source} ({Instance}): window {From} .. {To}{Split}", plan.SourceName,
+                     plan.CaptureInstance, CdcChangesPlan.Hex(fromLsn), CdcChangesPlan.Hex(toLsn),
+                     split is null ? string.Empty : " split " + CdcChangesPlan.Hex(split));
+        return new CdcWindow(fromLsn, toLsn, plan.StartingPosition, plan.EndingPosition, split);
     }
 
 
@@ -1148,19 +1551,41 @@ public sealed partial class SqlServerCatalog
         {
             return;
         }
+        // ⚠⚠ A DDL AT OR BELOW THE BOUNDARY IS ABSORBED, and skipping it is what makes a two-instance read
+        // usable at all. The second capture instance exists BECAUSE of that DDL, so the union already carries
+        // both shapes and _capture_instance tells the two apart — refusing there would refuse precisely the
+        // window slice 7 was built to serve. A DDL AFTER the newest instance was created is a different
+        // thing: nobody re-captured for it, so it is exactly what this check exists to name. MEASURED
+        // 2026-08-25: the ADD and the DROP that motivated the second instance land BELOW its start_lsn, and
+        // an ADD issued afterwards lands ABOVE it.
+        byte[] fromLsn = window.Split is { } boundary
+                         && CdcChangesPlan.CompareLsn(boundary, window.FromLsn) > 0
+            ? boundary
+            : window.FromLsn;
+        // ⚠ DISTINCT, because cdc.ddl_history holds ONE ROW PER (DDL x capture instance) — MEASURED: with two
+        // instances every DDL appears twice, INCLUDING DDLs that predate the newer instance, which SQL Server
+        // back-fills onto it. Counting rows would report "2 schema changes" for one ALTER.
+        // ⚠ TOP 1 ORDER BY ddl_lsn for the command, not MIN(ddl_command): MIN picks the ALPHABETICALLY first
+        // statement, which need not be the one at MIN(ddl_lsn) — so the message could name an LSN and a
+        // command belonging to different DDLs. Harmless while a window held one; slice 7's windows span
+        // several by construction.
         const string sql =
             "SET NOCOUNT ON; " +
-            "SELECT CAST(COUNT(*) AS varchar(16)) AS ddl_count, " +
-            "       CONVERT(varchar(30), MIN(d.ddl_lsn), 1) AS first_lsn, " +
-            "       CAST(MAX(CAST(d.required_column_update AS int)) AS varchar(1)) AS any_type_change, " +
-            "       CAST(MIN(LEFT(d.ddl_command, 300)) AS varchar(300)) AS first_command " +
-            "FROM cdc.ddl_history AS d " +
-            "JOIN cdc.change_tables AS ct ON ct.source_object_id = d.source_object_id " +
-            "WHERE ct.capture_instance = @inst AND d.ddl_lsn > @from_lsn AND d.ddl_lsn <= @to_lsn;";
+            "WITH d AS (SELECT DISTINCT h.ddl_lsn, CAST(h.required_column_update AS int) AS rcu, " +
+            "                  CONVERT(nvarchar(300), LEFT(h.ddl_command, 300)) AS cmd " +
+            "           FROM cdc.ddl_history AS h " +
+            "           JOIN cdc.change_tables AS ct ON ct.source_object_id = h.source_object_id " +
+            "           WHERE (ct.capture_instance = @inst OR ct.capture_instance = @inst2) " +
+            "             AND h.ddl_lsn > @from_lsn AND h.ddl_lsn <= @to_lsn) " +
+            "SELECT CAST((SELECT COUNT(*) FROM d) AS varchar(16)) AS ddl_count, " +
+            "       (SELECT CONVERT(varchar(30), MIN(ddl_lsn), 1) FROM d) AS first_lsn, " +
+            "       (SELECT CAST(MAX(rcu) AS varchar(1)) FROM d) AS any_type_change, " +
+            "       (SELECT TOP 1 CAST(cmd AS varchar(300)) FROM d ORDER BY ddl_lsn) AS first_command;";
         var rows = ReadMetadataRows(sql, 4, new[]
         {
             new SqlParameter("@inst", CdcRequireResolved(plan).Instance),
-            CdcBinaryParam("@from_lsn", window.FromLsn),
+            NullableParam("@inst2", plan.SecondInstance),
+            CdcBinaryParam("@from_lsn", fromLsn),
             CdcBinaryParam("@to_lsn", window.ToLsn),
         });
         if (rows.Count == 0 || rows[0][0] == "0")
@@ -1180,7 +1605,12 @@ public sealed partial class SqlServerCatalog
                 : "A column ADDED after capture began is NOT captured, so this read would simply omit it; a "
                   + "DROPPED one stays in the change table and reads NULL from that point. ")
             + "Read up to the change and re-bind (a fresh statement re-reads the schema), or pass "
-            + "on_schema_change := 'ignore' to read anyway.");
+            + "on_schema_change := 'ignore' to read anyway."
+            + (plan.IsUnion
+                ? " This read already spans the boundary between capture instances "
+                  + $"'{plan.CaptureInstance}' and '{plan.SecondInstance}', so the changes that produced the "
+                  + "newer instance are NOT what is being reported here - these landed after it."
+                : string.Empty));
     }
 
     /// <summary>Runs the change read and streams it.</summary>
@@ -1203,13 +1633,53 @@ public sealed partial class SqlServerCatalog
     /// </remarks>
     internal IArrowArrayStream CdcExecuteChanges(CdcChangesPlan plan, CdcWindow window)
     {
-        var parameters = new List<SqlParameter>(8)
+        var parameters = new List<SqlParameter>(14);
+        if (window.Split is { } split)
         {
-            CdcBinaryParam("@from_lsn", window.FromLsn),
-            CdcBinaryParam("@to_lsn", window.ToLsn),
-            new("@row_filter", System.Data.SqlDbType.NVarChar, 30) { Value = CdcChangesPlan.RowFilterAll },
-            new("@inst_name", System.Data.SqlDbType.VarChar, 128) { Value = CdcRequireResolved(plan).Instance },
-        };
+            // ⚠⚠ THE TVF ARGUMENTS ARE CLAMPED INTO A LEGAL WINDOW, and that is what lets ONE statement,
+            // built at bind, serve every position of the caller's window relative to the boundary. The TVF
+            // refuses an inverted window with the unattributable 313 (§2.1), so a leg that has nothing to
+            // read cannot simply be handed (split, from-below-it): it is handed a one-LSN window instead, and
+            // the WHERE predicates remove what that returns. MEASURED both degenerate directions.
+            byte[] toOlder = CdcChangesPlan.CompareLsn(window.ToLsn, split) < 0 ? window.ToLsn : split;
+            if (CdcChangesPlan.CompareLsn(toOlder, window.FromLsn) < 0)
+            {
+                toOlder = window.FromLsn;
+            }
+            byte[] fromNewer = CdcChangesPlan.CompareLsn(window.FromLsn, split) > 0 ? window.FromLsn : split;
+            byte[] toNewer = CdcChangesPlan.CompareLsn(window.ToLsn, fromNewer) < 0 ? fromNewer : window.ToLsn;
+            parameters.Add(CdcBinaryParam("@from_a", window.FromLsn));
+            parameters.Add(CdcBinaryParam("@to_a", toOlder));
+            parameters.Add(CdcBinaryParam("@from_b", fromNewer));
+            parameters.Add(CdcBinaryParam("@to_b", toNewer));
+            parameters.Add(CdcBinaryParam("@split", split));
+            parameters.Add(CdcBinaryParam("@win_to", window.ToLsn));
+            parameters.Add(new SqlParameter("@inst_a", System.Data.SqlDbType.VarChar, 128)
+            {
+                Value = CdcRequireResolved(plan).Instance,
+            });
+            parameters.Add(new SqlParameter("@inst_b", System.Data.SqlDbType.VarChar, 128)
+            {
+                Value = plan.SecondInstance,
+            });
+            parameters.Add(new SqlParameter("@row_filter", System.Data.SqlDbType.NVarChar, 30)
+            {
+                Value = CdcChangesPlan.RowFilterAll,
+            });
+        }
+        else
+        {
+            parameters.Add(CdcBinaryParam("@from_lsn", window.FromLsn));
+            parameters.Add(CdcBinaryParam("@to_lsn", window.ToLsn));
+            parameters.Add(new SqlParameter("@row_filter", System.Data.SqlDbType.NVarChar, 30)
+            {
+                Value = CdcChangesPlan.RowFilterAll,
+            });
+            parameters.Add(new SqlParameter("@inst_name", System.Data.SqlDbType.VarChar, 128)
+            {
+                Value = CdcRequireResolved(plan).Instance,
+            });
+        }
         if (window.StartingPosition is { } starting)
         {
             parameters.Add(CdcBinaryParam("@cur_lsn", CdcChangesPlan.LsnOf(starting)));
