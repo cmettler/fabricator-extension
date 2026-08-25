@@ -633,7 +633,11 @@ case "$TIER" in
         # /!\ The floor waits are not politeness: fn_cdc_get_min_lsn is transiently NULL for a newly enabled
         # instance (§1.6a) and that value IS the boundary, so without them the section intermittently gets
         # "the boundary ... is not established yet" instead of rows.
-        : "${MIN_ASSERTIONS:=2607}"
+        # /!\ Slice 8 (the initial-snapshot leg) took verify_mssql_cdc 351 -> 476. This number is
+        # 2732 because a GREEN RUN said so, not because 2607 + 125 does: while the slice was being
+        # finished two arithmetic routes to it disagreed by 8, and a floor left below the actual
+        # silently tolerates a regression that size.
+        : "${MIN_ASSERTIONS:=2732}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2
