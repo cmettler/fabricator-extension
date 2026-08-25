@@ -1830,6 +1830,19 @@ SELECT count(*) FROM c1.cdc.changes('dbo.cdc_img', images := 'both') WHERE _upda
 ----
 5
 
+# ⚠ `_changed_columns` rides with the mask and nowhere else — it is DERIVED from it, so a build that emitted
+# one without the other would be reporting a decode of something it does not have.
+statement error
+SELECT _changed_columns FROM c1.cdc.changes('dbo.cdc_img');
+----
+_changed_columns
+
+query TT
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM c1.cdc.changes('dbo.cdc_img', images := 'both'))
+WHERE column_name = '_changed_columns';
+----
+_changed_columns	VARCHAR[]
+
 # ⚠ NEVER NULL IN A CHANGE ROW — MEASURED, and it corrects the plausible story. An insert and a delete have
 # no "columns changed" to report, so declaring the mask nullable looked obviously right; SQL Server reports
 # ALL columns for them instead (0x03FF here — ten bits). The count above is the assertion.
@@ -1870,6 +1883,31 @@ update_postimage	0	1
 update_preimage	1	0
 update_postimage	1	0
 
+# ⚠⚠ …AND `_changed_columns` IS THE SAME ANSWER WITHOUT THE ARITHMETIC, which is the point of shipping it.
+# A consumer reading a NULL in a MAX column asks one question — "was this recorded?" — and this answers it
+# by NAME, with no ordinal to look up, no bit index to get right and no byte order to get wrong.
+query II
+SELECT _change_type, list_contains(_changed_columns, 'notes') AS notes_recorded
+FROM c1.cdc.changes('dbo.cdc_img', images := 'both')
+WHERE _operation IN (3, 4) ORDER BY _position;
+----
+update_preimage	false
+update_postimage	false
+update_preimage	true
+update_postimage	true
+
+# The whole list, so the assertion above cannot pass on a build that returns a list of everything: an UPDATE
+# reports ONLY what it touched, while an insert and a delete report every captured column (SQL Server's own
+# answer — an insert does set them all).
+query TT
+SELECT _change_type, _changed_columns FROM c1.cdc.changes('dbo.cdc_img', images := 'both') ORDER BY _position;
+----
+insert	[id, c2, c3, c4, c5, c6, c7, c8, notes, tag]
+update_preimage	[c2]
+update_postimage	[c2]
+update_preimage	[notes]
+update_postimage	[notes]
+
 # ⚠ `notes` is column_ordinal 9 and `c2` is 2 — from cdc.captured_columns, never counted by hand.
 query II
 SELECT cc.column_name, cc.column_ordinal FROM c1.cdc.captured_columns cc
@@ -1887,11 +1925,14 @@ notes	9
 # that trap twice for _change_type and _position; this is the third instance of it.
 # ⚠ NULL rather than an all-bits-set mask, deliberately: all-bits-set would read as "this update changed
 # every column", which is a claim about an event that never happened.
-query III
-SELECT _change_type, _capture_instance IS NULL AS is_baseline, _update_mask IS NULL AS no_mask
+# ⚠ `_changed_columns` is NULL there too, and NOT an empty list: "this update changed nothing" and "this row
+# is not an update" are different claims, and an empty list would assert the first about a baseline row.
+query IIII
+SELECT _change_type, _capture_instance IS NULL AS is_baseline, _update_mask IS NULL AS no_mask,
+       _changed_columns IS NULL AS no_list
 FROM c1.cdc.changes('dbo.cdc_img', include := 'snapshot', images := 'both');
 ----
-insert	true	true
+insert	true	true	true
 
 # ═══ §30c  ⚠⚠ THE MULTI-BYTE MASK — where the documented per-byte rule stops being right ═══════════════
 # §1.4 records "bit index = column_ordinal - 1, little-endian within each byte", which is true and says
@@ -1919,6 +1960,18 @@ WHERE _operation = 4 ORDER BY _position;
 ----
 0002	0	0
 0100	1	0
+
+# ⚠⚠ AND `_changed_columns` AGREES WITH THE CORRECT COLUMN, NOT THE NAIVE ONE — which is what makes shipping
+# it worth more than documenting the recipe. `0x0100` is ordinal 9, in the SECOND byte from the front and
+# the FIRST from the end; a decoder indexing from the front reports it as untouched, and this row is what
+# would catch that.
+query TT
+SELECT hex(_update_mask) AS mask, _changed_columns
+FROM c1.cdc.changes('dbo.cdc_img', images := 'both')
+WHERE _operation = 4 ORDER BY _position;
+----
+0002	[c2]
+0100	[notes]
 
 # ═══ §30d  images refusals — a value that is not a mode, and the one that never will be ════════════════
 statement error

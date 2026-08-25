@@ -106,7 +106,7 @@ See [SQL Server external tables on S3](#sql-server-external-tables-on-s3).
 | | `db.cdc.enable_database()` / `enable()` / `disable()` / `capture_now()` — set capture up from SQL, with a generated capture-instance name; the catalog refreshes itself | ✅ |
 | | `db.cdc.changes(...)` — a resumable change-stream reader with a 21-byte cursor, a retention pre-check, `enable := true`, an in-window schema-change check, and a table's two capture instances read as ONE stream across the boundary | ✅ |
 | | `include := 'snapshot'` / `'snapshot+changes'` — the whole table as of one consistent instant, then the changes after it, with no gap between the halves | ✅ |
-| | Before-images (`images := 'both'` + `_update_mask`) and wall-clock window bounds | ✅ |
+| | Before-images (`images := 'both'`, with `_update_mask` and a decoded `_changed_columns`) and wall-clock window bounds | ✅ |
 | | `on_schema_change := 'resync'` — re-capture and re-baseline when the capture instance no longer matches the source | ✅ |
 | **Monitoring** | `db.dbo.fabricator_session_tag(k, v)` — tag a transaction's connection so Fabric query insights can attribute its cost | ✅ (see dbt caveat) |
 | | `application_name` on the secret → `program_name` on every statement (run-level attribution) | ✅ |
@@ -954,7 +954,8 @@ FROM db.cdc.changes('dbo.orders'                    -- a <schema>.<table> or a c
 | `_operation` | `INTEGER` | SQL Server's raw code (1 delete, 2 insert, 3 update **before**-image, 4 update after-image) |
 | `_capture_instance` | `VARCHAR` | which capture instance produced the row — what makes a `NULL` in a source column decidable when a table has two (see the note below). **`NULL` means a `include := 'snapshot'` baseline row**, read from the source rather than from a capture instance |
 | `_commit_timestamp` | `TIMESTAMP` | only with `commit_timestamp := true` |
-| `_update_mask` | `BLOB` | only with `images := 'both'` — which columns the update actually recorded; `NULL` on a `include := 'snapshot'` baseline row. See the before-image note below |
+| `_update_mask` | `BLOB` | only with `images := 'both'` — which columns the update actually recorded, as SQL Server's raw bit mask; `NULL` on a `include := 'snapshot'` baseline row |
+| `_changed_columns` | `VARCHAR[]` | only with `images := 'both'` — the same answer as the NAMES, decoded for you. `NULL` (not an empty list) on a baseline row. See the before-image note below |
 | …source columns… | as the source table | a `delete` row carries the **deleted** values |
 
 **The resumable idiom.** Take the window END first, read a closed window, then advance the cursor to that
@@ -1035,25 +1036,22 @@ UPDATE my_cursors SET cur = getvariable('cdc_end') WHERE tbl = 'dbo.orders';
   **not store** a `varchar(max)` / `nvarchar(max)` / `varbinary(max)` column in an update's before-image
   unless that update touched it, so such a column reads `NULL` there whatever the row held. We deliberately
   do **not** substitute a placeholder — a placeholder is a value, so it cannot be told apart from a row that
-  genuinely holds it. Read `_update_mask` instead: bit clear means *not recorded*, bit set means *genuinely
-  NULL*.
+  genuinely holds it. Read **`_changed_columns`** instead: if the column is not in the list, the value was
+  not recorded; if it is, the `NULL` is genuine.
 
   ```sql
-  -- did this row's update actually record <column>?  Ordinals come from cdc.captured_columns.
-  SELECT _change_type, notes,
-         get_bit(_update_mask::BIT, (8 * octet_length(_update_mask) - 9)::INTEGER) AS notes_recorded
+  SELECT _change_type, notes, list_contains(_changed_columns, 'notes') AS notes_recorded
   FROM db.cdc.changes('dbo.orders', images := 'both');
-
-  SELECT cc.column_name, cc.column_ordinal
-  FROM db.cdc.captured_columns cc
-  JOIN db.cdc.change_tables ct ON ct.object_id = cc.object_id
-  WHERE ct.capture_instance = '<instance>' ORDER BY cc.column_ordinal;
   ```
 
-  ⚠ **Count the bit from the RIGHT END of the whole mask, as that expression does.** The mask is a
-  big-endian bit string over the entire `varbinary`, so on a table with more than eight captured columns the
-  intuitive "byte `(ordinal-1)/8`" picks the wrong end and silently reports the wrong column. ⚠ A mask is
-  only decodable against the instance that produced it, which is what `_capture_instance` is for.
+  `_update_mask` carries the same information as SQL Server's raw bit mask, if you want it. ⚠ **If you decode
+  it yourself, count the bit from the RIGHT END of the whole mask** — it is a big-endian bit string over the
+  entire `varbinary`, so on a table with more than eight captured columns the intuitive "byte
+  `(ordinal-1)/8`" picks the wrong end and silently reports the wrong column:
+  `get_bit(_update_mask::BIT, (8 * octet_length(_update_mask) - <ordinal>)::INTEGER)`, with ordinals from
+  `db.cdc.captured_columns` joined to `db.cdc.change_tables` on `object_id`. ⚠ A mask is only decodable
+  against the instance that produced it, which is what `_capture_instance` is for — and what
+  `_changed_columns` already accounts for.
 - **`commit_timestamp` is opt-in because it costs a join.** It is the only column that needs
   `cdc.lsn_time_mapping`, DuckDB will not eliminate that join when nothing selects from it, and the value is
   a `datetime` (~3.33 ms) — metadata, never an ordering key. `_position` is the ordering key.

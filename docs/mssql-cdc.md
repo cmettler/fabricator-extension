@@ -3584,4 +3584,72 @@ the split the fix itself has.
 is not in the catalog cache (`mssql_exec_invalidate_cache` is off by default), so the reference would not
 bind at all — and a suite that cannot bind proves nothing about pushdown. That cost one wasted probe.
 
+
+## 24. `_changed_columns` — the mask, decoded (2026-08-25)
+
+Under `images := 'both'` the read now also emits **`_changed_columns LIST<VARCHAR>`**: the NAMES of the
+columns that update recorded. C#-only, no ABI change. Gate: `verify_mssql_cdc` 604 → **630**, two mutants.
+
+```
+_change_type      | _update_mask | _changed_columns
+------------------+--------------+---------------------------------------------
+insert            | 0x03FF       | [id, c2, c3, c4, c5, c6, c7, c8, notes, tag]
+update_preimage   | 0x0002       | [c2]
+update_postimage  | 0x0100       | [notes]
+```
+
+### 24.1 Why it is worth shipping rather than documenting
+
+§21.4 measured that the obvious way to decode the mask is WRONG past eight captured columns — the mask is a
+big-endian bit string over the whole `varbinary`, so ordinals 1-8 live in the LAST byte and the natural
+`floor((ord-1)/8)` index picks the wrong end. Documenting the correct recipe leaves every consumer one
+arithmetic slip from silently naming the wrong column, on exactly the tables (wide ones) where it matters
+most. The raw mask still ships — it is the truth — and this is the answer most callers actually want:
+`list_contains(_changed_columns, 'notes')` needs no ordinal, no bit index and no byte order.
+
+It is also the direct answer to §1.5's MAX-column trap: a NULL in a `varchar(max)` column of an
+`update_preimage` means *not recorded* when the name is absent from the list, and *genuinely NULL* when it is
+present.
+
+### 24.2 ⚠⚠ Keyed by capture INSTANCE, not one list
+
+A two-instance read (§19) unions two change tables whose ordinals need not agree, and the aligned output
+order is NEITHER instance's — so a single list would name the wrong columns for one leg. The map is keyed by
+instance and `_capture_instance` picks it per row, which is a third job for the column §18.2 shipped early.
+An instance with no map yields **NULL**, never a guess: decoding against the wrong ordinals would name the
+wrong columns, which is worse than saying nothing.
+
+**⚠ Ordinal `i` is the `i`-th captured column, MEASURED rather than assumed.** An explicit
+`@captured_column_list = 'd,b,a'` on a four-column table comes back as ordinals 1=a, 2=b, 3=d — SQL Server
+normalises to the source's own column order — and the TVF emits a, b, d in that same order. So the declared
+source columns ARE the map for a one-instance read, at no extra round trip; the union path takes it from
+`cdc.captured_columns`, which is already ordered.
+
+### 24.3 ⚠ Two placement decisions, both about not breaking something else
+
+**It goes at the END of the schema, not into the metadata block.** `meta` indexes BOTH the SQL statement's
+columns and the declared schema, and they agree only while every declared metadata column is also a
+SELECT-list column. This one is computed in C# and has no SQL counterpart, so putting it in the block would
+split `meta` into two counts across six call sites — and getting that wrong shifts every captured column by
+one, silently, which is the failure `CdcDeclare`'s own name check exists to prevent.
+
+**⚠⚠ The decorator derives its schema from the INNER stream, never from the plan's declaration** — and taking
+the declaration would have made the ARRIVAL CHECK VACUOUS. That check compares what the plan declared at bind
+against what the statement actually returned, and it is the only thing between a type that moved under us and
+a silently mis-read column; reporting the declaration would have it compare the declaration to itself.
+
+**⚠ NULL, not an empty list, for a row with no mask** (a snapshot baseline row). "This update changed
+nothing" and "this row is not an update" are different claims, and an empty list asserts the first.
+
+### 24.4 What the gate does NOT cover
+
+- **A two-instance read under `images := 'both'`.** The per-instance map is the reason the structure is a
+  dictionary, and no fixture combines the two — building one means a schema drift AND an update AND both
+  instances still live. Reasoned and unexercised; said here rather than implied.
+- **The vacuous-arrival-check mutant.** Making the decorator report the declaration produces the same schema
+  in every fixture, so no assertion can see it. It is guarded by construction and by the comment, not by a
+  test.
+- **A column name containing a comma or a quote.** The list is a real Arrow LIST, so no escaping question
+  arises — which is precisely why a comma-joined string was rejected. Nothing exercises it.
+
 ---

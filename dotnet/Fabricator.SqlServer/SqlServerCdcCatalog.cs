@@ -1352,6 +1352,10 @@ public sealed partial class SqlServerCatalog
                                            || isNullable));
         }
 
+        if (updateMask)
+        {
+            fields.Add(CdcChangedColumnsStream.DeclaredField());
+        }
         string sql = CdcUnionSql(older, newer, aligned, olderSet, newerSet, commitTimestamp, updateMask,
                                  CdcCursorShape(include, startingPosition), endingPosition, executable: true);
         string? snapshotSql = null;
@@ -1367,7 +1371,11 @@ public sealed partial class SqlServerCatalog
                                   endingPosition, startingTimestamp, endingTimestamp,
                                   captureInstance: older, sourceSchema: sourceSchema,
                                   sourceTable: sourceTable, sql: sql, secondInstance: newer,
-                                  snapshotSql: snapshotSql);
+                                  snapshotSql: snapshotSql,
+                                  // ⚠ TWO maps, because the two instances' ordinals need not agree and the
+                                  // aligned output order is NEITHER of theirs. captured is already ordered
+                                  // by column_ordinal.
+                                  maskColumns: updateMask ? CdcMaskColumns(captured) : null);
     }
 
     /// <summary>
@@ -1437,6 +1445,18 @@ public sealed partial class SqlServerCatalog
     /// <para>⚠ The <c>_commit_timestamp</c> LEFT JOIN is per LEG, each with its own <c>m</c> alias — a join in
     /// a <c>UNION ALL</c> belongs to one branch, so there is nothing shared to hoist.</para>
     /// </remarks>
+    /// <summary>Narrows the per-instance captured-column lists to the read-only shape the plan carries.</summary>
+    private static IReadOnlyDictionary<string, IReadOnlyList<string>> CdcMaskColumns(
+        Dictionary<string, List<string>> captured)
+    {
+        var map = new Dictionary<string, IReadOnlyList<string>>(StringComparer.Ordinal);
+        foreach (var pair in captured)
+        {
+            map[pair.Key] = pair.Value;
+        }
+        return map;
+    }
+
     private static string CdcUnionSql(string older, string newer, IReadOnlyList<string> aligned,
                                       ISet<string> olderSet, ISet<string> newerSet, bool commitTimestamp,
                                       bool updateMask, byte[]? startingPosition, byte[]? endingPosition,
@@ -1643,6 +1663,13 @@ public sealed partial class SqlServerCatalog
                                  nullable: !nullability.TryGetValue(f.Name, out bool isNullable) || isNullable));
         }
 
+        if (updateMask)
+        {
+            // ⚠ The map is the DECLARED source columns in order — ordinal i is the i-th captured column
+            // (MEASURED: an explicit @captured_column_list is normalised to source order and the TVF emits
+            // that same order), so this costs no round trip.
+            fields.Add(CdcChangedColumnsStream.DeclaredField());
+        }
         string sql = "SELECT " + CdcChangesSelectList(commitTimestamp, updateMask, sourceColumns)
                      + " FROM " + tvf + "(@from_lsn, @to_lsn, @row_filter) AS c"
                      + (commitTimestamp ? CdcCommitTimeJoinSql : string.Empty)
@@ -1658,7 +1685,13 @@ public sealed partial class SqlServerCatalog
                                   images, new Schema(fields, metadata: null), startingPosition,
                                   endingPosition, startingTimestamp, endingTimestamp,
                                   captureInstance: instance, sourceSchema: sourceSchema,
-                                  sourceTable: sourceTable, sql: sql, snapshotSql: snapshotSql);
+                                  sourceTable: sourceTable, sql: sql, snapshotSql: snapshotSql,
+                                  maskColumns: updateMask
+                                      ? new Dictionary<string, IReadOnlyList<string>>(StringComparer.Ordinal)
+                                        {
+                                            [instance] = sourceColumns,
+                                        }
+                                      : null);
     }
 
     /// <summary>

@@ -441,10 +441,12 @@ internal sealed class CdcChangesPlan
                             string? captureInstance = null, string? sourceSchema = null,
                             string? sourceTable = null, string? sql = null,
                             string? secondInstance = null, string? snapshotSql = null,
-                            string? resyncFrom = null, string? resyncTo = null)
+                            string? resyncFrom = null, string? resyncTo = null,
+                            IReadOnlyDictionary<string, IReadOnlyList<string>>? maskColumns = null)
     {
         ResyncFrom = resyncFrom;
         ResyncTo = resyncTo;
+        MaskColumns = maskColumns;
         Source = source;
         ExplicitInstance = explicitInstance;
         CommitTimestamp = commitTimestamp;
@@ -574,6 +576,23 @@ internal sealed class CdcChangesPlan
 
     /// <summary>True when this bind decided to re-capture and re-baseline.</summary>
     internal bool IsResync => ResyncFrom is not null;
+
+    /// <summary>
+    /// Capture instance → its captured column names in <c>column_ordinal</c> order, which is what decodes
+    /// <c>_update_mask</c> into <c>_changed_columns</c>. Null unless <see cref="HasUpdateMask"/>.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>⚠ KEYED BY INSTANCE, because a mask is only decodable against the one that produced it.</b>
+    /// A two-instance read unions two change tables whose ordinals need not agree, and the aligned output
+    /// order is neither instance's — so a single list would name the WRONG columns for one of the two legs.
+    /// <c>_capture_instance</c> is what picks the map per row.</para>
+    /// <para><b>⚠ ORDINAL <c>i</c> IS THE <c>i</c>-th CAPTURED COLUMN, MEASURED rather than assumed.</b> An
+    /// explicit <c>@captured_column_list = 'd,b,a'</c> on a four-column table comes back as ordinals
+    /// 1=a, 2=b, 3=d — SQL Server normalises to the source's own column order — and the TVF emits a, b, d in
+    /// that same order. So the declared source columns ARE the map for a one-instance read, with no extra
+    /// round trip; the union path takes it from <c>cdc.captured_columns</c>, already ordered.</para>
+    /// </remarks>
+    internal IReadOnlyDictionary<string, IReadOnlyList<string>>? MaskColumns { get; }
 
     /// <summary>
     /// Null on a DEFERRED plan — <c>enable := true</c> over a table that is not captured yet, where the
@@ -861,7 +880,8 @@ internal sealed class CdcChangesBinding : ITableFunctionBinding
         byte[]? handoff = null;
         if (_plan.HasSnapshot)
         {
-            (handoff, _snapshot) = _catalog.CdcOpenSnapshot(_plan);
+            (handoff, var rawSnapshot) = _catalog.CdcOpenSnapshot(_plan);
+            _snapshot = Decorate(rawSnapshot);
             try
             {
                 CheckArrivedSchema(_declared, _snapshot.Schema);
@@ -904,7 +924,7 @@ internal sealed class CdcChangesBinding : ITableFunctionBinding
         IArrowArrayStream stream;
         try
         {
-            stream = _catalog.CdcExecuteChanges(_plan, window);
+            stream = Decorate(_catalog.CdcExecuteChanges(_plan, window));
         }
         catch
         {
@@ -932,6 +952,21 @@ internal sealed class CdcChangesBinding : ITableFunctionBinding
         _stream = stream;
         return _snapshot is { } first ? Stream(first, stream) : Stream(stream);
     }
+
+    /// <summary>
+    /// Wraps a raw read so it also carries <c>_changed_columns</c>, when <c>images := 'both'</c> asked for
+    /// the mask.
+    /// </summary>
+    /// <remarks>
+    /// <para>⚠ BOTH legs go through it — the snapshot's rows have no mask, so they get a NULL list, which is
+    /// what keeps the two halves of a <c>snapshot+changes</c> read one shape.</para>
+    /// <para>⚠ The decorator derives its schema from the INNER stream, so the arrival check below still
+    /// compares the declaration against what SQL Server actually returned rather than against itself.</para>
+    /// </remarks>
+    private IArrowArrayStream Decorate(IArrowArrayStream inner) =>
+        _plan.HasUpdateMask && _plan.MaskColumns is { Count: > 0 } maskColumns
+            ? new CdcChangedColumnsStream(inner, maskColumns)
+            : inner;
 
     private static async IAsyncEnumerable<RecordBatch> Empty()
     {
