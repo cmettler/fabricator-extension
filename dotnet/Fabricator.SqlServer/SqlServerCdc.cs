@@ -118,10 +118,22 @@ internal static class SqlServerCdcFunctions
     /// A capture instance's owner marker, as a correlated subquery over <c>sys.extended_properties</c>.
     /// Joins on the instance's TVF, which is what <see cref="OwnerProperty"/> is set on.
     /// </summary>
-    internal const string OwnerLookupSql =
-        "(SELECT CONVERT(varchar(400), ep.value) FROM sys.extended_properties ep " +
-        " WHERE ep.class = 1 AND ep.minor_id = 0 AND ep.name = '" + OwnerProperty + "' " +
-        "   AND ep.major_id = OBJECT_ID('cdc.fn_cdc_get_all_changes_' + c.capture_instance))";
+    internal const string OwnerLookupSql = "(SELECT CONVERT(varchar(400), ep.value) "
+        + "FROM sys.extended_properties ep "
+        + "WHERE ep.class = 1 AND ep.minor_id = 0 AND ep.name = '" + OwnerProperty + "' "
+        + "  AND ep.major_id = OBJECT_ID('cdc.fn_cdc_get_all_changes_' + c.capture_instance))";
+
+    /// <summary>
+    /// The same lookup correlated on a caller-chosen alias — <c>cdc.changes</c>'s bind query already uses
+    /// <c>c</c> for <c>sys.columns</c>.
+    /// </summary>
+    /// <remarks>
+    /// ⚠ Derived from <see cref="OwnerLookupSql"/> by substitution rather than written out a second time:
+    /// two copies of a correlated subquery are two things to keep in step, and the property name is the part
+    /// that must never drift.
+    /// </remarks>
+    internal static string OwnerLookupFor(string alias) =>
+        OwnerLookupSql.Replace("c.capture_instance", alias + ".capture_instance");
 
     /// <summary>Fills <c>@cdct</c> — or leaves it EMPTY when CDC is not enabled, instead of raising 22901.</summary>
     internal const string FillHelpTableVar =

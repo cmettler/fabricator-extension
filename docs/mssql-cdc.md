@@ -7,9 +7,11 @@
 > two more — §3.4's cursor idiom does not run as printed, and §15.7's "the first call always returns zero
 > rows" is false in an already-capturing database.
 >
-> **What remains is `on_schema_change := 'resync'` (slice 8b) alone.** The two-instance boundary is §19,
-> the snapshot leg §20, and `images := 'both'` plus the timestamp bounds §21. ⚠ §18.1 records why slice 5
-> was re-scoped and slice 6 partly absorbed — read it before trusting §15.12's ordering.
+> **EVERY SLICE ON §15.12's LIST IS BUILT.** The two-instance boundary is §19, the snapshot leg §20,
+> `images := 'both'` plus the timestamp bounds §21, and `on_schema_change := 'resync'` §22. What remains is
+> only what §15.9 deliberately put last: `'fill'` and `'null'`, both of which assert something about a
+> column that was never captured. ⚠ §18.1 records why slice 5 was re-scoped and slice 6 partly absorbed —
+> read it before trusting §15.12's ordering.
 >
 > ⚠ The original header read *"DESIGN ONLY, 2026-08-23. No code, no ABI, no gate."* — true when written,
 > and superseded by slice 2's ABI v81.
@@ -2022,7 +2024,7 @@ had no value, when the truth is that we never captured it.
 
 | mode | behaviour | verdict |
 |---|---|---|
-| `resync` | new capture instance + a fresh snapshot leg (§5), then changes from its `start_lsn` | **DEFAULT when `enable := true`.** Coherent: the snapshot is a consistent point in time and the handoff is MEASURED exactly-once |
+| `resync` | new capture instance + a fresh snapshot leg (§5), then changes from its `start_lsn` | ✅ **BUILT — §22.** ⚠ NOT a default, and §22 records why: it is opt-in on every path, because re-capturing and snapshotting is a heavy privileged act and the second one destroys history |
 | `fill` | added columns read from the SOURCE by key, for rows after the adding DDL | opt-in only, and name the semantics: values are as of NOW, not as of the change |
 | `null` | NULL + `_capture_instance` | the floor — honest and decidable, never silent |
 | `error` | refuse, naming the boundary | **DEFAULT when the instance is NOT ours** |
@@ -2085,7 +2087,7 @@ The user's question. What the reader can do about it, now that §15.6 has the ma
 | **6** | ✅ **BUILT 2026-08-25 — §18.3**, pulled forward into slice 5. `on_schema_change := 'error'` (default) / `'ignore'` | loud before it is clever. §15.11 |
 | **7** | ✅ **BUILT 2026-08-25 — §19.** The two-instance boundary: derive the split, partition the window, `UNION ALL` by name. It also retires BOTH items deferred from slice 5 — the name-alignment is BUILT, and `WidenArrowType` is **DISSOLVED** (§19.2: the union is in T-SQL, and the helper's stated rule was measurably wrong AND has no reachable case) | needed 3 and 5 |
 | **8** | ✅ **BUILT 2026-08-25 — §20.** `include := 'snapshot'` / `'snapshot+changes'`: §5's two-connection protocol, the handoff position on every baseline row, and the refusals a snapshot needs. ⚠ **`on_schema_change := 'resync'` is NOT in it** — see the note below | the resync story needs the snapshot leg first |
-| **8b** | `on_schema_change := 'resync'` — a new capture instance plus a fresh snapshot leg on drift | now unblocked. ⚠ §15.11's constraint governs it: at most TWO instances, so re-enabling is not repeatable and the second drift must DISABLE the oldest, destroying its unread history. That must be opt-in, which makes it a decision rather than a mode |
+| **8b** | ✅ **BUILT 2026-08-25 — §22.** `on_schema_change := 'resync'`: a new capture instance plus a forced snapshot leg when the captured set no longer matches the source. ⚠ §15.11's constraint is honoured by REFUSING rather than by choosing — at most TWO instances, so a second resync would have to DISABLE the oldest and destroy its unread history, and the message names that operator action instead. ⚠ It also exposed a defect in the emitted handoff (§22.5) and RETRACTED §21.2's proposed discrimination as measurably impossible (§22.6) | needed the snapshot leg |
 | **9** | ✅ **BUILT 2026-08-25 — §21.** `starting_timestamp` / `ending_timestamp` (both INCLUSIVE, unlike a position) and `images := 'both'` + `_update_mask`. ⚠ There is deliberately NO mask PLACEHOLDER — §21.3: a placeholder is a value, so it cannot be distinguished from a row that genuinely holds it; the mask makes the trap decidable instead | additive to the same reader |
 | — | ~~`on_schema_change := 'fill'`~~ | last, if ever — §15.9 records why |
 
@@ -3249,9 +3251,14 @@ about the other.
 
 It still refuses rather than clamping, and that is the safe half of an honest uncertainty: if changes really
 were purged, reading on returns a SHORT answer with nothing failing — the exact failure the retention
-pre-check exists for. ⚠ **Discriminating properly is cheap and deliberately NOT taken**: nothing was purged
-iff `min_lsn <= start_lsn`, which is one more column in a batch that already runs. Left undone so that a
-false alarm stays a false alarm and never becomes a silent short read; it is the obvious follow-on.
+pre-check exists for.
+
+> **⚠⚠ RETRACTED — this paragraph proposed a discrimination that is MEASURABLY IMPOSSIBLE, and §22.6 has the
+> measurement.** It read: *"Discriminating properly is cheap and deliberately NOT taken: nothing was purged
+> iff `min_lsn <= start_lsn`, which is one more column in a batch that already runs … it is the obvious
+> follow-on."* It was built the next day and measured: `sp_cdc_cleanup_change_table` MOVES
+> `cdc.change_tables.start_lsn` up along with the floor, so the two are the SAME VALUE, the test is
+> vacuously true, and building it **deleted the below-floor refusal outright**. Do not re-propose it.
 
 ### 21.3 `images := 'both'` — and why no placeholder is substituted
 
@@ -3368,5 +3375,144 @@ gate — mixing it into a feature commit would drown it. Mutant D is the reader'
   the one SQL Server documents for all three.
 - **The multi-byte layout is SQL Server's, not ours**, so §30c is documentation-as-assertion: no mutant of
   our code can kill it. Its value is catching a future server change, or a reader that reorders the bytes.
+
+## 22. Slice 8b AS BUILT — `on_schema_change := 'resync'` (2026-08-25)
+
+The last slice on §15.12's list. When a capture instance no longer describes its source — a column was
+**ADDED**, so it is not captured and every read silently omits it — `'resync'` creates a fresh capture
+instance and answers with a **baseline of the whole table in the new shape**, plus a handoff to resume the
+stream from. C#-only, **no ABI change**. Gate: `verify_mssql_cdc` 559 → **604**, six mutants, each killed at
+its own assertion.
+
+```sql
+FROM db.cdc.changes('dbo.orders', on_schema_change := 'resync')
+```
+
+### 22.1 ⚠⚠ It keys on a DIFFERENT SIGNAL from the other two modes, and that is forced
+
+| mode | question | when | needs |
+|---|---|---|---|
+| `error` (default) / `ignore` | *did a DDL land INSIDE this window?* | EXECUTE | the window, and a `cdc.ddl_history` round trip |
+| `resync` | *does this capture instance still describe the source?* | **BIND** | nothing extra — both sides are already in hand |
+
+**It must be BIND**, and the reason is the arrival check: a resync changes the DECLARED output schema (the
+new column has to appear in it), and widening a schema mid-execute is exactly what that check correctly
+refuses. Deciding at bind is also what makes the DESCRIBE honest — `DESCRIBE … on_schema_change := 'resync'`
+shows the new column while `… 'ignore'` does not, which is gated as a pair.
+
+**It costs NOTHING extra.** The source's column list already comes back with the nullability the bind query
+fetches, and the captured set is the describe's own output. No round trip is added on any path, including
+the one that decides not to resync.
+
+**⚠ Only an ADDED column triggers it** (§15.11). A column DROPPED from the source is the other direction —
+the change table keeps it and it reads NULL — and re-capturing would LOSE it outright; a TYPE change
+propagates to the change table on its own. Neither is repaired by a new instance, so neither is a reason to
+take one. When nothing is stale, `'resync'` falls through to exactly what `'error'` does: it is not
+`'ignore'`, so a drift it cannot repair is still refused rather than swallowed.
+
+**⚠ The DDL runs at EXECUTE**, like `enable := true` (§17.4), so bind stays side-effect-free and an
+`EXPLAIN` / `DESCRIBE` / `CREATE VIEW` over a resync plan captures nothing. Gated.
+
+### 22.2 ⚠⚠ It FORCES the snapshot leg — the alternative is silent loss
+
+A new capture instance starts capturing NOW. Reading its changes alone would silently begin at the resync
+instant and lose everything committed before it: a short read with nothing failing, which is the one outcome
+this whole surface exists to prevent. Re-baselining IS the repair — the snapshot carries the state (in the
+NEW shape, which is the point) and its handoff joins the new instance's stream with no gap.
+
+So `include := 'changes'` becomes `'snapshot+changes'`. A caller who asked for `'snapshot'` alone keeps
+exactly that, re-captured.
+
+**⚠ A LOWER BOUND IS REFUSED**, at bind, before any DDL. A cursor says *continue from what I have read* and
+a resync answers with a fresh baseline instead — two different reads, and only the caller can say which they
+meant.
+
+### 22.3 ⚠⚠ Two refusals that are POLICY, not limits
+
+**Already two capture instances ⇒ refused.** SQL Server caps a table at two (§2.2, `Msg 22962`), so a second
+resync can only proceed by DISABLING the older one — destroying whatever history nobody has read yet.
+Whether that is acceptable depends on where every consumer's cursor is, which a `SELECT` cannot know. The
+message names the operator action (`cdc.disable(<table>, capture_instance := '<older>')`) and points at the
+two modes that still work, so it is a redirection rather than a dead end.
+
+**The instance is not OURS ⇒ refused** (§15.9). Creating a capture instance and taking a full-table snapshot
+is a heavy, privileged act, and doing it implicitly on a configuration a DBA chose is not ours to decide.
+`fabricator_source` (§17.2) is the marker, and UNMARKED means not ours, full stop — there is deliberately no
+fallback that adopts one, because adopting one is precisely what the refusal exists to prevent. Gated with
+its control (the instance really is unmarked) beside it.
+
+### 22.4 The second name — §17.3's deferred question, answered
+
+`GenerateSecondCaptureInstance` = the generated name plus `_b`, and `ResyncCaptureInstance` picks whichever
+of the pair the surviving instance is **not** using. Deterministic, no probing, no counter: a resync is
+refused outright when both exist, so exactly one of the two is always free at the moment one is needed.
+
+**⚠ "Otherwise take the primary" is a real case, not a fallback**: the surviving instance may carry an
+explicit name a caller passed to `cdc.enable`, or a name from an older digest (§17.3 — the generator may
+change without migration). Both leave the primary free.
+
+The gate asserts the RELATIONSHIP (`max(name) = min(name) || '_b'`) rather than a literal, because
+hard-coding the hash would pin the DIGEST, which §17.3 explicitly says may change.
+
+### 22.5 ⚠⚠ THE DEFECT THIS EXPOSED, and the fix is at the SOURCE of the cursor
+
+The documented resume idiom — take the handoff out of the rows, hand it back as `starting_position` — FAILED
+on the resync path, with `starting_position … is BELOW the retention floor … removed by the cleanup job`.
+Nothing had been removed: the instance was seconds old.
+
+**Mechanism.** The handoff is `fn_cdc_get_max_lsn()` at the pin, i.e. the capture WATERMARK, which LAGS; an
+instance enabled moments earlier has a floor ABOVE it (§20.7 already records this shape). `CdcResolveWindow`
+clamps for the read happening in the SAME statement, but the position PRINTED on the baseline rows was the
+raw watermark — so the next statement's bound was below the floor and refused.
+
+**Fixed by emitting the clamped position**, in `CdcOpenSnapshot`, so the cursor is right at its source
+rather than every caller learning a workaround. Mutant J restores the raw watermark and dies at the resume.
+
+**⚠⚠ AND THE FIRST VERSION OF THAT FIX READ THE WRONG FUNCTION AND SILENTLY DID NOTHING.** It clamped
+against `fn_cdc_get_min_lsn`, which §1.6a MEASURED as transiently NULL for a newly enabled instance while
+`start_lsn` is already set — and a resync creates its instance moments before, so NULL is the NORMAL answer
+there rather than a corner. The suite failed identically, which is what sent me to read §1.6a again.
+`cdc.change_tables.start_lsn` is the source that answers immediately.
+
+⚠ This does **not** contradict §1.6a's rule against substituting `start_lsn` for the floor. There the
+substitution would ASSERT a retention floor the engine declined to state, and reading past it loses data.
+Here the question is which POSITION TO HAND BACK as a cursor, where being too HIGH is bounded by the
+snapshot (at-least-once, never loss).
+
+### 22.6 ⚠⚠ A DISCRIMINATION §21.2 PROPOSED IS MEASURABLY IMPOSSIBLE — retract it
+
+§21.2 called it "the obvious follow-on": tell "the cleanup job removed those changes" apart from "the
+capture instance did not exist yet", because *nothing was purged iff `min_lsn <= start_lsn`*. It was built,
+and then measured:
+
+```
+before cleanup   floor 0x0000003000000548004E   start_lsn 0x0000003000000548004E
+EXEC sys.sp_cdc_cleanup_change_table @capture_instance='mx_v1', @low_water_mark=<max lsn>, @threshold=5000
+after  cleanup   floor 0x00000030000045200003   start_lsn 0x00000030000045200003
+```
+
+**`sp_cdc_cleanup_change_table` MOVES `cdc.change_tables.start_lsn` up along with the floor — they are the
+same value.** So `min_lsn <= start_lsn` is vacuously true, the test discriminates nothing, and building it
+**deleted the below-floor refusal entirely** — a silent short read wherever changes really had been purged.
+
+**⚠ The gate is what caught it**: §18's pre-check assertion (a zero cursor on a fresh instance) stopped
+refusing. Had that assertion not existed, the regression was invisible — no row moves, and the very reads it
+breaks are the ones nobody has yet.
+
+⇒ CDC keeps no record that separates the two causes. The refusal stands and its message names both, which is
+the safe half of an honest uncertainty. **Do not re-propose this.**
+
+### 22.7 What the gate does NOT cover, said rather than implied
+
+- **Disabling the older instance to make room.** That is the operator action the two-instance refusal names,
+  and running it inside the suite would destroy the fixture the refusal was just asserted against.
+- **A resync racing a concurrent column ADD.** The re-bind passes `'error'` rather than `'resync'`, so ONE
+  resync per statement is structural — but the arrival check is what would catch a column added between the
+  two metadata reads, and sqllogictest is sequential, so no suite can arrange it.
+- **Mutants H and I die at the SAME assertion** (the baseline rows) though they break different things — no
+  forced snapshot, and a re-bind that falls into the two-instance union. Both are killed; neither is
+  *independently* gated, and separating them would cost a second fixture for no additional protection.
+- **The `fill` and `null` modes** remain designed-but-unbuilt and are still refused BY NAME (§15.9 records
+  why they are last: both assert something about a column that was never captured).
 
 ---

@@ -84,7 +84,7 @@ statement ok
 SELECT fabricator_exec('${MSSQL_TESTDB_DSN}', 'IF OBJECT_ID(''dbo.cdc_zz_noidx'') IS NOT NULL DROP TABLE dbo.cdc_zz_noidx;');
 
 statement ok
-SELECT fabricator_exec('${MSSQL_TESTDB_DSN}', 'IF OBJECT_ID(''dbo.cdc_snap'') IS NOT NULL DROP TABLE dbo.cdc_snap; IF OBJECT_ID(''dbo.cdc_seed'') IS NOT NULL DROP TABLE dbo.cdc_seed; IF OBJECT_ID(''dbo.cdc_void'') IS NOT NULL DROP TABLE dbo.cdc_void; IF OBJECT_ID(''dbo.cdc_img'') IS NOT NULL DROP TABLE dbo.cdc_img; IF OBJECT_ID(''dbo.cdc_when'') IS NOT NULL DROP TABLE dbo.cdc_when;');
+SELECT fabricator_exec('${MSSQL_TESTDB_DSN}', 'IF OBJECT_ID(''dbo.cdc_snap'') IS NOT NULL DROP TABLE dbo.cdc_snap; IF OBJECT_ID(''dbo.cdc_seed'') IS NOT NULL DROP TABLE dbo.cdc_seed; IF OBJECT_ID(''dbo.cdc_void'') IS NOT NULL DROP TABLE dbo.cdc_void; IF OBJECT_ID(''dbo.cdc_img'') IS NOT NULL DROP TABLE dbo.cdc_img; IF OBJECT_ID(''dbo.cdc_when'') IS NOT NULL DROP TABLE dbo.cdc_when; IF OBJECT_ID(''dbo.cdc_rs'') IS NOT NULL DROP TABLE dbo.cdc_rs; IF OBJECT_ID(''dbo.cdc_rsx'') IS NOT NULL DROP TABLE dbo.cdc_rsx;');
 
 statement ok
 SELECT fabricator_exec('${MSSQL_TESTDB_DSN}', 'IF OBJECT_ID(''dbo.cdc_gen'') IS NOT NULL DROP TABLE dbo.cdc_gen; IF OBJECT_ID(''dbo.cdc_own'') IS NOT NULL DROP TABLE dbo.cdc_own; IF OBJECT_ID(''dbo.cdc_auto'') IS NOT NULL DROP TABLE dbo.cdc_auto; IF OBJECT_ID(''dbo.cdc_ddl'') IS NOT NULL DROP TABLE dbo.cdc_ddl; IF OBJECT_ID(''dbo.gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg'') IS NOT NULL DROP TABLE dbo.gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg;');
@@ -1131,10 +1131,21 @@ EXECUTE cdc_after_ddl(getvariable('cdc_ddl_end'));
 ----
 0
 
-# The modes that are DESIGNED but not built are refused BY NAME, so a reader of the design note is told
-# which slice they are waiting for rather than being told their spelling is wrong.
+# ⚠ `'resync'` is IMPLEMENTED since slice 8b and is exercised in §32, on its own fixture. It is deliberately
+# NOT exercised here: `dbo.cdc_ddl` IS stale (its `extra` column was added and never dropped), so a resync
+# would re-capture and re-baseline it in the middle of a section about the in-window DDL check — and this
+# section's remaining assertions are about that check, not about repairing it.
+#
+# ⚠⚠ THE ASSERTION THAT USED TO STAND HERE WAS WRONG AND PASSED ANYWAY, which is why it is gone rather than
+# adjusted. It claimed `cdc_ddl`'s captured set matched its source (it does not) and asserted the row count
+# beside an instance count in ONE statement — where the row count coincided at 2 either way, and DuckDB is
+# free to evaluate the second scalar subquery BEFORE the first, so the instance count could be read before
+# the resync's DDL ran. Two subqueries in one statement do not pin an order; §32 splits them.
+
+# The modes that are DESIGNED but not built are still refused BY NAME, so a reader of the design note is told
+# which one they are waiting for rather than being told their spelling is wrong.
 statement error
-SELECT count(*) FROM c1.cdc.changes('dbo.cdc_ddl', on_schema_change := 'resync');
+SELECT count(*) FROM c1.cdc.changes('dbo.cdc_ddl', on_schema_change := 'fill');
 ----
 designed but not implemented yet
 
@@ -2065,6 +2076,204 @@ SELECT count(*) FROM c1.cdc.changes('dbo.cdc_when', starting_timestamp := TIMEST
 ----
 BELOW the retention floor
 
+
+# ═══ §32  on_schema_change := 'resync' — re-capture and re-baseline (slice 8b) ═════════════════════════
+# docs §22, and §15.9/§15.11 for why it is a POLICY rather than a mode. When a capture instance no longer
+# describes its source — a column was ADDED, so it is not captured and the read silently omits it — 'resync'
+# creates a fresh instance and answers with a BASELINE of the whole table in the new shape, plus a handoff to
+# resume the stream from. ⚠ The trigger is a METADATA comparison decided at BIND, not the in-window DDL check
+# the other two modes use: a resync changes the DECLARED output schema, and widening one mid-execute is what
+# the arrival check correctly refuses.
+
+statement ok
+SELECT fabricator_exec('c1', 'IF OBJECT_ID(''dbo.cdc_rs'') IS NOT NULL DROP TABLE dbo.cdc_rs; CREATE TABLE dbo.cdc_rs(id INT NOT NULL PRIMARY KEY, v INT NULL);');
+
+# ⚠ A DEFAULT enable, so the instance carries the generated name AND the ownership marker — both are
+# preconditions of a resync, and §32c asserts what happens without the second.
+statement ok
+SELECT target, changed FROM c1.cdc.enable('dbo.cdc_rs');
+
+statement ok
+SELECT fabricator_exec('c1', 'INSERT INTO dbo.cdc_rs (id, v) VALUES (1, 10), (2, 20); UPDATE dbo.cdc_rs SET v = 99 WHERE id = 1;');
+
+statement ok
+SELECT fabricator_exec('c1', 'DECLARE @inst sysname = (SELECT TOP 1 ct.capture_instance FROM cdc.change_tables ct JOIN sys.tables t ON t.object_id = ct.source_object_id WHERE t.name = ''cdc_rs''); DECLARE @i int = 0; WHILE @i < 60 AND sys.fn_cdc_get_min_lsn(@inst) IS NULL BEGIN WAITFOR DELAY ''00:00:01''; SET @i = @i + 1; END');
+
+# The drift: a column the capture instance will never capture. ⚠ Its own statement — an ALTER and a
+# reference to the column it adds cannot share a batch (SQL Server compiles the whole batch first).
+statement ok
+SELECT fabricator_exec('c1', 'ALTER TABLE dbo.cdc_rs ADD region VARCHAR(10) NULL;');
+
+statement ok
+SELECT fabricator_exec('c1', 'UPDATE dbo.cdc_rs SET region = ''eu'';');
+
+# ⚠⚠ THE DECLARED SHAPE IS THE SOURCE'S CURRENT ONE, and that is the whole reason the decision is made at
+# BIND. The default read cannot see `region` at all — it is not captured — so the two shapes differing IS the
+# feature. Asserted as a pair so neither can pass alone.
+query II
+SELECT (SELECT count(*) FROM (DESCRIBE SELECT * FROM c1.cdc.changes('dbo.cdc_rs', on_schema_change := 'ignore')) WHERE column_name = 'region') AS ignore_sees,
+       (SELECT count(*) FROM (DESCRIBE SELECT * FROM c1.cdc.changes('dbo.cdc_rs', on_schema_change := 'resync')) WHERE column_name = 'region') AS resync_sees;
+----
+0	1
+
+# ⚠⚠ AND THE DESCRIBE ABOVE CAPTURED NOTHING. A resync performs DDL, so bind staying side-effect-free is not
+# hygiene — it is what keeps an EXPLAIN, a DESCRIBE or a CREATE VIEW from re-capturing a table. Same split
+# `enable := true` uses (§25).
+query I
+SELECT count(*) FROM c1.cdc.tables() WHERE source_table = 'cdc_rs';
+----
+1
+
+# ⚠ A LOWER BOUND IS REFUSED, and it is refused BEFORE any DDL happens. A cursor says "continue from what I
+# have read" and a resync answers with a fresh baseline instead, so honouring the cursor and re-baselining
+# are two different reads — only the caller can choose which they meant.
+statement ok
+SET VARIABLE cdc_rs_pos = (SELECT _position FROM c1.cdc.changes('dbo.cdc_rs', on_schema_change := 'ignore') WHERE id = 2);
+
+statement error
+SELECT count(*) FROM c1.cdc.changes('dbo.cdc_rs', on_schema_change := 'resync', starting_position := getvariable('cdc_rs_pos'));
+----
+cannot be combined with a lower bound
+
+statement error
+SELECT count(*) FROM c1.cdc.changes('dbo.cdc_rs', on_schema_change := 'resync', starting_timestamp := TIMESTAMP '2026-01-01 00:00:00');
+----
+cannot be combined with a lower bound
+
+# …and still no DDL, which is what makes the two refusals above safe to write in this order.
+query I
+SELECT count(*) FROM c1.cdc.tables() WHERE source_table = 'cdc_rs';
+----
+1
+
+# ═══ §32a  The resync itself — a baseline in the NEW shape ═════════════════════════════════════════════
+# ⚠⚠ IT FORCES THE SNAPSHOT LEG even though the caller asked for `changes`. A new capture instance starts
+# capturing NOW, so its changes alone would silently begin at the resync instant and LOSE everything before
+# it — a short read with nothing failing. Re-baselining IS the repair, and `region` is populated on every
+# row because the snapshot reads the SOURCE.
+query IIIII
+SELECT _change_type, _capture_instance IS NULL AS baseline, id, v, region
+FROM c1.cdc.changes('dbo.cdc_rs', on_schema_change := 'resync') ORDER BY id;
+----
+insert	true	1	99	eu
+insert	true	2	20	eu
+
+# ⚠ TWO instances now, and BOTH are ours — the new one carries the marker, so a later resync of it would be
+# permitted by the same rule that permitted this one (were there room, which §32c shows there is not).
+query I
+SELECT count(*) FROM c1.cdc.tables() WHERE source_table = 'cdc_rs' AND fabricator_source IS NOT NULL;
+----
+2
+
+# ⚠⚠ THE SECOND NAME IS THE FIRST PLUS `_b`, asserted as a RELATIONSHIP rather than as a literal. Two
+# canonical names per table and a resync takes whichever is free (§17.3's deferred question, answered here);
+# hard-coding the hash would pin the DIGEST, which §17.3 explicitly says may change without migration.
+query I
+SELECT max(capture_instance) = min(capture_instance) || '_b'
+FROM c1.cdc.tables() WHERE source_table = 'cdc_rs';
+----
+true
+
+# ═══ §32b  Resuming after a resync — the handoff joins the NEW instance's stream ════════════════════════
+# ⚠ This is the assertion that makes the whole slice worth having: the baseline is only useful if the stream
+# continues from it with no gap and no duplicate. The handoff comes out of the rows, exactly as the
+# documented idiom says, and the resumed read names the NEW instance.
+
+statement ok
+SET VARIABLE cdc_rs_new = (SELECT max(capture_instance) FROM c1.cdc.tables() WHERE source_table = 'cdc_rs');
+
+statement ok
+SET VARIABLE cdc_rs_h = (SELECT DISTINCT _position FROM c1.cdc.changes('dbo.cdc_rs', capture_instance := getvariable('cdc_rs_new'), include := 'snapshot'));
+
+statement ok
+SELECT fabricator_exec('c1', 'INSERT INTO dbo.cdc_rs (id, v, region) VALUES (7, 70, ''us'');');
+
+statement ok
+SELECT fabricator_exec('c1', 'DECLARE @ct sysname = (SELECT TOP 1 QUOTENAME(''cdc'') + ''.'' + QUOTENAME(ct.capture_instance + ''_CT'') FROM cdc.change_tables ct JOIN sys.tables t ON t.object_id = ct.source_object_id WHERE t.name = ''cdc_rs'' ORDER BY ct.start_lsn DESC); DECLARE @sql nvarchar(max) = N''DECLARE @i int = 0; WHILE @i < 60 AND ((SELECT COUNT(*) FROM '' + @ct + N'') < 1 OR sys.fn_cdc_get_max_lsn() IS NULL OR sys.fn_cdc_get_max_lsn() < (SELECT MAX(__$start_lsn) FROM '' + @ct + N'')) BEGIN WAITFOR DELAY ''''00:00:01''''; SET @i = @i + 1; END''; EXEC sys.sp_executesql @sql;');
+
+# Exactly the change that came AFTER the baseline, in the new shape. Not the two rows the baseline already
+# carried (no duplicate), and not nothing (no gap).
+query IIII
+SELECT _change_type, id, v, region
+FROM c1.cdc.changes('dbo.cdc_rs', capture_instance := getvariable('cdc_rs_new'),
+                    starting_position := getvariable('cdc_rs_h'));
+----
+insert	7	70	us
+
+# ═══ §32c  The refusals — a policy that destroys history is not a SELECT's to make ═════════════════════
+# ⚠⚠ THE ONE REFUSAL THAT IS A DECISION RATHER THAN A LIMIT. SQL Server caps a table at TWO capture
+# instances (§2.2), so a second resync can only proceed by DISABLING the older one — destroying whatever
+# history nobody has read yet. Whether that is acceptable depends on where every consumer's cursor is, which
+# this read cannot know, so it names the operator action instead of making an irreversible choice.
+statement ok
+SELECT fabricator_exec('c1', 'ALTER TABLE dbo.cdc_rs ADD extra INT NULL;');
+
+statement error
+SELECT count(*) FROM c1.cdc.changes('dbo.cdc_rs', on_schema_change := 'resync');
+----
+already has two capture instances
+
+# …and the same table still reads fine across BOTH instances under the other two modes, which is what makes
+# the refusal a redirection rather than a dead end.
+query I
+SELECT count(*) > 0 FROM c1.cdc.changes('dbo.cdc_rs', on_schema_change := 'ignore');
+----
+true
+
+# ⚠⚠ AN INSTANCE WE DID NOT CREATE IS REFUSED (§15.9). Creating a capture instance and taking a full-table
+# snapshot is a heavy, privileged act; doing it implicitly on a configuration a DBA chose is not ours to
+# decide. `fabricator_source` is the marker and UNMARKED means not ours, full stop — there is deliberately no
+# fallback that adopts one, because adopting one is exactly what this refusal exists to prevent.
+statement ok
+SELECT fabricator_exec('c1', 'IF OBJECT_ID(''dbo.cdc_rsx'') IS NOT NULL DROP TABLE dbo.cdc_rsx; CREATE TABLE dbo.cdc_rsx(id INT NOT NULL PRIMARY KEY, v INT NULL);');
+
+statement ok
+SELECT fabricator_exec('c1', 'EXEC sys.sp_cdc_enable_table @source_schema = ''dbo'', @source_name = ''cdc_rsx'', @role_name = NULL, @capture_instance = ''rsx_dba'';');
+
+statement ok
+SELECT fabricator_exec('c1', 'ALTER TABLE dbo.cdc_rsx ADD region VARCHAR(10) NULL;');
+
+# The control first: it really is unmarked, so the refusal below is about ownership and not about something
+# else having gone wrong.
+query I
+SELECT fabricator_source IS NULL FROM c1.cdc.tables() WHERE source_table = 'cdc_rsx';
+----
+true
+
+statement error
+SELECT count(*) FROM c1.cdc.changes('dbo.cdc_rsx', on_schema_change := 'resync');
+----
+was not created by this extension
+
+# ⚠ NOTHING STALE ⇒ NOTHING HAPPENS, and 'resync' is not 'ignore': the in-window DDL check still runs, so a
+# drift it cannot repair (a type change, a drop) is still refused rather than swallowed. Here the captured
+# set matches the source, so the read is ordinary and NO instance is created — which is the assertion, since
+# a build that resynced unconditionally would pass the row count and fail this.
+# ⚠ TWO STATEMENTS, NOT two scalar subqueries in one: DuckDB may evaluate the second before the first, so a
+# single statement could read the instance count BEFORE the read that would have changed it — and then pass
+# on a build that resyncs unconditionally. The order is the assertion, so it has to be written as one.
+query I
+SELECT count(*) FROM c1.cdc.changes('dbo.cdc_when', on_schema_change := 'resync');
+----
+3
+
+query I
+SELECT count(*) FROM c1.cdc.tables() WHERE source_table = 'cdc_when';
+----
+1
+
+# The mode is case-insensitive and the ones that remain designed-but-unbuilt are still named rather than
+# called invalid.
+statement error
+SELECT count(*) FROM c1.cdc.changes('dbo.cdc_when', on_schema_change := 'fill');
+----
+designed but not implemented yet
+
+statement error
+SELECT count(*) FROM c1.cdc.changes('dbo.cdc_when', on_schema_change := 'nonsense');
+----
+is not a value
+
 # ═══ §9  Teardown — leave NO CDC-enabled table behind ══════════════════════════════════════════════════
 # Load-bearing: the capture job keeps scanning a CDC-enabled database between runs, and the next run's §3
 # would then find max_position() non-NULL and fail for a reason unrelated to the code.
@@ -2083,7 +2292,7 @@ statement ok
 SELECT fabricator_exec('c1', 'IF OBJECT_ID(''dbo.cdc_zz_noidx'') IS NOT NULL DROP TABLE dbo.cdc_zz_noidx;');
 
 statement ok
-SELECT fabricator_exec('c1', 'IF OBJECT_ID(''dbo.cdc_span'') IS NOT NULL DROP TABLE dbo.cdc_span; IF OBJECT_ID(''dbo.cdc_conf'') IS NOT NULL DROP TABLE dbo.cdc_conf; IF OBJECT_ID(''dbo.cdc_snap'') IS NOT NULL DROP TABLE dbo.cdc_snap; IF OBJECT_ID(''dbo.cdc_seed'') IS NOT NULL DROP TABLE dbo.cdc_seed; IF OBJECT_ID(''dbo.cdc_void'') IS NOT NULL DROP TABLE dbo.cdc_void; IF OBJECT_ID(''dbo.cdc_img'') IS NOT NULL DROP TABLE dbo.cdc_img; IF OBJECT_ID(''dbo.cdc_when'') IS NOT NULL DROP TABLE dbo.cdc_when;');
+SELECT fabricator_exec('c1', 'IF OBJECT_ID(''dbo.cdc_span'') IS NOT NULL DROP TABLE dbo.cdc_span; IF OBJECT_ID(''dbo.cdc_conf'') IS NOT NULL DROP TABLE dbo.cdc_conf; IF OBJECT_ID(''dbo.cdc_snap'') IS NOT NULL DROP TABLE dbo.cdc_snap; IF OBJECT_ID(''dbo.cdc_seed'') IS NOT NULL DROP TABLE dbo.cdc_seed; IF OBJECT_ID(''dbo.cdc_void'') IS NOT NULL DROP TABLE dbo.cdc_void; IF OBJECT_ID(''dbo.cdc_img'') IS NOT NULL DROP TABLE dbo.cdc_img; IF OBJECT_ID(''dbo.cdc_when'') IS NOT NULL DROP TABLE dbo.cdc_when; IF OBJECT_ID(''dbo.cdc_rs'') IS NOT NULL DROP TABLE dbo.cdc_rs; IF OBJECT_ID(''dbo.cdc_rsx'') IS NOT NULL DROP TABLE dbo.cdc_rsx;');
 
 statement ok
 SELECT fabricator_exec('c1', 'IF OBJECT_ID(''dbo.cdc_gen'') IS NOT NULL DROP TABLE dbo.cdc_gen; IF OBJECT_ID(''dbo.cdc_own'') IS NOT NULL DROP TABLE dbo.cdc_own; IF OBJECT_ID(''dbo.cdc_auto'') IS NOT NULL DROP TABLE dbo.cdc_auto; IF OBJECT_ID(''dbo.cdc_ddl'') IS NOT NULL DROP TABLE dbo.cdc_ddl; IF OBJECT_ID(''dbo.gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg'') IS NOT NULL DROP TABLE dbo.gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg;');

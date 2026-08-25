@@ -107,7 +107,7 @@ See [SQL Server external tables on S3](#sql-server-external-tables-on-s3).
 | | `db.cdc.changes(...)` — a resumable change-stream reader with a 21-byte cursor, a retention pre-check, `enable := true`, an in-window schema-change check, and a table's two capture instances read as ONE stream across the boundary | ✅ |
 | | `include := 'snapshot'` / `'snapshot+changes'` — the whole table as of one consistent instant, then the changes after it, with no gap between the halves | ✅ |
 | | Before-images (`images := 'both'` + `_update_mask`) and wall-clock window bounds | ✅ |
-| | `on_schema_change := 'resync'` | ❌ designed, not built (`docs/mssql-cdc.md` §15.12) |
+| | `on_schema_change := 'resync'` — re-capture and re-baseline when the capture instance no longer matches the source | ✅ |
 | **Monitoring** | `db.dbo.fabricator_session_tag(k, v)` — tag a transaction's connection so Fabric query insights can attribute its cost | ✅ (see dbt caveat) |
 | | `application_name` on the secret → `program_name` on every statement (run-level attribution) | ✅ |
 | | Load-time *global* functions (connection-free); proc multi-result-set / `INOUT` params | ❌ deferred |
@@ -941,7 +941,7 @@ FROM db.cdc.changes('dbo.orders'                    -- a <schema>.<table> or a c
       [, images            := 'after']              -- 'after' (default) | 'both'
       [, commit_timestamp  := false]                -- opt-in, see below
       [, enable            := false]                -- capture the table on first read
-      [, on_schema_change  := 'error']              -- 'error' (default) | 'ignore'
+      [, on_schema_change  := 'error']              -- 'error' (default) | 'ignore' | 'resync'
       [, include           := 'changes'])           -- 'changes' (default) | 'snapshot' | 'snapshot+changes'
 ```
 
@@ -999,6 +999,18 @@ UPDATE my_cursors SET cur = getvariable('cdc_end') WHERE tbl = 'dbo.orders';
   `cdc.ddl_history` before returning rows and refuses, naming the statement and its LSN. Read up to the
   change and re-bind, or pass `on_schema_change := 'ignore'` to read anyway (which also saves the check's
   round trip). A window that *starts after* the change is clean again.
+- **`on_schema_change := 'resync'` repairs the one case a re-capture can repair.** If the source has columns
+  the capture instance does not — someone ran `ALTER TABLE … ADD` — a resync creates a **fresh capture
+  instance** and answers with a **baseline of the whole table in the new shape**, plus a handoff to resume
+  from. It keys on a metadata comparison, not on your window, so `DESCRIBE` already shows the new column;
+  the DDL itself happens at execute, so an `EXPLAIN` or a `CREATE VIEW` captures nothing. It is deliberately
+  **not** a default, and it declines rather than guesses in three cases: a **lower bound** beside it (a
+  cursor and a fresh baseline are two different reads), an instance **this extension did not create** (a
+  full-table snapshot on someone else's configuration is not a `SELECT`'s call), and a table that already
+  has **two capture instances** — SQL Server's maximum, so making room means disabling the older one and
+  destroying whatever history nobody has read. The message names that operator action. When nothing is
+  stale, `resync` behaves exactly like `error`: a drift it cannot repair (a type change, a drop) is still
+  refused rather than swallowed.
 - **An `UPDATE` produces ONE row by default** (the after-image); `images := 'both'` surfaces the pair as
   `update_preimage` + `update_postimage` and adds `_update_mask` — see below.
 - **Wall-clock bounds are INCLUSIVE, and a `_position` is not — that asymmetry is deliberate.** A
@@ -1133,8 +1145,9 @@ this handoff give unconditionally. Stop the capture job (`sys.sp_cdc_stop_job`) 
 > the reader; if you do take the baseline alone, fall back to `db.cdc.max_position()` taken **before** the
 > read, which is at worst a small replay and never a skip.
 
-- **Not built yet** (`docs/mssql-cdc.md` §15.12): `on_schema_change := 'resync'` (a new capture instance
-  plus a fresh snapshot on schema drift).
+- **Not built** (`docs/mssql-cdc.md` §15.9 records why they are last): `on_schema_change := 'fill'` and
+  `'null'`, both of which assert something about a column that was never captured. They are refused by name
+  rather than treated as typos.
 
 ### `db.dbo.fabricator_session_tag(key, value) -> TABLE` (SQL Server / Fabric)
 

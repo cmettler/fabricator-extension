@@ -855,7 +855,9 @@ public sealed partial class SqlServerCatalog
                                            DateTime? startingTimestamp = null,
                                            DateTime? endingTimestamp = null)
     {
-        const string sql =
+        // ⚠ Not `const`: the owner lookup is composed per alias (the bind query uses `c` for sys.columns), so
+        // the string is built rather than literal. Same text on every call.
+        string sql =
             "SET NOCOUNT ON; " +
             SqlServerCdcFunctions.HelpTableVar + " " +
             SqlServerCdcFunctions.FillHelpTableVar + " " +
@@ -863,7 +865,10 @@ public sealed partial class SqlServerCatalog
             "CAST(m.source_schema AS varchar(128)) AS source_schema, " +
             "CAST(m.source_table AS varchar(128)) AS source_table, " +
             "CAST(c.name AS varchar(128)) AS column_name, " +
-            "CAST(c.is_nullable AS varchar(1)) AS is_nullable " +
+            "CAST(c.is_nullable AS varchar(1)) AS is_nullable, " +
+            // The ownership marker (§17.2), so a resync can refuse to re-capture a DBA's configuration
+            // without a second round trip. Correlated on `m` because `c` is sys.columns here.
+            SqlServerCdcFunctions.OwnerLookupFor("m") + " AS owner " +
             // A LEFT JOIN so a matched instance still yields a row when sys.columns answers nothing (the
             // source table dropped out from under a capture instance): the resolution must not vanish with
             // the nullability.
@@ -876,7 +881,7 @@ public sealed partial class SqlServerCatalog
             // floors onto the same value; the name breaks a tie nothing can produce, so the order is total.
             "ORDER BY m.start_lsn, m.create_date, m.capture_instance, c.column_id;";
 
-        var rows = ReadMetadataRows(sql, 5, new[]
+        var rows = ReadMetadataRows(sql, 6, new[]
         {
             new SqlParameter("@source", source),
             NullableParam("@capture_instance", captureInstance),
@@ -908,6 +913,7 @@ public sealed partial class SqlServerCatalog
 
         var nullability = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
         var matched = new List<string>();
+        var owned = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
         foreach (var row in rows)
         {
             string name = row[0] ?? string.Empty;
@@ -915,6 +921,7 @@ public sealed partial class SqlServerCatalog
             {
                 matched.Add(name);
             }
+            owned[name] = row[5] is not null;
             if (row[3] is { } column)
             {
                 nullability[column] = row[4] != "0";
@@ -932,6 +939,23 @@ public sealed partial class SqlServerCatalog
                 + "source string must be matching both as a capture-instance name and as a table name. Name "
                 + "the instance with capture_instance := '<name>'; SELECT * FROM <catalog>.cdc.tables() "
                 + "lists them.");
+        }
+        if (matched.Count == 2
+            && string.Equals(onSchemaChange, CdcChangesPlan.OnSchemaChangeResync, StringComparison.Ordinal))
+        {
+            // ⚠⚠ THE ONE REFUSAL THAT IS A POLICY RATHER THAN A LIMIT, and §15.11 is why it must be. SQL
+            // Server caps a table at TWO capture instances (Msg 22962), so a second resync can only proceed
+            // by DISABLING the older one — which destroys whatever history nobody has read yet. Whether that
+            // is acceptable depends on where every consumer's cursor is, which this read cannot know. So it
+            // refuses and names the operator action, rather than making an irreversible choice implicitly.
+            throw new ArgumentException(
+                $"cdc.changes: on_schema_change := 'resync' cannot re-capture '{rows[0][1]}.{rows[0][2]}' - "
+                + $"it already has two capture instances ('{matched[0]}' and '{matched[1]}'), which is the "
+                + "maximum SQL Server allows. Making room means disabling the older one and DESTROYING any "
+                + "of its changes nobody has read yet, so it is not something a SELECT will do on its own: "
+                + $"once every consumer is past the boundary, run cdc.disable('{rows[0][1]}.{rows[0][2]}', "
+                + $"capture_instance := '{matched[0]}') and read again. Until then this read spans both "
+                + "instances as one stream (on_schema_change := 'error' or 'ignore').");
         }
         if (matched.Count == 2)
         {
@@ -960,9 +984,86 @@ public sealed partial class SqlServerCatalog
                 + "transaction would not be readable either, because the capture job reads COMMITTED log "
                 + "records. Commit first, then read.");
         }
-        return CdcDeclare(described, source, captureInstance, instance, rows[0][1] ?? "dbo",
-                          rows[0][2] ?? source, nullability, commitTimestamp, onSchemaChange, include, images,
-                          tvf, startingPosition, endingPosition, startingTimestamp, endingTimestamp);
+        var plan = CdcDeclare(described, source, captureInstance, instance, rows[0][1] ?? "dbo",
+                              rows[0][2] ?? source, nullability, commitTimestamp, onSchemaChange, include,
+                              images, tvf, startingPosition, endingPosition, startingTimestamp,
+                              endingTimestamp);
+        if (!string.Equals(onSchemaChange, CdcChangesPlan.OnSchemaChangeResync, StringComparison.Ordinal))
+        {
+            return plan;
+        }
+        return CdcMaybeResync(plan, instance, owned, nullability, commitTimestamp, images,
+                              CdcMetadataColumnCount(commitTimestamp, updateMask));
+    }
+
+    /// <summary>
+    /// <c>on_schema_change := 'resync'</c>: when the capture instance no longer describes the source, hand
+    /// back a plan that will create a fresh instance and re-baseline. Otherwise returns
+    /// <paramref name="plan"/> unchanged.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>⚠⚠ THE TRIGGER IS A METADATA COMPARISON, NOT THE IN-WINDOW DDL CHECK, and the two answer
+    /// different questions.</b> <c>'error'</c>/<c>'ignore'</c> ask "did a DDL land inside this window?",
+    /// which needs the window and is therefore an EXECUTE-time question. This asks "does the captured set
+    /// still match the source?", which needs no window — and it MUST be answered at bind, because a resync
+    /// changes the declared output schema and widening one mid-execute is exactly what the arrival check
+    /// refuses.</para>
+    /// <para><b>⚠ It costs NOTHING extra.</b> Both sides are already in hand: the source's column list came
+    /// back with the nullability the bind query already fetches, and the captured set is the describe's own
+    /// output. No round trip is added on any path, including the one that decides not to resync.</para>
+    /// <para><b>⚠ ONLY AN ADDED COLUMN TRIGGERS IT</b> (§15.11). A column DROPPED from the source is the
+    /// other direction — the change table keeps it and it reads NULL — and re-capturing would LOSE it
+    /// outright; a TYPE change propagates to the change table on its own. Neither is repaired by a new
+    /// instance, so neither is a reason to take one.</para>
+    /// <para><b>⚠ IT REFUSES OVER AN INSTANCE THAT IS NOT OURS</b> (§15.9). Creating a capture instance and
+    /// taking a full-table snapshot is a heavy, privileged act, and doing it implicitly on a configuration a
+    /// DBA chose is not ours to decide. <c>fabricator_source</c> (§17.2) is the marker; UNMARKED means not
+    /// ours, full stop — there is deliberately no fallback that adopts one.</para>
+    /// </remarks>
+    private CdcChangesPlan CdcMaybeResync(CdcChangesPlan plan, string instance,
+                                          IReadOnlyDictionary<string, bool> owned,
+                                          IReadOnlyDictionary<string, bool> nullability,
+                                          bool commitTimestamp, string images, int meta)
+    {
+        var captured = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        for (int i = meta; i < plan.Output.FieldsList.Count; i++)
+        {
+            captured.Add(plan.Output.FieldsList[i].Name);
+        }
+        var added = new List<string>();
+        foreach (var column in nullability.Keys)
+        {
+            if (!captured.Contains(column))
+            {
+                added.Add(column);
+            }
+        }
+        if (added.Count == 0)
+        {
+            // Nothing a new capture instance would repair. The in-window DDL check still runs at execute —
+            // 'resync' is not 'ignore'.
+            return plan;
+        }
+        if (!owned.TryGetValue(instance, out bool ours) || !ours)
+        {
+            throw new ArgumentException(
+                $"cdc.changes: on_schema_change := 'resync' will not re-capture '{plan.SourceName}' - its "
+                + $"capture instance '{instance}' was not created by this extension, so re-capturing it "
+                + "would take a full-table snapshot and add an instance to a configuration somebody else "
+                + "chose. "
+                + (added.Count == 1
+                       ? $"The source column '{added[0]}' is not captured by it"
+                       : $"{added.Count} source columns are not captured by it "
+                         + $"({string.Join(", ", added)})")
+                + ". Read with on_schema_change := 'error' (the default) or 'ignore', or capture the table "
+                + "yourself with cdc.enable(...) and read that instance.");
+        }
+        string resyncTo = SqlServerCdcSetup.ResyncCaptureInstance(plan.SourceSchema ?? "dbo",
+                                                                 plan.SourceTable ?? plan.Source, instance);
+        Log.LogDebug("cdc changes {Source} ({Instance}): resync - {Count} source column(s) not captured "
+                     + "({Columns}); will create {New} and re-baseline", plan.SourceName, instance,
+                     added.Count, string.Join(", ", added), resyncTo);
+        return CdcDeclareResync(plan, instance, resyncTo, commitTimestamp, images);
     }
 
 
@@ -1031,6 +1132,80 @@ public sealed partial class SqlServerCatalog
         return new CdcChangesPlan(source, explicitInstance: null, commitTimestamp, onSchemaChange, include,
                                   images, new Schema(fields, metadata: null), startingPosition,
                                   endingPosition, startingTimestamp, endingTimestamp);
+    }
+
+    /// <summary>
+    /// The RESYNC declaration: the capture instance is stale, so the output is declared from the SOURCE's
+    /// current shape and the DDL is deferred to execute.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>⚠⚠ IT FORCES THE SNAPSHOT LEG, and that is not a convenience.</b> A new capture instance
+    /// starts capturing NOW, so reading its changes alone would silently begin at the resync instant and
+    /// LOSE everything committed before it — a short read with nothing failing, which is the one outcome
+    /// this whole surface is built to prevent. Re-baselining IS the repair: the snapshot carries the state
+    /// (in the NEW shape, which is the point), and its handoff joins the new instance's stream with no gap
+    /// and no duplicate. A caller who asked for <c>include := 'snapshot'</c> alone keeps that; anything else
+    /// becomes <c>'snapshot+changes'</c>.</para>
+    /// <para><b>⚠ A LOWER BOUND IS REFUSED HERE, because a resync would silently discard it.</b> The whole
+    /// point of a cursor is "continue from what I have read", and a resync answers with a fresh baseline
+    /// instead — so honouring the cursor and re-baselining are two different reads and only the caller can
+    /// choose. Refusing at BIND keeps the choice theirs.</para>
+    /// <para><b>⚠ The declaration comes from the SOURCE, exactly as <see cref="CdcDeclareDeferred"/> does
+    /// for <c>enable := true</c></b> (§15.7), and it is correct BY CONSTRUCTION for the instance about to be
+    /// created: a default <c>sp_cdc_enable_table</c> captures every source column, so at the instant we
+    /// enable, captured == source. Anything that changes in between is caught by the arrival check.</para>
+    /// <para>⚠ EVERY source column is declared NULLABLE, for the same reason the deferred path does it: at
+    /// bind we do not know which columns the enable will capture, and a NOT NULL claim we cannot keep is the
+    /// one direction that becomes a wrong answer.</para>
+    /// </remarks>
+    private CdcChangesPlan CdcDeclareResync(CdcChangesPlan plan, string resyncFrom, string resyncTo,
+                                            bool commitTimestamp, string images)
+    {
+        if (plan.StartingPosition is not null || plan.StartingTimestamp is not null)
+        {
+            throw new ArgumentException(
+                $"cdc.changes: on_schema_change := 'resync' cannot be combined with a lower bound - "
+                + $"'{plan.SourceName}' has source columns its capture instance '{resyncFrom}' does not "
+                + "capture, so a resync answers with a fresh baseline of the whole table rather than with "
+                + "the changes after your cursor, and the cursor would be silently discarded. Drop the "
+                + "bound to re-baseline (the rows carry a new _position to resume from), or keep the bound "
+                + "and pass on_schema_change := 'error' to be told about the drift instead.");
+        }
+        bool updateMask = string.Equals(images, CdcChangesPlan.ImagesBoth, StringComparison.Ordinal);
+        string schema = plan.SourceSchema ?? "dbo";
+        string table = plan.SourceTable ?? plan.Source;
+        string qualified = Quote(schema) + "." + Quote(table);
+        string describeSql = "SELECT " + CdcSyntheticMetadataSelectList(commitTimestamp, updateMask)
+                             + ", s.* FROM " + qualified + " AS s";
+        var described = DescribeQuery(describeSql, CdcDescribeParameters());
+        if (described is null)
+        {
+            throw new InvalidOperationException(
+                $"cdc.changes: on_schema_change := 'resync' could not describe '{schema}.{table}' to declare "
+                + "the re-captured shape, although its capture instance reports it as the source. The table "
+                + "may have been dropped between this statement's two metadata reads; re-run it.");
+        }
+        // ⚠ 'snapshot' alone stays 'snapshot' — a caller who asked for the baseline and nothing else gets
+        // exactly that, re-captured. Everything else becomes 'snapshot+changes'.
+        string include = string.Equals(plan.Include, CdcChangesPlan.IncludeSnapshot, StringComparison.Ordinal)
+            ? CdcChangesPlan.IncludeSnapshot
+            : CdcChangesPlan.IncludeSnapshotChanges;
+        int meta = CdcMetadataColumnCount(commitTimestamp, updateMask);
+        var fields = new List<Field>(described.FieldsList.Count);
+        for (int i = 0; i < described.FieldsList.Count; i++)
+        {
+            var f = described.FieldsList[i];
+            fields.Add(new Field(f.Name, f.DataType,
+                                 nullable: i >= meta
+                                           || CdcMetadataNullable(i, meta, commitTimestamp, updateMask,
+                                                                  hasSnapshot: true)));
+        }
+        return new CdcChangesPlan(plan.Source, explicitInstance: null, commitTimestamp, plan.OnSchemaChange,
+                                  include, images, new Schema(fields, metadata: null),
+                                  startingPosition: null, endingPosition: plan.EndingPosition,
+                                  startingTimestamp: null, endingTimestamp: plan.EndingTimestamp,
+                                  sourceSchema: schema, sourceTable: table,
+                                  resyncFrom: resyncFrom, resyncTo: resyncTo);
     }
 
     /// <summary>
@@ -1345,6 +1520,51 @@ public sealed partial class SqlServerCatalog
     /// disagree — a table captured PARTIALLY by someone else in that window — the arrival check fails
     /// loudly, which is the honest outcome and the only one that cannot corrupt a result.</para>
     /// </remarks>
+    /// <summary>
+    /// <c>on_schema_change := 'resync'</c> at EXECUTE: create the fresh capture instance the bind chose, then
+    /// re-bind against THAT instance alone.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>⚠⚠ THE RE-BIND NAMES THE NEW INSTANCE, and leaving that out would silently undo the
+    /// resync.</b> The table now has TWO instances, so a bare re-bind takes slice 7's UNION path and reads
+    /// the old instance's history in the old shape beside the new one — which is a perfectly good answer to
+    /// a different question, and the exact opposite of re-baselining. Naming it also keeps the union's
+    /// boundary machinery out of a read whose lower bound is a snapshot handoff.</para>
+    /// <para><b>⚠ The re-bind passes <c>'error'</c>, not <c>'resync'</c>, so ONE resync per statement is
+    /// STRUCTURAL rather than incidental.</b> The new instance captures every source column by construction,
+    /// so a second pass would find nothing to do — but only until a column is added between our two metadata
+    /// reads, and then it would find a table with two instances and refuse, turning a working read into a
+    /// confusing failure. Declining to ask twice is cheaper than reasoning about that race.</para>
+    /// <para><b>⚠ The DDL runs HERE, at execute, for the same reason <c>enable := true</c> does</b> (§17.4):
+    /// bind must stay side-effect-free, so an <c>EXPLAIN</c> or <c>CREATE VIEW</c> over a resync plan
+    /// captures nothing. It is affordable because the declared schema came from the SOURCE, not from the
+    /// instance that does not exist yet.</para>
+    /// <para>⚠ The window that follows is resolved with <c>justCreated: true</c>, so a NULL retention floor
+    /// is the FACT "nothing readable yet" rather than the retry error (§17.4) — the ordinary state moments
+    /// after an enable, and harmless here because the SNAPSHOT carries the state and its handoff is what the
+    /// next read resumes from.</para>
+    /// </remarks>
+    internal (CdcChangesPlan Plan, bool Created) CdcResyncAndResolve(CdcChangesPlan plan)
+    {
+        string schema = plan.SourceSchema ?? "dbo";
+        string table = plan.SourceTable ?? plan.Source;
+        string resyncTo = plan.ResyncTo
+                          ?? throw new InvalidOperationException(
+                              "cdc.changes: internal - a resync plan carries no instance name to create.");
+        using var report = CdcEnableTable(schema, table, captureInstance: resyncTo, columns: null,
+                                          role: null, index: null, filegroup: null, net: false);
+        bool created = report.Length > 0 && ((BooleanArray)report.Column(1)).GetValue(0) == true;
+        Log.LogInformation("cdc changes {Source}: resync - superseding capture instance {Old} with {New} "
+                           + "({Outcome}); this read re-baselines from a snapshot", schema + "." + table,
+                           plan.ResyncFrom, resyncTo,
+                           created ? "created" : "it already existed");
+        var resolved = CdcBindChanges(schema + "." + table, resyncTo, plan.CommitTimestamp, enable: false,
+                                      CdcChangesPlan.OnSchemaChangeError, plan.Include, plan.Images,
+                                      startingPosition: null, endingPosition: plan.EndingPosition,
+                                      startingTimestamp: null, endingTimestamp: plan.EndingTimestamp);
+        return (resolved, created);
+    }
+
     internal (CdcChangesPlan Plan, bool Created) CdcEnableAndResolve(CdcChangesPlan plan)
     {
         var (schema, table) = SqlServerCdcSetup.SplitSource(plan.Source, "cdc.changes");
@@ -1666,6 +1886,8 @@ public sealed partial class SqlServerCatalog
                 Value = tsTo,
             });
         }
+        // enabled, min_lsn, max_lsn, [split], [ts_from], [ts_to]
+        int splitColumn = 3;
         int columns = (plan.IsUnion ? 4 : 3) + (mapStart ? 1 : 0) + (mapEnd ? 1 : 0);
         int tsFromColumn = plan.IsUnion ? 4 : 3;
         int tsToColumn = tsFromColumn + (mapStart ? 1 : 0);
@@ -1700,7 +1922,7 @@ public sealed partial class SqlServerCatalog
         byte[]? split = null;
         if (plan.IsUnion)
         {
-            split = SqlServerCdcFunctions.ParseHex(rows[0][3]);
+            split = SqlServerCdcFunctions.ParseHex(rows[0][splitColumn]);
             if (split is null)
             {
                 throw new InvalidOperationException(
@@ -1854,22 +2076,16 @@ public sealed partial class SqlServerCatalog
         }
         else if (CdcChangesPlan.CompareLsn(fromLsn, minLsn) < 0)
         {
-            // ⚠⚠ THE MESSAGE NAMES BOTH CAUSES, because this read cannot tell them apart and MEASURING
-            // it is what showed that. fn_cdc_map_time_to_lsn resolves against cdc.lsn_time_mapping, which is
-            // DATABASE-wide, while the floor is this INSTANCE's — so an old timestamp on a recently captured
-            // table maps below the floor with nothing having been lost at all. (Measured: an instance
-            // enabled minutes earlier, starting_timestamp := 2020-01-01, mapping floor 0x2C… against an
-            // instance floor 0x30….) An earlier wording asserted "removed by the cleanup job", which is
-            // true of one cause and a fabrication about the other.
-            // ⚠ It still REFUSES rather than clamping, and that is the safe half of an honest uncertainty:
-            // if changes WERE purged, proceeding delivers a short read with nothing failing — the exact
-            // failure the retention check exists for. Discriminating properly needs the instance's
-            // start_lsn beside its floor (nothing was purged iff min_lsn <= start_lsn), which is one more
-            // column in a batch that already runs; deliberately NOT taken here, so that a false alarm stays
-            // a false alarm and never becomes a silent short read.
-            // ⚠ And it names the parameter the CALLER actually passed: a timestamp bound arrives at this
-            // branch as an LSN they have never seen, so reporting it as "starting_position" would send them
-            // looking for a cursor they did not write.
+            // ⚠⚠ REFUSED, AND THE TWO CAUSES CANNOT BE TOLD APART — which is a FACT about CDC's metadata,
+            // not a gap in this code. §21.2 proposed discriminating them with the instance's start_lsn
+            // ("nothing was purged iff min_lsn <= start_lsn"), and MEASURING it killed the idea:
+            // sp_cdc_cleanup_change_table MOVES cdc.change_tables.start_lsn up to the new low-water mark
+            // along with the floor, so the two are the SAME VALUE and the test is vacuously true. Building
+            // it would have removed this refusal altogether — a silent short read wherever changes really
+            // had been purged. So the message names both causes and refuses, which is the safe half.
+            // ⚠ It names the parameter the CALLER actually passed: a timestamp bound arrives at this branch
+            // as an LSN they have never seen, so reporting it as "starting_position" would send them looking
+            // for a cursor they did not write.
             if (plan.StartingTimestamp is { } purgedTs)
             {
                 throw new InvalidOperationException(
@@ -1878,10 +2094,10 @@ public sealed partial class SqlServerCatalog
                     + $"{CdcChangesPlan.Hex(minLsn)} of capture instance '{plan.CaptureInstance}' - so this "
                     + "read cannot answer for the range between them. Either the cleanup job removed those "
                     + "changes (in which case reading on WOULD HAVE SILENTLY SKIPPED THEM), or the capture "
-                    + "instance simply did not exist that early; this read cannot tell which, so it refuses "
-                    + "rather than guess. Drop the lower bound to take everything still retained, start "
-                    + "from cdc.min_position('" + plan.CaptureInstance + "'), or re-baseline with "
-                    + "include := 'snapshot+changes'. cdc.health() reports the retention setting.");
+                    + "instance did not exist that early; CDC keeps no record that separates the two, so "
+                    + "this refuses rather than guess. Drop the lower bound to take everything still "
+                    + "retained, start from cdc.min_position('" + plan.CaptureInstance + "'), or re-baseline "
+                    + "with include := 'snapshot+changes'. cdc.health() reports the retention setting.");
             }
             throw new InvalidOperationException(
                 $"cdc.changes: starting_position {CdcChangesPlan.Hex(fromLsn)} is BELOW the retention floor "

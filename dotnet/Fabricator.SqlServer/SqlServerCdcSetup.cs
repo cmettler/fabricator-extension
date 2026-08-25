@@ -145,11 +145,10 @@ internal static class SqlServerCdcSetup
     /// <para>⚠ 16 hex characters is 64 bits. A collision would need two tables whose names hash the same,
     /// and the consequence would be a refusal (<c>this capture instance already exists</c>) rather than a
     /// wrong answer — SQL Server enforces uniqueness. It is not a correctness boundary.</para>
-    /// <para>⚠ There is deliberately NO second-instance discriminator yet. §2.2 caps a table at two
-    /// instances, and nothing in this release creates the second by itself: a default enable REFUSES to add
-    /// one (it would make <c>cdc.changes</c> ambiguous for that table), and an explicit
-    /// <c>capture_instance :=</c> names it. Slice 8's <c>resync</c> is what will need one, and it should
-    /// choose the shape then rather than inherit a guess.</para>
+    /// <para>⚠ The second-instance discriminator is <see cref="GenerateSecondCaptureInstance"/>, chosen when
+    /// <c>resync</c> was built rather than guessed in advance — see its remarks. A default enable still
+    /// REFUSES to add a second instance (it would make <c>cdc.changes</c> ambiguous for that table); only
+    /// <c>on_schema_change := 'resync'</c> and an explicit <c>capture_instance :=</c> create one.</para>
     /// </remarks>
     internal static string GenerateCaptureInstance(string schema, string table)
     {
@@ -163,6 +162,39 @@ internal static class SqlServerCdcSetup
         }
         return name.ToString();
     }
+
+    /// <summary>
+    /// The name a <c>resync</c> gives the SECOND capture instance of a table: the generated name plus
+    /// <c>_b</c>.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>⚠ TWO CANONICAL NAMES, AND A RESYNC TAKES WHICHEVER ONE IS FREE.</b> SQL Server caps a table
+    /// at two capture instances (§2.2, <c>Msg 22962</c>), and a resync is refused outright when both already
+    /// exist — so exactly one of the pair is always available at the moment one is needed. That makes the
+    /// choice deterministic with no probing and no counter: a resync creates
+    /// <see cref="GenerateSecondCaptureInstance"/> when the surviving instance is
+    /// <see cref="GenerateCaptureInstance"/>, and the primary otherwise.</para>
+    /// <para>⚠ "Otherwise" is a real case rather than a fallback: the surviving instance may carry an
+    /// EXPLICIT name the caller passed to <c>cdc.enable</c>, or a name from an older digest (§17.3 — the
+    /// generator may change, and a table captured under the old one is still found). Both leave the primary
+    /// name free, and taking it is right.</para>
+    /// <para>⚠ 22 characters, so the §15.4 length defect this whole naming scheme exists to remove cannot
+    /// come back through the suffix.</para>
+    /// <para>⚠ It is still a NAME and must never be PARSED — neither to recover the table nor to decide
+    /// which instance is newer. <c>cdc.change_tables.start_lsn</c> orders them (§19) and the
+    /// <c>fabricator_source</c> marker maps them back.</para>
+    /// </remarks>
+    internal static string GenerateSecondCaptureInstance(string schema, string table) =>
+        GenerateCaptureInstance(schema, table) + "_b";
+
+    /// <summary>
+    /// The capture-instance name a <c>resync</c> of <paramref name="schema"/>.<paramref name="table"/>
+    /// should create, given the one instance that exists today.
+    /// </summary>
+    internal static string ResyncCaptureInstance(string schema, string table, string existing) =>
+        string.Equals(existing, GenerateCaptureInstance(schema, table), StringComparison.OrdinalIgnoreCase)
+            ? GenerateSecondCaptureInstance(schema, table)
+            : GenerateCaptureInstance(schema, table);
 }
 
 /// <summary>

@@ -118,7 +118,7 @@ internal sealed class CdcChangesFunction : ICatalogTableFunction
                 + "lists what is captured.");
         }
         images = NormalizeImages(images);
-        ValidateOnSchemaChange(onSchemaChange);
+        onSchemaChange = NormalizeOnSchemaChange(onSchemaChange);
         include = NormalizeInclude(include);
         ValidateOneBoundPerSide(startingPosition, endingPosition, startingTimestamp, endingTimestamp);
         ValidateBoundsAgainstInclude(include, startingPosition, endingPosition, startingTimestamp,
@@ -253,24 +253,31 @@ internal sealed class CdcChangesFunction : ICatalogTableFunction
     /// need the two-instance alignment of §15.8. Refusing them BY NAME is what stops a caller reading the
     /// design note and concluding the reader is broken.
     /// </remarks>
-    private static void ValidateOnSchemaChange(string mode)
+    private static string NormalizeOnSchemaChange(string mode)
     {
-        if (string.Equals(mode, CdcChangesPlan.OnSchemaChangeError, StringComparison.OrdinalIgnoreCase)
-            || string.Equals(mode, CdcChangesPlan.OnSchemaChangeIgnore, StringComparison.OrdinalIgnoreCase))
+        foreach (string known in new[]
+                 {
+                     CdcChangesPlan.OnSchemaChangeError,
+                     CdcChangesPlan.OnSchemaChangeIgnore,
+                     CdcChangesPlan.OnSchemaChangeResync,
+                 })
         {
-            return;
+            if (string.Equals(mode, known, StringComparison.OrdinalIgnoreCase))
+            {
+                return known;
+            }
         }
-        bool designed = string.Equals(mode, "resync", StringComparison.OrdinalIgnoreCase)
-                        || string.Equals(mode, "fill", StringComparison.OrdinalIgnoreCase)
+        bool designed = string.Equals(mode, "fill", StringComparison.OrdinalIgnoreCase)
                         || string.Equals(mode, "null", StringComparison.OrdinalIgnoreCase);
         throw new ArgumentException(
             designed
                 ? $"cdc.changes: on_schema_change := '{mode}' is designed but not implemented yet - this "
-                  + "release offers 'error' (refuse when a DDL landed inside the window, the default) and "
-                  + "'ignore' (read anyway). 'resync' needs the initial-snapshot leg; 'fill' and 'null' need "
-                  + "the two-instance alignment."
+                  + "release offers 'error' (refuse when a DDL landed inside the window, the default), "
+                  + "'ignore' (read anyway) and 'resync' (re-capture and re-baseline when the capture "
+                  + "instance no longer matches the source). 'fill' and 'null' both assert something about a "
+                  + "column that was never captured, which is why they are last."
                 : $"cdc.changes: on_schema_change := '{mode}' is not a value - this release accepts 'error' "
-                  + "(the default) and 'ignore'.");
+                  + "(the default), 'ignore' and 'resync'.");
     }
 
     /// <summary>
@@ -386,6 +393,27 @@ internal sealed class CdcChangesPlan
     /// <summary>Read anyway, and skip the check (and its round trip).</summary>
     internal const string OnSchemaChangeIgnore = "ignore";
 
+    /// <summary>
+    /// Re-capture and re-baseline when the capture instance no longer matches the source (slice 8b, §22).
+    /// </summary>
+    /// <remarks>
+    /// <para><b>⚠⚠ IT KEYS ON A DIFFERENT SIGNAL FROM THE OTHER TWO MODES, and that is the design rather
+    /// than an inconsistency.</b> <c>'error'</c> and <c>'ignore'</c> answer "did a DDL land INSIDE this
+    /// window?", which is a question about a range of LSNs. <c>'resync'</c> answers "does this capture
+    /// instance still describe the source?", which is a question about METADATA and needs no window at all —
+    /// so it is decided at BIND, where the declared output schema can still be the new one. Deciding it at
+    /// execute would mean widening a schema mid-statement, which the arrival check correctly refuses.</para>
+    /// <para><b>⚠ Only an ADDED column is fixable by a new instance</b> (§15.11). A type change propagates
+    /// to the change table on its own and a DROP leaves the column reading NULL; neither is repaired by
+    /// re-capturing. So when nothing is stale, <c>'resync'</c> falls through to exactly what
+    /// <c>'error'</c> does — loud about what it cannot fix rather than silently doing nothing.</para>
+    /// <para><b>⚠ It FORCES the snapshot leg.</b> A new instance starts capturing NOW, so reading its
+    /// changes alone would silently begin at the resync instant and lose everything before it. Re-baselining
+    /// is the whole point: the snapshot carries the state, and its handoff joins the new instance's stream
+    /// with no gap.</para>
+    /// </remarks>
+    internal const string OnSchemaChangeResync = "resync";
+
     /// <summary>The TVF's <c>@row_filter_option</c> for <see cref="ImagesAfter"/>. Excludes op 3 for free.</summary>
     internal const string RowFilterAll = "all";
 
@@ -412,8 +440,11 @@ internal sealed class CdcChangesPlan
                             DateTime? startingTimestamp = null, DateTime? endingTimestamp = null,
                             string? captureInstance = null, string? sourceSchema = null,
                             string? sourceTable = null, string? sql = null,
-                            string? secondInstance = null, string? snapshotSql = null)
+                            string? secondInstance = null, string? snapshotSql = null,
+                            string? resyncFrom = null, string? resyncTo = null)
     {
+        ResyncFrom = resyncFrom;
+        ResyncTo = resyncTo;
         Source = source;
         ExplicitInstance = explicitInstance;
         CommitTimestamp = commitTimestamp;
@@ -511,8 +542,38 @@ internal sealed class CdcChangesPlan
     internal string OnSchemaChange { get; }
 
     /// <summary>Whether this read checks for a DDL inside its window before returning rows.</summary>
+    /// <remarks>
+    /// ⚠ TRUE under <c>'resync'</c> too, deliberately. A resync repairs exactly one thing — a column the
+    /// capture instance never captured — and a window may contain a DDL it cannot repair (a type change, a
+    /// drop). Falling through to the <c>'error'</c> check is what keeps the mode from silently swallowing
+    /// those. ⚠ On a plan that DID resync the check runs against the NEW instance's window, where by
+    /// construction nothing has drifted yet.
+    /// </remarks>
     internal bool ChecksSchemaDrift =>
         !string.Equals(OnSchemaChange, OnSchemaChangeIgnore, StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// The capture instance a <c>resync</c> is superseding — null unless this bind decided to resync.
+    /// </summary>
+    /// <remarks>
+    /// <b>⚠ ITS PRESENCE IS THE DECISION, and the decision is made at BIND.</b> The declared output schema
+    /// comes from the SOURCE on such a plan (the shape the NEW instance will capture), so by the time
+    /// execute runs there is nothing left to decide — only the DDL to perform. That is the same split
+    /// <c>enable := true</c> uses (§17): bind stays side-effect-free, so an <c>EXPLAIN</c> over a resync
+    /// plan captures nothing.
+    /// </remarks>
+    internal string? ResyncFrom { get; }
+
+    /// <summary>The capture-instance name the resync will CREATE at execute.</summary>
+    /// <remarks>
+    /// ⚠ Fixed at BIND rather than derived at execute, so the statement's effect is fully determined by the
+    /// plan. <see cref="SqlServerCdcSetup.ResyncCaptureInstance"/> picks whichever of the table's two
+    /// canonical names the surviving instance is not using.
+    /// </remarks>
+    internal string? ResyncTo { get; }
+
+    /// <summary>True when this bind decided to re-capture and re-baseline.</summary>
+    internal bool IsResync => ResyncFrom is not null;
 
     /// <summary>
     /// Null on a DEFERRED plan — <c>enable := true</c> over a table that is not captured yet, where the
@@ -778,8 +839,17 @@ internal sealed class CdcChangesBinding : ITableFunctionBinding
         // ⚠ THE DEFERRED ENABLE, and it belongs HERE for two independent reasons: bind must stay
         // side-effect-free (an EXPLAIN must not capture a table), and SchemaMayChange is read the moment
         // this method returns.
+        // ⚠ The resync branch is FIRST: a resync plan is also unresolved (its instance does not exist yet),
+        // so falling through to the ordinary enable would run a DEFAULT enable — which keys on the TABLE,
+        // finds the stale instance, creates nothing, and silently reads exactly what the resync was asked to
+        // replace.
         bool justCreated = false;
-        if (!_plan.IsResolved)
+        if (_plan.IsResync)
+        {
+            (_plan, justCreated) = _catalog.CdcResyncAndResolve(_plan);
+            _enabled |= justCreated;
+        }
+        else if (!_plan.IsResolved)
         {
             (_plan, justCreated) = _catalog.CdcEnableAndResolve(_plan);
             _enabled |= justCreated;

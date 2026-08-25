@@ -128,7 +128,61 @@ public sealed partial class SqlServerCatalog
 
             // Step 3: the handoff position, read on A in an ordinary transaction — which is what dissolves
             // §11 item 3 (nothing depends on how fn_cdc_get_max_lsn behaves inside a snapshot transaction).
+            // ⚠⚠ CLAMPED UP TO THE CAPTURE INSTANCE'S FLOOR, AND THE EMITTED HANDOFF IS THE CLAMPED ONE —
+            // which is what makes the documented resume idiom survive a FRESH instance.
+            //
+            // fn_cdc_get_max_lsn is the capture WATERMARK, which LAGS; an instance enabled moments ago has a
+            // floor ABOVE it (§20.7). CdcResolveWindow already clamps for the read happening in THIS
+            // statement, but the position printed on the baseline rows was the raw watermark — so taking it
+            // out of the rows and handing it back as starting_position in the NEXT statement produced a
+            // below-the-floor bound and a refusal (MEASURED, on the resync path, which is exactly where a
+            // fresh instance is guaranteed). Emitting the clamped value fixes the cursor at its SOURCE
+            // rather than teaching every caller a workaround.
+            //
+            // ⚠ NOT a way to dodge the retention refusal, which stays at full strength: the clamp is
+            // UPWARDS and only to a floor read in the same breath as the watermark. §21.2's proposal to
+            // discriminate "purged" from "never existed" at RESOLVE time was MEASURED WRONG and abandoned —
+            // sp_cdc_cleanup_change_table moves cdc.change_tables.start_lsn along with the floor, so the two
+            // are one value and the test would have been vacuously true, silently deleting the refusal.
+            //
+            // ⚠ Nothing is skipped by clamping up, for the reason §20.7 records: what lies between the
+            // watermark and the floor is history this instance never captured, and the SNAPSHOT carries the
+            // state it produced.
+            //
+            // ⚠⚠ THE FLOOR IS READ FROM cdc.change_tables.start_lsn, NOT FROM fn_cdc_get_min_lsn, AND THE
+            // FIRST VERSION OF THIS USED THE FUNCTION AND SILENTLY DID NOTHING. §1.6a: for a newly enabled
+            // instance the FUNCTION is transiently NULL for up to a polling interval while start_lsn is
+            // ALREADY SET — and a resync creates its instance moments before this runs, so NULL is the
+            // normal answer here rather than a corner. MEASURED: the emitted handoff stayed at the raw
+            // watermark and the resume then failed against a floor that had materialised above it.
+            //
+            // ⚠ §1.6a forbids substituting start_lsn for the floor, and this does NOT contradict it: there
+            // the substitution would ASSERT a retention floor the engine declined to state, and reading past
+            // it loses data. Here the question is which POSITION TO HAND BACK as a cursor, where being too
+            // HIGH is bounded by the snapshot (at-least-once, never loss) — and the two values are in fact
+            // the same one, MEASURED: sp_cdc_cleanup_change_table moves start_lsn and the floor together.
             byte[]? p0 = CdcScalarOn(a, txA, "SELECT sys.fn_cdc_get_max_lsn()") as byte[];
+            if (p0 is not null && plan.CaptureInstance is { } resolvedInstance)
+            {
+                using var floorCommand = a.CreateCommand();
+                floorCommand.Transaction = txA;
+                floorCommand.CommandText =
+                    "SELECT start_lsn FROM cdc.change_tables WHERE capture_instance = @inst";
+                floorCommand.Parameters.Add(new SqlParameter("@inst", SqlDbType.VarChar, 128)
+                {
+                    Value = resolvedInstance,
+                });
+                if (floorCommand.ExecuteScalar() is byte[] floor
+                    && !CdcChangesPlan.IsZeroLsn(floor)
+                    && CdcChangesPlan.CompareLsn(floor, p0) > 0)
+                {
+                    Log.LogDebug("cdc changes {Source} ({Instance}): handoff {Watermark} is below the "
+                                 + "instance floor {Floor} - emitting the floor, so the position these rows "
+                                 + "carry is resumable", plan.SourceName, resolvedInstance,
+                                 CdcChangesPlan.Hex(p0), CdcChangesPlan.Hex(floor));
+                    p0 = floor;
+                }
+            }
             if (p0 is null)
             {
                 throw new InvalidOperationException(
