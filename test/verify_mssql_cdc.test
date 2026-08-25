@@ -84,7 +84,7 @@ statement ok
 SELECT fabricator_exec('${MSSQL_TESTDB_DSN}', 'IF OBJECT_ID(''dbo.cdc_zz_noidx'') IS NOT NULL DROP TABLE dbo.cdc_zz_noidx;');
 
 statement ok
-SELECT fabricator_exec('${MSSQL_TESTDB_DSN}', 'IF OBJECT_ID(''dbo.cdc_snap'') IS NOT NULL DROP TABLE dbo.cdc_snap; IF OBJECT_ID(''dbo.cdc_seed'') IS NOT NULL DROP TABLE dbo.cdc_seed; IF OBJECT_ID(''dbo.cdc_void'') IS NOT NULL DROP TABLE dbo.cdc_void;');
+SELECT fabricator_exec('${MSSQL_TESTDB_DSN}', 'IF OBJECT_ID(''dbo.cdc_snap'') IS NOT NULL DROP TABLE dbo.cdc_snap; IF OBJECT_ID(''dbo.cdc_seed'') IS NOT NULL DROP TABLE dbo.cdc_seed; IF OBJECT_ID(''dbo.cdc_void'') IS NOT NULL DROP TABLE dbo.cdc_void; IF OBJECT_ID(''dbo.cdc_img'') IS NOT NULL DROP TABLE dbo.cdc_img; IF OBJECT_ID(''dbo.cdc_when'') IS NOT NULL DROP TABLE dbo.cdc_when;');
 
 statement ok
 SELECT fabricator_exec('${MSSQL_TESTDB_DSN}', 'IF OBJECT_ID(''dbo.cdc_gen'') IS NOT NULL DROP TABLE dbo.cdc_gen; IF OBJECT_ID(''dbo.cdc_own'') IS NOT NULL DROP TABLE dbo.cdc_own; IF OBJECT_ID(''dbo.cdc_auto'') IS NOT NULL DROP TABLE dbo.cdc_auto; IF OBJECT_ID(''dbo.cdc_ddl'') IS NOT NULL DROP TABLE dbo.cdc_ddl; IF OBJECT_ID(''dbo.gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg'') IS NOT NULL DROP TABLE dbo.gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg;');
@@ -752,16 +752,18 @@ SELECT count(*) FROM c1.cdc.changes('dbo.no_such_table');
 ----
 is not a captured table or capture instance
 
-# ⚠ `images` is DECLARED although this release implements only its default, so a caller who writes the mode
-# they read about in the docs gets a sentence rather than DuckDB's "invalid named parameter". The two
-# refusals are deliberately DIFFERENT: 'both' is not built, while 'net' is not a value this reader will ever
-# have (§1.7d — the collapse is lossy, unresumable, and reproducible in one line of DuckDB with a
-# MEASURED-identical outcome).
-statement error
-SELECT count(*) FROM c1.cdc.changes('dbo.cdc_setup', images := 'both');
+# ⚠ `images := 'both'` is IMPLEMENTED since slice 9 (§30), and this assertion moved with it rather than
+# being deleted: it used to pin the "not built yet" refusal, and it now pins the mode being live on a
+# DIFFERENT fixture from §30's — the extra row is the op-3 partner of this table's one update.
+query II
+SELECT (SELECT count(*) FROM c1.cdc.changes('dbo.cdc_setup')) AS after_rows,
+       (SELECT count(*) FROM c1.cdc.changes('dbo.cdc_setup', images := 'both')) AS both_rows;
 ----
-is not implemented yet
+5	6
 
+# ⚠ 'net' is a value this reader will NEVER have (§1.7d — the collapse is lossy, unresumable, and
+# reproducible in one line of DuckDB with a MEASURED-identical outcome), and it is refused as an unknown
+# value rather than named in the message, so nothing advertises a mode we decided against.
 statement error
 SELECT count(*) FROM c1.cdc.changes('dbo.cdc_setup', images := 'net');
 ----
@@ -1765,6 +1767,304 @@ WHERE message LIKE 'query [pinned%' AND message LIKE '%__$operation%';
 statement ok
 SET enable_logging = false;
 
+# ═══ §30  images := 'both' — the BEFORE image, and the mask that makes it readable (slice 9) ════════════
+# docs §1.5/§1.7. The default reads after-images only, which DODGES the MAX-column trap; 'both' is the only
+# way to see what a row held before an update, and it carries the trap with it. ⚠ The fixture is TEN columns
+# on purpose — a mask wider than one byte is where the obvious decoding rule stops being right (§30c).
+
+statement ok
+SELECT fabricator_exec('c1', 'IF OBJECT_ID(''dbo.cdc_img'') IS NOT NULL DROP TABLE dbo.cdc_img; CREATE TABLE dbo.cdc_img(id INT NOT NULL PRIMARY KEY, c2 INT NULL, c3 INT NULL, c4 INT NULL, c5 INT NULL, c6 INT NULL, c7 INT NULL, c8 INT NULL, notes VARCHAR(MAX) NULL, tag VARCHAR(20) NULL);');
+
+statement ok
+SELECT target, changed FROM c1.cdc.enable('dbo.cdc_img', capture_instance := 'img_v1');
+
+statement ok
+SELECT fabricator_exec('c1', 'DECLARE @i int = 0; WHILE @i < 60 AND sys.fn_cdc_get_min_lsn(''img_v1'') IS NULL BEGIN WAITFOR DELAY ''00:00:01''; SET @i = @i + 1; END');
+
+# ⚠ The UPDATE deliberately does NOT touch `notes`, which is the whole point: `notes` is a VARCHAR(MAX), and
+# SQL Server does not record an untouched MAX column in an update's BEFORE image (§1.5).
+statement ok
+SELECT fabricator_exec('c1', 'INSERT INTO dbo.cdc_img (id, c2, c3, c4, c5, c6, c7, c8, notes, tag) VALUES (1, 1, 1, 1, 1, 1, 1, 1, ''first'', ''a''); UPDATE dbo.cdc_img SET c2 = 99 WHERE id = 1; UPDATE dbo.cdc_img SET notes = ''changed'' WHERE id = 1;');
+
+statement ok
+SELECT fabricator_exec('c1', 'DECLARE @i int = 0; WHILE @i < 60 AND ((SELECT COUNT(*) FROM cdc.img_v1_CT) < 5 OR sys.fn_cdc_get_max_lsn() IS NULL OR sys.fn_cdc_get_max_lsn() < (SELECT MAX(__$start_lsn) FROM cdc.img_v1_CT)) BEGIN WAITFOR DELAY ''00:00:01''; SET @i = @i + 1; END');
+
+# ⚠⚠ THE ROW COUNTS ARE THE MODE, and they are asserted side by side so neither can pass alone. `all` gives
+# one row per change and `all update old` adds the op-3 partner of every update — MEASURED 5 vs 7 on the
+# probe rig, 3 vs 5 here (three changes, two of them updates).
+query II
+SELECT (SELECT count(*) FROM c1.cdc.changes('dbo.cdc_img')) AS after_rows,
+       (SELECT count(*) FROM c1.cdc.changes('dbo.cdc_img', images := 'both')) AS both_rows;
+----
+3	5
+
+# The extra rows are exactly the preimages, and they use the Delta change-feed spelling §3.3 chose.
+query II
+SELECT _change_type, count(*) FROM c1.cdc.changes('dbo.cdc_img', images := 'both')
+GROUP BY _change_type ORDER BY _change_type;
+----
+insert	1
+update_postimage	2
+update_preimage	2
+
+# ⚠ THE DEFAULT SHAPE IS UNCHANGED, and this is the assertion that keeps a new metadata column from becoming
+# a breaking change for every existing caller: `_update_mask` must not exist unless it was asked for.
+statement error
+SELECT _update_mask FROM c1.cdc.changes('dbo.cdc_img');
+----
+_update_mask
+
+query I
+SELECT count(*) FROM c1.cdc.changes('dbo.cdc_img', images := 'both') WHERE _update_mask IS NOT NULL;
+----
+5
+
+# ⚠ NEVER NULL IN A CHANGE ROW — MEASURED, and it corrects the plausible story. An insert and a delete have
+# no "columns changed" to report, so declaring the mask nullable looked obviously right; SQL Server reports
+# ALL columns for them instead (0x03FF here — ten bits). The count above is the assertion.
+
+# ═══ §30a  THE MAX-COLUMN TRAP, and the mask is what makes it decidable ════════════════════════════════
+# ⚠⚠ MEASURED, and the measurement points the OPPOSITE way to the obvious guess: it is the BEFORE image that
+# loses the value and the AFTER image that keeps it. The UPDATE above touched only `c2`, and `notes` held
+# 'first' on both sides of it — yet the preimage reads NULL.
+
+query III
+SELECT _change_type, coalesce(notes, '<unrecorded>') AS notes, c2
+FROM c1.cdc.changes('dbo.cdc_img', images := 'both')
+WHERE _operation IN (3, 4) ORDER BY _position;
+----
+update_preimage	<unrecorded>	1
+update_postimage	first	99
+update_preimage	first	99
+update_postimage	changed	99
+
+# ⚠⚠ THE SECOND PAIR IS THE CONTROL, and without it the first row proves nothing — a build that had simply
+# stopped returning `notes` at all would satisfy the NULL just as well. That UPDATE *did* touch `notes`, so
+# its preimage carries the genuine prior value ('first', which the first update left untouched). Same
+# column, same table, same mode; the only difference is whether the statement touched it.
+
+# ⚠⚠ AND THIS IS WHY NO PLACEHOLDER IS SUBSTITUTED. A placeholder is a value, so it would be
+# indistinguishable from a row that genuinely holds it — inventing data to signal missing data. The mask
+# says which columns the update actually recorded, so "NULL and bit clear" (not recorded) and "NULL and bit
+# set" (genuinely NULL) are two different, readable answers.
+query III
+SELECT _change_type,
+       get_bit(_update_mask::BIT, (8 * octet_length(_update_mask) - 9)::INTEGER) AS notes_recorded,
+       get_bit(_update_mask::BIT, (8 * octet_length(_update_mask) - 2)::INTEGER) AS c2_recorded
+FROM c1.cdc.changes('dbo.cdc_img', images := 'both')
+WHERE _operation IN (3, 4) ORDER BY _position;
+----
+update_preimage	0	1
+update_postimage	0	1
+update_preimage	1	0
+update_postimage	1	0
+
+# ⚠ `notes` is column_ordinal 9 and `c2` is 2 — from cdc.captured_columns, never counted by hand.
+query II
+SELECT cc.column_name, cc.column_ordinal FROM c1.cdc.captured_columns cc
+JOIN c1.cdc.change_tables ct ON ct.object_id = cc.object_id
+WHERE ct.capture_instance = 'img_v1' AND cc.column_name IN ('notes', 'c2')
+ORDER BY cc.column_ordinal;
+----
+c2	2
+notes	9
+
+# ═══ §30b  The snapshot leg carries the mask column too — as NULL, which is a fact rather than a filler ══
+# ⚠⚠ THE LOAD-BEARING ASSERTION FOR THE SNAPSHOT LIST'S EXPLICIT CONVERT. A baseline row has no update, so
+# it has no mask; but a BARE `NULL` there describes as `int` where the change read gives `varbinary(128)`,
+# the two legs' declared schemas then DIFFER, and the arrival check refuses EVERY snapshot. Slice 8 measured
+# that trap twice for _change_type and _position; this is the third instance of it.
+# ⚠ NULL rather than an all-bits-set mask, deliberately: all-bits-set would read as "this update changed
+# every column", which is a claim about an event that never happened.
+query III
+SELECT _change_type, _capture_instance IS NULL AS is_baseline, _update_mask IS NULL AS no_mask
+FROM c1.cdc.changes('dbo.cdc_img', include := 'snapshot', images := 'both');
+----
+insert	true	true
+
+# ═══ §30c  ⚠⚠ THE MULTI-BYTE MASK — where the documented per-byte rule stops being right ═══════════════
+# §1.4 records "bit index = column_ordinal - 1, little-endian within each byte", which is true and says
+# NOTHING about byte order. MEASURED on this ten-column table: `c2` (ordinal 2) sets 0x0002 and `notes`
+# (ordinal 9) sets 0x0100 — so ordinals 1-8 live in the LAST byte, not the first. The mask is a big-endian
+# bit string over the WHOLE varbinary, and the natural `floor((ord-1)/8)` byte index is the wrong end.
+query II
+SELECT hex(_update_mask) AS mask, octet_length(_update_mask) AS bytes
+FROM c1.cdc.changes('dbo.cdc_img', images := 'both')
+WHERE _operation = 4 ORDER BY _position;
+----
+0002	2
+0100	2
+
+# ⚠⚠ THE DISCRIMINATOR: the naive per-byte formula and the correct whole-mask one DISAGREE, and the naive
+# one reports the column that WAS touched as untouched. A consumer decoding that way silently mis-reads
+# every table with more than eight captured columns — which is why the recipe is gated rather than only
+# written down.
+query III
+SELECT hex(_update_mask) AS mask,
+       get_bit(_update_mask::BIT, (8 * octet_length(_update_mask) - 9)::INTEGER) AS correct_notes,
+       get_bit(_update_mask::BIT, (8 * ((9 - 1) // 8) + 7 - ((9 - 1) % 8))::INTEGER) AS naive_notes
+FROM c1.cdc.changes('dbo.cdc_img', images := 'both')
+WHERE _operation = 4 ORDER BY _position;
+----
+0002	0	0
+0100	1	0
+
+# ═══ §30d  images refusals — a value that is not a mode, and the one that never will be ════════════════
+statement error
+SELECT count(*) FROM c1.cdc.changes('dbo.cdc_img', images := 'all');
+----
+is not a value
+
+# ⚠ 'net' is refused as an unknown value and is deliberately NOT named in the message (§1.7d): naming it
+# would advertise a mode this reader has decided not to have, and the collapse is one line of DuckDB.
+statement error
+SELECT count(*) FROM c1.cdc.changes('dbo.cdc_img', images := 'net');
+----
+is not a value
+
+# Case-insensitive, like every other option on this surface.
+query I
+SELECT count(*) FROM c1.cdc.changes('dbo.cdc_img', images := 'BOTH');
+----
+5
+
+# ═══ §31  TIMESTAMP BOUNDS — a window named in wall-clock time (slice 9) ═══════════════════════════════
+# docs §1.6: sys.fn_cdc_map_time_to_lsn resolves an instant against cdc.lsn_time_mapping server-side, so the
+# reader offers the bound without inventing anything. ⚠⚠ BOTH ARE INCLUSIVE, and that is deliberately NOT
+# what a _position means: a position is a RESUME TOKEN naming a row already read, so it is exclusive, while a
+# timestamp is an instant the caller has read nothing of. Treating the two alike would silently drop whatever
+# committed exactly at the named instant.
+
+statement ok
+SELECT fabricator_exec('c1', 'IF OBJECT_ID(''dbo.cdc_when'') IS NOT NULL DROP TABLE dbo.cdc_when; CREATE TABLE dbo.cdc_when(id INT NOT NULL PRIMARY KEY, v INT NULL);');
+
+statement ok
+SELECT target, changed FROM c1.cdc.enable('dbo.cdc_when', capture_instance := 'when_v1');
+
+statement ok
+SELECT fabricator_exec('c1', 'DECLARE @i int = 0; WHILE @i < 60 AND sys.fn_cdc_get_min_lsn(''when_v1'') IS NULL BEGIN WAITFOR DELAY ''00:00:01''; SET @i = @i + 1; END');
+
+# ⚠ TWO batches separated by a real delay, and the delay is the fixture rather than padding: the bound is
+# resolved against cdc.lsn_time_mapping, whose tran_end_time is a `datetime` with ~3.33 ms resolution, so two
+# transactions in the same tick are indistinguishable BY DESIGN (§1.6). One second is far outside that.
+statement ok
+SELECT fabricator_exec('c1', 'INSERT INTO dbo.cdc_when (id, v) VALUES (1, 10), (2, 20);');
+
+statement ok
+SELECT fabricator_exec('c1', 'WAITFOR DELAY ''00:00:02''; INSERT INTO dbo.cdc_when (id, v) VALUES (3, 30);');
+
+statement ok
+SELECT fabricator_exec('c1', 'DECLARE @i int = 0; WHILE @i < 60 AND ((SELECT COUNT(*) FROM cdc.when_v1_CT) < 3 OR sys.fn_cdc_get_max_lsn() IS NULL OR sys.fn_cdc_get_max_lsn() < (SELECT MAX(__$start_lsn) FROM cdc.when_v1_CT)) BEGIN WAITFOR DELAY ''00:00:01''; SET @i = @i + 1; END');
+
+# The control: with no bound at all, everything.
+query I
+SELECT count(*) FROM c1.cdc.changes('dbo.cdc_when');
+----
+3
+
+# ⚠ A bound naming an instant NOTHING has been captured at is an EMPTY window, not an error — in both
+# directions. "What committed at or after next century" and "what committed before this server existed" both
+# have the answer "nothing", and raising there would make a legitimate poll something a caller has to
+# special-case. It is NOT the same as a below-the-floor bound, which IS refused (§31b): that one means the
+# rows existed and were purged.
+query II
+SELECT (SELECT count(*) FROM c1.cdc.changes('dbo.cdc_when', starting_timestamp := TIMESTAMP '2099-01-01 00:00:00')) AS since_future,
+       (SELECT count(*) FROM c1.cdc.changes('dbo.cdc_when', ending_timestamp := TIMESTAMP '1990-01-01 00:00:00')) AS until_prehistory;
+----
+0	0
+
+# …and an upper bound comfortably in the future is every row, which is the positive control for the pair
+# above: without it, two zeroes would pass equally on a build where the bound resolved to an empty window
+# ALWAYS.
+#
+# ⚠⚠ `+ INTERVAL 1 DAY`, and NOT a bare `now()`, because a bare `now()` makes this assertion depend on the
+# CLOCK OFFSET BETWEEN THE TWO MACHINES. MEASURED: a DuckDB session on Europe/Berlin reports
+# now()::TIMESTAMP = 12:07:46 while the SQL Server host's SYSDATETIME() is 10:07:46 — two hours apart — and
+# the bound is compared against tran_end_time, which is the SERVER's clock. Here that made the assertion
+# pass for the wrong reason (the session happens to be EAST of the server, so its "now" is in the server's
+# future); a session WEST of the server would have failed it. A day of slack is larger than any offset, so
+# the assertion tests the bound rather than the rig's geography.
+query I
+SELECT count(*) FROM c1.cdc.changes('dbo.cdc_when', ending_timestamp := now()::TIMESTAMP + INTERVAL 1 DAY);
+----
+3
+
+# ═══ §31a  ⚠⚠ THE LOWER BOUND IS INCLUSIVE — asserted by handing a row's own commit time back ═══════════
+# The sharpest available shape, and it is self-referential on purpose: take the commit timestamp of the row
+# the second batch produced and pass it back as starting_timestamp. INCLUSIVE means that row comes back.
+# 'smallest greater than OR EQUAL' is what makes it 1; 'smallest greater than' would make it 0, so this
+# assertion is the operator.
+statement ok
+SET VARIABLE cdc_when_t2 = (SELECT _commit_timestamp FROM c1.cdc.changes('dbo.cdc_when', commit_timestamp := true) WHERE id = 3);
+
+query I
+SELECT count(*) FROM c1.cdc.changes('dbo.cdc_when', starting_timestamp := getvariable('cdc_when_t2'));
+----
+1
+
+query I
+SELECT id FROM c1.cdc.changes('dbo.cdc_when', starting_timestamp := getvariable('cdc_when_t2'));
+----
+3
+
+# …and the first batch's own commit time takes everything, which is the control that keeps the 1 above from
+# passing on a build where any timestamp bound returned the last row.
+statement ok
+SET VARIABLE cdc_when_t1 = (SELECT min(_commit_timestamp) FROM c1.cdc.changes('dbo.cdc_when', commit_timestamp := true));
+
+query I
+SELECT count(*) FROM c1.cdc.changes('dbo.cdc_when', starting_timestamp := getvariable('cdc_when_t1'));
+----
+3
+
+# ⚠ The upper bound is inclusive too, and asserted the same way: bounding AT the first batch's instant keeps
+# its two rows and excludes the third.
+query I
+SELECT count(*) FROM c1.cdc.changes('dbo.cdc_when', ending_timestamp := getvariable('cdc_when_t1'));
+----
+2
+
+# ═══ §31b  Refusals — one bound per side, and a snapshot has no lower bound to name ════════════════════
+# ⚠ Per SIDE, not per call: a cursor lower bound with a wall-clock upper bound is a perfectly good window and
+# is deliberately allowed. Only two bounds on the SAME side are a question rather than a combination.
+statement ok
+SET VARIABLE cdc_when_pos = (SELECT _position FROM c1.cdc.changes('dbo.cdc_when') WHERE id = 1);
+
+query I
+SELECT count(*) FROM c1.cdc.changes('dbo.cdc_when', starting_position := getvariable('cdc_when_pos'), ending_timestamp := now()::TIMESTAMP + INTERVAL 1 DAY);
+----
+2
+
+statement error
+SELECT count(*) FROM c1.cdc.changes('dbo.cdc_when', starting_position := getvariable('cdc_when_pos'), starting_timestamp := getvariable('cdc_when_t1'));
+----
+two lower bounds
+
+statement error
+SELECT count(*) FROM c1.cdc.changes('dbo.cdc_when', ending_position := getvariable('cdc_when_pos'), ending_timestamp := getvariable('cdc_when_t1'));
+----
+two upper bounds
+
+statement error
+SELECT count(*) FROM c1.cdc.changes('dbo.cdc_when', include := 'snapshot+changes', starting_timestamp := getvariable('cdc_when_t1'));
+----
+a snapshot IS the starting point
+
+statement error
+SELECT count(*) FROM c1.cdc.changes('dbo.cdc_when', include := 'snapshot', ending_timestamp := now()::TIMESTAMP + INTERVAL 1 DAY);
+----
+not a window
+
+# ⚠⚠ BELOW THE RETENTION FLOOR IS REFUSED, and the message names BOTH causes because this read cannot tell
+# them apart: fn_cdc_map_time_to_lsn resolves against the DATABASE-wide cdc.lsn_time_mapping while the floor
+# belongs to the INSTANCE, so an old timestamp on a recently captured table maps below the floor with nothing
+# having been lost. Refusing is the safe half of that uncertainty — if changes WERE purged, reading on
+# returns a short answer with nothing failing.
+statement error
+SELECT count(*) FROM c1.cdc.changes('dbo.cdc_when', starting_timestamp := TIMESTAMP '2020-01-01 00:00:00');
+----
+BELOW the retention floor
+
 # ═══ §9  Teardown — leave NO CDC-enabled table behind ══════════════════════════════════════════════════
 # Load-bearing: the capture job keeps scanning a CDC-enabled database between runs, and the next run's §3
 # would then find max_position() non-NULL and fail for a reason unrelated to the code.
@@ -1783,7 +2083,7 @@ statement ok
 SELECT fabricator_exec('c1', 'IF OBJECT_ID(''dbo.cdc_zz_noidx'') IS NOT NULL DROP TABLE dbo.cdc_zz_noidx;');
 
 statement ok
-SELECT fabricator_exec('c1', 'IF OBJECT_ID(''dbo.cdc_span'') IS NOT NULL DROP TABLE dbo.cdc_span; IF OBJECT_ID(''dbo.cdc_conf'') IS NOT NULL DROP TABLE dbo.cdc_conf; IF OBJECT_ID(''dbo.cdc_snap'') IS NOT NULL DROP TABLE dbo.cdc_snap; IF OBJECT_ID(''dbo.cdc_seed'') IS NOT NULL DROP TABLE dbo.cdc_seed; IF OBJECT_ID(''dbo.cdc_void'') IS NOT NULL DROP TABLE dbo.cdc_void;');
+SELECT fabricator_exec('c1', 'IF OBJECT_ID(''dbo.cdc_span'') IS NOT NULL DROP TABLE dbo.cdc_span; IF OBJECT_ID(''dbo.cdc_conf'') IS NOT NULL DROP TABLE dbo.cdc_conf; IF OBJECT_ID(''dbo.cdc_snap'') IS NOT NULL DROP TABLE dbo.cdc_snap; IF OBJECT_ID(''dbo.cdc_seed'') IS NOT NULL DROP TABLE dbo.cdc_seed; IF OBJECT_ID(''dbo.cdc_void'') IS NOT NULL DROP TABLE dbo.cdc_void; IF OBJECT_ID(''dbo.cdc_img'') IS NOT NULL DROP TABLE dbo.cdc_img; IF OBJECT_ID(''dbo.cdc_when'') IS NOT NULL DROP TABLE dbo.cdc_when;');
 
 statement ok
 SELECT fabricator_exec('c1', 'IF OBJECT_ID(''dbo.cdc_gen'') IS NOT NULL DROP TABLE dbo.cdc_gen; IF OBJECT_ID(''dbo.cdc_own'') IS NOT NULL DROP TABLE dbo.cdc_own; IF OBJECT_ID(''dbo.cdc_auto'') IS NOT NULL DROP TABLE dbo.cdc_auto; IF OBJECT_ID(''dbo.cdc_ddl'') IS NOT NULL DROP TABLE dbo.cdc_ddl; IF OBJECT_ID(''dbo.gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg'') IS NOT NULL DROP TABLE dbo.gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg;');

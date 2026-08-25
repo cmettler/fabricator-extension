@@ -91,6 +91,8 @@ internal sealed class CdcChangesFunction : ICatalogTableFunction
         Params.Named("enable", BooleanType.Default),
         Params.Named("on_schema_change", StringType.Default),
         Params.Named("include", StringType.Default),
+        Params.Named("starting_timestamp", new TimestampType(TimeUnit.Microsecond, (string?)null)),
+        Params.Named("ending_timestamp", new TimestampType(TimeUnit.Microsecond, (string?)null)),
     }, metadata: null);
 
     public ITableFunctionBinding Bind(RecordBatch args)
@@ -105,6 +107,8 @@ internal sealed class CdcChangesFunction : ICatalogTableFunction
         bool enable = CdcEnableFunction.Bool(args, 6) ?? false;
         string onSchemaChange = CdcEnableFunction.Str(args, 7) ?? CdcChangesPlan.OnSchemaChangeError;
         string include = CdcEnableFunction.Str(args, 8) ?? CdcChangesPlan.IncludeChanges;
+        DateTime? startingTimestamp = Ts(args, 9);
+        DateTime? endingTimestamp = Ts(args, 10);
 
         if (string.IsNullOrWhiteSpace(source))
         {
@@ -113,15 +117,19 @@ internal sealed class CdcChangesFunction : ICatalogTableFunction
                 + "<schema>.<table> name or a capture-instance name; SELECT * FROM <catalog>.cdc.tables() "
                 + "lists what is captured.");
         }
-        ValidateImages(images);
+        images = NormalizeImages(images);
         ValidateOnSchemaChange(onSchemaChange);
         include = NormalizeInclude(include);
-        ValidateBoundsAgainstInclude(include, startingPosition, endingPosition);
+        ValidateOneBoundPerSide(startingPosition, endingPosition, startingTimestamp, endingTimestamp);
+        ValidateBoundsAgainstInclude(include, startingPosition, endingPosition, startingTimestamp,
+                                     endingTimestamp);
         return new CdcChangesBinding(
             _catalog,
             _catalog.CdcBindChanges(source!, instance, commitTimestamp, enable, onSchemaChange, include,
+                                    images,
                                     CdcChangesPlan.ValidatePosition(startingPosition, "starting_position"),
-                                    CdcChangesPlan.ValidatePosition(endingPosition, "ending_position")));
+                                    CdcChangesPlan.ValidatePosition(endingPosition, "ending_position"),
+                                    startingTimestamp, endingTimestamp));
     }
 
     /// <summary>
@@ -163,11 +171,29 @@ internal sealed class CdcChangesFunction : ICatalogTableFunction
     /// changes half.</para>
     /// </remarks>
     private static void ValidateBoundsAgainstInclude(string include, byte[]? startingPosition,
-                                                     byte[]? endingPosition)
+                                                     byte[]? endingPosition,
+                                                     DateTime? startingTimestamp, DateTime? endingTimestamp)
     {
         if (string.Equals(include, CdcChangesPlan.IncludeChanges, StringComparison.Ordinal))
         {
             return;
+        }
+        if (startingTimestamp is not null)
+        {
+            throw new ArgumentException(
+                $"cdc.changes: include := '{include}' cannot be combined with starting_timestamp - a "
+                + "snapshot IS the starting point, and it is taken at an instant this read chooses (the "
+                + "handoff), not at one the caller names. Read the snapshot without a lower bound and resume "
+                + "from the _position its rows carry, or drop the snapshot and read include := 'changes' "
+                + "from your timestamp.");
+        }
+        if (endingTimestamp is not null
+            && string.Equals(include, CdcChangesPlan.IncludeSnapshot, StringComparison.Ordinal))
+        {
+            throw new ArgumentException(
+                "cdc.changes: include := 'snapshot' cannot be combined with ending_timestamp - a snapshot is "
+                + "the table as of one instant, not a window, so there is no upper bound to apply. Use "
+                + "include := 'snapshot+changes', where ending_timestamp bounds the changes half.");
         }
         if (startingPosition is not null)
         {
@@ -189,26 +215,32 @@ internal sealed class CdcChangesFunction : ICatalogTableFunction
     }
 
     /// <summary>
-    /// Accepts <c>'after'</c> and refuses everything else — distinguishing "not built yet" from "not a mode".
+    /// Accepts <c>'after'</c> and <c>'both'</c> case-insensitively and returns the canonical spelling.
     /// </summary>
     /// <remarks>
-    /// ⚠ There is deliberately NO <c>'net'</c> here and there never will be (§1.7d): the collapse is lossy,
-    /// schedule-dependent, unresumable, and reproducible in one line of DuckDB with a MEASURED-identical
-    /// outcome. Naming it in a refusal would advertise a mode we have decided not to have.
+    /// <para>⚠ There is deliberately NO <c>'net'</c> here and there never will be (§1.7d): the collapse is
+    /// lossy, schedule-dependent, unresumable, and reproducible in one line of DuckDB with a
+    /// MEASURED-identical outcome. Naming it in a refusal would advertise a mode we have decided not to
+    /// have.</para>
+    /// <para>⚠ <c>'both'</c> is the only way to see a row's BEFORE image, and it carries §1.5's MAX-column
+    /// trap with it: an <c>UPDATE</c> that did not touch a <c>varchar(max)</c> / <c>nvarchar(max)</c> /
+    /// <c>varbinary(max)</c> column does not record that column in the BEFORE image, so it reads NULL there
+    /// whatever the row held. That is why the mode also emits <c>_update_mask</c> — the mask bit is what
+    /// separates "not recorded" from "genuinely NULL", and no substituted placeholder could.</para>
     /// </remarks>
-    private static void ValidateImages(string images)
+    private static string NormalizeImages(string images)
     {
-        if (string.Equals(images, CdcChangesPlan.ImagesAfter, StringComparison.OrdinalIgnoreCase))
+        foreach (string known in new[] { CdcChangesPlan.ImagesAfter, CdcChangesPlan.ImagesBoth })
         {
-            return;
+            if (string.Equals(images, known, StringComparison.OrdinalIgnoreCase))
+            {
+                return known;
+            }
         }
         throw new ArgumentException(
-            string.Equals(images, "both", StringComparison.OrdinalIgnoreCase)
-                ? "cdc.changes: images := 'both' is not implemented yet - this release reads after-images "
-                  + "only. It needs the update mask to tell an unrecorded MAX column from a genuine NULL, "
-                  + "which is a later slice."
-                : $"cdc.changes: images := '{images}' is not a value - the only value this release accepts is "
-                  + "'after' (one row per change: insert, update_postimage, delete).");
+            $"cdc.changes: images := '{images}' is not a value - this release accepts 'after' (the default: "
+            + "one row per change - insert, update_postimage, delete) and 'both' (which adds the "
+            + "update_preimage row of every update, plus an _update_mask column).");
     }
 
     /// <summary>
@@ -241,6 +273,73 @@ internal sealed class CdcChangesFunction : ICatalogTableFunction
                   + "(the default) and 'ignore'.");
     }
 
+    /// <summary>
+    /// Refuses two lower bounds, or two upper bounds, in one call.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>⚠ A POSITION AND A TIMESTAMP ARE NOT THE SAME KIND OF BOUND, which is exactly why holding
+    /// both is a question rather than a combination.</b> A <c>_position</c> is a RESUME TOKEN — the caller
+    /// has already seen that row, so it is EXCLUSIVE — while a timestamp is a WALL-CLOCK INSTANT the caller
+    /// has seen nothing of, so it is INCLUSIVE. Silently preferring either one would give a window whose
+    /// edge means something the caller did not ask for, and "the tighter of the two" is not a rule anybody
+    /// could predict.</para>
+    /// <para>⚠ Refused per SIDE, not per call: <c>starting_position</c> with <c>ending_timestamp</c> is a
+    /// perfectly good window (resume from a cursor, stop at an hour) and is deliberately allowed.</para>
+    /// </remarks>
+    private static void ValidateOneBoundPerSide(byte[]? startingPosition, byte[]? endingPosition,
+                                                DateTime? startingTimestamp, DateTime? endingTimestamp)
+    {
+        if (startingPosition is not null && startingTimestamp is not null)
+        {
+            throw new ArgumentException(
+                "cdc.changes: starting_position and starting_timestamp are two lower bounds and only one "
+                + "can govern. They are not interchangeable either: a position is a resume token, so it is "
+                + "EXCLUSIVE (the row it names has been read), while a timestamp is an instant, so it is "
+                + "INCLUSIVE (changes committed at or after it). Pass whichever one you mean.");
+        }
+        if (endingPosition is not null && endingTimestamp is not null)
+        {
+            throw new ArgumentException(
+                "cdc.changes: ending_position and ending_timestamp are two upper bounds and only one can "
+                + "govern. Both are INCLUSIVE; pass whichever one you mean.");
+        }
+    }
+
+    /// <summary>
+    /// A TIMESTAMP argument as a wall-clock <see cref="DateTime"/>.
+    /// </summary>
+    /// <remarks>
+    /// ⚠ NAIVE on both sides, and that is the contract this bound has to state out loud: DuckDB's
+    /// <c>TIMESTAMP</c> carries no zone, and the <c>tran_end_time</c> it is compared against is the SQL
+    /// Server host's LOCAL clock. So the bound means "that instant, on the server" — a caller passing
+    /// <c>now()</c> from a machine in another zone names a different moment than they think.
+    /// </remarks>
+    private static DateTime? Ts(RecordBatch? args, int col)
+    {
+        if (args is null || col >= args.ColumnCount || args.Length == 0)
+        {
+            return null;
+        }
+        // ⚠⚠ BOTH SHAPES, and the second one is not defensive — it is what actually arrives. MEASURED:
+        // ArrowValueReader.ReadScalar hands back a DateTimeOffset for a TIMESTAMP whose Arrow type carries NO
+        // timezone, even though its own comment says a DateTime. C#'s conditional operator unifies its two
+        // branches, and there IS an implicit DateTime -> DateTimeOffset conversion (not the reverse), so
+        // `cond ? ts.UtcDateTime : ts` has the natural type DateTimeOffset and the DateTime branch is
+        // converted straight back. A plain `as DateTime?` therefore yields NULL — and the bound was then
+        // SILENTLY IGNORED rather than refused, which is how this was found: the parameter bound, the query
+        // ran, and every window came back unbounded.
+        return ArrowValueReader.ReadScalar(args.Column(col), 0) switch
+        {
+            // ⚠ `.DateTime`, never `.UtcDateTime`: the caller wrote a NAIVE wall-clock and it is compared
+            // against tran_end_time, which is the server's local clock. They are the same value today
+            // (DuckDB stamps +00:00 on a tz-less TIMESTAMP, MEASURED across three session TimeZones), and
+            // `.DateTime` is the one that stays right if that ever stops being true.
+            DateTimeOffset offset => offset.DateTime,
+            DateTime naive => naive,
+            _ => null,
+        };
+    }
+
     private static byte[]? Blob(RecordBatch? args, int col)
     {
         if (args is null || col >= args.ColumnCount || args.Length == 0)
@@ -259,6 +358,20 @@ internal sealed class CdcChangesPlan
 {
     internal const string ImagesAfter = "after";
 
+    /// <summary>Emit the BEFORE image of every update too, plus the <c>_update_mask</c> that decodes it.</summary>
+    /// <remarks>
+    /// <b>⚠⚠ IT CARRIES §1.5's MAX-COLUMN TRAP, and the mask is the whole answer to it.</b> A
+    /// <c>varchar(max)</c> / <c>nvarchar(max)</c> / <c>varbinary(max)</c> column an <c>UPDATE</c> did not
+    /// touch is NOT STORED in that update's before image — MEASURED, and it is the BEFORE image that loses
+    /// the value while the AFTER image keeps it, which is the opposite of the obvious guess. From the value
+    /// alone "SQL Server did not record it" and "the row held NULL" are indistinguishable. We do NOT
+    /// substitute a placeholder: a placeholder is a value, so it is itself indistinguishable from a row that
+    /// genuinely holds it, and inventing data to signal missing data is the failure this file keeps
+    /// recording. Emitting the mask makes it DECIDABLE instead — the same answer <c>_capture_instance</c>
+    /// gives for a snapshot row, by the same rule.
+    /// </remarks>
+    internal const string ImagesBoth = "both";
+
     /// <summary>Refuse the read when a DDL landed inside the window — the DEFAULT.</summary>
     /// <remarks>
     /// <b>⚠ LOUD BEFORE CLEVER (§15.11), and it is a deliberate trade.</b> The check costs ONE extra round
@@ -276,6 +389,9 @@ internal sealed class CdcChangesPlan
     /// <summary>The TVF's <c>@row_filter_option</c> for <see cref="ImagesAfter"/>. Excludes op 3 for free.</summary>
     internal const string RowFilterAll = "all";
 
+    /// <summary>The TVF's <c>@row_filter_option</c> for <see cref="ImagesBoth"/> — op 3 rows included.</summary>
+    internal const string RowFilterAllUpdateOld = "all update old";
+
     /// <summary>The captured change rows in a window — the default, and everything before slice 8.</summary>
     internal const string IncludeChanges = "changes";
 
@@ -291,8 +407,9 @@ internal sealed class CdcChangesPlan
     internal const int PositionBytes = 21;
 
     internal CdcChangesPlan(string source, string? explicitInstance, bool commitTimestamp,
-                            string onSchemaChange, string include, Schema output,
+                            string onSchemaChange, string include, string images, Schema output,
                             byte[]? startingPosition, byte[]? endingPosition,
+                            DateTime? startingTimestamp = null, DateTime? endingTimestamp = null,
                             string? captureInstance = null, string? sourceSchema = null,
                             string? sourceTable = null, string? sql = null,
                             string? secondInstance = null, string? snapshotSql = null)
@@ -302,6 +419,9 @@ internal sealed class CdcChangesPlan
         CommitTimestamp = commitTimestamp;
         OnSchemaChange = onSchemaChange;
         Include = include;
+        Images = images;
+        StartingTimestamp = startingTimestamp;
+        EndingTimestamp = endingTimestamp;
         CaptureInstance = captureInstance;
         SecondInstance = secondInstance;
         SourceSchema = sourceSchema;
@@ -315,6 +435,31 @@ internal sealed class CdcChangesPlan
 
     /// <summary>Which halves this read delivers — <c>changes</c>, <c>snapshot</c> or both (§5).</summary>
     internal string Include { get; }
+
+    /// <summary>Which images a change row set carries — <c>after</c> (the default) or <c>both</c>.</summary>
+    internal string Images { get; }
+
+    /// <summary>True when this read emits <c>update_preimage</c> rows and the <c>_update_mask</c> column.</summary>
+    internal bool HasUpdateMask => string.Equals(Images, ImagesBoth, StringComparison.Ordinal);
+
+    /// <summary>The TVF's <c>@row_filter_option</c> for this read's <see cref="Images"/>.</summary>
+    internal string RowFilterOption => HasUpdateMask ? RowFilterAllUpdateOld : RowFilterAll;
+
+    /// <summary>
+    /// An INCLUSIVE lower bound in wall-clock time, resolved to an LSN at execute by
+    /// <c>sys.fn_cdc_map_time_to_lsn</c>. Null unless the caller passed one.
+    /// </summary>
+    /// <remarks>
+    /// <b>⚠ INCLUSIVE where <see cref="StartingPosition"/> is EXCLUSIVE, and the asymmetry is the point.</b>
+    /// A position is a resume token — the caller has read the row it names — so the next window must start
+    /// strictly after it. A timestamp is an instant the caller has read nothing of, so "changes at or after
+    /// it" is the only reading that does not silently drop whatever committed exactly then. Treating the two
+    /// alike would be the bug, which is why holding both on one side is refused rather than reconciled.
+    /// </remarks>
+    internal DateTime? StartingTimestamp { get; }
+
+    /// <summary>An INCLUSIVE upper bound in wall-clock time. Null unless the caller passed one.</summary>
+    internal DateTime? EndingTimestamp { get; }
 
     /// <summary>True when this read takes an initial snapshot of the SOURCE table.</summary>
     internal bool HasSnapshot => !string.Equals(Include, IncludeChanges, StringComparison.Ordinal);

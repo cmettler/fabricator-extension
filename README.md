@@ -106,7 +106,8 @@ See [SQL Server external tables on S3](#sql-server-external-tables-on-s3).
 | | `db.cdc.enable_database()` / `enable()` / `disable()` / `capture_now()` — set capture up from SQL, with a generated capture-instance name; the catalog refreshes itself | ✅ |
 | | `db.cdc.changes(...)` — a resumable change-stream reader with a 21-byte cursor, a retention pre-check, `enable := true`, an in-window schema-change check, and a table's two capture instances read as ONE stream across the boundary | ✅ |
 | | `include := 'snapshot'` / `'snapshot+changes'` — the whole table as of one consistent instant, then the changes after it, with no gap between the halves | ✅ |
-| | Before-images (`images := 'both'`), timestamp bounds, `on_schema_change := 'resync'` | ❌ designed, not built (`docs/mssql-cdc.md` §15.12) |
+| | Before-images (`images := 'both'` + `_update_mask`) and wall-clock window bounds | ✅ |
+| | `on_schema_change := 'resync'` | ❌ designed, not built (`docs/mssql-cdc.md` §15.12) |
 | **Monitoring** | `db.dbo.fabricator_session_tag(k, v)` — tag a transaction's connection so Fabric query insights can attribute its cost | ✅ (see dbt caveat) |
 | | `application_name` on the secret → `program_name` on every statement (run-level attribution) | ✅ |
 | | Load-time *global* functions (connection-free); proc multi-result-set / `INOUT` params | ❌ deferred |
@@ -855,7 +856,7 @@ with no message queue anywhere in it. They live in the catalog's `cdc` schema, s
 | `db.cdc.enable('<schema>.<table>' [, capture_instance :=] [, columns :=] [, role :=] [, index :=] [, filegroup :=] [, net :=])` | `sys.sp_cdc_enable_table`. With no `capture_instance` it generates one (`fab_…`) and is idempotent **per table**; with one, per instance |
 | `db.cdc.disable('<schema>.<table>' [, capture_instance :=])` | `sys.sp_cdc_disable_table`; with no instance named, all of that table's |
 | `db.cdc.capture_now()` | `sys.sp_cdc_scan` — force the capture log scan now (see the ⚠ below) |
-| `db.cdc.changes('<schema>.<table>' \| '<capture instance>' [, starting_position :=] [, ending_position :=] [, capture_instance :=] [, images :=] [, commit_timestamp :=] [, enable :=] [, on_schema_change :=] [, include :=])` | the change stream, and optionally an initial snapshot before it — see below |
+| `db.cdc.changes('<schema>.<table>' \| '<capture instance>' [, starting_position :=] [, ending_position :=] [, starting_timestamp :=] [, ending_timestamp :=] [, capture_instance :=] [, images :=] [, commit_timestamp :=] [, enable :=] [, on_schema_change :=] [, include :=])` | the change stream, and optionally an initial snapshot before it — see below |
 | `db.cdc.health()` | 12 `(property, value)` rows, in this order: `supports_cdc`, `database`, `cdc_enabled`, `captured_instances`, `capture_job`, `capture_polling_interval_seconds`, `cleanup_job`, `cleanup_retention_minutes`, `max_lsn`, `max_lsn_time`, `max_lsn_age_seconds`, `agent_status` |
 
 The four setup functions each return one report row — `target`, `changed`, `detail`. **`changed` is separate
@@ -934,8 +935,10 @@ SELECT * FROM db.cdc.health();
 FROM db.cdc.changes('dbo.orders'                    -- a <schema>.<table> or a capture-instance name
       [, starting_position := <BLOB>]               -- EXCLUSIVE lower bound: a 10-byte LSN or a 21-byte _position
       [, ending_position   := <BLOB>]               -- INCLUSIVE upper bound; default db.cdc.max_position()
+      [, starting_timestamp := <TIMESTAMP>]         -- INCLUSIVE lower bound in wall-clock time
+      [, ending_timestamp   := <TIMESTAMP>]         -- INCLUSIVE upper bound
       [, capture_instance  := '<name>']             -- read ONE instance of a table that has two
-      [, images            := 'after']              -- the only value this release accepts
+      [, images            := 'after']              -- 'after' (default) | 'both'
       [, commit_timestamp  := false]                -- opt-in, see below
       [, enable            := false]                -- capture the table on first read
       [, on_schema_change  := 'error']              -- 'error' (default) | 'ignore'
@@ -944,13 +947,14 @@ FROM db.cdc.changes('dbo.orders'                    -- a <schema>.<table> or a c
 
 | column | type | |
 |---|---|---|
-| `_change_type` | `VARCHAR` | `insert` / `update_postimage` / `delete` — the same spellings the Delta change feed uses, so a consumer that handles one handles the other |
+| `_change_type` | `VARCHAR` | `insert` / `update_postimage` / `delete` (plus `update_preimage` under `images := 'both'`) — the same spellings the Delta change feed uses, so a consumer that handles one handles the other |
 | `_position` | `BLOB(21)` | the resume token: `start_lsn ‖ seqval ‖ operation`, whose byte order **is** the change order |
 | `_commit_lsn` | `BLOB(10)` | every row of one transaction shares it |
 | `_seq_val` | `BLOB(10)` | |
-| `_operation` | `INTEGER` | SQL Server's raw code (1 delete, 2 insert, 4 update after-image) |
+| `_operation` | `INTEGER` | SQL Server's raw code (1 delete, 2 insert, 3 update **before**-image, 4 update after-image) |
 | `_capture_instance` | `VARCHAR` | which capture instance produced the row — what makes a `NULL` in a source column decidable when a table has two (see the note below). **`NULL` means a `include := 'snapshot'` baseline row**, read from the source rather than from a capture instance |
 | `_commit_timestamp` | `TIMESTAMP` | only with `commit_timestamp := true` |
+| `_update_mask` | `BLOB` | only with `images := 'both'` — which columns the update actually recorded; `NULL` on a `include := 'snapshot'` baseline row. See the before-image note below |
 | …source columns… | as the source table | a `delete` row carries the **deleted** values |
 
 **The resumable idiom.** Take the window END first, read a closed window, then advance the cursor to that
@@ -995,8 +999,49 @@ UPDATE my_cursors SET cur = getvariable('cdc_end') WHERE tbl = 'dbo.orders';
   `cdc.ddl_history` before returning rows and refuses, naming the statement and its LSN. Read up to the
   change and re-bind, or pass `on_schema_change := 'ignore'` to read anyway (which also saves the check's
   round trip). A window that *starts after* the change is clean again.
-- **An `UPDATE` produces ONE row** (the after-image). SQL Server records two — a before-image and an
-  after-image — and `images := 'both'` will surface the pair; this release reads after-images only.
+- **An `UPDATE` produces ONE row by default** (the after-image); `images := 'both'` surfaces the pair as
+  `update_preimage` + `update_postimage` and adds `_update_mask` — see below.
+- **Wall-clock bounds are INCLUSIVE, and a `_position` is not — that asymmetry is deliberate.** A
+  `_position` is a resume token, so the row it names has already been read and the bound is EXCLUSIVE; a
+  timestamp is an instant you have read nothing of, so `starting_timestamp` means *at or after*, and
+  `ending_timestamp` *at or before*. Passing **both kinds on the same side is refused** rather than
+  reconciled — "the tighter of the two" is not a rule you could predict. Mixing sides is fine
+  (`starting_position := <cursor>, ending_timestamp := <instant>`). Two things to know: the timestamp is
+  **naive on both sides**, so it means that instant *on the SQL Server host's clock*, not yours; and the
+  resolution is `datetime` (~3.33 ms), so two transactions inside one tick are indistinguishable by design.
+
+  ⚠ **The clock gap is real and it is silent.** DuckDB's `now()` is *your* wall clock: a session on
+  `Europe/Berlin` reading a server on UTC produces `now()::TIMESTAMP` two hours **ahead** of anything that
+  server has recorded, so `starting_timestamp := now() - INTERVAL 1 HOUR` names a window in the server's
+  future and quietly returns nothing. Take the instant from the data (a row's `_commit_timestamp`, which is
+  already the server's clock) or read the server's own — `SELECT * FROM fabricator_query('db', 'SELECT
+  SYSDATETIME()')` — rather than from the client.
+  A bound that maps to no captured transaction is an **empty window, not an error**; one that maps *below
+  the retention floor* is **refused**, because the reader cannot tell "those changes were purged" from
+  "this capture instance did not exist yet" and a wrong guess would return a short answer silently.
+- **⚠ `images := 'both'` gives you the before-image — and a trap that comes with it.** SQL Server does
+  **not store** a `varchar(max)` / `nvarchar(max)` / `varbinary(max)` column in an update's before-image
+  unless that update touched it, so such a column reads `NULL` there whatever the row held. We deliberately
+  do **not** substitute a placeholder — a placeholder is a value, so it cannot be told apart from a row that
+  genuinely holds it. Read `_update_mask` instead: bit clear means *not recorded*, bit set means *genuinely
+  NULL*.
+
+  ```sql
+  -- did this row's update actually record <column>?  Ordinals come from cdc.captured_columns.
+  SELECT _change_type, notes,
+         get_bit(_update_mask::BIT, (8 * octet_length(_update_mask) - 9)::INTEGER) AS notes_recorded
+  FROM db.cdc.changes('dbo.orders', images := 'both');
+
+  SELECT cc.column_name, cc.column_ordinal
+  FROM db.cdc.captured_columns cc
+  JOIN db.cdc.change_tables ct ON ct.object_id = cc.object_id
+  WHERE ct.capture_instance = '<instance>' ORDER BY cc.column_ordinal;
+  ```
+
+  ⚠ **Count the bit from the RIGHT END of the whole mask, as that expression does.** The mask is a
+  big-endian bit string over the entire `varbinary`, so on a table with more than eight captured columns the
+  intuitive "byte `(ordinal-1)/8`" picks the wrong end and silently reports the wrong column. ⚠ A mask is
+  only decodable against the instance that produced it, which is what `_capture_instance` is for.
 - **`commit_timestamp` is opt-in because it costs a join.** It is the only column that needs
   `cdc.lsn_time_mapping`, DuckDB will not eliminate that join when nothing selects from it, and the value is
   a `datetime` (~3.33 ms) — metadata, never an ordering key. `_position` is the ordering key.
@@ -1088,8 +1133,8 @@ this handoff give unconditionally. Stop the capture job (`sys.sp_cdc_stop_job`) 
 > the reader; if you do take the baseline alone, fall back to `db.cdc.max_position()` taken **before** the
 > read, which is at worst a small replay and never a skip.
 
-- **Not built yet** (`docs/mssql-cdc.md` §15.12): `images := 'both'`, timestamp bounds, and
-  `on_schema_change := 'resync'` (a new capture instance plus a fresh snapshot on schema drift).
+- **Not built yet** (`docs/mssql-cdc.md` §15.12): `on_schema_change := 'resync'` (a new capture instance
+  plus a fresh snapshot on schema drift).
 
 ### `db.dbo.fabricator_session_tag(key, value) -> TABLE` (SQL Server / Fabric)
 

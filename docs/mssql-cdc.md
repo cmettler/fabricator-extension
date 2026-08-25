@@ -7,9 +7,9 @@
 > two more — §3.4's cursor idiom does not run as printed, and §15.7's "the first call always returns zero
 > rows" is false in an already-capturing database.
 >
-> **What remains** is the two-instance boundary (with the name-alignment and widening §18.1 deferred into
-> it), the snapshot leg, `images := 'both'` and the timestamp bounds. ⚠ §18.1 records why slice 5 was
-> re-scoped and slice 6 partly absorbed — read it before trusting §15.12's ordering.
+> **What remains is `on_schema_change := 'resync'` (slice 8b) alone.** The two-instance boundary is §19,
+> the snapshot leg §20, and `images := 'both'` plus the timestamp bounds §21. ⚠ §18.1 records why slice 5
+> was re-scoped and slice 6 partly absorbed — read it before trusting §15.12's ordering.
 >
 > ⚠ The original header read *"DESIGN ONLY, 2026-08-23. No code, no ABI, no gate."* — true when written,
 > and superseded by slice 2's ABI v81.
@@ -2086,7 +2086,7 @@ The user's question. What the reader can do about it, now that §15.6 has the ma
 | **7** | ✅ **BUILT 2026-08-25 — §19.** The two-instance boundary: derive the split, partition the window, `UNION ALL` by name. It also retires BOTH items deferred from slice 5 — the name-alignment is BUILT, and `WidenArrowType` is **DISSOLVED** (§19.2: the union is in T-SQL, and the helper's stated rule was measurably wrong AND has no reachable case) | needed 3 and 5 |
 | **8** | ✅ **BUILT 2026-08-25 — §20.** `include := 'snapshot'` / `'snapshot+changes'`: §5's two-connection protocol, the handoff position on every baseline row, and the refusals a snapshot needs. ⚠ **`on_schema_change := 'resync'` is NOT in it** — see the note below | the resync story needs the snapshot leg first |
 | **8b** | `on_schema_change := 'resync'` — a new capture instance plus a fresh snapshot leg on drift | now unblocked. ⚠ §15.11's constraint governs it: at most TWO instances, so re-enabling is not repeatable and the second drift must DISABLE the oldest, destroying its unread history. That must be opt-in, which makes it a decision rather than a mode |
-| **9** | `starting_timestamp` / `ending_timestamp`; `images := 'both'` + the mask placeholder | additive to the same reader |
+| **9** | ✅ **BUILT 2026-08-25 — §21.** `starting_timestamp` / `ending_timestamp` (both INCLUSIVE, unlike a position) and `images := 'both'` + `_update_mask`. ⚠ There is deliberately NO mask PLACEHOLDER — §21.3: a placeholder is a value, so it cannot be distinguished from a row that genuinely holds it; the mask makes the trap decidable instead | additive to the same reader |
 | — | ~~`on_schema_change := 'fill'`~~ | last, if ever — §15.9 records why |
 
 ⚠ **Slice 8 shipped the snapshot leg WITHOUT `resync`, and the split is deliberate rather than a shortfall.**
@@ -2136,7 +2136,9 @@ FROM db.cdc.changes('dbo.orders'
       [, starting_position := <BLOB>]     -- EXCLUSIVE lower bound: a 10-byte LSN or a 21-byte _position
       [, ending_position   := <BLOB>]     -- INCLUSIVE upper bound; default cdc.max_position()
       [, capture_instance  := '<name>']   -- required when a table has two (§2.2)
-      [, images            := 'after']    -- the only value this release accepts
+      [, starting_timestamp := <TIMESTAMP>] -- INCLUSIVE, unlike a position; §21.1
+      [, ending_timestamp   := <TIMESTAMP>] -- INCLUSIVE; one bound per side, never two
+      [, images            := 'after']    -- or 'both' (§21.3), which adds _update_mask
       [, commit_timestamp  := false])     -- opt-in; see §11 item 2
 ```
 
@@ -2300,16 +2302,16 @@ document that the pre-check is the feature rather than a nicety.
 
 ### 16.5 Choices worth knowing before extending it
 
-- **`images` is DECLARED although only its default is implemented.** A caller who writes the mode they read
-  about gets a sentence rather than DuckDB's "invalid named parameter", and the two refusals are
-  deliberately different: `'both'` is *not built yet*, `'net'` is *not a value this reader will ever have*
-  (§1.7d). It also pins the vocabulary now rather than inventing it later.
+- ~~**`images` is DECLARED although only its default is implemented.**~~ **SUPERSEDED by §21.3** — `'both'`
+  is built. What survives is why the vocabulary was pinned before the mode existed: `'net'` is refused as an
+  unknown value and deliberately never NAMED, because naming it would advertise a mode this reader has
+  decided not to have (§1.7d).
 - **No `max_rows`, though §3.2 lists it.** A truncated read breaks the cursor idiom — the caller would have
   to advance to `max(_position)` rather than to the window end, which is exactly the trap §3.4 exists to
   warn about. It belongs with a story about resuming a PARTIAL window, not with the smallest correct reader.
-- **`_update_mask` is not emitted.** In `'after'` mode the after-image is the truth, so the mask is not
-  needed for correctness; it arrives with `images := 'both'`, where it is the only way to read a NULL
-  correctly.
+- **`_update_mask` is emitted ONLY under `images := 'both'`** (§21.3). In `'after'` mode the after-image is
+  the truth, so the mask is not needed for correctness; under `'both'` it is the only way to read a NULL
+  correctly, and §21.4 has the decoding recipe plus the multi-byte trap that makes the obvious one wrong.
 - **The DESCRIBE opens its OWN short-lived connection** (`DescribeQuery`'s documented behaviour), so a
   capture instance enabled inside an UNCOMMITTED transaction cannot be described. The error says so — and
   the shape is harmless, because a change captured by that same transaction would not be readable either:
@@ -3153,5 +3155,218 @@ nothing), plus an assertion that no pinned line carries the change read's `__$op
   than none.
 - **The two-connection protocol as such.** No row can show that a table lock was taken, released, and that a
   view was pinned inside the window. §20.1's measurements are the evidence; the suite pins the ANSWERS.
+
+## 21. Slice 9 AS BUILT — timestamp bounds and `images := 'both'` (2026-08-25)
+
+`cdc.changes` gained four things: `starting_timestamp` / `ending_timestamp`, the `'both'` image mode, the
+`_update_mask` column that makes `'both'` readable, and — found on the way — the diagnosis of a
+**pre-existing shipped defect in shared code** (§21.5). C#-only, **no ABI change**. Gate:
+`verify_mssql_cdc` 476 → **559**, five mutants, each killed at its own assertion.
+
+```sql
+-- a window named in wall-clock time; BOTH bounds are INCLUSIVE
+FROM db.cdc.changes('dbo.orders', starting_timestamp := TIMESTAMP '2026-08-25 09:00:00',
+                                  ending_timestamp   := TIMESTAMP '2026-08-25 10:00:00')
+
+-- the before image of every update, plus the mask that says which columns it recorded
+FROM db.cdc.changes('dbo.orders', images := 'both')
+```
+
+### 21.1 ⚠⚠ The timestamp bounds are INCLUSIVE and a `_position` is not — the asymmetry is the design
+
+| bound | meaning | operator |
+|---|---|---|
+| `starting_position` | a RESUME TOKEN: the caller has read the row it names | EXCLUSIVE |
+| `starting_timestamp` | an INSTANT the caller has read nothing of | **INCLUSIVE** (`smallest greater than or equal`) |
+| `ending_position` | the last row to deliver | INCLUSIVE |
+| `ending_timestamp` | the last instant to deliver | **INCLUSIVE** (`largest less than or equal`) |
+
+Treating a timestamp like a position would silently DROP whatever committed exactly at the named instant.
+That is why the two are **refused together on the same side** rather than reconciled: "the tighter of the
+two" is not a rule anybody could predict, and preferring either silently gives a window whose edge means
+something the caller did not ask for. ⚠ Per SIDE, not per call — `starting_position` with
+`ending_timestamp` is a perfectly good window (resume from a cursor, stop at an hour) and is allowed.
+
+The gate asserts the operator directly, in the sharpest shape available: take a row's own
+`_commit_timestamp` and hand it back as `starting_timestamp`. Inclusive returns that row; `smallest greater
+than` would return nothing, so the assertion IS the operator (mutant C dies exactly there).
+
+**Resolved at EXECUTE, not at bind**, riding the batch that resolves the window anyway — so it is free. The
+bound is a wall-clock instant and `cdc.lsn_time_mapping` only grows, so a bound naming an instant the
+capture job has not reached yet resolves to NULL at bind and to a real LSN moments later.
+
+**⚠ A timestamp lower bound leaves the CURSOR null on purpose**, so no cursor predicate is emitted and the
+TVF's own inclusive `from_lsn` governs. Synthesising a 21-byte position from the mapped LSN would push the
+bound through the *exclusive* three-clause predicate instead — the one thing an inclusive bound promises not
+to do.
+
+**⚠ Naive on both sides, and it has to be said out loud.** DuckDB's `TIMESTAMP` carries no zone and
+`tran_end_time` is the SQL Server host's LOCAL clock, so the bound means *that instant, on the server*. A
+caller passing `now()` from a machine in another zone names a different moment than they think.
+`CONVERT(datetime, @p)` is explicit rather than left implicit, because `cdc.lsn_time_mapping` stores
+`datetime`: the comparison happens at ~3.33 ms resolution whatever we do (MEASURED: `11:22:33.1234567`
+narrows to `11:22:33.123`), and doing the narrowing ourselves makes that a documented property of the bound
+rather than a conversion nobody chose.
+
+**⚠⚠ AND THE CLOCK GAP BIT THE FIRST EXAMPLE WRITTEN FOR THE README, which is the best argument that the
+warning belongs there.** MEASURED, one statement: a DuckDB session on `Europe/Berlin` reports
+`now()::TIMESTAMP` = `12:07:46` while the same instant's `SYSDATETIME()` on the SQL Server host is
+`10:07:46`. So `starting_timestamp := now() - INTERVAL 1 HOUR` names a window **two hours in the server's
+future** and returns **zero rows, silently** — the failure mode this whole surface is built to avoid,
+produced by the most natural thing a caller could write. The remedy is to take the instant from the DATA (a
+row's `_commit_timestamp` is already the server's clock) or from the server (`SELECT SYSDATETIME()`), never
+from the client.
+
+⚠ **It also made a gate assertion pass for the wrong reason**, which is why two of them changed: `ending_
+timestamp := now()::TIMESTAMP` returning every row depended on the session being EAST of the server. A
+session west of it would have failed the same assertion. They use `now() + INTERVAL 1 DAY` now — slack
+larger than any offset — so the assertion tests the bound rather than the rig's geography.
+
+### 21.2 ⚠ A timestamp that maps to nothing is an EMPTY WINDOW; below the floor is a REFUSAL
+
+MEASURED, all four cases:
+
+| call | result |
+|---|---|
+| `smallest greater than or equal`, a FUTURE instant | **NULL** ⇒ empty window |
+| `largest less than or equal`, an instant before everything | **NULL** ⇒ empty window |
+| `smallest greater than or equal`, an instant before everything | the SMALLEST mapped LSN |
+| `largest less than or equal`, now | exactly `fn_cdc_get_max_lsn()` |
+
+"What committed at or after next century" and "what committed before this server existed" both have the
+answer *nothing*, and raising there would make a legitimate poll something a caller has to special-case.
+That last row is also why the upper bound needs **no watermark check**: the LSN comes out of
+`cdc.lsn_time_mapping`, which the capture job writes as it scans, so it cannot exceed the watermark that
+same job publishes.
+
+**⚠⚠ BUT A BOUND BELOW THE RETENTION FLOOR IS REFUSED, AND THE MESSAGE NAMES BOTH CAUSES — because this
+read cannot tell them apart.** `fn_cdc_map_time_to_lsn` resolves against `cdc.lsn_time_mapping`, which is
+**DATABASE-wide**, while the floor belongs to the **INSTANCE**. MEASURED: an instance enabled minutes
+earlier, `starting_timestamp := 2020-01-01`, mapping floor `0x2C…` against an instance floor `0x30…` — so
+an old timestamp on a recently captured table maps below the floor **with nothing having been lost at all**.
+An earlier wording asserted *"removed by the cleanup job"*, which is true of one cause and a fabrication
+about the other.
+
+It still refuses rather than clamping, and that is the safe half of an honest uncertainty: if changes really
+were purged, reading on returns a SHORT answer with nothing failing — the exact failure the retention
+pre-check exists for. ⚠ **Discriminating properly is cheap and deliberately NOT taken**: nothing was purged
+iff `min_lsn <= start_lsn`, which is one more column in a batch that already runs. Left undone so that a
+false alarm stays a false alarm and never becomes a silent short read; it is the obvious follow-on.
+
+### 21.3 `images := 'both'` — and why no placeholder is substituted
+
+`all update old` instead of `all`, so op 3 rows appear as `update_preimage`. MEASURED on the probe rig:
+5 rows vs 7; in the gate, 3 vs 5.
+
+**⚠⚠ IT CARRIES §1.5's MAX-COLUMN TRAP, and the mask is the whole answer to it.** Reproduced end to end: a
+`varchar(max)` column an `UPDATE` did not touch reads **NULL in the before image** and carries its value in
+the after image. From the value alone, "SQL Server did not record it" and "the row held NULL" are
+indistinguishable.
+
+The industry answer is a distinguishable placeholder. **We do not do that**, and the reason is the rule this
+tree keeps re-deriving: *a placeholder is a value*, so it is itself indistinguishable from a row that
+genuinely holds it, and inventing data to signal missing data is the failure mode. `_update_mask` makes it
+**DECIDABLE** instead — the same answer `_capture_instance IS NULL` gives for a baseline row, by the same
+rule. Gated with its control beside it: a second update that DID touch the column, whose preimage carries
+the genuine prior value.
+
+**⚠ `_update_mask` is NEVER NULL in a change row — MEASURED, and it corrects the plausible story.** An
+insert and a delete have no "columns changed" to report, so declaring it nullable looked obviously right;
+SQL Server reports **ALL** of them instead (`0x0F` on a four-column table, `0x03FF` on a ten-column one). It
+is therefore declared exactly like its three neighbours — a per-CHANGE fact that only a SNAPSHOT row lacks.
+
+**⚠ The column is CONDITIONAL on the mode, not unconditional**, which departs from the one-way-door rule
+`_capture_instance` was shipped early under. The precedent is next door: `_commit_timestamp` is already an
+opt-in that adds a column, so a mode-dependent shape is what this reader already does. A caller in the
+default mode sees an unchanged shape — gated by asserting that `_update_mask` does not resolve there at all.
+
+**⚠ The snapshot leg's mask literal needs an explicit `CONVERT(varbinary(128), NULL)`** — the third instance
+of the trap slice 8 measured twice. A bare `NULL` describes as `int`, the two legs' declared schemas then
+differ, and the arrival check refuses EVERY snapshot (mutant B dies exactly there). NULL rather than
+all-bits-set, because all-bits-set would read as *"this update changed every column"* — a claim about an
+event that never happened.
+
+### 21.4 ⚠⚠ THE MULTI-BYTE MASK — where §1.4's documented rule stops being right
+
+§1.4 records *"bit index = `column_ordinal − 1`, little-endian within each byte"*. That is true, and it says
+**nothing about byte order**. MEASURED on a ten-column table:
+
+| touched column | ordinal | mask |
+|---|---|---|
+| `c2` | 2 | `0x0002` |
+| `notes` | 9 | `0x0100` |
+| (insert — all ten) | — | `0x03FF` |
+
+So **ordinals 1–8 live in the LAST byte, not the first**: the mask is a big-endian bit string over the WHOLE
+`varbinary`, and the natural `floor((ord-1)/8)` byte index picks the wrong end. A consumer decoding that way
+silently mis-reads every table with more than eight captured columns.
+
+The recipe, MEASURED in DuckDB and gated — including its disagreement with the naive form, which reports the
+touched column as untouched:
+
+```sql
+get_bit(_update_mask::BIT, (8 * octet_length(_update_mask) - <column_ordinal>)::INTEGER)
+```
+
+⚠ The `::INTEGER` is required — `octet_length` returns BIGINT and `get_bit(BIT, BIGINT)` is a binder error.
+⚠ `<column_ordinal>` comes from `cdc.captured_columns`, joined to `cdc.change_tables` on `object_id` and
+filtered by `capture_instance`; never counted by hand, and never assumed equal across two instances (which
+is also why `_capture_instance` ships beside the mask — a mask is only decodable against the instance that
+produced it).
+
+**⚠ `sys.fn_cdc_is_bit_set` and `sys.fn_cdc_get_column_ordinal` WORK, closing an UNVERIFIED item in §11.**
+Measured: `fn_cdc_get_column_ordinal('mx_v1','notes')` = 3, an unknown name gives NULL, and
+`fn_cdc_is_bit_set(ordinal, mask)` agrees with the DuckDB recipe row for row. ⚠ The *"Update mask evaluation
+will be disabled in net_changes_function because the CLR configuration option is disabled"* warning that
+`sp_cdc_enable_table` prints does **NOT** affect them — it is about the NET changes function, which this
+reader does not wrap.
+
+### 21.5 ⚠⚠ THE SHIPPED DEFECT THIS FOUND, in shared code and older than this slice: `ReadTimestamp` has never returned a `DateTime`
+
+`ArrowValueReader.ReadTimestamp` reads, with a comment saying exactly what it intends:
+
+```csharp
+// No timezone => a wall-clock value (SQL datetime2): hand back a DateTime.
+// With timezone (SQL datetimeoffset): hand back the DateTimeOffset.
+return string.IsNullOrEmpty(type.Timezone) ? ts.UtcDateTime : ts;
+```
+
+**It returns a `DateTimeOffset` in both cases.** C#'s conditional operator unifies its two branches, and
+there is an implicit `DateTime` → `DateTimeOffset` conversion (not the reverse), so the expression's natural
+type is `DateTimeOffset` and the `DateTime` branch is converted straight back. The comment describes an
+intent the language quietly undid.
+
+**⚠ How it surfaced is the part worth carrying: it FAILED SILENTLY.** `starting_timestamp := TIMESTAMP
+'2099-01-01'` bound cleanly, ran, and returned **every row** — the bound was simply ignored, because
+`as DateTime?` on a boxed `DateTimeOffset` is null and an absent bound is a legitimate state. A test that
+only asked *"does it bind"* would have passed. Instrumenting the seam is what found it: the probe printed
+`tzNull=True isNullOrEmpty=True kind=DateTimeOffset`, i.e. the branch condition was TRUE and the wrong type
+came out anyway, which is what ruled out every hypothesis about the Arrow type.
+
+The reader now accepts both shapes and takes `.DateTime` (the wall clock the caller wrote), never
+`.UtcDateTime`. MEASURED across three session `TimeZone` settings: DuckDB stamps `+00:00` on a tz-less
+`TIMESTAMP` and the wall clock is unchanged, so the two agree today — `.DateTime` is the one that stays
+right if that ever stops being true.
+
+**⚠ The shared bug itself is NOT fixed in this slice, deliberately.** `ReadScalar` feeds filter-value
+pushdown for every provider, so changing what a timestamp filter marshals as is its own change with its own
+gate — mixing it into a feature commit would drown it. Mutant D is the reader's half: restoring
+`as DateTime?` kills §31 at the empty-window pair.
+
+### 21.6 What the gate does NOT cover, said rather than implied
+
+- **The metadata block's index arithmetic.** Two optional columns now (`_commit_timestamp`, then
+  `_update_mask`), and the old shortcut "the last one is the timestamp" silently declares the MASK's
+  nullability for the TIMESTAMP when both are on. It is indexed from the front instead — but DuckDB DROPS a
+  table function's declared nullability (§16.4 item 2), so **no SQL assertion can see any of it**.
+- **`fn_cdc_map_time_to_lsn` against a mapping table the cleanup job trims mid-read.** The same race the
+  retention pre-check narrows rather than closes.
+- **The 3.33 ms boundary.** Two transactions inside one `datetime` tick are indistinguishable BY DESIGN, so
+  a bound landing between them is not a case a suite can construct — the fixture deliberately puts two
+  seconds between its batches instead.
+- **`varbinary(max)` and `nvarchar(max)` in the trap.** Only `varchar(max)` is exercised; the mechanism is
+  the one SQL Server documents for all three.
+- **The multi-byte layout is SQL Server's, not ours**, so §30c is documentation-as-assertion: no mutant of
+  our code can kill it. Its value is catching a future server change, or a reader that reorders the bytes.
 
 ---

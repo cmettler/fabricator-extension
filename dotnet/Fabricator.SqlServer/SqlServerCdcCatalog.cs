@@ -599,8 +599,8 @@ public sealed partial class SqlServerCatalog
     /// silently.</para>
     /// </remarks>
     private static string CdcMetadataSelectList(string op, string lsn, string seq, string? commitTime,
-                                               string instParam = "@inst_name", string? changeType = null,
-                                               string? position = null)
+                                               string? updateMask, string instParam = "@inst_name",
+                                               string? changeType = null, string? position = null)
     {
         var sb = new System.Text.StringBuilder();
         if (changeType is not null)
@@ -633,24 +633,51 @@ public sealed partial class SqlServerCatalog
         {
             sb.Append(", ").Append(commitTime).Append(" AS [_commit_timestamp]");
         }
+        if (updateMask is not null)
+        {
+            sb.Append(", ").Append(updateMask).Append(" AS [_update_mask]");
+        }
         return sb.ToString();
     }
 
     /// <summary>The number of metadata columns a read emits before the captured source columns.</summary>
-    private static int CdcMetadataColumnCount(bool commitTimestamp) => commitTimestamp ? 7 : 6;
+    /// <remarks>
+    /// ⚠ Two OPTIONAL columns now, and they are appended in a fixed order — <c>_commit_timestamp</c> then
+    /// <c>_update_mask</c> — so an index into the block is a function of which options are on rather than of
+    /// the order the caller wrote them. <see cref="CdcMetadataNullable"/> is the one place that has to know.
+    /// </remarks>
+    private static int CdcMetadataColumnCount(bool commitTimestamp, bool updateMask) =>
+        6 + (commitTimestamp ? 1 : 0) + (updateMask ? 1 : 0);
 
     /// <summary>The metadata list over a capture instance's TVF, aliased <c>c</c> (and <c>m</c> for the join).</summary>
-    private static string CdcRealMetadataSelectList(bool commitTimestamp, string instParam = "@inst_name") =>
+    private static string CdcRealMetadataSelectList(bool commitTimestamp, bool updateMask,
+                                                    string instParam = "@inst_name") =>
         CdcMetadataSelectList("c.[__$operation]", "c.[__$start_lsn]", "c.[__$seqval]",
-                              commitTimestamp ? "m.[tran_end_time]" : null, instParam);
+                              commitTimestamp ? "m.[tran_end_time]" : null,
+                              updateMask ? "c.[__$update_mask]" : null, instParam);
 
     /// <summary>
     /// The metadata list over NOTHING — literals of the same types — for describing a not-yet-captured
     /// table's output schema (§15.7).
     /// </summary>
-    private static string CdcSyntheticMetadataSelectList(bool commitTimestamp) =>
+    private static string CdcSyntheticMetadataSelectList(bool commitTimestamp, bool updateMask) =>
         CdcMetadataSelectList("CONVERT(int, 0)", "CONVERT(binary(10), 0)", "CONVERT(binary(10), 0)",
-                              commitTimestamp ? "CONVERT(datetime, NULL)" : null);
+                              commitTimestamp ? "CONVERT(datetime, NULL)" : null,
+                              updateMask ? UpdateMaskNullLiteral : null);
+
+    /// <summary>
+    /// The <c>_update_mask</c> placeholder for a row that has no update mask: a snapshot row, and the
+    /// literals a not-yet-captured table is described from.
+    /// </summary>
+    /// <remarks>
+    /// <b>⚠ THE WIDTH IS LOAD-BEARING and it is the same trap slice 8 measured twice.</b> The change table's
+    /// column is <c>varbinary(128)</c>; a bare <c>NULL</c> here would describe as <c>int</c> and a
+    /// differently-sized <c>varbinary</c> would describe as itself, and either makes the DECLARED schema
+    /// differ from the change read's — at which point the arrival check refuses every row of the leg. It is
+    /// restated as an explicit CONVERT for exactly that reason, verified column by column through
+    /// <c>sp_describe_first_result_set</c> rather than assumed from the documentation.
+    /// </remarks>
+    private const string UpdateMaskNullLiteral = "CONVERT(varbinary(128), NULL)";
 
     /// <summary>
     /// The metadata list of a SNAPSHOT row: literals, over the SOURCE table rather than a change table.
@@ -698,19 +725,37 @@ public sealed partial class SqlServerCatalog
     /// DuckDB DROPS a table function's declared nullability (§16.4 item 2), which makes it invisible rather
     /// than harmless — exactly the kind of claim this file exists to keep honest.</para>
     /// </remarks>
-    private static bool CdcMetadataNullable(int index, int meta, bool commitTimestamp, bool hasSnapshot)
+    private static bool CdcMetadataNullable(int index, int meta, bool commitTimestamp, bool updateMask,
+                                            bool hasSnapshot)
     {
-        if (commitTimestamp && index == meta - 1)
+        // ⚠ Indexed from the FRONT, never from `meta - 1`. The block used to have one optional trailing
+        // column, so "the last one is the timestamp" held; with two, that shortcut silently declares the
+        // MASK's nullability for the TIMESTAMP whenever both are on.
+        if (commitTimestamp && index == 6)
         {
             return true;
         }
-        // 2 = _commit_lsn, 3 = _seq_val, 5 = _capture_instance.
-        return hasSnapshot && (index == 2 || index == 3 || index == 5);
+        // ⚠⚠ NOT NULL IN A CHANGE ROW, and this is MEASURED rather than reasoned — my first version of this
+        // line declared it nullable always, on the plausible story that an insert and a delete have no
+        // "columns changed" to report. SQL Server's answer is the opposite: it reports ALL of them. Measured
+        // on a four-column table, `all update old`, one row per operation: insert 0x0F, delete 0x0F, and the
+        // two update images carrying exactly the touched column's bit (0x02 = ordinal 2, 0x04 = ordinal 3).
+        // Never NULL. So the mask behaves like its three neighbours below — a per-CHANGE fact that only a
+        // SNAPSHOT row lacks — and it is declared the same way.
+        // 2 = _commit_lsn, 3 = _seq_val, 5 = _capture_instance, then the mask when both options are on.
+        return hasSnapshot
+               && (index == 2 || index == 3 || index == 5
+                   || (updateMask && index == 6 + (commitTimestamp ? 1 : 0)));
     }
 
-    private static string CdcSnapshotMetadataSelectList(bool commitTimestamp) =>
+    private static string CdcSnapshotMetadataSelectList(bool commitTimestamp, bool updateMask) =>
         CdcMetadataSelectList("CONVERT(int, 2)", "CONVERT(binary(10), NULL)", "CONVERT(binary(10), NULL)",
                               commitTimestamp ? "CONVERT(datetime, NULL)" : null,
+                              // ⚠ NULL rather than an all-bits-set mask, and the two are NOT interchangeable:
+                              // a mask says WHICH COLUMNS AN UPDATE TOUCHED, and a baseline row is not an
+                              // update. All-bits-set would read as "this update changed every column", which
+                              // is a claim about an event that never happened.
+                              updateMask ? UpdateMaskNullLiteral : null,
                               instParam: "NULL",
                               changeType: "CONVERT(varchar(16), 'insert')",
                               position: "CONVERT(binary(21), @handoff)");
@@ -728,10 +773,10 @@ public sealed partial class SqlServerCatalog
     /// one column wider than the changes half.</para>
     /// </remarks>
     private static string CdcSnapshotSql(string schema, string table, IReadOnlyList<string> columns,
-                                         bool commitTimestamp)
+                                         bool commitTimestamp, bool updateMask)
     {
         var sb = new System.Text.StringBuilder("SELECT ");
-        sb.Append(CdcSnapshotMetadataSelectList(commitTimestamp));
+        sb.Append(CdcSnapshotMetadataSelectList(commitTimestamp, updateMask));
         foreach (string column in columns)
         {
             sb.Append(", s.").Append(Quote(column));
@@ -805,8 +850,10 @@ public sealed partial class SqlServerCatalog
     /// rather than reading <c>sys.columns</c> is what keeps the declaration equal to what arrives.</para>
     /// </remarks>
     internal CdcChangesPlan CdcBindChanges(string source, string? captureInstance, bool commitTimestamp,
-                                           bool enable, string onSchemaChange, string include,
-                                           byte[]? startingPosition, byte[]? endingPosition)
+                                           bool enable, string onSchemaChange, string include, string images,
+                                           byte[]? startingPosition, byte[]? endingPosition,
+                                           DateTime? startingTimestamp = null,
+                                           DateTime? endingTimestamp = null)
     {
         const string sql =
             "SET NOCOUNT ON; " +
@@ -838,8 +885,9 @@ public sealed partial class SqlServerCatalog
         {
             // enable := true over a table nobody has captured. Declare from the SOURCE and defer the DDL to
             // execute (§15.7) — bind must stay side-effect-free, or an EXPLAIN would capture a table.
-            return CdcDeclareDeferred(source, commitTimestamp, onSchemaChange, include, startingPosition,
-                                      endingPosition);
+            return CdcDeclareDeferred(source, commitTimestamp, onSchemaChange, include, images,
+                                      startingPosition, endingPosition, startingTimestamp,
+                                      endingTimestamp);
         }
         if (rows.Count == 0)
         {
@@ -889,14 +937,17 @@ public sealed partial class SqlServerCatalog
         {
             return CdcDeclareUnion(source, captureInstance, matched, rows[0][1] ?? "dbo",
                                    rows[0][2] ?? source, nullability, commitTimestamp, onSchemaChange,
-                                   include, startingPosition, endingPosition);
+                                   include, images, startingPosition, endingPosition, startingTimestamp,
+                                   endingTimestamp);
         }
 
         // The DESCRIBE, over the statement this reader is about to run. `c.*` rather than a column list
         // because the captured column NAMES are exactly what is being learned here — and the TVF's own four
         // metadata columns come first, which the check below asserts rather than assumes.
         string tvf = "cdc." + Quote("fn_cdc_get_all_changes_" + instance);
-        string describeSql = "SELECT " + CdcChangesSelectList(commitTimestamp, sourceColumns: null)
+        bool updateMask = string.Equals(images, CdcChangesPlan.ImagesBoth, StringComparison.Ordinal);
+        string describeSql = "SELECT " + CdcChangesSelectList(commitTimestamp, updateMask,
+                                                             sourceColumns: null)
                              + " FROM " + tvf + "(@from_lsn, @to_lsn, @row_filter) AS c"
                              + (commitTimestamp ? CdcCommitTimeJoinSql : string.Empty);
         var described = DescribeQuery(describeSql, CdcDescribeParameters());
@@ -910,8 +961,8 @@ public sealed partial class SqlServerCatalog
                 + "records. Commit first, then read.");
         }
         return CdcDeclare(described, source, captureInstance, instance, rows[0][1] ?? "dbo",
-                          rows[0][2] ?? source, nullability, commitTimestamp, onSchemaChange, include, tvf,
-                          startingPosition, endingPosition);
+                          rows[0][2] ?? source, nullability, commitTimestamp, onSchemaChange, include, images,
+                          tvf, startingPosition, endingPosition, startingTimestamp, endingTimestamp);
     }
 
 
@@ -940,12 +991,14 @@ public sealed partial class SqlServerCatalog
     /// in the wrong place.</para>
     /// </remarks>
     private CdcChangesPlan CdcDeclareDeferred(string source, bool commitTimestamp, string onSchemaChange,
-                                              string include, byte[]? startingPosition,
-                                              byte[]? endingPosition)
+                                              string include, string images, byte[]? startingPosition,
+                                              byte[]? endingPosition, DateTime? startingTimestamp,
+                                              DateTime? endingTimestamp)
     {
+        bool updateMask = string.Equals(images, CdcChangesPlan.ImagesBoth, StringComparison.Ordinal);
         var (schema, table) = SqlServerCdcSetup.SplitSource(source, "cdc.changes");
         string qualified = Quote(schema) + "." + Quote(table);
-        string describeSql = "SELECT " + CdcSyntheticMetadataSelectList(commitTimestamp)
+        string describeSql = "SELECT " + CdcSyntheticMetadataSelectList(commitTimestamp, updateMask)
                              + ", s.* FROM " + qualified + " AS s";
         // ⚠ The same parameter list as the real describe: the synthetic statement uses only @inst_name, and
         // the rest are declared-but-unused, which sp_executesql accepts. Passing one list keeps the two
@@ -958,7 +1011,7 @@ public sealed partial class SqlServerCatalog
                 + "it is not a table this connection can read. Change data capture is enabled per TABLE, so "
                 + "the source has to be one; a capture-instance name cannot be enabled.");
         }
-        int meta = CdcMetadataColumnCount(commitTimestamp);
+        int meta = CdcMetadataColumnCount(commitTimestamp, updateMask);
         // ⚠ The DECLARED schema is fixed at BIND and never re-derived, even though this plan re-resolves
         // itself at execute - so the metadata nullability a snapshot leg widens has to be right HERE too,
         // not only on the resolved path.
@@ -969,13 +1022,15 @@ public sealed partial class SqlServerCatalog
             var f = described.FieldsList[i];
             fields.Add(new Field(f.Name, f.DataType,
                                  nullable: i >= meta
-                                           || CdcMetadataNullable(i, meta, commitTimestamp, hasSnapshot)));
+                                           || CdcMetadataNullable(i, meta, commitTimestamp, updateMask,
+                                                                  hasSnapshot)));
         }
         // ⚠ NO snapshot statement here, deliberately: this plan's capture instance does not exist yet, so
         // neither does the boundary a snapshot hands off at. CdcEnableAndResolve re-binds at execute and the
         // RESOLVED plan is the one that carries it.
         return new CdcChangesPlan(source, explicitInstance: null, commitTimestamp, onSchemaChange, include,
-                                  new Schema(fields, metadata: null), startingPosition, endingPosition);
+                                  images, new Schema(fields, metadata: null), startingPosition,
+                                  endingPosition, startingTimestamp, endingTimestamp);
     }
 
     /// <summary>
@@ -1018,8 +1073,10 @@ public sealed partial class SqlServerCatalog
                                            IReadOnlyList<string> instances, string sourceSchema,
                                            string sourceTable, IReadOnlyDictionary<string, bool> nullability,
                                            bool commitTimestamp, string onSchemaChange, string include,
-                                           byte[]? startingPosition, byte[]? endingPosition)
+                                           string images, byte[]? startingPosition, byte[]? endingPosition,
+                                           DateTime? startingTimestamp, DateTime? endingTimestamp)
     {
+        bool updateMask = string.Equals(images, CdcChangesPlan.ImagesBoth, StringComparison.Ordinal);
         string older = instances[0];
         string newer = instances[1];
         var capturedTypes = new Dictionary<string, Dictionary<string, string>>(StringComparer.Ordinal);
@@ -1081,7 +1138,8 @@ public sealed partial class SqlServerCatalog
         // A predicate cannot change a column's type, and leaving it out means the describe needs neither the
         // cursor parameters nor the split, which do not exist until execute.
         string describeSql = CdcUnionSql(older, newer, aligned, olderSet, newerSet, commitTimestamp,
-                                         startingPosition: null, endingPosition: null, executable: false);
+                                         updateMask, startingPosition: null, endingPosition: null,
+                                         executable: false);
         var described = DescribeQuery(describeSql, CdcUnionDescribeParameters());
         if (described is null)
         {
@@ -1090,7 +1148,7 @@ public sealed partial class SqlServerCatalog
                 + $"'{newer}' for '{source}'. Name one of them with capture_instance := '<name>' to read it "
                 + "alone; SELECT * FROM <catalog>.cdc.tables() lists them.");
         }
-        int meta = CdcMetadataColumnCount(commitTimestamp);
+        int meta = CdcMetadataColumnCount(commitTimestamp, updateMask);
         if (described.FieldsList.Count != meta + aligned.Count)
         {
             throw new InvalidOperationException(
@@ -1105,7 +1163,8 @@ public sealed partial class SqlServerCatalog
         {
             var f = described.FieldsList[i];
             fields.Add(new Field(f.Name, f.DataType,
-                                 nullable: CdcMetadataNullable(i, meta, commitTimestamp, hasSnapshot)));
+                                 nullable: CdcMetadataNullable(i, meta, commitTimestamp, updateMask,
+                                                               hasSnapshot)));
         }
         for (int i = meta; i < described.FieldsList.Count; i++)
         {
@@ -1118,18 +1177,19 @@ public sealed partial class SqlServerCatalog
                                            || isNullable));
         }
 
-        string sql = CdcUnionSql(older, newer, aligned, olderSet, newerSet, commitTimestamp,
+        string sql = CdcUnionSql(older, newer, aligned, olderSet, newerSet, commitTimestamp, updateMask,
                                  CdcCursorShape(include, startingPosition), endingPosition, executable: true);
         string? snapshotSql = null;
         if (!string.Equals(include, CdcChangesPlan.IncludeChanges, StringComparison.Ordinal))
         {
             CdcEnsureSnapshotColumnsExist(include, sourceSchema + "." + sourceTable, aligned, nullability);
-            snapshotSql = CdcSnapshotSql(sourceSchema, sourceTable, aligned, commitTimestamp);
+            snapshotSql = CdcSnapshotSql(sourceSchema, sourceTable, aligned, commitTimestamp, updateMask);
         }
         Log.LogDebug("cdc changes {Source}: two capture instances - {Older} below the boundary, {Newer} at "
                      + "or above it, {Columns} aligned columns", source, older, newer, aligned.Count);
         return new CdcChangesPlan(source, explicitInstance, commitTimestamp, onSchemaChange, include,
-                                  new Schema(fields, metadata: null), startingPosition, endingPosition,
+                                  images, new Schema(fields, metadata: null), startingPosition,
+                                  endingPosition, startingTimestamp, endingTimestamp,
                                   captureInstance: older, sourceSchema: sourceSchema,
                                   sourceTable: sourceTable, sql: sql, secondInstance: newer,
                                   snapshotSql: snapshotSql);
@@ -1204,7 +1264,8 @@ public sealed partial class SqlServerCatalog
     /// </remarks>
     private static string CdcUnionSql(string older, string newer, IReadOnlyList<string> aligned,
                                       ISet<string> olderSet, ISet<string> newerSet, bool commitTimestamp,
-                                      byte[]? startingPosition, byte[]? endingPosition, bool executable)
+                                      bool updateMask, byte[]? startingPosition, byte[]? endingPosition,
+                                      bool executable)
     {
         var cursor = executable ? CdcCursorTerms(startingPosition, endingPosition) : new List<string>();
         var olderTerms = new List<string>(cursor);
@@ -1216,18 +1277,22 @@ public sealed partial class SqlServerCatalog
             newerTerms.Add("c.[__$start_lsn] <= @win_to");
         }
         return CdcUnionLegSql(older, "@inst_a", "@from_a", "@to_a", aligned, olderSet, commitTimestamp,
-                              olderTerms)
+                              updateMask, olderTerms)
                + " UNION ALL "
                + CdcUnionLegSql(newer, "@inst_b", "@from_b", "@to_b", aligned, newerSet, commitTimestamp,
-                                newerTerms);
+                                updateMask, newerTerms);
     }
 
     private static string CdcUnionLegSql(string instance, string instParam, string fromParam, string toParam,
                                          IReadOnlyList<string> aligned, ISet<string> captures,
-                                         bool commitTimestamp, IReadOnlyList<string> terms)
+                                         bool commitTimestamp, bool updateMask,
+                                         IReadOnlyList<string> terms)
     {
         var sb = new System.Text.StringBuilder("SELECT ");
-        sb.Append(CdcRealMetadataSelectList(commitTimestamp, instParam));
+        // ⚠ The mask comes from EACH LEG'S OWN change table, so its bit positions are that INSTANCE'S column
+        // ordinals - which the two instances need not agree on. That is why _capture_instance ships beside
+        // it: a mask is only decodable against the instance that produced it.
+        sb.Append(CdcRealMetadataSelectList(commitTimestamp, updateMask, instParam));
         foreach (string column in aligned)
         {
             // ⚠ A BARE `NULL`, never a CONVERT: MEASURED that it adopts the other branch's type through the
@@ -1289,8 +1354,8 @@ public sealed partial class SqlServerCatalog
         Log.LogDebug("cdc changes {Source}: enable := true {Outcome}", plan.Source,
                      created ? "created a capture instance" : "found the table already captured");
         var resolved = CdcBindChanges(plan.Source, plan.ExplicitInstance, plan.CommitTimestamp, enable: false,
-                                      plan.OnSchemaChange, plan.Include, plan.StartingPosition,
-                                      plan.EndingPosition);
+                                      plan.OnSchemaChange, plan.Include, plan.Images, plan.StartingPosition,
+                                      plan.EndingPosition, plan.StartingTimestamp, plan.EndingTimestamp);
         return (resolved, created);
     }
 
@@ -1308,9 +1373,17 @@ public sealed partial class SqlServerCatalog
                                              string instance, string sourceSchema, string sourceTable,
                                              IReadOnlyDictionary<string, bool> nullability,
                                              bool commitTimestamp, string onSchemaChange, string include,
-                                             string tvf, byte[]? startingPosition, byte[]? endingPosition)
+                                             string images, string tvf, byte[]? startingPosition,
+                                             byte[]? endingPosition, DateTime? startingTimestamp,
+                                             DateTime? endingTimestamp)
     {
-        int meta = CdcMetadataColumnCount(commitTimestamp);
+        bool updateMask = string.Equals(images, CdcChangesPlan.ImagesBoth, StringComparison.Ordinal);
+        int meta = CdcMetadataColumnCount(commitTimestamp, updateMask);
+        // ⚠ `__$update_mask` appears TWICE in the described statement when images := 'both', and that is not
+        // a duplicate to collapse: the metadata block's [_update_mask] is our OUTPUT column while this one is
+        // the TVF's own, still where it always was in the `c.*` expansion. Different names, so nothing
+        // collides — but the offset check below counts the TVF's four, and losing that distinction would
+        // shift every captured column by one.
         string[] expected = { "__$start_lsn", "__$seqval", "__$operation", "__$update_mask" };
         if (described.FieldsList.Count < meta + expected.Length)
         {
@@ -1336,7 +1409,8 @@ public sealed partial class SqlServerCatalog
         {
             var f = described.FieldsList[i];
             fields.Add(new Field(f.Name, f.DataType,
-                                 nullable: CdcMetadataNullable(i, meta, commitTimestamp, hasSnapshot)));
+                                 nullable: CdcMetadataNullable(i, meta, commitTimestamp, updateMask,
+                                                               hasSnapshot)));
         }
         var sourceColumns = new List<string>(described.FieldsList.Count - meta - expected.Length);
         for (int i = meta + expected.Length; i < described.FieldsList.Count; i++)
@@ -1349,7 +1423,7 @@ public sealed partial class SqlServerCatalog
                                  nullable: !nullability.TryGetValue(f.Name, out bool isNullable) || isNullable));
         }
 
-        string sql = "SELECT " + CdcChangesSelectList(commitTimestamp, sourceColumns)
+        string sql = "SELECT " + CdcChangesSelectList(commitTimestamp, updateMask, sourceColumns)
                      + " FROM " + tvf + "(@from_lsn, @to_lsn, @row_filter) AS c"
                      + (commitTimestamp ? CdcCommitTimeJoinSql : string.Empty)
                      + CdcCursorPredicateSql(CdcCursorShape(include, startingPosition), endingPosition);
@@ -1357,10 +1431,12 @@ public sealed partial class SqlServerCatalog
         if (!string.Equals(include, CdcChangesPlan.IncludeChanges, StringComparison.Ordinal))
         {
             CdcEnsureSnapshotColumnsExist(include, sourceSchema + "." + sourceTable, sourceColumns, nullability);
-            snapshotSql = CdcSnapshotSql(sourceSchema, sourceTable, sourceColumns, commitTimestamp);
+            snapshotSql = CdcSnapshotSql(sourceSchema, sourceTable, sourceColumns, commitTimestamp,
+                                         updateMask);
         }
         return new CdcChangesPlan(source, explicitInstance, commitTimestamp, onSchemaChange, include,
-                                  new Schema(fields, metadata: null), startingPosition, endingPosition,
+                                  images, new Schema(fields, metadata: null), startingPosition,
+                                  endingPosition, startingTimestamp, endingTimestamp,
                                   captureInstance: instance, sourceSchema: sourceSchema,
                                   sourceTable: sourceTable, sql: sql, snapshotSql: snapshotSql);
     }
@@ -1374,9 +1450,10 @@ public sealed partial class SqlServerCatalog
     private const string CdcCommitTimeJoinSql =
         " LEFT JOIN cdc.[lsn_time_mapping] AS m ON m.[start_lsn] = c.[__$start_lsn]";
 
-    private static string CdcChangesSelectList(bool commitTimestamp, IReadOnlyList<string>? sourceColumns)
+    private static string CdcChangesSelectList(bool commitTimestamp, bool updateMask,
+                                              IReadOnlyList<string>? sourceColumns)
     {
-        var sb = new System.Text.StringBuilder(CdcRealMetadataSelectList(commitTimestamp));
+        var sb = new System.Text.StringBuilder(CdcRealMetadataSelectList(commitTimestamp, updateMask));
         if (sourceColumns is null)
         {
             sb.Append(", c.*");
@@ -1502,18 +1579,41 @@ public sealed partial class SqlServerCatalog
     /// instance — reads back <c>0x0000000000000000000</c> rather than NULL (MEASURED), i.e. a value that must
     /// be ignored on pain of silently dropping every pre-boundary row.</para>
     /// </remarks>
-    private static string CdcWindowSql(bool union) =>
-        "SET NOCOUNT ON; " +
-        "DECLARE @en varchar(1) = CASE WHEN " + SqlServerCdcFunctions.CdcEnabledPredicate
-        + " THEN '1' ELSE '0' END; " +
-        "IF @en = '1' " +
-        "  SELECT @en AS enabled, CONVERT(varchar(30), sys.fn_cdc_get_min_lsn(@inst), 1) AS min_lsn, " +
-        "         CONVERT(varchar(30), sys.fn_cdc_get_max_lsn(), 1) AS max_lsn"
-        + (union ? ", CONVERT(varchar(30), sys.fn_cdc_get_min_lsn(@inst2), 1) AS split" : string.Empty)
-        + "; " +
-        "ELSE SELECT @en AS enabled, CAST(NULL AS varchar(30)) AS min_lsn, " +
-        "            CAST(NULL AS varchar(30)) AS max_lsn"
-        + (union ? ", CAST(NULL AS varchar(30)) AS split" : string.Empty) + ";";
+    private static string CdcWindowSql(bool union, bool mapStart, bool mapEnd)
+    {
+        // ⚠⚠ THE TWO RELATIONAL OPERATORS ARE THE SEMANTICS, not a detail of the call. A lower bound uses
+        // 'smallest greater than or equal' and an upper bound 'largest less than or equal', so BOTH are
+        // INCLUSIVE — which is what a wall-clock instant means, and deliberately NOT what a _position means
+        // (a resume token names a row already read, so it is exclusive). Getting the operator wrong on the
+        // lower bound would silently DROP whatever committed exactly at the named instant.
+        // ⚠ CONVERT(datetime, …) is EXPLICIT rather than left to an implicit datetime2 → datetime widening:
+        // cdc.lsn_time_mapping stores `datetime`, so the comparison happens at ~3.33 ms resolution whatever
+        // we do, and doing the narrowing ourselves is what makes that a documented property of the bound
+        // instead of a conversion nobody chose.
+        string mapped =
+            (mapStart
+                 ? ", CONVERT(varchar(30), sys.fn_cdc_map_time_to_lsn('smallest greater than or equal', "
+                   + "CONVERT(datetime, @ts_from)), 1) AS ts_from"
+                 : string.Empty)
+            + (mapEnd
+                   ? ", CONVERT(varchar(30), sys.fn_cdc_map_time_to_lsn('largest less than or equal', "
+                     + "CONVERT(datetime, @ts_to)), 1) AS ts_to"
+                   : string.Empty);
+        string nulls = (mapStart ? ", CAST(NULL AS varchar(30)) AS ts_from" : string.Empty)
+                       + (mapEnd ? ", CAST(NULL AS varchar(30)) AS ts_to" : string.Empty);
+        return
+            "SET NOCOUNT ON; " +
+            "DECLARE @en varchar(1) = CASE WHEN " + SqlServerCdcFunctions.CdcEnabledPredicate
+            + " THEN '1' ELSE '0' END; " +
+            "IF @en = '1' " +
+            "  SELECT @en AS enabled, CONVERT(varchar(30), sys.fn_cdc_get_min_lsn(@inst), 1) AS min_lsn, " +
+            "         CONVERT(varchar(30), sys.fn_cdc_get_max_lsn(), 1) AS max_lsn"
+            + (union ? ", CONVERT(varchar(30), sys.fn_cdc_get_min_lsn(@inst2), 1) AS split" : string.Empty)
+            + mapped + "; " +
+            "ELSE SELECT @en AS enabled, CAST(NULL AS varchar(30)) AS min_lsn, " +
+            "            CAST(NULL AS varchar(30)) AS max_lsn"
+            + (union ? ", CAST(NULL AS varchar(30)) AS split" : string.Empty) + nulls + ";";
+    }
 
     /// <summary>
     /// Resolves the read window and runs THE PRE-CHECK — the highest-value line in this feature (§2.1).
@@ -1540,17 +1640,40 @@ public sealed partial class SqlServerCatalog
                                         byte[]? handoff = null)
     {
         string instance = CdcRequireResolved(plan).Instance;
-        string sql = CdcWindowSql(plan.IsUnion);
+        // ⚠ A timestamp bound is resolved HERE, at execute, not at bind. The bound is a wall-clock instant
+        // and the mapping table only grows, so a bound naming an instant the capture job has not reached yet
+        // resolves to NULL at bind and to a real LSN moments later. Resolving with the window is also free —
+        // it rides the batch that was going to run anyway.
+        bool mapStart = plan.StartingTimestamp is not null;
+        bool mapEnd = plan.EndingTimestamp is not null;
+        string sql = CdcWindowSql(plan.IsUnion, mapStart, mapEnd);
         var windowParameters = new List<SqlParameter> { new("@inst", instance) };
         if (plan.SecondInstance is { } secondInstance)
         {
             windowParameters.Add(new SqlParameter("@inst2", secondInstance));
         }
+        if (plan.StartingTimestamp is { } tsFrom)
+        {
+            windowParameters.Add(new SqlParameter("@ts_from", System.Data.SqlDbType.DateTime2)
+            {
+                Value = tsFrom,
+            });
+        }
+        if (plan.EndingTimestamp is { } tsTo)
+        {
+            windowParameters.Add(new SqlParameter("@ts_to", System.Data.SqlDbType.DateTime2)
+            {
+                Value = tsTo,
+            });
+        }
+        int columns = (plan.IsUnion ? 4 : 3) + (mapStart ? 1 : 0) + (mapEnd ? 1 : 0);
+        int tsFromColumn = plan.IsUnion ? 4 : 3;
+        int tsToColumn = tsFromColumn + (mapStart ? 1 : 0);
 
         // readYourWrites: a capture instance enabled earlier in THIS transaction must be visible here, and
         // this is a short metadata read that holds no reader open. ⚠ The streaming read below deliberately
         // does NOT do that - see CdcExecuteChanges.
-        var rows = ReadMetadataRows(sql, plan.IsUnion ? 4 : 3, windowParameters);
+        var rows = ReadMetadataRows(sql, columns, windowParameters);
         if (rows.Count == 0 || rows[0][0] != "1")
         {
             throw new InvalidOperationException(
@@ -1639,8 +1762,39 @@ public sealed partial class SqlServerCatalog
                 + "would hand the window to SQL Server and get back an error naming neither.");
         }
 
+        // ⚠⚠ A TIMESTAMP THAT MAPS TO NOTHING IS AN EMPTY WINDOW, NOT AN ERROR — in BOTH directions, and
+        // for the same reason each time: the answer to "what committed at or after next Tuesday" is
+        // "nothing yet", and the answer to "what committed at or before the day before this table existed"
+        // is "nothing". Raising there would turn a legitimate poll into a failure the caller has to
+        // special-case. ⚠ It is NOT the same as a below-the-floor bound, which IS refused a few lines down:
+        // that one means the rows EXISTED and have been purged, so continuing would skip them silently.
+        byte[]? tsFromLsn = mapStart ? SqlServerCdcFunctions.ParseHex(rows[0][tsFromColumn]) : null;
+        byte[]? tsToLsn = mapEnd ? SqlServerCdcFunctions.ParseHex(rows[0][tsToColumn]) : null;
+        if (mapStart && tsFromLsn is null)
+        {
+            Log.LogDebug("cdc changes {Source} ({Instance}): starting_timestamp {Ts} is after every captured "
+                         + "transaction - empty window", plan.SourceName, plan.CaptureInstance,
+                         plan.StartingTimestamp);
+            return CdcWindow.Empty;
+        }
+        if (mapEnd && tsToLsn is null)
+        {
+            Log.LogDebug("cdc changes {Source} ({Instance}): ending_timestamp {Ts} is before every captured "
+                         + "transaction - empty window", plan.SourceName, plan.CaptureInstance,
+                         plan.EndingTimestamp);
+            return CdcWindow.Empty;
+        }
+
         byte[] toLsn;
-        if (plan.EndingPosition is { } ending)
+        if (tsToLsn is { } endingByTime)
+        {
+            // ⚠ No watermark check, and it is unnecessary rather than skipped: this LSN came OUT of
+            // cdc.lsn_time_mapping, which the capture job writes as it scans, so it cannot exceed the
+            // watermark that same job publishes. (maxLsn is NULL only when nothing has been captured, and
+            // then the mapping is empty and the branch above has already returned.)
+            toLsn = endingByTime;
+        }
+        else if (plan.EndingPosition is { } ending)
         {
             if (maxLsn is null)
             {
@@ -1676,7 +1830,12 @@ public sealed partial class SqlServerCatalog
         // include := 'snapshot+changes' read refuses starting_position at bind, precisely so that the
         // question "which lower bound governs" has one answer.
         byte[]? cursor = handoff ?? plan.StartingPosition;
-        byte[] fromLsn = cursor is { } starting ? CdcChangesPlan.LsnOf(starting) : minLsn;
+        // ⚠ A timestamp lower bound leaves the CURSOR null on purpose, so no cursor predicate is emitted and
+        // the TVF's own INCLUSIVE from_lsn is what governs. Synthesising a 21-byte position from the mapped
+        // LSN would push the bound through the exclusive three-clause predicate instead and drop whatever
+        // committed exactly at that instant — the one thing an inclusive bound promises not to do.
+        byte[] fromLsn = tsFromLsn
+                         ?? (cursor is { } starting ? CdcChangesPlan.LsnOf(starting) : minLsn);
         if (handoff is not null && CdcChangesPlan.CompareLsn(fromLsn, minLsn) < 0)
         {
             // ⚠⚠ CLAMPED UP TO THE FLOOR RATHER THAN REFUSED, and ONLY on the handoff path. The handoff is
@@ -1695,6 +1854,35 @@ public sealed partial class SqlServerCatalog
         }
         else if (CdcChangesPlan.CompareLsn(fromLsn, minLsn) < 0)
         {
+            // ⚠⚠ THE MESSAGE NAMES BOTH CAUSES, because this read cannot tell them apart and MEASURING
+            // it is what showed that. fn_cdc_map_time_to_lsn resolves against cdc.lsn_time_mapping, which is
+            // DATABASE-wide, while the floor is this INSTANCE's — so an old timestamp on a recently captured
+            // table maps below the floor with nothing having been lost at all. (Measured: an instance
+            // enabled minutes earlier, starting_timestamp := 2020-01-01, mapping floor 0x2C… against an
+            // instance floor 0x30….) An earlier wording asserted "removed by the cleanup job", which is
+            // true of one cause and a fabrication about the other.
+            // ⚠ It still REFUSES rather than clamping, and that is the safe half of an honest uncertainty:
+            // if changes WERE purged, proceeding delivers a short read with nothing failing — the exact
+            // failure the retention check exists for. Discriminating properly needs the instance's
+            // start_lsn beside its floor (nothing was purged iff min_lsn <= start_lsn), which is one more
+            // column in a batch that already runs; deliberately NOT taken here, so that a false alarm stays
+            // a false alarm and never becomes a silent short read.
+            // ⚠ And it names the parameter the CALLER actually passed: a timestamp bound arrives at this
+            // branch as an LSN they have never seen, so reporting it as "starting_position" would send them
+            // looking for a cursor they did not write.
+            if (plan.StartingTimestamp is { } purgedTs)
+            {
+                throw new InvalidOperationException(
+                    $"cdc.changes: starting_timestamp {purgedTs:yyyy-MM-dd HH:mm:ss.fff} maps to "
+                    + $"{CdcChangesPlan.Hex(fromLsn)}, BELOW the retention floor "
+                    + $"{CdcChangesPlan.Hex(minLsn)} of capture instance '{plan.CaptureInstance}' - so this "
+                    + "read cannot answer for the range between them. Either the cleanup job removed those "
+                    + "changes (in which case reading on WOULD HAVE SILENTLY SKIPPED THEM), or the capture "
+                    + "instance simply did not exist that early; this read cannot tell which, so it refuses "
+                    + "rather than guess. Drop the lower bound to take everything still retained, start "
+                    + "from cdc.min_position('" + plan.CaptureInstance + "'), or re-baseline with "
+                    + "include := 'snapshot+changes'. cdc.health() reports the retention setting.");
+            }
             throw new InvalidOperationException(
                 $"cdc.changes: starting_position {CdcChangesPlan.Hex(fromLsn)} is BELOW the retention floor "
                 + $"{CdcChangesPlan.Hex(minLsn)} of capture instance '{plan.CaptureInstance}'. The changes "
@@ -1876,7 +2064,7 @@ public sealed partial class SqlServerCatalog
             });
             parameters.Add(new SqlParameter("@row_filter", System.Data.SqlDbType.NVarChar, 30)
             {
-                Value = CdcChangesPlan.RowFilterAll,
+                Value = plan.RowFilterOption,
             });
         }
         else
@@ -1885,7 +2073,7 @@ public sealed partial class SqlServerCatalog
             parameters.Add(CdcBinaryParam("@to_lsn", window.ToLsn));
             parameters.Add(new SqlParameter("@row_filter", System.Data.SqlDbType.NVarChar, 30)
             {
-                Value = CdcChangesPlan.RowFilterAll,
+                Value = plan.RowFilterOption,
             });
             parameters.Add(new SqlParameter("@inst_name", System.Data.SqlDbType.VarChar, 128)
             {
