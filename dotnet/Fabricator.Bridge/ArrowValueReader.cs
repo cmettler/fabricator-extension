@@ -42,13 +42,37 @@ public static class ArrowValueReader
         };
     }
 
+    /// <summary>
+    /// A timestamp as the CLR type its Arrow type means: a wall-clock <see cref="DateTime"/> without a
+    /// timezone, a <see cref="DateTimeOffset"/> with one.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>⚠⚠ THE CASTS ARE LOAD-BEARING AND THEIR ABSENCE WAS A SHIPPED DEFECT.</b> This method used
+    /// to read <c>cond ? ts.UtcDateTime : ts</c>, with a comment saying exactly what it intended — and it
+    /// returned a <c>DateTimeOffset</c> in BOTH cases for four months. C#'s conditional operator unifies its
+    /// two branches, there is an implicit <c>DateTime</c> → <c>DateTimeOffset</c> conversion and none the
+    /// other way, so the expression's natural type is <c>DateTimeOffset</c> and the <c>DateTime</c> branch
+    /// was converted straight back before boxing. Casting both branches to <c>object</c> is what stops the
+    /// unification. (Found from the outside, by a caller whose <c>as DateTime?</c> silently yielded null —
+    /// docs/mssql-cdc.md §21.5.)</para>
+    /// <para><b>⚠ WHAT IT COST, MEASURED rather than assumed — it was never a wrong ANSWER.</b> A tz-less
+    /// value carries offset <c>+00:00</c> and its wall clock unchanged, and SQL Server compares a
+    /// <c>datetime2</c> column against a <c>datetimeoffset</c> parameter correctly. What it cost is the PLAN:
+    /// against an indexed <c>datetime2</c> column, a <c>datetime2</c> parameter gives a direct
+    /// <c>Index Seek(SEEK: dt &gt; @p)</c> that parallelises, while a <c>datetimeoffset</c> one goes through
+    /// <c>GetRangeWithMismatchedTypes</c> — a constant scan and a nested loop computing an equivalent range
+    /// before the seek — and did not parallelise. Still a seek, so this is a pessimisation rather than the
+    /// table scan a non-SARGable predicate would have caused.</para>
+    /// <para>⚠ The tz-PRESENT branch is unchanged: a <c>datetimeoffset</c> column exports WITH a timezone
+    /// and must keep marshalling as a <see cref="DateTimeOffset"/>, where it is the matching type.</para>
+    /// </remarks>
     private static object ReadTimestamp(TimestampArray a, int index)
     {
         var ts = a.GetTimestamp(index)!.Value; // DateTimeOffset (stored as UTC when no tz)
         var type = (TimestampType)a.Data.DataType;
         // No timezone => a wall-clock value (SQL datetime2): hand back a DateTime.
         // With timezone (SQL datetimeoffset): hand back the DateTimeOffset.
-        return string.IsNullOrEmpty(type.Timezone) ? ts.UtcDateTime : ts;
+        return string.IsNullOrEmpty(type.Timezone) ? (object)ts.UtcDateTime : (object)ts;
     }
 
     /// <summary>

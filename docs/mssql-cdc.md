@@ -3355,10 +3355,10 @@ The reader now accepts both shapes and takes `.DateTime` (the wall clock the cal
 `TIMESTAMP` and the wall clock is unchanged, so the two agree today — `.DateTime` is the one that stays
 right if that ever stops being true.
 
-**⚠ The shared bug itself is NOT fixed in this slice, deliberately.** `ReadScalar` feeds filter-value
+**⚠ The shared bug itself was NOT fixed in this slice, deliberately** — `ReadScalar` feeds filter-value
 pushdown for every provider, so changing what a timestamp filter marshals as is its own change with its own
-gate — mixing it into a feature commit would drown it. Mutant D is the reader's half: restoring
-`as DateTime?` kills §31 at the empty-window pair.
+gate. **✅ FIXED separately the same day, and it needed a SECOND change nobody would have predicted: see
+§23.** Mutant D is the reader's half: restoring `as DateTime?` kills §31 at the empty-window pair.
 
 ### 21.6 What the gate does NOT cover, said rather than implied
 
@@ -3514,5 +3514,74 @@ the safe half of an honest uncertainty. **Do not re-propose this.**
   *independently* gated, and separating them would cost a second fixture for no additional protection.
 - **The `fill` and `null` modes** remain designed-but-unbuilt and are still refused BY NAME (§15.9 records
   why they are last: both assert something about a column that was never captured).
+
+
+## 23. The shared-code fix §21.5 handed off — and the second half of it (2026-08-25)
+
+`ArrowValueReader.ReadTimestamp` now returns what its comment always claimed: a `DateTime` when the Arrow
+type carries no timezone, a `DateTimeOffset` when it does. One line — `? (object)ts.UtcDateTime : (object)ts`
+— because the casts are what stop C#'s conditional operator unifying the branches. Gate:
+`verify_filter_pushdown` 6 → **17**, two mutants, each killed at its own assertion.
+
+### 23.1 ⚠ What the bug actually cost — MEASURED, and it was never a wrong answer
+
+A tz-less value carried offset `+00:00` and its wall clock unchanged, and SQL Server compares a `datetime2`
+column against a `datetimeoffset` parameter correctly. What it cost was the PLAN, against an indexed
+`datetime2` column:
+
+| parameter type | plan |
+|---|---|
+| `datetime2` | `Index Seek(SEEK: dt > @p)`, **parallel** |
+| `datetimeoffset` | `GetRangeWithMismatchedTypes` — a constant scan and a nested loop computing an equivalent range — then the seek, **serial** |
+
+Still a seek, so this was a pessimisation rather than the table scan a non-SARGable predicate would cause.
+Saying so is the point: the fix is worth making and the pre-fix behaviour was not corrupting anything.
+
+### 23.2 ⚠⚠ AND FIXING IT ALONE WOULD HAVE INTRODUCED SILENT DATA LOSS
+
+`FilterWhereBuilder` binds `new SqlParameter(name, value)` and lets SqlClient infer the type. A CLR
+`DateTime` infers to **`SqlDbType.DateTime`** — the LEGACY type, ~3.33 ms resolution — so the bound is
+ROUNDED before the server sees it. Measured directly:
+
+```
+(@p0 datetime)SELECT [dt] FROM [dbo].[tsplan] WHERE [dt] > @p0     <- after the one-line fix, before the second
+```
+
+and over 3400 consecutive microsecond offsets narrowed to `datetime`: **1732 round DOWN, 1667 round UP.**
+
+Rounding down is harmless — pushdown is allowed to be a SUPERSET, because DuckDB re-applies every predicate.
+**Rounding UP makes the pushed predicate STRICTER, and rows dropped on the SERVER never reach that
+re-application.** That breaks the never-erases rule the whole pushdown design rests on.
+
+So the parameter is pinned: `value is DateTime ? new SqlParameter(name, SqlDbType.DateTime2) { Value = … }`.
+Verified through our own path afterwards — `(@p0 datetime2(7))`, direct seek, parallel.
+
+**⚠ The hazard was NOT reachable before this fix, and only by accident**: the ternary bug made every
+timestamp arrive as a `DateTimeOffset`, which infers to `datetimeoffset` — full precision, so no loss.
+Fixing the first bug is what made the second reachable, which is why the two belong in one commit. A
+one-line "obvious" fix would have shipped a wrong answer.
+
+**⚠ `datetime2` rather than `datetime` or `datetimeoffset`, and each rejection is measured.** Against a
+legacy `datetime` or a `date` column it is the mismatched-types seek instead — which is what
+`datetimeoffset` already was for BOTH — and the widening conversion is lossless, so no row is dropped. A
+`DateTimeOffset` is still left to inference, because `datetimeoffset` is the MATCHING type for the only
+column type that produces one.
+
+### 23.3 The gate, and what each half of it can see
+
+The row assertions use `12:00:00.001667` — the FIRST microsecond offset measured to round UP — so under the
+inferred binding the pushed predicate becomes `dt > .003333` and the mutant returns **0 rows where 4 was
+expected**, dropping two rows on the server. The round-DOWN case beside it is the control: harmless either
+way, so on its own it would pass with the bug fully present.
+
+The parameter-type assertion is separate because every row assertion is ALSO satisfiable by a build that
+stopped pushing timestamps altogether — DuckDB would then filter locally and be right for the wrong reason.
+It is what the ternary mutant dies on: that mutant leaves all 13 row assertions PASSING, because a
+`DateTimeOffset` really does preserve precision. The two mutants therefore prove different things, which is
+the split the fix itself has.
+
+⚠ The table is created THROUGH the catalog rather than with `fabricator_exec`: a table created out of band
+is not in the catalog cache (`mssql_exec_invalidate_cache` is off by default), so the reference would not
+bind at all — and a suite that cannot bind proves nothing about pushdown. That cost one wasted probe.
 
 ---

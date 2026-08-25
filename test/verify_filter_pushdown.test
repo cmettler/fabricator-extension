@@ -44,5 +44,81 @@ SELECT pushed FROM fabricator_query('db',
 ----
 1
 
+# ═══ TIMESTAMP filter values — pushed at FULL PRECISION, and bound as datetime2 ════════════════════════
+# ⚠⚠ THE FAILURE THIS GUARDS IS SILENT DATA LOSS, not a slow plan. Pushdown is allowed to be a SUPERSET
+# because DuckDB re-applies every predicate — but a bound that moves the WRONG WAY makes the pushed
+# predicate STRICTER, and rows dropped on the SERVER never reach the re-application that would have saved
+# them. A CLR DateTime bound by SqlClient's inference becomes the LEGACY `datetime` type (~3.33 ms), and
+# MEASURED over 3400 consecutive microsecond offsets: 1732 round DOWN (harmless) and 1667 round UP (loss).
+# So the parameter type is pinned to datetime2 rather than inferred.
+#
+# ⚠ The table is created THROUGH the catalog, not with fabricator_exec: a table created out of band is not
+# in the catalog's cache (mssql_exec_invalidate_cache is off by default), so the reference below would not
+# bind at all — and a suite that cannot bind proves nothing about pushdown.
+
+statement ok
+CREATE OR REPLACE TABLE db.dbo.tsprec (id INTEGER, dt TIMESTAMP);
+
+statement ok
+INSERT INTO db.dbo.tsprec VALUES
+  (1, TIMESTAMP '2026-06-01 12:00:00.000000'),
+  (2, TIMESTAMP '2026-06-01 12:00:00.001000'),
+  (3, TIMESTAMP '2026-06-01 12:00:00.001667'),
+  (4, TIMESTAMP '2026-06-01 12:00:00.003000');
+
+# ⚠ 12:00:00.001667 is chosen, not arbitrary: it is the FIRST microsecond offset MEASURED to round UP when
+# narrowed to `datetime` (it becomes .003333). Under the inferred binding the pushed predicate would be
+# `dt > .003333`, which excludes rows 3 AND 4 on the server — so this returns 4 instead of 3, 4.
+query I
+SELECT id FROM db.dbo.tsprec WHERE dt > TIMESTAMP '2026-06-01 12:00:00.001667' ORDER BY id;
+----
+4
+
+query I
+SELECT id FROM db.dbo.tsprec WHERE dt >= TIMESTAMP '2026-06-01 12:00:00.001667' ORDER BY id;
+----
+3
+4
+
+# …and the ROUND-DOWN direction, which is the control: it is harmless either way (a superset that DuckDB
+# re-applies), so on its own it would pass with the bug fully present. Its job is to show the predicate is
+# being pushed and re-applied correctly at all.
+query I
+SELECT id FROM db.dbo.tsprec WHERE dt > TIMESTAMP '2026-06-01 12:00:00.001000' ORDER BY id;
+----
+3
+4
+
+# Equality is the sharpest of the three: a moved bound matches NOTHING rather than too much or too little.
+query I
+SELECT id FROM db.dbo.tsprec WHERE dt = TIMESTAMP '2026-06-01 12:00:00.001667';
+----
+3
+
+# ⚠⚠ THE PARAMETER TYPE ITSELF, because every assertion above is also satisfiable by a build that stopped
+# pushing timestamps altogether — DuckDB would then filter locally and get the right answer for the wrong
+# reason. This asserts the value crossed as datetime2 AND that a `datetime` binding is absent.
+query II
+SELECT dt2, legacy FROM fabricator_query('db',
+  'SELECT CAST(CASE WHEN EXISTS (
+     SELECT 1 FROM sys.dm_exec_query_stats qs
+     CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) st
+     WHERE CHARINDEX(''FROM [dbo].[tsprec]'', st.text) > 0
+       AND CHARINDEX(''@p0 datetime2'', st.text) > 0
+       AND CHARINDEX(''dm_exec'', st.text) = 0
+   ) THEN 1 ELSE 0 END AS INT) AS dt2,
+   CAST(CASE WHEN EXISTS (
+     SELECT 1 FROM sys.dm_exec_query_stats qs
+     CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) st
+     WHERE CHARINDEX(''FROM [dbo].[tsprec]'', st.text) > 0
+       AND CHARINDEX(''@p0 datetime)'', st.text) > 0
+       AND CHARINDEX(''dm_exec'', st.text) = 0
+   ) THEN 1 ELSE 0 END AS INT) AS legacy');
+----
+1	0
+
+statement ok
+DROP TABLE db.dbo.tsprec;
+
 statement ok
 DETACH db;
