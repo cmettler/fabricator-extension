@@ -117,8 +117,27 @@ internal sealed class SqlServerSnapshotStream : IArrowArrayStream
                 }
                 catch (Exception)
                 {
-                    // A connection we cannot reset is one we should not hand back. Disposing it is still
-                    // right: SqlClient retires a broken connection rather than pooling it.
+                    // ⚠⚠ A CONNECTION WE COULD NOT RESET MUST NOT GO BACK TO THE POOL, and Dispose() ALONE
+                    // does not prevent that — it RETURNS a healthy connection to the pool rather than
+                    // closing it. An earlier comment here claimed "SqlClient retires a broken connection
+                    // rather than pooling it", which is true of a BROKEN one and says nothing about a
+                    // healthy connection whose reset failed for another reason (a command timeout, an
+                    // attention). That connection is still at SNAPSHOT, and handing it back is exactly the
+                    // leak this class exists to close.
+                    //
+                    // ⚠ ClearPool is the only tool SqlClient offers — there is no per-connection "do not
+                    // pool this" — so it is a blunt instrument on a path that should never fire: it evicts
+                    // every idle connection for this connection string, and other threads simply reconnect.
+                    // Acceptable precisely BECAUSE it is unreachable in normal operation; if it ever starts
+                    // firing, that is a signal worth having rather than a cost worth avoiding.
+                    try
+                    {
+                        SqlConnection.ClearPool(connection);
+                    }
+                    catch (Exception)
+                    {
+                        // Nothing further is available. The connection is disposed below either way.
+                    }
                 }
                 finally
                 {

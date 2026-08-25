@@ -369,6 +369,161 @@ public sealed partial class SqlServerCatalog
     // ---- slice 2: the SETUP half ----------------------------------------------------------------------
 
     /// <summary>
+    /// <c>db.cdc.ddl_history(...)</c> — the recorded DDL statements, resolved to names and LSN-bounded.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>⚠⚠ THE QUERY IS DYNAMIC, AND THAT IS FORCED RATHER THAN STYLISTIC.</b> A batch that
+    /// REFERENCES <c>cdc.ddl_history</c> fails at COMPILE when CDC is not enabled on the database — the
+    /// schema does not exist — so an ordinary <c>IF &lt;enabled&gt; SELECT … ELSE SELECT nothing</c> does not
+    /// guard it: the whole batch is rejected before the IF runs. §18.3 records the same fact costing the
+    /// reader's drift check its own round trip. <c>sp_executesql</c> defers the compile to the branch that
+    /// actually runs, which is what lets this answer EMPTY on a database with no CDC — the convention
+    /// <c>cdc.tables()</c> already sets — instead of raising <c>Msg 208</c>.</para>
+    /// <para>⚠ <c>NOLOCK</c> on both CDC tables: the capture job writes them continuously and a diagnostic
+    /// must neither block it nor wait on it. The cost is a possible dirty read, which is acceptable for an
+    /// advisory answer and is exactly why the reader's drift check issues its own guarded query instead of
+    /// calling this.</para>
+    /// <para>⚠ LEFT JOINs throughout: a DDL row can outlive the objects it names (the source table dropped,
+    /// the capture instance disabled), and losing the row would hide the very history this exists to show.
+    /// Unresolvable names come back NULL.</para>
+    /// </remarks>
+    internal RecordBatch CdcDdlHistory(string? source, byte[]? from, byte[]? to)
+    {
+        string inner =
+            "SELECT CAST(ss.name AS varchar(128)) AS source_schema, "
+            + "CAST(st.name AS varchar(128)) AS source_table, "
+            + "CAST(ct.capture_instance AS varchar(128)) AS capture_instance, "
+            + "CONVERT(varchar(30), h.ddl_lsn, 1) AS ddl_lsn, "
+            + "CONVERT(varchar(27), h.ddl_time, 126) AS ddl_time, "
+            + "CAST(h.required_column_update AS varchar(1)) AS required_column_update, "
+            + "CONVERT(varchar(max), h.ddl_command) AS ddl_command "
+            + "FROM cdc.ddl_history AS h WITH (NOLOCK) "
+            + "LEFT JOIN cdc.change_tables AS ct WITH (NOLOCK) ON ct.object_id = h.object_id "
+            + "LEFT JOIN sys.tables AS st ON st.object_id = h.source_object_id "
+            + "LEFT JOIN sys.schemas AS ss ON ss.schema_id = st.schema_id "
+            + "WHERE (@source IS NULL OR ct.capture_instance = @source "
+            + "       OR (ss.name + N'.' + st.name) = @source) "
+            // ⚠ The reader's own exclusivity: strictly after the cursor, through the window end.
+            + "  AND (@from IS NULL OR h.ddl_lsn > @from) "
+            + "  AND (@to IS NULL OR h.ddl_lsn <= @to) "
+            + "ORDER BY h.ddl_lsn, ct.capture_instance";
+        string sql =
+            "SET NOCOUNT ON; "
+            + "IF " + SqlServerCdcFunctions.CdcEnabledPredicate + " "
+            + "  EXEC sys.sp_executesql @inner, "
+            + "       N'@source sysname, @from binary(10), @to binary(10)', "
+            + "       @source = @source, @from = @from, @to = @to; "
+            + "ELSE SELECT CAST(NULL AS varchar(128)) AS source_schema, "
+            + "            CAST(NULL AS varchar(128)) AS source_table, "
+            + "            CAST(NULL AS varchar(128)) AS capture_instance, "
+            + "            CAST(NULL AS varchar(30)) AS ddl_lsn, CAST(NULL AS varchar(27)) AS ddl_time, "
+            + "            CAST(NULL AS varchar(1)) AS required_column_update, "
+            + "            CAST(NULL AS varchar(max)) AS ddl_command WHERE 1 = 0;";
+        var rows = ReadMetadataRows(sql, 7, new[]
+        {
+            // ⚠ The inner statement rides as a PARAMETER rather than being spliced into the outer string:
+            // it contains single quotes of its own, and doubling them by hand is how an injection-shaped
+            // bug gets written into a query that never needed one.
+            new SqlParameter("@inner", System.Data.SqlDbType.NVarChar, -1) { Value = inner },
+            NullableParam("@source", source),
+            CdcNullableBinary("@from", from),
+            CdcNullableBinary("@to", to),
+        });
+        var schemas = new StringArray.Builder();
+        var tables = new StringArray.Builder();
+        var instances = new StringArray.Builder();
+        var lsns = new BinaryArray.Builder();
+        var times = new TimestampArray.Builder(
+            (TimestampType)CdcDdlHistoryFunction.Columns.GetFieldByName("ddl_time").DataType);
+        var required = new BooleanArray.Builder();
+        var commands = new StringArray.Builder();
+        foreach (var row in rows)
+        {
+            schemas.Append(row[0]);
+            tables.Append(row[1]);
+            instances.Append(row[2]);
+            AppendBlob(lsns, row[3]);
+            AppendMicros(times, row[4]);
+            AppendBit(required, row[5]);
+            commands.Append(row[6]);
+        }
+        return new RecordBatch(CdcDdlHistoryFunction.Columns, new IArrowArray[]
+        {
+            schemas.Build(), tables.Build(), instances.Build(), lsns.Build(), times.Build(),
+            required.Build(), commands.Build(),
+        }, rows.Count);
+    }
+
+    /// <summary>
+    /// <c>db.cdc.lsn_time_mapping(...)</c> — the LSN ↔ time bridge, LSN-bounded.
+    /// </summary>
+    /// <remarks>
+    /// ⚠ Dynamic and <c>NOLOCK</c> for the reasons <see cref="CdcDdlHistory"/> records; the compile-time
+    /// hazard is identical, since <c>cdc.lsn_time_mapping</c> is in the same schema that does not exist
+    /// until CDC is enabled. ⚠ It is DATABASE-wide — every captured transaction, whichever table it touched
+    /// — which is what makes it usable for "what was happening at this LSN" and also why a bound resolved
+    /// through it can sit below a particular capture instance's retention floor.
+    /// </remarks>
+    internal RecordBatch CdcLsnTimeMapping(byte[]? from, byte[]? to)
+    {
+        string inner =
+            "SELECT CONVERT(varchar(30), m.start_lsn, 1) AS start_lsn, "
+            + "CONVERT(varchar(27), m.tran_begin_time, 126) AS tran_begin_time, "
+            + "CONVERT(varchar(27), m.tran_end_time, 126) AS tran_end_time, "
+            + "CONVERT(varchar(60), m.tran_id, 1) AS tran_id, "
+            + "CONVERT(varchar(30), m.tran_begin_lsn, 1) AS tran_begin_lsn "
+            + "FROM cdc.lsn_time_mapping AS m WITH (NOLOCK) "
+            + "WHERE (@from IS NULL OR m.start_lsn > @from) "
+            + "  AND (@to IS NULL OR m.start_lsn <= @to) "
+            + "ORDER BY m.start_lsn";
+        string sql =
+            "SET NOCOUNT ON; "
+            + "IF " + SqlServerCdcFunctions.CdcEnabledPredicate + " "
+            + "  EXEC sys.sp_executesql @inner, N'@from binary(10), @to binary(10)', "
+            + "       @from = @from, @to = @to; "
+            + "ELSE SELECT CAST(NULL AS varchar(30)) AS start_lsn, "
+            + "            CAST(NULL AS varchar(27)) AS tran_begin_time, "
+            + "            CAST(NULL AS varchar(27)) AS tran_end_time, "
+            + "            CAST(NULL AS varchar(60)) AS tran_id, "
+            + "            CAST(NULL AS varchar(30)) AS tran_begin_lsn WHERE 1 = 0;";
+        var rows = ReadMetadataRows(sql, 5, new[]
+        {
+            new SqlParameter("@inner", System.Data.SqlDbType.NVarChar, -1) { Value = inner },
+            CdcNullableBinary("@from", from),
+            CdcNullableBinary("@to", to),
+        });
+        var startLsn = new BinaryArray.Builder();
+        var beginTime = new TimestampArray.Builder(
+            (TimestampType)CdcLsnTimeMappingFunction.Columns.GetFieldByName("tran_begin_time").DataType);
+        var endTime = new TimestampArray.Builder(
+            (TimestampType)CdcLsnTimeMappingFunction.Columns.GetFieldByName("tran_end_time").DataType);
+        var tranId = new BinaryArray.Builder();
+        var beginLsn = new BinaryArray.Builder();
+        foreach (var row in rows)
+        {
+            AppendBlob(startLsn, row[0]);
+            AppendMicros(beginTime, row[1]);
+            AppendMicros(endTime, row[2]);
+            AppendBlob(tranId, row[3]);
+            AppendBlob(beginLsn, row[4]);
+        }
+        return new RecordBatch(CdcLsnTimeMappingFunction.Columns, new IArrowArray[]
+        {
+            startLsn.Build(), beginTime.Build(), endTime.Build(), tranId.Build(), beginLsn.Build(),
+        }, rows.Count);
+    }
+
+    /// <summary>
+    /// A <c>binary(10)</c> LSN bound that may be absent. ⚠ Only the LSN part of a 21-byte position is
+    /// compared, because the columns these bound (<c>ddl_lsn</c>, <c>start_lsn</c>) are LSNs.
+    /// </summary>
+    private static SqlParameter CdcNullableBinary(string name, byte[]? value) =>
+        new(name, System.Data.SqlDbType.Binary, CdcChangesPlan.LsnBytes)
+        {
+            Value = value is null ? (object)DBNull.Value : CdcChangesPlan.LsnOf(value),
+        };
+
+    /// <summary>
     /// <c>sys.sp_cdc_enable_db</c>, idempotently. Returns one report row; <c>changed = false</c> when the
     /// database was already enabled.
     /// </summary>
@@ -914,6 +1069,7 @@ public sealed partial class SqlServerCatalog
         var nullability = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
         var matched = new List<string>();
         var owned = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+        var sourceOrder = new List<string>();
         foreach (var row in rows)
         {
             string name = row[0] ?? string.Empty;
@@ -922,6 +1078,13 @@ public sealed partial class SqlServerCatalog
                 matched.Add(name);
             }
             owned[name] = row[5] is not null;
+            // ⚠ ORDER matters here and a Dictionary does not have it: the 'null'/'fill' projection declares
+            // the SOURCE's shape, so the source's own column order has to survive. The query orders by
+            // c.column_id for exactly this.
+            if (row[3] is { } ordered && !sourceOrder.Contains(ordered, StringComparer.OrdinalIgnoreCase))
+            {
+                sourceOrder.Add(ordered);
+            }
             if (row[3] is { } column)
             {
                 nullability[column] = row[4] != "0";
@@ -988,12 +1151,40 @@ public sealed partial class SqlServerCatalog
                               rows[0][2] ?? source, nullability, commitTimestamp, onSchemaChange, include,
                               images, tvf, startingPosition, endingPosition, startingTimestamp,
                               endingTimestamp);
-        if (!string.Equals(onSchemaChange, CdcChangesPlan.OnSchemaChangeResync, StringComparison.Ordinal))
+        int meta = CdcMetadataColumnCount(commitTimestamp, updateMask);
+        if (string.Equals(onSchemaChange, CdcChangesPlan.OnSchemaChangeResync, StringComparison.Ordinal))
         {
-            return plan;
+            return CdcMaybeResync(plan, instance, owned, nullability, commitTimestamp, images, meta);
         }
-        return CdcMaybeResync(plan, instance, owned, nullability, commitTimestamp, images,
-                              CdcMetadataColumnCount(commitTimestamp, updateMask));
+        if (string.Equals(onSchemaChange, CdcChangesPlan.OnSchemaChangeNull, StringComparison.Ordinal)
+            || string.Equals(onSchemaChange, CdcChangesPlan.OnSchemaChangeFill, StringComparison.Ordinal))
+        {
+            // ⚠ The SAME staleness question resync asks, and asked the same way: does the SOURCE have a
+            // column the capture instance does not? These two modes then PROJECT it rather than re-capturing
+            // it. When nothing is stale there is nothing to project, and the plan is the ordinary one — the
+            // in-window DDL check still runs, so a drift these modes cannot express is still refused.
+            var captured = new List<string>(plan.Output.FieldsList.Count - meta);
+            for (int i = meta; i < plan.Output.FieldsList.Count; i++)
+            {
+                captured.Add(plan.Output.FieldsList[i].Name);
+            }
+            var capturedSet = new HashSet<string>(captured, StringComparer.OrdinalIgnoreCase);
+            bool stale = false;
+            foreach (string column in sourceOrder)
+            {
+                if (!capturedSet.Contains(column))
+                {
+                    stale = true;
+                    break;
+                }
+            }
+            if (stale)
+            {
+                return CdcDeclareFilled(plan, instance, tvf, captured, nullability, sourceOrder,
+                                        commitTimestamp, images, onSchemaChange);
+            }
+        }
+        return plan;
     }
 
     /// <summary>
@@ -1132,6 +1323,224 @@ public sealed partial class SqlServerCatalog
         return new CdcChangesPlan(source, explicitInstance: null, commitTimestamp, onSchemaChange, include,
                                   images, new Schema(fields, metadata: null), startingPosition,
                                   endingPosition, startingTimestamp, endingTimestamp);
+    }
+
+    /// <summary>
+    /// <c>on_schema_change := 'null'</c> / <c>'fill'</c>: a source column the capture instance does not
+    /// capture is PROJECTED anyway — as NULL, or looked up from the live source by key.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>⚠⚠ ONE MECHANISM SERVES BOTH MODES, and it exists because of a MEASUREMENT.</b> An
+    /// uncaptured column has to appear in the statement with the SOURCE COLUMN'S TYPE, or the declared and
+    /// arrived schemas differ and the arrival check refuses every row. A bare <c>NULL</c> describes as
+    /// <c>int</c> (§19.3), and rendering the type by hand is the SQL type table this feature has twice
+    /// refused to build. MEASURED: a scalar subquery over the source carries the column's exact type —
+    /// <c>(SELECT TOP 0 f.s FROM dbo.t f)</c> describes as <c>varchar(37)</c>, <c>decimal(9,2)</c>,
+    /// <c>datetime2(3)</c> for the respective columns, where a bare NULL beside it gives <c>int</c>. So
+    /// <c>'null'</c> is <c>TOP 0</c> (matches nothing, always NULL) and <c>'fill'</c> is <c>TOP 1</c> with a
+    /// key predicate — the SAME expression shape, and neither needs a type name written down.</para>
+    /// <para><b>⚠⚠ WHAT <c>'fill'</c> COSTS, and §15.9 is why it was scheduled last.</b> It produces a TORN
+    /// ROW: the captured columns are as of the change's LSN, the filled column is as of NOW. And because the
+    /// column is not captured, NO LATER CHANGE EVENT EVER CORRECTS IT — this is not eventual consistency, it
+    /// is a value from a different instant that will never be revisited. It also adds a read of the LIVE
+    /// source table to what was a capture-layer-only read. A <c>delete</c> row fills NULL by construction:
+    /// the source row is gone, so there is nothing to look up, which is honest rather than a gap.</para>
+    /// <para><b>⚠ <c>'fill'</c> REFUSES WITHOUT A CAPTURED KEY</b>, and that is the case §15.9 predicted
+    /// would bite: the correlation needs the key columns to exist on BOTH sides, so a table with no primary
+    /// key and no unique index — a legitimate configuration — cannot be filled at all. Refusing names
+    /// <c>'null'</c>, which needs no key.</para>
+    /// <para>⚠ Both modes leave the CAPTURE INSTANCE alone. No DDL, no new instance, no snapshot — unlike
+    /// <c>'resync'</c>, which repairs the instance itself. That is the trade: these are cheap and reversible
+    /// and tell you less; resync is heavy and irreversible and tells you everything.</para>
+    /// <para>⚠ The declared column ORDER is the SOURCE's, not "captured then added". A consumer whose target
+    /// table matches the source can then keep using <c>SELECT *</c> across the drift, which is the entire
+    /// point of projecting the column at all.</para>
+    /// </remarks>
+    private CdcChangesPlan CdcDeclareFilled(CdcChangesPlan plan, string instance, string tvf,
+                                            IReadOnlyList<string> captured,
+                                            IReadOnlyDictionary<string, bool> nullability,
+                                            IReadOnlyList<string> sourceOrder,
+                                            bool commitTimestamp, string images, string mode)
+    {
+        bool updateMask = string.Equals(images, CdcChangesPlan.ImagesBoth, StringComparison.Ordinal);
+        string schema = plan.SourceSchema ?? "dbo";
+        string table = plan.SourceTable ?? plan.Source;
+        string qualified = Quote(schema) + "." + Quote(table);
+        var capturedSet = new HashSet<string>(captured, StringComparer.OrdinalIgnoreCase);
+        bool fill = string.Equals(mode, CdcChangesPlan.OnSchemaChangeFill, StringComparison.Ordinal);
+
+        IReadOnlyList<string> key = System.Array.Empty<string>();
+        if (fill)
+        {
+            key = CdcKeyColumns(schema, table);
+            var missing = new List<string>();
+            foreach (string k in key)
+            {
+                if (!capturedSet.Contains(k))
+                {
+                    missing.Add(k);
+                }
+            }
+            if (key.Count == 0 || missing.Count > 0)
+            {
+                throw new ArgumentException(
+                    $"cdc.changes: on_schema_change := 'fill' cannot fill '{plan.SourceName}' - "
+                    + (key.Count == 0
+                           ? "it has no primary key and no unique index, so there is no way to match a "
+                             + "change row back to the source row it came from"
+                           : "its key "
+                             + (missing.Count == 1 ? $"column '{missing[0]}' is" : "columns are")
+                             + " not captured, so the change rows carry nothing to match on")
+                    + ". Use on_schema_change := 'null' (which needs no key and reports the uncaptured "
+                    + "columns as NULL), 'error' (the default) to be told about the drift, or 'resync' to "
+                    + "re-capture the table so the columns are really there.");
+            }
+        }
+
+        // ⚠ The SELECT list is built in SOURCE order, taking each column from the TVF when it is captured
+        // and from a subquery when it is not.
+        var select = new System.Text.StringBuilder(CdcRealMetadataSelectList(commitTimestamp, updateMask));
+        var declaredOrder = new List<string>(sourceOrder.Count);
+        foreach (string column in sourceOrder)
+        {
+            declaredOrder.Add(column);
+            if (capturedSet.Contains(column))
+            {
+                select.Append(", c.").Append(Quote(column));
+                continue;
+            }
+            select.Append(", (SELECT TOP ").Append(fill ? '1' : '0').Append(" f.").Append(Quote(column))
+                  .Append(" FROM ").Append(qualified).Append(" AS f");
+            if (fill)
+            {
+                for (int i = 0; i < key.Count; i++)
+                {
+                    select.Append(i == 0 ? " WHERE f." : " AND f.").Append(Quote(key[i]))
+                          .Append(" = c.").Append(Quote(key[i]));
+                }
+            }
+            select.Append(") AS ").Append(Quote(column));
+        }
+        // ⚠ A column the INSTANCE captures but the SOURCE no longer has is appended at the end rather than
+        // dropped: it is real history the change table still answers for, and losing it silently would be
+        // the opposite of what these modes are for.
+        foreach (string column in captured)
+        {
+            if (!nullability.ContainsKey(column))
+            {
+                declaredOrder.Add(column);
+                select.Append(", c.").Append(Quote(column));
+            }
+        }
+
+        string body = " FROM " + tvf + "(@from_lsn, @to_lsn, @row_filter) AS c"
+                      + (commitTimestamp ? CdcCommitTimeJoinSql : string.Empty);
+        var described = DescribeQuery("SELECT " + select + body, CdcDescribeParameters());
+        if (described is null)
+        {
+            throw new InvalidOperationException(
+                $"cdc.changes: on_schema_change := '{mode}' could not describe the projected read of "
+                + $"'{plan.SourceName}'. The source table or one of its columns may have changed between "
+                + "this statement's two metadata reads; re-run it.");
+        }
+        int meta = CdcMetadataColumnCount(commitTimestamp, updateMask);
+        if (described.FieldsList.Count != meta + declaredOrder.Count)
+        {
+            throw new InvalidOperationException(
+                $"cdc.changes: the '{mode}' read of '{plan.SourceName}' described "
+                + $"{described.FieldsList.Count} columns where {meta + declaredOrder.Count} were composed. "
+                + "Change data capture may be mid-reconfiguration; re-run the statement.");
+        }
+        bool hasSnapshot = plan.HasSnapshot;
+        var fields = new List<Field>(described.FieldsList.Count + 1);
+        for (int i = 0; i < meta; i++)
+        {
+            var f = described.FieldsList[i];
+            fields.Add(new Field(f.Name, f.DataType,
+                                 nullable: CdcMetadataNullable(i, meta, commitTimestamp, updateMask,
+                                                               hasSnapshot)));
+        }
+        for (int i = meta; i < described.FieldsList.Count; i++)
+        {
+            var f = described.FieldsList[i];
+            // ⚠ EVERY projected column is NULLABLE here whatever sys.columns says, and it has to be: an
+            // uncaptured column is NULL on every row under 'null', and under 'fill' it is NULL for a delete
+            // (the source row is gone) and for any row whose key no longer exists. A NOT NULL claim would be
+            // one the data breaks on its first delete.
+            fields.Add(new Field(f.Name, f.DataType, nullable: true));
+        }
+        if (updateMask)
+        {
+            fields.Add(CdcChangedColumnsStream.DeclaredField());
+        }
+        string sql = "SELECT " + select + body
+                     + CdcCursorPredicateSql(CdcCursorShape(plan.Include, plan.StartingPosition),
+                                             plan.EndingPosition);
+        string? snapshotSql = null;
+        if (hasSnapshot)
+        {
+            CdcEnsureSnapshotColumnsExist(plan.Include, plan.SourceName, declaredOrder, nullability);
+            snapshotSql = CdcSnapshotSql(schema, table, declaredOrder, commitTimestamp, updateMask);
+        }
+        Log.LogDebug("cdc changes {Source} ({Instance}): on_schema_change = {Mode} - projecting {Count} "
+                     + "uncaptured source column(s)", plan.SourceName, instance, mode,
+                     declaredOrder.Count - captured.Count);
+        return new CdcChangesPlan(plan.Source, plan.ExplicitInstance, commitTimestamp, mode, plan.Include,
+                                  images, new Schema(fields, metadata: null), plan.StartingPosition,
+                                  plan.EndingPosition, plan.StartingTimestamp, plan.EndingTimestamp,
+                                  captureInstance: instance, sourceSchema: schema, sourceTable: table,
+                                  sql: sql, snapshotSql: snapshotSql,
+                                  // ⚠ The mask decodes against the CAPTURED set, not the projected one: an
+                                  // uncaptured column has no bit, and shifting the map by the projection
+                                  // would name the wrong columns.
+                                  maskColumns: updateMask
+                                      ? new Dictionary<string, IReadOnlyList<string>>(StringComparer.Ordinal)
+                                        {
+                                            [instance] = captured,
+                                        }
+                                      : null);
+    }
+
+    /// <summary>
+    /// The source table's key columns — the primary key, else the smallest unique index — which
+    /// <c>on_schema_change := 'fill'</c> correlates on.
+    /// </summary>
+    /// <remarks>
+    /// ⚠ The SOURCE's key, read from <c>sys.indexes</c>, not the index CDC recorded: §16.7 measured that the
+    /// all-tables form of <c>sp_cdc_help_change_data_capture</c> LEAKS the previous row's
+    /// <c>index_column_list</c> onto a row with no index, so that column is the wrong thing to correlate on.
+    /// ⚠ Empty when there is neither, which is a legitimate configuration and the caller is told so.
+    /// </remarks>
+    private IReadOnlyList<string> CdcKeyColumns(string schema, string table)
+    {
+        const string sql =
+            "SET NOCOUNT ON; " +
+            "SELECT TOP (1) WITH TIES CAST(c.name AS varchar(128)) AS column_name " +
+            "FROM sys.indexes AS i " +
+            "JOIN sys.index_columns AS ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id " +
+            "JOIN sys.columns AS c ON c.object_id = ic.object_id AND c.column_id = ic.column_id " +
+            "WHERE i.object_id = OBJECT_ID(QUOTENAME(@schema) + '.' + QUOTENAME(@table)) " +
+            "  AND (i.is_primary_key = 1 OR i.is_unique = 1) AND ic.is_included_column = 0 " +
+            // ⚠ The PK first, then the narrowest unique index: a narrower key is cheaper to correlate on and
+            // no less correct. WITH TIES over a per-index rank keeps every column of the ONE index chosen.
+            "ORDER BY DENSE_RANK() OVER (ORDER BY CASE WHEN i.is_primary_key = 1 THEN 0 ELSE 1 END, " +
+            "                            (SELECT COUNT(*) FROM sys.index_columns k " +
+            "                              WHERE k.object_id = i.object_id AND k.index_id = i.index_id " +
+            "                                AND k.is_included_column = 0), i.index_id);";
+        var rows = ReadMetadataRows(sql, 1, new[]
+        {
+            new SqlParameter("@schema", schema),
+            new SqlParameter("@table", table),
+        });
+        var key = new List<string>(rows.Count);
+        foreach (var row in rows)
+        {
+            if (row[0] is { } name)
+            {
+                key.Add(name);
+            }
+        }
+        return key;
     }
 
     /// <summary>
@@ -2244,6 +2653,16 @@ public sealed partial class SqlServerCatalog
         int count = int.TryParse(rows[0][0], System.Globalization.NumberStyles.Integer,
                                  System.Globalization.CultureInfo.InvariantCulture, out int n) ? n : 1;
         bool typeChange = rows[0][2] == "1";
+        if (plan.AbsorbsColumnSetChanges && !typeChange)
+        {
+            // ⚠ 'null'/'fill' EXPRESS a column-set change, so refusing here would make them useless — they
+            // would project the added column and then decline to return it. A TYPE change is a different
+            // matter and still falls through to the refusal below.
+            Log.LogDebug("cdc changes {Source} ({Instance}): {Count} column-set DDL(s) inside the window, "
+                         + "absorbed by on_schema_change = {Mode}", plan.SourceName, plan.CaptureInstance,
+                         count, plan.OnSchemaChange);
+            return;
+        }
         throw new InvalidOperationException(
             $"cdc.changes: {count} schema change{(count == 1 ? string.Empty : "s")} landed INSIDE this "
             + $"window on '{plan.SourceName}' - the columns this read declared may not describe all of it. "

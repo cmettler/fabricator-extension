@@ -281,6 +281,12 @@ internal sealed class CdcEnableFunction : ICatalogTableFunction
             () => _catalog.CdcEnableTable(schema, table, instance, columns, role, index, filegroup, net));
     }
 
+    /// <summary>A BLOB argument, or null when absent. Shared by the CDC log-inspection functions.</summary>
+    internal static byte[]? Blob(RecordBatch? args, int col) =>
+        args is null || col >= args.ColumnCount || args.Length == 0
+            ? null
+            : ArrowValueReader.ReadScalar(args.Column(col), 0) as byte[];
+
     internal static string? Str(RecordBatch? args, int col) =>
         args is null || col >= args.ColumnCount || args.Length == 0
             ? null

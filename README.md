@@ -851,6 +851,9 @@ with no message queue anywhere in it. They live in the catalog's `cdc` schema, s
 |---|---|
 | `db.cdc.tables()` | one row per capture **instance** — `source_schema`, `source_table`, `capture_instance`, `start_lsn`, `end_lsn`, `supports_net_changes`, `has_drop_pending`, `role_name`, `index_name`, `filegroup_name`, `create_date`, `index_column_list`, `captured_column_list`, `fabricator_source` (non-NULL ⇒ this extension created the instance) |
 | `db.cdc.max_position()` | the current log position (`sys.fn_cdc_get_max_lsn`) as a `BLOB`, or `NULL` |
+| `db.cdc.inc_position(<10-byte LSN>)` / `db.cdc.dec_position(<10-byte LSN>)` | the next / previous representable LSN (`sys.fn_cdc_increment_lsn` / `_decrement_lsn`). `NULL` in, `NULL` out. ⚠ Both **refuse at the ends of the range** where SQL Server's own functions wrap silently to the opposite end, and refuse a 21-byte `_position` — stepping a row's LSN would skip the other rows at that LSN, and `starting_position` is already exclusive at full granularity |
+| `db.cdc.ddl_history([source :=] [, starting_position :=] [, ending_position :=])` | the recorded DDL against captured tables, resolved to `source_schema` / `source_table` / `capture_instance` and bounded by LSN. `required_column_update` is true for exactly an `ALTER COLUMN <type>`. ⚠ One row per (DDL × capture instance) — a table with two instances records each DDL twice — and read `WITH (NOLOCK)` |
+| `db.cdc.lsn_time_mapping([starting_position :=] [, ending_position :=])` | the LSN ↔ time bridge, one row per captured transaction, database-wide. ⚠ `tran_end_time` is a `datetime` (~3.33 ms); `start_lsn` is the ordering key. Read `WITH (NOLOCK)` |
 | `db.cdc.min_position('<capture instance>' \| '<schema>.<table>')` | the **retention floor** (`sys.fn_cdc_get_min_lsn`) as a `BLOB`, or `NULL`. For a table with two capture instances, the floor of the range `cdc.changes` can read — i.e. the older instance's |
 | `db.cdc.enable_database()` | `sys.sp_cdc_enable_db` — idempotent |
 | `db.cdc.enable('<schema>.<table>' [, capture_instance :=] [, columns :=] [, role :=] [, index :=] [, filegroup :=] [, net :=])` | `sys.sp_cdc_enable_table`. With no `capture_instance` it generates one (`fab_…`) and is idempotent **per table**; with one, per instance |
@@ -941,7 +944,7 @@ FROM db.cdc.changes('dbo.orders'                    -- a <schema>.<table> or a c
       [, images            := 'after']              -- 'after' (default) | 'both'
       [, commit_timestamp  := false]                -- opt-in, see below
       [, enable            := false]                -- capture the table on first read
-      [, on_schema_change  := 'error']              -- 'error' (default) | 'ignore' | 'resync'
+      [, on_schema_change  := 'error']              -- 'error' (default) | 'ignore' | 'resync' | 'null' | 'fill'
       [, include           := 'changes'])           -- 'changes' (default) | 'snapshot' | 'snapshot+changes'
 ```
 
@@ -1143,9 +1146,16 @@ this handoff give unconditionally. Stop the capture job (`sys.sp_cdc_stop_job`) 
 > the reader; if you do take the baseline alone, fall back to `db.cdc.max_position()` taken **before** the
 > read, which is at worst a small replay and never a skip.
 
-- **Not built** (`docs/mssql-cdc.md` §15.9 records why they are last): `on_schema_change := 'fill'` and
-  `'null'`, both of which assert something about a column that was never captured. They are refused by name
-  rather than treated as typos.
+- **`on_schema_change := 'null'` and `'fill'` answer the added-column drift instead of refusing it.**
+  `'null'` projects the uncaptured column with the source column's type and `NULL` on every row — decidable,
+  because `_capture_instance` says which instance produced the row. `'fill'` looks the value up from the
+  **live source** by key.
+  ⚠⚠ **`'fill'` produces a torn row and this is not a rough edge, it is what the mode is.** The captured
+  columns are as of the change's LSN; the filled column is as of **now** — and since that column is not
+  captured, **no later change event will ever correct it**. A `delete` row fills `NULL`, because the source
+  row is gone. It also needs a key: with no primary key and no unique index there is nothing to correlate
+  on, and it refuses (use `'null'`, which needs no key). Both modes leave the capture instance alone — use
+  `'resync'` if you want the columns genuinely captured from now on.
 
 ### `db.dbo.fabricator_session_tag(key, value) -> TABLE` (SQL Server / Fabric)
 

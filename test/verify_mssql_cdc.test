@@ -84,7 +84,7 @@ statement ok
 SELECT fabricator_exec('${MSSQL_TESTDB_DSN}', 'IF OBJECT_ID(''dbo.cdc_zz_noidx'') IS NOT NULL DROP TABLE dbo.cdc_zz_noidx;');
 
 statement ok
-SELECT fabricator_exec('${MSSQL_TESTDB_DSN}', 'IF OBJECT_ID(''dbo.cdc_snap'') IS NOT NULL DROP TABLE dbo.cdc_snap; IF OBJECT_ID(''dbo.cdc_seed'') IS NOT NULL DROP TABLE dbo.cdc_seed; IF OBJECT_ID(''dbo.cdc_void'') IS NOT NULL DROP TABLE dbo.cdc_void; IF OBJECT_ID(''dbo.cdc_img'') IS NOT NULL DROP TABLE dbo.cdc_img; IF OBJECT_ID(''dbo.cdc_when'') IS NOT NULL DROP TABLE dbo.cdc_when; IF OBJECT_ID(''dbo.cdc_rs'') IS NOT NULL DROP TABLE dbo.cdc_rs; IF OBJECT_ID(''dbo.cdc_rsx'') IS NOT NULL DROP TABLE dbo.cdc_rsx;');
+SELECT fabricator_exec('${MSSQL_TESTDB_DSN}', 'IF OBJECT_ID(''dbo.cdc_snap'') IS NOT NULL DROP TABLE dbo.cdc_snap; IF OBJECT_ID(''dbo.cdc_seed'') IS NOT NULL DROP TABLE dbo.cdc_seed; IF OBJECT_ID(''dbo.cdc_void'') IS NOT NULL DROP TABLE dbo.cdc_void; IF OBJECT_ID(''dbo.cdc_img'') IS NOT NULL DROP TABLE dbo.cdc_img; IF OBJECT_ID(''dbo.cdc_when'') IS NOT NULL DROP TABLE dbo.cdc_when; IF OBJECT_ID(''dbo.cdc_rs'') IS NOT NULL DROP TABLE dbo.cdc_rs; IF OBJECT_ID(''dbo.cdc_rsx'') IS NOT NULL DROP TABLE dbo.cdc_rsx; IF OBJECT_ID(''dbo.cdc_lg'') IS NOT NULL DROP TABLE dbo.cdc_lg; IF OBJECT_ID(''dbo.cdc_fn'') IS NOT NULL DROP TABLE dbo.cdc_fn; IF OBJECT_ID(''dbo.cdc_nk'') IS NOT NULL DROP TABLE dbo.cdc_nk;');
 
 statement ok
 SELECT fabricator_exec('${MSSQL_TESTDB_DSN}', 'IF OBJECT_ID(''dbo.cdc_gen'') IS NOT NULL DROP TABLE dbo.cdc_gen; IF OBJECT_ID(''dbo.cdc_own'') IS NOT NULL DROP TABLE dbo.cdc_own; IF OBJECT_ID(''dbo.cdc_auto'') IS NOT NULL DROP TABLE dbo.cdc_auto; IF OBJECT_ID(''dbo.cdc_ddl'') IS NOT NULL DROP TABLE dbo.cdc_ddl; IF OBJECT_ID(''dbo.gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg'') IS NOT NULL DROP TABLE dbo.gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg;');
@@ -1142,13 +1142,18 @@ EXECUTE cdc_after_ddl(getvariable('cdc_ddl_end'));
 # free to evaluate the second scalar subquery BEFORE the first, so the instance count could be read before
 # the resync's DDL ran. Two subqueries in one statement do not pin an order; §32 splits them.
 
-# The modes that are DESIGNED but not built are still refused BY NAME, so a reader of the design note is told
-# which one they are waiting for rather than being told their spelling is wrong.
-statement error
-SELECT count(*) FROM c1.cdc.changes('dbo.cdc_ddl', on_schema_change := 'fill');
+# ⚠ EVERY on_schema_change mode is implemented now, so what used to be a "designed but not built" refusal
+# here is an assertion instead — and `dbo.cdc_ddl` is the right table for it, because its `extra` column was
+# ADDED and never dropped, so it is genuinely stale. 'fill' projects that column and looks it up from the
+# live source; the section's own subject (the in-window DDL check) is unaffected, because a column-set DDL
+# is exactly what 'fill' absorbs.
+query I
+SELECT count(*) FROM (DESCRIBE SELECT * FROM c1.cdc.changes('dbo.cdc_ddl', on_schema_change := 'fill'))
+WHERE column_name = 'extra';
 ----
-designed but not implemented yet
+1
 
+# An unknown value is still refused, naming the five that exist rather than the caller's spelling.
 statement error
 SELECT count(*) FROM c1.cdc.changes('dbo.cdc_ddl', on_schema_change := 'nonsense');
 ----
@@ -2315,17 +2320,262 @@ SELECT count(*) FROM c1.cdc.tables() WHERE source_table = 'cdc_when';
 ----
 1
 
-# The mode is case-insensitive and the ones that remain designed-but-unbuilt are still named rather than
-# called invalid.
-statement error
+# ⚠ 'fill' is implemented (§35) and it is a NO-OP here, because dbo.cdc_when's captured set still matches
+# its source — there is nothing to project. That is the assertion, not an accident: these modes only act on
+# a table that has actually drifted.
+query I
 SELECT count(*) FROM c1.cdc.changes('dbo.cdc_when', on_schema_change := 'fill');
 ----
-designed but not implemented yet
+3
 
+# An unknown value is refused, naming the five modes that exist rather than the caller's spelling.
 statement error
 SELECT count(*) FROM c1.cdc.changes('dbo.cdc_when', on_schema_change := 'nonsense');
 ----
 is not a value
+
+
+# ═══ §33  inc_position / dec_position — LSN ±1, and the wrap SQL Server does silently ══════════════════
+# docs §25. sys.fn_cdc_increment_lsn / decrement_lsn, computed in C# because a scalar runs per BATCH and a
+# round trip there would put a server call on every chunk of every query that uses one.
+
+# ⚠⚠ THE AGREEMENT IS THE ASSERTION: ours beside SQL Server's own, in one statement, across a plain step, a
+# byte carry, a multi-byte carry and a borrow. Without this the C# arithmetic is just a plausible story
+# about big-endian bytes.
+query TTTT
+WITH ours(lbl, inc, dec) AS (
+  SELECT lbl, hex(c1.cdc.inc_position(p)), hex(c1.cdc.dec_position(p)) FROM (VALUES
+    ('a_plain',       '\x00\x00\x00\x2C\x00\x00\x0C\xC0\x00\x40'::BLOB),
+    ('b_byte_carry',  '\x00\x00\x00\x2C\x00\x00\x0C\xC0\x00\xFF'::BLOB),
+    ('c_multi_carry', '\x00\x00\x00\x2C\x00\x00\x0C\xFF\xFF\xFF'::BLOB),
+    ('d_borrow',      '\x00\x00\x00\x2C\x00\x00\x0D\x00\x00\x00'::BLOB)) t(lbl, p)),
+srv AS (SELECT * FROM fabricator_query('c1', '
+  SELECT lbl, CONVERT(varchar(30), sys.fn_cdc_increment_lsn(p), 2) AS sinc,
+              CONVERT(varchar(30), sys.fn_cdc_decrement_lsn(p), 2) AS sdec
+  FROM (VALUES (''a_plain'',       0x0000002C00000CC00040),
+               (''b_byte_carry'',  0x0000002C00000CC000FF),
+               (''c_multi_carry'', 0x0000002C00000CFFFFFF),
+               (''d_borrow'',      0x0000002C00000D000000)) v(lbl, p)'))
+SELECT ours.lbl, ours.inc, CAST(ours.inc = srv.sinc AS VARCHAR) AS inc_matches_server,
+       CAST(ours.dec = srv.sdec AS VARCHAR) AS dec_matches_server
+FROM ours JOIN srv ON srv.lbl = ours.lbl ORDER BY ours.lbl;
+----
+a_plain	0000002C00000CC00041	true	true
+b_byte_carry	0000002C00000CC00100	true	true
+c_multi_carry	0000002C00000D000000	true	true
+d_borrow	0000002C00000D000001	true	true
+
+# NULL in, NULL out — matching the SQL functions and this surface's "an absent bound is a state" convention.
+query II
+SELECT c1.cdc.inc_position(NULL) IS NULL, c1.cdc.dec_position(NULL) IS NULL;
+----
+true	true
+
+# ⚠⚠ THE WRAPS ARE REFUSED, and this is the whole reason these are not one-line pass-throughs. MEASURED:
+# fn_cdc_decrement_lsn(0) answers 0xFF…FF and fn_cdc_increment_lsn(0xFF…FF) answers 0 — the OPPOSITE END of
+# the range. As a window bound that is not a neighbouring position, and the zero LSN is additionally what
+# fn_cdc_get_min_lsn answers for a capture instance that does not exist (§19), so it would surface as an
+# entirely unrelated diagnostic three steps later.
+statement error
+SELECT c1.cdc.dec_position('\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'::BLOB);
+----
+LOWEST representable
+
+statement error
+SELECT c1.cdc.inc_position('\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF'::BLOB);
+----
+HIGHEST representable
+
+# ⚠⚠ A 21-BYTE _position IS REFUSED, and it is the sharp edge of the pair: stepping the LSN of a row's
+# position moves PAST the other rows at that same LSN, so using the result as a lower bound would skip them
+# SILENTLY. starting_position is already exclusive at full granularity, so it is also unnecessary.
+statement error
+SELECT c1.cdc.inc_position(c1.cdc.max_position() || '\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'::BLOB);
+----
+21-byte _position is not accepted
+
+# ⚠ CONSISTENT, not VOLATILE — so a call over constant arguments FOLDS at plan time, which is what makes it
+# usable as a table-function argument at all (those must be constant). This is the assertion for that: the
+# call sits in an argument position and binds.
+query I
+SELECT count(*) >= 0 FROM c1.cdc.changes('dbo.cdc_when',
+  starting_position := c1.cdc.dec_position(c1.cdc.max_position()));
+----
+true
+
+# ═══ §34  ddl_history() / lsn_time_mapping() — the CDC log, resolved and bounded ════════════════════════
+# docs §26. Both tables are already reachable through the ATTACH; these add the three things a raw read
+# makes a caller do by hand — resolving ids to names, bounding by an LSN window with the READER's
+# exclusivity, and reading WITH (NOLOCK) so a diagnostic neither blocks the capture job nor waits on it.
+
+statement ok
+SELECT fabricator_exec('c1', 'IF OBJECT_ID(''dbo.cdc_lg'') IS NOT NULL DROP TABLE dbo.cdc_lg; CREATE TABLE dbo.cdc_lg(id INT NOT NULL PRIMARY KEY, v INT NULL);');
+
+statement ok
+SELECT target, changed FROM c1.cdc.enable('dbo.cdc_lg', capture_instance := 'lg_v1');
+
+statement ok
+SELECT fabricator_exec('c1', 'DECLARE @i int = 0; WHILE @i < 60 AND sys.fn_cdc_get_min_lsn(''lg_v1'') IS NULL BEGIN WAITFOR DELAY ''00:00:01''; SET @i = @i + 1; END');
+
+statement ok
+SELECT fabricator_exec('c1', 'ALTER TABLE dbo.cdc_lg ADD extra INT NULL;');
+
+statement ok
+SELECT fabricator_exec('c1', 'ALTER TABLE dbo.cdc_lg ALTER COLUMN v BIGINT;');
+
+statement ok
+SELECT fabricator_exec('c1', 'DECLARE @i int = 0; WHILE @i < 60 AND (SELECT COUNT(*) FROM cdc.ddl_history h JOIN cdc.change_tables ct ON ct.object_id = h.object_id WHERE ct.capture_instance = ''lg_v1'') < 2 BEGIN WAITFOR DELAY ''00:00:01''; SET @i = @i + 1; END');
+
+# ⚠ The raw table carries only object ids; these are resolved. And required_column_update discriminates
+# exactly the ALTER COLUMN <type> — the ONE kind the capture job propagates to the change table (§18.3) —
+# from an ADD, which it does not. Both rows are asserted so neither value can pass by being constant.
+query TTTT
+SELECT source_schema, source_table, CAST(required_column_update AS VARCHAR), ddl_command
+FROM c1.cdc.ddl_history(source := 'dbo.cdc_lg') ORDER BY ddl_lsn;
+----
+dbo	cdc_lg	false	ALTER TABLE dbo.cdc_lg ADD extra INT NULL
+dbo	cdc_lg	true	ALTER TABLE dbo.cdc_lg ALTER COLUMN v BIGINT
+
+# ⚠ The bound is the READER'S — starting_position EXCLUSIVE — so the same cursor answers "which DDLs are in
+# the window I am about to read". Nothing is above the current watermark, which is the bounded control.
+query II
+SELECT (SELECT count(*) FROM c1.cdc.ddl_history(source := 'dbo.cdc_lg')) AS unbounded,
+       (SELECT count(*) FROM c1.cdc.ddl_history(source := 'dbo.cdc_lg',
+                                                starting_position := c1.cdc.max_position())) AS after_now;
+----
+2	0
+
+# The source filter matches a capture INSTANCE name as well as a schema.table, like every other source
+# argument on this surface.
+query I
+SELECT count(*) FROM c1.cdc.ddl_history(source := 'lg_v1');
+----
+2
+
+# lsn_time_mapping: the LSN <-> time bridge, one row per captured transaction, DATABASE-wide.
+query III
+SELECT count(*) > 0 AS has_rows, count(*) = count(start_lsn) AS every_row_has_an_lsn,
+       count(tran_end_time) > 0 AS has_times
+FROM c1.cdc.lsn_time_mapping();
+----
+true	true	true
+
+# ⚠ Bounded the same way. `> max_position()` is empty by construction — nothing is captured above the
+# watermark — and the unbounded count beside it is what stops that passing on an always-empty function.
+query II
+SELECT (SELECT count(*) > 0 FROM c1.cdc.lsn_time_mapping()) AS unbounded_has_rows,
+       (SELECT count(*) FROM c1.cdc.lsn_time_mapping(starting_position := c1.cdc.max_position()))
+         AS above_watermark;
+----
+true	0
+
+# ═══ §35  on_schema_change := 'null' / 'fill' — projecting a column that was never captured ═════════════
+# docs §27, and §15.9 for why these were scheduled last. Both answer the ADDED-column drift instead of
+# refusing it: 'null' reports the column as NULL, 'fill' looks it up from the LIVE source by key.
+
+statement ok
+SELECT fabricator_exec('c1', 'IF OBJECT_ID(''dbo.cdc_fn'') IS NOT NULL DROP TABLE dbo.cdc_fn; CREATE TABLE dbo.cdc_fn(id INT NOT NULL PRIMARY KEY, v INT NULL);');
+
+statement ok
+SELECT target, changed FROM c1.cdc.enable('dbo.cdc_fn', capture_instance := 'fn_v1');
+
+statement ok
+SELECT fabricator_exec('c1', 'DECLARE @i int = 0; WHILE @i < 60 AND sys.fn_cdc_get_min_lsn(''fn_v1'') IS NULL BEGIN WAITFOR DELAY ''00:00:01''; SET @i = @i + 1; END');
+
+statement ok
+SELECT fabricator_exec('c1', 'INSERT INTO dbo.cdc_fn (id, v) VALUES (1, 10), (2, 20); UPDATE dbo.cdc_fn SET v = 99 WHERE id = 1; DELETE FROM dbo.cdc_fn WHERE id = 2;');
+
+statement ok
+SELECT fabricator_exec('c1', 'ALTER TABLE dbo.cdc_fn ADD region VARCHAR(10) NULL;');
+
+statement ok
+SELECT fabricator_exec('c1', 'UPDATE dbo.cdc_fn SET region = ''eu'';');
+
+statement ok
+SELECT fabricator_exec('c1', 'DECLARE @i int = 0; WHILE @i < 60 AND ((SELECT COUNT(*) FROM cdc.fn_v1_CT) < 4 OR sys.fn_cdc_get_max_lsn() IS NULL OR sys.fn_cdc_get_max_lsn() < (SELECT MAX(__$start_lsn) FROM cdc.fn_v1_CT)) BEGIN WAITFOR DELAY ''00:00:01''; SET @i = @i + 1; END');
+
+# ⚠⚠ THE THREE SHAPES SIDE BY SIDE, which is what makes each one mean something. Under 'ignore' the column
+# is ABSENT — it was never captured, so the read simply omits it and a pipeline loses a field with nothing
+# failing, which is the failure this whole option exists for.
+query III
+SELECT (SELECT count(*) FROM (DESCRIBE SELECT * FROM c1.cdc.changes('dbo.cdc_fn', on_schema_change := 'ignore')) WHERE column_name = 'region') AS ignore_has,
+       (SELECT count(*) FROM (DESCRIBE SELECT * FROM c1.cdc.changes('dbo.cdc_fn', on_schema_change := 'null')) WHERE column_name = 'region') AS null_has,
+       (SELECT count(*) FROM (DESCRIBE SELECT * FROM c1.cdc.changes('dbo.cdc_fn', on_schema_change := 'fill')) WHERE column_name = 'region') AS fill_has;
+----
+0	1	1
+
+# ⚠⚠ THE TYPE IS THE SOURCE COLUMN'S, and that is the measurement the whole implementation rests on: a bare
+# NULL describes as `int`, so the declared and arrived schemas would differ and the arrival check would
+# refuse every row. It comes from a TOP 0 scalar subquery over the source, which carries the column's exact
+# type without a SQL type name being written down anywhere.
+query TT
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM c1.cdc.changes('dbo.cdc_fn', on_schema_change := 'null'))
+WHERE column_name = 'region';
+----
+region	VARCHAR
+
+query TTTT
+SELECT _change_type, id, v, coalesce(region, '<null>') FROM c1.cdc.changes('dbo.cdc_fn', on_schema_change := 'null') ORDER BY _position;
+----
+insert	1	10	<null>
+insert	2	20	<null>
+update_postimage	1	99	<null>
+delete	2	20	<null>
+
+# ⚠⚠ 'fill' AND ITS COST IN ONE RESULT. Row id=1 still exists on the source, so `region` fills with 'eu' —
+# INCLUDING on its `insert` row, where the column did not exist yet and its value at that instant was
+# nothing at all. That is §15.9's TORN ROW, and it is asserted rather than described because a reader of the
+# docs deserves to see it. Row id=2 was DELETED, so there is no source row to look up and it fills NULL:
+# honest, and not a gap.
+query TTTT
+SELECT _change_type, id, v, coalesce(region, '<null>') FROM c1.cdc.changes('dbo.cdc_fn', on_schema_change := 'fill') ORDER BY _position;
+----
+insert	1	10	eu
+insert	2	20	<null>
+update_postimage	1	99	eu
+delete	2	20	<null>
+
+# ⚠ A column-set DDL inside the window is ABSORBED by these two modes — without that they would project the
+# column and then refuse to return it, which is exactly what happened the first time they ran. A window
+# containing this ADD is refused under the default and read under 'null'.
+statement error
+SELECT count(*) FROM c1.cdc.changes('dbo.cdc_fn');
+----
+schema change
+
+# ⚠⚠ 'fill' NEEDS A CAPTURED KEY, and §15.9 predicted this would bite exactly the tables that most need
+# help: no primary key and no unique index is a legitimate configuration, and then there is nothing to
+# correlate a change row back to its source row with. 'null' still works there, which is what the refusal
+# points at.
+statement ok
+SELECT fabricator_exec('c1', 'IF OBJECT_ID(''dbo.cdc_nk'') IS NOT NULL DROP TABLE dbo.cdc_nk; CREATE TABLE dbo.cdc_nk(id INT NULL, v INT NULL);');
+
+statement ok
+SELECT target, changed FROM c1.cdc.enable('dbo.cdc_nk', capture_instance := 'nk_v1');
+
+statement ok
+SELECT fabricator_exec('c1', 'ALTER TABLE dbo.cdc_nk ADD region VARCHAR(10) NULL;');
+
+statement error
+SELECT count(*) FROM c1.cdc.changes('dbo.cdc_nk', on_schema_change := 'fill');
+----
+no primary key and no unique index
+
+# …and the control: the same table under 'null' binds, because 'null' needs no key at all.
+query I
+SELECT count(*) FROM (DESCRIBE SELECT * FROM c1.cdc.changes('dbo.cdc_nk', on_schema_change := 'null'))
+WHERE column_name = 'region';
+----
+1
+
+# Nothing stale ⇒ nothing projected: the modes are no-ops on a table whose captured set still matches its
+# source, which is the assertion that stops them being unconditional. Asserted as an EQUALITY against the
+# ignore shape rather than as a literal count, so it cannot drift with the fixture's column list.
+query I
+SELECT (SELECT count(*) FROM (DESCRIBE SELECT * FROM c1.cdc.changes('dbo.cdc_when', on_schema_change := 'null')))
+     = (SELECT count(*) FROM (DESCRIBE SELECT * FROM c1.cdc.changes('dbo.cdc_when', on_schema_change := 'ignore')));
+----
+true
 
 # ═══ §9  Teardown — leave NO CDC-enabled table behind ══════════════════════════════════════════════════
 # Load-bearing: the capture job keeps scanning a CDC-enabled database between runs, and the next run's §3
@@ -2345,7 +2595,7 @@ statement ok
 SELECT fabricator_exec('c1', 'IF OBJECT_ID(''dbo.cdc_zz_noidx'') IS NOT NULL DROP TABLE dbo.cdc_zz_noidx;');
 
 statement ok
-SELECT fabricator_exec('c1', 'IF OBJECT_ID(''dbo.cdc_span'') IS NOT NULL DROP TABLE dbo.cdc_span; IF OBJECT_ID(''dbo.cdc_conf'') IS NOT NULL DROP TABLE dbo.cdc_conf; IF OBJECT_ID(''dbo.cdc_snap'') IS NOT NULL DROP TABLE dbo.cdc_snap; IF OBJECT_ID(''dbo.cdc_seed'') IS NOT NULL DROP TABLE dbo.cdc_seed; IF OBJECT_ID(''dbo.cdc_void'') IS NOT NULL DROP TABLE dbo.cdc_void; IF OBJECT_ID(''dbo.cdc_img'') IS NOT NULL DROP TABLE dbo.cdc_img; IF OBJECT_ID(''dbo.cdc_when'') IS NOT NULL DROP TABLE dbo.cdc_when; IF OBJECT_ID(''dbo.cdc_rs'') IS NOT NULL DROP TABLE dbo.cdc_rs; IF OBJECT_ID(''dbo.cdc_rsx'') IS NOT NULL DROP TABLE dbo.cdc_rsx;');
+SELECT fabricator_exec('c1', 'IF OBJECT_ID(''dbo.cdc_span'') IS NOT NULL DROP TABLE dbo.cdc_span; IF OBJECT_ID(''dbo.cdc_conf'') IS NOT NULL DROP TABLE dbo.cdc_conf; IF OBJECT_ID(''dbo.cdc_snap'') IS NOT NULL DROP TABLE dbo.cdc_snap; IF OBJECT_ID(''dbo.cdc_seed'') IS NOT NULL DROP TABLE dbo.cdc_seed; IF OBJECT_ID(''dbo.cdc_void'') IS NOT NULL DROP TABLE dbo.cdc_void; IF OBJECT_ID(''dbo.cdc_img'') IS NOT NULL DROP TABLE dbo.cdc_img; IF OBJECT_ID(''dbo.cdc_when'') IS NOT NULL DROP TABLE dbo.cdc_when; IF OBJECT_ID(''dbo.cdc_rs'') IS NOT NULL DROP TABLE dbo.cdc_rs; IF OBJECT_ID(''dbo.cdc_rsx'') IS NOT NULL DROP TABLE dbo.cdc_rsx; IF OBJECT_ID(''dbo.cdc_lg'') IS NOT NULL DROP TABLE dbo.cdc_lg; IF OBJECT_ID(''dbo.cdc_fn'') IS NOT NULL DROP TABLE dbo.cdc_fn; IF OBJECT_ID(''dbo.cdc_nk'') IS NOT NULL DROP TABLE dbo.cdc_nk;');
 
 statement ok
 SELECT fabricator_exec('c1', 'IF OBJECT_ID(''dbo.cdc_gen'') IS NOT NULL DROP TABLE dbo.cdc_gen; IF OBJECT_ID(''dbo.cdc_own'') IS NOT NULL DROP TABLE dbo.cdc_own; IF OBJECT_ID(''dbo.cdc_auto'') IS NOT NULL DROP TABLE dbo.cdc_auto; IF OBJECT_ID(''dbo.cdc_ddl'') IS NOT NULL DROP TABLE dbo.cdc_ddl; IF OBJECT_ID(''dbo.gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg'') IS NOT NULL DROP TABLE dbo.gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg;');

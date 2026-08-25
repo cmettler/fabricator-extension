@@ -260,6 +260,8 @@ internal sealed class CdcChangesFunction : ICatalogTableFunction
                      CdcChangesPlan.OnSchemaChangeError,
                      CdcChangesPlan.OnSchemaChangeIgnore,
                      CdcChangesPlan.OnSchemaChangeResync,
+                     CdcChangesPlan.OnSchemaChangeNull,
+                     CdcChangesPlan.OnSchemaChangeFill,
                  })
         {
             if (string.Equals(mode, known, StringComparison.OrdinalIgnoreCase))
@@ -267,17 +269,13 @@ internal sealed class CdcChangesFunction : ICatalogTableFunction
                 return known;
             }
         }
-        bool designed = string.Equals(mode, "fill", StringComparison.OrdinalIgnoreCase)
-                        || string.Equals(mode, "null", StringComparison.OrdinalIgnoreCase);
+        const bool designed = false;
+        _ = designed;
         throw new ArgumentException(
-            designed
-                ? $"cdc.changes: on_schema_change := '{mode}' is designed but not implemented yet - this "
-                  + "release offers 'error' (refuse when a DDL landed inside the window, the default), "
-                  + "'ignore' (read anyway) and 'resync' (re-capture and re-baseline when the capture "
-                  + "instance no longer matches the source). 'fill' and 'null' both assert something about a "
-                  + "column that was never captured, which is why they are last."
-                : $"cdc.changes: on_schema_change := '{mode}' is not a value - this release accepts 'error' "
-                  + "(the default), 'ignore' and 'resync'.");
+            $"cdc.changes: on_schema_change := '{mode}' is not a value - it accepts 'error' (refuse when a "
+            + "DDL landed inside the window - the default), 'ignore' (read anyway), 'resync' (re-capture and "
+            + "re-baseline), 'null' (project an uncaptured column as NULL) and 'fill' (look it up from the "
+            + "live source by key).");
     }
 
     /// <summary>
@@ -413,6 +411,23 @@ internal sealed class CdcChangesPlan
     /// with no gap.</para>
     /// </remarks>
     internal const string OnSchemaChangeResync = "resync";
+
+    /// <summary>Project an uncaptured source column as NULL — §15.9's "floor": honest, decidable, never silent.</summary>
+    /// <remarks>
+    /// ⚠ It is decidable ONLY because <c>_capture_instance</c> is on every row: the NULL says "this
+    /// instance did not capture this column", which a consumer can tell from a genuine NULL by asking
+    /// which instance produced the row. Without that column §15.8 would have refused the whole idea.
+    /// </remarks>
+    internal const string OnSchemaChangeNull = "null";
+
+    /// <summary>Look an uncaptured column up from the LIVE source by key — a TORN ROW, by design.</summary>
+    /// <remarks>
+    /// <b>⚠⚠ THE VALUE IS AS OF NOW, NOT AS OF THE CHANGE, AND NO LATER EVENT EVER CORRECTS IT</b>
+    /// (§15.9). The column is not captured, so nothing will ever emit a change for it. This is not
+    /// eventual consistency; it is a value from a different instant, permanently. It also needs a key
+    /// and adds a read of the live source to a read that was capture-layer-only.
+    /// </remarks>
+    internal const string OnSchemaChangeFill = "fill";
 
     /// <summary>The TVF's <c>@row_filter_option</c> for <see cref="ImagesAfter"/>. Excludes op 3 for free.</summary>
     internal const string RowFilterAll = "all";
@@ -553,6 +568,28 @@ internal sealed class CdcChangesPlan
     /// </remarks>
     internal bool ChecksSchemaDrift =>
         !string.Equals(OnSchemaChange, OnSchemaChangeIgnore, StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Whether this read EXPRESSES a change to the captured column SET, so the in-window check need only
+    /// refuse for a drift it cannot express.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>⚠⚠ WITHOUT THIS, <c>'null'</c> AND <c>'fill'</c> ARE USELESS — they project the added column
+    /// and then the drift check refuses the read anyway.</b> Measured the moment they first ran: the
+    /// declaration was correct, <c>region</c> was there and typed, and the statement failed with "1 schema
+    /// change landed INSIDE this window". The check keys on <c>OnSchemaChange != 'ignore'</c>, which was
+    /// right while every mode either refused or ignored, and stopped being right the moment a mode ANSWERED
+    /// the drift instead.</para>
+    /// <para><b>⚠ It absorbs a column-SET change and nothing else.</b> <c>required_column_update = 1</c> — a
+    /// captured column's TYPE changed — is still refused, because the projection says nothing about it: the
+    /// declared type came from a describe taken BEFORE the capture job propagated the change, and §15.13
+    /// records that window as the single most useful unmeasured number in this feature. An ADD and a DROP
+    /// are both expressed (the added column is projected; a dropped one is appended from the change table,
+    /// which still answers for it), so both are absorbed.</para>
+    /// </remarks>
+    internal bool AbsorbsColumnSetChanges =>
+        string.Equals(OnSchemaChange, OnSchemaChangeNull, StringComparison.Ordinal)
+        || string.Equals(OnSchemaChange, OnSchemaChangeFill, StringComparison.Ordinal);
 
     /// <summary>
     /// The capture instance a <c>resync</c> is superseding — null unless this bind decided to resync.

@@ -71,8 +71,12 @@ internal static class SqlServerCdcFunctions
     {
         scalars.Add(new CdcPositionFunction(catalog));
         scalars.Add(new CdcMinPositionFunction(catalog));
+        scalars.Add(new CdcIncPositionFunction());
+        scalars.Add(new CdcDecPositionFunction());
         tables.Add(new CdcTablesFunction(catalog));
         tables.Add(new CdcHealthFunction(catalog));
+        tables.Add(new CdcDdlHistoryFunction(catalog));
+        tables.Add(new CdcLsnTimeMappingFunction(catalog));
         tables.Add(new CdcChangesFunction(catalog));
         SqlServerCdcSetup.Register(tables, catalog);
     }

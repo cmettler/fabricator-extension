@@ -7,11 +7,11 @@
 > two more — §3.4's cursor idiom does not run as printed, and §15.7's "the first call always returns zero
 > rows" is false in an already-capturing database.
 >
-> **EVERY SLICE ON §15.12's LIST IS BUILT.** The two-instance boundary is §19, the snapshot leg §20,
-> `images := 'both'` plus the timestamp bounds §21, and `on_schema_change := 'resync'` §22. What remains is
-> only what §15.9 deliberately put last: `'fill'` and `'null'`, both of which assert something about a
-> column that was never captured. ⚠ §18.1 records why slice 5 was re-scoped and slice 6 partly absorbed —
-> read it before trusting §15.12's ordering.
+> **EVERY SLICE ON §15.12's LIST IS BUILT, INCLUDING THE TWO IT PUT LAST.** The two-instance boundary is
+> §19, the snapshot leg §20, `images := 'both'` plus the timestamp bounds §21, `on_schema_change := 'resync'`
+> §22, `_changed_columns` §24, `inc_position`/`dec_position` §25, `ddl_history()`/`lsn_time_mapping()` §26,
+> and `'null'`/`'fill'` §27. ⚠ §18.1 records why slice 5 was re-scoped and slice 6 partly absorbed — read it
+> before trusting §15.12's ordering.
 >
 > ⚠ The original header read *"DESIGN ONLY, 2026-08-23. No code, no ABI, no gate."* — true when written,
 > and superseded by slice 2's ABI v81.
@@ -2025,8 +2025,8 @@ had no value, when the truth is that we never captured it.
 | mode | behaviour | verdict |
 |---|---|---|
 | `resync` | new capture instance + a fresh snapshot leg (§5), then changes from its `start_lsn` | ✅ **BUILT — §22.** ⚠ NOT a default, and §22 records why: it is opt-in on every path, because re-capturing and snapshotting is a heavy privileged act and the second one destroys history |
-| `fill` | added columns read from the SOURCE by key, for rows after the adding DDL | opt-in only, and name the semantics: values are as of NOW, not as of the change |
-| `null` | NULL + `_capture_instance` | the floor — honest and decidable, never silent |
+| `fill` | added columns read from the SOURCE by key, for rows after the adding DDL | ✅ **BUILT — §27.** Opt-in, and the semantics are named at every surface: values are as of NOW, not as of the change |
+| `null` | NULL + `_capture_instance` | ✅ **BUILT — §27.** The floor — honest and decidable, never silent |
 | `error` | refuse, naming the boundary | **DEFAULT when the instance is NOT ours** |
 
 **⚠ `resync` may only be the default when WE own the capture instance.** Creating an instance and taking a
@@ -2089,7 +2089,8 @@ The user's question. What the reader can do about it, now that §15.6 has the ma
 | **8** | ✅ **BUILT 2026-08-25 — §20.** `include := 'snapshot'` / `'snapshot+changes'`: §5's two-connection protocol, the handoff position on every baseline row, and the refusals a snapshot needs. ⚠ **`on_schema_change := 'resync'` is NOT in it** — see the note below | the resync story needs the snapshot leg first |
 | **8b** | ✅ **BUILT 2026-08-25 — §22.** `on_schema_change := 'resync'`: a new capture instance plus a forced snapshot leg when the captured set no longer matches the source. ⚠ §15.11's constraint is honoured by REFUSING rather than by choosing — at most TWO instances, so a second resync would have to DISABLE the oldest and destroy its unread history, and the message names that operator action instead. ⚠ It also exposed a defect in the emitted handoff (§22.5) and RETRACTED §21.2's proposed discrimination as measurably impossible (§22.6) | needed the snapshot leg |
 | **9** | ✅ **BUILT 2026-08-25 — §21.** `starting_timestamp` / `ending_timestamp` (both INCLUSIVE, unlike a position) and `images := 'both'` + `_update_mask`. ⚠ There is deliberately NO mask PLACEHOLDER — §21.3: a placeholder is a value, so it cannot be distinguished from a row that genuinely holds it; the mask makes the trap decidable instead | additive to the same reader |
-| — | ~~`on_schema_change := 'fill'`~~ | last, if ever — §15.9 records why |
+| **10** | ✅ **BUILT 2026-08-25 — §27.** `on_schema_change := 'null'` and `'fill'`, on one mechanism (a typed scalar subquery over the source). ⚠ §15.9's costs are UNCHANGED and are now asserted rather than described: `'fill'` produces a torn row no later event corrects, and refuses without a captured key | user-requested; they were "last, if ever" |
+| — | ✅ **BUILT — §25/§26.** `inc_position`/`dec_position`, `ddl_history()`/`lsn_time_mapping()` | user-requested |
 
 ⚠ **Slice 8 shipped the snapshot leg WITHOUT `resync`, and the split is deliberate rather than a shortfall.**
 The leg is one coherent thing with its own protocol, its own refusals and its own guarantee; `resync` is a
@@ -3651,5 +3652,217 @@ nothing" and "this row is not an update" are different claims, and an empty list
   test.
 - **A column name containing a comma or a quote.** The list is a real Arrow LIST, so no escaping question
   arises — which is precisely why a comma-joined string was rejected. Nothing exercises it.
+
+## 25. `inc_position` / `dec_position` — LSN ±1 (2026-08-25)
+
+`sys.fn_cdc_increment_lsn` / `sys.fn_cdc_decrement_lsn`, as CONSISTENT scalars. Gate: §33.
+
+```sql
+SELECT db.cdc.inc_position(db.cdc.max_position());
+FROM db.cdc.changes('dbo.orders', starting_position := db.cdc.dec_position(<lsn>))
+```
+
+**⚠ Computed in C#, not by the server**, and that is a requirement rather than a shortcut: a scalar is
+invoked per BATCH, so a round trip inside it would put a server call on every chunk of every query that uses
+one, and would need a connection where none is otherwise required. An LSN is a 10-byte big-endian integer
+and these are ±1 on it. What makes that safe is the check, not the reasoning — the gate runs ours beside SQL
+Server's own in ONE statement across a plain step, a byte carry, a multi-byte carry and a borrow.
+
+### 25.1 ⚠⚠ Both SQL Server functions WRAP silently; these refuse
+
+MEASURED:
+
+| call | SQL Server answers |
+|---|---|
+| `fn_cdc_decrement_lsn(0x00…00)` | **`0xFFFFFFFFFFFFFFFFFFFF`** |
+| `fn_cdc_increment_lsn(0xFF…FF)` | **`0x00000000000000000000`** |
+
+A wrapped value is not a neighbouring position, it is the OPPOSITE END of the range. As a window bound it
+either sits far above the capture watermark or lands on the zero LSN — which §19 records is exactly what
+`fn_cdc_get_min_lsn` answers for an instance that does not exist, so it would surface as a completely
+unrelated diagnostic three steps later. Refusing is the only answer that cannot mislead.
+
+⚠ NULL in, NULL out, matching both the SQL functions (measured) and this surface's convention that an absent
+bound is a state rather than an error. ⚠ They work with CDC **not** enabled on the database — pure
+computation, no guard needed.
+
+### 25.2 ⚠⚠ A 21-byte `_position` is refused — the sharp edge of the pair
+
+Stepping the LSN of a row's position moves PAST every remaining row at that LSN, and a transaction commonly
+has several — so using the result as an exclusive lower bound would SKIP them **silently**. It is also
+unnecessary: `starting_position` is already exclusive at full 21-byte granularity (§17), so passing a row's
+own `_position` already means "the changes strictly after this row". These take an LSN and return an LSN.
+
+⚠ CONSISTENT rather than VOLATILE, so a call over constant arguments FOLDS at plan time — which is what
+makes `starting_position := cdc.dec_position(...)` usable as a table-function argument at all, since those
+must be constant. Gated.
+
+---
+
+## 26. `ddl_history()` / `lsn_time_mapping()` — the CDC log, resolved and bounded (2026-08-25)
+
+Both tables are already reachable through the ATTACH, so this is not about access. It is about the three
+things a raw read makes a caller do by hand: resolving `source_object_id` / `object_id` back to names,
+bounding by an LSN window, and reading without contending with the capture job. Gate: §34.
+
+```sql
+FROM db.cdc.ddl_history([source :=] [, starting_position :=] [, ending_position :=])
+FROM db.cdc.lsn_time_mapping([starting_position :=] [, ending_position :=])
+```
+
+**⚠ The bounds mean what they mean in `cdc.changes` — `starting_position` EXCLUSIVE, `ending_position`
+INCLUSIVE.** Inclusive-both would have been the obvious choice for an inspection function and it would have
+been a trap: the point is that a caller hands them the SAME cursor they hand the reader and gets the DDLs
+for exactly the window they are about to read. A second convention on one surface is how an off-by-one
+becomes somebody's afternoon.
+
+**⚠⚠ THE QUERY IS DYNAMIC, AND THAT IS FORCED.** A batch that REFERENCES `cdc.ddl_history` fails at COMPILE
+when CDC is not enabled — the schema does not exist — so an `IF <enabled> … ELSE …` does not guard it: the
+whole batch is rejected before the IF runs. §18.3 records the same fact costing the reader's drift check its
+own round trip. `sp_executesql` defers the compile to the branch that runs, which is what lets these answer
+EMPTY on a database with no CDC (the convention `cdc.tables()` already sets) instead of raising `Msg 208`.
+⚠ The inner statement rides as a PARAMETER rather than being spliced in — it contains quotes of its own, and
+doubling them by hand is how an injection-shaped bug gets written into a query that never needed one.
+
+**⚠ `NOLOCK`, deliberately and at a stated cost** (the user asked for it, and the reason holds): the capture
+job writes both tables continuously and a diagnostic must neither block it nor wait on it. The cost is the
+usual one — a dirty read can see a row the recording transaction later rolls back. Acceptable HERE because
+the answer is advisory and nothing branches on it, and precisely why the reader's own drift check does NOT
+call these but issues its own guarded query.
+
+**⚠ ONE ROW PER (DDL × CAPTURE INSTANCE), not de-duplicated.** §19 measured that a table with two instances
+records every DDL twice, including DDLs that predate the newer instance (SQL Server back-fills them). Left
+raw because `capture_instance` is on every row: the caller can see the duplication, where collapsing it
+would hide which instances a DDL was applied to. The reader's own check uses `DISTINCT` for that reason.
+
+---
+
+## 27. `on_schema_change := 'null'` / `'fill'` (2026-08-25)
+
+The two modes §15.9 deliberately scheduled last. Both ANSWER the added-column drift instead of refusing it:
+`'null'` projects the uncaptured column as NULL, `'fill'` looks it up from the LIVE source by key. Gate: §35,
+four mutants.
+
+### 27.1 ⚠⚠ One mechanism serves both, and a MEASUREMENT is what made it small
+
+An uncaptured column must appear in the statement **with the source column's type**, or the declared and
+arrived schemas differ and the arrival check refuses every row. A bare `NULL` describes as `int` (§19.3), and
+rendering the type by hand is the SQL type table this feature has twice refused to build.
+
+MEASURED: a scalar subquery over the source carries the column's exact type.
+
+```
+(SELECT TOP 0 f.s FROM dbo.t f)  ->  varchar(37)
+(SELECT TOP 0 f.d FROM dbo.t f)  ->  decimal(9,2)
+(SELECT TOP 0 f.t FROM dbo.t f)  ->  datetime2(3)
+NULL                             ->  int
+```
+
+So `'null'` is `TOP 0` (matches nothing, always NULL) and `'fill'` is `TOP 1` with a key predicate — the
+SAME expression shape, and neither needs a type name written down anywhere.
+
+### 27.2 ⚠⚠ What `'fill'` costs, asserted rather than described
+
+It produces a **TORN ROW**: the captured columns are as of the change's LSN, the filled column is as of NOW.
+And because the column is not captured, **no later change event ever corrects it** — this is not eventual
+consistency, it is a value from a different instant, permanently. The gate asserts it rather than describing
+it, on a fixture where the difference is visible:
+
+```
+_change_type      id   v    region
+insert            1    10   eu       <- region did not exist at this insert; 'eu' is as of NOW
+insert            2    20   <null>   <- this row was DELETED, so there is no source row to look up
+update_postimage  1    99   eu
+delete            2    20   <null>
+```
+
+The NULLs are honest rather than a gap: a `delete` has no surviving source row by construction.
+
+**⚠ `'fill'` REFUSES WITHOUT A CAPTURED KEY**, and §15.9 predicted this would bite exactly the tables that
+most need help: no primary key and no unique index is a legitimate configuration, and then there is nothing
+to correlate a change row back to its source row with. The refusal names `'null'`, which needs no key —
+gated, with the same table read successfully under `'null'` as the control.
+
+⚠ The key is the SOURCE's, read from `sys.indexes` (PK first, then the narrowest unique index), not the
+index CDC recorded: §16.7 measured that the all-tables form of `sp_cdc_help_change_data_capture` LEAKS the
+previous row's `index_column_list`, so that column is the wrong thing to correlate on.
+
+### 27.3 ⚠⚠ The defect they exposed the first time they ran
+
+Both modes projected the added column correctly — and the statement then FAILED with *"1 schema change
+landed INSIDE this window"*. `ChecksSchemaDrift` keys on `OnSchemaChange != 'ignore'`, which was right while
+every mode either refused or ignored, and stopped being right the moment a mode **answered** the drift.
+
+Fixed with `AbsorbsColumnSetChanges`: under `'null'`/`'fill'` a `required_column_update = 0` DDL — an ADD or
+a DROP — is absorbed, because the projection expresses it (the added column is projected; a dropped one is
+appended from the change table, which still answers for it). `required_column_update = 1` — a captured
+column's TYPE changed — is still refused, because the projection says nothing about it and §15.13 records
+that propagation window as the single most useful unmeasured number in this feature.
+
+⚠ Without that, these two modes are useless: they project the column and then decline to return it. Mutant
+N3 restores the old rule and dies at the first `'null'` row read.
+
+### 27.4 Other decisions
+
+- **Declared column order is the SOURCE's**, not "captured then added", so a consumer whose target table
+  matches the source keeps working across the drift — which is the entire point of projecting at all.
+- **A column the INSTANCE captures but the SOURCE no longer has is appended**, not dropped: it is real
+  history the change table still answers for.
+- **Every projected column is declared NULLABLE** whatever `sys.columns` says — under `'null'` it is always
+  NULL, and under `'fill'` it is NULL for a delete and for any row whose key no longer exists. A NOT NULL
+  claim would break on the first delete.
+- **The update mask decodes against the CAPTURED set**, not the projected one: an uncaptured column has no
+  bit, and shifting the map by the projection would name the wrong columns.
+- **Neither mode touches the capture instance** — no DDL, no new instance, no snapshot. That is the trade
+  against `'resync'`: these are cheap and reversible and tell you less.
+
+### 27.5 What the gate does NOT cover
+
+- **`'fill'` racing a concurrent source UPDATE.** The torn row is asserted, but "how torn" is a function of
+  when the lookup runs, which no sequential suite can vary.
+- **A projected column under `images := 'both'`.** The mask map is deliberately the captured set; nothing
+  combines the two modes.
+- **The `NOLOCK` dirty read** in §26. It needs an uncommitted concurrent DDL, which sqllogictest cannot
+  arrange.
+- **`ddl_history()` / `lsn_time_mapping()` on a database with CDC disabled.** They answer empty by design
+  (the dynamic-SQL guard), but the suite's teardown is what disables CDC, so the check would have to run
+  after it.
+
+---
+
+## 28. ⚠ The connection-pool isolation leak, revisited (2026-08-25)
+
+User-raised: since a leaked SNAPSHOT level travels through the pool (§20.6), would `Pooling=false` or a
+distinct `Application Name` — which gives a separate pool, since SqlClient pools by the whole connection
+string — be simpler than restoring the level?
+
+**Both work, MEASURED** with `Max Pool Size=1` so reuse is provable:
+
+| | `transaction_isolation_level` |
+|---|---|
+| next open from the SAME pool after a leak | **5 (Snapshot)** — the leak |
+| next open with a different `Application Name` | 2 (ReadCommitted) — a separate pool |
+| `Pooling=false` | 2 (ReadCommitted) |
+
+**The restore stays, and the reasons are cost and scope rather than taste.** `SqlServerSnapshotStream` must
+exist anyway — it owns the connection and commits the transaction — so removing the restore shortens it by
+about eight lines rather than deleting it. `Pooling=false` costs a full connect per snapshot read, and the
+snapshot leg opens TWO connections (on Fabric a connect is seconds). `Application Name` collides with a
+shipped feature: it is the consumption-attribution vector (`program_name`, consumption-monitoring.md §2.4),
+so hijacking it would split one dbt run across two program names. And both only CONTAIN the leak — the
+connections in that pool stay at SNAPSHOT — which is harmless for the snapshot leg but not for the other
+fixed site (`ExecuteQuery`'s `mssql_read_isolation` branch), whose connections are the ORDINARY read pool.
+
+**⚠⚠ THE QUESTION DID FIND A REAL HOLE, in the comment rather than the code.** The catch around the restore
+read *"SqlClient retires a broken connection rather than pooling it"* — true of a BROKEN connection, and
+silent about a HEALTHY one whose reset failed for another reason (a command timeout, an attention).
+`Dispose()` RETURNS a healthy connection to the pool, so that path leaked exactly what the class exists to
+prevent. It now calls `SqlConnection.ClearPool` on the failure path — the only tool SqlClient offers, since
+there is no per-connection "do not pool this" — which is blunt and acceptable precisely because it should
+never fire.
+
+⚠ One correction to the framing: the class is `SqlServerSnapshotStream`, and the CDC **reader** was not
+designed around the leak. The leak was found while building the snapshot LEG (§20.6) and fixed there and in
+`ExecuteQuery`'s pooled snapshot branch.
 
 ---
