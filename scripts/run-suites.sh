@@ -638,7 +638,7 @@ case "$TIER" in
         # delta). verify_mssql_cdc went 476 -> 559 -> 604 -> 630 -> 725 across slice 9, slice 8b,
         # _changed_columns and the four user-requested items. A floor left below the actual silently
         # tolerates a regression that size.
-        : "${MIN_ASSERTIONS:=3001}"
+        : "${MIN_ASSERTIONS:=3011}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

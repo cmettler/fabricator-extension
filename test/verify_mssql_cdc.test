@@ -2335,6 +2335,81 @@ SELECT count(*) FROM c1.cdc.changes('dbo.cdc_when', on_schema_change := 'nonsens
 is not a value
 
 
+
+# ═══ §32d  retire_previous_instance — the operator action §32c's refusal names ═══════════════════════════
+# ⚠⚠ THIS SECTION ONLY MEANS ANYTHING BECAUSE §32c RAN FIRST. That refusal names an action a caller then has
+# to perform by copying an instance name out of an error message into cdc.disable; this is that action as one
+# call, and the assertion that matters is not "it disabled something" but that THE READ §32c REFUSED NOW
+# SUCCEEDS. A helper that destroyed the wrong instance would pass every count assertion here and fail that.
+#
+# ⚠ "OLDER" is asserted against the name §32b captured, NOT against a literal and NOT by sorting names. The
+#   generated names are a digest plus a `_b` discriminator and a resync takes whichever the survivor is not
+#   using, so `fab_<h>` is the NEWER one whenever the previous resync went the other way — ordering by name
+#   would be wrong half the time and right often enough to look correct.
+query I
+SELECT changed FROM c1.cdc.retire_previous_instance('dbo.cdc_rs');
+----
+true
+
+# The SURVIVOR is the one §32b resumed from — so the instance destroyed was the older one.
+query I
+SELECT capture_instance = getvariable('cdc_rs_new') FROM c1.cdc.tables() WHERE source_table = 'cdc_rs';
+----
+true
+
+# ⚠ Idempotent, and a REPORTED no-op rather than an error: the point of the call is "leave this table with
+#   one instance", and a table already in that state is a success. Erroring would make the obvious
+#   retire-then-resync sequence fail whenever it had nothing to do.
+query I
+SELECT changed FROM c1.cdc.retire_previous_instance('dbo.cdc_rs');
+----
+false
+
+# ⚠⚠ THE PAYOFF ASSERTION. §32c added `extra` and asserted the resync was REFUSED for want of a free slot.
+#   The drift is still there and the slot is now free, so the identical statement must succeed — which is
+#   what ties this helper to the thing it exists for. A build that retired the NEWER instance would also
+#   answer here, which is why the survivor assertion above is separate and specific.
+query I
+SELECT count(*) >= 0 FROM c1.cdc.changes('dbo.cdc_rs', on_schema_change := 'resync');
+----
+true
+
+query I
+SELECT count(*) FROM c1.cdc.tables() WHERE source_table = 'cdc_rs';
+----
+2
+
+# ⚠⚠ AN INSTANCE WE DID NOT CREATE IS NOT OURS TO DESTROY — the same line resync draws (§32c), and the check
+#   is on the OLDER instance alone, since that is the one being destroyed. `dbo.cdc_rsx` already carries one
+#   DBA-created instance from §32c; a second makes the table eligible by COUNT, so the refusal below is about
+#   ownership and nothing else.
+statement ok
+SELECT fabricator_exec('c1', 'EXEC sys.sp_cdc_enable_table @source_schema = ''dbo'', @source_name = ''cdc_rsx'', @role_name = NULL, @capture_instance = ''rsx_dba2'';');
+
+# The control: two instances, so a count-based guard would have let this through.
+query I
+SELECT count(*) FROM c1.cdc.tables() WHERE source_table = 'cdc_rsx';
+----
+2
+
+statement error
+SELECT changed FROM c1.cdc.retire_previous_instance('dbo.cdc_rsx');
+----
+not created by this extension
+
+# …and it really did refuse rather than half-acting: both instances are still there.
+query I
+SELECT count(*) FROM c1.cdc.tables() WHERE source_table = 'cdc_rsx';
+----
+2
+
+# ⚠ A table nobody captures is a reported no-op too, not an error — the same reasoning as the one-instance
+#   case, and it keeps the function safe to call defensively before a resync.
+query I
+SELECT changed FROM c1.cdc.retire_previous_instance('dbo.cdc_none');
+----
+false
+
 # ═══ §33  inc_position / dec_position — LSN ±1, and the wrap SQL Server does silently ══════════════════
 # docs §25. sys.fn_cdc_increment_lsn / decrement_lsn, computed in C# because a scalar runs per BATCH and a
 # round trip there would put a server call on every chunk of every query that uses one.

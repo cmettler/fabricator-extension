@@ -677,6 +677,77 @@ public sealed partial class SqlServerCatalog
     }
 
     /// <summary>
+    /// <c>cdc.retire_previous_instance('dbo.orders')</c> — disables the OLDER of a table's two capture
+    /// instances, which is what makes room for the next <c>on_schema_change := 'resync'</c>.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>⚠⚠ THIS IS DESTRUCTIVE AND IT IS THE WHOLE POINT.</b> SQL Server caps a table at TWO capture
+    /// instances (<c>Msg 22962</c>), so after one resync the table is full and a second resync is REFUSED
+    /// (§22) — deliberately, because making room destroys whatever history nobody has read yet, and a
+    /// <c>SELECT</c> cannot know where every consumer's cursor is. This is the operator saying they do know.
+    /// It exists so that answer can be given in one call instead of by copying an instance name out of an
+    /// error message into <c>cdc.disable</c>, which is the same act with more chances to name the wrong
+    /// one.</para>
+    /// <para><b>⚠⚠ "OLDER" IS NOT A GUESS AND IT MUST NOT BECOME ONE: the ordering is
+    /// <c>start_lsn, create_date, capture_instance</c>, the SAME total order the union read's boundary rests
+    /// on</b> (§19 — the boundary IS the newer instance's floor). Ordering by NAME instead would be wrong
+    /// half the time, since the generated names are a digest plus a <c>_b</c> discriminator and a resync
+    /// takes whichever the survivor is not using — so <c>fab_&lt;h&gt;</c> is the NEWER one whenever the
+    /// previous resync went the other way. <c>create_date</c> breaks the tie the cleanup job can produce by
+    /// raising both floors onto the same value.</para>
+    /// <para><b>⚠ IT REFUSES ON AN INSTANCE WE DID NOT CREATE</b>, the same line <c>resync</c> draws: an
+    /// unmarked instance is somebody else's configuration, and destroying a DBA's change table is not
+    /// something this extension does because a caller named a table. The check is on the OLDER instance
+    /// alone — that is the one being destroyed; a foreign SURVIVOR is none of our business.</para>
+    /// <para>⚠ Fewer than two instances is a NO-OP that REPORTS, not an error: the point of the call is
+    /// "leave this table with one instance", and a table that already has one is in that state. Erroring
+    /// would make the obvious retry-until-clean loop fail on success.</para>
+    /// </remarks>
+    internal RecordBatch CdcRetirePreviousInstance(string schema, string table)
+    {
+        string sql =
+            "SET NOCOUNT ON; " +
+            "DECLARE @target varchar(400) = CAST(@schema + N'.' + @table AS varchar(400)); " +
+            SqlServerCdcFunctions.HelpTableVar + " " +
+            SqlServerCdcFunctions.FillHelpTableVar + " " +
+            "DECLARE @n int = (SELECT COUNT(*) FROM @cdct " +
+            "                  WHERE source_schema = @schema AND source_table = @table); " +
+            "DECLARE @older sysname, @newer sysname, @owner varchar(400); " +
+            // ⚠ The SAME total order the union read rests on. Never ORDER BY name.
+            "SELECT TOP (1) @older = m.capture_instance, @owner = " +
+            SqlServerCdcFunctions.OwnerLookupFor("m") + " " +
+            "FROM @cdct m WHERE m.source_schema = @schema AND m.source_table = @table " +
+            "ORDER BY m.start_lsn, m.create_date, m.capture_instance; " +
+            "SELECT TOP (1) @newer = m.capture_instance FROM @cdct m " +
+            "WHERE m.source_schema = @schema AND m.source_table = @table " +
+            "ORDER BY m.start_lsn DESC, m.create_date DESC, m.capture_instance DESC; " +
+            "IF @n = 0 " +
+            "  SELECT @target AS target, '0' AS changed, " +
+            "         CAST('not a captured table - nothing to retire' AS varchar(400)) AS detail; " +
+            "ELSE IF @n = 1 " +
+            "  SELECT @target AS target, '0' AS changed, " +
+            "         CAST('only one capture instance (' + @older + ') - nothing to retire' " +
+            "AS varchar(400)) AS detail; " +
+            "ELSE IF @owner IS NULL " +
+            "  THROW 50003, 'cdc.retire_previous_instance: the older capture instance was not created by " +
+            "this extension, so it will not be destroyed here. Disable it deliberately with " +
+            "cdc.disable(source, capture_instance := ...) if that is really intended.', 1; " +
+            "ELSE BEGIN " +
+            "  EXEC sys.sp_cdc_disable_table @source_schema = @schema, @source_name = @table, " +
+            "       @capture_instance = @older; " +
+            "  SELECT @target AS target, '1' AS changed, " +
+            "         CAST('retired ' + @older + '; ' + @newer + ' survives and is now the only instance, " +
+            "so the table has room for another resync. The retired instance''s change history is gone.' " +
+            "AS varchar(400)) AS detail; " +
+            "END";
+        return CdcReportFrom(ReadMetadataRows(sql, 3, new[]
+        {
+            new SqlParameter("@schema", schema),
+            new SqlParameter("@table", table),
+        }), "cdc.retire_previous_instance");
+    }
+
+    /// <summary>
     /// <c>sys.sp_cdc_scan</c> — force the capture job's log scan now.
     /// </summary>
     /// <remarks>

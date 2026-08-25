@@ -858,6 +858,7 @@ with no message queue anywhere in it. They live in the catalog's `cdc` schema, s
 | `db.cdc.enable_database()` | `sys.sp_cdc_enable_db` — idempotent |
 | `db.cdc.enable('<schema>.<table>' [, capture_instance :=] [, columns :=] [, role :=] [, index :=] [, filegroup :=] [, net :=])` | `sys.sp_cdc_enable_table`. With no `capture_instance` it generates one (`fab_…`) and is idempotent **per table**; with one, per instance |
 | `db.cdc.disable('<schema>.<table>' [, capture_instance :=])` | `sys.sp_cdc_disable_table`; with no instance named, all of that table's |
+| `db.cdc.retire_previous_instance('<schema>.<table>')` | disables the **older** of a table's two capture instances, making room for the next `on_schema_change := 'resync'`. ⚠ **Destructive** — the retired instance's change history is gone. A table with fewer than two instances is a reported no-op, not an error; an instance this extension did not create is refused |
 | `db.cdc.capture_now()` | `sys.sp_cdc_scan` — force the capture log scan now (see the ⚠ below) |
 | `db.cdc.changes('<schema>.<table>' \| '<capture instance>' [, starting_position :=] [, ending_position :=] [, starting_timestamp :=] [, ending_timestamp :=] [, capture_instance :=] [, images :=] [, commit_timestamp :=] [, enable :=] [, on_schema_change :=] [, include :=])` | the change stream, and optionally an initial snapshot before it — see below |
 | `db.cdc.health()` | 12 `(property, value)` rows, in this order: `supports_cdc`, `database`, `cdc_enabled`, `captured_instances`, `capture_job`, `capture_polling_interval_seconds`, `cleanup_job`, `cleanup_retention_minutes`, `max_lsn`, `max_lsn_time`, `max_lsn_age_seconds`, `agent_status` |
@@ -1015,6 +1016,25 @@ UPDATE my_cursors SET cur = getvariable('cdc_end') WHERE tbl = 'dbo.orders';
   destroying whatever history nobody has read. The message names that operator action. When nothing is
   stale, `resync` behaves exactly like `error`: a drift it cannot repair (a type change, a drop) is still
   refused rather than swallowed.
+- **⚠ A resync is NOT re-runnable if its rows fail to land, and this is the sharp edge of the feature.** The
+  new capture instance is DDL and commits immediately; the baseline rows are just a result set. So if your
+  `INSERT INTO … SELECT … FROM cdc.changes(…, on_schema_change := 'resync')` fails while writing — disk,
+  network, a constraint — the instance is created and the rows are not, and **re-running the identical
+  statement is refused**, because the table now has two capture instances. Measured, not theorised.
+  - **What to do instead: re-read with `on_schema_change := 'error'` (or `'ignore'`) and
+    `include := 'snapshot+changes'`.** Both instances exist now, so an ordinary read already spans them as
+    one stream in the aligned shape, and a fresh snapshot leg gives you a new baseline and a new handoff.
+    Nothing is lost — you just take a *different* snapshot, at the retry's instant rather than the original's.
+  - **Do NOT reach for `cdc.retire_previous_instance` here.** The refusal's message suggests disabling the
+    older instance, which is right when consumers have caught up and wrong in exactly this case: your
+    consumer never got the baseline, so its last good cursor is still inside the OLD instance, and retiring
+    it destroys the history between that cursor and the resync. Retire once everyone is past the boundary,
+    not to make a failed retry go through.
+- **A plain snapshot leg, by contrast, IS fully re-runnable.** `include := 'snapshot'` and
+  `'snapshot+changes'` without a resync perform no DDL and consume nothing — nothing server-side records
+  that you took one. Re-running gives a fresh snapshot at a new instant with a later handoff. What you
+  cannot do is *resume* a half-written snapshot: it is all-or-nothing per attempt, and the handoff rides in
+  the rows, so if the rows do not land neither does the cursor.
 - **An `UPDATE` produces ONE row by default** (the after-image); `images := 'both'` surfaces the pair as
   `update_preimage` + `update_postimage` and adds `_update_mask` — see below.
 - **To bound how much you take in one pass, use `LIMIT` — there is no `max_rows` and there will not be

@@ -3889,3 +3889,90 @@ designed around the leak. The leak was found while building the snapshot LEG (§
 `ExecuteQuery`'s pooled snapshot branch.
 
 ---
+
+---
+
+## 29. `retire_previous_instance` — and the resync failure mode it does NOT fix (2026-08-25)
+
+User-raised, in two parts: *"a `cdc.retire_previous_instance(src)` scalar helper makes sense"*, and *"in the
+scenario when a snapshot leg is sent, is it only once sent i.e. it is lost when materializing to a storage
+fails?"*. The second question turned out to have a different answer for the plain snapshot and for a resync,
+and the difference is the more valuable half. Gate: §32d, two mutants.
+
+### 29.1 The helper
+
+`db.cdc.retire_previous_instance('dbo.orders')` disables the OLDER of a table's two capture instances. It is
+the operator action §22's refusal already named — previously performed by copying an instance name out of an
+error message into `cdc.disable`, which is the same act with more chances to name the wrong one.
+
+**⚠ It is a TABLE FUNCTION returning a `(target, changed, detail)` report, not a scalar**, despite being
+asked for as one. Every other CDC DDL surface here is that report, a caller of a DESTRUCTIVE operation should
+be told what was destroyed rather than handed a bare value, and a scalar is the wrong shape for DDL on
+principle — DuckDB may fold a CONSISTENT scalar at plan time or evaluate a VOLATILE one once per ROW. The
+pure-computation CDC scalars (`inc_position`, `dec_position`) are scalars precisely because they touch
+nothing.
+
+**⚠⚠ "OLDER" IS THE UNION READ'S OWN TOTAL ORDER — `start_lsn, create_date, capture_instance` — and it must
+never become a sort by NAME.** The generated names are a digest plus a `_b` discriminator and a resync takes
+whichever the survivor is not using, so `fab_<h>` is the NEWER one whenever the previous resync went the
+other way. A name sort would be wrong half the time and right often enough to look correct. `create_date`
+breaks the tie the cleanup job produces by raising both floors onto the same value.
+
+Two behaviours are deliberate rather than incidental:
+
+- **Fewer than two instances is a reported NO-OP, not an error.** The point of the call is "leave this table
+  with one instance", and a table already in that state is a success. Erroring would break the obvious
+  retire-then-resync sequence whenever it had nothing to do.
+- **An instance we did not create is REFUSED**, the same line resync draws. The check is on the OLDER
+  instance alone — that is the one being destroyed; a foreign SURVIVOR is none of our business.
+
+### 29.2 ⚠⚠ A resync is NOT idempotent under failure — MEASURED, and by accident
+
+The probe that exercised the helper reproduced this without meaning to. `cdc.changes(…, on_schema_change :=
+'resync')` on a drifted table created the second capture instance and then FAILED, because the forced
+snapshot leg needs `ALLOW_SNAPSHOT_ISOLATION` and the throwaway database did not have it:
+
+```
+--- 3. resync creates the SECOND instance ---
+IO Error: ... cdc.changes(include := 'snapshot+changes') needs snapshot isolation ...
+┌────────────────────────┐
+│ fab_16c1f6da84f77e10   │
+│ fab_16c1f6da84f77e10_b │   <- both instances exist; ZERO rows were returned
+└────────────────────────┘
+```
+
+**The DDL commits and the rows do not**, so re-running the identical statement is refused:
+
+```
+cdc.changes: on_schema_change := 'resync' cannot re-capture 'dbo.orders' - it already has two capture
+instances (...), which is the maximum SQL Server allows.
+```
+
+That is the shape of ANY failed materialization of a resync, not an artefact of the isolation error: the
+instance is durable, the result set is not.
+
+**⚠⚠ AND THE REFUSAL'S OWN ADVICE IS WRONG FOR THIS CASE.** It says to disable the older instance, which is
+right when consumers have caught up and destructive here: the consumer never received the baseline, so its
+last good cursor is still inside the OLD instance, and retiring it destroys the history between that cursor
+and the resync. **The recovery is to re-read with `'error'` or `'ignore'` plus `include :=
+'snapshot+changes'`** — both instances exist, so an ordinary read already spans them as one stream in the
+aligned shape, and a fresh snapshot leg supplies a new baseline and a new handoff.
+
+⚠ The refusal message is not wrong in general and is deliberately left alone: it cannot tell "you have two
+instances because a resync succeeded and everyone has moved on" from "you have two because a resync's rows
+never landed", and the second is the rarer case. What was missing was the DOCUMENTATION, which the README now
+carries.
+
+### 29.3 The plain snapshot leg, by contrast, is fully re-runnable
+
+`include := 'snapshot'` / `'snapshot+changes'` WITHOUT a resync performs no DDL and consumes nothing —
+nothing server-side records that a snapshot was taken, there is no acknowledgement and no cursor of ours.
+Re-running takes a fresh snapshot at a new instant with a later handoff.
+
+Two properties follow, and both are worth stating because neither is a guess:
+
+- **It is all-or-nothing per attempt.** There is no resuming a half-written snapshot; the retry is a
+  different snapshot, not a continuation of the first.
+- **The handoff rides in the ROWS** (`_position` on the baseline rows), so if the rows do not land neither
+  does the cursor — which is the same reason §20 records that an EMPTY table snapshots to no rows and
+  therefore to no handoff.

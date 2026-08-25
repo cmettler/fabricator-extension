@@ -42,6 +42,7 @@ internal static class SqlServerCdcSetup
         tables.Add(new CdcEnableDatabaseFunction(catalog));
         tables.Add(new CdcEnableFunction(catalog));
         tables.Add(new CdcDisableFunction(catalog));
+        tables.Add(new CdcRetirePreviousInstanceFunction(catalog));
         tables.Add(new CdcCaptureNowFunction(catalog));
     }
 
@@ -338,6 +339,55 @@ internal sealed class CdcDisableFunction : ICatalogTableFunction
     }
 }
 
+
+/// <summary>
+/// <c>db.cdc.retire_previous_instance('dbo.orders')</c> — disables the OLDER of a table's two capture
+/// instances, making room for the next <c>on_schema_change := 'resync'</c>.
+/// </summary>
+/// <remarks>
+/// <para><b>⚠⚠ DESTRUCTIVE BY DESIGN.</b> It exists because <c>resync</c> REFUSES when a table already has
+/// two instances (SQL Server's cap, <c>Msg 22962</c>): making room destroys history nobody may have read
+/// yet, and a <c>SELECT</c> cannot know where every consumer's cursor is, so the refusal names an operator
+/// action instead of guessing. This IS that action — the operator asserting they know. Sitting on the same
+/// consent line as <c>cdc.disable</c>, which it is a constrained special case of.</para>
+/// <para><b>⚠ IT IS A TABLE FUNCTION RETURNING A REPORT, NOT A SCALAR, and that is deliberate</b> even
+/// though "a scalar helper" is the natural way to ask for it. Two reasons, and the second is the load-bearing
+/// one: every other CDC DDL surface here (<c>enable</c>, <c>disable</c>, <c>enable_database</c>,
+/// <c>capture_now</c>) is a <c>(target, changed, detail)</c> report, and a caller of a DESTRUCTIVE operation
+/// should be told WHAT was destroyed rather than handed a bare value. And a scalar is the wrong shape for
+/// DDL on principle — DuckDB may fold a CONSISTENT scalar at plan time or evaluate a VOLATILE one once per
+/// ROW, neither of which is a thing to do to <c>sp_cdc_disable_table</c>. The pure-computation CDC scalars
+/// (<c>inc_position</c>, <c>dec_position</c>) are scalars precisely because they touch nothing.</para>
+/// <para>⚠ <c>SchemaMayChange</c> is left at its default (true): disabling an instance drops its change
+/// table and its <c>fn_cdc_get_all_changes_*</c> function, so the host's metadata cache must be rebuilt or a
+/// later read binds against an object that is gone.</para>
+/// </remarks>
+internal sealed class CdcRetirePreviousInstanceFunction : ICatalogTableFunction
+{
+    private readonly SqlServerCatalog _catalog;
+
+    internal CdcRetirePreviousInstanceFunction(SqlServerCatalog catalog) => _catalog = catalog;
+
+    public string SchemaName => SqlServerCdcFunctions.SchemaName;
+
+    public string Name => "retire_previous_instance";
+
+    public Schema Parameters { get; } = new(new[]
+    {
+        Params.Positional("source", StringType.Default, nullable: false),
+    }, metadata: null);
+
+    public ITableFunctionBinding Bind(RecordBatch args)
+    {
+        string? source = CdcEnableFunction.Str(args, 0);
+        // ⚠ Resolved as a TABLE, never as a capture-instance name — unlike cdc.changes, which accepts
+        // either. "the previous instance of <an instance name>" is not a question with an answer, and
+        // accepting the spelling would let a caller ask it and get a destructive answer to a different one.
+        var (schema, table) = SqlServerCdcSetup.SplitSource(source ?? string.Empty,
+                                                           "cdc.retire_previous_instance");
+        return new CdcSetupBinding(() => _catalog.CdcRetirePreviousInstance(schema, table));
+    }
+}
 /// <summary>
 /// <c>db.cdc.capture_now()</c> — <c>sys.sp_cdc_scan</c>, forcing the capture job's log scan to run now instead of
 /// waiting a polling interval.
