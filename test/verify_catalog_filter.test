@@ -35,3 +35,70 @@ SELECT count(*) FROM duckdb_tables() WHERE database_name = 'dbempty';
 
 statement ok
 DETACH dbempty;
+
+# ── §3  AN EXCLUDED SCHEMA IS NEVER ENUMERATED — and the two discovery queries agree about it
+#
+# ⚠⚠ THE DEFECT THIS PINS: `SchemasSql` excluded the system schemas and the fixed database roles from
+#    the start, while `TablesSql` joined sys.tables/sys.views to sys.schemas with NO predicate at all.
+#    So an object in an excluded schema was LISTED — and the catalog then materialized the excluded
+#    SCHEMA to hold it, resurrecting exactly what SchemasSql had refused. One policy, written twice,
+#    and one copy forgot.
+#
+# ⚠⚠ ON BOX THE DEFECT IS INVISIBLE WITHOUT THIS FIXTURE, and on Fabric it was FATAL — which is why it
+#    survived. MEASURED: a real SQL Server does not surface its system views through sys.views for a
+#    user database, so on box the missing predicate changed no answer (TablesSql returns dbo and
+#    nothing else). A Fabric Warehouse returns `sys` 7 as well — its internal Delta plumbing — and
+#    Fabric REFUSES to describe one of them (`Msg 15871 … 'managed_delta_table_forks' is not
+#    supported`), so materializing the catalog threw and FULL ENUMERATION WAS BROKEN: duckdb_tables(),
+#    information_schema.tables, cache refresh, and every dbt run, which introspects before it builds.
+#    The view created below is the only thing that makes the box tier able to see any of this.
+#
+# ⚠ THE FIX IS TO NOT ASK, NOT TO SWALLOW THE ANSWER. A try/catch around the per-table schema fetch is
+#   the obvious shape and it is the one this codebase forbids: on a warehouse engine a statement that
+#   fails inside an explicit transaction aborts the whole transaction (warehouse-support.md §6.5 — the
+#   dbt 15225 defect came from exactly that), so swallowing would leave a poisoned transaction and
+#   surface somewhere unrelated.
+
+statement ok
+SELECT fabricator_exec('${MSSQL_TESTDB_DSN}', 'IF OBJECT_ID(''guest.gv_sysfilter'') IS NOT NULL DROP VIEW guest.gv_sysfilter');
+
+# `guest` is in the excluded list, and a view can really be created there — so this is a fixture, not a
+# hypothetical.
+statement ok
+SELECT fabricator_exec('${MSSQL_TESTDB_DSN}', 'CREATE VIEW guest.gv_sysfilter AS SELECT 1 AS x');
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS dbsys (TYPE fabricator);
+
+# The object in the excluded schema must not be listed.
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'dbsys' AND schema_name = 'guest';
+----
+0
+
+# ⚠ POSITIVE CONTROL, and it is load-bearing: without it the assertion above passes equally on a build
+#   where discovery has stopped returning ANYTHING.
+query I
+SELECT count(*) > 0 FROM duckdb_tables() WHERE database_name = 'dbsys' AND schema_name = 'dbo';
+----
+true
+
+# ⚠ And the excluded SCHEMA must not be resurrected to hold it. Before the fix this was 1 — the catalog
+#   creates a schema for any listed table's schema, so the missing predicate did not merely add orphan
+#   entries, it undid SchemasSql.
+query I
+SELECT count(*) FROM duckdb_schemas() WHERE database_name = 'dbsys' AND schema_name = 'guest';
+----
+0
+
+# The view is not reachable by name either — it was never discovered, and there is no by-name fallback
+# for an object in a schema the catalog does not have.
+statement error
+SELECT * FROM dbsys.guest.gv_sysfilter;
+----
+
+statement ok
+DETACH dbsys;
+
+statement ok
+SELECT fabricator_exec('${MSSQL_TESTDB_DSN}', 'DROP VIEW guest.gv_sysfilter');

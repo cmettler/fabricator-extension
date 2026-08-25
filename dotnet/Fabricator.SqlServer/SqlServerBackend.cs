@@ -4240,20 +4240,57 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     private static string ObjectLiteral(string schemaName, string tableName) =>
         "N'" + (schemaName + "." + tableName).Replace("'", "''") + "'";
 
+    /// <summary>
+    /// The schemas discovery must NOT enumerate — system schemas and the fixed database roles.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>⚠⚠ ONE CONSTANT BECAUSE THE POLICY USED TO BE WRITTEN TWICE AND ONE COPY FORGOT.</b>
+    /// <see cref="SchemasSql"/> excluded these from the start; <see cref="TablesSql"/> joined
+    /// <c>sys.tables</c>/<c>sys.views</c> to <c>sys.schemas</c> with NO predicate at all, so the two
+    /// queries disagreed about what the catalog contains — objects were listed in schemas that were never
+    /// discovered.</para>
+    /// <para><b>⚠⚠ ON BOX THAT WAS INVISIBLE AND ON FABRIC IT WAS FATAL, which is why it survived.</b>
+    /// MEASURED: on SQL Server 2025 the same <c>TablesSql</c> returns <c>dbo</c> and nothing else — a real
+    /// SQL Server does not surface its system views through <c>sys.views</c> for a user database — so the
+    /// missing predicate changed no answer. On a Fabric Warehouse it returns <c>dbo</c> 53,
+    /// <b><c>sys</c> 7</b> and <c>queryinsights</c> 6, and the seven are Fabric's internal Delta plumbing
+    /// (<c>managed_delta_tables</c>, <c>managed_delta_table_forks</c>, <c>external_delta_tables</c>, …).
+    /// Fabric then REFUSES to describe one of them — <c>Msg 15871 … 'managed_delta_table_forks' is not
+    /// supported</c>, reproduced directly with <c>SELECT TOP 0 *</c> — so materializing the catalog threw
+    /// and <b>FULL ENUMERATION WAS BROKEN</b>: <c>duckdb_tables()</c>, <c>information_schema.tables</c>,
+    /// a cache refresh, and therefore every dbt run, which introspects before it builds.</para>
+    /// <para><b>⚠ THE FIX IS TO NOT ASK, NOT TO SWALLOW THE ANSWER.</b> A <c>try</c>/<c>catch</c> around
+    /// the per-table schema fetch is the obvious shape and it is the one this codebase forbids: on a
+    /// warehouse engine a statement that fails INSIDE an explicit transaction aborts the whole transaction
+    /// (warehouse-support.md §6.5 — the dbt <c>15225</c> defect came from exactly that), so swallowing the
+    /// error would leave a poisoned transaction and surface somewhere unrelated. Filtering keeps the
+    /// statement from being issued at all.</para>
+    /// <para>⚠ <c>queryinsights</c> is deliberately KEPT. It is Fabric's documented query-history surface,
+    /// not internal plumbing, and a user may legitimately read it; it is not in this list because it is not
+    /// a system schema in the sense the list means.</para>
+    /// </remarks>
+    private const string ExcludedSchemas =
+        "'sys','INFORMATION_SCHEMA','guest','db_owner','db_accessadmin'," +
+        "'db_securityadmin','db_ddladmin','db_backupoperator','db_datareader','db_datawriter'," +
+        "'db_denydatareader','db_denydatawriter'";
+
     // User schemas only (exclude system / fixed database roles).
     private const string SchemasSql =
         "SELECT s.name FROM sys.schemas s " +
-        "WHERE s.name NOT IN ('sys','INFORMATION_SCHEMA','guest','db_owner','db_accessadmin'," +
-        "'db_securityadmin','db_ddladmin','db_backupoperator','db_datareader','db_datawriter'," +
-        "'db_denydatareader','db_denydatawriter') ORDER BY s.name";
+        "WHERE s.name NOT IN (" + ExcludedSchemas + ") ORDER BY s.name";
 
     // Base tables and views across all schemas, with a uniform (schema, table, type) shape.
+    // ⚠ The schema predicate is the SAME one SchemasSql uses, and it must stay that way: an object in a
+    // schema discovery never returns is an entry nothing can resolve, and on Fabric one of them cannot even
+    // be described. See ExcludedSchemas.
     private const string TablesSql =
         "SELECT s.name AS schema_name, t.name AS table_name, 'BASE TABLE' AS table_type " +
         "FROM sys.tables t JOIN sys.schemas s ON t.schema_id = s.schema_id " +
+        "WHERE s.name NOT IN (" + ExcludedSchemas + ") " +
         "UNION ALL " +
         "SELECT s.name, v.name, 'VIEW' " +
         "FROM sys.views v JOIN sys.schemas s ON v.schema_id = s.schema_id " +
+        "WHERE s.name NOT IN (" + ExcludedSchemas + ") " +
         "ORDER BY 1, 2";
 
     // Row-identity columns in key order: the primary key if present, else the

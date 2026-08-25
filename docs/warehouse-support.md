@@ -496,6 +496,42 @@ catching. Two diagnostics were added in the same pass to make this class of bug 
 path's own DDL is now logged (`bulk ddl [txn=… own=…]`), and the `ddl create`/`ddl alter` traces now carry the
 transaction id and whether the connection was the pinned one — the annotation that made the diagnosis possible.
 
+## 6.6 FABRIC: catalog discovery enumerated schemas it had already excluded — FIXED (2026-08-25)
+
+`dbt run --target fabric` died before building any model with
+`table_schema failed: 15871:  'managed_delta_table_forks' is not supported`, and had done since 2026-08-09.
+Recorded at the time as "a Fabric-side object our TABLES discovery SQL now trips over … not diagnosed
+further" — every word true, and the framing wrong.
+
+**The cause was ours.** `SchemasSql` has always excluded the system schemas and the fixed database roles;
+`TablesSql`, one line below it, joined `sys.tables`/`sys.views` to `sys.schemas` **with no `WHERE` at all**.
+One policy, written twice, one copy incomplete. Both now share a single `ExcludedSchemas` constant, which is
+the part of the fix that stops it recurring.
+
+**Why box could never have caught it.** MEASURED: on SQL Server 2025 that same `TablesSql` returns `dbo` and
+nothing else — a real SQL Server does not surface its system views through `sys.views` for a user database —
+so the missing predicate changed no answer. On a Fabric Warehouse it returns `dbo` 53, **`sys` 7** and
+`queryinsights` 6; the seven are Fabric's internal Delta plumbing, and Fabric refuses to describe one of
+them (reproduced directly with `SELECT TOP 0 * FROM sys.managed_delta_table_forks`). Materializing the
+catalog therefore threw, and dbt introspects before it builds.
+
+⚠ On box the defect was not invisible in principle, only unreachable in practice: a view created in `guest`
+— an excluded schema — was listed in `duckdb_tables()` **and** resurrected `guest` in `duckdb_schemas()`,
+because the catalog materializes a schema to hold any listed table. That fixture is now the gate
+(`verify_catalog_filter`, 7 → 16, mutation-tested, with `dbo` still populated as the positive control).
+
+### ⚠⚠ It is §6.5's rule applied, not an exception to it
+
+The obvious shape is a `try`/`catch` around the per-table schema fetch — and that is exactly what §6.5
+forbids, because on a warehouse a statement that fails inside an explicit transaction aborts the whole
+transaction, so the swallow would surface later as something unrelated. **The fix is to not issue the
+statement, not to swallow its answer.** Where §6.5 capability-gates a probe on `ServerProfile`, this filters
+the query so the object is never named; both obey the same rule.
+
+⚠ `queryinsights` is deliberately kept — it is Fabric's documented query-history surface, not internal
+plumbing. Post-fix enumeration answers 59 (= 53 + 6), and `dbt run --target fabric --threads 4` is PASS=4/4
+in 49 s, which it had never been.
+
 ## 7. Open decisions
 
 - **Naive-`datetime2` semantic:** RESOLVED — keep naive↔naive (validated under a non-UTC session zone, §3.1;
