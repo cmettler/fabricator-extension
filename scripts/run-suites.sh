@@ -633,12 +633,12 @@ case "$TIER" in
         # /!\ The floor waits are not politeness: fn_cdc_get_min_lsn is transiently NULL for a newly enabled
         # instance (§1.6a) and that value IS the boundary, so without them the section intermittently gets
         # "the boundary ... is not established yet" instead of rows.
-        # /!\ From a GREEN RUN (54/54 - 2897), never from arithmetic - the arithmetic only CORROBORATES it
-        # afterwards, and that is what shows no OTHER suite moved. The CDC reader went 476 -> 559 (slice 9)
-        # -> 604 (slice 8b) -> 630 (_changed_columns) and verify_filter_pushdown 6 -> 17 (the timestamp
-        # binding), i.e. 2860 + 26 + 11 = 2897. A floor left below the actual silently tolerates a
-        # regression that size.
-        : "${MIN_ASSERTIONS:=2897}"
+        # /!\ From a GREEN RUN (54/54 - 2992), never from arithmetic - the arithmetic only CORROBORATES it
+        # afterwards, and that is what shows no OTHER suite moved (2897 + 95 = 2992, the CDC suite's whole
+        # delta). verify_mssql_cdc went 476 -> 559 -> 604 -> 630 -> 725 across slice 9, slice 8b,
+        # _changed_columns and the four user-requested items. A floor left below the actual silently
+        # tolerates a regression that size.
+        : "${MIN_ASSERTIONS:=2992}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2
