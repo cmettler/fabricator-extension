@@ -269,13 +269,19 @@ void PopulateReturnSchema(ClientContext &context, ArrowStreamBindData &bind_data
 
 	int ret = schema_stream.get_schema(&schema_stream, &bind_data.schema_root.arrow_schema);
 	if (ret != 0) {
-		const char *msg =
-		    schema_stream.get_last_error ? schema_stream.get_last_error(&schema_stream) : nullptr;
+		// Copy the error BEFORE release: get_last_error's pointer lives in the stream's
+		// private data, which release frees.
+		string msg;
+		if (schema_stream.get_last_error) {
+			if (const char *err = schema_stream.get_last_error(&schema_stream)) {
+				msg = err;
+			}
+		}
 		if (schema_stream.release) {
 			schema_stream.release(&schema_stream);
 		}
 		throw IOException(string("Fabricator: failed to read schema from stream") +
-		                  (msg ? string(": ") + msg : string()));
+		                  (msg.empty() ? string() : ": " + msg));
 	}
 	if (schema_stream.release) {
 		schema_stream.release(&schema_stream);

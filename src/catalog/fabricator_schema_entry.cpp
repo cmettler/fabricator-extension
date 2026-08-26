@@ -2059,12 +2059,19 @@ unique_ptr<FunctionData> FabricatorExchangeBind(ClientContext &context, TableFun
 
 	ArrowSchemaWrapper schema_root;
 	if (out_schema.get_schema(&out_schema, &schema_root.arrow_schema) != 0) {
-		const char *msg = out_schema.get_last_error ? out_schema.get_last_error(&out_schema) : nullptr;
+		// Copy the error BEFORE release: get_last_error's pointer lives in the stream's
+		// private data, which release frees.
+		string msg;
+		if (out_schema.get_last_error) {
+			if (const char *err = out_schema.get_last_error(&out_schema)) {
+				msg = err;
+			}
+		}
 		if (out_schema.release) {
 			out_schema.release(&out_schema);
 		}
 		throw IOException(string("fabricator: failed to read in-out exchange output schema") +
-		                  (msg ? string(": ") + msg : string()));
+		                  (msg.empty() ? string() : ": " + msg));
 	}
 	if (out_schema.release) {
 		out_schema.release(&out_schema);
@@ -2375,12 +2382,19 @@ unique_ptr<FunctionData> FabricatorCollectorBind(ClientContext &context, TableFu
 
 	ArrowSchemaWrapper schema_root;
 	if (out_schema.get_schema(&out_schema, &schema_root.arrow_schema) != 0) {
-		const char *msg = out_schema.get_last_error ? out_schema.get_last_error(&out_schema) : nullptr;
+		// Copy the error BEFORE release: get_last_error's pointer lives in the stream's
+		// private data, which release frees.
+		string msg;
+		if (out_schema.get_last_error) {
+			if (const char *err = out_schema.get_last_error(&out_schema)) {
+				msg = err;
+			}
+		}
 		if (out_schema.release) {
 			out_schema.release(&out_schema);
 		}
 		throw IOException(string("fabricator: failed to read collector output schema") +
-		                  (msg ? string(": ") + msg : string()));
+		                  (msg.empty() ? string() : ": " + msg));
 	}
 	if (out_schema.release) {
 		out_schema.release(&out_schema);
