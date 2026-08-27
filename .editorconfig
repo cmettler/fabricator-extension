@@ -1,0 +1,19 @@
+# EditorConfig — https://editorconfig.org
+#
+# Deliberately minimal: the licence header only. Formatting rules are NOT declared here — the tree has
+# mixed CRLF/LF under core.autocrlf and clang-format owns the C++ layout, so declaring end_of_line /
+# indent_style would either fight those or reformat files wholesale on the next save.
+root = true
+
+[*.cs]
+# IDE0073. The template carries NO comment markers and no leading blank — Roslyn prefixes each line with
+# "// " itself. Keep it byte-identical to the header in the source files, or every file reports a warning.
+file_header_template = Copyright (c) Christoph Mettler and contributors.\nSPDX-License-Identifier: Apache-2.0\nSee LICENSE in the project root for license information.
+dotnet_diagnostic.IDE0073.severity = warning
+
+# Vendored submodules keep their own licences — never stamp ours on their sources. engineered-wood needs
+# no entry here: it ships its own .editorconfig with `root = true`, so this file never reaches it. These
+# two do not, and DuckDB.ExtensionKit is compiled into Fabricator.Installer.
+[{duckdb,DuckDB.ExtensionKit}/**.cs]
+file_header_template = unset
+dotnet_diagnostic.IDE0073.severity = none

@@ -3345,8 +3345,9 @@ CMakeLists.txt, Makefile, extension_config.cmake
 
 ## License
 
-[MIT](LICENSE) © 2026 Christoph Mettler.
+[Apache License 2.0](LICENSE) © 2026 Christoph Mettler.
 
-Bundled submodules keep their own licenses (all MIT): [DuckDB](https://github.com/duckdb/duckdb),
-[extension-ci-tools](https://github.com/duckdb/extension-ci-tools), and
-[engineered-wood](https://github.com/clast-project/engineered-wood).
+Bundled submodules keep their own licenses: [DuckDB](https://github.com/duckdb/duckdb) (MIT),
+[extension-ci-tools](https://github.com/duckdb/extension-ci-tools) (MIT),
+[DuckDB.ExtensionKit](https://github.com/Giorgi/DuckDB.ExtensionKit) (MIT), and
+[engineered-wood](https://github.com/clast-project/engineered-wood) (Apache 2.0).

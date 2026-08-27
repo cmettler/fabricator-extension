@@ -1,3 +1,7 @@
+// Copyright (c) Christoph Mettler and contributors.
+// SPDX-License-Identifier: Apache-2.0
+// See LICENSE in the project root for license information.
+
 using Apache.Arrow;
 using Apache.Arrow.Ipc;
 

@@ -16,6 +16,15 @@
          DeltaTableOptions.DataFileWriter/Reader) [Experimental("EWDELTA0001")] — fabricator IS the
          in-tree implementation of those seams, so opt in deliberately. -->
     <NoWarn>$(NoWarn);EWDELTA0001;EWPARQUET0002</NoWarn>
+    <!-- Without this, IDExxxx analyzers are IDE-ONLY and .editorconfig's
+         dotnet_diagnostic.IDE0073.severity is accepted and silently ignored by `dotnet build` — so a file
+         added without the licence header would pass CI. MEASURED before enabling: a full non-incremental
+         build of the whole graph reports ZERO IDE warnings, because .editorconfig elevates IDE0073 alone
+         and every other IDE rule keeps its default (suggestion/silent) severity.
+         WARNING: never write a double hyphen in an MSBuild comment — it is illegal inside an XML comment,
+         and the SDK surfaces it as "NETSDK1013: The TargetFramework value '' was not recognized", which
+         names neither the file nor the comment. -->
+    <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
     <!-- The managed bridge is loaded in-process by a native host; it has no
          managed entry point of its own. -->
     <RuntimeIdentifier Condition="'$(RuntimeIdentifier)' == '' and $([MSBuild]::IsOSPlatform('Windows'))">win-x64</RuntimeIdentifier>

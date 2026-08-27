@@ -1,5 +1,6 @@
-// Copyright (c) fabricator contributors.
-// Licensed under the MIT License.
+// Copyright (c) Christoph Mettler and contributors.
+// SPDX-License-Identifier: Apache-2.0
+// See LICENSE in the project root for license information.
 
 namespace Fabricator.Bridge;
 

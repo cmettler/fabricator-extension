@@ -1,3 +1,7 @@
+// Copyright (c) Christoph Mettler and contributors.
+// SPDX-License-Identifier: Apache-2.0
+// See LICENSE in the project root for license information.
+
 namespace Fabricator.Bridge;
 
 /// <summary>DuckDB-side type of a secret field (maps to VARCHAR / INTEGER / BOOLEAN).</summary>
