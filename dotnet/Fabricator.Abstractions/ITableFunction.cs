@@ -132,13 +132,13 @@ public interface ITableFunctionBinding : System.IDisposable
     /// 2026-08-13, which made the two Delta readers unable to prune columns: both push the filter and neither
     /// can promise a filtered result, so the single flag had to be <c>false</c> — and that also switched off
     /// the projection, which they could have honoured. One axis was hostage to the other.</para>
-    /// <para><b>THIS one IS read — at exactly ONE site</b>, <c>BindingBoundTableFunction.Execute</c>, which
+    /// <para><b>THIS one IS read — at exactly ONE site</b>, <c>TableFunctionBindingAdapter.Execute</c>, which
     /// narrows the DECLARED stream schema to the requested columns when it is true and hands over the full
     /// <see cref="OutputSchema"/> when it is false. That is the whole switch: the declaration is the contract
     /// with <c>arrow_ingest</c>, so declaring the projected set is what makes emitting the projected set legal.
     /// ⚠ Its sibling <see cref="SupportsFilterPushdown"/> is read NOWHERE (see its own remarks), and
-    /// <see cref="IBoundTableFunction.MapResultByName"/> is a THIRD question that no binding is consulted
-    /// about — the four <c>BindingBoundTableFunction</c> call sites pass a literal. Do not read the three as
+    /// <see cref="ITableFunctionSession.MapResultByName"/> is a THIRD question that no binding is consulted
+    /// about — the four <c>TableFunctionBindingAdapter</c> call sites pass a literal. Do not read the three as
     /// one mechanism.</para>
     /// <para>⚠ A comment here used to read <i>"NOTHING READS EITHER FLAG YET"</i>. That was accurate when the
     /// flags were split and went stale the moment the projection was wired, which is the failure this file

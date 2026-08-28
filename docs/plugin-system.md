@@ -356,7 +356,7 @@ Therefore:
 Extract a thin **`Fabricator.Abstractions`** assembly = the interfaces + the Arrow-typed contract POCOs
 (`IBackend`, `IBackendCatalog`, `IScalarFunction`/`ICatalog*`, `ITableFunction`/`ITableFunctionBinding`,
 `IInOutFunction`, `ICollectorFunction`, `IAggregateFunction`/`IAggregateState`/`IAggregateSession`,
-`ProviderSetting`, `SecretField`, `TableFunctionScan`, `ScanSpec`, `FilterNode`, `IBoundTableFunction`, …). Shared
+`ProviderSetting`, `SecretField`, `TableFunctionScan`, `ScanSpec`, `FilterNode`, `ITableFunctionSession`, …). Shared
 (default context). `Fabricator.Bridge` references it and keeps the ABI/marshaling/`Bootstrap`/`GlobalFunctions`/
 `BackendRegistry` (also default context — it's the hostfxr entry assembly). A plugin references **only**
 `Fabricator.Abstractions` + `Apache.Arrow` (both host-provided, NOT copied into the plugin dir) + its own private
@@ -451,7 +451,7 @@ discipline (and the restrictions collectible ALCs impose). We never unload a plu
    discovery. Plugins reference `Fabricator.Bridge` directly (no `Abstractions` needed without ALC — everything is
    one context). Sample plugin + `verify_plugin.test`. **Plugins must align their full dependency closure with
    the host** (Apache.Arrow always; every other shared dep too — there is no version isolation without ALC).
-2. **Extract `Fabricator.Abstractions` — DONE** — the contract surface (the `I*Function`/`IBackend`/`IBoundTableFunction`/
+2. **Extract `Fabricator.Abstractions` — DONE** — the contract surface (the `I*Function`/`IBackend`/`ITableFunctionSession`/
    `IAggregateSession` interfaces + `ProviderSetting`/`SecretField`/`TableFunctionScan`/`ScanSpec`/`FilterNode`)
    is now a separate assembly, **kept in the `Fabricator.Bridge` namespace** (assembly split only — zero source
    churn). `Fabricator.Bridge` references it (the ABI/marshaling/`Bootstrap`/`BackendRegistry`/Static-bases/

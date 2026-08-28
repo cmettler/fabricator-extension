@@ -533,7 +533,7 @@ typedef struct FabricatorVTable {
 	// zero-row Arrow stream whose schema = the function's output columns (a custom
 	// function's MAY depend on `args`) — read it for the DuckDB return types, then
 	// release it. *supports_pushdown drives the host's projection mapping — the managed side
-	// calls it IBoundTableFunction.MapResultByName, which is what it has always meant (renamed there
+	// calls it ITableFunctionSession.MapResultByName, which is what it has always meant (renamed there
 	// 2026-08-13; the ABI parameter keeps its name so no rebuild is forced for a spelling).
 	// 1 = map result
 	// columns by NAME — a discovered TVF (pushes the projection + filter into the SELECT)

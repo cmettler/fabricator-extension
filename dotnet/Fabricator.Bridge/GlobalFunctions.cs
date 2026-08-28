@@ -65,12 +65,12 @@ public static class GlobalFunctions
     public static IReadOnlyCollection<ITableFunction> AllTables() => (IReadOnlyCollection<ITableFunction>)TableMap.Value.Values;
 
     /// <summary>Bind a global table function by name (the handle-0 tablefn_bind path) → an
-    /// IBoundTableFunction. Wraps the arg-dependent binding in a <see cref="BindingBoundTableFunction"/>
+    /// ITableFunctionSession. Wraps the arg-dependent binding in a <see cref="TableFunctionBindingAdapter"/>
     /// (by-name projection mapping, like a custom table function); DuckDB re-applies filters above the
     /// scan.</summary>
-    public static IBoundTableFunction ResolveTable(string name, RecordBatch? args) =>
+    public static ITableFunctionSession ResolveTable(string name, RecordBatch? args) =>
         TableMap.Value.TryGetValue(name, out var t)
-            ? new BindingBoundTableFunction(t.Bind(args!), supportsPushdown: true)
+            ? new TableFunctionBindingAdapter(t.Bind(args!), supportsPushdown: true)
             : throw new ArgumentException($"fabricator: no global table function '{name}'");
 
     /// <summary>All declared global aggregate functions, for <c>list_global_functions</c>.</summary>

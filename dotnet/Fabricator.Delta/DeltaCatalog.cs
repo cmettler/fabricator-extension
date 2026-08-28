@@ -5449,7 +5449,7 @@ public sealed class DeltaCatalog : IBackendCatalog
     public Schema GetFunctionOutputSchema(string s, string f, RecordBatch? a = null) =>
         Functions.OutputSchema(s, f, a) ?? throw NoFunction(s, f);
 
-    public IBoundTableFunction TableFnBind(string s, string f, RecordBatch? a) =>
+    public ITableFunctionSession TableFnBind(string s, string f, RecordBatch? a) =>
         Functions.TableFnBind(s, f, a) ?? throw NoFunction(s, f);
 
     public IInOutFunctionBinding InOutBind(string s, string f, RecordBatch? a, Schema input) => throw NoFunctions();

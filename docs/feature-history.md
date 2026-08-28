@@ -859,7 +859,7 @@
   the projected batches and must NOT be re-wrapped with the full schema (doing so crashed `arrow_ingest`
   with SIGSEGV on `SELECT sq FROM tf_ms(4)`). `ProcResultColumns`/`ProcOutputParams`/`FunctionOutputColumns`/
   `ScanFromSource` widened to `internal`. The **table-function session ABI v29** (`c2e452f`+`1f9fe96`) then
-  unified the dispatch under `IBoundTableFunction` (`tablefn_bind`/`tablefn_execute`/`tablefn_close`); see the Phase 5
+  unified the dispatch under `ITableFunctionSession` (`tablefn_bind`/`tablefn_execute`/`tablefn_close`); see the Phase 5
   section. The bespoke TVF could now fold into `ITableFunction` (`tablefn_execute` returns a stream) but
   needn't — the dispatch is already unified.
 
@@ -890,9 +890,9 @@
   `bind_data.string_order_pushable`; no ABI bump.
   The predicate drives the Delta file pruner `ReadAllAsync(columns, filter)` AND per-file Parquet row-group
   pruning via `ParquetReadOptions.Filter` on a per-scan `DeltaTableOptions` — no engineered-wood change). Column
-  PROJECTION into the Parquet read stays deferred: the shared `BindingBoundTableFunction` wraps the result stream with
+  PROJECTION into the Parquet read stays deferred: the shared `TableFunctionBindingAdapter` wraps the result stream with
   the binding's FULL `OutputSchema`, so a projected subset mismatches it (arrow_ingest SIGSEGV) — DuckDB projects
-  above the scan instead (a pushdown-native `IBoundTableFunction` would be needed; small follow-up). See
+  above the scan instead (a pushdown-native `ITableFunctionSession` would be needed; small follow-up). See
   docs/filesystem-bridge.md §"Streaming + filter pushdown".
   Connection-free, ATTACH-free functions registered at `Extension::Load`
   via `loader.RegisterFunction`. **Slice 1 built + verified**: `list_global_functions` enumerates the
@@ -922,7 +922,7 @@
   exchange ABI, no bump — enables the effectful global *apply* half, e.g. `fabricator_apply_tmdl` collector);
   (3) compute/connstr table **DONE** (`tablefn_bind` handle-0 → `GlobalFunctions.ResolveTable` over the v29
   session; the handle-0 `get_function_param_schema` is kind-agnostic via `GlobalFunctions.ParamSchema`;
-  `BindingBoundTableFunction` moved to the Bridge; demos `fabricator_seq` fixed-schema + `fabricator_columns` arg-dependent
+  `TableFunctionBindingAdapter` moved to the Bridge; demos `fabricator_seq` fixed-schema + `fabricator_columns` arg-dependent
   schema); (4) aggregate **DONE** (`IAggregateFunction` base + `ICatalogAggregateFunction`; `AggSessionImpl` →
   the Bridge as public `AggregateSession` shared by catalog+global; `agg_open` handle-0 →
   `GlobalFunctions.ResolveAggregate`; `ParamSchema`/`ReturnField` kind-agnostic; shared
@@ -1180,7 +1180,7 @@
   `DaxCatalog.SystemTables`; bare `SELECT * FROM $SYSTEM.<dmv>`, no pushdown; metadata/scan branch on the
   `system` schema; 14 DMVs validated live), **`daxeval(expression := …, params := …)` function** (slice 4 +
   param binding — under the model schema; evaluates an arbitrary DAX `EVALUATE`/`DEFINE…EVALUATE` query,
-  output schema resolved at bind via `GetSchemaTable` no-describe, `DaxEvalBoundTableFunction`, `SupportsPushdown=false`,
+  output schema resolved at bind via `GetSchemaTable` no-describe, `DaxEvalTableFunctionSession`, `SupportsPushdown=false`,
   streams; validated ROW/COUNTROWS/SUMMARIZECOLUMNS/full-table. **Registered `kind='proc'`** (not `'table'`)
   so args are NAMED params — that's what allows the optional `params` arg without breaking the no-arg call.
   **`params` accepts EITHER a DuckDB `STRUCT` (`{'a':40,'b':2}`, preferred — type-safe, no quoting) OR a
@@ -1376,7 +1376,7 @@ use the `fabricator` bucket — `docker-compose.yml` was renamed too, so the Min
   copy (different, non-assignable `IBackend` → 0 backends). The loader skips host-context-loaded assemblies (the
   shared set) + a `Resolving` hook probes plugin dirs for private deps. **Plugins must align their full
   dependency closure with the host (Apache.Arrow always)** — no version isolation without ALC. **The contract
-  assembly `Fabricator.Abstractions` is extracted** (the `I*Function`/`IBackend`/`IBoundTableFunction`/`IAggregateSession`
+  assembly `Fabricator.Abstractions` is extracted** (the `I*Function`/`IBackend`/`ITableFunctionSession`/`IAggregateSession`
   interfaces + `ProviderSetting`/`SecretField`/`TableFunctionScan`/`ScanSpec`/`FilterNode`, kept in the
   `Fabricator.Bridge` namespace — assembly split only, zero source churn; Bridge references it, the
   ABI/marshaling/`BackendRegistry`/Static-bases/adapters stay in Bridge). `Fabricator.SamplePlugin` references
@@ -1475,8 +1475,8 @@ v29 table-function session, and the v30 removal of the dead `execute_table`/`exe
   `tablefn_execute` (run the scan, per execution) / `tablefn_close` (free the binding at plan teardown), the
   session-handle successor to `get_function_output_schema`+`execute_table`/`execute_proc` in the table scan.
   C++ `FabricatorTableFunctionBind` uses them; the `is_proc` **execute** branch is gone (`tablefn_execute`
-  unifies TVF/proc/custom — C# `SqlServerCatalog.TableFnBind` classifies + returns an `IBoundTableFunction`:
-  `TvfBoundTableFunction` (SQL pushdown) or `BindingBoundTableFunction` (proc positional / custom by-name)). `push_projection`
+  unifies TVF/proc/custom — C# `SqlServerCatalog.TableFnBind` classifies + returns an `ITableFunctionSession`:
+  `TvfTableFunctionSession` (SQL pushdown) or `TableFunctionBindingAdapter` (proc positional / custom by-name)). `push_projection`
   = the binding's `supports_pushdown` (= `!is_proc`, behavior-preserving; `is_proc` survives only for the
   named-vs-positional arg marshaling). The binding is **reused across (prepared) re-executions** — proven by
   a `PREPARE`/`EXECUTE`-twice test (R2); `SqlServerTableValuedFunction.ExecuteScan` no longer consumes its
@@ -1488,7 +1488,7 @@ v29 table-function session, and the v30 removal of the dead `execute_table`/`exe
   every later entry's offset), so `abi.h` + `Abi.cs` field order stay in exact sync; the function suite is
   the alignment gate. **Optional remaining**: fold the bespoke `SqlServerTableValuedFunction` into
   `ITableFunction` now that `tablefn_execute` returns a stream (organizational — the dispatch is already
-  unified under `IBoundTableFunction`). Full design: the plan file's "Phase 5".
+  unified under `ITableFunctionSession`). Full design: the plan file's "Phase 5".
 - **Verified**: inline TVF (`tf_nums(3)`→1,2,3), multi-column (`tf_pair(7,'hi')`), multi-statement
   (`tf_ms`→squares), and aggregation over a TVF. **Pushdown proven via the plan cache**: the statement that
   reached SQL Server was `SELECT [id],[name],[salary] FROM [dbo].[tf_emp](@a0) WHERE [id] <> @p0` (column

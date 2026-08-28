@@ -4032,19 +4032,19 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         return procBinding.OutputSchema;
     }
 
-    // Phase 5 session model: bind a table-function call into an IBoundTableFunction (the host then runs it via
+    // Phase 5 session model: bind a table-function call into an ITableFunctionSession (the host then runs it via
     // tablefn_execute and frees it via tablefn_close). Classifies the function the same way
     // GetFunctionOutputSchema does — a custom (pure-C#) table function, else a discovered TVF (its result
     // columns are in ROUTINE_COLUMNS; pushdown), else a stored proc (no pushdown). The binding resolves the
     // output schema once and is reused across (prepared) re-executions.
-    public IBoundTableFunction TableFnBind(string schemaName, string functionName, RecordBatch? args)
+    public ITableFunctionSession TableFnBind(string schemaName, string functionName, RecordBatch? args)
     {
         // supportsPushdown = !is_proc (preserves the prior push_projection): a custom function maps its full
         // result by NAME (true); a discovered TVF pushes the projection into SQL (true); a stored proc is
         // projected positionally above the scan (false).
         if (SqlServerSessionTagFunction.Is(functionName))
         {
-            return new BindingBoundTableFunction(SessionTag.Bind(args!), supportsPushdown: true);
+            return new TableFunctionBindingAdapter(SessionTag.Bind(args!), supportsPushdown: true);
         }
         var custom = Functions.TableFnBind(schemaName, functionName, args);
         if (custom is not null)
@@ -4053,9 +4053,9 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         }
         if (FunctionOutputColumns(schemaName, functionName).Count > 0)
         {
-            return new TvfBoundTableFunction(new SqlServerTableValuedFunction(this, schemaName, functionName), args!);
+            return new TvfTableFunctionSession(new SqlServerTableValuedFunction(this, schemaName, functionName), args!);
         }
-        return new BindingBoundTableFunction(new SqlServerProcedure(this, schemaName, functionName).Bind(args!), supportsPushdown: false);
+        return new TableFunctionBindingAdapter(new SqlServerProcedure(this, schemaName, functionName).Bind(args!), supportsPushdown: false);
     }
 
     // Phase 6 streaming-exchange bind for every `_each` form. A custom C# in-out (ICatalogInOutFunction —

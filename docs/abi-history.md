@@ -38,7 +38,7 @@ which makes the two paths consistent rather than adding a special case.
 
 **⚠⚠ THE ORDERING IS THE CONTRACT, AND IT IS THE ONLY SUBTLE THING HERE.** The host reads the flag when
 `tablefn_execute` RETURNS — before a single row is pulled — because the managed side reads
-`IBoundTableFunction.SchemaMayChange` immediately after `bound.Execute(...)` and before exporting the stream.
+`ITableFunctionSession.SchemaMayChange` immediately after `bound.Execute(...)` and before exporting the stream.
 A binding whose side effect lives in an async-iterator body has **not run it yet** at that moment: an
 iterator does not begin until the first batch PULL, a different ABI crossing, on whatever thread DuckDB pulls
 from. So a function reporting through this flag MUST do its work in the EAGER part of `Execute()`.
@@ -83,7 +83,7 @@ not transactional in any useful sense, and the change table it creates is empty 
 |---|---|
 | C++ | `TableFnExecute(..., bool *schema_may_change = nullptr)` — **SET-ONLY**, so several executions sharing one accumulator (a prepared statement re-executed, or one plan with several scans) cannot have an earlier `true` erased by a later `false` |
 | C++ | `FabricatorTableFunctionInfo::catalog` carries the `FabricatorCatalog *`. Null for a GLOBAL function, which belongs to no catalog and has nothing to invalidate. ⚠ Set at exactly ONE registration site (`GetOrCreateTableFunction`) because that is the only path whose scans go through `tablefn_execute` — sqlgen uses `bind_replace`, in-out uses the exchange |
-| C# | `ITableFunctionBinding.SchemaMayChange` (author-facing) and `IBoundTableFunction.SchemaMayChange` (ABI-facing), both DIM `=> false`, forwarded by `BindingBoundTableFunction`. An ordinary reader implements nothing |
+| C# | `ITableFunctionBinding.SchemaMayChange` (author-facing) and `ITableFunctionSession.SchemaMayChange` (ABI-facing), both DIM `=> false`, forwarded by `TableFunctionBindingAdapter`. An ordinary reader implements nothing |
 
 ⚠ Capturing the catalog by POINTER in the scan factory is safe for the same reason capturing `handle` there
 already was: both are DATABASE-scoped and outlive every plan that can reference them. It is deliberately NOT
@@ -625,8 +625,25 @@ Dropping "Table" from collector/lateral is safe on the ground `IInOutFunction` a
 kinds are inherently table-valued, so the word disambiguated nothing (there is no lateral SCALAR to confuse
 it with), and `kind='collector'` / `kind='lateral'` is what the declaration wire says.
 
-Breaking for plugin authors, no aliases (the un-prefixing precedent); the ABI and C++ are
-untouched, and the pass was proven mechanical by the masking check (strip the renamed identifiers from
+**The second half (same day): `Bound` left the vocabulary — the ABI-session layer says `Session`.**
+`IBoundTableFunction` → **`ITableFunctionSession`** (with `BindingBoundTableFunction` →
+`TableFunctionBindingAdapter`, `TvfBoundTableFunction` → `TvfTableFunctionSession`,
+`DaxEvalBoundTableFunction` → `DaxEvalTableFunctionSession`, file `SqlServerBoundTableFunction.cs` →
+`SqlServerTableFunctionSession.cs`). "Bound" vs "Binding" were two participles of one verb naming two
+DIFFERENT layers: `ITableFunctionBinding` is the AUTHOR contract (typed `TableFunctionScan` in,
+`IAsyncEnumerable<RecordBatch>` out, result-guarantee flags), the session is the HOST/transport contract
+behind the `tablefn_*` handle (raw `specJson`+`filterValues` in, `IArrowArrayStream` out,
+`MapResultByName`) — the ABI's own vocabulary, which already called this "the Phase 5 table-function
+session model" and names every handle-scoped group a session (`table_*`, `inout_*`, `agg_*`, `lateral_*`).
+The convention after the pass: **`…FunctionBinding` = what an author's `Bind` returns; `…Session` = what
+the ABI handle holds**; in-out/lateral hold their binding directly because the author contract suffices.
+Unifying discovered TVFs under `ITableFunction` to delete the session layer was considered and REJECTED:
+procs already flow through the adapter, but the discovered TVF and `daxeval` are stream-native with
+SQL-side projection, and `MapResultByName = false` has no author-side home — the two-layer split has
+genuine content.
+
+Both halves breaking for plugin authors, no aliases (the un-prefixing precedent); the ABI and C++ are
+untouched, and both passes were proven mechanical by the masking check (strip the renamed identifiers from
 `git diff -U0`; every removed line must be byte-identical to its added counterpart). ⚠ The rename-record
 passages in THIS file and `docs/global-functions.md` deliberately keep the old names — they document the
 earlier renames themselves.

@@ -90,7 +90,7 @@ with zero arguments.
   fallback. Hosting catalog-bound functions there needs: a registry, a real in-memory ≥3-column
   FUNCTIONS stream (`schema_name, name, kind`, built like `CatalogMacroMetadata.Stream` — Delta has no
   SQL engine to `UNION ALL` through), and five member implementations — each mostly a one-liner over
-  existing Bridge pieces (`GlobalFunctions.ExecuteScalar`, `BindingBoundTableFunction`,
+  existing Bridge pieces (`GlobalFunctions.ExecuteScalar`, `TableFunctionBindingAdapter`,
   `ScalarFunctionMetadata.TagVolatility`, `fn.Bind(args).OutputSchema`). Schema names expand across
   `SchemaNames()` exactly like `ExpandCatalogMacroSchemas` does for catalog macros (a declared schema
   must be discovered or C++ drops the function). **No C++ or ABI change** — the catalog machinery is
@@ -344,7 +344,7 @@ Slices land independently, tests green per slice. Estimated shape, not a schedul
 2. **Delta catalog function hosting (hermetic, the enabling refactor).** Registry + in-memory
    FUNCTIONS stream + five `DeltaCatalog` member implementations (§2 Gap 1). Gated by a new hermetic
    suite with demo functions on a local Delta attach — no Fabric involved; it tests the HOSTING. <!-- check-docs:ignore (suite lands with the slice) -->
-   Reuses `GlobalFunctions.ExecuteScalar`, `BindingBoundTableFunction`, `TagVolatility`, the macro
+   Reuses `GlobalFunctions.ExecuteScalar`, `TableFunctionBindingAdapter`, `TagVolatility`, the macro
    schema-expansion pattern. No C++/ABI change; loadable rebuild not required.
 3. **P0 functions.** `FabricApiClient` + refresh + the shortcut five + `run_notebook`
    (build the generic job engine — submit/poll/cancel plumbing — here; only the notebook sugar is

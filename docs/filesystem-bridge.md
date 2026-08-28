@@ -129,8 +129,8 @@ skipping, byte-order-sound) — all green. The Apache.Arrow version is aligned (
   correct superset. `test/verify_delta.test` (60 — incl. `=`/`IN`/`AND`-range pushed, and string `=`/`>`/`<>`
   correctly NOT pushed but still filtered by DuckDB).
 - **Column projection into the Parquet read — DONE 2026-08-13.** It was deferred because the shared
-  `BindingBoundTableFunction` wrapped the result stream with the binding's FULL `OutputSchema`, so a projected SUBSET
-  mismatched the declaration (arrow_ingest SIGSEGV). The fix needed no "pushdown-native `IBoundTableFunction`" as
+  `TableFunctionBindingAdapter` wrapped the result stream with the binding's FULL `OutputSchema`, so a projected SUBSET
+  mismatched the declaration (arrow_ingest SIGSEGV). The fix needed no "pushdown-native `ITableFunctionSession`" as
   predicted here: the WRAPPER holds both the full schema and the spec, so it declares the projected schema
   itself and the bindings resolve their column list through the same `ProjectionPlan`.
   - ⚠ What actually blocked it was a NAME, not the plumbing: one `SupportsPushdown` flag conflated "already

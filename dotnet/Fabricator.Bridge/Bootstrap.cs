@@ -1681,7 +1681,7 @@ public static unsafe class Bootstrap
             {
                 return FabricatorStatus.InvalidArgument;
             }
-            var bound = Handles.Resolve<IBoundTableFunction>(binding);
+            var bound = Handles.Resolve<ITableFunctionSession>(binding);
             if (bound is null)
             {
                 return FabricatorStatus.InvalidArgument;
@@ -1714,7 +1714,7 @@ public static unsafe class Bootstrap
     {
         try
         {
-            Handles.Resolve<IBoundTableFunction>(binding)?.Dispose(); // idempotent
+            Handles.Resolve<ITableFunctionSession>(binding)?.Dispose(); // idempotent
             Handles.Free(binding);
             return FabricatorStatus.Ok;
         }

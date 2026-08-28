@@ -174,7 +174,7 @@ which caps at 19.84.1) loads in net10 (win-x64), connects to local PBI Desktop, 
    Registered via `GetMetadata(Functions)` with **`kind='proc'`** (not `'table'`) so its args register as
    **named parameters** — that's what lets it take an *optional* second arg without breaking the no-arg call.
    `GetFunctionParamSchema` returns `expression VARCHAR` (required) + `params VARCHAR` (optional). The C++
-   table-session path calls `TableFnBind(schema, func, args)` → `DaxEvalBoundTableFunction`: **bind** resolves the
+   table-session path calls `TableFnBind(schema, func, args)` → `DaxEvalTableFunctionSession`: **bind** resolves the
    output schema by executing the query + `GetSchemaTable` (no rows fetched — the no-describe approach;
    arg-dependent, the columns follow the DAX); **`Execute`** re-runs the query and streams via `DaxArrowStream`.
    `SupportsPushdown = false` (an arbitrary DAX query can't be wrapped — DuckDB projects/filters/aggregates

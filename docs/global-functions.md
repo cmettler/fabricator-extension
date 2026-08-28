@@ -231,7 +231,7 @@ Iceberg/Lance next). The mechanism, built on the existing `kind='table'` global 
   skipping** (`DeltaFilterBuilder` → `EngineeredWood.Expressions.Predicate`; the superset-safe policy is in the
   shared C++ `FilterSerializer` gated on `string_order_pushable`, which `DeltaGlobalTableFunction` declares
   `true` (Parquet stats are byte-ordered like DuckDB's default), so all comparisons + `IN` push incl. strings;
-  DuckDB re-applies). Column projection into the Parquet read stays deferred (the shared `BindingBoundTableFunction` wraps the stream with
+  DuckDB re-applies). Column projection into the Parquet read stays deferred (the shared `TableFunctionBindingAdapter` wraps the stream with
   the full output schema, so a projected subset would mismatch it — DuckDB projects above the scan instead).
   See docs/filesystem-bridge.md §"Streaming + filter pushdown".
 
@@ -382,7 +382,7 @@ built once in slice 1; each later slice just extends the handle-0 branch to one 
    `fabricator_tag` (streaming) + `fabricator_collect_sum` (collector); `test/verify_global_functions.test`. Enables
    the effectful global *apply* half (e.g. an `fabricator_apply_tmdl` collector).
 3. **Global table (compute / connstr) — DONE**: the `ITableFunction` base rename; `tablefn_bind` handle-0 →
-   `GlobalFunctions.ResolveTable` (wraps the arg-dependent binding in the now-Bridge `BindingBoundTableFunction`);
+   `GlobalFunctions.ResolveTable` (wraps the arg-dependent binding in the now-Bridge `TableFunctionBindingAdapter`);
    `RegisterFabricatorGlobalFunctions` registers `kind='table'` on the v29 session at load (handle 0, projection +
    best-effort filter pushdown). The handle-0 `get_function_param_schema` became kind-agnostic
    (`GlobalFunctions.ParamSchema`). Demos `fabricator_seq` (fixed schema) + `fabricator_columns` (ARG-DEPENDENT

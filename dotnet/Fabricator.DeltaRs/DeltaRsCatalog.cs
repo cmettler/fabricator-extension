@@ -1093,7 +1093,7 @@ public sealed class DeltaRsCatalog : IBackendCatalog
     // defaults answer — this catalog declares no function of those kinds, so it is never asked.
     public Schema GetFunctionOutputSchema(string s, string f, RecordBatch? a = null) =>
         Functions.OutputSchema(s, f, a) ?? throw NoFunctions();
-    public IBoundTableFunction TableFnBind(string s, string f, RecordBatch? a) =>
+    public ITableFunctionSession TableFnBind(string s, string f, RecordBatch? a) =>
         Functions.TableFnBind(s, f, a) ?? throw NoFunctions();
 
     public void Dispose() => _engine.Dispose();

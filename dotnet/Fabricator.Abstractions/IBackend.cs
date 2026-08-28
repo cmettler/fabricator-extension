@@ -182,7 +182,7 @@ public interface IBackend
 /// filter into the SELECT; a stored proc returns its full result positionally and DuckDB projects + filters
 /// above the scan. Disposed via the host's tablefn_close.
 /// </summary>
-public interface IBoundTableFunction : IDisposable
+public interface ITableFunctionSession : IDisposable
 {
     /// <summary>The function's output columns (may depend on the bound constant args).</summary>
     Schema OutputSchema { get; }
@@ -459,13 +459,13 @@ public interface IBackendCatalog : IDisposable
     /// <summary>
     /// Binds one table-function call (Phase 5 session model — the successor to the removed
     /// <c>execute_table</c>/<c>execute_proc</c>). <paramref name="args"/> (nullable) is a 1-row batch of the
-    /// constant call arguments. Returns an <see cref="IBoundTableFunction"/> whose
-    /// <see cref="IBoundTableFunction.OutputSchema"/>
+    /// constant call arguments. Returns an <see cref="ITableFunctionSession"/> whose
+    /// <see cref="ITableFunctionSession.OutputSchema"/>
     /// is the function's output columns (a custom function's may depend on the args) and which executes the
     /// scan (possibly many times); the managed side classifies the function (discovered TVF / stored proc /
     /// custom). The binding is reused across (prepared) re-executions and disposed via the host's tablefn_close.
     /// </summary>
-    IBoundTableFunction TableFnBind(string schemaName, string functionName, RecordBatch? args) =>
+    ITableFunctionSession TableFnBind(string schemaName, string functionName, RecordBatch? args) =>
         throw NotHosted("table", schemaName, functionName);
 
     /// <summary>

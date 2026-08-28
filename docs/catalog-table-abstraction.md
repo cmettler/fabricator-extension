@@ -687,7 +687,7 @@ SqlServer/DAX/DeltaRs/Stub) — leaving `*BoundTable` classes implementing `ITab
 reproduced the half-applied-convention state the `IArrow*` sweep existed to fix. The `*TableDefinition`
 concrete names deliberately STAY (`DeltaTable : ITable` would collide with engineered-wood's `DeltaTable`).
 `IBoundTable` was deliberately NOT used for the bound half — that name existed until the `tablefn_*` rename
-(it became `IBoundTableFunction`), and resurrecting it for a different concept would poison history greps.
+(it became `ITableFunctionSession`), and resurrecting it for a different concept would poison history greps.
 ⚠ `DeltaRsCatalog.cs` was HAND-edited, excluded from the mechanical pass: it contains
 `DeltaLake.Interfaces.ITable` (delta-dotnet's OWN type), which a word-boundary substitution would have
 corrupted; the `DrsTable` alias + our fully-qualified `Fabricator.Bridge.ITable` (now the definition) stay.
@@ -926,7 +926,7 @@ so the option is not lost, nothing motivates it today.
       **`ITableBinding`** (mirroring `ITableFunctionBinding`). Concretes rode along (`DeltaBoundTable` →
       `DeltaTableBinding` + file rename, same for SqlServer/DAX/DeltaRs/Stub); `*TableDefinition` concrete
       names STAY (`DeltaTable` would collide with engineered-wood's). ⚠ `IBoundTable` deliberately NOT
-      reused (a retired name — it became `IBoundTableFunction`); ⚠ `DeltaRsCatalog.cs` hand-edited outside
+      reused (a retired name — it became `ITableFunctionSession`); ⚠ `DeltaRsCatalog.cs` hand-edited outside
       the mechanical pass because `DeltaLake.Interfaces.ITable` (delta-dotnet's own type) would have been
       corrupted by a word-boundary substitution. Proven mechanical by the masking check; full record: the
       design doc's rename section under §5. En route SETTLED (from DuckDB's source, cited in the design
@@ -994,7 +994,7 @@ so the option is not lost, nothing motivates it today.
       frees a table function's args batch. It is marshaled into a STACK-LOCAL ArrowProducer
       (`fabricator_schema_entry.cpp:1305`), pulled SYNCHRONOUSLY inside `tablefn_bind`
       (`Bootstrap.cs:1372-1377`), and the pull MOVES ownership (`arrow_produce.cpp:217`) — the producer's
-      destructor frees only what was never pulled. Retention is relied on: `TvfBoundTableFunction` stores
+      destructor frees only what was never pulled. Retention is relied on: `TvfTableFunctionSession` stores
       `_args` across executions and disposes it in its own Dispose. The "freed after the batch is
       consumed; do not retain" note is `ICollectorFunction.cs:23` — the COLLECTOR's per-input-CHUNK
       contract, a different path. ⚠ Open doc gap: `ITableFunction.Bind(RecordBatch args)` states no

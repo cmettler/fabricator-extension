@@ -258,11 +258,11 @@ public sealed class CatalogFunctionSet
     /// <summary>
     /// Binds a table function for one execution. <c>supportsPushdown: true</c> means the host maps the full
     /// result BY NAME (the flag is projection mapping, NOT SQL pushdown — see
-    /// <see cref="BindingBoundTableFunction"/>).
+    /// <see cref="TableFunctionBindingAdapter"/>).
     /// </summary>
-    public IBoundTableFunction? TableFnBind(string schema, string func, RecordBatch? args) =>
+    public ITableFunctionSession? TableFnBind(string schema, string func, RecordBatch? args) =>
         TryTable(schema, func, out var fn)
-            ? new BindingBoundTableFunction(fn.Bind(args!), supportsPushdown: true)
+            ? new TableFunctionBindingAdapter(fn.Bind(args!), supportsPushdown: true)
             : null;
 
     /// <summary>

@@ -695,11 +695,11 @@ internal sealed class DaxCatalog : IBackendCatalog
                ?? throw NoFunction(schemaName, functionName);
     }
 
-    public IBoundTableFunction TableFnBind(string schemaName, string functionName, RecordBatch? args)
+    public ITableFunctionSession TableFnBind(string schemaName, string functionName, RecordBatch? args)
     {
         if (IsDaxEval(functionName))
         {
-            return new DaxEvalBoundTableFunction(this, DaxEvalExpression(args), DaxParams(args));
+            return new DaxEvalTableFunctionSession(this, DaxEvalExpression(args), DaxParams(args));
         }
         return Functions.TableFnBind(schemaName, functionName, args)
                ?? throw NoFunction(schemaName, functionName);
@@ -741,13 +741,13 @@ internal sealed class DaxCatalog : IBackendCatalog
     /// <summary>A bound <c>daxeval(expression)</c> call: the output schema is resolved once (at bind, via a
     /// row-less GetSchemaTable probe), and each <see cref="Execute"/> re-runs the DAX and streams the result.
     /// No pushdown (an arbitrary DAX query can't be wrapped) — DuckDB projects/filters above the scan.</summary>
-    private sealed class DaxEvalBoundTableFunction : IBoundTableFunction
+    private sealed class DaxEvalTableFunctionSession : ITableFunctionSession
     {
         private readonly DaxCatalog _catalog;
         private readonly string _dax;
         private readonly IReadOnlyList<KeyValuePair<string, object?>> _params;
 
-        public DaxEvalBoundTableFunction(DaxCatalog catalog, string dax,
+        public DaxEvalTableFunctionSession(DaxCatalog catalog, string dax,
                                  IReadOnlyList<KeyValuePair<string, object?>> daxParams)
         {
             _catalog = catalog;
@@ -757,7 +757,7 @@ internal sealed class DaxCatalog : IBackendCatalog
         }
 
         public Schema OutputSchema { get; }
-        // IBoundTableFunction, not a binding: this is the host's projection MAPPING. False = map positionally, which
+        // ITableFunctionSession, not a binding: this is the host's projection MAPPING. False = map positionally, which
         // is right here — daxeval returns whatever columns the DAX query produced, so there is no declared
         // schema to match names against.
         public bool MapResultByName => false;

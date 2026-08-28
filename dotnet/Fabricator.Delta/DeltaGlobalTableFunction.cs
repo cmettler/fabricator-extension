@@ -74,7 +74,7 @@ public sealed class DeltaGlobalTableFunction : ITableFunction
         // answer rather than a missed optimisation.
         public bool SupportsFilterPushdown => false;
 
-        // Claimed since 2026-08-13: engineered-wood reads ONLY the requested columns, and BindingBoundTableFunction
+        // Claimed since 2026-08-13: engineered-wood reads ONLY the requested columns, and TableFunctionBindingAdapter
         // now declares the projected schema (it resolves it with the same ProjectionPlan used below, so the
         // batches and the declaration cannot disagree). Exact by nature — there is no "superset of columns".
         public bool SupportsProjectionPushdown => true;
@@ -165,7 +165,7 @@ internal static class FilterConstants
 /// partition columns, column mapping and schema evolution.</para>
 ///
 /// <para>⚠ Pushdown: the FILTER is pushed (file / row-group skipping), the PROJECTION is not —
-/// <see cref="BindingBoundTableFunction"/> declares the binding's full <c>OutputSchema</c> at bind, so a projected
+/// <see cref="TableFunctionBindingAdapter"/> declares the binding's full <c>OutputSchema</c> at bind, so a projected
 /// subset would mismatch it. <c>fabricator_delta_scan</c> carries the identical limitation for the identical
 /// reason; lifting it needs a bound table that declares the projected schema.</para>
 ///
@@ -231,7 +231,7 @@ public sealed class DeltaNativeScanFunction : ITableFunction
             // caveat this spike shipped with: the follow-up slices all went into that class.
             //
             // ⚠ THE PROJECTION IS NOT PUSHED, and that is a constraint of this seam rather than of the
-            // reader. BindingBoundTableFunction wraps the stream with the binding's FULL OutputSchema, fixed at bind
+            // reader. TableFunctionBindingAdapter wraps the stream with the binding's FULL OutputSchema, fixed at bind
             // before DuckDB knows what it wants, so emitting a projected subset mismatches the declared
             // schema (arrow_ingest reads past the end — SIGSEGV). Passing no Columns makes the reader
             // resolve the full schema, which is what OutputSchema promises. fabricator_delta_scan carries
@@ -240,7 +240,7 @@ public sealed class DeltaNativeScanFunction : ITableFunction
             var spec = scan.Spec;
             // ⚠ Columns are re-resolved through ProjectionPlan rather than forwarded verbatim: it drops the
             // shapes that must read everything and, crucially, fixes the ORDER to the declared schema's —
-            // DeltaNativeReader emits in the order it is handed, and BindingBoundTableFunction declares in that same
+            // DeltaNativeReader emits in the order it is handed, and TableFunctionBindingAdapter declares in that same
             // order. Forwarding spec.Columns as given would let the two disagree whenever DuckDB asks for
             // columns out of schema order.
             var columns = spec is null ? null : ProjectionPlan.Columns(_schema, spec.Columns);
