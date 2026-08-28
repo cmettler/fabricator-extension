@@ -415,22 +415,37 @@ public interface IBackendCatalog : IDisposable
     IArrowArrayStream ScanTable(string schemaName, string tableName, string? specJson, IArrowArrayStream? filterValues);
 
     /// <summary>
+    /// The ONE refusal behind every function member's default implementation, public so a provider hosting
+    /// some kinds can raise the identical shape for the kinds it does not. Throwing defaults are safe here
+    /// by the declared-set rule (the same one <c>LateralBind</c> shipped under): each of these members is
+    /// only ever called for a name this catalog itself declared (<see cref="GetFunctions"/>), so a catalog
+    /// that declares no functions of a kind is never asked — and one that declares some and omits the member
+    /// gets this refusal naming the exact call instead of a NullReference three layers away.
+    /// </summary>
+    static NotSupportedException NotHosted(string kind, string schemaName, string functionName) =>
+        new($"fabricator: catalog does not host {kind} functions (asked for '{schemaName}.{functionName}')");
+
+    /// <summary>
     /// The Arrow schema describing a function's input parameters (one field per parameter, in order). Used
     /// to register the DuckDB function's argument types. Exported to the host as a bare <c>ArrowSchema</c>.
     /// </summary>
-    Schema GetFunctionParamSchema(string schemaName, string functionName);
+    Schema GetFunctionParamSchema(string schemaName, string functionName) =>
+        throw NotHosted("catalog", schemaName, functionName);
 
     /// <summary>The Arrow schema whose single field is the scalar function's return type.</summary>
-    Schema GetFunctionReturnSchema(string schemaName, string functionName);
+    Schema GetFunctionReturnSchema(string schemaName, string functionName) =>
+        throw NotHosted("scalar", schemaName, functionName);
 
     /// <summary>
-    /// Binds one scalar-function CALL SITE (ABI v80 — the successor to the removed stateless
-    /// <c>execute_scalar</c>). <paramref name="args"/> carries the call's arguments as seen at bind: PARTIAL
-    /// (only the constant slots are real — consult <see cref="ScalarBindArgs.IsConstant"/>) and PRE-CAST.
-    /// Returns a handle whose binding computes the result column for every chunk and whose result field may
-    /// depend on those arguments (null = the declared type stands). Disposed via <c>scalarfn_close</c>.
+    /// Resolves a scalar function to its <see cref="IScalarFunction"/> DEFINITION — resolution only, the
+    /// same split as <see cref="GetTable"/>: the catalog hands out definitions, binding is the HOST's
+    /// per-call act. The <c>scalarfn_bind</c> ABI handler (v80) calls <see cref="IScalarFunction.Bind"/>
+    /// with the call site's <see cref="ScalarBindArgs"/> (PARTIAL and PRE-CAST — see that type) and owns
+    /// the (definition, binding) pair for the handle's life; <c>scalarfn_close</c> disposes it. Null = no
+    /// such scalar, which the host refuses BY NAME — and null is the default, so a catalog that declares no
+    /// scalar functions (and is therefore never asked) implements nothing.
     /// </summary>
-    ScalarBindingHandle ScalarFnBind(string schemaName, string functionName, ScalarBindArgs args);
+    IScalarFunction? GetScalarFunction(string schemaName, string functionName) => null;
 
     /// <summary>
     /// The Arrow schema describing a table-returning function's output columns.
@@ -438,7 +453,8 @@ public interface IBackendCatalog : IDisposable
     /// table function's output schema may depend on them (bound via <see cref="ICatalogTableFunction.Bind"/>);
     /// discovered SQL TVFs/procs read their schema from metadata and ignore it.
     /// </summary>
-    Schema GetFunctionOutputSchema(string schemaName, string functionName, RecordBatch? args = null);
+    Schema GetFunctionOutputSchema(string schemaName, string functionName, RecordBatch? args = null) =>
+        throw NotHosted("table", schemaName, functionName);
 
     /// <summary>
     /// Binds one table-function call (Phase 5 session model — the successor to the removed
@@ -449,7 +465,8 @@ public interface IBackendCatalog : IDisposable
     /// scan (possibly many times); the managed side classifies the function (discovered TVF / stored proc /
     /// custom). The binding is reused across (prepared) re-executions and disposed via the host's tablefn_close.
     /// </summary>
-    IBoundTableFunction TableFnBind(string schemaName, string functionName, RecordBatch? args);
+    IBoundTableFunction TableFnBind(string schemaName, string functionName, RecordBatch? args) =>
+        throw NotHosted("table", schemaName, functionName);
 
     /// <summary>
     /// Binds one streaming table-in-out call (Phase 6 exchange path) for every <c>_each</c> form.
@@ -460,7 +477,8 @@ public interface IBackendCatalog : IDisposable
     /// read-only connection), a stored proc (per-row EXEC on DuckDB's pinned write transaction), or a custom
     /// C# in-out. The gate-based exchange operator drives it.
     /// </summary>
-    IInOutBinding InOutBind(string schemaName, string functionName, RecordBatch? args, Schema inputSchema);
+    IInOutBinding InOutBind(string schemaName, string functionName, RecordBatch? args, Schema inputSchema) =>
+        throw NotHosted("table-in-out", schemaName, functionName);
 
     /// <summary>
     /// Binds one ROW-MAPPED (correlated LATERAL) call. <paramref name="args"/> (nullable) is a 1-row batch of
@@ -473,8 +491,7 @@ public interface IBackendCatalog : IDisposable
     /// declaration typo surface as a null-reference deep in the host.
     /// </remarks>
     ILateralBinding LateralBind(string schemaName, string functionName, RecordBatch? args, Schema inputSchema) =>
-        throw new System.NotSupportedException(
-            $"fabricator: catalog does not host lateral functions (asked for '{schemaName}.{functionName}')");
+        throw NotHosted("lateral", schemaName, functionName);
 
     /// <summary>
     /// Generates the replacement SQL for one call of a catalog-bound SQL-generating table function
@@ -487,8 +504,7 @@ public interface IBackendCatalog : IDisposable
     /// so it must be deterministic and side-effect-free. Providers without any such function throw.
     /// </summary>
     string GenerateTableSql(string schemaName, string functionName, string catalogName, RecordBatch? args) =>
-        throw new NotSupportedException(
-            $"provider: no SQL-generating table function '{schemaName}.{functionName}'");
+        throw NotHosted("SQL-generating table", schemaName, functionName);
 
     /// <summary>
     /// Opens a custom-aggregate session for <c>schema.func</c> (a provider-authored
@@ -496,7 +512,8 @@ public interface IBackendCatalog : IDisposable
     /// to live C# accumulators; the C++ aggregate callbacks marshal ids + argument columns through it. See
     /// <see cref="IAggregateSession"/>.
     /// </summary>
-    IAggregateSession AggOpen(string schemaName, string functionName);
+    IAggregateSession AggOpen(string schemaName, string functionName) =>
+        throw NotHosted("aggregate", schemaName, functionName);
 
     /// <summary>
     /// Creates a table whose columns are described by <paramref name="columns"/>

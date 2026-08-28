@@ -236,9 +236,10 @@ public sealed class CatalogFunctionSet
         return null;
     }
 
-    /// <summary>Binds a scalar call site, or null when this set declares no such function.</summary>
-    public ScalarBindingHandle? BindScalar(string schema, string func, ScalarBindArgs args) =>
-        TryScalar(schema, func, out var fn) ? new ScalarBindingHandle(fn, fn.Bind(args)) : null;
+    /// <summary>The scalar DEFINITION, or null when this set declares no such function — the host binds it
+    /// per call site (<see cref="IBackendCatalog.GetScalarFunction"/>).</summary>
+    public ICatalogScalarFunction? Scalar(string schema, string func) =>
+        TryScalar(schema, func, out var fn) ? fn : null;
 
     /// <summary>
     /// Output schema of a table function, resolved from its constant args — this is the whole reason the

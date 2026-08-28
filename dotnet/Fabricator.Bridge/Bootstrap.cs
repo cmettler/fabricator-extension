@@ -1316,11 +1316,17 @@ public static unsafe class Bootstrap
             }
             var bindArgs = new ScalarBindArgs(argsBatch, constant);
             var f = Marshal.PtrToStringUTF8((nint)func) ?? string.Empty;
-            // handle == 0 => a connection-free GLOBAL scalar: resolve from the global registry by name.
-            var bound = handle == 0
-                ? GlobalFunctions.BindScalar(f, bindArgs)
+            var schemaName = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
+            // The catalog RESOLVES the definition; the HOST binds it — the GetTable split. handle == 0 => a
+            // connection-free GLOBAL scalar, resolved from the global registry by name (which throws by name
+            // when unregistered, so only the catalog branch can answer null).
+            var fn = handle == 0
+                ? GlobalFunctions.ResolveScalar(f)
                 : (Handles.Resolve<IBackendCatalog>(handle) ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty))
-                    .ScalarFnBind(Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty, f, bindArgs);
+                      .GetScalarFunction(schemaName, f)
+                  ?? throw new NotSupportedException(
+                      $"fabricator: no scalar function '{schemaName}.{f}' in this catalog");
+            var bound = new ScalarBindingHandle(fn, fn.Bind(bindArgs));
             // Export the resolved result as a BARE ArrowSchema — the carrier get_function_return_schema uses.
             // ⚠ NOT tablefn_bind's zero-row stream: reading a stream's schema host-side goes through
             // PopulateReturnSchema, which clobbers the ambient host-FS opener, and a scalar binds wherever it is

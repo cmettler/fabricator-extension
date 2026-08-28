@@ -257,6 +257,16 @@ that is a raw function pointer and cannot capture) + `ScalarBindingHolder` (refc
 `scalarfn_close`; refcounted because `FunctionData::Copy` means several copies address ONE managed binding) in
 `src/catalog/fabricator_schema_entry.cpp`.
 
+**⚠ SUPERSEDED IN PART (2026-08-28, C#-only, NO ABI change):** `ScalarFnBind` left the provider contract —
+`IBackendCatalog.GetScalarFunction(schema, name)` returns the scalar's DEFINITION and the HOST binds it per
+call site (the `GetTable` split: the catalog resolves definitions, binding is the host's per-call act), so
+the copy-pasted `new ScalarBindingHandle(fn, fn.Bind(args))` left every provider. `ScalarBindingHandle`
+moved into `Fabricator.Bridge` as an INTERNAL type (still the pair, still only for the zero-input fallback);
+the `scalarfn_bind/execute/close` entries and the C++ side are untouched. The same pass gave every
+function member of `IBackendCatalog` a throwing default (`IBackendCatalog.NotHosted`) with ONE refusal
+wording, justified by the declared-set rule `LateralBind` shipped under — so a provider hosting no
+functions of a kind implements nothing, and the DAX/DeltaRs/Stub refusal stubs were deleted.
+
 ## v79 (2026-08-22) — the `lateral_*` session: row-mapped (correlated LATERAL) functions
 
 **Additive**, five entries appended after `table_close`:

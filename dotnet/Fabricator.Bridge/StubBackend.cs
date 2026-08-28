@@ -116,20 +116,11 @@ public sealed class StubBackend : IBackend
         public Schema GetFunctionReturnSchema(string schemaName, string functionName) =>
             new Schema(new[] { new Field("result", StringType.Default, nullable: true) }, null);
 
-        public ScalarBindingHandle ScalarFnBind(string schemaName, string functionName, ScalarBindArgs args) =>
-            throw new NotSupportedException("stub backend: no scalar functions.");
-
         public Schema GetFunctionOutputSchema(string schemaName, string functionName, RecordBatch? args = null) =>
             new Schema(new[] { new Field("result", StringType.Default, nullable: true) }, null);
 
-        public IBoundTableFunction TableFnBind(string schemaName, string functionName, RecordBatch? args) =>
-            throw new NotSupportedException("stub backend has no table functions");
-
-        public IInOutBinding InOutBind(string schemaName, string functionName, RecordBatch? args, Schema inputSchema) =>
-            throw new NotSupportedException("stub backend has no table-in-out functions");
-
-        public IAggregateSession AggOpen(string schemaName, string functionName) =>
-            throw new NotSupportedException("stub backend has no aggregate functions");
+        // GetScalarFunction / TableFnBind / InOutBind / AggOpen: the interface's uniform throwing defaults
+        // answer — the stub declares no functions, so it is never asked.
 
         public void CreateTable(string schemaName, string tableName, Schema columns, bool ifNotExists,
                                 string? primaryKey, string? uniques, string? defaults,

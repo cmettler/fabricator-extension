@@ -3896,15 +3896,12 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
             ? custom
             : new SqlServerScalarFunction(this, schemaName, functionName);
 
-    // Binds one scalar call site (ABI v80). Both kinds go through IScalarFunction.Bind: a custom C# function
-    // may resolve its result type from the call's constants, and a discovered SQL UDF takes the default
-    // binding, which defers to the DECLARED type — deliberately, since reading SqlServerScalarFunction.Result
-    // is a round trip to INFORMATION_SCHEMA and the host already holds that type from registration.
-    public ScalarBindingHandle ScalarFnBind(string schemaName, string functionName, ScalarBindArgs args)
-    {
-        var fn = ResolveScalar(schemaName, functionName);
-        return new ScalarBindingHandle(fn, fn.Bind(args));
-    }
+    // The host binds whatever this resolves (ABI v80): a custom C# function may resolve its result type
+    // from the call's constants via its own Bind, and a discovered SQL UDF takes the default binding, which
+    // defers to the DECLARED type — deliberately, since reading SqlServerScalarFunction.Result is a round
+    // trip to INFORMATION_SCHEMA and the host already holds that type from registration.
+    public IScalarFunction GetScalarFunction(string schemaName, string functionName) =>
+        ResolveScalar(schemaName, functionName);
 
     // A table-valued function's output columns from INFORMATION_SCHEMA.ROUTINE_COLUMNS
     // (the result-set columns of inline + multi-statement TVFs), each with a

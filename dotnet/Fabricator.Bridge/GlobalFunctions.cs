@@ -201,11 +201,4 @@ public static class GlobalFunctions
     private static IReadOnlyDictionary<string, IScalarFunction> BuildScalars() =>
         Build<IScalarFunction>(b => b.GlobalScalarFunctions, f => f.Name, "scalar");
 
-    /// <summary>Bind a global scalar call site by name (the handle-0 scalarfn_bind path); throws if none is
-    /// registered.</summary>
-    public static ScalarBindingHandle BindScalar(string name, ScalarBindArgs args)
-    {
-        var fn = ResolveScalar(name);
-        return new ScalarBindingHandle(fn, fn.Bind(args));
-    }
 }

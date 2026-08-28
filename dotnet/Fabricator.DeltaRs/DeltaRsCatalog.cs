@@ -1089,14 +1089,12 @@ public sealed class DeltaRsCatalog : IBackendCatalog
 
     public Schema GetFunctionParamSchema(string s, string f) =>
         Functions.ParamSchema(s, f) ?? throw NoFunctions();
-    public Schema GetFunctionReturnSchema(string s, string f) => throw NoFunctions();
-    public ScalarBindingHandle ScalarFnBind(string s, string f, ScalarBindArgs a) => throw NoFunctions();
+    // GetFunctionReturnSchema / GetScalarFunction / InOutBind / AggOpen: the interface's uniform throwing
+    // defaults answer — this catalog declares no function of those kinds, so it is never asked.
     public Schema GetFunctionOutputSchema(string s, string f, RecordBatch? a = null) =>
         Functions.OutputSchema(s, f, a) ?? throw NoFunctions();
     public IBoundTableFunction TableFnBind(string s, string f, RecordBatch? a) =>
         Functions.TableFnBind(s, f, a) ?? throw NoFunctions();
-    public IInOutBinding InOutBind(string s, string f, RecordBatch? a, Schema inputSchema) => throw NoFunctions();
-    public IAggregateSession AggOpen(string s, string f) => throw NoFunctions();
 
     public void Dispose() => _engine.Dispose();
 

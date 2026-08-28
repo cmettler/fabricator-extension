@@ -13,7 +13,7 @@ namespace Fabricator.Bridge;
 /// The single implementation of that loop — it used to be copy-pasted three times, once per caller of the
 /// removed <c>execute_scalar</c> (the global registry, the catalog function set, and SqlServerBackend).
 /// </summary>
-public static class ScalarBindingRunner
+internal static class ScalarBindingRunner
 {
     /// <summary>Consumes + disposes <paramref name="args"/>. Does NOT dispose the binding.</summary>
     public static IArrowArrayStream Execute(ScalarBindingHandle handle, IArrowArrayStream args)

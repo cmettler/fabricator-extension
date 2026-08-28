@@ -8,8 +8,11 @@ namespace Fabricator.Bridge;
 
 /// <summary>
 /// A bound scalar call site as the host holds it: the <see cref="IScalarFunctionBinding"/> plus the
-/// <see cref="IScalarFunction"/> it came from. One of these is what <c>scalarfn_bind</c> hands back as an
-/// opaque handle, and <c>scalarfn_close</c> disposes.
+/// <see cref="IScalarFunction"/> it came from. The <c>scalarfn_bind</c> handler builds one from the
+/// definition <see cref="IBackendCatalog.GetScalarFunction"/> (or the global registry) resolved and hands it
+/// back as an opaque handle; <c>scalarfn_close</c> disposes it. INTERNAL — providers resolve definitions and
+/// never see this pairing (it left the provider contract when <c>ScalarFnBind</c> became
+/// <c>GetScalarFunction</c>).
 /// </summary>
 /// <remarks>
 /// The DEFINITION is carried alongside the binding for one reason: a binding may legitimately report
@@ -17,7 +20,7 @@ namespace Fabricator.Bridge;
 /// result stream then needs the declaration to fall back to. Everything on the hot path uses the binding
 /// alone.
 /// </remarks>
-public sealed class ScalarBindingHandle : System.IDisposable
+internal sealed class ScalarBindingHandle : System.IDisposable
 {
     public ScalarBindingHandle(IScalarFunction definition, IScalarFunctionBinding binding)
     {
