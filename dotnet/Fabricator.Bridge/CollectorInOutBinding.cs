@@ -7,17 +7,17 @@ using Apache.Arrow;
 namespace Fabricator.Bridge;
 
 /// <summary>
-/// Adapts an <see cref="ICollectorBinding"/> to <see cref="IInOutBinding"/> so a collector flows
+/// Adapts an <see cref="ICollectorFunctionBinding"/> to <see cref="IInOutFunctionBinding"/> so a collector flows
 /// through the existing in-out exchange marshaling (<see cref="InOutExchangeStream"/> / the <c>inout_bind</c>
 /// / <c>inout_exchange_open</c> ABI) with no ABI change. The semantic difference is entirely in the contract:
 /// <c>Collect</c> reads all input before yielding and yields NO sentinels — which is exactly what the C++
 /// collector operator's NON-gated (buffered) input stream allows, so there is no single-slot deadlock.
 /// </summary>
-public sealed class CollectorInOutBinding : IInOutBinding
+public sealed class CollectorInOutBinding : IInOutFunctionBinding
 {
-    private readonly ICollectorBinding _inner;
+    private readonly ICollectorFunctionBinding _inner;
 
-    public CollectorInOutBinding(ICollectorBinding inner) => _inner = inner;
+    public CollectorInOutBinding(ICollectorFunctionBinding inner) => _inner = inner;
 
     public Schema OutputSchema => _inner.OutputSchema;
 

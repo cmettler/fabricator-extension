@@ -411,7 +411,7 @@ DETACH pw;
 # argued. docs/lateral_unnest_analysis.md §8.
 #
 # Two things at once. (1) A plugin can declare one: it references Fabricator.Abstractions and nothing else, so
-# `ILateralTableFunction` must cost it no more than a scalar does — and this is the audience the kind is FOR,
+# `ILateralFunction` must cost it no more than a scalar does — and this is the audience the kind is FOR,
 # since a plugin's callee is typically a REST or model call. (2) `plug_lat_slow(n, millis)` sleeps ONCE PER
 # CALL, which is the only cost batching can amortise, so N distinct outer rows cost N sleeps on DuckDB's
 # row-by-row driver and about ONE on the batched operator.

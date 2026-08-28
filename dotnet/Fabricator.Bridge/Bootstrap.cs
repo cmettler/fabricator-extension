@@ -1443,7 +1443,7 @@ public static unsafe class Bootstrap
             }
             var f = Marshal.PtrToStringUTF8((nint)func) ?? string.Empty;
             // handle == 0 => a connection-free GLOBAL in-out / collector: resolve from the global registry by
-            // name (a collector is wrapped as an IInOutBinding). Else the catalog path.
+            // name (a collector is wrapped as an IInOutFunctionBinding). Else the catalog path.
             var binding = handle == 0
                 ? GlobalFunctions.ResolveInOut(f, argsBatch, inSchema)
                 : (Handles.Resolve<IBackendCatalog>(handle) ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty))
@@ -1471,7 +1471,7 @@ public static unsafe class Bootstrap
             {
                 return FabricatorStatus.InvalidArgument;
             }
-            var b = Handles.Resolve<IInOutBinding>(binding);
+            var b = Handles.Resolve<IInOutFunctionBinding>(binding);
             if (b is null)
             {
                 return FabricatorStatus.InvalidArgument;
@@ -1494,7 +1494,7 @@ public static unsafe class Bootstrap
     {
         try
         {
-            Handles.Resolve<IInOutBinding>(binding)?.Dispose(); // idempotent
+            Handles.Resolve<IInOutFunctionBinding>(binding)?.Dispose(); // idempotent
             Handles.Free(binding);
             return FabricatorStatus.Ok;
         }
@@ -1505,7 +1505,7 @@ public static unsafe class Bootstrap
         }
     }
 
-    // --- row-mapped (correlated LATERAL) functions, ABI v79. See ILateralTableFunction + LateralExchange. ---
+    // --- row-mapped (correlated LATERAL) functions, ABI v79. See ILateralFunction + LateralExchange. ---
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
     private static int LateralBind(nint handle, byte* schema, byte* func, CArrowArrayStream* args,

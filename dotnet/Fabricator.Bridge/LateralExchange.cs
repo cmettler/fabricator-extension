@@ -49,7 +49,7 @@ internal sealed class LateralSessionRunner : IDisposable
     private readonly string _func;
     private readonly int _outputColumns;
 
-    public LateralSessionRunner(ILateralBinding binding, string func, Schema inputSchema)
+    public LateralSessionRunner(ILateralFunctionBinding binding, string func, Schema inputSchema)
     {
         _session = binding.Open();
         _func = func;
@@ -149,14 +149,14 @@ internal sealed class LateralSessionRunner : IDisposable
 /// </summary>
 internal sealed class LateralBindingHandle : IDisposable
 {
-    public LateralBindingHandle(ILateralBinding binding, string func, Schema inputSchema)
+    public LateralBindingHandle(ILateralFunctionBinding binding, string func, Schema inputSchema)
     {
         Binding = binding;
         Func = func;
         InputSchema = inputSchema;
     }
 
-    public ILateralBinding Binding { get; }
+    public ILateralFunctionBinding Binding { get; }
     public string Func { get; }
     public Schema InputSchema { get; }
 

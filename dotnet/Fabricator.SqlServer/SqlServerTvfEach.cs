@@ -25,7 +25,7 @@ namespace Fabricator.SqlServer;
 // first chunk and committed when the input stream ends. A top-level internal class (like
 // SqlServerScalarFunction) holding a SqlServerCatalog; reaches its internal helpers (FunctionParameters /
 // BeginInOutScope / GetFunction*Schema / Quote / AddParameters).
-internal sealed class SqlServerTvfEach : IInOutBinding, IInOutIsolation
+internal sealed class SqlServerTvfEach : IInOutFunctionBinding, IInOutIsolation
 {
     private readonly SqlServerCatalog _owner;
     private readonly string _qualified;     // [schema].[func]

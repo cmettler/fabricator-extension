@@ -5452,7 +5452,7 @@ public sealed class DeltaCatalog : IBackendCatalog
     public IBoundTableFunction TableFnBind(string s, string f, RecordBatch? a) =>
         Functions.TableFnBind(s, f, a) ?? throw NoFunction(s, f);
 
-    public IInOutBinding InOutBind(string s, string f, RecordBatch? a, Schema input) => throw NoFunctions();
+    public IInOutFunctionBinding InOutBind(string s, string f, RecordBatch? a, Schema input) => throw NoFunctions();
     public IAggregateSession AggOpen(string s, string f) => throw NoFunctions();
 
     private static NotSupportedException NoFunctions() => new("delta provider: no catalog functions.");

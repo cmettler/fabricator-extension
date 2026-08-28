@@ -24,12 +24,12 @@ public static class GlobalFunctions
         new(() => Build<IInOutFunction>(b => b.GlobalInOutFunctions, f => f.Name, "in-out"),
             LazyThreadSafetyMode.ExecutionAndPublication);
 
-    private static readonly Lazy<IReadOnlyDictionary<string, ILateralTableFunction>> LateralMap =
-        new(() => Build<ILateralTableFunction>(b => b.GlobalLateralFunctions, f => f.Name, "lateral"),
+    private static readonly Lazy<IReadOnlyDictionary<string, ILateralFunction>> LateralMap =
+        new(() => Build<ILateralFunction>(b => b.GlobalLateralFunctions, f => f.Name, "lateral"),
             LazyThreadSafetyMode.ExecutionAndPublication);
 
-    private static readonly Lazy<IReadOnlyDictionary<string, ICollectorTableFunction>> CollectorMap =
-        new(() => Build<ICollectorTableFunction>(b => b.GlobalCollectorFunctions, f => f.Name, "collector"),
+    private static readonly Lazy<IReadOnlyDictionary<string, ICollectorFunction>> CollectorMap =
+        new(() => Build<ICollectorFunction>(b => b.GlobalCollectorFunctions, f => f.Name, "collector"),
             LazyThreadSafetyMode.ExecutionAndPublication);
 
     private static readonly Lazy<IReadOnlyDictionary<string, ITableFunction>> TableMap =
@@ -56,10 +56,10 @@ public static class GlobalFunctions
     public static IReadOnlyCollection<IInOutFunction> AllInOut() => (IReadOnlyCollection<IInOutFunction>)InOutMap.Value.Values;
 
     /// <summary>All declared global row-mapped (correlated LATERAL) functions, for <c>list_global_functions</c>.</summary>
-    public static IReadOnlyCollection<ILateralTableFunction> AllLaterals() => (IReadOnlyCollection<ILateralTableFunction>)LateralMap.Value.Values;
+    public static IReadOnlyCollection<ILateralFunction> AllLaterals() => (IReadOnlyCollection<ILateralFunction>)LateralMap.Value.Values;
 
     /// <summary>All declared global collector functions, for <c>list_global_functions</c>.</summary>
-    public static IReadOnlyCollection<ICollectorTableFunction> AllCollectors() => (IReadOnlyCollection<ICollectorTableFunction>)CollectorMap.Value.Values;
+    public static IReadOnlyCollection<ICollectorFunction> AllCollectors() => (IReadOnlyCollection<ICollectorFunction>)CollectorMap.Value.Values;
 
     /// <summary>All declared global table functions, for <c>list_global_functions</c>.</summary>
     public static IReadOnlyCollection<ITableFunction> AllTables() => (IReadOnlyCollection<ITableFunction>)TableMap.Value.Values;
@@ -140,7 +140,7 @@ public static class GlobalFunctions
 
     /// <summary>Bind a global row-mapped (correlated LATERAL) function by name (the handle-0 lateral_bind
     /// path); throws if none is registered.</summary>
-    public static ILateralBinding ResolveLateral(string name, RecordBatch? args, Schema inputSchema)
+    public static ILateralFunctionBinding ResolveLateral(string name, RecordBatch? args, Schema inputSchema)
     {
         if (!LateralMap.Value.TryGetValue(name, out var fn))
         {
@@ -155,7 +155,7 @@ public static class GlobalFunctions
 
     /// <summary>Bind a global in-out OR collector by name (the handle-0 inout_bind path). A collector is wrapped
     /// in a <see cref="CollectorInOutBinding"/> so it flows through the shared exchange marshaling.</summary>
-    public static IInOutBinding ResolveInOut(string name, RecordBatch? args, Schema inputSchema)
+    public static IInOutFunctionBinding ResolveInOut(string name, RecordBatch? args, Schema inputSchema)
     {
         if (InOutMap.Value.TryGetValue(name, out var io))
         {

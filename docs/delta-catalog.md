@@ -377,7 +377,7 @@ addition (a put-if-absent commit-write) or our own commit step that calls a put-
      through the shared `DeltaWriter` (OmitPathInSchema=false → Fabric-readable). The opener is threaded through
      the collector operator's Source `GetDataInternal` (where the C# `Collect` actually runs, sync-over-async on
      the pull thread — setting it only in Finalize was racy). Cost args ride as NAMED params (`Parameters` added
-     to `IInOutFunction`/`ICollectorTableFunction`, surfaced via the handle-0 `GlobalFunctions.ParamSchema`).
+     to `IInOutFunction`/`ICollectorFunction`, surfaced via the handle-0 `GlobalFunctions.ParamSchema`).
      Validated local (`test/verify_delta_write.test`, official delta-kernel read-back) + a live OneLake managed
      table (`Tables/dbo/fabricator_query`, 20-row query result).
    - **Catalog (streaming) form — DONE** (`ATTACH … (TYPE fabricator, PROVIDER 'delta')`; `CREATE TABLE` / `INSERT

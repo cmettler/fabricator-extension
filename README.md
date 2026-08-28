@@ -2051,7 +2051,7 @@ SELECT * FROM mssql.dbo.usp_process_each((SELECT id FROM mssql.dbo.queue));
   base) are called by their **bare name** (e.g. `db.dbo.cf_tag(<table>)`, not `_each`) and stream on the same
   gate-based exchange; the author's `DoExchange` reads the input and yields output + a per-input sentinel.
 
-### Correlated LATERAL functions (`ILateralTableFunction`)
+### Correlated LATERAL functions (`ILateralFunction`)
 
 A **row-mapped** function is the shape `fn_each` cannot express: its arguments are ordinary values, so it can
 be written the way you would expect — correlated against an outer relation.
@@ -2068,7 +2068,7 @@ SELECT t.id, r.i FROM t, fabricator_lat_repeat(t.n, 3) r;
 ```
 
 The mapping may be 1→1, 1→0 (filtering) or 1→N (fan-out), and the outer columns are carried onto every
-emitted row. Author it in C# with `ILateralTableFunction` (`ICatalogLateralFunction` for a catalog-bound one)
+emitted row. Author it in C# with `ILateralFunction` (`ICatalogLateralFunction` for a catalog-bound one)
 — see [docs/lateral_unnest_analysis.md](docs/lateral_unnest_analysis.md) §8.
 
 **Calls are BATCHED.** The whole input chunk crosses in one call (up to 2048 rows) rather than one call per

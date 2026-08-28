@@ -303,7 +303,7 @@ read-only.
 because the correlated passthrough columns are the HOST's business (DuckDB's `projected_input` on the
 row-by-row path, our own stamping on the batched one).
 
-Managed: `ILateralTableFunction` / `ILateralBinding` / `ILateralSession` / `LateralResult` in
+Managed: `ILateralFunction` / `ILateralFunctionBinding` / `ILateralSession` / `LateralResult` in
 `Fabricator.Abstractions`, marshaled by `Fabricator.Bridge/LateralExchange.cs`; `IBackend
 .GlobalLateralFunctions` and a throwing-DIM `IBackendCatalog.LateralBind`. Declaration kind `lateral`.
 C++: `src/catalog/fabricator_lateral.{cpp,hpp}` — the bind, the row-by-row `in_out_function`, the batched
@@ -605,6 +605,31 @@ were both mechanical: DuckDB's own `TableBinding` must NOT be caught by a `Table
 boundary — it survives at `fabricator_table_entry.cpp:903` and `arrow_ingest.hpp:50`), and a `grep -rl`
 across `dotnet/` sweeps `bin/`/`obj/`, so a `sed -i` over its output rewrites BUILD-OUTPUT DLLs. They are
 gitignored and regenerable, but delete them afterwards rather than letting a corrupted one be picked up.
+
+## The function-kind naming normalization (2026-08-28, C#-only, no ABI involvement)
+
+**One rule, the image of the decl-kind vocabulary** (`scalar`/`table`/`inout`/`collector`/`lateral`/
+`aggregate`): the author contract is `I<Kind>Function` → `Bind(...)` → `I<Kind>FunctionBinding`
+(+ `ICatalog<Kind>Function` for the attach-time scope), mirroring the deliberate `ITable` → `ITableBinding`
+pattern of 2026-08-15. Before it, two kinds followed the rule and three did not — the short binding names
+were an accident of the `IArrow*` un-prefixing above, never a decision — and the definition column was
+inconsistent with itself (collector and lateral carried "TableFunction", in-out did not).
+
+| old | new |
+|---|---|
+| `IInOutBinding` / `ICollectorBinding` / `ILateralBinding` | `IInOutFunctionBinding` / `ICollectorFunctionBinding` / `ILateralFunctionBinding` |
+| `ICollectorTableFunction` / `ICatalogCollectorTableFunction` / `ILateralTableFunction` | `ICollectorFunction` / `ICatalogCollectorFunction` / `ILateralFunction` |
+| files `ICollectorTableFunction.cs` / `ILateralTableFunction.cs` | `ICollectorFunction.cs` / `ILateralFunction.cs` |
+
+Dropping "Table" from collector/lateral is safe on the ground `IInOutFunction` already stands on: those
+kinds are inherently table-valued, so the word disambiguated nothing (there is no lateral SCALAR to confuse
+it with), and `kind='collector'` / `kind='lateral'` is what the declaration wire says.
+
+Breaking for plugin authors, no aliases (the un-prefixing precedent); the ABI and C++ are
+untouched, and the pass was proven mechanical by the masking check (strip the renamed identifiers from
+`git diff -U0`; every removed line must be byte-identical to its added counterpart). ⚠ The rename-record
+passages in THIS file and `docs/global-functions.md` deliberately keep the old names — they document the
+earlier renames themselves.
 
 ## The `IArrow*` un-prefixing, finished in the same pass (2026-08-14, C#-only, no ABI involvement)
 
@@ -1782,7 +1807,7 @@ and would be `FabricTableFunctionBinding` under this convention.
   global host-FS **collector** that writes ANY input table (a DuckDB query result) to a Delta table (Overwrite),
   returning `(version, rows_written)`; buffers input (Arrow-IPC round-trip copy), commits one version via the
   shared `DeltaWriter`. Cost args ride as NAMED params (`Parameters` added to `IInOutFunction`/
-  `ICollectorTableFunction` + handle-0 `GlobalFunctions.ParamSchema`); the opener is threaded into the collector
+  `ICollectorFunction` + handle-0 `GlobalFunctions.ParamSchema`); the opener is threaded into the collector
   Source `GetDataInternal` (where C# `Collect` runs — Finalize-only was racy) AND into the shared
   `FabricatorSetActiveTxn` helper (so any connection-using callsite sets it). Validated local + a live OneLake
   managed table (`Tables/dbo/fabricator_query`). `test/verify_delta_write.test` (18). **Delta folder-as-catalog

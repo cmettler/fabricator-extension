@@ -634,9 +634,9 @@ regression immediately.
 
 ## 8. As built in fabricator (2026-08-22)
 
-**BUILT: `ILateralTableFunction`, both execution paths, ABI v79.** C++
+**BUILT: `ILateralFunction`, both execution paths, ABI v79.** C++
 `src/catalog/fabricator_lateral.{cpp,hpp}`; managed
-`dotnet/Fabricator.Abstractions/ILateralTableFunction.cs` + `dotnet/Fabricator.Bridge/LateralExchange.cs`.
+`dotnet/Fabricator.Abstractions/ILateralFunction.cs` + `dotnet/Fabricator.Bridge/LateralExchange.cs`.
 Gates: `verify_lateral` **144** (hermetic, GLOBAL demos — no ATTACH) and `verify_functions` 34 → **67**
 (service, the catalog-bound half). Four mutants, each killed at its own section.
 
@@ -737,7 +737,7 @@ finalize-bearing function defensively); `ParamsToString` runtime counters (Invar
 captured before execution, and the per-operator `OperatorState::Finalize` route was not wired); projection
 pushdown (§8.3).
 
-### 8.6 ⛔ A PER-FUNCTION batching flag on `ILateralTableFunction` — considered 2026-08-23, DECLINED
+### 8.6 ⛔ A PER-FUNCTION batching flag on `ILateralFunction` — considered 2026-08-23, DECLINED
 
 **Mechanically trivial and needs no ABI change**: the bind's `out_schema` already crosses, so a
 `fabricator.batched = "0"` in Arrow schema/field metadata (the `fabricator.volatile` / `fabricator.param_style`
@@ -789,7 +789,7 @@ provenance contract already supports it unchanged.
 > §8 above is the as-built record. This is the entry `CLAUDE.md` carried alongside it — the scoping
 > bullets, the declined per-function flag, and the corrections — moved here to bound that file.
 
-- **`ILateralTableFunction` — BATCHED CORRELATED LATERAL. ✅ BUILT 2026-08-22 (ABI v79, ADDITIVE; C++ + C#),
+- **`ILateralFunction` — BATCHED CORRELATED LATERAL. ✅ BUILT 2026-08-22 (ABI v79, ADDITIVE; C++ + C#),
   user-directed. Gates: `verify_lateral` **168** (hermetic) + `verify_functions` 34 → **67** and
   `verify_plugin` 79 → **97** (service); tiers **74/74 — 7986** and **52/52 — 2221** LOCALLY, both exactly the
   old floor plus the new assertions, so NO other suite moved. Four mutants, each killed at its own section.
@@ -861,7 +861,7 @@ provenance contract already supports it unchanged.
     so several threads split the 8 rows and move the ratio. ⚠ A plugin references `Fabricator.Abstractions`
     and nothing else, so this also establishes that declaring a lateral costs a plugin no more than declaring
     a scalar.
-  - **⛔ A PER-FUNCTION batching flag on `ILateralTableFunction` — asked 2026-08-23, DECLINED, and the
+  - **⛔ A PER-FUNCTION batching flag on `ILateralFunction` — asked 2026-08-23, DECLINED, and the
     measurement is what settles it (docs §8.6).** It is mechanically trivial (schema metadata on the bind's
     out_schema, the `fabricator.volatile` precedent, no ABI change, precedence AND so the oracle survives) and
     every reason to want it dissolves: a callee that cannot compute provenance is 1:1 and batches fine; a

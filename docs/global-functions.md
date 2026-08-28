@@ -166,21 +166,21 @@ public interface ICatalogTableFunction : ITableFunction { string SchemaName { ge
 
 public interface IInOutFunction {                               // global in-out (streaming exchange)
     string Name { get; } Schema Parameters { get; }   // incl. the Params.TableInput field
-    IInOutBinding Bind(RecordBatch? args, Schema inputSchema);
+    IInOutFunctionBinding Bind(RecordBatch? args, Schema inputSchema);
 }
 public interface ICatalogInOutFunction : IInOutFunction { string SchemaName { get; } }   // was IInOutFunction
 
-public interface ICollectorTableFunction {                      // global collector (pipeline breaker)
+public interface ICollectorFunction {                      // global collector (pipeline breaker)
     string Name { get; } Schema Parameters { get; }   // incl. the Params.TableInput field
-    ICollectorBinding Bind(RecordBatch? args, Schema inputSchema);
+    ICollectorFunctionBinding Bind(RecordBatch? args, Schema inputSchema);
 }
-public interface ICatalogCollectorTableFunction : ICollectorTableFunction { string SchemaName { get; } }  // was ICollectorTableFunction
+public interface ICatalogCollectorFunction : ICollectorFunction { string SchemaName { get; } }  // was ICatalogCollectorTableFunction
 ```
 
 Globals declare `IBackend.GlobalTableFunctions` / `GlobalInOutFunctions` / `GlobalCollectorFunctions`
 (`IReadOnlyList<ITableFunction>` etc., default empty), unioned by `BackendRegistry` into per-kind global
-registries keyed by name. The `Binding` types (`ITableFunctionBinding`, `IInOutBinding`,
-`ICollectorBinding`) are **unchanged** — they already carry no schema-name. Behavior-preserving renames,
+registries keyed by name. The `Binding` types (then `ITableFunctionBinding`, `IInOutBinding`,
+`ICollectorBinding`) were **unchanged** by that pass — they already carry no schema-name. Behavior-preserving renames,
 same gate (the function `verify_*` suites green).
 
 ### Registration at load + handle-0 reuse (no new ABI)

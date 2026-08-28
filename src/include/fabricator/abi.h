@@ -951,7 +951,7 @@ typedef struct FabricatorVTable {
 	void (*table_close)(FabricatorHandle table);
 
 	// -------------------------------------------------------------------------
-	// ROW-MAPPED (correlated LATERAL) table functions — `ILateralTableFunction`, ABI v79.
+	// ROW-MAPPED (correlated LATERAL) table functions — `ILateralFunction`, ABI v79.
 	//
 	// The shape a table-in-out CANNOT express. An in-out declares its input as a {TABLE} parameter, so it is
 	// called `f(<relation>)` and the relation must be nameable; a lateral function declares its positional

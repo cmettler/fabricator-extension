@@ -22,13 +22,13 @@ namespace Fabricator.AnalysisServices;
 /// <c>_input</c>. The old Airport <c>DaxEvalTableFlight</c> equivalent.
 ///
 /// <para>Whole-table semantics (the DAX sees the entire injected table at once) make this a <b>COLLECTOR</b>
-/// (<see cref="ICollectorBinding"/>, registered <c>kind='collector'</c>): the C++ Sink+Source operator
+/// (<see cref="ICollectorFunctionBinding"/>, registered <c>kind='collector'</c>): the C++ Sink+Source operator
 /// buffers ALL input, then <see cref="Collect"/> reads every row into one <c>DATATABLE</c>, evaluates once,
 /// and streams the result — so there is <b>no single-chunk cap</b> (unlike the earlier streaming-exchange
 /// form). Bounded only by what ADOMD accepts as a query string, so still aimed at a parameter / lookup /
 /// filter table; for row-by-row work over a large input use <c>daxeach</c> instead.</para>
 /// </summary>
-internal sealed class DaxEvalTableBinding : ICollectorBinding
+internal sealed class DaxEvalTableBinding : ICollectorFunctionBinding
 {
     private readonly DaxCatalog _catalog;
     private readonly string _expression;
@@ -100,7 +100,7 @@ internal sealed class DaxEvalTableBinding : ICollectorBinding
 /// Output = the DAX result's columns (no input echo — reference <c>@col</c> in the expression to carry input
 /// values through). Per-row + per-chunk emit fits the streaming exchange with no input-size limit.
 /// </summary>
-internal sealed class DaxEachBinding : IInOutBinding
+internal sealed class DaxEachBinding : IInOutFunctionBinding
 {
     private readonly DaxCatalog _catalog;
     private readonly string _expression;

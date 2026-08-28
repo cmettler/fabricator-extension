@@ -63,13 +63,13 @@ public interface IBackend
 
     /// <summary>Connection-free GLOBAL collector (pipeline-breaker) functions, registered at load as bare
     /// <c>fn(&lt;input&gt;)</c>. Empty by default. See docs/global-functions.md.</summary>
-    IEnumerable<ICollectorTableFunction> GlobalCollectorFunctions => System.Array.Empty<ICollectorTableFunction>();
+    IEnumerable<ICollectorFunction> GlobalCollectorFunctions => System.Array.Empty<ICollectorFunction>();
 
     /// <summary>Connection-free GLOBAL row-mapped (correlated LATERAL) functions, registered at load as bare
     /// <c>fn(a, b)</c> — callable both with literal args and correlated against an outer relation
     /// (<c>FROM t, fn(t.a, t.b)</c>), which is the spelling an in-out cannot offer. Empty by default. See
-    /// <see cref="ILateralTableFunction"/>.</summary>
-    IEnumerable<ILateralTableFunction> GlobalLateralFunctions => System.Array.Empty<ILateralTableFunction>();
+    /// <see cref="ILateralFunction"/>.</summary>
+    IEnumerable<ILateralFunction> GlobalLateralFunctions => System.Array.Empty<ILateralFunction>();
 
     /// <summary>Connection-free GLOBAL table functions, registered at load as a bare <c>fn(args)</c> (output
     /// schema resolved per-call from the args via the v29 table session). Empty by default. See
@@ -472,12 +472,12 @@ public interface IBackendCatalog : IDisposable
     /// Binds one streaming table-in-out call (Phase 6 exchange path) for every <c>_each</c> form.
     /// <paramref name="args"/> (nullable) is a 1-row batch of the constant "cost" arguments;
     /// <paramref name="inputSchema"/> is the input table's schema. Returns a binding whose
-    /// <see cref="IInOutBinding.OutputSchema"/> is the full output (input echo ++ the function's own
+    /// <see cref="IInOutFunctionBinding.OutputSchema"/> is the full output (input echo ++ the function's own
     /// columns) and whose <c>DoExchange</c> streams the transform — a discovered TVF (CROSS APPLY on a
     /// read-only connection), a stored proc (per-row EXEC on DuckDB's pinned write transaction), or a custom
     /// C# in-out. The gate-based exchange operator drives it.
     /// </summary>
-    IInOutBinding InOutBind(string schemaName, string functionName, RecordBatch? args, Schema inputSchema) =>
+    IInOutFunctionBinding InOutBind(string schemaName, string functionName, RecordBatch? args, Schema inputSchema) =>
         throw NotHosted("table-in-out", schemaName, functionName);
 
     /// <summary>
@@ -490,7 +490,7 @@ public interface IBackendCatalog : IDisposable
     /// catalog that declares no <c>lateral</c> function can never be asked. Returning null instead would let a
     /// declaration typo surface as a null-reference deep in the host.
     /// </remarks>
-    ILateralBinding LateralBind(string schemaName, string functionName, RecordBatch? args, Schema inputSchema) =>
+    ILateralFunctionBinding LateralBind(string schemaName, string functionName, RecordBatch? args, Schema inputSchema) =>
         throw NotHosted("lateral", schemaName, functionName);
 
     /// <summary>

@@ -9,8 +9,8 @@ namespace Fabricator.Bridge;
 /// <summary>
 /// Convenience base for a custom COLLECTOR table-in-out with a FIXED output schema: override
 /// <see cref="OutputSchema"/> and <see cref="Collect"/>, and the base supplies the
-/// <see cref="ICatalogCollectorTableFunction.Bind"/> → binding wiring. This is to
-/// <see cref="ICatalogCollectorTableFunction"/> what <c>StaticInOutFunction</c> is to
+/// <see cref="ICatalogCollectorFunction.Bind"/> → binding wiring. This is to
+/// <see cref="ICatalogCollectorFunction"/> what <c>StaticInOutFunction</c> is to
 /// <see cref="ICatalogInOutFunction"/>.
 ///
 /// The author writes the whole-table transform in <see cref="Collect"/>: read <c>allInput</c> to EOF
@@ -18,7 +18,7 @@ namespace Fabricator.Bridge;
 /// the operator buffers all input before <c>Collect</c> runs. Cross-input state lives in <c>Collect</c> LOCALS
 /// (a fresh enumerator runs per call, so state never leaks across prepared re-executions).
 /// </summary>
-public abstract class StaticCollectorFunction : ICatalogCollectorTableFunction
+public abstract class StaticCollectorFunction : ICatalogCollectorFunction
 {
     /// <summary>Target catalog schema (e.g. "dbo").</summary>
     public abstract string SchemaName { get; }
@@ -46,9 +46,9 @@ public abstract class StaticCollectorFunction : ICatalogCollectorTableFunction
     public abstract IAsyncEnumerable<RecordBatch> Collect(
         IAsyncEnumerable<RecordBatch> allInput, CancellationToken ct = default);
 
-    public ICollectorBinding Bind(RecordBatch? args, Schema inputSchema) => new Binding(this);
+    public ICollectorFunctionBinding Bind(RecordBatch? args, Schema inputSchema) => new Binding(this);
 
-    private sealed class Binding : ICollectorBinding
+    private sealed class Binding : ICollectorFunctionBinding
     {
         private readonly StaticCollectorFunction _fn;
 

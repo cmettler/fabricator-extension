@@ -914,7 +914,7 @@
   table + in-out cost ZERO new ABI beyond the scalar entry** (arg-dependent output schema is already solved by the
   v29 `tablefn_bind` / v28 `inout_bind` sessions). C# = a base/derived interface split per kind (`IScalarFunction`
   + `ICatalogScalarFunction` [rename of `IArrowScalarFunction`], same for `ITableFunction`/`IInOutFunction`/
-  `ICollectorTableFunction`) + `IBackend.GlobalScalarFunctions`/`GlobalTableFunctions`/`GlobalInOutFunctions`/
+  `ICollectorFunction`) + `IBackend.GlobalScalarFunctions`/`GlobalTableFunctions`/`GlobalInOutFunctions`/
   `GlobalCollectorFunctions`; C++ `RegisterFabricatorGlobalFunctions` branches on `kind` at load →
   `loader.RegisterFunction`. Slices: (1) scalar **DONE** — template engine **`fabricator_render`** via **Fluid**
   (Liquid, secure-by-default); (2) in-out/collector **DONE** (pure-C#, **no opener**; demos `fabricator_tag`
@@ -1216,15 +1216,15 @@ use the `fabricator` bucket — `docker-compose.yml` was renamed too, so the Min
   (validated live to 5000 rows). **The collector table-in-out (pipeline breaker) is BUILT + verified**: a
   second in-out execution shape (a Sink+Source: collect all input, emit at input-EOF) that coexists with the
   streaming exchange, picked by a new additive `kind='collector'`; reuses the v28
-  `inout_bind`/`inout_exchange_open` ABI as-is (no bump). C# `ICollectorTableFunction`/
-  `ICollectorBinding` (+ `StaticCollectorFunction` base, the `CollectorInOutBinding` adapter); C++
+  `inout_bind`/`inout_exchange_open` ABI as-is (no bump). C# `ICollectorFunction`/
+  `ICollectorFunctionBinding` (+ `StaticCollectorFunction` base, the `CollectorInOutBinding` adapter); C++
   `FabricatorCollector*` (in-out `Execute` buffers input into an `ArrowProducer` on the refcounted holder; the
   injected `FabricatorCollectorPhysical` Sink+Source opens the exchange at Finalize and **streams** the C# output
   — the Source pulls the `ArrowStreamReader` a vector-slice at a time, so **input is fully buffered (inherent)
   but output is never materialized**). SqlServer demo `dbo.cf_collect` (`test/verify_collector.test`, 40 —
   whole-table total, 5000-row multi-chunk, sequential-UNION threads=1, empty, NULLs, prepared re-exec; +50k-row
   streamed-output smoke). **`daxevaltable` migrated onto it**
-  (`DaxEvalTableBinding : ICollectorBinding`, `kind='collector'`; reads the whole input into one DATATABLE
+  (`DaxEvalTableBinding : ICollectorFunctionBinding`, `kind='collector'`; reads the whole input into one DATATABLE
   → no 2048 cap; `daxeach` stays streaming `inout`) — validated live against Power BI Desktop
   (`test/verify_dax.test`, 29). In-out regression green: custom 89 / table_inout 63 /
   proc_inout 31 / isolation 17) + **`daxeach(<input>, expression := …)` in-out** (slice 5b — per-input-row
@@ -1630,7 +1630,7 @@ v29 table-function session, and the v30 removal of the dead `execute_table`/`exe
   `test/verify_custom_functions.test`.
 - **Per-row stored procs (4g-proc → now on the exchange, `9056eae`)**: a discovered proc also gets `_each`
   (C++ `AddTableFunction` registers the alias for procs too; a proc can't be inline-CROSS-APPLY'd, so it's
-  EXEC'd per input row). **Now on the streaming exchange** (`SqlServerProcEach : IInOutBinding`, resolved
+  EXEC'd per input row). **Now on the streaming exchange** (`SqlServerProcEach : IInOutFunctionBinding`, resolved
   by `InOutBind` — proc vs TVF classified by ROUTINE_COLUMNS): `DoExchange` runs, per input row, `DECLARE @t
   TABLE(<proc result>); INSERT @t EXEC [s].[p] @param=@p,…; SELECT <echoed input>, t.* FROM @t;` on **DuckDB's
   pinned connection/`_txn`** (`BeginWrite`) — echo is server-side (output = input cols ++ proc result cols),
@@ -1663,7 +1663,7 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   read-your-writes + ROLLBACK) holds — verified by `verify_proc_inout`. The 4g push operator (`FabricatorInOut*`)
   + the `inout_open`/`push`/`finish`/`abort` ABI + `IInOutSession`/`InOutOpen` were **removed at ABI v31**
   (`49e6d94`); the exchange is the only in-out path.
-- **Author API** (`IInOutBinding`, Bridge): `Schema OutputSchema` + `IAsyncEnumerable<RecordBatch>
+- **Author API** (`IInOutFunctionBinding`, Bridge): `Schema OutputSchema` + `IAsyncEnumerable<RecordBatch>
   DoExchange(IAsyncEnumerable<RecordBatch> input, ct)`. `input` yields one batch per DuckDB input chunk; the
   returned enumerable maps to the operator contract — non-empty = HAVE_MORE_OUTPUT, **length-0 = the
   per-input sentinel (NEED_MORE_INPUT)**, end-of-enumerable = FINISHED. **The author yields the sentinel** (the
@@ -1680,7 +1680,7 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
   `IArrowArrayStream` — the Arrow C-stream exporter blocks on `ReadNextRecordBatchAsync` (sync-over-async; the
   hostfxr CLR has no `SynchronizationContext`, so `GetResult` can't deadlock — proven by the 6.0 spike).
   Custom authors implement **one** interface, `IInOutFunction.Bind(args,inputSchema) →
-  IInOutBinding` (registry `CustomInOut`, resolved by `InOutBind`): the author writes `DoExchange` —
+  IInOutFunctionBinding` (registry `CustomInOut`, resolved by `InOutBind`): the author writes `DoExchange` —
   reads the input stream, yields output batches, and yields a length-0 sentinel after each input chunk, with
   cross-chunk state in `DoExchange` locals (a fresh enumerator runs per exchange, so state never leaks across
   re-executions). For a FIXED output schema, derive from the convenience base **`StaticInOutFunction`**

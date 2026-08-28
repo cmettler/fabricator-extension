@@ -28,8 +28,8 @@ public sealed class SamplePluginBackend : IBackend
     public IEnumerable<ITableFunction> GlobalTableFunctions =>
         new ITableFunction[] { new PlugSlowRangeFunction(), new PlugSlowRange2Function() };
 
-    public IEnumerable<ILateralTableFunction> GlobalLateralFunctions =>
-        new ILateralTableFunction[] { new PlugLatSlowFunction() };
+    public IEnumerable<ILateralFunction> GlobalLateralFunctions =>
+        new ILateralFunction[] { new PlugLatSlowFunction() };
 
     /// <summary>
     /// Macros a plugin ships — proving the SQL-template path needs no more from a plugin than the function path
@@ -293,7 +293,7 @@ internal sealed class PlugSlowRange2Function : PlugSlowRangeFunction
 /// Timeout.Infinite — in a suite a hang is the one failure worse than a failure.
 /// </para>
 /// </remarks>
-internal sealed class PlugLatSlowFunction : ILateralTableFunction
+internal sealed class PlugLatSlowFunction : ILateralFunction
 {
     public string Name => "plug_lat_slow";
 
@@ -307,9 +307,9 @@ internal sealed class PlugLatSlowFunction : ILateralTableFunction
         Params.Positional("millis", Int32Type.Default),
     }, metadata: null);
 
-    public ILateralBinding Bind(RecordBatch? args, Schema inputSchema) => new Binding();
+    public ILateralFunctionBinding Bind(RecordBatch? args, Schema inputSchema) => new Binding();
 
-    private sealed class Binding : ILateralBinding
+    private sealed class Binding : ILateralFunctionBinding
     {
         public Schema OutputSchema => new(new[]
         {

@@ -502,7 +502,7 @@ local POSIX for free — the code above `HostFsOpenWrite` needs no change at all
 
 **Status: reproduced on our pinned 1.5.5, mechanism read from the source, NOT filed. ⚠ CHECKED AGAINST
 UPSTREAM `main` @ `044a04a7` (2026-08-23): STILL PRESENT.** It bounds a shipped feature
-(`ILateralTableFunction`, see docs/lateral_unnest_analysis.md §8), so the workaround matters more than the
+(`ILateralFunction`, see docs/lateral_unnest_analysis.md §8), so the workaround matters more than the
 report. **Decision (user, 2026-08-23): WAIT for an upstream fix rather than build a host-side one** — see
 §5.1 for what was declined and why waiting is cheap.
 

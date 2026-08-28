@@ -19,7 +19,7 @@ namespace Fabricator.Bridge;
 /// author yields), end-of-enumerable = FINISHED. One binding may run one exchange at a time; it is reused
 /// across prepared re-executions and disposed when the bind is torn down.
 /// </summary>
-public interface IInOutBinding : IDisposable
+public interface IInOutFunctionBinding : IDisposable
 {
     Schema OutputSchema { get; }
 
@@ -28,7 +28,7 @@ public interface IInOutBinding : IDisposable
 
 /// <summary>
 /// Optional capability for a binding that runs against a SQL connection: the framework sets the configured
-/// transaction isolation level for the exchange before <see cref="IInOutBinding.DoExchange"/> runs, so
+/// transaction isolation level for the exchange before <see cref="IInOutFunctionBinding.DoExchange"/> runs, so
 /// the call's one transaction sees a consistent snapshot. Pure-C# bindings need not implement it.
 /// </summary>
 public interface IInOutIsolation
@@ -38,7 +38,7 @@ public interface IInOutIsolation
 
 /// <summary>
 /// A provider-authored custom table-in-out function that drives the streaming exchange directly (the
-/// free-form shape): <see cref="Bind"/> returns an <see cref="IInOutBinding"/> whose <c>DoExchange</c>
+/// free-form shape): <see cref="Bind"/> returns an <see cref="IInOutFunctionBinding"/> whose <c>DoExchange</c>
 /// the author writes — reading the input stream and yielding output, INCLUDING the length-0 sentinel after
 /// each input chunk (cross-chunk state lives in DoExchange locals). Implement this directly when the output
 /// schema depends on the call's args; for a FIXED output schema derive from <see cref="StaticInOutFunction"/>
@@ -67,7 +67,7 @@ public interface IInOutFunction
 
     /// <summary>Binds one call: <paramref name="args"/> (nullable) are the constant "cost" args (1-row batch);
     /// <paramref name="inputSchema"/> is the actual input table's schema. Returns the per-call binding.</summary>
-    IInOutBinding Bind(RecordBatch? args, Schema inputSchema);
+    IInOutFunctionBinding Bind(RecordBatch? args, Schema inputSchema);
 }
 
 /// <summary>A catalog-bound table-in-out function (attach-time scope) — <see cref="IInOutFunction"/> plus the

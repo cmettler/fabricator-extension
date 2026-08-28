@@ -253,7 +253,7 @@ should be something the USER asks for by name rather than something a file appea
 
 ## A plugin can declare a CORRELATED LATERAL function (2026-08-22, ABI v79)
 
-`ILateralTableFunction` lives in `Fabricator.Abstractions`, so declaring one costs a plugin no more than
+`ILateralFunction` lives in `Fabricator.Abstractions`, so declaring one costs a plugin no more than
 declaring a scalar — and it is the function kind a plugin most often wants, because its callee is typically a
 REST or model call and the whole point is that the WHOLE INPUT CHUNK crosses in one call:
 
@@ -355,7 +355,7 @@ Therefore:
 
 Extract a thin **`Fabricator.Abstractions`** assembly = the interfaces + the Arrow-typed contract POCOs
 (`IBackend`, `IBackendCatalog`, `IScalarFunction`/`ICatalog*`, `ITableFunction`/`ITableFunctionBinding`,
-`IInOutFunction`, `ICollectorTableFunction`, `IAggregateFunction`/`IAggregateState`/`IAggregateSession`,
+`IInOutFunction`, `ICollectorFunction`, `IAggregateFunction`/`IAggregateState`/`IAggregateSession`,
 `ProviderSetting`, `SecretField`, `TableFunctionScan`, `ScanSpec`, `FilterNode`, `IBoundTableFunction`, …). Shared
 (default context). `Fabricator.Bridge` references it and keeps the ABI/marshaling/`Bootstrap`/`GlobalFunctions`/
 `BackendRegistry` (also default context — it's the hostfxr entry assembly). A plugin references **only**

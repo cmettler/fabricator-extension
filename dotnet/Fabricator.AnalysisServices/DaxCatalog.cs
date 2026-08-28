@@ -719,13 +719,13 @@ internal sealed class DaxCatalog : IBackendCatalog
     private static NotSupportedException NoFunction(string schema, string func) =>
         new($"dax provider: no catalog function '{schema}.{func}'.");
 
-    public IInOutBinding InOutBind(string schemaName, string functionName, RecordBatch? args, Schema inputSchema)
+    public IInOutFunctionBinding InOutBind(string schemaName, string functionName, RecordBatch? args, Schema inputSchema)
     {
         // args carries the named "expression" param (1-row, column 0); inputSchema = the input table.
         if (IsDaxEvalTable(functionName))
         {
             // daxevaltable is a COLLECTOR (registered kind='collector'): the C++ Sink+Source operator buffers
-            // ALL input then calls inout_exchange_open once. Wrap the collector binding as an IInOutBinding
+            // ALL input then calls inout_exchange_open once. Wrap the collector binding as an IInOutFunctionBinding
             // (CollectorInOutBinding adapter) so it flows through the shared exchange marshaling. No single-chunk
             // cap — DaxEvalTableBinding now reads the whole input into one DATATABLE.
             return new CollectorInOutBinding(new DaxEvalTableBinding(this, DaxEvalExpression(args), inputSchema));

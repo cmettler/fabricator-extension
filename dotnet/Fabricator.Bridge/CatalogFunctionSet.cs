@@ -41,7 +41,7 @@ public sealed class CatalogFunctionSet
     private readonly Dictionary<string, ICatalogSqlTableFunction> _sqlTables;
     private readonly Dictionary<string, ICatalogInOutFunction> _inOut;
     private readonly Dictionary<string, ICatalogLateralFunction> _laterals;
-    private readonly Dictionary<string, ICatalogCollectorTableFunction> _collectors;
+    private readonly Dictionary<string, ICatalogCollectorFunction> _collectors;
     private readonly Dictionary<string, ICatalogAggregateFunction> _aggregates;
 
     public CatalogFunctionSet(
@@ -50,7 +50,7 @@ public sealed class CatalogFunctionSet
         IEnumerable<ICatalogSqlTableFunction>? sqlTables = null,
         IEnumerable<ICatalogInOutFunction>? inOut = null,
         IEnumerable<ICatalogLateralFunction>? laterals = null,
-        IEnumerable<ICatalogCollectorTableFunction>? collectors = null,
+        IEnumerable<ICatalogCollectorFunction>? collectors = null,
         IEnumerable<ICatalogAggregateFunction>? aggregates = null)
     {
         _scalars = Index(scalars);
@@ -81,7 +81,7 @@ public sealed class CatalogFunctionSet
         ICatalogSqlTableFunction f => f.SchemaName,
         ICatalogInOutFunction f => f.SchemaName,
         ICatalogLateralFunction f => f.SchemaName,
-        ICatalogCollectorTableFunction f => f.SchemaName,
+        ICatalogCollectorFunction f => f.SchemaName,
         ICatalogAggregateFunction f => f.SchemaName,
         _ => throw new ArgumentException($"not a catalog-bound function: {fn.GetType().Name}"),
     };
@@ -93,7 +93,7 @@ public sealed class CatalogFunctionSet
         ICatalogSqlTableFunction f => f.Name,
         ICatalogInOutFunction f => f.Name,
         ICatalogLateralFunction f => f.Name,
-        ICatalogCollectorTableFunction f => f.Name,
+        ICatalogCollectorFunction f => f.Name,
         ICatalogAggregateFunction f => f.Name,
         _ => throw new ArgumentException($"not a catalog-bound function: {fn.GetType().Name}"),
     };
@@ -186,7 +186,7 @@ public sealed class CatalogFunctionSet
     public bool TryLateral(string schema, string func, out ICatalogLateralFunction fn) =>
         TryGet(_laterals, schema, func, out fn);
 
-    public bool TryCollector(string schema, string func, out ICatalogCollectorTableFunction fn) =>
+    public bool TryCollector(string schema, string func, out ICatalogCollectorFunction fn) =>
         TryGet(_collectors, schema, func, out fn);
 
     public bool TryAggregate(string schema, string func, out ICatalogAggregateFunction fn) =>
@@ -279,7 +279,7 @@ public sealed class CatalogFunctionSet
     /// name is not ours. A caller that honours isolation applies it to the returned binding itself — the level
     /// is provider state, not something this set knows.
     /// </summary>
-    public IInOutBinding? InOutBind(string schema, string func, RecordBatch? args, Schema inputSchema)
+    public IInOutFunctionBinding? InOutBind(string schema, string func, RecordBatch? args, Schema inputSchema)
     {
         if (TryCollector(schema, func, out var collector))
         {
@@ -293,7 +293,7 @@ public sealed class CatalogFunctionSet
     /// <see cref="InOutBind"/> on purpose: the two answer different ABI entries and their bindings have
     /// different contracts (an in-out echoes its input, a lateral function does not).
     /// </summary>
-    public ILateralBinding? LateralBind(string schema, string func, RecordBatch? args, Schema inputSchema)
+    public ILateralFunctionBinding? LateralBind(string schema, string func, RecordBatch? args, Schema inputSchema)
     {
         if (!TryLateral(schema, func, out var fn))
         {

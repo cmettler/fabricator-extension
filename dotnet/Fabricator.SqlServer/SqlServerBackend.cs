@@ -138,8 +138,8 @@ public sealed class SqlServerBackend : IBackend
     // (e.g. the fabricator_render template engine) ride along on the always-present default provider.
     public IEnumerable<IScalarFunction> GlobalScalarFunctions => CustomFunctions.GlobalScalar;
     public IEnumerable<IInOutFunction> GlobalInOutFunctions => CustomFunctions.GlobalInOut;
-    public IEnumerable<ICollectorTableFunction> GlobalCollectorFunctions => CustomFunctions.GlobalCollector;
-    public IEnumerable<ILateralTableFunction> GlobalLateralFunctions => CustomFunctions.GlobalLateral;
+    public IEnumerable<ICollectorFunction> GlobalCollectorFunctions => CustomFunctions.GlobalCollector;
+    public IEnumerable<ILateralFunction> GlobalLateralFunctions => CustomFunctions.GlobalLateral;
     public IEnumerable<ITableFunction> GlobalTableFunctions => CustomFunctions.GlobalTable;
     public IEnumerable<IAggregateFunction> GlobalAggregateFunctions => CustomFunctions.GlobalAggregate;
     public IEnumerable<ISqlTableFunction> GlobalSqlTableFunctions => CustomFunctions.GlobalSqlTable;
@@ -4063,7 +4063,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     // read-only connection (SqlServerTvfEach); a stored-proc `_each` EXECs once per input row on DuckDB's
     // pinned write transaction (SqlServerProcEach). Proc vs TVF is classified the same way as elsewhere — a
     // TVF has result columns in ROUTINE_COLUMNS, a proc doesn't.
-    public IInOutBinding InOutBind(string schemaName, string functionName, RecordBatch? args, Schema inputSchema)
+    public IInOutFunctionBinding InOutBind(string schemaName, string functionName, RecordBatch? args, Schema inputSchema)
     {
         // A custom COLLECTOR (pipeline breaker) is tried before a streaming in-out inside the set: the host
         // registered it on the Sink+Source collector operator (kind='collector'), which feeds a NON-gated
@@ -4076,7 +4076,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         var binding = Functions.InOutBind(schemaName, functionName, args, inputSchema)
                       ?? (FunctionOutputColumns(schemaName, routine).Count > 0
                           ? new SqlServerTvfEach(this, schemaName, routine, inputSchema)
-                          : (IInOutBinding)new SqlServerProcEach(this, schemaName, routine, inputSchema));
+                          : (IInOutFunctionBinding)new SqlServerProcEach(this, schemaName, routine, inputSchema));
         // Resolve the SQL isolation for this in-out call and set it on the binding (if it honors isolation):
         // a SET mssql_isolation_level (pushed to the provider settings store) overrides this catalog's ATTACH
         // isolation_level default; pure-C# / proc bindings ignore it. Replaces the former C++
@@ -4092,7 +4092,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
     // Row-mapped (correlated LATERAL) bind. Only provider-AUTHORED lateral functions exist: a discovered SQL
     // routine has no row-mapped form to fall back to — its per-row shape is the `_each` in-out above, which
     // takes a table argument — so an unknown name is an error rather than a fallback.
-    public ILateralBinding LateralBind(string schemaName, string functionName, RecordBatch? args, Schema inputSchema) =>
+    public ILateralFunctionBinding LateralBind(string schemaName, string functionName, RecordBatch? args, Schema inputSchema) =>
         Functions.LateralBind(schemaName, functionName, args, inputSchema)
         ?? throw new ArgumentException(
             $"fabricator: '{schemaName}.{functionName}' is not a lateral function");

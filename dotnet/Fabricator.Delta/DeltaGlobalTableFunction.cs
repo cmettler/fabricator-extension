@@ -1843,7 +1843,7 @@ internal static class DeltaWriter
 /// host before the collector runs). Single-writer; the commit is put-if-absent (EXCLUSIVE_CREATE). The written
 /// table is standard-/Fabric-readable.
 /// </summary>
-public sealed class DeltaWriteCollectorFunction : ICollectorTableFunction
+public sealed class DeltaWriteCollectorFunction : ICollectorFunction
 {
     public string Name => "fabricator_delta_write";
 
@@ -1864,7 +1864,7 @@ public sealed class DeltaWriteCollectorFunction : ICollectorTableFunction
         Params.Named("path", StringType.Default),
     }, metadata: null);
 
-    public ICollectorBinding Bind(RecordBatch? args, Schema inputSchema)
+    public ICollectorFunctionBinding Bind(RecordBatch? args, Schema inputSchema)
     {
         var path = ReadPath(args);
         return new WriteCollectorBinding(path, inputSchema);
@@ -1886,7 +1886,7 @@ public sealed class DeltaWriteCollectorFunction : ICollectorTableFunction
         throw new System.ArgumentException("fabricator_delta_write: the 'path' argument is required");
     }
 
-    private sealed class WriteCollectorBinding : ICollectorBinding
+    private sealed class WriteCollectorBinding : ICollectorFunctionBinding
     {
         private readonly string _path;
         private readonly Schema _inputSchema;

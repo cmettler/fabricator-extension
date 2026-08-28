@@ -8,7 +8,7 @@ namespace Fabricator.Bridge;
 
 /// <summary>
 /// A bound COLLECTOR table-in-out call (the pipeline-breaker shape). Unlike the streaming
-/// <see cref="IInOutBinding"/>, a collector emits NOTHING until it has seen ALL input: the C++ collector
+/// <see cref="IInOutFunctionBinding"/>, a collector emits NOTHING until it has seen ALL input: the C++ collector
 /// operator buffers every input chunk, then (once, after all branches) hands the complete input to
 /// <see cref="Collect"/> and emits its full output. So there is <b>no per-chunk sentinel</b> — input EOF and
 /// output EOF are the genuine signals. Right for whole-table transforms (inject the input as a lookup table,
@@ -16,7 +16,7 @@ namespace Fabricator.Bridge;
 /// pipeline breaker by definition: the input is buffered (no streaming-memory bound). For bounded memory use
 /// the streaming <see cref="ICatalogInOutFunction"/> instead.
 /// </summary>
-public interface ICollectorBinding : IDisposable
+public interface ICollectorFunctionBinding : IDisposable
 {
     /// <summary>The FULL output columns (may depend on the call's args and the input schema).</summary>
     Schema OutputSchema { get; }
@@ -36,7 +36,7 @@ public interface ICollectorBinding : IDisposable
 /// collector operator (NOT the streaming exchange). For a FIXED output schema derive from
 /// <see cref="StaticCollectorFunction"/>.
 /// </summary>
-public interface ICollectorTableFunction
+public interface ICollectorFunction
 {
     /// <summary>Function name. Catalog: <c>SELECT * FROM db.schema.Name(&lt;input&gt;)</c>; global: the bare name.</summary>
     string Name { get; }
@@ -52,13 +52,13 @@ public interface ICollectorTableFunction
 
     /// <summary>Binds one call: <paramref name="args"/> (nullable) are the constant "cost" args (1-row batch);
     /// <paramref name="inputSchema"/> is the actual input table's schema. Returns the per-call binding.</summary>
-    ICollectorBinding Bind(RecordBatch? args, Schema inputSchema);
+    ICollectorFunctionBinding Bind(RecordBatch? args, Schema inputSchema);
 }
 
 /// <summary>A catalog-bound collector table-in-out function (attach-time scope) —
-/// <see cref="ICollectorTableFunction"/> plus the <see cref="SchemaName"/>. For a connection-free collector,
-/// implement the base <see cref="ICollectorTableFunction"/> and declare it as a global instead.</summary>
-public interface ICatalogCollectorTableFunction : ICollectorTableFunction
+/// <see cref="ICollectorFunction"/> plus the <see cref="SchemaName"/>. For a connection-free collector,
+/// implement the base <see cref="ICollectorFunction"/> and declare it as a global instead.</summary>
+public interface ICatalogCollectorFunction : ICollectorFunction
 {
     /// <summary>Target catalog schema (e.g. "dbo").</summary>
     string SchemaName { get; }

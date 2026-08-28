@@ -996,7 +996,7 @@ so the option is not lost, nothing motivates it today.
       (`Bootstrap.cs:1372-1377`), and the pull MOVES ownership (`arrow_produce.cpp:217`) — the producer's
       destructor frees only what was never pulled. Retention is relied on: `TvfBoundTableFunction` stores
       `_args` across executions and disposes it in its own Dispose. The "freed after the batch is
-      consumed; do not retain" note is `ICollectorTableFunction.cs:23` — the COLLECTOR's per-input-CHUNK
+      consumed; do not retain" note is `ICollectorFunction.cs:23` — the COLLECTOR's per-input-CHUNK
       contract, a different path. ⚠ Open doc gap: `ITableFunction.Bind(RecordBatch args)` states no
       ownership; the de-facto contract is THE BINDING OWNS ARGS (retain freely, dispose with the
       binding) — worth a sentence when that file is next touched.

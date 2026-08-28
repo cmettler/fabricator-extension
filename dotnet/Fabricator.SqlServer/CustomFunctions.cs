@@ -60,8 +60,8 @@ internal static class CustomFunctions
 
     // Connection-free GLOBAL row-mapped (correlated LATERAL) functions — bare fn(a, b), callable BOTH with
     // literal args and correlated against an outer relation (FROM t, fn(t.a, t.b)). Implement the base
-    // ILateralTableFunction (no SchemaName). See ILateralTableFunction / catalog/fabricator_lateral.hpp.
-    public static readonly IReadOnlyList<ILateralTableFunction> GlobalLateral = new ILateralTableFunction[]
+    // ILateralFunction (no SchemaName). See ILateralFunction / catalog/fabricator_lateral.hpp.
+    public static readonly IReadOnlyList<ILateralFunction> GlobalLateral = new ILateralFunction[]
     {
         new GfLatRepeatFunction(),
         new GfLatScaleFunction(),
@@ -69,8 +69,8 @@ internal static class CustomFunctions
     };
 
     // Connection-free GLOBAL collector (pipeline-breaker) functions — bare fn(<input>), no ATTACH.
-    // Implement the base ICollectorTableFunction (no SchemaName).
-    public static readonly IReadOnlyList<ICollectorTableFunction> GlobalCollector = new ICollectorTableFunction[]
+    // Implement the base ICollectorFunction (no SchemaName).
+    public static readonly IReadOnlyList<ICollectorFunction> GlobalCollector = new ICollectorFunction[]
     {
         new GfCollectSumFunction(),
         // HOST-FS WRITE: fabricator_delta_write(<input>, path := '…') writes any input table to a Delta table
@@ -230,11 +230,11 @@ internal static class CustomFunctions
         new CfMedianFunction(),
     };
 
-    // Collector table-in-out functions (ICatalogCollectorTableFunction), singletons — surfaced as
+    // Collector table-in-out functions (ICatalogCollectorFunction), singletons — surfaced as
     // `kind='collector'` and resolved by SqlServerCatalog.InOutBind on the Sink+Source pipeline-breaker
     // operator (NOT the streaming exchange). A collector sees ALL input before emitting any output (whole-table
     // semantics), so it can take arbitrarily many input chunks — unlike the streaming in-out. Pure C#.
-    public static readonly IReadOnlyList<ICatalogCollectorTableFunction> Collector = new ICatalogCollectorTableFunction[]
+    public static readonly IReadOnlyList<ICatalogCollectorFunction> Collector = new ICatalogCollectorFunction[]
     {
         new CfCollectFunction(),
     };
@@ -942,9 +942,9 @@ internal sealed class GfTagFunction : IInOutFunction
     {
         Params.TableInput("input", new Field("n", Int32Type.Default, nullable: true)),
     }, metadata: null);
-    public IInOutBinding Bind(RecordBatch? args, Schema inputSchema) => new Binding();
+    public IInOutFunctionBinding Bind(RecordBatch? args, Schema inputSchema) => new Binding();
 
-    private sealed class Binding : IInOutBinding
+    private sealed class Binding : IInOutFunctionBinding
     {
         public Schema OutputSchema => new(new[]
         {
@@ -1000,7 +1000,7 @@ internal sealed class GfMixFunction : IInOutFunction
         Params.Named("bias", Int32Type.Default),
     }, metadata: null);
 
-    public IInOutBinding Bind(RecordBatch? args, Schema inputSchema)
+    public IInOutFunctionBinding Bind(RecordBatch? args, Schema inputSchema)
     {
         // Read BY POSITION over the declared order, skipping the table input (it carries no value). An
         // omitted named argument arrives as a typed NULL, which is the documented "omitted == explicit NULL".
@@ -1023,7 +1023,7 @@ internal sealed class GfMixFunction : IInOutFunction
         return null;
     }
 
-    private sealed class Binding : IInOutBinding
+    private sealed class Binding : IInOutFunctionBinding
     {
         private readonly int _factor;
         private readonly int _offset;
@@ -1064,9 +1064,9 @@ internal sealed class GfMixFunction : IInOutFunction
 
 // GLOBAL collector (pipeline-breaker, connection-free): fabricator_collect_sum(<table of n>) -> (n, total),
 // emitting every input row paired with the GLOBAL sum across ALL input — only knowable after the whole input
-// is seen. The global analog of cf_collect; implements the base ICollectorTableFunction, registered at load on
+// is seen. The global analog of cf_collect; implements the base ICollectorFunction, registered at load on
 // the Sink+Source collector operator. No ATTACH. See docs/global-functions.md.
-internal sealed class GfCollectSumFunction : ICollectorTableFunction
+internal sealed class GfCollectSumFunction : ICollectorFunction
 {
     public string Name => "fabricator_collect_sum";
 
@@ -1074,9 +1074,9 @@ internal sealed class GfCollectSumFunction : ICollectorTableFunction
     {
         Params.TableInput("input", new Field("n", Int32Type.Default, nullable: true)),
     }, metadata: null);
-    public ICollectorBinding Bind(RecordBatch? args, Schema inputSchema) => new Binding();
+    public ICollectorFunctionBinding Bind(RecordBatch? args, Schema inputSchema) => new Binding();
 
-    private sealed class Binding : ICollectorBinding
+    private sealed class Binding : ICollectorFunctionBinding
     {
         public Schema OutputSchema => new(new[]
         {
@@ -1515,7 +1515,7 @@ internal sealed class CfAddFunction : ICatalogScalarFunction
 // It also covers 1->0 (times <= 0 or NULL emits nothing for that row) and, with a large `times`, the case
 // where ONE input chunk produces more than a DuckDB vector of output — which is what exercises the host's
 // multi-slice drain.
-internal sealed class GfLatRepeatFunction : ILateralTableFunction
+internal sealed class GfLatRepeatFunction : ILateralFunction
 {
     public string Name => "fabricator_lat_repeat";
 
@@ -1527,9 +1527,9 @@ internal sealed class GfLatRepeatFunction : ILateralTableFunction
         Params.Positional("times", Int32Type.Default),
     }, metadata: null);
 
-    public ILateralBinding Bind(RecordBatch? args, Schema inputSchema) => new Binding();
+    public ILateralFunctionBinding Bind(RecordBatch? args, Schema inputSchema) => new Binding();
 
-    private sealed class Binding : ILateralBinding
+    private sealed class Binding : ILateralFunctionBinding
     {
         public Schema OutputSchema => new(new[]
         {
@@ -1589,7 +1589,7 @@ internal sealed class GfLatRepeatFunction : ILateralTableFunction
 // row; on the batched path it is the chunk size. Counting Debug log lines was tried first and does not work —
 // duckdb_logs flushes per-thread LAZILY, so a read immediately after the query saw 1 of 98 entries and a
 // count assertion would have been comparing whatever happened to be visible.
-internal sealed class GfLatScaleFunction : ILateralTableFunction
+internal sealed class GfLatScaleFunction : ILateralFunction
 {
     public string Name => "fabricator_lat_scale";
 
@@ -1599,7 +1599,7 @@ internal sealed class GfLatScaleFunction : ILateralTableFunction
         Params.Named("factor", Int32Type.Default),
     }, metadata: null);
 
-    public ILateralBinding Bind(RecordBatch? args, Schema inputSchema)
+    public ILateralFunctionBinding Bind(RecordBatch? args, Schema inputSchema)
     {
         // Read the args HERE — the framework owns that batch and its lifetime ends with the bind.
         int factor = 2;
@@ -1617,7 +1617,7 @@ internal sealed class GfLatScaleFunction : ILateralTableFunction
         return new Binding(factor);
     }
 
-    private sealed class Binding : ILateralBinding
+    private sealed class Binding : ILateralFunctionBinding
     {
         private readonly int _factor;
 
@@ -1680,7 +1680,7 @@ internal sealed class GfLatScaleFunction : ILateralTableFunction
 // parameters — see docs/duckdb-upstream-issues.md), so a named selector would leave the BATCHED path's own
 // validation unreachable from SQL. Positional means it arrives as a constant input column instead, which
 // works in both shapes.
-internal sealed class GfLatBadOriginFunction : ILateralTableFunction
+internal sealed class GfLatBadOriginFunction : ILateralFunction
 {
     public string Name => "fabricator_lat_badorigin";
 
@@ -1690,9 +1690,9 @@ internal sealed class GfLatBadOriginFunction : ILateralTableFunction
         Params.Positional("mode", StringType.Default),
     }, metadata: null);
 
-    public ILateralBinding Bind(RecordBatch? args, Schema inputSchema) => new Binding();
+    public ILateralFunctionBinding Bind(RecordBatch? args, Schema inputSchema) => new Binding();
 
-    private sealed class Binding : ILateralBinding
+    private sealed class Binding : ILateralFunctionBinding
     {
         public Schema OutputSchema => new(new[] { new Field("v", Int32Type.Default, nullable: true) },
                                           metadata: null);
@@ -1770,9 +1770,9 @@ internal sealed class CfLatSplitFunction : ICatalogLateralFunction
         Params.Positional("sep", StringType.Default),
     }, metadata: null);
 
-    public ILateralBinding Bind(RecordBatch? args, Schema inputSchema) => new Binding();
+    public ILateralFunctionBinding Bind(RecordBatch? args, Schema inputSchema) => new Binding();
 
-    private sealed class Binding : ILateralBinding
+    private sealed class Binding : ILateralFunctionBinding
     {
         public Schema OutputSchema => new(new[]
         {

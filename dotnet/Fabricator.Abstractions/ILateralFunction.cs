@@ -70,16 +70,16 @@ public interface ILateralSession : IDisposable
 }
 
 /// <summary>
-/// A bound lateral call — the per-plan object produced by <see cref="ILateralTableFunction.Bind"/>. It holds
+/// A bound lateral call — the per-plan object produced by <see cref="ILateralFunction.Bind"/>. It holds
 /// whatever the call's constant arguments resolved to and hands out per-thread sessions.
 /// </summary>
-public interface ILateralBinding : IDisposable
+public interface ILateralFunctionBinding : IDisposable
 {
     /// <summary>
     /// The function's OWN output columns. Note what is NOT here: the correlated passthrough columns. Those are
     /// the host's business — DuckDB projects them on the row-by-row path and the batched operator stamps them
     /// from <see cref="LateralResult.Origin"/> — so a lateral function never echoes its input, unlike an
-    /// <see cref="IInOutBinding"/>.
+    /// <see cref="IInOutFunctionBinding"/>.
     /// </summary>
     Schema OutputSchema { get; }
 
@@ -115,7 +115,7 @@ public interface ILateralBinding : IDisposable
 /// <c>UNNEST</c>. Both are batched by construction and need none of this machinery.
 /// </para>
 /// </remarks>
-public interface ILateralTableFunction
+public interface ILateralFunction
 {
     /// <summary>Function name. Catalog: <c>SELECT * FROM t, db.schema.Name(t.a)</c>; global: the bare name.</summary>
     string Name { get; }
@@ -138,13 +138,13 @@ public interface ILateralTableFunction
     /// ⚠ Read <paramref name="args"/> DURING this call and do not retain it — the framework owns the batch and
     /// its lifetime ends with the bind, exactly as on the in-out path. Capture the plain values you need.
     /// </remarks>
-    ILateralBinding Bind(RecordBatch? args, Schema inputSchema);
+    ILateralFunctionBinding Bind(RecordBatch? args, Schema inputSchema);
 }
 
-/// <summary>A catalog-bound lateral function (attach-time scope) — <see cref="ILateralTableFunction"/> plus the
+/// <summary>A catalog-bound lateral function (attach-time scope) — <see cref="ILateralFunction"/> plus the
 /// <see cref="SchemaName"/>. For a connection-free, ATTACH-free one, implement the base interface and declare
 /// it as a global instead.</summary>
-public interface ICatalogLateralFunction : ILateralTableFunction
+public interface ICatalogLateralFunction : ILateralFunction
 {
     /// <summary>Target catalog schema (e.g. "dbo").</summary>
     string SchemaName { get; }

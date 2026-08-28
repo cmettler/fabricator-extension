@@ -7,7 +7,7 @@
 //
 // fabricator_lateral.hpp
 //
-// An `ILateralTableFunction` is registered so that its POSITIONAL parameters are real value types and its
+// An `ILateralFunction` is registered so that its POSITIONAL parameters are real value types and its
 // input relation is whatever DuckDB synthesises from the argument EXPRESSIONS — which is what makes the
 // idiomatic correlated spelling bind:
 //
