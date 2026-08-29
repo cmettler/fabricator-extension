@@ -2091,17 +2091,20 @@ Two things are worth knowing before you author one:
   input column. Named arguments do work with literal arguments.
 - **A BIND-TIME constant — one the function needs while resolving its OUTPUT SCHEMA — is its own parameter
   style**: declare it with `Params.Constant("fields")` and read its typed value in `Bind`'s `args` (it never
-  appears among the per-row input columns). In the literal call shape a bare constant just works; in the
-  correlated shape wrap it in **`const_arg(…)`**, which carries the value past DuckDB's argument rewrite
-  through its result *type*:
+  appears among the per-row input columns). A bare constant works in BOTH call shapes:
 
   ```sql
-  SELECT * FROM fabricator_lat_fields(7, 'x,y,z');                       -- literal shape: bare constant
-  SELECT t.n, f.* FROM t, fabricator_lat_fields(t.n, const_arg('x,y'));  -- correlated: const_arg carries it
+  SELECT * FROM fabricator_lat_fields(7, 'x,y,z');                 -- literal shape
+  SELECT t.n, f.* FROM t, fabricator_lat_fields(t.n, 'x,y') f;    -- correlated: also just works
   ```
 
-  The constant may be of any type (a string, a number, a LIST, a STRUCT…). A bare constant in a correlated
-  call is refused with a message naming the wrapper — it cannot reach the bind there.
+  The constant may be of any type (a string, a number, a LIST, a STRUCT…), and anything that *folds at
+  bind* works: constant expressions (`upper('ab') || ',cd'`), `getvariable(…)` (the same SET VARIABLE idiom
+  the CDC cursor uses), and prepared-statement parameters (`f(t.n, ?)` — DuckDB re-binds each EXECUTE, so
+  each execution may even produce a different schema). In the correlated shape the value is recovered from
+  the expression's own rendering, guarded three ways: columns are refused, volatiles (`random()`) are
+  refused, and the folded value must match the slot's bound type. Anything the guards decline gets a clean
+  bind-time refusal saying what a constant slot accepts.
 
 ### Custom aggregates (UDAF)
 

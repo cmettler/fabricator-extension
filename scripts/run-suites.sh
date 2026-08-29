@@ -382,13 +382,22 @@ case "$TIER" in
         # survive a dangling buffer), plus a STRUCT and a LIST, all replicated across drain slices by a 1→N
         # fan-out; §14 executes a PREPARED statement twice, since the managed binding is reused across
         # executions while a session is per operator state.
+        # 8082 since 2026-08-29 (same day, fifth bump): verify_lateral 235 -> 247 (const_arg REMOVED -- the
+        # text channel measured complete; +prepared-parameter, getvariable and NULL-refusal pins), from a
+        # green 74/74 run. Supersedes:
+        # 8070 since 2026-08-29 (same day, fourth bump): verify_lateral 227 -> 235 (+8, struct configs through
+        # all three channels), from a green 74/74 run. Supersedes:
+        # 8062 since 2026-08-29 (same day, third bump): verify_lateral 221 -> 227 (+6, the weird-name guards
+        # and the pinned text-channel residual), from a green 74/74 run. Supersedes:
+        # 8056 since 2026-08-29 (same day, second bump): verify_lateral 211 -> 221 (+10, the bare-constant
+        # fold in the correlated shape — TryFoldRenderedConstant), from a green 74/74 run. Supersedes:
         # 8046 since 2026-08-29: verify_lateral 168 -> 211 (+43, the bind-time constant channel:
         # Params.Constant + const_arg), from a green 74/74 run. The 8003 note it supersedes:
         # 8003 since 2026-08-23: NOT from the CDC slice (that is SqlServer-only and adds nothing here) — the
         # ABI v80 scalar-bind commit took verify_global_functions 101 -> 118 and did not bump this floor, so
         # the tree ran 17 assertions above it for a day. Surfaced by the CDC slice's hermetic run coming out
         # at 8003 against a floor of 7986 and the delta not being attributable to the change under test.
-        : "${MIN_ASSERTIONS:=8046}"
+        : "${MIN_ASSERTIONS:=8082}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

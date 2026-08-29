@@ -799,15 +799,44 @@ reaches the rows: the host strips it from the bind's input schema and from every
 (`LateralBindData.wire_slots` — the child chunk still carries it at its positional index, the wire skips it,
 and the correlated split point is the new `arg_width`, not `input_types.size()`).
 
-**The caller contract.** In the LITERAL shape a bare constant works with no wrapper — the binder folds the
-arguments into `Value`s and the C++ bind forwards `input.inputs[slot]` into the managed args batch. In the
-CORRELATED shape only the type crosses, so the caller wraps the constant: `const_arg(…)`, a host CONSISTENT
-scalar whose per-call-site bind (ABI v80) parks the value in a registry (`CapturedConstants`) and resolves
-its result type to `STRUCT("__fab_const_<md5>": VARCHAR)` — the member NAME is the registry key, and the
-member-name PREFIX is what makes a capture struct unambiguous against a user's own single-member struct
-constant. The scalar's bind runs while the binder builds the synthesized input relation, i.e. BEFORE the
-lateral's own bind consumes the key. A bare constant (or a real column) in a correlated constant slot is
-refused with a message naming the wrapper.
+**The caller contract.** A bare constant works in BOTH shapes. LITERAL: the binder folds the arguments into
+`Value`s and the C++ bind forwards `input.inputs[slot]` into the managed args batch. CORRELATED (added
+2026-08-29, same day, after a probe showed the channel is faithful): the rewrite turns the constant into an
+input COLUMN, but that column's rendered NAME is the parsed expression's own rendering
+(`input_table_names[slot]`) — measured: `'it''s'` keeps its escaping, `5::SMALLINT` renders as
+`CAST(5 AS SMALLINT)`, `upper('ab')` as itself — so `TryFoldRenderedConstant` re-parses it, binds it with
+DuckDB's `ConstantBinder` (which REFUSES column references — a genuine column's rendered name is an
+identifier and dies there), folds it (which refuses volatiles), and accepts the value only when its type
+EQUALS the slot's bound type (the rendering and the original bound independently; a type disagreement means
+the text was not faithful and must not be trusted for the value either). Every guard failure falls through
+to the explicit refusal naming `const_arg(…)` — the wrapper remains as the always-works spelling: a host
+CONSISTENT scalar whose per-call-site bind (ABI v80) parks the value in a registry (`CapturedConstants`) and
+resolves its result type to `STRUCT("__fab_const_<md5>": VARCHAR)` — the member NAME is the registry key,
+and the member-name PREFIX is what makes a capture struct unambiguous against a user's own single-member
+struct constant (the C++ bind also uses it to skip the text channel for wrapped calls). The scalar's bind
+runs while the binder builds the synthesized input relation, i.e. BEFORE the lateral's own bind consumes the
+key.
+
+**⚠ The sqlgen-decoy alternative was probed and is DEAD, not merely unchosen** (user-proposed 2026-08-29:
+a `bind_replace` function rewriting `f_test(t.n, 'x,y')` → `f(t.n, const_arg('x,y'))`): a sqlgen function
+is a STANDARD table function, and the binder refuses a column argument BEFORE `bind_replace` runs —
+`Binder Error: Table function "fabricator_sql_seq" does not support lateral join column parameters` — and
+`generate_table_sql` receives only constant VALUES, never expressions, so it could not reconstruct `t.n`
+even if it bound. The rendered-name probe that killed it is also what showed the text channel was faithful
+enough to build the direct fold above instead.
+
+**⚠ One documented residual in the text channel, MEASURED both ways (2026-08-29)**: a column whose RAW NAME
+parses as a single constant of the column's own type is mis-captured as that constant — a VARCHAR column
+named `'a,b'` (single quotes INSIDE the quoted identifier) and an INTEGER column named `2` both reproduce it,
+pinned in `verify_lateral` §15 so a future fix flips the assertion consciously. ⚠ The double-quoted REFERENCE
+syntax (`t."x,y"`) protects nothing — the channel carries the raw NAME, not the reference spelling; what
+makes ordinary weird names safe is the guards (a comma-name parses as TWO expressions ⇒ declined; a plain
+name parses as an identifier ⇒ ConstantBinder refuses; a wrong-type constant ⇒ the type guard). Both residual
+shapes additionally require passing a COLUMN into a slot documented as a bind-time constant — invalid usage
+either way, so the degradation is refusal→wrong-capture, never corruption of a valid query. There is no
+perfect fix available: the original parse tree would disambiguate, but the binder MOVES the argument
+expressions into the synthesized subquery (`ref.function`'s children measure EMPTY at bind, §8.4), so the
+rendered name is genuinely the only carrier.
 
 **The lifecycle, and it is MEASURED, not designed on taste: an entry is removable only when it is CONSUMED
 *and* UNREFERENCED — neither signal alone is correct.** The prototype (sample plugin, 2026-08-29) shipped
@@ -837,6 +866,31 @@ comma-separated names, an integer count, or a LIST of names, pinning that the ch
 `plug_lat_fields` (sample plugin, ZERO plugin-side machinery — the point of hosting it). Gate:
 `verify_lateral` 168 → **211**, one mutant killed at its own assertion. No ABI bump: the `constant` param
 style is an additive metadata value, and the capture scalar is ordinary v80 machinery.
+
+### 9.1 `const_arg` REMOVED — the text channel needs no fallback (2026-08-29, same day; user-driven)
+
+**The capture wrapper and everything stateful in this feature are GONE**: `const_arg`, the
+`CapturedConstants` registry, its consumed+unreferenced lifecycle, the purge backstop and the "expired"
+error — all deleted the same day they shipped, once measurement showed no case needs them. What remains is
+`LateralConstants.Validate` (a stateless null-check with the one refusal a caller can act on) and the C++
+`TryFoldRenderedConstant`. §9 above records the capture design as HISTORY — it was built, pushed
+(`2e41b2a`), measured superseded, and removed; its lifecycle findings (the two call shapes bracket a scalar
+binding's life differently; dispose-only release broke the literal shape) remain worth knowing because they
+are properties of DuckDB's binder, not of the deleted code.
+
+**The measurement that justified removal** — every probed case works BARE through the text channel, in both
+call shapes: strings (escaping intact), numbers, casts, foldable expressions, LISTs, STRUCTs
+(`main.struct_pack(a := 5, b := 'a')` — reparseable), `getvariable(…)`, and — the case expected to need the
+wrapper — **prepared-statement parameters**: `f(t.n, ?)` works because DuckDB re-binds every EXECUTE and the
+re-parsed `$1` re-binds against the executing binder's parameter values, so successive EXECUTEs may even
+resolve DIFFERENT output schemas (gated). With zero measured differentiators, the wrapper's only remaining
+value was insurance against a future rendering drift — and that fails LOUDLY (a bind-time refusal the gate
+catches at the next pin bump) and is cheap to re-introduce. Do not re-add it speculatively.
+
+⚠ One mechanical find during removal: an UNTYPED NULL constant slot in the correlated shape crashed the args
+marshal with Apache.Arrow's *"Length must equal null count"* — the same null-array hostility the v80 scalar
+path recorded (DuckDB exports a null array with `null_count = 0`). Carried as a typed NULL now; the managed
+side only asks `IsNull` before refusing, so the carrier type is irrelevant.
 
 ## Appendix — the `CLAUDE.md` entry, moved verbatim (2026-08-23)
 

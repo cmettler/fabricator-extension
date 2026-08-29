@@ -557,27 +557,22 @@ EXECUTE lat_p(3);
 12	12
 
 # ============================================================================
-# 15. BIND-TIME CONSTANT PARAMETERS (Params.Constant + const_arg) — the capture channel.
+# 15. BIND-TIME CONSTANT PARAMETERS (Params.Constant) — stateless, bare constants in BOTH call shapes.
 #     A lateral function's positional slots are per-row input columns, so a per-call constant that shapes the
 #     OUTPUT SCHEMA has no direct spelling: DuckDB rewrites every argument into the synthesized input relation
 #     (bind_table_function.cpp), and named parameters cannot be written in the correlated shape at all
 #     (docs/duckdb-upstream-issues.md §5). fabricator_lat_fields(n, fields) declares `fields` as a bind-time
-#     CONSTANT: in the literal shape the folded value reaches the bind directly (a BARE constant works); in
-#     the correlated shape the caller wraps it in const_arg(...), whose per-call-site RESULT TYPE — a
-#     single-member struct whose member name keys the host's capture registry — smuggles the value past the
-#     rewrite. The output columns are named by the constant, which is the assertion that matters: no fixed
-#     schema could produce them.
+#     CONSTANT: the literal shape folds the value directly, and the CORRELATED shape recovers it from the
+#     synthesized column's rendered expression text (parsed, bound by ConstantBinder — which refuses columns —
+#     folded, and type-checked against the slot's bound type). A `const_arg(...)` capture wrapper existed for
+#     one day and was REMOVED once measurement showed the text channel needs no fallback
+#     (lateral_unnest_analysis.md §9.1). The output columns are named by the constant, which is the assertion
+#     that matters: no fixed schema could produce them.
 # ============================================================================
 
 # The literal shape needs NO wrapper: the constant arrives as the folded parameter value.
 query III
 SELECT x, y, z FROM fabricator_lat_fields(7, 'x,y,z');
-----
-7	14	21
-
-# The wrapper is harmless where it is unnecessary.
-query III
-SELECT x, y, z FROM fabricator_lat_fields(7, const_arg('x,y,z'));
 ----
 7	14	21
 
@@ -596,7 +591,7 @@ SELECT aa, bb FROM fabricator_lat_fields(4, ['aa','bb']);
 # the synthesized input relation, i.e. BEFORE the lateral's own bind reads the registry; and the constant slot
 # is stripped from the callee's rows (Session.Call sees only `n`).
 query TII
-SELECT t.range::VARCHAR AS n, f.a, f.b FROM range(1,4) t, fabricator_lat_fields(t.range, const_arg('a,b')) f ORDER BY 1;
+SELECT t.range::VARCHAR AS n, f.a, f.b FROM range(1,4) t, fabricator_lat_fields(t.range, 'a,b') f ORDER BY 1;
 ----
 1	1	2
 2	2	4
@@ -604,16 +599,18 @@ SELECT t.range::VARCHAR AS n, f.a, f.b FROM range(1,4) t, fabricator_lat_fields(
 
 # DESCRIBE binds without executing — the schema really is resolved at bind, from the captured constant.
 query T
-SELECT column_name FROM (DESCRIBE SELECT * FROM fabricator_lat_fields(1, const_arg('d1,d2,d3'))) ORDER BY ALL;
+SELECT column_name FROM (DESCRIBE SELECT * FROM fabricator_lat_fields(1, 'd1,d2,d3')) ORDER BY ALL;
 ----
 d1
 d2
 d3
 
-# Re-binds repopulate the registry before re-consuming: a view (bound at use) and a prepared statement
-# (DuckDB re-binds each EXECUTE).
+# Re-binds resolve afresh each time: a view (bound at use) and prepared statements (DuckDB re-binds each
+# EXECUTE) — including a PREPARED PARAMETER as the constant, with a DIFFERENT value (and therefore a
+# different output schema) per execution: the re-bind re-parses `$1` against the executing binder's
+# parameter values.
 statement ok
-CREATE VIEW v_lat_capture AS SELECT * FROM fabricator_lat_fields(6, const_arg('va,vb'));
+CREATE VIEW v_lat_capture AS SELECT * FROM fabricator_lat_fields(6, 'va,vb');
 
 query II
 SELECT va, vb FROM v_lat_capture;
@@ -624,7 +621,7 @@ statement ok
 DROP VIEW v_lat_capture;
 
 statement ok
-PREPARE lat_cap AS SELECT u, v FROM fabricator_lat_fields(3, const_arg('u,v'));
+PREPARE lat_cap AS SELECT u, v FROM fabricator_lat_fields(3, 'u,v');
 
 query II
 EXECUTE lat_cap;
@@ -639,30 +636,83 @@ EXECUTE lat_cap;
 statement ok
 DEALLOCATE lat_cap;
 
-# A BARE constant cannot reach the bind in the CORRELATED shape (the rewrite turns it into an input column),
-# so it is refused with the recipe — never silently treated as a per-row value.
-statement error
-SELECT * FROM range(3) t, fabricator_lat_fields(t.range, 'x,y') f;
-----
-<REGEX>:.*bind-time CONSTANT.*const_arg.*
+statement ok
+PREPARE lat_param AS SELECT t.range AS n, f.* FROM range(1,2) t, fabricator_lat_fields(t.range, ?) f;
 
-# A real COLUMN in the constant slot is the same refusal: there is no bind-time value to capture.
+query III
+EXECUTE lat_param('x,y');
+----
+1	1	2
+
+query IIII
+EXECUTE lat_param('a,b,c');
+----
+1	1	2	3
+
+statement ok
+DEALLOCATE lat_param;
+
+# getvariable(...) folds at bind — the SET VARIABLE idiom carries a lateral config the same way it carries
+# the CDC cursor.
+statement ok
+SET VARIABLE lat_cfg = 'g1,g2';
+
+query II
+SELECT g1, g2 FROM fabricator_lat_fields(4, getvariable('lat_cfg'));
+----
+4	8
+
+query TII
+SELECT t.range::VARCHAR, f.g1, f.g2 FROM range(1,2) t, fabricator_lat_fields(t.range, getvariable('lat_cfg')) f ORDER BY 1;
+----
+1	1	2
+
+# A BARE constant in the CORRELATED shape: the rewrite turns it into an input column, but its rendered
+# expression text is faithful (measured: quotes escaped, casts as CAST(...)), so the bind recovers the value
+# from the text — no wrapper needed.
+query TII
+SELECT t.range::VARCHAR, f.x, f.y FROM range(1,3) t, fabricator_lat_fields(t.range, 'x,y') f ORDER BY 1;
+----
+1	1	2
+2	2	4
+
+# The quote round-trip is the assertion that the text channel is FAITHFUL, not merely present: the second
+# column's name IS the embedded-quote fragment.
+query I
+SELECT count(*) FROM range(3) t, fabricator_lat_fields(t.range, 'a b,it''s') f;
+----
+3
+
+# A FOLDABLE expression works too — it re-binds and folds to the same value the original would have.
+query TII
+SELECT t.range::VARCHAR, f."AB", f.cd FROM range(1,2) t, fabricator_lat_fields(t.range, upper('ab') || ',cd') f ORDER BY 1;
+----
+1	1	2
+
+# A real COLUMN in the constant slot is refused: ConstantBinder refuses column references, so the text
+# channel declines and there is no bind-time value to capture.
 statement error
 SELECT * FROM range(3) t, fabricator_lat_fields(t.range, t.range) f;
 ----
-<REGEX>:.*bind-time CONSTANT.*const_arg.*
+<REGEX>:.*bind-time CONSTANT.*folds at bind.*
 
-# const_arg itself refuses a runtime expression and a NULL — capturing the NULL placeholder would hand the
-# consumer a value that looks real.
+# A VOLATILE expression is refused too — it parses and binds, but IsFoldable says no: capturing one
+# evaluation of random() as "the constant" would be a value the caller never wrote.
 statement error
-SELECT * FROM range(3) t, fabricator_lat_fields(t.range, const_arg(t.range::VARCHAR)) f;
+SELECT * FROM range(3) t, fabricator_lat_fields(t.range, random()::VARCHAR) f;
 ----
-<REGEX>:.*must be a non-NULL constant.*
+<REGEX>:.*bind-time CONSTANT.*folds at bind.*
+
+# An explicit NULL has no value to shape a schema with — refused, in both shapes.
+statement error
+SELECT * FROM fabricator_lat_fields(1, NULL);
+----
+<REGEX>:.*bind-time CONSTANT.*
 
 statement error
-SELECT * FROM fabricator_lat_fields(1, const_arg(NULL));
+SELECT * FROM range(3) t, fabricator_lat_fields(t.range, NULL) f;
 ----
-<REGEX>:.*must be a non-NULL constant.*
+<REGEX>:.*bind-time CONSTANT.*
 
 # The CAPTURE is type-generic; what types the CONSUMER accepts is its own business, and the refusal names
 # the captured type rather than pretending the argument was malformed.
@@ -671,12 +721,52 @@ SELECT * FROM fabricator_lat_fields(1, 1.5);
 ----
 <REGEX>:.*got decimal128.*
 
-# Two captures of the SAME constant in one statement: content-keyed entries refcount rather than collide.
+# A STRUCT is the structured-config shape: its FIELD NAMES become the columns (the demo's semantics), which
+# is the end-to-end proof a captured struct arrives with its fields intact rather than merely as a type.
+# Rendered in the correlated name channel as `main.struct_pack(a := 5, b := 'a')` — reparseable and foldable.
 query II
-SELECT (SELECT count(*) FROM fabricator_lat_fields(1, const_arg('m1,m2'))) AS a,
-       (SELECT count(*) FROM fabricator_lat_fields(2, const_arg('m1,m2'))) AS b;
+SELECT a, b FROM fabricator_lat_fields(7, {a:5,"b":'a'});
+----
+7	14
+
+query TII
+SELECT t.range::VARCHAR, f.a, f.b FROM range(1,3) t, fabricator_lat_fields(t.range, {a:5,"b":'a'}) f ORDER BY 1;
+----
+1	1	2
+2	2	4
+
+# The SAME constant at two call sites in one statement: each resolves independently (stateless channel).
+query II
+SELECT (SELECT count(*) FROM fabricator_lat_fields(1, 'm1,m2')) AS a,
+       (SELECT count(*) FROM fabricator_lat_fields(2, 'm1,m2')) AS b;
 ----
 1	1
+
+# A column whose NAME merely LOOKS odd is safe — the reference syntax is irrelevant (the channel carries the
+# RAW name), the guards are what protect: "x,y" re-parses as TWO expressions and is declined.
+statement ok
+CREATE TABLE weird_names ("x,y" VARCHAR, "2" INTEGER, n BIGINT);
+
+statement ok
+INSERT INTO weird_names VALUES ('runtime', 999, 1);
+
+statement error
+SELECT * FROM weird_names t, fabricator_lat_fields(t.n, t."x,y") f;
+----
+<REGEX>:.*bind-time CONSTANT.*folds at bind.*
+
+# ⚠ DOCUMENTED RESIDUAL, pinned so a fix flips this CONSCIOUSLY (lateral_unnest_analysis.md §9): a column
+# whose raw name parses as a single constant of the column's own type IS mis-captured — the INTEGER column
+# named "2" yields the constant 2 (columns c1, c2), not the column's runtime value. Reaching it requires
+# passing a COLUMN into a bind-time-constant slot, which is invalid usage in every shape; the honest fix
+# would need the original parse tree, which the binder moves out before the bind can see it.
+query II
+SELECT f.c1, f.c2 FROM weird_names t, fabricator_lat_fields(t.n, t."2") f;
+----
+1	2
+
+statement ok
+DROP TABLE weird_names;
 
 # Inside an explicit transaction — the channel has no transactional footprint at all.
 statement ok

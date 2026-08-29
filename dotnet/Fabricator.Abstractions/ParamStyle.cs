@@ -23,9 +23,9 @@ public enum ParamStyle
     /// A bind-time CONSTANT parameter of a LATERAL function: it occupies a positional slot (so the correlated
     /// call shape can spell it — DuckDB has no named-parameter syntax there), but its value is delivered to
     /// <see cref="ILateralFunction.Bind"/> in <c>args</c> under the parameter's name rather than arriving as a
-    /// per-row input column. In the literal call shape a bare constant works; in the correlated shape the
-    /// caller wraps it in <c>const_arg(…)</c>, whose result TYPE smuggles the value past the binder's
-    /// args-to-input-relation rewrite. Lateral functions only.
+    /// per-row input column. A bare constant works in BOTH call shapes: the literal shape folds it, and the
+    /// correlated shape recovers it from the synthesized column's rendered expression text (parsed, bound as
+    /// a constant, folded, type-checked — columns and volatiles refuse). Lateral functions only.
     /// </summary>
     Constant,
 
@@ -105,12 +105,11 @@ public static class Params
 
     /// <summary>
     /// A bind-time CONSTANT parameter of a LATERAL function (see <see cref="ParamStyle.Constant"/>): the
-    /// caller passes a constant of ANY type — bare in the literal call shape, wrapped in <c>const_arg(…)</c>
-    /// in the correlated shape — and its typed value arrives in <see cref="ILateralFunction.Bind"/>'s
-    /// <c>args</c> under <paramref name="name"/>. It is NOT an input column: the host strips it from the
-    /// bind's input schema and from every <see cref="ILateralSession.Call"/> chunk. The Arrow null type
-    /// registers the slot as DuckDB <c>ANY</c>, which is what lets both the wrapper's per-call-site struct
-    /// and a bare constant bind there.
+    /// caller passes a bare constant of ANY type — in EITHER call shape — and its typed value arrives in
+    /// <see cref="ILateralFunction.Bind"/>'s <c>args</c> under <paramref name="name"/>. It is NOT an input
+    /// column: the host strips it from the bind's input schema and from every
+    /// <see cref="ILateralSession.Call"/> chunk. The Arrow null type registers the slot as DuckDB <c>ANY</c>,
+    /// which is what lets any constant's own type bind there.
     /// </summary>
     public static Field Constant(string name) =>
         new(name, NullType.Default, nullable: true, Meta(ConstantValue));

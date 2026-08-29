@@ -32,6 +32,9 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
+#include "duckdb/execution/expression_executor.hpp"
+#include "duckdb/parser/parser.hpp"
+#include "duckdb/planner/expression_binder/constant_binder.hpp"
 #include "duckdb/execution/execution_context.hpp"
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
@@ -259,6 +262,46 @@ void EmitCalleeColumns(DataChunk &wire, DataChunk &output, idx_t base_idx) {
 // Bind — shared by both paths (the batched rewrite happens entirely after binding)
 //===----------------------------------------------------------------------===//
 
+//! A BARE constant in a CONSTANT slot of a CORRELATED call: the binder's rewrite turned it into an input
+//! COLUMN, so no value reaches the bind — but the column's rendered NAME is the parsed expression's own
+//! rendering (input_table_names), and for a constant that text is re-bindable. MEASURED faithful before this
+//! was written: `'it''s'` renders with its escaping intact, `5::SMALLINT` as `CAST(5 AS SMALLINT)`,
+//! `upper('ab')` as itself (foldable to the right value). Three guards make a wrong capture structurally
+//! hard, and EVERY failure falls through to the managed side's explicit const_arg refusal rather than to a
+//! guess: ConstantBinder refuses column references outright (a genuine column's rendered name is the column
+//! name, which parses as an identifier and dies here), IsFoldable refuses volatiles (`random()` parses and
+//! binds but is not a constant), and the folded value must have EXACTLY the slot's bound type (the rendering
+//! and the original expression bound independently — if they disagree about the TYPE, the text was not a
+//! faithful rendering and must not be trusted for the VALUE either).
+static bool TryFoldRenderedConstant(ClientContext &context, TableFunctionBindInput &input, const string &text,
+                                    const LogicalType &bound_type, Value &out) {
+	if (text.empty() || !input.binder) {
+		return false;
+	}
+	try {
+		auto exprs = Parser::ParseExpressionList(text, context.GetParserOptions());
+		if (exprs.size() != 1) {
+			return false;
+		}
+		ConstantBinder cb(*input.binder, context, "lateral constant argument");
+		auto bound = cb.Bind(exprs[0]);
+		if (!bound || !bound->IsFoldable()) {
+			return false;
+		}
+		Value folded;
+		if (!ExpressionExecutor::TryEvaluateScalar(context, *bound, folded)) {
+			return false;
+		}
+		if (folded.type() != bound_type) {
+			return false;
+		}
+		out = std::move(folded);
+		return true;
+	} catch (std::exception &) {
+		return false; // any parse/bind failure means "not a bare constant" — the managed refusal explains
+	}
+}
+
 unique_ptr<FunctionData> LateralBind(ClientContext &context, TableFunctionBindInput &input,
                                     vector<LogicalType> &return_types, vector<string> &names) {
 	auto &info = input.info->Cast<LateralFunctionInfo>();
@@ -300,8 +343,17 @@ unique_ptr<FunctionData> LateralBind(ClientContext &context, TableFunctionBindIn
 			all_names_empty = false;
 		}
 		if (i < declared_constant.size() && declared_constant[i]) {
-			Value v = (!input.inputs.empty() && i < input.inputs.size()) ? input.inputs[i]
-			                                                            : Value(input.input_table_types[i]);
+			Value v;
+			if (!input.inputs.empty() && i < input.inputs.size()) {
+				v = input.inputs[i]; // the literal shape: the folded value itself
+			} else {
+				// The correlated shape: the value did not survive the rewrite, but a constant's rendered
+				// expression text did (the synthesized column's name). Recover it from there; anything the
+				// fold declines stays a NULL marker, which the managed side refuses with the one message a
+				// caller can act on.
+				v = Value(input.input_table_types[i]);
+				TryFoldRenderedConstant(context, input, slot_name, input.input_table_types[i], v);
+			}
 			const_names.push_back(declared_pos_names[i]);
 			const_values.push_back(std::move(v));
 			continue; // never a wire column: the callee's rows do not carry it
@@ -360,6 +412,12 @@ unique_ptr<FunctionData> LateralBind(ClientContext &context, TableFunctionBindIn
 		arg_values.push_back(std::move(v));
 	}
 	for (idx_t k = 0; k < const_names.size(); k++) {
+		if (const_values[k].type().id() == LogicalTypeId::SQLNULL) {
+			// An UNTYPED NULL (a bare NULL argument the fold declined): Apache.Arrow refuses DuckDB's
+			// null-array export (null_count 0 — the same hostility the v80 scalar path recorded), and the
+			// managed side only asks IsNull before refusing — so carry it as a typed NULL instead.
+			const_values[k] = Value(LogicalType::VARCHAR);
+		}
 		arg_names.push_back(const_names[k]);
 		arg_types.push_back(const_values[k].type());
 		arg_values.push_back(std::move(const_values[k]));
@@ -767,8 +825,8 @@ TableFunction FabricatorMakeLateralFunction(FabricatorHandle handle, const strin
 	// named parameters — bind-time configuration the LITERAL call shape can spell. A CONSTANT parameter is
 	// the bind-time configuration BOTH shapes can spell: it registers as an ordinary ANY positional slot
 	// (falling into the else below — Params.Constant declares the Arrow null type), and LateralBind resolves
-	// its VALUE into the managed args batch instead of the wire (see the capture registry in
-	// Fabricator.Bridge/CapturedConstants.cs).
+	// its VALUE into the managed args batch instead of the wire (the literal shape's folded parameter, or
+	// the rendered-text fold above).
 	for (idx_t i = 0; i < arg_names.size(); i++) {
 		auto style = i < arg_styles.size() ? arg_styles[i] : FabricatorParamStyle::POSITIONAL;
 		auto type = arg_types[i].id() == LogicalTypeId::SQLNULL ? LogicalType::ANY : arg_types[i];

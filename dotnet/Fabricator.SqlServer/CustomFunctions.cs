@@ -1593,10 +1593,10 @@ internal sealed class GfLatRepeatFunction : ILateralFunction
 // GLOBAL lateral with a BIND-TIME CONSTANT parameter (Params.Constant — the host capture channel):
 // fabricator_lat_fields(n, fields) has an OUTPUT SCHEMA that depends on `fields`, which the v79 registration
 // cannot express directly (a positional lateral parameter carries no bind-time value). The captured constant
-// may be a VARCHAR of comma-separated column names, an integer count (columns c1..cN), or a LIST of names —
-// pinning that the channel is type-generic. Column i = n * (i+1), 1:1 with the input rows. Callers:
-//   SELECT * FROM fabricator_lat_fields(7, 'x,y');                        -- literal shape, bare constant
-//   SELECT * FROM t, fabricator_lat_fields(t.n, const_arg('x,y'));       -- correlated: const_arg carries it
+// may be a VARCHAR of comma-separated column names, an integer count (columns c1..cN), a LIST of names, or
+// a STRUCT (its field names become the columns) — pinning that the channel is type-generic. Column i = n * (i+1), 1:1 with the input rows. Callers:
+//   SELECT * FROM fabricator_lat_fields(7, 'x,y');                 -- literal shape
+//   SELECT * FROM t, fabricator_lat_fields(t.n, 'x,y');             -- correlated: bare constants work too
 internal sealed class GfLatFieldsFunction : ILateralFunction
 {
     public string Name => "fabricator_lat_fields";
@@ -1621,9 +1621,14 @@ internal sealed class GfLatFieldsFunction : ILateralFunction
                 Enumerable.Range(1, (int)l.Values[0]).Select(k => "c" + k).ToArray(),
             ListArray list when !list.IsNull(0) && list.GetSlicedValues(0) is StringArray items =>
                 Enumerable.Range(0, items.Length).Select(k => items.GetString(k)).ToArray(),
+            // A STRUCT works as a structured config: its FIELD NAMES become the columns — which is also the
+            // end-to-end proof that a captured struct arrives with its fields intact, not merely as a type.
+            StructArray st when !st.IsNull(0) =>
+                ((StructType)st.Data.DataType).Fields.Select(f => f.Name).ToArray(),
             _ => throw new NotSupportedException(
                 "fabricator_lat_fields: `fields` must be a VARCHAR of comma-separated column names, an integer "
-                + $"count between 1 and 99, or a LIST of names — got {col?.Data.DataType.Name ?? "nothing"}."),
+                + "count between 1 and 99, a LIST of names, or a STRUCT (its field names become the columns) "
+                + $"— got {col?.Data.DataType.Name ?? "nothing"}."),
         };
         if (names.Length == 0)
         {

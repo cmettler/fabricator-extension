@@ -358,11 +358,11 @@ internal sealed class PlugLatSlowFunction : ILateralFunction
 /// <summary>
 /// A lateral function whose OUTPUT SCHEMA depends on a bind-time constant, consumed through the HOST's
 /// capture channel: <c>plug_lat_fields(n, fields)</c> declares <see cref="Params.Constant"/> and reads the
-/// value in <see cref="Bind"/>'s <c>args</c> — a plugin needs ZERO machinery of its own (the dictionary, the
-/// capture scalar and both call-shape resolutions live in the host; the prototype that developed them in this
-/// file is superseded). Callers: <c>SELECT * FROM plug_lat_fields(7, 'x,y')</c> (literal shape, bare
-/// constant) or <c>SELECT * FROM t, plug_lat_fields(t.n, const_arg('x,y'))</c> (correlated — the host's
-/// <c>const_arg</c> smuggles the value past the binder's args-to-input-relation rewrite via its result TYPE).
+/// value in <see cref="Bind"/>'s <c>args</c> — a plugin needs ZERO machinery of its own (both call-shape
+/// resolutions live in the host; the prototype that developed them in this file is superseded). Callers pass
+/// a bare constant in EITHER shape: <c>SELECT * FROM plug_lat_fields(7, 'x,y')</c> or
+/// <c>SELECT * FROM t, plug_lat_fields(t.n, 'x,y')</c> — the correlated value is recovered from the
+/// synthesized column's rendered expression text (fabricator_lateral.cpp).
 /// Output = one BIGINT column per comma-separated name, column i = n * (i+1), 1:1 with the input rows.
 /// </summary>
 internal sealed class PlugLatFieldsFunction : ILateralFunction

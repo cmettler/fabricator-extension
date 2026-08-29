@@ -508,12 +508,13 @@ report. **Decision (user, 2026-08-23): WAIT for an upstream fix rather than buil
 
 **⚠ PARTLY SUPERSEDED FOR THE BIND-TIME CASE (2026-08-29):** the need this limitation actually bounded — a
 per-call constant a lateral function reads AT BIND (e.g. to shape its output schema) — now has a shipped
-spelling that works in BOTH call shapes: declare `Params.Constant("name")` and the caller passes a bare
-constant (literal shape) or wraps it in `const_arg(…)` (correlated shape); the value crosses through the
-capture struct's TYPE. Full record: docs/lateral_unnest_analysis.md §9. ⚠ That is NOT a named-parameter fix
-and does not touch the mechanism below — `f(t.a, opt := 5)` still does not bind, the 2026-08-23 decision to
-wait stands, and §5.1's declined host-side rebind is still declined. What changed is only that the commonest
-reason to WANT a named argument in the correlated shape no longer needs one.
+spelling that works BARE in BOTH call shapes: declare `Params.Constant("name")` and the caller passes the
+constant directly (`f(t.a, 'x,y')`); in the correlated shape the value is recovered from the synthesized
+column's rendered expression text (a `const_arg(…)` wrapper existed for one day and was removed once the
+text channel measured complete). Full record: docs/lateral_unnest_analysis.md §9/§9.1. ⚠ That is NOT a
+named-parameter fix and does not touch the mechanism below — `f(t.a, opt := 5)` still does not bind, the
+2026-08-23 decision to wait stands, and §5.1's declined host-side rebind is still declined. What changed is
+only that the commonest reason to WANT a named argument in the correlated shape no longer needs one.
 
 `f(t.a, opt := 5)` — a named argument alongside a column argument — does not bind:
 

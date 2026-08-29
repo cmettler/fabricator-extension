@@ -150,7 +150,7 @@ public static class GlobalFunctions
         // would build a {TABLE} signature the correlated spelling cannot bind against, i.e. a function nobody
         // could call the way it was declared. The host refuses it too; this is where the message is best.
         Params.Validate(fn.Name, fn.Parameters, allowNamed: true, allowTableInput: false, allowConstant: true);
-        args = CapturedConstants.ResolveLateralArgs(fn.Name, fn.Parameters, args);
+        args = LateralConstants.Validate(fn.Name, fn.Parameters, args);
         return fn.Bind(args, inputSchema);
     }
 
@@ -200,7 +200,6 @@ public static class GlobalFunctions
     }
 
     private static IReadOnlyDictionary<string, IScalarFunction> BuildScalars() =>
-        Build<IScalarFunction>(b => b.GlobalScalarFunctions, f => f.Name, "scalar",
-                               HostGlobalFunctions.ScalarFunctions);
+        Build<IScalarFunction>(b => b.GlobalScalarFunctions, f => f.Name, "scalar");
 
 }
