@@ -299,7 +299,8 @@ public sealed class CatalogFunctionSet
         {
             return null;
         }
-        Params.Validate(fn.Name, fn.Parameters, allowNamed: true, allowTableInput: false);
+        Params.Validate(fn.Name, fn.Parameters, allowNamed: true, allowTableInput: false, allowConstant: true);
+        args = CapturedConstants.ResolveLateralArgs(fn.Name, fn.Parameters, args);
         return fn.Bind(args, inputSchema);
     }
 

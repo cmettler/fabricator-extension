@@ -33,6 +33,14 @@ internal static class HostGlobalFunctions
         new UninstallPluginFunction(),
         new HttpRequestFunction(),
     };
+
+    /// <summary>Host scalars that must exist whatever providers loaded: <c>const_arg</c> is the caller-side
+    /// half of every provider's <see cref="Params.Constant"/> parameters, so it cannot live with any one
+    /// provider.</summary>
+    public static IEnumerable<IScalarFunction> ScalarFunctions { get; } = new IScalarFunction[]
+    {
+        new ConstArgFunction(),
+    };
 }
 
 /// <summary>

@@ -109,6 +109,11 @@ enum class FabricatorParamStyle : uint8_t {
 	//! A DuckDB named parameter — `f(x := 1)`. Must follow every positional/table parameter (DuckDB's own
 	//! rule: "Unnamed parameters cannot come after named parameters").
 	NAMED,
+	//! A bind-time CONSTANT parameter of a LATERAL function: occupies a positional slot (registered ANY) so
+	//! the correlated call shape can spell it, but it is NOT a per-row input column — its value is resolved
+	//! at bind (from the folded parameter in the literal shape, or from the `const_arg(...)` capture registry
+	//! in the correlated one) and delivered to the managed bind in the args batch under the parameter's name.
+	CONSTANT,
 	//! The input TABLE of a table-in-out function. At most one, positional; DuckDB gives the subquery its own
 	//! argument slot (bind_table_function.cpp pushes a placeholder value), so following positions keep their
 	//! natural index.

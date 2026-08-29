@@ -122,8 +122,11 @@ public interface ILateralFunction
 
     /// <summary>
     /// The call signature. POSITIONAL fields (<see cref="Params.Positional"/>) are the PER-ROW INPUT COLUMNS —
-    /// their types become the function's DuckDB argument types. NAMED fields (<see cref="Params.Named"/>) are
-    /// the constant "cost" args, and are the only ones whose values reach <see cref="Bind"/>.
+    /// their types become the function's DuckDB argument types. NAMED fields (<see cref="Params.Named"/>) and
+    /// CONSTANT fields (<see cref="Params.Constant"/>) are the bind-time "cost" args, and are the ones whose
+    /// values reach <see cref="Bind"/> — a named one is spellable only in the literal call shape
+    /// (<c>f(1, x := 2)</c>), a constant one in BOTH (bare in the literal shape, <c>const_arg(…)</c>-wrapped
+    /// in the correlated one), which is the whole reason the constant style exists.
     /// </summary>
     /// <remarks>
     /// Declaring a <see cref="Params.TableInput"/> here is REFUSED at registration: a lateral function has no

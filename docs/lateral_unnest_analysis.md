@@ -784,6 +784,60 @@ provenance contract already supports it unchanged.
 
 ---
 
+## 9. Bind-time constants: `Params.Constant` + `const_arg` — BUILT 2026-08-29 (C++ + C#, no ABI bump)
+
+§5's workaround ("declare the per-call constant positionally, it arrives as a constant input column") gives
+a lateral function the constant's *runtime* value, which cannot shape the OUTPUT SCHEMA — the bind sees no
+argument values at all: DuckDB rewrites every argument of a table-in-out call into the synthesized input
+relation (`bind_table_function.cpp`), named parameters are unspellable in the correlated shape (§5), and the
+one channel that provably survives the rewrite in BOTH call shapes is the column TYPE. This section is the
+as-built record of the mechanism that rides it.
+
+**The author contract.** A lateral declares `Params.Constant("fields")` — a positional slot registered as
+`ANY` — and reads the constant's typed value in `Bind`'s `args` under the parameter's name. The slot never
+reaches the rows: the host strips it from the bind's input schema and from every `Session.Call` chunk
+(`LateralBindData.wire_slots` — the child chunk still carries it at its positional index, the wire skips it,
+and the correlated split point is the new `arg_width`, not `input_types.size()`).
+
+**The caller contract.** In the LITERAL shape a bare constant works with no wrapper — the binder folds the
+arguments into `Value`s and the C++ bind forwards `input.inputs[slot]` into the managed args batch. In the
+CORRELATED shape only the type crosses, so the caller wraps the constant: `const_arg(…)`, a host CONSISTENT
+scalar whose per-call-site bind (ABI v80) parks the value in a registry (`CapturedConstants`) and resolves
+its result type to `STRUCT("__fab_const_<md5>": VARCHAR)` — the member NAME is the registry key, and the
+member-name PREFIX is what makes a capture struct unambiguous against a user's own single-member struct
+constant. The scalar's bind runs while the binder builds the synthesized input relation, i.e. BEFORE the
+lateral's own bind consumes the key. A bare constant (or a real column) in a correlated constant slot is
+refused with a message naming the wrapper.
+
+**The lifecycle, and it is MEASURED, not designed on taste: an entry is removable only when it is CONSUMED
+*and* UNREFERENCED — neither signal alone is correct.** The prototype (sample plugin, 2026-08-29) shipped
+dispose-only release first and every literal-shape call MISSED: in that shape the binder folds the argument
+and DISCARDS the bound scalar expression, so the binding's Dispose fires BEFORE the consumer's bind — while
+in the correlated shape the bound scalar lives in the subquery until plan teardown and Dispose fires after.
+So `Store` takes a reference, Dispose releases it, the consumer's lookup marks it consumed, and removal
+happens at whichever event sees both. Mutation-tested: reverting Release to dispose-only dies at
+`verify_lateral`'s wrapped-literal assertion with the explicit "expired" error (171 pass before it). Every
+re-bind — view, EXPLAIN, prepared statement (DuckDB re-binds each EXECUTE — MEASURED; the PREPARE-time
+bind's plan is torn down) — re-runs the scalar bind and repopulates before the consumer looks, so the state
+drains to zero after every statement. The stored value is an OWNED copy via one Arrow IPC round-trip, whose
+canonical bytes are also what the md5 key hashes — same value ⇒ same key, which keeps the CONSISTENT
+contract and makes double-Store idempotent through the refcount.
+
+**Two binder quirks the build flushed out, both fixed in `fabricator_lateral.cpp` and both PRE-EXISTING
+v79 sharp edges** (`bind_table_function.cpp:425-457` reports `input_table_types` differently per shape, and
+neither reading matches what the child delivers): the CORRELATED shape RELABELS the reported type to the
+declared parameter type without casting the child — `Vector::Reference` on the mismatch was an INTERNAL
+error that INVALIDATED the whole database; the LITERAL shape reports the PRE-cast expression type while
+delivering the POST-cast value. Fixed by normalizing `input_types` to the DECLARATION (the one contract
+stable across both shapes; ANY-declared slots keep the bound type — that is what carries the capture
+struct) and casting each runtime chunk to it at the marshaling seam.
+
+Consumers: `fabricator_lat_fields(n, fields)` (host, `CustomFunctions.cs` — fields may be a VARCHAR of
+comma-separated names, an integer count, or a LIST of names, pinning that the channel is type-generic) and
+`plug_lat_fields` (sample plugin, ZERO plugin-side machinery — the point of hosting it). Gate:
+`verify_lateral` 168 → **211**, one mutant killed at its own assertion. No ABI bump: the `constant` param
+style is an additive metadata value, and the capture scalar is ordinary v80 machinery.
+
 ## Appendix — the `CLAUDE.md` entry, moved verbatim (2026-08-23)
 
 > §8 above is the as-built record. This is the entry `CLAUDE.md` carried alongside it — the scoping

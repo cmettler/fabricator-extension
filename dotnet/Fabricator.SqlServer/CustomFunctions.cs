@@ -66,6 +66,7 @@ internal static class CustomFunctions
         new GfLatRepeatFunction(),
         new GfLatScaleFunction(),
         new GfLatBadOriginFunction(),
+        new GfLatFieldsFunction(),
     };
 
     // Connection-free GLOBAL collector (pipeline-breaker) functions — bare fn(<input>), no ATTACH.
@@ -1589,6 +1590,94 @@ internal sealed class GfLatRepeatFunction : ILateralFunction
 // row; on the batched path it is the chunk size. Counting Debug log lines was tried first and does not work —
 // duckdb_logs flushes per-thread LAZILY, so a read immediately after the query saw 1 of 98 entries and a
 // count assertion would have been comparing whatever happened to be visible.
+// GLOBAL lateral with a BIND-TIME CONSTANT parameter (Params.Constant — the host capture channel):
+// fabricator_lat_fields(n, fields) has an OUTPUT SCHEMA that depends on `fields`, which the v79 registration
+// cannot express directly (a positional lateral parameter carries no bind-time value). The captured constant
+// may be a VARCHAR of comma-separated column names, an integer count (columns c1..cN), or a LIST of names —
+// pinning that the channel is type-generic. Column i = n * (i+1), 1:1 with the input rows. Callers:
+//   SELECT * FROM fabricator_lat_fields(7, 'x,y');                        -- literal shape, bare constant
+//   SELECT * FROM t, fabricator_lat_fields(t.n, const_arg('x,y'));       -- correlated: const_arg carries it
+internal sealed class GfLatFieldsFunction : ILateralFunction
+{
+    public string Name => "fabricator_lat_fields";
+
+    public Schema Parameters => new(new[]
+    {
+        Params.Positional("n", Int64Type.Default),
+        Params.Constant("fields"), // bind-time constant: arrives in Bind's args, never in the rows
+    }, metadata: null);
+
+    public ILateralFunctionBinding Bind(RecordBatch? args, Schema inputSchema)
+    {
+        int idx = args?.Schema.GetFieldIndex("fields") ?? -1;
+        var col = idx >= 0 ? args!.Column(idx) : null;
+        var names = col switch
+        {
+            StringArray s when !s.IsNull(0) =>
+                s.GetString(0).Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries),
+            Int32Array i when !i.IsNull(0) && i.Values[0] is > 0 and <= 99 =>
+                Enumerable.Range(1, i.Values[0]).Select(k => "c" + k).ToArray(),
+            Int64Array l when !l.IsNull(0) && l.Values[0] is > 0 and <= 99 =>
+                Enumerable.Range(1, (int)l.Values[0]).Select(k => "c" + k).ToArray(),
+            ListArray list when !list.IsNull(0) && list.GetSlicedValues(0) is StringArray items =>
+                Enumerable.Range(0, items.Length).Select(k => items.GetString(k)).ToArray(),
+            _ => throw new NotSupportedException(
+                "fabricator_lat_fields: `fields` must be a VARCHAR of comma-separated column names, an integer "
+                + $"count between 1 and 99, or a LIST of names — got {col?.Data.DataType.Name ?? "nothing"}."),
+        };
+        if (names.Length == 0)
+        {
+            throw new NotSupportedException("fabricator_lat_fields: `fields` names no columns.");
+        }
+        return new Binding(names);
+    }
+
+    private sealed class Binding : ILateralFunctionBinding
+    {
+        private readonly string[] _names;
+
+        public Binding(string[] names) => _names = names;
+
+        public Schema OutputSchema =>
+            new(_names.Select(n => new Field(n, Int64Type.Default, nullable: true)).ToArray(), metadata: null);
+
+        public ILateralSession Open() => new Session(OutputSchema, _names.Length);
+
+        public void Dispose() { }
+    }
+
+    private sealed class Session : ILateralSession
+    {
+        private readonly Schema _output;
+        private readonly int _cols;
+
+        public Session(Schema output, int cols)
+        {
+            _output = output;
+            _cols = cols;
+        }
+
+        public LateralResult Call(RecordBatch input)
+        {
+            // ONE per-row input column: the `fields` slot never reaches the rows (the host strips it).
+            var n = (Int64Array)input.Column(0);
+            var builders = new Int64Array.Builder[_cols];
+            for (int c = 0; c < _cols; c++) { builders[c] = new Int64Array.Builder().Reserve(input.Length); }
+            for (int r = 0; r < input.Length; r++)
+            {
+                for (int c = 0; c < _cols; c++)
+                {
+                    if (n.IsNull(r)) { builders[c].AppendNull(); } else { builders[c].Append(n.Values[r] * (c + 1)); }
+                }
+            }
+            return new LateralResult(new RecordBatch(
+                _output, builders.Select(b => (IArrowArray)b.Build()).ToArray(), input.Length));
+        }
+
+        public void Dispose() { }
+    }
+}
+
 internal sealed class GfLatScaleFunction : ILateralFunction
 {
     public string Name => "fabricator_lat_scale";

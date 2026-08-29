@@ -555,3 +555,137 @@ query II
 EXECUTE lat_p(3);
 ----
 12	12
+
+# ============================================================================
+# 15. BIND-TIME CONSTANT PARAMETERS (Params.Constant + const_arg) — the capture channel.
+#     A lateral function's positional slots are per-row input columns, so a per-call constant that shapes the
+#     OUTPUT SCHEMA has no direct spelling: DuckDB rewrites every argument into the synthesized input relation
+#     (bind_table_function.cpp), and named parameters cannot be written in the correlated shape at all
+#     (docs/duckdb-upstream-issues.md §5). fabricator_lat_fields(n, fields) declares `fields` as a bind-time
+#     CONSTANT: in the literal shape the folded value reaches the bind directly (a BARE constant works); in
+#     the correlated shape the caller wraps it in const_arg(...), whose per-call-site RESULT TYPE — a
+#     single-member struct whose member name keys the host's capture registry — smuggles the value past the
+#     rewrite. The output columns are named by the constant, which is the assertion that matters: no fixed
+#     schema could produce them.
+# ============================================================================
+
+# The literal shape needs NO wrapper: the constant arrives as the folded parameter value.
+query III
+SELECT x, y, z FROM fabricator_lat_fields(7, 'x,y,z');
+----
+7	14	21
+
+# The wrapper is harmless where it is unnecessary.
+query III
+SELECT x, y, z FROM fabricator_lat_fields(7, const_arg('x,y,z'));
+----
+7	14	21
+
+# The channel is TYPE-GENERIC, not VARCHAR-only: an integer count and a LIST of names.
+query III
+SELECT c1, c2, c3 FROM fabricator_lat_fields(7, 3);
+----
+7	14	21
+
+query II
+SELECT aa, bb FROM fabricator_lat_fields(4, ['aa','bb']);
+----
+4	8
+
+# THE CORRELATED SHAPE — the whole reason the channel exists. The scalar's bind runs while the binder builds
+# the synthesized input relation, i.e. BEFORE the lateral's own bind reads the registry; and the constant slot
+# is stripped from the callee's rows (Session.Call sees only `n`).
+query TII
+SELECT t.range::VARCHAR AS n, f.a, f.b FROM range(1,4) t, fabricator_lat_fields(t.range, const_arg('a,b')) f ORDER BY 1;
+----
+1	1	2
+2	2	4
+3	3	6
+
+# DESCRIBE binds without executing — the schema really is resolved at bind, from the captured constant.
+query T
+SELECT column_name FROM (DESCRIBE SELECT * FROM fabricator_lat_fields(1, const_arg('d1,d2,d3'))) ORDER BY ALL;
+----
+d1
+d2
+d3
+
+# Re-binds repopulate the registry before re-consuming: a view (bound at use) and a prepared statement
+# (DuckDB re-binds each EXECUTE).
+statement ok
+CREATE VIEW v_lat_capture AS SELECT * FROM fabricator_lat_fields(6, const_arg('va,vb'));
+
+query II
+SELECT va, vb FROM v_lat_capture;
+----
+6	12
+
+statement ok
+DROP VIEW v_lat_capture;
+
+statement ok
+PREPARE lat_cap AS SELECT u, v FROM fabricator_lat_fields(3, const_arg('u,v'));
+
+query II
+EXECUTE lat_cap;
+----
+3	6
+
+query II
+EXECUTE lat_cap;
+----
+3	6
+
+statement ok
+DEALLOCATE lat_cap;
+
+# A BARE constant cannot reach the bind in the CORRELATED shape (the rewrite turns it into an input column),
+# so it is refused with the recipe — never silently treated as a per-row value.
+statement error
+SELECT * FROM range(3) t, fabricator_lat_fields(t.range, 'x,y') f;
+----
+<REGEX>:.*bind-time CONSTANT.*const_arg.*
+
+# A real COLUMN in the constant slot is the same refusal: there is no bind-time value to capture.
+statement error
+SELECT * FROM range(3) t, fabricator_lat_fields(t.range, t.range) f;
+----
+<REGEX>:.*bind-time CONSTANT.*const_arg.*
+
+# const_arg itself refuses a runtime expression and a NULL — capturing the NULL placeholder would hand the
+# consumer a value that looks real.
+statement error
+SELECT * FROM range(3) t, fabricator_lat_fields(t.range, const_arg(t.range::VARCHAR)) f;
+----
+<REGEX>:.*must be a non-NULL constant.*
+
+statement error
+SELECT * FROM fabricator_lat_fields(1, const_arg(NULL));
+----
+<REGEX>:.*must be a non-NULL constant.*
+
+# The CAPTURE is type-generic; what types the CONSUMER accepts is its own business, and the refusal names
+# the captured type rather than pretending the argument was malformed.
+statement error
+SELECT * FROM fabricator_lat_fields(1, 1.5);
+----
+<REGEX>:.*got decimal128.*
+
+# Two captures of the SAME constant in one statement: content-keyed entries refcount rather than collide.
+query II
+SELECT (SELECT count(*) FROM fabricator_lat_fields(1, const_arg('m1,m2'))) AS a,
+       (SELECT count(*) FROM fabricator_lat_fields(2, const_arg('m1,m2'))) AS b;
+----
+1	1
+
+# Inside an explicit transaction — the channel has no transactional footprint at all.
+statement ok
+BEGIN;
+
+query I
+SELECT t1 FROM fabricator_lat_fields(2, 't1');
+----
+2
+
+statement ok
+COMMIT;

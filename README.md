@@ -2086,9 +2086,22 @@ Two things are worth knowing before you author one:
   `DISTINCT` under the call and re-expands the result by joining above it, so a 20 000-row table with 97
   distinct argument tuples costs 97 rows of input, not 20 000. Cost scales with distinct tuples.
 - **A named argument cannot be used in the correlated shape** — `fn(t.a, opt := 5)` does not bind (a DuckDB
-  limitation, [docs/duckdb-upstream-issues.md](docs/duckdb-upstream-issues.md) §5). Declare a per-call
-  constant POSITIONALLY instead: `fn(t.a, 5)` works in both shapes and the value arrives as a constant input
-  column. Named arguments do work with literal arguments.
+  limitation, [docs/duckdb-upstream-issues.md](docs/duckdb-upstream-issues.md) §5). For a plain per-call
+  constant, declaring it positionally (`fn(t.a, 5)`) works in both shapes — the value arrives as a constant
+  input column. Named arguments do work with literal arguments.
+- **A BIND-TIME constant — one the function needs while resolving its OUTPUT SCHEMA — is its own parameter
+  style**: declare it with `Params.Constant("fields")` and read its typed value in `Bind`'s `args` (it never
+  appears among the per-row input columns). In the literal call shape a bare constant just works; in the
+  correlated shape wrap it in **`const_arg(…)`**, which carries the value past DuckDB's argument rewrite
+  through its result *type*:
+
+  ```sql
+  SELECT * FROM fabricator_lat_fields(7, 'x,y,z');                       -- literal shape: bare constant
+  SELECT t.n, f.* FROM t, fabricator_lat_fields(t.n, const_arg('x,y'));  -- correlated: const_arg carries it
+  ```
+
+  The constant may be of any type (a string, a number, a LIST, a STRUCT…). A bare constant in a correlated
+  call is refused with a message naming the wrapper — it cannot reach the bind there.
 
 ### Custom aggregates (UDAF)
 

@@ -19,6 +19,16 @@ public enum ParamStyle
     /// <summary>A named argument — <c>f(recreate := true)</c>. Must follow every positional/table field.</summary>
     Named,
 
+    /// <summary>
+    /// A bind-time CONSTANT parameter of a LATERAL function: it occupies a positional slot (so the correlated
+    /// call shape can spell it — DuckDB has no named-parameter syntax there), but its value is delivered to
+    /// <see cref="ILateralFunction.Bind"/> in <c>args</c> under the parameter's name rather than arriving as a
+    /// per-row input column. In the literal call shape a bare constant works; in the correlated shape the
+    /// caller wraps it in <c>const_arg(…)</c>, whose result TYPE smuggles the value past the binder's
+    /// args-to-input-relation rewrite. Lateral functions only.
+    /// </summary>
+    Constant,
+
     /// <summary>The input TABLE of a table-in-out function — <c>f((SELECT …))</c>. At most one, positional.</summary>
     TableInput,
 }
@@ -56,6 +66,7 @@ public static class Params
 
     private const string NamedValue = "named";
     private const string TableValue = "table";
+    private const string ConstantValue = "constant";
 
     /// <summary>An ordinary positional parameter.</summary>
     public static Field Positional(string name, IArrowType type, bool nullable = true) =>
@@ -91,6 +102,18 @@ public static class Params
 
     /// <summary>Re-flags an existing field as a named parameter, preserving its name and type.</summary>
     public static Field AsNamed(Field field) => Named(field.Name, field.DataType);
+
+    /// <summary>
+    /// A bind-time CONSTANT parameter of a LATERAL function (see <see cref="ParamStyle.Constant"/>): the
+    /// caller passes a constant of ANY type — bare in the literal call shape, wrapped in <c>const_arg(…)</c>
+    /// in the correlated shape — and its typed value arrives in <see cref="ILateralFunction.Bind"/>'s
+    /// <c>args</c> under <paramref name="name"/>. It is NOT an input column: the host strips it from the
+    /// bind's input schema and from every <see cref="ILateralSession.Call"/> chunk. The Arrow null type
+    /// registers the slot as DuckDB <c>ANY</c>, which is what lets both the wrapper's per-call-site struct
+    /// and a bare constant bind there.
+    /// </summary>
+    public static Field Constant(string name) =>
+        new(name, NullType.Default, nullable: true, Meta(ConstantValue));
 
     /// <summary>
     /// Composes a canonical signature from a provider's local "positional here, named there" pair. The
@@ -141,6 +164,7 @@ public static class Params
         {
             if (v == NamedValue) return ParamStyle.Named;
             if (v == TableValue) return ParamStyle.TableInput;
+            if (v == ConstantValue) return ParamStyle.Constant;
         }
         return ParamStyle.Positional;
     }
@@ -157,7 +181,11 @@ public static class Params
     /// concept at all — declaring one would produce a function whose documented call syntax is a binder
     /// error, so it is refused here rather than silently ignored.</param>
     /// <param name="allowTableInput">True only for the in-out kinds.</param>
-    public static void Validate(string function, Schema parameters, bool allowNamed, bool allowTableInput)
+    /// <param name="allowConstant">True only for lateral functions — the one kind whose positional slots are
+    /// per-row input columns, which is what a bind-time constant needs an escape from. On any other kind a
+    /// named parameter already does the job.</param>
+    public static void Validate(string function, Schema parameters, bool allowNamed, bool allowTableInput,
+                                bool allowConstant = false)
     {
         bool seenNamed = false;
         bool seenTable = false;
@@ -169,6 +197,12 @@ public static class Params
                 throw new ArgumentException(
                     $"fabricator: '{function}' declares the named parameter '{f.Name}', but this function kind "
                     + "has no named-parameter support in DuckDB — declare it positionally.");
+            }
+            if (style == ParamStyle.Constant && !allowConstant)
+            {
+                throw new ArgumentException(
+                    $"fabricator: '{function}' declares the bind-time constant parameter '{f.Name}', which only "
+                    + "a LATERAL function may take — declare a named parameter instead.");
             }
             if (style == ParamStyle.TableInput && !allowTableInput)
             {

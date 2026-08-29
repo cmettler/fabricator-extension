@@ -29,7 +29,7 @@ public sealed class SamplePluginBackend : IBackend
         new ITableFunction[] { new PlugSlowRangeFunction(), new PlugSlowRange2Function() };
 
     public IEnumerable<ILateralFunction> GlobalLateralFunctions =>
-        new ILateralFunction[] { new PlugLatSlowFunction() };
+        new ILateralFunction[] { new PlugLatSlowFunction(), new PlugLatFieldsFunction() };
 
     /// <summary>
     /// Macros a plugin ships — proving the SQL-template path needs no more from a plugin than the function path
@@ -349,6 +349,85 @@ internal sealed class PlugLatSlowFunction : ILateralFunction
             // No Origin: exactly one output row per input row, in order (the identity map).
             return new LateralResult(
                 new RecordBatch(_output, new IArrowArray[] { sq.Build(), rows.Build() }, input.Length));
+        }
+
+        public void Dispose() { }
+    }
+}
+
+/// <summary>
+/// A lateral function whose OUTPUT SCHEMA depends on a bind-time constant, consumed through the HOST's
+/// capture channel: <c>plug_lat_fields(n, fields)</c> declares <see cref="Params.Constant"/> and reads the
+/// value in <see cref="Bind"/>'s <c>args</c> — a plugin needs ZERO machinery of its own (the dictionary, the
+/// capture scalar and both call-shape resolutions live in the host; the prototype that developed them in this
+/// file is superseded). Callers: <c>SELECT * FROM plug_lat_fields(7, 'x,y')</c> (literal shape, bare
+/// constant) or <c>SELECT * FROM t, plug_lat_fields(t.n, const_arg('x,y'))</c> (correlated — the host's
+/// <c>const_arg</c> smuggles the value past the binder's args-to-input-relation rewrite via its result TYPE).
+/// Output = one BIGINT column per comma-separated name, column i = n * (i+1), 1:1 with the input rows.
+/// </summary>
+internal sealed class PlugLatFieldsFunction : ILateralFunction
+{
+    public string Name => "plug_lat_fields";
+
+    public Schema Parameters => new(new[]
+    {
+        Params.Positional("n", Int64Type.Default),
+        Params.Constant("fields"), // bind-time constant: arrives in Bind's args, never in the rows
+    }, metadata: null);
+
+    public ILateralFunctionBinding Bind(RecordBatch? args, Schema inputSchema)
+    {
+        int idx = args?.Schema.GetFieldIndex("fields") ?? -1;
+        var names = (idx >= 0 ? args!.Column(idx) : null) is StringArray s && !s.IsNull(0)
+            ? s.GetString(0).Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)
+            : throw new NotSupportedException(
+                "plug_lat_fields: `fields` must be a VARCHAR constant of comma-separated column names.");
+        if (names.Length == 0)
+        {
+            throw new NotSupportedException("plug_lat_fields: `fields` names no columns.");
+        }
+        return new Binding(names);
+    }
+
+    private sealed class Binding : ILateralFunctionBinding
+    {
+        private readonly string[] _names;
+
+        public Binding(string[] names) => _names = names;
+
+        public Schema OutputSchema =>
+            new(_names.Select(n => new Field(n, Int64Type.Default, nullable: true)).ToArray(), metadata: null);
+
+        public ILateralSession Open() => new Session(OutputSchema, _names.Length);
+
+        public void Dispose() { }
+    }
+
+    private sealed class Session : ILateralSession
+    {
+        private readonly Schema _output;
+        private readonly int _cols;
+
+        public Session(Schema output, int cols)
+        {
+            _output = output;
+            _cols = cols;
+        }
+
+        public LateralResult Call(RecordBatch input)
+        {
+            var n = (Int64Array)input.Column(0); // the `fields` slot never arrives here — the host strips it
+            var builders = new Int64Array.Builder[_cols];
+            for (int c = 0; c < _cols; c++) { builders[c] = new Int64Array.Builder().Reserve(input.Length); }
+            for (int r = 0; r < input.Length; r++)
+            {
+                for (int c = 0; c < _cols; c++)
+                {
+                    if (n.IsNull(r)) { builders[c].AppendNull(); } else { builders[c].Append(n.Values[r] * (c + 1)); }
+                }
+            }
+            return new LateralResult(new RecordBatch(
+                _output, builders.Select(b => (IArrowArray)b.Build()).ToArray(), input.Length));
         }
 
         public void Dispose() { }

@@ -75,10 +75,17 @@ struct LateralBindData : public TableFunctionData {
 	FabricatorHandle handle = nullptr;
 	string schema;
 	string func;
-	//! The per-row INPUT columns — the function's positional parameters, as DuckDB resolved them from the
-	//! argument expressions (input_table_types), NOT from input.inputs. See abi.h.
+	//! The per-row INPUT columns — the function's positional parameters as DuckDB resolved them from the
+	//! argument expressions (input_table_types), MINUS any bind-time CONSTANT slots (those never reach the
+	//! callee's rows). This is what the managed bind sees as its input schema and what the wire carries.
 	vector<LogicalType> input_types;
 	vector<string> input_names;
+	//! For each entry of input_types, the CHILD-CHUNK column index it comes from. Identity while no CONSTANT
+	//! slot is declared; with one, the wire skips that slot while the child chunk still carries it.
+	vector<idx_t> wire_slots;
+	//! The TOTAL positional width in the child chunk (CONSTANT slots included) — the correlated operator's
+	//! [callee inputs | correlated columns] split point, which input_types.size() no longer is.
+	idx_t arg_width = 0;
 	//! The callee's OWN output columns (what the function returns; the correlated columns are the host's).
 	vector<LogicalType> output_types;
 	//! TRUE for the literal-argument shape (`f(1,2)`): no child, so DuckDB plans a PhysicalTableScan that
@@ -111,13 +118,27 @@ struct LateralSession {
 		// A narrow VIEW of the leading input columns. Required, not tidy: ArrowAppender::Append iterates
 		// `input.ColumnCount()` against its own per-type root_data, so handing it the child chunk (whose
 		// trailing slots hold the correlated columns) walks off the end of that array in a release build.
+		//
+		// ⚠ CAST-AT-SEAM, not a blind Reference: for an in-out function DuckDB RELABELS input_table_types[i]
+		// to the DECLARED parameter type without inserting a cast into the child subquery
+		// (bind_table_function.cpp:448-457 — ANY slots exempt), so the chunk can legitimately arrive in the
+		// EXPRESSION's own type: `plug_lat_slow(t.bigint_col, …)` against a declared INTEGER delivers BIGINT
+		// here while the bind promised INTEGER. Vector::Reference on that mismatch is an INTERNAL error that
+		// INVALIDATES the whole database. Deliver the type the bind REPORTED instead — the binder already
+		// judged the pair implicitly castable when it matched the overload.
 		DataChunk view;
-		view.InitializeEmpty(bind_.input_types);
-		vector<column_t> ids;
+		view.Initialize(Allocator::DefaultAllocator(), bind_.input_types);
 		for (idx_t i = 0; i < bind_.input_types.size(); i++) {
-			ids.push_back(i);
+			// wire_slots skips bind-time CONSTANT slots — the child chunk still carries them, the callee
+			// never sees them (their value went to the managed bind through the args batch).
+			auto &src = input.data[bind_.wire_slots[i]];
+			if (src.GetType() == bind_.input_types[i]) {
+				view.data[i].Reference(src);
+			} else {
+				VectorOperations::Cast(context, src, view.data[i], input.size());
+			}
 		}
-		view.ReferenceColumns(input, ids);
+		view.SetCardinality(input.size());
 		ArrowAppender appender(bind_.input_types, input.size(), props, ext);
 		appender.Append(view, 0, input.size(), input.size());
 		ArrowArray array = appender.Finalize();
@@ -252,17 +273,61 @@ unique_ptr<FunctionData> LateralBind(ClientContext &context, TableFunctionBindIn
 	// literal shape too (bind_table_function pushes the parameter types with EMPTY names), which is exactly
 	// how the source shape is detected.
 	bool all_names_empty = true;
+	// The DECLARED positional slots (bind-time CONSTANT ones included — they occupy positional slots), in
+	// slot order: the one contract that is stable across the two call shapes (see the normalization below).
+	vector<LogicalType> declared_positional;
+	vector<bool> declared_constant;
+	vector<string> declared_pos_names;
+	for (idx_t i = 0; i < info.arg_types.size(); i++) {
+		auto style = i < info.arg_styles.size() ? info.arg_styles[i] : FabricatorParamStyle::POSITIONAL;
+		if (style == FabricatorParamStyle::NAMED) {
+			continue;
+		}
+		declared_positional.push_back(info.arg_types[i]);
+		declared_constant.push_back(style == FabricatorParamStyle::CONSTANT);
+		declared_pos_names.push_back(i < info.arg_names.size() ? info.arg_names[i] : "arg" + to_string(i));
+	}
+	// Bind-time CONSTANT slots, collected here and marshaled into the args batch below: the folded VALUE
+	// where the binder evaluated the arguments (the literal shape, input.inputs), else a NULL of the BOUND
+	// type — for a `const_arg(...)` wrapper that type is the capture struct whose member name keys the
+	// managed registry, and for anything else the managed side refuses with the wrap-it message.
+	vector<string> const_names;
+	vector<Value> const_values;
+	bind_data->arg_width = input.input_table_types.size();
 	for (idx_t i = 0; i < input.input_table_types.size(); i++) {
-		bind_data->input_types.push_back(input.input_table_types[i]);
-		auto name = i < input.input_table_names.size() ? input.input_table_names[i] : string();
-		if (!name.empty()) {
+		auto slot_name = i < input.input_table_names.size() ? input.input_table_names[i] : string();
+		if (!slot_name.empty()) {
 			all_names_empty = false;
 		}
-		bind_data->input_names.push_back(name.empty() ? "col" + to_string(i) : name);
+		if (i < declared_constant.size() && declared_constant[i]) {
+			Value v = (!input.inputs.empty() && i < input.inputs.size()) ? input.inputs[i]
+			                                                            : Value(input.input_table_types[i]);
+			const_names.push_back(declared_pos_names[i]);
+			const_values.push_back(std::move(v));
+			continue; // never a wire column: the callee's rows do not carry it
+		}
+		auto col_type = input.input_table_types[i];
+		// ⚠ NORMALIZE TO THE DECLARATION — DuckDB's two call shapes DISAGREE about this type, in OPPOSITE
+		// directions (bind_table_function.cpp:425-457): the CORRELATED shape RELABELS input_table_types[i]
+		// to the declared parameter type while the child still delivers the expression's own type (no cast
+		// is inserted), and the LITERAL shape reports the PRE-cast expression type while delivering the
+		// POST-cast value (input_table_types is filled from parameters[i].type() BEFORE the cast loop runs).
+		// So neither reading can be trusted as "what arrives at execute". The DECLARATION is the one stable
+		// contract: a concrete declared type WINS here — the input schema handed to the managed bind then
+		// shows the author's own declaration, and LateralSession::Call casts each runtime chunk to it. An
+		// ANY-declared slot (Arrow null type => SQLNULL/ANY) keeps the BOUND type: carrying a per-call-site
+		// type through untouched is what ANY is for.
+		if (i < declared_positional.size() && declared_positional[i].id() != LogicalTypeId::SQLNULL &&
+		    declared_positional[i].id() != LogicalTypeId::ANY) {
+			col_type = declared_positional[i];
+		}
+		bind_data->input_types.push_back(col_type);
+		bind_data->input_names.push_back(slot_name.empty() ? "col" + to_string(i) : slot_name);
+		bind_data->wire_slots.push_back(i);
 	}
 	if (bind_data->input_types.empty()) {
-		throw BinderException("Fabricator: lateral function \"%s\" needs at least one argument — its arguments "
-		                      "ARE its per-row input columns",
+		throw BinderException("Fabricator: lateral function \"%s\" needs at least one PER-ROW argument — its "
+		                      "non-constant positional parameters ARE its per-row input columns",
 		                      info.func);
 	}
 	bind_data->source_shape = all_names_empty;
@@ -272,9 +337,9 @@ unique_ptr<FunctionData> LateralBind(ClientContext &context, TableFunctionBindIn
 	std::memset(&input_schema, 0, sizeof(input_schema));
 	ArrowConverter::ToArrowSchema(&input_schema, bind_data->input_types, bind_data->input_names, props);
 
-	// Only the NAMED parameters are bind-time constants here; a positional slot is runtime data (see above),
-	// so there is nothing positional to marshal. An omitted named argument crosses as a typed NULL — the same
-	// "omitted == explicit NULL" equivalence every other function kind uses.
+	// The bind-time arguments: NAMED parameters (an omitted one crosses as a typed NULL — the same
+	// "omitted == explicit NULL" equivalence every other function kind uses) plus the CONSTANT slots
+	// collected above. An ordinary positional slot is runtime data and has nothing to marshal.
 	vector<LogicalType> arg_types;
 	vector<string> arg_names;
 	vector<Value> arg_values;
@@ -293,6 +358,11 @@ unique_ptr<FunctionData> LateralBind(ClientContext &context, TableFunctionBindIn
 		arg_names.push_back(info.arg_names[i]);
 		arg_types.push_back(info.arg_types[i].id() == LogicalTypeId::SQLNULL ? v.type() : info.arg_types[i]);
 		arg_values.push_back(std::move(v));
+	}
+	for (idx_t k = 0; k < const_names.size(); k++) {
+		arg_names.push_back(const_names[k]);
+		arg_types.push_back(const_values[k].type());
+		arg_values.push_back(std::move(const_values[k]));
 	}
 	fabricator::ArrowProducer arg_producer(arg_types, arg_names, props);
 	ArrowArrayStream *args_ptr = nullptr;
@@ -622,9 +692,10 @@ bool LateralIsEligible(LogicalGet &get) {
 		return false;
 	}
 	// The child chunk is [ callee input columns | correlated columns ], and the input half must be exactly
-	// what the bind resolved — otherwise the leading-columns view the call exports would be the wrong shape.
+	// the bind's POSITIONAL width (arg_width, bind-time CONSTANT slots included — they sit in the child chunk
+	// even though the wire skips them) — otherwise the wire_slots view would index the wrong columns.
 	idx_t input_width = child_width - get.projected_input.size();
-	if (input_width != bind.input_types.size()) {
+	if (input_width != bind.arg_width) {
 		return false;
 	}
 	for (auto entry : get.projected_input) {
@@ -693,8 +764,11 @@ TableFunction FabricatorMakeLateralFunction(FabricatorHandle handle, const strin
 	auto info = make_shared_ptr<LateralFunctionInfo>();
 	// POSITIONAL parameters become real ARGUMENT TYPES — that is what makes `f(i.a)` bind at all, and what
 	// lets overloads work (the TABLE-parameter overload restriction does not apply). NAMED ones become DuckDB
-	// named parameters, which is the ONLY way to configure a lateral function at bind time: every positional
-	// slot is runtime data, so there is no positional constant to read.
+	// named parameters — bind-time configuration the LITERAL call shape can spell. A CONSTANT parameter is
+	// the bind-time configuration BOTH shapes can spell: it registers as an ordinary ANY positional slot
+	// (falling into the else below — Params.Constant declares the Arrow null type), and LateralBind resolves
+	// its VALUE into the managed args batch instead of the wire (see the capture registry in
+	// Fabricator.Bridge/CapturedConstants.cs).
 	for (idx_t i = 0; i < arg_names.size(); i++) {
 		auto style = i < arg_styles.size() ? arg_styles[i] : FabricatorParamStyle::POSITIONAL;
 		auto type = arg_types[i].id() == LogicalTypeId::SQLNULL ? LogicalType::ANY : arg_types[i];

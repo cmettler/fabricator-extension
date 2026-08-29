@@ -231,8 +231,8 @@ void FetchFunctionParamSchema(ClientContext &context, FabricatorHandle handle, c
 	fabricator::GetFunctionParamSchema(handle, schema_name, func_name, schema);
 	if (out_styles) {
 		// A parameter's STYLE rides its FIELD metadata (the same C-ABI channel as the volatility signal
-		// above): fabricator.param_style = "named" | "table". Absent => positional. ONE schema per function
-		// carries all three kinds, so there is no second schema to align this against. Read BEFORE
+		// above): fabricator.param_style = "named" | "table" | "constant". Absent => positional. ONE schema
+		// per function carries every kind, so there is no second schema to align this against. Read BEFORE
 		// ReadArrowSchema consumes the struct.
 		out_styles->clear();
 		for (int64_t c = 0; c < schema.n_children; c++) {
@@ -244,6 +244,8 @@ void FetchFunctionParamSchema(ClientContext &context, FabricatorHandle handle, c
 					style = FabricatorParamStyle::NAMED;
 				} else if (value == "table") {
 					style = FabricatorParamStyle::TABLE_INPUT;
+				} else if (value == "constant") {
+					style = FabricatorParamStyle::CONSTANT;
 				}
 			}
 			out_styles->push_back(style);
