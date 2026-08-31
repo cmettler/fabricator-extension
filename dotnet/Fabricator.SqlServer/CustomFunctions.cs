@@ -47,6 +47,9 @@ internal static class CustomFunctions
         // fabricator_batch_seq() — takes NO ARGUMENTS, which is the point: it is the gate for zero-argument
         // scalars, previously recorded as impossible. See BatchSeqFunction and verify_global_functions §.
         new Fabricator.Bridge.BatchSeqFunction(),
+        // fabricator_va_concat(sep, …) — the VARIADIC tail (Params.VarArgs): minimum arity 1, then any number
+        // of further arguments of ANY type. See the varargs section at the bottom of this file.
+        new GfVaConcatFunction(),
     };
 
     // Connection-free GLOBAL table-in-out (streaming exchange) functions — bare fn(<input>), no ATTACH.
@@ -96,6 +99,8 @@ internal static class CustomFunctions
         // HOST-FS WRITE spike: fabricator_delta_write_demo(path) writes a fixed 5-row Delta table via the host-FS
         // write callbacks (put-if-absent commit), returning (version, rows_written). Proves the write bridge.
         new Fabricator.Bridge.DeltaWriteDemoFunction(),
+        // fabricator_va_args(label, …) — a VARIADIC table function: one row per tail argument.
+        new GfVaArgsFunction(),
     };
 
     // Connection-free GLOBAL aggregate functions (UDAF) — bare fn(args), no ATTACH, usable in GROUP BY / OVER /
@@ -114,6 +119,8 @@ internal static class CustomFunctions
     {
         new GfSqlSeqFunction(),
         new GfDeltaUnionFunction(),
+        // fabricator_va_values(…) — a VARIADIC generator: the SQL's COLUMN COUNT is the argument count.
+        new GfVaValuesFunction(),
     };
 
     // Provider MACROs — SQL templates registered into DuckDB's system catalog at extension load, so they
@@ -185,6 +192,10 @@ internal static class CustomFunctions
         new CfHostAnswerFunction(),
         new CfHostSumFunction(),
         new CfHostParamFunction(),
+        // cf_va_sum(…) — the CATALOG-BOUND half of the variadic surface. A declaration form that only ever
+        // ships GLOBAL looks covered while the second registration path (GetOrCreateScalarFunction) is
+        // untested; this closes that, the same gap the catalog-VIEW work had to close for providers.
+        new CfVaSumFunction(),
     };
 
     public static readonly IReadOnlyList<ICatalogTableFunction> Table = new ICatalogTableFunction[]
@@ -2048,4 +2059,250 @@ internal sealed class CfParseBinding : IScalarFunctionBinding
     public void Dispose()
     {
     }
+}
+
+// =============================================================================
+// VARIADIC (varargs) demonstrations — one per kind that supports a variadic tail.
+//
+// A tail is declared with `Params.VarArgs(name[, type])`: the fields BEFORE it are the function's MINIMUM
+// arity, and DuckDB then accepts any number of further arguments, each implicitly cast to the tail's type
+// (the ANY overload => no cast, so each argument keeps its own runtime type). The args batch of a variadic
+// call is WIDER than `Parameters` — the tail columns follow the prefix in call order, named `<tail>_0`,
+// `<tail>_1`, … — so an implementation reads the COUNT from the batch, never from its own declaration.
+//
+// ⚠ A LIST parameter already covers the homogeneous case (`f(['a','b'])`) and needs none of this machinery.
+// What a tail buys is HETEROGENEOUS, individually-typed arguments, which is why every one of these demos
+// mixes types at the call site.
+// =============================================================================
+
+/// <summary>
+/// Renders one bound argument for display. ⚠ INVARIANT culture, deliberately: the default
+/// <c>object.ToString()</c> formats dates and numbers per the machine's locale, so a gate asserting the
+/// output would pass here and fail on a runner set to another culture — the kind of environment dependency
+/// this tree treats as a defect rather than a quirk.
+/// </summary>
+internal static class VaRender
+{
+    internal static string? Text(object? v) => v switch
+    {
+        null => null,
+        string s => s,
+        System.IFormattable f => f.ToString(null, System.Globalization.CultureInfo.InvariantCulture),
+        _ => v.ToString(),
+    };
+}
+
+/// <summary>
+/// <c>fabricator_va_concat(sep, …)</c> — the SCALAR tail: renders every argument after the separator and
+/// joins them. Min arity 1; <c>ANY</c> tail, so <c>fabricator_va_concat('-', 1, 'x', DATE '2020-01-01')</c>
+/// works and each value arrives as its own Arrow type.
+/// </summary>
+internal sealed class GfVaConcatFunction : IScalarFunction
+{
+    public string Name => "fabricator_va_concat";
+
+    public Schema Parameters => new(new[]
+    {
+        Params.Positional("sep", StringType.Default),
+        // No type => the ANY tail. DuckDB inserts no cast for ANY, so a heterogeneous call arrives verbatim.
+        Params.VarArgs("value"),
+    }, metadata: null);
+
+    public Field Result => new("result", StringType.Default, nullable: true);
+
+    public IArrowArray Invoke(RecordBatch args)
+    {
+        var sep = (StringArray)args.Column(0);
+        var b = new StringArray.Builder().Reserve(args.Length);
+        for (int row = 0; row < args.Length; row++)
+        {
+            var parts = new List<string>();
+            // The COUNT comes from the batch: the declaration says only "a tail follows".
+            for (int c = 1; c < args.ColumnCount; c++)
+            {
+                parts.Add(VaRender.Text(ArrowValueReader.ReadScalar(args.Column(c), row)) ?? "NULL");
+            }
+            b.Append(string.Join(sep.IsNull(row) ? string.Empty : sep.GetString(row), parts));
+        }
+        return b.Build();
+    }
+}
+
+/// <summary>
+/// <c>fabricator_va_args(label, …)</c> — the TABLE tail: one output row per tail argument, reporting its
+/// ordinal, the column NAME the host gave it, its Arrow type and its rendered value. The shipped proof that
+/// a variadic call's args batch reaches a table function intact.
+/// </summary>
+/// <remarks>
+/// It keeps a fixed prefix deliberately: a table function whose tail is its ONLY parameter has minimum arity
+/// 0, and a zero-argument call crosses with NO args stream at all (a zero-field Arrow schema cannot be
+/// represented), which is a different code path from the one being demonstrated here.
+/// </remarks>
+internal sealed class GfVaArgsFunction : ITableFunction
+{
+    public string Name => "fabricator_va_args";
+
+    public Schema Parameters => new(new[]
+    {
+        Params.Positional("label", StringType.Default),
+        Params.VarArgs("arg"),
+    }, metadata: null);
+
+    public ITableFunctionBinding Bind(RecordBatch args)
+    {
+        var label = args.ColumnCount > 0 && args.Column(0) is StringArray l && !l.IsNull(0)
+            ? l.GetString(0)
+            : string.Empty;
+        var rows = new List<(int Ordinal, string Name, string Type, string? Value)>();
+        for (int c = 1; c < args.ColumnCount; c++)
+        {
+            var col = args.Column(c);
+            rows.Add((c - 1, args.Schema.FieldsList[c].Name, col.Data.DataType.Name,
+                      VaRender.Text(ArrowValueReader.ReadScalar(col, 0))));
+        }
+        return new Binding(label, rows);
+    }
+
+    private sealed class Binding : ITableFunctionBinding
+    {
+        private readonly string _label;
+        private readonly List<(int Ordinal, string Name, string Type, string? Value)> _rows;
+
+        public Binding(string label, List<(int Ordinal, string Name, string Type, string? Value)> rows)
+        {
+            _label = label;
+            _rows = rows;
+        }
+
+        public Schema OutputSchema => new(new[]
+        {
+            new Field("label", StringType.Default, nullable: false),
+            new Field("ordinal", Int32Type.Default, nullable: false),
+            new Field("name", StringType.Default, nullable: false),
+            new Field("type", StringType.Default, nullable: false),
+            new Field("value", StringType.Default, nullable: true),
+        }, metadata: null);
+
+        public bool SupportsFilterPushdown => false;
+        public bool SupportsProjectionPushdown => false;
+
+        // Dispose eagerly in a plain method, then delegate — see the lifetime note in StaticTableFunction.Execute.
+        public IAsyncEnumerable<RecordBatch> Execute(TableFunctionScan scan, CancellationToken ct = default)
+        {
+            scan.FilterValues?.Dispose();
+            return Rows(ct);
+        }
+
+        private async IAsyncEnumerable<RecordBatch> Rows([EnumeratorCancellation] CancellationToken ct)
+        {
+            await Task.CompletedTask;
+            var label = new StringArray.Builder().Reserve(_rows.Count);
+            var ordinal = new Int32Array.Builder().Reserve(_rows.Count);
+            var name = new StringArray.Builder().Reserve(_rows.Count);
+            var type = new StringArray.Builder().Reserve(_rows.Count);
+            var value = new StringArray.Builder().Reserve(_rows.Count);
+            foreach (var r in _rows)
+            {
+                label.Append(_label);
+                ordinal.Append(r.Ordinal);
+                name.Append(r.Name);
+                type.Append(r.Type);
+                if (r.Value is null) { value.AppendNull(); } else { value.Append(r.Value); }
+            }
+            yield return new RecordBatch(
+                OutputSchema,
+                new IArrowArray[] { label.Build(), ordinal.Build(), name.Build(), type.Build(), value.Build() },
+                _rows.Count);
+        }
+
+        public void Dispose() { }
+    }
+}
+
+/// <summary>
+/// <c>db.dbo.cf_va_sum(…)</c> — the CATALOG-BOUND variadic scalar: sums any number of arguments, NULLs
+/// skipped, and reports 0 for a call with none. Its whole job is to exercise the ATTACH-time registration
+/// path (<c>GetOrCreateScalarFunction</c>), which is a different site from the load-time global one.
+/// </summary>
+/// <remarks>
+/// A CONCRETE tail type (<c>BIGINT</c>) rather than the ANY used by the global demos, which is the other
+/// half of the mechanism: DuckDB applies its ordinary IMPLICIT-CAST rules per tail argument, so
+/// <c>cf_va_sum(1, 2::SMALLINT, 3::TINYINT)</c> arrives as three <c>int64</c> columns.
+/// <para>⚠ MEASURED, and it corrects the obvious reading: a concrete tail is not "anything, coerced". A cast
+/// DuckDB will not make implicitly is refused at BIND, exactly as for a declared parameter —
+/// <c>cf_va_sum(1, 2::SMALLINT, 3.0)</c> fails with <i>"No function matches … cf_va_sum(INTEGER_LITERAL,
+/// SMALLINT, DECIMAL(2,1))"</i> because DECIMAL→BIGINT is lossy. Declare an ANY tail when the point is to
+/// accept anything.</para>
+/// </remarks>
+internal sealed class CfVaSumFunction : ICatalogScalarFunction
+{
+    public string SchemaName => "dbo";
+    public string Name => "cf_va_sum";
+
+    public Schema Parameters => new(new[] { Params.VarArgs("n", Int64Type.Default) }, metadata: null);
+
+    public Field Result => new("result", Int64Type.Default, nullable: false);
+
+    public IArrowArray Invoke(RecordBatch args)
+    {
+        var b = new Int64Array.Builder().Reserve(args.Length);
+        for (int row = 0; row < args.Length; row++)
+        {
+            long sum = 0;
+            for (int c = 0; c < args.ColumnCount; c++)
+            {
+                if (args.Column(c) is Int64Array v && !v.IsNull(row))
+                {
+                    sum += v.Values[row];
+                }
+            }
+            b.Append(sum);
+        }
+        return b.Build();
+    }
+}
+
+/// <summary>
+/// <c>fabricator_va_values(…)</c> — the SQL-GENERATING tail: emits a one-row SELECT whose COLUMN COUNT is the
+/// number of arguments (<c>SELECT 1 AS v0, 'x' AS v1</c>). The shape sqlgen exists for — the SQL TEXT, not
+/// just the values, depends on the call.
+/// </summary>
+internal sealed class GfVaValuesFunction : ISqlTableFunction
+{
+    public string Name => "fabricator_va_values";
+
+    public Schema Parameters => new(new[] { Params.VarArgs("v") }, metadata: null);
+
+    public string GenerateSql(RecordBatch args)
+    {
+        // ⚠ `args` can be an EMPTY batch, not just a short one: a variadic generator's minimum arity is its
+        // (here empty) prefix, so `fabricator_va_values()` binds and the host hands the crossing no args
+        // stream at all. The generator's own rule is what refuses it.
+        if (args is null || args.ColumnCount == 0)
+        {
+            throw new ArgumentException("fabricator_va_values: pass at least one value");
+        }
+        var cols = new List<string>();
+        for (int c = 0; c < args.ColumnCount; c++)
+        {
+            cols.Add(Literal(ArrowValueReader.ReadScalar(args.Column(c), 0)) + " AS v" + c);
+        }
+        return "SELECT " + string.Join(", ", cols);
+    }
+
+    /// <summary>
+    /// Renders one bound argument as a SQL literal. ⚠ An ALLOW-LIST, not an escaper: this text is parsed as
+    /// SQL, so a type whose rendering is not provably safe is refused by name rather than interpolated.
+    /// </summary>
+    private static string Literal(object? v) => v switch
+    {
+        null => "NULL",
+        bool b => b ? "TRUE" : "FALSE",
+        sbyte or byte or short or ushort or int or uint or long or ulong => v.ToString()!,
+        float or double or decimal => Convert.ToString(v, System.Globalization.CultureInfo.InvariantCulture)!,
+        string s => "'" + s.Replace("'", "''") + "'",
+        _ => throw new ArgumentException(
+            "fabricator_va_values: cannot render a " + v.GetType().Name + " as a SQL literal — pass a number, "
+            + "a boolean, a string or NULL"),
+    };
 }

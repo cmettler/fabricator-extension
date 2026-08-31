@@ -405,3 +405,78 @@ query I
 EXECUTE p80b('bigint');
 ----
 BIGINT
+
+# ---- VARIADIC parameters (Params.VarArgs) — a scalar and a table function with a variable-arity tail ----
+#
+# DuckDB carries variadics as ONE type on SimpleFunction::varargs: the declared parameters are the MINIMUM
+# arity and every argument past them must implicitly cast to that type. `Params.VarArgs(name[, type])`
+# declares the tail; the host strips it from the signature's argument list and assigns it to `varargs`.
+#
+# ⚠ THE ASSERTION THAT PINS THE MECHANISM IS THE SIGNATURE, not any answer: an implementation reading its
+# args batch positionally would produce the same rows for a FIXED 3-parameter declaration. Only
+# duckdb_functions() distinguishes "registered as variadic" from "registered with N arguments".
+query III
+SELECT parameter_types, varargs, return_type
+FROM duckdb_functions() WHERE function_name = 'fabricator_va_concat';
+----
+[VARCHAR]	ANY	VARCHAR
+
+# The declared prefix is the MINIMUM arity: below it DuckDB refuses at bind, and its candidate rendering
+# spells the tail — which is the other half of "the registration really is variadic".
+statement error
+SELECT fabricator_va_concat();
+----
+<REGEX>:.*fabricator_va_concat\(VARCHAR, \[ANY\.\.\.\]\).*
+
+# Zero tail arguments is a legal call (the minimum is satisfied) and yields the empty join.
+query I
+SELECT fabricator_va_concat('|');
+----
+(empty)
+
+# The tail is HETEROGENEOUS, which is the whole reason it is not a LIST parameter: a LIST forces one element
+# type, and these five arguments have five. ⚠ The rendering is INVARIANT-culture on purpose (VaRender) —
+# object.ToString() would format the DATE per the machine's locale and this assertion would be machine-
+# dependent.
+query I
+SELECT fabricator_va_concat('-', 1, 'x', DATE '2020-01-01', 4.5, NULL);
+----
+1-x-01/01/2020 00:00:00-4.5-NULL
+
+# Arity varies per CALL SITE, not per function: two calls in one statement, two widths.
+query II
+SELECT fabricator_va_concat(':', 1, 2), fabricator_va_concat(':', 1, 2, 3, 4);
+----
+1:2	1:2:3:4
+
+# A tail argument may be a COLUMN — it is an ordinary argument expression, evaluated per row. (The bind-time
+# constant channel is a different feature; a tail is a runtime value.)
+query I
+SELECT fabricator_va_concat(':', r, r * 2) FROM range(3) t(r) ORDER BY 1;
+----
+0:0
+1:2
+2:4
+
+# TABLE functions take a tail too, and this is what proves the args batch reaches the bind WIDENED: one
+# output row per tail argument, each carrying the column NAME the host generated (`<tail>_<k>`) and the
+# Arrow TYPE it arrived as. int32/utf8/bool side by side is the no-cast property of an ANY tail — a
+# concrete tail type would have coerced all three.
+query IIII
+SELECT ordinal, name, type, value FROM fabricator_va_args('demo', 42, 'hi', TRUE) ORDER BY ordinal;
+----
+0	arg_0	int32	42
+1	arg_1	utf8	hi
+2	arg_2	bool	True
+
+# A call supplying NO tail arguments is legal — the minimum arity is the prefix alone.
+query I
+SELECT count(*) FROM fabricator_va_args('empty');
+----
+0
+
+query III
+SELECT parameter_types, varargs, function_type
+FROM duckdb_functions() WHERE function_name = 'fabricator_va_args';
+----
+[VARCHAR]	ANY	table

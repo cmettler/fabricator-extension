@@ -829,6 +829,16 @@ TableFunction FabricatorMakeLateralFunction(FabricatorHandle handle, const strin
 	// the rendered-text fold above).
 	for (idx_t i = 0; i < arg_names.size(); i++) {
 		auto style = i < arg_styles.size() ? arg_styles[i] : FabricatorParamStyle::POSITIONAL;
+		if (style == FabricatorParamStyle::VARARGS) {
+			// DEFERRED for this kind, and refused at REGISTRATION rather than left to the managed bind: a
+			// lateral function's positional slots are its per-row INPUT COLUMNS, so a tail is a
+			// variable-width wire, and it would have to compose with CONSTANT slots, which are also trailing
+			// and also stripped from the wire. Falling through would make it an ordinary ANY input column.
+			throw InvalidInputException("Fabricator: lateral function \"%s\" declares the variadic tail "
+			                            "\"%s\" — a lateral function's positional parameters are its per-row "
+			                            "input columns, so it cannot take one",
+			                            func_name, arg_names[i]);
+		}
 		auto type = arg_types[i].id() == LogicalTypeId::SQLNULL ? LogicalType::ANY : arg_types[i];
 		if (style == FabricatorParamStyle::NAMED) {
 			tf.named_parameters[arg_names[i]] = type;

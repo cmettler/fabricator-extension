@@ -449,6 +449,10 @@ struct FabricatorScalarFunctionInfo : public ScalarFunctionInfo {
 	string schema;
 	string func;
 	vector<string> arg_names;
+	//! Position of the declared VARARGS tail, or INVALID_INDEX. Needed at BIND because a variadic call is
+	//! wider than the declaration, so both the marshal TYPE and the column NAME of a tail argument have to be
+	//! derived rather than looked up.
+	idx_t varargs_index = DConstants::INVALID_INDEX;
 };
 
 // Refcounted holder for the managed scalar binding; its destructor calls scalarfn_close at plan teardown
@@ -482,6 +486,111 @@ struct FabricatorScalarBindData : public FunctionData {
 // into TableFunctionBindInput::inputs. Here we are handed argument EXPRESSIONS, so we fold what we can and
 // tell the provider WHICH slots are real via the mask; an unfoldable slot carries a NULL placeholder that
 // must not be mistaken for an explicit NULL literal.
+// =============================================================================
+// VARIADIC parameters (`fabricator.param_style = "varargs"` => FabricatorParamStyle::VARARGS)
+//
+// DuckDB carries variadics as ONE type on `SimpleFunction::varargs`, shared by scalar / table / aggregate:
+// `arguments` is the FIXED PREFIX and therefore the MINIMUM arity, and every argument beyond it must
+// implicitly cast to `varargs` (function_binder.cpp `BindVarArgsFunctionCost`). There is NO maximum, and
+// overload resolution costs a variadic candidate like any other, so a fixed-arity overload still wins.
+//
+// A declaration's variadic field is therefore NOT one of `tf.arguments` — it names the TAIL'S TYPE. Two
+// structural rules are enforced rather than reinterpreted (see FabricatorVarArgsIndex).
+//
+// ⚠ THE PART THAT IS EASY TO MISS: every args marshal in this file initializes a DataChunk from the
+// DECLARED types and then loops the SUPPLIED values. For a variadic call there are MORE values than
+// declared types, so each marshal has to be widened to the actual call — FabricatorExpandVarArgs does it.
+// =============================================================================
+
+//! The index of the declared VARARGS parameter, or DConstants::INVALID_INDEX when the function is not
+//! variadic. Throws on a malformed declaration, naming the function and the offending parameter.
+static idx_t FabricatorVarArgsIndex(const string &func_name, const vector<string> &names,
+                                    const vector<FabricatorParamStyle> &styles) {
+	idx_t found = DConstants::INVALID_INDEX;
+	for (idx_t i = 0; i < names.size(); i++) {
+		auto style = i < styles.size() ? styles[i] : FabricatorParamStyle::POSITIONAL;
+		if (style == FabricatorParamStyle::VARARGS) {
+			if (found != DConstants::INVALID_INDEX) {
+				throw InvalidInputException("Fabricator: function \"%s\" declares more than one variadic tail "
+				                            "(\"%s\"); DuckDB carries exactly one varargs type per function",
+				                            func_name, names[i]);
+			}
+			found = i;
+			continue;
+		}
+		if (found != DConstants::INVALID_INDEX && style != FabricatorParamStyle::NAMED) {
+			throw InvalidInputException(
+			    "Fabricator: function \"%s\" declares \"%s\" after its variadic tail. The tail must be the LAST "
+			    "positional parameter — every argument past the declared ones belongs to it, so a positional "
+			    "parameter following it can never be filled",
+			    func_name, names[i]);
+		}
+	}
+	return found;
+}
+
+//! The DuckDB type of a variadic tail. SQLNULL is this protocol's "accept any value" sentinel and maps to
+//! ANY — which is also what makes DuckDB insert NO cast, so each argument arrives as its own runtime type.
+//! That is the whole point of a HETEROGENEOUS tail (a homogeneous one is better served by a LIST argument).
+static LogicalType FabricatorVarArgsType(const LogicalType &declared) {
+	return declared.id() == LogicalTypeId::SQLNULL ? LogicalType::ANY : declared;
+}
+
+//! The name of the i-th ACTUAL argument of a (possibly variadic) call: the fixed prefix keeps its declared
+//! name, and each tail argument is `<tail>_<k>` with k from 0. Subsumes the historical `arg<i>` fallback for
+//! a call wider than its declaration, which is what a variadic call always is.
+static string FabricatorArgName(const vector<string> &decl_names, idx_t varargs_index, idx_t i) {
+	if (varargs_index != DConstants::INVALID_INDEX && varargs_index < decl_names.size() && i >= varargs_index) {
+		return decl_names[varargs_index] + "_" + to_string(i - varargs_index);
+	}
+	return i < decl_names.size() ? decl_names[i] : "arg" + to_string(i);
+}
+
+//! Refuses a variadic tail on a function kind that cannot carry one. ⚠ Doing NOTHING is worse than an
+//! error rather than merely less helpful: with no case for it, a VARARGS field falls through to the
+//! positional branch and silently becomes an ordinary ANY argument — a function whose documented call
+//! syntax then does not work, and whose declaration looks honoured.
+static void FabricatorRefuseVarArgs(const string &func_name, const char *kind, const vector<string> &names,
+                                    const vector<FabricatorParamStyle> &styles) {
+	for (idx_t i = 0; i < names.size(); i++) {
+		if (i < styles.size() && styles[i] == FabricatorParamStyle::VARARGS) {
+			throw InvalidInputException("Fabricator: function \"%s\" declares the variadic tail \"%s\", which "
+			                            "a %s function cannot take — scalar, table and SQL-generating "
+			                            "functions only",
+			                            func_name, names[i], kind);
+		}
+	}
+}
+
+//! Widens a declared (names, types) pair to the ACTUAL positional width of a variadic call, given the
+//! supplied values. A NON-VARIADIC function comes back byte-identical to its declaration, so callers need
+//! no second branch.
+//! ⚠ A variadic one comes back at the CALL's width, which for a call supplying NO tail arguments is the
+//! prefix ALONE — one entry SHORTER than the declaration, because the tail slot names a TYPE rather than an
+//! argument. That is what the marshal needs (its values are the call's), not what the declaration says.
+static void FabricatorExpandVarArgs(idx_t varargs_index, const vector<string> &decl_names,
+                                    const vector<LogicalType> &decl_types, const vector<Value> &values,
+                                    vector<string> &out_names, vector<LogicalType> &out_types) {
+	out_names.clear();
+	out_types.clear();
+	if (varargs_index == DConstants::INVALID_INDEX) {
+		out_names = decl_names;
+		out_types = decl_types;
+		return;
+	}
+	auto tail_type = FabricatorVarArgsType(decl_types[varargs_index]);
+	for (idx_t i = 0; i < values.size(); i++) {
+		out_names.push_back(FabricatorArgName(decl_names, varargs_index, i));
+		if (i < varargs_index) {
+			out_types.push_back(decl_types[i]);
+			continue;
+		}
+		// An ANY tail keeps the supplied value's OWN type — DuckDB inserted no cast, so the runtime type is
+		// what the managed side must be handed. A concrete tail has already been cast to its declared type.
+		out_types.push_back(tail_type.id() == LogicalTypeId::ANY ? values[i].type() : tail_type);
+	}
+}
+
 static unique_ptr<FunctionData> FabricatorScalarBind(ClientContext &context, ScalarFunction &bound_function,
                                                     vector<unique_ptr<Expression>> &arguments) {
 	auto &info = bound_function.function_info->Cast<FabricatorScalarFunctionInfo>();
@@ -531,6 +640,12 @@ static unique_ptr<FunctionData> FabricatorScalarBind(ClientContext &context, Sca
 		if (i < bound_function.arguments.size() && bound_function.arguments[i].id() != LogicalTypeId::ANY &&
 		    bound_function.arguments[i].id() != LogicalTypeId::INVALID) {
 			marshal_type = bound_function.arguments[i];
+		} else if (i >= bound_function.arguments.size() && bound_function.varargs.IsValid() &&
+		           bound_function.varargs.id() != LogicalTypeId::ANY) {
+			// A VARIADIC tail argument: past the fixed prefix there is no `arguments[i]` to read, and the
+			// cast DuckDB is about to insert targets `varargs`. Same reasoning as the branch above — an ANY
+			// tail gets no cast, so the expression's own type is what execute will see.
+			marshal_type = bound_function.varargs;
 		}
 		bool folded = false;
 		Value value(marshal_type); // NULL placeholder for a runtime expression
@@ -548,7 +663,7 @@ static unique_ptr<FunctionData> FabricatorScalarBind(ClientContext &context, Sca
 			}
 		}
 		arg_types.push_back(marshal_type);
-		arg_names.push_back(i < info.arg_names.size() ? info.arg_names[i] : "arg" + to_string(i));
+		arg_names.push_back(FabricatorArgName(info.arg_names, info.varargs_index, i));
 		arg_constant.push_back(folded ? '1' : '0');
 		arg_values.push_back(std::move(value));
 	}
@@ -644,8 +759,9 @@ static unique_ptr<FunctionData> FabricatorScalarBind(ClientContext &context, Sca
 static ScalarFunction BuildFabricatorScalarFunction(FabricatorHandle handle, const string &schema_name,
                                                   const string &fn_name, vector<LogicalType> arg_types,
                                                   vector<string> arg_names, LogicalType return_type,
-                                                  bool is_volatile) {
-	scalar_function_t exec = [arg_names](DataChunk &args, ExpressionState &state, Vector &result) {
+                                                  bool is_volatile,
+                                                  idx_t varargs_index = DConstants::INVALID_INDEX) {
+	scalar_function_t exec = [arg_names, varargs_index](DataChunk &args, ExpressionState &state, Vector &result) {
 		auto &ctx = state.GetContext();
 		idx_t row_count = args.size();
 
@@ -654,7 +770,12 @@ static ScalarFunction BuildFabricatorScalarFunction(FabricatorHandle handle, con
 		// the value UNCAST, so the runtime type (a STRUCT, a VARCHAR, …) is what must be appended. For a
 		// concrete-typed param DuckDB has already cast to the declared type, so this equals the signature.
 		auto actual_types = args.GetTypes();
-		auto marshal_names = arg_names;
+		// Name the ACTUAL columns, not the declared ones: a VARIADIC call is wider than its declaration, and
+		// the producer pairs names with types positionally — a short name list would misdescribe the batch.
+		vector<string> marshal_names;
+		for (idx_t c = 0; c < actual_types.size(); c++) {
+			marshal_names.push_back(FabricatorArgName(arg_names, varargs_index, c));
+		}
 
 		// ── ZERO-ARGUMENT SCALAR: send one throwaway column ──────────────────────────────────────────
 		// Apache.Arrow (23.0.0) cannot represent a zero-FIELD schema across the C interface in EITHER
@@ -736,11 +857,12 @@ static ScalarFunction BuildFabricatorScalarFunction(FabricatorHandle handle, con
 	// Signature: a SQLNULL-typed param is the "accept any value" sentinel (no Arrow type for ANY) → register it
 	// as LogicalType::ANY so DuckDB passes any literal (a STRUCT, a VARCHAR, …) UNCAST; the exec marshals the
 	// runtime type. Same marker the table/proc named-param path uses (e.g. daxeval's params bag).
-	vector<LogicalType> sig_types = arg_types;
-	for (auto &t : sig_types) {
-		if (t.id() == LogicalTypeId::SQLNULL) {
-			t = LogicalType::ANY;
+	vector<LogicalType> sig_types;
+	for (idx_t i = 0; i < arg_types.size(); i++) {
+		if (i == varargs_index) {
+			continue; // the tail names a TYPE, not an argument slot — it becomes fn.varargs below
 		}
+		sig_types.push_back(arg_types[i].id() == LogicalTypeId::SQLNULL ? LogicalType::ANY : arg_types[i]);
 	}
 	// An UNRESOLVED declared return (the SQLNULL sentinel) registers as ANY — the same mapping the
 	// parameters above use for "accept anything", and the placeholder upstream uses for a bind-resolved
@@ -750,12 +872,18 @@ static ScalarFunction BuildFabricatorScalarFunction(FabricatorHandle handle, con
 	}
 	ScalarFunction fn(sig_types, return_type, exec, FabricatorScalarBind);
 	fn.name = fn_name;
+	if (varargs_index != DConstants::INVALID_INDEX) {
+		// The declared parameters BEFORE the tail are now the MINIMUM arity; DuckDB accepts any number of
+		// further arguments, each implicitly cast to this type (ANY => no cast at all).
+		fn.varargs = FabricatorVarArgsType(arg_types[varargs_index]);
+	}
 	// Identity for the bind callback, which is a raw function pointer and cannot capture.
 	auto fn_info = make_shared_ptr<FabricatorScalarFunctionInfo>();
 	fn_info->handle = handle;
 	fn_info->schema = schema_name;
 	fn_info->func = fn_name;
 	fn_info->arg_names = arg_names;
+	fn_info->varargs_index = varargs_index;
 	fn.SetExtraFunctionInfo(std::move(fn_info));
 	// A remote UDF may be non-deterministic / side-effecting (VOLATILE => never folded) — the default. A
 	// function DECLARED pure (fabricator.volatile = "0" on its return field, e.g. hilbert_index / bucket) is
@@ -780,10 +908,11 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateScalarFunction(Clie
 
 	vector<string> arg_names;
 	vector<LogicalType> arg_types;
+	vector<FabricatorParamStyle> arg_styles;
 	LogicalType return_type;
 	bool is_volatile = true;
 	try {
-		FetchFunctionParamSchema(context, handle_, name, func_name, arg_names, arg_types);
+		FetchFunctionParamSchema(context, handle_, name, func_name, arg_names, arg_types, &arg_styles);
 		return_type = FetchFunctionReturnType(context, handle_, name, func_name, &is_volatile);
 	} catch (std::exception &) {
 		// The discovered name is stale — the function no longer exists on the server
@@ -793,9 +922,12 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateScalarFunction(Clie
 		return nullptr;
 	}
 
-	// The per-call execution callback (shared with load-time global scalars).
-	ScalarFunction fn =
-	    BuildFabricatorScalarFunction(handle_, name, func_name, arg_types, arg_names, return_type, is_volatile);
+	// The per-call execution callback (shared with load-time global scalars). A malformed variadic
+	// declaration throws HERE rather than in the fetch above — it is a declaration bug, not a stale name, and
+	// the catch above would turn it into a silent "function does not exist".
+	ScalarFunction fn = BuildFabricatorScalarFunction(
+	    handle_, name, func_name, arg_types, arg_names, return_type, is_volatile,
+	    FabricatorVarArgsIndex(func_name, arg_names, arg_styles));
 
 	CreateScalarFunctionInfo info(std::move(fn));
 	info.catalog = catalog.GetName();
@@ -1321,9 +1453,10 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateAggregateFunction(C
 
 	vector<string> arg_names;
 	vector<LogicalType> arg_types;
+	vector<FabricatorParamStyle> arg_styles;
 	LogicalType return_type;
 	try {
-		FetchFunctionParamSchema(context, handle_, name, func_name, arg_names, arg_types);
+		FetchFunctionParamSchema(context, handle_, name, func_name, arg_names, arg_types, &arg_styles);
 		return_type = FetchFunctionReturnType(context, handle_, name, func_name);
 	} catch (std::exception &) {
 		// Stale discovery (the function no longer exists) — treat as not-found, like the scalar path.
@@ -1332,6 +1465,8 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateAggregateFunction(C
 		return nullptr;
 	}
 
+	// Outside the catch above: a malformed declaration is a bug to report, not a stale name to drop.
+	FabricatorRefuseVarArgs(func_name, "aggregate", arg_names, arg_styles);
 	AggregateFunction fn =
 	    BuildFabricatorAggregateFunction(handle_, name, func_name, arg_types, arg_names, return_type, spillable);
 
@@ -1509,6 +1644,10 @@ struct FabricatorTableFunctionInfo : public TableFunctionInfo {
 	// TVF and every pre-named-parameter provider function look like. The provider tags them via
 	// `fabricator.param_style` in the parameter schema's field metadata — ONE schema carries all styles.
 	vector<FabricatorParamStyle> arg_styles;
+	//! Position of the declared VARARGS tail within arg_names/arg_types, or INVALID_INDEX. STORED rather
+	//! than derived from arg_styles: the SQL-GENERATING path stores a FILTERED declaration (named parameters
+	//! are re-added by name at bind), so the two lists do not share indices there.
+	idx_t varargs_index = DConstants::INVALID_INDEX;
 	bool is_proc = false;    // stored procedure (EXEC, no pushdown) vs TVF (FROM, pushdown)
 	// SQL-generating (`table_sql`, v68) functions only: the DuckDB ATTACH ALIAS of the catalog this entry
 	// belongs to (empty for a global function). Passed to generate_table_sql so a catalog-bound generator can
@@ -1587,8 +1726,23 @@ unique_ptr<FunctionData> FabricatorTableFunctionBind(ClientContext &context, Tab
 		// thing, which is the semantic a provider already has to implement for a nullable trailing argument.
 		idx_t positional_index = 0;
 		for (idx_t i = 0; i < info.arg_names.size(); i++) {
-			bool named = i < info.arg_styles.size() && info.arg_styles[i] == FabricatorParamStyle::NAMED;
+			auto style = i < info.arg_styles.size() ? info.arg_styles[i] : FabricatorParamStyle::POSITIONAL;
+			bool named = style == FabricatorParamStyle::NAMED;
 			LogicalType declared = info.arg_types[i];
+			if (style == FabricatorParamStyle::VARARGS) {
+				// The VARIADIC tail takes EVERY remaining positional argument (it is the last positional
+				// parameter by construction), each named `<tail>_<k>`. An ANY tail keeps each value's own
+				// runtime type — DuckDB inserted no cast for it.
+				auto tail_type = FabricatorVarArgsType(declared);
+				for (idx_t k = positional_index; k < input.inputs.size(); k++) {
+					auto &v = input.inputs[k];
+					arg_names.push_back(info.arg_names[i] + "_" + to_string(k - positional_index));
+					arg_types.push_back(tail_type.id() == LogicalTypeId::ANY ? v.type() : tail_type);
+					arg_values.push_back(v);
+				}
+				positional_index = input.inputs.size();
+				continue;
+			}
 			if (!named) {
 				Value v = positional_index < input.inputs.size() ? input.inputs[positional_index]
 				                                                 : Value(declared);
@@ -1615,9 +1769,12 @@ unique_ptr<FunctionData> FabricatorTableFunctionBind(ClientContext &context, Tab
 			}
 		}
 	} else {
-		arg_types = info.arg_types;
-		arg_names = info.arg_names;
+		// ⚠ The values are the ACTUAL call's, so for a VARIADIC function there are MORE of them than declared
+		// types — and the marshal below initializes its chunk from `arg_types` while looping `arg_values`.
+		// Expanding here is what keeps that loop in bounds; a non-variadic function comes back unchanged.
 		arg_values = input.inputs;
+		FabricatorExpandVarArgs(info.varargs_index, info.arg_names, info.arg_types, arg_values, arg_names,
+		                        arg_types);
 	}
 
 	auto bind_data = make_uniq<fabricator::ArrowStreamBindData>();
@@ -1790,6 +1947,7 @@ static void FabricatorMarshalInOutArgs(const FabricatorTableFunctionInfo &info, 
 static void FabricatorBuildInOutSignature(const vector<string> &names, const vector<LogicalType> &types,
                                           const vector<FabricatorParamStyle> &styles, TableFunction &tf,
                                           bool named_any_for_null = false) {
+	FabricatorRefuseVarArgs(tf.name, "table-in-out", names, styles);
 	for (idx_t i = 0; i < names.size(); i++) {
 		auto style = i < styles.size() ? styles[i] : FabricatorParamStyle::POSITIONAL;
 		switch (style) {
@@ -1815,17 +1973,33 @@ static void FabricatorBuildInOutSignature(const vector<string> &names, const vec
 void FabricatorBuildSqlGenSignature(const vector<string> &all_names, const vector<LogicalType> &all_types,
                                     const vector<FabricatorParamStyle> &styles, TableFunction &tf,
                                     vector<string> &arg_names,
-                                    vector<LogicalType> &arg_types) {
-	for (idx_t k = 0; k < all_names.size(); k++) {
-		auto type = all_types[k].id() == LogicalTypeId::SQLNULL ? LogicalType::ANY : all_types[k];
-		if (k < styles.size() && styles[k] == FabricatorParamStyle::NAMED) {
-			tf.named_parameters[all_names[k]] = type;
-		} else {
-			arg_names.push_back(all_names[k]);
-			arg_types.push_back(type);
-		}
+                                    vector<LogicalType> &arg_types, idx_t *out_varargs_index) {
+	vector<LogicalType> positional;
+	if (out_varargs_index) {
+		*out_varargs_index = DConstants::INVALID_INDEX;
 	}
-	tf.arguments = arg_types;
+	for (idx_t k = 0; k < all_names.size(); k++) {
+		auto style = k < styles.size() ? styles[k] : FabricatorParamStyle::POSITIONAL;
+		auto type = all_types[k].id() == LogicalTypeId::SQLNULL ? LogicalType::ANY : all_types[k];
+		if (style == FabricatorParamStyle::NAMED) {
+			tf.named_parameters[all_names[k]] = type;
+			continue;
+		}
+		if (style == FabricatorParamStyle::VARARGS) {
+			// NOT an argument slot — it names the TYPE of every argument past the declared ones. It stays in
+			// the DECLARATION (arg_names/arg_types) because FabricatorSqlGenBindReplace expands it per call;
+			// only `tf.arguments` must omit it, or DuckDB would demand a value for the tail itself.
+			tf.varargs = FabricatorVarArgsType(all_types[k]);
+			if (out_varargs_index) {
+				*out_varargs_index = arg_names.size();
+			}
+		} else {
+			positional.push_back(type);
+		}
+		arg_names.push_back(all_names[k]);
+		arg_types.push_back(type);
+	}
+	tf.arguments = positional;
 }
 
 unique_ptr<TableRef> FabricatorSqlGenBindReplace(ClientContext &context, TableFunctionBindInput &input) {
@@ -1838,9 +2012,13 @@ unique_ptr<TableRef> FabricatorSqlGenBindReplace(ClientContext &context, TableFu
 	// The 1-row constant-arg batch: POSITIONAL args in declared order, then the SUPPLIED named parameters by
 	// name (the binder has already validated the names and cast each value to its declared type — except an
 	// ANY-declared one, whose runtime type is preserved on purpose).
-	vector<LogicalType> arg_types = info.arg_types;
-	vector<string> arg_names = info.arg_names;
+	vector<LogicalType> arg_types;
+	vector<string> arg_names;
 	vector<Value> arg_values = input.inputs;
+	// A VARIADIC generator's call is wider than its declaration; expand before the named parameters are
+	// appended, so the tail keeps its positional block. Non-variadic => the declaration, unchanged.
+	FabricatorExpandVarArgs(info.varargs_index, info.arg_names, info.arg_types, arg_values, arg_names,
+	                        arg_types);
 	for (auto &kv : input.named_parameters) {
 		arg_names.push_back(kv.first);
 		arg_types.push_back(kv.second.type());
@@ -1849,8 +2027,22 @@ unique_ptr<TableRef> FabricatorSqlGenBindReplace(ClientContext &context, TableFu
 
 	auto properties = fabricator::BoundaryClientProperties(context);
 	auto extension_types = ArrowTypeExtensionData::GetExtensionTypes(context, arg_types);
-	fabricator::ArrowProducer producer(arg_types, arg_names, properties);
-	if (!arg_types.empty()) {
+
+	// The catalog ALIAS (what the user wrote in ATTACH) is only known here — a catalog-bound generator needs
+	// it to emit qualified references back into its own catalog. Empty for a global function.
+	string sql;
+	if (arg_types.empty()) {
+		// A generator called with NO arguments AT ALL — which a VARIADIC one legitimately can be, since its
+		// minimum arity is the declared prefix and that may be empty. Pass NO stream rather than an empty
+		// one: a zero-FIELD Arrow schema cannot cross in either direction (Apache.Arrow raises
+		// ArgumentNullException on 'fields'), so merely CONSTRUCTING the producer fails the bind with an
+		// error that names nothing recognizable. The managed side already reads a null args stream as an
+		// empty batch (SqlGen.Generate), so the generator's own arity rule is what refuses the call.
+		// ⚠ Same rule and same reason as the zero-argument branch in FabricatorTableFunctionBind — it was
+		// simply unreachable here until a generator could have minimum arity 0.
+		sql = fabricator::GenerateTableSql(info.handle, info.schema, info.func, info.catalog_name, nullptr);
+	} else {
+		fabricator::ArrowProducer producer(arg_types, arg_names, properties);
 		DataChunk chunk;
 		chunk.Initialize(Allocator::DefaultAllocator(), arg_types);
 		for (idx_t c = 0; c < arg_values.size(); c++) {
@@ -1860,13 +2052,10 @@ unique_ptr<TableRef> FabricatorSqlGenBindReplace(ClientContext &context, TableFu
 		ArrowAppender appender(arg_types, 1, properties, extension_types);
 		appender.Append(chunk, 0, 1, 1);
 		producer.AddBatch(appender.Finalize());
+		producer.Finish();
+		sql = fabricator::GenerateTableSql(info.handle, info.schema, info.func, info.catalog_name,
+		                                   producer.Stream());
 	}
-	producer.Finish();
-
-	// The catalog ALIAS (what the user wrote in ATTACH) is only known here — a catalog-bound generator needs
-	// it to emit qualified references back into its own catalog. Empty for a global function.
-	string sql = fabricator::GenerateTableSql(info.handle, info.schema, info.func, info.catalog_name,
-	                                          producer.Stream());
 	return FabricatorParseGeneratedSelect(sql, context.GetParserOptions(), info.func);
 }
 
@@ -2630,17 +2819,19 @@ void RegisterFabricatorGlobalFunctions(ExtensionLoader &loader) {
 			if (kind == "scalar") {
 				vector<string> arg_names;
 				vector<LogicalType> arg_types;
+				vector<FabricatorParamStyle> arg_styles;
 				LogicalType return_type;
 				bool is_volatile = true;
 				try {
 					// handle = 0 + empty schema = the global marker; C# resolves the function by name.
-					FetchFunctionParamSchema(context, nullptr, "", fn_name, arg_names, arg_types);
+					FetchFunctionParamSchema(context, nullptr, "", fn_name, arg_names, arg_types, &arg_styles);
 					return_type = FetchFunctionReturnType(context, nullptr, "", fn_name, &is_volatile);
 				} catch (std::exception &) {
 					continue; // skip a global whose schema can't be resolved
 				}
-				ScalarFunction fn = BuildFabricatorScalarFunction(nullptr, "", fn_name, arg_types, arg_names,
-				                                                  return_type, is_volatile);
+				ScalarFunction fn = BuildFabricatorScalarFunction(
+				    nullptr, "", fn_name, arg_types, arg_names, return_type, is_volatile,
+				    FabricatorVarArgsIndex(fn_name, arg_names, arg_styles));
 				loader.RegisterFunction(fn);
 			} else if (kind == "inout" || kind == "collector") {
 				// A connection-free in-out / collector: a {TABLE}-param table function on the streaming-exchange
@@ -2706,13 +2897,15 @@ void RegisterFabricatorGlobalFunctions(ExtensionLoader &loader) {
 				// GROUP BY / OVER / parallel. Mirrors GetOrCreateAggregateFunction.
 				vector<string> arg_names;
 				vector<LogicalType> arg_types;
+				vector<FabricatorParamStyle> arg_styles;
 				LogicalType return_type;
 				try {
-					FetchFunctionParamSchema(context, nullptr, "", fn_name, arg_names, arg_types);
+					FetchFunctionParamSchema(context, nullptr, "", fn_name, arg_names, arg_types, &arg_styles);
 					return_type = FetchFunctionReturnType(context, nullptr, "", fn_name);
 				} catch (std::exception &) {
 					continue;
 				}
+				FabricatorRefuseVarArgs(fn_name, "aggregate", arg_names, arg_styles);
 				AggregateFunction fn = BuildFabricatorAggregateFunction(nullptr, "", fn_name, arg_types, arg_names,
 				                                                      return_type, kind == "aggregate_spill");
 				loader.RegisterFunction(fn);
@@ -2732,9 +2925,11 @@ void RegisterFabricatorGlobalFunctions(ExtensionLoader &loader) {
 				// Positional args only in the signature; a parameter tagged `fabricator.param_style=named` becomes a
 				// DuckDB named parameter instead, which is how a global function expresses an OPTIONAL
 				// argument (positional table arguments have no defaults). Same split as the catalog path.
+				auto varargs_index = FabricatorVarArgsIndex(fn_name, arg_names, arg_styles);
 				vector<LogicalType> positional;
 				for (idx_t k = 0; k < arg_types.size(); k++) {
-					if (k >= arg_styles.size() || arg_styles[k] != FabricatorParamStyle::NAMED) {
+					auto style = k < arg_styles.size() ? arg_styles[k] : FabricatorParamStyle::POSITIONAL;
+					if (style != FabricatorParamStyle::NAMED && style != FabricatorParamStyle::VARARGS) {
 						positional.push_back(arg_types[k]);
 					}
 				}
@@ -2744,6 +2939,11 @@ void RegisterFabricatorGlobalFunctions(ExtensionLoader &loader) {
 				// PhysicalBufferedBatchCollector instead of the single-threaded PhysicalBufferedCollector.
 				// See ArrowStreamGetPartitionData + docs/scan-concurrency.md.
 				tf.get_partition_data = fabricator::ArrowStreamGetPartitionData;
+				if (varargs_index != DConstants::INVALID_INDEX) {
+					// The declared parameters before the tail become the MINIMUM arity; DuckDB then accepts any
+					// number of further arguments, each implicitly cast to this type (ANY => no cast at all).
+					tf.varargs = FabricatorVarArgsType(arg_types[varargs_index]);
+				}
 				tf.projection_pushdown = true;
 				tf.pushdown_complex_filter = FabricatorComplexFilterPushdown;
 				for (idx_t k = 0; k < arg_names.size(); k++) {
@@ -2759,6 +2959,7 @@ void RegisterFabricatorGlobalFunctions(ExtensionLoader &loader) {
 				fn_info->arg_types = arg_types;
 				fn_info->arg_names = arg_names;
 				fn_info->arg_styles = arg_styles;
+				fn_info->varargs_index = varargs_index;
 				fn_info->is_proc = false;
 				// A byte-ordered-string reader (e.g. Delta/Parquet) can safely push string ordering + BETWEEN.
 				fn_info->string_order_pushable = string_order[i] == "1";
@@ -2780,10 +2981,13 @@ void RegisterFabricatorGlobalFunctions(ExtensionLoader &loader) {
 				// fabricator.param_style="named" — split them into the DuckDB signature.
 				vector<string> arg_names;
 				vector<LogicalType> arg_types;
+				idx_t sqlgen_varargs_index = DConstants::INVALID_INDEX;
 				TableFunction tf(fn_name, {}, nullptr, nullptr);
-				FabricatorBuildSqlGenSignature(all_names, all_types, styles, tf, arg_names, arg_types);
+				FabricatorBuildSqlGenSignature(all_names, all_types, styles, tf, arg_names, arg_types,
+				                               &sqlgen_varargs_index);
 				tf.bind_replace = FabricatorSqlGenBindReplace;
 				auto fn_info = make_shared_ptr<FabricatorTableFunctionInfo>();
+				fn_info->varargs_index = sqlgen_varargs_index;
 				fn_info->handle = nullptr; // global marker
 				fn_info->schema = "";
 				fn_info->func = fn_name;
@@ -2886,10 +3090,13 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateTableFunction(Clien
 	// A provider-authored function may ALSO declare named parameters (tagged `fabricator.param_style`) alongside
 	// its positional ones — that is how an OPTIONAL argument is expressed, since DuckDB positional table
 	// arguments have no defaults. A discovered TVF tags nothing, so it stays fully positional.
+	auto varargs_index = is_proc ? DConstants::INVALID_INDEX
+	                             : FabricatorVarArgsIndex(func_name, arg_names, arg_styles);
 	vector<LogicalType> positional;
 	if (!is_proc) {
 		for (idx_t i = 0; i < arg_types.size(); i++) {
-			if (i >= arg_styles.size() || arg_styles[i] != FabricatorParamStyle::NAMED) {
+			auto style = i < arg_styles.size() ? arg_styles[i] : FabricatorParamStyle::POSITIONAL;
+			if (style != FabricatorParamStyle::NAMED && style != FabricatorParamStyle::VARARGS) {
 				positional.push_back(arg_types[i]);
 			}
 		}
@@ -2900,6 +3107,11 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateTableFunction(Clien
 	// PhysicalBufferedBatchCollector instead of the single-threaded PhysicalBufferedCollector.
 	// See ArrowStreamGetPartitionData + docs/scan-concurrency.md.
 	tf.get_partition_data = fabricator::ArrowStreamGetPartitionData;
+	if (varargs_index != DConstants::INVALID_INDEX) {
+		// The declared parameters before the tail become the MINIMUM arity; DuckDB then accepts any number of
+		// further arguments, each implicitly cast to this type (ANY => no cast at all).
+		tf.varargs = FabricatorVarArgsType(arg_types[varargs_index]);
+	}
 	tf.projection_pushdown = true;
 	if (is_proc) {
 		for (idx_t i = 0; i < arg_names.size(); i++) {
@@ -2931,6 +3143,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateTableFunction(Clien
 	fn_info->arg_types = arg_types;
 	fn_info->arg_names = arg_names;
 	fn_info->arg_styles = arg_styles;
+	fn_info->varargs_index = varargs_index;
 	fn_info->is_proc = is_proc;
 	// ABI v81: this is the ONE registration path whose scans go through tablefn_execute, so it is the one
 	// that can be told "my execution performed DDL". A GLOBAL function belongs to no catalog and leaves this
@@ -2968,10 +3181,13 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateSqlTableFunction(Cl
 
 	vector<string> arg_names;
 	vector<LogicalType> arg_types;
+	idx_t sqlgen_varargs_index = DConstants::INVALID_INDEX;
 	TableFunction tf(func_name, {}, nullptr, nullptr);
-	FabricatorBuildSqlGenSignature(all_names, all_types, styles, tf, arg_names, arg_types);
+	FabricatorBuildSqlGenSignature(all_names, all_types, styles, tf, arg_names, arg_types,
+	                               &sqlgen_varargs_index);
 	tf.bind_replace = FabricatorSqlGenBindReplace;
 	auto fn_info = make_shared_ptr<FabricatorTableFunctionInfo>();
+	fn_info->varargs_index = sqlgen_varargs_index;
 	fn_info->handle = handle_;
 	fn_info->schema = name;
 	fn_info->func = func_name;

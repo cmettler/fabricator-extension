@@ -119,6 +119,14 @@ enum class FabricatorParamStyle : uint8_t {
 	//! argument slot (bind_table_function.cpp pushes a placeholder value), so following positions keep their
 	//! natural index.
 	TABLE_INPUT,
+	//! A VARIADIC TAIL: DuckDB's `SimpleFunction::varargs`. The parameters declared BEFORE it are the
+	//! MINIMUM arity and there is no maximum; every further argument must implicitly cast to this field's
+	//! type (SQLNULL => ANY, i.e. anything, and then DuckDB inserts no cast at all). At most one, and it
+	//! must be the last POSITIONAL parameter — both refused where the signature is built rather than
+	//! reinterpreted, since a tail followed by a positional slot can never be filled.
+	//! Scalar / table / sqlgen only; lateral + in-out are deferred (their positional slots are the per-row
+	//! input columns, so a tail there is a variable-width wire).
+	VARARGS,
 };
 
 //! Resolves a scalar function's parameter names + DuckDB types from the Arrow schema of

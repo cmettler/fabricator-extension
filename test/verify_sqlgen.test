@@ -211,3 +211,71 @@ true
 
 statement ok
 CALL disable_logging();
+
+# ---- 8. VARIADIC generator (Params.VarArgs): the SQL TEXT's COLUMN COUNT is the ARGUMENT COUNT ----
+#
+# The sharpest shape for this feature and for sqlgen at once. A macro cannot express it (its body is fixed
+# text), a marshaled table function cannot express it cheaply (the output schema would have to be resolved
+# per call across the bridge), and a fixed signature cannot express it at all.
+#
+# ⚠ Registration first: `parameter_types = []` is the MINIMUM ARITY — zero — and `varargs` is what says the
+# function takes anything at all. A fixed-arity registration would show its types here instead, so this is
+# the assertion no row count can substitute for.
+query III
+SELECT parameter_types, varargs, function_type
+FROM duckdb_functions() WHERE function_name = 'fabricator_va_values';
+----
+[]	ANY	table
+
+# Four arguments => four columns, and the VALUES are rendered as SQL literals (so the types are DuckDB's own
+# for those literals, not something the bridge chose).
+query IIII
+SELECT * FROM fabricator_va_values(1, 'x', TRUE, NULL);
+----
+1	x	true	NULL
+
+query IIII
+SELECT typeof(v0), typeof(v1), typeof(v2), typeof(v3) FROM fabricator_va_values(1, 'x', TRUE, NULL);
+----
+INTEGER	VARCHAR	BOOLEAN	"NULL"
+
+# One argument => one column. The COLUMN SET, not just the values, changed between these two calls.
+query I
+SELECT * FROM fabricator_va_values(7);
+----
+7
+
+query I
+SELECT count(*) FROM (DESCRIBE SELECT * FROM fabricator_va_values(1, 2, 3, 4, 5));
+----
+5
+
+# The generator's own minimum: it refuses an empty call rather than emitting `SELECT `.
+statement error
+SELECT * FROM fabricator_va_values();
+----
+<REGEX>:.*at least one value.*
+
+# ⚠ The generator renders SQL TEXT, so its literal rendering is an ALLOW-LIST rather than an escaper: a value
+# whose rendering is not provably safe is refused BY TYPE. This is the assertion that keeps a future "just
+# call ToString" change from turning a variadic generator into an injection surface. A DATE is the case that
+# reaches the allow-list: readable, and deliberately not rendered.
+statement error
+SELECT * FROM fabricator_va_values(DATE '2020-01-01');
+----
+<REGEX>:.*cannot render a DateTime as a SQL literal.*
+
+# ⚠ And a value the ARGUMENT READER cannot represent at all is refused one layer EARLIER, before the
+# generator sees it — a different message from a different place, pinned here so the two are not confused
+# for one guard. Both are loud; neither interpolates.
+statement error
+SELECT * FROM fabricator_va_values([1, 2]);
+----
+<REGEX>:.*unsupported filter value type List.*
+
+# A quote in a string argument is doubled, not passed through — the same rule, on the one type that is
+# accepted and still needs escaping.
+query I
+SELECT v0 FROM fabricator_va_values('it''s');
+----
+it's

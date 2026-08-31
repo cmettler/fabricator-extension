@@ -1117,3 +1117,163 @@ pass-through `PhysicalOperator`, fires once even above a UNION). Possible future
     scan is handed out by `GetScanFunction` and is not a registered catalog function ⇒ "Failed to find
     function fabricator_scan()". So `FabricatorScanDeserialize` is UNREACHABLE — and must still exist,
     because `Serialize` only emits bind data when BOTH callbacks are set. Do not "clean it up".
+
+## 13. VARIADIC parameters (`Params.VarArgs`) — as built, 2026-08-31
+
+Scalar, table and SQL-generating functions may declare a **variadic tail**: any number of trailing
+arguments. Lateral and table-in-out are **deferred** (see §13.5). C# + C++, **no ABI bump** — the style rides
+the existing `fabricator.param_style` field metadata as a new value, exactly as `constant` did.
+
+### 13.1 How DuckDB does it, and why that shape is the whole design
+
+`varargs` is a single `LogicalType` on `SimpleFunction`, the shared base of `ScalarFunction`, `TableFunction`
+and `AggregateFunction` (`function.hpp`); `LogicalTypeId::INVALID` means "not variadic". The entire contract
+is `FunctionBinder::BindVarArgsFunctionCost` (`function_binder.cpp`):
+
+```cpp
+if (arguments.size() < func.arguments.size()) return optional_idx();   // minimum arity
+for (idx_t i = 0; i < arguments.size(); i++) {
+    LogicalType arg_type = i < func.arguments.size() ? func.arguments[i] : func.varargs;
+    ... ImplicitCastCost(arguments[i], arg_type) ...
+}
+```
+
+So **`arguments` is a fixed prefix = the MINIMUM arity, `varargs` is the type every further argument must
+implicitly cast to, and there is no maximum.** Overload resolution costs a variadic candidate like any other,
+so a fixed-arity overload still wins on cost when both match. `Function::CallToString` renders it `[TYPE...]`,
+which is what a too-short call's error message shows.
+
+⇒ our declaration's tail field is **not** one of `tf.arguments`; it names the tail's TYPE.
+
+**⚠ In DuckDB's own catalog `varargs` is an OVERLOAD-RESOLUTION device, not an arity contract**, and reading
+it as one misleads. MEASURED: `cardinality(MAP{'a':1}, 42, 'junk')` binds through the variadic path and is
+then refused by cardinality's OWN bind (*"Cardinality must have exactly one arguments"*); `to_json()`,
+`struct_insert()` and `array_value()` likewise register with minimum arity **0** and enforce the real rule in
+their bind. `hash(1,2,3)` and `list_concat()` are genuinely variadic. So `duckdb_functions().varargs` reports
+the REGISTRATION faithfully; several functions register permissively on purpose and pay only a worse error
+message.
+
+### 13.2 The author contract
+
+`Params.VarArgs(name)` (ANY tail — the `NullType` sentinel this protocol has always used for
+`LogicalType::ANY`) or `Params.VarArgs(name, type)` (homogeneous tail). Two structural rules, refused rather
+than reinterpreted:
+
+- **at most one** — DuckDB carries exactly one varargs type per function;
+- **it must be the last POSITIONAL field** — named parameters may follow, since they are a separate
+  namespace. A positional field after the tail could never be filled: every argument past the prefix belongs
+  to the tail, so the caller would pass a value the function never receives at the position it declared.
+
+Enforced in **two** places on purpose. `Params.ValidateVarArgs` (C#) is the author-facing check and also
+gates the KIND (`Params.Validate(..., allowVarArgs:)` — false for lateral/in-out, refused by name rather than
+silently registered as an ordinary positional parameter). `FabricatorVarArgsIndex` (C++) re-checks where the
+signature is BUILT, because that is the last point before a malformed declaration becomes a registered
+function.
+
+**⚠ It is deliberately NOT checked in `GetFunctionParamSchema`**, the one crossing that sees every
+declaration: the host treats ANY failure there as "the function is stale" and silently drops it, so a
+declaration bug would present as a function that does not exist. Loud in the right place beats early in the
+wrong one.
+
+### 13.3 What arrives, and the one thing that had to change everywhere
+
+**The args batch of a variadic call is WIDER than `Parameters`.** The fixed prefix keeps its declared
+positions and names; each tail argument follows in call order, named `<tail>_0`, `<tail>_1`, …
+(`FabricatorArgName`, which subsumes the historical `arg<i>` fallback). An implementation reads the count
+from the batch.
+
+**⚠ THE TRAP THIS FEATURE IS BUILT AROUND: every args marshal in `fabricator_schema_entry.cpp` initializes a
+`DataChunk` from the DECLARED types and then loops the SUPPLIED values.** For a variadic call there are more
+values than declared types, so each marshal writes past its chunk. `FabricatorExpandVarArgs` widens the
+declaration to the actual call before the chunk is built; a non-variadic function comes back byte-identical,
+so no call site needs a second branch. Three marshals needed it: the TVF bind's pure-positional branch, its
+mixed positional+named branch, and the sqlgen `bind_replace`.
+
+**An ANY tail keeps each value's own runtime type** (DuckDB inserts no cast for ANY), which is what makes a
+heterogeneous call arrive verbatim — gated by asserting `int32`/`utf8`/`bool` side by side from one call. A
+concrete tail type is applied by DuckDB before the batch is built, so the marshal takes the declared type
+there; the scalar BIND additionally reads `bound_function.varargs` for a tail slot, because at bind time the
+cast has not been inserted yet and `arguments[i]` does not exist past the prefix.
+
+**⚠ A CONCRETE TAIL IS NOT "ANYTHING, COERCED", and the obvious reading is wrong.** DuckDB applies its
+ORDINARY implicit-cast rules per tail argument, so a cast it declines is a BIND error exactly as for a
+declared parameter. MEASURED on the `BIGINT` tail of `cf_va_sum`: `(1, 2::SMALLINT, 3::TINYINT)` → 6, while
+`(1, 3.0)` is refused — *"No function matches … `cf_va_sum(INTEGER_LITERAL, DECIMAL(2,1))`"*, because
+DECIMAL→BIGINT is lossy. ⚠ The first version of that demo's own doc comment claimed the DECIMAL case worked;
+running it is what corrected it. **An ANY tail is the declaration that accepts anything.**
+
+### 13.4 The pre-existing defect it made reachable
+
+A SQL-generating function with **minimum arity 0** — which only a variadic one can have — called with no
+arguments crossed as a **zero-FIELD Arrow schema**, which Apache.Arrow cannot represent in either direction
+(`ArgumentNullException` on `'fields'`). `FabricatorSqlGenBindReplace` constructed its `ArrowProducer`
+unconditionally, so the bind failed with an error naming nothing recognizable. Fixed by passing **no stream**
+when there are no arguments — the same rule, for the same reason, as the zero-argument branch that
+`FabricatorTableFunctionBind` has always had; it was simply unreachable on the sqlgen path until a generator
+could take zero arguments. The managed side already read a null args stream as an empty batch
+(`SqlGen.Generate`'s `args ?? EmptyArgs()`), so the generator's own arity rule is what refuses the call.
+
+### 13.5 The deferred kinds, and why they must REFUSE rather than ignore
+
+Lateral and table-in-out positional slots ARE the per-row input columns, so a tail is a variable-width wire
+rather than a wider args batch — and it would have to compose with `Params.Constant`, whose slots are also
+trailing and also stripped from the wire (`LateralBindData.wire_slots` / `arg_width`). Neither question is
+answered. Aggregates could carry one (DuckDB's `AggregateFunction` shares the same `varargs` field) but the
+state/update marshal was not examined, so they are out of scope too.
+
+**⚠ On every one of those kinds, a `switch` with no VARARGS case does not "ignore" the declaration — it
+falls through to the positional branch and registers the tail as an ordinary `ANY` argument.** The function
+then binds, runs, and does not do what its declaration says, which is the failure mode this protocol exists
+to prevent. So each refuses explicitly, at REGISTRATION:
+
+| kind | refusal |
+|---|---|
+| lateral | `FabricatorMakeLateralFunction` throws (plus the C# `Params.Validate(allowVarArgs: false)` at bind) |
+| in-out, collector | `FabricatorBuildInOutSignature` → `FabricatorRefuseVarArgs` |
+| aggregate | both registration sites → `FabricatorRefuseVarArgs` |
+
+⚠ For a GLOBAL declaration the throw is caught by the registration loop's own `continue` — the standing
+policy that one bad declaration must not fail extension load — so the function is simply ABSENT rather than
+misregistered. Loud at call time ("does not exist"), and the same behaviour a table-input on a lateral has
+always had.
+
+### 13.6 What it is worth
+
+**A `LIST` parameter already covers the homogeneous case** (`f(['a','b'])`) and needs none of this machinery.
+What a tail buys is HETEROGENEOUS, individually-typed arguments — which is exactly the shape of DuckDB's own
+variadics (`printf`, `format`, `concat_ws`, `struct_pack`, `row`, `create_sort_key`). Every shipped demo
+mixes types at the call site for that reason.
+
+### 13.7 Demos, gates and the mutation record
+
+| demo | kind | path | gate |
+|---|---|---|---|
+| `fabricator_va_concat(sep, …)` | scalar | load-time global | `verify_global_functions` 118 → **145** |
+| `fabricator_va_args(label, …)` | table | load-time global | (same suite) |
+| `fabricator_va_values(…)` | sqlgen | load-time global | `verify_sqlgen` 59 → **76** |
+| `cf_va_sum(…)` | scalar, CONCRETE tail | **attach-time catalog** | `verify_custom_functions` 89 → **101** |
+
+**The load-bearing assertion in each is the SIGNATURE from `duckdb_functions()`**, not the rows: an
+implementation reading its args batch positionally would produce identical rows for a fixed-arity
+declaration, so only `varargs` and `parameter_types` distinguish "registered variadic" from "registered with
+N arguments".
+
+⚠ `cf_va_sum` exists because **a declaration form that only ever ships GLOBAL looks covered while the
+ATTACH-TIME registration path is untested** — the same gap the catalog-views work had to close. It is a
+second registration site (`GetOrCreateScalarFunction`), not a second spelling.
+
+**Mutation-tested, four mutants, each killed at its own assertion:**
+
+| mutant | dies at | after |
+|---|---|---|
+| 1 — `fn.varargs` never set on a scalar | the `duckdb_functions()` signature assertion | 119 pass |
+| 2 — the TVF marshal not widened to the actual call | the per-tail-argument rows | 129 pass |
+| 3 — tail columns named `arg<i>` instead of `<tail>_<k>` | the same rows, on the NAME column | 130 pass |
+| 4 — `tf.varargs` never set on a generator | the variadic generator's first call | 60 pass |
+
+**⚠ THE FIRST MUTATION RUN WAS VOID AND REPORTED ALL FOUR AS SURVIVORS.** It drove the build from a bash
+script via `cmd /c`, which MSYS rewrites into a path — `cmd` then starts INTERACTIVELY, reads EOF and exits
+**0** having built nothing, so each "mutant" was the clean binary tested again. The tell is a bare
+`D:eposabricator-extension>` prompt where ninja output belongs. This trap is already recorded in
+`CLAUDE.md`; it is repeated here because a surviving mutant is normally read as a weak gate, and here it
+meant the opposite. **Drive every C++ build from the PowerShell tool.**

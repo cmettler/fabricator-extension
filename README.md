@@ -2020,6 +2020,42 @@ Two rules the compiler cannot enforce:
 A binding returning `Result = null` means "the declared type stands" — the cheap answer, and what the default
 binding does, so a fixed-return function implements nothing new.
 
+#### Variadic arguments (`Params.VarArgs`)
+
+A **scalar**, **table** or **SQL-generating** function may take any number of trailing arguments. Declare the
+tail with `Params.VarArgs(name)` — with no type it is DuckDB `ANY`, so each argument keeps its own type and
+no cast is inserted; `Params.VarArgs(name, type)` gives a homogeneous tail instead:
+
+```csharp
+public Schema Parameters => new(new[]
+{
+    Params.Positional("sep", StringType.Default),
+    Params.VarArgs("value"),          // any number of further arguments, any type
+}, metadata: null);
+```
+
+```sql
+SELECT fabricator_va_concat('-', 1, 'x', DATE '2020-01-01');   -- 1-x-01/01/2020 00:00:00
+SELECT * FROM fabricator_va_args('demo', 42, 'hi', TRUE);      -- one row per tail argument
+SELECT * FROM fabricator_va_values(1, 'x', TRUE);              -- SELECT 1 AS v0, 'x' AS v1, true AS v2
+```
+
+- **The fields before the tail are the MINIMUM arity**, and there is no maximum — this is DuckDB's own
+  `varargs` mechanism, so `duckdb_functions()` reports it and a too-short call is refused at bind with the
+  signature spelled `f(VARCHAR, [ANY...])`.
+- **The args batch is wider than `Parameters`.** Tail columns follow the prefix in call order, named
+  `<tail>_0`, `<tail>_1`, … — read the count from the batch, never from your own declaration.
+- **At most one tail, and it must be the last positional parameter** (named parameters may follow). Both are
+  refused where the signature is built, rather than reinterpreted.
+- **A concrete tail is not "anything, coerced".** DuckDB applies its ordinary implicit-cast rules per
+  argument, so a `BIGINT` tail takes `2::SMALLINT` and refuses `3.0` at bind. Declare the ANY form
+  (`Params.VarArgs(name)`) when the point is to accept anything.
+- **A `LIST` parameter already covers the homogeneous case** (`f(['a','b'])`) and needs none of this. What a
+  tail buys is *heterogeneous, individually-typed* arguments — the shape of DuckDB's own `printf`,
+  `concat_ws` and `struct_pack`.
+- Lateral and table-in-out functions **cannot** take one yet: there the positional slots are the per-row
+  input columns, so a tail would be a variable-width wire. Declaring one on those kinds is refused by name.
+
 ### Table-in-out (`fn_each`)
 
 A discovered TVF or stored proc *also* gets a sibling `fn_each(<input table>)` that applies the function

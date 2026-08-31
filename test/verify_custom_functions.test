@@ -236,5 +236,49 @@ SELECT cnt FROM fabricator_query('cdb', 'SELECT COUNT(*) AS cnt FROM sys.objects
 ----
 0
 
+# ---- VARIADIC parameters on a CATALOG-BOUND function (Params.VarArgs) ----
+#
+# The global demos (fabricator_va_concat / _va_args / _va_values, gated in verify_global_functions and
+# verify_sqlgen) exercise the LOAD-TIME registration path. This is the ATTACH-TIME one — a different site
+# (GetOrCreateScalarFunction), and a declaration form that ships only global LOOKS covered while it is
+# untested.
+#
+# ⚠ The signature is the load-bearing assertion, not the sums: an implementation reading its args batch
+# positionally would answer identically for a fixed-arity declaration. `parameter_types = []` is a MINIMUM
+# arity of ZERO and `varargs` is what says the function is variadic at all.
+query TTTT
+SELECT parameters, parameter_types, varargs, return_type
+FROM duckdb_functions() WHERE function_name = 'cf_va_sum';
+----
+[]	[]	BIGINT	BIGINT
+
+query III
+SELECT cdb.dbo.cf_va_sum(1, 2, 3), cdb.dbo.cf_va_sum(10), cdb.dbo.cf_va_sum();
+----
+6	10	0
+
+# A CONCRETE tail applies DuckDB's ordinary implicit-cast rules per argument, so three integral widths
+# arrive as one type…
+query I
+SELECT cdb.dbo.cf_va_sum(1, 2::SMALLINT, 3::TINYINT);
+----
+6
+
+# …and a cast DuckDB will NOT make implicitly is refused at BIND, exactly as for a declared parameter. This
+# is the assertion that keeps "a concrete tail" from being read as "anything, coerced" — the ANY tail is
+# what accepts anything, and the two are different declarations.
+statement error
+SELECT cdb.dbo.cf_va_sum(1, 3.0);
+----
+<REGEX>:.*cf_va_sum\(\[BIGINT\.\.\.\]\).*
+
+# A tail argument may be a column, evaluated per row.
+query I
+SELECT cdb.dbo.cf_va_sum(r, r * 2) FROM range(3) t(r) ORDER BY 1;
+----
+0
+3
+6
+
 statement ok
 DETACH cdb;

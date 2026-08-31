@@ -31,6 +31,29 @@ public enum ParamStyle
 
     /// <summary>The input TABLE of a table-in-out function — <c>f((SELECT …))</c>. At most one, positional.</summary>
     TableInput,
+
+    /// <summary>
+    /// A VARIADIC TAIL: the caller may pass any number of FURTHER arguments after the declared ones, each of
+    /// which must implicitly cast to this field's type (the Arrow null type ⇒ DuckDB <c>ANY</c>, i.e.
+    /// anything). It registers as DuckDB's <c>SimpleFunction::varargs</c>, so the fields BEFORE it are the
+    /// MINIMUM arity and there is no maximum.
+    /// </summary>
+    /// <remarks>
+    /// <para>At most one, and it must be the LAST POSITIONAL field — named parameters may follow, since they
+    /// are a separate namespace. A declaration breaking either rule is refused where the signature is built,
+    /// loudly, rather than silently reinterpreted.</para>
+    /// <para>⚠ It changes what ARRIVES: the args batch of a variadic call is WIDER than
+    /// <c>Parameters</c>. The fixed prefix keeps its declared positions; each further argument follows in
+    /// call order, named <c>&lt;varargs-name&gt;_0</c>, <c>_1</c>, … Read the count from the batch, never
+    /// from the declaration.</para>
+    /// <para>⚠ Scalar, table and sqlgen functions only. Lateral and in-out functions are DEFERRED — for them
+    /// the positional slots are the per-row INPUT COLUMNS, so a variadic tail is a variable-width wire and
+    /// interacts with <see cref="Constant"/>'s trailing slots; neither question is answered yet.</para>
+    /// <para>⚠ A LIST parameter covers the HOMOGENEOUS case already (<c>f(['a','b'])</c>) and needs none of
+    /// this. What a variadic tail buys is HETEROGENEOUS, individually-typed arguments — DuckDB's own
+    /// variadics are exactly that shape (<c>printf</c>, <c>concat_ws</c>, <c>struct_pack</c>).</para>
+    /// </remarks>
+    VarArgs,
 }
 
 /// <summary>
@@ -67,6 +90,7 @@ public static class Params
     private const string NamedValue = "named";
     private const string TableValue = "table";
     private const string ConstantValue = "constant";
+    private const string VarArgsValue = "varargs";
 
     /// <summary>An ordinary positional parameter.</summary>
     public static Field Positional(string name, IArrowType type, bool nullable = true) =>
@@ -113,6 +137,21 @@ public static class Params
     /// </summary>
     public static Field Constant(string name) =>
         new(name, NullType.Default, nullable: true, Meta(ConstantValue));
+
+    /// <summary>
+    /// A VARIADIC TAIL of <paramref name="type"/> (see <see cref="ParamStyle.VarArgs"/>): any number of
+    /// further arguments after the declared ones, each implicitly cast to it. Must be the last positional
+    /// field.
+    /// </summary>
+    public static Field VarArgs(string name, IArrowType type) =>
+        new(name, type, nullable: true, Meta(VarArgsValue));
+
+    /// <summary>
+    /// A VARIADIC TAIL accepting arguments of ANY type — the <see cref="NullType"/> sentinel, which is how
+    /// this protocol has always spelled DuckDB <c>ANY</c> (the host maps it to <c>LogicalType::ANY</c>, so
+    /// DuckDB inserts no cast and each argument arrives as its own runtime type).
+    /// </summary>
+    public static Field VarArgs(string name) => VarArgs(name, NullType.Default);
 
     /// <summary>
     /// Composes a canonical signature from a provider's local "positional here, named there" pair. The
@@ -164,6 +203,7 @@ public static class Params
             if (v == NamedValue) return ParamStyle.Named;
             if (v == TableValue) return ParamStyle.TableInput;
             if (v == ConstantValue) return ParamStyle.Constant;
+            if (v == VarArgsValue) return ParamStyle.VarArgs;
         }
         return ParamStyle.Positional;
     }
@@ -171,6 +211,59 @@ public static class Params
     /// <summary>The declared input-table columns of a table-input field (empty when none were declared).</summary>
     public static IReadOnlyList<Field> TableColumns(Field field) =>
         field.DataType is StructType s ? s.Fields : System.Array.Empty<Field>();
+
+    /// <summary>
+    /// The variadic tail of a declaration, or null. The host reads this to fill DuckDB's
+    /// <c>SimpleFunction::varargs</c>; everything before it is the function's MINIMUM arity.
+    /// </summary>
+    public static Field? VarArgsField(Schema parameters)
+    {
+        foreach (var f in parameters.FieldsList)
+        {
+            if (StyleOf(f) == ParamStyle.VarArgs)
+            {
+                return f;
+            }
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// The two STRUCTURAL rules a variadic tail must obey, independent of function kind: at most one, and it
+    /// must be the last POSITIONAL field (named parameters may follow — they are a separate namespace).
+    /// </summary>
+    /// <remarks>
+    /// ⚠ Both are refused rather than reinterpreted. A second tail has no meaning DuckDB can express (there
+    /// is one <c>varargs</c> type), and a tail with a positional field after it would silently swallow that
+    /// field's slot — the caller would pass an argument the function never receives at the position it
+    /// declared.
+    /// </remarks>
+    public static void ValidateVarArgs(string function, Schema parameters)
+    {
+        bool seenVarArgs = false;
+        foreach (var f in parameters.FieldsList)
+        {
+            var style = StyleOf(f);
+            if (style == ParamStyle.VarArgs)
+            {
+                if (seenVarArgs)
+                {
+                    throw new ArgumentException(
+                        $"fabricator: '{function}' declares more than one variadic tail ('{f.Name}'); DuckDB "
+                        + "carries exactly one varargs type per function.");
+                }
+                seenVarArgs = true;
+                continue;
+            }
+            if (seenVarArgs && style != ParamStyle.Named)
+            {
+                throw new ArgumentException(
+                    $"fabricator: '{function}' declares '{f.Name}' after its variadic tail. The tail must be "
+                    + "the LAST positional parameter — everything the caller writes after the declared "
+                    + "arguments belongs to it, so a positional parameter following it can never be filled.");
+            }
+        }
+    }
 
     /// <summary>
     /// Validates a declaration against the rules above and the kind's own limits. Throws
@@ -183,11 +276,16 @@ public static class Params
     /// <param name="allowConstant">True only for lateral functions — the one kind whose positional slots are
     /// per-row input columns, which is what a bind-time constant needs an escape from. On any other kind a
     /// named parameter already does the job.</param>
+    /// <param name="allowVarArgs">False for the kinds where a variadic tail is DEFERRED (lateral, in-out):
+    /// there the positional slots are the per-row input columns, so a variadic tail would be a variable-width
+    /// wire. Refused by name rather than silently registered as an ordinary positional parameter, which is
+    /// what it would otherwise become.</param>
     public static void Validate(string function, Schema parameters, bool allowNamed, bool allowTableInput,
-                                bool allowConstant = false)
+                                bool allowConstant = false, bool allowVarArgs = false)
     {
         bool seenNamed = false;
         bool seenTable = false;
+        ValidateVarArgs(function, parameters);
         foreach (var f in parameters.FieldsList)
         {
             var style = StyleOf(f);
@@ -202,6 +300,13 @@ public static class Params
                 throw new ArgumentException(
                     $"fabricator: '{function}' declares the bind-time constant parameter '{f.Name}', which only "
                     + "a LATERAL function may take — declare a named parameter instead.");
+            }
+            if (style == ParamStyle.VarArgs && !allowVarArgs)
+            {
+                throw new ArgumentException(
+                    $"fabricator: '{function}' declares the variadic tail '{f.Name}', which this function kind "
+                    + "does not support (scalar, table and sqlgen functions only — it is deferred for lateral "
+                    + "and in-out, whose positional slots are per-row input columns).");
             }
             if (style == ParamStyle.TableInput && !allowTableInput)
             {
