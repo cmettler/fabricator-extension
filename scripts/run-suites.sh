@@ -382,6 +382,14 @@ case "$TIER" in
         # survive a dangling buffer), plus a STRUCT and a LIST, all replicated across drain slices by a 1→N
         # fan-out; §14 executes a PREPARED statement twice, since the managed binding is reused across
         # executions while a session is per operator state.
+        # 8179 since 2026-08-31 (same day, third bump): the VARIADIC tail extended to TABLE-IN-OUT --
+        # verify_global_functions 145 -> 160 (+15). There the tail widens the ARGS BATCH, not the input
+        # stream, so the load-bearing assertion is the ROW COUNT: 3 input rows in, 3 out. From a green 74/74
+        # run; 8164 + 15 = 8179 exactly. Supersedes:
+        # 8164 since 2026-08-31 (same day, second bump): the VARIADIC tail extended to LATERAL functions --
+        # verify_lateral 247 -> 285 (+38: a bind-time constant declared FIRST, which needed no code at all,
+        # and [CONSTANT][POSITIONAL][TAIL] in one declaration). From a green 74/74 run; 8126 + 38 = 8164
+        # exactly. Supersedes:
         # 8126 since 2026-08-31: VARIADIC parameters (Params.VarArgs) -- verify_global_functions 118 -> 145
         # (+27, the scalar and table tails) and verify_sqlgen 59 -> 76 (+17, the variadic generator), from a
         # green 74/74 run. 8082 + 27 + 17 = 8126 exactly, which is what shows no other suite moved -- the
@@ -402,7 +410,7 @@ case "$TIER" in
         # ABI v80 scalar-bind commit took verify_global_functions 101 -> 118 and did not bump this floor, so
         # the tree ran 17 assertions above it for a day. Surfaced by the CDC slice's hermetic run coming out
         # at 8003 against a floor of 7986 and the delta not being attributable to the change under test.
-        : "${MIN_ASSERTIONS:=8126}"
+        : "${MIN_ASSERTIONS:=8179}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

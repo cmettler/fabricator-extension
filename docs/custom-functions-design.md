@@ -1213,29 +1213,70 @@ when there are no arguments — the same rule, for the same reason, as the zero-
 could take zero arguments. The managed side already read a null args stream as an empty batch
 (`SqlGen.Generate`'s `args ?? EmptyArgs()`), so the generator's own arity rule is what refuses the call.
 
-### 13.5 The deferred kinds, and why they must REFUSE rather than ignore
+### 13.5 LATERAL takes one too — and the reason it was deferred was an artifact (2026-08-31, user-raised)
 
-Lateral and table-in-out positional slots ARE the per-row input columns, so a tail is a variable-width wire
-rather than a wider args batch — and it would have to compose with `Params.Constant`, whose slots are also
-trailing and also stripped from the wire (`LateralBindData.wire_slots` / `arg_width`). Neither question is
-answered. Aggregates could carry one (DuckDB's `AggregateFunction` shares the same `varargs` field) but the
-state/update marshal was not examined, so they are out of scope too.
+**The deferral rested on a claim this file made without checking it**: that a lateral's `Params.Constant`
+slots "are also trailing", so a tail would contend with them for the same positions. Nothing in the code
+says trailing. `LateralBind` builds `declared_constant` in slot order and tests `declared_constant[i]` per
+ACTUAL slot; `wire_slots` is simply the non-constant indices; `LateralConstants.Validate` matches by NAME;
+`Params.Validate` gives `Constant` no ordering rule; and the demo reads `GetFieldIndex("fields")`. The
+convention was the demos', not the mechanism's.
 
-**⚠ On every one of those kinds, a `switch` with no VARARGS case does not "ignore" the declaration — it
-falls through to the positional branch and registers the tail as an ordinary `ANY` argument.** The function
-then binds, runs, and does not do what its declaration says, which is the failure mode this protocol exists
-to prevent. So each refuses explicitly, at REGISTRATION:
+**MEASURED before anything was built** (`fabricator_lat_front(fields, n)`, constant FIRST, zero code
+changes): the literal shape, the correlated shape, a folded expression in the front slot, and the
+non-constant refusal all behave exactly as with a trailing constant. ⇒ the layout
+`[constants][positionals][tail]` is unambiguous and there is nothing to contend with.
 
-| kind | refusal |
-|---|---|
-| lateral | `FabricatorMakeLateralFunction` throws (plus the C# `Params.Validate(allowVarArgs: false)` at bind) |
-| in-out, collector | `FabricatorBuildInOutSignature` → `FabricatorRefuseVarArgs` |
-| aggregate | both registration sites → `FabricatorRefuseVarArgs` |
+**A LATERAL TAIL IS A DIFFERENT MECHANISM FROM EVERY OTHER KIND'S, and that is why it cost almost nothing.**
+A scalar/table/sqlgen tail widens the ARGS BATCH; a lateral's positional slots ARE its per-row input
+columns, so its tail widens the **wire**. `LateralBind` was already written against the actual call —
+`arg_width` is `input.input_table_types.size()`, the slot loop runs over that, and every declaration lookup
+is guarded `i < declared_*.size()` — so surplus slots were legal by construction. Two small changes:
+
+- `FabricatorMakeLateralFunction` sets `tf.varargs` instead of throwing;
+- the `col_type` normalization takes the tail's declared type for slots PAST the declaration
+  (`declared_tail`). An ANY tail needs nothing; a CONCRETE one would otherwise normalize only its first
+  argument and leave the rest at their bound types, under which the two call shapes disagree — the
+  `Vector::Reference` crash class the normalization exists to close.
+
+**⚠ A NEW REACHABLE SHAPE: an EMPTY wire.** A function declared `[CONSTANT][TAIL]` and called with no tail
+arguments has zero wire columns, which the lateral operator had never seen. MEASURED to land on the
+pre-existing "needs at least one PER-ROW argument" `BinderException` cleanly, in BOTH call shapes; the
+message now names the tail, since that is the only way to reach it.
+
+**IN-OUT AND COLLECTOR TAKE ONE TOO, and the same day, for the same reason — my deferral applied LATERAL's
+property to a kind that does not have it (user-raised: "varargs in table in out should not be pumped into
+the table input stream, they should be part of standard function arguments"). Exactly so.** An in-out's
+per-row input is its `{TABLE}` argument ALONE; its positional and named parameters are CONSTANTS resolved at
+bind and marshaled into the 1-row args batch the author reads in `Bind` (`GfMixFunction` reads `factor` /
+`bias` there). So an in-out tail is the ARGS-BATCH mechanism — the scalar/table/sqlgen one, already
+built — and the input stream is untouched. The two cannot mix: the subquery slot binds to a
+`BoundStatement`, the tail arguments are constants in `input.inputs`.
+
+Two sites, mirroring the plain-table path: `FabricatorBuildInOutSignature` sets `tf.varargs`, and
+`FabricatorMarshalInOutArgs` gains the tail branch. **⚠ That second one is why it had to be BUILT rather
+than merely unblocked: the marshal walks the DECLARATION and indexes into the values, so surplus arguments
+were SILENTLY DROPPED** — no crash, no error, just a function not receiving what the caller wrote.
+
+DuckDB resolves `{TABLE}` + varargs, verified in source and then measured: `GetTableFunctionBindType` keys
+`has_table_parameter` on `function.arguments` containing `TABLE` (which the `{TABLE}` slot supplies whatever
+`varargs` says), the subquery contributes `LogicalTypeId::TABLE` plus an empty `Value` to the match, and
+every further argument is costed against `varargs`.
+
+**Still refused — AGGREGATES ALONE**, and for the standing reason: a `switch` with no VARARGS case does not
+ignore the declaration, it registers the tail as an ordinary `ANY` argument. Both aggregate registration
+sites call `FabricatorRefuseVarArgs`. That one is "unexamined", not "impossible": DuckDB's
+`AggregateFunction` carries the same `varargs` field, and what was never looked at is whether the
+state/update/combine marshal tolerates a per-call-site width.
 
 ⚠ For a GLOBAL declaration the throw is caught by the registration loop's own `continue` — the standing
-policy that one bad declaration must not fail extension load — so the function is simply ABSENT rather than
-misregistered. Loud at call time ("does not exist"), and the same behaviour a table-input on a lateral has
-always had.
+policy that one bad declaration must not fail extension load — so the function is ABSENT rather than
+misregistered. Loud at call time, and the behaviour a table-input on a lateral has always had.
+
+**⚠ THE TRANSFERABLE POINT is not about varargs.** A deferral justified by a property nobody measured is a
+deferral that can outlive its reason indefinitely, because nothing ever re-tests it — the note reads as
+settled and gets cited. Both claims here fell to one probe each, and the probe for the first needed no code
+at all.
 
 ### 13.6 What it is worth
 
@@ -1252,6 +1293,9 @@ mixes types at the call site for that reason.
 | `fabricator_va_args(label, …)` | table | load-time global | (same suite) |
 | `fabricator_va_values(…)` | sqlgen | load-time global | `verify_sqlgen` 59 → **76** |
 | `cf_va_sum(…)` | scalar, CONCRETE tail | **attach-time catalog** | `verify_custom_functions` 89 → **101** |
+| `fabricator_lat_front(fields, n)` | lateral, constant FIRST | load-time global | `verify_lateral` 247 → **285** |
+| `fabricator_lat_span(fields, n, …extra)` | lateral, `[CONST][POS][TAIL]` | load-time global | (same suite) |
+| `fabricator_inout_va(<table>, label, …extra)` | table-in-out, ARGS-batch tail | load-time global | `verify_global_functions` 145 → **160** |
 
 **The load-bearing assertion in each is the SIGNATURE from `duckdb_functions()`**, not the rows: an
 implementation reading its args batch positionally would produce identical rows for a fixed-arity
@@ -1261,6 +1305,13 @@ N arguments".
 ⚠ `cf_va_sum` exists because **a declaration form that only ever ships GLOBAL looks covered while the
 ATTACH-TIME registration path is untested** — the same gap the catalog-views work had to close. It is a
 second registration site (`GetOrCreateScalarFunction`), not a second spelling.
+
+⚠ **One gate assertion is written against behaviour that is NOT ours and looks wrong**: the lateral suite
+asserts the candidate DuckDB actually prints for a failed variadic TABLE-function call
+(`fabricator_lat_span(ANY, BIGINT)`), which OMITS the tail — a scalar's candidate renders `[TYPE...]` and a
+table function's does not. Reproduced on stock DuckDB with a control pair; recorded as
+[docs/duckdb-upstream-issues.md](duckdb-upstream-issues.md) §6. Asserting the correct-but-absent rendering
+would fail forever against something we do not control.
 
 **Mutation-tested, four mutants, each killed at its own assertion:**
 

@@ -480,3 +480,53 @@ SELECT parameter_types, varargs, function_type
 FROM duckdb_functions() WHERE function_name = 'fabricator_va_args';
 ----
 [VARCHAR]	ANY	table
+
+# ---- a VARIADIC TAIL on a TABLE-IN-OUT function: it widens the ARGS BATCH, not the input stream ----
+#
+# ⚠ THIS IS THE ASSERTION THE FEATURE TURNS ON, and it is about WHICH SIDE the tail lands on. An in-out's
+# per-row input is its {TABLE} argument ALONE; its positional and named parameters are CONSTANTS resolved at
+# bind and marshaled into the 1-row args batch the author reads in `Bind`. So the tail is bind-time data —
+# the same mechanism as a scalar/table/sqlgen tail — and the input STREAM is untouched. (A LATERAL tail is
+# the other mechanism entirely: there the positional slots ARE the per-row input columns, so its tail widens
+# the wire. Same declaration, opposite half of the call.)
+#
+# The registration shows the {TABLE} slot and the constant prefix as the arguments, with the tail separate.
+query TT
+SELECT parameter_types, varargs FROM duckdb_functions() WHERE function_name = 'fabricator_inout_va';
+----
+[TABLE, VARCHAR]	ANY
+
+# No tail arguments: the minimum arity is the declared prefix (the table + `label`).
+query IT
+SELECT n, tag FROM fabricator_inout_va((SELECT * FROM range(2) t(n)), 'base') ORDER BY n;
+----
+0	base
+1	base
+
+# A HETEROGENEOUS tail reaches Bind — 7 / 'x' / TRUE keep their own types, which is the no-cast property of
+# an ANY tail — while the input stream still yields both of its rows.
+query IT
+SELECT n, tag FROM fabricator_inout_va((SELECT * FROM range(2) t(n)), 'base', 7, 'x', TRUE) ORDER BY n;
+----
+0	base:7+x+True
+1	base:7+x+True
+
+# THE LOAD-BEARING ONE: three input rows in, three out. The tail changed the TAG and nothing else — if a tail
+# argument had been pumped into the input stream the row count would move, which is the failure this pins.
+query IT
+SELECT count(*), min(tag) FROM fabricator_inout_va((SELECT * FROM range(3) t(n)), 'L', 1, 2);
+----
+3	L:1+2
+
+# Arity varies per CALL SITE, not per function — two widths in one statement.
+query TT
+SELECT (SELECT min(tag) FROM fabricator_inout_va((SELECT 1 AS n), 'a', 9)),
+       (SELECT min(tag) FROM fabricator_inout_va((SELECT 1 AS n), 'a', 9, 8, 7));
+----
+a:9	a:9+8+7
+
+# Below the declared prefix DuckDB refuses at bind.
+statement error
+SELECT * FROM fabricator_inout_va((SELECT 1 AS n));
+----
+<REGEX>:.*(No function matches|Binder Error).*

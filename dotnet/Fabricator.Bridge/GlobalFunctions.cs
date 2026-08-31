@@ -149,7 +149,8 @@ public static class GlobalFunctions
         // Checked at BIND (once per plan, so free) rather than at registration: a table-input declaration
         // would build a {TABLE} signature the correlated spelling cannot bind against, i.e. a function nobody
         // could call the way it was declared. The host refuses it too; this is where the message is best.
-        Params.Validate(fn.Name, fn.Parameters, allowNamed: true, allowTableInput: false, allowConstant: true);
+        Params.Validate(fn.Name, fn.Parameters, allowNamed: true, allowTableInput: false, allowConstant: true,
+                        allowVarArgs: true);
         args = LateralConstants.Validate(fn.Name, fn.Parameters, args);
         return fn.Bind(args, inputSchema);
     }

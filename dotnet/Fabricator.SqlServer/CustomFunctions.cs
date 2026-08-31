@@ -59,6 +59,8 @@ internal static class CustomFunctions
         new GfTagFunction(),
         // Mixed signature: table input + POSITIONAL + NAMED in one declaration (see GfMixFunction).
         new GfMixFunction(),
+        // Table input + POSITIONAL + a VARIADIC TAIL of bind-time cost args (see GfInOutVaFunction).
+        new GfInOutVaFunction(),
     };
 
     // Connection-free GLOBAL row-mapped (correlated LATERAL) functions — bare fn(a, b), callable BOTH with
@@ -70,6 +72,10 @@ internal static class CustomFunctions
         new GfLatScaleFunction(),
         new GfLatBadOriginFunction(),
         new GfLatFieldsFunction(),
+        // A lateral whose bind-time CONSTANT is the FIRST parameter -- see GfLatFrontFunction.
+        new GfLatFrontFunction(),
+        // [CONSTANT][POSITIONAL][VARIADIC TAIL] in one declaration -- see GfLatSpanFunction.
+        new GfLatSpanFunction(),
     };
 
     // Connection-free GLOBAL collector (pipeline-breaker) functions — bare fn(<input>), no ATTACH.
@@ -2305,4 +2311,296 @@ internal sealed class GfVaValuesFunction : ISqlTableFunction
             "fabricator_va_values: cannot render a " + v.GetType().Name + " as a SQL literal — pass a number, "
             + "a boolean, a string or NULL"),
     };
+}
+
+// GLOBAL lateral whose bind-time CONSTANT is the FIRST parameter, not the last:
+// fabricator_lat_front(fields, n) -> one INT64 column per name in `fields`, column k = n * (k+1), 1:1.
+//
+// ⚠ It exists to settle a claim this tree carried WITHOUT CHECKING IT. The design note said a lateral's
+// constant slots "are also trailing", and used that to argue a variadic tail could not compose with them.
+// Nothing in the code says trailing: `LateralBind` builds `declared_constant` in slot order and tests
+// `declared_constant[i]` per ACTUAL slot, `wire_slots` is simply the non-constant indices,
+// `LateralConstants.Validate` matches by NAME, and `Params.Validate` gives Constant no ordering rule at all.
+// The convention was the demos', not the mechanism's — and once constants may sit at the FRONT, the layout
+// [constants][positionals][tail] leaves a variadic tail nothing to contend with.
+internal sealed class GfLatFrontFunction : ILateralFunction
+{
+    public string Name => "fabricator_lat_front";
+
+    public Schema Parameters => new(new[]
+    {
+        Params.Constant("fields"), // FIRST — the point of this demo
+        Params.Positional("n", Int64Type.Default),
+    }, metadata: null);
+
+    public ILateralFunctionBinding Bind(RecordBatch? args, Schema inputSchema)
+    {
+        // By NAME, not by position — which is what makes the declaration order a free choice.
+        int idx = args?.Schema.GetFieldIndex("fields") ?? -1;
+        var col = idx >= 0 ? args!.Column(idx) : null;
+        if (col is not StringArray s || s.IsNull(0))
+        {
+            throw new ArgumentException(
+                "fabricator_lat_front: 'fields' must be a non-NULL VARCHAR of comma-separated column names");
+        }
+        var names = s.GetString(0).Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+        if (names.Length == 0)
+        {
+            throw new ArgumentException("fabricator_lat_front: 'fields' named no columns");
+        }
+        return new Binding(names);
+    }
+
+    private sealed class Binding : ILateralFunctionBinding
+    {
+        private readonly string[] _names;
+
+        public Binding(string[] names) => _names = names;
+
+        public Schema OutputSchema =>
+            new(_names.Select(n => new Field(n, Int64Type.Default, nullable: true)).ToList(), metadata: null);
+
+        public ILateralSession Open() => new Session(OutputSchema, _names.Length);
+
+        public void Dispose() { }
+    }
+
+    private sealed class Session : ILateralSession
+    {
+        private readonly Schema _output;
+        private readonly int _cols;
+
+        public Session(Schema output, int cols)
+        {
+            _output = output;
+            _cols = cols;
+        }
+
+        public LateralResult Call(RecordBatch input)
+        {
+            // The constant is NOT on the wire, so column 0 is `n` even though it is declared SECOND — the
+            // assertion that the slot was stripped by index rather than by position-from-the-end.
+            var n = (Int64Array)input.Column(0);
+            var cols = new IArrowArray[_cols];
+            for (int c = 0; c < _cols; c++)
+            {
+                var b = new Int64Array.Builder().Reserve(input.Length);
+                for (int r = 0; r < input.Length; r++)
+                {
+                    if (n.IsNull(r)) { b.AppendNull(); } else { b.Append(n.Values[r] * (c + 1)); }
+                }
+                cols[c] = b.Build();
+            }
+            return new LateralResult(new RecordBatch(_output, cols, input.Length)); // 1:1, no provenance
+        }
+
+        public void Dispose() { }
+    }
+}
+
+// GLOBAL lateral combining BOTH ends of the parameter protocol:
+// fabricator_lat_span(fields, n, ...extra) -> one INT64 column per name in `fields` (column k = n * (k+1))
+// plus `tail_sum` = the sum of the tail arguments for that row. 1:1 with the input rows.
+//
+// The layout is [CONSTANT][POSITIONAL][VARIADIC TAIL], which is the whole point: a lateral's positional
+// slots ARE its per-row input columns, so the tail is a variable-width WIRE rather than a wider args batch.
+// That works because LateralBind is written against the ACTUAL call — `arg_width` is the call's width and
+// every declaration lookup is guarded — and because CONSTANT slots are stripped BY INDEX, so a front
+// constant leaves the tail nothing to contend with.
+//
+// ⚠ The tail is CONCRETE (BIGINT) rather than ANY, deliberately: that is the case where the host must
+// normalize the slots PAST the declaration to the tail's declared type (an ANY tail needs no normalization,
+// so it would not exercise it). It also means DuckDB applies its ordinary implicit-cast rules per tail
+// argument — `2::SMALLINT` is taken, a DECIMAL is refused at bind.
+internal sealed class GfLatSpanFunction : ILateralFunction
+{
+    public string Name => "fabricator_lat_span";
+
+    public Schema Parameters => new(new[]
+    {
+        Params.Constant("fields"),                       // bind-time, FIRST
+        Params.Positional("n", Int64Type.Default),       // per-row
+        Params.VarArgs("extra", Int64Type.Default),      // per-row, any number, LAST
+    }, metadata: null);
+
+    public ILateralFunctionBinding Bind(RecordBatch? args, Schema inputSchema)
+    {
+        int idx = args?.Schema.GetFieldIndex("fields") ?? -1;
+        if ((idx >= 0 ? args!.Column(idx) : null) is not StringArray s || s.IsNull(0))
+        {
+            throw new ArgumentException(
+                "fabricator_lat_span: 'fields' must be a non-NULL VARCHAR of comma-separated column names");
+        }
+        var names = s.GetString(0).Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+        if (names.Length == 0)
+        {
+            throw new ArgumentException("fabricator_lat_span: 'fields' named no columns");
+        }
+        // The tail's WIDTH is known here from the input schema, not from the declaration — `inputSchema` is
+        // the wire (the constant already stripped), so column 0 is `n` and the rest are the tail.
+        return new Binding(names, System.Math.Max(0, inputSchema.FieldsList.Count - 1));
+    }
+
+    private sealed class Binding : ILateralFunctionBinding
+    {
+        private readonly string[] _names;
+        private readonly int _tailWidth;
+
+        public Binding(string[] names, int tailWidth)
+        {
+            _names = names;
+            _tailWidth = tailWidth;
+        }
+
+        public Schema OutputSchema
+        {
+            get
+            {
+                var fields = _names.Select(n => new Field(n, Int64Type.Default, nullable: true)).ToList();
+                fields.Add(new Field("tail_sum", Int64Type.Default, nullable: false));
+                return new Schema(fields, metadata: null);
+            }
+        }
+
+        public ILateralSession Open() => new Session(OutputSchema, _names.Length, _tailWidth);
+
+        public void Dispose() { }
+    }
+
+    private sealed class Session : ILateralSession
+    {
+        private readonly Schema _output;
+        private readonly int _cols;
+        private readonly int _tailWidth;
+
+        public Session(Schema output, int cols, int tailWidth)
+        {
+            _output = output;
+            _cols = cols;
+            _tailWidth = tailWidth;
+        }
+
+        public LateralResult Call(RecordBatch input)
+        {
+            var n = (Int64Array)input.Column(0);
+            var arrays = new IArrowArray[_cols + 1];
+            for (int c = 0; c < _cols; c++)
+            {
+                var b = new Int64Array.Builder().Reserve(input.Length);
+                for (int r = 0; r < input.Length; r++)
+                {
+                    if (n.IsNull(r)) { b.AppendNull(); } else { b.Append(n.Values[r] * (c + 1)); }
+                }
+                arrays[c] = b.Build();
+            }
+            var sum = new Int64Array.Builder().Reserve(input.Length);
+            for (int r = 0; r < input.Length; r++)
+            {
+                long acc = 0;
+                // 1 .. ColumnCount-1 are the tail columns. Read the count from the BATCH, never from the
+                // declaration — that is the whole contract of a variadic tail.
+                for (int c = 1; c < input.ColumnCount; c++)
+                {
+                    if (input.Column(c) is Int64Array v && !v.IsNull(r))
+                    {
+                        acc += v.Values[r];
+                    }
+                }
+                sum.Append(acc);
+            }
+            arrays[_cols] = sum.Build();
+            return new LateralResult(new RecordBatch(_output, arrays, input.Length)); // 1:1, no provenance
+        }
+
+        public void Dispose() { }
+    }
+}
+
+// GLOBAL table-in-out with a VARIADIC TAIL of BIND-TIME cost arguments:
+// fabricator_inout_va(<table of n>, label, ...extra) -> (n, tag) where tag is `label` followed by the tail
+// values joined with '+'.
+//
+// ⚠ THE POINT IS WHICH SIDE THE TAIL LANDS ON. An in-out's per-row input is its {TABLE} argument ALONE; its
+// positional and named parameters are CONSTANTS resolved at bind and marshaled into the 1-row args batch the
+// author reads in `Bind`. So a tail here widens the ARGS BATCH — the scalar/table/sqlgen mechanism — and the
+// input STREAM is untouched. The two cannot mix: the subquery slot binds to a BoundStatement while the tail
+// arguments are constants in `input.inputs`.
+//
+// (A LATERAL tail is the other mechanism — there the positional slots really ARE the per-row input columns,
+// so its tail widens the WIRE. Same declaration, different half of the call.)
+internal sealed class GfInOutVaFunction : IInOutFunction
+{
+    public string Name => "fabricator_inout_va";
+
+    public Schema Parameters => new(new[]
+    {
+        Params.TableInput("input", new Field("n", Int32Type.Default, nullable: true)),
+        Params.Positional("label", StringType.Default),
+        Params.VarArgs("extra"), // ANY tail: heterogeneous bind-time arguments
+    }, metadata: null);
+
+    public IInOutFunctionBinding Bind(RecordBatch? args, Schema inputSchema)
+    {
+        // Read the tail from the BATCH, by the host's `<tail>_<k>` naming — the count is a property of the
+        // call, not of the declaration.
+        string label = "";
+        var extras = new List<string>();
+        for (int c = 0; args is not null && c < args.ColumnCount; c++)
+        {
+            var name = args.Schema.FieldsList[c].Name;
+            var v = ArrowValueReader.ReadScalar(args.Column(c), 0);
+            if (string.Equals(name, "label", System.StringComparison.OrdinalIgnoreCase))
+            {
+                label = VaRender.Text(v) ?? "";
+            }
+            else if (name.StartsWith("extra_", System.StringComparison.Ordinal))
+            {
+                extras.Add(VaRender.Text(v) ?? "NULL");
+            }
+        }
+        return new Binding(extras.Count == 0 ? label : label + ":" + string.Join("+", extras));
+    }
+
+    private sealed class Binding : IInOutFunctionBinding
+    {
+        private readonly string _tag;
+
+        public Binding(string tag) => _tag = tag;
+
+        public Schema OutputSchema => new(new[]
+        {
+            new Field("n", Int64Type.Default, nullable: true),
+            new Field("tag", StringType.Default, nullable: false),
+        }, metadata: null);
+
+        public async IAsyncEnumerable<RecordBatch> DoExchange(
+            IAsyncEnumerable<RecordBatch> input, [EnumeratorCancellation] CancellationToken ct = default)
+        {
+            await foreach (var chunk in input.WithCancellation(ct))
+            {
+                using (chunk)
+                {
+                    // ⚠ Read the input column GENERICALLY. A TableInput's declared columns are recorded,
+                    // not enforced (see Params.TableInput), so the subquery may hand over any type DuckDB
+                    // produced -- `range(2)` is BIGINT where the declaration says INTEGER. A hard cast here
+                    // is the shape that makes an in-out demo look broken on the most obvious call a user
+                    // writes.
+                    var col = chunk.Column(0);
+                    int rows = chunk.Length;
+                    var nb = new Int64Array.Builder().Reserve(rows);
+                    var tb = new StringArray.Builder().Reserve(rows);
+                    for (int i = 0; i < rows; i++)
+                    {
+                        var v = ArrowValueReader.ReadScalar(col, i);
+                        if (v is null) { nb.AppendNull(); } else { nb.Append(System.Convert.ToInt64(v)); }
+                        tb.Append(_tag);
+                    }
+                    yield return new RecordBatch(OutputSchema, new IArrowArray[] { nb.Build(), tb.Build() }, rows);
+                }
+                yield return InOutExchange.EmptyBatch(OutputSchema); // per-input sentinel
+            }
+        }
+
+        public void Dispose() { }
+    }
 }

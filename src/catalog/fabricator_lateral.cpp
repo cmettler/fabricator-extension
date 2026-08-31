@@ -321,10 +321,16 @@ unique_ptr<FunctionData> LateralBind(ClientContext &context, TableFunctionBindIn
 	vector<LogicalType> declared_positional;
 	vector<bool> declared_constant;
 	vector<string> declared_pos_names;
+	// Index INTO declared_positional of the VARIADIC tail, or INVALID_INDEX. Every ACTUAL slot at or past it
+	// is a tail argument, which is what lets a call be wider than the declaration.
+	idx_t declared_tail = DConstants::INVALID_INDEX;
 	for (idx_t i = 0; i < info.arg_types.size(); i++) {
 		auto style = i < info.arg_styles.size() ? info.arg_styles[i] : FabricatorParamStyle::POSITIONAL;
 		if (style == FabricatorParamStyle::NAMED) {
 			continue;
+		}
+		if (style == FabricatorParamStyle::VARARGS) {
+			declared_tail = declared_positional.size();
 		}
 		declared_positional.push_back(info.arg_types[i]);
 		declared_constant.push_back(style == FabricatorParamStyle::CONSTANT);
@@ -369,17 +375,27 @@ unique_ptr<FunctionData> LateralBind(ClientContext &context, TableFunctionBindIn
 		// shows the author's own declaration, and LateralSession::Call casts each runtime chunk to it. An
 		// ANY-declared slot (Arrow null type => SQLNULL/ANY) keeps the BOUND type: carrying a per-call-site
 		// type through untouched is what ANY is for.
-		if (i < declared_positional.size() && declared_positional[i].id() != LogicalTypeId::SQLNULL &&
-		    declared_positional[i].id() != LogicalTypeId::ANY) {
-			col_type = declared_positional[i];
+		// A slot PAST the declaration is a VARIADIC tail argument, and the declaration governing it is the
+		// tail's own (declared_positional still carries it, at declared_tail). Without this a concrete tail
+		// would normalize only its FIRST argument and leave the rest at their bound types — under which the
+		// two call shapes disagree about those slots, which is the crash class this normalization closes.
+		auto declared_slot = i < declared_positional.size() ? i : declared_tail;
+		if (declared_slot != DConstants::INVALID_INDEX &&
+		    declared_positional[declared_slot].id() != LogicalTypeId::SQLNULL &&
+		    declared_positional[declared_slot].id() != LogicalTypeId::ANY) {
+			col_type = declared_positional[declared_slot];
 		}
 		bind_data->input_types.push_back(col_type);
 		bind_data->input_names.push_back(slot_name.empty() ? "col" + to_string(i) : slot_name);
 		bind_data->wire_slots.push_back(i);
 	}
 	if (bind_data->input_types.empty()) {
+		// ⚠ Reachable in a NEW way since the variadic tail: a function declared [CONSTANT][TAIL] and called
+		// with no tail arguments has an EMPTY wire, which is not the same as declaring no positional
+		// parameters. MEASURED to land here cleanly in BOTH call shapes.
 		throw BinderException("Fabricator: lateral function \"%s\" needs at least one PER-ROW argument — its "
-		                      "non-constant positional parameters ARE its per-row input columns",
+		                      "non-constant positional parameters (a variadic tail argument counts) ARE its "
+		                      "per-row input columns",
 		                      info.func);
 	}
 	bind_data->source_shape = all_names_empty;
@@ -829,17 +845,22 @@ TableFunction FabricatorMakeLateralFunction(FabricatorHandle handle, const strin
 	// the rendered-text fold above).
 	for (idx_t i = 0; i < arg_names.size(); i++) {
 		auto style = i < arg_styles.size() ? arg_styles[i] : FabricatorParamStyle::POSITIONAL;
-		if (style == FabricatorParamStyle::VARARGS) {
-			// DEFERRED for this kind, and refused at REGISTRATION rather than left to the managed bind: a
-			// lateral function's positional slots are its per-row INPUT COLUMNS, so a tail is a
-			// variable-width wire, and it would have to compose with CONSTANT slots, which are also trailing
-			// and also stripped from the wire. Falling through would make it an ordinary ANY input column.
-			throw InvalidInputException("Fabricator: lateral function \"%s\" declares the variadic tail "
-			                            "\"%s\" — a lateral function's positional parameters are its per-row "
-			                            "input columns, so it cannot take one",
-			                            func_name, arg_names[i]);
-		}
 		auto type = arg_types[i].id() == LogicalTypeId::SQLNULL ? LogicalType::ANY : arg_types[i];
+		if (style == FabricatorParamStyle::VARARGS) {
+			// A VARIADIC TAIL of per-row input columns. It needs almost nothing beyond this line, because
+			// LateralBind is already written against the ACTUAL call rather than the declaration: `arg_width`
+			// is `input.input_table_types.size()`, the slot loop runs over that, and every declaration lookup
+			// is guarded `i < declared_*.size()` so surplus slots keep their bound type — exactly what an ANY
+			// tail wants. The tail is NOT an argument slot; it names the TYPE of every argument past the
+			// declared ones.
+			// ⚠ It composes with CONSTANT slots because those are stripped BY INDEX (`declared_constant[i]`),
+			// not by position from the end, so [constants][positionals][tail] is unambiguous. An earlier
+			// version of this comment claimed constants were "trailing" and used that to defer the whole
+			// feature; nothing in the code said so, and a front-constant lateral was measured before this
+			// was built.
+			tf.varargs = type;
+			continue;
+		}
 		if (style == FabricatorParamStyle::NAMED) {
 			tf.named_parameters[arg_names[i]] = type;
 		} else if (style == FabricatorParamStyle::TABLE_INPUT) {

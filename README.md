@@ -2053,8 +2053,20 @@ SELECT * FROM fabricator_va_values(1, 'x', TRUE);              -- SELECT 1 AS v0
 - **A `LIST` parameter already covers the homogeneous case** (`f(['a','b'])`) and needs none of this. What a
   tail buys is *heterogeneous, individually-typed* arguments — the shape of DuckDB's own `printf`,
   `concat_ws` and `struct_pack`.
-- Lateral and table-in-out functions **cannot** take one yet: there the positional slots are the per-row
-  input columns, so a tail would be a variable-width wire. Declaring one on those kinds is refused by name.
+- **Correlated LATERAL functions take one too**, and there it means something different: a lateral's
+  positional slots are its per-row input columns, so the tail widens the **wire** rather than the args
+  batch. `[Params.Constant][Params.Positional][Params.VarArgs]` composes — a bind-time constant may sit
+  anywhere in the declaration, including first:
+  ```sql
+  SELECT t.n, f.* FROM t, fabricator_lat_span('a,b', t.n, t.n * 10, t.n * 100) f;
+  ```
+- **Table-in-out functions take one as bind-time arguments.** Their per-row input is the `TableInput`
+  alone, so the tail widens the args batch and the input stream is untouched:
+  ```sql
+  SELECT * FROM fabricator_inout_va((SELECT * FROM range(3) t(n)), 'L', 1, 2);  -- 3 rows in, 3 out
+  ```
+- Aggregate functions **cannot** take one — their state marshal has no per-call-site width. Declaring one
+  there is refused by name rather than silently registered as an ordinary argument.
 
 ### Table-in-out (`fn_each`)
 

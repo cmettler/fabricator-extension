@@ -276,10 +276,12 @@ public static class Params
     /// <param name="allowConstant">True only for lateral functions — the one kind whose positional slots are
     /// per-row input columns, which is what a bind-time constant needs an escape from. On any other kind a
     /// named parameter already does the job.</param>
-    /// <param name="allowVarArgs">False for the kinds where a variadic tail is DEFERRED (lateral, in-out):
-    /// there the positional slots are the per-row input columns, so a variadic tail would be a variable-width
-    /// wire. Refused by name rather than silently registered as an ordinary positional parameter, which is
-    /// what it would otherwise become.</param>
+    /// <param name="allowVarArgs">False only for AGGREGATES, whose state/update/combine marshal was never
+    /// examined for a per-call-site width. Refused BY NAME rather than silently registered as an ordinary
+    /// positional parameter, which is what it would otherwise become.
+    /// ⚠ Every other kind takes one, by one of two mechanisms: for scalar, table, sqlgen and in-out the tail
+    /// widens the ARGS BATCH (its values are bind-time constants); for LATERAL it widens the per-row WIRE,
+    /// because there the positional slots really are the input columns.</param>
     public static void Validate(string function, Schema parameters, bool allowNamed, bool allowTableInput,
                                 bool allowConstant = false, bool allowVarArgs = false)
     {

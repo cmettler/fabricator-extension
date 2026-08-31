@@ -546,17 +546,20 @@ static string FabricatorArgName(const vector<string> &decl_names, idx_t varargs_
 	return i < decl_names.size() ? decl_names[i] : "arg" + to_string(i);
 }
 
-//! Refuses a variadic tail on a function kind that cannot carry one. ⚠ Doing NOTHING is worse than an
-//! error rather than merely less helpful: with no case for it, a VARARGS field falls through to the
-//! positional branch and silently becomes an ordinary ANY argument — a function whose documented call
-//! syntax then does not work, and whose declaration looks honoured.
+//! Refuses a variadic tail on a function kind that cannot carry one — AGGREGATES only, now that scalar,
+//! table, sqlgen, in-out/collector and lateral all take one. Their state/update/combine marshal was never
+//! examined for a per-call-site width, and DuckDB's AggregateFunction carries the same `varargs` field, so
+//! this is "unexamined", not "impossible".
+//! ⚠ Doing NOTHING is worse than an error rather than merely less helpful: with no case for it, a VARARGS
+//! field falls through to the positional branch and silently becomes an ordinary ANY argument — a function
+//! whose documented call syntax then does not work, and whose declaration looks honoured.
 static void FabricatorRefuseVarArgs(const string &func_name, const char *kind, const vector<string> &names,
                                     const vector<FabricatorParamStyle> &styles) {
 	for (idx_t i = 0; i < names.size(); i++) {
 		if (i < styles.size() && styles[i] == FabricatorParamStyle::VARARGS) {
 			throw InvalidInputException("Fabricator: function \"%s\" declares the variadic tail \"%s\", which "
-			                            "a %s function cannot take — scalar, table and SQL-generating "
-			                            "functions only",
+			                            "a %s function cannot take — its per-call state marshal has no "
+			                            "per-call-site width",
 			                            func_name, names[i], kind);
 		}
 	}
@@ -1900,6 +1903,23 @@ static void FabricatorMarshalInOutArgs(const FabricatorTableFunctionInfo &info, 
 			positional_index++; // consume the subquery's reserved slot; the table itself is not an arg value
 			continue;
 		}
+		if (style == FabricatorParamStyle::VARARGS) {
+			// The tail takes EVERY remaining positional argument (it is the last positional parameter by
+			// construction), each named `<tail>_<k>`. ⚠ Without this branch the loop walks the DECLARATION
+			// and indexes into the values, so surplus arguments are SILENTLY DROPPED — no crash and no
+			// error, just a function that does not receive what the caller wrote. That is the failure this
+			// kind's refusal used to prevent, and it is why the tail has to be marshaled rather than left to
+			// fall through.
+			auto tail_type = FabricatorVarArgsType(info.arg_types[i]);
+			for (idx_t k = positional_index; k < input.inputs.size(); k++) {
+				auto &v = input.inputs[k];
+				arg_names.push_back(info.arg_names[i] + "_" + to_string(k - positional_index));
+				arg_types.push_back(tail_type.id() == LogicalTypeId::ANY ? v.type() : tail_type);
+				arg_values.push_back(v);
+			}
+			positional_index = input.inputs.size();
+			continue;
+		}
 		const LogicalType &declared = info.arg_types[i];
 		if (style == FabricatorParamStyle::NAMED) {
 			Value v(declared);
@@ -1947,10 +1967,24 @@ static void FabricatorMarshalInOutArgs(const FabricatorTableFunctionInfo &info, 
 static void FabricatorBuildInOutSignature(const vector<string> &names, const vector<LogicalType> &types,
                                           const vector<FabricatorParamStyle> &styles, TableFunction &tf,
                                           bool named_any_for_null = false) {
-	FabricatorRefuseVarArgs(tf.name, "table-in-out", names, styles);
 	for (idx_t i = 0; i < names.size(); i++) {
 		auto style = i < styles.size() ? styles[i] : FabricatorParamStyle::POSITIONAL;
 		switch (style) {
+		case FabricatorParamStyle::VARARGS:
+			// A VARIADIC TAIL of BIND-TIME COST ARGUMENTS — the args-batch mechanism, exactly as for a
+			// scalar / table / sqlgen function, NOT the lateral one. An in-out's per-row input is its
+			// {TABLE} argument alone; its positional and named parameters are constants resolved at bind
+			// (FabricatorMarshalInOutArgs marshals them into the 1-row batch the author reads in Bind). So
+			// the tail widens the ARGS BATCH and the input stream is untouched — the two cannot mix, since
+			// the subquery slot binds to a BoundStatement while the tail arguments are constants in
+			// `input.inputs`.
+			// ⚠ DuckDB resolves this: GetTableFunctionBindType keys `has_table_parameter` on
+			// `function.arguments` containing TABLE (which the {TABLE} slot supplies regardless of varargs),
+			// the subquery contributes LogicalTypeId::TABLE + an empty Value to the match, and every further
+			// argument is costed against `varargs` by BindVarArgsFunctionCost.
+			tf.varargs = (named_any_for_null && types[i].id() == LogicalTypeId::SQLNULL) ? LogicalType::ANY
+			                                                                            : types[i];
+			break;
 		case FabricatorParamStyle::TABLE_INPUT:
 			// The DECLARED type (a struct of the expected input columns) is ours alone: DuckDB only ever
 			// accepts LogicalType::TABLE here, so any column-level check would be a bind-time one of our own.

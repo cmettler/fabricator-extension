@@ -611,6 +611,42 @@ cheap move if that ever matters: file it. We have the reproduction, the file and
 direction (run the named-parameter extraction BEFORE the in-out sweep), which is the self-contained,
 needs-nothing-of-ours shape CLAUDE.md records as making an offer land.
 
+## 6. A TABLE function's `varargs` is omitted from the "Candidate functions" list — scalars render it
+
+**Found 2026-08-31 while gating our own variadic table functions. Cosmetic — a message, never an answer —
+but it MISDESCRIBES the function to the one person who needs the description: someone whose call just
+failed.** A variadic table function's candidate is printed as though it had a fixed arity, so a caller reads
+"this takes one argument" about a function that takes one or more.
+
+**Stock repro, three lines, no extensions** (`duckdb==1.5.2` python wheel):
+
+```python
+import duckdb
+duckdb.sql("SELECT concat_ws()")            # SCALAR    -> concat_ws(VARCHAR, ANY, [ANY...]) -> VARCHAR
+duckdb.sql("SELECT * FROM test_vector_types()")  # TABLE -> test_vector_types(ANY, all_flat : BOOLEAN)
+duckdb.sql("SELECT * FROM enable_profiling(1)")  # TABLE -> enable_profiling(format : VARCHAR, …, metrics : ANY)
+```
+
+`test_vector_types` and `enable_profiling` both declare a `varargs` (`ANY` and `VARCHAR[]` respectively —
+`SELECT function_name, varargs FROM duckdb_functions() WHERE varargs IS NOT NULL` lists them), and neither
+candidate shows it. The scalar path does: `Function::CallToString` appends `"[" + varargs.ToString() + "...]"`
+when `varargs.IsValid()`, and the scalar binder's error goes through it.
+
+**The control is the pair, not either half** — `concat_ws` and `test_vector_types` are both variadic, both
+fail to bind, and only one renders the tail. Without the scalar beside it, the table rendering looks like a
+deliberate choice rather than a gap.
+
+⚠ **NOT FILED**, and the reason is worth stating rather than leaving to inference: it is a message-only
+defect with an obvious workaround (read `duckdb_functions().varargs`), so it is worth an issue only if
+someone is already in that code. Recorded here so the next person who sees a fixed-arity candidate for a
+variadic function of ours does not go looking for a bug on our side — which is exactly what happened when
+`verify_lateral`'s first draft asserted the tail would appear.
+
+⚠ It is also why that gate asserts the candidate DuckDB actually prints
+(`fabricator_lat_span(ANY, BIGINT)`) rather than the one it should: an assertion written against the
+correct-but-absent rendering would fail forever, and "fix the test to match" is the wrong move only when the
+behaviour under test is ours. Here it is not.
+
 ## Not a bug, but pinned here because it wasted time three times
 
 `read_parquet` answers `count(*)` — and `count(<col>)` — from parquet footer metadata without decoding the

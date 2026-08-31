@@ -779,3 +779,120 @@ SELECT t1 FROM fabricator_lat_fields(2, 't1');
 
 statement ok
 COMMIT;
+
+# 16. A BIND-TIME CONSTANT MAY SIT ANYWHERE, AND A VARIADIC TAIL COMPOSES WITH ONE
+#
+# §9/§15 shipped `Params.Constant` with the constant declared LAST in every demo, and the design note then
+# recorded that a lateral's constant slots "are also trailing" — using that to defer a variadic tail, which
+# would have wanted the same trailing positions. Nothing in the code ever said trailing: LateralBind builds
+# `declared_constant` in slot order and tests `declared_constant[i]` per ACTUAL slot, `wire_slots` is simply
+# the non-constant indices, `LateralConstants.Validate` matches by NAME, and `Params.Validate` gives Constant
+# no ordering rule. The convention was the demos'.
+#
+# fabricator_lat_front(fields, n) declares the constant FIRST and nothing else changed to make it work.
+query III
+SELECT * FROM fabricator_lat_front('x,y,z', 7);
+----
+7	14	21
+
+# The registration shows the constant occupying slot 0 as ANY — it IS a positional slot, it is just resolved
+# at bind and stripped from the wire.
+query TT
+SELECT parameter_types, varargs FROM duckdb_functions() WHERE function_name = 'fabricator_lat_front';
+----
+[ANY, BIGINT]	NULL
+
+# CORRELATED shape with the constant in front: the fold reads slot 0's rendered expression text exactly as it
+# reads a later slot's, and `n` is column 0 ON THE WIRE although it is declared SECOND — which is the
+# assertion that the slot was stripped BY INDEX rather than by position from the end.
+statement ok
+CREATE TABLE lat_pos(n BIGINT);
+
+statement ok
+INSERT INTO lat_pos VALUES (3), (4);
+
+query III
+SELECT t.n, f.a, f.b FROM lat_pos t, fabricator_lat_front('a,b', t.n) f ORDER BY 1;
+----
+3	3	6
+4	4	8
+
+# A folded expression works in the front slot too (the channel is the rendering, not the literal).
+query T
+SELECT column_name FROM (DESCRIBE SELECT * FROM fabricator_lat_front(upper('p') || ',q', 1)) ORDER BY ALL;
+----
+P
+q
+
+# …and the refusal is unchanged: a COLUMN in the constant slot has no bind-time value wherever the slot sits.
+statement error
+SELECT * FROM lat_pos t, fabricator_lat_front(t.n::VARCHAR, t.n) f;
+----
+<REGEX>:.*bind-time CONSTANT.*folds at bind.*
+
+# ---- the VARIADIC TAIL on a lateral: [CONSTANT][POSITIONAL][TAIL] in one declaration ----
+#
+# ⚠ THE MECHANISM IS DIFFERENT FROM EVERY OTHER KIND'S. A scalar/table/sqlgen tail widens the ARGS BATCH; a
+# lateral's positional slots ARE the per-row input columns, so its tail widens the WIRE. It needed almost no
+# code because LateralBind is written against the ACTUAL call — `arg_width` is the call's width, and every
+# declaration lookup is guarded — which is what makes surplus slots legal by construction.
+#
+# fabricator_lat_span(fields, n, ...extra) — the tail is CONCRETE (BIGINT), which is the case that exercises
+# normalizing the slots PAST the declaration (an ANY tail keeps its bound type and would not).
+query TT
+SELECT parameter_types, varargs FROM duckdb_functions() WHERE function_name = 'fabricator_lat_span';
+----
+[ANY, BIGINT]	BIGINT
+
+# No tail arguments at all — the minimum arity is the declared prefix.
+query III
+SELECT x, y, tail_sum FROM fabricator_lat_span('x,y', 7);
+----
+7	14	0
+
+query III
+SELECT x, y, tail_sum FROM fabricator_lat_span('x,y', 7, 100, 20);
+----
+7	14	120
+
+# CORRELATED, with the tail supplied from COLUMNS: this is the assertion no other kind can make, because it
+# is the tail arriving as per-row WIRE data rather than as bind-time arguments.
+query IIII
+SELECT t.n, f.a, f.b, f.tail_sum
+FROM lat_pos t, fabricator_lat_span('a,b', t.n, t.n * 10, t.n * 100) f ORDER BY 1;
+----
+3	3	6	330
+4	4	8	440
+
+# Arity varies per CALL SITE, not per function — two widths in one statement.
+query II
+SELECT (SELECT tail_sum FROM fabricator_lat_span('q', 1, 5)),
+       (SELECT tail_sum FROM fabricator_lat_span('q', 1, 5, 6, 7));
+----
+5	18
+
+# A concrete tail applies DuckDB's ordinary implicit-cast rules per argument, so mixed integral widths all
+# arrive as the declared type.
+query I
+SELECT tail_sum FROM fabricator_lat_span('q', 1, 2::SMALLINT, 3::TINYINT);
+----
+5
+
+# …and a cast DuckDB will not make implicitly is refused at bind — DECIMAL -> BIGINT is lossy.
+# ⚠ The candidate is asserted as DuckDB actually PRINTS it, without the tail: a TABLE function's varargs is
+# omitted from the candidate list while a scalar's is rendered `[TYPE...]`. That is upstream and reproduces
+# on stock (docs/duckdb-upstream-issues.md §6); asserting the correct-but-absent rendering here would fail
+# forever against behaviour that is not ours.
+statement error
+SELECT tail_sum FROM fabricator_lat_span('q', 1, 3.7);
+----
+<REGEX>:.*No function matches.*fabricator_lat_span\(VARCHAR, INTEGER, DECIMAL\(2,1\)\).*
+
+# Below the declared prefix DuckDB refuses before the bind is reached.
+statement error
+SELECT * FROM fabricator_lat_span('x');
+----
+<REGEX>:.*No function matches.*fabricator_lat_span\(VARCHAR\).*
+
+statement ok
+DROP TABLE lat_pos;
