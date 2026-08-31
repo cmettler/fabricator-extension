@@ -479,7 +479,7 @@ query III
 SELECT parameter_types, varargs, function_type
 FROM duckdb_functions() WHERE function_name = 'fabricator_va_args';
 ----
-[VARCHAR]	ANY	table
+[VARCHAR, VARCHAR]	ANY	table
 
 # ---- a VARIADIC TAIL on a TABLE-IN-OUT function: it widens the ARGS BATCH, not the input stream ----
 #
@@ -494,7 +494,7 @@ FROM duckdb_functions() WHERE function_name = 'fabricator_va_args';
 query TT
 SELECT parameter_types, varargs FROM duckdb_functions() WHERE function_name = 'fabricator_inout_va';
 ----
-[TABLE, VARCHAR]	ANY
+[TABLE, VARCHAR, VARCHAR]	ANY
 
 # No tail arguments: the minimum arity is the declared prefix (the table + `label`).
 query IT
@@ -530,3 +530,57 @@ statement error
 SELECT * FROM fabricator_inout_va((SELECT 1 AS n));
 ----
 <REGEX>:.*(No function matches|Binder Error).*
+
+# ---- a NAMED parameter AFTER the tail: legal, and the one combination the marshals had never been asked
+#      for. The rule is "the tail is the last POSITIONAL parameter"; named parameters are a separate
+#      namespace, so they may follow. What has to be right is the INTERLEAVING: the tail consumes every
+#      remaining POSITIONAL value and the named one is matched BY NAME, not by the position it would
+#      otherwise have occupied. Both marshals do this in the same loop, which is why it was worth measuring
+#      rather than assuming — `positional_index` is set to the input width by the tail branch, and a named
+#      lookup that depended on it would read the wrong slot or none.
+#
+# TABLE function: the named value reaches Bind (it is appended to `label`) and is NOT mistaken for a tail
+# argument — the tail is exactly the two positional values.
+query IT
+SELECT ordinal, name FROM fabricator_va_args('demo', 42, 'hi', note := 'N') ORDER BY ordinal;
+----
+0	arg_0
+1	arg_1
+
+query T
+SELECT DISTINCT label FROM fabricator_va_args('demo', 42, note := 'N');
+----
+demo/N
+
+# Omitting it is the documented "omitted == explicit NULL", so the label is unchanged…
+query T
+SELECT DISTINCT label FROM fabricator_va_args('demo', 42);
+----
+demo
+
+# …and a call with NO named argument is byte-identical to what it was before the parameter existed, which is
+# the control: the tail must not have shifted.
+query IIT
+SELECT ordinal, name, value FROM fabricator_va_args('demo', 42, 'hi', TRUE) ORDER BY ordinal;
+----
+0	arg_0	42
+1	arg_1	hi
+2	arg_2	True
+
+# TABLE-IN-OUT: the other marshal, same question. Tail and named together, then each alone.
+query T
+SELECT DISTINCT tag FROM fabricator_inout_va((SELECT * FROM range(2) t(n)), 'base', 7, 'x', note := 'N');
+----
+base:7+x/N
+
+query T
+SELECT DISTINCT tag FROM fabricator_inout_va((SELECT * FROM range(2) t(n)), 'base', 7, 'x');
+----
+base:7+x
+
+# A named argument with NO tail arguments at all — the case where the tail branch consumes nothing and the
+# named lookup must still find its value.
+query T
+SELECT DISTINCT tag FROM fabricator_inout_va((SELECT 1 AS n), 'base', note := 'only_named');
+----
+base/only_named

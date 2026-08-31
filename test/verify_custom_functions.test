@@ -280,5 +280,109 @@ SELECT cdb.dbo.cf_va_sum(r, r * 2) FROM range(3) t(r) ORDER BY 1;
 3
 6
 
+# ---- VARIADIC tails on the ATTACH-TIME (catalog-bound) registration sites ----
+#
+# cf_va_sum above covers the catalog SCALAR path. These cover TABLE, SQLGEN and LATERAL. They add no
+# capability — each mirrors a load-time global that is already gated — and exist because each catalog path
+# has its OWN plumbing to fetch parameter styles and hand the tail's position to its marshal, so each is an
+# independent chance to have made the mistake the sqlgen path actually made (its info stored a FILTERED
+# declaration, so the varargs index did not correspond to the names it indexed, and it surfaced three layers
+# away as `ArgumentNullException: 'fields'`). A static audit cannot see that class of error.
+#
+# ⚠⚠ THE CATALOG TABLE-IN-OUT SECTION BELOW IS A REGRESSION GATE ON A PRE-EXISTING DEFECT THIS WORK FOUND.
+# CatalogFunctionSet.ParamSchema omitted in-out and collector, so the host's param-schema fetch yielded
+# nothing, GetOrCreateCustomInOutFunction caught the failure and fell back to the bare {TABLE} signature —
+# SILENTLY dropping the whole declaration. A [TableInput][Positional][VarArgs] in-out registered as `[TABLE]`,
+# losing its positional AND its tail, with NO error anywhere: the failed-crossing log was empty because
+# nothing failed, the fetch simply returned one parameter. The site's own comment had recorded the omission as
+# "right for every in-out shipped today" — accurate then, and a trap for the first one to declare a cost arg.
+# ⚠ The fix is behaviour-neutral for every other in-tree in-out/collector (they declare only their table
+# input, so the declaration produces exactly the `[TABLE]` the fallback produced), which is what made it safe.
+
+# TABLE: the registration carries the prefix and the tail separately...
+query TTT
+SELECT parameter_types, varargs, function_type
+FROM duckdb_functions() WHERE function_name = 'cf_va_rows';
+----
+[VARCHAR]	ANY	table
+
+# ...and the tail arrives with its own types preserved (an ANY tail inserts no cast).
+query TT
+SELECT name, value FROM cdb.dbo.cf_va_rows('L', 42, 'hi') ORDER BY name;
+----
+arg_0	42
+arg_1	hi
+
+query I
+SELECT count(*) FROM cdb.dbo.cf_va_rows('L');
+----
+0
+
+# SQLGEN: minimum arity zero (the tail is the only parameter), and the generated SQL's COLUMN COUNT is the
+# argument count — the shape a fixed signature cannot express.
+query TTT
+SELECT parameter_types, varargs, function_type
+FROM duckdb_functions() WHERE function_name = 'cf_va_select';
+----
+[]	BIGINT	table
+
+query III
+SELECT * FROM cdb.dbo.cf_va_select(1, 2, 3);
+----
+1	2	3
+
+query I
+SELECT count(*) FROM (DESCRIBE SELECT * FROM cdb.dbo.cf_va_select(4, 5));
+----
+2
+
+# LATERAL: here the tail is per-row WIRE data, not bind-time arguments — so the assertion that matters is the
+# tail supplied from COLUMNS in the correlated shape.
+query TT
+SELECT parameter_types, varargs FROM duckdb_functions() WHERE function_name = 'cf_va_span';
+----
+[BIGINT]	BIGINT
+
+statement ok
+CREATE TABLE cat_va_t(n BIGINT);
+
+statement ok
+INSERT INTO cat_va_t VALUES (3), (4);
+
+query II
+SELECT t.n, f.tail_sum FROM cat_va_t t, cdb.dbo.cf_va_span(t.n, t.n * 10, t.n * 100) f ORDER BY 1;
+----
+3	330
+4	440
+
+# No tail arguments at all is a legal call on the same declaration.
+query II
+SELECT t.n, f.tail_sum FROM cat_va_t t, cdb.dbo.cf_va_span(t.n) f ORDER BY 1;
+----
+3	0
+4	0
+
+statement ok
+DROP TABLE cat_va_t;
+
+# TABLE-IN-OUT: the registration must carry the {TABLE} slot, the positional prefix AND the tail. `[TABLE]`
+# alone is the defect's own signature, so this row is the regression gate.
+query TT
+SELECT parameter_types, varargs FROM duckdb_functions() WHERE function_name = 'cf_va_tag';
+----
+[TABLE, VARCHAR]	ANY
+
+# The tail is BIND-TIME data here — it widens the args batch, not the input stream — so the load-bearing
+# assertion is the row count: three input rows in, three out, with the tail changing only the tag.
+query IT
+SELECT count(*), min(tag) FROM cdb.dbo.cf_va_tag((SELECT * FROM range(3) t(n)), 'L', 1, 2);
+----
+3	L:1+2
+
+query T
+SELECT DISTINCT tag FROM cdb.dbo.cf_va_tag((SELECT * FROM range(2) t(n)), 'base');
+----
+base
+
 statement ok
 DETACH cdb;

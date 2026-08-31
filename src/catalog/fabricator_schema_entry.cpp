@@ -1982,8 +1982,12 @@ static void FabricatorBuildInOutSignature(const vector<string> &names, const vec
 			// `function.arguments` containing TABLE (which the {TABLE} slot supplies regardless of varargs),
 			// the subquery contributes LogicalTypeId::TABLE + an empty Value to the match, and every further
 			// argument is costed against `varargs` by BindVarArgsFunctionCost.
-			tf.varargs = (named_any_for_null && types[i].id() == LogicalTypeId::SQLNULL) ? LogicalType::ANY
-			                                                                            : types[i];
+			// ⚠ SQLNULL => ANY UNCONDITIONALLY, and NOT via `named_any_for_null`. That flag exists for
+			// NAMED parameters alone (its own comment says so); reusing it here made an ANY tail register as
+			// varargs = SQLNULL on the CATALOG path, which only a NULL literal casts to — so every real
+			// argument failed to bind while the GLOBAL path, which passes the flag true, worked. Found by
+			// the catalog-bound gate; the type sentinel is a property of the DECLARATION, not of the caller.
+			tf.varargs = FabricatorVarArgsType(types[i]);
 			break;
 		case FabricatorParamStyle::TABLE_INPUT:
 			// The DECLARED type (a struct of the expected input columns) is ours alone: DuckDB only ever

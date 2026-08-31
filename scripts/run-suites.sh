@@ -382,6 +382,11 @@ case "$TIER" in
         # survive a dangling buffer), plus a STRUCT and a LIST, all replicated across drain slices by a 1→N
         # fan-out; §14 executes a PREPARED statement twice, since the managed binding is reused across
         # executions while a session is per operator state.
+        # 8197 since 2026-08-31 (same day, fourth bump): a NAMED parameter AFTER the variadic tail --
+        # verify_global_functions 160 -> 178 (+18). The one combination the two marshals had never been asked
+        # for: the tail branch sets positional_index to the input width, so a named lookup that depended on it
+        # would read the wrong slot. It worked unchanged; the gate is what stops it being "wired and never
+        # exercised". From a green 74/74 run; 8179 + 18 = 8197 exactly. Supersedes:
         # 8179 since 2026-08-31 (same day, third bump): the VARIADIC tail extended to TABLE-IN-OUT --
         # verify_global_functions 145 -> 160 (+15). There the tail widens the ARGS BATCH, not the input
         # stream, so the load-bearing assertion is the ROW COUNT: 3 input rows in, 3 out. From a green 74/74
@@ -410,7 +415,7 @@ case "$TIER" in
         # ABI v80 scalar-bind commit took verify_global_functions 101 -> 118 and did not bump this floor, so
         # the tree ran 17 assertions above it for a day. Surfaced by the CDC slice's hermetic run coming out
         # at 8003 against a floor of 7986 and the delta not being attributable to the change under test.
-        : "${MIN_ASSERTIONS:=8179}"
+        : "${MIN_ASSERTIONS:=8197}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh
@@ -657,6 +662,17 @@ case "$TIER" in
         # /!\ The floor waits are not politeness: fn_cdc_get_min_lsn is transiently NULL for a newly enabled
         # instance (§1.6a) and that value IS the boundary, so without them the section intermittently gets
         # "the boundary ... is not established yet" instead of rows.
+        # 3056 since 2026-08-31 (same day, second bump): the ATTACH-TIME variadic coverage --
+        # verify_custom_functions 101 -> 134 (+33), covering all five catalog-bound kinds that take a tail
+        # (scalar / table / sqlgen / table-in-out / lateral). From a GREEN 54/54 run; 3023 + 33 = 3056
+        # exactly, which is the neutrality claim for the CatalogFunctionSet.ParamSchema change -- it now
+        # answers for in-out and collector, so EVERY catalog in-out's signature is built from its declaration
+        # instead of the bare {TABLE} fallback. verify_table_inout (63) and verify_collector (40) unmoved is
+        # what shows that was byte-neutral for the functions that declare only their table input.
+        # /!\ The coverage found TWO defects, which is why it was worth doing: the ParamSchema omission
+        # (pre-existing, silently dropped a catalog in-out's whole declaration) and an ANY tail registering as
+        # varargs = SQLNULL on the catalog path only (ours, hidden by the global path passing a flag).
+        # The 3023 note it supersedes:
         # 3023 since 2026-08-31: VARIADIC parameters (Params.VarArgs) -- verify_custom_functions 89 -> 101
         # (+12, the CATALOG-BOUND variadic scalar cf_va_sum, which is the attach-time registration site the
         # three global demos do not reach), from a GREEN 54/54 run. 3011 + 12 = 3023 exactly, so no other
@@ -668,7 +684,7 @@ case "$TIER" in
         # delta). verify_mssql_cdc went 476 -> 559 -> 604 -> 630 -> 725 across slice 9, slice 8b,
         # _changed_columns and the four user-requested items. A floor left below the actual silently
         # tolerates a regression that size.
-        : "${MIN_ASSERTIONS:=3023}"
+        : "${MIN_ASSERTIONS:=3056}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

@@ -1265,9 +1265,48 @@ every further argument is costed against `varargs`.
 
 **Still refused — AGGREGATES ALONE**, and for the standing reason: a `switch` with no VARARGS case does not
 ignore the declaration, it registers the tail as an ordinary `ANY` argument. Both aggregate registration
-sites call `FabricatorRefuseVarArgs`. That one is "unexamined", not "impossible": DuckDB's
-`AggregateFunction` carries the same `varargs` field, and what was never looked at is whether the
-state/update/combine marshal tolerates a per-call-site width.
+sites call `FabricatorRefuseVarArgs`.
+
+**⚠ ANALYSED 2026-08-31 (user-raised) AND DELIBERATELY NOT BUILT — it is the ONE kind that would need an ABI
+BUMP, which is what settles it.** Every other kind is no-bump because the callee can see the actual width:
+the args batch carries its own schema, or the lateral wire does. The aggregate crossing does neither.
+`BuildUpdateBatch` returns a BARE `ArrowArray` with no schema, and the managed side reconstructs it with
+`CArrowArrayImporter.ImportRecordBatch(batch, s.UpdateSchema)`, where `UpdateSchema` is
+`[state_id] ++ fn.Parameters.FieldsList` built ONCE in the `AggregateSession` constructor from the
+DECLARATION. A tail makes the actual batch wider than that schema, and `agg_open(handle, schema, func,
+*out_session)` has no argument that could carry the bound arity. Four sites, not two:
+
+1. `BuildFabricatorAggregateFunction` — split the tail from `sig_types`, set `fn.varargs` (as the scalar);
+2. `BuildUpdateBatch` — see the trap below;
+3. `AggregateSession.UpdateSchema` — must become per-call-site;
+4. `agg_open` — the ABI entry that has to carry it.
+
+`agg_combine` / `agg_finalize` carry no params and are unaffected; `agg_update_spill` calls the same
+`BuildUpdateBatch` and rides the same fix.
+
+**⚠⚠ THE TRAP WAITING AT `BuildUpdateBatch` FOR WHOEVER LIFTS THE REFUSAL, and it is the same
+declaration-vs-actual bug as the other marshals with a WORSE failure mode.** It loops `input_count` (the
+ACTUAL arity, from `AggregateInputData`) while indexing `bind.arg_types[i]` (the DECLARED vector):
+
+```cpp
+for (idx_t i = 0; i < input_count; i++) {
+    types.push_back(bind.arg_types[i]);      // OOB past the declaration -- garbage LogicalType
+}
+...
+batch.data[1 + i].Reference(inputs[i]);      // Reference with a mismatched type
+```
+
+Past the declaration that is an out-of-bounds `vector::operator[]`, and the garbage type then feeds a
+`Reference` — the `Vector::Reference used on vector of different type` INTERNAL error class, which
+INVALIDATES the database. **Unreachable today only because the refusal blocks it**, which is why it is
+documented rather than guarded: a defensive check on an unreachable path is untestable, and this note is
+what makes the path safe to open later.
+
+**⚠ And a signal worth weighing before starting: DuckDB ships ZERO variadic aggregates** — 43 scalar, 4
+table, 0 aggregate (`SELECT function_type, count(*) FROM duckdb_functions() WHERE varargs IS NOT NULL GROUP
+BY 1`). `BindFunctionCost` is shared so it probably binds, but we would be the FIRST user of that binder
+path. ⇒ highest cost of any kind, weakest payoff (a homogeneous aggregate over N values is what a `LIST`
+argument already does well). The honest refusal is the better trade.
 
 ⚠ For a GLOBAL declaration the throw is caught by the registration loop's own `continue` — the standing
 policy that one bad declaration must not fail extension load — so the function is ABSENT rather than
@@ -1296,6 +1335,8 @@ mixes types at the call site for that reason.
 | `fabricator_lat_front(fields, n)` | lateral, constant FIRST | load-time global | `verify_lateral` 247 → **285** |
 | `fabricator_lat_span(fields, n, …extra)` | lateral, `[CONST][POS][TAIL]` | load-time global | (same suite) |
 | `fabricator_inout_va(<table>, label, …extra)` | table-in-out, ARGS-batch tail | load-time global | `verify_global_functions` 145 → **160** |
+| a NAMED parameter AFTER the tail (both marshals) | table + in-out | load-time global | `verify_global_functions` 160 → **178** |
+| `cf_va_rows` / `cf_va_select` / `cf_va_tag` / `cf_va_span` | table / sqlgen / in-out / lateral | **attach-time catalog** | `verify_custom_functions` 101 → **134** |
 
 **The load-bearing assertion in each is the SIGNATURE from `duckdb_functions()`**, not the rows: an
 implementation reading its args batch positionally would produce identical rows for a fixed-arity
@@ -1305,6 +1346,45 @@ N arguments".
 ⚠ `cf_va_sum` exists because **a declaration form that only ever ships GLOBAL looks covered while the
 ATTACH-TIME registration path is untested** — the same gap the catalog-views work had to close. It is a
 second registration site (`GetOrCreateScalarFunction`), not a second spelling.
+
+### 13.8 The attach-time coverage found TWO defects — which is the argument for having done it
+
+Finishing that coverage for the other four catalog kinds (2026-08-31, user-directed) was framed as
+completeness. It was not: **one kind was broken on the catalog site while working on the global one**, which
+is the exact shape a per-site gate exists to catch, and no amount of reading found it.
+
+**Defect 1 — PRE-EXISTING, and its own comment had predicted it.** `CatalogFunctionSet.ParamSchema` omitted
+in-out and collector, so the host's param-schema fetch yielded nothing, `GetOrCreateCustomInOutFunction`
+caught the failure and fell back to the bare `{TABLE}` signature — **silently dropping the whole
+declaration**. A `[TableInput][Positional][VarArgs]` in-out registered as `[TABLE]`, losing its positional
+*and* its tail. The site's note read *"right for every in-out shipped today (none declares a cost arg on a
+CATALOG) and would silently drop one that did. Left alone"* — accurate when written, and a trap for the first
+function to declare one. Fixed by adding `TryInOut`/`TryCollector`.
+- ⚠ **It presented with NO error and NO failed crossing.** My first diagnosis was "the `catch` swallowed a
+  throw"; the bridge's failed-crossing log was EMPTY, because nothing threw — the fetch simply returned one
+  parameter. (A stale append-mode `FABRICATOR_LOG_FILE` from a previous session nearly sent that the wrong
+  way too: its `GetFunctionParamSchema failed: 'fields'` lines were from July.)
+- ⚠ Safe to change only because it is **behaviour-neutral in-tree**: all three catalog in-outs and the one
+  catalog collector declare ONLY their table input, so the declaration produces exactly the `[TABLE]` the
+  fallback produced. Proven by `verify_table_inout` (63) and `verify_collector` (40) unmoved and the service
+  tier landing at 3023 + 33 exactly — not by inspection.
+
+**Defect 2 — OURS, in the new varargs code, and hidden by the global path.** With defect 1 fixed, `varargs`
+came back as `"NULL"` — `SQLNULL` rendered, not absence. The in-out signature case decided the SQLNULL→ANY
+mapping through `named_any_for_null`:
+
+```cpp
+tf.varargs = (named_any_for_null && types[i].id() == SQLNULL) ? ANY : types[i];   // WRONG
+```
+
+That flag exists for **named parameters alone** (its own comment says so). The catalog path passes it
+`false`, so an ANY tail registered as `varargs = SQLNULL`, which only a NULL literal casts to — every real
+argument failed to bind. **The global path passes it `true`, which is why `fabricator_inout_va` worked and
+concealed it completely.** Now `FabricatorVarArgsType(types[i])`, unconditional: the sentinel is a property
+of the DECLARATION, not of the caller.
+
+⇒ **the transferable rule: a shared helper reached through two call sites with different flag values is two
+code paths, and gating one of them is gating one of them.**
 
 ⚠ **One gate assertion is written against behaviour that is NOT ours and looks wrong**: the lateral suite
 asserts the candidate DuckDB actually prints for a failed variadic TABLE-function call

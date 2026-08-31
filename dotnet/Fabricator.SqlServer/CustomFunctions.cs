@@ -208,6 +208,7 @@ internal static class CustomFunctions
     {
         new CfRangeFunction(),
         new CfColumnsFunction(),
+        new CfVaRowsFunction(),      // VARIADIC tail on the attach-time TABLE path
     };
 
     // Custom table-in-out functions (ICatalogInOutFunction), singletons — surfaced as `kind='inout'` and
@@ -222,6 +223,7 @@ internal static class CustomFunctions
     public static readonly IReadOnlyList<ICatalogSqlTableFunction> SqlTable = new ICatalogSqlTableFunction[]
     {
         new CfUnionByPatternFunction(),
+        new CfVaSelectFunction(),    // VARIADIC tail on the attach-time SQLGEN path
     };
 
     public static readonly IReadOnlyList<ICatalogInOutFunction> InOut = new ICatalogInOutFunction[]
@@ -229,6 +231,11 @@ internal static class CustomFunctions
         new CfTagFunction(),
         new CfRunningSumFunction(),
         new CfExchangeFunction(),
+        // ⚠ The FIRST catalog-bound in-out to declare a cost argument, and it did not work when it was
+        // written: CatalogFunctionSet.ParamSchema omitted in-out/collector, so the host fell back to the bare
+        // {TABLE} signature and SILENTLY dropped both the positional and the tail. Fixed at that site the
+        // same day; this demo is what found it and is the gate that keeps it fixed.
+        new CfVaTagFunction(),
     };
 
     // Catalog-bound row-mapped (correlated LATERAL) functions (ICatalogLateralFunction), singletons —
@@ -236,6 +243,7 @@ internal static class CustomFunctions
     public static readonly IReadOnlyList<ICatalogLateralFunction> Lateral = new ICatalogLateralFunction[]
     {
         new CfLatSplitFunction(),
+        new CfVaSpanFunction(),      // VARIADIC tail on the attach-time LATERAL path
     };
 
     // Aggregate functions (UDAF). The function object is a singleton; CreateState() mints the per-group
@@ -2152,6 +2160,11 @@ internal sealed class GfVaArgsFunction : ITableFunction
     {
         Params.Positional("label", StringType.Default),
         Params.VarArgs("arg"),
+        // ⚠ A NAMED parameter AFTER the tail — legal, and the ordering under test. The tail must be the last
+        // POSITIONAL parameter; named parameters are a separate namespace, so they may follow. The marshal
+        // has to interleave them correctly: the tail consumes every remaining POSITIONAL value, and the
+        // named one is then matched BY NAME rather than by the position it would otherwise have had.
+        Params.Named("note", StringType.Default),
     }, metadata: null);
 
     public ITableFunctionBinding Bind(RecordBatch args)
@@ -2160,13 +2173,22 @@ internal sealed class GfVaArgsFunction : ITableFunction
             ? l.GetString(0)
             : string.Empty;
         var rows = new List<(int Ordinal, string Name, string Type, string? Value)>();
+        string? note = null;
         for (int c = 1; c < args.ColumnCount; c++)
         {
             var col = args.Column(c);
-            rows.Add((c - 1, args.Schema.FieldsList[c].Name, col.Data.DataType.Name,
+            var name = args.Schema.FieldsList[c].Name;
+            // The NAMED parameter arrives under its own name; the tail columns under `<tail>_<k>`. Reading
+            // by name is what keeps the two apart without counting positions.
+            if (string.Equals(name, "note", System.StringComparison.OrdinalIgnoreCase))
+            {
+                note = VaRender.Text(ArrowValueReader.ReadScalar(col, 0));
+                continue;
+            }
+            rows.Add((rows.Count, name, col.Data.DataType.Name,
                       VaRender.Text(ArrowValueReader.ReadScalar(col, 0))));
         }
-        return new Binding(label, rows);
+        return new Binding(note is null ? label : label + "/" + note, rows);
     }
 
     private sealed class Binding : ITableFunctionBinding
@@ -2537,6 +2559,7 @@ internal sealed class GfInOutVaFunction : IInOutFunction
         Params.TableInput("input", new Field("n", Int32Type.Default, nullable: true)),
         Params.Positional("label", StringType.Default),
         Params.VarArgs("extra"), // ANY tail: heterogeneous bind-time arguments
+        Params.Named("note", StringType.Default), // NAMED after the tail — a separate namespace, so legal
     }, metadata: null);
 
     public IInOutFunctionBinding Bind(RecordBatch? args, Schema inputSchema)
@@ -2544,6 +2567,7 @@ internal sealed class GfInOutVaFunction : IInOutFunction
         // Read the tail from the BATCH, by the host's `<tail>_<k>` naming — the count is a property of the
         // call, not of the declaration.
         string label = "";
+        string? note = null;
         var extras = new List<string>();
         for (int c = 0; args is not null && c < args.ColumnCount; c++)
         {
@@ -2553,12 +2577,17 @@ internal sealed class GfInOutVaFunction : IInOutFunction
             {
                 label = VaRender.Text(v) ?? "";
             }
+            else if (string.Equals(name, "note", System.StringComparison.OrdinalIgnoreCase))
+            {
+                note = VaRender.Text(v);
+            }
             else if (name.StartsWith("extra_", System.StringComparison.Ordinal))
             {
                 extras.Add(VaRender.Text(v) ?? "NULL");
             }
         }
-        return new Binding(extras.Count == 0 ? label : label + ":" + string.Join("+", extras));
+        var tag = extras.Count == 0 ? label : label + ":" + string.Join("+", extras);
+        return new Binding(note is null ? tag : tag + "/" + note);
     }
 
     private sealed class Binding : IInOutFunctionBinding
@@ -2585,6 +2614,250 @@ internal sealed class GfInOutVaFunction : IInOutFunction
                     // produced -- `range(2)` is BIGINT where the declaration says INTEGER. A hard cast here
                     // is the shape that makes an in-out demo look broken on the most obvious call a user
                     // writes.
+                    var col = chunk.Column(0);
+                    int rows = chunk.Length;
+                    var nb = new Int64Array.Builder().Reserve(rows);
+                    var tb = new StringArray.Builder().Reserve(rows);
+                    for (int i = 0; i < rows; i++)
+                    {
+                        var v = ArrowValueReader.ReadScalar(col, i);
+                        if (v is null) { nb.AppendNull(); } else { nb.Append(System.Convert.ToInt64(v)); }
+                        tb.Append(_tag);
+                    }
+                    yield return new RecordBatch(OutputSchema, new IArrowArray[] { nb.Build(), tb.Build() }, rows);
+                }
+                yield return InOutExchange.EmptyBatch(OutputSchema); // per-input sentinel
+            }
+        }
+
+        public void Dispose() { }
+    }
+}
+
+// =============================================================================
+// VARIADIC tails on the ATTACH-TIME (catalog-bound) registration sites.
+//
+// The four demos below exist for coverage, not capability: every one mirrors a load-time global that is
+// already gated, and they run through the SAME helpers. What they exercise is the OTHER registration site.
+// Each catalog path has its own plumbing to fetch parameter styles and hand the tail's position to its
+// marshal, so each is an independent chance to have made the mistake the sqlgen path actually made — there
+// the info stored a FILTERED declaration, so the varargs index did not correspond to the names it indexed,
+// and it surfaced three layers away as `ArgumentNullException: 'fields'`. A static audit cannot see that.
+//
+// With these, all five catalog kinds that take a tail are covered: scalar (cf_va_sum), table, sqlgen,
+// table-in-out and lateral.
+// =============================================================================
+
+/// <summary><c>db.dbo.cf_va_rows(label, …)</c> — the catalog TABLE path: one row per tail argument.</summary>
+internal sealed class CfVaRowsFunction : ICatalogTableFunction
+{
+    public string SchemaName => "dbo";
+    public string Name => "cf_va_rows";
+
+    public Schema Parameters => new(new[]
+    {
+        Params.Positional("label", StringType.Default),
+        Params.VarArgs("arg"),
+    }, metadata: null);
+
+    public ITableFunctionBinding Bind(RecordBatch args)
+    {
+        var label = args.ColumnCount > 0 && args.Column(0) is StringArray l && !l.IsNull(0)
+            ? l.GetString(0)
+            : string.Empty;
+        var rows = new List<(string Name, string? Value)>();
+        for (int c = 1; c < args.ColumnCount; c++)
+        {
+            rows.Add((args.Schema.FieldsList[c].Name,
+                      VaRender.Text(ArrowValueReader.ReadScalar(args.Column(c), 0))));
+        }
+        return new Binding(label, rows);
+    }
+
+    private sealed class Binding : ITableFunctionBinding
+    {
+        private readonly string _label;
+        private readonly List<(string Name, string? Value)> _rows;
+
+        public Binding(string label, List<(string Name, string? Value)> rows)
+        {
+            _label = label;
+            _rows = rows;
+        }
+
+        public Schema OutputSchema => new(new[]
+        {
+            new Field("label", StringType.Default, nullable: false),
+            new Field("name", StringType.Default, nullable: false),
+            new Field("value", StringType.Default, nullable: true),
+        }, metadata: null);
+
+        public bool SupportsFilterPushdown => false;
+        public bool SupportsProjectionPushdown => false;
+
+        public IAsyncEnumerable<RecordBatch> Execute(TableFunctionScan scan, CancellationToken ct = default)
+        {
+            scan.FilterValues?.Dispose(); // eager dispose, then delegate — see StaticTableFunction.Execute
+            return Rows(ct);
+        }
+
+        private async IAsyncEnumerable<RecordBatch> Rows([EnumeratorCancellation] CancellationToken ct)
+        {
+            await Task.CompletedTask;
+            var label = new StringArray.Builder().Reserve(_rows.Count);
+            var name = new StringArray.Builder().Reserve(_rows.Count);
+            var value = new StringArray.Builder().Reserve(_rows.Count);
+            foreach (var r in _rows)
+            {
+                label.Append(_label);
+                name.Append(r.Name);
+                if (r.Value is null) { value.AppendNull(); } else { value.Append(r.Value); }
+            }
+            yield return new RecordBatch(OutputSchema,
+                                         new IArrowArray[] { label.Build(), name.Build(), value.Build() },
+                                         _rows.Count);
+        }
+
+        public void Dispose() { }
+    }
+}
+
+/// <summary><c>db.dbo.cf_va_select(…)</c> — the catalog SQLGEN path: the generated SQL's column count is the
+/// argument count. ⚠ The catalog generator's `GenerateSql` also receives the ATTACH alias; this one does not
+/// need it, which keeps the demo about the tail.</summary>
+internal sealed class CfVaSelectFunction : ICatalogSqlTableFunction
+{
+    public string SchemaName => "dbo";
+    public string Name => "cf_va_select";
+
+    public Schema Parameters => new(new[] { Params.VarArgs("v", Int64Type.Default) }, metadata: null);
+
+    public string GenerateSql(SqlGenContext ctx, RecordBatch args)
+    {
+        if (args is null || args.ColumnCount == 0)
+        {
+            throw new ArgumentException("cf_va_select: pass at least one value");
+        }
+        var cols = new List<string>();
+        for (int c = 0; c < args.ColumnCount; c++)
+        {
+            // A CONCRETE BIGINT tail, so every value is an int64 by the time it arrives — no literal
+            // rendering allow-list is needed here (the global fabricator_va_values covers that question).
+            var v = ArrowValueReader.ReadScalar(args.Column(c), 0);
+            cols.Add((v is null ? "NULL" : System.Convert.ToInt64(v).ToString(
+                          System.Globalization.CultureInfo.InvariantCulture)) + " AS v" + c);
+        }
+        return "SELECT " + string.Join(", ", cols);
+    }
+}
+
+/// <summary><c>db.dbo.cf_va_span(n, …extra)</c> — the catalog LATERAL path: the tail is per-row WIRE data
+/// here, not bind-time arguments. 1:1 with the input rows.</summary>
+internal sealed class CfVaSpanFunction : ICatalogLateralFunction
+{
+    public string SchemaName => "dbo";
+    public string Name => "cf_va_span";
+
+    public Schema Parameters => new(new[]
+    {
+        Params.Positional("n", Int64Type.Default),
+        Params.VarArgs("extra", Int64Type.Default),
+    }, metadata: null);
+
+    public ILateralFunctionBinding Bind(RecordBatch? args, Schema inputSchema) => new Binding();
+
+    private sealed class Binding : ILateralFunctionBinding
+    {
+        public Schema OutputSchema => new(new[]
+        {
+            new Field("n", Int64Type.Default, nullable: true),
+            new Field("tail_sum", Int64Type.Default, nullable: false),
+        }, metadata: null);
+
+        public ILateralSession Open() => new Session(OutputSchema);
+
+        public void Dispose() { }
+    }
+
+    private sealed class Session : ILateralSession
+    {
+        private readonly Schema _output;
+
+        public Session(Schema output) => _output = output;
+
+        public LateralResult Call(RecordBatch input)
+        {
+            var n = (Int64Array)input.Column(0);
+            var nb = new Int64Array.Builder().Reserve(input.Length);
+            var sb = new Int64Array.Builder().Reserve(input.Length);
+            for (int r = 0; r < input.Length; r++)
+            {
+                if (n.IsNull(r)) { nb.AppendNull(); } else { nb.Append(n.Values[r]); }
+                long acc = 0;
+                // Columns 1.. are the tail — its width is a property of the CALL, read from the batch.
+                for (int c = 1; c < input.ColumnCount; c++)
+                {
+                    if (input.Column(c) is Int64Array v && !v.IsNull(r)) { acc += v.Values[r]; }
+                }
+                sb.Append(acc);
+            }
+            return new LateralResult(new RecordBatch(_output, new IArrowArray[] { nb.Build(), sb.Build() },
+                                                     input.Length)); // 1:1, no provenance
+        }
+
+        public void Dispose() { }
+    }
+}
+
+/// <summary><c>db.dbo.cf_va_tag(&lt;table&gt;, label, …)</c> — the catalog TABLE-IN-OUT path. Implements
+/// <see cref="ICatalogInOutFunction"/> directly rather than the <c>StaticInOutFunction</c> base, because that
+/// base composes <c>Parameters</c> itself (table input ++ named) and so cannot carry a tail.</summary>
+internal sealed class CfVaTagFunction : ICatalogInOutFunction
+{
+    public string SchemaName => "dbo";
+    public string Name => "cf_va_tag";
+
+    public Schema Parameters => new(new[]
+    {
+        Params.TableInput("input", new Field("n", Int32Type.Default, nullable: true)),
+        Params.Positional("label", StringType.Default),
+        Params.VarArgs("extra"),
+    }, metadata: null);
+
+    public IInOutFunctionBinding Bind(RecordBatch? args, Schema inputSchema)
+    {
+        string label = "";
+        var extras = new List<string>();
+        for (int c = 0; args is not null && c < args.ColumnCount; c++)
+        {
+            var name = args.Schema.FieldsList[c].Name;
+            var v = VaRender.Text(ArrowValueReader.ReadScalar(args.Column(c), 0));
+            if (string.Equals(name, "label", System.StringComparison.OrdinalIgnoreCase)) { label = v ?? ""; }
+            else if (name.StartsWith("extra_", System.StringComparison.Ordinal)) { extras.Add(v ?? "NULL"); }
+        }
+        return new Binding(extras.Count == 0 ? label : label + ":" + string.Join("+", extras));
+    }
+
+    private sealed class Binding : IInOutFunctionBinding
+    {
+        private readonly string _tag;
+
+        public Binding(string tag) => _tag = tag;
+
+        public Schema OutputSchema => new(new[]
+        {
+            new Field("n", Int64Type.Default, nullable: true),
+            new Field("tag", StringType.Default, nullable: false),
+        }, metadata: null);
+
+        public async IAsyncEnumerable<RecordBatch> DoExchange(
+            IAsyncEnumerable<RecordBatch> input, [EnumeratorCancellation] CancellationToken ct = default)
+        {
+            await foreach (var chunk in input.WithCancellation(ct))
+            {
+                using (chunk)
+                {
+                    // Generic read: a TableInput's declared columns are recorded, not enforced.
                     var col = chunk.Column(0);
                     int rows = chunk.Length;
                     var nb = new Int64Array.Builder().Reserve(rows);

@@ -209,12 +209,21 @@ public sealed class CatalogFunctionSet
         // without this the host resolves no signature and the declaration silently never becomes a callable
         // function (measured — `fabricator_functions()` listed it and `db.dbo.fn(...)` said "does not exist").
         //
-        // ⚠ In-out and collector are NOT in this list, and that is pre-existing rather than deliberate:
-        // GetOrCreateCustomInOutFunction catches the resulting failure and falls back to the bare {TABLE}
-        // signature, which is right for every in-out shipped today (none declares a cost arg on a CATALOG) and
-        // would silently drop one that did. Left alone — adding them here would change how every existing
-        // in-out's signature is built, which is not this change's business.
         if (TryLateral(schema, func, out var l)) { return l.Parameters; }
+        // ⚠ IN-OUT AND COLLECTOR ADDED 2026-08-31, and this list's own comment used to explain why they were
+        // NOT here: the omission meant the host's param-schema fetch yielded nothing, so
+        // GetOrCreateCustomInOutFunction fell back to the bare {TABLE} signature and SILENTLY DROPPED any
+        // declared cost argument. The old note called that "right for every in-out shipped today (none
+        // declares a cost arg on a CATALOG)" and left it alone — accurate then, and a latent trap: the first
+        // catalog in-out to declare one gets a signature missing both it and every positional beside it, with
+        // NO error anywhere (measured: a [TableInput][Positional][VarArgs] declaration registered as
+        // `[TABLE]`, and the failed-crossing log was EMPTY because nothing failed — the fetch simply returned
+        // one parameter).
+        // ⚠ Behaviour-neutral for everything in-tree, which is what made it safe to change: all three catalog
+        // in-outs and the one catalog collector declare ONLY their table input, so the declaration produces
+        // exactly the `[TABLE]` the fallback produced. Proven by the service tier, not by inspection.
+        if (TryInOut(schema, func, out var io)) { return io.Parameters; }
+        if (TryCollector(schema, func, out var co)) { return co.Parameters; }
         return null;
     }
 
