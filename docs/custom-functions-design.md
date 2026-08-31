@@ -1322,6 +1322,28 @@ would fail forever against something we do not control.
 | 3 — tail columns named `arg<i>` instead of `<tail>_<k>` | the same rows, on the NAME column | 130 pass |
 | 4 — `tf.varargs` never set on a generator | the variadic generator's first call | 60 pass |
 
+**Four more for the LATERAL and IN-OUT extensions, all killed:**
+
+| mutant | dies at | after |
+|---|---|---|
+| 5 — `tf.varargs` never set on a lateral | the `duckdb_functions()` signature row | 264 pass |
+| 6 — no tail-type normalization for slots PAST the declaration | the first multi-tail call | 270 pass |
+| 7 — `tf.varargs` never set on an in-out | the signature row | 146 pass |
+| 8 — the in-out marshal has no tail branch | the NO-TAIL call | 147 pass |
+
+**⚠ MUTANT 6 WAS EXPECTED TO SURVIVE AND DID NOT.** The reasoning was that `LateralSession::Call` casts at
+the seam, so a mis-normalized slot type would be corrected before the callee sees it. It is not: the
+declaration also reaches the managed bind as `inputSchema`, and the callee reads its tail from there. An
+untested prediction about which of two redundant-looking guards matters is worth one build to settle.
+
+**⚠ MUTANT 8 HAS TWO DISTINCT FAILURE MODES, and the gate trips on the one that was NOT predicted first.**
+With no tail arguments the tail field falls through to the positional branch, takes `Value(declared)` — a
+SQLNULL for an ANY tail — and marshals as a null-typed Arrow column, which Apache.Arrow refuses:
+*"Length must equal null count"*, LOUD. With tail arguments it is the predicted SILENT DROP — exit 0, right
+row count, `base` where `base:7+x+True` was written. **Both assertions kill it independently** (measured by
+running the mutant's two calls directly), so the coverage is stronger than the single kill line suggests;
+the earlier one simply reports first.
+
 **⚠ THE FIRST MUTATION RUN WAS VOID AND REPORTED ALL FOUR AS SURVIVORS.** It drove the build from a bash
 script via `cmd /c`, which MSYS rewrites into a path — `cmd` then starts INTERACTIVELY, reads EOF and exits
 **0** having built nothing, so each "mutant" was the clean binary tested again. The tell is a bare
