@@ -649,12 +649,18 @@ case "$TIER" in
         # /!\ The floor waits are not politeness: fn_cdc_get_min_lsn is transiently NULL for a newly enabled
         # instance (§1.6a) and that value IS the boundary, so without them the section intermittently gets
         # "the boundary ... is not established yet" instead of rows.
+        # 3023 since 2026-08-31: VARIADIC parameters (Params.VarArgs) -- verify_custom_functions 89 -> 101
+        # (+12, the CATALOG-BOUND variadic scalar cf_va_sum, which is the attach-time registration site the
+        # three global demos do not reach), from a GREEN 54/54 run. 3011 + 12 = 3023 exactly, so no other
+        # suite moved. /!\ Its own commit, not the feature's: that tier was still running when the feature
+        # was committed, and a total from a run with any failure in it is not a floor candidate at all.
+        # The 3011 note it supersedes:
         # /!\ From a GREEN RUN (54/54 - 2992), never from arithmetic - the arithmetic only CORROBORATES it
         # afterwards, and that is what shows no OTHER suite moved (2897 + 95 = 2992, the CDC suite's whole
         # delta). verify_mssql_cdc went 476 -> 559 -> 604 -> 630 -> 725 across slice 9, slice 8b,
         # _changed_columns and the four user-requested items. A floor left below the actual silently
         # tolerates a regression that size.
-        : "${MIN_ASSERTIONS:=3011}"
+        : "${MIN_ASSERTIONS:=3023}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2
