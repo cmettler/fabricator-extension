@@ -2739,18 +2739,18 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         // Functions set still does not carry — it captures ATTACH context (Fabric workspace/item/credential),
         // not a connection. Same "match the name first" pattern the DAX provider uses for daxeval.
         sb.Append(" UNION ALL SELECT 'dbo', '").Append(Esc(SqlServerSessionTagFunction.FunctionName))
-          .Append("', 'table', 2, ''");
+          .Append("', 'table', 2, '', ''");
         foreach (var d in Functions.Declarations(ExpandAllSchemas))
         {
             sb.Append(" UNION ALL SELECT '").Append(Esc(d.SchemaName)).Append("', '").Append(Esc(d.Name))
               .Append("', '").Append(Esc(d.Kind)).Append("', ").Append(d.ParamCount).Append(", '")
-              .Append(Esc(d.ReturnType)).Append('\'');
+              .Append(Esc(d.ReturnType)).Append("', '").Append(Esc(d.VarArgs)).Append('\'');
         }
         return sb.ToString();
     }
 
     // Discovered routines (user scalar/table functions + procedures), uniform shape
-    // (schema_name, name, kind, param_count, return_type). For scalar functions the
+    // (schema_name, name, kind, param_count, return_type, varargs). For scalar functions the
     // return value is sys.parameters.parameter_id = 0; input params are parameter_id > 0.
     private const string FunctionsSql =
         "SELECT s.name AS schema_name, o.name AS name, " +
@@ -2759,7 +2759,11 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         "WHEN 'P' THEN 'proc' WHEN 'PC' THEN 'proc' ELSE 'other' END AS kind, " +
         "(SELECT COUNT(*) FROM sys.parameters p WHERE p.object_id = o.object_id AND p.parameter_id > 0) AS param_count, " +
         "ISNULL((SELECT t.name FROM sys.parameters p JOIN sys.types t ON p.user_type_id = t.user_type_id " +
-        "WHERE p.object_id = o.object_id AND p.parameter_id = 0), '') AS return_type " +
+        "WHERE p.object_id = o.object_id AND p.parameter_id = 0), '') AS return_type, " +
+        // A discovered SQL routine is never variadic -- T-SQL has no varargs -- so this is a literal ''.
+        // It exists so every branch of this UNION ALL (and the C#-appended declaration rows) share one
+        // six-column shape, which is also the schema fabricator_functions() reports.
+        "'' AS varargs " +
         "FROM sys.objects o JOIN sys.schemas s ON o.schema_id = s.schema_id " +
         "WHERE o.type IN ('FN','FS','IF','TF','FT','P','PC') AND o.is_ms_shipped = 0 " +
         // THIS PROVIDER'S per-row form. A discovered TVF or proc also gets `<name>_each`, which applies it
@@ -2770,7 +2774,7 @@ public sealed partial class SqlServerCatalog : IBackendCatalog
         // Only routines that TAKE parameters get one — there is nothing to apply per input row otherwise.
         "UNION ALL " +
         "SELECT s.name AS schema_name, o.name + '_each' AS name, 'inout' AS kind, 0 AS param_count, " +
-        "'' AS return_type " +
+        "'' AS return_type, '' AS varargs " +
         "FROM sys.objects o JOIN sys.schemas s ON o.schema_id = s.schema_id " +
         "WHERE o.type IN ('IF','TF','FT','P','PC') AND o.is_ms_shipped = 0 " +
         "AND EXISTS (SELECT 1 FROM sys.parameters p WHERE p.object_id = o.object_id AND p.parameter_id > 0) " +

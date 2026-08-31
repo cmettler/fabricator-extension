@@ -353,10 +353,36 @@ public static class Params
     /// input, so the number keeps meaning "arguments you pass a value for". A table-in-out function taking
     /// only its input table therefore reports 0, not 1.
     /// </summary>
-    /// <remarks>Derived, never stored — a hand-maintained count is exactly the kind of number that drifts
-    /// from the schema it describes.</remarks>
+    /// <remarks>
+    /// <para>Derived, never stored — a hand-maintained count is exactly the kind of number that drifts from
+    /// the schema it describes.</para>
+    /// <para>⚠ The VARIADIC TAIL is excluded too, so for a variadic function this is the MINIMUM arity and
+    /// must be read beside <see cref="VarArgsTypeName"/>. Counting it produced a number that was neither the
+    /// minimum nor the maximum — `f(label, …)` reported 2 while accepting one argument or twenty — and it
+    /// looked exactly like an exact arity. Mirrors DuckDB's own split: `duckdb_functions().parameters` is the
+    /// fixed prefix and `varargs` is reported separately.</para>
+    /// </remarks>
     public static int DeclaredCount(Schema parameters) =>
-        parameters.FieldsList.Count(f => StyleOf(f) != ParamStyle.TableInput);
+        parameters.FieldsList.Count(f => StyleOf(f) is not (ParamStyle.TableInput or ParamStyle.VarArgs));
+
+    /// <summary>
+    /// The tail's type as <c>fabricator_functions()</c> reports it — EMPTY when the function is not variadic,
+    /// which is what makes the column readable as "is this variadic, and of what".
+    /// </summary>
+    /// <remarks>
+    /// ⚠ An ANY tail is declared as the Arrow null type, whose own <c>Name</c> is <c>"null"</c> — reported
+    /// verbatim that would read as "no varargs", i.e. the opposite of the truth. It is rendered
+    /// <c>"any"</c>, which is also what the host registers it as (<c>LogicalType::ANY</c>).
+    /// </remarks>
+    public static string VarArgsTypeName(Schema parameters)
+    {
+        var tail = VarArgsField(parameters);
+        if (tail is null)
+        {
+            return string.Empty;
+        }
+        return tail.DataType is NullType ? "any" : tail.DataType.Name;
+    }
 
     private static IReadOnlyDictionary<string, string> Meta(string style) =>
         new Dictionary<string, string> { [StyleKey] = style };

@@ -28,22 +28,25 @@ public static class FunctionsMetadata
 {
     /// <summary>One declaration row: which schema it binds into, its name, and its host registration kind.</summary>
     /// <remarks>
-    /// <see cref="ParamCount"/> and <see cref="ReturnType"/> are NOT part of the three columns this class
-    /// streams — the host ignores them. They exist because the SQL-Server catalog assembles the SAME
-    /// declarations as a T-SQL <c>UNION ALL</c> against its discovered routines, whose shape is five columns
-    /// wide, so every branch must supply all five. Carrying them here is what lets ONE producer
-    /// (<see cref="CatalogFunctionSet.Declarations"/>) feed both the in-memory stream and that SQL.
+    /// <para>⚠ This stream used to carry only the first THREE columns while the SQL-Server catalog assembled
+    /// the same declarations as a five-column T-SQL <c>UNION ALL</c> — so <c>fabricator_functions()</c>
+    /// reported <c>param_count</c> and <c>return_type</c> on a SQL Server catalog and NOT on a Delta / DAX /
+    /// delta-rs one, for the same declarations. The host reads only the first three either way
+    /// (<c>DiscoverFunctions</c>), and the user-facing view takes its schema FROM the stream
+    /// (<c>PopulateReturnSchema</c>), which is what made the divergence invisible from the C++ side.
+    /// Widened to the full shape 2026-08-31 while adding <see cref="VarArgs"/>.</para>
     /// </remarks>
     public readonly struct Declaration
     {
         public Declaration(string schemaName, string name, string kind, int paramCount = 0,
-                           string returnType = "")
+                           string returnType = "", string varArgs = "")
         {
             SchemaName = schemaName;
             Name = name;
             Kind = kind;
             ParamCount = paramCount;
             ReturnType = returnType;
+            VarArgs = varArgs;
         }
 
         public string SchemaName { get; }
@@ -55,6 +58,13 @@ public static class FunctionsMetadata
 
         /// <summary>Arrow type name of a scalar/aggregate result; empty for every other kind.</summary>
         public string ReturnType { get; }
+
+        /// <summary>
+        /// The VARIADIC TAIL's type, or empty when the function is not variadic — which is what makes
+        /// <see cref="ParamCount"/> readable: beside a non-empty value here it is a MINIMUM, not an exact
+        /// arity. Mirrors <c>duckdb_functions().varargs</c>.
+        /// </summary>
+        public string VarArgs { get; }
     }
 
     /// <summary>The Arrow schema of the kind-6 stream, in the host's column order.</summary>
@@ -62,6 +72,9 @@ public static class FunctionsMetadata
         .Field(new Field("schema_name", StringType.Default, nullable: true))
         .Field(new Field("name", StringType.Default, nullable: true))
         .Field(new Field("kind", StringType.Default, nullable: true))
+        .Field(new Field("param_count", Int32Type.Default, nullable: true))
+        .Field(new Field("return_type", StringType.Default, nullable: true))
+        .Field(new Field("varargs", StringType.Default, nullable: true))
         .Build();
 
     /// <summary>
@@ -75,20 +88,31 @@ public static class FunctionsMetadata
         var schemas = new StringArray.Builder();
         var names = new StringArray.Builder();
         var kinds = new StringArray.Builder();
+        var counts = new Int32Array.Builder();
+        var returns = new StringArray.Builder();
+        var varargs = new StringArray.Builder();
         int n = 0;
         foreach (var d in declarations ?? System.Array.Empty<Declaration>())
         {
             schemas.Append(d.SchemaName);
             names.Append(d.Name);
             kinds.Append(d.Kind);
+            counts.Append(d.ParamCount);
+            returns.Append(d.ReturnType);
+            varargs.Append(d.VarArgs);
             n++;
         }
         if (n == 0)
         {
             return new InMemoryArrayStream(StreamSchema, System.Array.Empty<RecordBatch>());
         }
-        var batch = new RecordBatch(StreamSchema,
-                                    new IArrowArray[] { schemas.Build(), names.Build(), kinds.Build() }, n);
+        var batch = new RecordBatch(
+            StreamSchema,
+            new IArrowArray[]
+            {
+                schemas.Build(), names.Build(), kinds.Build(), counts.Build(), returns.Build(), varargs.Build(),
+            },
+            n);
         return new InMemoryArrayStream(StreamSchema, new[] { batch });
     }
 }

@@ -201,3 +201,66 @@ statement error
 SELECT * FROM cf_lat_split('a,b', ',');
 ----
 does not exist
+
+# ---- fabricator_functions() reports VARIADICITY (2026-08-31) ----
+#
+# ⚠ THE DEFECT THIS FIXES: `param_count` counted the variadic tail as one ordinary parameter, so a variadic
+# function reported a number that was neither its minimum nor its maximum — `f(label, …)` said 2 while
+# accepting one argument or twenty — and it looked exactly like an exact arity. There was no way to tell from
+# this view that a function was variadic at all.
+#
+# The split mirrors DuckDB's own: `param_count` is now the MINIMUM arity (the tail excluded) and `varargs`
+# names the tail's type, or is EMPTY when the function is not variadic. Read together, `param_count` means
+# "exactly this many" beside an empty varargs and "at least this many" beside a non-empty one.
+#
+# ⚠ It also widened the DECLARATIONS STREAM from three columns to six. A SQL Server catalog assembled these
+# rows as a five-column T-SQL UNION ALL while every other provider streamed three, so `param_count` and
+# `return_type` were reported on SQL Server and NOT on Delta / DAX / delta-rs — for the same declarations.
+# The host reads only the first three either way (DiscoverFunctions) and this view takes its schema FROM the
+# stream (PopulateReturnSchema), which is what kept the divergence invisible from the C++ side.
+
+query TIT
+SELECT name, param_count, varargs FROM fabricator_functions('fdb')
+WHERE starts_with(name, 'cf_va_') ORDER BY name;
+----
+cf_va_rows	1	any
+cf_va_select	0	int64
+cf_va_span	1	int64
+cf_va_sum	0	int64
+cf_va_tag	1	any
+
+# The non-variadic neighbours are the control: an empty varargs, and a count that did not move. cf_va_tag
+# reporting 1 rather than 2 is the other half — its {TABLE} input is excluded from the count as it always was,
+# so "arguments you pass a value for" still means what it says.
+query TIT
+SELECT name, param_count, varargs FROM fabricator_functions('fdb')
+WHERE name IN ('cf_add', 'cf_range', 'cf_tag', 'cf_lat_split') ORDER BY name;
+----
+cf_add	2	(empty)
+cf_lat_split	2	(empty)
+cf_range	1	(empty)
+cf_tag	0	(empty)
+
+# A DISCOVERED SQL routine can never be variadic — T-SQL has no varargs — so its branch of the UNION supplies
+# a literal ''.
+# ⚠ What PINS that branch is not this row but SQL SERVER ITSELF: every branch of the UNION ALL must have the
+# same column count, so a branch left at five fails the whole ATTACH with error 205 and NOTHING in this suite
+# runs (measured — that is exactly how the missed session-tag branch surfaced). Any successful query here is
+# already proof that all six branches agree; this assertion adds only that discovered routines report the
+# empty value rather than something else.
+query I
+SELECT count(*) FROM fabricator_functions('fdb') WHERE kind IN ('proc', 'other') AND varargs <> '';
+----
+0
+
+# Exactly one variadic per kind that takes a tail, and NONE for the kinds that refuse one (aggregate,
+# collector) — the assertion that the tail is not leaking into a kind that cannot carry it.
+query TI
+SELECT kind, count(*) FILTER (varargs <> '') FROM fabricator_functions('fdb')
+GROUP BY kind HAVING count(*) FILTER (varargs <> '') > 0 ORDER BY kind;
+----
+inout	1
+lateral	1
+scalar	1
+table	1
+table_sql	1

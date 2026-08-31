@@ -118,52 +118,65 @@ public sealed class CatalogFunctionSet
         }
         var rows = new List<FunctionsMetadata.Declaration>();
         IReadOnlyList<string>? schemas = null;
-        void Emit(string declaredSchema, string name, string kind, int paramCount, string returnType)
+        void Emit(string declaredSchema, string name, string kind, int paramCount, string returnType,
+                  string varArgs = "")
         {
             if (!string.Equals(declaredSchema, AllSchemas, StringComparison.Ordinal))
             {
-                rows.Add(new FunctionsMetadata.Declaration(declaredSchema, name, kind, paramCount, returnType));
+                rows.Add(new FunctionsMetadata.Declaration(declaredSchema, name, kind, paramCount, returnType,
+                                                           varArgs));
                 return;
             }
             schemas ??= schemaNames();
             foreach (var s in schemas)
             {
-                rows.Add(new FunctionsMetadata.Declaration(s, name, kind, paramCount, returnType));
+                rows.Add(new FunctionsMetadata.Declaration(s, name, kind, paramCount, returnType, varArgs));
             }
         }
         foreach (var f in _scalars.Values)
         {
             // "ANY" when the function declares no fixed return type (resolved per call site at scalarfn_bind).
-            Emit(f.SchemaName, f.Name, "scalar", f.Parameters.FieldsList.Count, f.Result?.DataType.Name ?? "ANY");
+            // ⚠ DeclaredCount, not FieldsList.Count: a variadic scalar must report its MINIMUM arity, and
+            // the two differ by exactly the tail field.
+            Emit(f.SchemaName, f.Name, "scalar", Params.DeclaredCount(f.Parameters),
+                 f.Result?.DataType.Name ?? "ANY", Params.VarArgsTypeName(f.Parameters));
         }
         foreach (var f in _tables.Values)
         {
-            Emit(f.SchemaName, f.Name, "table", Params.DeclaredCount(f.Parameters), "");
+            Emit(f.SchemaName, f.Name, "table", Params.DeclaredCount(f.Parameters), "",
+                 Params.VarArgsTypeName(f.Parameters));
         }
         foreach (var f in _sqlTables.Values)
         {
-            Emit(f.SchemaName, f.Name, "table_sql", Params.DeclaredCount(f.Parameters), "");
+            Emit(f.SchemaName, f.Name, "table_sql", Params.DeclaredCount(f.Parameters), "",
+                 Params.VarArgsTypeName(f.Parameters));
         }
         foreach (var f in _inOut.Values)
         {
-            Emit(f.SchemaName, f.Name, "inout", Params.DeclaredCount(f.Parameters), "");
+            Emit(f.SchemaName, f.Name, "inout", Params.DeclaredCount(f.Parameters), "",
+                 Params.VarArgsTypeName(f.Parameters));
         }
         foreach (var f in _laterals.Values)
         {
             // DeclaredCount counts positional + named, which for a lateral function is exactly its argument
             // count: its positional parameters ARE the per-row input columns and each occupies an arg slot.
-            Emit(f.SchemaName, f.Name, "lateral", Params.DeclaredCount(f.Parameters), "");
+            Emit(f.SchemaName, f.Name, "lateral", Params.DeclaredCount(f.Parameters), "",
+                 Params.VarArgsTypeName(f.Parameters));
         }
         foreach (var f in _collectors.Values)
         {
-            Emit(f.SchemaName, f.Name, "collector", Params.DeclaredCount(f.Parameters), "");
+            Emit(f.SchemaName, f.Name, "collector", Params.DeclaredCount(f.Parameters), "",
+                 Params.VarArgsTypeName(f.Parameters));
         }
         foreach (var f in _aggregates.Values)
         {
             // 'aggregate' (fast in-memory id-based) vs 'aggregate_spill' (state serialized into DuckDB's blob
             // so external GROUP BY can spill it) — the host picks the callback set from this kind.
+            // An aggregate cannot declare a tail (refused at registration), so VarArgsTypeName is always
+            // empty here — passed anyway so the row is built the same way as every other kind's.
             Emit(f.SchemaName, f.Name, f.SupportsSpill ? "aggregate_spill" : "aggregate",
-                 f.Parameters.FieldsList.Count, f.Result.DataType.Name);
+                 Params.DeclaredCount(f.Parameters), f.Result.DataType.Name,
+                 Params.VarArgsTypeName(f.Parameters));
         }
         return rows;
     }
