@@ -29,6 +29,26 @@
 
 require fabricator
 
+# ⚠⚠ TEMPORARILY OUT OF THE SERVICE TIER (2026-08-31, user-directed) — this suite is INTERMITTENT and the
+# failure is NOT in what it tests. §5's `SELECT * FROM db.dbo.fabricator_session_tag(...)` on the statement
+# immediately after a bare `BEGIN;` sometimes refuses with "must be called inside an explicit transaction",
+# i.e. the provider had not yet learned the transaction is EXPLICIT. It has reddened two scheduled CI runs on
+# commits that cannot reach it (4eec562; e0523a1, whose only content was the Arrow error-string fix) and was
+# first reproduced LOCALLY on 2026-08-31 — 1 failure in 4 consecutive runs, then green in the very next full
+# tier. Nothing here is a wrong ANSWER; it is a transaction-state propagation race.
+#
+# ⚠ THE COST IS REAL AND IS NOT "a flaky test removed": the session-tagging feature now has NO gate at all,
+# and §4 (a tag set by one call and read by a DIFFERENT call) is the assertion that pins why this must be a
+# FUNCTION rather than fabricator_exec. Re-enable by running it explicitly — the extra require-env below is
+# the ONLY thing keeping it out, and the suite is otherwise unchanged:
+#
+#   FABRICATOR_RUN_SESSION_TAG=1 build/release/test/unittest.exe --test-dir . test/verify_session_tag.test
+#
+# ⚠ The mechanism is the tier's own DERIVED classification (scripts/list-service-suites.sh): an unrecognized
+# require-env disqualifies a suite ENTIRELY. That is deliberate — it keeps the exclusion visible HERE, in the
+# file it applies to, instead of in a hand-kept list somewhere else that nobody reads.
+require-env FABRICATOR_RUN_SESSION_TAG
+
 require-env MSSQL_TESTDB_DSN
 
 statement ok

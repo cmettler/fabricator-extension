@@ -453,7 +453,16 @@ case "$TIER" in
         # because NOTHING owned those two functions: 29 suites USE fabricator_query and none was about it,
         # which is how it shipped executing every statement TWICE with no assertion noticing. Only a COUNTING
         # assertion can see that; every "the rows are right" test passes either way.
-        : "${MIN_SUITES:=54}"
+        # 53 runs since 2026-08-31: verify_session_tag was moved OUT of this tier (user-directed) behind a
+        # require-env FABRICATOR_RUN_SESSION_TAG the tier does not provide. It is INTERMITTENT — its section 5
+        # sometimes refuses with "must be called inside an explicit transaction" on the statement right after
+        # a bare BEGIN, i.e. a transaction-state propagation race, not a wrong answer. It reddened two
+        # scheduled CI runs on commits that cannot reach it and was first reproduced LOCALLY on 2026-08-31
+        # (1 in 4, then green in the very next full tier).
+        # /!\ The exclusion is a LOSS: the session-tagging feature now has NO gate. The suite is unchanged and
+        # runs on demand -- FABRICATOR_RUN_SESSION_TAG=1 unittest --test-dir . test/verify_session_tag.test.
+        # Deleting that one require-env line puts it back.
+        : "${MIN_SUITES:=53}"
         # 1424 since 2026-08-01: verify_exec_invalidate_cache 10 -> 21, for the OUT-OF-BAND DROP path Ã¢ÂÂ the
         # catalog's self-heal, documented in CLAUDE.md and until now covered by NOTHING. The service tier ran
         # 44/44 green while that path was broken, which is why the section exists. It must run with
@@ -684,7 +693,13 @@ case "$TIER" in
         # delta). verify_mssql_cdc went 476 -> 559 -> 604 -> 630 -> 725 across slice 9, slice 8b,
         # _changed_columns and the four user-requested items. A floor left below the actual silently
         # tolerates a regression that size.
-        : "${MIN_ASSERTIONS:=3056}"
+        # 3069 since 2026-08-31 (same day, third bump): fabricator_functions() reports variadicity --
+        # verify_functions 67 -> 105 (+38) -- MINUS verify_session_tag's 25, which left the tier (see the
+        # MIN_SUITES note above). Both halves come from ONE green 54/54 -- 3094 run: 3056 + 38 = 3094 exactly,
+        # and that run's own per-suite line reports verify_session_tag at 25, so 3094 - 25 = 3069 is a
+        # subtraction of a measured value rather than an inference about a suite that did not finish.
+        # The 3056 note it supersedes:
+        : "${MIN_ASSERTIONS:=3069}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2
