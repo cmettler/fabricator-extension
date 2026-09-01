@@ -91,6 +91,83 @@ struct HostQueryStream {
 	ArrowArrayStream stream {};
 };
 
+//! A SCHEMA-ONLY stream: it reports a result schema and yields no rows, so a bind can learn the output
+//! columns WITHOUT running the statement. `HostQueryBind` fills it from a PREPARED statement.
+//!
+//! ⚠ Its schema must match what the executing stream produces, which is why both derive it the same way —
+//! `ArrowConverter::ToArrowSchema` over the plan's types/names with `BoundaryClientProperties`. The types
+//! come from `PreparedStatement`, the executing ones from `QueryResult`; both are the bound plan's.
+//! Applies a captured caller session to a fresh connection.
+//!
+//! ⚠ SHARED BY THE DESCRIBE AND THE EXECUTE ON PURPOSE. `HostQueryBind` prepares the statement on its own
+//! fresh connection to learn the output schema; if that connection resolved names or times differently from
+//! the one that later runs it, the declared schema and the delivered batches could disagree — and the scan
+//! reads the batches through converters built from the DECLARED schema. One function, no drift.
+void ApplyHostQuerySession(Connection &conn, const HostQuerySession *session) {
+	if (!session) {
+		return;
+	}
+	if (!session->search_path.empty()) {
+		// SET_DIRECTLY: install exactly the captured entries. Copying the resolved values avoids emitting
+		// `USE <ident>` text, which would need identifier quoting to be safe.
+		ClientData::Get(*conn.context)
+		    .catalog_search_path->Set(session->search_path, CatalogSetPathType::SET_DIRECTLY);
+	}
+	if (!session->time_zone.empty()) {
+		// TimeZone is an ICU-registered EXTENSION option (icu_extension.cpp AddExtensionOption), so there is
+		// no core set_local to call — it goes through the normal SET path. Value::ToSQLString() quotes and
+		// escapes the literal, so a hostile zone string cannot break out.
+		auto tz_result = conn.Query("SET TimeZone=" + Value(session->time_zone).ToSQLString());
+		if (tz_result->HasError()) {
+			// Non-fatal by design: the caller's query is what matters, and a build without ICU has no
+			// TimeZone option to set. Falling back to the fresh connection's default beats refusing to run.
+			tz_result.reset();
+		}
+	}
+}
+
+struct HostQuerySchemaStream {
+	//! ⚠ THE CONNECTION IS OWNED HERE, AND THAT IS A CORRECTNESS REQUIREMENT RATHER THAN CONVENIENCE.
+	//! `ClientProperties` holds an `optional_ptr<ClientContext>` which `ToArrowSchema` dereferences, so props
+	//! captured from a connection that has since been destroyed are a use-after-free — and a DEFAULT-
+	//! constructed ClientProperties fails outright ("Attempting to dereference an optional pointer that is not
+	//! set"), which is how this was found. Owning the connection makes the context provably alive for exactly
+	//! as long as the stream, which is the only window get_schema is called in.
+	unique_ptr<Connection> conn;
+	duckdb::vector<LogicalType> types;
+	duckdb::vector<string> names;
+	string last_error;
+	ArrowArrayStream stream {};
+};
+
+int HostQuerySchemaGetSchema(ArrowArrayStream *stream, ArrowSchema *out) {
+	auto *st = static_cast<HostQuerySchemaStream *>(stream->private_data);
+	try {
+		// Rebuilt per call rather than moved out of the struct, so a second get_schema is well-defined.
+		auto props = fabricator::BoundaryClientProperties(*st->conn->context);
+		ArrowConverter::ToArrowSchema(out, st->types, st->names, props);
+		return 0;
+	} catch (std::exception &e) {
+		st->last_error = e.what();
+		return 1;
+	}
+}
+
+int HostQuerySchemaGetNext(ArrowArrayStream *stream, ArrowArray *out) {
+	std::memset(out, 0, sizeof(*out)); // a zeroed (released) ArrowArray is the end marker
+	return 0;
+}
+
+const char *HostQuerySchemaGetLastError(ArrowArrayStream *stream) {
+	auto *st = static_cast<HostQuerySchemaStream *>(stream->private_data);
+	return st->last_error.empty() ? nullptr : st->last_error.c_str();
+}
+
+void HostQuerySchemaRelease(ArrowArrayStream *stream) {
+	delete static_cast<HostQuerySchemaStream *>(stream->private_data);
+	stream->release = nullptr;
+}
+
 int HostQueryGetSchema(ArrowArrayStream *stream, ArrowSchema *out) {
 	auto *st = static_cast<HostQueryStream *>(stream->private_data);
 	auto props = fabricator::BoundaryClientProperties(*st->conn->context);
@@ -199,11 +276,256 @@ unique_ptr<FunctionData> HostQueryBind(ClientContext &context, TableFunctionBind
 		// C#-callable host_query service — see docs/host-query.md).
 		MakeHostQueryStream(*db, sql, nullptr, {}, out, nullptr, &session);
 	};
+
+	// ⚠⚠ DESCRIBE WITHOUT EXECUTING. Without the schema_factory below, PopulateReturnSchema runs `factory`
+	// to learn the output columns and the scan then runs it AGAIN for the data — so ONE call executed the
+	// statement TWICE. Harmless-looking for a SELECT (wasted work); a silent duplicate for anything with a
+	// side effect: measured, one `fabricator_host_query('INSERT INTO audit VALUES (1)')` left TWO rows, and
+	// DDL failed its second run with "already exists" from a statement issued once.
+	//
+	// This is the same defect that was fixed for `fabricator_query` in 0acd679, and the comment that used to
+	// sit here appealed to that very function ("like the other fabricator table functions") — a
+	// justification by analogy that aged the moment the analogue was fixed.
+	//
+	// The fix is cheaper here than it was there: `fabricator_query` needed the provider to describe remote
+	// SQL (sp_describe_first_result_set), whereas DuckDB describes its OWN statements natively — a PREPARED
+	// statement carries the bound plan's result types and names, and preparing binds without running.
+	{
+		auto describe_conn = make_uniq<Connection>(*db);
+		ApplyHostQuerySession(*describe_conn, &session); // resolve names/times as the execution will
+		auto prepared = describe_conn->Prepare(sql);
+		// ⚠ FALLING BACK RATHER THAN FAILING, deliberately: `SendQuery` accepts shapes `Prepare` refuses —
+		// several statements in one string, most obviously ("Cannot prepare multiple statements at once").
+		// Those keep working exactly as before, double execution included; what would be worse is turning a
+		// working call into a bind error. A genuinely invalid statement also lands here and then fails in
+		// the factory, i.e. where it failed before. See docs/host-query.md.
+		if (!prepared->HasError() && !prepared->GetTypes().empty()) {
+			auto types = prepared->GetTypes();
+			auto col_names = prepared->GetNames();
+			// ⚠ The factory opens and CONFIGURES its own connection rather than capturing one: the props
+			// derived from it must match the execute path's, and a TimeZone difference would change a
+			// TIMESTAMPTZ column's Arrow type — so the same session is applied here as there.
+			bind_data->schema_factory = [db, session, types, col_names](ArrowArrayStream &out) {
+				auto *st = new HostQuerySchemaStream();
+				st->conn = make_uniq<Connection>(*db);
+				ApplyHostQuerySession(*st->conn, &session);
+				st->types = types;
+				st->names = col_names;
+				st->stream.get_schema = HostQuerySchemaGetSchema;
+				st->stream.get_next = HostQuerySchemaGetNext;
+				st->stream.get_last_error = HostQuerySchemaGetLastError;
+				st->stream.release = HostQuerySchemaRelease;
+				st->stream.private_data = st;
+				out = st->stream;
+			};
+		}
+	}
+	fabricator::PopulateReturnSchema(context, *bind_data, return_types, names);
+	return std::move(bind_data);
+}
+
+// ============================================================================================================
+// fabricator_host_exec(sql) — DDL / DML on a fresh host connection, reporting the affected-row count.
+//
+// THE SIBLING OF fabricator_host_query, and it exists because that one has to DESCRIBE. A table function must
+// declare its output columns at BIND, and for arbitrary SQL that means asking DuckDB to prepare the statement
+// — which cannot be done for several statements in one string, and cannot be done at all when a later
+// statement's schema depends on an earlier one's effects (`CREATE TABLE t …; SELECT * FROM t`). Those fall
+// back to describing by EXECUTING, so they run twice.
+//
+// exec sidesteps the whole question: its output schema is FIXED — one BIGINT — so there is nothing to
+// describe, nothing to prepare, and the statement runs EXACTLY ONCE whatever it is. That is the point of the
+// function, not a side benefit.
+//
+// ⚠ THE RESULT IS NORMALISED, NOT PASSED THROUGH. Whatever the statement returns is discarded; the single
+// row is the engine's own affected-row count when it reports one and 0 otherwise. That is what makes the
+// fixed schema honest: without it a `SELECT` here would declare one BIGINT and deliver something else, and
+// the scan reads batches through converters built from the DECLARED schema.
+// ============================================================================================================
+
+struct HostExecStream {
+	unique_ptr<Connection> conn; // kept alive: BoundaryClientProperties and the appender need its context
+	duckdb::vector<LogicalType> types;
+	duckdb::vector<string> names;
+	int64_t affected = 0;
+	bool emitted = false;
+	string last_error;
+	ArrowArrayStream stream {};
+};
+
+int HostExecGetSchema(ArrowArrayStream *stream, ArrowSchema *out) {
+	auto *st = static_cast<HostExecStream *>(stream->private_data);
+	try {
+		auto props = fabricator::BoundaryClientProperties(*st->conn->context);
+		ArrowConverter::ToArrowSchema(out, st->types, st->names, props);
+		return 0;
+	} catch (std::exception &e) {
+		st->last_error = e.what();
+		return 1;
+	}
+}
+
+int HostExecGetNext(ArrowArrayStream *stream, ArrowArray *out) {
+	auto *st = static_cast<HostExecStream *>(stream->private_data);
+	std::memset(out, 0, sizeof(*out));
+	try {
+		if (st->emitted) {
+			return 0; // one row, once — a zeroed (released) ArrowArray is the end marker
+		}
+		DataChunk chunk;
+		chunk.Initialize(Allocator::Get(*st->conn->context), st->types);
+		chunk.SetValue(0, 0, Value::BIGINT(st->affected));
+		chunk.SetCardinality(1);
+		auto props = fabricator::BoundaryClientProperties(*st->conn->context);
+		auto extension_types = ArrowTypeExtensionData::GetExtensionTypes(*st->conn->context, st->types);
+		ArrowAppender appender(st->types, 1, props, extension_types);
+		appender.Append(chunk, 0, chunk.size(), chunk.size());
+		*out = appender.Finalize();
+		st->emitted = true;
+		return 0;
+	} catch (std::exception &e) {
+		st->last_error = e.what();
+		return 1;
+	}
+}
+
+const char *HostExecGetLastError(ArrowArrayStream *stream) {
+	auto *st = static_cast<HostExecStream *>(stream->private_data);
+	return st->last_error.empty() ? nullptr : st->last_error.c_str();
+}
+
+void HostExecRelease(ArrowArrayStream *stream) {
+	delete static_cast<HostExecStream *>(stream->private_data);
+	stream->release = nullptr;
+}
+
+//! Runs `sql` for effect on a FRESH connection and returns the affected-row count.
+//!
+//! ⚠ THE ONE EXECUTION PATH, shared by both surfaces — the table function's stream and the scalar. Two
+//! copies would be two chances for the count, the session handling or the error prefix to drift apart, and
+//! nothing would notice until someone compared them.
+int64_t RunHostExec(DatabaseInstance &db, const string &sql, const HostQuerySession *session,
+                    unique_ptr<Connection> *out_conn) {
+	auto conn = make_uniq<Connection>(db); // FRESH connection: own context/transaction, as host_query does
+	ApplyHostQuerySession(*conn, session);
+
+	// SendQuery rather than Query: several statements in one string all run (which is the case exec exists
+	// for), and a caller who passes a SELECT anyway streams rather than materialising the whole thing.
+	auto result = conn->SendQuery(sql);
+	if (result->HasError()) {
+		throw IOException("fabricator_host_exec: " + result->GetError());
+	}
+	int64_t affected = 0;
+	// ⚠ ASKED OF THE STATEMENT, not inferred from its column types. `StatementReturnType::CHANGED_ROWS` is
+	// DuckDB's own "this result IS a row count", so a DML reports its count and a SELECT that happens to
+	// return one BIGINT column does not get its first value mistaken for one.
+	// ⚠ For several statements, SendQuery returns the LAST one's result — so the count is the LAST
+	// statement's, which is the only one that could be meant.
+	if (result->properties.return_type == StatementReturnType::CHANGED_ROWS) {
+		auto chunk = result->Fetch();
+		if (chunk && chunk->size() > 0) {
+			auto v = chunk->GetValue(0, 0);
+			if (!v.IsNull()) {
+				affected = v.GetValue<int64_t>();
+			}
+		}
+	}
+	if (out_conn) {
+		*out_conn = std::move(conn); // the stream needs a live context to build its Arrow batch from
+	}
+	return affected;
+}
+
+//! Runs `sql` for effect and yields ONE BIGINT row: the affected-row count.
+void MakeHostExecStream(DatabaseInstance &db, const string &sql, ArrowArrayStream &out,
+                        const HostQuerySession *session) {
+	unique_ptr<Connection> conn;
+	auto affected = RunHostExec(db, sql, session, &conn);
+	auto *st = new HostExecStream();
+	st->conn = std::move(conn);
+	st->types = {LogicalType::BIGINT};
+	st->names = {"affected"};
+	st->affected = affected;
+	st->stream.get_schema = HostExecGetSchema;
+	st->stream.get_next = HostExecGetNext;
+	st->stream.get_last_error = HostExecGetLastError;
+	st->stream.release = HostExecRelease;
+	st->stream.private_data = st;
+	out = st->stream;
+}
+
+//! Captures the caller's session at bind/execute time — shared by both exec surfaces.
+HostQuerySession CaptureSession(ClientContext &context) {
+	HostQuerySession session;
+	session.search_path = ClientData::Get(context).catalog_search_path->GetSetPaths();
+	Value tz_value;
+	if (context.TryGetCurrentSetting("TimeZone", tz_value) && !tz_value.IsNull()) {
+		session.time_zone = tz_value.ToString();
+	}
+	return session;
+}
+
+// --- fabricator_host_exec(sql) -> BIGINT, the SCALAR spelling -------------------------------------------
+//
+// The same function as the table form, for symmetry with fabricator_exec, which is also a VOLATILE scalar.
+//
+// ⚠⚠ VOLATILE IS LOAD-BEARING AND IT IS STILL NOT THE SAFER SHAPE. Volatile stops DuckDB constant-folding
+// the call at PLAN time — without it a `SELECT fabricator_host_exec('CREATE …')` would run during binding,
+// firing on an EXPLAIN that executes nothing (measured for bind-time host queries generally; see
+// docs/fluid-templating.md §8.3). What volatile does NOT stop is PER-ROW evaluation: in a row context the
+// statement runs once per row, so `SELECT fabricator_host_exec('…') FROM range(1000)` executes it a
+// thousand times. The TABLE form runs once per scan and is the one to reach for with DDL; this exists
+// because `SELECT f('…')` is what people write and fabricator_exec set that precedent.
+static void HostExecScalarFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &context = state.GetContext();
+	auto session = CaptureSession(context);
+	auto count = args.size();
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	auto result_data = FlatVector::GetData<int64_t>(result);
+	auto &validity = FlatVector::Validity(result);
+	for (idx_t i = 0; i < count; i++) {
+		auto sql_value = args.GetValue(0, i);
+		if (sql_value.IsNull()) {
+			validity.SetInvalid(i); // a NULL statement is NULL, not zero rows affected
+			continue;
+		}
+		result_data[i] = RunHostExec(*context.db, StringValue::Get(sql_value), &session, nullptr);
+	}
+}
+
+// Bind: the output schema is FIXED, so it is declared outright — no prepare, no execution, nothing to get
+// wrong. This is why exec runs its statement exactly once where query cannot always.
+unique_ptr<FunctionData> HostExecBind(ClientContext &context, TableFunctionBindInput &input,
+                                      vector<LogicalType> &return_types, vector<string> &names) {
+	auto sql = input.inputs[0].GetValue<string>();
+	auto db = context.db;
+	auto bind_data = make_uniq<fabricator::ArrowStreamBindData>();
+	auto session = CaptureSession(context);
+	bind_data->factory = [db, sql, session](const fabricator::ArrowScanRequest &, ArrowArrayStream &out) {
+		MakeHostExecStream(*db, sql, out, &session);
+	};
+	// The fixed schema, handed over without running anything. PopulateReturnSchema still builds the Arrow
+	// converters from it, so the declared and delivered schemas are the same object by construction.
+	bind_data->schema_factory = [db](ArrowArrayStream &out) {
+		auto *st = new HostQuerySchemaStream();
+		// No session applied: one BIGINT has no timezone or encoding sensitivity, so any live context
+		// describes it identically. The connection exists only to give ToArrowSchema a context to hold.
+		st->conn = make_uniq<Connection>(*db);
+		st->types = {LogicalType::BIGINT};
+		st->names = {"affected"};
+		st->stream.get_schema = HostQuerySchemaGetSchema;
+		st->stream.get_next = HostQuerySchemaGetNext;
+		st->stream.get_last_error = HostQuerySchemaGetLastError;
+		st->stream.release = HostQuerySchemaRelease;
+		st->stream.private_data = st;
+		out = st->stream;
+	};
 	fabricator::PopulateReturnSchema(context, *bind_data, return_types, names);
 	return std::move(bind_data);
 }
 
 } // namespace
+
 
 void MakeHostQueryStream(DatabaseInstance &db, const string &sql, ArrowArrayStream *params,
                          const vector<HostQueryInput> &inputs, ArrowArrayStream &out,
@@ -214,25 +536,7 @@ void MakeHostQueryStream(DatabaseInstance &db, const string &sql, ArrowArrayStre
 	}
 	// Adopt the caller's session state, when one was supplied (the table function supplies it; the C# host
 	// service deliberately does not — provider-generated SQL must not depend on what the user last USEd).
-	if (session) {
-		if (!session->search_path.empty()) {
-			// SET_DIRECTLY: install exactly the captured entries. Copying the resolved values avoids emitting
-			// `USE <ident>` text, which would need identifier quoting to be safe.
-			ClientData::Get(*conn->context)
-			    .catalog_search_path->Set(session->search_path, CatalogSetPathType::SET_DIRECTLY);
-		}
-		if (!session->time_zone.empty()) {
-			// TimeZone is an ICU-registered EXTENSION option (icu_extension.cpp AddExtensionOption), so there is
-			// no core set_local to call — it goes through the normal SET path. Value::ToSQLString() quotes and
-			// escapes the literal, so a hostile zone string cannot break out.
-			auto tz_result = conn->Query("SET TimeZone=" + Value(session->time_zone).ToSQLString());
-			if (tz_result->HasError()) {
-				// Non-fatal by design: the caller's query is what matters, and a build without ICU has no
-				// TimeZone option to set. Falling back to the fresh connection's default beats refusing to run.
-				tz_result.reset();
-			}
-		}
-	}
+	ApplyHostQuerySession(*conn, session);
 	// Register each named Arrow input as a connection-scoped view (data-in). duckdb_arrow_scan reinterprets
 	// the opaque handle back to ArrowArrayStream* and creates a view over it. We ADOPT each stream first (see
 	// OwnedArrowInputs): the view keeps the RAW POINTER and the query below is LAZY, so the caller's own
@@ -433,6 +737,21 @@ void RegisterHostQuery(ExtensionLoader &loader) {
 	// See ArrowStreamGetPartitionData + docs/scan-concurrency.md.
 	fn.get_partition_data = fabricator::ArrowStreamGetPartitionData;
 	loader.RegisterFunction(fn);
+
+	// fabricator_host_exec(sql) — the DDL/DML sibling. Fixed one-BIGINT output, so no describe is needed and
+	// the statement runs EXACTLY ONCE, including several statements in one string (see docs/host-query.md).
+	TableFunction exec_fn("fabricator_host_exec", {LogicalType::VARCHAR}, fabricator::ArrowStreamScan,
+	                      HostExecBind, fabricator::ArrowStreamInitGlobal, fabricator::ArrowStreamInitLocal);
+	loader.RegisterFunction(exec_fn);
+
+	// The SCALAR spelling of the same function, for symmetry with fabricator_exec (also a VOLATILE scalar).
+	// ⚠ VOLATILE stops constant folding at PLAN time — without it a `SELECT fabricator_host_exec('CREATE …')`
+	// would run during binding and fire on an EXPLAIN. It does NOT stop per-ROW evaluation; the TABLE form is
+	// the one to reach for with DDL. See docs/host-query.md.
+	ScalarFunction exec_scalar("fabricator_host_exec", {LogicalType::VARCHAR}, LogicalType::BIGINT,
+	                           HostExecScalarFunction);
+	exec_scalar.stability = FunctionStability::VOLATILE;
+	loader.RegisterFunction(exec_scalar);
 
 	TableFunction scan("fabricator_scan", {LogicalType::VARCHAR}, fabricator::ArrowStreamScan, NamedScanBind,
 	                   fabricator::ArrowStreamInitGlobal, fabricator::ArrowStreamInitLocal);

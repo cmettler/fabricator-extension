@@ -79,6 +79,7 @@ See [SQL Server external tables on S3](#sql-server-external-tables-on-s3).
 | | `fabricator_functions(catalog)` — list discovered routines | ✅ |
 | | `fabricator_delta_scan(path)` / `fabricator_delta_native_scan(path)` — read a Delta table by path, no ATTACH (C# reader / DuckDB's parquet reader) | ✅ |
 | | `fabricator_host_query(sql)` — run a query on DuckDB itself (inherits your search path + `TimeZone`) | ✅ |
+| | `fabricator_host_exec(sql)` — DDL/DML on DuckDB itself, returning the affected-row count (table + scalar) | ✅ |
 | | `fabricator_http_request(url, …)` — an HTTP call through DuckDB's own stack (its `TYPE http` secret, TLS trust, proxy, retries) | ✅ |
 | **Macros** | Provider **global** macros — bare `fn(...)` / `FROM fn(...)`, every database, no ATTACH | ✅ |
 | | Provider **catalog-bound** macros → `db.schema.m(...)` (namespaced per catalog; expanded by the binder) | ✅ |
@@ -1546,6 +1547,39 @@ SELECT * FROM fabricator_host_query('SELECT count(*) FROM t');   -- resolves lak
 But it runs in its **own transaction**, so it sees only *committed* data — inside a `BEGIN`, your own
 uncommitted `INSERT`s are invisible to it. That is deliberate (reusing the in-flight connection would corrupt
 the outer query), not a bug to work around.
+
+### `fabricator_host_exec(sql) -> TABLE(affected BIGINT)`
+
+The **DDL/DML sibling**. Same fresh connection and committed-reads semantics; one row, one column — the
+engine's affected-row count.
+
+```sql
+SELECT * FROM fabricator_host_exec('INSERT INTO t VALUES (1),(2),(3)');   -- affected = 3
+```
+
+Use it whenever you do not need a result set. `fabricator_host_query` has to *describe* your SQL to declare
+its output columns, which DuckDB cannot do for **several statements in one string** — so those run twice
+there, and a non-idempotent one fails outright. `fabricator_host_exec` declares a fixed schema, so it
+describes nothing and **runs your SQL exactly once whatever it is**:
+
+```sql
+-- fails through fabricator_host_query ("Table with name t already exists!"); works here
+SELECT * FROM fabricator_host_exec('CREATE TABLE t AS SELECT 1 AS c; INSERT INTO t VALUES (2)');
+```
+
+The count comes from the statement itself, so a `SELECT` reports `0` rather than its first value, and a
+`CREATE` reports `0` even when it created rows. For several statements it is the **last** statement's count.
+
+It is also available as a **scalar**, for symmetry with [`fabricator_exec`](#fabricator_execcontext-sql---bigint):
+
+```sql
+SELECT fabricator_host_exec('INSERT INTO t VALUES (1),(2)');   -- 2
+```
+
+> ⚠ **Prefer the table form for DDL.** The scalar is evaluated **per row**, so
+> `SELECT fabricator_host_exec('…') FROM range(1000)` runs your statement a thousand times; the table form
+> runs it once per scan whatever the cardinality. (Both are safe from the other hazard — the scalar is
+> `VOLATILE`, so an `EXPLAIN` does not execute it.) A `NULL` statement yields `NULL`, not `0`.
 
 ### `fabricator_delta_scan(path) -> TABLE`
 

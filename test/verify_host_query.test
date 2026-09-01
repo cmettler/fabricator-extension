@@ -165,3 +165,399 @@ SELECT * FROM fabricator_host_query('SELECT (''2024-01-15 12:00:00Z''::TIMESTAMP
 
 statement ok
 SET TimeZone='UTC';
+
+# ============================================================================================
+# ⚠⚠ ONE CALL EXECUTES THE STATEMENT ONCE (fixed 2026-09-01)
+#
+# It used to execute it TWICE: PopulateReturnSchema ran the bind factory to learn the output columns and the
+# scan then ran it again for the data. Invisible for a SELECT (wasted work); a silent DUPLICATE for anything
+# with a side effect. The bind now DESCRIBES instead, via a PREPARED statement — DuckDB carries the bound
+# plan's result types and names without running it.
+#
+# ⚠ THIS IS THE SAME DEFECT THAT WAS FIXED FOR fabricator_query IN 0acd679, and the comment that used to sit
+# in HostQueryBind appealed to that very function ("like the other fabricator table functions") — a
+# justification by analogy that aged the moment the analogue was fixed and that nothing re-checked.
+#
+# ⚠ ONLY A COUNTING ASSERTION CAN SEE THIS. Every "the rows are right" test in this file passed with the
+# defect fully present, which is exactly how it survived. The side-effecting statement is the instrument.
+# ============================================================================================
+
+statement ok
+CREATE TABLE hq_audit AS SELECT 0 AS n WHERE false;
+
+query I
+SELECT * FROM fabricator_host_query('INSERT INTO hq_audit VALUES (1)') AS a(x);
+----
+1
+
+query I
+SELECT count(*) FROM hq_audit;
+----
+1
+
+# DDL likewise runs once — with the defect the second run failed "Table with name ... already exists!" from a
+# statement the user issued once, so this asserts BOTH that it ran and that it did not run twice.
+query I
+SELECT * FROM fabricator_host_query('CREATE TABLE hq_made AS SELECT 42 AS n') AS b(x);
+----
+1
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE table_name = 'hq_made';
+----
+1
+
+query I
+SELECT n FROM hq_made;
+----
+42
+
+# The describe must agree with the data: same statement, schema read at bind and rows read at scan.
+query III
+SELECT * FROM fabricator_host_query('SELECT 7 AS a, ''x'' AS b, [1,2] AS c');
+----
+7	x	[1, 2]
+
+query II
+SELECT column_name, column_type
+FROM (DESCRIBE SELECT * FROM fabricator_host_query('SELECT 7 AS a, ''x'' AS b, [1,2] AS c'))
+ORDER BY column_name;
+----
+a	INTEGER
+b	VARCHAR
+c	INTEGER[]
+
+# Multi-batch, so the describe path does not quietly truncate a streaming result.
+query II
+SELECT count(*), sum(i) FROM fabricator_host_query('SELECT * FROM range(5000) t(i)');
+----
+5000	12497500
+
+# ---- THE DOCUMENTED FALLBACK, pinned so its boundary is visible rather than implied ----
+#
+# ⚠ `Prepare` handles ONE statement; `SendQuery` accepts several in a string. Rather than turn a working call
+# into a bind error, the bind falls back to the old path for those — so a multi-statement call keeps its
+# PRE-EXISTING behaviour, double execution included. Asserted as the value it really produces: two rows from
+# one call. If DuckDB ever learns to prepare them, this is where that surfaces.
+#
+# ⚠⚠ AND "STILL WORKS" IS TOO KIND — the second assertion below is the honest half. Double execution means a
+# NON-IDEMPOTENT prefix FAILS: `CREATE TABLE mk …; SELECT * FROM mk` creates mk on the describe run and then
+# collides with itself on the data run. That is unchanged from before the fix (everything double-executed
+# then, so this shape failed identically) — but it is why describing cannot be made to work here rather than
+# merely being unimplemented: the LAST statement's schema can DEPEND on the earlier statements' effects, so
+# there is nothing to describe until they have run.
+
+statement ok
+CREATE TABLE hq_multi AS SELECT 0 AS n WHERE false;
+
+query I
+SELECT * FROM fabricator_host_query('INSERT INTO hq_multi VALUES (1); SELECT 99 AS z') AS c(x);
+----
+99
+
+query I
+SELECT count(*) FROM hq_multi;
+----
+2
+
+# The non-idempotent prefix, pinned as the failure it is rather than left to the prose above.
+statement error
+SELECT * FROM fabricator_host_query('CREATE TABLE hq_mk AS SELECT 1 AS c; SELECT * FROM hq_mk');
+----
+<REGEX>:.*already exists.*
+
+# A bind error still names the column, and now surfaces at BIND rather than mid-scan.
+statement error
+SELECT * FROM fabricator_host_query('SELECT nosuchcol FROM range(1)');
+----
+<REGEX>:.*nosuchcol.*
+
+statement error
+SELECT * FROM fabricator_host_query('this is not sql');
+----
+<REGEX>:.*Parser Error.*
+
+# ============================================================================================
+# fabricator_host_exec(sql) — the DDL/DML sibling, and the shape that needs no describe
+#
+# fabricator_host_query must declare its output columns at BIND, which for arbitrary SQL means asking DuckDB
+# to prepare the statement — impossible for several statements in one string, and impossible in principle
+# when a later statement's schema depends on an earlier one's effects. Those fall back to describing by
+# EXECUTING, so they run twice.
+#
+# exec has a FIXED output schema — one BIGINT, `affected` — so there is nothing to describe, nothing to
+# prepare, and the statement runs EXACTLY ONCE whatever it is. That is the function's reason to exist.
+# ============================================================================================
+
+# ⚠ Scoped to the TABLE form: the same name is ALSO a scalar (asserted together further down), so an
+# unscoped count here would have to change every time either spelling does.
+query II
+SELECT DISTINCT function_name, function_type FROM duckdb_functions()
+WHERE function_name = 'fabricator_host_exec' AND function_type = 'table';
+----
+fabricator_host_exec	table
+
+statement ok
+CREATE TABLE he_t AS SELECT 0 AS n WHERE false;
+
+# DML reports the engine's own affected-row count, and runs ONCE — the row count is the proof of both.
+query I
+SELECT * FROM fabricator_host_exec('INSERT INTO he_t VALUES (1),(2),(3)');
+----
+3
+
+query I
+SELECT count(*) FROM he_t;
+----
+3
+
+query I
+SELECT * FROM fabricator_host_exec('DELETE FROM he_t WHERE n > 1');
+----
+2
+
+# DDL reports 0 and, again, happens once — twice would collide with itself.
+#
+# ⚠ A CTAS REPORTS 0 THOUGH IT CREATED A ROW, and that is deliberate rather than an oversight. The count is
+# asked of the statement via DuckDB's own StatementReturnType, which does not classify CREATE as a
+# row-count statement; it also matches Host.ExecuteNonQuery's existing contract ("DML -> a 1-row BIGINT
+# Count; DDL -> 0"), so the SQL surface and the C# one agree. Inferring from column types instead would
+# report 1 here — which is exactly where the mutant for that shortcut dies.
+query I
+SELECT * FROM fabricator_host_exec('CREATE TABLE he_made AS SELECT 42 AS v');
+----
+0
+
+query I
+SELECT v FROM he_made;
+----
+42
+
+# ============================================================================================
+# ⚠⚠ THE ASSERTION THAT JUSTIFIES THE FUNCTION EXISTING: the same SQL, both surfaces.
+#
+# A non-idempotent multi-statement string cannot go through host_query at all — the describe run performs
+# the CREATE and the data run collides with it. Through exec it simply works, because nothing is described.
+# ============================================================================================
+
+statement error
+SELECT * FROM fabricator_host_query('CREATE TABLE he_both AS SELECT 1 AS c; INSERT INTO he_both VALUES (2)');
+----
+<REGEX>:.*already exists.*
+
+statement ok
+DROP TABLE IF EXISTS he_both;
+
+query I
+SELECT * FROM fabricator_host_exec('CREATE TABLE he_both AS SELECT 1 AS c; INSERT INTO he_both VALUES (2)');
+----
+1
+
+# Both statements ran, and each ran once: the CREATE's row plus the INSERT's.
+query I
+SELECT count(*) FROM he_both;
+----
+2
+
+# ⚠ The count is the LAST statement's, which is the only one it could sensibly be — SendQuery returns the
+# last result, and asserting it here stops that becoming a silent surprise.
+query I
+SELECT * FROM fabricator_host_exec('INSERT INTO he_both VALUES (3); INSERT INTO he_both VALUES (4),(5)');
+----
+2
+
+# ⚠ THE RESULT IS NORMALISED, NOT PASSED THROUGH. A SELECT reports 0 rather than leaking its own shape — the
+# fixed schema would otherwise be a lie, and the scan reads batches through converters built from it.
+query I
+SELECT * FROM fabricator_host_exec('SELECT 1, 2, 3');
+----
+0
+
+# It is asked of the STATEMENT (StatementReturnType::CHANGED_ROWS), not inferred from column types, so a
+# SELECT returning a single BIGINT does not get its first value mistaken for a row count.
+query I
+SELECT * FROM fabricator_host_exec('SELECT 99::BIGINT');
+----
+0
+
+# Errors surface with the function's own prefix rather than mid-scan.
+statement error
+SELECT * FROM fabricator_host_exec('this is not sql');
+----
+<REGEX>:.*Parser Error.*
+
+statement error
+SELECT * FROM fabricator_host_exec('INSERT INTO he_no_such_table VALUES (1)');
+----
+<REGEX>:.*he_no_such_table.*
+
+# It runs on a FRESH connection like its sibling, so it does not see the caller's uncommitted writes — the
+# same committed-reads semantics host_query has, asserted so the pair cannot drift.
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO he_t VALUES (7);
+
+query I
+SELECT * FROM fabricator_host_exec('DELETE FROM he_t WHERE n = 7');
+----
+0
+
+statement ok
+COMMIT;
+
+# ============================================================================================
+# THE SCALAR SPELLING — `SELECT fabricator_host_exec(sql)`, for symmetry with fabricator_exec
+#
+# ⚠⚠ A SCALAR AND A TABLE FUNCTION SHARE THE NAME, and that is a non-obvious DuckDB fact worth pinning
+# rather than assuming: they live in different catalog sets, so each resolves in its own syntactic position
+# and neither shadows the other. If that ever changed, one of the two spellings would silently stop
+# resolving — this is where it would surface.
+# ============================================================================================
+
+query II
+SELECT function_name, function_type FROM duckdb_functions() WHERE function_name = 'fabricator_host_exec' ORDER BY function_type;
+----
+fabricator_host_exec	scalar
+fabricator_host_exec	table
+
+statement ok
+CREATE TABLE hs_t AS SELECT 0 AS n WHERE false;
+
+query I
+SELECT fabricator_host_exec('INSERT INTO hs_t VALUES (1),(2)');
+----
+2
+
+# The table spelling of the SAME name, in the same session — each ran once, so the total is 3.
+query I
+SELECT * FROM fabricator_host_exec('INSERT INTO hs_t VALUES (3)');
+----
+1
+
+query I
+SELECT count(*) FROM hs_t;
+----
+3
+
+# A NULL statement is NULL, not "zero rows affected" — the two mean different things.
+query I
+SELECT fabricator_host_exec(NULL);
+----
+NULL
+
+# ============================================================================================
+# ⚠⚠ VOLATILE IS LOAD-BEARING: an EXPLAIN MUST NOT EXECUTE IT.
+#
+# Without FunctionStability::VOLATILE, DuckDB constant-folds a call over constant arguments at PLAN time —
+# so `EXPLAIN SELECT fabricator_host_exec('CREATE …')` would perform the DDL for a statement that executes
+# nothing. That is the same class measured for bind-time host queries (docs/fluid-templating.md §8.3), and
+# the reason the DDL-shaped surface is a TABLE function first and a scalar second.
+# ============================================================================================
+
+statement ok
+CREATE TABLE hs_audit AS SELECT 0 AS n WHERE false;
+
+statement ok
+EXPLAIN SELECT fabricator_host_exec('INSERT INTO hs_audit VALUES (1)');
+
+query I
+SELECT count(*) FROM hs_audit;
+----
+0
+
+# ============================================================================================
+# ⚠⚠ AND WHAT VOLATILE DOES *NOT* PREVENT: PER-ROW EVALUATION. Asserted as the real behaviour, because it
+# is the reason to prefer the TABLE form for DDL — three input rows, three executions.
+#
+# ⚠ THE AGGREGATE MUST CONSUME THE COLUMN. With `count(*)` DuckDB PRUNES a projected column no aggregate
+# reads, so the scalar is evaluated ZERO times and this section would assert the opposite of the truth while
+# passing. That trap is recorded in CLAUDE.md and it caught the first version of this very measurement.
+# `sum()` reads the value, so the evaluation really happens.
+# ============================================================================================
+
+query I
+SELECT sum(x) FROM (SELECT fabricator_host_exec('INSERT INTO hs_audit VALUES (9)') AS x FROM range(3));
+----
+3
+
+query I
+SELECT count(*) FROM hs_audit;
+----
+3
+
+# THE CONTRAST that justifies preferring the table form: one scan, one execution, whatever the cardinality.
+query I
+SELECT count(*) FROM (SELECT * FROM fabricator_host_exec('INSERT INTO hs_audit VALUES (5)'));
+----
+1
+
+query I
+SELECT count(*) FROM hs_audit;
+----
+4
+
+# Both spellings share ONE execution path (RunHostExec), so the count rule is the same for each: asked of
+# the statement, not inferred from its columns.
+query I
+SELECT fabricator_host_exec('SELECT 99::BIGINT');
+----
+0
+
+# ============================================================================================
+# NAMED SOURCES: how many times a bound scan invokes the registered factory
+#
+# ⚠⚠ THE COST IS INVISIBLE IN ORDINARY DATA, which is why the two instruments exist. Each yields ONE row —
+# how many times its own factory had been invoked BEFORE this invocation — so reading each TWICE makes the
+# DELTA the number of invocations one bound scan costs. Same mechanism on both sides, so the baseline and the
+# improvement come from one comparison rather than two unrelated assertions.
+#
+#   fabricator_demo_eager  registered with NO schema  => the BIND must open a stream to learn the columns,
+#                                                        so the factory runs at bind AND at scan. Delta 2.
+#   fabricator_demo_lazy   registered WITH a schema   => the bind answers from the declaration and never
+#                                                        reaches the factory. Delta 1.
+#
+# ⚠ THIS IS THE ONLY PLACE EITHER INSTRUMENT IS SCANNED. Their counters are per-process and cumulative, so a
+# scan anywhere else in this file would shift these numbers. The bare replacement-scan spelling
+# (`FROM fabricator_demo_eager`) would count too — hence the explicit fabricator_scan(...) form throughout.
+# ============================================================================================
+
+query I
+SELECT * FROM fabricator_scan('fabricator_demo_eager');
+----
+1
+
+query I
+SELECT * FROM fabricator_scan('fabricator_demo_eager');
+----
+3
+
+# ⇒ delta 2: the bind opened a stream purely to read its schema, and the scan opened another for the rows.
+# That is what `RegisterSource`'s doc used to describe as "invoked per scan" — the sentence an author would
+# write an expensive or side-effecting factory against.
+
+query I
+SELECT * FROM fabricator_scan('fabricator_demo_lazy');
+----
+0
+
+query I
+SELECT * FROM fabricator_scan('fabricator_demo_lazy');
+----
+1
+
+# ⇒ delta 1, and the FIRST value is 0 rather than 1: the bind never reached the factory at all. That zero is
+# the whole claim — a declared schema makes the bind free.
+
+# The pre-existing source is undisturbed by the registry change (it declares no schema, so it keeps the
+# two-invocation behaviour; only its DATA is asserted here, as before).
+query I
+SELECT sum(value)::BIGINT FROM fabricator_scan('fabricator_demo_numbers');
+----
+60
+
+# An unregistered name still errors clearly rather than yielding an empty result.
+statement error
+SELECT * FROM fabricator_scan('no_such_source_at_all_xyz');
+----

@@ -415,13 +415,25 @@ case "$TIER" in
         # ABI v80 scalar-bind commit took verify_global_functions 101 -> 118 and did not bump this floor, so
         # the tree ran 17 assertions above it for a day. Surfaced by the CDC slice's hermetic run coming out
         # at 8003 against a floor of 7986 and the delta not being attributable to the change under test.
+        # 8250 since 2026-09-01 (same day, THIRD bump): verify_host_query 31 -> 98 across the whole
+        # host_query pass -- the double-execution fix, fabricator_host_exec (the DDL/DML sibling, table form
+        # AND scalar under one name), and the NAMED-SOURCE factory fix, whose two instruments are the only
+        # way its cost is visible from SQL. 8183 + 67 = 8250 exactly, from a green 74/74 run, which is what
+        # shows no other suite moved. The 8205 note it supersedes:
+        # 8205 since 2026-09-01 (same day, second bump): +22 on verify_host_query (31 -> 53) for the
+        # DOUBLE-EXECUTION fix -- fabricator_host_query ran its SQL twice (PopulateReturnSchema ran the bind
+        # factory for the schema, the scan ran it again for the data), so one call of an INSERT left TWO
+        # rows. The bind now DESCRIBES via a prepared statement. 8183 + 22 = 8205 exactly, from a green
+        # 74/74 run, which is what shows no other suite moved. /!\ Only a COUNTING assertion can see this:
+        # every "the rows are right" test in that file passed with the defect fully present. The 8183 note
+        # it supersedes:
         # 8183 since 2026-09-01: fabricator_render MOVED OUT to Fabricator.FluidPlugin, taking
         # verify_global_functions 178 -> 164 (-14). A DOWNWARD bump, which is the rare one: the assertions
         # were not deleted, they moved to verify_plugin_fluid (service tier, 20) because a plugin cannot be
         # loaded in a tier that points FABRICATOR_PLUGIN_DIR at an empty directory on purpose. The one thing
         # only render covered here -- an untyped NULL in an ANY-declared position -- was re-homed onto the
         # VARARGS tail in the same suite rather than dropped. The 8197 note it supersedes:
-        : "${MIN_ASSERTIONS:=8183}"
+        : "${MIN_ASSERTIONS:=8250}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

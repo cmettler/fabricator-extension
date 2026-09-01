@@ -229,3 +229,185 @@ ABI minimal. Both get parameter binding for free.
 
 - **Connection pool** for hot `host_query` callers (create-per-call first).
 - **Same-transaction** reads — intentionally not supported (would require the live context = corruption).
+
+## ⚠⚠ `fabricator_host_query` USED TO EXECUTE ITS SQL TWICE — found and FIXED 2026-09-01
+
+**MEASURED before the fix**: `SELECT * FROM fabricator_host_query('INSERT INTO audit VALUES (1)')`, called
+ONCE, left **2 rows**. DDL doubled too — the second `CREATE TABLE` failed *"already exists"* from a statement
+the user issued once. After: **1 row**, and the DDL runs once.
+
+It was the SAME defect fixed for `fabricator_query` in `0acd679` (2026-08-24), and `HostQueryBind`'s own
+comment described it:
+
+> *"PopulateReturnSchema runs the factory once for the schema; the scan runs it again for the data — like the
+> other fabricator table functions."*
+
+⚠ **That justification was STALE in its load-bearing clause.** "Like the other fabricator table functions"
+was true when written; `fabricator_query` was fixed precisely so it no longer does this, so the sibling the
+comment appealed to had become the counter-example. **A justification by analogy ages when the analogue is
+fixed, and nothing re-checks it.**
+
+⚠ **IT WAS THE SQL FUNCTION ONLY, NOT THE C# `Host.Query`.** Measured separately: a C# caller runs the
+statement ONCE (the slice-2 bind probe wrote exactly one row per bind). The doubling came from
+`PopulateReturnSchema` running the bind factory to obtain the output schema — i.e. from the TABLE FUNCTION's
+bind, which only the SQL surface has.
+
+### The fix — describe instead of execute
+
+`HostQueryBind` now sets `bind_data->schema_factory`, the existing "the bound object can describe itself"
+seam, filled from a **PREPARED statement**: DuckDB carries the bound plan's result `types`/`names` without
+running it. Cheaper than `fabricator_query`'s fix, which needed the provider to describe remote SQL
+(`sp_describe_first_result_set`); here the engine describes its own statements natively.
+
+⚠ **The describe and the execute must BIND IDENTICALLY**, or the declared schema and the delivered batches
+could disagree — and the scan reads batches through converters built from the DECLARED schema. So the session
+application (search path, TimeZone) was factored into one `ApplyHostQuerySession` that both call, and both
+derive the Arrow schema the same way (`ArrowConverter::ToArrowSchema` over the plan's types/names with
+`BoundaryClientProperties`).
+
+⚠ **A DOCUMENTED FALLBACK, not a silent one.** `Prepare` handles ONE statement; `SendQuery` accepts several
+in a string. Rather than turn a working call into a bind error, the bind falls back to the old path there, so
+a multi-statement call keeps its PRE-EXISTING behaviour — double execution included. Pinned in
+`verify_host_query` as the value it really produces (two rows from one call).
+
+⚠⚠ **"Still works" is too kind, and the gate says so.** Double execution means a NON-IDEMPOTENT prefix
+FAILS: `fabricator_host_query('CREATE TABLE mk …; SELECT * FROM mk')` creates `mk` on the describe run and
+then collides with itself on the data run — measured, *"Table with name mk already exists!"*. That is
+UNCHANGED from before the fix (everything double-executed then, so this shape failed identically), and it is
+also why describing cannot be MADE to work here rather than merely being unimplemented: **the last
+statement's schema can depend on the earlier statements' effects**, so there is nothing to describe until
+they have run.
+
+⚠ **A behaviour change worth knowing**: a bind/parse error now surfaces at BIND rather than mid-scan. Better,
+and the same change `fabricator_query`'s fix made.
+
+⚠ **`fabricator_scan` (`NamedScanBind`) IS NOT THE SAME DEFECT — corrected after actually reading the C#
+side, having first been written up here as "the identical shape".** `Host.RegisterSource` registers a
+**factory** (`Func<IArrowArrayStream>`), and `PopulateReturnSchema` opens a stream, reads `get_schema` and
+releases it **without ever pulling a batch**. So the bind does not execute anything the caller wrote; it
+INVOKES THE FACTORY. Whether that costs is entirely the factory's business — lazy ones are nearly free, eager
+ones repeat their work, side-effecting ones repeat their effect.
+
+It is fixed below, differently and more cheaply than `host_query`'s was.
+
+Gate: `verify_host_query` 31 → 53 for THIS section (the suite ends the pass at **98** — see the totals at
+the foot of this page), mutation-tested: restoring describe-by-execute dies at exactly the `count(*)`
+assertion. ⚠ Only a COUNTING assertion can see this — every "the rows are right" test in that file passed
+with the defect fully present, which is how it survived.
+
+## `fabricator_host_exec(sql)` — the DDL/DML sibling (added 2026-09-01)
+
+```sql
+SELECT * FROM fabricator_host_exec('INSERT INTO t VALUES (1),(2),(3)');   -- affected = 3
+```
+
+One `BIGINT` column, `affected`. It exists because of the section above: `fabricator_host_query` must declare
+its output columns at BIND, which for arbitrary SQL means asking DuckDB to prepare the statement — impossible
+for several statements in one string, and impossible in principle when a later statement's schema depends on
+an earlier one's effects. Those fall back to describing by EXECUTING.
+
+**exec has a FIXED output schema, so there is nothing to describe, nothing to prepare, and the statement runs
+EXACTLY ONCE whatever it is.** That is the point of the function, not a side benefit — and it is what makes
+this work where the sibling cannot:
+
+```sql
+-- through host_query: "Table with name he_both already exists!" (the describe run created it)
+-- through host_exec:  both statements run, once each
+SELECT * FROM fabricator_host_exec('CREATE TABLE t AS SELECT 1 AS c; INSERT INTO t VALUES (2)');
+```
+
+- **The count is ASKED OF THE STATEMENT**, via DuckDB's own `StatementReturnType::CHANGED_ROWS`, not inferred
+  from column types — so a `SELECT` returning one `BIGINT` does not get its first value mistaken for a count.
+- **For several statements it is the LAST one's**, because `SendQuery` returns the last result.
+- ⚠ **A CTAS reports 0 though it created rows.** DuckDB does not classify `CREATE` as a row-count statement,
+  and 0 also matches `Host.ExecuteNonQuery`'s existing contract ("DML → a 1-row BIGINT Count; DDL → 0"), so
+  the SQL surface and the C# one agree.
+- ⚠ **The result is NORMALISED, not passed through**: whatever the statement returns is discarded. Without
+  that the fixed schema would be a lie — a `SELECT` would declare one BIGINT and deliver something else, and
+  the scan reads batches through converters built from the DECLARED schema.
+- Same fresh connection and committed-reads semantics as `fabricator_host_query`, asserted side by side so
+  the pair cannot drift.
+
+### Both spellings exist
+
+```sql
+SELECT * FROM fabricator_host_exec('…');   -- TABLE form: one row, runs once per scan
+SELECT fabricator_host_exec('…');          -- SCALAR form, for symmetry with fabricator_exec
+```
+
+⚠ **A scalar and a table function SHARE the name**, which is a non-obvious DuckDB fact and is pinned rather
+than assumed: they live in different catalog sets, so each resolves in its own syntactic position and neither
+shadows the other. Both go through ONE execution path (`RunHostExec`), so the count rule, the session
+handling and the error prefix cannot drift between them.
+
+⚠⚠ **PREFER THE TABLE FORM FOR DDL**, and the reason is measured rather than stylistic:
+
+- The scalar is **`VOLATILE`, and that is load-bearing**. Without it DuckDB constant-folds a call over
+  constant arguments at PLAN time, so `EXPLAIN SELECT fabricator_host_exec('INSERT …')` would perform the
+  insert for a statement that executes nothing. Mutation-tested: dropping the volatility makes exactly that
+  assertion fail, 1 instead of 0.
+- **What volatile does NOT prevent is PER-ROW evaluation.** In a row context the statement runs once per
+  row — measured, `SELECT fabricator_host_exec('INSERT …') FROM range(3)` performs three inserts. The table
+  form runs once per scan whatever the cardinality.
+- ⚠ Measuring that needs an aggregate that CONSUMES the column: with `count(*)` DuckDB prunes a projected
+  column no aggregate reads, so the scalar is evaluated zero times and the measurement asserts the opposite
+  of the truth while passing. That trap caught the first version of this very check.
+
+A `NULL` statement yields `NULL`, not 0 — "no statement" and "zero rows affected" are different claims.
+
+## Named sources: the factory is invoked TWICE per bound scan (fixed 2026-09-01)
+
+`Host.RegisterSource`'s doc said the factory *"is invoked per scan to produce a fresh stream."* **That was
+wrong, and it is the sentence an author would write an expensive or side-effecting factory against**: it is
+invoked once per BIND and once per SCAN, and binds REPEAT — every use of a view over the source, every
+`EXECUTE` of a prepared statement.
+
+**The fix is an optional declared schema**, C#-only, no ABI change and no C++ change:
+
+```csharp
+Host.RegisterSource("my_source", factory, schema);   // the bind never invokes `factory`
+```
+
+`OpenSource` then returns a wrapper that answers the schema from the declaration and opens the real stream on
+the first batch pull — which the bind never performs. So the factory runs **exactly once, by the scan**. Use
+it whenever producing a stream costs anything: opening a connection, running a query, buffering. Sources that
+declare no schema keep the old behaviour.
+
+⚠ **The declaration is VERIFIED on the first pull**, because the host builds its Arrow→DuckDB converters from
+the DECLARED schema and reads the delivered batches through them — a mismatch would be read as data rather
+than reported. The check covers the column COUNT, the column NAMES and each column's `TypeId`; it does NOT
+compare a type's PARAMETERS, so a declared `decimal(18,4)` against a produced `decimal(9,2)` passes.
+`IArrowType.Equals` is REFERENCE equality in Apache.Arrow, so real structural comparison needs a hand-written
+comparer — `SqlServerCdcReader.SameType` is one, private to another assembly. **Consolidating the two into
+the bridge is the right follow-up.**
+
+⚠ **The cost is invisible in ordinary data**, so two instruments ship and the gate reads them rather than
+asserting nothing: `fabricator_demo_eager` (no declared schema) and `fabricator_demo_lazy` (declared) each
+yield one row — how many times its own factory ran before this invocation. Read twice, the DELTA is the
+invocations one bound scan costs. MEASURED: eager `1, 3` (delta 2); lazy `0, 1` (delta 1), and that leading
+**0** is the whole claim — the bind never reached the factory. Same mechanism on both sides, so baseline and
+fix come from one comparison. Mutation-tested: ignoring the declared schema turns that 0 into a 1.
+
+### ⚠ A LATER DIRECTION, not built: registration by LOOKUP rather than by name
+
+Recorded 2026-09-01 (user): the replacement-scan mechanism will want revisiting, and the shape it likely
+needs is **a lookup function plus a schema function** rather than eager per-name registration — i.e. the host
+asks "do you have a source called X, and what is its schema" instead of the provider having enumerated every
+name up front. That suits a provider whose source set is large or dynamic, which the current dictionary
+cannot express at all.
+
+The declared-schema overload above is a step toward it rather than a detour: it already separates *what the
+columns are* from *producing the data*, which is precisely the split a lookup+schema pair formalises. Revisit
+both together.
+
+## Gate totals for the whole pass
+
+`verify_host_query` **31 → 98** (hermetic), across the three changes on this page: the double-execution fix
+(→ 53), `fabricator_host_exec` in both spellings (→ 92), and the named-source declared schema (→ 98).
+
+**FIVE mutants, each killed at its own assertion** — describe-by-execute, count-by-type-inference, dropping
+the scalar's volatility, removing the `schema_factory`, and ignoring a source's declared schema.
+
+Tiers on the final payload: hermetic **74/74 — 8250** (8183 + exactly this suite's 67, which is what shows no
+other suite moved) and service **54/54 — 3162** unchanged, since `verify_host_query` is hermetic — that run
+is the regression check for the C# Bridge change, not a floor bump.

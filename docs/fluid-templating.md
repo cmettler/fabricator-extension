@@ -531,6 +531,20 @@ then the write has happened.
 
 - **Slice 3** (`HostQueryTransport` + a Fluid `query`) is unblocked, with §8.3's SELECT-only refusal added to
   its scope and §8.2 as a documented semantic. No bind/execute asymmetry to build around.
+
+  **⚠ WHAT THE host_query PASS CHANGED FOR IT (2026-09-01, after slice 2 — read this before starting):**
+  - **`fabricator_host_query` no longer executes its SQL twice.** It did when slice 2's probe ran, so a
+    Fluid `query` built then would have run every template's SQL twice. Fixed; see
+    [host-query.md](host-query.md). ⚠ The residue is multi-statement SQL, which still double-executes and
+    therefore FAILS on a non-idempotent prefix — one more reason for the SELECT-only refusal below.
+  - **§8.3's SELECT-only refusal now has somewhere to point.** `fabricator_host_exec(sql)` exists as the
+    honest home for DDL/DML on the host, so `query`'s refusal is not "you cannot do this" but "use exec" —
+    a better surface than a bare error. The refusal itself is unchanged and still mandatory: it must key on
+    the STATEMENT KIND before execution, because a bind-time write fires on `EXPLAIN`.
+  - **⚠ The seam should carry the SCHEMA question too.** `Host.RegisterSource` grew a declared-schema
+    overload the same day for exactly the reason slice 3 will meet: a bind must learn columns, and the only
+    alternative to declaring them is producing data. Whatever `HostQueryTransport` ends up looking like,
+    decide up front how a caller says "these are my columns" without running anything.
 - **Slice 5** (dynamic DuckDB function resolution) inherits the same verdict — it is the same re-entry.
 - ⚠ Slice 3 still needs the `HostQueryTransport` seam of §2 regardless: this probe reached `Host.Query`
   because it lived in a first-party assembly. The plugin still cannot.

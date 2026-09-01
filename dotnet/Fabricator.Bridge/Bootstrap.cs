@@ -67,6 +67,29 @@ public static unsafe class Bootstrap
             return new InMemoryArrayStream(schema, new[] { batch });
         });
 
+        // ---- INSTRUMENTS for the named-source registry, and the ONLY way its cost is visible from SQL ----
+        //
+        // Each yields ONE row: how many times its own factory had been invoked BEFORE this invocation. Read
+        // twice in a session, the DELTA is the number of factory invocations one bound scan costs — which is
+        // the property `RegisterSource`'s schema overload exists to change, and which no row of ordinary data
+        // could ever show.
+        //
+        //   fabricator_demo_eager  declares no schema => the BIND must open a stream to learn the columns, so
+        //                          the factory runs at bind AND at scan. Delta 2.
+        //   fabricator_demo_lazy   declares its schema => the bind answers from the declaration and never
+        //                          reaches the factory. Delta 1.
+        //
+        // Shipped deliberately, like fabricator_wait: an instrument whose answer cannot be blamed on the
+        // machinery it measures. Both are trivial and side-effect-free apart from their own counter.
+        var probeSchema = new Apache.Arrow.Schema(
+            new[] { new Apache.Arrow.Field("prior_invocations", Apache.Arrow.Types.Int64Type.Default, false) },
+            null);
+        Host.RegisterSource("fabricator_demo_eager",
+                            () => OneRowStream(probeSchema, Interlocked.Increment(ref _eagerOpens) - 1));
+        Host.RegisterSource("fabricator_demo_lazy",
+                            () => OneRowStream(probeSchema, Interlocked.Increment(ref _lazyOpens) - 1),
+                            probeSchema);
+
         vtable->AbiVersion = 81;
         vtable->OpenCatalog = &OpenCatalog;
         vtable->CloseCatalog = &CloseCatalog;
@@ -1024,6 +1047,18 @@ public static unsafe class Bootstrap
             SetError(err, ex);
             return FabricatorStatus.Error;
         }
+    }
+
+    // Factory-invocation counters for the two named-source instruments registered in Initialize.
+    private static int _eagerOpens;
+    private static int _lazyOpens;
+
+    /// <summary>One row, one BIGINT — the payload of the named-source instruments.</summary>
+    private static Apache.Arrow.Ipc.IArrowArrayStream OneRowStream(Apache.Arrow.Schema schema, long value)
+    {
+        var col = new Apache.Arrow.Int64Array.Builder().Append(value).Build();
+        var batch = new Apache.Arrow.RecordBatch(schema, new Apache.Arrow.IArrowArray[] { col }, 1);
+        return new InMemoryArrayStream(schema, new[] { batch });
     }
 
     // Ambient named-source registry (data-in by name) — see Host.RegisterSource. open_named_input exports a
