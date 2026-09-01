@@ -165,3 +165,494 @@ statement error
 SELECT fabricator_render('{% if %}', '{}');
 ----
 <REGEX>:.*template parse error.*
+
+# ============================================================================================
+# fluid_query — the template IS the SQL (slice 1)
+#
+# A SQL-GENERATING table function (ISqlTableFunction): at BIND time DuckDB hands the generator the call's
+# constant arguments and SUBSTITUTES the returned SELECT for the call. So the output schema is arg-dependent
+# for free, nothing streams through C# at execution, and the generated SQL's own scans keep their pushdown.
+# See docs/macros-and-sqlgen-functions.md §2 and docs/fluid-templating.md.
+# ============================================================================================
+
+query II
+SELECT DISTINCT function_name, function_type FROM duckdb_functions() WHERE function_name = 'fluid_query';
+----
+fluid_query	table
+
+# `params` is NAMED and OPTIONAL, so a template with no variables needs no bag at all.
+query II
+SELECT * FROM fluid_query('SELECT 1 AS a, ''x'' AS b');
+----
+1	x
+
+query I
+SELECT * FROM fluid_query('SELECT {{ n }} AS n', params := {'n': 7});
+----
+7
+
+query I
+SELECT * FROM fluid_query('SELECT {% if big %}999{% else %}1{% endif %} AS v', params := '{"big":true}');
+----
+999
+
+# An explicit NULL bag is the same as none — the ANY-declared slot carries an untyped NULL (see the
+# fabricator_render assertion above for why that crossing is worth pinning).
+query I
+SELECT * FROM fluid_query('SELECT 1 AS v', params := NULL);
+----
+1
+
+# ---- THE SHAPE sqlgen EXISTS FOR: the SQL TEXT, not just the values, depends on the argument ----
+#
+# The COLUMN LIST comes from the argument, so the same call with a different bag has a different output
+# schema. A macro cannot express this; a marshaled table function would have to declare one schema up front.
+
+query II
+SELECT * FROM fluid_query(
+  'SELECT {% for c in cols %}{{ c | sql_ident }}{% unless forloop.last %}, {% endunless %}{% endfor %} FROM (SELECT 1 AS a, 2 AS b, 3 AS c)',
+  params := {'cols': ['a','c']});
+----
+1	3
+
+query I
+SELECT count(*) FROM (DESCRIBE SELECT * FROM fluid_query(
+  'SELECT {% for c in cols %}{{ c | sql_ident }}{% unless forloop.last %}, {% endunless %}{% endfor %} FROM (SELECT 1 AS a, 2 AS b, 3 AS c)',
+  params := {'cols': ['a','b','c']}));
+----
+3
+
+# ============================================================================================
+# ⚠⚠ COMPARISON AND ARITHMETIC — THE ASSERTIONS THIS WHOLE FILE TURNS ON
+#
+# Fluid 3.0.0-beta.7 understands System.Text.Json's JsonNode natively, and that support RENDERS CORRECTLY
+# WHILE COMPUTING WRONG: bound with no value converter, `{{ d.i }}` prints 3 and `{% if d.i > 1 %}` takes the
+# ELSE branch, `{{ d.money | plus: 1 }}` with 19.99 gives 1, and `{% if d.s == 'x' %}` with s = "x" is FALSE.
+# Leaves arrive as opaque nodes: they format faithfully and compare as nothing.
+#
+# ⇒ EVERY RENDER ASSERTION IN THIS FILE PASSES ON A BUILD WITH NO CONVERTER. These do not. And because
+# fluid_query's rendered text IS the statement, a wrong {% if %} branch there is a wrong SQL statement — the
+# silent-wrong-answer class, not a formatting nit. See FluidValueModel's header for the full measurement.
+# ============================================================================================
+
+query I
+SELECT * FROM fluid_query('SELECT {% if n > 5 %}''big''{% else %}''small''{% endif %} AS c', params := '{"n":7}');
+----
+big
+
+query I
+SELECT * FROM fluid_query('SELECT {{ n | plus: 1 }} AS v', params := '{"n":41}');
+----
+42
+
+query III
+SELECT fabricator_render('{% if n > 1 %}big{% else %}small{% endif %}', '{"n":3}') AS cmp,
+       fabricator_render('{{ n | plus: 1 }}', '{"n":19.99}')                       AS arith,
+       fabricator_render('{% if s == "x" %}y{% else %}n{% endif %}', '{"s":"x"}')  AS streq;
+----
+big	20.99	y
+
+# The same three through an Arrow STRUCT rather than JSON — a different code path to the same value model.
+query III
+SELECT fabricator_render('{% if n > 1 %}big{% else %}small{% endif %}', {'n': 3}) AS cmp,
+       fabricator_render('{{ n | plus: 1 }}', {'n': 19.99::DECIMAL(10,2)})        AS arith,
+       fabricator_render('{% if s == "x" %}y{% else %}n{% endif %}', {'s': 'x'})  AS streq;
+----
+big	20.99	y
+
+# Comparison THROUGH a nested Arrow struct — the nested reader must produce a real number too, not a string.
+query I
+SELECT fabricator_render('{% if o.deep > 40 %}y{% else %}n{% endif %}', {'o': {'deep': 42}});
+----
+y
+
+# ============================================================================================
+# THE NUMBER LADDER: int64 -> decimal -> refuse
+#
+# ⚠ A SHIPPED BUG THIS FIXED, and it is this repo's own recorded trap in a new place. JsonToClr read
+#   `e.TryGetInt64(out var l) ? l : e.GetDouble()`
+# whose branches C# unifies to DOUBLE (long converts to double implicitly, not the reverse) — so the int64
+# branch had NEVER had any effect and every JSON integer went through a double. Fluid then builds its
+# NumberValue with Convert.ToDecimal, which keeps 15 significant digits. Invisible for small integers, which
+# is why nothing caught it. Same shape as ReadTimestamp's documented (object) casts, one method away.
+# ============================================================================================
+
+query IIII
+SELECT fabricator_render('{{ n }}', '{"n":9007199254740993}')             AS json_bigint,
+       fabricator_render('{{ n }}', {'n': 9007199254740993::BIGINT})      AS struct_bigint,
+       fabricator_render('{{ n }}', '{"n":19.99}')                        AS money,
+       fabricator_render('{{ n }}', '{"n":0}')                            AS zero;
+----
+9007199254740993	9007199254740993	19.99	0
+
+# ⚠ A CONSEQUENCE OF THE LADDER, pinned so it is a decision rather than a surprise: taking the decimal rung
+# preserves a JSON number's written form, so `3.0` renders `3.0` where a double rendered `3`. In a function
+# whose output is SQL that is the better answer (the literal keeps its type), but it IS a change.
+query I
+SELECT fabricator_render('{{ n }}', '{"n":3.0}');
+----
+3.0
+
+# ⚠ REFUSED rather than rendered as 0 or failing mid-render inside Fluid. Fluid's number model is DECIMAL, so
+# a magnitude outside it cannot be represented at all: without this, 1e100 raises Fluid's own
+# "Value was either too large or too small for a Decimal" naming neither the parameter nor the value, and
+# 1e-30 renders as `0` — a silently wrong number spliced into a SQL statement. The `zero` column asserted
+# just above is the POSITIVE CONTROL: a real 0 must still render, or this check would be refusing everything.
+
+statement error
+SELECT fabricator_render('{{ n }}', '{"n":1e100}');
+----
+<REGEX>:.*cannot be represented in a template.*
+
+statement error
+SELECT fabricator_render('{{ n }}', '{"n":1e-30}');
+----
+<REGEX>:.*cannot be represented in a template.*
+
+# The same refusal on the ARROW path, so a DuckDB DOUBLE cannot smuggle it past the JSON check.
+statement error
+SELECT fabricator_render('{{ n }}', {'n': 1e100::DOUBLE});
+----
+<REGEX>:.*cannot be represented in a template.*
+
+# ============================================================================================
+# WHAT IS AND IS NOT QUOTED — {{ }} is RAW by design; `sql` / `sql_ident` are the opt-in
+#
+# Raw interpolation is the entire point of generating SQL from a template: a template must be able to emit
+# object names, predicates and whole fragments. So values that are DATA get an explicit filter, and both are
+# ALLOW-LISTS (the fabricator_va_values precedent) — a value with no provably safe rendering is refused by
+# name rather than interpolated.
+# ============================================================================================
+
+query I
+SELECT * FROM fluid_query('SELECT {{ v | sql }} AS v', params := {'v': 'O''Brien'});
+----
+O'Brien
+
+# A quote in an IDENTIFIER, likewise doubled rather than breaking the statement.
+query I
+SELECT column_name FROM (DESCRIBE SELECT * FROM fluid_query('SELECT 1 AS {{ n | sql_ident }}', params := {'n': 'we"ird'}));
+----
+we"ird
+
+# nil renders as SQL NULL, not as the empty string (which would be a syntax error, or worse, '').
+query I
+SELECT * FROM fluid_query('SELECT {{ v | sql }} AS v', params := {'v': NULL::VARCHAR});
+----
+NULL
+
+statement error
+SELECT * FROM fluid_query('SELECT {{ v | sql }}', params := {'v': [1,2]});
+----
+<REGEX>:.*cannot render a.*as a SQL literal.*
+
+# ============================================================================================
+# THE PLAN: the call is GONE, and the generated SQL's own scans keep their pushdown
+#
+# This is the property that separates sqlgen from a marshaled table function, and no row assertion can see
+# it — the same rows come back either way.
+# ============================================================================================
+
+statement ok
+CREATE TABLE fq_t AS SELECT i AS id, i%7 AS g, 'v'||i AS v FROM range(1000) s(i);
+
+# Projection AND filter reach the base table; `fluid_query` appears nowhere.
+query II
+EXPLAIN SELECT id FROM fluid_query('SELECT * FROM fq_t WHERE g = {{ g }}', params := {'g': 3});
+----
+physical_plan	<REGEX>:.*SEQ_SCAN.*fq_t.*Projections: id.*Filters: g=3.*
+
+query I
+SELECT count(*) FROM fluid_query('SELECT * FROM fq_t WHERE g = {{ g }}', params := {'g': 3});
+----
+143
+
+# A VIEW over it re-binds on every use — the generator's contract is "deterministic and side-effect free,
+# because binds repeat and happen without execution".
+statement ok
+CREATE VIEW fq_v AS SELECT * FROM fluid_query('SELECT id FROM fq_t WHERE g = {{ g }}', params := {'g': 5});
+
+query I
+SELECT count(*) FROM fq_v;
+----
+143
+
+query I
+SELECT count(*) FROM fq_v;
+----
+143
+
+# ============================================================================================
+# THE PARAMS BAG: STRUCT, MAP or JSON, meaning the same thing in each
+#
+# ⚠ One value model serves both functions deliberately: two mappings would let the same bag render
+# differently depending on which function received it.
+# ============================================================================================
+
+query I
+SELECT fabricator_render('{{ a }}-{{ b }}', MAP {'a': 'one', 'b': 'two'});
+----
+one-two
+
+# Nested struct, nested list, list indexing and .size, all from one Arrow bag.
+query I
+SELECT fabricator_render('{{ o.deep }}|{% for t in tags %}{{ t }};{% endfor %}|{{ tags[1] }}|{{ tags.size }}',
+                         {'o': {'deep': 42}, 'tags': ['a','b','c']});
+----
+42|a;b;c;|b|3
+
+# ⚠ ORDINAL access, for a row whose members have no usable names. MEASURED: Fluid resolves `p[0]` by asking
+# the indexable for the KEY "0", so an int-parse fallback IS index access — it is not a second mechanism. A
+# member genuinely NAMED "0" therefore wins, which is the right precedence.
+query I
+SELECT fabricator_render('{{ p[0] }}/{{ p[1] }}', {'p': {'x': 1, 'y': 2}});
+----
+1/2
+
+statement error
+SELECT fabricator_render('{{ n }}', 'not json');
+----
+<REGEX>:.*params is not valid JSON.*
+
+statement error
+SELECT fabricator_render('{{ n }}', '[1,2]');
+----
+<REGEX>:.*params JSON must be an OBJECT.*
+
+# A template that renders to nothing is refused by the shared sqlgen plumbing, naming the function.
+statement error
+SELECT * FROM fluid_query('   ');
+----
+<REGEX>:.*generated no SQL.*
+
+# ============================================================================================
+# DRIVING THE TEMPLATE FROM SQL — a prepared parameter, and a session variable
+#
+# A sqlgen generator sees constant VALUES, never expressions, so "where does the bag come from" is a real
+# question for anyone building a pipeline on this. Both routes work, and the second is the one that reads a
+# bag out of a table without a client.
+# ============================================================================================
+
+statement ok
+PREPARE fq_p AS SELECT * FROM fluid_query('SELECT {{ n }} AS n', params := ?);
+
+query I
+EXECUTE fq_p({'n': 1});
+----
+1
+
+# The SAME prepared statement, a different bag: DuckDB re-binds every EXECUTE, so the generator runs again
+# and the substituted SQL differs.
+query I
+EXECUTE fq_p({'n': 2});
+----
+2
+
+# ⚠ AND THE OUTPUT SCHEMA MAY DIFFER BETWEEN TWO EXECUTES OF ONE PREPARED STATEMENT — measured, and worth
+# pinning because it is surprising: a prepared statement is normally a fixed plan with a fixed result shape.
+# Here the re-bind re-renders the template, so the column LIST is whatever this EXECUTE's bag says.
+statement ok
+PREPARE fq_pc AS SELECT * FROM fluid_query(
+  'SELECT {% for c in cols %}{{ c | sql_ident }}{% unless forloop.last %}, {% endunless %}{% endfor %} FROM (SELECT 1 AS a, 2 AS b, 3 AS c)',
+  params := ?);
+
+query I
+EXECUTE fq_pc({'cols': ['a']});
+----
+1
+
+query III
+EXECUTE fq_pc({'cols': ['a','b','c']});
+----
+1	2	3
+
+# A session variable is the pure-SQL way to feed the bag — the same idiom the CDC reader documents for
+# carrying a cursor, and it means a template-driven pipeline needs no client and no spliced literal.
+statement ok
+SET VARIABLE fq_cols = ['a','c'];
+
+query II
+SELECT * FROM fluid_query(
+  'SELECT {% for c in cols %}{{ c | sql_ident }}{% unless forloop.last %}, {% endunless %}{% endfor %} FROM (SELECT 1 AS a, 2 AS b, 3 AS c)',
+  params := {'cols': getvariable('fq_cols')});
+----
+1	3
+
+# ============================================================================================
+# TEMPORAL AND BINARY VALUES
+#
+# ⚠⚠ A DATE USED TO RENDER THE PREVIOUS DAY. `Date32Array.GetDateTime` returns a DateTime with
+# `Kind = Unspecified`, which Fluid resolves against the machine's LOCAL zone, so on a UTC+2 box
+# `DATE '2026-09-01'` rendered as `2026-08-31 22:00:00Z` — and fluid_query would have spliced that wrong
+# date into a statement. The fix is the KIND (`DateTime.SpecifyKind(..., Utc)`).
+#
+# ⚠ `TemplateOptions.TimeZone` is NOT the fix and setting it changes nothing — MEASURED, an Unspecified
+# midnight renders identically under TimeZoneInfo.Utc and under the local zone. `DateOnly` is not the fix
+# either: Fluid has no support for it and degrades it to a culture-dependent string (`09/01/2026`).
+#
+# ⚠ THIS SUITE CANNOT PROVE THE TIMEZONE HALF ON ITS OWN. The assertions below are correct on a UTC box
+# whether or not the fix is present; what makes them discriminating is running where local time is not UTC,
+# which is where the bug was found. Said plainly rather than implied.
+# ============================================================================================
+
+query I
+SELECT fabricator_render('{{ d }}', {'d': DATE '2026-09-01'});
+----
+2026-09-01 00:00:00Z
+
+# A wall-clock TIMESTAMP is not shifted either — it was already right (ReadTimestamp stamps it UTC), and
+# this is the CONTROL that says the date fix did not achieve its result by shifting everything else.
+query I
+SELECT fabricator_render('{{ t }}', {'t': TIMESTAMP '2026-09-01 12:34:56'});
+----
+2026-09-01 12:34:56Z
+
+query I
+SELECT fabricator_render('{{ t }}', {'t': TIMESTAMPTZ '2026-09-01 12:34:56+00'});
+----
+2026-09-01 12:34:56Z
+
+# ⚠⚠ FLUID DOES NOT ORDER TEMPORAL VALUES AT ALL, and this assertion pins that rather than wishing it away.
+# MEASURED with controls: `>` and `<` are BOTH false for two different dates (as DateTime and as
+# DateTimeOffset alike), while `==`/`!=` behave; numbers and strings compare correctly with the same
+# operators, so it is specific to temporals. A template branching on `{% if d > cutoff %}` therefore takes
+# the ELSE branch silently — the same failure class as §the value-model header, but this one is Fluid's and
+# not something the value model can fix without making a date stop being a date.
+query I
+SELECT fabricator_render('{% if a > b %}later{% else %}earlier{% endif %}',
+                         {'a': DATE '2026-09-02', 'b': DATE '2026-09-01'});
+----
+earlier
+
+# THE WORKAROUND, gated beside it so the docs are not the only place it exists: format to ISO first and
+# compare the strings. ISO-8601 sorts lexicographically, verified across a year boundary.
+query I
+SELECT fabricator_render(
+  '{% assign x = a | date: "%Y-%m-%d" %}{% assign y = b | date: "%Y-%m-%d" %}{% if x > y %}later{% else %}earlier{% endif %}',
+  {'a': DATE '2027-01-01', 'b': DATE '2026-12-31'});
+----
+later
+
+# ⚠ EVERY temporal renders as a TIMESTAMPTZ literal through `| sql`, whatever it started as: Fluid's date
+# model is one DateTimeOffset, so by the time the filter sees it a DATE, a TIMESTAMP and a TIMESTAMPTZ are
+# indistinguishable. The INSTANT survives, the TYPE does not. Pinned as a documented limitation, with the
+# cast that works around it.
+# ⚠ Asserted by TYPE and by INSTANT rather than by rendered text: a TIMESTAMPTZ's display form depends on
+# the session timezone, so pinning the string would make this suite report the runner's locale.
+query I
+SELECT typeof(raw) FROM fluid_query('SELECT {{ d | sql }} AS raw', params := {'d': DATE '2026-09-01'});
+----
+TIMESTAMP WITH TIME ZONE
+
+query I
+SELECT raw = TIMESTAMPTZ '2026-09-01 00:00:00+00'
+FROM fluid_query('SELECT {{ d | sql }} AS raw', params := {'d': DATE '2026-09-01'});
+----
+true
+
+# ⚠⚠ GETTING A DATE BACK OUT IS A TIMEZONE TRAP, AND IT IS SILENT IN EVERY DIRECTION.
+#
+# ANYTHING that reads a TIMESTAMPTZ without NAMING a timezone reads it in the SESSION's timezone — the
+# direct cast included — so in any session west of UTC it yields the PREVIOUS DAY with no error. That is
+# DuckDB behaving correctly; it is our TIMESTAMPTZ representation (forced by Fluid collapsing DATE /
+# TIMESTAMP / TIMESTAMPTZ into one DateTimeOffset) that turns it into a trap. MEASURED on the literal
+# `| sql` produces for DATE '2026-09-01':
+#
+#   route                                        UTC          America/New_York   Australia/Sydney
+#   ------------------------------------------   ----------   ----------------   ----------------
+#   ::DATE                                       2026-09-01   2026-08-31         2026-09-01
+#   ::TIMESTAMP::DATE                            2026-09-01   2026-08-31         .
+#   date_trunc('day', …)                         2026-09-01   2026-08-31         .
+#   strftime(…, '%Y-%m-%d')                      2026-09-01   2026-08-31         .
+#   extract('day' FROM …) / date_part('day', …)   1           31                 .
+#   (… AT TIME ZONE 'UTC')::DATE                 2026-09-01   2026-09-01         ok
+#   {{ d | date: '%Y-%m-%d' | sql }}::DATE       2026-09-01   2026-09-01         ok
+#
+# ⚠⚠ AN EARLIER VERSION OF THIS SECTION ASSERTED THAT `::DATE` DID NOT EXIST ("Conversion Error:
+# Unimplemented type for cast"), AND THAT WAS AN ARTIFACT OF THIS SUITE, NOT A FACT ABOUT DuckDB. The cast
+# needs ICU, unittest does not auto-load extensions, and the suite had no `require icu` — so a missing
+# REQUIRE presented as a missing FEATURE. The repo already records the opposite direction (requiring
+# something not compiled in SKIPS silently); this is the same hazard the other way round, and it is worse,
+# because it reads as a definite negative result about the engine.
+#
+# ⚠⚠ AND EVERY TEMPORAL ASSERTION IN THIS FILE IS A FLUID-PIN GATE. The pin is a PRERELEASE and there is
+# TIMEZONE WORK ON FLUID'S MAIN BRANCH that 3.0.0-beta.7 does not carry (reported by the user, not verified
+# here). So these are the assertions most likely to move at the next bump -- which is the point: they pin
+# TODAY's behaviour exactly, so a change arrives as a failed assertion naming the value rather than as a
+# silently different rendering. If they move, re-derive §7.4a of docs/fluid-templating.md rather than
+# editing the expected values to match.
+#
+# ⚠⚠ WHAT THIS COSTS IN PRACTICE DEPENDS ON THE SESSION, AND THE EXPECTED DEPLOYMENT IS SAFE.
+# DuckDB's TimeZone defaults to the SYSTEM zone once ICU is loaded (measured: `Europe/Berlin` on this box) --
+# NOT to UTC. But a fabricator deployment is expected to run at `SET TimeZone = 'UTC'`, because that is what
+# the Delta protocol stores and accepts, and there every route above agrees. So this is a trap for a session
+# that DEVIATES from the expected configuration, not a defect the normal path walks into. It is gated
+# because "the normal path is safe" is exactly the reasoning under which a trap survives unrecorded.
+#
+# ⚠ AND NOTE THE OTHER TIMEZONE: the DATE-renders-previous-day bug fixed above is the .NET side reading
+# `TimeZoneInfo.Local`, i.e. the OS zone of the machine running the extension. Setting DuckDB's TimeZone to
+# UTC does NOT affect it. Two different clocks, two different fixes; only this section's is neutralised by
+# running at UTC.
+#
+# ⚠ THE SESSION TIMEZONE IS SET EXPLICITLY BELOW AND THAT IS THE WHOLE POINT: with no ICU loaded there is no
+# `TimeZone` SETTING AT ALL (measured: "Setting with name timezone is not in the catalog") and a TIMESTAMPTZ
+# degenerates to UTC, so every route agrees and this section would pass while saying nothing. That is also
+# the whole of the original confusion -- no ICU meant no timezone AND no TIMESTAMPTZ -> DATE cast, one cause
+# presenting as two unrelated facts.
+
+require icu
+
+statement ok
+SET TimeZone = 'America/New_York';
+
+# ⚠ THE SILENT WRONG DAY, asserted as the value it actually produces. Pinning the truth is what makes this
+# a warning to a reader rather than a wish, and it is where a future DuckDB change would surface.
+query I
+SELECT * FROM fluid_query('SELECT {{ d | sql }}::DATE AS d', params := {'d': DATE '2026-09-01'});
+----
+2026-08-31
+
+query I
+SELECT * FROM fluid_query('SELECT strftime({{ d | sql }}, ''%Y-%m-%d'') AS d', params := {'d': DATE '2026-09-01'});
+----
+2026-08-31
+
+# ---- SAFE ROUTE 1: name the timezone. Works for a genuine TIMESTAMP too, and preserves the instant. ----
+
+query I
+SELECT * FROM fluid_query('SELECT ({{ d | sql }} AT TIME ZONE ''UTC'')::DATE AS d',
+                          params := {'d': DATE '2026-09-01'});
+----
+2026-09-01
+
+# ---- SAFE ROUTE 2: never build a TIMESTAMPTZ. Format to ISO in the template, quote THAT, then cast. ----
+#
+# The form the README teaches for a DATE, because no timezone is in play at any step — and, unlike route 1,
+# it needs no ICU.
+
+query I
+SELECT typeof(d) FROM fluid_query('SELECT {{ d | date: "%Y-%m-%d" | sql }}::DATE AS d',
+                                  params := {'d': DATE '2026-09-01'});
+----
+DATE
+
+query I
+SELECT * FROM fluid_query('SELECT {{ d | date: "%Y-%m-%d" | sql }}::DATE AS d',
+                          params := {'d': DATE '2026-09-01'});
+----
+2026-09-01
+
+# ⚠ THE POSITIVE CONTROL for both safe routes: they are not passing merely because this session agrees with
+# UTC. It does not — the two wrong-day assertions above prove the session is genuinely offset, and these
+# still answer 2026-09-01.
+
+statement ok
+SET TimeZone = 'UTC';
+
+# ⚠ A BLOB arrives as a LOWERCASE HEX STRING. It used to arrive as a byte[], which Fluid renders as the
+# concatenated decimal bytes — `'ab'::BLOB` came out as `9798`, which looks like a number and is useless.
+# Hex is lossless, readable, and compares as a string.
+query I
+SELECT fabricator_render('{{ b }}', {'b': 'ab'::BLOB});
+----
+6162

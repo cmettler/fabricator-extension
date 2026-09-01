@@ -706,6 +706,24 @@ case "$TIER" in
         # and that run's own per-suite line reports verify_session_tag at 25, so 3094 - 25 = 3069 is a
         # subtraction of a measured value rather than an inference about a suite that did not finish.
         # The 3056 note it supersedes:
+        # 3162 since 2026-09-01 (same day, FOURTH bump): +4 on verify_plugin_fluid (89 -> 93) for the
+        # TIMESTAMPTZ-to-DATE TIMEZONE TRAP. The section it replaced asserted that DuckDB had no
+        # TIMESTAMPTZ -> DATE cast at all, which was FALSE and was an artifact of this suite: the cast needs
+        # ICU, unittest does not auto-load extensions, and the suite had no `require icu` -- so a missing
+        # REQUIRE presented as a missing FEATURE. The real hazard is bigger and silent: anything reading a
+        # TIMESTAMPTZ without NAMING a timezone reads it in the SESSION's, so west of UTC five natural
+        # spellings give the PREVIOUS DAY with no error. The section now SETS America/New_York (under the
+        # runner's default UTC every route agrees and it would pass saying nothing), asserts the wrong-day
+        # values as the truth, and asserts the two safe routes with those rows as their positive control.
+        # 3158 + 4 = 3162 exactly, from a green 54/54 run. The 3158 note it supersedes:
+        # 3158 since 2026-09-01 (same day, THIRD bump): fluid_query -- a Liquid template that renders to SQL
+        # -- plus the shared Arrow/JSON value model behind it. verify_plugin_fluid 23 -> 89 (+66), and
+        # 3092 + 66 = 3158 EXACTLY, which is what shows no other suite moved. Taken from a green 54/54 run,
+        # not from that arithmetic: the arithmetic only corroborated it afterwards. The bulk of the +66 is
+        # assertions no render test can make -- COMPARISON and ARITHMETIC on both the JSON and the Arrow
+        # path, because Fluid's native JsonNode support renders correctly while computing wrong, so every
+        # render assertion in that file passes on a build with no value converter. The 3092 note it
+        # supersedes:
         # 3092 since 2026-09-01 (same day, second bump): verify_plugin_fluid 20 -> 23, three NULL-VALUE
         # assertions added when the Fluid pin moved to 3.0.0-beta.7 and its CS8604 exposed that a NULL
         # inside the params bag was covered by nothing. The 3089 note it supersedes:
@@ -714,7 +732,7 @@ case "$TIER" in
         # verify_global_functions plus the plugin-loaded, no-rejection, single-registration and parse-error
         # ones the move itself makes assertable). 3069 + 20 = 3089 exactly, which is what shows no other
         # suite moved. The 3069 note it supersedes:
-        : "${MIN_ASSERTIONS:=3092}"
+        : "${MIN_ASSERTIONS:=3162}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

@@ -215,6 +215,17 @@ SELECT count(*) FROM mssql.dbo.people;
 DETACH mssql;
 ```
 
+> ⚠ **Set your session timezone to UTC.**
+>
+> ```sql
+> SET TimeZone = 'UTC';
+> ```
+>
+> DuckDB's `TimeZone` defaults to the **system** zone once `icu` is loaded, not to UTC. The Delta protocol
+> stores and accepts UTC, and several surfaces here read the session zone — `fabricator_host_query` inherits
+> it, `TIMESTAMPTZ` values are interpreted in it, and a `TIMESTAMPTZ → DATE` conversion resolves in it — so
+> a session left on local time can silently shift a date by a day. Setting UTC once makes all of that agree.
+
 ## Connection Configuration
 
 A `fabricator` connection is given **either** a `Microsoft.Data.SqlClient` connection string, the
@@ -1290,10 +1301,13 @@ A plugin's global functions are registered while the extension loads, so a plugi
 available the **next time** DuckDB loads fabricator — not in the running session. See
 [docs/plugin-system.md](docs/plugin-system.md).
 
-#### The Fluid plugin — `fabricator_render(template, params)`
+#### The Fluid plugin — `fabricator_render(...)` and `fluid_query(...)`
 
-The **Fluid / Liquid template engine** is a plugin, not part of the extension. It renders a Liquid template
-against a params bag that is either a DuckDB `STRUCT` (preferred — typed, no quoting) or a JSON string:
+The **Fluid / Liquid template engine** is a plugin, not part of the extension. It contributes two global
+functions, both taking a params bag that is a DuckDB `STRUCT` (preferred — typed, no quoting), a `MAP`, or a
+JSON string.
+
+**`fabricator_render(template, params)`** renders a template to **text**:
 
 ```sql
 SELECT fabricator_render('Hello {{ name }}, you have {{ n }} messages', {'name':'world','n':3});
@@ -1303,23 +1317,85 @@ SELECT fabricator_render('{% if x > 1 %}big{% else %}small{% endif %}', '{"x":5}
 -- big
 ```
 
-Liquid control flow (`{% if %}`, `{% for %}`) works; Fluid is secure-by-default, so only the variables you
-pass are reachable and no custom filters or tags are registered.
+**`fluid_query(template [, params := …])`** renders a template to **SQL** — the result is a relation, and the
+rendered text *is* the statement:
+
+```sql
+SELECT * FROM fluid_query('SELECT {{ n }} AS n', params := {'n': 7});
+-- 7
+
+-- The COLUMN LIST comes from the argument, so the output schema differs per call:
+SELECT * FROM fluid_query(
+  'SELECT {% for c in cols %}{{ c | sql_ident }}{% unless forloop.last %}, {% endunless %}{% endfor %}
+   FROM (SELECT 1 AS a, 2 AS b, 3 AS c)',
+  params := {'cols': ['a','c']});
+-- a=1, c=3
+```
+
+`params` is optional, so `fluid_query('SELECT 1')` works. The call **disappears at bind time**: DuckDB
+substitutes the generated statement for it, so the generated SQL's own scans keep their full projection and
+filter pushdown, parallelism and join reordering, and nothing streams through the bridge at execution. That
+also means the generator runs during binding, repeatedly and without executing anything — an `EXPLAIN`, a
+`DESCRIBE` or a `CREATE VIEW` re-renders the template.
+
+> ⚠ **`{{ x }}` is interpolated RAW into the SQL.** That is deliberate: a template must be able to emit table
+> names, predicates and whole fragments, which is the only reason to generate SQL from a template. For values
+> that are **data**, use the two filters the plugin registers:
+>
+> - `{{ v | sql }}` — a SQL **literal** (quoted string, invariant-culture number, typed date/time, `NULL`)
+> - `{{ n | sql_ident }}` — a quoted **identifier**
+>
+> Both are allow-lists: a value with no provably safe rendering is refused by name rather than interpolated.
+>
+> ```sql
+> SELECT * FROM fluid_query('SELECT {{ v | sql }} AS v', params := {'v': 'O''Brien'});
+> -- O'Brien   (not a syntax error, and not an injection)
+> ```
+
+The bag can come from SQL rather than a literal — `params := ?` in a prepared statement (DuckDB re-binds
+every `EXECUTE`, so the template is re-rendered and even the **column list may differ between two executes of
+one prepared statement**), or `params := {'cols': getvariable('cols')}` to drive it from a session variable.
+
+Liquid control flow (`{% if %}`, `{% for %}`) works, comparisons and arithmetic filters work on numbers from
+either kind of bag, and nested `STRUCT`/`MAP`/`LIST` members are reachable by name, by index and by `.size`.
+Fluid is secure-by-default: only the variables you pass are reachable, and apart from the two SQL filters
+above no custom filters or tags are registered.
+
+> ⚠ **Dates and times.** A `DATE`/`TIMESTAMP`/`TIMESTAMPTZ` renders in UTC (`2026-09-01 00:00:00Z`), and
+> `{{ d | date: '%Y-%m-%d' }}` formats it. Two things to know:
+>
+> - **Fluid does not ORDER temporal values** — `{% if a > b %}` between two dates is always false, so compare
+>   formatted strings instead: `{% assign x = a | date: '%Y-%m-%d' %}` … `{% if x > y %}`. ISO-8601 sorts
+>   lexicographically, so that is exact.
+> - `{{ d | sql }}` always emits a **`TIMESTAMPTZ`** literal (Fluid keeps one date type internally). With
+>   the session on **UTC** as [recommended above](#quick-start) that is unambiguous. In a session left on
+>   local time it is a trap: `::DATE`, `::TIMESTAMP::DATE`, `date_trunc`, `strftime` and `extract` all read
+>   it in the *session's* zone, so west of UTC they silently give the previous day. Either of these is safe
+>   in any session — `{{ d | date: '%Y-%m-%d' | sql }}::DATE` (no timezone in play at any step), or
+>   `({{ d | sql }} AT TIME ZONE 'UTC')::DATE` (names the zone; also right for a `TIMESTAMP`).
+>
+> A `BLOB` arrives as a lowercase hex string.
+
+> ⚠ **Numbers are `DECIMAL` inside a template.** JSON integers and decimals are carried exactly, but a value
+> outside DuckDB `DECIMAL`'s range or below its resolution (roughly beyond ±7.9e28, or under ~1e-28) cannot be
+> represented and is **refused with an error naming the value** — rather than rendering as `0` or failing
+> deep inside the engine. Pass such a value as a string if you only need to print it. A `DOUBLE` with more
+> than 15 significant digits renders rounded.
 
 **It ships with the released artifact** — bundled under the extension's own managed directory — so it needs
 no configuration.
 
 > ⚠ **Setting `FABRICATOR_PLUGIN_DIR` turns it off.** That variable **replaces** every default root rather
 > than adding to it, so a session that sets it to pick up your own plugin also stops seeing the bundled ones
-> and `fabricator_render` will not resolve. `SELECT root, status, provider FROM fabricator_plugins()` shows
+> and these functions will not resolve. `SELECT root, status, provider FROM fabricator_plugins()` shows
 > exactly which roots were searched. To keep both, name the bundled root as well — it is the `plugins` folder
 > inside the directory reported by `fabricator_managed_dir()`.
 
 > ⚠ Building from source, it is not in the default build output. `dotnet build dotnet/Fabricator.FluidPlugin
 > -c Release` writes it to `build/plugins/fluid`; point `FABRICATOR_PLUGIN_DIR` there, or install
-> `build/plugins/fluid/Fabricator.FluidPlugin.plugin.zip` with `fabricator_install_plugin(...)`. Because it
-> contributes a **global** function it must be present when the extension loads — installing it mid-session
-> surfaces it only at the next start.
+> `build/plugins/fluid/Fabricator.FluidPlugin.plugin.zip` with `fabricator_install_plugin(...)`. Because they
+> are **global** functions the plugin must be present when the extension loads — installing it mid-session
+> surfaces them only at the next start.
 
 ### `fabricator_install_plugin(archive [, root := …] [, replace := …]) -> TABLE`
 

@@ -372,6 +372,13 @@ catalog-bound ones join the `CustomFunctions`-style per-catalog registry and are
 `FunctionsMetadataSql` with `kind='table_sql'` (consulted before SQL discovery, like
 `CustomScalar`/`CustomTable`).
 
+⚠ **A PLUGIN can declare a global one, and since 2026-09-01 one does** — `fluid_query`, in
+`Fabricator.FluidPlugin` ([fluid-templating.md](fluid-templating.md) §7). Nothing had to change for that:
+the plugin scan feeds `GlobalFunctions.SqlTableMap` from every discovered `IBackend` exactly as it feeds the
+scalar map. Worth knowing because it is a genuinely new shape for this surface — the generator then runs
+inside a plugin's own assembly-load context, with only `Fabricator.Abstractions` in scope, which is why
+`DuckSql` living in the contract assembly rather than the bridge matters.
+
 #### ABI v68 — ONE appended entry
 
 ```c

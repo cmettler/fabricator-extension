@@ -49,6 +49,14 @@
          published form is a beta. A prerelease is not a stable contract - the API may move between betas -
          so a bump here is a CODE-COMPATIBILITY question, not a routine version bump, and the gate that
          answers it is test/verify_plugin_fluid.test. Move to the stable 3.0.0 as soon as it ships.
+
+         /!\ AND THERE IS TIMEZONE WORK ON FLUID'S MAIN BRANCH THAT THIS BETA DOES NOT CARRY (user-reported
+         2026-09-01, not verified here). The TEMPORAL assertions in verify_plugin_fluid are therefore the
+         ones most likely to move at the next bump - which is what they are for: they pin today's rendering
+         and ordering EXACTLY, so a change arrives as a failed assertion naming the value rather than as a
+         silently different result. If they move, re-derive docs/fluid-templating.md section 7.4a rather
+         than editing the expected values to match; that section also holds a DEFERRED decision (an
+         ISO-string value model) whose case depends on what upstream does here.
          ⚠ It is ALSO why this stays a PackageReference rather than a source reference to a local clone: a
          sibling-path reference pins nothing and no clone but the author's can build it - exactly the shape
          this repo converted engineered-wood and DuckDB.ExtensionKit away from - and it would leave CI

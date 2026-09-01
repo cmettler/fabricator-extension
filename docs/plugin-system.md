@@ -269,6 +269,15 @@ so that conditional dissolves rather than being solved.
 registered during `Extension::Load()`, so the plugin must be in a plugin root at load time — installing it
 mid-session surfaces it only at the next start.
 
+**⚠ SINCE 2026-09-01 IT ALSO SHIPS A GLOBAL *SQLGEN* FUNCTION — `fluid_query(template [, params := …])` —
+and that is a SECOND registration path, not a second function.** `fabricator_render` arrives through
+`IBackend.GlobalScalarFunctions` and becomes a DuckDB scalar; `fluid_query` arrives through
+`IBackend.GlobalSqlTableFunctions` and becomes a `bind_replace` TABLE function whose call disappears at bind.
+**This is the first plugin in the tree to use the latter at all**, so it is the first evidence that the
+plugin scan carries a provider's sqlgen declarations as well as its scalars — which is why the distribution
+smoke gained a check for it rather than trusting the render one to cover both. Full record:
+[fluid-templating.md](fluid-templating.md) §7.
+
 **It IS in the distribution artifact**, via the bundled root below — so a user on a released binary keeps
 `fabricator_render` with no configuration. ⚠ But a user who sets `FABRICATOR_PLUGIN_DIR` loses it, because
 that variable REPLACES every default root rather than extending them.

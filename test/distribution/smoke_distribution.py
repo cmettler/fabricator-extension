@@ -80,6 +80,17 @@ def test_fresh_install(duckdb, artifact: str) -> None:
             == "bundled plugin",
             "the bundled plugin renders (its private Fluid closure resolved from the plugin folder)",
         )
+        # /!\ A SECOND REGISTRATION PATH, not a second spelling of the one above. fabricator_render arrives
+        # through IBackend.GlobalScalarFunctions and is registered as a DuckDB scalar; fluid_query arrives
+        # through GlobalSqlTableFunctions and is registered as a bind_replace TABLE function. This plugin is
+        # the first shipped one to use the latter at all, so a packaging or registration fault that reached
+        # only the sqlgen path would leave the check above passing.
+        check(
+            con.execute(
+                "select * from fluid_query('select {{ n }} as n', params := {'n': 41})"
+            ).fetchone()[0] == 41,
+            "the bundled plugin's SQL-generating table function binds and its generated SQL runs",
+        )
 
         loaded = [r[0] for r in con.execute(
             "select extension_name from duckdb_extensions() "
