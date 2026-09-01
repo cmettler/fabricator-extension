@@ -32,10 +32,12 @@ Hello, Bob (from plugin)
 Hello, stranger (from plugin)
 
 # A built-in global function still works alongside the plugin's (both in the same registry, no conflict).
+# ⚠ It used to be fabricator_render here, which stopped meaning anything the day render itself became a
+# plugin: the assertion is that a FIRST-PARTY global coexists with a plugin's, so it needs a first-party one.
 query I
-SELECT fabricator_render('Hi {{ name }}', {'name':'plugin'});
+SELECT fabricator_va_concat('-', 'a', 'b');
 ----
-Hi plugin
+a-b
 
 # ---- plugin-declared MACROs (docs/macros-and-sqlgen-functions.md §1) ----
 # A plugin ships SQL templates the same way it ships functions: declare CREATE MACRO statements, the host

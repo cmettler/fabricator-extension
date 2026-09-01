@@ -1274,13 +1274,52 @@ SELECT status, provider, detail FROM fabricator_plugins() WHERE status <> 'share
 | `rejected` | could not be loaded; `detail` carries the reason, e.g. a mismatched Apache Arrow version |
 
 **Where plugins are looked for.** `FABRICATOR_PLUGIN_DIR` (a comma-separated list of directories) if set —
-which **replaces** the default rather than adding to it — otherwise **`~/.duckdb/fabricator/plugins`**. The
-search is recursive, so a plugin may sit in a nested folder such as
+which **replaces** the defaults rather than adding to them — otherwise **two** roots, in this order:
+
+1. **`~/.duckdb/fabricator/plugins`**, the per-user root that `fabricator_install_plugin()` writes to;
+2. the **bundled** root, `plugins/` inside the extension's managed directory (what `fabricator_managed_dir()`
+   reports) — this is where plugins that ship with the release live.
+
+**The first root wins.** If the same plugin is present in both, the one in (1) loads and the other is
+reported `rejected` with a provider-name collision — so installing your own copy of a bundled plugin takes
+precedence, and `fabricator_plugins()` tells you the shipped copy was set aside rather than silently ignored.
+The search is recursive, so a plugin may sit in a nested folder such as
 `~/.duckdb/fabricator/plugins/myplugin/1.0.0/windows_amd64/`.
 
 A plugin's global functions are registered while the extension loads, so a plugin added to the folder becomes
 available the **next time** DuckDB loads fabricator — not in the running session. See
 [docs/plugin-system.md](docs/plugin-system.md).
+
+#### The Fluid plugin — `fabricator_render(template, params)`
+
+The **Fluid / Liquid template engine** is a plugin, not part of the extension. It renders a Liquid template
+against a params bag that is either a DuckDB `STRUCT` (preferred — typed, no quoting) or a JSON string:
+
+```sql
+SELECT fabricator_render('Hello {{ name }}, you have {{ n }} messages', {'name':'world','n':3});
+-- Hello world, you have 3 messages
+
+SELECT fabricator_render('{% if x > 1 %}big{% else %}small{% endif %}', '{"x":5}');
+-- big
+```
+
+Liquid control flow (`{% if %}`, `{% for %}`) works; Fluid is secure-by-default, so only the variables you
+pass are reachable and no custom filters or tags are registered.
+
+**It ships with the released artifact** — bundled under the extension's own managed directory — so it needs
+no configuration.
+
+> ⚠ **Setting `FABRICATOR_PLUGIN_DIR` turns it off.** That variable **replaces** every default root rather
+> than adding to it, so a session that sets it to pick up your own plugin also stops seeing the bundled ones
+> and `fabricator_render` will not resolve. `SELECT root, status, provider FROM fabricator_plugins()` shows
+> exactly which roots were searched. To keep both, name the bundled root as well — it is the `plugins` folder
+> inside the directory reported by `fabricator_managed_dir()`.
+
+> ⚠ Building from source, it is not in the default build output. `dotnet build dotnet/Fabricator.FluidPlugin
+> -c Release` writes it to `build/plugins/fluid`; point `FABRICATOR_PLUGIN_DIR` there, or install
+> `build/plugins/fluid/Fabricator.FluidPlugin.plugin.zip` with `fabricator_install_plugin(...)`. Because it
+> contributes a **global** function it must be present when the extension loads — installing it mid-session
+> surfaces it only at the next start.
 
 ### `fabricator_install_plugin(archive [, root := …] [, replace := …]) -> TABLE`
 

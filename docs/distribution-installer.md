@@ -500,7 +500,8 @@ So the Core's output is a working install, not just well-formed bytes.
 
 **A single 61 MB `fabricator.duckdb_extension` now installs and runs itself on Windows**, verified
 against the official `duckdb==1.5.5` wheel with an empty extension directory and no environment
-variables (`test/distribution/smoke_distribution.py`, 12 checks):
+variables (`test/distribution/smoke_distribution.py`, 14 checks — 12 until 2026-09-01, when the bundled
+Fluid plugin added two):
 
 ```
 [1] fresh install, no environment variables

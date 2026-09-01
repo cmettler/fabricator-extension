@@ -54,6 +54,71 @@ public class PluginPathsTests
         Assert.Empty(PluginPaths.ResolveRoots(env: "   ", userHome: "   "));
     }
 
+    // ---------------------------------------------------------------- bundled root (the distribution)
+
+    [Fact]
+    public void Bundled_root_sits_under_the_managed_directory_and_is_searched_LAST()
+    {
+        // The single-file distribution's payload is the core loadable plus the MANAGED directory, so a
+        // shipped plugin can only live inside it.
+        //
+        // ⚠⚠ LAST is load-bearing, and the FIRST version of this test asserted the opposite for a reason
+        // that was simply wrong. The plugin scan registers with `refuseCollisions: true`, so it is
+        // FIRST-ROOT-WINS: a duplicate provider name met in a later root is reported `rejected`, never
+        // overwritten. (The justification originally written here — that `BackendRegistry.Add` is
+        // `map[name] = backend`, last-wins — describes the BUILT-IN registration path, not the plugin one.)
+        // Under bundled-first the shipped copy won and a user's install was REJECTED, which is the opposite
+        // of what a user installing a newer copy expects. MEASURED with two roots holding one plugin: the
+        // first loads, the second is rejected with a collision message naming both.
+        var home = Home;
+        var managed = Path.Combine(Path.GetTempPath(), "fab-managed-" + Guid.NewGuid().ToString("N"));
+        var roots = PluginPaths.ResolveRoots(env: null, userHome: home, managedDir: managed);
+
+        Assert.Equal(2, roots.Count);
+        Assert.Equal(
+            Path.GetFullPath(Path.Combine(home, ".duckdb", "fabricator", "plugins")),
+            roots[0]);
+        Assert.Equal(Path.GetFullPath(Path.Combine(managed, "plugins")), roots[1]);
+    }
+
+    [Fact]
+    public void Override_replaces_the_bundled_root_too()
+    {
+        // ⚠ THE FOOTGUN, PINNED DELIBERATELY. FABRICATOR_PLUGIN_DIR replaces EVERYTHING, bundled included —
+        // so a user who sets it to add their own plugin silently loses the shipped ones. That is the
+        // intended behaviour and not an oversight: the hermetic tier points the variable at an empty
+        // directory precisely so its plugin set is provably independent of machine state, and a bundled root
+        // that survived the override would make a tier's result depend on whether anyone had run a pack into
+        // that build tree. If this test ever fails, hermeticity has been traded away — decide that on
+        // purpose.
+        var only = Path.Combine(Path.GetTempPath(), "fab-only-" + Guid.NewGuid().ToString("N"));
+        var roots = PluginPaths.ResolveRoots(env: only, userHome: Home,
+                                             managedDir: Path.GetTempPath());
+        Assert.Single(roots);
+        Assert.Equal(Path.GetFullPath(only), roots[0]);
+    }
+
+    [Fact]
+    public void No_managed_directory_yields_no_bundled_root()
+    {
+        // A host that will not say where it loaded us from costs the BUNDLED root, never the user's — which
+        // is why ManagedDirectory() swallows and returns null rather than throwing.
+        var home = Home;
+        Assert.Single(PluginPaths.ResolveRoots(env: null, userHome: home, managedDir: null));
+        Assert.Single(PluginPaths.ResolveRoots(env: null, userHome: home, managedDir: "   "));
+    }
+
+    [Fact]
+    public void Bundled_root_alone_is_enough_when_there_is_no_home()
+    {
+        // The distribution's shape on a machine with no resolvable user profile: the artifact's own plugins
+        // still load. Without this the two "no home" cases would be indistinguishable.
+        var managed = Path.Combine(Path.GetTempPath(), "fab-managed-" + Guid.NewGuid().ToString("N"));
+        var roots = PluginPaths.ResolveRoots(env: null, userHome: null, managedDir: managed);
+        Assert.Single(roots);
+        Assert.Equal(Path.GetFullPath(Path.Combine(managed, "plugins")), roots[0]);
+    }
+
     // ---------------------------------------------------------------- override precedence
 
     [Fact]

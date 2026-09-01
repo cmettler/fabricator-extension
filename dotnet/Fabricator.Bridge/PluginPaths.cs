@@ -75,6 +75,34 @@ internal static class PluginPaths
     /// </remarks>
     public const string DefaultRelativeRoot = ".duckdb/fabricator/plugins";
 
+    /// <summary>The BUNDLED plugin root, relative to the MANAGED directory: <c>plugins</c>.</summary>
+    /// <remarks>
+    /// ⚠ THIS IS NOT A CONTRADICTION OF THE REMARK ABOVE, and the distinction is OWNERSHIP rather than
+    /// location. The hazard recorded there is that <c>dotnet publish</c> DELETES files under the managed
+    /// directory that its own previous publish wrote — which would destroy a plugin the USER installed. A
+    /// BUNDLED plugin is part of the artifact: <c>pack-distribution.ps1</c> writes it there after the
+    /// publish and rewrites it on every pack, so being wiped by a publish is correct rather than data loss.
+    /// It is the only place a shipped plugin CAN live — the single-file distribution's payload is exactly
+    /// the core loadable plus the managed directory, so anything outside it is not in the artifact at all.
+    /// <para>⚠⚠ IT IS SEARCHED LAST, and the ordering is load-bearing. <b>FIRST ROOT WINS</b>: the plugin
+    /// scan registers with <c>refuseCollisions: true</c>, so a duplicate provider name met later is REPORTED
+    /// <c>rejected</c> with a collision message — it does not overwrite. Putting the user's root first is
+    /// therefore what lets a user-installed copy take precedence over a shipped one.
+    /// <para>⚠ THIS WAS WRONG WHEN FIRST WRITTEN (2026-09-01) and the fix is worth recording, because the
+    /// mistake is easy to repeat: the original comment justified BUNDLED-FIRST by <c>BackendRegistry.Add</c>
+    /// being <c>map[name] = backend</c>, i.e. last-wins. That is true of the BUILT-IN registration path and
+    /// false of the PLUGIN path, which refuses collisions instead — so bundled-first made the shipped copy
+    /// win and REJECTED the user's install, the exact opposite of the stated intent. MEASURED with two roots
+    /// holding the same plugin: first loads, second is <c>rejected</c>.</para></para>
+    /// <para>⚠ FABRICATOR_PLUGIN_DIR still REPLACES it, along with everything else. That is deliberate: the
+    /// hermetic tier points the variable at an empty directory precisely so its plugin set is provably
+    /// independent of machine state, and a bundled root that survived the override would make a tier's
+    /// behaviour depend on whether anyone had run a pack into that build tree. The cost is a real footgun —
+    /// a user who sets the variable to add their OWN plugin silently loses the bundled ones — which is why
+    /// every root is REPORTED by <c>fabricator_plugins()</c> rather than merely searched.</para>
+    /// </remarks>
+    public const string BundledRelativeRoot = "plugins";
+
     /// <summary>
     /// Resolves the roots to search, in order. <paramref name="env"/> is FABRICATOR_PLUGIN_DIR (a
     /// comma-separated list); when it names anything at all it wins OUTRIGHT — the default is not appended.
@@ -86,7 +114,7 @@ internal static class PluginPaths
     /// an override in force the default is silently not searched, and that should be visible rather than
     /// inferred.
     /// </remarks>
-    public static IReadOnlyList<string> ResolveRoots(string? env, string? userHome)
+    public static IReadOnlyList<string> ResolveRoots(string? env, string? userHome, string? managedDir = null)
     {
         var roots = new List<string>();
         if (!string.IsNullOrWhiteSpace(env))
@@ -97,17 +125,56 @@ internal static class PluginPaths
             }
             return new ReadOnlyCollection<string>(roots);
         }
+        // USER first, BUNDLED second - see BundledRelativeRoot. The plugin scan is FIRST-ROOT-WINS (it
+        // registers with refuseCollisions: true), so this order is what lets a user-installed copy take
+        // precedence over the one we shipped.
         if (!string.IsNullOrWhiteSpace(userHome))
         {
             Add(roots, Path.Combine(userHome, DefaultRelativeRoot.Replace('/', Path.DirectorySeparatorChar)));
         }
+        if (!string.IsNullOrWhiteSpace(managedDir))
+        {
+            Add(roots, Path.Combine(managedDir, BundledRelativeRoot));
+        }
         return new ReadOnlyCollection<string>(roots);
     }
 
-    /// <summary><see cref="ResolveRoots(string?, string?)"/> against the live environment.</summary>
+    /// <summary><see cref="ResolveRoots(string?, string?, string?)"/> against the live environment.</summary>
     public static IReadOnlyList<string> ResolveRoots() => ResolveRoots(
         Environment.GetEnvironmentVariable("FABRICATOR_PLUGIN_DIR"),
-        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile));
+        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+        ManagedDirectory());
+
+    /// <summary>
+    /// The directory this assembly was loaded from — the MANAGED directory, wherever the host put it (a
+    /// build tree, <c>~/.duckdb/extensions/...</c>, or the single-file distribution's extracted cache).
+    /// </summary>
+    /// <remarks>
+    /// ⚠ Derived from the assembly, NOT from FABRICATOR_MANAGED_DIR: that variable is an INPUT to clr_host
+    /// and is simply absent whenever the host used its default (an <c>fabricator/</c> folder next to the
+    /// loaded module), which is the common case and the one the distribution takes. Asking the assembly
+    /// where it is cannot be wrong in the way reading an optional variable can.
+    /// <para><c>Assembly.Location</c> is EMPTY for a single-file or AOT-published host, hence the
+    /// <c>AppContext.BaseDirectory</c> fallback.</para>
+    /// </remarks>
+    private static string? ManagedDirectory()
+    {
+        try
+        {
+            var location = typeof(PluginPaths).Assembly.Location;
+            if (!string.IsNullOrWhiteSpace(location))
+            {
+                return Path.GetDirectoryName(location);
+            }
+            return AppContext.BaseDirectory;
+        }
+        catch
+        {
+            // Resolution is best-effort: a host that will not say where it loaded us from costs the BUNDLED
+            // root, never the user's.
+            return null;
+        }
+    }
 
     private static void Add(List<string> roots, string path)
     {

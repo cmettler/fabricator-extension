@@ -11,7 +11,6 @@ using Apache.Arrow.Ipc;
 using Apache.Arrow.Types;
 using Fabricator.Bridge;
 using Fabricator.Bridge.Conversion;
-using Fluid;
 
 namespace Fabricator.SqlServer;
 
@@ -30,7 +29,6 @@ internal static class CustomFunctions
     // -present default provider). Implement the base IScalarFunction (no SchemaName).
     public static readonly IReadOnlyList<IScalarFunction> GlobalScalar = new IScalarFunction[]
     {
-        new CfRenderFunction(),
         // fabricator_parse(text, type_name) — parses `text` as the named type, and RETURNS that type: its
         // result type is resolved at BIND from the constant `type_name`, which is the ABI v80 scalar bind
         // session's whole point (docs/abi-history.md §v80). The shipped demonstration of the capability, and
@@ -96,7 +94,7 @@ internal static class CustomFunctions
         new GfColumnsFunction(),
         // Reference HOST-FS reader: fabricator_delta_scan(path) reads a Delta Lake table via engineered-wood,
         // IO through DuckDB's FileSystem + secrets. A provider-agnostic core reader (lives in the Bridge);
-        // declared here because SqlServer is the always-present default backend (same as fabricator_render).
+        // declared here because SqlServer is the always-present default backend.
         new Fabricator.Bridge.DeltaGlobalTableFunction(),
         // NATIVE-READ pre-spike: fabricator_delta_native_scan(path) — engineered-wood lists the exact active files,
         // DuckDB's native parquet reader reads them via read_parquet (cached, over onelake:// for OneLake).
@@ -868,90 +866,6 @@ internal sealed class CfHostParamFunction : ICatalogScalarFunction
         }
         return outb.Build();
     }
-}
-
-// GLOBAL scalar (connection-free, no ATTACH): fabricator_render(template, params) -> the Liquid template rendered
-// with the params bag, where `params` is EITHER a DuckDB STRUCT ({'name':'x','n':3}, type-safe, no quoting) OR a
-// JSON string ('{"name":"x"}'). A template engine (Fluid / Liquid — secure-by-default, parse-once cached).
-// Registered at extension load via SqlServerBackend.GlobalScalarFunctions; resolved as a bare fn(...) with no
-// catalog. Implements the base IScalarFunction (no SchemaName). See docs/global-functions.md.
-internal sealed class CfRenderFunction : IScalarFunction
-{
-    private static readonly FluidParser Parser = new();
-    // Parse-once / render-many: templates are usually a constant literal across a batch, so cache the parsed,
-    // thread-safe IFluidTemplate keyed by the template string.
-    private static readonly ConcurrentDictionary<string, IFluidTemplate> Cache = new();
-
-    public string Name => "fabricator_render";
-
-    public Schema Parameters => new(new[]
-    {
-        new Field("template", StringType.Default, nullable: true),
-        // The SQLNULL sentinel => the host registers this param as LogicalType::ANY, so a caller may pass a
-        // STRUCT (preferred) OR a JSON string; Invoke reads the column's runtime type.
-        new Field("params", NullType.Default, nullable: true),
-    }, metadata: null);
-
-    public Field Result => new("result", StringType.Default, nullable: true);
-
-    public IArrowArray Invoke(RecordBatch args)
-    {
-        var templates = (StringArray)args.Column(0);
-        var paramsCol = args.Column(1); // a StructArray (preferred), a StringArray (JSON), or a NullArray
-        var structType = (paramsCol as StructArray)?.Data.DataType as StructType;
-        var b = new StringArray.Builder().Reserve(args.Length);
-        for (int i = 0; i < args.Length; i++)
-        {
-            if (templates.IsNull(i))
-            {
-                b.AppendNull();
-                continue;
-            }
-            var template = Cache.GetOrAdd(templates.GetString(i), src =>
-            {
-                if (!Parser.TryParse(src, out var parsed, out var error))
-                {
-                    throw new ArgumentException($"fabricator_render: template parse error: {error}");
-                }
-                return parsed;
-            });
-            var ctx = new TemplateContext();
-            if (paramsCol is StructArray sa && structType is not null)
-            {
-                // STRUCT params: each field becomes a template variable (the field's value at this row).
-                for (int k = 0; k < structType.Fields.Count; k++)
-                {
-                    ctx.SetValue(structType.Fields[k].Name, ArrowValueReader.ReadScalar(sa.Fields[k], i));
-                }
-            }
-            else if (paramsCol is StringArray jsonStrs && !jsonStrs.IsNull(i))
-            {
-                // JSON-string params (programmatic callers).
-                using var doc = JsonDocument.Parse(jsonStrs.GetString(i));
-                if (doc.RootElement.ValueKind == JsonValueKind.Object)
-                {
-                    foreach (var p in doc.RootElement.EnumerateObject())
-                    {
-                        ctx.SetValue(p.Name, JsonToClr(p.Value));
-                    }
-                }
-            }
-            b.Append(template.Render(ctx));
-        }
-        return b.Build();
-    }
-
-    private static object? JsonToClr(JsonElement e) => e.ValueKind switch
-    {
-        JsonValueKind.String => e.GetString(),
-        JsonValueKind.Number => e.TryGetInt64(out var l) ? l : e.GetDouble(),
-        JsonValueKind.True => true,
-        JsonValueKind.False => false,
-        JsonValueKind.Null => null,
-        JsonValueKind.Array => e.EnumerateArray().Select(JsonToClr).ToList(),
-        JsonValueKind.Object => e.EnumerateObject().ToDictionary(p => p.Name, p => JsonToClr(p.Value)),
-        _ => e.ToString(),
-    };
 }
 
 // GLOBAL in-out (streaming, connection-free): fabricator_tag(<table of n>) -> (n, sq=n*n) per input row, no

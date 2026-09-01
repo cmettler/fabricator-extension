@@ -1,73 +1,24 @@
 # name: test/verify_global_functions.test
 # description: Load-time GLOBAL (connection-free) functions — a bare fn(...) registered at extension load,
-#              usable with NO ATTACH and no SQL Server / DAX connection. Demo: fabricator_render (the Fluid /
-#              Liquid template engine). Proves the global-function path end-to-end (list_global_functions +
-#              the handle-0 scalar dispatch). See docs/global-functions.md.
+#              usable with NO ATTACH and no SQL Server / DAX connection. Proves the global-function path
+#              end-to-end (list_global_functions + the handle-0 scalar dispatch). ⚠ The former headline demo,
+#              fabricator_render, is now a plugin — see verify_plugin_fluid.test. See docs/global-functions.md.
 # group: [fabricator]
 
 require fabricator
 
 # NOTE: no ATTACH, no require-env — a global function resolves on a bare loaded extension.
 
-# Basic render: Liquid substitution from a JSON params bag.
-query I
-SELECT fabricator_render('Hello {{ name }}, you have {{ n }} messages', '{"name":"world","n":3}');
-----
-Hello world, you have 3 messages
-
-# params as a DuckDB STRUCT (type-safe, no quoting) — the SQLNULL->ANY sentinel lets the same fn accept it.
-query I
-SELECT fabricator_render('Hello {{ name }}, you have {{ n }} messages', {'name':'world','n':3});
-----
-Hello world, you have 3 messages
-
-# STRUCT params vectorized over rows (each row's struct supplies that row's variables).
-query I
-SELECT fabricator_render('id={{ id }}', {'id': i}) AS r FROM range(3) t(i) ORDER BY r;
-----
-id=0
-id=1
-id=2
-
-# Vectorized over a batch (the template is a per-row column; params empty object).
-query I
-SELECT fabricator_render('row ' || i::VARCHAR, '{}') AS r FROM range(3) t(i) ORDER BY i;
-----
-row 0
-row 1
-row 2
-
-# Liquid control flow (if/else) — proves it's a real template engine, not just substitution.
-query I
-SELECT fabricator_render('{% if x > 1 %}big{% else %}small{% endif %}', '{"x":5}');
-----
-big
-
-# Liquid loop over a JSON array param.
-query I
-SELECT fabricator_render('{% for i in items %}{{ i }};{% endfor %}', '{"items":[1,2,3]}');
-----
-1;2;3;
-
-# A NULL template yields NULL (SPECIAL_HANDLING — the function sees NULL args).
-query I
-SELECT fabricator_render(NULL, '{"a":1}');
-----
-NULL
-
-# An unreferenced/empty params object renders the literal text.
-query I
-SELECT fabricator_render('static text', '{}');
-----
-static text
-
-# Still resolves AFTER an ATTACH is in play elsewhere is not needed — but confirm it composes with a normal
-# query (no catalog dependency): used inside a CTE over generated rows.
-query I
-SELECT fabricator_render('id={{ id }}', '{"id":' || i::VARCHAR || '}') AS r FROM range(2) t(i) ORDER BY i;
-----
-id=0
-id=1
+# ⚠ THE OPENING SCALAR DEMO MOVED OUT. fabricator_render (the Fluid/Liquid template engine) used to lead
+# this file and was its simplest end-to-end proof of the global SCALAR path. It is now a PLUGIN
+# (dotnet/Fabricator.FluidPlugin), so it is NOT registered on a bare extension and cannot be asserted here:
+# the hermetic tier points FABRICATOR_PLUGIN_DIR at an empty directory on purpose. Its nine assertions moved
+# verbatim to verify_plugin_fluid.test.
+#
+# ⚠ Nothing is uncovered by the move. The global scalar path is still gated below by FIRST-PARTY scalars —
+# hilbert_index, bucket, fabricator_batch_seq (zero-argument), fabricator_va_concat (variadic) and
+# fabricator_parse (bind-resolved return type) — and the one thing only render used to carry, an untyped
+# NULL in an ANY-declared position, was re-homed onto the varargs tail further down rather than dropped.
 
 # ---- global TABLE-IN-OUT (streaming exchange) — bare fn(<input>), no ATTACH ----
 # fabricator_tag applies n -> (n, n*n) per input row on the streaming-exchange operator (handle-0 binding).
@@ -296,7 +247,8 @@ SELECT n, value FROM fabricator_mix((SELECT * FROM (VALUES (1),(2)) v(n)), 3) OR
 # the constant `type_name`. ONE registered function, so the pair of typeof() assertions below is the whole
 # feature: a build that fixes the return type at registration CANNOT make them differ, whatever it reports.
 #
-# ⚠ The POSITIVE CONTROL is the fixed-return assertions ABOVE (fabricator_render etc.). Without them
+# ⚠ The POSITIVE CONTROL is the fixed-return assertions ABOVE (hilbert_index, bucket, fabricator_va_concat
+# — fabricator_render used to be named here and is now a plugin). Without them
 # "two calls report two types" would pass equally on a build where the declared path had stopped working
 # and everything resolved at bind — and the declared path is what every other scalar in the product uses.
 # ============================================================================================
@@ -358,15 +310,21 @@ must not be NULL
 
 # ⚠ AN UNTYPED NULL IN AN *ANY-DECLARED* POSITION. This was BROKEN BEFORE the bind session existed and no
 # suite covered it: DuckDB exports an Arrow null-typed array with null_count = 0 and Apache.Arrow refuses it
-# ("Length must equal null count"), so `fabricator_render('tpl', NULL)` failed at execute. The one NULL the
-# suites did carry (line ~54, the first argument) sits in a VARCHAR-declared position, which DuckDB CASTS —
-# which is exactly why the ANY position stayed untested. It now has to work on BOTH crossings: at bind the
-# literal is still SQLNULL (argument casts run after the bind callback), and at execute it still is, because
-# an ANY parameter is never cast.
+# ("Length must equal null count"), so an ANY-declared slot handed a bare NULL failed at execute. Every other
+# NULL the suites carry sits in a CONCRETELY-declared position, which DuckDB CASTS — which is exactly why the
+# ANY position stayed untested. It has to work on BOTH crossings: at bind the literal is still SQLNULL
+# (argument casts run after the bind callback), and at execute it still is, because an ANY parameter is never
+# cast.
+#
+# ⚠⚠ THE CARRIER IS A VARARGS TAIL, AND THAT IS A DELIBERATE SUBSTITUTION. The original carrier was
+# `fabricator_render('tpl', NULL)`, whose `params` was the ONLY ANY-declared non-varargs global scalar
+# parameter in the tree — and it left with the Fluid plugin. An ANY *tail* registers as the same
+# LogicalType::ANY and is likewise never cast, so it crosses identically; MEASURED before the substitution
+# was made, not assumed. The render spelling is still gated, in verify_plugin_fluid.test.
 query I
-SELECT fabricator_render('x{{ a }}', NULL);
+SELECT fabricator_va_concat('-', 1, NULL, 'x');
 ----
-x
+1-NULL-x
 
 # duckdb_functions() reports the UNRESOLVED declaration as ANY — the honest answer for a function whose
 # return type does not exist until a call site does.

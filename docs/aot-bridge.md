@@ -91,7 +91,7 @@ explicit construction, no reflection.
 | `Microsoft.Data.SqlClient` | **validated (7.1 preview)** | user-tested 2026-07-25: **SqlClient 7.1 preview compiles and works under NativeAOT** — the AOT SKU targets the 7.1+ line (6.0.2, our current pin, was managed-SNI + annotations but only experimental AOT). Remaining check is scope, not feasibility: exercise OUR paths (TLS, Entra `AccessTokenCallback`, `SqlBulkCopy`, MARS) via the suite in Phase 3 |
 | `Azure.Identity` / `Azure.Storage.Files.DataLake` | good | Azure SDK AOT-annotated; **verify** MSAL edges in `ClientSecretCredential`/`DefaultAzureCredential` |
 | `AWSSDK.S3` 4.x | good | v4 line ships Native-AOT support |
-| `Fluid.Core` 2.31 (`fabricator_render`) | conditional | Parlot's *compiled* mode uses `System.Linq.Expressions` (not AOT); **force interpreted mode**, or exclude `fabricator_render` from the AOT SKU if it fights back |
+| ~~`Fluid.Core` 2.31 (`fabricator_render`)~~ | **N/A since 2026-09-01** | **Gone from the core.** `fabricator_render` moved to `Fabricator.FluidPlugin`, so Fluid/Parlot are no longer in the bridge payload at all — the conditional dissolved rather than being solved. It becomes the AOT question of whoever wants that PLUGIN under AOT (a plugin is loaded reflectively, which is its own problem — see "compile-time plugins"). |
 | `Microsoft.Extensions.Logging` | good | |
 | `Microsoft.Fabric.Api` | verify | OpenAPI-generated REST client |
 | engineered-wood | good after #4 | pure C#; one `JsonSerializer` file (`ActionSerializer.cs`) |
@@ -267,8 +267,11 @@ therefore "the existing suites, minus DAX, on the native bridge", not a new test
   task (6.0.2 → 7.1+, both SKUs or AOT-head-only via a conditional package version) plus
   coverage of our specific paths (TLS, Entra token callback, `SqlBulkCopy`, MARS) — the
   Phase-3 suite gate. The Delta-only-first fallback is no longer needed.
-- **R2 — Fluid/Parlot** expression compilation; force interpreted or drop
-  `fabricator_render` from the SKU.
+- ~~**R2 — Fluid/Parlot** expression compilation; force interpreted or drop
+  `fabricator_render` from the SKU.~~ **RETIRED 2026-09-01**: `fabricator_render` left the core for
+  `Fabricator.FluidPlugin`, so neither Fluid nor Parlot is in the AOT SKU's closure. ⚠ Do not read this as
+  the risk being *solved* — it was removed from this SKU's scope, and returns verbatim the day anyone wants
+  the Fluid plugin compiled into an AOT head.
 - **R3 — behavioral drift** between SKUs (trimmed code paths, culture/ICU differences —
   NativeAOT defaults differ e.g. in globalization mode; pin `InvariantGlobalization=false`
   deliberately and let the suite decide).

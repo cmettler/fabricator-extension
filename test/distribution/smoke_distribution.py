@@ -58,6 +58,29 @@ def test_fresh_install(duckdb, artifact: str) -> None:
             con.execute("select hilbert_index([1,2], 4), bucket(8, 'alice')").fetchone() == (7, 5),
             "the managed bridge booted and answers (zero configuration)",
         )
+        # The BUNDLED PLUGIN. pack-distribution.ps1 stages Fabricator.FluidPlugin under
+        # <managed>/plugins/fluid, which PluginPaths.BundledRelativeRoot makes a default search root - so
+        # this is the only thing that proves a shipped plugin is IN the artifact and gets discovered from it.
+        # /!\ ATTRIBUTED BY ROOT, not merely by the function working. This session sets no environment
+        # variables, so the per-user root (~/.duckdb/fabricator/plugins) is searched too; a developer who had
+        # installed the Fluid plugin there would make a bare "does fabricator_render work" check pass on an
+        # artifact that ships nothing. Requiring the loaded row's root to sit under THIS session's extension
+        # directory removes that reading.
+        fluid_root = con.execute(
+            "select root from fabricator_plugins() where status = 'loaded' and provider = 'fluid'"
+        ).fetchall()
+        check(
+            len(fluid_root) == 1
+            and os.path.realpath(fluid_root[0][0]).startswith(os.path.realpath(extension_directory)),
+            "the bundled Fluid plugin shipped inside the artifact and loaded from it",
+            str(fluid_root),
+        )
+        check(
+            con.execute("select fabricator_render('bundled {{ who }}', {'who': 'plugin'})").fetchone()[0]
+            == "bundled plugin",
+            "the bundled plugin renders (its private Fluid closure resolved from the plugin folder)",
+        )
+
         loaded = [r[0] for r in con.execute(
             "select extension_name from duckdb_extensions() "
             "where extension_name like 'fabricator%' and loaded order by 1").fetchall()]

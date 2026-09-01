@@ -415,7 +415,13 @@ case "$TIER" in
         # ABI v80 scalar-bind commit took verify_global_functions 101 -> 118 and did not bump this floor, so
         # the tree ran 17 assertions above it for a day. Surfaced by the CDC slice's hermetic run coming out
         # at 8003 against a floor of 7986 and the delta not being attributable to the change under test.
-        : "${MIN_ASSERTIONS:=8197}"
+        # 8183 since 2026-09-01: fabricator_render MOVED OUT to Fabricator.FluidPlugin, taking
+        # verify_global_functions 178 -> 164 (-14). A DOWNWARD bump, which is the rare one: the assertions
+        # were not deleted, they moved to verify_plugin_fluid (service tier, 20) because a plugin cannot be
+        # loaded in a tier that points FABRICATOR_PLUGIN_DIR at an empty directory on purpose. The one thing
+        # only render covered here -- an untyped NULL in an ANY-declared position -- was re-homed onto the
+        # VARARGS tail in the same suite rather than dropped. The 8197 note it supersedes:
+        : "${MIN_ASSERTIONS:=8183}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh
@@ -462,7 +468,8 @@ case "$TIER" in
         # /!\ The exclusion is a LOSS: the session-tagging feature now has NO gate. The suite is unchanged and
         # runs on demand -- FABRICATOR_RUN_SESSION_TAG=1 unittest --test-dir . test/verify_session_tag.test.
         # Deleting that one require-env line puts it back.
-        : "${MIN_SUITES:=53}"
+        # 54 since 2026-09-01: + verify_plugin_fluid (the Fluid/Liquid template engine as a plugin).
+        : "${MIN_SUITES:=54}"
         # 1424 since 2026-08-01: verify_exec_invalidate_cache 10 -> 21, for the OUT-OF-BAND DROP path Ã¢ÂÂ the
         # catalog's self-heal, documented in CLAUDE.md and until now covered by NOTHING. The service tier ran
         # 44/44 green while that path was broken, which is why the section exists. It must run with
@@ -699,7 +706,15 @@ case "$TIER" in
         # and that run's own per-suite line reports verify_session_tag at 25, so 3094 - 25 = 3069 is a
         # subtraction of a measured value rather than an inference about a suite that did not finish.
         # The 3056 note it supersedes:
-        : "${MIN_ASSERTIONS:=3069}"
+        # 3092 since 2026-09-01 (same day, second bump): verify_plugin_fluid 20 -> 23, three NULL-VALUE
+        # assertions added when the Fluid pin moved to 3.0.0-beta.7 and its CS8604 exposed that a NULL
+        # inside the params bag was covered by nothing. The 3089 note it supersedes:
+        # 3089 since 2026-09-01: + verify_plugin_fluid's 20 (fabricator_render moved out of
+        # Fabricator.SqlServer into Fabricator.FluidPlugin -- nine render assertions moved verbatim from
+        # verify_global_functions plus the plugin-loaded, no-rejection, single-registration and parse-error
+        # ones the move itself makes assertable). 3069 + 20 = 3089 exactly, which is what shows no other
+        # suite moved. The 3069 note it supersedes:
+        : "${MIN_ASSERTIONS:=3092}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2
@@ -927,6 +942,16 @@ while IFS="$(printf '\t')" read -r suite provider batchrows; do
     # The restore is an unconditional else-arm rather than an unset, because every OTHER suite in the tier
     # - verify_plugin above all - needs the real directory.
     case "$suite" in
+        *verify_plugin_fluid.test)
+            # The Fluid plugin ALONE, and the "alone" is the assertion. The suite pins that exactly ONE
+            # provider is loaded and that fabricator_render has exactly ONE registration -- both of which say
+            # nothing if the tier's normal root (Fabricator.SamplePlugin) is also in scope. A FIXED path with
+            # no TFM and no RID in it, because the plugin's csproj sets OutputPath; RELATIVE for the same
+            # reason as the collide fixture below (an MSYS $PWD becomes a path under D:\d on the managed
+            # side, which reports as root_missing rather than failing).
+            # Build it with: dotnet build dotnet/Fabricator.FluidPlugin -c Release
+            export FABRICATOR_PLUGIN_DIR="build/plugins/fluid"
+            ;;
         *verify_plugin_install.test)
             # TWO roots: an empty one to install into, plus the COLLIDING TEST FIXTURE
             # (dotnet/Fabricator.CollidingPlugin, an IBackend claiming the first-party name 'sqlserver').

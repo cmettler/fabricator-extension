@@ -10,7 +10,7 @@
 > `fabricator_lat_badorigin`, gated hermetically by `test/verify_lateral.test` (144).
 >
 > Status: **BUILT + verified for ALL FIVE kinds** — global **scalar** (ABI v46 `list_global_functions` +
-> handle-0 dispatch; `fabricator_render`, Fluid/Liquid), **in-out + collector** (`fabricator_tag` +
+> handle-0 dispatch; `hilbert_index`, `bucket`, `fabricator_parse`), **in-out + collector** (`fabricator_tag` +
 > `fabricator_collect_sum`, handle-0 `inout_bind`), **table** (`fabricator_seq` fixed + `fabricator_columns`
 > ARG-DEPENDENT schema, handle-0 `tablefn_bind` / v29 session), AND **aggregate** (`fabricator_product`, handle-0
 > `agg_open`; GROUP BY / parallel / OVER all work). All resolve as a bare `fn(...)` with NO ATTACH —
@@ -36,10 +36,14 @@
 
 ## Why / the defining property
 
-A global function is **connection-free and ATTACH-free**: `SELECT fabricator_render('Hello {{name}}', {'name':'x'})`
+A global function is **connection-free and ATTACH-free**: `SELECT hilbert_index([1, 2, 3], 10)`
 works on a bare DuckDB with the extension loaded — no `ATTACH … (TYPE fabricator)`, no SQL Server / DAX
 connection. That is exactly right for:
-- a **template engine** (`fabricator_render(template, params)` → text) — pure compute, no backend;
+- a **template engine** (`fabricator_render(template, params)` → text) — pure compute, no backend. ⚠ **That
+  one moved OUT on 2026-09-01**: it is the `Fabricator.FluidPlugin` plugin now, so it is connection-free
+  *and* opt-in. The mechanism it demonstrated is unchanged — a plugin contributes global scalars through the
+  very same `IBackend.GlobalScalarFunctions` path — which is the point: the scope does not care who supplies
+  the function. Gate moved with it, to `test/verify_plugin_fluid.test`;
 - future connection-free readers (`fabricator_iceberg_scan(path)`, lakehouse readers) — they belong to no
   catalog (`fabricator_delta_scan` is **already** a global function — bespoke `RegisterDeltaScan`, proof the scope
   exists).
@@ -356,9 +360,15 @@ effectful halves, exactly as deliberated.
 
 ## Verification
 
-- `test/verify_global_functions.test`: **no ATTACH** throughout. Scalar: `SELECT fabricator_render('Hi {{name}}',
-  {'name':'x'})` → `Hi x`; vectorized over `range()`; NULL handling; the JSON-string param form; resolves on a
-  bare loaded extension (no catalog); a collision test if two providers declare the same global name. Later
+- `test/verify_global_functions.test`: **no ATTACH** throughout. Scalar: `hilbert_index` / `bucket` /
+  `fabricator_batch_seq` (zero-argument) / `fabricator_va_concat` (variadic) / `fabricator_parse`
+  (bind-resolved return type); vectorized over `range()`; NULL handling incl. an untyped NULL in an
+  ANY-declared position; resolves on a bare loaded extension (no catalog); a collision test if two providers
+  declare the same global name.
+  ⚠ **The template-engine assertions are no longer here.** They led this suite until 2026-09-01, when
+  `fabricator_render` became `Fabricator.FluidPlugin`; they moved verbatim to
+  `test/verify_plugin_fluid.test`, which is a SERVICE-tier suite because the hermetic tier points
+  `FABRICATOR_PLUGIN_DIR` at an empty directory on purpose. Later
   slices add: a global **table** fn (`SELECT * FROM fabricator_gen(3)`) proving arg-dependent output schema via
   `tablefn_bind` with no catalog; a global **in-out** (`SELECT * FROM fabricator_xform((SELECT …))`) and **collector**
   proving the exchange/Sink+Source operators run handle-0 with no ATTACH.

@@ -15,7 +15,6 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Fluid.Core" Version="2.31.0" />
     <ProjectReference Include="..\Fabricator.Abstractions\Fabricator.Abstractions.csproj" />
     <ProjectReference Include="..\Fabricator.Bridge\Fabricator.Bridge.csproj" />
     <!-- SQL Server EXTERNAL TABLES write Delta: ExternalTableRouting (INSERT/identity-keyed UPDATE+DELETE

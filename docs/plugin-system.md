@@ -251,6 +251,140 @@ should be something the USER asks for by name rather than something a file appea
 - **Signature or checksum verification** of an archive. `Hashing` is there; nothing consumes it here.
 - **Per-plugin ALC isolation** -- see the sequenced recommendation below. Still correctly deferred.
 
+## The FLUID plugin — the first plugin with a PRIVATE PACKAGE CLOSURE (2026-09-01)
+
+`fabricator_render(template, params)`, the Fluid/Liquid template engine, was a first-party global scalar
+registered by `Fabricator.SqlServer`. It is now `dotnet/Fabricator.FluidPlugin`, a plugin. The move is
+user-directed and the mechanism needed **no** change to the bridge, the ABI or the plugin system — a plugin
+contributes global scalars through the same `IBackend.GlobalScalarFunctions` a backend does.
+
+**Why it was worth moving.** A template engine inside the SQL Server backend has nothing to do with SQL
+Server, and its `Fluid.Core` closure rode into every shipped payload whether or not anyone rendered a
+template. MEASURED: `Fluid.dll`, `Parlot.dll` and `TimeZoneConverter.dll` are gone from
+`build/release/extension/fabricator/fabricator` after the move. It is also the one dependency
+[the AOT SKU had to reason about](aot-bridge.md) — Parlot's compiled mode uses `System.Linq.Expressions` —
+so that conditional dissolves rather than being solved.
+
+**⚠ CONSEQUENCE: `fabricator_render` is registered by a plugin now.** A global function can only be
+registered during `Extension::Load()`, so the plugin must be in a plugin root at load time — installing it
+mid-session surfaces it only at the next start.
+
+**It IS in the distribution artifact**, via the bundled root below — so a user on a released binary keeps
+`fabricator_render` with no configuration. ⚠ But a user who sets `FABRICATOR_PLUGIN_DIR` loses it, because
+that variable REPLACES every default root rather than extending them.
+
+### The BUNDLED root — how a plugin ships at all
+
+The single-file payload is exactly *the core loadable plus the managed directory*, so a plugin ships only by
+living inside the managed directory. `PluginPaths.BundledRelativeRoot` (`plugins`) makes
+`<managed>/plugins/` a default search root, and `pack-distribution.ps1` step **2b** builds each bundled
+plugin and copies its assemblies to `<managed>/plugins/<name>/`.
+
+- **⚠ Step 2b MUST run after `publish-managed.ps1` and before the pack.** `dotnet publish` deletes files
+  under the managed directory that a previous publish wrote and the current closure no longer contains — the
+  mechanism that silently removed five SqlClient DLLs on 2026-08-18 — so a plugin copied in earlier would
+  simply not be in the artifact, with no error anywhere.
+- **⚠ This does NOT contradict the rule that the default root is not under the managed directory.** That rule
+  protects a plugin the USER installed, which a publish would destroy. A bundled plugin is part of the
+  artifact and is rewritten by every pack, so being wiped by a publish is correct rather than data loss. The
+  distinction is ownership, not location.
+- **⚠⚠ The bundled root is searched LAST, and the first version of this shipped with the ordering — and the
+  justification — BACKWARDS.** The scan is **FIRST-ROOT-WINS**: it registers with `refuseCollisions: true`,
+  so a duplicate provider name met in a later root is reported `rejected` with a collision message naming
+  both, never overwritten. The original comment justified bundled-FIRST by `BackendRegistry.Add` being
+  `map[name] = backend` (last-wins) — true of the BUILT-IN registration path, false of the plugin path. Under
+  that ordering the shipped copy won and a user's install was rejected, the opposite of the intent.
+  MEASURED with two roots holding one plugin: the first loads, the second is rejected. Gated offline
+  (`PluginPathsTests.Bundled_root_sits_under_the_managed_directory_and_is_searched_LAST`), mutation-tested:
+  reversing the two kills that test and nothing else.
+  ⚠ The consequence to expect in normal use: a user who installs their own copy of a bundled plugin sees a
+  `rejected` row for the shipped one. That is the honest report, not a fault.
+- **⚠ `FABRICATOR_PLUGIN_DIR` replaces it too**, deliberately: the hermetic tier points that variable at an
+  empty directory precisely so its plugin set is provably independent of machine state, and a bundled root
+  that survived the override would make a tier's result depend on whether anyone had run a pack into that
+  build tree. The cost is the footgun above, which is why every root is REPORTED by `fabricator_plugins()`.
+  - **An EXTEND spelling (`FABRICATOR_PLUGIN_DIR_EXTEND=1`) was proposed and DECLINED (2026-09-01,
+    user-decided) — recorded so it is not re-proposed as an obvious ergonomic win.** The motivation was
+    dev/test: point the variable at a plugin under development without losing the bundled ones. **The
+    root-ordering fix above removes that pain**: `~/.duckdb/fabricator/plugins` is searched BEFORE the
+    bundled root, so dropping a build there wins over a shipped copy of the same plugin while every other
+    bundled plugin stays present — no variable needed. What extend would have cost is the hermetic tier's
+    exclusivity guarantee, and a `,`-separated list already expresses "mine plus the bundled root"
+    explicitly for anyone who wants it.
+- The managed directory is derived from **the bridge assembly's own location**, not from
+  `FABRICATOR_MANAGED_DIR` — that variable is an INPUT to `clr_host` and is absent whenever the host used its
+  default, which is the case the distribution takes.
+- Gate: `test/distribution/smoke_distribution.py` (12 → **14** checks). ⚠ It attributes by **root**, not by
+  the function merely working: that session sets no environment variables, so the per-user root is searched
+  too and a developer with Fluid installed there would make a bare "does render work" check pass on an
+  artifact shipping nothing.
+
+### ⚠⚠ What this plugin tests that `Fabricator.SamplePlugin` cannot
+
+`Fabricator.SamplePlugin` is pure IL with no third-party package. So until this existed, **nothing exercised
+`BackendRegistry.InstallPluginResolver` actually loading a plugin's own NuGet closure out of the plugin
+folder** — the resolver had a test for the case where there is nothing to resolve. Fluid pulls **six**
+assemblies (`Fluid`, `Parlot`, `TimeZoneConverter` and two `Microsoft.Extensions.*`), all resolved by that
+hook, and since the move none of them is in the bridge payload — so **any successful render IS the closure
+resolving**. (The exact list moved with the pin: `Fluid`, `Parlot`, `TimeZoneConverter`, `System.Linq.Async`
+and two `Microsoft.Extensions.*` on 3.0.0-beta.7.)
+
+**⚠ The Fluid pin is a PRERELEASE — `Fluid.Core 3.0.0-beta.7`, because v3.0 has no stable package.** That
+makes a bump here a CODE-COMPATIBILITY question rather than a routine version bump, and
+`verify_plugin_fluid.test` is what answers it. Moving `2.31.0 → 3.0.0-beta.7` already changed an annotation
+under us: v3 declares `TemplateContext.SetValue(string, object)` NON-nullable while its body still maps null
+to `NilValue.Instance`. Nothing broke — but the plugin now routes null to the `FluidValue` overload itself
+rather than depending on that internal branch, precisely because an internal null-handling branch is the kind
+of thing that moves between betas and moves SILENTLY. ⚠ **The compiler warning is what found it, and the
+suite had no assertion either way** — a NULL is ordinary here (a STRUCT field can be NULL, JSON has `null`),
+so three assertions were added for it. Go to the stable 3.0.0 as soon as it ships.
+
+⚠ It stays a `PackageReference` rather than a source reference to a local clone: a sibling-path reference
+pins nothing, no clone but the author's can build it — the shape this repo converted engineered-wood and
+DuckDB.ExtensionKit away from — and it would leave CI silently gating a DIFFERENT Fluid than the developer
+runs.
+
+### ⚠ The trap the build walked into, which every future plugin with a dependency will meet
+
+**A library does not copy its NuGet closure to the output directory.** `CopyLocalLockFileAssemblies` defaults
+to false for libraries; package assemblies are materialised only by `dotnet publish`. `Fabricator.SqlServer`
+got Fluid that way, through `publish-managed.ps1`. **A plugin has no publish step** — its build OUTPUT is
+what a plugin root points at — so the first build produced `Fabricator.FluidPlugin.dll` and nothing else, and
+the plugin would have loaded and then failed at first render with a `FileNotFoundException` naming an
+assembly nobody had copied. Set `CopyLocalLockFileAssemblies=true`.
+
+**And then the opposite hazard arrives.** With it set, `Apache.Arrow` — which reaches the plugin transitively
+through `Fabricator.Abstractions` — gets copied too, which is exactly the "aligned dependency closure" hazard
+this document warns about elsewhere. `ExcludeAssets="runtime"` on an explicit `Apache.Arrow` /
+`Apache.Arrow.Scalars` reference keeps the compile reference and drops the copy. ⚠ `ExcludeAssets` does NOT
+flow to a transitive dependency, so `Apache.Arrow.Scalars` has to be named separately.
+
+### ⚠ It references Abstractions ONLY, and paid ~20 lines for it
+
+`ArrowValueReader.ReadScalar` — which the original code used to read a STRUCT field — lives in
+`Fabricator.Bridge`, and `IScalarFunction`'s own doc says it is available "if a provider references the
+bridge". A plugin has `Fabricator.Abstractions` only. The plugin therefore carries a local copy
+(`ArrowScalar.Read`, same type coverage including the timestamp rule). Widening the reference to the bridge
+to save those lines would make the in-tree example stop demonstrating the surface out-of-tree plugin authors
+actually have.
+
+### Gates
+
+`test/verify_plugin_fluid.test` (**20**, service tier). The runner points `FABRICATOR_PLUGIN_DIR` at
+`build/plugins/fluid` **and nothing else** for that one suite, because two of its assertions — exactly one
+loaded provider, exactly one `fabricator_render` registration — say nothing with the tier's normal root
+(holding `Fabricator.SamplePlugin`) also in scope. The single-registration one is what pins the MOVE rather
+than the behaviour: a build that had merely ADDED the plugin while leaving the first-party copy in place
+would pass every render assertion.
+
+⚠ Two things moved rather than being deleted, and `verify_global_functions` says so at both sites: the nine
+render assertions, and the **untyped-NULL-in-an-ANY-declared-position** regression — `fabricator_render`'s
+`params` was the only ANY-declared non-varargs global scalar parameter in the tree, so that crossing was
+re-homed onto the VARARGS tail (`fabricator_va_concat('-', 1, NULL, 'x')`), MEASURED to cross identically
+before the substitution was made. `verify_plugin.test` also had to stop using `fabricator_render` for its
+"a built-in global coexists with a plugin's" assertion — which stopped meaning anything the day render
+itself became a plugin.
+
 ## A plugin can declare a CORRELATED LATERAL function (2026-08-22, ABI v79)
 
 `ILateralFunction` lives in `Fabricator.Abstractions`, so declaring one costs a plugin no more than

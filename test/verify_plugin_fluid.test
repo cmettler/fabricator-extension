@@ -1,0 +1,167 @@
+# name: test/verify_plugin_fluid.test
+# description: The Fluid/Liquid template engine as a PLUGIN — fabricator_render(template, params), moved out
+#              of Fabricator.SqlServer into Fabricator.FluidPlugin. Two things are gated here: the render
+#              behaviour itself (moved verbatim from verify_global_functions, where it used to run against
+#              the first-party build), and the property that makes this plugin worth having in-tree — a
+#              plugin carrying its OWN NuGet closure. See docs/plugin-system.md.
+# group: [fabricator]
+
+require fabricator
+
+# ⚠ THE SUITE RUNNER POINTS THIS AT build/plugins/fluid AND NOTHING ELSE. It must NOT be the tier's normal
+# plugin root: that root holds Fabricator.SamplePlugin, and a second loaded plugin would make the "exactly one
+# provider" assertion below say nothing. Build the fixture with:
+#   dotnet build dotnet/Fabricator.FluidPlugin -c Release
+require-env FABRICATOR_PLUGIN_DIR
+
+# ============================================================================================
+# THE PLUGIN LOADED — and this is the assertion the whole file rests on, because every render below is
+# vacuous if the function came from somewhere else.
+# ============================================================================================
+
+query TT
+SELECT status, provider FROM fabricator_plugins() WHERE status = 'loaded';
+----
+loaded	fluid
+
+# ⚠ NOTHING was rejected. A plugin whose private dependency failed to resolve reports `rejected` with the
+# exception, NOT a missing function — so without this a broken closure would surface further down as a
+# confusing render failure rather than as what it is.
+query I
+SELECT count(*) FROM fabricator_plugins() WHERE status = 'rejected';
+----
+0
+
+# ============================================================================================
+# THE PRIVATE NuGet CLOSURE — the property Fabricator.SamplePlugin cannot test
+#
+# ⚠ Fabricator.SamplePlugin is pure IL with no third-party package, so until this plugin existed NOTHING
+# exercised BackendRegistry.InstallPluginResolver actually loading a plugin's own dependencies out of the
+# plugin folder. Fluid.Core 3.0.0-beta.7 pulls SIX assemblies (Fluid, Parlot, TimeZoneConverter,
+# System.Linq.Async and two Microsoft.Extensions.*), and since the move they are NOT in the bridge payload —
+# so any successful render below IS the closure resolving. That is why the first render is stated as a
+# property, not just a value.
+#
+# ⚠ The pin is a PRERELEASE (v3.0 has no stable package yet), so a bump here is a code-compatibility
+# question rather than a routine one — this suite is what answers it. Moving 2.31.0 -> 3.0.0-beta.7 already
+# changed one annotation under us; see the NULL-value section below.
+# ============================================================================================
+
+# Basic render: Liquid substitution from a JSON params bag. Reaching Fluid at all proves the resolver worked.
+query I
+SELECT fabricator_render('Hello {{ name }}, you have {{ n }} messages', '{"name":"world","n":3}');
+----
+Hello world, you have 3 messages
+
+# params as a DuckDB STRUCT (type-safe, no quoting) — the SQLNULL->ANY sentinel lets the same fn accept it.
+query I
+SELECT fabricator_render('Hello {{ name }}, you have {{ n }} messages', {'name':'world','n':3});
+----
+Hello world, you have 3 messages
+
+# STRUCT params vectorized over rows (each row's struct supplies that row's variables).
+query I
+SELECT fabricator_render('id={{ id }}', {'id': i}) AS r FROM range(3) t(i) ORDER BY r;
+----
+id=0
+id=1
+id=2
+
+# Vectorized over a batch (the template is a per-row column; params empty object).
+query I
+SELECT fabricator_render('row ' || i::VARCHAR, '{}') AS r FROM range(3) t(i) ORDER BY i;
+----
+row 0
+row 1
+row 2
+
+# Liquid control flow (if/else) — proves it's a real template engine, not just substitution.
+query I
+SELECT fabricator_render('{% if x > 1 %}big{% else %}small{% endif %}', '{"x":5}');
+----
+big
+
+# Liquid loop over a JSON array param.
+query I
+SELECT fabricator_render('{% for i in items %}{{ i }};{% endfor %}', '{"items":[1,2,3]}');
+----
+1;2;3;
+
+# A NULL template yields NULL (SPECIAL_HANDLING — the function sees NULL args).
+query I
+SELECT fabricator_render(NULL, '{"a":1}');
+----
+NULL
+
+# An unreferenced/empty params object renders the literal text.
+query I
+SELECT fabricator_render('static text', '{}');
+----
+static text
+
+# Composes with a normal query (no catalog dependency): a per-row JSON params string.
+query I
+SELECT fabricator_render('id={{ id }}', '{"id":' || i::VARCHAR || '}') AS r FROM range(2) t(i) ORDER BY i;
+----
+id=0
+id=1
+
+# ⚠ AN UNTYPED NULL IN AN *ANY-DECLARED* POSITION. This was BROKEN BEFORE the ABI v80 bind session existed and
+# no suite covered it: DuckDB exports an Arrow null-typed array with null_count = 0 and Apache.Arrow refuses
+# it ("Length must equal null count"), so this call failed at execute. The one NULL the suites did carry (the
+# NULL-template case above) sits in a VARCHAR-declared position, which DuckDB CASTS — which is exactly why the
+# ANY position stayed untested. It has to work on BOTH crossings: at bind the literal is still SQLNULL
+# (argument casts run after the bind callback), and at execute it still is, because an ANY parameter is never
+# cast. ⚠ verify_global_functions keeps a VARARGS-tail twin of this assertion, so the crossing stays covered
+# in the hermetic tier where no plugin is loaded.
+query I
+SELECT fabricator_render('x{{ a }}', NULL);
+----
+x
+
+# ---- NULL VALUES in the params bag (as opposed to a NULL bag) ----
+#
+# ⚠⚠ THESE EXIST BECAUSE A COMPILER WARNING FOUND THE GAP, not because anyone predicted it. Moving the pin to
+# Fluid 3.0.0-beta.7 produced CS8604 on SetValue: v3 annotates its `object` overload as NON-nullable. Reading
+# Fluid's source showed the body maps null to NilValue.Instance anyway, so the behaviour was never at risk —
+# but the suite had no assertion either way, and a NULL is ORDINARY here: a STRUCT field can be NULL and JSON
+# has `null`. The plugin now routes null to the FluidValue overload itself rather than leaning on a
+# PRERELEASE's internal null-handling branch, and these pin what that must produce.
+#
+# The brackets are load-bearing: an empty render and a NULL result are both "nothing" in a bare query.
+
+query I
+SELECT '[' || fabricator_render('{{ a }}', {'a': NULL::VARCHAR}) || ']';
+----
+[]
+
+query I
+SELECT '[' || fabricator_render('{{ a }}', '{"a":null}') || ']';
+----
+[]
+
+# nil is FALSY, not merely empty — the property a template branching on an optional value depends on.
+query I
+SELECT fabricator_render('{% if a %}set{% else %}nil{% endif %}', {'a': NULL::BIGINT});
+----
+nil
+
+# ============================================================================================
+# THE PLUGIN IS THE ONLY SOURCE OF THIS FUNCTION
+#
+# ⚠ This is the assertion that pins the MOVE rather than the behaviour. fabricator_render used to be a
+# first-party global registered by Fabricator.SqlServer; a build that had merely ADDED the plugin while
+# leaving the original in place would pass every render above. Exactly one registration, and the plugin is
+# the only thing loaded (asserted at the top), so this one is it.
+# ============================================================================================
+
+query I
+SELECT count(*) FROM duckdb_functions() WHERE function_name = 'fabricator_render';
+----
+1
+
+# A malformed template is refused with the function's own message, not a render of the broken text.
+statement error
+SELECT fabricator_render('{% if %}', '{}');
+----
+<REGEX>:.*template parse error.*

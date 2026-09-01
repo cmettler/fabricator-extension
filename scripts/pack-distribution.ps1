@@ -60,7 +60,11 @@ param(
     # artifact carries its own copy of those bytes — so it is deleted by default rather than doubling
     # the output size. Useful when auditing what went into a build: its SHA-256 is the value recorded
     # in the artifact's manifest.
-    [switch]$KeepPayload
+    [switch]$KeepPayload,
+
+    # Skip building + staging the bundled plugins (step 2b). The artifact then ships WITHOUT them, so
+    # fabricator_render does not resolve for anyone using it -- a deliberate choice, not a default.
+    [switch]$SkipPlugins
 )
 
 $ErrorActionPreference = 'Stop'
@@ -125,6 +129,53 @@ if (-not $SkipManaged) {
     if ($LASTEXITCODE -ne 0) { throw 'publish-managed.ps1 failed' }
 }
 if (-not (Test-Path $managedPath)) { throw "Managed directory not found: $managedPath" }
+
+# --- 2b. BUNDLED PLUGINS ----------------------------------------------------------------------
+# The payload IS the core loadable plus the managed directory, so a plugin ships only by living inside the
+# managed directory. It goes under `<managed>/plugins/<name>/`, which PluginPaths.BundledRelativeRoot makes
+# a DEFAULT search root (searched first, so a user-installed plugin of the same name still overrides it).
+#
+# /!\ ORDER IS LOAD-BEARING: this MUST run AFTER publish-managed.ps1 and BEFORE the pack. `dotnet publish`
+# deletes files under the managed directory that a previous publish wrote and the current closure no longer
+# contains -- the same mechanism that silently removed five SqlClient DLLs on 2026-08-18 -- so a plugin
+# copied in BEFORE step 2 would simply not be in the artifact, with no error anywhere.
+#
+# /!\ And this is why it re-copies rather than checking for existence: the copy is CHEAP and the failure it
+# prevents is SILENT.
+if (-not $SkipPlugins) {
+    Step 'Building and staging the bundled plugins'
+    $pluginsRoot = Join-Path $managedPath 'plugins'
+    # Each entry: the project to build, and the directory its build lands in (its csproj fixes OutputPath,
+    # so no TFM and no RID appear here).
+    $bundledPlugins = @(
+        @{ Name = 'fluid'; Project = 'dotnet/Fabricator.FluidPlugin'; Output = 'build/plugins/fluid' }
+    )
+    foreach ($plugin in $bundledPlugins) {
+        & dotnet build (Join-Path $repo $plugin.Project) -c Release --nologo
+        if ($LASTEXITCODE -ne 0) { throw "building the bundled plugin '$($plugin.Name)' failed" }
+        $source = Join-Path $repo $plugin.Output
+        if (-not (Test-Path $source)) { throw "bundled plugin '$($plugin.Name)' not found at $source" }
+
+        # /!\ ASSERT THE PRIVATE NuGet CLOSURE, not merely the entry assembly. A library does not copy its
+        # package closure to the output directory unless CopyLocalLockFileAssemblies is set; without it the
+        # plugin LOADS and then throws FileNotFoundException at its first call. Shipping that would put the
+        # failure in the user's session rather than in this build.
+        $dlls = @(Get-ChildItem -Path $source -Filter *.dll -File)
+        if ($dlls.Count -lt 2) {
+            throw "bundled plugin '$($plugin.Name)' has $($dlls.Count) assembly/assemblies in $source - " +
+                  'expected its dependency closure too (is CopyLocalLockFileAssemblies set in its csproj?)'
+        }
+
+        $destination = Join-Path $pluginsRoot $plugin.Name
+        if (Test-Path $destination) { Remove-Item $destination -Recurse -Force }
+        New-Item -ItemType Directory -Path $destination -Force | Out-Null
+        # .dll ONLY: the build output also holds a .pdb, a .deps.json and the .plugin.zip archive, none of
+        # which the scan needs -- and the ARCHIVE especially must not ride along, since the search is
+        # RECURSIVE and a zip inside a plugin root is dead weight in every artifact.
+        Copy-Item -Path (Join-Path $source '*.dll') -Destination $destination -Force
+        Write-Host "    $($plugin.Name): $($dlls.Count) assemblies -> $destination"
+    }
+}
 
 # --- 3. the NativeAOT installer shell --------------------------------------------------------
 if (-not $SkipShell) {
