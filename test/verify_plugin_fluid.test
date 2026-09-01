@@ -886,3 +886,134 @@ query I
 SELECT fabricator_render('{% assign r = query("SELECT n FROM fq_txn") %}{{ r.size }}', NULL);
 ----
 2
+
+# ============================================================================================
+# NAMED PARAMETER BINDING — `sql | query: name: value`, binding $name. See docs/fluid-templating.md §9.10.
+#
+# ⚠⚠ IT IS A FILTER, NOT A SECOND ARGUMENT TO THE FUNCTION, and Fluid's GRAMMAR is what decides that:
+# MEASURED, `query('s', a: 5)` is a PARSE error ("End of tag was expected") while `'s' | query: a: 5`
+# parses and arrives with its names populated. Fluid has no dictionary literal either ({'a':1} and {a:1}
+# both fail), so the filter is the ONLY spelling in this Fluid that can carry named parameters — and it
+# needs nothing added to Fluid.
+# ============================================================================================
+
+statement ok
+CREATE TABLE fq_orders AS SELECT * FROM (VALUES ('eu',10,1),('us',25,2),('eu',5,3)) v(region,amt,id);
+
+# Two parameters, of different types, bound by NAME.
+query I
+SELECT fabricator_render('{% assign rs = "SELECT id FROM fq_orders WHERE region = $region AND amt > $min ORDER BY id" | query: region: "eu", min: 6 %}{% for r in rs %}[{{ r.id }}]{% endfor %} n={{ rs.size }}', NULL);
+----
+[1] n=1
+
+# ⚠ The DISCRIMINATING row: the same statement with a different bound value returns a different set. Without
+# it, the assertion above would pass equally on a build that ignored the parameters and got lucky.
+query I
+SELECT fabricator_render('{% assign rs = "SELECT id FROM fq_orders WHERE region = $region AND amt > $min ORDER BY id" | query: region: "eu", min: 1 %}{% for r in rs %}[{{ r.id }}]{% endfor %}', NULL);
+----
+[1][3]
+
+# Parameter values may come from template variables, not only literals.
+query I
+SELECT fabricator_render('{% assign g = "us" %}{% assign rs = "SELECT id FROM fq_orders WHERE region = $r" | query: r: g %}{% for r in rs %}{{ r.id }}{% endfor %}', NULL);
+----
+2
+
+# ============================================================================================
+# ⚠⚠ THE PROPERTY THAT JUSTIFIES PARAMETERS EXISTING: A VALUE CANNOT BECOME SQL.
+#
+# The payload is a classic injection string. Bound, it is ONE VARCHAR that matches no region, so the answer
+# is 0. Spliced into the SQL it would have matched every row and answered 3. The two outcomes differ, which
+# is what makes this an assertion rather than a demonstration.
+# ============================================================================================
+
+query I
+SELECT fabricator_render('{% assign rs = "SELECT count(*) AS n FROM fq_orders WHERE region = $r" | query: r: "eu'' OR 1=1 --" %}{% for x in rs %}{{ x.n }}{% endfor %}', NULL);
+----
+0
+
+# THE CONTROL: the identical statement with a value that DOES match. Without it, "0" would be equally true
+# of a build where the parameter never reached the statement at all.
+query I
+SELECT fabricator_render('{% assign rs = "SELECT count(*) AS n FROM fq_orders WHERE region = $r" | query: r: "eu" %}{% for x in rs %}{{ x.n }}{% endfor %}', NULL);
+----
+2
+
+# ============================================================================================
+# TYPES — the allow-list, and what each one becomes.
+# ⚠ Fluid's number model IS decimal (§7.3), so every number arrives as one; an INTEGRAL value is narrowed
+# back to BIGINT so the common spelling behaves like the literal it replaced, and a fractional one keeps its
+# own scale as DECIMAL(38, s) rather than being widened or rounded.
+# ============================================================================================
+
+query I
+SELECT fabricator_render('{% assign rs = "SELECT $i AS i, $d::VARCHAR AS d, $s AS s, $b AS b, ($n IS NULL) AS n" | query: i: 42, d: 19.99, s: "hi", b: true, n: nil %}{% for r in rs %}{{ r.i }}|{{ r.d }}|{{ r.s }}|{{ r.b }}|{{ r.n }}{% endfor %}', NULL);
+----
+42|19.99|hi|true|true
+
+# The bound integer really is an INTEGER-family value, not text: it arithmetics on the server.
+query I
+SELECT fabricator_render('{% assign rs = "SELECT $i + 1 AS v" | query: i: 41 %}{% for r in rs %}{{ r.v }}{% endfor %}', NULL);
+----
+42
+
+# ============================================================================================
+# REFUSALS — each is a shape that would otherwise be a silently wrong statement.
+# ============================================================================================
+
+# ⚠ A POSITIONAL argument is REFUSED rather than ignored. Fluid lets a filter take both, and a positional
+# value could only mean `?` / `$1`, which cannot coexist with the by-name binding a named batch selects.
+# Dropping it silently would run the statement with a parameter the author believed they had supplied.
+statement error
+SELECT fabricator_render('{% assign rs = "SELECT $1" | query: 5 %}x', NULL);
+----
+NAMED parameters only
+
+statement error
+SELECT fabricator_render('{% assign rs = "SELECT $a" | query: 5, a: 1 %}x', NULL);
+----
+positional argument
+
+# A LIST has no SQL parameter form and is refused BY NAME rather than rendered into the statement.
+statement error
+SELECT fabricator_render('{% assign L = (1..3) %}{% assign rs = "SELECT $a" | query: a: L %}x', NULL);
+----
+has no SQL parameter form
+
+# ⚠ A MISSING parameter is DuckDB's own error and it NAMES the parameter — better than anything we could
+# invent, and the reason nothing here tries to pre-validate the placeholder set.
+statement error
+SELECT fabricator_render('{% assign rs = "SELECT $a, $b" | query: a: 1 %}x', NULL);
+----
+parameters: b
+
+# ⚠ THE SELECT-ONLY REFUSAL APPLIES TO THE FILTER FORM TOO — the parameters do not buy an exemption. A
+# parameterised write is still a write, and still fires at bind.
+statement error
+SELECT fabricator_render('{% assign rs = "DELETE FROM fq_orders WHERE id = $i" | query: i: 1 %}x', NULL);
+----
+runs SELECT statements only
+
+query I
+SELECT count(*) FROM fq_orders;
+----
+3
+
+# ============================================================================================
+# BOTH SPELLINGS COEXIST, and the no-parameter cases are unchanged.
+# ⚠ The FUNCTION and the FILTER share the name `query`. The function is registered per context; the filter
+# ONCE in the shared TemplateOptions, with the caller travelling in AmbientValues — registering it per
+# render would mutate that shared object on every call and report another render's function name.
+# ============================================================================================
+
+query I
+SELECT fabricator_render('{% assign a = query("SELECT 1 AS v") %}{% assign b = "SELECT 2 AS v" | query %}{% for r in a %}{{ r.v }}{% endfor %}{% for r in b %}{{ r.v }}{% endfor %}', NULL);
+----
+12
+
+# The filter form works at BIND inside fluid_query, exactly as the function form does — with its parameter
+# deciding the generated SQL.
+query I
+SELECT * FROM fluid_query('SELECT {% assign rs = "SELECT amt FROM fq_orders WHERE id = $i" | query: i: 2 %}{% for r in rs %}{{ r.amt }}{% endfor %} AS a');
+----
+25

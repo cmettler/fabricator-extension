@@ -3,6 +3,7 @@
 // See LICENSE in the project root for license information.
 
 using Apache.Arrow;
+using Apache.Arrow.Types;
 using Apache.Arrow.Ipc;
 using Fabricator.Bridge;
 using Fluid;
@@ -30,8 +31,22 @@ namespace Fabricator.FluidPlugin;
 /// </remarks>
 internal static class FluidHostQuery
 {
-    /// <summary>The name a template calls it by.</summary>
+    /// <summary>The name a template calls it by, as BOTH a function and a filter.</summary>
     internal const string FunctionName = "query";
+
+    /// <summary>
+    /// The <see cref="TemplateContext.AmbientValues"/> key carrying the SQL function name being rendered.
+    /// </summary>
+    /// <remarks>
+    /// ⚠ It exists because the FILTER is registered ONCE in the shared <see cref="TemplateOptions"/>, so it
+    /// cannot capture `caller` the way the per-context function does — and registering it per render would
+    /// mutate that shared object on every call and report another render's name in an error.
+    /// </remarks>
+    internal const string CallerKey = "fabricator.caller";
+
+    /// <summary>The caller for this render, or a neutral name if it was not set.</summary>
+    private static string CallerOf(TemplateContext ctx) =>
+        ctx.AmbientValues.TryGetValue(CallerKey, out var v) && v is string s ? s : FunctionName;
 
     /// <summary>The most rows one <c>query()</c> call will materialise before refusing.</summary>
     /// <remarks>
@@ -42,7 +57,7 @@ internal static class FluidHostQuery
     /// </remarks>
     internal const int MaxRows = 1_000_000;
 
-    /// <summary>Runs one <c>query(sql)</c> call and returns its rows as a Fluid array.</summary>
+    /// <summary>The FUNCTION form — <c>query(sql)</c>, no parameters.</summary>
     /// <param name="caller">The SQL function the template was rendered by, so an error names it.</param>
     internal static FluidValue Execute(string caller, FunctionArguments args, TemplateContext ctx)
     {
@@ -50,8 +65,31 @@ internal static class FluidHostQuery
         {
             throw new ArgumentException($"{caller}: {FunctionName}() takes one argument, the SQL to run.");
         }
-        var sql = args.At(0).ToStringValue(ctx);
+        // ⚠ NAMED ARGUMENTS CANNOT REACH HERE, and the reason is Fluid's GRAMMAR rather than our choice:
+        // MEASURED, `query('s', a: 5)` is a PARSE error ("End of tag was expected"), while the same names on
+        // a FILTER parse and arrive populated. That is why parameter binding is the filter form below and
+        // not an overload of this one. If a future Fluid teaches the function grammar named arguments, this
+        // is where they would be read.
+        return Run(caller, args.At(0).ToStringValue(ctx), null);
+    }
 
+    /// <summary>
+    /// The FILTER form — <c>sql | query: a: 1, b: 2</c> — whose NAMED arguments become the statement's
+    /// <c>$a</c> / <c>$b</c> parameters, bound as VALUES rather than spliced into the SQL.
+    /// </summary>
+    /// <remarks>
+    /// ⚠ It is a filter because Fluid's named-argument grammar only exists there (see <see cref="Execute"/>).
+    /// The SQL is the filter's INPUT, which also reads correctly: the statement is the subject and the
+    /// parameters modify it.
+    /// </remarks>
+    internal static ValueTask<FluidValue> Filter(FluidValue input, FilterArguments args, TemplateContext ctx)
+    {
+        var caller = CallerOf(ctx);
+        return new(Run(caller, input.ToStringValue(ctx), BuildParameters(caller, args, ctx)));
+    }
+
+    private static FluidValue Run(string caller, string? sql, RecordBatch? parameters)
+    {
         // ⚠ MEASURED: json_serialize_sql('') reports NO error — an empty string parses to zero statements,
         // so the classifier below would wave it through. Refused here, where the cause can still be named.
         if (string.IsNullOrWhiteSpace(sql))
@@ -66,7 +104,7 @@ internal static class FluidHostQuery
 
         RefuseUnlessSelect(caller, sql, run);
 
-        using var stream = run(sql, null);
+        using var stream = run(sql, parameters);
         var rows = new List<FluidValue>();
         while (true)
         {
@@ -100,6 +138,127 @@ internal static class FluidHostQuery
             }
         }
         return new ArrayValue(rows);
+    }
+
+
+    /// <summary>
+    /// Turns the filter's NAMED arguments into the 1-row Arrow batch the host binds as <c>$name</c>
+    /// parameters. Returns null when there are none, which keeps the no-parameter path byte-identical.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// ⚠⚠ <b>Every column is NAMED, and that is what selects binding by name.</b> The host binds by name
+    /// when all columns carry a non-empty Arrow field name and positionally otherwise — the names were
+    /// always crossing in the Arrow schema and simply were not read until this. So an unnamed batch keeps
+    /// the original positional behaviour.
+    /// </para>
+    /// <para>
+    /// ⚠ POSITIONAL arguments are REFUSED rather than ignored. Fluid lets a filter take both
+    /// (<c>sql | query: 5, b: 'x'</c> parses), and a positional value here could only mean a <c>?</c> or
+    /// <c>$1</c> placeholder — which cannot coexist with the named binding this batch selects. Silently
+    /// dropping it would run the statement with a parameter the author believed they had supplied.
+    /// </para>
+    /// <para>
+    /// ⚠ The value types are an ALLOW-LIST, the same discipline as the <c>| sql</c> filter, but they cross
+    /// as VALUES rather than as rendered text — so this is strictly safer and there is no escaping to get
+    /// wrong. A LIST/STRUCT/MAP argument is refused BY NAME: DuckDB has no parameter binding for them here,
+    /// and rendering one into the SQL is exactly what parameters exist to avoid.
+    /// </para>
+    /// </remarks>
+    private static RecordBatch? BuildParameters(string caller, FilterArguments args, TemplateContext ctx)
+    {
+        var names = args.Names.ToList();
+        if (names.Count == 0)
+        {
+            if (args.Count > 0)
+            {
+                throw new ArgumentException(
+                    $"{caller}: {FunctionName} takes NAMED parameters only — write "
+                    + $"`sql | {FunctionName}: name: value` so the statement can reference $name.");
+            }
+            return null;
+        }
+        if (args.Count != names.Count)
+        {
+            throw new ArgumentException(
+                $"{caller}: {FunctionName} was given {args.Count - names.Count} positional argument(s) "
+                + "beside its named ones. Parameters must all be named, because the statement references "
+                + "them as $name.");
+        }
+
+        var fields = new List<Field>(names.Count);
+        var columns = new List<IArrowArray>(names.Count);
+        foreach (var name in names)
+        {
+            var value = args[name];
+            var (field, array) = ToParameter(caller, name, value, ctx);
+            fields.Add(field);
+            columns.Add(array);
+        }
+        return new RecordBatch(new Schema(fields, null), columns, 1);
+    }
+
+    /// <summary>One named parameter as a 1-row Arrow column.</summary>
+    private static (Field, IArrowArray) ToParameter(string caller, string name, FluidValue value,
+                                                    TemplateContext ctx)
+    {
+        switch (value.Type)
+        {
+            case FluidValues.Nil:
+            case FluidValues.Empty:
+                // ⚠ A NULL still needs a TYPE to cross, and VARCHAR is the one DuckDB casts most freely
+                // from. `$x IS NULL` and `$x` on its own behave; a comparison against a numeric column may
+                // still refuse the cast, which is DuckDB's answer rather than something to paper over.
+                return (new Field(name, StringType.Default, nullable: true),
+                        new StringArray.Builder().AppendNull().Build());
+            case FluidValues.Boolean:
+                return (new Field(name, BooleanType.Default, nullable: true),
+                        new BooleanArray.Builder().Append(value.ToBooleanValue()).Build());
+            case FluidValues.String:
+                return (new Field(name, StringType.Default, nullable: true),
+                        new StringArray.Builder().Append(value.ToStringValue(ctx)).Build());
+            case FluidValues.Number:
+                return NumberParameter(name, value.ToNumberValue());
+            case FluidValues.DateTime:
+                // ⚠ Stamped UTC for the same reason §7.4a records on the way in: an Unspecified DateTime is
+                // resolved against the MACHINE's local zone, which silently shifts the value.
+                var dt = value.ToObjectValue() is DateTimeOffset dto
+                    ? dto.UtcDateTime
+                    : DateTime.SpecifyKind((DateTime)(value.ToObjectValue() ?? default(DateTime)),
+                                           DateTimeKind.Utc);
+                return (new Field(name, new TimestampType(TimeUnit.Microsecond, "UTC"), nullable: true),
+                        new TimestampArray.Builder(new TimestampType(TimeUnit.Microsecond, "UTC"))
+                            .Append(new DateTimeOffset(dt, TimeSpan.Zero)).Build());
+            default:
+                throw new ArgumentException(
+                    $"{caller}: {FunctionName} cannot bind parameter '{name}' — a {value.Type} has no SQL "
+                    + "parameter form. Pass a number, string, boolean, date or null; build a list or struct "
+                    + "in SQL instead.");
+        }
+    }
+
+    /// <summary>
+    /// A numeric parameter, as <c>BIGINT</c> when the value is integral and fits, else <c>DECIMAL</c>.
+    /// </summary>
+    /// <remarks>
+    /// ⚠ Fluid's number model IS decimal (§7.3), so every number arrives here as one — including a literal
+    /// `10`. Binding all of them as DECIMAL would work but would make an ordinary integer parameter compare
+    /// against integer columns as a decimal; the integral case is narrowed back to BIGINT so the common
+    /// spelling behaves like the literal it replaced. A value outside BIGINT keeps full precision as
+    /// DECIMAL(38, scale).
+    /// </remarks>
+    private static (Field, IArrowArray) NumberParameter(string name, decimal number)
+    {
+        if (decimal.Truncate(number) == number && number >= long.MinValue && number <= long.MaxValue)
+        {
+            return (new Field(name, Int64Type.Default, nullable: true),
+                    new Int64Array.Builder().Append((long)number).Build());
+        }
+        // The decimal's own scale, so 19.99 stays 19.99 rather than being widened or rounded.
+        var scale = (int)((decimal.GetBits(number)[3] >> 16) & 0x7F);
+        var type = new Decimal128Type(38, scale);
+        return (new Field(name, type, nullable: true),
+                new Decimal128Array.Builder(type).Append(number).Build());
     }
 
     /// <summary>
@@ -140,10 +299,13 @@ internal static class FluidHostQuery
     {
         const string classify =
             "SELECT j ->> 'error' AS err, j ->> 'error_message' AS msg "
-            // ⚠ The cast is REQUIRED, not defensive: a bare `?` has no type at bind, so DuckDB cannot
-            // resolve the overload and answers "json_serialize_sql first argument must be a VARCHAR" -
-            // which arrives as a REFUSAL, since an unenforceable check fails closed.
-            + "FROM (SELECT json_serialize_sql(?::VARCHAR) AS j)";
+            // ⚠ The cast is REQUIRED, not defensive: an untyped placeholder has no type at bind, so DuckDB
+            // cannot resolve the overload and answers "json_serialize_sql first argument must be a VARCHAR"
+            // - which arrives as a REFUSAL, since an unenforceable check fails closed.
+            // ⚠⚠ $sql, NOT `?`: the batch below names its column, and a batch whose columns are all named
+            // is bound BY NAME. This read `?` first and broke the instant named binding landed
+            // ("Values were not provided for ... parameters: 1"), which is the mechanism announcing itself.
+            + "FROM (SELECT json_serialize_sql($sql::VARCHAR) AS j)";
 
         string? err;
         string? msg;

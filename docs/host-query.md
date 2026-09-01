@@ -400,6 +400,81 @@ The declared-schema overload above is a step toward it rather than a detour: it 
 columns are* from *producing the data*, which is precisely the split a lookup+schema pair formalises. Revisit
 both together.
 
+## OPEN — `Host.Query` does not see the caller's SESSION, and `fabricator_host_query`'s replay of it is BROKEN for an unqualified search path (found 2026-09-01, user-raised, NOT built)
+
+Two separate items, found by probing what slice 3's Fluid `query()` inherits. **Neither is a slice-3
+regression** — the first is how `Host.Query` has always behaved, the second predates today's commits.
+
+### A. The C# `Host.Query` inherits nothing, so a template's `query()` runs in a different session
+
+MEASURED with the outer session set:
+
+| path | `SET TimeZone='UTC'` ⇒ it reports | `SET search_path='myschema'` ⇒ `FROM t` |
+|---|---|---|
+| the outer session | `UTC` | resolves, 1 row |
+| `fabricator_host_query(sql)` — the SQL surface | `UTC` ✓ | ⚠ **INTERNAL Error**, see B |
+| **`query()` in a template** (C# `Host.Query`) | **`Europe/Berlin`** ✗ | ✗ *"Table with name t does not exist!"* |
+
+⚠ **The search-path half is the sharper one**: a wrong timezone is a silently wrong VALUE, but an
+unresolvable name is an outright failure for a table the caller can see unqualified. It also breaks the
+standing convention (README Quick Start) that a client should `SET TimeZone = 'UTC'` — that setting does
+not reach a template's queries.
+
+**⚠⚠ WHY THE SQL SURFACE SEES IT, AND IT IS NOT INHERITANCE — this is the part to understand before
+designing a fix.** `fabricator_host_query` is C++ invoked WITH a `ClientContext`, and it explicitly COPIES
+exactly TWO settings: `CaptureSession` reads `catalog_search_path->GetSetPaths()` and
+`TryGetCurrentSetting("TimeZone")`, and `ApplyHostQuerySession` replays them onto the fresh connection.
+**Nothing is inherited; two named settings are copied.** So any fix here has the same shape, and the same
+question: WHICH settings.
+
+**Why the C# path cannot do it today**: the ABI `host_query` entry has no per-call context — its own
+comment says *"the host service has no per-call context, unlike the fs callbacks"* — and it opens its
+connection on `g_host_db`, the `DatabaseInstance` captured at extension load. There is no caller session
+on that path to copy from.
+
+**Options, none chosen:**
+
+1. **Prepend `SET SESSION …;` to the SQL.** The existing in-tree precedent — `DeltaNativeReader.cs:519`
+   emits `"SET SESSION preserve_insertion_order=false; " + Sql`. ⚠⚠ **But it is now much less attractive
+   than it was, because of named parameters**: the no-params path is `SendQuery` (several statements, so a
+   prefix works) while the parameterised path is `Prepare` (ONE statement — *"Cannot prepare multiple
+   statements at once"*). A prefix would therefore silently work for unparameterised calls and break every
+   parameterised one.
+2. **An optional settings argument on `Host.Query`** (user's suggestion), applied to the connection before
+   the statement. ⚠ It needs an ABI change (a new `host_query` argument) — and, more importantly, it does
+   not by itself achieve INHERITANCE: the caller would have to name the settings, and a plugin does not
+   know the session either. It is the right shape for *"run this with these settings"*, not for *"run this
+   as my caller would".*
+3. **Pass the ambient `ClientContext` to `host_query`** so C++ can `CaptureSession` itself, exactly as the
+   SQL surface does. The ambient already exists and `HostHttpTransport` already reads it per call
+   (`AmbientOpener.Current`). This is the only option that actually inherits. ABI change.
+4. **Do nothing; document it.** Defensible: `Host.Query` is contracted as a FRESH connection with its own
+   transaction and committed-reads semantics, and "a different session" is arguably consistent with that.
+
+⚠ **The design question to settle first is whether it SHOULD inherit at all**, and 2 vs 3 turns on it: an
+explicit settings argument and an implicit session copy answer different questions. Note also that "copy
+the session" has no principled boundary — the SQL surface copies two settings because those are the two
+that were needed, not because they are the right set.
+
+### B. ⚠⚠ `fabricator_host_query`'s search-path replay raises a DuckDB INTERNAL Error — PRE-EXISTING
+
+```
+SET search_path='myschema';
+SELECT * FROM fabricator_host_query('SELECT count(*) FROM t');
+-- INTERNAL Error: SET_WITHOUT_VERIFICATION requires a fully qualified set path
+```
+
+`ApplyHostQuerySession` replays with `CatalogSetPathType::SET_DIRECTLY`, which requires fully-qualified
+entries, while `GetSetPaths()` returns what the user set — here the bare schema `myschema`. **Pre-existing**:
+the same call with the same flag is in the parent of `20960af`; today's work only factored it into a helper.
+
+⚠ It is an **INTERNAL Error**, the class this project records as an assertion failure that can invalidate
+the database — so it is worth more than its rarity suggests. Likely fixes: qualify the captured entries
+against the caller's catalog before replaying, or use a set-path type that verifies. **Not attempted.**
+
+⚠ **It is UNGATED, and that is why it survived**: no suite sets `search_path` and then calls
+`fabricator_host_query`. Any fix should land with a gate that does exactly that.
+
 ## Gate totals for the whole pass
 
 `verify_host_query` **31 → 98** (hermetic), across the three changes on this page: the double-execution fix

@@ -18,6 +18,7 @@
 #include "duckdb/function/replacement_scan.hpp"
 #include "duckdb/catalog/catalog_search_path.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/planner/expression/bound_parameter_data.hpp" // named parameter binding for host_query
 #include "duckdb/main/client_data.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/connection.hpp"
@@ -552,7 +553,8 @@ void MakeHostQueryStream(DatabaseInstance &db, const string &sql, ArrowArrayStre
 	unique_ptr<QueryResult> result;
 	unique_ptr<PreparedStatement> prepared;
 	if (params) {
-		// Read the 1-row Arrow params batch into values, bind positionally via a prepared statement.
+		// Read the 1-row Arrow params batch into values and bind them via a prepared statement — POSITIONALLY
+		// by column order, or BY NAME when the batch names its columns (see below).
 		fabricator::ArrowStreamReader reader(*conn->context, *params); // consumes + releases the params stream
 		DataChunk chunk;
 		chunk.Initialize(Allocator::Get(*conn->context), reader.Types());
@@ -565,8 +567,43 @@ void MakeHostQueryStream(DatabaseInstance &db, const string &sql, ArrowArrayStre
 		if (prepared->HasError()) {
 			throw IOException("fabricator_host_query: " + prepared->GetError());
 		}
-		// Streaming result: it references the prepared statement, so the holder keeps `prepared` alive.
-		result = prepared->Execute(values, /*allow_stream_result=*/true);
+		// ⚠⚠ THE STATEMENT DECIDES, NOT THE BATCH — bind by name only when the batch's column names are
+		// EXACTLY the statement's own parameter names. The names were always crossing in the Arrow schema;
+		// nothing read them until named binding landed, which is why this overload was positional-only for
+		// its whole life.
+		// ⚠ The first rule tried here was "every column has a non-empty name", and it was WRONG in a way a
+		// local run did not show: an Arrow field practically always HAS a name, so that test is nearly
+		// always true and it silently switched EVERY existing caller to name-binding. `cf_host_param` sends
+		// columns p0/p1 against positional `?` placeholders and broke with "Values were not provided for
+		// the following prepared statement parameters: 1, 2" — caught by the service tier, not by review.
+		// Matching against `named_param_map` cannot make that mistake: a `?` statement names its parameters
+		// "1", "2", … so p0/p1 do not match and it stays positional.
+		// ⚠ Duplicate names are NOT silently collapsed: case_insensitive_map_t would keep the LAST value and
+		// bind a parameter the caller never intended, so they are refused by name.
+		const auto &names = reader.Names();
+		const auto &declared = prepared->named_param_map;
+		// ⚠ A SUBSET is enough, deliberately: requiring declared.size() == values.size() would send a call
+		// that supplies only some of the statement's parameters down the POSITIONAL path, where DuckDB then
+		// reports every parameter as missing ("… parameters: a, b") including the one that WAS supplied.
+		// Binding by name and letting DuckDB name only what is genuinely absent is the better error.
+		bool by_name = !values.empty() && names.size() == values.size();
+		for (idx_t c = 0; by_name && c < names.size(); c++) {
+			by_name = !names[c].empty() && declared.find(names[c]) != declared.end();
+		}
+		if (by_name) {
+			case_insensitive_map_t<BoundParameterData> named;
+			for (idx_t c = 0; c < values.size(); c++) {
+				if (named.find(names[c]) != named.end()) {
+					throw IOException("fabricator_host_query: duplicate parameter name '" + names[c] +
+					                  "' in the bound parameters");
+				}
+				named.emplace(names[c], BoundParameterData(values[c]));
+			}
+			// Streaming result: it references the prepared statement, so the holder keeps `prepared` alive.
+			result = prepared->Execute(named, /*allow_stream_result=*/true);
+		} else {
+			result = prepared->Execute(values, /*allow_stream_result=*/true);
+		}
 	} else {
 		result = conn->SendQuery(sql); // streaming (lazy Fetch) — bounded memory for large results
 	}

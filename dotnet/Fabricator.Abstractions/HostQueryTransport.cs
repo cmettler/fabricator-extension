@@ -47,8 +47,14 @@ public static class HostQueryTransport
 {
     /// <summary>
     /// Runs <paramref name="sql"/> on a FRESH host connection and returns the result as an Arrow stream the
-    /// caller owns and disposes. <c>parameters</c> is an optional 1-row batch bound positionally to the
-    /// statement's <c>?</c> / <c>$1</c> placeholders. Installed by the bridge; null until then.
+    /// caller owns and disposes. <c>parameters</c> is an optional 1-row batch of parameter values.
+    /// Installed by the bridge; null until then.
+    /// </summary>
+    /// <remarks>
+    /// ⚠ <b>The STATEMENT decides how the batch binds.</b> When the batch's column names are all parameter
+    /// names the statement actually declares (<c>$region</c>, <c>$min</c>), it binds BY NAME; otherwise it
+    /// binds POSITIONALLY, which is what a <c>?</c> / <c>$1</c> statement gets — such a statement names its
+    /// parameters "1", "2", … so ordinary column names cannot collide with it by accident.
     /// </summary>
     /// <remarks>
     /// ⚠ Prefer the parameter form over building a literal: it is the difference between handing the engine

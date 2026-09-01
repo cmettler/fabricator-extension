@@ -26,9 +26,16 @@ public static class Host
     public static IArrowArrayStream Query(string sql) => HostFs.Query(sql);
 
     /// <summary>
-    /// Runs <paramref name="sql"/> binding a 1-row <paramref name="parameters"/> batch positionally to the
-    /// statement's parameters (?, $1, …) via a prepared statement on a fresh host connection.
+    /// Runs <paramref name="sql"/> binding a 1-row <paramref name="parameters"/> batch to the statement's
+    /// parameters via a prepared statement on a fresh host connection.
     /// </summary>
+    /// <remarks>
+    /// ⚠ <b>The STATEMENT decides which binding is used</b>: BY NAME when the batch's column names are all
+    /// parameter names the statement declares (<c>$a</c>), POSITIONALLY otherwise — which is what a
+    /// <c>?</c> / <c>$1</c> statement gets, since it names its parameters "1", "2", … Only ROW 0 is read,
+    /// an empty batch binds all-NULL, and a parameterised call is limited to ONE statement (Prepare, not
+    /// SendQuery).
+    /// </remarks>
     public static IArrowArrayStream Query(string sql, RecordBatch parameters) => HostFs.Query(sql, parameters);
 
     /// <summary>

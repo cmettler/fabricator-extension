@@ -1132,6 +1132,10 @@ ArrowStreamReader::ArrowStreamReader(ClientContext &context, ArrowArrayStream st
 	auto &arrow_schema = schema_root_.arrow_schema;
 	for (int64_t i = 0; i < arrow_schema.n_children; i++) {
 		types_.push_back(arrow_table_.GetColumns().at((idx_t)i)->GetDuckType());
+		// The Arrow field name, captured beside the type. It always arrived here; nothing read it until
+		// host_query grew named parameter binding, which is why that path bound positionally.
+		auto *child = arrow_schema.children[i];
+		names_.push_back(child && child->name ? string(child->name) : string());
 	}
 	lstate_ = make_uniq<ArrowScanLocalState>(make_uniq<ArrowArrayWrapper>(), context_);
 	lstate_->column_ids.clear(); // identity mapping

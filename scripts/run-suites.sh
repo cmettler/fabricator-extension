@@ -749,7 +749,12 @@ case "$TIER" in
         # CORRECTNESS requirement rather than a policy (a template may render at BIND, and a bind-time write
         # fires on EXPLAIN of a statement that never runs). 3162 + 38 = 3200 exactly, from a green run,
         # which is what shows no other suite moved. The 3162 note it supersedes:
-        : "${MIN_ASSERTIONS:=3200}"
+        # 3216 since 2026-09-01 (same day): verify_plugin_fluid 131 -> 147 for NAMED PARAMETER BINDING --
+        # `sql | query: a: 1` binding $a. It is a FILTER because Fluid's grammar puts named arguments there
+        # and nowhere else (a function call with them is a PARSE error, and Fluid has no dict literal).
+        # 3200 + 16 = 3216 exactly, from a green run, which is what shows no other suite moved.
+        # The 3200 note it supersedes:
+        : "${MIN_ASSERTIONS:=3216}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

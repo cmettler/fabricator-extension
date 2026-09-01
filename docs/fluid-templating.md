@@ -684,6 +684,104 @@ both directions, and it is why the directive carries a comment saying so.
 row and `query()` does not; after `COMMIT` it does. The post-commit assertion is what makes the middle one
 a visibility result rather than a broken read.
 
+### 9.10 NAMED PARAMETER BINDING — `sql | query: a: 1` (2026-09-01, user-raised)
+
+C# **and C++**, still **NO ABI change**. Gate `verify_plugin_fluid` **131 → 147**, three further mutants.
+
+```liquid
+{% assign rs = "SELECT id FROM orders WHERE region = $region AND amt > $min"
+   | query: region: "eu", min: 6 %}
+```
+
+**⚠⚠ IT IS A FILTER BECAUSE FLUID'S GRAMMAR PUTS NAMED ARGUMENTS THERE AND NOWHERE ELSE — measured, and it
+is the finding that decided the surface.** The user asked how a template creates a params object, and
+whether dictionary support had to be added to Fluid. Neither: Fluid 3.0.0-beta.7 already has named
+arguments, on filters.
+
+| construct | |
+|---|---|
+| `query('s', a: 5)` — function, named | ❌ parse error, *"End of tag was expected"* |
+| `{'a': 1}` / `{a: 1}` — hash literal | ❌ *"A value was expected"* |
+| `{% assign h.a = 1 %}` — subscript assign | ❌ |
+| `(1..3)` — range literal | ✅ |
+| **`'s' \| q: a: 5`** — filter, named | ✅ |
+| `'s' \| q: 5, b: 'x'` — filter, mixed | ✅ (both arrive) |
+
+⇒ `FunctionArguments.Names`/`HasNamed` — the members that make named function arguments *look* supported —
+are populated by the FILTER grammar only. **Nothing was added to Fluid**, and the reading is natural: the
+statement is the filter's input, the parameters modify it.
+
+#### The host half: the names were already crossing
+
+Both pieces existed. DuckDB has `$name` parameters and
+`PreparedStatement::Execute(case_insensitive_map_t<BoundParameterData>&, bool)`; and the params
+`RecordBatch` carries its column names in the Arrow schema, which `ArrowStreamReader` walked for types
+while never capturing `children[i]->name`. So `MakeHostQueryStream` bound positionally for the whole life
+of that overload because **nothing had read the names**, not because they were absent — the same shape as
+the `fabricator_functions()` finding, where the data crossed and only the consumer was missing.
+
+- **⚠⚠ THE STATEMENT SELECTS THE BINDING, NOT THE BATCH — and the first rule tried here was WRONG in a way
+  no local run showed.** It read *"every column has a non-empty name ⇒ bind by name"*. An Arrow field
+  practically always HAS a name, so that test is nearly always true, and it silently switched **every
+  existing caller** to name-binding: `cf_host_param` sends columns `p0`/`p1` against positional `?`
+  placeholders and broke with *"Values were not provided for the following prepared statement parameters:
+  1, 2"*. **The SERVICE TIER caught it, review did not** — and the claim it falsified was my own
+  "keeps the original positional behaviour byte-for-byte".
+  The rule now matches the batch's column names against the statement's OWN `named_param_map`: a `?`
+  statement names its parameters `"1"`, `"2"`, … so `p0`/`p1` cannot match and it stays positional.
+  ⚠ A SUBSET is enough, deliberately — requiring equal sizes sends a call supplying only *some* parameters
+  down the positional path, where DuckDB then reports every parameter as missing including the one that
+  WAS supplied.
+- **⚠ Duplicate names are REFUSED, not collapsed** — `case_insensitive_map_t` would keep the LAST value and
+  bind a parameter the caller never intended.
+- **⚠ THE POSITIONAL BRANCH IS NOW UNREACHABLE FROM ANY IN-TREE CALLER and is therefore UNGATED.** Every
+  in-tree producer of a params batch names its columns. It is kept for an out-of-tree plugin using `?`, and
+  the suite does not pretend to cover it.
+
+#### ⚠⚠ THE CHANGE BROKE THE CLASSIFIER, AND THAT IS THE MECHANISM ANNOUNCING ITSELF
+
+§9.2's classifier read `json_serialize_sql(?::VARCHAR)` and sent a batch whose single column is named
+`sql`. The instant named binding landed, that column bound to a name while the statement wanted parameter
+**1** — *"Values were not provided for the following prepared statement parameters: 1"*. Fixed by naming the
+placeholder `$sql`. **The field name in a params batch is now load-bearing**, which it never was before.
+
+#### Values, and why they are an allow-list
+
+Number → `BIGINT` when integral and in range, else `DECIMAL(38, scale)`; String → VARCHAR; Boolean → BOOLEAN;
+DateTime → `TIMESTAMP` stamped UTC (§7.4a's rule on the way in applies on the way out); Nil → a NULL VARCHAR.
+A LIST/STRUCT/MAP is **refused by name** — DuckDB has no parameter form for them here, and rendering one into
+the SQL is precisely what parameters exist to avoid.
+
+- **⚠ Fluid's number model IS decimal (§7.3), so even `10` arrives as one.** The integral case is narrowed
+  back to BIGINT so the ordinary spelling behaves like the literal it replaced; a fractional value keeps its
+  own scale, so `19.99` stays `19.99`.
+- **⚠ POSITIONAL filter arguments are REFUSED rather than ignored.** Fluid permits `sql | query: 5, b: 'x'`,
+  and a positional value could only mean `?` / `$1`, which cannot coexist with the by-name binding a named
+  batch selects. Dropping it silently would run the statement with a parameter the author believed they had
+  supplied. Mutation-tested.
+- **⚠ A MISSING parameter is DuckDB's own error and it NAMES the parameter** (*"Values were not provided …:
+  b"*), which is better than anything we could invent — and the reason nothing here pre-validates the
+  placeholder set against the statement.
+
+#### The gate
+
+- **The load-bearing assertion is the INJECTION one, with its control.** `region: "eu' OR 1=1 --"` answers
+  **0**; spliced it would have answered 3. Beside it the same statement with `"eu"` answers 2 — without
+  which "0" would be equally true of a build where the parameter never reached the statement.
+- A DISCRIMINATING pair on `min` (6 ⇒ one row, 1 ⇒ two), so a build ignoring the parameters cannot pass by
+  luck.
+- The SELECT-only refusal is re-asserted on the filter form: **parameters buy no exemption.** A
+  parameterised write is still a write and still fires at bind.
+- ⚠ MUTANT A (never bind by name) dies at the FIRST `query()` rather than at a parameter assertion, because
+  the classifier itself now binds by name — so every call exercises the path. That is strong coverage but a
+  broad kill, which is why MUTANT B exists: names in order, VALUES reversed, so a one-parameter call is
+  unaffected and a two-parameter one binds wrongly. It dies at the first named-parameter row with
+  *"Could not convert string 'eu' to INT32"*.
+- ⚠ My first attempt at MUTANT B was NOT the mutation I intended: I reversed the name at the INSERT but not
+  at the duplicate CHECK, so it tripped my own duplicate guard instead of demonstrating a wrong binding. It
+  killed at the right line for the wrong reason — the same trap as a mutant that dies in the right place by
+  accident.
+
 ### 9.9 What slice 3 leaves
 
 - **§1.4 (DuckDB functions callable from inside Fluid) should be RE-DERIVED, not inherited.** §6 already

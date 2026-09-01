@@ -292,6 +292,15 @@ public:
 		return types_;
 	}
 
+	//! Arrow field NAMES of the stream's columns, same order as Types(). An entry is empty when the
+	//! producer named nothing.
+	//! \warning They were always crossing the boundary and were simply never captured — which is why
+	//! host_query bound its parameters POSITIONALLY for as long as that overload existed. A consumer that
+	//! wants them must still decide what an EMPTY or DUPLICATE name means; this only reports what arrived.
+	const duckdb::vector<duckdb::string> &Names() const {
+		return names_;
+	}
+
 	//! Reads the next batch into `output` (which must be initialized to Types());
 	//! sets cardinality 0 at end of stream.
 	void Read(duckdb::DataChunk &output);
@@ -318,6 +327,7 @@ private:
 	duckdb::ArrowSchemaWrapper schema_root_;
 	duckdb::ArrowTableSchema arrow_table_;
 	duckdb::vector<duckdb::LogicalType> types_;
+	duckdb::vector<duckdb::string> names_;
 	duckdb::unique_ptr<duckdb::ArrowScanLocalState> lstate_;
 	bool done_ = false;
 };

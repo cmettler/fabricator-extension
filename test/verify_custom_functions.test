@@ -55,6 +55,14 @@ SELECT cdb.dbo.cf_host_sum(0);
 
 # dbo.cf_host_param binds a 1-row Arrow params batch [40, 2] POSITIONALLY into a host query
 # (SELECT (?::BIGINT)+(?::BIGINT)) via a prepared statement on a fresh host connection -> 42. host-query.md.
+#
+# ⚠⚠ IT IS ALSO THE GUARD ON POSITIONAL BINDING, and it is the only one. When host_query grew NAMED
+# parameter binding (2026-09-01, docs/fluid-templating.md §9.10) the first rule tried was "every column has
+# a non-empty Arrow name ⇒ bind by name" — and an Arrow field practically always HAS a name, so that
+# silently switched this call, whose columns are p0/p1 against `?` placeholders, to name-binding:
+# "Values were not provided for the following prepared statement parameters: 1, 2". THIS ASSERTION CAUGHT
+# IT; review had passed it. The rule now matches the batch's names against the statement's own
+# named_param_map, which a `?` statement fills with "1", "2", … so p0/p1 cannot match.
 query I
 SELECT cdb.dbo.cf_host_param(0);
 ----

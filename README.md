@@ -1380,6 +1380,35 @@ SELECT * FROM fluid_query(
 -- columns: region, amt
 ```
 
+**Parameters bind by name.** Write `query` as a **filter** and give it named arguments; the statement
+references them as `$name`:
+
+```sql
+SELECT fabricator_render(
+  '{% assign rs = "SELECT sum(amt) AS total FROM orders
+                   WHERE region = $region AND amt > $min" | query: region: "eu", min: 6 %}
+   {% for r in rs %}{{ r.total }}{% endfor %}', NULL);
+-- 10
+```
+
+> ⚠ **It is a filter, not a second argument to `query(...)`** — because that is where Liquid puts named
+> arguments. `query('sql', a: 5)` is a *parse* error, and Liquid has no dictionary literal, so
+> `sql | query: a: 5` is the spelling that works.
+
+The values are **bound, never spliced**, so a parameter can never become SQL:
+
+```sql
+SELECT fabricator_render(
+  '{% assign rs = "SELECT count(*) AS n FROM orders WHERE region = $r"
+    | query: r: "eu'' OR 1=1 --" %}{% for r in rs %}{{ r.n }}{% endfor %}', NULL);
+-- 0   (one value that matches no region — not 3, which splicing would have given)
+```
+
+Numbers, strings, booleans, dates and `nil` can be bound; an integral number binds as `BIGINT` and a
+fractional one keeps its exact scale. A list or struct is refused by name — build those in SQL. Every
+parameter must be **named**: a positional argument is an error rather than silently ignored, and a
+parameter the statement wants but you did not supply is reported by DuckDB, naming it.
+
 > ⚠ **`query()` runs `SELECT` statements only, and this is not a policy you can turn off.** A template is
 > rendered while a statement is being *bound*, and binding repeats and happens without executing — so a
 > write here would fire on an `EXPLAIN` of a statement that never runs, and again every time a view over it

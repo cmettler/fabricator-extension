@@ -39,6 +39,11 @@ internal static class FluidEngine
         // actually called rather than the template machinery.
         ctx.SetValue(FluidHostQuery.FunctionName,
                      new FunctionValue((args, c) => FluidHostQuery.Execute(caller, args, c)));
+        // ⚠⚠ The FILTER of the same name is registered ONCE, in the shared TemplateOptions (see
+        // FluidValueModel.Build) — NOT here. `ctx.Options` IS that shared static, so registering per render
+        // would mutate global state on every call and capture whichever `caller` happened to register last,
+        // giving another render's function name in an error. The caller travels per context instead:
+        ctx.AmbientValues[FluidHostQuery.CallerKey] = caller;
         bind(ctx);
         return parsed.Render(ctx);
     }

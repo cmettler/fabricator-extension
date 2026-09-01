@@ -58,6 +58,10 @@ internal static class FluidValueModel
         // SQL-generating function — so quoting is opt-in per interpolation and loudly documented.
         o.Filters.AddFilter("sql", (input, _, ctx) =>
             new ValueTask<FluidValue>(new StringValue(SqlLiteral(input, ctx), encode: false)));
+        // ⚠ `query` is registered ONCE, HERE, rather than per context: this TemplateOptions is a static
+        // singleton, so a per-render AddFilter would mutate shared state on every call. The function form
+        // of the same name is per-context (FluidEngine); the caller travels in AmbientValues.
+        o.Filters.AddFilter(FluidHostQuery.FunctionName, FluidHostQuery.Filter);
         o.Filters.AddFilter("sql_ident", (input, _, ctx) =>
             new ValueTask<FluidValue>(new StringValue(DuckSql.QuoteIdent(input.ToStringValue(ctx)), encode: false)));
 

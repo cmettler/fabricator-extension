@@ -1503,6 +1503,27 @@ about the parallel sink changes that.
    not be removed on that alone: the setting was justified by REMOTE numbers taken before the fix, and the
    union form's remote gate in `TryUnionForm` rests on the same pre-fix measurements. Re-measure live, then
    decide both together.
+   **⚠⚠ A THIRD OPTION, raised 2026-09-01 (user): TAKE IT FROM THE OUTER SESSION rather than forcing it —
+   and it is in DIRECT TENSION with the justification the SET currently ships under, which is why it has to
+   be decided rather than adopted.** Today the reader FORCES `false`, overriding whatever the caller's
+   session says. Inheriting instead would respect a user who deliberately asked for insertion order.
+   - ⚠ **But the SET's own justification is that it is CORRECTNESS-NEUTRAL HERE** — the batched reader's
+     contract is already that row order across files is not preserved. **If that claim holds, inheriting is
+     strictly WORSE than forcing**: a user leaving the DuckDB default (`true`) would pay the remote penalty
+     for an order guarantee this reader never made. ⇒ **the inherit option is only worth building if the
+     neutrality claim is FALSE**, so settle that first — it is the same question as item 1's, approached
+     from the other side.
+   - ⚠ **It is not currently POSSIBLE anyway**, and that couples this item to
+     [host-query.md](host-query.md) §OPEN item A: `Host.Query` cannot see the caller's session at all (the
+     ABI `host_query` entry has no per-call context), which is *why* the reader forces a literal instead of
+     reading one. Any "inherit" answer here needs that item built first.
+   - **⚠⚠ AND NAMED PARAMETERS HAVE NOW CONSTRAINED THE MECHANISM ITSELF (2026-09-01).** The `SET SESSION
+     …;` PREFIX works only because the no-params path is `SendQuery`, which accepts several statements. The
+     parameterised path is `Prepare`, which does not (*"Cannot prepare multiple statements at once"*). The
+     batched Delta plan binds **inputs**, not parameters, so it is unaffected TODAY — but the prefix is no
+     longer a generally-available trick, and anything that gives this plan a bound parameter breaks it
+     silently. A settings argument on `host_query` (host-query.md §OPEN item A option 2) is the shape that
+     would survive both.
 2. **The remote figures in §5 all predate the fix** — 120.4 / 44.7 / 13.7 s, and the "union loses cold by
    ~3.5x" ranking. Nothing about them is known to still hold.
 3. **The batch-size default** (§3). Removing engineered-wood's one-file-per-batch coupling, or adding a
