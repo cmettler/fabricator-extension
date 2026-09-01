@@ -1455,6 +1455,41 @@ above no custom filters or tags are registered.
 > deep inside the engine. Pass such a value as a string if you only need to print it. A `DOUBLE` with more
 > than 15 significant digits renders rounded.
 
+##### Reusing templates from files — `{% include %}` and `{% render %}`
+
+A template can pull in another one from **any storage the extension can read** — a local directory, `s3://`,
+`abfss://`, `onelake://` — so shared SQL fragments and macros live in files under version control instead of
+inside SQL string literals:
+
+```sql
+SET GLOBAL fluid_template_root = 's3://analytics/templates';
+
+-- templates/dims/customer.liquid holds:  SELECT id, name FROM customers WHERE region = {{ region | sql }}
+SELECT * FROM fluid_query('{% include ''dims/customer'' %}', params := {'region': 'eu'});
+```
+
+The included template shares the caller's variables, and it may include others in turn.
+
+> ⚠ **It is `SET GLOBAL`, not `SET`.** These are *global* functions, which run without a session context, so
+> a session-scoped `SET` is not reliably visible to them — DuckDB will report the value through
+> `current_setting()` while an include still fails for want of a root. A plain `SET` is not an equivalent
+> spelling here.
+
+> ⚠ **An absolute path needs no root at all** — `{% include 's3://bucket/templates/dims.liquid' %}` works
+> whether or not `fluid_template_root` is set, which is the escape when a process-wide setting is the wrong
+> granularity. The root is a convenience for writing short names, **not a sandbox**: a template that can
+> `{% include %}` is being rendered by someone who can already run SQL here, and `query()` can read any path
+> the host can open. What is refused is refused for predictability — `..` in a relative path, and the glob
+> characters `*`, `?`, `[`, `]`, because one include must name one file.
+
+> ⚠ **Name the extension.** `{% include 'dims/customer' %}` asks storage for `dims/customer` *and then* for
+> `dims/customer.liquid` — two round trips on remote storage where `{% include 'dims/customer.liquid' %}`
+> costs one. If both files exist, the one **without** the extension wins.
+
+The file is read the same way `query()` runs SQL — on its own connection — so a location authorised by a
+**persistent** secret works, while one authorised by a `CREATE SECRET` of the calling session does not. A
+template above 1 MiB is refused, and a missing include reports every path it asked for.
+
 **It ships with the released artifact** — bundled under the extension's own managed directory — so it needs
 no configuration.
 

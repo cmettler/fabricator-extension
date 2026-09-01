@@ -749,12 +749,18 @@ case "$TIER" in
         # CORRECTNESS requirement rather than a policy (a template may render at BIND, and a bind-time write
         # fires on EXPLAIN of a statement that never runs). 3162 + 38 = 3200 exactly, from a green run,
         # which is what shows no other suite moved. The 3162 note it supersedes:
+        # 3243 since 2026-09-02: verify_plugin_fluid 147 -> 174 for SLICE 4 -- {% include %} / {% render %}
+        # resolved against fluid_template_root and read with read_blob over slice 3's HostQueryTransport.
+        # /!\ NOT over a host-FS seam: one was built and MEASURED unusable, because a GLOBAL function has no
+        # ambient opener and every fs_* callback dereferences it (the read took the process down). The same
+        # missing ambient is why the setting must be SET GLOBAL. 3216 + 27 = 3243 exactly, from a green run,
+        # which is what shows no other suite moved. The 3216 note it supersedes:
         # 3216 since 2026-09-01 (same day): verify_plugin_fluid 131 -> 147 for NAMED PARAMETER BINDING --
         # `sql | query: a: 1` binding $a. It is a FILTER because Fluid's grammar puts named arguments there
         # and nowhere else (a function call with them is a PARSE error, and Fluid has no dict literal).
         # 3200 + 16 = 3216 exactly, from a green run, which is what shows no other suite moved.
         # The 3200 note it supersedes:
-        : "${MIN_ASSERTIONS:=3216}"
+        : "${MIN_ASSERTIONS:=3243}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

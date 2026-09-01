@@ -14,6 +14,11 @@ require fabricator
 #   dotnet build dotnet/Fabricator.FluidPlugin -c Release
 require-env FABRICATOR_PLUGIN_DIR
 
+# ⚠ A per-suite scratch DIRECTORY, used only by the slice-4 section at the foot of this file: it writes a
+# small template library with COPY and points fluid_template_root at it. The name says delta because that
+# is what the runner has always called its scratch dir; nothing Delta is involved.
+require-env FABRICATOR_DELTA_WRITE_DIR
+
 # ============================================================================================
 # THE PLUGIN LOADED — and this is the assertion the whole file rests on, because every render below is
 # vacuous if the function came from somewhere else.
@@ -1017,3 +1022,221 @@ query I
 SELECT * FROM fluid_query('SELECT {% assign rs = "SELECT amt FROM fq_orders WHERE id = $i" | query: i: 2 %}{% for r in rs %}{{ r.amt }}{% endfor %} AS a');
 ----
 25
+
+
+# ============================================================================================
+# SLICE 4 — {% include %} / {% render %} READ THROUGH DuckDB'S OWN FILESYSTEM
+# (docs/fluid-templating.md §10)
+#
+# A template library lives on whatever storage the host can reach. HostTemplateFileProvider resolves an
+# include against `fluid_template_root` and reads it with read_blob over slice 3's HostQueryTransport, so
+# s3://, abfss:// and onelake:// work with the persistent secrets already in scope. Only the LOCAL leg is
+# gated: the mechanism is the transport, and a remote root would be exercising DuckDB's filesystem rather
+# than anything of ours.
+#
+# ⚠⚠ IT DOES NOT USE A FILESYSTEM SEAM, and the reason is the finding of this slice: a GLOBAL function has
+# no ambient opener, so every fs_* host callback would receive a null ClientContext — measured, an access
+# violation inside HostFs.OpenRead. The same missing ambient is why the root must be SET GLOBAL.
+#
+# ⚠ NOT GATED, and said here rather than implied: the per-render read CACHE (it changes how many times a
+# file is read and changes no answer, and nothing in SQL can observe a read count), and the MULTI-MATCH
+# refusal inside the reader (a mutant survives it — Resolve refuses glob metacharacters in the subpath
+# first, so nothing a template can write reaches it; only a ROOT containing one could, and that is the
+# user's own string).
+# ============================================================================================
+
+# ⚠ THE SETTING IS REGISTERED AT ALL, and it is the first thing a PLUGIN has ever declared besides
+# functions. Every assertion below is vacuous without it, and a plugin whose Settings never reached the host
+# would surface further down as a mysterious refusal rather than as what it is.
+query I
+SELECT count(*) FROM duckdb_settings() WHERE name = 'fluid_template_root';
+----
+1
+
+# ⚠⚠ A RELATIVE INCLUDE WITH NO ROOT IS REFUSED, and this has to come before any SET. Fail-closed: the
+# alternative is resolving against the process working directory, i.e. reading a file the author never
+# named. ⚠ The message names SET GLOBAL, not SET — see below for why that is not pedantry.
+statement error
+SELECT fabricator_render('{% include ''hello'' %}', NULL);
+----
+SET GLOBAL fluid_template_root
+
+# --- the library, written by DuckDB itself -------------------------------------------------
+# ⚠ PER_THREAD_OUTPUT on this first COPY is what CREATES the directory. A plain COPY to a file path does
+# NOT create its parent, and the scratch directory the runner exports need not exist from DuckDB's point of
+# view. (It leaves a data_0.csv in the root, which is harmless: nothing enumerates a template root.)
+statement ok
+COPY (SELECT 1 AS c) TO '${FABRICATOR_DELTA_WRITE_DIR}/tpl' (FORMAT csv, PER_THREAD_OUTPUT true, HEADER false);
+
+statement ok
+COPY (SELECT 'hi {{ who }}' AS c) TO '${FABRICATOR_DELTA_WRITE_DIR}/tpl/hello.liquid' (FORMAT csv, HEADER false, QUOTE '');
+
+statement ok
+COPY (SELECT 'outer[{% include ''hello'' %}]' AS c) TO '${FABRICATOR_DELTA_WRITE_DIR}/tpl/outer.liquid' (FORMAT csv, HEADER false, QUOTE '');
+
+statement ok
+COPY (SELECT 'SELECT {{ n }} AS n' AS c) TO '${FABRICATOR_DELTA_WRITE_DIR}/tpl/frag.liquid' (FORMAT csv, HEADER false, QUOTE '');
+
+statement ok
+COPY (SELECT 'BARE' AS c) TO '${FABRICATOR_DELTA_WRITE_DIR}/tpl/both' (FORMAT csv, HEADER false, QUOTE '');
+
+statement ok
+COPY (SELECT 'WITHEXT' AS c) TO '${FABRICATOR_DELTA_WRITE_DIR}/tpl/both.liquid' (FORMAT csv, HEADER false, QUOTE '');
+
+statement ok
+COPY (SELECT chr(65279) || 'BOMMED' AS c) TO '${FABRICATOR_DELTA_WRITE_DIR}/tpl/bom.liquid' (FORMAT csv, HEADER false, QUOTE '');
+
+# ⚠⚠ AN ABSOLUTE INCLUDE NEEDS NO ROOT — asserted HERE, with none set, which is the only position where
+# it discriminates. Placed after the SET GLOBAL below it passes on a build that ignores the absolute form
+# entirely: MEASURED on Windows, joining a drive-lettered path onto a root still opens the file, so the
+# join accidentally succeeds and a mutant survives. With no root, a build that does not recognise an
+# absolute path has nothing to join and refuses.
+query I
+SELECT rtrim(fabricator_render('{% include ''${FABRICATOR_DELTA_WRITE_DIR}/tpl/hello.liquid'' %}', {'who': 'abs'}), chr(10));
+----
+hi abs
+
+# ⚠⚠ SET **GLOBAL**, AND A PLAIN SET IS NOT AN EQUIVALENT SPELLING — the sharpest consequence of a global
+# function having no ambients. Provider settings register SESSION-scoped, and a session write lands in a
+# layer keyed on an id that ProviderSettingsStore.CurrentSession must supply; that ambient is not
+# established for a global function, so the read falls through to the global layer.
+#
+# MEASURED reproducibly — a two-statement suite, the shell, and this suite in two shapes: a plain SET is
+# INVISIBLE here, while current_setting() reports it the whole time, which is what makes it a trap rather
+# than an error.
+#
+# ⚠ IT IS NOT ASSERTED HERE, and the reason is NOT that it is unstable — it is stable. It is a property of
+# the AMBIENT PLUMBING rather than of this plugin, and the day a global function is given its caller's
+# session a plain SET should start working. An assertion here would then fail for the right reason in the
+# wrong file. docs/fluid-templating.md §10.2 carries it, along with the retraction of an earlier claim that
+# the behaviour was non-deterministic — that story was invented to fit one unreproducible run.
+statement ok
+SET GLOBAL fluid_template_root = '${FABRICATOR_DELTA_WRITE_DIR}/tpl';
+
+# --- it resolves, and the outer scope reaches inside ---------------------------------------
+# ⚠ rtrim(x, chr(10)) throughout, NOT trim(x): DuckDB's one-argument trim removes SPACES and leaves a
+# newline exactly where the fixtures have one, since COPY appends it. That trailing byte is part of the
+# file and therefore part of the include, which is exactly what the nested case below shows.
+query I
+SELECT rtrim(fabricator_render('{% include ''hello'' %}', {'who': 'world'}), chr(10));
+----
+hi world
+
+# ⚠ NAMING THE EXTENSION IS THE SPELLING TO PREFER. MEASURED on Fluid 3.0.0-beta.7: an include asks for the
+# bare subpath FIRST and only then for `<subpath>.liquid`, so omitting it costs TWO host reads where naming
+# it costs one — on remote storage, two round trips.
+query I
+SELECT rtrim(fabricator_render('{% include ''hello.liquid'' %}', {'who': 'again'}), chr(10));
+----
+hi again
+
+# ⚠⚠ AND THE BARE PROBE WINS WHEN BOTH FILES EXIST — the discriminating pair. A library holding `both` and
+# `both.liquid` resolves `{% include 'both' %}` to the one WITHOUT the extension, which is the opposite of
+# what an author following a `.liquid` convention would guess.
+query I
+SELECT rtrim(fabricator_render('{% include ''both'' %}', NULL), chr(10));
+----
+BARE
+
+query I
+SELECT rtrim(fabricator_render('{% include ''both.liquid'' %}', NULL), chr(10));
+----
+WITHEXT
+
+# NESTED — a partial that includes another. The inner file's own trailing newline lands INSIDE the outer
+# text, which is why this renders the line break rather than trimming it away.
+query I
+SELECT replace(rtrim(fabricator_render('{% include ''outer'' %}', {'who': 'x'}), chr(10)), chr(10), '~');
+----
+outer[hi x~]
+
+# {% render %} goes through the same provider.
+query I
+SELECT rtrim(fabricator_render('{% render ''hello'' %}', {'who': 'rendered'}), chr(10));
+----
+hi rendered
+
+# --- a BOM does not survive an include -----------------------------------------------------
+# ⚠⚠ AND IT IS FLUID DOING IT, NOT US — which is why this is asserted rather than assumed. A file provider
+# hands Fluid a STREAM and Fluid reads it with a StreamReader, which detects and strips a UTF-8 byte-order
+# mark. We wrote a BOM-stripping branch first and a mutant proved it INERT; it was deleted. ⚠ Fluid does NOT
+# strip a BOM from a template passed as a STRING (measured), so fabricator_render on a BOM-prefixed literal
+# keeps it — that is the caller's own text. The ord() is the assertion: 66 is 'B', 65279 is the BOM, and
+# neither rtrim nor trim removes it.
+query IT
+SELECT ord(rtrim(fabricator_render('{% include ''bom'' %}', NULL), chr(10))[1]),
+       rtrim(fabricator_render('{% include ''bom'' %}', NULL), chr(10));
+----
+66	BOMMED
+
+# --- what a failure says -------------------------------------------------------------------
+# ⚠⚠ A MISSING INCLUDE NAMES THE PATHS IT ASKED FOR, not just the include's argument. Fluid's own
+# FileNotFoundException carries only `nope`, which tells an author whose ROOT is wrong nothing at all — so
+# the provider records each resolved path and FluidEngine appends them. Both probes appear, which is also
+# how the two-read cost of an extension-less include is visible from SQL.
+#
+# ⚠ Claiming ABSENCE here is legitimate, unlike most of this repo: read_blob returns ZERO ROWS for a file
+# that is not there and THROWS for anything else, so a credential or transport failure never reaches this
+# message — it arrives as its own error. The engine establishes absence; we do not infer it.
+statement error
+SELECT fabricator_render('{% include ''nope'' %}', NULL);
+----
+tried
+
+# ⚠ A SUBDIRECTORY JOINS AS WRITTEN. There is no fixture under sub/ — creating a directory from SQL is
+# awkward — so what this pins is the RESOLUTION, which is the half that could silently be wrong; the read
+# failing afterwards is expected, and the message naming the JOINED path is the assertion.
+statement error
+SELECT fabricator_render('{% include ''sub/x'' %}', NULL);
+----
+tpl/sub/x.liquid
+
+# --- what the root is, and what it is not --------------------------------------------------
+# ⚠⚠ THE ROOT IS ERGONOMICS, NOT A SANDBOX, and the suite says so rather than letting these refusals imply
+# otherwise. A template that can {% include %} is being rendered by someone who can already run SQL here,
+# and slice 3's query() lets that same template read any path the host can open — so confining an include
+# would protect nothing. The absolute form is asserted ABOVE, before any root exists.
+# ⚠ `..` is refused for PREDICTABILITY rather than safety: it resolves against a root the template's author
+# may never see, and the absolute form above says the same thing unambiguously.
+statement error
+SELECT fabricator_render('{% include ''../escape'' %}', NULL);
+----
+cannot walk out of fluid_template_root
+
+# ⚠⚠ A GLOB METACHARACTER IS REFUSED, and this one IS load-bearing: read_blob GLOBS, so `he*` would match
+# hello.liquid today and something else the day a file is added — an include silently rendering a different
+# partial on a directory change is very hard to see. Refused at the path rather than by taking the first
+# row, because taking a row is what makes it silent.
+statement error
+SELECT fabricator_render('{% include ''he*'' %}', NULL);
+----
+would treat this as a glob
+
+# --- the size ceiling ----------------------------------------------------------------------
+statement ok
+COPY (SELECT repeat('x', 1100000) AS c) TO '${FABRICATOR_DELTA_WRITE_DIR}/tpl/big.liquid' (FORMAT csv, HEADER false, QUOTE '');
+
+# ⚠ Refused on the file's REPORTED SIZE, before a byte is allocated, so a root pointed at a directory of
+# parquet cannot turn a typo into a multi-gigabyte read. This assertion is also what proves the enrichment
+# above carries the REAL reason: without it the message would read "was not found" for a file that is
+# plainly there.
+statement error
+SELECT fabricator_render('{% include ''big'' %}', NULL);
+----
+above the 1048576-byte ceiling
+
+# --- the payoff ----------------------------------------------------------------------------
+# ⚠⚠ THIS IS WHAT SLICE 4 EXISTS FOR: a SQL fragment lives in a file and any number of statements share it.
+# The include resolves at RENDER, which for fluid_query is inside BIND — so the generated SQL, and with it
+# the output SCHEMA, comes out of a file on storage.
+query I
+SELECT n FROM fluid_query('{% include ''frag'' %}', params := {'n': 41});
+----
+41
+
+# ⚠ And the same fragment with a different parameter, so the assertion above cannot pass on a build that
+# ignored the bag and hard-coded a constant.
+query I
+SELECT n FROM fluid_query('{% include ''frag'' %}', params := {'n': 7});
+----
+7

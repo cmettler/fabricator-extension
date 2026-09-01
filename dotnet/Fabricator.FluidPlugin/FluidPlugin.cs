@@ -37,6 +37,27 @@ public sealed class FluidPluginBackend : IBackend
     public IEnumerable<ISqlTableFunction> GlobalSqlTableFunctions =>
         new ISqlTableFunction[] { new FluidQueryFunction() };
 
+    /// <summary>
+    /// The one setting this plugin declares: where <c>{% include %}</c> / <c>{% render %}</c> resolve from.
+    /// </summary>
+    /// <remarks>
+    /// ⚠ It is registered because a PLUGIN's settings go through the same path a backend's do
+    /// (<c>BackendRegistry.All()</c> at load), which is also why it shares the load-time opt-in property of
+    /// the functions above: the plugin has to be in a plugin root when the extension loads.
+    /// </remarks>
+    public IEnumerable<ProviderSetting> Settings =>
+        new[]
+        {
+            new ProviderSetting(
+                HostTemplateFileProvider.RootSetting,
+                ProviderSettingType.Varchar,
+                Default: null,
+                Description: "Directory or URI prefix that {% include %} and {% render %} resolve against, " +
+                             "read through DuckDB's own FileSystem (so s3://, abfss:// and onelake:// work " +
+                             "with the secrets already in scope). Unset by default: an include is REFUSED " +
+                             "rather than resolved against the process working directory."),
+        };
+
     public string BuildConnectionString(string secretType, IReadOnlyDictionary<string, string> fields,
                                         string baseConnString) =>
         throw new NotSupportedException("fluid: a template engine, not a catalog (global functions only).");

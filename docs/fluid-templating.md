@@ -1,6 +1,7 @@
 # Fluid templating — shipped state and the follow-on plan
 
-> **Status: slice 0 SHIPPED (`7f1940c`), slice 1 SHIPPED (`58aa6b4`, §7), slice 2 MEASURED (§8 — the answer is PERMISSIVE); slices 3–5 PLANNED.**
+> **Status: slice 0 SHIPPED (`7f1940c`), slice 1 SHIPPED (`58aa6b4`, §7), slice 2 MEASURED (§8 — the answer is
+> PERMISSIVE), slice 3 SHIPPED (§9), slice 4 SHIPPED (§10); slice 5 PLANNED, and §10.8 says re-derive it.**
 > The shipped part is `fabricator_render` as a bundled plugin; its record lives in
 > [plugin-system.md](plugin-system.md) §The FLUID plugin. This document is the FOLLOW-ON plan, written
 > down because the architectural finding in §2 is what makes slices 2–5 possible without undoing the move.
@@ -132,7 +133,7 @@ The original framing was:
 | **1** ✅ | `fluid_query` + **the value model**: the `ValueConverters` mapping, and the Arrow→`FluidValue` wrapping (`ArrowStruct : IFluidIndexable`, name AND index access, nested list → enumerable). BUILT — see §7 | Slices 3 and 5 both reuse the value model, so it was built ONCE here. Needed no new ABI and no new seam, exactly as §2 predicted |
 | **2** ✅ | **Probe** bind-time `host_query` (§3) — DONE, see §8 | One measurement; it came back PERMISSIVE, and added a SELECT-only refusal to slice 3's scope |
 | **3** ✅ | `HostQueryTransport` seam in Abstractions + the Fluid `query` function. BUILT — see §9 | Needs 1's row wrapping and 2's verdict |
-| **4** | `ITemplateFileProvider` over a host-FS seam (§1.3) | Independent of 3; same seam pattern |
+| **4** ✅ | `ITemplateFileProvider` — BUILT, see §10. ⚠ **NOT over a host-FS seam**: one was built and MEASURED unusable (a global function has no ambient opener), so it reads `read_blob` over slice 3's `HostQueryTransport` | Predicted independent of 3; it turned out to DEPEND on 3 |
 | **5** | Dynamic DuckDB function/macro resolution from Fluid (§1.4) | Largest and least specified; scope it DOWN once 1–3 exist |
 
 ## 5. Things to get right in slice 1 (so they are not rediscovered)
@@ -791,3 +792,240 @@ the SQL is precisely what parameters exist to avoid.
   now a second worked example of it, and the two should look alike.
 - ⚠ The seam is deliberately NOT exposed as a SQL function; it is a plugin-facing capability.
   `fabricator_host_query` remains the SQL surface and is unchanged by this slice.
+
+## 10. Slice 4 AS BUILT (2026-09-02) — `{% include %}` / `{% render %}` from any storage the host can reach
+
+C#-only, in the plugin. **NO ABI change, NO C++ change, NO bridge change** — which is not what §4 predicted,
+and the correction is the substance of this slice. Gate `verify_plugin_fluid` **147 → 174**, four mutants
+each killed at its own assertion.
+
+```sql
+SET GLOBAL fluid_template_root = 's3://analytics/templates';
+SELECT * FROM fluid_query('{% include ''dims/customer'' %}', params := {'region': 'eu'});
+```
+
+### 10.1 ⚠⚠ THE PLAN SAID "A `HostFs` SEAM". ONE WAS BUILT, AND IT CANNOT WORK FROM HERE
+
+§2's table says `HostFs` is unreachable from a plugin *because the type lives in the bridge*, and §4 scheduled
+slice 4 as "`ITemplateFileProvider` over a host-FS seam — independent of 3; same seam pattern". A
+`HostFileTransport` was written to exactly the `HostHttpTransport` shape, the bridge filled it in at boot, and
+the first include **killed the process**:
+
+```
+Fatal error. 0xC0000005
+   at Fabricator.Bridge.HostFs.OpenRead(IntPtr, System.String)
+   at Fabricator.Bridge.HostFs.ReadAllBytes(IntPtr, System.String, Int64)
+   at Fabricator.FluidPlugin.HostTemplateFileProvider.GetFileInfoAsync(...)
+   ...
+   at Fabricator.Bridge.Bootstrap.ScalarFnExecute(...)
+```
+
+**Every `fs_*` host callback takes the calling operator's `ClientContext` as its opener and dereferences it
+(`auto *ctx = reinterpret_cast<ClientContext *>(opener); FileSystem::GetFileSystem(*ctx)`), and a GLOBAL
+function has no ambient opener established.** Both `fabricator_render` (a global scalar) and `fluid_query`
+(a global sqlgen table function) are exactly that. So the blocker was never the assembly the type lives in —
+**it is that the AMBIENT the seam needs is not established for global functions**, which §2 could not see
+because it was reasoning about references rather than about call context.
+
+⚠ §2's own corollary already contained the answer and neither of us read it that way: *"such a seam is usable
+only from INSIDE an ABI crossing, or where the ambient still flows from one."* A global function's crossing is
+a crossing — it just does not carry that ambient.
+
+**The seam was deleted rather than shipped unreachable.** It would have been a public contract in the contract
+assembly with no in-tree caller and no way to reach it from the surface that motivated it.
+
+### 10.2 ⚠⚠ AND THE SAME MISSING AMBIENT MAKES A PLAIN `SET` UNRELIABLE — hence `SET GLOBAL`
+
+The root is the DuckDB setting `fluid_template_root`, the first setting any PLUGIN declares (a plugin's
+`IBackend.Settings` go through the same `BackendRegistry.All()` path a backend's do — measured, it appears in
+`duckdb_settings()`).
+
+Provider settings register SESSION-scoped (ABI v69) and `ProviderSettingsStore` resolves *session ?? global*
+from `ProviderSettingsStore.CurrentSession` — **an `AsyncLocal` set by `set_active_opener`, i.e. the same
+ambient the opener rides on, and equally absent for a global function.** So a plain `SET` writes a layer keyed
+on a session id the plugin never receives.
+
+**The chain, read from source and matching the measurement exactly:** `SET x = v` on an extension option
+resolves `SetScope::AUTOMATIC` against `FABRICATOR_SETTING_DEFAULT_SCOPE`, which is `SESSION`, so the
+trampoline writes under `SessionKeyFor(&context)` — the ClientContext ADDRESS. `GetString` consults that
+layer only when `CurrentSession != 0` and otherwise falls through to the global bucket, which `SET GLOBAL`
+writes under key 0. `CurrentSession` is an `AsyncLocal<long>` assigned only by `set_active_opener`, which
+C++ calls from catalog and scan crossings — **never from a global scalar's execute**. So the value goes into
+a drawer the plugin has no key to.
+
+**MEASURED, reproducibly: a plain `SET` is simply INVISIBLE here** — in a two-statement suite, in
+`duckdb.exe`, and at the foot of the 1200-line suite in two different shapes. `current_setting()` reports
+the value the whole time, which is what makes it a trap rather than an error.
+
+**⚠⚠ A CORRECTION, RECORDED BECAUSE THE WRONG VERSION REACHED FOUR PLACES BEFORE IT WAS CHECKED.** This
+section first claimed the behaviour was NON-DETERMINISTIC — invisible in a small session, visible after
+unrelated statements — and explained it by `SetActiveOpener` assigning the ambients and never clearing them,
+so an earlier crossing on the same thread would leave `CurrentSession` set for a later one. **That story was
+invented to fit ONE observation and it does not survive testing.** The observation was real (an intermediate
+build's includes rendered after a plain `SET`) and it **does not reproduce**: the direct test of the story —
+a `fabricator_plugins()` call, i.e. a fabricator table function whose bind and scan DO call
+`set_active_opener`, run immediately before the `SET` — came back NEGATIVE, and so did reconstructing the
+original suite shape. The one run remains unexplained; nothing rests on it. ⇒ **the claim is now the simpler
+and stronger one: not visible, full stop.** The `SET GLOBAL` requirement is unchanged either way.
+
+⚠ The suite still does NOT assert the plain-`SET` behaviour. Not because it is unstable — it is stable — but
+because it is a property of the AMBIENT PLUMBING rather than of this plugin, and the day the gap below is
+closed a plain `SET` should start working. An assertion here would then fail for the right reason in the
+wrong file.
+
+⇒ the refusal names `SET GLOBAL` explicitly — *"a plain SET is not visible here"* — because "the setting is
+set and the feature says it is not" is exactly the trap that costs an afternoon. And an ABSOLUTE include path
+needs no root at all, which is the escape when a process-wide setting is the wrong granularity.
+
+**⚠ THE UNDERLYING GAP IS NOT FIXED AND IS BIGGER THAN THIS SLICE:** a global function reaches neither the
+host filesystem nor its own session's settings. Fixing it means establishing the ambients around
+`scalarfn_execute` and the sqlgen bind **with save/restore** — and the v80 record is the warning, not the
+recipe: pushing them at a scalar BIND crashed under `OPTIMIZE` because a scalar binds inside whatever an outer
+operation is running, so it CLOBBERED the outer ambient. A correct version needs the previous value back,
+which C++ cannot read from the managed `AsyncLocal` today. Its own change.
+
+**⚠ AND A SEPARATE, PRE-EXISTING CRASH IT EXPOSED: none of the nine `fs_*` host callbacks null-check the
+opener, while their sibling `HostHttpRequest` does** (*"http_request requires a client context (no ambient
+opener)"*). So any managed caller reaching the filesystem without an ambient gets an access violation instead
+of a message. Fixed separately; ungated, because nothing in tree can currently reach it.
+
+### 10.3 WHAT SHIPS: `read_blob` over slice 3's `HostQueryTransport`
+
+`HostTemplateFileProvider : ITemplateFileProvider` resolves a path and reads it with
+
+```sql
+SELECT content, size, last_modified FROM read_blob($path)
+```
+
+through `HostQueryTransport` — the seam slice 3 already built, gated and measured at bind time. It needs no
+ambient because `Host.Query` opens its own connection on the captured `DatabaseInstance`.
+
+**And it is better on its own merits, which is what settles it rather than mere availability.** Measured, all
+four:
+
+- **`read_blob` on a missing file returns ZERO ROWS rather than throwing**, so **absence is ESTABLISHED by the
+  engine instead of guessed from a message.** That matters here more than anywhere: the host has no
+  `fs_exists`, so a failed open is equally a missing file, a denied credential and an unreachable endpoint —
+  and Fluid's normal behaviour is to probe a path that is *supposed* to be missing (see 10.4). A filesystem
+  seam would have forced this repo's own "never infer absence from a failure" rule to be broken on the hot
+  path.
+- **It reports `size`**, so the per-template ceiling is checked against the file rather than hoped for.
+- **It reports `last_modified`**, so `TemplateSourceInfo.LastModified` carries a REAL time. A filesystem seam
+  has no mtime at all, and this repo has already shipped the alternative once: `DuckDbTableFileSystem`
+  reported a hardcoded epoch as every file's mtime, which nothing read until a retention pass did.
+- **The path crosses as a BOUND PARAMETER** — `read_blob($path)` binds, measured — so it never becomes SQL
+  text. That is slice 3's named-parameter work paying out immediately: the params batch column is named
+  `path`, and host_query binds by name when the batch's names are all parameters the statement declares.
+
+**⚠ The cost, stated rather than hidden: the read inherits every limitation of `query()`** (§8.2, §9). It runs
+on a connection of its own, so a template whose location is authorised by a TEMPORARY secret of the calling
+session is unreadable; a persistent secret works. One rule for both surfaces, which is better than two.
+
+### 10.4 What Fluid's file-provider contract actually is (measured on 3.0.0-beta.7)
+
+`ITemplateFileProvider` is **Fluid's own**, not `Microsoft.Extensions.FileProviders.IFileProvider` (that is
+what the DEFAULT `FileProviderTemplateFileProvider` wraps):
+
+```csharp
+ValueTask<TemplateSourceInfo> GetFileInfoAsync(string subpath, TemplateContext context, CancellationToken ct)
+```
+
+- **It receives the `TemplateContext`.** MEASURED: a value put in `ctx.AmbientValues` before `Render` is
+  visible inside the provider. **⚠ That is what makes ONE instance on the shared static `TemplateOptions`
+  safe, where the `query` FILTER registration needed a warning** — the root, the read cache and the tried-path
+  record all travel per call. The difference is the context parameter, not care.
+- **It is called at RENDER, never at PARSE** (zero calls during `TryParse`), so `FluidEngine`'s parse-once
+  cache is unaffected.
+- **⚠⚠ IT PROBES TWICE PER INCLUDE**: `{% include 'a' %}` asks for `a` and *then* for `a.liquid`. An author
+  who omits the extension pays TWO reads where `{% include 'a.liquid' %}` pays one — on remote storage, two
+  round trips. **And the bare probe WINS when both files exist**, which is the opposite of what a `.liquid`
+  convention would suggest; gated as a discriminating pair.
+- **Not-found is `null`** (the type is a CLASS), after which Fluid raises `FileNotFoundException` carrying
+  only the include's ARGUMENT.
+- Repeated includes of one file are NOT cached by Fluid: two includes made four provider calls. Caching is
+  ours.
+- `{% render %}` goes through the same provider, and in this beta it is **not** scope-isolated — the outer
+  variables are visible inside it, unlike standard Liquid.
+- A cyclic include is stopped by `TemplateOptions.MaxRecursion` (default 100), after ~200 provider calls.
+
+### 10.5 What the provider does with that
+
+- **A per-RENDER read cache**, keyed on the resolved path, in `ctx.AmbientValues`. Safe by construction — one
+  render cannot coherently see two versions of a file — and it is what makes an include inside a `{% for %}`
+  cost one read, and a cyclic include cost no reads at all. ⚠ NOT GATED: it changes how many times a file is
+  read and changes no answer, and nothing in SQL can observe a read count. The suite says so.
+- **Every MISSED path is recorded, keyed by the include's argument**, so the not-found message names what
+  was asked for. Fluid's own exception says only `nope`, which tells an author whose ROOT is wrong nothing
+  at all. ⚠ Two details, both from getting it wrong first: record on the MISS only, or a successful include
+  contributes its own bare-form probe to a later failure's message and names a file that was found; and key
+  it PER ARGUMENT, then look under both `a` and `a.liquid` at the point of failure, because Fluid's two
+  probes arrive as two different subpaths while its exception names only the first.
+  **⚠ Claiming ABSENCE in that message is legitimate here, unlike almost everywhere else in this repo**: a
+  credential or transport failure never reaches it, because `read_blob` throws for those and returns zero rows
+  only for a genuinely missing file.
+- **A 1 MiB ceiling per template**, checked against the reported `size`, so a root pointed at a directory of
+  parquet turns a typo into a message.
+- **Bytes are streamed to Fluid undecoded.** ⚠ A BOM-stripping branch was written here and **a mutant proved
+  it INERT**: `TemplateSourceInfo` takes a stream factory and Fluid reads it with a `StreamReader`, which
+  detects and strips a UTF-8 byte-order mark itself. Deleted. ⚠ Fluid does NOT strip a BOM from a template
+  passed as a STRING (measured), so `fabricator_render` on a BOM-prefixed literal keeps it — that is the
+  caller's own text.
+
+### 10.6 ⚠⚠ THE ROOT IS ERGONOMICS, NOT A SANDBOX — and saying so is the point
+
+An absolute path is simply allowed and needs no root. Confining an include would protect nothing: a template
+that can `{% include %}` is being rendered by someone who can already run SQL here, and slice 3's `query()`
+lets that same template read any path the host can open. Dressing a convenience as a boundary is how a
+non-boundary comes to be relied on.
+
+What IS refused is refused for PREDICTABILITY, and each has its own reason:
+
+| refused | why |
+|---|---|
+| `..` in a relative path | it resolves against a root the template's author may never see; the absolute form says the same thing unambiguously |
+| `*` `?` `[` `]` | **`read_blob` GLOBS.** `he*` matches `hello.liquid` today and something else the day a file is added — an include silently rendering a different partial on a directory change is very hard to see |
+| a relative path with no root | fail-closed; the alternative is resolving against the process working directory, i.e. reading a file the author never named |
+
+⚠ The multi-match refusal inside the reader is DEFENSIVE and UNGATED — a mutant survives it, because `Resolve`
+refuses glob metacharacters in the subpath first. Only a ROOT containing one could reach it, and that is the
+user's own string.
+
+### 10.7 Gate and mutants
+
+`verify_plugin_fluid` **147 → 174**. The fixtures are a small template library written by DuckDB itself.
+⚠ The first `COPY` uses `PER_THREAD_OUTPUT` **because that is what CREATES the directory** — a plain COPY to a
+file path does not create its parent, and the runner's scratch directory need not exist from DuckDB's point of
+view. ⚠ `rtrim(x, chr(10))`, not `trim(x)`: DuckDB's one-argument `trim` removes SPACES and leaves the newline
+COPY appends.
+
+| mutant | dies at |
+|---|---|
+| the absolute-path branch never fires | the absolute include asserted **with no root set** |
+| no glob refusal | `{% include 'he*' %}` renders instead of refusing |
+| no size ceiling | the >1 MiB template renders |
+| missed paths not recorded | the not-found message no longer says what it tried |
+
+**⚠⚠ TWO MUTANTS SURVIVED FIRST AND BOTH WERE INSTRUCTIVE.** The BOM one was a REAL survivor and the code was
+deleted. The absolute-path one survived TWICE for two different wrong reasons, and only the second is about
+the code:
+
+1. **The mutation never applied** — the anchor had a `\\` in it and did not match. The build succeeded and the
+   suite passed *identically*, which is exactly what a no-op mutation looks like. A control mutation that
+   makes `Resolve` always throw is what proved the harness sound.
+2. **The condition was only half disabled.** `if (false && A || B || C)` still fires on `B` and `C`;
+   precedence, not the code.
+3. **And then it survived legitimately, because of a Windows path quirk**: with the absolute branch off, the
+   join produces `<root>/C:/Users/.../hello.liquid` — and **that opens on Windows**. Measured. So the
+   assertion had to move to where no root exists at all; on Linux the join would have failed and the mutant
+   would have died in place. ⇒ **an assertion that depends on a path NOT resolving is platform-dependent;
+   assert the refusal instead.**
+
+### 10.8 What slice 4 leaves
+
+- **Slice 5 (§1.4) should still be RE-DERIVED, not inherited** — §9.9's reasoning is unchanged.
+- **The ambient gap (10.2) is the real follow-on**, and it is not Fluid's: until a global function can reach
+  the host filesystem and its own session's settings, every plugin has the same two limitations.
+- ⚠ A per-call `template_root` argument was considered and not built. It is clean for `fluid_query` (a named
+  table-function parameter) and awkward for `fabricator_render` (a scalar, so a third parameter means a second
+  arity), and the global setting plus absolute paths covers the cases. Revisit if the process-wide scope
+  becomes a real complaint rather than an aesthetic one.

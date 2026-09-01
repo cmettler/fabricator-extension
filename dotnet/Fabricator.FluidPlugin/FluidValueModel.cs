@@ -65,6 +65,12 @@ internal static class FluidValueModel
         o.Filters.AddFilter("sql_ident", (input, _, ctx) =>
             new ValueTask<FluidValue>(new StringValue(DuckSql.QuoteIdent(input.ToStringValue(ctx)), encode: false)));
 
+        // {% include %} / {% render %} resolve through DuckDB's FileSystem against fluid_template_root.
+        // ⚠ ONE instance on the shared static, and safe here where a per-render FILTER would not be: Fluid
+        // passes the TemplateContext to the provider, so the root, the read cache and the failure record all
+        // travel per call rather than on this object. See HostTemplateFileProvider.
+        o.FileProvider = new HostTemplateFileProvider();
+
         return o;
     }
 

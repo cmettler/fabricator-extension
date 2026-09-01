@@ -3,6 +3,7 @@
 // See LICENSE in the project root for license information.
 
 using System.Collections.Concurrent;
+using System.Linq;
 using Fluid;
 using Fluid.Values;
 
@@ -45,6 +46,27 @@ internal static class FluidEngine
         // giving another render's function name in an error. The caller travels per context instead:
         ctx.AmbientValues[FluidHostQuery.CallerKey] = caller;
         bind(ctx);
-        return parsed.Render(ctx);
+        try
+        {
+            return parsed.Render(ctx);
+        }
+        catch (FileNotFoundException ex)
+        {
+            // ⚠ Fluid raises this carrying ONLY the include's argument, which reads as though the template
+            // engine itself were missing a file. Naming the function and the root is what turns it into
+            // something an author can act on.
+            // ⚠ BOTH KEYS, because Fluid probes twice: `{% include 'a' %}` asks the provider for `a` and
+            // then for `a.liquid`, i.e. two different subpaths, while its exception names only the first.
+            // Looking under both is what puts the whole probe pair in the message.
+            // ⚠ Claiming ABSENCE here is legitimate, unlike almost everywhere else in this repo: the read
+            // goes through read_blob, which returns ZERO ROWS for a file that is not there and THROWS for
+            // anything else — so a credential or transport failure never arrives here at all, it arrives as
+            // its own error. Absence is established by the engine, not inferred from a failure.
+            throw new FileNotFoundException(
+                $"{caller}: template include '{ex.Message}' was not found; tried "
+                + string.Join(", ", HostTemplateFileProvider.TriedFor(ctx, ex.Message)
+                                       .Concat(HostTemplateFileProvider.TriedFor(ctx, ex.Message + ".liquid"))),
+                ex);
+        }
     }
 }
