@@ -38,13 +38,32 @@ char *DupErr(const std::string &msg) {
 	return out;
 }
 
+// The calling operator's ClientContext, or a clean refusal when there is none.
+//
+// ⚠⚠ WITHOUT THIS EVERY fs_* CALLBACK DEREFERENCES A NULL ClientContext AND THE PROCESS DIES with an
+// access violation. It is reachable: the ambient opener is established for CATALOG crossings, and a GLOBAL
+// function (a global scalar, a sqlgen bind) has none - measured while building the Fluid template file
+// provider, which read a file from `fabricator_render` and took the process down inside HostFsOpenRead.
+// The sibling HostHttpRequest in fabricator_http.cpp has always had this check; the fs family did not, so
+// this is consistency with its own twin rather than a new policy.
+//
+// ⚠ UNGATED, deliberately: nothing in tree currently calls an fs_* callback without an ambient, so there
+// is no statement that reaches it. Documented here instead of pretending a test covers it.
+ClientContext &OpenerContext(FabricatorHandle opener, const char *what) {
+	auto *ctx = reinterpret_cast<ClientContext *>(opener);
+	if (!ctx) {
+		throw InvalidInputException("fabricator: %s requires a client context (no ambient opener)", what);
+	}
+	return *ctx;
+}
+
 int32_t HostFsOpenRead(FabricatorHandle opener, const char *path, FabricatorHandle *out_file, char **err) {
 	try {
 		// `opener` is the calling operator's ClientContext (alive for the duration of the managed call).
 		// FileSystem::GetFileSystem(context) returns an OpenerFileSystem that AUTO-pushes the context's
 		// FileOpener (secret resolution for az://, s3://, …) — so we must NOT pass an explicit opener.
-		auto *ctx = reinterpret_cast<ClientContext *>(opener);
-		auto &fs = FileSystem::GetFileSystem(*ctx);
+		auto &ctx_ref = OpenerContext(opener, "fs_open_read");
+		auto &fs = FileSystem::GetFileSystem(ctx_ref);
 		auto handle = fs.OpenFile(path, FileOpenFlags::FILE_FLAGS_READ);
 		*out_file = reinterpret_cast<FabricatorHandle>(handle.release()); // closed via HostFsClose
 		return FABRICATOR_OK;
@@ -104,8 +123,8 @@ std::string JsonEscape(const std::string &s) {
 int32_t HostFsGlob(FabricatorHandle opener, const char *pattern, char **out_json, char **err) {
 	try {
 		// Opener auto-pushed (OpenerFileSystem) — secrets resolve as a native read would.
-		auto *ctx = reinterpret_cast<ClientContext *>(opener);
-		auto &fs = FileSystem::GetFileSystem(*ctx);
+		auto &ctx_ref = OpenerContext(opener, "fs_glob");
+		auto &fs = FileSystem::GetFileSystem(ctx_ref);
 		auto files = fs.Glob(pattern);
 		std::string json = "[";
 		for (idx_t i = 0; i < files.size(); i++) {
@@ -177,8 +196,8 @@ int32_t HostFsGlob(FabricatorHandle opener, const char *pattern, char **out_json
 int32_t HostFsOpenWrite(FabricatorHandle opener, const char *path, int32_t exclusive, FabricatorHandle *out_file,
                         char **err) {
 	try {
-		auto *ctx = reinterpret_cast<ClientContext *>(opener);
-		auto &fs = FileSystem::GetFileSystem(*ctx);
+		auto &ctx_ref = OpenerContext(opener, "fs_open_write");
+		auto &fs = FileSystem::GetFileSystem(ctx_ref);
 		// exclusive => put-if-absent (O_CREAT|O_EXCL on POSIX / honored on ADLS); else create-or-truncate.
 		idx_t flags = exclusive ? (FileOpenFlags::FILE_FLAGS_WRITE | FileOpenFlags::FILE_FLAGS_FILE_CREATE |
 		                           FileOpenFlags::FILE_FLAGS_EXCLUSIVE_CREATE)
@@ -211,8 +230,8 @@ int32_t HostFsOpenWrite(FabricatorHandle opener, const char *path, int32_t exclu
 				return FABRICATOR_ALREADY_EXISTS;
 			}
 			try {
-				auto *ctx = reinterpret_cast<ClientContext *>(opener);
-				auto &fs = FileSystem::GetFileSystem(*ctx);
+				auto &ctx_ref = OpenerContext(opener, "fs_open_write");
+				auto &fs = FileSystem::GetFileSystem(ctx_ref);
 				if (fs.FileExists(path)) {
 					return FABRICATOR_ALREADY_EXISTS; // no *err — the caller treats this as a conflict, not a failure
 				}
@@ -258,8 +277,8 @@ int32_t HostFsCloseWrite(FabricatorHandle file, char **err) {
 
 int32_t HostFsRemove(FabricatorHandle opener, const char *path, char **err) {
 	try {
-		auto *ctx = reinterpret_cast<ClientContext *>(opener);
-		auto &fs = FileSystem::GetFileSystem(*ctx);
+		auto &ctx_ref = OpenerContext(opener, "fs_remove");
+		auto &fs = FileSystem::GetFileSystem(ctx_ref);
 		fs.TryRemoveFile(path); // no error if missing
 		return FABRICATOR_OK;
 	} catch (std::exception &e) {
@@ -307,8 +326,8 @@ void CreateDirRecursive(FileSystem &fs, const std::string &path) {
 
 int32_t HostFsCreateDir(FabricatorHandle opener, const char *path, char **err) {
 	try {
-		auto *ctx = reinterpret_cast<ClientContext *>(opener);
-		auto &fs = FileSystem::GetFileSystem(*ctx);
+		auto &ctx_ref = OpenerContext(opener, "fs_create_dir");
+		auto &fs = FileSystem::GetFileSystem(ctx_ref);
 		CreateDirRecursive(fs, path);
 		return FABRICATOR_OK;
 	} catch (std::exception &e) {
@@ -321,8 +340,8 @@ int32_t HostFsCreateDir(FabricatorHandle opener, const char *path, char **err) {
 
 int32_t HostFsRemoveDir(FabricatorHandle opener, const char *path, char **err) {
 	try {
-		auto *ctx = reinterpret_cast<ClientContext *>(opener);
-		auto &fs = FileSystem::GetFileSystem(*ctx);
+		auto &ctx_ref = OpenerContext(opener, "fs_remove_dir");
+		auto &fs = FileSystem::GetFileSystem(ctx_ref);
 		if (fs.DirectoryExists(path)) {
 			fs.RemoveDirectory(path); // recursive; idempotent (skip if absent)
 		}
@@ -337,8 +356,8 @@ int32_t HostFsRemoveDir(FabricatorHandle opener, const char *path, char **err) {
 
 int32_t HostFsMoveDir(FabricatorHandle opener, const char *src, const char *dest, char **err) {
 	try {
-		auto *ctx = reinterpret_cast<ClientContext *>(opener);
-		auto &fs = FileSystem::GetFileSystem(*ctx);
+		auto &ctx_ref = OpenerContext(opener, "fs_move_dir");
+		auto &fs = FileSystem::GetFileSystem(ctx_ref);
 		fs.MoveFile(src, dest); // atomic directory rename on local; object stores throw "not implemented"
 		return FABRICATOR_OK;
 	} catch (std::exception &e) {
