@@ -1524,6 +1524,46 @@ about the parallel sink changes that.
      longer a generally-available trick, and anything that gives this plan a bound parameter breaks it
      silently. A settings argument on `host_query` (host-query.md §OPEN item A option 2) is the shape that
      would survive both.
+   **⚠⚠ AND IT IS NOT ONLY A PERFORMANCE QUESTION — REMOVING THE SET CREATES A PROMISE WE WOULD OWE
+   (user, 2026-09-01, and the framing above was too narrow). MEASURED, so this is no longer arguable:**
+   three parquet files of 400k rows each, `UNION ALL` of three `read_parquet` scans, `threads=8`, order
+   observed as the CLIENT receives it (`.output` to CSV, not an aggregate):
+
+   | `preserve_insertion_order` | rows | out-of-sequence steps | first | last |
+   |---|---|---|---|---|
+   | `true` | 1,200,000 | **0** | 0 | 1199999 |
+   | `false` | 1,200,000 | **478** | **368640** | **1045759** |
+
+   ⇒ the setting is **observable**, not merely a tuning knob: under `false` the client genuinely receives a
+   different order. And under `true` DuckDB **does** keep insertion order across a UNION ALL of plain
+   `read_parquet` scans — so on that shape the promise is kept by DuckDB's own machinery.
+
+   **⚠ THAT SPLITS INTO TWO QUESTIONS, AND ONLY THE FIRST IS ANSWERED ABOVE:**
+   1. *Does DuckDB preserve the order our plan emits?* Measured YES for the synthetic union. ⚠ **It does
+      NOT transfer to our real plan**, which is not a union of plain `read_parquet`: it carries bound
+      `duckdb_arrow_scan` views and a `WITH … AS MATERIALIZED` CTE, i.e. exactly the sources item 1 shows
+      do not declare a batch index. On our shape DuckDB would either still preserve order or fall back to
+      the SINGLE-THREADED `PhysicalBufferedCollector` — **which is the 94.5 s stall the SET exists to
+      avoid.** So "inherit `true`" plausibly reintroduces the original problem rather than producing a
+      wrong answer.
+   2. *Is the order our plan emits the Delta table's insertion order?* **UNANSWERED, and it is OURS, not
+      DuckDB's.** DuckDB faithfully preserves whatever order the sources emit; it has no idea what order we
+      intended. If the union assembles branches in log-listing order that may coincide with the table's
+      order — but nothing verifies it, and nothing pins the branch order. This is what the user's *"we
+      might need to adjust this with batchid or whatever"* points at.
+
+   ⇒ **THE EXPERIMENT THE DECISION NEEDS**, before removing or inheriting anything: a multi-file Delta
+   table whose rows carry a known monotonic key, read through EACH batched form (union, partition-join
+   plain, the two others) with the SET removed and the session at `true`, checking (a) the delivered order
+   against the key and (b) the wall clock against today's. Both legs matter: a green order check that costs
+   94.5 s has answered question 1 the wrong way.
+
+   ⚠ Method note for whoever runs it: **the obvious instrument is void.** `row_number() OVER ()` makes the
+   plan order-preserving by itself — `PhysicalWindow` is one of only four operators overriding
+   `SupportsPartitioning` — so it reports perfect order under BOTH settings. Observe what the client
+   receives (`.mode csv` + `.output`), and use enough rows that parallelism can actually interleave: at
+   3 × 2000 rows both settings gave 0 out-of-sequence steps, because nothing splits below the row-group and
+   morsel thresholds. The table above needed 400k per file.
 2. **The remote figures in §5 all predate the fix** — 120.4 / 44.7 / 13.7 s, and the "union loses cold by
    ~3.5x" ranking. Nothing about them is known to still hold.
 3. **The batch-size default** (§3). Removing engineered-wood's one-file-per-batch coupling, or adding a
