@@ -1,6 +1,6 @@
 # Fluid templating — shipped state and the follow-on plan
 
-> **Status: slice 0 SHIPPED (commit `7f1940c`) and slice 1 SHIPPED (2026-09-01, §7); slices 2–5 PLANNED.**
+> **Status: slice 0 SHIPPED (`7f1940c`), slice 1 SHIPPED (`58aa6b4`, §7), slice 2 MEASURED (§8 — the answer is PERMISSIVE); slices 3–5 PLANNED.**
 > The shipped part is `fabricator_render` as a bundled plugin; its record lives in
 > [plugin-system.md](plugin-system.md) §The FLUID plugin. This document is the FOLLOW-ON plan, written
 > down because the architectural finding in §2 is what makes slices 2–5 possible without undoing the move.
@@ -105,15 +105,20 @@ They do NOT move Fluid back into the Bridge, and they do NOT widen the plugin's 
 an ABI crossing, or where the ambient still flows from one. `AsyncLocal`, so it survives `await` and
 `Task.Run`; it does NOT survive a thread parked before the crossing began.
 
-## 3. ⚠⚠ THE HAZARD TO SETTLE BEFORE BUILDING §1.2 OR §1.4 — unmeasured
+## 3. ⚠⚠ THE HAZARD TO SETTLE BEFORE BUILDING §1.2 OR §1.4 — **MEASURED AND CLOSED, see §8**
 
 **A sqlgen function renders at BIND.** So a Fluid `query` function used inside `fluid_query` would run
 `host_query` *while DuckDB is binding a statement* — re-entrant query execution during bind. This project
 has been bitten by that class twice: the ABI v80 scalar-bind ambient SIGSEGV under `OPTIMIZE`, and the
 standing rule *never call anything that BINDS while holding `entry_lock_`*.
 
-It may well be fine — `host_query` runs on its own connection — but **it is not obviously fine and it has
-not been measured.** The probe is cheap and it decides the shape of two slices:
+**✅ ANSWERED IN §8 (2026-09-01): it IS fine, and the transaction semantics are the same at bind and at
+execute, so there is no asymmetry to state.** The rest of this section is the reasoning that motivated the
+probe, kept because the two incidents it cites are real and NOT repealed by the result. It also under-called
+one thing: the probe found a hazard neither branch below anticipated — a bind-time WRITE fires on `EXPLAIN`
+(§8.3), which constrains slice 3's surface.
+
+The original framing was:
 
 - If bind-time `host_query` is safe ⇒ `query` works in both `fabricator_render` (execute time) and
   `fluid_query` (bind time).
@@ -125,7 +130,7 @@ not been measured.** The probe is cheap and it decides the shape of two slices:
 | slice | contents | why here |
 |---|---|---|
 | **1** ✅ | `fluid_query` + **the value model**: the `ValueConverters` mapping, and the Arrow→`FluidValue` wrapping (`ArrowStruct : IFluidIndexable`, name AND index access, nested list → enumerable). BUILT — see §7 | Slices 3 and 5 both reuse the value model, so it was built ONCE here. Needed no new ABI and no new seam, exactly as §2 predicted |
-| **2** | **Probe** bind-time `host_query` (§3) | One measurement; decides the shape of 3 and 5 |
+| **2** ✅ | **Probe** bind-time `host_query` (§3) — DONE, see §8 | One measurement; it came back PERMISSIVE, and added a SELECT-only refusal to slice 3's scope |
 | **3** | `HostQueryTransport` seam in Abstractions + the Fluid `query` function | Needs 1's row wrapping and 2's verdict |
 | **4** | `ITemplateFileProvider` over a host-FS seam (§1.3) | Independent of 3; same seam pattern |
 | **5** | Dynamic DuckDB function/macro resolution from Fluid (§1.4) | Largest and least specified; scope it DOWN once 1–3 exist |
@@ -445,3 +450,87 @@ case. Both of these work and both are gated:
   generates text. Slice 2 is still the next thing.
 - ⚠ `fluid_query` gives §3 a sharper edge than the plan anticipated: a Fluid `query` inside `fluid_query`
   would execute SQL inside `bind_replace`, i.e. during the binder's own walk, not merely "during bind".
+
+## 8. Slice 2 — the bind-time `host_query` PROBE: MEASURED SAFE (2026-09-01)
+
+**§3's hazard is CLOSED, and the answer is the permissive one.** Bind-time `host_query` neither deadlocks nor
+crashes, and — the part §3 did not anticipate — its transaction semantics are the SAME at bind and at
+execute, so there is no asymmetry for the surface to state. `query` can exist in BOTH `fabricator_render`
+(execute time) and `fluid_query` (bind time). **Slice 3 is unblocked in its simple form.**
+
+Method: a THROWAWAY `ISqlTableFunction` (`fabricator_bind_probe(sql)`) in `Fabricator.SqlServer` whose
+`GenerateSql` calls `Host.Query` and splices the scalar result into the generated SQL — i.e. a real
+host query executed while DuckDB is binding a statement. It lived only for the measurement and was removed
+(`CustomFunctions.cs` is byte-identical to its pre-probe state; `duckdb_functions()` reports 0). It had to go
+in a first-party assembly rather than the plugin, because `Host.Query` is Bridge-only — §2's whole point.
+
+### 8.1 Safety: fourteen shapes, none of them failed
+
+Each run under a 30–60 s timeout, so a deadlock would surface as a timeout rather than a hang:
+
+| shape | result |
+|---|---|
+| constant query at bind | ok |
+| reads a DuckDB table at bind | ok |
+| inside a `CREATE VIEW`, then using the view (bind REPEATS) | ok |
+| inside an explicit transaction | ok |
+| `EXPLAIN` / `DESCRIBE` (bind WITHOUT execute) | ok |
+| **NESTED** — a bind-time host query whose SQL calls the probe again | ok |
+| prepared statement, two `EXECUTE`s (re-bind each time) | ok |
+| reads OUR OWN attached fabricator catalog at bind | ok, correct value |
+| bind-read AND outer scan of the SAME table in one statement | ok, both 10 |
+| `CTAS` into the same catalog it read at bind | ok |
+
+⚠ The catalog cases are three levels deep by construction, not two: `PROVIDER 'delta'` defaults
+`native_read` on, so a Delta scan issues its own `Host.Query` per file — bind → host query → Delta scan →
+host query. That is the re-entrancy §3 was worried about, and it holds.
+
+⚠ **This does not retroactively make the §3 worry unfounded.** The two incidents it cited are real
+(the ABI v80 scalar-bind ambient SIGSEGV under OPTIMIZE; the `entry_lock_` rule) and neither is contradicted:
+both are about holding an AMBIENT or a LOCK across a re-entry, and `Host.Query` opens its own connection and
+establishes its own scope. The probe measured the specific question and answered it; it did not repeal the
+class.
+
+### 8.2 ⚠ TRANSACTION VISIBILITY — a real limitation, and NOT bind-specific
+
+MEASURED with a control, inside `BEGIN; INSERT …;`:
+
+| reader | sees the uncommitted row? |
+|---|---|
+| the statement's own scan | **yes** — 109 |
+| `fabricator_host_query` at EXECUTE time | no — 10 |
+| the bind-time probe | no — 10 |
+| after `COMMIT` | 109 |
+
+**Identical at bind and at execute, and identical on a plain DuckDB table** — so this is a property of
+`host_query` opening its own connection, not something bind introduces. That is what makes the surface
+symmetric: a Fluid `query` reads COMMITTED state wherever it is called, which is one rule to document rather
+than two. ⚠ It is still a limitation a template author must know: a template cannot observe the writes of the
+transaction that is running it.
+
+### 8.3 ⚠⚠ THE HAZARD THE PROBE FOUND, AND IT CONSTRAINS SLICE 3's SURFACE: A BIND-TIME WRITE FIRES ON `EXPLAIN`
+
+A bind-time host query can perform DML, and because binding is neither once nor tied to execution, it fires
+where nobody asked for it. MEASURED, counting rows in an audit table:
+
+| statement | rows after |
+|---|---|
+| `EXPLAIN SELECT … probe('INSERT INTO audit …')` — **never executed** | **1** |
+| `CREATE VIEW v AS SELECT … probe('INSERT …')` — merely DEFINING the view | **2** |
+| `SELECT count(*) FROM v` — every use re-binds | **3** |
+
+⇒ **Slice 3's Fluid `query` must REFUSE anything that is not a SELECT.** That is not a new rule invented
+here: `ISqlTableFunction`'s own authoring contract already requires `GenerateSql` to be deterministic and
+side-effect-free *because* binds repeat and happen without execution. A `query` that writes would violate the
+contract its host runs under, and the failure is invisible — an `EXPLAIN` that mutates.
+
+⚠ The refusal has to be on the STATEMENT KIND, decided before execution — not a catch afterwards, because by
+then the write has happened.
+
+### 8.4 What this settles for the remaining slices
+
+- **Slice 3** (`HostQueryTransport` + a Fluid `query`) is unblocked, with §8.3's SELECT-only refusal added to
+  its scope and §8.2 as a documented semantic. No bind/execute asymmetry to build around.
+- **Slice 5** (dynamic DuckDB function resolution) inherits the same verdict — it is the same re-entry.
+- ⚠ Slice 3 still needs the `HostQueryTransport` seam of §2 regardless: this probe reached `Host.Query`
+  because it lived in a first-party assembly. The plugin still cannot.
