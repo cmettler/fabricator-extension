@@ -1,0 +1,237 @@
+// Copyright (c) Christoph Mettler and contributors.
+// SPDX-License-Identifier: Apache-2.0
+// See LICENSE in the project root for license information.
+
+using Apache.Arrow;
+using Apache.Arrow.Ipc;
+using Fabricator.Bridge;
+using Fluid;
+using Fluid.Values;
+
+namespace Fabricator.FluidPlugin;
+
+/// <summary>
+/// The Fluid <c>query(sql)</c> function: runs a SELECT on the hosting DuckDB through
+/// <see cref="HostQueryTransport"/> and hands the template its rows.
+/// </summary>
+/// <remarks>
+/// <para>
+/// Rows come back as the SAME <see cref="ArrowStruct"/> lookup a STRUCT cell uses, so a row is addressed by
+/// NAME (<c>r.total</c>, <c>r['total']</c>) and by ORDINAL (<c>r[0]</c>) through one rule, and nested values
+/// unbox exactly as they do everywhere else in this plugin.
+/// </para>
+/// <para>
+/// ⚠⚠ <b>It refuses anything that is not a SELECT, and that is a correctness requirement rather than a
+/// policy.</b> A template may be rendered at BIND (<c>fluid_query</c> is a sqlgen function), and a bind
+/// REPEATS and happens WITHOUT execution — MEASURED, a bind-time write fires on <c>EXPLAIN</c> of a
+/// statement that never runs, and again on merely defining a view over it. So a writing <c>query</c> would
+/// mutate where nobody asked, invisibly. See docs/fluid-templating.md §8.3 and §9.
+/// </para>
+/// </remarks>
+internal static class FluidHostQuery
+{
+    /// <summary>The name a template calls it by.</summary>
+    internal const string FunctionName = "query";
+
+    /// <summary>The most rows one <c>query()</c> call will materialise before refusing.</summary>
+    /// <remarks>
+    /// ⚠ It ERRORS rather than truncating. A silent truncation is a wrong ANSWER — the template would render
+    /// a partial result as though it were the whole one — whereas the cap exists only to turn an
+    /// out-of-memory into a sentence naming the cause. Rows are fully materialised because a template may
+    /// iterate them any number of times, so there is no streaming form to fall back to.
+    /// </remarks>
+    internal const int MaxRows = 1_000_000;
+
+    /// <summary>Runs one <c>query(sql)</c> call and returns its rows as a Fluid array.</summary>
+    /// <param name="caller">The SQL function the template was rendered by, so an error names it.</param>
+    internal static FluidValue Execute(string caller, FunctionArguments args, TemplateContext ctx)
+    {
+        if (args.Count < 1)
+        {
+            throw new ArgumentException($"{caller}: {FunctionName}() takes one argument, the SQL to run.");
+        }
+        var sql = args.At(0).ToStringValue(ctx);
+
+        // ⚠ MEASURED: json_serialize_sql('') reports NO error — an empty string parses to zero statements,
+        // so the classifier below would wave it through. Refused here, where the cause can still be named.
+        if (string.IsNullOrWhiteSpace(sql))
+        {
+            throw new ArgumentException($"{caller}: {FunctionName}() was given an empty statement.");
+        }
+
+        var run = HostQueryTransport.Query
+            ?? throw new InvalidOperationException(
+                $"{caller}: {FunctionName}() needs the host query transport, which is not installed here. "
+                + "It is available only from inside a fabricator function call.");
+
+        RefuseUnlessSelect(caller, sql, run);
+
+        using var stream = run(sql, null);
+        var rows = new List<FluidValue>();
+        while (true)
+        {
+            var batch = stream.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult();
+            if (batch is null)
+            {
+                break;
+            }
+            using (batch)
+            {
+                if (rows.Count + batch.Length > MaxRows)
+                {
+                    throw new InvalidOperationException(
+                        $"{caller}: {FunctionName}() returned more than {MaxRows} rows. Narrow the query — "
+                        + "the rows are all held in memory, because a template may iterate them repeatedly.");
+                }
+                // ⚠ Hoisted out of the row loop: batch.Arrays is an enumerable, so materialising it per
+                // row would allocate one list per row on a path whose whole point is many rows.
+                var columns = batch.Arrays.ToList();
+                var fields = batch.Schema.FieldsList;
+                for (int r = 0; r < batch.Length; r++)
+                {
+                    // ⚠ The cells are read EAGERLY rather than holding the batch, because the batch is
+                    // disposed at the end of this block while the rows live for the whole render.
+                    // ⚠ MEASURED, and NOT the silent native use-after-free class this project usually warns
+                    // about: Apache.Arrow nulls a disposed RecordBatch's arrays, so holding it fails LOUDLY
+                    // with a NullReferenceException on the first cell read, deterministically and on every
+                    // platform. Mutation-tested — it dies at the very first query() assertion.
+                    rows.Add(new DictionaryValue(new EagerRow(fields, columns, r)));
+                }
+            }
+        }
+        return new ArrayValue(rows);
+    }
+
+    /// <summary>
+    /// Refuses <paramref name="sql"/> unless DuckDB's own parser can serialize it, which it does for the
+    /// SELECT family and nothing else.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// ⚠⚠ <b>The classifier is <c>json_serialize_sql</c>, i.e. THE ENGINE'S OWN PARSER, and the SQL crosses
+    /// as a BOUND PARAMETER.</b> Two cheaper-looking mechanisms were measured and both are broken:
+    /// </para>
+    /// <list type="bullet">
+    /// <item>A prefix check (<c>starts with SELECT/WITH</c>) waves through
+    /// <c>WITH x AS (SELECT 1) INSERT INTO t SELECT * FROM x</c> — a write that begins with WITH.</item>
+    /// <item>Wrapping as <c>SELECT * FROM (&lt;sql&gt;)</c> refuses the honest non-SELECT and is defeated by
+    /// the adversarial one: MEASURED, <c>SELECT 1) ; INSERT INTO t VALUES (99); SELECT * FROM (SELECT 2</c>
+    /// performed the insert, and a <c>DROP TABLE</c> variant dropped the table. It is string concatenation,
+    /// so it has an escape by construction.</item>
+    /// </list>
+    /// <para>
+    /// The serializer refuses multi-statement input too, so <c>SELECT 1; INSERT …</c> cannot slip past, and
+    /// it PARSES ONLY — measured, a table's row count is unchanged by classifying a DELETE against it.
+    /// </para>
+    /// <para>
+    /// ⚠ <b>The cost, stated rather than hidden: it also refuses some READ-ONLY statements.</b> <c>PIVOT</c>
+    /// and <c>EXPLAIN</c> are not serializable, and for PIVOT that holds even wrapped in a subquery, where
+    /// it would otherwise execute. <c>DESCRIBE</c>, <c>SUMMARIZE</c>, <c>VALUES</c>, <c>TABLE t</c>,
+    /// <c>FROM t</c>, CTEs and set operations all pass. Being conservative in this direction is the correct
+    /// trade: the alternative admits writes.
+    /// </para>
+    /// <para>
+    /// ⚠ If the classification itself cannot run — <c>json</c> unavailable, host unreachable — the statement
+    /// is REFUSED, not waved through. An unenforceable check must fail closed.
+    /// </para>
+    /// </remarks>
+    private static void RefuseUnlessSelect(string caller, string sql,
+                                           Func<string, RecordBatch?, IArrowArrayStream> run)
+    {
+        const string classify =
+            "SELECT j ->> 'error' AS err, j ->> 'error_message' AS msg "
+            // ⚠ The cast is REQUIRED, not defensive: a bare `?` has no type at bind, so DuckDB cannot
+            // resolve the overload and answers "json_serialize_sql first argument must be a VARCHAR" -
+            // which arrives as a REFUSAL, since an unenforceable check fails closed.
+            + "FROM (SELECT json_serialize_sql(?::VARCHAR) AS j)";
+
+        string? err;
+        string? msg;
+        try
+        {
+            var field = new Field("sql", Apache.Arrow.Types.StringType.Default, nullable: false);
+            var schema = new Schema(new[] { field }, null);
+            var arg = new StringArray.Builder().Append(sql).Build();
+            using var parameters = new RecordBatch(schema, new IArrowArray[] { arg }, 1);
+            using var stream = run(classify, parameters);
+            var batch = stream.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult();
+            if (batch is null || batch.Length == 0)
+            {
+                throw new InvalidOperationException("the classifier returned no row");
+            }
+            using (batch)
+            {
+                err = ((StringArray)batch.Column(0)).GetString(0);
+                msg = batch.Column(1) is StringArray m && !m.IsNull(0) ? m.GetString(0) : null;
+            }
+        }
+        catch (Exception ex)
+        {
+            throw new InvalidOperationException(
+                $"{caller}: {FunctionName}() could not establish that the statement is a SELECT, so it was "
+                + $"refused rather than run: {ex.Message}", ex);
+        }
+
+        if (string.Equals(err, "false", StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        // ⚠ The engine's own message is surfaced verbatim, because it distinguishes the two causes this
+        // check would otherwise conflate: "Only SELECT statements can be serialized to json!" (a non-SELECT)
+        // and a real syntax error such as `syntax error at or near "SELEC"`. Reporting "not a SELECT" for a
+        // typo would send the author looking in the wrong place.
+        throw new InvalidOperationException(
+            $"{caller}: {FunctionName}() runs SELECT statements only, and this one was refused by DuckDB's "
+            + $"parser: {msg ?? "(no message)"}. A template is rendered while a statement is being BOUND, "
+            + "and a bind repeats and happens without execution — so a write here would fire on EXPLAIN.");
+    }
+}
+
+/// <summary>
+/// A result row whose cells were read EAGERLY, so it outlives the <see cref="RecordBatch"/> they came from.
+/// </summary>
+/// <remarks>
+/// ⚠ It exists because the batches are disposed as the result is consumed, while the rows live for the whole
+/// render. It keeps <see cref="ArrowStruct"/>'s lookup rule — name first, then an int-parse ORDINAL, and
+/// FALSE for an unknown member so Fluid can still answer <c>.size</c> — by building itself FROM one.
+/// </remarks>
+internal sealed class EagerRow : IFluidIndexable
+{
+    private readonly List<KeyValuePair<string, FluidValue>> _cells = new();
+
+    internal EagerRow(IReadOnlyList<Field> fields, IReadOnlyList<IArrowArray> columns, int row)
+    {
+        var source = new ArrowStruct(fields, columns, row);
+        foreach (var name in source.Keys)
+        {
+            _cells.Add(new KeyValuePair<string, FluidValue>(
+                name, source.TryGetValue(name, out var v) ? v : NilValue.Instance));
+        }
+    }
+
+    public int Count => _cells.Count;
+
+    public IEnumerable<string> Keys => _cells.Select(c => c.Key);
+
+    public bool TryGetValue(string name, out FluidValue value)
+    {
+        for (int i = 0; i < _cells.Count; i++)
+        {
+            if (string.Equals(_cells[i].Key, name, StringComparison.Ordinal))
+            {
+                value = _cells[i].Value;
+                return true;
+            }
+        }
+        // ⚠ Fluid resolves `r[0]` by asking for the KEY "0", so an int-parse fallback IS index access — the
+        // same rule ArrowStruct documents. A column genuinely named "0" wins, which is the right precedence.
+        if (int.TryParse(name, out var ordinal) && ordinal >= 0 && ordinal < _cells.Count)
+        {
+            value = _cells[ordinal].Value;
+            return true;
+        }
+        value = NilValue.Instance;
+        return false;
+    }
+}

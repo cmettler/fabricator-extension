@@ -4,6 +4,7 @@
 
 using System.Collections.Concurrent;
 using Fluid;
+using Fluid.Values;
 
 namespace Fabricator.FluidPlugin;
 
@@ -15,7 +16,10 @@ namespace Fabricator.FluidPlugin;
 /// </summary>
 internal static class FluidEngine
 {
-    private static readonly FluidParser Parser = new();
+    // ⚠ AllowFunctions is OFF in Fluid by default and is a PARSER-level gate: without it `query('…')` is a
+    // PARSE error ("Functions are not allowed"), not a missing-function error at render. It is enabled
+    // because slice 3 ships `query`; nothing else in this plugin needs it.
+    private static readonly FluidParser Parser = new(new FluidParserOptions { AllowFunctions = true });
     private static readonly ConcurrentDictionary<string, IFluidTemplate> Cache = new();
 
     /// <summary>Parses (or reuses) <paramref name="template"/> and renders it over a fresh context.</summary>
@@ -31,6 +35,10 @@ internal static class FluidEngine
             return t;
         });
         var ctx = FluidValueModel.NewContext();
+        // ⚠ Registered PER CONTEXT, and `caller` is captured so a refusal names the SQL function the user
+        // actually called rather than the template machinery.
+        ctx.SetValue(FluidHostQuery.FunctionName,
+                     new FunctionValue((args, c) => FluidHostQuery.Execute(caller, args, c)));
         bind(ctx);
         return parsed.Render(ctx);
     }

@@ -131,7 +131,7 @@ The original framing was:
 |---|---|---|
 | **1** ✅ | `fluid_query` + **the value model**: the `ValueConverters` mapping, and the Arrow→`FluidValue` wrapping (`ArrowStruct : IFluidIndexable`, name AND index access, nested list → enumerable). BUILT — see §7 | Slices 3 and 5 both reuse the value model, so it was built ONCE here. Needed no new ABI and no new seam, exactly as §2 predicted |
 | **2** ✅ | **Probe** bind-time `host_query` (§3) — DONE, see §8 | One measurement; it came back PERMISSIVE, and added a SELECT-only refusal to slice 3's scope |
-| **3** | `HostQueryTransport` seam in Abstractions + the Fluid `query` function | Needs 1's row wrapping and 2's verdict |
+| **3** ✅ | `HostQueryTransport` seam in Abstractions + the Fluid `query` function. BUILT — see §9 | Needs 1's row wrapping and 2's verdict |
 | **4** | `ITemplateFileProvider` over a host-FS seam (§1.3) | Independent of 3; same seam pattern |
 | **5** | Dynamic DuckDB function/macro resolution from Fluid (§1.4) | Largest and least specified; scope it DOWN once 1–3 exist |
 
@@ -548,3 +548,148 @@ then the write has happened.
 - **Slice 5** (dynamic DuckDB function resolution) inherits the same verdict — it is the same re-entry.
 - ⚠ Slice 3 still needs the `HostQueryTransport` seam of §2 regardless: this probe reached `Host.Query`
   because it lived in a first-party assembly. The plugin still cannot.
+
+## 9. Slice 3 AS BUILT (2026-09-01) — `HostQueryTransport` + the Fluid `query` function
+
+C#-only. **NO ABI change, NO C++ change** — because the seam is a delegate in the contract assembly that
+the bridge fills in at boot, which is §2's prediction paying out a second time. Gate
+`verify_plugin_fluid` **93 → 131**, four mutants each killed at its own assertion.
+
+```liquid
+{% assign rs = query("SELECT id, nm FROM people ORDER BY id") %}
+{% for r in rs %}{{ r.nm }} is {{ r.id }} / {{ r[0] }}{% endfor %} ({{ rs.size }} rows)
+```
+
+### 9.1 The seam — `Fabricator.Abstractions/HostQueryTransport.cs`
+
+`HostHttpTransport`'s shape, copied deliberately including its rules: one static delegate
+`Func<string, RecordBatch?, IArrowArrayStream>? Query`, declared in Abstractions and assigned by
+`Bootstrap` beside the HTTP one. A plugin reaches `host_query` with the reference it already has.
+
+- **⚠ It carries no opener**, for the reason that seam records: `Host.Query` reads the AMBIENT
+  `ClientContext` per call, and a captured one dangles the day its connection closes.
+- **It carries the PARAMETERISED overload, and that is not a convenience.** The refusal below classifies
+  arbitrary user SQL; passing it as a bound VALUE rather than concatenating it into SQL text is the whole
+  defence. A seam offering only `Query(sql)` would have forced the security-critical path to hand-escape.
+- **⚠ THAT OVERLOAD HAD NO IN-TREE CALLER UNTIL NOW** (user-raised, 2026-09-01) — every existing caller uses
+  the bare form or the named-Arrow-`inputs` form — so slice 3's classifier is its first consumer and the
+  first thing to gate it. What it does, read from `fabricator_host_query.cpp`: with `params` the host runs
+  `conn->Prepare(sql)` then `prepared->Execute(values)`, i.e. a REAL prepared statement, binding **one Arrow
+  COLUMN per parameter, positionally**, against `?` / `$1`. Four edges worth knowing:
+  - only **row 0** is read (`GetValue(c, 0)`); a batch with more rows is silently ignored, not refused;
+  - an **empty batch binds all-NULL** rather than erroring (`chunk.size() > 0 ? … : Value()`);
+  - ⚠ **passing parameters restricts you to ONE statement**, because the no-params branch is `SendQuery`
+    (which accepts several) and this one is `Prepare` (which does not) — the same asymmetry that forced
+    `fabricator_host_query`'s documented fallback and motivated `fabricator_host_exec`;
+  - ⚠ an **untyped `?` may fail overload resolution** — see the cast note in §9.2.
+
+### 9.2 ⚠⚠ THE SELECT-ONLY REFUSAL — the classifier is DuckDB's OWN PARSER, and the two obvious mechanisms are BOTH BROKEN
+
+§8.3 required the refusal and said it must key on the STATEMENT KIND before execution. What it did not say
+is how, and the two mechanisms anyone would reach for first were MEASURED and both fail:
+
+| candidate | verdict |
+|---|---|
+| prefix check (`starts with SELECT`/`WITH`) | **admits writes** — `WITH x AS (SELECT 1) INSERT INTO t SELECT * FROM x` begins with `WITH` |
+| wrap as `SELECT * FROM (<sql>)` | **injectable** — it is string concatenation, so it has an escape by construction |
+
+**⚠⚠ The wrap deserves its own line because it LOOKS airtight and its failure is silent.** Measured, it
+refuses every honest non-SELECT (INSERT/DELETE/UPDATE/CREATE/DROP/ATTACH/COPY/PRAGMA/SET all raise a
+Parser Error with the target table's row count unchanged) — and then:
+
+- `SELECT 1) ; INSERT INTO aud VALUES (99); SELECT * FROM (SELECT 2` — **not refused, and the row landed.**
+- `SELECT 1) ; DROP TABLE aud; --` — **the table was dropped.**
+
+A mechanism that refuses the accident and admits the attack is worse than none, because it reads as a
+defence.
+
+**What ships is `json_serialize_sql`, with the SQL as a BOUND PARAMETER.** DuckDB's own parser decides, and
+it announces the rule itself: *"Only SELECT statements can be serialized to json!"*. Measured, it refuses
+both escapes above, refuses multi-statement input, refuses the `WITH …INSERT` shape — and **parses only**:
+a target table's row count is unchanged by classifying a `DELETE` against it.
+
+- **⚠ The cast is REQUIRED**: `json_serialize_sql(?)` cannot resolve its overload from an untyped
+  parameter, and answers *"first argument must be a VARCHAR"*. It is `?::VARCHAR`. Found by running it —
+  and it arrived as a REFUSAL rather than as a crash, which is the fail-closed rule working before it was
+  ever deliberately tested.
+- **⚠ An EMPTY string classifies as NO ERROR**, because it parses to zero statements — so the classifier
+  ALONE would wave it through. Guarded separately, before the classifier, where the cause can be named.
+- **⚠ The engine's own message is surfaced verbatim**, because the check conflates two causes otherwise: a
+  non-SELECT and a real syntax error (`syntax error at or near "SELEC"`). Reporting "not a SELECT" for a
+  typo sends the author looking in the wrong place.
+- **⚠ It FAILS CLOSED.** If the classification itself cannot run — `json` unavailable, host unreachable —
+  the statement is REFUSED, not run. An unenforceable check must fail closed.
+
+**⚠ THE COST, stated rather than hidden: some READ-ONLY statements are refused too.** `PIVOT` and `EXPLAIN`
+are not serializable — and for `PIVOT` that holds even wrapped in a subquery, where it would otherwise
+execute, so it is unreachable through `query()` in any spelling. `DESCRIBE`, `SUMMARIZE`, `VALUES`,
+`TABLE t`, `FROM t`, CTEs and set operations all pass. Being conservative in this direction is the correct
+trade: the alternative admits writes. The workaround is a view defined outside the template.
+
+### 9.3 The payoff, and it is the thing slice 2 was run to permit
+
+A template can ask the database what SQL to generate, **at bind time** — MEASURED, the output SCHEMA of a
+statement decided by rows read during `bind_replace`:
+
+```sql
+SELECT * FROM fluid_query('SELECT {% assign rs = query("SELECT nm FROM cols ORDER BY ord") %}
+  {% for r in rs %}{{ r.nm | sql }} AS {{ r.nm | sql_ident }}{% unless forloop.last %}, {% endunless %}{% endfor %}');
+-- columns: alpha, beta  — names that exist only in `cols`
+```
+
+### 9.4 ⚠ THE GATE IS A PAIR, AND NEITHER HALF ALONE SAYS ANYTHING
+
+The refusal is asserted at the sharpest point §8.3 identified — `EXPLAIN` of a statement that never
+executes — and "the write did not happen" is **equally true of a build where bind-time `query()` had
+stopped working altogether**. So a POSITIVE CONTROL sits immediately above it: an `EXPLAIN` whose plan
+carries column names that could only have come from a bind-time read. Measured, both fire.
+
+⚠ It uses the `<REGEX>:` form on the `physical_plan` row, because **`EXPLAIN` cannot be a subquery source**
+— the convention this suite already used a few sections up, and which I re-derived the hard way.
+
+### 9.5 Rows reuse slice 1's value model, as §6 required — one type, one lookup rule
+
+`ArrowStruct` gained a `RecordBatch` constructor rather than growing a sibling, so a result row and a
+STRUCT cell resolve members through the same rule: name first, then an int-parse ORDINAL (Fluid asks for
+the key `"0"` when it sees `r[0]`), and FALSE for an unknown member so Fluid can still answer `.size`.
+Arithmetic and comparison work on query results because it is the same model §7.1 was built around.
+
+- **⚠ Cells are read EAGERLY into a row, not lazily from the batch.** The batches are disposed as the
+  result is consumed while the rows live for the whole render. ⚠ MEASURED, and it is **NOT** the silent
+  native use-after-free class this project usually warns about: Apache.Arrow nulls a disposed
+  `RecordBatch`'s arrays, so holding one fails LOUDLY with a `NullReferenceException` on the first cell
+  read, deterministically. My first code comment claimed the silent class and was wrong — the mutant is
+  what corrected it.
+- **⚠ A row cap that ERRORS, at 1,000,000.** Rows are fully materialised because a template may iterate
+  them any number of times, so there is no streaming form to fall back to. It errors rather than
+  truncating: a silent truncation is a wrong ANSWER, where the cap only turns an out-of-memory into a
+  sentence. Not knob-controlled yet; make it one if anyone hits it.
+
+### 9.6 ⚠ `AllowFunctions` is OFF in Fluid by default, and it is a PARSER-level gate
+
+Without `new FluidParser(new FluidParserOptions { AllowFunctions = true })`, `query('…')` is a PARSE error
+(*"Functions are not allowed"*) rather than a missing function at render — so the failure appears one layer
+away from its cause. Enabled for the whole plugin, since `query` is the only function it ships.
+
+### 9.7 ⚠ `require json` is LOAD-BEARING in the suite, not hygiene
+
+The classifier is `json_serialize_sql`, and `unittest` does NOT auto-load extensions the way the shell
+does. Without the directive every `query()` call is refused — the check fails closed — and the section
+would read as a broken feature rather than a missing REQUIRE. That is this file's own recorded trap in
+both directions, and it is why the directive carries a comment saying so.
+
+### 9.8 Transaction visibility, gated with its control
+
+§8.2's measurement is now pinned: inside `BEGIN; INSERT …;` the statement's own scan sees the uncommitted
+row and `query()` does not; after `COMMIT` it does. The post-commit assertion is what makes the middle one
+a visibility result rather than a broken read.
+
+### 9.9 What slice 3 leaves
+
+- **§1.4 (DuckDB functions callable from inside Fluid) should be RE-DERIVED, not inherited.** §6 already
+  flagged this, and slice 3 strengthens it: a template that can run SQL can already call any DuckDB
+  function through `query()`. The remaining case for §1.4 is ergonomic, not capability.
+- **Slice 4 (`ITemplateFileProvider`) needs the same seam shape for `HostFs`** — `HostQueryTransport` is
+  now a second worked example of it, and the two should look alike.
+- ⚠ The seam is deliberately NOT exposed as a SQL function; it is a plugin-facing capability.
+  `fabricator_host_query` remains the SQL surface and is unchanged by this slice.

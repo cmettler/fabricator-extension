@@ -406,14 +406,25 @@ internal static class FluidValueModel
 /// </remarks>
 internal sealed class ArrowStruct : IFluidIndexable
 {
-    private readonly StructArray _array;
+    private readonly IReadOnlyList<IArrowArray> _columns;
     private readonly IReadOnlyList<Field> _fields;
     private readonly int _row;
 
     internal ArrowStruct(StructArray array, int row)
+        : this(((StructType)array.Data.DataType).Fields, array.Fields, row)
     {
-        _array = array;
-        _fields = ((StructType)array.Data.DataType).Fields;
+    }
+
+    /// <summary>
+    /// The shared form, and what makes a QUERY RESULT row (slice 3) the SAME type with the SAME lookup rule
+    /// as a STRUCT cell — which is what docs/fluid-templating.md §6 settled: one type, not two.
+    /// </summary>
+    /// <remarks>⚠ <paramref name="columns"/> is hoisted by the caller on the row-per-batch path, so a large
+    /// result does not allocate one list per row.</remarks>
+    internal ArrowStruct(IReadOnlyList<Field> fields, IReadOnlyList<IArrowArray> columns, int row)
+    {
+        _fields = fields;
+        _columns = columns;
         _row = row;
     }
 
@@ -443,7 +454,7 @@ internal sealed class ArrowStruct : IFluidIndexable
             value = NilValue.Instance;
             return false;
         }
-        var cell = FluidValueModel.ReadCell(_array.Fields[i], _row);
+        var cell = FluidValueModel.ReadCell(_columns[i], _row);
         value = cell is null ? NilValue.Instance : FluidValue.Create(cell, FluidValueModel.Options);
         return true;
     }

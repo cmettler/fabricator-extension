@@ -48,6 +48,10 @@ public static unsafe class Bootstrap
             // that attached it, so a held ClientContext* would dangle.
             HostHttpTransport.Send = (method, url, headers, body) =>
                 HostFs.HttpRequest(AmbientOpener.Current, method, url, headers, body);
+            // Fill in the contract assembly's host_query seam, so a plugin can run SQL on the hosting DuckDB
+            // with the Abstractions reference alone. Same rule as the HTTP seam above and for the same
+            // reason: the ambient is read per call by Host.Query, never captured here.
+            HostQueryTransport.Query = (sql, parameters) => Host.Query(sql, parameters, null);
             // Forward ILogger output into DuckDB's internal logging (duckdb_logs) when the host provides host_log.
             // The file sink (FABRICATOR_LOG_LEVEL/_FILE) stays independent; this adds the engine-log route.
             if (HostFs.CanLog)

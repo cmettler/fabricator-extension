@@ -1357,6 +1357,49 @@ The bag can come from SQL rather than a literal — `params := ?` in a prepared 
 every `EXECUTE`, so the template is re-rendered and even the **column list may differ between two executes of
 one prepared statement**), or `params := {'cols': getvariable('cols')}` to drive it from a session variable.
 
+**A template can read from the database.** `query(sql)` runs a `SELECT` on the DuckDB you are already
+connected to and hands the template its rows, addressable by name, by index and by `.size`:
+
+```sql
+SELECT fabricator_render(
+  '{% assign rs = query("SELECT region, sum(amt) AS total FROM orders GROUP BY region ORDER BY region") %}
+   {% for r in rs %}{{ r.region }}={{ r.total }} {% endfor %}', NULL);
+-- eu=15 us=25
+```
+
+Inside `fluid_query` this runs while the statement is being **bound**, so the database can decide what the
+generated SQL — and therefore the result's own column list — should be:
+
+```sql
+CREATE TABLE wanted AS SELECT * FROM (VALUES ('region',1),('amt',2)) v(col,ord);
+
+SELECT * FROM fluid_query(
+  'SELECT {% assign rs = query("SELECT col FROM wanted ORDER BY ord") %}
+   {% for r in rs %}{{ r.col | sql_ident }}{% unless forloop.last %}, {% endunless %}{% endfor %}
+   FROM orders ORDER BY amt');
+-- columns: region, amt
+```
+
+> ⚠ **`query()` runs `SELECT` statements only, and this is not a policy you can turn off.** A template is
+> rendered while a statement is being *bound*, and binding repeats and happens without executing — so a
+> write here would fire on an `EXPLAIN` of a statement that never runs, and again every time a view over it
+> is used. Anything else is refused before it runs, by DuckDB's own parser:
+>
+> ```sql
+> SELECT fabricator_render('{% assign r = query("DELETE FROM orders") %}x', NULL);
+> -- Error: query() runs SELECT statements only ... Only SELECT statements can be serialized to json!
+> ```
+>
+> `WITH`-prefixed writes, multi-statement strings and `COPY … TO` are refused too. `DESCRIBE`, `SUMMARIZE`,
+> `VALUES`, `TABLE t`, `FROM t`, CTEs and set operations all work; **`PIVOT` and `EXPLAIN` are refused**
+> although they are read-only — define a view outside the template if you need them. Use
+> [`fabricator_host_exec`](#fabricator_host_execsql---tableaffected-bigint) for statements that write.
+
+> ⚠ **`query()` reads COMMITTED data.** It runs on its own connection, so inside an explicit transaction it
+> does **not** see that transaction's uncommitted rows — a template cannot observe the writes of the
+> statement running it. Rows are held in memory (a template may loop over them repeatedly), and a result
+> above one million rows is refused rather than truncated.
+
 Liquid control flow (`{% if %}`, `{% for %}`) works, comparisons and arithmetic filters work on numbers from
 either kind of bag, and nested `STRUCT`/`MAP`/`LIST` members are reachable by name, by index and by `.size`.
 Fluid is secure-by-default: only the variables you pass are reachable, and apart from the two SQL filters

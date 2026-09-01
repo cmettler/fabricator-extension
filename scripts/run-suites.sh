@@ -744,7 +744,12 @@ case "$TIER" in
         # verify_global_functions plus the plugin-loaded, no-rejection, single-registration and parse-error
         # ones the move itself makes assertable). 3069 + 20 = 3089 exactly, which is what shows no other
         # suite moved. The 3069 note it supersedes:
-        : "${MIN_ASSERTIONS:=3162}"
+        # 3200 since 2026-09-01: verify_plugin_fluid 93 -> 131 for SLICE 3 -- the Fluid `query(sql)`
+        # function over the new HostQueryTransport seam, and above all its SELECT-only refusal, which is a
+        # CORRECTNESS requirement rather than a policy (a template may render at BIND, and a bind-time write
+        # fires on EXPLAIN of a statement that never runs). 3162 + 38 = 3200 exactly, from a green run,
+        # which is what shows no other suite moved. The 3162 note it supersedes:
+        : "${MIN_ASSERTIONS:=3200}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

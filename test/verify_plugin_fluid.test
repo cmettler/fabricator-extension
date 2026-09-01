@@ -656,3 +656,233 @@ query I
 SELECT fabricator_render('{{ b }}', {'b': 'ab'::BLOB});
 ----
 6162
+
+# ============================================================================================
+# SLICE 3 — the Fluid `query(sql)` function, running SQL on the hosting DuckDB through the
+# HostQueryTransport seam. See docs/fluid-templating.md §9.
+#
+# ⚠⚠ `require json` IS LOAD-BEARING, NOT HYGIENE. The SELECT-only refusal below classifies with
+# `json_serialize_sql`, i.e. DuckDB's own parser. `unittest` does NOT auto-load extensions (unlike the
+# shell), so without this every query() call would be REFUSED — the check fails closed — and the whole
+# section would read as a broken feature rather than a missing REQUIRE. That is this repo's own recorded
+# trap in both directions: a missing require presenting as a missing feature, and a require for something
+# not compiled in SKIPPING silently.
+require json
+
+statement ok
+CREATE TABLE fq_people AS SELECT * FROM (VALUES (1,'ada'),(2,'bob'),(3,'cy')) v(id,nm);
+
+# ---- the basic shape: rows addressed by NAME, by ORDINAL, and counted --------------------------------
+# ⚠ Name and ordinal go through ONE lookup rule (docs/fluid-templating.md §6 settled that in slice 1):
+# Fluid resolves `r[1]` by asking for the KEY "1", so an int-parse fallback IS index access.
+query I
+SELECT fabricator_render('{% assign rs = query("SELECT id, nm FROM fq_people ORDER BY id") %}{% for r in rs %}[{{ r.id }}:{{ r.nm }}:{{ r[1] }}]{% endfor %} n={{ rs.size }}', NULL);
+----
+[1:ada:ada][2:bob:bob][3:cy:cy] n=3
+
+# An empty result is an empty array, not an error or a nil.
+query I
+SELECT fabricator_render('{% assign rs = query("SELECT id FROM fq_people WHERE id > 99") %}n={{ rs.size }}', NULL);
+----
+n=0
+
+# A NULL cell renders empty and is FALSY, the same as everywhere else in this plugin.
+query I
+SELECT fabricator_render('{% assign rs = query("SELECT NULL AS v") %}{% for r in rs %}[{{ r.v }}]{% if r.v %}T{% else %}F{% endif %}{% endfor %}', NULL);
+----
+[]F
+
+# ⚠ An unknown column returns FALSE from TryGetValue rather than a nil value, which is what lets Fluid
+# answer `.size` itself — the rule ArrowStruct documents and EagerRow had to keep.
+query I
+SELECT fabricator_render('{% assign rs = query("SELECT 1 AS a") %}{% for r in rs %}[{{ r.nosuch }}][{{ r.size }}]{% endfor %}', NULL);
+----
+[][1]
+
+# The value model is the SAME one slice 1 built, so arithmetic and comparison work on query results too —
+# which is the property §7.1 showed a render-only assertion cannot see.
+query I
+SELECT fabricator_render('{% assign rs = query("SELECT 19.99::DECIMAL(9,2) AS m, 3 AS i") %}{% for r in rs %}{{ r.m | plus: 1 }}|{% if r.i > 1 %}GT{% else %}LE{% endif %}{% endfor %}', NULL);
+----
+20.99|GT
+
+# ============================================================================================
+# THE POINT OF THE SLICE: a template asks the DATABASE what SQL to generate, at BIND time.
+#
+# This is the shape §3 worried about and §8 measured safe — a host query executed inside `bind_replace`,
+# during the binder's own walk. The output SCHEMA of the statement is decided by rows read at bind.
+# ============================================================================================
+
+statement ok
+CREATE TABLE fq_cols AS SELECT * FROM (VALUES ('alpha',1),('beta',2)) v(nm,ord);
+
+query II
+SELECT * FROM fluid_query('SELECT {% assign rs = query("SELECT nm FROM fq_cols ORDER BY ord") %}{% for r in rs %}{{ r.nm | sql }} AS {{ r.nm | sql_ident }}{% unless forloop.last %}, {% endunless %}{% endfor %}');
+----
+alpha	beta
+
+# ⚠ The COLUMN NAMES are the assertion, not the values: they can only have come from the bind-time read.
+query II
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM fluid_query('SELECT {% assign rs = query("SELECT nm FROM fq_cols ORDER BY ord") %}{% for r in rs %}1 AS {{ r.nm | sql_ident }}{% unless forloop.last %}, {% endunless %}{% endfor %}')) ORDER BY column_name;
+----
+alpha	INTEGER
+beta	INTEGER
+
+# ============================================================================================
+# ⚠⚠ THE REFUSAL, AND ITS POSITIVE CONTROL — the pair is the gate, neither half alone.
+#
+# §8.3 MEASURED that a bind-time write fires on EXPLAIN of a statement that never executes. So the refusal
+# has to hold exactly there. But "the write did not happen" is ALSO true of a build where bind-time query()
+# had stopped working altogether — the vacuous-pass shape — so the control below establishes that binds
+# really do fire here before the refusal is asserted.
+# ============================================================================================
+
+statement ok
+CREATE TABLE fq_audit AS SELECT 1 AS n;
+
+# POSITIVE CONTROL: EXPLAIN of a NEVER-EXECUTED statement still binds, and the bind's query() really runs —
+# proven by the plan carrying column names that exist only in fq_cols.
+# ⚠ The `<REGEX>:` form on the physical_plan row, because EXPLAIN cannot be a subquery source
+# (Parser Error) — the convention this suite already uses a few sections up.
+query II
+EXPLAIN SELECT * FROM fluid_query('SELECT {% assign rs = query("SELECT nm FROM fq_cols ORDER BY ord") %}{% for r in rs %}1 AS {{ r.nm | sql_ident }}{% unless forloop.last %}, {% endunless %}{% endfor %}');
+----
+physical_plan	<REGEX>:.*alpha.*beta.*
+
+# ...and in that same position a WRITE is refused.
+statement error
+EXPLAIN SELECT * FROM fluid_query('SELECT 1 AS x {% assign r = query("INSERT INTO fq_audit VALUES (99)") %}');
+----
+runs SELECT statements only
+
+# NOTHING WAS WRITTEN. Read together with the control above, this says the refusal fired rather than the
+# mechanism being absent.
+query I
+SELECT count(*) FROM fq_audit;
+----
+1
+
+# ============================================================================================
+# EVERY REFUSAL CLASS, and each one is a shape a cheaper classifier gets wrong.
+# ⚠ The classifier is `json_serialize_sql` — DuckDB's OWN parser — with the SQL crossing as a BOUND
+# PARAMETER. Two cheaper mechanisms were measured and both are broken; see FluidHostQuery.cs.
+# ============================================================================================
+
+# A plain write.
+statement error
+SELECT fabricator_render('{% assign r = query("INSERT INTO fq_audit VALUES (99)") %}x', NULL);
+----
+runs SELECT statements only
+
+# ⚠ A write that BEGINS WITH `WITH` — the shape a prefix check ("starts with SELECT or WITH") waves through.
+statement error
+SELECT fabricator_render('{% assign r = query("WITH x AS (SELECT 99) INSERT INTO fq_audit SELECT * FROM x") %}x', NULL);
+----
+runs SELECT statements only
+
+# ⚠⚠ THE INJECTION ESCAPE that defeats a `SELECT * FROM (<sql>)` wrap. MEASURED against that wrap, this
+# exact string performed the INSERT; a DROP TABLE variant dropped the table. String concatenation has an
+# escape by construction, which is why the classifier takes the SQL as a VALUE instead.
+statement error
+SELECT fabricator_render('{% assign r = query("SELECT 1) ; INSERT INTO fq_audit VALUES (99); SELECT * FROM (SELECT 2") %}x', NULL);
+----
+runs SELECT statements only
+
+# Multi-statement input, which the serializer refuses as a whole.
+statement error
+SELECT fabricator_render('{% assign r = query("SELECT 1; INSERT INTO fq_audit VALUES (99)") %}x', NULL);
+----
+runs SELECT statements only
+
+statement error
+SELECT fabricator_render('{% assign r = query("DROP TABLE fq_audit") %}x', NULL);
+----
+runs SELECT statements only
+
+statement error
+SELECT fabricator_render('{% assign r = query("COPY fq_audit TO ''/tmp/fq_should_not_exist.csv''") %}x', NULL);
+----
+runs SELECT statements only
+
+# ⚠ A SYNTAX error surfaces the ENGINE'S OWN message rather than "not a SELECT" — the two causes are
+# different and reporting the wrong one sends the author looking in the wrong place.
+statement error
+SELECT fabricator_render('{% assign r = query("SELEC 1") %}x', NULL);
+----
+syntax error
+
+# ⚠ MEASURED: json_serialize_sql('') reports NO error, because an empty string parses to zero statements —
+# so the classifier alone would wave it through. It is refused before reaching the classifier.
+statement error
+SELECT fabricator_render('{% assign r = query("") %}x', NULL);
+----
+empty statement
+
+# NOT ONE of the statements above ran.
+query I
+SELECT count(*) FROM fq_audit;
+----
+1
+
+statement ok
+DROP TABLE IF EXISTS fq_audit;
+
+# ============================================================================================
+# WHAT IS ADMITTED, AND WHAT IS REFUSED THOUGH READ-ONLY — the cost stated rather than hidden.
+# ============================================================================================
+
+# The SELECT family, including DuckDB's own shorthands.
+query I
+SELECT fabricator_render('{% assign a = query("VALUES (1),(2)") %}{% assign b = query("TABLE fq_people") %}{% assign c = query("FROM fq_people") %}{% assign d = query("WITH x AS (SELECT 1 AS v) SELECT * FROM x") %}{% assign e = query("SELECT 1 UNION ALL SELECT 2") %}{{ a.size }}{{ b.size }}{{ c.size }}{{ d.size }}{{ e.size }}', NULL);
+----
+23312
+
+# ⚠ THE COST: PIVOT is READ-ONLY and is REFUSED, because json_serialize_sql cannot serialize it — and that
+# holds even wrapped in a subquery, where it would otherwise execute. Being conservative in this direction
+# is the correct trade, since the alternative admits writes. Pinned so the cost is visible rather than
+# discovered.
+statement error
+SELECT fabricator_render('{% assign r = query("PIVOT fq_people ON nm USING sum(id)") %}x', NULL);
+----
+runs SELECT statements only
+
+# SUMMARIZE and DESCRIBE, by contrast, ARE serializable and pass — so the refusal is not "anything unusual".
+query I
+SELECT fabricator_render('{% assign r = query("DESCRIBE SELECT 1 AS a") %}{{ r.size }}', NULL);
+----
+1
+
+# ============================================================================================
+# ⚠ TRANSACTION VISIBILITY — §8.2, and it is a property of opening a separate connection rather than
+# anything bind introduces. A template cannot observe the writes of the transaction running it.
+# ============================================================================================
+
+statement ok
+CREATE TABLE fq_txn AS SELECT 1 AS n;
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO fq_txn VALUES (2);
+
+# The statement's OWN scan sees the uncommitted row...
+query I
+SELECT count(*) FROM fq_txn;
+----
+2
+
+# ...and query(), on its own connection, does not.
+query I
+SELECT fabricator_render('{% assign r = query("SELECT n FROM fq_txn") %}{{ r.size }}', NULL);
+----
+1
+
+statement ok
+COMMIT;
+
+# After COMMIT it does — which is what makes the row above a visibility result rather than a broken read.
+query I
+SELECT fabricator_render('{% assign r = query("SELECT n FROM fq_txn") %}{{ r.size }}', NULL);
+----
+2
