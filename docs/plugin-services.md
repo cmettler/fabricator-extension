@@ -1,0 +1,201 @@
+# Plugin services — replacing the ad-hoc seams with a resolvable service surface
+
+> **Status: ANALYSIS IN PROGRESS, nothing built (opened 2026-09-02).** User-directed:
+> *"we should improve the use of fabricator.bridge/abstraction functionalities in plugins. reflection hack is
+> not so nice. something like a `GetService<IHttpClientxx>()` would be nice. in a similar way what dependency
+> injection does. Maybe this way a plugin expose a singleton which could be used by another plugin."*
+>
+> This file is the working record so the analysis can continue across sessions. Everything in §1 is READ FROM
+> THE TREE or MEASURED and dated; §2 onward is design space, not decisions.
+
+## 1. What is actually there today (read 2026-09-02)
+
+### 1.1 The two assemblies, and why a plugin references only one
+
+| | references | what it holds |
+|---|---|---|
+| `Fabricator.Abstractions` | `Apache.Arrow` only | the 25 contract files: `IBackend`, the function interfaces, `ITable`, `ITransaction`, `ProviderSettings`, `DuckSql`, `ScanSpec`, `DuckDbHttpHandler`, and the two seams below |
+| `Fabricator.Bridge` | Azure.Storage.Files.DataLake, Azure.Identity, Microsoft.Fabric.Api, Apache.Arrow | the ABI, the handle table, `Host`, `HostFs`, `ArrowValueReader`, `InterruptScope`, `FabricatorLog`, `MemoryProbe`, the registry |
+
+**⚠⚠ THE CONSTRAINT IS NOT VISIBILITY — IT IS WEIGHT, and getting this wrong sends the design somewhere
+useless.** `ArrowValueReader`, `Host`, `AmbientOpener`, `AmbientTransaction`, `InterruptScope`,
+`FabricatorLog`, `MemoryProbe`, `InMemoryArrayStream`, `DbDataReaderArrowStream` are **all already `public`
+in `Fabricator.Bridge`** (grepped). A plugin cannot use them because it does not *reference* Bridge, and it
+does not reference Bridge because that would drag the Azure + Fabric package closure into every plugin
+build. `Fabricator.Abstractions` exists to be the light contract.
+
+⇒ **the shape the user asks for is the right one**: interfaces in Abstractions (light), implementations in
+Bridge, resolution by interface.
+
+⚠ `BackendRegistry`'s own comment is STALE about this — *"A plugin references Fabricator.Bridge +
+Apache.Arrow (host-provided, not copied)"*. `Fabricator.FluidPlugin` references **Abstractions only**, and
+`fabricator-sustainalytics` does the same. Fix that comment whenever this area is touched.
+
+### 1.2 The seams that exist, and the fact that there were nearly three
+
+Both are a `static` mutable delegate property on a static class in Abstractions, filled in by
+`Bootstrap.Initialize`:
+
+```csharp
+HostHttpTransport.Send  : Func<string, string, string?, byte[]?, (string ResponseJson, byte[]? Body)>?
+HostQueryTransport.Query: Func<string, RecordBatch?, IArrowArrayStream>?
+```
+
+Each carries `IsAvailable => X is not null`, and each documents the same three rules (read them before
+designing anything — they are the real contract):
+
+1. **The delegate carries no opener, deliberately.** The bridge's lambda reads the AMBIENT `ClientContext`
+   per call. Anything holding an ATTACH-time `ClientContext *` is a dangling pointer the day that connection
+   closes — the `table_stats` SIGSEGV class, paid for twice already.
+2. It is therefore usable only from INSIDE an ABI crossing, or where the ambient still flows from one.
+   `AsyncLocal`, so it survives `await` and `Task.Run`; it does NOT survive a thread parked before the
+   crossing began.
+3. `null` until the bridge boots.
+
+**⚠ A THIRD SEAM WAS WRITTEN AND DELETED ON 2026-09-02** — `HostFileTransport.ReadAllBytes`, for the Fluid
+template file provider. It was deleted because a GLOBAL SCALAR had no ambient opener, so every `fs_*` host
+callback received a null `ClientContext` and the process died; the provider was rebuilt on `read_blob` over
+`HostQueryTransport` instead (docs/fluid-templating.md §10). ABI v82 has since given the scalar crossings
+their context, so the filesystem seam is now *buildable* — and that is the point: **the pattern has been
+reached for three times in about two weeks, which is the argument for generalising it rather than adding a
+fourth static class.**
+
+### 1.3 The reflection, and which of it the user means
+
+Three different things get called "reflection" around here; they are separate problems and only the first
+two are in scope.
+
+| where | what | in scope? |
+|---|---|---|
+| `BackendRegistry.ScanPluginDirectories` | `assembly.GetTypes()` + `typeof(IBackend).IsAssignableFrom` + `Activator.CreateInstance` — plugin DISCOVERY | partly: a service surface does not remove it, but see §4 |
+| a plugin reaching Bridge internals | there is no mechanism, so today it either cannot, or it duplicates code (§1.4) | **yes — this is the ask** |
+| `Bootstrap.FormatError` | `e.GetType().GetProperty("Number")` — duck-typing `SqlException.Number` so Bridge need not reference `Microsoft.Data.SqlClient` | **NO — different problem.** Its answer is already designed: an `IBackend.GetErrorNumber(Exception)` DIM (docs/aot-bridge.md). Do not conflate. |
+
+⚠ Nearly every other `GetProperty(` hit in the tree is `JsonElement.TryGetProperty` — not reflection at all.
+Do not count those.
+
+### 1.4 What the absence costs today, concretely
+
+- `Fabricator.FluidPlugin` carries a local `ArrowScalar.Read` — *"a deliberate superset of
+  `ArrowValueReader.ReadScalar`"* — ~20 lines duplicating a Bridge type that is public but unreachable.
+  `IScalarFunction`'s own doc admits the split: `ArrowValueReader` is available *"if a provider references
+  the bridge"*.
+- A plugin cannot log through `FabricatorLog` (so nothing it does appears in `duckdb_logs`), cannot use
+  `InterruptScope` (so a long plugin operation ignores Ctrl+C), cannot read the host filesystem, cannot
+  register a named Arrow source (`Host.RegisterSource`).
+- `ProviderSettingsStore` IS reachable (it lives in Abstractions) — a useful precedent: the one piece of
+  host state a plugin can already touch, because someone put it on the right side of the line.
+
+### 1.5 Two facts that constrain every option
+
+- **ALL PLUGINS LOAD INTO ONE ALC — the BRIDGE's, not Default** (`BackendRegistry`, with the reason: hostfxr
+  loads the bridge into a non-default context, so a plugin must join it or its `IBackend` is a different,
+  non-assignable type). Per-plugin ALC isolation is DEFERRED (docs/plugin-system.md). ⇒ cross-plugin type
+  sharing *works today by accident of there being no isolation*, and would break the day isolation lands
+  unless the shared interface lives in an assembly both sides reference.
+- **`Fabricator.Abstractions` IS NOT VERSIONED OR PACKED.** Every assembly is `1.0.0.0`, there is no
+  `PackageId`, it is not on NuGet, and out-of-tree plugins pin this repo BY SHA
+  (`fabricator-sustainalytics`, `-quantax`, `-dlrest`). A mismatch surfaces as a `rejected` plugin row with
+  a `TypeLoadException`. ⇒ **anything added to Abstractions widens a contract that has no version number**,
+  and a service locator widens it a lot. See §5.
+
+## 2. The shape the user described
+
+```csharp
+var http = FabricatorServices.Get<IHostHttp>();      // host capability
+var log  = FabricatorServices.Get<IHostLog>();
+var mine = FabricatorServices.Get<ISomeOtherPlugin>(); // another plugin's singleton
+```
+
+**⚠ `System.IServiceProvider` IS IN THE BCL** (`System`, since .NET 1.0: `object? GetService(Type)`), so the
+locator shape needs NO new package — a `GetService<T>()` extension method over it is three lines. That
+matters because a plugin's dependency closure is a live concern here (docs/plugin-system.md: the FluidPlugin
+already has to `ExcludeAssets="runtime"` on Apache.Arrow to avoid handing the host a second copy).
+`Microsoft.Extensions.DependencyInjection.Abstractions` would give `GetRequiredService<T>()` and a
+container, at the cost of a package every plugin then aligns on — weigh, do not assume.
+
+## 3. Design space (nothing chosen)
+
+### 3.1 Host capabilities — interfaces in Abstractions, implementations in Bridge
+
+The mechanical part, and the part with a clear answer. Candidates, each with why it is wanted:
+
+| interface | wraps | why |
+|---|---|---|
+| `IHostQuery` | `Host.Query` / `ExecuteNonQuery` | already a seam; add the v83 `clientSession` |
+| `IHostHttp` | `HostFs.HttpRequest` | already a seam; `DuckDbHttpHandler` is its consumer and already lives in Abstractions |
+| `IHostFileSystem` | `HostFs` open/read/glob/write | the seam that was written and deleted; now buildable post-v82 |
+| `IHostLog` | `FabricatorLog` | a plugin's diagnostics currently cannot reach `duckdb_logs` |
+| `IArrowValues` | `ArrowValueReader` | deletes the FluidPlugin's ~20-line duplicate |
+| `IHostSources` | `Host.RegisterSource` | lets a plugin publish a named Arrow source |
+| `IInterruptScope` | `InterruptScope` | Ctrl+C during a long plugin operation |
+
+**⚠ RULE THAT MUST SURVIVE THE REFACTOR: a service instance MUST NOT capture the ambient.** The three
+warnings in §1.2 exist because holding an opener is a use-after-free. A singleton `IHostQuery` is fine
+*provided* every method reads the ambient at call time — which is what the current lambdas do. Say it on the
+interface, not just in the implementation.
+
+### 3.2 Where registration happens
+
+- Host services: `Bootstrap.Initialize`, beside the existing seam fills. Trivial.
+- Plugin services: `IBackend` gains a DIM, e.g. `void RegisterServices(IFabricatorServiceRegistry r)`, called
+  during the plugin scan. Costs nothing for a plugin that publishes none.
+
+### 3.3 ⚠⚠ Plugin → plugin is the HARD half, and it is not the locator
+
+The locator is easy; the TYPE IDENTITY is not. For plugin A to consume plugin B's singleton, both must agree
+on an interface type, which must live in an assembly both reference:
+
+| where the shared interface lives | cost |
+|---|---|
+| `Fabricator.Abstractions` | first-party has to know about every cross-plugin contract — defeats the purpose |
+| a third "plugin contracts" assembly, shipped and versioned | the honest answer, and a new artifact to build, ship and version |
+| plugin B's own assembly, referenced by A | works TODAY (one shared ALC, §1.5) and dies the day ALC isolation lands; also makes A build-depend on B |
+| `object` + duck typing | back to reflection, i.e. the thing being removed |
+| a `string` key + a well-known shape | reflection with extra steps |
+
+⇒ **decide whether cross-plugin sharing is in scope BEFORE designing the locator**, because it is the only
+requirement that forces a new shipped artifact. A host-only service surface needs nothing new.
+
+### 3.4 Locator vs injection
+
+The user said "in a similar way what dependency injection does" — worth being precise about which:
+
+- **Service locator** (`Get<T>()` at the point of use): fits what exists. Plugins are instantiated with
+  `Activator.CreateInstance(type)` — parameterless — so nothing has to change in discovery.
+- **Constructor injection**: the registry would resolve ctor args when instantiating an `IBackend`. Nicer
+  for testing, but it changes the discovery contract and every out-of-tree plugin's ctor. A bigger step, and
+  it can be added later ON TOP of a locator.
+
+## 4. Interactions to check before building
+
+- **AOT** (docs/aot-bridge.md): a `typeof(T)`-keyed locator is AOT-safe and strictly better than reflection,
+  so this direction HELPS that plan. ⚠ But the AOT plan's five dynamic-code sites include the
+  `BackendRegistry` reflection and `FormatError`'s duck-type — re-read it, because a service surface changes
+  the shape of the source-generator answer it proposes.
+- **`fabricator_plugins()`** already reports the scan per root with a status. A service registry should be
+  visible the same way, or a mis-registration is silent — the exact fault that section of
+  docs/plugin-system.md was written to end.
+- **The three out-of-tree plugins** pin by sha and hand-write boilerplate; each migrates at its next pin
+  bump. An additive locator breaks none of them.
+- ⚠ **Do not let this become a reason to widen the FluidPlugin's reference to Bridge.** Its Abstractions-only
+  reference is deliberate — it is what makes the in-tree example demonstrate the surface out-of-tree plugins
+  actually have (CLAUDE.md). If the locator is right, the ~20-line duplicate disappears *without* widening
+  the reference, which is the test of whether the design worked.
+
+## 5. Open questions
+
+1. Is **cross-plugin** sharing in scope, or only host→plugin? (§3.3 — it is the only part that forces a new
+   shipped artifact.)
+2. `System.IServiceProvider` + our own extensions, or take
+   `Microsoft.Extensions.DependencyInjection.Abstractions`? (§2)
+3. Does the locator REPLACE `HostHttpTransport` / `HostQueryTransport`, or wrap them? Replacing is cleaner
+   and is a BREAKING change for out-of-tree plugins — which this repo has done before without aliases (the
+   `IArrow*` renames, `ScalarFnBind`), so it is a decision, not an obstacle.
+4. Should `Fabricator.Abstractions` finally be PACKED and versioned? (§1.5.) A bigger contract surface makes
+   the sha-pin more load-bearing, and this is the natural moment to ask.
+5. Scoping: are all services singletons, or is there a per-call/per-transaction scope? The ambient rule
+   (§3.1) means a singleton is safe for the current set — but a service that *did* need per-call state
+   (an `IInterruptScope`) is a factory, not a singleton.
+6. What does a plugin do when a service is absent — `null`, throw, or a no-op implementation? The existing
+   seams expose `IsAvailable` and the callers refuse by name; a locator should not quietly lose that.
