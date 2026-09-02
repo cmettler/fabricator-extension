@@ -783,6 +783,23 @@ the SQL is precisely what parameters exist to avoid.
   killed at the right line for the wrong reason — the same trap as a mutant that dies in the right place by
   accident.
 
+### 9.11 ✅ `query()` INHERITS THE CALLER'S SESSION — ABI v83 (2026-09-02)
+
+A template's `query()` ran on a connection with DuckDB's DEFAULTS: a statement could `SET TimeZone` and the
+template it rendered still read the machine's zone, and an unqualified name did not resolve at all. It now
+inherits the caller's **TimeZone** and **catalog search path** — `HostQueryTransport` passes the ambient
+`ClientContext` as the caller's session, so a plugin gets it without asking. Full record:
+[abi-history.md](abi-history.md) §v83; the gap's own record is [host-query.md](host-query.md), now closed.
+
+⚠ It does NOT inherit the TRANSACTION: §8.2's rule is unchanged, `query()` still reads COMMITTED state.
+Name and time RESOLUTION are what cross.
+
+⚠ **This supersedes the `SET GLOBAL TimeZone` advice** measured the same day. That worked — a fresh
+connection inherits the GLOBAL layer while it cannot see another connection's SESSION layer — and a plain
+`SET` now works, so the README's own `SET TimeZone = 'UTC'` convention reaches template queries too. ⚠ §7.4a's
+note that a DATE renders through the .NET side's `TimeZoneInfo.Local` is a DIFFERENT clock and is unaffected;
+do not let this entry be cited as covering it.
+
 ### 9.9 What slice 3 leaves
 
 - **§1.4 (DuckDB functions callable from inside Fluid) should be RE-DERIVED, not inherited.** §6 already
@@ -845,44 +862,54 @@ from `ProviderSettingsStore.CurrentSession` — **an `AsyncLocal` set by `set_ac
 ambient the opener rides on, and equally absent for a global function.** So a plain `SET` writes a layer keyed
 on a session id the plugin never receives.
 
-**The chain, read from source and matching the measurement exactly:** `SET x = v` on an extension option
-resolves `SetScope::AUTOMATIC` against `FABRICATOR_SETTING_DEFAULT_SCOPE`, which is `SESSION`, so the
-trampoline writes under `SessionKeyFor(&context)` — the ClientContext ADDRESS. `GetString` consults that
-layer only when `CurrentSession != 0` and otherwise falls through to the global bucket, which `SET GLOBAL`
-writes under key 0. `CurrentSession` is an `AsyncLocal<long>` assigned only by `set_active_opener`, which
-C++ calls from catalog and scan crossings — **never from a global scalar's execute**. So the value goes into
-a drawer the plugin has no key to.
+**⚠⚠ THIS IS NOW FIXED — ABI v82, the same day, and the requirement to write `SET GLOBAL` IS GONE.** A
+plain session `SET fluid_template_root` works. What follows is the record of the gap, kept because the
+reasoning about it went wrong twice and because the fix is what closed it: `scalarfn_bind`/`scalarfn_execute`
+now carry the caller's context and RESTORE it (abi-history.md §v82).
 
-**MEASURED, reproducibly: a plain `SET` is simply INVISIBLE here** — in a two-statement suite, in
-`duckdb.exe`, and at the foot of the 1200-line suite in two different shapes. `current_setting()` reports
-the value the whole time, which is what makes it a trap rather than an error.
+**The chain, read from source:** `SET x = v` on an extension option resolves `SetScope::AUTOMATIC` against
+`FABRICATOR_SETTING_DEFAULT_SCOPE`, which is `SESSION`, so the trampoline writes under
+`SessionKeyFor(&context)` — the ClientContext ADDRESS. `GetString` consults that layer only when
+`CurrentSession != 0` and otherwise falls through to the global bucket, which `SET GLOBAL` writes under key
+0. `CurrentSession` is an `AsyncLocal<long>` assigned only by `set_active_opener` — which C++ called from
+catalog and scan crossings and **not from a global scalar's execute**.
 
-**⚠⚠ A CORRECTION, RECORDED BECAUSE THE WRONG VERSION REACHED FOUR PLACES BEFORE IT WAS CHECKED.** This
-section first claimed the behaviour was NON-DETERMINISTIC — invisible in a small session, visible after
-unrelated statements — and explained it by `SetActiveOpener` assigning the ambients and never clearing them,
-so an earlier crossing on the same thread would leave `CurrentSession` set for a later one. **That story was
-invented to fit ONE observation and it does not survive testing.** The observation was real (an intermediate
-build's includes rendered after a plain `SET`) and it **does not reproduce**: the direct test of the story —
-a `fabricator_plugins()` call, i.e. a fabricator table function whose bind and scan DO call
-`set_active_opener`, run immediately before the `SET` — came back NEGATIVE, and so did reconstructing the
-original suite shape. The one run remains unexplained; nothing rests on it. ⇒ **the claim is now the simpler
-and stronger one: not visible, full stop.** The `SET GLOBAL` requirement is unchanged either way.
+**⚠⚠ AND IT WAS NON-DETERMINISTIC, WHICH IS WHERE I WENT WRONG TWICE — WORTH MORE THAN THE FIX.**
 
-⚠ The suite still does NOT assert the plain-`SET` behaviour. Not because it is unstable — it is stable — but
-because it is a property of the AMBIENT PLUMBING rather than of this plugin, and the day the gap below is
-closed a plain `SET` should start working. An assertion here would then fail for the right reason in the
-wrong file.
+1. **First I claimed non-determinism and invented a mechanism for it** — `set_active_opener` assigns and
+   never clears, so an earlier crossing on the same thread leaves `CurrentSession` set. Written into four
+   places off ONE observation, untested.
+2. **Then, asked to explain it, I tested the mechanism with the wrong probe and RETRACTED a true claim.**
+   The probe was `SELECT count(*) FROM fabricator_plugins()` before the `SET` — chosen by reading
+   `arrow_ingest.cpp`, where a table function's bind and scan DO call `set_active_opener`. It came back
+   negative, so I recorded the whole thing as an invention. ⚠ **A single negative probe of a plausible
+   candidate is not a refutation of the class.**
+3. **Then the right probe found it in one statement.** `fluid_query` — whose sqlgen `bind_replace` runs on
+   the BINDER's thread, the same thread that later evaluates the scalar — leaks where a table function's
+   scan (a worker thread) does not:
 
-⇒ the refusal names `SET GLOBAL` explicitly — *"a plain SET is not visible here"* — because "the setting is
-set and the feature says it is not" is exactly the trap that costs an afternoon. And an ABSOLUTE include path
-needs no root at all, which is the escape when a process-wide setting is the wrong granularity.
+   | between `SET` and `fabricator_render('{% include … %}')` | result |
+   |---|---|
+   | nothing | **fails** — "no root is set" |
+   | `SELECT * FROM fluid_query('SELECT 1 AS x')` | **renders** |
 
-**⚠ THE UNDERLYING GAP IS NOT FIXED AND IS BIGGER THAN THIS SLICE:** a global function reaches neither the
-host filesystem nor its own session's settings. Fixing it means establishing the ambients around
-`scalarfn_execute` and the sqlgen bind **with save/restore** — and the v80 record is the warning, not the
-recipe: pushing them at a scalar BIND crashed under `OPTIMIZE` because a scalar binds inside whatever an outer
-operation is running, so it CLOBBERED the outer ambient. A correct version needs the previous value back,
-which C++ cannot read from the managed `AsyncLocal` today. Its own change.
+   ⇒ the original claim was RIGHT, the retraction was WRONG, and only the third attempt had a
+   DISCRIMINATOR. The lesson is not "trust the first instinct": it is that steps 1 and 2 were both
+   reasoning where a one-line A/B was available.
+
+**⚠ The leaked OPENER was the sharper half of the same defect**, and it is why the fix matters beyond
+ergonomics: a leaked opener is a raw `ClientContext *` whose connection may already be gone, so a global
+scalar doing host-FS IO could dereference a dangling pointer — the `table_stats` use-after-free class, which
+the fs_* null guard added the same day cannot catch because the pointer is not null.
+
+**✅ THE FIX IS ABI v82 rather than anything Fluid-shaped**: `scalarfn_bind`/`scalarfn_execute` take the
+caller's `opener`/`session`/`txn_id` and the managed handlers wrap the call in `CallScope`, which puts the
+previous ambients back on the way out. The restore is what v80's record demanded, and it is mutation-proven:
+with `Dispose` emptied, `verify_delta_clustered_optimize` dies at `OPTIMIZE main.c1` with **exit 127 and no
+output**, v80's exact signature; with it, 147 assertions on both engine legs. ⚠ The other crossings still
+assign without restoring — correct for one that binds its statement's OWN source, and the scalar no longer
+depends on it either way. ⚠ It does NOT make `Host.Query` inherit DuckDB's own session settings; that is a
+different mechanism and still open ([host-query.md](host-query.md) §OPEN). Full record: abi-history.md §v82.
 
 **⚠ AND A SEPARATE, PRE-EXISTING CRASH IT EXPOSED: none of the nine `fs_*` host callbacks null-check the
 opener, while their sibling `HostHttpRequest` does** (*"http_request requires a client context (no ambient

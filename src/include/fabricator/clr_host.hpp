@@ -48,8 +48,8 @@ void SetHostServices(const FabricatorHostServices &services);
 // load by the host-query module, after SetHostServices set the rest; both run before the bridge boots, so
 // order-independent). See FabricatorHostServices::host_query in abi.h.
 using HostQueryFn = int32_t (*)(const char *sql, struct ArrowArrayStream *params,
-                                struct FabricatorHostInputs *inputs, struct ArrowArrayStream *out,
-                                void **out_interrupt, char **err);
+                                struct FabricatorHostInputs *inputs, FabricatorHandle client_context,
+                                struct ArrowArrayStream *out, void **out_interrupt, char **err);
 using HostQueryInterruptFn = void (*)(void *interrupt_handle);
 void SetHostQueryService(HostQueryFn fn, HostQueryInterruptFn interrupt_fn, HostQueryInterruptFn free_fn);
 
@@ -358,14 +358,24 @@ void GetFunctionReturnSchema(FabricatorHandle handle, const std::string &schema,
 // GetFunctionReturnSchema) with the single resolved result field — Arrow `null` type meaning "the DECLARED
 // type stands". Returns an opaque binding handle (reused by ScalarFnExecute for every chunk; freed via
 // ScalarFnClose).
+// The CALLER's context, carried into a crossing that must not merely OVERWRITE the managed ambients but
+// RESTORE them afterwards (see CallScope.cs). Built by MakeCallContext in catalog/fabricator_txn_util.hpp,
+// which is where the duckdb types live; a zeroed value means "the host has no context to give".
+struct CallContext {
+	FabricatorHandle opener = nullptr;
+	int64_t session = 0;
+	int64_t txn_id = 0;
+};
+
 FabricatorHandle ScalarFnBind(FabricatorHandle handle, const std::string &schema, const std::string &func,
-                              ArrowArrayStream *args, const std::string &arg_constant,
+                              ArrowArrayStream *args, const std::string &arg_constant, const CallContext &call,
                               ArrowSchema &out_schema);
 
 // Execute a bound scalar function over one chunk: `args` is an N-row stream of the argument columns (in
 // param order, post-cast; consumed by the managed side); fills `out` with an N-row, single-column stream of
 // the per-row results.
-void ScalarFnExecute(FabricatorHandle binding, ArrowArrayStream &args, ArrowArrayStream &out);
+void ScalarFnExecute(FabricatorHandle binding, ArrowArrayStream &args, const CallContext &call,
+                     ArrowArrayStream &out);
 
 // Release a binding handle from ScalarFnBind. Idempotent; safe with nullptr. Best-effort (swallows errors).
 void ScalarFnClose(FabricatorHandle binding);

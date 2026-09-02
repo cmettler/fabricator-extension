@@ -369,8 +369,17 @@ typedef struct FabricatorVTable {
 	// fixed-return function costs no work at bind. If BOTH are unresolved the call is refused by name at bind.
 	// *out_binding receives an opaque binding handle, reused by scalarfn_execute for every chunk and freed
 	// via scalarfn_close.
+	//
+	// ⚠⚠ `opener` / `session` / `txn_id` (ABI v82) are the CALLER's context, and they are parameters rather
+	// than a preceding set_active_opener BECAUSE THE MANAGED SIDE MUST RESTORE THEM. A scalar is evaluated
+	// wherever it is CALLED — including inside a nested host query an OUTER operation is running while that
+	// operation holds the ambient — so assigning without restoring leaves the outer operation resolving a
+	// ClientContext that is gone (measured as a SIGSEGV at OPTIMIZE, docs/abi-history.md §v80). The ambients
+	// are AsyncLocals the host can only overwrite, so only the managed handler can put back what it found;
+	// see CallScope. `opener` may be 0 where the host has no context to give.
 	int32_t (*scalarfn_bind)(FabricatorHandle handle, const char *schema, const char *func,
 	                         struct ArrowArrayStream *args, const char *arg_constant,
+	                         FabricatorHandle opener, int64_t session, int64_t txn_id,
 	                         struct ArrowSchema *out_schema, FabricatorHandle *out_binding, char **err);
 
 	// Execute a bound scalar function over one chunk: `args` is an N-row stream whose columns are the
@@ -382,7 +391,13 @@ typedef struct FabricatorVTable {
 	// meaning parameter i, differently per call site. Uniformity keeps the param schema the single
 	// positional contract. (Cost: a constant column is materialized as N values per chunk — Arrow has no
 	// constant encoding.)
+	//
+	// ⚠ `opener` / `session` / `txn_id` are the caller's context for THIS chunk, on the same terms as
+	// scalarfn_bind above: repeated per call rather than captured on the binding, because a binding is
+	// reused across chunks and — for a prepared statement — across transactions, so the context it was bound
+	// under need not be the context it is executed under.
 	int32_t (*scalarfn_execute)(FabricatorHandle binding, struct ArrowArrayStream *args,
+	                            FabricatorHandle opener, int64_t session, int64_t txn_id,
 	                            struct ArrowArrayStream *out, char **err);
 
 	// Release a binding handle from scalarfn_bind. Idempotent; safe with nullptr. Best-effort
@@ -1069,7 +1084,24 @@ typedef struct FabricatorHostServices {
 	// query). The fresh connection is invisible to the USER query's Ctrl+C, so without this a long host-side
 	// fetch (the native_write rewrite's read_parquet JOIN, a big COPY) was uncancellable (ABI v66). See
 	// docs/host-query.md + docs/cancellation.md.
+	//
+	// ⚠⚠ `client_context` (ABI v83) is OPTIONAL and it is what lets a managed caller run "as my caller
+	// would". 0 = a clean session, which is what every caller got before v83; non-zero = the calling
+	// operator's ClientContext, whose TimeZone and catalog SEARCH PATH are copied onto the fresh
+	// connection. The search path covers current_catalog() and current_schema() too — all three read the
+	// same CatalogSearchPath object — so it is one thing to copy, not three. It goes through the SAME
+	// CaptureSession/ApplyHostQuerySession pair the fabricator_host_query SQL surface has always used, so
+	// the two surfaces cannot drift.
+	//
+	// ⚠ A per-call ARGUMENT rather than an ambient the service reads for itself, because inheriting is a
+	// CHOICE: a template rendering the caller's statement wants it; a provider doing its own internal
+	// bookkeeping does not, and a clean session is the safer default for anything that must not depend on
+	// who called it. The managed Host.Query exposes it the same way (`clientSession`, default 0).
+	//
+	// ⚠ It is NOT general inheritance: only those settings are copied, and "copy the session" has no
+	// principled boundary. What is copied is what has been needed; adding one is a deliberate act.
 	int32_t (*host_query)(const char *sql, struct ArrowArrayStream *params, struct FabricatorHostInputs *inputs,
+	                      FabricatorHandle client_context,
 	                      struct ArrowArrayStream *out, void **out_interrupt, char **err);
 
 	// -------------------------------------------------------------------------
@@ -1161,7 +1193,7 @@ typedef struct FabricatorHostServices {
 // state blob is this many bytes + a 4-byte length prefix). Serialize() must fit within it.
 #define FABRICATOR_AGG_SPILL_CAP 1024
 
-#define FABRICATOR_ABI_VERSION 81
+#define FABRICATOR_ABI_VERSION 83
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(FabricatorVTable) as seen

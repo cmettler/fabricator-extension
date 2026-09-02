@@ -1428,6 +1428,11 @@ parameter the statement wants but you did not supply is reported by DuckDB, nami
 > does **not** see that transaction's uncommitted rows — a template cannot observe the writes of the
 > statement running it. Rows are held in memory (a template may loop over them repeatedly), and a result
 > above one million rows is refused rather than truncated.
+>
+> It *does* inherit your session's **`TimeZone`** and **`search_path`** (and with them `current_catalog()`
+> and `current_schema()`), so an unqualified `FROM t` resolves the way it does in the statement that
+> rendered the template, and a timestamp renders in the zone you set. Name and time resolution are
+> inherited; the transaction is not.
 
 Liquid control flow (`{% if %}`, `{% for %}`) works, comparisons and arithmetic filters work on numbers from
 either kind of bag, and nested `STRUCT`/`MAP`/`LIST` members are reachable by name, by index and by `.size`.
@@ -1462,18 +1467,13 @@ A template can pull in another one from **any storage the extension can read** �
 inside SQL string literals:
 
 ```sql
-SET GLOBAL fluid_template_root = 's3://analytics/templates';
+SET fluid_template_root = 's3://analytics/templates';
 
 -- templates/dims/customer.liquid holds:  SELECT id, name FROM customers WHERE region = {{ region | sql }}
 SELECT * FROM fluid_query('{% include ''dims/customer'' %}', params := {'region': 'eu'});
 ```
 
 The included template shares the caller's variables, and it may include others in turn.
-
-> ⚠ **It is `SET GLOBAL`, not `SET`.** These are *global* functions, which run without a session context, so
-> a session-scoped `SET` is not reliably visible to them — DuckDB will report the value through
-> `current_setting()` while an include still fails for want of a root. A plain `SET` is not an equivalent
-> spelling here.
 
 > ⚠ **An absolute path needs no root at all** — `{% include 's3://bucket/templates/dims.liquid' %}` works
 > whether or not `fluid_template_root` is set, which is the escape when a process-wide setting is the wrong

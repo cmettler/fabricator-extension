@@ -1,4 +1,4 @@
-# ABI history — prior versions v16–v81
+# ABI history — prior versions v16–v83
 
 > Moved VERBATIM out of `CLAUDE.md` on 2026-07-29 (conservative split — see the commit message).
 > Append-only as-built history; the live summary + pointers stay in `CLAUDE.md`.
@@ -11,6 +11,163 @@
 > entries and the `table_*` session; v73: `table_info`/`table_stats` re-carried as ONE typed JSON doc each,
 > parsed with our own vcpkg yyjson, retiring the `ReadCapabilityFlag` string-find). v74 below is the
 > follow-on that finished the same job for ALTER.
+
+## v83 — `host_query` can run AS THE CALLER'S SESSION (2026-09-02)
+
+`host_query` gains an OPTIONAL `FabricatorHandle client_context`. 0 = a clean session, which is what every
+caller got before; non-zero = the calling operator's `ClientContext`, whose **TimeZone** and **catalog search
+path** are copied onto the fresh connection before the statement runs. Managed surface:
+`Host.Query(sql, parameters, inputs, clientSession)`; `HostQueryTransport` passes the ambient for you, so a
+plugin — and therefore a Fluid template's `query()` — inherits without asking.
+
+It closes [host-query.md](host-query.md) §OPEN, **both items**, which had been open since 2026-09-01.
+
+### ⚠ The search path is ONE thing to copy, not three
+
+`current_catalog()`, `current_schema()` and `search_path` all read the same `CatalogSearchPath` object, so
+copying it carries all three. That is why the surface takes no separate catalog/schema arguments.
+
+### ⚠⚠ TWO API ROUTES TO APPLY IT, AND BOTH ARE MEASURED WRONG — it goes through the SET statement
+
+The replay is `conn.Query("SET search_path=" + Value(ListToString(paths)).ToSQLString())`, and it looks like
+the crude option until you try the other two:
+
+| route | what happens |
+|---|---|
+| `Set(paths, SET_DIRECTLY)` — what shipped | **`InternalException: SET_WITHOUT_VERIFICATION requires a fully qualified set path`** |
+| `Set(paths, SET_SCHEMAS)` — the obvious fix | **`InternalException: TransactionContext::ActiveTransaction called without active transaction`** |
+| `conn.Query("SET search_path=…")` | works |
+
+- **SET_DIRECTLY** refuses an entry whose catalog OR schema is empty, and a captured entry legitimately has
+  an empty catalog. Read from `duckdb/src/catalog/catalog_search_path.cpp`: a bare `SET search_path='x'`
+  stores `path.catalog = GetDefault().catalog`; `GetDefault()` returns `paths[1]`; with nothing previously
+  set that is `{INVALID_CATALOG, DEFAULT_SCHEMA}` — and **`#define INVALID_CATALOG ""`**. So the stored
+  catalog is the empty string. This was §OPEN item B, an INTERNAL error (the assertion-failure class) on a
+  shape as ordinary as "set a schema, then call host_query".
+- **SET_SCHEMAS** resolves the empty catalog by calling `Catalog::GetSchema` — which needs an ACTIVE
+  TRANSACTION, and a fresh idle connection has none. One internal error traded for another.
+- The **statement** begins its own transaction and resolves the entry exactly as the caller's own `SET` did.
+  Two layers of quoting, both DuckDB's: `CatalogSearchEntry::ListToString` quotes an identifier containing
+  `.`, `,` or `"`, and `Value::ToSQLString` escapes the string literal.
+
+⚠ A failed search-path apply is **FATAL**, unlike the TimeZone fallback beside it, and the asymmetry is
+deliberate: a search path that will not apply means the caller's unqualified names resolve differently, so
+the statement fails later as "table not found" — naming a table that plainly exists. Saying which session
+could not be applied is the more useful failure.
+
+### ⚠ Why a per-call ARGUMENT rather than an ambient the service reads
+
+Because inheriting is a CHOICE, and §OPEN said to settle that before choosing a mechanism. A template
+rendering the caller's statement wants it; a provider doing its own bookkeeping wants a session that cannot
+depend on who called it. 0 is exactly the pre-v83 behaviour, so nothing changed under any existing caller.
+⚠ And it is NOT general inheritance: two settings are copied because two settings have been needed. "Copy the
+session" has no principled boundary, so each addition is a deliberate act.
+
+⚠ It does **not** make the query part of the caller's transaction. The connection is still fresh and still
+reads COMMITTED state — a caller inside `BEGIN; INSERT …;` still does not see its own uncommitted rows. What
+is inherited is name and time RESOLUTION.
+
+### Gates, and a mutant that exposed a vacuous assertion
+
+- `verify_host_query` **98 → 107** (hermetic): the caller's search path AND TimeZone reaching
+  `fabricator_host_query`, asserted through an **unqualified `FROM t`**, which fails both ways — a build that
+  applies nothing cannot resolve it, and one that applies it wrongly raises.
+- `verify_plugin_fluid` **177 → 188** (service): the same two through a template's `query()`, plus the
+  bind-time surface (`fluid_query`), where an unqualified name decides the statement's output SCHEMA.
+- **Mutant 1** — the transport passes `clientSession: 0` — dies at the template's TimeZone row.
+- **Mutant 2** — `SET_DIRECTLY` restored — dies at the unqualified `FROM t` with the original INTERNAL error.
+
+**⚠⚠ MUTANT 2 FIRST SURVIVED, AND THE REASON IS THE REUSABLE PART: the section was passing for the wrong
+reason.** `USE memory.hq_s` earlier in the same file leaves a FULLY QUALIFIED entry in the search path, and
+DuckDB resolves a later bare `SET search_path=` against it (`path.catalog = GetDefault().catalog`) — so the
+captured entry had a real catalog and `SET_DIRECTLY` accepted it happily. The assertion asserted nothing. A
+`RESET search_path` first is what restores the vulnerable state, and it is load-bearing rather than hygiene.
+⚠ The bug reproduced instantly in the shell and not in the suite, which is the shape to watch for: **a
+repro that works everywhere except in the test is usually the test's own prior state.**
+
+### ⚠ The temporal advice this supersedes
+
+The Fluid docs told a client to write `SET GLOBAL TimeZone = 'UTC'` so a template's `query()` would see it —
+measured the same day, and true, because `Host.Query` opens on the captured `DatabaseInstance` and a fresh
+connection inherits the GLOBAL layer while it cannot see another connection's SESSION layer. A plain `SET`
+now works, so the README's own `SET TimeZone = 'UTC'` convention reaches template queries too. ⚠ `SET GLOBAL
+search_path` never existed as a workaround — DuckDB refuses it outright (*"option \"search_path\" cannot be
+set globally"*) — which is why that half was the one with no escape at all.
+
+## v82 — the scalar crossings carry the caller's context, and RESTORE it (2026-09-02)
+
+`scalarfn_bind` and `scalarfn_execute` gain `FabricatorHandle opener, int64_t session, int64_t txn_id`, and
+the managed handlers wrap the call in `CallScope` — save the three ambients, set the caller's, put the old
+ones back on the way out. C++ builds the triple with `MakeCallContext(ClientContext&)`
+(`catalog/fabricator_txn_util.hpp`), carried as `fabricator::CallContext`.
+
+**⚠⚠ IT CLOSES A GAP THAT AFFECTED EVERY PLUGIN, NOT A FLUID ONE.** A GLOBAL SCALAR was the ONE crossing in
+the tree with no ambients at all — measured, and the boundary is exact: sqlgen's `bind_replace`, `tablefn_*`,
+the ALTER paths and every catalog crossing call `FabricatorSetActiveTxn`, so a global TABLE function has both
+the host-FS opener and the settings session, while a global SCALAR had neither. So a global scalar could not
+read a file through the host FileSystem, and could not see a session-scoped provider setting.
+
+### Why it is a parameter rather than a preceding `set_active_opener`
+
+Because the managed side must RESTORE it, and only the managed side can. **v80 established this the
+expensive way**: giving the scalar bind a bare `FabricatorSetActiveTxn` SIGSEGV'd the process at
+`OPTIMIZE main.c1`, because a scalar is evaluated *wherever it is called* — including inside a nested host
+query an OUTER operation is running while that operation holds the ambient — so assigning without restoring
+leaves the outer operation resolving a `ClientContext` that is gone. v80's own note prescribed the fix
+(*"the fix is a MANAGED-side push/restore scope … the host cannot restore it, because the ambient is an
+AsyncLocal the host can only overwrite"*) and this is it. Every crossing puts back what it found, so nesting
+composes to any depth.
+
+**MUTATION-TESTED, and it reproduces v80 exactly.** With `CallScope.Dispose` emptied:
+
+```
+MUTANT EXIT=127
+--- output (3 lines) ---
+Filters: test/verify_delta_clustered_optimize.test
+[0/1] (0%): test/verify_delta_clustered_optimize.test
+```
+
+— no assertions, no summary, no stderr, which is byte-for-byte the signature v80 recorded. With the restore:
+**147 assertions on BOTH engine legs.** `verify_delta_clustered_optimize` is therefore the gate for the
+hazard, and it is hermetic and engine-doubled, so it costs nothing new.
+
+### ⚠⚠ WHAT IT REPLACED WAS WORSE THAN NOTHING: THE SCALAR INHERITED WHATEVER THE LAST BINDER LEFT
+
+`set_active_opener` ASSIGNS and never clears, and sqlgen's `bind_replace` runs on the binder's thread — the
+same thread that later evaluates a scalar. So the scalar read a session that was not its own, or none,
+depending on what ran before it. **MEASURED with a one-statement discriminator**, byte-identical otherwise:
+
+| | `SET fluid_template_root = …` then `fabricator_render('{% include … %}')` |
+|---|---|
+| nothing in between | **fails** — "no root is set" |
+| one `SELECT * FROM fluid_query('SELECT 1 AS x')` in between | **renders** |
+
+⚠ **The leaked OPENER is the sharper half.** It is a raw `ClientContext *` whose connection may already be
+gone, so a global scalar doing host-FS IO could dereference a dangling pointer — the `table_stats`
+use-after-free class, and one the fs_* null guard added the same day cannot catch, because the pointer is not
+null. Nothing in tree did that IO, which is why it never fired.
+
+### ⚠ WHAT IT DOES NOT FIX
+
+**`Host.Query` still does not inherit the caller's DuckDB session** — different mechanism, still open
+([host-query.md](host-query.md) §OPEN item A). The ambients govern OUR provider-settings store and the
+host-FS opener; `Host.Query` opens its own connection on the captured `DatabaseInstance`, so DuckDB's own
+session settings (`TimeZone`, `search_path`) are unaffected. MEASURED after the change: with
+`SET TimeZone='UTC'`, `fabricator_host_query` reports `UTC` and a template's `query()` still reports the
+machine zone; `SET GLOBAL TimeZone` remains the answer there.
+
+⚠ The OTHER crossings still leak (they assign without restoring). That is correct for a crossing that binds
+or scans its statement's OWN source — the value it leaves is the value the rest of the statement wants — and
+the scalar no longer depends on it either way, because it now sets and restores its own. Converting the rest
+to `CallScope` is a separate, larger change with no demonstrated need.
+
+### Gates
+
+- `verify_delta_clustered_optimize` **147 × 2 engine legs** — the crash shape, mutation-proven.
+- `verify_plugin_fluid` **174 → 177**: the plain session `SET` now works and is asserted, with a `SET GLOBAL`
+  leg beside it so a fix that repaired only one layer cannot pass. ⚠ Slice 4 shipped hours earlier
+  documenting `SET GLOBAL` as REQUIRED; that requirement is gone and the README, the plugin's own doc comment
+  and its error message all changed with it.
 
 ## v81 (2026-08-24) — `tablefn_execute` reports whether the execution changed the CATALOG
 

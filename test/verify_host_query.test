@@ -561,3 +561,66 @@ SELECT sum(value)::BIGINT FROM fabricator_scan('fabricator_demo_numbers');
 statement error
 SELECT * FROM fabricator_scan('no_such_source_at_all_xyz');
 ----
+
+
+# ============================================================================================
+# THE CALLER'S SESSION — search_path AND TimeZone (ABI v83; docs/host-query.md §OPEN, now closed)
+#
+# The SQL surface has always CAPTURED two settings off the calling context and replayed them onto its fresh
+# connection. What was broken is the replay of the search path, and what was missing is that a MANAGED caller
+# (a plugin's Host.Query, and so a Fluid template's query()) could not ask for the same thing at all.
+# ============================================================================================
+
+statement ok
+CREATE SCHEMA hq_sess;
+
+statement ok
+CREATE TABLE hq_sess.t AS SELECT 42 AS v;
+
+# ⚠⚠ THE RESET IS LOAD-BEARING AND A MUTANT IS WHAT PROVED IT. `USE memory.hq_s` earlier in this file
+# leaves a FULLY QUALIFIED entry in the search path, and DuckDB resolves a later bare `SET search_path=`
+# against it (`path.catalog = GetDefault().catalog`) — so the captured entry has a real catalog and the old
+# SET_DIRECTLY replay accepts it happily. Without this line the section below PASSED with the bug fully
+# present: restoring SET_DIRECTLY changed nothing. Resetting first is what puts GetDefault() back to
+# `{INVALID_CATALOG, main}` — where INVALID_CATALOG is the empty string — which is the state the internal
+# error needs.
+statement ok
+RESET search_path;
+
+statement ok
+SET search_path='hq_sess';
+
+# ⚠⚠ THIS RAISED AN INTERNAL ERROR — "SET_WITHOUT_VERIFICATION requires a fully qualified set path", i.e. the
+# assertion-failure class, on a shape as ordinary as "set a schema, then call host_query". The replay used
+# CatalogSetPathType::SET_DIRECTLY, which refuses an entry whose catalog is empty, and a captured entry
+# legitimately has one: duckdb stores `path.catalog = GetDefault().catalog` for a bare `SET search_path=`,
+# and with nothing previously set that resolves to INVALID_CATALOG — which is `#define INVALID_CATALOG ""`.
+#
+# ⚠ The unqualified `FROM t` is the assertion. A build that silently applied nothing would fail to resolve
+# it, and one that applied it wrongly would raise again — so this one row covers both directions.
+query I
+SELECT v FROM fabricator_host_query('SELECT v FROM t');
+----
+42
+
+# ⚠ SET_SCHEMAS was the obvious fix and is ALSO wrong: it resolves the empty catalog by calling
+# Catalog::GetSchema, which needs an ACTIVE TRANSACTION, and a fresh idle connection has none —
+# "TransactionContext::ActiveTransaction called without active transaction". One internal error for another.
+# The replay therefore goes through the SET statement, which begins its own transaction and resolves the
+# entry exactly as the caller's own SET did.
+
+# The caller's TimeZone reaches it too — the other half of the captured session, and the control for the
+# search-path row above: if the capture had stopped happening altogether, this would report the machine zone.
+statement ok
+SET TimeZone='UTC';
+
+query I
+SELECT tz FROM fabricator_host_query('SELECT current_setting(''TimeZone'') AS tz');
+----
+UTC
+
+statement ok
+RESET search_path;
+
+statement ok
+RESET TimeZone;

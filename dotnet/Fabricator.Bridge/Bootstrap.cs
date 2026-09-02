@@ -51,7 +51,12 @@ public static unsafe class Bootstrap
             // Fill in the contract assembly's host_query seam, so a plugin can run SQL on the hosting DuckDB
             // with the Abstractions reference alone. Same rule as the HTTP seam above and for the same
             // reason: the ambient is read per call by Host.Query, never captured here.
-            HostQueryTransport.Query = (sql, parameters) => Host.Query(sql, parameters, null);
+            // ⚠ The ambient ClientContext is passed as the caller's SESSION (ABI v83), so a template's
+            // query() resolves names and times the way the statement that rendered it does — the gap
+            // docs/host-query.md §OPEN item A recorded. Read HERE, per call, never captured, for the same
+            // reason as the two seams above. 0 (no ambient) falls back to a clean session.
+            HostQueryTransport.Query = (sql, parameters) =>
+                Host.Query(sql, parameters, null, clientSession: AmbientOpener.Current);
             // Forward ILogger output into DuckDB's internal logging (duckdb_logs) when the host provides host_log.
             // The file sink (FABRICATOR_LOG_LEVEL/_FILE) stays independent; this adds the engine-log route.
             if (HostFs.CanLog)
@@ -94,7 +99,7 @@ public static unsafe class Bootstrap
                             () => OneRowStream(probeSchema, Interlocked.Increment(ref _lazyOpens) - 1),
                             probeSchema);
 
-        vtable->AbiVersion = 81;
+        vtable->AbiVersion = 83;
         vtable->OpenCatalog = &OpenCatalog;
         vtable->CloseCatalog = &CloseCatalog;
         vtable->ExecuteQuery = &ExecuteQuery;
@@ -1330,10 +1335,15 @@ public static unsafe class Bootstrap
     // -------------------------------------------------------------------------
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
     private static int ScalarFnBind(nint handle, byte* schema, byte* func, CArrowArrayStream* args,
-                                    byte* argConstant, CArrowSchema* outSchema, nint* outBinding, byte** err)
+                                    byte* argConstant, nint opener, long session, long txn,
+                                    CArrowSchema* outSchema, nint* outBinding, byte** err)
     {
         try
         {
+            // ⚠ The ambients are ESTABLISHED AND RESTORED here, not assigned by a preceding
+            // set_active_opener: a scalar binds wherever it is CALLED, so overwriting an outer
+            // operation's context would leave that operation resolving one that is gone. See CallScope.
+            using var scope = new CallScope(opener, session, txn);
             if (outSchema is null || outBinding is null)
             {
                 return FabricatorStatus.InvalidArgument;
@@ -1384,11 +1394,12 @@ public static unsafe class Bootstrap
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static int ScalarFnExecute(nint binding, CArrowArrayStream* args, CArrowArrayStream* outStream,
-                                       byte** err)
+    private static int ScalarFnExecute(nint binding, CArrowArrayStream* args, nint opener, long session,
+                                       long txn, CArrowArrayStream* outStream, byte** err)
     {
         try
         {
+            using var scope = new CallScope(opener, session, txn);
             if (args is null || outStream is null)
             {
                 return FabricatorStatus.InvalidArgument;

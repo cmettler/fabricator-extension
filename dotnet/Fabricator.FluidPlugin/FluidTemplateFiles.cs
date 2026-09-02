@@ -63,16 +63,19 @@ internal sealed class HostTemplateFileProvider : ITemplateFileProvider
 {
     /// <summary>The DuckDB setting naming the directory or URI prefix a RELATIVE include resolves against.</summary>
     /// <remarks>
-    /// <b>⚠⚠ IT MUST BE SET WITH <c>SET GLOBAL</c>, and that is forced by the same measurement as the
-    /// transport above.</b> Provider settings are registered SESSION-scoped (ABI v69) and
-    /// <see cref="ProviderSettingsStore"/> resolves session-then-global from
-    /// <see cref="ProviderSettingsStore.CurrentSession"/> — an ambient that, like the opener, is not
-    /// established for a GLOBAL function. So a plain <c>SET</c> writes a session layer this plugin can never
-    /// read: measured, DuckDB reported the value through <c>current_setting()</c> while an include still
-    /// failed for want of a root. The refusal below therefore names <c>SET GLOBAL</c> explicitly, because
-    /// "the setting is set and the feature says it is not" is exactly the trap that costs an afternoon.
-    /// <para>⚠ An ABSOLUTE include path needs no root at all, which is the escape when a global setting is
-    /// the wrong granularity.</para>
+    /// <para>
+    /// A plain session <c>SET</c> works, and so does <c>SET GLOBAL</c>. ⚠ That is true only since <b>ABI
+    /// v82</b>: a global scalar's crossing had NO settings session at all, so a session-scoped write landed
+    /// in a layer this plugin could not read, and the shipped answer was "use <c>SET GLOBAL</c>". v82 hands
+    /// <c>scalarfn_bind</c>/<c>scalarfn_execute</c> the caller's context and restores it afterwards
+    /// (<c>CallScope</c>), which closed the gap for every plugin, not just this one.
+    /// </para>
+    /// <para>
+    /// ⚠ It is a SETTING rather than a per-call argument because a template library has one root per
+    /// project, and repeating it on every call would be noise. Session-scoped like every provider setting,
+    /// so a dbt pre-hook can set it for one model without leaking to a model building concurrently on
+    /// another connection. An ABSOLUTE include path needs no root at all.
+    /// </para>
     /// </remarks>
     internal const string RootSetting = "fluid_template_root";
 
@@ -262,12 +265,10 @@ internal sealed class HostTemplateFileProvider : ITemplateFileProvider
         {
             // ⚠ REFUSED, not resolved against the process working directory. An unset root has no defensible
             // default — "wherever DuckDB happens to be running" is the answer that reads a file the author
-            // never named — so the failure names the setting, AND names SET GLOBAL, because a plain SET is
-            // measured invisible from a global function (see RootSetting).
+            // never named — so the failure names the setting instead of guessing.
             throw new InvalidOperationException(
                 $"template include '{subpath}' is relative and no root is set: " +
-                $"SET GLOBAL {RootSetting} = '<directory or URI prefix>' (a plain SET is not visible here), " +
-                "or write an absolute path.");
+                $"SET {RootSetting} = '<directory or URI prefix>', or write an absolute path.");
         }
 
         var parts = new List<string>();

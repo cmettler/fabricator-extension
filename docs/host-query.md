@@ -400,7 +400,20 @@ The declared-schema overload above is a step toward it rather than a detour: it 
 columns are* from *producing the data*, which is precisely the split a lookup+schema pair formalises. Revisit
 both together.
 
-## OPEN — `Host.Query` does not see the caller's SESSION, and `fabricator_host_query`'s replay of it is BROKEN for an unqualified search path (found 2026-09-01, user-raised, NOT built)
+## ✅ CLOSED — `Host.Query` can now run AS THE CALLER'S SESSION (ABI v83, 2026-09-02); the record below is what it took
+
+**⚠⚠ BOTH ITEMS ARE FIXED. ABI v83 gives `host_query` an OPTIONAL `client_context`** — 0 for a clean
+session, non-zero for the caller's, whose TimeZone and catalog search path are copied onto the fresh
+connection. `Host.Query(sql, parameters, inputs, clientSession)` exposes it, `HostQueryTransport` passes
+the ambient for you, and item B's INTERNAL error is gone because the replay goes through the `SET`
+statement rather than `SET_DIRECTLY`. **MEASURED after the fix: with `SET search_path='myschema'` and
+`SET TimeZone='UTC'`, the outer session, `fabricator_host_query` and a template's `query()` all agree.**
+Full record, including the two API routes that are BOTH wrong and the mutant that exposed a vacuous
+assertion: [abi-history.md](abi-history.md) §v83. Everything below is the record of the gap.
+
+⚠ It does NOT make the query part of the caller's TRANSACTION — the connection is still fresh and still
+reads COMMITTED state, so §8.2's visibility rule is unchanged. What is inherited is name and time
+RESOLUTION, and only the two settings named; "copy the session" has no principled boundary.
 
 Two separate items, found by probing what slice 3's Fluid `query()` inherits. **Neither is a slice-3
 regression** — the first is how `Host.Query` has always behaved, the second predates today's commits.
@@ -414,6 +427,14 @@ MEASURED with the outer session set:
 | the outer session | `UTC` | resolves, 1 row |
 | `fabricator_host_query(sql)` — the SQL surface | `UTC` ✓ | ⚠ **INTERNAL Error**, see B |
 | **`query()` in a template** (C# `Host.Query`) | **`Europe/Berlin`** ✗ | ✗ *"Table with name t does not exist!"* |
+
+**⚠⚠ ABI v82 DID NOT CLOSE THIS, and the distinction is worth stating because the two look alike.** v82
+gives a global SCALAR its caller's context — the host-FS opener, the provider-settings session and the
+transaction id — with a restore (abi-history.md §v82). Those are OUR ambients. `Host.Query` opens its own
+connection on the captured `DatabaseInstance`, so **DuckDB's own session settings are untouched by it**:
+MEASURED after v82, `SET TimeZone='UTC'` still leaves a template's `query()` reporting the machine zone
+while `fabricator_host_query` reports `UTC`. Item A is unchanged and still needs the ambient
+`ClientContext` on the `host_query` entry (option 3 below).
 
 **⚠⚠ `SET GLOBAL` IS A WORKING WORKAROUND FOR THE TIMEZONE HALF, AND THERE IS NONE FOR THE OTHER HALF —
 MEASURED 2026-09-02 (user-asked: "does a set global timezone get seen in the host query or not").** The

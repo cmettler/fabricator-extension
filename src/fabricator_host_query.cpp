@@ -109,10 +109,37 @@ void ApplyHostQuerySession(Connection &conn, const HostQuerySession *session) {
 		return;
 	}
 	if (!session->search_path.empty()) {
-		// SET_DIRECTLY: install exactly the captured entries. Copying the resolved values avoids emitting
-		// `USE <ident>` text, which would need identifier quoting to be safe.
-		ClientData::Get(*conn.context)
-		    .catalog_search_path->Set(session->search_path, CatalogSetPathType::SET_DIRECTLY);
+		// ⚠⚠ THROUGH SQL, and BOTH of the obvious API routes are measured wrong.
+		//
+		// `Set(paths, SET_DIRECTLY)` refuses any entry whose catalog OR schema is empty
+		// (`InternalException: SET_WITHOUT_VERIFICATION requires a fully qualified set path`), and a
+		// captured entry legitimately HAS an empty catalog: read from duckdb's catalog_search_path.cpp, a
+		// plain `SET search_path='myschema'` stores `path.catalog = GetDefault().catalog`, GetDefault()
+		// returns paths[1], and with nothing previously set that is `{INVALID_CATALOG, DEFAULT_SCHEMA}` —
+		// where `#define INVALID_CATALOG ""`. So the stored catalog is the empty string. MEASURED as an
+		// INTERNAL error, i.e. the assertion-failure class, on `SET search_path='myschema'` followed by any
+		// fabricator_host_query.
+		//
+		// `Set(paths, SET_SCHEMAS)` resolves the empty catalog — and calls Catalog::GetSchema, which needs
+		// an ACTIVE TRANSACTION. On a fresh, idle connection there is none: MEASURED as
+		// `InternalException: TransactionContext::ActiveTransaction called without active transaction`.
+		// One internal error traded for another.
+		//
+		// So it goes through the statement, which begins its own transaction and resolves the entry exactly
+		// as the caller's own `SET search_path` did. Two layers of quoting, both DuckDB's own:
+		// ListToString quotes an identifier containing `.`, `,` or `"`, and ToSQLString escapes the string
+		// literal — so neither a hostile schema name nor a hostile catalog name can break out.
+		auto path_sql = "SET search_path=" +
+		                Value(CatalogSearchEntry::ListToString(session->search_path)).ToSQLString();
+		auto sp_result = conn.Query(path_sql);
+		if (sp_result->HasError()) {
+			// ⚠ FATAL, unlike the TimeZone fallback below, and the asymmetry is deliberate: a search path
+			// that will not apply means the caller's unqualified names resolve differently here, so the
+			// statement fails later as "table not found" — an error naming a table that plainly exists.
+			// Saying which session could not be applied is the more useful failure.
+			throw IOException("fabricator host_query: could not apply the caller's search path (%s): %s",
+			                  path_sql, sp_result->GetError());
+		}
 	}
 	if (!session->time_zone.empty()) {
 		// TimeZone is an ICU-registered EXTENSION option (icu_extension.cpp AddExtensionOption), so there is
@@ -644,7 +671,8 @@ static char *DupErr(const string &msg) {
 // in-flight Fetch out-of-band (the fresh connection is invisible to the USER query's Ctrl+C). See abi.h /
 // docs/host-query.md / docs/cancellation.md.
 int32_t HostQueryService(const char *sql, ArrowArrayStream *params, FabricatorHostInputs *inputs,
-                         ArrowArrayStream *out, void **out_interrupt, char **err) {
+                         FabricatorHandle client_context, ArrowArrayStream *out, void **out_interrupt,
+                         char **err) {
 	try {
 		if (!g_host_db) {
 			throw IOException("fabricator host_query: host database not available");
@@ -655,9 +683,20 @@ int32_t HostQueryService(const char *sql, ArrowArrayStream *params, FabricatorHo
 				in.push_back({string(inputs->names[i]), inputs->streams[i]});
 			}
 		}
+		// ⚠ The caller's session, when it gave us one (ABI v83). Captured HERE, on the caller's LIVE
+		// context — the handle is valid only for the duration of this synchronous call — and applied to
+		// the fresh connection by MakeHostQueryStream, which is the same pair the SQL surface uses, so
+		// `fabricator_host_query` and a plugin's Host.Query cannot resolve names or times differently. A 0
+		// handle means a clean session, which is what every caller got before v83.
+		HostQuerySession session;
+		const HostQuerySession *session_ptr = nullptr;
+		if (client_context) {
+			session = CaptureSession(*reinterpret_cast<ClientContext *>(client_context));
+			session_ptr = &session;
+		}
 		shared_ptr<ClientContext> ctx;
 		MakeHostQueryStream(*g_host_db, sql ? string(sql) : string(), params, in, *out,
-		                    out_interrupt ? &ctx : nullptr);
+		                    out_interrupt ? &ctx : nullptr, session_ptr);
 		if (out_interrupt) {
 			// The handle owns a shared_ptr copy: an interrupt AFTER the result stream is released still
 			// dereferences a live (idle) context — a harmless no-op instead of a use-after-free.

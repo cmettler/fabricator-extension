@@ -54,6 +54,41 @@ public static class Host
         => HostFs.Query(sql, parameters, inputs);
 
     /// <summary>
+    /// Runs <paramref name="sql"/> on a fresh host connection, optionally AS THE CALLER'S SESSION WOULD:
+    /// pass the calling operator's <c>ClientContext</c> handle as <paramref name="clientSession"/> and the
+    /// fresh connection inherits its <c>TimeZone</c> and catalog SEARCH PATH before the statement runs.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// ⚠ <b>The search path is one thing, not three.</b> <c>current_catalog()</c>, <c>current_schema()</c>
+    /// and <c>search_path</c> all read the same <c>CatalogSearchPath</c>, so copying it carries all three —
+    /// which is why an unqualified <c>FROM t</c> resolves the way the caller's statement would.
+    /// </para>
+    /// <para>
+    /// ⚠ <b>It is opt-in, and that is the design rather than caution.</b> Inheriting is a CHOICE: a template
+    /// rendering the caller's statement wants it, while a provider doing its own bookkeeping wants a session
+    /// that cannot depend on who called it. 0 (the default) is exactly the behaviour every caller had before
+    /// ABI v83. Inside an ABI crossing the handle to pass is <c>AmbientOpener.Current</c>; a plugin gets it
+    /// automatically through <see cref="HostQueryTransport"/>, which passes the ambient for you.
+    /// </para>
+    /// <para>
+    /// ⚠ <b>It does NOT make the query part of the caller's transaction.</b> The connection is still fresh
+    /// and still reads COMMITTED state, so a caller inside <c>BEGIN; INSERT …;</c> does not see its own
+    /// uncommitted rows — that is a property of opening a separate connection and is unchanged. What is
+    /// copied is name and time RESOLUTION, nothing else; "copy the session" has no principled boundary, so
+    /// each addition is deliberate.
+    /// </para>
+    /// <para>
+    /// ⚠ The handle is valid only for the duration of this synchronous call — the host captures the session
+    /// immediately and does not keep the pointer.
+    /// </para>
+    /// </remarks>
+    public static IArrowArrayStream Query(string sql, RecordBatch? parameters,
+                                          IReadOnlyList<(string Name, IArrowArrayStream Stream)>? inputs,
+                                          nint clientSession)
+        => HostFs.Query(sql, parameters, inputs, clientSession: clientSession);
+
+    /// <summary>
     /// Runs a non-query statement (DDL / DML) on a fresh host connection and returns the affected-row count
     /// when the engine reports one (DML → a 1-row BIGINT "Count"; DDL → 0). A thin helper over
     /// <see cref="Query"/> (the ABI has one primitive — host_query subsumes exec).

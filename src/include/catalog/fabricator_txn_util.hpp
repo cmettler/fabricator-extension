@@ -30,4 +30,16 @@ inline void FabricatorSetActiveTxn(FabricatorHandle handle, ClientContext &conte
 	fabricator::SetActiveOpener(reinterpret_cast<FabricatorHandle>(&context), fabricator::SessionKeyFor(&context));
 }
 
+// The caller's context, for a crossing that RESTORES the ambients rather than merely overwriting them
+// (fabricator::CallContext / CallScope.cs). Use this — never FabricatorSetActiveTxn — wherever the crossing
+// can happen inside somebody else's statement: a global SCALAR is the case it was built for, since it is
+// evaluated wherever it is CALLED, including inside a nested host query an OUTER operation is running.
+inline fabricator::CallContext MakeCallContext(ClientContext &context) {
+	fabricator::CallContext call;
+	call.opener = reinterpret_cast<FabricatorHandle>(&context);
+	call.session = fabricator::SessionKeyFor(&context);
+	call.txn_id = (int64_t)MetaTransaction::Get(context).global_transaction_id;
+	return call;
+}
+
 } // namespace duckdb

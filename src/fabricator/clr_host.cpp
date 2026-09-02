@@ -1135,7 +1135,7 @@ void GetFunctionReturnSchema(FabricatorHandle handle, const std::string &schema,
 }
 
 FabricatorHandle ScalarFnBind(FabricatorHandle handle, const std::string &schema, const std::string &func,
-                              ArrowArrayStream *args, const std::string &arg_constant,
+                              ArrowArrayStream *args, const std::string &arg_constant, const CallContext &call,
                               ArrowSchema &out_schema) {
 	const FabricatorVTable &vt = GetBridge();
 	if (!vt.scalarfn_bind) {
@@ -1143,21 +1143,22 @@ FabricatorHandle ScalarFnBind(FabricatorHandle handle, const std::string &schema
 	}
 	FabricatorHandle binding = nullptr;
 	char *err = nullptr;
-	int32_t rc = vt.scalarfn_bind(handle, schema.c_str(), func.c_str(), args, arg_constant.c_str(), &out_schema,
-	                              &binding, &err);
+	int32_t rc = vt.scalarfn_bind(handle, schema.c_str(), func.c_str(), args, arg_constant.c_str(), call.opener,
+	                              call.session, call.txn_id, &out_schema, &binding, &err);
 	if (rc != FABRICATOR_OK) {
 		ThrowManagedError(vt, err, "Fabricator: scalarfn_bind failed");
 	}
 	return binding;
 }
 
-void ScalarFnExecute(FabricatorHandle binding, ArrowArrayStream &args, ArrowArrayStream &out) {
+void ScalarFnExecute(FabricatorHandle binding, ArrowArrayStream &args, const CallContext &call,
+                     ArrowArrayStream &out) {
 	const FabricatorVTable &vt = GetBridge();
 	if (!vt.scalarfn_execute) {
 		throw duckdb::IOException("Fabricator: bridge does not provide scalarfn_execute");
 	}
 	char *err = nullptr;
-	int32_t rc = vt.scalarfn_execute(binding, &args, &out, &err);
+	int32_t rc = vt.scalarfn_execute(binding, &args, call.opener, call.session, call.txn_id, &out, &err);
 	if (rc != FABRICATOR_OK) {
 		ThrowManagedError(vt, err, "Fabricator: scalarfn_execute failed");
 	}

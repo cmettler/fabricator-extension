@@ -327,7 +327,8 @@ internal static unsafe class HostFs
     public static IArrowArrayStream Query(string sql,
                                           RecordBatch? parameters = null,
                                           IReadOnlyList<(string Name, IArrowArrayStream Stream)>? inputs = null,
-                                          CancellationToken ct = default)
+                                          CancellationToken ct = default,
+                                          nint clientSession = 0)
     {
         if (!CanQuery)
         {
@@ -372,7 +373,7 @@ internal static unsafe class HostFs
             // Request the interrupt handle only when the v66 pair is available (defensive vs an older host).
             bool cancellable = _h.HostQueryInterrupt != null && _h.HostQueryInterruptFree != null;
             void* interruptHandle = null;
-            int rc = _h.HostQuery((byte*)sqlPtr, paramStream, hiPtr, cstream,
+            int rc = _h.HostQuery((byte*)sqlPtr, paramStream, hiPtr, clientSession, cstream,
                                   cancellable ? &interruptHandle : null, &err);
             if (rc != 0)
             {

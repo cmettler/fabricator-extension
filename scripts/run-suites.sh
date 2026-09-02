@@ -433,7 +433,13 @@ case "$TIER" in
         # loaded in a tier that points FABRICATOR_PLUGIN_DIR at an empty directory on purpose. The one thing
         # only render covered here -- an untyped NULL in an ANY-declared position -- was re-homed onto the
         # VARARGS tail in the same suite rather than dropped. The 8197 note it supersedes:
-        : "${MIN_ASSERTIONS:=8250}"
+        # 8259 since 2026-09-02: verify_host_query 98 -> 107 for ABI v83 -- fabricator_host_query's replay
+        # of the caller's SEARCH PATH raised an INTERNAL error (SET_WITHOUT_VERIFICATION requires a fully
+        # qualified set path) on a shape as ordinary as "set a schema, then call host_query". /!\ The RESET
+        # in that section is load-bearing and a mutant proved it: an earlier `USE memory.hq_s` leaves a
+        # qualified entry, against which the bug does not fire, so the section PASSED with it fully present.
+        # 8250 + 9 = 8259 exactly, from a green run.
+        : "${MIN_ASSERTIONS:=8259}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh
@@ -749,6 +755,12 @@ case "$TIER" in
         # CORRECTNESS requirement rather than a policy (a template may render at BIND, and a bind-time write
         # fires on EXPLAIN of a statement that never runs). 3162 + 38 = 3200 exactly, from a green run,
         # which is what shows no other suite moved. The 3162 note it supersedes:
+        # 3246 since 2026-09-02 (same day): verify_plugin_fluid 174 -> 177 for ABI v82 -- the scalar
+        # crossings now carry the caller's context and RESTORE it, so a plain session SET reaches a plugin's
+        # global scalar. Slice 4 had shipped hours earlier telling users to write SET GLOBAL; that
+        # requirement is gone, and the +3 is the plain-SET assertion plus a SET GLOBAL leg kept beside it so
+        # a fix repairing only one layer cannot pass. 3243 + 3 = 3246 exactly, from a green run.
+        # The 3243 note it supersedes:
         # 3243 since 2026-09-02: verify_plugin_fluid 147 -> 174 for SLICE 4 -- {% include %} / {% render %}
         # resolved against fluid_template_root and read with read_blob over slice 3's HostQueryTransport.
         # /!\ NOT over a host-FS seam: one was built and MEASURED unusable, because a GLOBAL function has no
@@ -760,7 +772,12 @@ case "$TIER" in
         # and nowhere else (a function call with them is a PARSE error, and Fluid has no dict literal).
         # 3200 + 16 = 3216 exactly, from a green run, which is what shows no other suite moved.
         # The 3200 note it supersedes:
-        : "${MIN_ASSERTIONS:=3243}"
+        # 3257 since 2026-09-02 (same day): verify_plugin_fluid 177 -> 188 for ABI v83 -- a template's
+        # query() now inherits the caller's TimeZone and catalog search path, so it resolves names and times
+        # the way the statement that rendered it does. The discriminator is a SECOND, deliberately unusual
+        # zone: one row alone would pass on a runner whose machine zone happens to be UTC.
+        # 3246 + 11 = 3257 exactly, from a green run.
+        : "${MIN_ASSERTIONS:=3257}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

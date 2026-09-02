@@ -100,10 +100,10 @@ public unsafe struct FabricatorVTable
     //                     const char* arg_constant, ArrowSchema* out_schema, void** out_binding, char** err)
     // `arg_constant` is a mask, one char per argument: '1' = a folded constant, '0' = a runtime expression
     // whose slot holds a NULL PLACEHOLDER. A provider MUST consult it before reading a value.
-    public delegate* unmanaged[Cdecl]<nint, byte*, byte*, CArrowArrayStream*, byte*, CArrowSchema*, nint*, byte**, int> ScalarFnBind;
+    public delegate* unmanaged[Cdecl]<nint, byte*, byte*, CArrowArrayStream*, byte*, nint, long, long, CArrowSchema*, nint*, byte**, int> ScalarFnBind;
 
     // int32 scalarfn_execute(void* binding, ArrowArrayStream* args, ArrowArrayStream* out, char** err)
-    public delegate* unmanaged[Cdecl]<nint, CArrowArrayStream*, CArrowArrayStream*, byte**, int> ScalarFnExecute;
+    public delegate* unmanaged[Cdecl]<nint, CArrowArrayStream*, nint, long, long, CArrowArrayStream*, byte**, int> ScalarFnExecute;
 
     // int32 scalarfn_close(void* binding, char** err)
     public delegate* unmanaged[Cdecl]<nint, byte**, int> ScalarFnClose;
@@ -340,7 +340,7 @@ public unsafe struct FabricatorHostServices
     // connection (binding a 1-row params batch positionally + registering named Arrow inputs as views first);
     // result as Arrow (the managed caller imports + releases the stream). out_interrupt (nullable) receives an
     // opaque cancellation handle for the query's fresh ClientContext (v66). See docs/host-query.md.
-    public delegate* unmanaged[Cdecl]<byte*, CArrowArrayStream*, FabricatorHostInputs*, CArrowArrayStream*, void**, byte**, int> HostQuery;
+    public delegate* unmanaged[Cdecl]<byte*, CArrowArrayStream*, FabricatorHostInputs*, nint, CArrowArrayStream*, void**, byte**, int> HostQuery;
 
     // ---- WRITE surface (Delta write-back foundation; see docs/delta-catalog.md) ----
     // int32 fs_open_write(void* opener, const char* path, int32 exclusive, void** out_file, char** err)

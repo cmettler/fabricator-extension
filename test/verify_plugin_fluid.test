@@ -1055,11 +1055,11 @@ SELECT count(*) FROM duckdb_settings() WHERE name = 'fluid_template_root';
 
 # ⚠⚠ A RELATIVE INCLUDE WITH NO ROOT IS REFUSED, and this has to come before any SET. Fail-closed: the
 # alternative is resolving against the process working directory, i.e. reading a file the author never
-# named. ⚠ The message names SET GLOBAL, not SET — see below for why that is not pedantry.
+# named.
 statement error
 SELECT fabricator_render('{% include ''hello'' %}', NULL);
 ----
-SET GLOBAL fluid_template_root
+no root is set
 
 # --- the library, written by DuckDB itself -------------------------------------------------
 # ⚠ PER_THREAD_OUTPUT on this first COPY is what CREATES the directory. A plain COPY to a file path does
@@ -1096,22 +1096,13 @@ SELECT rtrim(fabricator_render('{% include ''${FABRICATOR_DELTA_WRITE_DIR}/tpl/h
 ----
 hi abs
 
-# ⚠⚠ SET **GLOBAL**, AND A PLAIN SET IS NOT AN EQUIVALENT SPELLING — the sharpest consequence of a global
-# function having no ambients. Provider settings register SESSION-scoped, and a session write lands in a
-# layer keyed on an id that ProviderSettingsStore.CurrentSession must supply; that ambient is not
-# established for a global function, so the read falls through to the global layer.
-#
-# MEASURED reproducibly — a two-statement suite, the shell, and this suite in two shapes: a plain SET is
-# INVISIBLE here, while current_setting() reports it the whole time, which is what makes it a trap rather
-# than an error.
-#
-# ⚠ IT IS NOT ASSERTED HERE, and the reason is NOT that it is unstable — it is stable. It is a property of
-# the AMBIENT PLUMBING rather than of this plugin, and the day a global function is given its caller's
-# session a plain SET should start working. An assertion here would then fail for the right reason in the
-# wrong file. docs/fluid-templating.md §10.2 carries it, along with the retraction of an earlier claim that
-# the behaviour was non-deterministic — that story was invented to fit one unreproducible run.
+# ⚠⚠ A PLAIN SESSION `SET` — and pinning that spelling is the point, because it did NOT work when slice 4
+# shipped and the docs told users to write SET GLOBAL instead. A global scalar's crossing carried no
+# settings session, so a session-scoped write landed in a layer the plugin could not read; ABI v82 hands
+# scalarfn_bind/_execute the caller's context (and RESTORES it), which closed that gap for every plugin.
+# The regression this guards is the whole feature silently reverting to needing SET GLOBAL.
 statement ok
-SET GLOBAL fluid_template_root = '${FABRICATOR_DELTA_WRITE_DIR}/tpl';
+SET fluid_template_root = '${FABRICATOR_DELTA_WRITE_DIR}/tpl';
 
 # --- it resolves, and the outer scope reaches inside ---------------------------------------
 # ⚠ rtrim(x, chr(10)) throughout, NOT trim(x): DuckDB's one-argument trim removes SPACES and leaves a
@@ -1121,6 +1112,20 @@ query I
 SELECT rtrim(fabricator_render('{% include ''hello'' %}', {'who': 'world'}), chr(10));
 ----
 hi world
+
+# ⚠ AND `SET GLOBAL` STILL WORKS — the two spellings differ in SCOPE, not in whether the plugin can see
+# them. Kept beside the session one so a change that fixed only the layer this suite happens to write
+# cannot pass.
+statement ok
+SET GLOBAL fluid_template_root = '${FABRICATOR_DELTA_WRITE_DIR}/tpl';
+
+query I
+SELECT rtrim(fabricator_render('{% include ''hello'' %}', {'who': 'global'}), chr(10));
+----
+hi global
+
+statement ok
+RESET GLOBAL fluid_template_root;
 
 # ⚠ NAMING THE EXTENSION IS THE SPELLING TO PREFER. MEASURED on Fluid 3.0.0-beta.7: an include asks for the
 # bare subpath FIRST and only then for `<subpath>.liquid`, so omitting it costs TWO host reads where naming
@@ -1240,3 +1245,63 @@ query I
 SELECT n FROM fluid_query('{% include ''frag'' %}', params := {'n': 7});
 ----
 7
+
+# ============================================================================================
+# THE CALLER'S SESSION REACHES query() — ABI v83 (docs/host-query.md §OPEN item A, now closed)
+#
+# A template's query() runs on a connection of its own, and until v83 that connection had DuckDB's DEFAULTS:
+# a statement could SET TimeZone and the template it rendered would still read the machine's zone, and an
+# unqualified name would not resolve at all. The seam now passes the ambient ClientContext as the caller's
+# session, so the fresh connection inherits its TimeZone and catalog search path.
+#
+# ⚠ It is NOT transaction inheritance, and the section below the fixtures still asserts that: query() reads
+# COMMITTED state. What is inherited is name and time RESOLUTION.
+# ============================================================================================
+
+statement ok
+SET TimeZone='UTC';
+
+query I
+SELECT fabricator_render('{% assign r = query("SELECT current_setting(''TimeZone'') AS tz") %}{% for x in r %}{{ x.tz }}{% endfor %}', NULL);
+----
+UTC
+
+# ⚠ The DISCRIMINATOR, without which the row above would pass on a build that ignores the session entirely
+# and happens to run where the machine zone IS UTC: a second, deliberately unusual zone. A build that
+# inherits nothing reports the runner's zone for both, so the two rows cannot both be right by accident.
+statement ok
+SET TimeZone='Asia/Kolkata';
+
+query I
+SELECT fabricator_render('{% assign r = query("SELECT current_setting(''TimeZone'') AS tz") %}{% for x in r %}{{ x.tz }}{% endfor %}', NULL);
+----
+Asia/Kolkata
+
+statement ok
+RESET TimeZone;
+
+# And the search path, which is the sharper half — a wrong timezone is a silently wrong VALUE, an
+# unresolvable name is an outright failure for a table the caller can see unqualified.
+statement ok
+CREATE SCHEMA fq_sess;
+
+statement ok
+CREATE TABLE fq_sess.t AS SELECT 7 AS v;
+
+statement ok
+SET search_path='fq_sess';
+
+query I
+SELECT fabricator_render('{% assign r = query("SELECT v FROM t") %}{% for x in r %}{{ x.v }}{% endfor %}', NULL);
+----
+7
+
+# ⚠ And it reaches the BIND-TIME surface too, which is the one that decides a statement's output SCHEMA:
+# fluid_query renders while DuckDB is binding, so an unqualified name there resolves the caller's way.
+query I
+SELECT v FROM fluid_query('{% assign r = query("SELECT v FROM t") %}SELECT {% for x in r %}{{ x.v }}{% endfor %} AS v');
+----
+7
+
+statement ok
+RESET search_path;

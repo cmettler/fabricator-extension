@@ -691,7 +691,7 @@ static unique_ptr<FunctionData> FabricatorScalarBind(ClientContext &context, Sca
 		// cross the C interface in EITHER direction (Apache.Arrow throws on 'fields'), which is the same
 		// reason the exec callback sends a throwaway column and tablefn_bind passes nullptr here.
 		holder->binding = fabricator::ScalarFnBind(info.handle, info.schema, info.func, nullptr,
-		                                           arg_constant, result_schema);
+		                                           arg_constant, MakeCallContext(context), result_schema);
 	} else {
 		DataChunk chunk;
 		chunk.Initialize(Allocator::DefaultAllocator(), arg_types);
@@ -718,7 +718,7 @@ static unique_ptr<FunctionData> FabricatorScalarBind(ClientContext &context, Sca
 		producer.AddBatch(array);
 		producer.Finish();
 		holder->binding = fabricator::ScalarFnBind(info.handle, info.schema, info.func, producer.Stream(),
-		                                           arg_constant, result_schema);
+		                                           arg_constant, MakeCallContext(context), result_schema);
 	}
 
 	vector<LogicalType> result_types;
@@ -838,7 +838,7 @@ static ScalarFunction BuildFabricatorScalarFunction(FabricatorHandle handle, con
 		auto &bind_data = func_expr.bind_info->Cast<FabricatorScalarBindData>();
 		ArrowArrayStream out;
 		std::memset(&out, 0, sizeof(out));
-		fabricator::ScalarFnExecute(bind_data.holder->binding, *producer.Stream(), out);
+		fabricator::ScalarFnExecute(bind_data.holder->binding, *producer.Stream(), MakeCallContext(ctx), out);
 
 		// Single-column, row_count-row result -> the output vector (matching offsets).
 		fabricator::ArrowStreamReader reader(ctx, out);
