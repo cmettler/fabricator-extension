@@ -42,21 +42,13 @@ public static unsafe class Bootstrap
         if (host is not null)
         {
             HostFs.Set(*host);
-            // Fill in the contract assembly's HTTP transport seam (ABI v76), so DuckDbHttpHandler works for
-            // anything referencing Fabricator.Abstractions alone — a plugin above all. ⚠ The ambient opener
-            // is read HERE, per call, not captured: a catalog is database-scoped and outlives the connection
-            // that attached it, so a held ClientContext* would dangle.
-            HostHttpTransport.Send = (method, url, headers, body) =>
-                HostFs.HttpRequest(AmbientOpener.Current, method, url, headers, body);
-            // Fill in the contract assembly's host_query seam, so a plugin can run SQL on the hosting DuckDB
-            // with the Abstractions reference alone. Same rule as the HTTP seam above and for the same
-            // reason: the ambient is read per call by Host.Query, never captured here.
-            // ⚠ The ambient ClientContext is passed as the caller's SESSION (ABI v83), so a template's
-            // query() resolves names and times the way the statement that rendered it does — the gap
-            // docs/host-query.md §OPEN item A recorded. Read HERE, per call, never captured, for the same
-            // reason as the two seams above. 0 (no ambient) falls back to a clean session.
-            HostQueryTransport.Query = (sql, parameters) =>
-                Host.Query(sql, parameters, null, clientSession: AmbientOpener.Current);
+            // Publish the plugin-facing host services (docs/plugin-services.md). They REPLACE the
+            // HostHttpTransport / HostQueryTransport static-delegate seams: same mechanism, one registry, and
+            // room for the next capability without a fourth static class. Published HERE, before any plugin is
+            // scanned, so a plugin resolving one at load time still finds it.
+            // ⚠ Every implementation reads the ambient opener PER CALL and captures nothing — a catalog is
+            // database-scoped and outlives the connection that attached it, so a held ClientContext* dangles.
+            HostServices.Publish();
             // Forward ILogger output into DuckDB's internal logging (duckdb_logs) when the host provides host_log.
             // The file sink (FABRICATOR_LOG_LEVEL/_FILE) stays independent; this adds the engine-log route.
             if (HostFs.CanLog)

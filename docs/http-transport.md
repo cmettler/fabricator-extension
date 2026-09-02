@@ -250,8 +250,13 @@ behaviours a caller has to compensate for.
 
 ## 6. The plugin-facing surface — RESOLVED: the handler lives in the contract assembly
 
-`DuckDbHttpHandler` and `HostHttpTransport` are in **`Fabricator.Abstractions`**; the bridge fills in
-`HostHttpTransport.Send` at boot. **A plugin therefore reaches the transport with the reference it already
+**⚠ SUPERSEDED IN ONE DETAIL (2026-09-02): `HostHttpTransport` is GONE.** The static-delegate seam became
+`IHostHttp`, resolved through `FabricatorServices` — see docs/plugin-services.md §8. Everything else below
+holds verbatim, including the reason the handler holds no opener; only the name of the thing the bridge
+fills in has changed, and it is now one registry rather than a class per capability.
+
+`DuckDbHttpHandler` and `IHostHttp` are in **`Fabricator.Abstractions`**; the bridge publishes the
+implementation at boot. **A plugin therefore reaches the transport with the reference it already
 has**, and needs no `Fabricator.Bridge` reference, no `OpenCatalog` signature change, and no contact with an
 opener or an ambient:
 

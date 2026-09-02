@@ -16,9 +16,9 @@ namespace Fabricator.FluidPlugin;
 /// </summary>
 /// <remarks>
 /// <para>
-/// <b>⚠⚠ IT READS THROUGH <see cref="HostQueryTransport"/> AND <c>read_blob</c>, NOT THROUGH A FILESYSTEM
+/// <b>⚠⚠ IT READS THROUGH <see cref="IHostQuery"/> AND <c>read_blob</c>, NOT THROUGH A FILESYSTEM
 /// SEAM — and that is a MEASURED correction of the plan, not a shortcut.</b> §2 of the plan predicted this
-/// slice would need a <c>HostFs</c> seam mirroring <see cref="HostHttpTransport"/>; one was built, and it
+/// slice would need a host filesystem service (there is one now — <see cref="IHostFileSystem"/>); one was built, and it
 /// CANNOT WORK from here. Every host filesystem callback takes the calling operator's <c>ClientContext</c>
 /// as its opener, and a GLOBAL function — which both <c>fabricator_render</c> and <c>fluid_query</c> are —
 /// has no ambient opener established: measured, the read reached <c>fs_open_read</c> with a null handle and
@@ -167,15 +167,15 @@ internal sealed class HostTemplateFileProvider : ITemplateFileProvider
     /// <summary>Reads one template, or null when storage says there is no such file.</summary>
     private static Loaded? Load(string resolved)
     {
-        var run = HostQueryTransport.Query
+        var host = FabricatorServices.Get<IHostQuery>()
             ?? throw new InvalidOperationException(
-                "a template include needs the host query transport, which is not installed here.");
+                "a template include needs the IHostQuery service, which is not published here.");
 
         // ⚠ The batch is NOT disposed here, matching FluidHostQuery: Host.Query exports it into an Arrow
         // stream that the HOST consumes and releases, so disposing it on this side would be a second
         // free of buffers the exporter already owns.
         var parameters = PathBatch(resolved);
-        using var stream = run(ReadSql, parameters);
+        using var stream = host.Query(ReadSql, parameters);
 
         Loaded? result = null;
         int rows = 0;

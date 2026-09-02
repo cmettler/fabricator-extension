@@ -120,6 +120,43 @@ internal static unsafe class HostFs
         }
     }
 
+    /// <summary>
+    /// Opens, reads and closes <paramref name="path"/> in one call, refusing anything larger than
+    /// <paramref name="maxBytes"/>.
+    /// </summary>
+    /// <remarks>
+    /// ⚠ The ceiling is checked against the file's SIZE before a byte is read, so an oversized file costs an
+    /// open and a stat rather than the memory. It FAILS rather than truncating: a silent truncation is a wrong
+    /// ANSWER, where the refusal only turns an out-of-memory into a sentence naming both sizes.
+    /// </remarks>
+    public static byte[] ReadAllBytes(nint opener, string path, long maxBytes)
+    {
+        nint file = OpenRead(opener, path);
+        try
+        {
+            long size = Size(file);
+            if (size > maxBytes)
+            {
+                throw new InvalidOperationException(
+                    $"'{path}' is {size} bytes, above the {maxBytes}-byte limit for this read.");
+            }
+            if (size <= 0)
+            {
+                return System.Array.Empty<byte>();
+            }
+            var buffer = new byte[size];
+            fixed (byte* p = buffer)
+            {
+                Read(file, p, size, 0);
+            }
+            return buffer;
+        }
+        finally
+        {
+            Close(file);
+        }
+    }
+
     /// <summary>True once the host registered the glob callback (needed for directory listing).</summary>
     public static bool CanGlob => _set && _h.FsGlob != null;
 

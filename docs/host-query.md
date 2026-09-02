@@ -404,8 +404,8 @@ both together.
 
 **⚠⚠ BOTH ITEMS ARE FIXED. ABI v83 gives `host_query` an OPTIONAL `client_context`** — 0 for a clean
 session, non-zero for the caller's, whose TimeZone and catalog search path are copied onto the fresh
-connection. `Host.Query(sql, parameters, inputs, clientSession)` exposes it, `HostQueryTransport` passes
-the ambient for you, and item B's INTERNAL error is gone because the replay goes through the `SET`
+connection. `Host.Query(sql, parameters, inputs, clientSession)` exposes it, and the `IHostQuery` service passes
+the ambient for you (it was `HostQueryTransport` until 2026-09-02 — docs/plugin-services.md §8), and item B's INTERNAL error is gone because the replay goes through the `SET`
 statement rather than `SET_DIRECTLY`. **MEASURED after the fix: with `SET search_path='myschema'` and
 `SET TimeZone='UTC'`, the outer session, `fabricator_host_query` and a template's `query()` all agree.**
 Full record, including the two API routes that are BOTH wrong and the mutant that exposed a vacuous

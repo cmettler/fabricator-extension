@@ -13,7 +13,7 @@ namespace Fabricator.FluidPlugin;
 
 /// <summary>
 /// The Fluid <c>query(sql)</c> function: runs a SELECT on the hosting DuckDB through
-/// <see cref="HostQueryTransport"/> and hands the template its rows.
+/// <see cref="IHostQuery"/> and hands the template its rows.
 /// </summary>
 /// <remarks>
 /// <para>
@@ -97,14 +97,14 @@ internal static class FluidHostQuery
             throw new ArgumentException($"{caller}: {FunctionName}() was given an empty statement.");
         }
 
-        var run = HostQueryTransport.Query
+        var host = FabricatorServices.Get<IHostQuery>()
             ?? throw new InvalidOperationException(
-                $"{caller}: {FunctionName}() needs the host query transport, which is not installed here. "
+                $"{caller}: {FunctionName}() needs the IHostQuery service, which is not published here. "
                 + "It is available only from inside a fabricator function call.");
 
-        RefuseUnlessSelect(caller, sql, run);
+        RefuseUnlessSelect(caller, sql, host);
 
-        using var stream = run(sql, parameters);
+        using var stream = host.Query(sql, parameters);
         var rows = new List<FluidValue>();
         while (true)
         {
@@ -294,8 +294,7 @@ internal static class FluidHostQuery
     /// is REFUSED, not waved through. An unenforceable check must fail closed.
     /// </para>
     /// </remarks>
-    private static void RefuseUnlessSelect(string caller, string sql,
-                                           Func<string, RecordBatch?, IArrowArrayStream> run)
+    private static void RefuseUnlessSelect(string caller, string sql, IHostQuery host)
     {
         const string classify =
             "SELECT j ->> 'error' AS err, j ->> 'error_message' AS msg "
@@ -315,7 +314,7 @@ internal static class FluidHostQuery
             var schema = new Schema(new[] { field }, null);
             var arg = new StringArray.Builder().Append(sql).Build();
             using var parameters = new RecordBatch(schema, new IArrowArray[] { arg }, 1);
-            using var stream = run(classify, parameters);
+            using var stream = host.Query(classify, parameters);
             var batch = stream.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult();
             if (batch is null || batch.Length == 0)
             {

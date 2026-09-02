@@ -777,7 +777,14 @@ case "$TIER" in
         # the way the statement that rendered it does. The discriminator is a SECOND, deliberately unusual
         # zone: one row alone would pass on a runner whose machine zone happens to be UTC.
         # 3246 + 11 = 3257 exactly, from a green run.
-        : "${MIN_ASSERTIONS:=3257}"
+        # 3272 since 2026-09-02 (same day, second bump): verify_plugin 97 -> 112 for the HOST SERVICE
+        # LOCATOR -- a plugin resolving IHostFileSystem with a Fabricator.Abstractions reference alone. It is
+        # also the first in-tree proof that the ABI v82 ambient reaches a PLUGIN's global scalar: every fs_*
+        # host callback dereferences the caller's ClientContext, and a global scalar had none until v82 (the
+        # earlier attempt at this seam died with 0xC0000005). The load-bearing pair is the glob COUNT with a
+        # zero-match negative control beside it -- 2 alone would pass on a build that returned everything.
+        # 3257 + 15 = 3272 exactly, from a green run, which is what shows no other suite moved.
+        : "${MIN_ASSERTIONS:=3272}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

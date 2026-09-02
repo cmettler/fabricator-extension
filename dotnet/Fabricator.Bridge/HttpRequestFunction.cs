@@ -103,7 +103,7 @@ internal sealed class HttpRequestFunction : ITableFunction
         private async IAsyncEnumerable<RecordBatch> Rows(nint opener, [EnumeratorCancellation] CancellationToken ct)
         {
             // Re-establish what Execute captured: the handler resolves the ambient PER REQUEST (it holds no
-            // opener — see HostHttpTransport), and this iterator body runs at the first batch pull, a
+            // opener — see IHostHttp), and this iterator body runs at the first batch pull, a
             // different crossing on whatever thread DuckDB pulls from, where the ambient would be 0.
             AmbientOpener.Current = opener;
             ct.ThrowIfCancellationRequested();

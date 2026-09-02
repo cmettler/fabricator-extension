@@ -13,17 +13,24 @@ namespace Fabricator.SamplePlugin;
 /// connection-free GLOBAL functions, demonstrating that a plugin dropped into an <c>FABRICATOR_PLUGIN_DIR</c>
 /// folder is discovered, its <see cref="IBackend"/> registered, and its global functions surfaced — with no
 /// change to the bridge or any ABI. See docs/plugin-system.md.
-/// <para>Two scalars, for two different jobs: <see cref="PlugGreetFunction"/> proves the plumbing carries
-/// VALUES, and <see cref="PlugSleepFunction"/> is a test INSTRUMENT — it makes a query's cost a number the
+/// <para>Four scalars, for three different jobs: <see cref="PlugGreetFunction"/> proves the plumbing carries
+/// VALUES; <see cref="PlugSleepFunction"/> is a test INSTRUMENT — it makes a query's cost a number the
 /// caller chose, which is what lets a test measure effective parallelism or park a query inside a long
-/// managed call on purpose.</para>
+/// managed call on purpose; and <see cref="PlugReadFileFunction"/> + <see cref="PlugGlobCountFunction"/> are
+/// the GATE for the host service locator (<see cref="FabricatorServices"/>) — a plugin reaching DuckDB's own
+/// filesystem, which needs the caller's <c>ClientContext</c> and so also proves the ABI v82 ambient reaches
+/// a global scalar.</para>
 /// </summary>
 public sealed class SamplePluginBackend : IBackend
 {
     public string Name => "sampleplugin";
 
     public IEnumerable<IScalarFunction> GlobalScalarFunctions =>
-        new IScalarFunction[] { new PlugGreetFunction(), new PlugSleepFunction() };
+        new IScalarFunction[]
+        {
+            new PlugGreetFunction(), new PlugSleepFunction(),
+            new PlugReadFileFunction(), new PlugGlobCountFunction(),
+        };
 
     public IEnumerable<ITableFunction> GlobalTableFunctions =>
         new ITableFunction[] { new PlugSlowRangeFunction(), new PlugSlowRange2Function() };
@@ -431,5 +438,92 @@ internal sealed class PlugLatFieldsFunction : ILateralFunction
         }
 
         public void Dispose() { }
+    }
+}
+
+/// <summary>
+/// <c>plug_read_file(path) -&gt; VARCHAR</c> — reads a file through DuckDB's OWN filesystem, resolved as a
+/// host service (<see cref="FabricatorServices"/> / <see cref="IHostFileSystem"/>).
+/// </summary>
+/// <remarks>
+/// <para>
+/// <b>⚠⚠ THIS IS THE GATE FOR TWO THINGS AT ONCE, and neither had one before it.</b> It proves that a plugin
+/// can resolve a HOST SERVICE with an <c>Fabricator.Abstractions</c> reference alone, and — because a global
+/// scalar is the crossing that had NO ambient context until ABI v82 — that the caller's
+/// <c>ClientContext</c> now reaches one. An earlier attempt at a host-filesystem seam died with an access
+/// violation on its first call for exactly that reason (docs/fluid-templating.md §10.2), so "a plugin reads
+/// a file" is a claim worth a test rather than a comment.
+/// </para>
+/// <para>
+/// It follows that the path may be anything the HOST can open — a local path, <c>s3://</c>,
+/// <c>abfss://</c> — and that SECRETS resolve from the calling session, which is the whole reason to reach
+/// through the host instead of calling <see cref="System.IO.File"/>.
+/// </para>
+/// <para>
+/// ⚠ The 64 KiB ceiling is this FUNCTION's, not the interface's: it returns the whole file as one VARCHAR
+/// cell, so a large file is a wrong tool rather than a large answer. The read FAILS above it instead of
+/// truncating — a truncated document is a wrong answer that looks like a right one.
+/// </para>
+/// </remarks>
+internal sealed class PlugReadFileFunction : IScalarFunction
+{
+    private const long MaxBytes = 64L * 1024;
+
+    public string Name => "plug_read_file";
+
+    public Schema Parameters => new(new[] { new Field("path", StringType.Default, nullable: true) }, metadata: null);
+
+    public Field Result => new("content", StringType.Default, nullable: true);
+
+    public IArrowArray Invoke(RecordBatch args)
+    {
+        var paths = (StringArray)args.Column(0);
+        // Resolved PER INVOKE, never cached in a field: the service itself reads the ambient per call, but a
+        // plugin holding one across a catalog's lifetime is the habit this surface exists to discourage.
+        var fs = FabricatorServices.GetRequired<IHostFileSystem>();
+        var b = new StringArray.Builder().Reserve(args.Length);
+        for (int i = 0; i < args.Length; i++)
+        {
+            if (paths.IsNull(i))
+            {
+                b.AppendNull();
+                continue;
+            }
+            var bytes = fs.ReadAllBytes(paths.GetString(i), MaxBytes);
+            b.Append(System.Text.Encoding.UTF8.GetString(bytes));
+        }
+        return b.Build();
+    }
+}
+
+/// <summary>
+/// <c>plug_glob_count(pattern) -&gt; BIGINT</c> — how many paths a DuckDB glob matches, through
+/// <see cref="IHostFileSystem.Glob"/>. The counting twin of <see cref="PlugReadFileFunction"/>: it gates the
+/// other member of that interface, and a COUNT is the one answer a glob gives that is assertable without
+/// knowing the runner's scratch directory.
+/// </summary>
+internal sealed class PlugGlobCountFunction : IScalarFunction
+{
+    public string Name => "plug_glob_count";
+
+    public Schema Parameters => new(new[] { new Field("pattern", StringType.Default, nullable: true) }, metadata: null);
+
+    public Field Result => new("matches", Int64Type.Default, nullable: true);
+
+    public IArrowArray Invoke(RecordBatch args)
+    {
+        var patterns = (StringArray)args.Column(0);
+        var fs = FabricatorServices.GetRequired<IHostFileSystem>();
+        var b = new Int64Array.Builder().Reserve(args.Length);
+        for (int i = 0; i < args.Length; i++)
+        {
+            if (patterns.IsNull(i))
+            {
+                b.AppendNull();
+                continue;
+            }
+            b.Append(fs.Glob(patterns.GetString(i)).Count);
+        }
+        return b.Build();
     }
 }

@@ -480,3 +480,83 @@ table	[INTEGER, INTEGER]
 
 statement ok
 RESET threads;
+
+# ============================================================================
+# The HOST SERVICE LOCATOR — a plugin resolving a capability that needs the
+# RUNNING HOST (docs/plugin-services.md §7).
+# ============================================================================
+#
+# ⚠⚠ THIS SECTION GATES TWO THINGS AT ONCE AND NEITHER HAD A GATE BEFORE IT.
+#   (1) FabricatorServices: a plugin resolving IHostFileSystem with an
+#       Fabricator.Abstractions reference alone — no Fabricator.Bridge.
+#   (2) The ABI v82 AMBIENT. A global scalar is the crossing that had NO
+#       ClientContext at all until v82, and every fs_* host callback
+#       dereferences one — an earlier host-filesystem seam died with an ACCESS
+#       VIOLATION on its first call for exactly that reason
+#       (docs/fluid-templating.md §10.2). So "a plugin reads a file" is not
+#       plumbing, it is the claim.
+#
+# ⚠ It reads through DuckDB's FileSystem, not System.IO — which is the point:
+#   the same call reaches s3:// or abfss:// with the calling session's secrets.
+#   That half is not assertable here (no remote in the hermetic fixtures), so
+#   the suite says so rather than implying it.
+
+# PER_THREAD_OUTPUT on this first COPY is what CREATES the directory: a plain
+# COPY to a file path does not create its parent, and the runner's scratch dir
+# need not exist from DuckDB's point of view.
+statement ok
+COPY (SELECT 1 AS c) TO '${FABRICATOR_DELTA_WRITE_DIR}/svc' (FORMAT csv, PER_THREAD_OUTPUT true, HEADER false);
+
+statement ok
+COPY (SELECT 'hello from storage' AS c) TO '${FABRICATOR_DELTA_WRITE_DIR}/svc/a.txt' (FORMAT csv, HEADER false, QUOTE '');
+
+statement ok
+COPY (SELECT 'second' AS c) TO '${FABRICATOR_DELTA_WRITE_DIR}/svc/b.txt' (FORMAT csv, HEADER false, QUOTE '');
+
+# THE LOAD-BEARING ASSERTION: the plugin resolved IHostFileSystem and read a
+# real file through the host. ⚠ rtrim(x, chr(10)) and NOT trim(x) — DuckDB's
+# one-argument trim removes SPACES and leaves the newline COPY appends.
+query I
+SELECT rtrim(plug_read_file('${FABRICATOR_DELTA_WRITE_DIR}/svc/a.txt'), chr(10));
+----
+hello from storage
+
+# Vectorized over a batch, and NULL means "no path" rather than "empty file".
+query II
+SELECT p IS NULL, rtrim(coalesce(plug_read_file(p), 'NULLPATH'), chr(10)) AS r
+FROM (VALUES ('${FABRICATOR_DELTA_WRITE_DIR}/svc/b.txt'), (NULL)) v(p) ORDER BY r;
+----
+true	NULLPATH
+false	second
+
+# The other member of the interface. A count is the one glob answer that is
+# assertable without knowing the runner's scratch path.
+query I
+SELECT plug_glob_count('${FABRICATOR_DELTA_WRITE_DIR}/svc/*.txt');
+----
+2
+
+# ZERO MATCHES IS AN ANSWER, NOT A FAILURE — and it is the negative control for
+# the 2 above, which would otherwise pass on a build where glob returned
+# everything it was handed.
+query I
+SELECT plug_glob_count('${FABRICATOR_DELTA_WRITE_DIR}/svc/*.nosuchext');
+----
+0
+
+# A missing file THROWS, where a glob answers zero. The two are different
+# questions and the surface keeps them different: absence of a named file is an
+# error, absence of matches is a count. (The message is the host filesystem's,
+# so only the prefix is asserted.)
+statement error
+SELECT plug_read_file('${FABRICATOR_DELTA_WRITE_DIR}/svc/does_not_exist.txt');
+----
+IO Error
+
+# The plugin's two service-backed scalars are advertised like any other.
+query II
+SELECT function_name, return_type FROM duckdb_functions()
+WHERE function_name IN ('plug_read_file', 'plug_glob_count') ORDER BY function_name;
+----
+plug_glob_count	BIGINT
+plug_read_file	VARCHAR

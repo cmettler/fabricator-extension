@@ -25,7 +25,7 @@ namespace Fabricator.Bridge;
 /// <remarks>
 /// <para>
 /// It lives in the CONTRACT assembly so a plugin needs no reference to <c>Fabricator.Bridge</c>; the bridge
-/// fills in <see cref="HostHttpTransport.Send"/> at boot.
+/// publishes <see cref="IHostHttp"/> at boot.
 /// </para>
 /// <para>
 /// This is the TERMINAL handler, not a <c>DelegatingHandler</c> — there is nothing below it. Everything above
@@ -36,7 +36,7 @@ namespace Fabricator.Bridge;
 /// ⚠ <b>It holds no state and no opener</b>, so one instance may back any number of clients and it is safe to
 /// keep for a catalog's lifetime. That is not a convenience: the ClientContext it ultimately uses is resolved
 /// PER REQUEST from the ambient, because a catalog is database-scoped and outlives the connection that
-/// attached it — see <see cref="HostHttpTransport"/> for why capturing one would be a dangling pointer.
+/// attached it — see <see cref="FabricatorServices"/> for why capturing one would be a dangling pointer.
 /// </para>
 /// <para>
 /// ⚠ WHAT IT DOES NOT INHERIT FROM <c>HttpClientHandler</c>, because DuckDB is doing the transport: automatic
@@ -56,8 +56,8 @@ namespace Fabricator.Bridge;
 /// </remarks>
 public sealed class DuckDbHttpHandler : HttpMessageHandler
 {
-    /// <summary>True once the host has installed the transport (needs a host at ABI v76 or later).</summary>
-    public static bool IsAvailable => HostHttpTransport.IsAvailable;
+    /// <summary>True once the host has published <see cref="IHostHttp"/> (needs a host at ABI v76 or later).</summary>
+    public static bool IsAvailable => FabricatorServices.IsAvailable<IHostHttp>();
 
     protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
     {
@@ -65,9 +65,9 @@ public sealed class DuckDbHttpHandler : HttpMessageHandler
         {
             throw new InvalidOperationException("DuckDbHttpHandler: the request has no URI");
         }
-        var send = HostHttpTransport.Send
+        var http = FabricatorServices.Get<IHostHttp>()
             ?? throw new NotSupportedException(
-                "DuckDbHttpHandler: the host has not installed an HTTP transport (it predates ABI v76).");
+                "DuckDbHttpHandler: the host has published no IHostHttp (it predates ABI v76).");
 
         byte[]? body = request.Content is null
             ? null
@@ -94,7 +94,7 @@ public sealed class DuckDbHttpHandler : HttpMessageHandler
             // into Task.Run — captured here, on the caller's context, which is why this still resolves the
             // right connection despite running on a pool thread.
             (responseJson, responseBody) = await Task
-                .Run(() => send(method, url, headers, body), ct)
+                .Run(() => http.Send(method, url, headers, body), ct)
                 .ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)

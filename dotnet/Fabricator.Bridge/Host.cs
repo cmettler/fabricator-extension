@@ -69,7 +69,7 @@ public static class Host
     /// rendering the caller's statement wants it, while a provider doing its own bookkeeping wants a session
     /// that cannot depend on who called it. 0 (the default) is exactly the behaviour every caller had before
     /// ABI v83. Inside an ABI crossing the handle to pass is <c>AmbientOpener.Current</c>; a plugin gets it
-    /// automatically through <see cref="HostQueryTransport"/>, which passes the ambient for you.
+    /// automatically through <see cref="IHostQuery"/>, whose implementation passes the ambient for you.
     /// </para>
     /// <para>
     /// ⚠ <b>It does NOT make the query part of the caller's transaction.</b> The connection is still fresh

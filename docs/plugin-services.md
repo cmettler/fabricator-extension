@@ -1,8 +1,7 @@
 # Plugin services — replacing the ad-hoc seams with a resolvable service surface
 
-> **Status: BOTH PIECES APPROVED (2026-09-02) — the `GetService<T>()` locator scoped to the DuckDB
-> filesystem, HTTP and host query/exec, and a new `Fabricator.Common` assembly. NOTHING BUILT YET;
-> §7 is the implementation plan to start from.** Opened user-directed:
+> **Status: STEP 1 (the `GetService<T>()` locator) IS BUILT — §8. Step 2 (`Fabricator.Common`) is
+> approved and NOT started — §7.4.** Opened user-directed:
 > This file is the working record so the analysis can continue across sessions. Everything in §1 is READ FROM
 > THE TREE or MEASURED and dated; §2 onward is design space, not decisions.
 
@@ -25,11 +24,15 @@ build. `Fabricator.Abstractions` exists to be the light contract.
 ⇒ **the shape the user asks for is the right one**: interfaces in Abstractions (light), implementations in
 Bridge, resolution by interface.
 
-⚠ `BackendRegistry`'s own comment is STALE about this — *"A plugin references Fabricator.Bridge +
-Apache.Arrow (host-provided, not copied)"*. `Fabricator.FluidPlugin` references **Abstractions only**, and
-`fabricator-sustainalytics` does the same. Fix that comment whenever this area is touched.
+⚠ ~~`BackendRegistry`'s own comment is STALE about this~~ — it claimed *"A plugin references
+Fabricator.Bridge + Apache.Arrow (host-provided, not copied)"* while `Fabricator.FluidPlugin` and
+`fabricator-sustainalytics` both reference **Abstractions only**. **FIXED 2026-09-02** with §8.
 
-### 1.2 The seams that exist, and the fact that there were nearly three
+### 1.2 The seams that exist(ed), and the fact that there were nearly three
+
+**⚠ SUPERSEDED BY §8 — both seams are DELETED.** Read this section anyway: the three rules below ARE the
+real contract, and §8 preserves them verbatim on the services that replaced the delegates. What changed is
+the mechanism, not the rules.
 
 Both are a `static` mutable delegate property on a static class in Abstractions, filled in by
 `Bootstrap.Initialize`:
@@ -512,22 +515,179 @@ tier.
    and callers refuse BY NAME. `Get<T>()` returning null loses that unless `GetRequired<T>()` throws with
    the interface name in the message.
 
+## 8. STEP 1 AS BUILT (2026-09-02) — the locator
+
+C#-only. **NO ABI change, NO C++ change.** Gate `verify_plugin` **97 → 112**; `verify_plugin_fluid` **188**
+and `verify_http_transport` **21**, both UNCHANGED, which is the behaviour-neutrality claim for the two
+capabilities that already had callers. Tiers: hermetic **74/74 — 8259**, IDENTICAL to the previous floor, and
+service **54/54 — 3272** = 3257 + exactly this suite's 15, which is what shows no other suite moved.
+
+### 8.1 What shipped
+
+| | |
+|---|---|
+| `Fabricator.Abstractions/FabricatorServices.cs` | the registry: `Register<T>` / `Get<T>` / `GetRequired<T>` / `IsAvailable<T>`, plus `Provider` as a BCL `System.IServiceProvider` |
+| `Fabricator.Abstractions/IHostFileSystem.cs` | `ReadAllBytes(path, maxBytes)` + `Glob(pattern)`, with `HostFileEntry(Path, Size)` |
+| `Fabricator.Abstractions/IHostHttp.cs` | `Send(method, url, headersJson, body)` — the shape `DuckDbHttpHandler` already consumed |
+| `Fabricator.Abstractions/IHostQuery.cs` | `Query(sql, parameters?, inheritSession?)` + `ExecuteNonQuery(sql)` |
+| `Fabricator.Bridge/HostServices.cs` | the three implementations + `Publish()` |
+| DELETED | `HostHttpTransport.cs`, `HostQueryTransport.cs` |
+
+Consumers updated: `DuckDbHttpHandler` (in Abstractions), the Fluid plugin's `FluidHostQuery` and
+`FluidTemplateFiles`. ⚠ **Breaking for the three out-of-tree plugins** (`-sustainalytics`, `-quantax`,
+`-dlrest`), which pin by sha and migrate at their next bump — this repo does not keep aliases (the `IArrow*`
+renames, `ScalarFnBind`).
+
+⚠ **A `GetService<T>()` EXTENSION OVER `IServiceProvider` IS NOT SHIPPED, and it is a deliberate omission
+rather than an oversight.** The primary API is `FabricatorServices.Get<T>()` (what §7.1 named and what the
+plan was approved as); `Provider` exists for handing the BCL type to code that wants one, and a caller
+holding it uses `GetService(typeof(T))`. A three-line generic extension would be nicer and is worth adding —
+but it needs a managed publish, which is what §8.4 is blocked on, and shipping source that has never been
+built is worse than the small ergonomic gap.
+
+### 8.2 ⚠⚠ `IHostFileSystem` SHIPS, and what decided it was ABI v82 rather than taste
+
+§7.3 left this open: the interface would have had no consumer and therefore no gate. It ships **with** a
+gate, and the reason it is now shippable at all is that **the ambient gap that killed the last attempt is
+closed**. Slice 4 of the Fluid work built a `HostFileTransport` to exactly the HTTP seam's shape and the
+first include died with `0xC0000005` inside `HostFs.OpenRead`, because every `fs_*` host callback
+dereferences the calling operator's `ClientContext` and a GLOBAL function had none
+(docs/fluid-templating.md §10.2). ABI v82 gives the scalar crossings `(opener, session, txn)`, so a
+plugin's global scalar now HAS one.
+
+⇒ the gate is `plug_read_file(path)` and `plug_glob_count(pattern)` in `Fabricator.SamplePlugin`, and it is
+**the first in-tree proof that the v82 ambient reaches a PLUGIN** — a plugin reading a file through DuckDB's
+own filesystem is a claim about two mechanisms at once, and neither had a test before.
+
+⚠ **What the gate does NOT cover, said plainly rather than implied:** the interesting half of routing through
+the host is that the same call reaches `s3://` or `abfss://` with the CALLING SESSION's secrets, and no
+hermetic fixture has a remote root. The suite asserts local reads and says so.
+
+⚠ **The surface is deliberately two members.** A filesystem interface is easy to widen and impossible to
+narrow, and an unused member on a plugin-facing contract is a compatibility obligation bought for nothing.
+Streaming, writing and directory manipulation are all reachable inside the bridge and are not exposed.
+
+⚠ **`read_blob` through `IHostQuery` remains the better tool where ABSENCE is an ordinary outcome** — it
+returns zero rows rather than throwing, and reports `size` and `last_modified` besides. That is why the Fluid
+template provider was NOT switched onto the filesystem now that one exists (docs/fluid-templating.md §10.3
+gives all four measured reasons). `IHostFileSystem` is for a path you expect to exist.
+
+### 8.2a ⚠ `IHostQuery.ExecuteNonQuery` IS UNGATED, and the suite does not pretend otherwise
+
+The member is in scope (the user's words were "host query/**exec**") and `Host.ExecuteNonQuery` behind it is
+long-standing and used internally — but **no in-tree plugin calls it**, so nothing exercises it through the
+locator. The Fluid `query()` filter cannot be the gate: it REFUSES anything that is not a SELECT, by design
+(§8.3 of fluid-templating.md — a bind-time write fires on `EXPLAIN`).
+
+⇒ It is one sample-plugin scalar away from covered — the same shape `plug_read_file` took — and that is the
+natural follow-up. It is recorded here rather than quietly shipped as if the `IHostQuery` gate covered both
+members: `verify_plugin_fluid`'s 188 assertions prove `Query`, and say nothing about `ExecuteNonQuery`.
+
+⚠ Adding that scalar needs a managed publish, which is exactly what §8.4 is blocked on.
+
+### 8.3 Four things building it established
+
+1. **`HostFs` had no read-all**, so one was added THERE — the unsafe wrapper class is its home, and putting
+   it in the service would have made `HostServices.cs` unsafe for one method. ⚠ The ceiling is checked
+   against the file's SIZE **before** a byte is read, so an oversized file costs an open and a stat rather
+   than the memory, and it FAILS rather than truncating: a truncated document is a wrong answer that looks
+   like a right one.
+2. **⚠ `Array.Empty<byte>()` DOES NOT COMPILE inside `Fabricator.Bridge`** — `Apache.Arrow.Array` and
+   `System.Array` are both in scope (CS0104). Loud, immediate, and worth knowing before writing the next
+   file there.
+3. **`Publish()` registers only what the host supports.** A capability the host did not register is absent
+   from the registry, so `GetRequired<T>()` names the interface. Registering an implementation that always
+   throws would make *"the host cannot do this"* indistinguishable from *"the call was wrong"*.
+4. **The glob JSON is parsed in the BRIDGE, not handed to the plugin.** A plugin gets `HostFileEntry`, never
+   the host's wire format. ⚠ `Size` is **-1** when the listing carries none, not 0: a local filesystem
+   reports no size (DuckDB's `FileSystem` has no path-stat, so a size there costs an OPEN — the finding that
+   once made a lakehouse ATTACH take minutes), and a 0 would read as "empty file".
+
+### 8.3a ✅ MUTATION-TESTED — the gate IS an ABI-v82-ambient test, and it dies with the predicted sentence
+
+One mutant, killed at its own assertion. In `HostFileSystemService.ReadAllBytes`, pass `0` instead of
+`AmbientOpener.Current`:
+
+| leg | result |
+|---|---|
+| control (clean) | `verify_plugin` **112** |
+| mutant (ambient dropped) | **dies at line 519**, the first `plug_read_file` assertion, after 100 pass |
+
+**The message is the point, and it was PREDICTED before the run rather than read off afterwards:**
+`IO Error: … scalarfn_execute failed: host fs_open_read failed: … "fabricator: fs_open_read requires a
+client context (no ambient opener)"`. So the gate does not merely read a file — it reads it *through the
+caller's `ClientContext`*, which is what makes it a proof about ABI v82 and not a coincidence.
+
+⚠ **Both legs were published to a SCRATCH `-ExtensionDir`**, leaving the tier-measured payload untouched —
+the shared `build/release` payload is contended (another session's `unittest.exe` has raced it before), and
+a mutant published over it would invalidate the very counts it is being compared against.
+
+⚠ **It also gives the `fs_*` null-opener guard its first demonstrated reachable path.** That guard was added
+the same day and recorded as UNGATED, because nothing in tree calls an `fs_*` callback without an ambient.
+It still is, in normal operation — but the mutant shows it converting what used to be an access violation
+into a sentence naming the missing context, which is the behaviour it was written for.
+
+⚠ **The control also settles that the SDK move is behaviour-neutral HERE**: the clean leg was published by
+SDK **10.0.400** (the tiers were measured on a **10.0.203** payload) and answers the same 112. That is one
+suite, not a tier — see §8.4.
+
+### 8.4 ⚠ THE MUTATION TEST WAS BLOCKED FOR AN HOUR BY A VISUAL STUDIO UPDATE IN FLIGHT — and my first
+diagnosis named the wrong cause
+
+**Kept because the CORRECTION is the useful part.** Mid-session, between a successful publish and the next
+one, publishing began failing with `NETSDK1045: The current .NET SDK does not support targeting .NET 10.0`.
+The observations were right — `dotnet --list-sdks` reported only 9.0.313/9.0.317, `host/fxr` had no 10.x,
+and `sdk/10.0.203` was an empty leftover holding one `Roslyn` folder. **The CAUSE I wrote down was wrong:**
+I recorded it as "the .NET 10 SDK was uninstalled from this machine", which implies somebody must reinstall
+it. **A VISUAL STUDIO UPDATE WAS RUNNING IN THE BACKGROUND** (user-supplied), and I had caught the window
+between it removing 10.0.203 and installing its replacement. Forty minutes later:
+`10.0.400` present, `host/fxr` carrying `10.0.11`.
+
+⇒ **the transferable rule: a build environment that changes UNDER a session is more likely mid-update than
+mid-uninstall, and the two call for opposite responses** — wait, versus escalate. The tell was available and
+I did not read it: an "uninstall" that leaves a version-numbered `Roslyn` folder behind is a partially
+completed *replacement*, not a removal.
+
+⚠ **THE SDK VERSION MOVED (10.0.203 → 10.0.400) AND THAT IS NOT NEUTRAL FOR MEASUREMENT.** A payload
+published after the update is built by a different compiler and ships a different runtime pack than one
+published before it. So a mutation test spanning the change would differ in TWO variables. Both legs —
+mutant and control — must be published on the SAME SDK, and a green result carried over from before the
+update is a result about a payload that no longer exists.
+
+⚠ **The other half of a VS update: the MSVC toolset can move too.** `build/release/CMakeCache.txt` pins
+`CMAKE_CXX_COMPILER` to an exact toolset directory, and CLAUDE.md records that linking against a *different*
+toolset than the configure used fails with unresolved `__std_*` STL intrinsics. Nothing here needed a C++
+rebuild, so it was not hit — but check that path exists before the next one.
+
+✅ **AND THE MUTANT HAS SINCE RUN — §8.3a.** The SDK came back as 10.0.400 within the hour, both legs were
+published on it, and the mutant died at its own assertion with the predicted message. What §8.4 preserves is
+the diagnosis error, not an outstanding debt.
+
+⚠ **What the block did NOT cause: the two void service tiers.** Those were a concurrency mistake of mine
+(two runs against one SQL Server and one MinIO bucket), and the SIGSEGV and row-count mismatch they produced
+belong to that, not to the SDK. Do not let one environmental problem absorb the blame for an unrelated one.
+
 ## 5. Open questions
 
 1. ~~Is **cross-plugin** sharing in scope?~~ **ANSWERED 2026-09-02 (user): it is the EXCEPTION, and a
    shared assembly the plugins own is the answer — so the host ships nothing new. See §3.3, including the
    measured version rule.**
-2. ~~`System.IServiceProvider` + our own extensions, or take MEDI?~~ **ANALYSED in §3.4; RECOMMENDED:
-   BCL `IServiceProvider` as the contract, our own dictionary as the implementation. Awaiting the
-   user's decision.** The deciding facts are that there is no dependency graph to resolve, and that a
-   built MEDI provider is IMMUTABLE while `BackendRegistry.Invalidate()` re-scans.
-3. Does the locator REPLACE `HostHttpTransport` / `HostQueryTransport`, or wrap them? Replacing is cleaner
-   and is a BREAKING change for out-of-tree plugins — which this repo has done before without aliases (the
-   `IArrow*` renames, `ScalarFnBind`), so it is a decision, not an obstacle.
+2. ~~`System.IServiceProvider` + our own extensions, or take MEDI?~~ **ANSWERED and BUILT (§8): BCL
+   `IServiceProvider` as the contract, our own `ConcurrentDictionary` as the implementation.** The deciding
+   facts are that there is no dependency graph to resolve, and that a built MEDI provider is IMMUTABLE while
+   `BackendRegistry.Invalidate()` re-scans.
+3. ~~Does the locator REPLACE `HostHttpTransport` / `HostQueryTransport`, or wrap them?~~ **REPLACED —
+   both are DELETED (§8). Breaking for the three out-of-tree plugins, which pin by sha and migrate at their
+   next bump; no aliases, as with the `IArrow*` renames and `ScalarFnBind`.**
 4. Should `Fabricator.Abstractions` finally be PACKED and versioned? (§1.5.) A bigger contract surface makes
    the sha-pin more load-bearing, and this is the natural moment to ask.
-5. Scoping: are all services singletons, or is there a per-call/per-transaction scope? The ambient rule
-   (§3.1) means a singleton is safe for the current set — but a service that *did* need per-call state
-   (an `IInterruptScope`) is a factory, not a singleton.
-6. What does a plugin do when a service is absent — `null`, throw, or a no-op implementation? The existing
-   seams expose `IsAvailable` and the callers refuse by name; a locator should not quietly lose that.
+5. Scoping: are all services singletons, or is there a per-call/per-transaction scope? **STILL OPEN, and
+   the three built services sidestep it rather than answer it**: the ambient rule (§3.1) makes a singleton
+   safe for all three, because each reads the ambient per call and holds nothing. A service that genuinely
+   needed per-call state (an `IInterruptScope`) would be a FACTORY, not a singleton, and the registry has no
+   opinion about that yet.
+6. ~~What does a plugin do when a service is absent?~~ **ANSWERED by the build (§8): `Get<T>()` returns
+   null, `GetRequired<T>()` throws NAMING the interface, and `IsAvailable<T>()` preserves what the old seams'
+   `IsAvailable` gave.** ⚠ The load-bearing half is what `Publish()` does NOT do: a capability the host did
+   not register is simply absent, rather than present as an implementation that always throws — otherwise
+   "the host cannot do this" and "the call was wrong" become the same failure.
