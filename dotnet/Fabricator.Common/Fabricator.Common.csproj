@@ -17,6 +17,17 @@
       impossibility is the membership rule: a type that needs the running host cannot live here, it is a
       SERVICE (see FabricatorServices). docs/plugin-services.md sections 6 and 7.4.
     </Description>
+
+    <!-- PACKABLE. Directory.Build.props turns packing OFF for the whole folder; these two assemblies are the
+         only ones a plugin may reference, so they are the only ones that opt back in.
+         /!\ PackageId is UNRESERVED on nuget.org: `Fabricator.Abstractions` is free but the bare `Fabricator`
+         ID is TAKEN by an unrelated package (checked 2026-09-02), so a `Fabricator.*` prefix reservation is
+         unlikely to be granted. That binds nothing while packages go to a local folder or a release asset;
+         revisit the ID before publishing to nuget.org. docs/plugin-services.md section 5 Q4. -->
+    <IsPackable>true</IsPackable>
+    <PackageId>Fabricator.Common</PackageId>
+    <PackageDescription>Optional reusable implementations of the Fabricator.Abstractions contracts - Arrow value reading, the Arrow stream adapters, the custom-aggregate session, and the fixed-schema function base classes - so a plugin need not hand-roll them. Adds no package to a plugin closure beyond Abstractions.</PackageDescription>
+    <PackageTags>duckdb;fabricator;plugin;arrow</PackageTags>
   </PropertyGroup>
 
   <ItemGroup>

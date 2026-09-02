@@ -5,7 +5,14 @@ set(TARGET_NAME fabricator)
 set(EXTENSION_NAME ${TARGET_NAME}_extension)
 set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 
-set(FABRICATOR_EXTENSION_VERSION "0.0.13")
+# THE VERSION LIVES IN ONE FILE, and that is a fix rather than a style choice: it used to be a literal
+# here AND a second literal in extension_config.cmake, and CLAUDE.md records that bumping BOTH is easy to
+# miss -- the prose tracking it went stale four separate times. Since the managed side needs the same
+# number too (the NuGet package version + AssemblyInformationalVersion, dotnet/Directory.Build.props), a
+# third literal would have made a known problem worse. All three read ./VERSION.
+# CMAKE_CURRENT_LIST_DIR, not CMAKE_CURRENT_SOURCE_DIR: this file is processed from DuckDB's build, so
+# only the former reliably names THIS repo.
+file(STRINGS "${CMAKE_CURRENT_LIST_DIR}/VERSION" FABRICATOR_EXTENSION_VERSION LIMIT_COUNT 1)
 
 project(${TARGET_NAME} CXX)
 

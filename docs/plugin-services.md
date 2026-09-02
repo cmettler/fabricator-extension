@@ -1,7 +1,7 @@
 # Plugin services — replacing the ad-hoc seams with a resolvable service surface
 
 > **Status: BOTH STEPS BUILT — §8 (the `GetService<T>()` locator), §9 (`Fabricator.Common`), §10
-> (`IHostLog`, §7.4a's third question).**
+> (`IHostLog`, §7.4a's third question), §11 (versioning + NuGet packages, §5 Q4).**
 > ⚠ §9.4, §9.5 and §10.4 CORRECT the plan and this build: the acceptance test's target no longer existed,
 > §7.4a's "13 → 16" is wrong on two of three, and a defensive mechanism in `IHostLog` turned out to be
 > unnecessary — its mutant survived. Opened user-directed:
@@ -1032,6 +1032,192 @@ question; nothing about reading the code would have.
   `(int level, string category, string message)` and `FileLoggerProvider.Write` takes a line — so no
   structured field survives today either.
 
+## 11. VERSIONING + PACKAGING (2026-09-02) — steps 1–3 of §5 Q4's ladder
+
+User-directed: *"i think a nuget is a good idea. it could just be an local artifacts folder for the
+moment."* C# + build files, **NO ABI change, NO C++ code change** (two CMake files now READ a version they
+used to state). Gate: tier-0 `Fabricator.Bridge.Tests` **244 → 249**, two mutants each killed at its own
+test.
+
+### 11.1 ⚠⚠ THE VERSION LIVES IN ONE FILE, AND THAT IS A FIX RATHER THAN NEW MACHINERY
+
+Before: **two** literals — `CMakeLists.txt`'s `FABRICATOR_EXTENSION_VERSION` (what `fabricator_version()`
+returns) and `extension_config.cmake`'s `EXTENSION_VERSION` (the artifact footer) — with CLAUDE.md recording
+that *"bumping BOTH … are easy to miss"*, and the prose tracking the current number having gone stale
+**four separate times**. The managed side needed the same number too, so a third literal would have made a
+known problem worse.
+
+Now: **`./VERSION`**, read by all three.
+
+| reader | how |
+|---|---|
+| `CMakeLists.txt` | `file(STRINGS "${CMAKE_CURRENT_LIST_DIR}/VERSION" … LIMIT_COUNT 1)` |
+| `extension_config.cmake` | the same, in its own scope — the two are different CMake scopes, so each reads the file |
+| `dotnet/Directory.Build.props` | `$([System.IO.File]::ReadAllText('…/VERSION').Trim())` |
+
+⚠ `CMAKE_CURRENT_LIST_DIR`, **not** `CMAKE_CURRENT_SOURCE_DIR`: both files are processed from DuckDB's
+build, so only the former names this repo. `extension_config.cmake` already relied on it for `SOURCE_DIR`,
+which is what makes the usage proven rather than plausible.
+
+⚠ `.Trim()` is required on the MSBuild side and not on the CMake side — `file(STRINGS)` drops the newline,
+`ReadAllText` does not.
+
+⚠ **A `.gitattributes` rule forcing LF looked necessary and is NOT — measured, so it was not added.** A
+stray `` in the version would corrupt the artifact footer, which is the kind of hazard `*.sh text eol=lf`
+exists for. But `file(STRINGS)` on a CRLF file returns `0.0.13` at **length 6** (checked with `cmake -P`),
+i.e. it strips the CR itself, and `.Trim()` covers the MSBuild side by construction. Adding a rule that
+protects against nothing would make `.gitattributes` claim a load-bearing entry it does not have.
+
+**VERIFIED IN THE GENERATED BUILD, not by reading**: `build.ninja` carries
+`FABRICATOR_VERSION=\"0.0.13\"` and `EXTENSION_VERSION="0.0.13"`. A configure was enough; no full build was
+needed to establish it.
+
+### 11.2 ⚠⚠ `AssemblyVersion` IS PINNED AT `1.0.0.0` AND MUST STAY THERE
+
+`<Version>` alone would drive `AssemblyVersion` too, which would make the contract's **assembly identity**
+move with every release. That is the one thing to avoid, and the reason is what §5 Q4 established by reading
+the loader:
+
+- the plugin scan skips a plugin-dir copy of a host assembly by **SIMPLE NAME** (`a.GetName().Name`);
+- `InstallPluginResolver` probes `name.Name + ".dll"`, also simple name;
+- and `Fabricator.Abstractions` is already loaded in the bridge's ALC before any plugin is scanned, so the
+  reference never reaches the resolver at all.
+
+⇒ **today the running host's copy always wins, whatever the plugin compiled against.** Letting
+`AssemblyVersion` float risks trading that forgiving behaviour for a `FileLoadException` at load — which is
+a WORSE failure than the member-missing one it would replace, because it names a version instead of the
+member that is absent.
+
+What moves is `InformationalVersion` (and `PackageVersion`), which are **diagnostic**: they are what the
+plugin manifest records and what the install row reports. **Skew stays REPORTABLE without becoming
+ENFORCED.**
+
+⚠ Measured on the built assembly: `AssemblyVersion=1.0.0.0`, `FileVersion=1.0.0.0`,
+`InformationalVersion=0.0.13+<sha>`. The SDK appends the commit sha by default — worth keeping, since it
+makes an informal build identifiable — which is why `FabricatorVersion.Contract` **trims at the `+`**: a
+manifest written from a different checkout would carry a different sha for the same contract.
+
+### 11.3 The packages
+
+`IsPackable` is **false for the whole folder** and the two assemblies a plugin may reference opt back in.
+`scripts/pack-nuget.ps1` produces:
+
+```
+artifacts/Fabricator.Abstractions.0.0.13.nupkg   lib/net10.0 + lib/net8.0, deps: Apache.Arrow 23.0.0
+artifacts/Fabricator.Common.0.0.13.nupkg         lib/net10.0 + lib/net8.0, deps: Fabricator.Abstractions 0.0.13
+```
+
+Both TFMs, so a net8.0-only plugin resolves; `Common → Abstractions` is a real package dependency, so
+referencing Common brings the contract transitively; and **`Apache.Arrow`'s version becomes NuGet's problem
+rather than a comment in each plugin's csproj saying "must track Abstractions' (23.0.0)"**.
+
+⚠ **The script ASSERTS the `.nupkg` exists rather than trusting the exit code**: `dotnet pack` on a project
+whose `IsPackable` is false **succeeds and emits nothing**, which is exactly the silent failure the check
+is for.
+
+### 11.4 ⚠⚠ WHERE TO PUBLISH — two external facts, both checked rather than recalled
+
+1. **`Fabricator.Abstractions` is FREE on nuget.org** (flat-container 404) **but the bare `Fabricator` ID is
+   TAKEN** by an unrelated package (versions 0.3.2–0.5.0). ⇒ a **`Fabricator.*` prefix reservation is
+   unlikely to be granted**, since NuGet weighs whether the prefix is already in use by others. Publishing
+   unreserved works (no verified badge, no protection against a stranger taking `Fabricator.Something`); a
+   distinct prefix such as `Ethenea.Fabricator.*` is the alternative. **Neither binds while packages go to a
+   local folder or a release asset, which is why the ID decision is deferred rather than made.**
+2. **GitHub Packages requires a token to install even PUBLIC packages** — GitHub's own docs: *"You need an
+   access token to publish, install, and delete private, internal, and public packages."* ⇒ it would give
+   the appearance of a public feed with none of the benefit, which is the opposite of what packaging is for.
+   Fine while every consumer is CI you own — which today it is, all three plugin repos.
+
+**The ladder, in order of cost:** local `artifacts/` folder (**done**) → attach the `.nupkg` to the GitHub
+Release, which `distribution.yml` already drafts (**not done**) → nuget.org, when a third party who cannot
+clone this repo needs `dotnet add package` (**not done, and the ID question lands here**).
+
+### 11.5 The skew report — it REPORTS, it does not gate
+
+`PluginPackage.ContractSkew(declared, running)` appends a note to the install row's `detail` when a plugin
+declares a different contract version than the host is running. `PluginInstall` passes
+`manifest.AbstractionsVersion` and `FabricatorVersion.Contract`.
+
+**⚠ Refusing would be a STRICTER rule than the runtime's own.** Nothing binds on the number (§11.2), so a
+skewed plugin loads and fails only on a member it uses that moved — while the contract version now moves on
+**every release**, most of which change nothing a given plugin touches. A gate would refuse working plugins.
+
+⚠ **Absent says NOTHING, not "unknown"**: `abstractionsVersion` is optional and every archive built before
+today has none, so treating absence as a mismatch would put a note on every older plugin — the noise that
+would make a real one invisible. An empty RUNNING version is silent too: that is our build being wrong, and
+reporting the plugin for it would blame the wrong side.
+
+⚠ The comparison is **ORDINAL**. A scheme this repo does not have yet (a prerelease suffix, a sha) would
+make two equivalent contracts compare unequal — the safe direction for a message that changes nothing, and
+the reason to keep it out of any decision.
+
+**⚠⚠ IT RETIRED A JUSTIFICATION RATHER THAN A DECISION, and the distinction is the point.**
+`PluginPackage`'s doc said the field was ungated because *"Nothing in this repo versions
+`Fabricator.Abstractions` — every assembly is 1.0.0.0 — so a comparison would either pass always or fail
+always, i.e. it would be an untestable flag."* That reason is now false, and the conclusion is unchanged —
+for a different and better reason. Both the class doc and the tier-0 test's summary were rewritten, because
+a stale justification for a live decision is how the decision gets reversed by someone reading it.
+
+### 11.6 Gates
+
+Tier-0 `Fabricator.Bridge.Tests` **244 → 249** (⚠ `installer-core.yml`'s `EXPECTED_MINIMUM` bumped; the
+workflow is the authority, not any table). Three assertions plus two mutants:
+
+| mutant | dies at |
+|---|---|
+| absence no longer silent | the three-case absence theory (3 failures), leaving the other 246 green |
+| the note names neither version | the "names both and says not enforced" test (1 failure) |
+
+**⚠ The skew note is tier-0-testable ONLY because `ContractSkew` is a PURE function taking both versions as
+parameters.** It was written first inside `PluginInstall` reading `FabricatorVersion.Contract` directly,
+which is untestable offline — an install test can produce only the "equal" outcome, since the fixture is
+built from this same tree. Moving it to `PluginPackage` (*"the decidable half … deliberately free of file
+I/O"*) is what let all three outcomes be pinned.
+
+⚠ **`verify_plugin_install` cannot see any of this**: the sample plugin's manifest now declares `0.0.13` and
+the host runs `0.0.13`, so the note is correctly silent. The suite pins that silence by continuing to pass;
+the three outcomes are tier 0's.
+
+### 11.7 What is NOT done
+
+- The GitHub Release asset (§11.4 rung 2) — one line in `distribution.yml`'s release job.
+- nuget.org, and the package ID decision that goes with it.
+- **The sustainalytics migration**, which is the acceptance test for the whole thing: its submodule,
+  `FabricatorPath` property and `CheckFabricatorPath` target all disappear in favour of a `nuget.config`
+  naming the folder. **The consuming half IS proven** — §11.8 — so what remains is that repo's edit.
+- A `PackageReadmeFile`. `dotnet pack` warns about it; it matters only on nuget.org.
+
+### 11.8 ✅ THE FOLDER FEED IS PROVEN FROM THE CONSUMING SIDE — and it CORRECTED the migration note twice
+
+A throwaway net8.0 project (`nuget.config` naming `artifacts/`, one
+`PackageReference Include="Fabricator.Common"`) restores and compiles code touching `FabricatorVersion`,
+`ArrowValueReader`, `FabricatorServices`, `IHostFileSystem` and Apache.Arrow types. So a plugin really can be
+built with no checkout of this repo, which is the entire point of the exercise.
+
+**⚠⚠ AND THE `ExcludeAssets="runtime"` ADVICE I WROTE FROM REASONING WAS WRONG IN BOTH DIRECTIONS.**
+Measured, three builds of the same project:
+
+| plugin csproj shape | what lands in the output |
+|---|---|
+| library default | `probe.dll` **only** |
+| `+ CopyLocalLockFileAssemblies=true` | probe **+ Fabricator.Common + Fabricator.Abstractions + Apache.Arrow + Apache.Arrow.Scalars** |
+| `+ ExcludeAssets="runtime"` on **`Fabricator.Common` alone** | `probe.dll` **only** |
+
+1. **"A package reference copies to output by DEFAULT" is FALSE for a library** — neither form copies.
+   `CopyLocalLockFileAssemblies=true`, which every plugin sets **to get its own dependencies**, is what makes
+   the contract copy too. That is the same fact this repo already recorded for the FluidPlugin from the
+   other side (*"a LIBRARY does not copy its NuGet closure"*), reached again from the opposite direction.
+2. **`ExcludeAssets="runtime"` on the TOP-LEVEL package suppresses the WHOLE transitive closure** —
+   Abstractions, Apache.Arrow and Apache.Arrow.Scalars all vanish from one attribute. ⚠ That is the OPPOSITE
+   of the FluidPlugin's note that *"ExcludeAssets does not flow to a transitive dependency"*, and both are
+   true: there, `Apache.Arrow` arrives through a **ProjectReference** to Abstractions, which a
+   `PackageReference`'s ExcludeAssets does not govern. **Package-rooted and project-rooted closures behave
+   differently, and the migration crosses from one to the other** — so a plugin moving to packages gets
+   SIMPLER, not fussier: one attribute replaces the pair.
+
+⇒ the migration note is now: add `CopyLocalLockFileAssemblies` as today, and put `ExcludeAssets="runtime"`
+on the ONE fabricator package reference.
+
 ## 5. Open questions
 
 1. ~~Is **cross-plugin** sharing in scope?~~ **ANSWERED 2026-09-02 (user): it is the EXCEPTION, and a
@@ -1044,8 +1230,11 @@ question; nothing about reading the code would have.
 3. ~~Does the locator REPLACE `HostHttpTransport` / `HostQueryTransport`, or wrap them?~~ **REPLACED —
    both are DELETED (§8). Breaking for the three out-of-tree plugins, which pin by sha and migrate at their
    next bump; no aliases, as with the `IArrow*` renames and `ScalarFnBind`.**
-4. Should `Fabricator.Abstractions` finally be PACKED and versioned? (§1.5.) **STILL OPEN, and §9 made it
-   SHARPER rather than answering it.** Two things changed on 2026-09-02: a plugin may now pin **two** of our
+4. Should `Fabricator.Abstractions` finally be PACKED and versioned? (§1.5.) **DECIDED AND PARTLY BUILT —
+   §11.** User, 2026-09-02: *"i think a nuget is a good idea. it could just be an local artifacts folder for
+   the moment."* Both assemblies pack, versioned from a single `./VERSION`; what remains open is only WHERE
+   a package is published (§11.4's ladder) and the nuget.org package ID, which is unforced until something
+   is published there. The analysis that led to it: Two things changed on 2026-09-02: a plugin may now pin **two** of our
    assemblies by sha instead of one (Abstractions + optionally Common), and the contract grew — four service
    interfaces plus eight implementation types that are now part of what a pin bump can break. Neither is an
    argument for packaging by itself; what they do is raise the cost of the status quo, which is that

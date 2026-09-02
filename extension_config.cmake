@@ -1,9 +1,13 @@
 # DuckDB extension build configuration for fabricator.
 # EXTENSION_VERSION is set explicitly so the build does not require a git commit
 # in this repo (DuckDB otherwise derives the version via `git describe`).
+# It is READ FROM ./VERSION rather than written twice: this value and CMakeLists.txt's
+# FABRICATOR_EXTENSION_VERSION must agree (one becomes the artifact footer, the other what
+# fabricator_version() returns), and they are in different CMake scopes, so each reads the file itself.
+file(STRINGS "${CMAKE_CURRENT_LIST_DIR}/VERSION" FABRICATOR_EXTENSION_VERSION LIMIT_COUNT 1)
 duckdb_extension_load(fabricator
     SOURCE_DIR ${CMAKE_CURRENT_LIST_DIR}
-    EXTENSION_VERSION "0.0.13"
+    EXTENSION_VERSION "${FABRICATOR_EXTENSION_VERSION}"
     LOAD_TESTS
 )
 

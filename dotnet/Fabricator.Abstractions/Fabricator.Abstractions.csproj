@@ -18,6 +18,17 @@
       A type here must be CONTRACT. An implementation belongs in Common; anything needing the running host is
       a SERVICE (FabricatorServices). docs/plugin-services.md sections 7.2 and 9.
     </Description>
+
+    <!-- PACKABLE. Directory.Build.props turns packing OFF for the whole folder; these two assemblies are the
+         only ones a plugin may reference, so they are the only ones that opt back in.
+         /!\ PackageId is UNRESERVED on nuget.org: `Fabricator.Abstractions` is free but the bare `Fabricator`
+         ID is TAKEN by an unrelated package (checked 2026-09-02), so a `Fabricator.*` prefix reservation is
+         unlikely to be granted. That binds nothing while packages go to a local folder or a release asset;
+         revisit the ID before publishing to nuget.org. docs/plugin-services.md section 5 Q4. -->
+    <IsPackable>true</IsPackable>
+    <PackageId>Fabricator.Abstractions</PackageId>
+    <PackageDescription>The stable contract surface a fabricator PLUGIN compiles against: the provider and function interfaces, the Arrow-typed POCOs that cross the host boundary, and the host-service locator. Reference this and Apache.Arrow; nothing else is required to write a plugin.</PackageDescription>
+    <PackageTags>duckdb;fabricator;plugin;arrow</PackageTags>
   </PropertyGroup>
 
   <ItemGroup>

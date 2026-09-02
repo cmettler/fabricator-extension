@@ -81,3 +81,8 @@ docker/certs/openssl.cnf
 # `scripts/check-docs.sh` already guards its two CLAUDE.md reads with os.path.exists, so a clone without it
 # still passes rather than failing on a missing file.
 /CLAUDE.md
+
+# NuGet output (scripts/pack-nuget.ps1). Build product, not source.
+# /!\ ANCHORED: an unanchored `artifacts` would also ignore any subdirectory of that name, and this is
+# specifically the repo-root staging folder a plugin points a local feed at.
+/artifacts/

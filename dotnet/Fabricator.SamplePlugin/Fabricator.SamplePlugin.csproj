@@ -46,7 +46,7 @@
     <MakeDir Directories="$(PluginStageDir)any" />
     <Copy SourceFiles="$(OutputPath)$(AssemblyName).dll" DestinationFolder="$(PluginStageDir)any" />
     <WriteLinesToFile File="$(PluginStageDir)fabricator-plugin.json" Overwrite="true" WriteOnlyWhenDifferent="false"
-                      Lines="{ &quot;formatVersion&quot;: 1, &quot;name&quot;: &quot;sampleplugin&quot;, &quot;version&quot;: &quot;1.0.0&quot;, &quot;entryAssembly&quot;: &quot;$(AssemblyName).dll&quot;, &quot;abstractionsVersion&quot;: &quot;1.0.0&quot; }" />
+                      Lines="{ &quot;formatVersion&quot;: 1, &quot;name&quot;: &quot;sampleplugin&quot;, &quot;version&quot;: &quot;1.0.0&quot;, &quot;entryAssembly&quot;: &quot;$(AssemblyName).dll&quot;, &quot;abstractionsVersion&quot;: &quot;$(FabricatorContractVersion)&quot; }" />
     <Delete Files="$(PluginArchivePath)" />
     <ZipDirectory SourceDirectory="$(PluginStageDir)" DestinationFile="$(PluginArchivePath)" Overwrite="true" />
   </Target>

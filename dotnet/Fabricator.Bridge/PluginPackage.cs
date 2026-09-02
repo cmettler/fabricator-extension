@@ -50,15 +50,54 @@ internal readonly record struct PluginFileSelection(string Entry, string Relativ
 /// — is REFUSED rather than guessed at, because the alternative is a rule that has to recognise a platform
 /// directory by its NAME: an archive shipping only <c>linux_amd64/</c> would then look flat on Windows and
 /// its Linux binaries would be installed. Guessing there is a wrong ANSWER, so the archive states it.</para>
-/// <para>⚠ <see cref="PluginManifest.AbstractionsVersion"/> is NOT gated on, deliberately. Nothing in this
-/// repo versions <c>Fabricator.Abstractions</c> — every assembly is 1.0.0.0 — so a comparison would either
-/// pass always or fail always, i.e. it would be an untestable flag. The real incompatibility (a plugin built
-/// against a different <c>Apache.Arrow</c> or contract major) already has an honest report: the scan records
-/// it as <c>rejected</c> with the exception. The field is carried so a future version scheme has somewhere
-/// to land, and surfaced so a human can see the mismatch.</para>
+/// <para>⚠ <see cref="PluginManifest.AbstractionsVersion"/> is REPORTED, NOT GATED ON — and the reason
+/// changed on 2026-09-02 without the conclusion changing. It used to be that nothing here versioned
+/// <c>Fabricator.Abstractions</c> (every assembly was 1.0.0.0), so a comparison would have passed always or
+/// failed always — an untestable flag. There IS a version now (<see cref="FabricatorVersion.Contract"/>,
+/// from the repo's single <c>VERSION</c> file), and <c>PluginInstall</c> compares the two and appends a note
+/// to the install row's <c>detail</c>. It still does not REFUSE, because refusing would be a stricter rule
+/// than the runtime's own: nothing binds on the number — the plugin's reference resolves to whichever copy
+/// the host already loaded, matched by SIMPLE NAME — so a skewed plugin loads and fails only on a member it
+/// uses that moved. Most releases move the version and change nothing a given plugin touches.</para>
 /// </remarks>
 internal static class PluginPackage
 {
+    /// <summary>
+    /// A note for the install row's <c>detail</c> when a plugin was built against a DIFFERENT contract
+    /// version than the one running. Empty otherwise — silence is the normal case, and the common one.
+    /// </summary>
+    /// <param name="declared">The manifest's <c>abstractionsVersion</c>; <c>""</c> when the archive
+    /// declared none.</param>
+    /// <param name="running">The host's own contract version (<c>FabricatorVersion.Contract</c>). Passed
+    /// in rather than read here, so this stays a PURE function with no assembly to interrogate — which is
+    /// what lets tier 0 pin all three outcomes offline, where an install test can only ever produce the
+    /// "equal" one.</param>
+    /// <remarks>
+    /// <para><b>⚠ It REPORTS; it does not gate, and that is a decision rather than an unfinished one.</b>
+    /// Nothing in the runtime binds on this number: a plugin's <c>Fabricator.Abstractions</c> reference is
+    /// satisfied by the copy already loaded in the bridge's load context (the scan skips a plugin-dir copy
+    /// by SIMPLE NAME, and <c>InstallPluginResolver</c> probes by simple name too), so a skewed plugin
+    /// loads and then fails at the first member it uses that moved. Refusing the install would be a
+    /// STRICTER rule than the runtime's own, and it would refuse plugins that work — the contract version
+    /// moves on every release, most of which change nothing a given plugin touches.</para>
+    /// <para>⚠ An EMPTY declared version says NOTHING rather than "unknown": the field is optional and
+    /// every archive built before there was a version to record has none.</para>
+    /// <para>⚠ The comparison is ORDINAL, not semantic. A scheme this repo does not yet have (a prerelease
+    /// suffix, a build sha) would make two equivalent contracts compare unequal and produce a note where
+    /// none is warranted — the safe direction for a message that changes nothing, and the reason to keep
+    /// it out of any decision.</para>
+    /// </remarks>
+    internal static string ContractSkew(string declared, string running)
+    {
+        if (string.IsNullOrWhiteSpace(declared) || string.IsNullOrWhiteSpace(running)
+            || string.Equals(declared, running, StringComparison.Ordinal))
+        {
+            return string.Empty;
+        }
+        return $"; built against Fabricator.Abstractions {declared}, this host has {running} "
+               + "(reported, not enforced - the plugin loads, and fails only on a member it uses that moved)";
+    }
+
     /// <summary>The manifest's name, matched EXACTLY at the archive root (zip entry names are case-sensitive
     /// on every platform, so accepting a case variant here would make an archive install on one OS and not
     /// another).</summary>

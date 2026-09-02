@@ -4,6 +4,44 @@
          framework-dependent publish targets it with rollForward=LatestMajor so ONE payload runs on
          .NET 8 AND 10+. net10.0 stays the self-contained default. EW already multi-targets net8.0. -->
     <TargetFrameworks>net10.0;net8.0</TargetFrameworks>
+
+    <!-- ONE version for the whole repo, read from ./VERSION. It used to be two literals (CMakeLists.txt's
+         FABRICATOR_EXTENSION_VERSION and extension_config.cmake's EXTENSION_VERSION) and CLAUDE.md records
+         that bumping BOTH is easy to miss - the prose tracking it went stale four times - so a third
+         literal here would have made a known problem worse. All three read the same file.
+         /!\ The .Trim() is required: file(STRINGS) in CMake drops the newline, ReadAllText does not. -->
+    <FabricatorVersionFile>$(MSBuildThisFileDirectory)..\VERSION</FabricatorVersionFile>
+    <FabricatorContractVersion>$([System.IO.File]::ReadAllText('$(FabricatorVersionFile)').Trim())</FabricatorContractVersion>
+    <Version>$(FabricatorContractVersion)</Version>
+
+    <!-- /!\ FabricatorContractVersion is SEPARATE from Version on purpose, even though they are equal here.
+         Version is what an assembly claims for ITSELF; FabricatorContractVersion is which
+         Fabricator.Abstractions it was BUILT AGAINST, which is what a plugin manifest records and what
+         PluginInstall compares. For the in-tree plugins the two coincide because both come from this repo;
+         for an out-of-tree plugin they are unrelated, and collapsing them would make a plugin's manifest
+         report the PLUGIN's version as the contract's the day it sets its own. -->
+
+    <!-- /!\/!\ AssemblyVersion IS DELIBERATELY PINNED AT 1.0.0.0 AND MUST STAY THERE. `Version` alone would
+         drive it too, which would make the contract's ASSEMBLY IDENTITY move with every release - and a
+         plugin's Fabricator.Abstractions reference is satisfied by the copy ALREADY LOADED in the bridge's
+         ALC, so today the running host's copy always wins whatever the plugin compiled against. Letting
+         AssemblyVersion float risks trading that forgiving behaviour for a FileLoadException at load time,
+         which is a WORSE failure than the member-missing one it would replace: it names a version rather
+         than the member that is absent.
+         The moving numbers are FileVersion / InformationalVersion / PackageVersion, which are DIAGNOSTIC -
+         they are what the plugin manifest records and what fabricator_plugins() reports. Skew stays
+         REPORTABLE without becoming ENFORCED. docs/plugin-services.md section 5 Q4. -->
+    <AssemblyVersion>1.0.0.0</AssemblyVersion>
+
+    <!-- Packable is OPT-IN: only the two assemblies a plugin may reference are packages. Everything else
+         here is host internals, a provider, a test project or a fixture, and `dotnet pack` on the folder
+         would otherwise emit a package for each. -->
+    <IsPackable>false</IsPackable>
+    <Authors>Christoph Mettler</Authors>
+    <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/cmettler/fabricator-extension</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/cmettler/fabricator-extension.git</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
     <!-- The framework-dependent payload targets net8.0 and ROLLS FORWARD to any newer major (a .NET 10
          install runs the same payload) — the runtime is selected by the native host's dotnet-root
          resolution (FABRICATOR_DOTNET_ROOT > DOTNET_ROOT > global install), not by the TFM. -->

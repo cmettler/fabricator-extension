@@ -127,7 +127,9 @@ internal static class PluginInstall
         string destination = PluginPackage.DestinationFor(root, manifest);
         var (providers, detail) = Activate(destination);
         return new PluginInstallResult(manifest.Name, manifest.Version, platform, destination, written,
-                                       providers, providers.Length > 0, detail);
+                                       providers, providers.Length > 0,
+                                       detail + PluginPackage.ContractSkew(manifest.AbstractionsVersion,
+                                                                          FabricatorVersion.Contract));
     }
 
     private static string ResolveRoot(string? rootOverride)

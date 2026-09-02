@@ -132,14 +132,60 @@ public class PluginPackageTests
         Assert.Contains("entryAssembly", error);
     }
 
-    /// <summary>abstractionsVersion is OPTIONAL and never gated on — nothing versions that assembly today, so
-    /// a comparison would be an untestable flag. Absent must therefore parse, not fail.</summary>
+    /// <summary>abstractionsVersion is OPTIONAL and stays optional now that there IS a version to record
+    /// (<c>FabricatorVersion.Contract</c>, 2026-09-02): every archive built before then has none, and
+    /// <c>PluginInstall.ContractSkew</c> treats absent as "say nothing" rather than "unknown". Absent must
+    /// therefore parse, not fail — this is the assertion that keeps an older archive installable.</summary>
     [Fact]
     public void Abstractions_version_is_optional()
     {
         Assert.True(PluginPackage.TryParseManifest(
             Utf8("""{"formatVersion":1,"name":"d","version":"1","entryAssembly":"D.dll"}"""), out var m, out _));
         Assert.Equal("", m!.AbstractionsVersion);
+    }
+
+    // ---------------------------------------------------------------- contract skew
+
+    /// <summary>
+    /// The skew note is EMPTY when the plugin was built against the running contract — the normal case, and
+    /// the one an install test can produce. It is silent rather than confirming, because a line on every
+    /// successful install is noise that trains people to ignore the column.
+    /// </summary>
+    [Fact]
+    public void Contract_skew_is_silent_when_versions_match()
+    {
+        Assert.Equal(string.Empty, PluginPackage.ContractSkew("0.0.13", "0.0.13"));
+    }
+
+    /// <summary>
+    /// ⚠ ABSENT says NOTHING, not "unknown". abstractionsVersion is optional and every archive built before
+    /// there was a version to record has none, so treating absence as a mismatch would put a note on every
+    /// older plugin — which is exactly the noise that would make the real one invisible.
+    /// ⚠ An empty RUNNING version is silent too: an assembly built without the informational attribute is
+    /// our build being wrong, and reporting the plugin for it would blame the wrong side.
+    /// </summary>
+    [Theory]
+    [InlineData("", "0.0.13")]
+    [InlineData("   ", "0.0.13")]
+    [InlineData("0.0.12", "")]
+    public void Contract_skew_is_silent_when_either_side_is_absent(string declared, string running)
+    {
+        Assert.Equal(string.Empty, PluginPackage.ContractSkew(declared, running));
+    }
+
+    /// <summary>
+    /// A real mismatch NAMES BOTH numbers and says it is not enforced. Naming both is the whole value: "a
+    /// version mismatch" sends someone hunting, "built against 0.0.12, this host has 0.0.13" does not.
+    /// ⚠ It also asserts the note does NOT read as a failure — the plugin installed and works unless it
+    /// touches something that moved, and a message implying otherwise would provoke a needless rebuild.
+    /// </summary>
+    [Fact]
+    public void Contract_skew_names_both_versions_and_says_it_is_not_enforced()
+    {
+        string note = PluginPackage.ContractSkew("0.0.12", "0.0.13");
+        Assert.Contains("0.0.12", note);
+        Assert.Contains("0.0.13", note);
+        Assert.Contains("not enforced", note);
     }
 
     // ---------------------------------------------------------------- layout
