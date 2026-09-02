@@ -310,7 +310,9 @@ internal static class FluidValueModel
             case BinaryArray a: return Convert.ToHexString(a.GetBytes(index)).ToLowerInvariant();
             case Date32Array a: return AsUtc(a.GetDateTime(index));
             case Date64Array a: return AsUtc(a.GetDateTime(index));
-            case TimestampArray a: return ReadTimestamp(a, index);
+            // /!\ NOT a local copy: the shared decision from Fabricator.Common, which the Bridge's own
+            // filter marshaling uses too. See the note where the local duplicate used to be.
+            case TimestampArray a: return ArrowValueReader.ReadTimestamp(a, index);
             case StructArray s: return new DictionaryValue(new ArrowStruct(s, index));
             // ⚠ MapArray BEFORE ListArray, and the compiler is what caught it: Apache.Arrow declares
             // `MapArray : ListArray`, so the list case matches a MAP first. Ordered the other way this is
@@ -357,15 +359,19 @@ internal static class FluidValueModel
     private static object? AsUtc(DateTime? value) =>
         value is { } dt ? DateTime.SpecifyKind(dt, DateTimeKind.Utc) : null;
 
-    private static object ReadTimestamp(TimestampArray a, int index)
-    {
-        var ts = a.GetTimestamp(index)!.Value; // DateTimeOffset (stored as UTC when no tz)
-        var type = (TimestampType)a.Data.DataType;
-        // No timezone => a wall-clock value: hand back a DateTime. With timezone: the DateTimeOffset.
-        // ⚠ The explicit (object) casts are load-bearing — without them C#'s conditional operator unifies
-        // both branches to DateTimeOffset and the DateTime branch is converted straight back (docs §23).
-        return string.IsNullOrEmpty(type.Timezone) ? (object)ts.UtcDateTime : (object)ts;
-    }
+    // ⚠⚠ THE LOCAL ReadTimestamp IS GONE — it is `ArrowValueReader.ReadTimestamp` (Fabricator.Common) now,
+    // and this is the one duplicate here that was worth removing rather than the one it looks like.
+    //
+    // It was a CHARACTER-FOR-CHARACTER copy of the bridge's, including the two explicit `(object)` casts,
+    // and those casts are the fix for a defect that shipped for four months: without them C#'s conditional
+    // operator unifies both branches to DateTimeOffset and the DateTime branch is converted straight back,
+    // so a tz-less timestamp silently marshals as the wrong CLR type. A decision with that history must not
+    // exist twice with two chances to drift.
+    //
+    // ⚠ Contrast ReadCell above, which is NOT substitutable and stays: it differs from
+    // ArrowValueReader.ReadScalar on floats (the decimal ladder), blobs (hex, not byte[]), dates (the
+    // DateTimeKind.Utc stamp) and every nested type — Fluid semantics, not generic unboxing. Replacing it
+    // wholesale would revert three gated behaviours.
 
     // ------------------------------------------------------------------------------------------------
     // SQL quoting filters

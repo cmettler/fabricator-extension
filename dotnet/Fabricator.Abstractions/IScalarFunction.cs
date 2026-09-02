@@ -140,7 +140,9 @@ public sealed class ScalarBindArgs
     /// <summary>
     /// The Arrow array holding argument <paramref name="index"/>'s value (length 1), or null when the index is
     /// out of range or the argument is not a folded constant. Read row 0 for the literal;
-    /// <c>ArrowValueReader.ReadScalar</c> (Fabricator.Bridge) boxes it if a provider references the bridge.
+    /// <c>ArrowValueReader.ReadScalar</c> boxes it — it lives in <c>Fabricator.Common</c>, the OPTIONAL
+    /// reusable-implementation assembly, so a plugin can reach it with one ProjectReference and without
+    /// taking on the bridge's closure. (It used to be Bridge-only, i.e. out of reach for a plugin.)
     /// </summary>
     public IArrowArray? ConstantArray(int index) =>
         IsConstant(index) && Values is not null && index < Values.ColumnCount ? Values.Column(index) : null;

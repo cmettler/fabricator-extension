@@ -368,14 +368,22 @@ this document warns about elsewhere. `ExcludeAssets="runtime"` on an explicit `A
 `Apache.Arrow.Scalars` reference keeps the compile reference and drops the copy. ⚠ `ExcludeAssets` does NOT
 flow to a transitive dependency, so `Apache.Arrow.Scalars` has to be named separately.
 
-### ⚠ It references Abstractions ONLY, and paid ~20 lines for it
+### ⚠ It references Abstractions + Common, and NEVER Bridge
 
-`ArrowValueReader.ReadScalar` — which the original code used to read a STRUCT field — lives in
-`Fabricator.Bridge`, and `IScalarFunction`'s own doc says it is available "if a provider references the
-bridge". A plugin has `Fabricator.Abstractions` only. The plugin therefore carries a local copy
-(`ArrowScalar.Read`, same type coverage including the timestamp rule). Widening the reference to the bridge
-to save those lines would make the in-tree example stop demonstrating the surface out-of-tree plugin authors
-actually have.
+**⚠ CORRECTED 2026-09-02.** This section used to read *"it references Abstractions ONLY, and paid ~20 lines
+for it"*: `ArrowValueReader.ReadScalar` lived in `Fabricator.Bridge`, `IScalarFunction`'s doc said it was
+available "if a provider references the bridge", and the plugin therefore carried a local copy
+(`ArrowScalar.Read`). **That is the gap `Fabricator.Common` closed** — the reader is in Common now, which a
+plugin may reference without taking on the host's Azure/Fabric/unsafe closure
+(docs/plugin-services.md §9).
+
+What did NOT change is the rule the old wording was defending: **the plugin still references NO Bridge**, and
+that is the acceptance test for the split rather than a stylistic preference. What became of the ~20 lines is
+more interesting than "they were deleted": the local reader had GROWN into `FluidValueModel.ReadCell`, a
+deliberate superset with Fluid-specific float/blob/date handling, so it stays. The copy that actually went is
+`ReadTimestamp`, which was character-for-character identical to the bridge's including the two `(object)`
+casts that fix a four-month defect (§9.4). **The duplicate worth removing was the small invisible one, not
+the big obvious one.**
 
 ### Gates
 

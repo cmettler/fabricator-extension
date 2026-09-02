@@ -1,7 +1,8 @@
 # Plugin services — replacing the ad-hoc seams with a resolvable service surface
 
-> **Status: STEP 1 (the `GetService<T>()` locator) IS BUILT — §8. Step 2 (`Fabricator.Common`) is
-> approved and NOT started — §7.4.** Opened user-directed:
+> **Status: BOTH STEPS BUILT — §8 (the `GetService<T>()` locator) and §9 (`Fabricator.Common`).**
+> ⚠ §9.4 and §9.5 CORRECT the plan: the acceptance test's target no longer existed, and §7.4a's "13 → 16"
+> is wrong on two of three. Opened user-directed:
 > This file is the working record so the analysis can continue across sessions. Everything in §1 is READ FROM
 > THE TREE or MEASURED and dated; §2 onward is design space, not decisions.
 
@@ -446,7 +447,12 @@ plus `size`, `last_modified`, and a bound parameter).
 
 ### 7.4 STEP 2 — `Fabricator.Common`
 
-**New project** `dotnet/Fabricator.Common/Fabricator.Common.csproj`, referencing Abstractions. <!-- check-docs:ignore (it does not exist yet; that is the plan) --> ⚠ It needs no
+> **BUILT 2026-09-02 — read §9 FIRST.** Two things below did not survive contact: the acceptance test's
+> target no longer exists and what replaced it is not substitutable (§9.4), and four of the thirteen movers
+> were deliberately left behind (§9.3). The plan is kept as written so the corrections have something to
+> correct.
+
+**New project** `dotnet/Fabricator.Common/Fabricator.Common.csproj`, referencing Abstractions. ⚠ It needs no
 `TargetFramework` line — `dotnet/Directory.Build.props` sets `net10.0;net8.0` for everything. ⚠ It needs no
 `publish-managed.ps1` line either: Abstractions reaches the payload transitively as a ProjectReference, and
 Common will the same way (VERIFIED: `Fabricator.Abstractions.dll` is in the payload with no script entry).
@@ -482,6 +488,10 @@ argument for having Common at all.
 **Acceptance test, and it is the whole point:** delete the FluidPlugin's local `ArrowScalar.Read` duplicate
 and have it use `ArrowValueReader` — **without widening its reference to `Fabricator.Bridge`.** If that is
 not possible, the split did not achieve what it was for.
+
+⚠⚠ **SUPERSEDED — `ArrowScalar` no longer exists, and its successor (`FluidValueModel.ReadCell`) is a
+documented SUPERSET whose substitution would revert three gated behaviours. The property is intact and was
+checked against `ReadTimestamp` instead: §9.4.**
 
 ### 7.4a DECISIONS on the three open sub-questions (user, 2026-09-02)
 
@@ -541,6 +551,12 @@ An `IHostLog` with only `Log(level, category, message)` would force either losin
 values eagerly — the exact regression the gate exists to prevent.
 
 **⇒ WITH `IHostLog`, THE DEFERRED THREE BECOME MOVABLE AND THE MOVER LIST GOES 13 → 16.**
+
+⚠⚠ **MEASURED WRONG ON TWO OF THE THREE — the real number is 13 → 14, and `IHostLog` therefore has to be
+justified as a CAPABILITY rather than as an unblocker. `InterruptScope` reaches `HostFs`, so
+`DbDataReaderArrowStream` is blocked transitively, and `SingleScanArrowStream` shares a file with a
+`Host.Query` caller. §9.5.**
+
 `DbDataReaderArrowStream`, `SingleScanArrowStream` and `MemoryProbe` need MEL for nothing else — read from
 source, each holds one `static readonly ILogger` and uses `IsEnabled` plus one log call. So "phase 2" is not
 a second migration; it is *add `IHostLog` first*. ⚠ `DbDataReaderArrowStream` additionally takes an
@@ -561,8 +577,8 @@ is cleaner once nothing else is in flight.
 
 | step | proof |
 |---|---|
-| locator | `verify_plugin_fluid` green (it drives `query()` through the new service); a gate for `IHostFileSystem` per §7.3, or the interface does not ship |
-| Common | **both tiers at IDENTICAL counts** — a pure move changes no answer — plus the **masking check**: strip the moved files from `git diff -U0` and every removed line must be byte-identical to its added counterpart |
+| locator ✅ **DONE, §8** | `verify_plugin_fluid` green (it drives `query()` through the new service); a gate for `IHostFileSystem` per §7.3, or the interface does not ship |
+| Common ✅ **DONE, §9** | **both tiers at IDENTICAL counts** — a pure move changes no answer — plus the **masking check**: strip the moved files from `git diff -U0` and every removed line must be byte-identical to its added counterpart |
 
 ⚠ Publish with **`-Clean`** if any PackageReference moves between assemblies. That rule exists because a
 publish once silently deleted all five SqlClient DLLs from the payload, and it is invisible to the hermetic
@@ -766,6 +782,140 @@ the diagnosis error, not an outstanding debt.
 ⚠ **What the block did NOT cause: the two void service tiers.** Those were a concurrency mistake of mine
 (two runs against one SQL Server and one MinIO bucket), and the SIGSEGV and row-count mismatch they produced
 belong to that, not to the SDK. Do not let one environmental problem absorb the blame for an unrelated one.
+
+## 9. STEP 2 AS BUILT (2026-09-02) — `Fabricator.Common`
+
+C#-only. **NO ABI change, NO C++ change.** Nine files left `Fabricator.Bridge`: eight to a new
+`Fabricator.Common`, one (`ObjectNotFoundException`) to `Fabricator.Abstractions` per §7.4a. **Compile cost
+ZERO** — 0 errors across every buildable project, and the same 8 pre-existing warnings.
+
+### 9.1 What shipped
+
+| | |
+|---|---|
+| `dotnet/Fabricator.Common/Fabricator.Common.csproj` | references **Abstractions and nothing else**; no `TargetFramework` line (Directory.Build.props); no `publish-managed.ps1` line |
+| → `Fabricator.Common` | `ArrowValueReader`, `InMemoryArrayStream`, `AsyncEnumerableArrowStream`, `ArrowDataReader`, `AggregateSession`, `StaticTableFunction`, `StaticInOutFunction`, `StaticCollectorFunction` |
+| → `Fabricator.Abstractions` | `ObjectNotFoundException` — it is provider CONTRACT, not a convenience (§7.4a) |
+| `Fabricator.Bridge.csproj` | one new `ProjectReference` |
+| `Fabricator.FluidPlugin.csproj` | one new `ProjectReference`, `Private="false"` — and **still none to Bridge** |
+| `BackendRegistry`'s plugin-reference comment | now names Common as the optional middle (§7.6 hazard 3) |
+
+**VERIFIED in the payload: `Fabricator.Common.dll` sits in `build/release/extension/fabricator/fabricator/`
+with no script entry**, exactly as §7.4 predicted — a ProjectReference is transitive, which is also why
+`Fabricator.SqlServer`, `.Delta`, `.DeltaRs` and `.AnalysisServices` needed no edit at all.
+
+### 9.2 ⚠⚠ THE PLAN PREDICTED "a batch of visibility errors". THERE WERE NONE — and the reason is the cheap check to run BEFORE any future carve-out
+
+Two facts, both knowable in advance and neither one obvious:
+
+1. **All eight movers were ALREADY `public`.** §7.4a spends a paragraph deciding they should become public
+   and warning about the widened contract; measured, that widening had happened long ago for the ordinary
+   reason — `Fabricator.SqlServer` / `.Delta` / `.DeltaRs` / `.AnalysisServices` are separate assemblies and
+   were already using them. **The only genuinely NEW public surface this commit creates is one method**
+   (`ArrowValueReader.ReadTimestamp`, §9.4). So the "13 newly public types widen a contract with no version
+   number" cost is about one thirteenth of what the plan priced.
+2. **The namespace is unchanged**, so not one `using` moved. Third time that convention has paid out
+   (`Fabricator.Abstractions`, `Fabricator.Delta`, now Common).
+
+⇒ **the pre-flight check for a carve-out is: grep the candidates' declared visibility, and who already
+references them.** Public and used across assemblies ⇒ the move is mechanical. The plan's fear was of a case
+that did not exist here.
+
+### 9.3 ⚠⚠ FOUR OF THE THIRTEEN DID NOT MOVE, AND THE DECLINATIONS ARE THE PART A LIST CANNOT CAPTURE
+
+§7.4a's instruction was *"move what is genuinely wanted, not all 13 because the list exists"*. Applied, with
+one reason each:
+
+| stayed in Bridge | why |
+|---|---|
+| `ChannelArrowStream` | `internal`, and the bulk-write channel is host machinery — no caller outside the ABI's own `begin_bulk`/`push_batch` |
+| `DescribedArrowStream` | exists ONLY for the host's bind-vs-scan split (`PopulateReturnSchema` calling `get_schema` without pulling). No consumer in any other assembly |
+| `SqlGen` | the host calls it **on a provider's behalf** during `bind_replace`; a provider never calls it. Being *about* `ISqlTableFunction` is not the same as being *for* its author |
+| `SqlDdl` | a heuristic producing a signal the HOST acts on (invalidate the catalog cache after `fabricator_exec`) |
+
+⚠ The distinction that did the work in three of the four: **"is this called BY a provider, or called ON a
+provider's declaration?"** `AggregateSession` moved because a provider's `AggOpen` returns one
+(`SqlServerBackend` literally does `new AggregateSession(fn)`), so an out-of-tree plugin authoring a UDAF
+needs it. `SqlGen` did not, because the provider only supplies the declaration it validates.
+
+### 9.4 ⚠⚠ THE ACCEPTANCE TEST HAD TO BE RE-DERIVED — ITS TARGET NO LONGER EXISTS, AND WHAT REPLACED IT IS NOT SUBSTITUTABLE
+
+§7.4's acceptance test was: *"delete the FluidPlugin's local `ArrowScalar.Read` duplicate and have it use
+`ArrowValueReader` — without widening its reference to `Fabricator.Bridge`."*
+
+**There is no `ArrowScalar` in the plugin any more.** The ~20-line duplicate that existed when §7.4 was
+written became `FluidValueModel.ReadCell` during the Fluid value-model work, and **it is now a documented
+SUPERSET rather than a duplicate** — its own remarks say so. Measured against `ArrowValueReader.ReadScalar`,
+it differs on four case groups:
+
+| case | `ReadScalar` | `ReadCell` |
+|---|---|---|
+| `FloatArray` / `DoubleArray` | the raw float/double | the **decimal ladder** (`Number(...)`), which REFUSES a magnitude Fluid cannot represent |
+| `BinaryArray` | `byte[]` | **lowercase hex**, because a byte array renders as concatenated decimals |
+| `Date32` / `Date64` | the raw `DateTime` (**`Kind = Unspecified`**) | `AsUtc(...)`, i.e. `DateTimeKind.Utc` |
+| STRUCT / MAP / LIST | not handled at all | the Fluid indexables |
+
+⇒ **substituting it wholesale would revert three GATED behaviours**, the date one being the
+renders-the-previous-day bug fixed in fluid-templating.md §7.4a. **A test written as "delete the duplicate"
+can age into "delete the fix".**
+
+**WHAT SHIPPED INSTEAD, and it is narrower but genuinely the right one: `ReadTimestamp`.** The plugin held a
+character-for-character copy of the bridge's, including its two explicit `(object)` casts — and those casts
+are the fix for a defect that **shipped for four months** (C#'s conditional operator unifying both branches
+back to `DateTimeOffset`; docs/mssql-cdc.md §21.5 and §23). It is `ArrowValueReader.ReadTimestamp` now, made
+`public` for exactly this caller, reached through a `Fabricator.Common` reference **with no
+`Fabricator.Bridge` reference added** — which is the property the acceptance test existed to check.
+
+⚠ **Of the two duplicates in that file, the one worth removing was the one that looked least urgent.** The
+big obvious one is a deliberate superset; the small invisible one carried the defect history. **The size of a
+duplicate says nothing about the cost of its divergence.**
+
+⚠ **`Private="false"` verified by measurement, not by reading the csproj**: `build/plugins/fluid/` still
+holds exactly its previous seven DLLs and the plugin archive still ships seven — `Fabricator.Common.dll`
+resolves from the host's own context, per §7.6 hazard 1.
+
+⚠ **NOT done, deliberately: no consumer was manufactured in `Fabricator.SamplePlugin`.** It reads its scalar
+arguments by casting to the concrete Arrow array type, which is correct for a typed signature; routing that
+through `ArrowValueReader` would box every value for nothing — a worse example, not a better gate.
+
+### 9.5 ⚠⚠ §7.4a's "13 → 16" IS WRONG ON TWO OF THE THREE, AND THE CHECK IT ASKED FOR IS WHAT SHOWS IT
+
+§7.4a concluded that adding `IHostLog` makes `DbDataReaderArrowStream`, `SingleScanArrowStream` and
+`MemoryProbe` movable, *"so 'phase 2' is not a second migration; it is add `IHostLog` first"*, with one
+caveat: *"`DbDataReaderArrowStream` additionally takes an `InterruptScope`, so it needs that resolved too —
+check before counting it in."* **Checked. It does not resolve, and it takes a second file with it.**
+
+| deferred file | needs, besides `FabricatorLog` | verdict |
+|---|---|---|
+| `MemoryProbe` | nothing — `Environment.WorkingSet` + `GC`, both BCL | **movable with `IHostLog`** |
+| `DbDataReaderArrowStream` | `InterruptScope`, which calls **`HostFs.CanInterrupt` / `HostFs.IsInterrupted`** | **BLOCKED** — `HostFs` is the unsafe ABI wrapper and can never leave Bridge |
+| `SingleScanArrowStream` | shares its FILE with a class calling **`Host.Query`** | **BLOCKED**, and it is `internal` Bridge machinery for single-use host-query inputs — not plugin-facing even if it were free |
+
+⇒ **the real number is 13 → 14**, and the one type `IHostLog` unlocks is a diagnostic for OUR heavy paths
+rather than anything a plugin wants. **So `IHostLog`'s justification is NOT "it unblocks the deferred
+three" — that argument is measured false. Its justification is the capability itself**: a plugin has no way
+to log anywhere a user can see, because reaching `duckdb_logs` goes through the `host_log` ABI callback. That
+is a §3.1 service on its own merits, and it should be decided on those rather than inherited from a
+migration argument that did not survive contact.
+
+⚠ The chain `DbDataReaderArrowStream → InterruptScope → HostFs` is §7.4a's impossibility rule working one
+step further out than the rule was stated: not only *"a file needing a Bridge internal cannot move"* but
+*"a file needing a type that needs a Bridge internal cannot move either"*. **A closure check must be
+TRANSITIVE** — a one-level scan reports `DbDataReaderArrowStream` as clean.
+
+### 9.6 Gates
+
+| | |
+|---|---|
+| every project builds | **0 errors**, 8 pre-existing warnings, no new one |
+| the masking check (§7.5) | **git itself asserts it**: `git diff -M --numstat` reports **8 of the 9 moved files as 0-changed-line renames**. The ninth is `ArrowValueReader.cs`, whose entire diff is `private`→`public` plus the five doc lines explaining it |
+| both tiers | IDENTICAL counts — a pure move changes no answer |
+| the payload | `Fabricator.Common.dll` present, with no `publish-managed.ps1` entry |
+| the plugin output | still exactly seven DLLs, so nothing was copied that should not be |
+
+⚠ **The tiers can only show the move broke nothing; no assertion can see WHERE a type lives.** What proves
+the move achieved something is §9.4's deletion, and the FluidPlugin's csproj having two ProjectReferences
+rather than three.
 
 ## 5. Open questions
 

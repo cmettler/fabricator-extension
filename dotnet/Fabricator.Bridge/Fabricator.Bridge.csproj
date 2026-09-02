@@ -39,6 +39,12 @@
     <!-- The stable contract surface (interfaces + Arrow-typed POCOs), split out so plugins can reference a
          minimal shared assembly. Same Fabricator.Bridge namespace — assembly split only. -->
     <ProjectReference Include="..\Fabricator.Abstractions\Fabricator.Abstractions.csproj" />
+    <!-- The reusable middle (Arrow value reading, the stream adapters, the aggregate session, the
+         fixed-schema function bases). The direction is load-bearing and one-way: Common references
+         Abstractions and NOTHING else, so a reference back from Common to here would be a project cycle —
+         which is exactly what makes "does it need the running host?" the membership rule rather than a
+         matter of taste. docs/plugin-services.md §7.4a. -->
+    <ProjectReference Include="..\Fabricator.Common\Fabricator.Common.csproj" />
     <!-- The plugin installer's archive-path guard. Referenced for ArchivePath alone: it is the zip-slip
          validation the single-file distribution's extractor already uses, and a security guard is the last
          thing that should exist twice in one codebase with two chances to drift. Cheap to take — this

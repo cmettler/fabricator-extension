@@ -16,7 +16,8 @@
   `PluginPaths.BundledRelativeRoot` makes a default search root (user root first, bundled second —
   first-root-wins).
 - **Gate**: `test/verify_plugin_fluid.test` (23, service tier, its own plugin root).
-- It references **`Fabricator.Abstractions` only**, which is the property §2 is about.
+- It references **`Fabricator.Abstractions` + `Fabricator.Common`, and never `Fabricator.Bridge`** —
+  which is the property §2 is about. (Common since 2026-09-02; docs/plugin-services.md §9.)
 
 ## 1. The four follow-ons, as the user specified them
 
@@ -261,9 +262,17 @@ with more than 15 significant digits renders rounded.
 
 ### 7.4 The Arrow half — one unboxing, shared with slice 3
 
-`FluidValueModel.ReadCell` is a deliberate SUPERSET of `ArrowValueReader.ReadScalar` (Bridge-only, so
-unreachable from a plugin — §2), extended with the nested cases the bridge's reader has no counterpart for,
-since that one exists for FILTER values and those are scalars by construction:
+`FluidValueModel.ReadCell` is a deliberate SUPERSET of `ArrowValueReader.ReadScalar`, extended with the
+nested cases the bridge's reader has no counterpart for, since that one exists for FILTER values and those
+are scalars by construction:
+
+⚠ **`ArrowValueReader` IS REACHABLE FROM A PLUGIN AS OF 2026-09-02** — it moved to `Fabricator.Common`, which
+this plugin now references (docs/plugin-services.md §9). That does NOT make `ReadCell` redundant: it differs
+from `ReadScalar` on floats (the decimal ladder), blobs (hex), dates (the `DateTimeKind.Utc` stamp) and every
+nested type, and three of those four are gated — substituting it would revert §7.4a's date fix. What the
+reference DID remove is the `ReadTimestamp` copy, which was character-for-character identical including the
+load-bearing `(object)` casts (§9.4).
+
 
 - `StructArray` → `DictionaryValue(ArrowStruct)`, `MapArray` → `DictionaryValue(ArrowMap)`,
   `ListArray`/`LargeListArray`/`FixedSizeListArray` → `List<object?>`, recursively.

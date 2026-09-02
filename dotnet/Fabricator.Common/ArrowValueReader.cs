@@ -69,8 +69,13 @@ public static class ArrowValueReader
     /// table scan a non-SARGable predicate would have caused.</para>
     /// <para>⚠ The tz-PRESENT branch is unchanged: a <c>datetimeoffset</c> column exports WITH a timezone
     /// and must keep marshalling as a <see cref="DateTimeOffset"/>, where it is the matching type.</para>
+    /// <para><b>⚠ PUBLIC on purpose, and it is the one method here a caller is expected to reach for
+    /// individually.</b> A consumer with its own type switch (the Fluid plugin's value model, which needs
+    /// Fluid-specific handling for floats, blobs and dates and so cannot call
+    /// <see cref="ReadScalar"/> wholesale) still wants THIS decision, because getting it wrong is the
+    /// four-month defect above rather than a stylistic difference. One copy, one place to fix.</para>
     /// </remarks>
-    private static object ReadTimestamp(TimestampArray a, int index)
+    public static object ReadTimestamp(TimestampArray a, int index)
     {
         var ts = a.GetTimestamp(index)!.Value; // DateTimeOffset (stored as UTC when no tz)
         var type = (TimestampType)a.Data.DataType;

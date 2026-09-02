@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Library</OutputType>
+    <RootNamespace>Fabricator.Bridge</RootNamespace>
+    <AssemblyName>Fabricator.Common</AssemblyName>
+    <Description>
+      The reusable middle: dependency-light IMPLEMENTATIONS of the Fabricator.Abstractions contracts that a
+      provider or plugin would otherwise hand-roll - Arrow value reading, the Arrow stream adapters, the
+      custom-aggregate session, and the fixed-schema function base classes. Kept in the Fabricator.Bridge
+      namespace (assembly split only - no source churn), exactly as Fabricator.Abstractions and
+      Fabricator.Delta are.
+
+      OPTIONAL for a plugin, which is the whole point: it references Abstractions (+ Apache.Arrow) and
+      nothing else, so taking it on adds no package to a plugin's closure. It must NEVER reference
+      Fabricator.Bridge - Bridge references THIS, so a reference back is a project cycle, and that
+      impossibility is the membership rule: a type that needs the running host cannot live here, it is a
+      SERVICE (see FabricatorServices). docs/plugin-services.md sections 6 and 7.4.
+    </Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Abstractions ONLY. Apache.Arrow arrives with it. Adding any other package here is a change to every
+         plugin's compile closure, which is the cost this assembly exists to avoid. -->
+    <ProjectReference Include="..\Fabricator.Abstractions\Fabricator.Abstractions.csproj" />
+  </ItemGroup>
+
+</Project>

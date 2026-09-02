@@ -234,8 +234,9 @@ public static class BackendRegistry
     // folders; every assembly in each is loaded into the DEFAULT context (no AssemblyLoadContext isolation —
     // deferred until a real dep conflict lands) and reflected for IBackend, whose backends + global functions
     // register like the built-in providers. A plugin references Fabricator.ABSTRACTIONS + Apache.Arrow
-    // (host-provided, not copied) — NOT Fabricator.Bridge, which drags the Azure/Fabric closure into every
-    // plugin build; that is what the 2026-08-18 assembly split and the FabricatorServices locator are for.
+    // (host-provided, not copied), OPTIONALLY Fabricator.COMMON for shared implementations — but NOT
+    // Fabricator.Bridge, which drags the Azure/Fabric closure into every plugin build; that is what the
+    // 2026-08-18 assembly split, Fabricator.Common and the FabricatorServices locator are for.
     // Either way its IBackend resolves to the default-context one and IsAssignableFrom works. Plugins must
     // align their full dependency closure with the host (Apache.Arrow especially) — there is no version
     // isolation without ALC.

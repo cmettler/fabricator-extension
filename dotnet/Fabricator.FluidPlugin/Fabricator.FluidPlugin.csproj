@@ -40,6 +40,14 @@
          non-assignable type. -->
     <ProjectReference Include="..\Fabricator.Abstractions\Fabricator.Abstractions.csproj" Private="false" />
 
+    <!-- The reusable middle - OPTIONAL, taken here for ArrowValueReader.ReadTimestamp. Private=false for
+         the SAME reason as Abstractions above: a copied Fabricator.Common.dll beside the plugin is a second
+         copy of every type in it, and this plugin hands Arrow-shaped values to the host.
+         /!\ Note what is NOT widened: still no reference to Fabricator.Bridge. That is the acceptance test
+         for the split - a plugin reaching shared IMPLEMENTATION without taking on the host's Azure/Fabric/
+         unsafe closure. docs/plugin-services.md section 9. -->
+    <ProjectReference Include="..\Fabricator.Common\Fabricator.Common.csproj" Private="false" />
+
     <!-- ⚠ Fluid is the plugin's OWN dependency and IS copied. This is what makes the plugin worth having
          in-tree beyond the move itself: Fabricator.SamplePlugin is pure IL with no third-party package, so
          until now NOTHING exercised a plugin carrying a private NuGet closure and relying on

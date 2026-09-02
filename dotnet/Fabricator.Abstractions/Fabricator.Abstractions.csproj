@@ -10,6 +10,13 @@
       (assembly split only — no source churn). Plugins reference THIS + Apache.Arrow (host-provided); it carries
       no ABI/marshaling internals. Shared (default-context) assembly — the prerequisite for AssemblyLoadContext
       plugin isolation. See docs/plugin-system.md.
+
+      The layering, one-way and enforced by the reference graph being acyclic:
+        Fabricator.Abstractions   contracts + the service registry   (Apache.Arrow only)   &lt;- required
+        Fabricator.Common         reusable implementations                                 &lt;- optional
+        Fabricator.Bridge         ABI, host, Azure/Fabric, unsafe                          &lt;- never, for a plugin
+      A type here must be CONTRACT. An implementation belongs in Common; anything needing the running host is
+      a SERVICE (FabricatorServices). docs/plugin-services.md sections 7.2 and 9.
     </Description>
   </PropertyGroup>
 

@@ -35,6 +35,7 @@ EXTERNAL = {
     'src/tds/tds_protocol.cpp',                     # ditto
     'test/sql/remote_pushdown/remote_pushdown_delete.test',  # ditto
     'src/DeltaLake/DeltaLake.cs',                   # delta-rs, referenced by the deltars provider doc
+    'src/DeltaLake/DeltaLake.csproj',               # ditto - surfaced the day .csproj became checkable
 }
 
 # A submodule may be absent (a docs-only CI job need not check out duckdb). Skips are REPORTED, never silent.
@@ -67,7 +68,10 @@ FILES = sorted(glob.glob('docs/*.md')) + [f for f in ('CLAUDE.md', 'README.md') 
 # mistaken for a path. A false POSITIVE here costs more than a miss — it trains the reader to ignore the check.
 PATH_RE = re.compile(
     r'(?<![\w./-])((?:src|dotnet|test|scripts|docs|\.github)/[A-Za-z0-9_./\-]+'
-    r'\.(?:cpp|hpp|h|cs|md|test|sh|yml|ps1|py|cmake))')
+    # /!\ csproj BEFORE cs: the alternation is ordered and there is no trailing boundary, so `cs`
+    # alone matched `.csproj` and then reported the truncated `.cs` path as missing - which is why
+    # a csproj citation used to need a check-docs:ignore marker instead of being CHECKED.
+    r'\.(?:cpp|hpp|h|csproj|cs|md|test|sh|yml|ps1|py|cmake))')
 skipped_sub = 0
 for f in FILES:
     txt = open(f, encoding='utf-8', errors='replace').read()
