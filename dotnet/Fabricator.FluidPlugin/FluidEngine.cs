@@ -25,19 +25,7 @@ internal static class FluidEngine
 
     /// <summary>Parses (or reuses) <paramref name="template"/> and renders it over a fresh context.</summary>
     /// <param name="caller">The SQL function name, so a parse error names the function the user called.</param>
-    /// <param name="allowExec">
-    /// Whether this surface may run WRITES from the template (<see cref="FluidHostExec"/>).
-    /// <para>
-    /// ⚠⚠ <b>It DEFAULTS TO FALSE and must stay that way — the default is the safety property.</b> A
-    /// template rendered while DuckDB is BINDING (which is what <c>fluid_query</c> does) repeats and runs
-    /// without execution, so a write there fires on <c>EXPLAIN</c> and on merely defining a view. A new
-    /// surface that forgets this parameter therefore gets the SAFE answer; had the flag been derived from
-    /// the caller's NAME instead, an unrecognised name would have read as "not fluid_query" and been
-    /// allowed.
-    /// </para>
-    /// </param>
-    internal static string Render(string caller, string template, Action<TemplateContext> bind,
-                                  bool allowExec = false)
+    internal static string Render(string caller, string template, Action<TemplateContext> bind)
     {
         var parsed = Cache.GetOrAdd(template, src =>
         {
@@ -52,9 +40,8 @@ internal static class FluidEngine
         // actually called rather than the template machinery.
         ctx.SetValue(FluidHostQuery.FunctionName,
                      new FunctionValue((args, c) => FluidHostQuery.Execute(caller, args, c)));
-        // ⚠ REGISTERED EVEN WHERE IT IS REFUSED. The refusal explains the bind-time hazard and names the
-        // alternative; leaving the function out would instead produce an unknown-identifier error and send
-        // the author hunting for a typo.
+        // ⚠ Available on BOTH surfaces by user decision. In fluid_query it therefore writes during BINDING,
+        // which repeats — see FluidHostExec for the measured 1 -> 2 -> 3.
         ctx.SetValue(FluidHostExec.FunctionName,
                      new FunctionValue((args, c) => FluidHostExec.Execute(caller, args, c)));
         // ⚠⚠ The FILTER of the same name is registered ONCE, in the shared TemplateOptions (see
@@ -62,9 +49,6 @@ internal static class FluidEngine
         // would mutate global state on every call and capture whichever `caller` happened to register last,
         // giving another render's function name in an error. The caller travels per context instead:
         ctx.AmbientValues[FluidHostQuery.CallerKey] = caller;
-        // The FILTER form of exec reads this; the shared TemplateOptions cannot capture it (same reason as
-        // the caller above).
-        ctx.AmbientValues[FluidHostExec.AllowKey] = allowExec;
         bind(ctx);
         try
         {

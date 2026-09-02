@@ -17,24 +17,27 @@ namespace Fabricator.FluidPlugin;
 /// </summary>
 /// <remarks>
 /// <para>
-/// <b>⚠⚠ IT IS REFUSED IN <c>fluid_query</c>, AND THAT IS THE WHOLE SAFETY DESIGN.</b> A
-/// <c>fluid_query</c> template is rendered during <c>bind_replace</c> — while DuckDB is BINDING — and a bind
-/// REPEATS and happens WITHOUT execution. MEASURED (docs/fluid-templating.md §8.3): a bind-time write fires
-/// on <c>EXPLAIN</c> of a statement that never runs (audit count 1), again on merely defining a VIEW over it
-/// (2), and again on every USE of that view (3). A template that writes therefore belongs on a surface that
-/// renders at EXECUTE time, which is <c>fabricator_render</c>.
+/// <b>⚠⚠ IT IS AVAILABLE ON BOTH SURFACES — USER DECISION (2026-09-02) — AND IN <c>fluid_query</c> IT WRITES
+/// DURING BINDING, WHICH MULTIPLIES.</b> A <c>fluid_query</c> template is rendered during
+/// <c>bind_replace</c>, and a bind REPEATS and happens WITHOUT execution. MEASURED, one audit table through
+/// three steps that execute nothing the caller wrote: <c>EXPLAIN</c> of a never-run statement gives
+/// <b>1</b>; merely defining a VIEW over it gives <b>2</b>; ONE <c>SELECT</c> from that view gives <b>3</b>.
+/// <b>So a writing template behind a view writes ON EVERY USE</b> — which is the consequence to know,
+/// because it works in testing, where the statement runs once.
 /// </para>
 /// <para>
-/// <b>⚠ THE PERMISSION IS FAIL-CLOSED AND OPT-IN, which is the direction that matters.</b> A render must
-/// ASK for exec (<see cref="FluidEngine.Render"/>'s <c>allowExec</c>, default <see langword="false"/>), so a
-/// surface added later gets the SAFE answer by forgetting rather than the dangerous one. Keying on the
-/// caller's NAME would have inverted that: an unrecognised name would read as "not fluid_query" and be
-/// allowed.
+/// ⚠ <b>An earlier build REFUSED this in <c>fluid_query</c> behind a fail-closed opt-in, and that mechanism
+/// was DELETED rather than left defaulted-on</b> — with both surfaces permitting exec it would have been
+/// vestigial machinery that reads as a restriction while restricting nothing. What justified removing it
+/// beyond the decision: the refusal never made bind-time writes impossible, only inconvenient.
+/// <c>query()</c> is permitted at bind BY DESIGN, any SELECT may CONTAIN a writing function, and
+/// <c>SELECT fabricator_host_exec('INSERT …')</c> IS a SELECT — measured to write at bind time before
+/// <c>exec()</c> existed at all (docs/fluid-templating.md §11.1a). To restore a restriction, the design is
+/// recorded in §11.1: a per-render permission ambient, fail-closed, set by the surface.
 /// </para>
 /// <para>
-/// ⚠ <b>The function is REGISTERED even where it is refused</b>, deliberately: a refusal that explains the
-/// bind-time hazard and names the alternative is worth far more than an unknown-identifier error, which
-/// would send the author hunting for a typo.
+/// ⚠ <b>For DDL, prefer <c>fabricator_render</c> anyway</b> — not because <c>fluid_query</c> refuses, but
+/// because a bind you did not ask for is a write you did not ask for.
 /// </para>
 /// <para>
 /// ⚠ <b>It grants no authority a template did not already have.</b> Anyone who can call
@@ -53,20 +56,6 @@ internal static class FluidHostExec
 {
     /// <summary>The name a template calls it by, as BOTH a function and a filter.</summary>
     internal const string FunctionName = "exec";
-
-    /// <summary>
-    /// The <see cref="TemplateContext.AmbientValues"/> key carrying whether this render may write.
-    /// </summary>
-    /// <remarks>
-    /// ⚠ It is an AMBIENT rather than a captured variable because the FILTER form is registered ONCE on the
-    /// shared <see cref="TemplateOptions"/> and cannot capture anything per render — the same reason
-    /// <see cref="FluidHostQuery.CallerKey"/> exists.
-    /// </remarks>
-    internal const string AllowKey = "fabricator.allow_exec";
-
-    /// <summary>Whether this render opted in. ABSENT means NO — the fail-closed direction.</summary>
-    private static bool Allowed(TemplateContext ctx) =>
-        ctx.AmbientValues.TryGetValue(AllowKey, out var v) && v is bool b && b;
 
     private static string CallerOf(TemplateContext ctx) =>
         ctx.AmbientValues.TryGetValue(FluidHostQuery.CallerKey, out var v) && v is string s ? s : FunctionName;
@@ -96,15 +85,6 @@ internal static class FluidHostExec
 
     private static FluidValue Run(string caller, string? sql, RecordBatch? parameters, TemplateContext ctx)
     {
-        if (!Allowed(ctx))
-        {
-            throw new InvalidOperationException(
-                $"{caller}: {FunctionName}() is refused here. A {caller} template is rendered while DuckDB is "
-                + "BINDING, and a bind repeats and happens without execution — so a write would fire on "
-                + "EXPLAIN of a statement that never runs, and on merely defining a view over it. Use "
-                + $"fabricator_render(...) for a template that writes, or {FluidHostQuery.FunctionName}() "
-                + "for a SELECT.");
-        }
         // ⚠ MEASURED for query() and true here for the same reason: an empty string reports NO error from
         // the classifier (it parses to zero statements), so the guard must come BEFORE it.
         if (string.IsNullOrWhiteSpace(sql))

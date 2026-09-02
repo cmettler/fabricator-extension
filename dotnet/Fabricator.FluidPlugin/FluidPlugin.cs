@@ -104,12 +104,11 @@ internal sealed class FluidRenderFunction : IScalarFunction
                 continue;
             }
             int row = i;
-            // ⚠ allowExec: THIS is the surface that may write, because a VOLATILE scalar is evaluated at
-            // EXECUTE time and is not constant-folded at plan time. fluid_query renders during bind_replace
-            // and therefore does NOT opt in — see FluidHostExec.
+            // ⚠ This surface renders at EXECUTE time (a VOLATILE scalar, never folded into the plan), so a
+            // writing template here runs once per ROW rather than once per BIND. fluid_query permits exec
+            // too, where it runs during binding — see FluidHostExec.
             b.Append(FluidEngine.Render(Name, templates.GetString(i),
-                                        ctx => FluidValueModel.Bind(ctx, paramsCol, row),
-                                        allowExec: true));
+                                        ctx => FluidValueModel.Bind(ctx, paramsCol, row)));
         }
         return b.Build();
     }

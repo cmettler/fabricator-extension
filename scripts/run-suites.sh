@@ -792,7 +792,15 @@ case "$TIER" in
         # The load-bearing pairs are the refusal's "and the write did NOT happen" count, a query()-still-works
         # positive control beside it, and the injection pair (0 deleted with the table intact).
         # 3272 + 30 = 3302 exactly, from a green run, which is what shows no other suite moved.
-        : "${MIN_ASSERTIONS:=3302}"
+        # 3318 since 2026-09-02 (same day, fourth bump): verify_plugin_fluid 218 -> 234. exec() is now
+        # permitted in fluid_query too (user decision), so the refusal assertions became a PINNED
+        # characterization of what a bind-time write costs -- EXPLAIN 1, CREATE VIEW 2, each view USE 3 then
+        # 4 -- plus the finding that a statement cannot see the write its own template made (generated SQL
+        # reads 1 while the table holds 42 afterwards), which is why "prepare then select" does not work.
+        # ⚠ That block pins DuckDB's bind repetition, not our code, so no mutant of ours can kill it; its
+        # value is that a change there fails an assertion naming the step.
+        # 3302 + 16 = 3318 exactly, from a green run, which is what shows no other suite moved.
+        : "${MIN_ASSERTIONS:=3318}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

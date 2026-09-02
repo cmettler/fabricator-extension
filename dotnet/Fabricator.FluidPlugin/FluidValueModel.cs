@@ -62,9 +62,9 @@ internal static class FluidValueModel
         // singleton, so a per-render AddFilter would mutate shared state on every call. The function form
         // of the same name is per-context (FluidEngine); the caller travels in AmbientValues.
         o.Filters.AddFilter(FluidHostQuery.FunctionName, FluidHostQuery.Filter);
-        // ⚠ The write-side twin. Registered unconditionally on the SHARED options, like query's — whether a
-        // given render may actually use it is carried per context by FluidHostExec.AllowKey, because this
-        // object is process-wide and cannot hold a per-render permission.
+        // ⚠ The write-side twin, registered unconditionally on the SHARED options like query's. It is
+        // available on BOTH surfaces; in fluid_query that means it writes during BINDING, which repeats —
+        // see FluidHostExec.
         o.Filters.AddFilter(FluidHostExec.FunctionName, FluidHostExec.Filter);
         o.Filters.AddFilter("sql_ident", (input, _, ctx) =>
             new ValueTask<FluidValue>(new StringValue(DuckSql.QuoteIdent(input.ToStringValue(ctx)), encode: false)));

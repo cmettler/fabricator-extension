@@ -1062,7 +1062,8 @@ the code:
 ## 11. `exec()` AS BUILT (2026-09-02) — the write-side twin of `query()`
 
 User-asked: *"i want a exec() in fluid as well."* C#-only, in the PLUGIN. **NO ABI change, NO C++ change, NO
-bridge change.** Gate `verify_plugin_fluid` **188 → 218**, three mutants each killed at its own assertion.
+bridge change.** Gate `verify_plugin_fluid` **188 → 234**, three mutants each killed at its own assertion.
+Service tier **54/54 — 3318** = 3302 + exactly this suite's 16, which is what shows no other suite moved.
 Tiers: hermetic **74/74 — 8259** (unchanged — no hermetic suite loads this plugin) and service
 **54/54 — 3302** = 3272 + exactly this suite's 30, which is what shows no other suite moved.
 
@@ -1074,31 +1075,85 @@ SELECT fabricator_render('deleted={{ "DELETE FROM t WHERE g = $g" | exec: g: "eu
 It also gives `IHostQuery.ExecuteNonQuery` its first caller — the member §8.2a of docs/plugin-services.md
 recorded as ungated hours earlier.
 
-### 11.1 ⚠⚠ THE DESIGN IS ONE BOUNDARY: PERMITTED IN `fabricator_render`, REFUSED IN `fluid_query`
+### 11.1 ⚠⚠ IT IS AVAILABLE ON BOTH SURFACES (user decision) — AND IN `fluid_query` A WRITE MULTIPLIES
 
-And it is a CORRECTNESS boundary, not a policy. A `fluid_query` template renders inside `bind_replace` —
-while DuckDB is BINDING — and a bind REPEATS and happens WITHOUT execution. §8.3 measured that; the mutant
-that removes the refusal **re-measured it exactly**, which is the strongest form this claim has ever had:
+**User, 2026-09-02: *"no problem to have a exec() in render or query."*** The first build refused `exec()` in
+`fluid_query` behind a fail-closed opt-in; that mechanism is DELETED. What replaces it is not silence — the
+gate now PINS the cost as asserted behaviour, which is a stronger record than a refusal plus prose.
 
-| step, none of which executes the user's statement | audit rows |
+A `fluid_query` template renders inside `bind_replace`, and a bind REPEATS and happens WITHOUT execution.
+**MEASURED, one counter through four steps that execute nothing the caller wrote:**
+
+| step | rows written |
 |---|---|
 | `EXPLAIN SELECT * FROM fluid_query('… {{ exec("INSERT …") }} …')` | **1** |
 | merely `CREATE VIEW v AS SELECT * FROM fluid_query(…)` | **2** |
 | one `SELECT count(*) FROM v` | **3** |
+| a second `SELECT count(*) FROM v` | **4** |
 
-`fabricator_render` is safe for the complementary reason, now MEASURED rather than inferred: it is a
-**VOLATILE** scalar (the `IScalarFunction` default, which the plugin does not override), so DuckDB does not
-constant-fold it at PLAN time — `EXPLAIN` of a render containing `exec()` leaves the table unchanged, and the
-plan shows the un-folded call.
+⇒ **the consequence to carry is the last two rows, not the first.** A writing template behind a view writes
+ON EVERY USE — and it works in testing, where the statement runs once. `EXPLAIN` writing is startling;
+a view that writes per use is what actually bites.
 
-**⚠ THE PERMISSION IS OPT-IN AND FAIL-CLOSED, and the direction is the whole point.** A render must ASK
-(`FluidEngine.Render(..., allowExec: true)`, default `false`), carried per context in
-`FluidHostExec.AllowKey` because the FILTER form lives on the shared `TemplateOptions` and can capture
-nothing. **Keying on the caller's NAME would have inverted the failure mode**: an unrecognised name reads as
-"not `fluid_query`" and would be ALLOWED, so a surface added later would default to the dangerous answer.
+`fabricator_render` behaves differently for a reason worth keeping straight: it is a **VOLATILE** scalar (the
+`IScalarFunction` default, which the plugin does not override), so DuckDB never folds it into the PLAN —
+`EXPLAIN` of a render containing `exec()` leaves the table unchanged (measured), and the plan shows the
+un-folded call. Its multiplier is ROWS, not binds.
 
-⚠ The function is **registered even where it is refused**. A refusal that names the bind-time hazard and the
-alternative beats an unknown-identifier error, which sends the author hunting for a typo.
+**⚠ WHY THE MECHANISM WAS DELETED RATHER THAN DEFAULTED ON.** With both surfaces permitting exec, an
+`allowExec` parameter that every caller passes `true` is vestigial machinery that READS as a restriction
+while restricting nothing — the worst of both. And the refusal never made bind-time writes impossible, only
+inconvenient: see §11.1a, where a write reached bind time through `query()` before `exec()` existed.
+
+**To restore a restriction**, the design is here rather than in git history: a per-render permission carried
+as a `TemplateContext.AmbientValues` flag (it cannot be a captured variable — the FILTER form is registered
+once on the shared `TemplateOptions`), **fail-closed**, set by each surface. ⚠ And do NOT derive it from the
+caller's NAME: an unrecognised name reads as "not `fluid_query`" and would be ALLOWED, so a surface added
+later would default to the dangerous answer.
+
+### 11.1b ⚠⚠ A STATEMENT CANNOT SEE THE WRITE ITS OWN TEMPLATE MADE — so "prepare then select" DOES NOT WORK
+
+**Found by asking what `exec()` in `fluid_query` is actually FOR, once it was permitted — i.e. by trying the
+pattern a user would try first, rather than only testing the hazard.** MEASURED 2026-09-02:
+
+```sql
+CREATE TABLE ex_prep(c INTEGER); INSERT INTO ex_prep VALUES (1);
+
+SELECT c FROM fluid_query('{% assign _ = exec("UPDATE ex_prep SET c = 42") %}SELECT c FROM ex_prep');
+--> 1     the generated SQL reads the OLD state
+SELECT c FROM ex_prep;
+--> 42    the write was real
+```
+
+⇒ **the write happens and the statement that triggered it observes the state before it.** `exec()` runs on
+its own connection; the outer statement's snapshot predates the commit. It is the exact mirror of §9's
+documented `query()` rule — *a template cannot observe the writes of the transaction running it* — in the
+other direction, and it follows from the same one-connection-per-host-query fact rather than being a second
+thing to remember.
+
+**And therefore a template cannot create a table the same statement selects from:**
+
+```sql
+SELECT * FROM fluid_query('{% assign _ = exec("CREATE OR REPLACE TABLE t AS SELECT 1 AS c") %}SELECT c FROM t');
+--> Catalog Error: Table with name t does not exist!  Did you mean "memory.t"?
+```
+
+⚠ **The table DOES exist afterwards** (asserted in the gate) — so the error is a VISIBILITY result, not a
+failed CREATE, and the "Did you mean" hint naming the very table it says is absent is the tell. Pinned
+rather than described, precisely because the message points away from the cause.
+
+⚠ **What works is a SEPARATE statement**: `exec()` in one, the read in the next. Gated, so the workaround is
+not folklore.
+
+⇒ **so what is `exec()` in `fluid_query` good for?** Side effects the statement does not itself read —
+audit rows, logging, staging for a LATER statement — plus the ordinary case of a template that writes and
+returns a count. Not for preparing data the generated SQL consumes. ⚠ That is a real narrowing of the
+capability, and it is nobody's fault: it is the connection model, and it would be there whether or not
+`exec()` had ever been refused at bind.
+
+⚠ **`{{ exec(…) }}` vs `{% assign _ = exec(…) %}` matters here**: the first INTERPOLATES the count into the
+generated SQL (measured: `1SELECT c FROM t` ⇒ a parser error), so a template that writes for effect must
+swallow the value.
 
 ### 11.1a ⚠⚠ THE REFUSAL STOPS THE ACCIDENT, NOT A DETERMINED CALLER — and the hole PRE-DATES `exec()`
 
@@ -1121,17 +1176,17 @@ a FUNCTION inside a SELECT.** DuckDB's parser is being asked what KIND of statem
 correctly — there is no question one could ask it that would catch a volatile writing scalar buried in a
 projection.
 
-**What that changes, and what it does not:**
+**What that establishes:**
 
-- ⚠ **State the refusal as what it is: it stops the ACCIDENT.** The overwhelmingly likely case is an author
-  writing `exec("DELETE …")` in a `fluid_query` template without knowing that binds repeat and fire on
-  `EXPLAIN`. That case is now caught, loudly, with the reason. Describing the boundary as making bind-time
-  writes *impossible* would be an overclaim.
-- It does **not** weaken the argument for `exec()`. The reverse: it is the measured form of "exec grants no
-  authority a caller did not already have" — the authority was reachable before it existed.
-- It is the same conclusion §10.4 reached one level down about the template ROOT — *ergonomics, not a
-  sandbox* — for the same reason: **the renderer can already run SQL.** Anyone who can call
-  `fabricator_render` or `fluid_query` can call `fabricator_exec` directly.
+- **It is the reason the `exec()` refusal was worth deleting rather than defending** (§11.1). A refusal that
+  can be walked around by anyone willing to nest a scalar was never a boundary; it was a speed bump for the
+  accident. With it gone, the accident is instead PINNED as asserted behaviour, which is at least honest
+  about what happens.
+- It is the measured form of *"exec grants no authority a caller did not already have"* — the authority was
+  reachable before `exec()` existed.
+- Same conclusion §10.4 reached one level down about the template ROOT — *ergonomics, not a sandbox* — for
+  the same reason: **the renderer can already run SQL.** Anyone who can call `fabricator_render` or
+  `fluid_query` can call `fabricator_exec` directly.
 - ⚠ **Do NOT "fix" it by blacklisting function names in the classified SQL.** That is the prefix-check
   anti-pattern in a new costume: an allow-list of safe functions is unmaintainable, and a deny-list is
   defeated by a macro, a view, or a name we do not ship.
@@ -1211,13 +1266,21 @@ description, not the behaviour.
 
 ### 11.6 What is pinned, and the honest gaps
 
-Gated: the write and its count; the `fluid_query` refusal **with the write-did-not-happen assertion** and a
-`query()`-still-works POSITIVE CONTROL beside it (without which "exec is refused" would pass equally on a
-build where the whole template surface had broken); `EXPLAIN` not writing; both SELECT refusals; the syntax-
-error path; the DDL/CTAS/host_exec triple; several statements; the filter form with a named parameter; the
-INJECTION pair (`0` deleted, table intact — `0` alone would also be true of a parameter that never arrived);
-the two-path agreement; per-row evaluation (3 rows ⇒ 3 writes); and the empty-statement guard, which must
-come BEFORE the classifier because an empty string reports no error from it.
+Gated: the write and its count; **the four-step bind-time multiplication in `fluid_query`** (each step
+against a fresh counter, so it reads as three facts rather than one total) with a `query()`-still-works
+POSITIVE CONTROL beside it and an assertion that the *other* table was untouched; `EXPLAIN` not writing on
+the `fabricator_render` side; both SELECT refusals; the syntax-error path; the DDL/CTAS/host_exec triple;
+several statements; the filter form with a named parameter; the INJECTION pair (`0` deleted, table intact —
+`0` alone would also be true of a parameter that never arrived); the two-path agreement; per-row evaluation
+(3 rows ⇒ 3 writes); and the empty-statement guard, which must come BEFORE the classifier because an empty
+string reports no error from it.
+
+⚠ **The multiplication block is a CHARACTERIZATION test and the suite says so**: it pins DuckDB's bind
+repetition, which is not ours to implement, so no mutant of ours can kill it. Its value is that a change in
+that behaviour — ours or upstream's — arrives as a failed assertion naming the step, instead of as a
+surprise in someone's audit table. The two mutants that DO belong to our code (the SELECT refusal, the
+parameterised count) were established on the previous commit and this change touches neither path — the
+permission check it removed sat ABOVE both, and all 227 assertions still pass.
 
 ⚠ **NOT gated:** that `exec()` grants no authority a caller lacked (that is an argument about the surface,
 not an observable), and the refusal's behaviour under `{% include %}` from remote storage (no hermetic

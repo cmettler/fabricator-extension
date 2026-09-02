@@ -1422,7 +1422,8 @@ parameter the statement wants but you did not supply is reported by DuckDB, nami
 > `WITH`-prefixed writes and `COPY … TO` are refused too, as is any multi-statement string containing a
 > write (a string of nothing but `SELECT`s is allowed and harmless). `DESCRIBE`, `SUMMARIZE`, `VALUES`,
 > `TABLE t`, `FROM t`, CTEs and set operations all work; **`PIVOT` and `EXPLAIN` are refused** although they
-> are read-only — define a view outside the template if you need them. To write, use `exec()` below.
+> are read-only — define a view outside the template if you need them. To write, use `exec()` below (which
+> works on both surfaces, with the bind-repetition caveat noted there).
 
 > ⚠ **`query()` reads COMMITTED data.** It runs on its own connection, so inside an explicit transaction it
 > does **not** see that transaction's uncommitted rows — a template cannot observe the writes of the
@@ -1458,21 +1459,48 @@ SELECT fabricator_render('{{ exec("CREATE TABLE m AS SELECT 1 AS c; INSERT INTO 
 -- 1        (and m now has 2 rows)
 ```
 
-> ⚠⚠ **`exec()` works in `fabricator_render` and is REFUSED in `fluid_query`.** That is not a policy — it is
-> the same fact that makes `query()` read-only. A `fluid_query` template is rendered while DuckDB is
-> *binding*, and binding repeats and happens without executing, so a write there would fire on an `EXPLAIN`
-> of a statement that never runs, again on merely **defining** a view over it, and again on every use of that
-> view. Measured: with the refusal removed, one audit table went 1 → 2 → 3 through exactly those three steps.
+> ⚠⚠ **`exec()` works in `fluid_query` too — and there a write MULTIPLIES.** A `fluid_query` template is
+> rendered while DuckDB is *binding*, and binding repeats and happens without executing. Measured, one
+> counter through four steps that execute nothing you wrote:
+>
+> | step | rows written |
+> |---|---|
+> | `EXPLAIN SELECT * FROM fluid_query('… {{ exec("INSERT …") }} …')` | 1 |
+> | merely `CREATE VIEW v AS SELECT * FROM fluid_query(…)` | 2 |
+> | one `SELECT … FROM v` | 3 |
+> | a second `SELECT … FROM v` | 4 |
+>
+> **The last two rows are the ones that bite.** A writing template behind a view writes on *every use*, and
+> it looks fine in testing, where the statement runs once. `EXPLAIN` writing is merely startling.
+>
+> **So put writes in `fabricator_render` unless you specifically want one per bind.** It is a volatile
+> scalar, so it is never folded into a plan (an `EXPLAIN` does not run it) — its multiplier is *rows*, which
+> you control by choosing the statement's cardinality. `SELECT fabricator_render(…)` with no `FROM` is one
+> row.
+
+> ⚠⚠ **A statement cannot see the write its own template made — so "prepare, then select" does not work.**
+> This is the pattern most people will try first, and it fails in the least obvious way: the write really
+> happens, and the generated SQL reads the state *before* it.
 >
 > ```sql
-> SELECT * FROM fluid_query('SELECT {{ exec("INSERT INTO audit VALUES (7)") }} AS n');
-> -- Error: exec() is refused here ... Use fabricator_render(...) for a template that writes
+> SELECT c FROM fluid_query('{% assign _ = exec("UPDATE t SET c = 42") %}SELECT c FROM t');
+> -- 1     the generated SQL reads the old value
+> SELECT c FROM t;
+> -- 42    the write was real
 > ```
 >
-> It catches the **accident**, which is the case that matters — writing `exec(...)` in a `fluid_query`
-> template without knowing that binds repeat. It is not a sandbox: `query()` permits any `SELECT`, and a
-> `SELECT` may itself call a writing function, so a template that means to write at bind time can. Nothing
-> here is a privilege boundary — a template can already run SQL.
+> `exec()` runs on its own connection, and the outer statement's snapshot predates the commit — the same
+> one-connection rule that makes `query()` read committed data, in the other direction. A template therefore
+> **cannot create a table the same statement selects from**: the `CREATE` succeeds and the statement still
+> reports `Table with name t does not exist!` (helpfully adding *"Did you mean memory.t"* — it exists, just
+> not for that statement).
+>
+> **Use two statements**: `exec()` in one, the read in the next. So `exec()` inside `fluid_query` is for side
+> effects the statement does not itself read — an audit row, a log line, staging for later — not for
+> preparing data the generated SQL consumes.
+>
+> ⚠ Write it as `{% assign _ = exec(…) %}`, not `{{ exec(…) }}` — the latter interpolates the row count into
+> your SQL (`1SELECT c FROM t`, which is a parser error).
 
 > ⚠ **A `SELECT` is refused by `exec()`, and the reason is a wrong number.** The count is read from the
 > statement's first column, so `exec('SELECT count(*) FROM t')` would report the *count of rows in `t`* as
@@ -1484,9 +1512,8 @@ SELECT fabricator_render('{{ exec("CREATE TABLE m AS SELECT 1 AS c; INSERT INTO 
 > ask the engine to classify the statement. Plain DDL is `0` in both.
 
 > ⚠ **`fabricator_render` is a scalar, so `exec()` runs once PER ROW.** Rendering a writing template over
-> three rows performs the write three times. For DDL, call it from a statement whose cardinality you chose —
-> `SELECT fabricator_render(…)` with no `FROM` is one row. (An `EXPLAIN` does *not* run it: the function is
-> volatile, so it is never folded into the plan.)
+> three rows performs the write three times — measured. That is the multiplier to watch on this surface, as
+> bind repetition is on the other one.
 
 `exec()` gives a template no authority you did not already have — anyone who can call `fabricator_render`
 can call [`fabricator_exec`](#fabricator_execcontext-sql---bigint) — and it reads and writes on its own connection,

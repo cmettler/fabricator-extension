@@ -1314,12 +1314,13 @@ RESET search_path;
 # (DuckDB's own parser, via json_serialize_sql): query() refuses everything
 # that is not a SELECT, exec() refuses everything that is.
 #
-# WHAT THIS SECTION IS REALLY ABOUT: exec() is refused in fluid_query and
-# permitted in fabricator_render, and that split is a CORRECTNESS boundary, not
-# a policy. A fluid_query template renders during bind_replace -- while DuckDB
-# is BINDING -- and a bind repeats and happens WITHOUT execution, so a write
-# there fires on EXPLAIN of a statement that never runs and on merely defining
-# a view (measured, section 8.3).
+# exec() is available on BOTH surfaces (user decision, 2026-09-02). In
+# fabricator_render it runs at EXECUTE time; in fluid_query it runs during
+# bind_replace -- while DuckDB is BINDING -- and a bind REPEATS and happens
+# WITHOUT execution. The section below therefore PINS that multiplication as
+# known behaviour rather than refusing it, which is a stronger record than
+# prose: if it ever stops multiplying, or starts multiplying differently, an
+# assertion says so.
 
 statement ok
 CREATE TABLE ex_aud(id INTEGER);
@@ -1341,27 +1342,121 @@ SELECT count(*) FROM ex_aud;
 ----
 3
 
-# --- REFUSED in fluid_query, naming the hazard and the alternative ---
-statement error
-SELECT * FROM fluid_query('SELECT {{ exec("INSERT INTO ex_aud VALUES (7)") }} AS n');
-----
-exec() is refused here
+# --- it works in fluid_query too, and THIS IS WHERE THE COST LIVES ---
+# ⚠⚠ THE POINT OF THIS BLOCK: a write inside a fluid_query template happens at
+# BIND, and binds repeat. Each step below is asserted against a FRESH counter so
+# the multiplication is visible as three separate facts rather than one total.
 
-# THE LOAD-BEARING ASSERTION OF THE WHOLE SECTION: the refusal happened at BIND
-# and NOTHING was written. Without this, the error assertion above would be
-# equally satisfied by a build that performed the insert and then complained.
+statement ok
+CREATE TABLE ex_bind(id INTEGER);
+
+# STEP 1 -- EXPLAIN of a statement that EXECUTES NOTHING still performs the write.
+statement ok
+EXPLAIN SELECT * FROM fluid_query('SELECT {{ exec("INSERT INTO ex_bind VALUES (1)") }} AS n');
+
 query I
-SELECT count(*) FROM ex_aud;
+SELECT count(*) FROM ex_bind;
+----
+1
+
+# STEP 2 -- merely DEFINING a view over it performs it again. Nothing has been
+# selected from the view at this point.
+statement ok
+CREATE VIEW ex_v AS SELECT * FROM fluid_query('SELECT {{ exec("INSERT INTO ex_bind VALUES (2)") }} AS n');
+
+query I
+SELECT count(*) FROM ex_bind;
+----
+2
+
+# STEP 3 -- and EVERY USE of that view performs it again. This is the one that
+# bites in practice: a writing template behind a view works in testing, where
+# the statement runs once.
+statement ok
+SELECT count(*) FROM ex_v;
+
+query I
+SELECT count(*) FROM ex_bind;
 ----
 3
 
-# ⚠ POSITIVE CONTROL, and it is what makes the refusal mean something: query()
-# still works in fluid_query. Otherwise "exec is refused" would pass equally on
-# a build where the whole template surface had stopped functioning.
+statement ok
+SELECT count(*) FROM ex_v;
+
+query I
+SELECT count(*) FROM ex_bind;
+----
+4
+
+statement ok
+DROP VIEW ex_v;
+
+# --- ⚠⚠ AND THE STATEMENT CANNOT SEE THE WRITE ITS OWN TEMPLATE MADE ---
+# This is the limitation that matters for the pattern anyone tries first --
+# "let the template PREPARE what the generated SQL then reads". It does not
+# work, and it fails in the least obvious way: the write really happens, and the
+# statement that triggered it observes the OLD state, because exec() runs on its
+# own connection and the outer statement's snapshot predates the commit.
+#
+# It is the exact mirror of query()'s documented rule (a template cannot observe
+# the writes of the transaction running it) in the other direction.
+
+statement ok
+CREATE TABLE ex_prep(c INTEGER);
+
+statement ok
+INSERT INTO ex_prep VALUES (1);
+
+# THE PAIR IS THE POINT. The first value shows the generated SQL read the OLD
+# state; the second shows the write was real. Either alone is misleading -- a 1
+# by itself would look like exec() had not run.
+query I
+SELECT c FROM fluid_query('{% assign _ = exec("UPDATE ex_prep SET c = 42") %}SELECT c FROM ex_prep');
+----
+1
+
+query I
+SELECT c FROM ex_prep;
+----
+42
+
+# ⇒ AND THEREFORE a template CANNOT create a table the same statement selects
+# from: the CREATE commits, but the table does not exist for that statement.
+# ⚠ Note the error names the table as absent even though it now exists, which is
+# what makes this worth pinning rather than describing.
+statement error
+SELECT * FROM fluid_query('{% assign _ = exec("CREATE OR REPLACE TABLE ex_late AS SELECT 1 AS c") %}SELECT c FROM ex_late');
+----
+does not exist
+
+# ... and it really was created, which is what makes the refusal above a
+# VISIBILITY result rather than a failed CREATE.
+query I
+SELECT count(*) FROM ex_late;
+----
+1
+
+# ⚠ The usable shape is therefore a SEPARATE statement: exec() in one, the read
+# in the next. Pinned so the workaround is not folklore.
+query I
+SELECT c FROM fluid_query('SELECT c FROM ex_prep');
+----
+42
+
+# ⚠ POSITIVE CONTROL for the whole block: query() still works in fluid_query, so
+# the counts above are exec() firing rather than the template surface behaving
+# oddly in some other way.
 query I
 SELECT n FROM fluid_query('SELECT {{ query("SELECT 41 + 1 AS v")[0].v }} AS n');
 ----
 42
+
+# ⚠ And the earlier ex_aud count is UNCHANGED by all of the above, which is what
+# shows the bind-time writes went where they were addressed and nowhere else.
+query I
+SELECT count(*) FROM ex_aud;
+----
+3
 
 # --- EXPLAIN of a fabricator_render exec does NOT write ---
 # ⚠ THE VOLATILITY MEASUREMENT. fabricator_render is VOLATILE (the
