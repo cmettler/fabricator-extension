@@ -85,7 +85,7 @@ internal static class FluidHostQuery
     internal static ValueTask<FluidValue> Filter(FluidValue input, FilterArguments args, TemplateContext ctx)
     {
         var caller = CallerOf(ctx);
-        return new(Run(caller, input.ToStringValue(ctx), BuildParameters(caller, args, ctx)));
+        return new(Run(caller, input.ToStringValue(ctx), BuildParameters(caller, FunctionName, args, ctx)));
     }
 
     private static FluidValue Run(string caller, string? sql, RecordBatch? parameters)
@@ -165,7 +165,7 @@ internal static class FluidHostQuery
     /// and rendering one into the SQL is exactly what parameters exist to avoid.
     /// </para>
     /// </remarks>
-    private static RecordBatch? BuildParameters(string caller, FilterArguments args, TemplateContext ctx)
+    internal static RecordBatch? BuildParameters(string caller, string fn, FilterArguments args, TemplateContext ctx)
     {
         var names = args.Names.ToList();
         if (names.Count == 0)
@@ -173,15 +173,15 @@ internal static class FluidHostQuery
             if (args.Count > 0)
             {
                 throw new ArgumentException(
-                    $"{caller}: {FunctionName} takes NAMED parameters only — write "
-                    + $"`sql | {FunctionName}: name: value` so the statement can reference $name.");
+                    $"{caller}: {fn} takes NAMED parameters only — write "
+                    + $"`sql | {fn}: name: value` so the statement can reference $name.");
             }
             return null;
         }
         if (args.Count != names.Count)
         {
             throw new ArgumentException(
-                $"{caller}: {FunctionName} was given {args.Count - names.Count} positional argument(s) "
+                $"{caller}: {fn} was given {args.Count - names.Count} positional argument(s) "
                 + "beside its named ones. Parameters must all be named, because the statement references "
                 + "them as $name.");
         }
@@ -296,6 +296,58 @@ internal static class FluidHostQuery
     /// </remarks>
     private static void RefuseUnlessSelect(string caller, string sql, IHostQuery host)
     {
+        var (isSelect, msg) = Classify(caller, FunctionName, sql, host);
+        if (isSelect)
+        {
+            return;
+        }
+
+        // ⚠ The engine's own message is surfaced verbatim, because it distinguishes the two causes this
+        // check would otherwise conflate: "Only SELECT statements can be serialized to json!" (a non-SELECT)
+        // and a real syntax error such as `syntax error at or near "SELEC"`. Reporting "not a SELECT" for a
+        // typo would send the author looking in the wrong place.
+        throw new InvalidOperationException(
+            $"{caller}: {FunctionName}() runs SELECT statements only, and this one was refused by DuckDB's "
+            + $"parser: {msg ?? "(no message)"}. A template is rendered while a statement is being BOUND, "
+            + "and a bind repeats and happens without execution — so a write here would fire on EXPLAIN. "
+            + $"To write, use {FluidHostExec.FunctionName}() from fabricator_render.");
+    }
+
+    /// <summary>
+    /// Asks DuckDB'S OWN PARSER whether <paramref name="sql"/> is a SELECT, without executing it. Returns
+    /// whether it is, plus the engine's message when it is not.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// ⚠ <b>This is the one mechanism behind two opposite policies</b> — <c>query()</c> refuses everything
+    /// that is NOT a SELECT, <c>exec()</c> refuses everything that IS one — so they cannot drift apart on
+    /// what "a SELECT" means. Both fail CLOSED: a classification that cannot run refuses.
+    /// </para>
+    /// <para>
+    /// ⚠⚠ <b>The two mechanisms anyone reaches for first are MEASURED broken</b> (docs/fluid-templating.md
+    /// §9.2). A prefix check admits <c>WITH x AS (SELECT 1) INSERT INTO t SELECT * FROM x</c>, a write
+    /// beginning with WITH. Wrapping as <c>SELECT * FROM (&lt;sql&gt;)</c> is worse than useless: it refuses
+    /// every honest non-SELECT and is defeated by the adversarial one —
+    /// <c>SELECT 1) ; INSERT INTO aud VALUES (99); SELECT * FROM (SELECT 2</c> performed the insert, and a
+    /// DROP variant dropped the table. A mechanism that refuses the accident and admits the attack is worse
+    /// than none, because it reads as a defence.
+    /// </para>
+    /// <para>
+    /// ⚠ <b>MULTI-STATEMENT, measured 2026-09-02 and NOT what an earlier note claimed.</b> The classifier
+    /// does not refuse multi-statement input as such: <c>SELECT 1; SELECT 2</c> classifies as a SELECT,
+    /// while <c>SELECT 1; INSERT …</c>, <c>SELECT 1; DROP TABLE t</c> and <c>CREATE …; INSERT …</c> are all
+    /// refused. So the SAFETY property is intact in both directions — an all-SELECT sequence is harmless to
+    /// <c>query()</c>, and a sequence containing a write reaches <c>exec()</c>, which is exactly the
+    /// several-statements case exec exists for.
+    /// </para>
+    /// <para>
+    /// ⚠ It PARSES ONLY. Measured: classifying a <c>DELETE</c> leaves the target table's row count
+    /// unchanged. And it tolerates a <c>$name</c> placeholder, which is what lets the parameterised filter
+    /// forms be classified at all.
+    /// </para>
+    /// </remarks>
+    internal static (bool IsSelect, string? Message) Classify(string caller, string fn, string sql, IHostQuery host)
+    {
         const string classify =
             "SELECT j ->> 'error' AS err, j ->> 'error_message' AS msg "
             // ⚠ The cast is REQUIRED, not defensive: an untyped placeholder has no type at bind, so DuckDB
@@ -329,23 +381,11 @@ internal static class FluidHostQuery
         catch (Exception ex)
         {
             throw new InvalidOperationException(
-                $"{caller}: {FunctionName}() could not establish that the statement is a SELECT, so it was "
+                $"{caller}: {fn}() could not establish what kind of statement this is, so it was "
                 + $"refused rather than run: {ex.Message}", ex);
         }
 
-        if (string.Equals(err, "false", StringComparison.OrdinalIgnoreCase))
-        {
-            return;
-        }
-
-        // ⚠ The engine's own message is surfaced verbatim, because it distinguishes the two causes this
-        // check would otherwise conflate: "Only SELECT statements can be serialized to json!" (a non-SELECT)
-        // and a real syntax error such as `syntax error at or near "SELEC"`. Reporting "not a SELECT" for a
-        // typo would send the author looking in the wrong place.
-        throw new InvalidOperationException(
-            $"{caller}: {FunctionName}() runs SELECT statements only, and this one was refused by DuckDB's "
-            + $"parser: {msg ?? "(no message)"}. A template is rendered while a statement is being BOUND, "
-            + "and a bind repeats and happens without execution — so a write here would fire on EXPLAIN.");
+        return (string.Equals(err, "false", StringComparison.OrdinalIgnoreCase), msg);
     }
 }
 

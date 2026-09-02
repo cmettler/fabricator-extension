@@ -784,7 +784,15 @@ case "$TIER" in
         # earlier attempt at this seam died with 0xC0000005). The load-bearing pair is the glob COUNT with a
         # zero-match negative control beside it -- 2 alone would pass on a build that returned everything.
         # 3257 + 15 = 3272 exactly, from a green run, which is what shows no other suite moved.
-        : "${MIN_ASSERTIONS:=3272}"
+        # 3302 since 2026-09-02 (same day, third bump): verify_plugin_fluid 188 -> 218 for the Fluid
+        # exec() -- a template that WRITES, permitted in fabricator_render and REFUSED in fluid_query. That
+        # split is a CORRECTNESS boundary: a fluid_query template renders during bind_replace, and the mutant
+        # removing the refusal re-measured section 8.3 exactly (an audit table 1 -> 2 -> 3 through EXPLAIN,
+        # then merely CREATE VIEW, then one use of that view -- none of which executes the statement).
+        # The load-bearing pairs are the refusal's "and the write did NOT happen" count, a query()-still-works
+        # positive control beside it, and the injection pair (0 deleted with the table intact).
+        # 3272 + 30 = 3302 exactly, from a green run, which is what shows no other suite moved.
+        : "${MIN_ASSERTIONS:=3302}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

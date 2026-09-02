@@ -90,9 +90,30 @@ public static class Host
 
     /// <summary>
     /// Runs a non-query statement (DDL / DML) on a fresh host connection and returns the affected-row count
-    /// when the engine reports one (DML → a 1-row BIGINT "Count"; DDL → 0). A thin helper over
-    /// <see cref="Query"/> (the ABI has one primitive — host_query subsumes exec).
+    /// when the engine reports one. A thin helper over <see cref="Query"/> (the ABI has one primitive —
+    /// host_query subsumes exec).
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// ⚠⚠ <b>THE RULE IS "the first column of the first batch, when it is an Int64" — an INFERENCE from the
+    /// RESULT SHAPE, not a question put to the statement.</b> This doc used to say "DML → a 1-row BIGINT
+    /// Count; DDL → 0", which is right for DML and for PURE DDL and WRONG for a CTAS: MEASURED 2026-09-02,
+    /// <c>CREATE TABLE c AS SELECT * FROM range(7)</c> returns <b>7</b> here.
+    /// </para>
+    /// <para>
+    /// ⚠⚠ <b>SO THIS DIVERGES FROM THE SQL SURFACE, and the divergence is REAL rather than cosmetic:</b> the
+    /// C++ <c>fabricator_host_exec</c> asks DuckDB's own <c>StatementReturnType::CHANGED_ROWS</c> and answers
+    /// <b>0</b> for that same CTAS (measured side by side). Managed code cannot reach that classification, so
+    /// this cannot be made to agree without one — do not "fix" it by matching on a leading keyword, which is
+    /// the prefix-check anti-pattern §9.2 of docs/fluid-templating.md measures as broken.
+    /// </para>
+    /// <para>
+    /// ⚠ It follows that a <b>SELECT</b> returning a single BIGINT reports that VALUE as though it were a
+    /// count. Callers for whom that matters must refuse a SELECT first — the Fluid <c>exec()</c> does, using
+    /// DuckDB's parser rather than a prefix test.
+    /// </para>
+    /// <para>For several statements the count is the LAST one's (<c>SendQuery</c> returns the last result).</para>
+    /// </remarks>
     public static long ExecuteNonQuery(string sql)
     {
         using var stream = Query(sql);

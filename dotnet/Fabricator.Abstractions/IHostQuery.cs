@@ -65,9 +65,21 @@ public interface IHostQuery
     /// Runs a non-query statement (DDL / DML) and returns the affected-row count when the engine reports one.
     /// </summary>
     /// <remarks>
-    /// ⚠ DML yields the count; DDL yields <c>0</c>, and so does a CTAS although it created rows — DuckDB does
-    /// not classify CREATE as a row-count statement. That reads as a bug otherwise, which is why it is stated
-    /// here. For several statements the count is the LAST one's.
+    /// ⚠⚠ <b>The count is INFERRED from the result shape — the first column of the first batch when it is an
+    /// Int64 — and NOT asked of the statement.</b> MEASURED 2026-09-02: DML yields its affected count, PURE
+    /// DDL (<c>CREATE TABLE z(a INTEGER)</c>) yields <c>0</c>, and a <b>CTAS yields the rows it created</b>
+    /// (<c>CREATE TABLE c AS SELECT * FROM range(7)</c> → <b>7</b>).
+    /// <para>
+    /// ⚠ <b>That last case DIVERGES from the SQL-surface <c>fabricator_host_exec</c>, which answers 0</b>,
+    /// because the C++ side can ask DuckDB's <c>StatementReturnType::CHANGED_ROWS</c> and managed code
+    /// cannot. An earlier version of this doc claimed the CTAS yielded 0 here too; it was copied from the
+    /// other surface rather than measured on this one.
+    /// </para>
+    /// <para>
+    /// ⚠ It follows that a SELECT returning one BIGINT reports that VALUE as a "count". A caller for whom
+    /// that matters must refuse a SELECT before calling — with DuckDB's parser, not a prefix test.
+    /// </para>
+    /// <para>For several statements the count is the LAST one's.</para>
     /// </remarks>
     long ExecuteNonQuery(string sql);
 }

@@ -1305,3 +1305,207 @@ SELECT v FROM fluid_query('{% assign r = query("SELECT v FROM t") %}SELECT {% fo
 
 statement ok
 RESET search_path;
+
+# ============================================================================
+# exec() -- the WRITE-side twin of query() (docs/fluid-templating.md 11)
+# ============================================================================
+#
+# The two functions are deliberate mirror images through ONE mechanism
+# (DuckDB's own parser, via json_serialize_sql): query() refuses everything
+# that is not a SELECT, exec() refuses everything that is.
+#
+# WHAT THIS SECTION IS REALLY ABOUT: exec() is refused in fluid_query and
+# permitted in fabricator_render, and that split is a CORRECTNESS boundary, not
+# a policy. A fluid_query template renders during bind_replace -- while DuckDB
+# is BINDING -- and a bind repeats and happens WITHOUT execution, so a write
+# there fires on EXPLAIN of a statement that never runs and on merely defining
+# a view (measured, section 8.3).
+
+statement ok
+CREATE TABLE ex_aud(id INTEGER);
+
+statement ok
+CREATE TABLE ex_t(id INTEGER, g VARCHAR);
+
+statement ok
+INSERT INTO ex_t VALUES (1, 'eu'), (2, 'eu'), (3, 'us');
+
+# --- it works where it is permitted, and reports the affected-row count ---
+query I
+SELECT fabricator_render('rows={{ exec("INSERT INTO ex_aud VALUES (1), (2), (3)") }}', NULL);
+----
+rows=3
+
+query I
+SELECT count(*) FROM ex_aud;
+----
+3
+
+# --- REFUSED in fluid_query, naming the hazard and the alternative ---
+statement error
+SELECT * FROM fluid_query('SELECT {{ exec("INSERT INTO ex_aud VALUES (7)") }} AS n');
+----
+exec() is refused here
+
+# THE LOAD-BEARING ASSERTION OF THE WHOLE SECTION: the refusal happened at BIND
+# and NOTHING was written. Without this, the error assertion above would be
+# equally satisfied by a build that performed the insert and then complained.
+query I
+SELECT count(*) FROM ex_aud;
+----
+3
+
+# ⚠ POSITIVE CONTROL, and it is what makes the refusal mean something: query()
+# still works in fluid_query. Otherwise "exec is refused" would pass equally on
+# a build where the whole template surface had stopped functioning.
+query I
+SELECT n FROM fluid_query('SELECT {{ query("SELECT 41 + 1 AS v")[0].v }} AS n');
+----
+42
+
+# --- EXPLAIN of a fabricator_render exec does NOT write ---
+# ⚠ THE VOLATILITY MEASUREMENT. fabricator_render is VOLATILE (the
+# IScalarFunction default), so DuckDB does not constant-fold it over constant
+# arguments at PLAN time. Dropping that would make EXPLAIN of a statement that
+# executes nothing perform the write -- which is exactly what was measured for
+# fabricator_host_exec's scalar form.
+# ⚠ EXPLAIN cannot be a subquery source, so the plan row is matched by regex;
+# what the assertion below is really for is the COUNT that follows it.
+query II
+EXPLAIN SELECT fabricator_render('{{ exec("INSERT INTO ex_aud VALUES (99)") }}', NULL);
+----
+physical_plan	<REGEX>:.*fabricator_render.*
+
+query I
+SELECT count(*) FROM ex_aud;
+----
+3
+
+# --- a SELECT is refused BY NAME, and the reason is a wrong NUMBER ---
+# The managed count is INFERRED from the result's first column when that column
+# is an Int64 -- the C++ surface can ask DuckDB for CHANGED_ROWS and this one
+# cannot. Refusing sends the author to query() instead of handing them a number
+# that looks right.
+statement error
+SELECT fabricator_render('{{ exec("SELECT 42") }}', NULL);
+----
+runs WRITES only
+
+# ⚠ THE SHAPE THAT ACTUALLY MISREPORTS, and it is the one a user would write.
+# MEASURED with the refusal removed: this renders 99, as though 99 rows had been
+# affected. (`SELECT 42` renders 0 -- an INT32 literal fails the Int64 test -- so
+# asserting only that one would motivate the refusal with a case that is harmless.)
+statement error
+SELECT fabricator_render('{{ exec("SELECT count(*) FROM range(99)") }}', NULL);
+----
+runs WRITES only
+
+# A statement DuckDB cannot parse is reported as such, not run. The classifier
+# distinguishes this from a non-SELECT, and conflating them would send the
+# author looking in the wrong place.
+statement error
+SELECT fabricator_render('{{ exec("INSER INTO ex_aud VALUES (1)") }}', NULL);
+----
+cannot parse
+
+# --- the count rule, pinned as the DISCRIMINATING TRIPLE it is ---
+# ⚠⚠ MEASURED, and it CORRECTS what this repo previously recorded: pure DDL is
+# 0, but a CTAS reports the rows it CREATED (7), where the SQL-surface
+# fabricator_host_exec answers 0 for the same statement. The managed path infers
+# the count from the result shape; only C++ can ask DuckDB's CHANGED_ROWS. The
+# divergence is asserted here rather than left latent.
+query I
+SELECT fabricator_render('{{ exec("CREATE TABLE ex_z(a INTEGER)") }}', NULL);
+----
+0
+
+query I
+SELECT fabricator_render('{{ exec("CREATE TABLE ex_c AS SELECT * FROM range(7)") }}', NULL);
+----
+7
+
+query I
+SELECT fabricator_host_exec('CREATE TABLE ex_c3 AS SELECT * FROM range(7)');
+----
+0
+
+# --- SEVERAL STATEMENTS in one call: what the no-parameter path buys ---
+# The parameterised path cannot do this (the host prepares it, and Prepare takes
+# one statement), which is why exec has two paths at all. The count is the LAST
+# statement's.
+query I
+SELECT fabricator_render('{{ exec("CREATE TABLE ex_m AS SELECT 1 AS c; INSERT INTO ex_m VALUES (2)") }}', NULL);
+----
+1
+
+query I
+SELECT count(*) FROM ex_m;
+----
+2
+
+# --- the FILTER form: NAMED parameters bound as VALUES ---
+query I
+SELECT fabricator_render('deleted={{ "DELETE FROM ex_t WHERE g = $g" | exec: g: "eu" }}', NULL);
+----
+deleted=2
+
+query I
+SELECT count(*) FROM ex_t;
+----
+1
+
+# ⚠⚠ INJECTION, with its control. The value must arrive as a VALUE, never as SQL
+# text: splicing would delete the remaining row. 0 alone would be equally true of
+# a build where the parameter never arrived, which is what the pair above pins.
+query I
+SELECT fabricator_render('{{ "DELETE FROM ex_t WHERE g = $g" | exec: g: "us'' OR 1=1 --" }}', NULL);
+----
+0
+
+query I
+SELECT count(*) FROM ex_t;
+----
+1
+
+# --- the TWO COUNT PATHS MUST AGREE ---
+# ⚠ exec reads its count in two places: IHostQuery.ExecuteNonQuery for the bare
+# form, and a local read of Query()'s result for the parameterised one (which
+# cannot use ExecuteNonQuery -- it has no parameter overload). A rule written
+# twice can drift, so the same statement is put through both.
+query II
+SELECT fabricator_render('{{ exec("INSERT INTO ex_aud VALUES (9), (9)") }}', NULL) AS no_params,
+       fabricator_render('{{ "INSERT INTO ex_aud VALUES ($a), ($a)" | exec: a: 9 }}', NULL) AS with_params;
+----
+2	2
+
+# --- PER-ROW EVALUATION IS REAL, and nothing prevents it ---
+# fabricator_render is a scalar, so three rows perform three writes. Volatility
+# keeps it out of PLAN time; it does not make it run once. Pinned because it is
+# surprising and because a caller doing DDL needs to know.
+statement ok
+DELETE FROM ex_aud;
+
+query I
+SELECT count(fabricator_render('{{ exec("INSERT INTO ex_aud VALUES (1)") }}', NULL)) FROM range(3);
+----
+3
+
+query I
+SELECT count(*) FROM ex_aud;
+----
+3
+
+# --- an empty statement is refused BEFORE the classifier ---
+# ⚠ Load-bearing ordering: an empty string reports NO error from
+# json_serialize_sql (it parses to zero statements), so the classifier alone
+# would wave it through.
+statement error
+SELECT fabricator_render('{{ exec("") }}', NULL);
+----
+empty statement
+
+# --- both are advertised, and exec resolves as a function AND a filter ---
+query I
+SELECT fabricator_render('{{ exec("INSERT INTO ex_aud VALUES (5)") }}|{{ "INSERT INTO ex_aud VALUES ($x)" | exec: x: 6 }}', NULL);
+----
+1|1

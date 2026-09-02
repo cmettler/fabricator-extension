@@ -1419,10 +1419,10 @@ parameter the statement wants but you did not supply is reported by DuckDB, nami
 > -- Error: query() runs SELECT statements only ... Only SELECT statements can be serialized to json!
 > ```
 >
-> `WITH`-prefixed writes, multi-statement strings and `COPY … TO` are refused too. `DESCRIBE`, `SUMMARIZE`,
-> `VALUES`, `TABLE t`, `FROM t`, CTEs and set operations all work; **`PIVOT` and `EXPLAIN` are refused**
-> although they are read-only — define a view outside the template if you need them. Use
-> [`fabricator_host_exec`](#fabricator_host_execsql---tableaffected-bigint) for statements that write.
+> `WITH`-prefixed writes and `COPY … TO` are refused too, as is any multi-statement string containing a
+> write (a string of nothing but `SELECT`s is allowed and harmless). `DESCRIBE`, `SUMMARIZE`, `VALUES`,
+> `TABLE t`, `FROM t`, CTEs and set operations all work; **`PIVOT` and `EXPLAIN` are refused** although they
+> are read-only — define a view outside the template if you need them. To write, use `exec()` below.
 
 > ⚠ **`query()` reads COMMITTED data.** It runs on its own connection, so inside an explicit transaction it
 > does **not** see that transaction's uncommitted rows — a template cannot observe the writes of the
@@ -1434,10 +1434,68 @@ parameter the statement wants but you did not supply is reported by DuckDB, nami
 > rendered the template, and a timestamp renders in the zone you set. Name and time resolution are
 > inherited; the transaction is not.
 
+**A template can also WRITE — `exec(sql)`.** It is `query()`'s mirror image: `query()` runs `SELECT`
+statements only, `exec()` runs everything else, and both decide with DuckDB's own parser. It returns the
+affected-row count, so a template can report what it did:
+
+```sql
+SELECT fabricator_render('inserted={{ exec("INSERT INTO audit VALUES (1), (2), (3)") }}', NULL);
+-- inserted=3
+```
+
+Parameters bind by name through the filter form, exactly as for `query()` — and, exactly as for `query()`,
+the value is bound rather than spliced:
+
+```sql
+SELECT fabricator_render('deleted={{ "DELETE FROM orders WHERE region = $r" | exec: r: "eu" }}', NULL);
+-- deleted=2
+```
+
+Unlike `query()`, the plain form takes **several statements in one call**, and the count is the last one's:
+
+```sql
+SELECT fabricator_render('{{ exec("CREATE TABLE m AS SELECT 1 AS c; INSERT INTO m VALUES (2)") }}', NULL);
+-- 1        (and m now has 2 rows)
+```
+
+> ⚠⚠ **`exec()` works in `fabricator_render` and is REFUSED in `fluid_query`.** That is not a policy — it is
+> the same fact that makes `query()` read-only. A `fluid_query` template is rendered while DuckDB is
+> *binding*, and binding repeats and happens without executing, so a write there would fire on an `EXPLAIN`
+> of a statement that never runs, again on merely **defining** a view over it, and again on every use of that
+> view. Measured: with the refusal removed, one audit table went 1 → 2 → 3 through exactly those three steps.
+>
+> ```sql
+> SELECT * FROM fluid_query('SELECT {{ exec("INSERT INTO audit VALUES (7)") }} AS n');
+> -- Error: exec() is refused here ... Use fabricator_render(...) for a template that writes
+> ```
+>
+> It catches the **accident**, which is the case that matters — writing `exec(...)` in a `fluid_query`
+> template without knowing that binds repeat. It is not a sandbox: `query()` permits any `SELECT`, and a
+> `SELECT` may itself call a writing function, so a template that means to write at bind time can. Nothing
+> here is a privilege boundary — a template can already run SQL.
+
+> ⚠ **A `SELECT` is refused by `exec()`, and the reason is a wrong number.** The count is read from the
+> statement's first column, so `exec('SELECT count(*) FROM t')` would report the *count of rows in `t`* as
+> though that many rows had been affected. It is refused by name instead, pointing you at `query()`.
+>
+> Note this makes `exec()` disagree with
+> [`fabricator_host_exec`](#fabricator_host_execsql---tableaffected-bigint) on one shape: a `CREATE TABLE …
+> AS SELECT` reports the rows it created here (`7`) and `0` there, because only the SQL-level function can
+> ask the engine to classify the statement. Plain DDL is `0` in both.
+
+> ⚠ **`fabricator_render` is a scalar, so `exec()` runs once PER ROW.** Rendering a writing template over
+> three rows performs the write three times. For DDL, call it from a statement whose cardinality you chose —
+> `SELECT fabricator_render(…)` with no `FROM` is one row. (An `EXPLAIN` does *not* run it: the function is
+> volatile, so it is never folded into the plan.)
+
+`exec()` gives a template no authority you did not already have — anyone who can call `fabricator_render`
+can call [`fabricator_exec`](#fabricator_execcontext-sql---bigint) — and it reads and writes on its own connection,
+so the same committed-data rule as `query()` applies.
+
 Liquid control flow (`{% if %}`, `{% for %}`) works, comparisons and arithmetic filters work on numbers from
 either kind of bag, and nested `STRUCT`/`MAP`/`LIST` members are reachable by name, by index and by `.size`.
-Fluid is secure-by-default: only the variables you pass are reachable, and apart from the two SQL filters
-above no custom filters or tags are registered.
+Fluid is secure-by-default: only the variables you pass are reachable, and the only registered filters and
+functions are the two SQL filters (`sql`, `sql_ident`) and `query` / `exec` above.
 
 > ⚠ **Dates and times.** A `DATE`/`TIMESTAMP`/`TIMESTAMPTZ` renders in UTC (`2026-09-01 00:00:00Z`), and
 > `{{ d | date: '%Y-%m-%d' }}` formats it. Two things to know:

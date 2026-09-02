@@ -606,7 +606,9 @@ defence.
 
 **What ships is `json_serialize_sql`, with the SQL as a BOUND PARAMETER.** DuckDB's own parser decides, and
 it announces the rule itself: *"Only SELECT statements can be serialized to json!"*. Measured, it refuses
-both escapes above, refuses multi-statement input, refuses the `WITH …INSERT` shape — and **parses only**:
+both escapes above (⚠ but NOT a write performed by a FUNCTION inside a SELECT — measured in §11.1a; the rule is about the statement KIND), refuses any multi-statement input CONTAINING A WRITE (⚠ NOT every multi-statement
+input — an all-`SELECT` sequence is accepted; corrected and measured in §11.5), refuses the
+`WITH …INSERT` shape — and **parses only**:
 a target table's row count is unchanged by classifying a `DELETE` against it.
 
 - **⚠ The cast is REQUIRED**: `json_serialize_sql(?)` cannot resolve its overload from an untyped
@@ -1056,3 +1058,167 @@ the code:
   table-function parameter) and awkward for `fabricator_render` (a scalar, so a third parameter means a second
   arity), and the global setting plus absolute paths covers the cases. Revisit if the process-wide scope
   becomes a real complaint rather than an aesthetic one.
+
+## 11. `exec()` AS BUILT (2026-09-02) — the write-side twin of `query()`
+
+User-asked: *"i want a exec() in fluid as well."* C#-only, in the PLUGIN. **NO ABI change, NO C++ change, NO
+bridge change.** Gate `verify_plugin_fluid` **188 → 218**, three mutants each killed at its own assertion.
+Tiers: hermetic **74/74 — 8259** (unchanged — no hermetic suite loads this plugin) and service
+**54/54 — 3302** = 3272 + exactly this suite's 30, which is what shows no other suite moved.
+
+```sql
+SELECT fabricator_render('inserted={{ exec("INSERT INTO audit VALUES (1),(2),(3)") }}', NULL);  -- inserted=3
+SELECT fabricator_render('deleted={{ "DELETE FROM t WHERE g = $g" | exec: g: "eu" }}', NULL);   -- deleted=2
+```
+
+It also gives `IHostQuery.ExecuteNonQuery` its first caller — the member §8.2a of docs/plugin-services.md
+recorded as ungated hours earlier.
+
+### 11.1 ⚠⚠ THE DESIGN IS ONE BOUNDARY: PERMITTED IN `fabricator_render`, REFUSED IN `fluid_query`
+
+And it is a CORRECTNESS boundary, not a policy. A `fluid_query` template renders inside `bind_replace` —
+while DuckDB is BINDING — and a bind REPEATS and happens WITHOUT execution. §8.3 measured that; the mutant
+that removes the refusal **re-measured it exactly**, which is the strongest form this claim has ever had:
+
+| step, none of which executes the user's statement | audit rows |
+|---|---|
+| `EXPLAIN SELECT * FROM fluid_query('… {{ exec("INSERT …") }} …')` | **1** |
+| merely `CREATE VIEW v AS SELECT * FROM fluid_query(…)` | **2** |
+| one `SELECT count(*) FROM v` | **3** |
+
+`fabricator_render` is safe for the complementary reason, now MEASURED rather than inferred: it is a
+**VOLATILE** scalar (the `IScalarFunction` default, which the plugin does not override), so DuckDB does not
+constant-fold it at PLAN time — `EXPLAIN` of a render containing `exec()` leaves the table unchanged, and the
+plan shows the un-folded call.
+
+**⚠ THE PERMISSION IS OPT-IN AND FAIL-CLOSED, and the direction is the whole point.** A render must ASK
+(`FluidEngine.Render(..., allowExec: true)`, default `false`), carried per context in
+`FluidHostExec.AllowKey` because the FILTER form lives on the shared `TemplateOptions` and can capture
+nothing. **Keying on the caller's NAME would have inverted the failure mode**: an unrecognised name reads as
+"not `fluid_query`" and would be ALLOWED, so a surface added later would default to the dangerous answer.
+
+⚠ The function is **registered even where it is refused**. A refusal that names the bind-time hazard and the
+alternative beats an unknown-identifier error, which sends the author hunting for a typo.
+
+### 11.1a ⚠⚠ THE REFUSAL STOPS THE ACCIDENT, NOT A DETERMINED CALLER — and the hole PRE-DATES `exec()`
+
+Found by asking whether the boundary can be nested around, rather than assuming it cannot. **MEASURED
+2026-09-02, and it is a property of the SHIPPED `query()` from slice 3, independent of anything added here:**
+
+```sql
+-- the classifier is asked about a SELECT that CONTAINS a writing scalar
+SELECT json_serialize_sql('SELECT fabricator_host_exec(''INSERT INTO aud VALUES (1)'')');
+--> error = false, i.e. it IS a SELECT, which is CORRECT
+
+-- so a fluid_query template reaches a write through query(), AT BIND TIME
+SELECT * FROM fluid_query(
+  'SELECT {{ query("SELECT fabricator_host_exec(''INSERT INTO aud VALUES (1)'') AS c")[0].c }} AS n');
+--> aud goes 0 -> 1
+```
+
+⇒ **`query()`'s SELECT-only rule prevents a statement-level write; it does not prevent a write performed by
+a FUNCTION inside a SELECT.** DuckDB's parser is being asked what KIND of statement this is, and it answers
+correctly — there is no question one could ask it that would catch a volatile writing scalar buried in a
+projection.
+
+**What that changes, and what it does not:**
+
+- ⚠ **State the refusal as what it is: it stops the ACCIDENT.** The overwhelmingly likely case is an author
+  writing `exec("DELETE …")` in a `fluid_query` template without knowing that binds repeat and fire on
+  `EXPLAIN`. That case is now caught, loudly, with the reason. Describing the boundary as making bind-time
+  writes *impossible* would be an overclaim.
+- It does **not** weaken the argument for `exec()`. The reverse: it is the measured form of "exec grants no
+  authority a caller did not already have" — the authority was reachable before it existed.
+- It is the same conclusion §10.4 reached one level down about the template ROOT — *ergonomics, not a
+  sandbox* — for the same reason: **the renderer can already run SQL.** Anyone who can call
+  `fabricator_render` or `fluid_query` can call `fabricator_exec` directly.
+- ⚠ **Do NOT "fix" it by blacklisting function names in the classified SQL.** That is the prefix-check
+  anti-pattern in a new costume: an allow-list of safe functions is unmaintainable, and a deny-list is
+  defeated by a macro, a view, or a name we do not ship.
+
+⚠ Deliberately NOT gated. A test asserting "this bypass works" would pin a behaviour we would happily lose
+if DuckDB ever grew a read-only execution mode, and it is the absence of a defence rather than a defence.
+The measurement is recorded here instead.
+
+### 11.2 ⚠ IT REFUSES A `SELECT`, AND THE REASON IS A WRONG NUMBER RATHER THAN A HAZARD
+
+`query()` refuses everything that is not a SELECT; `exec()` refuses everything that is. **One mechanism, two
+opposite policies** (`FluidHostQuery.Classify`), so they cannot drift on what "a SELECT" means.
+
+The motivation is concrete: managed code cannot ask DuckDB for a statement's `StatementReturnType::
+CHANGED_ROWS` (that lives C++-side), so `Host.ExecuteNonQuery` INFERS the count from the first column when it
+is an `Int64`. **MEASURED with the refusal removed:**
+
+| statement | reported "affected" |
+|---|---|
+| `SELECT count(*) FROM range(99)` | **99** ← a number that looks right and is not one |
+| `SELECT 42::BIGINT` | **42** |
+| `SELECT 42` | 0 — an INT32 literal fails the `Int64` test |
+| `SELECT 'x'` | 0 |
+
+**⚠ THE TRAP IS NARROWER THAN "ANY SELECT" AND THE NARROW VERSION IS THE LIKELY ONE, which is why the gate
+asserts BOTH.** My first write-up claimed `exec('SELECT 42')` would render 42; it renders **0**. An aggregate
+`count(*)` is what a template author would actually reach for, and that one does misreport — so pinning only
+the `SELECT 42` case would have motivated the refusal with a harmless example.
+
+### 11.3 ⚠⚠ A MEASURED DIVERGENCE BETWEEN THE TWO `exec` SURFACES, and a doc that was WRONG on both sides
+
+MEASURED side by side, same statement:
+
+| `CREATE TABLE c AS SELECT * FROM range(7)` | reports |
+|---|---|
+| Fluid `exec()` (managed, infers from the result shape) | **7** |
+| `fabricator_host_exec` (C++, asks `CHANGED_ROWS`) | **0** |
+
+Pure DDL (`CREATE TABLE z(a INTEGER)`) is **0** on both. The divergence cannot be closed from managed code
+without the engine's classification, and it must NOT be closed by matching a leading keyword — that is the
+prefix-check anti-pattern §9.2 measures as broken. It is ASSERTED in the gate as a triple rather than left
+latent.
+
+**⚠ Both `ExecuteNonQuery` docs said "DDL → 0", including the one I had written the same day, and both were
+wrong for a CTAS.** Mine was copied from `fabricator_host_exec`'s recorded behaviour instead of being
+measured on the path it documents — the same "described it by analogy rather than reading the second
+implementation" error this repo keeps recording. Both are corrected.
+
+### 11.4 Two paths, one count rule
+
+Without parameters `exec()` calls `IHostQuery.ExecuteNonQuery`. With them it cannot — the host's
+parameterised route is `Prepare`, which takes ONE statement, and `ExecuteNonQuery` has no parameter overload
+— so the count is read locally by the SAME rule. **A rule written twice can drift, so the gate puts one
+statement through both and asserts they agree (2 / 2).** Mutant C, which makes the parameterised path report
+0, dies at the filter-form assertion.
+
+⚠ The asymmetry buys something real: the no-parameter path takes **several statements in one call**
+(`CREATE …; INSERT …`, count = the LAST one's), which the parameterised path cannot. Measured, and the
+classifier permits it — see §11.5.
+
+### 11.5 ⚠ MULTI-STATEMENT: A RECORDED CLAIM CORRECTED
+
+§9.2 said the classifier "refuses multi-statement input". MEASURED 2026-09-02, that is imprecise in a way
+that matters for both functions:
+
+| input | classifier verdict |
+|---|---|
+| `SELECT 1; SELECT 2` | **a SELECT** (accepted) |
+| `SELECT 1; INSERT INTO t VALUES (1)` | refused |
+| `SELECT 1; DROP TABLE t` | refused |
+| `CREATE TABLE t AS SELECT 1; INSERT INTO t VALUES (2)` | refused |
+
+⇒ **the SAFETY property is intact in both directions and is better than the old description**: an all-SELECT
+sequence is harmless to `query()`, and any sequence containing a write is refused by `query()` and therefore
+reaches `exec()` — which is precisely the several-statements case exec exists for. What was wrong was the
+description, not the behaviour.
+
+### 11.6 What is pinned, and the honest gaps
+
+Gated: the write and its count; the `fluid_query` refusal **with the write-did-not-happen assertion** and a
+`query()`-still-works POSITIVE CONTROL beside it (without which "exec is refused" would pass equally on a
+build where the whole template surface had broken); `EXPLAIN` not writing; both SELECT refusals; the syntax-
+error path; the DDL/CTAS/host_exec triple; several statements; the filter form with a named parameter; the
+INJECTION pair (`0` deleted, table intact — `0` alone would also be true of a parameter that never arrived);
+the two-path agreement; per-row evaluation (3 rows ⇒ 3 writes); and the empty-statement guard, which must
+come BEFORE the classifier because an empty string reports no error from it.
+
+⚠ **NOT gated:** that `exec()` grants no authority a caller lacked (that is an argument about the surface,
+not an observable), and the refusal's behaviour under `{% include %}` from remote storage (no hermetic
+fixture has a remote root — the same gap §10 records).
