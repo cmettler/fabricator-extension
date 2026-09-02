@@ -513,7 +513,11 @@ internal sealed class PlugGlobCountFunction : IScalarFunction
     public IArrowArray Invoke(RecordBatch args)
     {
         var patterns = (StringArray)args.Column(0);
-        var fs = FabricatorServices.GetRequired<IHostFileSystem>();
+        // ⚠ DELIBERATELY THE OTHER RESOLUTION ROUTE. PlugReadFileFunction uses the primary
+        // FabricatorServices.GetRequired<T>(); this one goes through the BCL IServiceProvider and the
+        // generic extension over it. Two routes, one existing assertion each, so both are gated by
+        // construction rather than by a test written to cover them.
+        var fs = FabricatorServices.Provider.GetRequiredService<IHostFileSystem>();
         var b = new Int64Array.Builder().Reserve(args.Length);
         for (int i = 0; i < args.Length; i++)
         {

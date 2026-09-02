@@ -483,6 +483,76 @@ argument for having Common at all.
 and have it use `ArrowValueReader` — **without widening its reference to `Fabricator.Bridge`.** If that is
 not possible, the split did not achieve what it was for.
 
+### 7.4a DECISIONS on the three open sub-questions (user, 2026-09-02)
+
+**1. `DuckSql` / `DuckDbHttpHandler` STAY IN ABSTRACTIONS.** User: *"i think it doesn't matter today where
+DuckSql/DuckDbHttpHandler live."* Agreed and settled: moving them is a BREAKING change for out-of-tree
+plugins (the FluidPlugin alone uses `DuckSql` in two places, and the three out-of-tree ones may) in exchange
+for a naming purity nobody has asked for. Reversible later at the same cost; §6.3's tidying argument is
+noted and declined for now.
+
+**2. THE MOVERS BECOME `public`, AND NO `InternalsVisibleTo` IS NEEDED — but the second half of the question
+has the direction inverted, and the inversion matters.** User: *"if we move stuff to common then internal
+does not make much sense as the purpose is to reuse? so InternalsVisibleTo not needed? make public but
+bridges internals must be visible in common?"*
+
+The first two clauses are right: a type moved to Common **in order to be reusable** must be `public`, or the
+move achieves nothing, and once it is public Bridge needs no `InternalsVisibleTo` to keep using it.
+
+**⚠⚠ The third clause is impossible, not merely unnecessary: COMMON CAN NEVER SEE BRIDGE.** Bridge
+references Common, so a reference back would be a project CYCLE — and `InternalsVisibleTo` cannot help,
+because it grants access to code that already has a reference. So:
+
+| direction | answer |
+|---|---|
+| Bridge → Common internals | unnecessary; make the movers `public` |
+| Common → Bridge internals | **IMPOSSIBLE (cycle)** — a file needing one CANNOT MOVE |
+
+⇒ **that impossibility IS the closure check's criterion**, and it is exactly why the three
+`FabricatorLog` users were deferred rather than moved with a visibility patch. There is no
+`InternalsVisibleTo` that would have rescued them. Anything a mover needs from Bridge must either move with
+it, become a SERVICE, or stop the move.
+
+⚠ **One cost to take deliberately rather than by reflex: making 13 types `public` widens a contract that has
+no version number** — out-of-tree plugins pin this repo BY SHA (§1.5), so each newly public type is one more
+thing a pin bump can break. Move what is genuinely wanted, not all 13 because the list exists.
+
+⚠ **`ObjectNotFoundException` should go to ABSTRACTIONS, not Common** (§6.2 flagged this and it is now a
+decision): every provider is REQUIRED to throw it to signal absence, so it is part of the provider CONTRACT
+rather than a reusable convenience.
+
+**3. `FabricatorLog` IS A SERVICE (`IHostLog`), NOT A MOVER — and answering this DISSOLVES the phase-2
+deferral rather than deciding a trade-off.** User: *"FabricatorLog into common or as a GetService<>()?"*
+
+Two reasons, the first decisive and the second merely expensive:
+
+- **It needs the RUNNING HOST.** What a plugin wants from it is reaching `duckdb_logs`, and that happens
+  through the `host_log` ABI callback (`FabricatorLog.EnableHostForwarding`). That is §3.1's dividing line —
+  needs host state ⇒ SERVICE. (It also has a host-independent file sink via `FABRICATOR_LOG_LEVEL`/`_FILE`,
+  but that is not the half a plugin is asking for.)
+- **Moving it drags `Microsoft.Extensions.Logging` into every plugin's compile closure**, and the two are not
+  separable: its whole public surface is MEL types (`ILoggerFactory`, `ILogger`, `ILoggerProvider`). An
+  interface with primitive parameters keeps MEL out.
+
+**⚠⚠ THE CONSTRAINT THAT MUST SURVIVE INTO THE INTERFACE: `IHostLog` MUST EXPOSE `IsEnabled(level)`.**
+`MemoryProbe` gates every mark on `Log.IsEnabled(LogLevel.Debug)` and CLAUDE.md is emphatic that it must stay
+that way, because `Environment.WorkingSet` queries OS process counters and some marks sit in per-group loops.
+An `IHostLog` with only `Log(level, category, message)` would force either losing that gate or computing the
+values eagerly — the exact regression the gate exists to prevent.
+
+**⇒ WITH `IHostLog`, THE DEFERRED THREE BECOME MOVABLE AND THE MOVER LIST GOES 13 → 16.**
+`DbDataReaderArrowStream`, `SingleScanArrowStream` and `MemoryProbe` need MEL for nothing else — read from
+source, each holds one `static readonly ILogger` and uses `IsEnabled` plus one log call. So "phase 2" is not
+a second migration; it is *add `IHostLog` first*. ⚠ `DbDataReaderArrowStream` additionally takes an
+`InterruptScope`, so it needs that resolved too (either as a mover or as a second service) — check before
+counting it in.
+
+⚠ **Formatting moves caller-side and nothing is lost by it, which is worth stating because it looks like a
+regression.** Those three use structured logging (`LogDebug("mem {Where}: ws={Ws}MB…", …)`), and an
+`IHostLog` with primitive parameters means interpolating first. Both existing sinks are message-string based
+anyway — the host callback is `(int level, string category, string message)` and `FileLoggerProvider.Write`
+takes a line — so no structured field survives today either.
+
 ### 7.5 Order, and how each step is proven
 
 **Locator first, Common second.** They are independent, but the locator is the approved capability and is
@@ -538,12 +608,12 @@ Consumers updated: `DuckDbHttpHandler` (in Abstractions), the Fluid plugin's `Fl
 `-dlrest`), which pin by sha and migrate at their next bump — this repo does not keep aliases (the `IArrow*`
 renames, `ScalarFnBind`).
 
-⚠ **A `GetService<T>()` EXTENSION OVER `IServiceProvider` IS NOT SHIPPED, and it is a deliberate omission
-rather than an oversight.** The primary API is `FabricatorServices.Get<T>()` (what §7.1 named and what the
-plan was approved as); `Provider` exists for handing the BCL type to code that wants one, and a caller
-holding it uses `GetService(typeof(T))`. A three-line generic extension would be nicer and is worth adding —
-but it needs a managed publish, which is what §8.4 is blocked on, and shipping source that has never been
-built is worse than the small ergonomic gap.
+✅ **THE `GetService<T>()` EXTENSION OVER `IServiceProvider` IS NOW SHIPPED** (2026-09-02, user-asked;
+`FabricatorServiceProviderExtensions` — `GetService<T>()` and `GetRequiredService<T>()`). The primary API is
+still `FabricatorServices.Get<T>()`; these exist for the case the locator was shaped around — handing
+`Provider` to code that wants an `IServiceProvider` and expects the familiar generic call on it. They work on
+ANY provider, not only ours, which is why `GetRequiredService<T>`'s message says nothing about the bridge.
+See §8.5.
 
 ### 8.2 ⚠⚠ `IHostFileSystem` SHIPS, and what decided it was ABI v82 rather than taste
 
@@ -630,6 +700,36 @@ into a sentence naming the missing context, which is the behaviour it was writte
 ⚠ **The control also settles that the SDK move is behaviour-neutral HERE**: the clean leg was published by
 SDK **10.0.400** (the tiers were measured on a **10.0.203** payload) and answers the same 112. That is one
 suite, not a tier — see §8.4.
+
+### 8.5 `GetService<T>()` over `IServiceProvider` (2026-09-02)
+
+`FabricatorServiceProviderExtensions` in Abstractions: `GetService<T>()` → `T?`, `GetRequiredService<T>()` →
+throws naming the interface. Two extension methods, no new dependency.
+
+**⚠⚠ THE NAMES ARE DELIBERATELY MEDI's, AND THAT MEANS A PLUGIN REFERENCING MEDI TOO SEES AN AMBIGUITY
+(CS0121) if it imports both namespaces.** That is the right trade and the right failure mode, for three
+reasons: familiarity is the ONLY thing MEDI was wanted for here (§3.4), a plugin that references MEDI
+*already has* these methods so ours are redundant for it, and the compiler saying so — with a one-line fix,
+dropping one `using` — beats inventing a second vocabulary nobody knows. It is a COMPILE error, never a
+silent wrong resolution.
+
+⚠ **MEASURED that it reaches no in-tree project**: all seven assemblies build with zero errors, and the
+reason is checkable rather than inferred — **no file in `dotnet/` imports
+`Microsoft.Extensions.DependencyInjection` at all** (grepped), so the two namespaces are never in scope
+together. ⚠ MEDI *is* in the published payload transitively, so the collision is reachable the day someone
+imports it.
+
+**⚠ GATED WITHOUT A NEW ASSERTION, by construction rather than by a test written to cover it.** The sample
+plugin's two service-backed scalars now resolve by DIFFERENT routes — `plug_read_file` through
+`FabricatorServices.GetRequired<T>()`, `plug_glob_count` through
+`FabricatorServices.Provider.GetRequiredService<T>()` — so each existing assertion gates one route.
+Mutation-tested: making the extension resolve nothing kills `plug_glob_count` **after both
+`plug_read_file` assertions pass**, which is what demonstrates the two routes are independent rather than
+one wrapping the other.
+
+⚠ `verify_plugin` stays at **112** — the same assertions, one of them now flowing through the new path. A
+count that did not move is the honest outcome for a change that adds no answer; what stands behind it is the
+mutant and the tier at its exact prior total.
 
 ### 8.4 ⚠ THE MUTATION TEST WAS BLOCKED FOR AN HOUR BY A VISUAL STUDIO UPDATE IN FLIGHT — and my first
 diagnosis named the wrong cause
