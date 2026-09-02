@@ -185,15 +185,67 @@ plugin its own copy of the shared assembly and non-assignable types — so if is
 shared assembly must become host-provided or explicitly shared at that moment. Note it in whatever issue
 tracks the isolation work; it is a consequence that will not be obvious from the isolation change itself.
 
-### 3.4 Locator vs injection
+### 3.4 "Locator vs Microsoft.Extensions.DependencyInjection" — they are not the same kind of thing
 
-The user said "in a similar way what dependency injection does" — worth being precise about which:
+Asked directly (2026-09-02), and the question is worth untangling before answering, because the two names
+sit on different axes:
 
-- **Service locator** (`Get<T>()` at the point of use): fits what exists. Plugins are instantiated with
-  `Activator.CreateInstance(type)` — parameterless — so nothing has to change in discovery.
-- **Constructor injection**: the registry would resolve ctor args when instantiating an `IBackend`. Nicer
-  for testing, but it changes the discovery contract and every out-of-tree plugin's ctor. A bigger step, and
-  it can be added later ON TOP of a locator.
+- **Service locator** and **constructor injection** are PATTERNS. The first asks a registry at the point of
+  use (`Services.Get<IHostHttp>()`); the second takes dependencies as constructor parameters and lets
+  something else decide what to pass.
+- **`Microsoft.Extensions.DependencyInjection`** is a LIBRARY — a container plus the
+  `IServiceCollection` / `ServiceDescriptor` abstractions. It *supports* constructor injection, and
+  `provider.GetRequiredService<T>()` is *itself* a locator call. So MEDI is not the opposite of a locator;
+  it is one possible implementation of one, with a graph resolver attached.
+
+⇒ the real choice is **(a) which pattern**, and **(b) hand-written registry or take the package**.
+
+#### What MEDI would add, and whether we would use it
+
+| MEDI feature | do we need it here? |
+|---|---|
+| recursive constructor injection | **no** — the candidate services (§3.1) have no dependency graph at all |
+| lifetimes (singleton / scoped / transient) | **no** — every candidate is a stateless singleton, and the only "scope" that exists is the AMBIENT, an `AsyncLocal` the service reads per call, which no container models |
+| disposal management | **no** — nothing to dispose; `InterruptScope` is a factory the caller already `using`s |
+| `IEnumerable<T>`, keyed services, validate-on-build | not for this set |
+| familiarity | **yes, genuinely** — every .NET developer knows the shape, and a plugin author seeing `IServiceProvider` needs no documentation |
+
+Only the last row is a real benefit, and §3.4a shows it can be had without the package.
+
+#### ⚠⚠ Two costs that are specific to THIS codebase
+
+1. **`Fabricator.Abstractions` references `Apache.Arrow` and nothing else.** Adding
+   `Microsoft.Extensions.DependencyInjection.Abstractions` makes it a second closure every plugin has to
+   align on — and the FluidPlugin already carries `ExcludeAssets="runtime"` on Apache.Arrow for exactly that
+   reason (docs/plugin-system.md). ⚠ It is *softer* than it looks: `GetRequiredService<T>` is a static
+   extension over the BCL `IServiceProvider`, so a duplicated copy of that package resolves against itself
+   and no type identity crosses. The cost lands only if the host ever exposes an `IServiceCollection` for
+   plugins to register into — which §3.2's design does not.
+2. **⚠⚠ A BUILT MEDI PROVIDER IS IMMUTABLE, AND OUR REGISTRY IS NOT — the decisive one.**
+   `BuildServiceProvider()` is one-shot: there is no adding after the build. But
+   `BackendRegistry.Invalidate()` nulls the memoized map so the NEXT access re-scans, which is what makes
+   `fabricator_install_plugin` usable in the session that installs (docs/plugin-system.md, "the reload
+   split"). A container would have to be rebuilt on every invalidate, and anything holding the previous
+   provider would be silently stale. A mutable registry fits the lifecycle that already exists; an immutable
+   one fights it.
+
+#### 3.4a RECOMMENDED (not yet decided): the CONTRACT is BCL, the IMPLEMENTATION is ours
+
+**`System.IServiceProvider` is in the BCL** (`System.Runtime`, since .NET 1.0: `object? GetService(Type)`).
+So expose that as the contract, implement it with a dictionary keyed on `typeof(T)`, and ship a three-line
+`GetService<T>()` extension in Abstractions.
+
+That gets every real benefit and none of the costs: a plugin author sees a familiar BCL type; no package
+enters anyone's closure; the registry stays mutable so `Invalidate()` keeps working; and it is trivially
+AOT-safe where a reflection-based container is the thing docs/aot-bridge.md exists to remove. It is also not
+a one-way door — if constructor injection is ever wanted for `IBackend`, MEDI can be swapped in *behind*
+`IServiceProvider` without touching the contract or any plugin.
+
+⚠ **Pattern-wise this is a locator, and that is a deliberate choice rather than an oversight.** Locators are
+often criticised for hiding dependencies — fair in an application, much weaker here: a plugin is discovered
+by reflection and instantiated with `Activator.CreateInstance(type)` (parameterless), so constructor
+injection would change the discovery contract and every out-of-tree plugin's constructor. It can be added
+later ON TOP; it cannot be un-added.
 
 ## 4. Interactions to check before building
 
@@ -216,8 +268,10 @@ The user said "in a similar way what dependency injection does" — worth being 
 1. ~~Is **cross-plugin** sharing in scope?~~ **ANSWERED 2026-09-02 (user): it is the EXCEPTION, and a
    shared assembly the plugins own is the answer — so the host ships nothing new. See §3.3, including the
    measured version rule.**
-2. `System.IServiceProvider` + our own extensions, or take
-   `Microsoft.Extensions.DependencyInjection.Abstractions`? (§2)
+2. ~~`System.IServiceProvider` + our own extensions, or take MEDI?~~ **ANALYSED in §3.4; RECOMMENDED:
+   BCL `IServiceProvider` as the contract, our own dictionary as the implementation. Awaiting the
+   user's decision.** The deciding facts are that there is no dependency graph to resolve, and that a
+   built MEDI provider is IMMUTABLE while `BackendRegistry.Invalidate()` re-scans.
 3. Does the locator REPLACE `HostHttpTransport` / `HostQueryTransport`, or wrap them? Replacing is cleaner
    and is a BREAKING change for out-of-tree plugins — which this repo has done before without aliases (the
    `IArrow*` renames, `ScalarFnBind`), so it is a decision, not an obstacle.
