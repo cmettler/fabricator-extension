@@ -9,9 +9,10 @@ namespace Fabricator.Bridge;
 
 /// <summary>
 /// The host service locator: how a plugin reaches a capability that needs the RUNNING HOST — DuckDB's
-/// filesystem (<see cref="IHostFileSystem"/>), its HTTP stack (<see cref="IHostHttp"/>), and SQL on the
-/// hosting instance (<see cref="IHostQuery"/>). Declared HERE, in the contract assembly, and FILLED IN by
-/// the bridge at boot, so a plugin resolves them with a reference to <c>Fabricator.Abstractions</c> alone.
+/// filesystem (<see cref="IHostFileSystem"/>), its HTTP stack (<see cref="IHostHttp"/>), SQL on the
+/// hosting instance (<see cref="IHostQuery"/>), and its logging (<see cref="IHostLog"/>, the route into
+/// <c>duckdb_logs</c>). Declared HERE, in the contract assembly, and FILLED IN by the bridge at boot, so a
+/// plugin resolves them with a reference to <c>Fabricator.Abstractions</c> alone.
 /// </summary>
 /// <remarks>
 /// <para>
@@ -47,6 +48,15 @@ namespace Fabricator.Bridge;
 /// provider's <c>OpenCatalog</c>) or anywhere the ambient still flows from one; the ambient is an
 /// <c>AsyncLocal</c>, so it survives <c>await</c> and <c>Task.Run</c> but not a thread parked before the
 /// crossing began.
+/// <para>⚠ <see cref="IHostLog"/> is the EXCEPTION and shows where the boundary really is: it needs the
+/// running host (the <c>host_log</c> callback) but no per-call context, so it works anywhere.</para>
+/// </para>
+/// <para>
+/// <b>EVERY SERVICE HERE IS A SINGLETON, and one that needs a narrower scope supplies its own factory
+/// method rather than asking the registry for one.</b> <see cref="IHostLog"/> is the worked example:
+/// resolving it gives one object for the process, and <c>GetLogger(category)</c> is what produces the
+/// per-category one. So the registry has no notion of scope and does not need one — which is why it can
+/// stay a dictionary. docs/plugin-services.md §5 Q5.
 /// </para>
 /// </remarks>
 public static class FabricatorServices

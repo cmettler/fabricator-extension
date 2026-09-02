@@ -1044,13 +1044,30 @@ question; nothing about reading the code would have.
 3. ~~Does the locator REPLACE `HostHttpTransport` / `HostQueryTransport`, or wrap them?~~ **REPLACED —
    both are DELETED (§8). Breaking for the three out-of-tree plugins, which pin by sha and migrate at their
    next bump; no aliases, as with the `IArrow*` renames and `ScalarFnBind`.**
-4. Should `Fabricator.Abstractions` finally be PACKED and versioned? (§1.5.) A bigger contract surface makes
-   the sha-pin more load-bearing, and this is the natural moment to ask.
-5. Scoping: are all services singletons, or is there a per-call/per-transaction scope? **STILL OPEN, and
-   the three built services sidestep it rather than answer it**: the ambient rule (§3.1) makes a singleton
-   safe for all three, because each reads the ambient per call and holds nothing. A service that genuinely
-   needed per-call state (an `IInterruptScope`) would be a FACTORY, not a singleton, and the registry has no
-   opinion about that yet.
+4. Should `Fabricator.Abstractions` finally be PACKED and versioned? (§1.5.) **STILL OPEN, and §9 made it
+   SHARPER rather than answering it.** Two things changed on 2026-09-02: a plugin may now pin **two** of our
+   assemblies by sha instead of one (Abstractions + optionally Common), and the contract grew — four service
+   interfaces plus eight implementation types that are now part of what a pin bump can break. Neither is an
+   argument for packaging by itself; what they do is raise the cost of the status quo, which is that
+   *nothing here has a version number at all* (every assembly is `1.0.0.0`, nothing sets `PackageId`), so
+   "built against contract X" is inexpressible except as a commit sha. ⚠ Note the cost is CURRENTLY PAID BY
+   SOMEONE: `fabricator-sustainalytics` and its two siblings each carry a shallow submodule of this repo for
+   exactly this reason. A product decision, not a technical one.
+5. ~~Scoping: are all services singletons, or is there a per-call/per-transaction scope?~~ **ANSWERED BY
+   §10's build, and the answer is that the registry needs no scoping concept at all.** Every service is a
+   SINGLETON; one that needs something narrower supplies its own factory method. `IHostLog` is the worked
+   example rather than a hypothetical: resolving it yields one object for the process, and
+   `GetLogger(category)` is what produces the per-category one — so the scope lives in the INTERFACE, where
+   the service author can choose it, instead of in the container, where every service would inherit one
+   vocabulary.
+   - ⚠ That is what keeps the registry a dictionary (§3.4). A container with lifetimes is the thing MEDI
+     would have brought, and this is the second measured reason not to have taken it — the first being that
+     a built provider is immutable while `BackendRegistry.Invalidate()` re-scans.
+   - ⚠ The prediction in the old wording was RIGHT in shape and named the wrong example: it said "a service
+     that genuinely needed per-call state (an `IInterruptScope`) would be a FACTORY". `IHostLog` needs no
+     per-CALL state at all — it needs per-CATEGORY identity — and the factory shape was forced by
+     `IsEnabled` being on the hot path, not by lifetime. A real `IInterruptScope` remains unbuilt, and
+     §9.5 records why `InterruptScope` itself cannot simply move.
 6. ~~What does a plugin do when a service is absent?~~ **ANSWERED by the build (§8): `Get<T>()` returns
    null, `GetRequired<T>()` throws NAMING the interface, and `IsAvailable<T>()` preserves what the old seams'
    `IsAvailable` gave.** ⚠ The load-bearing half is what `Publish()` does NOT do: a capability the host did
