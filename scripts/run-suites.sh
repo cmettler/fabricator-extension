@@ -800,7 +800,21 @@ case "$TIER" in
         # ⚠ That block pins DuckDB's bind repetition, not our code, so no mutant of ours can kill it; its
         # value is that a change there fails an assertion naming the step.
         # 3302 + 16 = 3318 exactly, from a green run, which is what shows no other suite moved.
-        : "${MIN_ASSERTIONS:=3318}"
+        # 3339 since 2026-09-02 (same day, fifth bump): verify_plugin 112 -> 133 for IHostLog, the host
+        # LOGGING service -- the only in-tree proof that a PLUGIN can reach duckdb_logs, which it cannot do
+        # on its own because FabricatorLog's whole surface is Microsoft.Extensions.Logging and the route runs
+        # through the host_log reverse callback. Three assertions carry it and none implies another: the
+        # BOOLEAN is IsEnabled (Trace false while Debug is true, so it is a real answer and not a constant),
+        # `log_level` is the level MAPPING after two hops, and `type` is the plugin's own CATEGORY. Three
+        # mutants, each dying at its own line: the mapping off by one at the log_level pair (116 pass first),
+        # IsEnabled always true at the Trace assertion (124), and a Log that records nothing at the first
+        # count (115).
+        # ⚠ The braces assertion is a CHARACTERIZATION test of Microsoft.Extensions.Logging, not of our code:
+        # a fourth mutant removing our "{Message}" indirection SURVIVED the whole gate, which is what showed
+        # the indirection was unnecessary (MEL parses the format only when the argument array is non-empty).
+        # The code was simplified to match the measurement rather than the theory.
+        # 3318 + 21 = 3339 exactly, from a green run, which is what shows no other suite moved.
+        : "${MIN_ASSERTIONS:=3339}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

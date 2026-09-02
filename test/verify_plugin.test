@@ -560,3 +560,146 @@ WHERE function_name IN ('plug_read_file', 'plug_glob_count') ORDER BY function_n
 ----
 plug_glob_count	BIGINT
 plug_read_file	VARCHAR
+
+# ============================================================================
+# IHostLog — a PLUGIN reaching DuckDB's own log (docs/plugin-services.md §10)
+#
+# The only in-tree proof that a plugin can log anywhere a user can see. A plugin
+# cannot reference FabricatorLog — its whole public surface is
+# Microsoft.Extensions.Logging, which would land in every plugin's compile
+# closure — and the route into duckdb_logs runs through the host_log reverse
+# callback, so without this service a plugin's options are its own file or
+# silence.
+#
+# ⚠ THREE INDEPENDENT THINGS ARE ASSERTED and none implies another:
+#   - the BOOLEAN is IsEnabled, so a build answering it wrongly shows up there;
+#   - `log_level` is the level MAPPING (HostLogLevel → MEL LogLevel → the host's
+#     int code), which no "did the message arrive" assertion can see;
+#   - `type` is the CATEGORY, so a plugin's output is attributable to the plugin
+#     rather than to the host.
+# ============================================================================
+
+# ⚠ REPRODUCING THIS IN THE SHELL NEEDS ONE MORE SETTING THAN IT NEEDS HERE:
+# `SET logging_storage = 'memory'`. The default storage is stdout, so duckdb.exe
+# PRINTS every event — which looks like success — while
+# `SELECT count(*) FROM duckdb_logs` answers 0. unittest needs no such setting
+# (verify_catalog_init has queried duckdb_logs with just these two since it was
+# written). Two environments, two answers; a probe in the wrong one reads as "the
+# service does not work".
+statement ok
+SET enable_logging = true;
+
+statement ok
+SET logging_level = 'DEBUG';
+
+# The service resolves and Warning is enabled.
+query I
+SELECT plug_log('warn', 'plug_log warning probe');
+----
+true
+
+# ... and it reached DuckDB's own log, not merely a file sink.
+query I
+SELECT count(*) FROM duckdb_logs WHERE message = 'plug_log warning probe';
+----
+1
+
+# ⚠⚠ THE TWO LOAD-BEARING COLUMNS, asserted together because they answer
+# different questions. `log_level` is the level after two hops (our enum → MEL →
+# the host's int), so a mapping that slipped by one still delivers the message
+# and only this can see it. `type` is the CATEGORY the plugin chose, which is
+# what makes its output distinguishable from the host's own (QueryLog,
+# Fabricator.Bridge, …) rather than an anonymous line.
+# ⚠ MEASURED spelling: DuckDB renders the level as 'WARNING', not 'WARN'.
+query II
+SELECT log_level, type FROM duckdb_logs WHERE message = 'plug_log warning probe';
+----
+WARNING	Fabricator.SamplePlugin
+
+# A SECOND and THIRD level, because one cannot distinguish "mapped correctly"
+# from "everything maps to WARNING".
+query I
+SELECT plug_log('info', 'plug_log info probe');
+----
+true
+
+query I
+SELECT plug_log('debug', 'plug_log debug probe');
+----
+true
+
+query II
+SELECT log_level, count(*) FROM duckdb_logs
+WHERE message IN ('plug_log info probe', 'plug_log debug probe')
+GROUP BY 1 ORDER BY 1;
+----
+DEBUG	1
+INFO	1
+
+# ⚠⚠ THE ASSERTION THAT MAKES THE BOOLEAN MEAN ANYTHING: Trace is NOT enabled,
+# so IsEnabled is a real answer rather than a constant true. The reason is
+# mechanical — with the host forwarding wired, FabricatorLog promotes a
+# NullLoggerFactory to one whose minimum level is Debug, so Trace falls below it
+# while Debug does not.
+# ⚠ IT DEPENDS ON FABRICATOR_LOG_LEVEL BEING UNSET (or above Trace), which is
+# the default and what both CI tiers do: with FABRICATOR_LOG_LEVEL=trace exported
+# the factory is built at Trace instead and this answers true. That is the one
+# assertion here a developer's own environment can move.
+query I
+SELECT plug_log('trace', 'plug_log trace probe');
+----
+false
+
+# ... and nothing was recorded for it, which is the other half of the same claim:
+# the function logs ONLY when enabled, which is the discipline the interface
+# documents rather than an optimisation of this one caller.
+query I
+SELECT count(*) FROM duckdb_logs WHERE message = 'plug_log trace probe';
+----
+0
+
+# NEGATIVE CONTROL. Without it every count above is equally satisfied by a
+# duckdb_logs that matches anything.
+query I
+SELECT count(*) FROM duckdb_logs WHERE message = 'plug_log probe never logged';
+----
+0
+
+# ⚠⚠ THE MESSAGE IS TAKEN VERBATIM. Braces are the normal case for this plugin's
+# neighbours (a rendered Fluid template, a JSON fragment), so this is worth
+# knowing — but it is a CHARACTERIZATION TEST and the suite says so: it pins
+# Microsoft.Extensions.Logging's behaviour, not ours. MEL builds a format parser
+# only when the argument array is non-empty, so our zero-argument call returns
+# the string untouched. The defensive version (message as an ARGUMENT to a fixed
+# "{Message}" template) shipped for an hour on the theory that braces would
+# otherwise be mangled, and the mutant removing it SURVIVES this whole gate —
+# which is what showed the theory was wrong and the indirection unnecessary.
+query I
+SELECT plug_log('warn', 'plug_log braces {Not} {0} {{x}} probe');
+----
+true
+
+query I
+SELECT count(*) FROM duckdb_logs WHERE message = 'plug_log braces {Not} {0} {{x}} probe';
+----
+1
+
+# An unknown level is refused BY NAME rather than defaulted — silently logging a
+# typo as Information would put it in the output looking plausible.
+statement error
+SELECT plug_log('shout', 'never');
+----
+unknown level
+
+# NULL in either argument yields NULL and records nothing.
+query I
+SELECT plug_log(NULL, 'x') IS NULL AND plug_log('warn', NULL) IS NULL;
+----
+true
+
+# The service-backed scalars are advertised like any other.
+query II
+SELECT function_name, return_type FROM duckdb_functions()
+WHERE function_name = 'plug_log';
+----
+plug_log	BOOLEAN

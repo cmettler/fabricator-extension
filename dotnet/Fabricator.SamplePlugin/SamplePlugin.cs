@@ -29,7 +29,7 @@ public sealed class SamplePluginBackend : IBackend
         new IScalarFunction[]
         {
             new PlugGreetFunction(), new PlugSleepFunction(),
-            new PlugReadFileFunction(), new PlugGlobCountFunction(),
+            new PlugReadFileFunction(), new PlugGlobCountFunction(), new PlugLogFunction(),
         };
 
     public IEnumerable<ITableFunction> GlobalTableFunctions =>
@@ -530,4 +530,84 @@ internal sealed class PlugGlobCountFunction : IScalarFunction
         }
         return b.Build();
     }
+}
+
+/// <summary>
+/// <c>plug_log(level, message) -&gt; BOOLEAN</c> — writes one event through <see cref="IHostLog"/> and returns
+/// whether that level was enabled. The gate for the host's LOGGING service.
+/// </summary>
+/// <remarks>
+/// <para>
+/// It is the only in-tree proof that a PLUGIN can reach <c>duckdb_logs</c>. A plugin cannot reference
+/// <c>FabricatorLog</c> (its whole surface is Microsoft.Extensions.Logging, which would land in every
+/// plugin's closure), and the route to DuckDB's own log runs through the <c>host_log</c> reverse callback —
+/// so without this service a plugin's only options are its own file or silence.
+/// </para>
+/// <para>
+/// ⚠ The RETURN VALUE is <c>IsEnabled</c>, not "did it work", so the two halves of the interface are gated
+/// by one call: a build where <c>IsEnabled</c> answered wrongly changes the returned boolean, and a build
+/// where the level MAPPING slipped changes the <c>log_level</c> column of the row in <c>duckdb_logs</c>.
+/// Neither is visible from the message text alone.
+/// </para>
+/// <para>
+/// ⚠ It logs ONLY when enabled — which is the discipline the interface documents rather than an
+/// optimisation here. A plugin whose message costs something to build must ask first.
+/// </para>
+/// </remarks>
+internal sealed class PlugLogFunction : IScalarFunction
+{
+    /// <summary>The plugin's own category, so its output is greppable and cannot be read as the host's.</summary>
+    private const string Category = "Fabricator.SamplePlugin";
+
+    public string Name => "plug_log";
+
+    public Schema Parameters => new(
+        new[]
+        {
+            new Field("level", StringType.Default, nullable: true),
+            new Field("message", StringType.Default, nullable: true),
+        },
+        metadata: null);
+
+    public Field Result => new("enabled", BooleanType.Default, nullable: true);
+
+    public IArrowArray Invoke(RecordBatch args)
+    {
+        var levels = (StringArray)args.Column(0);
+        var messages = (StringArray)args.Column(1);
+        // Resolved per invoke, then the LOGGER once: GetLogger is the part worth hoisting out of a loop,
+        // which is exactly why the interface is a factory rather than one Log(category, level, message).
+        var logger = FabricatorServices.GetRequired<IHostLog>().GetLogger(Category);
+        var b = new BooleanArray.Builder().Reserve(args.Length);
+        for (int i = 0; i < args.Length; i++)
+        {
+            if (levels.IsNull(i) || messages.IsNull(i))
+            {
+                b.AppendNull();
+                continue;
+            }
+            var level = ParseLevel(levels.GetString(i));
+            bool enabled = logger.IsEnabled(level);
+            if (enabled)
+            {
+                logger.Log(level, messages.GetString(i));
+            }
+            b.Append(enabled);
+        }
+        return b.Build();
+    }
+
+    // Refused BY NAME rather than defaulted: silently logging an unrecognised level as Information would
+    // put the caller's typo in the output as a plausible-looking event.
+    private static HostLogLevel ParseLevel(string level) => level.ToLowerInvariant() switch
+    {
+        "trace" => HostLogLevel.Trace,
+        "debug" => HostLogLevel.Debug,
+        "info" or "information" => HostLogLevel.Information,
+        "warn" or "warning" => HostLogLevel.Warning,
+        "error" => HostLogLevel.Error,
+        "critical" => HostLogLevel.Critical,
+        _ => throw new ArgumentException(
+            $"plug_log: unknown level '{level}' - use trace|debug|info|warn|error|critical.", nameof(level)),
+    };
 }

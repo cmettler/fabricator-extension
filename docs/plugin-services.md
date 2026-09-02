@@ -1,8 +1,10 @@
 # Plugin services — replacing the ad-hoc seams with a resolvable service surface
 
-> **Status: BOTH STEPS BUILT — §8 (the `GetService<T>()` locator) and §9 (`Fabricator.Common`).**
-> ⚠ §9.4 and §9.5 CORRECT the plan: the acceptance test's target no longer existed, and §7.4a's "13 → 16"
-> is wrong on two of three. Opened user-directed:
+> **Status: BOTH STEPS BUILT — §8 (the `GetService<T>()` locator), §9 (`Fabricator.Common`), §10
+> (`IHostLog`, §7.4a's third question).**
+> ⚠ §9.4, §9.5 and §10.4 CORRECT the plan and this build: the acceptance test's target no longer existed,
+> §7.4a's "13 → 16" is wrong on two of three, and a defensive mechanism in `IHostLog` turned out to be
+> unnecessary — its mutant survived. Opened user-directed:
 > This file is the working record so the analysis can continue across sessions. Everything in §1 is READ FROM
 > THE TREE or MEASURED and dated; §2 onward is design space, not decisions.
 
@@ -531,7 +533,7 @@ thing a pin bump can break. Move what is genuinely wanted, not all 13 because th
 decision): every provider is REQUIRED to throw it to signal absence, so it is part of the provider CONTRACT
 rather than a reusable convenience.
 
-**3. `FabricatorLog` IS A SERVICE (`IHostLog`), NOT A MOVER — and answering this DISSOLVES the phase-2
+**3. ✅ BUILT — §10. `FabricatorLog` IS A SERVICE (`IHostLog`), NOT A MOVER — and answering this DISSOLVES the phase-2
 deferral rather than deciding a trade-off.** User: *"FabricatorLog into common or as a GetService<>()?"*
 
 Two reasons, the first decisive and the second merely expensive:
@@ -617,6 +619,7 @@ service **54/54 — 3272** = 3257 + exactly this suite's 15, which is what shows
 | `Fabricator.Abstractions/IHostHttp.cs` | `Send(method, url, headersJson, body)` — the shape `DuckDbHttpHandler` already consumed |
 | `Fabricator.Abstractions/IHostQuery.cs` | `Query(sql, parameters?, inheritSession?)` + `ExecuteNonQuery(sql)` |
 | `Fabricator.Bridge/HostServices.cs` | the three implementations + `Publish()` |
+| *(later the same day)* `IHostLog.cs` | a FOURTH service — §10 |
 | DELETED | `HostHttpTransport.cs`, `HostQueryTransport.cs` |
 
 Consumers updated: `DuckDbHttpHandler` (in Abstractions), the Fluid plugin's `FluidHostQuery` and
@@ -916,6 +919,118 @@ TRANSITIVE** — a one-level scan reports `DbDataReaderArrowStream` as clean.
 ⚠ **The tiers can only show the move broke nothing; no assertion can see WHERE a type lives.** What proves
 the move achieved something is §9.4's deletion, and the FluidPlugin's csproj having two ProjectReferences
 rather than three.
+
+## 10. `IHostLog` AS BUILT (2026-09-02) — the answer to §7.4a's third question
+
+C#-only. **NO ABI change, NO C++ change.** Gate `verify_plugin` **112 → 133**; three mutants, each killed at
+its own assertion, and a fourth that SURVIVED and corrected the code (§10.4). Service **54/54 — 3339** =
+3318 + exactly this suite's 21, which is what shows no other suite moved; hermetic **74/74 — 8259**,
+unchanged, because that tier points `FABRICATOR_PLUGIN_DIR` at an EMPTY directory on purpose and so cannot
+load the sample plugin at all.
+
+⚠ **Nothing user-visible ships.** `plug_log` lives in `Fabricator.SamplePlugin`, which is a test fixture —
+`pack-distribution.ps1` bundles only the Fluid plugin — so no SQL function was added to the product and the
+README owes nothing. `IHostLog` is a plugin-AUTHOR surface.
+
+**⚠ Built on the CAPABILITY argument, not the migration one.** §7.4a decided `FabricatorLog` should be a
+service rather than a mover, and gave two reasons: it needs the running host, and moving it would drag
+Microsoft.Extensions.Logging into every plugin's closure. Both hold. What does NOT hold is the third thing it
+said — that `IHostLog` unblocks three deferred movers — which §9.5 measured wrong on two of the three. So the
+case for building it is the plain one: **a plugin has no way to log anywhere a user can see.**
+
+### 10.1 What shipped
+
+| | |
+|---|---|
+| `Fabricator.Abstractions/IHostLog.cs` | `HostLogLevel` (an enum whose VALUES are the `host_log` ABI codes), `IHostLog.GetLogger(category)`, `IHostLogger.IsEnabled(level)` / `.Log(level, message)` |
+| `Fabricator.Bridge/HostServices.cs` | `HostLogService` / `HostLoggerAdapter` over `FabricatorLog`, registered by `Publish()` |
+| `Fabricator.SamplePlugin` | `plug_log(level, message) -> BOOLEAN` — logs when enabled, returns `IsEnabled` |
+
+**⚠ It is a FACTORY, not one `Log(category, level, message)` method**, and that is §7.4a's `IsEnabled`
+constraint deciding the shape rather than taste: the category is fixed per call site while the level check
+happens per event, often inside a per-batch loop. A one-method interface would re-resolve the category on
+every event and — worse — make the cheap gate look expensive enough to skip, which is exactly the regression
+`MemoryProbe`'s `IsEnabled` gate exists to prevent.
+
+**⚠ Registered UNCONDITIONALLY, unlike the other three.** `IHostFileSystem` / `IHostHttp` / `IHostQuery` are
+each published only if the host filled the matching callback, so `GetRequired<T>()` can say "the host cannot
+do this". Logging has no such capability to test: `FabricatorLog` always has somewhere to put an event (the
+`FABRICATOR_LOG_FILE` sink, or nothing), and reaching `duckdb_logs` is an ADDITIONAL sink rather than a
+precondition. A plugin can therefore always log; it may log into the void, which is the same deal the host's
+own categories get.
+
+### 10.2 ⚠⚠ MEASURED: `IsEnabled` IS A REAL ANSWER, and the discriminating pair is Trace vs Debug
+
+`plug_log('debug', …)` → **true**, `plug_log('trace', …)` → **false**, with no environment change. The
+mechanism, read from `FabricatorLog` and then confirmed: when the host forwarding is wired,
+`EnableHostForwarding` PROMOTES a `NullLoggerFactory` to `LoggerFactory.Create(b =>
+b.SetMinimumLevel(LogLevel.Debug))` — so Debug is the floor and Trace falls below it.
+
+⚠ **That pair is the only assertion in the gate a developer's own environment can move**, and the suite says
+so: with `FABRICATOR_LOG_LEVEL=trace` exported, `BuildDefault()` builds a real factory at Trace, the
+promotion does not happen, and Trace answers true. Neither CI tier sets that variable.
+
+⚠ Without the pair the boolean would be worthless — a build returning a constant `true` passes every other
+assertion here. Mutant B is exactly that build.
+
+### 10.3 ⚠⚠ TWO COLUMNS OF `duckdb_logs` CARRY THINGS THE MESSAGE CANNOT
+
+MEASURED, one row per plugin event:
+
+| column | value | what it proves |
+|---|---|---|
+| `message` | `plug_log warning probe` | the event arrived |
+| `log_level` | **`WARNING`** (not `WARN`) | the level survived TWO hops — `HostLogLevel` → MEL `LogLevel` → the host's int code |
+| `type` | **`Fabricator.SamplePlugin`** | the CATEGORY crossed, so a plugin's output is attributable to the plugin rather than lost among the host's (`QueryLog`, `Fabricator.Bridge`, …) |
+
+⇒ a mapping that slipped by one still delivers every message, so **only `log_level` can see it**. That is
+mutant A.
+
+**⚠ A MEASUREMENT WORTH KEEPING FOR ANY FUTURE `duckdb_logs` PROBE: in the SHELL, `duckdb_logs` is EMPTY
+unless you `SET logging_storage = 'memory'`.** The default storage is stdout, so `duckdb.exe` PRINTS every
+event (which looks like success) while `SELECT count(*) FROM duckdb_logs` answers **0**. `unittest` does not
+need the setting — `verify_catalog_init` has queried `duckdb_logs` with only `enable_logging` +
+`logging_level` since it was written. Two environments, two answers; a probe in the wrong one reads as "the
+service does not work".
+
+### 10.4 ⚠⚠ THE FOURTH MUTANT SURVIVED, AND IT CORRECTED THE CODE RATHER THAN THE GATE
+
+`HostLoggerAdapter.Log` shipped for an hour as:
+
+```csharp
+LoggerExtensions.Log(_log, Map(level), "{Message}", message);   // the message as an ARGUMENT
+```
+
+justified in a comment by: *"MEL parses the format string for {placeholders}, so a message containing a brace
+— a rendered template, a JSON fragment — would either be mangled or throw inside the logger."*
+
+**The mutant that removes the indirection (`Log(_log, Map(level), message)`) passes all 133 assertions**,
+including one asserting that `plug_log braces {Not} {0} {{x}} probe` arrives verbatim. Reading MEL's source
+afterwards says why: `FormattedLogValues` constructs a `LogValuesFormatter` only when the argument array is
+NON-EMPTY, so a zero-argument call returns the original string untouched and never parses it.
+
+⇒ **the theory was wrong, the indirection unnecessary, and the code was simplified to match the
+measurement.** The braces assertion stays, relabelled as what it is: a CHARACTERIZATION test of MEL, which no
+mutant of ours can kill. Its value is that a change in that behaviour — ours or upstream's — arrives as a
+failed assertion naming the string.
+
+⚠ The general form, and it is this file's recurring one: **a defensive mechanism justified by a hazard nobody
+measured is indistinguishable from a necessary one until you delete it.** The mutation run is what asked the
+question; nothing about reading the code would have.
+
+### 10.5 What was deliberately NOT done
+
+- **`MemoryProbe` did NOT move**, though §9.5 establishes it is the one type `IHostLog` unlocks. It is a
+  diagnostic for OUR heavy paths and a plugin gains nothing from it, so moving it would be motion to
+  demonstrate the interface rather than to serve anybody. It would also need its `static readonly` logger
+  resolved lazily, since a static initializer can run before `Publish()`.
+- **`FabricatorLog` is unchanged and stays in Bridge.** `HostLogService` is a thin adapter on purpose: every
+  routing decision (which providers, the minimum level, the `duckdb_logs` forwarding) already lives in one
+  place, and a plugin's events must be filtered and sunk exactly like the host's own.
+- **No structured logging.** `IHostLog` takes a rendered string, so a caller interpolates its own message.
+  Nothing is lost: both existing sinks are message-string based already — the host callback is
+  `(int level, string category, string message)` and `FileLoggerProvider.Write` takes a line — so no
+  structured field survives today either.
 
 ## 5. Open questions
 
