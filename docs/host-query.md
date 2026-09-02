@@ -415,6 +415,26 @@ MEASURED with the outer session set:
 | `fabricator_host_query(sql)` — the SQL surface | `UTC` ✓ | ⚠ **INTERNAL Error**, see B |
 | **`query()` in a template** (C# `Host.Query`) | **`Europe/Berlin`** ✗ | ✗ *"Table with name t does not exist!"* |
 
+**⚠⚠ `SET GLOBAL` IS A WORKING WORKAROUND FOR THE TIMEZONE HALF, AND THERE IS NONE FOR THE OTHER HALF —
+MEASURED 2026-09-02 (user-asked: "does a set global timezone get seen in the host query or not").** The
+answer is YES for TimeZone and NOT AVAILABLE for search_path:
+
+| statement | outer session | `fabricator_host_query` | `query()` in a template |
+|---|---|---|---|
+| *(nothing set)* | `Europe/Berlin` | `Europe/Berlin` | `Europe/Berlin` |
+| `SET TimeZone='UTC'` | `UTC` | **`UTC`** ✓ | **`Europe/Berlin`** ✗ |
+| `SET GLOBAL TimeZone='UTC'` | `UTC` | **`UTC`** ✓ | **`UTC`** ✓ |
+
+It works for the reason the gap exists: `Host.Query` opens its connection on the captured
+`DatabaseInstance`, and a fresh connection there inherits the GLOBAL setting layer while it has no way to
+see another connection's SESSION layer. So a client that follows the README's UTC convention with
+`SET GLOBAL` rather than `SET` gets the convention honoured everywhere, template queries included.
+
+**⚠⚠ THE SAME TRICK DOES NOT EXIST FOR `search_path`: DuckDB REFUSES IT** — *"Catalog Error: option
+\"search_path\" cannot be set globally"*, with or without a fully-qualified value. So that half has NO
+workaround at all, which is a second reason it is the sharper one, and it stays a real blocker for a
+template that wants to name tables unqualified.
+
 ⚠ **The search-path half is the sharper one**: a wrong timezone is a silently wrong VALUE, but an
 unresolvable name is an outright failure for a table the caller can see unqualified. It also breaks the
 standing convention (README Quick Start) that a client should `SET TimeZone = 'UTC'` — that setting does
