@@ -1,11 +1,8 @@
 # Plugin services — replacing the ad-hoc seams with a resolvable service surface
 
-> **Status: the LOCATOR is APPROVED and scoped (2026-09-02); `Fabricator.Common` is under
-> analysis (§6). Nothing built yet.** Opened user-directed:
-> *"we should improve the use of fabricator.bridge/abstraction functionalities in plugins. reflection hack is
-> not so nice. something like a `GetService<IHttpClientxx>()` would be nice. in a similar way what dependency
-> injection does. Maybe this way a plugin expose a singleton which could be used by another plugin."*
->
+> **Status: BOTH PIECES APPROVED (2026-09-02) — the `GetService<T>()` locator scoped to the DuckDB
+> filesystem, HTTP and host query/exec, and a new `Fabricator.Common` assembly. NOTHING BUILT YET;
+> §7 is the implementation plan to start from.** Opened user-directed:
 > This file is the working record so the analysis can continue across sessions. Everything in §1 is READ FROM
 > THE TREE or MEASURED and dated; §2 onward is design space, not decisions.
 
@@ -361,7 +358,14 @@ The question deserves splitting, because the two readings have opposite answers:
   the plugins ship their own shared assembly), and putting it in Common would recreate what that decision
   rejected: the host curating contracts it has no stake in.
 
-**⚠ But Common does give the cross-plugin case something real, and it is not a place to put types.** Because
+**⚠⚠ CORRECTION TO AN EARLIER DRAFT OF THIS SECTION, caught while planning the build: THE REGISTRY CANNOT
+LIVE IN COMMON.** This section first said Common was "the natural home for the locator plumbing". It is not:
+Common references Abstractions and not the reverse, so a registry there would make **Common mandatory for
+any plugin that wants to resolve a host service** — which contradicts the whole point of Common being the
+OPTIONAL half. The registry is tiny (a dictionary and an `IServiceProvider`), so it belongs in
+**Abstractions**, and Common stays optional. See §7.2.
+
+**⚠ What Common does still give the cross-plugin case is real, and it is not a place to put types.** Because
 Common ships with the host, it is in `host.Assemblies` at plugin-scan time, so it lands in the skip set and
 no plugin's copy is ever loaded — the version-collision measured in §3.3 cannot happen to it. That makes it
 the natural home for the **locator plumbing** through which plugins find each other, while the TYPES they
@@ -372,14 +376,141 @@ exception, a host-shipped assembly is the shape that fixes the collision, and Co
 
 ### 6.5 What is NOT settled
 
-1. Is a third assembly worth it, or should the reusable set simply go INTO Abstractions? The case for
-   splitting is that Abstractions is sha-pinned and should stay small; the case against is one more
-   assembly in the payload, the publish script, and every plugin's csproj. **§6.3's tidying of
-   `DuckSql`/`DuckDbHttpHandler` only pays off if the answer is "separate".**
+1. ~~Is a third assembly worth it?~~ **ANSWERED 2026-09-02 (user): "one more assembly in the payload is
+   no problem." `Fabricator.Common` is approved — see §7.**
 2. Does `Fabricator.Common` need its own `net8.0`-only target, like the plugins? A plugin runs on whatever
    the bridge was published for, and Abstractions multi-targets — check before assuming.
 3. `FabricatorLog` stays in Bridge on the MEL argument (§3.1). Revisit only if MEL is wanted in the plugin
    closure for other reasons.
+
+## 7. IMPLEMENTATION PLAN (approved 2026-09-02; start here)
+
+### 7.1 What is decided
+
+| | decision |
+|---|---|
+| the locator | **APPROVED**, scoped to the DuckDB **filesystem**, **HTTP**, and **host query/exec** |
+| pattern | service LOCATOR, not constructor injection (§3.4) |
+| contract type | **`System.IServiceProvider`** (BCL) + our own `Get<T>()` extension — no MEDI package (§3.4a) |
+| `Fabricator.Common` | **APPROVED** — user: *"one more assembly in the payload is no problem"* |
+| cross-plugin contracts | the plugins' own shared assembly, not ours (§3.3) |
+
+### 7.2 ⚠ Where each piece lives — and the registry is NOT in Common
+
+    Fabricator.Abstractions   interfaces + data contracts + THE REGISTRY      (Apache.Arrow only)
+        ^
+    Fabricator.Common         dependency-light reusable implementations       (optional for a plugin)
+        ^
+    Fabricator.Bridge         ABI, host, Azure/Fabric/unsafe                  (never referenced by a plugin)
+
+The registry goes in **Abstractions** because Common references Abstractions and not the reverse: putting it
+in Common would make Common mandatory for anyone resolving a host service, and Common's whole point is being
+optional. It is a dictionary and an `IServiceProvider`; it does not need a home of its own.
+
+### 7.3 STEP 1 — the locator
+
+**New in `Fabricator.Abstractions`:**
+
+- `FabricatorServices.cs` — a `ConcurrentDictionary<Type, object>` behind
+  `Register<T>(T)` / `Get<T>()` / `GetRequired<T>()`, exposed additionally as `System.IServiceProvider` so a
+  plugin author can hold the BCL type. Mutable by design: `BackendRegistry.Invalidate()` re-scans, and an
+  immutable built container would fight that (§3.4).
+- `IHostFileSystem` — read-all + glob for v1. ⚠ Scope it to what is demonstrably needed and say so; the
+  deleted `HostFileTransport` was `ReadAllBytes(path, maxBytes)` and that ceiling parameter is worth keeping
+  (it is what stops a wrong path buffering a multi-gigabyte object).
+- `IHostHttp` — the shape `HostHttpTransport.Send` already has (JSON envelope + body bytes). It is not
+  pretty, but `DuckDbHttpHandler` already consumes exactly that and it is proven; do not redesign it in the
+  same change.
+- `IHostQuery` — `Query(sql, parameters?, inheritSession?)` + `ExecuteNonQuery(sql)`. ⚠ Expose the ABI v83
+  session choice: the transport currently passes the ambient unconditionally, and the interface should let a
+  caller ask for a clean session.
+
+**In `Fabricator.Bridge`:** implementations over `HostFs` / `Host`, registered in `Bootstrap.Initialize`
+beside the existing seam fills. **⚠ Every implementation reads the ambient PER CALL and captures nothing** —
+§3.1's rule, and the reason the three existing seams each carry the same warning.
+
+**Migration:** delete `HostHttpTransport` and `HostQueryTransport`. Breaking for out-of-tree plugins, which
+this repo does without aliases (the `IArrow*` renames, `ScalarFnBind`). Update `DuckDbHttpHandler` and the
+FluidPlugin's `FluidHostQuery`.
+
+**Gate:** `verify_plugin_fluid` already exercises `query()` end to end through the transport, so it becomes
+the locator's regression test for free. ⚠ **`IHostFileSystem` would have NO consumer and therefore no gate**
+— decide before building: either add a small `IBackend` in `Fabricator.SamplePlugin` that reads a file
+through it (the natural home for "prove the plugin surface works"), or do not ship that interface yet.
+**Do not** switch the Fluid template provider back onto the filesystem to manufacture a consumer: §10 of
+fluid-templating.md gives four measured reasons `read_blob` is better there (zero rows establishes absence,
+plus `size`, `last_modified`, and a bound parameter).
+
+### 7.4 STEP 2 — `Fabricator.Common`
+
+**New project** `dotnet/Fabricator.Common/Fabricator.Common.csproj`, referencing Abstractions. <!-- check-docs:ignore (it does not exist yet; that is the plan) --> ⚠ It needs no
+`TargetFramework` line — `dotnet/Directory.Build.props` sets `net10.0;net8.0` for everything. ⚠ It needs no
+`publish-managed.ps1` line either: Abstractions reaches the payload transitively as a ProjectReference, and
+Common will the same way (VERIFIED: `Fabricator.Abstractions.dll` is in the payload with no script entry).
+
+**Keep the `Fabricator.Bridge` NAMESPACE.** That is the established convention for an assembly split here —
+`Fabricator.Abstractions` and `Fabricator.Delta` both do it — and it is what makes the move cost ZERO `using`
+churn across six projects.
+
+**MOVES CLEANLY (13, closure-checked 2026-09-02):** `ArrowValueReader`, `InMemoryArrayStream`,
+`AsyncEnumerableArrowStream`, `DescribedArrowStream`, `ChannelArrowStream`, `ArrowDataReader`,
+`AggregateSession`, `SqlDdl`, `SqlGen`, `ObjectNotFoundException`, `StaticTableFunction`,
+`StaticInOutFunction`, `StaticCollectorFunction`.
+
+**⚠ THE CLOSURE CHECK PRODUCED THREE FALSE POSITIVES AND ONE REAL BLOCKER — read both.**
+
+- **FALSE POSITIVE:** the three `Static*Function` files "depend on" a type `Binding` declared in
+  `DeltaCatalogInfoFunction.cs`. They do not — each declares its OWN `private sealed class Binding`. This is
+  the exact trap CLAUDE.md records from the `Fabricator.Delta` split ("private nested helper names collide
+  across dozens of files"), hit again by a script that excluded `Handle`/`State`/`Entry` but not `Binding`.
+  **A name-based closure check must be confirmed by reading each hit.**
+- **REAL BLOCKER, and all three share it:** `DbDataReaderArrowStream`, `SingleScanArrowStream` and
+  `MemoryProbe` each do `FabricatorLog.CreateLogger(...)`, and `DbDataReaderArrowStream` also takes an
+  `InterruptScope`. ⇒ **DEFER them to a phase 2**, whose only real question is whether
+  `Microsoft.Extensions.Logging.Abstractions` (where `ILogger` lives — light) is acceptable in a plugin's
+  closure. ⚠ Bridge references the FULL `Microsoft.Extensions.Logging` 9.0.0, so check which half
+  `FabricatorLog` actually needs before moving it.
+
+**Also consider moving OUT of Abstractions** (§6.3): `DuckSql` and `DuckDbHttpHandler` are implementations,
+not abstractions. ⚠ Breaking — the FluidPlugin uses `DuckSql` in two places and out-of-tree plugins may too;
+they gain a Common reference. Worth it only if Abstractions is meant to stay purely contracts, which is the
+argument for having Common at all.
+
+**Acceptance test, and it is the whole point:** delete the FluidPlugin's local `ArrowScalar.Read` duplicate
+and have it use `ArrowValueReader` — **without widening its reference to `Fabricator.Bridge`.** If that is
+not possible, the split did not achieve what it was for.
+
+### 7.5 Order, and how each step is proven
+
+**Locator first, Common second.** They are independent, but the locator is the approved capability and is
+self-contained, while Common is a large mechanical move whose acceptance test (the duplicate disappearing)
+is cleaner once nothing else is in flight.
+
+| step | proof |
+|---|---|
+| locator | `verify_plugin_fluid` green (it drives `query()` through the new service); a gate for `IHostFileSystem` per §7.3, or the interface does not ship |
+| Common | **both tiers at IDENTICAL counts** — a pure move changes no answer — plus the **masking check**: strip the moved files from `git diff -U0` and every removed line must be byte-identical to its added counterpart |
+
+⚠ Publish with **`-Clean`** if any PackageReference moves between assemblies. That rule exists because a
+publish once silently deleted all five SqlClient DLLs from the payload, and it is invisible to the hermetic
+tier.
+
+### 7.6 Hazards specific to this work
+
+1. **⚠⚠ A plugin's reference to Common must be `Private="false"`, exactly like Abstractions.** A copied
+   `Fabricator.Common.dll` beside a plugin is a second copy of every type in it — the "aligned dependency
+   closure" hazard, and the FluidPlugin already carries `ExcludeAssets="runtime"` on Apache.Arrow for the
+   same reason.
+2. **⚠ Deleting the two transports is a contract break for three out-of-tree plugins** (`-sustainalytics`,
+   `-quantax`, `-dlrest`), which pin by sha and migrate at their next bump. Fine, but say so in the commit.
+3. **⚠ `BackendRegistry`'s comment is stale** — it claims a plugin references `Fabricator.Bridge`. Fix it
+   while in there (§1.1).
+4. **⚠ Registration ORDER for cross-plugin services:** the plugin scan is sorted by path, so a plugin
+   resolving another's service at LOAD time may run first. Resolution must be LAZY — at use, not at load —
+   and the docs should say so before anyone builds a cross-plugin dependency on it.
+5. **⚠ A missing service must not be silent** (§5 Q6, still open): the existing seams expose `IsAvailable`
+   and callers refuse BY NAME. `Get<T>()` returning null loses that unless `GetRequired<T>()` throws with
+   the interface name in the message.
 
 ## 5. Open questions
 
