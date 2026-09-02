@@ -1182,9 +1182,10 @@ the three outcomes are tier 0's.
 
 - The GitHub Release asset (§11.4 rung 2) — one line in `distribution.yml`'s release job.
 - nuget.org, and the package ID decision that goes with it.
-- **The sustainalytics migration**, which is the acceptance test for the whole thing: its submodule,
-  `FabricatorPath` property and `CheckFabricatorPath` target all disappear in favour of a `nuget.config`
-  naming the folder. **The consuming half IS proven** — §11.8 — so what remains is that repo's edit.
+- **The sustainalytics migration** — the acceptance test for the whole thing, and **BLOCKED ON RUNG 3 for a
+  reason that is not effort: see §11.10.** The consuming half is proven (§11.8); what is missing is a place
+  to fetch the packages from, without which the migration makes that repo HARDER to build than the submodule
+  does.
 - A `PackageReadmeFile`. `dotnet pack` warns about it; it matters only on nuget.org.
 
 ### 11.8 ✅ THE FOLDER FEED IS PROVEN FROM THE CONSUMING SIDE — and it CORRECTED the migration note twice
@@ -1250,6 +1251,31 @@ for Windows-only constructs (there are none — `$PSScriptRoot`, `Join-Path`, `d
 itself only runs on a dispatch or a tag push, which needs a push. **The first dispatch is the test**; the
 likely failure is `setup-dotnet` or a RID interaction on Linux, both of which fail loudly in a job that
 touches nothing else.
+
+### 11.10 ⚠⚠ THE sustainalytics MIGRATION IS NOT READY YET, AND THE REASON IS NOT EFFORT
+
+Rung 3 of §11.4's ladder (nuget.org) is not a nicety that can be deferred indefinitely — **it, or at least a
+published release carrying the packages, is a PRECONDITION for cutting a plugin over.** Two reasons, and the
+second is the one that decides it:
+
+1. **A local folder feed is LESS reproducible than the submodule it replaces.** Today
+   `fabricator-sustainalytics` builds after one documented command
+   (`git submodule update --init fabricator-extension`). With a `PackageReference` resolved from
+   `artifacts/`, anyone else must clone THIS repo anyway *and* run `pack-nuget.ps1` — the submodule plus a
+   manual step. The migration only pays off once the `.nupkg` is fetchable without a checkout, which is
+   what §11.9's release assets (unrun) and nuget.org are for.
+2. **⚠ It would bundle a MECHANISM change with a CONTRACT upgrade, and this repo's practice is to keep
+   those apart.** That plugin pins `6897c8c` (2026-08-29), so it predates the locator, `Fabricator.Common`,
+   `IHostLog` and the packaging — including the BREAKING deletion of `HostHttpTransport` /
+   `HostQueryTransport`. Doing both at once means a failure could be either, which is exactly why the EW pin
+   bump and the SqlServer discovery fix were deliberately two commits.
+
+⇒ **the order that works is: publish a release carrying the packages → THEN repin that plugin onto the new
+contract as its own change → THEN swap ProjectReference for PackageReference.** Steps two and three can be
+one commit or two; step one cannot be skipped without making that repo harder to build than it is now.
+
+⚠ It has **no CI**, so nothing breaks automatically — which is precisely why the reproducibility argument
+has to be made deliberately here rather than discovered by a red build.
 
 ## 5. Open questions
 
