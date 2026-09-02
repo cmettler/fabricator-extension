@@ -141,21 +141,49 @@ interface, not just in the implementation.
 - Plugin services: `IBackend` gains a DIM, e.g. `void RegisterServices(IFabricatorServiceRegistry r)`, called
   during the plugin scan. Costs nothing for a plugin that publishes none.
 
-### 3.3 ⚠⚠ Plugin → plugin is the HARD half, and it is not the locator
+### 3.3 ✅ DECIDED — plugin → plugin is the EXCEPTION, and a shared assembly is the answer
 
-The locator is easy; the TYPE IDENTITY is not. For plugin A to consume plugin B's singleton, both must agree
-on an interface type, which must live in an assembly both reference:
+**User decision, 2026-09-02: *"plugin->plugin is the exception and creating a shared assembly is the better
+solution"*.** ⇒ the locator's job is HOST → plugin, which needs **no new shipped artifact**. Two plugins that
+genuinely need a contract between them ship a small assembly of their own and both reference it; the host
+curates nothing.
 
-| where the shared interface lives | cost |
+That is the right split for a reason worth stating: the alternative — a first-party "plugin contracts"
+assembly — would put the host in the business of knowing about every cross-plugin contract, which is exactly
+the coupling a plugin system exists to avoid.
+
+#### ⚠⚠ THE OPERATING RULE THE DECISION NEEDS, MEASURED 2026-09-02
+
+Two plugin directories, each holding a copy of `SharedContracts.dll`, loaded into ONE `AssemblyLoadContext`
+by `LoadFromAssemblyPath` — which is exactly what `ScanPluginDirectories` does, because a shared assembly is
+subtracted OUT of the skip set (it is in `PluginLoaded`) and so is a candidate again in the second plugin's
+directory:
+
+| the two copies | what .NET does |
 |---|---|
-| `Fabricator.Abstractions` | first-party has to know about every cross-plugin contract — defeats the purpose |
-| a third "plugin contracts" assembly, shipped and versioned | the honest answer, and a new artifact to build, ship and version |
-| plugin B's own assembly, referenced by A | works TODAY (one shared ALC, §1.5) and dies the day ALC isolation lands; also makes A build-depend on B |
-| `object` + duck typing | back to reflection, i.e. the thing being removed |
-| a `string` key + a well-known shape | reflection with extra steps |
+| **same identity** (same version) | **returns the ALREADY-LOADED assembly.** One copy in the ALC, `ReferenceEquals` true, SAME type identity, `IsAssignableFrom` both ways. It just works. |
+| **different versions** | **`FileLoadException: Assembly with same name is already loaded`** |
 
-⇒ **decide whether cross-plugin sharing is in scope BEFORE designing the locator**, because it is the only
-requirement that forces a new shipped artifact. A host-only service surface needs nothing new.
+⇒ **a shared contracts assembly must be VERSIONED and both plugins must ship the SAME version.** On a
+mismatch the second copy is reported `rejected` in `fabricator_plugins()` (visible — good), but the
+CONSEQUENCE is not: the second plugin still loads and silently binds to the FIRST one's version, so it fails
+later at the first use of anything the older version lacks. Which version wins is decided by scan order,
+i.e. sorted by path — a property of the install layout, not of either plugin.
+
+⚠ This is the "aligned dependency closure" hazard docs/plugin-system.md already records for `Apache.Arrow`,
+now measured for the cross-plugin case. The FluidPlugin's `ExcludeAssets="runtime"` on `Apache.Arrow` is the
+same problem solved the same way.
+
+**⚠ THE STRICTLY BETTER SHAPE, if a shared contract ever becomes common: ship it with the HOST.** An
+assembly in the bridge payload is in `host.Assemblies` at scan time, lands in the skip set, and neither
+plugin's copy is loaded at all — one identity, no collision, no ordering dependence. Nothing supports that
+today (there is no "host-provided but not first-party" slot), and it is not needed while cross-plugin
+sharing is the exception. Record it as the escape if that assumption stops holding.
+
+⚠ **And it all rests on there being ONE ALC** (§1.5). Per-plugin ALC isolation, deferred, would give each
+plugin its own copy of the shared assembly and non-assignable types — so if isolation is ever built, the
+shared assembly must become host-provided or explicitly shared at that moment. Note it in whatever issue
+tracks the isolation work; it is a consequence that will not be obvious from the isolation change itself.
 
 ### 3.4 Locator vs injection
 
@@ -185,8 +213,9 @@ The user said "in a similar way what dependency injection does" — worth being 
 
 ## 5. Open questions
 
-1. Is **cross-plugin** sharing in scope, or only host→plugin? (§3.3 — it is the only part that forces a new
-   shipped artifact.)
+1. ~~Is **cross-plugin** sharing in scope?~~ **ANSWERED 2026-09-02 (user): it is the EXCEPTION, and a
+   shared assembly the plugins own is the answer — so the host ships nothing new. See §3.3, including the
+   measured version rule.**
 2. `System.IServiceProvider` + our own extensions, or take
    `Microsoft.Extensions.DependencyInjection.Abstractions`? (§2)
 3. Does the locator REPLACE `HostHttpTransport` / `HostQueryTransport`, or wrap them? Replacing is cleaner
