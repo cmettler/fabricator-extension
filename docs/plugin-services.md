@@ -1129,8 +1129,8 @@ is for.
    Fine while every consumer is CI you own — which today it is, all three plugin repos.
 
 **The ladder, in order of cost:** local `artifacts/` folder (**done**) → attach the `.nupkg` to the GitHub
-Release, which `distribution.yml` already drafts (**not done**) → nuget.org, when a third party who cannot
-clone this repo needs `dotnet add package` (**not done, and the ID question lands here**).
+Release, which `distribution.yml` already drafts (**done — §11.9**) → nuget.org, when a third party who
+cannot clone this repo needs `dotnet add package` (**not done, and the ID question lands there**).
 
 ### 11.5 The skew report — it REPORTS, it does not gate
 
@@ -1217,6 +1217,39 @@ Measured, three builds of the same project:
 
 ⇒ the migration note is now: add `CopyLocalLockFileAssemblies` as today, and put `ExcludeAssets="runtime"`
 on the ONE fabricator package reference.
+
+### 11.9 The packages ride the release (`distribution.yml`) — rung 2
+
+A new `nuget` job packs **once** and uploads `nuget-packages`; `release` now `needs: [pack, nuget]` and
+attaches the two `.nupkg` beside the platform ZIPs, with a paragraph in the notes telling a plugin author
+what they are for.
+
+**⚠ ONCE, not per matrix leg, and that is why it is its own job.** The packages are pure IL
+(`lib/net10.0` + `lib/net8.0`) and platform-independent, so packing them inside `pack` would produce FOUR
+identical artifacts whose upload names collide — and which one survived would be decided by which leg
+finished last. Exactly the hazard the (platform × SKU) matrix already had to solve for the ZIPs, which is
+recorded in CLAUDE.md as the thing to check before adding any further SKU.
+
+**⚠ THE GLOB IN `release` HAD TO NARROW, and missing it would have failed the release job rather than the
+new one.** It looped `artifacts/*/` and ERRORS on any downloaded directory without a
+`fabricator.duckdb_extension` — which `nuget-packages/` is. It loops `artifacts/fabricator-*/` now, so the
+guard stays aimed at exactly the artifacts it is about.
+
+**⚠ NO SUBMODULES in the nuget job**, and that is a property to preserve rather than an optimisation:
+`Fabricator.Abstractions` references only Apache.Arrow and `Fabricator.Common` only Abstractions, so neither
+needs duckdb, engineered-wood or the extension kit. It keeps the job ~1 minute beside `pack`'s half hour —
+and **a package that needed a submodule would be a package a plugin author could not reproduce.**
+
+⚠ The `.nupkg` are attached UNZIPPED, unlike the extension. They are already archives, a local feed is a
+FOLDER of them, and — unlike `fabricator.duckdb_extension`, whose name determines its entry symbol — a
+package may be renamed freely, since its identity is its nuspec.
+
+**⚠ NOT VERIFIED IN CI, and it cannot be from here.** The workflow YAML parses and the job graph is right
+(`jobs: pack, nuget, release`; `release needs [pack, nuget]`), the script runs on Windows, and it was read
+for Windows-only constructs (there are none — `$PSScriptRoot`, `Join-Path`, `dotnet pack`). But the job
+itself only runs on a dispatch or a tag push, which needs a push. **The first dispatch is the test**; the
+likely failure is `setup-dotnet` or a RID interaction on Linux, both of which fail loudly in a job that
+touches nothing else.
 
 ## 5. Open questions
 

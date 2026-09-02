@@ -166,6 +166,55 @@ jobs:
           retention-days: 14
 
   # ---------------------------------------------------------------------------------------------------
+  # NuGet: the two assemblies a PLUGIN references, packed ONCE.
+  #
+  # ⚠ ONCE, not per matrix leg, and that is the whole reason this is its own job: the packages are pure IL
+  # (lib/net10.0 + lib/net8.0) and platform-independent, so packing them inside `pack` would produce four
+  # identical artifacts whose upload names would collide — and the one that won would be decided by which
+  # leg finished last.
+  #
+  # ⚠ NO SUBMODULES. Fabricator.Abstractions references only Apache.Arrow (NuGet) and Fabricator.Common
+  # references only Abstractions, so neither needs duckdb, engineered-wood or the extension kit. That is
+  # what keeps this job ~1 minute next to `pack`'s half hour, and it is a property worth preserving: a
+  # package that needed a submodule would be a package a plugin author could not reproduce.
+  #
+  # The version comes from ./VERSION, the same file the C++ build reads, so a package cannot claim a
+  # version the extension does not. docs/plugin-services.md §11.
+  # ---------------------------------------------------------------------------------------------------
+  nuget:
+    name: nuget packages
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          # SDK 10 builds both TFMs; the 8.0 SDK is what supplies the net8.0 targeting pack.
+          dotnet-version: |
+            8.0.x
+            10.0.x
+
+      # pwsh is preinstalled on ubuntu-latest. The script is the one place that names WHICH projects are
+      # packable — `dotnet pack` on a project whose IsPackable is false succeeds and emits nothing, so it
+      # asserts the .nupkg exists rather than trusting the exit code.
+      - name: Pack
+        shell: pwsh
+        run: ./scripts/pack-nuget.ps1 -Clean
+
+      - name: Report
+        run: ls -lh artifacts
+
+      - uses: actions/upload-artifact@v4
+        with:
+          # NOT `fabricator-*`: the release job globs the platform artifacts by that prefix and errors on a
+          # directory without a `fabricator.duckdb_extension`, so this must not look like one.
+          name: nuget-packages
+          path: artifacts/*.nupkg
+          if-no-files-found: error
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------------------------------
   # Release: attach one archive per (platform x SKU) to a GitHub release. Tag pushes only — a dispatch
   # still produces artifacts, it just does not publish anything.
   #
@@ -183,7 +232,7 @@ jobs:
   # ---------------------------------------------------------------------------------------------------
   release:
     name: release (draft)
-    needs: pack
+    needs: [pack, nuget]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
@@ -200,7 +249,10 @@ jobs:
           mkdir -p release
           shopt -s nullglob
           count=0
-          for d in artifacts/*/; do
+          # /!\ `fabricator-*`, not `*`: since the nuget job there is a downloaded directory that is NOT a
+          # platform artifact, and the check below errors on anything without a fabricator.duckdb_extension.
+          # Narrowing the glob keeps that guard aimed at exactly the artifacts it is about.
+          for d in artifacts/fabricator-*/; do
             name=$(basename "$d")   # fabricator-<duckdbversion>-<platform>-<sku>
             if [ ! -f "$d/fabricator.duckdb_extension" ]; then
               echo "::error::$d has no fabricator.duckdb_extension"; exit 1
@@ -211,7 +263,16 @@ jobs:
             count=$((count + 1))
           done
           if [ "$count" -eq 0 ]; then echo '::error::no artifacts were downloaded'; exit 1; fi
-          echo "packaged $count archive(s):"
+
+          # The NuGet packages ride along UNZIPPED: they are already archives, and a plugin author points a
+          # local feed at a FOLDER of .nupkg files, so re-wrapping them would only add a step for the
+          # consumer. Unlike the extension they may also be renamed freely - a package's identity is its
+          # nuspec, not its file name - so no versioned wrapper is needed to keep them distinguishable.
+          nupkgs=(artifacts/nuget-packages/*.nupkg)
+          if [ "${#nupkgs[@]}" -eq 0 ]; then echo '::error::the nuget job produced no .nupkg'; exit 1; fi
+          cp "${nupkgs[@]}" release/
+
+          echo "packaged $count archive(s) + ${#nupkgs[@]} package(s):"
           ls -lh release
 
       - name: Create the draft release
@@ -232,6 +293,13 @@ jobs:
           ```
 
           `allow_unsigned_extensions` is required (unchanged from previous builds).
+
+          **Writing a plugin?** The two `.nupkg` assets are the contract:
+          `Fabricator.Abstractions` (interfaces, POCOs, the host-service locator) and the optional
+          `Fabricator.Common` (reusable implementations). Drop them in a folder, point a `nuget.config`
+          at it, and reference `Fabricator.Abstractions` — no checkout of this repo is needed. Use
+          `ExcludeAssets="runtime"` so the plugin does not carry its own copy of the contract: it must
+          resolve to the one the host already loaded. See `docs/plugin-services.md`.
 
           SKUs: **Standalone** ships the .NET runtime (no prerequisite); **Standard** is
           framework-dependent and expects a provided .NET 8+ (the relevant SKU for Fabric notebooks,
@@ -254,7 +322,7 @@ jobs:
           if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
             echo "release $TAG exists — updating it in place"
             # --clobber replaces same-named assets; names are <duckdbversion>-<platform>-<sku> and stable.
-            gh release upload "$TAG" release/*.zip --clobber --repo "${{ github.repository }}"
+            gh release upload "$TAG" release/*.zip release/*.nupkg --clobber --repo "${{ github.repository }}"
             # Re-assert the title/notes AND that it is still a draft, so a re-cut cannot silently publish.
             gh release edit "$TAG" \
               --repo "${{ github.repository }}" \
@@ -262,7 +330,7 @@ jobs:
               --notes "$notes" \
               --draft=true
           else
-            gh release create "$TAG" release/*.zip \
+            gh release create "$TAG" release/*.zip release/*.nupkg \
               --repo "${{ github.repository }}" \
               --title "$TITLE" \
               --notes "$notes" \
