@@ -1,6 +1,7 @@
 # Plugin services — replacing the ad-hoc seams with a resolvable service surface
 
-> **Status: ANALYSIS IN PROGRESS, nothing built (opened 2026-09-02).** User-directed:
+> **Status: the LOCATOR is APPROVED and scoped (2026-09-02); `Fabricator.Common` is under
+> analysis (§6). Nothing built yet.** Opened user-directed:
 > *"we should improve the use of fabricator.bridge/abstraction functionalities in plugins. reflection hack is
 > not so nice. something like a `GetService<IHttpClientxx>()` would be nice. in a similar way what dependency
 > injection does. Maybe this way a plugin expose a singleton which could be used by another plugin."*
@@ -126,9 +127,27 @@ The mechanical part, and the part with a clear answer. Candidates, each with why
 | `IHostHttp` | `HostFs.HttpRequest` | already a seam; `DuckDbHttpHandler` is its consumer and already lives in Abstractions |
 | `IHostFileSystem` | `HostFs` open/read/glob/write | the seam that was written and deleted; now buildable post-v82 |
 | `IHostLog` | `FabricatorLog` | a plugin's diagnostics currently cannot reach `duckdb_logs` |
-| `IArrowValues` | `ArrowValueReader` | deletes the FluidPlugin's ~20-line duplicate |
+| ~~`IArrowValues`~~ | ~~`ArrowValueReader`~~ | **REMOVED from the list by §6's analysis — it needs no host state, so it wants to be REFERENCEABLE, not resolvable. It belongs in `Fabricator.Common`.** |
 | `IHostSources` | `Host.RegisterSource` | lets a plugin publish a named Arrow source |
 | `IInterruptScope` | `InterruptScope` | Ctrl+C during a long plugin operation |
+
+**✅ APPROVED AND SCOPED (user, 2026-09-02): "i am fine for an easy solution with `GetService<T>()` which
+works for the duckdb filesystem, http and host query/exec."**
+
+**⚠⚠ AND THAT SCOPING DRAWS THE LINE THIS DESIGN NEEDED, which §3.1's first draft did not have.** The four
+approved capabilities have one thing in common and it is not that they are useful: **they all need the
+RUNNING HOST** — specifically the ambient `ClientContext`, for secrets, for the HTTP stack, for a
+connection. A capability that needs no host state has no business being resolved at all; it should simply be
+code a plugin can REFERENCE. That is §6.
+
+    needs the live host  -> a SERVICE, resolved through the locator   (fs, http, query/exec)
+    needs nothing        -> a LIBRARY, referenced directly            (Arrow helpers, SQL helpers)
+
+⇒ `IArrowValues` came off the list above, and `IHostLog` survives for a reason worth stating: logging looks
+like pure computation but `FabricatorLog` forwards into `duckdb_logs` through a host callback, and
+`Fabricator.Bridge` references `Microsoft.Extensions.Logging` — so exposing it as an interface with primitive
+parameters keeps MEL out of every plugin's closure, where MOVING the class would drag it in. A service, not
+a library, and the dependency is why.
 
 **⚠ RULE THAT MUST SURVIVE THE REFACTOR: a service instance MUST NOT capture the ambient.** The three
 warnings in §1.2 exist because holding an opener is a use-after-free. A singleton `IHostQuery` is fine
@@ -262,6 +281,105 @@ later ON TOP; it cannot be un-added.
   reference is deliberate — it is what makes the in-tree example demonstrate the surface out-of-tree plugins
   actually have (CLAUDE.md). If the locator is right, the ~20-line duplicate disappears *without* widening
   the reference, which is the test of whether the design worked.
+
+## 6. `Fabricator.Common` — the reusable middle (analysis opened 2026-09-02)
+
+User-raised: *"we can also analyse the fabricator.bridge files to move some useful/reusable ones into a
+Fabricator.Common. Fabricator.Common could then be the place for shared assemblies for plugins?"*
+
+### 6.1 The inventory (measured 2026-09-02)
+
+66 root files in `Fabricator.Bridge`. Classified by whether anything HEAVY appears in them — Azure, Fabric,
+SqlClient, engineered-wood, `Apache.Arrow.C`, `unsafe`, or the ABI surface:
+
+| | files | lines |
+|---|---|---|
+| BCL + `Apache.Arrow` only | **47** | **6208** |
+| pinned to something heavy | 19 | ~6600 |
+
+⚠ **The script mis-tagged two files and only reading them caught it**: `Bootstrap.cs` and `PluginPaths.cs`
+matched `Microsoft.Data.SqlClient` in COMMENTS — Bridge has not referenced that package since the
+2026-08-18 split. A dependency inventory by grep needs its hits read, not counted.
+
+⚠ **Bridge's real package closure is `Apache.Arrow`, `Microsoft.Extensions.Logging`,
+`Microsoft.Fabric.Api`, `Azure.Identity`, `Azure.Storage.Files.DataLake` + a ProjectReference to
+`Fabricator.Installer.Core`.** `Fabricator.Abstractions` references `Apache.Arrow` and nothing else. That
+asymmetry is the whole reason this analysis exists.
+
+### 6.2 Dependency-light is NOT the same as plugin-useful
+
+Of the 47 clean files, most are HOST INTERNALS that merely happen to need no heavy package — the binding
+adapters, the metadata carriers, `CatalogFunctionSet`, the exchanges, `StubBackend`, `BackendRegistry`
+itself. Moving those would grow a plugin-facing assembly with things no plugin can use.
+
+The genuinely reusable set, each with the reason:
+
+| candidate | lines | why a plugin wants it |
+|---|---|---|
+| `ArrowValueReader` | 112 | THE motivating case — the FluidPlugin duplicates it today |
+| `InMemoryArrayStream` | 39 | an `IArrowArrayStream` over batches; anything returning data needs one |
+| `AsyncEnumerableArrowStream` | 57 | the async form |
+| `DescribedArrowStream` | 131 | declared-schema wrapper (the `RegisterSource` laziness fix) |
+| `SingleScanArrowStream` | 141 | one-shot scan |
+| `ChannelArrowStream` | 51 | producer/consumer streaming |
+| `DbDataReaderArrowStream` | 183 | ADO.NET → Arrow, for any SQL-shaped plugin |
+| `ArrowDataReader` | 211 | the reverse direction |
+| `StaticTableFunction` / `StaticInOutFunction` / `StaticCollectorFunction` | ~207 | the AUTHOR-FACING base classes — a plugin writing a table function wants these, and they are documented as the authoring surface |
+| `AggregateSession` | 371 | the UDAF helper |
+| `SqlDdl`, `SqlGen` | 128 | SQL text helpers |
+| `MemoryProbe` | 76 | already `public` *"so any backend assembly can use it"* |
+| `ObjectNotFoundException` | 49 | ⚠ arguably belongs in **Abstractions**, not Common: every provider is REQUIRED to throw it to signal absence, so it is part of the contract |
+
+≈ 15 files, ≈ 1800 lines. ⚠ Every entry needs its `internal` dependencies checked before moving — the
+2026-08-18 `Fabricator.Delta` split found the first closure attempt proposed moving two types that three
+sibling assemblies used, because it was computed over one project instead of all consumers. **Same method
+here: enumerate the types the candidate set DECLARES, then grep every project for those.**
+
+### 6.3 It also lets `Fabricator.Abstractions` become what its name says
+
+Abstractions already holds two things that are not abstractions: `DuckSql` (a quoting helper) and
+`DuckDbHttpHandler` (a full `HttpMessageHandler`). A `Common` gives them a home and leaves Abstractions as
+interfaces and data contracts only — which matters because Abstractions is the thing out-of-tree plugins pin
+BY SHA (§1.5): the smaller and more stable it is, the less a pin bump can mean.
+
+Proposed layering, each arrow a reference:
+
+    Fabricator.Abstractions  (interfaces + data contracts; Apache.Arrow only)
+        ^
+    Fabricator.Common        (dependency-light reusable implementations)
+        ^
+    Fabricator.Bridge        (ABI, host, Azure/Fabric/unsafe)
+
+A plugin references Abstractions (required) and Common (optional).
+
+### 6.4 ⚠⚠ "the place for shared assemblies for plugins?" — YES for code, NO for cross-plugin contracts
+
+The question deserves splitting, because the two readings have opposite answers:
+
+- **Reusable CODE that many plugins want** — yes, that is exactly what Common is for.
+- **A CONTRACT between two specific plugins** — no. §3.3 settled that (user: cross-plugin is the exception,
+  the plugins ship their own shared assembly), and putting it in Common would recreate what that decision
+  rejected: the host curating contracts it has no stake in.
+
+**⚠ But Common does give the cross-plugin case something real, and it is not a place to put types.** Because
+Common ships with the host, it is in `host.Assemblies` at plugin-scan time, so it lands in the skip set and
+no plugin's copy is ever loaded — the version-collision measured in §3.3 cannot happen to it. That makes it
+the natural home for the **locator plumbing** through which plugins find each other, while the TYPES they
+exchange stay theirs. Shared mechanism, private contracts.
+
+⚠ It is also the answer if the assumption in §3.3 ever breaks: if cross-plugin contracts stop being the
+exception, a host-shipped assembly is the shape that fixes the collision, and Common already is one.
+
+### 6.5 What is NOT settled
+
+1. Is a third assembly worth it, or should the reusable set simply go INTO Abstractions? The case for
+   splitting is that Abstractions is sha-pinned and should stay small; the case against is one more
+   assembly in the payload, the publish script, and every plugin's csproj. **§6.3's tidying of
+   `DuckSql`/`DuckDbHttpHandler` only pays off if the answer is "separate".**
+2. Does `Fabricator.Common` need its own `net8.0`-only target, like the plugins? A plugin runs on whatever
+   the bridge was published for, and Abstractions multi-targets — check before assuming.
+3. `FabricatorLog` stays in Bridge on the MEL argument (§3.1). Revisit only if MEL is wanted in the plugin
+   closure for other reasons.
 
 ## 5. Open questions
 
