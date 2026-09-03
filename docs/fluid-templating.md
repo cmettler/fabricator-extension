@@ -1908,3 +1908,60 @@ which is consistent with the recommendation but is not a substitute for asking u
 and issue our own temp view. The remaining work before the change lands is (a) the same probe against the
 real `arrow_scan(POINTER…)` form, and (b) §17.7's outstanding question of whether today's non-temp view
 persists.
+
+### 17.9 ⇒ PICK UP HERE — state of play, and the two measurements owed
+
+**Nothing is built. §17 is analysis only.** Four things are settled, two are open, and the open ones are
+MEASUREMENTS rather than decisions.
+
+#### Settled
+
+| | |
+|---|---|
+| the surface | **ONE site**: `src/fabricator_host_query.cpp:617`, the named-`inputs` loop in `MakeHostQueryStream` |
+| what it does today | `duckdb_arrow_scan` → `CreateView(name, replace: true, temporary: **false**)` — a CATALOG view, replace-on-conflict |
+| the decision | **TEMP view, unconditionally — no flag** (§17.7's four reasons) |
+| the mechanics | MEASURED to work: temp view over an Arrow table function binds, scans, REPLACEs, lands in `temp.main`, `memory` count 0 (§17.8) |
+
+#### Open — measurement 1: does today's non-temp view PERSIST?
+
+If yes, it is a **shipped defect** on the `inputs` path and must be recorded as one, not quietly fixed.
+⚠ THREE of my probes were INCONCLUSIVE and all looked like passes (`memory` views 0 → 0). They never
+reached a view-creating path, shown by the absence of any `delta native batch:` line in a Debug log.
+
+**Do not repeat that mistake: prove the path ran BEFORE reading the result.** A usable probe must
+(a) provably bind inputs and (b) show it did. The Delta batched reader is the only in-tree producer of
+`inputs`; `FABRICATOR_DELTA_BATCH_MIN_FILES=1` alone was not sufficient on a 5-row single-file table.
+Options: a bigger/multi-file table so a batched form is genuinely chosen, or instrument
+`MakeHostQueryStream` to log each `in.name` it registers — the second is the reliable one, because it
+makes the positive control impossible to miss.
+
+#### Open — measurement 2: does `CREATE OR REPLACE TEMP VIEW … AS SELECT * FROM arrow_scan(POINTER…)` work?
+
+§17.8 tested the SHAPE through `fabricator_scan(name)`, not the pointer form. ⚠ The gap is narrow because
+pointer lifetime is orthogonal to temp-ness — but narrow is not closed, and this is the exact class of
+assumption this section exists to record. It needs a C++ probe (the POINTER values cannot be built from
+SQL), so it belongs with the change itself rather than before it.
+
+#### The change, when the measurements are in
+
+Replace the `duckdb_arrow_scan` call at `fabricator_host_query.cpp:617` with our own
+`CREATE OR REPLACE TEMP VIEW <name> AS SELECT * FROM arrow_scan(<ptr>, <ptr>, <ptr>)` (or the 3-arg
+`Relation::CreateView(schema, name, replace, temporary)` overload). Keep `OwnedArrowInputs` exactly as it
+is — the adoption discipline is unaffected.
+
+⇒ **Then LIFT the ABI v84 refusal of named inputs on a pinned connection**, whose stated reason is already
+known false (§17.6). With a temp view the scope becomes the connection (= the render), re-registration
+replaces, and nothing reaches the catalog — which is the prerequisite §17.2 needs for
+`{% query t %}` … `{% query u %}SELECT … FROM t{% endquery %}`.
+
+#### ⚠ Traps this session paid for — do not re-pay them
+
+- **Three claims were asserted before being run** and all three were wrong: "the view would collide",
+  "it is connection-scoped", "a temp view will work". Run it first.
+- A probe that returns the expected answer is not evidence unless it PROVES it reached the code path.
+- The `duckdb` submodule is a **shallow clone**: `git log -S`/`-L` attribute every line to one commit, so
+  upstream intent cannot be read from here. Ask upstream or say unknown.
+- `python` here is a Windows binary and cannot see MSYS `/tmp` — use the scratchpad path.
+- Check `Get-Process duckdb` before a build or publish; a leftover `-batch` shell holds the payload and
+  fails the link or the publish, after which a suite silently measures the STALE payload.
