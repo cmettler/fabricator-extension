@@ -1791,3 +1791,39 @@ lifted for this path.
 
 Not built. The measurement that would justify it is a real multi-step template where the intermediate is
 large enough that round-tripping it through `| sql` interpolation is the wrong shape.
+
+### 17.6 ⚠⚠ CORRECTION (user-caught): `duckdb_arrow_scan`'s view is NOT temporary, and NOT collision-prone
+
+User-asked: *"isn't the connection scoped view here created as a temporary view which should not
+collide?"* — and reading the source settles it against me on BOTH counts.
+`duckdb/src/main/capi/arrow-c.cpp:425` ends in
+
+```cpp
+->CreateView(table_name, /*replace=*/true, /*temporary=*/false);
+```
+
+| what I wrote | what the source says |
+|---|---|
+| the view "would collide with the next one" (abi-history §v84, and the refusal's own message) | **`replace = true`** — re-registering a name REPLACES it. There is no collision |
+| "`duckdb_arrow_scan` registers a CONNECTION-scoped view" (§17.2, §v84) | **`temporary = false`** — it is an ordinary CATALOG view, visible to every connection |
+
+⇒ **§17.2's argument is void as written.** It rested on "connection-scoped ⇒ render scope, dies with the
+render", and a non-temp catalog view does neither: it would be visible to other connections and outlive
+the render, i.e. exactly the global-namespace problem §17.1 rejects the replacement-scan route for.
+
+**The design survives, but it must ASK for what I assumed.** `Relation::CreateView` has a 3-arg overload
+taking `temporary`, so a **`CREATE OR REPLACE TEMP VIEW`** over `arrow_scan(...)` gives real
+connection scope — and with `replace` it is also re-assignable, which is what `{% query t %}` twice needs
+(§17.3's "defined drop/replace" is then free). That is a different call from `duckdb_arrow_scan`, so the
+host would issue the SQL itself rather than reuse the C-API helper.
+
+⚠ **UNMEASURED, and not claimed either way: whether a view created by today's `inputs` path actually
+persists after its fresh connection closes.** A probe against a small Delta table showed `memory` views
+0 → 0, but that shape took the plain `read_parquet` form and bound no inputs, so it never reached a
+view-creating path. It is a real question for the EXISTING code, independent of §17: a non-temp view named
+by the caller, created on a throwaway connection, has no obvious cleanup.
+
+⚠ **And the v84 refusal now has no stated reason.** Refusing named inputs on a pinned connection may still
+be right — a caller-named CATALOG view created on a long-lived connection is worse than on a throwaway one,
+and the semantics of "persists until you replace it" were never designed — but the message and the doc
+give a justification that is false. Fix the reason before relying on the refusal.

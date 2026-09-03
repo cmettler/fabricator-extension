@@ -78,6 +78,12 @@ use-after-free class this repo's history says is invisible on the platform you d
 
 ### ⚠ Two deliberate refusals
 
+- **⚠⚠ CORRECTION (2026-09-03, user-caught): the reason given below is FALSE on both counts.**
+  `duckdb_arrow_scan` ends in `CreateView(name, replace: true, temporary: false)` — so a re-registration
+  REPLACES rather than collides, and the view is an ordinary CATALOG view, not a connection-scoped one.
+  The refusal may still be right (a caller-named catalog view on a LONG-LIVED connection is worse than on
+  a throwaway one, and "persists until replaced" was never designed), but it needs a true reason before
+  anything relies on it. See fluid-templating.md §17.6.
 - **Named Arrow inputs are refused on a pinned connection.** `duckdb_arrow_scan` registers a
   CONNECTION-scoped view: on a fresh connection it dies with the call, on a pinned one it would outlive
   it and the next call using that name would collide. Refusing by name beats leaking a view into a
