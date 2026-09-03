@@ -3,6 +3,8 @@
 // See LICENSE in the project root for license information.
 
 using System.Collections.Concurrent;
+using Fluid.Ast;
+using Fluid.Utils;
 using System.Linq;
 using Fluid;
 using Fluid.Values;
@@ -20,7 +22,70 @@ internal static class FluidEngine
     // ⚠ AllowFunctions is OFF in Fluid by default and is a PARSER-level gate: without it `query('…')` is a
     // PARSE error ("Functions are not allowed"), not a missing-function error at render. It is enabled
     // because slice 3 ships `query`; nothing else in this plugin needs it.
-    private static readonly FluidParser Parser = new(new FluidParserOptions { AllowFunctions = true });
+    //
+    // ⚠ Built by a METHOD rather than an object initializer so the custom tag is registered BEFORE anything
+    // can be parsed: templates are cached by text, so a template parsed before registration would be cached
+    // with `{% exec %}` unrecognised and stay that way for the process's life.
+    private static readonly FluidParser Parser = CreateParser();
+
+    // The buffer TextWriterFluidOutput allocates while capturing a block body. 16 KB is what Fluid's own
+    // {% capture %} source generator uses; a longer body simply flushes through it.
+    private const int CaptureBufferSize = 16 * 1024;
+
+    private static FluidParser CreateParser()
+    {
+        var parser = new FluidParser(new FluidParserOptions { AllowFunctions = true });
+
+        // ⚠⚠ THE {% exec %} BLOCK: render the body to a SEPARATE output, run the captured text as SQL, and
+        // write NOTHING to the caller's output. It is what makes a real statement writable — multi-line,
+        // with Liquid inside it, and no quote-escaping — where the exec("…") function needs the whole
+        // statement as one escaped string argument.
+        //
+        // ⚠ NullEncoder.Default, EXPLICITLY, rather than the ambient `encoder`. The body is SQL and must
+        // never be HTML-escaped — an encoder would turn `'` into `&#39;` and corrupt every literal. Today
+        // the ambient encoder IS NullEncoder (Render(template, context) passes NullEncoder.Default), so
+        // this changes nothing now; it is written explicitly so that stays true if a caller ever renders
+        // through an encoding overload. Fluid's own {% capture %} passes the ambient encoder through, which
+        // is right for HTML and wrong here.
+        //
+        // ⚠⚠ THE CAPTURE OUTPUT BUFFERS (CaptureBufferSize), so the body must be FLUSHED before it is
+        // read — otherwise a statement shorter than the buffer has not reached the StringWriter at all and
+        // we would "execute" the empty string. The text is therefore read INSIDE the scope, immediately
+        // after the flush, which is also what Fluid's own {% capture %} source generator does.
+        // ⚠ MEASURED: reading AFTER the `await using` instead works too, because DisposeAsync flushes —
+        // and a mutant that dropped the explicit flush SURVIVED in that arrangement. That is exactly why
+        // it is written this way: the dependency is real, and here it is explicit and local rather than
+        // resting on disposal order, so removing the flush now fails loudly.
+        parser.RegisterEmptyBlock(FluidHostExec.BlockName, static async (statements, output, encoder, ctx) =>
+        {
+            using var sql = new StringWriter();
+            var completion = Completion.Normal;
+            await using var capture = new TextWriterFluidOutput(sql, CaptureBufferSize, leaveOpen: true);
+            for (var i = 0; i < statements.Count; i++)
+            {
+                completion = await statements[i].WriteToAsync(capture, NullEncoder.Default, ctx);
+                if (completion != Completion.Normal)
+                {
+                    break;
+                }
+            }
+
+            // ⚠ A body that did not finish normally is NOT executed — a `{% break %}` inside the block (of
+            // an enclosing {% for %}) leaves a PARTIALLY rendered statement, and running half a statement
+            // is a different statement. Propagate the completion instead, which is what the author asked
+            // for by breaking.
+            if (completion != Completion.Normal)
+            {
+                return completion;
+            }
+
+            await capture.FlushAsync();
+            FluidHostExec.ExecuteCaptured(ctx, sql.ToString());
+            return Completion.Normal;
+        });
+
+        return parser;
+    }
     private static readonly ConcurrentDictionary<string, IFluidTemplate> Cache = new();
 
     /// <summary>Parses (or reuses) <paramref name="template"/> and renders it over a fresh context.</summary>
@@ -49,6 +114,16 @@ internal static class FluidEngine
         // would mutate global state on every call and capture whichever `caller` happened to register last,
         // giving another render's function name in an error. The caller travels per context instead:
         ctx.AmbientValues[FluidHostQuery.CallerKey] = caller;
+        // ⚠⚠ ONE PINNED DuckDB CONNECTION PER RENDER (ABI v84), so this template's exec() and query() see
+        // each other — a `CREATE TEMP TABLE` in one and a `SELECT` from it in the other. Created here
+        // rather than in either function so the two share it, LAZILY (nothing is opened until the first
+        // call), and disposed below so the temporary catalog dies with the render. See FluidRenderSession
+        // for why per-render is also what makes it thread-safe.
+        using var session = FluidRenderSession.TryCreate();
+        if (session is not null)
+        {
+            ctx.AmbientValues[FluidRenderSession.Key] = session;
+        }
         bind(ctx);
         try
         {

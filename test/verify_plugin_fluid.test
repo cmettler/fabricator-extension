@@ -1633,3 +1633,259 @@ query I
 SELECT fabricator_render('{{ exec("INSERT INTO ex_aud VALUES (5)") }}|{{ "INSERT INTO ex_aud VALUES ($x)" | exec: x: 6 }}', NULL);
 ----
 1|1
+
+# ============================================================================================
+# §12 — ONE PINNED CONNECTION PER RENDER (ABI v84): exec() and query() see each other.
+#
+# The template's SQL used to run on a FRESH connection per call, so a statement could not see
+# what an earlier one in the SAME template created — and for a TEMP table it never could, since
+# a temporary catalog belongs to the ClientContext that made it. FluidEngine.Render now opens
+# ONE pinned host connection per render, lazily, and disposes it when the render ends.
+#
+# ⚠ MEASURED before building this (docs/host-query.md §Pinned connections): a temp table is
+# invisible from any other connection, and DuckDB CLOSES a connection's active streaming result
+# when the next statement starts on it — SILENTLY, reporting end-of-stream — which is why the
+# host refuses a second query while a stream is open rather than truncating the first.
+# ============================================================================================
+
+# --- THE FEATURE: stage into a TEMP table, then read it, in one render ---
+# ⚠ THE TEMP TABLE IS THE DISCRIMINATOR, and a plain table would not be one: a plain table is
+# COMMITTED by exec(), so a fresh-connection query() would see it too and this assertion would
+# pass on the old behaviour. Only a temporary catalog is provably the same connection.
+query I
+SELECT fabricator_render('{% assign _ = exec("CREATE TEMP TABLE scratch AS SELECT 7 AS v") %}{% assign rows = query("SELECT v FROM scratch") %}v={{ rows[0].v }}', NULL);
+----
+v=7
+
+# --- and the next render CANNOT see it: the scope really is one render ---
+# ⚠ This is the other half. Without it the assertion above is equally satisfied by a build that
+# shared ONE connection for the whole process, which would make a template's scratch state
+# visible to every later render — the opposite of what "per rendered template" means. MEASURED
+# against exactly that mutant: the second render read `leaked=7` where this build errors.
+#
+# ⚠⚠ IT PINS THE SCOPE, NOT THE DISPOSAL, and the distinction cost a surviving mutant. Isolation
+# comes from FluidEngine.Render building a NEW session per render, so a build whose Dispose() does
+# nothing still passes every assertion here — each render opens its own connection either way. What
+# Dispose() prevents is a native connection LEAK (one per render, for the process's life), and no
+# SQL assertion can observe that. Said here rather than left to be re-derived.
+statement error
+SELECT fabricator_render('{% assign rows = query("SELECT v FROM scratch") %}x', NULL);
+----
+Table with name scratch does not exist
+
+# --- PER ROW is PER RENDER, and this is the sharpest form of that claim ---
+# ⚠ Three rows each create the SAME temp-table name. On one shared connection the second row
+# would fail with "table scratch already exists"; on a per-render connection each row has its
+# own temporary catalog. The VALUES also differ, so a build that somehow shared one table would
+# have to return the wrong number rather than merely not erroring.
+query I
+SELECT fabricator_render('{% assign ddl = "CREATE TEMP TABLE perrow AS SELECT " | append: n | append: " AS v" %}{% assign _ = exec(ddl) %}{% assign r = query("SELECT v FROM perrow") %}{{ r[0].v }}', {'n': n}) FROM (VALUES (10), (20), (30)) t(n);
+----
+10
+20
+30
+
+# --- the sqlgen surface gets it too, i.e. at BIND time ---
+# ⚠ fluid_query renders while DuckDB is BINDING, so this also pins that a pinned connection is
+# usable from inside the binder — the place where the ambient-clobbering hazard of ABI v80 lives.
+query I
+SELECT * FROM fluid_query('{% assign _ = exec("CREATE TEMP TABLE s2 AS SELECT 3 AS a UNION ALL SELECT 4") %}{% assign rows = query("SELECT sum(a) AS t FROM s2") %}SELECT {{ rows[0].t }} AS staged');
+----
+7
+
+# --- the render's TEMP table is invisible to the OUTER statement ---
+# ⚠ That is a FEATURE rather than a limitation, and it is why a temp table is the right scratch
+# space for a template: nothing it stages can be seen by, or collide with, the statement that
+# invoked it, and there is nothing to clean up. The §11.1b rule (a statement cannot see the
+# write its own template made) therefore still holds OUTWARD — what changed is only that the
+# template's own later statements can see its earlier ones.
+query I
+SELECT fabricator_render('{% assign _ = exec("CREATE TEMP TABLE leak AS SELECT 1 AS z") %}made', NULL);
+----
+made
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE table_name = 'leak';
+----
+0
+
+# --- pinning did NOT weaken either classifier ---
+# ⚠ The classifier now runs on the SAME pinned connection as the statement it is about (one
+# connection per render instead of one per classification), so both refusals are re-asserted
+# here: a mechanism that moved is a mechanism that could have been dropped.
+statement error
+SELECT fabricator_render('{% assign r = query("INSERT INTO ex_aud VALUES (1)") %}x', NULL);
+----
+query() runs SELECT statements only
+
+statement error
+SELECT fabricator_render('{{ exec("SELECT 1") }}', NULL);
+----
+exec() runs WRITES only, and this statement is a SELECT
+
+# --- ⚠⚠ STAGING INTO A TEMP TABLE IS IDEMPOTENT UNDER BIND REPETITION; A REAL TABLE IS NOT ---
+# This is the property that makes the temp-table idiom the RIGHT one on the fluid_query surface
+# rather than merely the tidy one. §11 measured that a writing template behind a VIEW writes on
+# EVERY use (1 -> 2 -> 3 -> 4). A per-render connection turns that from a footgun into a non-issue
+# for staging specifically: each bind gets its own temporary catalog, so the same CREATE runs again
+# harmlessly. Staging into a REAL table hits the multiplication head-on and fails.
+statement ok
+CREATE VIEW v_stage AS SELECT * FROM fluid_query('{% assign _ = exec("CREATE TEMP TABLE st AS SELECT 5 AS a") %}{% assign r = query("SELECT a FROM st") %}SELECT {{ r[0].a }} AS staged');
+
+query I
+SELECT staged FROM v_stage;
+----
+5
+
+# ⚠ The SECOND use is the assertion. The first proves only that it works once, which the section
+# above already showed; a shared connection (or a real table) fails HERE.
+query I
+SELECT staged FROM v_stage;
+----
+5
+
+# --- the contrast, as a CHARACTERIZATION test of DuckDB's bind repetition ---
+# ⚠ Not a test of our code and no mutant of ours can kill it: the CREATE VIEW below binds the
+# template once (creating the table) and the SELECT binds it again, so the second CREATE collides.
+# It is pinned because it is the reason to reach for a TEMP table, and because a change in DuckDB's
+# bind repetition should arrive as a failed assertion naming this shape rather than as a surprise.
+statement ok
+CREATE VIEW w_stage AS SELECT * FROM fluid_query('{% assign _ = exec("CREATE TABLE realst AS SELECT 5 AS a") %}{% assign r = query("SELECT a FROM realst") %}SELECT {{ r[0].a }} AS staged');
+
+statement error
+SELECT staged FROM w_stage;
+----
+already exists
+
+statement ok
+DROP VIEW w_stage;
+
+statement ok
+DROP VIEW v_stage;
+
+statement ok
+DROP TABLE realst;
+
+# ============================================================================================
+# §13 — THE {% exec %} BLOCK (user-asked): render the body to a SEPARATE output, run the
+# captured text as SQL, emit NOTHING.
+#
+# It is what makes a REAL statement writable from a template — multi-line, with Liquid inside
+# it, and no quote-escaping — where exec("…") needs the whole statement as one escaped string
+# argument. Registered with Fluid's RegisterEmptyBlock on the shared parser (so both surfaces
+# get it), following {% capture %}'s own capture pattern.
+#
+# ⚠⚠ FlushAsync() on the capture output is MANDATORY, not hygiene: TextWriterFluidOutput
+# BUFFERS, so without it a body shorter than the buffer never reaches the writer and the block
+# would "execute" an empty statement. Read out of Fluid's own capture source generator.
+# ============================================================================================
+
+statement ok
+CREATE TABLE blk(id INTEGER, name VARCHAR);
+
+# --- THE FEATURE: a multi-line statement built by a loop, and NOTHING rendered ---
+# ⚠ The brackets are the assertion about output: the block contributes no text at all, so the
+# render is exactly the literal that follows {% endexec %}. Without them a stray newline or a
+# leaked row count would be invisible.
+query I
+SELECT '[' || fabricator_render('{% exec %}
+INSERT INTO blk VALUES
+{% for r in rows %}({{ r.id }}, {{ r.name | sql }}){% unless forloop.last %},{% endunless %}
+{% endfor %}
+{% endexec %}done', {'rows': [{'id': 1, 'name': 'a'}, {'id': 2, 'name': 'O''Brien'}]}) || ']';
+----
+[done]
+
+# ⚠ And the rows really landed, with the quote correctly escaped by `| sql`. A block that
+# rendered nothing AND wrote nothing would satisfy the assertion above on its own.
+query IT
+SELECT id, name FROM blk ORDER BY id;
+----
+1	a
+2	O'Brien
+
+# --- it composes with the per-render pinned connection (§12) ---
+# ⚠ The block and query() share ONE connection, so a TEMP table staged in the block is readable
+# by a later query() in the same template. This is the two features meeting, and neither works
+# for this shape alone.
+query I
+SELECT fabricator_render('{% exec %}CREATE TEMP TABLE blk_s AS SELECT 11 AS v{% endexec %}{% assign r = query("SELECT v FROM blk_s") %}v={{ r[0].v }}', NULL);
+----
+v=11
+
+# --- and on the sqlgen surface, i.e. at BIND time ---
+query I
+SELECT * FROM fluid_query('{% exec %}CREATE TEMP TABLE blk_q AS SELECT 4 AS a UNION ALL SELECT 5{% endexec %}{% assign r = query("SELECT sum(a) AS t FROM blk_q") %}SELECT {{ r[0].t }} AS total');
+----
+9
+
+# --- CONDITIONAL execution, which is a large part of why a block is better than a function ---
+# ⚠ An unreached block runs nothing: the tag is a statement in the tree, not an argument that
+# had to be evaluated to build the call.
+query I
+SELECT fabricator_render('{% if go %}{% exec %}CREATE TEMP TABLE blk_c AS SELECT 1{% endexec %}ran{% else %}skipped{% endif %}', {'go': false});
+----
+skipped
+
+# --- ⚠⚠ A BODY THAT DID NOT FINISH NORMALLY IS NOT EXECUTED ---
+# A {% break %} inside the block (of an enclosing {% for %}) leaves a PARTIALLY rendered
+# statement, and running half a statement is a different statement. The completion is
+# propagated instead, which is what the author asked for by breaking. MEASURED: zero rows.
+statement ok
+CREATE TABLE blk_brk(id INTEGER);
+
+query I
+SELECT fabricator_render('{% for i in (1..3) %}{% exec %}INSERT INTO blk_brk VALUES ({{ i }}){% break %}{% endexec %}{% endfor %}done', NULL);
+----
+done
+
+query I
+SELECT count(*) FROM blk_brk;
+----
+0
+
+# --- interpolation inside the block is RAW: `| sql` is what makes a VALUE safe ---
+# ⚠ Same rule as fluid_query, and for the same reason: a template must be able to emit object
+# names and whole fragments, so `{{ x }}` cannot escape. The failure mode is a PARSER ERROR
+# rather than a silent injection, which is the safe direction but not a substitute for `| sql`.
+statement error
+SELECT fabricator_render('{% exec %}INSERT INTO blk VALUES (9, {{ v }}){% endexec %}ok', {'v': 'O''Brien'});
+----
+unterminated quoted string
+
+# --- the block obeys the SAME classifier as the function ---
+# ⚠ One mechanism, two spellings: the block cannot drift from exec() on what counts as a write.
+statement error
+SELECT fabricator_render('{% exec %}SELECT 1{% endexec %}', NULL);
+----
+exec() runs WRITES only, and this statement is a SELECT
+
+# --- an empty (or whitespace-only) body is refused BEFORE the classifier ---
+# ⚠ Load-bearing ordering, exactly as for the function form: json_serialize_sql('') reports NO
+# error, so the classifier alone would wave it through and report success for nothing.
+statement error
+SELECT fabricator_render('{% exec %}   {% endexec %}', NULL);
+----
+block is empty
+
+# --- an unterminated block is a PARSE error naming the tag Fluid wanted ---
+statement error
+SELECT fabricator_render('{% exec %}INSERT INTO blk VALUES (3, ''x'')', NULL);
+----
+endexec
+
+# --- the block name does NOT shadow the function or the filter of the same name ---
+# ⚠ Tags and expressions are different grammars in Fluid, so all three spellings of `exec`
+# coexist. Pinned because it is not obvious and a change would silently break one of them.
+statement ok
+DELETE FROM blk;
+
+query I
+SELECT fabricator_render('{% exec %}INSERT INTO blk VALUES (1, ''b''){% endexec %}{{ exec("INSERT INTO blk VALUES (2, ''c'')") }}|{{ "INSERT INTO blk VALUES ($i, ''d'')" | exec: i: 3 }}', NULL);
+----
+1|1
+
+query I
+SELECT count(*) FROM blk;
+----
+3

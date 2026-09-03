@@ -82,4 +82,79 @@ public interface IHostQuery
     /// <para>For several statements the count is the LAST one's.</para>
     /// </remarks>
     long ExecuteNonQuery(string sql);
+
+    /// <summary>
+    /// Opens a connection that OUTLIVES a single call, so several statements share one DuckDB connection —
+    /// and therefore one TEMPORARY catalog, one set of session settings and one transaction context.
+    /// Dispose it when the unit of work ends.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// ⚠⚠ <b>What it is FOR: read-your-writes inside one logical unit of work.</b> <see cref="Query"/> and
+    /// <see cref="ExecuteNonQuery"/> each open their own connection, so a statement cannot see what an
+    /// earlier one created. On a pinned connection <c>CREATE TEMP TABLE t …</c> followed by
+    /// <c>SELECT … FROM t</c> works — a scratch space needing no name in the shared catalog and no cleanup,
+    /// since disposing the connection destroys its temporary catalog with it.
+    /// </para>
+    /// <para>
+    /// ⚠ <b>It does NOT join the caller's transaction</b>, exactly as the fresh-connection members do not:
+    /// reads are of COMMITTED state. What pinning adds is that YOUR OWN earlier statements are visible.
+    /// </para>
+    /// <para>
+    /// ⚠⚠ <b>There is NO capability probe beside this, deliberately (user decision, 2026-09-03: "we don't
+    /// need any fallbacks with CanPinConnection").</b> A probe exists only so a caller can DEGRADE, and
+    /// degrading here means a caller's statements quietly stop sharing a connection — its work then runs
+    /// and MEANS SOMETHING DIFFERENT, with nothing failing. So there is one behaviour: it either works or
+    /// says why. Contrast <c>Host.CanQuery</c>, which has a dozen real callers because reaching the host
+    /// engine at all IS optional and a provider legitimately falls back to its own reader.
+    /// </para>
+    /// <para>
+    /// ⚠ The default implementation is for an IMPLEMENTER, not for an old host. Only the bridge implements
+    /// this interface — a plugin CONSUMES it — so the one type that realistically implements it out of tree
+    /// is a test double, and the default is what keeps such a type compiling when this contract gains a
+    /// member (the <c>IProviderCatalog.NotHosted</c> precedent). An old HOST cannot reach it: the C++ side
+    /// refuses a bridge whose declared ABI version differs, so a running bridge implies a host of exactly
+    /// its own version.
+    /// </para>
+    /// </remarks>
+    IHostConnection OpenConnection(bool inheritSession = true) =>
+        throw new NotSupportedException(
+            "this IHostQuery implementation does not support pinned connections — it does not override "
+            + "OpenConnection.");
 }
+
+/// <summary>
+/// A pinned host DuckDB connection (<see cref="IHostQuery.OpenConnection"/>): several statements on ONE
+/// connection, so its TEMPORARY catalog and session settings persist until it is disposed.
+/// </summary>
+/// <remarks>
+/// <para>
+/// ⚠⚠ <b>ONE RESULT STREAM AT A TIME, and the host REFUSES a second statement rather than truncating the
+/// first.</b> DuckDB closes a connection's active streaming result when the next statement starts on it, and
+/// MEASURED it does so SILENTLY — the abandoned stream reports end-of-stream, so the earlier query's
+/// remaining rows would be LOST with no error anywhere. Read (or dispose) each stream before calling again.
+/// </para>
+/// <para>
+/// ⚠ <b>NOT thread-safe</b>, like any DuckDB connection: one call at a time. Code working on several threads
+/// opens one connection per thread.
+/// </para>
+/// <para>
+/// ⚠ The write-then-read rule of <see cref="IHostQuery"/> still applies OUTWARD: a statement the SURROUNDING
+/// DuckDB query is running cannot see what this connection wrote, because its snapshot predates the commit.
+/// A <b>TEMP</b> table sidesteps that question entirely — it is visible only here, which is usually what a
+/// multi-step generator actually wants.
+/// </para>
+/// </remarks>
+public interface IHostConnection : IDisposable
+{
+    /// <summary>Runs <paramref name="sql"/> on this connection; the caller owns and disposes the stream.</summary>
+    IArrowArrayStream Query(string sql, RecordBatch? parameters = null);
+
+    /// <summary>
+    /// Runs a non-query statement (DDL / DML) on this connection and returns the affected-row count when the
+    /// engine reports one — the same inference <see cref="IHostQuery.ExecuteNonQuery"/> documents, including
+    /// that a CTAS reports the rows it created and a SELECT of one BIGINT reports its VALUE.
+    /// </summary>
+    long ExecuteNonQuery(string sql);
+}
+

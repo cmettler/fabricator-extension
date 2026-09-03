@@ -75,6 +75,90 @@ Deliberately **not guarded in code**: a guard would have to answer "am I inside 
 touched this catalog", which is substantial machinery for a hazard nobody has hit, and it would also forbid
 the legitimate read-only re-entrancy that the table above shows working.
 
+## ✅ PINNED CONNECTIONS — several calls on ONE connection (ABI v84, 2026-09-03)
+
+User-asked, in the shape the request gave: `con = host.connection()` / `con.query()` / `con.dispose()`,
+*"so a exec() could create a temporary table on this connection which could be queried in the same render
+session"*. Full ABI record: [abi-history.md](abi-history.md) §v84.
+
+**It does not weaken the section above.** A pinned connection is still NOT the in-flight `ClientContext` —
+it is a connection of its own, opened on the host `DatabaseInstance`, and every reason "a FRESH connection
+per call" gives still applies to it. What changes is only its LIFETIME: instead of dying with the call it
+lives until the caller disposes it, so the caller's own statements share one transaction context, one set
+of session settings and — the point — one **TEMPORARY catalog**.
+
+### What it buys, measured before it was built
+
+| | |
+|---|---|
+| a TEMP table read back on the SAME connection | **works** |
+| the same table from another connection | `Catalog Error: Table with name t does not exist!` |
+| a `SET` on one connection | persists there; another connection reports its own value |
+| a TEMP table inside `BEGIN … ROLLBACK` | **gone** — temp tables are transactional |
+
+⇒ this is not "a faster fresh connection". A multi-step managed job — stage, then read — is
+INEXPRESSIBLE on fresh connections when the intermediate is a temp table, whatever the timing. And a temp
+table is the right intermediate: it needs no name in the shared catalog, nothing else can see it, and
+closing the connection destroys it.
+
+### ⚠⚠ ONE result stream at a time, and the host refuses rather than truncating
+
+`ClientContext::InitialCleanup` — called by every query path, comment *"Cleanup any open results"* —
+closes the connection's active streaming result. MEASURED, it does so **SILENTLY**:
+
+```
+r1 = conn.execute("SELECT i FROM big ORDER BY i");  r1.fetchmany(3)  -> [(0,), (1,), (2,)]
+conn.execute("SELECT 1").fetchall()                  # second query, SAME connection
+r1.fetchmany(3)                                      -> []           # the rest is GONE, no error
+   the same pair across two DIFFERENT connections    -> [(3,), (4,), (5,)]
+```
+
+So a second statement on a pinned connection with a live result stream is **REFUSED**, naming the cause.
+Release (or fully read) each stream first. `HostConnection::open_streams` counts them; the slot is taken
+only once the statement has SUCCEEDED, and released after the result is dropped.
+
+⚠ Unreachable from the Fluid plugin, which reads every result eagerly and disposes it before returning —
+so the refusal carries no test. It exists for a plugin author holding a stream, which is a sequencing
+mistake whose alternative is a silent short read.
+
+### ⚠ Refused: named Arrow inputs
+
+`duckdb_arrow_scan` registers a CONNECTION-scoped view. On a fresh connection it dies with the call; on a
+pinned one it would outlive it and the next call using that name would collide. Refusing by name beats
+leaking a view into a connection the caller keeps using.
+
+### ⚠ The session is applied at OPEN, and that has a consequence worth knowing
+
+v83's optional `client_context` is read ONCE, when the connection is opened — because re-applying it per
+query would undo a `SET` the caller performed THROUGH the pin. It follows that **a pinned connection
+outliving its logical unit of work hands every later user the FIRST one's session**. MEASURED via a mutant
+that shared one connection process-wide: a render under `Asia/Kolkata` reported the zone the first render
+had seen. That is a wrong VALUE, not merely stale scratch state, and it is the sharpest reason the Fluid
+engine scopes its connection to ONE RENDER.
+
+### It does NOT join the caller's transaction
+
+Unchanged, in both directions: a pinned connection reads COMMITTED state, so the surrounding statement's
+uncommitted rows are invisible to it, and what it writes is invisible to the surrounding statement (whose
+snapshot predates the commit — fluid-templating.md §11.1b). What changed is only that the CALLER's own
+earlier statements are visible to its later ones.
+
+### The surface
+
+- C++: `host_query`'s new `connection` parameter (0 = fresh), `host_connection_open` /
+  `host_connection_close`; `MakeHostQueryStream` takes an optional `shared_ptr<HostConnection>`.
+- Bridge: `Host.OpenConnection(clientSession)` → `Host.HostConnection : IDisposable`
+  (`Query` / `ExecuteNonQuery` / `Dispose`), plus `Host.CanPinConnection`.
+- Plugin contract: `IHostQuery.OpenConnection(inheritSession)` → `IHostConnection : IDisposable`.
+  DEFAULT-implemented, so a published contract gained a member without breaking a plugin — the default is
+  for an IMPLEMENTER (a test double), never for an old host, which cannot reach managed code at all.
+  **⚠ There is deliberately NO capability probe** (user, 2026-09-03: *"we don't need any fallbacks with
+  CanPinConnection"*): a probe exists only so a caller can DEGRADE, and a degraded pinned connection means
+  statements quietly stop sharing — a different answer, not a slower one. Contrast `Host.CanQuery`, which
+  stays and has a dozen callers, because falling back to a provider's own reader is still CORRECT.
+- First consumer: the Fluid plugin's per-render session — see
+  [fluid-templating.md](fluid-templating.md) §12.
+
 ## Session state — the table function inherits, the C# service deliberately does NOT (2026-07-30)
 
 A fresh `ClientContext` starts at DuckDB's **defaults**, which is a second consequence of the above and was

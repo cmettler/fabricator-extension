@@ -336,11 +336,15 @@ public unsafe struct FabricatorHostServices
     // int32 fs_glob(void* opener, const char* pattern, char** out_json, char** err)
     public delegate* unmanaged[Cdecl]<nint, byte*, byte**, byte**, int> FsGlob;
     // int32 host_query(const char* sql, ArrowArrayStream* params, FabricatorHostInputs* inputs,
-    //                  ArrowArrayStream* out, void** out_interrupt, char** err) — run sql on a fresh host
+    //                  void* client_context, void* connection,
+    //                  ArrowArrayStream* out, void** out_interrupt, char** err) — run sql on a host
     // connection (binding a 1-row params batch positionally + registering named Arrow inputs as views first);
     // result as Arrow (the managed caller imports + releases the stream). out_interrupt (nullable) receives an
-    // opaque cancellation handle for the query's fresh ClientContext (v66). See docs/host-query.md.
-    public delegate* unmanaged[Cdecl]<byte*, CArrowArrayStream*, FabricatorHostInputs*, nint, CArrowArrayStream*, void**, byte**, int> HostQuery;
+    // opaque cancellation handle for the query's ClientContext (v66). `client_context` (v83, 0 = clean
+    // session) inherits the caller's TimeZone + search path; `connection` (v84, 0 = a FRESH connection per
+    // call) runs on a PINNED connection from HostConnectionOpen, so TEMP tables and session settings persist
+    // across calls. See docs/host-query.md.
+    public delegate* unmanaged[Cdecl]<byte*, CArrowArrayStream*, FabricatorHostInputs*, nint, nint, CArrowArrayStream*, void**, byte**, int> HostQuery;
 
     // ---- WRITE surface (Delta write-back foundation; see docs/delta-catalog.md) ----
     // int32 fs_open_write(void* opener, const char* path, int32 exclusive, void** out_file, char** err)
@@ -379,6 +383,14 @@ public unsafe struct FabricatorHostServices
     // http_timeout and the retry settings. Wrapped by DuckDbHttpHandler as a .NET HttpMessageHandler.
     // Additive (ABI v76). See docs/http-transport.md.
     public delegate* unmanaged[Cdecl]<nint, byte*, byte*, byte*, void*, long, byte**, void**, long*, byte**, int> HttpRequest;
+    // int32 host_connection_open(void* client_context, void** out_connection, char** err) — open a host
+    // connection that OUTLIVES a single host_query call, so several statements share one TEMPORARY catalog,
+    // one set of session settings and one transaction context. The v83 session is applied ONCE, here.
+    // Additive (ABI v84). See docs/host-query.md.
+    public delegate* unmanaged[Cdecl]<nint, nint*, byte**, int> HostConnectionOpen;
+    // void host_connection_close(void* connection) — release the handle. Result streams opened on it hold
+    // their own reference, so closing first is safe. Additive (ABI v84).
+    public delegate* unmanaged[Cdecl]<nint, void> HostConnectionClose;
 }
 
 /// <summary>Mirrors <c>FabricatorHostInputs</c> in abi.h — named Arrow streams handed to host_query as data-in

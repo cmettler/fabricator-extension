@@ -70,7 +70,7 @@ internal static class FluidHostQuery
         // a FILTER parse and arrive populated. That is why parameter binding is the filter form below and
         // not an overload of this one. If a future Fluid teaches the function grammar named arguments, this
         // is where they would be read.
-        return Run(caller, args.At(0).ToStringValue(ctx), null);
+        return Run(caller, args.At(0).ToStringValue(ctx), null, FluidRenderSession.For(ctx));
     }
 
     /// <summary>
@@ -85,10 +85,16 @@ internal static class FluidHostQuery
     internal static ValueTask<FluidValue> Filter(FluidValue input, FilterArguments args, TemplateContext ctx)
     {
         var caller = CallerOf(ctx);
-        return new(Run(caller, input.ToStringValue(ctx), BuildParameters(caller, FunctionName, args, ctx)));
+        return new(Run(caller, input.ToStringValue(ctx), BuildParameters(caller, FunctionName, args, ctx),
+                        FluidRenderSession.For(ctx)));
     }
 
-    private static FluidValue Run(string caller, string? sql, RecordBatch? parameters)
+    // ⚠ `session` is THIS RENDER's pinned connection (ABI v84) — see FluidRenderSession. Both the
+    // classifier and the statement itself go through it, so a template's exec() and query() share one
+    // DuckDB connection and therefore one TEMPORARY catalog. Null only when the host publishes no
+    // IHostQuery at all, which the guard below reports by name.
+    private static FluidValue Run(string caller, string? sql, RecordBatch? parameters,
+                                  FluidRenderSession? session)
     {
         // ⚠ MEASURED: json_serialize_sql('') reports NO error — an empty string parses to zero statements,
         // so the classifier below would wave it through. Refused here, where the cause can still be named.
@@ -97,14 +103,14 @@ internal static class FluidHostQuery
             throw new ArgumentException($"{caller}: {FunctionName}() was given an empty statement.");
         }
 
-        var host = FabricatorServices.Get<IHostQuery>()
+        var run = session
             ?? throw new InvalidOperationException(
                 $"{caller}: {FunctionName}() needs the IHostQuery service, which is not published here. "
                 + "It is available only from inside a fabricator function call.");
 
-        RefuseUnlessSelect(caller, sql, host);
+        RefuseUnlessSelect(caller, sql, run);
 
-        using var stream = host.Query(sql, parameters);
+        using var stream = run.Query(sql, parameters);
         var rows = new List<FluidValue>();
         while (true)
         {
@@ -294,9 +300,9 @@ internal static class FluidHostQuery
     /// is REFUSED, not waved through. An unenforceable check must fail closed.
     /// </para>
     /// </remarks>
-    private static void RefuseUnlessSelect(string caller, string sql, IHostQuery host)
+    private static void RefuseUnlessSelect(string caller, string sql, FluidRenderSession run)
     {
-        var (isSelect, msg) = Classify(caller, FunctionName, sql, host);
+        var (isSelect, msg) = Classify(caller, FunctionName, sql, run);
         if (isSelect)
         {
             return;
@@ -346,7 +352,13 @@ internal static class FluidHostQuery
     /// forms be classified at all.
     /// </para>
     /// </remarks>
-    internal static (bool IsSelect, string? Message) Classify(string caller, string fn, string sql, IHostQuery host)
+    // ⚠ Classified on the SAME pinned connection as the statement it is about (ABI v84), which is right
+    // on both counts: it is one connection per render instead of one per classification, and a template
+    // whose exec() created a TEMP table classifies its later query() against the connection that owns it.
+    // ⚠ It PARSES ONLY, so it cannot see a temp table either way — what matters is that it does not open
+    // a second connection to find that out.
+    internal static (bool IsSelect, string? Message) Classify(string caller, string fn, string sql,
+                                                             FluidRenderSession run)
     {
         const string classify =
             "SELECT j ->> 'error' AS err, j ->> 'error_message' AS msg "
@@ -366,7 +378,7 @@ internal static class FluidHostQuery
             var schema = new Schema(new[] { field }, null);
             var arg = new StringArray.Builder().Append(sql).Build();
             using var parameters = new RecordBatch(schema, new IArrowArray[] { arg }, 1);
-            using var stream = host.Query(classify, parameters);
+            using var stream = run.Query(classify, parameters);
             var batch = stream.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult();
             if (batch is null || batch.Length == 0)
             {

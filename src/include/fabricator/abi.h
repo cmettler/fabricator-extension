@@ -1100,8 +1100,13 @@ typedef struct FabricatorHostServices {
 	//
 	// ⚠ It is NOT general inheritance: only those settings are copied, and "copy the session" has no
 	// principled boundary. What is copied is what has been needed; adding one is a deliberate act.
+	// ⚠⚠ `connection` (ABI v84) is OPTIONAL: 0 = a FRESH connection per call, which is what every caller
+	// got before v84; non-zero = a PINNED connection from host_connection_open, so several calls share one
+	// DuckDB Connection and therefore one TEMPORARY catalog, one set of session settings and one
+	// transaction context. That is what lets a caller CREATE TEMP TABLE in one call and read it in the
+	// next — the read-your-writes a fresh connection structurally cannot give (see host_connection_open).
 	int32_t (*host_query)(const char *sql, struct ArrowArrayStream *params, struct FabricatorHostInputs *inputs,
-	                      FabricatorHandle client_context,
+	                      FabricatorHandle client_context, FabricatorHandle connection,
 	                      struct ArrowArrayStream *out, void **out_interrupt, char **err);
 
 	// -------------------------------------------------------------------------
@@ -1187,13 +1192,54 @@ typedef struct FabricatorHostServices {
 	int32_t (*http_request)(FabricatorHandle opener, const char *method, const char *url, const char *headers_json,
 	                        const void *body, int64_t body_length, char **out_response_json, void **out_body,
 	                        int64_t *out_body_length, char **err);
+	// -------------------------------------------------------------------------
+	// PINNED host connection (ABI v84) — several host_query calls on ONE DuckDB Connection.
+	// -------------------------------------------------------------------------
+	// Open a host connection that OUTLIVES a single host_query call and hand back an owned handle. Pass it
+	// as host_query's `connection` and the statements share one Connection, hence one TEMPORARY catalog,
+	// one set of session settings and one transaction context.
+	//
+	// ⚠⚠ WHY IT EXISTS: a fresh-per-call connection cannot see what an earlier call wrote in the same
+	// logical unit of work. `exec('CREATE TEMP TABLE t …')` then `query('SELECT … FROM t')` is the shape,
+	// and on separate connections the second call fails — a TEMP table is scoped to the ClientContext that
+	// created it (MEASURED: invisible from any other connection, and dropped by that connection's own
+	// ROLLBACK). A pinned connection makes such a pair a working scratch space that needs no name in the
+	// shared catalog and no cleanup, because closing the handle destroys the temporary catalog with it.
+	//
+	// `client_context` is the v83 optional session source, applied ONCE at open: 0 = a clean session,
+	// non-zero = the calling operator's ClientContext, whose TimeZone and catalog SEARCH PATH are copied.
+	// ⚠ Applied at OPEN, not per query, which is the point of pinning — a `SET` performed through the
+	// pinned connection then STICKS for its life (measured), so the caller can configure its own session.
+	//
+	// ⚠⚠ ONE STREAMING RESULT AT A TIME, AND THE HOST ENFORCES IT. DuckDB's every query path calls
+	// ClientContext::InitialCleanup, which CLOSES the connection's active streaming result — and MEASURED,
+	// it does so SILENTLY: the abandoned stream reports end-of-stream, so the first query's remaining rows
+	// are LOST with no error anywhere. A second host_query on a pinned connection whose previous result
+	// stream is still open is therefore REFUSED with a message naming the cause, rather than allowed to
+	// truncate it. Release the stream (or drain it) before the next call. A FRESH-connection call is
+	// unaffected — it has a connection of its own.
+	//
+	// ⚠ NOT THREAD-SAFE, like any DuckDB Connection: one call at a time per handle. A caller that renders
+	// on several threads opens one connection per thread (which is what the Fluid engine does — one per
+	// render, created lazily on the first query/exec).
+	//
+	// ⚠ NAMED ARROW INPUTS ARE REFUSED on a pinned connection. duckdb_arrow_scan registers a
+	// CONNECTION-scoped view, which on a pinned connection would outlive the call that created it and
+	// collide with the next call using the same name. Refusing by name beats leaking a view.
+	int32_t (*host_connection_open)(FabricatorHandle client_context, FabricatorHandle *out_connection, char **err);
+	// Close a handle from host_connection_open. Safe with 0, and idempotent from the caller's point of view
+	// only in the sense that the handle must not be reused afterwards. ⚠ Result streams opened on this
+	// connection keep the underlying Connection ALIVE (they hold a shared reference), so closing the handle
+	// while a stream is outstanding is safe rather than a use-after-free — the Connection dies with the
+	// last of them. The TEMPORARY catalog goes with it.
+	void (*host_connection_close)(FabricatorHandle connection);
 } FabricatorHostServices;
 
 // Max serialized size of a spillable aggregate's per-group state (the inline, pointer-free
 // state blob is this many bytes + a 4-byte length prefix). Serialize() must fit within it.
 #define FABRICATOR_AGG_SPILL_CAP 1024
 
-#define FABRICATOR_ABI_VERSION 83
+#define FABRICATOR_ABI_VERSION 84
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(FabricatorVTable) as seen

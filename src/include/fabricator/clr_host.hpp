@@ -49,9 +49,19 @@ void SetHostServices(const FabricatorHostServices &services);
 // order-independent). See FabricatorHostServices::host_query in abi.h.
 using HostQueryFn = int32_t (*)(const char *sql, struct ArrowArrayStream *params,
                                 struct FabricatorHostInputs *inputs, FabricatorHandle client_context,
+                                FabricatorHandle connection,
                                 struct ArrowArrayStream *out, void **out_interrupt, char **err);
 using HostQueryInterruptFn = void (*)(void *interrupt_handle);
 void SetHostQueryService(HostQueryFn fn, HostQueryInterruptFn interrupt_fn, HostQueryInterruptFn free_fn);
+
+// Register the pinned-connection pair (ABI v84): host_connection_open hands out a connection that outlives
+// a single host_query call, so TEMP tables and session settings persist across calls made with it. Patched
+// onto the shared host-services block at load, like SetHostQueryService. See
+// FabricatorHostServices::host_connection_open in abi.h + docs/host-query.md.
+using HostConnectionOpenFn = int32_t (*)(FabricatorHandle client_context, FabricatorHandle *out_connection,
+                                         char **err);
+using HostConnectionCloseFn = void (*)(FabricatorHandle connection);
+void SetHostConnectionService(HostConnectionOpenFn open_fn, HostConnectionCloseFn close_fn);
 
 // Register the host_log callback (DuckDB internal-logging forward). Patched onto the shared host-services block
 // at load, like SetHostQueryService. See FabricatorHostServices::host_log in abi.h.

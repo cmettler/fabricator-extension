@@ -169,4 +169,30 @@ internal sealed class HostQueryService : IHostQuery
         Host.Query(sql, parameters, null, clientSession: inheritSession ? AmbientOpener.Current : 0);
 
     public long ExecuteNonQuery(string sql) => Host.ExecuteNonQuery(sql);
+
+
+    // ⚠ The session is read HERE, at open, and NOT per query — which is what the ABI does too. The ambient
+    // ClientContext is only valid for the duration of THIS crossing, so a pinned connection that tried to
+    // re-read it per query would either dereference a dangling pointer or silently inherit whichever
+    // operation happened to be running. Capturing once, on the caller's live context, is the same rule the
+    // table function's CaptureSession follows.
+    public IHostConnection OpenConnection(bool inheritSession = true) =>
+        new PinnedHostConnection(Host.OpenConnection(inheritSession ? AmbientOpener.Current : 0));
+}
+
+/// <summary>Adapts <see cref="Host.HostConnection"/> to the plugin-facing <see cref="IHostConnection"/>.</summary>
+internal sealed class PinnedHostConnection : IHostConnection
+{
+    private readonly Host.HostConnection _inner;
+
+    internal PinnedHostConnection(Host.HostConnection inner)
+    {
+        _inner = inner;
+    }
+
+    public IArrowArrayStream Query(string sql, RecordBatch? parameters = null) => _inner.Query(sql, parameters);
+
+    public long ExecuteNonQuery(string sql) => _inner.ExecuteNonQuery(sql);
+
+    public void Dispose() => _inner.Dispose();
 }

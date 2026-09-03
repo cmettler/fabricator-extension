@@ -1492,15 +1492,17 @@ SELECT fabricator_render('{{ exec("CREATE TABLE m AS SELECT 1 AS c; INSERT INTO 
 > -- 42    the write was real
 > ```
 >
-> `exec()` runs on its own connection, and the outer statement's snapshot predates the commit — the same
-> one-connection rule that makes `query()` read committed data, in the other direction. A template therefore
-> **cannot create a table the same statement selects from**: the `CREATE` succeeds and the statement still
-> reports `Table with name t does not exist!` (helpfully adding *"Did you mean memory.t"* — it exists, just
-> not for that statement).
+> `exec()` runs on the RENDER's own connection, and the outer statement's snapshot predates the commit —
+> the same one-connection rule that makes `query()` read committed data, in the other direction. A template
+> therefore **cannot create a table the same statement selects from**: the `CREATE` succeeds and the
+> statement still reports `Table with name t does not exist!` (helpfully adding *"Did you mean memory.t"* —
+> it exists, just not for that statement).
 >
-> **Use two statements**: `exec()` in one, the read in the next. So `exec()` inside `fluid_query` is for side
-> effects the statement does not itself read — an audit row, a log line, staging for later — not for
-> preparing data the generated SQL consumes.
+> **Use two statements**: `exec()` in one, the read in the next. So `exec()` inside `fluid_query` is for
+> side effects the *generated SQL* does not itself read — an audit row, a log line, staging for later.
+>
+> ⚠ **But the template's OWN `query()` does see it** — see the next section. What cannot see it is the SQL
+> you generate, because that runs on the outer statement's connection.
 >
 > ⚠ Write it as `{% assign _ = exec(…) %}`, not `{{ exec(…) }}` — the latter interpolates the row count into
 > your SQL (`1SELECT c FROM t`, which is a parser error).
@@ -1517,6 +1519,99 @@ SELECT fabricator_render('{{ exec("CREATE TABLE m AS SELECT 1 AS c; INSERT INTO 
 > ⚠ **`fabricator_render` is a scalar, so `exec()` runs once PER ROW.** Rendering a writing template over
 > three rows performs the write three times — measured. That is the multiplier to watch on this surface, as
 > bind repetition is on the other one.
+
+**For a real statement, use the `{% exec %}` BLOCK instead.** The body is rendered to a separate buffer,
+executed as SQL, and **nothing is written to the output** — so the statement is ordinary template text:
+multi-line, with `{% for %}` and `{% if %}` inside it, and no quote-escaping.
+
+```sql
+SELECT fabricator_render('{% exec %}
+INSERT INTO audit VALUES
+{% for r in rows %}({{ r.id }}, {{ r.name | sql }}){% unless forloop.last %},{% endunless %}
+{% endfor %}
+{% endexec %}done', {'rows': [{'id': 1, 'name': 'a'}, {'id': 2, 'name': 'O''Brien'}]});
+-- done          (the block renders nothing; both rows land, with the quote escaped by | sql)
+```
+
+Because the block is a *statement* rather than an argument, it is naturally conditional — an unreached
+`{% exec %}` runs nothing:
+
+```sql
+SELECT fabricator_render('{% if go %}{% exec %}DELETE FROM staging{% endexec %}cleared{% else %}skipped{% endif %}', {'go': false});
+-- skipped       (and nothing was deleted)
+```
+
+> ⚠ **Interpolation inside the block is RAW**, exactly as in `fluid_query` and for the same reason — a
+> template must be able to emit object names and whole fragments. Use `{{ v | sql }}` for a value and
+> `{{ n | sql_ident }}` for an identifier. Splicing a raw string containing a quote gives a parser error
+> rather than a silent injection, but that is not a substitute.
+>
+> ⚠ **The block renders nothing, so it does not give you the affected-row count.** Use the `exec(...)`
+> function when you want the number.
+>
+> ⚠ It obeys the same rules as the function: it refuses a `SELECT`, it runs on the render's own connection
+> (so a `{% exec %}CREATE TEMP TABLE …{% endexec %}` is readable by a later `query()` in the same
+> template), and inside `fluid_query` it still runs at **bind** time, with the multiplication described
+> above. A `{% break %}` inside the block leaves a half-rendered statement, which is discarded rather than
+> executed.
+
+
+**`exec()` and `query()` in one template share ONE connection — so a template can stage its own data.**
+Everything a single render runs goes through one pinned DuckDB connection, which means the template's own
+later `query()` sees what its earlier `exec()` created. A **temporary** table is the natural scratch space:
+nothing outside the render can see it, and it disappears when the render ends — no name in your catalog,
+nothing to clean up.
+
+```sql
+SELECT fabricator_render(
+  '{% assign _    = exec("CREATE TEMP TABLE scratch AS SELECT 7 AS v") %}'
+  '{% assign rows = query("SELECT v FROM scratch") %}'
+  'v={{ rows[0].v }}', NULL);
+-- v=7
+```
+
+This is what makes multi-step generation work on the `fluid_query` surface: stage, read the result back,
+and interpolate it into the SQL you generate.
+
+```sql
+SELECT * FROM fluid_query(
+  '{% assign _    = exec("CREATE TEMP TABLE s AS SELECT 3 AS a UNION ALL SELECT 4") %}'
+  '{% assign rows = query("SELECT sum(a) AS t FROM s") %}'
+  'SELECT {{ rows[0].t }} AS staged');
+-- staged = 7
+```
+
+> ⚠ **The scope is ONE render.** For `fluid_query` that is one bind; for `fabricator_render`, which is a
+> scalar, it is **one row** — so three rows are three connections, and a temp table made by one row is
+> invisible to the next. That is deliberate: it is what keeps a per-row scalar from accumulating state, and
+> what makes rendering on several threads safe.
+>
+> ⚠ **The staged table is still invisible to the SQL you generate.** The generated statement is executed by
+> the *outer* query, on its own connection — so the distinction is: your template may **read** staged data
+> and inline the values (above), but the generated SQL cannot `SELECT FROM` the staged table. Stage for the
+> template, not for the statement.
+>
+> ⚠ Nothing is opened unless the template actually calls `query()` or `exec()`, so a template that runs no
+> SQL costs nothing.
+
+> ⚠⚠ **And staging into a *temporary* table is what makes this safe on the `fluid_query` surface.** A
+> writing template behind a view writes on *every use* (the table above) — but each bind gets its own
+> connection and its own temporary catalog, so the same `CREATE TEMP TABLE` simply runs again. Measured, a
+> view over such a template used twice:
+>
+> ```sql
+> CREATE VIEW v AS SELECT * FROM fluid_query(
+>   '{% assign _ = exec("CREATE TEMP TABLE st AS SELECT 5 AS a") %}'
+>   '{% assign r = query("SELECT a FROM st") %}'
+>   'SELECT {{ r[0].a }} AS staged');
+> SELECT staged FROM v;   -- 5
+> SELECT staged FROM v;   -- 5   (a REAL table fails here: Table with name "realst" already exists!)
+> ```
+>
+> So bind repetition, which is a footgun for a template that writes to your catalog, is a non-issue for one
+> that stages into a temp table.
+
+
 
 `exec()` gives a template no authority you did not already have — anyone who can call `fabricator_render`
 can call [`fabricator_exec`](#fabricator_execcontext-sql---bigint) — and it reads and writes on its own connection,

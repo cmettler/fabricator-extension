@@ -353,6 +353,54 @@ internal static unsafe class HostFs
     public static bool CanQuery => _set && _h.HostQuery != null;
 
     /// <summary>
+    /// Opens a host connection that OUTLIVES a single <see cref="Query"/> call (ABI v84). Pass the returned
+    /// handle as <c>connection</c> and the statements share one DuckDB Connection — one TEMPORARY catalog,
+    /// one set of session settings, one transaction context. Close it with <see cref="CloseConnection"/>.
+    /// </summary>
+    /// <remarks>
+    /// ⚠ <paramref name="clientSession"/> is applied ONCE, here — not per query — so a <c>SET</c> performed
+    /// through the pin sticks for the connection's life.
+    /// </remarks>
+    public static nint OpenConnection(nint clientSession = 0)
+    {
+        // ⚠ A NULL GUARD, NOT A CAPABILITY PROBE — nothing branches on it to choose behaviour, and there
+        // is deliberately no public property asking the question (user, 2026-09-03: "we don't need any
+        // fallbacks with CanPinConnection"). It cannot fire for our own host: the C++ side refuses a bridge
+        // whose declared ABI version differs, so a running bridge implies a host of exactly its version,
+        // and RegisterHostQuery patches this pair unconditionally at extension load. It exists so a host
+        // that passed a zeroed services block gets a sentence rather than a null-pointer call.
+        if (!_set || _h.HostConnectionOpen == null)
+        {
+            throw new InvalidOperationException(
+                "host_connection_open is unavailable (the host did not register it)");
+        }
+        nint handle = 0;
+        byte* err = null;
+        int rc = _h.HostConnectionOpen(clientSession, &handle, &err);
+        if (rc != 0)
+        {
+            throw HostError("host_connection_open", err);
+        }
+        return handle;
+    }
+
+    /// <summary>Closes a handle from <see cref="OpenConnection"/>. A no-op for 0.</summary>
+    /// <remarks>
+    /// ⚠ Safe with result streams still outstanding: each holds its own reference, so the Connection (and
+    /// its temporary catalog) dies with the last of them rather than under a live stream.
+    /// </remarks>
+    public static void CloseConnection(nint connection)
+    {
+        // ⚠ Only the handle is tested: a non-zero handle can only exist if OpenConnection succeeded, which
+        // required the pair to be present. Re-asking would be a probe pretending to be a guard.
+        if (connection == 0)
+        {
+            return;
+        }
+        _h.HostConnectionClose(connection);
+    }
+
+    /// <summary>
     /// Runs <paramref name="sql"/> on a FRESH host DuckDB connection (its own transaction) and returns the
     /// result as an Arrow stream the caller owns (dispose to release the connection + result). Lets a managed
     /// component reuse the host engine — functions, readers, the catalog — over Arrow. CANCELLABLE (v66):
@@ -365,7 +413,8 @@ internal static unsafe class HostFs
                                           RecordBatch? parameters = null,
                                           IReadOnlyList<(string Name, IArrowArrayStream Stream)>? inputs = null,
                                           CancellationToken ct = default,
-                                          nint clientSession = 0)
+                                          nint clientSession = 0,
+                                          nint connection = 0)
     {
         if (!CanQuery)
         {
@@ -410,7 +459,7 @@ internal static unsafe class HostFs
             // Request the interrupt handle only when the v66 pair is available (defensive vs an older host).
             bool cancellable = _h.HostQueryInterrupt != null && _h.HostQueryInterruptFree != null;
             void* interruptHandle = null;
-            int rc = _h.HostQuery((byte*)sqlPtr, paramStream, hiPtr, clientSession, cstream,
+            int rc = _h.HostQuery((byte*)sqlPtr, paramStream, hiPtr, clientSession, connection, cstream,
                                   cancellable ? &interruptHandle : null, &err);
             if (rc != 0)
             {

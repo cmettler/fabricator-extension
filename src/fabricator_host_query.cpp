@@ -76,7 +76,13 @@ struct HostQueryStream {
 	// FIRST member on purpose: members are destroyed in reverse declaration order, so the adopted input
 	// streams outlive the result/connection that scans them.
 	unique_ptr<OwnedArrowInputs> inputs;
-	unique_ptr<Connection> conn;
+	//! SHARED, not owned outright (ABI v84): with a PINNED connection several streams and the caller's own
+	//! handle reference one Connection, so the last of them destroys it. A fresh-connection call still ends
+	//! up with a refcount of one, i.e. the previous behaviour with no extra lifetime.
+	shared_ptr<Connection> conn;
+	//! Non-null when this stream runs on a PINNED connection: it keeps the pin alive (so the caller may
+	//! close the handle first) and its `open_streams` slot is released in HostQueryRelease.
+	shared_ptr<HostConnection> pin;
 	unique_ptr<PreparedStatement> prepared; // kept alive for the param path (the streaming result references it)
 	unique_ptr<QueryResult> result;         // a StreamQueryResult — fetched lazily (bounded memory)
 	vector<LogicalType> types;
@@ -278,7 +284,17 @@ const char *HostQueryGetLastError(ArrowArrayStream *stream) {
 }
 
 void HostQueryRelease(ArrowArrayStream *stream) {
-	delete static_cast<HostQueryStream *>(stream->private_data);
+	auto *st = static_cast<HostQueryStream *>(stream->private_data);
+	// ⚠ ORDER IS LOAD-BEARING on a PINNED connection: the whole point of the open_streams guard is that no
+	// query runs while a streaming result of ours is alive, so the result must be GONE before the slot is
+	// released. Member destruction would do it in the right order too, but only by accident of declaration
+	// order — doing it explicitly is what keeps that true after the next edit to the struct.
+	if (st && st->pin) {
+		st->result.reset();
+		st->prepared.reset();
+		st->pin->open_streams.fetch_sub(1);
+	}
+	delete st;
 	stream->release = nullptr;
 }
 
@@ -557,14 +573,41 @@ unique_ptr<FunctionData> HostExecBind(ClientContext &context, TableFunctionBindI
 
 void MakeHostQueryStream(DatabaseInstance &db, const string &sql, ArrowArrayStream *params,
                          const vector<HostQueryInput> &inputs, ArrowArrayStream &out,
-                         shared_ptr<ClientContext> *out_context, const HostQuerySession *session) {
-	auto conn = make_uniq<Connection>(db); // FRESH connection: own context/transaction (see header)
+                         shared_ptr<ClientContext> *out_context, const HostQuerySession *session,
+                         shared_ptr<HostConnection> pinned) {
+	// ⚠ A PINNED connection is REFUSED a named input, because duckdb_arrow_scan registers a
+	// CONNECTION-scoped view: on a fresh connection it dies with the call, on a pinned one it would outlive
+	// it and the next call registering the same name would collide. Refusing by name beats leaking a view
+	// into a connection the caller keeps using. Checked BEFORE anything is adopted, so nothing leaks.
+	if (pinned && !inputs.empty()) {
+		throw IOException("fabricator host_query: named Arrow inputs are not supported on a pinned host "
+		                  "connection (an arrow_scan view is connection-scoped, so it would outlive this "
+		                  "call). Use a fresh-connection query for inputs.");
+	}
+	// ⚠⚠ ONE STREAMING RESULT AT A TIME. DuckDB's every query path calls InitialCleanup, which closes the
+	// connection's active streaming result SILENTLY — the abandoned stream reports end-of-stream, so the
+	// earlier query's remaining rows are LOST with no error. Refusing is the only honest answer; a fresh
+	// connection is unaffected because it has one of its own. Not a race guard (a Connection is
+	// single-threaded by contract) — it catches a caller HOLDING a stream, which is a sequencing mistake.
+	if (pinned && pinned->open_streams.load() > 0) {
+		throw IOException("fabricator host_query: this pinned host connection still has an open result "
+		                  "stream; release (or fully read) it before running another statement on the same "
+		                  "connection. DuckDB closes a connection's active streaming result when the next "
+		                  "statement starts, which would silently truncate it.");
+	}
+	// FRESH connection (own context/transaction, see header) unless the caller pinned one (ABI v84), in
+	// which case its TEMP catalog + session settings are exactly what it is here for.
+	shared_ptr<Connection> conn = pinned ? pinned->conn : shared_ptr<Connection>(new Connection(db));
 	if (out_context) {
 		*out_context = conn->context; // for out-of-band interruption (host_query_interrupt, ABI v66)
 	}
 	// Adopt the caller's session state, when one was supplied (the table function supplies it; the C# host
 	// service deliberately does not — provider-generated SQL must not depend on what the user last USEd).
-	ApplyHostQuerySession(*conn, session);
+	// ⚠ Skipped for a pinned connection: it was applied ONCE at open, and re-applying per query would undo
+	// a `SET` the caller performed THROUGH the pin, which is one of the things pinning is for.
+	if (!pinned) {
+		ApplyHostQuerySession(*conn, session);
+	}
 	// Register each named Arrow input as a connection-scoped view (data-in). duckdb_arrow_scan reinterprets
 	// the opaque handle back to ArrowArrayStream* and creates a view over it. We ADOPT each stream first (see
 	// OwnedArrowInputs): the view keeps the RAW POINTER and the query below is LAZY, so the caller's own
@@ -639,6 +682,7 @@ void MakeHostQueryStream(DatabaseInstance &db, const string &sql, ArrowArrayStre
 	}
 	auto *st = new HostQueryStream();
 	st->inputs = std::move(owned_inputs); // the views reference these; they outlive `result` (see the struct)
+	st->pin = std::move(pinned); // null unless PINNED; keeps the pin alive for this stream's life
 	st->conn = std::move(conn);
 	st->prepared = std::move(prepared);
 	st->types = result->types;
@@ -649,6 +693,15 @@ void MakeHostQueryStream(DatabaseInstance &db, const string &sql, ArrowArrayStre
 	st->stream.get_last_error = HostQueryGetLastError;
 	st->stream.release = HostQueryRelease;
 	st->stream.private_data = st;
+	if (st->pin) {
+		// ⚠ TAKEN LAST, and both halves of that matter. Only now has the statement SUCCEEDED — counting
+		// earlier would wedge the connection on the first failed query, refusing every later one. And
+		// only now is there nothing left that can throw: an allocation failing between the increment and
+		// the handover below would leave a slot taken by a stream the caller never receives, i.e. a
+		// permanently unusable connection, where leaking `st` (which the raw `new` above already risks)
+		// costs nothing extra.
+		st->pin->open_streams.fetch_add(1);
+	}
 	out = st->stream; // copy the stream struct; ownership of `st` rides private_data (freed in HostQueryRelease)
 }
 
@@ -671,8 +724,8 @@ static char *DupErr(const string &msg) {
 // in-flight Fetch out-of-band (the fresh connection is invisible to the USER query's Ctrl+C). See abi.h /
 // docs/host-query.md / docs/cancellation.md.
 int32_t HostQueryService(const char *sql, ArrowArrayStream *params, FabricatorHostInputs *inputs,
-                         FabricatorHandle client_context, ArrowArrayStream *out, void **out_interrupt,
-                         char **err) {
+                         FabricatorHandle client_context, FabricatorHandle connection, ArrowArrayStream *out,
+                         void **out_interrupt, char **err) {
 	try {
 		if (!g_host_db) {
 			throw IOException("fabricator host_query: host database not available");
@@ -694,9 +747,15 @@ int32_t HostQueryService(const char *sql, ArrowArrayStream *params, FabricatorHo
 			session = CaptureSession(*reinterpret_cast<ClientContext *>(client_context));
 			session_ptr = &session;
 		}
+		// The PINNED connection, when the caller opened one (ABI v84). A shared_ptr COPY, so the
+		// statement's result stream keeps it alive even if the managed side closes the handle first.
+		shared_ptr<HostConnection> pinned;
+		if (connection) {
+			pinned = *reinterpret_cast<shared_ptr<HostConnection> *>(connection);
+		}
 		shared_ptr<ClientContext> ctx;
 		MakeHostQueryStream(*g_host_db, sql ? string(sql) : string(), params, in, *out,
-		                    out_interrupt ? &ctx : nullptr, session_ptr);
+		                    out_interrupt ? &ctx : nullptr, session_ptr, std::move(pinned));
 		if (out_interrupt) {
 			// The handle owns a shared_ptr copy: an interrupt AFTER the result stream is released still
 			// dereferences a live (idle) context — a harmless no-op instead of a use-after-free.
@@ -709,6 +768,47 @@ int32_t HostQueryService(const char *sql, ArrowArrayStream *params, FabricatorHo
 		}
 		return 1;
 	}
+}
+
+// host_connection_open — hand C# a connection that OUTLIVES a single host_query call (ABI v84), so a
+// caller can CREATE TEMP TABLE in one statement and read it in the next. The handle owns a
+// shared_ptr<HostConnection>; result streams opened on it hold their own copies, so closing the handle
+// while a stream is outstanding destroys the Connection only once the last of them is released.
+//
+// ⚠ The caller's session is applied HERE, once, rather than per query — a `SET` the caller then performs
+// THROUGH the pin sticks for the connection's life, which is one of the reasons to pin at all.
+int32_t HostConnectionOpenService(FabricatorHandle client_context, FabricatorHandle *out_connection, char **err) {
+	try {
+		if (!g_host_db) {
+			throw IOException("fabricator host_connection_open: host database not available");
+		}
+		if (!out_connection) {
+			throw IOException("fabricator host_connection_open: out_connection is null");
+		}
+		auto pin = make_shared_ptr<HostConnection>();
+		pin->conn = shared_ptr<Connection>(new Connection(*g_host_db));
+		if (client_context) {
+			auto session = CaptureSession(*reinterpret_cast<ClientContext *>(client_context));
+			ApplyHostQuerySession(*pin->conn, &session);
+		}
+		*out_connection = reinterpret_cast<FabricatorHandle>(new shared_ptr<HostConnection>(std::move(pin)));
+		return FABRICATOR_OK;
+	} catch (std::exception &e) {
+		if (err) {
+			*err = DupErr(e.what());
+		}
+		return 1;
+	}
+}
+
+// host_connection_close — release the caller's reference. The Connection (and with it the TEMPORARY catalog)
+// dies here unless a result stream opened on it is still alive, which is exactly why the handle owns a
+// shared_ptr rather than the object.
+void HostConnectionCloseService(FabricatorHandle connection) {
+	if (!connection) {
+		return;
+	}
+	delete reinterpret_cast<shared_ptr<HostConnection> *>(connection);
 }
 
 // host_query_interrupt — trip the fresh context's interrupted flag (thread-safe atomic); an in-flight
@@ -804,6 +904,8 @@ void RegisterHostQuery(ExtensionLoader &loader) {
 	g_host_db = &loader.GetDatabaseInstance();
 	// Make host_query (+ its v66 interrupt pair) callable from C# (patched onto the host-services block).
 	fabricator::SetHostQueryService(HostQueryService, HostQueryInterruptService, HostQueryInterruptFreeService);
+	// The v84 pinned-connection pair: several host_query calls on ONE connection (TEMP tables, settings).
+	fabricator::SetHostConnectionService(HostConnectionOpenService, HostConnectionCloseService);
 	fabricator::SetHostLog(HostLogService);            // forward ILogger events into DuckDB's internal logging
 	DBConfig::GetConfig(loader.GetDatabaseInstance()).replacement_scans.emplace_back(NamedSourceReplacement);
 	TableFunction fn("fabricator_host_query", {LogicalType::VARCHAR}, fabricator::ArrowStreamScan, HostQueryBind,

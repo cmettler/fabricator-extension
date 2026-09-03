@@ -69,7 +69,7 @@ internal static class FluidHostExec
         }
         // ⚠ Named arguments cannot reach here — Fluid's grammar puts them on FILTERS only (measured; see
         // FluidHostQuery.Execute). The parameterised form is the filter below.
-        return Run(caller, args.At(0).ToStringValue(ctx), null, ctx);
+        return Run(caller, args.At(0).ToStringValue(ctx), null, FluidRenderSession.For(ctx));
     }
 
     /// <summary>
@@ -80,10 +80,15 @@ internal static class FluidHostExec
     {
         var caller = CallerOf(ctx);
         return new(Run(caller, input.ToStringValue(ctx),
-                       FluidHostQuery.BuildParameters(caller, FunctionName, args, ctx), ctx));
+                       FluidHostQuery.BuildParameters(caller, FunctionName, args, ctx),
+                       FluidRenderSession.For(ctx)));
     }
 
-    private static FluidValue Run(string caller, string? sql, RecordBatch? parameters, TemplateContext ctx)
+    // ⚠ `session` is THIS RENDER's pinned connection (ABI v84), the same one query() uses — which is the
+    // whole point: a TEMP table created here is readable by a query() later in the same template. It
+    // REPLACED an unused TemplateContext parameter, so no call site gained an argument.
+    private static FluidValue Run(string caller, string? sql, RecordBatch? parameters,
+                                  FluidRenderSession? session)
     {
         // ⚠ MEASURED for query() and true here for the same reason: an empty string reports NO error from
         // the classifier (it parses to zero statements), so the guard must come BEFORE it.
@@ -92,12 +97,12 @@ internal static class FluidHostExec
             throw new ArgumentException($"{caller}: {FunctionName}() was given an empty statement.");
         }
 
-        var host = FabricatorServices.Get<IHostQuery>()
+        var run = session
             ?? throw new InvalidOperationException(
                 $"{caller}: {FunctionName}() needs the IHostQuery service, which is not published here. "
                 + "It is available only from inside a fabricator function call.");
 
-        RefuseIfSelect(caller, sql, host);
+        RefuseIfSelect(caller, sql, run);
 
         // ⚠⚠ TWO PATHS, and the split is not arbitrary. Without parameters this goes through
         // IHostQuery.ExecuteNonQuery — the member built for exactly this and, until now, called by nothing
@@ -108,13 +113,13 @@ internal static class FluidHostExec
         long affected;
         if (parameters is null)
         {
-            affected = host.ExecuteNonQuery(sql);
+            affected = run.ExecuteNonQuery(sql);
         }
         else
         {
             using (parameters)
             {
-                using var stream = host.Query(sql, parameters);
+                using var stream = run.Query(sql, parameters);
                 affected = CountOf(stream);
             }
         }
@@ -160,9 +165,44 @@ internal static class FluidHostExec
     /// what the no-parameter path buys over the parameterised one.
     /// </para>
     /// </remarks>
-    private static void RefuseIfSelect(string caller, string sql, IHostQuery host)
+    /// <summary>The Liquid tag name of the BLOCK form: <c>{% exec %}…{% endexec %}</c>.</summary>
+    internal const string BlockName = "exec";
+
+    /// <summary>
+    /// The BLOCK form's body, already rendered to text: classify it and run it, emitting NOTHING.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// ⚠ It runs the SAME classifier and the SAME connection as the function form — one mechanism, so the
+    /// two spellings cannot drift on what counts as a write or on which connection they use. What differs
+    /// is only where the SQL comes from (a rendered body rather than an argument) and that the count is
+    /// DISCARDED, because a block renders nothing. Use the function form when you want the number.
+    /// </para>
+    /// </remarks>
+    internal static void ExecuteCaptured(TemplateContext ctx, string sql)
     {
-        var (isSelect, msg) = FluidHostQuery.Classify(caller, FunctionName, sql, host);
+        var caller = CallerOf(ctx);
+        // ⚠ A whitespace-only body is refused BEFORE the classifier, for the reason the function form
+        // documents: json_serialize_sql('') reports NO error (it parses to zero statements), so the
+        // classifier alone would wave it through and we would "execute" nothing while reporting success.
+        if (string.IsNullOrWhiteSpace(sql))
+        {
+            throw new ArgumentException(
+                $"{caller}: {{% {BlockName} %}} block is empty — it rendered no SQL.");
+        }
+
+        var run = FluidRenderSession.For(ctx)
+            ?? throw new InvalidOperationException(
+                $"{caller}: {{% {BlockName} %}} needs the IHostQuery service, which is not published here. "
+                + "It is available only from inside a fabricator function call.");
+
+        RefuseIfSelect(caller, sql, run);
+        run.ExecuteNonQuery(sql); // the count is deliberately discarded: a block renders nothing
+    }
+
+    private static void RefuseIfSelect(string caller, string sql, FluidRenderSession run)
+    {
+        var (isSelect, msg) = FluidHostQuery.Classify(caller, FunctionName, sql, run);
         if (!isSelect)
         {
             // ⚠ A SYNTAX ERROR also lands here and is surfaced rather than run. `msg` distinguishes the two

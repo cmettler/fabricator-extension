@@ -114,9 +114,119 @@ public static class Host
     /// </para>
     /// <para>For several statements the count is the LAST one's (<c>SendQuery</c> returns the last result).</para>
     /// </remarks>
+
+    /// <summary>
+    /// Opens a host connection that OUTLIVES a single call, so several statements share one DuckDB
+    /// Connection — and therefore one TEMPORARY catalog, one set of session settings and one transaction
+    /// context (ABI v84). Dispose it when the unit of work ends.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// ⚠⚠ <b>What it is FOR: read-your-writes inside one logical unit of work.</b> Every
+    /// <see cref="Query"/> overload opens its own connection, so a statement cannot see what an earlier one
+    /// created. On a pinned connection <c>CREATE TEMP TABLE t …</c> followed by <c>SELECT … FROM t</c>
+    /// works, which is the shape a template or a multi-step generator wants: a scratch space needing no
+    /// name in the shared catalog and no cleanup, because disposing the connection destroys its temporary
+    /// catalog with it.
+    /// </para>
+    /// <para>
+    /// ⚠⚠ <b>ONE RESULT STREAM AT A TIME, and the host REFUSES a second query rather than truncating the
+    /// first.</b> DuckDB closes a connection's active streaming result when the next statement starts on
+    /// it, and MEASURED it does so SILENTLY — the abandoned stream reports end-of-stream, so the first
+    /// query's remaining rows would be LOST with no error anywhere. Read (or dispose) each stream before
+    /// the next call on the same connection.
+    /// </para>
+    /// <para>
+    /// ⚠ <b>NOT thread-safe</b>, like any DuckDB connection: one call at a time. A caller working on
+    /// several threads opens one connection per thread.
+    /// </para>
+    /// <para>
+    /// ⚠ <paramref name="clientSession"/> is applied ONCE at open rather than per query, so a <c>SET</c>
+    /// performed THROUGH the pin sticks — which is part of the point. It still does NOT join the caller's
+    /// transaction: reads are of COMMITTED state, exactly as for a fresh connection.
+    /// </para>
+    /// <para>
+    /// ⚠ Named Arrow <c>inputs</c> are REFUSED on a pinned connection: an arrow_scan view is
+    /// connection-scoped, so it would outlive the call and collide with the next one using that name.
+    /// </para>
+    /// </remarks>
+    public static HostConnection OpenConnection(nint clientSession = 0) => new(HostFs.OpenConnection(clientSession));
+
+    /// <summary>
+    /// A pinned host DuckDB connection (see <see cref="Host.OpenConnection"/>): several statements on ONE
+    /// connection, so its temporary catalog and session settings persist for the object's life.
+    /// </summary>
+    public sealed class HostConnection : IDisposable
+    {
+        private nint _handle;
+
+        internal HostConnection(nint handle)
+        {
+            _handle = handle;
+        }
+
+        /// <summary>Runs <paramref name="sql"/> on this connection; the caller owns and disposes the stream.</summary>
+        /// <remarks>
+        /// ⚠ Dispose the returned stream before calling again on this connection — a second statement would
+        /// otherwise be REFUSED, which is deliberately better than DuckDB silently closing the first
+        /// result. See <see cref="Host.OpenConnection"/>.
+        /// </remarks>
+        public IArrowArrayStream Query(string sql, RecordBatch? parameters = null)
+        {
+            ThrowIfDisposed();
+            return HostFs.Query(sql, parameters, connection: _handle);
+        }
+
+        /// <summary>
+        /// Runs a non-query statement (DDL / DML) on this connection and returns the affected-row count when
+        /// the engine reports one — the same inference <see cref="Host.ExecuteNonQuery"/> documents.
+        /// </summary>
+        public long ExecuteNonQuery(string sql)
+        {
+            ThrowIfDisposed();
+            using var stream = Query(sql);
+            return ReadCount(stream);
+        }
+
+        /// <summary>Closes the connection, destroying its temporary catalog.</summary>
+        /// <remarks>
+        /// ⚠ Safe with result streams still outstanding: each holds its own reference to the underlying
+        /// connection, so it dies with the last of them rather than under a live stream. Idempotent.
+        /// </remarks>
+        public void Dispose()
+        {
+            var h = _handle;
+            _handle = 0;
+            HostFs.CloseConnection(h);
+        }
+
+        private void ThrowIfDisposed()
+        {
+            if (_handle == 0)
+            {
+                throw new ObjectDisposedException(nameof(HostConnection));
+            }
+        }
+    }
+
     public static long ExecuteNonQuery(string sql)
     {
         using var stream = Query(sql);
+        return ReadCount(stream);
+    }
+
+    /// <summary>
+    /// The affected-row inference both exec surfaces use: the first column of the first batch when it is an
+    /// Int64, else 0.
+    /// </summary>
+    /// <remarks>
+    /// ⚠ ONE copy on purpose. <see cref="ExecuteNonQuery"/> and
+    /// <see cref="HostConnection.ExecuteNonQuery"/> answer the same question about the same primitive, and
+    /// the rule is subtle enough (a CTAS reports its rows; a SELECT of one BIGINT reports its VALUE) that two
+    /// copies would drift and only one of them would be documented.
+    /// </remarks>
+    private static long ReadCount(IArrowArrayStream stream)
+    {
         var batch = stream.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult();
         if (batch is null || batch.ColumnCount == 0 || batch.Length == 0)
         {

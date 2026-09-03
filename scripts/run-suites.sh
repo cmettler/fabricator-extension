@@ -444,13 +444,24 @@ case "$TIER" in
         # in that section is load-bearing and a mutant proved it: an earlier `USE memory.hq_s` leaves a
         # qualified entry, against which the bug does not fire, so the section PASSED with it fully present.
         # 8250 + 9 = 8259 exactly, from a green run.
+        # 8534 since 2026-09-03 (same day, third bump): verify_plugin_fluid 256 -> 275 for the
+        # {% exec %} BLOCK -- the body is rendered to a separate output and run as SQL, so a real
+        # multi-line statement with Liquid inside it needs no quote-escaping and the block emits nothing.
+        # 8515 since 2026-09-03 (same day, second bump): verify_plugin_fluid 248 -> 256 -- staging into
+        # a TEMP table is IDEMPOTENT under bind repetition (a view over such a template works on every
+        # use) while a REAL table collides with itself, which is the property that makes the temp-table
+        # idiom the right one on the fluid_query surface rather than merely the tidy one.
+        # 8507 since 2026-09-03: verify_plugin_fluid 238 -> 248 for the PINNED per-render host
+        # connection (ABI v84) -- exec() and query() in one template now share one DuckDB connection,
+        # so a TEMP table staged by one is readable by the other. 8497 + exactly that suite's 10, which
+        # is what shows no other suite moved.
         # 8497 since 2026-09-02: 8259 + verify_plugin_fluid's 238, moved in from the service tier with Fluid
         # becoming a built-in. The suite went 234 -> 238 in the same change: its two plugin-row assertions
         # ("loaded | fluid", nothing rejected) became a pair saying Fluid contributes NO plugin row and its
         # two functions have exactly ONE registration each, plus the HostsCatalog refusal and its
         # unknown-provider control. 3105 + 238 + 8259 - 3339 arithmetic aside, both numbers come from green
         # runs.
-        : "${MIN_ASSERTIONS:=8497}"
+        : "${MIN_ASSERTIONS:=8534}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

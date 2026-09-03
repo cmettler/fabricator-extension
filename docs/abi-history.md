@@ -12,6 +12,122 @@
 > parsed with our own vcpkg yyjson, retiring the `ReadCapabilityFlag` string-find). v74 below is the
 > follow-on that finished the same job for ALTER.
 
+## v84 — the PINNED host connection (2026-09-03)
+
+`host_query` gains a `connection` parameter and two entries appear beside it: `host_connection_open`
+and `host_connection_close`. 0 = a fresh connection per call, exactly as before; non-zero = a connection
+that OUTLIVES the call, so several statements share one DuckDB `Connection` — and therefore one
+TEMPORARY catalog, one set of session settings and one transaction context.
+
+User-asked, with the shape given in the request:
+
+```
+con = host.connection()
+con.query(...) / con.exec(...)
+con.dispose()
+```
+
+### Why a fresh connection could not do it
+
+`Host.Query` has always opened its own connection, which is what makes it safe (the in-flight
+`ClientContext` is non-reentrant) and what makes committed-reads its semantics. The cost is that a
+managed caller cannot do a multi-step job: statement 2 cannot see what statement 1 created. For a
+**TEMP** table it can never see it, whatever the timing — a temporary catalog belongs to the
+`ClientContext` that created it.
+
+MEASURED before anything was built:
+
+| | |
+|---|---|
+| a TEMP table read back on the SAME connection | **works** |
+| the same table from another connection | `Catalog Error: Table with name t does not exist!` |
+| a `SET` on one connection | persists there, and the other reports its own value |
+| a TEMP table inside `BEGIN … ROLLBACK` | **gone** — temp tables are transactional |
+
+⇒ a pinned connection is not a convenience over a fresh one; it is the only way to express "these
+statements belong together", and a temp table is the right scratch space for it: nothing else can see
+it, and closing the connection destroys it — no name in the shared catalog, no cleanup.
+
+### ⚠⚠ The one hazard, and the host REFUSES rather than allowing it
+
+Every DuckDB query path calls `ClientContext::InitialCleanup`, whose own comment is *"Cleanup any open
+results"*. So starting a statement on a connection CLOSES that connection's active streaming result —
+and MEASURED, it does so **SILENTLY**:
+
+```
+r1 = conn.execute("SELECT i FROM big ORDER BY i");  r1.fetchmany(3)  -> [(0,), (1,), (2,)]
+conn.execute("SELECT 1").fetchall()                 # a second query on the SAME connection
+r1.fetchmany(3)                                     -> []            # <- the rest is GONE, no error
+   ... the same pair on two DIFFERENT connections   -> [(3,), (4,), (5,)]
+```
+
+A short read with nothing failing is the worst outcome available, so `MakeHostQueryStream` REFUSES a
+second statement on a pinned connection whose previous result stream is still open, naming the cause.
+`HostConnection::open_streams` counts them; a stream takes its slot only once the statement has
+SUCCEEDED (counting earlier would wedge the connection on the first error) and gives it back in
+`HostQueryRelease` **after** dropping the result — order stated explicitly rather than left to member
+destruction order, so it survives the next edit to the struct.
+
+### Lifetime: the handle owns a `shared_ptr`, and result streams hold their own
+
+`HostQueryStream::conn` became a `shared_ptr<Connection>` (a fresh-connection call simply ends up with a
+refcount of one, so nothing changed for it) and carries a `shared_ptr<HostConnection>` when pinned. So
+closing the handle while a stream is outstanding is SAFE — the `Connection` dies with the last of them,
+not under a live stream. That is the `out_interrupt` idiom of v66 reused, and it removes the
+use-after-free class this repo's history says is invisible on the platform you develop on.
+
+### ⚠ Two deliberate refusals
+
+- **Named Arrow inputs are refused on a pinned connection.** `duckdb_arrow_scan` registers a
+  CONNECTION-scoped view: on a fresh connection it dies with the call, on a pinned one it would outlive
+  it and the next call using that name would collide. Refusing by name beats leaking a view into a
+  connection the caller keeps using. Checked before anything is adopted, so nothing leaks on the refusal.
+- **The v83 session is applied at OPEN, not per query.** Re-applying would undo a `SET` the caller
+  performed THROUGH the pin, which is one of the things pinning is for. The consequence matters and is
+  recorded under the Fluid engine: a connection that outlived its render would hand every later render
+  the FIRST one's TimeZone, which is a wrong VALUE rather than stale scratch state.
+
+### What it does NOT change
+
+It does not join the caller's transaction. A pinned connection still reads COMMITTED state, so the
+surrounding DuckDB statement's uncommitted rows stay invisible and — the other direction — what the pin
+writes is invisible to the statement that invoked it, whose snapshot predates the commit. That rule
+(fluid-templating.md §11.1b) is untouched OUTWARD; what changed is that the caller's own earlier
+statements are visible to its later ones.
+
+### The managed surface
+
+`Host.OpenConnection(clientSession)` → `Host.HostConnection : IDisposable` with `Query` /
+`ExecuteNonQuery` / `Dispose`. For a plugin, `IHostQuery` gains `OpenConnection(inheritSession)` →
+`IHostConnection : IDisposable` — DEFAULT-implemented, so adding it to a published contract breaks no
+plugin. The default is for an IMPLEMENTER (realistically a test double), NOT for an old host: a
+version-mismatched bridge is refused by the C++ side at boot, so a running bridge implies a host of
+exactly its own version.
+
+**⚠⚠ AND THERE IS DELIBERATELY NO CAPABILITY PROBE** (user, 2026-09-03: *"we don't need any fallbacks with
+CanPinConnection"*). A `CanPinConnection` was built on all three layers — `IHostQuery`, `Host`, `HostFs` —
+and then DELETED along with the fallback it existed for. The principle it leaves behind is worth more than
+the member was: **a capability probe is worth having exactly when the DEGRADED PATH IS STILL RIGHT.**
+
+| | probe? | why |
+|---|---|---|
+| `Host.CanQuery` | **stays**, a dozen callers | a provider that cannot reach the host engine falls back to its own parquet reader and still answers CORRECTLY — slower, not different |
+| `CanPinConnection` | **deleted** | a caller that fails to pin gets statements which quietly stop sharing a connection: a DIFFERENT answer, with nothing failing |
+
+What remains is a null GUARD inline in `HostFs.OpenConnection` — a zeroed host-services block yields a
+sentence rather than a null-pointer call. Nothing branches on it, and it cannot fire for our own host.
+
+⚠ `Host.ExecuteNonQuery` and `HostConnection.ExecuteNonQuery` now share ONE `ReadCount` helper. The rule
+is subtle enough (a CTAS reports the rows it created; a SELECT of one BIGINT reports its VALUE) that two
+copies would drift and only one of them would be documented.
+
+### ⚠ The version guard earned its keep, immediately
+
+`abi.h` was bumped and `Bootstrap.Initialize`'s `vtable->AbiVersion` was not, so the first run died with
+`ABI version mismatch (host=84, bridge=83)` before anything else could go wrong — which is exactly the
+standing rule in CLAUDE.md ("bump BOTH") demonstrating itself. The symptom without that guard would have
+been a call through a shifted signature.
+
 ## v83 — `host_query` can run AS THE CALLER'S SESSION (2026-09-02)
 
 `host_query` gains an OPTIONAL `FabricatorHandle client_context`. 0 = a clean session, which is what every

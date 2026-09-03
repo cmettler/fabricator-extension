@@ -1294,3 +1294,242 @@ permission check it removed sat ABOVE both, and all 227 assertions still pass.
 ⚠ **NOT gated:** that `exec()` grants no authority a caller lacked (that is an argument about the surface,
 not an observable), and the refusal's behaviour under `{% include %}` from remote storage (no hermetic
 fixture has a remote root — the same gap §10 records).
+
+## 12. ONE PINNED CONNECTION PER RENDER — `exec()` and `query()` now see each other (2026-09-03)
+
+User-asked: *"if fluid template uses query/exec a duckdb connection should be pinned for a rendered
+template … this way a exec() could create a temporary table on this connection which could be queried in
+the same render session"*. Built on ABI **v84** (host-query.md §Pinned connections). Gate
+`verify_plugin_fluid` **238 → 248**.
+
+### 12.1 What it fixes
+
+§11.1b measured that a template could not see the write its own `exec()` made, and treated that as one
+fact. It is really two:
+
+| | before | now |
+|---|---|---|
+| the template's own later `query()` | could not see it | **sees it** |
+| the SURROUNDING DuckDB statement | cannot see it | cannot see it (unchanged) |
+
+The first was an artefact of every call opening its own connection; the second is the snapshot the outer
+statement already holds, and no connection change touches it. §11.1b's conclusion — *"exec() in
+fluid_query is for side effects the statement does not itself read"* — therefore still holds for the
+OUTER statement and no longer holds within the template.
+
+MEASURED, one render:
+
+```
+{% assign _    = exec("CREATE TEMP TABLE scratch AS SELECT 7 AS v") %}
+{% assign rows = query("SELECT v FROM scratch") %}v={{ rows[0].v }}      ->  v=7
+```
+
+and the same `query()` in the NEXT render: `Catalog Error: Table with name scratch does not exist!`
+
+**⚠ A TEMP table is the discriminator, and a plain table would not be one.** A plain table is COMMITTED by
+`exec()`, so a fresh-connection `query()` would see it too and the assertion would pass on the old
+behaviour. Only a temporary catalog is provably the same connection — which is also why a temp table is the
+right scratch space here: the outer statement cannot see it (gated: `duckdb_tables()` reports 0), and
+there is nothing to clean up.
+
+### 12.2 The scope is ONE RENDER, and three separate reasons say so
+
+`FluidEngine.Render` creates a `FluidRenderSession`, puts it in `ctx.AmbientValues`, and disposes it in a
+`using`. Both `query()` and `exec()` — and the CLASSIFIER, so one connection per render rather than one
+per classification — go through it.
+
+1. **Semantics**: "a rendered template" is what was asked for. For `fabricator_render` that is per ROW;
+   for `fluid_query`, one bind.
+2. **Thread safety, by construction**: a DuckDB connection is single-threaded by contract and
+   `fabricator_render` is a VOLATILE scalar that may be evaluated on several threads at once. Each render
+   builds its own `TemplateContext`, hence its own session, so nothing is shared. ⚠ Do NOT hoist it to a
+   static or onto the shared `TemplateOptions` — the same trap the `query` FILTER registration documents.
+3. **⚠⚠ Correctness, which is the one I had not anticipated.** `OpenConnection` applies the caller's
+   TimeZone and search path ONCE, at open. So a connection outliving its render would hand every later
+   render the FIRST one's session — MEASURED with a process-wide mutant: a render under `Asia/Kolkata`
+   reported the zone the first render had seen, failing a PRE-EXISTING v83 assertion. A wrong VALUE, not
+   stale scratch state.
+
+**⚠ LAZY, and that is load-bearing rather than an optimisation.** `fabricator_render` is evaluated per
+ROW, so an eagerly-opened connection would cost one open per row for every template — including the
+overwhelming majority that run no SQL at all. Nothing is opened until the first `query()` or `exec()`.
+
+The sharpest gate assertion is the per-row one: three rows each create the SAME temp-table name
+`perrow` with different values and each reads its own back (10 / 20 / 30). On one shared connection the
+second row would fail with "table already exists".
+
+### 12.3 What it does NOT widen
+
+Every statement still goes through the same classifier — `query()` refuses anything that is not a SELECT,
+`exec()` refuses SELECTs — and both refusals are re-asserted in §12 of the suite, because a mechanism that
+MOVED (the classifier now runs on the pinned connection) is a mechanism that could have been dropped. The
+connection still reads COMMITTED state, so §9's transaction-visibility rule is unchanged. And §11.1a's
+measured hole is unchanged too: a determined caller can still reach a write through `query()` by nesting
+`fabricator_host_exec` inside a SELECT — pinning neither opens nor closes that.
+
+### 12.4 Mutation testing, including the one that SURVIVED
+
+- **A — never pin** (fall back to a fresh connection per call): dies at the FIRST §12 assertion after 238
+  pass. That is the feature's own claim, killed by its own gate.
+- **C — one session for the whole process**: dies at line 1304, a **pre-existing** assertion (§12.2 reason
+  3), which is stronger evidence than dying at mine — it means per-render scoping was already
+  correctness-bearing. Independently MEASURED to be caught by §12's own "next render" assertion: under
+  that mutant the second render read `leaked=7` where the shipped build errors.
+- **B — never dispose: SURVIVED, and it was the wrong mutant.** Isolation comes from building a NEW
+  session per render, not from disposing one; a `Dispose()` that does nothing still passes every
+  assertion, because each render opens its own connection either way. What `Dispose()` prevents is a
+  native connection LEAK — one per render for the process's life — which no SQL assertion can observe.
+  Recorded in the suite rather than left to be re-derived, and it is why §12 says it pins the SCOPE and
+  not the disposal.
+
+### 12.5 ⚠⚠ Staging into a TEMP table is IDEMPOTENT under bind repetition; a real table is not
+
+§11 measured that a writing template behind a VIEW writes on EVERY use (1 → 2 → 3 → 4), which is a footgun
+for a template that writes to the catalog. For one that STAGES it is a non-issue, and that is what makes
+the temp-table idiom the right one here rather than merely the tidy one: each bind gets its own connection
+and therefore its own temporary catalog, so the same `CREATE TEMP TABLE` simply runs again.
+
+MEASURED, a view over such a template used twice — and the contrast:
+
+| staged into | first use | second use |
+|---|---|---|
+| `CREATE TEMP TABLE st` | `staged = 5` | **`staged = 5`** |
+| `CREATE TABLE realst` | `Table with name "realst" already exists!` | — (it fails at the first SELECT, because `CREATE VIEW` already bound once) |
+
+Both are gated. ⚠ The real-table row is a CHARACTERIZATION test of DuckDB's bind repetition, not of our
+code, so no mutant of ours can kill it — it is pinned because it is the REASON to reach for a temp table,
+and because a change in bind repetition should arrive as a failed assertion naming this shape.
+
+### 12.6 ⚠⚠ It pins UNCONDITIONALLY — the fallback was removed, and why
+
+The first build consulted `IHostQuery.CanPinConnection` and degraded to a fresh connection per call when it
+was false. User-questioned (*"i actual thought fluids render would pin the connection?"*) — and the
+question was right about the code reading as conditional. It is wrong twice over:
+
+1. **Unreachable.** The Fluid provider is a BUILT-IN, published beside the bridge by
+   `publish-managed.ps1`, so it cannot meet a host older than its own contract. The branch was dead, and
+   its own comment said so.
+2. **⚠⚠ And if it ever DID fire it would be a silent wrong answer.** `exec()` and `query()` would quietly
+   stop sharing a connection — the single guarantee this class exists to provide — so a template would run
+   and MEAN SOMETHING DIFFERENT with nothing failing. That is the failure class this repo keeps recording,
+   arrived at by defensive coding.
+
+⇒ **degrading here is never right, so nothing offers it.** User-decided the same day — *"we don't need any
+fallbacks with CanPinConnection"* — and the probe went with the fallback: `IHostQuery.CanPinConnection`,
+`Host.CanPinConnection` and `HostFs.CanPinConnection` are all DELETED. A probe exists only so a caller can
+degrade; with no legitimate way to degrade it is machinery that reads as an option and offers none.
+
+⚠ **What remains is a null GUARD, not a probe**: `HostFs.OpenConnection` tests the function pointer inline
+so a zeroed host-services block yields a sentence rather than a null-pointer call. Nothing branches on it.
+And it cannot fire for our own host — the C++ side refuses a bridge whose declared ABI version differs, so
+a running bridge implies a host of exactly its version.
+
+⚠ The same question exposed a wrong MESSAGE on the interface's default implementation. It read *"this host
+does not support pinned connections (needs ABI v84)"*, which describes a case the throw cannot handle at
+all: an old HOST never reaches managed code, because the C++ side refuses a version-mismatched bridge at
+boot. The default fires only when an IMPLEMENTATION did not override the member — realistically a plugin
+author's test double, which is the only reason it exists (the `IProviderCatalog.NotHosted` precedent).
+Corrected to say that.
+
+⚠⚠ **The contrast that makes the decision principled rather than a preference: `Host.CanQuery` STAYS, and
+has a dozen real callers.** Reaching the host engine at all genuinely IS optional — a provider legitimately
+falls back to its own parquet reader — so branching there produces a correct, merely slower answer.
+Branching on pinning produces a DIFFERENT answer. A capability probe is worth having exactly when the
+degraded path is still right.
+
+## 13. THE `{% exec %}` BLOCK — a real statement, not an escaped string (2026-09-03)
+
+User-asked, with the shape given: a custom Fluid block on the `RegisterEmptyBlock` pattern that renders its
+body **to a separate output**, executes the captured text as SQL, and writes **nothing** to the caller's
+output. Gate `verify_plugin_fluid` **256 → 275**, two mutants.
+
+```sql
+SELECT fabricator_render('{% exec %}
+INSERT INTO t VALUES
+{% for r in rows %}({{ r.id }}, {{ r.name | sql }}){% unless forloop.last %},{% endunless %}
+{% endfor %}
+{% endexec %}done', {'rows': [{'id': 1, 'name': 'a'}, {'id': 2, 'name': 'O''Brien'}]});
+-- done          (the block contributes no text; both rows land, the quote escaped by | sql)
+```
+
+### 13.1 Why it is better than `exec("…")`, concretely
+
+The function form takes the whole statement as ONE string argument, so every quote inside it must be
+escaped through SQL's literal syntax *and* Liquid's, and the statement has to be assembled by
+concatenation. The block form makes the statement ordinary template text: multi-line, with `{% for %}` /
+`{% if %}` inside it, and no escaping at all. It is also naturally CONDITIONAL — an unreached
+`{% exec %}` runs nothing, because the tag is a statement in the tree rather than an argument that had to
+be evaluated to build a call (gated).
+
+The function form is not superseded: it RETURNS the affected-row count, and the block deliberately does
+not (it renders nothing, which is the whole point). Use the function when you want the number.
+
+### 13.2 ⚠ Everything downstream of the capture is SHARED with the function form
+
+The block routes into `FluidHostExec.ExecuteCaptured`, which uses the same empty-body guard, the same
+classifier (`RefuseIfSelect`), the same per-render pinned connection (§12) and the same messages. One
+mechanism, two spellings — so the block cannot drift from `exec()` on what counts as a write, and a
+`{% exec %}` staging a TEMP table is readable by a later `query()` in the same template (gated, and that
+assertion needs both features at once).
+
+### 13.3 ⚠⚠ What building it against beta.7 established
+
+- **The signature is `IFluidOutput`, not `TextWriter`** — the request's sketch used the 2.x shape.
+  `RegisterEmptyBlock(string, Func<IReadOnlyList<Statement>, IFluidOutput, TextEncoder, TemplateContext,
+  ValueTask<Completion>>)`. ⚠ The local Fluid clone is at `main`, which is AHEAD of our pinned
+  `3.0.0-beta.7`; the signature was read from `git show v3.0.0-beta.7:…` rather than from the working tree,
+  because a clone at a different revision is exactly the "CI gates a different Fluid than the developer
+  runs" hazard this repo already records about referencing a local clone.
+- **`BufferFluidOutput` is `internal`; `TextWriterFluidOutput` is public** — so the capture is a
+  `StringWriter` wrapped in the latter, which is also what Fluid's own `{% capture %}` source generator
+  emits.
+- **⚠⚠ The capture output BUFFERS, so the body must be flushed before it is read** — otherwise a statement
+  shorter than the buffer has not reached the `StringWriter` at all and the block "executes" the empty
+  string. See §13.4: my first arrangement made this claim and could not back it.
+- **`Render(template, context)` passes `NullEncoder.Default`**, read from
+  `FluidTemplateExtensions.Sync.cs`. The block nonetheless passes `NullEncoder.Default` EXPLICITLY rather
+  than the ambient encoder: the body is SQL and must never be HTML-escaped (an encoder turns `'` into
+  `&#39;` and corrupts every literal). Fluid's `{% capture %}` passes the ambient encoder through, which is
+  right for HTML and wrong here. ⚠ This changes nothing today and is therefore NOT gated — it is
+  future-proofing against a caller rendering through an encoding overload, and saying so beats implying a
+  test covers it.
+
+### 13.4 ⚠⚠ A mutant survived and the CODE changed, not the comment
+
+The first version read the captured text AFTER the `await using` block. A mutant dropping the explicit
+`FlushAsync()` **survived**, because `TextWriterFluidOutput.DisposeAsync` flushes — so the flush was
+redundant and the comment calling it "MANDATORY" was wrong.
+
+Fixed by restructuring rather than by softening the comment: the text is now read INSIDE the scope,
+immediately after the flush, which is what upstream's generated capture code does and makes the dependency
+explicit and local instead of resting on disposal order. Re-run, the same mutant now dies at the FIRST
+block assertion after 257 pass.
+
+⇒ the general form of it, which this file has recorded before: **a defensive step justified by a hazard
+nobody measured is indistinguishable from a necessary one until you delete it** — and when the mutant
+survives, the honest fix is sometimes to make the step necessary rather than to remove it.
+
+### 13.5 ⚠ A partially rendered body is NOT executed
+
+A `{% break %}` inside the block (belonging to an enclosing `{% for %}`) leaves a HALF-RENDERED statement,
+and running half a statement is a different statement. The completion is propagated instead — which is
+what the author asked for by breaking. MEASURED: zero rows written. Mutant E (execute anyway) dies at
+exactly that assertion after 267 pass.
+
+### 13.6 ⚠ Interpolation inside the block is RAW
+
+Same rule as `fluid_query`, for the same reason: a template must be able to emit object names and whole
+fragments, so `{{ x }}` cannot escape. Use `{{ v | sql }}` for a VALUE and `{{ n | sql_ident }}` for an
+identifier. The failure mode without it is a PARSER ERROR rather than a silent injection (gated:
+`O'Brien` spliced raw gives *"unterminated quoted string"*), which is the safe direction but not a
+substitute.
+
+### 13.7 ⚠ Registration is on the shared parser, and it must precede any parse
+
+`FluidEngine.Parser` is built by a METHOD now rather than an object initializer, so the tag is registered
+before anything can be parsed — templates are cached by text, so one parsed before registration would be
+cached with `{% exec %}` unrecognised and stay that way for the process's life.
+
+⚠ The three spellings of `exec` coexist — the BLOCK, the `exec()` function and the `| exec` filter — because
+tags and expressions are different grammars in Fluid. Pinned, because it is not obvious and a change
+would silently break one of them.

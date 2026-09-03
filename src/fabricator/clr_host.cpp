@@ -512,6 +512,13 @@ void SetHostQueryService(HostQueryFn fn, HostQueryInterruptFn interrupt_fn, Host
 	g_host_services.host_query_interrupt_free = free_fn;
 }
 
+void SetHostConnectionService(HostConnectionOpenFn open_fn, HostConnectionCloseFn close_fn) {
+	// Patches the v84 pinned-connection pair, like SetHostQueryService. At extension load, before the
+	// bridge boots.
+	g_host_services.host_connection_open = open_fn;
+	g_host_services.host_connection_close = close_fn;
+}
+
 void SetHostLog(HostLogFn fn) {
 	// Patches the host_log field (DuckDB internal-logging forward), like SetHostQueryService. At extension load,
 	// before the bridge boots.
