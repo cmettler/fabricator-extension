@@ -13,6 +13,14 @@ set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 # CMAKE_CURRENT_LIST_DIR, not CMAKE_CURRENT_SOURCE_DIR: this file is processed from DuckDB's build, so
 # only the former reliably names THIS repo.
 file(STRINGS "${CMAKE_CURRENT_LIST_DIR}/VERSION" FABRICATOR_EXTENSION_VERSION LIMIT_COUNT 1)
+# ⚠⚠ WITHOUT THIS, EDITING ./VERSION CHANGES NOTHING UNTIL SOMEBODY RE-CONFIGURES BY HAND — and the build
+# then produces a binary reporting the OLD version from a tree containing the new one, which is precisely
+# the half-applied bump the single file exists to prevent, reintroduced one layer down. MEASURED: after
+# 0.0.13 -> 0.0.14, build.ninja still carried FABRICATOR_VERSION="0.0.13".
+# file(STRINGS) READS a file; it does not make it a configure input. This does.
+# ⚠ Registering it ONCE is enough for both readers: a re-configure re-processes extension_config.cmake too,
+# so its own file(STRINGS) picks the new value up in the same pass.
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_LIST_DIR}/VERSION")
 
 project(${TARGET_NAME} CXX)
 
