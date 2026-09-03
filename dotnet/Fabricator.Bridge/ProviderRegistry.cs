@@ -22,7 +22,20 @@ public static class ProviderRegistry
 {
     private static readonly object Gate = new();
     private static Dictionary<string, IProvider>? _byName; // name/alias (case-insensitive) -> backend
-    private static string? _defaultProvider;              // canonical name of the default backend
+    private static string? _defaultProvider;              // an EXPLICIT choice: the env var, or Register()
+
+    /// <summary>
+    /// The provider every call site that carries no PROVIDER name resolves to, unless
+    /// <c>FABRICATOR_DEFAULT_PROVIDER</c> says otherwise.
+    /// </summary>
+    /// <remarks>
+    /// ⚠⚠ NAMED, NOT POSITIONAL, AND THAT IS THE POINT. The default used to be "whichever provider was
+    /// discovered first", which made it a property of a hardcoded list's ORDER — a landmine the list's own
+    /// comment had to warn about ("prepend it and SqlServer silently stops being the default"). Discovery is
+    /// a directory glob now, so order is ALPHABETICAL: first would be Fabricator.AnalysisServices, and
+    /// before that Fabricator.Bridge's own StubBackend. Either would have become the default silently.
+    /// </remarks>
+    private const string BuiltInDefaultProvider = "sqlserver";
 
     // Simple names of assemblies WE loaded out of a plugin directory. Subtracted from the host's loaded set
     // when deciding what to skip as "shared" — see ScanPluginDirectories.
@@ -114,11 +127,19 @@ public static class ProviderRegistry
 
     private static IProvider Default(Dictionary<string, IProvider> map)
     {
+        // 1. an EXPLICIT choice — FABRICATOR_DEFAULT_PROVIDER, or a host/test calling Register().
         if (_defaultProvider != null && map.TryGetValue(_defaultProvider, out var named))
         {
             return named;
         }
-        // Exactly one backend (the common single-provider case) => it. Otherwise the first by name.
+        // 2. the built-in default, BY NAME. See BuiltInDefaultProvider: this is what stops the default
+        //    being an accident of discovery order.
+        if (map.TryGetValue(BuiltInDefaultProvider, out var builtIn))
+        {
+            return builtIn;
+        }
+        // 3. the sole provider (the common single-provider case), else the first — a last resort that only
+        //    applies to a payload not shipping the SQL Server provider at all.
         return map.Values.Distinct().First();
     }
 
@@ -150,25 +171,32 @@ public static class ProviderRegistry
         var names = Environment.GetEnvironmentVariable("FABRICATOR_BACKEND_ASSEMBLY");
         if (string.IsNullOrWhiteSpace(names))
         {
-            // Default to every shipped provider; a missing/unloadable assembly is skipped below, so listing
-            // Fabricator.AnalysisServices here is harmless when only the SqlServer provider is published.
+            // ⚠⚠ DISCOVERED BY GLOB, NOT BY A HARDCODED LIST (2026-09-02, user-directed). The managed
+            // directory holds ~261 assemblies of which EIGHT are ours, so `Fabricator*.dll` keeps the
+            // whitelist property — nothing reflects over the .NET runtime, Azure or Arrow — while removing
+            // the defect the list had: the same fact lived in TWO places, publish-managed.ps1 and a string
+            // here, and forgetting either made a provider SILENTLY ABSENT. The publish is now the only
+            // declaration.
             //
-            // ⚠ ORDER IS LOAD-BEARING, and Fabricator.Delta must stay LAST. Until 2026-08-18 the Delta
-            // provider lived in this assembly and was registered by hand AFTER this loop, with a comment
-            // saying it went there so a scanned provider stayed the default. That was not decoration:
-            // Default() falls through to map.Values.Distinct().First(), i.e. Dictionary INSERTION order, so
-            // whichever provider is registered first becomes the default for every call site that carries no
-            // provider name. Delta is now discovered like the others, so its POSITION IN THIS STRING is what
-            // preserves that — prepend it and SqlServer silently stops being the default. The same rule is
-            // why Fabricator.FluidPlugin is APPENDED: it declares a provider name ("fluid") and would become
-            // the default if it came first, even though it hosts no catalog at all.
+            // ⚠ The name convention is therefore CONTRACT: a built-in provider assembly must be
+            // `Fabricator.*`. Every one of ours already is, and the publish step is what enforces it.
             //
-            // ⚠ Fabricator.FluidPlugin is a BUILT-IN here since 2026-09-02, not a plugin. It was bundled
-            // into <managed>/plugins/ for one day, and what moved it is a FOOTGUN rather than tidiness:
-            // FABRICATOR_PLUGIN_DIR REPLACES the plugin roots rather than extending them
-            // (PluginPaths.ResolveRoots returns early), so a user pointing it at their OWN plugin silently
-            // lost fabricator_render — the one capability documented as available out of the box, and the
-            // bundled root's only occupant.
+            // ⚠ Loading an assembly that declares no provider (Abstractions, Common, Installer.Core, and
+            // the Bridge itself) costs nothing — they are already loaded, so Assembly.Load returns the
+            // live instance and GetTypes() walks a handful of types.
+            names = GlobProviderAssemblies();
+        }
+        if (string.IsNullOrWhiteSpace(names))
+        {
+            // THE FALLBACK, for a host that cannot locate its own managed directory (the glob above then
+            // finds nothing). A missing or unloadable assembly is skipped below, so naming one that was not
+            // published is harmless.
+            //
+            // ⚠ ORDER NO LONGER DECIDES THE DEFAULT. It used to: the first provider discovered became the
+            // default for every call site carrying no provider name, so this string's order was
+            // load-bearing and its comment had to warn against prepending. BuiltInDefaultProvider names
+            // "sqlserver" outright now, which is what made the glob safe — alphabetically the first
+            // provider found would be `dax`, and before it the Bridge's own StubBackend.
             names = "Fabricator.SqlServer,Fabricator.AnalysisServices,Fabricator.DeltaRs,Fabricator.Delta,Fabricator.FluidPlugin";
         }
         foreach (var assemblyName in names.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
@@ -191,6 +219,43 @@ public static class ProviderRegistry
         return map;
     }
 
+    /// <summary>
+    /// The provider assemblies shipped beside this one: every <c>Fabricator*.dll</c> in the managed
+    /// directory, as a comma-separated list of simple names. Empty when the directory cannot be located.
+    /// </summary>
+    /// <remarks>
+    /// <para>⚠ SIMPLE NAMES, then <c>Assembly.Load</c> — not <c>LoadFromAssemblyPath</c>. These assemblies
+    /// are already loaded (the Bridge, Abstractions) or resolve from this same directory through the
+    /// bridge's own load context, and loading one by PATH would risk a second identity for a type the host
+    /// already holds.</para>
+    /// <para>⚠ TOP LEVEL ONLY. The managed directory is flat, and the one subdirectory that can appear
+    /// under it is the bundled PLUGIN root — which the plugin scan owns, and which must not be discovered
+    /// as a built-in.</para>
+    /// </remarks>
+    private static string GlobProviderAssemblies()
+    {
+        var dir = PluginPaths.ManagedDirectory();
+        if (string.IsNullOrWhiteSpace(dir) || !System.IO.Directory.Exists(dir))
+        {
+            return string.Empty;
+        }
+        try
+        {
+            var names = System.IO.Directory
+                .GetFiles(dir, "Fabricator*.dll", System.IO.SearchOption.TopDirectoryOnly)
+                .Select(System.IO.Path.GetFileNameWithoutExtension)
+                .Where(x => !string.IsNullOrEmpty(x))
+                .OrderBy(x => x, StringComparer.OrdinalIgnoreCase);
+            return string.Join(",", names);
+        }
+        catch
+        {
+            // An unreadable managed directory falls through to the hardcoded fallback rather than leaving
+            // the host with no providers at all.
+            return string.Empty;
+        }
+    }
+
     private static void RegisterProvidersFrom(System.Reflection.Assembly assembly, Dictionary<string, IProvider> map,
                                              bool refuseCollisions = false)
     {
@@ -198,7 +263,14 @@ public static class ProviderRegistry
         foreach (var type in assembly.GetTypes())
         {
             if (!type.IsAbstract && typeof(IProvider).IsAssignableFrom(type) &&
-                type.GetConstructor(Type.EmptyTypes) != null)
+                type.GetConstructor(Type.EmptyTypes) != null &&
+                // ⚠ StubBackend is the LAST-RESORT fallback, registered by hand when discovery found
+                // nothing — never a provider in its own right. It is public and lives in Fabricator.Bridge,
+                // so the `Fabricator*.dll` glob reaches it; without this it would register on every start
+                // and, being alphabetically ahead of Fabricator.SqlServer, would have become the default
+                // before BuiltInDefaultProvider existed. Excluded by TYPE rather than by skipping the
+                // Bridge assembly, so a real provider could still live there one day.
+                type != typeof(StubBackend))
             {
                 found.Add((IProvider)Activator.CreateInstance(type)!);
             }
@@ -236,7 +308,10 @@ public static class ProviderRegistry
         foreach (var backend in found)
         {
             Add(map, backend);
-            _defaultProvider ??= Environment.GetEnvironmentVariable("FABRICATOR_DEFAULT_PROVIDER") ?? backend.Name;
+            // ⚠ ONLY the env var, never `?? backend.Name`. Letting the first provider FOUND become the
+            // default is what made the default positional; with a directory glob that is alphabetical order,
+            // so `dax` would win. The built-in default is named in BuiltInDefaultProvider instead.
+            _defaultProvider ??= Environment.GetEnvironmentVariable("FABRICATOR_DEFAULT_PROVIDER");
         }
     }
 

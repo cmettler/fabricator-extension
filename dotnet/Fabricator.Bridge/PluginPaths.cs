@@ -157,7 +157,7 @@ internal static class PluginPaths
     /// <para><c>Assembly.Location</c> is EMPTY for a single-file or AOT-published host, hence the
     /// <c>AppContext.BaseDirectory</c> fallback.</para>
     /// </remarks>
-    private static string? ManagedDirectory()
+    internal static string? ManagedDirectory()
     {
         try
         {

@@ -475,7 +475,8 @@ the same, refuse remote URLs initially, and never auto-install.
 ## Why / when
 
 Today the bridge loads providers (`Fabricator.SqlServer`, `Fabricator.AnalysisServices`) by reflection into the
-**default** ALC (`BackendRegistry`, env `FABRICATOR_BACKEND_ASSEMBLY`). They're all version-aligned with the
+**default** ALC (`ProviderRegistry`, a `Fabricator*.dll` glob of the managed directory since 2026-09-02, or
+the `FABRICATOR_BACKEND_ASSEMBLY` override). They're all version-aligned with the
 bridge, so they share one of everything — fine. A plugin system adds value only when plugins have **genuinely
 conflicting managed deps** (e.g. two providers needing different Azure SDK / Newtonsoft versions) or are
 **third-party** (you don't control their dependency graph). ALC isolation gives each plugin its own private

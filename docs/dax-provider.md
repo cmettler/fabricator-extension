@@ -66,10 +66,11 @@ which caps at 19.84.1) loads in net10 (win-x64), connects to local PBI Desktop, 
 - **`Fabricator.AnalysisServices`** (new project) — `DaxBackend : IBackend` (provider `"dax"`, aliases
   `adomd`/`powerbi`/`ssas`/`fabric`) + `DaxCatalog : IBackendCatalog` + `PowerBiDesktop` (port detection).
   References `Fabricator.Bridge` + `Microsoft.AnalysisServices.AdomdClient`.
-- **Discovery:** `BackendRegistry` loads the assemblies in `FABRICATOR_BACKEND_ASSEMBLY` (default now
-  `Fabricator.SqlServer,Fabricator.AnalysisServices,Fabricator.DeltaRs,Fabricator.Delta`; a missing assembly is
-  skipped). SqlServer loads first → it stays the default provider, so existing `fabricator` ATTACHes (no
-  `PROVIDER`) are unchanged.
+- **Discovery:** `ProviderRegistry` reflects over the assemblies named by `FABRICATOR_BACKEND_ASSEMBLY`, and
+  when that is unset over **every `Fabricator*.dll` in the managed directory** (a glob since 2026-09-02 —
+  plugin-services.md §13; a missing or unloadable assembly is skipped). SqlServer is the default provider
+  BY NAME (`ProviderRegistry.BuiltInDefaultProvider`), so existing `fabricator` ATTACHes carrying no
+  `PROVIDER` are unchanged.
   - ⚠ **SETTING THIS VARIABLE NOW BOUNDS THE DELTA PROVIDER TOO — a behaviour change on 2026-08-18.** Delta
     used to live inside `Fabricator.Bridge` and was hard-registered UNCONDITIONALLY after the scan, so it was
     present no matter what this variable said. It is now its own assembly (`Fabricator.Delta`), discovered by
@@ -77,9 +78,11 @@ which caps at 19.84.1) loads in net10 (win-x64), connects to local PBI Desktop, 
     `FABRICATOR_BACKEND_ASSEMBLY=Fabricator.SqlServer` silently loses `PROVIDER 'delta'`, where before it did
     not. Include `Fabricator.Delta` in any override that needs Delta. The failure is a clean
     unknown-provider error at ATTACH, not a wrong answer.
-  - ⚠ **ORDER IS LOAD-BEARING**: `Default()` falls through to `map.Values.Distinct().First()`, i.e. Dictionary
-    INSERTION order, so whichever assembly registers a provider FIRST supplies the default for call sites that
-    carry no provider name. `Fabricator.Delta` is deliberately LAST in the default list.
+  - ⚠ **ORDER USED TO BE LOAD-BEARING AND NO LONGER IS** (2026-09-02): `Default()` fell through to
+    `map.Values.Distinct().First()`, i.e. Dictionary INSERTION order, so whichever assembly registered a
+    provider FIRST supplied the default — which is why `Fabricator.Delta` had to be listed LAST. The default
+    is named outright now, which is what made discovery-by-glob safe: alphabetically the first provider found
+    is `dax`.
 - **Publish:** `publish-managed.ps1` publishes both providers into the same `fabricator/` dir (Bridge +
   SqlClient + AdomdClient + both backend dlls); the CoreCLR host initializes against Bridge's runtimeconfig.
 - **Connection modes** (`DaxBackend.ResolveConnectionString`): empty target or a `pbidesktop[://]` /

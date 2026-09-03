@@ -2,7 +2,8 @@
 
 > **Status: BOTH STEPS BUILT — §8 (the `GetService<T>()` locator), §9 (`Fabricator.Common`), §10
 > (`IHostLog`, §7.4a's third question), §11 (versioning + NuGet packages, §5 Q4), §12 (Fluid becomes a
-> built-in provider; `IBackend` → `IProvider`).**
+> built-in provider; `IBackend` → `IProvider`), §13 (core providers discovered by GLOB — the manifest idea
+> retired unbuilt).**
 > ⚠ §9.4, §9.5 and §10.4 CORRECT the plan and this build: the acceptance test's target no longer existed,
 > §7.4a's "13 → 16" is wrong on two of three, and a defensive mechanism in `IHostLog` turned out to be
 > unnecessary — its mutant survived. Opened user-directed:
@@ -1429,6 +1430,107 @@ naming the type that is absent, which is the worse error of the two.
 
 ⚠ It is also what the three out-of-tree plugins will hit the moment they repin, and the reason each needs
 the same substitution in the same commit as its pin bump.
+## 13. CORE PROVIDERS ARE DISCOVERED BY GLOB (2026-09-02) — and the manifest is retired unbuilt
+
+User-proposed: *"instead of a manifest what about just listing `fabricator*.dll`"*. It is the better answer
+and it replaces §12-adjacent planning for a provider MANIFEST, which was mine. C#-only, no ABI, no C++.
+
+### 13.1 Why it beats the manifest
+
+The defect both were aimed at: **the declared set was a hardcoded C# string, so one fact lived in two files
+that had to agree** — a `Publish-Project` line in `publish-managed.ps1` and a name in `ProviderRegistry`.
+Forget either and the provider is SILENTLY ABSENT, because `Discover()` skips an unloadable name on purpose.
+Fluid becoming a built-in hit exactly this, and the publish script now carries a comment warning about it.
+
+A manifest fixes that by adding a third artifact the build must write. **A glob fixes it by removing the
+second one: the publish IS the declaration.** No format, no parser, no version, nothing to keep in step.
+
+**⚠ It keeps the whitelist property, which is the whole reason a list existed.** MEASURED: the managed
+directory holds **261 DLLs, EIGHT of them `Fabricator.*`**. So `Fabricator*.dll` narrows by 32× — nothing
+reflects over the .NET runtime, Azure SDK, Arrow or engineered-wood, which is what made "just scan the
+managed dir" a non-starter (250-odd `rejected` rows and a `GetTypes()` over the world).
+
+⚠ **The name convention becomes CONTRACT**: a built-in provider assembly must be `Fabricator.*`. All eight
+already are, and the publish step is what enforces it.
+
+### 13.2 ⚠⚠ IT WAS ONLY SAFE AFTER THE DEFAULT STOPPED BEING POSITIONAL
+
+Here is what the glob picks up, in the order it finds them:
+
+```
+Fabricator.Abstractions      —
+Fabricator.AnalysisServices  DaxBackend           ← first PROVIDER alphabetically
+Fabricator.Bridge            StubBackend          ← ⚠ public, and earlier still
+Fabricator.Common            —
+Fabricator.Delta             DeltaBackend
+Fabricator.FluidPlugin       FluidPluginBackend
+Fabricator.Installer.Core    —
+Fabricator.SqlServer         SqlServerBackend     ← sorts LAST
+```
+
+`Default()` fell through to `map.Values.Distinct().First()` — Dictionary INSERTION order — and discovery
+set `_defaultProvider` from the first provider it found. With a hardcoded list that made the list's ORDER
+load-bearing, which its own comment had to warn about. **With a glob it would have made `stub` or `dax` the
+default for every call site carrying no `PROVIDER`, silently.**
+
+Two changes make it safe, and both are improvements independent of the glob:
+
+1. **`BuiltInDefaultProvider = "sqlserver"`, named rather than positional** (user: *"sqlserver as default
+   makes sense"*). Discovery no longer assigns `_defaultProvider` at all; only `FABRICATOR_DEFAULT_PROVIDER`
+   and an explicit `Register()` do. The resolution ladder is: explicit choice → the built-in default by NAME
+   → the sole provider → first, the last rung reachable only by a payload shipping no SQL Server provider.
+2. **`StubBackend` excluded BY TYPE.** It is `public`, lives in `Fabricator.Bridge`, and is the last-resort
+   fallback registered by hand when discovery found nothing — never a provider in its own right. Excluded
+   by type rather than by skipping the Bridge assembly, so a real provider could live there one day.
+
+**MEASURED after the change**, environment clean:
+
+```
+Registered providers: dax, engineeredwooddelta, sqlserver     (globbed; stub and fluid correctly absent)
+ATTACH … (TYPE fabricator)  with no PROVIDER   →  MSSQL … network-related
+```
+
+⚠ The second line is the load-bearing one: it went to SQL Server. `stub` is absent because of (2); `fluid`
+is absent from the HINT because §12.2's `HostsCatalog` filters it, though it is registered.
+
+### 13.3 What is kept
+
+- **`FABRICATOR_BACKEND_ASSEMBLY` still REPLACES the glob**, which is the "narrow the search" property a
+  test rig needs. MEASURED: `=Fabricator.SqlServer` gives `Registered providers: sqlserver, dlrest` — the
+  built-ins narrowed to one while a user PLUGIN still loaded, which is the two mechanisms staying
+  independent.
+- **The hardcoded list survives as a FALLBACK** for a host that cannot locate its managed directory, so an
+  odd hosting configuration gets providers rather than none. Its comment now says that is what it is.
+- **Top-level only.** The one subdirectory that can appear under the managed dir is the bundled PLUGIN root,
+  which the plugin scan owns and which must not be discovered as a built-in.
+- **Simple names + `Assembly.Load`**, not `LoadFromAssemblyPath`: these assemblies are already loaded or
+  resolve through the bridge's own load context, and loading one by PATH would risk a second identity for a
+  type the host already holds.
+
+### 13.4 ⇒ `FABRICATOR_BACKEND_ASSEMBLY` is now free to rename
+
+§12.4 left it alone because a manifest might redefine it. It will not — it stays an override, and it is no
+longer a list anyone edits, so renaming it to `FABRICATOR_PROVIDER_ASSEMBLY` is a pure rename whenever
+somebody wants it. That was the last thing holding the rest of the rename back.
+
+### 13.5 The gate, and what it cannot reach
+
+Gates: hermetic **75/75 — 8497** and service **53/53 — 3108**, both unchanged — discovery finds the same
+providers by a different route, so no ANSWER moves, and an unchanged count is the honest outcome.
+
+**⚠ One assertion DOES see the discovered set, and it is the only one anywhere that does.**
+`verify_plugin_fluid`'s unknown-provider control now pins the hint verbatim —
+`Registered providers: dax, engineeredwooddelta, sqlserver` — which is **alphabetical by ASSEMBLY name**
+(AnalysisServices, Delta, SqlServer), i.e. the very ordering that made §13.2 necessary.
+**Mutation-tested: dropping the `StubBackend` exclusion kills it at that line after 6 assertions pass.**
+
+⚠ **What it does NOT kill, and the suite says so rather than implying coverage:** a `GlobProviderAssemblies`
+returning empty falls back to the hardcoded list, which on this payload names the SAME three providers — so
+only reading the code distinguishes the two routes. And it depends on the hermetic tier's EMPTY plugin root;
+with a real one a plugin's provider joins the list, which is why the assertion is hermetic-only.
+
+⚠ It is a `<REGEX>:` on a `statement error`, and it costs no new assertion (238 either way) — it TIGHTENED
+an existing substring match rather than adding one.
 ## 5. Open questions
 
 1. ~~Is **cross-plugin** sharing in scope?~~ **ANSWERED 2026-09-02 (user): it is the EXCEPTION, and a

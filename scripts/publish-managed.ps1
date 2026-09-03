@@ -110,7 +110,7 @@ $appProj = Join-Path $PSScriptRoot "../dotnet/Fabricator.SqlServer/Fabricator.Sq
 Publish-Project $appProj "Fabricator.SqlServer"
 
 # Second provider: Fabricator.AnalysisServices (DAX/ADOMD) — published into the SAME fabricator/ dir so the
-# bridge discovers it by assembly name (FABRICATOR_BACKEND_ASSEMBLY defaults to both). Adds its own dll +
+# bridge discovers it by the `Fabricator*.dll` glob of that directory. Adds its own dll +
 # Microsoft.AnalysisServices.AdomdClient (+ deps) alongside the shared Bridge files.
 $daxProj = Join-Path $PSScriptRoot "../dotnet/Fabricator.AnalysisServices/Fabricator.AnalysisServices.csproj" | Resolve-Path
 Publish-Project $daxProj "Fabricator.AnalysisServices"
@@ -118,17 +118,18 @@ Publish-Project $daxProj "Fabricator.AnalysisServices"
 # The built-in Delta provider, carved out of Fabricator.Bridge on 2026-08-18. It is a PROJECT REFERENCE of
 # Fabricator.SqlServer (external tables write Delta), so its DLLs already ride in on that publish — this
 # line exists so the payload is correct even if the composition root ever stops referencing it, and so the
-# assembly is named in one obvious place. BackendRegistry discovers it BY NAME, last in the default
-# FABRICATOR_BACKEND_ASSEMBLY list so SqlServer stays the default provider.
+# assembly is named in one obvious place. ProviderRegistry discovers it by GLOBBING this directory for
+# `Fabricator*.dll`, so publishing it here is the whole declaration.
 $deltaBuiltinProj = Join-Path $PSScriptRoot "../dotnet/Fabricator.Delta/Fabricator.Delta.csproj" | Resolve-Path
 Publish-Project $deltaBuiltinProj "Fabricator.Delta"
 
 # The Fluid template engine (fabricator_render, fluid_query). A BUILT-IN provider assembly since
-# 2026-09-02, not a plugin: BackendRegistry discovers it by name, APPENDED LAST to the default
-# FABRICATOR_BACKEND_ASSEMBLY list so it cannot become the default provider.
-# /!\ UNLIKE Fabricator.Delta above, NOTHING ELSE REFERENCES THIS PROJECT, so without this line the
-# assembly is simply absent from the payload and both functions vanish -- with no error anywhere, because
-# Discover() skips an unloadable name on purpose. That is the one way this can silently regress.
+# 2026-09-02, not a plugin: ProviderRegistry discovers it by GLOBBING this directory for `Fabricator*.dll`.
+# /!\/!\ UNLIKE Fabricator.Delta above, NOTHING ELSE REFERENCES THIS PROJECT, so THIS LINE IS THE ONLY
+# THING THAT PUTS IT IN THE PAYLOAD -- and since discovery is now a glob of what was published, the publish
+# IS the declaration. Delete it and both functions vanish with no error anywhere, because Discover() skips
+# an assembly that is not there. That is the one way this can silently regress, and it is why the glob
+# replaced a hardcoded list: there is no second place left to forget.
 $fluidProj = Join-Path $PSScriptRoot "../dotnet/Fabricator.FluidPlugin/Fabricator.FluidPlugin.csproj" | Resolve-Path
 Publish-Project $fluidProj "Fabricator.FluidPlugin"
 
