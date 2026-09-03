@@ -43,24 +43,19 @@ public static class HostParquetStaging
     /// </remarks>
     public static long WriteDirectory(string directory, IArrowArrayStream data)
     {
-        // Unique per call + dropped afterwards — see BoundInput.
-        string inputName = BoundInput.NextName("__fabricator_stage_src");
-        var sql = $"COPY (SELECT * FROM \"{inputName}\") TO '{directory.Replace("'", "''")}' "
+        // A FIXED name needs no uniquing and no cleanup: a bound input is a TEMPORARY view on this call's
+        // own fresh connection, so it cannot be seen by — let alone collide with — any other host query, and
+        // it dies with the connection. See RegisterArrowInputView.
+        const string inputView = "__fabricator_stage_src";
+        var sql = $"COPY (SELECT * FROM \"{inputView}\") TO '{directory.Replace("'", "''")}' "
                   + "(FORMAT parquet, PER_THREAD_OUTPUT true)";
         Log.LogDebug("stage parquet: {Sql}", sql);
-        try
-        {
-            using var result = Host.Query(sql, new (string, IArrowArrayStream)[] { (inputName, data) });
-            var batch = result.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult();
-            long rows = batch is { ColumnCount: > 0, Length: > 0 } && batch.Column(0) is Int64Array c
-                        && c.GetValue(0) is long v ? v : 0;
-            batch?.Dispose();
-            return rows;
-        }
-        finally
-        {
-            BoundInput.Drop(inputName);
-        }
+        using var result = Host.Query(sql, new (string, IArrowArrayStream)[] { (inputView, data) });
+        var batch = result.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult();
+        long rows = batch is { ColumnCount: > 0, Length: > 0 } && batch.Column(0) is Int64Array c
+                    && c.GetValue(0) is long v ? v : 0;
+        batch?.Dispose();
+        return rows;
     }
 
     /// <summary>

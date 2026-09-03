@@ -23,9 +23,11 @@ namespace Fabricator.Bridge;
 /// </summary>
 internal static class HostBatchFilter
 {
-    // A PREFIX: each call takes a unique view name and drops it (see BoundInput — a fixed name both
-    // races concurrent host queries and leaks a view into the user's catalog).
-    private const string InputPrefix = "__fabricator_scan_batch";
+    // ⚠ A FIXED name, not a prefix, and that is safe by an ENFORCED invariant rather than by luck: a bound
+    // input is a TEMPORARY view on the call's own fresh connection (see RegisterArrowInputView), and named
+    // inputs are REFUSED on a pinned connection — so no two host queries can ever share a temp catalog.
+    // Lifting that refusal is what would make a fixed name unsafe again.
+    private const string InputView = "__fabricator_scan_batch";
 
     internal static async IAsyncEnumerable<RecordBatch> Apply(
         Schema schema, IAsyncEnumerable<RecordBatch> source, string whereSql,
@@ -36,8 +38,7 @@ internal static class HostBatchFilter
         // `SELECT * FROM <input> WHERE ...` gets its WHERE erased INTO the arrow scan — where a plain
         // C-stream input cannot apply it — and silently returns every row. Materializing first forces the
         // filter to run above the scan.
-        string inputName = BoundInput.NextName(InputPrefix);
-        string sql = $"WITH b AS MATERIALIZED (SELECT * FROM \"{inputName}\") SELECT * FROM b WHERE {whereSql}";
+        string sql = $"WITH b AS MATERIALIZED (SELECT * FROM \"{InputView}\") SELECT * FROM b WHERE {whereSql}";
         await foreach (var batch in source.ConfigureAwait(false))
         {
             if (batch.Length == 0)
@@ -45,7 +46,7 @@ internal static class HostBatchFilter
                 continue;
             }
             using var input = new InMemoryArrayStream(schema, new[] { batch });
-            using var filtered = Host.Query(sql, new (string, IArrowArrayStream)[] { (inputName, input) });
+            using var filtered = Host.Query(sql, new (string, IArrowArrayStream)[] { (InputView, input) });
             while (true)
             {
                 var rb = await filtered.ReadNextRecordBatchAsync(ct).ConfigureAwait(false);

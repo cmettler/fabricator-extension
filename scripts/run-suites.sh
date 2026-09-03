@@ -444,6 +444,12 @@ case "$TIER" in
         # in that section is load-bearing and a mutant proved it: an earlier `USE memory.hq_s` leaves a
         # qualified entry, against which the bug does not fire, so the section PASSED with it fully present.
         # 8250 + 9 = 8259 exactly, from a green run.
+        # 8572 since 2026-09-03 (same day, seventh bump): verify_delta_catalog_native_write 147 -> 148 --
+        #   the NATIVE-path half of the bound-input leak gate. Both COPY sites in
+        #   NativeParquetDataFileWriter used to take a unique view name and DROP it afterwards; the views are
+        #   TEMPORARY now, so the names are fixed constants and nothing drops anything. No row assertion in
+        #   that suite can see the difference, which is how the original defect survived. Mutation-tested
+        #   together with the codec half: restoring temporary:false kills BOTH, each at its own line.
         # 8571 since 2026-09-03 (same day, sixth bump): verify_delta_catalog_filter_modes 39 -> 55 --
         #   the codec exact-filter path binds an Arrow view per batch, and until today it was registered
         #   NON-TEMPORARY (duckdb_arrow_scan hardcodes it), so each filtered SELECT left one behind in the
@@ -473,7 +479,7 @@ case "$TIER" in
         # two functions have exactly ONE registration each, plus the HostsCatalog refusal and its
         # unknown-provider control. 3105 + 238 + 8259 - 3339 arithmetic aside, both numbers come from green
         # runs.
-        : "${MIN_ASSERTIONS:=8571}"
+        : "${MIN_ASSERTIONS:=8572}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

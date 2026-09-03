@@ -228,18 +228,32 @@ under the DEFAULT `PROVIDER 'delta'`, i.e. on the configuration almost everyone 
   `DeltaCatalog`'s sort input, `DeltaNativeReader` — already worked around it with a unique name plus an
   explicit `DROP VIEW`.
 
-### ⚠ THE APPARATUS IT DISSOLVES, and why it is a separate change
+### ✅ THE APPARATUS IT DISSOLVED — retired in the follow-on commit (−171 lines)
 
-Two independent copies of the same workaround exist — `BoundInput.NextName`/`Drop`/`WrapDrop`
-(`Fabricator.Bridge`) and `DeltaNativeReader`'s own `NextViewName`/`DropViews`. Both exist ONLY because the
-view was catalog-level: unique names avoid a cross-connection collision that a temp view cannot have, and
-the drops reclaim a catalog entry a temp view never makes. `BoundInput`'s own doc records what it cost to
-learn — *"six concurrent Delta writers in one process — the `dbt run --threads N` shape — and **five of the
-six failed**"*.
+Two independent copies of the same workaround existed — `BoundInput.NextName`/`Drop`/`WrapDrop`
+(`Fabricator.Bridge`) and `DeltaNativeReader`'s own `NextViewName`/`DropViews` — and both existed ONLY
+because the view was catalog-level: unique names avoided a cross-connection collision a temp view cannot
+have, and the drops reclaimed a catalog entry a temp view never makes. `BoundInput`'s doc recorded what it
+cost to learn — *"six concurrent Delta writers in one process — the `dbt run --threads N` shape — and
+**five of the six failed**"*.
 
-They are now dead weight (a `DROP VIEW IF EXISTS` from another connection finds nothing, so it is a
-harmless wasted host query), and retiring them is deliberately **NOT** in this change: removing ~2 copies of
-an apparatus across three assemblies alongside the mechanism change would make the mechanism unreviewable.
+Both are gone, across seven call sites in three assemblies: `HostBatchFilter`, `HostParquetStaging`,
+`ExternalTableRouting`, `DeltaCatalog`'s sort input, `NativeParquetDataFileWriter` (×2) and
+`DeltaNativeReader`'s per-file and batched forms — plus the `BatchPlan.ViewNames` / `BatchQueryOwner` view
+plumbing that carried names to the drop. Each site takes a FIXED name again.
+
+**⚠ THE INVARIANT THAT MAKES A FIXED NAME SAFE IS ENFORCED, NOT ASSUMED, and every site says so:** a bound
+input is a TEMPORARY view on that call's OWN fresh connection, and named inputs are REFUSED on a pinned
+connection — so no two host queries can ever share a temp catalog. **Lifting that refusal is exactly what
+would bring the race back**, which is why the note lives at the call sites and not only here.
+
+⚠ `SingleScanArrowStream` STAYS and is untouched. The single-use property is the STREAM's, not the view's,
+and it is unchanged — measured the same day at 399 (§the double-scan measurement in
+[fluid-templating.md](fluid-templating.md) §17.11).
+
+**⚠ What proves a removal, when there is no new behaviour to assert:** the gate written for the fix got
+STRONGER without changing a character. `starts_with(view_name, '__fab') = 0` used to be satisfiable two
+ways — temp-ness OR the drops. With the drops gone, only temp-ness can satisfy it.
 
 ### ⚠⚠ IT PERSISTED INTO A FILE-BACKED DATABASE, AND THE CRASH SURVIVES A RESTART — measured
 

@@ -1363,11 +1363,10 @@ public sealed class DeltaCatalog : IProviderCatalog
     // (channel backpressure feeds the sort; the sorted stream feeds whichever write path runs next).
     private static IArrowArrayStream SortStream(IArrowArrayStream data, IReadOnlyList<string> cols)
     {
-        // Unique per call — see BoundInput (a fixed name races concurrent host queries). This returns a LAZY
-        // stream, so the view must outlive the call: BoundInput.WrapDrop defers the DROP to the caller's
-        // Dispose, the only point that knows draining is over. (The COPY/filter sites instead drop in a
-        // finally, because their queries materialize before returning.)
-        string sortInput = BoundInput.NextName("__fabricator_sort_input");
+        // A FIXED name, and no cleanup even though this returns a LAZY stream: the bound input is a
+        // TEMPORARY view on this call's own fresh connection, so it lives exactly as long as the stream that
+        // needs it and dies with it. See RegisterArrowInputView.
+        const string sortInput = "__fabricator_sort_input";
         var sb = new System.Text.StringBuilder("SELECT * FROM \"" + sortInput + "\" ORDER BY ");
         for (int i = 0; i < cols.Count; i++)
         {
@@ -1377,9 +1376,7 @@ public sealed class DeltaCatalog : IProviderCatalog
             }
             sb.Append('"').Append(cols[i].Replace("\"", "\"\"")).Append('"');
         }
-        return BoundInput.WrapDrop(
-            Host.Query(sb.ToString(), new (string, IArrowArrayStream)[] { (sortInput, data) }),
-            sortInput);
+        return Host.Query(sb.ToString(), new (string, IArrowArrayStream)[] { (sortInput, data) });
     }
 
     /// <summary>The catalog's schemas: the lakehouse schemas for a schema-enabled OneLake lakehouse; for a

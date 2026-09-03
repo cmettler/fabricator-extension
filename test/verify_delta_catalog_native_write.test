@@ -283,3 +283,26 @@ SELECT id, name, extra FROM se.main.t ORDER BY id;
 
 statement ok
 DETACH se;
+
+# ============================================================================================
+# ⚠⚠ NO BOUND-INPUT VIEW SURVIVES ANY OF THE WRITES ABOVE.
+#
+# Every native write binds its source as a named Arrow input for DuckDB's COPY — the plain form and
+# the partitioned form are two separate COPY sites in NativeParquetDataFileWriter, and both ran above.
+# Until 2026-09-03 those inputs were CATALOG views (duckdb_arrow_scan hardcodes temporary:false) that
+# outlived the connection AND the stream they point into, so each site had to take a UNIQUE name and
+# issue an explicit DROP VIEW afterwards. They are TEMPORARY views now and die with the connection, so
+# the names are fixed constants again and nothing drops anything.
+#
+# ⚠ This is the assertion that gates that removal on the NATIVE path — the codec path's equivalent lives
+# in verify_delta_catalog_filter_modes. No row assertion above can see it: every one of them passes
+# whether or not a view is left behind, which is exactly how the original defect survived.
+#
+# ⚠ It is deliberately broad (`__fab%` covers __fabricator_delta_write_src, __fab_files, __fab_dv,
+# __fabricator_sort_input, …) so it also catches a future path that binds an input and forgets.
+# ============================================================================================
+
+query I
+SELECT count(*) FROM duckdb_views() WHERE starts_with(view_name, '__fab');
+----
+0

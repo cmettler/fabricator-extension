@@ -28,10 +28,14 @@ namespace Fabricator.Bridge;
 /// </summary>
 internal sealed class NativeParquetDataFileWriter : IDataFileWriter
 {
-    // ⚠ A PREFIX, not a name: each COPY gets its own view (BoundInput.NextName) and drops it afterwards.
-    // A fixed name raced — six concurrent writers in one process (the dbt --threads N shape) and FIVE failed
-    // with "failed to register input view '__fabricator_delta_write_src'". See BoundInput for why.
-    private const string InputPrefix = "__fabricator_delta_write_src";
+    // ⚠⚠ A FIXED name again, and the history is the reason to say why rather than just use one. It raced
+    // once — six concurrent writers in one process (the dbt --threads N shape) and FIVE failed with
+    // "failed to register input view '__fabricator_delta_write_src'" — because a bound input used to be a
+    // CATALOG view shared by the whole database. Since 2026-09-03 it is a TEMPORARY view on the call's own
+    // fresh connection (see RegisterArrowInputView), so concurrent writers cannot see each other's at all.
+    // ⚠ The invariant is ENFORCED, not assumed: named inputs are REFUSED on a pinned connection, so no two
+    // host queries share a temp catalog. Lifting that refusal is what would bring the race back.
+    private const string InputView = "__fabricator_delta_write_src";
     private static readonly ILogger Log = FabricatorLog.CreateLogger("Fabricator.Delta.Native");
 
     // The table root as a URI DuckDB's writer can open (onelake:// for OneLake, else the local/s3 path). Files
@@ -255,25 +259,17 @@ internal sealed class NativeParquetDataFileWriter : IDataFileWriter
             try { HostFs.CreateDir(AmbientOpener.Current, writableRoot + "/" + rel.Substring(0, slash)); }
             catch { /* object-store implicit dirs / unimplemented CreateDirectory — the COPY still writes */ }
         }
-        var inputName = BoundInput.NextName(InputPrefix);
         var sql =
-            $"COPY (SELECT {SelectList(src.Schema, renameToPhysical)} FROM {QuoteIdent(inputName)}) TO '{uri.Replace("'", "''")}' " +
+            $"COPY (SELECT {SelectList(src.Schema, renameToPhysical)} FROM {QuoteIdent(InputView)}) TO '{uri.Replace("'", "''")}' " +
             "(FORMAT parquet, WRITE_BLOOM_FILTER true, RETURN_STATS" + CopyTuning(spec)
             + (fieldIdsSpec is not null ? ", FIELD_IDS " + fieldIdsSpec : FieldIdsClause(fieldIds)) + ")";
         Log.LogInformation("delta native copy {Uri}", uri);
-        var input = new (string, IArrowArrayStream)[] { (inputName, src) };
-        try
-        {
-            using var result = Host.Query(sql, input);
-            var files = ReadFileStats(result, ct, statsSchema, writableRoot);
-            long rows = 0, size = 0;
-            foreach (var f in files) { rows += f.Rows; size += f.Size; }
-            return (rows, size, files.Count > 0 ? files[0].Stats : null);
-        }
-        finally
-        {
-            BoundInput.Drop(inputName);
-        }
+        var input = new (string, IArrowArrayStream)[] { (InputView, src) };
+        using var result = Host.Query(sql, input);
+        var files = ReadFileStats(result, ct, statsSchema, writableRoot);
+        long rows = 0, size = 0;
+        foreach (var f in files) { rows += f.Rows; size += f.Size; }
+        return (rows, size, files.Count > 0 ? files[0].Stats : null);
     }
 
     /// <summary>
@@ -318,23 +314,15 @@ internal sealed class NativeParquetDataFileWriter : IDataFileWriter
         // Under column mapping the input stream was renamed to physical names, so `partitionColumns` must
         // already be the PHYSICAL (output) names — dirs, RETURN_STATS.partition_keys, and FIELD_IDS key by them.
         var quoted = string.Join(", ", partitionColumns.Select(c => "\"" + c.Replace("\"", "\"\"") + "\""));
-        var inputName = BoundInput.NextName(InputPrefix);
         var sql =
-            $"COPY (SELECT {SelectList(src.Schema, renameToPhysical)} FROM {QuoteIdent(inputName)}) TO '{writableRoot.Replace("'", "''")}' " +
+            $"COPY (SELECT {SelectList(src.Schema, renameToPhysical)} FROM {QuoteIdent(InputView)}) TO '{writableRoot.Replace("'", "''")}' " +
             $"(FORMAT parquet, PARTITION_BY ({quoted}), APPEND true, FILENAME_PATTERN '{{uuid}}', " +
             "WRITE_BLOOM_FILTER true, RETURN_STATS" + CopyTuning(spec)
             + (fieldIdsSpec is not null ? ", FIELD_IDS " + fieldIdsSpec : FieldIdsClause(fieldIds)) + ")";
         Log.LogInformation("delta native partitioned copy {Root} by [{Cols}]", writableRoot, quoted);
-        var input = new (string, IArrowArrayStream)[] { (inputName, src) };
-        try
-        {
-            using var result = Host.Query(sql, input);
-            return ReadFileStats(result, ct, statsSchema, writableRoot);
-        }
-        finally
-        {
-            BoundInput.Drop(inputName);
-        }
+        var input = new (string, IArrowArrayStream)[] { (InputView, src) };
+        using var result = Host.Query(sql, input);
+        return ReadFileStats(result, ct, statsSchema, writableRoot);
     }
 
     // RETURN_STATS emits one row per written file: (filename, count, file_size_bytes, footer_size_bytes,

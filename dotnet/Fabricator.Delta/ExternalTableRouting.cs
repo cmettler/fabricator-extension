@@ -506,21 +506,15 @@ public static class ExternalTableRouting
     {
         var file = folderUri.TrimEnd('/') + "/" + Guid.NewGuid().ToString("N") + ".parquet";
         Log.LogInformation("external parquet append: {File}", file);
-        // Unique per call + dropped afterwards — see BoundInput.
-        string inputName = BoundInput.NextName("__fabricator_external_insert");
-        var sql = $"COPY (SELECT * FROM \"{inputName}\") TO '{file.Replace("'", "''")}' (FORMAT parquet)";
-        try
-        {
-            using var result = Host.Query(sql, new (string, IArrowArrayStream)[] { (inputName, data) });
-            var batch = result.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult();
-            long rows = batch is { ColumnCount: > 0, Length: > 0 } && batch.Column(0) is Int64Array c
-                        && c.GetValue(0) is long v ? v : 0;
-            batch?.Dispose();
-            return rows;
-        }
-        finally
-        {
-            BoundInput.Drop(inputName);
-        }
+        // A FIXED name: a bound input is a TEMPORARY view on this call's own fresh connection, so it is
+        // invisible to every other host query and dies with the connection. See RegisterArrowInputView.
+        const string inputView = "__fabricator_external_insert";
+        var sql = $"COPY (SELECT * FROM \"{inputView}\") TO '{file.Replace("'", "''")}' (FORMAT parquet)";
+        using var result = Host.Query(sql, new (string, IArrowArrayStream)[] { (inputView, data) });
+        var batch = result.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult();
+        long rows = batch is { ColumnCount: > 0, Length: > 0 } && batch.Column(0) is Int64Array c
+                    && c.GetValue(0) is long v ? v : 0;
+        batch?.Dispose();
+        return rows;
     }
 }
