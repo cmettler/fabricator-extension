@@ -93,6 +93,40 @@ internal static class FluidHostQuery
     // classifier and the statement itself go through it, so a template's exec() and query() share one
     // DuckDB connection and therefore one TEMPORARY catalog. Null only when the host publishes no
     // IHostQuery at all, which the guard below reports by name.
+    /// <summary>The Liquid tag name of the BLOCK form: <c>{% query name %}…{% endquery %}</c>.</summary>
+    internal const string BlockName = "query";
+
+    /// <summary>
+    /// The BLOCK form's body, already rendered to text: run it and return the ROW SET, so the caller can
+    /// bind it to a template variable.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// ⚠ It returns exactly what the <c>query()</c> FUNCTION returns — an array of indexable rows — because
+    /// it goes through the same <see cref="Run"/>. That is the whole point of the block: the body is SQL
+    /// written as ordinary template text, and the RESULT is still a result set rather than a rendered
+    /// string. One mechanism, two spellings, so the classifier, the row cap, the value model and the
+    /// per-render connection cannot drift between them.
+    /// </para>
+    /// <para>
+    /// ⚠ <b>No parameters.</b> An identifier block has nowhere to put named arguments, so a value must be
+    /// interpolated with <c>| sql</c> — the body is raw, exactly as in <c>fluid_query</c> and
+    /// <c>{% exec %}</c>. When you want BOUND parameters, use the filter form: <c>sql | query: a: 1</c>.
+    /// </para>
+    /// </remarks>
+    internal static FluidValue RunCaptured(TemplateContext ctx, string sql)
+    {
+        var caller = CallerOf(ctx);
+        // ⚠ The block-specific empty message, before Run's own: an empty body is a different mistake from
+        // an empty argument, and json_serialize_sql('') reports NO error, so something must refuse it here.
+        if (string.IsNullOrWhiteSpace(sql))
+        {
+            throw new ArgumentException(
+                $"{caller}: {{% {BlockName} %}} block is empty — it rendered no SQL.");
+        }
+        return Run(caller, sql, null, FluidRenderSession.For(ctx));
+    }
+
     private static FluidValue Run(string caller, string? sql, RecordBatch? parameters,
                                   FluidRenderSession? session)
     {

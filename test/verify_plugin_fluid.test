@@ -1889,3 +1889,95 @@ query I
 SELECT count(*) FROM blk;
 ----
 3
+
+# ============================================================================================
+# §14 — THE {% query name %} BLOCK (user-asked): the body is SQL written as template text, and
+# the RESULT IS A RESULT SET bound to `name` — not a rendered string.
+#
+# It is an IDENTIFIER block, i.e. {% capture %}'s shape, which is Liquid's own precedent for
+# "run this block and bind the result to a name". ⚠ The sketch `{% assign r = query %}…
+# {% endquery %}` is NOT expressible: Liquid's `assign` parses `identifier = EXPRESSION` and
+# terminates at `%}`, so a block body can never be its operand.
+#
+# ⚠ The value is the SAME one query() returns, because both go through FluidHostQuery.Run —
+# one mechanism, so the classifier, the row cap, the value model and the per-render connection
+# cannot drift between the two spellings.
+# ============================================================================================
+
+# --- THE REQUIREMENT: a RESULT SET, addressable by column, not a varchar ---
+# ⚠ Three different columns and `.size` together: a build that bound the rendered SQL as a
+# string would fail every one of them, which is exactly the mutant this section exists to kill.
+query I
+SELECT fluid_render('{% query result %}
+SELECT 1 AS a, 2 AS b, 3 AS c
+{% endquery %}a={{ result[0].a }} b={{ result[0].b }} c={{ result[0].c }} rows={{ result.size }}', NULL);
+----
+a=1 b=2 c=3 rows=1
+
+# --- several rows, iterated like any Fluid array ---
+query I
+SELECT fluid_render('{% query rs %}
+SELECT i AS n, i * i AS sq FROM range(1, 5) t(i)
+{% endquery %}{% for r in rs %}{{ r.n }}^2={{ r.sq }};{% endfor %}', NULL);
+----
+1^2=1;2^2=4;3^2=9;4^2=16;
+
+# --- and the block itself contributes NO text ---
+# ⚠ The brackets are the assertion: without them a leaked row rendering would be invisible.
+query I
+SELECT '[' || fluid_render('{% query z %}SELECT 9 AS v{% endquery %}', NULL) || ']';
+----
+[]
+
+# --- the two blocks compose over the render's pinned connection (§12) ---
+# ⚠ THE assertion that needs all three features at once: {% exec %} stages a TEMP table, the
+# pinned connection makes it visible, and {% query %} reads it back as rows.
+query I
+SELECT fluid_render('{% exec %}
+CREATE TEMP TABLE stg AS SELECT 10 AS v UNION ALL SELECT 32
+{% endexec %}{% query t %}
+SELECT sum(v) AS total FROM stg
+{% endquery %}total={{ t[0].total }}', NULL);
+----
+total=42
+
+# --- and on the sqlgen surface, i.e. at BIND time ---
+query I
+SELECT * FROM fluid_query('{% query cols %}SELECT 7 AS seven{% endquery %}SELECT {{ cols[0].seven }} AS n');
+----
+7
+
+# --- all THREE spellings of `query` coexist: block, function, filter ---
+# ⚠ Tags and expressions are different grammars in Fluid. Pinned because it is not obvious and
+# a change would silently break one of them.
+query I
+SELECT fluid_render('{% query b %}SELECT 1 AS x{% endquery %}{% assign f = query("SELECT 2 AS x") %}{% assign g = "SELECT $n AS x" | query: n: 3 %}{{ b[0].x }}{{ f[0].x }}{{ g[0].x }}', NULL);
+----
+123
+
+# --- the SAME classifier as the function: a write is refused ---
+statement error
+SELECT fluid_render('{% query r %}INSERT INTO blk VALUES (1, ''z''){% endquery %}x', NULL);
+----
+query() runs SELECT statements only
+
+# --- an empty body is refused BEFORE the classifier ---
+statement error
+SELECT fluid_render('{% query r %}   {% endquery %}', NULL);
+----
+block is empty
+
+# --- an unterminated block is a PARSE error naming the tag Fluid wanted ---
+statement error
+SELECT fluid_render('{% query r %}SELECT 1', NULL);
+----
+endquery
+
+# --- ⚠ the block takes NO parameters, so a VALUE goes through `| sql` ---
+# An identifier block has nowhere to put named arguments. That is a real limitation with a real
+# workaround — the FILTER form binds parameters — and the body is raw either way, so `| sql` is
+# what makes a literal safe. Gated with a quote, which is where raw splicing breaks.
+query I
+SELECT fluid_render('{% query r %}SELECT {{ v | sql }} AS s{% endquery %}s={{ r[0].s }}', {'v': 'O''Brien'});
+----
+s=O'Brien

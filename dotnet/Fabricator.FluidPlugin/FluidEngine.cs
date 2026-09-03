@@ -58,35 +58,93 @@ internal static class FluidEngine
         // resting on disposal order, so removing the flush now fails loudly.
         parser.RegisterEmptyBlock(FluidHostExec.BlockName, static async (statements, output, encoder, ctx) =>
         {
-            using var sql = new StringWriter();
-            var completion = Completion.Normal;
-            await using var capture = new TextWriterFluidOutput(sql, CaptureBufferSize, leaveOpen: true);
-            for (var i = 0; i < statements.Count; i++)
-            {
-                completion = await statements[i].WriteToAsync(capture, NullEncoder.Default, ctx);
-                if (completion != Completion.Normal)
-                {
-                    break;
-                }
-            }
-
-            // ⚠ A body that did not finish normally is NOT executed — a `{% break %}` inside the block (of
-            // an enclosing {% for %}) leaves a PARTIALLY rendered statement, and running half a statement
-            // is a different statement. Propagate the completion instead, which is what the author asked
-            // for by breaking.
+            var (completion, sql) = await CaptureBodyAsync(statements, ctx);
             if (completion != Completion.Normal)
             {
                 return completion;
             }
 
-            await capture.FlushAsync();
-            FluidHostExec.ExecuteCaptured(ctx, sql.ToString());
+            FluidHostExec.ExecuteCaptured(ctx, sql);
+            return Completion.Normal;
+        });
+
+        // ⚠⚠ THE {% query name %} BLOCK: the same capture, but the captured text is RUN AS A QUERY and its
+        // ROW SET is bound to `name` — not a rendered string. It is `{% capture %}`'s shape (an IDENTIFIER
+        // block) because that is Liquid's own precedent for "run this block and bind the result to a name",
+        // and because the value is what the caller wanted: `{{ result[0].a }}` works exactly as it does
+        // after the query() FUNCTION, since both go through FluidHostQuery.Run and get the same
+        // ArrayValue of indexable rows.
+        //
+        // ⚠ `{% assign result = query %}…{% endquery %}` is NOT expressible in Liquid and this is the
+        // nearest thing: `assign` parses `identifier = EXPRESSION` and terminates at `%}`, so a block body
+        // can never be its operand. `{% query result %}` reads the same way and is one tag rather than two.
+        parser.RegisterIdentifierBlock(FluidHostQuery.BlockName,
+                                       static async (identifier, statements, output, encoder, ctx) =>
+        {
+            var (completion, sql) = await CaptureBodyAsync(statements, ctx);
+            if (completion != Completion.Normal)
+            {
+                return completion;
+            }
+
+            // ⚠ SetValue, and NOTHING is written to `output` — the block contributes no text, exactly like
+            // {% capture %}. The rows are held for the render, so a template may iterate them repeatedly.
+            ctx.SetValue(identifier, FluidHostQuery.RunCaptured(ctx, sql));
             return Completion.Normal;
         });
 
         return parser;
     }
     private static readonly ConcurrentDictionary<string, IFluidTemplate> Cache = new();
+
+    /// <summary>
+    /// Renders a custom block's body to TEXT — the SQL both {% exec %} and {% query %} run.
+    /// </summary>
+    /// <returns>The body's completion, and the captured text (empty unless the completion is Normal).</returns>
+    /// <remarks>
+    /// <para>
+    /// ⚠⚠ ONE COPY, and that is the point rather than tidiness: the two subtleties below were each got
+    /// wrong once, and a second copy is where they come back.
+    /// </para>
+    /// <para>
+    /// ⚠⚠ THE CAPTURE OUTPUT BUFFERS, so the body must be FLUSHED before it is read — otherwise a
+    /// statement shorter than CaptureBufferSize has not reached the StringWriter at all and the caller
+    /// "executes" the empty string. The text is therefore read INSIDE the scope, right after the flush,
+    /// which is what Fluid's own {% capture %} source generator does. MEASURED: reading AFTER the
+    /// `await using` works too, because DisposeAsync flushes — and a mutant that dropped the explicit
+    /// flush SURVIVED in that arrangement. Written this way so removing the flush fails loudly.
+    /// </para>
+    /// <para>
+    /// ⚠ NullEncoder.Default EXPLICITLY, not the ambient encoder: the body is SQL and must never be
+    /// HTML-escaped, since an encoder turns <c>'</c> into <c>&amp;#39;</c> and corrupts every literal.
+    /// Today the ambient encoder IS NullEncoder, so this changes nothing now; it is explicit so that stays
+    /// true if a caller ever renders through an encoding overload. Fluid's own {% capture %} passes the
+    /// ambient encoder through, which is right for HTML and wrong here.
+    /// </para>
+    /// <para>
+    /// ⚠ A body that did not finish normally yields its completion and NO text, so the caller runs nothing:
+    /// a `{% break %}` inside the block (of an enclosing {% for %}) leaves a PARTIALLY rendered statement,
+    /// and half a statement is a different statement.
+    /// </para>
+    /// </remarks>
+    private static async ValueTask<(Completion Completion, string Sql)> CaptureBodyAsync(
+        IReadOnlyList<Statement> statements, TemplateContext ctx)
+    {
+        using var sql = new StringWriter();
+        var completion = Completion.Normal;
+        await using var capture = new TextWriterFluidOutput(sql, CaptureBufferSize, leaveOpen: true);
+        for (var i = 0; i < statements.Count; i++)
+        {
+            completion = await statements[i].WriteToAsync(capture, NullEncoder.Default, ctx);
+            if (completion != Completion.Normal)
+            {
+                return (completion, string.Empty);
+            }
+        }
+
+        await capture.FlushAsync();
+        return (Completion.Normal, sql.ToString());
+    }
 
     /// <summary>Parses (or reuses) <paramref name="template"/> and renders it over a fresh context.</summary>
     /// <param name="caller">The SQL function name, so a parse error names the function the user called.</param>

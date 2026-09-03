@@ -1559,3 +1559,68 @@ convention every previous rename here followed: a passage that RECORDS what was 
 not made truer by rewriting the name it was measured under. **Every `fabricator_render` in a dated record
 is this function under its former name** — said here once so the connection is findable, rather than
 annotating each site.
+
+## 15. THE `{% query name %}` BLOCK — the body is SQL, the RESULT IS A RESULT SET (2026-09-03)
+
+User-asked, and the requirement was stated sharply: *"where result is the result set and not some rendered
+as a single varchar, i.e. like a function call result"*. Gate `verify_plugin_fluid` **275 → 285**, one
+mutant aimed at exactly that requirement.
+
+```liquid
+{% query result %}
+SELECT 1 AS a, 'two' AS b, 3.5 AS c
+{% endquery %}
+{{ result[0].a }} {{ result[0].b }} {{ result.size }}
+```
+
+### 15.1 ⚠ The sketch's spelling is not expressible, and this is the nearest thing
+
+The request wrote `{% assign result = query %}…{% endquery %}`. Liquid cannot express that: `assign` parses
+`identifier = EXPRESSION` and terminates at `%}`, so a block body can never be its operand. What ships is
+an IDENTIFIER block — `{% query result %}` — which is **`{% capture %}`'s own shape**, i.e. Liquid's
+established precedent for *"run this block and bind the result to a name"*. One tag instead of two, and it
+reads the same way.
+
+`FluidParser.RegisterIdentifierBlock` exists at our pinned `3.0.0-beta.7` and hands the delegate the
+identifier; `ctx.SetValue(identifier, value)` is what binds it.
+
+### 15.2 It is the SAME value the function returns, by construction
+
+`RunCaptured` calls the same `FluidHostQuery.Run` the `query()` function and the `| query:` filter call, so
+the result is the same `ArrayValue` of `DictionaryValue`-wrapped rows. One mechanism, three spellings —
+the classifier, the 1,000,000-row cap, the value model and the per-render pinned connection cannot drift
+between them.
+
+MEASURED, and these are the assertions that separate a result set from a string:
+
+| | |
+|---|---|
+| `r.size` → 1, `r[0].a` → 1, `r[0].b` → `two`, `r[0].c` → 3.5 | addressed BY COLUMN NAME, per row |
+| `r[0].a \| plus: 1` → **2** | a NUMBER — arithmetic, not concatenation |
+| `{% if r[0].a > 0 %}` → **yes** | it COMPARES as a number |
+| `{% for x in rs %}` over 3 rows → `sum=6` | a real iterable array |
+
+⚠ The comparison row is the one that matters most, and §7 is why: a broken value model **renders correctly
+while computing wrong**, so a render-only assertion cannot tell the two apart.
+
+**Mutant F — bind the captured TEXT instead of the rows** — dies at the FIRST assertion of §14 after 275
+pass. That is the user's requirement expressed as a test.
+
+### 15.3 ⚠ No parameters, and the workaround is the filter form
+
+An identifier block has nowhere to put named arguments, so `{% query r %}` cannot bind `$a`. The body is
+raw-interpolated (same rule as `fluid_query` and `{% exec %}`), so a VALUE must go through `| sql`; gated
+with a quote, which is where raw splicing breaks. When you want BOUND parameters, use `sql | query: a: 1`.
+
+A parameterised block would need `RegisterParserBlock` with a custom grammar (`{% query r, a: 1 %}`) —
+possible, not built, and not asked for.
+
+### 15.4 The capture is now ONE helper, shared with `{% exec %}`
+
+`FluidEngine.CaptureBodyAsync` renders a block body to text and is used by both blocks. That is not
+tidiness: it is where §13.4's flush subtlety and the partial-body rule live, and a second copy is where
+they would come back. Both blocks therefore inherit the flush-before-read arrangement and the rule that a
+body which did not complete normally yields NO text and runs nothing.
+
+⚠ All THREE spellings of `query` coexist — block, function, filter — because tags and expressions are
+different grammars in Fluid. Pinned, since a change would silently break one.

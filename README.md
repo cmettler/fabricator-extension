@@ -1555,6 +1555,36 @@ SELECT fluid_render('{% if go %}{% exec %}DELETE FROM staging{% endexec %}cleare
 > above. A `{% break %}` inside the block leaves a half-rendered statement, which is discarded rather than
 > executed.
 
+**And `{% query name %}` is its read-side twin — the body is SQL, and the result is a *result set*.**
+Like `{% capture %}`, it binds to a name; unlike it, what you get back is rows you can index and iterate,
+not text.
+
+```sql
+SELECT fluid_render('{% query result %}
+SELECT i AS n, i * i AS sq FROM range(1, 5) t(i)
+{% endquery %}{% for r in result %}{{ r.n }}^2={{ r.sq }};{% endfor %}', NULL);
+-- 1^2=1;2^2=4;3^2=9;4^2=16;
+```
+
+It is the same value `query(...)` returns — `{{ result[0].n }}`, `{{ result.size }}`, arithmetic and
+comparisons on the columns all work — so the two spellings differ only in how you write the SQL. Together
+with `{% exec %}` and the per-render connection, a template can stage and then read its own data:
+
+```sql
+SELECT fluid_render('{% exec %}
+CREATE TEMP TABLE stg AS SELECT 10 AS v UNION ALL SELECT 32
+{% endexec %}{% query t %}
+SELECT sum(v) AS total FROM stg
+{% endquery %}total={{ t[0].total }}', NULL);
+-- total=42
+```
+
+> ⚠ **The block takes no parameters** — an identifier block has nowhere to put them. Interpolate values with
+> `{{ v | sql }}`, or use the filter form `sql | query: a: 1` when you want bound parameters.
+>
+> ⚠ It obeys the same rules as `query(...)`: `SELECT` statements only, committed reads on the render's own
+> connection, and a result above one million rows is refused rather than truncated.
+
 
 **`exec()` and `query()` in one template share ONE connection — so a template can stage its own data.**
 Everything a single render runs goes through one pinned DuckDB connection, which means the template's own
