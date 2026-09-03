@@ -1695,3 +1695,99 @@ the first assertion of §15 after 285 pass.**
 IDENTIFIER block and false of what Fluid can express, so it was a limitation of the CHOICE rather than of
 the library — the kind of sentence that hardens into a fact if nobody re-reads it. Corrected in place, in
 the README, in the suite's own comment and in CLAUDE.md, rather than left to contradict the feature.
+
+## 17. ⚠ OPEN — referencing a previous `{% query %}` result BY NAME in a later one (ANALYSED, NOT BUILT)
+
+User-proposed 2026-09-03: *"we also have this replacement scan where we register a name and an
+arrowstream. i guess this is on a connection level. we could try to use the replacement scan feature with
+fluid … we could register the query result as arrow after execution with name = variablename. but how do
+we get the replacement scan feature into fluidplugins rendersession?"*
+
+The goal:
+
+```liquid
+{% query t %}SELECT region, n FROM big{% endquery %}
+{% query u %}SELECT region, sum(n) AS s FROM t GROUP BY region{% endquery %}
+```
+
+### 17.1 ⚠⚠ The guess is wrong in the load-bearing place: BOTH halves are GLOBAL, not per connection
+
+- `fabricator_host_query.cpp:910` — `DBConfig::GetConfig(loader.GetDatabaseInstance())
+  .replacement_scans.emplace_back(NamedSourceReplacement)`. A replacement scan is registered on the
+  **DatabaseInstance**, so it fires for every connection in the process.
+- `Host.cs:244` — `private static readonly ConcurrentDictionary<string, NamedSource> Sources`. The name
+  registry is **process-static**.
+
+⇒ built as sketched, `{% query t %}` would publish `t` process-wide. `fluid_render` is a VOLATILE scalar
+evaluated PER ROW and may run on several threads at once, so two concurrent renders both binding `t` is
+not a hypothetical collision — it is the ordinary case. And a name would outlive its render unless
+explicitly removed, so a later unrelated statement could resolve `t` to a dead result. **Both are silent
+wrong answers, not errors.**
+
+### 17.2 ⇒ The pinned connection already gives render-scoped naming, and the refusal I wrote IS the feature
+
+`duckdb_arrow_scan` registers a **CONNECTION-scoped view**. §13/abi-history §v84 refuse named Arrow inputs
+on a pinned connection with the reason *"a connection-scoped view would outlive the call and collide with
+the next one"* — and for a RENDER SESSION, outliving the call is exactly the requirement. Same fact,
+opposite sign.
+
+Registering the result as a view on the render's own pinned connection gives, by construction:
+
+| | |
+|---|---|
+| scope | the render — the connection dies with it, taking the view |
+| collisions | impossible between renders; each has its own connection |
+| cleanup | none; no global registry to unregister from |
+| resolution | a real relation, so `FROM t` binds normally — **no replacement scan needed at all** |
+
+So the answer to the user's question is that the replacement-scan machinery is the wrong half to reach
+for; the right one is the v84 connection, which the plugin already owns.
+
+### 17.3 The hard part is OWNERSHIP, not naming
+
+`duckdb_arrow_scan` keeps a **raw pointer** to the stream, so the stream must outlive the view — i.e. the
+whole render. Today `FluidHostQuery.Run` reads cells EAGERLY and disposes each batch, deliberately: a
+disposed `RecordBatch` has its arrays nulled and fails loudly on first read (§9 records that a mutant
+proved this is a NullReferenceException, not a silent use-after-free).
+
+To expose the same result as Arrow, `FluidRenderSession` would have to OWN the batches for its life. Two
+consequences, one of them a genuine improvement:
+
+- ⚠ **Memory doubles unless the rows become lazy.** Rows are already held for the render (the 1,000,000-row
+  cap exists for that), so retaining batches as well is double-holding — *unless* the Fluid rows become
+  lazy views over the retained batches, which is possible **only** because the session would then own
+  them. The eagerness exists precisely because nothing owned them.
+- ⚠ A second `{% query t %}` must REPLACE the view, so re-assignment needs a defined drop/replace step
+  rather than a second registration under the same name.
+
+### 17.4 The plugin-reachability question, which is what was actually asked
+
+`Host.RegisterSource` lives in `Fabricator.Bridge`, which a plugin does **not** reference (§plugin-services
+§1: the constraint is dependency WEIGHT, not visibility). So this cannot be reached by adding a static —
+it needs a host SERVICE, following the `IHostFileSystem` / `IHostQuery` pattern. The natural shape is a
+member on the object that already owns the lifetime:
+
+```csharp
+public interface IHostConnection : IDisposable
+{
+    // …
+    void Bind(string name, IReadOnlyList<RecordBatch> rows);   // a connection-scoped Arrow view
+}
+```
+
+That keeps the scope and the lifetime in one object, so "the view dies with the render" is true by
+construction rather than by discipline. It needs the ABI's refusal of inputs on a pinned connection to be
+lifted for this path.
+
+### 17.5 ⚠ Two hazards to settle BEFORE building
+
+1. **A bound name SHADOWS a real table on that connection.** `{% query orders %}` would make a later
+   `FROM orders` in the same render read the template's rows rather than the catalog's — silently. That is
+   either the feature or a serious trap depending on who is writing the template; it needs a deliberate
+   answer (a required prefix? refuse a name the catalog already resolves?).
+2. **Bind repetition on the sqlgen surface.** A `fluid_query` template renders per BIND, so the
+   registration repeats — harmless if each bind has its own connection (it does), but it means the cost is
+   paid per bind, not per execution.
+
+Not built. The measurement that would justify it is a real multi-step template where the intermediate is
+large enough that round-tripping it through `| sql` interpolation is the wrong shape.
