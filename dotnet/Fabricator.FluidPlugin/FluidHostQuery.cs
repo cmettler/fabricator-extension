@@ -316,7 +316,7 @@ internal static class FluidHostQuery
             $"{caller}: {FunctionName}() runs SELECT statements only, and this one was refused by DuckDB's "
             + $"parser: {msg ?? "(no message)"}. A template is rendered while a statement is being BOUND, "
             + "and a bind repeats and happens without execution — so a write here would fire on EXPLAIN. "
-            + $"To write, use {FluidHostExec.FunctionName}() from fabricator_render.");
+            + $"To write, use {FluidHostExec.FunctionName}() from fluid_render.");
     }
 
     /// <summary>

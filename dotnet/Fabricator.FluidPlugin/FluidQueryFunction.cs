@@ -45,7 +45,7 @@ internal sealed class FluidQueryFunction : ISqlTableFunction
         Params.Positional("template", StringType.Default, nullable: false),
         // NAMED and optional, following fabricator_sql_seq's `cols :=`. The NullType sentinel registers it as
         // DuckDB ANY, so the same parameter takes a STRUCT (type-safe, no quoting), a MAP, or a JSON string —
-        // exactly what fabricator_render accepts, because the params bag means the same thing in both.
+        // exactly what fluid_render accepts, because the params bag means the same thing in both.
         Params.Named("params", NullType.Default),
     }, metadata: null);
 

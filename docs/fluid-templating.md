@@ -2,14 +2,14 @@
 
 > **Status: slice 0 SHIPPED (`7f1940c`), slice 1 SHIPPED (`58aa6b4`, §7), slice 2 MEASURED (§8 — the answer is
 > PERMISSIVE), slice 3 SHIPPED (§9), slice 4 SHIPPED (§10); slice 5 PLANNED, and §10.8 says re-derive it.**
-> The shipped part is `fabricator_render` as a bundled plugin; its record lives in
+> The shipped part is `fluid_render` as a bundled plugin; its record lives in
 > [plugin-system.md](plugin-system.md) §The FLUID plugin. This document is the FOLLOW-ON plan, written
 > down because the architectural finding in §2 is what makes slices 2–5 possible without undoing the move.
 
 ## 0. What is already there (do not re-derive it)
 
 - **`Fabricator.FluidPlugin`** — an `IBackend` named `fluid`, contributing ONE global scalar,
-  `fabricator_render(template, params)`. Params is a DuckDB `STRUCT` **or** a JSON string.
+  `fluid_render(template, params)`. Params is a DuckDB `STRUCT` **or** a JSON string.
 - **Pinned at `Fluid.Core 3.0.0-beta.7`** — a PRERELEASE. A bump there is a code-compatibility question,
   not a routine one, and `verify_plugin_fluid.test` is what answers it.
 - **It ships**: `pack-distribution.ps1` step 2b stages it under `<managed>/plugins/`, which
@@ -27,7 +27,7 @@ recoverable from the code.
 ### 1.1 `fluid_query` — a global **sqlgen** table function
 
 Accepts a template and a JSON argument; the rendered text IS the SQL. Fluid can reach a
-`System.Text.Json` `JsonNode` directly, so `JsonToClr` (the hand-rolled mapper `fabricator_render` uses)
+`System.Text.Json` `JsonNode` directly, so `JsonToClr` (the hand-rolled mapper `fluid_render` uses)
 may be unnecessary:
 
 ```csharp
@@ -122,7 +122,7 @@ one thing: the probe found a hazard neither branch below anticipated — a bind-
 
 The original framing was:
 
-- If bind-time `host_query` is safe ⇒ `query` works in both `fabricator_render` (execute time) and
+- If bind-time `host_query` is safe ⇒ `query` works in both `fluid_render` (execute time) and
   `fluid_query` (bind time).
 - If it is not ⇒ **`query` is available at execute time and REFUSED at bind time**, which is a real
   asymmetry the surface has to state rather than hide.
@@ -179,7 +179,7 @@ SELECT * FROM fluid_query('SELECT {{ n }} AS n', params := {'n': 7});
 
 `template` is positional and NON-nullable; **`params` is NAMED and optional** (the `fabricator_sql_seq(2,
 cols := 3)` precedent), so a template with no variables is simply `fluid_query('SELECT 1')`. It takes the
-same bag `fabricator_render` does — a STRUCT, a MAP, or a JSON string — because a params bag has to mean the
+same bag `fluid_render` does — a STRUCT, a MAP, or a JSON string — because a params bag has to mean the
 same thing in both.
 
 ### 7.1 ⚠⚠ THE FINDING THE SLICE TURNS ON: Fluid's native `JsonNode` support RENDERS CORRECTLY AND COMPUTES WRONG
@@ -220,7 +220,7 @@ so **the whole expression is `double` and the int64 branch has never had any eff
 `TryGetInt64` returns true, and the boxed value's runtime type is `Double`; with explicit `(object)` casts it
 is `Int64`.
 
-The user-visible consequence: `fabricator_render('{{ n }}', '{"n":9007199254740993}')` returned
+The user-visible consequence: `fluid_render('{{ n }}', '{"n":9007199254740993}')` returned
 **`9007199254740990`**, while the identical value as a DuckDB `BIGINT` returned it exactly. Two independent
 losses compounded — the silent widening to double, then Fluid's `Convert.ToDecimal(double)`, which keeps only
 15 significant digits.
@@ -254,7 +254,7 @@ control — without which the check would pass equally on a build that refused e
 
 ⚠ **A CONSEQUENCE, pinned as a decision:** taking the decimal rung preserves a JSON number's written form, so
 `3.0` renders `3.0` where the double path rendered `3`. Better for a function emitting SQL (the literal keeps
-its type), but it IS a change to `fabricator_render`'s output.
+its type), but it IS a change to `fluid_render`'s output.
 
 ⚠ **STILL TRUE AND NOT FIXED:** a genuine CLR `double` (a DuckDB `DOUBLE` column) has ~17 significant digits
 and Fluid keeps 15. That is Fluid's model, not something the ladder can route around; a `DOUBLE` params value
@@ -299,7 +299,7 @@ holding the `IFluidIndexable` rather than unwrapping the `FluidValue`.
 Found by probing edge cases after the slice was otherwise finished, which is the only reason they were found
 at all: nothing in the plan mentions dates.
 
-**A DATE RENDERED THE PREVIOUS DAY.** On a UTC+2 box, `fabricator_render('{{ d }}', {'d': DATE '2026-09-01'})`
+**A DATE RENDERED THE PREVIOUS DAY.** On a UTC+2 box, `fluid_render('{{ d }}', {'d': DATE '2026-09-01'})`
 returned **`2026-08-31 22:00:00Z`**. `Date32Array.GetDateTime` returns a `DateTime` with
 `Kind = Unspecified`, which Fluid resolves against the machine's LOCAL zone. Pre-existing, and made worse by
 this slice: `fluid_query` would splice that wrong date into a statement. Fixed by stamping the Kind
@@ -465,7 +465,7 @@ case. Both of these work and both are gated:
 
 **§3's hazard is CLOSED, and the answer is the permissive one.** Bind-time `host_query` neither deadlocks nor
 crashes, and — the part §3 did not anticipate — its transaction semantics are the SAME at bind and at
-execute, so there is no asymmetry for the surface to state. `query` can exist in BOTH `fabricator_render`
+execute, so there is no asymmetry for the surface to state. `query` can exist in BOTH `fluid_render`
 (execute time) and `fluid_query` (bind time). **Slice 3 is unblocked in its simple form.**
 
 Method: a THROWAWAY `ISqlTableFunction` (`fabricator_bind_probe(sql)`) in `Fabricator.SqlServer` whose
@@ -850,7 +850,7 @@ Fatal error. 0xC0000005
 
 **Every `fs_*` host callback takes the calling operator's `ClientContext` as its opener and dereferences it
 (`auto *ctx = reinterpret_cast<ClientContext *>(opener); FileSystem::GetFileSystem(*ctx)`), and a GLOBAL
-function has no ambient opener established.** Both `fabricator_render` (a global scalar) and `fluid_query`
+function has no ambient opener established.** Both `fluid_render` (a global scalar) and `fluid_query`
 (a global sqlgen table function) are exactly that. So the blocker was never the assembly the type lives in —
 **it is that the AMBIENT the seam needs is not established for global functions**, which §2 could not see
 because it was reasoning about references rather than about call context.
@@ -899,7 +899,7 @@ catalog and scan crossings and **not from a global scalar's execute**.
    the BINDER's thread, the same thread that later evaluates the scalar — leaks where a table function's
    scan (a worker thread) does not:
 
-   | between `SET` and `fabricator_render('{% include … %}')` | result |
+   | between `SET` and `fluid_render('{% include … %}')` | result |
    |---|---|
    | nothing | **fails** — "no root is set" |
    | `SELECT * FROM fluid_query('SELECT 1 AS x')` | **renders** |
@@ -1006,7 +1006,7 @@ ValueTask<TemplateSourceInfo> GetFileInfoAsync(string subpath, TemplateContext c
 - **Bytes are streamed to Fluid undecoded.** ⚠ A BOM-stripping branch was written here and **a mutant proved
   it INERT**: `TemplateSourceInfo` takes a stream factory and Fluid reads it with a `StreamReader`, which
   detects and strips a UTF-8 byte-order mark itself. Deleted. ⚠ Fluid does NOT strip a BOM from a template
-  passed as a STRING (measured), so `fabricator_render` on a BOM-prefixed literal keeps it — that is the
+  passed as a STRING (measured), so `fluid_render` on a BOM-prefixed literal keeps it — that is the
   caller's own text.
 
 ### 10.6 ⚠⚠ THE ROOT IS ERGONOMICS, NOT A SANDBOX — and saying so is the point
@@ -1064,7 +1064,7 @@ the code:
 - **The ambient gap (10.2) is the real follow-on**, and it is not Fluid's: until a global function can reach
   the host filesystem and its own session's settings, every plugin has the same two limitations.
 - ⚠ A per-call `template_root` argument was considered and not built. It is clean for `fluid_query` (a named
-  table-function parameter) and awkward for `fabricator_render` (a scalar, so a third parameter means a second
+  table-function parameter) and awkward for `fluid_render` (a scalar, so a third parameter means a second
   arity), and the global setting plus absolute paths covers the cases. Revisit if the process-wide scope
   becomes a real complaint rather than an aesthetic one.
 
@@ -1077,8 +1077,8 @@ Tiers: hermetic **74/74 — 8259** (unchanged — no hermetic suite loads this p
 **54/54 — 3302** = 3272 + exactly this suite's 30, which is what shows no other suite moved.
 
 ```sql
-SELECT fabricator_render('inserted={{ exec("INSERT INTO audit VALUES (1),(2),(3)") }}', NULL);  -- inserted=3
-SELECT fabricator_render('deleted={{ "DELETE FROM t WHERE g = $g" | exec: g: "eu" }}', NULL);   -- deleted=2
+SELECT fluid_render('inserted={{ exec("INSERT INTO audit VALUES (1),(2),(3)") }}', NULL);  -- inserted=3
+SELECT fluid_render('deleted={{ "DELETE FROM t WHERE g = $g" | exec: g: "eu" }}', NULL);   -- deleted=2
 ```
 
 It also gives `IHostQuery.ExecuteNonQuery` its first caller — the member §8.2a of docs/plugin-services.md
@@ -1104,7 +1104,7 @@ A `fluid_query` template renders inside `bind_replace`, and a bind REPEATS and h
 ON EVERY USE — and it works in testing, where the statement runs once. `EXPLAIN` writing is startling;
 a view that writes per use is what actually bites.
 
-`fabricator_render` behaves differently for a reason worth keeping straight: it is a **VOLATILE** scalar (the
+`fluid_render` behaves differently for a reason worth keeping straight: it is a **VOLATILE** scalar (the
 `IScalarFunction` default, which the plugin does not override), so DuckDB never folds it into the PLAN —
 `EXPLAIN` of a render containing `exec()` leaves the table unchanged (measured), and the plan shows the
 un-folded call. Its multiplier is ROWS, not binds.
@@ -1194,7 +1194,7 @@ projection.
 - It is the measured form of *"exec grants no authority a caller did not already have"* — the authority was
   reachable before `exec()` existed.
 - Same conclusion §10.4 reached one level down about the template ROOT — *ergonomics, not a sandbox* — for
-  the same reason: **the renderer can already run SQL.** Anyone who can call `fabricator_render` or
+  the same reason: **the renderer can already run SQL.** Anyone who can call `fluid_render` or
   `fluid_query` can call `fabricator_exec` directly.
 - ⚠ **Do NOT "fix" it by blacklisting function names in the classified SQL.** That is the prefix-check
   anti-pattern in a new costume: an allow-list of safe functions is unmaintainable, and a deny-list is
@@ -1278,7 +1278,7 @@ description, not the behaviour.
 Gated: the write and its count; **the four-step bind-time multiplication in `fluid_query`** (each step
 against a fresh counter, so it reads as three facts rather than one total) with a `query()`-still-works
 POSITIVE CONTROL beside it and an assertion that the *other* table was untouched; `EXPLAIN` not writing on
-the `fabricator_render` side; both SELECT refusals; the syntax-error path; the DDL/CTAS/host_exec triple;
+the `fluid_render` side; both SELECT refusals; the syntax-error path; the DDL/CTAS/host_exec triple;
 several statements; the filter form with a named parameter; the INJECTION pair (`0` deleted, table intact —
 `0` alone would also be true of a parameter that never arrived); the two-path agreement; per-row evaluation
 (3 rows ⇒ 3 writes); and the empty-statement guard, which must come BEFORE the classifier because an empty
@@ -1338,10 +1338,10 @@ there is nothing to clean up.
 `using`. Both `query()` and `exec()` — and the CLASSIFIER, so one connection per render rather than one
 per classification — go through it.
 
-1. **Semantics**: "a rendered template" is what was asked for. For `fabricator_render` that is per ROW;
+1. **Semantics**: "a rendered template" is what was asked for. For `fluid_render` that is per ROW;
    for `fluid_query`, one bind.
 2. **Thread safety, by construction**: a DuckDB connection is single-threaded by contract and
-   `fabricator_render` is a VOLATILE scalar that may be evaluated on several threads at once. Each render
+   `fluid_render` is a VOLATILE scalar that may be evaluated on several threads at once. Each render
    builds its own `TemplateContext`, hence its own session, so nothing is shared. ⚠ Do NOT hoist it to a
    static or onto the shared `TemplateOptions` — the same trap the `query` FILTER registration documents.
 3. **⚠⚠ Correctness, which is the one I had not anticipated.** `OpenConnection` applies the caller's
@@ -1350,7 +1350,7 @@ per classification — go through it.
    reported the zone the first render had seen, failing a PRE-EXISTING v83 assertion. A wrong VALUE, not
    stale scratch state.
 
-**⚠ LAZY, and that is load-bearing rather than an optimisation.** `fabricator_render` is evaluated per
+**⚠ LAZY, and that is load-bearing rather than an optimisation.** `fluid_render` is evaluated per
 ROW, so an eagerly-opened connection would cost one open per row for every template — including the
 overwhelming majority that run no SQL at all. Nothing is opened until the first `query()` or `exec()`.
 
@@ -1444,7 +1444,7 @@ body **to a separate output**, executes the captured text as SQL, and writes **n
 output. Gate `verify_plugin_fluid` **256 → 275**, two mutants.
 
 ```sql
-SELECT fabricator_render('{% exec %}
+SELECT fluid_render('{% exec %}
 INSERT INTO t VALUES
 {% for r in rows %}({{ r.id }}, {{ r.name | sql }}){% unless forloop.last %},{% endunless %}
 {% endfor %}
@@ -1533,3 +1533,29 @@ cached with `{% exec %}` unrecognised and stay that way for the process's life.
 ⚠ The three spellings of `exec` coexist — the BLOCK, the `exec()` function and the `| exec` filter — because
 tags and expressions are different grammars in Fluid. Pinned, because it is not obvious and a change
 would silently break one of them.
+
+## 14. `fabricator_render` IS NOW `fluid_render` (2026-09-03, BREAKING, no alias)
+
+User-asked. The function is contributed by the Fluid provider and its sibling was already `fluid_query`, so
+the `fluid_` prefix is the one that describes it; `fabricator_*` is the core/host namespace
+(`fabricator_query`, `fabricator_exec`, `fabricator_host_query`, `fabricator_plugins`). Per this repo's
+standing convention for renames — the `fabricator` rename, `IArrow*`, `ITable`, `IProvider` — **no alias is
+kept**: the old spelling now answers *"Scalar Function with name fabricator_render does not exist!"*.
+
+⚠ **THE CODE CHANGE IS ONE LINE.** `FluidRenderFunction.Name`; everything else in the plugin was doc
+comments. The bulk of the work was the 133 occurrences in `verify_plugin_fluid.test` and 20 in the README.
+
+⚠ **It silently changed an ORDER BY, which is the one thing a mechanical rename can break.**
+`verify_plugin_fluid`'s registration check does
+`… WHERE function_name IN ('fluid_render','fluid_query') GROUP BY 1 ORDER BY 1` — and
+`fabricator_render` sorted BEFORE `fluid_query` while `fluid_render` sorts AFTER it, so the expected rows
+had to swap. Caught by running the suite; a rename that only compiles is not a rename that passes.
+
+### 14.1 ⚠ Older dated records deliberately keep the old spelling
+
+`docs/abi-history.md` (the v80/v82 entries), `docs/feature-history.md`, `docs/plugin-system.md` §The FLUID
+plugin, and the floor-bump comments in `scripts/run-suites.sh` still say `fabricator_render`. That is the
+convention every previous rename here followed: a passage that RECORDS what was measured on a given day is
+not made truer by rewriting the name it was measured under. **Every `fabricator_render` in a dated record
+is this function under its former name** — said here once so the connection is findable, rather than
+annotating each site.

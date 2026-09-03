@@ -1294,8 +1294,8 @@ also the one capability the README documents as available out of the box. So:
 
 ```
 FABRICATOR_PLUGIN_DIR = D:/repos/fabricator-dlrest/.../net8.0     (the user's actual setting)
-    before: fabricator_render → does not exist
-    after:  fabricator_render('both work: {{ n }}', {'n':'yes'}) → both work: yes
+    before: fluid_render → does not exist
+    after:  fluid_render('both work: {{ n }}', {'n':'yes'}) → both work: yes
             fabricator_plugins() → loaded | dlrest
 ```
 

@@ -123,7 +123,7 @@ Publish-Project $daxProj "Fabricator.AnalysisServices"
 $deltaBuiltinProj = Join-Path $PSScriptRoot "../dotnet/Fabricator.Delta/Fabricator.Delta.csproj" | Resolve-Path
 Publish-Project $deltaBuiltinProj "Fabricator.Delta"
 
-# The Fluid template engine (fabricator_render, fluid_query). A BUILT-IN provider assembly since
+# The Fluid template engine (fluid_render, fluid_query). A BUILT-IN provider assembly since
 # 2026-09-02, not a plugin: ProviderRegistry discovers it by GLOBBING this directory for `Fabricator*.dll`.
 # /!\/!\ UNLIKE Fabricator.Delta above, NOTHING ELSE REFERENCES THIS PROJECT, so THIS LINE IS THE ONLY
 # THING THAT PUTS IT IN THE PAYLOAD -- and since discovery is now a glob of what was published, the publish

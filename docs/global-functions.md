@@ -39,7 +39,7 @@
 A global function is **connection-free and ATTACH-free**: `SELECT hilbert_index([1, 2, 3], 10)`
 works on a bare DuckDB with the extension loaded — no `ATTACH … (TYPE fabricator)`, no SQL Server / DAX
 connection. That is exactly right for:
-- a **template engine** (`fabricator_render(template, params)` → text) — pure compute, no backend. ⚠ **That
+- a **template engine** (`fluid_render(template, params)` → text) — pure compute, no backend. ⚠ **That
   one moved OUT on 2026-09-01**: it is the `Fabricator.FluidPlugin` plugin now, so it is connection-free
   *and* opt-in. The mechanism it demonstrated is unchanged — a plugin contributes global scalars through the
   very same `IBackend.GlobalScalarFunctions` path — which is the point: the scope does not care who supplies
@@ -264,7 +264,7 @@ catalog/proc/custom callsite + churn `ITableFunctionBinding.Execute`), the opene
 Side effects belong in **table / in-out / collector / aggregate-finalize**, never scalars (optimizer purity).
 So the effectful "apply" steps can be **global** too — e.g. a global `fabricator_apply_tmdl(<fragments>)`
 **collector** (collect fragments → one atomic apply at Finalize, run once single-threaded) whose target is
-addressed by its args (a connstr/endpoint), composing with the global `fabricator_render` scalar: render (pure
+addressed by its args (a connstr/endpoint), composing with the global `fluid_render` scalar: render (pure
 global scalar) → apply (effectful global collector), **both connection-free / no ATTACH**. A target that's
 inherently a live model/connection is more naturally catalog-bound; a target addressable by an arg works global.
 
@@ -332,7 +332,7 @@ NULL/guards, partitioned CTAS + a duckdb_logs `pruned=2` pin proving fold→prun
 
 ## The template-engine demo (the motivator)
 
-A provider-agnostic core global, e.g. `fabricator_render(template VARCHAR, params <any>) → VARCHAR`:
+A provider-agnostic core global, e.g. `fluid_render(template VARCHAR, params <any>) → VARCHAR`:
 - **Engine**: **Fluid** (`github.com/sebastienros/fluid`) — a pure-managed (.NET, MIT, on Parlot) **Liquid**
   template engine; published transitively like `Azure.Identity` / engineered-wood. Chosen over Scriban for this
   use because (a) **secure-by-default** — Liquid + opt-in `MemberAccessStrategy`, no arbitrary .NET eval, so a
@@ -353,7 +353,7 @@ A provider-agnostic core global, e.g. `fabricator_render(template VARCHAR, param
   constant across a batch — a literal), render per row off the cached, thread-safe template.
 
 **Composition with TMDL** (the original driver, [docs/dax-provider.md](dax-provider.md) "TMDL"): the global
-scalar is the **"dynamically create a TMDL"** step — `fabricator_render(tmdl_template, params)` → a TMDL string —
+scalar is the **"dynamically create a TMDL"** step — `fluid_render(tmdl_template, params)` → a TMDL string —
 which then feeds the **effectful apply** step (a table function / the collector `apply_tmdl`, never a
 side-effecting scalar). Render = pure global scalar; apply = catalog/collector. Clean separation of the pure and
 effectful halves, exactly as deliberated.
@@ -366,7 +366,7 @@ effectful halves, exactly as deliberated.
   ANY-declared position; resolves on a bare loaded extension (no catalog); a collision test if two providers
   declare the same global name.
   ⚠ **The template-engine assertions are no longer here.** They led this suite until 2026-09-01, when
-  `fabricator_render` became `Fabricator.FluidPlugin`; they moved verbatim to
+  `fluid_render` became `Fabricator.FluidPlugin`; they moved verbatim to
   `test/verify_plugin_fluid.test`, which is a SERVICE-tier suite because the hermetic tier points
   `FABRICATOR_PLUGIN_DIR` at an empty directory on purpose. Later
   slices add: a global **table** fn (`SELECT * FROM fabricator_gen(3)`) proving arg-dependent output schema via
@@ -384,7 +384,7 @@ built once in slice 1; each later slice just extends the handle-0 branch to one 
 1. **Global scalar — DONE** (ABI v46): the `IScalarFunction`/`ICatalogScalarFunction` rename, `list_global_functions`
    + handle-0 reuse of `get_function_*_schema`/`execute_scalar`, `IBackend.GlobalScalarFunctions` (unioned by
    `GlobalFunctions`), `RegisterFabricatorGlobalFunctions` at load (shared `BuildFabricatorScalarFunction`), the
-   `fabricator_render` (Fluid/Liquid) demo. `test/verify_global_functions.test`. Unblocks the TMDL render step.
+   `fluid_render` (Fluid/Liquid) demo. `test/verify_global_functions.test`. Unblocks the TMDL render step.
 2. **Global in-out + collector (pure-C#) — DONE**: the `IInOutFunction`/`ICollectorTableFunction` base renames;
    the handle-0 branch on `inout_bind` resolves against the C# global registry (`GlobalFunctions.ResolveInOut`,
    a collector wrapped as `CollectorInOutBinding`); `RegisterFabricatorGlobalFunctions` registers the

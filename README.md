@@ -1293,7 +1293,7 @@ which **replaces** the defaults rather than adding to them — otherwise **two**
    reports) — a place a plugin may be dropped so it travels with the extension. ⚠ **Nothing ships there
    today.** The Fluid template engine used to, and became part of the extension proper on 2026-09-02 —
    precisely because `FABRICATOR_PLUGIN_DIR` replaces this root rather than extending it, so setting it to
-   load your own plugin silently cost you `fabricator_render`.
+   load your own plugin silently cost you `fluid_render`.
 
 **The first root wins.** If the same plugin is present in both, the one in (1) loads and the other is
 reported `rejected` with a provider-name collision — so installing your own copy of a bundled plugin takes
@@ -1305,19 +1305,19 @@ A plugin's global functions are registered while the extension loads, so a plugi
 available the **next time** DuckDB loads fabricator — not in the running session. See
 [docs/plugin-system.md](docs/plugin-system.md).
 
-#### Templates — `fabricator_render(...)` and `fluid_query(...)`
+#### Templates — `fluid_render(...)` and `fluid_query(...)`
 
 The **Fluid / Liquid template engine** is **built in** — it ships inside the extension and needs no
 configuration. It contributes two global functions, both taking a params bag that is a DuckDB `STRUCT`
 (preferred — typed, no quoting), a `MAP`, or a JSON string.
 
-**`fabricator_render(template, params)`** renders a template to **text**:
+**`fluid_render(template, params)`** renders a template to **text**:
 
 ```sql
-SELECT fabricator_render('Hello {{ name }}, you have {{ n }} messages', {'name':'world','n':3});
+SELECT fluid_render('Hello {{ name }}, you have {{ n }} messages', {'name':'world','n':3});
 -- Hello world, you have 3 messages
 
-SELECT fabricator_render('{% if x > 1 %}big{% else %}small{% endif %}', '{"x":5}');
+SELECT fluid_render('{% if x > 1 %}big{% else %}small{% endif %}', '{"x":5}');
 -- big
 ```
 
@@ -1364,7 +1364,7 @@ one prepared statement**), or `params := {'cols': getvariable('cols')}` to drive
 connected to and hands the template its rows, addressable by name, by index and by `.size`:
 
 ```sql
-SELECT fabricator_render(
+SELECT fluid_render(
   '{% assign rs = query("SELECT region, sum(amt) AS total FROM orders GROUP BY region ORDER BY region") %}
    {% for r in rs %}{{ r.region }}={{ r.total }} {% endfor %}', NULL);
 -- eu=15 us=25
@@ -1387,7 +1387,7 @@ SELECT * FROM fluid_query(
 references them as `$name`:
 
 ```sql
-SELECT fabricator_render(
+SELECT fluid_render(
   '{% assign rs = "SELECT sum(amt) AS total FROM orders
                    WHERE region = $region AND amt > $min" | query: region: "eu", min: 6 %}
    {% for r in rs %}{{ r.total }}{% endfor %}', NULL);
@@ -1401,7 +1401,7 @@ SELECT fabricator_render(
 The values are **bound, never spliced**, so a parameter can never become SQL:
 
 ```sql
-SELECT fabricator_render(
+SELECT fluid_render(
   '{% assign rs = "SELECT count(*) AS n FROM orders WHERE region = $r"
     | query: r: "eu'' OR 1=1 --" %}{% for r in rs %}{{ r.n }}{% endfor %}', NULL);
 -- 0   (one value that matches no region — not 3, which splicing would have given)
@@ -1418,7 +1418,7 @@ parameter the statement wants but you did not supply is reported by DuckDB, nami
 > is used. Anything else is refused before it runs, by DuckDB's own parser:
 >
 > ```sql
-> SELECT fabricator_render('{% assign r = query("DELETE FROM orders") %}x', NULL);
+> SELECT fluid_render('{% assign r = query("DELETE FROM orders") %}x', NULL);
 > -- Error: query() runs SELECT statements only ... Only SELECT statements can be serialized to json!
 > ```
 >
@@ -1443,7 +1443,7 @@ statements only, `exec()` runs everything else, and both decide with DuckDB's ow
 affected-row count, so a template can report what it did:
 
 ```sql
-SELECT fabricator_render('inserted={{ exec("INSERT INTO audit VALUES (1), (2), (3)") }}', NULL);
+SELECT fluid_render('inserted={{ exec("INSERT INTO audit VALUES (1), (2), (3)") }}', NULL);
 -- inserted=3
 ```
 
@@ -1451,14 +1451,14 @@ Parameters bind by name through the filter form, exactly as for `query()` — an
 the value is bound rather than spliced:
 
 ```sql
-SELECT fabricator_render('deleted={{ "DELETE FROM orders WHERE region = $r" | exec: r: "eu" }}', NULL);
+SELECT fluid_render('deleted={{ "DELETE FROM orders WHERE region = $r" | exec: r: "eu" }}', NULL);
 -- deleted=2
 ```
 
 Unlike `query()`, the plain form takes **several statements in one call**, and the count is the last one's:
 
 ```sql
-SELECT fabricator_render('{{ exec("CREATE TABLE m AS SELECT 1 AS c; INSERT INTO m VALUES (2)") }}', NULL);
+SELECT fluid_render('{{ exec("CREATE TABLE m AS SELECT 1 AS c; INSERT INTO m VALUES (2)") }}', NULL);
 -- 1        (and m now has 2 rows)
 ```
 
@@ -1476,9 +1476,9 @@ SELECT fabricator_render('{{ exec("CREATE TABLE m AS SELECT 1 AS c; INSERT INTO 
 > **The last two rows are the ones that bite.** A writing template behind a view writes on *every use*, and
 > it looks fine in testing, where the statement runs once. `EXPLAIN` writing is merely startling.
 >
-> **So put writes in `fabricator_render` unless you specifically want one per bind.** It is a volatile
+> **So put writes in `fluid_render` unless you specifically want one per bind.** It is a volatile
 > scalar, so it is never folded into a plan (an `EXPLAIN` does not run it) — its multiplier is *rows*, which
-> you control by choosing the statement's cardinality. `SELECT fabricator_render(…)` with no `FROM` is one
+> you control by choosing the statement's cardinality. `SELECT fluid_render(…)` with no `FROM` is one
 > row.
 
 > ⚠⚠ **A statement cannot see the write its own template made — so "prepare, then select" does not work.**
@@ -1516,7 +1516,7 @@ SELECT fabricator_render('{{ exec("CREATE TABLE m AS SELECT 1 AS c; INSERT INTO 
 > AS SELECT` reports the rows it created here (`7`) and `0` there, because only the SQL-level function can
 > ask the engine to classify the statement. Plain DDL is `0` in both.
 
-> ⚠ **`fabricator_render` is a scalar, so `exec()` runs once PER ROW.** Rendering a writing template over
+> ⚠ **`fluid_render` is a scalar, so `exec()` runs once PER ROW.** Rendering a writing template over
 > three rows performs the write three times — measured. That is the multiplier to watch on this surface, as
 > bind repetition is on the other one.
 
@@ -1525,7 +1525,7 @@ executed as SQL, and **nothing is written to the output** — so the statement i
 multi-line, with `{% for %}` and `{% if %}` inside it, and no quote-escaping.
 
 ```sql
-SELECT fabricator_render('{% exec %}
+SELECT fluid_render('{% exec %}
 INSERT INTO audit VALUES
 {% for r in rows %}({{ r.id }}, {{ r.name | sql }}){% unless forloop.last %},{% endunless %}
 {% endfor %}
@@ -1537,7 +1537,7 @@ Because the block is a *statement* rather than an argument, it is naturally cond
 `{% exec %}` runs nothing:
 
 ```sql
-SELECT fabricator_render('{% if go %}{% exec %}DELETE FROM staging{% endexec %}cleared{% else %}skipped{% endif %}', {'go': false});
+SELECT fluid_render('{% if go %}{% exec %}DELETE FROM staging{% endexec %}cleared{% else %}skipped{% endif %}', {'go': false});
 -- skipped       (and nothing was deleted)
 ```
 
@@ -1563,7 +1563,7 @@ nothing outside the render can see it, and it disappears when the render ends �
 nothing to clean up.
 
 ```sql
-SELECT fabricator_render(
+SELECT fluid_render(
   '{% assign _    = exec("CREATE TEMP TABLE scratch AS SELECT 7 AS v") %}'
   '{% assign rows = query("SELECT v FROM scratch") %}'
   'v={{ rows[0].v }}', NULL);
@@ -1581,7 +1581,7 @@ SELECT * FROM fluid_query(
 -- staged = 7
 ```
 
-> ⚠ **The scope is ONE render.** For `fluid_query` that is one bind; for `fabricator_render`, which is a
+> ⚠ **The scope is ONE render.** For `fluid_query` that is one bind; for `fluid_render`, which is a
 > scalar, it is **one row** — so three rows are three connections, and a temp table made by one row is
 > invisible to the next. That is deliberate: it is what keeps a per-row scalar from accumulating state, and
 > what makes rendering on several threads safe.
@@ -1613,7 +1613,7 @@ SELECT * FROM fluid_query(
 
 
 
-`exec()` gives a template no authority you did not already have — anyone who can call `fabricator_render`
+`exec()` gives a template no authority you did not already have — anyone who can call `fluid_render`
 can call [`fabricator_exec`](#fabricator_execcontext-sql---bigint) — and it reads and writes on its own connection,
 so the same committed-data rule as `query()` applies.
 

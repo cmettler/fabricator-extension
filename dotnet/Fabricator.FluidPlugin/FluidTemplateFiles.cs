@@ -20,7 +20,7 @@ namespace Fabricator.FluidPlugin;
 /// SEAM — and that is a MEASURED correction of the plan, not a shortcut.</b> §2 of the plan predicted this
 /// slice would need a host filesystem service (there is one now — <see cref="IHostFileSystem"/>); one was built, and it
 /// CANNOT WORK from here. Every host filesystem callback takes the calling operator's <c>ClientContext</c>
-/// as its opener, and a GLOBAL function — which both <c>fabricator_render</c> and <c>fluid_query</c> are —
+/// as its opener, and a GLOBAL function — which both <c>fluid_render</c> and <c>fluid_query</c> are —
 /// has no ambient opener established: measured, the read reached <c>fs_open_read</c> with a null handle and
 /// the process died with an access violation inside <c>HostFs.OpenRead</c>. The blocker was never that the
 /// TYPE lived in the bridge; it is that the AMBIENT the seam needs is not established for global functions.
@@ -159,7 +159,7 @@ internal sealed class HostTemplateFileProvider : ITemplateFileProvider
     /// mark itself. Decoding here would have meant handing Fluid a string it then re-encodes — and it is how
     /// a BOM-stripping branch came to be written here and MEASURED inert: a mutant that removed it changed
     /// nothing, because the BOM never survives to us. (Fluid does NOT strip one from a template passed as a
-    /// STRING — measured — so <c>fabricator_render</c> on a BOM-prefixed literal keeps it. That is the
+    /// STRING — measured — so <c>fluid_render</c> on a BOM-prefixed literal keeps it. That is the
     /// caller's own text, and not ours to edit.)
     /// </remarks>
     private sealed record Loaded(byte[] Bytes, DateTimeOffset LastModified);

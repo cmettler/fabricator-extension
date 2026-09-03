@@ -2,14 +2,14 @@
 # description: Load-time GLOBAL (connection-free) functions — a bare fn(...) registered at extension load,
 #              usable with NO ATTACH and no SQL Server / DAX connection. Proves the global-function path
 #              end-to-end (list_global_functions + the handle-0 scalar dispatch). ⚠ The former headline demo,
-#              fabricator_render, is now a plugin — see verify_plugin_fluid.test. See docs/global-functions.md.
+#              fluid_render, is now a plugin — see verify_plugin_fluid.test. See docs/global-functions.md.
 # group: [fabricator]
 
 require fabricator
 
 # NOTE: no ATTACH, no require-env — a global function resolves on a bare loaded extension.
 
-# ⚠ THE OPENING SCALAR DEMO MOVED OUT. fabricator_render (the Fluid/Liquid template engine) used to lead
+# ⚠ THE OPENING SCALAR DEMO MOVED OUT. fluid_render (the Fluid/Liquid template engine) used to lead
 # this file and was its simplest end-to-end proof of the global SCALAR path. It is now a PLUGIN
 # (dotnet/Fabricator.FluidPlugin), so it is NOT registered on a bare extension and cannot be asserted here:
 # the hermetic tier points FABRICATOR_PLUGIN_DIR at an empty directory on purpose. Its nine assertions moved
@@ -248,7 +248,7 @@ SELECT n, value FROM fabricator_mix((SELECT * FROM (VALUES (1),(2)) v(n)), 3) OR
 # feature: a build that fixes the return type at registration CANNOT make them differ, whatever it reports.
 #
 # ⚠ The POSITIVE CONTROL is the fixed-return assertions ABOVE (hilbert_index, bucket, fabricator_va_concat
-# — fabricator_render used to be named here and is now a plugin). Without them
+# — fluid_render used to be named here and is now a plugin). Without them
 # "two calls report two types" would pass equally on a build where the declared path had stopped working
 # and everything resolved at bind — and the declared path is what every other scalar in the product uses.
 # ============================================================================================
@@ -317,7 +317,7 @@ must not be NULL
 # cast.
 #
 # ⚠⚠ THE CARRIER IS A VARARGS TAIL, AND THAT IS A DELIBERATE SUBSTITUTION. The original carrier was
-# `fabricator_render('tpl', NULL)`, whose `params` was the ONLY ANY-declared non-varargs global scalar
+# `fluid_render('tpl', NULL)`, whose `params` was the ONLY ANY-declared non-varargs global scalar
 # parameter in the tree — and it left with the Fluid plugin. An ANY *tail* registers as the same
 # LogicalType::ANY and is likewise never cast, so it crosses identically; MEASURED before the substitution
 # was made, not assumed. The render spelling is still gated, in verify_plugin_fluid.test.

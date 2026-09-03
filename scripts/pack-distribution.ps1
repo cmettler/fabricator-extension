@@ -137,7 +137,7 @@ if (-not (Test-Path $managedPath)) { throw "Managed directory not found: $manage
 # 2026-09-02 (publish-managed.ps1 publishes Fabricator.FluidPlugin into the managed dir; BackendRegistry
 # discovers it by name). The reason is a footgun rather than tidiness: FABRICATOR_PLUGIN_DIR REPLACES the
 # plugin roots rather than extending them, so a user pointing it at their OWN plugin silently lost
-# fabricator_render -- and the bundled root's only occupant was the one capability documented as available
+# fluid_render -- and the bundled root's only occupant was the one capability documented as available
 # out of the box.
 #
 # PluginPaths.BundledRelativeRoot ("plugins" under the managed dir) is STILL a default search root and its

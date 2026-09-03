@@ -17,7 +17,7 @@ namespace Fabricator.FluidPlugin;
 /// a JSON string — becomes template variables, and how a value renders, compares and arithmetics inside a
 /// template.
 ///
-/// <para>It is deliberately one type rather than one per function. <c>fabricator_render</c> produces TEXT and
+/// <para>It is deliberately one type rather than one per function. <c>fluid_render</c> produces TEXT and
 /// <c>fluid_query</c> produces SQL, but a params bag means the same thing in both, and two mappings that
 /// drifted would make the same JSON render differently depending on which function you called.</para>
 ///

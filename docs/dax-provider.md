@@ -363,7 +363,7 @@ lateral-capable apply is `apply_tmdl_each(<rows>)`; no new "lateral table functi
 **The function family (each in its natural shape; TOM-backed):**
 - **`render_tmdl(template, args…)` — scalar (pure):** the templating engine — composes/chains anywhere, runs
   per row. Authored as a custom `ICatalogScalarFunction` (the 4e machinery) — or, connection-free, a global
-  `fabricator_render` (⚠ a PLUGIN since 2026-09-01 — `Fabricator.FluidPlugin`, so it is opt-in rather than
+  `fluid_render` (⚠ a PLUGIN since 2026-09-01 — `Fabricator.FluidPlugin`, so it is opt-in rather than
   always present; see [plugin-system.md](plugin-system.md)) — or just DuckDB `format`/`concat`.
 - **`<model>.tmdl()` — table function (pure read):** scripts the model to TMDL, one row per object/document
   `(path, content)`. `tmdl_of('Table','Sales')` scalar = one object (pure read → scalar is fine here).

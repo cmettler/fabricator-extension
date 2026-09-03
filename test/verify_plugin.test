@@ -32,7 +32,7 @@ Hello, Bob (from plugin)
 Hello, stranger (from plugin)
 
 # A built-in global function still works alongside the plugin's (both in the same registry, no conflict).
-# ⚠ It used to be fabricator_render here, which stopped meaning anything the day render itself became a
+# ⚠ It used to be fluid_render here, which stopped meaning anything the day render itself became a
 # plugin: the assertion is that a FIRST-PARTY global coexists with a plugin's, so it needs a first-party one.
 query I
 SELECT fabricator_va_concat('-', 'a', 'b');

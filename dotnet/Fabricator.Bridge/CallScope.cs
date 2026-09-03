@@ -31,7 +31,7 @@ namespace Fabricator.Bridge;
 /// <para>
 /// <b>⚠⚠ WITHOUT IT THE SCALAR PATH INHERITED WHATEVER THE LAST BINDER LEFT — non-deterministically, and
 /// that is strictly worse than having nothing.</b> MEASURED with a one-statement discriminator: a plain
-/// <c>SET fluid_template_root</c> is invisible to <c>fabricator_render</c>, and putting a single
+/// <c>SET fluid_template_root</c> is invisible to <c>fluid_render</c>, and putting a single
 /// <c>SELECT * FROM fluid_query('SELECT 1 AS x')</c> between the two makes it visible — because sqlgen's
 /// <c>bind_replace</c> sets the ambients on the binder's thread and never clears them, and the scalar's
 /// crossing then reads a session that is not its own. The leaked OPENER is the sharper half: it is a raw

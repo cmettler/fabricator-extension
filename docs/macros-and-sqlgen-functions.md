@@ -178,7 +178,7 @@ Findings + deviations from the plan:
   with a warning (macros land in the system catalog's `main`; provider namespacing goes in the NAME prefix).
   This settles open question #2 in favor of "force main".
 
-Demos now shipping (SQL Server provider = the always-present default, like `fabricator_render`):
+Demos now shipping (SQL Server provider = the always-present default, like `fluid_render`):
 `fabricator_rowid_parts(rid)` (scalar → struct), `fabricator_rowid_of(ordinal, position)` /
 `(parts)` (**overload set**, the round-trip inverse), `fabricator_bucket_of(v, n := 8)` (**named default**),
 `fabricator_delta_head(path, n := 100)` (**table macro** over `fabricator_delta_scan`).

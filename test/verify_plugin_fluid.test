@@ -1,5 +1,5 @@
 # name: test/verify_plugin_fluid.test
-# description: The Fluid/Liquid template engine as a PLUGIN — fabricator_render(template, params), moved out
+# description: The Fluid/Liquid template engine as a PLUGIN — fluid_render(template, params), moved out
 #              of Fabricator.SqlServer into Fabricator.FluidPlugin. Two things are gated here: the render
 #              behaviour itself (moved verbatim from verify_global_functions, where it used to run against
 #              the first-party build), and the property that makes this plugin worth having in-tree — a
@@ -24,7 +24,7 @@ require-env FABRICATOR_DELTA_WRITE_DIR
 # below read TimeZoneInfo.Local, and the renders-the-previous-day bug was a local-timezone bug.
 #
 # ⚠ WHAT MOVED IT WAS A FOOTGUN, not tidiness: FABRICATOR_PLUGIN_DIR REPLACES the plugin roots rather than
-# extending them, so a user pointing it at their OWN plugin silently lost fabricator_render — and the
+# extending them, so a user pointing it at their OWN plugin silently lost fluid_render — and the
 # bundled root's only occupant was the one capability documented as available out of the box.
 # ============================================================================================
 
@@ -40,10 +40,10 @@ SELECT count(*) FROM fabricator_plugins() WHERE provider = 'fluid';
 # a build that both bundled AND published it would register twice, and every render below would still pass.
 query II
 SELECT function_name, count(*) FROM duckdb_functions()
-WHERE function_name IN ('fabricator_render', 'fluid_query') GROUP BY 1 ORDER BY 1;
+WHERE function_name IN ('fluid_render', 'fluid_query') GROUP BY 1 ORDER BY 1;
 ----
-fabricator_render	1
 fluid_query	1
+fluid_render	1
 
 # ============================================================================================
 # IT IS A PROVIDER THAT HOSTS NO CATALOG
@@ -83,19 +83,19 @@ ATTACH 'x' AS f (TYPE fabricator, PROVIDER 'nosuchprovider');
 
 # Basic render: Liquid substitution from a JSON params bag.
 query I
-SELECT fabricator_render('Hello {{ name }}, you have {{ n }} messages', '{"name":"world","n":3}');
+SELECT fluid_render('Hello {{ name }}, you have {{ n }} messages', '{"name":"world","n":3}');
 ----
 Hello world, you have 3 messages
 
 # params as a DuckDB STRUCT (type-safe, no quoting) — the SQLNULL->ANY sentinel lets the same fn accept it.
 query I
-SELECT fabricator_render('Hello {{ name }}, you have {{ n }} messages', {'name':'world','n':3});
+SELECT fluid_render('Hello {{ name }}, you have {{ n }} messages', {'name':'world','n':3});
 ----
 Hello world, you have 3 messages
 
 # STRUCT params vectorized over rows (each row's struct supplies that row's variables).
 query I
-SELECT fabricator_render('id={{ id }}', {'id': i}) AS r FROM range(3) t(i) ORDER BY r;
+SELECT fluid_render('id={{ id }}', {'id': i}) AS r FROM range(3) t(i) ORDER BY r;
 ----
 id=0
 id=1
@@ -103,7 +103,7 @@ id=2
 
 # Vectorized over a batch (the template is a per-row column; params empty object).
 query I
-SELECT fabricator_render('row ' || i::VARCHAR, '{}') AS r FROM range(3) t(i) ORDER BY i;
+SELECT fluid_render('row ' || i::VARCHAR, '{}') AS r FROM range(3) t(i) ORDER BY i;
 ----
 row 0
 row 1
@@ -111,31 +111,31 @@ row 2
 
 # Liquid control flow (if/else) — proves it's a real template engine, not just substitution.
 query I
-SELECT fabricator_render('{% if x > 1 %}big{% else %}small{% endif %}', '{"x":5}');
+SELECT fluid_render('{% if x > 1 %}big{% else %}small{% endif %}', '{"x":5}');
 ----
 big
 
 # Liquid loop over a JSON array param.
 query I
-SELECT fabricator_render('{% for i in items %}{{ i }};{% endfor %}', '{"items":[1,2,3]}');
+SELECT fluid_render('{% for i in items %}{{ i }};{% endfor %}', '{"items":[1,2,3]}');
 ----
 1;2;3;
 
 # A NULL template yields NULL (SPECIAL_HANDLING — the function sees NULL args).
 query I
-SELECT fabricator_render(NULL, '{"a":1}');
+SELECT fluid_render(NULL, '{"a":1}');
 ----
 NULL
 
 # An unreferenced/empty params object renders the literal text.
 query I
-SELECT fabricator_render('static text', '{}');
+SELECT fluid_render('static text', '{}');
 ----
 static text
 
 # Composes with a normal query (no catalog dependency): a per-row JSON params string.
 query I
-SELECT fabricator_render('id={{ id }}', '{"id":' || i::VARCHAR || '}') AS r FROM range(2) t(i) ORDER BY i;
+SELECT fluid_render('id={{ id }}', '{"id":' || i::VARCHAR || '}') AS r FROM range(2) t(i) ORDER BY i;
 ----
 id=0
 id=1
@@ -149,7 +149,7 @@ id=1
 # cast. ⚠ verify_global_functions keeps a VARARGS-tail twin of this assertion, so the crossing stays covered
 # in the hermetic tier where no plugin is loaded.
 query I
-SELECT fabricator_render('x{{ a }}', NULL);
+SELECT fluid_render('x{{ a }}', NULL);
 ----
 x
 
@@ -165,38 +165,38 @@ x
 # The brackets are load-bearing: an empty render and a NULL result are both "nothing" in a bare query.
 
 query I
-SELECT '[' || fabricator_render('{{ a }}', {'a': NULL::VARCHAR}) || ']';
+SELECT '[' || fluid_render('{{ a }}', {'a': NULL::VARCHAR}) || ']';
 ----
 []
 
 query I
-SELECT '[' || fabricator_render('{{ a }}', '{"a":null}') || ']';
+SELECT '[' || fluid_render('{{ a }}', '{"a":null}') || ']';
 ----
 []
 
 # nil is FALSY, not merely empty — the property a template branching on an optional value depends on.
 query I
-SELECT fabricator_render('{% if a %}set{% else %}nil{% endif %}', {'a': NULL::BIGINT});
+SELECT fluid_render('{% if a %}set{% else %}nil{% endif %}', {'a': NULL::BIGINT});
 ----
 nil
 
 # ============================================================================================
 # THE PLUGIN IS THE ONLY SOURCE OF THIS FUNCTION
 #
-# ⚠ This is the assertion that pins the MOVE rather than the behaviour. fabricator_render used to be a
+# ⚠ This is the assertion that pins the MOVE rather than the behaviour. fluid_render used to be a
 # first-party global registered by Fabricator.SqlServer; a build that had merely ADDED the plugin while
 # leaving the original in place would pass every render above. Exactly one registration, and the plugin is
 # the only thing loaded (asserted at the top), so this one is it.
 # ============================================================================================
 
 query I
-SELECT count(*) FROM duckdb_functions() WHERE function_name = 'fabricator_render';
+SELECT count(*) FROM duckdb_functions() WHERE function_name = 'fluid_render';
 ----
 1
 
 # A malformed template is refused with the function's own message, not a render of the broken text.
 statement error
-SELECT fabricator_render('{% if %}', '{}');
+SELECT fluid_render('{% if %}', '{}');
 ----
 <REGEX>:.*template parse error.*
 
@@ -231,7 +231,7 @@ SELECT * FROM fluid_query('SELECT {% if big %}999{% else %}1{% endif %} AS v', p
 999
 
 # An explicit NULL bag is the same as none — the ANY-declared slot carries an untyped NULL (see the
-# fabricator_render assertion above for why that crossing is worth pinning).
+# fluid_render assertion above for why that crossing is worth pinning).
 query I
 SELECT * FROM fluid_query('SELECT 1 AS v', params := NULL);
 ----
@@ -280,23 +280,23 @@ SELECT * FROM fluid_query('SELECT {{ n | plus: 1 }} AS v', params := '{"n":41}')
 42
 
 query III
-SELECT fabricator_render('{% if n > 1 %}big{% else %}small{% endif %}', '{"n":3}') AS cmp,
-       fabricator_render('{{ n | plus: 1 }}', '{"n":19.99}')                       AS arith,
-       fabricator_render('{% if s == "x" %}y{% else %}n{% endif %}', '{"s":"x"}')  AS streq;
+SELECT fluid_render('{% if n > 1 %}big{% else %}small{% endif %}', '{"n":3}') AS cmp,
+       fluid_render('{{ n | plus: 1 }}', '{"n":19.99}')                       AS arith,
+       fluid_render('{% if s == "x" %}y{% else %}n{% endif %}', '{"s":"x"}')  AS streq;
 ----
 big	20.99	y
 
 # The same three through an Arrow STRUCT rather than JSON — a different code path to the same value model.
 query III
-SELECT fabricator_render('{% if n > 1 %}big{% else %}small{% endif %}', {'n': 3}) AS cmp,
-       fabricator_render('{{ n | plus: 1 }}', {'n': 19.99::DECIMAL(10,2)})        AS arith,
-       fabricator_render('{% if s == "x" %}y{% else %}n{% endif %}', {'s': 'x'})  AS streq;
+SELECT fluid_render('{% if n > 1 %}big{% else %}small{% endif %}', {'n': 3}) AS cmp,
+       fluid_render('{{ n | plus: 1 }}', {'n': 19.99::DECIMAL(10,2)})        AS arith,
+       fluid_render('{% if s == "x" %}y{% else %}n{% endif %}', {'s': 'x'})  AS streq;
 ----
 big	20.99	y
 
 # Comparison THROUGH a nested Arrow struct — the nested reader must produce a real number too, not a string.
 query I
-SELECT fabricator_render('{% if o.deep > 40 %}y{% else %}n{% endif %}', {'o': {'deep': 42}});
+SELECT fluid_render('{% if o.deep > 40 %}y{% else %}n{% endif %}', {'o': {'deep': 42}});
 ----
 y
 
@@ -312,10 +312,10 @@ y
 # ============================================================================================
 
 query IIII
-SELECT fabricator_render('{{ n }}', '{"n":9007199254740993}')             AS json_bigint,
-       fabricator_render('{{ n }}', {'n': 9007199254740993::BIGINT})      AS struct_bigint,
-       fabricator_render('{{ n }}', '{"n":19.99}')                        AS money,
-       fabricator_render('{{ n }}', '{"n":0}')                            AS zero;
+SELECT fluid_render('{{ n }}', '{"n":9007199254740993}')             AS json_bigint,
+       fluid_render('{{ n }}', {'n': 9007199254740993::BIGINT})      AS struct_bigint,
+       fluid_render('{{ n }}', '{"n":19.99}')                        AS money,
+       fluid_render('{{ n }}', '{"n":0}')                            AS zero;
 ----
 9007199254740993	9007199254740993	19.99	0
 
@@ -323,7 +323,7 @@ SELECT fabricator_render('{{ n }}', '{"n":9007199254740993}')             AS jso
 # preserves a JSON number's written form, so `3.0` renders `3.0` where a double rendered `3`. In a function
 # whose output is SQL that is the better answer (the literal keeps its type), but it IS a change.
 query I
-SELECT fabricator_render('{{ n }}', '{"n":3.0}');
+SELECT fluid_render('{{ n }}', '{"n":3.0}');
 ----
 3.0
 
@@ -334,18 +334,18 @@ SELECT fabricator_render('{{ n }}', '{"n":3.0}');
 # just above is the POSITIVE CONTROL: a real 0 must still render, or this check would be refusing everything.
 
 statement error
-SELECT fabricator_render('{{ n }}', '{"n":1e100}');
+SELECT fluid_render('{{ n }}', '{"n":1e100}');
 ----
 <REGEX>:.*cannot be represented in a template.*
 
 statement error
-SELECT fabricator_render('{{ n }}', '{"n":1e-30}');
+SELECT fluid_render('{{ n }}', '{"n":1e-30}');
 ----
 <REGEX>:.*cannot be represented in a template.*
 
 # The same refusal on the ARROW path, so a DuckDB DOUBLE cannot smuggle it past the JSON check.
 statement error
-SELECT fabricator_render('{{ n }}', {'n': 1e100::DOUBLE});
+SELECT fluid_render('{{ n }}', {'n': 1e100::DOUBLE});
 ----
 <REGEX>:.*cannot be represented in a template.*
 
@@ -424,13 +424,13 @@ SELECT count(*) FROM fq_v;
 # ============================================================================================
 
 query I
-SELECT fabricator_render('{{ a }}-{{ b }}', MAP {'a': 'one', 'b': 'two'});
+SELECT fluid_render('{{ a }}-{{ b }}', MAP {'a': 'one', 'b': 'two'});
 ----
 one-two
 
 # Nested struct, nested list, list indexing and .size, all from one Arrow bag.
 query I
-SELECT fabricator_render('{{ o.deep }}|{% for t in tags %}{{ t }};{% endfor %}|{{ tags[1] }}|{{ tags.size }}',
+SELECT fluid_render('{{ o.deep }}|{% for t in tags %}{{ t }};{% endfor %}|{{ tags[1] }}|{{ tags.size }}',
                          {'o': {'deep': 42}, 'tags': ['a','b','c']});
 ----
 42|a;b;c;|b|3
@@ -439,17 +439,17 @@ SELECT fabricator_render('{{ o.deep }}|{% for t in tags %}{{ t }};{% endfor %}|{
 # the indexable for the KEY "0", so an int-parse fallback IS index access — it is not a second mechanism. A
 # member genuinely NAMED "0" therefore wins, which is the right precedence.
 query I
-SELECT fabricator_render('{{ p[0] }}/{{ p[1] }}', {'p': {'x': 1, 'y': 2}});
+SELECT fluid_render('{{ p[0] }}/{{ p[1] }}', {'p': {'x': 1, 'y': 2}});
 ----
 1/2
 
 statement error
-SELECT fabricator_render('{{ n }}', 'not json');
+SELECT fluid_render('{{ n }}', 'not json');
 ----
 <REGEX>:.*params is not valid JSON.*
 
 statement error
-SELECT fabricator_render('{{ n }}', '[1,2]');
+SELECT fluid_render('{{ n }}', '[1,2]');
 ----
 <REGEX>:.*params JSON must be an OBJECT.*
 
@@ -530,19 +530,19 @@ SELECT * FROM fluid_query(
 # ============================================================================================
 
 query I
-SELECT fabricator_render('{{ d }}', {'d': DATE '2026-09-01'});
+SELECT fluid_render('{{ d }}', {'d': DATE '2026-09-01'});
 ----
 2026-09-01 00:00:00Z
 
 # A wall-clock TIMESTAMP is not shifted either — it was already right (ReadTimestamp stamps it UTC), and
 # this is the CONTROL that says the date fix did not achieve its result by shifting everything else.
 query I
-SELECT fabricator_render('{{ t }}', {'t': TIMESTAMP '2026-09-01 12:34:56'});
+SELECT fluid_render('{{ t }}', {'t': TIMESTAMP '2026-09-01 12:34:56'});
 ----
 2026-09-01 12:34:56Z
 
 query I
-SELECT fabricator_render('{{ t }}', {'t': TIMESTAMPTZ '2026-09-01 12:34:56+00'});
+SELECT fluid_render('{{ t }}', {'t': TIMESTAMPTZ '2026-09-01 12:34:56+00'});
 ----
 2026-09-01 12:34:56Z
 
@@ -553,7 +553,7 @@ SELECT fabricator_render('{{ t }}', {'t': TIMESTAMPTZ '2026-09-01 12:34:56+00'})
 # the ELSE branch silently — the same failure class as §the value-model header, but this one is Fluid's and
 # not something the value model can fix without making a date stop being a date.
 query I
-SELECT fabricator_render('{% if a > b %}later{% else %}earlier{% endif %}',
+SELECT fluid_render('{% if a > b %}later{% else %}earlier{% endif %}',
                          {'a': DATE '2026-09-02', 'b': DATE '2026-09-01'});
 ----
 earlier
@@ -561,7 +561,7 @@ earlier
 # THE WORKAROUND, gated beside it so the docs are not the only place it exists: format to ISO first and
 # compare the strings. ISO-8601 sorts lexicographically, verified across a year boundary.
 query I
-SELECT fabricator_render(
+SELECT fluid_render(
   '{% assign x = a | date: "%Y-%m-%d" %}{% assign y = b | date: "%Y-%m-%d" %}{% if x > y %}later{% else %}earlier{% endif %}',
   {'a': DATE '2027-01-01', 'b': DATE '2026-12-31'});
 ----
@@ -687,7 +687,7 @@ SET TimeZone = 'UTC';
 # concatenated decimal bytes — `'ab'::BLOB` came out as `9798`, which looks like a number and is useless.
 # Hex is lossless, readable, and compares as a string.
 query I
-SELECT fabricator_render('{{ b }}', {'b': 'ab'::BLOB});
+SELECT fluid_render('{{ b }}', {'b': 'ab'::BLOB});
 ----
 6162
 
@@ -710,33 +710,33 @@ CREATE TABLE fq_people AS SELECT * FROM (VALUES (1,'ada'),(2,'bob'),(3,'cy')) v(
 # ⚠ Name and ordinal go through ONE lookup rule (docs/fluid-templating.md §6 settled that in slice 1):
 # Fluid resolves `r[1]` by asking for the KEY "1", so an int-parse fallback IS index access.
 query I
-SELECT fabricator_render('{% assign rs = query("SELECT id, nm FROM fq_people ORDER BY id") %}{% for r in rs %}[{{ r.id }}:{{ r.nm }}:{{ r[1] }}]{% endfor %} n={{ rs.size }}', NULL);
+SELECT fluid_render('{% assign rs = query("SELECT id, nm FROM fq_people ORDER BY id") %}{% for r in rs %}[{{ r.id }}:{{ r.nm }}:{{ r[1] }}]{% endfor %} n={{ rs.size }}', NULL);
 ----
 [1:ada:ada][2:bob:bob][3:cy:cy] n=3
 
 # An empty result is an empty array, not an error or a nil.
 query I
-SELECT fabricator_render('{% assign rs = query("SELECT id FROM fq_people WHERE id > 99") %}n={{ rs.size }}', NULL);
+SELECT fluid_render('{% assign rs = query("SELECT id FROM fq_people WHERE id > 99") %}n={{ rs.size }}', NULL);
 ----
 n=0
 
 # A NULL cell renders empty and is FALSY, the same as everywhere else in this plugin.
 query I
-SELECT fabricator_render('{% assign rs = query("SELECT NULL AS v") %}{% for r in rs %}[{{ r.v }}]{% if r.v %}T{% else %}F{% endif %}{% endfor %}', NULL);
+SELECT fluid_render('{% assign rs = query("SELECT NULL AS v") %}{% for r in rs %}[{{ r.v }}]{% if r.v %}T{% else %}F{% endif %}{% endfor %}', NULL);
 ----
 []F
 
 # ⚠ An unknown column returns FALSE from TryGetValue rather than a nil value, which is what lets Fluid
 # answer `.size` itself — the rule ArrowStruct documents and EagerRow had to keep.
 query I
-SELECT fabricator_render('{% assign rs = query("SELECT 1 AS a") %}{% for r in rs %}[{{ r.nosuch }}][{{ r.size }}]{% endfor %}', NULL);
+SELECT fluid_render('{% assign rs = query("SELECT 1 AS a") %}{% for r in rs %}[{{ r.nosuch }}][{{ r.size }}]{% endfor %}', NULL);
 ----
 [][1]
 
 # The value model is the SAME one slice 1 built, so arithmetic and comparison work on query results too —
 # which is the property §7.1 showed a render-only assertion cannot see.
 query I
-SELECT fabricator_render('{% assign rs = query("SELECT 19.99::DECIMAL(9,2) AS m, 3 AS i") %}{% for r in rs %}{{ r.m | plus: 1 }}|{% if r.i > 1 %}GT{% else %}LE{% endif %}{% endfor %}', NULL);
+SELECT fluid_render('{% assign rs = query("SELECT 19.99::DECIMAL(9,2) AS m, 3 AS i") %}{% for r in rs %}{{ r.m | plus: 1 }}|{% if r.i > 1 %}GT{% else %}LE{% endif %}{% endfor %}', NULL);
 ----
 20.99|GT
 
@@ -804,13 +804,13 @@ SELECT count(*) FROM fq_audit;
 
 # A plain write.
 statement error
-SELECT fabricator_render('{% assign r = query("INSERT INTO fq_audit VALUES (99)") %}x', NULL);
+SELECT fluid_render('{% assign r = query("INSERT INTO fq_audit VALUES (99)") %}x', NULL);
 ----
 runs SELECT statements only
 
 # ⚠ A write that BEGINS WITH `WITH` — the shape a prefix check ("starts with SELECT or WITH") waves through.
 statement error
-SELECT fabricator_render('{% assign r = query("WITH x AS (SELECT 99) INSERT INTO fq_audit SELECT * FROM x") %}x', NULL);
+SELECT fluid_render('{% assign r = query("WITH x AS (SELECT 99) INSERT INTO fq_audit SELECT * FROM x") %}x', NULL);
 ----
 runs SELECT statements only
 
@@ -818,37 +818,37 @@ runs SELECT statements only
 # exact string performed the INSERT; a DROP TABLE variant dropped the table. String concatenation has an
 # escape by construction, which is why the classifier takes the SQL as a VALUE instead.
 statement error
-SELECT fabricator_render('{% assign r = query("SELECT 1) ; INSERT INTO fq_audit VALUES (99); SELECT * FROM (SELECT 2") %}x', NULL);
+SELECT fluid_render('{% assign r = query("SELECT 1) ; INSERT INTO fq_audit VALUES (99); SELECT * FROM (SELECT 2") %}x', NULL);
 ----
 runs SELECT statements only
 
 # Multi-statement input, which the serializer refuses as a whole.
 statement error
-SELECT fabricator_render('{% assign r = query("SELECT 1; INSERT INTO fq_audit VALUES (99)") %}x', NULL);
+SELECT fluid_render('{% assign r = query("SELECT 1; INSERT INTO fq_audit VALUES (99)") %}x', NULL);
 ----
 runs SELECT statements only
 
 statement error
-SELECT fabricator_render('{% assign r = query("DROP TABLE fq_audit") %}x', NULL);
+SELECT fluid_render('{% assign r = query("DROP TABLE fq_audit") %}x', NULL);
 ----
 runs SELECT statements only
 
 statement error
-SELECT fabricator_render('{% assign r = query("COPY fq_audit TO ''/tmp/fq_should_not_exist.csv''") %}x', NULL);
+SELECT fluid_render('{% assign r = query("COPY fq_audit TO ''/tmp/fq_should_not_exist.csv''") %}x', NULL);
 ----
 runs SELECT statements only
 
 # ⚠ A SYNTAX error surfaces the ENGINE'S OWN message rather than "not a SELECT" — the two causes are
 # different and reporting the wrong one sends the author looking in the wrong place.
 statement error
-SELECT fabricator_render('{% assign r = query("SELEC 1") %}x', NULL);
+SELECT fluid_render('{% assign r = query("SELEC 1") %}x', NULL);
 ----
 syntax error
 
 # ⚠ MEASURED: json_serialize_sql('') reports NO error, because an empty string parses to zero statements —
 # so the classifier alone would wave it through. It is refused before reaching the classifier.
 statement error
-SELECT fabricator_render('{% assign r = query("") %}x', NULL);
+SELECT fluid_render('{% assign r = query("") %}x', NULL);
 ----
 empty statement
 
@@ -867,7 +867,7 @@ DROP TABLE IF EXISTS fq_audit;
 
 # The SELECT family, including DuckDB's own shorthands.
 query I
-SELECT fabricator_render('{% assign a = query("VALUES (1),(2)") %}{% assign b = query("TABLE fq_people") %}{% assign c = query("FROM fq_people") %}{% assign d = query("WITH x AS (SELECT 1 AS v) SELECT * FROM x") %}{% assign e = query("SELECT 1 UNION ALL SELECT 2") %}{{ a.size }}{{ b.size }}{{ c.size }}{{ d.size }}{{ e.size }}', NULL);
+SELECT fluid_render('{% assign a = query("VALUES (1),(2)") %}{% assign b = query("TABLE fq_people") %}{% assign c = query("FROM fq_people") %}{% assign d = query("WITH x AS (SELECT 1 AS v) SELECT * FROM x") %}{% assign e = query("SELECT 1 UNION ALL SELECT 2") %}{{ a.size }}{{ b.size }}{{ c.size }}{{ d.size }}{{ e.size }}', NULL);
 ----
 23312
 
@@ -876,13 +876,13 @@ SELECT fabricator_render('{% assign a = query("VALUES (1),(2)") %}{% assign b = 
 # is the correct trade, since the alternative admits writes. Pinned so the cost is visible rather than
 # discovered.
 statement error
-SELECT fabricator_render('{% assign r = query("PIVOT fq_people ON nm USING sum(id)") %}x', NULL);
+SELECT fluid_render('{% assign r = query("PIVOT fq_people ON nm USING sum(id)") %}x', NULL);
 ----
 runs SELECT statements only
 
 # SUMMARIZE and DESCRIBE, by contrast, ARE serializable and pass — so the refusal is not "anything unusual".
 query I
-SELECT fabricator_render('{% assign r = query("DESCRIBE SELECT 1 AS a") %}{{ r.size }}', NULL);
+SELECT fluid_render('{% assign r = query("DESCRIBE SELECT 1 AS a") %}{{ r.size }}', NULL);
 ----
 1
 
@@ -908,7 +908,7 @@ SELECT count(*) FROM fq_txn;
 
 # ...and query(), on its own connection, does not.
 query I
-SELECT fabricator_render('{% assign r = query("SELECT n FROM fq_txn") %}{{ r.size }}', NULL);
+SELECT fluid_render('{% assign r = query("SELECT n FROM fq_txn") %}{{ r.size }}', NULL);
 ----
 1
 
@@ -917,7 +917,7 @@ COMMIT;
 
 # After COMMIT it does — which is what makes the row above a visibility result rather than a broken read.
 query I
-SELECT fabricator_render('{% assign r = query("SELECT n FROM fq_txn") %}{{ r.size }}', NULL);
+SELECT fluid_render('{% assign r = query("SELECT n FROM fq_txn") %}{{ r.size }}', NULL);
 ----
 2
 
@@ -936,20 +936,20 @@ CREATE TABLE fq_orders AS SELECT * FROM (VALUES ('eu',10,1),('us',25,2),('eu',5,
 
 # Two parameters, of different types, bound by NAME.
 query I
-SELECT fabricator_render('{% assign rs = "SELECT id FROM fq_orders WHERE region = $region AND amt > $min ORDER BY id" | query: region: "eu", min: 6 %}{% for r in rs %}[{{ r.id }}]{% endfor %} n={{ rs.size }}', NULL);
+SELECT fluid_render('{% assign rs = "SELECT id FROM fq_orders WHERE region = $region AND amt > $min ORDER BY id" | query: region: "eu", min: 6 %}{% for r in rs %}[{{ r.id }}]{% endfor %} n={{ rs.size }}', NULL);
 ----
 [1] n=1
 
 # ⚠ The DISCRIMINATING row: the same statement with a different bound value returns a different set. Without
 # it, the assertion above would pass equally on a build that ignored the parameters and got lucky.
 query I
-SELECT fabricator_render('{% assign rs = "SELECT id FROM fq_orders WHERE region = $region AND amt > $min ORDER BY id" | query: region: "eu", min: 1 %}{% for r in rs %}[{{ r.id }}]{% endfor %}', NULL);
+SELECT fluid_render('{% assign rs = "SELECT id FROM fq_orders WHERE region = $region AND amt > $min ORDER BY id" | query: region: "eu", min: 1 %}{% for r in rs %}[{{ r.id }}]{% endfor %}', NULL);
 ----
 [1][3]
 
 # Parameter values may come from template variables, not only literals.
 query I
-SELECT fabricator_render('{% assign g = "us" %}{% assign rs = "SELECT id FROM fq_orders WHERE region = $r" | query: r: g %}{% for r in rs %}{{ r.id }}{% endfor %}', NULL);
+SELECT fluid_render('{% assign g = "us" %}{% assign rs = "SELECT id FROM fq_orders WHERE region = $r" | query: r: g %}{% for r in rs %}{{ r.id }}{% endfor %}', NULL);
 ----
 2
 
@@ -962,14 +962,14 @@ SELECT fabricator_render('{% assign g = "us" %}{% assign rs = "SELECT id FROM fq
 # ============================================================================================
 
 query I
-SELECT fabricator_render('{% assign rs = "SELECT count(*) AS n FROM fq_orders WHERE region = $r" | query: r: "eu'' OR 1=1 --" %}{% for x in rs %}{{ x.n }}{% endfor %}', NULL);
+SELECT fluid_render('{% assign rs = "SELECT count(*) AS n FROM fq_orders WHERE region = $r" | query: r: "eu'' OR 1=1 --" %}{% for x in rs %}{{ x.n }}{% endfor %}', NULL);
 ----
 0
 
 # THE CONTROL: the identical statement with a value that DOES match. Without it, "0" would be equally true
 # of a build where the parameter never reached the statement at all.
 query I
-SELECT fabricator_render('{% assign rs = "SELECT count(*) AS n FROM fq_orders WHERE region = $r" | query: r: "eu" %}{% for x in rs %}{{ x.n }}{% endfor %}', NULL);
+SELECT fluid_render('{% assign rs = "SELECT count(*) AS n FROM fq_orders WHERE region = $r" | query: r: "eu" %}{% for x in rs %}{{ x.n }}{% endfor %}', NULL);
 ----
 2
 
@@ -981,13 +981,13 @@ SELECT fabricator_render('{% assign rs = "SELECT count(*) AS n FROM fq_orders WH
 # ============================================================================================
 
 query I
-SELECT fabricator_render('{% assign rs = "SELECT $i AS i, $d::VARCHAR AS d, $s AS s, $b AS b, ($n IS NULL) AS n" | query: i: 42, d: 19.99, s: "hi", b: true, n: nil %}{% for r in rs %}{{ r.i }}|{{ r.d }}|{{ r.s }}|{{ r.b }}|{{ r.n }}{% endfor %}', NULL);
+SELECT fluid_render('{% assign rs = "SELECT $i AS i, $d::VARCHAR AS d, $s AS s, $b AS b, ($n IS NULL) AS n" | query: i: 42, d: 19.99, s: "hi", b: true, n: nil %}{% for r in rs %}{{ r.i }}|{{ r.d }}|{{ r.s }}|{{ r.b }}|{{ r.n }}{% endfor %}', NULL);
 ----
 42|19.99|hi|true|true
 
 # The bound integer really is an INTEGER-family value, not text: it arithmetics on the server.
 query I
-SELECT fabricator_render('{% assign rs = "SELECT $i + 1 AS v" | query: i: 41 %}{% for r in rs %}{{ r.v }}{% endfor %}', NULL);
+SELECT fluid_render('{% assign rs = "SELECT $i + 1 AS v" | query: i: 41 %}{% for r in rs %}{{ r.v }}{% endfor %}', NULL);
 ----
 42
 
@@ -999,32 +999,32 @@ SELECT fabricator_render('{% assign rs = "SELECT $i + 1 AS v" | query: i: 41 %}{
 # value could only mean `?` / `$1`, which cannot coexist with the by-name binding a named batch selects.
 # Dropping it silently would run the statement with a parameter the author believed they had supplied.
 statement error
-SELECT fabricator_render('{% assign rs = "SELECT $1" | query: 5 %}x', NULL);
+SELECT fluid_render('{% assign rs = "SELECT $1" | query: 5 %}x', NULL);
 ----
 NAMED parameters only
 
 statement error
-SELECT fabricator_render('{% assign rs = "SELECT $a" | query: 5, a: 1 %}x', NULL);
+SELECT fluid_render('{% assign rs = "SELECT $a" | query: 5, a: 1 %}x', NULL);
 ----
 positional argument
 
 # A LIST has no SQL parameter form and is refused BY NAME rather than rendered into the statement.
 statement error
-SELECT fabricator_render('{% assign L = (1..3) %}{% assign rs = "SELECT $a" | query: a: L %}x', NULL);
+SELECT fluid_render('{% assign L = (1..3) %}{% assign rs = "SELECT $a" | query: a: L %}x', NULL);
 ----
 has no SQL parameter form
 
 # ⚠ A MISSING parameter is DuckDB's own error and it NAMES the parameter — better than anything we could
 # invent, and the reason nothing here tries to pre-validate the placeholder set.
 statement error
-SELECT fabricator_render('{% assign rs = "SELECT $a, $b" | query: a: 1 %}x', NULL);
+SELECT fluid_render('{% assign rs = "SELECT $a, $b" | query: a: 1 %}x', NULL);
 ----
 parameters: b
 
 # ⚠ THE SELECT-ONLY REFUSAL APPLIES TO THE FILTER FORM TOO — the parameters do not buy an exemption. A
 # parameterised write is still a write, and still fires at bind.
 statement error
-SELECT fabricator_render('{% assign rs = "DELETE FROM fq_orders WHERE id = $i" | query: i: 1 %}x', NULL);
+SELECT fluid_render('{% assign rs = "DELETE FROM fq_orders WHERE id = $i" | query: i: 1 %}x', NULL);
 ----
 runs SELECT statements only
 
@@ -1041,7 +1041,7 @@ SELECT count(*) FROM fq_orders;
 # ============================================================================================
 
 query I
-SELECT fabricator_render('{% assign a = query("SELECT 1 AS v") %}{% assign b = "SELECT 2 AS v" | query %}{% for r in a %}{{ r.v }}{% endfor %}{% for r in b %}{{ r.v }}{% endfor %}', NULL);
+SELECT fluid_render('{% assign a = query("SELECT 1 AS v") %}{% assign b = "SELECT 2 AS v" | query %}{% for r in a %}{{ r.v }}{% endfor %}{% for r in b %}{{ r.v }}{% endfor %}', NULL);
 ----
 12
 
@@ -1086,7 +1086,7 @@ SELECT count(*) FROM duckdb_settings() WHERE name = 'fluid_template_root';
 # alternative is resolving against the process working directory, i.e. reading a file the author never
 # named.
 statement error
-SELECT fabricator_render('{% include ''hello'' %}', NULL);
+SELECT fluid_render('{% include ''hello'' %}', NULL);
 ----
 no root is set
 
@@ -1121,7 +1121,7 @@ COPY (SELECT chr(65279) || 'BOMMED' AS c) TO '${FABRICATOR_DELTA_WRITE_DIR}/tpl/
 # join accidentally succeeds and a mutant survives. With no root, a build that does not recognise an
 # absolute path has nothing to join and refuses.
 query I
-SELECT rtrim(fabricator_render('{% include ''${FABRICATOR_DELTA_WRITE_DIR}/tpl/hello.liquid'' %}', {'who': 'abs'}), chr(10));
+SELECT rtrim(fluid_render('{% include ''${FABRICATOR_DELTA_WRITE_DIR}/tpl/hello.liquid'' %}', {'who': 'abs'}), chr(10));
 ----
 hi abs
 
@@ -1138,7 +1138,7 @@ SET fluid_template_root = '${FABRICATOR_DELTA_WRITE_DIR}/tpl';
 # newline exactly where the fixtures have one, since COPY appends it. That trailing byte is part of the
 # file and therefore part of the include, which is exactly what the nested case below shows.
 query I
-SELECT rtrim(fabricator_render('{% include ''hello'' %}', {'who': 'world'}), chr(10));
+SELECT rtrim(fluid_render('{% include ''hello'' %}', {'who': 'world'}), chr(10));
 ----
 hi world
 
@@ -1149,7 +1149,7 @@ statement ok
 SET GLOBAL fluid_template_root = '${FABRICATOR_DELTA_WRITE_DIR}/tpl';
 
 query I
-SELECT rtrim(fabricator_render('{% include ''hello'' %}', {'who': 'global'}), chr(10));
+SELECT rtrim(fluid_render('{% include ''hello'' %}', {'who': 'global'}), chr(10));
 ----
 hi global
 
@@ -1160,7 +1160,7 @@ RESET GLOBAL fluid_template_root;
 # bare subpath FIRST and only then for `<subpath>.liquid`, so omitting it costs TWO host reads where naming
 # it costs one — on remote storage, two round trips.
 query I
-SELECT rtrim(fabricator_render('{% include ''hello.liquid'' %}', {'who': 'again'}), chr(10));
+SELECT rtrim(fluid_render('{% include ''hello.liquid'' %}', {'who': 'again'}), chr(10));
 ----
 hi again
 
@@ -1168,25 +1168,25 @@ hi again
 # `both.liquid` resolves `{% include 'both' %}` to the one WITHOUT the extension, which is the opposite of
 # what an author following a `.liquid` convention would guess.
 query I
-SELECT rtrim(fabricator_render('{% include ''both'' %}', NULL), chr(10));
+SELECT rtrim(fluid_render('{% include ''both'' %}', NULL), chr(10));
 ----
 BARE
 
 query I
-SELECT rtrim(fabricator_render('{% include ''both.liquid'' %}', NULL), chr(10));
+SELECT rtrim(fluid_render('{% include ''both.liquid'' %}', NULL), chr(10));
 ----
 WITHEXT
 
 # NESTED — a partial that includes another. The inner file's own trailing newline lands INSIDE the outer
 # text, which is why this renders the line break rather than trimming it away.
 query I
-SELECT replace(rtrim(fabricator_render('{% include ''outer'' %}', {'who': 'x'}), chr(10)), chr(10), '~');
+SELECT replace(rtrim(fluid_render('{% include ''outer'' %}', {'who': 'x'}), chr(10)), chr(10), '~');
 ----
 outer[hi x~]
 
 # {% render %} goes through the same provider.
 query I
-SELECT rtrim(fabricator_render('{% render ''hello'' %}', {'who': 'rendered'}), chr(10));
+SELECT rtrim(fluid_render('{% render ''hello'' %}', {'who': 'rendered'}), chr(10));
 ----
 hi rendered
 
@@ -1194,12 +1194,12 @@ hi rendered
 # ⚠⚠ AND IT IS FLUID DOING IT, NOT US — which is why this is asserted rather than assumed. A file provider
 # hands Fluid a STREAM and Fluid reads it with a StreamReader, which detects and strips a UTF-8 byte-order
 # mark. We wrote a BOM-stripping branch first and a mutant proved it INERT; it was deleted. ⚠ Fluid does NOT
-# strip a BOM from a template passed as a STRING (measured), so fabricator_render on a BOM-prefixed literal
+# strip a BOM from a template passed as a STRING (measured), so fluid_render on a BOM-prefixed literal
 # keeps it — that is the caller's own text. The ord() is the assertion: 66 is 'B', 65279 is the BOM, and
 # neither rtrim nor trim removes it.
 query IT
-SELECT ord(rtrim(fabricator_render('{% include ''bom'' %}', NULL), chr(10))[1]),
-       rtrim(fabricator_render('{% include ''bom'' %}', NULL), chr(10));
+SELECT ord(rtrim(fluid_render('{% include ''bom'' %}', NULL), chr(10))[1]),
+       rtrim(fluid_render('{% include ''bom'' %}', NULL), chr(10));
 ----
 66	BOMMED
 
@@ -1213,7 +1213,7 @@ SELECT ord(rtrim(fabricator_render('{% include ''bom'' %}', NULL), chr(10))[1]),
 # that is not there and THROWS for anything else, so a credential or transport failure never reaches this
 # message — it arrives as its own error. The engine establishes absence; we do not infer it.
 statement error
-SELECT fabricator_render('{% include ''nope'' %}', NULL);
+SELECT fluid_render('{% include ''nope'' %}', NULL);
 ----
 tried
 
@@ -1221,7 +1221,7 @@ tried
 # awkward — so what this pins is the RESOLUTION, which is the half that could silently be wrong; the read
 # failing afterwards is expected, and the message naming the JOINED path is the assertion.
 statement error
-SELECT fabricator_render('{% include ''sub/x'' %}', NULL);
+SELECT fluid_render('{% include ''sub/x'' %}', NULL);
 ----
 tpl/sub/x.liquid
 
@@ -1233,7 +1233,7 @@ tpl/sub/x.liquid
 # ⚠ `..` is refused for PREDICTABILITY rather than safety: it resolves against a root the template's author
 # may never see, and the absolute form above says the same thing unambiguously.
 statement error
-SELECT fabricator_render('{% include ''../escape'' %}', NULL);
+SELECT fluid_render('{% include ''../escape'' %}', NULL);
 ----
 cannot walk out of fluid_template_root
 
@@ -1242,7 +1242,7 @@ cannot walk out of fluid_template_root
 # partial on a directory change is very hard to see. Refused at the path rather than by taking the first
 # row, because taking a row is what makes it silent.
 statement error
-SELECT fabricator_render('{% include ''he*'' %}', NULL);
+SELECT fluid_render('{% include ''he*'' %}', NULL);
 ----
 would treat this as a glob
 
@@ -1255,7 +1255,7 @@ COPY (SELECT repeat('x', 1100000) AS c) TO '${FABRICATOR_DELTA_WRITE_DIR}/tpl/bi
 # above carries the REAL reason: without it the message would read "was not found" for a file that is
 # plainly there.
 statement error
-SELECT fabricator_render('{% include ''big'' %}', NULL);
+SELECT fluid_render('{% include ''big'' %}', NULL);
 ----
 above the 1048576-byte ceiling
 
@@ -1291,7 +1291,7 @@ statement ok
 SET TimeZone='UTC';
 
 query I
-SELECT fabricator_render('{% assign r = query("SELECT current_setting(''TimeZone'') AS tz") %}{% for x in r %}{{ x.tz }}{% endfor %}', NULL);
+SELECT fluid_render('{% assign r = query("SELECT current_setting(''TimeZone'') AS tz") %}{% for x in r %}{{ x.tz }}{% endfor %}', NULL);
 ----
 UTC
 
@@ -1302,7 +1302,7 @@ statement ok
 SET TimeZone='Asia/Kolkata';
 
 query I
-SELECT fabricator_render('{% assign r = query("SELECT current_setting(''TimeZone'') AS tz") %}{% for x in r %}{{ x.tz }}{% endfor %}', NULL);
+SELECT fluid_render('{% assign r = query("SELECT current_setting(''TimeZone'') AS tz") %}{% for x in r %}{{ x.tz }}{% endfor %}', NULL);
 ----
 Asia/Kolkata
 
@@ -1321,7 +1321,7 @@ statement ok
 SET search_path='fq_sess';
 
 query I
-SELECT fabricator_render('{% assign r = query("SELECT v FROM t") %}{% for x in r %}{{ x.v }}{% endfor %}', NULL);
+SELECT fluid_render('{% assign r = query("SELECT v FROM t") %}{% for x in r %}{{ x.v }}{% endfor %}', NULL);
 ----
 7
 
@@ -1344,7 +1344,7 @@ RESET search_path;
 # that is not a SELECT, exec() refuses everything that is.
 #
 # exec() is available on BOTH surfaces (user decision, 2026-09-02). In
-# fabricator_render it runs at EXECUTE time; in fluid_query it runs during
+# fluid_render it runs at EXECUTE time; in fluid_query it runs during
 # bind_replace -- while DuckDB is BINDING -- and a bind REPEATS and happens
 # WITHOUT execution. The section below therefore PINS that multiplication as
 # known behaviour rather than refusing it, which is a stronger record than
@@ -1362,7 +1362,7 @@ INSERT INTO ex_t VALUES (1, 'eu'), (2, 'eu'), (3, 'us');
 
 # --- it works where it is permitted, and reports the affected-row count ---
 query I
-SELECT fabricator_render('rows={{ exec("INSERT INTO ex_aud VALUES (1), (2), (3)") }}', NULL);
+SELECT fluid_render('rows={{ exec("INSERT INTO ex_aud VALUES (1), (2), (3)") }}', NULL);
 ----
 rows=3
 
@@ -1487,8 +1487,8 @@ SELECT count(*) FROM ex_aud;
 ----
 3
 
-# --- EXPLAIN of a fabricator_render exec does NOT write ---
-# ⚠ THE VOLATILITY MEASUREMENT. fabricator_render is VOLATILE (the
+# --- EXPLAIN of a fluid_render exec does NOT write ---
+# ⚠ THE VOLATILITY MEASUREMENT. fluid_render is VOLATILE (the
 # IScalarFunction default), so DuckDB does not constant-fold it over constant
 # arguments at PLAN time. Dropping that would make EXPLAIN of a statement that
 # executes nothing perform the write -- which is exactly what was measured for
@@ -1496,9 +1496,9 @@ SELECT count(*) FROM ex_aud;
 # ⚠ EXPLAIN cannot be a subquery source, so the plan row is matched by regex;
 # what the assertion below is really for is the COUNT that follows it.
 query II
-EXPLAIN SELECT fabricator_render('{{ exec("INSERT INTO ex_aud VALUES (99)") }}', NULL);
+EXPLAIN SELECT fluid_render('{{ exec("INSERT INTO ex_aud VALUES (99)") }}', NULL);
 ----
-physical_plan	<REGEX>:.*fabricator_render.*
+physical_plan	<REGEX>:.*fluid_render.*
 
 query I
 SELECT count(*) FROM ex_aud;
@@ -1511,7 +1511,7 @@ SELECT count(*) FROM ex_aud;
 # cannot. Refusing sends the author to query() instead of handing them a number
 # that looks right.
 statement error
-SELECT fabricator_render('{{ exec("SELECT 42") }}', NULL);
+SELECT fluid_render('{{ exec("SELECT 42") }}', NULL);
 ----
 runs WRITES only
 
@@ -1520,7 +1520,7 @@ runs WRITES only
 # affected. (`SELECT 42` renders 0 -- an INT32 literal fails the Int64 test -- so
 # asserting only that one would motivate the refusal with a case that is harmless.)
 statement error
-SELECT fabricator_render('{{ exec("SELECT count(*) FROM range(99)") }}', NULL);
+SELECT fluid_render('{{ exec("SELECT count(*) FROM range(99)") }}', NULL);
 ----
 runs WRITES only
 
@@ -1528,7 +1528,7 @@ runs WRITES only
 # distinguishes this from a non-SELECT, and conflating them would send the
 # author looking in the wrong place.
 statement error
-SELECT fabricator_render('{{ exec("INSER INTO ex_aud VALUES (1)") }}', NULL);
+SELECT fluid_render('{{ exec("INSER INTO ex_aud VALUES (1)") }}', NULL);
 ----
 cannot parse
 
@@ -1539,12 +1539,12 @@ cannot parse
 # the count from the result shape; only C++ can ask DuckDB's CHANGED_ROWS. The
 # divergence is asserted here rather than left latent.
 query I
-SELECT fabricator_render('{{ exec("CREATE TABLE ex_z(a INTEGER)") }}', NULL);
+SELECT fluid_render('{{ exec("CREATE TABLE ex_z(a INTEGER)") }}', NULL);
 ----
 0
 
 query I
-SELECT fabricator_render('{{ exec("CREATE TABLE ex_c AS SELECT * FROM range(7)") }}', NULL);
+SELECT fluid_render('{{ exec("CREATE TABLE ex_c AS SELECT * FROM range(7)") }}', NULL);
 ----
 7
 
@@ -1558,7 +1558,7 @@ SELECT fabricator_host_exec('CREATE TABLE ex_c3 AS SELECT * FROM range(7)');
 # one statement), which is why exec has two paths at all. The count is the LAST
 # statement's.
 query I
-SELECT fabricator_render('{{ exec("CREATE TABLE ex_m AS SELECT 1 AS c; INSERT INTO ex_m VALUES (2)") }}', NULL);
+SELECT fluid_render('{{ exec("CREATE TABLE ex_m AS SELECT 1 AS c; INSERT INTO ex_m VALUES (2)") }}', NULL);
 ----
 1
 
@@ -1569,7 +1569,7 @@ SELECT count(*) FROM ex_m;
 
 # --- the FILTER form: NAMED parameters bound as VALUES ---
 query I
-SELECT fabricator_render('deleted={{ "DELETE FROM ex_t WHERE g = $g" | exec: g: "eu" }}', NULL);
+SELECT fluid_render('deleted={{ "DELETE FROM ex_t WHERE g = $g" | exec: g: "eu" }}', NULL);
 ----
 deleted=2
 
@@ -1582,7 +1582,7 @@ SELECT count(*) FROM ex_t;
 # text: splicing would delete the remaining row. 0 alone would be equally true of
 # a build where the parameter never arrived, which is what the pair above pins.
 query I
-SELECT fabricator_render('{{ "DELETE FROM ex_t WHERE g = $g" | exec: g: "us'' OR 1=1 --" }}', NULL);
+SELECT fluid_render('{{ "DELETE FROM ex_t WHERE g = $g" | exec: g: "us'' OR 1=1 --" }}', NULL);
 ----
 0
 
@@ -1597,20 +1597,20 @@ SELECT count(*) FROM ex_t;
 # cannot use ExecuteNonQuery -- it has no parameter overload). A rule written
 # twice can drift, so the same statement is put through both.
 query II
-SELECT fabricator_render('{{ exec("INSERT INTO ex_aud VALUES (9), (9)") }}', NULL) AS no_params,
-       fabricator_render('{{ "INSERT INTO ex_aud VALUES ($a), ($a)" | exec: a: 9 }}', NULL) AS with_params;
+SELECT fluid_render('{{ exec("INSERT INTO ex_aud VALUES (9), (9)") }}', NULL) AS no_params,
+       fluid_render('{{ "INSERT INTO ex_aud VALUES ($a), ($a)" | exec: a: 9 }}', NULL) AS with_params;
 ----
 2	2
 
 # --- PER-ROW EVALUATION IS REAL, and nothing prevents it ---
-# fabricator_render is a scalar, so three rows perform three writes. Volatility
+# fluid_render is a scalar, so three rows perform three writes. Volatility
 # keeps it out of PLAN time; it does not make it run once. Pinned because it is
 # surprising and because a caller doing DDL needs to know.
 statement ok
 DELETE FROM ex_aud;
 
 query I
-SELECT count(fabricator_render('{{ exec("INSERT INTO ex_aud VALUES (1)") }}', NULL)) FROM range(3);
+SELECT count(fluid_render('{{ exec("INSERT INTO ex_aud VALUES (1)") }}', NULL)) FROM range(3);
 ----
 3
 
@@ -1624,13 +1624,13 @@ SELECT count(*) FROM ex_aud;
 # json_serialize_sql (it parses to zero statements), so the classifier alone
 # would wave it through.
 statement error
-SELECT fabricator_render('{{ exec("") }}', NULL);
+SELECT fluid_render('{{ exec("") }}', NULL);
 ----
 empty statement
 
 # --- both are advertised, and exec resolves as a function AND a filter ---
 query I
-SELECT fabricator_render('{{ exec("INSERT INTO ex_aud VALUES (5)") }}|{{ "INSERT INTO ex_aud VALUES ($x)" | exec: x: 6 }}', NULL);
+SELECT fluid_render('{{ exec("INSERT INTO ex_aud VALUES (5)") }}|{{ "INSERT INTO ex_aud VALUES ($x)" | exec: x: 6 }}', NULL);
 ----
 1|1
 
@@ -1653,7 +1653,7 @@ SELECT fabricator_render('{{ exec("INSERT INTO ex_aud VALUES (5)") }}|{{ "INSERT
 # COMMITTED by exec(), so a fresh-connection query() would see it too and this assertion would
 # pass on the old behaviour. Only a temporary catalog is provably the same connection.
 query I
-SELECT fabricator_render('{% assign _ = exec("CREATE TEMP TABLE scratch AS SELECT 7 AS v") %}{% assign rows = query("SELECT v FROM scratch") %}v={{ rows[0].v }}', NULL);
+SELECT fluid_render('{% assign _ = exec("CREATE TEMP TABLE scratch AS SELECT 7 AS v") %}{% assign rows = query("SELECT v FROM scratch") %}v={{ rows[0].v }}', NULL);
 ----
 v=7
 
@@ -1669,7 +1669,7 @@ v=7
 # Dispose() prevents is a native connection LEAK (one per render, for the process's life), and no
 # SQL assertion can observe that. Said here rather than left to be re-derived.
 statement error
-SELECT fabricator_render('{% assign rows = query("SELECT v FROM scratch") %}x', NULL);
+SELECT fluid_render('{% assign rows = query("SELECT v FROM scratch") %}x', NULL);
 ----
 Table with name scratch does not exist
 
@@ -1679,7 +1679,7 @@ Table with name scratch does not exist
 # own temporary catalog. The VALUES also differ, so a build that somehow shared one table would
 # have to return the wrong number rather than merely not erroring.
 query I
-SELECT fabricator_render('{% assign ddl = "CREATE TEMP TABLE perrow AS SELECT " | append: n | append: " AS v" %}{% assign _ = exec(ddl) %}{% assign r = query("SELECT v FROM perrow") %}{{ r[0].v }}', {'n': n}) FROM (VALUES (10), (20), (30)) t(n);
+SELECT fluid_render('{% assign ddl = "CREATE TEMP TABLE perrow AS SELECT " | append: n | append: " AS v" %}{% assign _ = exec(ddl) %}{% assign r = query("SELECT v FROM perrow") %}{{ r[0].v }}', {'n': n}) FROM (VALUES (10), (20), (30)) t(n);
 ----
 10
 20
@@ -1700,7 +1700,7 @@ SELECT * FROM fluid_query('{% assign _ = exec("CREATE TEMP TABLE s2 AS SELECT 3 
 # write its own template made) therefore still holds OUTWARD — what changed is only that the
 # template's own later statements can see its earlier ones.
 query I
-SELECT fabricator_render('{% assign _ = exec("CREATE TEMP TABLE leak AS SELECT 1 AS z") %}made', NULL);
+SELECT fluid_render('{% assign _ = exec("CREATE TEMP TABLE leak AS SELECT 1 AS z") %}made', NULL);
 ----
 made
 
@@ -1714,12 +1714,12 @@ SELECT count(*) FROM duckdb_tables() WHERE table_name = 'leak';
 # connection per render instead of one per classification), so both refusals are re-asserted
 # here: a mechanism that moved is a mechanism that could have been dropped.
 statement error
-SELECT fabricator_render('{% assign r = query("INSERT INTO ex_aud VALUES (1)") %}x', NULL);
+SELECT fluid_render('{% assign r = query("INSERT INTO ex_aud VALUES (1)") %}x', NULL);
 ----
 query() runs SELECT statements only
 
 statement error
-SELECT fabricator_render('{{ exec("SELECT 1") }}', NULL);
+SELECT fluid_render('{{ exec("SELECT 1") }}', NULL);
 ----
 exec() runs WRITES only, and this statement is a SELECT
 
@@ -1788,7 +1788,7 @@ CREATE TABLE blk(id INTEGER, name VARCHAR);
 # render is exactly the literal that follows {% endexec %}. Without them a stray newline or a
 # leaked row count would be invisible.
 query I
-SELECT '[' || fabricator_render('{% exec %}
+SELECT '[' || fluid_render('{% exec %}
 INSERT INTO blk VALUES
 {% for r in rows %}({{ r.id }}, {{ r.name | sql }}){% unless forloop.last %},{% endunless %}
 {% endfor %}
@@ -1809,7 +1809,7 @@ SELECT id, name FROM blk ORDER BY id;
 # by a later query() in the same template. This is the two features meeting, and neither works
 # for this shape alone.
 query I
-SELECT fabricator_render('{% exec %}CREATE TEMP TABLE blk_s AS SELECT 11 AS v{% endexec %}{% assign r = query("SELECT v FROM blk_s") %}v={{ r[0].v }}', NULL);
+SELECT fluid_render('{% exec %}CREATE TEMP TABLE blk_s AS SELECT 11 AS v{% endexec %}{% assign r = query("SELECT v FROM blk_s") %}v={{ r[0].v }}', NULL);
 ----
 v=11
 
@@ -1823,7 +1823,7 @@ SELECT * FROM fluid_query('{% exec %}CREATE TEMP TABLE blk_q AS SELECT 4 AS a UN
 # ⚠ An unreached block runs nothing: the tag is a statement in the tree, not an argument that
 # had to be evaluated to build the call.
 query I
-SELECT fabricator_render('{% if go %}{% exec %}CREATE TEMP TABLE blk_c AS SELECT 1{% endexec %}ran{% else %}skipped{% endif %}', {'go': false});
+SELECT fluid_render('{% if go %}{% exec %}CREATE TEMP TABLE blk_c AS SELECT 1{% endexec %}ran{% else %}skipped{% endif %}', {'go': false});
 ----
 skipped
 
@@ -1835,7 +1835,7 @@ statement ok
 CREATE TABLE blk_brk(id INTEGER);
 
 query I
-SELECT fabricator_render('{% for i in (1..3) %}{% exec %}INSERT INTO blk_brk VALUES ({{ i }}){% break %}{% endexec %}{% endfor %}done', NULL);
+SELECT fluid_render('{% for i in (1..3) %}{% exec %}INSERT INTO blk_brk VALUES ({{ i }}){% break %}{% endexec %}{% endfor %}done', NULL);
 ----
 done
 
@@ -1849,14 +1849,14 @@ SELECT count(*) FROM blk_brk;
 # names and whole fragments, so `{{ x }}` cannot escape. The failure mode is a PARSER ERROR
 # rather than a silent injection, which is the safe direction but not a substitute for `| sql`.
 statement error
-SELECT fabricator_render('{% exec %}INSERT INTO blk VALUES (9, {{ v }}){% endexec %}ok', {'v': 'O''Brien'});
+SELECT fluid_render('{% exec %}INSERT INTO blk VALUES (9, {{ v }}){% endexec %}ok', {'v': 'O''Brien'});
 ----
 unterminated quoted string
 
 # --- the block obeys the SAME classifier as the function ---
 # ⚠ One mechanism, two spellings: the block cannot drift from exec() on what counts as a write.
 statement error
-SELECT fabricator_render('{% exec %}SELECT 1{% endexec %}', NULL);
+SELECT fluid_render('{% exec %}SELECT 1{% endexec %}', NULL);
 ----
 exec() runs WRITES only, and this statement is a SELECT
 
@@ -1864,13 +1864,13 @@ exec() runs WRITES only, and this statement is a SELECT
 # ⚠ Load-bearing ordering, exactly as for the function form: json_serialize_sql('') reports NO
 # error, so the classifier alone would wave it through and report success for nothing.
 statement error
-SELECT fabricator_render('{% exec %}   {% endexec %}', NULL);
+SELECT fluid_render('{% exec %}   {% endexec %}', NULL);
 ----
 block is empty
 
 # --- an unterminated block is a PARSE error naming the tag Fluid wanted ---
 statement error
-SELECT fabricator_render('{% exec %}INSERT INTO blk VALUES (3, ''x'')', NULL);
+SELECT fluid_render('{% exec %}INSERT INTO blk VALUES (3, ''x'')', NULL);
 ----
 endexec
 
@@ -1881,7 +1881,7 @@ statement ok
 DELETE FROM blk;
 
 query I
-SELECT fabricator_render('{% exec %}INSERT INTO blk VALUES (1, ''b''){% endexec %}{{ exec("INSERT INTO blk VALUES (2, ''c'')") }}|{{ "INSERT INTO blk VALUES ($i, ''d'')" | exec: i: 3 }}', NULL);
+SELECT fluid_render('{% exec %}INSERT INTO blk VALUES (1, ''b''){% endexec %}{{ exec("INSERT INTO blk VALUES (2, ''c'')") }}|{{ "INSERT INTO blk VALUES ($i, ''d'')" | exec: i: 3 }}', NULL);
 ----
 1|1
 

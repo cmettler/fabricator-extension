@@ -10,7 +10,7 @@ namespace Fabricator.FluidPlugin;
 
 /// <summary>
 /// The Fluid/Liquid template engine, packaged as a plugin. It exposes no catalog (ATTACH throws) and exists
-/// purely to contribute connection-free GLOBAL functions: <c>fabricator_render</c> (template → TEXT) and
+/// purely to contribute connection-free GLOBAL functions: <c>fluid_render</c> (template → TEXT) and
 /// <c>fluid_query</c> (template → SQL, i.e. a RELATION).
 /// <para><b>Why it is a plugin rather than part of a backend.</b> It lived in <c>Fabricator.SqlServer</c>,
 /// which put a template engine — and the <c>Fluid.Core</c> package — inside the SQL Server backend, where it
@@ -74,7 +74,7 @@ public sealed class FluidPluginBackend : IProvider
 }
 
 /// <summary>
-/// GLOBAL scalar (connection-free, no ATTACH): <c>fabricator_render(template, params)</c> renders the Liquid
+/// GLOBAL scalar (connection-free, no ATTACH): <c>fluid_render(template, params)</c> renders the Liquid
 /// template with the params bag, where <c>params</c> is EITHER a DuckDB STRUCT/MAP (type-safe, no quoting) OR
 /// a JSON string.
 /// <para>Fluid is secure-by-default: the context is stock apart from this plugin's two SQL-quoting filters,
@@ -86,7 +86,7 @@ public sealed class FluidPluginBackend : IProvider
 /// </summary>
 internal sealed class FluidRenderFunction : IScalarFunction
 {
-    public string Name => "fabricator_render";
+    public string Name => "fluid_render";
 
     public Schema Parameters => new(new[]
     {

@@ -36,17 +36,17 @@ namespace Fabricator.FluidPlugin;
 /// recorded in §11.1: a per-render permission ambient, fail-closed, set by the surface.
 /// </para>
 /// <para>
-/// ⚠ <b>For DDL, prefer <c>fabricator_render</c> anyway</b> — not because <c>fluid_query</c> refuses, but
+/// ⚠ <b>For DDL, prefer <c>fluid_render</c> anyway</b> — not because <c>fluid_query</c> refuses, but
 /// because a bind you did not ask for is a write you did not ask for.
 /// </para>
 /// <para>
 /// ⚠ <b>It grants no authority a template did not already have.</b> Anyone who can call
-/// <c>fabricator_render</c> can already call <c>fabricator_host_exec</c> or <c>fabricator_exec</c>; this is
+/// <c>fluid_render</c> can already call <c>fabricator_host_exec</c> or <c>fabricator_exec</c>; this is
 /// the same capability reached from inside a template. The precedent is <c>fabricator_http_request</c>,
 /// which is ungated for the same reason (docs/http-transport.md).
 /// </para>
 /// <para>
-/// ⚠ <b>PER-ROW EVALUATION IS REAL AND NOTHING PREVENTS IT.</b> <c>fabricator_render</c> is a scalar, so
+/// ⚠ <b>PER-ROW EVALUATION IS REAL AND NOTHING PREVENTS IT.</b> <c>fluid_render</c> is a scalar, so
 /// rendering a template containing <c>exec()</c> over three rows performs the write THREE times. Volatility
 /// keeps it out of PLAN time; it does not make it run once. Same rule as <c>fabricator_host_exec</c>'s
 /// scalar form, and the same advice: for DDL, prefer a statement whose cardinality you chose.

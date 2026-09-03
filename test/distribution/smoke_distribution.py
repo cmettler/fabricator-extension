@@ -65,7 +65,7 @@ def test_fresh_install(duckdb, artifact: str) -> None:
         # /!\ IT WAS A BUNDLED PLUGIN UNTIL THEN, and this check attributed it BY ROOT for a reason that
         # still applies in its new form: this session sets no environment variables, so the per-user plugin
         # root (~/.duckdb/fabricator/plugins) is searched too, and a developer who had INSTALLED Fluid there
-        # would make a bare "does fabricator_render work" check pass on an artifact shipping nothing. The
+        # would make a bare "does fluid_render work" check pass on an artifact shipping nothing. The
         # root check is replaced by its exact counterpart for a built-in: Fluid must contribute NO plugin
         # row at all. A copy loaded from a plugin root would show up here, and the render below would then
         # be proving somebody's local install.
@@ -78,11 +78,11 @@ def test_fresh_install(duckdb, artifact: str) -> None:
             str(fluid_rows),
         )
         check(
-            con.execute("select fabricator_render('builtin {{ who }}', {'who': 'provider'})").fetchone()[0]
+            con.execute("select fluid_render('builtin {{ who }}', {'who': 'provider'})").fetchone()[0]
             == "builtin provider",
             "the built-in Fluid renders (its package closure shipped in the managed directory)",
         )
-        # /!\ A SECOND REGISTRATION PATH, not a second spelling of the one above. fabricator_render arrives
+        # /!\ A SECOND REGISTRATION PATH, not a second spelling of the one above. fluid_render arrives
         # through IBackend.GlobalScalarFunctions and is registered as a DuckDB scalar; fluid_query arrives
         # through GlobalSqlTableFunctions and is registered as a bind_replace TABLE function. Fluid is the
         # only shipped provider using the latter at all, so a packaging or registration fault that reached

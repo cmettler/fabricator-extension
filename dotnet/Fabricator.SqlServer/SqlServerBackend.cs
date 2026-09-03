@@ -135,7 +135,7 @@ public sealed class SqlServerBackend : IProvider
     };
 
     // Connection-free GLOBAL functions registered at extension load (no ATTACH). Provider-agnostic utilities
-    // (e.g. the fabricator_render template engine) ride along on the always-present default provider.
+    // (e.g. the fluid_render template engine) ride along on the always-present default provider.
     public IEnumerable<IScalarFunction> GlobalScalarFunctions => CustomFunctions.GlobalScalar;
     public IEnumerable<IInOutFunction> GlobalInOutFunctions => CustomFunctions.GlobalInOut;
     public IEnumerable<ICollectorFunction> GlobalCollectorFunctions => CustomFunctions.GlobalCollector;
