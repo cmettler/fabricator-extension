@@ -201,6 +201,26 @@ Design and internals: [docs/distribution-installer.md](docs/distribution-install
 
 </details>
 
+### ⚠ Upgrading past 2026-09-03: check a persistent database for a stale input view
+
+Builds before 2026-09-03 registered the Arrow inputs of an internal host query as ordinary **catalog**
+views instead of temporary ones. On an in-memory database they simply piled up and vanished on exit. On a
+**file-backed** database they were written into the file — and because such a view holds a pointer into a
+stream that is long gone, *scanning one crashes the process*, and it keeps doing so after a restart.
+
+Nothing creates them any more. If you have a `.duckdb` file that a pre-2026-09-03 build wrote to, check
+once and drop what you find:
+
+```sql
+SELECT view_name FROM duckdb_views()
+WHERE view_name = 'in0' OR starts_with(view_name, '__fab');
+-- for each, if any:
+DROP VIEW IF EXISTS "<name>";
+```
+
+They are only ever created by the extension, never by you, so anything this returns is safe to drop. An
+in-memory database (the default) is unaffected.
+
 ## Quick Start
 
 With the extension loaded ([Install](#install)):

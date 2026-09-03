@@ -1042,9 +1042,16 @@ typedef struct FabricatorVTable {
 // provided, sets *err to an owned UTF-8 message the managed side frees via `free_str`.
 // -----------------------------------------------------------------------------
 // Named Arrow inputs handed to host_query: the managed caller exports N Arrow streams + their names; the
-// host registers each as a connection-scoped view (duckdb_arrow_scan) BEFORE running the query, so the SQL
-// can reference them by name (`SELECT … FROM <name>`). The host consumes the streams during the query (which
-// materializes), so they're done by the time host_query returns. count==0 / null => no inputs.
+// host registers each as a TEMPORARY (connection-scoped) view BEFORE running the query, so the SQL can
+// reference them by name (`SELECT … FROM <name>`) and nothing survives the connection.
+// ⚠⚠ THE HOST TAKES OWNERSHIP OF EACH STREAM AT ONCE AND THE CALLER MUST NOT RELEASE IT. This used to read
+// "the host consumes the streams during the query (which materializes), so they're done by the time
+// host_query returns" — which contradicted the implementation's own comment and was the WRONG half: the
+// query is STREAMING (`SendQuery` returns as soon as the first chunk is ready), so the arrow scan is
+// generally NOT consumed by then. That is exactly why `OwnedArrowInputs` ADOPTS each stream (C-data-interface
+// move, source zeroed): the view holds a RAW POINTER and would otherwise outlive the caller's allocation.
+// ⚠ Each input is scanned ONCE — the view is re-queryable but the stream is a cursor, so a second reference
+// sees end-of-stream and returns ZERO ROWS silently (MEASURED 2026-09-03). count==0 / null => no inputs.
 typedef struct FabricatorHostInputs {
 	int32_t count;
 	const char **names;                  // count UTF-8 view names
@@ -1223,9 +1230,11 @@ typedef struct FabricatorHostServices {
 	// on several threads opens one connection per thread (which is what the Fluid engine does — one per
 	// render, created lazily on the first query/exec).
 	//
-	// ⚠ NAMED ARROW INPUTS ARE REFUSED on a pinned connection. duckdb_arrow_scan registers a
-	// CONNECTION-scoped view, which on a pinned connection would outlive the call that created it and
-	// collide with the next call using the same name. Refusing by name beats leaking a view.
+	// ⚠ NAMED ARROW INPUTS ARE REFUSED on a pinned connection — and the reason shipped with v84 ("a
+	// connection-scoped view … would collide") was MEASURED FALSE on 2026-09-03: `replace: true` replaces,
+	// and the view was a CATALOG view. Inputs are TEMPORARY views now, so a pin is the RIGHT scope and the
+	// refusal is LIFTABLE — but not by deleting it: the view would then outlive the RESULT STREAM that owns
+	// the input's storage, which is the same defect one layer over. docs/fluid-templating.md §17.10.
 	int32_t (*host_connection_open)(FabricatorHandle client_context, FabricatorHandle *out_connection, char **err);
 	// Close a handle from host_connection_open. Safe with 0, and idempotent from the caller's point of view
 	// only in the sense that the handle must not be reused afterwards. ⚠ Result streams opened on this

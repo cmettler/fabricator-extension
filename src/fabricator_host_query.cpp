@@ -14,7 +14,9 @@
 #include "duckdb/common/arrow/arrow_appender.hpp"
 #include "duckdb/common/arrow/arrow_converter.hpp"
 #include "duckdb/function/table/arrow/arrow_duck_schema.hpp"
-#include "duckdb.h" // C API: duckdb_arrow_scan + duckdb_connection (data-in via connection-scoped views)
+#include "duckdb/common/arrow/arrow_wrapper.hpp" // ArrowArrayStreamWrapper (our arrow_scan factory)
+#include "duckdb/function/table/arrow.hpp"       // ArrowStreamParameters + the factory typedefs
+#include "duckdb/main/relation.hpp"              // Relation::CreateView(name, replace, TEMPORARY)
 #include "duckdb/function/replacement_scan.hpp"
 #include "duckdb/catalog/catalog_search_path.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -40,8 +42,8 @@ namespace {
 // transaction — the in-flight context is non-reentrant, so reusing it would corrupt the outer query.
 // Owns MOVED-IN copies of the caller's input ArrowArrayStreams.
 //
-// ⚠ This is load-bearing, not tidiness. `duckdb_arrow_scan` stores the RAW POINTER it is given inside the
-// view it creates (`Value::POINTER((uintptr_t)input)`) and the query below is STREAMING — `SendQuery` returns
+// ⚠ This is load-bearing, not tidiness. The arrow scan stores the RAW POINTER it is given inside the view
+// it creates (`Value::POINTER((uintptr_t)input)`) and the query below is STREAMING — `SendQuery` returns
 // as soon as the first chunk is ready, so the arrow scan is generally NOT consumed by the time this function
 // returns. The caller's struct is a managed allocation whose cleanup runs the moment the ABI call returns, so
 // leaving the view pointed at it is a use-after-free: the scan later dereferences freed memory and reads
@@ -568,6 +570,83 @@ unique_ptr<FunctionData> HostExecBind(ClientContext &context, TableFunctionBindI
 	return std::move(bind_data);
 }
 
+
+// ── Registering a named Arrow input as a TEMPORARY view ────────────────────────────────────────────────
+//
+// This is `duckdb_arrow_scan` with ONE argument changed. That C-API entry ends in
+// `CreateView(name, /*replace=*/true, /*temporary=*/FALSE)` (duckdb/src/main/capi/arrow-c.cpp:425), so the
+// view it makes is an ordinary CATALOG view: visible to every other connection on the database, and
+// OUTLIVING the connection that made it — including the stream whose raw pointer it stores.
+//
+// ⚠⚠ THAT IS NOT A TIDINESS POINT, IT IS A CRASH — MEASURED 2026-09-03 with a positive control. On a codec
+// Delta scan under exact pushdown (`Fabricator.Delta` Debug: `mode=Exact native_filter="g"=3`, which is what
+// proves the path ran), three filtered SELECTs left THREE views behind in the user's own `memory.main` —
+// `__fabricator_scan_batch_1..3`, `temporary = false`, one per statement and unbounded — and
+// `SELECT * FROM __fabricator_scan_batch_1` afterwards SEGFAULTED the process, because the stream that view
+// points at was released when its own query finished. A TEMPORARY view is scoped to the connection that
+// made it, so the whole class goes away by construction: nothing reaches the shared catalog, nothing
+// outlives the stream, and nothing has to be cleaned up afterwards.
+//
+// ⚠ The factory pair below is duplicated from that same upstream file, where it lives in an ANONYMOUS
+// namespace and is therefore unlinkable from an extension. `EmptyStreamRelease` is not laziness: ownership
+// of the input stays with OwnedArrowInputs, which releases it when the result stream is released, so DuckDB
+// must not release it on our behalf.
+void FabricatorEmptyStreamRelease(ArrowArrayStream *stream) {
+	stream->release = nullptr;
+}
+
+void FabricatorEmptySchemaRelease(ArrowSchema *schema) {
+	schema->release = nullptr;
+}
+
+unique_ptr<ArrowArrayStreamWrapper> FabricatorArrowStreamProduce(uintptr_t stream_factory_ptr,
+                                                                 ArrowStreamParameters &) {
+	auto *stream = reinterpret_cast<ArrowArrayStream *>(stream_factory_ptr);
+	auto ret = make_uniq<ArrowArrayStreamWrapper>();
+	ret->arrow_array_stream = *stream;
+	ret->arrow_array_stream.release = FabricatorEmptyStreamRelease;
+	return ret;
+}
+
+void FabricatorArrowStreamGetSchema(ArrowArrayStream *stream, ArrowSchema &schema) {
+	stream->get_schema(stream, &schema);
+	// Nulling the ROOT release stops ArrowSchemaWrapper's destructor freeing a schema the caller owns; the
+	// children are covered by the backup dance below. (Upstream does exactly this, for the same reason.)
+	schema.release = nullptr;
+}
+
+// Registers `stream` as a TEMPORARY view named `name` on `conn`. Returns false on any failure, which is the
+// same signal `duckdb_arrow_scan`'s DuckDBError gave the caller.
+bool RegisterArrowInputView(Connection &conn, const string &name, ArrowArrayStream *stream) {
+	// Back up and neutralise the IMMEDIATE children's release callbacks so DuckDB cannot release the
+	// caller's schema children on its behalf. Arrow releases are not recursive, so immediate children are
+	// the whole job — upstream's comment, and its dance, reproduced verbatim.
+	ArrowSchema schema;
+	if (stream->get_schema(stream, &schema) != 0) {
+		return false;
+	}
+	const idx_t n_children = schema.n_children > 0 ? static_cast<idx_t>(schema.n_children) : 0;
+	vector<void (*)(ArrowSchema *)> release_fns(n_children);
+	for (idx_t i = 0; i < n_children; i++) {
+		release_fns[i] = schema.children[i]->release;
+		schema.children[i]->release = FabricatorEmptySchemaRelease;
+	}
+	bool ok = true;
+	try {
+		conn.TableFunction("arrow_scan",
+		                   {Value::POINTER(reinterpret_cast<uintptr_t>(stream)),
+		                    Value::POINTER(reinterpret_cast<uintptr_t>(FabricatorArrowStreamProduce)),
+		                    Value::POINTER(reinterpret_cast<uintptr_t>(FabricatorArrowStreamGetSchema))})
+		    ->CreateView(name, /*replace=*/true, /*temporary=*/true);
+	} catch (...) {
+		ok = false;
+	}
+	for (idx_t i = 0; i < n_children; i++) {
+		schema.children[i]->release = release_fns[i];
+	}
+	return ok;
+}
+
 } // namespace
 
 
@@ -575,10 +654,15 @@ void MakeHostQueryStream(DatabaseInstance &db, const string &sql, ArrowArrayStre
                          const vector<HostQueryInput> &inputs, ArrowArrayStream &out,
                          shared_ptr<ClientContext> *out_context, const HostQuerySession *session,
                          shared_ptr<HostConnection> pinned) {
-	// ⚠ A PINNED connection is REFUSED a named input, because duckdb_arrow_scan registers a
-	// CONNECTION-scoped view: on a fresh connection it dies with the call, on a pinned one it would outlive
-	// it and the next call registering the same name would collide. Refusing by name beats leaking a view
-	// into a connection the caller keeps using. Checked BEFORE anything is adopted, so nothing leaks.
+	// ⚠⚠ A PINNED connection is REFUSED a named input — and the reason this shipped with (v84: "a
+	// connection-scoped view … would collide") was MEASURED FALSE on 2026-09-03 on BOTH counts: the view
+	// was created with `replace: true`, so a re-registration REPLACES, and it was a CATALOG view, not a
+	// connection-scoped one. Inputs are TEMPORARY views now (see RegisterArrowInputView), which makes a pin
+	// the RIGHT scope rather than the wrong one, so this refusal is LIFTABLE.
+	// ⚠ It is NOT a one-line deletion, which is why it still stands: `OwnedArrowInputs` is owned by the
+	// RESULT STREAM, and on a pinned connection the view would outlive that stream — the same
+	// use-after-free one layer over. Move the ownership onto the pin first; docs/fluid-templating.md §17.10.
+	// Checked BEFORE anything is adopted, so nothing leaks on the refusal.
 	if (pinned && !inputs.empty()) {
 		throw IOException("fabricator host_query: named Arrow inputs are not supported on a pinned host "
 		                  "connection (an arrow_scan view is connection-scoped, so it would outlive this "
@@ -608,15 +692,14 @@ void MakeHostQueryStream(DatabaseInstance &db, const string &sql, ArrowArrayStre
 	if (!pinned) {
 		ApplyHostQuerySession(*conn, session);
 	}
-	// Register each named Arrow input as a connection-scoped view (data-in). duckdb_arrow_scan reinterprets
-	// the opaque handle back to ArrowArrayStream* and creates a view over it. We ADOPT each stream first (see
-	// OwnedArrowInputs): the view keeps the RAW POINTER and the query below is LAZY, so the caller's own
-	// allocation must not be what it points at. On any throw below, the local holder releases them.
+	// Register each named Arrow input as a TEMPORARY, connection-scoped view (data-in) — see
+	// RegisterArrowInputView, which is duckdb_arrow_scan with `temporary` flipped and says why. We ADOPT each
+	// stream first (see OwnedArrowInputs): the view keeps the RAW POINTER and the query below is LAZY, so the
+	// caller's own allocation must not be what it points at. On any throw below, the local holder releases
+	// them.
 	auto owned_inputs = make_uniq<OwnedArrowInputs>();
 	for (auto &in : inputs) {
-		auto rc = duckdb_arrow_scan(reinterpret_cast<duckdb_connection>(conn.get()), in.name.c_str(),
-		                            reinterpret_cast<duckdb_arrow_stream>(owned_inputs->Adopt(in.stream)));
-		if (rc != DuckDBSuccess) {
+		if (!RegisterArrowInputView(*conn, in.name, owned_inputs->Adopt(in.stream))) {
 			throw IOException("fabricator_host_query: failed to register input view '" + in.name + "'");
 		}
 	}

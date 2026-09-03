@@ -46,12 +46,24 @@ SELECT count(*) FILTER (WHERE a = 42) FROM (SELECT cdb.dbo.cf_host_answer(i) AS 
 3
 
 # dbo.cf_host_sum pushes a C#-built Arrow table [1,2,3,4] INTO a host query (data-in): Host.Query registers
-# it as the connection-scoped view `in0` (duckdb_arrow_scan) and runs SELECT sum(v) FROM in0 on the host
-# engine. Proves C#-provided Arrow streaming into the host. 1+2+3+4 = 10. host-query.md.
+# it as the connection-scoped TEMPORARY view `in0` and runs SELECT sum(v) FROM in0 on the host engine.
+# Proves C#-provided Arrow streaming into the host. 1+2+3+4 = 10. host-query.md.
 query I
 SELECT cdb.dbo.cf_host_sum(0);
 ----
 10
+
+# ⚠⚠ ...AND IT LEAVES NOTHING BEHIND. Until 2026-09-03 the input was registered by duckdb_arrow_scan, which
+# ends in CreateView(name, replace, temporary: FALSE) — so this very call left an `in0` CATALOG view in the
+# caller's own memory.main, pointing at a stream that was released when its query finished. MEASURED then:
+# `SELECT * FROM in0` right here SEGFAULTED the process (exit 139). They are TEMPORARY views now.
+#
+# ⚠ The 10 above is this assertion's positive control and is load-bearing: a 0 here is equally true of a
+# build where the input was never registered at all, which is why the two must be read together.
+query I
+SELECT count(*) FROM duckdb_views() WHERE view_name = 'in0';
+----
+0
 
 # dbo.cf_host_param binds a 1-row Arrow params batch [40, 2] POSITIONALLY into a host query
 # (SELECT (?::BIGINT)+(?::BIGINT)) via a prepared statement on a fresh host connection -> 42. host-query.md.

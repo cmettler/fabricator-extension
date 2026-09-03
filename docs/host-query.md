@@ -121,11 +121,22 @@ only once the statement has SUCCEEDED, and released after the result is dropped.
 so the refusal carries no test. It exists for a plugin author holding a stream, which is a sequencing
 mistake whose alternative is a silent short read.
 
-### ⚠ Refused: named Arrow inputs
+### ⚠ Refused: named Arrow inputs — and the stated reason was MEASURED FALSE the next day
 
-`duckdb_arrow_scan` registers a CONNECTION-scoped view. On a fresh connection it dies with the call; on a
-pinned one it would outlive it and the next call using that name would collide. Refusing by name beats
-leaking a view into a connection the caller keeps using.
+As shipped, the refusal reads: *"`duckdb_arrow_scan` registers a CONNECTION-scoped view … on a pinned one it
+would outlive it and the next call using that name would collide."* **Both halves are wrong** (measured
+2026-09-03, see §Named Arrow inputs are TEMPORARY views below): that view was neither connection-scoped nor
+collision-prone — it was a CATALOG view created with `replace: true`, so a re-registration REPLACES rather
+than colliding, and it outlived not just the call but the connection.
+
+⇒ **The refusal is now LIFTABLE and has not yet been lifted.** Since the inputs are TEMPORARY views, a
+pinned connection is exactly the right scope for one: the view lives as long as the pin, dies with it,
+is invisible to every other connection, and re-registering the same name replaces it. That is the
+prerequisite [fluid-templating.md](fluid-templating.md) §17 needs for `{% query t %}` …
+`{% query u %}SELECT … FROM t{% endquery %}`. Lifting it is its own change: the refusal is currently the
+only thing keeping a caller from binding an input whose STREAM it might release before the pin closes,
+so the ownership rule (`OwnedArrowInputs` is owned by the RESULT STREAM, not by the connection) has to be
+re-examined for a view that now outlives the result stream.
 
 ### ⚠ The session is applied at OPEN, and that has a consequence worth knowing
 
@@ -158,6 +169,127 @@ earlier statements are visible to its later ones.
   stays and has a dozen callers, because falling back to a provider's own reader is still CORRECT.
 - First consumer: the Fluid plugin's per-render session — see
   [fluid-templating.md](fluid-templating.md) §12.
+
+## ✅ Named Arrow inputs are TEMPORARY views now — a SHIPPED DEFECT, measured and fixed (2026-09-03)
+
+A named Arrow input was registered with DuckDB's C-API `duckdb_arrow_scan`, which ends in
+`CreateView(table_name, replace: true, temporary: false)` (`duckdb/src/main/capi/arrow-c.cpp:425`). So every
+bound input became an ordinary **CATALOG view in the user's own `memory.main`** — visible to every other
+connection, and outliving the connection that made it *and the stream whose raw pointer it stores*.
+
+`MakeHostQueryStream` now registers them itself (`RegisterArrowInputView`), which is that same upstream code
+with `temporary` flipped to `true`. Nothing else changed.
+
+### The measurement, with its positive controls
+
+Two probes, each with a control that proves the code path ran — because §17.9 had recorded three earlier
+probes that all *looked* like passes and had never reached a view-creating path at all.
+
+| probe | control that the path ran | before | after |
+|---|---|---|---|
+| `dbo.cf_host_sum(1)` — binds `in0`, sums it on the host | returns **10**, which can only come from `in0` having been registered AND scanned | `in0` present in `memory.main`, `temporary = false` | **absent** |
+| codec Delta scan, `pushdown_filters 'all'`, three filtered `SELECT`s | Debug `mode=Exact native_filter="g"=1/2/3` — the `HostBatchFilter` path, three times | **three** views `__fabricator_scan_batch_1..3` | **none** |
+
+Row counts were identical throughout (715 / 714 / 714), which is the behaviour-neutrality claim.
+
+### ⚠⚠ It was not untidiness — it was a SIGSEGV reachable from ordinary SQL
+
+The view holds a raw `ArrowArrayStream *` that `OwnedArrowInputs` releases when the result stream is
+released. Once the query is done, the view points at freed memory — and it is still in the catalog, under a
+name anyone can type:
+
+```sql
+SELECT dbo.cf_host_sum(1);        -- 10
+SELECT * FROM in0;                 -- Segmentation fault, exit 139
+```
+
+Measured on both the demo name (`in0`) and a production one (`__fabricator_scan_batch_1`). And it
+**accumulated**: one view per statement, unbounded, for the process's life.
+
+⚠ **A second hazard goes with it, and it is v83's doing.** The fresh connection inherits the CALLER's
+search path, so a catalog view named by a managed caller landed in **whatever schema the user was working
+in**, under a name the user never chose. A temporary view lands in `temp.main` whatever the search path —
+which also makes the input name resolve identically regardless of session state, since `temp` is always
+searched first.
+
+### ⚠ Reachability was narrower than the mechanism — and that is why it survived
+
+Establish it per path rather than assuming. The one prediction made before measuring was WRONG, and it was
+the one that would have made the defect far more serious — I expected the buffered-overlay branch to leak
+under the DEFAULT `PROVIDER 'delta'`, i.e. on the configuration almost everyone runs. It does not.
+
+- **`HostBatchFilter`** (codec Delta + exact pushdown) leaks — measured. It is the one production path that
+  calls `BoundInput.NextName` and never calls `Drop`.
+- **`cf_host_sum`** leaks — a demo function using the FIXED name `in0` with no drop.
+- **The default `PROVIDER 'delta'`** does NOT — measured with the same Debug control (`mode=Exact
+  native_filter="g"=3` present, zero views left). Under `native_read` the filter goes into `read_parquet`'s
+  own WHERE and no input is bound.
+- Every other input site — `HostParquetStaging`, `ExternalTableRouting`, `NativeParquetDataFileWriter`,
+  `DeltaCatalog`'s sort input, `DeltaNativeReader` — already worked around it with a unique name plus an
+  explicit `DROP VIEW`.
+
+### ⚠ THE APPARATUS IT DISSOLVES, and why it is a separate change
+
+Two independent copies of the same workaround exist — `BoundInput.NextName`/`Drop`/`WrapDrop`
+(`Fabricator.Bridge`) and `DeltaNativeReader`'s own `NextViewName`/`DropViews`. Both exist ONLY because the
+view was catalog-level: unique names avoid a cross-connection collision that a temp view cannot have, and
+the drops reclaim a catalog entry a temp view never makes. `BoundInput`'s own doc records what it cost to
+learn — *"six concurrent Delta writers in one process — the `dbt run --threads N` shape — and **five of the
+six failed**"*.
+
+They are now dead weight (a `DROP VIEW IF EXISTS` from another connection finds nothing, so it is a
+harmless wasted host query), and retiring them is deliberately **NOT** in this change: removing ~2 copies of
+an apparatus across three assemblies alongside the mechanism change would make the mechanism unreviewable.
+
+### ⚠⚠ IT PERSISTED INTO A FILE-BACKED DATABASE, AND THE CRASH SURVIVES A RESTART — measured
+
+The worst case was real, and it is the reason this is worth telling users about rather than only fixing.
+Measured on the **pre-fix build**, against a `.duckdb` FILE rather than the in-memory default:
+
+```
+$ duckdb probe.db
+  SELECT db.dbo.cf_host_sum(1);                     -- 10   (control: the input really was bound)
+  SELECT database_name, view_name, temporary
+    FROM duckdb_views() WHERE view_name = 'in0';    -- probe | in0 | false     <- the FILE, not memory
+$ duckdb probe.db                                   -- fresh process
+  SELECT count(*) FROM duckdb_views()
+    WHERE view_name = 'in0';                        -- 1     <- it was SERIALIZED
+  SELECT * FROM in0;                                -- Segmentation fault, exit 139
+```
+
+⇒ a database file written by a pre-fix build can hold a **permanently poisoned view**: it dereferences a
+pointer from a process that no longer exists, so it crashes any process that scans it, for ever. The
+remediation is a one-liner — `DROP VIEW IF EXISTS <name>` — but a user has to know to run it.
+
+⚠ The exposure is bounded by the reachability above: the fixed name `in0` (from the `cf_host_sum` demo) and
+`__fabricator_scan_batch_N` (codec Delta with exact pushdown). Both only reach a file-backed catalog when
+the user's DEFAULT database is a file. `SELECT view_name FROM duckdb_views() WHERE view_name = 'in0' OR
+starts_with(view_name, '__fab')` finds them.
+
+### ⚠ What is NOT settled
+
+- The root `ArrowSchema` that `RegisterArrowInputView` fills is never released — replicated verbatim from
+  upstream, where it is also never released. A per-registration leak of one schema struct. Left alone
+  deliberately: the children's release callbacks are the CALLER's and are restored afterwards, so releasing
+  the root here risks a double free, and an ownership fix does not belong in a scope fix.
+
+### The gate
+
+`verify_delta_catalog_filter_modes` **39 → 55** (hermetic). No row assertion can see this change, so the
+section is built as a pair:
+
+- **the positive control** — an `EXPLAIN` (`<REGEX>:` form; `EXPLAIN` cannot be a subquery source) showing
+  that under exact mode the plan carries `Filters: id>495` on the scan and has **no `FILTER` operator**.
+  DuckDB has erased the predicate and will not re-apply it, so on the codec path the correct row count is
+  evidence that `HostBatchFilter` ran.
+- **the assertion** — `SELECT count(*) FROM duckdb_views() WHERE starts_with(view_name, '__fab')` = 0.
+
+⚠ **The first version of that assertion was VACUOUS and passed on both builds.** It was written as
+`LIKE '\_\_fab%' ESCAPE ''` and the escape character did not survive into the file (`ESCAPE ''`), so the
+pattern matched nothing. Only the mutation test caught it. `starts_with` has no metacharacters and cannot
+fail that way. Mutation-tested afterwards: restoring `temporary: false` kills the suite at exactly that
+line after 53 assertions pass.
+
 
 ## Session state — the table function inherits, the C# service deliberately does NOT (2026-07-30)
 
@@ -253,9 +385,14 @@ ABI minimal. Both get parameter binding for free.
 ## Data-in — two layers
 
 1. **Scoped inputs (built in `host_query`):** the caller passes named Arrow streams with the query; the host
-   registers them as connection-scoped views (`duckdb_arrow_scan`) for that query only and tears them down with
-   the connection. No global state, no name collisions, no lifetime ambiguity. **This is the primary data-in
-   path** — the query references the input names directly.
+   registers them as **TEMPORARY** views for that query only, and they die with the connection. No global
+   state, no name collisions, no lifetime ambiguity. **This is the primary data-in path** — the query
+   references the input names directly.
+   - ⚠⚠ **That sentence described the INTENT and not the behaviour until 2026-09-03**, and it said
+     "connection-scoped" while `BoundInput` (`SingleScanArrowStream.cs`) documented the opposite — CATALOG
+     views that outlive the connection — *with a measurement attached*. Two docs in one tree, contradicting
+     each other, and the wrong one was the one describing the mechanism. See §Named Arrow inputs are
+     TEMPORARY views.
 2. **Replacement-scan layer (optional, ambient registry):** for "register a C# source by name once, then any
    query referencing that bare name resolves to it" (pandas-df style). A C# registry maps `name → Func<
    IArrowArrayStream>`; a C++ replacement scan registered on the `DBConfig` rewrites an unknown table name to a

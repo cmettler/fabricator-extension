@@ -1726,6 +1726,11 @@ wrong answers, not errors.**
 
 ### 17.2 ⇒ The pinned connection already gives render-scoped naming, and the refusal I wrote IS the feature
 
+> ⚠⚠ **THE FIRST SENTENCE BELOW IS FALSE — corrected in §17.6, measured in §17.9.** `duckdb_arrow_scan`
+> registered a CATALOG view, not a connection-scoped one. The SECTION'S CONCLUSION SURVIVES, because the
+> fix made the premise true: bound inputs are TEMPORARY views since 2026-09-03. Kept as written because
+> the reasoning it led to is what got built. The rest of §17.2 reads correctly today.
+
 `duckdb_arrow_scan` registers a **CONNECTION-scoped view**. §13/abi-history §v84 refuse named Arrow inputs
 on a pinned connection with the reason *"a connection-scoped view would outlive the call and collide with
 the next one"* — and for a RENDER SESSION, outliving the call is exactly the requirement. Same fact,
@@ -1909,59 +1914,98 @@ and issue our own temp view. The remaining work before the change lands is (a) t
 real `arrow_scan(POINTER…)` form, and (b) §17.7's outstanding question of whether today's non-temp view
 persists.
 
-### 17.9 ⇒ PICK UP HERE — state of play, and the two measurements owed
+### 17.9 ✅ RESOLVED — both measurements taken, and the fix is BUILT (2026-09-03)
 
-**Nothing is built. §17 is analysis only.** Four things are settled, two are open, and the open ones are
-MEASUREMENTS rather than decisions.
+**The `inputs` path registers TEMPORARY views now.** Full record, with the probes and their positive
+controls: [host-query.md](host-query.md) §Named Arrow inputs are TEMPORARY views. In summary:
 
-#### Settled
-
-| | |
+| what §17.9 asked | answer |
 |---|---|
-| the surface | **ONE site**: `src/fabricator_host_query.cpp:617`, the named-`inputs` loop in `MakeHostQueryStream` |
-| what it does today | `duckdb_arrow_scan` → `CreateView(name, replace: true, temporary: **false**)` — a CATALOG view, replace-on-conflict |
-| the decision | **TEMP view, unconditionally — no flag** (§17.7's four reasons) |
-| the mechanics | MEASURED to work: temp view over an Arrow table function binds, scans, REPLACEs, lands in `temp.main`, `memory` count 0 (§17.8) |
+| does today's non-temp view PERSIST after its connection closes? | **YES** — and it is worse than persistence: it accumulates one per statement, and `SELECT * FROM <name>` afterwards **SEGFAULTS**, because the stream it points at was released when its query finished. A shipped defect, recorded as one. |
+| does `arrow_scan(POINTER…)` work under a TEMP view? | **YES** — `cf_host_sum` still answers 10, and nothing is left in `memory.main`. |
 
-#### Open — measurement 1: does today's non-temp view PERSIST?
+The change is `RegisterArrowInputView` in `src/fabricator_host_query.cpp`: upstream's
+`duckdb_arrow_scan` body with `temporary` flipped, because its factory pair lives in an anonymous namespace
+and is unlinkable from an extension. Gate `verify_delta_catalog_filter_modes` **39 → 55**, mutation-tested.
 
-If yes, it is a **shipped defect** on the `inputs` path and must be recorded as one, not quietly fixed.
-⚠ THREE of my probes were INCONCLUSIVE and all looked like passes (`memory` views 0 → 0). They never
-reached a view-creating path, shown by the absence of any `delta native batch:` line in a Debug log.
+⚠ **The probe discipline §17.9 demanded is what made this work, and it earned its keep twice.** The three
+earlier probes were inconclusive *and looked like passes*; the two that settled it each carry a control that
+proves the path ran (a value only the bound input can produce; a Debug line naming the exact-filter mode).
+And the gate's FIRST assertion was itself vacuous — a mangled `LIKE … ESCAPE` matched nothing and passed on
+both builds — caught only by the mutation test.
 
-**Do not repeat that mistake: prove the path ran BEFORE reading the result.** A usable probe must
-(a) provably bind inputs and (b) show it did. The Delta batched reader is the only in-tree producer of
-`inputs`; `FABRICATOR_DELTA_BATCH_MIN_FILES=1` alone was not sufficient on a 5-row single-file table.
-Options: a bigger/multi-file table so a batched form is genuinely chosen, or instrument
-`MakeHostQueryStream` to log each `in.name` it registers — the second is the reliable one, because it
-makes the positive control impossible to miss.
+### 17.10 ⇒ WHAT IS STILL OPEN: lifting the v84 refusal
 
-#### Open — measurement 2: does `CREATE OR REPLACE TEMP VIEW … AS SELECT * FROM arrow_scan(POINTER…)` work?
+The prerequisite §17.2 needs is now in place — a bound input on a pinned connection would be a TEMP view
+scoped to that connection, i.e. to the render — but **the refusal has not been lifted**, and it is not a
+one-line deletion. The ownership question §17.3 raised is the real work and it is unchanged:
 
-§17.8 tested the SHAPE through `fabricator_scan(name)`, not the pointer form. ⚠ The gap is narrow because
-pointer lifetime is orthogonal to temp-ness — but narrow is not closed, and this is the exact class of
-assumption this section exists to record. It needs a C++ probe (the POINTER values cannot be built from
-SQL), so it belongs with the change itself rather than before it.
+- Today `OwnedArrowInputs` is owned by the **result stream**, and the view is dropped with the connection.
+  On a fresh connection those coincide. On a **pinned** one they do not: the view would outlive the result
+  stream, so the stream's storage must be re-homed onto the connection (or the pin) or the view points at
+  freed memory again — the very defect just fixed, in a new place.
+- Only then does the naming question of §17.5 matter (a bound name SHADOWS a real table on that connection),
+  and the re-assignment question dissolves on its own, since `replace: true` already replaces.
 
-#### The change, when the measurements are in
+### 17.11 ⚠⚠ A BOUND INPUT IS SINGLE-USE, so "reference `t` later" needs MATERIALIZING, not just scoping
 
-Replace the `duckdb_arrow_scan` call at `fabricator_host_query.cpp:617` with our own
-`CREATE OR REPLACE TEMP VIEW <name> AS SELECT * FROM arrow_scan(<ptr>, <ptr>, <ptr>)` (or the 3-arg
-`Relation::CreateView(schema, name, replace, temporary)` overload). Keep `OwnedArrowInputs` exactly as it
-is — the adoption discipline is unaffected.
+User-raised 2026-09-03: *"is such a temp view + arrow_scan one single scan or can such a view be queried
+several times?"* — and it is the question that decides §17.10's design, which had the wrong answer in it.
 
-⇒ **Then LIFT the ABI v84 refusal of named inputs on a pinned connection**, whose stated reason is already
-known false (§17.6). With a temp view the scope becomes the connection (= the render), re-registration
-replaces, and nothing reaches the catalog — which is the prerequisite §17.2 needs for
-`{% query t %}` … `{% query u %}SELECT … FROM t{% endquery %}`.
+**The VIEW is re-queryable; the DATA is not**, and the chain is three links, each read rather than recalled:
 
-#### ⚠ Traps this session paid for — do not re-pay them
+1. `ProduceArrowScan` is called once per scan's global init (`duckdb/src/function/table/arrow.cpp:142`), so
+   a second reference to the view is a second scan with its own global state — it binds and plans normally.
+2. Our factory (like upstream's) hands back a wrapper around **the same `ArrowArrayStream *`**. It is a
+   cursor, not a snapshot.
+3. Behind it, `InMemoryArrayStream` is a `Queue<RecordBatch>` that **dequeues** — once drained it returns
+   `null` forever.
 
-- **Three claims were asserted before being run** and all three were wrong: "the view would collide",
-  "it is connection-scoped", "a temp view will work". Run it first.
-- A probe that returns the expected answer is not evidence unless it PROVES it reached the code path.
-- The `duckdb` submodule is a **shallow clone**: `git log -S`/`-L` attribute every line to one commit, so
-  upstream intent cannot be read from here. Ask upstream or say unknown.
-- `python` here is a Windows binary and cannot see MSYS `/tmp` — use the scratchpad path.
-- Check `Get-Process duckdb` before a build or publish; a leftover `-batch` shell holds the payload and
-  fails the link or the publish, after which a suite silently measures the STALE payload.
+⇒ the first scan consumes it and the second sees end-of-stream ⇒ **zero rows, silently**. Nothing to do
+with temp-vs-catalog; it is the stream's property and today's fix does not touch it.
+
+The tree already knows this and carries two mitigations: `HostBatchFilter` wraps its query in
+`WITH b AS MATERIALIZED (…)` to force exactly one scan, and `SingleScanArrowStream` turns a second
+end-of-stream read into a THROW — its comment says why in the sharpest available terms, that for a
+deletion-vector anti-join zero rows is *deleted rows coming back*.
+
+⚠ Source-read plus the tree's own recorded measurement; **not re-measured on 2026-09-03**. It needs a query
+referencing one input twice and no in-tree one does — `cf_host_sum`'s SQL is fixed at
+`SELECT sum(v) FROM in0`. A C#-only edit to that demo would measure it.
+
+#### ⇒ It CHANGES §17.10: prefer MATERIALIZING over owning the batches
+
+§17.10 says the hard part is making the session own the batches so the view can outlive the result stream.
+For `{% query t %}` … `{% query u %}SELECT … FROM t{% endquery %}` that is the **wrong fix**: a second
+reference to `t` returns zero rows however long the stream lives.
+
+| option | what it costs |
+|---|---|
+| **A. bind a REPLAYABLE Arrow source** — the factory builds a FRESH reader over retained batches per scan instead of re-wrapping one cursor | the batches must be owned for the render; no copy into DuckDB storage, no DDL, data stays Arrow |
+| **B. MATERIALIZE into DuckDB** — `CREATE TEMP TABLE t AS SELECT * FROM <bound view>` on the pinned connection | the stream is released immediately and `t` is an ordinary re-scannable relation that dies with the render ⇒ no new lifetime machinery at all; costs a copy into DuckDB's storage format and a DDL per binding |
+
+Neither was considered when §17.3/§17.10 were written; §17.10's "own the batches so the view outlives the
+result stream" is not on this list because it does not make a second reference work.
+
+**⚠⚠ WHAT MAKES (A) NEWLY CHEAP is today's commit, and it is the non-obvious part.** `RegisterArrowInputView`
+is OURS now, and `FabricatorArrowStreamProduce` is called **once per scan**
+(`duckdb/src/function/table/arrow.cpp:142`). Today it re-wraps one cursor. If the bound object were a
+retained *list* of batches rather than a cursor, that same function could hand out a fresh reader each time
+— and the view becomes replayable with no temp table, no CTAS and no copy. The replayability seam is
+already in our hands; before today it was upstream's.
+
+**⚠ There is no "materialize" option on `host_query` to reach for** — checked, not recalled: it returns a
+lazy `ArrowArrayStream` and the ABI has no such flag (the only `materialize` in the tree is
+`mssql_materialize`, an unrelated SQL Server scan-routing switch). But **the Fluid path does not need one**:
+`FluidHostQuery.Run` already reads every cell eagerly into an `ArrayValue` of rows — that is why `MaxRows`
+exists — so the result is materialized in managed memory before any of this starts.
+
+**⚠⚠ WHICHEVER IS BUILT, IT MUST BE OPT-IN PER BINDING AND MUST NOT CHANGE THE EXISTING PATH.** Two reasons,
+and the second is the one that bites:
+
+1. Every current caller depends on **streaming, bounded memory** — a Delta scan binding a deletion vector,
+   a bulk write binding its source. Retaining batches to make them replayable would defeat that.
+2. Replayability would quietly dissolve the premise of two correctness-bearing mechanisms:
+   `HostBatchFilter`'s `WITH … AS MATERIALIZED` and `SingleScanArrowStream`, which THROWS on a second
+   end-of-stream *because for a DV anti-join zero rows means deleted rows coming back*. A change that makes
+   those guards look unnecessary is exactly the kind that gets them deleted later.

@@ -444,6 +444,12 @@ case "$TIER" in
         # in that section is load-bearing and a mutant proved it: an earlier `USE memory.hq_s` leaves a
         # qualified entry, against which the bug does not fire, so the section PASSED with it fully present.
         # 8250 + 9 = 8259 exactly, from a green run.
+        # 8571 since 2026-09-03 (same day, sixth bump): verify_delta_catalog_filter_modes 39 -> 55 --
+        #   the codec exact-filter path binds an Arrow view per batch, and until today it was registered
+        #   NON-TEMPORARY (duckdb_arrow_scan hardcodes it), so each filtered SELECT left one behind in the
+        #   user's own memory.main -- unbounded, and scanning one SEGFAULTED. Temp views now; the section's
+        #   EXPLAIN control proves exact mode is in force, which is what makes the row count evidence that
+        #   HostBatchFilter ran at all.
         # 8555 since 2026-09-03 (same day, fifth bump): verify_plugin_fluid 285 -> 296 -- both blocks
         # take OPTIONAL NAMED ARGUMENTS now, bound as parameters ({% query t a: 1, b: 2 %}), through the
         # same ToParameter table the filter form uses.
@@ -467,7 +473,7 @@ case "$TIER" in
         # two functions have exactly ONE registration each, plus the HostsCatalog refusal and its
         # unknown-provider control. 3105 + 238 + 8259 - 3339 arithmetic aside, both numbers come from green
         # runs.
-        : "${MIN_ASSERTIONS:=8555}"
+        : "${MIN_ASSERTIONS:=8571}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh
@@ -850,7 +856,12 @@ case "$TIER" in
         # ... and +3 on verify_plugin (133 -> 136) for the closure fixture that replaces what Fluid used to
         # prove: the sample plugin now has a PRIVATE DEPENDENCY, so a plugin's own assembly shipping beside
         # it and being reachable is still gated somewhere. 3339 - 234 + 3 = 3108.
-        : "${MIN_ASSERTIONS:=3108}"
+        # 3109 since 2026-09-03: verify_custom_functions +1 -- dbo.cf_host_sum binds an Arrow input and
+        #   must leave NO `in0` view behind. Until today that input was a CATALOG view (duckdb_arrow_scan
+        #   hardcodes temporary:false), so this very call left one in the caller's memory.main pointing at
+        #   a released stream, and scanning it SEGFAULTED. The 10 asserted just above is its positive
+        #   control: a 0 is equally true of a build where the input was never registered at all.
+        : "${MIN_ASSERTIONS:=3109}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

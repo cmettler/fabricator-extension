@@ -120,6 +120,60 @@ SELECT count(*) FROM n_static.main.t WHERE id = 250;
 ----
 1
 
+# ============================================================================================
+# ⚠⚠ THE CODEC EXACT PATH BINDS AN ARROW VIEW PER BATCH, AND IT MUST LEAVE NOTHING BEHIND.
+#
+# HostBatchFilter runs `SELECT * FROM <bound input> WHERE ...` on the host engine, binding the
+# batch as a named Arrow input. Until 2026-09-03 that input was registered by duckdb_arrow_scan,
+# which ends in CreateView(name, replace, temporary: FALSE) — an ordinary CATALOG view. MEASURED
+# then: three filtered SELECTs left THREE views in the user's own `memory.main`
+# (__fabricator_scan_batch_1..3), one per statement and unbounded, and `SELECT * FROM
+# __fabricator_scan_batch_1` afterwards SEGFAULTED, because the stream it points at was released
+# when its query finished. They are TEMPORARY views now, so they die with the fresh connection.
+#
+# ⚠ Note the earlier sections cannot see this: they attach PROVIDER 'delta', which defaults
+# native_read ON, and there the filter goes into read_parquet's WHERE — HostBatchFilter never runs.
+# The codec provider is what reaches it.
+# ============================================================================================
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/fmodes' AS codec_x (TYPE fabricator, PROVIDER 'engineeredwooddelta', column_mapping 'none', pushdown_filters 'all');
+
+# ⚠⚠ POSITIVE CONTROL, and the row counts below are worthless without it: under EXACT mode DuckDB
+# ERASES the filter from the plan — there is NO `FILTER` operator, the predicate sits on the scan —
+# so it will NOT re-apply, and on the codec path the only thing left that can apply it is
+# HostBatchFilter. A `static` catalog plans the same query with a FILTER above the scan instead.
+# ⚠ EXPLAIN cannot be a subquery source, hence the <REGEX>: form on the physical_plan row.
+query II
+EXPLAIN SELECT count(*) FROM codec_x.main.t WHERE id > 495;
+----
+physical_plan	<REGEX>:.*FABRICATOR_SCAN.*Filters: id>495.*
+
+# ...and the answer is exact, so it really did run.
+query IT
+SELECT id, name FROM codec_x.main.t WHERE id > 495 ORDER BY id;
+----
+496	name6
+497	name0
+498	name1
+499	name2
+500	name3
+
+statement ok
+SELECT count(*) FROM codec_x.main.t WHERE grp IS NULL;
+
+statement ok
+SELECT count(*) FROM codec_x.main.t WHERE name IN ('name0', 'name3') AND amt > 1.0;
+
+# ⚠ THE ASSERTION. Broad on purpose — `__fab%` covers every bound-input prefix in the tree
+# (__fabricator_scan_batch, __fab_files, __fab_dv, __fabricator_sort_input, …), so it also catches a
+# future path that registers one and forgets to clean up. Mutation-tested: registering them
+# non-temporary again (the pre-2026-09-03 duckdb_arrow_scan) makes this THREE.
+query I
+SELECT count(*) FROM duckdb_views() WHERE starts_with(view_name, '__fab');
+----
+0
+
 # ---- unknown mode is a clean error ----
 statement error
 ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/fmodes' AS bad (TYPE fabricator, PROVIDER 'delta', pushdown_filters 'sometimes');

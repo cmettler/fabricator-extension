@@ -78,12 +78,16 @@ use-after-free class this repo's history says is invisible on the platform you d
 
 ### ⚠ Two deliberate refusals
 
-- **⚠⚠ CORRECTION (2026-09-03, user-caught): the reason given below is FALSE on both counts.**
-  `duckdb_arrow_scan` ends in `CreateView(name, replace: true, temporary: false)` — so a re-registration
-  REPLACES rather than collides, and the view is an ordinary CATALOG view, not a connection-scoped one.
-  The refusal may still be right (a caller-named catalog view on a LONG-LIVED connection is worse than on
-  a throwaway one, and "persists until replaced" was never designed), but it needs a true reason before
-  anything relies on it. See fluid-templating.md §17.6.
+- **⚠⚠ CORRECTION (2026-09-03, user-caught): the reason given below is FALSE on both counts, and the
+  mechanism it appeals to is GONE.** `duckdb_arrow_scan` ended in
+  `CreateView(name, replace: true, temporary: false)` — so a re-registration REPLACED rather than collided,
+  and the view was an ordinary CATALOG view, not a connection-scoped one. Measured the same day, that
+  catalog view turned out to be a **shipped defect** in its own right (it outlived the stream it points at,
+  accumulated one per statement, and scanning one SEGFAULTED), so `MakeHostQueryStream` registers inputs as
+  **TEMPORARY** views now — see host-query.md §Named Arrow inputs are TEMPORARY views.
+  ⇒ **The refusal below is therefore LIFTABLE and has NOT been lifted.** With a temp view a pinned
+  connection is the right scope, not the wrong one; what remains is an OWNERSHIP change, because the view
+  would then outlive the result stream that owns the input's storage. fluid-templating.md §17.10.
 - **Named Arrow inputs are refused on a pinned connection.** `duckdb_arrow_scan` registers a
   CONNECTION-scoped view: on a fresh connection it dies with the call, on a pinned one it would outlive
   it and the next call using that name would collide. Refusing by name beats leaking a view into a

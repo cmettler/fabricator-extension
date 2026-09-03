@@ -798,8 +798,11 @@ internal sealed class CfHostAnswerFunction : ICatalogScalarFunction
 }
 
 // Demo: dbo.cf_host_sum(x) pushes a C#-built Arrow table INTO a host query (data-in) and sums it on the
-// host DuckDB engine: Host.Query registers the input as a connection-scoped view `in0` (via duckdb_arrow_scan)
-// and runs `SELECT sum(v) FROM in0`. Proves C#-provided Arrow streaming into the host. See docs/host-query.md.
+// host DuckDB engine: Host.Query registers the input as a connection-scoped TEMPORARY view `in0` and runs
+// `SELECT sum(v) FROM in0`. Proves C#-provided Arrow streaming into the host. See docs/host-query.md.
+// ⚠ It is also the gate on that view leaving NOTHING behind: until 2026-09-03 the input was a CATALOG view
+// (duckdb_arrow_scan hardcodes temporary:false), so this call left an `in0` in the caller's own memory.main
+// pointing at a released stream, and scanning it SEGFAULTED. verify_custom_functions asserts both halves.
 internal sealed class CfHostSumFunction : ICatalogScalarFunction
 {
     public string SchemaName => "dbo";

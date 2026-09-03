@@ -23,10 +23,11 @@ struct ArrowArrayStream;
 
 namespace duckdb {
 
-// One named Arrow input to register as a connection-scoped view before the query runs (data-in).
+// One named Arrow input to register as a TEMPORARY (connection-scoped) view before the query runs
+// (data-in) — see RegisterArrowInputView for why it must not be a catalog view.
 struct HostQueryInput {
 	string name;
-	ArrowArrayStream *stream; // not owned here — consumed (+ released) by DuckDB's arrow_scan during the query
+	ArrowArrayStream *stream; // not owned here — ADOPTED by OwnedArrowInputs, which releases it with the stream
 };
 
 // SESSION state copied from the CALLING context onto the fresh connection, so `fabricator_host_query('…')`
@@ -74,8 +75,11 @@ struct HostConnection {
 // host service. Throws on a query error.
 // `pinned` (nullable) runs the statement on an EXISTING connection instead of a fresh one — see
 // HostConnection. The stream then holds a shared reference to it (so the pin may be closed first) and
-// releases its `open_streams` slot on release. Named `inputs` are REFUSED with a pinned connection: an
-// arrow_scan view is CONNECTION-scoped, so it would outlive the call and collide with the next one.
+// releases its `open_streams` slot on release. Named `inputs` are REFUSED with a pinned connection —
+// ⚠ on a reason that was MEASURED FALSE on 2026-09-03 (the view neither collided, `replace: true`, nor was
+// connection-scoped). The refusal is now LIFTABLE but is NOT a one-line deletion: an input view is a TEMP
+// view scoped to the connection, so on a pin it would outlive the RESULT STREAM that owns the input's
+// storage. Move the ownership first. docs/host-query.md + docs/fluid-templating.md §17.10.
 void MakeHostQueryStream(DatabaseInstance &db, const string &sql, ArrowArrayStream *params,
                          const vector<HostQueryInput> &inputs, ArrowArrayStream &out,
                          shared_ptr<ClientContext> *out_context = nullptr,
