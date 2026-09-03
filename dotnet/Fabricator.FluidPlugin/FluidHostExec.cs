@@ -175,11 +175,11 @@ internal static class FluidHostExec
     /// <para>
     /// ⚠ It runs the SAME classifier and the SAME connection as the function form — one mechanism, so the
     /// two spellings cannot drift on what counts as a write or on which connection they use. What differs
-    /// is only where the SQL comes from (a rendered body rather than an argument) and that the count is
+    /// is only where the SQL comes from (a rendered body rather than a string argument) and that the count is
     /// DISCARDED, because a block renders nothing. Use the function form when you want the number.
     /// </para>
     /// </remarks>
-    internal static void ExecuteCaptured(TemplateContext ctx, string sql)
+    internal static void ExecuteCaptured(TemplateContext ctx, string sql, RecordBatch? parameters)
     {
         var caller = CallerOf(ctx);
         // ⚠ A whitespace-only body is refused BEFORE the classifier, for the reason the function form
@@ -191,13 +191,11 @@ internal static class FluidHostExec
                 $"{caller}: {{% {BlockName} %}} block is empty — it rendered no SQL.");
         }
 
-        var run = FluidRenderSession.For(ctx)
-            ?? throw new InvalidOperationException(
-                $"{caller}: {{% {BlockName} %}} needs the IHostQuery service, which is not published here. "
-                + "It is available only from inside a fabricator function call.");
-
-        RefuseIfSelect(caller, sql, run);
-        run.ExecuteNonQuery(sql); // the count is deliberately discarded: a block renders nothing
+        // ⚠ Straight to Run, which owns the two execution paths (ExecuteNonQuery without parameters,
+        // Query + a local count with them) and the SELECT refusal. The count it returns is DISCARDED —
+        // a block renders nothing — but routing through Run is what keeps the block from acquiring its
+        // own copy of the parameterised/unparameterised split.
+        Run(caller, sql, parameters, FluidRenderSession.For(ctx));
     }
 
     private static void RefuseIfSelect(string caller, string sql, FluidRenderSession run)

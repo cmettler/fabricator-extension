@@ -444,6 +444,9 @@ case "$TIER" in
         # in that section is load-bearing and a mutant proved it: an earlier `USE memory.hq_s` leaves a
         # qualified entry, against which the bug does not fire, so the section PASSED with it fully present.
         # 8250 + 9 = 8259 exactly, from a green run.
+        # 8555 since 2026-09-03 (same day, fifth bump): verify_plugin_fluid 285 -> 296 -- both blocks
+        # take OPTIONAL NAMED ARGUMENTS now, bound as parameters ({% query t a: 1, b: 2 %}), through the
+        # same ToParameter table the filter form uses.
         # 8544 since 2026-09-03 (same day, fourth bump): verify_plugin_fluid 275 -> 285 for the
         # {% query name %} BLOCK -- the body is SQL written as template text and the RESULT SET is bound
         # to `name`, the same ArrayValue of indexable rows the query() function returns.
@@ -464,7 +467,7 @@ case "$TIER" in
         # two functions have exactly ONE registration each, plus the HostsCatalog refusal and its
         # unknown-provider control. 3105 + 238 + 8259 - 3339 arithmetic aside, both numbers come from green
         # runs.
-        : "${MIN_ASSERTIONS:=8544}"
+        : "${MIN_ASSERTIONS:=8555}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

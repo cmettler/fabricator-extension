@@ -1579,8 +1579,11 @@ SELECT sum(v) AS total FROM stg
 -- total=42
 ```
 
-> ⚠ **The block takes no parameters** — an identifier block has nowhere to put them. Interpolate values with
-> `{{ v | sql }}`, or use the filter form `sql | query: a: 1` when you want bound parameters.
+> ⚠ **The block takes optional named arguments, and they become BOUND parameters** —
+> `{% query t region: 'eu', min: 10 %}` binds `$region` and `$min`, so a value crosses as a *value* rather
+> than as SQL text. Commas separate them, as everywhere else in Liquid. Interpolation with
+> `{{ v | sql }}` still works and is what you need for an object *name* or a fragment, which a parameter
+> cannot carry.
 >
 > ⚠ It obeys the same rules as `query(...)`: `SELECT` statements only, committed reads on the render's own
 > connection, and a result above one million rows is refused rather than truncated.

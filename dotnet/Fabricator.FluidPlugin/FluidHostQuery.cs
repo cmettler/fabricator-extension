@@ -7,6 +7,7 @@ using Apache.Arrow.Types;
 using Apache.Arrow.Ipc;
 using Fabricator.Bridge;
 using Fluid;
+using Fluid.Ast;
 using Fluid.Values;
 
 namespace Fabricator.FluidPlugin;
@@ -45,7 +46,7 @@ internal static class FluidHostQuery
     internal const string CallerKey = "fabricator.caller";
 
     /// <summary>The caller for this render, or a neutral name if it was not set.</summary>
-    private static string CallerOf(TemplateContext ctx) =>
+    internal static string CallerOf(TemplateContext ctx) =>
         ctx.AmbientValues.TryGetValue(CallerKey, out var v) && v is string s ? s : FunctionName;
 
     /// <summary>The most rows one <c>query()</c> call will materialise before refusing.</summary>
@@ -109,12 +110,13 @@ internal static class FluidHostQuery
     /// per-render connection cannot drift between them.
     /// </para>
     /// <para>
-    /// ⚠ <b>No parameters.</b> An identifier block has nowhere to put named arguments, so a value must be
-    /// interpolated with <c>| sql</c> — the body is raw, exactly as in <c>fluid_query</c> and
-    /// <c>{% exec %}</c>. When you want BOUND parameters, use the filter form: <c>sql | query: a: 1</c>.
+    /// ⚠ <b>Named arguments on the tag become BOUND parameters</b> — <c>{% query t a: 1, b: 2 %}</c> binds
+    /// <c>$a</c> and <c>$b</c>, so a value crosses as a VALUE rather than as SQL text. Interpolating with
+    /// <c>{{ v | sql }}</c> still works and is what you need for an object NAME or a fragment, which is
+    /// not something a parameter can carry.
     /// </para>
     /// </remarks>
-    internal static FluidValue RunCaptured(TemplateContext ctx, string sql)
+    internal static FluidValue RunCaptured(TemplateContext ctx, string sql, RecordBatch? parameters)
     {
         var caller = CallerOf(ctx);
         // ⚠ The block-specific empty message, before Run's own: an empty body is a different mistake from
@@ -124,7 +126,7 @@ internal static class FluidHostQuery
             throw new ArgumentException(
                 $"{caller}: {{% {BlockName} %}} block is empty — it rendered no SQL.");
         }
-        return Run(caller, sql, null, FluidRenderSession.For(ctx));
+        return Run(caller, sql, parameters, FluidRenderSession.For(ctx));
     }
 
     private static FluidValue Run(string caller, string? sql, RecordBatch? parameters,
@@ -205,6 +207,60 @@ internal static class FluidHostQuery
     /// and rendering one into the SQL is exactly what parameters exist to avoid.
     /// </para>
     /// </remarks>
+    /// <summary>
+    /// The BLOCK forms' named arguments — <c>{% query t a: 1, b: 2 %}</c> — as a 1-row Arrow batch, or
+    /// <see langword="null"/> when there are none.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// ⚠ The AST twin of <see cref="BuildParameters"/>: a tag's arguments arrive as unevaluated
+    /// <see cref="FilterArgument"/>s (name + expression) where a filter's arrive already evaluated, so this
+    /// evaluates each and then hands it to the SAME <c>ToParameter</c>. One conversion table for all three
+    /// spellings — the value→Arrow rules (the int64/decimal ladder, the UTC stamp on dates, the refusal of
+    /// LIST/STRUCT/MAP) cannot drift between a filter and a block.
+    /// </para>
+    /// <para>
+    /// ⚠ POSITIONAL arguments are REFUSED rather than ignored, exactly as in the filter form: the statement
+    /// references parameters as <c>$name</c>, so an unnamed one could not be bound and dropping it silently
+    /// would run the statement with a parameter the author believed they had supplied.
+    /// </para>
+    /// <para>
+    /// ⚠ A DUPLICATE name is refused HERE as well as by the host. The host's refusal is correct but names
+    /// the crossing rather than the tag; catching it early is what makes the message point at the template.
+    /// </para>
+    /// </remarks>
+    internal static async ValueTask<RecordBatch?> BuildBlockParametersAsync(
+        string caller, string tag, IReadOnlyList<FilterArgument>? args, TemplateContext ctx)
+    {
+        if (args is null || args.Count == 0)
+        {
+            return null;
+        }
+
+        var fields = new List<Field>(args.Count);
+        var columns = new List<IArrowArray>(args.Count);
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var arg in args)
+        {
+            if (string.IsNullOrEmpty(arg.Name))
+            {
+                throw new ArgumentException(
+                    $"{caller}: {{% {tag} %}} takes NAMED parameters only — write `{tag} … name: value` so "
+                    + "the statement can reference $name.");
+            }
+            if (!seen.Add(arg.Name))
+            {
+                throw new ArgumentException(
+                    $"{caller}: {{% {tag} %}} was given the parameter '{arg.Name}' twice.");
+            }
+            var value = await arg.Expression.EvaluateAsync(ctx);
+            var (field, array) = ToParameter(caller, arg.Name, value, ctx);
+            fields.Add(field);
+            columns.Add(array);
+        }
+        return new RecordBatch(new Schema(fields, null), columns, 1);
+    }
+
     internal static RecordBatch? BuildParameters(string caller, string fn, FilterArguments args, TemplateContext ctx)
     {
         var names = args.Names.ToList();

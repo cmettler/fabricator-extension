@@ -5,6 +5,8 @@
 using System.Collections.Concurrent;
 using Fluid.Ast;
 using Fluid.Utils;
+using Parlot.Fluent;
+using static Parlot.Fluent.Parsers;
 using System.Linq;
 using Fluid;
 using Fluid.Values;
@@ -34,7 +36,7 @@ internal static class FluidEngine
 
     private static FluidParser CreateParser()
     {
-        var parser = new FluidParser(new FluidParserOptions { AllowFunctions = true });
+        var parser = new FabricatorFluidParser(new FluidParserOptions { AllowFunctions = true });
 
         // ⚠⚠ THE {% exec %} BLOCK: render the body to a SEPARATE output, run the captured text as SQL, and
         // write NOTHING to the caller's output. It is what makes a real statement writable — multi-line,
@@ -56,7 +58,13 @@ internal static class FluidEngine
         // and a mutant that dropped the explicit flush SURVIVED in that arrangement. That is exactly why
         // it is written this way: the dependency is real, and here it is explicit and local rather than
         // resting on disposal order, so removing the flush now fails loudly.
-        parser.RegisterEmptyBlock(FluidHostExec.BlockName, static async (statements, output, encoder, ctx) =>
+        // ⚠ A PARSER block rather than an EMPTY one, so the tag can carry OPTIONAL NAMED ARGUMENTS that
+        // become BOUND parameters: `{% exec a: 1, b: 2 %}INSERT … VALUES ($a, $b){% endexec %}`. The
+        // grammar is Fluid's OWN `ArgumentsList` (`name: value`, comma-separated) rather than one invented
+        // here, so it reads like every other named-argument site in Liquid; `ZeroOrOne` is what makes it
+        // optional, since ArgumentsList is `Separated(Comma, …)` and matches at least one.
+        parser.RegisterParserBlock(FluidHostExec.BlockName, ZeroOrOne(parser.NamedArguments),
+                                   static async (args, statements, output, encoder, ctx) =>
         {
             var (completion, sql) = await CaptureBodyAsync(statements, ctx);
             if (completion != Completion.Normal)
@@ -64,7 +72,9 @@ internal static class FluidEngine
                 return completion;
             }
 
-            FluidHostExec.ExecuteCaptured(ctx, sql);
+            var parameters = await FluidHostQuery.BuildBlockParametersAsync(
+                FluidHostQuery.CallerOf(ctx), FluidHostExec.BlockName, args, ctx);
+            FluidHostExec.ExecuteCaptured(ctx, sql, parameters);
             return Completion.Normal;
         });
 
@@ -78,8 +88,12 @@ internal static class FluidEngine
         // ⚠ `{% assign result = query %}…{% endquery %}` is NOT expressible in Liquid and this is the
         // nearest thing: `assign` parses `identifier = EXPRESSION` and terminates at `%}`, so a block body
         // can never be its operand. `{% query result %}` reads the same way and is one tag rather than two.
-        parser.RegisterIdentifierBlock(FluidHostQuery.BlockName,
-                                       static async (identifier, statements, output, encoder, ctx) =>
+        // ⚠ The identifier is followed by OPTIONAL NAMED ARGUMENTS, which become BOUND parameters:
+        // `{% query t region: 'eu' %}SELECT … WHERE region = $region{% endquery %}`. Composed from Fluid's
+        // own `Identifier` and `ArgumentsList`, both `protected` on FluidParser — hence the subclass below.
+        parser.RegisterParserBlock(FluidHostQuery.BlockName,
+                                   parser.Ident.And(ZeroOrOne(parser.NamedArguments)),
+                                   static async (head, statements, output, encoder, ctx) =>
         {
             var (completion, sql) = await CaptureBodyAsync(statements, ctx);
             if (completion != Completion.Normal)
@@ -87,9 +101,11 @@ internal static class FluidEngine
                 return completion;
             }
 
+            var parameters = await FluidHostQuery.BuildBlockParametersAsync(
+                FluidHostQuery.CallerOf(ctx), FluidHostQuery.BlockName, head.Item2, ctx);
             // ⚠ SetValue, and NOTHING is written to `output` — the block contributes no text, exactly like
             // {% capture %}. The rows are held for the render, so a template may iterate them repeatedly.
-            ctx.SetValue(identifier, FluidHostQuery.RunCaptured(ctx, sql));
+            ctx.SetValue(head.Item1, FluidHostQuery.RunCaptured(ctx, sql, parameters));
             return Completion.Normal;
         });
 
@@ -206,4 +222,35 @@ internal static class FluidEngine
                 ex);
         }
     }
+}
+
+/// <summary>
+/// <see cref="FluidParser"/> with the two grammar pieces a custom BLOCK needs exposed.
+/// </summary>
+/// <remarks>
+/// <para>
+/// ⚠ <c>Identifier</c> and <c>ArgumentsList</c> are <c>protected readonly</c> on <see cref="FluidParser"/>,
+/// so a subclass is the only way to compose them into a custom block's header. That is the documented
+/// approach (deanebarker.net/tech/fluid/parser-tags-blocks) — ⚠ though that article is out of date against
+/// our pinned 3.0.0-beta.7 in two ways: the block registration is <c>RegisterParserBlock</c>, not
+/// <c>RegisterTagBlock</c>, and <c>ArgumentsList</c> is an <c>IReadOnlyList</c>, not a <c>List</c>.
+/// </para>
+/// <para>
+/// ⚠ Re-using Fluid's OWN <c>ArgumentsList</c> rather than inventing a grammar is deliberate: named
+/// arguments then look the same in a block as everywhere else in Liquid (<c>name: value</c>, comma
+/// separated), and the parsing of a value is Fluid's, not ours. <c>LogicalExpression</c> is also exposed
+/// and would allow a bespoke separator-free form; that would be a grammar only this plugin speaks.
+/// </para>
+/// </remarks>
+internal sealed class FabricatorFluidParser : FluidParser
+{
+    internal FabricatorFluidParser(FluidParserOptions options) : base(options)
+    {
+    }
+
+    /// <summary>Fluid's identifier parser — the <c>t</c> in <c>{% query t %}</c>.</summary>
+    internal Parser<string> Ident => Identifier;
+
+    /// <summary>Fluid's named-argument list — <c>a: 1, b: 2</c>. Matches at least one; wrap in ZeroOrOne.</summary>
+    internal Parser<IReadOnlyList<FilterArgument>> NamedArguments => ArgumentsList;
 }

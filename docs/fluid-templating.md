@@ -1606,14 +1606,19 @@ while computing wrong**, so a render-only assertion cannot tell the two apart.
 **Mutant F — bind the captured TEXT instead of the rows** — dies at the FIRST assertion of §14 after 275
 pass. That is the user's requirement expressed as a test.
 
-### 15.3 ⚠ No parameters, and the workaround is the filter form
+### 15.3 ⚠ Optional NAMED ARGUMENTS, bound as parameters (added the same day — see §16)
 
-An identifier block has nowhere to put named arguments, so `{% query r %}` cannot bind `$a`. The body is
-raw-interpolated (same rule as `fluid_query` and `{% exec %}`), so a VALUE must go through `| sql`; gated
-with a quote, which is where raw splicing breaks. When you want BOUND parameters, use `sql | query: a: 1`.
+This section first read *"no parameters — an identifier block has nowhere to put named arguments"*, and
+that was true of an IDENTIFIER block and false of what Fluid can express. Both blocks are PARSER blocks
+now and take optional named arguments that become BOUND parameters:
 
-A parameterised block would need `RegisterParserBlock` with a custom grammar (`{% query r, a: 1 %}`) —
-possible, not built, and not asked for.
+```liquid
+{% query t region: 'eu', min: 10 %}SELECT … WHERE region = $region AND n >= $min{% endquery %}
+{% exec x: 7, y: 8 %}INSERT INTO ab VALUES ($x, $y){% endexec %}
+```
+
+⚠ The body is still raw-interpolated, and `{{ v | sql }}` is still what carries an object NAME or a
+fragment — a parameter cannot. Full record: §16.
 
 ### 15.4 The capture is now ONE helper, shared with `{% exec %}`
 
@@ -1624,3 +1629,69 @@ body which did not complete normally yields NO text and runs nothing.
 
 ⚠ All THREE spellings of `query` coexist — block, function, filter — because tags and expressions are
 different grammars in Fluid. Pinned, since a change would silently break one.
+
+## 16. OPTIONAL NAMED ARGUMENTS ON BOTH BLOCKS (2026-09-03)
+
+User-asked — *"could we eventually allow optional named args e.g. `{% query t arg1: 1 arg2: 2 %}` which
+could be used for parameter binding?"* — with a pointer to
+[deanebarker.net/tech/fluid/parser-tags-blocks](https://deanebarker.net/tech/fluid/parser-tags-blocks/) and
+the caveat that it might be out of date. Gate `verify_plugin_fluid` **285 → 296**, one mutant.
+
+```liquid
+{% query t region: 'eu', min: 10 %}SELECT … WHERE region = $region AND n >= $min{% endquery %}
+{% exec x: 7, y: 8 %}INSERT INTO ab VALUES ($x, $y){% endexec %}
+```
+
+### 16.1 The article's trick works; two of its details do not
+
+Its key move is real and is what this rests on: `Identifier` and `ArgumentsList` are **`protected readonly`**
+on `FluidParser`, so a SUBCLASS is the only way to compose them into a custom block's header
+(`FabricatorFluidParser`). Checked against `git show v3.0.0-beta.7:` rather than the local clone, which sits
+at `main` and is ahead of our pin. Two things in it are stale:
+
+| the article | our pin |
+|---|---|
+| `RegisterTagBlock()` | **does not exist** — it is `RegisterParserBlock` |
+| `List<FilterArgument>` | `IReadOnlyList<FilterArgument>` |
+
+### 16.2 ⚠ Fluid's OWN grammar, not one invented here — and that decides the comma
+
+`ArgumentsList` is `Separated(Comma, OneOf(Identifier ':' Primary, Primary))`, so arguments are
+**comma-separated** and there must be at least one — `ZeroOrOne` around it is what makes the whole list
+optional, and without that every bare `{% query t %}` would stop parsing.
+
+**⚠ MEASURED: the comma-free form in the request does NOT parse** — `{% query t arg1: 1 arg2: 2 %}` gives
+*"Invalid query tag at (1:9)"*. Pinned as a CHARACTERIZATION test, because it is the form people write
+first and the parse error does not mention commas.
+
+A separator-free grammar IS buildable — `LogicalExpression` is also `protected`, so
+`ZeroOrMany(Identifier ':' LogicalExpression)` would accept it — and it was **deliberately not built**: it
+would be a grammar only this plugin speaks, where `name: value, name: value` is what every other named
+argument site in Liquid uses (`| filter: a: 1, b: 2`, `{% render 'x', a: 1 %}`). Consistency beat matching
+the sketch keystroke for keystroke.
+
+### 16.3 One conversion table, three spellings
+
+A tag's arguments arrive as unevaluated `FilterArgument`s (name + expression) where a filter's arrive
+already evaluated, so `BuildBlockParametersAsync` evaluates each and hands it to the SAME `ToParameter`
+the filter form uses. The int64→decimal ladder, the UTC stamp on dates and the refusal of LIST/STRUCT/MAP
+therefore cannot drift between a filter and a block.
+
+⚠ POSITIONAL arguments are REFUSED rather than ignored (the statement references `$name`, so an unnamed one
+cannot be bound and dropping it would run the statement with a parameter the author believed they
+supplied), and a DUPLICATE name is refused HERE as well as by the host — the host's refusal is correct but
+names the crossing rather than the tag.
+
+### 16.4 ⚠⚠ The load-bearing gate assertion is the injection PAIR
+
+`region: "eu' OR 1=1 --"` answers **0** where splicing would answer 3, and the same statement with `"eu"`
+answers **2**. The first row alone is worthless — it is equally true of a build where the parameter never
+arrived — so the control is what makes it a binding result. **Mutant G (ignore the tag's arguments) dies at
+the first assertion of §15 after 285 pass.**
+
+### 16.5 ⚠ It made a documented limitation false, which is the thing to watch
+
+§15.3 read *"No parameters — an identifier block has nowhere to put named arguments"*. That was true of an
+IDENTIFIER block and false of what Fluid can express, so it was a limitation of the CHOICE rather than of
+the library — the kind of sentence that hardens into a fact if nobody re-reads it. Corrected in place, in
+the README, in the suite's own comment and in CLAUDE.md, rather than left to contradict the feature.

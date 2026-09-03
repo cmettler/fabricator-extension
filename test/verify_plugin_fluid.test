@@ -1973,11 +1973,92 @@ SELECT fluid_render('{% query r %}SELECT 1', NULL);
 ----
 endquery
 
-# --- ⚠ the block takes NO parameters, so a VALUE goes through `| sql` ---
-# An identifier block has nowhere to put named arguments. That is a real limitation with a real
-# workaround — the FILTER form binds parameters — and the body is raw either way, so `| sql` is
-# what makes a literal safe. Gated with a quote, which is where raw splicing breaks.
+# --- ⚠ interpolation with `| sql` still works, and carries what a PARAMETER cannot ---
+# §15 adds named arguments to the tag, so a VALUE should normally be bound rather than spliced.
+# `| sql` remains what you need for an object NAME or a whole fragment. Gated with a quote,
+# which is where raw splicing breaks.
 query I
 SELECT fluid_render('{% query r %}SELECT {{ v | sql }} AS s{% endquery %}s={{ r[0].s }}', {'v': 'O''Brien'});
 ----
 s=O'Brien
+
+# ============================================================================================
+# §15 — OPTIONAL NAMED ARGUMENTS ON BOTH BLOCKS, bound as PARAMETERS (user-asked).
+#
+#   {% query t arg1: 1, arg2: 2 %}SELECT $arg1 AS a, $arg2 AS b{% endquery %}
+#   {% exec x: 7, y: 8 %}INSERT INTO ab VALUES ($x, $y){% endexec %}
+#
+# Both blocks are PARSER blocks now, composed from Fluid's own `Identifier` and `ArgumentsList`
+# (both `protected` on FluidParser, hence the FabricatorFluidParser subclass). The values go
+# through the SAME ToParameter table the filter form uses, so the int64/decimal ladder, the UTC
+# stamp on dates and the refusal of LIST/STRUCT/MAP cannot drift between the spellings.
+# ============================================================================================
+
+# --- the arguments bind as $name ---
+query I
+SELECT fluid_render('{% query t arg1: 1, arg2: 2 %}
+SELECT $arg1 AS a, $arg2 AS b, $arg1 + $arg2 AS s
+{% endquery %}a={{ t[0].a }} b={{ t[0].b }} s={{ t[0].s }}', NULL);
+----
+a=1 b=2 s=3
+
+# --- and they are OPTIONAL: the bare block still works ---
+# ⚠ ArgumentsList is Separated(Comma, …) and so matches AT LEAST ONE; ZeroOrOne is what makes
+# the whole list optional. Without it every bare {% query t %} above would stop parsing.
+query I
+SELECT fluid_render('{% query t %}SELECT 5 AS v{% endquery %}v={{ t[0].v }}', NULL);
+----
+v=5
+
+# --- ⚠⚠ THE LOAD-BEARING PAIR: a value crosses as a VALUE, not as SQL text ---
+# The first row is meaningless without the second: `n=0` is equally true of a build where the
+# parameter never arrived at all. The control proves the parameter IS being used, and splicing
+# would answer 3 rather than 0.
+query I
+SELECT fluid_render('{% query t region: r %}SELECT count(*) AS n FROM (VALUES (''eu''),(''us''),(''eu'')) v(x) WHERE x = $region{% endquery %}n={{ t[0].n }}', {'r': 'eu'' OR 1=1 --'});
+----
+n=0
+
+query I
+SELECT fluid_render('{% query t region: r %}SELECT count(*) AS n FROM (VALUES (''eu''),(''us''),(''eu'')) v(x) WHERE x = $region{% endquery %}n={{ t[0].n }}', {'r': 'eu'});
+----
+n=2
+
+# --- the exec block takes them too ---
+statement ok
+CREATE TABLE ab(a INTEGER, b INTEGER);
+
+query I
+SELECT fluid_render('{% exec x: 7, y: 8 %}INSERT INTO ab VALUES ($x, $y){% endexec %}ok', NULL);
+----
+ok
+
+query II
+SELECT a, b FROM ab;
+----
+7	8
+
+# --- a POSITIONAL argument is REFUSED, not ignored ---
+# ⚠ The statement references parameters as $name, so an unnamed one cannot be bound — and
+# dropping it silently would run the statement with a parameter the author believed they had
+# supplied. Same rule as the filter form.
+statement error
+SELECT fluid_render('{% query t 1 %}SELECT 1 AS a{% endquery %}x', NULL);
+----
+NAMED parameters only
+
+# --- a DUPLICATE name is refused, naming the parameter ---
+statement error
+SELECT fluid_render('{% query t a: 1, a: 2 %}SELECT $a AS x{% endquery %}y', NULL);
+----
+was given the parameter 'a' twice
+
+# --- ⚠ CHARACTERIZATION of Fluid's grammar: the args are COMMA-separated ---
+# ArgumentsList is Separated(Comma, …), so `a: 1 b: 2` does NOT parse. That is Fluid's own
+# convention — the same one `| filter: a: 1, b: 2` and `{% render 'x', a: 1 %}` use — rather
+# than a rule of ours, so no mutant of ours can kill this. It is pinned because the comma-free
+# form is the one people write first, and because the parse error does not mention commas.
+statement error
+SELECT fluid_render('{% query t arg1: 1 arg2: 2 %}SELECT $arg1 AS a{% endquery %}x', NULL);
+----
+Invalid query tag
