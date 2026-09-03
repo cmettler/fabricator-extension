@@ -2000,6 +2000,47 @@ lazy `ArrowArrayStream` and the ABI has no such flag (the only `materialize` in 
 `FluidHostQuery.Run` already reads every cell eagerly into an `ArrayValue` of rows — that is why `MaxRows`
 exists — so the result is materialized in managed memory before any of this starts.
 
+#### ⚠⚠ THE TRUE REASON THE v84 REFUSAL EXISTS — found while asking how A's lifetime would work
+
+The refusal's stated reason is false (§17.6) but it is **not** protecting nothing, and the real reason is the
+thing A and B each have to solve. `HostQueryStream` declares `inputs` FIRST so they are destroyed LAST —
+after `conn` — and its own comment says why. On a FRESH connection that is airtight: `conn` is the only
+reference, so the Connection dies first, taking the temporary catalog and the view with it, and only then
+are the input streams released.
+
+**On a PINNED connection those two lifetimes diverge.** `conn` is a `shared_ptr` COPY (the pin holds
+another), so releasing the result stream destroys `OwnedArrowInputs` while the Connection lives on — leaving
+a temp view in the pin's catalog pointing at released streams. That is today's defect again, scoped to the
+render instead of the process.
+
+⇒ **rewrite the refusal's message and comments when it is lifted, do not just delete them.** A future reader
+who sees only "the stated reason was measured false" would conclude there was nothing there.
+
+#### What A's lifetime machinery would be, concretely
+
+1. **A replay store**, built by draining the adopted stream once:
+   `struct ReplayableArrowInput { ArrowSchema schema{}; vector<ArrowArray> arrays; };`
+2. **A per-scan cursor.** `FabricatorArrowStreamProduce` builds a wrapper whose stream carries
+   `private_data = new Cursor{store, 0}`; `get_next` copies `arrays[i++]` out with a **no-op release** so the
+   consumer cannot free the store's array; `release` deletes the cursor only. ⚠ This is upstream's own
+   pattern — `duckdb_arrow_array_scan` does exactly it with `EmptyArrayRelease` — but only for ONE scan, so
+   whether a re-handed array survives REPEATED scans is the first thing to measure.
+3. **The owner is `HostConnection`, using the reverse-declaration-order trick already in this file:**
+   `vector<unique_ptr<ReplayableArrowInput>> bound;` declared BEFORE `conn`, so the Connection (and its temp
+   view) is destroyed before the store it points into.
+4. **One ABI entry** — `host_connection_bind(connection, name, stream, err)` (drain, store, create the temp
+   view) — plus a managed `IHostConnection.Bind`.
+
+⚠ Also unmeasured: whether a PARALLEL scan needs per-thread cursors. `arrow_scan` parallelises
+(`ArrowScanMaxThreads` returns `NumberOfThreads()`), but the wrapper is produced once per scan and
+`GetNextChunk` runs under the parallel state's lock, so one cursor per scan looks right — looks, not is.
+
+#### ⚠ B is far less machinery but is NOT free of the same hazard
+
+After `CREATE TEMP TABLE t AS SELECT * FROM <bound view>`, the bound view ALSO outlives the result stream on
+a pin — so B must DROP it in the same call. A rule rather than a structure, but forgetting it recreates the
+crash inside a render, which is precisely the failure this whole section exists to have found once.
+
 **⚠⚠ WHICHEVER IS BUILT, IT MUST BE OPT-IN PER BINDING AND MUST NOT CHANGE THE EXISTING PATH.** Two reasons,
 and the second is the one that bites:
 
