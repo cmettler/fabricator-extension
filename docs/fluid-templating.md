@@ -1827,3 +1827,45 @@ by the caller, created on a throwaway connection, has no obvious cleanup.
 be right — a caller-named CATALOG view created on a long-lived connection is worse than on a throwaway one,
 and the semantics of "persists until you replace it" were never designed — but the message and the doc
 give a justification that is false. Fix the reason before relying on the refusal.
+
+### 17.7 ⚠ Where else do we create an arrow-scan view? EXACTLY ONE PLACE — and the answer is TEMP, not a flag
+
+User-asked: *"so wherever we use this arrow scan with a view should be analysed if we should use temp view
+instead or add a flag to functions for temp or not?"*
+
+**The surface is one line.** `grep duckdb_arrow_scan( src/` → `fabricator_host_query.cpp:617`, the named
+`inputs` loop in `MakeHostQueryStream`. Nothing else in the tree creates an arrow-scan view.
+(`FabricatorSchemaEntry::GetOrCreateView` is the ABI v77 provider-declared catalog views — a different
+mechanism, real entries in the ATTACHed catalog, correctly non-temp.) One site makes this cheap to fix and
+cheap to get right.
+
+**⚠ The hazard is sharper than "a leak", because of v83.** The fresh connection inherits the CALLER'S
+search path, so the view's default schema is whatever the caller last `USE`d — i.e. a view named by a
+managed caller can land in the USER'S OWN schema, under a name the user did not choose.
+
+**⇒ Use a TEMP view, unconditionally. Do NOT add a flag.** Four reasons, in order of weight:
+
+1. **No current consumer wants a catalog object.** Every use is data-in for one query; the view exists to
+   give that statement a name to read.
+2. **A flag would be a choice nobody can make correctly**, because making it correctly requires knowing
+   everything in §17.6. And the non-temp branch is not a capability worth offering: "persists in your
+   catalog under a name the extension chose" has no caller asking for it.
+3. **TEMP + `replace` gives re-assignment for free**, which is exactly what §17.3 listed as an open
+   problem (`{% query t %}` twice).
+4. **⚠ It removes the hazard class WITHOUT settling the measurement I could not complete.** Whether the
+   view persists today is UNKNOWN — three probes failed to provably reach an input-binding path. A temp
+   view is correct whether or not it does, which is why this recommendation does not wait on that answer.
+
+**The change:** issue the SQL ourselves — `CREATE OR REPLACE TEMP VIEW <name> AS SELECT * FROM
+arrow_scan(…)` — rather than calling `duckdb_arrow_scan`, whose `temporary: false` is hardcoded. The
+3-arg `Relation::CreateView(schema, name, replace, temporary)` overload is the other route.
+
+⇒ **It also lets the v84 refusal be LIFTED rather than re-justified.** With a temp view the reason to
+refuse named inputs on a pinned connection disappears: scope becomes the connection (= the render),
+re-registration replaces, and nothing reaches the catalog. That is the prerequisite §17.2 needs.
+
+⚠ **Still owed before the change lands:** establish whether the current non-temp view persists after its
+connection closes. Not because the fix depends on it, but because if it DOES, that is a shipped defect on
+the `inputs` path and it should be recorded as one rather than quietly fixed. A reliable probe needs a
+path that provably binds inputs — three attempts via Delta reads did not, and the absence of any
+`delta native batch:` log line is what shows they missed rather than passed.
