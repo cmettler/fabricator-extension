@@ -1869,3 +1869,42 @@ connection closes. Not because the fix depends on it, but because if it DOES, th
 the `inputs` path and it should be recorded as one rather than quietly fixed. A reliable probe needs a
 path that provably binds inputs — three attempts via Delta reads did not, and the absence of any
 `delta native batch:` log line is what shows they missed rather than passed.
+
+### 17.8 ⚠ "Could there be a REASON for `temporary: false`?" — user-asked, and the fix was untested when proposed
+
+Two fair objections: DuckDB may hardcode it deliberately, and §17.7 recommended
+`CREATE OR REPLACE TEMP VIEW … AS SELECT * FROM arrow_scan(…)` **without running it**. Both addressed.
+
+**MEASURED — the shape works, and re-assignment with it:**
+
+```
+CREATE OR REPLACE TEMP VIEW v AS SELECT * FROM fabricator_scan('fabricator_demo_lazy');  -> scans, 1 row
+CREATE OR REPLACE TEMP VIEW v AS SELECT * FROM fabricator_scan('fabricator_demo_eager'); -> scans, 1 row
+SELECT database_name, schema_name FROM duckdb_views() WHERE view_name='v';               -> temp | main
+… WHERE database_name='memory' AND view_name='v'                                          -> 0
+```
+
+⇒ a temp view over an Arrow-producing table function binds, scans, REPLACES cleanly, and lands in
+`temp.main` — out of the user's catalog entirely.
+
+⚠ **What that probe does NOT cover, said rather than glossed:** it used our own `fabricator_scan(name)`,
+not `arrow_scan(POINTER, POINTER, POINTER)`. The untested part is the pointer form specifically.
+
+**⚠ But the pointer hazard is ORTHOGONAL to temp-ness, which is why the gap is narrow.** A view of EITHER
+kind stores the `POINTER` constants and dereferences them on every scan — that is exactly what
+`MakeHostQueryStream`'s existing comment is about ("the view keeps the RAW POINTER and the query below is
+LAZY, so the caller's own allocation must not be what it points at", hence `OwnedArrowInputs`). Making the
+view temporary changes its SCOPE, not its pointer lifetime, so nothing about the adoption discipline
+changes.
+
+**Why might DuckDB hardcode `temporary: false`? UNKNOWN, and not guessable from here.** The `duckdb`
+submodule is a SHALLOW clone (`shallow = true`), so `git log -S` and `git log -L` attribute every line to
+the single fetched commit — there is no history to read. ⚠ The plausible candidate, offered as REASONING
+not evidence: a non-temp view is visible to OTHER connections, which a C-API consumer registering a stream
+on one connection and querying it from another would need. That is precisely the property we do not want,
+which is consistent with the recommendation but is not a substitute for asking upstream.
+
+⇒ **The recommendation stands, with its basis corrected:** do not change DuckDB's helper — stop using it,
+and issue our own temp view. The remaining work before the change lands is (a) the same probe against the
+real `arrow_scan(POINTER…)` form, and (b) §17.7's outstanding question of whether today's non-temp view
+persists.
