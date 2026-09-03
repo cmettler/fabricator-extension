@@ -1973,6 +1973,47 @@ deletion-vector anti-join zero rows is *deleted rows coming back*.
 referencing one input twice and no in-tree one does — `cf_host_sum`'s SQL is fixed at
 `SELECT sum(v) FROM in0`. A C#-only edit to that demo would measure it.
 
+#### ⚠⚠ FIRST — FOR THE FLUID CASE, NEITHER OPTION IS NEEDED. MEASURED 2026-09-03.
+
+User-asked, *"who and when is `IHostConnection.Bind` called?"* — and tracing it showed the whole A/B choice
+below rests on a premise that was never checked: that a `{% query t %}` result has to be shipped BACK INTO
+DuckDB as Arrow. **It does not, because for that block WE OWN THE SQL TEXT.** We can tell DuckDB to keep
+the result instead of handing it back:
+
+```
+{% query t %}SELECT …{% endquery %}
+   1. classify the body as a SELECT       (the guard that already exists)
+   2. CREATE TEMP TABLE "t" AS (body)     on the per-render pinned connection
+   3. SELECT * FROM "t"                   to fill the Fluid variable
+```
+
+**C#-only in the plugin: no ABI change, no C++, no lifetime machinery, and no v84 refusal to lift.**
+
+⚠ **AND THE MECHANISM ALREADY SHIPS — measured with what is in the tree today**, not with a prototype:
+
+```sql
+SELECT fluid_render('{% exec %}
+CREATE TEMP TABLE t AS SELECT i AS id, i * 10 AS v FROM range(1, 5) r(i)
+{% endexec %}{% query u %}SELECT count(*) AS n, sum(v) AS s FROM t{% endquery %}n={{ u[0].n }} s={{ u[0].s }}', NULL);
+-- n=4 s=100
+```
+
+and the staged table is genuinely re-scannable — two separate blocks reading one `t2` answer `a=3 b=6`,
+which is the property a bound Arrow input does NOT have (§17.11). The enabling piece is **v84's per-render
+pinned connection**, already shipped and already gated by `verify_plugin_fluid` §12. What is missing is
+therefore only ERGONOMICS: `{% query t %}` issuing the CTAS itself instead of the author hand-writing an
+`{% exec %}`.
+
+⚠ It also inherits §17.5's naming hazard in a sharper form — `t` is an author-chosen identifier that
+becomes a TEMP TABLE name, and a temp table SHADOWS a catalog table of the same name on that connection.
+Quote it, and settle whether to namespace it.
+
+#### ⇒ WHAT A AND B ARE STILL FOR
+
+They apply where the data originates in **C#** and we do NOT own a SQL query producing it — a plugin
+pushing a computed table in, i.e. the original replacement-scan use case. They do not apply to
+`{% query t %}`.
+
 #### ⇒ It CHANGES §17.10: prefer MATERIALIZING over owning the batches
 
 §17.10 says the hard part is making the session own the batches so the view can outlive the result stream.
