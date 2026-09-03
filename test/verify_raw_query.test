@@ -23,7 +23,7 @@ SELECT fabricator_exec('q', 'IF OBJECT_ID(''dbo.rq_probe'') IS NOT NULL DROP TAB
 # for rows. Since the SQL Server stream can only be built around an ALREADY-EXECUTED reader, that probe WAS a
 # full execution: this section measured **2** before the fix.
 #
-# The fix is a describe-then-execute stream (DescribedArrowStream + IBackendCatalog.DescribeQuery): get_schema
+# The fix is a describe-then-execute stream (DescribedArrowStream + IProviderCatalog.DescribeQuery): get_schema
 # describes via CommandBehavior.SchemaOnly, only a row pull executes.
 #
 # ⚠ A counting assertion is the only thing that can see this. Every "the rows are right" test in the tree

@@ -65,7 +65,7 @@ public class PluginPathsTests
         // ⚠⚠ LAST is load-bearing, and the FIRST version of this test asserted the opposite for a reason
         // that was simply wrong. The plugin scan registers with `refuseCollisions: true`, so it is
         // FIRST-ROOT-WINS: a duplicate provider name met in a later root is reported `rejected`, never
-        // overwritten. (The justification originally written here — that `BackendRegistry.Add` is
+        // overwritten. (The justification originally written here — that `ProviderRegistry.Add` is
         // `map[name] = backend`, last-wins — describes the BUILT-IN registration path, not the plugin one.)
         // Under bundled-first the shipped copy won and a user's install was REJECTED, which is the opposite
         // of what a user installing a newer copy expects. MEASURED with two roots holding one plugin: the

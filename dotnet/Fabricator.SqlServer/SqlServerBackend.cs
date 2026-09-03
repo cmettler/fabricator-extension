@@ -18,10 +18,10 @@ using Microsoft.Data.SqlClient;
 namespace Fabricator.SqlServer;
 
 /// <summary>
-/// <see cref="IBackend"/> backed by Microsoft.Data.SqlClient. Discovered and
-/// instantiated reflectively by <see cref="BackendRegistry"/>.
+/// <see cref="IProvider"/> backed by Microsoft.Data.SqlClient. Discovered and
+/// instantiated reflectively by <see cref="ProviderRegistry"/>.
 /// </summary>
-public sealed class SqlServerBackend : IBackend
+public sealed class SqlServerBackend : IProvider
 {
     public const string ProviderName = "sqlserver";
     public string Name => ProviderName;
@@ -149,7 +149,7 @@ public sealed class SqlServerBackend : IBackend
 
     public IEnumerable<ViewDefinition> CatalogViews => CustomFunctions.CatalogViews;
 
-    public IBackendCatalog OpenCatalog(string connectionString, string optionsJson) =>
+    public IProviderCatalog OpenCatalog(string connectionString, string optionsJson) =>
         new SqlServerCatalog(connectionString, optionsJson);
 
     /// <summary>
@@ -399,7 +399,7 @@ public sealed class SqlServerBackend : IBackend
 /// <see cref="SqlConnection"/> (ADO.NET pools by connection string); the
 /// connection's lifetime is owned by the returned Arrow stream.
 /// </summary>
-public sealed partial class SqlServerCatalog : IBackendCatalog
+public sealed partial class SqlServerCatalog : IProviderCatalog
 {
     // Traces every T-SQL statement the provider sends to SQL Server (the scan/filter/DML SQL, the connection
     // routing and affected-row counts) — off by default (FABRICATOR_LOG_LEVEL). This is the SQL-provider

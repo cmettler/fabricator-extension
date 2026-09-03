@@ -10,7 +10,7 @@
       provider ("engineeredwooddelta", the default): production-grade reads/writes/maintenance + MERGE,
       standard-compliant writes, object_store cloud IO. delta-rs does its own IO (storage_options), so it
       does NOT use the host-FS bridge. UPDATE/DELETE do not map to DuckDB's rowid model (deferred — see
-      docs/delta-rs-provider.md). Discovered by BackendRegistry only when this assembly + its native libs
+      docs/delta-rs-provider.md). Discovered by ProviderRegistry only when this assembly + its native libs
       (delta_rs_bridge.dll / delta_kernel_ffi.dll) are published; skipped otherwise.
     </Description>
     <GenerateRuntimeConfigurationFiles>true</GenerateRuntimeConfigurationFiles>

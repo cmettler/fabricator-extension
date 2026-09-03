@@ -1,7 +1,8 @@
 # Plugin services — replacing the ad-hoc seams with a resolvable service surface
 
 > **Status: BOTH STEPS BUILT — §8 (the `GetService<T>()` locator), §9 (`Fabricator.Common`), §10
-> (`IHostLog`, §7.4a's third question), §11 (versioning + NuGet packages, §5 Q4).**
+> (`IHostLog`, §7.4a's third question), §11 (versioning + NuGet packages, §5 Q4), §12 (Fluid becomes a
+> built-in provider; `IBackend` → `IProvider`).**
 > ⚠ §9.4, §9.5 and §10.4 CORRECT the plan and this build: the acceptance test's target no longer existed,
 > §7.4a's "13 → 16" is wrong on two of three, and a defensive mechanism in `IHostLog` turned out to be
 > unnecessary — its mutant survived. Opened user-directed:
@@ -1277,6 +1278,157 @@ one commit or two; step one cannot be skipped without making that repo harder to
 ⚠ It has **no CI**, so nothing breaks automatically — which is precisely why the reproducibility argument
 has to be made deliberately here rather than discovered by a red build.
 
+## 12. FLUID BECOMES A BUILT-IN, AND `IBackend` BECOMES `IProvider` (2026-09-02)
+
+User-directed, in two steps: *"i find the fluid usefull so we could add it as builtin functions instead of
+separate plugin but leave as a seperate project?"* and then *"interface + backendregistry"*. C#-only apart
+from build files. **NO ABI change, NO C++ code change.** Gates: hermetic **74/74 — 8259 → 75/75 — 8497**,
+service **54/54 — 3339 → 53/53 — 3108**.
+
+### 12.1 ⚠⚠ WHAT MOVED FLUID WAS A FOOTGUN, NOT TIDINESS — and it was measured on the user's own machine
+
+`PluginPaths.ResolveRoots` **returns early** when `FABRICATOR_PLUGIN_DIR` is set, so the variable REPLACES
+the plugin roots rather than extending them. The bundled root had exactly one occupant — Fluid — which was
+also the one capability the README documents as available out of the box. So:
+
+```
+FABRICATOR_PLUGIN_DIR = D:/repos/fabricator-dlrest/.../net8.0     (the user's actual setting)
+    before: fabricator_render → does not exist
+    after:  fabricator_render('both work: {{ n }}', {'n':'yes'}) → both work: yes
+            fabricator_plugins() → loaded | dlrest
+```
+
+⚠ The replace-not-extend behaviour is CORRECT and stays: a test rig that narrows the search must actually
+get a narrow search. What was wrong was that something users expect to be present depended on it. An
+`_EXTEND` spelling was proposed and declined earlier (plugin-system.md); this is the other way to fix it.
+
+**The move is three edits and the project stays separate**, which is what keeps the AOT cost contained —
+docs/aot-bridge.md risk R2 (Parlot's compiled mode needs `System.Linq.Expressions`) is now handled by the
+AOT SKU dropping one entry from the provider list, where a merge back into `Fabricator.SqlServer` would put
+a template engine inside the SQL Server backend again:
+
+| | |
+|---|---|
+| `publish-managed.ps1` | one `Publish-Project` line → the managed directory |
+| `ProviderRegistry` | appended to the default `FABRICATOR_BACKEND_ASSEMBLY` list |
+| `pack-distribution.ps1` | step 2b deleted (`$bundledPlugins` had one entry) |
+
+⚠ **APPENDED, never prepended.** `Default()` falls through to `map.Values.Distinct().First()` — Dictionary
+insertion order — so a provider listed first becomes the default for every call site carrying no provider
+name. Fluid declares a provider name and hosts no catalog; first in the list it would become the default.
+
+⚠ **Nothing else references `Fabricator.FluidPlugin`**, unlike `Fabricator.Delta` (which rides in on
+`Fabricator.SqlServer`'s publish). Without that publish line the assembly is simply ABSENT and both
+functions vanish with no error anywhere, because `Discover()` skips an unloadable name on purpose. That is
+the one way this can silently regress.
+
+### 12.2 `HostsCatalog` — a provider that hosts nothing to ATTACH
+
+`IProvider.HostsCatalog => true` (a DIM), checked in `ProviderRegistry.Resolve` before anything is opened.
+Fluid declares `false`.
+
+**⚠ It exists because `IProvider` is the ONLY surface that can contribute a global function.**
+`GlobalScalarFunctions`, `GlobalSqlTableFunctions` and `Settings` all hang off it and the host walks
+`ProviderRegistry.All()` at load — so a template engine must present as a provider and then implement
+`OpenCatalog` and `BuildConnectionString` as throws. Two of its three provider members exist only to fail.
+
+**What declaring `false` buys is WHERE the failure happens**, measured both ways:
+
+```
+before:  ATTACH 'x' AS f (TYPE fabricator, PROVIDER 'fluid');
+         → "MSSQL connection validation failed: {…open_catalog failed: fluid: a template engine…}"
+after:   → "provider 'fluid' hosts no catalog and cannot be ATTACHed — it contributes global
+            functions only. Call its functions directly; they need no ATTACH."
+```
+
+⚠ **Every caller of `Resolve` wants a catalog** (the two ATTACH crossings and Delta's external-table
+routing), which is what makes it the right funnel — global functions never go through it. And the
+unknown-provider hint now lists only ATTACHABLE providers, so nobody is offered a candidate that would then
+be refused.
+
+⚠ **Defaulting to `true` is deliberate**: every existing provider hosts a catalog, and a `false` default
+would make one that forgot to override it unattachable — a silent removal rather than a loud one. Verified
+across the three out-of-tree plugins: all implement `OpenCatalog`, so all are correct with no edit.
+
+⚠ The C++ ATTACH wrapper still nests this in `MSSQL connection validation failed: {…}`. That envelope is a
+pre-existing wart; `HostsCatalog` fixed the message inside it, not the envelope.
+
+### 12.3 ⚠⚠ THE CLOSURE FIXTURE — because Fluid was the only proof, and it stopped being a plugin
+
+`Fabricator.SamplePlugin` is pure IL, so Fluid was the ONLY in-tree plugin with a private dependency:
+"any successful render IS the closure resolving". Making it a built-in would have taken that coverage to
+zero — and `pack-distribution`'s *"a bundled plugin must have more than one assembly"* assertion went with
+the bundling, so the count check disappeared too.
+
+`Fabricator.SamplePlugin.Support` is a sibling project the sample plugin genuinely calls, surfaced as
+`plug_support()`. **A sibling rather than a NuGet package, deliberately:** a third-party package adds a
+supply-chain surface to a test asset and a second version to keep aligned with the host's Apache.Arrow —
+and it would have to be one the host does NOT ship, or the scan skips it by simple name as `shared` and the
+fixture proves nothing.
+
+**⚠⚠ THE MARKER IS A METHOD, NOT A `const`, AND THAT IS THE WHOLE FIXTURE.** C# bakes a `const` into the
+CALLER's IL at compile time, so a plugin returning one would answer correctly with the support assembly
+ABSENT — the test would pass while proving exactly nothing, which is the failure mode it exists to detect.
+
+**⚠ It found a second defect on the way: the archive carried one hard-coded file.** `PackPluginArchive`
+copied `$(AssemblyName).dll` and nothing else, so `fabricator_install_plugin` would have installed a plugin
+that could not run. The payload is computed from `ReferenceCopyLocalPaths` now, and
+`verify_plugin_install` pins `files = 2`.
+
+⚠ A blanket *"nothing was rejected"* assertion I wrote FAILED on a developer machine: a stale `publish/`
+subdirectory under the sample plugin's output holds a second copy of the plugin and is correctly refused as
+a provider-name collision. That asserts a property of the DIRECTORY, not of the code — scoped to the
+support assembly instead.
+
+### 12.4 The rename — `IBackend` → `IProvider`, `BackendRegistry` → `ProviderRegistry`
+
+User's choice of scope: the interface and the registry, **not** `FABRICATOR_BACKEND_ASSEMBLY` (which the
+manifest work of §11-adjacent planning may redefine, so renaming it now risks moving it twice).
+
+| from | to | why |
+|---|---|---|
+| `IBackend` | `IProvider` | the SQL keyword is `PROVIDER 'delta'`, the method is `Resolve(provider)`, `fabricator_plugins()` has a `provider` column. "Backend" claims a data source, and Fluid disproves it |
+| `IBackendCatalog` | `IProviderCatalog` | not requested, included anyway: `IProvider.OpenCatalog() → IBackendCatalog` is the half-rename that ages badly |
+| `BackendRegistry` | `ProviderRegistry` | |
+| `RegisterBackendsFrom` | `RegisterProvidersFrom` | |
+
+**⚠ `IPlugin` was considered and rejected, and the reason is concrete.** "Plugin" already means the
+DISTRIBUTION unit here — `fabricator_plugins()`, `fabricator_install_plugin`, `PluginPaths`,
+`PluginPackage`, `FABRICATOR_PLUGIN_DIR`. And `RegisterProvidersFrom` loops over EVERY type in an assembly,
+so one plugin can contain several providers: naming the interface `IPlugin` makes "how many plugins are in
+this plugin?" a real question. The model that survives is the user's own — **a plugin is a distribution; it
+contains one or more providers; providers are either declared (core) or discovered (user-installed)**.
+
+⚠ Concrete class names STAY (`SqlServerBackend`, `DeltaBackend`, `StubBackend`), following the
+`*TableDefinition` precedent from the `ITable` rename.
+
+**196 occurrences over 52 files**, three source files renamed to match. The masking check reports **0
+unpaired lines across the 43 files the rename alone touched** — strip the renamed identifiers and every
+removed line is byte-identical to its added counterpart.
+
+⚠ **The other 9 files could NOT be masked-checked in isolation**, because the rename landed on top of
+uncommitted Fluid work and they carry both. That is a sequencing error against this repo's own rule that a
+rename gets its own reviewable diff; splitting them afterwards would have produced a non-compiling
+intermediate commit, since the shared set includes `ProviderRegistry.cs` itself.
+
+### 12.5 ⚠⚠ THE RENAME DEMONSTRATED CONTRACT SKEW LIVE, which is the most useful thing in this section
+
+Mid-work, the service tier failed two suites with `plug_greet does not exist`. Cause: the sample plugin had
+been rebuilt against `IProvider` while the PAYLOAD still carried an `Fabricator.Abstractions` declaring
+`IBackend`. The report named it exactly:
+
+```
+rejected | ReflectionTypeLoadException: Could not load type 'Fabricator.Bridge.IProvider'
+           from assembly 'Fabricator.Abstractions, Version=1.0.0.0'
+```
+
+⇒ **that is §11.2's reasoning happening rather than being argued**: the assembly loaded on a SIMPLE-NAME
+match with identical `AssemblyVersion=1.0.0.0`, and failed on a member that moved. It also vindicates the
+pin — had the version floated, this would have been a `FileLoadException` naming a VERSION instead of
+naming the type that is absent, which is the worse error of the two.
+
+⚠ It is also what the three out-of-tree plugins will hit the moment they repin, and the reason each needs
+the same substitution in the same commit as its pin bump.
 ## 5. Open questions
 
 1. ~~Is **cross-plugin** sharing in scope?~~ **ANSWERED 2026-09-02 (user): it is the EXCEPTION, and a

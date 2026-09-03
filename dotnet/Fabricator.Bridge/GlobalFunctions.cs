@@ -9,7 +9,7 @@ namespace Fabricator.Bridge;
 
 /// <summary>
 /// The process-wide registry of connection-free GLOBAL functions — the union, across all registered providers,
-/// of <c>IBackend.GlobalScalarFunctions</c>. Built once (lazily) and keyed by name (case-insensitive). Used for
+/// of <c>IProvider.GlobalScalarFunctions</c>. Built once (lazily) and keyed by name (case-insensitive). Used for
 /// the <b>handle-0</b> path of the scalar ABI entries (<c>get_function_param_schema</c> /
 /// <c>get_function_return_schema</c> / <c>execute_scalar</c>, where a 0 handle means "global, by name") and
 /// enumerated by <c>list_global_functions</c> at extension load. A duplicate name across providers is a fatal
@@ -170,7 +170,7 @@ public static class GlobalFunctions
         throw new ArgumentException($"fabricator: no global in-out/collector function '{name}'");
     }
 
-    private static IReadOnlyDictionary<string, T> Build<T>(Func<IBackend, IEnumerable<T>> select,
+    private static IReadOnlyDictionary<string, T> Build<T>(Func<IProvider, IEnumerable<T>> select,
                                                            Func<T, string> nameOf, string kind,
                                                            IEnumerable<T>? host = null)
     {
@@ -186,7 +186,7 @@ public static class GlobalFunctions
                     $"fabricator: duplicate global {kind} function name '{nameOf(fn)}' among host functions");
             }
         }
-        foreach (var backend in BackendRegistry.All())
+        foreach (var backend in ProviderRegistry.All())
         {
             foreach (var fn in select(backend))
             {

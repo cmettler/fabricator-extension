@@ -23,11 +23,11 @@ namespace Fabricator.Bridge;
 /// </summary>
 internal sealed class TableSession
 {
-    private readonly IBackendCatalog _catalog;
+    private readonly IProviderCatalog _catalog;
     private readonly ITable _definition;
     private readonly TableAt? _at;
 
-    internal TableSession(IBackendCatalog catalog, ITable definition, TableAt? at)
+    internal TableSession(IProviderCatalog catalog, ITable definition, TableAt? at)
     {
         _catalog = catalog;
         _definition = definition;

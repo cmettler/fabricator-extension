@@ -15,7 +15,7 @@ using Microsoft.Extensions.Logging;
 namespace Fabricator.Bridge;
 
 /// <summary>
-/// The Delta Lake provider backed by <b>engineered-wood</b> (the 3rd <see cref="IBackend"/>, after SQL Server
+/// The Delta Lake provider backed by <b>engineered-wood</b> (the 3rd <see cref="IProvider"/>, after SQL Server
 /// and DAX): a Delta <b>folder</b> is an ATTACH-able catalog root —
 /// <c>ATTACH '/lake' AS lake (TYPE fabricator, PROVIDER 'engineeredwooddelta')</c> (or an <c>abfss://…</c>
 /// OneLake/ADLS prefix). The provider name is <c>engineeredwooddelta</c> to distinguish it from a future
@@ -26,7 +26,7 @@ namespace Fabricator.Bridge;
 /// DROP, DELETE (copy-on-write or opt-in deletion vectors), UPDATE (copy-on-write), OCC retry for concurrent
 /// writers — all reuse the provider-agnostic C++ catalog machinery. See docs/delta-catalog.md.
 /// </summary>
-public sealed class DeltaBackend : IBackend
+public sealed class DeltaBackend : IProvider
 {
     public string Name => "engineeredwooddelta";
 
@@ -181,17 +181,17 @@ public sealed class DeltaBackend : IBackend
 
     // The two-argument form cannot know which name was written, so it takes the conservative profile. Reached
     // only by a caller that predates the three-argument overload (the host always passes the name).
-    public IBackendCatalog OpenCatalog(string connectionString, string optionsJson) =>
+    public IProviderCatalog OpenCatalog(string connectionString, string optionsJson) =>
         new DeltaCatalog(connectionString, optionsJson, (false, false));
 
-    public IBackendCatalog OpenCatalog(string connectionString, string optionsJson, string requestedProvider) =>
+    public IProviderCatalog OpenCatalog(string connectionString, string optionsJson, string requestedProvider) =>
         new DeltaCatalog(connectionString, optionsJson, NativeDefaultsFor(requestedProvider));
 }
 
 /// <summary>An ATTACH'd Delta folder catalog. Lazy: holds the root path; all FS access happens during metadata
 /// discovery / scan, using the active host-FS opener (<see cref="AmbientOpener"/>, set by the host before each
 /// catalog metadata + scan + bulk-write call).</summary>
-public sealed class DeltaCatalog : IBackendCatalog
+public sealed class DeltaCatalog : IProviderCatalog
 {
     internal const string MainSchema = "main";
     // The stable row-tracking id surfaced as the DuckDB rowid for UPDATE/DELETE (a VIRTUAL column — not part

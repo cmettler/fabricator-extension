@@ -13,7 +13,7 @@ namespace Fabricator.DeltaRs;
 /// cloud credentials are passed as <c>storage_options</c> derived from the ATTACH'd secret. See
 /// docs/delta-rs-provider.md.
 /// </summary>
-public sealed class DeltaRsBackend : IBackend
+public sealed class DeltaRsBackend : IProvider
 {
     public string Name => "deltars";
 
@@ -28,6 +28,6 @@ public sealed class DeltaRsBackend : IBackend
         string secretType, IReadOnlyDictionary<string, string> fields, string baseConnString)
         => StorageOptionsCodec.Encode(secretType, fields, baseConnString);
 
-    public IBackendCatalog OpenCatalog(string connectionString, string optionsJson)
+    public IProviderCatalog OpenCatalog(string connectionString, string optionsJson)
         => new DeltaRsCatalog(connectionString, optionsJson);
 }

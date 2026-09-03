@@ -14,11 +14,11 @@ namespace Fabricator.Bridge;
 /// <see cref="StubBackend"/>; Phase 1 adds the SqlClient-based implementation in
 /// the Fabricator.SqlServer assembly.
 /// </summary>
-public interface IBackend
+public interface IProvider
 {
     /// <summary>
     /// Canonical provider name this backend registers under (case-insensitive), e.g.
-    /// <c>"sqlserver"</c>. One binary can host several providers; <see cref="BackendRegistry"/>
+    /// <c>"sqlserver"</c>. One binary can host several providers; <see cref="ProviderRegistry"/>
     /// keys backends by this name (and <see cref="Aliases"/>) so a connection can be routed to the
     /// right provider.
     /// </summary>
@@ -140,13 +140,36 @@ public interface IBackend
     string BuildConnectionString(string secretType, IReadOnlyDictionary<string, string> fields, string baseConnString);
 
     /// <summary>
+    /// Whether this provider can be ATTACHed. <c>true</c> for anything that hosts data; <c>false</c> for a
+    /// provider that exists ONLY to contribute global functions and settings.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>⚠ It exists because <see cref="IProvider"/> is the only surface that can contribute a global
+    /// function.</b> <c>GlobalScalarFunctions</c>, <c>GlobalSqlTableFunctions</c> and <see cref="Settings"/>
+    /// all hang off this interface, and the host walks <c>ProviderRegistry.All()</c> at load — so something
+    /// wanting only globals (the Fluid template engine) must still present as a provider, and then
+    /// necessarily implements <see cref="OpenCatalog"/> and
+    /// <see cref="BuildConnectionString"/> as throws.</para>
+    /// <para><b>What declaring <c>false</c> buys is WHERE the failure happens.</b> Without it an
+    /// <c>ATTACH … (PROVIDER 'fluid')</c> resolves, is handed a connection string, and fails inside
+    /// <c>OpenCatalog</c> — which the host reports as
+    /// <c>"MSSQL connection validation failed: {…}"</c>, naming a connection problem for a template engine.
+    /// With it the registry refuses BY NAME before anything is opened, and can say what the provider
+    /// actually is.</para>
+    /// <para>⚠ Defaulting to <c>true</c> is deliberate: every existing provider hosts a catalog, and a
+    /// default of <c>false</c> would make a provider that forgot to override it unattachable — a silent
+    /// removal rather than a loud one.</para>
+    /// </remarks>
+    bool HostsCatalog => true;
+
+    /// <summary>
     /// Open a catalog/connection for the given connection string. <paramref name="optionsJson"/> is the
     /// provider-owned ATTACH options as a flat JSON object of strings (e.g.
     /// <c>{"schema_filter":"…","table_filter":"…","isolation_level":"…"}</c>; empty/null => none). The C++
     /// core forwards every ATTACH option except the two it handles itself (PROVIDER / SECRET), so the
     /// provider parses the keys it knows. See docs/provider-extensibility.md §3.
     /// </summary>
-    IBackendCatalog OpenCatalog(string connectionString, string optionsJson);
+    IProviderCatalog OpenCatalog(string connectionString, string optionsJson);
 
     /// <summary>
     /// Open a catalog, additionally told WHICH of this backend's names the user actually wrote in
@@ -159,7 +182,7 @@ public interface IBackend
     /// it that way: <c>PROVIDER 'delta'</c> defaults the native reader/writer ON (the hybrid production path,
     /// DuckDB's parquet reader/writer with engineered-wood owning the <c>_delta_log</c>) while
     /// <c>PROVIDER 'engineeredwooddelta'</c> defaults them OFF (pure engineered-wood). Both resolve to the same
-    /// <see cref="IBackend"/>; only the defaults differ, and an explicit ATTACH option still wins either way.
+    /// <see cref="IProvider"/>; only the defaults differ, and an explicit ATTACH option still wins either way.
     /// </para>
     /// <para>
     /// ⚠ A backend that behaves this way MUST document the name → profile mapping, because
@@ -172,7 +195,7 @@ public interface IBackend
     /// thing (and every existing plugin) needs no change.
     /// </para>
     /// </remarks>
-    IBackendCatalog OpenCatalog(string connectionString, string optionsJson, string requestedProvider)
+    IProviderCatalog OpenCatalog(string connectionString, string optionsJson, string requestedProvider)
         => OpenCatalog(connectionString, optionsJson);
 }
 
@@ -231,7 +254,7 @@ public interface ITableFunctionSession : IDisposable
 }
 
 /// <summary>An opened connection/catalog. Disposed when the native side closes the handle.</summary>
-public interface IBackendCatalog : IDisposable
+public interface IProviderCatalog : IDisposable
 {
     /// <summary>
     /// The catalog's capability doc (ABI v71): ONE flat JSON object of boolean flags the HOST consumes,
@@ -280,7 +303,7 @@ public interface IBackendCatalog : IDisposable
     /// discovery call below. No-op by default — a provider that needs nothing implements nothing.
     /// </summary>
     /// <remarks>
-    /// <para><b>Why it exists.</b> <see cref="IBackend.OpenCatalog(string,string)"/> runs with NO ambients:
+    /// <para><b>Why it exists.</b> <see cref="IProvider.OpenCatalog(string,string)"/> runs with NO ambients:
     /// there is no opener and no settings session, because it only CONSTRUCTS the catalog — an invariant the
     /// host relies on. So a provider whose setup needs a context (connect and detect the engine, resolve a
     /// secret, probe the root) had nowhere to put it, and had to hang it off whichever discovery call happened

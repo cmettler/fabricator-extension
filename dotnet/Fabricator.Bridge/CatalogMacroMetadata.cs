@@ -14,7 +14,7 @@ namespace Fabricator.Bridge;
 /// (<c>schema</c>, <c>name</c>, <c>create_sql</c>) the host reads to bind provider-declared macros into an
 /// ATTACHed catalog's schemas.
 ///
-/// <para>Shared by every provider that declares <see cref="IBackend.CatalogMacros"/> — the point of a separate
+/// <para>Shared by every provider that declares <see cref="IProvider.CatalogMacros"/> — the point of a separate
 /// metadata kind is that a macro body is a purely LOCAL declaration, so it must not be assembled into provider
 /// SQL and executed on a server (which is how the <c>Functions</c> discovery stream works). That also means a
 /// provider with no SQL engine, and a provider whose server is unreachable, can still declare macros.</para>

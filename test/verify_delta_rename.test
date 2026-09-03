@@ -130,7 +130,7 @@ statement ok
 DETACH xb;
 
 # ---- The removed alias is an UNKNOWN provider — pinned so the removal cannot regress into a silent
-#      resolution (BackendRegistry matches Name + Aliases case-insensitively, so a stray re-add would be
+#      resolution (ProviderRegistry matches Name + Aliases case-insensitively, so a stray re-add would be
 #      invisible without this). ----
 statement error
 ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/rn_deltalake' AS lc (TYPE fabricator, PROVIDER 'deltalake');

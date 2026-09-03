@@ -11,7 +11,7 @@ namespace Fabricator.Bridge;
 /// <summary>
 /// A streaming bulk-load session: the C++ host pushes Arrow record batches one at
 /// a time (<c>push_batch</c>) while a background task drains them into the backend
-/// via <see cref="IBackendCatalog.BulkInsert"/> (e.g. SqlBulkCopy). A bounded
+/// via <see cref="IProviderCatalog.BulkInsert"/> (e.g. SqlBulkCopy). A bounded
 /// channel provides backpressure — <see cref="Push"/> blocks while the channel is
 /// full so peak memory stays bounded regardless of dataset size. This offloads the
 /// bulk-copy concurrency to the .NET thread pool: the host's sink thread only fills
@@ -42,7 +42,7 @@ internal sealed class BulkSession
 
     public Schema Schema { get; }
 
-    public BulkSession(IBackendCatalog catalog, string schemaName, string tableName, Schema schema, bool createTable,
+    public BulkSession(IProviderCatalog catalog, string schemaName, string tableName, Schema schema, bool createTable,
                        bool replace, bool checkConstraints, long txnId, nint opener = 0,
                        IReadOnlyList<string>? partitionColumns = null, IReadOnlyList<string>? sortColumns = null,
                        string? schemaMode = null, bool partitionOverwrite = false, string? optionsJson = null)

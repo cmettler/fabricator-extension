@@ -19,7 +19,7 @@ namespace Fabricator.Bridge;
 /// <param name="Name">Plugin identity, and the first directory level it installs into. A path SEGMENT.</param>
 /// <param name="Version">Plugin version, and the second directory level. A path SEGMENT, so installs of
 /// different versions coexist and an upgrade never has to overwrite a file that may be locked.</param>
-/// <param name="EntryAssembly">The assembly declaring the plugin's <c>IBackend</c> / global functions,
+/// <param name="EntryAssembly">The assembly declaring the plugin's <c>IProvider</c> / global functions,
 /// relative to the merged install directory. Its presence after the merge is checked at install, because an
 /// archive that installs cleanly and contains no plugin is exactly the silent failure this whole surface
 /// exists to remove.</param>

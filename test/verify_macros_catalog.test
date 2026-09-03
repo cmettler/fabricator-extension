@@ -1,7 +1,7 @@
 # name: test/verify_macros_catalog.test
 # description: CATALOG-BOUND provider-declared DuckDB MACROs (docs/macros-and-sqlgen-functions.md §1.4) — the
 #              attach-time counterpart of verify_macros.test's load-time global ones. The provider declares
-#              complete CREATE MACRO statements (IBackend.CatalogMacros) which the host binds into the ATTACHed
+#              complete CREATE MACRO statements (IProvider.CatalogMacros) which the host binds into the ATTACHed
 #              catalog's schemas, so they resolve as db.schema.m(...) and NOT under a bare name.
 #
 #              WHY THIS EXISTS AT ALL. A schema buys NAMESPACING, and namespacing a SCALAR helper is the one

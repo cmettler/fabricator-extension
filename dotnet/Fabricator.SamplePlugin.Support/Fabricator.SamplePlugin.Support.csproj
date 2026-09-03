@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Library</OutputType>
+    <RootNamespace>Fabricator.SamplePlugin.Support</RootNamespace>
+    <AssemblyName>Fabricator.SamplePlugin.Support</AssemblyName>
+    <Description>
+      A PRIVATE DEPENDENCY of Fabricator.SamplePlugin, and a test fixture with exactly one job: to be an
+      assembly the plugin needs, the HOST does not ship, and the loader therefore has to find beside the
+      plugin.
+
+      ⚠ WHY IT EXISTS AT ALL. The failure it guards is measured, not imagined: a LIBRARY does not copy its
+      dependency closure to the output directory unless CopyLocalLockFileAssemblies is set, and when
+      Fabricator.FluidPlugin was created the first build produced one DLL and nothing else — it loaded, and
+      died at the first render with a FileNotFoundException naming an assembly that was never copied. Fluid
+      was the only in-tree plugin with a private dependency, so when it became a built-in provider assembly
+      (2026-09-02) that coverage would have gone to zero: Fabricator.SamplePlugin is pure IL, and
+      pack-distribution's "a bundled plugin must have more than one assembly" assertion went with the
+      bundling.
+
+      ⚠ A SIBLING PROJECT RATHER THAN A NuGet PACKAGE, deliberately. A third-party package would add a
+      supply-chain surface to a test asset and a second version to keep aligned with the host's (the
+      Apache.Arrow hazard), and it would have to be one the host does NOT already ship — otherwise the
+      plugin scan skips it by simple name as `shared` and the fixture proves nothing.
+    </Description>
+  </PropertyGroup>
+
+</Project>

@@ -33,7 +33,7 @@ AS SELECT …;   -- writes Delta to S3 client-side + provisions the SQL external
 - The two ABI entries that must carry the options: `create_table` (`abi.h:269`, empty CREATE) and
   `begin_bulk` (`abi.h:354`, CTAS/COPY/INSERT bulk). Both already grew nullable string params the
   same way (`partition_columns` v51, `sort_columns` v52, `schema_mode` v54) — **one bump, v67**.
-- C# seams: `IBackendCatalog.CreateTable(…)` + `BulkInsert(…)` (`dotnet/Fabricator.Abstractions/IBackend.cs:159/:271`)
+- C# seams: `IBackendCatalog.CreateTable(…)` + `BulkInsert(…)` (`dotnet/Fabricator.Abstractions/IProvider.cs:159/:271`)
   gain a `string? optionsJson`; Delta write tuning resolves in `DeltaCatalog.ResolveWriteSpec`
   (`DeltaCatalog.cs:450` — precedence today: ATTACH defaults < `delta_write_options` session setting);
   Delta table config stamps in `DeltaWriter.CreateConfig`; per-table property DDL already exists

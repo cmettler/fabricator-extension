@@ -19,7 +19,7 @@
 namespace duckdb {
 
 //! Registers every provider's secret type(s) + their `config` creation functions, declared in C#
-//! (IBackend.SecretType / SecretFields) and queried via the list_secret_fields ABI at load — so the
+//! (IProvider.SecretType / SecretFields) and queried via the list_secret_fields ABI at load — so the
 //! provider-agnostic core names no secret type or field. See docs/provider-extensibility.md §2.
 void RegisterProviderSecrets(ExtensionLoader &loader);
 

@@ -5,112 +5,54 @@
     <RootNamespace>Fabricator.FluidPlugin</RootNamespace>
     <AssemblyName>Fabricator.FluidPlugin</AssemblyName>
     <Description>
-      The Fluid/Liquid template engine as a PLUGIN: a connection-free IBackend contributing the global scalar
-      fabricator_render(template, params). Carved out of Fabricator.SqlServer, where a template engine had no
-      business living and where its Fluid closure rode into every shipped payload. Built to a fixed folder
-      and discovered via FABRICATOR_PLUGIN_DIR; see docs/plugin-system.md.
+      The Fluid/Liquid template engine: a connection-free IProvider contributing the global scalar
+      fabricator_render(template, params) and the SQL-generating table function fluid_query(template, params).
+
+      ⚠ IT IS A BUILT-IN PROVIDER ASSEMBLY, NOT A PLUGIN, since 2026-09-02 — discovered by name through
+      ProviderRegistry's FABRICATOR_BACKEND_ASSEMBLY list exactly like Fabricator.Delta, and published into
+      the managed directory by publish-managed.ps1. It was a bundled PLUGIN for one day, and the reason it
+      stopped being one is a footgun rather than tidiness: FABRICATOR_PLUGIN_DIR REPLACES the plugin roots
+      rather than extending them (PluginPaths.ResolveRoots returns early), so a user who set it to load
+      their OWN plugin silently lost fabricator_render. The bundled root had exactly one occupant, and it
+      was the one capability documented as available out of the box.
+
+      It remains its OWN PROJECT, which is what keeps the cost of the Fluid dependency contained: the AOT
+      SKU drops one entry from the backend list (docs/aot-bridge.md risk R2 — Parlot's compiled mode needs
+      System.Linq.Expressions), where a merge back into Fabricator.SqlServer would put a template engine
+      inside the SQL Server backend again.
     </Description>
-
-    <!-- ⚠ net8.0 ONLY, unlike most projects here. A plugin runs on whatever runtime the BRIDGE was published
-         for, and net8.0 loads on both SKUs where net10.0 fails on the framework-dependent one. Clearing
-         TargetFrameworks first is required: Directory.Build.props sets it, and TargetFrameworks WINS over
-         TargetFramework when both are present. -->
-    <TargetFrameworks></TargetFrameworks>
-    <TargetFramework>net8.0</TargetFramework>
-
-    <!-- A FIXED output path, so the suite runner names one directory with no TFM and no RID in it - the
-         Fabricator.CollidingPlugin precedent. `build/plugins/`, NOT `build/test-plugins/`: this is a real
-         shippable plugin that the tier happens to point at, not a fixture manufactured for one assertion. -->
-    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
-    <AppendRuntimeIdentifierToOutputPath>false</AppendRuntimeIdentifierToOutputPath>
-    <OutputPath>$(MSBuildThisFileDirectory)..\..\build\plugins\fluid\</OutputPath>
-
-    <!-- ⚠ A LIBRARY does not copy its NuGet closure to the output directory by default; it is materialised
-         only on `publish`. Fabricator.SqlServer got Fluid that way, via publish-managed.ps1. A PLUGIN has no
-         publish step - its build OUTPUT is what a plugin root points at - so without this the plugin loads
-         and then fails at first render with a FileNotFoundException naming an assembly that was never
-         copied. MEASURED: the first build produced Fabricator.FluidPlugin.dll and nothing else. -->
-    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
   </PropertyGroup>
 
   <ItemGroup>
-    <!-- The contract assembly (+ Apache.Arrow transitively) is HOST-PROVIDED: Private=false, NOT copied, so
-         at runtime it resolves to the bridge's own default-context copy. Copying either would give the
-         plugin a SECOND Apache.Arrow, and every Arrow type it handed the host would be a different,
-         non-assignable type. -->
-    <ProjectReference Include="..\Fabricator.Abstractions\Fabricator.Abstractions.csproj" Private="false" />
+    <!-- The contract, plus the reusable middle (ArrowValueReader.ReadTimestamp). Ordinary references now:
+         as a published provider assembly this lands in the same managed directory as the bridge, so the
+         Private="false" the PLUGIN form needed — to avoid a second, non-assignable copy of every contract
+         type beside the plugin — no longer applies. -->
+    <ProjectReference Include="..\Fabricator.Abstractions\Fabricator.Abstractions.csproj" />
+    <ProjectReference Include="..\Fabricator.Common\Fabricator.Common.csproj" />
 
-    <!-- The reusable middle - OPTIONAL, taken here for ArrowValueReader.ReadTimestamp. Private=false for
-         the SAME reason as Abstractions above: a copied Fabricator.Common.dll beside the plugin is a second
-         copy of every type in it, and this plugin hands Arrow-shaped values to the host.
-         /!\ Note what is NOT widened: still no reference to Fabricator.Bridge. That is the acceptance test
-         for the split - a plugin reaching shared IMPLEMENTATION without taking on the host's Azure/Fabric/
-         unsafe closure. docs/plugin-services.md section 9. -->
-    <ProjectReference Include="..\Fabricator.Common\Fabricator.Common.csproj" Private="false" />
+    <!--
+      ⚠⚠ A PRERELEASE PIN, deliberately and with its own review rule: we track Fluid v3.0, whose only
+      published form is a beta. A prerelease is not a stable contract — the API may move between betas — so
+      a bump here is a CODE-COMPATIBILITY question, not a routine version bump, and the gate that answers it
+      is test/verify_plugin_fluid.test. Move to the stable 3.0.0 as soon as it ships.
+      ⚠ Being a built-in raises the stakes: this now loads in every payload rather than only where a plugin
+      root was configured. It already shipped in every RELEASE artifact (pack-distribution staged it as a
+      bundled plugin), so the bytes are not new — what is new is that a dev build carries it too.
 
-    <!-- ⚠ Fluid is the plugin's OWN dependency and IS copied. This is what makes the plugin worth having
-         in-tree beyond the move itself: Fabricator.SamplePlugin is pure IL with no third-party package, so
-         until now NOTHING exercised a plugin carrying a private NuGet closure and relying on
-         BackendRegistry.InstallPluginResolver to load it out of the plugin folder.
-
-         ⚠⚠ A PRERELEASE PIN, deliberately and with its own review rule: we track Fluid v3.0, whose only
-         published form is a beta. A prerelease is not a stable contract - the API may move between betas -
-         so a bump here is a CODE-COMPATIBILITY question, not a routine version bump, and the gate that
-         answers it is test/verify_plugin_fluid.test. Move to the stable 3.0.0 as soon as it ships.
-
-         /!\ AND THERE IS TIMEZONE WORK ON FLUID'S MAIN BRANCH THAT THIS BETA DOES NOT CARRY (user-reported
-         2026-09-01, not verified here). The TEMPORAL assertions in verify_plugin_fluid are therefore the
-         ones most likely to move at the next bump - which is what they are for: they pin today's rendering
-         and ordering EXACTLY, so a change arrives as a failed assertion naming the value rather than as a
-         silently different result. If they move, re-derive docs/fluid-templating.md section 7.4a rather
-         than editing the expected values to match; that section also holds a DEFERRED decision (an
-         ISO-string value model) whose case depends on what upstream does here.
-         ⚠ It is ALSO why this stays a PackageReference rather than a source reference to a local clone: a
-         sibling-path reference pins nothing and no clone but the author's can build it - exactly the shape
-         this repo converted engineered-wood and DuckDB.ExtensionKit away from - and it would leave CI
-         silently gating a DIFFERENT Fluid than the developer runs. -->
+      /!\ AND THERE IS TIMEZONE WORK ON FLUID'S MAIN BRANCH THAT THIS BETA DOES NOT CARRY (user-reported
+      2026-09-01, not verified here). The TEMPORAL assertions in verify_plugin_fluid are therefore the
+      ones most likely to move at the next bump - which is what they are for: they pin today's rendering
+      and ordering EXACTLY, so a change arrives as a failed assertion naming the value rather than as a
+      silently different result. If they move, re-derive docs/fluid-templating.md section 7.4a rather
+      than editing the expected values to match; that section also holds a DEFERRED decision (an
+      ISO-string value model) whose case depends on what upstream does here.
+      ⚠ It is ALSO why this stays a PackageReference rather than a source reference to a local clone: a
+      sibling-path reference pins nothing and no clone but the author's can build it - exactly the shape
+      this repo converted engineered-wood and DuckDB.ExtensionKit away from - and it would leave CI
+      silently gating a DIFFERENT Fluid than the developer runs.
+    -->
     <PackageReference Include="Fluid.Core" Version="3.0.0-beta.7" />
-
-    <!-- ⚠ Apache.Arrow arrives transitively through Abstractions, and CopyLocalLockFileAssemblies above would
-         otherwise copy it HERE too. ExcludeAssets="runtime" keeps the compile reference and drops the copy:
-         a second Apache.Arrow.dll beside the plugin is at best dead weight the recursive plugin scan has to
-         classify, and is the exact shape of the "aligned dependency closure" hazard docs/plugin-system.md
-         warns about. The version must track Abstractions' (23.0.0). -->
-    <PackageReference Include="Apache.Arrow" Version="23.0.0" ExcludeAssets="runtime" />
-    <!-- Arrow's own transitive companion, likewise already in the bridge payload (MEASURED: both
-         Apache.Arrow.dll and Apache.Arrow.Scalars.dll sit in build/release/extension/fabricator/fabricator).
-         Named explicitly because ExcludeAssets does not flow to a transitive dependency. -->
-    <PackageReference Include="Apache.Arrow.Scalars" Version="23.0.0" ExcludeAssets="runtime" />
   </ItemGroup>
-
-  <!--
-    Emit the plugin as an INSTALLABLE ARCHIVE (the PluginPackage layout: a manifest at the archive root plus
-    an `any/` directory), so fabricator_install_plugin() has a second, dependency-carrying fixture.
-    `any/` because this plugin is pure IL on every platform.
-
-    ⚠ The payload is computed from ReferenceCopyLocalPaths rather than listed by hand: Fluid pulls several
-    assemblies transitively, and a hard-coded file list silently stops shipping one the day the package graph
-    changes - which surfaces at first render as a FileNotFoundException naming an assembly that is sitting in
-    the build output.
-  -->
-  <Target Name="PackPluginArchive" AfterTargets="Build">
-    <PropertyGroup>
-      <!-- Staged under obj/, NOT bin/: the plugin scan is RECURSIVE, so staging inside the output directory
-           would make the staged copy a second candidate for the very same assembly. -->
-      <PluginStageDir>$(IntermediateOutputPath)pluginpkg\</PluginStageDir>
-      <PluginArchivePath>$(OutputPath)$(AssemblyName).plugin.zip</PluginArchivePath>
-    </PropertyGroup>
-    <ItemGroup>
-      <PluginPayload Include="$(OutputPath)$(AssemblyName).dll" />
-      <PluginPayload Include="@(ReferenceCopyLocalPaths)" Condition="'%(Extension)' == '.dll'" />
-    </ItemGroup>
-    <RemoveDir Directories="$(PluginStageDir)" />
-    <MakeDir Directories="$(PluginStageDir)any" />
-    <Copy SourceFiles="@(PluginPayload)" DestinationFolder="$(PluginStageDir)any" />
-    <WriteLinesToFile File="$(PluginStageDir)fabricator-plugin.json" Overwrite="true" WriteOnlyWhenDifferent="false"
-                      Lines="{ &quot;formatVersion&quot;: 1, &quot;name&quot;: &quot;fluid&quot;, &quot;version&quot;: &quot;1.0.0&quot;, &quot;entryAssembly&quot;: &quot;$(AssemblyName).dll&quot;, &quot;abstractionsVersion&quot;: &quot;$(FabricatorContractVersion)&quot; }" />
-    <Delete Files="$(PluginArchivePath)" />
-    <ZipDirectory SourceDirectory="$(PluginStageDir)" DestinationFile="$(PluginArchivePath)" Overwrite="true" />
-  </Target>
 
 </Project>

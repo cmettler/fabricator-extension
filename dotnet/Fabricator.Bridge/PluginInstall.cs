@@ -294,8 +294,8 @@ internal static class PluginInstall
     /// </remarks>
     private static (string Providers, string Detail) Activate(string destination)
     {
-        BackendRegistry.Invalidate();
-        _ = BackendRegistry.All().Count(); // forces Discover(), i.e. a fresh plugin scan
+        ProviderRegistry.Invalidate();
+        _ = ProviderRegistry.All().Count(); // forces Discover(), i.e. a fresh plugin scan
         string prefix = destination.EndsWith(Path.DirectorySeparatorChar)
             ? destination
             : destination + Path.DirectorySeparatorChar;
@@ -427,8 +427,8 @@ internal static class PluginInstall
         catch
         {
         }
-        BackendRegistry.Invalidate();
-        _ = BackendRegistry.All().Count(); // force the re-scan, so the provider stops resolving NOW
+        ProviderRegistry.Invalidate();
+        _ = ProviderRegistry.All().Count(); // force the re-scan, so the provider stops resolving NOW
         return results;
     }
 

@@ -14,7 +14,7 @@ namespace Fabricator.Bridge;
 /// <c>name</c>, <c>create_sql</c>) the host reads to bind provider-declared views into an ATTACHed catalog's
 /// schemas.
 ///
-/// <para>Shared by every provider that declares <see cref="IBackend.CatalogViews"/>. Its own entry rather
+/// <para>Shared by every provider that declares <see cref="IProvider.CatalogViews"/>. Its own entry rather
 /// than a column on the functions stream for the same reason <see cref="CatalogMacroMetadata"/> has one: a
 /// view body is a purely LOCAL declaration, so it must not be assembled into provider SQL and executed on a
 /// server. A provider with no SQL engine, or one whose server is unreachable, can still declare views.</para>

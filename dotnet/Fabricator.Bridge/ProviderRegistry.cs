@@ -8,8 +8,8 @@ namespace Fabricator.Bridge;
 /// Process-wide registry of backends, **keyed by provider name** so one binary can host several
 /// providers (SQL Server, later Power BI/DAX, …). On first use it loads the provider assemblies named
 /// by <c>FABRICATOR_BACKEND_ASSEMBLY</c> (comma-separated; default <c>Fabricator.SqlServer</c>), finds every
-/// <see cref="IBackend"/> implementation, and registers each under its <see cref="IBackend.Name"/> +
-/// <see cref="IBackend.Aliases"/> (case-insensitive). If none are found it falls back to
+/// <see cref="IProvider"/> implementation, and registers each under its <see cref="IProvider.Name"/> +
+/// <see cref="IProvider.Aliases"/> (case-insensitive). If none are found it falls back to
 /// <see cref="StubBackend"/> so the bridge still works standalone.
 /// <para>
 /// <see cref="Resolve"/> picks a backend by provider name; <see cref="Active"/> returns the default
@@ -18,10 +18,10 @@ namespace Fabricator.Bridge;
 /// the ABI.
 /// </para>
 /// </summary>
-public static class BackendRegistry
+public static class ProviderRegistry
 {
     private static readonly object Gate = new();
-    private static Dictionary<string, IBackend>? _byName; // name/alias (case-insensitive) -> backend
+    private static Dictionary<string, IProvider>? _byName; // name/alias (case-insensitive) -> backend
     private static string? _defaultProvider;              // canonical name of the default backend
 
     // Simple names of assemblies WE loaded out of a plugin directory. Subtracted from the host's loaded set
@@ -44,7 +44,7 @@ public static class BackendRegistry
     /// clearing it would let an install re-derive which provider is the default — and every call site that
     /// carries no provider name would silently start going somewhere else. An install must add a provider,
     /// never re-point the existing ones.</para>
-    /// <para>Existing ATTACHed catalogs are unaffected: they hold an already-resolved <see cref="IBackend"/>
+    /// <para>Existing ATTACHed catalogs are unaffected: they hold an already-resolved <see cref="IProvider"/>
     /// and its catalog object, neither of which is reached through this map.</para>
     /// </remarks>
     public static void Invalidate()
@@ -59,7 +59,7 @@ public static class BackendRegistry
     /// Explicitly registers a backend (e.g. from a host or test) under its name + aliases. The first
     /// registered backend becomes the default unless <c>FABRICATOR_DEFAULT_PROVIDER</c> overrides it.
     /// </summary>
-    public static void Register(IBackend backend)
+    public static void Register(IProvider backend)
     {
         lock (Gate)
         {
@@ -73,7 +73,7 @@ public static class BackendRegistry
     /// Resolves a backend by provider name or alias (case-insensitive). A null/empty provider yields the
     /// default (see <see cref="Active"/>). Throws when the provider is unknown.
     /// </summary>
-    public static IBackend Resolve(string? provider)
+    public static IProvider Resolve(string? provider)
     {
         var map = Map();
         if (string.IsNullOrWhiteSpace(provider))
@@ -82,9 +82,23 @@ public static class BackendRegistry
         }
         if (map.TryGetValue(provider.Trim(), out var backend))
         {
+            // ⚠ REFUSED BY NAME, BEFORE ANYTHING IS OPENED. Every caller of Resolve wants a catalog (the two
+            // ATTACH crossings and the external-table routing), so this is the one funnel where a
+            // globals-only provider can be turned away with a sentence about what it IS. Left to
+            // OpenCatalog, the same refusal surfaces as "MSSQL connection validation failed: {…}" — a
+            // connection error for a template engine, naming the wrong subsystem.
+            if (!backend.HostsCatalog)
+            {
+                throw new ArgumentException(
+                    $"fabricator: provider '{provider}' hosts no catalog and cannot be ATTACHed — it "
+                    + "contributes global functions only. Call its functions directly; they need no ATTACH.");
+            }
             return backend;
         }
-        var known = string.Join(", ", map.Values.Select(b => b.Name).Distinct(StringComparer.OrdinalIgnoreCase));
+        // ⚠ The hint lists only ATTACHABLE providers. Offering a globals-only one as a candidate for the
+        // ATTACH that just failed would send the reader straight into the refusal above.
+        var known = string.Join(", ", map.Values.Where(b => b.HostsCatalog)
+                                               .Select(b => b.Name).Distinct(StringComparer.OrdinalIgnoreCase));
         throw new ArgumentException($"fabricator: unknown provider '{provider}'. Registered providers: {known}.");
     }
 
@@ -92,13 +106,13 @@ public static class BackendRegistry
     /// The default backend, for call sites that don't yet carry a provider (the sole registered backend,
     /// or the one named by <c>FABRICATOR_DEFAULT_PROVIDER</c> / the first registered).
     /// </summary>
-    public static IBackend Active => Default(Map());
+    public static IProvider Active => Default(Map());
 
     /// <summary>All distinct registered backends — for host-side enumeration (e.g. listing every provider's
     /// declared settings at load).</summary>
-    public static IEnumerable<IBackend> All() => Map().Values.Distinct();
+    public static IEnumerable<IProvider> All() => Map().Values.Distinct();
 
-    private static IBackend Default(Dictionary<string, IBackend> map)
+    private static IProvider Default(Dictionary<string, IProvider> map)
     {
         if (_defaultProvider != null && map.TryGetValue(_defaultProvider, out var named))
         {
@@ -108,7 +122,7 @@ public static class BackendRegistry
         return map.Values.Distinct().First();
     }
 
-    private static Dictionary<string, IBackend> Map()
+    private static Dictionary<string, IProvider> Map()
     {
         lock (Gate)
         {
@@ -116,9 +130,9 @@ public static class BackendRegistry
         }
     }
 
-    private static Dictionary<string, IBackend> NewMap() => new(StringComparer.OrdinalIgnoreCase);
+    private static Dictionary<string, IProvider> NewMap() => new(StringComparer.OrdinalIgnoreCase);
 
-    private static void Add(Dictionary<string, IBackend> map, IBackend backend)
+    private static void Add(Dictionary<string, IProvider> map, IProvider backend)
     {
         map[backend.Name] = backend;
         foreach (var alias in backend.Aliases)
@@ -130,7 +144,7 @@ public static class BackendRegistry
         }
     }
 
-    private static Dictionary<string, IBackend> Discover()
+    private static Dictionary<string, IProvider> Discover()
     {
         var map = NewMap();
         var names = Environment.GetEnvironmentVariable("FABRICATOR_BACKEND_ASSEMBLY");
@@ -145,15 +159,24 @@ public static class BackendRegistry
             // Default() falls through to map.Values.Distinct().First(), i.e. Dictionary INSERTION order, so
             // whichever provider is registered first becomes the default for every call site that carries no
             // provider name. Delta is now discovered like the others, so its POSITION IN THIS STRING is what
-            // preserves that — prepend it and SqlServer silently stops being the default.
-            names = "Fabricator.SqlServer,Fabricator.AnalysisServices,Fabricator.DeltaRs,Fabricator.Delta";
+            // preserves that — prepend it and SqlServer silently stops being the default. The same rule is
+            // why Fabricator.FluidPlugin is APPENDED: it declares a provider name ("fluid") and would become
+            // the default if it came first, even though it hosts no catalog at all.
+            //
+            // ⚠ Fabricator.FluidPlugin is a BUILT-IN here since 2026-09-02, not a plugin. It was bundled
+            // into <managed>/plugins/ for one day, and what moved it is a FOOTGUN rather than tidiness:
+            // FABRICATOR_PLUGIN_DIR REPLACES the plugin roots rather than extending them
+            // (PluginPaths.ResolveRoots returns early), so a user pointing it at their OWN plugin silently
+            // lost fabricator_render — the one capability documented as available out of the box, and the
+            // bundled root's only occupant.
+            names = "Fabricator.SqlServer,Fabricator.AnalysisServices,Fabricator.DeltaRs,Fabricator.Delta,Fabricator.FluidPlugin";
         }
         foreach (var assemblyName in names.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
         {
             try
             {
                 var assembly = System.Reflection.Assembly.Load(assemblyName);
-                RegisterBackendsFrom(assembly, map);
+                RegisterProvidersFrom(assembly, map);
             }
             catch
             {
@@ -168,22 +191,22 @@ public static class BackendRegistry
         return map;
     }
 
-    private static void RegisterBackendsFrom(System.Reflection.Assembly assembly, Dictionary<string, IBackend> map,
+    private static void RegisterProvidersFrom(System.Reflection.Assembly assembly, Dictionary<string, IProvider> map,
                                              bool refuseCollisions = false)
     {
-        var found = new List<IBackend>();
+        var found = new List<IProvider>();
         foreach (var type in assembly.GetTypes())
         {
-            if (!type.IsAbstract && typeof(IBackend).IsAssignableFrom(type) &&
+            if (!type.IsAbstract && typeof(IProvider).IsAssignableFrom(type) &&
                 type.GetConstructor(Type.EmptyTypes) != null)
             {
-                found.Add((IBackend)Activator.CreateInstance(type)!);
+                found.Add((IProvider)Activator.CreateInstance(type)!);
             }
         }
         if (refuseCollisions)
         {
             // ⚠⚠ A PLUGIN MAY NOT TAKE A NAME THAT IS ALREADY REGISTERED. Add() is a plain overwrite, so
-            // without this a plugin declaring IBackend.Name == "sqlserver" SILENTLY REPLACES the first-party
+            // without this a plugin declaring IProvider.Name == "sqlserver" SILENTLY REPLACES the first-party
             // provider and the scan reports it as an ordinary `loaded` row: every later ATTACH goes somewhere
             // the user did not choose, with nothing anywhere saying so. Refusing is the only one of the three
             // options (report / refuse / allow-as-override) that cannot end in a wrong ANSWER; an override
@@ -204,7 +227,7 @@ public static class BackendRegistry
                             $"plugin provider name collision: '{assembly.GetName().Name}' declares " +
                             $"'{name}' (via {backend.GetType().FullName}), which is already registered by " +
                             $"'{incumbent.GetType().Assembly.GetName().Name}' as provider '{incumbent.Name}'. " +
-                            "Rename the plugin's IBackend.Name or its Aliases; a plugin may not replace an " +
+                            "Rename the plugin's IProvider.Name or its Aliases; a plugin may not replace an " +
                             "existing provider.");
                     }
                 }
@@ -218,7 +241,7 @@ public static class BackendRegistry
     }
 
     /// <summary>The keys a backend would occupy: its name plus every non-blank alias.</summary>
-    private static IEnumerable<string> Names(IBackend backend)
+    private static IEnumerable<string> Names(IProvider backend)
     {
         yield return backend.Name;
         foreach (var alias in backend.Aliases)
@@ -232,15 +255,15 @@ public static class BackendRegistry
 
     // Third-party plugin discovery (docs/plugin-system.md). FABRICATOR_PLUGIN_DIR is a comma-separated list of
     // folders; every assembly in each is loaded into the DEFAULT context (no AssemblyLoadContext isolation —
-    // deferred until a real dep conflict lands) and reflected for IBackend, whose backends + global functions
+    // deferred until a real dep conflict lands) and reflected for IProvider, whose backends + global functions
     // register like the built-in providers. A plugin references Fabricator.ABSTRACTIONS + Apache.Arrow
     // (host-provided, not copied), OPTIONALLY Fabricator.COMMON for shared implementations — but NOT
     // Fabricator.Bridge, which drags the Azure/Fabric closure into every plugin build; that is what the
     // 2026-08-18 assembly split, Fabricator.Common and the FabricatorServices locator are for.
-    // Either way its IBackend resolves to the default-context one and IsAssignableFrom works. Plugins must
+    // Either way its IProvider resolves to the default-context one and IsAssignableFrom works. Plugins must
     // align their full dependency closure with the host (Apache.Arrow especially) — there is no version
     // isolation without ALC.
-    private static void ScanPluginDirectories(Dictionary<string, IBackend> map)
+    private static void ScanPluginDirectories(Dictionary<string, IProvider> map)
     {
         // Every decision below is RECORDED, not just acted on: fabricator_plugins() reads this back. The scan
         // runs once per process behind the memoized map, so it cannot be replayed on demand — see the remarks
@@ -267,9 +290,9 @@ public static class BackendRegistry
         }
         // Load plugins into the BRIDGE's own ALC, not Default: hostfxr loads the bridge into a non-default
         // context, so a plugin must be loaded into that same context for its Fabricator.Bridge / Apache.Arrow
-        // references to resolve to the RUNNING bridge (else it binds to a separate copy and its IBackend is a
+        // references to resolve to the RUNNING bridge (else it binds to a separate copy and its IProvider is a
         // different, non-assignable type). The same ALC's loaded assemblies are the shared set to skip.
-        var host = System.Runtime.Loader.AssemblyLoadContext.GetLoadContext(typeof(BackendRegistry).Assembly)
+        var host = System.Runtime.Loader.AssemblyLoadContext.GetLoadContext(typeof(ProviderRegistry).Assembly)
                    ?? System.Runtime.Loader.AssemblyLoadContext.Default;
         // The resolver gets every DIRECTORY that holds a candidate, not just the roots: with the recursive
         // search below, a plugin's private dependencies sit next to it several levels down, and a resolver
@@ -292,7 +315,7 @@ public static class BackendRegistry
         // are in host.Assemblies — they would match this skip set, be reported "shared", and never be
         // registered into the FRESH map. Excluding what we ourselves loaded from a plugin directory keeps
         // them candidates; LoadFromAssemblyPath then returns the already-loaded instance (cheap) and
-        // RegisterBackendsFrom puts the provider back. A plugin whose FILES were deleted simply stops being
+        // RegisterProvidersFrom puts the provider back. A plugin whose FILES were deleted simply stops being
         // a candidate and drops out of the map, which is the right answer for an uninstall.
         var loaded = new HashSet<string>(
             host.Assemblies.Select(a => a.GetName().Name).Where(n => n != null)!,
@@ -328,14 +351,14 @@ public static class BackendRegistry
                     // Count what THIS assembly added, so "loaded" and "loaded but contributed nothing" are
                     // distinguishable. The second is the ordinary state of a plugin's private dependency and
                     // must not read as a failure.
-                    var before = new HashSet<IBackend>(map.Values);
-                    RegisterBackendsFrom(assembly, map, refuseCollisions: true);
+                    var before = new HashSet<IProvider>(map.Values);
+                    RegisterProvidersFrom(assembly, map, refuseCollisions: true);
                     var added = map.Values.Distinct().Where(b => !before.Contains(b)).Select(b => b.Name).ToArray();
                     report.Add(added.Length > 0
                         ? new PluginScanEntry(root, dll, PluginScanStatus.Loaded, string.Join(",", added),
                                               $"{added.Length} provider(s)")
                         : new PluginScanEntry(root, dll, PluginScanStatus.NoBackend, string.Empty,
-                                              "loaded, but declares no IBackend"));
+                                              "loaded, but declares no IProvider"));
                 }
                 catch (Exception ex)
                 {

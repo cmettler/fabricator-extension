@@ -1,7 +1,7 @@
 # name: test/verify_plugin_install.test
 # description: fabricator_install_plugin() — unpack a plugin archive into a plugin root and make its PROVIDER
 #              usable in the SAME session, while its global functions remain unreachable until next start.
-#              That asymmetry is the point of the suite: BackendRegistry.Invalidate() can reach a provider and
+#              That asymmetry is the point of the suite: ProviderRegistry.Invalidate() can reach a provider and
 #              structurally cannot reach a global function (loader.RegisterFunction is permitted only during
 #              Extension::Load(), DuckDB has no unload API, and GlobalFunctions' maps are Lazy<> per PROCESS).
 #              Needs FABRICATOR_PLUGIN_ZIP (built by Fabricator.SamplePlugin's PackPluginArchive target) and an
@@ -63,7 +63,7 @@ SELECT count(*) FROM fabricator_plugins() WHERE status NOT IN ('root', 'rejected
 0
 
 # ---- 2b A PLUGIN MAY NOT TAKE A FIRST-PARTY PROVIDER'S NAME --------------------------------------------
-# Fabricator.CollidingPlugin declares IBackend.Name = 'sqlserver'. BackendRegistry.Add is a plain dictionary
+# Fabricator.CollidingPlugin declares IProvider.Name = 'sqlserver'. ProviderRegistry.Add is a plain dictionary
 # assignment, so before this refusal such a plugin SILENTLY REPLACED the first-party provider and the scan
 # reported it as an ordinary `loaded` row -- every later ATTACH going somewhere the user never chose. Refusing
 # is the only one of the three options (report / refuse / allow-as-override) that cannot end in a wrong
@@ -96,13 +96,19 @@ SELECT count(*) FROM duckdb_settings() WHERE name = 'mssql_mars';
 statement ok
 SET fabricator_allow_plugin_install = true;
 
-# name/version come from the archive's manifest; files is the merged count (this archive ships one assembly
-# under any/); providers + activated are read back out of the FRESH scan, so the row distinguishes
-# "installed" from "installed and usable" rather than assuming them equal.
+# name/version come from the archive's manifest; files is the merged count; providers + activated are read
+# back out of the FRESH scan, so the row distinguishes "installed" from "installed and usable" rather than
+# assuming them equal.
+# ⚠ TWO files since 2026-09-02, and the second one is the point: the sample plugin gained a PRIVATE
+# DEPENDENCY (Fabricator.SamplePlugin.Support) so that something in-tree still proves a plugin's closure
+# both SHIPS IN THE ARCHIVE and is reachable after install — Fabricator.FluidPlugin used to be that proof
+# and stopped being a plugin. An archive carrying only the entry assembly installs CLEANLY and fails at the
+# first call, which is the silent shape this whole surface exists to remove; this count is what would catch
+# a payload rule that stopped including the closure.
 query IIIII
 SELECT name, version, files, providers, activated FROM fabricator_install_plugin('${FABRICATOR_PLUGIN_ZIP}');
 ----
-sampleplugin	1.0.0	1	sampleplugin	true
+sampleplugin	1.0.0	2	sampleplugin	true
 
 # platform and destination are machine-dependent, so they are asserted for SHAPE rather than value: the
 # platform is DuckDB's own (asked of the engine, never derived), and the destination is the version-stamped
@@ -118,7 +124,7 @@ true	true
 
 # ⚠ THE PROVIDER IS NOW RESOLVED. The error CHANGED — from "unknown provider" (the registry had no such
 # name) to the plugin's own refusal to open a catalog. Nothing but a re-discovery can produce that, so this
-# is the assertion BackendRegistry.Invalidate() exists for; a version that installed the files and left the
+# is the assertion ProviderRegistry.Invalidate() exists for; a version that installed the files and left the
 # memoized map alone would still say "unknown provider" here.
 statement error
 ATTACH 'ignored' AS px (TYPE fabricator, PROVIDER 'sampleplugin');

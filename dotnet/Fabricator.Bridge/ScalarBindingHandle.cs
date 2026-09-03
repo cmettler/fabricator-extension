@@ -9,7 +9,7 @@ namespace Fabricator.Bridge;
 /// <summary>
 /// A bound scalar call site as the host holds it: the <see cref="IScalarFunctionBinding"/> plus the
 /// <see cref="IScalarFunction"/> it came from. The <c>scalarfn_bind</c> handler builds one from the
-/// definition <see cref="IBackendCatalog.GetScalarFunction"/> (or the global registry) resolved and hands it
+/// definition <see cref="IProviderCatalog.GetScalarFunction"/> (or the global registry) resolved and hands it
 /// back as an opaque handle; <c>scalarfn_close</c> disposes it. INTERNAL — providers resolve definitions and
 /// never see this pairing (it left the provider contract when <c>ScalarFnBind</c> became
 /// <c>GetScalarFunction</c>).

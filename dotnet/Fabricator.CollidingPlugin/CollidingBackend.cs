@@ -8,7 +8,7 @@ namespace Fabricator.Bridge;
 /// A plugin backend that claims <c>sqlserver</c> — a name the first-party provider already owns.
 /// </summary>
 /// <remarks>
-/// <para>Its ONLY purpose is to be refused. <c>BackendRegistry.Add</c> is a plain dictionary assignment, so
+/// <para>Its ONLY purpose is to be refused. <c>ProviderRegistry.Add</c> is a plain dictionary assignment, so
 /// before 2026-08-18 this assembly would have SILENTLY REPLACED <c>Fabricator.SqlServer</c> in the registry
 /// and the scan would have reported it as an ordinary <c>loaded</c> row: every later
 /// <c>ATTACH … PROVIDER 'sqlserver'</c> would go somewhere the user never chose, with nothing anywhere saying
@@ -21,7 +21,7 @@ namespace Fabricator.Bridge;
 /// <para>It is deliberately NOT packaged as an installable archive. The scan refuses it wherever it is found,
 /// so pointing a plugin root at it is enough, and an archive would only add a second thing to keep in step.</para>
 /// </remarks>
-public sealed class CollidingBackend : IBackend
+public sealed class CollidingBackend : IProvider
 {
     /// <summary>The first-party SQL Server provider's name.</summary>
     public string Name => "sqlserver";
@@ -30,6 +30,6 @@ public sealed class CollidingBackend : IBackend
                                         string baseConnString) =>
         throw new NotSupportedException("colliding test fixture: never reached — registration is refused.");
 
-    public IBackendCatalog OpenCatalog(string connectionString, string optionsJson) =>
+    public IProviderCatalog OpenCatalog(string connectionString, string optionsJson) =>
         throw new NotSupportedException("colliding test fixture: never reached — registration is refused.");
 }

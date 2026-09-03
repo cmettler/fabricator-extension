@@ -60,7 +60,7 @@ public interface ITable
 /// <summary>
 /// A table BOUND to a transaction — the session where Schema/Info resolution and the scan live, and where
 /// ALL per-(table × transaction) state belongs (docs/catalog-table-abstraction.md §2.3). Replaces the
-/// (schema, table) name pair the <see cref="IBackendCatalog"/> surface passes on every member — the
+/// (schema, table) name pair the <see cref="IProviderCatalog"/> surface passes on every member — the
 /// name-pair-per-call convention is why nothing could hold state.
 /// </summary>
 /// <remarks>
@@ -125,7 +125,7 @@ public interface ITableBinding : IDisposable
     /// <summary>
     /// Scans the table. <paramref name="specJson"/> (null =&gt; SELECT *) + <paramref name="filterValues"/>
     /// carry projection + best-effort filter pushdown per EXECUTION, exactly as
-    /// <see cref="IBackendCatalog.ScanTable"/> — including the <c>schema_only</c> bind probe and, in the
+    /// <see cref="IProviderCatalog.ScanTable"/> — including the <c>schema_only</c> bind probe and, in the
     /// current transport, the AT clause (which for an AT-bound instance matches the binding's own).
     /// </summary>
     IArrowArrayStream Scan(string? specJson, IArrowArrayStream? filterValues);

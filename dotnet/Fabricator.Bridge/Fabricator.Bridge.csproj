@@ -23,7 +23,7 @@
          so the ~20 host types it uses — HostFs, BoundInput, HostBatchFilter, ParquetTuning, the ambients —
          stay `internal` rather than being made public just to cross a project file.
          Deliberately NARROW: this grants exactly one assembly, and only in this direction. Bridge does not
-         reference Fabricator.Delta and must not — BackendRegistry discovers the provider by assembly name.
+         reference Fabricator.Delta and must not — ProviderRegistry discovers the provider by assembly name.
          (It departs from the DeltaFunctions precedent, which was made `public` for Fabricator.DeltaRs; that
          was ONE type crossing to an opt-in provider, where widening the surface was cheaper than a grant.) -->
     <InternalsVisibleTo Include="Fabricator.Delta" />

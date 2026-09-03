@@ -20,7 +20,7 @@ namespace Fabricator.AnalysisServices;
 /// </list>
 /// See docs/dax-provider.md.
 /// </summary>
-public sealed class DaxBackend : IBackend
+public sealed class DaxBackend : IProvider
 {
     public string Name => "dax";
 
@@ -51,7 +51,7 @@ public sealed class DaxBackend : IBackend
         return baseConnString;
     }
 
-    public IBackendCatalog OpenCatalog(string connectionString, string optionsJson)
+    public IProviderCatalog OpenCatalog(string connectionString, string optionsJson)
     {
         // Split off any azure-secret credential marker (Fabric/AAS token auth) before resolving the target.
         var (connStr, credential) = DaxTokenAuth.Extract(connectionString);

@@ -1,6 +1,6 @@
 # name: test/verify_views_catalog.test
 # description: CATALOG-BOUND provider-declared DuckDB VIEWs (docs/macros-and-sqlgen-functions.md §5, ABI v77).
-#              The provider declares complete CREATE VIEW statements (IBackend.CatalogViews) which the host
+#              The provider declares complete CREATE VIEW statements (IProvider.CatalogViews) which the host
 #              parses and binds into the ATTACHed catalog's schemas, so each resolves as an ordinary RELATION
 #              db.schema.v — enumerable, describable, joinable, usable anywhere a table is.
 #

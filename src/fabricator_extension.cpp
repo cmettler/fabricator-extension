@@ -93,7 +93,7 @@ static void FabricatorVersionFunction(DataChunk &args, ExpressionState &state, V
 
 // -----------------------------------------------------------------------------
 // Provider-declared settings (see docs/settings-architecture.md). Each provider declares its settings in C#
-// (IBackend.Settings); we register them here as DuckDB extension options and push value changes back into
+// (IProvider.Settings); we register them here as DuckDB extension options and push value changes back into
 // the managed ProviderSettingsStore. DuckDB's set-callback carries no setting name, so we bind one callback
 // per slot (a compile-time trampoline array). The provider-agnostic core thus knows no setting names.
 // -----------------------------------------------------------------------------

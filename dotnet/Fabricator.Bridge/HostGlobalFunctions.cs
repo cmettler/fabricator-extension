@@ -15,8 +15,8 @@ namespace Fabricator.Bridge;
 /// Global functions contributed by the HOST itself rather than by a provider.
 /// </summary>
 /// <remarks>
-/// Every other global function comes from an <see cref="IBackend"/> — <see cref="GlobalFunctions"/> builds its
-/// maps by walking <see cref="BackendRegistry.All"/>. That is right for anything provider-shaped, and wrong
+/// Every other global function comes from an <see cref="IProvider"/> — <see cref="GlobalFunctions"/> builds its
+/// maps by walking <see cref="ProviderRegistry.All"/>. That is right for anything provider-shaped, and wrong
 /// for a diagnostic ABOUT the provider machinery: <c>fabricator_plugins()</c> has to answer "which providers
 /// were found, and why was this one not" — a question no single provider can answer, and which must still be
 /// answerable when the answer is "none of them loaded".
@@ -270,7 +270,7 @@ internal sealed class InstallPluginFunction : ITableFunction
 /// </summary>
 /// <remarks>
 /// It reports the RECORDED scan, never a fresh one: the scan happens once per process behind
-/// <see cref="BackendRegistry"/>'s memoized map, and re-running it would both lie about when it happened and
+/// <see cref="ProviderRegistry"/>'s memoized map, and re-running it would both lie about when it happened and
 /// risk loading assemblies a second time. By the time this is callable the scan has necessarily run —
 /// registering this very function enumerates the global functions, which walks the backend registry.
 /// </remarks>

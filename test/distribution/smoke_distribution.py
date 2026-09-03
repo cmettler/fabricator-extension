@@ -58,38 +58,40 @@ def test_fresh_install(duckdb, artifact: str) -> None:
             con.execute("select hilbert_index([1,2], 4), bucket(8, 'alice')").fetchone() == (7, 5),
             "the managed bridge booted and answers (zero configuration)",
         )
-        # The BUNDLED PLUGIN. pack-distribution.ps1 stages Fabricator.FluidPlugin under
-        # <managed>/plugins/fluid, which PluginPaths.BundledRelativeRoot makes a default search root - so
-        # this is the only thing that proves a shipped plugin is IN the artifact and gets discovered from it.
-        # /!\ ATTRIBUTED BY ROOT, not merely by the function working. This session sets no environment
-        # variables, so the per-user root (~/.duckdb/fabricator/plugins) is searched too; a developer who had
-        # installed the Fluid plugin there would make a bare "does fabricator_render work" check pass on an
-        # artifact that ships nothing. Requiring the loaded row's root to sit under THIS session's extension
-        # directory removes that reading.
-        fluid_root = con.execute(
-            "select root from fabricator_plugins() where status = 'loaded' and provider = 'fluid'"
+        # THE FLUID TEMPLATE ENGINE, which ships as a BUILT-IN provider assembly since 2026-09-02 --
+        # publish-managed.ps1 puts Fabricator.FluidPlugin in the managed directory and BackendRegistry
+        # discovers it by name, exactly like Fabricator.Delta.
+        #
+        # /!\ IT WAS A BUNDLED PLUGIN UNTIL THEN, and this check attributed it BY ROOT for a reason that
+        # still applies in its new form: this session sets no environment variables, so the per-user plugin
+        # root (~/.duckdb/fabricator/plugins) is searched too, and a developer who had INSTALLED Fluid there
+        # would make a bare "does fabricator_render work" check pass on an artifact shipping nothing. The
+        # root check is replaced by its exact counterpart for a built-in: Fluid must contribute NO plugin
+        # row at all. A copy loaded from a plugin root would show up here, and the render below would then
+        # be proving somebody's local install.
+        fluid_rows = con.execute(
+            "select status, root from fabricator_plugins() where provider = 'fluid'"
         ).fetchall()
         check(
-            len(fluid_root) == 1
-            and os.path.realpath(fluid_root[0][0]).startswith(os.path.realpath(extension_directory)),
-            "the bundled Fluid plugin shipped inside the artifact and loaded from it",
-            str(fluid_root),
+            len(fluid_rows) == 0,
+            "Fluid ships as a built-in provider, not as a plugin (no plugin row claims it)",
+            str(fluid_rows),
         )
         check(
-            con.execute("select fabricator_render('bundled {{ who }}', {'who': 'plugin'})").fetchone()[0]
-            == "bundled plugin",
-            "the bundled plugin renders (its private Fluid closure resolved from the plugin folder)",
+            con.execute("select fabricator_render('builtin {{ who }}', {'who': 'provider'})").fetchone()[0]
+            == "builtin provider",
+            "the built-in Fluid renders (its package closure shipped in the managed directory)",
         )
         # /!\ A SECOND REGISTRATION PATH, not a second spelling of the one above. fabricator_render arrives
         # through IBackend.GlobalScalarFunctions and is registered as a DuckDB scalar; fluid_query arrives
-        # through GlobalSqlTableFunctions and is registered as a bind_replace TABLE function. This plugin is
-        # the first shipped one to use the latter at all, so a packaging or registration fault that reached
+        # through GlobalSqlTableFunctions and is registered as a bind_replace TABLE function. Fluid is the
+        # only shipped provider using the latter at all, so a packaging or registration fault that reached
         # only the sqlgen path would leave the check above passing.
         check(
             con.execute(
                 "select * from fluid_query('select {{ n }} as n', params := {'n': 41})"
             ).fetchone()[0] == 41,
-            "the bundled plugin's SQL-generating table function binds and its generated SQL runs",
+            "the built-in Fluid's SQL-generating table function binds and its generated SQL runs",
         )
 
         loaded = [r[0] for r in con.execute(

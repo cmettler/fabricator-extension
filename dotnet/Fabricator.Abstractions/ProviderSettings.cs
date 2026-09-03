@@ -16,7 +16,7 @@ public enum ProviderSettingType
 }
 
 /// <summary>
-/// A setting a provider declares (see <see cref="IBackend.Settings"/>). The host registers each as a DuckDB
+/// A setting a provider declares (see <see cref="IProvider.Settings"/>). The host registers each as a DuckDB
 /// extension option at load (so <c>SET</c> / <c>duckdb_settings()</c> work), then pushes value changes back
 /// into <see cref="ProviderSettingsStore"/> so the provider reads them in C# — no per-method ABI params. See
 /// docs/settings-architecture.md.

@@ -10,7 +10,7 @@ namespace Fabricator.Bridge;
 
 /// <summary>
 /// A bound table-in-out call for the Phase 6 streaming exchange. Produced by
-/// <c>IBackendCatalog.InOutBind</c> (resolving cost args + the input-table schema) and consumed by the
+/// <c>IProviderCatalog.InOutBind</c> (resolving cost args + the input-table schema) and consumed by the
 /// framework pump (<see cref="InOutExchangeStream"/>). <see cref="OutputSchema"/> is the FULL output
 /// (input echo ++ the function's own columns). <see cref="DoExchange"/> is the streaming transform:
 /// <paramref name="input"/> yields one <see cref="RecordBatch"/> per DuckDB input chunk (ends at EOF), and
@@ -43,7 +43,7 @@ public interface IInOutIsolation
 /// each input chunk (cross-chunk state lives in DoExchange locals). Implement this directly when the output
 /// schema depends on the call's args; for a FIXED output schema derive from <see cref="StaticInOutFunction"/>
 /// (it supplies the <see cref="Bind"/> wiring — you still write DoExchange). Surfaced into the catalog as
-/// <c>kind='inout'</c> and resolved by <c>IBackendCatalog.InOutBind</c>.
+/// <c>kind='inout'</c> and resolved by <c>IProviderCatalog.InOutBind</c>.
 /// </summary>
 public interface IInOutFunction
 {

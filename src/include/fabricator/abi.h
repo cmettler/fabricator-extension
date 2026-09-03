@@ -825,7 +825,7 @@ typedef struct FabricatorVTable {
 	// catalog_init (ABI v78) — the provider's ONE chance to initialise with a live client context, called
 	// from LoadCatalog immediately after the ambients are established and BEFORE any discovery crossing.
 	// -------------------------------------------------------------------------
-	// Optional (a DIM no-op on IBackendCatalog): a provider that needs nothing implements nothing.
+	// Optional (a DIM no-op on IProviderCatalog): a provider that needs nothing implements nothing.
 	//
 	// ⚠ WHY IT EXISTS. open_catalog runs with NO ambients — no opener, no settings session — because it only
 	// CONSTRUCTS (that invariant is what makes the missing ambient safe; see fabricator_storage.cpp). So a

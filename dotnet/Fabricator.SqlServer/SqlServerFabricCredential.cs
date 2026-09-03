@@ -15,7 +15,7 @@ namespace Fabricator.SqlServer;
 /// (docs/fabric-api-functions.md §9h).
 /// </summary>
 /// <remarks>
-/// <para><b>Why a connection-string marker.</b> <c>IBackend.OpenCatalog</c> receives only the assembled
+/// <para><b>Why a connection-string marker.</b> <c>IProvider.OpenCatalog</c> receives only the assembled
 /// connection string, so secret fields are consumed by <see cref="SqlServerBackend.BuildConnectionString"/> and
 /// then lost. The same problem was already solved twice this way — <c>SqlServerCatalog.AccessTokenKeyword</c>
 /// here and <c>FabricatorDeltaCred</c> on the Delta side — so this reuses the proven shape rather than widening

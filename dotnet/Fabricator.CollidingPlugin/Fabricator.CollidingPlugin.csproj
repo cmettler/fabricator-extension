@@ -5,7 +5,7 @@
     <RootNamespace>Fabricator.Bridge</RootNamespace>
     <AssemblyName>Fabricator.CollidingPlugin</AssemblyName>
     <!--
-      A TEST FIXTURE, not a shipped plugin: an IBackend that deliberately claims a first-party provider name,
+      A TEST FIXTURE, not a shipped plugin: an IProvider that deliberately claims a first-party provider name,
       so verify_plugin_install can pin that the scan REFUSES it. Without a second assembly the refusal is
       unreachable from SQL — a provider name collision needs two assemblies claiming one name, and no
       manifest, root or install argument can manufacture that.
@@ -29,7 +29,7 @@
 
   <ItemGroup>
     <!-- Host-provided, exactly like a real plugin: binding to the RUNNING bridge's contract is what makes
-         this assembly's IBackend the same type the registry checks against. -->
+         this assembly's IProvider the same type the registry checks against. -->
     <ProjectReference Include="..\Fabricator.Abstractions\Fabricator.Abstractions.csproj" Private="false" />
   </ItemGroup>
 

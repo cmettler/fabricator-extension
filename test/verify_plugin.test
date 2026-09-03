@@ -1,6 +1,6 @@
 # name: test/verify_plugin.test
 # description: Third-party plugin SPI (no ALC isolation) — a plugin assembly dropped into an FABRICATOR_PLUGIN_DIR
-#              folder is discovered at load, its IBackend registered, and its connection-free GLOBAL functions
+#              folder is discovered at load, its IProvider registered, and its connection-free GLOBAL functions
 #              surfaced as bare fn(...) with NO ATTACH. Demo plugin: Fabricator.SamplePlugin's plug_greet.
 #              Set FABRICATOR_PLUGIN_DIR to the folder the sample plugin was built into. See docs/plugin-system.md.
 # group: [fabricator]
@@ -560,6 +560,53 @@ WHERE function_name IN ('plug_read_file', 'plug_glob_count') ORDER BY function_n
 ----
 plug_glob_count	BIGINT
 plug_read_file	VARCHAR
+
+# ============================================================================
+# A PLUGIN'S PRIVATE DEPENDENCY — the closure ships beside it and is reachable
+#
+# ⚠ WHAT THIS GUARDS IS MEASURED, NOT IMAGINED: a LIBRARY does not copy its dependency
+# closure to the output directory unless CopyLocalLockFileAssemblies is set. When
+# Fabricator.FluidPlugin was created its first build produced ONE assembly and nothing
+# else — it loaded fine and died at the first render with a FileNotFoundException naming
+# an assembly that was never copied.
+#
+# ⚠ Fluid was the ONLY in-tree plugin with a private dependency, and it became a built-in
+# provider assembly on 2026-09-02 — so without this fixture that coverage went to zero.
+# pack-distribution's "a bundled plugin must have more than one assembly" assertion went
+# with the bundling, too.
+#
+# ⚠ The marker comes from a METHOD in Fabricator.SamplePlugin.Support, not a const: C#
+# bakes a const into the CALLER's IL, so this would answer correctly with the support
+# assembly ABSENT and the assertion would prove nothing.
+# ============================================================================
+
+query I
+SELECT plug_support();
+----
+sample support present
+
+# ⚠ AND THE HOST SAW IT AS A CANDIDATE THAT DECLARES NO PROVIDER, which is what tells a
+# shipped dependency apart from a broken one: `no_backend` is the ORDINARY state of a
+# plugin's own dependency, where a closure that failed to resolve reports `rejected` with
+# the exception. Both halves matter — the row proves it was there, the value above proves
+# it was USED.
+query I
+SELECT count(*) FROM fabricator_plugins()
+WHERE status = 'no_backend' AND path LIKE '%Fabricator.SamplePlugin.Support.dll';
+----
+1
+
+# ... and it was not REJECTED, which is the state a dependency present but unloadable would
+# report. ⚠ SCOPED TO THIS ASSEMBLY on purpose: a blanket "nothing was rejected" asserts a
+# property of whatever else happens to be in the plugin directory, and a stale `publish/`
+# subdirectory holding a second copy of the plugin legitimately produces a rejected row
+# (a provider-name collision, correctly refused). That would make this assertion fail for
+# a reason it is not about.
+query I
+SELECT count(*) FROM fabricator_plugins()
+WHERE status = 'rejected' AND path LIKE '%Fabricator.SamplePlugin.Support.dll';
+----
+0
 
 # ============================================================================
 # IHostLog — a PLUGIN reaching DuckDB's own log (docs/plugin-services.md §10)

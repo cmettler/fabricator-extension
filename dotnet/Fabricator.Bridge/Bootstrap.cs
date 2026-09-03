@@ -195,7 +195,7 @@ public static unsafe class Bootstrap
             // The REQUESTED name is forwarded, not just used to resolve the backend: for the Delta backend the
             // name selects a default PROFILE ('delta' = native hybrid, 'engineeredwooddelta' = pure EW), so
             // dropping it here is what used to make that distinction unexpressible.
-            var catalog = BackendRegistry.Resolve(providerName)
+            var catalog = ProviderRegistry.Resolve(providerName)
                 .OpenCatalog(connStr, options, providerName ?? string.Empty);
             *outHandle = Handles.Alloc(catalog);
             return FabricatorStatus.Ok;
@@ -211,7 +211,7 @@ public static unsafe class Bootstrap
     private static void CloseCatalog(nint handle) => Handles.Free(handle);
 
     // v71: the catalog's capability doc — one flat JSON object of booleans (absent key = false), read once
-    // at ATTACH from LoadCatalog. The provider answers via IBackendCatalog.CapabilitiesJson (DIM "{}"), so a
+    // at ATTACH from LoadCatalog. The provider answers via IProviderCatalog.CapabilitiesJson (DIM "{}"), so a
     // provider with nothing to assert declares nothing. Replaces the host's grep of the diagnostic kind-7
     // (property, value) stream; that stream stays, as the fabricator_server_info() diagnostic only.
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
@@ -223,7 +223,7 @@ public static unsafe class Bootstrap
             {
                 return FabricatorStatus.InvalidArgument;
             }
-            var catalog = Handles.Resolve<IBackendCatalog>(handle)
+            var catalog = Handles.Resolve<IProviderCatalog>(handle)
                           ?? throw new InvalidOperationException("get_capabilities: invalid catalog handle");
             *outJson = (byte*)Marshal.StringToCoTaskMemUTF8(catalog.CapabilitiesJson); // host frees via free_error
             return FabricatorStatus.Ok;
@@ -244,8 +244,8 @@ public static unsafe class Bootstrap
             {
                 return FabricatorStatus.InvalidArgument;
             }
-            var catalog = Handles.Resolve<IBackendCatalog>(handle)
-                          ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
+            var catalog = Handles.Resolve<IProviderCatalog>(handle)
+                          ?? ProviderRegistry.Active.OpenCatalog(string.Empty, string.Empty);
             var query = Marshal.PtrToStringUTF8((nint)sql) ?? string.Empty;
 
             // ⚠ DESCRIBE-THEN-EXECUTE, and it is a FIX rather than an optimisation. The host's bind-time
@@ -307,8 +307,8 @@ public static unsafe class Bootstrap
     {
         try
         {
-            var catalog = Handles.Resolve<IBackendCatalog>(handle)
-                          ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
+            var catalog = Handles.Resolve<IProviderCatalog>(handle)
+                          ?? ProviderRegistry.Active.OpenCatalog(string.Empty, string.Empty);
             var statement = Marshal.PtrToStringUTF8((nint)sql) ?? string.Empty;
             // DDL detection lives here (C#); the host invalidates its catalog cache
             // when this is set (and the mssql_exec_invalidate_cache setting is on).
@@ -340,8 +340,8 @@ public static unsafe class Bootstrap
             {
                 return FabricatorStatus.InvalidArgument;
             }
-            var catalog = Handles.Resolve<IBackendCatalog>(handle)
-                          ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
+            var catalog = Handles.Resolve<IProviderCatalog>(handle)
+                          ?? ProviderRegistry.Active.OpenCatalog(string.Empty, string.Empty);
             var schemaName = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
             var tableName = Marshal.PtrToStringUTF8((nint)table) ?? string.Empty;
 
@@ -374,8 +374,8 @@ public static unsafe class Bootstrap
             {
                 return FabricatorStatus.InvalidArgument;
             }
-            var catalog = Handles.Resolve<IBackendCatalog>(handle)
-                          ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
+            var catalog = Handles.Resolve<IProviderCatalog>(handle)
+                          ?? ProviderRegistry.Active.OpenCatalog(string.Empty, string.Empty);
             var schemaName = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
             var tableName = Marshal.PtrToStringUTF8((nint)table) ?? string.Empty;
             var stream = CArrowArrayStreamImporter.ImportArrayStream(keys);
@@ -403,8 +403,8 @@ public static unsafe class Bootstrap
             {
                 return FabricatorStatus.InvalidArgument;
             }
-            var catalog = Handles.Resolve<IBackendCatalog>(handle)
-                          ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
+            var catalog = Handles.Resolve<IProviderCatalog>(handle)
+                          ?? ProviderRegistry.Active.OpenCatalog(string.Empty, string.Empty);
             var schemaName = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
             var tableName = Marshal.PtrToStringUTF8((nint)table) ?? string.Empty;
             var stream = CArrowArrayStreamImporter.ImportArrayStream(data);
@@ -427,7 +427,7 @@ public static unsafe class Bootstrap
     /// <summary>Shared body of the five catalog_* discovery exports: resolve the catalog, export the
     /// member's stream.</summary>
     private static int CatalogList(nint handle, CArrowArrayStream* outStream, byte** err, string what,
-                                   Func<IBackendCatalog, IArrowArrayStream> member)
+                                   Func<IProviderCatalog, IArrowArrayStream> member)
     {
         try
         {
@@ -435,8 +435,8 @@ public static unsafe class Bootstrap
             {
                 return FabricatorStatus.InvalidArgument;
             }
-            var catalog = Handles.Resolve<IBackendCatalog>(handle)
-                          ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
+            var catalog = Handles.Resolve<IProviderCatalog>(handle)
+                          ?? ProviderRegistry.Active.OpenCatalog(string.Empty, string.Empty);
             BridgeLog.LogDebug("abi {What}", what);
             CArrowArrayStreamExporter.ExportArrayStream(member(catalog), outStream);
             return FabricatorStatus.Ok;
@@ -472,7 +472,7 @@ public static unsafe class Bootstrap
     {
         try
         {
-            var catalog = Handles.Resolve<IBackendCatalog>(handle);
+            var catalog = Handles.Resolve<IProviderCatalog>(handle);
             if (catalog is null)
             {
                 // ⚠ Deliberately NOT the CatalogList fallback of opening a fresh catalog: initialising a
@@ -512,8 +512,8 @@ public static unsafe class Bootstrap
             {
                 return FabricatorStatus.InvalidArgument;
             }
-            var catalog = Handles.Resolve<IBackendCatalog>(handle)
-                          ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
+            var catalog = Handles.Resolve<IProviderCatalog>(handle)
+                          ?? ProviderRegistry.Active.OpenCatalog(string.Empty, string.Empty);
             var schemaName = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
             var tableName = Marshal.PtrToStringUTF8((nint)table) ?? string.Empty;
             var unit = Marshal.PtrToStringUTF8((nint)atUnit);
@@ -677,8 +677,8 @@ public static unsafe class Bootstrap
             {
                 return FabricatorStatus.InvalidArgument;
             }
-            var catalog = Handles.Resolve<IBackendCatalog>(handle)
-                          ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
+            var catalog = Handles.Resolve<IProviderCatalog>(handle)
+                          ?? ProviderRegistry.Active.OpenCatalog(string.Empty, string.Empty);
             var schemaName = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
             var tableName = Marshal.PtrToStringUTF8((nint)table) ?? string.Empty;
             var pk = Marshal.PtrToStringUTF8((nint)pkColumns);
@@ -708,8 +708,8 @@ public static unsafe class Bootstrap
     {
         try
         {
-            var catalog = Handles.Resolve<IBackendCatalog>(handle)
-                          ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
+            var catalog = Handles.Resolve<IProviderCatalog>(handle)
+                          ?? ProviderRegistry.Active.OpenCatalog(string.Empty, string.Empty);
             var schemaName = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
             var tableName = Marshal.PtrToStringUTF8((nint)table) ?? string.Empty;
             catalog.DropTable(schemaName, tableName, ifExists != 0);
@@ -727,8 +727,8 @@ public static unsafe class Bootstrap
     {
         try
         {
-            var catalog = Handles.Resolve<IBackendCatalog>(handle)
-                          ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
+            var catalog = Handles.Resolve<IProviderCatalog>(handle)
+                          ?? ProviderRegistry.Active.OpenCatalog(string.Empty, string.Empty);
             var schemaName = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
             catalog.CreateSchema(schemaName, ifNotExists != 0);
             return FabricatorStatus.Ok;
@@ -745,8 +745,8 @@ public static unsafe class Bootstrap
     {
         try
         {
-            var catalog = Handles.Resolve<IBackendCatalog>(handle)
-                          ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
+            var catalog = Handles.Resolve<IProviderCatalog>(handle)
+                          ?? ProviderRegistry.Active.OpenCatalog(string.Empty, string.Empty);
             var schemaName = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
             catalog.DropSchema(schemaName, ifExists != 0);
             return FabricatorStatus.Ok;
@@ -768,8 +768,8 @@ public static unsafe class Bootstrap
             {
                 return FabricatorStatus.InvalidArgument;
             }
-            var catalog = Handles.Resolve<IBackendCatalog>(handle)
-                          ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
+            var catalog = Handles.Resolve<IProviderCatalog>(handle)
+                          ?? ProviderRegistry.Active.OpenCatalog(string.Empty, string.Empty);
             var schemaName = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
             var tableName = Marshal.PtrToStringUTF8((nint)table) ?? string.Empty;
 
@@ -1035,7 +1035,7 @@ public static unsafe class Bootstrap
             var f = Marshal.PtrToStringUTF8((nint)func) ?? string.Empty;
             string sql = handle == 0
                 ? GlobalFunctions.GenerateTableSql(f, argsBatch)
-                : (Handles.Resolve<IBackendCatalog>(handle)
+                : (Handles.Resolve<IProviderCatalog>(handle)
                    ?? throw new InvalidOperationException(
                        $"fabricator: generate_table_sql got a stale catalog handle for '{f}'"))
                     .GenerateTableSql(Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty, f,
@@ -1120,8 +1120,8 @@ public static unsafe class Bootstrap
             // Take ownership of the C schema (materialized into a managed Schema; the
             // C struct is released by the importer).
             var arrowSchema = CArrowSchemaImporter.ImportSchema(schemaIn);
-            var catalog = Handles.Resolve<IBackendCatalog>(handle)
-                          ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
+            var catalog = Handles.Resolve<IProviderCatalog>(handle)
+                          ?? ProviderRegistry.Active.OpenCatalog(string.Empty, string.Empty);
             var schemaName = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
             var tableName = Marshal.PtrToStringUTF8((nint)table) ?? string.Empty;
             var partition = SplitColumnList(Marshal.PtrToStringUTF8((nint)partitionColumns));
@@ -1209,7 +1209,7 @@ public static unsafe class Bootstrap
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
     private static int RollbackTransaction(nint handle, byte** err) => RunTransactionOp(handle, c => c.RollbackTransaction(), err);
 
-    private static int RunTransactionOp(nint handle, Action<IBackendCatalog> op, byte** err)
+    private static int RunTransactionOp(nint handle, Action<IProviderCatalog> op, byte** err)
     {
         try
         {
@@ -1217,7 +1217,7 @@ public static unsafe class Bootstrap
             // handle (GCHandle slots are reused after a DETACH frees them, so the old value may resolve to an
             // arbitrary unrelated object) — surface it as the diagnostic it is instead of opening a nonsense
             // default catalog with an empty connection string.
-            var catalog = Handles.Resolve<IBackendCatalog>(handle)
+            var catalog = Handles.Resolve<IProviderCatalog>(handle)
                           ?? throw new InvalidOperationException(
                               $"Fabricator: transaction op on a stale/unknown catalog handle 0x{handle:x} "
                               + $"(resolves to: {Handles.Resolve<object>(handle)?.GetType().FullName ?? "<freed>"})");
@@ -1249,7 +1249,7 @@ public static unsafe class Bootstrap
                          ?? new Dictionary<string, string>();
             // Case-insensitive: secret field names may be stored lower-cased (ours) or differ by provider (azure).
             var fields = new Dictionary<string, string>(parsed, StringComparer.OrdinalIgnoreCase);
-            var connStr = BackendRegistry.Resolve(providerName).BuildConnectionString(type, fields, baseConn);
+            var connStr = ProviderRegistry.Resolve(providerName).BuildConnectionString(type, fields, baseConn);
             *outConnStr = (byte*)Marshal.StringToCoTaskMemUTF8(connStr);
             return FabricatorStatus.Ok;
         }
@@ -1280,7 +1280,7 @@ public static unsafe class Bootstrap
                 ArrowSchemaExport.Export(GlobalFunctions.ParamSchema(f), outSchema);
                 return FabricatorStatus.Ok;
             }
-            var catalog = Handles.Resolve<IBackendCatalog>(handle) ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
+            var catalog = Handles.Resolve<IProviderCatalog>(handle) ?? ProviderRegistry.Active.OpenCatalog(string.Empty, string.Empty);
             var s = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
             ArrowSchemaExport.Export(catalog.GetFunctionParamSchema(s, f), outSchema);
             return FabricatorStatus.Ok;
@@ -1308,7 +1308,7 @@ public static unsafe class Bootstrap
                 CArrowSchemaExporter.ExportSchema(new Schema(new[] { GlobalFunctions.ReturnField(f) }, null), outSchema);
                 return FabricatorStatus.Ok;
             }
-            var catalog = Handles.Resolve<IBackendCatalog>(handle) ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
+            var catalog = Handles.Resolve<IProviderCatalog>(handle) ?? ProviderRegistry.Active.OpenCatalog(string.Empty, string.Empty);
             var s = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
             CArrowSchemaExporter.ExportSchema(catalog.GetFunctionReturnSchema(s, f), outSchema);
             return FabricatorStatus.Ok;
@@ -1363,7 +1363,7 @@ public static unsafe class Bootstrap
             // when unregistered, so only the catalog branch can answer null).
             var fn = handle == 0
                 ? GlobalFunctions.ResolveScalar(f)
-                : (Handles.Resolve<IBackendCatalog>(handle) ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty))
+                : (Handles.Resolve<IProviderCatalog>(handle) ?? ProviderRegistry.Active.OpenCatalog(string.Empty, string.Empty))
                       .GetScalarFunction(schemaName, f)
                   ?? throw new NotSupportedException(
                       $"fabricator: no scalar function '{schemaName}.{f}' in this catalog");
@@ -1438,7 +1438,7 @@ public static unsafe class Bootstrap
             {
                 return FabricatorStatus.InvalidArgument;
             }
-            var catalog = Handles.Resolve<IBackendCatalog>(handle) ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty);
+            var catalog = Handles.Resolve<IProviderCatalog>(handle) ?? ProviderRegistry.Active.OpenCatalog(string.Empty, string.Empty);
             var s = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
             var f = Marshal.PtrToStringUTF8((nint)func) ?? string.Empty;
             // `args` (nullable) is a 1-row stream of the constant call args — a custom table function's output
@@ -1488,7 +1488,7 @@ public static unsafe class Bootstrap
             // name (a collector is wrapped as an IInOutFunctionBinding). Else the catalog path.
             var binding = handle == 0
                 ? GlobalFunctions.ResolveInOut(f, argsBatch, inSchema)
-                : (Handles.Resolve<IBackendCatalog>(handle) ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty))
+                : (Handles.Resolve<IProviderCatalog>(handle) ?? ProviderRegistry.Active.OpenCatalog(string.Empty, string.Empty))
                     .InOutBind(Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty, f, argsBatch, inSchema);
             // Export the binding's full output schema as a zero-row stream so the host can read return types.
             CArrowArrayStreamExporter.ExportArrayStream(
@@ -1572,7 +1572,7 @@ public static unsafe class Bootstrap
             var f = Marshal.PtrToStringUTF8((nint)func) ?? string.Empty;
             var binding = handle == 0
                 ? GlobalFunctions.ResolveLateral(f, argsBatch, inSchema)
-                : (Handles.Resolve<IBackendCatalog>(handle) ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty))
+                : (Handles.Resolve<IProviderCatalog>(handle) ?? ProviderRegistry.Active.OpenCatalog(string.Empty, string.Empty))
                     .LateralBind(Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty, f, argsBatch, inSchema);
             var bound = new LateralBindingHandle(binding, f, inSchema);
             // The host binds its RETURN TYPES from this: the function's own columns, WITHOUT the provenance
@@ -1693,7 +1693,7 @@ public static unsafe class Bootstrap
             // handle == 0 => a connection-free GLOBAL table function: resolve from the global registry by name.
             var bound = handle == 0
                 ? GlobalFunctions.ResolveTable(f, argsBatch)
-                : (Handles.Resolve<IBackendCatalog>(handle) ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty))
+                : (Handles.Resolve<IProviderCatalog>(handle) ?? ProviderRegistry.Active.OpenCatalog(string.Empty, string.Empty))
                     .TableFnBind(Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty, f, argsBatch);
             // Export the binding's output schema as a zero-row stream so the host can read return types.
             CArrowArrayStreamExporter.ExportArrayStream(
@@ -1812,7 +1812,7 @@ public static unsafe class Bootstrap
             {
                 Emit(HostSettings.Provider, s);
             }
-            foreach (var backend in BackendRegistry.All())
+            foreach (var backend in ProviderRegistry.All())
             {
                 foreach (var s in backend.Settings)
                 {
@@ -1999,7 +1999,7 @@ public static unsafe class Bootstrap
             var type = new StringArray.Builder();
             var redact = new StringArray.Builder();
             int rows = 0;
-            foreach (var backend in BackendRegistry.All())
+            foreach (var backend in ProviderRegistry.All())
             {
                 if (string.IsNullOrEmpty(backend.SecretType))
                 {
@@ -2127,7 +2127,7 @@ public static unsafe class Bootstrap
             // handle == 0 => a connection-free GLOBAL aggregate: open a session from the global registry by name.
             var session = handle == 0
                 ? GlobalFunctions.ResolveAggregate(f)
-                : (Handles.Resolve<IBackendCatalog>(handle) ?? BackendRegistry.Active.OpenCatalog(string.Empty, string.Empty))
+                : (Handles.Resolve<IProviderCatalog>(handle) ?? ProviderRegistry.Active.OpenCatalog(string.Empty, string.Empty))
                     .AggOpen(Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty, f);
             *outSession = Handles.Alloc(session);
             return FabricatorStatus.Ok;

@@ -13,7 +13,7 @@ namespace Fabricator.Bridge;
 /// 3-row table for any query, proving the C++ -> CoreCLR -> Arrow -> DuckDB
 /// round-trip end to end without a real database.
 /// </summary>
-public sealed class StubBackend : IBackend
+public sealed class StubBackend : IProvider
 {
     public string Name => "stub";
 
@@ -21,9 +21,9 @@ public sealed class StubBackend : IBackend
     public string BuildConnectionString(string secretType, IReadOnlyDictionary<string, string> fields,
                                         string baseConnString) => "stub";
 
-    public IBackendCatalog OpenCatalog(string connectionString, string optionsJson) => new StubCatalog();
+    public IProviderCatalog OpenCatalog(string connectionString, string optionsJson) => new StubCatalog();
 
-    private sealed class StubCatalog : IBackendCatalog
+    private sealed class StubCatalog : IProviderCatalog
     {
         private static Schema ScanSchema() =>
             new Schema.Builder()

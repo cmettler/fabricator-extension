@@ -8,51 +8,65 @@
 
 require fabricator
 
-# ⚠ THE SUITE RUNNER POINTS THIS AT build/plugins/fluid AND NOTHING ELSE. It must NOT be the tier's normal
-# plugin root: that root holds Fabricator.SamplePlugin, and a second loaded plugin would make the "exactly one
-# provider" assertion below say nothing. Build the fixture with:
-#   dotnet build dotnet/Fabricator.FluidPlugin -c Release
-require-env FABRICATOR_PLUGIN_DIR
-
 # ⚠ A per-suite scratch DIRECTORY, used only by the slice-4 section at the foot of this file: it writes a
 # small template library with COPY and points fluid_template_root at it. The name says delta because that
 # is what the runner has always called its scratch dir; nothing Delta is involved.
 require-env FABRICATOR_DELTA_WRITE_DIR
 
 # ============================================================================================
-# THE PLUGIN LOADED — and this is the assertion the whole file rests on, because every render below is
-# vacuous if the function came from somewhere else.
+# FLUID IS A BUILT-IN PROVIDER, NOT A PLUGIN (since 2026-09-02)
+#
+# ⚠ THIS SUITE USED TO NEED ITS OWN PLUGIN ROOT, and the runner gave it `build/plugins/fluid` and nothing
+# else so that "exactly one loaded provider" meant something. Fluid is now published into the managed
+# directory and discovered by name from ProviderRegistry's FABRICATOR_BACKEND_ASSEMBLY list, like
+# Fabricator.Delta — so the suite needs no plugin root at all, which is what moved it to the HERMETIC tier
+# and gained it macOS and Windows coverage. That matters here more than usual: the temporal assertions
+# below read TimeZoneInfo.Local, and the renders-the-previous-day bug was a local-timezone bug.
+#
+# ⚠ WHAT MOVED IT WAS A FOOTGUN, not tidiness: FABRICATOR_PLUGIN_DIR REPLACES the plugin roots rather than
+# extending them, so a user pointing it at their OWN plugin silently lost fabricator_render — and the
+# bundled root's only occupant was the one capability documented as available out of the box.
 # ============================================================================================
 
-query TT
-SELECT status, provider FROM fabricator_plugins() WHERE status = 'loaded';
-----
-loaded	fluid
-
-# ⚠ NOTHING was rejected. A plugin whose private dependency failed to resolve reports `rejected` with the
-# exception, NOT a missing function — so without this a broken closure would surface further down as a
-# confusing render failure rather than as what it is.
+# ⚠ THE ASSERTION THAT PINS THE MOVE, and no render below can see it: Fluid contributes NO plugin row.
+# Before the move this read `loaded | fluid`; a build that quietly went back to bundling it would pass every
+# other assertion in this file.
 query I
-SELECT count(*) FROM fabricator_plugins() WHERE status = 'rejected';
+SELECT count(*) FROM fabricator_plugins() WHERE provider = 'fluid';
 ----
 0
 
+# ⚠ ... and its functions are here ANYWAY, which is the other half of the same claim. One registration each:
+# a build that both bundled AND published it would register twice, and every render below would still pass.
+query II
+SELECT function_name, count(*) FROM duckdb_functions()
+WHERE function_name IN ('fabricator_render', 'fluid_query') GROUP BY 1 ORDER BY 1;
+----
+fabricator_render	1
+fluid_query	1
+
 # ============================================================================================
-# THE PRIVATE NuGet CLOSURE — the property Fabricator.SamplePlugin cannot test
+# IT IS A PROVIDER THAT HOSTS NO CATALOG
 #
-# ⚠ Fabricator.SamplePlugin is pure IL with no third-party package, so until this plugin existed NOTHING
-# exercised BackendRegistry.InstallPluginResolver actually loading a plugin's own dependencies out of the
-# plugin folder. Fluid.Core 3.0.0-beta.7 pulls SIX assemblies (Fluid, Parlot, TimeZoneConverter,
-# System.Linq.Async and two Microsoft.Extensions.*), and since the move they are NOT in the bridge payload —
-# so any successful render below IS the closure resolving. That is why the first render is stated as a
-# property, not just a value.
-#
-# ⚠ The pin is a PRERELEASE (v3.0 has no stable package yet), so a bump here is a code-compatibility
-# question rather than a routine one — this suite is what answers it. Moving 2.31.0 -> 3.0.0-beta.7 already
-# changed one annotation under us; see the NULL-value section below.
+# ⚠ IProvider is the ONLY surface that can contribute a global function, so a template engine has to present
+# as a provider and then implement OpenCatalog as a throw. HostsCatalog=false is what lets the REGISTRY
+# refuse by name instead: without it this same ATTACH failed inside OpenCatalog and the host reported it as
+# "MSSQL connection validation failed: {…}" — a connection error naming the wrong subsystem entirely.
 # ============================================================================================
 
-# Basic render: Liquid substitution from a JSON params bag. Reaching Fluid at all proves the resolver worked.
+statement error
+ATTACH 'x' AS f (TYPE fabricator, PROVIDER 'fluid');
+----
+hosts no catalog
+
+# The POSITIVE CONTROL: an attachable provider still resolves. Without it the refusal above is equally
+# satisfied by a build where PROVIDER resolution had stopped working altogether.
+statement error
+ATTACH 'x' AS f (TYPE fabricator, PROVIDER 'nosuchprovider');
+----
+unknown provider
+
+# Basic render: Liquid substitution from a JSON params bag.
 query I
 SELECT fabricator_render('Hello {{ name }}, you have {{ n }} messages', '{"name":"world","n":3}');
 ----

@@ -25,7 +25,7 @@
     <ProjectReference Include="..\Fabricator.Abstractions\Fabricator.Abstractions.csproj" />
     <!-- The host: the ABI, the Arrow interop, the function machinery, HostFs (DuckDB's FileSystem over the
          reverse callbacks) and the onelake:// VFS forwarder. The dependency is one-way — Bridge does NOT
-         reference this project; BackendRegistry discovers DeltaBackend by assembly name, exactly as it
+         reference this project; ProviderRegistry discovers DeltaBackend by assembly name, exactly as it
          already does for the SqlServer and AnalysisServices providers. -->
     <ProjectReference Include="..\Fabricator.Bridge\Fabricator.Bridge.csproj" />
   </ItemGroup>

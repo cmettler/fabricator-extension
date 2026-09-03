@@ -162,7 +162,12 @@ case "$TIER" in
         # execution paths. Hermetic because the demos are GLOBAL functions: no ATTACH, no connection, so the
         # host machinery (the optimizer rewrite, the operator, the provenance contract) is provable without a
         # server. The catalog-bound half rides verify_functions in the service tier.
-        : "${MIN_SUITES:=74}"
+        # 75 since 2026-09-02: verify_plugin_fluid moved here from the service tier. It is not a NEW
+        # suite -- Fluid became a BUILT-IN provider assembly rather than a bundled plugin, so it needs no
+        # plugin root, and the derived lists reclassified it on their own. The service tier loses the same
+        # run. Its 234 assertions now run on all THREE platforms instead of linux-only, which matters here
+        # more than usual: its temporal assertions read TimeZoneInfo.Local.
+        : "${MIN_SUITES:=75}"
         # 5656 since 2026-08-02: verify_delta_catalog_transactions 943 -> 944 Ã¢ÂÂ ROLLBACK now RECLAIMS the
         # data files the transaction eagerly wrote (EW #52's DiscardDataFilesAsync) instead of leaving them
         # for VACUUM. +2, not +1: that suite is one of the DOUBLED ones below, so an assertion added to it
@@ -439,7 +444,13 @@ case "$TIER" in
         # in that section is load-bearing and a mutant proved it: an earlier `USE memory.hq_s` leaves a
         # qualified entry, against which the bug does not fire, so the section PASSED with it fully present.
         # 8250 + 9 = 8259 exactly, from a green run.
-        : "${MIN_ASSERTIONS:=8259}"
+        # 8497 since 2026-09-02: 8259 + verify_plugin_fluid's 238, moved in from the service tier with Fluid
+        # becoming a built-in. The suite went 234 -> 238 in the same change: its two plugin-row assertions
+        # ("loaded | fluid", nothing rejected) became a pair saying Fluid contributes NO plugin row and its
+        # two functions have exactly ONE registration each, plus the HostsCatalog refusal and its
+        # unknown-provider control. 3105 + 238 + 8259 - 3339 arithmetic aside, both numbers come from green
+        # runs.
+        : "${MIN_ASSERTIONS:=8497}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh
@@ -487,7 +498,10 @@ case "$TIER" in
         # runs on demand -- FABRICATOR_RUN_SESSION_TAG=1 unittest --test-dir . test/verify_session_tag.test.
         # Deleting that one require-env line puts it back.
         # 54 since 2026-09-01: + verify_plugin_fluid (the Fluid/Liquid template engine as a plugin).
-        : "${MIN_SUITES:=54}"
+        # 53 since 2026-09-02: verify_plugin_fluid LEFT for the hermetic tier (Fluid is a built-in
+        # provider assembly now, so it needs no plugin root). A DOWNWARD bump -- the run moved, it was not
+        # lost.
+        : "${MIN_SUITES:=53}"
         # 1424 since 2026-08-01: verify_exec_invalidate_cache 10 -> 21, for the OUT-OF-BAND DROP path Ã¢ÂÂ the
         # catalog's self-heal, documented in CLAUDE.md and until now covered by NOTHING. The service tier ran
         # 44/44 green while that path was broken, which is why the section exists. It must run with
@@ -814,7 +828,12 @@ case "$TIER" in
         # the indirection was unnecessary (MEL parses the format only when the argument array is non-empty).
         # The code was simplified to match the measurement rather than the theory.
         # 3318 + 21 = 3339 exactly, from a green run, which is what shows no other suite moved.
-        : "${MIN_ASSERTIONS:=3339}"
+        # 3105 since 2026-09-02: 3339 - verify_plugin_fluid's 234, which moved to the hermetic tier with
+        # Fluid becoming a built-in. A DOWNWARD bump for a suite that MOVED, not one that shrank.
+        # ... and +3 on verify_plugin (133 -> 136) for the closure fixture that replaces what Fluid used to
+        # prove: the sample plugin now has a PRIVATE DEPENDENCY, so a plugin's own assembly shipping beside
+        # it and being reachable is still gated somewhere. 3339 - 234 + 3 = 3108.
+        : "${MIN_ASSERTIONS:=3108}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2
@@ -1042,16 +1061,11 @@ while IFS="$(printf '\t')" read -r suite provider batchrows; do
     # The restore is an unconditional else-arm rather than an unset, because every OTHER suite in the tier
     # - verify_plugin above all - needs the real directory.
     case "$suite" in
-        *verify_plugin_fluid.test)
-            # The Fluid plugin ALONE, and the "alone" is the assertion. The suite pins that exactly ONE
-            # provider is loaded and that fabricator_render has exactly ONE registration -- both of which say
-            # nothing if the tier's normal root (Fabricator.SamplePlugin) is also in scope. A FIXED path with
-            # no TFM and no RID in it, because the plugin's csproj sets OutputPath; RELATIVE for the same
-            # reason as the collide fixture below (an MSYS $PWD becomes a path under D:\d on the managed
-            # side, which reports as root_missing rather than failing).
-            # Build it with: dotnet build dotnet/Fabricator.FluidPlugin -c Release
-            export FABRICATOR_PLUGIN_DIR="build/plugins/fluid"
-            ;;
+        # /!\ verify_plugin_fluid USED TO BE HERE, given `build/plugins/fluid` and nothing else so that its
+        # "exactly one loaded provider" assertion meant something. Fluid became a BUILT-IN provider assembly
+        # on 2026-09-02 (published into the managed dir, discovered by name), so it needs no plugin root and
+        # moved to the HERMETIC tier -- which the derived suite lists picked up on their own, since they
+        # classify by the require-env directives a suite declares.
         *verify_plugin_install.test)
             # TWO roots: an empty one to install into, plus the COLLIDING TEST FIXTURE
             # (dotnet/Fabricator.CollidingPlugin, an IBackend claiming the first-party name 'sqlserver').

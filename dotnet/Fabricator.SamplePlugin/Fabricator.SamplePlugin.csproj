@@ -5,7 +5,7 @@
     <RootNamespace>Fabricator.SamplePlugin</RootNamespace>
     <AssemblyName>Fabricator.SamplePlugin</AssemblyName>
     <Description>
-      A sample THIRD-PARTY plugin for the fabricator bridge: a connection-free IBackend that contributes
+      A sample THIRD-PARTY plugin for the fabricator bridge: a connection-free IProvider that contributes
       global scalar functions (plug_greet, and plug_sleep — a test instrument that makes a query cost exactly
       what the caller asks for). Built to a folder and discovered via FABRICATOR_PLUGIN_DIR; it
       references Fabricator.Bridge + Apache.Arrow as HOST-PROVIDED (Private=false, not copied), so at runtime
@@ -18,6 +18,15 @@
          — host-provided, NOT copied (the loaded bridge supplies them). This is the minimal, stable plugin
          surface the Abstractions split enables. -->
     <ProjectReference Include="..\Fabricator.Abstractions\Fabricator.Abstractions.csproj" Private="false" />
+
+    <!-- ⚠ A PRIVATE DEPENDENCY, and the ONE reference here that IS copied (no Private="false"). It exists so
+         something in-tree still proves a plugin's own closure ships beside it and is available at runtime.
+         Fabricator.FluidPlugin used to be that proof and stopped being a plugin on 2026-09-02; the failure
+         guarded is measured — a library does not copy its closure without CopyLocalLockFileAssemblies, and
+         Fluid's first build produced one DLL and died at the first render.
+         ⚠ It must stay REACHED, not merely referenced: plug_support() calls into it, and verify_plugin
+         asserts the value. A reference nothing calls is one "remove unused references" pass from gone. -->
+    <ProjectReference Include="..\Fabricator.SamplePlugin.Support\Fabricator.SamplePlugin.Support.csproj" />
   </ItemGroup>
 
   <!--
@@ -44,7 +53,16 @@
     </PropertyGroup>
     <RemoveDir Directories="$(PluginStageDir)" />
     <MakeDir Directories="$(PluginStageDir)any" />
-    <Copy SourceFiles="$(OutputPath)$(AssemblyName).dll" DestinationFolder="$(PluginStageDir)any" />
+    <!-- ⚠ THE CLOSURE, NOT JUST THE ENTRY ASSEMBLY. This copied one hard-coded file until the plugin gained
+         a private dependency; an archive carrying only the entry assembly INSTALLS CLEANLY and then fails at
+         the first call, which is the silent shape the whole install surface exists to remove. Computed from
+         ReferenceCopyLocalPaths rather than listed by hand, for the same reason the Fluid archive was: a
+         hard-coded list stops shipping something the day the reference graph changes. -->
+    <ItemGroup>
+      <PluginPayload Include="$(OutputPath)$(AssemblyName).dll" />
+      <PluginPayload Include="@(ReferenceCopyLocalPaths)" Condition="'%(Extension)' == '.dll'" />
+    </ItemGroup>
+    <Copy SourceFiles="@(PluginPayload)" DestinationFolder="$(PluginStageDir)any" />
     <WriteLinesToFile File="$(PluginStageDir)fabricator-plugin.json" Overwrite="true" WriteOnlyWhenDifferent="false"
                       Lines="{ &quot;formatVersion&quot;: 1, &quot;name&quot;: &quot;sampleplugin&quot;, &quot;version&quot;: &quot;1.0.0&quot;, &quot;entryAssembly&quot;: &quot;$(AssemblyName).dll&quot;, &quot;abstractionsVersion&quot;: &quot;$(FabricatorContractVersion)&quot; }" />
     <Delete Files="$(PluginArchivePath)" />

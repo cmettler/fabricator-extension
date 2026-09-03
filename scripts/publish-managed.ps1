@@ -123,6 +123,15 @@ Publish-Project $daxProj "Fabricator.AnalysisServices"
 $deltaBuiltinProj = Join-Path $PSScriptRoot "../dotnet/Fabricator.Delta/Fabricator.Delta.csproj" | Resolve-Path
 Publish-Project $deltaBuiltinProj "Fabricator.Delta"
 
+# The Fluid template engine (fabricator_render, fluid_query). A BUILT-IN provider assembly since
+# 2026-09-02, not a plugin: BackendRegistry discovers it by name, APPENDED LAST to the default
+# FABRICATOR_BACKEND_ASSEMBLY list so it cannot become the default provider.
+# /!\ UNLIKE Fabricator.Delta above, NOTHING ELSE REFERENCES THIS PROJECT, so without this line the
+# assembly is simply absent from the payload and both functions vanish -- with no error anywhere, because
+# Discover() skips an unloadable name on purpose. That is the one way this can silently regress.
+$fluidProj = Join-Path $PSScriptRoot "../dotnet/Fabricator.FluidPlugin/Fabricator.FluidPlugin.csproj" | Resolve-Path
+Publish-Project $fluidProj "Fabricator.FluidPlugin"
+
 # Optional third provider: Fabricator.DeltaRs (delta-rs via delta-dotnet). Published into the SAME fabricator/
 # dir so the bridge discovers it by assembly name. Brings DeltaLake.dll + the two native Rust DLLs
 # (delta_rs_bridge.dll / delta_kernel_ffi.dll, ~240 MB) — hence opt-in via -IncludeDeltaRs.

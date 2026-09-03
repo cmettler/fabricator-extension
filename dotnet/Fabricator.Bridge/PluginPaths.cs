@@ -12,7 +12,7 @@ namespace Fabricator.Bridge;
 
 /// <summary>What one candidate file (or one root) contributed to the plugin scan. Purely descriptive: the
 /// scan records these as it goes and <c>fabricator_plugins()</c> reads them back, because the scan runs ONCE
-/// per process (behind <see cref="BackendRegistry"/>'s memoized map) and cannot be replayed on demand.</summary>
+/// per process (behind <see cref="ProviderRegistry"/>'s memoized map) and cannot be replayed on demand.</summary>
 /// <remarks>
 /// ⚠ THIS EXISTS BECAUSE THE SCAN USED TO FAIL SILENTLY, which is the single worst property of a plugin
 /// system: <c>ScanPluginDirectories</c> ends every candidate in a <c>catch</c>, so a plugin built against a
@@ -38,7 +38,7 @@ internal static class PluginScanStatus
     /// <summary>Loaded and contributed at least one provider. <c>Provider</c> lists their names.</summary>
     public const string Loaded = "loaded";
 
-    /// <summary>Loaded, but declared no <c>IBackend</c>. Usually a private dependency of a plugin rather
+    /// <summary>Loaded, but declared no <c>IProvider</c>. Usually a private dependency of a plugin rather
     /// than a plugin — benign, and worth showing so it is not mistaken for a failure.</summary>
     public const string NoBackend = "no_backend";
 
@@ -89,7 +89,7 @@ internal static class PluginPaths
     /// <c>rejected</c> with a collision message — it does not overwrite. Putting the user's root first is
     /// therefore what lets a user-installed copy take precedence over a shipped one.
     /// <para>⚠ THIS WAS WRONG WHEN FIRST WRITTEN (2026-09-01) and the fix is worth recording, because the
-    /// mistake is easy to repeat: the original comment justified BUNDLED-FIRST by <c>BackendRegistry.Add</c>
+    /// mistake is easy to repeat: the original comment justified BUNDLED-FIRST by <c>ProviderRegistry.Add</c>
     /// being <c>map[name] = backend</c>, i.e. last-wins. That is true of the BUILT-IN registration path and
     /// false of the PLUGIN path, which refuses collisions instead — so bundled-first made the shipped copy
     /// win and REJECTED the user's install, the exact opposite of the stated intent. MEASURED with two roots

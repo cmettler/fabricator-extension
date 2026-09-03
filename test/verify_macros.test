@@ -1,6 +1,6 @@
 # name: test/verify_macros.test
 # description: Provider-declared DuckDB MACROs (docs/macros-and-sqlgen-functions.md §1) — a provider ships
-#              complete CREATE MACRO statements (IBackend.GlobalMacros), the host hands each to DuckDB's OWN
+#              complete CREATE MACRO statements (IProvider.GlobalMacros), the host hands each to DuckDB's OWN
 #              parser at extension load and registers the resulting CreateMacroInfo into the SYSTEM catalog.
 #              So a macro resolves as a bare fn(...) / FROM fn(...) in EVERY database with NO ATTACH, and the
 #              full grammar works: scalar + table macros, named-parameter defaults, overload sets. A macro is

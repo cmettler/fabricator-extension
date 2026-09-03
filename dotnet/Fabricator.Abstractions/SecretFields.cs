@@ -13,11 +13,11 @@ public enum SecretFieldType
 }
 
 /// <summary>
-/// A field a provider declares for its secret type (see <see cref="IBackend.SecretType"/> /
-/// <see cref="IBackend.SecretFields"/>). The host registers these generically as the <c>CREATE SECRET</c>
+/// A field a provider declares for its secret type (see <see cref="IProvider.SecretType"/> /
+/// <see cref="IProvider.SecretFields"/>). The host registers these generically as the <c>CREATE SECRET</c>
 /// named parameters at extension load (via the <c>list_secret_fields</c> ABI) and stores the supplied values
 /// (redacting the marked ones); the provider reads them when it assembles the connection string
-/// (<see cref="IBackend.BuildConnectionString"/>). The provider-agnostic core thus names no secret field. See
+/// (<see cref="IProvider.BuildConnectionString"/>). The provider-agnostic core thus names no secret field. See
 /// docs/provider-extensibility.md §2.
 /// </summary>
 /// <param name="Name">The field name = <c>CREATE SECRET</c> parameter, e.g. <c>host</c>.</param>

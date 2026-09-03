@@ -27,7 +27,7 @@ namespace duckdb {
 
 // -----------------------------------------------------------------------------
 // Provider-declared secret types (see docs/provider-extensibility.md §2). Each provider declares its secret
-// type + fields in C# (IBackend.SecretType / SecretFields); we register them here generically from the
+// type + fields in C# (IProvider.SecretType / SecretFields); we register them here generically from the
 // list_secret_fields ABI, so the provider-agnostic core names no secret type or field. Field validation +
 // connection-string assembly live in the managed backend (build_connection_string).
 // -----------------------------------------------------------------------------

@@ -59,13 +59,13 @@ public interface ISqlTableFunction
 /// <summary>
 /// What a CATALOG-BOUND generator is given beyond its arguments: the catalog's DuckDB ATTACH alias (which only
 /// the host knows) and the live provider catalog, so the generator may LOOK THINGS UP at bind time — e.g. list
-/// the tables matching a pattern via <see cref="IBackendCatalog.ExecuteQuery"/> — and then emit SQL that names
+/// the tables matching a pattern via <see cref="IProviderCatalog.ExecuteQuery"/> — and then emit SQL that names
 /// them. Read-only use please: a generator must stay deterministic and side-effect-free (binds repeat).
 /// </summary>
 /// <param name="CatalogName">The DuckDB ATTACH alias (e.g. <c>db</c>) — quote it with
 /// <see cref="DuckSql.QuoteName"/> when emitting references back into this catalog.</param>
 /// <param name="Catalog">The live provider catalog for bind-time lookups (its connection is the catalog's own).</param>
-public sealed record SqlGenContext(string CatalogName, IBackendCatalog Catalog);
+public sealed record SqlGenContext(string CatalogName, IProviderCatalog Catalog);
 
 /// <summary>
 /// A catalog-bound SQL-generating table function (attach-time scope) — resolved as

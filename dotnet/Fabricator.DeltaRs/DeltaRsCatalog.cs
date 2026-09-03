@@ -26,7 +26,7 @@ namespace Fabricator.DeltaRs;
 /// <summary>
 /// A Delta Lake catalog over delta-rs (delta-dotnet). delta-dotnet is single-table (<see cref="IEngine"/> +
 /// <see cref="DrsTable"/>), so this class supplies the catalog layer: discovery (local FS in v1), per-table
-/// open, and the mapping of each <see cref="IBackendCatalog"/> operation to a delta-dotnet call. delta-rs does
+/// open, and the mapping of each <see cref="IProviderCatalog"/> operation to a delta-dotnet call. delta-rs does
 /// its own object_store IO, so — unlike the engineered-wood provider — this does NOT use the host-FS bridge.
 ///
 /// Scope: read (scan, streamed via DataFusion), CREATE/INSERT/CTAS/COPY (append/overwrite), metadata
@@ -37,7 +37,7 @@ namespace Fabricator.DeltaRs;
 /// (live-validated). DEFERRED: RENAME/DROP COLUMN + ALTER TYPE (need column mapping / a rewrite), S3 /
 /// plain-ADLS discovery, OneLake RENAME TABLE + schema DDL, and a first-class user-facing MERGE surface.
 /// </summary>
-public sealed class DeltaRsCatalog : IBackendCatalog
+public sealed class DeltaRsCatalog : IProviderCatalog
 {
     private const string MainSchema = "main";
 

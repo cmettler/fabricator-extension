@@ -29,14 +29,14 @@ namespace Fabricator.Bridge;
 /// on top later; it cannot be un-added.
 /// </para>
 /// <para>
-/// ⚠ <b>The registry is MUTABLE and must stay so.</b> <c>BackendRegistry.Invalidate()</c> re-scans after
+/// ⚠ <b>The registry is MUTABLE and must stay so.</b> <c>ProviderRegistry.Invalidate()</c> re-scans after
 /// <c>fabricator_install_plugin</c>, which is what makes install-and-use work in the session that installs.
 /// A built, immutable container (the <c>Microsoft.Extensions.DependencyInjection</c> shape) would have to be
 /// rebuilt on every invalidate, and anything holding the previous provider would be silently stale.
 /// </para>
 /// <para>
 /// ⚠ <b>Resolve LAZILY — at USE, not at load.</b> The plugin scan is ordered by path, so a plugin that
-/// resolves a service in its constructor or in <c>IBackend.Name</c> may run before whatever registers it.
+/// resolves a service in its constructor or in <c>IProvider.Name</c> may run before whatever registers it.
 /// Every service here is registered by the bridge before any plugin is scanned, so the host services are
 /// safe either way; the rule matters the day one plugin publishes a service another consumes.
 /// </para>
@@ -75,7 +75,7 @@ public static class FabricatorServices
     /// Write <c>Register&lt;IFoo&gt;(new FooService())</c>. C# cannot constrain a type parameter to be an
     /// interface, so this is a convention rather than a compiler check.
     /// <para>
-    /// ⚠ Last registration WINS, deliberately — the same rule <c>BackendRegistry.Add</c> follows for built-in
+    /// ⚠ Last registration WINS, deliberately — the same rule <c>ProviderRegistry.Add</c> follows for built-in
     /// providers. There is no collision refusal here because there is no name to collide on: the key is the
     /// interface TYPE, and two assemblies can only agree on it by both referencing the assembly that declares
     /// it. That is also why a cross-plugin contract needs a shared assembly the plugins BOTH reference and not

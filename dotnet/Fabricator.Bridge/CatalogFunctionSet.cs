@@ -259,7 +259,7 @@ public sealed class CatalogFunctionSet
     }
 
     /// <summary>The scalar DEFINITION, or null when this set declares no such function — the host binds it
-    /// per call site (<see cref="IBackendCatalog.GetScalarFunction"/>).</summary>
+    /// per call site (<see cref="IProviderCatalog.GetScalarFunction"/>).</summary>
     public ICatalogScalarFunction? Scalar(string schema, string func) =>
         TryScalar(schema, func, out var fn) ? fn : null;
 

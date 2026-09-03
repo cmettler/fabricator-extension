@@ -24,12 +24,19 @@ namespace Fabricator.FluidPlugin;
 /// (docs/plugin-system.md, "the reload split").</para>
 /// <para><b>⚠ It is also the first in-tree plugin with a PRIVATE PACKAGE DEPENDENCY.</b>
 /// <c>Fabricator.SamplePlugin</c> is pure IL, so until this existed nothing exercised
-/// <c>BackendRegistry.InstallPluginResolver</c> actually loading a plugin's own NuGet closure (here
+/// <c>ProviderRegistry.InstallPluginResolver</c> actually loading a plugin's own NuGet closure (here
 /// <c>Fluid.Core</c> and its transitive <c>Parlot</c>) out of the plugin folder.</para>
 /// </summary>
-public sealed class FluidPluginBackend : IBackend
+public sealed class FluidPluginBackend : IProvider
 {
     public string Name => "fluid";
+
+    /// <summary>
+    /// FALSE: this contributes global functions and one setting, and hosts nothing to ATTACH. The registry
+    /// refuses <c>PROVIDER 'fluid'</c> BY NAME because of this, so the two throwing members below are a
+    /// backstop rather than the user-facing message.
+    /// </summary>
+    public bool HostsCatalog => false;
 
     public IEnumerable<IScalarFunction> GlobalScalarFunctions =>
         new IScalarFunction[] { new FluidRenderFunction() };
@@ -42,7 +49,7 @@ public sealed class FluidPluginBackend : IBackend
     /// </summary>
     /// <remarks>
     /// ⚠ It is registered because a PLUGIN's settings go through the same path a backend's do
-    /// (<c>BackendRegistry.All()</c> at load), which is also why it shares the load-time opt-in property of
+    /// (<c>ProviderRegistry.All()</c> at load), which is also why it shares the load-time opt-in property of
     /// the functions above: the plugin has to be in a plugin root when the extension loads.
     /// </remarks>
     public IEnumerable<ProviderSetting> Settings =>
@@ -62,7 +69,7 @@ public sealed class FluidPluginBackend : IBackend
                                         string baseConnString) =>
         throw new NotSupportedException("fluid: a template engine, not a catalog (global functions only).");
 
-    public IBackendCatalog OpenCatalog(string connectionString, string optionsJson) =>
+    public IProviderCatalog OpenCatalog(string connectionString, string optionsJson) =>
         throw new NotSupportedException("fluid: a template engine, not a catalog (global functions only).");
 }
 

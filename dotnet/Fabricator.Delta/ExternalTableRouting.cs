@@ -101,7 +101,7 @@ public static class ExternalTableRouting
         var uri = tableUri.TrimEnd('/');
         var (root, leaf) = SplitTable(uri);
         Log.LogInformation("external delta append: {Uri} (root={Root}, table={Leaf})", uri, root, leaf);
-        var catalog = BackendRegistry.Resolve("delta").OpenCatalog(root, "{\"native_write\":\"true\"}");
+        var catalog = ProviderRegistry.Resolve("delta").OpenCatalog(root, "{\"native_write\":\"true\"}");
         try
         {
             long rows = catalog.BulkInsert("main", leaf, data, createTable: false, replace: false,
@@ -135,7 +135,7 @@ public static class ExternalTableRouting
     {
         var (root, leaf) = SplitTable(tableUri);
         Log.LogInformation("external delta CREATE AS: {Uri}", tableUri);
-        var catalog = BackendRegistry.Resolve("delta").OpenCatalog(root,
+        var catalog = ProviderRegistry.Resolve("delta").OpenCatalog(root,
             "{\"native_write\":\"true\",\"deletion_vectors\":\"false\",\"column_mapping\":\"none\","
             + "\"copy_disposition\":\"error\"}");
         try
@@ -167,7 +167,7 @@ public static class ExternalTableRouting
     {
         var (root, leaf) = SplitTable(tableUri);
         Log.LogInformation("external delta CREATE (empty): {Uri}", tableUri);
-        var catalog = BackendRegistry.Resolve("delta").OpenCatalog(root,
+        var catalog = ProviderRegistry.Resolve("delta").OpenCatalog(root,
             "{\"native_write\":\"true\",\"deletion_vectors\":\"false\",\"column_mapping\":\"none\"}");
         try
         {
@@ -225,7 +225,7 @@ public static class ExternalTableRouting
         // outlives the C++ side's struct and segfaults; every exit below must not leak it.
         var ids = CollectInt64(keys);
         var (root, leaf) = SplitTable(tableUri);
-        var catalog = BackendRegistry.Resolve("delta").OpenCatalog(root, "{\"native_write\":\"true\"}");
+        var catalog = ProviderRegistry.Resolve("delta").OpenCatalog(root, "{\"native_write\":\"true\"}");
         try
         {
             if (ids.Count == 0)
@@ -279,7 +279,7 @@ public static class ExternalTableRouting
             (schema, batches, _) = DeltaWriter.Materialize(data, default);
         }
         var (root, leaf) = SplitTable(tableUri);
-        var catalog = BackendRegistry.Resolve("delta").OpenCatalog(root, "{\"native_write\":\"true\"}");
+        var catalog = ProviderRegistry.Resolve("delta").OpenCatalog(root, "{\"native_write\":\"true\"}");
         try
         {
             if (batches.Count == 0)
@@ -357,7 +357,7 @@ public static class ExternalTableRouting
     // identity value -> transient (file, position) rowid, via chunked PRUNED scans: the IN predicate rides
     // the spec's FilterNode + value batch, so the delta side skips files by the identity column's standard
     // min/max stats. Pushdown is superset-safe — the wanted-set re-filter here is the exact predicate.
-    private static Dictionary<long, long> ResolveRowIds(IBackendCatalog catalog, string leaf,
+    private static Dictionary<long, long> ResolveRowIds(IProviderCatalog catalog, string leaf,
                                                         string identityColumn, IReadOnlyList<long> ids)
     {
         const int ChunkSize = 500;
@@ -376,7 +376,7 @@ public static class ExternalTableRouting
         return map;
     }
 
-    private static void ResolveChunk(IBackendCatalog catalog, string leaf, string identityColumn,
+    private static void ResolveChunk(IProviderCatalog catalog, string leaf, string identityColumn,
                                      IReadOnlyList<long> chunk, HashSet<long> want, Dictionary<long, long> map)
     {
         var vals = new List<int>(chunk.Count);

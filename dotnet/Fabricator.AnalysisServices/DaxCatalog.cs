@@ -18,7 +18,7 @@ namespace Fabricator.AnalysisServices;
 /// slices (the read/scan/function methods throw <see cref="NotSupportedException"/> for now). See
 /// docs/dax-provider.md.
 /// </summary>
-internal sealed class DaxCatalog : IBackendCatalog
+internal sealed class DaxCatalog : IProviderCatalog
 {
     private readonly string _connectionString;
     private readonly Azure.Core.TokenCredential? _credential; // Entra cred for Fabric/AAS XMLA (null = no token auth)

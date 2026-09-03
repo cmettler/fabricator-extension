@@ -11,7 +11,7 @@ namespace Fabricator.SamplePlugin;
 /// <summary>
 /// A sample third-party plugin backend. It exposes no catalog (ATTACH throws) — it exists purely to contribute
 /// connection-free GLOBAL functions, demonstrating that a plugin dropped into an <c>FABRICATOR_PLUGIN_DIR</c>
-/// folder is discovered, its <see cref="IBackend"/> registered, and its global functions surfaced — with no
+/// folder is discovered, its <see cref="IProvider"/> registered, and its global functions surfaced — with no
 /// change to the bridge or any ABI. See docs/plugin-system.md.
 /// <para>Four scalars, for three different jobs: <see cref="PlugGreetFunction"/> proves the plumbing carries
 /// VALUES; <see cref="PlugSleepFunction"/> is a test INSTRUMENT — it makes a query's cost a number the
@@ -21,7 +21,7 @@ namespace Fabricator.SamplePlugin;
 /// filesystem, which needs the caller's <c>ClientContext</c> and so also proves the ABI v82 ambient reaches
 /// a global scalar.</para>
 /// </summary>
-public sealed class SamplePluginBackend : IBackend
+public sealed class SamplePluginBackend : IProvider
 {
     public string Name => "sampleplugin";
 
@@ -30,6 +30,7 @@ public sealed class SamplePluginBackend : IBackend
         {
             new PlugGreetFunction(), new PlugSleepFunction(),
             new PlugReadFileFunction(), new PlugGlobCountFunction(), new PlugLogFunction(),
+            new PlugSupportFunction(),
         };
 
     public IEnumerable<ITableFunction> GlobalTableFunctions =>
@@ -54,7 +55,7 @@ public sealed class SamplePluginBackend : IBackend
                                         string baseConnString) =>
         throw new NotSupportedException("sampleplugin: global functions only (no catalog).");
 
-    public IBackendCatalog OpenCatalog(string connectionString, string optionsJson) =>
+    public IProviderCatalog OpenCatalog(string connectionString, string optionsJson) =>
         throw new NotSupportedException("sampleplugin: global functions only (no catalog).");
 }
 
@@ -610,4 +611,43 @@ internal sealed class PlugLogFunction : IScalarFunction
         _ => throw new ArgumentException(
             $"plug_log: unknown level '{level}' - use trace|debug|info|warn|error|critical.", nameof(level)),
     };
+}
+
+/// <summary>
+/// <c>plug_support() -&gt; VARCHAR</c> — returns a value produced by <c>Fabricator.SamplePlugin.Support</c>,
+/// this plugin's PRIVATE DEPENDENCY. The point is not the string; it is that answering at all requires an
+/// assembly the HOST does not ship to have been found beside the plugin.
+/// </summary>
+/// <remarks>
+/// <para><b>⚠ WHAT IT GUARDS, and it is measured rather than imagined.</b> A LIBRARY does not copy its
+/// dependency closure to the output directory unless <c>CopyLocalLockFileAssemblies</c> is set. When
+/// <c>Fabricator.FluidPlugin</c> was created, its first build produced ONE assembly and nothing else — it
+/// loaded fine and died at the first render with a <c>FileNotFoundException</c> naming an assembly that was
+/// never copied. Fluid was the only in-tree plugin with a private dependency, so when it became a built-in
+/// provider assembly (2026-09-02) that coverage would have dropped to zero.</para>
+/// <para>⚠ It also guards the ARCHIVE: <c>fabricator_install_plugin</c> installs from a zip whose payload is
+/// computed from <c>ReferenceCopyLocalPaths</c>, and an archive carrying only the entry assembly installs
+/// CLEANLY and then fails at the first call — the silent shape that whole surface exists to remove.</para>
+/// <para>⚠ The value comes from a METHOD, not a <c>const</c>: C# bakes a <c>const</c> into the CALLER's IL,
+/// so this would answer correctly with the support assembly absent and the fixture would prove nothing.</para>
+/// </remarks>
+internal sealed class PlugSupportFunction : IScalarFunction
+{
+    public string Name => "plug_support";
+
+    public Schema Parameters { get; } = new(System.Array.Empty<Field>(), metadata: null);
+
+    public Field Result => new("marker", StringType.Default, nullable: false);
+
+    public IArrowArray Invoke(RecordBatch args)
+    {
+        // Length is the CHUNK's row count even with no arguments — a zero-argument scalar is still evaluated
+        // once per row, so building a single-element array here would return the wrong shape.
+        var b = new StringArray.Builder().Reserve(args.Length);
+        for (int i = 0; i < args.Length; i++)
+        {
+            b.Append(Support.SampleSupport.Marker());
+        }
+        return b.Build();
+    }
 }
