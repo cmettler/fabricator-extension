@@ -261,17 +261,23 @@ int HostQueryGetNext(ArrowArrayStream *stream, ArrowArray *out) {
 		// ⚠ The env var, when SET, still OVERRIDES the caller — including to 0 — because it is an
 		// operator's deliberate act and an experiment hook that code can silently outvote is not one. Unset
 		// is distinguished from "set to 0" for exactly that: `=0` forces one chunk everywhere.
+		// ⚠⚠ NO DEFAULT MEMBER INITIALIZERS, AND CONSTRUCTED BY NAME. DuckDB builds extensions at
+		// CMAKE_CXX_STANDARD=11, and in C++11 an NSDMI makes a class a NON-AGGREGATE, so `return {…}` does
+		// not compile. C++14 relaxed exactly that, which is why the first version looked fine: MSVC accepted
+		// it and gcc/clang did not. MEASURED (run 33905088601): windows_amd64 GREEN, linux_amd64 and
+		// osx_arm64 both failed to BUILD — "could not convert '{true, …}' from '<brace-enclosed initializer
+		// list>'" — and reproduced locally at -std=c++11, clean at -std=c++14.
 		struct EnvOverride {
-			bool set = false;
-			idx_t rows = 0;
+			bool set;
+			idx_t rows;
 		};
 		static const EnvOverride env_override = []() -> EnvOverride {
 			const char *env = std::getenv("FABRICATOR_HOST_QUERY_BATCH_ROWS");
 			if (!env || !*env) {
-				return {};
+				return EnvOverride{false, 0};
 			}
 			auto n = std::atoll(env);
-			return {true, n > 0 ? (idx_t)n : 0};
+			return EnvOverride{true, n > 0 ? (idx_t)n : 0};
 		}();
 		const idx_t target_rows = env_override.set ? env_override.rows : st->batch_rows;
 		ArrowAppender appender(st->types, target_rows > 0 ? target_rows : chunk->size(), props, extension_types);
