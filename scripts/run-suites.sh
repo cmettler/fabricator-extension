@@ -444,6 +444,12 @@ case "$TIER" in
         # in that section is load-bearing and a mutant proved it: an earlier `USE memory.hq_s` leaves a
         # qualified entry, against which the bug does not fire, so the section PASSED with it fully present.
         # 8250 + 9 = 8259 exactly, from a green run.
+        # 8594 since 2026-09-04 (same day, third bump): verify_plugin_fluid 313 -> 318 -- a SHIPPED BUG,
+        #   user-found: a STRUCT cell coming OUT of a query result was a LAZY wrapper over a RecordBatch
+        #   that is disposed as the result is consumed, so reading it at render time threw a
+        #   NullReferenceException out of Apache.Arrow. The eagerness a ROW always had stopped ONE LEVEL
+        #   DOWN. ⚠ Needed no parameters to reproduce, and nothing above could see it: every earlier
+        #   nested read came from the PARAMS bag, whose batch lives for the whole call.
         # 8589 since 2026-09-04 (same day, second bump): verify_plugin_fluid 307 -> 313 -- parameters
         #   NEST (lists of structs, structs of lists, any depth), converted recursively in two passes.
         #   ⚠ TWO of the 6 are REPLACED assertions: §17 pinned "a nested value has no SQL list form"
@@ -488,7 +494,7 @@ case "$TIER" in
         # two functions have exactly ONE registration each, plus the HostsCatalog refusal and its
         # unknown-provider control. 3105 + 238 + 8259 - 3339 arithmetic aside, both numbers come from green
         # runs.
-        : "${MIN_ASSERTIONS:=8589}"
+        : "${MIN_ASSERTIONS:=8594}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

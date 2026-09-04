@@ -818,6 +818,34 @@ a, b) and a MAP (`($1)['k']` ⇒ 7).
 - ⚠ Refusals speak the AUTHOR's vocabulary, not Arrow's: mixing `1` and `"a"` reports *"its elements mix
   Number and String"*, never *"int64 and utf8"* — they wrote the former and never see the latter.
 
+##### ⚠⚠ A SHIPPED BUG THE NESTING WORK EXPOSED: a nested value out of a RESULT was LAZY
+
+User-found 2026-09-04, by passing one query's rows into the next as a parameter and reading the struct back.
+It needed **no parameters at all** to reproduce:
+
+```sql
+SELECT fluid_render('{% query r %}SELECT {''a'':1} AS s{% endquery %}{{ r[0].s.a }}', NULL);
+-- Object reference not set to an instance of an object.
+```
+
+`FluidHostQuery.Run` has always materialised a row's cells EAGERLY, *because* the batches are disposed as
+the result is consumed — the code says exactly that. But `ReadCell` returned a **lazy `ArrowStruct`** for a
+STRUCT cell, which reads its members when the template asks. By then the `RecordBatch` is gone, and
+Apache.Arrow nulls a disposed batch's buffers, so it died in `SharedMemoryHandle.get_Memory()`.
+**The eagerness stopped ONE LEVEL DOWN.**
+
+- Fixed by making that case eager too, through the type that already means "cells read eagerly" —
+  `EagerRow` became **`EagerStruct`**, since it now serves both a query-result ROW and a nested STRUCT cell.
+  `ArrowStruct` remains as the lazy SOURCE it materialises from, so the two cannot drift on the lookup rule.
+- **⚠ WHY NOTHING CAUGHT IT: every earlier nested read came from the PARAMS bag**, whose batch lives for the
+  whole call, so laziness was harmless there. Only a nested value from a RESULT dies — and until a template
+  passed one query's rows into another, nothing produced one.
+- ⚠ `ArrowMap` was already eager and `ReadList` materialises its items, so MAP and LIST cells were never
+  affected; the gate pins them anyway, because that is now a property to keep rather than an accident.
+- **⚠ CHARACTERIZATION, not ours:** `SELECT unnest($arg)` yields ONE struct-typed column *named*
+  `unnest($arg)`, so `{{ r.a }}` finds nothing and renders empty — which looks like a bug and is DuckDB's
+  naming. `AS s` or `unnest($arg, recursive := true)` are what flatten it. Both are pinned.
+
 **⚠ The READ direction was already recursive and is untouched** — `{{ v.kids[1].scores[2] }}` resolves
 through struct → list → struct → list, and has for as long as `ReadCell` has existed. The gap this closes
 was one-directional.

@@ -313,7 +313,14 @@ internal static class FluidValueModel
             // /!\ NOT a local copy: the shared decision from Fabricator.Common, which the Bridge's own
             // filter marshaling uses too. See the note where the local duplicate used to be.
             case TimestampArray a: return ArrowValueReader.ReadTimestamp(a, index);
-            case StructArray s: return new DictionaryValue(new ArrowStruct(s, index));
+            // ⚠⚠ EAGER, not `new ArrowStruct(s, index)`. A lazy wrapper here reads its members at RENDER
+            // time, and on a QUERY RESULT the RecordBatch is long disposed by then — Apache.Arrow nulls a
+            // disposed batch's buffers, so `{{ r[0].s.a }}` died with a NullReferenceException out of
+            // SharedMemoryHandle.get_Memory(). The eagerness `EagerStruct` gives a ROW has to reach all the
+            // way down, or it only holds for the first level.
+            case StructArray s:
+                return new DictionaryValue(
+                    new EagerStruct(((StructType)s.Data.DataType).Fields, s.Fields, index));
             // ⚠ MapArray BEFORE ListArray, and the compiler is what caught it: Apache.Arrow declares
             // `MapArray : ListArray`, so the list case matches a MAP first. Ordered the other way this is
             // not an error but a silently WRONG SHAPE - a MAP would arrive as a list of key/value structs,
@@ -423,6 +430,13 @@ internal static class FluidValueModel
 /// asking <see cref="TryGetValue"/> for the key <c>"0"</c>, so an int-parse fallback IS index access. A field
 /// genuinely NAMED <c>0</c> therefore wins over the ordinal, which is the right precedence — the data's own
 /// names come first.
+/// </remarks>
+/// <remarks>
+/// ⚠⚠ THIS IS THE LAZY FORM AND IT MUST NOT OUTLIVE ITS <see cref="RecordBatch"/>. It reads a member only
+/// when asked, so anything that survives the batch has to be materialised through
+/// <see cref="EagerStruct"/> instead — which is why <see cref="FluidValueModel.ReadCell"/> never returns one
+/// of these. It exists as the SOURCE EagerStruct materialises from, so the two cannot drift on the lookup
+/// rule (name, then an int-parse ordinal, then FALSE so Fluid can answer `.size` itself).
 /// </remarks>
 internal sealed class ArrowStruct : IFluidIndexable
 {

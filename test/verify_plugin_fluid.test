@@ -2206,3 +2206,49 @@ statement error
 SELECT fluid_render('{% query r xs: v %}SELECT 1{% endquery %}ok', '{"v":[1,[2]]}');
 ----
 mix Number and Array
+
+# ============================================================================================
+# §19 — NESTED VALUES COMING BACK OUT of a query result. User-found: passing one query's rows
+# into the next as a parameter and reading the struct back threw "Object reference not set".
+#
+# ⚠⚠ IT WAS A SHIPPED BUG AND IT NEEDED NO PARAMETERS AT ALL — the first assertion below is the
+# whole repro. ReadCell returned a LAZY ArrowStruct for a STRUCT cell, which reads its members at
+# RENDER time; by then the RecordBatch has been disposed, and Apache.Arrow nulls a disposed
+# batch's buffers, so it died in SharedMemoryHandle.get_Memory(). The eagerness a query-result ROW
+# has always had stopped ONE LEVEL DOWN.
+#
+# ⚠ Nothing above could see it: every earlier nested read came from the PARAMS bag, whose batch
+# lives for the whole call, so laziness was harmless there. Only a nested value from a RESULT dies.
+# ============================================================================================
+
+query I
+SELECT fluid_render('{% query r %}SELECT {''a'':1,''b'':2} AS s{% endquery %}{{ r[0].s.a }}', NULL);
+----
+1
+
+# --- and at depth: a struct holding a list of structs, all out of a result ---
+query I
+SELECT fluid_render('{% query r %}SELECT {''k'': [{''n'': 7}, {''n'': 8}]} AS s{% endquery %}{{ r[0].s.k[1].n }}', NULL);
+----
+8
+
+# --- the user's shape: one query's ROWS bound as the next one's parameter ---
+query I
+SELECT fluid_render('{% query r2 arg: input %}SELECT a:unnest($arg), x:5{% endquery %}{% query r3 arg: r2 %}SELECT unnest($arg) AS s{% endquery %}{% for r in r3 %}[{{ r.s.a }}:{{ r.s.x }}]{% endfor %}', {input:[1,2,3]});
+----
+[1:5][2:5][3:5]
+
+# --- ⚠ CHARACTERIZATION, not a rule of ours: `SELECT unnest($arg)` yields ONE struct-typed column
+# NAMED "unnest($arg)", so `r.a` finds nothing and renders empty. `AS s` (above) or
+# `unnest($arg, recursive := true)` (below) are what flatten it. Pinned because the empty render
+# looks like a bug and is DuckDB's naming, not ours. ---
+query I
+SELECT fluid_render('{% query r2 arg: input %}SELECT a:unnest($arg), x:5{% endquery %}{% query r3 arg: r2 %}SELECT unnest($arg, recursive := true){% endquery %}{% for r in r3 %}[{{ r.a }}/{{ r.x }}]{% endfor %}', {input:[1,2,3]});
+----
+[1/5][2/5][3/5]
+
+# --- a MAP cell out of a result reads too (ArrowMap was already eager; this pins that it stays) ---
+query I
+SELECT fluid_render('{% query r %}SELECT MAP{''k1'':10,''k2'':20} AS m{% endquery %}{{ r[0].m[''k2''] }}', NULL);
+----
+20

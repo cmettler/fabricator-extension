@@ -175,7 +175,7 @@ internal static class FluidHostQuery
                     // about: Apache.Arrow nulls a disposed RecordBatch's arrays, so holding it fails LOUDLY
                     // with a NullReferenceException on the first cell read, deterministically and on every
                     // platform. Mutation-tested — it dies at the very first query() assertion.
-                    rows.Add(new DictionaryValue(new EagerRow(fields, columns, r)));
+                    rows.Add(new DictionaryValue(new EagerStruct(fields, columns, r)));
                 }
             }
         }
@@ -755,18 +755,23 @@ internal static class FluidHostQuery
 }
 
 /// <summary>
-/// A result row whose cells were read EAGERLY, so it outlives the <see cref="RecordBatch"/> they came from.
+/// A struct whose cells were read EAGERLY, so it outlives the <see cref="RecordBatch"/> they came from —
+/// used both for a query-result ROW and for a nested STRUCT cell.
 /// </summary>
 /// <remarks>
 /// ⚠ It exists because the batches are disposed as the result is consumed, while the rows live for the whole
 /// render. It keeps <see cref="ArrowStruct"/>'s lookup rule — name first, then an int-parse ORDINAL, and
 /// FALSE for an unknown member so Fluid can still answer <c>.size</c> — by building itself FROM one.
+/// <para>⚠⚠ It was called <c>EagerStruct</c> and served ROWS only, which left the eagerness ONE LEVEL DEEP: a
+/// STRUCT cell inside a row came back as a lazy <see cref="ArrowStruct"/> and reading it after the batch
+/// was disposed threw a NullReferenceException. `{% query r %}SELECT {'a':1} AS s{% endquery %}{{ r[0].s.a }}`
+/// reproduced it with no parameters at all.</para>
 /// </remarks>
-internal sealed class EagerRow : IFluidIndexable
+internal sealed class EagerStruct : IFluidIndexable
 {
     private readonly List<KeyValuePair<string, FluidValue>> _cells = new();
 
-    internal EagerRow(IReadOnlyList<Field> fields, IReadOnlyList<IArrowArray> columns, int row)
+    internal EagerStruct(IReadOnlyList<Field> fields, IReadOnlyList<IArrowArray> columns, int row)
     {
         var source = new ArrowStruct(fields, columns, row);
         foreach (var name in source.Keys)
