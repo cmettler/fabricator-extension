@@ -2122,7 +2122,28 @@ proves the path ran (a value only the bound input can produce; a Debug line nami
 And the gate's FIRST assertion was itself vacuous — a mangled `LIKE … ESCAPE` matched nothing and passed on
 both builds — caught only by the mutation test.
 
-### 17.10 ⇒ WHAT IS STILL OPEN: lifting the v84 refusal
+### 17.9a ⛔ DEFERRED BY DECISION (user, 2026-09-04): "the query + automatic CTAS is not needed for now,
+maybe revisit later"
+
+**Nothing below is pending work.** The sugar — `{% query t %}` issuing its own
+`CREATE TEMP TABLE t AS (body)` so a later block can say `FROM t` — is deliberately NOT built.
+
+⚠ **Deferring it costs nothing, which is why it was cheap to decide.** The MECHANISM already ships and is
+gated: `{% exec %}CREATE TEMP TABLE t AS …{% endexec %}` followed by `{% query u %}… FROM t{% endquery %}`
+works today on the per-render pinned connection (measured, §17.9's own probe: `n=4 s=100`, and a staged
+table read twice answers `a=3 b=6`). So a template that needs this can express it in one extra tag; what is
+deferred is only who writes the CTAS.
+
+⚠ **The one thing that would still need settling if it is revisited** — and the reason it is not a
+five-minute change — is §17.5's naming hazard in its sharper form: `t` becomes a TEMP TABLE name, and a temp
+table SHADOWS a catalog table of the same name on that connection. Silently. Decide that deliberately
+(namespace the name? refuse one the catalog already resolves?) rather than defaulting to it.
+
+⚠ Everything from §17.10 down is therefore BACKGROUND, kept because it was measured and because the option
+analysis applies to a DIFFERENT case that is still open: data originating in C# with no SQL of ours
+producing it. Read it as a record, not a queue.
+
+### 17.10 ⇒ THE v84 REFUSAL, still unlifted (and no longer needed for Fluid)
 
 The prerequisite §17.2 needs is now in place — a bound input on a pinned connection would be a TEMP view
 scoped to that connection, i.e. to the render — but **the refusal has not been lifted**, and it is not a
