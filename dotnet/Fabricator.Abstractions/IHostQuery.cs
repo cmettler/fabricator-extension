@@ -156,5 +156,59 @@ public interface IHostConnection : IDisposable
     /// that a CTAS reports the rows it created and a SELECT of one BIGINT reports its VALUE.
     /// </summary>
     long ExecuteNonQuery(string sql);
+
+    /// <summary>
+    /// Publishes <paramref name="sql"/> — to be run ON THIS CONNECTION when the scan pulls — as a named
+    /// Arrow source the hosting DuckDB can scan as <c>fabricator_scan('&lt;token&gt;')</c>. Returns the token.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>⚠⚠ THIS IS THE ONLY WAY A RELATION STAGED ON A PINNED CONNECTION CAN REACH THE CALLER'S
+    /// STATEMENT.</b> A TEMP table belongs to the ClientContext that created it, and a REAL table created
+    /// here is invisible to a statement whose catalog snapshot predates the commit — so a name in the
+    /// catalog cannot carry it. A named Arrow source is read by a TABLE FUNCTION, which asks the caller's
+    /// catalog nothing, so the snapshot rule cannot reach it.
+    /// </para>
+    /// <para>
+    /// ⚠ <b>SINGLE-USE, and it fails LOUDLY on a second scan</b> rather than returning zero rows — the
+    /// silent-short-read failure this repo has paid for twice. Publish again for a second reference.
+    /// </para>
+    /// <para>
+    /// ⚠ <b>LAZY: nothing runs until the scan pulls, and the rows then STREAM.</b> There is no buffer and
+    /// no row cap, so a staged relation larger than memory is fine. The scan's own disposal of the stream
+    /// is what releases everything.
+    /// </para>
+    /// <para>
+    /// ⚠ <b>An unscanned publication holds this connection OPEN until an eviction cap reclaims it</b> — a
+    /// bind that is never executed (an <c>EXPLAIN</c>) publishes and never scans, and nothing in managed
+    /// code can observe that the caller's statement finished. So publish in the statement that scans it;
+    /// do not keep a token across statements.
+    /// </para>
+    /// <para>
+    /// ⚠ Publishing exists for a relation a template COMPUTED in several steps. For a SINGLE query a
+    /// <c>WITH … AS MATERIALIZED</c> CTE in the generated SQL is still better — it needs no publication at
+    /// all, and keeps the whole relation inside one DuckDB plan.
+    /// </para>
+    /// <para>
+    /// ⚠ <b><paramref name="sql"/> must be a SELECT usable as a SUBQUERY</b>, because the schema is
+    /// established by running it wrapped in <c>SELECT * FROM (…) LIMIT 0</c> — a declared schema is what
+    /// keeps the BIND from opening a stream and claiming the single handout. A trailing semicolon or a
+    /// non-SELECT statement fails there, at publish time, naming the statement.
+    /// </para>
+    /// <para>
+    /// ⚠ <b>Only ONE publication of a given connection can be scanned at a time</b>: each streams from that
+    /// connection, and a pinned connection allows one live result stream. Two scanned together fail loudly
+    /// — never silently — with either this host's refusal or DuckDB's own closed-result error, depending on
+    /// the plan.
+    /// </para>
+    /// <para>
+    /// DEFAULT-implemented, so an implementation predating it (a plugin author's test double) keeps
+    /// compiling and says what is missing when called.
+    /// </para>
+    /// </remarks>
+    string Publish(string sql) =>
+        throw new NotSupportedException(
+            "This IHostConnection implementation does not support Publish. It is implemented by the "
+            + "fabricator bridge; an implementation that did not override it cannot publish a relation.");
 }
 

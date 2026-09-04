@@ -444,6 +444,12 @@ case "$TIER" in
         # in that section is load-bearing and a mutant proved it: an earlier `USE memory.hq_s` leaves a
         # qualified entry, against which the bug does not fire, so the section PASSED with it fully present.
         # 8250 + 9 = 8259 exactly, from a green run.
+        # 8662 since 2026-09-04 (same day, seventh bump): verify_plugin_fluid 344 -> 386 -- publish(name),
+        # which hands a table the template STAGED to the SQL the template generated. The one route that
+        # works: a TEMP table is invisible to the caller and a REAL table created at bind time is invisible
+        # to the statement being bound, so only a TABLE FUNCTION can carry it. LAZY (user-directed): the
+        # relation streams at scan time under no row cap, and an unscanned publication is bounded by an
+        # eviction cap instead.
         # 8620 since 2026-09-04 (same day, sixth bump): verify_plugin_fluid 337 -> 344 -- the print block's
         #   `sql_literal` option, which renders each value as a DuckDB SQL literal through the SAME
         #   FluidValueModel.SqlLiteral the {{ v | sql }} filter uses. One assertion states that agreement
@@ -508,7 +514,7 @@ case "$TIER" in
         # two functions have exactly ONE registration each, plus the HostsCatalog refusal and its
         # unknown-provider control. 3105 + 238 + 8259 - 3339 arithmetic aside, both numbers come from green
         # runs.
-        : "${MIN_ASSERTIONS:=8620}"
+        : "${MIN_ASSERTIONS:=8662}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

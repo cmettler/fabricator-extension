@@ -185,6 +185,17 @@ internal sealed class PinnedHostConnection : IHostConnection
 {
     private readonly Host.HostConnection _inner;
 
+    // ⚠⚠ REFERENCE-COUNTED, because a LAZY publication must be able to ISSUE its query after the render
+    // that opened this connection has finished. The render holds one reference (given back by Dispose);
+    // each not-yet-scanned publication holds one more. The connection closes — destroying the temporary
+    // catalog, and with it anything the template staged — when the last is gone.
+    //
+    // ⚠ It only has to survive until the scan's Query RETURNS: from that point the returned stream holds
+    // its own reference to the underlying connection (see Host.HostConnection.Dispose), so the staged table
+    // stays readable for the stream's whole life without anything here holding the handle.
+    private int _refs = 1;
+    private bool _renderReleased;
+
     internal PinnedHostConnection(Host.HostConnection inner)
     {
         _inner = inner;
@@ -194,5 +205,46 @@ internal sealed class PinnedHostConnection : IHostConnection
 
     public long ExecuteNonQuery(string sql) => _inner.ExecuteNonQuery(sql);
 
-    public void Dispose() => _inner.Dispose();
+    // ⚠⚠ THE SCHEMA PROBE IS WHAT MAKES THE PUBLICATION LAZY — and it is required, not merely cheap. A
+    // named source must DECLARE its columns or the table function's BIND opens a stream to learn them,
+    // which would claim the single handout and leave the scan with nothing. `LIMIT 0` answers that without
+    // running the relation, and its stream is disposed before this returns, so the pin is left with no live
+    // result and every later query() / exec() in the same render still works.
+    public string Publish(string sql)
+    {
+        Schema schema;
+        using (var probe = _inner.Query($"SELECT * FROM ({sql}) LIMIT 0"))
+        {
+            schema = probe.Schema;
+        }
+        return PublishedSources.Register(this, sql, schema);
+    }
+
+    /// <summary>Runs a publication's statement. The returned stream owns what it needs; the caller disposes it.</summary>
+    internal IArrowArrayStream OpenPublication(string sql) => _inner.Query(sql);
+
+    /// <summary>Holds the handle open for one not-yet-scanned publication.</summary>
+    internal void AddRef() => Interlocked.Increment(ref _refs);
+
+    /// <summary>Gives one reference back, closing the connection when it was the last.</summary>
+    internal void Release()
+    {
+        if (Interlocked.Decrement(ref _refs) == 0)
+        {
+            _inner.Dispose();
+        }
+    }
+
+    // ⚠ The render's OWN reference, and idempotent: FluidRenderSession.Dispose is called from a `using`
+    // and may be called again, and over-decrementing would close the connection under a publication that
+    // has not been scanned yet.
+    public void Dispose()
+    {
+        if (_renderReleased)
+        {
+            return;
+        }
+        _renderReleased = true;
+        Release();
+    }
 }

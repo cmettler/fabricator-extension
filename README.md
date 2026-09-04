@@ -1639,6 +1639,57 @@ follow it exactly as in `{% query %}`: `{% exec n limit: 100 %}`. The number is 
 > above. A `{% break %}` inside the block leaves a half-rendered statement, which is discarded rather than
 > executed.
 
+**`publish(name)` hands a table the template STAGED to the SQL it is generating.** This is the piece that
+makes multi-step staging inside `fluid_query` useful: stage with `{% exec %}`, then scan the result.
+
+```sql
+SELECT * FROM fluid_query('
+{% exec lo: 1, hi: 5 %}
+  CREATE TEMP TABLE _result AS SELECT i AS n, i * i AS sq FROM range($lo, $hi) t(i)
+{% endexec %}
+SELECT * FROM {{ publish(''_result'') }}
+');
+-- n | sq
+-- 1 | 1
+-- 2 | 4
+-- 3 | 9
+-- 4 | 16
+```
+
+`publish` renders a `fabricator_scan('<token>')` call, so it must be interpolated **raw** — `{{ publish(…) }}`,
+never `{{ publish(…) | sql }}`. Values keep their types: a `DATE` stays a `DATE`, a list stays a list, a
+struct stays a struct — which is the difference from building a `VALUES` list with
+`{% print sql_literal %}`, where every temporal becomes a `TIMESTAMPTZ` and a list is refused.
+
+> ⚠ **Nothing simpler works, and it is worth knowing why.** A `CREATE TEMP TABLE` belongs to the render's
+> own connection, so the caller cannot see it at all; and a *real* table created by `{% exec %}` is
+> invisible to the statement being bound, because that statement's catalog snapshot predates the commit.
+> `publish` sidesteps both by handing the rows over as a table function instead of as a name.
+
+> ⚠ **It is LAZY — nothing runs until the scan pulls, and the rows then stream.** There is no row cap, so
+> a staged relation larger than memory is fine, and the scan's own completion releases it.
+
+> ⚠ **A publication is scanned ONCE**, and a second scan fails saying so rather than returning zero rows.
+> Call `publish` per reference; reusing one token twice is an error.
+
+> ⚠ **Two publications from the SAME template cannot be scanned in one statement** — both stream from the
+> render's single connection, which allows one live result at a time, so it fails (loudly, never silently).
+> Two ways round it, whichever fits: put the join in `{% exec %}` and publish one relation — better anyway,
+> since the work stays inside DuckDB — or use two separate `fluid_query` calls, which are two connections.
+
+> ⚠ A publication that is never scanned — an `EXPLAIN` renders the template and never runs it — keeps the
+> render's connection, and the staged table with it, until 32 further publications reclaim it; a scan of a
+> reclaimed one says so. Publish in the statement that scans it; do not keep a token across statements.
+
+> ⚠ For a **single** query a `WITH … AS MATERIALIZED` CTE inside the generated SQL is still better — it
+> needs no publication at all and keeps the whole relation inside one DuckDB plan:
+> ```sql
+> SELECT * FROM fluid_query('
+> WITH _result AS MATERIALIZED (SELECT i AS n, i*i AS sq FROM range(1, 5) t(i))
+> SELECT * FROM _result');
+> ```
+> `publish` is for a relation computed in several steps, which a CTE cannot express.
+
 **And `{% query name %}` is its read-side twin — the body is SQL, and the result is a *result set*.**
 Like `{% capture %}`, it binds to a name; unlike it, what you get back is rows you can index and iterate,
 not text.

@@ -231,6 +231,11 @@ internal static class FluidEngine
         // which repeats — see FluidHostExec for the measured 1 -> 2 -> 3.
         ctx.SetValue(FluidHostExec.FunctionName,
                      new FunctionValue((args, c) => FluidHostExec.Execute(caller, args, c)));
+        // ⚠ publish() RENDERS SQL (a fabricator_scan call), so it is only meaningful where the render IS a
+        // statement — i.e. in fluid_query. Registered on both surfaces anyway: branching on the caller name
+        // is what the exec() decision rejected, and in fluid_render the result is merely inert text.
+        ctx.SetValue(FluidHostPublish.FunctionName,
+                     new FunctionValue((args, c) => FluidHostPublish.Execute(caller, args, c)));
         // ⚠⚠ The FILTER of the same name is registered ONCE, in the shared TemplateOptions (see
         // FluidValueModel.Build) — NOT here. `ctx.Options` IS that shared static, so registering per render
         // would mutate global state on every call and capture whichever `caller` happened to register last,

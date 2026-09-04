@@ -91,6 +91,20 @@ internal sealed class FluidRenderSession : IDisposable
     /// <summary>Runs a non-query statement on this render's connection and returns its affected-row count.</summary>
     internal long ExecuteNonQuery(string sql) => Pin().ExecuteNonQuery(sql);
 
+    /// <summary>
+    /// Publishes <paramref name="sql"/> — to be run LATER on THIS render's connection, so it can read the
+    /// template's own staged temp tables — as a named Arrow source, returning the token.
+    /// </summary>
+    /// <remarks>
+    /// ⚠⚠ The publication OUTLIVES this session, and it has to: <c>fluid_query</c> renders during
+    /// <c>bind_replace</c>, so by the time the generated SQL is parsed — let alone scanned — <see
+    /// cref="Dispose"/> has already run. It works because the connection is REFERENCE-COUNTED: an
+    /// unscanned publication holds the handle open, so <see cref="Dispose"/> gives up the render's claim
+    /// without closing anything, and the temporary catalog survives to be read. See FluidHostPublish and
+    /// docs/fluid-templating.md §18.
+    /// </remarks>
+    internal string Publish(string sql) => Pin().Publish(sql);
+
     // The render's connection, opened on first use.
     //
     // ⚠⚠ UNCONDITIONAL, AND THERE IS NO FALLBACK TO A FRESH CONNECTION — nor any capability probe left to

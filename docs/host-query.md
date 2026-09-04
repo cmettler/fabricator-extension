@@ -81,6 +81,21 @@ User-asked, in the shape the request gave: `con = host.connection()` / `con.quer
 *"so a exec() could create a temporary table on this connection which could be queried in the same render
 session"*. Full ABI record: [abi-history.md](abi-history.md) §v84.
 
+> **⚠ SINCE 2026-09-04 `IHostConnection` HAS A THIRD MEMBER: `Publish(sql)`** — it registers the statement
+> as a named Arrow source the hosting DuckDB can scan, returning an opaque token, and runs it LAZILY when
+> that scan pulls. It exists because a relation staged in this connection's temporary catalog has **no other
+> way** to reach the caller's statement: a temp table is invisible to every other connection, and a real
+> table created during `bind_replace` is invisible to the statement being bound. DEFAULT-implemented, so the
+> contract gained a member without breaking a plugin.
+>
+> ⚠⚠ **IT IS WHY THIS CLASS IS REFERENCE-COUNTED.** A publication must be able to ISSUE its query after the
+> render that opened the connection has finished, so an unscanned publication holds the handle open. It only
+> has to survive until `Query` RETURNS — from there the stream holds its own reference, per the Dispose
+> remark below — so the reference is given back the moment the stream exists. ⚠ Consequence of the
+> single-live-stream rule below: **only ONE publication of a connection can be scanned at a time**, and two
+> scanned together fail loudly rather than silently. Full record:
+> [fluid-templating.md](fluid-templating.md) §18.9.
+
 **It does not weaken the section above.** A pinned connection is still NOT the in-flight `ClientContext` —
 it is a connection of its own, opened on the host `DatabaseInstance`, and every reason "a FRESH connection
 per call" gives still applies to it. What changes is only its LIFETIME: instead of dying with the call it

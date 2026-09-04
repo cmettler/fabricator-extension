@@ -2449,3 +2449,219 @@ query I
 SELECT fluid_render('{% print sql_literal: false %}SELECT ''x'' AS s{% endprint %}', NULL);
 ----
 x
+
+# ============================================================================================
+# §23 — publish(name): hand a table the template STAGED to the SQL the template is generating
+#       (user-asked 2026-09-04).
+#
+# ⚠⚠ THE POINT, and why nothing else can do it: a TEMP table belongs to the ClientContext that made it,
+# and a REAL table created during bind_replace is invisible to the statement being bound (§11.1b). So a
+# NAME in the caller's catalog cannot carry a staged relation. publish() renders a TABLE FUNCTION call
+# instead, which asks the caller's catalog nothing.
+# ============================================================================================
+
+# --- the headline: the user's own example, verbatim in shape ---
+query II
+SELECT * FROM fluid_query('
+{% exec arg1: 1, arg2: 5 %}
+create temporary table _result as
+SELECT i AS n, i * i AS sq FROM range($arg1, $arg2) t(i)
+{% endexec %}
+select * from {{ publish(''_result'') }}
+') ORDER BY n;
+----
+1	1
+2	4
+3	9
+4	16
+
+# --- ⚠⚠ THE LOAD-BEARING ASSERTION: TYPES SURVIVE, because the rows never become SQL TEXT. This is the
+# whole difference from {% print sql_literal %} — and the row below it is that contrast, measured: the
+# literal renderer REFUSES a LIST outright, and collapses every temporal to TIMESTAMPTZ (§22). A DATE
+# that stays a DATE and a STRUCT that stays a STRUCT is the property publish() exists for. ---
+query III
+SELECT typeof(d), typeof(xs), typeof(s) FROM fluid_query('
+{% exec %}CREATE TEMP TABLE _t AS SELECT DATE ''2023-01-02'' AS d, [1,2,3] AS xs, {''a'': 7} AS s{% endexec %}
+SELECT * FROM {{ publish(''_t'') }}
+');
+----
+DATE	INTEGER[]	STRUCT(a INTEGER)
+
+query III
+SELECT d, xs[2], s.a FROM fluid_query('
+{% exec %}CREATE TEMP TABLE _t2 AS SELECT DATE ''2023-01-02'' AS d, [1,2,3] AS xs, {''a'': 7} AS s{% endexec %}
+SELECT * FROM {{ publish(''_t2'') }}
+');
+----
+2023-01-02	2	7
+
+# --- the contrast, so the choice between the two is not folklore: sql_literal cannot express this ---
+statement error
+SELECT fluid_render('{% print sql_literal: true %}SELECT [1,2] AS xs{% endprint %}', NULL);
+----
+{% print sql_literal %} cannot render
+
+# --- CHARACTERIZATION of the rendered text: publish() emits a scan, and it must be interpolated RAW ---
+statement ok
+CREATE TABLE pub_real AS SELECT 1 AS a;
+
+query I
+SELECT starts_with(fluid_render('{{ publish(''pub_real'') }}', NULL), 'fabricator_scan(''__fabpub_');
+----
+true
+
+# --- the case that JUSTIFIES the feature: SEVERAL staged steps, and query()/exec() still work AFTER a
+# publish on the same render — which is what shows the publication does not hold the pin's one live
+# result stream open (a second statement on a pin with a live stream is refused, §12). ---
+query III
+SELECT * FROM fluid_query('
+{% exec %}CREATE TEMP TABLE s1 AS SELECT i AS n FROM range(1,6) t(i){% endexec %}
+{% exec %}CREATE TEMP TABLE s2 AS SELECT n, n*10 AS ten FROM s1 WHERE n % 2 = 1{% endexec %}
+{% assign scan = publish(''s2'') %}
+{% query chk %}SELECT count(*) AS c FROM s2{% endquery %}
+{% exec %}CREATE TEMP TABLE after_publish AS SELECT 1{% endexec %}
+SELECT *, {{ chk[0].c }} AS staged_rows FROM {{ scan }}
+') ORDER BY n;
+----
+1	10	3
+3	30	3
+5	50	3
+
+# --- ⚠ SINGLE-USE, and it fails LOUDLY rather than returning zero rows — the silent-short-read failure
+# this repo has paid for twice. One token, two references. ⚠ Note the fix its message names (publish again)
+# is itself bounded by the row below it — two publications in ONE template cannot be scanned together. ---
+statement error
+SELECT count(*) FROM fluid_query('
+{% exec %}CREATE TEMP TABLE _t3 AS SELECT 1 AS a{% endexec %}
+{% assign p = publish(''_t3'') %}
+SELECT * FROM {{ p }} x JOIN {{ p }} y ON x.a = y.a
+');
+----
+can be scanned ONCE
+
+# --- ⚠⚠ TWO PUBLICATIONS FROM ONE TEMPLATE, SCANNED IN ONE STATEMENT, FAIL — the price of laziness, and
+# the ONE capability the buffered design had that this does not. A publication's rows stream from the
+# render's pinned connection, and a pinned connection tolerates only ONE live result stream, so two of them
+# in one plan collide. It fails LOUDLY with one of two messages depending on the plan (the pin's own v84
+# refusal, or DuckDB reporting the closed result downstream) — never silently. ⚠ The expected text is an
+# ALTERNATION over both, deliberately: which one wins is DuckDB's plan choice, not ours, and the property
+# worth pinning is that it cannot quietly half-work. MEASURED: this JOIN gives the first, while the same
+# two publications under UNION ALL give the second.
+statement error
+SELECT count(*) FROM fluid_query('
+{% exec %}CREATE TEMP TABLE _t4 AS SELECT 1 AS a UNION ALL SELECT 2{% endexec %}
+SELECT * FROM {{ publish(''_t4'') }} x JOIN {{ publish(''_t4'') }} y ON x.a = y.a
+');
+----
+<REGEX>:.*(open result stream|closed pending query result).*
+
+# --- POSITIVE CONTROL 1, and the first workaround: TWO SEPARATE RENDERS are two separate pins, so two
+# fluid_query calls in one statement each publish and scan happily. Without a control, the refusal above
+# would be equally true of a build where publish() had stopped working altogether. ---
+query I
+SELECT count(*) FROM
+  (SELECT * FROM fluid_query('{% exec %}CREATE TEMP TABLE pa AS SELECT 1 AS k UNION ALL SELECT 2{% endexec %}
+SELECT * FROM {{ publish(''pa'') }}')) x
+JOIN
+  (SELECT * FROM fluid_query('{% exec %}CREATE TEMP TABLE pb AS SELECT 1 AS k UNION ALL SELECT 2{% endexec %}
+SELECT * FROM {{ publish(''pb'') }}')) y ON x.k = y.k;
+----
+2
+
+# --- POSITIVE CONTROL 2, and the better workaround: do the join INSIDE {% exec %} and publish ONE
+# relation. This keeps the work in DuckDB instead of shipping two relations out and back, so it is the
+# answer to reach for rather than a consolation. ---
+query I
+SELECT count(*) FROM fluid_query('
+{% exec %}CREATE TEMP TABLE ja AS SELECT 1 AS k UNION ALL SELECT 2{% endexec %}
+{% exec %}CREATE TEMP TABLE jb AS SELECT 1 AS k UNION ALL SELECT 2{% endexec %}
+{% exec %}CREATE TEMP TABLE jj AS SELECT ja.k FROM ja JOIN jb ON ja.k = jb.k{% endexec %}
+SELECT * FROM {{ publish(''jj'') }}
+');
+----
+2
+
+# --- ⚠⚠ LAZY, SO THERE IS NO ROW CAP: 1.2 million rows through one publication, which is ABOVE the
+# 1,000,000-row ceiling the buffered design needed. The relation streams and the scan's disposal releases
+# it, so the only limit is what DuckDB itself can stream. (Cheap: ~0.5 s.) ---
+query II
+SELECT count(*), sum(n) FROM fluid_query('
+{% exec %}CREATE TEMP TABLE bigpub AS SELECT i AS n FROM range(1200000) t(i){% endexec %}
+SELECT * FROM {{ publish(''bigpub'') }}
+');
+----
+1200000	719999400000
+
+# --- ⚠ THE EVICTION CAP IS THE ONLY BACKSTOP for an unscanned publication, and it is a ROUTINE path
+# (an EXPLAIN publishes and never scans), so it is asserted rather than assumed. 33 publications after
+# the one we kept, the first is reclaimed AND SAYS SO — the message naming the cause is the fix this
+# section was written for, since unregistering on eviction gave only "no named source registered". ---
+statement error
+SELECT * FROM fluid_query('
+{% exec %}CREATE TEMP TABLE _t5 AS SELECT 1 AS a{% endexec %}
+{% assign first = publish(''_t5'') %}
+{% for i in (1..33) %}{% assign _ = publish(''_t5'') %}{% endfor %}
+SELECT * FROM {{ first }}
+');
+----
+was reclaimed
+
+# --- CONTROL: the identical shape with five extra publications is UNDER the cap and still works ---
+query I
+SELECT * FROM fluid_query('
+{% exec %}CREATE TEMP TABLE _t6 AS SELECT 1 AS a{% endexec %}
+{% assign first = publish(''_t6'') %}
+{% for i in (1..5) %}{% assign _ = publish(''_t6'') %}{% endfor %}
+SELECT * FROM {{ first }}
+');
+----
+1
+
+# --- ⚠ EXPLAIN renders the template — so it PUBLISHES — and never scans. It must plan cleanly; the
+# publication is simply left for the cap. ⚠ The <REGEX>: form on the physical_plan row is required, not
+# stylistic: EXPLAIN cannot be a subquery source (Parser Error), which is the convention every other
+# plan assertion in this tree uses. It also asserts more — publish()'s rendered scan reached the PLAN.
+# CHARACTERIZATION of DuckDB's bind repetition, not of our code. ---
+query II
+EXPLAIN SELECT * FROM fluid_query('
+{% exec %}CREATE TEMP TABLE _t7 AS SELECT 1 AS a{% endexec %}
+SELECT * FROM {{ publish(''_t7'') }}
+');
+----
+physical_plan	<REGEX>:.*FABRICATOR_SCAN.*
+
+# --- a name that is not there fails naming the table AND the SELECT we built from it ---
+statement error
+SELECT * FROM fluid_query('SELECT * FROM {{ publish(''nosuchstaged'') }}');
+----
+Table with name nosuchstaged does not exist
+
+# --- an empty name is refused by publish() itself, before any SQL is built ---
+statement error
+SELECT fluid_render('{{ publish('''') }}', NULL);
+----
+empty table name
+
+# --- ⚠ ONE identifier, QUOTED — so a name needing quotes works and injection is not expressible ---
+statement ok
+CREATE TABLE "pub odd" AS SELECT 5 AS a;
+
+query I
+SELECT * FROM fluid_query('SELECT * FROM {{ publish(''pub odd'') }}');
+----
+5
+
+# --- ⚠⚠ AND THE ALTERNATIVE, PINNED SO THE CHOICE IS NOT FOLKLORE: for a SINGLE query a MATERIALIZED
+# CTE inside the generated SQL is better on every axis — no publication to reclaim, no Arrow round trip,
+# full pushdown, one plan. publish() earns its keep for a MULTI-STEP staged relation, which is what the
+# multi-step row above asserts. ⚠ Laziness removes SIZE as the discriminator (there is no row cap); it
+# does not remove this one. ---
+query II
+SELECT count(*), sum(sq) FROM fluid_query('
+{% assign lo = 1 %}{% assign hi = 5 %}
+WITH _result AS MATERIALIZED (
+  SELECT i AS n, i * i AS sq FROM range({{ lo }}, {{ hi }}) t(i)
+)
+SELECT * FROM _result');
+----
+4	30

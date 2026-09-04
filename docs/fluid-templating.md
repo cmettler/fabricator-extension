@@ -1258,6 +1258,53 @@ capability, and it is nobody's fault: it is the connection model, and it would b
 generated SQL (measured: `1SELECT c FROM t` ⇒ a parser error), so a template that writes for effect must
 swallow the value.
 
+#### 11.1b-i ⚠⚠ THE RULE IS NARROWER THAN §11.1b STATES, AND THE EXCEPTION IS AN ACCIDENT OF DuckDB'S LAZY PER-CATALOG TRANSACTION START — DO NOT BUILD ON IT
+
+MEASURED 2026-09-04, while answering whether a `fluid_table(session, name)` function could read a table a
+template staged. §11.1b's conclusion is right for the DEFAULT catalog and **false for an ATTACHed catalog the
+outer transaction has not yet touched**:
+
+```sql
+ATTACH ':memory:' AS scratch;
+SELECT * FROM fluid_query('
+{% exec %}CREATE OR REPLACE TABLE scratch.st AS SELECT 42 AS a{% endexec %}
+SELECT * FROM scratch.st');
+--> a = 42        the SAME statement reads what its own template just created
+```
+
+**And it is not qualification that decides it** — the obvious explanation, and it is wrong. Three legs all
+FAIL, so the difference is not bare-vs-qualified and not default-vs-attached either:
+
+| leg | result |
+|---|---|
+| `memory.qt` — QUALIFIED, default catalog | `Table with name qt does not exist!  Did you mean "memory.qt"?` |
+| `bt` — bare, default catalog | fails, same shape |
+| `ct` — bare, attached catalog made current with `USE scratch` | `Did you mean "main.ct"?` |
+| `scratch.st` — attached catalog, **NOT** the current one | **works** |
+
+**The discriminator is whether the OUTER TRANSACTION HAS ALREADY TOUCHED THAT CATALOG**, which is
+`MetaTransaction`'s lazy per-`AttachedDatabase` transaction start: the default (or `USE`d) catalog is joined
+to the transaction before `bind_replace` runs, so its catalog snapshot predates the `{% exec %}`; a catalog
+first named in the GENERATED SQL is joined at bind time, i.e. AFTER. Proven with the pair that isolates it —
+one explicit transaction, same table shape, the only difference being one preceding read:
+
+```sql
+BEGIN;
+SELECT count(*) FROM scratch.seed;      -- touch the catalog FIRST
+SELECT * FROM fluid_query('{% exec %}CREATE OR REPLACE TABLE scratch.st2 …{% endexec %}
+                           SELECT * FROM scratch.st2');
+--> Catalog Error: Table with name st2 does not exist!
+-- CONTROL: the identical transaction WITHOUT that first read --> a = 8
+```
+
+⚠⚠ **So it is a TIMING artefact, not a supported route, and it must not be recommended or gated as a
+feature.** It breaks on anything that touches the staging catalog earlier in the same transaction — a
+preceding statement, a second `fluid_query` reading the same scratch catalog, a view whose body references
+it — and it breaks by raising a catalog error that names the table it just created, i.e. §11.1b's own
+misleading message. What it is good for is understanding WHY the sound route has to be a TABLE FUNCTION
+(§17.12): a marshaled scan reads through its own connection and asks the caller's catalog nothing, so the
+snapshot rule cannot reach it.
+
 ### 11.1a ⚠⚠ THE REFUSAL STOPS THE ACCIDENT, NOT A DETERMINED CALLER — and the hole PRE-DATES `exec()`
 
 Found by asking whether the boundary can be nested around, rather than assuming it cannot. **MEASURED
@@ -2300,3 +2347,378 @@ and the second is the one that bites:
    `HostBatchFilter`'s `WITH … AS MATERIALIZED` and `SingleScanArrowStream`, which THROWS on a second
    end-of-stream *because for a DV anti-join zero rows means deleted rows coming back*. A change that makes
    those guards look unnecessary is exactly the kind that gets them deleted later.
+
+---
+
+## 18. ✅ AS BUILT (2026-09-04) — `publish(name)`: handing a table the template STAGED to the SQL it generated
+
+> **WHAT SHIPPED**, and the spelling is the user's own choice from the analysis below —
+> `SELECT * FROM {{ publish('_result') }}`. **C#-only: no ABI change, no C++ change, and no new SQL
+> function** (it renders a call to the `fabricator_scan` that already existed). Gate
+> `verify_plugin_fluid` **344 → 386**, hermetic floor 8620 → **8662**, THREE mutants each killed at its
+> own assertion.
+>
+> ⚠⚠ **IT IS LAZY: the relation STREAMS at scan time, under no row cap, and the scan's own disposal
+> releases it** (user-directed). A first build BUFFERED; **§18.9 is what shipped, and it CORRECTS §18.8's
+> four reasons for buffering — one of which was plainly wrong, with a measurement that did not
+> discriminate.** Read §18.9 first; §18.4, §18.5 and §18.8 are kept because they are what it corrects.
+
+### 18.0 The original ask (kept, because the shape it was reaching for is what got built)
+
+
+**User-asked 2026-09-04, with the design questions raised in the same breath** — *"as the first arg is a
+pointer we would need to adjust our parameter types or use a string handle which points to a gc pinned fluid
+session. then there s question about owndership/lifetime management and not leaking memory."* The shape:
+
+```sql
+SELECT * FROM fluid_query('
+{% exec arg1: 1, arg2: 5 %}
+create temporary table _result as
+SELECT i AS n, i * i AS sq FROM range($arg1, $arg2) t(i)
+{% endexec %}
+select * from fluid_table(this, ''_result'')
+');
+```
+
+### 18.1 ⚠⚠ THE HANDLE QUESTION IS A NON-ISSUE, AND MEASURING IT FIRST IS WHAT SHRINKS THE FEATURE
+
+The transport the sketch reaches for **already exists, already takes a STRING, and already binds from inside
+`fluid_query`'s generated SQL.** Measured 2026-09-04:
+
+```sql
+SELECT count(*) FROM fluid_query('SELECT * FROM fabricator_scan(''fabricator_demo_numbers'')');
+--> 3                     a named-source scan inside GENERATED SQL binds and runs
+
+SELECT * FROM fabricator_scan('fabricator_demo_lazy');   --> prior_invocations = 0
+SELECT * FROM fabricator_scan('fabricator_demo_lazy');   --> prior_invocations = 1
+```
+
+That leading **0** is the whole property: `Host.RegisterSource(name, factory, schema)` answers the BIND from
+the declaration, so the factory runs **exactly once, at the scan** — never at `EXPLAIN`, never on a re-bind
+that is not executed. ⇒ **no new ABI entry, no new parameter type, no GC pinning, no `LogicalType::POINTER`.**
+A registry key IS the handle.
+
+⚠ **A POINTER argument would be wrong even if it were convenient.** `duckdb_arrow_scan` uses
+`{LogicalType::POINTER}` but builds its relation PROGRAMMATICALLY with `Value::POINTER(…)`; a template emits
+SQL **TEXT**, so the argument must be writable as a literal — and a raw address in SQL text is copyable,
+editable and re-runnable by anyone, i.e. the use-after-free class §17.6 was written about, reachable from
+ordinary SQL. The token must be opaque and unguessable, not an address.
+
+⚠ **There is also a replacement scan** (`NamedSourceReplacement`, `fabricator_host_query.cpp`): an
+unresolved BARE name matching a registered source is rewritten to `fabricator_scan('<name>')`. So
+`select * from _result` — the sketch without any function call — would resolve. **Do not reach for that
+spelling:** §17.1 measured the registry to be process-static, so two concurrent renders staging `_result`
+collide on the name. The token is what makes it per-render.
+
+⇒ **the better spelling needs no new SQL function at all** — one Fluid function returning the scan text:
+
+```
+{% exec %}CREATE TEMP TABLE _result AS …{% endexec %}
+SELECT * FROM {{ publish('_result') }}
+```
+
+`publish` registers a lazily-opened named source over this render's pin and renders
+`fabricator_scan('<token>')`. Reusing a measured-working mechanism beats adding a parallel one.
+
+### 18.2 ⚠⚠ THE ONE FACT THAT DECIDES IT: THE SESSION IS ALREADY DEAD BY THE TIME THE SCAN RUNS
+
+`FluidEngine.Render` holds the session in a `using var`, and `fluid_query` renders inside `GenerateSql`,
+i.e. in `bind_replace`. So:
+
+| # | event | session |
+|---|---|---|
+| 1 | binder calls `GenerateSql` → render → `{% exec %}` creates the temp table on the pin | alive |
+| 2 | `Render` returns → **`using` disposes → pin CLOSED → temp catalog destroyed** | **gone** |
+| 3 | DuckDB parses + binds the generated SQL; `fabricator_scan`'s bind runs | gone |
+| 4 | DuckDB executes; the scan pulls → the factory needs the pin | gone |
+
+⇒ **the entire feature is the lifetime rework.** Nothing else in it is unbuilt.
+
+### 18.3 Why it MUST be a table function, and not a name in the caller's catalog
+
+The tempting alternative — stage a REAL table and let the generated SQL name it — is measured
+**fragile, not merely unsupported**: see §11.1b-i. An ATTACHed catalog the outer transaction has not yet
+touched really does see the `{% exec %}`'s CREATE (`a = 42`), and one preceding read of that same catalog
+makes the identical statement fail. A marshaled scan reads through its OWN connection and asks the caller's
+catalog nothing, so `MetaTransaction`'s snapshot rule cannot reach it. That is the argument FOR the design,
+and it is the only one that survives measurement.
+
+### 18.4 ⚠ SUPERSEDED BY §18.8 — the ownership design a LAZY publication would have needed
+
+Two owners, because one is not enough:
+
+* **A refcount held by each `fabricator_scan` bind data** — prompt release on the happy path.
+* **A backstop with a bounded, longer lifetime**, because if binding the generated SQL FAILS (a typo, an
+  absent column) no bind data is ever constructed and nothing would release the session. A
+  `ClientContextState` on the CALLER's connection is the natural home — v82 hands the global function its
+  caller's `ClientContext`, and v69's scoped settings already use that destructor as the connection-close
+  signal. This is the `InOutSessionHolder` pattern: an RAII backstop on every teardown path.
+
+⚠⚠ **AND THE RECORDED OBJECTIONS TO A LONGER-LIVED SESSION DO NOT APPLY IF THE CHANGE IS SCOPED TO
+`fluid_query`.** `FluidRenderSession`'s remarks give two, and both are about `fluid_render`:
+
+1. *the session is captured at OPEN, so a connection outliving its unit of work hands every later user the
+   FIRST one's session* — measured as a WRONG VALUE (a render under `Asia/Kolkata` reporting the first
+   render's zone). Scoping the session to ONE BIND of ONE `fluid_query` call keeps the capture correct: it is
+   captured at that bind, for that bind's statement, and shared with nobody.
+2. *thread safety, since a volatile scalar may be evaluated on several threads* — `fluid_render` is that
+   scalar; `GenerateSql` is called once per bind, single-threaded.
+
+⇒ **extend the lifetime for `fluid_query` only; leave `fluid_render` per-render.** That is what turns a
+correctness-bearing rework into a contained one.
+
+### 18.5 ⚠ PARTLY SUPERSEDED BY §18.8 — three costs, and buffering removed the first two
+
+1. **⚠⚠ ONE LIVE STREAM PER PIN.** §12 measured that a second statement on a pinned connection with a live
+   result stream makes the first stream report end-of-stream — a SILENT short read — which is why the host
+   REFUSES it. Two `fluid_table`/`publish` references in one generated SQL are exactly that shape, scanned
+   in an order nobody controls. So either **one pin per published table**, or accept the refusal. It fails
+   loudly rather than truncating, which is the tolerable half; it is still the sharpest constraint in the
+   design and must be settled deliberately, not discovered.
+2. **The rows ROUND-TRIP** DuckDB(pin) → Arrow → managed → Arrow → DuckDB(caller), for data already sitting
+   in DuckDB's own memory in the same process. This tree's own number for that boundary is ~3x against a
+   native read (0.203 s vs 0.592 s on a 6M-row aggregate), so it is a real cost on a large `_result`.
+3. **Binds REPEAT.** §11 measured a view over a writing `fluid_query` writing on EVERY use (1 → 2 → 3 → 4).
+   Each bind would open its own pin, re-run the DDL and register its own token — self-consistent, but N
+   concurrent pinned DuckDB connections in the worst case.
+
+### 18.6 ⚠ What already covers most of the example, measured — so the feature is narrower than it looks
+
+**The sketch's own body is a single SELECT, and a MATERIALIZED CTE does it better** — no session, no handle,
+no round trip, full pushdown, one statement (measured 2026-09-04):
+
+```sql
+SELECT count(*), sum(sq) FROM fluid_query('
+{% assign lo = 1 %}{% assign hi = 5 %}
+WITH _result AS MATERIALIZED (
+  SELECT i AS n, i * i AS sq FROM range({{ lo }}, {{ hi }}) t(i)
+)
+SELECT * FROM _result');
+--> 4, 30
+```
+
+And for a SMALL staged result there is now a text channel that did not exist a day ago: `{% query r %}` reads
+the staged table through the pin at render time, and **`{% print sql_literal: true %}`** (§13.9) renders its
+rows as a SQL `VALUES` list in one block.
+
+⇒ **`publish` earns its keep for a genuinely MULTI-STEP staged computation.** That case is real — it is the
+whole reason to stage — but it is not the case the sketch shows, and saying so is what keeps the feature from
+being built to serve an example a CTE already answers. ⚠ §18.9 narrows this in one direction and widens it in
+another: the shipped design is LAZY, so SIZE is no longer the discriminator (there is no row cap), while a
+single statement can scan only ONE publication per template.
+
+### 18.7 The pre-build recommendation (kept — it held, and §18.8 is what it became)
+
+Buildable, and cheaper than it first appears: **no ABI change, no C++ change, no new SQL function** — one
+Fluid `publish()` function, a token registry entry, and the §18.4 lifetime rework in the plugin. The
+prerequisites are (a) deciding §18.5 item 1 (one pin per published table, or the refusal), and (b) a gate
+that pins the release path, since a leaked pinned connection is invisible to every row assertion — the same
+gap `FluidRenderSession`'s surviving `Dispose` mutant already documents.
+
+### 18.8 ⚠ SUPERSEDED BY §18.9 — the FIRST build, which buffered (kept: its reasons are what §18.9 corrects)
+
+The analysis proposed *"a lazily-opened named source over this render's pin"*. What shipped reads the rows
+**at publish time**, on the pinned connection, buffers them, and registers a replay-free in-memory source.
+Four reasons, and the first is structural rather than a preference:
+
+1. **⚠⚠ A LAZY PUBLICATION WOULD HOLD THE PIN'S ONE LIVE RESULT STREAM.** §12 measured that a second
+   statement on a pinned connection with a live stream makes the first report end-of-stream, which is why
+   the host refuses it — so a lazy publication would poison every later `query()` and `exec()` in the same
+   render, and two publications would collide with each other. Buffering opens, drains and disposes inside
+   the call. **MEASURED: a `{% query %}` AND an `{% exec %}` after a publish both still work**, which is
+   the assertion that pins it (§23's multi-step row).
+2. **A DuckDB connection is single-threaded by contract**, and a lazy factory runs at SCAN time on whatever
+   worker pulls it — possibly two at once for two publications. A buffered publication touches no
+   connection at scan time at all, so the question does not arise.
+3. **It would need the pin to outlive the render**, i.e. a refcount inside `IHostConnection` and a change to
+   its disposal contract — against a class whose per-render scoping this repo documents as
+   correctness-bearing (the `Asia/Kolkata` session-capture measurement).
+4. **`Host.RegisterSource` is in `Fabricator.Bridge`, which a plugin does not reference** (§17.4), so a host
+   service was needed either way. Buffering makes that service a single call — `IHostConnection.Publish(sql)`
+   → a token — instead of a lifetime protocol.
+
+**The cost is memory, and it is stated rather than hidden**: a host-side cap of 1,000,000 rows that ERRORS
+rather than truncating, naming the CTE as the cheaper route. ⇒ **§18.6 stands unchanged and now cuts
+harder**: for a single query a `WITH … AS MATERIALIZED` CTE is better on every axis, and `publish` is for a
+relation computed in SEVERAL steps.
+
+#### What it is made of
+
+| piece | where |
+|---|---|
+| `IHostConnection.Publish(string sql)` → token | `Fabricator.Abstractions`, **default-implemented** (the v84 precedent — a published contract gained a member without breaking a plugin) |
+| buffer + token registry + eviction | `Fabricator.Bridge/PublishedSources.cs` |
+| `publish(name)` → `fabricator_scan('<token>')` | `Fabricator.FluidPlugin/FluidHostPublish.cs` |
+
+#### ⚠⚠ THE DECLARED SCHEMA IS MANDATORY, NOT AN OPTIMISATION — and that is the design's keystone
+
+`Host.RegisterSource`'s **schema overload** is what makes a bind answer from the declaration instead of
+opening a stream to learn the columns. Since a publication is SINGLE-USE, a bind that opened one would
+CONSUME it and the scan would then find it already taken. **Mutant A — drop the declared schema — dies at
+the FIRST §23 assertion after exactly 344 pass**, i.e. at the boundary where the section begins. The
+registry's own instruments say the same thing from the other side: `fabricator_demo_lazy` reports
+`prior_invocations = 0` on its first scan where `fabricator_demo_eager` reports 1.
+
+#### ⚠ SINGLE-USE, failing LOUDLY — the silent-short-read class avoided by construction
+
+One publication is handed to exactly one stream; the entry keeps only a marker, so the buffer is released
+deterministically by the scan that consumes it. A second scan says so and names the fix. MEASURED — one
+token, two references:
+
+```
+publish: a publication can be scanned ONCE and this one has been scanned already. Call publish() again
+for a second reference — each call is an independent publication.
+```
+
+⚠ Its POSITIVE CONTROL is load-bearing: `{{ publish('t') }} x JOIN {{ publish('t') }} y` — two
+publications — **works** (2 rows). Without it the refusal would be equally true of a build where `publish`
+had stopped working altogether. **Mutant B (replayable: do not take the batches) dies at the single-use
+assertion after 370 pass.**
+
+#### ⚠⚠ THE EVICTION CAP IS A ROUTINE PATH, NOT AN ERROR PATH — and its first version named the token but not the cause
+
+Nothing in managed code can observe *"the caller's statement finished"*, and a bind that is never executed
+publishes and never scans — **an `EXPLAIN` of a generated statement is exactly that**. So an unscanned
+publication is reclaimed when it becomes the oldest of 32. **Mutant C (never evict) dies at the eviction
+assertion after 372 pass.**
+
+⚠⚠ **The first build unregistered the name on eviction, and MEASURING the path is what showed that was
+wrong**: the factory is then never reached, so the scan failed with the registry's generic
+*"no named source registered as '__fabpub_…'"* — which names the token and not the cause. Evicted tokens now
+stay REGISTERED as tombstones (a bounded second ring; a tombstone holds a schema and a closure and no rows),
+so the recent ones answer properly:
+
+```
+publish: the publication '__fabpub_…' was reclaimed — more than 32 publications have been made since,
+and an unscanned publication is only held that long. Publish it in the statement that scans it, rather
+than keeping a token across statements.
+```
+
+#### ⚠⚠ THE MEASUREMENT THAT JUSTIFIES THE FEATURE OVER `{% print sql_literal %}`: TYPES SURVIVE
+
+The rows never become SQL text, so nothing is collapsed and nothing is refused. MEASURED and gated:
+
+| staged column | through `publish` | through `{% print sql_literal %}` |
+|---|---|---|
+| `DATE '2023-01-02'` | `DATE` | `'2023-01-02 00:00:00.000000+00:00'::TIMESTAMPTZ` — the instant survives, the TYPE does not |
+| `[1,2,3]` | `INTEGER[]` | **refused by name** |
+| `{'a': 7}` | `STRUCT(a INTEGER)` | **refused by name** |
+
+⚠ Gated as a CONTRAST — the `sql_literal` refusal is asserted immediately below the `publish` row — so the
+choice between the two surfaces is a pinned fact rather than folklore.
+
+#### Smaller decisions, each with its reason
+
+* **ONE identifier, quoted** through `DuckSql.QuoteIdent`, so `publish('pub odd')` works (gated) and
+  injection is not expressible. ⚠ A DOTTED name is one identifier, not a qualified one, and fails as
+  "table does not exist". A general `publish`-a-query surface is the follow-on.
+* **The token is an opaque `__fabpub_<32 hex>`**, never an address — §18.1's reason, unchanged: it goes into
+  SQL text, where anything copyable and re-runnable becomes the use-after-free class §17 exists to have
+  closed.
+* **Registered on BOTH surfaces**, and inert on one: in `fluid_render` the rendered scan is text nobody
+  binds, and being a per-row scalar it would publish per row. Not refused — branching on the caller's name
+  is what the `exec()` decision rejected (§11.1) — but documented.
+* **A missing table fails naming BOTH the table and the SELECT we built** (`SELECT * FROM "x"`), which is
+  what makes the quoting visible when a name is wrong.
+
+#### ⚠ Two traps paid for while building it
+
+1. **`dotnet build dotnet/Fabricator.FluidPlugin` DOES NOT COMPILE THE BRIDGE**, because the plugin
+   references `Fabricator.Abstractions` and `Fabricator.Common` and deliberately not the Bridge (§2). A
+   missing `using Apache.Arrow.Ipc;` in `PublishedSources.cs` therefore reported **"Build succeeded"** and
+   failed at `publish-managed.ps1` instead. Build `Fabricator.Bridge` too, or publish, before believing a
+   green plugin build.
+2. **`EXPLAIN` CANNOT BE A SUBQUERY SOURCE** — a recorded trap walked into anyway. The gate's `EXPLAIN`
+   assertion uses the `<REGEX>:` form on the `physical_plan` row, which is both required and stronger: it
+   asserts that `publish`'s rendered scan reached the PLAN.
+
+#### Still open, deliberately
+
+* **A per-statement release** would make the eviction cap unnecessary. It needs the C++ `fabricator_scan`
+  bind data's destructor to report through the ABI — an ABI change, hence not in this one.
+* **A `publish`-a-query form** (`publish_query('SELECT …')`) would cover qualified and computed sources.
+  Declined for now: the pairing with `{% exec %}` is the intended one, and one surface is easier to keep
+  honest than two.
+* **The row cap is UNGATED** — reaching it needs a million staged rows, which no hermetic suite should
+  build. Asserted by reading, not by running.
+
+### 18.9 ⚠⚠ IT IS LAZY, AND §18.8's FOUR REASONS FOR BUFFERING WERE ONE AND A HALF (user-directed, 2026-09-04)
+
+The user, reading §18.8: *"it is nice but i actually would have prefered a lazy approach without buffering
+and automatic release of resources after scan."* They were right, and the correction matters more than the
+rebuild — **my lead argument was simply wrong, and the measurement I offered for it did not discriminate.**
+
+#### What each reason was worth
+
+| §18.8's reason | verdict |
+|---|---|
+| 1. a lazy publication would hold the pin's ONE live stream and *"poison every later `query()`/`exec()` in the same render"* | **WRONG.** A lazy publication opens NOTHING at publish time; the stream opens at SCAN time, by which point the render is over and there are no later `query()`/`exec()` calls to poison. |
+| 2. a DuckDB connection is single-threaded, and a lazy factory runs on a worker | **collapses into the same case as 1.** MEASURED: a 500,000-row publication at `threads=8` invokes the factory exactly ONCE. |
+| 3. the pin must outlive the render | **REAL, and it is the whole job** — but much smaller than priced, see below. |
+| 4. `Host.RegisterSource` is Bridge-only | **NEUTRAL.** True, and true of either design; the service was needed either way. |
+
+**⚠⚠ AND THE MEASUREMENT I CITED FOR REASON 1 WAS VACUOUS.** §18.8 offers *"MEASURED that buffering removes
+the hazard: a `{% query %}` AND an `{% exec %}` after a publish both still work"*. That passes on the LAZY
+build too (re-measured), because a lazy publish leaves no live stream either — its schema probe is disposed
+before it returns. **A measurement that both designs satisfy is not evidence for one of them**, and
+presenting it as such is the error this file keeps recording in other forms.
+
+#### ⚠⚠ Reason 3 was much cheaper than priced, because the refcount ALREADY EXISTS — in C++, from v84
+
+`Host.HostConnection.Dispose`'s own remark: *"safe with result streams still outstanding: each holds its own
+reference to the underlying connection, so it dies with the last of them rather than under a live stream."*
+⇒ **once `Query` has RETURNED, nothing managed needs to keep the connection alive** — the stream does, and
+the temporary catalog holding the staged table lives exactly as long as the stream does. So the only thing
+that must survive the render is the HANDLE, so a scan can still ISSUE its query.
+
+That makes the managed side a plain reference count on `PinnedHostConnection`: the render holds one
+(given back by `Dispose`, idempotently), each unscanned publication holds one more, and a publication gives
+its reference back **the moment `Query` returns** — not when the stream ends. `Open` is ~15 lines and there
+is **no wrapper stream at all**.
+
+- **MUTANT D — the publication takes no reference — dies at the FIRST §23 assertion after exactly 344 pass**,
+  with `Cannot access a disposed object. Object name: 'HostConnection'`: the pin closes at end of render and
+  the scan cannot issue its query. That is the mechanism, named by its own failure.
+- ⚠ `Dispose` must be IDEMPOTENT (`_renderReleased`), because `FluidRenderSession` disposes from a `using`
+  and an over-decrement would close the connection under a publication that has not been scanned.
+
+#### What the user gets, measured
+
+* **NO ROW CAP.** `MaxRows` is gone. MEASURED: **3,000,000 rows** through one publication, checksum exact
+  (`4499998500000`) — where the buffered design refused above 1,000,000. Gated at 1.2M, which runs in ~0.5 s.
+* **RELEASE BY THE SCAN.** The rows are the stream's; disposing it releases everything, and the token is
+  claimed at open so nothing is held afterwards.
+
+#### ⚠⚠ WHAT IT COSTS, AND IT IS A REAL CAPABILITY THE BUFFERED BUILD HAD
+
+**Two publications from ONE template, scanned in one statement, FAIL.** Both stream from the render's single
+pinned connection, and a pinned connection tolerates only one live result stream. MEASURED, and the message
+depends on the PLAN:
+
+| shape | outcome |
+|---|---|
+| `{{ publish('t') }} x JOIN {{ publish('t') }} y` | our v84 refusal — *"this pinned host connection still has an open result stream"* |
+| `SELECT * FROM {{ publish('u') }} UNION ALL SELECT * FROM {{ publish('u') }}` | DuckDB's — *"Attempting to execute an unsuccessful or closed pending query result"* |
+
+⚠ **Neither is silent**, which is what makes the trade acceptable — and the gate's expected text is an
+ALTERNATION over both, because which one wins is DuckDB's plan choice and not ours.
+
+**TWO WORKAROUNDS, both measured, and the second is better than what it replaces:**
+
+1. **Two separate renders are two separate pins** — two `fluid_query` calls in one statement each publish
+   and scan happily (gated, joins to 2).
+2. **Do the join inside `{% exec %}` and publish ONE relation** (gated, joins to 2). This keeps the work in
+   DuckDB rather than shipping two relations out through Arrow and back, so it is the answer to reach for.
+
+⚠ **A serializing lock was considered and REJECTED**: the measured JOIN opens both streams before draining
+either, so blocking the second would deadlock whenever the executor needs it before the first — and this
+repo's standing rule is that a hang is worse than an error. **A hybrid (lazy for the first publication on a
+pin, buffered for the rest) is buildable and was declined**: it makes the memory characteristics depend on
+the ORDER of `publish()` calls, which is the "runs and means something different" shape this file keeps
+warning about. One code path with one set of properties is easier to keep honest.
+
+#### The other cost, restated because it inverted
+
+An unscanned publication now holds a **DuckDB connection and its staged table** open until the eviction cap
+reclaims it, where the buffered design held **rows in managed memory** under a row cap. Same cap, different
+resource. `EXPLAIN` is the routine path that produces one.
