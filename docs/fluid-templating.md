@@ -761,8 +761,40 @@ placeholder `$sql`. **The field name in a params batch is now load-bearing**, wh
 
 Number → `BIGINT` when integral and in range, else `DECIMAL(38, scale)`; String → VARCHAR; Boolean → BOOLEAN;
 DateTime → `TIMESTAMP` stamped UTC (§7.4a's rule on the way in applies on the way out); Nil → a NULL VARCHAR.
-A LIST/STRUCT/MAP is **refused by name** — DuckDB has no parameter form for them here, and rendering one into
-the SQL is precisely what parameters exist to avoid.
+An **ARRAY binds as a SQL LIST** (see below); a STRUCT/MAP is **refused by name** — rendering one into the
+SQL is precisely what parameters exist to avoid.
+
+##### ⚠⚠ A LIST parameter — added 2026-09-04, and it REPLACES a refusal this document used to state
+
+The line above read *"A LIST/STRUCT/MAP is refused by name — DuckDB has no parameter form for them here"*.
+The second half was **false, and it was ours**: MEASURED, `PREPARE p AS SELECT a: unnest($1); EXECUTE
+p([1,2,3,4,5])` yields five rows, and DuckDB does not even need the parameter typed. So
+
+```liquid
+{% query r xs: v %}SELECT count(*) FROM t WHERE region IN (SELECT unnest($xs)){% endquery %}
+```
+
+crosses the list as VALUES instead of forcing the `{{ v | json }}::json[]` splice it used to.
+
+- **⚠⚠ ONE element kind per list, because an Arrow list is TYPED.** A mixed list is REFUSED by name rather
+  than coerced: the only common representation is text, and turning `5` into `'5'` silently changes what the
+  statement compares. NULL elements carry no kind, so they mix with anything. ⚠ The mixed case is reachable
+  ONLY through the JSON parameter form — a DuckDB LIST is homogeneous, so `{v: [1,'a']}` fails in DuckDB's
+  own struct construction first.
+- The element type uses the SAME int64 → decimal ladder as the scalar path, decided over the WHOLE list: one
+  non-integral element makes every element a decimal, and the widest scale wins so `19.99` stays `19.99`.
+- **⚠ An EMPTY or all-NULL list has no element kind to read off** ⇒ VARCHAR, which is the choice the scalar
+  NULL case already makes and for the same reason (it is what DuckDB casts most freely FROM, so
+  `$xs::BIGINT[]` still works, and `unnest` of it yields no rows either way).
+- **NESTED arrays and structs are refused** — the same one-level rule the scalar ladder has.
+
+**⚠⚠ THE BUILD HAD THE JANUARY-1970 BUG, IN A NEW PLACE, AND ONLY A DATE ELEMENT SHOWED IT.** The first
+version appended through `ListArray.Builder.ValueBuilder`, which does **not** carry a `TimestampType`'s UNIT
+into the builder it creates: values were stored as MILLISECONDS under a field declaring MICROSECONDS, so
+`DATE '2023-01-02'` read back as `1970-01-20 09:36:57.6`. That is the exact signature this repo already
+records for hand-rolled Arrow timestamp sites — and numbers, strings and booleans have nothing to get wrong,
+so a battery without a date would have shipped it. The values array is now built with an explicitly typed
+builder and the list assembled by hand.
 
 - **⚠ Fluid's number model IS decimal (§7.3), so even `10` arrives as one.** The integral case is narrowed
   back to BIGINT so the ordinary spelling behaves like the literal it replaced; a fractional value keeps its
@@ -1674,7 +1706,7 @@ the sketch keystroke for keystroke.
 
 A tag's arguments arrive as unevaluated `FilterArgument`s (name + expression) where a filter's arrive
 already evaluated, so `BuildBlockParametersAsync` evaluates each and hands it to the SAME `ToParameter`
-the filter form uses. The int64→decimal ladder, the UTC stamp on dates and the refusal of LIST/STRUCT/MAP
+the filter form uses. The int64→decimal ladder, the UTC stamp on dates, the LIST element rules and the refusal of STRUCT/MAP
 therefore cannot drift between a filter and a block.
 
 ⚠ POSITIONAL arguments are REFUSED rather than ignored (the statement references `$name`, so an unnamed one

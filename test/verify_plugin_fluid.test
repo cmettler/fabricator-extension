@@ -1008,11 +1008,14 @@ SELECT fluid_render('{% assign rs = "SELECT $a" | query: 5, a: 1 %}x', NULL);
 ----
 positional argument
 
-# A LIST has no SQL parameter form and is refused BY NAME rather than rendered into the statement.
-statement error
-SELECT fluid_render('{% assign L = (1..3) %}{% assign rs = "SELECT $a" | query: a: L %}x', NULL);
+# ⚠⚠ A LIST BINDS AS A SQL LIST — this assertion used to pin the OPPOSITE ("has no SQL parameter
+# form") and was falsified deliberately on 2026-09-04, which is how the change announced itself.
+# It is REPLACED rather than deleted: the point of the row is that the filter form and the block
+# form share ONE conversion table, so whatever a list does in one it must do in the other (§17).
+query I
+SELECT fluid_render('{% assign L = (1..3) %}{% assign rs = "SELECT len($a) AS n" | query: a: L %}n={{ rs[0].n }}', NULL);
 ----
-has no SQL parameter form
+n=3
 
 # ⚠ A MISSING parameter is DuckDB's own error and it NAMES the parameter — better than anything we could
 # invent, and the reason nothing here tries to pre-validate the placeholder set.
@@ -2062,3 +2065,90 @@ statement error
 SELECT fluid_render('{% query t arg1: 1 arg2: 2 %}SELECT $arg1 AS a{% endquery %}x', NULL);
 ----
 Invalid query tag
+
+# ============================================================================================
+# §17 — A LIST PARAMETER. `{% query r xs: v %}… $xs …{% endquery %}` binds a Fluid ARRAY as a
+# real SQL LIST, so `unnest($xs)` / `x IN (SELECT unnest($xs))` work without splicing text.
+#
+# ⚠ The refusal this replaces was OURS, not DuckDB's: MEASURED, `PREPARE p AS SELECT a: unnest($1);
+# EXECUTE p([1,2,3,4,5])` yields five rows, and even untyped.
+#
+# ⚠⚠ ONE element kind per list, because an Arrow list is TYPED. A mixed list is REFUSED by name
+# rather than coerced — the only common representation is text, and turning 5 into '5' silently
+# changes what the statement compares. NULL elements carry no kind, so they mix with anything.
+# ============================================================================================
+
+# --- the shape this was asked for ---
+query I
+SELECT fluid_render('{% query r xs: v %}SELECT a: unnest($xs){% endquery %}{% for x in r %}{{ x.a }} {% endfor %}', {v: [1,2,3,4,5]});
+----
+1 2 3 4 5 
+
+# --- ⚠⚠ THE LOAD-BEARING PAIR: an element crosses as a VALUE, not as SQL text ---
+# The first row alone is worthless — `n=0` is equally true of a build where the parameter never
+# arrived. The control proves it IS being used, and splicing would answer 2 rather than 0.
+query I
+SELECT fluid_render('{% query r xs: v %}SELECT count(*) AS n FROM (VALUES (''eu''),(''us'')) t(x) WHERE x IN (SELECT unnest($xs)){% endquery %}n={{ r[0].n }}', {v: ['eu'' OR 1=1 --']});
+----
+n=0
+
+query I
+SELECT fluid_render('{% query r xs: v %}SELECT count(*) AS n FROM (VALUES (''eu''),(''us''),(''eu'')) t(x) WHERE x IN (SELECT unnest($xs)){% endquery %}n={{ r[0].n }}', {v: ['eu','xx']});
+----
+n=2
+
+# --- the int64 -> decimal ladder is decided over the WHOLE list, and keeps scale ---
+query I
+SELECT fluid_render('{% query r xs: v %}SELECT sum(u)::VARCHAR AS s FROM (SELECT unnest($xs) AS u){% endquery %}s={{ r[0].s }}', {v: [19.99, 0.01]});
+----
+s=20.00
+
+# --- booleans ---
+query I
+SELECT fluid_render('{% query r xs: v %}SELECT count(*) FILTER (WHERE u) AS n FROM (SELECT unnest($xs) AS u){% endquery %}n={{ r[0].n }}', {v: [true,false,true]});
+----
+n=2
+
+# --- ⚠⚠ DATES, AND THIS ONE CAUGHT A REAL BUG ---
+# The first build appended through `ListArray.Builder.ValueBuilder`, which does NOT carry a
+# TimestampType's UNIT into the builder it creates: values were stored as MILLISECONDS under a field
+# declaring MICROSECONDS, so DATE '2023-01-02' read back as 1970-01-20 09:36:57.6 — the exact
+# January-1970 signature this repo already recorded for hand-rolled Arrow timestamp sites. Only a
+# DATE element can show it; numbers, strings and booleans have nothing to get wrong.
+# ⚠ Asserted as an INSTANT (epoch seconds), never as rendered text: a TIMESTAMPTZ renders in the
+# session's zone, so pinning the string would assert the runner's locale instead of the value.
+query I
+SELECT fluid_render('{% query r xs: v %}SELECT epoch(min(u))::BIGINT AS e FROM (SELECT unnest($xs) AS u){% endquery %}e={{ r[0].e }}', {v: [DATE '2024-03-01', DATE '2023-01-02']});
+----
+e=1672617600
+
+# --- NULL elements carry no kind, so they mix with a typed list ---
+query I
+SELECT fluid_render('{% query r xs: v %}SELECT count(u) AS nn, count(*) AS tot FROM (SELECT unnest($xs) AS u){% endquery %}nn={{ r[0].nn }} tot={{ r[0].tot }}', {v: [1,NULL,3]});
+----
+nn=2 tot=3
+
+# --- an EMPTY list has no element kind to read off; VARCHAR is the same choice the scalar NULL
+# case makes, and `unnest` of it yields no rows whatever the type ---
+query I
+SELECT fluid_render('{% query r xs: v %}SELECT count(*) AS n FROM (SELECT unnest($xs) AS u){% endquery %}n={{ r[0].n }}', {v: []});
+----
+n=0
+
+# --- a MIXED list is refused BY NAME. ⚠ Only reachable through the JSON parameter form: a DuckDB
+# LIST is homogeneous, so `{v: [1,'a']}` fails in DuckDB's own struct construction first. ---
+statement error
+SELECT fluid_render('{% query r xs: v %}SELECT count(*) FROM (SELECT unnest($xs)){% endquery %}ok', '{"v":[1,"a"]}');
+----
+its elements mix Number and String
+
+# --- and a NESTED array or struct is refused, the same one-level rule the scalar ladder has ---
+statement error
+SELECT fluid_render('{% query r xs: v %}SELECT count(*) FROM (SELECT unnest($xs)){% endquery %}ok', {v: [[1,2],[3]]});
+----
+a nested value has no SQL list form
+
+statement error
+SELECT fluid_render('{% query r xs: v %}SELECT count(*) FROM (SELECT unnest($xs)){% endquery %}ok', {v: [{'a':1}]});
+----
+a nested value has no SQL list form

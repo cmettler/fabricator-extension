@@ -444,6 +444,11 @@ case "$TIER" in
         # in that section is load-bearing and a mutant proved it: an earlier `USE memory.hq_s` leaves a
         # qualified entry, against which the bug does not fire, so the section PASSED with it fully present.
         # 8250 + 9 = 8259 exactly, from a green run.
+        # 8583 since 2026-09-04: verify_plugin_fluid 296 -> 307 -- a Fluid ARRAY binds as a SQL LIST
+        #   ({% query r xs: v %}… unnest($xs) …), replacing a refusal that was OURS and not DuckDB's
+        #   (measured: PREPARE p AS SELECT a: unnest($1); EXECUTE p([1,2,3,4,5]) yields five rows).
+        #   ⚠ One of the 11 is a REPLACED assertion, not a new one: the suite used to pin "has no SQL
+        #   parameter form" for the filter spelling, and falsifying it is how the change announced itself.
         # 8572 since 2026-09-03 (same day, seventh bump): verify_delta_catalog_native_write 147 -> 148 --
         #   the NATIVE-path half of the bound-input leak gate. Both COPY sites in
         #   NativeParquetDataFileWriter used to take a unique view name and DROP it afterwards; the views are
@@ -479,7 +484,7 @@ case "$TIER" in
         # two functions have exactly ONE registration each, plus the HostsCatalog refusal and its
         # unknown-provider control. 3105 + 238 + 8259 - 3339 arithmetic aside, both numbers come from green
         # runs.
-        : "${MIN_ASSERTIONS:=8572}"
+        : "${MIN_ASSERTIONS:=8583}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

@@ -1428,9 +1428,22 @@ SELECT fluid_render(
 ```
 
 Numbers, strings, booleans, dates and `nil` can be bound; an integral number binds as `BIGINT` and a
-fractional one keeps its exact scale. A list or struct is refused by name — build those in SQL. Every
-parameter must be **named**: a positional argument is an error rather than silently ignored, and a
-parameter the statement wants but you did not supply is reported by DuckDB, naming it.
+fractional one keeps its exact scale. Every parameter must be **named**: a positional argument is an error
+rather than silently ignored, and a parameter the statement wants but you did not supply is reported by
+DuckDB, naming it.
+
+**A list binds too**, so you can pass a set of values without building it in SQL:
+
+```sql
+SELECT fluid_render(
+  '{% query r xs: v %}SELECT count(*) AS n FROM orders WHERE region IN (SELECT unnest($xs))
+   {% endquery %}{{ r[0].n }}', {v: ['eu','us']});
+```
+
+Its elements must all be of one kind — numbers, strings, booleans or dates, with `nil`s allowed anywhere
+among them. A mixed list, a nested list and a struct are each refused by name rather than coerced, because
+the only shape they all share is text and turning `5` into `'5'` would quietly change what the statement
+compares.
 
 > ⚠ **`query()` runs `SELECT` statements only, and this is not a policy you can turn off.** A template is
 > rendered while a statement is being *bound*, and binding repeats and happens without executing — so a
