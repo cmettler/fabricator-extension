@@ -118,11 +118,11 @@ internal static class FluidEngine
                 return completion;
             }
 
-            var (delim, rowDelim, rest) = await FluidHostPrint.SplitOptionsAsync(args, ctx);
+            var (delim, rowDelim, sqlLiteral, rest) = await FluidHostPrint.SplitOptionsAsync(args, ctx);
             var parameters = await FluidHostQuery.BuildBlockParametersAsync(
                 FluidHostQuery.CallerOf(ctx), FluidHostPrint.BlockName, rest, ctx);
             var rows = FluidHostQuery.RunCaptured(ctx, FluidHostPrint.BlockName, sql, parameters);
-            await FluidHostPrint.WriteRowsAsync(rows, output, encoder, ctx, delim, rowDelim);
+            await FluidHostPrint.WriteRowsAsync(rows, output, encoder, ctx, delim, rowDelim, sqlLiteral);
             return Completion.Normal;
         });
 

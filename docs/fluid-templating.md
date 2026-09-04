@@ -1612,11 +1612,26 @@ block cannot quietly pick the other one.
 - `delim` joins the VALUES of a row (default a space), `rowdelim` joins the ROWS (default a newline). Both
   are **JOINERS, not terminators** — nothing before the first row or after the last, so composing the block
   into a larger string does not leave a stray separator. A caller who wants a trailing one writes it.
+- `sql_literal` (default false) renders each value as a DuckDB **SQL literal** instead of as text — the
+  SAME `FluidValueModel.SqlLiteral` the `{{ v | sql }}` filter uses, so the two cannot disagree about
+  quoting, about the invariant number format, or about which values are refused. What it is for:
+
+  ```liquid
+  INSERT INTO t VALUES ({% print sql_literal: true, delim: ", ", rowdelim: "), (" %}
+  SELECT id, name FROM staging
+  {% endprint %});
+  ```
+
+  ⚠ It is an **ALLOW-LIST, not an escaper**: a cell with no provably safe rendering (a LIST, a STRUCT) is
+  refused BY NAME rather than stringified, and the refusal names `{% print sql_literal %}` rather than the
+  `sql` filter the author never wrote. ⚠ It inherits the filter's temporal rule — every date renders as a
+  `TIMESTAMPTZ` literal, so the INSTANT survives and the TYPE does not — and it writes RAW, bypassing the
+  encoder, because an encoder would turn the quotes it exists to produce into `&#39;`.
 - No IDENTIFIER, unlike `{% query name %}` and `{% exec name %}`: there is nothing to bind, so the header is
   arguments-only and needs none of §13.8's lookahead.
 
-**⚠⚠ `delim` and `rowdelim` are RESERVED ARGUMENT NAMES**, so a statement wanting a parameter of either name
-cannot get one. Accepted because it fails LOUDLY — DuckDB reports the parameter it was not given, BY NAME —
+**⚠⚠ `delim`, `rowdelim` and `sql_literal` are RESERVED ARGUMENT NAMES**, so a statement wanting a parameter
+of any of those names cannot get one. Accepted because it fails LOUDLY — DuckDB reports the parameter it was not given, BY NAME —
 rather than silently binding nothing. ⚠ The request's `delim := " "` spelling is not expressible: Fluid's
 grammar is `name: value`, and inventing one would be a grammar only this plugin speaks, which is the reason
 `ArgumentsList` was reused for the other blocks in the first place.

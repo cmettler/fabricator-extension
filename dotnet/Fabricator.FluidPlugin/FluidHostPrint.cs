@@ -34,6 +34,9 @@ internal static class FluidHostPrint
     /// <summary>Separator between ROWS. Default a newline.</summary>
     internal const string RowDelimArg = "rowdelim";
 
+    /// <summary>Render each value as a DuckDB SQL LITERAL rather than as text. Default false.</summary>
+    internal const string SqlLiteralArg = "sql_literal";
+
     internal const string DefaultDelim = " ";
     internal const string DefaultRowDelim = "\n";
 
@@ -51,15 +54,17 @@ internal static class FluidHostPrint
     /// expressible; inventing one would be a grammar only this plugin speaks (the reason
     /// <c>ArgumentsList</c> was reused in the first place).
     /// </remarks>
-    internal static async ValueTask<(string Delim, string RowDelim, List<FilterArgument> Parameters)>
+    internal static async ValueTask<(string Delim, string RowDelim, bool SqlLiteral,
+                                     List<FilterArgument> Parameters)>
         SplitOptionsAsync(IReadOnlyList<FilterArgument>? args, TemplateContext ctx)
     {
         var delim = DefaultDelim;
         var rowDelim = DefaultRowDelim;
+        var sqlLiteral = false;
         var rest = new List<FilterArgument>();
         if (args is null)
         {
-            return (delim, rowDelim, rest);
+            return (delim, rowDelim, sqlLiteral, rest);
         }
         foreach (var arg in args)
         {
@@ -71,12 +76,16 @@ internal static class FluidHostPrint
             {
                 rowDelim = (await arg.Expression.EvaluateAsync(ctx)).ToStringValue();
             }
+            else if (string.Equals(arg.Name, SqlLiteralArg, StringComparison.OrdinalIgnoreCase))
+            {
+                sqlLiteral = (await arg.Expression.EvaluateAsync(ctx)).ToBooleanValue();
+            }
             else
             {
                 rest.Add(arg);
             }
         }
-        return (delim, rowDelim, rest);
+        return (delim, rowDelim, sqlLiteral, rest);
     }
 
     /// <summary>Writes the rows, values joined by <paramref name="delim"/> and rows by
@@ -86,9 +95,15 @@ internal static class FluidHostPrint
     /// last. A trailing newline would be invisible in most templates and wrong in the ones that compose
     /// this into a larger string, and a caller who wants one can write it.
     /// </remarks>
+    /// <param name="sqlLiteral">Render each value as a DuckDB SQL literal instead of as text — the SAME
+    /// <see cref="FluidValueModel.SqlLiteral"/> the <c>{{ v | sql }}</c> filter uses, so the two spellings
+    /// cannot disagree about quoting, about the invariant number format, or about which values are refused.
+    /// ⚠ It is an ALLOW-LIST, not an escaper: a cell whose rendering is not provably safe (a LIST, a STRUCT)
+    /// is refused BY NAME rather than stringified, and the refusal names this block.</param>
     internal static async ValueTask WriteRowsAsync(FluidValue rows, IFluidOutput output,
                                                    System.Text.Encodings.Web.TextEncoder encoder,
-                                                   TemplateContext ctx, string delim, string rowDelim)
+                                                   TemplateContext ctx, string delim, string rowDelim,
+                                                   bool sqlLiteral = false)
     {
         bool firstRow = true;
         await foreach (var row in rows.EnumerateAsync(ctx))
@@ -110,7 +125,18 @@ internal static class FluidHostPrint
                     output.Write(delim);
                 }
                 firstCell = false;
-                await cell.WriteToAsync(output, encoder, ctx.CultureInfo);
+                if (sqlLiteral)
+                {
+                    // ⚠ Written RAW, not through the encoder: the output is SQL text, and an encoder would
+                    // turn the quotes this very option exists to produce into &#39; — corrupting every
+                    // literal. The same reason the {% exec %} block renders its body with NullEncoder.
+                    output.Write(FluidValueModel.SqlLiteral(cell, ctx,
+                                                            "{% " + BlockName + " " + SqlLiteralArg + " %}"));
+                }
+                else
+                {
+                    await cell.WriteToAsync(output, encoder, ctx.CultureInfo);
+                }
             }
         }
     }

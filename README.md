@@ -1605,9 +1605,22 @@ SELECT i AS n, i*i AS sq FROM range(1, 4) t(i)
 ```
 
 `delim` joins the values of a row (default a space) and `rowdelim` joins the rows (default a newline); both
-are joiners, so nothing is written before the first row or after the last. Any other named argument is a
-bound parameter, exactly as in `{% query %}` — which means a statement cannot have a parameter called
-`delim` or `rowdelim`, and DuckDB will say so by name if you try.
+are joiners, so nothing is written before the first row or after the last.
+
+`sql_literal: true` renders each value as a **SQL literal** rather than as text — the same conversion
+`{{ v | sql }}` performs — which is what makes a result set into a `VALUES` list:
+
+```sql
+SELECT fluid_render('INSERT INTO t VALUES ({% print sql_literal: true, delim: ", ", rowdelim: "), (" %}
+SELECT i, ''v''||i FROM range(1, 3) t(i)
+{% endprint %});', NULL);
+-- INSERT INTO t VALUES (1, 'v1'), (2, 'v2');
+```
+
+Like the filter it is an allow-list, not an escaper: a list or struct cell is refused by name rather than
+stringified. Any other named argument is a bound parameter, exactly as in `{% query %}` — so a statement
+cannot have a parameter called `delim`, `rowdelim` or `sql_literal`, and DuckDB will say so by name if you
+try.
 
 **Name the `{% exec %}` block to get the affected-row count**, the same way `{% query name %}` names its
 result:

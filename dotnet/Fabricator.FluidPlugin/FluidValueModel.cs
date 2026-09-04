@@ -404,8 +404,13 @@ internal static class FluidValueModel
     /// (<c>{{ d | date: '%Y-%m-%d' | sql }}::DATE</c>, which also needs no ICU). See
     /// docs/fluid-templating.md §7.4a.</para>
     /// </remarks>
-    private static string SqlLiteral(FluidValue input, TemplateContext ctx)
+    /// <param name="surface">What to NAME in the refusal — the <c>sql</c> filter by default, and
+    /// <c>{% print sql_literal: true %}</c> when the print block borrows this. ⚠ Not cosmetic: a message
+    /// naming a filter the author did not write sends them looking in the wrong place, which is the same
+    /// defect the SELECT-only refusal had until the print block exposed it.</param>
+    internal static string SqlLiteral(FluidValue input, TemplateContext ctx, string? surface = null)
     {
+        surface ??= "the 'sql' filter";
         var clr = input is null or NilValue ? null : input.ToObjectValue(ctx);
         try
         {
@@ -414,7 +419,7 @@ internal static class FluidValueModel
         catch (NotSupportedException)
         {
             throw new ArgumentException(
-                $"fabricator: the 'sql' filter cannot render a {clr?.GetType().Name ?? "null"} as a SQL "
+                $"fabricator: {surface} cannot render a {clr?.GetType().Name ?? "null"} as a SQL "
                 + "literal — apply it to a number, a string, a boolean, a date/time or nil. For a list, loop "
                 + "and quote each element.");
         }

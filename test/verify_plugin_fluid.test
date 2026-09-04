@@ -2396,3 +2396,56 @@ statement error
 SELECT fluid_render('{% print %}   {% endprint %}', NULL);
 ----
 {% print %} block is empty
+
+# ============================================================================================
+# §22 — {% print sql_literal: true %} renders each value as a DuckDB SQL LITERAL (user-asked).
+#
+# ⚠ It is the SAME FluidValueModel.SqlLiteral the {{ v | sql }} filter uses, not a second
+# conversion — so the two cannot disagree about quoting, about the invariant number format, or
+# about which values are refused. One assertion below states that agreement directly.
+# ============================================================================================
+
+query I
+SELECT fluid_render('{% print sql_literal: true, delim: ", " %}SELECT ''O''''Brien'' AS n, 42 AS a, NULL AS z, true AS b{% endprint %}', NULL);
+----
+'O''Brien', 42, NULL, true
+
+# --- ⚠ the DEFAULT is unchanged, and the contrast is the point: text rendering leaves the quote
+# bare and a NULL empty, which is right for prose and wrong for SQL ---
+query I
+SELECT fluid_render('{% print delim: ", " %}SELECT ''O''''Brien'' AS n, 42 AS a, NULL AS z, true AS b{% endprint %}', NULL);
+----
+O'Brien, 42, , true
+
+# --- what the option is FOR: building a VALUES list out of a result ---
+query I
+SELECT fluid_render('({% print sql_literal: true, delim: ", ", rowdelim: "), (" %}SELECT i, ''v''||i FROM range(1,3) t(i){% endprint %})', NULL);
+----
+(1, 'v1'), (2, 'v2')
+
+# --- ⚠⚠ IT AGREES WITH THE FILTER, because it IS the filter's conversion ---
+query I
+SELECT fluid_render('{% print sql_literal: true %}SELECT ''O''''Brien'' AS n{% endprint %}|{{ v | sql }}', {v: 'O''Brien'});
+----
+'O''Brien'|'O''Brien'
+
+# --- ⚠ AN ALLOW-LIST, NOT AN ESCAPER: a value with no provably safe rendering is refused BY NAME,
+# and the refusal names THIS BLOCK rather than the `sql` filter the author never wrote ---
+statement error
+SELECT fluid_render('{% print sql_literal: true %}SELECT [1,2] AS xs{% endprint %}', NULL);
+----
+{% print sql_literal %} cannot render
+
+# --- ⚠ a temporal renders as a TIMESTAMPTZ literal whatever it started as — Fluid's date model is a
+# single DateTimeOffset, so a DATE and a TIMESTAMP are indistinguishable by the time we see one. The
+# INSTANT is preserved, the TYPE is not. Inherited from the filter, and pinned here too. ---
+query I
+SELECT fluid_render('{% print sql_literal: true %}SELECT DATE ''2023-01-02'' AS d{% endprint %}', NULL);
+----
+'2023-01-02 00:00:00.000000+00:00'::TIMESTAMPTZ
+
+# --- sql_literal: false is the default, spelled out ---
+query I
+SELECT fluid_render('{% print sql_literal: false %}SELECT ''x'' AS s{% endprint %}', NULL);
+----
+x
