@@ -75,15 +75,17 @@ jobs:
           # fixes the output path (no TFM, no RID) precisely so the runner and this line can name it.
           dotnet build dotnet/Fabricator.CollidingPlugin -c Release --nologo
           ls build/test-plugins/collide/Fabricator.CollidingPlugin.dll
-          # The FLUID plugin: fabricator_render lives here since 2026-09-01, so verify_plugin_fluid is the
-          # ONLY coverage that function now has. Its csproj fixes the output path and targets net8.0 alone.
-          dotnet build dotnet/Fabricator.FluidPlugin -c Release --nologo
-          ls build/plugins/fluid/Fabricator.FluidPlugin.dll
-          # /!\ Assert the PRIVATE NuGet CLOSURE landed, not just the assembly. A library does not copy its
-          # package closure to the output directory unless CopyLocalLockFileAssemblies is set, and without
-          # Fluid.dll beside it the plugin LOADS and then fails at first render — which would surface as a
-          # confusing suite failure rather than as a missing build artifact.
-          ls build/plugins/fluid/Fluid.dll build/plugins/fluid/Parlot.dll
+          # ⚠ FLUID IS NOT BUILT HERE, and the three lines that used to do it are why this tier was RED on
+          # 2026-09-04: `e9707ae` made Fluid a BUILT-IN PROVIDER rather than a bundled plugin, which removed
+          # its csproj's fixed output path — so `ls build/plugins/fluid/…` failed, and it failed in the step
+          # BEFORE the containers start, taking the whole service tier with it. It is published into the
+          # managed directory by publish-managed.ps1 now, like Fabricator.Delta, so the composite action
+          # above already builds it.
+          # ⚠ The PRIVATE-CLOSURE assertion those lines carried (Fluid.dll / Parlot.dll beside the plugin)
+          # is not lost, it moved with the assembly: a built-in's closure rides the managed publish, and any
+          # successful render in verify_plugin_fluid IS that closure resolving — which is the same argument
+          # that made Fluid the closure fixture when it was a plugin. That suite is HERMETIC since
+          # 2026-09-02 and runs on all three platforms, so this tier is not its coverage either.
 
       - name: Generate the MinIO TLS certificate
         # SQL Server's s3:// connector REFUSES plain HTTP, so MinIO must serve TLS even in tests. The
