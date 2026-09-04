@@ -116,7 +116,11 @@ internal static class FluidHostQuery
     /// not something a parameter can carry.
     /// </para>
     /// </remarks>
-    internal static FluidValue RunCaptured(TemplateContext ctx, string sql, RecordBatch? parameters)
+    /// <param name="tag">The BLOCK that captured the body — <c>query</c> or <c>print</c>. It names itself in
+    /// the empty-body message, because "{% query %} block is empty" pointing at a <c>{% print %}</c> sends
+    /// the author to the wrong tag.</param>
+    internal static FluidValue RunCaptured(TemplateContext ctx, string tag, string sql,
+                                           RecordBatch? parameters)
     {
         var caller = CallerOf(ctx);
         // ⚠ The block-specific empty message, before Run's own: an empty body is a different mistake from
@@ -124,27 +128,33 @@ internal static class FluidHostQuery
         if (string.IsNullOrWhiteSpace(sql))
         {
             throw new ArgumentException(
-                $"{caller}: {{% {BlockName} %}} block is empty — it rendered no SQL.");
+                $"{caller}: {{% {tag} %}} block is empty — it rendered no SQL.");
         }
-        return Run(caller, sql, parameters, FluidRenderSession.For(ctx));
+        return Run(caller, sql, parameters, FluidRenderSession.For(ctx), "{% " + tag + " %}");
     }
 
+    /// <param name="surface">How to NAME this call in an error — <c>query()</c> by default, so the function
+    /// and filter forms are unchanged, and <c>{% print %}</c> for the print block.
+    /// ⚠ Not cosmetic: the refusal below tells the author which construct to reach for instead, and a
+    /// message naming <c>query()</c> inside a <c>{% print %}</c> sends them to the wrong tag. Every existing
+    /// caller passes nothing and keeps the wording its gates already assert.</param>
     private static FluidValue Run(string caller, string? sql, RecordBatch? parameters,
-                                  FluidRenderSession? session)
+                                  FluidRenderSession? session, string? surface = null)
     {
+        surface ??= FunctionName + "()";
         // ⚠ MEASURED: json_serialize_sql('') reports NO error — an empty string parses to zero statements,
         // so the classifier below would wave it through. Refused here, where the cause can still be named.
         if (string.IsNullOrWhiteSpace(sql))
         {
-            throw new ArgumentException($"{caller}: {FunctionName}() was given an empty statement.");
+            throw new ArgumentException($"{caller}: {surface} was given an empty statement.");
         }
 
         var run = session
             ?? throw new InvalidOperationException(
-                $"{caller}: {FunctionName}() needs the IHostQuery service, which is not published here. "
+                $"{caller}: {surface} needs the IHostQuery service, which is not published here. "
                 + "It is available only from inside a fabricator function call.");
 
-        RefuseUnlessSelect(caller, sql, run);
+        RefuseUnlessSelect(caller, surface, sql, run);
 
         using var stream = run.Query(sql, parameters);
         var rows = new List<FluidValue>();
@@ -160,7 +170,7 @@ internal static class FluidHostQuery
                 if (rows.Count + batch.Length > MaxRows)
                 {
                     throw new InvalidOperationException(
-                        $"{caller}: {FunctionName}() returned more than {MaxRows} rows. Narrow the query — "
+                        $"{caller}: {surface} returned more than {MaxRows} rows. Narrow the query — "
                         + "the rows are all held in memory, because a template may iterate them repeatedly.");
                 }
                 // ⚠ Hoisted out of the row loop: batch.Arrays is an enumerable, so materialising it per
@@ -653,7 +663,8 @@ internal static class FluidHostQuery
     /// is REFUSED, not waved through. An unenforceable check must fail closed.
     /// </para>
     /// </remarks>
-    private static void RefuseUnlessSelect(string caller, string sql, FluidRenderSession run)
+    private static void RefuseUnlessSelect(string caller, string surface, string sql,
+                                           FluidRenderSession run)
     {
         var (isSelect, msg) = Classify(caller, FunctionName, sql, run);
         if (isSelect)
@@ -666,7 +677,7 @@ internal static class FluidHostQuery
         // and a real syntax error such as `syntax error at or near "SELEC"`. Reporting "not a SELECT" for a
         // typo would send the author looking in the wrong place.
         throw new InvalidOperationException(
-            $"{caller}: {FunctionName}() runs SELECT statements only, and this one was refused by DuckDB's "
+            $"{caller}: {surface} runs SELECT statements only, and this one was refused by DuckDB's "
             + $"parser: {msg ?? "(no message)"}. A template is rendered while a statement is being BOUND, "
             + "and a bind repeats and happens without execution — so a write here would fire on EXPLAIN. "
             + $"To write, use {FluidHostExec.FunctionName}() from fluid_render.");

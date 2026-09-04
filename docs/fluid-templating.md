@@ -1595,6 +1595,48 @@ nothing back; binding is opt-in by writing the name.
 `fabricator_host_exec` reports 0 — §11's measured divergence between the two exec surfaces, pinned so the
 block cannot quietly pick the other one.
 
+### 13.9 ✅ The `{% print %}` block (2026-09-04, user-asked)
+
+`{% query %}` with the destination changed: the rows are RENDERED instead of bound to a name.
+
+```liquid
+{% print delim: ", " %}SELECT name, amt FROM orders ORDER BY amt{% endprint %}
+```
+
+- **It routes through the SAME `FluidHostQuery.RunCaptured`**, so the classifier (SELECT only), the
+  per-render pinned connection, the row cap and the value model are ONE mechanism rather than a second copy
+  free to drift.
+- **⚠⚠ Each cell is written with `WriteToAsync` — the call `{{ r.a }}` itself makes — not `ToStringValue`.**
+  That is what makes printed text identical to interpolated text; a second formatting path would be free to
+  disagree about numbers, dates and nulls, and would do so silently.
+- `delim` joins the VALUES of a row (default a space), `rowdelim` joins the ROWS (default a newline). Both
+  are **JOINERS, not terminators** — nothing before the first row or after the last, so composing the block
+  into a larger string does not leave a stray separator. A caller who wants a trailing one writes it.
+- No IDENTIFIER, unlike `{% query name %}` and `{% exec name %}`: there is nothing to bind, so the header is
+  arguments-only and needs none of §13.8's lookahead.
+
+**⚠⚠ `delim` and `rowdelim` are RESERVED ARGUMENT NAMES**, so a statement wanting a parameter of either name
+cannot get one. Accepted because it fails LOUDLY — DuckDB reports the parameter it was not given, BY NAME —
+rather than silently binding nothing. ⚠ The request's `delim := " "` spelling is not expressible: Fluid's
+grammar is `name: value`, and inventing one would be a grammar only this plugin speaks, which is the reason
+`ArgumentsList` was reused for the other blocks in the first place.
+
+#### ⚠⚠ It corrected a message that had been naming the wrong surface
+
+The SELECT-only refusal said `query() runs SELECT statements only` whatever refused — so a `{% print %}`
+author was told to look at `query()`. `Run` now takes the surface name (defaulting to `query()`, so the
+function and filter forms are untouched) and each spelling names itself:
+
+| refused in | says |
+|---|---|
+| `query(…)` / `\| query:` | `query() runs SELECT statements only` |
+| `{% query r %}` | `{% query %} runs SELECT statements only` |
+| `{% print %}` | `{% print %} runs SELECT statements only` |
+
+⚠ **The `{% query %}` block had been mis-naming itself all along and its own assertion is what caught it** —
+the row is corrected in the suite rather than the wording reverted, because the advice a refusal gives is
+only useful if it points at the tag the author wrote.
+
 ### 13.2 ⚠ Everything downstream of the capture is SHARED with the function form
 
 The block routes into `FluidHostExec.ExecuteCaptured`, which uses the same empty-body guard, the same

@@ -96,6 +96,36 @@ internal static class FluidEngine
             return Completion.Normal;
         });
 
+        // ⚠⚠ THE {% print %} BLOCK: {% query %} with the destination changed — the rows are RENDERED
+        // instead of bound to a name. It routes through the SAME FluidHostQuery.RunCaptured, so the
+        // classifier (SELECT only), the per-render pinned connection, the row cap and the value model are
+        // one mechanism rather than a second copy free to drift.
+        //
+        // ⚠⚠ `delim` and `rowdelim` are RESERVED ARGUMENT NAMES, so a statement wanting a parameter called
+        // either cannot get one. Accepted because it fails LOUDLY: DuckDB names the parameter it was not
+        // given. ⚠ The request's `delim := " "` spelling is not expressible — Fluid's grammar is
+        // `name: value` — and inventing one would be a grammar only this plugin speaks, which is the same
+        // reason ArgumentsList was reused for the other two blocks.
+        //
+        // ⚠ No IDENTIFIER, unlike {% query name %} and {% exec name %}: there is nothing to bind, so the
+        // header is arguments-only and needs none of the lookahead the exec block does.
+        parser.RegisterParserBlock(FluidHostPrint.BlockName, ZeroOrOne(parser.NamedArguments),
+                                   static async (args, statements, output, encoder, ctx) =>
+        {
+            var (completion, sql) = await CaptureBodyAsync(statements, ctx);
+            if (completion != Completion.Normal)
+            {
+                return completion;
+            }
+
+            var (delim, rowDelim, rest) = await FluidHostPrint.SplitOptionsAsync(args, ctx);
+            var parameters = await FluidHostQuery.BuildBlockParametersAsync(
+                FluidHostQuery.CallerOf(ctx), FluidHostPrint.BlockName, rest, ctx);
+            var rows = FluidHostQuery.RunCaptured(ctx, FluidHostPrint.BlockName, sql, parameters);
+            await FluidHostPrint.WriteRowsAsync(rows, output, encoder, ctx, delim, rowDelim);
+            return Completion.Normal;
+        });
+
         // ⚠⚠ THE {% query name %} BLOCK: the same capture, but the captured text is RUN AS A QUERY and its
         // ROW SET is bound to `name` — not a rendered string. It is `{% capture %}`'s shape (an IDENTIFIER
         // block) because that is Liquid's own precedent for "run this block and bind the result to a name",
@@ -123,7 +153,7 @@ internal static class FluidEngine
                 FluidHostQuery.CallerOf(ctx), FluidHostQuery.BlockName, head.Item2, ctx);
             // ⚠ SetValue, and NOTHING is written to `output` — the block contributes no text, exactly like
             // {% capture %}. The rows are held for the render, so a template may iterate them repeatedly.
-            ctx.SetValue(head.Item1, FluidHostQuery.RunCaptured(ctx, sql, parameters));
+            ctx.SetValue(head.Item1, FluidHostQuery.RunCaptured(ctx, FluidHostQuery.BlockName, sql, parameters));
             return Completion.Normal;
         });
 

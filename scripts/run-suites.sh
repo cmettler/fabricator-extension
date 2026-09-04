@@ -444,6 +444,11 @@ case "$TIER" in
         # in that section is load-bearing and a mutant proved it: an earlier `USE memory.hq_s` leaves a
         # qualified entry, against which the bug does not fire, so the section PASSED with it fully present.
         # 8250 + 9 = 8259 exactly, from a green run.
+        # 8613 since 2026-09-04 (same day, fifth bump): verify_plugin_fluid 327 -> 337 -- the {% print %}
+        #   BLOCK, which is {% query %} with the destination changed (rows RENDERED, not bound to a name).
+        #   ⚠ One of the 10 is a CORRECTED assertion, not a new one: the shared SELECT-only refusal used to
+        #   say "query()" whatever surface refused, so a {% print %} author was sent to the wrong tag. Each
+        #   surface names itself now, and the {% query %} block's own assertion is what caught it.
         # 8603 since 2026-09-04 (same day, fourth bump): verify_plugin_fluid 318 -> 327 -- {% exec name %}
         #   binds the affected-row count, the same shape as {% query name %}. ⚠ The identifier is OPTIONAL
         #   and that is the whole difficulty: {% exec %} and {% exec x: 7 %} are shipped spellings, and a
@@ -499,7 +504,7 @@ case "$TIER" in
         # two functions have exactly ONE registration each, plus the HostsCatalog refusal and its
         # unknown-provider control. 3105 + 238 + 8259 - 3339 arithmetic aside, both numbers come from green
         # runs.
-        : "${MIN_ASSERTIONS:=8603}"
+        : "${MIN_ASSERTIONS:=8613}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

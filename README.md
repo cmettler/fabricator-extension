@@ -1592,7 +1592,25 @@ SELECT fluid_render('{% if go %}{% exec %}DELETE FROM staging{% endexec %}cleare
 > `{{ n | sql_ident }}` for an identifier. Splicing a raw string containing a quote gives a parser error
 > rather than a silent injection, but that is not a substitute.
 >
-**Name the block to get the affected-row count**, the same way `{% query name %}` names its result:
+**`{% print %}` renders a result set directly** — `{% query %}` with the destination changed, for when you
+want the rows in the output rather than in a variable:
+
+```sql
+SELECT fluid_render('{% print delim: ", " %}
+SELECT i AS n, i*i AS sq FROM range(1, 4) t(i)
+{% endprint %}', NULL);
+-- 1, 1
+-- 2, 4
+-- 3, 9
+```
+
+`delim` joins the values of a row (default a space) and `rowdelim` joins the rows (default a newline); both
+are joiners, so nothing is written before the first row or after the last. Any other named argument is a
+bound parameter, exactly as in `{% query %}` — which means a statement cannot have a parameter called
+`delim` or `rowdelim`, and DuckDB will say so by name if you try.
+
+**Name the `{% exec %}` block to get the affected-row count**, the same way `{% query name %}` names its
+result:
 
 ```sql
 SELECT fluid_render('{% exec n %}DELETE FROM staging WHERE loaded{% endexec %}removed {{ n }} rows', NULL);

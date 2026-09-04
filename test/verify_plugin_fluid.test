@@ -1959,10 +1959,14 @@ SELECT fluid_render('{% query b %}SELECT 1 AS x{% endquery %}{% assign f = query
 123
 
 # --- the SAME classifier as the function: a write is refused ---
+# ⚠ It NAMES THE BLOCK, not the function. This row read "query() runs SELECT statements only" until
+# 2026-09-04, when {% print %} made the wording matter: one shared message told a {% print %} author to
+# look at query(). The refusal now names the surface that refused — {% query %}, {% print %} or query() —
+# and this assertion is what caught that the block had been mis-naming itself all along.
 statement error
 SELECT fluid_render('{% query r %}INSERT INTO blk VALUES (1, ''z''){% endquery %}x', NULL);
 ----
-query() runs SELECT statements only
+{% query %} runs SELECT statements only
 
 # --- an empty body is refused BEFORE the classifier ---
 statement error
@@ -2316,3 +2320,79 @@ query I
 SELECT fluid_render('{% exec n %}CREATE TABLE ex20c AS SELECT * FROM range(7){% endexec %}n={{ n }}', NULL);
 ----
 n=7
+
+# ============================================================================================
+# §21 — THE {% print %} BLOCK (user-asked): {% query %} with the destination changed — the rows are
+# RENDERED instead of bound to a name.
+#
+# ⚠ It routes through the SAME FluidHostQuery.RunCaptured, so the classifier (SELECT only), the
+# per-render pinned connection, the row cap and the value model are ONE mechanism. Each cell is
+# written with WriteToAsync — the same call {{ r.a }} makes — so printed text and interpolated text
+# cannot disagree about numbers, dates or nulls.
+#
+# ⚠⚠ `delim` and `rowdelim` are RESERVED argument names, so a statement wanting a parameter of
+# either name cannot get one. Accepted because it fails LOUDLY — DuckDB names the parameter it was
+# not given — rather than silently binding nothing.
+# ============================================================================================
+
+# --- defaults: values joined by a space, rows by a NEWLINE ---
+# ⚠ The newline is replaced with a visible token, not asserted directly: sqllogictest reads a
+# multi-line result as several ROWS, so the raw form would compare a 3-row expectation against one
+# VARCHAR and fail while the value is correct.
+query I
+SELECT replace(fluid_render('{% print %}SELECT i AS n, i*i AS sq FROM range(1,4) t(i){% endprint %}', NULL), chr(10), '~');
+----
+1 1~2 4~3 9
+
+query I
+SELECT replace(fluid_render('{% print delim: ", " %}SELECT i AS n, i*i AS sq FROM range(1,3) t(i){% endprint %}', NULL), chr(10), '~');
+----
+1, 1~2, 4
+
+# --- both delimiters, on one line so the row separator is visible in the expected value ---
+query I
+SELECT fluid_render('{% print delim: "|", rowdelim: " / " %}SELECT i AS n, i*i AS sq FROM range(1,4) t(i){% endprint %}', NULL);
+----
+1|1 / 2|4 / 3|9
+
+# --- ⚠ the delimiters are JOINERS, not terminators: nothing before the first row or after the last ---
+query I
+SELECT '[' || fluid_render('{% print rowdelim: "," %}SELECT i FROM range(1,3) t(i){% endprint %}', NULL) || ']';
+----
+[1,2]
+
+# --- options and BOUND PARAMETERS coexist; everything that is not an option is a parameter ---
+query I
+SELECT fluid_render('{% print delim: "-", region: r %}SELECT x, ''hit'' AS h FROM (VALUES (''eu''),(''us'')) v(x) WHERE x = $region{% endprint %}', {r:'eu'});
+----
+eu-hit
+
+# --- ⚠ the injection control, as everywhere else: a value crosses as a VALUE ---
+query I
+SELECT '[' || fluid_render('{% print region: r %}SELECT x FROM (VALUES (''eu''),(''us'')) v(x) WHERE x = $region{% endprint %}', {r: 'eu'' OR 1=1 --'}) || ']';
+----
+[]
+
+# --- zero rows print nothing at all ---
+query I
+SELECT '[' || fluid_render('{% print %}SELECT 1 WHERE false{% endprint %}', NULL) || ']';
+----
+[]
+
+# --- a NULL renders empty, exactly as {{ }} does ---
+query I
+SELECT '[' || fluid_render('{% print %}SELECT NULL AS a, 2 AS b{% endprint %}', NULL) || ']';
+----
+[ 2]
+
+# --- it inherits the SELECT-only refusal, and the message NAMES THIS BLOCK ---
+statement error
+SELECT fluid_render('{% print %}DELETE FROM ex20{% endprint %}', NULL);
+----
+{% print %} runs SELECT statements only
+
+# --- ...and the empty-body refusal names it too ---
+statement error
+SELECT fluid_render('{% print %}   {% endprint %}', NULL);
+----
+{% print %} block is empty
