@@ -221,7 +221,15 @@ internal sealed class PinnedHostConnection : IHostConnection
     }
 
     /// <summary>Runs a publication's statement. The returned stream owns what it needs; the caller disposes it.</summary>
-    internal IArrowArrayStream OpenPublication(string sql) => _inner.Query(sql);
+    /// <remarks>
+    /// ⚠⚠ ROW-GROUP-SIZED BATCHES (ABI v85), and a publication is exactly the consumer for which that is
+    /// unambiguously safe: its stream is scanned into the CALLER's DuckDB by <c>fabricator_scan</c> and
+    /// never becomes parquet files, so the "a batch is also a FILE" constraint that keeps the host_query
+    /// default at one DataChunk does not apply here. MEASURED on 100M rows of one BIGINT, threads=8,
+    /// interleaved: 2.08-2.13 s at the default against 0.83-0.85 s here.
+    /// </remarks>
+    internal IArrowArrayStream OpenPublication(string sql) =>
+        _inner.Query(sql, batchRows: PublishedSources.BatchRows);
 
     /// <summary>Holds the handle open for one not-yet-scanned publication.</summary>
     internal void AddRef() => Interlocked.Increment(ref _refs);

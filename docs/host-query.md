@@ -88,6 +88,13 @@ session"*. Full ABI record: [abi-history.md](abi-history.md) §v84.
 > table created during `bind_replace` is invisible to the statement being bound. DEFAULT-implemented, so the
 > contract gained a member without breaking a plugin.
 >
+> ⚠⚠ **AND SINCE 2026-09-04 `Query` TAKES `batchRows` (ABI v85)** — how many rows to accumulate into each
+> exported Arrow batch, 0 keeping the historical default of one DuckDB `DataChunk` (2048 rows). Ask for a
+> big batch when the rows become SCAN MORSELS (measured ~2.4x on 100M rows; a publication asks for 122880)
+> and leave it at 0 when they become FILES, because engineered-wood writes one parquet file per input batch
+> — which is why this cannot be a better default and has to be the caller's call. Full record:
+> [abi-history.md](abi-history.md) §v85.
+>
 > ⚠⚠ **IT IS WHY THIS CLASS IS REFERENCE-COUNTED.** A publication must be able to ISSUE its query after the
 > render that opened the connection has finished, so an unscanned publication holds the handle open. It only
 > has to survive until `Query` RETURNS — from there the stream holds its own reference, per the Dispose

@@ -167,14 +167,23 @@ public static class Host
 
         /// <summary>Runs <paramref name="sql"/> on this connection; the caller owns and disposes the stream.</summary>
         /// <remarks>
+        /// <para>
         /// ⚠ Dispose the returned stream before calling again on this connection — a second statement would
         /// otherwise be REFUSED, which is deliberately better than DuckDB silently closing the first
         /// result. See <see cref="Host.OpenConnection"/>.
+        /// </para>
+        /// <para>
+        /// ⚠ <paramref name="batchRows"/> (ABI v85) is how many rows to accumulate into each exported Arrow
+        /// batch; 0 keeps the historical default of ONE DuckDB DataChunk (2048 rows). Ask for a big batch
+        /// when the rows become SCAN MORSELS (measured ~2.4x on 100M rows), and leave it at 0 when they
+        /// become FILES — engineered-wood writes one parquet file per input batch, which is why this cannot
+        /// simply be a better default. See <c>FabricatorHostServices::host_query</c> in abi.h.
+        /// </para>
         /// </remarks>
-        public IArrowArrayStream Query(string sql, RecordBatch? parameters = null)
+        public IArrowArrayStream Query(string sql, RecordBatch? parameters = null, long batchRows = 0)
         {
             ThrowIfDisposed();
-            return HostFs.Query(sql, parameters, connection: _handle);
+            return HostFs.Query(sql, parameters, connection: _handle, batchRows: batchRows);
         }
 
         /// <summary>

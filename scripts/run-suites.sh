@@ -444,6 +444,10 @@ case "$TIER" in
         # in that section is load-bearing and a mutant proved it: an earlier `USE memory.hq_s` leaves a
         # qualified entry, against which the bug does not fire, so the section PASSED with it fully present.
         # 8250 + 9 = 8259 exactly, from a green run.
+        # 8673 since 2026-09-04 (same day, eighth bump): verify_plugin_fluid 386 -> 397 -- ABI v85 lets a
+        # caller pick its Arrow batch size and a publication asks for a row group (measured ~2.4x). The
+        # batch size is NOT observable from SQL; what the new rows pin is the accumulation loop's
+        # boundaries, which before v85 no suite reached at all.
         # 8662 since 2026-09-04 (same day, seventh bump): verify_plugin_fluid 344 -> 386 -- publish(name),
         # which hands a table the template STAGED to the SQL the template generated. The one route that
         # works: a TEMP table is invisible to the caller and a REAL table created at bind time is invisible
@@ -514,7 +518,7 @@ case "$TIER" in
         # two functions have exactly ONE registration each, plus the HostsCatalog refusal and its
         # unknown-provider control. 3105 + 238 + 8259 - 3339 arithmetic aside, both numbers come from green
         # runs.
-        : "${MIN_ASSERTIONS:=8662}"
+        : "${MIN_ASSERTIONS:=8673}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

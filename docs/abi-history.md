@@ -1,4 +1,4 @@
-# ABI history — prior versions v16–v83
+# ABI history — prior versions v16–v84
 
 > Moved VERBATIM out of `CLAUDE.md` on 2026-07-29 (conservative split — see the commit message).
 > Append-only as-built history; the live summary + pointers stay in `CLAUDE.md`.
@@ -11,6 +11,87 @@
 > entries and the `table_*` session; v73: `table_info`/`table_stats` re-carried as ONE typed JSON doc each,
 > parsed with our own vcpkg yyjson, retiring the `ReadCapabilityFlag` string-find). v74 below is the
 > follow-on that finished the same job for ALTER.
+
+## v85 (2026-09-04) — `host_query` gains `batch_rows`: the CALLER picks its Arrow batch size
+
+**User-directed**, after measuring why a published relation was ~10x slower than the same relation left
+inside one DuckDB plan. `host_query` takes an `int64_t batch_rows` between `connection` and `out`; **0 is
+the historical default** (one DuckDB `DataChunk`, `STANDARD_VECTOR_SIZE` = 2048 rows), so every existing
+caller is byte-identical. C++ + C#; the only consumer that asks for anything else today is a `publish`
+publication, which requests **122880** — DuckDB's own row-group size.
+
+### The measurement that motivated it
+
+`sum(n)` over a billion-row relation, one BIGINT column:
+
+| | time |
+|---|---|
+| the relation left in the generated SQL (no boundary) | **2.15 s** |
+| the same relation through a publication, before v85 | ~20 s |
+| the same relation through a publication, **at v85** | **7.89 s** |
+
+Decomposed at 100M rows, threads=8, interleaved over two rounds: **2.08–2.13 s at the default against
+0.83–0.85 s at 122880 — ~2.4x**, with `sys` time falling from 2.1–3.0 s to 0.4–0.5 s, which is the
+per-batch allocation churn disappearing. At the default `user` (3.8–4.0 s) far exceeds `real`, i.e. threads
+burning on overhead; at a row group `user ≈ real`, so the overhead is gone rather than parallelised away.
+
+**Why a small batch costs so much: the exported `RecordBatch` IS the morsel of a parallel Arrow scan.**
+`arrow_ingest`'s `GetNextBatch` hands one batch to one thread, so 2048-row batches mean a billion rows
+arrive as ~488,000 morsels, each paying a mutex acquisition, an `ArrowAppender` construction, an `Append`,
+a `Finalize` (a real copy into fresh Arrow buffers), an import on the managed side, an export back and
+converter setup.
+
+### ⚠⚠ Why it is a per-call PARAMETER and can never be a better default: A BATCH IS ALSO A FILE
+
+engineered-wood writes **one parquet file per input batch**, and this same service feeds WRITERS as well as
+scans — the OPTIMIZE recluster's `ORDER BY`, sorted-by writes. Making a row group the default silently
+changed physical LAYOUT: `verify_delta_clustered_optimize` collapsed 80,000 rows into ONE file and
+`delta.targetFileSize` stopped being honoured (**147 passed at one chunk; 1 failed at 122880**). That
+measurement predates this entry — it is why the win was recorded as *deferred* rather than taken, in
+`HostQueryGetNext`'s own comment.
+
+⇒ only the CALLER knows which it is. A scan wants big morsels; a writer wants its file granularity. The
+default stays the safe one, and asking for more is a deliberate act.
+
+**`publish` is the consumer for which a big batch is unambiguously safe**, which is what made this worth
+building now: a publication's stream is scanned into the CALLER's DuckDB by `fabricator_scan` and never
+becomes files. `PublishedSources.BatchRows` states that, next to the reason.
+
+### ⚠ The env var still OVERRIDES the caller, and "unset" is distinguished from "set to 0"
+
+`FABRICATOR_HOST_QUERY_BATCH_ROWS`, when SET, wins over the per-call value — **including when set to 0**,
+which forces one chunk everywhere. Unset ⇒ the caller decides. An experiment hook that code can silently
+outvote is not an experiment hook, and the env var is what produced every number above; distinguishing
+unset from zero is what lets an operator push the default in either direction.
+
+### What it does NOT fix
+
+**Projection is still not pushed through a publication**, and after v85 that is the DOMINANT remaining cost
+on a multi-column relation: the same billion rows with a second, unread column take **20.3 s** against
+7.89 s for one column. A publication's SQL is fixed at render time as `SELECT * FROM "<name>"`, before the
+outer statement's projection exists; DuckDB does push a projection into the `fabricator_scan` node, but the
+factory ignores the request (`ArrowScanRequest` is an unused parameter) and delivers every column.
+
+⚠ `ArrowScanRequest` already carries what would be needed (`spec_json` = `{"columns":[…],"filter":…}`), so
+the factory COULD wrap its statement — but the obstacle is the DECLARED SCHEMA, which is the same mechanism
+that makes a lazy publication possible: the declaration is made once, at publish time, and the host builds
+its Arrow→DuckDB converters from it, refusing a mismatch on the first pull. A projected stream delivers
+FEWER columns than declared and would trip exactly that check. Filter pushdown has no such obstacle (the
+schema is unchanged) and is the cheaper half if it is ever wanted.
+
+### Gate
+
+The batch size is **not observable from SQL** — no row moves, nothing prints a batch count, and the only
+difference is wall clock. What IS observable is that the accumulation loop gets the ROW COUNT right at its
+boundaries, and **before v85 that loop was reachable only through the env var, which no suite sets** — so
+`verify_plugin_fluid` §24 pins exactly one batch, one over, one under, several batches plus a tail, empty,
+and a multi-column boundary (a per-column appender bug would keep the counts right and the pairing wrong).
+
+The behaviour-neutrality claim is the tier: `verify_host_query` **107** and
+`verify_delta_clustered_optimize` **147** unchanged, the latter being the suite that caught the layout
+regression when a row group was tried as the default.
+
+---
 
 ## v84 — the PINNED host connection (2026-09-03)
 

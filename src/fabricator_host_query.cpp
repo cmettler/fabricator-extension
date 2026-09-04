@@ -97,6 +97,11 @@ struct HostQueryStream {
 	//! more. DuckDB's own multi-chunk batching guards the same way (ChunkScanState::Finished /
 	//! QueryResultChunkScanState::InternalLoad's `if (!stream_result.IsOpen()) return true;`).
 	bool finished = false;
+	//! Rows to accumulate into each exported RecordBatch; 0 = one DataChunk (ABI v85). The exported batch IS
+	//! the morsel of a parallel Arrow scan, so this is the caller's morsel-size request — and the reason it
+	//! is per call rather than a better default is that a batch is also a FILE to engineered-wood. See
+	//! FabricatorHostServices::host_query in abi.h.
+	idx_t batch_rows = 0;
 	ArrowArrayStream stream {};
 };
 
@@ -250,14 +255,25 @@ int HostQueryGetNext(ArrowArrayStream *stream, ArrowArray *out) {
 		// ABI change), so the win is deferred rather than taken here. What it is worth, measured on a 6M-row
 		// CPU-bound GROUP BY (median of 3): 0.864s -> 0.689s single-threaded from batching alone.
 		// The env var stays as the experiment hook that produced those numbers.
-		static const idx_t target_rows = []() -> idx_t {
+		// ⚠ THE CALLER DECIDES (ABI v85), because only the caller knows whether its batches become MORSELS
+		// or FILES — that is the whole reason this is not a better default. 0 = one DataChunk, which is what
+		// every caller got before v85 and what a writer still wants.
+		// ⚠ The env var, when SET, still OVERRIDES the caller — including to 0 — because it is an
+		// operator's deliberate act and an experiment hook that code can silently outvote is not one. Unset
+		// is distinguished from "set to 0" for exactly that: `=0` forces one chunk everywhere.
+		struct EnvOverride {
+			bool set = false;
+			idx_t rows = 0;
+		};
+		static const EnvOverride env_override = []() -> EnvOverride {
 			const char *env = std::getenv("FABRICATOR_HOST_QUERY_BATCH_ROWS");
 			if (!env || !*env) {
-				return 0; // one chunk per batch — never change this without scoping it per consumer
+				return {};
 			}
 			auto n = std::atoll(env);
-			return n > 0 ? (idx_t)n : 0;
+			return {true, n > 0 ? (idx_t)n : 0};
 		}();
+		const idx_t target_rows = env_override.set ? env_override.rows : st->batch_rows;
 		ArrowAppender appender(st->types, target_rows > 0 ? target_rows : chunk->size(), props, extension_types);
 		idx_t appended = 0;
 		while (true) {
@@ -653,7 +669,7 @@ bool RegisterArrowInputView(Connection &conn, const string &name, ArrowArrayStre
 void MakeHostQueryStream(DatabaseInstance &db, const string &sql, ArrowArrayStream *params,
                          const vector<HostQueryInput> &inputs, ArrowArrayStream &out,
                          shared_ptr<ClientContext> *out_context, const HostQuerySession *session,
-                         shared_ptr<HostConnection> pinned) {
+                         shared_ptr<HostConnection> pinned, idx_t batch_rows) {
 	// ⚠⚠ A PINNED connection is REFUSED a named input — and the reason this shipped with (v84: "a
 	// connection-scoped view … would collide") was MEASURED FALSE on 2026-09-03 on BOTH counts: the view
 	// was created with `replace: true`, so a re-registration REPLACES, and it was a CATALOG view, not a
@@ -770,6 +786,7 @@ void MakeHostQueryStream(DatabaseInstance &db, const string &sql, ArrowArrayStre
 	st->prepared = std::move(prepared);
 	st->types = result->types;
 	st->names = result->names;
+	st->batch_rows = batch_rows; // the caller's morsel-size request (ABI v85); 0 = one DataChunk
 	st->result = std::move(result);
 	st->stream.get_schema = HostQueryGetSchema;
 	st->stream.get_next = HostQueryGetNext;
@@ -807,8 +824,8 @@ static char *DupErr(const string &msg) {
 // in-flight Fetch out-of-band (the fresh connection is invisible to the USER query's Ctrl+C). See abi.h /
 // docs/host-query.md / docs/cancellation.md.
 int32_t HostQueryService(const char *sql, ArrowArrayStream *params, FabricatorHostInputs *inputs,
-                         FabricatorHandle client_context, FabricatorHandle connection, ArrowArrayStream *out,
-                         void **out_interrupt, char **err) {
+                         FabricatorHandle client_context, FabricatorHandle connection, int64_t batch_rows,
+                         ArrowArrayStream *out, void **out_interrupt, char **err) {
 	try {
 		if (!g_host_db) {
 			throw IOException("fabricator host_query: host database not available");
@@ -838,7 +855,8 @@ int32_t HostQueryService(const char *sql, ArrowArrayStream *params, FabricatorHo
 		}
 		shared_ptr<ClientContext> ctx;
 		MakeHostQueryStream(*g_host_db, sql ? string(sql) : string(), params, in, *out,
-		                    out_interrupt ? &ctx : nullptr, session_ptr, std::move(pinned));
+		                    out_interrupt ? &ctx : nullptr, session_ptr, std::move(pinned),
+		                    batch_rows > 0 ? (idx_t)batch_rows : 0);
 		if (out_interrupt) {
 			// The handle owns a shared_ptr copy: an interrupt AFTER the result stream is released still
 			// dereferences a live (idle) context — a harmless no-op instead of a use-after-free.

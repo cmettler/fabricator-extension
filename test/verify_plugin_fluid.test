@@ -2665,3 +2665,76 @@ WITH _result AS MATERIALIZED (
 SELECT * FROM _result');
 ----
 4	30
+
+# ============================================================================================
+# §24 — a publication asks for ROW-GROUP-SIZED Arrow batches (ABI v85), so the accumulation loop in
+#       HostQueryGetNext runs for the first time in any suite.
+#
+# ⚠⚠ THE BATCH SIZE ITSELF IS NOT OBSERVABLE FROM SQL — no row moves, nothing prints a batch count, and
+# the only difference is wall clock (measured ~2.4x on 100M rows; see abi.h). So NOTHING HERE CAN KILL A
+# MUTANT THAT IGNORES THE PER-CALL VALUE, and this section does not pretend to: what it pins is that the
+# accumulation loop gets the ROW COUNT right at its boundaries. Before v85 that loop was reachable only
+# through FABRICATOR_HOST_QUERY_BATCH_ROWS, which no suite sets, so it had never run here at all.
+#
+# ⚠ §23 ALREADY COVERS THE SHORT TAIL — every publication smaller than one batch takes it, which is most of
+# them. MEASURED: a mutant dropping `st->finished = true` in that branch dies at §23's FIRST assertion
+# after 344 pass ("Attempting to execute an unsuccessful or closed pending query result"). What §23 does
+# NOT reach, and these rows do, is the EXACT FILL, MORE THAN ONE batch in a stream, and a column boundary.
+# ============================================================================================
+
+# --- exactly ONE batch: the target is met precisely, and the next get_next must not re-Fetch a closed
+# result. sum(0..122879) = 122879*122880/2 = 7549685760 ---
+query II
+SELECT count(*), sum(n) FROM fluid_query('
+{% exec %}CREATE TEMP VIEW bb1 AS SELECT i AS n FROM range(0, 122880) t(i){% endexec %}
+SELECT * FROM {{ publish(''bb1'') }}
+');
+----
+122880	7549685760
+
+# --- ONE OVER: a full batch plus a 1-row tail, which is the short-tail path ---
+query II
+SELECT count(*), sum(n) FROM fluid_query('
+{% exec %}CREATE TEMP VIEW bb2 AS SELECT i AS n FROM range(0, 122881) t(i){% endexec %}
+SELECT * FROM {{ publish(''bb2'') }}
+');
+----
+122881	7549808640
+
+# --- ONE UNDER: the target is NEVER met, so the loop must exit on EOF with a partial batch appended ---
+query II
+SELECT count(*), sum(n) FROM fluid_query('
+{% exec %}CREATE TEMP VIEW bb3 AS SELECT i AS n FROM range(0, 122879) t(i){% endexec %}
+SELECT * FROM {{ publish(''bb3'') }}
+');
+----
+122879	7549562881
+
+# --- SEVERAL batches plus a tail, so the loop runs more than once in one stream ---
+query II
+SELECT count(*), sum(n) FROM fluid_query('
+{% exec %}CREATE TEMP VIEW bb4 AS SELECT i AS n FROM range(0, 300000) t(i){% endexec %}
+SELECT * FROM {{ publish(''bb4'') }}
+');
+----
+300000	44999850000
+
+# --- ⚠ EMPTY: zero rows must not accumulate anything, and the first get_next is already EOF ---
+query II
+SELECT count(*), coalesce(sum(n), -1) FROM fluid_query('
+{% exec %}CREATE TEMP VIEW bb5 AS SELECT i AS n FROM range(0, 122880) t(i) WHERE i < 0{% endexec %}
+SELECT * FROM {{ publish(''bb5'') }}
+');
+----
+0	-1
+
+# --- ⚠ MULTI-COLUMN across a batch boundary, because the appender is per-COLUMN: a bug that shifted one
+# column relative to another would keep the counts right and the pairing wrong. n and its double must
+# still agree on every row, checked by an aggregate that can only hold if they do. ---
+query I
+SELECT count(*) FROM fluid_query('
+{% exec %}CREATE TEMP VIEW bb6 AS SELECT i AS n, i * 2 AS d FROM range(0, 200000) t(i){% endexec %}
+SELECT * FROM {{ publish(''bb6'') }}
+') WHERE d <> n * 2;
+----
+0

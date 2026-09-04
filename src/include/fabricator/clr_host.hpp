@@ -49,7 +49,7 @@ void SetHostServices(const FabricatorHostServices &services);
 // order-independent). See FabricatorHostServices::host_query in abi.h.
 using HostQueryFn = int32_t (*)(const char *sql, struct ArrowArrayStream *params,
                                 struct FabricatorHostInputs *inputs, FabricatorHandle client_context,
-                                FabricatorHandle connection,
+                                FabricatorHandle connection, int64_t batch_rows,
                                 struct ArrowArrayStream *out, void **out_interrupt, char **err);
 using HostQueryInterruptFn = void (*)(void *interrupt_handle);
 void SetHostQueryService(HostQueryFn fn, HostQueryInterruptFn interrupt_fn, HostQueryInterruptFn free_fn);

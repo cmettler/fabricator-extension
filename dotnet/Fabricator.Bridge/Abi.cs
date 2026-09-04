@@ -344,7 +344,7 @@ public unsafe struct FabricatorHostServices
     // session) inherits the caller's TimeZone + search path; `connection` (v84, 0 = a FRESH connection per
     // call) runs on a PINNED connection from HostConnectionOpen, so TEMP tables and session settings persist
     // across calls. See docs/host-query.md.
-    public delegate* unmanaged[Cdecl]<byte*, CArrowArrayStream*, FabricatorHostInputs*, nint, nint, CArrowArrayStream*, void**, byte**, int> HostQuery;
+    public delegate* unmanaged[Cdecl]<byte*, CArrowArrayStream*, FabricatorHostInputs*, nint, nint, long, CArrowArrayStream*, void**, byte**, int> HostQuery;
 
     // ---- WRITE surface (Delta write-back foundation; see docs/delta-catalog.md) ----
     // int32 fs_open_write(void* opener, const char* path, int32 exclusive, void** out_file, char** err)

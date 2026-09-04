@@ -117,6 +117,14 @@ file's own layout, so the 60x is the artifact's ratio and not a quoted constant 
 `HostQueryGetNext` in [src/fabricator_host_query.cpp](../src/fabricator_host_query.cpp) can accumulate
 `DataChunk`s into one batch, and **the default is one chunk** (`FABRICATOR_HOST_QUERY_BATCH_ROWS` unset).
 
+> **⚠ SINCE ABI v85 (2026-09-04) THE CALLER MAY ASK FOR MORE**, which is how the win below was finally
+> taken without paying the cost in the box under it: `host_query` has a `batch_rows` parameter, 0 keeping
+> the one-chunk default. **Only a caller whose batches become MORSELS may raise it** — today just a
+> `publish()` publication, whose stream is scanned into the caller's DuckDB and never written (measured
+> ~2.4x on 100M rows; the user's billion-row query went ~20 s → 7.89 s). A caller whose batches become
+> FILES leaves it at 0, which is why this cannot be a global default. ⚠ The env var still OVERRIDES the
+> per-call value when SET, including to 0. Full record: [abi-history.md](abi-history.md) §v85.
+
 > **⚠⚠ THE REASON IT IS OFF IS NOT PERFORMANCE — A BATCH IS ALSO A FILE.** This stream feeds WRITERS as well
 > as scans, and the clustered rewrite cuts output files with `BudgetedStream`
 > ([dotnet/Fabricator.Delta/DeltaReader.cs](../dotnet/Fabricator.Delta/DeltaReader.cs)). Raising the batch

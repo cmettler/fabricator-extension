@@ -1112,8 +1112,27 @@ typedef struct FabricatorHostServices {
 	// DuckDB Connection and therefore one TEMPORARY catalog, one set of session settings and one
 	// transaction context. That is what lets a caller CREATE TEMP TABLE in one call and read it in the
 	// next — the read-your-writes a fresh connection structurally cannot give (see host_connection_open).
+	// ⚠⚠ `batch_rows` (ABI v85) is OPTIONAL and it is a PERFORMANCE contract, not a semantic one: how many
+	// rows to accumulate into each exported Arrow RecordBatch. 0 = the historical default of ONE DuckDB
+	// DataChunk (STANDARD_VECTOR_SIZE, 2048 rows). MEASURED on 100M rows of one BIGINT through a
+	// publication, threads=8, interleaved: 2.08-2.13 s at the default against 0.83-0.85 s at 122880 — a
+	// ~2.4x wall-clock difference, with `sys` time falling 2.1-3.0 s to 0.4-0.5 s, which is the per-batch
+	// allocation churn disappearing. The exported batch IS the morsel of a parallel Arrow scan, so a small
+	// one multiplies mutex acquisitions, ArrowAppender/Finalize copies, imports and converter setups.
+	//
+	// ⚠⚠ IT IS PER CALL BECAUSE A BATCH IS ALSO A FILE, AND THAT IS WHY IT CANNOT BE A BETTER DEFAULT.
+	// engineered-wood writes ONE PARQUET FILE PER INPUT BATCH, and this same service feeds WRITERS as well
+	// as scans (the OPTIMIZE recluster's ORDER BY, sorted-by writes). Making a row group the default
+	// silently changed physical LAYOUT: verify_delta_clustered_optimize collapsed 80000 rows into ONE file
+	// and `delta.targetFileSize` stopped being honoured (147 passed at one chunk; 1 failed at 122880). So
+	// only the CALLER knows what it wants — a scan wants big morsels, a writer wants its file granularity —
+	// and the default stays the safe one.
+	//
+	// ⚠ FABRICATOR_HOST_QUERY_BATCH_ROWS still OVERRIDES this per-call value when set, including to 0,
+	// because an environment variable is an operator's deliberate act and an experiment hook that code can
+	// silently outvote is not one. Unset => the caller's value decides.
 	int32_t (*host_query)(const char *sql, struct ArrowArrayStream *params, struct FabricatorHostInputs *inputs,
-	                      FabricatorHandle client_context, FabricatorHandle connection,
+	                      FabricatorHandle client_context, FabricatorHandle connection, int64_t batch_rows,
 	                      struct ArrowArrayStream *out, void **out_interrupt, char **err);
 
 	// -------------------------------------------------------------------------
@@ -1248,7 +1267,7 @@ typedef struct FabricatorHostServices {
 // state blob is this many bytes + a 4-byte length prefix). Serialize() must fit within it.
 #define FABRICATOR_AGG_SPILL_CAP 1024
 
-#define FABRICATOR_ABI_VERSION 84
+#define FABRICATOR_ABI_VERSION 85
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(FabricatorVTable) as seen

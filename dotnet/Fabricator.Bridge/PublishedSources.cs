@@ -55,6 +55,20 @@ internal static class PublishedSources
 {
     /// <summary>Live publications kept before the oldest is reclaimed.</summary>
     internal const int MaxLive = 32;
+
+    /// <summary>
+    /// Rows per exported Arrow batch for a publication's stream (ABI v85). DuckDB's own row-group size, and
+    /// the reason a publication may ask for it when <c>host_query</c>'s default cannot: these rows are
+    /// SCAN MORSELS, never files.
+    /// </summary>
+    /// <remarks>
+    /// The exported batch IS the morsel of a parallel Arrow scan, so a 2048-row default multiplies mutex
+    /// acquisitions, ArrowAppender copies, imports and converter setups by 60. MEASURED on 100M rows of one
+    /// BIGINT through a publication, threads=8, interleaved: 2.08-2.13 s at the default against
+    /// 0.83-0.85 s here, with `sys` time falling 2.1-3.0 s to 0.4-0.5 s — the allocation churn disappearing.
+    /// </remarks>
+    internal const long BatchRows = 122880;
+
     // ⚠ The token is what goes into GENERATED SQL, so it is an opaque unguessable name and never an address.
     // A pointer would be writable, copyable and re-runnable by anyone who read the statement, which is the
     // use-after-free class the temporary-view fix exists to have closed.

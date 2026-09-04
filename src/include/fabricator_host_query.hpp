@@ -84,7 +84,10 @@ void MakeHostQueryStream(DatabaseInstance &db, const string &sql, ArrowArrayStre
                          const vector<HostQueryInput> &inputs, ArrowArrayStream &out,
                          shared_ptr<ClientContext> *out_context = nullptr,
                          const HostQuerySession *session = nullptr,
-                         shared_ptr<HostConnection> pinned = nullptr);
+                         shared_ptr<HostConnection> pinned = nullptr,
+                         // Rows per exported RecordBatch; 0 = one DataChunk (the safe default — a batch is
+                         // also a FILE to engineered-wood). ABI v85; see abi.h.
+                         idx_t batch_rows = 0);
 
 // Registers the `fabricator_host_query(VARCHAR)` table function.
 void RegisterHostQuery(ExtensionLoader &loader);

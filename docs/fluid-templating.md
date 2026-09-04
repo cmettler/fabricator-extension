@@ -2722,3 +2722,40 @@ warning about. One code path with one set of properties is easier to keep honest
 An unscanned publication now holds a **DuckDB connection and its staged table** open until the eviction cap
 reclaims it, where the buffered design held **rows in managed memory** under a row cap. Same cap, different
 resource. `EXPLAIN` is the routine path that produces one.
+
+### 18.10 ⚠⚠ THE BOUNDARY, NOT THE PUSHDOWN, WAS THE COST — and it took an ABI parameter to fix (2026-09-04)
+
+**User-measured**: their billion-row publication took ~20 s where the same relation left in the generated
+SQL took 2.15 s, *and dropping to one column barely helped* — which correctly rejected my first
+explanation (the missing projection pushdown). Decomposed at 100M rows, threads=8:
+
+| | time | vs no boundary |
+|---|---|---|
+| (a) relation left in the generated SQL — no boundary at all | **0.308 s** | — |
+| (d) same rows via `fabricator_host_query`, 1 column | 1.861 s | 6.0x |
+| (c) publication, 1 column | 2.381 s | 7.7x |
+| (b) publication, 2 columns | 3.906 s | 12.7x |
+
+⇒ **projection was only the (c)→(b) gap; ~6x was the boundary itself.** (a) is fast because `fluid_query`'s
+call DISAPPEARS at bind — the physical plan is `RANGE → PROJECTION(n) → UNGROUPED_AGGREGATE`, so `sq` is
+pruned and `i*i` is never computed for a single row.
+
+**THE CAUSE: the default was ONE DuckDB `DataChunk` per exported Arrow batch — 2048 rows.** A billion rows
+therefore crossed as ~488,000 batches, each paying a mutex acquisition, an `ArrowAppender` copy, an import,
+an export and converter setup, *because the exported batch IS the morsel of a parallel Arrow scan*. Fixed
+by ABI **v85**, which lets the CALLER pick; a publication asks for a row group (122880), and
+`fabricator_host_query.cpp`'s own comment had already recorded the win as deferred, with the reason.
+
+**Result on the user's query: ~20 s → 7.89 s** (one column). ⚠ Their two-column form went 27 s → 20.3 s —
+less, because with the per-batch overhead gone the un-pruned second column is now the dominant cost. So
+§18.9's ordering of the two costs was right about their existence and wrong about their size.
+
+⚠ **Why it could not just be the default is the sharpest part, and it was already measured**: a batch is
+also a FILE to engineered-wood, and this same service feeds writers — a row-group default made
+`verify_delta_clustered_optimize` collapse 80,000 rows into one file (147 passed at one chunk, 1 failed at
+122880). A publication is the consumer for which a big batch is unambiguously safe, its stream being scanned
+into the caller's DuckDB and never written. Full record: [abi-history.md](abi-history.md) §v85.
+
+⚠ **Projection pushdown remains unfixed and is now the biggest remaining gap for a wide publication** — the
+obstacle is the declared schema, which is the same mechanism that makes laziness work (§18.9). Filter
+pushdown has no such obstacle.
