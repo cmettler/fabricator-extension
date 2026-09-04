@@ -2252,3 +2252,67 @@ query I
 SELECT fluid_render('{% query r %}SELECT MAP{''k1'':10,''k2'':20} AS m{% endquery %}{{ r[0].m[''k2''] }}', NULL);
 ----
 20
+
+# ============================================================================================
+# §20 — {% exec name %} binds the AFFECTED-ROW COUNT (user-asked). The same shape as
+# {% query name %}: an optional identifier, then optional named arguments.
+#
+# ⚠⚠ THE IDENTIFIER IS OPTIONAL, AND THAT IS THE WHOLE DIFFICULTY. `{% exec %}` and
+# `{% exec x: 7 %}` are shipped spellings that must keep working, and a bare optional Ident cannot
+# coexist with them: on `{% exec x: 7 %}` it matches `x`, ZeroOrOne SUCCEEDS having consumed it,
+# and the `: 7` left over is a parse error — ZeroOrOne does not retry its empty branch once the
+# sequence fails downstream. A negative lookahead, Not(Terms.Char(':')), consumes nothing and
+# fails the identifier branch exactly when the token is really the first NAMED ARGUMENT.
+# All four header shapes below are therefore load-bearing, not variations on a theme.
+# ============================================================================================
+
+statement ok
+CREATE TABLE ex20(a INTEGER);
+
+statement ok
+INSERT INTO ex20 VALUES (1),(2),(3),(4),(5);
+
+# --- the new form ---
+query I
+SELECT fluid_render('{% exec n %}DELETE FROM ex20 WHERE a > 3{% endexec %}deleted={{ n }}', NULL);
+----
+deleted=2
+
+# --- the bare form is unchanged and binds nothing ---
+query I
+SELECT fluid_render('{% exec %}INSERT INTO ex20 VALUES (9){% endexec %}ok', NULL);
+----
+ok
+
+# --- ⚠ THE AMBIGUOUS ONE: named arguments with NO identifier. Without the lookahead this is a
+# parse error, so it is the assertion that guards the grammar rather than the feature. ---
+query I
+SELECT fluid_render('{% exec x: 7 %}INSERT INTO ex20 VALUES ($x){% endexec %}ok', NULL);
+----
+ok
+
+# --- identifier AND named arguments, NO comma — the same shape as {% query t x: 7 %} ---
+query I
+SELECT fluid_render('{% exec n x: 8 %}INSERT INTO ex20 VALUES ($x){% endexec %}n={{ n }}', NULL);
+----
+n=1
+
+# --- and every one of them actually ran ---
+query I
+SELECT string_agg(a::VARCHAR, ',' ORDER BY a) FROM ex20;
+----
+1,2,3,7,8,9
+
+# --- ⚠⚠ THE LOAD-BEARING ASSERTION: all THREE spellings of exec report the SAME number, because
+# they go through one Run. A count computed twice can drift; this is what stops it. ---
+query I
+SELECT fluid_render('{% exec n %}UPDATE ex20 SET a = a WHERE a <= 2{% endexec %}{% assign f = exec("UPDATE ex20 SET a = a WHERE a <= 2") %}{% assign g = "UPDATE ex20 SET a = a WHERE a <= $k" | exec: k: 2 %}block={{ n }} fn={{ f }} filter={{ g }}', NULL);
+----
+block=2 fn=2 filter=2
+
+# --- ⚠ A CTAS reports the ROW COUNT here, where fabricator_host_exec reports 0 (§11's measured
+# divergence between the two exec surfaces). Pinned so the block cannot quietly pick the other. ---
+query I
+SELECT fluid_render('{% exec n %}CREATE TABLE ex20c AS SELECT * FROM range(7){% endexec %}n={{ n }}', NULL);
+----
+n=7

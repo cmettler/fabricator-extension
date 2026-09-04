@@ -175,11 +175,16 @@ internal static class FluidHostExec
     /// <para>
     /// ⚠ It runs the SAME classifier and the SAME connection as the function form — one mechanism, so the
     /// two spellings cannot drift on what counts as a write or on which connection they use. What differs
-    /// is only where the SQL comes from (a rendered body rather than a string argument) and that the count is
-    /// DISCARDED, because a block renders nothing. Use the function form when you want the number.
+    /// is only where the SQL comes from: a rendered body rather than a string argument.
+    /// </para>
+    /// <para>
+    /// ⚠ It RETURNS what <see cref="Run"/> returns rather than discarding it, so <c>{% exec retcode %}</c>
+    /// can bind it — the SAME shape as <c>{% query name %}</c>, and deliberately the same VALUE the
+    /// <c>exec()</c> function yields, so the three spellings cannot report different numbers. The caller
+    /// drops it when no name was given, which is what a bare <c>{% exec %}</c> has always done.
     /// </para>
     /// </remarks>
-    internal static void ExecuteCaptured(TemplateContext ctx, string sql, RecordBatch? parameters)
+    internal static FluidValue ExecuteCaptured(TemplateContext ctx, string sql, RecordBatch? parameters)
     {
         var caller = CallerOf(ctx);
         // ⚠ A whitespace-only body is refused BEFORE the classifier, for the reason the function form
@@ -192,10 +197,10 @@ internal static class FluidHostExec
         }
 
         // ⚠ Straight to Run, which owns the two execution paths (ExecuteNonQuery without parameters,
-        // Query + a local count with them) and the SELECT refusal. The count it returns is DISCARDED —
-        // a block renders nothing — but routing through Run is what keeps the block from acquiring its
-        // own copy of the parameterised/unparameterised split.
-        Run(caller, sql, parameters, FluidRenderSession.For(ctx));
+        // Query + a local count with them) and the SELECT refusal — routing through it is what keeps the
+        // block from acquiring its own copy of the parameterised/unparameterised split, so the two
+        // spellings can never disagree on the number they report.
+        return Run(caller, sql, parameters, FluidRenderSession.For(ctx));
     }
 
     private static void RefuseIfSelect(string caller, string sql, FluidRenderSession run)

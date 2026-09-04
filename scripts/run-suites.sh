@@ -444,6 +444,11 @@ case "$TIER" in
         # in that section is load-bearing and a mutant proved it: an earlier `USE memory.hq_s` leaves a
         # qualified entry, against which the bug does not fire, so the section PASSED with it fully present.
         # 8250 + 9 = 8259 exactly, from a green run.
+        # 8603 since 2026-09-04 (same day, fourth bump): verify_plugin_fluid 318 -> 327 -- {% exec name %}
+        #   binds the affected-row count, the same shape as {% query name %}. ⚠ The identifier is OPTIONAL
+        #   and that is the whole difficulty: {% exec %} and {% exec x: 7 %} are shipped spellings, and a
+        #   bare optional Ident consumes the `x` of `x: 7` and cannot back out. A negative lookahead
+        #   Not(Terms.Char(':')) separates them; the mutant without it dies at a PRE-EXISTING §16 assertion.
         # 8594 since 2026-09-04 (same day, third bump): verify_plugin_fluid 313 -> 318 -- a SHIPPED BUG,
         #   user-found: a STRUCT cell coming OUT of a query result was a LAZY wrapper over a RecordBatch
         #   that is disposed as the result is consumed, so reading it at render time threw a
@@ -494,7 +499,7 @@ case "$TIER" in
         # two functions have exactly ONE registration each, plus the HostsCatalog refusal and its
         # unknown-provider control. 3105 + 238 + 8259 - 3339 arithmetic aside, both numbers come from green
         # runs.
-        : "${MIN_ASSERTIONS:=8594}"
+        : "${MIN_ASSERTIONS:=8603}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

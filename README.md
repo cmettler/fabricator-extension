@@ -1592,8 +1592,15 @@ SELECT fluid_render('{% if go %}{% exec %}DELETE FROM staging{% endexec %}cleare
 > `{{ n | sql_ident }}` for an identifier. Splicing a raw string containing a quote gives a parser error
 > rather than a silent injection, but that is not a substitute.
 >
-> ⚠ **The block renders nothing, so it does not give you the affected-row count.** Use the `exec(...)`
-> function when you want the number.
+**Name the block to get the affected-row count**, the same way `{% query name %}` names its result:
+
+```sql
+SELECT fluid_render('{% exec n %}DELETE FROM staging WHERE loaded{% endexec %}removed {{ n }} rows', NULL);
+```
+
+The name is optional — a bare `{% exec %}` still renders nothing and binds nothing — and named arguments
+follow it exactly as in `{% query %}`: `{% exec n limit: 100 %}`. The number is the same one the
+`exec(...)` function and the `| exec:` filter return.
 >
 > ⚠ It obeys the same rules as the function: it refuses a `SELECT`, it runs on the render's own connection
 > (so a `{% exec %}CREATE TEMP TABLE …{% endexec %}` is readable by a later `query()` in the same

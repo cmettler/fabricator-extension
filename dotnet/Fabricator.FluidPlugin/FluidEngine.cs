@@ -63,8 +63,18 @@ internal static class FluidEngine
         // grammar is Fluid's OWN `ArgumentsList` (`name: value`, comma-separated) rather than one invented
         // here, so it reads like every other named-argument site in Liquid; `ZeroOrOne` is what makes it
         // optional, since ArgumentsList is `Separated(Comma, …)` and matches at least one.
-        parser.RegisterParserBlock(FluidHostExec.BlockName, ZeroOrOne(parser.NamedArguments),
-                                   static async (args, statements, output, encoder, ctx) =>
+        // ⚠⚠ THE IDENTIFIER IS OPTIONAL, AND THE NEGATIVE LOOKAHEAD IS WHAT MAKES THAT POSSIBLE.
+        // `{% exec retcode %}` binds the affected-row count to `retcode`; `{% exec %}` and
+        // `{% exec x: 7 %}` must keep working unchanged. Without the lookahead they cannot coexist: on
+        // `{% exec x: 7 %}` a bare optional Ident matches `x`, ZeroOrOne then SUCCEEDS having consumed it,
+        // and the `: 7` that follows is a parse error — ZeroOrOne does not retry its empty branch once the
+        // sequence fails downstream. `Not(Terms.Char(':'))` consumes nothing and fails the identifier
+        // branch exactly when the token is really the first NAMED ARGUMENT, so the two spellings separate
+        // cleanly and `{% exec retcode x: 7 %}` reads like `{% query t x: 7 %}` — no comma, same shape.
+        parser.RegisterParserBlock(
+            FluidHostExec.BlockName,
+            ZeroOrOne(parser.Ident.AndSkip(Not(Terms.Char(':')))).And(ZeroOrOne(parser.NamedArguments)),
+            static async (head, statements, output, encoder, ctx) =>
         {
             var (completion, sql) = await CaptureBodyAsync(statements, ctx);
             if (completion != Completion.Normal)
@@ -73,8 +83,16 @@ internal static class FluidEngine
             }
 
             var parameters = await FluidHostQuery.BuildBlockParametersAsync(
-                FluidHostQuery.CallerOf(ctx), FluidHostExec.BlockName, args, ctx);
-            FluidHostExec.ExecuteCaptured(ctx, sql, parameters);
+                FluidHostQuery.CallerOf(ctx), FluidHostExec.BlockName, head.Item2, ctx);
+            var affected = FluidHostExec.ExecuteCaptured(ctx, sql, parameters);
+            // ⚠ Bound ONLY when a name was given, and bound as the VALUE ExecuteCaptured returns — the
+            // same one the exec() FUNCTION yields, so the three spellings cannot report different numbers.
+            // Without a name it is discarded, which is what `{% exec %}` has always done: a block renders
+            // nothing and most callers want nothing back.
+            if (!string.IsNullOrEmpty(head.Item1))
+            {
+                ctx.SetValue(head.Item1, affected);
+            }
             return Completion.Normal;
         });
 

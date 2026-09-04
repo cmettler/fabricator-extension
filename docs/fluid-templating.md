@@ -1555,8 +1555,45 @@ concatenation. The block form makes the statement ordinary template text: multi-
 `{% exec %}` runs nothing, because the tag is a statement in the tree rather than an argument that had to
 be evaluated to build a call (gated).
 
-The function form is not superseded: it RETURNS the affected-row count, and the block deliberately does
-not (it renders nothing, which is the whole point). Use the function when you want the number.
+**⚠ That paragraph used to read *"The function form is not superseded: it RETURNS the affected-row count,
+and the block deliberately does not."* Since 2026-09-04 the block returns it too** — see §13.8. The
+function form remains the right spelling inside an expression; the block is the right one for a real
+statement.
+
+### 13.8 ✅ `{% exec name %}` binds the affected-row count (2026-09-04, user-asked)
+
+```liquid
+{% exec n %}DELETE FROM staging WHERE loaded{% endexec %}removed {{ n }} rows
+```
+
+The same shape as `{% query name %}` — an optional identifier, then optional named arguments — and
+deliberately the same VALUE the `exec()` function and the `| exec:` filter yield, because all three go
+through one `Run`. **Gated as a triple** (`block=2 fn=2 filter=2`): a count computed in more than one place
+can drift, and that assertion is what stops it.
+
+**⚠⚠ THE IDENTIFIER IS OPTIONAL, AND THAT IS THE WHOLE DIFFICULTY.** `{% exec %}` and `{% exec x: 7 %}`
+are shipped spellings that must keep working, and a bare optional `Ident` cannot coexist with the second:
+on `{% exec x: 7 %}` it matches `x`, `ZeroOrOne` then SUCCEEDS having consumed it, and the `: 7` left over
+is a parse error — **`ZeroOrOne` does not retry its empty branch once the sequence fails downstream.**
+
+The fix is a negative lookahead, which consumes nothing and fails the identifier branch exactly when the
+token is really the first named argument:
+
+```csharp
+ZeroOrOne(parser.Ident.AndSkip(Not(Terms.Char(':')))).And(ZeroOrOne(parser.NamedArguments))
+```
+
+With it, `{% exec n x: 8 %}` reads like `{% query t x: 8 %}` — identifier, space, comma-separated
+arguments, no comma after the name. ⚠ **Mutation-tested, and the mutant dies at a PRE-EXISTING §16
+assertion** (`{% exec x: 7, y: 8 %}`) after 290 pass, not at one of the new ones — which is what shows the
+lookahead is protecting a shipped spelling rather than only enabling a new one.
+
+⚠ Without a name the value is DISCARDED, exactly as before. A block renders nothing and most callers want
+nothing back; binding is opt-in by writing the name.
+
+⚠ A CTAS reports the ROW COUNT here (`n=7` for `CREATE TABLE c AS SELECT * FROM range(7)`), where
+`fabricator_host_exec` reports 0 — §11's measured divergence between the two exec surfaces, pinned so the
+block cannot quietly pick the other one.
 
 ### 13.2 ⚠ Everything downstream of the capture is SHARED with the function form
 
