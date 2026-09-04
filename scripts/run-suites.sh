@@ -444,6 +444,10 @@ case "$TIER" in
         # in that section is load-bearing and a mutant proved it: an earlier `USE memory.hq_s` leaves a
         # qualified entry, against which the bug does not fire, so the section PASSED with it fully present.
         # 8250 + 9 = 8259 exactly, from a green run.
+        # 8589 since 2026-09-04 (same day, second bump): verify_plugin_fluid 307 -> 313 -- parameters
+        #   NEST (lists of structs, structs of lists, any depth), converted recursively in two passes.
+        #   ⚠ TWO of the 6 are REPLACED assertions: §17 pinned "a nested value has no SQL list form"
+        #   hours earlier, and falsifying that is how the change announced itself.
         # 8583 since 2026-09-04: verify_plugin_fluid 296 -> 307 -- a Fluid ARRAY binds as a SQL LIST
         #   ({% query r xs: v %}… unnest($xs) …), replacing a refusal that was OURS and not DuckDB's
         #   (measured: PREPARE p AS SELECT a: unnest($1); EXECUTE p([1,2,3,4,5]) yields five rows).
@@ -484,7 +488,7 @@ case "$TIER" in
         # two functions have exactly ONE registration each, plus the HostsCatalog refusal and its
         # unknown-provider control. 3105 + 238 + 8259 - 3339 arithmetic aside, both numbers come from green
         # runs.
-        : "${MIN_ASSERTIONS:=8583}"
+        : "${MIN_ASSERTIONS:=8589}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

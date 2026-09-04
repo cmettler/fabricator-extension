@@ -761,8 +761,7 @@ placeholder `$sql`. **The field name in a params batch is now load-bearing**, wh
 
 Number → `BIGINT` when integral and in range, else `DECIMAL(38, scale)`; String → VARCHAR; Boolean → BOOLEAN;
 DateTime → `TIMESTAMP` stamped UTC (§7.4a's rule on the way in applies on the way out); Nil → a NULL VARCHAR.
-An **ARRAY binds as a SQL LIST** (see below); a STRUCT/MAP is **refused by name** — rendering one into the
-SQL is precisely what parameters exist to avoid.
+**Lists, structs and any nesting of them bind recursively** (see below).
 
 ##### ⚠⚠ A LIST parameter — added 2026-09-04, and it REPLACES a refusal this document used to state
 
@@ -786,7 +785,42 @@ crosses the list as VALUES instead of forcing the `{{ v | json }}::json[]` splic
 - **⚠ An EMPTY or all-NULL list has no element kind to read off** ⇒ VARCHAR, which is the choice the scalar
   NULL case already makes and for the same reason (it is what DuckDB casts most freely FROM, so
   `$xs::BIGINT[]` still works, and `unnest` of it yields no rows either way).
-- **NESTED arrays and structs are refused** — the same one-level rule the scalar ladder has.
+- **NESTED arrays and structs bind too** — see §Nesting below. (This line read *"nested arrays and structs
+  are refused — the same one-level rule the scalar ladder has"* for a few hours on 2026-09-04, and the gate
+  is what announced that it had stopped being true.)
+
+##### Nesting — lists of structs, structs of lists, any depth
+
+A parameter is converted RECURSIVELY, in two passes: infer the Arrow type over the whole value, then build
+it. Two passes because Arrow (and DuckDB) need a concrete type at every level where Fluid has none.
+
+```liquid
+{% query rows xs: people %}SELECT string_agg(u.label, ',') AS s FROM (SELECT unnest($xs) AS u){% endquery %}
+```
+
+⚠ **Nesting was measured to be possible before any of it was built** — DuckDB binds a STRUCT
+(`SELECT ($1).a` ⇒ 42), a nested LIST (`len(unnest($1))` ⇒ 2, 1), a LIST of STRUCT (`unnest($1).label` ⇒
+a, b) and a MAP (`($1)['k']` ⇒ 7).
+
+- **The shape that earns it is LIST-of-STRUCT** — a small table as one parameter, expanded with
+  `unnest($xs).*`. A bare struct is marginal (pass the fields separately) and nested lists are rare.
+- **⚠⚠ STRUCTS IN ONE LIST MUST SHARE A SHAPE** — same field names, same order. Unioning the field sets
+  with NULLs would invent members the author never wrote, so it is refused by name. ⚠ Reachable only
+  through the JSON form: a DuckDB LIST of structs is already homogeneous.
+- **⚠⚠ A DuckDB MAP ROUND-TRIPS AS A STRUCT, and that asymmetry is deliberate.** Read in, a MAP becomes an
+  `IFluidIndexable` exactly like a struct, so nothing at the Fluid level distinguishes them and a struct is
+  the only honest thing to write back. Refusing would block a shape that otherwise works end to end.
+- Members are read through `EnumerateAsync` rather than `IFluidIndexable.Keys`, because that is the ONE
+  spelling that works for both sources — a DuckDB struct arrives as a `DictionaryValue` over our
+  `ArrowStruct`, a JSON object through Fluid's own JsonNode support, and **both yield `[key, value]` pairs**
+  (measured; it is what `{% for kv in v %}` uses).
+- A depth guard at 16 levels turns a cyclic value into a sentence rather than a stack overflow.
+- ⚠ Refusals speak the AUTHOR's vocabulary, not Arrow's: mixing `1` and `"a"` reports *"its elements mix
+  Number and String"*, never *"int64 and utf8"* — they wrote the former and never see the latter.
+
+**⚠ The READ direction was already recursive and is untouched** — `{{ v.kids[1].scores[2] }}` resolves
+through struct → list → struct → list, and has for as long as `ReadCell` has existed. The gap this closes
+was one-directional.
 
 **⚠⚠ THE BUILD HAD THE JANUARY-1970 BUG, IN A NEW PLACE, AND ONLY A DATE ELEMENT SHOWED IT.** The first
 version appended through `ListArray.Builder.ValueBuilder`, which does **not** carry a `TimestampType`'s UNIT

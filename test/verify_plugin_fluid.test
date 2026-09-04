@@ -2142,13 +2142,67 @@ SELECT fluid_render('{% query r xs: v %}SELECT count(*) FROM (SELECT unnest($xs)
 ----
 its elements mix Number and String
 
-# --- and a NESTED array or struct is refused, the same one-level rule the scalar ladder has ---
-statement error
-SELECT fluid_render('{% query r xs: v %}SELECT count(*) FROM (SELECT unnest($xs)){% endquery %}ok', {v: [[1,2],[3]]});
-----
-a nested value has no SQL list form
+# ============================================================================================
+# §18 — NESTING. Lists, structs and any combination of them bind recursively, so a template can
+# hand a statement a whole small table rather than a flat list.
+#
+# ⚠⚠ These two shapes were REFUSALS in §17, asserted hours earlier ("a nested value has no SQL
+# list form"). Falsifying those assertions is how this change announced itself; they are REPLACED
+# with what the behaviour is now rather than deleted.
+#
+# ⚠ Nesting is not speculative — DuckDB binds every one of these, MEASURED before any was built:
+# a STRUCT (SELECT ($1).a => 42), a nested LIST (len(unnest($1)) => 2, 1), a LIST of STRUCT
+# (unnest($1).label => a, b) and a MAP (($1)['k'] => 7).
+# ============================================================================================
 
-statement error
-SELECT fluid_render('{% query r xs: v %}SELECT count(*) FROM (SELECT unnest($xs)){% endquery %}ok', {v: [{'a':1}]});
+query I
+SELECT fluid_render('{% query r xs: v %}SELECT string_agg(len(u), '','') AS s FROM (SELECT unnest($xs) AS u){% endquery %}s={{ r[0].s }}', {v: [[1,2],[3]]});
 ----
-a nested value has no SQL list form
+s=2,1
+
+# --- the shape that earns the feature: a small TABLE as one parameter ---
+query I
+SELECT fluid_render('{% query r xs: v %}SELECT string_agg(u.label, '','') AS s FROM (SELECT unnest($xs) AS u){% endquery %}s={{ r[0].s }}', {v: [{'label':'a'},{'label':'b'}]});
+----
+s=a,b
+
+query I
+SELECT fluid_render('{% query r s: v %}SELECT ($s).a + ($s).b AS n{% endquery %}n={{ r[0].n }}', {v: {'a':40,'b':2}});
+----
+n=42
+
+# --- ⚠⚠ A DATE AT DEPTH: struct > list > struct > date. This is §17's January-1970 guard carried
+# down the recursion, and it is the only element kind that can catch a unit mismatch — numbers,
+# strings and booleans have nothing to get wrong. Asserted as an INSTANT, never as rendered text. ---
+query I
+SELECT fluid_render('{% query r s: v %}SELECT epoch((($s).rows)[1].d)::BIGINT AS e{% endquery %}e={{ r[0].e }}', {v: {'rows': [{'d': DATE '2023-01-02'}]}});
+----
+e=1672617600
+
+# --- ⚠ A DuckDB MAP round-trips as a STRUCT, and that asymmetry is deliberate: read in, a MAP
+# becomes an IFluidIndexable exactly like a struct, so nothing at the Fluid level distinguishes
+# them. Refusing would block a shape that otherwise works end to end. ---
+query I
+SELECT fluid_render('{% query r s: v %}SELECT ($s).m.k2 AS n{% endquery %}n={{ r[0].n }}', {v: {'m': MAP{'k1':10,'k2':20}}});
+----
+n=20
+
+# --- and the same through the JSON parameter form, which is a different value model entirely ---
+query I
+SELECT fluid_render('{% query r xs: v %}SELECT count(*) AS n FROM (SELECT unnest($xs)){% endquery %}n={{ r[0].n }}', '{"v":[{"a":1},{"a":2}]}');
+----
+n=2
+
+# --- ⚠ STRUCTS IN ONE LIST MUST SHARE A SHAPE. Unioning the field sets with NULLs would invent
+# members the author never wrote, so it is refused by name. Reachable only through JSON: a DuckDB
+# LIST of structs is already homogeneous. ---
+statement error
+SELECT fluid_render('{% query r xs: v %}SELECT 1{% endquery %}ok', '{"v":[{"a":1},{"a":1,"b":2}]}');
+----
+do not all carry the same fields
+
+# --- mixing a scalar with a container is refused in the author's vocabulary, not Arrow's ---
+statement error
+SELECT fluid_render('{% query r xs: v %}SELECT 1{% endquery %}ok', '{"v":[1,[2]]}');
+----
+mix Number and Array

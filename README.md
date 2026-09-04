@@ -1440,10 +1440,23 @@ SELECT fluid_render(
    {% endquery %}{{ r[0].n }}', {v: ['eu','us']});
 ```
 
-Its elements must all be of one kind — numbers, strings, booleans or dates, with `nil`s allowed anywhere
-among them. A mixed list, a nested list and a struct are each refused by name rather than coerced, because
-the only shape they all share is text and turning `5` into `'5'` would quietly change what the statement
-compares.
+Its elements must all be of one kind — numbers, strings, booleans, dates, or nested lists and structs, with
+`nil`s allowed anywhere among them. A *mixed* list is refused by name rather than coerced, because the only
+shape they all share is text and turning `5` into `'5'` would quietly change what the statement compares.
+
+**Lists and structs nest**, so a template can hand a statement a whole small table:
+
+```sql
+SELECT fluid_render(
+  '{% query rows xs: people %}SELECT string_agg(u.label, '','') AS s
+   FROM (SELECT unnest($xs) AS u){% endquery %}{{ rows[0].s }}',
+  {people: [{'label':'a'}, {'label':'b'}]});
+-- a,b
+```
+
+Structs in one list must share their field names and order — unioning them with `NULL`s would invent
+members you never wrote. A DuckDB `MAP` comes back as a struct, because nothing at the template level
+distinguishes the two.
 
 > ⚠ **`query()` runs `SELECT` statements only, and this is not a policy you can turn off.** A template is
 > rendered while a statement is being *bound*, and binding repeats and happens without executing — so a

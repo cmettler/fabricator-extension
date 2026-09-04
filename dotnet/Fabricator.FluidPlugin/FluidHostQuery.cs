@@ -295,223 +295,330 @@ internal static class FluidHostQuery
     }
 
     /// <summary>One named parameter as a 1-row Arrow column.</summary>
+    /// <summary>
+    /// A Fluid value as ONE bound SQL parameter, RECURSIVELY: scalars, lists, structs and any nesting of
+    /// them. Two passes — infer the Arrow type over the whole value, then build it — because Arrow (and
+    /// DuckDB) need a concrete type at every level where Fluid has none.
+    /// <para>⚠ Nesting is not speculative: DuckDB binds all of these, MEASURED — a STRUCT
+    /// (<c>SELECT ($1).a</c> gives 42), a nested LIST (<c>len(unnest($1))</c> gives 2, 1), a LIST of STRUCT
+    /// (<c>unnest($1).label</c> gives a, b) and a MAP (<c>($1)['k']</c> gives 7).</para>
+    /// <para>⚠⚠ A DuckDB MAP round-trips as a STRUCT, and that is a real asymmetry rather than an
+    /// oversight: read in, a MAP becomes an <c>IFluidIndexable</c> exactly like a struct, so nothing at the
+    /// Fluid level distinguishes them and a struct is the only honest thing to write back. Refusing instead
+    /// would block a shape that otherwise works end to end.</para>
+    /// </summary>
     private static (Field, IArrowArray) ToParameter(string caller, string name, FluidValue value,
                                                     TemplateContext ctx)
     {
-        switch (value.Type)
+        // ⚠ An all-NULL or empty value carries no type at all. VARCHAR is what the scalar NULL case has
+        // always used, and for the same reason: it is what DuckDB casts most freely FROM.
+        var type = InferType(caller, name, value, ctx, 0) ?? StringType.Default;
+        return (new Field(name, type, nullable: true),
+                BuildArray(caller, name, type, new[] { value }, ctx));
+    }
+
+    /// <summary>How deep a bound value may nest. A guard, not a limit anyone should meet: it exists so a
+    /// cyclic or pathological value fails with a sentence instead of a stack overflow.</summary>
+    private const int MaxParameterDepth = 16;
+
+    private static bool IsNullish(FluidValue v)
+        => v.Type is FluidValues.Nil or FluidValues.Empty or FluidValues.Blank;
+
+    private static IReadOnlyList<FluidValue> Items(FluidValue v, TemplateContext ctx)
+        => (v as ArrayValue)?.Values ?? v.EnumerateAsync(ctx).ToBlockingEnumerable().ToList();
+
+    /// <summary>The members of a dictionary-like value, in the order it enumerates them.
+    /// <para>⚠ Read through <c>EnumerateAsync</c> rather than <c>IFluidIndexable.Keys</c> because that is
+    /// the ONE spelling that works for both sources: a DuckDB STRUCT arrives as a <c>DictionaryValue</c>
+    /// over our <c>ArrowStruct</c>, a JSON object through Fluid's own JsonNode support, and both yield
+    /// <c>[key, value]</c> pairs (measured — it is what <c>{% for kv in v %}</c> uses). A value that yields
+    /// anything else is refused rather than guessed at.</para></summary>
+    private static IReadOnlyList<(string Key, FluidValue Value)> Members(string caller, string name,
+                                                                        FluidValue v, TemplateContext ctx)
+    {
+        var members = new List<(string, FluidValue)>();
+        foreach (var pair in v.EnumerateAsync(ctx).ToBlockingEnumerable())
+        {
+            if (pair is ArrayValue kv && kv.Values.Count == 2)
+            {
+                members.Add((kv.Values[0].ToStringValue(), kv.Values[1]));
+            }
+            else
+            {
+                throw Refusal(caller, name, "a " + v.Type + " whose members cannot be enumerated as "
+                                            + "key/value pairs has no SQL parameter form");
+            }
+        }
+        return members;
+    }
+
+    // null == "no type yet" (a NULL, or an empty container). Resolved to VARCHAR by the caller.
+    private static IArrowType? InferType(string caller, string name, FluidValue v, TemplateContext ctx,
+                                         int depth)
+    {
+        if (depth > MaxParameterDepth)
+        {
+            throw Refusal(caller, name, "it nests deeper than " + MaxParameterDepth + " levels");
+        }
+        switch (v.Type)
         {
             case FluidValues.Nil:
             case FluidValues.Empty:
-                // ⚠ A NULL still needs a TYPE to cross, and VARCHAR is the one DuckDB casts most freely
-                // from. `$x IS NULL` and `$x` on its own behave; a comparison against a numeric column may
-                // still refuse the cast, which is DuckDB's answer rather than something to paper over.
-                return (new Field(name, StringType.Default, nullable: true),
-                        new StringArray.Builder().AppendNull().Build());
+            case FluidValues.Blank:
+                return null;
             case FluidValues.Boolean:
-                return (new Field(name, BooleanType.Default, nullable: true),
-                        new BooleanArray.Builder().Append(value.ToBooleanValue()).Build());
+                return BooleanType.Default;
             case FluidValues.String:
-                return (new Field(name, StringType.Default, nullable: true),
-                        new StringArray.Builder().Append(value.ToStringValue(ctx)).Build());
-            case FluidValues.Number:
-                return NumberParameter(name, value.ToNumberValue());
-            case FluidValues.Array:
-                return ArrayParameter(caller, name, value, ctx);
+                return StringType.Default;
             case FluidValues.DateTime:
-                // ⚠ Stamped UTC for the same reason §7.4a records on the way in: an Unspecified DateTime is
-                // resolved against the MACHINE's local zone, which silently shifts the value.
-                var dt = value.ToObjectValue() is DateTimeOffset dto
-                    ? dto.UtcDateTime
-                    : DateTime.SpecifyKind((DateTime)(value.ToObjectValue() ?? default(DateTime)),
-                                           DateTimeKind.Utc);
-                return (new Field(name, new TimestampType(TimeUnit.Microsecond, "UTC"), nullable: true),
-                        new TimestampArray.Builder(new TimestampType(TimeUnit.Microsecond, "UTC"))
-                            .Append(new DateTimeOffset(dt, TimeSpan.Zero)).Build());
+                return new TimestampType(TimeUnit.Microsecond, "UTC");
+            case FluidValues.Number:
+            {
+                // Fluid's number model IS decimal, so even `10` arrives as one. The integral case is
+                // narrowed back to BIGINT so the ordinary spelling behaves like the literal it replaced; a
+                // fractional value keeps its own scale, so 19.99 stays 19.99.
+                var n = v.ToNumberValue();
+                return decimal.Truncate(n) == n && n >= long.MinValue && n <= long.MaxValue
+                    ? Int64Type.Default
+                    : new Decimal128Type(38, (int)((decimal.GetBits(n)[3] >> 16) & 0x7F));
+            }
+            case FluidValues.Array:
+            {
+                IArrowType? elem = null;
+                foreach (var item in Items(v, ctx))
+                {
+                    elem = Unify(caller, name, elem, InferType(caller, name, item, ctx, depth + 1));
+                }
+                return new ListType(new Field("item", elem ?? StringType.Default, nullable: true));
+            }
+            case FluidValues.Dictionary:
+            case FluidValues.Object:
+            {
+                var fields = new List<Field>();
+                foreach (var (key, member) in Members(caller, name, v, ctx))
+                {
+                    var ft = InferType(caller, name, member, ctx, depth + 1) ?? StringType.Default;
+                    fields.Add(new Field(key, ft, nullable: true));
+                }
+                if (fields.Count == 0)
+                {
+                    throw Refusal(caller, name, "an empty struct has no SQL parameter form");
+                }
+                return new StructType(fields);
+            }
             default:
-                throw new ArgumentException(
-                    $"{caller}: {FunctionName} cannot bind parameter '{name}' — a {value.Type} has no SQL "
-                    + "parameter form. Pass a number, string, boolean, date, null or a LIST of those; build "
-                    + "a struct in SQL instead.");
+                throw Refusal(caller, name, "a " + v.Type + " has no SQL parameter form");
         }
     }
 
     /// <summary>
-    /// A Fluid ARRAY as a bound LIST parameter — so <c>{% query r items: xs %}…$items…{% endquery %}</c>
-    /// crosses as VALUES rather than as spliced text.
-    /// <para>⚠ DuckDB binds a LIST parameter happily, and even infers its use untyped — MEASURED:
-    /// <c>PREPARE p AS SELECT a: unnest($1); EXECUTE p([1,2,3,4,5])</c> yields five rows. So the refusal this
-    /// replaces was OURS, not the engine's.</para>
-    /// <para>⚠⚠ ONE element kind for the whole list, because an Arrow list is TYPED. A mixed list is REFUSED
-    /// by name rather than coerced: the only common representation is text, and turning 5 into "5" silently
-    /// changes what the statement compares. NULL elements carry no kind, so they mix with anything.</para>
-    /// <para>⚠ NESTED arrays/structs are refused — the same one-level rule the scalar ladder has, for the
-    /// same reason (there is no obvious SQL form and guessing one is worse than saying so).</para>
+    /// One type for values that must share one. ⚠⚠ MIXED KINDS ARE REFUSED rather than coerced: the only
+    /// representation they all share is text, and turning 5 into '5' silently changes what the statement
+    /// compares. The only widening allowed is the scalar path's own int64 to decimal ladder; for structs the
+    /// field NAME SETS must match exactly, since unioning them with NULLs would invent members the author
+    /// never wrote.
     /// </summary>
-    private static (Field, IArrowArray) ArrayParameter(string caller, string name, FluidValue value,
-                                                       TemplateContext ctx)
+    private static IArrowType? Unify(string caller, string name, IArrowType? a, IArrowType? b)
     {
-        var items = (value as ArrayValue)?.Values
-                    ?? value.EnumerateAsync(ctx).ToBlockingEnumerable().ToList();
-
-        var kind = FluidValues.Nil;
-        bool integral = true;
-        int scale = 0;
-        foreach (var item in items)
+        if (a is null) { return b; }
+        if (b is null) { return a; }
+        switch (a, b)
         {
-            var k = item.Type;
-            if (k is FluidValues.Nil or FluidValues.Empty or FluidValues.Blank)
+            case (Int64Type, Int64Type):
+                return a;
+            case (Decimal128Type da, Decimal128Type db):
+                return new Decimal128Type(38, Math.Max(da.Scale, db.Scale));
+            case (Int64Type, Decimal128Type d1):
+                return d1;
+            case (Decimal128Type d2, Int64Type):
+                return d2;
+            case (ListType la, ListType lb):
+                return new ListType(new Field(
+                    "item", Unify(caller, name, la.ValueDataType, lb.ValueDataType) ?? StringType.Default,
+                    nullable: true));
+            case (StructType sa, StructType sb):
             {
-                continue; // a NULL element carries no type
-            }
-            if (k is FluidValues.Array or FluidValues.Object or FluidValues.Dictionary or FluidValues.Function)
-            {
-                throw ArrayRefusal(caller, name, $"it contains a {k}, and a nested value has no SQL list form");
-            }
-            if (kind == FluidValues.Nil)
-            {
-                kind = k;
-            }
-            else if (kind != k)
-            {
-                throw ArrayRefusal(caller, name,
-                                   $"its elements mix {kind} and {k}, and an Arrow list carries ONE type");
-            }
-            if (k == FluidValues.Number)
-            {
-                // The same int64 -> decimal ladder the scalar path uses, decided over the WHOLE list: one
-                // non-integral element makes every element a decimal, and the widest scale wins so 19.99
-                // stays 19.99.
-                var n = item.ToNumberValue();
-                if (decimal.Truncate(n) != n || n < long.MinValue || n > long.MaxValue)
+                if (sa.Fields.Count != sb.Fields.Count
+                    || !sa.Fields.Select(f => f.Name).SequenceEqual(sb.Fields.Select(f => f.Name)))
                 {
-                    integral = false;
+                    throw Refusal(caller, name,
+                                  "its structs do not all carry the same fields in the same order, and an "
+                                  + "Arrow struct has ONE shape");
                 }
-                scale = Math.Max(scale, (int)((decimal.GetBits(n)[3] >> 16) & 0x7F));
+                var merged = new List<Field>(sa.Fields.Count);
+                for (int i = 0; i < sa.Fields.Count; i++)
+                {
+                    merged.Add(new Field(
+                        sa.Fields[i].Name,
+                        Unify(caller, name, sa.Fields[i].DataType, sb.Fields[i].DataType)
+                            ?? StringType.Default,
+                        nullable: true));
+                }
+                return new StructType(merged);
             }
+            default:
+                if (a.TypeId == b.TypeId)
+                {
+                    return a; // Boolean / String / Timestamp — nothing to widen
+                }
+                throw Refusal(caller, name,
+                              "its elements mix " + Friendly(a) + " and " + Friendly(b)
+                              + ", and one parameter carries ONE type");
         }
+    }
 
-        // ⚠ An ALL-NULL or EMPTY list has no element kind to read off. VARCHAR is the choice the scalar NULL
-        // case already makes, and for the same reason: it is what DuckDB casts most freely FROM, so
-        // `$xs::BIGINT[]` still works and `unnest($xs)` yields no rows either way.
-        IArrowType elem = kind switch
-        {
-            FluidValues.Boolean => BooleanType.Default,
-            FluidValues.String => StringType.Default,
-            FluidValues.DateTime => new TimestampType(TimeUnit.Microsecond, "UTC"),
-            FluidValues.Number => integral ? Int64Type.Default : new Decimal128Type(38, scale),
-            _ => StringType.Default,
-        };
-
-        // ⚠⚠ THE VALUES ARRAY IS BUILT WITH AN EXPLICITLY TYPED BUILDER AND THE LIST IS ASSEMBLED BY HAND,
-        // which is not fussiness — `ListArray.Builder` creates its own ValueBuilder from the type and does
-        // NOT carry a TimestampType's UNIT into it. Appending through it stored MILLISECONDS under a field
-        // declaring MICROSECONDS, so DATE '2023-01-02' read back as 1970-01-20 09:36:57.6 — the exact
-        // January-1970 signature this repo already recorded for hand-rolled Arrow timestamp sites, in a new
-        // place. Only a DATE element shows it: numbers, strings and booleans have nothing to get wrong.
-        IArrowArray values;
-        switch (elem)
+    /// <summary>
+    /// Builds the Arrow array for <paramref name="values"/> at the already-inferred <paramref name="type"/>.
+    /// <para>⚠⚠ EVERY BUILDER IS CONSTRUCTED FROM THE DECLARED TYPE, and the nested arrays are assembled by
+    /// hand rather than through <c>ListArray.Builder</c>. That is not fussiness: its <c>ValueBuilder</c>
+    /// does NOT carry a <c>TimestampType</c>'s UNIT into the builder it creates, so appending through it
+    /// stored MILLISECONDS under a field declaring MICROSECONDS and a date read back as
+    /// <c>1970-01-20 09:36:57.6</c> — the January-1970 signature this repo already records for hand-rolled
+    /// Arrow timestamp sites. Only a DATE shows it; numbers, strings and booleans have nothing to get
+    /// wrong, so a battery without one would ship it.</para>
+    /// </summary>
+    private static IArrowArray BuildArray(string caller, string name, IArrowType type,
+                                          IReadOnlyList<FluidValue> values, TemplateContext ctx)
+    {
+        switch (type)
         {
             case BooleanType:
             {
                 var b = new BooleanArray.Builder();
-                foreach (var item in items)
+                foreach (var v in values)
                 {
-                    if (IsNullElement(item)) { b.AppendNull(); } else { b.Append(item.ToBooleanValue()); }
+                    if (IsNullish(v)) { b.AppendNull(); } else { b.Append(v.ToBooleanValue()); }
                 }
-                values = b.Build();
-                break;
+                return b.Build();
             }
             case Int64Type:
             {
                 var b = new Int64Array.Builder();
-                foreach (var item in items)
+                foreach (var v in values)
                 {
-                    if (IsNullElement(item)) { b.AppendNull(); } else { b.Append((long)item.ToNumberValue()); }
+                    if (IsNullish(v)) { b.AppendNull(); } else { b.Append((long)v.ToNumberValue()); }
                 }
-                values = b.Build();
-                break;
+                return b.Build();
             }
             case Decimal128Type dec:
             {
                 var b = new Decimal128Array.Builder(dec);
-                foreach (var item in items)
+                foreach (var v in values)
                 {
-                    if (IsNullElement(item)) { b.AppendNull(); } else { b.Append(item.ToNumberValue()); }
+                    if (IsNullish(v)) { b.AppendNull(); } else { b.Append(v.ToNumberValue()); }
                 }
-                values = b.Build();
-                break;
+                return b.Build();
             }
             case TimestampType ts:
             {
-                var b = new TimestampArray.Builder(ts);   // the DECLARED unit, never the builder's default
-                foreach (var item in items)
+                var b = new TimestampArray.Builder(ts); // the DECLARED unit, never the builder's default
+                foreach (var v in values)
                 {
-                    if (IsNullElement(item))
+                    if (IsNullish(v))
                     {
                         b.AppendNull();
                         continue;
                     }
-                    // Stamped UTC for the reason the scalar case records: an Unspecified DateTime is
-                    // resolved against the MACHINE's zone, which silently shifts the value.
-                    var o = item.ToObjectValue();
+                    // Stamped UTC: an Unspecified DateTime is otherwise resolved against the MACHINE's
+                    // zone, which silently shifts the value.
+                    var o = v.ToObjectValue();
                     var d = o is DateTimeOffset dto
                         ? dto.UtcDateTime
                         : DateTime.SpecifyKind((DateTime)(o ?? default(DateTime)), DateTimeKind.Utc);
                     b.Append(new DateTimeOffset(d, TimeSpan.Zero));
                 }
-                values = b.Build();
-                break;
+                return b.Build();
+            }
+            case ListType lt:
+            {
+                var flat = new List<FluidValue>();
+                var offsets = new ArrowBuffer.Builder<int>();
+                var validity = new ArrowBuffer.BitmapBuilder();
+                int nulls = 0;
+                offsets.Append(0);
+                foreach (var v in values)
+                {
+                    if (IsNullish(v))
+                    {
+                        validity.Append(false);
+                        nulls++;
+                    }
+                    else
+                    {
+                        validity.Append(true);
+                        flat.AddRange(Items(v, ctx));
+                    }
+                    offsets.Append(flat.Count);
+                }
+                var child = BuildArray(caller, name, lt.ValueDataType, flat, ctx);
+                return new ListArray(type, values.Count, offsets.Build(), child,
+                                     nulls == 0 ? ArrowBuffer.Empty : validity.Build(), nulls);
+            }
+            case StructType st:
+            {
+                // One COLUMN per field, gathered across all the struct values — a struct array is stored
+                // column-wise, so an absent member becomes a NULL in that column rather than a hole.
+                var perValue = new List<Dictionary<string, FluidValue>?>(values.Count);
+                foreach (var v in values)
+                {
+                    perValue.Add(IsNullish(v)
+                                     ? null
+                                     : Members(caller, name, v, ctx)
+                                           .ToDictionary(m => m.Key, m => m.Value));
+                }
+                var children = new List<IArrowArray>(st.Fields.Count);
+                foreach (var f in st.Fields)
+                {
+                    var column = new List<FluidValue>(values.Count);
+                    foreach (var members in perValue)
+                    {
+                        column.Add(members is not null && members.TryGetValue(f.Name, out var mv)
+                                       ? mv
+                                       : NilValue.Instance);
+                    }
+                    children.Add(BuildArray(caller, name, f.DataType, column, ctx));
+                }
+                var validity = new ArrowBuffer.BitmapBuilder();
+                int nulls = 0;
+                foreach (var v in values)
+                {
+                    bool present = !IsNullish(v);
+                    validity.Append(present);
+                    if (!present) { nulls++; }
+                }
+                return new StructArray(type, values.Count, children,
+                                       nulls == 0 ? ArrowBuffer.Empty : validity.Build(), nulls);
             }
             default:
             {
                 var b = new StringArray.Builder();
-                foreach (var item in items)
+                foreach (var v in values)
                 {
-                    if (IsNullElement(item)) { b.AppendNull(); } else { b.Append(item.ToStringValue(ctx)); }
+                    if (IsNullish(v)) { b.AppendNull(); } else { b.Append(v.ToStringValue(ctx)); }
                 }
-                values = b.Build();
-                break;
+                return b.Build();
             }
         }
-
-        // ONE list value — the params batch is a single row. Offsets are [0, N]; the list itself is never
-        // null (an absent parameter is the scalar Nil case, not an empty list).
-        var offsets = new ArrowBuffer.Builder<int>().Append(0).Append(values.Length).Build();
-        var listType = new ListType(new Field("item", elem, nullable: true));
-        var list = new ListArray(listType, length: 1, offsets, values, ArrowBuffer.Empty, nullCount: 0);
-        return (new Field(name, listType, nullable: true), list);
     }
 
-    private static bool IsNullElement(FluidValue v)
-        => v.Type is FluidValues.Nil or FluidValues.Empty or FluidValues.Blank;
-
-    private static ArgumentException ArrayRefusal(string caller, string name, string why)
-        => new($"{caller}: {FunctionName} cannot bind parameter '{name}' — {why}. Pass a list whose elements "
-               + "are all numbers, all strings, all booleans or all dates (nulls may be mixed in).");
-
-    /// <summary>
-    /// A numeric parameter, as <c>BIGINT</c> when the value is integral and fits, else <c>DECIMAL</c>.
-    /// </summary>
-    /// <remarks>
-    /// ⚠ Fluid's number model IS decimal (§7.3), so every number arrives here as one — including a literal
-    /// `10`. Binding all of them as DECIMAL would work but would make an ordinary integer parameter compare
-    /// against integer columns as a decimal; the integral case is narrowed back to BIGINT so the common
-    /// spelling behaves like the literal it replaced. A value outside BIGINT keeps full precision as
-    /// DECIMAL(38, scale).
-    /// </remarks>
-    private static (Field, IArrowArray) NumberParameter(string name, decimal number)
+    /// <summary>The TEMPLATE AUTHOR's word for a type, not Arrow's. They wrote `1` and `"a"`, so the
+    /// refusal must say "Number and String" — `int64` and `utf8` name an implementation they never see.
+    /// ⚠ int64 and decimal are UNIFIED rather than refused, so they can never appear opposite each other
+    /// here and both may safely read as "Number".</summary>
+    private static string Friendly(IArrowType t) => t switch
     {
-        if (decimal.Truncate(number) == number && number >= long.MinValue && number <= long.MaxValue)
-        {
-            return (new Field(name, Int64Type.Default, nullable: true),
-                    new Int64Array.Builder().Append((long)number).Build());
-        }
-        // The decimal's own scale, so 19.99 stays 19.99 rather than being widened or rounded.
-        var scale = (int)((decimal.GetBits(number)[3] >> 16) & 0x7F);
-        var type = new Decimal128Type(38, scale);
-        return (new Field(name, type, nullable: true),
-                new Decimal128Array.Builder(type).Append(number).Build());
-    }
+        Int64Type or Decimal128Type => "Number",
+        StringType => "String",
+        BooleanType => "Boolean",
+        TimestampType => "DateTime",
+        ListType => "Array",
+        StructType => "Dictionary",
+        _ => t.Name,
+    };
+
+    private static ArgumentException Refusal(string caller, string name, string why)
+        => new($"{caller}: {FunctionName} cannot bind parameter '{name}' — {why}. Pass numbers, strings, "
+               + "booleans, dates, nulls, or lists and structs nesting those.");
 
     /// <summary>
     /// Refuses <paramref name="sql"/> unless DuckDB's own parser can serialize it, which it does for the
