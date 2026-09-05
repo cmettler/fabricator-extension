@@ -444,6 +444,13 @@ case "$TIER" in
         # in that section is load-bearing and a mutant proved it: an earlier `USE memory.hq_s` leaves a
         # qualified entry, against which the bug does not fire, so the section PASSED with it fully present.
         # 8250 + 9 = 8259 exactly, from a green run.
+        # 8875 since 2026-09-05 (same day, fifth bump): verify_plugin_fluid 563 -> 599 -- {% ret %}, Scriban's
+        # early exit, which Liquid has not and Fluid cannot express: its Completion type has three values and
+        # the template ROOT awaits each statement's completion and never reads it, so a top-level
+        # {% break %} is SILENTLY IGNORED (pinned beside {% ret %} as the pair). It is therefore an
+        # exception, caught where we now own the output. /!\ The rows that matter are the ones an
+        # output-swallowing implementation would pass while doing the wrong thing: a statement after the tag
+        # does not merely render nothing, it does not RUN.
         # 8839 since 2026-09-05 (same day, fourth bump): verify_plugin_fluid 459 -> 563 -- fluid_query_lateral,
         # the CORRELATED sibling of fluid_query_batch: a template rendered once per INPUT CHUNK, its
         # statement run, the caller's columns stamped from a provenance column the template must project.
@@ -545,7 +552,7 @@ case "$TIER" in
         # two functions have exactly ONE registration each, plus the HostsCatalog refusal and its
         # unknown-provider control. 3105 + 238 + 8259 - 3339 arithmetic aside, both numbers come from green
         # runs.
-        : "${MIN_ASSERTIONS:=8839}"
+        : "${MIN_ASSERTIONS:=8875}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

@@ -3277,3 +3277,141 @@ assumption — and the mutant is what turned it into a measurement.
 ⚠ A third mutant was not re-run because it was already observed during the build: reverting §22.5's
 ownership rule (dispose every part in a `finally`) does not fail an assertion, it takes the process down
 with `0xC0000005` inside Arrow's release callback. A crash is a kill; it is just not one that names itself.
+
+## 23. ✅ AS BUILT (2026-09-05) — `{% ret %}`: end the render here, keep what was written
+
+```liquid
+{% if params.dry_run %}SELECT 0 AS rows{% ret %}{% endif %}
+INSERT INTO … SELECT … FROM …
+```
+
+User-asked, after the earlier measurement that Fluid has no equivalent of Scriban's `ret`. C#-only in the
+plugin — **NO ABI change, NO C++ change, NO bridge change**. Gate `verify_plugin_fluid` 563 → **599**,
+hermetic floor 8839 → **8875**, three mutants.
+
+### 23.1 ⚠⚠ Why it had to be an exception, and the two candidates that fail
+
+**A completion cannot work.** Liquid's `Completion` has three values — `Normal | Break | Continue` — and
+`FluidTemplate.RenderAsync` (the ROOT) awaits each statement's completion and **never inspects it**. Read at
+the pin and MEASURED:
+
+| template | renders |
+|---|---|
+| `A{% break %}B` | **AB** |
+| `A{% if go %}{% break %}{% endif %}B` | **AB** |
+| `A{% for i in (1..3) %}{{ i }}{% break %}{% endfor %}B` | A1B |
+
+Only a `{% for %}` consumes a Break at all. So a completion-based `{% ret %}` would be silently ignored at
+the top level — precisely where it is wanted. §29 pins the `ret`/`break` pair side by side; the `break` row
+is a CHARACTERIZATION test of Fluid that no mutant of ours can kill, and it is there because it is the whole
+reason the tag exists.
+
+**An output wrapper that discards writes after the tag was rejected on the merits.** It produces the same
+TEXT while every statement after the tag still RUNS — an `{% exec %}` or a `{% query %}` below a `{% ret %}`
+would still hit the database, and a `{% for %}` would still spin. "Stop" has to mean stop, and §29 pins it:
+a render whose `{% exec %}` sits after the tag leaves the audit table at **0**.
+
+⇒ `{% ret %}` throws a private `FluidEarlyReturn`, and `RenderOn` catches it.
+
+⚠ Nothing in Fluid swallows it on the way out: the pinned source has exactly two `catch (Exception)` sites,
+both in `FilterExpression`, and both re-fault the task rather than absorbing it — and a tag is a statement,
+so it is never evaluated inside a filter anyway.
+
+### 23.2 It forced us to own the output, and that brought the child scope with it
+
+Fluid's `Render(ctx)` extension builds the `StringWriter` and the `TextWriterFluidOutput` INSIDE itself, so
+a `FluidEarlyReturn` caught around it would leave the text where nothing can reach it. `RenderOn` therefore
+renders into its own output — which means reproducing what that extension does, not merely calling it.
+
+⚠⚠ **The child scope is the part that would have been easy to drop.** `EnterChildScope`/`ReleaseScope` is
+what makes a `{% assign %}` NOT survive a render, which §19 measured (three groups, a per-group counter
+reading 1, 1, 1) and §25 pins. **Mutant G — remove both — dies after 423 assertions, inside §25**, i.e. at a
+PRE-EXISTING assertion rather than one written for this change. That is the stronger kill: the property was
+already correctness-bearing, and this change would have quietly broken it.
+
+### 23.3 ⚠⚠ The flush, and a correction to the design note
+
+The note this was built from said the tag "must flush before throwing, because the catch site cannot".
+**FALSE at this pin, and for a reason this repo has already recorded once**: `TextWriterFluidOutput
+.DisposeAsync` flushes, which is exactly what let an earlier `{% exec %}` flush-mutant SURVIVE. The tag
+flushes nothing; the catch site does.
+
+⚠ And the flush is narrower than "the output buffers": `FluidTemplate.RenderAsync` ends with a flush of its
+own, so an ordinary render needs nothing from us — **the exception is what skips it**. MEASURED, mutant D
+(drop the flush) passes **563** assertions and dies at the FIRST `{% ret %}` one, which is what shows the
+flush serves that path and only that path.
+
+### 23.4 ⚠⚠ THE ONE DIVERGENCE FROM SCRIBAN: `ret` inside an include ends the WHOLE render
+
+Scriban's `ret` "exits a top-level/include page", i.e. the include only. Ours cannot. MEASURED, with the
+no-`ret` control beside it so the row reads as a truncation rather than a broken include:
+
+| template | renders |
+|---|---|
+| `before-{% include 'stop' %}-after` where the partial is `P{% ret %}Q` | **`before-P`** |
+| the same with a partial of `PQ` | `before-PQ\n-after` |
+| `{% render 'stop' %}` — scope-ISOLATED in standard Liquid | **`before-P`**, identically |
+
+**Why it cannot be scoped to the include:** Fluid renders an include as a NESTED `FluidTemplate`, whose root
+discards completions in exactly the same way as the outer one. Catching the sentinel at the include boundary
+would mean re-implementing `{% include %}` and its whole grammar (`with`, `for`, named parameters) — a large
+surface to buy a semantic our templates have no functions to need.
+
+⚠ It is also arguably the better reading HERE: an include in this plugin is a FRAGMENT of the statement being
+built, not a function call, so "stop the whole statement" is coherent. But it is a divergence from the thing
+it emulates, so it is pinned rather than described.
+
+### 23.5 The scope stack stays balanced when the exception unwinds
+
+⚠ An unwinding exception passes through `{% for %}`, `{% include %}` and `{% render %}`, all of which enter a
+child scope. Read at the pin: all three release it in a `finally`, so nothing leaks. MEASURED where it would
+actually bite — a SHARED context across renders (`fluid_query_batch`, three groups, each unwinding out of a
+loop): the per-render counter reads **1, 1, 1**. Had a scope leaked, `RenderOn`'s own `ReleaseScope` would
+have released the include's in its place and Liquid state would have started carrying between groups.
+
+### 23.6 Where it works
+
+Every surface, because they all go through `RenderOn`: `fluid_render`, `fluid_query` (where it TRUNCATES the
+generated statement — `'SELECT 7 AS v{% ret %} WHERE 1=0'` runs `SELECT 7 AS v`), `fluid_query_batch` and
+`fluid_query_lateral`. Inside an `{% exec %}` or `{% query %}` body it discards the body, which is the rule a
+`{% break %}` in those blocks already followed: half a statement is a different statement.
+
+⚠ `{% ret %}` takes no arguments — our templates have no functions, so a return VALUE would mean nothing —
+and Fluid says so at PARSE (*"Unexpected arguments in ret tag"*).
+
+### 23.7 ⚠⚠ A SEPARATE, PRE-EXISTING FINDING IT SURFACED: a SESSION-scoped `fluid_template_root` does not
+reach every surface
+
+Not caused by `{% ret %}` and not fixed here, but measured precisely while gating it. With the root set by a
+plain `SET` (session scope) and a relative `{% include %}`:
+
+| surface | resolves? |
+|---|---|
+| `fluid_render` | ✓ |
+| `fluid_query` | ✓ |
+| `fluid_query_batch` — at BIND | ✗ *"no root is set"* |
+| `fluid_query_batch` — at SCAN | ✓ |
+| `fluid_query_lateral` — at CALL | ✗ |
+
+⚠ The bind/scan SPLIT is what makes it diagnosable rather than mysterious, and it took a three-way A/B to
+see: with BOTH layers set the collector renders the SESSION value (so its scan has the ambient), while with
+the session layer alone its BIND fails (so its bind reads the global layer and finds nothing). The
+discriminating probe is an `{% if is_bind %}` branch that avoids the include at bind — under a session-only
+root that renders correctly, which no other explanation predicts.
+
+**Workaround, and it is complete: `SET GLOBAL fluid_template_root = …`** — measured working on every surface.
+
+⚠ This is the same class as the slice-4 finding (§10) that a plain `SET` was invisible to `fluid_render`,
+which ABI v82 fixed for scalar crossings. The in-out/collector BIND and the lateral CALL both call
+`FabricatorSetActiveTxn`, which sets the settings session as well as the opener — so the mechanism is there
+and something about these two crossings defeats it. Chasing it means touching the ambient plumbing, which
+the v80 record warns is delicate (a bare `set_active_opener` without a restore was a SIGSEGV), so it is its
+own change.
+
+### 23.8 Mutants
+
+| mutant | dies |
+|---|---|
+| **D** — no flush at the catch site | at the FIRST `{% ret %}` assertion, after 563 pass — and nowhere else, because Fluid's own root flushes the normal path |
+| **F** — return `Completion.Break` instead of throwing | at the same first assertion, after 563 pass |
+| **G** — no `EnterChildScope`/`ReleaseScope` | after 423, at a PRE-EXISTING `fluid_query_batch` assertion |

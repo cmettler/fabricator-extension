@@ -166,6 +166,15 @@ internal static class FluidEngine
             return Completion.Normal;
         });
 
+        // ⚠⚠ {% ret %} — Scriban's early exit, which Liquid does not have and Fluid cannot express through
+        // its Completion type (see FluidEarlyReturn for the measurement that settles it). It is an EMPTY
+        // tag: our templates have no functions, so there is nothing for a return VALUE to mean.
+        //
+        // ⚠ It throws and does NOT flush. The catch site owns the output and flushes there, where the flush
+        // is necessary; a flush here as well would be the redundant one — which is the shape that let an
+        // earlier {% exec %} mutant survive.
+        parser.RegisterEmptyTag(RetTagName, static (output, encoder, ctx) => throw new FluidEarlyReturn());
+
         return parser;
     }
     private static readonly ConcurrentDictionary<string, IFluidTemplate> Cache = new();
@@ -297,7 +306,9 @@ internal static class FluidEngine
         });
         try
         {
-            return parsed.Render(ctx);
+            // ⚠ Sync-over-async, blocking ONCE at the wrapper — the convention this codebase adopted for
+            // every sync ABI surface over an async core.
+            return RenderToStringAsync(parsed, ctx).AsTask().GetAwaiter().GetResult();
         }
         catch (FileNotFoundException ex)
         {
@@ -321,6 +332,104 @@ internal static class FluidEngine
 
     /// <summary>The template variable naming the schema-probe render — see <c>fluid_query_batch</c>.</summary>
     internal const string IsBindVariable = "is_bind";
+
+    /// <summary>The tag that ends a render early — Scriban's <c>ret</c>, which Liquid has no equivalent of.</summary>
+    internal const string RetTagName = "ret";
+
+    /// <summary>
+    /// Renders <paramref name="parsed"/> to a string, stopping at a <c>{% ret %}</c> and keeping whatever
+    /// had been written by then.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// ⚠⚠ <b>THIS EXISTS SO WE OWN THE OUTPUT.</b> Fluid's own <c>Render(ctx)</c> extension builds the
+    /// <c>StringWriter</c> and the <see cref="TextWriterFluidOutput"/> INSIDE itself, so a
+    /// <see cref="FluidEarlyReturn"/> caught around it would leave the text where nothing can reach it.
+    /// Everything else here — the child scope, the encoder, the buffer size — is that extension's
+    /// behaviour reproduced, because this replaces it rather than wrapping it.
+    /// </para>
+    /// <para>
+    /// ⚠⚠ <b>THE CHILD SCOPE IS NOT DECORATION.</b> It is what makes a <c>{% assign %}</c> NOT survive a
+    /// render, which <c>fluid_query_batch</c> measures (three groups, a per-group counter reading 1, 1, 1)
+    /// and its gate pins. Dropping <c>EnterChildScope</c>/<c>ReleaseScope</c> here would silently start
+    /// carrying Liquid state between the renders that share one context.
+    /// </para>
+    /// <para>
+    /// ⚠⚠ <b>THE FLUSH BELONGS TO THE <c>{% ret %}</c> PATH SPECIFICALLY, which is sharper than "the output
+    /// buffers".</b> <c>FluidTemplate.RenderAsync</c> ends with a flush of its own, so an ordinary render
+    /// needs nothing from us — the EXCEPTION is what skips it, leaving whatever the tag had written sitting
+    /// in the pooled buffer. MEASURED: a mutant that drops this flush passes 563 assertions and dies at the
+    /// FIRST <c>{% ret %}</c> one, which is what shows the flush serves that path and only that path.
+    /// ⚠ Reading AFTER the <c>await using</c> would work too, because <c>DisposeAsync</c> flushes — and
+    /// that is exactly what made an earlier mutant of the <c>{% exec %}</c> flush SURVIVE. Written this way
+    /// the dependency is explicit and local, and removing it fails loudly.
+    /// </para>
+    /// <para>
+    /// ⚠ Note what does NOT flush: the tag itself. The design note this was built from asserted that
+    /// <c>{% ret %}</c> "must flush before throwing, because the catch site cannot" — FALSE at this pin,
+    /// for the same disposal behaviour recorded above. One flush, here, where it is necessary.
+    /// </para>
+    /// </remarks>
+    private static async ValueTask<string> RenderToStringAsync(IFluidTemplate parsed, TemplateContext ctx)
+    {
+        // A template is evaluated in a child scope so the caller's context stays immutable.
+        ctx.EnterChildScope();
+        try
+        {
+            using var text = new StringWriter();
+            var bufferSize = ctx.Options?.OutputBufferSize ?? 0;
+            if (bufferSize <= 0)
+            {
+                bufferSize = CaptureBufferSize;
+            }
+            await using var output = new TextWriterFluidOutput(
+                text, bufferSize, ctx.CancellationToken, leaveOpen: true);
+            try
+            {
+                // ⚠ NullEncoder.Default, explicitly and for the same reason the {% exec %} capture gives:
+                // what a template here renders is SQL or plain text, never HTML, and an encoder would turn
+                // every `'` into `&#39;`.
+                await parsed.RenderAsync(output, NullEncoder.Default, ctx);
+            }
+            catch (FluidEarlyReturn)
+            {
+                // {% ret %}: everything written before it stands, everything after it never ran.
+            }
+            await output.FlushAsync();
+            return text.ToString();
+        }
+        finally
+        {
+            ctx.ReleaseScope();
+        }
+    }
+}
+
+/// <summary>
+/// Thrown by <c>{% ret %}</c> and caught by <see cref="FluidEngine.RenderToStringAsync"/> — never seen by a
+/// caller, and carrying no state.
+/// </summary>
+/// <remarks>
+/// ⚠⚠ <b>AN EXCEPTION IS THE ONLY MECHANISM THAT WORKS, and the alternative was measured rather than
+/// assumed.</b> Liquid's <c>Completion</c> has three values — Normal, Break, Continue — and
+/// <c>FluidTemplate.RenderAsync</c> AWAITS each statement's completion and never inspects it. MEASURED at
+/// this pin: <c>A{% break %}B</c> renders <b>AB</b>, and so does <c>A{% if go %}{% break %}{% endif %}B</c>;
+/// only a <c>{% for %}</c> consumes a Break at all. So a completion-based <c>{% ret %}</c> would be silently
+/// ignored at the top level, which is precisely where it is wanted.
+/// <para>⚠ The other candidate — an output wrapper that discards writes after the tag fires — was rejected
+/// on the merits: it produces the same TEXT while every statement after the tag still RUNS, so an
+/// <c>{% exec %}</c> or a <c>{% query %}</c> below a <c>{% ret %}</c> would still hit the database and a
+/// <c>{% for %}</c> would still spin. "Stop" has to mean stop.</para>
+/// <para>⚠ Nothing in Fluid swallows it on the way out: the pinned source has exactly two
+/// <c>catch (Exception)</c> sites, both in <c>FilterExpression</c>, and both re-fault the task rather than
+/// absorbing it — and a tag is a statement, so it is not evaluated inside a filter anyway.</para>
+/// </remarks>
+internal sealed class FluidEarlyReturn : Exception
+{
+    internal FluidEarlyReturn()
+        : base("{% ret %} ended the render (internal signal; it should never reach a caller).")
+    {
+    }
 }
 
 /// <summary>

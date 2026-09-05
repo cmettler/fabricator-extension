@@ -1669,6 +1669,36 @@ follow it exactly as in `{% query %}`: `{% exec n limit: 100 %}`. The number is 
 > above. A `{% break %}` inside the block leaves a half-rendered statement, which is discarded rather than
 > executed.
 
+**`{% ret %}` ends the render there and keeps what was written** — the guard clause Liquid has no other way
+to write. Everything after it, in the whole template, neither renders nor runs.
+
+```sql
+SELECT fluid_render('A{% ret %}B', NULL);            -- A
+SELECT fluid_render('A{% break %}B', NULL);          -- AB  (break is ignored outside a loop)
+
+SELECT * FROM fluid_query('SELECT 7 AS v{% ret %} WHERE 1=0');
+-- 7        -- the WHERE was never rendered, so the statement is `SELECT 7 AS v`
+```
+
+It is a *return*, not a *break*: inside a `{% for %}` it leaves the whole render, not the loop.
+
+```sql
+SELECT fluid_render('{% for i in (1..5) %}{{ i }}{% if i > 2 %}{% ret %}{% endif %}{% endfor %}Z', NULL);
+-- 123     -- no Z
+```
+
+> ⚠ **Stop means stop.** A statement after `{% ret %}` does not merely render nothing — it does not run. An
+> `{% exec %}` below the tag performs no write, and a `{% ret %}` *inside* an `{% exec %}` or `{% query %}`
+> body discards that body rather than executing half a statement.
+
+> ⚠ **Inside an `{% include %}` it ends the WHOLE render, not just the included page.** This differs from
+> Scriban's `ret`, which our tag otherwise mirrors: Fluid renders an include as a nested template, so there
+> is no boundary to stop at without re-implementing `{% include %}`. `{% render %}` behaves the same, even
+> though standard Liquid isolates its scope.
+
+It takes no arguments (`{% ret 1 %}` is a parse error) and works on every surface — `fluid_render`,
+`fluid_query`, `fluid_query_batch` and `fluid_query_lateral`.
+
 **`publish(name)` hands a table the template STAGED to the SQL it is generating.** This is the piece that
 makes multi-step staging inside `fluid_query` useful: stage with `{% exec %}`, then scan the result.
 

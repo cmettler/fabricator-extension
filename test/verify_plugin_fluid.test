@@ -3318,3 +3318,157 @@ WHERE f.s > 2 ORDER BY f.s DESC;
 
 statement ok
 DROP TABLE lat_t;
+
+# ============================================================================================
+# §29 — {% ret %}: end the render here, keep what was written (Scriban's `ret`, which Liquid has not).
+#
+# ⚠⚠ IT HAD TO BE AN EXCEPTION, and the row below is the measurement that settles it: Liquid's Completion
+# type has three values and Fluid's template ROOT awaits each statement's completion and never looks at it,
+# so `{% break %}` at the top level is SILENTLY IGNORED. A completion-based `ret` would be ignored in
+# exactly the place it is wanted.
+#
+# ⚠ The alternative — an output wrapper that discards writes after the tag — was rejected on the merits: it
+# produces the same TEXT while every statement after the tag still RUNS. "Stop" has to mean stop, which is
+# what §29's exec rows pin.
+# ============================================================================================
+
+# --- THE PAIR. `ret` stops; `break` does not, and never did. The second row is a CHARACTERIZATION test of
+# Fluid that no mutant of ours can kill — it is here because it is the whole reason the tag exists. ---
+query II
+SELECT fluid_render('A{% ret %}B', NULL) AS ret,
+       fluid_render('A{% break %}B', NULL) AS brk;
+----
+A	AB
+
+# --- it takes no arguments, and Fluid says so at PARSE. ---
+statement error
+SELECT fluid_render('A{% ret 1 %}B', NULL);
+----
+<REGEX>:.*Unexpected arguments in ret tag.*
+
+# --- the guard clause, which is what it is for. ⚠ The false row is the control: without it, `A` would be
+# equally true of a build where the {% if %} had stopped evaluating. ---
+query II
+SELECT fluid_render('A{% if params.go %}{% ret %}{% endif %}B', {'go': true}) AS taken,
+       fluid_render('A{% if params.go %}{% ret %}{% endif %}B', {'go': false}) AS not_taken;
+----
+A	AB
+
+# --- ⚠ INSIDE A LOOP IT IS A RETURN, NOT A BREAK: `ret` leaves the whole render, `break` leaves the loop
+# and the text after it still renders. Side by side, because that difference is the point. ---
+query II
+SELECT fluid_render('A{% for i in (1..3) %}{{ i }}{% ret %}{% endfor %}B', NULL) AS ret,
+       fluid_render('A{% for i in (1..3) %}{{ i }}{% break %}{% endfor %}B', NULL) AS brk;
+----
+A1	A1B
+
+# --- nested, which is the shape an author actually writes: stop the loop from inside a condition. ---
+query I
+SELECT fluid_render('{% for i in (1..5) %}{{ i }}{% if i > 2 %}{% ret %}{% endif %}{% endfor %}Z', NULL);
+----
+123
+
+# --- ⚠⚠ THE TEXT BEFORE IT SURVIVES, PAST THE BUFFER. The output buffers into a pooled array, so this is
+# the row that fails if the flush at the catch site goes: 5000 * 10 + 1 for the X, and no Y. ---
+query I
+SELECT length(fluid_render('{% for i in (1..5000) %}0123456789{% endfor %}X{% ret %}Y', NULL));
+----
+50001
+
+statement ok
+CREATE TABLE ret_aud(n INTEGER);
+
+# --- ⚠⚠ STOP MEANS STOP: a statement after the tag does not merely render nothing, it does not RUN. This
+# is what an output-swallowing implementation would get wrong while producing identical text. ---
+query II
+SELECT fluid_render('A{% ret %}{% exec %}INSERT INTO ret_aud VALUES (1){% endexec %}B', NULL) AS rendered,
+       (SELECT count(*) FROM ret_aud) AS writes;
+----
+A	0
+
+# --- ⚠ and INSIDE an {% exec %} body it discards the body: half a statement is a different statement, the
+# same rule a {% break %} in that block already followed. ---
+query II
+SELECT fluid_render('A{% exec %}INSERT INTO ret_aud VALUES (2){% ret %}{% endexec %}B', NULL) AS rendered,
+       (SELECT count(*) FROM ret_aud) AS writes;
+----
+A	0
+
+# --- the same inside a {% query %} body: the SELECT never runs and the name is never bound. ---
+query I
+SELECT fluid_render('A{% query r %}SELECT 1 AS a{% ret %}{% endquery %}B[{{ r }}]', NULL);
+----
+A
+
+statement ok
+DROP TABLE ret_aud;
+
+# --- IN fluid_query IT TRUNCATES THE GENERATED STATEMENT, which is the point of having it on that surface:
+# the ` WHERE 1=0` is never rendered, so the statement that runs is `SELECT 7 AS v`. ---
+query I
+SELECT * FROM fluid_query('SELECT 7 AS v{% ret %} WHERE 1=0');
+----
+7
+
+# --- and on both data-driven surfaces. ---
+query I
+SELECT v FROM fluid_query_batch('SELECT count(*)::BIGINT AS v FROM input_table{% ret %} WHERE 1=0',
+                                (SELECT * FROM range(4) t(i)));
+----
+4
+
+statement ok
+CREATE TABLE ret_lt(id INTEGER, n INTEGER);
+
+statement ok
+INSERT INTO ret_lt VALUES (1, 5), (2, 6);
+
+query II
+SELECT t.id, f.v FROM ret_lt t, fluid_query_lateral(
+  'SELECT __fab_row, n AS v FROM input_table{% ret %} WHERE 1=0', 'null', t.n, t.id) f ORDER BY 1;
+----
+1	5
+2	6
+
+# --- ⚠⚠ THE SCOPE STACK STAYS BALANCED WHEN THE EXCEPTION UNWINDS THROUGH A SCOPE-ENTERING STATEMENT, and
+# only a SHARED context can show it. Fluid's {% for %}, {% include %} and {% render %} all release their
+# child scope in a `finally`, so unwinding does not leak one — but if it did, the render's own scope would
+# be released in its place and Liquid state would start CARRYING between the groups that share a context.
+# Three groups, each unwinding out of a loop: the per-render counter reads 1, 1, 1 rather than 1, 2, 3. ---
+query II
+SELECT c, n FROM fluid_query_batch(
+  '{% assign c = c | default: 0 | plus: 1 %}SELECT {{ c }} AS c, count(*)::BIGINT AS n FROM input_table{% for i in (1..2) %}{% ret %}{% endfor %} WHERE 1=0',
+  (SELECT * FROM range(3) t(i)), batchsize := 1) ORDER BY n;
+----
+1	1
+1	1
+1	1
+
+statement ok
+DROP TABLE ret_lt;
+
+# --- ⚠⚠ AND THE ONE DIVERGENCE FROM SCRIBAN, PINNED RATHER THAN DESCRIBED: a `ret` inside an INCLUDE ends
+# the WHOLE render, not just the included page. Scriban's exits the include; ours cannot, because Fluid
+# renders an include as a nested template whose root discards completions in exactly the same way, so
+# stopping just the include would mean re-implementing {% include %} and its whole grammar. The control
+# below it is what makes this row read as "ret truncated the render" rather than "include is broken". ---
+statement ok
+COPY (SELECT 'P{% ret %}Q' AS c) TO '${FABRICATOR_DELTA_WRITE_DIR}/tpl/stop.liquid' (FORMAT csv, HEADER false, QUOTE '');
+
+statement ok
+COPY (SELECT 'PQ' AS c) TO '${FABRICATOR_DELTA_WRITE_DIR}/tpl/nostop.liquid' (FORMAT csv, HEADER false, QUOTE '');
+
+# ⚠ The control's newline is INTERIOR (the library file ends with one, and the include is mid-template), so
+# it is replaced rather than trimmed — a multi-line value cannot be written as one expected row.
+query II
+SELECT fluid_render('before-{% include ''stop'' %}-after', NULL) AS with_ret,
+       replace(fluid_render('before-{% include ''nostop'' %}-after', NULL), chr(10), '') AS control;
+----
+before-P	before-PQ-after
+
+# --- {% render %} behaves identically, which is worth pinning because it is scope-ISOLATED in standard
+# Liquid and a reader might expect the isolation to contain the exit. It does not. ---
+query I
+SELECT fluid_render('before-{% render ''stop'' %}-after', NULL);
+----
+before-P
