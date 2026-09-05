@@ -444,6 +444,10 @@ case "$TIER" in
         # in that section is load-bearing and a mutant proved it: an earlier `USE memory.hq_s` leaves a
         # qualified entry, against which the bug does not fire, so the section PASSED with it fully present.
         # 8250 + 9 = 8259 exactly, from a green run.
+        # 8731 since 2026-09-05 (same day, second bump): verify_plugin_fluid 443 -> 455 -- the params bag
+        # is ALSO bound WHOLE, under the name `params`, so it is readable as params.x and params[0]. It
+        # lifts an ASSUMPTION: the bag used to be reachable only through its members, so a JSON array was
+        # REFUSED and a DuckDB LIST bound nothing SILENTLY. The member spread is unchanged.
         # 8719 since 2026-09-05: verify_plugin_fluid 397 -> 443 -- fluid_query_batch(template, <input>
         # [, params :=] [, batchsize :=]), a template rendered WITH A RELATION and its statement run, once
         # for the whole input or once per batchsize rows. A COLLECTOR, and forced: the whole-table default
@@ -524,7 +528,7 @@ case "$TIER" in
         # two functions have exactly ONE registration each, plus the HostsCatalog refusal and its
         # unknown-provider control. 3105 + 238 + 8259 - 3339 arithmetic aside, both numbers come from green
         # runs.
-        : "${MIN_ASSERTIONS:=8719}"
+        : "${MIN_ASSERTIONS:=8731}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

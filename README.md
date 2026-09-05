@@ -1329,7 +1329,7 @@ available the **next time** DuckDB loads fabricator — not in the running sessi
 
 The **Fluid / Liquid template engine** is **built in** — it ships inside the extension and needs no
 configuration. It contributes three global functions, all taking a params bag that is a DuckDB `STRUCT`
-(preferred — typed, no quoting), a `MAP`, or a JSON string.
+(preferred — typed, no quoting), a `MAP`, a JSON string, a `LIST`, or a plain scalar.
 
 **`fluid_render(template, params)`** renders a template to **text**:
 
@@ -1375,6 +1375,32 @@ also means the generator runs during binding, repeatedly and without executing a
 > SELECT * FROM fluid_query('SELECT {{ v | sql }} AS v', params := {'v': 'O''Brien'});
 > -- O'Brien   (not a syntax error, and not an injection)
 > ```
+
+**The bag is also bound WHOLE, under the name `params`.** A struct's or map's members still become
+top-level variables — `{{ n }}` — and the same value is reachable as `{{ params.n }}`, `{{ params[0] }}`
+and `{{ params.size }}`:
+
+```sql
+SELECT fluid_render('spread={{ n }} dot={{ params.n }} ord={{ params[0] }} size={{ params.size }}',
+                    {'n': 7, 'z': 9});
+-- spread=7 dot=7 ord=7 size=2
+```
+
+That is what makes a bag with no named members usable at all — a JSON array, a DuckDB `LIST`, or a bare
+scalar:
+
+```sql
+SELECT fluid_render('first={{ params[0] }} size={{ params.size }}', [10, 20, 30]);
+-- first=10 size=3
+
+SELECT fluid_render('v={{ params | plus: 1 }}', 41);
+-- v=42
+```
+
+> ⚠ A member literally named `params` does not win: `{{ params }}` is always the bag, and the member is
+> reachable as `{{ params.params }}`. A NULL bag binds nothing at all, `params` included, so
+> `{% if params %}` is how you ask whether one was passed. A VARCHAR bag is still parsed as JSON, and
+> unparseable text is still an error rather than a string.
 
 The bag can come from SQL rather than a literal — `params := ?` in a prepared statement (DuckDB re-binds
 every `EXECUTE`, so the template is re-rendered and even the **column list may differ between two executes of

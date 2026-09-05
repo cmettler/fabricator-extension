@@ -2949,3 +2949,84 @@ fresh scratch dir — and it VOIDED a mutation run here until a fresh-dir contro
   template loop over rows without a round trip. Today `{% query rows %}SELECT … FROM input_table{% endquery %}`
   does it in one statement, which is why this was left out.
 
+## 20. ✅ AS BUILT (2026-09-05) — the params bag is bound WHOLE, under the name `params`
+
+User-asked: *"the fluid `params` parameter we assume a struct with named members or json so these member
+names are used as templatecontext variable names. let us lift this … assign params to variable name
+`params` so the params members will be accessed via `params.` or e.g. `params[0]`"*.
+
+C#-only in the plugin, ONE function (`FluidValueModel.Capture`). Gate `verify_plugin_fluid` 443 → **455**,
+hermetic floor 8719 → **8731**, two mutants each killed at its own assertion.
+
+### 20.1 What the assumption cost, and it was worse than an ergonomic gap
+
+The bag was readable ONLY through its members, so it had to HAVE members. Everything else fell off the walk:
+
+| bag | before | after |
+|---|---|---|
+| `STRUCT`, `MAP`, JSON object | members spread | members spread **and** `params.x` / `params[0]` / `params.size` |
+| JSON array `'[1,2]'` | **REFUSED** — *"params JSON must be an OBJECT"* | `params[0]`, `params.size`, `{% for %}` |
+| DuckDB `LIST` `[10,20,30]` | **bound NOTHING, silently** — matched no case at all | as above |
+| a scalar `41` | bound nothing, silently | `{{ params }}`, `{{ params | plus: 1 }}` |
+
+⚠⚠ **The LIST row is the one that makes this a fix rather than sugar.** A JSON array at least said no; a
+DuckDB LIST matched no `case` in the switch and bound nothing, so a template reading it rendered EMPTY with
+no error anywhere — the silent-wrong-answer class. It is also the shape a caller reaches for most naturally
+from SQL (`params := ['a','b']`), and `fluid_query` splices what it renders into a STATEMENT.
+
+⚠ **The member spread is UNCHANGED** and this is additive: every existing template, README example and gate
+assertion keeps working. Removing the spread would be a separate, breaking decision — see §20.5.
+
+### 20.2 Ordinal access is not a second mechanism
+
+`params[0]` works because Fluid resolves an index by asking `TryGetValue` for the KEY `"0"`, and
+`EagerStruct` (what a STRUCT bag materialises into) already has the int-parse fallback that `ArrowStruct`
+documents. So the bag binding buys ordinals for free wherever the underlying indexable has that rule.
+
+⚠ `ArrowMap` deliberately does NOT have it, so `params[0]` on a MAP bag does not resolve — a MAP being
+unordered in principle. Pinned in §26 as an asymmetry rather than papered over.
+
+### 20.3 The bag is appended LAST, so it always means the bag
+
+A member literally named `params` does not shadow it: `{{ params }}` is the bag and the member is reachable
+as `{{ params.params }}`. The alternative precedence (member wins) loses nothing measurable either, so
+**predictability decides it** — a `params` that is sometimes the bag and sometimes a member is unreadable,
+while a shadowed member has an obvious one-level-down spelling. Gated.
+
+### 20.4 What did NOT change, deliberately
+
+- **Invalid JSON is still an error.** A VARCHAR bag IS JSON, so binding unparseable text as a plain string
+  would hide a typo in the caller's own JSON. Only the *object-only* half of the refusal was lifted.
+- **A NULL bag binds nothing at all**, `params` included, so `{% if params %}` is how a template asks
+  whether one was passed. Gated.
+- **One walk, three surfaces.** `fluid_render`, `fluid_query` and `fluid_query_batch` all go through
+  `Capture`, so the bag cannot mean different things depending on which function you called — the reason
+  this file's header gives for having one value model at all. `fluid_query_batch` gets it through the same
+  CAPTURE that makes its params outlive the bind, which is only safe because the walk is eager (§19.6).
+
+### 20.5 ⚠ OPEN — whether the member spread should go
+
+The request can be read as *"bind the bag as well"* or as *"bind the bag INSTEAD"*. What shipped is the
+first, because it is the literal ask and because it is the reversible half: dropping the spread is a
+one-line change to `Capture` plus gate and README churn, whereas shipping the break and being wrong costs
+both. **If the spread is dropped it is BREAKING with no alias** — `{{ n }}` becomes `{{ params.n }}` in
+every template, and ~a dozen gate rows and several README examples move with it.
+
+⚠ The argument FOR dropping it is not ergonomics but namespace hygiene: today a member can shadow a
+template variable, an `{% assign %}`, or a future built-in, and nothing warns. The argument AGAINST is that
+`{{ n }}` is what a Liquid author expects of a model.
+
+### 20.6 Gate
+
+Two mutants, each dying at its own assertion: never binding the bag dies at the FIRST §26 row (the struct)
+after 442 pass; keeping the old "named members only" walk dies at the **DuckDB LIST** row after 445 — the
+silent case, which is the one worth pinning precisely.
+
+⚠⚠ **`.size` and `params[0]` alone would NOT have caught a broken build.** A `JsonNode` bound with no
+converter renders correctly while comparing and computing as nothing (this file's header), so the JSON-array
+row asserts a `{% for %}` **SUM** and the scalar row asserts `| plus: 1`. Arithmetic is the only thing that
+separates a real value from one that merely renders like one.
+
+⚠ The row that used to pin *"params JSON must be an OBJECT"* is REPLACED, not deleted — that refusal WAS
+the assumption being lifted, so falsifying it is the change announcing itself, and a note at the old site
+points at the row that replaces it.

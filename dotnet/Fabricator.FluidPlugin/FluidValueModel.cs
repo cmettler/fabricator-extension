@@ -42,6 +42,9 @@ internal static class FluidValueModel
     /// </summary>
     internal static readonly TemplateOptions Options = Build();
 
+    /// <summary>The variable the WHOLE params bag is bound under, whatever its shape.</summary>
+    internal const string BagVariable = "params";
+
     /// <summary>A fresh context over the shared <see cref="Options"/>.</summary>
     internal static TemplateContext NewContext() => new(Options);
 
@@ -91,8 +94,9 @@ internal static class FluidValueModel
     }
 
     /// <summary>
-    /// The params bag's members as PLAIN VALUES, so a caller can bind them to a context LATER — after the
-    /// Arrow batch they came from is gone.
+    /// The params bag as PLAIN VALUES — its members under their own names, plus the WHOLE BAG under
+    /// <see cref="BagVariable"/> — so a caller can bind them to a context LATER, after the Arrow batch they
+    /// came from is gone.
     /// </summary>
     /// <remarks>
     /// <para>
@@ -112,69 +116,83 @@ internal static class FluidValueModel
     internal static IReadOnlyList<KeyValuePair<string, object?>> Capture(IArrowArray? paramsCol, int row)
     {
         var members = new List<KeyValuePair<string, object?>>();
+        if (paramsCol is null or NullArray || row >= paramsCol.Length || paramsCol.IsNull(row))
+        {
+            return members;
+        }
+        object? bag;
         switch (paramsCol)
         {
-            case null:
-            case NullArray:
-                break;
             case StructArray sa when sa.Data.DataType is StructType st:
-                if (sa.IsNull(row))
-                {
-                    break;
-                }
                 for (int k = 0; k < st.Fields.Count; k++)
                 {
                     members.Add(new KeyValuePair<string, object?>(st.Fields[k].Name, ReadCell(sa.Fields[k], row)));
                 }
+                bag = ReadCell(sa, row);
                 break;
             case StringArray json:
-                if (!json.IsNull(row))
+                var root = ParseParamsJson(json.GetString(row));
+                if (root is JsonObject obj)
                 {
-                    CaptureJson(members, json.GetString(row));
-                }
-                break;
-            default:
-                // A MAP arrives as a MapArray; spread its entries the same way a STRUCT's fields are, so
-                // `{'a': 1}` and `MAP {['a'], [1]}` bind identically.
-                // ⚠ The indexable is built here rather than unwrapped from ReadCell's DictionaryValue:
-                // DictionaryValue exposes neither Keys nor TryGetValue publicly.
-                if (paramsCol is MapArray map && !map.IsNull(row))
-                {
-                    var spread = new ArrowMap(map, row);
-                    foreach (var key in spread.Keys)
+                    foreach (var kv in obj)
                     {
-                        if (spread.TryGetValue(key, out var v))
-                        {
-                            members.Add(new KeyValuePair<string, object?>(key, v));
-                        }
+                        // ⚠ A JSON `null` member arrives as a NULL JsonNode rather than a JsonValue holding
+                        // null, so the converter never sees it — SetVariable maps it to Liquid's nil.
+                        members.Add(new KeyValuePair<string, object?>(kv.Key, kv.Value));
                     }
                 }
+                bag = root;
+                break;
+            case MapArray map:
+                // A MAP spreads its entries the same way a STRUCT's fields do, so `{'a': 1}` and
+                // `MAP {['a'], [1]}` bind identically.
+                // ⚠ The indexable is built here rather than unwrapped from ReadCell's DictionaryValue:
+                // DictionaryValue exposes neither Keys nor TryGetValue publicly.
+                var spread = new ArrowMap(map, row);
+                foreach (var key in spread.Keys)
+                {
+                    if (spread.TryGetValue(key, out var v))
+                    {
+                        members.Add(new KeyValuePair<string, object?>(key, v));
+                    }
+                }
+                bag = new DictionaryValue(spread);
+                break;
+            default:
+                // ⚠⚠ ANY OTHER SHAPE BINDS AS THE BAG AND SPREADS NOTHING — a LIST, a scalar, whatever the
+                // caller passed. Before this, `params := [1,2,3]` matched no case and bound absolutely
+                // nothing, silently: the surface ASSUMED named members. That assumption is what
+                // BagVariable lifts, and it is why an ordinal (`params[0]`) is now expressible at all.
+                // ⚠ An Arrow type ReadCell does not handle still throws, naming the fix — loud where this
+                // path used to be silent.
+                bag = ReadCell(paramsCol, row);
                 break;
         }
+        // ⚠⚠ THE WHOLE BAG, ALWAYS, AND LAST — so `params` means the bag even when a member is itself
+        // called `params`. Predictability wins over the alternative precedence: a shadowed member is still
+        // reachable as `params.params`, whereas a bag that sometimes is not the bag is unreadable. It is
+        // appended rather than prepended for exactly that reason.
+        members.Add(new KeyValuePair<string, object?>(BagVariable, bag));
         return members;
     }
 
-    private static void CaptureJson(List<KeyValuePair<string, object?>> members, string json)
+    /// <summary>Parses a JSON params bag. ANY root is accepted — object, array or scalar.</summary>
+    /// <remarks>
+    /// ⚠ It used to REFUSE anything but an object, because members were the only thing a bag could
+    /// contribute. With the bag itself bound under <see cref="BagVariable"/> that refusal would reject a
+    /// perfectly usable value: `'[1,2]'` is now `params[0]`, `params.size`, `{% for x in params %}`.
+    /// Invalid JSON is still an error — a VARCHAR bag IS JSON, and quietly treating unparseable text as a
+    /// string would hide a typo in the caller's own JSON.
+    /// </remarks>
+    private static JsonNode? ParseParamsJson(string json)
     {
-        JsonNode? root;
         try
         {
-            root = JsonNode.Parse(json);
+            return JsonNode.Parse(json);
         }
         catch (JsonException ex)
         {
             throw new ArgumentException($"fabricator: params is not valid JSON: {ex.Message}", ex);
-        }
-        if (root is not JsonObject obj)
-        {
-            throw new ArgumentException(
-                "fabricator: params JSON must be an OBJECT — its members become the template's variables");
-        }
-        foreach (var kv in obj)
-        {
-            // ⚠ A JSON `null` member arrives as a NULL JsonNode rather than a JsonValue holding null, so the
-            // converter never sees it — SetVariable is what maps it to Liquid's nil.
-            members.Add(new KeyValuePair<string, object?>(kv.Key, kv.Value));
         }
     }
 

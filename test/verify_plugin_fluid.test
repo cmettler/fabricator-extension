@@ -448,10 +448,8 @@ SELECT fluid_render('{{ n }}', 'not json');
 ----
 <REGEX>:.*params is not valid JSON.*
 
-statement error
-SELECT fluid_render('{{ n }}', '[1,2]');
-----
-<REGEX>:.*params JSON must be an OBJECT.*
+# NOTE: '[1,2]' used to be REFUSED here ("params JSON must be an OBJECT"). It is now bound as the whole
+# bag -- see the JSON-array row in the params-bag section at the end of this file, which replaces this one.
 
 # A template that renders to nothing is refused by the shared sqlgen plumbing, naming the function.
 statement error
@@ -2928,3 +2926,103 @@ SELECT a, b FROM fluid_query_batch(
 ----
 4	6
 
+# ============================================================================================
+# §26 — the params bag is ALSO bound WHOLE, under the name `params`.
+#
+# ⚠⚠ THE ASSUMPTION THIS LIFTS: the bag used to be readable ONLY through its members, which meant it had to
+# HAVE members — a struct, a map, or a JSON object. Anything else was refused (a JSON array) or, worse,
+# bound absolutely nothing SILENTLY (a DuckDB LIST, which matched no case at all). Binding the bag itself
+# makes every shape usable and makes an ORDINAL expressible, which no spread ever could.
+#
+# ⚠ The member spread is UNCHANGED and every existing template keeps working; this is additive.
+# ============================================================================================
+
+# --- a STRUCT: the members still spread, AND the bag answers by name, by ordinal, and for .size. ⚠ The
+# ordinal is not a second mechanism — Fluid resolves `params[0]` by asking for the KEY "0", and the struct's
+# int-parse fallback IS index access. ---
+query I
+SELECT fluid_render('spread={{ n }} dot={{ params.n }} ord={{ params[0] }} size={{ params.size }}',
+                    {'n': 7, 'z': 9});
+----
+spread=7 dot=7 ord=7 size=2
+
+# --- a JSON object: both spellings, and nested member access through the bag. ---
+query I
+SELECT fluid_render('dot={{ params.a.b }} spread={{ a.b }}', '{"a":{"b":5}}');
+----
+dot=5 spread=5
+
+# --- ⚠⚠ A JSON ARRAY. This assertion REPLACES one that pinned the opposite: `'[1,2]'` used to be refused
+# with "params JSON must be an OBJECT — its members become the template's variables". That refusal WAS the
+# assumption, so lifting it necessarily falsifies the row, and replacing rather than deleting is what makes
+# the change announce itself.
+# ⚠ The SUM is the load-bearing part, not the render. A JsonNode bound with no converter renders correctly
+# while comparing and computing as nothing (see the head of FluidValueModel), so `size` and `params[0]`
+# alone would pass on a build where the leaves were opaque. Only arithmetic separates the two. ---
+query I
+SELECT fluid_render('first={{ params[0] }} size={{ params.size }} sum={% assign t = 0 %}{% for x in params %}{% assign t = t | plus: x %}{% endfor %}{{ t }}',
+                    '[1,2,3]');
+----
+first=1 size=3 sum=6
+
+# --- ⚠⚠ A DuckDB LIST, which is the SILENT half of the same assumption: it matched no case in the walk, so
+# it bound NOTHING and a template reading it rendered empty with no error anywhere. That is the failure
+# mode this repo keeps calling the worst kind, and it is why the bag binding is a fix rather than sugar. ---
+query I
+SELECT fluid_render('first={{ params[0] }} last={{ params[2] }} size={{ params.size }}', [10, 20, 30]);
+----
+first=10 last=30 size=3
+
+# --- a SCALAR bag. ⚠ `plus` is again the discriminator: it proves the value arrived as a NUMBER rather than
+# as something that merely renders like one. ---
+query I
+SELECT fluid_render('v={{ params }} plus={{ params | plus: 1 }}', 41);
+----
+v=41 plus=42
+
+# --- a MAP spreads and is addressable, exactly as the STRUCT is: one conversion table, two spellings. ⚠ No
+# ordinal here — ArrowMap has no int-parse fallback, deliberately, a MAP being unordered in principle. ---
+query I
+SELECT fluid_render('spread={{ k }} dot={{ params.k }}', MAP {'k': 3});
+----
+spread=3 dot=3
+
+# --- ⚠⚠ A MEMBER LITERALLY NAMED `params`: THE BAG WINS at the top level, and the member stays reachable
+# one level down. Appended last, deliberately — `params` meaning the bag ALWAYS is readable, whereas a
+# `params` that is sometimes the bag and sometimes a member is not. The alternative precedence loses
+# nothing measurable, so predictability decides it. ---
+query I
+SELECT fluid_render('top={{ params }} nested={{ params.params }} other={{ x }}',
+                    {'params': 'inner', 'x': 1});
+----
+top={"params":inner,"x":1} nested=inner other=1
+
+# --- it is the SAME bag on every surface, because all three go through one walk. fluid_query renders at
+# BIND from constants ... ---
+query II
+SELECT * FROM fluid_query('SELECT {{ params.n }} AS viadot, {{ n }} AS viaspread', params := {'n': 4});
+----
+4	4
+
+# --- ... and fluid_query_batch, whose params are CAPTURED at bind and replayed into a per-execution
+# context, sees the same thing. ⚠ Load-bearing beyond the value: the bag has to survive the capture, which
+# is only safe because the whole walk is eager. ---
+query II
+SELECT tag, n FROM fluid_query_batch(
+  'SELECT {{ params.tag | sql }} AS tag, count(*)::BIGINT AS n FROM input_table',
+  (SELECT * FROM range(3) t(i)), params := {'tag': 'g'});
+----
+g	3
+
+# --- invalid JSON is STILL an error. A VARCHAR bag IS JSON, so quietly binding unparseable text as a plain
+# string would hide a typo in the caller's own JSON — the one refusal worth keeping. ---
+statement error
+SELECT fluid_render('{{ params }}', 'not json');
+----
+<REGEX>:.*params is not valid JSON.*
+
+# --- a NULL bag binds nothing at all, `params` included, so `{% if params %}` is the way to ask. ---
+query I
+SELECT fluid_render('[{{ params }}]{% if params %}yes{% else %}no{% endif %}', NULL);
+----
+[]no
