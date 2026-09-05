@@ -46,9 +46,13 @@ public enum ParamStyle
     /// <c>Parameters</c>. The fixed prefix keeps its declared positions; each further argument follows in
     /// call order, named <c>&lt;varargs-name&gt;_0</c>, <c>_1</c>, … Read the count from the batch, never
     /// from the declaration.</para>
-    /// <para>⚠ Scalar, table and sqlgen functions only. Lateral and in-out functions are DEFERRED — for them
-    /// the positional slots are the per-row INPUT COLUMNS, so a variadic tail is a variable-width wire and
-    /// interacts with <see cref="Constant"/>'s trailing slots; neither question is answered yet.</para>
+    /// <para>⚠ Every function kind EXCEPT AGGREGATES. For a lateral or an in-out the positional slots are
+    /// the per-row INPUT COLUMNS, so the tail is a variable-width WIRE rather than a wider args batch —
+    /// which turned out to need almost nothing, because the lateral bind is written against the ACTUAL
+    /// call and a <see cref="Constant"/> slot is stripped BY INDEX, so a leading constant leaves the tail
+    /// nothing to contend with. An in-out's tail is the ordinary args-batch mechanism (its per-row input is
+    /// its TABLE argument alone). AGGREGATES stay refused: their crossing sends a bare array whose schema
+    /// the managed side reconstructs from the DECLARATION, so a variadic one needs an ABI change.</para>
     /// <para>⚠ A LIST parameter covers the HOMOGENEOUS case already (<c>f(['a','b'])</c>) and needs none of
     /// this. What a variadic tail buys is HETEROGENEOUS, individually-typed arguments — DuckDB's own
     /// variadics are exactly that shape (<c>printf</c>, <c>concat_ws</c>, <c>struct_pack</c>).</para>
@@ -307,8 +311,8 @@ public static class Params
             {
                 throw new ArgumentException(
                     $"fabricator: '{function}' declares the variadic tail '{f.Name}', which this function kind "
-                    + "does not support (scalar, table and sqlgen functions only — it is deferred for lateral "
-                    + "and in-out, whose positional slots are per-row input columns).");
+                    + "does not support — every kind but AGGREGATES takes one, and an aggregate cannot "
+                    + "because its update crossing reconstructs the batch schema from this declaration.");
             }
             if (style == ParamStyle.TableInput && !allowTableInput)
             {
