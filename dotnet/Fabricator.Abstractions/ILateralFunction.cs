@@ -104,9 +104,20 @@ public interface ILateralFunctionBinding : IDisposable
 /// </code>
 /// <para>
 /// <b>Consequences of that registration, all forced by DuckDB:</b> a positional parameter carries no
-/// bind-time value (it is runtime data), so <b>bind-time configuration must use NAMED parameters</b> — those
-/// are what arrive in <see cref="Bind"/>'s <c>args</c>. Overload resolution goes by input-column COUNT, not
-/// by argument values.
+/// bind-time value (it is runtime data), so bind-time configuration needs a parameter whose value reaches
+/// <see cref="Bind"/>'s <c>args</c> — a <see cref="Params.Named"/> or a <see cref="Params.Constant"/> one.
+/// Overload resolution goes by input-column COUNT, not by argument values.
+/// </para>
+/// <para>
+/// ⚠⚠ <b>A NAMED PARAMETER IS UNUSABLE IN THE CORRELATED SHAPE, so a function meant to be called that way
+/// must declare its cost args <see cref="Params.Constant"/>.</b> This remark used to say bind-time
+/// configuration "must use NAMED parameters", which predates <see cref="ParamStyle.Constant"/> and is the
+/// opposite of the truth for the shape this interface exists to serve. MEASURED on
+/// <c>fabricator_lat_scale(n, factor := …)</c>: the literal call <c>f(5, factor := 10)</c> answers 50,
+/// while <c>FROM t, f(t.n, factor := 10)</c> is a Binder Error — and the error names
+/// <c>f(INTEGER, INTEGER)</c>, i.e. DuckDB has DROPPED the name and matched positionally against a
+/// signature that declares <c>factor</c> as named. A constant occupies a positional slot instead, and its
+/// value is recovered from the synthesized column's rendered expression text, so it works in BOTH shapes.
 /// </para>
 /// <para>
 /// <b>Reach for this only when the per-call cost dominates the per-row work</b> — a network round trip, a
