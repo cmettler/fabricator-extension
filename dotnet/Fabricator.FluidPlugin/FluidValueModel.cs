@@ -84,27 +84,55 @@ internal static class FluidValueModel
     /// <param name="row">Which row of that column supplies this call's variables.</param>
     internal static void Bind(TemplateContext ctx, IArrowArray? paramsCol, int row)
     {
+        foreach (var member in Capture(paramsCol, row))
+        {
+            SetVariable(ctx, member.Key, member.Value);
+        }
+    }
+
+    /// <summary>
+    /// The params bag's members as PLAIN VALUES, so a caller can bind them to a context LATER — after the
+    /// Arrow batch they came from is gone.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// ⚠⚠ <b>Safe to outlive the batch because <see cref="ReadCell"/> is EAGER ALL THE WAY DOWN</b>, which
+    /// was checked rather than assumed: a STRUCT materialises through <c>EagerStruct</c>, a MAP through
+    /// <see cref="ArrowMap"/> (whose constructor copies every entry), a LIST through <c>ReadList</c>, and
+    /// every scalar is a .NET value. Nothing returned here holds an <c>IArrowArray</c>. Were any leaf lazy
+    /// it would read a disposed batch's nulled buffers at render time — the exact NullReferenceException
+    /// the eagerness note on the STRUCT case records.
+    /// </para>
+    /// <para>
+    /// It exists for <c>fluid_query_batch</c>, whose bind args are gone by the time its groups render, and
+    /// whose context must be per-EXECUTION (a binding is reused across prepared re-executions, so a context
+    /// built at bind would carry one execution's state into the next).
+    /// </para>
+    /// </remarks>
+    internal static IReadOnlyList<KeyValuePair<string, object?>> Capture(IArrowArray? paramsCol, int row)
+    {
+        var members = new List<KeyValuePair<string, object?>>();
         switch (paramsCol)
         {
             case null:
             case NullArray:
-                return;
+                break;
             case StructArray sa when sa.Data.DataType is StructType st:
                 if (sa.IsNull(row))
                 {
-                    return;
+                    break;
                 }
                 for (int k = 0; k < st.Fields.Count; k++)
                 {
-                    SetVariable(ctx, st.Fields[k].Name, ReadCell(sa.Fields[k], row));
+                    members.Add(new KeyValuePair<string, object?>(st.Fields[k].Name, ReadCell(sa.Fields[k], row)));
                 }
-                return;
+                break;
             case StringArray json:
                 if (!json.IsNull(row))
                 {
-                    BindJson(ctx, json.GetString(row));
+                    CaptureJson(members, json.GetString(row));
                 }
-                return;
+                break;
             default:
                 // A MAP arrives as a MapArray; spread its entries the same way a STRUCT's fields are, so
                 // `{'a': 1}` and `MAP {['a'], [1]}` bind identically.
@@ -112,24 +140,21 @@ internal static class FluidValueModel
                 // DictionaryValue exposes neither Keys nor TryGetValue publicly.
                 if (paramsCol is MapArray map && !map.IsNull(row))
                 {
-                    Spread(ctx, new ArrowMap(map, row));
+                    var spread = new ArrowMap(map, row);
+                    foreach (var key in spread.Keys)
+                    {
+                        if (spread.TryGetValue(key, out var v))
+                        {
+                            members.Add(new KeyValuePair<string, object?>(key, v));
+                        }
+                    }
                 }
-                return;
+                break;
         }
+        return members;
     }
 
-    private static void Spread(TemplateContext ctx, IFluidIndexable members)
-    {
-        foreach (var key in members.Keys)
-        {
-            if (members.TryGetValue(key, out var v))
-            {
-                ctx.SetValue(key, v);
-            }
-        }
-    }
-
-    private static void BindJson(TemplateContext ctx, string json)
+    private static void CaptureJson(List<KeyValuePair<string, object?>> members, string json)
     {
         JsonNode? root;
         try
@@ -149,7 +174,7 @@ internal static class FluidValueModel
         {
             // ⚠ A JSON `null` member arrives as a NULL JsonNode rather than a JsonValue holding null, so the
             // converter never sees it — SetVariable is what maps it to Liquid's nil.
-            SetVariable(ctx, kv.Key, kv.Value);
+            members.Add(new KeyValuePair<string, object?>(kv.Key, kv.Value));
         }
     }
 
@@ -167,6 +192,14 @@ internal static class FluidValueModel
         if (value is null)
         {
             ctx.SetValue(name, NilValue.Instance);
+        }
+        else if (value is FluidValue already)
+        {
+            // ⚠ The FluidValue overload EXPLICITLY. The MAP path yields values that are already
+            // FluidValues, and routing one through the object overload would hand it to FluidValue.Create
+            // to be wrapped a second time. It reached ctx.SetValue directly before this method took over
+            // that path, and this keeps it doing so.
+            ctx.SetValue(name, already);
         }
         else
         {

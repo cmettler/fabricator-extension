@@ -178,6 +178,71 @@ internal sealed class HostQueryService : IHostQuery
     // table function's CaptureSession follows.
     public IHostConnection OpenConnection(bool inheritSession = true) =>
         new PinnedHostConnection(Host.OpenConnection(inheritSession ? AmbientOpener.Current : 0));
+
+    // ⚠⚠ BORROWED, and the whole contract turns on it: the factory hands out a reader over the CALLER's
+    // batch and nothing here copies or disposes it. That is what makes this usable from a collector, whose
+    // input chunks it does NOT own — the framework frees each chunk's Arrow buffers once consumed, so the
+    // caller's register / scan / release must be one synchronous stretch and a token outliving its rows
+    // would read freed memory.
+    //
+    // ⚠ The schema is DECLARED, so a bind answers from the declaration and never opens a stream. Without
+    // that the bind would invoke the factory too — harmless here (the factory is cheap and re-entrant) but
+    // it is the property that makes "scanned exactly once per scan" true rather than incidental.
+    public string RegisterRows(RecordBatch rows)
+    {
+        if (rows is null)
+        {
+            throw new ArgumentNullException(nameof(rows));
+        }
+        var schema = rows.Schema;
+        var token = "__fabrows_" + Guid.NewGuid().ToString("N");
+        Host.RegisterSource(token, () => new BorrowedBatchStream(schema, rows), schema);
+        return token;
+    }
+
+    public string RegisterRows(Schema schema)
+    {
+        if (schema is null)
+        {
+            throw new ArgumentNullException(nameof(schema));
+        }
+        var token = "__fabrows_" + Guid.NewGuid().ToString("N");
+        Host.RegisterSource(token, () => new InMemoryArrayStream(schema, System.Array.Empty<RecordBatch>()),
+                            schema);
+        return token;
+    }
+
+    public bool ReleaseRows(string token) =>
+        !string.IsNullOrEmpty(token) && Host.UnregisterSource(token);
+
+    /// <summary>One reader over a batch the stream does NOT own — see <see cref="RegisterRows"/>.</summary>
+    /// <remarks>
+    /// ⚠ Deliberately NOT <c>InMemoryArrayStream</c>, whose <c>Dispose</c> disposes the batches it was
+    /// given. Handing it a borrowed batch would free the caller's Arrow buffers when the scan released the
+    /// stream, and the caller (or the framework that owns the batch) would free them again.
+    /// </remarks>
+    private sealed class BorrowedBatchStream : IArrowArrayStream
+    {
+        private RecordBatch? _pending;
+
+        internal BorrowedBatchStream(Schema schema, RecordBatch rows)
+        {
+            Schema = schema;
+            _pending = rows;
+        }
+
+        public Schema Schema { get; }
+
+        public ValueTask<RecordBatch?> ReadNextRecordBatchAsync(CancellationToken cancellationToken = default)
+        {
+            var next = _pending;
+            _pending = null;
+            return new ValueTask<RecordBatch?>(next);
+        }
+
+        // Drops the reference only. The batch belongs to whoever registered it.
+        public void Dispose() => _pending = null;
+    }
 }
 
 /// <summary>Adapts <see cref="Host.HostConnection"/> to the plugin-facing <see cref="IHostConnection"/>.</summary>

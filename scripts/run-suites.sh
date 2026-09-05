@@ -444,6 +444,12 @@ case "$TIER" in
         # in that section is load-bearing and a mutant proved it: an earlier `USE memory.hq_s` leaves a
         # qualified entry, against which the bug does not fire, so the section PASSED with it fully present.
         # 8250 + 9 = 8259 exactly, from a green run.
+        # 8719 since 2026-09-05: verify_plugin_fluid 397 -> 443 -- fluid_query_batch(template, <input>
+        # [, params :=] [, batchsize :=]), a template rendered WITH A RELATION and its statement run, once
+        # for the whole input or once per batchsize rows. A COLLECTOR, and forced: the whole-table default
+        # emits nothing until input EOF, which the streaming in-out operator cannot express. §25 pins the
+        # exact slicing, is_bind, the cross-group temp table, the publish() refusal (which replaces a
+        # measured HANG) and the per-group schema check.
         # 8673 since 2026-09-04 (same day, eighth bump): verify_plugin_fluid 386 -> 397 -- ABI v85 lets a
         # caller pick its Arrow batch size and a publication asks for a row group (measured ~2.4x). The
         # batch size is NOT observable from SQL; what the new rows pin is the accumulation loop's
@@ -518,7 +524,7 @@ case "$TIER" in
         # two functions have exactly ONE registration each, plus the HostsCatalog refusal and its
         # unknown-provider control. 3105 + 238 + 8259 - 3339 arithmetic aside, both numbers come from green
         # runs.
-        : "${MIN_ASSERTIONS:=8673}"
+        : "${MIN_ASSERTIONS:=8719}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

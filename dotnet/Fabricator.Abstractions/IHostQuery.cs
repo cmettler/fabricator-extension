@@ -121,6 +121,60 @@ public interface IHostQuery
         throw new NotSupportedException(
             "this IHostQuery implementation does not support pinned connections — it does not override "
             + "OpenConnection.");
+
+    /// <summary>
+    /// Registers <paramref name="rows"/> as a named Arrow source, returning a token the host DuckDB can scan
+    /// as <c>fabricator_scan('&lt;token&gt;')</c>. The DATA-IN direction: the way a relation that exists only
+    /// as Arrow in managed memory becomes something SQL can read.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// ⚠⚠ <b>THE ROWS ARE BORROWED, NOT ADOPTED, and the window is until <see cref="ReleaseRows"/>.</b>
+    /// Nothing here copies or disposes <paramref name="rows"/> — the caller still owns it and must keep it
+    /// alive for every scan of the token. Register, run the statement that scans it, release, in one
+    /// synchronous stretch; the pattern this exists for is a caller handed a batch it does not own (a
+    /// collector's input chunk, whose Arrow buffers the framework frees once the chunk is consumed).
+    /// </para>
+    /// <para>
+    /// ⚠ <b>The registry is PROCESS-GLOBAL, not connection-scoped</b>, so the token resolves on ANY host
+    /// connection — including a pinned one, which is what makes it the way to get a relation onto a pinned
+    /// connection's temporary catalog (<c>CREATE TEMP TABLE t AS SELECT * FROM fabricator_scan('…')</c>).
+    /// Named Arrow INPUTS cannot do that: the host refuses them on a pinned connection.
+    /// </para>
+    /// <para>
+    /// ⚠ The token is opaque and unique per call. It goes into SQL TEXT, so it is deliberately a name and
+    /// never an address — a copyable, re-runnable pointer in a statement is the use-after-free class the
+    /// temporary-view fix exists to have closed.
+    /// </para>
+    /// <para>
+    /// ⚠ The source DECLARES its schema, so a bind never opens a stream and the rows are read exactly once
+    /// per scan. Scanning the same token twice is fine: each scan gets a fresh reader over the same rows.
+    /// </para>
+    /// </remarks>
+    string RegisterRows(RecordBatch rows) =>
+        throw new NotSupportedException(
+            "this IHostQuery implementation does not support RegisterRows — it does not override it.");
+
+    /// <summary>
+    /// Registers an EMPTY named Arrow source declaring <paramref name="schema"/> — a relation with the right
+    /// columns and no rows.
+    /// </summary>
+    /// <remarks>
+    /// ⚠ It exists because the columns cannot be spelled in SQL from managed code: rendering
+    /// <c>CREATE TABLE t(a VARCHAR, b INTEGER)</c> means writing an Arrow→DuckDB type-name table by hand,
+    /// which is the kind of second type mapping this codebase refuses to keep in step. Scanning a
+    /// zero-row source lets DuckDB derive the types from the schema it already understands.
+    /// </remarks>
+    string RegisterRows(Schema schema) =>
+        throw new NotSupportedException(
+            "this IHostQuery implementation does not support RegisterRows — it does not override it.");
+
+    /// <summary>Releases a token from <see cref="RegisterRows"/>. Returns true if it was registered.</summary>
+    /// <remarks>⚠ Call it in a <c>finally</c>: a token left registered outlives the rows it borrows, and the
+    /// next scan of it would read freed Arrow buffers.</remarks>
+    bool ReleaseRows(string token) =>
+        throw new NotSupportedException(
+            "this IHostQuery implementation does not support ReleaseRows — it does not override it.");
 }
 
 /// <summary>

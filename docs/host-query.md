@@ -773,6 +773,29 @@ against the caller's catalog before replaying, or use a set-path type that verif
 ⚠ **It is UNGATED, and that is why it survived**: no suite sets `search_path` and then calls
 `fabricator_host_query`. Any fix should land with a gate that does exactly that.
 
+## ✅ DATA-IN FROM MANAGED CODE — `IHostQuery.RegisterRows` (2026-09-05)
+
+A plugin can now put a `RecordBatch` it holds in front of SQL: `RegisterRows(rows)` returns a token
+scannable as `fabricator_scan('<token>')`, and `RegisterRows(schema)` does the same for an EMPTY relation.
+Built for `fluid_query_batch`'s `input_table` ([fluid-templating.md](fluid-templating.md) §19.3).
+
+**⚠⚠ It closes the case §17.11 left open** — *"data originating in C# with no SQL of ours producing it"* —
+and it does so WITHOUT lifting the v84 refusal on named Arrow inputs over a pinned connection. MEASURED:
+`fabricator_scan` resolves on a pinned connection (a `{% query %}` on a render's pin read
+`fabricator_demo_numbers`' 3 rows), because the named-source registry is process-global and the
+replacement scan lives on the DatabaseInstance. So the lifetime hazard §17.6 describes is sidestepped
+rather than negotiated with: the rows reach a pinned connection's temporary catalog through
+`CREATE TEMP TABLE … AS SELECT * FROM fabricator_scan('<token>')`.
+
+⚠ **BORROWED, not adopted.** Nothing copies or disposes the batch — the caller keeps owning it and must
+`ReleaseRows` before it is freed. That is what makes it usable from a collector, whose input chunks it does
+not own and whose Arrow buffers the framework frees once a chunk is consumed: register, run the statement,
+release, in one synchronous stretch. The Bridge's stream is deliberately not `InMemoryArrayStream`, whose
+`Dispose` disposes the batches it was given.
+
+⚠ The source DECLARES its schema, so a bind never opens a stream and the rows are read once per scan;
+scanning the same token twice is fine, each scan getting a fresh reader.
+
 ## Gate totals for the whole pass
 
 `verify_host_query` **31 → 98** (hermetic), across the three changes on this page: the double-execution fix

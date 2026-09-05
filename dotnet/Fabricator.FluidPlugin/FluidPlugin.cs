@@ -44,6 +44,12 @@ public sealed class FluidPluginBackend : IProvider
     public IEnumerable<ISqlTableFunction> GlobalSqlTableFunctions =>
         new ISqlTableFunction[] { new FluidQueryFunction() };
 
+    // ⚠ A COLLECTOR, not a streaming in-out, and forced: fluid_query_batch's default renders once over the
+    // WHOLE input, which the streaming operator cannot express — its all-input-done hook is handed no
+    // DataChunk, so output held back until input EOF is drained and discarded.
+    public IEnumerable<ICollectorFunction> GlobalCollectorFunctions =>
+        new ICollectorFunction[] { new FluidQueryBatchFunction() };
+
     /// <summary>
     /// The one setting this plugin declares: where <c>{% include %}</c> / <c>{% render %}</c> resolve from.
     /// </summary>
@@ -114,8 +120,12 @@ internal sealed class FluidRenderFunction : IScalarFunction
             // ⚠ This surface renders at EXECUTE time (a VOLATILE scalar, never folded into the plan), so a
             // writing template here runs once per ROW rather than once per BIND. fluid_query permits exec
             // too, where it runs during binding — see FluidHostExec.
+            // publishRefusal: null — a publication made here is never scanned (this surface produces TEXT
+            // that nobody binds), so it is pointless rather than dangerous, and refusing a harmless call
+            // would be the mechanism-that-restricts-nothing the exec() decision rejected.
             b.Append(FluidEngine.Render(Name, templates.GetString(i),
-                                        ctx => FluidValueModel.Bind(ctx, paramsCol, row)));
+                                        ctx => FluidValueModel.Bind(ctx, paramsCol, row),
+                                        publishRefusal: null));
         }
         return b.Build();
     }

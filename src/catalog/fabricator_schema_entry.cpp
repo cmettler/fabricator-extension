@@ -1880,6 +1880,23 @@ unique_ptr<TableRef> FabricatorParseGeneratedSelect(const string &sql, const Par
 }
 
 // Build the DuckDB signature of a SQL-generating table function from its ONE declared parameter schema:
+//! Resolves an ANY-declared argument slot against the value that actually arrived.
+//!
+//! ⚠ Two rules, and the second is the one that bites. A SQLNULL DECLARATION is this protocol's "accept any
+//! value" marker, so the slot takes the VALUE's own runtime type. But a value that is itself an UNTYPED NULL
+//! leaves it SQLNULL — and an untyped NULL cannot cross the Arrow boundary at all: DuckDB exports a
+//! null-typed array with `null_count = 0`, which Apache.Arrow refuses ("Length must equal null count"). So
+//! an unresolved slot is carried as a typed NULL VARCHAR, which every reader already treats as "absent".
+static void FabricatorResolveAnyArg(LogicalType &type, Value &value) {
+	if (type.id() == LogicalTypeId::SQLNULL) {
+		type = value.type();
+	}
+	if (type.id() == LogicalTypeId::SQLNULL) {
+		type = LogicalType::VARCHAR;
+		value = Value(LogicalType::VARCHAR);
+	}
+}
+
 // Marshals an in-out / collector call's CONSTANT arguments in DECLARED ORDER, so the managed side reads them
 // by position exactly as it does for a table function. Walks the declared parameters:
 //   TABLE_INPUT — consumes its slot in `input.inputs` and emits NOTHING. DuckDB reserves a positional slot for
@@ -1930,14 +1947,24 @@ static void FabricatorMarshalInOutArgs(const FabricatorTableFunctionInfo &info, 
 				}
 			}
 			arg_names.push_back(info.arg_names[i]);
-			arg_types.push_back(declared);
+			// ⚠⚠ THE SQLNULL SENTINEL IS THE *ANY* DECLARATION, and this branch used to push `declared`
+			// unconditionally while the POSITIONAL branch below already resolved it. An ANY-declared NAMED
+			// parameter was therefore unusable in BOTH directions: supplied, the marshal tried to write the
+			// caller's value into a SQLNULL vector ("Failed to cast value ... -> NULL"); omitted, it carried
+			// an untyped NULL that Apache.Arrow refuses on import. Latent rather than shipped-broken — no
+			// in-tree in-out or collector declared one until fluid_query_batch's `params` bag.
+			auto named_type = declared;
+			FabricatorResolveAnyArg(named_type, v);
+			arg_types.push_back(named_type);
 			arg_values.push_back(std::move(v));
 			continue;
 		}
 		Value v = positional_index < input.inputs.size() ? input.inputs[positional_index] : Value(declared);
 		positional_index++;
 		arg_names.push_back(info.arg_names[i]);
-		arg_types.push_back(declared.id() == LogicalTypeId::SQLNULL ? v.type() : declared);
+		auto positional_type = declared;
+		FabricatorResolveAnyArg(positional_type, v);
+		arg_types.push_back(positional_type);
 		arg_values.push_back(std::move(v));
 	}
 	// A provider that declared nothing (every discovered `_each`) still gets the historical behavior: any
@@ -2244,6 +2271,15 @@ void ExchangeInputRelease(ArrowArrayStream *stream) {
 unique_ptr<FunctionData> FabricatorExchangeBind(ClientContext &context, TableFunctionBindInput &input,
                                               vector<LogicalType> &return_types, vector<string> &names) {
 	auto &info = input.info->Cast<FabricatorTableFunctionInfo>();
+	// ⚠⚠ THE AMBIENTS, and the BIND needs them as much as the scan does: this crossing runs the author's
+	// Bind(), which may reach the host — open a pinned connection, read a file, resolve a setting. Without
+	// them the managed side reads whatever the LAST crossing left, and AmbientOpener is a raw
+	// ClientContext* whose connection may be gone. MEASURED as `host_connection_open failed: vector too
+	// long` — CaptureSession dereferencing a dangling pointer, non-zero so the null guard waved it through,
+	// and reproducible only with an earlier statement in the same session to leave one behind. Latent until
+	// a binding did host work in Bind (fluid_query_batch's schema probe); FabricatorSetActiveTxn's own
+	// comment already named "a global collector/in-out" as the case it is for.
+	FabricatorSetActiveTxn(info.handle, context);
 	auto bind_data = make_uniq<FabricatorExchangeBindData>();
 	bind_data->handle = info.handle;
 	bind_data->schema = info.schema;
@@ -2567,6 +2603,15 @@ void CollectorHolder::OpenExchange(ClientContext &context) {
 unique_ptr<FunctionData> FabricatorCollectorBind(ClientContext &context, TableFunctionBindInput &input,
                                                vector<LogicalType> &return_types, vector<string> &names) {
 	auto &info = input.info->Cast<FabricatorTableFunctionInfo>();
+	// ⚠⚠ THE AMBIENTS, and the BIND needs them as much as the scan does: this crossing runs the author's
+	// Bind(), which may reach the host — open a pinned connection, read a file, resolve a setting. Without
+	// them the managed side reads whatever the LAST crossing left, and AmbientOpener is a raw
+	// ClientContext* whose connection may be gone. MEASURED as `host_connection_open failed: vector too
+	// long` — CaptureSession dereferencing a dangling pointer, non-zero so the null guard waved it through,
+	// and reproducible only with an earlier statement in the same session to leave one behind. Latent until
+	// a binding did host work in Bind (fluid_query_batch's schema probe); FabricatorSetActiveTxn's own
+	// comment already named "a global collector/in-out" as the case it is for.
+	FabricatorSetActiveTxn(info.handle, context);
 	auto bind_data = make_uniq<FabricatorCollectorBindData>();
 	bind_data->handle = info.handle;
 	bind_data->schema = info.schema;

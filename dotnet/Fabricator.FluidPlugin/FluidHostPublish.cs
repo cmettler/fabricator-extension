@@ -80,8 +80,25 @@ internal static class FluidHostPublish
     /// <summary>The host table function a publication is scanned through.</summary>
     private const string ScanFunction = "fabricator_scan";
 
+    /// <summary>
+    /// <see cref="TemplateContext.AmbientValues"/> key carrying a surface's refusal message. Present ⇒
+    /// <c>publish()</c> throws it; absent ⇒ allowed.
+    /// </summary>
+    /// <remarks>
+    /// ⚠⚠ It exists for a surface that runs the rendered statement ITSELF, on the render's own pinned
+    /// connection — where a publication is not merely pointless but DEADLOCKS. MEASURED: the scan invokes
+    /// the publication's factory, which opens a second query on the connection already executing the first,
+    /// and the process HANGS rather than raising the one-live-result refusal. A hang is worse than an
+    /// error, which is why this is refused rather than documented.
+    /// </remarks>
+    internal const string RefusalKey = "fabricator.publish_refused";
+
     internal static FluidValue Execute(string caller, FunctionArguments args, TemplateContext ctx)
     {
+        if (ctx.AmbientValues.TryGetValue(RefusalKey, out var refusal) && refusal is string reason)
+        {
+            throw new InvalidOperationException($"{caller}: {reason}");
+        }
         if (args.Count < 1)
         {
             throw new ArgumentException(

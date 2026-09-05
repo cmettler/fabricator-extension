@@ -2759,3 +2759,193 @@ into the caller's DuckDB and never written. Full record: [abi-history.md](abi-hi
 ⚠ **Projection pushdown remains unfixed and is now the biggest remaining gap for a wide publication** — the
 obstacle is the declared schema, which is the same mechanism that makes laziness work (§18.9). Filter
 pushdown has no such obstacle.
+
+## 19. ✅ AS BUILT (2026-09-05) — `fluid_query_batch`: a template rendered WITH A RELATION
+
+`fluid_query_batch(template, <input> [, params := …] [, batchsize := …])`. Where `fluid_query` renders from
+CONSTANTS at bind time and hands the result to DuckDB (`bind_replace`), this renders from DATA at execution
+time and runs the result itself. **User-designed**, over two rounds: the first sketch was a LATERAL
+`fluid_query_each(template, params, vararg …)`; the user re-cut it as an in-out taking a TABLE, then
+corrected themselves again — *"whole table does not work, we have a special collector function for this"* —
+which is exactly right and is what shipped.
+
+C# in the plugin + two host members + one C++ marshal fix. **No ABI change.** Gate
+`verify_plugin_fluid` **397 → 443**, hermetic floor 8673 → **8719**, three mutants each killed at its own
+assertion.
+
+### 19.1 Why a COLLECTOR, and why that was forced
+
+The default — no `batchsize`, one render over the whole input — emits nothing until input EOF. The
+streaming in-out operator **cannot express that**: its only all-input-done hook is the injected
+`OperatorFinalize`, which is handed no `DataChunk`, so output held back until EOF is drained and discarded
+([inout-collector-mode.md](inout-collector-mode.md)). A collector buffers its input and emits afterwards,
+which is this shape exactly.
+
+⚠ The price is inherent and is stated in the README: **the whole input is buffered before the first
+render**, even with a small `batchsize`. So `batchsize` is about how many rows each RENDER sees, never
+about memory. A bounded-memory batched variant is a SECOND registration of the same body on the streaming
+in-out — the author surface is identical (`CollectorInOutBinding` adapts `ICollectorFunctionBinding` to
+`IInOutFunctionBinding` with `DoExchange = Collect`), so the choice is reversible.
+
+⚠ **`kind` is fixed at REGISTRATION**, so one function name cannot switch operators by parameter. That is
+why `batchsize` had to live on the collector rather than selecting between the two.
+
+### 19.2 ⚠⚠ THE MEASUREMENT THAT SHAPED IT: the user's own sketch HANGS
+
+The sketch ended `select * from {{ publish('_result') }}`. MEASURED: **2 minutes, killed, 13.5 s CPU**,
+while the identical template through `fluid_query` returns in seconds as the control.
+
+The mechanism is re-entrancy. In `fluid_query` the caller's plan scans the publication on a DIFFERENT
+connection; here **we** run the generated statement on the render's own pinned connection, so the
+publication's factory opens a second query on the connection that is mid-query. It deadlocks rather than
+raising the one-live-result refusal.
+
+⇒ **`publish()` is refused by name in this surface**, and the refusal names the alternative. Nothing is
+lost: a publication carries a staged relation ACROSS a connection boundary and here there is none —
+`SELECT * FROM my_staged_table` just works, because the statement runs where the table lives.
+
+⚠ The mechanism is carried on `FluidHostPublish.RefusalKey`, an ambient each surface sets for itself, and
+`FluidEngine.Render`'s `publishRefusal` parameter is **REQUIRED with no default**. That is §11.1's rule
+applied: a policy defaulting to "allowed" makes a surface added later inherit the permissive answer
+silently, which is the same trap as branching on the caller's NAME.
+
+⚠ A test that reproduced the hang would HANG the tier rather than fail it, so what §25 pins is the
+REFUSAL, with the still-allowed `fluid_query` publish beside it as the positive control.
+
+### 19.3 The input table needs NO ABI change — measured
+
+`fabricator_scan` **resolves on a pinned connection** (measured: a `{% query %}` on the render's pin read
+`fabricator_demo_numbers`' 3 rows). The named-source registry is process-global and the replacement scan
+lives on the DatabaseInstance, so a batch can go managed → `Host.RegisterSource` →
+`CREATE TEMP TABLE … AS SELECT * FROM fabricator_scan('<token>')` on the pin.
+
+That sidesteps the obvious route rather than negotiating with it: named Arrow INPUTS are **refused** on a
+pinned connection (`fabricator_host_query.cpp`), and lifting that refusal re-opens the lifetime hazard
+[host-query.md](host-query.md) §17.6 documents. Two new default-implemented members on `IHostQuery`:
+
+- `RegisterRows(RecordBatch)` → a token. ⚠ **BORROWED, not adopted** — nothing copies or disposes the
+  batch, which is what makes it usable from a collector whose input chunks it does not own. Register, run
+  the statement, release, in one synchronous stretch.
+- `RegisterRows(Schema)` → a token for an EMPTY relation. It exists because the columns cannot be spelled
+  in SQL from managed code: rendering `CREATE TABLE t(a VARCHAR, …)` means an Arrow→DuckDB type-name table
+  by hand, the second type mapping this codebase keeps refusing to maintain.
+
+⚠ The Bridge's stream is deliberately **not** `InMemoryArrayStream`, whose `Dispose` disposes the batches
+it was given — handing it a borrowed batch would free the caller's Arrow buffers when the scan released
+the stream.
+
+### 19.4 `is_bind` selects what to RENDER; the schema comes from BINDING what was rendered
+
+The user proposed `is_bind` as a way for the template to DECLARE its columns. What ships uses it to choose
+what to render, and then takes the schema from `SELECT * FROM (<generated>) LIMIT 0` — the same probe
+`Publish` uses, which both binds without scanning and requires the statement to be a SELECT usable as a
+subquery.
+
+⚠ **A declaration written twice is a declaration that drifts**, and the drift would be read as DATA (the
+host builds its Arrow→DuckDB converters from the declared schema). So the columns are never taken on
+trust. What `is_bind` genuinely buys is skipping expensive or side-effecting setup — binds REPEAT, once per
+view use and once per prepared re-execution.
+
+⚠ It is defined ONLY in this surface's renders. In `fluid_query` there is no second kind of render to tell
+it apart from, so leaving it undefined (falsy) is the honest answer rather than picking a value.
+
+⚠ Every group's arriving schema is verified against the declaration (count, names, type IDs — the same
+three the host's own declared-source check compares, with the same limit: a change of type PARAMETERS
+alone passes). NOT defensive: the template renders anew per group and may legitimately render different
+SQL, so drift is reachable from an ordinary template — §25's row branches on its own row count.
+
+### 19.5 Exact slicing, and why it needed a staging table
+
+Every input row is copied into `__fab_input` with a `__fab_seq` row number as it arrives, and `input_table`
+is a temp **VIEW** over a range of it. That buys three things:
+
+- **exactness**: `batchsize := 2` over 5 rows gives 2, 2, 1 — not "at least 2, rounded up to an input
+  chunk". Batch-aligned grouping would make `batchsize := 1` mean 2048.
+- **no second copy**: a view, not a table, so the whole-input case does not duplicate the staged relation.
+- **the rows leave managed memory immediately**, which the collector contract requires — it frees a
+  chunk's Arrow buffers once consumed, so accumulating batches to form a group would be a use-after-free.
+  DuckDB is also the better owner: it can spill.
+
+⚠ `row_number() OVER ()` numbers each batch in scan order. WHICH row gets which number does not matter —
+they only have to be unique and contiguous, so every row lands in exactly one group.
+
+⚠ An input column named `__fab*` is refused at bind, by name.
+
+⚠ **An empty input still renders ONCE** — the template is a statement generator and its output need not
+depend on the rows. It is also the only case with no batch to build the staging table from, hence the
+schema-only `RegisterRows`.
+
+### 19.6 ⚠⚠ A CLAIM I WROTE DOWN AND THE PROBE FALSIFIED
+
+The first version of this feature's doc comments said one shared `TemplateContext` makes a Liquid
+`{% assign %}` carry from group to group. **It does not.** Fluid renders into a CHILD SCOPE and pops it,
+so every group starts from the variables the context was built with. MEASURED in one run: a counter
+assigned per group read **1, 1, 1** where a temp-table counter read **1, 2, 3**.
+
+⇒ **SQL state carries; Liquid state does not.** The shared context is worth having for what it does do
+(the params bag and the three host functions are bound once), and the sequential-state story the user
+asked for — *"keeping state e.g. in temp tables"* — is the half that works. Both are now pinned in §25,
+the Liquid one as a CHARACTERIZATION test of Fluid's scoping that no mutant of ours can kill.
+
+⚠ The context is built per EXECUTION, not per binding: a binding is reused across prepared re-executions,
+so a context or session built at bind would carry one execution's state into the next. That is also why
+the params bag is CAPTURED (`FluidValueModel.Capture`) rather than retained — the args batch belongs to
+the framework and its lifetime ends with the bind. Capture is safe because `ReadCell` is eager all the way
+down, which was checked rather than assumed: `EagerStruct`, `ArrowMap`'s copying constructor, `ReadList`.
+
+### 19.7 ⚠⚠ TWO PRE-EXISTING DEFECTS IT EXPOSED, both latent until now
+
+**(a) An ANY-declared NAMED parameter was unusable on the in-out/collector path.**
+`FabricatorMarshalInOutArgs`'s NAMED branch pushed the DECLARED type unconditionally while the POSITIONAL
+branch two lines below already resolved the SQLNULL sentinel against the value that arrived. So `params`
+failed in BOTH directions: supplied, *"Failed to cast value … -> NULL"*; omitted, an untyped NULL that
+Apache.Arrow refuses (*"Length must equal null count"*, the v80-recorded hostility). Fixed with a shared
+`FabricatorResolveAnyArg` applied to both branches. **Latent rather than shipped-broken:
+`fluid_query_batch` is the first in-tree in-out or collector to declare one** (`fluid_query` is sqlgen, a
+different marshal).
+
+**(b) ⚠⚠ The in-out and collector BINDS established no ambients — a dangling `ClientContext *`.**
+`FabricatorExchangeBind` and `FabricatorCollectorBind` never called `FabricatorSetActiveTxn`, while their
+`InitGlobal`s did. So managed code running in the author's `Bind()` read whatever the LAST crossing left.
+MEASURED as **`host_connection_open failed: vector too long`** — `CaptureSession` dereferencing a stale
+pointer, NON-ZERO so the null guard waved it through, and reproducible only with an earlier statement in
+the same session to leave one behind.
+
+⚠ `FabricatorSetActiveTxn`'s own comment already named *"a global collector/in-out"* as the case it exists
+for; the bind sites were simply missed. Latent until a binding did host work in `Bind` — which the schema
+probe is.
+
+⚠ The mutant for (b) kills reliably but at a VARYING line, which is the signature of the bug it guards
+rather than a weak gate: a dangling pointer breaks wherever the garbage lands. Both observed kills were
+inside §25 with the same message.
+
+⚠ The exchange (streaming in-out) half of the fix is **UNGATED** — no in-tree in-out binding does host
+work in `Bind`, so no statement reaches it. Said here rather than implying coverage.
+
+### 19.8 ⚠ A CI FLAKE FOUND ON THE WAY, pre-existing, in §23
+
+§23's two-publications-in-one-statement row pinned an alternation over TWO plan-dependent messages. A
+THIRD is reachable: the SINGLE-USE refusal, i.e. one token scanned twice rather than two scanned at once.
+MEASURED **~1 run in 6**, and attributed rather than guessed — it reproduces against the **unmodified**
+suite file, while the same statement run ALONE gives "open result stream" 10 times out of 10, so it needs
+preceding suite state and is not the new section's doing. The alternation is widened; all three ARE the
+property under test (a loud refusal), and pinning which one arrives would be pinning DuckDB's plan choice.
+
+⚠ **A separate harness trap, worth knowing for any local re-run:** `verify_plugin_fluid` is NOT
+re-runnable against the same `FABRICATOR_DELTA_WRITE_DIR`. First run passes, every later one with the same
+directory fails at the no-root include refusal. Invisible in CI because `run-suites.sh` gives each suite a
+fresh scratch dir — and it VOIDED a mutation run here until a fresh-dir control separated it.
+
+### 19.9 What is NOT built
+
+- **The LATERAL form** (`FROM t, fluid_query_each(…, t.a, t.b)`) — parallel, and the host stamps the
+  correlated columns. It needs two things this shape does not: a mandatory row id in every generated
+  statement (`LateralResult.Origin` is required, and absent-with-a-different-length is a hard error), and
+  a rule for naming input columns, since a lateral's wire columns are named by their rendered EXPRESSION
+  TEXT (`t.a`, but also `(t.a + 1)` and `CAST(5 AS SMALLINT)`). A STRUCT argument would dissolve the
+  naming half.
+- **A bounded-memory batched variant** on the streaming in-out — same body, different registration.
+- **The input rows as a Fluid VALUE** (`input`, via the `{% query %}` value model), which would let a
+  template loop over rows without a round trip. Today `{% query rows %}SELECT … FROM input_table{% endquery %}`
+  does it in one statement, which is why this was left out.
+

@@ -1325,10 +1325,10 @@ A plugin's global functions are registered while the extension loads, so a plugi
 available the **next time** DuckDB loads fabricator — not in the running session. See
 [docs/plugin-system.md](docs/plugin-system.md).
 
-#### Templates — `fluid_render(...)` and `fluid_query(...)`
+#### Templates — `fluid_render(...)`, `fluid_query(...)` and `fluid_query_batch(...)`
 
 The **Fluid / Liquid template engine** is **built in** — it ships inside the extension and needs no
-configuration. It contributes two global functions, both taking a params bag that is a DuckDB `STRUCT`
+configuration. It contributes three global functions, all taking a params bag that is a DuckDB `STRUCT`
 (preferred — typed, no quoting), a `MAP`, or a JSON string.
 
 **`fluid_render(template, params)`** renders a template to **text**:
@@ -1840,6 +1840,85 @@ The included template shares the caller's variables, and it may include others i
 The file is read the same way `query()` runs SQL — on its own connection — so a location authorised by a
 **persistent** secret works, while one authorised by a `CREATE SECRET` of the calling session does not. A
 template above 1 MiB is refused, and a missing include reports every path it asked for.
+
+**`fluid_query_batch(template, <input> [, params := …] [, batchsize := …])` renders a template WITH A
+RELATION IN HAND** and runs the statement it produces. Where `fluid_query` renders from constants at bind
+time, this renders from *data* at execution time — so the SQL text itself can depend on the rows.
+
+```sql
+CREATE TABLE orders  AS SELECT * FROM range(3);
+CREATE TABLE returns AS SELECT * FROM range(1);
+CREATE TABLE manifest AS SELECT unnest(['orders','returns']) AS tbl;
+
+SELECT * FROM fluid_query_batch('
+{% if is_bind %}SELECT NULL::VARCHAR AS src, 0::BIGINT AS n LIMIT 0
+{% else %}
+  {% query rows %}SELECT tbl FROM input_table ORDER BY tbl{% endquery %}
+  {% for r in rows %}
+    SELECT {{ r.tbl | sql }} AS src, count(*)::BIGINT AS n FROM {{ r.tbl | sql_ident }}
+    {% unless forloop.last %} UNION ALL {% endunless %}
+  {% endfor %}
+{% endif %}', (SELECT tbl FROM manifest)) ORDER BY src;
+-- src     | n
+-- orders  | 3
+-- returns | 1
+```
+
+The input arrives as a temporary table called **`input_table`**, on the template's own connection — read it
+with `{% query %}`, join it in the generated statement, or ignore it. Its columns are the input relation's
+own.
+
+**`is_bind` is true for exactly one render: the one that determines the output columns.** DuckDB needs a
+table function's schema before it runs anything, so the template is rendered once against an *empty*
+`input_table` and the resulting statement is bound to learn its shape. You do not have to branch — a
+template that simply reads `input_table` works, because an empty input still produces the right columns —
+but branching lets you skip expensive setup, and it is the idiom when the real body is costly. Whatever the
+branch renders is what gets bound: the columns are never taken on trust, and a later render that produces a
+different shape is refused rather than misread.
+
+**Without `batchsize` the template is rendered ONCE for the whole input.** With it, once per that many
+rows — exactly that many, not "at least":
+
+```sql
+SELECT n, lo, hi FROM fluid_query_batch(
+  'SELECT count(*) AS n, min(i) AS lo, max(i) AS hi FROM input_table',
+  (SELECT * FROM range(5) t(i)), batchsize := 2) ORDER BY lo;
+-- 2 | 0 | 1
+-- 2 | 2 | 3
+-- 1 | 4 | 4
+```
+
+**Groups run in order on one connection, so SQL state carries between them** — a temp table one group
+stages is there for the next, which is how you accumulate across a large input:
+
+```sql
+SELECT groups_so_far, n FROM fluid_query_batch('
+{% exec %}CREATE TEMP TABLE IF NOT EXISTS acc(n BIGINT){% endexec %}
+{% exec %}INSERT INTO acc SELECT count(*) FROM input_table{% endexec %}
+SELECT (SELECT count(*) FROM acc)::BIGINT AS groups_so_far, count(*)::BIGINT AS n FROM input_table',
+  (SELECT * FROM range(5) t(i)), batchsize := 2) ORDER BY groups_so_far;
+-- 1 | 2
+-- 2 | 2
+-- 3 | 1
+```
+
+> ⚠ **Liquid variables do NOT carry between groups**, only SQL state does. Fluid renders each group in its
+> own scope, so a `{% assign %}` starts fresh every time. Accumulate in a temp table, as above.
+
+> ⚠ **The whole input is buffered before the first render**, and `batchsize` does not change that — it
+> controls how many rows each *render* sees, never how much memory the function uses. This is inherent: a
+> function that may render once over everything cannot know it has everything until the input ends.
+
+> ⚠ **`publish()` is refused here**, and unlike in `fluid_query` you do not need it: this function runs the
+> generated statement on the template's own connection, so a table `{% exec %}` staged is simply in scope —
+> `SELECT * FROM my_staged_table`. (`publish` exists to carry a relation to a *different* connection.)
+
+> ⚠ **Prefer `fluid_query` plus an ordinary join when the generated SQL does not depend on the data.** This
+> function does not disappear into the caller's plan the way `fluid_query` does, so its rows cross the
+> managed boundary and it gets no pushdown. It earns its cost only when the SQL *text* must vary.
+
+> ⚠ An input column whose name begins `__fab` is refused — the function needs that prefix for its own
+> staging columns. Alias it in the input query.
 
 **It is always available**, in a released artifact and in a build from source alike. It used to ship as a
 bundled *plugin*, which had one sharp edge worth knowing about if you remember it that way: setting

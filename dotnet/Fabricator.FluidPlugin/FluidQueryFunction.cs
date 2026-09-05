@@ -62,7 +62,11 @@ internal sealed class FluidQueryFunction : ISqlTableFunction
         int p = args.Schema.GetFieldIndex("params");
         var bag = p >= 0 ? args.Column(p) : null;
 
+        // publishRefusal: null — the generated SQL is substituted into the CALLER's plan (bind_replace),
+        // so a publication is scanned on a DIFFERENT connection than the one that staged it. That is the
+        // shape publish() was built for. Contrast fluid_query_batch, which runs the statement itself.
         return FluidEngine.Render(Name, templates.GetString(0),
-                                  ctx => FluidValueModel.Bind(ctx, bag, 0));
+                                  ctx => FluidValueModel.Bind(ctx, bag, 0),
+                                  publishRefusal: null);
     }
 }

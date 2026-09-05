@@ -181,6 +181,18 @@ spill in C# (out of scope; the streaming exchange is the input-bounded path by d
    threads=1** catching premature-finish, empty, NULLs, prepared re-exec) + `verify_dax.test` (29, incl. the
    5000-row daxevaltable). **DONE.**
 
+## Second consumer: `fluid_query_batch` (2026-09-05)
+
+`fluid_query_batch` is a collector for exactly the reason this mode exists: its default renders a template
+ONCE over the whole input, which the streaming exchange cannot express — see
+[fluid-templating.md](fluid-templating.md) §19.1. It is also the first collector whose `Bind` does HOST
+WORK (a schema probe on a pinned connection), which exposed that neither `FabricatorCollectorBind` nor
+`FabricatorExchangeBind` established the call ambients, leaving managed code to dereference a stale
+`ClientContext *` (§19.7b). Both binds set them now.
+
+⚠ It is also the first in-tree in-out or collector to declare an ANY-typed NAMED parameter, which exposed
+that the args marshal resolved the SQLNULL sentinel on the POSITIONAL path only (§19.7a).
+
 ## Remaining (future, on demand)
 
 The collector scaffold is now reusable for other whole-table needs as they arise: a sort/dedup-the-input

@@ -2544,16 +2544,23 @@ can be scanned ONCE
 # render's pinned connection, and a pinned connection tolerates only ONE live result stream, so two of them
 # in one plan collide. It fails LOUDLY with one of two messages depending on the plan (the pin's own v84
 # refusal, or DuckDB reporting the closed result downstream) — never silently. ⚠ The expected text is an
-# ALTERNATION over both, deliberately: which one wins is DuckDB's plan choice, not ours, and the property
-# worth pinning is that it cannot quietly half-work. MEASURED: this JOIN gives the first, while the same
-# two publications under UNION ALL give the second.
+# ALTERNATION over ALL THREE, deliberately: which one wins is DuckDB's plan choice, not ours, and the
+# property worth pinning is that it cannot quietly half-work. MEASURED: this JOIN gives the first, and the
+# same two publications under UNION ALL give the second.
+# ⚠⚠ THE THIRD WAS A CI FLAKE, found 2026-09-05 while gating fluid_query_batch and PRE-EXISTING: this
+# statement intermittently reports the SINGLE-USE refusal instead — one token scanned twice rather than two
+# scanned at once. MEASURED ~1 run in 6, and attributable: it reproduces against the UNMODIFIED suite file,
+# while the same statement run alone gives "open result stream" 10 times out of 10, so it needs preceding
+# suite state and is not this section's doing. Left as a widened alternation rather than chased, because
+# all three ARE the property under test — a loud refusal — and pinning which one arrives would be pinning
+# DuckDB's plan choice.
 statement error
 SELECT count(*) FROM fluid_query('
 {% exec %}CREATE TEMP TABLE _t4 AS SELECT 1 AS a UNION ALL SELECT 2{% endexec %}
 SELECT * FROM {{ publish(''_t4'') }} x JOIN {{ publish(''_t4'') }} y ON x.a = y.a
 ');
 ----
-<REGEX>:.*(open result stream|closed pending query result).*
+<REGEX>:.*(open result stream|closed pending query result|scanned ONCE).*
 
 # --- POSITIVE CONTROL 1, and the first workaround: TWO SEPARATE RENDERS are two separate pins, so two
 # fluid_query calls in one statement each publish and scan happily. Without a control, the refusal above
@@ -2738,3 +2745,186 @@ SELECT * FROM {{ publish(''bb6'') }}
 ') WHERE d <> n * 2;
 ----
 0
+
+# ============================================================================================
+# §25 — fluid_query_batch: a template rendered WITH A RELATION, once for the whole input or once per
+#       `batchsize` rows, with each rendered statement run and its rows returned.
+#
+# ⚠ It is a COLLECTOR, and forced: the whole-table default emits nothing until input EOF, which the
+# streaming in-out operator cannot express at all (its all-input-done hook is handed no DataChunk, so
+# output held back until EOF is drained and discarded — docs/inout-collector-mode.md).
+# ============================================================================================
+
+# --- the signature registers as declared: the table input is a TABLE argument, the ANY params bag stays
+# ANY, and batchsize is a real BIGINT. ⚠ Load-bearing: an ANY-declared NAMED parameter on an in-out or
+# collector had never been declared in tree, and the args marshal resolved the SQLNULL sentinel on the
+# POSITIONAL path only — so `params` was unusable in BOTH directions before this (supplied, it failed to
+# cast to "NULL"; omitted, it carried an untyped NULL that Apache.Arrow refuses). ---
+query IIII
+SELECT function_name, parameters, parameter_types, coalesce(varargs, '')
+FROM duckdb_functions() WHERE function_name = 'fluid_query_batch';
+----
+fluid_query_batch	[col0, col1, params, batchsize]	[VARCHAR, TABLE, ANY, BIGINT]	(empty)
+
+# --- THE DEFAULT: no batchsize => ONE render over the WHOLE input. ---
+query II
+SELECT n, s FROM fluid_query_batch('SELECT count(*) AS n, sum(i)::BIGINT AS s FROM input_table',
+                                   (SELECT * FROM range(5) t(i)));
+----
+5	10
+
+# --- ⚠ batchsize slices EXACTLY, not "at least N rounded up to an input chunk": 5 rows at 2 gives 2, 2, 1
+# with contiguous, non-overlapping ranges. That every row appears in exactly one group is what the
+# staging row number buys; the lo/hi columns are what make it checkable rather than assumed. ---
+query III
+SELECT n, lo, hi FROM fluid_query_batch(
+  'SELECT count(*) AS n, min(i) AS lo, max(i) AS hi FROM input_table',
+  (SELECT * FROM range(5) t(i)), batchsize := 2) ORDER BY lo;
+----
+2	0	1
+2	2	3
+1	4	4
+
+# --- is_bind: the probe render declares the shape, every other render produces it. ⚠ The template's two
+# branches are DIFFERENT SQL, so this also shows the declared schema comes from binding what the probe
+# rendered rather than from anything the author asserted. ---
+query II
+SELECT tag, n FROM fluid_query_batch('
+{% if is_bind %}SELECT NULL::VARCHAR AS tag, 0::BIGINT AS n LIMIT 0
+{% else %}SELECT ''g'' AS tag, count(*)::BIGINT AS n FROM input_table
+{% endif %}', (SELECT * FROM range(3) t(i)));
+----
+g	3
+
+# --- the params bag reaches the template, in the STRUCT spelling fluid_query takes. ---
+query II
+SELECT pre, n FROM fluid_query_batch(
+  'SELECT {{ pre | sql }} AS pre, count(*)::BIGINT AS n FROM input_table',
+  (SELECT * FROM range(4) t(i)), params := {'pre': 'p'});
+----
+p	4
+
+# --- ⚠⚠ SQL STATE CARRIES BETWEEN GROUPS and it is the whole point of the sequential shape: one pinned
+# connection for the execution, so a temp table one group stages is there for the next. 1, 2, 3 could
+# not be produced by three independent renders. ---
+query II
+SELECT groups_so_far, n FROM fluid_query_batch('
+{% exec %}CREATE TEMP TABLE IF NOT EXISTS acc(n BIGINT){% endexec %}
+{% exec %}INSERT INTO acc SELECT count(*) FROM input_table{% endexec %}
+SELECT (SELECT count(*) FROM acc)::BIGINT AS groups_so_far, count(*)::BIGINT AS n FROM input_table',
+  (SELECT * FROM range(5) t(i)), batchsize := 2) ORDER BY groups_so_far;
+----
+1	2
+2	2
+3	1
+
+# --- ⚠⚠ LIQUID state does NOT carry, and this row exists because the code comment claimed it did until it
+# was measured. Fluid renders into a child scope and pops it, so every group starts from the variables the
+# context was built with: the counter reads 1, 1, 1 where the temp-table counter above reads 1, 2, 3.
+# A CHARACTERIZATION test of Fluid's scoping — no mutant of ours can kill it — pinned so the two halves of
+# "state carries" cannot be conflated again. ---
+query II
+SELECT grp, n FROM fluid_query_batch('
+{% assign seen = seen | default: 0 | plus: 1 %}
+SELECT {{ seen }}::BIGINT AS grp, count(*)::BIGINT AS n FROM input_table',
+  (SELECT * FROM range(5) t(i)), batchsize := 2) ORDER BY n DESC;
+----
+1	2
+1	2
+1	1
+
+# --- THE CASE THAT JUSTIFIES THE FUNCTION: the SQL TEXT depends on the DATA. A driver relation names the
+# tables; the template reads it with {% query %} and fans out one UNION ALL branch per row. Nothing about
+# this is expressible through fluid_query, whose render sees only constants. ---
+statement ok
+CREATE TABLE fqb_t1 AS SELECT 1 AS v;
+
+statement ok
+CREATE TABLE fqb_t2 AS SELECT 2 AS v UNION ALL SELECT 3;
+
+query II
+SELECT src, n FROM fluid_query_batch('
+{% if is_bind %}SELECT NULL::VARCHAR AS src, 0::BIGINT AS n LIMIT 0
+{% else %}
+  {% query rows %}SELECT tbl FROM input_table ORDER BY tbl{% endquery %}
+  {% for r in rows %}
+    SELECT {{ r.tbl | sql }} AS src, count(*)::BIGINT AS n FROM {{ r.tbl | sql_ident }}
+    {% unless forloop.last %} UNION ALL {% endunless %}
+  {% endfor %}
+{% endif %}', (SELECT unnest(['fqb_t1','fqb_t2']) AS tbl)) ORDER BY src;
+----
+fqb_t1	1
+fqb_t2	2
+
+# --- ⚠ AN EMPTY INPUT STILL RENDERS ONCE. The template is a statement generator and its output need not
+# depend on the rows, so producing nothing at all would be the wrong answer — and it is the case that has
+# no batch to build the staging table from. ---
+query I
+SELECT n FROM fluid_query_batch('SELECT count(*)::BIGINT AS n FROM input_table',
+                                (SELECT * FROM range(0) t(i)));
+----
+0
+
+# --- ⚠⚠ publish() IS REFUSED, AND THE REFUSAL REPLACES A HANG. This surface runs the generated statement
+# on the render's OWN pinned connection, so scanning a publication re-enters that connection while it is
+# mid-query — MEASURED to deadlock (2 min, killed) rather than to raise the one-live-result error, while
+# the identical template through fluid_query returns in seconds. A test that reproduced the hazard would
+# HANG the tier instead of failing it, so what is pinned is the refusal. ---
+statement error
+SELECT * FROM fluid_query_batch('
+{% exec %}CREATE TEMP TABLE pubs AS SELECT 1 AS a{% endexec %}
+SELECT * FROM {{ publish(''pubs'') }}', (SELECT * FROM range(2) t(i)));
+----
+publish() cannot be used here
+
+# --- the same publish() is still ALLOWED in fluid_query, where the caller's plan scans it on a different
+# connection. Without this row the refusal above would pass equally on a build where publish had simply
+# stopped working. ---
+query I
+SELECT a FROM fluid_query('
+{% exec %}CREATE TEMP TABLE pubok AS SELECT 7 AS a{% endexec %}
+SELECT * FROM {{ publish(''pubok'') }}');
+----
+7
+
+# --- ⚠⚠ A GROUP THAT RENDERS A DIFFERENT SHAPE IS REFUSED, not read as data. Reachable from an ordinary
+# template: this one branches on its own row count, so the last group (1 row) produces two columns where
+# the declaration has one. The host builds its Arrow converters from the DECLARED schema, so an unchecked
+# mismatch would be read as VALUES. ---
+statement error
+SELECT * FROM fluid_query_batch('
+{% query c %}SELECT count(*) AS n FROM input_table{% endquery %}
+{% if c[0].n == 1 %}SELECT 1 AS a, 2 AS b{% else %}SELECT 1 AS a{% endif %}',
+  (SELECT * FROM range(3) t(i)), batchsize := 2);
+----
+2 columns where 1 were declared
+
+# --- an input column under the reserved prefix would collide with the staging row number, and is refused
+# by name at bind rather than producing a confusing SQL error later. ---
+statement error
+SELECT * FROM fluid_query_batch('SELECT 1 AS n', (SELECT 1 AS __fab_seq));
+----
+reserved '__fab' prefix
+
+# --- batchsize must be positive; the message names the way to ask for the whole input. ---
+statement error
+SELECT * FROM fluid_query_batch('SELECT 1 AS n', (SELECT * FROM range(2) t(i)), batchsize := 0);
+----
+batchsize must be positive
+
+# --- the generated statement must be a SELECT usable as a subquery, which is what the schema probe
+# establishes. A template rendering DDL is refused at bind rather than run. ---
+statement error
+SELECT * FROM fluid_query_batch('CREATE TEMP TABLE nope(a INT)', (SELECT * FROM range(1) t(i)));
+----
+fluid_query_batch
+
+# --- ⚠ input_table is a temp VIEW over the staged rows, so it costs no second copy — and being a view is
+# also why a template may scan it repeatedly. Two references in one generated statement must agree. ---
+query II
+SELECT a, b FROM fluid_query_batch(
+  'SELECT (SELECT count(*) FROM input_table)::BIGINT AS a, (SELECT sum(i) FROM input_table)::BIGINT AS b',
+  (SELECT * FROM range(4) t(i)));
+----
+4	6
+

@@ -105,6 +105,22 @@ internal sealed class FluidRenderSession : IDisposable
     /// </remarks>
     internal string Publish(string sql) => Pin().Publish(sql);
 
+    /// <summary>
+    /// Registers <paramref name="rows"/> as a named Arrow source, returning a token scannable as
+    /// <c>fabricator_scan('&lt;token&gt;')</c> — including on THIS render's pinned connection, which is how
+    /// a batch of rows becomes a temp table the template can read.
+    /// </summary>
+    /// <remarks>⚠ BORROWED: the caller keeps owning <paramref name="rows"/> and must
+    /// <see cref="ReleaseRows"/> before they are freed.</remarks>
+    internal string RegisterRows(RecordBatch rows) => _host.RegisterRows(rows);
+
+    /// <summary>Registers an EMPTY source declaring <paramref name="schema"/> — a relation with the right
+    /// columns and no rows, which is how a table's shape is created without rendering DuckDB type names.</summary>
+    internal string RegisterRows(Schema schema) => _host.RegisterRows(schema);
+
+    /// <summary>Releases a token from <see cref="RegisterRows"/>.</summary>
+    internal bool ReleaseRows(string token) => _host.ReleaseRows(token);
+
     // The render's connection, opened on first use.
     //
     // ⚠⚠ UNCONDITIONAL, AND THERE IS NO FALLBACK TO A FRESH CONNECTION — nor any capability probe left to

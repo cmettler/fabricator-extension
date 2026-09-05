@@ -212,16 +212,38 @@ internal static class FluidEngine
 
     /// <summary>Parses (or reuses) <paramref name="template"/> and renders it over a fresh context.</summary>
     /// <param name="caller">The SQL function name, so a parse error names the function the user called.</param>
-    internal static string Render(string caller, string template, Action<TemplateContext> bind)
+    /// <param name="publishRefusal">Null = <c>publish()</c> is allowed; otherwise the message it throws.
+    /// ⚠ REQUIRED, with no default, DELIBERATELY: a policy that defaults to "allowed" makes a surface added
+    /// later inherit the permissive answer silently, which is exactly the trap docs/fluid-templating.md §11.1
+    /// records about deriving it from the caller's NAME. Every surface states its own.</param>
+    internal static string Render(string caller, string template, Action<TemplateContext> bind,
+                                  string? publishRefusal)
     {
-        var parsed = Cache.GetOrAdd(template, src =>
-        {
-            if (!Parser.TryParse(src, out var t, out var error))
-            {
-                throw new ArgumentException($"{caller}: template parse error: {error}");
-            }
-            return t;
-        });
+        // ⚠⚠ ONE PINNED DuckDB CONNECTION PER RENDER (ABI v84), so this template's exec() and query() see
+        // each other — a `CREATE TEMP TABLE` in one and a `SELECT` from it in the other. Created here
+        // rather than in either function so the two share it, LAZILY (nothing is opened until the first
+        // call), and disposed with the render so the temporary catalog dies with it. See FluidRenderSession
+        // for why per-render is also what makes it thread-safe.
+        using var session = FluidRenderSession.TryCreate();
+        var ctx = NewRenderContext(caller, publishRefusal, session, bind);
+        return RenderOn(caller, template, ctx);
+    }
+
+    /// <summary>
+    /// Builds the context a render runs over: the three host functions, the caller key, the publish policy
+    /// and the session.
+    /// </summary>
+    /// <remarks>
+    /// ⚠ Separated from <see cref="Render"/> for <c>fluid_query_batch</c>, which renders MANY times over one
+    /// context and one session, so the per-context setup — the params bag, the three host functions — happens
+    /// once. Every other surface wants exactly one render per context and uses <see cref="Render"/>.
+    /// <para>⚠ Sharing a context does NOT share Liquid VARIABLES between renders: Fluid renders into a child
+    /// scope and pops it, so a <c>{% assign %}</c> does not survive (MEASURED, after this comment first
+    /// claimed it did). What carries between renders is the SESSION's SQL state — a temp table.</para>
+    /// </remarks>
+    internal static TemplateContext NewRenderContext(string caller, string? publishRefusal,
+                                                     FluidRenderSession? session, Action<TemplateContext> bind)
+    {
         var ctx = FluidValueModel.NewContext();
         // ⚠ Registered PER CONTEXT, and `caller` is captured so a refusal names the SQL function the user
         // actually called rather than the template machinery.
@@ -241,17 +263,29 @@ internal static class FluidEngine
         // would mutate global state on every call and capture whichever `caller` happened to register last,
         // giving another render's function name in an error. The caller travels per context instead:
         ctx.AmbientValues[FluidHostQuery.CallerKey] = caller;
-        // ⚠⚠ ONE PINNED DuckDB CONNECTION PER RENDER (ABI v84), so this template's exec() and query() see
-        // each other — a `CREATE TEMP TABLE` in one and a `SELECT` from it in the other. Created here
-        // rather than in either function so the two share it, LAZILY (nothing is opened until the first
-        // call), and disposed below so the temporary catalog dies with the render. See FluidRenderSession
-        // for why per-render is also what makes it thread-safe.
-        using var session = FluidRenderSession.TryCreate();
+        if (publishRefusal is not null)
+        {
+            ctx.AmbientValues[FluidHostPublish.RefusalKey] = publishRefusal;
+        }
         if (session is not null)
         {
             ctx.AmbientValues[FluidRenderSession.Key] = session;
         }
         bind(ctx);
+        return ctx;
+    }
+
+    /// <summary>Parses (or reuses) <paramref name="template"/> and renders it over an EXISTING context.</summary>
+    internal static string RenderOn(string caller, string template, TemplateContext ctx)
+    {
+        var parsed = Cache.GetOrAdd(template, src =>
+        {
+            if (!Parser.TryParse(src, out var t, out var error))
+            {
+                throw new ArgumentException($"{caller}: template parse error: {error}");
+            }
+            return t;
+        });
         try
         {
             return parsed.Render(ctx);
@@ -275,6 +309,9 @@ internal static class FluidEngine
                 ex);
         }
     }
+
+    /// <summary>The template variable naming the schema-probe render — see <c>fluid_query_batch</c>.</summary>
+    internal const string IsBindVariable = "is_bind";
 }
 
 /// <summary>
