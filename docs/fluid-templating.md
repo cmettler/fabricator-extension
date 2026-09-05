@@ -3225,14 +3225,32 @@ that would otherwise truncate silently. A small-result test exercises only the s
   pinned; the hang is the same one §19.2 measured for `fluid_query_batch`, from the same cause (the
   generated statement runs on the render's own pin).
 
-### 22.7 Still open
+### 22.7 Still open — and TWO of the three it first listed were not open at all
 
-- **A `batchsize`-like control.** A lateral's chunk is DuckDB's, up to 2048 rows; there is no way to ask
-  for smaller ones. Nobody has needed it.
-- **Projection pushdown into the generated statement.** The declared output is fixed at bind, so a caller
-  selecting one column still pays for all of them — the same obstacle `publish` has (docs §18).
+- ~~A `batchsize`-like control~~ — **NOT WANTED (user, 2026-09-05).** A lateral's chunk is DuckDB's, up to
+  2048 rows. Do not build it.
+- ~~Projection pushdown~~ — **A SETTLED DECISION, not an open item, and this entry's reason for it was
+  wrong.** It said "the declared output is fixed at bind … the same obstacle `publish` has". Neither half
+  holds:
+  - **DuckDB DOES support it for this shape** (user-questioned, then read at the pin). It is one flag,
+    `TableFunction::projection_pushdown`, and `RemoveUnusedColumns` gates on exactly that
+    (`remove_unused_columns.cpp:720`) — for ANY `LOGICAL_GET`, a lateral's included: the visitor has a
+    branch that recurses into a get's child with the comment *"Some LOGICAL_GET operators (e.g., table in
+    out functions) may have a child operator"*.
+  - **The real reason it is off is OURS and was recorded in the C++ months ago** — the header of
+    `fabricator_lateral.cpp` says so: advertising it narrows the get, which would require capturing the
+    callee-original column indices at rewrite time and threading them through as the wire projection,
+    *"where an off-by-one reads a callee column into a correlated column's slot: wrong data, no error."*
+    DuckDB projects above the operator instead, which costs a projection and cannot be wrong.
+  - ⚠ And there is a second cost the note does not mention: `LateralIsEligible` BAILS OUT when
+    `projection_ids` is non-empty (`fabricator_lateral.cpp:757`), so turning the flag on today would
+    silently drop every projected lateral onto the ROW-BY-ROW path — losing the batching the whole feature
+    exists for. Enabling it is therefore two changes, not one.
+  - ⚠ It has nothing to do with `publish`'s obstacle (§18), which is that a lazily projected stream
+    delivers fewer columns than its DECLARED schema and trips the mismatch check. Different mechanism,
+    different surface; the two were conflated here and should not be again.
 - **The input rows as a Fluid VALUE**, as for the collector (§19.9): `{% query %}` over `input_table` does
-  it in one statement today.
+  it in one statement today. **This one is genuinely open.**
 
 ### 22.8 ⚠⚠ THE MUTANT THAT SHOWED THE PROVENANCE ROWS WERE VACUOUS
 
