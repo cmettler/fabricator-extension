@@ -81,24 +81,28 @@ internal static class FluidValueModel
         return o;
     }
 
-    /// <summary>Binds every member of a params bag as a top-level template variable.</summary>
+    /// <summary>Binds the params bag as the single template variable <see cref="BagVariable"/>.</summary>
     /// <param name="ctx">The context to populate.</param>
-    /// <param name="paramsCol">The ANY-declared argument column: a STRUCT, a MAP, a JSON string, or all-null.</param>
+    /// <param name="paramsCol">The ANY-declared argument column: a STRUCT, a MAP, a JSON string, a LIST, a
+    /// scalar, or all-null.</param>
     /// <param name="row">Which row of that column supplies this call's variables.</param>
-    internal static void Bind(TemplateContext ctx, IArrowArray? paramsCol, int row)
-    {
-        foreach (var member in Capture(paramsCol, row))
-        {
-            SetVariable(ctx, member.Key, member.Value);
-        }
-    }
+    internal static void Bind(TemplateContext ctx, IArrowArray? paramsCol, int row) =>
+        SetVariable(ctx, BagVariable, CaptureBag(paramsCol, row));
 
     /// <summary>
-    /// The params bag as PLAIN VALUES — its members under their own names, plus the WHOLE BAG under
-    /// <see cref="BagVariable"/> — so a caller can bind them to a context LATER, after the Arrow batch they
-    /// came from is gone.
+    /// The params bag as a PLAIN VALUE, so a caller can bind it to a context LATER — after the Arrow batch
+    /// it came from is gone.
     /// </summary>
     /// <remarks>
+    /// <para>
+    /// ⚠⚠ <b>ONE VARIABLE, <see cref="BagVariable"/>, AND NOTHING ELSE.</b> A bag's members used to ALSO be
+    /// spread as top-level variables, so <c>params := {'n': 7}</c> bound both <c>{{ n }}</c> and
+    /// <c>{{ params.n }}</c>. The spread is GONE (user decision) and there is no alias: <c>{{ n }}</c> now
+    /// renders empty. One spelling means a member can no longer shadow, or be shadowed by, anything else in
+    /// the template's namespace — an ambient like <c>is_bind</c>, an <c>{% assign %}</c>, or a variable a
+    /// future version introduces. It also removes the question of which of two spellings a reader is
+    /// looking at.
+    /// </para>
     /// <para>
     /// ⚠⚠ <b>Safe to outlive the batch because <see cref="ReadCell"/> is EAGER ALL THE WAY DOWN</b>, which
     /// was checked rather than assumed: a STRUCT materialises through <c>EagerStruct</c>, a MAP through
@@ -108,79 +112,37 @@ internal static class FluidValueModel
     /// the eagerness note on the STRUCT case records.
     /// </para>
     /// <para>
-    /// It exists for <c>fluid_query_batch</c>, whose bind args are gone by the time its groups render, and
-    /// whose context must be per-EXECUTION (a binding is reused across prepared re-executions, so a context
-    /// built at bind would carry one execution's state into the next).
+    /// That matters most for <c>fluid_query_batch</c>, whose bind args are gone by the time its groups
+    /// render, and whose context must be per-EXECUTION (a binding is reused across prepared re-executions,
+    /// so a context built at bind would carry one execution's state into the next).
     /// </para>
     /// </remarks>
-    internal static IReadOnlyList<KeyValuePair<string, object?>> Capture(IArrowArray? paramsCol, int row)
+    internal static object? CaptureBag(IArrowArray? paramsCol, int row)
     {
-        var members = new List<KeyValuePair<string, object?>>();
         if (paramsCol is null or NullArray || row >= paramsCol.Length || paramsCol.IsNull(row))
         {
-            return members;
+            // ⚠ NULL, which SetVariable maps to Liquid's nil — so `{% if params %}` is how a template asks
+            // whether a bag was passed at all, and every `{{ params.x }}` in it renders empty rather than
+            // failing.
+            return null;
         }
-        object? bag;
-        switch (paramsCol)
+        return paramsCol switch
         {
-            case StructArray sa when sa.Data.DataType is StructType st:
-                for (int k = 0; k < st.Fields.Count; k++)
-                {
-                    members.Add(new KeyValuePair<string, object?>(st.Fields[k].Name, ReadCell(sa.Fields[k], row)));
-                }
-                bag = ReadCell(sa, row);
-                break;
-            case StringArray json:
-                var root = ParseParamsJson(json.GetString(row));
-                if (root is JsonObject obj)
-                {
-                    foreach (var kv in obj)
-                    {
-                        // ⚠ A JSON `null` member arrives as a NULL JsonNode rather than a JsonValue holding
-                        // null, so the converter never sees it — SetVariable maps it to Liquid's nil.
-                        members.Add(new KeyValuePair<string, object?>(kv.Key, kv.Value));
-                    }
-                }
-                bag = root;
-                break;
-            case MapArray map:
-                // A MAP spreads its entries the same way a STRUCT's fields do, so `{'a': 1}` and
-                // `MAP {['a'], [1]}` bind identically.
-                // ⚠ The indexable is built here rather than unwrapped from ReadCell's DictionaryValue:
-                // DictionaryValue exposes neither Keys nor TryGetValue publicly.
-                var spread = new ArrowMap(map, row);
-                foreach (var key in spread.Keys)
-                {
-                    if (spread.TryGetValue(key, out var v))
-                    {
-                        members.Add(new KeyValuePair<string, object?>(key, v));
-                    }
-                }
-                bag = new DictionaryValue(spread);
-                break;
-            default:
-                // ⚠⚠ ANY OTHER SHAPE BINDS AS THE BAG AND SPREADS NOTHING — a LIST, a scalar, whatever the
-                // caller passed. Before this, `params := [1,2,3]` matched no case and bound absolutely
-                // nothing, silently: the surface ASSUMED named members. That assumption is what
-                // BagVariable lifts, and it is why an ordinal (`params[0]`) is now expressible at all.
-                // ⚠ An Arrow type ReadCell does not handle still throws, naming the fix — loud where this
-                // path used to be silent.
-                bag = ReadCell(paramsCol, row);
-                break;
-        }
-        // ⚠⚠ THE WHOLE BAG, ALWAYS, AND LAST — so `params` means the bag even when a member is itself
-        // called `params`. Predictability wins over the alternative precedence: a shadowed member is still
-        // reachable as `params.params`, whereas a bag that sometimes is not the bag is unreadable. It is
-        // appended rather than prepended for exactly that reason.
-        members.Add(new KeyValuePair<string, object?>(BagVariable, bag));
-        return members;
+            // ⚠ A JSON string bag is PARSED, not returned as text: a VARCHAR bag IS JSON. Any root is
+            // accepted — object, array or scalar — because the bag no longer has to have members.
+            StringArray json => ParseParamsJson(json.GetString(row)),
+            // ⚠ Everything else goes through ReadCell, which handles STRUCT, MAP, LIST and every scalar,
+            // and THROWS on a type it does not know, naming the fix. A LIST or a scalar used to match no
+            // case at all and bind nothing SILENTLY.
+            _ => ReadCell(paramsCol, row),
+        };
     }
 
     /// <summary>Parses a JSON params bag. ANY root is accepted — object, array or scalar.</summary>
     /// <remarks>
     /// ⚠ It used to REFUSE anything but an object, because members were the only thing a bag could
     /// contribute. With the bag itself bound under <see cref="BagVariable"/> that refusal would reject a
-    /// perfectly usable value: `'[1,2]'` is now `params[0]`, `params.size`, `{% for x in params %}`.
+    /// perfectly usable value: `'[1,2]'` is `params[0]`, `params.size`, `{% for x in params %}`.
     /// Invalid JSON is still an error — a VARCHAR bag IS JSON, and quietly treating unparseable text as a
     /// string would hide a typo in the caller's own JSON.
     /// </remarks>

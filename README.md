@@ -1334,10 +1334,10 @@ configuration. It contributes three global functions, all taking a params bag th
 **`fluid_render(template, params)`** renders a template to **text**:
 
 ```sql
-SELECT fluid_render('Hello {{ name }}, you have {{ n }} messages', {'name':'world','n':3});
+SELECT fluid_render('Hello {{ params.name }}, you have {{ params.n }} messages', {'name':'world','n':3});
 -- Hello world, you have 3 messages
 
-SELECT fluid_render('{% if x > 1 %}big{% else %}small{% endif %}', '{"x":5}');
+SELECT fluid_render('{% if params.x > 1 %}big{% else %}small{% endif %}', '{"x":5}');
 -- big
 ```
 
@@ -1345,12 +1345,12 @@ SELECT fluid_render('{% if x > 1 %}big{% else %}small{% endif %}', '{"x":5}');
 rendered text *is* the statement:
 
 ```sql
-SELECT * FROM fluid_query('SELECT {{ n }} AS n', params := {'n': 7});
+SELECT * FROM fluid_query('SELECT {{ params.n }} AS n', params := {'n': 7});
 -- 7
 
 -- The COLUMN LIST comes from the argument, so the output schema differs per call:
 SELECT * FROM fluid_query(
-  'SELECT {% for c in cols %}{{ c | sql_ident }}{% unless forloop.last %}, {% endunless %}{% endfor %}
+  'SELECT {% for c in params.cols %}{{ c | sql_ident }}{% unless forloop.last %}, {% endunless %}{% endfor %}
    FROM (SELECT 1 AS a, 2 AS b, 3 AS c)',
   params := {'cols': ['a','c']});
 -- a=1, c=3
@@ -1372,19 +1372,23 @@ also means the generator runs during binding, repeatedly and without executing a
 > Both are allow-lists: a value with no provably safe rendering is refused by name rather than interpolated.
 >
 > ```sql
-> SELECT * FROM fluid_query('SELECT {{ v | sql }} AS v', params := {'v': 'O''Brien'});
+> SELECT * FROM fluid_query('SELECT {{ params.v | sql }} AS v', params := {'v': 'O''Brien'});
 > -- O'Brien   (not a syntax error, and not an injection)
 > ```
 
-**The bag is also bound WHOLE, under the name `params`.** A struct's or map's members still become
-top-level variables — `{{ n }}` — and the same value is reachable as `{{ params.n }}`, `{{ params[0] }}`
-and `{{ params.size }}`:
+**The bag is bound WHOLE, under the name `params`** — `{{ params.n }}`, `{{ params[0] }}`,
+`{{ params.size }}`:
 
 ```sql
-SELECT fluid_render('spread={{ n }} dot={{ params.n }} ord={{ params[0] }} size={{ params.size }}',
-                    {'n': 7, 'z': 9});
--- spread=7 dot=7 ord=7 size=2
+SELECT fluid_render('dot={{ params.n }} ord={{ params[0] }} size={{ params.size }}', {'n': 7, 'z': 9});
+-- dot=7 ord=7 size=2
 ```
+
+> ⚠⚠ **BREAKING (0.0.14): a bag's members are no longer ALSO bound as bare variables.** `{{ n }}` used to
+> work alongside `{{ params.n }}` and now renders empty; there is no alias. One spelling means a member can
+> no longer shadow, or be shadowed by, anything else in the template's namespace. **Rewrite `{{ x }}` as
+> `{{ params.x }}`** — including inside `{% if %}`, `{% for %}` and block-tag arguments
+> (`{% query r xs: params.v %}`).
 
 That is what makes a bag with no named members usable at all — a JSON array, a DuckDB `LIST`, or a bare
 scalar:
@@ -1462,7 +1466,7 @@ DuckDB, naming it.
 
 ```sql
 SELECT fluid_render(
-  '{% query r xs: v %}SELECT count(*) AS n FROM orders WHERE region IN (SELECT unnest($xs))
+  '{% query r xs: params.v %}SELECT count(*) AS n FROM orders WHERE region IN (SELECT unnest($xs))
    {% endquery %}{{ r[0].n }}', {v: ['eu','us']});
 ```
 
@@ -1474,7 +1478,7 @@ shape they all share is text and turning `5` into `'5'` would quietly change wha
 
 ```sql
 SELECT fluid_render(
-  '{% query rows xs: people %}SELECT string_agg(u.label, '','') AS s
+  '{% query rows xs: params.people %}SELECT string_agg(u.label, '','') AS s
    FROM (SELECT unnest($xs) AS u){% endquery %}{{ rows[0].s }}',
   {people: [{'label':'a'}, {'label':'b'}]});
 -- a,b
@@ -1609,7 +1613,7 @@ Because the block is a *statement* rather than an argument, it is naturally cond
 `{% exec %}` runs nothing:
 
 ```sql
-SELECT fluid_render('{% if go %}{% exec %}DELETE FROM staging{% endexec %}cleared{% else %}skipped{% endif %}', {'go': false});
+SELECT fluid_render('{% if params.go %}{% exec %}DELETE FROM staging{% endexec %}cleared{% else %}skipped{% endif %}', {'go': false});
 -- skipped       (and nothing was deleted)
 ```
 

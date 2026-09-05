@@ -83,19 +83,19 @@ ATTACH 'x' AS f (TYPE fabricator, PROVIDER 'nosuchprovider');
 
 # Basic render: Liquid substitution from a JSON params bag.
 query I
-SELECT fluid_render('Hello {{ name }}, you have {{ n }} messages', '{"name":"world","n":3}');
+SELECT fluid_render('Hello {{ params.name }}, you have {{ params.n }} messages', '{"name":"world","n":3}');
 ----
 Hello world, you have 3 messages
 
 # params as a DuckDB STRUCT (type-safe, no quoting) — the SQLNULL->ANY sentinel lets the same fn accept it.
 query I
-SELECT fluid_render('Hello {{ name }}, you have {{ n }} messages', {'name':'world','n':3});
+SELECT fluid_render('Hello {{ params.name }}, you have {{ params.n }} messages', {'name':'world','n':3});
 ----
 Hello world, you have 3 messages
 
 # STRUCT params vectorized over rows (each row's struct supplies that row's variables).
 query I
-SELECT fluid_render('id={{ id }}', {'id': i}) AS r FROM range(3) t(i) ORDER BY r;
+SELECT fluid_render('id={{ params.id }}', {'id': i}) AS r FROM range(3) t(i) ORDER BY r;
 ----
 id=0
 id=1
@@ -111,13 +111,13 @@ row 2
 
 # Liquid control flow (if/else) — proves it's a real template engine, not just substitution.
 query I
-SELECT fluid_render('{% if x > 1 %}big{% else %}small{% endif %}', '{"x":5}');
+SELECT fluid_render('{% if params.x > 1 %}big{% else %}small{% endif %}', '{"x":5}');
 ----
 big
 
 # Liquid loop over a JSON array param.
 query I
-SELECT fluid_render('{% for i in items %}{{ i }};{% endfor %}', '{"items":[1,2,3]}');
+SELECT fluid_render('{% for i in params.items %}{{ i }};{% endfor %}', '{"items":[1,2,3]}');
 ----
 1;2;3;
 
@@ -135,7 +135,7 @@ static text
 
 # Composes with a normal query (no catalog dependency): a per-row JSON params string.
 query I
-SELECT fluid_render('id={{ id }}', '{"id":' || i::VARCHAR || '}') AS r FROM range(2) t(i) ORDER BY i;
+SELECT fluid_render('id={{ params.id }}', '{"id":' || i::VARCHAR || '}') AS r FROM range(2) t(i) ORDER BY i;
 ----
 id=0
 id=1
@@ -149,7 +149,7 @@ id=1
 # cast. ⚠ verify_global_functions keeps a VARARGS-tail twin of this assertion, so the crossing stays covered
 # in the hermetic tier where no plugin is loaded.
 query I
-SELECT fluid_render('x{{ a }}', NULL);
+SELECT fluid_render('x{{ params.a }}', NULL);
 ----
 x
 
@@ -165,18 +165,18 @@ x
 # The brackets are load-bearing: an empty render and a NULL result are both "nothing" in a bare query.
 
 query I
-SELECT '[' || fluid_render('{{ a }}', {'a': NULL::VARCHAR}) || ']';
+SELECT '[' || fluid_render('{{ params.a }}', {'a': NULL::VARCHAR}) || ']';
 ----
 []
 
 query I
-SELECT '[' || fluid_render('{{ a }}', '{"a":null}') || ']';
+SELECT '[' || fluid_render('{{ params.a }}', '{"a":null}') || ']';
 ----
 []
 
 # nil is FALSY, not merely empty — the property a template branching on an optional value depends on.
 query I
-SELECT fluid_render('{% if a %}set{% else %}nil{% endif %}', {'a': NULL::BIGINT});
+SELECT fluid_render('{% if params.a %}set{% else %}nil{% endif %}', {'a': NULL::BIGINT});
 ----
 nil
 
@@ -221,12 +221,12 @@ SELECT * FROM fluid_query('SELECT 1 AS a, ''x'' AS b');
 1	x
 
 query I
-SELECT * FROM fluid_query('SELECT {{ n }} AS n', params := {'n': 7});
+SELECT * FROM fluid_query('SELECT {{ params.n }} AS n', params := {'n': 7});
 ----
 7
 
 query I
-SELECT * FROM fluid_query('SELECT {% if big %}999{% else %}1{% endif %} AS v', params := '{"big":true}');
+SELECT * FROM fluid_query('SELECT {% if params.big %}999{% else %}1{% endif %} AS v', params := '{"big":true}');
 ----
 999
 
@@ -244,14 +244,14 @@ SELECT * FROM fluid_query('SELECT 1 AS v', params := NULL);
 
 query II
 SELECT * FROM fluid_query(
-  'SELECT {% for c in cols %}{{ c | sql_ident }}{% unless forloop.last %}, {% endunless %}{% endfor %} FROM (SELECT 1 AS a, 2 AS b, 3 AS c)',
+  'SELECT {% for c in params.cols %}{{ c | sql_ident }}{% unless forloop.last %}, {% endunless %}{% endfor %} FROM (SELECT 1 AS a, 2 AS b, 3 AS c)',
   params := {'cols': ['a','c']});
 ----
 1	3
 
 query I
 SELECT count(*) FROM (DESCRIBE SELECT * FROM fluid_query(
-  'SELECT {% for c in cols %}{{ c | sql_ident }}{% unless forloop.last %}, {% endunless %}{% endfor %} FROM (SELECT 1 AS a, 2 AS b, 3 AS c)',
+  'SELECT {% for c in params.cols %}{{ c | sql_ident }}{% unless forloop.last %}, {% endunless %}{% endfor %} FROM (SELECT 1 AS a, 2 AS b, 3 AS c)',
   params := {'cols': ['a','b','c']}));
 ----
 3
@@ -270,33 +270,33 @@ SELECT count(*) FROM (DESCRIBE SELECT * FROM fluid_query(
 # ============================================================================================
 
 query I
-SELECT * FROM fluid_query('SELECT {% if n > 5 %}''big''{% else %}''small''{% endif %} AS c', params := '{"n":7}');
+SELECT * FROM fluid_query('SELECT {% if params.n > 5 %}''big''{% else %}''small''{% endif %} AS c', params := '{"n":7}');
 ----
 big
 
 query I
-SELECT * FROM fluid_query('SELECT {{ n | plus: 1 }} AS v', params := '{"n":41}');
+SELECT * FROM fluid_query('SELECT {{ params.n | plus: 1 }} AS v', params := '{"n":41}');
 ----
 42
 
 query III
-SELECT fluid_render('{% if n > 1 %}big{% else %}small{% endif %}', '{"n":3}') AS cmp,
-       fluid_render('{{ n | plus: 1 }}', '{"n":19.99}')                       AS arith,
-       fluid_render('{% if s == "x" %}y{% else %}n{% endif %}', '{"s":"x"}')  AS streq;
+SELECT fluid_render('{% if params.n > 1 %}big{% else %}small{% endif %}', '{"n":3}') AS cmp,
+       fluid_render('{{ params.n | plus: 1 }}', '{"n":19.99}')                       AS arith,
+       fluid_render('{% if params.s == "x" %}y{% else %}n{% endif %}', '{"s":"x"}')  AS streq;
 ----
 big	20.99	y
 
 # The same three through an Arrow STRUCT rather than JSON — a different code path to the same value model.
 query III
-SELECT fluid_render('{% if n > 1 %}big{% else %}small{% endif %}', {'n': 3}) AS cmp,
-       fluid_render('{{ n | plus: 1 }}', {'n': 19.99::DECIMAL(10,2)})        AS arith,
-       fluid_render('{% if s == "x" %}y{% else %}n{% endif %}', {'s': 'x'})  AS streq;
+SELECT fluid_render('{% if params.n > 1 %}big{% else %}small{% endif %}', {'n': 3}) AS cmp,
+       fluid_render('{{ params.n | plus: 1 }}', {'n': 19.99::DECIMAL(10,2)})        AS arith,
+       fluid_render('{% if params.s == "x" %}y{% else %}n{% endif %}', {'s': 'x'})  AS streq;
 ----
 big	20.99	y
 
 # Comparison THROUGH a nested Arrow struct — the nested reader must produce a real number too, not a string.
 query I
-SELECT fluid_render('{% if o.deep > 40 %}y{% else %}n{% endif %}', {'o': {'deep': 42}});
+SELECT fluid_render('{% if params.o.deep > 40 %}y{% else %}n{% endif %}', {'o': {'deep': 42}});
 ----
 y
 
@@ -312,10 +312,10 @@ y
 # ============================================================================================
 
 query IIII
-SELECT fluid_render('{{ n }}', '{"n":9007199254740993}')             AS json_bigint,
-       fluid_render('{{ n }}', {'n': 9007199254740993::BIGINT})      AS struct_bigint,
-       fluid_render('{{ n }}', '{"n":19.99}')                        AS money,
-       fluid_render('{{ n }}', '{"n":0}')                            AS zero;
+SELECT fluid_render('{{ params.n }}', '{"n":9007199254740993}')             AS json_bigint,
+       fluid_render('{{ params.n }}', {'n': 9007199254740993::BIGINT})      AS struct_bigint,
+       fluid_render('{{ params.n }}', '{"n":19.99}')                        AS money,
+       fluid_render('{{ params.n }}', '{"n":0}')                            AS zero;
 ----
 9007199254740993	9007199254740993	19.99	0
 
@@ -323,7 +323,7 @@ SELECT fluid_render('{{ n }}', '{"n":9007199254740993}')             AS json_big
 # preserves a JSON number's written form, so `3.0` renders `3.0` where a double rendered `3`. In a function
 # whose output is SQL that is the better answer (the literal keeps its type), but it IS a change.
 query I
-SELECT fluid_render('{{ n }}', '{"n":3.0}');
+SELECT fluid_render('{{ params.n }}', '{"n":3.0}');
 ----
 3.0
 
@@ -334,18 +334,18 @@ SELECT fluid_render('{{ n }}', '{"n":3.0}');
 # just above is the POSITIVE CONTROL: a real 0 must still render, or this check would be refusing everything.
 
 statement error
-SELECT fluid_render('{{ n }}', '{"n":1e100}');
+SELECT fluid_render('{{ params.n }}', '{"n":1e100}');
 ----
 <REGEX>:.*cannot be represented in a template.*
 
 statement error
-SELECT fluid_render('{{ n }}', '{"n":1e-30}');
+SELECT fluid_render('{{ params.n }}', '{"n":1e-30}');
 ----
 <REGEX>:.*cannot be represented in a template.*
 
 # The same refusal on the ARROW path, so a DuckDB DOUBLE cannot smuggle it past the JSON check.
 statement error
-SELECT fluid_render('{{ n }}', {'n': 1e100::DOUBLE});
+SELECT fluid_render('{{ params.n }}', {'n': 1e100::DOUBLE});
 ----
 <REGEX>:.*cannot be represented in a template.*
 
@@ -359,24 +359,24 @@ SELECT fluid_render('{{ n }}', {'n': 1e100::DOUBLE});
 # ============================================================================================
 
 query I
-SELECT * FROM fluid_query('SELECT {{ v | sql }} AS v', params := {'v': 'O''Brien'});
+SELECT * FROM fluid_query('SELECT {{ params.v | sql }} AS v', params := {'v': 'O''Brien'});
 ----
 O'Brien
 
 # A quote in an IDENTIFIER, likewise doubled rather than breaking the statement.
 query I
-SELECT column_name FROM (DESCRIBE SELECT * FROM fluid_query('SELECT 1 AS {{ n | sql_ident }}', params := {'n': 'we"ird'}));
+SELECT column_name FROM (DESCRIBE SELECT * FROM fluid_query('SELECT 1 AS {{ params.n | sql_ident }}', params := {'n': 'we"ird'}));
 ----
 we"ird
 
 # nil renders as SQL NULL, not as the empty string (which would be a syntax error, or worse, '').
 query I
-SELECT * FROM fluid_query('SELECT {{ v | sql }} AS v', params := {'v': NULL::VARCHAR});
+SELECT * FROM fluid_query('SELECT {{ params.v | sql }} AS v', params := {'v': NULL::VARCHAR});
 ----
 NULL
 
 statement error
-SELECT * FROM fluid_query('SELECT {{ v | sql }}', params := {'v': [1,2]});
+SELECT * FROM fluid_query('SELECT {{ params.v | sql }}', params := {'v': [1,2]});
 ----
 <REGEX>:.*cannot render a.*as a SQL literal.*
 
@@ -392,19 +392,19 @@ CREATE TABLE fq_t AS SELECT i AS id, i%7 AS g, 'v'||i AS v FROM range(1000) s(i)
 
 # Projection AND filter reach the base table; `fluid_query` appears nowhere.
 query II
-EXPLAIN SELECT id FROM fluid_query('SELECT * FROM fq_t WHERE g = {{ g }}', params := {'g': 3});
+EXPLAIN SELECT id FROM fluid_query('SELECT * FROM fq_t WHERE g = {{ params.g }}', params := {'g': 3});
 ----
 physical_plan	<REGEX>:.*SEQ_SCAN.*fq_t.*Projections: id.*Filters: g=3.*
 
 query I
-SELECT count(*) FROM fluid_query('SELECT * FROM fq_t WHERE g = {{ g }}', params := {'g': 3});
+SELECT count(*) FROM fluid_query('SELECT * FROM fq_t WHERE g = {{ params.g }}', params := {'g': 3});
 ----
 143
 
 # A VIEW over it re-binds on every use — the generator's contract is "deterministic and side-effect free,
 # because binds repeat and happen without execution".
 statement ok
-CREATE VIEW fq_v AS SELECT * FROM fluid_query('SELECT id FROM fq_t WHERE g = {{ g }}', params := {'g': 5});
+CREATE VIEW fq_v AS SELECT * FROM fluid_query('SELECT id FROM fq_t WHERE g = {{ params.g }}', params := {'g': 5});
 
 query I
 SELECT count(*) FROM fq_v;
@@ -424,13 +424,13 @@ SELECT count(*) FROM fq_v;
 # ============================================================================================
 
 query I
-SELECT fluid_render('{{ a }}-{{ b }}', MAP {'a': 'one', 'b': 'two'});
+SELECT fluid_render('{{ params.a }}-{{ params.b }}', MAP {'a': 'one', 'b': 'two'});
 ----
 one-two
 
 # Nested struct, nested list, list indexing and .size, all from one Arrow bag.
 query I
-SELECT fluid_render('{{ o.deep }}|{% for t in tags %}{{ t }};{% endfor %}|{{ tags[1] }}|{{ tags.size }}',
+SELECT fluid_render('{{ params.o.deep }}|{% for t in params.tags %}{{ t }};{% endfor %}|{{ params.tags[1] }}|{{ params.tags.size }}',
                          {'o': {'deep': 42}, 'tags': ['a','b','c']});
 ----
 42|a;b;c;|b|3
@@ -439,7 +439,7 @@ SELECT fluid_render('{{ o.deep }}|{% for t in tags %}{{ t }};{% endfor %}|{{ tag
 # the indexable for the KEY "0", so an int-parse fallback IS index access — it is not a second mechanism. A
 # member genuinely NAMED "0" therefore wins, which is the right precedence.
 query I
-SELECT fluid_render('{{ p[0] }}/{{ p[1] }}', {'p': {'x': 1, 'y': 2}});
+SELECT fluid_render('{{ params.p[0] }}/{{ params.p[1] }}', {'p': {'x': 1, 'y': 2}});
 ----
 1/2
 
@@ -466,7 +466,7 @@ SELECT * FROM fluid_query('   ');
 # ============================================================================================
 
 statement ok
-PREPARE fq_p AS SELECT * FROM fluid_query('SELECT {{ n }} AS n', params := ?);
+PREPARE fq_p AS SELECT * FROM fluid_query('SELECT {{ params.n }} AS n', params := ?);
 
 query I
 EXECUTE fq_p({'n': 1});
@@ -485,7 +485,7 @@ EXECUTE fq_p({'n': 2});
 # Here the re-bind re-renders the template, so the column LIST is whatever this EXECUTE's bag says.
 statement ok
 PREPARE fq_pc AS SELECT * FROM fluid_query(
-  'SELECT {% for c in cols %}{{ c | sql_ident }}{% unless forloop.last %}, {% endunless %}{% endfor %} FROM (SELECT 1 AS a, 2 AS b, 3 AS c)',
+  'SELECT {% for c in params.cols %}{{ c | sql_ident }}{% unless forloop.last %}, {% endunless %}{% endfor %} FROM (SELECT 1 AS a, 2 AS b, 3 AS c)',
   params := ?);
 
 query I
@@ -505,7 +505,7 @@ SET VARIABLE fq_cols = ['a','c'];
 
 query II
 SELECT * FROM fluid_query(
-  'SELECT {% for c in cols %}{{ c | sql_ident }}{% unless forloop.last %}, {% endunless %}{% endfor %} FROM (SELECT 1 AS a, 2 AS b, 3 AS c)',
+  'SELECT {% for c in params.cols %}{{ c | sql_ident }}{% unless forloop.last %}, {% endunless %}{% endfor %} FROM (SELECT 1 AS a, 2 AS b, 3 AS c)',
   params := {'cols': getvariable('fq_cols')});
 ----
 1	3
@@ -528,19 +528,19 @@ SELECT * FROM fluid_query(
 # ============================================================================================
 
 query I
-SELECT fluid_render('{{ d }}', {'d': DATE '2026-09-01'});
+SELECT fluid_render('{{ params.d }}', {'d': DATE '2026-09-01'});
 ----
 2026-09-01 00:00:00Z
 
 # A wall-clock TIMESTAMP is not shifted either — it was already right (ReadTimestamp stamps it UTC), and
 # this is the CONTROL that says the date fix did not achieve its result by shifting everything else.
 query I
-SELECT fluid_render('{{ t }}', {'t': TIMESTAMP '2026-09-01 12:34:56'});
+SELECT fluid_render('{{ params.t }}', {'t': TIMESTAMP '2026-09-01 12:34:56'});
 ----
 2026-09-01 12:34:56Z
 
 query I
-SELECT fluid_render('{{ t }}', {'t': TIMESTAMPTZ '2026-09-01 12:34:56+00'});
+SELECT fluid_render('{{ params.t }}', {'t': TIMESTAMPTZ '2026-09-01 12:34:56+00'});
 ----
 2026-09-01 12:34:56Z
 
@@ -551,7 +551,7 @@ SELECT fluid_render('{{ t }}', {'t': TIMESTAMPTZ '2026-09-01 12:34:56+00'});
 # the ELSE branch silently — the same failure class as §the value-model header, but this one is Fluid's and
 # not something the value model can fix without making a date stop being a date.
 query I
-SELECT fluid_render('{% if a > b %}later{% else %}earlier{% endif %}',
+SELECT fluid_render('{% if params.a > params.b %}later{% else %}earlier{% endif %}',
                          {'a': DATE '2026-09-02', 'b': DATE '2026-09-01'});
 ----
 earlier
@@ -560,7 +560,7 @@ earlier
 # compare the strings. ISO-8601 sorts lexicographically, verified across a year boundary.
 query I
 SELECT fluid_render(
-  '{% assign x = a | date: "%Y-%m-%d" %}{% assign y = b | date: "%Y-%m-%d" %}{% if x > y %}later{% else %}earlier{% endif %}',
+  '{% assign x = params.a | date: "%Y-%m-%d" %}{% assign y = params.b | date: "%Y-%m-%d" %}{% if x > y %}later{% else %}earlier{% endif %}',
   {'a': DATE '2027-01-01', 'b': DATE '2026-12-31'});
 ----
 later
@@ -572,13 +572,13 @@ later
 # ⚠ Asserted by TYPE and by INSTANT rather than by rendered text: a TIMESTAMPTZ's display form depends on
 # the session timezone, so pinning the string would make this suite report the runner's locale.
 query I
-SELECT typeof(raw) FROM fluid_query('SELECT {{ d | sql }} AS raw', params := {'d': DATE '2026-09-01'});
+SELECT typeof(raw) FROM fluid_query('SELECT {{ params.d | sql }} AS raw', params := {'d': DATE '2026-09-01'});
 ----
 TIMESTAMP WITH TIME ZONE
 
 query I
 SELECT raw = TIMESTAMPTZ '2026-09-01 00:00:00+00'
-FROM fluid_query('SELECT {{ d | sql }} AS raw', params := {'d': DATE '2026-09-01'});
+FROM fluid_query('SELECT {{ params.d | sql }} AS raw', params := {'d': DATE '2026-09-01'});
 ----
 true
 
@@ -640,19 +640,19 @@ SET TimeZone = 'America/New_York';
 # ⚠ THE SILENT WRONG DAY, asserted as the value it actually produces. Pinning the truth is what makes this
 # a warning to a reader rather than a wish, and it is where a future DuckDB change would surface.
 query I
-SELECT * FROM fluid_query('SELECT {{ d | sql }}::DATE AS d', params := {'d': DATE '2026-09-01'});
+SELECT * FROM fluid_query('SELECT {{ params.d | sql }}::DATE AS d', params := {'d': DATE '2026-09-01'});
 ----
 2026-08-31
 
 query I
-SELECT * FROM fluid_query('SELECT strftime({{ d | sql }}, ''%Y-%m-%d'') AS d', params := {'d': DATE '2026-09-01'});
+SELECT * FROM fluid_query('SELECT strftime({{ params.d | sql }}, ''%Y-%m-%d'') AS d', params := {'d': DATE '2026-09-01'});
 ----
 2026-08-31
 
 # ---- SAFE ROUTE 1: name the timezone. Works for a genuine TIMESTAMP too, and preserves the instant. ----
 
 query I
-SELECT * FROM fluid_query('SELECT ({{ d | sql }} AT TIME ZONE ''UTC'')::DATE AS d',
+SELECT * FROM fluid_query('SELECT ({{ params.d | sql }} AT TIME ZONE ''UTC'')::DATE AS d',
                           params := {'d': DATE '2026-09-01'});
 ----
 2026-09-01
@@ -663,13 +663,13 @@ SELECT * FROM fluid_query('SELECT ({{ d | sql }} AT TIME ZONE ''UTC'')::DATE AS 
 # it needs no ICU.
 
 query I
-SELECT typeof(d) FROM fluid_query('SELECT {{ d | date: "%Y-%m-%d" | sql }}::DATE AS d',
+SELECT typeof(d) FROM fluid_query('SELECT {{ params.d | date: "%Y-%m-%d" | sql }}::DATE AS d',
                                   params := {'d': DATE '2026-09-01'});
 ----
 DATE
 
 query I
-SELECT * FROM fluid_query('SELECT {{ d | date: "%Y-%m-%d" | sql }}::DATE AS d',
+SELECT * FROM fluid_query('SELECT {{ params.d | date: "%Y-%m-%d" | sql }}::DATE AS d',
                           params := {'d': DATE '2026-09-01'});
 ----
 2026-09-01
@@ -685,7 +685,7 @@ SET TimeZone = 'UTC';
 # concatenated decimal bytes — `'ab'::BLOB` came out as `9798`, which looks like a number and is useless.
 # Hex is lossless, readable, and compares as a string.
 query I
-SELECT fluid_render('{{ b }}', {'b': 'ab'::BLOB});
+SELECT fluid_render('{{ params.b }}', {'b': 'ab'::BLOB});
 ----
 6162
 
@@ -1099,13 +1099,13 @@ statement ok
 COPY (SELECT 1 AS c) TO '${FABRICATOR_DELTA_WRITE_DIR}/tpl' (FORMAT csv, PER_THREAD_OUTPUT true, HEADER false);
 
 statement ok
-COPY (SELECT 'hi {{ who }}' AS c) TO '${FABRICATOR_DELTA_WRITE_DIR}/tpl/hello.liquid' (FORMAT csv, HEADER false, QUOTE '');
+COPY (SELECT 'hi {{ params.who }}' AS c) TO '${FABRICATOR_DELTA_WRITE_DIR}/tpl/hello.liquid' (FORMAT csv, HEADER false, QUOTE '');
 
 statement ok
 COPY (SELECT 'outer[{% include ''hello'' %}]' AS c) TO '${FABRICATOR_DELTA_WRITE_DIR}/tpl/outer.liquid' (FORMAT csv, HEADER false, QUOTE '');
 
 statement ok
-COPY (SELECT 'SELECT {{ n }} AS n' AS c) TO '${FABRICATOR_DELTA_WRITE_DIR}/tpl/frag.liquid' (FORMAT csv, HEADER false, QUOTE '');
+COPY (SELECT 'SELECT {{ params.n }} AS n' AS c) TO '${FABRICATOR_DELTA_WRITE_DIR}/tpl/frag.liquid' (FORMAT csv, HEADER false, QUOTE '');
 
 statement ok
 COPY (SELECT 'BARE' AS c) TO '${FABRICATOR_DELTA_WRITE_DIR}/tpl/both' (FORMAT csv, HEADER false, QUOTE '');
@@ -1680,7 +1680,7 @@ Table with name scratch does not exist
 # own temporary catalog. The VALUES also differ, so a build that somehow shared one table would
 # have to return the wrong number rather than merely not erroring.
 query I
-SELECT fluid_render('{% assign ddl = "CREATE TEMP TABLE perrow AS SELECT " | append: n | append: " AS v" %}{% assign _ = exec(ddl) %}{% assign r = query("SELECT v FROM perrow") %}{{ r[0].v }}', {'n': n}) FROM (VALUES (10), (20), (30)) t(n);
+SELECT fluid_render('{% assign ddl = "CREATE TEMP TABLE perrow AS SELECT " | append: params.n | append: " AS v" %}{% assign _ = exec(ddl) %}{% assign r = query("SELECT v FROM perrow") %}{{ r[0].v }}', {'n': n}) FROM (VALUES (10), (20), (30)) t(n);
 ----
 10
 20
@@ -1791,7 +1791,7 @@ CREATE TABLE blk(id INTEGER, name VARCHAR);
 query I
 SELECT '[' || fluid_render('{% exec %}
 INSERT INTO blk VALUES
-{% for r in rows %}({{ r.id }}, {{ r.name | sql }}){% unless forloop.last %},{% endunless %}
+{% for r in params.rows %}({{ r.id }}, {{ r.name | sql }}){% unless forloop.last %},{% endunless %}
 {% endfor %}
 {% endexec %}done', {'rows': [{'id': 1, 'name': 'a'}, {'id': 2, 'name': 'O''Brien'}]}) || ']';
 ----
@@ -1824,7 +1824,7 @@ SELECT * FROM fluid_query('{% exec %}CREATE TEMP TABLE blk_q AS SELECT 4 AS a UN
 # ⚠ An unreached block runs nothing: the tag is a statement in the tree, not an argument that
 # had to be evaluated to build the call.
 query I
-SELECT fluid_render('{% if go %}{% exec %}CREATE TEMP TABLE blk_c AS SELECT 1{% endexec %}ran{% else %}skipped{% endif %}', {'go': false});
+SELECT fluid_render('{% if params.go %}{% exec %}CREATE TEMP TABLE blk_c AS SELECT 1{% endexec %}ran{% else %}skipped{% endif %}', {'go': false});
 ----
 skipped
 
@@ -1850,7 +1850,7 @@ SELECT count(*) FROM blk_brk;
 # names and whole fragments, so `{{ x }}` cannot escape. The failure mode is a PARSER ERROR
 # rather than a silent injection, which is the safe direction but not a substitute for `| sql`.
 statement error
-SELECT fluid_render('{% exec %}INSERT INTO blk VALUES (9, {{ v }}){% endexec %}ok', {'v': 'O''Brien'});
+SELECT fluid_render('{% exec %}INSERT INTO blk VALUES (9, {{ params.v }}){% endexec %}ok', {'v': 'O''Brien'});
 ----
 unterminated quoted string
 
@@ -1983,7 +1983,7 @@ endquery
 # `| sql` remains what you need for an object NAME or a whole fragment. Gated with a quote,
 # which is where raw splicing breaks.
 query I
-SELECT fluid_render('{% query r %}SELECT {{ v | sql }} AS s{% endquery %}s={{ r[0].s }}', {'v': 'O''Brien'});
+SELECT fluid_render('{% query r %}SELECT {{ params.v | sql }} AS s{% endquery %}s={{ r[0].s }}', {'v': 'O''Brien'});
 ----
 s=O'Brien
 
@@ -2020,12 +2020,12 @@ v=5
 # parameter never arrived at all. The control proves the parameter IS being used, and splicing
 # would answer 3 rather than 0.
 query I
-SELECT fluid_render('{% query t region: r %}SELECT count(*) AS n FROM (VALUES (''eu''),(''us''),(''eu'')) v(x) WHERE x = $region{% endquery %}n={{ t[0].n }}', {'r': 'eu'' OR 1=1 --'});
+SELECT fluid_render('{% query t region: params.r %}SELECT count(*) AS n FROM (VALUES (''eu''),(''us''),(''eu'')) v(x) WHERE x = $region{% endquery %}n={{ t[0].n }}', {'r': 'eu'' OR 1=1 --'});
 ----
 n=0
 
 query I
-SELECT fluid_render('{% query t region: r %}SELECT count(*) AS n FROM (VALUES (''eu''),(''us''),(''eu'')) v(x) WHERE x = $region{% endquery %}n={{ t[0].n }}', {'r': 'eu'});
+SELECT fluid_render('{% query t region: params.r %}SELECT count(*) AS n FROM (VALUES (''eu''),(''us''),(''eu'')) v(x) WHERE x = $region{% endquery %}n={{ t[0].n }}', {'r': 'eu'});
 ----
 n=2
 
@@ -2082,7 +2082,7 @@ Invalid query tag
 
 # --- the shape this was asked for ---
 query I
-SELECT fluid_render('{% query r xs: v %}SELECT a: unnest($xs){% endquery %}{% for x in r %}{{ x.a }} {% endfor %}', {v: [1,2,3,4,5]});
+SELECT fluid_render('{% query r xs: params.v %}SELECT a: unnest($xs){% endquery %}{% for x in r %}{{ x.a }} {% endfor %}', {v: [1,2,3,4,5]});
 ----
 1 2 3 4 5 
 
@@ -2090,24 +2090,24 @@ SELECT fluid_render('{% query r xs: v %}SELECT a: unnest($xs){% endquery %}{% fo
 # The first row alone is worthless — `n=0` is equally true of a build where the parameter never
 # arrived. The control proves it IS being used, and splicing would answer 2 rather than 0.
 query I
-SELECT fluid_render('{% query r xs: v %}SELECT count(*) AS n FROM (VALUES (''eu''),(''us'')) t(x) WHERE x IN (SELECT unnest($xs)){% endquery %}n={{ r[0].n }}', {v: ['eu'' OR 1=1 --']});
+SELECT fluid_render('{% query r xs: params.v %}SELECT count(*) AS n FROM (VALUES (''eu''),(''us'')) t(x) WHERE x IN (SELECT unnest($xs)){% endquery %}n={{ r[0].n }}', {v: ['eu'' OR 1=1 --']});
 ----
 n=0
 
 query I
-SELECT fluid_render('{% query r xs: v %}SELECT count(*) AS n FROM (VALUES (''eu''),(''us''),(''eu'')) t(x) WHERE x IN (SELECT unnest($xs)){% endquery %}n={{ r[0].n }}', {v: ['eu','xx']});
+SELECT fluid_render('{% query r xs: params.v %}SELECT count(*) AS n FROM (VALUES (''eu''),(''us''),(''eu'')) t(x) WHERE x IN (SELECT unnest($xs)){% endquery %}n={{ r[0].n }}', {v: ['eu','xx']});
 ----
 n=2
 
 # --- the int64 -> decimal ladder is decided over the WHOLE list, and keeps scale ---
 query I
-SELECT fluid_render('{% query r xs: v %}SELECT sum(u)::VARCHAR AS s FROM (SELECT unnest($xs) AS u){% endquery %}s={{ r[0].s }}', {v: [19.99, 0.01]});
+SELECT fluid_render('{% query r xs: params.v %}SELECT sum(u)::VARCHAR AS s FROM (SELECT unnest($xs) AS u){% endquery %}s={{ r[0].s }}', {v: [19.99, 0.01]});
 ----
 s=20.00
 
 # --- booleans ---
 query I
-SELECT fluid_render('{% query r xs: v %}SELECT count(*) FILTER (WHERE u) AS n FROM (SELECT unnest($xs) AS u){% endquery %}n={{ r[0].n }}', {v: [true,false,true]});
+SELECT fluid_render('{% query r xs: params.v %}SELECT count(*) FILTER (WHERE u) AS n FROM (SELECT unnest($xs) AS u){% endquery %}n={{ r[0].n }}', {v: [true,false,true]});
 ----
 n=2
 
@@ -2120,27 +2120,27 @@ n=2
 # ⚠ Asserted as an INSTANT (epoch seconds), never as rendered text: a TIMESTAMPTZ renders in the
 # session's zone, so pinning the string would assert the runner's locale instead of the value.
 query I
-SELECT fluid_render('{% query r xs: v %}SELECT epoch(min(u))::BIGINT AS e FROM (SELECT unnest($xs) AS u){% endquery %}e={{ r[0].e }}', {v: [DATE '2024-03-01', DATE '2023-01-02']});
+SELECT fluid_render('{% query r xs: params.v %}SELECT epoch(min(u))::BIGINT AS e FROM (SELECT unnest($xs) AS u){% endquery %}e={{ r[0].e }}', {v: [DATE '2024-03-01', DATE '2023-01-02']});
 ----
 e=1672617600
 
 # --- NULL elements carry no kind, so they mix with a typed list ---
 query I
-SELECT fluid_render('{% query r xs: v %}SELECT count(u) AS nn, count(*) AS tot FROM (SELECT unnest($xs) AS u){% endquery %}nn={{ r[0].nn }} tot={{ r[0].tot }}', {v: [1,NULL,3]});
+SELECT fluid_render('{% query r xs: params.v %}SELECT count(u) AS nn, count(*) AS tot FROM (SELECT unnest($xs) AS u){% endquery %}nn={{ r[0].nn }} tot={{ r[0].tot }}', {v: [1,NULL,3]});
 ----
 nn=2 tot=3
 
 # --- an EMPTY list has no element kind to read off; VARCHAR is the same choice the scalar NULL
 # case makes, and `unnest` of it yields no rows whatever the type ---
 query I
-SELECT fluid_render('{% query r xs: v %}SELECT count(*) AS n FROM (SELECT unnest($xs) AS u){% endquery %}n={{ r[0].n }}', {v: []});
+SELECT fluid_render('{% query r xs: params.v %}SELECT count(*) AS n FROM (SELECT unnest($xs) AS u){% endquery %}n={{ r[0].n }}', {v: []});
 ----
 n=0
 
 # --- a MIXED list is refused BY NAME. ⚠ Only reachable through the JSON parameter form: a DuckDB
 # LIST is homogeneous, so `{v: [1,'a']}` fails in DuckDB's own struct construction first. ---
 statement error
-SELECT fluid_render('{% query r xs: v %}SELECT count(*) FROM (SELECT unnest($xs)){% endquery %}ok', '{"v":[1,"a"]}');
+SELECT fluid_render('{% query r xs: params.v %}SELECT count(*) FROM (SELECT unnest($xs)){% endquery %}ok', '{"v":[1,"a"]}');
 ----
 its elements mix Number and String
 
@@ -2158,18 +2158,18 @@ its elements mix Number and String
 # ============================================================================================
 
 query I
-SELECT fluid_render('{% query r xs: v %}SELECT string_agg(len(u), '','') AS s FROM (SELECT unnest($xs) AS u){% endquery %}s={{ r[0].s }}', {v: [[1,2],[3]]});
+SELECT fluid_render('{% query r xs: params.v %}SELECT string_agg(len(u), '','') AS s FROM (SELECT unnest($xs) AS u){% endquery %}s={{ r[0].s }}', {v: [[1,2],[3]]});
 ----
 s=2,1
 
 # --- the shape that earns the feature: a small TABLE as one parameter ---
 query I
-SELECT fluid_render('{% query r xs: v %}SELECT string_agg(u.label, '','') AS s FROM (SELECT unnest($xs) AS u){% endquery %}s={{ r[0].s }}', {v: [{'label':'a'},{'label':'b'}]});
+SELECT fluid_render('{% query r xs: params.v %}SELECT string_agg(u.label, '','') AS s FROM (SELECT unnest($xs) AS u){% endquery %}s={{ r[0].s }}', {v: [{'label':'a'},{'label':'b'}]});
 ----
 s=a,b
 
 query I
-SELECT fluid_render('{% query r s: v %}SELECT ($s).a + ($s).b AS n{% endquery %}n={{ r[0].n }}', {v: {'a':40,'b':2}});
+SELECT fluid_render('{% query r s: params.v %}SELECT ($s).a + ($s).b AS n{% endquery %}n={{ r[0].n }}', {v: {'a':40,'b':2}});
 ----
 n=42
 
@@ -2177,7 +2177,7 @@ n=42
 # down the recursion, and it is the only element kind that can catch a unit mismatch — numbers,
 # strings and booleans have nothing to get wrong. Asserted as an INSTANT, never as rendered text. ---
 query I
-SELECT fluid_render('{% query r s: v %}SELECT epoch((($s).rows)[1].d)::BIGINT AS e{% endquery %}e={{ r[0].e }}', {v: {'rows': [{'d': DATE '2023-01-02'}]}});
+SELECT fluid_render('{% query r s: params.v %}SELECT epoch((($s).rows)[1].d)::BIGINT AS e{% endquery %}e={{ r[0].e }}', {v: {'rows': [{'d': DATE '2023-01-02'}]}});
 ----
 e=1672617600
 
@@ -2185,13 +2185,13 @@ e=1672617600
 # becomes an IFluidIndexable exactly like a struct, so nothing at the Fluid level distinguishes
 # them. Refusing would block a shape that otherwise works end to end. ---
 query I
-SELECT fluid_render('{% query r s: v %}SELECT ($s).m.k2 AS n{% endquery %}n={{ r[0].n }}', {v: {'m': MAP{'k1':10,'k2':20}}});
+SELECT fluid_render('{% query r s: params.v %}SELECT ($s).m.k2 AS n{% endquery %}n={{ r[0].n }}', {v: {'m': MAP{'k1':10,'k2':20}}});
 ----
 n=20
 
 # --- and the same through the JSON parameter form, which is a different value model entirely ---
 query I
-SELECT fluid_render('{% query r xs: v %}SELECT count(*) AS n FROM (SELECT unnest($xs)){% endquery %}n={{ r[0].n }}', '{"v":[{"a":1},{"a":2}]}');
+SELECT fluid_render('{% query r xs: params.v %}SELECT count(*) AS n FROM (SELECT unnest($xs)){% endquery %}n={{ r[0].n }}', '{"v":[{"a":1},{"a":2}]}');
 ----
 n=2
 
@@ -2199,13 +2199,13 @@ n=2
 # members the author never wrote, so it is refused by name. Reachable only through JSON: a DuckDB
 # LIST of structs is already homogeneous. ---
 statement error
-SELECT fluid_render('{% query r xs: v %}SELECT 1{% endquery %}ok', '{"v":[{"a":1},{"a":1,"b":2}]}');
+SELECT fluid_render('{% query r xs: params.v %}SELECT 1{% endquery %}ok', '{"v":[{"a":1},{"a":1,"b":2}]}');
 ----
 do not all carry the same fields
 
 # --- mixing a scalar with a container is refused in the author's vocabulary, not Arrow's ---
 statement error
-SELECT fluid_render('{% query r xs: v %}SELECT 1{% endquery %}ok', '{"v":[1,[2]]}');
+SELECT fluid_render('{% query r xs: params.v %}SELECT 1{% endquery %}ok', '{"v":[1,[2]]}');
 ----
 mix Number and Array
 
@@ -2236,7 +2236,7 @@ SELECT fluid_render('{% query r %}SELECT {''k'': [{''n'': 7}, {''n'': 8}]} AS s{
 
 # --- the user's shape: one query's ROWS bound as the next one's parameter ---
 query I
-SELECT fluid_render('{% query r2 arg: input %}SELECT a:unnest($arg), x:5{% endquery %}{% query r3 arg: r2 %}SELECT unnest($arg) AS s{% endquery %}{% for r in r3 %}[{{ r.s.a }}:{{ r.s.x }}]{% endfor %}', {input:[1,2,3]});
+SELECT fluid_render('{% query r2 arg: params.input %}SELECT a:unnest($arg), x:5{% endquery %}{% query r3 arg: r2 %}SELECT unnest($arg) AS s{% endquery %}{% for r in r3 %}[{{ r.s.a }}:{{ r.s.x }}]{% endfor %}', {input:[1,2,3]});
 ----
 [1:5][2:5][3:5]
 
@@ -2245,7 +2245,7 @@ SELECT fluid_render('{% query r2 arg: input %}SELECT a:unnest($arg), x:5{% endqu
 # `unnest($arg, recursive := true)` (below) are what flatten it. Pinned because the empty render
 # looks like a bug and is DuckDB's naming, not ours. ---
 query I
-SELECT fluid_render('{% query r2 arg: input %}SELECT a:unnest($arg), x:5{% endquery %}{% query r3 arg: r2 %}SELECT unnest($arg, recursive := true){% endquery %}{% for r in r3 %}[{{ r.a }}/{{ r.x }}]{% endfor %}', {input:[1,2,3]});
+SELECT fluid_render('{% query r2 arg: params.input %}SELECT a:unnest($arg), x:5{% endquery %}{% query r3 arg: r2 %}SELECT unnest($arg, recursive := true){% endquery %}{% for r in r3 %}[{{ r.a }}/{{ r.x }}]{% endfor %}', {input:[1,2,3]});
 ----
 [1/5][2/5][3/5]
 
@@ -2361,13 +2361,13 @@ SELECT '[' || fluid_render('{% print rowdelim: "," %}SELECT i FROM range(1,3) t(
 
 # --- options and BOUND PARAMETERS coexist; everything that is not an option is a parameter ---
 query I
-SELECT fluid_render('{% print delim: "-", region: r %}SELECT x, ''hit'' AS h FROM (VALUES (''eu''),(''us'')) v(x) WHERE x = $region{% endprint %}', {r:'eu'});
+SELECT fluid_render('{% print delim: "-", region: params.r %}SELECT x, ''hit'' AS h FROM (VALUES (''eu''),(''us'')) v(x) WHERE x = $region{% endprint %}', {r:'eu'});
 ----
 eu-hit
 
 # --- ⚠ the injection control, as everywhere else: a value crosses as a VALUE ---
 query I
-SELECT '[' || fluid_render('{% print region: r %}SELECT x FROM (VALUES (''eu''),(''us'')) v(x) WHERE x = $region{% endprint %}', {r: 'eu'' OR 1=1 --'}) || ']';
+SELECT '[' || fluid_render('{% print region: params.r %}SELECT x FROM (VALUES (''eu''),(''us'')) v(x) WHERE x = $region{% endprint %}', {r: 'eu'' OR 1=1 --'}) || ']';
 ----
 []
 
@@ -2423,7 +2423,7 @@ SELECT fluid_render('({% print sql_literal: true, delim: ", ", rowdelim: "), (" 
 
 # --- ⚠⚠ IT AGREES WITH THE FILTER, because it IS the filter's conversion ---
 query I
-SELECT fluid_render('{% print sql_literal: true %}SELECT ''O''''Brien'' AS n{% endprint %}|{{ v | sql }}', {v: 'O''Brien'});
+SELECT fluid_render('{% print sql_literal: true %}SELECT ''O''''Brien'' AS n{% endprint %}|{{ params.v | sql }}', {v: 'O''Brien'});
 ----
 'O''Brien'|'O''Brien'
 
@@ -2797,7 +2797,7 @@ g	3
 # --- the params bag reaches the template, in the STRUCT spelling fluid_query takes. ---
 query II
 SELECT pre, n FROM fluid_query_batch(
-  'SELECT {{ pre | sql }} AS pre, count(*)::BIGINT AS n FROM input_table',
+  'SELECT {{ params.pre | sql }} AS pre, count(*)::BIGINT AS n FROM input_table',
   (SELECT * FROM range(4) t(i)), params := {'pre': 'p'});
 ----
 p	4
@@ -2927,30 +2927,34 @@ SELECT a, b FROM fluid_query_batch(
 4	6
 
 # ============================================================================================
-# §26 — the params bag is ALSO bound WHOLE, under the name `params`.
+# §26 — the params bag is bound WHOLE, under the name `params`, and ONLY that way.
 #
 # ⚠⚠ THE ASSUMPTION THIS LIFTS: the bag used to be readable ONLY through its members, which meant it had to
 # HAVE members — a struct, a map, or a JSON object. Anything else was refused (a JSON array) or, worse,
 # bound absolutely nothing SILENTLY (a DuckDB LIST, which matched no case at all). Binding the bag itself
 # makes every shape usable and makes an ORDINAL expressible, which no spread ever could.
 #
-# ⚠ The member spread is UNCHANGED and every existing template keeps working; this is additive.
+# ⚠⚠ BREAKING, NO ALIAS (user decision): the members are NO LONGER also bound as top-level variables, so
+# `{{ n }}` renders EMPTY and `{{ params.n }}` is the only spelling. That is pinned by the FIRST row below,
+# because a removal nothing asserts is a removal that can come back. The whole suite moved with it: ~98 call
+# sites, rewritten mechanically and then driven to green by the suite itself.
 # ============================================================================================
 
-# --- a STRUCT: the members still spread, AND the bag answers by name, by ordinal, and for .size. ⚠ The
-# ordinal is not a second mechanism — Fluid resolves `params[0]` by asking for the KEY "0", and the struct's
-# int-parse fallback IS index access. ---
+# --- ⚠⚠ THE REMOVAL ITSELF, and it has to come first: `{{ n }}` is EMPTY where `{{ params.n }}` answers.
+# Without this row nothing in the suite would notice the spread coming back, and every other row here would
+# pass just as happily with it. ⚠ The ordinal is not a second mechanism — Fluid resolves `params[0]` by
+# asking for the KEY "0", and the struct's int-parse fallback IS index access. ---
 query I
-SELECT fluid_render('spread={{ n }} dot={{ params.n }} ord={{ params[0] }} size={{ params.size }}',
+SELECT fluid_render('bare=[{{ n }}] dot={{ params.n }} ord={{ params[0] }} size={{ params.size }}',
                     {'n': 7, 'z': 9});
 ----
-spread=7 dot=7 ord=7 size=2
+bare=[] dot=7 ord=7 size=2
 
-# --- a JSON object: both spellings, and nested member access through the bag. ---
+# --- a JSON object: nested member access through the bag, and the bare form empty there too. ---
 query I
-SELECT fluid_render('dot={{ params.a.b }} spread={{ a.b }}', '{"a":{"b":5}}');
+SELECT fluid_render('dot={{ params.a.b }} bare=[{{ a.b }}]', '{"a":{"b":5}}');
 ----
-dot=5 spread=5
+dot=5 bare=[]
 
 # --- ⚠⚠ A JSON ARRAY. This assertion REPLACES one that pinned the opposite: `'[1,2]'` used to be refused
 # with "params JSON must be an OBJECT — its members become the template's variables". That refusal WAS the
@@ -2980,19 +2984,19 @@ SELECT fluid_render('v={{ params }} plus={{ params | plus: 1 }}', 41);
 ----
 v=41 plus=42
 
-# --- a MAP spreads and is addressable, exactly as the STRUCT is: one conversion table, two spellings. ⚠ No
-# ordinal here — ArrowMap has no int-parse fallback, deliberately, a MAP being unordered in principle. ---
+# --- a MAP is addressable exactly as the STRUCT is: one conversion table, one spelling. ⚠ No ordinal here
+# — ArrowMap has no int-parse fallback, deliberately, a MAP being unordered in principle. ---
 query I
-SELECT fluid_render('spread={{ k }} dot={{ params.k }}', MAP {'k': 3});
+SELECT fluid_render('dot={{ params.k }} bare=[{{ k }}]', MAP {'k': 3});
 ----
-spread=3 dot=3
+dot=3 bare=[]
 
 # --- ⚠⚠ A MEMBER LITERALLY NAMED `params`: THE BAG WINS at the top level, and the member stays reachable
 # one level down. Appended last, deliberately — `params` meaning the bag ALWAYS is readable, whereas a
 # `params` that is sometimes the bag and sometimes a member is not. The alternative precedence loses
 # nothing measurable, so predictability decides it. ---
 query I
-SELECT fluid_render('top={{ params }} nested={{ params.params }} other={{ x }}',
+SELECT fluid_render('top={{ params }} nested={{ params.params }} other={{ params.x }}',
                     {'params': 'inner', 'x': 1});
 ----
 top={"params":inner,"x":1} nested=inner other=1
@@ -3000,9 +3004,10 @@ top={"params":inner,"x":1} nested=inner other=1
 # --- it is the SAME bag on every surface, because all three go through one walk. fluid_query renders at
 # BIND from constants ... ---
 query II
-SELECT * FROM fluid_query('SELECT {{ params.n }} AS viadot, {{ n }} AS viaspread', params := {'n': 4});
+SELECT * FROM fluid_query('SELECT {{ params.n }} AS viadot, {{ params.n | plus: 1 }} AS viaplus',
+                          params := {'n': 4});
 ----
-4	4
+4	5
 
 # --- ... and fluid_query_batch, whose params are CAPTURED at bind and replayed into a per-execution
 # context, sees the same thing. ⚠ Load-bearing beyond the value: the bag has to survive the capture, which

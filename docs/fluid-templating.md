@@ -2974,8 +2974,9 @@ DuckDB LIST matched no `case` in the switch and bound nothing, so a template rea
 no error anywhere — the silent-wrong-answer class. It is also the shape a caller reaches for most naturally
 from SQL (`params := ['a','b']`), and `fluid_query` splices what it renders into a STATEMENT.
 
-⚠ **The member spread is UNCHANGED** and this is additive: every existing template, README example and gate
-assertion keeps working. Removing the spread would be a separate, breaking decision — see §20.5.
+⚠⚠ **The member spread is GONE (§20.5)** — this section's table describes what the bag binding ADDED, and
+the spread's removal is the second half of the same change. `{{ n }}` renders empty; `{{ params.n }}` is
+the only spelling.
 
 ### 20.2 Ordinal access is not a second mechanism
 
@@ -2986,12 +2987,11 @@ documents. So the bag binding buys ordinals for free wherever the underlying ind
 ⚠ `ArrowMap` deliberately does NOT have it, so `params[0]` on a MAP bag does not resolve — a MAP being
 unordered in principle. Pinned in §26 as an asymmetry rather than papered over.
 
-### 20.3 The bag is appended LAST, so it always means the bag
+### 20.3 Precedence stopped being a question
 
-A member literally named `params` does not shadow it: `{{ params }}` is the bag and the member is reachable
-as `{{ params.params }}`. The alternative precedence (member wins) loses nothing measurable either, so
-**predictability decides it** — a `params` that is sometimes the bag and sometimes a member is unreadable,
-while a shadowed member has an obvious one-level-down spelling. Gated.
+While the spread survived, a member literally named `params` had to lose to the bag (appended last), with
+the member still reachable as `params.params`. With the spread gone there is nothing to order: `params` is
+the only variable the bag binds, and a member of any name is reachable only through it.
 
 ### 20.4 What did NOT change, deliberately
 
@@ -3004,28 +3004,57 @@ while a shadowed member has an obvious one-level-down spelling. Gated.
   this file's header gives for having one value model at all. `fluid_query_batch` gets it through the same
   CAPTURE that makes its params outlive the bind, which is only safe because the walk is eager (§19.6).
 
-### 20.5 ⚠ OPEN — whether the member spread should go
+### 20.5 ✅ DECIDED — the member spread is GONE (user, 2026-09-05), BREAKING, no alias
 
-The request can be read as *"bind the bag as well"* or as *"bind the bag INSTEAD"*. What shipped is the
-first, because it is the literal ask and because it is the reversible half: dropping the spread is a
-one-line change to `Capture` plus gate and README churn, whereas shipping the break and being wrong costs
-both. **If the spread is dropped it is BREAKING with no alias** — `{{ n }}` becomes `{{ params.n }}` in
-every template, and ~a dozen gate rows and several README examples move with it.
+The request read two ways — bind the bag *as well*, or *instead*. The additive reading shipped first because
+it was the literal ask and the reversible one; the user then chose **instead**: `{{ params.n }}` is the only
+spelling and `{{ n }}` renders empty.
 
-⚠ The argument FOR dropping it is not ergonomics but namespace hygiene: today a member can shadow a
-template variable, an `{% assign %}`, or a future built-in, and nothing warns. The argument AGAINST is that
-`{{ n }}` is what a Liquid author expects of a model.
+**What it buys.** One spelling, so a member can no longer shadow — or be shadowed by — anything else in the
+template's namespace: an ambient like `is_bind`, an `{% assign %}`, or a variable a future version adds. It
+also removes the "which of two spellings am I reading" question from every template.
+
+⚠ **`is_bind` stays TOP LEVEL** (user preference, and it is what `fluid_query_batch` already did). It is an
+ambient the host sets, not a member of anything, so it is not affected by the bag's shape — and with the
+spread gone it can no longer be shadowed by a member of the same name. MEASURED before the change that the
+ambient already won that collision and the member remained reachable as `params.is_bind`.
+
+⚠⚠ **THE COST, MEASURED RATHER THAN ESTIMATED, and my first estimate was wrong by ~8x.** I wrote "~a dozen
+gate rows"; `verify_plugin_fluid` in fact passes a params bag at **~98 call sites** (48 positional
+struct/MAP literals, 29 `params := …`, 21 JSON-string bags) out of 278 `fluid_*` calls, plus 8 README
+examples. **Correcting that number is what made the decision an informed one**, and it is why the estimate
+is recorded here rather than quietly replaced.
+
+**How the rewrite was done, because "mechanical" needed proving.** A member-DRIVEN script, not an
+identifier-driven one: for each sqllogictest block, the member names come from that block's OWN bag
+literals, and only those names are rewritten. That is what keeps loop variables out of it — `{% for c in
+cols %}{{ c }}` rewrites `cols` and leaves `c`, because `c` is not a member. Two passes (the second for
+bags written `{v: …}` rather than `{'v': …}`) covered 98 regions; the suite then found the rest, and each
+was a case the script could not have known:
+
+- five CROSS-BLOCK sites, where the bag arrives as a prepared parameter (`params := ?`) or belongs to the
+  *including* render, so the template's own block contains no bag literal at all;
+- one FALSE POSITIVE — `{{ d | date: "%Y-%m-%d" }}` became `%Y-%m-%params.d`, because the lookbehind
+  guarded `.` and word characters but not `%`.
+
+⇒ **the suite was the oracle, and it had to be**: a rewrite this size cannot be eyeballed, and every
+failure it produced named its own line.
 
 ### 20.6 Gate
 
-Two mutants, each dying at its own assertion: never binding the bag dies at the FIRST §26 row (the struct)
-after 442 pass; keeping the old "named members only" walk dies at the **DuckDB LIST** row after 445 — the
-silent case, which is the one worth pinning precisely.
+Assertion count UNCHANGED at 455 across the removal, which is the honest outcome: templates were rewritten,
+not assertions added — and it is also why the removal needed an assertion of its OWN. §26's first row is
+now `bare=[{{ n }}] dot={{ params.n }}` expecting `bare=[] dot=7`. **Without it nothing in the suite would
+notice the spread coming back**, since every other row passes just as happily with it.
+
+Mutants, each dying at its own assertion: restoring the STRUCT spread dies at that first row after 442
+pass; never binding the bag at all dies there too; keeping the old named-members-only walk dies at the
+DuckDB LIST row after 445 — the silent case, which is the one worth pinning precisely.
 
 ⚠⚠ **`.size` and `params[0]` alone would NOT have caught a broken build.** A `JsonNode` bound with no
-converter renders correctly while comparing and computing as nothing (this file's header), so the JSON-array
-row asserts a `{% for %}` **SUM** and the scalar row asserts `| plus: 1`. Arithmetic is the only thing that
-separates a real value from one that merely renders like one.
+converter renders correctly while comparing and computing as nothing (this file's header), so the
+JSON-array row asserts a `{% for %}` **SUM** and the scalar row asserts `| plus: 1`. Arithmetic is the only
+thing that separates a real value from one that merely renders like one.
 
 ⚠ The row that used to pin *"params JSON must be an OBJECT"* is REPLACED, not deleted — that refusal WAS
 the assumption being lifted, so falsifying it is the change announcing itself, and a note at the old site

@@ -104,7 +104,7 @@ internal sealed class FluidQueryBatchFunction : ICollectorFunction
         // ⚠⚠ CAPTURED, not retained: the args batch belongs to the framework and its lifetime ends with this
         // call, while the groups render much later. FluidValueModel.Capture is eager all the way down, so
         // what comes back holds no Arrow memory.
-        var parameters = FluidValueModel.Capture(ArgColumn(args, "params"), 0);
+        var parameters = FluidValueModel.CaptureBag(ArgColumn(args, "params"), 0);
 
         foreach (var f in inputSchema.FieldsList)
         {
@@ -134,15 +134,12 @@ internal sealed class FluidQueryBatchFunction : ICollectorFunction
 
     /// <summary>Builds the render context every render of one execution shares.</summary>
     private static TemplateContext NewContext(FluidRenderSession session,
-                                              IReadOnlyList<KeyValuePair<string, object?>> parameters,
+                                              object? parameters,
                                               bool isBind)
     {
         var ctx = FluidEngine.NewRenderContext(FunctionName, PublishRefusal, session, c =>
         {
-            foreach (var member in parameters)
-            {
-                FluidValueModel.SetVariable(c, member.Key, member.Value);
-            }
+            FluidValueModel.SetVariable(c, FluidValueModel.BagVariable, parameters);
         });
         ctx.SetValue(FluidEngine.IsBindVariable, isBind);
         return ctx;
@@ -226,11 +223,11 @@ internal sealed class FluidQueryBatchFunction : ICollectorFunction
     private sealed class Binding : ICollectorFunctionBinding
     {
         private readonly string _template;
-        private readonly IReadOnlyList<KeyValuePair<string, object?>> _parameters;
+        private readonly object? _parameters;
         private readonly long? _batchSize;
         private readonly Schema _inputSchema;
 
-        internal Binding(string template, IReadOnlyList<KeyValuePair<string, object?>> parameters,
+        internal Binding(string template, object? parameters,
                          long? batchSize, Schema inputSchema, Schema outputSchema)
         {
             _template = template;
