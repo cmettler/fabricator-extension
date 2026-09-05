@@ -2938,12 +2938,12 @@ fresh scratch dir — and it VOIDED a mutation run here until a fresh-dir contro
 
 ### 19.9 What is NOT built
 
-- **The LATERAL form** (`FROM t, fluid_query_each(…, t.a, t.b)`) — parallel, and the host stamps the
-  correlated columns. It needs two things this shape does not: a mandatory row id in every generated
-  statement (`LateralResult.Origin` is required, and absent-with-a-different-length is a hard error), and
-  a rule for naming input columns, since a lateral's wire columns are named by their rendered EXPRESSION
-  TEXT (`t.a`, but also `(t.a + 1)` and `CAST(5 AS SMALLINT)`). A STRUCT argument would dissolve the
-  naming half.
+- **The LATERAL form** (`FROM t, fluid_query_lateral(…, t.a, t.b)`) — parallel, and the host stamps the
+  correlated columns. It needs ONE thing this shape does not: a mandatory row id in every generated
+  statement, because `LateralResult.Origin` is required and absent-with-a-different-length is a hard error.
+  ⚠ The wire columns being named by their rendered EXPRESSION TEXT (`t.a`, but also `(t.a + 1)`) is NOT a
+  second obstacle — user decision, 2026-09-05: take the names as they come, and a caller wanting clean ones
+  passes a struct and addresses its fields in the template.
 - **A bounded-memory batched variant** on the streaming in-out — same body, different registration.
 - **The input rows as a Fluid VALUE** (`input`, via the `{% query %}` value model), which would let a
   template loop over rows without a round trip. Today `{% query rows %}SELECT … FROM input_table{% endquery %}`
