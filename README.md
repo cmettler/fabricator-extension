@@ -1896,6 +1896,12 @@ The included template shares the caller's variables, and it may include others i
 > the host can open. What is refused is refused for predictability — `..` in a relative path, and the glob
 > characters `*`, `?`, `[`, `]`, because one include must name one file.
 
+> ⚠ **Use `SET GLOBAL` for the root if the template runs through `fluid_query_batch` or
+> `fluid_query_lateral`.** A plain session-scoped `SET fluid_template_root` reaches `fluid_render` and
+> `fluid_query`, but those two resolve part of their work where the session-scoped value is not visible, and
+> a relative include then fails with *"no root is set"* — at bind for the batch form, at call time for the
+> lateral. `SET GLOBAL` works on every surface, and an absolute include path needs no root at all.
+
 > ⚠ **Name the extension.** `{% include 'dims/customer' %}` asks storage for `dims/customer` *and then* for
 > `dims/customer.liquid` — two round trips on remote storage where `{% include 'dims/customer.liquid' %}`
 > costs one. If both files exist, the one **without** the extension wins.
