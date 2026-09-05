@@ -444,6 +444,10 @@ case "$TIER" in
         # in that section is load-bearing and a mutant proved it: an earlier `USE memory.hq_s` leaves a
         # qualified entry, against which the bug does not fire, so the section PASSED with it fully present.
         # 8250 + 9 = 8259 exactly, from a green run.
+        # 8735 since 2026-09-05 (same day, third bump): verify_plugin_fluid 455 -> 459 -- PARENTHESES are
+        # enabled on the parser (Fluid AllowParentheses, off by default). Liquid has NO operator precedence
+        # and evaluates right to left, so grouping is the only way to express a mixed and/or condition:
+        # MEASURED, `a or b and c` and `(a or b) and c` give OPPOSITE answers on the same bag.
         # 8731 since 2026-09-05 (same day, second bump): verify_plugin_fluid 443 -> 455 -- the params bag
         # is ALSO bound WHOLE, under the name `params`, so it is readable as params.x and params[0]. It
         # lifts an ASSUMPTION: the bag used to be reachable only through its members, so a JSON array was
@@ -528,7 +532,7 @@ case "$TIER" in
         # two functions have exactly ONE registration each, plus the HostsCatalog refusal and its
         # unknown-provider control. 3105 + 238 + 8259 - 3339 arithmetic aside, both numbers come from green
         # runs.
-        : "${MIN_ASSERTIONS:=8731}"
+        : "${MIN_ASSERTIONS:=8735}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

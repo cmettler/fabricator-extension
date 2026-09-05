@@ -3031,3 +3031,38 @@ query I
 SELECT fluid_render('[{{ params }}]{% if params %}yes{% else %}no{% endif %}', NULL);
 ----
 []no
+
+# ============================================================================================
+# §27 — PARENTHESES are enabled on the parser (Fluid's AllowParentheses).
+#
+# ⚠ A PARSER option, like AllowFunctions beside it, so without it a template using them fails at PARSE with
+# Fluid naming the option — never at render with a quietly different answer.
+# ============================================================================================
+
+# --- grouping parses at all ---
+query I
+SELECT fluid_render('{% if (params.a or params.b) and params.c %}yes{% else %}no{% endif %}',
+                    {'a': true, 'b': false, 'c': true});
+----
+yes
+
+# --- ⚠⚠ THE LOAD-BEARING PAIR, and it is why this is worth enabling rather than a convenience: LIQUID HAS
+# NO OPERATOR PRECEDENCE. It evaluates strictly RIGHT TO LEFT, so `a or b and c` is `a or (b and c)` — and
+# on these inputs (a true, b false, c false) that is TRUE while the grouped `(a or b) and c` is FALSE. Same
+# template shape, same bag, opposite answers: without parentheses the second condition is INEXPRESSIBLE,
+# not merely clumsy. ⚠ The ungrouped row is the control — alone, the grouped `no` would be equally true of
+# a build where the condition had stopped evaluating at all. ---
+query II
+SELECT fluid_render('{% if params.a or params.b and params.c %}yes{% else %}no{% endif %}',
+                    {'a': true, 'b': false, 'c': false}) AS ungrouped_rtl,
+       fluid_render('{% if (params.a or params.b) and params.c %}yes{% else %}no{% endif %}',
+                    {'a': true, 'b': false, 'c': false}) AS grouped;
+----
+yes	no
+
+# --- ⚠ FUNCTIONS STILL PARSE. Both options are on at once and a function call is itself parenthesised, so
+# this pins that enabling grouping did not disturb the call syntax `query(...)` depends on. ---
+query I
+SELECT fluid_render('{% assign r = query("SELECT 41 AS v") %}{{ r[0].v | plus: 1 }}', NULL);
+----
+42

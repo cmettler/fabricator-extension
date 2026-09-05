@@ -1817,6 +1817,9 @@ so the same committed-data rule as `query()` applies.
 
 Liquid control flow (`{% if %}`, `{% for %}`) works, comparisons and arithmetic filters work on numbers from
 either kind of bag, and nested `STRUCT`/`MAP`/`LIST` members are reachable by name, by index and by `.size`.
+**Parentheses group conditions** — `{% if (a or b) and c %}` — which you will want, because Liquid has no
+operator precedence and evaluates strictly right to left: without them `a or b and c` means `a or (b and
+c)`, and the grouped condition is not expressible at all.
 Fluid is secure-by-default: only the variables you pass are reachable, and the only registered filters and
 functions are the two SQL filters (`sql`, `sql_ident`) and `query` / `exec` above.
 

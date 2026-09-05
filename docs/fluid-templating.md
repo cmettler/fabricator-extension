@@ -3059,3 +3059,23 @@ thing that separates a real value from one that merely renders like one.
 ⚠ The row that used to pin *"params JSON must be an OBJECT"* is REPLACED, not deleted — that refusal WAS
 the assumption being lifted, so falsifying it is the change announcing itself, and a note at the old site
 points at the row that replaces it.
+
+## 21. ✅ AS BUILT (2026-09-05) — parentheses enabled on the parser
+
+User-asked. `FluidParserOptions.AllowParentheses = true`, set beside `AllowFunctions` in
+`FluidEngine.CreateParser`. One line; gate `verify_plugin_fluid` 455 → **459**, hermetic floor 8731 →
+**8735**, one mutant.
+
+⚠ It is a PARSER option, not a `TemplateContext` one, so it must be set where the parser is built —
+templates are cached by TEXT, and one parsed before the option was set would stay cached, rejected, for the
+process's life. Fluid names the option in its own parse error, which is how the need surfaces.
+
+⚠⚠ **Why it is worth having rather than a convenience: LIQUID HAS NO OPERATOR PRECEDENCE.** It evaluates
+strictly RIGHT TO LEFT, so `a or b and c` is `a or (b and c)`. MEASURED on one bag (a true, b false, c
+false): ungrouped answers **yes**, `(a or b) and c` answers **no**. The grouped condition is therefore
+INEXPRESSIBLE without this, not merely clumsy — and a template that generates SQL is exactly where a mixed
+and/or condition turns up. §27 pins the pair, with the ungrouped row as the control: the grouped `no`
+alone would be equally true of a build where the condition had stopped evaluating.
+
+⚠ Both parser options are now on at once and a function call is itself parenthesised, so §27 also pins that
+`query(...)` still parses — enabling grouping did not disturb the call syntax it depends on.

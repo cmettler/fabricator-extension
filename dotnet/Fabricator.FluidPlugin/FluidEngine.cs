@@ -21,9 +21,10 @@ namespace Fabricator.FluidPlugin;
 /// </summary>
 internal static class FluidEngine
 {
-    // ⚠ AllowFunctions is OFF in Fluid by default and is a PARSER-level gate: without it `query('…')` is a
-    // PARSE error ("Functions are not allowed"), not a missing-function error at render. It is enabled
-    // because slice 3 ships `query`; nothing else in this plugin needs it.
+    // ⚠ BOTH options below are OFF in Fluid by default and BOTH are PARSER-level gates, so a template using
+    // either fails at PARSE with Fluid naming the option — not at render with a missing function or a
+    // mis-evaluated condition. They are set HERE, where the parser is built, because templates are cached
+    // by TEXT: one parsed before the option was set would stay cached, rejected, for the process's life.
     //
     // ⚠ Built by a METHOD rather than an object initializer so the custom tag is registered BEFORE anything
     // can be parsed: templates are cached by text, so a template parsed before registration would be cached
@@ -36,7 +37,15 @@ internal static class FluidEngine
 
     private static FluidParser CreateParser()
     {
-        var parser = new FabricatorFluidParser(new FluidParserOptions { AllowFunctions = true });
+        var parser = new FabricatorFluidParser(new FluidParserOptions
+        {
+            AllowFunctions = true,
+            // ⚠ Fluid refuses `{% if (a or b) and c %}` without this, naming the option in the parse error.
+            // Liquid has no operator precedence — it evaluates strictly right to left — so grouping is the
+            // ONLY way to express a mixed and/or condition, and a template that generates SQL is exactly
+            // where such a condition turns up.
+            AllowParentheses = true,
+        });
 
         // ⚠⚠ THE {% exec %} BLOCK: render the body to a SEPARATE output, run the captured text as SQL, and
         // write NOTHING to the caller's output. It is what makes a real statement writable — multi-line,
