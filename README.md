@@ -1325,7 +1325,7 @@ A plugin's global functions are registered while the extension loads, so a plugi
 available the **next time** DuckDB loads fabricator — not in the running session. See
 [docs/plugin-system.md](docs/plugin-system.md).
 
-#### Templates — `fluid_render(...)`, `fluid_query(...)` and `fluid_query_batch(...)`
+#### Templates — `fluid_render(...)`, `fluid_query(...)`, `fluid_query_batch(...)` and `fluid_query_lateral(...)`
 
 The **Fluid / Liquid template engine** is **built in** — it ships inside the extension and needs no
 configuration. It contributes three global functions, all taking a params bag that is a DuckDB `STRUCT`
@@ -1953,10 +1953,80 @@ SELECT (SELECT count(*) FROM acc)::BIGINT AS groups_so_far, count(*)::BIGINT AS 
 > ⚠ An input column whose name begins `__fab` is refused — the function needs that prefix for its own
 > staging columns. Alias it in the input query.
 
+**`fluid_query_lateral(template, params, <per-row columns…>)` is the correlated sibling.** Where
+`fluid_query_batch` takes a whole table, this takes ordinary columns, so it sits *inside* your query: the
+template is rendered once per chunk of input rows, its statement is run, and your own columns are stamped
+onto every output row.
+
+```sql
+CREATE TABLE people AS SELECT * FROM (VALUES (1, 'ab', 2), (2, 'cde', 0)) v(id, name, n);
+
+SELECT p.id, f.*
+FROM people p, fluid_query_lateral(
+  'SELECT __fab_row, upper(name) AS u, length(name) AS n FROM input_table', 'null', p.name) f
+ORDER BY p.id;
+-- id | u   | n
+-- 1  | AB  | 2
+-- 2  | CDE | 3
+```
+
+The rows arrive as **`input_table`** again, on the template's own connection, and `is_bind` works exactly
+as above. Two things are different, and both are load-bearing:
+
+> ⚠ **The generated statement MUST project `__fab_row`.** One render sees a whole chunk of input rows and
+> may return any number of output rows, so the extension has to be told which input row each output row
+> belongs to before it can stamp your columns onto it. `input_table`'s first column *is* `__fab_row` — carry
+> it through and it is removed from the result. Omitting it is refused when the query is bound, naming the
+> column. That requirement is also what buys you fan-out and filtering:
+
+```sql
+-- one input row -> N output rows, or none at all
+SELECT p.id, f.k
+FROM people p, fluid_query_lateral(
+  'SELECT i.__fab_row, r.range AS k FROM input_table i, range(i.n) r', 'null', p.n) f;
+-- id | k
+-- 1  | 0
+-- 1  | 1        -- id 2 has n = 0, so it produces no rows at all
+```
+
+> ⚠ **`params` is positional and cannot be `NULL`** — write `'null'` for "no bag" (or `'{}'` for an empty
+> one; `{% if params %}` tells them apart). Both `template` and `params` are *bind-time constants*, which
+> is forced: DuckDB drops named arguments in a correlated call, so `params := …` does not bind there. Any
+> constant expression works — a literal, a cast, a struct such as `{'mul': 10}`, `getvariable('x')`.
+
+**Naming.** DuckDB names each input column after the *expression you passed*: `p.name` arrives as `name`,
+`p.n + 1` as `(p.n + 1)`, and a struct as `main.struct_pack(...)`. In a call whose arguments are all
+literals there is no expression text at all, so they are named by argument POSITION — in
+`fluid_query_lateral('…', 'null', 7, 'x')` they are `col2` and `col3`, since the two constants come first.
+If that is awkward, name them yourself with a positional alias, which needs no knowledge of any of the
+above:
+
+```sql
+SELECT p.id, f.s
+FROM people p, fluid_query_lateral(
+  'SELECT r AS __fab_row, a * b AS s FROM (SELECT * FROM input_table) AS q(r, a, b)',
+  'null', p.id, p.n) f;
+-- id | s
+-- 1  | 2
+-- 2  | 0
+```
+
+> ⚠ **Nothing carries between chunks here.** The lateral runs in PARALLEL — each thread gets its own
+> connection and its own temporary catalog — so a temp table one render stages may or may not be there for
+> the next. Use `fluid_query_batch` when you need to accumulate; it is sequential by construction.
+
+> ⚠ `publish()` is refused here too, for the same reason and with the same answer: select the staged table
+> directly.
+
+**Which to reach for.** `fluid_query` when the SQL does not depend on the data (it disappears into your
+plan, and nothing beats that). `fluid_query_lateral` when the statement is *per row* and the result belongs
+beside the outer row. `fluid_query_batch` when the template needs the whole relation, or needs to
+accumulate across it.
+
 **It is always available**, in a released artifact and in a build from source alike. It used to ship as a
 bundled *plugin*, which had one sharp edge worth knowing about if you remember it that way: setting
 `FABRICATOR_PLUGIN_DIR` to pick up your own plugin **replaces** the default roots and therefore used to make
-these two functions disappear. That cannot happen now — they are part of the extension, not of any plugin
+these functions disappear. That cannot happen now — they are part of the extension, not of any plugin
 root.
 
 > ⚠ `ATTACH … (PROVIDER 'fluid')` is refused, deliberately. Templates are global functions; there is no

@@ -104,7 +104,7 @@ internal sealed class FluidQueryBatchFunction : ICollectorFunction
         // ⚠⚠ CAPTURED, not retained: the args batch belongs to the framework and its lifetime ends with this
         // call, while the groups render much later. FluidValueModel.Capture is eager all the way down, so
         // what comes back holds no Arrow memory.
-        var parameters = FluidValueModel.CaptureBag(ArgColumn(args, "params"), 0);
+        var parameters = FluidValueModel.CaptureBag(FluidValueModel.ArgColumn(args, "params"), 0);
 
         foreach (var f in inputSchema.FieldsList)
         {
@@ -185,7 +185,7 @@ internal sealed class FluidQueryBatchFunction : ICollectorFunction
 
     private static string ReadTemplate(RecordBatch? args)
     {
-        if (ArgColumn(args, "template") is not StringArray templates || templates.Length == 0
+        if (FluidValueModel.ArgColumn(args, "template") is not StringArray templates || templates.Length == 0
             || templates.IsNull(0))
         {
             throw new ArgumentException($"{FunctionName}: 'template' must be a non-NULL VARCHAR");
@@ -195,7 +195,8 @@ internal sealed class FluidQueryBatchFunction : ICollectorFunction
 
     private static long? ReadBatchSize(RecordBatch? args)
     {
-        if (ArgColumn(args, "batchsize") is not Int64Array sizes || sizes.Length == 0 || sizes.IsNull(0))
+        if (FluidValueModel.ArgColumn(args, "batchsize") is not Int64Array sizes || sizes.Length == 0
+            || sizes.IsNull(0))
         {
             return null;
         }
@@ -206,18 +207,6 @@ internal sealed class FluidQueryBatchFunction : ICollectorFunction
                 $"{FunctionName}: batchsize must be positive; omit it to render once over the whole input.");
         }
         return size;
-    }
-
-    // ⚠ BY NAME, not by position: a named parameter is present only when SUPPLIED, so its column index
-    // depends on the call site.
-    private static IArrowArray? ArgColumn(RecordBatch? args, string name)
-    {
-        if (args is null)
-        {
-            return null;
-        }
-        int i = args.Schema.GetFieldIndex(name);
-        return i >= 0 ? args.Column(i) : null;
     }
 
     private sealed class Binding : ICollectorFunctionBinding

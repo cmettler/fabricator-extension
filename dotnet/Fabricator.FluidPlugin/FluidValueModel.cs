@@ -138,6 +138,24 @@ internal static class FluidValueModel
         };
     }
 
+    /// <summary>
+    /// One column of a bind-time args batch, BY NAME.
+    /// </summary>
+    /// <remarks>
+    /// ⚠ By name, never by position: a NAMED parameter is present only when SUPPLIED, so its column index
+    /// depends on the call site — and a CONSTANT one is present only when the host could recover its value.
+    /// Shared by every Fluid function that reads bind arguments so the rule cannot exist in two versions.
+    /// </remarks>
+    internal static IArrowArray? ArgColumn(RecordBatch? args, string name)
+    {
+        if (args is null)
+        {
+            return null;
+        }
+        int i = args.Schema.GetFieldIndex(name);
+        return i >= 0 ? args.Column(i) : null;
+    }
+
     /// <summary>Parses a JSON params bag. ANY root is accepted — object, array or scalar.</summary>
     /// <remarks>
     /// ⚠ It used to REFUSE anything but an object, because members were the only thing a bag could

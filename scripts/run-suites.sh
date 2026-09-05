@@ -444,6 +444,19 @@ case "$TIER" in
         # in that section is load-bearing and a mutant proved it: an earlier `USE memory.hq_s` leaves a
         # qualified entry, against which the bug does not fire, so the section PASSED with it fully present.
         # 8250 + 9 = 8259 exactly, from a green run.
+        # 8839 since 2026-09-05 (same day, fourth bump): verify_plugin_fluid 459 -> 563 -- fluid_query_lateral,
+        # the CORRELATED sibling of fluid_query_batch: a template rendered once per INPUT CHUNK, its
+        # statement run, the caller's columns stamped from a provenance column the template must project.
+        # 8735 + exactly that suite's 104, which is what shows no other suite moved. /!\ The load-bearing
+        # rows are the ones no count could give: 1->N and 1->0 in ONE result over MULTI-ROW chunks, the
+        # 6000-row checksum over the multi-batch concatenation path, and the naming PAIR (correlated `n`
+        # vs literal `col2`), neither half of which means anything alone.
+        # /!\/!\ 50 of those 104 exist because a MUTANT exposed that the first version's provenance rows
+        # were VACUOUS: a lateral call with ONE input column is delivered ONE OUTER ROW AT A TIME, and with
+        # a chunk of one row every provenance index is 0 -- so "ignore the projected __fab_row entirely"
+        # passed all of them and died only at the last assertion in the section. What produces a multi-row
+        # chunk here is a call with TWO input columns; every provenance row now runs on that shape, with
+        # `max(chunk) > 1` as the control and a template that REORDERS its output as the sharpest case.
         # 8735 since 2026-09-05 (same day, third bump): verify_plugin_fluid 455 -> 459 -- PARENTHESES are
         # enabled on the parser (Fluid AllowParentheses, off by default). Liquid has NO operator precedence
         # and evaluates right to left, so grouping is the only way to express a mixed and/or condition:
@@ -532,7 +545,7 @@ case "$TIER" in
         # two functions have exactly ONE registration each, plus the HostsCatalog refusal and its
         # unknown-provider control. 3105 + 238 + 8259 - 3339 arithmetic aside, both numbers come from green
         # runs.
-        : "${MIN_ASSERTIONS:=8735}"
+        : "${MIN_ASSERTIONS:=8839}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

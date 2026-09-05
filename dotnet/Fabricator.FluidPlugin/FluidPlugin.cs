@@ -50,6 +50,12 @@ public sealed class FluidPluginBackend : IProvider
     public IEnumerable<ICollectorFunction> GlobalCollectorFunctions =>
         new ICollectorFunction[] { new FluidQueryBatchFunction() };
 
+    // ⚠ The CORRELATED sibling of the collector, and a different operator rather than a mode of it: `kind` is
+    // fixed at registration, so one name could not switch between them by parameter. It is PARALLEL, which is
+    // what it buys and also what costs it the collector's cross-chunk state.
+    public IEnumerable<ILateralFunction> GlobalLateralFunctions =>
+        new ILateralFunction[] { new FluidQueryLateralFunction() };
+
     /// <summary>
     /// The one setting this plugin declares: where <c>{% include %}</c> / <c>{% render %}</c> resolve from.
     /// </summary>

@@ -3066,3 +3066,255 @@ query I
 SELECT fluid_render('{% assign r = query("SELECT 41 AS v") %}{{ r[0].v | plus: 1 }}', NULL);
 ----
 42
+
+# ============================================================================================
+# §28 — fluid_query_lateral: the CORRELATED sibling of fluid_query_batch. A template rendered once per
+#       INPUT CHUNK with those rows in hand, its statement run, and the caller's own columns stamped onto
+#       every output row.
+#
+# ⚠⚠ THE CONTRACT IS PROVENANCE. One call sees up to 2048 input rows and may return any number of output
+# rows, so the template MUST project `__fab_row` — the 0-based index of the input row each output row
+# belongs to — or the host cannot stamp the correlated columns. That is what makes 1->N and 1->0
+# expressible, and it is refused at BIND rather than guessed.
+#
+# ⚠ NOT GATED, deliberately: the operator is PARALLEL, so which rows reach which session is the
+# scheduler's business and "no state carries between chunks" cannot be asserted without a flaky test. It
+# is a property of the design (one session per pipeline thread), documented on the class.
+# ============================================================================================
+
+statement ok
+CREATE TABLE lat_t(id INTEGER, n INTEGER);
+
+statement ok
+INSERT INTO lat_t VALUES (1, 1), (2, 3), (3, 0);
+
+# --- the signature: two ANY constants then an ANY variadic tail. ⚠ The tail is what carries the per-row
+# input columns — a lateral's positional slots ARE its input, so the arguments after `params` are a
+# variable-width WIRE rather than a wider args batch. ---
+query IIII
+SELECT function_name, parameters, parameter_types, coalesce(varargs, '(empty)')
+FROM duckdb_functions() WHERE function_name = 'fluid_query_lateral';
+----
+fluid_query_lateral	[col0, col1]	[ANY, ANY]	ANY
+
+# --- ⚠⚠ 1->N AND 1->0 IN ONE RESULT, which is the whole point of provenance: id 2 fans out to three rows
+# and id 3 (n = 0) produces none, while every row carries the OUTER id the host stamped from `__fab_row`.
+# A row COUNT could not show this — the pairing is the assertion. ---
+query III
+SELECT t.id, t.n, f.k FROM lat_t t, fluid_query_lateral(
+  'SELECT i.__fab_row, r.range AS k FROM input_table i, range(i.n) r', 'null', t.n) f
+ORDER BY t.id, f.k;
+----
+1	1	0
+2	3	0
+2	3	1
+2	3	2
+
+# ============================================================================================
+# ⚠⚠ AND THE ROWS ABOVE DO NOT TEST PROVENANCE, WHICH A MUTANT IS WHAT REVEALED. A call with ONE input
+# column is delivered ONE OUTER ROW AT A TIME, and with a chunk of one row every provenance index is 0 —
+# so `origin[i] = 0` (ignore the projected `__fab_row` entirely) passes every assertion above. Only a
+# MULTI-ROW chunk can tell a correct mapping from a constant one, and what produces one here is a call
+# with TWO input columns. Everything below runs on that shape.
+# ============================================================================================
+
+statement ok
+CREATE TABLE lat_t6(id INTEGER, n INTEGER);
+
+statement ok
+INSERT INTO lat_t6 VALUES (1, 1), (2, 3), (3, 0), (4, 2), (5, 1), (6, 4);
+
+# --- THE CONTROL for everything that follows: chunks really do carry several rows here. ⚠ Only
+# `max > 1` is asserted, never the sizes — the grouping is DuckDB's scheduling, and pinning it would be a
+# test of the scheduler. What matters is that the batched path is reached at all. ---
+query II
+SELECT max(f.chunk) > 1 AS batched, count(*) FROM lat_t6 t, fluid_query_lateral(
+  'SELECT __fab_row, (SELECT count(*) FROM input_table) AS chunk FROM input_table', 'null', t.n, t.id) f;
+----
+true	6
+
+# --- the same 1->N / 1->0 fan-out, now over multi-row chunks: id 3 (n = 0) produces nothing and every
+# other row is stamped with ITS OWN outer id. ---
+query III
+SELECT t.id, t.n, f.k FROM lat_t6 t, fluid_query_lateral(
+  'SELECT i.__fab_row, r.range AS k FROM input_table i, range(i.n) r', 'null', t.n, t.id) f
+ORDER BY t.id, f.k;
+----
+1	1	0
+2	3	0
+2	3	1
+2	3	2
+4	2	0
+4	2	1
+5	1	0
+6	4	0
+6	4	1
+6	4	2
+6	4	3
+
+# --- ⚠⚠ THE SHARPEST ONE: the template REORDERS its output (`ORDER BY n DESC`), so within a chunk the
+# output row order deliberately differs from the input row order. A mapping that took position in the
+# OUTPUT — or a constant — would pair the wrong `id` with the wrong `v`. Every row still gets its own. ---
+query II
+SELECT t.id, f.v FROM lat_t6 t, fluid_query_lateral(
+  'SELECT __fab_row, n AS v FROM input_table ORDER BY n DESC', 'null', t.n, t.id) f ORDER BY t.id;
+----
+1	1
+2	3
+3	0
+4	2
+5	1
+6	4
+
+statement ok
+DROP TABLE lat_t6;
+
+# --- ⚠ THE MULTI-BATCH PATH: 3000 output rows per input row exceeds one Arrow batch, so the result
+# arrives in several and is concatenated. This is the branch that would silently truncate — the checksum
+# is what makes a short read visible (sum(range(3000)) = 4498500, twice). ---
+query II
+SELECT count(*), sum(f.k) FROM (SELECT 1 AS n UNION ALL SELECT 2) t, fluid_query_lateral(
+  'SELECT i.__fab_row, r.range AS k FROM input_table i, range(3000) r', 'null', t.n) f;
+----
+6000	8997000
+
+# --- provenance is MANDATORY, refused at bind, and the message names the column and the fix. ---
+statement error
+SELECT f.* FROM lat_t t, fluid_query_lateral('SELECT 1 AS v', 'null', t.n) f;
+----
+<REGEX>:.*must project '__fab_row'.*
+
+# --- ⚠ and an index outside the chunk is refused with the VALUE, at call time. Computing the row id
+# instead of carrying it through is the mistake this catches; without it a row would be attributed to the
+# wrong outer row, silently. ---
+statement error
+SELECT f.* FROM lat_t t, fluid_query_lateral('SELECT 99 AS __fab_row, n AS v FROM input_table', 'null', t.n) f;
+----
+<REGEX>:.*'__fab_row' = 99 for an input chunk of.*
+
+# --- ⚠⚠ THE NAMING PAIR, and neither half means anything alone. DuckDB synthesises the input relation
+# from the argument EXPRESSIONS, so the correlated shape names a column by its rendered text (`t.n` renders
+# as `n`) while a literal call has no expression text and falls back to `col<SLOT>` — where SLOT is the
+# ARGUMENT position, so with the two constants ahead of it the first input column is `col2`, not `col0`. ---
+query I
+SELECT f.cols FROM lat_t t, fluid_query_lateral(
+  'SELECT __fab_row, (SELECT string_agg(column_name, ''|'') FROM (DESCRIBE SELECT * FROM input_table)) AS cols FROM input_table',
+  'null', t.n) f LIMIT 1;
+----
+__fab_row|n
+
+query I
+SELECT cols FROM fluid_query_lateral(
+  'SELECT __fab_row, (SELECT string_agg(column_name, ''|'') FROM (DESCRIBE SELECT * FROM input_table)) AS cols FROM input_table',
+  'null', 7, 'x');
+----
+__fab_row|col2|col3
+
+# --- ⚠ SO THE NAMING-FREE SPELLING IS A POSITIONAL COLUMN ALIAS, which is ordinary SQL and identical in
+# both call shapes. Note the row id is re-aliased BACK to `__fab_row`: the requirement is on the OUTPUT
+# column's name, not the input's. ---
+query II
+SELECT t.id, f.s FROM lat_t t, fluid_query_lateral(
+  'SELECT r AS __fab_row, a * b AS s FROM (SELECT * FROM input_table) AS q(r, a, b)', 'null', t.id, t.n) f
+ORDER BY 1;
+----
+1	1
+2	6
+3	0
+
+# --- ⚠⚠ `params` CANNOT BE NULL — a bind-time constant that arrives NULL is refused, because in the
+# correlated shape an explicit NULL is indistinguishable from a fold that failed. The row below is the
+# control: `'null'` binds and is NIL, `'{}'` binds and is TRUTHY, so the refusal is about NULL rather
+# than about constants having stopped arriving. ---
+statement error
+SELECT f.* FROM lat_t t, fluid_query_lateral('SELECT __fab_row, n AS v FROM input_table', NULL, t.n) f;
+----
+<REGEX>:.*is a bind-time CONSTANT, and this argument has no bind-time value.*
+
+query II
+SELECT (SELECT max(f.has_bag) FROM lat_t t, fluid_query_lateral(
+          'SELECT __fab_row, {% if params %}1{% else %}0{% endif %} AS has_bag FROM input_table', 'null', t.n) f) AS json_null,
+       (SELECT max(f.has_bag) FROM lat_t t, fluid_query_lateral(
+          'SELECT __fab_row, {% if params %}1{% else %}0{% endif %} AS has_bag FROM input_table', '{}', t.n) f) AS empty_object;
+----
+0	1
+
+# --- a STRUCT bag survives the correlated shape: the constant's value is recovered from the synthesized
+# column's rendered expression text, re-parsed and folded. ---
+query II
+SELECT t.id, f.scaled FROM lat_t t, fluid_query_lateral(
+  'SELECT __fab_row, n * {{ params.mul }} AS scaled FROM input_table', {'mul': 10}, t.n) f ORDER BY 1;
+----
+1	10
+2	30
+3	0
+
+# --- is_bind selects WHICH render happens; the columns still come from BINDING what was rendered. The two
+# branches are different SQL, so this also shows nothing is taken on the author's word. ---
+query I
+SELECT f.v FROM lat_t t, fluid_query_lateral(
+  '{% if is_bind %}SELECT 0::BIGINT AS __fab_row, 0::INTEGER AS v LIMIT 0{% else %}SELECT __fab_row, n AS v FROM input_table{% endif %}',
+  'null', t.n) f ORDER BY 1;
+----
+0
+1
+3
+
+# --- ⚠ and a chunk that produces a DIFFERENT shape is refused rather than read as data: the template
+# renders anew per chunk and may legitimately render different SQL, so this is reachable from an ordinary
+# template, not defensive. ---
+statement error
+SELECT f.* FROM lat_t t, fluid_query_lateral(
+  'SELECT __fab_row{% if is_bind %}, 1 AS a{% else %}, 1 AS a, 2 AS b{% endif %} FROM input_table', 'null', t.n) f;
+----
+<REGEX>:.*columns where 1 were declared.*
+
+# --- publish() is REFUSED BY NAME, and the refusal replaces a HANG: this surface runs the generated
+# statement on the render's OWN pinned connection, so scanning a publication would re-enter it mid-query.
+# ⚠ A test reproducing the hang would hang the tier, so what is pinned is the refusal. ---
+statement error
+SELECT f.* FROM lat_t t, fluid_query_lateral('SELECT * FROM {{ publish(''x'') }}', 'null', t.n) f;
+----
+<REGEX>:.*publish\(\) cannot be used here.*
+
+# --- the per-render pinned connection reaches here too: an {% exec %} stages a temp table and a
+# {% query %} in the same render reads it back. ---
+query I
+SELECT f.v FROM lat_t t, fluid_query_lateral(
+  '{% exec %}CREATE OR REPLACE TEMP TABLE lat_s AS SELECT 5 AS b{% endexec %}{% query q %}SELECT b FROM lat_s{% endquery %}SELECT __fab_row, n + {{ q[0].b }} AS v FROM input_table',
+  'null', t.n) f ORDER BY 1;
+----
+5
+6
+8
+
+# --- an input column under the reserved prefix would collide with the provenance column, so it is refused
+# at bind rather than silently shadowed. ---
+statement error
+SELECT f.* FROM (SELECT 1 AS __fab_x) t, fluid_query_lateral(
+  'SELECT __fab_row, 1 AS v FROM input_table', 'null', t.__fab_x) f;
+----
+<REGEX>:.*reserved '__fab' prefix.*
+
+# --- an EMPTY outer relation yields no rows and no error: there is no chunk, so nothing renders. ⚠ Unlike
+# fluid_query_batch, which renders ONCE over an empty input because its template is a generator whose
+# output need not depend on the rows. ---
+query I
+SELECT count(*) FROM (SELECT * FROM lat_t WHERE false) t, fluid_query_lateral(
+  'SELECT __fab_row, n AS v FROM input_table', 'null', t.n) f;
+----
+0
+
+# --- ⚠ THE PROPERTY THAT DISTINGUISHES IT FROM THE COLLECTOR: it composes. The lateral's output is an
+# ordinary relation in the caller's plan, so WHERE and ORDER BY over it work and the outer columns are
+# available beside it — none of which a collector taking a TABLE argument can offer. ---
+query II
+SELECT t.id, f.s FROM lat_t t, fluid_query_lateral(
+  'SELECT __fab_row, n + id AS s FROM input_table', 'null', t.n, t.id) f
+WHERE f.s > 2 ORDER BY f.s DESC;
+----
+2	5
+3	3
+
+statement ok
+DROP TABLE lat_t;

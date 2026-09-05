@@ -2938,12 +2938,14 @@ fresh scratch dir — and it VOIDED a mutation run here until a fresh-dir contro
 
 ### 19.9 What is NOT built
 
-- **The LATERAL form** (`FROM t, fluid_query_lateral(…, t.a, t.b)`) — parallel, and the host stamps the
-  correlated columns. It needs ONE thing this shape does not: a mandatory row id in every generated
-  statement, because `LateralResult.Origin` is required and absent-with-a-different-length is a hard error.
-  ⚠ The wire columns being named by their rendered EXPRESSION TEXT (`t.a`, but also `(t.a + 1)`) is NOT a
-  second obstacle — user decision, 2026-09-05: take the names as they come, and a caller wanting clean ones
-  passes a struct and addresses its fields in the template.
+- ~~**The LATERAL form**~~ — **BUILT the same day, §22.** Its one genuine obstacle was the one named here
+  (a mandatory row id in every generated statement, because `LateralResult.Origin` is required and
+  absent-with-a-different-length is a hard error), and it survived contact unchanged.
+  ⚠ The naming half did NOT. This entry said a caller wanting clean names "passes a struct and addresses
+  its fields in the template" — MEASURED, that struct's column is named
+  `main.struct_pack(a := t.id, b := t.n)` and has to be quoted verbatim, which is worse than the answer
+  §22.3 found: a positional column alias (`FROM (SELECT * FROM input_table) AS q(r, a, b)`), which is
+  ordinary SQL and needs no knowledge of what anything rendered as.
 - **A bounded-memory batched variant** on the streaming in-out — same body, different registration.
 - **The input rows as a Fluid VALUE** (`input`, via the `{% query %}` value model), which would let a
   template loop over rows without a round trip. Today `{% query rows %}SELECT … FROM input_table{% endquery %}`
@@ -3079,3 +3081,199 @@ alone would be equally true of a build where the condition had stopped evaluatin
 
 ⚠ Both parser options are now on at once and a function call is itself parenthesised, so §27 also pins that
 `query(...)` still parses — enabling grouping did not disturb the call syntax it depends on.
+
+## 22. ✅ AS BUILT (2026-09-05) — `fluid_query_lateral`: the CORRELATED sibling
+
+```sql
+SELECT t.id, f.*
+FROM   orders t,
+       fluid_query_lateral(
+         'SELECT __fab_row, upper(name) AS u FROM input_table',
+         'null', t.name) f;
+```
+
+User-designed (the original sketch was `fluid_query_each`, "template, params, vararg lateral1, vararg
+lateral2 .."), with the signature settled by their later hint: *"laterals currently don't support named
+args, so params must be positional"*. C#-only in the plugin — **NO ABI change, NO C++ change**, because
+`Params.Constant` and the lateral variadic tail were both already built. Gate `verify_plugin_fluid`
+459 → **563**, hermetic floor 8735 → **8839**, two mutants each killed at its own assertion — and the
+second of them (§22.8) is the most useful thing in this section.
+
+### 22.1 What it is, against `fluid_query_batch`
+
+Both render a template with DATA in hand and run the result. The difference is the operator:
+
+| | `fluid_query_batch` (collector) | `fluid_query_lateral` |
+|---|---|---|
+| input | a TABLE argument | ordinary per-row COLUMNS |
+| composition | a standalone relation | correlated — the caller's own columns are stamped on |
+| parallelism | sequential, one session | **PARALLEL**, one session per pipeline thread |
+| cross-chunk state | temp tables carry between groups | **nothing carries** |
+| memory | the whole input is buffered before the first render | one chunk at a time |
+| provenance | none needed | **mandatory** (§22.2) |
+
+⇒ reach for the lateral when the generated statement is *per row* and the result belongs beside the outer
+row; reach for the collector when the template needs the whole relation, or needs to accumulate.
+
+### 22.2 ⚠⚠ PROVENANCE IS THE CONTRACT, and it is the whole cost
+
+One call sees up to 2048 input rows and may return any number of output rows, so `LateralResult.Origin` —
+"which INPUT row did this OUTPUT row come from" — is what lets the host stamp the correlated columns.
+Absent-with-a-different-length is a hard error by design, so it cannot be inferred.
+
+So `input_table` carries **`__fab_row`** as its first column and **the generated statement must project
+it**. It is stripped from the result. Three consequences:
+
+- `SELECT * FROM input_table` is the identity template — the id rides along and disappears again.
+- 1→N is "repeat the id", 1→0 is "omit the row". Both are gated in one result, because only the PAIRING
+  shows them: a row count would be equally true of a build that had lost the correlation.
+- Omitting it is refused **at BIND**, naming the column and the fix. Not at execute, and never silently:
+  a mis-attributed row is a wrong answer with nothing failing.
+
+⚠ A value outside `[0, chunk)` is refused too, with the value in the message. The host checks this as well
+and precisely (`ReadOriginColumn`); the managed check exists for the MESSAGE, since only this side knows
+the number came from a projected `__fab_row`. The mistake it catches is computing the id instead of
+carrying it through.
+
+### 22.3 ⚠⚠ The input column NAMES, measured — and the answer is better than the design assumed
+
+DuckDB synthesises the input relation from the argument EXPRESSIONS, so a column is named by its rendered
+text. MEASURED:
+
+| argument | column name |
+|---|---|
+| `t.n` | `n` |
+| `t.n + 1` | `(t.n + 1)` |
+| `upper('x')` | `upper('x')` |
+| `{'a': t.id, 'b': t.n}` | `main.struct_pack(a := t.id, b := t.n)` |
+| a LITERAL call — no expression text | `col<SLOT>` |
+
+⚠⚠ **`col<SLOT>` is the ARGUMENT position, not the input position.** With the two constants ahead of it,
+the first input column of `f('tpl', 'null', 7, 'x')` is **`col2`**, not `col0`. Defensible (it names the
+argument), and surprising enough to gate — the two naming regimes are pinned as a PAIR, since either alone
+says nothing about the other.
+
+⚠ **The naming-free spelling is a positional column alias, and it is ordinary SQL:**
+
+```sql
+SELECT r AS __fab_row, a * b AS s FROM (SELECT * FROM input_table) AS q(r, a, b)
+```
+
+The columns are positional — row id first, then the arguments in call order — so this needs no knowledge of
+what anything rendered as and is identical in both call shapes. Note the id is re-aliased BACK to
+`__fab_row`: the requirement is on the OUTPUT column's name, not the input's.
+
+⇒ this **supersedes the struct advice in §19.9**. Passing one struct does give the template a single
+value, but its rendered name (`main.struct_pack(a := t.id, b := t.n)`) has to be quoted verbatim to address
+it, which is worse than the alias in every respect. The struct is still the right shape when you want the
+fields *together*; the alias is what makes either shape addressable.
+
+### 22.4 ⚠⚠ `params` CANNOT be `NULL` — the no-bag spelling is `'null'`
+
+Both cost arguments are `Params.Constant`, forced: a NAMED argument is unusable in the correlated shape
+(measured — DuckDB drops the name and matches positionally, so `f(t.n, params := …)` is a Binder Error
+while the literal call works). A constant occupies a positional slot and is recovered in both shapes.
+
+But a constant that arrives NULL is REFUSED by the host, and rightly: in the correlated shape the value is
+recovered from the synthesized column's rendered expression text, where an explicit `NULL` is
+indistinguishable from a fold that FAILED (a column, a volatile) — which is the one thing that refusal
+exists to catch. So:
+
+| written | result |
+|---|---|
+| `NULL` | **refused** — *"is a bind-time CONSTANT, and this argument has no bind-time value"* |
+| `'null'` | binds; the bag is NIL, so `{% if params %}` is FALSE |
+| `'{}'` | binds; the bag is an empty object, so `{% if params %}` is TRUE |
+| `{'mul': 10}` | binds — a STRUCT constant survives the correlated shape |
+
+All four are gated, and the last three are the control: the refusal alone would be equally true of a build
+where constants had stopped arriving at all.
+
+### 22.5 ⚠⚠ A shipped defect the first run found: the result's ARRAYS were freed under the caller
+
+The first build read the drained batches, built the output over `parts[0]`'s columns, and disposed every
+part in a `finally`. That is a use-after-free, and it faulted where such things fault rather than where
+they are written: **`0xC0000005` inside `Apache.Arrow.C.CArrowArrayExporter.ReleaseArray`**, two frames
+deep, with nothing pointing at the plugin.
+
+The fix is an ownership rule, stated at the seam:
+
+- **several parts** ⇒ every output column is freshly allocated by `ArrowArrayConcatenator`, so all the
+  parts are released;
+- **one part** ⇒ the output columns ARE that part's, so the batch is handed on undisposed and only the
+  provenance column — the one array not handed on — is released.
+
+⚠ Disposing a single column is not a trick: `RecordBatch.Dispose` is *defined* as disposing its columns,
+so this is that operation performed selectively, and every array is still disposed exactly once. ⚠ And it
+is a `catch`, not a `finally`: only the failure path may free blindly.
+
+⚠ The gate for it is the **6000-row checksum** over a fan-out that exceeds one Arrow batch — the branch
+that would otherwise truncate silently. A small-result test exercises only the single-part branch.
+
+### 22.6 What is NOT gated, and why
+
+- **"No state carries between chunks."** The operator is parallel, so which rows reach which session is the
+  scheduler's business; asserting it would be flaky in one direction and vacuous in the other. It is a
+  property of the design — one `FluidRenderSession`, one DuckDB connection and one temporary catalog per
+  session — and it is documented on the class instead.
+  ⚠ What IS measured is that running several sessions at once is CORRECT, which is the half that could
+  break: every session issues `CREATE OR REPLACE TEMP TABLE input_table` under the same name, so a shared
+  catalog would have them overwriting each other. **50,000 distinct correlated values at `threads = 8`:
+  50,000 rows out, `sum` exactly 2,499,950,000.** Not in the suite — a row count that large is a poor gate
+  and the property it proves is structural — but worth having taken once.
+- **The `publish()` HANG the refusal replaces.** A test reproducing it would hang the tier. The refusal is
+  pinned; the hang is the same one §19.2 measured for `fluid_query_batch`, from the same cause (the
+  generated statement runs on the render's own pin).
+
+### 22.7 Still open
+
+- **A `batchsize`-like control.** A lateral's chunk is DuckDB's, up to 2048 rows; there is no way to ask
+  for smaller ones. Nobody has needed it.
+- **Projection pushdown into the generated statement.** The declared output is fixed at bind, so a caller
+  selecting one column still pays for all of them — the same obstacle `publish` has (docs §18).
+- **The input rows as a Fluid VALUE**, as for the collector (§19.9): `{% query %}` over `input_table` does
+  it in one statement today.
+
+### 22.8 ⚠⚠ THE MUTANT THAT SHOWED THE PROVENANCE ROWS WERE VACUOUS
+
+Two mutants, both killed — but the second one only after the section had been rewritten around what it
+found, and that is the part worth carrying.
+
+| mutant | dies |
+|---|---|
+| **A** — `sawOrigin` starts `true`, i.e. never refuse a generated statement that omits `__fab_row` | at the "must project `__fab_row`" refusal, after 529 pass |
+| **C** — `origin[i] = 0`, i.e. ignore the projected `__fab_row` entirely | at the multi-row fan-out, after 484 pass |
+
+**C's FIRST run died at the LAST assertion in the section, after 510 of 511 passed** — a kill, and a
+worthless one. Every provenance row above it passed with the mapping thrown away.
+
+**The reason is that a lateral call with ONE input column is delivered ONE OUTER ROW AT A TIME.** With a
+chunk of one row, the only valid provenance index is 0, so a constant 0 is *correct*. MEASURED with a
+template that reports its own chunk size (`(SELECT count(*) FROM input_table)`):
+
+| call shape | chunk sizes over 3 rows |
+|---|---|
+| one input column (`f(…, t.n)`) | 1, 1, 1 |
+| one input column, no outer column projected | 1, 1, 1 |
+| **two input columns (`f(…, t.n, t.id)`)** | **1, 2, 2** |
+
+⇒ every provenance assertion now runs on a two-column call, over six rows, with **`max(chunk) > 1` as the
+control** — because without it the section would be asserting a property it never reaches. ⚠ Only `> 1` is
+pinned, never the sizes: the grouping is DuckDB's scheduling, and asserting it would be a test of the
+scheduler.
+
+⚠ The sharpest row is a template that REORDERS its own output (`ORDER BY n DESC`), so within a chunk the
+output order deliberately differs from the input order. A mapping that took position in the OUTPUT — the
+plausible wrong implementation, and one a constant-0 mutant does not model — pairs the wrong outer row with
+the wrong value there and nowhere else.
+
+⚠ The one-input-column rows are KEPT, labelled as the row-by-row path: both paths exist and both should
+work. What changed is that the section no longer *claims* they test provenance.
+
+**The transferable rule: a gate over a batched interface is only as good as the batch it actually gets.**
+Nothing in the SQL says how many rows reach one call, so "this obviously exercises the mapping" was an
+assumption — and the mutant is what turned it into a measurement.
+
+⚠ A third mutant was not re-run because it was already observed during the build: reverting §22.5's
+ownership rule (dispose every part in a `finally`) does not fail an assertion, it takes the process down
+with `0xC0000005` inside Arrow's release callback. A crash is a kill; it is just not one that names itself.
