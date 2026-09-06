@@ -1696,6 +1696,40 @@ follow it exactly as in `{% query %}`: `{% exec n limit: 100 %}`. The number is 
 > above. A `{% break %}` inside the block leaves a half-rendered statement, which is discarded rather than
 > executed.
 
+**`{% provider_query %}` / `{% provider_exec %}` run the body on ANOTHER engine.** The body is written in
+that provider's dialect (T-SQL, DAX) and runs against an attached fabricator catalog, while the result comes
+back as an ordinary Liquid value:
+
+```sql
+SELECT fluid_render('{% provider_query "mssql" r region: "eu" %}
+                       SELECT id, region
+                       FROM dbo.people
+                       WHERE region = @region
+                     {% endprovider_query %}{{ r.size }} rows, first {{ r[0].id }}', NULL);
+```
+
+```sql
+SELECT fluid_render('{% provider_exec "mssql" n old: "us", new: "uk" %}
+                       UPDATE dbo.people SET region = @new WHERE region = @old
+                     {% endprovider_exec %}updated {{ n }}', NULL);
+```
+
+The tag's named arguments become the **provider's** parameters — `@region` for SQL Server and DAX — and they
+are bound, never spliced, so the dialect difference between DuckDB and the provider cannot leak into a value.
+The catalog is an **expression**, so `"mssql"` and `params.cat` both work; a bare word is a Liquid variable
+and is refused by name rather than reaching the provider as an empty catalog. The name is required on
+`provider_query` and optional on `provider_exec`, matching `{% query %}` and `{% exec %}`.
+
+> ⚠ **The SELECT-only guard does not apply here, and that is deliberate.** `{% query %}` refuses a
+> non-`SELECT` by asking DuckDB's parser; there is no such parser for another engine's dialect, so a
+> `{% provider_exec %}` inside `fluid_query` runs at **bind** time — which repeats, including on `EXPLAIN`
+> and on every use of a view built over it. Use `fluid_render` for a write unless you want that
+> multiplication, and treat the two tag names as your own assertion about what the body does.
+
+What the tags buy over `{% query r %}SELECT * FROM fabricator_query('mssql', '…'){% endquery %}` — which has
+always worked — is that the body stops being a quoted string argument: multi-line, with `{% for %}` and
+`{% if %}` inside it, and no escaping.
+
 **`{% query name materialize: 'view' %}` also leaves the result on the connection** — as a TEMP view or
 table the rest of the template can read as SQL, *while the name stays usable in Liquid too*:
 

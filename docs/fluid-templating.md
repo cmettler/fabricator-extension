@@ -3824,3 +3824,118 @@ The SQL object is a different namespace and still holds the rows, which §34 ass
 ⚠ The name is now meaningful in Liquid where it previously resolved to nothing. A template that rendered
 `{{ input_table }}` and got an empty string will now render the row set. Low risk (it referenced a name that
 meant nothing), but it is a behaviour change rather than a pure addition.
+
+## 29. ✅ AS BUILT (2026-09-06) — `{% provider_query %}` / `{% provider_exec %}`: a body in ANOTHER engine's dialect
+
+User-designed (*"seperatur tags `{% provider_query cat r %}` / `{% provider_exec cat n %}` is good"*), built as
+slice B of [provider-query-parameters.md](provider-query-parameters.md). C#-only IN THE PLUGIN: no ABI, no
+C++, no bridge. Gate: a NEW suite `verify_plugin_fluid_provider` (**22**, SERVICE tier), two mutants each
+killed at its own row.
+
+```liquid
+{%- provider_query 'mssql' r region: 'eu' -%}
+  SELECT id, region
+  FROM dbo.people
+  WHERE region = @region
+{%- endprovider_query -%}
+{{ r.size }} rows, first is {{ r[0].id }}
+
+{%- provider_exec 'mssql' n old: 'us', new: 'uk' -%}
+  UPDATE dbo.people SET region = @new WHERE region = @old
+{%- endprovider_exec -%}
+```
+
+### 29.1 WRAP AND DELEGATE — there is no new mechanism
+
+The rendered body is embedded in a `fabricator_query` / `fabricator_exec` call which the existing
+`{% query %}` path runs. So the value model, the row cap, the per-render pinned connection and `materialize:`'
+siblings compose for free, and the tags cannot drift from the function forms on what a result or a count
+means. `RunCaptured` is the single entry point for both.
+
+⚠ **What the tag buys is that the body stops being a quoted string argument** — multi-line, with
+`{% for %}`/`{% if %}` inside, no escaping. `{% query r %}SELECT * FROM fabricator_query('mssql', '…')
+{% endquery %}` has always been legal. Exactly the argument that justified `{% exec %}` over `exec("…")`.
+
+⚠ **A distinct NAME is a feature, not readability.** An option on the existing block
+(`{% query r catalog: 'mssql' %}`) was considered and rejected: `materialize:` changes where the rows GO,
+while a catalog option would change which engine PARSES AND RUNS the body. An option that silently switches
+dialect is the runs-and-means-something-different shape.
+
+### 29.2 ⚠⚠ The tag's named arguments are the PROVIDER's parameters, bound the whole way
+
+`params := struct_pack("region" := $region)` — never a rendered literal. MEASURED before building that this
+binds and keeps its types: a prepared `fabricator_query($cat, $sql, params := struct_pack(a := $a, b := $b))`
+returns `int32`/`varchar` for 41 and `'hi'`. It matters because the only interpolation available is
+`DuckSql.Literal`, which is DuckDB DIALECT — it coincides with T-SQL for strings and integers and diverges
+for booleans, blobs and temporals (§7.4a's `| sql` finding, one layer out).
+
+⚠ The CATALOG and the BODY are embedded as DuckDB string LITERALS, and that is correct rather than a
+shortcut: they are arguments to a DuckDB function, so DuckDB's dialect is the right one. Nothing of the body
+is parsed here — it is opaque text on its way to another engine.
+
+⚠ `fabricator_query` takes the bag NAMED and `fabricator_exec` POSITIONALLY, because the latter is a SCALAR
+and a DuckDB scalar carries no named parameters at all. **Mutant A** (send the query bag positionally) dies
+at the first parameter row after 4 assertions.
+
+⚠ With no named arguments the bag is OMITTED rather than sent empty: `struct_pack()` with no fields is a
+zero-field struct, which Apache.Arrow refuses in both directions.
+
+### 29.3 ⚠⚠ `{% provider_exec %}` goes through the **QUERY** path, and it must
+
+The wrapper is `SELECT fabricator_exec(…)` — a SELECT by construction — so `{% exec %}`'s classifier would
+REFUSE it. The provider write happens inside that scalar; what DuckDB runs is a read.
+
+⚠ That is also the sharpest illustration of §29.5: **the statement DuckDB classifies and the statement the
+provider executes are not the same statement.**
+
+⚠ The count is read back from an ALIASED column (`AS affected`). Without the alias the column is named by its
+own expression text — the whole `fabricator_exec(...)` call, quotes and all — which is what the value would
+have to be addressed by. **Mutant C** (drop the alias) dies at the count row after 6 assertions.
+
+### 29.4 ⚠ The catalog is an EXPRESSION, and a bare word is refused BY NAME
+
+`{% provider_query 'mssql' r %}` and `{% provider_query params.cat r %}` both work, because the first token is
+an INPUT and a bare identifier in an input position reads as a Liquid variable to anyone who has written
+Liquid. The cost is that `{% provider_query mssql r %}` — the spelling someone will try first — evaluates to
+nil, so it is refused HERE naming the quoted form. Without that it would reach the host as an empty catalog
+and fail somewhere that names neither the tag nor the word.
+
+⚠ The result name is REQUIRED on `provider_query` and OPTIONAL on `provider_exec`, matching `{% query %}` vs
+`{% exec %}`: a write's count is often not wanted, while a read that binds nothing has done nothing. Same
+negative lookahead as `{% exec %}` — without it `{% provider_exec 'c' x: 7 %}` would take `x` as the name and
+then fail on the `: 7`, because `ZeroOrOne` does not retry its empty branch once the sequence fails.
+
+### 29.5 ⚠⚠ The SELECT-only guard does NOT transfer — ACCEPTED and PINNED, not overlooked
+
+`{% query %}` refuses a non-SELECT using DuckDB's OWN parser, because a bind REPEATS and happens WITHOUT
+execution. For provider SQL there is no parser we can ask, and `fabricator_query` runs writes happily — so a
+provider tag inside `fluid_query` writes at BIND time, repeatedly.
+
+**MEASURED**: an `EXPLAIN` of a `fluid_query` containing `{% provider_exec %}INSERT …{% endprovider_exec %}`
+takes the target table 0 → **1**, and the statement that DOES execute takes it 1 → **2**.
+
+**Accepted (user decision, 2026-09-06)**, for the reason the `exec()` refusal was DELETED: §11.1a MEASURED
+that a host-side refusal was already walk-aroundable by nesting a writing scalar inside a SELECT, and a
+refusal anyone can nest around is a speed bump for the accident that READS as a defence. So the cost is
+PINNED as asserted behaviour (§5 of the suite), exactly as `{% exec %}`'s own bind-repetition is — a change
+then arrives as a failed assertion naming the step rather than as a surprise in someone's database.
+
+⛔ Do NOT "fix" it by matching a leading keyword on the body: §9.2's measured-broken prefix check, defeated by
+`WITH x AS (…) INSERT …`, a view, or a name we do not ship.
+
+### 29.6 ⚠ Two suite mechanics that cost real time
+
+* **`require json` is LOAD-BEARING**, and its absence reads as a broken FEATURE. The classifier is
+  `json_serialize_sql`; `unittest` does not auto-load extensions, so without the directive EVERY provider tag
+  is refused (fail-closed) with a message about the json extension. ⚠ It cost half an hour because the
+  runner's terse failure (`explicitly with message: 0`) hid it — **the full output had the whole error all
+  along, and a narrow `grep` was discarding it.** Same rule this repo already records for `run-suites.sh`.
+* **sqllogictest splits a result ROW on WHITESPACE**, so a single-column value containing spaces is read as
+  several values and never matches. Every rendered assertion here is deliberately `|`-separated.
+* ⚠ `rtrim(x, chr(10))`, not `trim(x)`: DuckDB's one-argument `trim` removes SPACES and leaves the newline a
+  `$$`-quoted template ends with.
+
+### 29.7 Why the gate is its OWN suite
+
+`verify_plugin_fluid` is HERMETIC. The tags need a real provider catalog to mean anything, so adding a
+`require-env` there would move **759** assertions out of the hermetic tier to gate 22.

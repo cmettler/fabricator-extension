@@ -1,0 +1,190 @@
+# name: test/verify_plugin_fluid_provider.test
+# description: {% provider_query %} / {% provider_exec %} — a Fluid body in ANOTHER engine's dialect
+# group: [fabricator]
+#
+# ⚠ SERVICE TIER, and that is why it is its own file. The tags need a real provider catalog to mean anything,
+#   while verify_plugin_fluid is HERMETIC — adding a require-env there would move 759 assertions out of the
+#   hermetic tier to gate 30.
+#
+# Slice B of docs/provider-query-parameters.md. The tags WRAP AND DELEGATE: the rendered body is embedded in
+# a fabricator_query / fabricator_exec call which the {% query %} path runs, so the value model, the row cap
+# and the per-render pinned connection are shared rather than re-implemented.
+
+require fabricator
+
+# ⚠ LOAD-BEARING, not hygiene: query()'s classifier is `json_serialize_sql`, and unittest does NOT
+# auto-load extensions — so without this EVERY provider tag is refused (fail-closed) and the suite reads as
+# a broken FEATURE rather than a missing REQUIRE.
+require json
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS mssql (TYPE fabricator);
+
+statement ok
+SELECT fabricator_exec('mssql', 'IF OBJECT_ID(''dbo.fpt'') IS NOT NULL DROP TABLE dbo.fpt; CREATE TABLE dbo.fpt(id INT, region NVARCHAR(20));');
+
+statement ok
+SELECT fabricator_exec('mssql', 'INSERT INTO dbo.fpt VALUES (1, ''eu''), (2, ''eu''), (3, ''us'');');
+
+# ═══ §1  The body is TEMPLATE TEXT, not a quoted argument ═════════════════════════════════════════════
+# ⚠ THIS IS WHAT THE TAG BUYS, and nothing else here does. `{% query r %}SELECT * FROM fabricator_query(
+# 'mssql', '…'){% endquery %}` has always been legal; what it cannot be is multi-line with {% for %} inside
+# and no escaping. Same argument that justified {% exec %} over exec("…").
+#
+# ⚠ THE RENDERED VALUES ARE DELIBERATELY SPACE-FREE (`|`-separated). sqllogictest splits a result ROW on
+# WHITESPACE, so a single-column value containing spaces is read as SEVERAL values and never matches — the
+# failure reports a bare "0" and says nothing about why.
+#
+# The result is the SAME ArrayValue of indexable rows {% query %} yields — it goes through one RunCaptured —
+# so `r[0].id` reads identically whichever tag produced it.
+
+query T
+SELECT rtrim(fluid_render($$
+{%- assign cols = "id,region" | split: "," -%}
+{%- provider_query 'mssql' r -%}
+  SELECT {% for c in cols %}{{ c }}{% unless forloop.last %}, {% endunless %}{% endfor %}
+  FROM dbo.fpt
+  ORDER BY id
+{%- endprovider_query -%}
+n={{ r.size }}|first={{ r[0].id }}-{{ r[0].region }}|last={{ r[2].id }}-{{ r[2].region }}
+$$, '{}'), chr(10));
+----
+n=3|first=1-eu|last=3-us
+
+# ═══ §2  ⚠⚠ THE TAG'S NAMED ARGUMENTS ARE THE PROVIDER'S PARAMETERS ═══════════════════════════════════
+# They cross as DuckDB BOUND parameters all the way — `params := struct_pack("region" := $region)` — never a
+# rendered literal. That matters because the only interpolation available is DuckSql.Literal, which is DuckDB
+# DIALECT: it coincides with T-SQL for strings and integers and diverges for booleans, blobs and temporals.
+#
+# ⚠ THE CONTROL IS LOAD-BEARING: without the 'eu' row, the 0 below would be equally satisfied by a build in
+# which the parameter never arrived.
+
+query T
+SELECT rtrim(fluid_render($$
+{%- provider_query 'mssql' r region: 'eu' -%}
+  SELECT id FROM dbo.fpt WHERE region = @region
+{%- endprovider_query -%}
+{{ r.size }}
+$$, '{}'), chr(10));
+----
+2
+
+query T
+SELECT rtrim(fluid_render($$
+{%- provider_query 'mssql' r region: "eu' OR 1=1 --" -%}
+  SELECT id FROM dbo.fpt WHERE region = @region
+{%- endprovider_query -%}
+{{ r.size }}
+$$, '{}'), chr(10));
+----
+0
+
+# ═══ §3  {% provider_exec %} — the count, and the write ═══════════════════════════════════════════════
+# ⚠⚠ IT GOES THROUGH THE **QUERY** PATH, NOT {% exec %}'s. The wrapper is `SELECT fabricator_exec(…)` — a
+# SELECT by construction — so {% exec %}'s classifier would REFUSE it. The provider write happens inside that
+# scalar; what DuckDB runs is a read. That is also the sharpest illustration of why the SELECT-only guard
+# cannot transfer (§5): the statement DuckDB classifies and the statement the provider executes are not the
+# same statement.
+
+query T
+SELECT rtrim(fluid_render($$
+{%- provider_exec 'mssql' n old: 'us', new: 'uk' -%}
+  UPDATE dbo.fpt SET region = @new WHERE region = @old
+{%- endprovider_exec -%}
+updated={{ n }}
+$$, '{}'), chr(10));
+----
+updated=1
+
+query IT
+SELECT id, region FROM fabricator_query('mssql', 'SELECT id, region FROM dbo.fpt WHERE id = 3');
+----
+3	uk
+
+# ⚠ The name is OPTIONAL, matching {% exec %} and unlike {% query %}: a write's count is often not wanted,
+# while a read that binds nothing has done nothing. The block still runs.
+
+statement ok
+SELECT fabricator_exec('mssql', 'IF OBJECT_ID(''dbo.fptc'') IS NOT NULL DROP TABLE dbo.fptc; CREATE TABLE dbo.fptc(n INT);');
+
+query T
+SELECT rtrim(fluid_render($$
+{%- provider_exec 'mssql' -%}INSERT INTO dbo.fptc VALUES (7){%- endprovider_exec -%}ok
+$$, '{}'), chr(10));
+----
+ok
+
+query I
+SELECT c FROM fabricator_query('mssql', 'SELECT count(*) AS c FROM dbo.fptc');
+----
+1
+
+# ═══ §4  The catalog is an EXPRESSION, and a bare word is refused BY NAME ═════════════════════════════
+# ⚠ An expression rather than an identifier, because it is an INPUT — so a literal, a variable and a member
+# access all work. The cost is that a BARE word parses as a Liquid variable and evaluates to nil, which is
+# exactly the spelling someone will try first, so it is refused here naming the quoted form. Without that it
+# would reach the host as an empty catalog and fail somewhere that names neither the tag nor the word.
+
+query T
+SELECT rtrim(fluid_render($$
+{%- provider_query params.cat r -%}SELECT count(*) AS c FROM dbo.fpt{%- endprovider_query -%}
+{{ r[0].c }}
+$$, {'cat': 'mssql'}), chr(10));
+----
+3
+
+statement error
+SELECT fluid_render('{% provider_query mssql r %}SELECT 1 AS x{% endprovider_query %}', '{}');
+----
+was given no catalog
+
+statement error
+SELECT fluid_render('{% provider_query ''mssql'' r %}   {% endprovider_query %}', '{}');
+----
+block is empty
+
+# ═══ §5  ⚠⚠ THE COST OF THE SELECT-ONLY GUARD NOT TRANSFERRING — pinned, not described ════════════════
+# {% query %} refuses a non-SELECT using DuckDB's OWN parser, because a bind REPEATS and happens WITHOUT
+# execution. For provider SQL there is no parser to ask, and fabricator_query runs writes happily — so a
+# provider tag inside fluid_query writes at BIND time, repeatedly.
+#
+# ⚠⚠ ACCEPTED AND DOCUMENTED (user decision, 2026-09-06), for the reason the exec() refusal was DELETED:
+# §11.1a MEASURED that a host-side refusal was already walk-aroundable by nesting a writing scalar inside a
+# SELECT, and a refusal anyone can nest around is a speed bump for the accident that READS as a defence.
+# ⛔ Do NOT "fix" this by matching a leading keyword on the body — the measured-broken prefix check.
+#
+# So it is PINNED as asserted behaviour, exactly as {% exec %}'s own bind-repetition already is. A change
+# here then arrives as a failed assertion naming the step, rather than as a surprise in someone's database.
+
+statement ok
+SELECT fabricator_exec('mssql', 'IF OBJECT_ID(''dbo.fptb'') IS NOT NULL DROP TABLE dbo.fptb; CREATE TABLE dbo.fptb(n INT);');
+
+query I
+SELECT c FROM fabricator_query('mssql', 'SELECT count(*) AS c FROM dbo.fptb');
+----
+0
+
+# EXPLAIN binds and never executes — and the provider write happens anyway.
+statement ok
+EXPLAIN SELECT * FROM fluid_query('{% provider_exec ''mssql'' %}INSERT INTO dbo.fptb VALUES (1){% endprovider_exec %}SELECT 1 AS x');
+
+query I
+SELECT c FROM fabricator_query('mssql', 'SELECT count(*) AS c FROM dbo.fptb');
+----
+1
+
+# …and the statement that DOES execute writes again, so the count is the number of BINDS plus this one.
+statement ok
+SELECT * FROM fluid_query('{% provider_exec ''mssql'' %}INSERT INTO dbo.fptb VALUES (1){% endprovider_exec %}SELECT 1 AS x');
+
+query I
+SELECT c FROM fabricator_query('mssql', 'SELECT count(*) AS c FROM dbo.fptb');
+----
+2
+
+# ═══ §6  Teardown ════════════════════════════════════════════════════════════════════════════════════
+
+statement ok
+SELECT fabricator_exec('mssql', 'DROP TABLE dbo.fpt; DROP TABLE dbo.fptb; DROP TABLE dbo.fptc;');

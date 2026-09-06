@@ -190,6 +190,83 @@ internal static class FluidEngine
             return Completion.Normal;
         });
 
+        // ⚠⚠ {% provider_query <catalog> <name> %} / {% provider_exec <catalog> [<name>] %} — a body written
+        // in ANOTHER ENGINE's dialect, run against an attached fabricator catalog. WRAP AND DELEGATE: the
+        // rendered body is embedded in a fabricator_query / fabricator_exec call which the {% query %} path
+        // then runs, so the value model, the row cap and the per-render pinned connection are shared and the
+        // tags cannot drift from the function forms.
+        //
+        // ⚠ THE CATALOG IS AN EXPRESSION, not an identifier — `'mssql'` or `params.cat` — because it is an
+        // INPUT, and a bare identifier in an input position reads as a Liquid variable to everyone who has
+        // written Liquid. `{% provider_query mssql r %}` therefore evaluates to nil and is refused BY NAME
+        // (RequireCatalog), which is the loud half of that trade.
+        //
+        // ⚠⚠ THE SELECT-ONLY GUARD DOES NOT TRANSFER AND THAT IS A DECISION (user, 2026-09-06): there is no
+        // provider parser to ask, so a write inside fluid_query happens at BIND time, repeatedly. Accepted
+        // and PINNED as asserted behaviour, exactly as {% exec %}'s bind-repetition is. See
+        // FluidProviderTags for the precedent that settles it.
+        parser.RegisterParserBlock(
+            FluidProviderTags.QueryBlockName,
+            parser.Expression.And(parser.Ident).And(ZeroOrOne(parser.NamedArguments)),
+            static async (head, statements, output, encoder, ctx) =>
+        {
+            var (completion, body) = await CaptureBodyAsync(statements, ctx);
+            if (completion != Completion.Normal)
+            {
+                return completion;
+            }
+            var caller = FluidHostQuery.CallerOf(ctx);
+            var tag = FluidProviderTags.QueryBlockName;
+            var catalog = FluidProviderTags.RequireCatalog(
+                caller, tag, (await head.Item1.EvaluateAsync(ctx)).ToStringValue());
+            FluidProviderTags.RequireBody(caller, tag, body);
+            var parameters = await FluidHostQuery.BuildBlockParametersAsync(caller, tag, head.Item3, ctx);
+            var sql = FluidProviderTags.BuildStatement(
+                catalog, body, FluidProviderTags.NamesOf(parameters), isQuery: true);
+            // ⚠ Through RunCaptured, so the result is the SAME ArrayValue of indexable rows {% query %}
+            // yields — `{{ r[0].col }}` reads identically whichever tag produced it.
+            ctx.SetValue(head.Item2, FluidHostQuery.RunCaptured(ctx, tag, sql, parameters));
+            return Completion.Normal;
+        });
+
+        // ⚠ The name is OPTIONAL here and required above, matching {% exec %} vs {% query %}: a write's
+        // count is often not wanted, while a read that binds nothing has done nothing. Same negative
+        // lookahead as {% exec %} — without it `{% provider_exec 'c' x: 7 %}` would take `x` as the name and
+        // then fail on the `: 7`, because ZeroOrOne does not retry its empty branch once the sequence fails.
+        parser.RegisterParserBlock(
+            FluidProviderTags.ExecBlockName,
+            parser.Expression.And(ZeroOrOne(parser.Ident.AndSkip(Not(Terms.Char(':')))))
+                  .And(ZeroOrOne(parser.NamedArguments)),
+            static async (head, statements, output, encoder, ctx) =>
+        {
+            var (completion, body) = await CaptureBodyAsync(statements, ctx);
+            if (completion != Completion.Normal)
+            {
+                return completion;
+            }
+            var caller = FluidHostQuery.CallerOf(ctx);
+            var tag = FluidProviderTags.ExecBlockName;
+            var catalog = FluidProviderTags.RequireCatalog(
+                caller, tag, (await head.Item1.EvaluateAsync(ctx)).ToStringValue());
+            FluidProviderTags.RequireBody(caller, tag, body);
+            var parameters = await FluidHostQuery.BuildBlockParametersAsync(caller, tag, head.Item3, ctx);
+            var sql = FluidProviderTags.BuildStatement(
+                catalog, body, FluidProviderTags.NamesOf(parameters), isQuery: false);
+            // ⚠⚠ IT GOES THROUGH THE **QUERY** PATH, NOT THE EXEC ONE, AND IT MUST. The wrapper is
+            // `SELECT fabricator_exec(…)` — a SELECT by construction — so {% exec %}'s classifier would
+            // REFUSE it. The provider write happens inside that scalar; what DuckDB runs is a read.
+            // ⚠ This is also the sharpest illustration of why the SELECT-only guard cannot transfer: the
+            // statement DuckDB classifies and the statement the provider executes are different statements.
+            var rows = FluidHostQuery.RunCaptured(ctx, tag, sql, parameters);
+            var name = head.Item2;
+            if (name is not null)
+            {
+                var first = await rows.GetIndexAsync(NumberValue.Create(0), ctx);
+                ctx.SetValue(name, await first.GetValueAsync(FluidProviderTags.AffectedColumn, ctx));
+            }
+            return Completion.Normal;
+        });
+
         // ⚠⚠ {% ret %} — Scriban's early exit, which Liquid does not have and Fluid cannot express through
         // its Completion type (see FluidEarlyReturn for the measurement that settles it). It is an EMPTY
         // tag: our templates have no functions, so there is nothing for a return VALUE to mean.
@@ -534,4 +611,13 @@ internal sealed class FabricatorFluidParser : FluidParser
 
     /// <summary>Fluid's named-argument list — <c>a: 1, b: 2</c>. Matches at least one; wrap in ZeroOrOne.</summary>
     internal Parser<IReadOnlyList<FilterArgument>> NamedArguments => ArgumentsList;
+
+    /// <summary>Fluid's expression parser — the <c>'mssql'</c> in <c>{% provider_query 'mssql' r %}</c>.</summary>
+    /// <remarks>
+    /// ⚠ Used where the token is an INPUT rather than a name being bound, so a literal, a variable and a
+    /// member access all work. The cost is that a BARE word parses as a variable reference and evaluates to
+    /// nil rather than to itself — which the consuming tag refuses by name, since silently reaching the host
+    /// with an empty catalog is the failure that would name neither the tag nor the word.
+    /// </remarks>
+    internal Parser<Expression> Expression => LogicalExpression;
 }

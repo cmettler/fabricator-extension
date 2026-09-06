@@ -1,7 +1,7 @@
 # Parameter binding for `fabricator_query` / `fabricator_exec`, and the `{% provider_query %}` tags
 
-**Status: slices A1 (ABI v88) and A2 (DAX) BUILT 2026-09-06; B (the Fluid tags) not built.**
-⚠⚠ **§5 (A1) and §6 (A2) are the AS-BUILT records; §5 CORRECTS §2 and §3 in six places — read them first.**
+**Status: ALL SLICES BUILT 2026-09-06 — A1 (ABI v88), A2 (DAX), B (the two Fluid tags).**
+⚠⚠ **§5 (A1), §6 (A2) and §7 (B) are the AS-BUILT records; §5 CORRECTS §2 in six places and §7 settles §3.1 — read them first.**
 The original framing: User-raised, in two parts: *"instead of building fluid
 versions of fabricator_query + fabricator_exec we could add … tags to the existing fluid plugin"*, and
 *"i think fabricator_query/fabricator_execute ABI version with parameter binding would be beneficial?"*
@@ -207,7 +207,7 @@ about atomicity.
 | **A1** ✅ | ABI v88 + the DIMs + SQL Server override + the `params :=` surface — **BUILT, §5** | `verify_raw_query`: a parameterised SELECT, an injection pair with its control (`"eu' OR 1=1 --"` answering 0 beside `"eu"` answering N), and the describe/execute schema agreement |
 | **A2** ✅ | DAX override — **BUILT, §6**. `ExecuteQuery` was a THROW, and unifying `daxeval`'s bag onto the host decoder fixed a silent precision loss | `verify_dax` (manual — needs Power BI Desktop, so §6.5: the DAX-side rows were written BLIND) |
 | ~~**A3**~~ | ~~Delta/deltars refusal by name~~ — **NOT NEEDED**: the contract DIM refuses, so every non-overriding provider does (§5.3) | §15 asserts both refusals against a real Delta attach, with an unparameterised CTAS as the control |
-| **B** | the two tags | `verify_plugin_fluid`: both paths, the multi-line body, and whichever §3.1 decision was taken, asserted |
+| **B** ✅ | the two tags — **BUILT, §7** | a NEW suite `verify_plugin_fluid_provider` (22, SERVICE tier — `verify_plugin_fluid` is hermetic), two mutants |
 
 ⚠ A1's gate must include the **describe/execute agreement** explicitly — a parameterised statement whose
 described schema is compared against what the scan delivers. Everything else in `verify_raw_query` passes
@@ -362,8 +362,7 @@ temporal row.
 ### 5.8 What is NOT built
 
 * **A2 (DAX)** — BUILT the same day; see §6.
-* **B (the two Fluid tags)** — unchanged from §3, including the §3.1 decision, which is still a decision and
-  not a discovery.
+* **B (the two Fluid tags)** — BUILT the same day; §7, and §3.1 is SETTLED (option 1, by the user).
 * ⚠ **No tier-0 test for `ProviderParameters`, and the reason is the ADMISSION RULE rather than effort.**
   It is pure (no pointers, no I/O) but its closure is **Apache.Arrow**, and `Fabricator.Bridge.Tests` admits a
   file only when its closure is the BCL. Widening that rule is a decision about the tier, not something to
@@ -436,3 +435,39 @@ blind" before being read as a regression.
 
 ⚠ What IS established without a model: both assemblies compile, the payload publishes with all five SqlClient
 DLLs intact (the recorded publish-order hazard), and the ternary defect is measured on the pattern itself.
+
+---
+
+## 7. ✅ AS BUILT — slice B, the two Fluid tags (2026-09-06)
+
+C#-only in the plugin: no ABI, no C++, no bridge. Gate: a NEW suite `verify_plugin_fluid_provider` (**22**,
+SERVICE tier), two mutants each killed at its own row. **Full record, including every measurement:
+[fluid-templating.md](fluid-templating.md) §29.**
+
+### 7.1 §3.1 IS SETTLED: option 1, accept and document (user, 2026-09-06)
+
+The SELECT-only guard does not transfer, so a provider tag inside `fluid_query` writes at BIND time,
+repeatedly. **MEASURED**: an `EXPLAIN` of a `fluid_query` containing `{% provider_exec %}INSERT …` takes the
+target 0 → **1**, and the statement that DOES execute takes it 1 → **2**.
+
+The reasoning the user took is the one §3.1 listed first, and it is the same one that DELETED the `exec()`
+refusal: §11.1a MEASURED that a host-side refusal was already walk-aroundable by nesting a writing scalar
+inside a SELECT, so a refusal anyone can nest around is a speed bump for the accident that READS as a
+defence. ⇒ the cost is PINNED as asserted behaviour rather than described.
+
+⚠ Option 2 (refuse in `fluid_query`) was rejected on its own terms as well as on precedent: `fluid_render` is
+a VOLATILE scalar, so it is evaluated PER ROW instead of per bind — a different multiplier, not none.
+
+### 7.2 What the build added to §3
+
+§3 said: render the body, build `SELECT * FROM fabricator_query(<cat>, <body>, params := …)`, hand it to the
+existing `Run`. That held exactly. Three things it did not say:
+
+* **The bag crosses as DuckDB BOUND PARAMETERS** — `params := struct_pack("a" := $a)` — rather than as
+  rendered literals, which is what keeps a value out of `DuckSql.Literal`'s DuckDB dialect. MEASURED to bind
+  and keep its types before anything was built.
+* **`{% provider_exec %}` goes through the QUERY path**, because its wrapper is a SELECT by construction and
+  `{% exec %}`'s classifier would refuse it. That is §3.1's point in miniature: the statement DuckDB
+  classifies and the one the provider executes are different statements.
+* **The catalog is an EXPRESSION**, so `'mssql'` and `params.cat` both work — and a BARE word, the spelling
+  someone will try first, evaluates to nil and is refused by name.

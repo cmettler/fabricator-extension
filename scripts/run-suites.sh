@@ -650,7 +650,10 @@ case "$TIER" in
         # 53 since 2026-09-02: verify_plugin_fluid LEFT for the hermetic tier (Fluid is a built-in
         # provider assembly now, so it needs no plugin root). A DOWNWARD bump -- the run moved, it was not
         # lost.
-        : "${MIN_SUITES:=53}"
+        # 54 since 2026-09-06: + verify_plugin_fluid_provider ({% provider_query %} / {% provider_exec %}).
+        # It is its OWN suite because verify_plugin_fluid is HERMETIC and the tags need a real provider
+        # catalog -- a require-env there would have moved 759 assertions out of the hermetic tier to gate 22.
+        : "${MIN_SUITES:=54}"
         # 1424 since 2026-08-01: verify_exec_invalidate_cache 10 -> 21, for the OUT-OF-BAND DROP path Ã¢ÂÂ the
         # catalog's self-heal, documented in CLAUDE.md and until now covered by NOTHING. The service tier ran
         # 44/44 green while that path was broken, which is why the section exists. It must run with
@@ -990,7 +993,9 @@ case "$TIER" in
         # 3160 since 2026-09-06: verify_raw_query 34 -> 85, the ABI v88 parameter bag (§9-§16). 3109 + 51
         #   exactly, which is what shows no other suite moved — the ABI signatures of execute_query and
         #   execute_dml changed, so every suite in both tiers goes through them.
-        : "${MIN_ASSERTIONS:=3160}"
+        # 3182 since 2026-09-06: + verify_plugin_fluid_provider's 22 ({% provider_query %} /
+        #   {% provider_exec %}). 3160 + 22 exactly, so no other suite moved.
+        : "${MIN_ASSERTIONS:=3182}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2
