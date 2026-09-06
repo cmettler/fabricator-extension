@@ -444,6 +444,13 @@ case "$TIER" in
         # in that section is load-bearing and a mutant proved it: an earlier `USE memory.hq_s` leaves a
         # qualified entry, against which the bug does not fire, so the section PASSED with it fully present.
         # 8250 + 9 = 8259 exactly, from a green run.
+        # 9005 since 2026-09-06 (same day, fourth bump): verify_plugin_fluid 716 -> 729 -- {% query name
+        # materialize: 'view'|'table' %}, leaving the result on the render's connection as a TEMP object
+        # instead of pulling the rows into Liquid. /!\/!\ A TABLE can carry the block's named arguments and a
+        # VIEW cannot -- DuckDB's rule, not ours, since a view STORES its body -- so the combination is
+        # refused by name rather than surfacing an engine message that names neither. /!\ `materialize: null`
+        # is the default and its row is the discriminator for a real bug: an "unchanged when nothing was
+        # taken" shortcut cannot tell an ABSENT option from one PRESENT AND NULL.
         # 8992 since 2026-09-06 (same day, third bump): verify_plugin_fluid 702 -> 716 -- pinning that a
         # template's OUTPUT schema may be derived from its INPUT schema, not just from params. `input_table`
         # exists during the is_bind probe (empty, real columns) on both surfaces, so a template can DESCRIBE
@@ -577,7 +584,7 @@ case "$TIER" in
         # two functions have exactly ONE registration each, plus the HostsCatalog refusal and its
         # unknown-provider control. 3105 + 238 + 8259 - 3339 arithmetic aside, both numbers come from green
         # runs.
-        : "${MIN_ASSERTIONS:=8992}"
+        : "${MIN_ASSERTIONS:=9005}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

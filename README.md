@@ -1669,6 +1669,31 @@ follow it exactly as in `{% query %}`: `{% exec n limit: 100 %}`. The number is 
 > above. A `{% break %}` inside the block leaves a half-rendered statement, which is discarded rather than
 > executed.
 
+**`{% query name materialize: 'view' %}` leaves the result on the connection instead of in Liquid** — as a
+TEMP view or table, readable by the rest of the template:
+
+```sql
+SELECT fluid_render('{% query v materialize: "view" %}SELECT 3 AS a{% endquery %}'
+                 || '{% query u %}SELECT a FROM v{% endquery %}a={{ u[0].a }}', NULL);
+-- a=3
+```
+
+`materialize: null` is the default and means today's behaviour: the rows are bound to the name as a Liquid
+value. With `materialize:` set the name is a SQL object and *not* a Liquid variable — add `fluid: true` if
+you want both (the body then runs twice). Both kinds are TEMP: they live on the render's own connection and
+die with it.
+
+> ⚠ **A `'table'` can take the block's named parameters and a `'view'` cannot** — a view stores its body, so
+> DuckDB refuses a bound parameter inside one. `{% query t materialize: 'table', x: 5 %}SELECT $x …` works;
+> the same with `'view'` is refused, naming the fix.
+
+> ⚠ **A temp object shadows a catalog table of the same name** for the rest of the render — that is DuckDB's
+> rule for temporaries, and the name is the one you wrote. Your catalog table is untouched; the temp one dies
+> with the render.
+
+> ⚠ `materialize` and `fluid` are reserved argument names, so a statement cannot have parameters called
+> either. The body is still SELECT-only.
+
 **`{% ret %}` ends the render there and keeps what was written** — the guard clause Liquid has no other way
 to write. Everything after it, in the whole template, neither renders nor runs.
 

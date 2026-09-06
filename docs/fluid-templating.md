@@ -3627,3 +3627,67 @@ ordering, and a refactor moving the create past the render would take it away. T
 ⚠ It composes with `projected` (§24.5, §25) — the probe has the input schema but NOT the projection, which
 does not exist until after the bind. So a template may derive its FULL shape from the input at bind and then
 narrow that shape per call.
+
+## 27. ✅ AS BUILT (2026-09-06) — `{% query name materialize: … %}`
+
+User-asked: *"with {% query result %} i would like to have an optional result materialize types. fluid: true,
+materialize: 'view' or 'table' where both are temp"*, then *"materialize: null would be default"*. C#-only in
+the plugin — no ABI, no C++. Gate `verify_plugin_fluid` 716 → **729**, hermetic floor 8992 → **9005**.
+
+```liquid
+{% query r %}                                    rows in Liquid (unchanged)
+{% query r materialize: null %}                  the same, explicitly
+{% query v materialize: 'view' %}                TEMP VIEW v, no Liquid variable
+{% query t materialize: 'table', x: 5 %}         TEMP TABLE t, $x bound
+{% query t materialize: 'table', fluid: true %}  both (the body runs twice)
+```
+
+`fluid` defaults to *"no materialize"*, so today's spelling is unchanged and materializing does not ALSO pull
+every row into memory — which would defeat asking for a relation. With `materialize:` and no `fluid: true`
+the identifier names a SQL object and is NOT bound as a Liquid variable, so `{{ v }}` is empty; §33 asserts
+that pairing, because it is what "the rows went to SQL instead of to Liquid" means.
+
+### 27.1 ⚠⚠ A TABLE can carry the block's named arguments and a VIEW cannot
+
+MEASURED, and it is DuckDB's rule rather than ours: a CTAS with a bound parameter works, while the same body
+as a view is refused with *"Unexpected prepared parameter. This type of statement can't be prepared!"* — a
+view STORES its body, so a parameter has no meaning at scan time. The combination is therefore refused at the
+tag, naming the mode and pointing at `'table'`, rather than surfacing an engine message that names neither.
+
+⚠ Refused whenever named args are supplied with `'view'`, not only when the body references them: the
+narrower rule would depend on the body and be unpredictable, and the fix is one word.
+
+### 27.2 ⚠ It is ergonomics over something that already shipped, and that is fine
+
+`{% exec %}CREATE TEMP TABLE t AS …{% endexec %}` then `{% query u %}… FROM t{% endquery %}` has worked since
+the pinned connection (§12). What `materialize:` adds is that the body stays a `{% query %}` body — still
+classified as a SELECT, still parameterised the same way — so choosing the destination does not mean
+rewriting the block as DDL. This is the *"query + automatic CTAS"* idea deferred on 2026-09-04, in the
+explicit form rather than the automatic one.
+
+### 27.3 ⚠⚠ A bug my own shortcut created, and the row that pins it
+
+`materialize: null` failed with DuckDB's *"excess parameters"*. `ReadQueryOptionsAsync` returned the argument
+list UNCHANGED when nothing was taken — which cannot tell an ABSENT option from one PRESENT AND NULL, and
+`null` is the documented default. The list is always rebuilt now; §33's second row is the discriminator, and
+it would pass on a build with no options support at all if the first row were not beside it.
+
+### 27.4 ⚠⚠ The shadowing hazard, settled
+
+CLAUDE.md flagged it when the CTAS idea was deferred: *"`t` becomes a TEMP TABLE name and a temp table
+SHADOWS a catalog table of that name on the connection, silently. Settle that deliberately."* Settled, and
+MEASURED both halves: a materialized `mat_shadowed` DOES shadow a catalog table of that name for the rest of
+the render (99 over a table holding 1), and the catalog table is UNTOUCHED afterwards, because the temp
+object dies with the render's connection.
+
+⇒ accepted, because the name is the author's own identifier rather than something generated, and the blast
+radius ends with the render. Asserted rather than described, with the "untouched" row as what makes it
+acceptable.
+
+### 27.5 Reserved names, and what stays true
+
+`materialize` and `fluid` join `{% print %}`'s `delim`/`rowdelim` as argument names a statement cannot use
+for a parameter. Accepted for the same reason: it fails LOUDLY, with DuckDB naming the parameter it was not
+given. ⚠ The option is EVALUATED rather than matched on source text, so `materialize: params.mode` works. ⚠
+And the body is still classified as a SELECT — `materialize:` is a destination for rows, never a way to
+smuggle a write past the rule.

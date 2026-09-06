@@ -133,6 +133,68 @@ internal static class FluidHostQuery
         return Run(caller, sql, parameters, FluidRenderSession.For(ctx), "{% " + tag + " %}");
     }
 
+    /// <summary>
+    /// The <c>materialize:</c> option of <c>{% query name … %}</c>: run the body as SQL and leave the result
+    /// on the render's connection as a TEMP VIEW or TEMP TABLE named after the block's identifier, instead
+    /// of pulling the rows into Liquid.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// ⚠⚠ <b>A VIEW CANNOT CARRY THE BLOCK'S NAMED ARGUMENTS AND A TABLE CAN — MEASURED, and it is DuckDB's
+    /// rule rather than ours.</b> A CTAS with a bound parameter works; the same body as a view is refused
+    /// with <i>"Unexpected prepared parameter. This type of statement can't be prepared!"</i>, because a view
+    /// STORES its body and a parameter has no meaning at scan time. The combination is therefore refused
+    /// HERE, naming the mode and the alternative, rather than surfacing an engine message that names
+    /// neither.
+    /// </para>
+    /// <para>
+    /// ⚠ The body is still classified as a SELECT first, exactly as the unmaterialized form is — so
+    /// <c>materialize:</c> is a destination for the rows, never a way to smuggle a write past the classifier.
+    /// </para>
+    /// <para>
+    /// ⚠ TEMP, so it lives on the render's own pinned connection and dies with it: no name in the shared
+    /// catalog, nothing to clean up. It DOES shadow a catalog table of the same name for the rest of the
+    /// render, which is DuckDB's rule for temporaries and is the reason the name is the author's own
+    /// identifier rather than something generated.
+    /// </para>
+    /// </remarks>
+    internal static void MaterializeCaptured(TemplateContext ctx, string tag, string name, string sql,
+                                             RecordBatch? parameters, string kind)
+    {
+        var caller = CallerOf(ctx);
+        if (string.IsNullOrWhiteSpace(sql))
+        {
+            throw new ArgumentException($"{caller}: {{% {tag} %}} block is empty — it rendered no SQL.");
+        }
+        var run = FluidRenderSession.For(ctx)
+            ?? throw new InvalidOperationException(
+                $"{caller}: {{% {tag} %}} needs the IHostQuery service, which is not published here. "
+                + "It is available only from inside a fabricator function call.");
+        var surface = "{% " + tag + " %}";
+        RefuseUnlessSelect(caller, surface, sql, run);
+        if (parameters is not null && string.Equals(kind, "VIEW", StringComparison.Ordinal))
+        {
+            throw new ArgumentException(
+                $"{caller}: {surface} cannot take named parameters with materialize: 'view' — a view STORES "
+                + "its body, so DuckDB refuses a bound parameter inside one. Use materialize: 'table', which "
+                + "evaluates the body once and can.");
+        }
+        var ddl = $"CREATE OR REPLACE TEMP {kind} {DuckSql.QuoteIdent(name)} AS {sql}";
+        // ⚠ Through Query rather than ExecuteNonQuery when there are parameters, because ExecuteNonQuery has
+        // no parameter overload — the same route {% exec %}'s parameterised form takes. The result is
+        // drained and discarded: a DDL statement's own result is not something the block reports.
+        if (parameters is null)
+        {
+            run.ExecuteNonQuery(ddl);
+            return;
+        }
+        using var stream = run.Query(ddl, parameters);
+        while (stream.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult() is { } b)
+        {
+            b.Dispose();
+        }
+    }
+
     /// <param name="surface">How to NAME this call in an error — <c>query()</c> by default, so the function
     /// and filter forms are unchanged, and <c>{% print %}</c> for the print block.
     /// ⚠ Not cosmetic: the refusal below tells the author which construct to reach for instead, and a

@@ -158,11 +158,28 @@ internal static class FluidEngine
                 return completion;
             }
 
+            // ⚠⚠ `materialize` and `fluid` are RESERVED ARGUMENT NAMES, taken out before the rest become
+            // bound parameters — so a statement wanting a parameter called either cannot have one. The same
+            // trade {% print %}'s `delim`/`rowdelim` already make, and acceptable for the same reason: it
+            // fails LOUDLY, with DuckDB naming the parameter it was not given.
+            var (rest, kind, wantFluid) = await ReadQueryOptionsAsync(head.Item2, ctx);
             var parameters = await FluidHostQuery.BuildBlockParametersAsync(
-                FluidHostQuery.CallerOf(ctx), FluidHostQuery.BlockName, head.Item2, ctx);
+                FluidHostQuery.CallerOf(ctx), FluidHostQuery.BlockName, rest, ctx);
+            if (kind is not null)
+            {
+                FluidHostQuery.MaterializeCaptured(ctx, FluidHostQuery.BlockName, head.Item1, sql,
+                                                   parameters, kind);
+            }
             // ⚠ SetValue, and NOTHING is written to `output` — the block contributes no text, exactly like
             // {% capture %}. The rows are held for the render, so a template may iterate them repeatedly.
-            ctx.SetValue(head.Item1, FluidHostQuery.RunCaptured(ctx, FluidHostQuery.BlockName, sql, parameters));
+            // ⚠ `fluid` DEFAULTS TO "no materialize", so today's spelling is unchanged and materializing does
+            // NOT also pull every row into memory — which would defeat the point of asking for a relation.
+            // `fluid: true` alongside `materialize:` asks for both, and runs the body TWICE.
+            if (wantFluid ?? kind is null)
+            {
+                ctx.SetValue(head.Item1,
+                             FluidHostQuery.RunCaptured(ctx, FluidHostQuery.BlockName, sql, parameters));
+            }
             return Completion.Normal;
         });
 
@@ -332,6 +349,62 @@ internal static class FluidEngine
 
     /// <summary>The template variable naming the schema-probe render — see <c>fluid_query_batch</c>.</summary>
     internal const string IsBindVariable = "is_bind";
+
+    /// <summary>
+    /// Splits <c>{% query %}</c>'s named arguments into its two OPTIONS and the rest, which become bound
+    /// parameters. Returns (rest, materialize kind or null, explicit `fluid` or null).
+    /// </summary>
+    /// <remarks>
+    /// ⚠ The arguments arrive UNEVALUATED (name + expression), so each option is evaluated here rather than
+    /// pattern-matched on source text — which is what lets `materialize: params.mode` work as well as a
+    /// literal.
+    /// </remarks>
+    private static async ValueTask<(IReadOnlyList<FilterArgument>? Args, string? Kind, bool? Fluid)>
+        ReadQueryOptionsAsync(IReadOnlyList<FilterArgument>? args, TemplateContext ctx)
+    {
+        if (args is null || args.Count == 0)
+        {
+            return (args, null, null);
+        }
+        // ⚠ ALWAYS rebuilt rather than returned unchanged when nothing was taken. The shortcut cannot tell
+        // an ABSENT option from one PRESENT AND NULL — and `materialize: null` is the documented default, so
+        // it would leak `materialize` into the bound parameters and fail with DuckDB's "excess parameters".
+        // MEASURED before this comment existed.
+        var rest = new List<FilterArgument>(args.Count);
+        string? kind = null;
+        bool? fluid = null;
+        foreach (var arg in args)
+        {
+            if (string.Equals(arg.Name, "materialize", StringComparison.OrdinalIgnoreCase))
+            {
+                var v = await arg.Expression.EvaluateAsync(ctx);
+                // ⚠ NULL is the DEFAULT and must stay spellable: `materialize: null` means "bind the rows",
+                // so a template can choose the destination from a variable without branching.
+                if (v is not NilValue)
+                {
+                    var text = v.ToStringValue();
+                    kind = text.ToLowerInvariant() switch
+                    {
+                        "view" => "VIEW",
+                        "table" => "TABLE",
+                        _ => throw new ArgumentException(
+                            $"{FluidHostQuery.CallerOf(ctx)}: {{% {FluidHostQuery.BlockName} %}} "
+                            + $"materialize must be 'view', 'table' or null (given '{text}'). Both are TEMP: "
+                            + "they live on the render's own connection and die with it."),
+                    };
+                }
+                continue;
+            }
+            if (string.Equals(arg.Name, "fluid", StringComparison.OrdinalIgnoreCase))
+            {
+                var v = await arg.Expression.EvaluateAsync(ctx);
+                fluid = v is not NilValue && v.ToBooleanValue();
+                continue;
+            }
+            rest.Add(arg);
+        }
+        return (rest.Count == 0 ? null : rest, kind, fluid);
+    }
 
     /// <summary>The tag that ends a render early — Scriban's <c>ret</c>, which Liquid has no equivalent of.</summary>
     internal const string RetTagName = "ret";
