@@ -1,6 +1,8 @@
 # Parameter binding for `fabricator_query` / `fabricator_exec`, and the `{% provider_query %}` tags
 
-**Status: DESIGN ONLY, nothing built (2026-09-06).** User-raised, in two parts: *"instead of building fluid
+**Status: slice A1 BUILT (ABI v88, 2026-09-06); A2 (DAX) and B (the Fluid tags) not built.**
+⚠⚠ **§5 is the AS-BUILT record and it CORRECTS §2 and §3 in six places — read it first.**
+The original framing: User-raised, in two parts: *"instead of building fluid
 versions of fabricator_query + fabricator_exec we could add … tags to the existing fluid plugin"*, and
 *"i think fabricator_query/fabricator_execute ABI version with parameter binding would be beneficial?"*
 
@@ -202,9 +204,9 @@ about atomicity.
 
 | | | |
 |---|---|---|
-| **A1** | ABI v88 + the two DIMs + SQL Server override + the `params :=` surface | `verify_raw_query`: a parameterised SELECT, an injection pair with its control (`"eu' OR 1=1 --"` answering 0 beside `"eu"` answering N), and the describe/execute schema agreement |
+| **A1** ✅ | ABI v88 + the DIMs + SQL Server override + the `params :=` surface — **BUILT, §5** | `verify_raw_query`: a parameterised SELECT, an injection pair with its control (`"eu' OR 1=1 --"` answering 0 beside `"eu"` answering N), and the describe/execute schema agreement |
 | **A2** | DAX override; `daxeval` delegates to the shared bag | `verify_dax` (manual — needs Power BI Desktop) |
-| **A3** | Delta/deltars refusal by name | one row asserting the refusal names the provider |
+| ~~**A3**~~ | ~~Delta/deltars refusal by name~~ — **NOT NEEDED**: the contract DIM refuses, so every non-overriding provider does (§5.3) | §15 asserts both refusals against a real Delta attach, with an unparameterised CTAS as the control |
 | **B** | the two tags | `verify_plugin_fluid`: both paths, the multi-line body, and whichever §3.1 decision was taken, asserted |
 
 ⚠ A1's gate must include the **describe/execute agreement** explicitly — a parameterised statement whose
@@ -213,3 +215,160 @@ whether or not the two agree, which is how the original double-execution defect 
 
 ⚠ **A1 is the whole value.** B without A is a tag that can only carry constant SQL, and whose only way to
 pass a value is a filter that renders the wrong dialect (§1.2).
+---
+
+## 5. ✅ AS BUILT — slice A1, ABI v88 (2026-09-06)
+
+C++ + C#. Gate `verify_raw_query` **34 → 85** (service tier), §9–§16, two mutants each killed at its own
+row. **Read this section before §2 and §3** — building it corrected six things the design got wrong, and two
+of them would have shipped a silent defect.
+
+```sql
+SELECT * FROM fabricator_query('q', 'SELECT * FROM dbo.t WHERE region = @r', params := {'r': 'eu'});
+SELECT * FROM fabricator_query('q', 'SELECT @a AS a', params := '{"a": 7}');
+SELECT fabricator_exec('q', 'UPDATE dbo.t SET region = @new WHERE region = @old', {'new': 'uk', 'old': 'us'});
+```
+
+### 5.1 ⚠⚠ The WIRE and the CONTRACT are different shapes, and §2 conflated them
+
+§2 said the wire carries "a 1-row batch with one column per parameter", reusing `host_query`'s form. That is
+the right shape for the **contract** and the wrong one for the **wire**: getting there from a `params :=`
+argument means deciding STRUCT-vs-JSON and, for JSON, inventing Arrow types from JSON kinds — in C++.
+
+What ships instead is the `daxeval` shape on the wire — ONE row, ONE column named `params`, holding the
+argument exactly as written — with `Fabricator.Bridge.ProviderParameters` normalising it host-side into the
+contract's per-parameter form. So:
+
+* the STRUCT/JSON branch exists in ONE language, and cannot drift between `fabricator_query` and
+  `fabricator_exec`;
+* C++ exports one DuckDB `Value` and knows nothing about bags;
+* a provider receives a plain named batch and never sees the question.
+
+⚠ **The two spellings are not equally faithful, and that is JSON's property rather than a shortcut.** A
+STRUCT's children ARE the output columns — no conversion at all, so precision, scale, unit and time zone
+survive — while JSON has four scalar kinds, so a JSON bag can only produce BIGINT / DOUBLE / VARCHAR /
+BOOLEAN. MEASURED and pinned: `{'a': 41}` binds INTEGER, `'{"a": 41}'` binds BIGINT. A caller who needs a
+DECIMAL or a typed temporal must use the STRUCT form.
+
+### 5.2 ⚠ It is an `ArrowArrayStream *`, not the `ArrowArray *` §2 wrote — and that dissolves §2.3
+
+The house form for a 1-row args batch is a STREAM: `scalarfn_bind` and `tablefn_bind` both take one, built
+from a stack `ArrowProducer` the callee consumes before the call returns. Adopting it turns §2.3's lifetime
+warning from a thing to be careful about into the pattern those two already use.
+
+§2.3's substance stands and is honoured: `QueryBind` holds the DuckDB `Value` and `MakeParamsStream`
+re-exports **per invocation**, because `PopulateReturnSchema` runs the factory at BIND and the scan runs it
+again, and the managed side consumes what it is handed.
+
+### 5.3 ⚠⚠ The default DIM must REFUSE, not chain — §2.1's version drops parameters silently
+
+§2.1 proposed `IArrowArrayStream ExecuteQuery(string sql, RecordBatch? parameters) => ExecuteQuery(sql);`.
+That runs the statement with the parameters **discarded**: parameterised as far as the caller knows,
+unparameterised as far as the server is concerned, with nothing failing. On Delta the SQL is not even
+provider SQL, so the value would vanish into a statement that never referenced it.
+
+The default therefore throws by name when the bag is non-null:
+
+```
+DeltaCatalog does not support query parameters (the 'params' argument); it has no parameterised statement form
+```
+
+⇒ **§4's separate slice A3 ("Delta/deltars refusal by name") is unnecessary and is not being built** — every
+provider that does not override refuses, structurally, and the refusal names the concrete catalog class.
+§15 of the gate asserts both halves against a real Delta attach, with an unparameterised CTAS beside them as
+the control.
+
+⚠ `DescribeQuery(string, RecordBatch?)` is the deliberate exception and answers `null`. Null already means
+"I cannot describe this"; the caller then executes, and the execution is where the refusal lives. Refusing
+in the describe would convert a working fallback into a failure.
+
+### 5.4 ⚠⚠ §2.2's hazard is narrower than stated — and the observable for it DOES exist
+
+§2.2 says handing one bag to both lambdas closes a schema-mismatch hazard. One object for both is right and
+is what ships, but the failure it prevents is not the one described: **a describe that LACKS the parameters
+does not mismatch.** SQL Server cannot compile `SELECT @a` without a declaration, `DescribeQuery` catches and
+returns null, and the caller falls back to EXECUTING to learn the schema — same schema, same rows. The
+mismatch would need a describe that SUCCEEDS with DIFFERENT parameters, which one shared object makes
+impossible.
+
+⚠⚠ **I first concluded that made the property unobservable from SQL, and that was wrong.** The observable is
+a SIDE EFFECT AT BIND:
+
+```sql
+EXPLAIN SELECT * FROM fabricator_query('q','INSERT INTO t VALUES (@v); SELECT 1 AS x', params := {'v': 3});
+-- describe succeeded (parameters declared) => nothing runs at bind  => 0 rows
+-- describe fell back  (parameters missing) => the fallback executes => 1 row
+```
+
+MEASURED both ways: **mutant A** (hand the describe a null bag while the execution keeps the real one) passes
+§9 and §10 in full and dies at exactly that row, after 46 assertions. ⚠ `EXPLAIN` must be a STANDALONE
+statement — it cannot be a subquery source — a recorded trap walked into while looking for this very
+observable, whose failure quietly made a first attempt VOID.
+
+Independently corroborated before the mutant existed: with `FABRICATOR_LOG_LEVEL=Debug`, a parameterised
+`fabricator_query` produces a 15-line log with **zero** `describe_query: could not describe without
+executing` lines.
+
+### 5.5 ⚠ `fabricator_exec` takes the bag POSITIONALLY, and §2.5 is wrong about it twice
+
+§2.5 said to add `params :=` to `fabricator_exec` "on both its registrations (it ships as a table function
+AND a scalar under one name)". Both halves are wrong:
+
+1. **It has ONE registration**, a scalar. The dual table+scalar registration under one name belongs to
+   `fabricator_host_exec` — a different function.
+2. **A DuckDB scalar has no named parameters at all**, so `params :=` is not expressible there. It is a
+   `ScalarFunctionSet` with `{VARCHAR,VARCHAR}` and `{VARCHAR,VARCHAR,ANY}` overloads sharing one body, so
+   the two arities cannot drift on what a bag means. §14 pins both, the 2-arity form being the control that
+   adding an overload disturbed nothing.
+
+### 5.5a ⚠ A bag key is a NAME, and the SIGIL belongs to the provider
+
+`{'d': …}` binds `@d`; `SqlServerCatalog.ToSqlParameters` adds the `@`. That is deliberate rather than
+incidental: the bag is provider-AGNOSTIC, and `@` is T-SQL's (and DAX's) sigil, not a universal one — baking
+it into the key would make the contract speak one dialect. A caller who writes `{'@d': …}` gets `@@d` and SQL
+Server's own *"Must declare the scalar variable @d"*, which is loud rather than silent, so it is DOCUMENTED
+rather than stripped: stripping would put dialect knowledge in the host-side normaliser, which is the one
+place that must not have any.
+
+### 5.5b The bag is refused by TYPE before it can reach the JSON path
+
+MEASURED before the guard existed: `params := MAP{...}` and `params := [1,2]` both died inside
+`ArrowValueReader.ReadScalar` as *"unsupported filter value type Map"* — a message naming a subsystem the
+caller never touched — and a TIMESTAMP was stringified and then reported as invalid JSON. Anything that is
+neither a STRUCT nor a STRING is now refused naming its own type and both accepted shapes.
+
+⚠ A MAP is refused rather than supported, and not only for the message: a DuckDB MAP's values are ONE type,
+so a heterogeneous bag — the whole point of a bag — cannot be written as one.
+
+### 5.6 The datetime2 pin, and why it is now one helper
+
+A caller-supplied `DateTime` is pinned to `SqlDbType.DateTime2`, exactly as `FilterWhereBuilder` already
+pinned a pushed filter value: SqlClient infers the LEGACY `datetime` (~3.33 ms) and ROUNDS the value before
+the server sees it. There it cost a pushed predicate its never-erases property; **here it is simply a WRONG
+VALUE, which is worse.** Both surfaces now go through `SqlServerCatalog.MakeParameter`, so the rule cannot be
+fixed in one and missed in the other. **Mutant C** (drop the pin) passes 49 assertions and dies at §12's
+temporal row.
+
+### 5.7 ⚠ Two traps paid for while building it
+
+* **`Move-Item` PRESERVES the file's mtime**, so restoring a mutated source can leave it looking OLDER than
+  the DLL built from the mutant and MSBuild skips the rebuild. Mutant C's first run silently re-measured
+  mutant A — and the tell was that it produced mutant A's numbers EXACTLY (same line, same 46 passed).
+  Touch the file after restoring, or publish with a clean build.
+* **A Delta CTAS control needs `require parquet`.** Under the default `native_write` engine DuckDB's own COPY
+  writes the parquet, and `unittest` does not auto-load extensions — so the control failed as a missing
+  FEATURE rather than a missing REQUIRE, this repo's recorded trap in its usual costume.
+
+### 5.8 What is NOT built
+
+* **A2 (DAX)** — `daxeval` keeps its own bag; `fabricator_query` against a DAX catalog refuses through the
+  default. Wiring `DaxCatalog.ExecuteQuery(sql, params)` to ADOMD `@name` parameters and having `daxeval`
+  delegate to the shared bag is the remaining half, gated only by `verify_dax` (manual).
+* **B (the two Fluid tags)** — unchanged from §3, including the §3.1 decision, which is still a decision and
+  not a discovery.
+* ⚠ **No tier-0 test for `ProviderParameters`, and the reason is the ADMISSION RULE rather than effort.**
+  It is pure (no pointers, no I/O) but its closure is **Apache.Arrow**, and `Fabricator.Bridge.Tests` admits a
+  file only when its closure is the BCL. Widening that rule is a decision about the tier, not something to
+  smuggle into this slice — and the decidable half here (which JSON kind becomes which type) is meaningless
+  without Arrow types, so there is no clean split either. The gate reaches all four refusals through SQL
+  instead, at one provider round trip each.

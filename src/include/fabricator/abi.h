@@ -137,7 +137,19 @@ typedef struct FabricatorVTable {
 
 	// Execute a query and export the result as an Arrow stream into *out.
 	// `handle` may be NULL in Phase 0 stub mode.
-	int32_t (*execute_query)(FabricatorHandle handle, const char *sql,
+	//
+	// `params` (ABI v88, NULLABLE) carries the caller's parameter bag: a ONE-ROW stream with a SINGLE
+	// column named "params" whose value is the `params :=` argument exactly as written — a DuckDB STRUCT
+	// ({'a': 1}) or a JSON string ('{"a": 1}'). The managed side NORMALISES it into a 1-row RecordBatch
+	// with one column PER PARAMETER and hands that to the provider; the STRUCT/JSON branch therefore lives
+	// in ONE language. NULL (no bag) is spelled by passing NULL here, never by a SQLNULL value.
+	//
+	// ⚠ The managed side CONSUMES AND RELEASES `params`, as it does every stream it is passed — and this
+	// entry is called TWICE per bind+scan (PopulateReturnSchema runs the factory for the schema, the scan
+	// runs it again). So the caller must build a FRESH stream for each call and hold only the DuckDB Value
+	// between them. Handing one exported stream to both calls is a use-after-free of the same class as the
+	// recorded BuildFilterValues bug — invisible on Windows and Linux, an abort on macOS.
+	int32_t (*execute_query)(FabricatorHandle handle, const char *sql, struct ArrowArrayStream *params,
 	                         struct ArrowArrayStream *out, char **err);
 
 	// Release an error string previously returned through a char** out param.
@@ -147,8 +159,9 @@ typedef struct FabricatorVTable {
 	// `schema_may_change` (out, nullable): set to 1 if the statement may have changed
 	// schema/catalog metadata (DDL heuristic, decided in C#) so the host can invalidate
 	// its catalog cache; 0 otherwise.
-	int32_t (*execute_dml)(FabricatorHandle handle, const char *sql, int64_t *affected, int32_t *schema_may_change,
-	                       char **err);
+	// `params` (ABI v88, NULLABLE): as execute_query's, same shape and same ownership rule.
+	int32_t (*execute_dml)(FabricatorHandle handle, const char *sql, struct ArrowArrayStream *params,
+	                       int64_t *affected, int32_t *schema_may_change, char **err);
 
 	// Bulk-load an Arrow stream (produced by the host) into a table. Generic: the
 	// managed side maps the Arrow schema to provider types, optionally creates the
@@ -1287,7 +1300,7 @@ typedef struct FabricatorHostServices {
 // state blob is this many bytes + a 4-byte length prefix). Serialize() must fit within it.
 #define FABRICATOR_AGG_SPILL_CAP 1024
 
-#define FABRICATOR_ABI_VERSION 87
+#define FABRICATOR_ABI_VERSION 88
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(FabricatorVTable) as seen

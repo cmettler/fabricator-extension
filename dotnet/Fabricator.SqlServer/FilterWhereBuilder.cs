@@ -114,11 +114,11 @@ internal sealed class FilterWhereBuilder
     /// </remarks>
     private string Param(int valueIndex)
     {
-        var value = _values[valueIndex] ?? (object)DBNull.Value;
         var name = "@p" + Parameters.Count;
-        Parameters.Add(value is DateTime
-            ? new SqlParameter(name, System.Data.SqlDbType.DateTime2) { Value = value }
-            : new SqlParameter(name, value));
+        // ⚠ ONE rule, in ONE place. SqlServerCatalog.MakeParameter applies the datetime2 pin above; the
+        // caller-supplied `params` bag (ABI v88) goes through the same helper, so a fix to the inference
+        // rule cannot reach one surface and miss the other.
+        Parameters.Add(SqlServerCatalog.MakeParameter(name, _values[valueIndex]));
         return name;
     }
 }

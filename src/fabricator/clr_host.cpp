@@ -629,19 +629,21 @@ void CloseCatalog(FabricatorHandle handle) {
 	}
 }
 
-void ExecuteQuery(FabricatorHandle handle, const std::string &sql, ArrowArrayStream &out) {
+void ExecuteQuery(FabricatorHandle handle, const std::string &sql, ArrowArrayStream &out,
+                  ArrowArrayStream *params) {
 	const FabricatorVTable &vt = GetBridge();
 	if (!vt.execute_query) {
 		throw duckdb::IOException("Fabricator: bridge does not provide execute_query");
 	}
 	char *err = nullptr;
-	int32_t rc = vt.execute_query(handle, sql.c_str(), &out, &err);
+	int32_t rc = vt.execute_query(handle, sql.c_str(), params, &out, &err);
 	if (rc != FABRICATOR_OK) {
 		ThrowManagedError(vt, err, "Fabricator: execute_query failed");
 	}
 }
 
-int64_t ExecuteDml(FabricatorHandle handle, const std::string &sql, bool *schema_may_change) {
+int64_t ExecuteDml(FabricatorHandle handle, const std::string &sql, bool *schema_may_change,
+                   ArrowArrayStream *params) {
 	const FabricatorVTable &vt = GetBridge();
 	if (!vt.execute_dml) {
 		throw duckdb::IOException("Fabricator: bridge does not provide execute_dml");
@@ -649,7 +651,7 @@ int64_t ExecuteDml(FabricatorHandle handle, const std::string &sql, bool *schema
 	int64_t affected = 0;
 	int32_t schema_changed = 0;
 	char *err = nullptr;
-	int32_t rc = vt.execute_dml(handle, sql.c_str(), &affected, &schema_changed, &err);
+	int32_t rc = vt.execute_dml(handle, sql.c_str(), params, &affected, &schema_changed, &err);
 	if (rc != FABRICATOR_OK) {
 		ThrowManagedError(vt, err, "Fabricator: execute_dml failed");
 	}

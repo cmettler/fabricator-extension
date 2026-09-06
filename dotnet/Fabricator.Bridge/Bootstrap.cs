@@ -91,7 +91,7 @@ public static unsafe class Bootstrap
                             () => OneRowStream(probeSchema, Interlocked.Increment(ref _lazyOpens) - 1),
                             probeSchema);
 
-        vtable->AbiVersion = 87;
+        vtable->AbiVersion = 88;
         vtable->OpenCatalog = &OpenCatalog;
         vtable->CloseCatalog = &CloseCatalog;
         vtable->ExecuteQuery = &ExecuteQuery;
@@ -235,8 +235,29 @@ public static unsafe class Bootstrap
         }
     }
 
+    /// <summary>
+    /// Imports the ABI v88 <c>params</c> wire stream and normalises it (see <see cref="ProviderParameters"/>).
+    /// </summary>
+    /// <remarks>
+    /// ⚠ EAGER, inside the crossing, and that is required rather than convenient. The ABI's standing rule is
+    /// that the managed side consumes and releases every stream it is handed, which cannot be honoured from a
+    /// deferred body — and <c>execute_query</c> hands back a LAZY stream whose lambdas run later. A bag is one
+    /// row, so eager costs nothing. It is also the same discipline as the ambient capture immediately below it.
+    /// </remarks>
+    private static RecordBatch? ReadParameterBag(CArrowArrayStream* parameters)
+    {
+        if (parameters is null)
+        {
+            return null;
+        }
+        using var stream = CArrowArrayStreamImporter.ImportArrayStream(parameters); // we own it
+        var wire = stream.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult();
+        return ProviderParameters.Normalize(wire);
+    }
+
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static int ExecuteQuery(nint handle, byte* sql, CArrowArrayStream* outStream, byte** err)
+    private static int ExecuteQuery(nint handle, byte* sql, CArrowArrayStream* parameters,
+                                    CArrowArrayStream* outStream, byte** err)
     {
         try
         {
@@ -247,6 +268,7 @@ public static unsafe class Bootstrap
             var catalog = Handles.Resolve<IProviderCatalog>(handle)
                           ?? ProviderRegistry.Active.OpenCatalog(string.Empty, string.Empty);
             var query = Marshal.PtrToStringUTF8((nint)sql) ?? string.Empty;
+            var bag = ReadParameterBag(parameters);
 
             // ⚠ DESCRIBE-THEN-EXECUTE, and it is a FIX rather than an optimisation. The host's bind-time
             // schema probe (arrow_ingest's PopulateReturnSchema) calls this entry, reads get_schema and
@@ -289,9 +311,18 @@ public static unsafe class Bootstrap
 
             // Both halves need them: the describe resolves its command timeout from the session settings, and
             // the execution needs the transaction to find the pinned connection.
+            //
+            // ⚠⚠ ONE BAG, BOTH LAMBDAS — structural, not careful. If the describe saw different parameters
+            // from the execution the DECLARED and DELIVERED schemas could disagree, and IProvider.DescribeQuery's
+            // own doc names that as the serious class ("a schema mismatch, not a wrong estimate — the
+            // duckdb_arrow_scan class"). Handing one object to both is what makes it impossible rather than
+            // unlikely. ⚠ The describe consumes the bag's DECLARATION, not its values: SQL Server cannot
+            // compile a parameterised statement it is asked to describe unless the parameters are declared,
+            // and nothing executes, so the values are irrelevant there — a 1-row batch carries names, types
+            // and values together, so there is no separate declaration concept to keep in step.
             IArrowArrayStream stream = new DescribedArrowStream(
-                () => { Restore(); return catalog.DescribeQuery(query); },
-                () => { Restore(); return catalog.ExecuteQuery(query); });
+                () => { Restore(); return catalog.DescribeQuery(query, bag); },
+                () => { Restore(); return catalog.ExecuteQuery(query, bag); });
             CArrowArrayStreamExporter.ExportArrayStream(stream, outStream);
             return FabricatorStatus.Ok;
         }
@@ -303,7 +334,8 @@ public static unsafe class Bootstrap
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static int ExecuteDml(nint handle, byte* sql, long* affected, int* schemaMayChange, byte** err)
+    private static int ExecuteDml(nint handle, byte* sql, CArrowArrayStream* parameters, long* affected,
+                                  int* schemaMayChange, byte** err)
     {
         try
         {
@@ -316,7 +348,7 @@ public static unsafe class Bootstrap
             {
                 *schemaMayChange = SqlDdl.MayChangeSchema(statement) ? 1 : 0;
             }
-            long rows = catalog.ExecuteNonQuery(statement);
+            long rows = catalog.ExecuteNonQuery(statement, ReadParameterBag(parameters));
             if (affected is not null)
             {
                 *affected = rows;

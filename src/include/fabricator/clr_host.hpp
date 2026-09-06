@@ -174,12 +174,17 @@ std::string GetCapabilities(FabricatorHandle handle);
 void CloseCatalog(FabricatorHandle handle);
 
 // Execute a query and populate `out` with the resulting Arrow stream.
-void ExecuteQuery(FabricatorHandle handle, const std::string &sql, ArrowArrayStream &out);
+// `params` (nullable, ABI v88): the caller's parameter bag — see abi.h execute_query. The managed side
+// CONSUMES it, so a caller invoked more than once (a bind + a scan) must build a fresh one per call.
+void ExecuteQuery(FabricatorHandle handle, const std::string &sql, ArrowArrayStream &out,
+                  ArrowArrayStream *params = nullptr);
 
 // Execute a non-query statement (DML/DDL); returns the number of rows affected.
 // `schema_may_change` (out, nullable): set true if the statement may have changed
 // schema (DDL heuristic decided in C#), so the caller can invalidate its cache.
-int64_t ExecuteDml(FabricatorHandle handle, const std::string &sql, bool *schema_may_change = nullptr);
+// `params` (nullable, ABI v88): as ExecuteQuery's.
+int64_t ExecuteDml(FabricatorHandle handle, const std::string &sql, bool *schema_may_change = nullptr,
+                   ArrowArrayStream *params = nullptr);
 
 // Bulk-load an Arrow stream into a table; the managed side consumes/releases
 // `in`. Returns rows written. (Generic: provider does type mapping + DDL + copy.)

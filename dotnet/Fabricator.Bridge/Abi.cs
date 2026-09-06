@@ -23,14 +23,16 @@ public unsafe struct FabricatorVTable
     // void close_catalog(void* handle)
     public delegate* unmanaged[Cdecl]<nint, void> CloseCatalog;
 
-    // int32 execute_query(void* handle, const char* sql, ArrowArrayStream* out, char** err)
-    public delegate* unmanaged[Cdecl]<nint, byte*, CArrowArrayStream*, byte**, int> ExecuteQuery;
+    // int32 execute_query(void* handle, const char* sql, ArrowArrayStream* params,
+    //                     ArrowArrayStream* out, char** err)
+    public delegate* unmanaged[Cdecl]<nint, byte*, CArrowArrayStream*, CArrowArrayStream*, byte**, int> ExecuteQuery;
 
     // void free_error(char* err)
     public delegate* unmanaged[Cdecl]<byte*, void> FreeError;
 
-    // int32 execute_dml(void* handle, const char* sql, int64* affected, int32* schema_may_change, char** err)
-    public delegate* unmanaged[Cdecl]<nint, byte*, long*, int*, byte**, int> ExecuteDml;
+    // int32 execute_dml(void* handle, const char* sql, ArrowArrayStream* params,
+    //                   int64* affected, int32* schema_may_change, char** err)
+    public delegate* unmanaged[Cdecl]<nint, byte*, CArrowArrayStream*, long*, int*, byte**, int> ExecuteDml;
 
     // int32 bulk_insert(void* handle, const char* schema, const char* table,
     //                   int32 create_table, int32 replace, ArrowArrayStream* in, int64* affected, char** err)

@@ -353,6 +353,30 @@ public interface IProviderCatalog : IDisposable
     IArrowArrayStream ExecuteQuery(string sql);
 
     /// <summary>
+    /// As <see cref="ExecuteQuery(string)"/>, for a PARAMETERISED statement (ABI v88).
+    /// <paramref name="parameters"/> is a ONE-ROW batch with one column per parameter, named — the host has
+    /// already normalised whatever bag shape the caller wrote, so a provider never sees a STRUCT-vs-JSON
+    /// question. <c>null</c> means no parameters.
+    /// </summary>
+    /// <remarks>
+    /// <para>⚠⚠ <b>The default REFUSES a non-null bag rather than chaining.</b> Chaining unconditionally would
+    /// run the statement with the parameters silently DROPPED — a statement the caller believes was
+    /// parameterised, executed as if it were not, with nothing failing. That is the wrong direction for a
+    /// provider that has no parameter concept (Delta has no SQL to parameterise at all), so the honest answer
+    /// is to say so by name.</para>
+    /// <para>⚠ Values become parameters, never text. The point of the whole surface is that a value never
+    /// reaches the statement as SQL — an interpolated literal would additionally be rendered in DuckDB's
+    /// dialect, which coincides with T-SQL for strings and integers and diverges for booleans, blobs and
+    /// temporals.</para>
+    /// </remarks>
+    IArrowArrayStream ExecuteQuery(string sql, RecordBatch? parameters)
+        => parameters is null
+            ? ExecuteQuery(sql)
+            : throw new NotSupportedException(
+                $"{GetType().Name} does not support query parameters (the 'params' argument); "
+                + "it has no parameterised statement form");
+
+    /// <summary>
     /// Reports what <see cref="ExecuteQuery"/> would return, WITHOUT executing it — or <c>null</c> when this
     /// provider cannot describe this statement, in which case the caller executes instead.
     /// </summary>
@@ -377,8 +401,31 @@ public interface IProviderCatalog : IDisposable
     /// </remarks>
     Schema? DescribeQuery(string sql) => null;
 
+    /// <summary>
+    /// As <see cref="DescribeQuery(string)"/>, for a PARAMETERISED statement (ABI v88).
+    /// </summary>
+    /// <remarks>
+    /// ⚠ Unlike <see cref="ExecuteQuery(string, RecordBatch?)"/> this default IGNORES the bag rather than
+    /// refusing, and the asymmetry is deliberate: the only answer it can give is "I cannot describe this",
+    /// which is <c>null</c> — and null is safe, because the caller then executes, and the execution is where
+    /// a provider that cannot take parameters refuses. Refusing here would turn a describe into a failure
+    /// where a fallback exists.
+    /// </remarks>
+    Schema? DescribeQuery(string sql, RecordBatch? parameters) => parameters is null ? DescribeQuery(sql) : null;
+
     /// <summary>Execute a non-query statement (DML/DDL); returns rows affected.</summary>
     long ExecuteNonQuery(string sql);
+
+    /// <summary>
+    /// As <see cref="ExecuteNonQuery(string)"/>, for a PARAMETERISED statement (ABI v88). Refuses a non-null
+    /// bag by default, for the same reason <see cref="ExecuteQuery(string, RecordBatch?)"/> does.
+    /// </summary>
+    long ExecuteNonQuery(string sql, RecordBatch? parameters)
+        => parameters is null
+            ? ExecuteNonQuery(sql)
+            : throw new NotSupportedException(
+                $"{GetType().Name} does not support statement parameters (fabricator_exec's third argument); "
+                + "it has no parameterised statement form");
 
     /// <summary>
     /// Bulk-loads an Arrow stream into a table. If <paramref name="createTable"/>,

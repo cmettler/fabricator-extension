@@ -9,7 +9,16 @@
 
 require fabricator
 
+# §15's Delta control does a CTAS, and under the default native_write engine DuckDB's own COPY writes the
+# parquet. unittest does NOT auto-load extensions, so without this the control fails as a MISSING FEATURE
+# rather than a missing REQUIRE -- the recorded trap that has cost this repo several suites.
+require parquet
+
 require-env MSSQL_TESTDB_DSN
+
+# §15 attaches a local Delta catalog to exercise the contract default; the runner gives every suite a
+# fresh scratch dir, and declaring it keeps a hand-run of this file from failing on an unset variable.
+require-env FABRICATOR_DELTA_WRITE_DIR
 
 statement ok
 ATTACH '${MSSQL_TESTDB_DSN}' AS q (TYPE fabricator);
@@ -191,6 +200,271 @@ query I
 SELECT t FROM fabricator_query('q', 'SELECT @@TRANCOUNT AS t');
 ----
 0
+
+# ═══ §9  PARAMETERS (ABI v88) — the bag binds as parameters, in BOTH spellings ════════════════════════
+# `params :=` is declared ANY, so a caller may pass EITHER a DuckDB STRUCT or a JSON object string. The host
+# normalises both into a one-row batch with one column per parameter (ProviderParameters), so a provider
+# never sees the branch.
+
+statement ok
+SELECT fabricator_exec('q', 'IF OBJECT_ID(''dbo.rq_par'') IS NOT NULL DROP TABLE dbo.rq_par; CREATE TABLE dbo.rq_par(id INT, region NVARCHAR(20));');
+
+statement ok
+SELECT fabricator_exec('q', 'INSERT INTO dbo.rq_par VALUES (1, ''eu''), (2, ''eu''), (3, ''us'');');
+
+query IT
+SELECT a, b FROM fabricator_query('q', 'SELECT @a AS a, @b AS b', params := {'a': 41, 'b': 'hi'});
+----
+41	hi
+
+query I
+SELECT a FROM fabricator_query('q', 'SELECT @a AS a', params := '{"a": 7}');
+----
+7
+
+# ⚠ THE TWO SPELLINGS ARE NOT EQUALLY FAITHFUL, and the asymmetry is JSON's rather than ours: a STRUCT's
+# children ARE the parameters (no conversion at all, so the DuckDB type survives), while JSON has four scalar
+# kinds. Hence INTEGER from the struct and BIGINT from the JSON, for the same written digits. Pinned because a
+# caller who needs a DECIMAL or a typed temporal has to know to reach for the STRUCT form.
+query TT
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM fabricator_query('q', 'SELECT @a AS a', params := {'a': 41}));
+----
+a	INTEGER
+
+query TT
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM fabricator_query('q', 'SELECT @a AS a', params := '{"a": 41}'));
+----
+a	BIGINT
+
+# ⚠ int64 BEFORE double in the JSON ladder. C# unifies a conditional's branches to the wider type, so the
+# obvious `TryGetInt64(out l) ? l : GetDouble()` routes EVERY integer through a double — a defect this repo
+# shipped once, in JsonToClr, and one that is invisible below 2^53. 9007199254740993 is 2^53+1: through a
+# double it renders as ...992.
+query I
+SELECT n FROM fabricator_query('q', 'SELECT CAST(@n AS BIGINT) AS n', params := '{"n": 9007199254740993}');
+----
+9007199254740993
+
+# ═══ §10  ⚠⚠ THE INJECTION PAIR — the row this whole surface exists for ═══════════════════════════════
+# A value that reaches SQL Server as a PARAMETER cannot change the statement. Interpolating it would, and the
+# only interpolation available (`{{ v | sql }}`) is additionally DuckDB dialect — true/false, '\x…'::BLOB —
+# which coincides with T-SQL for strings and integers and diverges for booleans, blobs and temporals.
+#
+# ⚠ THE CONTROL IS LOAD-BEARING: without the 'eu' row immediately below, the 0 would be equally satisfied by
+# a build in which the parameter never arrived at all.
+
+query I
+SELECT count(*) AS n FROM fabricator_query('q', 'SELECT * FROM dbo.rq_par WHERE region = @r', params := {'r': 'eu'});
+----
+2
+
+query I
+SELECT count(*) AS n FROM fabricator_query('q', 'SELECT * FROM dbo.rq_par WHERE region = @r', params := {'r': 'eu'' OR 1=1 --'});
+----
+0
+
+# ═══ §11  ⚠⚠ THE PARAMETERS REACH THE **DESCRIBE**, not only the execution ════════════════════════════
+# ⚠⚠ This is the section §3 could not be for parameters, and finding an observable for it took a measurement:
+# a describe that LACKS the parameters does not produce a schema MISMATCH — it fails to compile, returns null,
+# and the caller falls back to EXECUTING to learn the schema. Same rows, same types. So no assertion about the
+# RESULT can tell the two apart.
+#
+# What CAN is a SIDE EFFECT at BIND. EXPLAIN binds and never executes, so:
+#   describe succeeded (parameters declared) => nothing runs at bind => 0 rows inserted
+#   describe fell back (parameters missing)  => the fallback executes at bind => 1 row inserted
+# MEASURED both ways: handing the describe a null bag while the execution keeps the real one turns the 0
+# below into a 1.
+#
+# ⚠ EXPLAIN must be a STANDALONE statement — it cannot be a subquery source (Parser Error), a recorded trap
+# walked into once while looking for exactly this observable.
+
+statement ok
+SELECT fabricator_exec('q', 'IF OBJECT_ID(''dbo.rq_bind'') IS NOT NULL DROP TABLE dbo.rq_bind; CREATE TABLE dbo.rq_bind(v INT);');
+
+statement ok
+EXPLAIN SELECT * FROM fabricator_query('q', 'INSERT INTO dbo.rq_bind VALUES (@v); SELECT 1 AS x', params := {'v': 3});
+
+query I
+SELECT c FROM fabricator_query('q', 'SELECT count(*) AS c FROM dbo.rq_bind');
+----
+0
+
+# …and the same statement actually SELECTED runs exactly once — §1's property, holding under parameters.
+statement ok
+SELECT * FROM fabricator_query('q', 'INSERT INTO dbo.rq_bind VALUES (@v); SELECT 1 AS x', params := {'v': 3});
+
+query I
+SELECT c FROM fabricator_query('q', 'SELECT count(*) AS c FROM dbo.rq_bind');
+----
+1
+
+# ═══ §12  Typed values, and the one with a measured data-loss history ═════════════════════════════════
+# ⚠⚠ A DateTime is PINNED to datetime2. SqlClient INFERS the legacy `datetime`, whose resolution is ~3.33 ms,
+# so the value is ROUNDED before the server ever sees it — .001 becomes .000. In FilterWhereBuilder that cost
+# a pushed predicate its never-erases property; HERE it is simply a WRONG VALUE, which is worse. Both surfaces
+# go through one helper (SqlServerCatalog.MakeParameter), so the rule cannot be fixed in one and missed in the
+# other.
+
+# ⚠ No session timezone is set and none is needed: DATETIME2 crosses as an Arrow timestamp WITHOUT a
+# timezone, so both the literal and the result are plain TIMESTAMPs and nothing reads the session zone. (A
+# reflexive `SET TimeZone` here would additionally have needed `require icu`, which unittest does not
+# auto-load — the recorded trap where a missing REQUIRE reads as a missing FEATURE.)
+query I
+SELECT t FROM fabricator_query('q', 'SELECT CAST(@t AS DATETIME2(3)) AS t', params := {'t': TIMESTAMP '2024-03-05 10:20:30.001'});
+----
+2024-03-05 10:20:30.001
+
+# A STRUCT carries precision and scale through untouched.
+query R
+SELECT d FROM fabricator_query('q', 'SELECT CAST(@d AS DECIMAL(9,2)) AS d', params := {'d': 12.34::DECIMAL(9,2)});
+----
+12.34
+
+# A NULL parameter is a value, not an absence.
+query I
+SELECT is_null FROM fabricator_query('q', 'SELECT CASE WHEN @v IS NULL THEN 1 ELSE 0 END AS is_null', params := {'v': NULL});
+----
+1
+
+# ⚠ An ABSENT argument and `params := NULL` mean the SAME thing — no parameters — so a caller composing the
+# argument need not distinguish them. The un-parameterised row is the control: it is what "no parameters"
+# already looked like before v88.
+query I
+SELECT two FROM fabricator_query('q', 'SELECT 2 AS two', params := NULL);
+----
+2
+
+query I
+SELECT two FROM fabricator_query('q', 'SELECT 2 AS two');
+----
+2
+
+# ═══ §13  Malformed bags are REFUSED by name ══════════════════════════════════════════════════════════
+# Every refusal below is decided host-side, in ProviderParameters, so it reads the same on every provider.
+
+statement error
+SELECT * FROM fabricator_query('q', 'SELECT 1 AS x', params := '[1, 2]');
+----
+must be a DuckDB STRUCT or a JSON object
+
+# ⚠ A nested value is refused rather than stringified: its JSON text is a value the caller never wrote, and it
+# would reach the provider looking perfectly plausible.
+statement error
+SELECT * FROM fabricator_query('q', 'SELECT 1 AS x', params := '{"a": {"b": 1}}');
+----
+is a JSON object; a parameter must be a scalar
+
+statement error
+SELECT * FROM fabricator_query('q', 'SELECT 1 AS x', params := 'not json');
+----
+'params' is not valid JSON
+
+# ⚠ Case-INSENSITIVE, because SqlClient's parameter collection is: collapsing the two would run the statement
+# with a value the caller did not choose.
+statement error
+SELECT * FROM fabricator_query('q', 'SELECT 1 AS x', params := '{"a": 1, "A": 2}');
+----
+declares 'A' more than once
+
+# ⚠⚠ A bag that is neither a STRUCT nor a STRING is refused HERE, naming its own type — it does NOT fall into
+# the JSON path. MEASURED before that guard existed: a MAP and a LIST both died inside ArrowValueReader as
+# "unsupported filter value type Map", a message naming a subsystem the caller never touched, and a TIMESTAMP
+# was stringified and reported as invalid JSON. Both are the error-names-the-wrong-thing class.
+#
+# ⚠ A MAP is refused rather than supported deliberately: a DuckDB MAP's values are ONE type, so a
+# heterogeneous bag — which is the whole point of a bag — cannot be written as one anyway.
+
+statement error
+SELECT * FROM fabricator_query('q', 'SELECT 1 AS x', params := MAP{'a': 1});
+----
+'params' is a map; it must be a DuckDB STRUCT
+
+statement error
+SELECT * FROM fabricator_query('q', 'SELECT 1 AS x', params := [1, 2]);
+----
+'params' is a list; it must be a DuckDB STRUCT
+
+statement error
+SELECT * FROM fabricator_query('q', 'SELECT 1 AS x', params := 5);
+----
+'params' is a int32; it must be a DuckDB STRUCT
+
+# ═══ §14  fabricator_exec takes the bag POSITIONALLY ══════════════════════════════════════════════════
+# ⚠ NOT `params :=`, and the difference is DuckDB's rather than a choice: fabricator_exec is a SCALAR function
+# and a DuckDB scalar carries no named parameters at all. It is an overload set, and both arities run one body.
+
+query I
+SELECT fabricator_exec('q', 'UPDATE dbo.rq_par SET region = @new WHERE region = @old', {'new': 'uk', 'old': 'us'});
+----
+1
+
+query IT
+SELECT id, region FROM fabricator_query('q', 'SELECT id, region FROM dbo.rq_par WHERE id = 3');
+----
+3	uk
+
+# The 2-arity form is unchanged — the control for "adding an overload did not disturb the old one".
+query I
+SELECT fabricator_exec('q', 'UPDATE dbo.rq_par SET region = ''us'' WHERE id = 3');
+----
+1
+
+statement ok
+SELECT fabricator_exec('q', 'DROP TABLE dbo.rq_par; DROP TABLE dbo.rq_bind;');
+
+# ═══ §15  A provider with no parameter form REFUSES, by name ═════════════════════════════════════════
+# ⚠⚠ The contract DIM does NOT chain to the un-parameterised call. Chaining would run the statement with the
+# parameters SILENTLY DROPPED — a statement the caller believes was parameterised, executed as if it were
+# not, with nothing failing. That is the silent-wrong-answer class, so the default refuses instead and names
+# the catalog that cannot serve it.
+#
+# ⚠ The DESCRIBE default is deliberately the OTHER way round (it ignores the bag and answers null): null means
+# "I cannot describe this", the caller then executes, and the execution is where the refusal lives. Refusing
+# in the describe would turn a fallback into a failure.
+#
+# ⚠ Delta is the carrier here because it has no SQL to parameterise at all; the assertion is about the
+# CONTRACT default, so it holds for every provider that does not override — today DAX and delta-rs as well.
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/rq_delta' AS rqd (TYPE fabricator, PROVIDER 'delta');
+
+statement error
+SELECT * FROM fabricator_query('rqd', 'SELECT 1', params := {'a': 1});
+----
+does not support query parameters
+
+statement error
+SELECT fabricator_exec('rqd', 'OPTIMIZE', {'a': 1});
+----
+does not support statement parameters
+
+# ⚠ THE CONTROL: the same catalog serves an UNPARAMETERISED exec, so the two refusals above are about the bag
+# and not about the catalog being unusable.
+statement ok
+CREATE TABLE rqd.main.t AS SELECT 1 AS i;
+
+statement ok
+DETACH rqd;
+
+# ═══ §16  The registered SURFACE ═════════════════════════════════════════════════════════════════════
+# What the two spellings look like from DuckDB's own inventory, pinned because it is independent of any
+# behaviour above: a registration regression would leave every row in §9–§15 passing on whichever overload
+# survived, or fail them all for a reason that names nothing.
+#
+# ⚠ Safe to assert IN ORDER, unlike a signature with two NAMED parameters: fabricator_query has exactly ONE
+# (a single entry cannot be out of order) and fabricator_exec is a SCALAR, whose parameters come from the
+# ordered `arguments` vector. See the named-parameter ordering trap — `duckdb_functions().parameters` lists
+# NAMED ones in an unordered_map's iteration order, which differs by platform.
+
+query TTTT
+SELECT function_name, function_type, parameters, parameter_types
+FROM duckdb_functions()
+WHERE function_name IN ('fabricator_query', 'fabricator_exec')
+ORDER BY function_name, len(parameters);
+----
+fabricator_exec	scalar	[col0, col1]	[VARCHAR, VARCHAR]
+fabricator_exec	scalar	[col0, col1, col2]	[VARCHAR, VARCHAR, ANY]
+fabricator_query	table	[col0, col1, params]	[VARCHAR, VARCHAR, ANY]
 
 # ═══ §7  Teardown ════════════════════════════════════════════════════════════════════════════════════
 

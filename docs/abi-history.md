@@ -12,6 +12,65 @@
 > parsed with our own vcpkg yyjson, retiring the `ReadCapabilityFlag` string-find). v74 below is the
 > follow-on that finished the same job for ALTER.
 
+## v88 (2026-09-06) — `execute_query` / `execute_dml` take a PARAMETER BAG
+
+**User-asked** (*"i think fabricator_query/fabricator_execute ABI version with parameter binding would be
+beneficial?"*), scoped in [provider-query-parameters.md](provider-query-parameters.md) and built as its
+slice A1. Both entries gain a nullable `struct ArrowArrayStream *params` before their out-params, so
+`fabricator_query(cat, sql, params := …)` and `fabricator_exec(cat, sql, params)` bind values instead of
+splicing them into the statement.
+
+```c
+int32_t (*execute_query)(FabricatorHandle handle, const char *sql, struct ArrowArrayStream *params,
+                         struct ArrowArrayStream *out, char **err);
+int32_t (*execute_dml)(FabricatorHandle handle, const char *sql, struct ArrowArrayStream *params,
+                       int64_t *affected, int32_t *schema_may_change, char **err);
+```
+
+**The WIRE and the CONTRACT are deliberately different shapes, and the design note conflated them.** The
+wire is ONE row with ONE column named `params`, carrying the `params :=` argument exactly as written — a
+DuckDB STRUCT or a JSON string, since the argument is declared `ANY`. The managed side (`ProviderParameters`)
+normalises that into the contract's shape: one row, one column PER PARAMETER, named. So the STRUCT/JSON
+branch lives in ONE language and neither C++ nor any provider has to know it exists. The note proposed
+carrying the normalised form on the wire, which would have put a JSON-to-Arrow type ladder in C++.
+
+**⚠ It is a `ArrowArrayStream *`, not the `ArrowArray *` the note wrote.** A stream is the house form for a
+1-row args batch (`scalarfn_bind`, `tablefn_bind` both take one), and it dissolves the note's §2.3 lifetime
+worry into the pattern those two already use: a STACK `ArrowProducer` built per call, whose stream the
+managed side consumes before the call returns.
+
+**⚠⚠ THE FACTORY RUNS TWICE AND EACH RUN NEEDS ITS OWN EXPORT.** `QueryBind` stores a factory that
+`PopulateReturnSchema` invokes at BIND and the scan invokes again; the managed side consumes and releases
+every stream it is handed. So the bind data holds the DuckDB `Value` and `MakeParamsStream` re-exports per
+call. Holding one exported stream across both is the recorded `BuildFilterValues` use-after-free — invisible
+on Windows and Linux, an abort on macOS.
+
+**⚠⚠ THE DEFAULT DIM REFUSES; IT DOES NOT CHAIN.** The note's
+`ExecuteQuery(sql, parameters) => ExecuteQuery(sql)` would run the statement with the parameters SILENTLY
+DROPPED — parameterised as far as the caller knows, unparameterised as far as the server is concerned. So
+`IProviderCatalog.ExecuteQuery(string, RecordBatch?)` and `ExecuteNonQuery(string, RecordBatch?)` throw by
+name when the bag is non-null, which is what makes the note's separate "A3: Delta/deltars refusal" slice
+unnecessary — every provider that does not override refuses, structurally.
+
+⚠ `DescribeQuery(string, RecordBatch?)` is the deliberate exception: it returns `null`, because null already
+means *"I cannot describe this"* and the caller then EXECUTES, where the refusal lives. Refusing in the
+describe would turn a fallback into a failure.
+
+**⚠ ONE bag object serves BOTH lambdas of the `DescribedArrowStream`** — but the hazard that closes is
+narrower than the note claims. A describe that LACKS the parameters does not produce a schema MISMATCH: it
+fails to compile, returns null, and the caller falls back to executing, which yields the same schema and the
+same rows. The mismatch would need a describe that SUCCEEDS with DIFFERENT parameters, which handing one
+object to both makes impossible.
+
+**⚠ `fabricator_exec` takes the bag POSITIONALLY, and that is DuckDB's rule rather than a choice.** It is a
+SCALAR function and a DuckDB scalar carries no named parameters at all, so it became a `ScalarFunctionSet`
+with `{VARCHAR,VARCHAR}` and `{VARCHAR,VARCHAR,ANY}` overloads sharing one body. ⚠ The note said to change
+"both its registrations (it ships as a table function AND a scalar under one name)" — that is
+`fabricator_host_exec`; `fabricator_exec` has only ever had one.
+
+Gate: `verify_raw_query` 34 → **85** (service tier), §9–§16, two mutants each killed at its own row.
+Full record + the corrections above: [provider-query-parameters.md](provider-query-parameters.md).
+
 ## v87 (2026-09-06) — `inout_exchange_open` gains the same PROJECTION HINT, for COLLECTORS
 
 **User-asked** right after v86: the collector half of the same feature. `inout_exchange_open` takes

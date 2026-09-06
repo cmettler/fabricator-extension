@@ -12,6 +12,7 @@
 // of clr_host so the project agrees on one ArrowSchema/ArrowArrayStream layout.
 #include "fabricator/arrow_ingest.hpp"
 
+#include "fabricator/arrow_produce.hpp"
 #include "fabricator/clr_host.hpp"
 #include "fabricator/fabricator_onelake_fs.hpp"
 #include "fabricator/fabricator_variant.hpp"
@@ -27,6 +28,7 @@
 #include "fabricator_http.hpp"
 #include "fabricator_secret.hpp"
 #include "fabricator_storage.hpp"
+#include "duckdb/common/arrow/arrow_appender.hpp"
 #include "duckdb/function/function_set.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/main/attached_database.hpp"
@@ -307,9 +309,42 @@ static unique_ptr<FunctionData> TestScanBind(ClientContext &context, TableFuncti
 	return std::move(bind_data);
 }
 
-// --- fabricator_query(connection_string VARCHAR, sql VARCHAR) -----------------
+// --- the `params :=` bag ------------------------------------------------------
+// Exports the caller's parameter bag as the ABI v88 `params` stream: ONE row, ONE column named "params",
+// holding the argument exactly as written (a DuckDB STRUCT or a JSON string). The STRUCT/JSON branch is
+// deliberately NOT taken here — the managed side normalises the bag into one column per parameter, so
+// that rule lives in one language and cannot drift between this surface and fabricator_exec's.
+//
+// ⚠ Returns an OWNING producer that must outlive the ABI call, and every call needs its OWN: the managed
+// side consumes and releases what it is handed, and this factory runs twice (bind + scan). Holding one
+// exported stream across both is the recorded BuildFilterValues use-after-free, which is invisible on
+// Windows and Linux and an abort on macOS. A NULL bag yields nullptr — "no parameters", the same answer
+// an absent argument gives, so a caller need not distinguish them.
+//
+// ⚠ No Arrow type extensions are registered for the appender ({}): a parameter is a scalar the provider
+// binds, and an extension-typed one (e.g. VARIANT) has no meaning as a provider parameter.
+static unique_ptr<fabricator::ArrowProducer> MakeParamsStream(const Value &params, ClientProperties props) {
+	if (params.IsNull()) {
+		return nullptr;
+	}
+	vector<LogicalType> types {params.type()};
+	vector<string> names {"params"};
+	DataChunk chunk;
+	chunk.Initialize(Allocator::DefaultAllocator(), types);
+	chunk.SetValue(0, 0, params);
+	chunk.SetCardinality(1);
+	ArrowAppender appender(types, 1, props, {});
+	appender.Append(chunk, 0, 1, 1);
+	auto producer = make_uniq<fabricator::ArrowProducer>(types, names, props);
+	producer->AddBatch(appender.Finalize());
+	producer->Finish();
+	return producer;
+}
+
+// --- fabricator_query(connection_string VARCHAR, sql VARCHAR [, params := ANY]) ---
 // Runs arbitrary T-SQL against SQL Server and streams the result into DuckDB as
 // Arrow. The connection/catalog handle lives as long as the bind data.
+// `params` (ABI v88, optional) is the caller's parameter bag — see MakeParamsStream.
 struct FabricatorQueryBindData : public fabricator::ArrowStreamBindData {
 	FabricatorHandle handle = nullptr;
 	bool owns_handle = true; // false when borrowed from an attached catalog
@@ -325,11 +360,29 @@ static unique_ptr<FunctionData> QueryBind(ClientContext &context, TableFunctionB
 	auto connection_string = input.inputs[0].GetValue<string>();
 	auto sql = input.inputs[1].GetValue<string>();
 
+	// The optional `params :=` bag (ABI v88). Held as a DuckDB Value and re-exported per call — see
+	// MakeParamsStream for why one exported stream must not serve both the bind and the scan.
+	//
+	// ⚠ `props` is CAPTURED here and used at scan time, and it carries an optional_ptr<ClientContext> that
+	// the schema export dereferences. Safe by the same argument as ArrowStreamBindData::properties (the
+	// established precedent, fabricator_schema_entry.cpp): the bind data lives with the PLAN, the plan
+	// belongs to a statement on this ClientContext, and a prepared statement re-binds on its OWN connection.
+	// Exercised deliberately: a VIEW over a parameterised query used repeatedly, and a prepared statement
+	// re-executed.
+	Value params;
+	auto param_entry = input.named_parameters.find("params");
+	if (param_entry != input.named_parameters.end()) {
+		params = param_entry->second;
+	}
+	auto props = fabricator::BoundaryClientProperties(context);
+
 	auto bind_data = make_uniq<FabricatorQueryBindData>();
 	bind_data->handle = ResolveConnection(context, connection_string, bind_data->owns_handle);
 	auto handle = bind_data->handle;
-	bind_data->factory = [handle, sql](const fabricator::ArrowScanRequest &, ArrowArrayStream &out) {
-		fabricator::ExecuteQuery(handle, sql, out);
+	bind_data->factory = [handle, sql, params, props](const fabricator::ArrowScanRequest &,
+	                                                  ArrowArrayStream &out) {
+		auto param_stream = MakeParamsStream(params, props);
+		fabricator::ExecuteQuery(handle, sql, out, param_stream ? param_stream->Stream() : nullptr);
 	};
 
 	fabricator::PopulateReturnSchema(context, *bind_data, return_types, names);
@@ -407,6 +460,7 @@ static void FabricatorExecFunction(DataChunk &args, ExpressionState &state, Vect
 	if (context.TryGetCurrentSetting("mssql_exec_invalidate_cache", invalidate_value) && !invalidate_value.IsNull()) {
 		invalidate_on_ddl = invalidate_value.GetValue<bool>();
 	}
+	auto props = fabricator::BoundaryClientProperties(context);
 
 	for (idx_t i = 0; i < count; i++) {
 		auto conn_value = args.GetValue(0, i);
@@ -432,7 +486,13 @@ static void FabricatorExecFunction(DataChunk &args, ExpressionState &state, Vect
 			// write the _delta_log/data through DuckDB's FileSystem). No-op for SQL Server / delta-rs (they ignore it).
 			fabricator::SetActiveOpener(reinterpret_cast<FabricatorHandle>(&context),
 			                            fabricator::SessionKeyFor(&context));
-			result_data[i] = fabricator::ExecuteDml(handle, StringValue::Get(sql_value), &schema_may_change);
+			// The optional third argument is the `params` bag (ABI v88). fabricator_exec is a SCALAR, and a
+			// DuckDB scalar has no named parameters at all, so it is POSITIONAL here where fabricator_query
+			// takes `params :=` — the two surfaces differ in spelling because DuckDB's function kinds do.
+			auto param_stream =
+			    args.ColumnCount() > 2 ? MakeParamsStream(args.GetValue(2, i), props) : nullptr;
+			result_data[i] = fabricator::ExecuteDml(handle, StringValue::Get(sql_value), &schema_may_change,
+			                                        param_stream ? param_stream->Stream() : nullptr);
 		} catch (...) {
 			if (owns) {
 				fabricator::CloseCatalog(handle);
@@ -552,6 +612,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// See ArrowStreamGetPartitionData + docs/scan-concurrency.md.
 	query_fn.get_partition_data = fabricator::ArrowStreamGetPartitionData;
 	query_fn.projection_pushdown = true;
+	// Optional parameter bag (ABI v88), declared ANY so a caller may pass EITHER a DuckDB STRUCT
+	// (params := {'a': 1}) or a JSON string (params := '{"a": 1}') — the daxeval/fluid_render convention.
+	// A fixed VARCHAR would force DuckDB to stringify a struct before we ever saw it.
+	// ⚠ `params` is a RESERVED argument name on this function from here on.
+	query_fn.named_parameters["params"] = LogicalType::ANY;
 	loader.RegisterFunction(query_fn);
 
 	// fabricator_functions(catalog|connstr) — lists discovered routines (diagnostic).
@@ -577,10 +642,20 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// The eight fabricator_delta_* registrations were DELETED here (ABI v70) — see the note above
 	// FabricatorExecFunction. Their replacements live in the `delta` schema of every attached Delta catalog.
 
-	ScalarFunction exec_fn("fabricator_exec", {LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::BIGINT,
-	                       FabricatorExecFunction);
-	exec_fn.stability = FunctionStability::VOLATILE;
-	loader.RegisterFunction(exec_fn);
+	// fabricator_exec(catalog, sql [, params]). The bag is POSITIONAL, not `params :=`: this is a SCALAR
+	// function and a DuckDB scalar carries no named parameters, so an overload set is the only spelling
+	// available. Both overloads run one body, so the two arities cannot drift on what a parameter means.
+	{
+		ScalarFunctionSet exec_set("fabricator_exec");
+		for (const auto &signature : vector<vector<LogicalType>> {
+		         {LogicalType::VARCHAR, LogicalType::VARCHAR},
+		         {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::ANY}}) {
+			ScalarFunction exec_fn("fabricator_exec", signature, LogicalType::BIGINT, FabricatorExecFunction);
+			exec_fn.stability = FunctionStability::VOLATILE;
+			exec_set.AddFunction(exec_fn);
+		}
+		loader.RegisterFunction(exec_set);
+	}
 
 	// fabricator_refresh_cache(catalog) re-discovers the attached catalog's metadata.
 	{

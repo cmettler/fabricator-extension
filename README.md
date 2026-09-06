@@ -815,6 +815,32 @@ commit that connection. If you need a statement to be reliably part of the trans
 transaction has written first, or use a purpose-built function (`db.dbo.fabricator_session_tag()` exists for
 exactly this reason).
 
+#### Parameters
+
+Both functions take an optional **parameter bag** — values that reach the provider as real bound
+parameters, never as text spliced into the statement. `fabricator_query` names it (`params :=`);
+`fabricator_exec` takes it as a third positional argument, because it is a scalar function and DuckDB
+scalars have no named parameters.
+
+```sql
+SELECT * FROM fabricator_query('mssql', 'SELECT * FROM dbo.people WHERE dept = @d', params := {'d': 'eng'});
+SELECT * FROM fabricator_query('mssql', 'SELECT @a AS a', params := '{"a": 7}');   -- JSON also accepted
+SELECT fabricator_exec('mssql', 'UPDATE dbo.people SET dept = @new WHERE dept = @old',
+                       {'new': 'platform', 'old': 'eng'});
+```
+
+Each key is a parameter NAME, without the provider's sigil — write `{'d': …}` for `@d`, not `{'@d': …}`.
+The sigil belongs to the statement's dialect, so the provider adds it. An absent argument and
+`params := NULL` both mean "no parameters".
+
+⚠ **Prefer the STRUCT form.** A struct's fields keep their DuckDB types exactly — precision, scale and
+temporal resolution all survive — while a JSON bag has only four scalar kinds, so it can carry
+`BIGINT` / `DOUBLE` / `VARCHAR` / `BOOLEAN` and nothing else. A `DECIMAL` or a typed timestamp needs the
+struct.
+
+⚠ **Only providers with a parameterised statement form accept a bag** — today SQL Server. Anything else
+refuses by name rather than running your statement with the values quietly dropped.
+
 ### `fabricator_refresh_cache(catalog)` / `fabricator_invalidate_cache(catalog [, schema [, table]])`
 
 Refresh cached catalog metadata after creating/dropping tables out-of-band (e.g. via

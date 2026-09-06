@@ -987,7 +987,10 @@ case "$TIER" in
         #   hardcodes temporary:false), so this very call left one in the caller's memory.main pointing at
         #   a released stream, and scanning it SEGFAULTED. The 10 asserted just above is its positive
         #   control: a 0 is equally true of a build where the input was never registered at all.
-        : "${MIN_ASSERTIONS:=3109}"
+        # 3160 since 2026-09-06: verify_raw_query 34 -> 85, the ABI v88 parameter bag (§9-§16). 3109 + 51
+        #   exactly, which is what shows no other suite moved — the ABI signatures of execute_query and
+        #   execute_dml changed, so every suite in both tiers goes through them.
+        : "${MIN_ASSERTIONS:=3160}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

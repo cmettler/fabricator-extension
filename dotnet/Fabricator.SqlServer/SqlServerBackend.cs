@@ -1428,7 +1428,7 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
     /// Server family member honours, and where a particular statement cannot be described the catch below
     /// already yields the fallback. So there is no capability question to answer and no probe to swallow.</para>
     /// </remarks>
-    public Schema? DescribeQuery(string sql) => DescribeQuery(sql, null);
+    public Schema? DescribeQuery(string sql) => DescribeQuery(sql, (IReadOnlyList<SqlParameter>?)null);
 
     /// <summary>
     /// As <see cref="DescribeQuery(string)"/>, for a PARAMETERIZED statement.
@@ -1476,10 +1476,65 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
         }
     }
 
-    public IArrowArrayStream ExecuteQuery(string sql) => ExecuteQuery(sql, null);
+    public IArrowArrayStream ExecuteQuery(string sql) => ExecuteQuery(sql, (IReadOnlyList<SqlParameter>?)null);
 
     public IArrowArrayStream ExecuteQuery(string sql, IReadOnlyList<SqlParameter>? parameters) =>
         ExecuteQuery(sql, parameters, readYourWrites: false);
+
+    // --- ABI v88: the caller's `params` bag -------------------------------------------------------------
+    // The host has already normalised whatever the caller wrote (a DuckDB STRUCT or a JSON object) into a
+    // one-row batch with one column per parameter, so all that is left here is Arrow -> SqlParameter.
+    // ⚠ Both members delegate to the SAME converter and then to the 2-arg forms this class ALREADY had for
+    // the CDC reader, so the describe and the execution cannot disagree about what a parameter is.
+
+    public Schema? DescribeQuery(string sql, RecordBatch? parameters) => DescribeQuery(sql, ToSqlParameters(parameters));
+
+    public IArrowArrayStream ExecuteQuery(string sql, RecordBatch? parameters) =>
+        ExecuteQuery(sql, ToSqlParameters(parameters));
+
+    public long ExecuteNonQuery(string sql, RecordBatch? parameters) =>
+        ExecuteNonQueryCore(sql, ToSqlParameters(parameters));
+
+    /// <summary>
+    /// Converts the host-normalised bag into SqlClient parameters: one per column, named by its field.
+    /// </summary>
+    /// <remarks>
+    /// <para>⚠⚠ A <see cref="DateTime"/> IS PINNED TO <c>datetime2</c> for the reason
+    /// <see cref="FilterWhereBuilder"/> records at length: SqlClient infers the LEGACY <c>datetime</c>
+    /// (~3.33 ms resolution) and ROUNDS the value before the server sees it. There it costs a pushed
+    /// predicate its never-erases property; HERE it is simply a WRONG VALUE, which is worse — so the rule is
+    /// the same and the reason to keep it is stronger. It goes through one helper so the two cannot drift.</para>
+    /// <para>⚠ The Arrow -&gt; CLR step is <see cref="ArrowValueReader.ReadScalar"/>, the same reader every
+    /// other value crossing here uses; a NULL becomes <see cref="DBNull"/>, which is what SqlClient requires
+    /// and what lets a describe declare the parameter without a value meaning anything.</para>
+    /// </remarks>
+    internal static IReadOnlyList<SqlParameter>? ToSqlParameters(RecordBatch? parameters)
+    {
+        if (parameters is null)
+        {
+            return null;
+        }
+        var fields = parameters.Schema.FieldsList;
+        var result = new List<SqlParameter>(fields.Count);
+        for (int i = 0; i < fields.Count; i++)
+        {
+            var value = parameters.Column(i).Length == 0 ? null : ArrowValueReader.ReadScalar(parameters.Column(i), 0);
+            result.Add(MakeParameter("@" + fields[i].Name, value));
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// One rule for turning a CLR value into a <see cref="SqlParameter"/>. See
+    /// <see cref="ToSqlParameters"/> for why the <see cref="DateTime"/> case is not inference.
+    /// </summary>
+    internal static SqlParameter MakeParameter(string name, object? value)
+    {
+        var bound = value ?? DBNull.Value;
+        return bound is DateTime
+            ? new SqlParameter(name, System.Data.SqlDbType.DateTime2) { Value = bound }
+            : new SqlParameter(name, bound);
+    }
 
     // A short metadata read (e.g. FetchTableColumns / FetchRowIdColumns) that must see the transaction's
     // own uncommitted writes — e.g. CREATE TABLE then immediately re-fetch the new table's columns to build
@@ -1934,7 +1989,9 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
         }
     }
 
-    public long ExecuteNonQuery(string sql)
+    public long ExecuteNonQuery(string sql) => ExecuteNonQueryCore(sql, null);
+
+    private long ExecuteNonQueryCore(string sql, IReadOnlyList<SqlParameter>? parameters)
     {
         // A raw exec (fabricator_exec) can be a slow DML (a big UPDATE/DELETE). Cancel it on query interrupt
         // via the async SqlClient token. The opener is set fresh before the exec (FabricatorExecFunction), so
@@ -1948,6 +2005,7 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
             command.CommandType = CommandType.Text;
             command.CommandTimeout = ResolveCommandTimeout();
             command.Transaction = transaction;
+            AddParameters(command, parameters);
             Log.LogDebug("exec [txn={Txn} own={Own}]: {Sql}", AmbientTransaction.Current, owns, Trunc(sql));
             // ExecuteNonQuery returns -1 for statements that don't affect rows
             // (DDL, SET, ...); report 0 for those (matches the C++ mssql extension).
