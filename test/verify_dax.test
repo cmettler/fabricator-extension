@@ -311,12 +311,18 @@ true
 # ⚠ daxeval is the control: it is kind 'proc', whose arguments the host makes named by construction, so it
 # needs no styles and must keep reporting two NAMED parameters.
 
+# ⚠ THE WHOLE INVENTORY, not just the two that broke: this is exactly the check that would have CAUGHT the
+# daxevaltable drift, so it covers every dax* function rather than the ones already known to be wrong. The
+# refresh trio goes through Params.Combine (the migrated path) and is included as the standing control.
 query TTT
 SELECT function_name, parameters, parameter_types
 FROM duckdb_functions()
-WHERE function_name IN ('daxeval', 'daxevaltable', 'daxeach')
+WHERE function_name LIKE 'dax%'
 ORDER BY function_name;
 ----
+dax_refresh	[type, objects_json, max_parallelism]	[VARCHAR, VARCHAR, BIGINT]
+dax_refresh_partition	[col0, col1, type]	[VARCHAR, VARCHAR, VARCHAR]
+dax_refresh_table	[col0, type]	[VARCHAR, VARCHAR]
 daxeach	[col0, expression]	[TABLE, VARCHAR]
 daxeval	[expression, params]	[VARCHAR, ANY]
 daxevaltable	[col0, expression]	[TABLE, VARCHAR]

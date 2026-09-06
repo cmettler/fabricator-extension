@@ -425,7 +425,7 @@ multi-fragment commit); (3) whole-model replace + DDL→model auto-sync — defe
 
 ## ✅ LIVE VALIDATION 2026-09-06 — and it found TWO regressions that only a running model could
 
-`verify_dax` **29 → 57**, all green against a local Power BI Desktop instance (`pbidesktop://` autodetect).
+`verify_dax` **29 → 66**, all green against a local Power BI Desktop instance (`pbidesktop://` autodetect).
 It had not been run for some time, and both defects below make everything EXCEPT targeted access fail —
 the same shape as the SQL Server discovery defect this project already records.
 
@@ -483,6 +483,13 @@ having asked for it.
 The `fabricator_query`-on-DAX and shared-bag rows added hours earlier had no model to run against. Every one
 passed, including the `9007199254740993` row that is the whole point of unifying the decoder — so the
 precision fix is now verified end to end on a live model rather than on the pattern alone.
+
+### 3a. ⚠ The registration inventory now covers EVERY `dax*` function, not the two that broke
+
+A signature row that lists only the functions already known to be wrong cannot catch the NEXT drift, and the
+defect above was precisely a drift. So the row asserts all six — the three query forms plus the refresh trio,
+which goes through `Params.Combine` (the migrated path) and is the standing control. Verified correct as
+found; nothing there needed fixing.
 
 ### 4. Both fixes are MUTATION-TESTED against the live model
 
