@@ -26,6 +26,40 @@ public interface ICollectorFunctionBinding : IDisposable
     /// full output (emitted lazily, but the operator materializes it once after all input). Copy values out of
     /// each input batch — the Arrow buffers are freed after the batch is consumed; do not retain the batch.</summary>
     IAsyncEnumerable<RecordBatch> Collect(IAsyncEnumerable<RecordBatch> allInput, CancellationToken ct = default);
+
+    /// <summary>
+    /// The whole-table transform, told which of <see cref="OutputSchema"/>'s columns the caller actually
+    /// reads — <paramref name="projected"/> holds their indices in output order, or is <see langword="null"/>
+    /// when the caller reads all of them.
+    /// </summary>
+    /// <remarks>
+    /// ⚠⚠ <b>A HINT, NOT A DEMAND, and the default implementation ignores it.</b> Honour it and return just
+    /// those columns, in that order, saving both the work and the crossing; ignore it and return the full
+    /// declared schema, which the host then narrows itself. It discriminates the two shapes by COLUMN COUNT
+    /// and validates types either way, so a collector written before this member existed keeps working — the
+    /// reason this is a default implementation rather than a signature change.
+    /// <para>⚠ Worth honouring where producing a column COSTS something — a remote call, or a generated SQL
+    /// statement whose unread expressions the engine would otherwise still evaluate. For a collector that
+    /// computes its columns in memory, ignoring it is the right answer.</para>
+    /// <para>⚠ It arrives HERE rather than at <see cref="ICollectorFunction.Bind"/> because DuckDB decides
+    /// the projection AFTER binding: the bind must still declare the full schema, since that is what the
+    /// planner narrows.</para>
+    /// </remarks>
+    IAsyncEnumerable<RecordBatch> Collect(IAsyncEnumerable<RecordBatch> allInput, IReadOnlyList<int>? projected,
+                                          CancellationToken ct = default) => Collect(allInput, ct);
+
+    /// <summary>
+    /// The columns <see cref="Collect"/> will actually produce for <paramref name="projected"/>. The default
+    /// is the full <see cref="OutputSchema"/> — i.e. "I ignore the hint", which is what makes overriding
+    /// <see cref="Collect"/> alone insufficient and this member necessary.
+    /// </summary>
+    /// <remarks>
+    /// ⚠⚠ A collector's output crosses as ONE stream whose schema is declared BEFORE the first batch, so the
+    /// host cannot discover the shape by looking at a batch the way it can for a lateral. Whatever this
+    /// returns is what <see cref="Collect"/> MUST produce; the host reads the two apart by width and narrows
+    /// the result itself when this says the full schema.
+    /// </remarks>
+    Schema ProjectedOutputSchema(IReadOnlyList<int>? projected) => OutputSchema;
 }
 
 /// <summary>

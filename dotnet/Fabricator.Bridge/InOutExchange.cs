@@ -20,18 +20,24 @@ internal sealed class InOutExchangeStream : IArrowArrayStream
     private readonly IInOutFunctionBinding _binding;
     private readonly IArrowArrayStream _input;   // imported from C++; owned + released here
     private readonly IAsyncEnumerator<RecordBatch> _out;
+    private readonly Schema _schema;
     private bool _disposed;
 
-    public InOutExchangeStream(IInOutFunctionBinding binding, IArrowArrayStream input)
+    public InOutExchangeStream(IInOutFunctionBinding binding, IArrowArrayStream input,
+                               IReadOnlyList<int>? projected = null)
     {
         // The SQL isolation (if any) was already resolved + set on the binding at bind time (InOutBind), so
         // there is nothing isolation-related to do here. See docs/provider-extensibility.md §3.
         _binding = binding;
         _input = input;
-        _out = binding.DoExchange(ReadInput(), CancellationToken.None).GetAsyncEnumerator();
+        _schema = binding.ProjectedOutputSchema(projected);
+        _out = binding.DoExchange(ReadInput(), projected, CancellationToken.None).GetAsyncEnumerator();
     }
 
-    public Schema Schema => _binding.OutputSchema;
+    // ⚠ What the binding SAYS it will produce for this projection, not its full declared schema: the C
+    // stream's schema is read once, before any batch, so a binding that honours the hint must be able to
+    // declare the narrower shape here or the host would read narrow batches through wide converters.
+    public Schema Schema => _schema;
 
     public ValueTask<RecordBatch?> ReadNextRecordBatchAsync(CancellationToken cancellationToken = default)
     {

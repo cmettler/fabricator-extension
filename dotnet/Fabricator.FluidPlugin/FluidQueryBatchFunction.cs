@@ -76,6 +76,9 @@ internal sealed class FluidQueryBatchFunction : ICollectorFunction
     /// <summary>Any input column under this prefix would collide with the staging machinery.</summary>
     private const string ReservedPrefix = "__fab";
 
+    /// <summary>The template variable naming the output columns the caller actually reads.</summary>
+    internal const string ProjectedVariable = "projected";
+
     private const string PublishRefusal =
         "publish() cannot be used here — " + FunctionName + " runs the rendered statement on the template's "
         + "OWN connection, so scanning a publication would re-enter that connection and hang. A publication "
@@ -135,15 +138,38 @@ internal sealed class FluidQueryBatchFunction : ICollectorFunction
     /// <summary>Builds the render context every render of one execution shares.</summary>
     private static TemplateContext NewContext(FluidRenderSession session,
                                               object? parameters,
-                                              bool isBind)
+                                              bool isBind,
+                                              Schema? projectedSchema = null)
     {
         var ctx = FluidEngine.NewRenderContext(FunctionName, PublishRefusal, session, c =>
         {
             FluidValueModel.SetVariable(c, FluidValueModel.BagVariable, parameters);
         });
         ctx.SetValue(FluidEngine.IsBindVariable, isBind);
+        if (projectedSchema is not null)
+        {
+            // ⚠ The template may use it or ignore it: the wrapper narrows the result either way, so a
+            // template that never reads `projected` is correct and merely does more work. NOT bound during
+            // the schema probe — there is no projection yet, the bind is what the planner narrows — so a
+            // template reading it branches on is_bind.
+            FluidValueModel.SetVariable(ctx, ProjectedVariable,
+                                        projectedSchema.FieldsList.Select(f => f.Name).ToArray());
+        }
         return ctx;
     }
+
+    /// <summary>
+    /// The generated statement as this function runs it: exactly the columns this plan reads, named.
+    /// </summary>
+    /// <remarks>
+    /// ⚠⚠ NAMING THEM IS THE PROJECTION PUSHDOWN — MEASURED, DuckDB prunes an unreferenced expression inside
+    /// a subquery, so a narrowed outer SELECT makes the TEMPLATE'S OWN statement stop computing what nobody
+    /// reads. It is applied even with no projection, so the drift behaviour does not depend on the caller's
+    /// SELECT list: an EXTRA column is dropped either way, and a missing or renamed one fails at the inner
+    /// bind naming the column.
+    /// </remarks>
+    private static string Wrap(string generated, Schema keep) =>
+        $"SELECT {string.Join(", ", keep.FieldsList.Select(f => DuckSql.QuoteIdent(f.Name)))} FROM ({generated})";
 
     /// <summary>The schema of <paramref name="generated"/> without producing a row of it.</summary>
     /// <remarks>
@@ -228,17 +254,34 @@ internal sealed class FluidQueryBatchFunction : ICollectorFunction
 
         public Schema OutputSchema { get; }
 
+        /// <summary>The columns a given projection narrows this binding's output to.</summary>
+        private Schema Narrow(IReadOnlyList<int>? projected) =>
+            projected is { Count: > 0 } && projected.Count != OutputSchema.FieldsList.Count
+                ? new Schema(projected.Select(i => OutputSchema.FieldsList[i]).ToList(), metadata: null)
+                : OutputSchema;
+
+        // ⚠ DECLARING that this binding HONOURS the hint: the exchange's stream schema is read before its
+        // first batch, so narrowing the output without saying so here would have the host read narrow
+        // batches through wide converters.
+        public Schema ProjectedOutputSchema(IReadOnlyList<int>? projected) => Narrow(projected);
+
+        public IAsyncEnumerable<RecordBatch> Collect(IAsyncEnumerable<RecordBatch> allInput,
+                                                    CancellationToken ct = default) =>
+            Collect(allInput, null, ct);
+
         public async IAsyncEnumerable<RecordBatch> Collect(
             IAsyncEnumerable<RecordBatch> allInput,
+            IReadOnlyList<int>? projected,
             [EnumeratorCancellation] CancellationToken ct = default)
         {
+            var outputSchema = Narrow(projected);
             // ⚠ PER EXECUTION, not per binding: a binding is reused across prepared re-executions, so a
             // session or a context built at bind would carry one execution's temp tables and Liquid state
             // into the next.
             using var session = FluidRenderSession.TryCreate()
                 ?? throw new InvalidOperationException(
                     $"{FunctionName} needs the hosting DuckDB, which is not available here.");
-            var ctx = NewContext(session, _parameters, isBind: false);
+            var ctx = NewContext(session, _parameters, isBind: false, outputSchema);
 
             long staged = await StageInputAsync(session, allInput, ct).ConfigureAwait(false);
             // ⚠ `staged > size` rather than `staged > 0`, so a batchsize at or above the row count is ONE
@@ -258,8 +301,8 @@ internal sealed class FluidQueryBatchFunction : ICollectorFunction
                         $"{FunctionName}: the template rendered nothing for group {g + 1} of {groups}; "
                         + "it must render a SELECT.");
                 }
-                using var stream = session.Query(generated);
-                Verify(stream.Schema, OutputSchema);
+                using var stream = session.Query(Wrap(generated, outputSchema));
+                Verify(stream.Schema, outputSchema);
                 while (true)
                 {
                     var batch = await stream.ReadNextRecordBatchAsync(ct).ConfigureAwait(false);

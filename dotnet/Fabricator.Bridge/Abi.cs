@@ -149,7 +149,9 @@ public unsafe struct FabricatorVTable
     public delegate* unmanaged[Cdecl]<nint, byte*, byte*, CArrowArrayStream*, CArrowSchema*, CArrowArrayStream*, nint*, byte**, int> InOutBind;
 
     // int32 inout_exchange_open(void* binding, ArrowArrayStream* input, ArrowArrayStream* output, char** err)
-    public delegate* unmanaged[Cdecl]<nint, CArrowArrayStream*, CArrowArrayStream*, byte**, int> InOutExchangeOpen;
+    // The two int params are the PROJECTION HINT: the output-column indices the caller reads (null/0 = all).
+    public delegate* unmanaged[Cdecl]<nint, CArrowArrayStream*, int*, int, CArrowArrayStream*, byte**, int>
+        InOutExchangeOpen;
 
     // int32 inout_bind_close(void* binding, char** err)
     public delegate* unmanaged[Cdecl]<nint, byte**, int> InOutBindClose;

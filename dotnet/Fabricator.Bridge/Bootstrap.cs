@@ -91,7 +91,7 @@ public static unsafe class Bootstrap
                             () => OneRowStream(probeSchema, Interlocked.Increment(ref _lazyOpens) - 1),
                             probeSchema);
 
-        vtable->AbiVersion = 86;
+        vtable->AbiVersion = 87;
         vtable->OpenCatalog = &OpenCatalog;
         vtable->CloseCatalog = &CloseCatalog;
         vtable->ExecuteQuery = &ExecuteQuery;
@@ -1504,8 +1504,8 @@ public static unsafe class Bootstrap
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static int InOutExchangeOpen(nint binding, CArrowArrayStream* input,
-                                         CArrowArrayStream* output, byte** err)
+    private static int InOutExchangeOpen(nint binding, CArrowArrayStream* input, int* projected,
+                                         int projectedCount, CArrowArrayStream* output, byte** err)
     {
         try
         {
@@ -1521,7 +1521,17 @@ public static unsafe class Bootstrap
             // Take ownership of the host's input stream; the pump pulls it (one chunk per gate tenure) + releases it.
             // The SQL isolation was resolved + set on the binding at inout_bind (C#), so it is not passed here.
             var inputStream = CArrowArrayStreamImporter.ImportArrayStream(input);
-            CArrowArrayStreamExporter.ExportArrayStream(new InOutExchangeStream(b, inputStream), output);
+            // ⚠ COPIED: the host's array belongs to this crossing, the exchange outlives it.
+            int[]? cols = null;
+            if (projected is not null && projectedCount > 0)
+            {
+                cols = new int[projectedCount];
+                for (int i = 0; i < projectedCount; i++)
+                {
+                    cols[i] = projected[i];
+                }
+            }
+            CArrowArrayStreamExporter.ExportArrayStream(new InOutExchangeStream(b, inputStream, cols), output);
             return FabricatorStatus.Ok;
         }
         catch (Exception ex)

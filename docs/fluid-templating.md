@@ -3534,3 +3534,64 @@ declared order. A reordering cannot be misread either. §28's one drift row beca
 - **A same-width REORDERING** would defeat the managed side's "projection or not" test, which keys on the
   count. It cannot arise — `RemoveColumnsFromLogicalGet` preserves column order, so a projection is always
   an ordered SUBSET — but that is an assumption about DuckDB, recorded here rather than guarded.
+
+## 25. ✅ AS BUILT (2026-09-06) — the same PROJECTION PUSHDOWN for a COLLECTOR (ABI v87)
+
+User-asked immediately after §24: *"should be possible to add `projected` to fluid_query_batch?"* — yes, and
+structurally simpler, because a collector has no correlated columns. Gate `verify_plugin_fluid`
+677 → **702**, hermetic floor 8953 → **8978**, one mutant.
+
+### 25.1 What is the same, and the one thing that is not
+
+`inout_exchange_open` gains `(projected, count)` — the only crossing between `inout_bind` and the first
+output pull, exactly as `lateral_open` was for §24. Still a HINT; still discriminated so a collector that
+knows nothing about it keeps working. Advertised for COLLECTORS ONLY: the streaming exchange passes an empty
+projection, so the two paths stay distinguishable at the call site.
+
+⚠⚠ **The difference is WHERE the shape is declared.** A lateral's result is a fresh stream per `Call`, so the
+host could tell the two shapes apart by looking at a batch. A collector's output crosses as ONE stream whose
+schema is read BEFORE the first batch — so an empty result must be classifiable too, and a callee that
+narrows has to SAY SO. Hence `ProjectedOutputSchema(projected)`, a DIM returning the full `OutputSchema` by
+default: overriding `Collect` alone is not enough, and would have the host read narrow batches through wide
+converters.
+
+### 25.2 ⚠⚠ THE PROBE THAT PROVED NOTHING, and it is the most useful thing here
+
+`SELECT b FROM fluid_query_batch(…)` returns one column **whether or not the get was narrowed**, because
+DuckDB projects above the operator either way. That row passed happily while the projection was reaching
+NOTHING AT ALL — `collector.projection_pushdown = true` had been set on the CATALOG registration, and
+`fluid_query_batch` is a GLOBAL collector, registered on a different path a hundred lines away.
+
+What exposed it was asking the template what it saw (`projected` reported all three columns) and the payoff
+row (an unread `error()` column still fired). ⇒ **the only evidence of pushdown is work not happening, or
+the projection itself; the shape of the result is not evidence.** §31 says so at the top and asserts only
+those two.
+
+⚠ A wrong explanation was reached for first, and the gate is what killed it: the same probe under
+`SELECT DISTINCT` also showed all columns, which fitted DuckDB's `everything_referenced = true` rule for a
+plain distinct (`remove_unused_columns.cpp`). That rule is real, but it was NOT the cause — re-measured after
+the registration fix, `DISTINCT` narrows fine. The row asserting otherwise failed and was deleted rather than
+adjusted.
+
+### 25.3 The payoff row has a trap of its own
+
+It must not aggregate. The schema probe renders against an EMPTY `input_table`, and a `count(*)` produces a
+row — and evaluates the `error()` — at BIND, which fails the row for a reason unrelated to projection. A
+row-producing template renders nothing at the probe and everything at the group, which is what makes the
+assertion mean what it says.
+
+### 25.4 Mutant, and the same lesson as §24.3
+
+Emitting by position instead of through the wire map passes **690** assertions and dies at the
+`fabricator_collect_sum` row — the collector that ignores the hint. `fluid_query_batch` honours it, so its
+map is the identity and its own rows cannot catch the off-by-one. Both surfaces now depend on having one
+in-tree callee that deliberately does NOT honour the hint.
+
+### 25.5 The same drift relaxation
+
+`fluid_query_batch` had no wrapper at all before this; it now wraps every group in a SELECT naming the
+declared columns, for the same reason and with the same consequence as §24.6 — an EXTRA column is dropped
+where it used to be refused, while MISSING, RENAMED and RETYPED stay refused. Its one drift row became four.
+⚠ The wrapper is applied even with NO projection, deliberately: otherwise the drift behaviour would depend on
+the caller's SELECT list, which is the "runs and means something different" shape this file keeps warning
+about.

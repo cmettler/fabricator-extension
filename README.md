@@ -1974,6 +1974,11 @@ SELECT (SELECT count(*) FROM acc)::BIGINT AS groups_so_far, count(*)::BIGINT AS 
 > ⚠ **Liquid variables do NOT carry between groups**, only SQL state does. Fluid renders each group in its
 > own scope, so a `{% assign %}` starts fresh every time. Accumulate in a temp table, as above.
 
+> ⚠ **It only computes the columns you select.** As for `fluid_query_lateral`, the generated statement is
+> narrowed to the columns your query actually reads, so an expensive expression in a column you did not
+> select is never evaluated — and the template can read the list itself as `projected` (unset during the
+> schema probe, so branch on `is_bind`).
+
 > ⚠ **The whole input is buffered before the first render**, and `batchsize` does not change that — it
 > controls how many rows each *render* sees, never how much memory the function uses. This is inherent: a
 > function that may render once over everything cannot know it has everything until the input ends.

@@ -444,6 +444,14 @@ case "$TIER" in
         # in that section is load-bearing and a mutant proved it: an earlier `USE memory.hq_s` leaves a
         # qualified entry, against which the bug does not fire, so the section PASSED with it fully present.
         # 8250 + 9 = 8259 exactly, from a green run.
+        # 8978 since 2026-09-06 (same day, second bump): verify_plugin_fluid 677 -> 702 -- the same PROJECTION
+        # PUSHDOWN for a COLLECTOR (ABI v87, fluid_query_batch). /!\/!\ SELECTING ONE COLUMN IS NOT EVIDENCE:
+        # `SELECT b FROM fluid_query_batch(...)` returns one column whether or not the get was narrowed,
+        # because DuckDB projects above the operator either way -- a probe like that passed happily while the
+        # projection reached NOTHING (the flag was set on the catalog registration and fluid_query_batch is a
+        # GLOBAL collector, registered elsewhere). The evidence is the PAYOFF row (an unread error() column is
+        # never evaluated) and the `projected` variable. Same mutant lesson as the lateral: the row that tests
+        # the wire map is the one where the callee IGNORES the hint (fabricator_collect_sum).
         # 8953 since 2026-09-06: verify_plugin_fluid 599 -> 677 -- PROJECTION PUSHDOWN through a lateral
         # (ABI v86). DuckDB narrows the get to the columns the caller reads and the callee is TOLD, through
         # lateral_open -- the only crossing in the window, since the projection is decided after bind.
@@ -562,7 +570,7 @@ case "$TIER" in
         # two functions have exactly ONE registration each, plus the HostsCatalog refusal and its
         # unknown-provider control. 3105 + 238 + 8259 - 3339 arithmetic aside, both numbers come from green
         # runs.
-        : "${MIN_ASSERTIONS:=8953}"
+        : "${MIN_ASSERTIONS:=8978}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

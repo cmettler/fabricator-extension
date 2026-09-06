@@ -12,6 +12,23 @@
 > parsed with our own vcpkg yyjson, retiring the `ReadCapabilityFlag` string-find). v74 below is the
 > follow-on that finished the same job for ALTER.
 
+## v87 (2026-09-06) — `inout_exchange_open` gains the same PROJECTION HINT, for COLLECTORS
+
+**User-asked** right after v86: the collector half of the same feature. `inout_exchange_open` takes
+`(const int32_t *projected, int32_t projected_count)` — the only crossing between `inout_bind` and the first
+output pull. Advertised for COLLECTORS ONLY; the streaming exchange passes an empty projection, so the two
+paths stay distinguishable at the call site.
+
+**⚠⚠ One thing differs from v86 and it needed an extra member.** A lateral returns a fresh stream per
+`lateral_call`, so the host can tell a narrowed answer from a full one by looking at a batch. A collector's
+output crosses as ONE stream whose schema is read BEFORE the first batch — an empty result must be
+classifiable too — so a callee that narrows has to DECLARE it:
+`ICollectorFunctionBinding.ProjectedOutputSchema(projected)`, a DIM returning the full schema by default.
+Overriding `Collect` alone would have the host read narrow batches through wide converters.
+
+Full record: [fluid-templating.md](fluid-templating.md) §25 — including the probe that proved nothing
+(`SELECT b FROM f(…)` returns one column whether or not the get was narrowed).
+
 ## v86 (2026-09-06) — `lateral_open` gains a PROJECTION HINT
 
 **User-directed.** `lateral_open` takes `(const int32_t *projected, int32_t projected_count)` between the

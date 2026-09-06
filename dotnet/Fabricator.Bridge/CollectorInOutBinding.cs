@@ -24,5 +24,13 @@ public sealed class CollectorInOutBinding : IInOutFunctionBinding
     public IAsyncEnumerable<RecordBatch> DoExchange(IAsyncEnumerable<RecordBatch> input,
                                                     CancellationToken ct = default) => _inner.Collect(input, ct);
 
+    public Schema ProjectedOutputSchema(IReadOnlyList<int>? projected) => _inner.ProjectedOutputSchema(projected);
+
+    /// <summary>Forwards the projection hint straight through — the adapter adds nothing of its own.</summary>
+    public IAsyncEnumerable<RecordBatch> DoExchange(IAsyncEnumerable<RecordBatch> input,
+                                                    IReadOnlyList<int>? projected,
+                                                    CancellationToken ct = default) =>
+        _inner.Collect(input, projected, ct);
+
     public void Dispose() => _inner.Dispose();
 }

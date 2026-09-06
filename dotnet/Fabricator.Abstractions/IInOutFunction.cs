@@ -24,6 +24,19 @@ public interface IInOutFunctionBinding : IDisposable
     Schema OutputSchema { get; }
 
     IAsyncEnumerable<RecordBatch> DoExchange(IAsyncEnumerable<RecordBatch> input, CancellationToken ct = default);
+
+    /// <summary>
+    /// The exchange, told which of <see cref="OutputSchema"/>'s columns the caller reads (their indices in
+    /// output order, or <see langword="null"/> for all of them). A HINT the default implementation ignores —
+    /// see <c>ICollectorFunctionBinding.Collect</c> for the full contract; the host copes with either shape.
+    /// </summary>
+    IAsyncEnumerable<RecordBatch> DoExchange(IAsyncEnumerable<RecordBatch> input, IReadOnlyList<int>? projected,
+                                             CancellationToken ct = default) => DoExchange(input, ct);
+
+    /// <summary>The columns <see cref="DoExchange"/> will produce for <paramref name="projected"/>. Default:
+    /// the full <see cref="OutputSchema"/>. The exchange's stream schema is declared before its first batch,
+    /// so a binding that honours the hint has to say so HERE as well as narrowing its output.</summary>
+    Schema ProjectedOutputSchema(IReadOnlyList<int>? projected) => OutputSchema;
 }
 
 /// <summary>

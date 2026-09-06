@@ -524,7 +524,14 @@ typedef struct FabricatorVTable {
 	// The connection opens lazily on first input pull. One binding may open at most one exchange at a time.
 	// The SQL isolation for the read transaction is resolved + set on the binding in C# at inout_bind (SET
 	// mssql_isolation_level ?? the catalog's ATTACH isolation_level — both C#-owned), so it is not passed here.
+	//
+	// ⚠ `projected` is the PROJECTION PUSHDOWN HINT — the indices, into the binding's declared output schema
+	// and in output order, of the columns the caller reads; NULL / count 0 means all of them. Same contract
+	// as lateral_open (ABI v86): a HINT, so a callee may honour it or return its full schema, and the host
+	// discriminates by COLUMN COUNT. It rides HERE because the projection is decided after inout_bind and
+	// this is the only crossing before the first output pull.
 	int32_t (*inout_exchange_open)(FabricatorHandle binding, struct ArrowArrayStream *input,
+	                               const int32_t *projected, int32_t projected_count,
 	                               struct ArrowArrayStream *output, char **err);
 
 	// Release a binding handle from inout_bind. Idempotent; safe with nullptr. Best-effort
@@ -1280,7 +1287,7 @@ typedef struct FabricatorHostServices {
 // state blob is this many bytes + a 4-byte length prefix). Serialize() must fit within it.
 #define FABRICATOR_AGG_SPILL_CAP 1024
 
-#define FABRICATOR_ABI_VERSION 86
+#define FABRICATOR_ABI_VERSION 87
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(FabricatorVTable) as seen

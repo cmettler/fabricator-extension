@@ -1224,13 +1224,15 @@ FabricatorHandle InOutBind(FabricatorHandle handle, const std::string &schema, c
 	return binding;
 }
 
-void InOutExchangeOpen(FabricatorHandle binding, ArrowArrayStream &input, ArrowArrayStream &output) {
+void InOutExchangeOpen(FabricatorHandle binding, ArrowArrayStream &input, const std::vector<int32_t> &projected,
+                       ArrowArrayStream &output) {
 	const FabricatorVTable &vt = GetBridge();
 	if (!vt.inout_exchange_open) {
 		throw duckdb::IOException("Fabricator: bridge does not provide inout_exchange_open");
 	}
 	char *err = nullptr;
-	int32_t rc = vt.inout_exchange_open(binding, &input, &output, &err);
+	int32_t rc = vt.inout_exchange_open(binding, &input, projected.empty() ? nullptr : projected.data(),
+	                                    (int32_t)projected.size(), &output, &err);
 	if (rc != FABRICATOR_OK) {
 		ThrowManagedError(vt, err, "Fabricator: inout_exchange_open failed");
 	}

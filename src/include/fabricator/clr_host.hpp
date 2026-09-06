@@ -462,7 +462,10 @@ FabricatorHandle InOutBind(FabricatorHandle handle, const std::string &schema, c
 // imports + pulls (one input chunk per gate tenure; released/null array = end). Fills `output` with the
 // managed output stream (the host pulls it: non-empty = HAVE_MORE_OUTPUT, length-0 = NEED_MORE_INPUT,
 // null = FINISHED). The SQL isolation is resolved + set on the binding in C# at inout_bind, not passed here.
-void InOutExchangeOpen(FabricatorHandle binding, ArrowArrayStream &input, ArrowArrayStream &output);
+// `projected` = the indices, into the binding's declared output schema and in output order, of the columns
+// the caller reads; EMPTY = all. A HINT (abi.h, inout_exchange_open).
+void InOutExchangeOpen(FabricatorHandle binding, ArrowArrayStream &input, const std::vector<int32_t> &projected,
+                       ArrowArrayStream &output);
 
 // Release a binding handle from InOutBind. Idempotent; safe with nullptr. Best-effort (swallows errors).
 void InOutBindClose(FabricatorHandle binding);
