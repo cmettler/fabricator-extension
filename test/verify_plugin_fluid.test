@@ -3699,3 +3699,58 @@ SELECT n, total FROM fabricator_collect_sum((SELECT i::INTEGER AS n FROM range(4
 1	6
 2	6
 3	6
+
+# ============================================================================================
+# §32 — THE OUTPUT SCHEMA MAY DEPEND ON THE INPUT SCHEMA, not just on params.
+#
+# ⚠⚠ `input_table` EXISTS DURING THE SCHEMA PROBE — empty, but with the real columns — because both surfaces
+# create it before the is_bind render. That is what lets a template DERIVE its output columns from its input
+# columns: DESCRIBE the empty table, build the SELECT list from the answer, and the probe binds exactly what
+# a group will produce. It was a consequence of making the probe bindable rather than a stated feature, and
+# nothing pinned it; these two rows are what stop a refactor from reordering the create past the render.
+# ============================================================================================
+
+statement ok
+CREATE TABLE sch_src AS SELECT 1 AS alpha, 'x' AS beta;
+
+# --- one template, output columns named after whatever the input happens to have. ---
+query II
+SELECT out_alpha, out_beta FROM fluid_query_batch('
+{% query c %}SELECT column_name FROM (DESCRIBE SELECT * FROM input_table){% endquery %}
+SELECT {% for col in c %}{{ col.column_name }} AS out_{{ col.column_name }}{% unless forloop.last %}, {% endunless %}{% endfor %} FROM input_table',
+  (SELECT * FROM sch_src));
+----
+1	x
+
+# --- ⚠ THE DISCRIMINATOR: the SAME template over a DIFFERENT input yields a DIFFERENT output column. A
+# single-input row would pass equally on a build where the names were hardcoded. ---
+query I
+SELECT out_gamma FROM fluid_query_batch('
+{% query c %}SELECT column_name FROM (DESCRIBE SELECT * FROM input_table){% endquery %}
+SELECT {% for col in c %}{{ col.column_name }} AS out_{{ col.column_name }}{% unless forloop.last %}, {% endunless %}{% endfor %} FROM input_table',
+  (SELECT 7 AS gamma));
+----
+7
+
+statement ok
+CREATE TABLE sch_lt(id INTEGER, n INTEGER);
+
+statement ok
+INSERT INTO sch_lt VALUES (1, 5), (2, 6);
+
+# --- the same on the lateral, where the input column NAMES are the rendered expression text. ⚠ input_table
+# carries __fab_row first, so a schema-derived template excludes it from its outputs and projects it. ---
+query III
+SELECT t.id, f.out_n, f.out_id FROM sch_lt t, fluid_query_lateral('
+{% query c %}SELECT column_name FROM (DESCRIBE SELECT * FROM input_table) WHERE column_name <> ''__fab_row''{% endquery %}
+SELECT __fab_row{% for col in c %}, {{ col.column_name }} AS out_{{ col.column_name }}{% endfor %} FROM input_table',
+  'null', t.n, t.id) f ORDER BY t.id;
+----
+1	5	1
+2	6	2
+
+statement ok
+DROP TABLE sch_lt;
+
+statement ok
+DROP TABLE sch_src;

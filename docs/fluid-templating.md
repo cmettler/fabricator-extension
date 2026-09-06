@@ -3595,3 +3595,35 @@ where it used to be refused, while MISSING, RENAMED and RETYPED stay refused. It
 ⚠ The wrapper is applied even with NO projection, deliberately: otherwise the drift behaviour would depend on
 the caller's SELECT list, which is the "runs and means something different" shape this file keeps warning
 about.
+
+## 26. ✅ ALREADY TRUE, now stated and pinned (2026-09-06) — the output schema may depend on the INPUT schema
+
+User-asked: *"could we make the input_table available as an empty table at bind time (is_bind)? This enables
+building the outputschema not only dependent on params but also on the input_table schema"*. It already is,
+on both surfaces — but as a CONSEQUENCE rather than a stated feature, and nothing pinned it. Gate
+`verify_plugin_fluid` 702 → **716**, hermetic floor 8978 → **8992**. No code change.
+
+Both binds call `CreateEmptyInput` BEFORE the `is_bind` render, so `input_table` exists during the probe with
+its real columns and no rows. A template can therefore DESCRIBE it and build its SELECT list from the answer:
+
+```liquid
+{% query c %}SELECT column_name FROM (DESCRIBE SELECT * FROM input_table){% endquery %}
+SELECT {% for col in c %}{{ col.column_name }} AS out_{{ col.column_name }}{% unless forloop.last %}, {% endunless %}{% endfor %}
+FROM input_table
+```
+
+MEASURED: over `(SELECT 1 AS alpha, 'x' AS beta)` that yields `out_alpha`/`out_beta`; over `(SELECT 7 AS
+gamma)` the SAME template yields `out_gamma`. That second row is the discriminator — a single-input
+assertion would pass equally on a build with the names hardcoded.
+
+⚠ It works on `fluid_query_lateral` too, where the input column names are the rendered EXPRESSION TEXT
+(§22.3), so a schema-derived template there names its outputs after `n`, `(t.n + 1)` and so on.
+`input_table` carries `__fab_row` first, so such a template excludes it from its outputs and projects it.
+
+⚠ Why it was worth pinning rather than just documenting: `CreateEmptyInput`'s stated purpose is letting the
+probe BIND the generated statement. That the schema is DERIVABLE from it is a second-order effect of the
+ordering, and a refactor moving the create past the render would take it away. The gate is what stops that.
+
+⚠ It composes with `projected` (§24.5, §25) — the probe has the input schema but NOT the projection, which
+does not exist until after the bind. So a template may derive its FULL shape from the input at bind and then
+narrow that shape per call.

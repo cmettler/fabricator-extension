@@ -1945,6 +1945,21 @@ but branching lets you skip expensive setup, and it is the idiom when the real b
 branch renders is what gets bound: the columns are never taken on trust, and a later render that produces a
 different shape is refused rather than misread.
 
+**The output columns can depend on the INPUT columns**, not just on `params`. `input_table` exists during the
+schema probe — empty, but with its real columns — so a template can inspect it and build its own SELECT list:
+
+```sql
+SELECT * FROM fluid_query_batch('
+{% query c %}SELECT column_name FROM (DESCRIBE SELECT * FROM input_table){% endquery %}
+SELECT {% for col in c %}{{ col.column_name }} AS out_{{ col.column_name }}{% unless forloop.last %}, {% endunless %}{% endfor %}
+FROM input_table', (SELECT 7 AS gamma));
+-- out_gamma
+-- 7
+```
+
+The same template over a different input produces differently named columns. It works in
+`fluid_query_lateral` too, where the input columns are named after the expressions you passed.
+
 **Without `batchsize` the template is rendered ONCE for the whole input.** With it, once per that many
 rows — exactly that many, not "at least":
 

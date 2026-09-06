@@ -444,6 +444,13 @@ case "$TIER" in
         # in that section is load-bearing and a mutant proved it: an earlier `USE memory.hq_s` leaves a
         # qualified entry, against which the bug does not fire, so the section PASSED with it fully present.
         # 8250 + 9 = 8259 exactly, from a green run.
+        # 8992 since 2026-09-06 (same day, third bump): verify_plugin_fluid 702 -> 716 -- pinning that a
+        # template's OUTPUT schema may be derived from its INPUT schema, not just from params. `input_table`
+        # exists during the is_bind probe (empty, real columns) on both surfaces, so a template can DESCRIBE
+        # it and build its SELECT list from the answer. /!\ It was a CONSEQUENCE of making the probe bindable
+        # rather than a stated feature and nothing pinned it; the discriminating row is the SAME template
+        # over a DIFFERENT input yielding a different output column, since one input would pass equally on a
+        # build with the names hardcoded.
         # 8978 since 2026-09-06 (same day, second bump): verify_plugin_fluid 677 -> 702 -- the same PROJECTION
         # PUSHDOWN for a COLLECTOR (ABI v87, fluid_query_batch). /!\/!\ SELECTING ONE COLUMN IS NOT EVIDENCE:
         # `SELECT b FROM fluid_query_batch(...)` returns one column whether or not the get was narrowed,
@@ -570,7 +577,7 @@ case "$TIER" in
         # two functions have exactly ONE registration each, plus the HostsCatalog refusal and its
         # unknown-provider control. 3105 + 238 + 8259 - 3339 arithmetic aside, both numbers come from green
         # runs.
-        : "${MIN_ASSERTIONS:=8978}"
+        : "${MIN_ASSERTIONS:=8992}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh
