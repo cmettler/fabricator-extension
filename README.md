@@ -1966,6 +1966,23 @@ The input arrives as a temporary table called **`input_table`**, on the template
 with `{% query %}`, join it in the generated statement, or ignore it. Its columns are the input relation's
 own.
 
+**`input_table` is also a Liquid value**, so the same rows are reachable either way under one name:
+
+```sql
+SELECT sql_n, fluid_n FROM fluid_query_batch(
+  'SELECT (SELECT count(*) FROM input_table)::BIGINT AS sql_n, {{ input_table.size }}::BIGINT AS fluid_n',
+  (SELECT i FROM range(5) t(i)), batchsize := 2);
+-- 2  2
+-- 2  2
+-- 1  1
+```
+
+It is read lazily and cached per render: a template that only writes SQL over `input_table` pays nothing for
+this, and one that reads it in Liquid pays a single round trip. `{% for r in input_table %}` and
+`{{ input_table.size }}` see **this group's** rows (this chunk's, for `fluid_query_lateral`) — the SQL view
+and the Liquid value are repointed together. Your own `{% assign input_table = … %}` shadows the Liquid name;
+the SQL object is a separate namespace and keeps the rows.
+
 **`is_bind` is true for exactly one render: the one that determines the output columns.** DuckDB needs a
 table function's schema before it runs anything, so the template is rendered once against an *empty*
 `input_table` and the resulting statement is bound to learn its shape. You do not have to branch — a

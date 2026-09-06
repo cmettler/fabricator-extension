@@ -444,6 +444,12 @@ case "$TIER" in
         # in that section is load-bearing and a mutant proved it: an earlier `USE memory.hq_s` leaves a
         # qualified entry, against which the bug does not fire, so the section PASSED with it fully present.
         # 8250 + 9 = 8259 exactly, from a green run.
+        # 9034 since 2026-09-06 (same day, sixth bump): verify_plugin_fluid 737 -> 758 -- `input_table` is
+        #   a lazy Fluid value too, on BOTH surfaces (collector groups and lateral chunks), so a template
+        #   reaches its input as SQL or as Liquid under one name with no copy. The load-bearing property is
+        #   FRESHNESS PER RENDER, not laziness: the value caches, so one bound per session would serve the
+        #   first group's rows to every later one. Mutant: bind once per session dies at the first row of
+        #   §34 after 742 pass.
         # 9013 since 2026-09-06 (same day, fifth bump): verify_plugin_fluid 729 -> 737 -- materialize:
         #   now ALSO binds the identifier, LAZILY, so both access paths work under one name and the rows
         #   only cross into Liquid if the template reads them. `fluid:` is GONE (breaking, no alias): with
@@ -589,7 +595,7 @@ case "$TIER" in
         # two functions have exactly ONE registration each, plus the HostsCatalog refusal and its
         # unknown-provider control. 3105 + 238 + 8259 - 3339 arithmetic aside, both numbers come from green
         # runs.
-        : "${MIN_ASSERTIONS:=9013}"
+        : "${MIN_ASSERTIONS:=9034}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

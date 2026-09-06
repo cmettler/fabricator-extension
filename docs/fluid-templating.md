@@ -3759,3 +3759,68 @@ parameter it was not given. ⚠ The option is EVALUATED rather than matched on s
 destination for rows, never a way to smuggle a write past the rule. ⚠ The lazy read itself is NOT classified
 and does not need to be: it is `SELECT * FROM` a quoted identifier, composed by `ReadMaterialized`, with no
 template text in it.
+
+## 28. ✅ AS BUILT (2026-09-06) — `input_table` is a lazy Fluid value too
+
+User-asked, as the second half of §27's inversion: *"yes lazy fluid makes also sense for input_table"*.
+C#-only in the plugin — no ABI, no C++, and no new mechanism: it is `LazyRowsValue` pointed at the temp
+object each surface already creates. Gate `verify_plugin_fluid` 737 → **758**, hermetic floor 9013 →
+**9034**, one mutant.
+
+```liquid
+{{ input_table.size }}                                     the Liquid side
+{% for r in input_table %}{{ r.i }}{% endfor %}
+SELECT (SELECT count(*) FROM input_table) AS n            the SQL side, unchanged
+```
+
+Both surfaces: `fluid_query_batch` (per GROUP) and `fluid_query_lateral` (per CHUNK), plus the schema probe
+on each, where the relation is EMPTY.
+
+### 28.1 ⚠⚠ The load-bearing property is FRESHNESS PER RENDER, not laziness
+
+`LazyRowsValue` caches — which is what keeps one render internally consistent, and is exactly why the value
+must be rebuilt before every render that repoints the object. One bound per session would serve the FIRST
+group's rows to every later group: right column names, right shape, wrong rows, no error anywhere.
+
+`FluidHostQuery.BindLazyRelation` is called immediately after `DefineGroupView` (collector) and after
+`StageInput` (lateral), so the SQL view and the Liquid value are repointed together and the two access paths
+cannot disagree about which group or chunk they are in. §34's first row is the discriminator — the SQL count
+and the Liquid `.size` in every group, and the numbers CHANGE (2, 2, 1 over five rows at `batchsize := 2`)
+where a session-scoped value reports 2, 2, 2. The mutant dies there after 742 pass.
+
+⚠ The lateral is PARALLEL, and this needs nothing extra: one session, one connection and one
+`TemplateContext` per pipeline thread, so a per-call `SetValue` on that thread's context is thread-confined
+by construction.
+
+### 28.2 ⚠ It costs nothing unless the template reads it
+
+The rows were already staged in DuckDB — `__fab_input` for the collector, a temp table for the lateral — so
+this adds no copy and no crossing. A template that only writes SQL over `input_table` pays exactly what it
+paid before; a template that reads it in Liquid pays one round trip per render, cached.
+
+⚠ The alternative — retaining the input `RecordBatch`es and mapping cells over them — would have been a
+genuine use-after-free rather than merely expensive: `IHostQuery.RegisterRows` documents that the rows are
+**borrowed, not adopted**, and the framework frees a collector's input chunk once consumed. Keeping them
+alive would have meant changing the ownership contract at that seam. §27.1's cost argument and this one
+point the same way for different reasons.
+
+### 28.3 ⚠ It is bound at BIND time too, EMPTY
+
+The schema probe renders against an empty `input_table` (§26), and the value is bound there as well, so
+`{{ input_table.size }}` answers 0 rather than failing. A name that resolves at scan and not at bind is the
+split this plugin already records as a trap for `fluid_template_root`; `is_bind` stays the way to branch.
+
+⚠ §34's `bind_saw_0` row pins the VALUE — the probe renders the size into the output COLUMN NAME, so a bind
+reading anything but 0 would declare `bind_saw_<n>` while the groups produce `bind_saw_0` and the drift check
+would refuse. It is a CHARACTERIZATION row: removing the bind-time binding does not reach it, because an
+unbound `{{ input_table.size }}` renders EMPTY and the probe's own SQL then fails to parse, which the
+section's first row catches. What it pins is that the probe's input is empty rather than sampled.
+
+### 28.4 ⚠ A template's own variable shadows it, and only on the Liquid side
+
+We bind before the render, so an `{% assign input_table = … %}` in the template wins — the safe direction.
+The SQL object is a different namespace and still holds the rows, which §34 asserts as a pair.
+
+⚠ The name is now meaningful in Liquid where it previously resolved to nothing. A template that rendered
+`{{ input_table }}` and got an empty string will now render the row set. Low risk (it referenced a name that
+meant nothing), but it is a behaviour change rather than a pure addition.

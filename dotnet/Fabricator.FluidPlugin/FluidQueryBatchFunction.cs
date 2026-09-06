@@ -130,6 +130,9 @@ internal sealed class FluidQueryBatchFunction : ICollectorFunction
                 + "available here.");
         var ctx = NewContext(probe, parameters, isBind: true);
         CreateEmptyInput(probe, inputSchema);
+        // ⚠ Bound at the probe too, EMPTY, so `{{ input_table.size }}` answers 0 here rather than failing.
+        // A name that resolves at scan and not at bind is the split this plugin already records as a trap.
+        FluidHostQuery.BindLazyRelation(ctx, InputTable);
         var generated = FluidEngine.RenderOn(FunctionName, template, ctx);
         var outputSchema = DescribeGenerated(probe, generated);
         return new Binding(template, parameters, batchSize, inputSchema, outputSchema);
@@ -294,6 +297,10 @@ internal sealed class FluidQueryBatchFunction : ICollectorFunction
             {
                 ct.ThrowIfCancellationRequested();
                 DefineGroupView(session, g);
+                // ⚠⚠ A FRESH lazy value per group, because it CACHES: one carried across groups would
+                // serve group 1's rows to every later group, silently. The SQL view and the Liquid value
+                // are repointed together, so the two access paths cannot disagree about which group it is.
+                FluidHostQuery.BindLazyRelation(ctx, InputTable);
                 var generated = FluidEngine.RenderOn(FunctionName, _template, ctx);
                 if (string.IsNullOrWhiteSpace(generated))
                 {

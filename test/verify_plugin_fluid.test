@@ -3909,3 +3909,86 @@ SELECT a FROM mat_shadowed;
 
 statement ok
 DROP TABLE mat_shadowed;
+
+# ============================================================================================
+# §34 — `input_table` IS A FLUID VALUE TOO, lazily. The same inversion as §33: the rows stay in DuckDB and
+#       the LIQUID side is a lazy read of them, so a template may reach its input either way under one name.
+#
+# ⚠⚠ THE LOAD-BEARING PROPERTY IS FRESHNESS PER RENDER, not laziness. The value CACHES, so one bound once
+# per session would serve the FIRST group's rows to every later group — silently, with the right column
+# names and the right shape. Every row below that varies across groups is aimed at exactly that.
+# ============================================================================================
+
+# --- BOTH PATHS AGREE, PER GROUP: the SQL count of input_table and its Liquid `.size` are the same number
+# in every group, and the numbers CHANGE (2, 2, 1 over five rows at batchsize 2). A value bound once per
+# session would report 2, 2, 2. ---
+query II
+SELECT sql_n, fluid_n FROM fluid_query_batch(
+  'SELECT (SELECT count(*) FROM input_table)::BIGINT AS sql_n, {{ input_table.size }}::BIGINT AS fluid_n',
+  (SELECT i FROM range(5) t(i)), batchsize := 2) ORDER BY sql_n DESC, fluid_n;
+----
+2	2
+2	2
+1	1
+
+# --- ⚠ THE LIQUID SIDE IS A REAL ROW SET: it ENUMERATES and does ARITHMETIC over the group's own rows.
+# §7 measured that a broken value model renders correctly while computing wrong, so a render-only assertion
+# could not tell the two apart — the per-group SUM is what makes this a measurement. ---
+query II
+SELECT n, s FROM fluid_query_batch(
+  '{% assign s = 0 %}{% for r in input_table %}{% assign s = s | plus: r.i %}{% endfor %}'
+  || 'SELECT {{ input_table.size }}::BIGINT AS n, {{ s }}::BIGINT AS s',
+  (SELECT i FROM range(5) t(i)), batchsize := 2) ORDER BY s;
+----
+2	1
+1	4
+2	5
+
+# --- ⚠ IT IS BOUND AT BIND TIME TOO, EMPTY, and this row pins the VALUE rather than merely that the bind
+# did not crash: the probe renders the size into the output COLUMN NAME, so a bind reading anything but 0
+# would declare `bind_saw_<n>` while the groups produce `bind_saw_0`, and §28's drift check would refuse the
+# statement. Selecting the column BY NAME is the assertion.
+# ⚠ A CHARACTERIZATION row — no mutant of ours can kill it. Removing the bind-time binding does not reach
+# here: an unbound `{{ input_table.size }}` renders EMPTY, so the probe's own SQL fails to parse and the
+# FIRST row of this section catches it. What this pins is that the probe's input is empty rather than
+# sampled, which nothing else would notice. ---
+query I
+SELECT bind_saw_0 FROM fluid_query_batch(
+  '{% if is_bind %}SELECT 1::BIGINT AS bind_saw_{{ input_table.size }}'
+  || '{% else %}SELECT 1::BIGINT AS bind_saw_0{% endif %}',
+  (SELECT i FROM range(3) t(i)));
+----
+1
+
+# --- ⚠ A TEMPLATE'S OWN VARIABLE SHADOWS OURS, and only the LIQUID one: the SQL object is a different
+# namespace and still holds the rows. The safe direction — we bind before the render, so anything the
+# author assigns wins. ---
+query II
+SELECT v, n FROM fluid_query_batch(
+  '{% assign input_table = "mine" %}'
+  || 'SELECT ''{{ input_table }}'' AS v, (SELECT count(*) FROM input_table)::BIGINT AS n',
+  (SELECT i FROM range(5) t(i)));
+----
+mine	5
+
+# --- ⚠⚠ THE LATERAL HALF, per CHUNK rather than per group. Same agreement assertion, and `max(sql_n) > 1`
+# is the CONTROL that chunks really carry several rows here — without it the whole row would be equally true
+# of the one-row-at-a-time shape, where any per-chunk bug is invisible (§22's lesson: a lateral called with
+# ONE input column is delivered one outer row at a time, so a constant would be correct). ⚠ Only `> 1` is
+# asserted, never the sizes: the grouping is DuckDB's scheduling. ---
+statement ok
+CREATE TABLE it_lat(id INTEGER, n INTEGER);
+
+statement ok
+INSERT INTO it_lat VALUES (1, 1), (2, 3), (3, 0), (4, 2), (5, 1), (6, 4);
+
+query III
+SELECT max(f.sql_n) > 1 AS batched, count(*), count(*) FILTER (WHERE f.sql_n <> f.fluid_n) AS disagreed
+FROM it_lat t, fluid_query_lateral(
+  'SELECT __fab_row, (SELECT count(*) FROM input_table)::BIGINT AS sql_n, '
+  || '{{ input_table.size }}::BIGINT AS fluid_n FROM input_table', 'null', t.n, t.id) f;
+----
+true	6	0
+
+statement ok
+DROP TABLE it_lat;

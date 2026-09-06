@@ -158,6 +158,8 @@ internal sealed class FluidQueryLateralFunction : ILateralFunction
                 + "available here.");
         var ctx = NewContext(probe, parameters, isBind: true);
         CreateEmptyInput(probe, stagedSchema);
+        // ⚠ Bound at the probe too, EMPTY — see fluid_query_batch's twin.
+        FluidHostQuery.BindLazyRelation(ctx, InputTable);
         var generated = FluidEngine.RenderOn(FunctionName, template, ctx);
         var outputSchema = DescribeGenerated(probe, generated);
         return new Binding(template, parameters, stagedSchema, outputSchema);
@@ -348,6 +350,11 @@ internal sealed class FluidQueryLateralFunction : ILateralFunction
         public LateralResult Call(RecordBatch input)
         {
             StageInput(input);
+            // ⚠⚠ A FRESH lazy value per CHUNK, for the same reason the collector needs one per group: the
+            // value caches, so one carried across calls would serve the first chunk's rows to all of them.
+            // ⚠ Thread-confined by construction — this session, its connection and this context all belong
+            // to one pipeline thread, so nothing here is shared with a concurrent call.
+            FluidHostQuery.BindLazyRelation(_ctx, InputTable);
             var generated = FluidEngine.RenderOn(FunctionName, _template, _ctx);
             if (string.IsNullOrWhiteSpace(generated))
             {

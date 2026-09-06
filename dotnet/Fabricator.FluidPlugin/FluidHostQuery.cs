@@ -220,16 +220,33 @@ internal static class FluidHostQuery
     /// there is no template text in it and nothing for the parser to decide.
     /// </para>
     /// </remarks>
-    internal static FluidValue ReadMaterialized(TemplateContext ctx, string name)
+    /// <param name="surface">How to NAME this read in an error. Defaults to the block, which is where
+    /// <c>materialize:</c> is written; the implicit input relations pass their own name instead, because
+    /// "{% query %} returned more than 1000000 rows" would point at a tag the author did not write.</param>
+    internal static FluidValue ReadMaterialized(TemplateContext ctx, string name, string? surface = null)
     {
         var caller = CallerOf(ctx);
-        var surface = "{% " + BlockName + " %}";
+        surface ??= "{% " + BlockName + " %}";
         var run = FluidRenderSession.For(ctx)
             ?? throw new InvalidOperationException(
                 $"{caller}: {surface} needs the IHostQuery service, which is not published here. "
                 + "It is available only from inside a fabricator function call.");
         return ReadRows(caller, surface, $"SELECT * FROM {DuckSql.QuoteIdent(name)}", null, run);
     }
+
+    /// <summary>
+    /// Binds <paramref name="name"/> in Liquid as a LAZY read of the SQL object of that name on the render's
+    /// connection — the way an implicit relation (<c>input_table</c>) becomes readable BOTH as SQL and as a
+    /// Fluid value without being copied into either.
+    /// </summary>
+    /// <remarks>
+    /// ⚠⚠ <b>CALL IT BEFORE EVERY RENDER THAT REPOINTS THE OBJECT, never once per session.</b> The value
+    /// CACHES its read, which is what keeps one render consistent — and is exactly why a value carried
+    /// across groups would serve the FIRST group's rows to every later one, silently. A fresh value per
+    /// render is the whole correctness argument.
+    /// </remarks>
+    internal static void BindLazyRelation(TemplateContext ctx, string name)
+        => ctx.SetValue(name, new LazyRowsValue(() => ReadMaterialized(ctx, name, name)));
 
     /// <param name="surface">How to NAME this call in an error — <c>query()</c> by default, so the function
     /// and filter forms are unchanged, and <c>{% print %}</c> for the print block.
