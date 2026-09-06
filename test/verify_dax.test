@@ -245,6 +245,58 @@ SELECT fabricator_exec('pbi', 'EVALUATE ROW("n", 1)', {'a': 1});
 ----
 dax provider is read-only
 
+# ═══ STRUCT vs JSON: the bag's type fidelity, MEASURED where it is visible in the RESULT ══════════════
+# ⚠⚠ The two bag spellings are NOT equally faithful, and on DAX the difference SHOWS IN THE OUTPUT TYPE
+# rather than only in what was sent: a STRUCT's fields keep their DuckDB type all the way to the ADOMD
+# parameter, while JSON has four scalar kinds and can only carry BIGINT / DOUBLE / VARCHAR / BOOLEAN.
+#
+# This is the reason the docs say to PREFER THE STRUCT FORM, and it is asserted here rather than described
+# because it is the one place the cost of the JSON path is directly observable.
+#
+# ⚠ Model-agnostic: no model data is referenced, only DAX's own type system.
+
+query T
+SELECT typeof(v) FROM ${FABRICATOR_DAX_SCHEMA}.daxeval(
+  expression := 'EVALUATE ROW("v", @d)', params := {'d': 19.99::DECIMAL(9,2)});
+----
+DECIMAL(19,4)
+
+# …the SAME digits through JSON arrive as a floating value. DAX's Currency type is what a real DECIMAL
+# parameter reaches; a JSON number cannot.
+query T
+SELECT typeof(v) FROM ${FABRICATOR_DAX_SCHEMA}.daxeval(
+  expression := 'EVALUATE ROW("v", @d)', params := '{"d": 19.99}');
+----
+DOUBLE
+
+# A typed temporal survives the STRUCT path as a DAX DateTime. JSON has no date kind at all, so there is no
+# JSON spelling of this row — which is the point.
+query T
+SELECT typeof(v) FROM ${FABRICATOR_DAX_SCHEMA}.daxeval(
+  expression := 'EVALUATE ROW("v", @t)', params := {'t': DATE '2024-03-05'});
+----
+TIMESTAMP_MS
+
+query I
+SELECT v FROM ${FABRICATOR_DAX_SCHEMA}.daxeval(
+  expression := 'EVALUATE ROW("v", @t)', params := {'t': DATE '2024-03-05'});
+----
+2024-03-05 00:00:00
+
+# A boolean reaches DAX as one (IF() accepts it without a cast).
+query I
+SELECT v FROM ${FABRICATOR_DAX_SCHEMA}.daxeval(
+  expression := 'EVALUATE ROW("v", IF(@b, 1, 0))', params := {'b': true});
+----
+1
+
+# ⚠ fabricator_query reaches the $SYSTEM DMVs as well as DAX — the provider's ExecuteQuery hands the text
+# straight to the same StreamCommand the model scans use, so a DMV SELECT and an EVALUATE are one path.
+query I
+SELECT count(*) > 0 FROM fabricator_query('pbi', 'SELECT [Name] FROM $SYSTEM.TMSCHEMA_TABLES');
+----
+true
+
 # ═══ Full ENUMERATION, and the two regressions a live model was needed to find (2026-09-06) ══════════
 # ⚠⚠ BOTH were invisible to CI because this tier is MANUAL, and both broke everything EXCEPT targeted access
 # — the same shape as the SQL Server discovery defect this project already recorded.

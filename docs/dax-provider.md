@@ -425,7 +425,7 @@ multi-fragment commit); (3) whole-model replace + DDL→model auto-sync — defe
 
 ## ✅ LIVE VALIDATION 2026-09-06 — and it found TWO regressions that only a running model could
 
-`verify_dax` **29 → 51**, all green against a local Power BI Desktop instance (`pbidesktop://` autodetect).
+`verify_dax` **29 → 57**, all green against a local Power BI Desktop instance (`pbidesktop://` autodetect).
 It had not been run for some time, and both defects below make everything EXCEPT targeted access fail —
 the same shape as the SQL Server discovery defect this project already records.
 
@@ -483,6 +483,31 @@ having asked for it.
 The `fabricator_query`-on-DAX and shared-bag rows added hours earlier had no model to run against. Every one
 passed, including the `9007199254740993` row that is the whole point of unifying the decoder — so the
 precision fix is now verified end to end on a live model rather than on the pattern alone.
+
+### 4. Both fixes are MUTATION-TESTED against the live model
+
+* **Reverting the param schema** to the un-migrated bare VARCHAR dies at the `daxevaltable` behaviour row
+  after **14** assertions — reproducing the original *"Subquery returns 2 columns - expected 1"* exactly.
+  ⚠ It dies at the BEHAVIOUR row rather than at the new SIGNATURE row, which is the stronger kill and the
+  honest ordering; the signature row exists for the case where a registration drifts WITHOUT breaking that
+  particular call.
+* **Dropping the `DISCOVER_SCHEMA_ROWSETS` narrowing** dies at the first enumeration row after **52**
+  assertions, with the original *"'TMSCHEMA_PARTITION_SOURCES' request type was not recognized"* text.
+
+### 5. ⚠ The STRUCT-vs-JSON bag asymmetry is SHARPER here than on SQL Server, and is now pinned
+
+On DAX the difference shows in the RESULT TYPE, not only in what was sent — which makes it the clearest
+statement of why the docs say to prefer the STRUCT form. MEASURED:
+
+| bag | reaches DAX as |
+|---|---|
+| `params := {'d': 19.99::DECIMAL(9,2)}` | `DECIMAL(19,4)` — a DAX Currency, exact |
+| `params := '{"d": 19.99}'` | `DOUBLE` |
+| `params := {'t': DATE '2024-03-05'}` | `TIMESTAMP_MS` — a real DAX DateTime |
+| a date through JSON | — there is no JSON date kind, which is the point |
+
+⚠ `fabricator_query` also reaches the `$SYSTEM` DMVs, not just DAX: `ExecuteQuery` hands the text to the same
+`StreamCommand` the model scans use, so a DMV SELECT and an `EVALUATE` are one path. Pinned.
 
 ⚠ The standing lesson is the tier's, not the code's: **this suite is MANUAL, so nothing between the
 2026-08-02 protocol migration and 2026-09-06 could have caught defect 1.** Run it whenever a model is

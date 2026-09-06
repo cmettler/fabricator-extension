@@ -430,7 +430,7 @@ are not why a write fails on this provider; writing is.
 
 These rows were authored with no model available. A local Power BI Desktop instance was provided the same
 day and **every one of them held** — including the `9007199254740993` row, so the precision fix is verified end
-to end rather than on the pattern alone. `verify_dax` went **29 → 51**.
+to end rather than on the pattern alone. `verify_dax` went **29 → 57**.
 
 ⚠⚠ **Running it found two regressions that only a live model could**, both of which break everything EXCEPT
 targeted access: `daxevaltable`/`daxeach` had lost their `{TABLE}` input to the unified-parameter-protocol
