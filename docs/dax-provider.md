@@ -186,9 +186,23 @@ which caps at 19.84.1) loads in net10 (win-x64), connects to local PBI Desktop, 
      ADOMD `AdomdParameter` the expression references as `@<name>`. **Two accepted shapes (dual-accept):**
      a DuckDB **`STRUCT`** — `params := {'a': 40, 'b': 2}` (type-safe, no quoting — the preferred shape), read
      field-by-field (`ReadStructParams`); or a **JSON string** — `params := '{"a": 40}'` (handy for
-     programmatic callers), parsed by `ParseDaxParams` (number→int64/double, string, bool, null→`BLANK`).
-     `BindDaxParams` adds them for **both** the bind-time schema probe and each execution; args are read **by
-     field name** (named params arrive in arbitrary order).
+     programmatic callers). `BindDaxParams` adds them for **both** the bind-time schema probe and each
+     execution; args are read **by field name** (named params arrive in arbitrary order).
+   - **⚠⚠ THE DECODING IS THE HOST'S SINCE 2026-09-06 (ABI v88's `ProviderParameters`), AND UNIFYING IT FIXED
+     A SILENT PRECISION LOSS.** The local `ParseDaxParams`/`ReadStructParams` pair is gone. Its `JsonScalar`
+     read `e.TryGetInt64(out var l) ? l : e.GetDouble()`, whose branches C# unifies to **double** — so the
+     int64 branch never had any effect and every JSON integer above 2^53 lost exactness (MEASURED:
+     `9007199254740993` → a `Double` valued `…992`). ⚠ Three behaviour changes came with it, all in the safe
+     direction: a NESTED json value is now REFUSED rather than passed as its raw JSON text, a duplicated name
+     is refused rather than collapsed, and a MAP/LIST is refused naming its own type rather than dying inside
+     `ArrowValueReader`. ⚠ It also gave this bag a GATE it could not otherwise have: `verify_dax` is manual,
+     while the shared ladder is pinned by `verify_raw_query` §9 on the service tier. Full record:
+     [provider-query-parameters.md](provider-query-parameters.md) §6.
+   - **⚠ `fabricator_query('<dax catalog>', 'EVALUATE …' [, params := …])` WORKS SINCE THE SAME DAY** —
+     `DaxCatalog.ExecuteQuery` used to throw *"raw query not supported yet (slice 1)"*. `daxeval` remains the
+     richer surface: it resolves its output schema at BIND, so DuckDB can plan around it, while a raw query
+     has no describe on this provider and learns its schema by executing (one execution, the host's
+     documented fallback).
    - **How the struct crosses with no ABI change**: `params` is declared in `GetFunctionParamSchema` as the
      **`NullType` sentinel** = "accept any value". There's no Arrow type for DuckDB `ANY`, so the host treats a
      `SQLNULL`-typed named parameter as `ANY` (`GetOrCreateTableFunction`), and the shared table-bind

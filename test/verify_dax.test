@@ -166,5 +166,85 @@ SELECT count(*) FROM ${FABRICATOR_DAX_SCHEMA}.daxeach(
 ----
 6
 
+# ═══ Raw DAX through fabricator_query, and the SHARED parameter bag (ABI v88) ═════════════════════════
+# ⚠ THESE ROWS WERE AUTHORED WITHOUT A LIVE MODEL — this tier needs Power BI Desktop and none was available.
+# The four REFUSAL texts come from ProviderParameters and were verified on the service tier
+# (verify_raw_query §13); the DAX-side row VALUES and column names were not run. Treat a red row here as
+# "the expectation was written blind" before treating it as a regression.
+# fabricator_query used to answer a DAX catalog with "raw query not supported yet (slice 1)". It runs the
+# statement now, so the generic function means the same thing on every provider.
+#
+# ⚠ There is NO describe on this provider (ADOMD cannot report a shape without evaluating), so the host's
+# DescribedArrowStream executes to learn the schema and keeps that stream for the rows — ONE execution, the
+# documented fallback. daxeval remains the richer surface: it resolves its schema at BIND, so DuckDB can plan
+# around it.
+
+query I
+SELECT n FROM fabricator_query('pbi', 'EVALUATE ROW("n", 42)');
+----
+42
+
+# The bag is the SAME one fabricator_query takes everywhere; each key becomes an ADOMD @parameter.
+query I
+SELECT result::BIGINT FROM fabricator_query('pbi', 'EVALUATE ROW("result", @a + @b)', params := {'a': 40, 'b': 2});
+----
+42
+
+query I
+SELECT result::BIGINT FROM fabricator_query('pbi', 'EVALUATE ROW("result", @a + @b)', params := '{"a": 40, "b": 2}');
+----
+42
+
+# ⚠⚠ THE ROW THIS SLICE EXISTS FOR. daxeval's bag used to decode JSON numbers with
+# `e.TryGetInt64(out var l) ? l : e.GetDouble()`, whose branches C# unifies to DOUBLE — so every JSON integer
+# went through a double and lost exactness above 2^53. MEASURED on the pattern in isolation: 9007199254740993
+# arrived as a Double valued …992. It is the same defect this repo shipped once in JsonToClr, and it is
+# invisible for every integer a test happens to use.
+#
+# Both surfaces now decode through the host's ProviderParameters, so the ladder exists ONCE — which is also
+# how this bag acquired a gate it could never have on its own: verify_dax needs Power BI Desktop and is
+# manual, while the shared rule is pinned by verify_raw_query §9 on the service tier.
+
+query I
+SELECT n::BIGINT FROM ${FABRICATOR_DAX_SCHEMA}.daxeval(
+  expression := 'EVALUATE ROW("n", @n)', params := '{"n": 9007199254740993}');
+----
+9007199254740993
+
+query I
+SELECT n::BIGINT FROM fabricator_query('pbi', 'EVALUATE ROW("n", @n)', params := '{"n": 9007199254740993}');
+----
+9007199254740993
+
+# ⚠ THREE REFUSALS INHERITED FROM THE SHARED DECODER, all replacing behaviour that was worse. A nested JSON
+# value used to be passed as its RAW JSON TEXT — a value the caller never wrote, arriving as a
+# plausible-looking string; a duplicate name used to be collapsed silently; and a MAP died inside
+# ArrowValueReader as "unsupported filter value type Map", naming a subsystem the caller never touched.
+
+statement error
+SELECT n FROM ${FABRICATOR_DAX_SCHEMA}.daxeval(
+  expression := 'EVALUATE ROW("n", @a)', params := '{"a": {"b": 1}}');
+----
+is a JSON object; a parameter must be a scalar
+
+statement error
+SELECT n FROM ${FABRICATOR_DAX_SCHEMA}.daxeval(
+  expression := 'EVALUATE ROW("n", @a)', params := '{"a": 1, "A": 2}');
+----
+declares 'A' more than once
+
+statement error
+SELECT n FROM ${FABRICATOR_DAX_SCHEMA}.daxeval(
+  expression := 'EVALUATE ROW("n", @a)', params := MAP{'a': 1});
+----
+'params' is a map; it must be a DuckDB STRUCT
+
+# ⚠ A WRITE names the right reason. The contract's default would say "does not support statement parameters",
+# which blames the bag; this provider is READ-ONLY, and that is what a caller needs to hear.
+statement error
+SELECT fabricator_exec('pbi', 'EVALUATE ROW("n", 1)', {'a': 1});
+----
+dax provider is read-only
+
 statement ok
 DETACH pbi;

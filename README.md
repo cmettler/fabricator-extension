@@ -838,8 +838,9 @@ temporal resolution all survive — while a JSON bag has only four scalar kinds,
 `BIGINT` / `DOUBLE` / `VARCHAR` / `BOOLEAN` and nothing else. A `DECIMAL` or a typed timestamp needs the
 struct.
 
-⚠ **Only providers with a parameterised statement form accept a bag** — today SQL Server. Anything else
-refuses by name rather than running your statement with the values quietly dropped.
+⚠ **Only providers with a parameterised statement form accept a bag** — today SQL Server (`@name`) and DAX
+(ADOMD `@name`, the same bag `daxeval` takes). Anything else refuses by name rather than running your
+statement with the values quietly dropped.
 
 ### `fabricator_refresh_cache(catalog)` / `fabricator_invalidate_cache(catalog [, schema [, table]])`
 

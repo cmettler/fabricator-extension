@@ -315,8 +315,31 @@ internal sealed class DaxCatalog : IProviderCatalog
 
     // ---- read / scan (later slices) -------------------------------------------------------------------
 
-    public IArrowArrayStream ExecuteQuery(string sql)
-        => throw new NotSupportedException("dax provider: raw query not supported yet (slice 1).");
+    /// <summary>
+    /// Runs a raw DAX statement (or a <c>$SYSTEM</c> DMV SELECT) through <c>fabricator_query</c>.
+    /// </summary>
+    /// <remarks>
+    /// <para>⚠ There is no describe — <see cref="DescribeQuery(string)"/> stays null for this provider,
+    /// because ADOMD cannot report a result shape without evaluating. So the host's DescribedArrowStream
+    /// executes to learn the schema and KEEPS that stream for the rows: one execution, which is the
+    /// documented fallback rather than a failure.</para>
+    /// <para>⚠ <c>daxeval</c> remains the richer surface — it resolves its output schema at BIND (a
+    /// <c>ProbeSchema</c> that fetches no rows), so DuckDB can plan around it. This entry point exists so
+    /// that the generic function means the same thing on every provider, and so that a DAX catalog stops
+    /// answering a raw query with a message about "slice 1".</para>
+    /// </remarks>
+    public IArrowArrayStream ExecuteQuery(string sql) => StreamCommand(sql, knownSchema: null);
+
+    /// <summary>As <see cref="ExecuteQuery(string)"/>, binding the caller's parameters as ADOMD
+    /// <c>@name</c> parameters (ABI v88).</summary>
+    /// <remarks>
+    /// ⚠ <paramref name="parameters"/> arrives ALREADY NORMALISED by the host — one column per parameter —
+    /// so <see cref="ProviderParameters.Normalize"/> must NOT be applied again here; it looks for a column
+    /// named <c>params</c> and would find none. <c>daxeval</c> is the caller that still needs it, because it
+    /// receives the RAW function-args batch.
+    /// </remarks>
+    public IArrowArrayStream ExecuteQuery(string sql, RecordBatch? parameters)
+        => StreamCommand(sql, knownSchema: null, ToDaxParams(parameters));
 
     /// <summary>
     /// Scans a model table: projects the requested columns via <c>EVALUATE SELECTCOLUMNS('T', "Col",
@@ -555,77 +578,55 @@ internal sealed class DaxCatalog : IProviderCatalog
         return expr!;
     }
 
-    // daxeval's optional `params` arg = a bag of DAX parameter values; each becomes an ADOMD parameter the
-    // expression references as @<name>. Two accepted shapes (the param is declared ANY — see the NullType
-    // sentinel above): a DuckDB STRUCT (params := {'p': 5, 'q': 'x'}) read field-by-field, OR a JSON string
-    // (params := '{"p": 5}') parsed below. STRUCT is type-safe + needs no quoting; JSON suits programmatic callers.
+    /// <summary>
+    /// <c>daxeval</c>'s optional <c>params</c> arg: a bag of DAX parameter values, each becoming an ADOMD
+    /// parameter the expression references as <c>@name</c>.
+    /// </summary>
+    /// <remarks>
+    /// <para>⚠⚠ THE DECODING IS THE HOST'S (<see cref="ProviderParameters"/>), NOT OURS, and unifying them
+    /// FIXED A SILENT PRECISION LOSS. The local copy read
+    /// <c>e.TryGetInt64(out var l) ? l : e.GetDouble()</c>, whose branches C# unifies to <b>double</b> — so
+    /// every JSON integer went through a double and lost exactness above 2^53. MEASURED:
+    /// <c>9007199254740993</c> arrived as a <c>Double</c> valued <c>…992</c>. It is the same defect this repo
+    /// shipped once in <c>JsonToClr</c>, and it is invisible for every integer a test happens to use.</para>
+    /// <para>⚠ Sharing also gives this bag a GATE it could never have on its own: <c>verify_dax</c> needs
+    /// Power BI Desktop and is manual, while the shared ladder is pinned by <c>verify_raw_query</c> §9 on the
+    /// service tier. The rule now exists once, and the tier that can run asserts it.</para>
+    /// <para>⚠ Three BEHAVIOUR CHANGES come with it, all in the safe direction: a nested JSON value is
+    /// REFUSED rather than passed as its raw JSON text (a value the caller never wrote, arriving as a
+    /// plausible-looking string); a duplicated name is refused rather than collapsed; and a bag that is
+    /// neither a STRUCT nor a string is refused naming its own type instead of dying inside
+    /// <c>ArrowValueReader</c> as "unsupported filter value type Map".</para>
+    /// </remarks>
     private static IReadOnlyList<KeyValuePair<string, object?>> DaxParams(RecordBatch? args)
+        => ToDaxParams(ProviderParameters.Normalize(args));
+
+    /// <summary>
+    /// Turns a host-normalised bag — one row, one column per parameter — into ADOMD name/value pairs.
+    /// </summary>
+    /// <remarks>
+    /// ⚠ The two entry points differ in what they are handed and it matters: <c>daxeval</c> receives the RAW
+    /// function-args batch and must call <see cref="ProviderParameters.Normalize"/> first, while
+    /// <c>ExecuteQuery(sql, parameters)</c> is handed a bag the host already normalised. Normalising twice
+    /// yields NOTHING — the second pass looks for a column named <c>params</c> and finds none.
+    /// </remarks>
+    internal static IReadOnlyList<KeyValuePair<string, object?>> ToDaxParams(RecordBatch? bag)
     {
-        if (args is null)
+        if (bag is null)
         {
             return System.Array.Empty<KeyValuePair<string, object?>>();
         }
-        var fields = args.Schema.FieldsList;
+        var fields = bag.Schema.FieldsList;
+        var result = new List<KeyValuePair<string, object?>>(fields.Count);
         for (int i = 0; i < fields.Count; i++)
         {
-            if (!string.Equals(fields[i].Name, "params", StringComparison.OrdinalIgnoreCase))
-            {
-                continue;
-            }
-            if (args.Column(i) is StructArray sa)
-            {
-                return ReadStructParams(sa);
-            }
-            // scalar: a JSON string, or a NULL literal (-> empty).
-            return ParseDaxParams(ArrowValueReader.ReadScalar(args.Column(i), 0)?.ToString());
-        }
-        return System.Array.Empty<KeyValuePair<string, object?>>();
-    }
-
-    private static IReadOnlyList<KeyValuePair<string, object?>> ReadStructParams(StructArray sa)
-    {
-        var result = new List<KeyValuePair<string, object?>>();
-        if (sa.Length == 0 || sa.IsNull(0))
-        {
-            return result;
-        }
-        var st = (StructType)sa.Data.DataType;
-        for (int f = 0; f < st.Fields.Count; f++)
-        {
-            // row 0 of each child = that field's value (the args batch is always 1 row).
-            result.Add(new KeyValuePair<string, object?>(st.Fields[f].Name, ArrowValueReader.ReadScalar(sa.Fields[f], 0)));
+            // row 0 of each column = that parameter's value (a normalised bag is always 1 row).
+            var column = bag.Column(i);
+            result.Add(new KeyValuePair<string, object?>(
+                fields[i].Name, column.Length == 0 ? null : ArrowValueReader.ReadScalar(column, 0)));
         }
         return result;
     }
-
-    private static IReadOnlyList<KeyValuePair<string, object?>> ParseDaxParams(string? json)
-    {
-        var result = new List<KeyValuePair<string, object?>>();
-        if (string.IsNullOrWhiteSpace(json))
-        {
-            return result;
-        }
-        using var doc = System.Text.Json.JsonDocument.Parse(json);
-        if (doc.RootElement.ValueKind != System.Text.Json.JsonValueKind.Object)
-        {
-            throw new ArgumentException("dax provider: daxeval 'params' must be a JSON object, e.g. '{\"p\": 5}'");
-        }
-        foreach (var p in doc.RootElement.EnumerateObject())
-        {
-            result.Add(new KeyValuePair<string, object?>(p.Name, JsonScalar(p.Value)));
-        }
-        return result;
-    }
-
-    private static object? JsonScalar(System.Text.Json.JsonElement e) => e.ValueKind switch
-    {
-        System.Text.Json.JsonValueKind.Number => e.TryGetInt64(out var l) ? l : e.GetDouble(),
-        System.Text.Json.JsonValueKind.String => e.GetString(),
-        System.Text.Json.JsonValueKind.True => true,
-        System.Text.Json.JsonValueKind.False => false,
-        System.Text.Json.JsonValueKind.Null => null,
-        _ => e.GetRawText(), // array/object — pass the raw JSON text (unusual for a DAX scalar param)
-    };
 
     private static void BindDaxParams(AdomdCommand cmd, IReadOnlyList<KeyValuePair<string, object?>>? daxParams)
     {
@@ -778,6 +779,11 @@ internal sealed class DaxCatalog : IProviderCatalog
     // ---- write paths: read-only provider --------------------------------------------------------------
 
     public long ExecuteNonQuery(string sql) => throw ReadOnly();
+
+    // ⚠ Overridden so BOTH arities give the READ-ONLY message. The contract default would answer
+    // "does not support statement parameters" for a bag, which names the wrong reason: parameters are not
+    // the problem here, writing is.
+    public long ExecuteNonQuery(string sql, RecordBatch? parameters) => throw ReadOnly();
     public long BulkInsert(string schemaName, string tableName, IArrowArrayStream data, bool createTable,
                            bool replace, bool checkConstraints, long txnId, IReadOnlyList<string>? partitionColumns,
                            IReadOnlyList<string>? sortColumns, string? schemaMode, bool partitionOverwrite,

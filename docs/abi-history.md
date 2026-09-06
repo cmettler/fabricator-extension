@@ -68,6 +68,11 @@ with `{VARCHAR,VARCHAR}` and `{VARCHAR,VARCHAR,ANY}` overloads sharing one body.
 "both its registrations (it ships as a table function AND a scalar under one name)" — that is
 `fabricator_host_exec`; `fabricator_exec` has only ever had one.
 
+**DAX overrides both** (same day, no ABI change): `DaxCatalog.ExecuteQuery` used to THROW *"raw query not
+supported yet (slice 1)"*, and unifying `daxeval`'s own bag decoder onto the host's fixed a shipped silent
+precision loss (a `TryGetInt64(out l) ? l : GetDouble()` whose branches unify to double). See
+[provider-query-parameters.md](provider-query-parameters.md) §6.
+
 Gate: `verify_raw_query` 34 → **85** (service tier), §9–§16, two mutants each killed at its own row.
 Full record + the corrections above: [provider-query-parameters.md](provider-query-parameters.md).
 

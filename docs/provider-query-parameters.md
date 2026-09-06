@@ -1,7 +1,7 @@
 # Parameter binding for `fabricator_query` / `fabricator_exec`, and the `{% provider_query %}` tags
 
-**Status: slice A1 BUILT (ABI v88, 2026-09-06); A2 (DAX) and B (the Fluid tags) not built.**
-⚠⚠ **§5 is the AS-BUILT record and it CORRECTS §2 and §3 in six places — read it first.**
+**Status: slices A1 (ABI v88) and A2 (DAX) BUILT 2026-09-06; B (the Fluid tags) not built.**
+⚠⚠ **§5 (A1) and §6 (A2) are the AS-BUILT records; §5 CORRECTS §2 and §3 in six places — read them first.**
 The original framing: User-raised, in two parts: *"instead of building fluid
 versions of fabricator_query + fabricator_exec we could add … tags to the existing fluid plugin"*, and
 *"i think fabricator_query/fabricator_execute ABI version with parameter binding would be beneficial?"*
@@ -205,7 +205,7 @@ about atomicity.
 | | | |
 |---|---|---|
 | **A1** ✅ | ABI v88 + the DIMs + SQL Server override + the `params :=` surface — **BUILT, §5** | `verify_raw_query`: a parameterised SELECT, an injection pair with its control (`"eu' OR 1=1 --"` answering 0 beside `"eu"` answering N), and the describe/execute schema agreement |
-| **A2** | DAX override; `daxeval` delegates to the shared bag | `verify_dax` (manual — needs Power BI Desktop) |
+| **A2** ✅ | DAX override — **BUILT, §6**. `ExecuteQuery` was a THROW, and unifying `daxeval`'s bag onto the host decoder fixed a silent precision loss | `verify_dax` (manual — needs Power BI Desktop, so §6.5: the DAX-side rows were written BLIND) |
 | ~~**A3**~~ | ~~Delta/deltars refusal by name~~ — **NOT NEEDED**: the contract DIM refuses, so every non-overriding provider does (§5.3) | §15 asserts both refusals against a real Delta attach, with an unparameterised CTAS as the control |
 | **B** | the two tags | `verify_plugin_fluid`: both paths, the multi-line body, and whichever §3.1 decision was taken, asserted |
 
@@ -361,9 +361,7 @@ temporal row.
 
 ### 5.8 What is NOT built
 
-* **A2 (DAX)** — `daxeval` keeps its own bag; `fabricator_query` against a DAX catalog refuses through the
-  default. Wiring `DaxCatalog.ExecuteQuery(sql, params)` to ADOMD `@name` parameters and having `daxeval`
-  delegate to the shared bag is the remaining half, gated only by `verify_dax` (manual).
+* **A2 (DAX)** — BUILT the same day; see §6.
 * **B (the two Fluid tags)** — unchanged from §3, including the §3.1 decision, which is still a decision and
   not a discovery.
 * ⚠ **No tier-0 test for `ProviderParameters`, and the reason is the ADMISSION RULE rather than effort.**
@@ -372,3 +370,69 @@ temporal row.
   smuggle into this slice — and the decidable half here (which JSON kind becomes which type) is meaningless
   without Arrow types, so there is no clean split either. The gate reaches all four refusals through SQL
   instead, at one provider round trip each.
+
+---
+
+## 6. ✅ AS BUILT — slice A2, DAX (2026-09-06)
+
+C#-only, no ABI change. Two halves, and the second is a bug fix that had nothing to do with parameters:
+
+1. **`DaxCatalog.ExecuteQuery` is implemented.** It used to throw *"raw query not supported yet (slice 1)"* —
+   a message about a slice long since finished — so `fabricator_query` against a DAX catalog did not work at
+   all. It delegates to the `StreamCommand` that `daxeval` already uses, with and without a bag.
+2. **`daxeval`'s bag decoder is the HOST's**, not a local copy.
+
+### 6.1 ⚠⚠ Unifying the decoder fixed a SILENT PRECISION LOSS in the shipped DAX provider
+
+`DaxCatalog.JsonScalar` read:
+
+```csharp
+JsonValueKind.Number => e.TryGetInt64(out var l) ? l : e.GetDouble(),
+```
+
+C# unifies a conditional's branches to the wider type, so the expression's type is **double** and the int64
+branch never had any effect. MEASURED on the pattern in isolation: `9007199254740993` comes back as a
+`Double` valued `9007199254740992`, where the corrected ladder returns `Int64 9007199254740993`.
+
+⚠ It is the **fourth** appearance of this exact pattern in this repo — `JsonToClr` shipped it, and
+`ArrowValueReader.ReadTimestamp` shipped its sibling (a `DateTime`/`DateTimeOffset` conditional that unified
+to `DateTimeOffset`). Both were invisible for every value a test happened to use.
+
+⚠ **The unification also gave this bag a GATE it could not otherwise have.** `verify_dax` needs Power BI
+Desktop and is manual; the shared ladder is pinned by `verify_raw_query` §9 on the service tier. The rule now
+exists once, and the tier that can actually run asserts it.
+
+### 6.2 Three behaviour changes, all in the safe direction
+
+| was | is |
+|---|---|
+| a nested JSON value passed as its **raw JSON text** (`_ => e.GetRawText()`) | REFUSED by name |
+| a duplicated parameter name silently collapsed | REFUSED by name |
+| a MAP or LIST died inside `ArrowValueReader` as *"unsupported filter value type Map"* | REFUSED naming its own type and both accepted shapes |
+
+The first is the notable one: its own comment called it *"unusual for a DAX scalar param"*, and passing a
+value the caller never wrote — arriving as a plausible-looking string — is the stringify hazard
+`ProviderParameters` exists to refuse. ⚠ The STRUCT path already effectively refused nested values (via
+`ArrowValueReader`), so this makes the two spellings AGREE rather than tightening one of them.
+
+### 6.3 ⚠ `Normalize` is applied at the ENTRY POINT, exactly once
+
+`daxeval` receives the RAW function-args batch (a column named `params`) and must call
+`ProviderParameters.Normalize`; `ExecuteQuery(sql, parameters)` is handed a bag the HOST already normalised
+and must not. Normalising twice yields NOTHING — the second pass looks for a `params` column and finds none —
+so this is a silent-empty-bag trap, not a compile error. `ToDaxParams` is the shared bottom half.
+
+### 6.4 ⚠ `ExecuteNonQuery(sql, bag)` is overridden to say READ-ONLY
+
+The contract default would answer *"does not support statement parameters"*, which blames the bag. Parameters
+are not why a write fails on this provider; writing is.
+
+### 6.5 ⚠⚠ The gate is MANUAL and these rows were written BLIND
+
+`verify_dax` needs Power BI Desktop, and none was available. The four REFUSAL texts come from
+`ProviderParameters` and were verified on the service tier (`verify_raw_query` §13); the DAX-side row values
+and column names were NOT run. The suite's own section header says so, so a red row there is read as "written
+blind" before being read as a regression.
+
+⚠ What IS established without a model: both assemblies compile, the payload publishes with all five SqlClient
+DLLs intact (the recorded publish-order hazard), and the ternary defect is measured on the pattern itself.
