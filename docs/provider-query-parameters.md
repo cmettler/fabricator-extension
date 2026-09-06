@@ -426,15 +426,22 @@ so this is a silent-empty-bag trap, not a compile error. `ToDaxParams` is the sh
 The contract default would answer *"does not support statement parameters"*, which blames the bag. Parameters
 are not why a write fails on this provider; writing is.
 
-### 6.5 ⚠⚠ The gate is MANUAL and these rows were written BLIND
+### 6.5 ✅ VERIFIED LIVE 2026-09-06 — the blind rows all held, and running them found TWO more regressions
 
-`verify_dax` needs Power BI Desktop, and none was available. The four REFUSAL texts come from
-`ProviderParameters` and were verified on the service tier (`verify_raw_query` §13); the DAX-side row values
-and column names were NOT run. The suite's own section header says so, so a red row there is read as "written
-blind" before being read as a regression.
+These rows were authored with no model available. A local Power BI Desktop instance was provided the same
+day and **every one of them held** — including the `9007199254740993` row, so the precision fix is verified end
+to end rather than on the pattern alone. `verify_dax` went **29 → 51**.
 
-⚠ What IS established without a model: both assemblies compile, the payload publishes with all five SqlClient
-DLLs intact (the recorded publish-order hazard), and the ternary defect is measured on the pattern itself.
+⚠⚠ **Running it found two regressions that only a live model could**, both of which break everything EXCEPT
+targeted access: `daxevaltable`/`daxeach` had lost their `{TABLE}` input to the unified-parameter-protocol
+migration (so DuckDB bound the input relation as a scalar subquery), and ONE unsupported `$SYSTEM` DMV
+(`TMSCHEMA_PARTITION_SOURCES` on Power BI Desktop) broke full ENUMERATION — `duckdb_tables()`,
+`duckdb_columns()` and `information_schema.tables` alike. Full record + the fixes:
+[dax-provider.md](dax-provider.md) §LIVE VALIDATION.
+
+⚠ The transferable half is about the TIER, not the code: this suite is MANUAL, so nothing between the
+2026-08-02 protocol migration and 2026-09-06 could have caught the first defect. Treat a long gap since the
+last run as a reason to EXPECT rot.
 
 ---
 

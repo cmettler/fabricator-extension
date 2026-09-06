@@ -167,10 +167,9 @@ SELECT count(*) FROM ${FABRICATOR_DAX_SCHEMA}.daxeach(
 6
 
 # ═══ Raw DAX through fabricator_query, and the SHARED parameter bag (ABI v88) ═════════════════════════
-# ⚠ THESE ROWS WERE AUTHORED WITHOUT A LIVE MODEL — this tier needs Power BI Desktop and none was available.
-# The four REFUSAL texts come from ProviderParameters and were verified on the service tier
-# (verify_raw_query §13); the DAX-side row VALUES and column names were not run. Treat a red row here as
-# "the expectation was written blind" before treating it as a regression.
+# ✅ VERIFIED against a live Power BI Desktop model 2026-09-06. These rows were AUTHORED BLIND (no model was
+# available at the time) and every one of them held — including the 2^53+1 row, which is the whole point of
+# unifying the decoder.
 # fabricator_query used to answer a DAX catalog with "raw query not supported yet (slice 1)". It runs the
 # statement now, so the generic function means the same thing on every provider.
 #
@@ -245,6 +244,77 @@ statement error
 SELECT fabricator_exec('pbi', 'EVALUATE ROW("n", 1)', {'a': 1});
 ----
 dax provider is read-only
+
+# ═══ Full ENUMERATION, and the two regressions a live model was needed to find (2026-09-06) ══════════
+# ⚠⚠ BOTH were invisible to CI because this tier is MANUAL, and both broke everything EXCEPT targeted access
+# — the same shape as the SQL Server discovery defect this project already recorded.
+
+# (1) THE {TABLE} INPUT MUST BE DECLARED. Under the unified parameter protocol a field's STYLE rides in its
+# Arrow metadata and an unflagged field is POSITIONAL, so daxevaltable/daxeach — which returned a bare
+# `expression` VARCHAR and were never migrated — registered as `f(VARCHAR)`: no {TABLE} parameter at all.
+# DuckDB then bound the input RELATION as a scalar subquery ("Subquery returns 2 columns - expected 1").
+#
+# ⚠ Omitting the style does not FAIL, it registers a DIFFERENT FUNCTION — which is why the signature is
+# pinned here rather than only the behaviour above.
+# ⚠ daxeval is the control: it is kind 'proc', whose arguments the host makes named by construction, so it
+# needs no styles and must keep reporting two NAMED parameters.
+
+query TTT
+SELECT function_name, parameters, parameter_types
+FROM duckdb_functions()
+WHERE function_name IN ('daxeval', 'daxevaltable', 'daxeach')
+ORDER BY function_name;
+----
+daxeach	[col0, expression]	[TABLE, VARCHAR]
+daxeval	[expression, params]	[VARCHAR, ANY]
+daxevaltable	[col0, expression]	[TABLE, VARCHAR]
+
+# (2) ONE MISSING DMV BROKE FULL ENUMERATION. The curated $SYSTEM list is what we know how to surface, not
+# what every server HAS — and a listed-but-absent DMV is materialized during enumeration, whose schema fetch
+# then throws. MEASURED on Power BI Desktop: `TMSCHEMA_PARTITION_SOURCES` is the one of eighteen it does not
+# recognise, and duckdb_tables() / duckdb_columns() / information_schema.tables ALL failed with "The
+# 'TMSCHEMA_PARTITION_SOURCES' request type was not recognized by the server" while targeted access worked.
+#
+# The list is now narrowed by DISCOVER_SCHEMA_ROWSETS — the SERVER's own answer, one round trip per catalog.
+#
+# ⚠ MODEL-AGNOSTIC by construction: which DMVs a given server declares varies, so what is asserted is that
+# enumeration SUCCEEDS and that every system table it lists can be described. Before the fix the first of
+# these queries did not return a number at all — it threw.
+
+query I
+SELECT count(*) > 0 FROM duckdb_tables() WHERE database_name = 'pbi' AND schema_name = 'system';
+----
+true
+
+# ⚠ THE DISCRIMINATING ROW: duckdb_columns() MATERIALIZES every listed table, so a system table the server
+# cannot describe fails here. Equal counts mean the enumeration lists exactly the tables it can describe.
+query I
+SELECT (SELECT count(DISTINCT table_name) FROM duckdb_columns() WHERE database_name = 'pbi' AND schema_name = 'system')
+     = (SELECT count(*) FROM duckdb_tables() WHERE database_name = 'pbi' AND schema_name = 'system');
+----
+true
+
+# …and the whole catalog enumerates, which is what dbt and every BI tool do before they read anything.
+query I
+SELECT count(*) = (SELECT count(*) FROM duckdb_tables() WHERE database_name = 'pbi')
+FROM information_schema.tables WHERE table_catalog = 'pbi';
+----
+true
+
+# ⚠ A DMV the server does not declare is ABSENT from enumeration rather than present-and-broken. Asserted as
+# a SUBSET rather than by naming one: every system table listed must be one we curate, and on a server that
+# has them all nothing is dropped. (Naming TMSCHEMA_PARTITION_SOURCES would pin THIS server's gap.)
+query I
+SELECT count(*) FROM duckdb_tables()
+WHERE database_name = 'pbi' AND schema_name = 'system'
+  AND table_name NOT IN (
+    'TMSCHEMA_MODEL','TMSCHEMA_TABLES','TMSCHEMA_COLUMNS','TMSCHEMA_MEASURES','TMSCHEMA_RELATIONSHIPS',
+    'TMSCHEMA_PARTITIONS','TMSCHEMA_HIERARCHIES','TMSCHEMA_EXPRESSIONS','TMSCHEMA_DATA_SOURCES',
+    'TMSCHEMA_PARTITION_SOURCES','DBSCHEMA_CATALOGS','DBSCHEMA_TABLES','DBSCHEMA_COLUMNS',
+    'DISCOVER_STORAGE_TABLES','DISCOVER_STORAGE_TABLE_COLUMNS','DISCOVER_STORAGE_TABLE_COLUMN_SEGMENTS',
+    'DISCOVER_CALC_DEPENDENCY','DISCOVER_OBJECT_MEMORY_USAGE');
+----
+0
 
 statement ok
 DETACH pbi;

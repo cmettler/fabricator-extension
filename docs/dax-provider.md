@@ -420,3 +420,70 @@ multi-fragment commit); (3) whole-model replace + DDL→model auto-sync — defe
   editions); a way to target a specific open file (by window title / workspace) is a later nicety.
 - **The generic rename** (`TYPE fabricator`, `fabricator_query`/`_exec`) — do it once the DAX provider is real,
   per the "Next up" thread in CLAUDE.md.
+
+---
+
+## ✅ LIVE VALIDATION 2026-09-06 — and it found TWO regressions that only a running model could
+
+`verify_dax` **29 → 51**, all green against a local Power BI Desktop instance (`pbidesktop://` autodetect).
+It had not been run for some time, and both defects below make everything EXCEPT targeted access fail —
+the same shape as the SQL Server discovery defect this project already records.
+
+### 1. ⚠⚠ `daxevaltable` / `daxeach` had lost their `{TABLE}` input
+
+`GetFunctionParamSchema` returned a bare `expression` VARCHAR for both. Under the **unified parameter
+protocol** (2026-08-02) a field's STYLE rides in its Arrow metadata and an unflagged field is POSITIONAL — so
+these two were never migrated and the host registered `daxevaltable(VARCHAR)`: no `{TABLE}` parameter, and
+`expression` not even named. DuckDB then bound the input RELATION as a scalar subquery:
+
+```
+Binder Error: Subquery returns 2 columns - expected 1
+```
+
+MEASURED before and after, from `duckdb_functions()`:
+
+| | before | after |
+|---|---|---|
+| `daxeach` | `[col0]` `[VARCHAR]` | `[col0, expression]` `[TABLE, VARCHAR]` |
+| `daxevaltable` | `[col0]` `[VARCHAR]` | `[col0, expression]` `[TABLE, VARCHAR]` |
+| `daxeval` (control) | `[expression, params]` `[VARCHAR, ANY]` | unchanged |
+
+⚠ **Omitting the style does not FAIL — it registers a DIFFERENT FUNCTION**, which is why the signature is now
+pinned rather than only the behaviour. ⚠ `daxeval` is deliberately left alone: it is kind `'proc'`, whose
+arguments the host makes named by construction.
+
+### 2. ⚠⚠ One missing DMV broke FULL ENUMERATION
+
+The curated `$SYSTEM` list is *what we know how to surface*, not *what every server has* — and a
+listed-but-absent DMV is materialized during enumeration, whose schema fetch then throws. On Power BI Desktop
+`TMSCHEMA_PARTITION_SOURCES` is the one of eighteen it does not recognise, and **`duckdb_tables()`,
+`duckdb_columns()` and `information_schema.tables` all failed**:
+
+```
+The 'TMSCHEMA_PARTITION_SOURCES' request type was not recognized by the server
+```
+
+while `SELECT * FROM pbi."Model"."<table>"` worked throughout. So dbt, every BI tool and any cache refresh
+were broken against a Power BI Desktop catalog while a hand-written query was fine.
+
+**Fixed by asking the server**: `SupportedSystemTables()` narrows the curated list by
+`$SYSTEM.DISCOVER_SCHEMA_ROWSETS`, one round trip per catalog, cached. MEASURED to name exactly the one
+missing DMV and no others; enumeration then reports 22 tables (5 model + 17 system) and 352 columns.
+
+⚠ **A failure to ask is not an answer.** If the discovery query itself fails, the full curated list is used —
+"I could not find out" must not become "this server has nothing", the same unknown-is-not-absence rule the
+catalog's object lookup already follows.
+
+⚠ It narrows ENUMERATION only. A caller who names an unsupported DMV explicitly still reaches it (an ATTACH
+filter bounds enumeration, not by-name access) and gets the server's own error, which is the honest answer to
+having asked for it.
+
+### 3. The slice-A2 rows were written BLIND and all held
+
+The `fabricator_query`-on-DAX and shared-bag rows added hours earlier had no model to run against. Every one
+passed, including the `9007199254740993` row that is the whole point of unifying the decoder — so the
+precision fix is now verified end to end on a live model rather than on the pattern alone.
+
+⚠ The standing lesson is the tier's, not the code's: **this suite is MANUAL, so nothing between the
+2026-08-02 protocol migration and 2026-09-06 could have caught defect 1.** Run it whenever a model is
+available, and treat a long gap as a reason to expect rot rather than confirmation.

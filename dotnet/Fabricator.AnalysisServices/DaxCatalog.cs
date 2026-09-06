@@ -8,6 +8,7 @@ using Apache.Arrow.Ipc;
 using Apache.Arrow.Types;
 using Fabricator.Bridge;
 using Microsoft.AnalysisServices.AdomdClient;
+using Microsoft.Extensions.Logging;
 
 namespace Fabricator.AnalysisServices;
 
@@ -214,6 +215,67 @@ internal sealed class DaxCatalog : IProviderCatalog
         }
     }
 
+    private static readonly ILogger Log = FabricatorLog.CreateLogger("Fabricator.Dax");
+
+    // The curated DMVs this server actually has, cached per catalog. Null until first asked.
+    private HashSet<string>? _serverRowsets;
+
+    /// <summary>
+    /// <see cref="SystemTables"/> narrowed to the rowsets this server DECLARES it supports.
+    /// </summary>
+    /// <remarks>
+    /// <para>⚠⚠ WITHOUT THIS, ONE MISSING DMV BREAKS FULL ENUMERATION. The curated list is what we know how
+    /// to surface, not what every server has — and a listed-but-absent DMV is materialized during
+    /// enumeration, whose schema fetch then throws: MEASURED on Power BI Desktop, where
+    /// <c>TMSCHEMA_PARTITION_SOURCES</c> is the one of eighteen it does not recognise, and
+    /// <c>duckdb_tables()</c> / <c>duckdb_columns()</c> / <c>information_schema.tables</c> all failed with
+    /// <i>"The 'TMSCHEMA_PARTITION_SOURCES' request type was not recognized by the server"</i>. Targeted
+    /// access was unaffected throughout, which is exactly the shape of the SQL Server discovery defect this
+    /// project already recorded — an enumeration that asks about an object it need not have asked about.
+    /// </para>
+    /// <para>⚠ <c>DISCOVER_SCHEMA_ROWSETS</c> is the SERVER's own answer rather than a probe of ours, so it
+    /// costs ONE round trip per catalog and cannot drift from what the server will accept. MEASURED to name
+    /// exactly the one missing DMV and no others.</para>
+    /// <para>⚠ <b>A failure to ask is NOT an answer.</b> If the discovery query itself fails the full curated
+    /// list is used, because "I could not find out" must not become "this server has nothing" — the same
+    /// unknown-is-not-absence rule the catalog's object lookup already follows.</para>
+    /// <para>⚠ It narrows ENUMERATION only. A caller who names an unsupported DMV explicitly still reaches it
+    /// (an ATTACH filter bounds enumeration, not by-name access) and gets the server's own error, which is
+    /// the honest answer to having asked for it.</para>
+    /// </remarks>
+    private IEnumerable<string> SupportedSystemTables()
+    {
+        if (_serverRowsets is null)
+        {
+            var found = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            try
+            {
+                using var cmd = _conn.CreateCommand();
+                cmd.CommandText = "SELECT SchemaName FROM $SYSTEM.DISCOVER_SCHEMA_ROWSETS";
+                using var r = cmd.ExecuteReader();
+                while (r.Read())
+                {
+                    var name = r.IsDBNull(0) ? null : r.GetValue(0)?.ToString();
+                    if (!string.IsNullOrEmpty(name))
+                    {
+                        found.Add(name!);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                // Logged rather than silent: a discovery that always fails turns the narrowing into a no-op,
+                // and nothing else would say so.
+                Log.LogDebug(ex, "dax: DISCOVER_SCHEMA_ROWSETS failed; surfacing the full curated DMV list");
+                found.Clear();
+            }
+            _serverRowsets = found;
+        }
+        return _serverRowsets.Count == 0
+            ? SystemTables
+            : SystemTables.Where(t => _serverRowsets.Contains(t));
+    }
+
     private IArrowArrayStream DiscoverTables()
     {
         var schemaCol = new List<string>();
@@ -235,8 +297,9 @@ internal sealed class DaxCatalog : IProviderCatalog
                 typeCol.Add("BASE TABLE");
             }
         }
-        // Curated $SYSTEM DMVs under the "system" schema (same catalog).
-        foreach (var sysTable in SystemTables)
+        // Curated $SYSTEM DMVs under the "system" schema (same catalog), narrowed to the ones THIS SERVER
+        // declares (see SupportedSystemTables).
+        foreach (var sysTable in SupportedSystemTables())
         {
             schemaCol.Add(SystemSchema);
             nameCol.Add(sysTable);
@@ -679,7 +742,21 @@ internal sealed class DaxCatalog : IProviderCatalog
         }
         if (IsDaxEvalTable(functionName) || IsDaxEach(functionName))
         {
-            return new Schema(new[] { new Field("expression", StringType.Default, nullable: false) }, null);
+            // ⚠⚠ THE TABLE INPUT MUST BE DECLARED, and omitting it does not fail — it registers a DIFFERENT
+            // FUNCTION. Under the unified parameter protocol (2026-08-02) a field's STYLE rides in its Arrow
+            // metadata; an unflagged field is POSITIONAL. This pair returned a bare `expression` VARCHAR and
+            // was never migrated, so the host registered `daxevaltable(VARCHAR)` — no {TABLE} parameter and
+            // `expression` not even named — and DuckDB then bound the input relation as a SCALAR subquery:
+            // "Binder Error: Subquery returns 2 columns - expected 1".
+            // ⚠ It survived because verify_dax is MANUAL (it needs Power BI Desktop), so nothing ran between
+            // the protocol migration and 2026-09-06.
+            // ⚠ daxeval is deliberately NOT given styles: it is kind 'proc', whose arguments the host makes
+            // named by construction, and it registers correctly as [expression, params].
+            return new Schema(new[]
+            {
+                Params.TableInput("input"),
+                Params.Named("expression", StringType.Default),
+            }, null);
         }
         return Functions.ParamSchema(schemaName, functionName)
                ?? throw NoFunction(schemaName, functionName);
