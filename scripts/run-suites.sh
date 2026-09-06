@@ -444,6 +444,11 @@ case "$TIER" in
         # in that section is load-bearing and a mutant proved it: an earlier `USE memory.hq_s` leaves a
         # qualified entry, against which the bug does not fire, so the section PASSED with it fully present.
         # 8250 + 9 = 8259 exactly, from a green run.
+        # 9013 since 2026-09-06 (same day, fifth bump): verify_plugin_fluid 729 -> 737 -- materialize:
+        #   now ALSO binds the identifier, LAZILY, so both access paths work under one name and the rows
+        #   only cross into Liquid if the template reads them. `fluid:` is GONE (breaking, no alias): with
+        #   binding free there was nothing left to opt out of. Two mutants -- an EAGER bind dies at the
+        #   deferral row after 721 pass, an uncached read at the cache row after 725.
         # 9005 since 2026-09-06 (same day, fourth bump): verify_plugin_fluid 716 -> 729 -- {% query name
         # materialize: 'view'|'table' %}, leaving the result on the render's connection as a TEMP object
         # instead of pulling the rows into Liquid. /!\/!\ A TABLE can carry the block's named arguments and a
@@ -584,7 +589,7 @@ case "$TIER" in
         # two functions have exactly ONE registration each, plus the HostsCatalog refusal and its
         # unknown-provider control. 3105 + 238 + 8259 - 3339 arithmetic aside, both numbers come from green
         # runs.
-        : "${MIN_ASSERTIONS:=9005}"
+        : "${MIN_ASSERTIONS:=9013}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

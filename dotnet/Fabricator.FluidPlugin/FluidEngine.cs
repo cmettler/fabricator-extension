@@ -158,28 +158,35 @@ internal static class FluidEngine
                 return completion;
             }
 
-            // ⚠⚠ `materialize` and `fluid` are RESERVED ARGUMENT NAMES, taken out before the rest become
-            // bound parameters — so a statement wanting a parameter called either cannot have one. The same
-            // trade {% print %}'s `delim`/`rowdelim` already make, and acceptable for the same reason: it
-            // fails LOUDLY, with DuckDB naming the parameter it was not given.
-            var (rest, kind, wantFluid) = await ReadQueryOptionsAsync(head.Item2, ctx);
+            // ⚠⚠ `materialize` is a RESERVED ARGUMENT NAME, taken out before the rest become bound
+            // parameters — so a statement wanting a parameter called that cannot have one. The same trade
+            // {% print %}'s `delim`/`rowdelim` already make, and acceptable for the same reason: it fails
+            // LOUDLY, with DuckDB naming the parameter it was not given.
+            var (rest, kind) = await ReadQueryOptionsAsync(head.Item2, ctx);
             var parameters = await FluidHostQuery.BuildBlockParametersAsync(
                 FluidHostQuery.CallerOf(ctx), FluidHostQuery.BlockName, rest, ctx);
-            if (kind is not null)
-            {
-                FluidHostQuery.MaterializeCaptured(ctx, FluidHostQuery.BlockName, head.Item1, sql,
-                                                   parameters, kind);
-            }
+
             // ⚠ SetValue, and NOTHING is written to `output` — the block contributes no text, exactly like
             // {% capture %}. The rows are held for the render, so a template may iterate them repeatedly.
-            // ⚠ `fluid` DEFAULTS TO "no materialize", so today's spelling is unchanged and materializing does
-            // NOT also pull every row into memory — which would defeat the point of asking for a relation.
-            // `fluid: true` alongside `materialize:` asks for both, and runs the body TWICE.
-            if (wantFluid ?? kind is null)
+            if (kind is null)
             {
                 ctx.SetValue(head.Item1,
                              FluidHostQuery.RunCaptured(ctx, FluidHostQuery.BlockName, sql, parameters));
+                return Completion.Normal;
             }
+
+            // ⚠⚠ MATERIALIZED: the rows are left in DuckDB AND the identifier is still bound — LAZILY, so
+            // the SQL destination costs nothing extra and only a template that reads the variable in Liquid
+            // pays a round trip to fetch it. That is why there is no `fluid` option: binding a value nobody
+            // touches is free, so there was nothing left to opt out of.
+            // ⚠ The body runs ONCE either way. The earlier `fluid: true` spelling rendered it TWICE, which
+            // is exactly the sort of thing a caller cannot see and should not have to reason about.
+            var name = head.Item1;
+            FluidHostQuery.MaterializeCaptured(ctx, FluidHostQuery.BlockName, name, sql, parameters, kind);
+            // ⚠ Capturing `ctx` is safe and is the point: a TemplateContext belongs to ONE execution, the
+            // value is set into that same context's scope, and the scope is popped at end of render — so the
+            // closure can neither outlive the render nor reach another one's connection.
+            ctx.SetValue(name, new LazyRowsValue(() => FluidHostQuery.ReadMaterialized(ctx, name)));
             return Completion.Normal;
         });
 
@@ -351,20 +358,20 @@ internal static class FluidEngine
     internal const string IsBindVariable = "is_bind";
 
     /// <summary>
-    /// Splits <c>{% query %}</c>'s named arguments into its two OPTIONS and the rest, which become bound
-    /// parameters. Returns (rest, materialize kind or null, explicit `fluid` or null).
+    /// Splits <c>{% query %}</c>'s named arguments into its OPTION and the rest, which become bound
+    /// parameters. Returns (rest, materialize kind or null).
     /// </summary>
     /// <remarks>
     /// ⚠ The arguments arrive UNEVALUATED (name + expression), so each option is evaluated here rather than
     /// pattern-matched on source text — which is what lets `materialize: params.mode` work as well as a
     /// literal.
     /// </remarks>
-    private static async ValueTask<(IReadOnlyList<FilterArgument>? Args, string? Kind, bool? Fluid)>
+    private static async ValueTask<(IReadOnlyList<FilterArgument>? Args, string? Kind)>
         ReadQueryOptionsAsync(IReadOnlyList<FilterArgument>? args, TemplateContext ctx)
     {
         if (args is null || args.Count == 0)
         {
-            return (args, null, null);
+            return (args, null);
         }
         // ⚠ ALWAYS rebuilt rather than returned unchanged when nothing was taken. The shortcut cannot tell
         // an ABSENT option from one PRESENT AND NULL — and `materialize: null` is the documented default, so
@@ -372,7 +379,6 @@ internal static class FluidEngine
         // MEASURED before this comment existed.
         var rest = new List<FilterArgument>(args.Count);
         string? kind = null;
-        bool? fluid = null;
         foreach (var arg in args)
         {
             if (string.Equals(arg.Name, "materialize", StringComparison.OrdinalIgnoreCase))
@@ -395,15 +401,9 @@ internal static class FluidEngine
                 }
                 continue;
             }
-            if (string.Equals(arg.Name, "fluid", StringComparison.OrdinalIgnoreCase))
-            {
-                var v = await arg.Expression.EvaluateAsync(ctx);
-                fluid = v is not NilValue && v.ToBooleanValue();
-                continue;
-            }
             rest.Add(arg);
         }
-        return (rest.Count == 0 ? null : rest, kind, fluid);
+        return (rest.Count == 0 ? null : rest, kind);
     }
 
     /// <summary>The tag that ends a render early — Scriban's <c>ret</c>, which Liquid has no equivalent of.</summary>

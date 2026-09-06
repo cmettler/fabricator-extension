@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // See LICENSE in the project root for license information.
 
+using System.Globalization;
+using System.Text.Encodings.Web;
 using Apache.Arrow;
 using Apache.Arrow.Types;
 using Apache.Arrow.Ipc;
@@ -195,6 +197,40 @@ internal static class FluidHostQuery
         }
     }
 
+    /// <summary>
+    /// Reads back a name <see cref="MaterializeCaptured"/> left on the render's connection — the LAZY half
+    /// of <c>materialize:</c>, run only if the template actually reads the variable.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// ⚠⚠ <b>THIS IS WHY THE ROWS STAY IN DuckDB.</b> The alternative — pulling every row into managed
+    /// memory so Liquid can index it, then registering those Arrow batches back as a scannable source — is
+    /// two crossings and a full buffer to reach a place the rows already were. <c>materialize:</c> is a CTAS
+    /// (or a view): nothing crosses, nothing is capped, and DuckDB spills. So the SQL side pays nothing and
+    /// only a template that genuinely wants the rows in Liquid pays this one round trip.
+    /// </para>
+    /// <para>
+    /// ⚠ <b>A VIEW IS EVALUATED HERE, A TABLE WAS EVALUATED AT THE BLOCK.</b> Reading a
+    /// <c>materialize: 'view'</c> name sees whatever its body selects NOW, so an <c>{% exec %}</c> between
+    /// the block and the first access is reflected; <c>'table'</c> is the snapshot the block took. That is
+    /// what those two words mean in SQL, and it is the reason both are offered.
+    /// </para>
+    /// <para>
+    /// ⚠ No classification: the statement is <c>SELECT * FROM</c> a QUOTED IDENTIFIER, composed here, so
+    /// there is no template text in it and nothing for the parser to decide.
+    /// </para>
+    /// </remarks>
+    internal static FluidValue ReadMaterialized(TemplateContext ctx, string name)
+    {
+        var caller = CallerOf(ctx);
+        var surface = "{% " + BlockName + " %}";
+        var run = FluidRenderSession.For(ctx)
+            ?? throw new InvalidOperationException(
+                $"{caller}: {surface} needs the IHostQuery service, which is not published here. "
+                + "It is available only from inside a fabricator function call.");
+        return ReadRows(caller, surface, $"SELECT * FROM {DuckSql.QuoteIdent(name)}", null, run);
+    }
+
     /// <param name="surface">How to NAME this call in an error — <c>query()</c> by default, so the function
     /// and filter forms are unchanged, and <c>{% print %}</c> for the print block.
     /// ⚠ Not cosmetic: the refusal below tells the author which construct to reach for instead, and a
@@ -217,7 +253,21 @@ internal static class FluidHostQuery
                 + "It is available only from inside a fabricator function call.");
 
         RefuseUnlessSelect(caller, surface, sql, run);
+        return ReadRows(caller, surface, sql!, parameters, run);
+    }
 
+    /// <summary>
+    /// Reads <paramref name="sql"/>'s rows into the array of indexable rows a template sees. The half of
+    /// <see cref="Run"/> that is NOT the classifier, so a statement WE composed can skip it.
+    /// </summary>
+    /// <remarks>
+    /// ⚠ Skipping the classifier is legitimate only for SQL this file builds from a quoted identifier —
+    /// see <see cref="ReadMaterialized"/>. Anything carrying template text goes through <see cref="Run"/>,
+    /// because a bind repeats and happens without execution, so a write there would fire on EXPLAIN.
+    /// </remarks>
+    private static FluidValue ReadRows(string caller, string surface, string sql, RecordBatch? parameters,
+                                       FluidRenderSession run)
+    {
         using var stream = run.Query(sql, parameters);
         var rows = new List<FluidValue>();
         while (true)
@@ -878,4 +928,88 @@ internal sealed class EagerStruct : IFluidIndexable
         value = NilValue.Instance;
         return false;
     }
+}
+
+/// <summary>
+/// A row set that is READ ON FIRST ACCESS — what <c>{% query t materialize: 'table' %}</c> binds to
+/// <c>t</c>, so the rows stay in DuckDB unless the template actually asks for them in Liquid.
+/// </summary>
+/// <remarks>
+/// <para>
+/// ⚠⚠ <b>EVERY MEMBER BUT <see cref="Type"/> FORCES, deliberately.</b> Forwarding wholesale is what makes
+/// this observationally IDENTICAL to the eager value the unmaterialized block binds — the only difference
+/// is WHEN the query runs — so nothing downstream has to know which kind it holds.
+/// <see cref="Type"/> is the one exception because it is answerable without asking: a materialized block
+/// always yields an array of rows, and Fluid consults it constantly (a forcing <c>Type</c> would defeat
+/// the laziness at the first <c>{% if %}</c> Fluid evaluates internally).
+/// </para>
+/// <para>
+/// ⚠ The read is cached, so a template touching the value several times costs ONE round trip. It is not
+/// thread-safe and does not need to be: a <see cref="TemplateContext"/> belongs to one render.
+/// </para>
+/// <para>
+/// ⚠ A failure surfaces at the ACCESS rather than at the block — if the name was dropped in between, that
+/// is where the author will be told. Honest, and the alternative (reading eagerly to fail early) is the
+/// cost this class exists to avoid.
+/// </para>
+/// </remarks>
+internal sealed class LazyRowsValue : FluidValue
+{
+    private readonly Func<FluidValue> _read;
+    private FluidValue? _rows;
+
+    internal LazyRowsValue(Func<FluidValue> read) => _read = read;
+
+    private FluidValue Rows => _rows ??= _read();
+
+    /// <summary>The one answer that does NOT force — see the class remark.</summary>
+    public override FluidValues Type => FluidValues.Array;
+
+    public override bool Equals(FluidValue other) => Rows.Equals(other);
+
+    // ⚠ Fluid marks the parameterless To*Value forms, Contains and Enumerate OBSOLETE while still
+    // declaring them abstract/virtual, so a complete forwarder must implement them and can only silence
+    // the warnings. Forwarding to the same obsolete member is the correct thing to do — this class adds
+    // laziness, not a policy about which overload a caller should reach for.
+#pragma warning disable CS0618, CS0672
+    public override bool ToBooleanValue() => Rows.ToBooleanValue();
+
+    public override decimal ToNumberValue() => Rows.ToNumberValue();
+
+    public override string ToStringValue() => Rows.ToStringValue();
+
+    public override object ToObjectValue() => Rows.ToObjectValue();
+
+    public override bool ToBooleanValue(TemplateContext context) => Rows.ToBooleanValue(context);
+
+    public override decimal ToNumberValue(TemplateContext context) => Rows.ToNumberValue(context);
+
+    public override string ToStringValue(TemplateContext context) => Rows.ToStringValue(context);
+
+    public override object ToObjectValue(TemplateContext context) => Rows.ToObjectValue(context);
+
+    public override ValueTask WriteToAsync(IFluidOutput output, TextEncoder encoder, CultureInfo cultureInfo)
+        => Rows.WriteToAsync(output, encoder, cultureInfo);
+
+    public override ValueTask<FluidValue> GetValueAsync(string name, TemplateContext context)
+        => Rows.GetValueAsync(name, context);
+
+    public override ValueTask<FluidValue> GetIndexAsync(FluidValue index, TemplateContext context)
+        => Rows.GetIndexAsync(index, context);
+
+    public override ValueTask<FluidValue> InvokeAsync(FunctionArguments arguments, TemplateContext context)
+        => Rows.InvokeAsync(arguments, context);
+
+    public override bool IsNil() => Rows.IsNil();
+
+    public override bool Contains(FluidValue value) => Rows.Contains(value);
+
+    public override ValueTask<bool> ContainsAsync(FluidValue value, TemplateContext context)
+        => Rows.ContainsAsync(value, context);
+
+    public override IAsyncEnumerable<FluidValue> EnumerateAsync(TemplateContext context)
+        => Rows.EnumerateAsync(context);
+
+    public override IEnumerable<FluidValue> Enumerate(TemplateContext context) => Rows.Enumerate(context);
+#pragma warning restore CS0618, CS0672
 }

@@ -3628,26 +3628,74 @@ ordering, and a refactor moving the create past the render would take it away. T
 does not exist until after the bind. So a template may derive its FULL shape from the input at bind and then
 narrow that shape per call.
 
-## 27. ✅ AS BUILT (2026-09-06) — `{% query name materialize: … %}`
+## 27. ✅ AS BUILT (2026-09-06) — `{% query name materialize: … %}`, and it binds the name LAZILY
 
 User-asked: *"with {% query result %} i would like to have an optional result materialize types. fluid: true,
-materialize: 'view' or 'table' where both are temp"*, then *"materialize: null would be default"*. C#-only in
-the plugin — no ABI, no C++. Gate `verify_plugin_fluid` 716 → **729**, hermetic floor 8992 → **9005**.
+materialize: 'view' or 'table' where both are temp"*, then *"materialize: null would be default"* — and then,
+hours later, a second round that changed the shape (§27.6). C#-only in the plugin — no ABI, no C++. Gate
+`verify_plugin_fluid` 716 → 729 → **737**, hermetic floor 8992 → 9005 → **9013**, two mutants each killed at
+its own assertion.
 
 ```liquid
-{% query r %}                                    rows in Liquid (unchanged)
-{% query r materialize: null %}                  the same, explicitly
-{% query v materialize: 'view' %}                TEMP VIEW v, no Liquid variable
-{% query t materialize: 'table', x: 5 %}         TEMP TABLE t, $x bound
-{% query t materialize: 'table', fluid: true %}  both (the body runs twice)
+{% query r %}                             rows in Liquid (unchanged)
+{% query r materialize: null %}           the same, explicitly
+{% query v materialize: 'view' %}         TEMP VIEW v  — AND v is bound, lazily
+{% query t materialize: 'table', x: 5 %}  TEMP TABLE t — AND t is bound, lazily; $x bound
 ```
 
-`fluid` defaults to *"no materialize"*, so today's spelling is unchanged and materializing does not ALSO pull
-every row into memory — which would defeat asking for a relation. With `materialize:` and no `fluid: true`
-the identifier names a SQL object and is NOT bound as a Liquid variable, so `{{ v }}` is empty; §33 asserts
-that pairing, because it is what "the rows went to SQL instead of to Liquid" means.
+**Both access paths, one name.** With `materialize:` set the rows are left on the render's own connection as
+a TEMP object a later `{% query %}` or `{% exec %}` can read, **and** the identifier is still bound in Liquid
+— as a `LazyRowsValue`, which runs `SELECT * FROM "name"` on the pin at FIRST ACCESS and caches. A template
+that never reads the variable never pays for it, so there is nothing to opt out of and no `fluid` option.
 
-### 27.1 ⚠⚠ A TABLE can carry the block's named arguments and a VIEW cannot
+### 27.1 ⚠⚠ Why the rows stay in DuckDB — the trade this section exists to record
+
+The obvious alternative is the mirror image: pull every row into managed memory, keep the `RecordBatch`es
+alive for the render, register them back as a scannable source, and let the template reach them either way.
+It is mechanically feasible — `IHostQuery.RegisterRows` documents that *"scanning the same token twice is
+fine: each scan gets a fresh reader over the same rows"*, which a bound Arrow INPUT cannot promise — and it
+was proposed and declined. Three costs settle it:
+
+1. **It is two crossings and a full buffer to reach a place the rows already were.** `materialize:` is a
+   CTAS (or a view): nothing crosses the ABI, nothing is capped, and DuckDB spills. The Arrow round trip
+   would reintroduce the 1,000,000-row cap `query()` carries, on a path whose whole point is a relation too
+   big to want in Liquid. This is the same trade `publish()` measured and reversed — the buffered build
+   refused above 1,000,000 rows, the lazy one did 3,000,000.
+2. **The temp object would become unconditional, so the shadowing in §27.4 would too.** Today a
+   `{% query customers %}` with no `materialize:` binds a Liquid variable and touches no catalog; unconditional
+   registration would silently change what `FROM customers` means in the generated SQL for the rest of the
+   render.
+3. Retained Arrow buffers live in NATIVE memory, where `MemoryProbe`'s `heap` is blind to them (measured
+   elsewhere at `ws=471MB heap=1MB`) — so the cost would also be invisible to our own instrument.
+
+⇒ **keep the rows in DuckDB and make the LIQUID side lazy over them**, which is what shipped.
+
+⚠ One premise of the proposal was right and is worth keeping: the earlier attempt at a lazy row wrapper
+failed because the batches were disposed under it, and that failure is **LOUD** — Apache.Arrow nulls a
+disposed `RecordBatch`'s arrays, so it throws a `NullReferenceException` on the first cell read,
+deterministically and on every platform. Not the silent native use-after-free class this repo usually warns
+about. So a retained-batch design is safe to ATTEMPT; it is the cost, not the safety, that decided it.
+
+### 27.2 ⚠⚠ A VIEW is evaluated at the ACCESS, a TABLE at the BLOCK
+
+A consequence of laziness, MEASURED, and the pair that proves the read is really deferred: a
+`materialize: 'view'` over a table, an `{% exec %}` that updates the table, then the first Liquid access ⇒
+the **new** value (7 where the block saw 1). The identical template with `'table'` reads **1** — the
+snapshot the block took. That is what those two words mean in SQL, and it is the reason both are offered.
+
+⚠ The `'table'` row is a CONTROL, not a second proof: an eager bind would report 1 there too. Only the
+`'view'` row can catch an eager bind, and mutant A (bind eagerly) dies exactly on it after 721 pass.
+
+⚠ **The read is CACHED** — a second access after another `{% exec %}` still reports the first read, so a
+template sees one consistent value and pays one round trip per name per render. Mutant B (drop the cache)
+dies at that row after 725 pass.
+
+⚠ **Each gate row sets its own starting value and renders ONCE.** The first version put the `'view'` and
+`'table'` legs in one `SELECT` as two `fluid_render` calls, which does not pin an order — whether the second
+saw the first's `UPDATE` would have been DuckDB's business. It passed, and it was a flake; the shape is
+already recorded in CLAUDE.md and was walked into anyway.
+
+### 27.3 ⚠⚠ A TABLE can carry the block's named arguments and a VIEW cannot
 
 MEASURED, and it is DuckDB's rule rather than ours: a CTAS with a bound parameter works, while the same body
 as a view is refused with *"Unexpected prepared parameter. This type of statement can't be prepared!"* — a
@@ -3657,21 +3705,6 @@ tag, naming the mode and pointing at `'table'`, rather than surfacing an engine 
 ⚠ Refused whenever named args are supplied with `'view'`, not only when the body references them: the
 narrower rule would depend on the body and be unpredictable, and the fix is one word.
 
-### 27.2 ⚠ It is ergonomics over something that already shipped, and that is fine
-
-`{% exec %}CREATE TEMP TABLE t AS …{% endexec %}` then `{% query u %}… FROM t{% endquery %}` has worked since
-the pinned connection (§12). What `materialize:` adds is that the body stays a `{% query %}` body — still
-classified as a SELECT, still parameterised the same way — so choosing the destination does not mean
-rewriting the block as DDL. This is the *"query + automatic CTAS"* idea deferred on 2026-09-04, in the
-explicit form rather than the automatic one.
-
-### 27.3 ⚠⚠ A bug my own shortcut created, and the row that pins it
-
-`materialize: null` failed with DuckDB's *"excess parameters"*. `ReadQueryOptionsAsync` returned the argument
-list UNCHANGED when nothing was taken — which cannot tell an ABSENT option from one PRESENT AND NULL, and
-`null` is the documented default. The list is always rebuilt now; §33's second row is the discriminator, and
-it would pass on a build with no options support at all if the first row were not beside it.
-
 ### 27.4 ⚠⚠ The shadowing hazard, settled
 
 CLAUDE.md flagged it when the CTAS idea was deferred: *"`t` becomes a TEMP TABLE name and a temp table
@@ -3680,14 +3713,49 @@ MEASURED both halves: a materialized `mat_shadowed` DOES shadow a catalog table 
 the render (99 over a table holding 1), and the catalog table is UNTOUCHED afterwards, because the temp
 object dies with the render's connection.
 
-⇒ accepted, because the name is the author's own identifier rather than something generated, and the blast
-radius ends with the render. Asserted rather than described, with the "untouched" row as what makes it
-acceptable.
+⇒ accepted, because the name is the author's own identifier rather than something generated, the blast radius
+ends with the render, and — the half that matters after §27.1 — it happens **only when the author asks for it
+with `materialize:`**. Asserted rather than described, with the "untouched" row as what makes it acceptable.
 
-### 27.5 Reserved names, and what stays true
+### 27.5 ⚠⚠ A bug my own shortcut created, and the row that pins it
 
-`materialize` and `fluid` join `{% print %}`'s `delim`/`rowdelim` as argument names a statement cannot use
-for a parameter. Accepted for the same reason: it fails LOUDLY, with DuckDB naming the parameter it was not
-given. ⚠ The option is EVALUATED rather than matched on source text, so `materialize: params.mode` works. ⚠
-And the body is still classified as a SELECT — `materialize:` is a destination for rows, never a way to
-smuggle a write past the rule.
+`materialize: null` failed with DuckDB's *"excess parameters"*. `ReadQueryOptionsAsync` returned the argument
+list UNCHANGED when nothing was taken — which cannot tell an ABSENT option from one PRESENT AND NULL, and
+`null` is the documented default. The list is always rebuilt now; §33's second row is the discriminator, and
+it would pass on a build with no options support at all if the first row were not beside it.
+
+### 27.6 ⚠⚠ `fluid:` IS GONE — the option the lazy bind made vestigial
+
+The first build shipped hours earlier with a second option. `fluid` defaulted to *"no materialize"*, so with
+`materialize:` set the identifier named a SQL object and was **not** bound in Liquid (`{{ v }}` rendered
+empty); `fluid: true` asked for both and **ran the body TWICE**. It is removed, BREAKING, with no alias.
+
+Once binding is lazy there is nothing left to opt out of: an unread variable costs zero, and the body runs
+ONCE in every spelling. ⚠ `fluid` is no longer a reserved name, so it falls through to the bound parameters
+and fails LOUDLY — *"excess parameters: 1"* on a statement that references no `$fluid`. §33 pins that, so the
+removal announces itself rather than being silently ignored, and the comment there records why the message
+names the parameter positionally rather than by name (the host binds by NAME only when the batch's names
+match the statement's own named parameters, and a body with none falls back to positional).
+
+⚠ **§33's row asserting the OPPOSITE was REPLACED, not deleted** — it pinned *"materializing means the rows
+went to SQL instead of to Liquid"*, which was true of the first build and is precisely the assumption this
+change lifts. Falsifying it is the change announcing itself; the replacement asserts both paths under one
+name, and a note at the site says so.
+
+### 27.7 ⚠ It is ergonomics over something that already shipped, and that is fine
+
+`{% exec %}CREATE TEMP TABLE t AS …{% endexec %}` then `{% query u %}… FROM t{% endquery %}` has worked since
+the pinned connection (§12). What `materialize:` adds is that the body stays a `{% query %}` body — still
+classified as a SELECT, still parameterised the same way — so choosing the destination does not mean
+rewriting the block as DDL, and after §27.6 it does not mean choosing between SQL and Liquid either. This is
+the *"query + automatic CTAS"* idea deferred on 2026-09-04, in the explicit form rather than the automatic one.
+
+### 27.8 Reserved names, and what stays true
+
+`materialize` is now the ONE reserved argument name, joining `{% print %}`'s `delim`/`rowdelim` as something
+a statement cannot use for a parameter. Accepted for the same reason: it fails LOUDLY, with DuckDB naming the
+parameter it was not given. ⚠ The option is EVALUATED rather than matched on source text, so
+`materialize: params.mode` works. ⚠ And the body is still classified as a SELECT — `materialize:` is a
+destination for rows, never a way to smuggle a write past the rule. ⚠ The lazy read itself is NOT classified
+and does not need to be: it is `SELECT * FROM` a quoted identifier, composed by `ReadMaterialized`, with no
+template text in it.

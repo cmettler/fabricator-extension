@@ -3756,12 +3756,13 @@ statement ok
 DROP TABLE sch_src;
 
 # ============================================================================================
-# §33 — {% query name materialize: … %}: leave the result on the connection as a TEMP VIEW or TEMP TABLE
-#       instead of pulling the rows into Liquid.
+# §33 — {% query name materialize: 'view'|'table' %}: leave the result on the connection as a TEMP VIEW or
+#       TEMP TABLE **and** bind the identifier LAZILY — so both access paths work under one name, and the
+#       rows only cross into Liquid if the template actually reads them.
 #
-# ⚠ `materialize` and `fluid` are RESERVED ARGUMENT NAMES — taken out before the rest become bound
-# parameters, so a statement wanting a parameter called either cannot have one. The same trade {% print %}'s
-# delim/rowdelim already make, and it fails loudly (DuckDB names the parameter it was not given).
+# ⚠ `materialize` is the ONE RESERVED ARGUMENT NAME — taken out before the rest become bound parameters, so
+# a statement wanting a parameter called that cannot have one. The same trade {% print %}'s delim/rowdelim
+# already make, and it fails loudly (DuckDB names the parameter it was not given).
 # ============================================================================================
 
 # --- today's spelling is unchanged, and `materialize: null` IS today's spelling. ⚠ The second is the
@@ -3773,15 +3774,71 @@ SELECT fluid_render('{% query r %}SELECT 1 AS a{% endquery %}a={{ r[0].a }}', NU
 ----
 a=1	a=2
 
-# --- ⚠ view: a SQL OBJECT on the render's own connection, readable by a later block — and the name is NOT
-# bound as a Liquid variable, so `{{ v }}` is empty. That pairing is the assertion: materializing means the
-# rows went to SQL instead of to Liquid, not as well as. ---
+# --- ⚠⚠ BOTH PATHS, ONE NAME: the rows are a SQL object a later block can read AND the identifier is bound
+# in Liquid. ⚠ This row REPLACES one that asserted the opposite (`{{ v }}` empty, "materializing means the
+# rows went to SQL instead of to Liquid"). That was true of the first build and is the assumption this
+# change lifts — the bind is LAZY, so binding it costs nothing until something reads it. ---
 query I
 SELECT fluid_render(
-  '{% query v materialize: "view" %}SELECT 3 AS a{% endquery %}{% query u %}SELECT a FROM v{% endquery %}a={{ u[0].a }} v=[{{ v }}]',
+  '{% query v materialize: "view" %}SELECT 3 AS a{% endquery %}{% query u %}SELECT a FROM v{% endquery %}sql={{ u[0].a }} fluid={{ v[0].a }}',
   NULL);
 ----
-a=3 v=[]
+sql=3 fluid=3
+
+# --- the lazy value is a REAL row set, not a rendering of one: it indexes, sizes, iterates and does
+# ARITHMETIC. ⚠ The arithmetic is the load-bearing half — §7 measured that a broken value model renders
+# correctly while computing wrong, so a render-only assertion cannot tell the two apart. ---
+query I
+SELECT fluid_render(
+  '{% query t materialize: "table" %}SELECT * FROM (VALUES (1),(2),(3)) v(a){% endquery %}size={{ t.size }} plus={{ t[0].a | plus: 10 }} sum={% assign s = 0 %}{% for r in t %}{% assign s = s | plus: r.a %}{% endfor %}{{ s }}',
+  NULL);
+----
+size=3 plus=11 sum=6
+
+# --- ⚠⚠ THE READ REALLY IS DEFERRED, and this is the row that proves it: a VIEW over a table, an
+# {% exec %} that changes the table, THEN the first Liquid access ⇒ the NEW value. An eager bind would have
+# captured 1 at the block.
+# ⚠ EACH ROW SETS ITS OWN STARTING VALUE AND RENDERS ONCE. Two fluid_render calls in one SELECT would not
+# pin an order, so whether the second saw the first's UPDATE would be DuckDB's business — the flake shape
+# this suite already records elsewhere. ---
+statement ok
+CREATE TABLE mat_lazy AS SELECT 1 AS a;
+
+query I
+SELECT fluid_render(
+  '{% query v materialize: "view" %}SELECT a FROM mat_lazy{% endquery %}{% assign _ = exec("UPDATE mat_lazy SET a = 7") %}{{ v[0].a }}',
+  NULL);
+----
+7
+
+statement ok
+UPDATE mat_lazy SET a = 1;
+
+# --- ⚠ THE SEMANTIC PAIR, and it is a CONTROL rather than a second proof of laziness: a TABLE is the
+# snapshot the block took, so the identical template reads 1 where the view read 7. No mutant of ours can
+# kill it — an eager bind would report 1 here too — but it is what makes 'view' and 'table' mean the two
+# different things SQL says they mean. ---
+query I
+SELECT fluid_render(
+  '{% query t materialize: "table" %}SELECT a FROM mat_lazy{% endquery %}{% assign _ = exec("UPDATE mat_lazy SET a = 9") %}{{ t[0].a }}',
+  NULL);
+----
+1
+
+statement ok
+UPDATE mat_lazy SET a = 5;
+
+# --- ⚠ THE READ IS CACHED: a second access after another {% exec %} still reports the FIRST read. One round
+# trip per name per render, and a value that does not change under the template's feet. ---
+query I
+SELECT fluid_render(
+  '{% query v materialize: "view" %}SELECT a FROM mat_lazy{% endquery %}{% assign x = v[0].a %}{% assign _ = exec("UPDATE mat_lazy SET a = 42") %}first={{ x }} again={{ v[0].a }}',
+  NULL);
+----
+first=5 again=5
+
+statement ok
+DROP TABLE mat_lazy;
 
 # --- ⚠⚠ A TABLE CAN CARRY THE BLOCK'S NAMED ARGUMENTS AND A VIEW CANNOT, which is DuckDB's rule and not
 # ours: a view STORES its body, so a bound parameter has no meaning at scan time. The refusal names the mode
@@ -3798,13 +3855,18 @@ SELECT fluid_render('{% query v materialize: "view", x: 1 %}SELECT $x AS a{% end
 ----
 <REGEX>:.*cannot take named parameters with materialize: 'view'.*
 
-# --- `fluid: true` alongside materialize asks for BOTH, and runs the body twice. ---
-query I
-SELECT fluid_render(
-  '{% query t materialize: "table", fluid: true %}SELECT 6 AS a{% endquery %}{% query u %}SELECT a FROM t{% endquery %}sql={{ u[0].a }} fluid={{ t[0].a }}',
-  NULL);
+# --- ⚠⚠ `fluid:` IS GONE, BREAKING AND WITH NO ALIAS — the lazy bind made it vestigial (there is nothing
+# left to opt out of when binding is free). It is no longer a reserved name, so it falls through to the
+# bound parameters and fails LOUDLY on a statement that does not reference it. Pinned so the removal
+# announces itself instead of being silently ignored.
+# ⚠ The message names the parameter POSITIONALLY ("excess parameters: 1"), not as `fluid`: the host binds
+# by NAME only when the batch's names match the statement's own named parameters, and `SELECT 6 AS a` has
+# none — so it falls back to positional. That is the ordinary fate of any misspelled parameter here, not
+# something special about this name. ---
+statement error
+SELECT fluid_render('{% query t materialize: "table", fluid: true %}SELECT 6 AS a{% endquery %}', NULL);
 ----
-sql=6 fluid=6
+<REGEX>:.*excess parameters.*
 
 # --- the option is EVALUATED, not matched on source text, so it can come from the params bag. ---
 query I
