@@ -2758,11 +2758,26 @@ SELECT * FROM {{ publish(''bb6'') }}
 # collector had never been declared in tree, and the args marshal resolved the SQLNULL sentinel on the
 # POSITIONAL path only — so `params` was unusable in BOTH directions before this (supplied, it failed to
 # cast to "NULL"; omitted, it carried an untyped NULL that Apache.Arrow refuses). ---
-query IIII
-SELECT function_name, parameters, parameter_types, coalesce(varargs, '')
+#
+# ⚠⚠ THE NAMED TAIL IS ASSERTED SORTED, AND THAT IS NOT TIDINESS — IT IS A PLATFORM BUG THIS ROW HAD.
+# `duckdb_functions().parameters` lists the POSITIONAL arguments first (a vector, ordered) and then the
+# NAMED ones by walking `TableFunction::named_parameters`, which is a `case_insensitive_map_t`, i.e. an
+# `unordered_map` — so their order is the C++ standard library's, not DuckDB's. MEASURED: Windows reports
+# `params, batchsize` and BOTH Linux and macOS report `batchsize, params`, so a row pinning either spelling
+# is red on two of three platforms. `fluid_query_batch` is the only function in this tree with TWO named
+# parameters, which is why nothing else ever showed it.
+# ⚠ The PAIRING is still exact: GetParameters and GetParameterTypes walk the SAME map, so name and type
+# stay together whatever the order — which is what lets this assert `name TYPE` pairs rather than two lists
+# that would have to be re-associated. The POSITIONAL prefix keeps its order, because that one IS
+# deterministic and a swap there would be a real bug.
+query IIIII
+SELECT function_name, parameters[1:2], parameter_types[1:2],
+       list_sort([parameters[i] || ' ' || parameter_types[i]
+                  for i in range(3, len(parameters) + 1)]),
+       coalesce(varargs, '')
 FROM duckdb_functions() WHERE function_name = 'fluid_query_batch';
 ----
-fluid_query_batch	[col0, col1, params, batchsize]	[VARCHAR, TABLE, ANY, BIGINT]	(empty)
+fluid_query_batch	[col0, col1]	[VARCHAR, TABLE]	[batchsize BIGINT, params ANY]	(empty)
 
 # --- THE DEFAULT: no batchsize => ONE render over the WHOLE input. ---
 query II

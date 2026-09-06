@@ -444,6 +444,10 @@ case "$TIER" in
         # in that section is load-bearing and a mutant proved it: an earlier `USE memory.hq_s` leaves a
         # qualified entry, against which the bug does not fire, so the section PASSED with it fully present.
         # 8250 + 9 = 8259 exactly, from a green run.
+        # 9035 since 2026-09-06 (same day, seventh bump): verify_plugin_fluid 758 -> 759 -- the
+        #   fluid_query_batch signature row asserted its NAMED parameters in a fixed order, which is an
+        #   unordered_map's iteration order, so it was RED on linux_amd64 and osx_arm64 while green on
+        #   windows. The named tail is asserted SORTED now; +1 is the extra column, not a new answer.
         # 9034 since 2026-09-06 (same day, sixth bump): verify_plugin_fluid 737 -> 758 -- `input_table` is
         #   a lazy Fluid value too, on BOTH surfaces (collector groups and lateral chunks), so a template
         #   reaches its input as SQL or as Liquid under one name with no copy. The load-bearing property is
@@ -595,7 +599,7 @@ case "$TIER" in
         # two functions have exactly ONE registration each, plus the HostsCatalog refusal and its
         # unknown-provider control. 3105 + 238 + 8259 - 3339 arithmetic aside, both numbers come from green
         # runs.
-        : "${MIN_ASSERTIONS:=9034}"
+        : "${MIN_ASSERTIONS:=9035}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh
