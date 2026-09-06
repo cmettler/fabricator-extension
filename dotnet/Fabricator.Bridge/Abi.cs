@@ -301,8 +301,11 @@ public unsafe struct FabricatorVTable
     //                    ArrowSchema* input_schema, ArrowArrayStream* out_schema, void** out_binding, char** err)
     public delegate* unmanaged[Cdecl]<nint, byte*, byte*, CArrowArrayStream*, CArrowSchema*, CArrowArrayStream*, nint*, byte**, int> LateralBind;
 
-    // int32 lateral_open(void* binding, void** out_session, char** err)
-    public delegate* unmanaged[Cdecl]<nint, nint*, byte**, int> LateralOpen;
+    // int32 lateral_open(void* binding, const int32_t* projected, int32_t projected_count,
+    //                    void** out_session, char** err)
+    // `projected` = the indices into the binding's declared output schema the caller reads, in output order;
+    // NULL/0 means all of them. A HINT: honour it and save the work, or ignore it and return everything.
+    public delegate* unmanaged[Cdecl]<nint, int*, int, nint*, byte**, int> LateralOpen;
 
     // int32 lateral_call(void* session, ArrowArray* input, ArrowArrayStream* out, char** err)
     public delegate* unmanaged[Cdecl]<nint, CArrowArray*, CArrowArrayStream*, byte**, int> LateralCall;

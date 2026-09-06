@@ -13,12 +13,21 @@
 // over N input rows must answer that question per output row, or 1->N and 1->0 are inexpressible and the
 // correlated columns cannot be stamped at all.
 //
-// DELIBERATELY NOT ADVERTISED: projection pushdown. With `projection_pushdown` false DuckDB's
-// remove-unused-columns pass leaves the get's column list alone, so the callee's batch positions always match
-// the bind-time output schema. Advertising it would narrow the get and require the callee-original column
-// indices to be captured at rewrite time and threaded through as the wire projection — where an off-by-one
-// reads a callee column into a correlated column's slot: wrong data, no error. DuckDB projects above the
-// operator instead, which costs a projection and cannot be wrong.
+// PROJECTION PUSHDOWN IS ADVERTISED (ABI v86). This note used to say it never would be, and the reason it
+// gave was right about the hazard and wrong about the price: "an off-by-one reads a callee column into a
+// correlated column's slot: wrong data, no error". That hazard is real and it is exactly what the wire map
+// exists to contain — it is built ONCE per call, beside the type check that validates it, in
+// LateralSession::Call, rather than being recomputed at each emit site.
+//
+// What made it worth taking: DuckDB narrows the get BEFORE optimizer extensions run (UNUSED_COLUMNS at
+// optimizer.cpp:222, extensions at :331), so the rewrite already sees the projection and no new plan pass is
+// needed; and the callee learns it through lateral_open, which is the only crossing in the window between
+// bind and execution. For a callee that GENERATES SQL the win is not the crossing but the inner statement:
+// MEASURED, DuckDB prunes an unreferenced expression inside a subquery, so a narrowed wrapper makes the
+// generated query stop computing what nobody reads.
+//
+// ⚠ It is a HINT rather than a demand: a callee may return its full declared schema and the host drops the
+// rest. That is what lets it be added without touching a single existing lateral function.
 //===----------------------------------------------------------------------===//
 
 #include "catalog/fabricator_lateral.hpp"
@@ -105,8 +114,11 @@ struct LateralBindData : public TableFunctionData {
 // path in the OperatorState. lateral_open permits several open at once precisely so that holds.
 //===----------------------------------------------------------------------===//
 struct LateralSession {
-	LateralSession(FabricatorHandle binding, const LateralBindData &bind) : bind_(bind) {
-		handle_ = fabricator::LateralOpen(binding);
+	//! `projected` = the indices into bind.output_types the caller reads, in output order. EMPTY = all of
+	//! them, which is both "no projection pushdown happened" and "the caller reads everything".
+	LateralSession(FabricatorHandle binding, const LateralBindData &bind, vector<int32_t> projected)
+	    : bind_(bind), projected_(std::move(projected)) {
+		handle_ = fabricator::LateralOpen(binding, projected_);
 	}
 	~LateralSession() {
 		reader_.reset(); // release the in-flight result stream BEFORE the session that produced it
@@ -155,23 +167,62 @@ struct LateralSession {
 		// the bind advertised and the schema this batch carries agree. A silent disagreement is a vector of
 		// one type read as another — the read-past-the-end class, not merely a wrong answer.
 		auto &types = reader_->Types();
-		if (types.size() != bind_.output_types.size() + 1) {
-			throw IOException("Fabricator: lateral function '%s' returned %llu wire columns, expected %llu (its "
-			                  "output columns plus one trailing INTEGER provenance column)",
-			                  bind_.func, (uint64_t)types.size(), (uint64_t)(bind_.output_types.size() + 1));
+		idx_t want = OutputCount();
+		idx_t full = bind_.output_types.size();
+		// ⚠⚠ TWO LEGAL SHAPES, DISCRIMINATED BY COUNT, and that is what makes the projection hint safe to
+		// add without touching a callee that knows nothing about it: one that HONOURED it returns exactly the
+		// projected columns, one that IGNORED it returns its full declared schema, and both are then
+		// validated by TYPE below. Neither can be silently read as the other.
+		bool narrowed;
+		if (types.size() == want + 1) {
+			narrowed = true;
+		} else if (types.size() == full + 1) {
+			narrowed = false;
+		} else {
+			throw IOException("Fabricator: lateral function '%s' returned %llu wire columns, expected %llu (the "
+			                  "%llu projected output columns) or %llu (all %llu of them), each plus one "
+			                  "trailing INTEGER provenance column",
+			                  bind_.func, (uint64_t)types.size(), (uint64_t)(want + 1), (uint64_t)want,
+			                  (uint64_t)(full + 1), (uint64_t)full);
 		}
-		for (idx_t c = 0; c < bind_.output_types.size(); c++) {
-			if (types[c] != bind_.output_types[c]) {
+		// ⚠⚠ THE MAP IS THE WHOLE HAZARD THIS FEATURE ADDS. `wire_map_[k]` says which WIRE column carries
+		// OUTPUT column k, and an off-by-one here reads a callee column into a correlated column's slot:
+		// same type quite possibly, wrong data, no error. It is built ONCE per call, beside the type check
+		// that validates it, so the two cannot drift.
+		wire_map_.clear();
+		for (idx_t k = 0; k < want; k++) {
+			idx_t declared = projected_.empty() ? k : (idx_t)projected_[k];
+			idx_t wire_col = narrowed ? k : declared;
+			wire_map_.push_back(wire_col);
+			if (types[wire_col] != bind_.output_types[declared]) {
 				throw IOException("Fabricator: lateral function '%s' column %llu came back as %s but was bound "
 				                  "as %s",
-				                  bind_.func, (uint64_t)c, types[c].ToString(), bind_.output_types[c].ToString());
+				                  bind_.func, (uint64_t)declared, types[wire_col].ToString(),
+				                  bind_.output_types[declared].ToString());
 			}
 		}
 		if (types.back() != LogicalType::INTEGER) {
 			throw IOException("Fabricator: lateral function '%s' provenance column is %s, expected INTEGER",
 			                  bind_.func, types.back().ToString());
 		}
+		origin_index_ = types.size() - 1;
 		Advance();
+	}
+
+	//! How many columns this session emits: the projection's width, or the full declared width.
+	idx_t OutputCount() const {
+		return projected_.empty() ? bind_.output_types.size() : projected_.size();
+	}
+
+	//! Per OUTPUT column, the WIRE column carrying it. Valid after the current call's wire check.
+	const vector<idx_t> &WireMap() const {
+		return wire_map_;
+	}
+
+	//! Where the trailing provenance column sits in the wire — NOT OutputCount() when the callee ignored
+	//! the projection hint and returned its full schema.
+	idx_t OriginIndex() const {
+		return origin_index_;
 	}
 
 	//! True while the current call still has rows to hand out.
@@ -209,6 +260,9 @@ private:
 	}
 
 	const LateralBindData &bind_;
+	vector<int32_t> projected_;
+	vector<idx_t> wire_map_;
+	idx_t origin_index_ = 0;
 	FabricatorHandle handle_ = nullptr;
 	unique_ptr<fabricator::ArrowStreamReader> reader_;
 };
@@ -251,9 +305,9 @@ void ReadOriginColumn(const string &func, DataChunk &wire, idx_t base_idx, idx_t
 //! AFTER them. Write ONLY [0, base_idx) and never Reset() the output: on the row-by-row path DuckDB has
 //! already installed the correlated columns as constant vectors by the time we are called, and a reset would
 //! clear them.
-void EmitCalleeColumns(DataChunk &wire, DataChunk &output, idx_t base_idx) {
-	for (idx_t c = 0; c < base_idx; c++) {
-		output.data[c].Reference(wire.data[c]);
+void EmitCalleeColumns(DataChunk &wire, DataChunk &output, const vector<idx_t> &wire_map) {
+	for (idx_t c = 0; c < wire_map.size(); c++) {
+		output.data[c].Reference(wire.data[wire_map[c]]);
 	}
 	output.SetCardinality(wire.size());
 }
@@ -505,18 +559,53 @@ struct LateralLocalState : public LocalTableFunctionState {
 	//! Source shape: the one call's rows are exhausted, so the next invocation must emit 0 rows — which is how
 	//! PhysicalTableScan learns the scan is over (it keys on chunk.size(), not on our return value).
 	bool done = false;
+	//! The projection DuckDB narrowed this get to, in output order. EMPTY = every column.
+	vector<int32_t> projected;
 };
 
-unique_ptr<LocalTableFunctionState> LateralInitLocal(ExecutionContext &, TableFunctionInitInput &,
+//! Read the projection off the init input. This is the ROW-BY-ROW path's only channel for it: the batched
+//! rewrite reads the same thing off the LogicalGet instead, because it never reaches an init.
+vector<int32_t> LateralProjectionOf(const vector<column_t> &column_ids, idx_t output_count) {
+	vector<int32_t> projected;
+	if (column_ids.size() == output_count) {
+		// Either nothing was narrowed, or every column survived — the same thing to us, and leaving it empty
+		// keeps the no-projection path byte-identical to what it was before pushdown was advertised.
+		bool identity = true;
+		for (idx_t i = 0; i < column_ids.size() && identity; i++) {
+			identity = column_ids[i] == i;
+		}
+		if (identity) {
+			return projected;
+		}
+	}
+	for (auto id : column_ids) {
+		if (id >= output_count) {
+			// A virtual column (rowid, or the EMPTY sentinel) — we declare none, so this is unreachable
+			// today. Falling back to "no projection" is the safe direction: the callee produces everything.
+			return vector<int32_t>();
+		}
+		projected.push_back((int32_t)id);
+	}
+	return projected;
+}
+
+unique_ptr<LocalTableFunctionState> LateralInitLocal(ExecutionContext &, TableFunctionInitInput &input,
                                                     GlobalTableFunctionState *) {
-	return make_uniq<LateralLocalState>();
+	auto state = make_uniq<LateralLocalState>();
+	if (input.bind_data) {
+		auto &bind = input.bind_data->Cast<LateralBindData>();
+		state->projected = LateralProjectionOf(input.column_ids, bind.output_types.size());
+	}
+	return state;
 }
 
 OperatorResultType LateralInOutFunction(ExecutionContext &context, TableFunctionInput &data, DataChunk &input,
                                         DataChunk &output) {
 	auto &bind = data.bind_data->Cast<LateralBindData>();
 	auto &l = data.local_state->Cast<LateralLocalState>();
-	idx_t base_idx = bind.output_types.size();
+	// The callee's column count AS THIS PLAN READS IT — the projection's width when DuckDB narrowed the get,
+	// which is also where the correlated passthrough columns begin in the output chunk.
+	idx_t base_idx = l.projected.empty() ? bind.output_types.size() : l.projected.size();
 	// Every ambient this crossing needs must be read HERE, in the crossing that sets them: the callee may
 	// open a provider connection or reach the host filesystem on its first call.
 	FabricatorSetActiveTxn(bind.handle, context.client);
@@ -528,7 +617,7 @@ OperatorResultType LateralInOutFunction(ExecutionContext &context, TableFunction
 			return OperatorResultType::NEED_MORE_INPUT;
 		}
 		if (!l.session) {
-			l.session = make_uniq<LateralSession>(bind.holder->binding, bind);
+			l.session = make_uniq<LateralSession>(bind.holder->binding, bind, l.projected);
 		}
 		if (!l.called) {
 			l.session->Call(context.client, input);
@@ -540,8 +629,8 @@ OperatorResultType LateralInOutFunction(ExecutionContext &context, TableFunction
 			return OperatorResultType::NEED_MORE_INPUT;
 		}
 		auto wire = l.session->DrainOwned(context.client);
-		ReadOriginColumn(bind.func, *wire, base_idx, input.size(), nullptr);
-		EmitCalleeColumns(*wire, output, base_idx);
+		ReadOriginColumn(bind.func, *wire, l.session->OriginIndex(), input.size(), nullptr);
+		EmitCalleeColumns(*wire, output, l.session->WireMap());
 		if (!l.session->HasRows()) {
 			l.done = true; // the next invocation emits 0 rows, which ends the scan
 		}
@@ -556,7 +645,7 @@ OperatorResultType LateralInOutFunction(ExecutionContext &context, TableFunction
 			return OperatorResultType::NEED_MORE_INPUT;
 		}
 		if (!l.session) {
-			l.session = make_uniq<LateralSession>(bind.holder->binding, bind);
+			l.session = make_uniq<LateralSession>(bind.holder->binding, bind, l.projected);
 		}
 		l.session->Call(context.client, input);
 		l.called = true;
@@ -569,8 +658,8 @@ OperatorResultType LateralInOutFunction(ExecutionContext &context, TableFunction
 		return OperatorResultType::NEED_MORE_INPUT;
 	}
 	auto wire = l.session->DrainOwned(context.client);
-	ReadOriginColumn(bind.func, *wire, base_idx, input.size(), nullptr);
-	EmitCalleeColumns(*wire, output, base_idx);
+	ReadOriginColumn(bind.func, *wire, l.session->OriginIndex(), input.size(), nullptr);
+	EmitCalleeColumns(*wire, output, l.session->WireMap());
 	if (l.session->HasRows()) {
 		return OperatorResultType::HAVE_MORE_OUTPUT;
 	}
@@ -597,15 +686,20 @@ public:
 class LateralBatchedPhysical : public PhysicalOperator {
 public:
 	LateralBatchedPhysical(PhysicalPlan &physical_plan, vector<LogicalType> types, idx_t estimated_cardinality,
-	                       unique_ptr<FunctionData> bind_data_p, vector<column_t> projected_input_p, idx_t base_idx_p)
+	                       unique_ptr<FunctionData> bind_data_p, vector<column_t> projected_input_p, idx_t base_idx_p,
+	                       vector<int32_t> projected_p)
 	    : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, std::move(types), estimated_cardinality),
-	      bind_data(std::move(bind_data_p)), projected_input(std::move(projected_input_p)), base_idx(base_idx_p) {
+	      bind_data(std::move(bind_data_p)), projected_input(std::move(projected_input_p)), base_idx(base_idx_p),
+	      projected(std::move(projected_p)) {
 	}
 
 	unique_ptr<FunctionData> bind_data;
 	vector<column_t> projected_input;
-	//! Where the correlated passthrough columns begin in the OUTPUT chunk == the callee's column count.
+	//! Where the correlated passthrough columns begin in the OUTPUT chunk == the callee's column count AS
+	//! THIS PLAN READS IT, i.e. the projection's width when DuckDB narrowed the get.
 	idx_t base_idx;
+	//! The indices, into the binding's declared output schema, this plan actually reads. EMPTY = all.
+	vector<int32_t> projected;
 
 	string GetName() const override {
 		return "FABRICATOR_LATERAL_BATCHED";
@@ -635,9 +729,13 @@ public:
 		auto wire = s.session->DrainOwned(context);
 		idx_t rows = wire->size();
 		SelectionVector sel(rows);
-		ReadOriginColumn(bind.func, *wire, base_idx, input.size(), &sel);
-		for (idx_t c = 0; c < base_idx; c++) {
-			chunk.data[c].Reference(wire->data[c]);
+		ReadOriginColumn(bind.func, *wire, s.session->OriginIndex(), input.size(), &sel);
+		// ⚠ Through the session's WIRE MAP, never by position: when the callee ignored the projection hint
+		// the wire is WIDER than this chunk, and referencing wire column c into output slot c would land a
+		// callee column in a correlated column's slot.
+		auto &wire_map = s.session->WireMap();
+		for (idx_t c = 0; c < wire_map.size(); c++) {
+			chunk.data[c].Reference(wire->data[wire_map[c]]);
 		}
 		// A gather, not a copy loop: the selection replicates a source row for fan-out AND severs the emitted
 		// chunk's dependency on the input chunk's buffers, which the child owns and will recycle.
@@ -672,7 +770,7 @@ public:
 		}
 		// (C) A fresh input chunk: ONE batched call, which is the whole point of this operator.
 		if (!s.session) {
-			s.session = make_uniq<LateralSession>(bind.holder->binding, bind);
+			s.session = make_uniq<LateralSession>(bind.holder->binding, bind, projected);
 		}
 		s.session->Call(context.client, input);
 		s.input_size_at_call = input.size();
@@ -694,6 +792,8 @@ struct LateralBatchedLogical : public LogicalExtensionOperator {
 	vector<LogicalType> callee_types;
 	vector<ColumnBinding> callee_bindings;
 	unique_ptr<FunctionData> bind_data;
+	//! The indices, into the binding's declared output schema, this plan reads. EMPTY = all of them.
+	vector<int32_t> projected;
 
 	vector<idx_t> GetTableIndex() const override {
 		return vector<idx_t> {table_index};
@@ -735,7 +835,7 @@ struct LateralBatchedLogical : public LogicalExtensionOperator {
 		}
 		auto &child_plan = planner.CreatePlan(*children[0]);
 		auto &op = planner.Make<LateralBatchedPhysical>(types, EstimateCardinality(context), std::move(bind_data),
-		                                               projected_input, callee_types.size());
+		                                               projected_input, callee_types.size(), projected);
 		op.children.push_back(child_plan);
 		return op;
 	}
@@ -777,7 +877,10 @@ bool LateralIsEligible(LogicalGet &get) {
 			return false;
 		}
 	}
-	if (get.types.size() != bind.output_types.size() + get.projected_input.size()) {
+	// ⚠ The CALLEE half of `get.types` is the NARROWED column list, not the binding's full output schema:
+	// DuckDB's UNUSED_COLUMNS pass runs at optimizer.cpp:222, well before optimizer extensions at :331, so
+	// by the time this sees the get the projection has already been applied.
+	if (get.types.size() != get.GetColumnIds().size() + get.projected_input.size()) {
 		return false;
 	}
 	return true;
@@ -797,9 +900,17 @@ void RewriteLateralNodes(unique_ptr<LogicalOperator> &op) {
 		return;
 	}
 	auto &bind = get.bind_data->Cast<LateralBindData>();
-	idx_t base = bind.output_types.size();
+	// The narrowed callee width, and the selection that produced it. `base` is what it always was — where
+	// the correlated columns begin — it is just no longer the binding's full output width.
+	vector<column_t> raw_ids;
+	for (auto &ci : get.GetColumnIds()) {
+		raw_ids.push_back(ci.GetPrimaryIndex());
+	}
+	auto projected = LateralProjectionOf(raw_ids, bind.output_types.size());
+	idx_t base = raw_ids.size();
 
 	auto node = make_uniq<LateralBatchedLogical>();
+	node->projected = std::move(projected);
 	node->table_index = get.table_index;
 	// Built directly rather than sliced out of get.GetColumnBindings(): with projection_ids empty (asserted in
 	// the eligibility check) LogicalGet produces exactly (table_index, i), and constructing them here avoids
@@ -835,6 +946,9 @@ TableFunction FabricatorMakeLateralFunction(FabricatorHandle handle, const strin
                                            vector<LogicalType> arg_types, vector<FabricatorParamStyle> arg_styles) {
 	TableFunction tf(func_name, {}, nullptr, LateralBind, nullptr, LateralInitLocal);
 	tf.in_out_function = LateralInOutFunction;
+	// ⚠ See the header note: this narrows the get, and the wire map in LateralSession::Call is what keeps a
+	// narrowed get from landing a callee column in a correlated column's slot.
+	tf.projection_pushdown = true;
 	auto info = make_shared_ptr<LateralFunctionInfo>();
 	// POSITIONAL parameters become real ARGUMENT TYPES — that is what makes `f(i.a)` bind at all, and what
 	// lets overloads work (the TABLE-parameter overload restriction does not apply). NAMED ones become DuckDB

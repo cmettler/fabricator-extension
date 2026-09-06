@@ -3260,14 +3260,38 @@ SELECT f.v FROM lat_t t, fluid_query_lateral(
 1
 3
 
-# --- ⚠ and a chunk that produces a DIFFERENT shape is refused rather than read as data: the template
-# renders anew per chunk and may legitimately render different SQL, so this is reachable from an ordinary
-# template, not defensive. ---
-statement error
-SELECT f.* FROM lat_t t, fluid_query_lateral(
+# --- ⚠⚠ A CHUNK THAT PRODUCES A DIFFERENT SHAPE, all four ways. The template renders anew per chunk and may
+# legitimately render different SQL, so this is reachable from an ordinary template, not defensive.
+# ⚠ THE FIRST ROW CHANGED WITH PROJECTION PUSHDOWN (§30) AND IS A RELAXATION: the wrapper now names the
+# declared columns instead of `* EXCLUDE`, so an EXTRA column is DROPPED where it used to be refused. That
+# is harmless by construction — a column absent from the declared schema is one nobody can read — and the
+# hazard the old check existed for is now structurally impossible rather than merely caught: selecting BY
+# NAME means the batch reaching the host always has exactly the declared columns in the declared order, so
+# a reordering cannot be read as data either. The three rows that matter are all still refused, two of them
+# by DuckDB's own binder naming the column. ---
+query I
+SELECT DISTINCT f.a FROM lat_t t, fluid_query_lateral(
   'SELECT __fab_row{% if is_bind %}, 1 AS a{% else %}, 1 AS a, 2 AS b{% endif %} FROM input_table', 'null', t.n) f;
 ----
-<REGEX>:.*columns where 1 were declared.*
+1
+
+statement error
+SELECT f.* FROM lat_t t, fluid_query_lateral(
+  'SELECT __fab_row{% if is_bind %}, 1 AS a, 2 AS b{% else %}, 1 AS a{% endif %} FROM input_table', 'null', t.n) f;
+----
+<REGEX>:.*Referenced column .*b.* not found.*
+
+statement error
+SELECT f.* FROM lat_t t, fluid_query_lateral(
+  'SELECT __fab_row{% if is_bind %}, 1 AS a{% else %}, 1 AS zz{% endif %} FROM input_table', 'null', t.n) f;
+----
+<REGEX>:.*Referenced column .*a.* not found.*
+
+statement error
+SELECT f.* FROM lat_t t, fluid_query_lateral(
+  'SELECT __fab_row{% if is_bind %}, 1 AS a{% else %}, ''x'' AS a{% endif %} FROM input_table', 'null', t.n) f;
+----
+<REGEX>:.*column 'a' is utf8 where int32 was declared.*
 
 # --- publish() is REFUSED BY NAME, and the refusal replaces a HANG: this surface runs the generated
 # statement on the render's OWN pinned connection, so scanning a publication would re-enter it mid-query.
@@ -3472,3 +3496,114 @@ query I
 SELECT fluid_render('before-{% render ''stop'' %}-after', NULL);
 ----
 before-P
+
+# ============================================================================================
+# §30 — PROJECTION PUSHDOWN through a lateral (ABI v86). DuckDB narrows the get to the columns the caller
+#       reads; the callee is TOLD, and may honour it or not.
+#
+# ⚠⚠ THE HAZARD THIS SECTION EXISTS FOR is an off-by-one in the wire map: when the callee returns its FULL
+# schema the wire is WIDER than the output chunk, and referencing wire column c into output slot c lands a
+# callee column in a correlated column's slot — plausibly the same type, wrong data, NO ERROR. Every row
+# below therefore asserts VALUES against a control, never shapes.
+# ============================================================================================
+
+statement ok
+CREATE TABLE proj_t(id INTEGER, n INTEGER);
+
+statement ok
+INSERT INTO proj_t VALUES (1, 1), (2, 3), (3, 0);
+
+# --- the control: all four columns, so the projected rows below have something to be checked against. ---
+query IIII
+SELECT t.id, f.a, f.b, f.c FROM proj_t t, fluid_query_lateral(
+  'SELECT __fab_row, n AS a, n*2 AS b, n*3 AS c FROM input_table', 'null', t.n, t.id) f ORDER BY t.id;
+----
+1	1	2	3
+2	3	6	9
+3	0	0	0
+
+# --- ⚠⚠ READING ONLY THE MIDDLE COLUMN. This is the off-by-one assertion: `b` is output index 1, so a map
+# that used the output slot instead of the wire column would return `a`'s values (1, 3, 0) — the same TYPE,
+# so nothing would fail. It must be 2, 6, 0. ---
+query II
+SELECT t.id, f.b FROM proj_t t, fluid_query_lateral(
+  'SELECT __fab_row, n AS a, n*2 AS b, n*3 AS c FROM input_table', 'null', t.n, t.id) f ORDER BY t.id;
+----
+1	2
+2	6
+3	0
+
+# --- ⚠⚠ THE PAYOFF, and it is what makes this worth having at all: the generated statement STOPS COMPUTING
+# what nobody reads. An unread column holding error() never fires, because the wrapper names only the
+# projected columns and DuckDB prunes the rest of the subquery. The control below it is what proves the
+# column is really there and really would be evaluated. ---
+query II
+SELECT t.id, f.a FROM proj_t t, fluid_query_lateral(
+  'SELECT __fab_row, n AS a, error(''EVALUATED'') AS b FROM input_table', 'null', t.n, t.id) f ORDER BY t.id;
+----
+1	1
+2	3
+3	0
+
+statement error
+SELECT t.id, f.b FROM proj_t t, fluid_query_lateral(
+  'SELECT __fab_row, n AS a, error(''EVALUATED'') AS b FROM input_table', 'null', t.n, t.id) f;
+----
+<REGEX>:.*EVALUATED.*
+
+# --- ⚠⚠ A CALLEE THAT IGNORES THE HINT still gets the right answer, which is what lets this ship without
+# touching a single existing lateral function. fabricator_lat_span does not override Open, so it returns its
+# full x/y/z/tail_sum schema and the HOST drops the two the caller does not read. Values checked against
+# the all-columns control that follows. ---
+query III
+SELECT t.id, f.y, f.tail_sum FROM proj_t t, fabricator_lat_span('x,y,z', t.n, t.id) f ORDER BY t.id;
+----
+1	2	1
+2	6	2
+3	0	3
+
+query IIIII
+SELECT t.id, f.x, f.y, f.z, f.tail_sum FROM proj_t t, fabricator_lat_span('x,y,z', t.n, t.id) f ORDER BY t.id;
+----
+1	1	2	3	1
+2	3	6	9	2
+3	0	0	0	3
+
+# --- ⚠ BOTH OPERATORS, because they map the wire independently: the batched rewrite and DuckDB's own
+# row-by-row driver. The kill switch is what makes the second reachable, and the answers must be identical. ---
+statement ok
+SET fabricator_batched_lateral = false;
+
+query II
+SELECT t.id, f.b FROM proj_t t, fluid_query_lateral(
+  'SELECT __fab_row, n AS a, n*2 AS b, n*3 AS c FROM input_table', 'null', t.n, t.id) f ORDER BY t.id;
+----
+1	2
+2	6
+3	0
+
+query III
+SELECT t.id, f.y, f.tail_sum FROM proj_t t, fabricator_lat_span('x,y,z', t.n, t.id) f ORDER BY t.id;
+----
+1	2	1
+2	6	2
+3	0	3
+
+statement ok
+SET fabricator_batched_lateral = true;
+
+# --- ⚠ THE TEMPLATE IS TOLD, under the name `projected`, so it can skip work SQL pruning cannot reach — an
+# {% exec %}, a {% query %}, a join it would otherwise write. Two of three columns read, and the template
+# reports exactly those two. ⚠ It is NOT bound during the schema probe (there is no projection yet — the
+# bind is what the planner narrows), so a template reading it branches on is_bind, as here. ---
+query II
+SELECT DISTINCT f.p, f.a FROM proj_t t, fluid_query_lateral(
+  'SELECT __fab_row, {% if is_bind %}NULL::VARCHAR{% else %}''{{ projected | join: "|" }}''{% endif %} AS p, n AS a, n*2 AS b FROM input_table',
+  'null', t.n, t.id) f ORDER BY f.a;
+----
+p|a	0
+p|a	1
+p|a	3
+
+statement ok
+DROP TABLE proj_t;

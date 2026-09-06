@@ -85,6 +85,28 @@ public interface ILateralFunctionBinding : IDisposable
 
     /// <summary>Open one per-thread session. Called once per pipeline thread, not once per chunk.</summary>
     ILateralSession Open();
+
+    /// <summary>
+    /// Open one per-thread session, told which of <see cref="OutputSchema"/>'s columns the caller actually
+    /// reads — <paramref name="projected"/> holds their indices in output order, or is <see langword="null"/>
+    /// when the caller reads all of them.
+    /// </summary>
+    /// <remarks>
+    /// ⚠⚠ <b>A HINT, NOT A DEMAND, and the default implementation ignores it.</b> Honour it and the session's
+    /// <see cref="ILateralSession.Call"/> may return just those columns, in that order — saving both the work
+    /// and the crossing. Ignore it and return the full declared schema: the host drops what it does not want.
+    /// It discriminates the two shapes by COLUMN COUNT and validates types either way, so a function written
+    /// before this member existed keeps working unchanged, which is why this is a default implementation and
+    /// not a signature change.
+    /// <para>⚠ It is worth honouring where producing a column COSTS something — a remote call, a model
+    /// invocation, or a generated SQL statement whose unread expressions the engine would otherwise still
+    /// evaluate. For a function that computes its columns cheaply in memory, ignoring it is the right
+    /// answer.</para>
+    /// <para>⚠ It arrives at OPEN rather than at <see cref="ILateralFunction.Bind"/> because DuckDB decides
+    /// the projection AFTER binding: the bind must still declare the full schema, since that is what the
+    /// planner narrows.</para>
+    /// </remarks>
+    ILateralSession Open(IReadOnlyList<int>? projected) => Open();
 }
 
 /// <summary>

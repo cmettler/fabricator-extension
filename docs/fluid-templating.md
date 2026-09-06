@@ -3229,8 +3229,9 @@ that would otherwise truncate silently. A small-result test exercises only the s
 
 - ~~A `batchsize`-like control~~ — **NOT WANTED (user, 2026-09-05).** A lateral's chunk is DuckDB's, up to
   2048 rows. Do not build it.
-- ~~Projection pushdown~~ — **A SETTLED DECISION, not an open item, and this entry's reason for it was
-  wrong.** It said "the declared output is fixed at bind … the same obstacle `publish` has". Neither half
+- ~~Projection pushdown~~ — **BUILT the next day, §24** (user-directed). The correction below stands as the
+  record of why it was not an open item in the form this entry described; what changed is the decision, once
+  the cost was re-priced against the two optimizer facts §24.1 records.** It said "the declared output is fixed at bind … the same obstacle `publish` has". Neither half
   holds:
   - **DuckDB DOES support it for this shape** (user-questioned, then read at the pin). It is one flag,
     `TableFunction::projection_pushdown`, and `RemoveUnusedColumns` gates on exactly that
@@ -3433,3 +3434,103 @@ own change.
 | **D** — no flush at the catch site | at the FIRST `{% ret %}` assertion, after 563 pass — and nowhere else, because Fluid's own root flushes the normal path |
 | **F** — return `Completion.Break` instead of throwing | at the same first assertion, after 563 pass |
 | **G** — no `EnterChildScope`/`ReleaseScope` | after 423, at a PRE-EXISTING `fluid_query_batch` assertion |
+
+## 24. ✅ AS BUILT (2026-09-06) — PROJECTION PUSHDOWN through a lateral (ABI v86)
+
+User-directed after §22.7's correction: *"build 1+2+(a). couldn't we just include a fluid `projected` as well
+and the template is free to use it or not?"* — and that question is what made (b) safe to include, see §24.4.
+C++ + ABI + C#. Gate `verify_plugin_fluid` 599 → **677**, hermetic floor 8875 → **8953**, one mutant.
+
+### 24.1 The shape of the problem: the projection arrives AFTER bind
+
+DuckDB decides it in `RemoveUnusedColumns`, which gates on `TableFunction::projection_pushdown`
+(`remove_unused_columns.cpp:720`) and applies to any `LOGICAL_GET` — a lateral's included, since the visitor
+recurses into a get's child with the comment *"Some LOGICAL_GET operators (e.g., table in out functions) may
+have a child operator"*. Two facts read at the pin decided the design:
+
+- **`UNUSED_COLUMNS` runs at `optimizer.cpp:222`, BEFORE optimizer extensions at `:331`** — so our own
+  `RewriteLateralNodes` already sees the narrowed `column_ids` and no new plan pass is needed.
+- **`GetAnyColumn()` falls through to `return 0`** for a get with no virtual columns, so the all-pruned case
+  (`SELECT count(*) FROM t, f(…)`) hands us column 0 rather than an empty list or a rowid sentinel. There is
+  no zero-column edge case to guard.
+
+The only crossing between bind and execution is `lateral_open`, so that is where it rides.
+
+### 24.2 ⚠⚠ It is a HINT, and that is what let it ship without touching one existing lateral
+
+`lateral_open(binding, projected, count, …)`. A callee may honour it — returning exactly those columns, in
+that order — or ignore it and return its full declared schema. **The host discriminates by COLUMN COUNT and
+validates types either way**, in the wire check that already existed as the trust boundary
+(`LateralSession::Call`). Neither shape can be silently read as the other, so:
+
+- `ILateralFunctionBinding.Open(IReadOnlyList<int>? projected)` is a **default implementation** calling
+  `Open()`. Nothing already written changes, in-tree or out.
+- The alternative — making it a demand — would have meant a signature change plus real narrowing logic in
+  seven in-tree demos and three out-of-tree plugins, to buy nothing they need.
+
+### 24.3 ⚠⚠ THE WIRE MAP IS THE WHOLE HAZARD, and the mutant showed which row tests it
+
+`wire_map_[k]` says which WIRE column carries OUTPUT column k. When the callee ignored the hint the wire is
+WIDER than the output chunk, and referencing wire column `c` into output slot `c` lands a callee column in a
+correlated column's slot — plausibly the same type, wrong data, no error. It is built ONCE per call, beside
+the type check that validates it, rather than recomputed at each of the three emit sites.
+
+**MEASURED, and it inverts which assertions matter:** mutant H (emit by position instead of through the map)
+passes **630** assertions — including every `fluid_query_lateral` projection row — and dies at the
+`fabricator_lat_span` row. Because *`fluid_query_lateral` honours the hint*, its wire map is the IDENTITY,
+so its own rows cannot catch the off-by-one at all. **The row that tests the map is the one where the callee
+IGNORES the hint**, and without a demo that does so this feature would have shipped with a vacuous gate.
+
+⚠ Both operators map independently — the batched rewrite and DuckDB's own row-by-row driver — so §30 runs
+its rows through the `fabricator_batched_lateral` kill switch as well.
+
+### 24.4 (a) The wrapper narrows, and the payoff is the INNER statement
+
+`Wrap()` now emits `SELECT <projected idents>, CAST(__fab_row AS BIGINT) AS __fab_row FROM (<generated>)`
+instead of `SELECT * EXCLUDE (__fab_row), …`. That is the whole of (a), and it works because **DuckDB prunes
+an unreferenced expression inside a subquery** — MEASURED before building anything:
+`SELECT a FROM (SELECT i AS a, error('NOT PRUNED') AS b FROM range(3))` returns three rows, and referencing
+`b` raises. So the TEMPLATE'S OWN statement stops computing what nobody reads; the bytes saved on the wire
+are the lesser half. Gated as a pair: an unread `error()` column does not fire, reading it does.
+
+### 24.5 (b) `projected` as a Fluid value — and why the user's question corrected my objection
+
+I had argued (§22.7) that exposing the projection to the template would *invert the schema contract*: a
+template branching on it renders fewer columns than the probe declared, and `Verify` would refuse. **That is
+true of (b) WITHOUT (a), and false with it.** The wrapper normalises the shape whatever the template did:
+
+- template ignores `projected`, renders everything ⇒ the wrapper drops the rest. ✓
+- template uses it, renders exactly the projected set ⇒ the wrapper selects what is there. ✓
+- template renders FEWER than projected ⇒ DuckDB's binder fails at the inner statement, naming the column. ✓
+
+So it is genuinely optional, which is what the user asked for. `projected` is bound as the column NAMES, in
+output order. ⚠ It is NOT bound during the schema probe — there is no projection yet, the bind is what the
+planner narrows — so a template reading it branches on `is_bind`, as §30 does.
+
+⚠ What it buys over (a) is work SQL pruning cannot reach: an `{% exec %}`, a `{% query %}`, a join or an
+include the template would otherwise write.
+
+### 24.6 ⚠⚠ A behaviour change it forced, and the gate is stronger for it
+
+Selecting BY NAME instead of `* EXCLUDE` changed what a schema DRIFT does. Measured, all four:
+
+| a chunk that renders… | before | now |
+|---|---|---|
+| an EXTRA column | refused | **dropped** |
+| a MISSING column | refused | refused — DuckDB's binder, naming it |
+| a RENAMED column | refused | refused — DuckDB's binder, naming it |
+| a RETYPED column | refused | refused — our `Verify`, naming the type |
+
+Only the harmless case relaxed, and it is harmless BY CONSTRUCTION: a column absent from the declared schema
+is one nobody can read. The hazard the old check existed for — *"the host builds its converters from the
+DECLARED schema, so a mismatch is read as DATA"* — is now structurally impossible rather than merely caught,
+because by-name selection means the batch reaching the host always has exactly the declared columns in the
+declared order. A reordering cannot be misread either. §28's one drift row became four.
+
+### 24.7 What is not done
+
+- **Filter pushdown.** Untouched; `filter_prune` stays off, which is also why `projection_ids` stays empty
+  and the eligibility check can keep bailing on it.
+- **A same-width REORDERING** would defeat the managed side's "projection or not" test, which keys on the
+  count. It cannot arise — `RemoveColumnsFromLogicalGet` preserves column order, so a projection is always
+  an ordered SUBSET — but that is an assumption about DuckDB, recorded here rather than guarded.

@@ -1007,7 +1007,20 @@ typedef struct FabricatorVTable {
 	// batched operator declares ParallelOperator(), so every pipeline thread gets its own OperatorState and
 	// therefore its own session — no shared mutable state, no gate. (Contrast the in-out exchange, which
 	// permits ONE exchange per binding and serialises parallel branches behind a mutex.)
-	int32_t (*lateral_open)(FabricatorHandle binding, FabricatorHandle *out_session, char **err);
+	//
+	// ⚠⚠ `projected` is the PROJECTION PUSHDOWN HINT: the indices, into the binding's declared output schema
+	// and in output order, of the columns the caller actually reads. It is the ONLY crossing in the window
+	// where it can be delivered — DuckDB decides the projection after `lateral_bind` and before any
+	// `lateral_call`, and a projection belongs to the PLAN rather than to a chunk. NULL / count 0 means "all
+	// columns", which is what a caller reading everything gets.
+	//
+	// ⚠ A HINT, NOT A DEMAND, so an older or simpler callee needs no change: it may return its FULL declared
+	// schema and the host drops what it does not want. A callee that honours it returns exactly those
+	// columns, in that order, and saves the work AND the crossing. The host discriminates by COLUMN COUNT
+	// and validates types either way (see the wire check in LateralSession::Call), so the two shapes cannot
+	// be confused and neither can be silently misread.
+	int32_t (*lateral_open)(FabricatorHandle binding, const int32_t *projected, int32_t projected_count,
+	                        FabricatorHandle *out_session, char **err);
 
 	// ONE batched call. `input` is an N-row Arrow array of the input columns (consumed/released by the
 	// managed side); *out receives a stream of the result, where every batch carries the binding's output
@@ -1267,7 +1280,7 @@ typedef struct FabricatorHostServices {
 // state blob is this many bytes + a 4-byte length prefix). Serialize() must fit within it.
 #define FABRICATOR_AGG_SPILL_CAP 1024
 
-#define FABRICATOR_ABI_VERSION 85
+#define FABRICATOR_ABI_VERSION 86
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(FabricatorVTable) as seen

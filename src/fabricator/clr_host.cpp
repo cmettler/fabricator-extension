@@ -1274,14 +1274,15 @@ FabricatorHandle LateralBind(FabricatorHandle handle, const std::string &schema,
 	return binding;
 }
 
-FabricatorHandle LateralOpen(FabricatorHandle binding) {
+FabricatorHandle LateralOpen(FabricatorHandle binding, const std::vector<int32_t> &projected) {
 	const FabricatorVTable &vt = GetBridge();
 	if (!vt.lateral_open) {
 		throw duckdb::IOException("Fabricator: bridge does not provide lateral_open");
 	}
 	FabricatorHandle session = nullptr;
 	char *err = nullptr;
-	int32_t rc = vt.lateral_open(binding, &session, &err);
+	int32_t rc = vt.lateral_open(binding, projected.empty() ? nullptr : projected.data(),
+	                             (int32_t)projected.size(), &session, &err);
 	if (rc != FABRICATOR_OK) {
 		ThrowManagedError(vt, err, "Fabricator: lateral_open failed");
 	}

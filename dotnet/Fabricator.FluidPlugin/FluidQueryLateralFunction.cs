@@ -105,6 +105,9 @@ internal sealed class FluidQueryLateralFunction : ILateralFunction
     /// <summary>Any input column under this prefix would collide with the staging machinery.</summary>
     private const string ReservedPrefix = "__fab";
 
+    /// <summary>The template variable naming the output columns the caller actually reads.</summary>
+    internal const string ProjectedVariable = "projected";
+
     private const string PublishRefusal =
         "publish() cannot be used here — " + FunctionName + " runs the rendered statement on the template's "
         + "OWN connection, so scanning a publication would re-enter that connection and hang. A publication "
@@ -181,10 +184,17 @@ internal sealed class FluidQueryLateralFunction : ILateralFunction
     /// may legitimately have produced — <c>SELECT 0 AS __fab_row</c> is an INT32 — into the one type the
     /// origin reader accepts.
     /// </remarks>
-    private static string Wrap(string generated)
+    private static string Wrap(string generated, IReadOnlyList<Field>? keep)
     {
         var origin = DuckSql.QuoteIdent(OriginColumn);
-        return $"SELECT * EXCLUDE ({origin}), CAST({origin} AS BIGINT) AS {origin} FROM ({generated})";
+        // ⚠⚠ NAMING THE COLUMNS IS THE PROJECTION PUSHDOWN, and it works because DuckDB prunes what a
+        // subquery does not need: MEASURED, an unreferenced `error('…')` inside a subquery never fires. So a
+        // narrowed outer SELECT makes the TEMPLATE'S OWN statement stop computing the columns nobody reads —
+        // which is the win, far more than the bytes saved on the wire.
+        var cols = keep is null
+            ? $"* EXCLUDE ({origin})"
+            : string.Join(", ", keep.Select(f => DuckSql.QuoteIdent(f.Name)));
+        return $"SELECT {cols}, CAST({origin} AS BIGINT) AS {origin} FROM ({generated})";
     }
 
     /// <summary>The columns <paramref name="generated"/> produces, without the provenance column.</summary>
@@ -293,8 +303,10 @@ internal sealed class FluidQueryLateralFunction : ILateralFunction
         // ⚠ PER THREAD — the batched lateral operator declares itself parallel, so several of these are open
         // at once, each with its own DuckDB connection and temporary catalog. That is what makes cross-chunk
         // state unavailable here and available in the collector.
-        public ILateralSession Open() =>
-            new Session(_template, _parameters, _stagedSchema, OutputSchema);
+        public ILateralSession Open() => Open(null);
+
+        public ILateralSession Open(IReadOnlyList<int>? projected) =>
+            new Session(_template, _parameters, _stagedSchema, OutputSchema, projected);
 
         public void Dispose()
         {
@@ -309,15 +321,28 @@ internal sealed class FluidQueryLateralFunction : ILateralFunction
         private readonly FluidRenderSession _session;
         private readonly TemplateContext _ctx;
 
-        internal Session(string template, object? parameters, Schema stagedSchema, Schema outputSchema)
+        internal Session(string template, object? parameters, Schema stagedSchema, Schema outputSchema,
+                         IReadOnlyList<int>? projected)
         {
             _template = template;
             _stagedSchema = stagedSchema;
-            _outputSchema = outputSchema;
+            // ⚠ The session's schema IS the projected one: everything below — the wrapper, the arrival check,
+            // the assembled batch — is written against "the columns this plan reads", so the narrowing is
+            // applied ONCE, here, rather than at each of those three places.
+            _outputSchema = projected is { Count: > 0 }
+                ? new Schema(projected.Select(i => outputSchema.FieldsList[i]).ToList(), metadata: null)
+                : outputSchema;
             _session = FluidRenderSession.TryCreate()
                 ?? throw new InvalidOperationException(
                     $"{FunctionName} needs the hosting DuckDB, which is not available here.");
             _ctx = NewContext(_session, parameters, isBind: false);
+            // ⚠⚠ AND THE TEMPLATE IS TOLD, so it can skip work the SQL pruning above cannot reach — an
+            // {% exec %}, a {% query %}, a join or an include it would otherwise write. Using it is OPTIONAL:
+            // the wrapper narrows the result either way, so a template that ignores `projected` is correct
+            // and merely does more work. NOT bound during the schema probe (there is no projection yet, the
+            // bind is what the planner narrows), so a template reading it must branch on is_bind.
+            FluidValueModel.SetVariable(_ctx, ProjectedVariable,
+                                        _outputSchema.FieldsList.Select(f => f.Name).ToArray());
         }
 
         public LateralResult Call(RecordBatch input)
@@ -339,7 +364,7 @@ internal sealed class FluidQueryLateralFunction : ILateralFunction
                 // independent of its stream's under the Arrow C data interface, so closing first would very
                 // likely be fine — but "very likely" is not a property to rest a use-after-free on, and
                 // outliving it costs nothing.
-                using var stream = _session.Query(Wrap(generated));
+                using var stream = _session.Query(Wrap(generated, _outputSchema.FieldsList));
                 Verify(stream.Schema);
                 while (true)
                 {

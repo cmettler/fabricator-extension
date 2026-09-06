@@ -12,6 +12,32 @@
 > parsed with our own vcpkg yyjson, retiring the `ReadCapabilityFlag` string-find). v74 below is the
 > follow-on that finished the same job for ALTER.
 
+## v86 (2026-09-06) — `lateral_open` gains a PROJECTION HINT
+
+**User-directed.** `lateral_open` takes `(const int32_t *projected, int32_t projected_count)` between the
+binding and the out-session: the indices, into the binding's declared output schema and in output order, of
+the columns the caller actually reads. NULL/0 = all of them. `TableFunction::projection_pushdown` is now
+advertised for every lateral function, so DuckDB narrows the get.
+
+**⚠ It rides `lateral_open` because that is the ONLY crossing in the window.** DuckDB decides the projection
+AFTER `lateral_bind` — the bind must still declare the full schema, since that is what the planner narrows —
+and before any `lateral_call`. A projection belongs to the PLAN, not to a chunk, so `open` is also the right
+granularity.
+
+**⚠⚠ A HINT, NOT A DEMAND, and that is what let it ship without touching one existing lateral function.** A
+callee may honour it (returning exactly those columns) or ignore it (returning its full declared schema).
+The host discriminates by COLUMN COUNT and validates types either way, in the wire check that was already
+the trust boundary — so neither shape can be silently read as the other, and
+`ILateralFunctionBinding.Open(IReadOnlyList<int>?)` is a DEFAULT implementation rather than a signature
+change.
+
+**⚠⚠ The hazard is the WIRE MAP**, and a mutant showed which assertion tests it: when the callee ignored the
+hint the wire is WIDER than the output chunk, and referencing wire column `c` into output slot `c` lands a
+callee column in a correlated column's slot — same type, wrong data, no error. Emitting by position instead
+of through the map passes **630** assertions and dies only at the row where the callee ignores the hint,
+because a callee that HONOURS it has an identity map. Full record + the two optimizer facts that made this
+cheap: [fluid-templating.md](fluid-templating.md) §24.
+
 ## v85 (2026-09-04) — `host_query` gains `batch_rows`: the CALLER picks its Arrow batch size
 
 **User-directed**, after measuring why a published relation was ~10x slower than the same relation left

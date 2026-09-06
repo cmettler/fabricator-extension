@@ -444,6 +444,16 @@ case "$TIER" in
         # in that section is load-bearing and a mutant proved it: an earlier `USE memory.hq_s` leaves a
         # qualified entry, against which the bug does not fire, so the section PASSED with it fully present.
         # 8250 + 9 = 8259 exactly, from a green run.
+        # 8953 since 2026-09-06: verify_plugin_fluid 599 -> 677 -- PROJECTION PUSHDOWN through a lateral
+        # (ABI v86). DuckDB narrows the get to the columns the caller reads and the callee is TOLD, through
+        # lateral_open -- the only crossing in the window, since the projection is decided after bind.
+        # /!\ It is a HINT: a callee may honour it or return its full schema, and the host discriminates by
+        # COLUMN COUNT and validates types either way, which is what let it ship without touching a single
+        # existing lateral function. /!\/!\ The row that tests the WIRE MAP is the one where the callee
+        # IGNORES the hint (fabricator_lat_span): when it honours it the map is the identity, so
+        # fluid_query_lateral's own rows cannot catch an off-by-one -- MEASURED, the mutant passes 630
+        # assertions and dies exactly there. Also here: the drift block went from one row to four, a
+        # relaxation and three refusals, because the wrapper now selects BY NAME.
         # 8875 since 2026-09-05 (same day, fifth bump): verify_plugin_fluid 563 -> 599 -- {% ret %}, Scriban's
         # early exit, which Liquid has not and Fluid cannot express: its Completion type has three values and
         # the template ROOT awaits each statement's completion and never reads it, so a top-level
@@ -552,7 +562,7 @@ case "$TIER" in
         # two functions have exactly ONE registration each, plus the HostsCatalog refusal and its
         # unknown-provider control. 3105 + 238 + 8259 - 3339 arithmetic aside, both numbers come from green
         # runs.
-        : "${MIN_ASSERTIONS:=8875}"
+        : "${MIN_ASSERTIONS:=8953}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

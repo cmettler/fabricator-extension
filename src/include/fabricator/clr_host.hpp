@@ -478,8 +478,11 @@ void InOutBindClose(FabricatorHandle binding);
 FabricatorHandle LateralBind(FabricatorHandle handle, const std::string &schema, const std::string &func,
                              ArrowArrayStream *args, ArrowSchema &input_schema, ArrowArrayStream &out_schema);
 
-// Open one per-thread session on a bound binding (several may be open at once).
-FabricatorHandle LateralOpen(FabricatorHandle binding);
+// Open one per-thread session on a bound binding (several may be open at once). `projected` = the indices,
+// into the binding's declared output schema and in output order, of the columns the caller reads; EMPTY
+// means all of them. A HINT: the callee may honour it or return its full schema, and the host copes either
+// way (abi.h, lateral_open).
+FabricatorHandle LateralOpen(FabricatorHandle binding, const std::vector<int32_t> &projected);
 
 // One batched call: `input` = an N-row array of the input columns (consumed). Fills `out` with the result
 // stream, whose batches carry the output columns + a TRAILING int32 provenance column.

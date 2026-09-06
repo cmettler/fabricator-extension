@@ -91,7 +91,7 @@ public static unsafe class Bootstrap
                             () => OneRowStream(probeSchema, Interlocked.Increment(ref _lazyOpens) - 1),
                             probeSchema);
 
-        vtable->AbiVersion = 85;
+        vtable->AbiVersion = 86;
         vtable->OpenCatalog = &OpenCatalog;
         vtable->CloseCatalog = &CloseCatalog;
         vtable->ExecuteQuery = &ExecuteQuery;
@@ -1590,7 +1590,7 @@ public static unsafe class Bootstrap
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static int LateralOpen(nint binding, nint* outSession, byte** err)
+    private static int LateralOpen(nint binding, int* projected, int projectedCount, nint* outSession, byte** err)
     {
         try
         {
@@ -1603,9 +1603,20 @@ public static unsafe class Bootstrap
             {
                 return FabricatorStatus.InvalidArgument;
             }
+            // ⚠ COPIED, not referenced: the host's array is the caller's and its lifetime ends with this
+            // crossing, while the session outlives it by the whole scan.
+            int[]? cols = null;
+            if (projected is not null && projectedCount > 0)
+            {
+                cols = new int[projectedCount];
+                for (int i = 0; i < projectedCount; i++)
+                {
+                    cols[i] = projected[i];
+                }
+            }
             // SEVERAL sessions may be open on one binding at once — the batched operator is parallel, so each
             // pipeline thread opens its own and nothing is shared.
-            *outSession = Handles.Alloc(b.Open());
+            *outSession = Handles.Alloc(b.Open(cols));
             return FabricatorStatus.Ok;
         }
         catch (Exception ex)

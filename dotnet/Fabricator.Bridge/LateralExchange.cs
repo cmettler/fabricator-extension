@@ -48,21 +48,39 @@ internal sealed class LateralSessionRunner : IDisposable
     private readonly ILateralSession _session;
     private readonly string _func;
     private readonly int _outputColumns;
+    private readonly Schema _fullWire;
+    private readonly Schema? _projectedWire;
+    private readonly int _projectedColumns;
 
-    public LateralSessionRunner(ILateralFunctionBinding binding, string func, Schema inputSchema)
+    public LateralSessionRunner(ILateralFunctionBinding binding, string func, Schema inputSchema,
+                               IReadOnlyList<int>? projected)
     {
-        _session = binding.Open();
+        _session = binding.Open(projected);
         _func = func;
         InputSchema = inputSchema;
         _outputColumns = binding.OutputSchema.FieldsList.Count;
-        WireSchema = WireSchemaFor(binding.OutputSchema);
+        _fullWire = WireSchemaFor(binding.OutputSchema);
+        // ⚠ BOTH wire schemas are precomputed because which one applies is not known until the author has
+        // answered: honouring the projection hint is optional, so a call may legitimately come back in either
+        // shape and the schema must match what it produced.
+        if (projected is { Count: > 0 } && projected.Count != _outputColumns)
+        {
+            var fields = new List<Field>(projected.Count);
+            foreach (var i in projected)
+            {
+                fields.Add(binding.OutputSchema.FieldsList[i]);
+            }
+            _projectedColumns = projected.Count;
+            _projectedWire = WireSchemaFor(new Schema(fields, metadata: null));
+        }
     }
 
     /// <summary>The per-row input columns, needed to import the host's array.</summary>
     public Schema InputSchema { get; }
 
-    /// <summary>The output columns plus the trailing provenance column.</summary>
-    public Schema WireSchema { get; }
+    /// <summary>The output columns plus the trailing provenance column — the PROJECTED set when the caller
+    /// narrowed it, since that is what a projection-aware author returns.</summary>
+    public Schema WireSchema => _projectedWire ?? _fullWire;
 
     /// <summary>The wire schema for a given output schema: its fields, then the provenance column.</summary>
     public static Schema WireSchemaFor(Schema output)
@@ -97,12 +115,26 @@ internal sealed class LateralSessionRunner : IDisposable
         {
             return new InMemoryArrayStream(WireSchema, System.Array.Empty<RecordBatch>());
         }
-        if (rows.ColumnCount != _outputColumns)
+        // ⚠ TWO LEGAL SHAPES: the author honoured the projection hint, or ignored it and returned everything.
+        // The count discriminates them and the host validates types on whichever arrives, so neither can be
+        // read as the other.
+        Schema wire;
+        if (rows.ColumnCount == _outputColumns)
+        {
+            wire = _fullWire;
+        }
+        else if (_projectedWire is not null && rows.ColumnCount == _projectedColumns)
+        {
+            wire = _projectedWire;
+        }
+        else
         {
             throw new InvalidOperationException(
                 $"fabricator: lateral function '{_func}' returned {rows.ColumnCount} columns but declared " +
-                $"{_outputColumns}");
+                $"{_outputColumns}" +
+                (_projectedWire is null ? "" : $" (or {_projectedColumns}, the projected subset)"));
         }
+        int wireColumns = rows.ColumnCount;
         var origin = result.Origin;
         if (origin is null)
         {
@@ -131,13 +163,13 @@ internal sealed class LateralSessionRunner : IDisposable
 
         // The wire batch takes over the author's columns; the RecordBatch it came in is left undisposed on
         // purpose — disposing both would release the same buffers twice.
-        var columns = new IArrowArray[_outputColumns + 1];
-        for (int c = 0; c < _outputColumns; c++)
+        var columns = new IArrowArray[wireColumns + 1];
+        for (int c = 0; c < wireColumns; c++)
         {
             columns[c] = rows.Column(c);
         }
-        columns[_outputColumns] = builder.Build();
-        return new InMemoryArrayStream(WireSchema, new[] { new RecordBatch(WireSchema, columns, m) });
+        columns[wireColumns] = builder.Build();
+        return new InMemoryArrayStream(wire, new[] { new RecordBatch(wire, columns, m) });
     }
 
     public void Dispose() => _session.Dispose();
@@ -164,8 +196,10 @@ internal sealed class LateralBindingHandle : IDisposable
     /// the provenance column (that is transport, not a result column).</summary>
     public Schema OutputSchema => Binding.OutputSchema;
 
-    /// <summary>Open one per-thread session. Several may be open at once — see <see cref="ILateralSession"/>.</summary>
-    public LateralSessionRunner Open() => new(Binding, Func, InputSchema);
+    /// <summary>Open one per-thread session, told which output columns the caller reads (null = all).
+    /// Several may be open at once — see <see cref="ILateralSession"/>.</summary>
+    public LateralSessionRunner Open(IReadOnlyList<int>? projected) =>
+        new(Binding, Func, InputSchema, projected);
 
     public void Dispose() => Binding.Dispose();
 }

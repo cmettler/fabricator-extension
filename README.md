@@ -2047,6 +2047,13 @@ FROM people p, fluid_query_lateral(
 -- 2  | 0
 ```
 
+> ⚠ **It only computes the columns you select.** DuckDB tells the function which of its output columns your
+> query actually reads, and the generated statement is narrowed to those — so an expensive expression in a
+> column you did not select is never evaluated. Nothing to configure. A template can also read the list
+> itself, as `projected`, to skip work that narrowing the SQL cannot reach (an `{% exec %}`, a `{% query %}`,
+> a join it would otherwise write); it is unset during the schema probe, so branch on `is_bind`:
+> `{% if is_bind %}…{% else %}SELECT __fab_row, {{ projected | join: ", " }} FROM input_table{% endif %}`.
+
 > ⚠ **Nothing carries between chunks here.** The lateral runs in PARALLEL — each thread gets its own
 > connection and its own temporary catalog — so a temp table one render stages may or may not be there for
 > the next. Use `fluid_query_batch` when you need to accumulate; it is sequential by construction.
