@@ -175,7 +175,14 @@ SELECT c FROM fabricator_query('mssql', 'SELECT count(*) AS c FROM dbo.fptb');
 ----
 1
 
-# …and the statement that DOES execute writes again, so the count is the number of BINDS plus this one.
+# …and the statement that DOES execute writes once more — because it BINDS once more, not because executing
+# writes. ⚠ The count IS the number of binds, and these two rows prove it: two binds gave 2, where an
+# execution that wrote separately from its own bind would have given 3. fluid_query renders in bind_replace,
+# so the multiplier is BINDS; fluid_render is a volatile scalar and its multiplier is ROWS.
+#
+# ⚠ Only the two steps below are measured HERE. The longer chain — EXPLAIN 1, CREATE VIEW 2, first select
+# from the view 3, a second select 4 — is a recorded measurement for exec() (fluid-templating.md §11),
+# inherited by shared mechanism rather than re-established for the provider tags.
 statement ok
 SELECT * FROM fluid_query('{% provider_exec ''mssql'' %}INSERT INTO dbo.fptb VALUES (1){% endprovider_exec %}SELECT 1 AS x');
 
