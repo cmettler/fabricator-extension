@@ -69,6 +69,7 @@ See [SQL Server external tables on S3](#sql-server-external-tables-on-s3).
 | | CHECK/FK constraint enforcement on INSERT | ✅ (`SqlBulkCopyOptions.CheckConstraints`; COPY/CTAS skip for speed) |
 | **DDL** | CREATE/DROP TABLE, CREATE/DROP SCHEMA, ALTER TABLE | ✅ |
 | | PRIMARY KEY / UNIQUE / NOT NULL / literal DEFAULT on CREATE | ✅ |
+| | `ALTER TABLE … ADD COLUMN … DEFAULT <literal>` | ✅ SQL Server (backfills, like DuckDB) — see the note below |
 | | `CREATE TABLE … WITH (…)` options (per-table Delta properties / write tuning / feature flags) | ✅ |
 | | CHECK constraints, non-literal DEFAULTs | ❌ (use `fabricator_exec`) |
 | **S3 external tables** | `INSERT` into a detected SQL Server S3 **Delta/Parquet** external table → routed to storage | ✅ |
@@ -749,6 +750,26 @@ ALTER TABLE mssql.staging.t RENAME TO t_renamed;
 DROP TABLE mssql.staging.t_renamed;
 DROP SCHEMA mssql.staging;
 ```
+
+**`ALTER TABLE … ADD COLUMN … DEFAULT <literal>`** applies the default to LATER inserts **and backfills the
+rows already there**, matching what DuckDB's own tables do for the same statement. SQL Server would not
+backfill on its own, so this emits `WITH VALUES` — which touches every existing row, so on a large table it
+is a real write rather than a metadata-only change.
+
+> ⚠ **Write the literal BARE, or as a string.** `DEFAULT 10`, `DEFAULT 1.5`, `DEFAULT 'x'` and
+> `DEFAULT '2024-01-01'` are carried; `DEFAULT true`, `DEFAULT DATE '2024-01-01'`, `DEFAULT TIMESTAMP '…'`
+> and `DEFAULT …::BLOB` are **refused by name**, because DuckDB discards a cast-wrapped literal before the
+> catalog ever sees it and the loss is indistinguishable from an intentional `DEFAULT NULL`. Refusing beats
+> storing the wrong default silently. For those types, add the column and then
+> `ALTER TABLE … ALTER COLUMN … SET DEFAULT …`, which carries every type correctly.
+>
+> ⚠ On the **Delta** provider a DEFAULT is refused outright: Delta records column defaults through a writer
+> feature this engine does not implement, so the value could neither be stored nor applied to later inserts.
+> Add the column, then set the values with an `UPDATE`.
+>
+> ⚠ A column default is **not reported** in `information_schema.columns.column_default` — the catalog does
+> not read defaults back from the provider. The default is really there; DuckDB's metadata just does not
+> show it.
 
 For SQL Server-specific features (IDENTITY, CHECK, indexes, FKs, non-literal DEFAULTs), use
 `fabricator_exec`.

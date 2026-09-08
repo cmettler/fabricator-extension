@@ -3709,8 +3709,30 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
             {
                 var field = RequireField(column, "added column");
                 string name = spec.RequireColumn();
-                string colDef = Quote(name) + " " + MapArrowToSqlType(field.DataType, Profile) +
+                string sqlType = MapArrowToSqlType(field.DataType, Profile);
+                string colDef = Quote(name) + " " + sqlType +
                                 (field.IsNullable ? " NULL" : " NOT NULL");
+                // ⚠⚠ THE DEFAULT AND `WITH VALUES`, and BOTH halves are measured (2026-09-08).
+                //
+                // Without the default the clause was SILENTLY DROPPED: the column appeared, and every later
+                // insert omitting it produced NULL where DuckDB's own table produces the default.
+                //
+                // ⚠ WITH VALUES is what BACKFILLS the existing rows, and it is needed because DuckDB
+                // backfills and SQL Server does not: MEASURED, `ADD l INT DEFAULT 10` leaves existing rows
+                // NULL while `… DEFAULT 10 WITH VALUES` makes them 10, matching DuckDB's own answer for the
+                // same statement. It is O(table) rather than metadata-only, which is the price of that
+                // agreement and is what the caller asked for by writing DEFAULT on an ADD COLUMN.
+                //
+                // ⚠ Unconditional, and that is safe rather than lucky: SQL Server backfills a NOT NULL
+                // default on its own (measured), and `NOT NULL DEFAULT 10 WITH VALUES` is valid T-SQL
+                // (measured) — but the NOT NULL shape cannot reach here at all, because DuckDB refuses
+                // `ADD COLUMN … NOT NULL DEFAULT` outright ("Adding columns with constraints not yet
+                // supported"). So the only possible shape is a NULLABLE column, which is exactly the one
+                // that needs WITH VALUES.
+                if (spec.HasDefault)
+                {
+                    colDef += " DEFAULT (" + RenderDefaultBySqlType(sqlType, spec.DefaultLiteral) + ") WITH VALUES";
+                }
                 string add = $"ALTER TABLE {qualified} ADD {colDef}";
                 ExecuteNonQuery(spec.Guard
                     ? $"IF COL_LENGTH({ObjectLiteral(schemaName, tableName)}, N'{name.Replace("'", "''")}') IS NULL " +

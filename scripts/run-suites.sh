@@ -653,7 +653,10 @@ case "$TIER" in
         # 54 since 2026-09-06: + verify_plugin_fluid_provider ({% provider_query %} / {% provider_exec %}).
         # It is its OWN suite because verify_plugin_fluid is HERMETIC and the tags need a real provider
         # catalog -- a require-env there would have moved 759 assertions out of the hermetic tier to gate 22.
-        : "${MIN_SUITES:=54}"
+        # 55 since 2026-09-08: + verify_alter_default (ADD COLUMN ... DEFAULT). SQL Server's ALTER TABLE
+        # had essentially NO gate before it -- the only catalog-level ADD COLUMN in the tree was a setup
+        # line in a locking test -- which is exactly how a silently dropped DEFAULT survived.
+        : "${MIN_SUITES:=55}"
         # 1424 since 2026-08-01: verify_exec_invalidate_cache 10 -> 21, for the OUT-OF-BAND DROP path Ã¢ÂÂ the
         # catalog's self-heal, documented in CLAUDE.md and until now covered by NOTHING. The service tier ran
         # 44/44 green while that path was broken, which is why the section exists. It must run with
@@ -995,7 +998,8 @@ case "$TIER" in
         #   execute_dml changed, so every suite in both tiers goes through them.
         # 3182 since 2026-09-06: + verify_plugin_fluid_provider's 22 ({% provider_query %} /
         #   {% provider_exec %}). 3160 + 22 exactly, so no other suite moved.
-        : "${MIN_ASSERTIONS:=3182}"
+        # 3241 since 2026-09-08: + verify_alter_default's 59. 3182 + 59 exactly, so no other suite moved.
+        : "${MIN_ASSERTIONS:=3241}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

@@ -3974,6 +3974,27 @@ void FabricatorSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
 //  position rather than the column. Field paths are still ARRAYS of segments, for the reason it gave: a
 //  segment name may contain dots.)
 
+// Carries a column DEFAULT expression onto the alter request. Shared by SET DEFAULT and ADD COLUMN, so the
+// two cannot drift on what counts as a literal or on how DEFAULT NULL is spelled.
+//
+// ⚠ Only LITERAL defaults, with ONE cast unwrapped (a boolean parses as CAST(… AS BOOLEAN)). The "default"
+// key carries the literal's TEXT and a JSON null for DEFAULT NULL; a JSON string keeps an EMPTY-string
+// literal distinguishable from an absent key, which the old "-"/"b"+base64 arg2 spelling needed base64 for.
+static void CarryDefault(FabricatorAlterRequest &request, const ParsedExpression *expr) {
+	if (expr->type == ExpressionType::OPERATOR_CAST) {
+		expr = expr->Cast<CastExpression>().child.get();
+	}
+	if (!expr || expr->type != ExpressionType::VALUE_CONSTANT) {
+		throw NotImplementedException("fabricator: only literal column DEFAULTs are supported");
+	}
+	auto &val = expr->Cast<ConstantExpression>().value;
+	request.has_default = true;
+	request.default_is_null = val.IsNull();
+	if (!request.default_is_null) {
+		request.default_literal = val.ToString();
+	}
+}
+
 void FabricatorSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 	if (info.type != AlterType::ALTER_TABLE) {
 		throw NotImplementedException("fabricator: only ALTER TABLE is supported");
@@ -4046,6 +4067,49 @@ void FabricatorSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &inf
 		request.column = ac.new_column.Name();
 		request.guard = ac.if_column_not_exists;
 		carry_type(ac.new_column.Type(), ac.new_column.Name());
+		// ⚠⚠ THE DEFAULT MUST BE CARRIED, and dropping it was SILENT: the column appeared, existing rows
+		// were NULL, and every LATER insert omitting it was NULL too, while DuckDB's own table both
+		// backfills and applies the default. Measured 2026-09-08 on SQL Server AND Delta.
+		//
+		// ⚠ A NOT NULL default cannot reach here: DuckDB refuses `ADD COLUMN … NOT NULL DEFAULT` outright
+		// ("Adding columns with constraints not yet supported"), so the only shape possible is a NULLABLE
+		// column with a default. That is what lets the SQL Server side emit ONE form unconditionally.
+		if (ac.new_column.HasDefaultValue()) {
+			CarryDefault(request, &ac.new_column.DefaultValue());
+			// ⚠⚠ A NULL-ARRIVING DEFAULT IS REFUSED, and that is the only way to avoid a silent wrong
+			// answer, because DuckDB HAS ALREADY LOST the value by this point.
+			//
+			// MEASURED 2026-09-08 by probing the expression we are handed: a BARE literal survives
+			// (10, 1.5, 1.50, 'x', and even '2024-01-01' written as a STRING), while ANY literal the parser
+			// wraps in a CAST arrives as a VALUE_CONSTANT holding NULL — `true`, `CAST(1 AS BOOLEAN)`,
+			// `DATE '2024-01-01'`, `TIMESTAMP '…'`, `'\x41'::BLOB`. DuckDB's OWN table is unaffected
+			// (ADD COLUMN e BOOLEAN DEFAULT true gives true there), so the loss is in the AlterInfo handed
+			// to a foreign catalog, not in the statement.
+			//
+			// ⚠ The two states are then INDISTINGUISHABLE: a dropped `DEFAULT true` and an honest
+			// `DEFAULT NULL` are the same NULL constant. Accepting it emitted `DEFAULT (NULL)` for
+			// `DEFAULT true` — exactly the silent defect this change exists to fix, reintroduced one layer in.
+			//
+			// ⚠ ONE RULE RATHER THAN A TYPE LIST, deliberately: a list of "types whose literals get cast"
+			// would be enumerated from measurements and could MISS one (UUID, ENUM, a nested type), and a
+			// missed type is a silent wrong answer again. Refusing every NULL arrival cannot be incomplete.
+			//
+			// ⚠ The cost is only the NO-OP spelling. `DEFAULT NULL` on an added NULLABLE column asks for what
+			// the column already does, and DuckDB refuses `ADD COLUMN … NOT NULL DEFAULT` outright, so
+			// nothing expressible here needs it. SET DEFAULT carries every type correctly (measured: a
+			// boolean lands as ((1)), a date as (N'2024-01-01')), which is what the message points at.
+			if (request.default_is_null) {
+				throw NotImplementedException(
+				    "fabricator: ALTER TABLE ADD COLUMN \"%s\" with a DEFAULT that arrives NULL is refused: a "
+				    "DEFAULT NULL and a literal DuckDB could not carry (a boolean, a DATE/TIMESTAMP literal, "
+				    "a BLOB — anything it wraps in a CAST) are indistinguishable here, so honouring it could "
+				    "silently store the wrong default. Either omit the DEFAULT (a nullable column already "
+				    "defaults to NULL), write the literal as a STRING (DEFAULT '2024-01-01'), or add the "
+				    "column and then ALTER TABLE … ALTER COLUMN \"%s\" SET DEFAULT …, which carries every "
+				    "type correctly.",
+				    ac.new_column.Name(), ac.new_column.Name());
+			}
+		}
 		break;
 	}
 	case AlterTableType::REMOVE_COLUMN: {
@@ -4106,23 +4170,7 @@ void FabricatorSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &inf
 			break;
 		}
 		request.kind = "set_default";
-		// Only literal defaults: unwrap one CAST (booleans parse as CAST(... AS BOOLEAN)).
-		const ParsedExpression *expr = sd.expression.get();
-		if (expr->type == ExpressionType::OPERATOR_CAST) {
-			expr = expr->Cast<CastExpression>().child.get();
-		}
-		if (!expr || expr->type != ExpressionType::VALUE_CONSTANT) {
-			throw NotImplementedException("fabricator: only literal column DEFAULTs are supported");
-		}
-		auto &val = expr->Cast<ConstantExpression>().value;
-		// The "default" key carries the literal's TEXT, JSON null for DEFAULT NULL. The old arg2 spelled
-		// those two states "-" and "b"+base64(text) — the base64 existed ONLY so an empty-string literal
-		// stayed distinguishable from an absent C string, which a JSON string does natively.
-		request.has_default = true;
-		request.default_is_null = val.IsNull();
-		if (!request.default_is_null) {
-			request.default_literal = val.ToString();
-		}
+		CarryDefault(request, sd.expression.get());
 		break;
 	}
 	case AlterTableType::SET_SORTED_BY: {

@@ -107,6 +107,52 @@ public class AlterTableSpecTests
     }
 
     [Fact]
+    public void AddColumnDistinguishesNoDefaultFromDefaultNull()
+    {
+        // ⚠⚠ THE SAME EMPTY-VS-ABSENT DISTINCTION AS THE TEST ABOVE, ARRIVING ON A SECOND KIND — and here
+        // DefaultLiteral alone CANNOT carry it, because the `default` key is OPTIONAL on add_column: a column
+        // with no default and one declared DEFAULT NULL would both read as null. HasDefault is what separates
+        // them, and reading it from key PRESENCE is the only way.
+        var none = AlterTableSpec.Parse("""{"kind":"add_column","column":"c"}""");
+        Assert.False(none.HasDefault);
+        Assert.Null(none.DefaultLiteral);
+
+        var explicitNull = AlterTableSpec.Parse("""{"kind":"add_column","column":"c","default":null}""");
+        Assert.True(explicitNull.HasDefault);
+        Assert.Null(explicitNull.DefaultLiteral);
+
+        var literal = AlterTableSpec.Parse("""{"kind":"add_column","column":"c","default":"10"}""");
+        Assert.True(literal.HasDefault);
+        Assert.Equal("10", literal.DefaultLiteral);
+
+        // The EMPTY literal, which is a real default (SQL Server stores it as (N'')) and must not read as
+        // absent — the case that motivated the whole distinction.
+        var empty = AlterTableSpec.Parse("""{"kind":"add_column","column":"c","default":""}""");
+        Assert.True(empty.HasDefault);
+        Assert.Equal("", empty.DefaultLiteral);
+    }
+
+    [Fact]
+    public void AddColumnWithoutADefaultKeyIsNotRefused()
+    {
+        // ⚠ The ASYMMETRY with set_default below, and it is deliberate rather than an oversight: a column
+        // need not have a default, so an absent key is the ORDINARY case here and refusing it would break
+        // every plain ADD COLUMN. On set_default the key is required, so absence can only be a malformed doc.
+        var spec = AlterTableSpec.Parse("""{"kind":"add_column","column":"c"}""");
+        Assert.Equal(AlterTableKind.AddColumn, spec.Kind);
+        Assert.False(spec.HasDefault);
+    }
+
+    [Fact]
+    public void SetDefaultAlwaysReportsHasDefault()
+    {
+        // Its key is REQUIRED, so HasDefault is always true there and DefaultLiteral null really does mean
+        // the NULL default. A consumer can therefore read one question on both kinds.
+        Assert.True(AlterTableSpec.Parse("""{"kind":"set_default","column":"c","default":null}""").HasDefault);
+        Assert.True(AlterTableSpec.Parse("""{"kind":"set_default","column":"c","default":"7"}""").HasDefault);
+    }
+
+    [Fact]
     public void SetDefaultWithoutItsDefaultKeyIsRefused()
     {
         // Absent is NOT DEFAULT NULL: null is a value here, so a missing key can only mean a malformed doc.

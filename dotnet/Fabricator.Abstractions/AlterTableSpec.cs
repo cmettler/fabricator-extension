@@ -82,6 +82,18 @@ public sealed class AlterTableSpec
     /// string cannot tell empty from absent.</summary>
     public string? DefaultLiteral { get; init; }
 
+    /// <summary>
+    /// Whether the doc carried a <c>default</c> key at all.
+    /// </summary>
+    /// <remarks>
+    /// ⚠⚠ REQUIRED because <see cref="DefaultLiteral"/> alone CANNOT distinguish the two states on
+    /// <c>add_column</c>, where the key is OPTIONAL: a column with no default and a column declared
+    /// <c>DEFAULT NULL</c> would both read as null. On <c>set_default</c> the key is required, so this is
+    /// always true there and null really does mean the NULL default — which is exactly the empty-vs-absent
+    /// distinction this class already warns about one property up, arriving a second time on a new kind.
+    /// </remarks>
+    public bool HasDefault { get; init; }
+
     /// <summary>The target column's name, or a clear error when the doc omitted it.</summary>
     public string RequireColumn() => Column ?? throw MissingField("column");
 
@@ -118,21 +130,28 @@ public sealed class AlterTableSpec
         string wire = kindElement.GetString()!;
         var kind = ParseKind(wire);
 
+        // The `default` key is REQUIRED by set_default and OPTIONAL on add_column (a column need not have
+        // one), so presence is tracked separately — see HasDefault for why null cannot carry both states.
         string? defaultLiteral = null;
-        if (kind == AlterTableKind.SetDefault)
+        bool hasDefault = false;
+        if (kind == AlterTableKind.SetDefault || kind == AlterTableKind.AddColumn)
         {
-            if (!root.TryGetProperty("default", out var defaultElement))
+            if (root.TryGetProperty("default", out var defaultElement))
+            {
+                hasDefault = true;
+                defaultLiteral = defaultElement.ValueKind switch
+                {
+                    JsonValueKind.Null => null,
+                    JsonValueKind.String => defaultElement.GetString(),
+                    _ => throw new InvalidOperationException(
+                        $"fabricator: ALTER TABLE ({wire}) 'default' must be a string or null."),
+                };
+            }
+            else if (kind == AlterTableKind.SetDefault)
             {
                 throw new InvalidOperationException(
                     "fabricator: ALTER TABLE (set_default) is missing its 'default' (use JSON null for DEFAULT NULL).");
             }
-            defaultLiteral = defaultElement.ValueKind switch
-            {
-                JsonValueKind.Null => null,
-                JsonValueKind.String => defaultElement.GetString(),
-                _ => throw new InvalidOperationException(
-                    "fabricator: ALTER TABLE (set_default) 'default' must be a string or null."),
-            };
         }
 
         return new AlterTableSpec
@@ -146,6 +165,7 @@ public sealed class AlterTableSpec
             // place that knows the mapping, keeping every consumer on a single question.
             Guard = ReadBool(root, "if_not_exists") || ReadBool(root, "if_exists"),
             DefaultLiteral = defaultLiteral,
+            HasDefault = hasDefault,
         };
     }
 

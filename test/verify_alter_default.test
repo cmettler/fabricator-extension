@@ -1,0 +1,239 @@
+# name: test/verify_alter_default.test
+# description: ALTER TABLE ADD COLUMN … DEFAULT — the clause was accepted and SILENTLY DROPPED
+# group: [fabricator]
+#
+# ⚠⚠ THIS SUITE EXISTS BECAUSE SQL SERVER'S ALTER TABLE HAD ESSENTIALLY NO GATE. The only catalog-level
+#   ADD COLUMN in the whole tree was one setup line in a locking test, asserting nothing about the ALTER —
+#   which is exactly how a dropped DEFAULT went unnoticed. Delta's ALTER has three suites; this one is
+#   SQL Server's first.
+#
+# The defect, measured 2026-09-08: `ADD COLUMN l INTEGER DEFAULT 10` added the column and discarded the
+# default, so existing rows were NULL *and every later insert omitting the column was NULL too*, where
+# DuckDB's own table both backfills and applies it.
+
+require fabricator
+
+# §6 does a Delta CTAS, and under the default native_write engine DuckDB's own COPY writes the parquet;
+# unittest does not auto-load extensions.
+require parquet
+
+require-env MSSQL_TESTDB_DSN
+
+require-env FABRICATOR_DELTA_WRITE_DIR
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS q (TYPE fabricator);
+
+# ═══ §1  ⚠⚠ THE DEFAULT IS APPLIED — to existing rows AND to later inserts ═══════════════════════════
+# ⚠ `WITH VALUES` is what backfills, and it is needed because DuckDB backfills and SQL Server does not:
+# MEASURED, `ADD l INT DEFAULT 10` leaves existing rows NULL while `… DEFAULT 10 WITH VALUES` makes them 10,
+# which is DuckDB's own answer for the same statement. It is O(table) rather than metadata-only — the price
+# of that agreement, and what the caller asked for by writing DEFAULT on an ADD COLUMN.
+#
+# ⚠ Unconditional, safely: SQL Server backfills a NOT NULL default on its own and
+# `NOT NULL DEFAULT 10 WITH VALUES` is valid T-SQL (both measured) — but the NOT NULL shape cannot arrive at
+# all, because DuckDB refuses `ADD COLUMN … NOT NULL DEFAULT` ("Adding columns with constraints not yet
+# supported"). The only possible shape is a NULLABLE column, which is the one needing WITH VALUES.
+
+statement ok
+CREATE OR REPLACE TABLE q.dbo.ad_a AS SELECT 1 AS i;
+
+statement ok
+ALTER TABLE q.dbo.ad_a ADD COLUMN a INTEGER DEFAULT 10;
+
+statement ok
+ALTER TABLE q.dbo.ad_a ADD COLUMN b VARCHAR DEFAULT 'x';
+
+statement ok
+ALTER TABLE q.dbo.ad_a ADD COLUMN c DATE DEFAULT '2024-01-01';
+
+statement ok
+ALTER TABLE q.dbo.ad_a ADD COLUMN d DOUBLE DEFAULT 1.5;
+
+# ⚠⚠ THE INSERT IS ASSERTED FIRST, AND THE ORDER IS DELIBERATE: it separates the two mutants. Losing the
+# default entirely kills THIS row, while losing only `WITH VALUES` leaves it passing and kills the BACKFILL
+# row below — so the two failures name different causes instead of both landing on whichever came first.
+# It is also the honest ordering: an insert honouring a declared default is wrong on ANY reading of the
+# semantics, where backfill is the contested half.
+statement ok
+INSERT INTO q.dbo.ad_a (i) VALUES (2);
+
+query IITTR
+SELECT i, a, b, c, d FROM q.dbo.ad_a WHERE i = 2;
+----
+2	10	x	2024-01-01	1.5
+
+# …and the row that already EXISTED is backfilled. This returned NULL for every added column before the fix,
+# and it is what `WITH VALUES` buys.
+query IITTR
+SELECT i, a, b, c, d FROM q.dbo.ad_a WHERE i = 1;
+----
+1	10	x	2024-01-01	1.5
+
+# ═══ §2  ⚠⚠ DEFAULT NULL vs NO DEFAULT — the state the wire could not carry ═══════════════════════════
+# `DefaultLiteral` alone cannot tell them apart, because null means both. `set_default` REQUIRES the key so
+# null is unambiguous there; on `add_column` the key is OPTIONAL, so the spec grew a separate `HasDefault`.
+# Without it, "no default" and "DEFAULT NULL" would collapse — the empty-vs-absent trap the spec's own
+# comment already warns about, arriving a second time on a new kind.
+#
+# ⚠ Asserted on the SERVER, because that is the only place the distinction is visible: SQL Server defaults
+# are named constraints, so an absent default has NO row and `DEFAULT ''` has one holding the empty string.
+
+statement ok
+ALTER TABLE q.dbo.ad_a ADD COLUMN e INTEGER;
+
+statement ok
+ALTER TABLE q.dbo.ad_a ADD COLUMN f VARCHAR DEFAULT '';
+
+query TT
+SELECT name, coalesce(definition, '<none>') AS def
+FROM fabricator_query('q', 'SELECT c.name AS name, dc.definition AS definition FROM sys.columns c LEFT JOIN sys.default_constraints dc ON dc.parent_object_id = c.object_id AND dc.parent_column_id = c.column_id WHERE c.object_id = OBJECT_ID(''dbo.ad_a'')')
+ORDER BY name;
+----
+a	((10))
+b	(N'x')
+c	(N'2024-01-01')
+d	((1.5))
+e	<none>
+f	(N'')
+i	<none>
+
+# ⚠ THE EMPTY STRING IS A VALUE, not an absence — the row above shows the constraint exists, and this shows
+# what it does.
+query II
+SELECT f = '' AS is_empty, f IS NULL AS is_null FROM q.dbo.ad_a WHERE i = 1;
+----
+1	0
+
+# ═══ §3  ⚠⚠ A NULL-ARRIVING DEFAULT IS REFUSED, because DuckDB HAS ALREADY LOST THE VALUE ══════════════
+# MEASURED by probing the expression handed to the catalog: a BARE literal survives (10, 1.5, 1.50, 'x', and
+# '2024-01-01' written as a STRING), while ANY literal the parser wraps in a CAST arrives as a VALUE_CONSTANT
+# holding NULL — `true`, `CAST(1 AS BOOLEAN)`, `DATE '2024-01-01'`, `TIMESTAMP '…'`, `'\x41'::BLOB`.
+# DuckDB's OWN table is unaffected (`ADD COLUMN e BOOLEAN DEFAULT true` gives true there), so the loss is in
+# the AlterInfo handed to a FOREIGN catalog. Recorded in docs/duckdb-upstream-issues.md.
+#
+# ⚠⚠ A dropped value and an honest `DEFAULT NULL` are then the SAME NULL constant, so accepting it emitted
+# `DEFAULT (NULL)` for `DEFAULT true` — the silent defect this suite exists for, reintroduced one layer in.
+#
+# ⚠ ONE RULE, NOT A TYPE LIST: a list of "types whose literals get cast" would be enumerated from
+# measurements and could MISS one (UUID, ENUM, a nested type), and a missed type is silent again.
+
+statement error
+ALTER TABLE q.dbo.ad_a ADD COLUMN g BOOLEAN DEFAULT true;
+----
+arrives NULL is refused
+
+statement error
+ALTER TABLE q.dbo.ad_a ADD COLUMN h TIMESTAMP DEFAULT TIMESTAMP '2024-01-01 10:00:00';
+----
+arrives NULL is refused
+
+# ⚠ Including the honest DEFAULT NULL, which is the cost of the one-rule form — and it is a NO-OP request: a
+# nullable column already defaults to NULL, and DuckDB refuses `ADD COLUMN … NOT NULL DEFAULT` outright, so
+# nothing expressible here needs the spelling.
+statement error
+ALTER TABLE q.dbo.ad_a ADD COLUMN k INTEGER DEFAULT NULL;
+----
+arrives NULL is refused
+
+# ⚠ THE WORKAROUND THE MESSAGE NAMES, asserted so it is not folklore: the same date as a STRING literal is
+# carried. §1 already proved the value lands; this is the pair that makes the refusal actionable.
+statement ok
+ALTER TABLE q.dbo.ad_a ADD COLUMN m DATE DEFAULT '2024-02-02';
+
+query T
+SELECT m FROM q.dbo.ad_a WHERE i = 1;
+----
+2024-02-02
+
+# ═══ §4  SET DEFAULT carries EVERY type — the control for the shared helper ═══════════════════════════
+# ADD COLUMN and SET DEFAULT now extract the literal through ONE helper (CarryDefault), so a change to what
+# counts as a literal cannot reach one and miss the other. These rows are what showed the helper was sound
+# and that the loss above is upstream: the SAME boolean and date that ADD COLUMN cannot carry arrive
+# correctly here.
+
+statement ok
+ALTER TABLE q.dbo.ad_a ALTER COLUMN e SET DEFAULT 7;
+
+statement ok
+CREATE OR REPLACE TABLE q.dbo.ad_b AS SELECT true AS b, DATE '2020-01-01' AS d;
+
+statement ok
+ALTER TABLE q.dbo.ad_b ALTER COLUMN b SET DEFAULT true;
+
+statement ok
+ALTER TABLE q.dbo.ad_b ALTER COLUMN d SET DEFAULT DATE '2024-01-01';
+
+query TT
+SELECT name, coalesce(definition, '<none>') AS def
+FROM fabricator_query('q', 'SELECT c.name AS name, dc.definition AS definition FROM sys.columns c LEFT JOIN sys.default_constraints dc ON dc.parent_object_id = c.object_id AND dc.parent_column_id = c.column_id WHERE c.object_id = OBJECT_ID(''dbo.ad_b'')')
+ORDER BY name;
+----
+b	((1))
+d	(N'2024-01-01')
+
+# ⚠ DROP DEFAULT removes the constraint rather than setting it to NULL — a second control for the refactor,
+# since drop_default is the kind that carries no literal at all.
+statement ok
+ALTER TABLE q.dbo.ad_b ALTER COLUMN b DROP DEFAULT;
+
+query T
+SELECT coalesce(definition, '<none>') AS def
+FROM fabricator_query('q', 'SELECT c.name AS name, dc.definition AS definition FROM sys.columns c LEFT JOIN sys.default_constraints dc ON dc.parent_object_id = c.object_id AND dc.parent_column_id = c.column_id WHERE c.object_id = OBJECT_ID(''dbo.ad_b'')')
+WHERE name = 'b';
+----
+<none>
+
+# ═══ §5  ⚠ CHARACTERIZATION: a column default is NOT reported in DuckDB's metadata ════════════════════
+# PRE-EXISTING and unrelated to the fix above — the catalog never reads column defaults back from the
+# provider, so `information_schema.columns.column_default` is NULL even for a column that demonstrably has
+# one on the server (§2 shows `((10))` for the same column). It is equally true of a CREATE-time default.
+#
+# ⚠ Pinned rather than fixed because it is a different mechanism (the table-schema crossing would have to
+# carry defaults as Arrow field metadata) and a different decision. No mutant of ours kills this row; its
+# value is that the day it is fixed, this assertion fails and names what changed.
+
+query I
+SELECT count(*) FROM information_schema.columns
+WHERE table_catalog = 'q' AND table_name = 'ad_a' AND column_default IS NOT NULL;
+----
+0
+
+# ═══ §6  Delta REFUSES a default rather than dropping it ══════════════════════════════════════════════
+# ⚠ Delta records a column default through the `allowColumnDefaults` writer feature and the
+# CURRENT_DEFAULT / EXISTS_DEFAULT field-metadata keys, and engineered-wood implements NONE of them (checked
+# 2026-09-08: zero hits for any of those names in its sources). So there is nothing correct to do with the
+# value — backfilling WITHOUT recording it would leave a table whose first N rows carry the default and
+# whose every later insert carries NULL, with nothing saying one was ever declared and nothing marking which
+# rows were written, so it could not be repaired afterwards either.
+#
+# ⚠ It agrees with SET DEFAULT, which this provider already refuses.
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/ad_delta' AS lake (TYPE fabricator, PROVIDER 'delta');
+
+statement ok
+CREATE TABLE lake.main.ad AS SELECT 1 AS i;
+
+statement error
+ALTER TABLE lake.main.ad ADD COLUMN l INTEGER DEFAULT 10;
+----
+ADD COLUMN ... DEFAULT is not supported
+
+# ⚠ THE CONTROL: the same ALTER without a default still works, so the refusal is about the bag and not about
+# ADD COLUMN being broken on this provider.
+statement ok
+ALTER TABLE lake.main.ad ADD COLUMN l INTEGER;
+
+query II
+SELECT i, l FROM lake.main.ad;
+----
+1	NULL
+
+# ═══ §7  Teardown ════════════════════════════════════════════════════════════════════════════════════
+
+statement ok
+DETACH lake;
+
+statement ok
+SELECT fabricator_exec('q', 'DROP TABLE dbo.ad_a; DROP TABLE dbo.ad_b;');

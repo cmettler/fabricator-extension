@@ -189,7 +189,10 @@ jobs:
           # the one platform it is running on, so "another platform's directory is never taken" and "an
           # archive carrying nothing for this platform is refused" are only reachable here.
           # Nothing here is platform-skipped, so Total is the same on both runners.
-          EXPECTED_MINIMUM: 249
+          # 252 since 2026-09-08: AlterTableSpec's HasDefault -- add_column's `default` key is OPTIONAL, so
+          #   DefaultLiteral alone cannot tell "no default" from "DEFAULT NULL". Same empty-vs-absent
+          #   distinction the class already warned about for arg2, arriving on a second kind.
+          EXPECTED_MINIMUM: 252
         run: |
           total=$(grep -oE 'Total:[[:space:]]+[0-9]+' bridge-test-output.txt | grep -oE '[0-9]+' | head -1)
           if [ -z "$total" ]; then

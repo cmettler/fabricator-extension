@@ -5224,6 +5224,29 @@ public sealed class DeltaCatalog : IProviderCatalog
                 {
                     var col0 = c ?? throw new System.InvalidOperationException(
                         "delta ADD COLUMN requires a column definition.");
+                    // ⚠⚠ A DEFAULT IS REFUSED HERE, and refusing is the SAFE answer rather than a gap. Delta
+                    // records a column default via the `allowColumnDefaults` writer feature and the
+                    // CURRENT_DEFAULT / EXISTS_DEFAULT field-metadata keys — and engineered-wood implements
+                    // NONE of them (checked 2026-09-08: zero hits for any of those names in its sources).
+                    //
+                    // ⚠ So there is no correct thing to do with the value. Backfilling the existing rows
+                    // WITHOUT recording the default would leave a table whose first N rows carry it and whose
+                    // every later insert carries NULL, with nothing anywhere saying a default was ever
+                    // declared — and nothing marking which rows were written, so it could not be repaired
+                    // afterwards either. Dropping it silently is what this build used to do, and that is the
+                    // defect being fixed.
+                    //
+                    // ⚠ The same reasoning is why SET DEFAULT is refused on this provider; the two agree.
+                    // Retiring this needs EW to support column defaults FIRST.
+                    if (spec.HasDefault)
+                    {
+                        throw new System.NotSupportedException(
+                            "delta provider: ADD COLUMN ... DEFAULT is not supported — Delta records a column "
+                            + "default through the allowColumnDefaults writer feature, which this engine does "
+                            + "not implement, so the value could neither be stored nor applied to later "
+                            + "inserts. Add the column, then set the values with an UPDATE.");
+                    }
+
                     string name0 = spec.Column ?? col0.Name;
                     var field0 = string.Equals(name0, col0.Name, System.StringComparison.Ordinal)
                         ? col0
@@ -5297,6 +5320,16 @@ public sealed class DeltaCatalog : IProviderCatalog
             {
                 var col = c ?? throw new System.InvalidOperationException(
                     "delta ADD COLUMN requires a column definition.");
+                // ⚠ Refused for the reason spelled out at the buffered site above: EW implements none of
+                // Delta's column-default surface, so the value can be neither stored nor applied.
+                if (spec.HasDefault)
+                {
+                    throw new System.NotSupportedException(
+                        "delta provider: ADD COLUMN ... DEFAULT is not supported — Delta records a column "
+                        + "default through the allowColumnDefaults writer feature, which this engine does not "
+                        + "implement, so the value could neither be stored nor applied to later inserts. Add "
+                        + "the column, then set the values with an UPDATE.");
+                }
                 string name = spec.Column ?? col.Name;
                 var field = string.Equals(name, col.Name, System.StringComparison.Ordinal)
                     ? col

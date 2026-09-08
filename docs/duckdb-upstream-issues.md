@@ -647,6 +647,60 @@ variadic function of ours does not go looking for a bug on our side — which is
 correct-but-absent rendering would fail forever, and "fix the test to match" is the wrong move only when the
 behaviour under test is ours. Here it is not.
 
+---
+
+## 7. ⚠ A cast-wrapped column DEFAULT is flattened to NULL in the `AlterInfo` a FOREIGN catalog receives
+
+**Found 2026-09-08. NOT REPRODUCED ON A STOCK WHEEL, and therefore NOT FILED** — see §2 for why that
+distinction is enforced here rather than being a formality.
+
+### What was measured
+
+`ALTER TABLE <foreign>.t ADD COLUMN e <type> DEFAULT <literal>` reaches the catalog's `Alter` as an
+`AddColumnInfo` whose `new_column.DefaultValue()` is a `VALUE_CONSTANT`. Probing that expression directly:
+
+| written | arrives as |
+|---|---|
+| `INTEGER DEFAULT 10` | `10` |
+| `BIGINT DEFAULT 10` | `10` |
+| `DOUBLE DEFAULT 1.5` | `1.5` |
+| `DECIMAL(9,2) DEFAULT 1.50` | `1.50` |
+| `VARCHAR DEFAULT 'x'` | `'x'` |
+| `DATE DEFAULT '2024-01-01'` | `'2024-01-01'` |
+| `BOOLEAN DEFAULT true` | **`NULL`** |
+| `BOOLEAN DEFAULT CAST(1 AS BOOLEAN)` | **`NULL`** |
+| `DATE DEFAULT DATE '2024-01-01'` | **`NULL`** |
+| `TIMESTAMP DEFAULT TIMESTAMP '…'` | **`NULL`** |
+| `BLOB DEFAULT '\x41'::BLOB` | **`NULL`** |
+
+⇒ a **BARE** literal survives; anything the parser wraps in a **CAST** arrives as a constant holding NULL.
+The expression type is `VALUE_CONSTANT` (75) in every case, so nothing signals that a value was lost.
+
+### The control that makes it a finding rather than a guess
+
+**DuckDB's OWN table is unaffected**: `CREATE TABLE t AS SELECT 1 AS i; ALTER TABLE t ADD COLUMN e BOOLEAN
+DEFAULT true;` yields `true`. So the statement and the parse are fine, and the loss is in what a foreign
+catalog's `Alter` is handed.
+
+### Why it matters, and what we do about it
+
+The lost value is **indistinguishable from an honest `DEFAULT NULL`** — both are a NULL constant — so a
+consumer that honours it stores the wrong default silently. `fabricator` therefore REFUSES a NULL-arriving
+default on `ADD COLUMN`, as one rule rather than a list of affected types (a list enumerated from
+measurements can miss one, and a missed type is silent again). Gate: `verify_alter_default` §3.
+
+⚠ `ALTER COLUMN … SET DEFAULT` is NOT affected — the same boolean and date arrive intact there (measured:
+they reach SQL Server as `((1))` and `(N'2024-01-01')`), which is what localises the problem to
+`AddColumnInfo` rather than to the shared literal handling.
+
+### What filing it would need
+
+A repro with no third-party extension. The behaviour is only observable through a catalog implementation's
+`Alter`, so it needs either a C++ unit test over a stub catalog, or another catalog extension that surfaces
+the default (postgres/mysql scanner). Until then this is a recorded local finding, not an upstream report.
+
+---
+
 ## Not a bug, but pinned here because it wasted time three times
 
 `read_parquet` answers `count(*)` — and `count(<col>)` — from parquet footer metadata without decoding the
