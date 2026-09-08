@@ -496,6 +496,39 @@ catching. Two diagnostics were added in the same pass to make this class of bug 
 path's own DDL is now logged (`bulk ddl [txn=… own=…]`), and the `ddl create`/`ddl alter` traces now carry the
 transaction id and whether the connection was the pinned one — the annotation that made the diagnosis possible.
 
+## 6.7 `COMMENT ON` and `supports_extended_properties` — the general rule applied BEFORE a defect (2026-09-08)
+
+`COMMENT ON TABLE` / `COMMENT ON COLUMN` are stored as the **`MS_Description`** extended property, which is
+what SSMS's *Description* box reads and writes. That makes the whole feature depend on
+`sys.extended_properties` + `sp_addextendedproperty` / `sp_updateextendedproperty` /
+`sp_dropextendedproperty`, and those are not part of the warehouse surface.
+
+`ServerProfile.SupportsExtendedProperties => !IsWarehouse` gates it, and the interesting thing about this one
+is that **it is §6.5's rule applied in advance rather than after an incident.** The tempting shape is to issue
+the proc and let the server answer; on Fabric that answer arrives as a statement error, which inside an
+explicit transaction aborts the whole transaction — so the user loses more than the `COMMENT ON`. Refusing
+before anything is sent leaves their transaction usable. The refusal names the engine edition and points at
+`fabricator_server_info(catalog)`, which reports the flag.
+
+> ⚠ **UNMEASURED on the engines it excludes.** There is no live Fabric Warehouse, Lakehouse SQL endpoint or
+> Synapse dedicated pool here, so the flag is CONSERVATIVE BY CHOICE rather than by measurement — exactly the
+> state `SupportsCdc` records for Azure SQL Database. Being wrong in this direction refuses a statement that
+> might have worked; being wrong the other way issues one that fails and takes a transaction with it. **If a
+> live warehouse becomes available, this is a one-line check worth running** (`EXEC sys.sp_addextendedproperty
+> @name=N'MS_Description', @value=N'x', @level0type=N'SCHEMA', @level0name=N'dbo', @level1type=N'TABLE',
+> @level1name=N'<t>'` in AUTOCOMMIT, never inside a transaction) — and if it works there, the gate narrows to
+> `EngineEdition == EditionSynapseDedicated` or disappears.
+>
+> ⚠ Edition 11 cannot tell a Fabric **Warehouse** from a Fabric **Lakehouse SQL endpoint**, so the gate
+> necessarily covers both. That is fine here — neither is expected to provide extended properties, and the
+> Lakehouse endpoint is read-only for DDL anyway — but it means a measurement on one does NOT settle the other,
+> and narrowing the gate would need a discriminator this profile does not have.
+
+Gate: `verify_comment_on_mssql` §0 asserts `is_warehouse = false` and `supports_extended_properties = true` on
+box. That pair is the control the rest of the suite rests on: without it a green run would be equally
+consistent with a build that had stopped gating at all, and the refusal on a warehouse could not be told apart
+from this box simply working.
+
 ## 6.6 FABRIC: catalog discovery enumerated schemas it had already excluded — FIXED (2026-08-25)
 
 `dbt run --target fabric` died before building any model with

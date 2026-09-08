@@ -167,7 +167,7 @@ case "$TIER" in
         # plugin root, and the derived lists reclassified it on their own. The service tier loses the same
         # run. Its 234 assertions now run on all THREE platforms instead of linux-only, which matters here
         # more than usual: its temporal assertions read TimeZoneInfo.Local.
-        : "${MIN_SUITES:=75}"
+        : "${MIN_SUITES:=76}"
         # 5656 since 2026-08-02: verify_delta_catalog_transactions 943 -> 944 Ã¢ÂÂ ROLLBACK now RECLAIMS the
         # data files the transaction eagerly wrote (EW #52's DiscardDataFilesAsync) instead of leaving them
         # for VACUUM. +2, not +1: that suite is one of the DOUBLED ones below, so an assertion added to it
@@ -599,7 +599,11 @@ case "$TIER" in
         # two functions have exactly ONE registration each, plus the HostsCatalog refusal and its
         # unknown-provider control. 3105 + 238 + 8259 - 3339 arithmetic aside, both numbers come from green
         # runs.
-        : "${MIN_ASSERTIONS:=9035}"
+        # 9074 since 2026-09-08: + verify_comment_on's 39 (COMMENT ON TABLE / COLUMN on Delta). 9035 + 39
+        #   exactly, so no other suite moved. 9075 the same day: the suite went 39 -> 40 when a COLUMN
+        #   comment on a provider-declared VIEW gained its own refusal - SetColumnCommentInfo leaves
+        #   catalog_entry_type INVALID, so the table form's entry-type check cannot cover it.
+        : "${MIN_ASSERTIONS:=9075}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh
@@ -656,7 +660,7 @@ case "$TIER" in
         # 55 since 2026-09-08: + verify_alter_default (ADD COLUMN ... DEFAULT). SQL Server's ALTER TABLE
         # had essentially NO gate before it -- the only catalog-level ADD COLUMN in the tree was a setup
         # line in a locking test -- which is exactly how a silently dropped DEFAULT survived.
-        : "${MIN_SUITES:=55}"
+        : "${MIN_SUITES:=56}"
         # 1424 since 2026-08-01: verify_exec_invalidate_cache 10 -> 21, for the OUT-OF-BAND DROP path Ã¢ÂÂ the
         # catalog's self-heal, documented in CLAUDE.md and until now covered by NOTHING. The service tier ran
         # 44/44 green while that path was broken, which is why the section exists. It must run with
@@ -999,7 +1003,9 @@ case "$TIER" in
         # 3182 since 2026-09-06: + verify_plugin_fluid_provider's 22 ({% provider_query %} /
         #   {% provider_exec %}). 3160 + 22 exactly, so no other suite moved.
         # 3241 since 2026-09-08: + verify_alter_default's 59. 3182 + 59 exactly, so no other suite moved.
-        : "${MIN_ASSERTIONS:=3241}"
+        # 3280 since 2026-09-08: + verify_comment_on_mssql's 39 (the MS_Description extended property).
+        #   3241 + 39 exactly, so no other suite moved.
+        : "${MIN_ASSERTIONS:=3280}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

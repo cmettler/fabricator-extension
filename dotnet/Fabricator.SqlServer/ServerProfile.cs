@@ -73,6 +73,26 @@ internal sealed class ServerProfile
     public bool SupportsCdc => !IsWarehouse;
 
     /// <summary>
+    /// Extended properties exist (<c>sys.extended_properties</c> + <c>sp_addextendedproperty</c>) — the only
+    /// place SQL Server can store what other engines call a COMMENT, under the <c>MS_Description</c> name
+    /// that SSMS's "Description" box writes. Gates <c>COMMENT ON TABLE</c> / <c>COMMENT ON COLUMN</c>.
+    /// </summary>
+    /// <remarks>
+    /// <para>FALSE for the whole warehouse family — Fabric Warehouse, the Fabric Lakehouse SQL endpoint
+    /// (both edition 11, indistinguishable from each other by edition) and Synapse dedicated (6).
+    /// <b>⚠ UNMEASURED on those engines</b>: there is no live warehouse here, so the flag is CONSERVATIVE by
+    /// choice rather than by measurement. Being wrong in this direction refuses a statement that might have
+    /// worked; being wrong the other way issues one that fails.</para>
+    /// <para><b>⚠ It MUST stay a capability gate and must never become a try/catch probe</b> — the same rule
+    /// <see cref="SupportsCdc"/> carries, and for the same measured reason: on a warehouse engine a statement
+    /// that errors inside an explicit transaction ABORTS the transaction, so a swallowed probe poisons
+    /// whatever the caller does next (docs/warehouse-support.md §6.5, the dbt 15225 defect). Refusing BEFORE
+    /// issuing anything leaves the caller's transaction usable, which propagating the server's own error
+    /// would not.</para>
+    /// </remarks>
+    public bool SupportsExtendedProperties => !IsWarehouse;
+
+    /// <summary>
     /// Isolation level for the pinned WRITE transaction (BeginWrite). Fabric Warehouse / Lakehouse SQL
     /// endpoint only support SNAPSHOT, so we set it explicitly there; box SQL Server / Azure SQL DB /
     /// Synapse dedicated keep the connection/server default (empty => Unspecified). Synapse dedicated is
@@ -126,6 +146,7 @@ internal sealed class ServerProfile
         ("max_datetime2_scale", MaxDateTime2Scale.ToString()),
         ("has_native_json", Bool(HasNativeJson)),
         ("supports_cdc", Bool(SupportsCdc)),
+        ("supports_extended_properties", Bool(SupportsExtendedProperties)),
         ("is_utf8_collation", Bool(IsUtf8Collation)),
         ("is_binary_collation", Bool(IsBinaryCollation)),
         ("is_case_sensitive", Bool(IsCaseSensitive)),

@@ -146,6 +146,11 @@ public:
 	void Alter(CatalogTransaction transaction, AlterInfo &info) override;
 
 private:
+	//! COMMENT ON TABLE / COMMENT ON COLUMN. Its own method rather than a case in Alter's switch because
+	//! those arrive as AlterType::SET_COMMENT / SET_COLUMN_COMMENT and carry NO AlterTableInfo — so they
+	//! must be dispatched before Alter's `info.Cast<AlterTableInfo>()`, which would otherwise be a bad cast.
+	void AlterComment(CatalogTransaction transaction, AlterInfo &info);
+
 	//! Materializes (and caches) the catalog entry for a table. `at` is the reference's time-travel clause:
 	//! null => the ordinary LATEST entry; set => an entry whose ColumnList is the schema AS OF that version,
 	//! which is what `SELECT *` expands against.

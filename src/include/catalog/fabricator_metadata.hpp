@@ -216,6 +216,12 @@ struct FabricatorAlterRequest {
 	bool has_default = false;
 	bool default_is_null = false;
 	string default_literal;
+	//! COMMENT ON only: emit the (required) "comment" key. `comment_is_null` is the REMOVE spelling
+	//! (`COMMENT ON TABLE t IS NULL`), which a missing key could not be told apart from — the same
+	//! required-key/nullable-value shape as `default`, for the same reason.
+	bool has_comment = false;
+	bool comment_is_null = false;
+	string comment;
 };
 
 //! Renders a `FabricatorAlterRequest` as the `table_alter` JSON doc. Uses yyjson's mutable API rather than

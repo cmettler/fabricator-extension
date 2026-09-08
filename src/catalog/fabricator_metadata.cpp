@@ -428,6 +428,13 @@ string FabricatorRenderAlterJson(const FabricatorAlterRequest &request) {
 			add_str("default", request.default_literal);
 		}
 	}
+	if (request.has_comment) {
+		if (request.comment_is_null) {
+			yyjson_mut_obj_add_null(doc, root, "comment");
+		} else {
+			add_str("comment", request.comment);
+		}
+	}
 
 	char *rendered = yyjson_mut_write(doc, 0, nullptr);
 	if (!rendered) {

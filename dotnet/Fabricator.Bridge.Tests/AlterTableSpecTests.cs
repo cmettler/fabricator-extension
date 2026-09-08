@@ -233,4 +233,76 @@ public class AlterTableSpecTests
         var spec = AlterTableSpec.Parse("""{"kind":"drop_column","column":"c","future_key":{"a":1}}""");
         Assert.Equal("c", spec.RequireColumn());
     }
+
+    [Fact]
+    public void CommentKindsCarryTheirTextAndTheirTarget()
+    {
+        var table = AlterTableSpec.Parse("""{"kind":"set_comment","comment":"a table comment"}""");
+        Assert.Equal(AlterTableKind.SetComment, table.Kind);
+        Assert.Equal("a table comment", table.Comment);
+        Assert.Null(table.Column); // the TABLE form addresses no column
+
+        var column = AlterTableSpec.Parse("""{"kind":"set_column_comment","column":"j","comment":"c"}""");
+        Assert.Equal(AlterTableKind.SetColumnComment, column.Kind);
+        Assert.Equal("j", column.RequireColumn());
+        Assert.Equal("c", column.Comment);
+    }
+
+    [Fact]
+    public void ANullCommentIsTheRemoveSpellingAndNotAnAbsence()
+    {
+        // THE reason the wire key is REQUIRED for these kinds. `COMMENT ON TABLE t IS NULL` REMOVES the
+        // comment, so a null VALUE is a real instruction; if an absent key also parsed to null the provider
+        // could not tell "remove it" from a malformed doc, and would remove a comment nobody asked about.
+        Assert.Null(AlterTableSpec.Parse("""{"kind":"set_comment","comment":null}""").Comment);
+        Assert.Null(AlterTableSpec.Parse("""{"kind":"set_column_comment","column":"j","comment":null}""").Comment);
+    }
+
+    [Fact]
+    public void ACommentKindWithoutItsCommentKeyIsRefused()
+    {
+        foreach (var json in new[]
+                 {
+                     """{"kind":"set_comment"}""",
+                     """{"kind":"set_column_comment","column":"j"}""",
+                 })
+        {
+            var error = Assert.Throws<InvalidOperationException>(() => AlterTableSpec.Parse(json));
+            Assert.Contains("'comment'", error.Message);
+            // The message must point at the REMOVE spelling, since that is the state an author reaching for
+            // an omitted key is usually after.
+            Assert.Contains("null", error.Message);
+        }
+    }
+
+    [Fact]
+    public void ANonStringCommentIsRefused()
+    {
+        var error = Assert.Throws<InvalidOperationException>(
+            () => AlterTableSpec.Parse("""{"kind":"set_comment","comment":42}"""));
+        Assert.Contains("must be a string or null", error.Message);
+    }
+
+    [Fact]
+    public void CommentTextSurvivesEveryEscapeTheHostMustEmit()
+    {
+        // The host renders this doc with yyjson's mutable API precisely so a comment containing quotes,
+        // backslashes or control characters round-trips; a comment is free-form user text, so it is the
+        // most likely field in the whole doc to carry one.
+        const string awkward = """it's "quoted", a backslash \, and a } brace""";
+        string json = System.Text.Json.JsonSerializer.Serialize(
+            new System.Collections.Generic.Dictionary<string, string>
+            {
+                ["kind"] = "set_comment",
+                ["comment"] = awkward,
+            });
+        Assert.Equal(awkward, AlterTableSpec.Parse(json).Comment);
+    }
+
+    [Fact]
+    public void CommentKindsRoundTripTheirWireNames()
+    {
+        Assert.Equal("set_comment", AlterTableSpec.WireName(AlterTableKind.SetComment));
+        Assert.Equal("set_column_comment", AlterTableSpec.WireName(AlterTableKind.SetColumnComment));
+    }
 }

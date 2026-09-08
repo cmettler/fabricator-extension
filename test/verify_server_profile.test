@@ -13,10 +13,15 @@ ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE fabricator);
 # value this CATALOG resolved (capability ∧ the mssql_mars setting/ATTACH option). The pair is the point:
 # `supports_mars` alone cannot show that a `SET mssql_mars='false'` reached the catalog, which is what let
 # verify_mars_off_same_catalog pass vacuously.
+#
+# 17 since 2026-09-08: + supports_extended_properties, which gates COMMENT ON (a comment is stored as the
+# MS_Description extended property, and the warehouse family provides none). It is here rather than only in
+# verify_comment_on_mssql because THIS is the suite that would notice a capability being added or dropped
+# without anyone updating its gate - which is exactly what happened when it was added.
 query I
 SELECT count(*) FROM fabricator_server_info('db');
 ----
-16
+17
 
 # Detected raw values for the test SQL Server 2025 (box, Developer edition).
 query I

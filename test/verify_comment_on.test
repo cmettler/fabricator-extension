@@ -1,0 +1,210 @@
+# name: test/verify_comment_on.test
+# description: COMMENT ON TABLE / COMMENT ON COLUMN against a Delta catalog, plus the shared refusals.
+#              Until 2026-09-08 both spellings failed with "fabricator: only ALTER TABLE is supported" -
+#              they arrive as AlterType::SET_COMMENT / SET_COLUMN_COMMENT and carry no AlterTableInfo, so
+#              FabricatorSchemaEntry::Alter refused them before its cast. WRITE-ONLY: the comment is stored
+#              where the Delta protocol puts it (metaData.description; the field's metadata.comment) so a
+#              foreign engine reads it, but nothing reads it BACK into duckdb_tables().comment yet - which
+#              is why every assertion here goes through the LOG rather than through DuckDB's metadata.
+#              THE LOAD-BEARING ASSERTIONS ARE THE COLUMN-MAPPING ONES (section 3): a column comment
+#              rewrites the schema JSON, and column mapping keeps delta.columnMapping.physicalName THERE. A
+#              typed round-trip through engineered-wood's schema model could drop it, which would make the
+#              existing data files unreadable with NOTHING failing at the time of the ALTER - so the edit is
+#              a surgical JsonNode change and these rows are what prove it. Set FABRICATOR_DELTA_WRITE_DIR.
+# group: [fabricator]
+
+require fabricator
+
+require parquet
+
+# json is LOAD-BEARING, not hygiene: every assertion below reads the Delta log through json_extract_string,
+# and unittest does NOT auto-load extensions - without this the whole suite fails as a missing FUNCTION.
+require json
+
+require-env FABRICATOR_DELTA_WRITE_DIR
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}' AS d (TYPE fabricator, PROVIDER 'delta');
+
+statement ok
+CREATE OR REPLACE TABLE d.main.co AS SELECT 7 AS i, 'seven' AS j;
+
+# The LATEST metaData action in the log. Every assertion reads through this: a metaData action REPLACES the
+# previous one, so the newest is the table's current metadata and an older one says nothing about now.
+statement ok
+CREATE OR REPLACE VIEW latest AS
+  SELECT line FROM read_text('${FABRICATOR_DELTA_WRITE_DIR}/co/_delta_log/*.json') t,
+         unnest(str_split(rtrim(t.content, chr(10)), chr(10))) AS u(line)
+   WHERE json_extract_string(line, '$.metaData.id') IS NOT NULL
+   ORDER BY t.filename DESC LIMIT 1;
+
+# ============================================================================
+# 1. THE STARTING STATE - no comment anywhere.
+#    A control, and not a formality: without it every "the comment is there" row below would pass equally
+#    on a build that had always written one.
+# ============================================================================
+
+query I
+SELECT json_extract_string(line, '$.metaData.description') IS NULL FROM latest;
+----
+true
+
+# ============================================================================
+# 2. COMMENT ON TABLE -> metaData.description, the field delta-spark's DESCRIBE DETAIL reports.
+# ============================================================================
+
+statement ok
+COMMENT ON TABLE d.main.co IS 'the table comment';
+
+query I
+SELECT json_extract_string(line, '$.metaData.description') FROM latest;
+----
+the table comment
+
+# An UPSERT, not an append: a second COMMENT ON replaces the first rather than adding a second description.
+statement ok
+COMMENT ON TABLE d.main.co IS 'O''Brien''s table';
+
+query I
+SELECT json_extract_string(line, '$.metaData.description') FROM latest;
+----
+O'Brien's table
+
+# ============================================================================
+# 3. COMMENT ON COLUMN -> the field's metadata.comment, AND the column-mapping metadata SURVIVES.
+#    `phys_kept` is the assertion this whole feature is guarded by. Column mapping is the DEFAULT here, so
+#    the physical name in field metadata is what maps a logical column to the bytes on disk; losing it while
+#    adding a comment would be silent corruption. Section 4 then proves the same thing from the DATA side.
+# ============================================================================
+
+statement ok
+COMMENT ON COLUMN d.main.co.j IS 'the column comment';
+
+query TTI
+SELECT json_extract_string(f, '$.name') AS col,
+       coalesce(json_extract_string(f, '$.metadata.comment'), '(none)') AS cmt,
+       json_extract_string(f, '$.metadata."delta.columnMapping.physicalName"') IS NOT NULL AS phys_kept
+  FROM latest, unnest(json_extract(json_extract_string(line, '$.metaData.schemaString'), '$.fields[*]')) AS x(f)
+ ORDER BY col;
+----
+i
+(none)
+true
+j
+the column comment
+true
+
+# The table's own comment is untouched by a COLUMN comment - the two live in different places, and a
+# metaData action replaces the WHOLE previous one, so carrying it forward is a property worth pinning.
+query I
+SELECT json_extract_string(line, '$.metaData.description') FROM latest;
+----
+O'Brien's table
+
+# ============================================================================
+# 4. THE DATA STILL RESOLVES - the schema rewrite did not break column mapping.
+#    count(*) would prove NOTHING here: a Delta count is answered from the log and opens no data file.
+#    These read VALUES, and the INSERT proves the WRITE path still matches the rewritten schema too.
+# ============================================================================
+
+query IT
+SELECT i, j FROM d.main.co;
+----
+7	seven
+
+statement ok
+INSERT INTO d.main.co VALUES (8, 'eight');
+
+query IT
+SELECT sum(i), string_agg(j, ',' ORDER BY i) FROM d.main.co;
+----
+15	seven,eight
+
+# ============================================================================
+# 5. IS NULL REMOVES, on both forms - the documented spelling, and the reason the wire's `comment` key is
+#    REQUIRED rather than optional: an absent key could not be told apart from an explicit null.
+# ============================================================================
+
+statement ok
+COMMENT ON COLUMN d.main.co.j IS NULL;
+
+statement ok
+COMMENT ON TABLE d.main.co IS NULL;
+
+query I
+SELECT json_extract_string(line, '$.metaData.description') IS NULL FROM latest;
+----
+true
+
+query TTI
+SELECT json_extract_string(f, '$.name') AS col,
+       coalesce(json_extract_string(f, '$.metadata.comment'), '(none)') AS cmt,
+       json_extract_string(f, '$.metadata."delta.columnMapping.physicalName"') IS NOT NULL AS phys_kept
+  FROM latest, unnest(json_extract(json_extract_string(line, '$.metaData.schemaString'), '$.fields[*]')) AS x(f)
+ ORDER BY col;
+----
+i
+(none)
+true
+j
+(none)
+true
+
+# Removing a comment that is not there is a NO-OP rather than an error, which is what it does on DuckDB's
+# own tables. Run twice so the assertion is about idempotence rather than about the first call.
+statement ok
+COMMENT ON COLUMN d.main.co.i IS NULL;
+
+statement ok
+COMMENT ON COLUMN d.main.co.i IS NULL;
+
+query IT
+SELECT i, j FROM d.main.co WHERE i = 8;
+----
+8	eight
+
+# ============================================================================
+# 6. THE REFUSALS.
+# ============================================================================
+
+# A column that does not exist is DuckDB's own refusal - it resolves the column before we are called.
+statement error
+COMMENT ON COLUMN d.main.co.nosuchcol IS 'x';
+----
+nosuchcol
+
+# A provider-declared VIEW (ViewDefinition, ABI v77) is a declaration the PROVIDER owns, so there is nowhere
+# on the far side to store a comment. Refused BY NAME and naming the entry type, rather than being forwarded
+# as though it were a table. SET_COMMENT is shared by every commentable catalog type, so this is the check
+# that keeps the table path from receiving a view.
+statement error
+COMMENT ON VIEW d.main.fab_view_numbers IS 'nope';
+----
+COMMENT ON is supported for TABLE and COLUMN only
+
+# A COLUMN comment on that same view needs its OWN check: SetColumnCommentInfo leaves catalog_entry_type
+# INVALID, so the entry-type test above cannot see it. Before this it reached the table path and failed as
+# `table "fab_view_numbers" does not exist` - true of no table, and MISLEADING about an object that plainly
+# exists, which sends the reader off checking spelling and permissions.
+statement error
+COMMENT ON COLUMN d.main.fab_view_numbers.n IS 'nope';
+----
+it is a provider-declared view
+
+# ============================================================================
+# 7. A comment is not confused with a table PROPERTY - `description` is a first-class metaData field, so it
+#    must not turn up in the table's configuration, where a foreign reader would never look for it.
+# ============================================================================
+
+statement ok
+COMMENT ON TABLE d.main.co IS 'back again';
+
+query I
+SELECT json_extract_string(line, '$.metaData.configuration.description') IS NULL FROM latest;
+----
+true
+
+query I
+SELECT json_extract_string(line, '$.metaData.description') FROM latest;
+----
+back again

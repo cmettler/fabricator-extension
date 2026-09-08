@@ -70,6 +70,7 @@ See [SQL Server external tables on S3](#sql-server-external-tables-on-s3).
 | **DDL** | CREATE/DROP TABLE, CREATE/DROP SCHEMA, ALTER TABLE | ✅ |
 | | PRIMARY KEY / UNIQUE / NOT NULL / literal DEFAULT on CREATE | ✅ |
 | | `ALTER TABLE … ADD COLUMN … DEFAULT <literal>` | ✅ SQL Server (backfills, like DuckDB) — see the note below |
+| | `COMMENT ON TABLE` / `COMMENT ON COLUMN` | ✅ SQL Server + Delta (write-only) — see the note below |
 | | `CREATE TABLE … WITH (…)` options (per-table Delta properties / write tuning / feature flags) | ✅ |
 | | CHECK constraints, non-literal DEFAULTs | ❌ (use `fabricator_exec`) |
 | **S3 external tables** | `INSERT` into a detected SQL Server S3 **Delta/Parquet** external table → routed to storage | ✅ |
@@ -747,6 +748,11 @@ ALTER TABLE mssql.staging.t ALTER COLUMN note SET DEFAULT 'n/a';
 ALTER TABLE mssql.staging.t RENAME COLUMN note TO comment;
 ALTER TABLE mssql.staging.t RENAME TO t_renamed;
 
+-- COMMENT ON: stored where the target engine keeps a comment, so other tools see it. IS NULL removes one.
+COMMENT ON TABLE mssql.staging.t_renamed IS 'staging rows, reloaded nightly';
+COMMENT ON COLUMN mssql.staging.t_renamed.id IS 'the source system''s key';
+COMMENT ON COLUMN mssql.staging.t_renamed.id IS NULL;
+
 DROP TABLE mssql.staging.t_renamed;
 DROP SCHEMA mssql.staging;
 ```
@@ -766,6 +772,27 @@ is a real write rather than a metadata-only change.
 > ⚠ On the **Delta** provider a DEFAULT is refused outright: Delta records column defaults through a writer
 > feature this engine does not implement, so the value could neither be stored nor applied to later inserts.
 > Add the column, then set the values with an `UPDATE`.
+>
+**`COMMENT ON TABLE` / `COMMENT ON COLUMN`** store the comment where the target engine keeps one, so other
+tools read it back. `IS NULL` removes a comment, and removing one that is not there is a no-op.
+
+| provider | where the comment goes |
+|---|---|
+| SQL Server / Azure SQL | the **`MS_Description`** extended property — the same one SSMS's *Description* box writes, so a comment set here shows up there and vice versa |
+| Delta | **`metaData.description`** for a table, the field's **`metadata.comment`** for a column — the protocol's own locations, so delta-spark's `DESCRIBE DETAIL` / `DESCRIBE TABLE` report them |
+
+> ⚠ **WRITE-ONLY for now.** `duckdb_tables().comment` and `duckdb_columns().comment` stay `NULL` even for a
+> table whose comment is demonstrably set on the server — the catalog does not read comments back yet. So
+> `COMMENT ON` is useful for annotating a table other tools will read, not for round-tripping through DuckDB.
+>
+> ⚠ **Refused on Fabric Warehouse, the Fabric Lakehouse SQL endpoint and Synapse dedicated pools**, which do
+> not provide extended properties. The refusal names the engine; `fabricator_server_info(catalog)` reports it
+> as `supports_extended_properties`. It is a capability check made BEFORE any statement is sent, deliberately:
+> on those engines a failing statement inside an explicit transaction aborts the whole transaction, so
+> attempting it and letting the server refuse would take your transaction down with it.
+>
+> ⚠ `COMMENT ON VIEW` is refused for a provider-declared view, and `COMMENT ON` is not supported at all on
+> the DAX provider (read-only) — in both cases there is nowhere on the far side to store it.
 >
 > ⚠ A column default is **not reported** in `information_schema.columns.column_default` — the catalog does
 > not read defaults back from the provider. The default is really there; DuckDB's metadata just does not

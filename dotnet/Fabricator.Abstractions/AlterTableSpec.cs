@@ -29,6 +29,11 @@ public enum AlterTableKind
     RenameField,
     SetSortedBy,
     SetPartitionedBy,
+    /// <summary><c>COMMENT ON TABLE t IS '…'</c>. Arrives as DuckDB's own <c>AlterType.SET_COMMENT</c>, not
+    /// as an ALTER TABLE variant. <see cref="AlterTableSpec.Comment"/> null = the REMOVE spelling.</summary>
+    SetComment,
+    /// <summary><c>COMMENT ON COLUMN t.c IS '…'</c> (<c>AlterType.SET_COLUMN_COMMENT</c>).</summary>
+    SetColumnComment,
 }
 
 /// <summary>
@@ -53,6 +58,14 @@ public sealed class AlterTableSpec
 {
     /// <summary>Which variant this is. Every other property is meaningful only for the kinds that define it.</summary>
     public required AlterTableKind Kind { get; init; }
+
+    /// <summary>
+    /// The comment text for <see cref="AlterTableKind.SetComment"/> / <see cref="AlterTableKind.SetColumnComment"/>;
+    /// <c>null</c> is the REMOVE spelling (<c>COMMENT ON TABLE t IS NULL</c>), which is why the wire key is
+    /// REQUIRED for those kinds — an absent key could not be told apart from a null one, and they mean
+    /// different things. Meaningless for every other kind.
+    /// </summary>
+    public string? Comment { get; init; }
 
     /// <summary>The target column's name (the top-level column kinds); null for the kinds that address a
     /// nested field via <see cref="Path"/>, a whole table, or a column list.</summary>
@@ -154,6 +167,26 @@ public sealed class AlterTableSpec
             }
         }
 
+        // REQUIRED for both comment kinds, and null is a legitimate VALUE there (remove the comment) rather
+        // than "not supplied" — so presence is checked instead of being inferred from the value, the same
+        // rule set_default follows.
+        string? comment = null;
+        if (kind == AlterTableKind.SetComment || kind == AlterTableKind.SetColumnComment)
+        {
+            if (!root.TryGetProperty("comment", out var commentElement))
+            {
+                throw new InvalidOperationException(
+                    $"fabricator: COMMENT ON ({wire}) is missing its 'comment' (use JSON null to REMOVE a comment).");
+            }
+            comment = commentElement.ValueKind switch
+            {
+                JsonValueKind.Null => null,
+                JsonValueKind.String => commentElement.GetString(),
+                _ => throw new InvalidOperationException(
+                    $"fabricator: COMMENT ON ({wire}) 'comment' must be a string or null."),
+            };
+        }
+
         return new AlterTableSpec
         {
             Kind = kind,
@@ -166,6 +199,7 @@ public sealed class AlterTableSpec
             Guard = ReadBool(root, "if_not_exists") || ReadBool(root, "if_exists"),
             DefaultLiteral = defaultLiteral,
             HasDefault = hasDefault,
+            Comment = comment,
         };
     }
 
@@ -187,6 +221,8 @@ public sealed class AlterTableSpec
         AlterTableKind.RenameField => "rename_field",
         AlterTableKind.SetSortedBy => "set_sorted_by",
         AlterTableKind.SetPartitionedBy => "set_partitioned_by",
+        AlterTableKind.SetComment => "set_comment",
+        AlterTableKind.SetColumnComment => "set_column_comment",
         _ => kind.ToString(),
     };
 
@@ -206,6 +242,8 @@ public sealed class AlterTableSpec
         "rename_field" => AlterTableKind.RenameField,
         "set_sorted_by" => AlterTableKind.SetSortedBy,
         "set_partitioned_by" => AlterTableKind.SetPartitionedBy,
+        "set_comment" => AlterTableKind.SetComment,
+        "set_column_comment" => AlterTableKind.SetColumnComment,
         _ => throw new InvalidOperationException($"fabricator: unknown ALTER TABLE kind '{wire}'."),
     };
 

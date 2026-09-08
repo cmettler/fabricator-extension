@@ -3790,11 +3790,86 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
                 DropColumnDefault(connection, schemaName, tableName, col);
                 break;
             }
+            case AlterTableKind.SetComment:
+                SetExtendedDescription(schemaName, tableName, column: null, spec.Comment);
+                break;
+            case AlterTableKind.SetColumnComment:
+                SetExtendedDescription(schemaName, tableName, spec.RequireColumn(), spec.Comment);
+                break;
             default:
                 throw new ArgumentOutOfRangeException(nameof(spec), AlterTableSpec.WireName(spec.Kind),
                                                       "fabricator: unsupported ALTER TABLE kind on SQL Server");
         }
     }
+
+    /// <summary>
+    /// COMMENT ON, as the <c>MS_Description</c> extended property — the only thing SQL Server has, and the
+    /// one SSMS's "Description" box reads. <paramref name="column"/> null = the TABLE's comment;
+    /// <paramref name="comment"/> null = REMOVE it.
+    /// </summary>
+    private void SetExtendedDescription(string schemaName, string tableName, string? column, string? comment)
+    {
+        // Capability-gated, NOT attempted-and-caught: see ServerProfile.SupportsExtendedProperties for why a
+        // probe would be worse than a refusal on a warehouse engine.
+        if (!Profile.SupportsExtendedProperties)
+        {
+            throw new NotSupportedException(
+                "fabricator: COMMENT ON is not supported on this engine (engine_edition "
+                + Profile.EngineEdition + "). A comment is stored as the MS_Description extended property, "
+                + "which Fabric Warehouse, the Fabric Lakehouse SQL endpoint and Synapse dedicated pools do "
+                + "not provide. fabricator_server_info() reports this as supports_extended_properties.");
+        }
+
+        // ⚠ THREE procs, not one, and that is SQL Server's shape rather than ours: sp_addextendedproperty
+        // FAILS when the property already exists (15233), sp_updateextendedproperty FAILS when it does not,
+        // and removal is a third proc. COMMENT ON is an upsert-or-remove, so the existence test and the
+        // branch are unavoidable — composed as ONE batch so it costs one round trip and cannot race between
+        // a separate check and act.
+        //
+        // ⚠ Guarded on BOTH sides: removing a comment that is not there is a NO-OP rather than an error,
+        // which is what `COMMENT ON … IS NULL` means on DuckDB's own tables.
+        string level2 = column is null
+            ? string.Empty
+            : ", @level2type=N'COLUMN', @level2name=" + NLiteral(column);
+        // ⚠ Plain concatenation, NOT string.Format with a {0} placeholder: `level2` and the level0/level1
+        // names are user-supplied identifiers spliced in BEFORE any formatting would run, so an identifier
+        // containing a brace would make the format string itself malformed. A quoted DuckDB identifier can
+        // legally contain one.
+        string levels =
+            ", @level0type=N'SCHEMA', @level0name=" + NLiteral(schemaName)
+            + ", @level1type=N'TABLE', @level1name=" + NLiteral(tableName) + level2;
+        // minor_id addresses the COLUMN within the object (0 = the object itself); class 1 = OBJECT_OR_COLUMN.
+        // OBJECT_ID parses its argument as a multi-part NAME, so the identifiers must be BRACKETED inside the
+        // literal - a table whose name contains a dot would otherwise be read as schema.table and resolve to
+        // nothing (a silent 0 rows, i.e. the batch would take the ADD branch and fail as a duplicate).
+        // The @levelNname arguments are the OPPOSITE: sp_addextendedproperty wants the RAW name, unbracketed.
+        string objectId = "OBJECT_ID(" + NLiteral(Quote(schemaName) + "." + Quote(tableName)) + ")";
+        string minorId = column is null
+            ? "0"
+            : "COLUMNPROPERTY(" + objectId + ", " + NLiteral(column) + ", 'ColumnId')";
+        string exists =
+            "EXISTS (SELECT 1 FROM sys.extended_properties WHERE class = 1 AND major_id = " + objectId
+            + " AND minor_id = " + minorId
+            + " AND name = N'MS_Description')";
+
+        if (comment is null)
+        {
+            ExecuteNonQuery("IF " + exists
+                            + " EXEC sys.sp_dropextendedproperty @name=N'MS_Description'" + levels);
+            return;
+        }
+        string named = "@name=N'MS_Description', @value=" + NLiteral(comment) + levels;
+        ExecuteNonQuery("IF " + exists
+                        + " EXEC sys.sp_updateextendedproperty " + named
+                        + " ELSE EXEC sys.sp_addextendedproperty " + named);
+    }
+
+    /// <summary>
+    /// A T-SQL <c>N'…'</c> literal. Doubling the single quote is the COMPLETE escape for a T-SQL string
+    /// literal — there is no backslash escaping to also account for — which is what makes composing these
+    /// calls safe even though a comment is arbitrary user text.
+    /// </summary>
+    private static string NLiteral(string value) => "N'" + value.Replace("'", "''") + "'";
 
     // Reconstructs a column's current SQL type (with length/precision) from the
     // catalog, e.g. "nvarchar(max)", "decimal(10,2)", "datetime2(7)", "int".

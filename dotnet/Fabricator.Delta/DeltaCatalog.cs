@@ -5406,9 +5406,26 @@ public sealed class DeltaCatalog : IProviderCatalog
                     "SET/RESET PARTITIONED BY — changing a Delta table's partitioning requires a full "
                     + "rewrite: COPY the data to the table's path with (FORMAT delta, MODE 'overwrite', "
                     + "PARTITION_COLUMNS '…')");
+            case AlterTableKind.SetComment:
+            {
+                // COMMENT ON TABLE → metaData.description. Immediate/administrative, like set_tblproperties
+                // and SET SORTED BY: ONE metadata-only commit rather than something buffered into the
+                // transaction, because it changes no data and no file.
+                DeltaReader.SetTableComment(Opener(), TablePath(s, t), spec.Comment);
+                return;
+            }
+            case AlterTableKind.SetColumnComment:
+            {
+                // COMMENT ON COLUMN → the field's metadata.comment in the Delta schema — where the protocol
+                // puts a column comment, so Spark reads it back. Rewritten as a surgical JSON edit; see
+                // DeltaReader.RewriteColumnComment for why a typed round trip would be unsafe on a
+                // column-mapped table.
+                DeltaReader.SetColumnComment(Opener(), TablePath(s, t), spec.RequireColumn(), spec.Comment);
+                return;
+            }
             default:
                 throw Unsupported("ALTER TABLE (only ADD/RENAME/DROP COLUMN — top-level or nested struct field — "
-                                  + "SET/RESET SORTED BY, and RENAME TABLE are supported on Delta)");
+                                  + "SET/RESET SORTED BY, RENAME TABLE and COMMENT ON are supported on Delta)");
         }
     }
 

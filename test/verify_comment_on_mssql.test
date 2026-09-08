@@ -1,0 +1,175 @@
+# name: test/verify_comment_on_mssql.test
+# description: COMMENT ON TABLE / COMMENT ON COLUMN against a SQL Server catalog. SQL Server has no
+#              first-class comment, so it is stored as the MS_Description extended property - the same one
+#              SSMS's "Description" box writes and reads, which is what makes this interoperable rather than
+#              a private convention. WRITE-ONLY: nothing reads a comment BACK into duckdb_tables().comment
+#              yet (section 5 pins that as a characterization), so every assertion goes through
+#              sys.extended_properties via fabricator_query.
+#              THREE PROCS, NOT ONE, and that is SQL Server's shape: sp_addextendedproperty FAILS when the
+#              property exists, sp_updateextendedproperty FAILS when it does not, and removal is a third -
+#              so COMMENT ON is an upsert-or-remove and sections 2/3/4 each exercise a different branch of
+#              one composed batch. Needs MSSQL_TESTDB_DSN.
+# group: [fabricator]
+
+require fabricator
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS q (TYPE fabricator);
+
+statement ok
+CREATE OR REPLACE TABLE q.dbo.co_t (i INTEGER, j VARCHAR);
+
+# ============================================================================
+# 0. THE CAPABILITY, and it is what makes the whole suite attributable.
+#    COMMENT ON is gated on supports_extended_properties, which is FALSE for the warehouse family (Fabric
+#    Warehouse, the Fabric Lakehouse SQL endpoint, Synapse dedicated). Asserting it TRUE here is the control:
+#    without it a green suite would be equally consistent with a build that had stopped gating at all, and
+#    the refusal on those engines could not be told apart from this box simply working.
+# ============================================================================
+
+query TT
+SELECT property, value FROM fabricator_server_info('q')
+ WHERE property IN ('is_warehouse', 'supports_extended_properties') ORDER BY property;
+----
+is_warehouse
+false
+supports_extended_properties
+true
+
+# The comments live under MS_Description, class 1 (OBJECT_OR_COLUMN). minor_id 0 addresses the OBJECT and a
+# non-zero minor_id the column at that ordinal, which is why the ordinal is resolved to a NAME here - an
+# assertion on the raw minor_id would silently pass if the wrong column were commented after a schema change.
+statement ok
+CREATE OR REPLACE VIEW descr AS
+  SELECT * FROM fabricator_query('q',
+    'SELECT CASE WHEN ep.minor_id = 0 THEN ''(table)'' ELSE c.name END AS target,
+            CAST(ep.value AS nvarchar(200)) AS descr
+       FROM sys.extended_properties ep
+       LEFT JOIN sys.columns c ON c.object_id = ep.major_id AND c.column_id = ep.minor_id
+      WHERE ep.class = 1 AND ep.major_id = OBJECT_ID(N''dbo.co_t'') AND ep.name = N''MS_Description''');
+
+# ============================================================================
+# 1. THE STARTING STATE - nothing. The control for every row below.
+# ============================================================================
+
+query I
+SELECT count(*) FROM descr;
+----
+0
+
+# ============================================================================
+# 2. THE ADD BRANCH - sp_addextendedproperty, on both a table and a column.
+# ============================================================================
+
+statement ok
+COMMENT ON TABLE q.dbo.co_t IS 'the table comment';
+
+statement ok
+COMMENT ON COLUMN q.dbo.co_t.j IS 'the column comment';
+
+query TT
+SELECT target, descr FROM descr ORDER BY target;
+----
+(table)
+the table comment
+j
+the column comment
+
+# ============================================================================
+# 3. THE UPDATE BRANCH - a second COMMENT ON the same target must REPLACE rather than fail.
+#    sp_addextendedproperty raises 15233 on an existing property, so a build that only ever called add
+#    would fail this row outright rather than answering the old value.
+#    The quotes also exercise the escaping: doubling the single quote is the complete escape for a T-SQL
+#    string literal, which is what makes composing these proc calls safe for arbitrary comment text.
+# ============================================================================
+
+statement ok
+COMMENT ON TABLE q.dbo.co_t IS 'O''Brien''s table';
+
+statement ok
+COMMENT ON COLUMN q.dbo.co_t.j IS 'it''s the second one';
+
+query TT
+SELECT target, descr FROM descr ORDER BY target;
+----
+(table)
+O'Brien's table
+j
+it's the second one
+
+# ============================================================================
+# 4. THE REMOVE BRANCH - IS NULL, which is the documented spelling, plus the no-op case.
+#    Removing a comment that is not there SUCCEEDS: the batch is guarded on existence, matching what
+#    COMMENT ON ... IS NULL does on DuckDB's own tables. Run twice so it is idempotence being asserted.
+# ============================================================================
+
+statement ok
+COMMENT ON COLUMN q.dbo.co_t.j IS NULL;
+
+query TT
+SELECT target, descr FROM descr ORDER BY target;
+----
+(table)
+O'Brien's table
+
+statement ok
+COMMENT ON COLUMN q.dbo.co_t.i IS NULL;
+
+statement ok
+COMMENT ON COLUMN q.dbo.co_t.i IS NULL;
+
+statement ok
+COMMENT ON TABLE q.dbo.co_t IS NULL;
+
+statement ok
+COMMENT ON TABLE q.dbo.co_t IS NULL;
+
+query I
+SELECT count(*) FROM descr;
+----
+0
+
+# ============================================================================
+# 5. CHARACTERIZATION - the READ-BACK is not implemented, on purpose (slice 2).
+#    duckdb_tables().comment stays NULL for a table with a demonstrable MS_Description on the server,
+#    because the catalog never reads comments back from the provider. Pinned rather than described so the
+#    day it is implemented arrives as a failed assertion naming this, rather than as a surprise.
+# ============================================================================
+
+statement ok
+COMMENT ON TABLE q.dbo.co_t IS 'visible on the server only';
+
+query TT
+SELECT target, descr FROM descr;
+----
+(table)
+visible on the server only
+
+query I
+SELECT comment IS NULL FROM duckdb_tables() WHERE database_name = 'q' AND table_name = 'co_t';
+----
+true
+
+# ============================================================================
+# 6. A comment survives an unrelated ALTER on the same table - the extended property is attached to the
+#    object and its column ordinal, so this is worth pinning rather than assumed.
+# ============================================================================
+
+statement ok
+COMMENT ON COLUMN q.dbo.co_t.j IS 'keep me';
+
+statement ok
+ALTER TABLE q.dbo.co_t ADD COLUMN k INTEGER;
+
+query TT
+SELECT target, descr FROM descr ORDER BY target;
+----
+(table)
+visible on the server only
+j
+keep me
+
+statement ok
+DROP TABLE q.dbo.co_t;

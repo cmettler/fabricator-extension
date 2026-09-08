@@ -969,10 +969,17 @@ typedef struct FabricatorVTable {
 	//   {"kind":"rename_field",       "path":["s","inner","f"], "new_name":"g"}
 	//   {"kind":"set_sorted_by",      "columns":["a","b"]}   ([] = RESET)
 	//   {"kind":"set_partitioned_by", "columns":["a","b"]}   ([] = RESET)
+	//   {"kind":"set_comment",                       "comment":<string|null>}   (COMMENT ON TABLE)
+	//   {"kind":"set_column_comment", "column":"c",  "comment":<string|null>}   (COMMENT ON COLUMN)
 	// `path` is an ARRAY of segments rather than a joined string because a field name may contain dots.
 	// "default" is REQUIRED by set_default and carries the literal's TEXT, with JSON null for DEFAULT NULL —
 	// the two states the old arg2 encoded as "-" / "b"+base64(literal), a hack that existed only because a
 	// C string cannot distinguish empty from absent.
+	// "comment" is REQUIRED by both comment kinds and carries the comment's TEXT, with JSON null for the
+	// REMOVE spelling (`COMMENT ON TABLE t IS NULL`) — the same required-key/nullable-value shape as
+	// "default", and required for the same reason: absent would be indistinguishable from "remove it".
+	// ⚠ These two arrive as AlterType::SET_COMMENT / SET_COLUMN_COMMENT, NOT as ALTER_TABLE, so the host
+	// dispatches them BEFORE its AlterTableInfo cast — they carry no AlterTableInfo at all.
 	//
 	// ⚠ `column` STAYS a separate Arrow stream and must NOT fold into the doc: it is the TYPE CHANNEL for
 	// the ADD_COLUMN / COLUMN_TYPE / ADD_FIELD kinds, and a VARIANT column rides an Arrow field-metadata

@@ -97,6 +97,18 @@ internal static class DeltaReader
     public static long SetTableProperties(nint opener, string path, IReadOnlyList<KeyValuePair<string, string?>> updates)
         => SetTablePropertiesAsync(opener, path, updates).GetAwaiter().GetResult();
 
+    /// <summary>COMMENT ON TABLE — Delta's <c>metaData.description</c>, the field delta-spark's
+    /// <c>DESCRIBE DETAIL</c> reports and its <c>COMMENT ON TABLE</c> writes. <paramref name="comment"/> null
+    /// REMOVES it. Returns the new commit version.</summary>
+    public static long SetTableComment(nint opener, string path, string? comment)
+        => SetTableCommentAsync(opener, path, comment).GetAwaiter().GetResult();
+
+    /// <summary>COMMENT ON COLUMN — the field's <c>metadata.comment</c> in the Delta schema, which is where
+    /// the protocol puts a column comment and where Spark reads it from. <paramref name="comment"/> null
+    /// REMOVES it. Returns the new commit version.</summary>
+    public static long SetColumnComment(nint opener, string path, string column, string? comment)
+        => SetColumnCommentAsync(opener, path, column, comment).GetAwaiter().GetResult();
+
     /// <summary>Writes a checkpoint for the table's CURRENT version (engineered-wood's
     /// <c>DeltaTable.CheckpointAsync</c> — the table's own ParquetWriteOptions/CheckpointFormat, and log
     /// cleanup runs after it exactly as on an automatic checkpoint). Returns the version checkpointed.
@@ -118,6 +130,119 @@ internal static class DeltaReader
             await table.DisposeAsync().ConfigureAwait(false);
         }
     }
+
+    private static async Task<long> SetTableCommentAsync(nint opener, string path, string? comment)
+    {
+        var fs = TableFileSystems.Create(opener, path);
+        var table = await DeltaTable.OpenAsync(fs, DeltaWriter.Options()).ConfigureAwait(false);
+        try
+        {
+            var snapshot = table.CurrentSnapshot;
+            // `description` is a first-class metaData field, so this needs no schema surgery at all — unlike
+            // the COLUMN form below. null clears it, which is the REMOVE spelling.
+            var metaData = snapshot.Metadata with { Description = comment };
+            // "SET TBLPROPERTIES" / "CHANGE COLUMN" are Delta's OWN operation names for these two metadata
+            // edits, which matters because commitInfo.operation is what a foreign reader keys on when it
+            // classifies a commit - an invented name would make our commits unclassifiable to delta-spark's
+            // history view. Delta itself has no distinct "COMMENT ON" operation.
+            return await CommitMetadataOnlyAsync(table, snapshot.Version, metaData, "SET TBLPROPERTIES")
+                .ConfigureAwait(false);
+        }
+        finally
+        {
+            await table.DisposeAsync().ConfigureAwait(false);
+        }
+    }
+
+    private static async Task<long> SetColumnCommentAsync(nint opener, string path, string column, string? comment)
+    {
+        var fs = TableFileSystems.Create(opener, path);
+        var table = await DeltaTable.OpenAsync(fs, DeltaWriter.Options()).ConfigureAwait(false);
+        try
+        {
+            var snapshot = table.CurrentSnapshot;
+            string rewritten = RewriteColumnComment(snapshot.Metadata.SchemaString, column, comment);
+            var metaData = snapshot.Metadata with { SchemaString = rewritten };
+            return await CommitMetadataOnlyAsync(table, snapshot.Version, metaData, "CHANGE COLUMN")
+                .ConfigureAwait(false);
+        }
+        finally
+        {
+            await table.DisposeAsync().ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// Sets (or, for a null comment, removes) <c>metadata.comment</c> on ONE top-level field of a Delta
+    /// schema, returning the rewritten schema JSON.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>⚠ A SURGICAL JsonNode EDIT, DELIBERATELY NOT A TYPED ROUND TRIP.</b> Deserializing the schema
+    /// into engineered-wood's typed model and re-serializing it would risk dropping any field metadata that
+    /// model does not represent — and the schema's metadata is where COLUMN MAPPING keeps
+    /// <c>delta.columnMapping.physicalName</c> and <c>delta.columnMapping.id</c>. Losing a physical name on a
+    /// column-mapped table (the DEFAULT here) would make the existing data files unreadable, with nothing
+    /// failing at the time of the ALTER. JsonNode preserves every property it does not touch verbatim, so the
+    /// blast radius is exactly the one key being set.</para>
+    /// <para>⚠ Matched on the LOGICAL <c>name</c>, which is correct precisely because column mapping keeps the
+    /// physical name in metadata: <c>name</c> is what the user wrote and what DuckDB's binder resolved.</para>
+    /// <para>⚠ Top-level only — DuckDB's <c>SetColumnCommentInfo</c> carries a single column name, so a nested
+    /// field is not expressible in the statement.</para>
+    /// </remarks>
+    internal static string RewriteColumnComment(string schemaJson, string column, string? comment)
+    {
+        var root = System.Text.Json.Nodes.JsonNode.Parse(schemaJson)
+                   ?? throw new System.InvalidOperationException(
+                       "fabricator: COMMENT ON COLUMN: the table's Delta schema is not a JSON document.");
+        if (root["fields"] is not System.Text.Json.Nodes.JsonArray fields)
+        {
+            throw new System.InvalidOperationException(
+                "fabricator: COMMENT ON COLUMN: the table's Delta schema has no 'fields' array.");
+        }
+        foreach (var field in fields)
+        {
+            if (field is not System.Text.Json.Nodes.JsonObject obj
+                || obj["name"]?.GetValue<string>() != column)
+            {
+                continue;
+            }
+            if (obj["metadata"] is not System.Text.Json.Nodes.JsonObject metadata)
+            {
+                // A field may legitimately carry no metadata object at all (an unmapped table's schema).
+                metadata = new System.Text.Json.Nodes.JsonObject();
+                obj["metadata"] = metadata;
+            }
+            if (comment is null)
+            {
+                metadata.Remove("comment");
+            }
+            else
+            {
+                metadata["comment"] = comment;
+            }
+            return root.ToJsonString();
+        }
+        // Refused rather than a silent no-op: the host resolved the column through DuckDB's binder, so an
+        // absence here means the catalog's view of the schema and the log's disagree.
+        throw new System.InvalidOperationException(
+            $"fabricator: COMMENT ON COLUMN: the table's Delta schema has no top-level column '{column}'.");
+    }
+
+    /// <summary>
+    /// Commits a replacement metaData action and nothing else — the shape every administrative Delta metadata
+    /// edit here shares (SET TBLPROPERTIES, SET SORTED BY, and both COMMENT ON forms).
+    /// </summary>
+    private static System.Threading.Tasks.ValueTask<long> CommitMetadataOnlyAsync(
+        DeltaTable table, long expectedVersion, DeltaAction metaData, string operation)
+        => table.CommitDataFilesAsync(
+            System.Array.Empty<WrittenDataFile>(), DeltaWriteMode.Append,
+            extraActions: new DeltaAction[] { metaData },
+            expectedVersion: expectedVersion, operation: operation,
+            // ⚠ VACUOUSLY TRUE and load-bearing, for the reason set_tblproperties records at length: the file
+            // list is EMPTY, so this commit writes no rows and nothing a CHECK constraint or invariant covers
+            // can be violated — while engineered-wood applies its refusal to the CALL rather than to the rows,
+            // so without this a constrained table would reject every comment edit too.
+            constraintsEnforcedByCaller: true);
 
     private static async Task<long> SetTablePropertiesAsync(
         nint opener, string path, IReadOnlyList<KeyValuePair<string, string?>> updates)

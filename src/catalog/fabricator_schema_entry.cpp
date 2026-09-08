@@ -16,6 +16,7 @@
 #include "catalog/fabricator_lateral.hpp"
 #include "catalog/fabricator_metadata.hpp"
 #include "catalog/fabricator_txn_util.hpp"
+#include "duckdb/parser/parsed_data/comment_on_column_info.hpp"
 #include "duckdb/common/arrow/arrow_appender.hpp"
 #include "duckdb/planner/tableref/bound_at_clause.hpp"
 #include "duckdb/common/arrow/arrow_converter.hpp"
@@ -3995,9 +3996,81 @@ static void CarryDefault(FabricatorAlterRequest &request, const ParsedExpression
 	}
 }
 
+void FabricatorSchemaEntry::AlterComment(CatalogTransaction transaction, AlterInfo &info) {
+	if (!transaction.context) {
+		throw InternalException("fabricator: COMMENT ON requires a client context");
+	}
+	auto &context = *transaction.context;
+	FabricatorSetActiveTxn(handle_, context);
+	fabricator::SetActiveOpener(reinterpret_cast<FabricatorHandle>(&context), fabricator::SessionKeyFor(&context));
+
+	FabricatorAlterRequest request;
+	Value comment;
+	if (info.type == AlterType::SET_COLUMN_COMMENT) {
+		auto &column_info = info.Cast<SetColumnCommentInfo>();
+		request.kind = "set_column_comment";
+		request.column = column_info.column_name;
+		comment = column_info.comment_value;
+	} else {
+		auto &entry_info = info.Cast<SetCommentInfo>();
+		// ⚠ SET_COMMENT is shared by every commentable catalog type (TABLE / VIEW / INDEX / SEQUENCE /
+		// TYPE / MACRO), so the entry type has to be checked rather than assumed. A provider-declared VIEW
+		// is a DECLARATION the provider owns (ViewDefinition, ABI v77) and a macro likewise — there is
+		// nothing on the far side to store a comment against, so those are refused BY NAME instead of being
+		// silently forwarded as if they were tables.
+		if (entry_info.entry_catalog_type != CatalogType::TABLE_ENTRY) {
+			throw NotImplementedException(
+			    "fabricator: COMMENT ON is supported for TABLE and COLUMN only, not %s. A provider-declared "
+			    "view or macro is a declaration the provider owns; there is nowhere to store a comment.",
+			    CatalogTypeToString(entry_info.entry_catalog_type));
+		}
+		request.kind = "set_comment";
+		comment = entry_info.comment_value;
+	}
+	// The key is ALWAYS emitted: `COMMENT ON … IS NULL` is the documented way to REMOVE a comment, so an
+	// absent key and a null one would mean different things and only one of them is expressible. Same
+	// required-key/nullable-value shape as set_default.
+	request.has_comment = true;
+	request.comment_is_null = comment.IsNull();
+	if (!request.comment_is_null) {
+		request.comment = comment.ToString();
+	}
+
+	// A COLUMN comment carries NO resolved entry type (SetColumnCommentInfo leaves catalog_entry_type
+	// INVALID), so the TABLE_ENTRY check above cannot cover it and a declared VIEW's column would reach the
+	// table path. MEASURED: it then failed as `table "v" does not exist` — true of no table and MISLEADING
+	// about an object that plainly exists, which is the same wrong-search-direction the ADD COLUMN DEFAULT
+	// work recorded. Refused with the reason instead.
+	{
+		lock_guard<mutex> lock(entry_lock_);
+		if (views_.find(info.name) != views_.end()) {
+			throw NotImplementedException(
+			    "fabricator: COMMENT ON is not supported for \"%s\": it is a provider-declared view, which is a "
+			    "declaration the provider owns — there is nowhere to store a comment.",
+			    info.name);
+		}
+	}
+	auto entry = GetOrCreateEntry(context, info.name);
+	if (!entry) {
+		throw CatalogException("fabricator: COMMENT ON: table \"%s\" does not exist", info.name);
+	}
+	// ⚠ NO refresh(), deliberately, and it is a scope statement rather than an omission: nothing this
+	// build CACHES can have changed, because the comment read-back is not implemented — duckdb_tables().comment
+	// is NULL for our tables either way. The day comments are surfaced on the table-schema crossing, this
+	// needs the same refresh(info.name) the column kinds do, or the cached entry keeps the old comment.
+	fabricator::TableAlter(entry->Cast<FabricatorTableEntry>().TableHandle(),
+	                       FabricatorRenderAlterJson(request), nullptr);
+}
+
 void FabricatorSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
+	// COMMENT ON arrives as its OWN AlterTypes and carries no AlterTableInfo, so it is dispatched before the
+	// cast below rather than as a case in the switch.
+	if (info.type == AlterType::SET_COMMENT || info.type == AlterType::SET_COLUMN_COMMENT) {
+		AlterComment(transaction, info);
+		return;
+	}
 	if (info.type != AlterType::ALTER_TABLE) {
-		throw NotImplementedException("fabricator: only ALTER TABLE is supported");
+		throw NotImplementedException("fabricator: only ALTER TABLE and COMMENT ON are supported");
 	}
 	if (!transaction.context) {
 		throw InternalException("fabricator: ALTER TABLE requires a client context");
