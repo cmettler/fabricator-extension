@@ -158,14 +158,26 @@ void FetchFunctionOutputSchema(ClientContext &context, FabricatorHandle handle, 
 void FetchTableSchema(ClientContext &context, FabricatorHandle catalog_handle, FabricatorHandle table_handle,
                       vector<string> &names, vector<LogicalType> &types);
 
-//! The row-identity + provider-virtual-column halves of the `table_info` crossing (ONE crossing — the old
-//! kinds 3 + 12).
-struct FabricatorTableRowIdentity {
+//! The parsed `table_info` doc (ONE crossing — the old kinds 3 + 12, plus the COMMENT ON read-back).
+//! Renamed from FabricatorTableRowIdentity when the comments arrived: it stopped being only about row
+//! identity, and a struct name that describes half its contents is how the next reader gets misled.
+//! ⚠ NOT `FabricatorTableInfo` — that name is TAKEN, 140 lines up, by the DISCOVERED-table struct
+//! (catalog_tables). Named for the crossing it parses would have collided in the same header.
+struct FabricatorTableDetails {
 	//! Row-identity column names in key order (PK / smallest unique index / IDENTITY / a provider virtual
 	//! rowid). Empty => no rowid, UPDATE/DELETE unavailable.
 	vector<string> rowid_columns;
 	//! Provider-declared VIRTUAL columns (name, DuckDB-type-text) — queryable by name, not in SELECT *.
 	vector<std::pair<string, string>> virtual_columns;
+	//! The table's own COMMENT. `has_comment` distinguishes "the provider reports none" from an EMPTY
+	//! comment, which a caller may legitimately have set (`COMMENT ON TABLE t IS ''`) — the empty-vs-absent
+	//! rule this crossing already follows for `default`.
+	bool has_comment = false;
+	string comment;
+	//! Per-column comments, keyed by the provider's column name. Resolved against the schema
+	//! CASE-INSENSITIVELY; a name that matches no column is IGNORED (a provider may report a comment on a
+	//! column an object filter or a pending ALTER has removed from this entry's schema).
+	vector<std::pair<string, string>> column_comments;
 };
 
 //! Reads the table's row identity + virtual columns from the session's `table_info` stream. Errors bubble
@@ -173,7 +185,7 @@ struct FabricatorTableRowIdentity {
 //! in the VIRTUAL half now fails materialization too, where the old kind-12 fetch was silently best-effort —
 //! acceptable because the reachable set is empty (the providers resolve the flag from state the schema
 //! fetch on the same ambient binding already cached).
-FabricatorTableRowIdentity FetchTableInfo(FabricatorHandle table_handle);
+FabricatorTableDetails FetchTableInfo(FabricatorHandle table_handle);
 
 //! The optimizer-statistics half of the table session (`table_stats` — the old kinds 4 + 5, ONE crossing,
 //! typed int64 values). Lazy by contract: called at first scan, never at entry materialization.

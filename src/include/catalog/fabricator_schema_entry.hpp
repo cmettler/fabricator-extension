@@ -151,6 +151,12 @@ private:
 	//! must be dispatched before Alter's `info.Cast<AlterTableInfo>()`, which would otherwise be a bad cast.
 	void AlterComment(CatalogTransaction transaction, AlterInfo &info);
 
+	//! Evict a table's cached entry and re-materialize it EAGERLY on the current transaction's connection.
+	//! Shared by ALTER TABLE and COMMENT ON so the rule exists once; see the call site in Alter for why the
+	//! re-fetch must be eager (a lazy one runs on a POOLED connection and blocks on this transaction's
+	//! still-uncommitted Sch-M lock).
+	void RefreshEntry(ClientContext &context, const string &table);
+
 	//! Materializes (and caches) the catalog entry for a table. `at` is the reference's time-travel clause:
 	//! null => the ordinary LATEST entry; set => an entry whose ColumnList is the schema AS OF that version,
 	//! which is what `SELECT *` expands against.

@@ -304,7 +304,7 @@ void FetchTableSchema(ClientContext &context, FabricatorHandle catalog_handle, F
 	fabricator::PopulateReturnSchema(context, bind_data, types, names);
 }
 
-FabricatorTableRowIdentity FetchTableInfo(FabricatorHandle table_handle) {
+FabricatorTableDetails FetchTableInfo(FabricatorHandle table_handle) {
 	// {"rowid":["a",...], "virtual":[{"name":"...","type":"..."}, ...]} — see abi.h table_info. The
 	// producer is TableSession.InfoJson (Utf8JsonWriter, proper escaping), so a malformed doc is a BUG,
 	// not an input condition — refused loudly rather than read as an empty answer (a silently-empty rowid
@@ -316,7 +316,7 @@ FabricatorTableRowIdentity FetchTableInfo(FabricatorHandle table_handle) {
 	if (!root) {
 		throw IOException("fabricator: table_info returned malformed JSON: %s", json);
 	}
-	FabricatorTableRowIdentity result;
+	FabricatorTableDetails result;
 	size_t idx, max;
 	yyjson_val *item;
 	// Hoisted out of the foreach macros, which evaluate their container argument more than once.
@@ -333,6 +333,26 @@ FabricatorTableRowIdentity FetchTableInfo(FabricatorHandle table_handle) {
 		if (yyjson_is_str(name) && yyjson_is_str(type)) {
 			result.virtual_columns.emplace_back(string(yyjson_get_str(name), yyjson_get_len(name)),
 			                                    string(yyjson_get_str(type), yyjson_get_len(type)));
+		}
+	}
+	// COMMENT ON read-back. Both keys are OPTIONAL and absent means "the provider reports none", which is
+	// why the table comment needs `has_comment` beside it: an EMPTY comment is a value a caller can set
+	// (`COMMENT ON TABLE t IS ''`) and must not read as absence. Skipping a non-string is deliberate rather
+	// than an error — the same unknown-key tolerance the rest of this doc has, so a future richer encoding
+	// (a struct per column, say) degrades to "no comment" instead of failing materialization.
+	auto *comment = yyjson_obj_get(root, "comment");
+	if (yyjson_is_str(comment)) {
+		result.has_comment = true;
+		result.comment.assign(yyjson_get_str(comment), yyjson_get_len(comment));
+	}
+	auto *column_comments = yyjson_obj_get(root, "column_comments");
+	yyjson_val *key, *val;
+	yyjson_obj_iter col_iter = yyjson_obj_iter_with(column_comments);
+	while ((key = yyjson_obj_iter_next(&col_iter))) {
+		val = yyjson_obj_iter_get_val(key);
+		if (yyjson_is_str(key) && yyjson_is_str(val)) {
+			result.column_comments.emplace_back(string(yyjson_get_str(key), yyjson_get_len(key)),
+			                                    string(yyjson_get_str(val), yyjson_get_len(val)));
 		}
 	}
 	return result;

@@ -358,8 +358,28 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateEntry(ClientContext
 		info.columns.AddColumn(ColumnDefinition(names[i], types[i]));
 	}
 
-	// Row identity + provider virtual columns — ONE table_info crossing (was kinds 3 + 12).
+	// Row identity + provider virtual columns + the COMMENT ON read-back — ONE table_info crossing.
 	auto identity = FetchTableInfo(table_guard.handle);
+
+	// COMMENT ON read-back. Set BEFORE the entry is constructed because that is the only chance: DuckDB's
+	// TableCatalogEntry constructor copies CreateTableInfo::comment into CatalogEntry::comment, and
+	// duckdb_tables() reads the ENTRY. There is no later hook, which is why a comment cannot ride the lazy
+	// table_stats entry the way row counts do.
+	if (identity.has_comment) {
+		info.comment = Value(identity.comment);
+	}
+	// Matched CASE-INSENSITIVELY, and an unmatched name is IGNORED rather than an error: a provider may
+	// legitimately report a comment for a column this entry's schema does not have — a pending ALTER in the
+	// open transaction, or a column mapping whose logical name differs. Refusing there would make a stale
+	// comment break table materialization, which is far worse than a missing comment.
+	for (auto &pair : identity.column_comments) {
+		for (idx_t i = 0; i < names.size(); i++) {
+			if (StringUtil::CIEquals(names[i], pair.first)) {
+				info.columns.GetColumnMutable(LogicalIndex(i)).SetComment(Value(pair.second));
+				break;
+			}
+		}
+	}
 
 	// Resolve row-identity columns (PK / smallest unique index) to column indices.
 	auto &rowid_names = identity.rowid_columns;
@@ -3996,6 +4016,19 @@ static void CarryDefault(FabricatorAlterRequest &request, const ParsedExpression
 	}
 }
 
+void FabricatorSchemaEntry::RefreshEntry(ClientContext &context, const string &table) {
+	{
+		lock_guard<mutex> lock(entry_lock_);
+		RetireErase(entries_, table, retired_entries_);
+		RetireAtEntriesFor(at_entries_, table, retired_entries_);
+	}
+	try {
+		GetOrCreateEntry(context, table); // eager re-fetch on this txn's connection (no Sch-M self-block)
+	} catch (...) {
+		// Best-effort: on any failure leave the entry evicted (falls back to lazy re-fetch).
+	}
+}
+
 void FabricatorSchemaEntry::AlterComment(CatalogTransaction transaction, AlterInfo &info) {
 	if (!transaction.context) {
 		throw InternalException("fabricator: COMMENT ON requires a client context");
@@ -4054,12 +4087,14 @@ void FabricatorSchemaEntry::AlterComment(CatalogTransaction transaction, AlterIn
 	if (!entry) {
 		throw CatalogException("fabricator: COMMENT ON: table \"%s\" does not exist", info.name);
 	}
-	// ⚠ NO refresh(), deliberately, and it is a scope statement rather than an omission: nothing this
-	// build CACHES can have changed, because the comment read-back is not implemented — duckdb_tables().comment
-	// is NULL for our tables either way. The day comments are surfaced on the table-schema crossing, this
-	// needs the same refresh(info.name) the column kinds do, or the cached entry keeps the old comment.
 	fabricator::TableAlter(entry->Cast<FabricatorTableEntry>().TableHandle(),
 	                       FabricatorRenderAlterJson(request), nullptr);
+	// ⚠ THE REFRESH IS REQUIRED, and it was NOT when this method was written: the comment then lived only on
+	// the far side, so nothing the host cached could have changed. Now that table_info carries comments BACK,
+	// a comment is part of the CatalogEntry — so without this eviction the entry keeps the old one and
+	// `COMMENT ON t IS 'x'; SELECT comment FROM duckdb_tables()` reports the PREVIOUS value in the same
+	// session. The note this replaces predicted exactly that and said what to do about it.
+	RefreshEntry(context, info.name);
 }
 
 void FabricatorSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
@@ -4092,18 +4127,7 @@ void FabricatorSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &inf
 	// fresh entry is cached — so the next bind (even in a different transaction) finds it and never issues the
 	// blocking pooled re-fetch. A transaction that later ROLLS BACK leaves this entry stale (it reflects the
 	// uncommitted ALTER) → RollbackTransaction invalidates the cache (fabricator_transaction.cpp).
-	auto refresh = [&](const string &t) {
-		{
-			lock_guard<mutex> lock(entry_lock_);
-			RetireErase(entries_, t, retired_entries_);
-			RetireAtEntriesFor(at_entries_, t, retired_entries_);
-		}
-		try {
-			GetOrCreateEntry(context, t); // eager re-fetch on this txn's connection (no Sch-M self-block)
-		} catch (...) {
-			// Best-effort: on any failure leave the entry evicted (falls back to lazy re-fetch).
-		}
-	};
+	auto refresh = [&](const string &t) { RefreshEntry(context, t); };
 
 	// The switch below only DESCRIBES the request (ABI v74) — it issues nothing. That is what the typed doc
 	// bought: with alter_kind + arg1 + arg2 + flags each meaning something different per kind, every branch

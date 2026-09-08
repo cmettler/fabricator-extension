@@ -70,7 +70,7 @@ See [SQL Server external tables on S3](#sql-server-external-tables-on-s3).
 | **DDL** | CREATE/DROP TABLE, CREATE/DROP SCHEMA, ALTER TABLE | ✅ |
 | | PRIMARY KEY / UNIQUE / NOT NULL / literal DEFAULT on CREATE | ✅ |
 | | `ALTER TABLE … ADD COLUMN … DEFAULT <literal>` | ✅ SQL Server (backfills, like DuckDB) — see the note below |
-| | `COMMENT ON TABLE` / `COMMENT ON COLUMN` | ✅ SQL Server + Delta (write-only) — see the note below |
+| | `COMMENT ON TABLE` / `COMMENT ON COLUMN` (+ read-back in `duckdb_tables()` / `duckdb_columns()`) | ✅ SQL Server + Delta — see the note below |
 | | `CREATE TABLE … WITH (…)` options (per-table Delta properties / write tuning / feature flags) | ✅ |
 | | CHECK constraints, non-literal DEFAULTs | ❌ (use `fabricator_exec`) |
 | **S3 external tables** | `INSERT` into a detected SQL Server S3 **Delta/Parquet** external table → routed to storage | ✅ |
@@ -781,9 +781,17 @@ tools read it back. `IS NULL` removes a comment, and removing one that is not th
 | SQL Server / Azure SQL | the **`MS_Description`** extended property — the same one SSMS's *Description* box writes, so a comment set here shows up there and vice versa |
 | Delta | **`metaData.description`** for a table, the field's **`metadata.comment`** for a column — the protocol's own locations, so delta-spark's `DESCRIBE DETAIL` / `DESCRIBE TABLE` report them |
 
-> ⚠ **WRITE-ONLY for now.** `duckdb_tables().comment` and `duckdb_columns().comment` stay `NULL` even for a
-> table whose comment is demonstrably set on the server — the catalog does not read comments back yet. So
-> `COMMENT ON` is useful for annotating a table other tools will read, not for round-tripping through DuckDB.
+They are also read BACK, so `duckdb_tables().comment` and `duckdb_columns().comment` report them — including
+a comment somebody else set (SSMS's *Description* box, or Spark's `COMMENT ON`), not just one written here:
+
+```sql
+SELECT table_name, comment FROM duckdb_tables() WHERE database_name = 'mssql';
+SELECT column_name, comment FROM duckdb_columns() WHERE table_name = 't';
+```
+
+> ⚠ A comment changed OUT OF BAND while a catalog is attached is not picked up immediately — the same
+> staleness as the rest of the catalog cache. `fabricator_refresh_cache('<catalog>')` or a re-ATTACH refreshes
+> it; a comment written THROUGH the catalog is visible at once.
 >
 > ⚠ **Refused on Fabric Warehouse, the Fabric Lakehouse SQL endpoint and Synapse dedicated pools**, which do
 > not provide extended properties. The refusal names the engine; `fabricator_server_info(catalog)` reports it

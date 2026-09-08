@@ -132,25 +132,75 @@ SELECT count(*) FROM descr;
 0
 
 # ============================================================================
-# 5. CHARACTERIZATION - the READ-BACK is not implemented, on purpose (slice 2).
-#    duckdb_tables().comment stays NULL for a table with a demonstrable MS_Description on the server,
-#    because the catalog never reads comments back from the provider. Pinned rather than described so the
-#    day it is implemented arrives as a failed assertion naming this, rather than as a surprise.
+# 5. THE READ-BACK - duckdb_tables().comment and duckdb_columns().comment report the server's own
+#    MS_Description, so a comment set by SSMS (or by anything else) is visible here.
+#
+#    ⚠ THIS SECTION REPLACES A CHARACTERIZATION THAT ASSERTED THE OPPOSITE. Until the read-back was built
+#    it pinned `comment IS NULL` for a table with a demonstrable MS_Description on the server, precisely so
+#    that implementing it would arrive as a failed assertion rather than a surprise. It did. The row is
+#    replaced rather than deleted, because falsifying it IS the change announcing itself.
+#
+#    ⚠ Read-your-own-writes is the sharp part, and it needs BOTH halves: the provider's comment cache is
+#    database-wide and loaded once (so a write must drop it), and the host caches the catalog ENTRY (so the
+#    ALTER must evict it). Miss either and this section reports the PREVIOUS comment in the same session.
 # ============================================================================
 
 statement ok
-COMMENT ON TABLE q.dbo.co_t IS 'visible on the server only';
+COMMENT ON TABLE q.dbo.co_t IS 'set through the catalog';
+
+statement ok
+COMMENT ON COLUMN q.dbo.co_t.i IS 'the i column';
 
 query TT
-SELECT target, descr FROM descr;
+SELECT target, descr FROM descr ORDER BY target;
 ----
 (table)
-visible on the server only
+set through the catalog
+i
+the i column
+
+query T
+SELECT comment FROM duckdb_tables() WHERE database_name = 'q' AND table_name = 'co_t';
+----
+set through the catalog
+
+# Per-column, and the UNCOMMENTED column must stay NULL - without that row the assertion would pass on a
+# build that reported the same comment for every column.
+query TT
+SELECT column_name, coalesce(comment, '(none)') FROM duckdb_columns()
+ WHERE database_name = 'q' AND table_name = 'co_t' ORDER BY column_name;
+----
+i
+the i column
+j
+(none)
+
+# An UPDATE through the catalog is visible immediately too - the second write has to invalidate both caches
+# again, which a build that cleared them only on the FIRST write would fail.
+statement ok
+COMMENT ON TABLE q.dbo.co_t IS 'updated in place';
+
+query T
+SELECT comment FROM duckdb_tables() WHERE database_name = 'q' AND table_name = 'co_t';
+----
+updated in place
+
+# And removal clears it rather than leaving the old value cached.
+statement ok
+COMMENT ON TABLE q.dbo.co_t IS NULL;
 
 query I
 SELECT comment IS NULL FROM duckdb_tables() WHERE database_name = 'q' AND table_name = 'co_t';
 ----
 true
+
+# Leave this section's own state behind rather than leaking it into the next one: section 6 asserts the FULL
+# set of comments on this table, so an `i` comment surviving from here would fail it for an unrelated reason.
+statement ok
+COMMENT ON COLUMN q.dbo.co_t.i IS NULL;
+
+statement ok
+COMMENT ON TABLE q.dbo.co_t IS 'visible on the server only';
 
 # ============================================================================
 # 6. A comment survives an unrelated ALTER on the same table - the extended property is attached to the

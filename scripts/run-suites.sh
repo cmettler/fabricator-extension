@@ -603,7 +603,9 @@ case "$TIER" in
         #   exactly, so no other suite moved. 9075 the same day: the suite went 39 -> 40 when a COLUMN
         #   comment on a provider-declared VIEW gained its own refusal - SetColumnCommentInfo leaves
         #   catalog_entry_type INVALID, so the table form's entry-type check cannot cover it.
-        : "${MIN_ASSERTIONS:=9075}"
+        # 9088 since 2026-09-08: verify_comment_on 40 -> 53, the COMMENT ON read-back (section 8).
+        #   9075 + 13 exactly, so no other suite moved.
+        : "${MIN_ASSERTIONS:=9088}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh
@@ -1005,7 +1007,9 @@ case "$TIER" in
         # 3241 since 2026-09-08: + verify_alter_default's 59. 3182 + 59 exactly, so no other suite moved.
         # 3280 since 2026-09-08: + verify_comment_on_mssql's 39 (the MS_Description extended property).
         #   3241 + 39 exactly, so no other suite moved.
-        : "${MIN_ASSERTIONS:=3280}"
+        # 3293 since 2026-09-08: verify_comment_on_mssql 39 -> 52, the read-back replacing the
+        #   write-only characterization. 3280 + 13 exactly, so no other suite moved.
+        : "${MIN_ASSERTIONS:=3293}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

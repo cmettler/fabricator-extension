@@ -113,6 +113,29 @@ public interface ITableBinding : IDisposable
     /// none. May do IO.</summary>
     IReadOnlyList<VirtualColumn> VirtualColumns();
 
+    /// <summary>The table's own COMMENT, or null when it has none. Rides <c>table_info</c>, so the host has
+    /// it when it CONSTRUCTS the catalog entry, and <c>duckdb_tables().comment</c> reports it.</summary>
+    /// <remarks>
+    /// <para><b>⚠ A comment CANNOT be lazy the way statistics are, and that is what forces it onto this
+    /// crossing.</b> <see cref="ApproximateRowCount"/> and <see cref="DistinctCounts"/> deliberately ride a
+    /// SEPARATE <c>table_stats</c> entry the host calls at first SCAN, precisely so entry materialization —
+    /// i.e. catalog ENUMERATION — never pays a stats query. A comment has no such option: it lives on the
+    /// CatalogEntry (DuckDB copies <c>CreateTableInfo::comment</c> in the TableCatalogEntry constructor), so
+    /// it must exist BEFORE the entry does. There is no later hook to fill it in.</para>
+    /// <para>⇒ <b>a provider that needs IO for this owes it a per-CATALOG cache, not a per-table query</b>,
+    /// or every full enumeration pays one round trip per table. Delta answers from the snapshot it already
+    /// holds (free); SQL Server reads the whole database's extended properties ONCE and caches.</para>
+    /// <para>DIM returning null so no provider is forced to implement it — a provider with no comment
+    /// concept (DAX) simply does not answer.</para>
+    /// </remarks>
+    string? TableComment() => null;
+
+    /// <summary>Per-column comments, keyed by the column's name as it appears in <see cref="Schema"/>;
+    /// null or empty when none. Only columns that HAVE a comment need appear. The host matches
+    /// case-insensitively and ignores a name that is not in the schema. Same laziness constraint and same
+    /// caching obligation as <see cref="TableComment"/>.</summary>
+    IReadOnlyDictionary<string, string>? ColumnComments() => null;
+
     /// <summary>Approximate row count for optimizer cardinality, or null when the provider surfaces none
     /// (Delta; warehouse engines, where the stats DMVs are unsupported and probing would poison an open
     /// transaction). May do IO.</summary>

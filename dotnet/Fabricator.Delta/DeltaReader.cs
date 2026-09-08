@@ -693,9 +693,18 @@ internal static class DeltaReader
     /// following) virtual-columns metadata fetch without a second <c>_delta_log</c> read (OneLake cost).</summary>
     public static Schema GetSchemaAndRowTracking(nint opener, string path, out bool rowTracking,
                                                  DeltaTableBinding? bound = null)
+        => GetSchemaAndRowTracking(opener, path, out rowTracking, out _, bound);
+
+    /// <summary>As above, and also reports the table's COMMENT (Delta's <c>metaData.description</c>) from
+    /// the SAME open, for exactly the reason the row-tracking flag rides along: the catalog's column fetch
+    /// is immediately followed by the table_info fetch that needs it, and a second <c>_delta_log</c> read
+    /// per table is what makes OneLake enumeration slow. Null = the table has no description.</summary>
+    public static Schema GetSchemaAndRowTracking(nint opener, string path, out bool rowTracking,
+                                                 out string? tableComment, DeltaTableBinding? bound = null)
     {
-        var (schema, rt) = GetSchemaAndRowTrackingAsync(opener, path, bound).GetAwaiter().GetResult();
+        var (schema, rt, comment) = GetSchemaAndRowTrackingAsync(opener, path, bound).GetAwaiter().GetResult();
         rowTracking = rt;
+        tableComment = comment;
         return schema;
     }
 
@@ -731,17 +740,18 @@ internal static class DeltaReader
         }
     }
 
-    private static async Task<(Schema Schema, bool RowTracking)> GetSchemaAndRowTrackingAsync(
+    private static async Task<(Schema Schema, bool RowTracking, string? TableComment)> GetSchemaAndRowTrackingAsync(
         nint opener, string path, DeltaTableBinding? bound)
     {
         var (open, shared) = await OpenForReadAsync(opener, path, bound).ConfigureAwait(false);
         try
         {
-            var cfg = open.Table.CurrentSnapshot.Metadata.Configuration;
+            var metadata = open.Table.CurrentSnapshot.Metadata;
+            var cfg = metadata.Configuration;
             bool rowTracking = cfg is not null
                 && cfg.TryGetValue("delta.enableRowTracking", out var v)
                 && string.Equals(v, "true", System.StringComparison.OrdinalIgnoreCase);
-            return (VariantMarker.ToTransportSchema(open.Table.ArrowSchema), rowTracking);
+            return (VariantMarker.ToTransportSchema(open.Table.ArrowSchema), rowTracking, metadata.Description);
         }
         finally
         {

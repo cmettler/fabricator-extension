@@ -3856,12 +3856,18 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
         {
             ExecuteNonQuery("IF " + exists
                             + " EXEC sys.sp_dropextendedproperty @name=N'MS_Description'" + levels);
+            InvalidateComments();
             return;
         }
         string named = "@name=N'MS_Description', @value=" + NLiteral(comment) + levels;
         ExecuteNonQuery("IF " + exists
                         + " EXEC sys.sp_updateextendedproperty " + named
                         + " ELSE EXEC sys.sp_addextendedproperty " + named);
+        // The read-back cache is database-wide and loaded once, so a write through this catalog must drop it
+        // or `COMMENT ON t IS 'x'` followed by a read of duckdb_tables() would report the PREVIOUS value.
+        // AFTER the write, never before: dropping it first would let a concurrent read reload the OLD state
+        // and cache that instead.
+        InvalidateComments();
     }
 
     /// <summary>

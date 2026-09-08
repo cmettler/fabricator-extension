@@ -927,8 +927,19 @@ typedef struct FabricatorVTable {
 	int32_t (*table_schema)(FabricatorHandle table, struct ArrowArrayStream *out, char **err);
 	// Row identity + provider virtual columns, ONE crossing (was kinds 3 + 12), as ONE typed JSON doc
 	// (v73; the v72 intermediate carried an Arrow stream):
-	//   {"rowid":["a","b",...], "virtual":[{"name":"...","type":"<DuckDB type text>"}, ...]}
-	// Both arrays always present (empty ok); rowid names in key order. *out_json is owned UTF-8, freed via
+	//   {"rowid":["a","b",...], "virtual":[{"name":"...","type":"<DuckDB type text>"}, ...],
+	//    "comment":"<table comment>", "column_comments":{"<column>":"<comment>", ...}}
+	// Both arrays always present (empty ok); rowid names in key order. The two COMMENT keys are OPTIONAL and
+	// OMITTED when there is nothing to report, so a provider with no comment concept produces the doc it
+	// always did (additive both ways — the host skips unknown keys).
+	//
+	// ⚠ THE COMMENTS RIDE *THIS* CROSSING RATHER THAN table_stats' LAZY ONE, AND NOT BY PREFERENCE. A
+	// comment lives on the CatalogEntry: DuckDB copies CreateTableInfo::comment in the TableCatalogEntry
+	// CONSTRUCTOR, and duckdb_tables()/duckdb_columns() read the ENTRY — so the value has to exist BEFORE the
+	// entry does, and there is no later hook to fill it in. table_info IS the entry-materialization crossing,
+	// i.e. the one catalog ENUMERATION performs for every table. ⇒ a provider that needs IO to answer owes it
+	// a per-CATALOG cache, not a per-table query (Delta answers from the Arrow schema it already fetched;
+	// SQL Server reads the whole database's extended properties once). See ITableBinding.TableComment. *out_json is owned UTF-8, freed via
 	// free_error (the get_capabilities convention). Parsed host-side with yyjson — OUR OWN vcpkg copy, not
 	// DuckDB's vendored one, whose `duckdb_yyjson`-namespaced symbols are not DUCKDB_API-exported and so
 	// cannot be resolved by a loadable extension (see CMakeLists.txt).

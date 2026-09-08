@@ -49,6 +49,101 @@ public sealed partial class SqlServerCatalog
         }
     }
 
+    // ── COMMENT ON read-back ─────────────────────────────────────────────────────────────────────────────
+    //
+    // ⚠⚠ ONE query for the WHOLE database, cached, rather than one per table — and that is a correctness-
+    // adjacent decision, not a micro-optimisation. A comment must be on the CatalogEntry when the host
+    // CONSTRUCTS it, so it rides table_info, which is the ENTRY MATERIALIZATION crossing. Entry
+    // materialization is what catalog ENUMERATION does to EVERY table (duckdb_tables(), and dbt introspects
+    // before it builds anything), so a per-table query here would add one round trip per table to every
+    // enumeration — the cost that this provider has already been burned by twice (the OneLake enumeration
+    // slowness, and the 15871 discovery defect). sys.extended_properties is database-wide, so asking once
+    // costs one query no matter how many tables materialize afterwards.
+    //
+    // ⚠ Staleness is the same contract _externalInfo documents: a comment changed OUT OF BAND shows up on
+    // re-ATTACH or after fabricator_refresh_cache. A comment written THROUGH this catalog invalidates the
+    // cache at the write site, so read-your-own-writes holds.
+    private System.Collections.Generic.Dictionary<string, TableComments>? _comments;
+    private readonly object _commentsLock = new();
+
+    private sealed class TableComments
+    {
+        internal string? Table;
+        internal Dictionary<string, string>? Columns;
+    }
+
+    // class 1 = OBJECT_OR_COLUMN; minor_id 0 addresses the OBJECT and non-zero the column at that ordinal,
+    // resolved to a NAME here so the host never has to know about ordinals. MS_Description is the property
+    // SSMS's "Description" box uses, which is what makes this interoperable in both directions.
+    private const string CommentsSql = @"
+SELECT s.name, o.name,
+       CASE WHEN ep.minor_id = 0 THEN NULL ELSE c.name END,
+       CAST(ep.value AS nvarchar(4000))
+  FROM sys.extended_properties ep
+  JOIN sys.objects o ON o.object_id = ep.major_id
+  JOIN sys.schemas s ON s.schema_id = o.schema_id
+  LEFT JOIN sys.columns c ON c.object_id = ep.major_id AND c.column_id = ep.minor_id
+ WHERE ep.class = 1 AND ep.name = N'MS_Description'";
+
+    private Dictionary<string, TableComments> CommentCache()
+    {
+        if (_comments is { } cached)
+        {
+            return cached;
+        }
+        lock (_commentsLock)
+        {
+            if (_comments is { } raced)
+            {
+                return raced;
+            }
+            var loaded = new Dictionary<string, TableComments>(StringComparer.OrdinalIgnoreCase);
+            // ⚠ CAPABILITY-GATED, never probed: extended properties are not part of the warehouse surface,
+            // and on those engines a statement that errors inside an explicit transaction ABORTS the
+            // transaction — so a swallowed "are they here?" query would poison whatever the caller does
+            // next (docs/warehouse-support.md §6.5). An empty cache is the honest answer there: no comments,
+            // no statement issued. Same gate as the WRITE side, so the two cannot disagree.
+            if (Profile.SupportsExtendedProperties)
+            {
+                foreach (var row in ReadMetadataRows(CommentsSql, 4))
+                {
+                    if (row[0] is not { } schemaName || row[1] is not { } tableName || row[3] is not { } descr)
+                    {
+                        continue;
+                    }
+                    if (!loaded.TryGetValue(ExternalKey(schemaName, tableName), out var entry))
+                    {
+                        entry = new TableComments();
+                        loaded[ExternalKey(schemaName, tableName)] = entry;
+                    }
+                    if (row[2] is { } columnName)
+                    {
+                        (entry.Columns ??= new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase))
+                            [columnName] = descr;
+                    }
+                    else
+                    {
+                        entry.Table = descr;
+                    }
+                }
+            }
+            _comments = loaded;
+            return loaded;
+        }
+    }
+
+    /// <summary>Drops the cached comments so the next read reloads them. Called wherever a comment is
+    /// written through this catalog, which is what makes read-your-own-writes hold.</summary>
+    internal void InvalidateComments() => _comments = null;
+
+    /// <summary>The table's own comment (the MS_Description extended property), or null.</summary>
+    internal string? TableCommentCore(string schemaName, string tableName) =>
+        CommentCache().TryGetValue(ExternalKey(schemaName, tableName), out var entry) ? entry.Table : null;
+
+    /// <summary>Per-column comments for the table, or null when it has none.</summary>
+    internal IReadOnlyDictionary<string, string>? ColumnCommentsCore(string schemaName, string tableName) =>
+        CommentCache().TryGetValue(ExternalKey(schemaName, tableName), out var entry) ? entry.Columns : null;
+
     /// <summary>The rowid column names: a detected external DELTA table with a Delta IDENTITY column
     /// advertises THAT column (slice D — an external table has no PK/UNIQUE/IDENTITY SQL-side); everything
     /// else runs the standard PK / smallest-unique-index / IDENTITY discovery (RowIdSql, whose engine-flipped
@@ -165,6 +260,14 @@ public sealed partial class SqlServerCatalog
         /// <summary>No provider virtual columns (the Delta catalog's stable row-tracking pair has no SQL
         /// analog).</summary>
         public IReadOnlyList<VirtualColumn> VirtualColumns() => System.Array.Empty<VirtualColumn>();
+
+        /// <inheritdoc/>
+        public string? TableComment() =>
+            _catalog.TableCommentCore(_definition.SchemaName, _definition.TableName);
+
+        /// <inheritdoc/>
+        public IReadOnlyDictionary<string, string>? ColumnComments() =>
+            _catalog.ColumnCommentsCore(_definition.SchemaName, _definition.TableName);
 
         public long? ApproximateRowCount() =>
             _catalog.RowCountCore(_definition.SchemaName, _definition.TableName);

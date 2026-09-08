@@ -4,8 +4,9 @@
 #              they arrive as AlterType::SET_COMMENT / SET_COLUMN_COMMENT and carry no AlterTableInfo, so
 #              FabricatorSchemaEntry::Alter refused them before its cast. WRITE-ONLY: the comment is stored
 #              where the Delta protocol puts it (metaData.description; the field's metadata.comment) so a
-#              foreign engine reads it, but nothing reads it BACK into duckdb_tables().comment yet - which
-#              is why every assertion here goes through the LOG rather than through DuckDB's metadata.
+#              foreign engine reads it. Section 8 asserts the READ-BACK; every OTHER assertion goes through
+#              the LOG on purpose, because that is what proves the comment landed where a foreign engine
+#              looks rather than merely round-tripping through our own catalog.
 #              THE LOAD-BEARING ASSERTIONS ARE THE COLUMN-MAPPING ONES (section 3): a column comment
 #              rewrites the schema JSON, and column mapping keeps delta.columnMapping.physicalName THERE. A
 #              typed round-trip through engineered-wood's schema model could drop it, which would make the
@@ -190,6 +191,62 @@ statement error
 COMMENT ON COLUMN d.main.fab_view_numbers.n IS 'nope';
 ----
 it is a provider-declared view
+
+# ============================================================================
+# 8. THE READ-BACK - duckdb_tables().comment / duckdb_columns().comment.
+#    The COLUMN half is the interesting one: it is read off the Arrow schema's FIELD METADATA, which is
+#    where engineered-wood's Delta -> Arrow conversion leaves a Delta column comment - so it costs no extra
+#    log read, and it works through COLUMN MAPPING (on by default here) because the LOGICAL name is what
+#    the schema carries. The uncommented column must stay NULL, or the assertion would pass on a build
+#    reporting one comment for every column.
+# ============================================================================
+
+statement ok
+COMMENT ON TABLE d.main.co IS 'read back me';
+
+statement ok
+COMMENT ON COLUMN d.main.co.i IS 'the i column';
+
+query T
+SELECT comment FROM duckdb_tables() WHERE database_name = 'd' AND table_name = 'co';
+----
+read back me
+
+query TT
+SELECT column_name, coalesce(comment, '(none)') FROM duckdb_columns()
+ WHERE database_name = 'd' AND table_name = 'co' ORDER BY column_name;
+----
+i
+the i column
+j
+(none)
+
+# Read-your-own-writes needs the host to EVICT the cached catalog entry on a COMMENT ON: without that the
+# entry keeps the old comment and this reports the PREVIOUS value in the same session.
+statement ok
+COMMENT ON TABLE d.main.co IS 'changed again';
+
+query T
+SELECT comment FROM duckdb_tables() WHERE database_name = 'd' AND table_name = 'co';
+----
+changed again
+
+statement ok
+COMMENT ON TABLE d.main.co IS NULL;
+
+statement ok
+COMMENT ON COLUMN d.main.co.i IS NULL;
+
+query I
+SELECT comment IS NULL FROM duckdb_tables() WHERE database_name = 'd' AND table_name = 'co';
+----
+true
+
+query I
+SELECT count(*) FROM duckdb_columns()
+ WHERE database_name = 'd' AND table_name = 'co' AND comment IS NOT NULL;
+----
+0
 
 # ============================================================================
 # 7. A comment is not confused with a table PROPERTY - `description` is a first-class metaData field, so it

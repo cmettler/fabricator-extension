@@ -94,6 +94,27 @@ internal sealed class TableSession
                 json.WriteEndObject();
             }
             json.WriteEndArray();
+            // COMMENT ON read-back. Both keys are OMITTED when there is nothing to say, so an older bridge
+            // and a provider with no comment concept produce byte-identical docs to before — and the host
+            // skips unknown keys, so the pair is additive in both directions (no ABI bump).
+            //
+            // ⚠ These ride table_info rather than a lazy entry of their own BECAUSE a comment lives on the
+            // CatalogEntry: DuckDB copies CreateTableInfo::comment in the TableCatalogEntry constructor, so
+            // the value has to exist before the entry does. See ITableBinding.TableComment for why that
+            // makes a per-CATALOG cache the provider's obligation rather than a nicety.
+            if (t.TableComment() is { } tableComment)
+            {
+                json.WriteString("comment", tableComment);
+            }
+            if (t.ColumnComments() is { Count: > 0 } columnComments)
+            {
+                json.WriteStartObject("column_comments");
+                foreach (var pair in columnComments)
+                {
+                    json.WriteString(pair.Key, pair.Value);
+                }
+                json.WriteEndObject();
+            }
             json.WriteEndObject();
         }
         return Encoding.UTF8.GetString(buffer.ToArray());

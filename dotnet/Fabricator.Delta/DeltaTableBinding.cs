@@ -364,6 +364,14 @@ internal sealed class DeltaTableBinding : ITableBinding
     /// <c>_rowTrackingByPath</c> was never invalidated, so a property change made it silently stale.</summary>
     internal bool? RowTracking;
 
+    /// <summary>The table's COMMENT (Delta's <c>metaData.description</c>), cached from the schema read the
+    /// way <see cref="RowTracking"/> is: the host fetches table_schema and then IMMEDIATELY table_info, so
+    /// the description rides the open the schema already paid for. <c>_tableCommentKnown</c> is separate
+    /// because null is a real ANSWER here (no description) and must not read as "not fetched yet".</summary>
+    private string? _tableComment;
+    private bool _tableCommentKnown;
+
+
     /// <inheritdoc/>
     /// <remarks>An AT binding answers the AS-OF schema (the time-travel entry's contract); otherwise the
     /// transaction's pending (buffered ALTER / CREATE) shape wins, then storage via the transaction's
@@ -388,7 +396,9 @@ internal sealed class DeltaTableBinding : ITableBinding
             try
             {
                 schema = DeltaReader.GetSchemaAndRowTracking(
-                    catalog.Opener(), Path, out rowTracking, catalog.ReadBound(Path));
+                    catalog.Opener(), Path, out rowTracking, out var tableComment, catalog.ReadBound(Path));
+                _tableComment = tableComment;
+                _tableCommentKnown = true;
             }
             catch (Exception ex)
             {
@@ -408,6 +418,73 @@ internal sealed class DeltaTableBinding : ITableBinding
     /// scan time (no row-tracking feature needed; works on ANY Delta table). Enables UPDATE/DELETE
     /// (rowid-based, mirrors the SQL Server backend); DELETE is copy-on-write (plain add/remove).</remarks>
     public IReadOnlyList<string> RowIdColumns() => new[] { DeltaCatalog.RowIdColumn };
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// <para>Delta's <c>metaData.description</c>, which is NOT in the Arrow schema — so unlike the column
+    /// comments it needs the snapshot. It rides the out-param of the schema read (the open that read is
+    /// making anyway), so the ordinary path adds no call at all. ⚠ That is an avoided CALL, not an avoided
+    /// IO: repeated opens are shared, measured — see <see cref="ColumnComments"/> for the numbers and for
+    /// the cache that measurement deleted.</para>
+    /// <para>⚠ NULL for a TIME-TRAVEL binding, deliberately: an AT entry takes its schema from
+    /// <c>GetSchemaAt</c>, which does not carry the description, so reporting the table's CURRENT comment on
+    /// a historical entry would be a wrong answer rather than a missing one. COLUMN comments are unaffected
+    /// and remain AS-OF correct, because they ride the AS-OF Arrow schema itself.</para>
+    /// <para>⚠ <b>And it is MEASURED UNOBSERVABLE from SQL, so do not spend effort closing it</b> — AT
+    /// entries live in their own cache and are NOT enumerated (<c>duckdb_tables()</c> shows exactly ONE row
+    /// for a table referenced with an AT clause), so nothing reads an AT entry's comment. Threading the
+    /// description through <c>GetSchemaAt</c> would buy a value no surface reports.</para>
+    /// </remarks>
+    public string? TableComment()
+    {
+        if (_at is not null)
+        {
+            return null;
+        }
+        if (!_tableCommentKnown)
+        {
+            // Reached only when table_info is asked before table_schema. The host's order is schema-then-info,
+            // so this is the defensive branch; it costs one open rather than answering null, because a
+            // silently missing comment is indistinguishable from a table that has none.
+            var catalog = Catalog;
+            DeltaReader.GetSchemaAndRowTracking(
+                catalog.Opener(), Path, out _, out var comment, catalog.ReadBound(Path));
+            _tableComment = comment;
+            _tableCommentKnown = true;
+        }
+        return _tableComment;
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>
+    /// <para>Read straight off the Arrow schema's FIELD METADATA: engineered-wood's Delta -> Arrow
+    /// conversion copies each StructField's metadata onto the Arrow field verbatim (its filter is
+    /// write-direction only and strips just <c>PARQUET:*</c>), and <c>comment</c> is where the Delta
+    /// protocol puts a column comment. That also makes it correct for a TIME-TRAVEL binding for free, since
+    /// the AS-OF schema carries the AS-OF metadata.</para>
+    /// <para><b>⚠ It touches <see cref="Schema"/>, which does NOT memoize — and MEASURED 2026-09-08 that
+    /// costs nothing anyway.</b> A cache was built here first, justified by "the getter re-opens the log, so
+    /// this would double the reads of every table during enumeration". A mutant that dropped the cache and
+    /// re-read the schema per call produced the IDENTICAL IO count — 10 ops for a 2-table enumeration,
+    /// 4 list + 6 read-all, on both builds — because the table open is already SHARED for the statement.
+    /// The cache was therefore deleted rather than kept on an unmeasured hazard.</para>
+    /// <para>⚠ So do not re-add one without re-measuring: the instrument is <c>FABRICATOR_LOG_LEVEL=Debug</c>
+    /// plus a count of the <c>Fabricator.Host.Fs</c> lines around a <c>duckdb_tables()</c> enumeration.</para>
+    /// </remarks>
+    public IReadOnlyDictionary<string, string>? ColumnComments()
+    {
+        Dictionary<string, string>? comments = null;
+        foreach (var field in Schema.FieldsList)
+        {
+            if (field.Metadata is { } metadata
+                && metadata.TryGetValue("comment", out var comment)
+                && comment is not null)
+            {
+                (comments ??= new Dictionary<string, string>())[field.Name] = comment;
+            }
+        }
+        return comments;
+    }
 
     /// <inheritdoc/>
     /// <remarks>The STABLE row-tracking id + commit version as queryable-by-name virtual columns
