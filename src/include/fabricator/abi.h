@@ -928,10 +928,18 @@ typedef struct FabricatorVTable {
 	// Row identity + provider virtual columns, ONE crossing (was kinds 3 + 12), as ONE typed JSON doc
 	// (v73; the v72 intermediate carried an Arrow stream):
 	//   {"rowid":["a","b",...], "virtual":[{"name":"...","type":"<DuckDB type text>"}, ...],
-	//    "comment":"<table comment>", "column_comments":{"<column>":"<comment>", ...}}
-	// Both arrays always present (empty ok); rowid names in key order. The two COMMENT keys are OPTIONAL and
-	// OMITTED when there is nothing to report, so a provider with no comment concept produces the doc it
-	// always did (additive both ways — the host skips unknown keys).
+	//    "comment":"<table comment>", "column_comments":{"<column>":"<comment>", ...},
+	//    "column_defaults":{"<column>":"<default expression text>", ...}}
+	// Both arrays always present (empty ok); rowid names in key order. The two COMMENT keys and the DEFAULTS
+	// key are OPTIONAL and OMITTED when there is nothing to report, so a provider with no comment concept
+	// produces the doc it always did (additive both ways — the host skips unknown keys).
+	//
+	// ⚠⚠ column_defaults IS TEXT THE PROVIDER HAS ALREADY NORMALISED OUT OF ITS OWN DIALECT (SQL Server
+	// strips the parens it wraps every default in, and the N'' prefix), and the HOST decides what to honour:
+	// it parses each one and accepts ONLY a single CONSTANT expression. That filter is not fussiness — a
+	// reported default is consumed by DuckDB's INSERT binder, so honouring `getdate()` would silently
+	// substitute the CLIENT's clock for the server's. Send whatever the provider has; unparseable and
+	// non-constant text is dropped, never an error.
 	//
 	// ⚠ THE COMMENTS RIDE *THIS* CROSSING RATHER THAN table_stats' LAZY ONE, AND NOT BY PREFERENCE. A
 	// comment lives on the CatalogEntry: DuckDB copies CreateTableInfo::comment in the TableCatalogEntry

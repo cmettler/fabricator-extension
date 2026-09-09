@@ -60,16 +60,26 @@ public sealed partial class SqlServerCatalog
     // slowness, and the 15871 discovery defect). sys.extended_properties is database-wide, so asking once
     // costs one query no matter how many tables materialize afterwards.
     //
-    // ⚠ Staleness is the same contract _externalInfo documents: a comment changed OUT OF BAND shows up on
-    // re-ATTACH or after fabricator_refresh_cache. A comment written THROUGH this catalog invalidates the
-    // cache at the write site, so read-your-own-writes holds.
-    private System.Collections.Generic.Dictionary<string, TableComments>? _comments;
-    private readonly object _commentsLock = new();
+    // ⚠ STALENESS: a comment or default written THROUGH this catalog invalidates the cache at the write
+    // site (every ALTER, and every COMMENT ON), so read-your-own-writes holds. One changed OUT OF BAND
+    // shows up on re-ATTACH or after fabricator_refresh_cache — the latter because GetTables drops this
+    // cache, which is the ONLY thing that makes the refresh_cache half of that sentence true. It was NOT
+    // true when this cache was first written: the claim was made by appealing to a contract _externalInfo
+    // was said to document, and _externalInfo neither documents it nor lives in this file. Fixed and the
+    // reasoning replaced 2026-09-09, after a surviving mutant showed the gap.
+    private System.Collections.Generic.Dictionary<string, TableMetadata>? _meta;
+    private readonly object _metaLock = new();
 
-    private sealed class TableComments
+    // ⚠ Comments and DEFAULTS share one cache and one load although they are two catalog surfaces behind
+    // two capability flags, because they are wanted at the SAME moment (entry materialization) and by the
+    // same caller. The cost of sharing is that either kind of write reloads both, which is a re-read rather
+    // than a wrong answer; the benefit is one lock, one lazy load, and no way for the two to disagree about
+    // which tables exist.
+    private sealed class TableMetadata
     {
         internal string? Table;
         internal Dictionary<string, string>? Columns;
+        internal Dictionary<string, string>? Defaults;
     }
 
     // class 1 = OBJECT_OR_COLUMN; minor_id 0 addresses the OBJECT and non-zero the column at that ordinal,
@@ -85,19 +95,39 @@ SELECT s.name, o.name,
   LEFT JOIN sys.columns c ON c.object_id = ep.major_id AND c.column_id = ep.minor_id
  WHERE ep.class = 1 AND ep.name = N'MS_Description'";
 
-    private Dictionary<string, TableComments> CommentCache()
+    // The column DEFAULTS, database-wide and in ONE query for the same reason the comments are. `definition`
+    // is SQL Server's own rendering and always arrives PARENTHESISED — ((10)), (N'2024-01-01'), (getdate()) —
+    // which is what NormaliseDefault strips before the host tries to parse it.
+    private const string DefaultsSql = @"
+SELECT s.name, o.name, c.name, dc.definition
+  FROM sys.default_constraints dc
+  JOIN sys.objects o ON o.object_id = dc.parent_object_id
+  JOIN sys.schemas s ON s.schema_id = o.schema_id
+  JOIN sys.columns c ON c.object_id = dc.parent_object_id AND c.column_id = dc.parent_column_id";
+
+    private Dictionary<string, TableMetadata> MetadataCache()
     {
-        if (_comments is { } cached)
+        if (_meta is { } cached)
         {
             return cached;
         }
-        lock (_commentsLock)
+        lock (_metaLock)
         {
-            if (_comments is { } raced)
+            if (_meta is { } raced)
             {
                 return raced;
             }
-            var loaded = new Dictionary<string, TableComments>(StringComparer.OrdinalIgnoreCase);
+            var loaded = new Dictionary<string, TableMetadata>(StringComparer.OrdinalIgnoreCase);
+            TableMetadata EntryFor(string schemaName, string tableName)
+            {
+                var cacheKey = ExternalKey(schemaName, tableName);
+                if (!loaded.TryGetValue(cacheKey, out var found))
+                {
+                    found = new TableMetadata();
+                    loaded[cacheKey] = found;
+                }
+                return found;
+            }
             // ⚠ CAPABILITY-GATED, never probed: extended properties are not part of the warehouse surface,
             // and on those engines a statement that errors inside an explicit transaction ABORTS the
             // transaction — so a swallowed "are they here?" query would poison whatever the caller does
@@ -111,11 +141,7 @@ SELECT s.name, o.name,
                     {
                         continue;
                     }
-                    if (!loaded.TryGetValue(ExternalKey(schemaName, tableName), out var entry))
-                    {
-                        entry = new TableComments();
-                        loaded[ExternalKey(schemaName, tableName)] = entry;
-                    }
+                    var entry = EntryFor(schemaName, tableName);
                     if (row[2] is { } columnName)
                     {
                         (entry.Columns ??= new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase))
@@ -127,22 +153,92 @@ SELECT s.name, o.name,
                     }
                 }
             }
-            _comments = loaded;
+            // ⚠ Gated on its OWN capability, not on the comments' one: they are separate catalog surfaces
+            // and a warehouse has no DEFAULT constraint at all, so there is nothing to ask for. Same rule
+            // as above — never issue a statement on a warehouse whose failure you would have to swallow.
+            if (Profile.SupportsDefaultConstraints)
+            {
+                foreach (var row in ReadMetadataRows(DefaultsSql, 4))
+                {
+                    if (row[0] is not { } schemaName || row[1] is not { } tableName ||
+                        row[2] is not { } columnName || row[3] is not { } definition)
+                    {
+                        continue;
+                    }
+                    if (NormaliseDefault(definition) is { } normalised)
+                    {
+                        (EntryFor(schemaName, tableName).Defaults ??=
+                            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase))[columnName] =
+                            normalised;
+                    }
+                }
+            }
+            _meta = loaded;
             return loaded;
         }
     }
 
+    /// <summary>Turns SQL Server's own rendering of a DEFAULT into something DuckDB's parser can read, or
+    /// null when there is nothing left. Dialect normalisation ONLY — it does not decide what is a literal,
+    /// because that rule lives host-side where one policy point serves every provider.</summary>
+    /// <remarks>SQL Server stores a default already parenthesised — <c>((10))</c>, <c>(N'2024-01-01')</c>,
+    /// <c>(getdate())</c> — and uses the <c>N</c> prefix for a national-character literal, which DuckDB
+    /// would read as a type-prefixed literal for a type called N. Both are stripped; everything else is
+    /// passed through verbatim for the host to accept or drop.</remarks>
+    internal static string? NormaliseDefault(string definition)
+    {
+        var text = definition.Trim();
+        // Peel BALANCED outer parens only. A test for "starts with ( and ends with )" would mangle
+        // `(a)+(b)` into `a)+(b`, which could then parse as something else entirely rather than fail.
+        while (text.Length >= 2 && text[0] == '(' && text[text.Length - 1] == ')')
+        {
+            var depth = 0;
+            var balanced = true;
+            for (var i = 0; i < text.Length; i++)
+            {
+                if (text[i] == '(')
+                {
+                    depth++;
+                }
+                else if (text[i] == ')')
+                {
+                    depth--;
+                    if (depth == 0 && i != text.Length - 1)
+                    {
+                        balanced = false;
+                        break;
+                    }
+                }
+            }
+            if (!balanced)
+            {
+                break;
+            }
+            text = text.Substring(1, text.Length - 2).Trim();
+        }
+        if (text.Length >= 2 && (text[0] == 'N' || text[0] == 'n') && text[1] == '\'')
+        {
+            text = text.Substring(1);
+        }
+        return text.Length == 0 ? null : text;
+    }
+
     /// <summary>Drops the cached comments so the next read reloads them. Called wherever a comment is
     /// written through this catalog, which is what makes read-your-own-writes hold.</summary>
-    internal void InvalidateComments() => _comments = null;
+    internal void InvalidateMetadata() => _meta = null;
 
     /// <summary>The table's own comment (the MS_Description extended property), or null.</summary>
     internal string? TableCommentCore(string schemaName, string tableName) =>
-        CommentCache().TryGetValue(ExternalKey(schemaName, tableName), out var entry) ? entry.Table : null;
+        MetadataCache().TryGetValue(ExternalKey(schemaName, tableName), out var entry) ? entry.Table : null;
 
     /// <summary>Per-column comments for the table, or null when it has none.</summary>
     internal IReadOnlyDictionary<string, string>? ColumnCommentsCore(string schemaName, string tableName) =>
-        CommentCache().TryGetValue(ExternalKey(schemaName, tableName), out var entry) ? entry.Columns : null;
+        MetadataCache().TryGetValue(ExternalKey(schemaName, tableName), out var entry) ? entry.Columns : null;
+
+    /// <summary>Per-column DEFAULT expressions for the table, normalised out of T-SQL, or null when it has
+    /// none. What the HOST does with them is much narrower — it keeps only constants.</summary>
+    internal IReadOnlyDictionary<string, string>? ColumnDefaultsCore(string schemaName, string tableName) =>
+        MetadataCache().TryGetValue(ExternalKey(schemaName, tableName), out var entry) ? entry.Defaults : null;
 
     /// <summary>The rowid column names: a detected external DELTA table with a Delta IDENTITY column
     /// advertises THAT column (slice D — an external table has no PK/UNIQUE/IDENTITY SQL-side); everything
@@ -268,6 +364,10 @@ SELECT s.name, o.name,
         /// <inheritdoc/>
         public IReadOnlyDictionary<string, string>? ColumnComments() =>
             _catalog.ColumnCommentsCore(_definition.SchemaName, _definition.TableName);
+
+        /// <inheritdoc/>
+        public IReadOnlyDictionary<string, string>? ColumnDefaults() =>
+            _catalog.ColumnDefaultsCore(_definition.SchemaName, _definition.TableName);
 
         public long? ApproximateRowCount() =>
             _catalog.RowCountCore(_definition.SchemaName, _definition.TableName);

@@ -1009,7 +1009,10 @@ case "$TIER" in
         #   3241 + 39 exactly, so no other suite moved.
         # 3293 since 2026-09-08: verify_comment_on_mssql 39 -> 52, the read-back replacing the
         #   write-only characterization. 3280 + 13 exactly, so no other suite moved.
-        : "${MIN_ASSERTIONS:=3293}"
+        # 3316 since 2026-09-09: verify_alter_default 59 -> 82, the column_default read-back (literals
+        #   only) replacing ITS write-only characterization, plus the out-of-band pair that gates the
+        #   provider metadata cache being dropped on refresh. 3293 + 23 exactly.
+        : "${MIN_ASSERTIONS:=3316}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

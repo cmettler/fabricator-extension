@@ -355,6 +355,15 @@ FabricatorTableDetails FetchTableInfo(FabricatorHandle table_handle) {
 			                                    string(yyjson_get_str(val), yyjson_get_len(val)));
 		}
 	}
+	auto *column_defaults = yyjson_obj_get(root, "column_defaults");
+	yyjson_obj_iter def_iter = yyjson_obj_iter_with(column_defaults);
+	while ((key = yyjson_obj_iter_next(&def_iter))) {
+		val = yyjson_obj_iter_get_val(key);
+		if (yyjson_is_str(key) && yyjson_is_str(val)) {
+			result.column_defaults.emplace_back(string(yyjson_get_str(key), yyjson_get_len(key)),
+			                                    string(yyjson_get_str(val), yyjson_get_len(val)));
+		}
+	}
 	return result;
 }
 

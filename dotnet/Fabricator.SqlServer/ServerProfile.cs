@@ -93,6 +93,24 @@ internal sealed class ServerProfile
     public bool SupportsExtendedProperties => !IsWarehouse;
 
     /// <summary>
+    /// Whether the engine has DEFAULT constraints, i.e. whether <c>sys.default_constraints</c> is worth
+    /// reading. FALSE for the warehouse family (Fabric Warehouse, the Lakehouse SQL endpoint, Synapse
+    /// dedicated), whose documented T-SQL surface has no DEFAULT constraint at all.
+    /// </summary>
+    /// <remarks>
+    /// <para>It gates the column-default READ-BACK. A warehouse with no defaults has nothing to report, so
+    /// the honest answer there is an empty map and NO statement issued — which also keeps us clear of the
+    /// enumeration path this provider has been burned on twice (the OneLake slowness; the 15871 defect,
+    /// where ONE unsupported <c>sys</c> object made full enumeration impossible for sixteen days).</para>
+    /// <para><b>⚠ Separate from <see cref="SupportsExtendedProperties"/> although both are currently
+    /// <c>!IsWarehouse</c></b>: they are different catalog surfaces and a future engine may well have one
+    /// without the other. Collapsing them into one flag would make the next divergence silent.</para>
+    /// <para><b>⚠ UNMEASURED, and a capability gate rather than a probe</b> — the same reasoning, and the
+    /// same measured reason, as <see cref="SupportsExtendedProperties"/> above.</para>
+    /// </remarks>
+    public bool SupportsDefaultConstraints => !IsWarehouse;
+
+    /// <summary>
     /// Isolation level for the pinned WRITE transaction (BeginWrite). Fabric Warehouse / Lakehouse SQL
     /// endpoint only support SNAPSHOT, so we set it explicitly there; box SQL Server / Azure SQL DB /
     /// Synapse dedicated keep the connection/server default (empty => Unspecified). Synapse dedicated is
@@ -147,6 +165,7 @@ internal sealed class ServerProfile
         ("has_native_json", Bool(HasNativeJson)),
         ("supports_cdc", Bool(SupportsCdc)),
         ("supports_extended_properties", Bool(SupportsExtendedProperties)),
+        ("supports_default_constraints", Bool(SupportsDefaultConstraints)),
         ("is_utf8_collation", Bool(IsUtf8Collation)),
         ("is_binary_collation", Bool(IsBinaryCollation)),
         ("is_case_sensitive", Bool(IsCaseSensitive)),

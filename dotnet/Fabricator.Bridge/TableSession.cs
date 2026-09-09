@@ -115,6 +115,15 @@ internal sealed class TableSession
                 }
                 json.WriteEndObject();
             }
+            if (t.ColumnDefaults() is { Count: > 0 } columnDefaults)
+            {
+                json.WriteStartObject("column_defaults");
+                foreach (var pair in columnDefaults)
+                {
+                    json.WriteString(pair.Key, pair.Value);
+                }
+                json.WriteEndObject();
+            }
             json.WriteEndObject();
         }
         return Encoding.UTF8.GetString(buffer.ToArray());

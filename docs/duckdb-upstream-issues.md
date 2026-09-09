@@ -649,12 +649,15 @@ behaviour under test is ours. Here it is not.
 
 ---
 
-## 7. ⚠ A cast-wrapped column DEFAULT is flattened to NULL in the `AlterInfo` a FOREIGN catalog receives
+## 7. ⚠⚠ RETRACTED — a cast-wrapped column DEFAULT is NOT lost; it is a deliberate three-statement rewrite
 
-**Found 2026-09-08. NOT REPRODUCED ON A STOCK WHEEL, and therefore NOT FILED** — see §2 for why that
-distinction is enforced here rather than being a formality.
+**Recorded 2026-09-08 as a DuckDB defect. RETRACTED 2026-09-09 after reading the transform and measuring.
+There is no upstream bug here, and it was never filed — which is the one thing this file's own standing
+rule got right.** The section is kept rather than deleted because the measurements below are all CORRECT
+and it is the INFERENCE drawn from them that was wrong, which is the more useful thing to be able to
+re-read.
 
-### What was measured
+### What was measured (unchanged — every row still reproduces)
 
 `ALTER TABLE <foreign>.t ADD COLUMN e <type> DEFAULT <literal>` reaches the catalog's `Alter` as an
 `AddColumnInfo` whose `new_column.DefaultValue()` is a `VALUE_CONSTANT`. Probing that expression directly:
@@ -662,42 +665,62 @@ distinction is enforced here rather than being a formality.
 | written | arrives as |
 |---|---|
 | `INTEGER DEFAULT 10` | `10` |
-| `BIGINT DEFAULT 10` | `10` |
 | `DOUBLE DEFAULT 1.5` | `1.5` |
 | `DECIMAL(9,2) DEFAULT 1.50` | `1.50` |
 | `VARCHAR DEFAULT 'x'` | `'x'` |
 | `DATE DEFAULT '2024-01-01'` | `'2024-01-01'` |
 | `BOOLEAN DEFAULT true` | **`NULL`** |
-| `BOOLEAN DEFAULT CAST(1 AS BOOLEAN)` | **`NULL`** |
 | `DATE DEFAULT DATE '2024-01-01'` | **`NULL`** |
 | `TIMESTAMP DEFAULT TIMESTAMP '…'` | **`NULL`** |
-| `BLOB DEFAULT '\x41'::BLOB` | **`NULL`** |
+| `BLOB DEFAULT 'A'::BLOB` | **`NULL`** |
 
-⇒ a **BARE** literal survives; anything the parser wraps in a **CAST** arrives as a constant holding NULL.
-The expression type is `VALUE_CONSTANT` (75) in every case, so nothing signals that a value was lost.
+### ⚠⚠ THE INFERENCE THAT WAS WRONG
 
-### The control that makes it a finding rather than a guess
+*"anything the parser wraps in a CAST arrives as a constant holding NULL ⇒ DuckDB has LOST the value before
+a foreign catalog sees it."* The first clause is true. The second does not follow, and it is false.
 
-**DuckDB's OWN table is unaffected**: `CREATE TABLE t AS SELECT 1 AS i; ALTER TABLE t ADD COLUMN e BOOLEAN
-DEFAULT true;` yields `true`. So the statement and the parse are fine, and the loss is in what a foreign
-catalog's `Alter` is handed.
+`transform_alter_table.cpp` splits `ADD COLUMN … DEFAULT` on `ExpressionClass::CONSTANT`. A **non-constant**
+default is deliberately rewritten into THREE statements, with the reason in an upstream comment — a WAL
+replay must not re-evaluate `random()`/`current_timestamp` into a different answer:
 
-### Why it matters, and what we do about it
+1. `ALTER TABLE t ADD COLUMN col <type> DEFAULT NULL;`  ← **the only one a catalog's `Alter` receives**
+2. `UPDATE t SET col = <expression>;`                   ← materialises the value for existing rows
+3. `ALTER TABLE t ALTER col SET DEFAULT <expression>;`  ← reinstates the real default
 
-The lost value is **indistinguishable from an honest `DEFAULT NULL`** — both are a NULL constant — so a
-consumer that honours it stores the wrong default silently. `fabricator` therefore REFUSES a NULL-arriving
-default on `ADD COLUMN`, as one rule rather than a list of affected types (a list enumerated from
-measurements can miss one, and a missed type is silent again). Gate: `verify_alter_default` §3.
+So the NULL is statement 1's own honest placeholder, not a dropped value. `true` and `DATE '…'` take that
+path because DuckDB parses each as a CAST rather than a constant — visible on its OWN tables, where
+`information_schema.columns.column_default` renders them as `CAST('t' AS BOOLEAN)` and
+`CAST('2024-01-01' AS "DATE")`.
 
-⚠ `ALTER COLUMN … SET DEFAULT` is NOT affected — the same boolean and date arrive intact there (measured:
-they reach SQL Server as `((1))` and `(N'2024-01-01')`), which is what localises the problem to
-`AddColumnInfo` rather than to the shared literal handling.
+### ⚠⚠ THE "CONTROL" WAS PART OF THE THING IT WAS CONTROLLING FOR
 
-### What filing it would need
+The finding rested on: *"`ALTER COLUMN … SET DEFAULT` carries the same boolean and date correctly, which
+localises the problem to `AddColumnInfo`."* That is **statement 3 of the very rewrite** — so the control was
+observing the mechanism succeed and being read as evidence that a different path had failed. A control drawn
+from inside the process under test cannot discriminate.
 
-A repro with no third-party extension. The behaviour is only observable through a catalog implementation's
-`Alter`, so it needs either a C++ unit test over a stub catalog, or another catalog extension that surfaces
-the default (postgres/mysql scanner). Until then this is a recorded local finding, not an upstream report.
+**The discriminator that settles it is one keyword**, and it needs no C++ at all:
+`ADD COLUMN IF NOT EXISTS c BOOLEAN DEFAULT true` takes the `missing_ok` branch, which skips the rewrite —
+and the value lands on SQL Server as `((1))`, backfills the existing row, and is applied to later inserts.
+Same statement, same type, one keyword apart from the spelling that "loses" it.
+
+### What we do about it, and why the behaviour did not change
+
+`fabricator` still REFUSES a NULL-arriving default on `ADD COLUMN`, for a corrected reason. At statement 1
+an honest `DEFAULT NULL` and the rewrite's placeholder are the same NULL constant, and accepting it hands
+the caller a sequence that completes only sometimes: statement 2 is an UPDATE, and on a table with no
+PK/unique/identity our rowid requirement refuses it (measured), leaving the column added, unbackfilled and
+defaultless behind a statement that failed with an error about UPDATE. Refusing at statement 1 is a clean
+failure with no partial state. Gate: `verify_alter_default` §3; the message now names `IF NOT EXISTS` as the
+workaround, which is both simpler and measured.
+
+### The transferable lesson
+
+Three things were measured correctly and assembled into a wrong mechanism: the value is absent, the absence
+is type-dependent, and a neighbouring path works. **The missing step was reading the code that produces the
+`AlterInfo`** — 20 lines of `transform_alter_table.cpp` — rather than inferring a cause from the shape of
+the symptom. This file already carries the same lesson under §2 for a different finding; it is now carrying
+it twice.
 
 ---
 

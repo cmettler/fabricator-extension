@@ -136,6 +136,25 @@ public interface ITableBinding : IDisposable
     /// caching obligation as <see cref="TableComment"/>.</summary>
     IReadOnlyDictionary<string, string>? ColumnComments() => null;
 
+    /// <summary>Per-column DEFAULT expressions, keyed like <see cref="ColumnComments"/>; null or empty when
+    /// none. The text must be NORMALISED out of the provider's dialect into something DuckDB can parse — a
+    /// SQL Server provider strips the parens it wraps every default in and the <c>N''</c> string prefix.
+    /// Same laziness constraint and same per-catalog caching obligation as <see cref="TableComment"/>.
+    /// </summary>
+    /// <remarks>
+    /// <para>⚠⚠ <b>REPORT WHATEVER YOU HAVE — THE HOST DECIDES WHAT TO HONOUR, and it honours far less than
+    /// you will send.</b> A default on a DuckDB column is not display metadata: the INSERT binder
+    /// SUBSTITUTES it for a column the statement omits, so a reported <c>getdate()</c> would stop the server
+    /// applying its own default and start sending the CLIENT's clock — a silently different row. The host
+    /// therefore parses each entry and keeps ONLY a single constant expression, dropping functions, casts
+    /// and anything it cannot parse. Do not pre-filter to match that rule; one policy point is the point.
+    /// </para>
+    /// <para>A provider that cannot RECORD a default has no business reporting one: Delta answers null
+    /// because engineered-wood implements no part of the column-default writer feature, which is the same
+    /// reason the write side refuses there.</para>
+    /// </remarks>
+    IReadOnlyDictionary<string, string>? ColumnDefaults() => null;
+
     /// <summary>Approximate row count for optimizer cardinality, or null when the provider surfaces none
     /// (Delta; warehouse engines, where the stats DMVs are unsupported and probing would poison an open
     /// transaction). May do IO.</summary>

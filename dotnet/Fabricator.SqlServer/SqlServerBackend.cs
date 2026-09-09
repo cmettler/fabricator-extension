@@ -2491,9 +2491,24 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
     // stream the query directly (no materialization).
     public IArrowArrayStream GetSchemas() => SchemasMetadata();
 
-    public IArrowArrayStream GetTables() => _schemaFilter is null && _tableFilter is null
-        ? ExecuteMetadataQuery(TablesSql)
-        : FilteredTables();
+    // ⚠ THE ONE HOOK THAT MEANS "the host is (re)discovering this catalog", and the database-wide comment
+    // and DEFAULT cache is dropped here because of it. GetTables is reached from exactly two places —
+    // the ATTACH (where the cache is unset anyway) and FabricatorCatalog::RefreshCache, i.e.
+    // fabricator_refresh_cache / fabricator_invalidate_cache. Entry MATERIALIZATION does not come through
+    // here (that is table_open/table_info), so this costs nothing per enumeration.
+    //
+    // ⚠⚠ Without it the documented escape hatch does not work: the cache is catalog-wide and loaded ONCE,
+    // so a comment or default changed OUT OF BAND — or a whole table created out of band — stayed invisible
+    // for the life of the ATTACH, with fabricator_refresh_cache appearing to do the job because it really
+    // does refresh everything ELSE. Found 2026-09-09 by a mutant that SURVIVED: the gate's "a non-literal
+    // default is withheld" row was passing because the stale cache had never heard of the column at all.
+    public IArrowArrayStream GetTables()
+    {
+        InvalidateMetadata();
+        return _schemaFilter is null && _tableFilter is null
+            ? ExecuteMetadataQuery(TablesSql)
+            : FilteredTables();
+    }
 
     public IArrowArrayStream GetFunctions() => _functionFilter is null
         ? ExecuteMetadataQuery(FunctionsMetadataSql())
@@ -3800,6 +3815,13 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
                 throw new ArgumentOutOfRangeException(nameof(spec), AlterTableSpec.WireName(spec.Kind),
                                                       "fabricator: unsupported ALTER TABLE kind on SQL Server");
         }
+        // ⚠ UNCONDITIONAL, and only after the switch has SUCCEEDED. The database-wide cache holds comments
+        // AND column defaults, so an ALTER can invalidate it in three different ways: it can move a default
+        // (ADD COLUMN … DEFAULT, SET/DROP DEFAULT), it can remove the column a cached entry is keyed to, and
+        // a RENAME changes the (schema, table) key itself — leaving the new name with nothing cached and the
+        // old name holding the entry forever. Reloading on the next read is one query; getting any of those
+        // three wrong is a stale answer that survives the session.
+        InvalidateMetadata();
     }
 
     /// <summary>
@@ -3856,7 +3878,7 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
         {
             ExecuteNonQuery("IF " + exists
                             + " EXEC sys.sp_dropextendedproperty @name=N'MS_Description'" + levels);
-            InvalidateComments();
+            InvalidateMetadata();
             return;
         }
         string named = "@name=N'MS_Description', @value=" + NLiteral(comment) + levels;
@@ -3867,7 +3889,7 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
         // or `COMMENT ON t IS 'x'` followed by a read of duckdb_tables() would report the PREVIOUS value.
         // AFTER the write, never before: dropping it first would let a concurrent read reload the OLD state
         // and cache that instead.
-        InvalidateComments();
+        InvalidateMetadata();
     }
 
     /// <summary>

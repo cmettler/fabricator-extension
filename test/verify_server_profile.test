@@ -14,14 +14,17 @@ ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE fabricator);
 # `supports_mars` alone cannot show that a `SET mssql_mars='false'` reached the catalog, which is what let
 # verify_mars_off_same_catalog pass vacuously.
 #
-# 17 since 2026-09-08: + supports_extended_properties, which gates COMMENT ON (a comment is stored as the
-# MS_Description extended property, and the warehouse family provides none). It is here rather than only in
-# verify_comment_on_mssql because THIS is the suite that would notice a capability being added or dropped
-# without anyone updating its gate - which is exactly what happened when it was added.
+# 18 since 2026-09-09: + supports_default_constraints, which gates the column-DEFAULT read-back (17 was
+# + supports_extended_properties the day before, which gates COMMENT ON). The two are deliberately SEPARATE
+# flags although both are !IsWarehouse today: extended properties and DEFAULT constraints are different
+# catalog surfaces, and collapsing them would make the next engine that has one without the other silent.
+# They are pinned here rather than only in their own suites because THIS is the suite that notices a
+# capability appearing or disappearing without its gate being updated - every other reader of
+# fabricator_server_info filters by NAME, so the COUNT is the only thing that can see it.
 query I
 SELECT count(*) FROM fabricator_server_info('db');
 ----
-17
+18
 
 # Detected raw values for the test SQL Server 2025 (box, Developer edition).
 query I

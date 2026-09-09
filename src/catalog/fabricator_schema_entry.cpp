@@ -283,6 +283,43 @@ static string AtEntryKey(const string &table_name, const string &unit, const str
 	return table_name + "\x1f" + unit + "\x1f" + value;
 }
 
+// Carries a provider's column DEFAULT onto the catalog entry — LITERALS ONLY, and everything about this
+// function is that restriction.
+//
+// ⚠⚠ A DEFAULT ON A ColumnDefinition IS NOT INERT METADATA: DuckDB's INSERT BINDER CONSUMES IT.
+// bind_insert.cpp's ExpandDefaultExpression substitutes `column.DefaultValue().Copy()` for a column the
+// statement OMITS, so the moment we report one, an INSERT stops sending nothing (leaving the provider to
+// apply its own default) and starts sending DuckDB's copy of the provider's expression. For a literal the
+// two are the same value. For `getdate()` it is the CLIENT's clock instead of the server's — a silently
+// different row — and for a function DuckDB does not have it is a bind error on a statement that works
+// today. There is no "report it but do not let the binder use it": display (duckdb_columns,
+// pragma_table_info, the CREATE-SQL renderer) and semantics (bind_insert, bind_create_table, the Appender)
+// read the SAME field.
+//
+// ⇒ accept ONLY a single CONSTANT expression. That is not a rule of ours: it is the line DuckDB itself
+// draws — transform_alter_table.cpp splits ADD COLUMN … DEFAULT on ExpressionClass::CONSTANT, materialising
+// anything else through an UPDATE rather than trusting it to be re-evaluated.
+//
+// ⚠ Withholding is SILENT and that is deliberate. An unreported default is a missing row in
+// information_schema; a wrongly-substituted one is a wrong row in the table. Failing materialization over a
+// default we cannot parse would be worse than either — it would make the TABLE unreadable — so a parse
+// error is caught and dropped, exactly as an unmatched column comment is.
+static void ApplyColumnDefault(ColumnDefinition &column, const string &text) {
+	if (text.empty()) {
+		return;
+	}
+	try {
+		auto expressions = Parser::ParseExpressionList(text);
+		if (expressions.size() != 1 || expressions[0]->GetExpressionClass() != ExpressionClass::CONSTANT) {
+			return; // a function, a cast, an operator — anything DuckDB would re-evaluate on our behalf
+		}
+		column.SetDefaultValue(std::move(expressions[0]));
+	} catch (std::exception &) {
+		// Not parseable as DuckDB SQL at all (a T-SQL CONVERT, a bracketed identifier, a sequence
+		// reference). Nothing correct to report, and nothing here may throw.
+	}
+}
+
 optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateEntry(ClientContext &context, const string &table_name,
                                                                  optional_ptr<BoundAtClause> at) {
 	lock_guard<mutex> lock(entry_lock_);
@@ -376,6 +413,15 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateEntry(ClientContext
 		for (idx_t i = 0; i < names.size(); i++) {
 			if (StringUtil::CIEquals(names[i], pair.first)) {
 				info.columns.GetColumnMutable(LogicalIndex(i)).SetComment(Value(pair.second));
+				break;
+			}
+		}
+	}
+	// Column DEFAULT read-back — same matching rule, but a MUCH narrower filter, and the filter is the point.
+	for (auto &pair : identity.column_defaults) {
+		for (idx_t i = 0; i < names.size(); i++) {
+			if (StringUtil::CIEquals(names[i], pair.first)) {
+				ApplyColumnDefault(info.columns.GetColumnMutable(LogicalIndex(i)), pair.second);
 				break;
 			}
 		}
@@ -4173,38 +4219,51 @@ void FabricatorSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &inf
 		// column with a default. That is what lets the SQL Server side emit ONE form unconditionally.
 		if (ac.new_column.HasDefaultValue()) {
 			CarryDefault(request, &ac.new_column.DefaultValue());
-			// ⚠⚠ A NULL-ARRIVING DEFAULT IS REFUSED, and that is the only way to avoid a silent wrong
-			// answer, because DuckDB HAS ALREADY LOST the value by this point.
+			// ⚠⚠ A NULL-ARRIVING DEFAULT IS REFUSED. The value really is absent from the AlterInfo we are
+			// handed — but NOT because DuckDB lost it, which is what this comment and the gate beside it used to
+			// claim. CORRECTED 2026-09-09 by reading transform_alter_table.cpp and then measuring.
 			//
-			// MEASURED 2026-09-08 by probing the expression we are handed: a BARE literal survives
-			// (10, 1.5, 1.50, 'x', and even '2024-01-01' written as a STRING), while ANY literal the parser
-			// wraps in a CAST arrives as a VALUE_CONSTANT holding NULL — `true`, `CAST(1 AS BOOLEAN)`,
-			// `DATE '2024-01-01'`, `TIMESTAMP '…'`, `'\x41'::BLOB`. DuckDB's OWN table is unaffected
-			// (ADD COLUMN e BOOLEAN DEFAULT true gives true there), so the loss is in the AlterInfo handed
-			// to a foreign catalog, not in the statement.
+			// ⚠⚠ THE REAL MECHANISM: `ADD COLUMN … DEFAULT <expr>` where <expr> is not an
+			// ExpressionClass::CONSTANT is DELIBERATELY REWRITTEN by the parser into THREE statements —
+			//   1. ADD COLUMN col <type> DEFAULT NULL   ← the only one that reaches this code
+			//   2. UPDATE t SET col = <expr>            ← materialises the value for the existing rows
+			//   3. ALTER col SET DEFAULT <expr>         ← reinstates the real default
+			// so that a WAL replay cannot re-evaluate `random()`/`current_timestamp` into a different answer.
+			// `true`, `DATE '…'`, `TIMESTAMP '…'` and `'A'::BLOB` all take that path because DuckDB parses
+			// each as a CAST rather than a constant — its OWN table renders those defaults as `CAST('t' AS
+			// BOOLEAN)` / `CAST('2024-01-01' AS "DATE")`, which is the same line drawn twice.
 			//
-			// ⚠ The two states are then INDISTINGUISHABLE: a dropped `DEFAULT true` and an honest
-			// `DEFAULT NULL` are the same NULL constant. Accepting it emitted `DEFAULT (NULL)` for
-			// `DEFAULT true` — exactly the silent defect this change exists to fix, reintroduced one layer in.
+			// ⇒ what reaches us is statement 1 of 3, legitimately carrying DEFAULT NULL. Two measurements pin it:
+			// `ADD COLUMN IF NOT EXISTS c BOOLEAN DEFAULT true` skips the rewrite entirely (missing_ok takes the
+			// old path) and lands ((1)) on the server, and running the three statements BY HAND against a keyed
+			// table reproduces the correct end state — ((1)) plus the backfilled row.
 			//
-			// ⚠ ONE RULE RATHER THAN A TYPE LIST, deliberately: a list of "types whose literals get cast"
-			// would be enumerated from measurements and could MISS one (UUID, ENUM, a nested type), and a
-			// missed type is a silent wrong answer again. Refusing every NULL arrival cannot be incomplete.
+			// ⚠ SO WHY STILL REFUSE? Because at statement 1 an honest `DEFAULT NULL` and the rewrite's placeholder
+			// are the SAME NULL constant, and accepting it hands the caller a sequence that completes only
+			// sometimes: statement 2 is an UPDATE, and on a table with no PK/unique/identity our rowid requirement
+			// REFUSES it — measured — leaving the column added, unbackfilled and defaultless behind a statement
+			// that failed with an error about UPDATE. Refusing at statement 1 is a clean failure with no partial
+			// state, and every workaround the message names does work.
 			//
-			// ⚠ The cost is only the NO-OP spelling. `DEFAULT NULL` on an added NULLABLE column asks for what
-			// the column already does, and DuckDB refuses `ADD COLUMN … NOT NULL DEFAULT` outright, so
-			// nothing expressible here needs it. SET DEFAULT carries every type correctly (measured: a
-			// boolean lands as ((1)), a date as (N'2024-01-01')), which is what the message points at.
+			// ⚠ ONE RULE RATHER THAN A TYPE LIST, deliberately: enumerating "types whose literals get cast" could
+			// MISS one (UUID, ENUM, a nested type), and a missed type is a silent wrong answer.
+			//
+			// ⚠ The cost is only the NO-OP spelling. `DEFAULT NULL` on an added NULLABLE column asks for what the
+			// column already does, and DuckDB refuses `ADD COLUMN … NOT NULL DEFAULT` outright, so nothing
+			// expressible here needs it. SET DEFAULT carries every type correctly (measured: a boolean lands as
+			// ((1)), a date as (N'2024-01-01')) — it is statement 3 of that very rewrite.
 			if (request.default_is_null) {
 				throw NotImplementedException(
-				    "fabricator: ALTER TABLE ADD COLUMN \"%s\" with a DEFAULT that arrives NULL is refused: a "
-				    "DEFAULT NULL and a literal DuckDB could not carry (a boolean, a DATE/TIMESTAMP literal, "
-				    "a BLOB — anything it wraps in a CAST) are indistinguishable here, so honouring it could "
-				    "silently store the wrong default. Either omit the DEFAULT (a nullable column already "
-				    "defaults to NULL), write the literal as a STRING (DEFAULT '2024-01-01'), or add the "
-				    "column and then ALTER TABLE … ALTER COLUMN \"%s\" SET DEFAULT …, which carries every "
-				    "type correctly.",
-				    ac.new_column.Name(), ac.new_column.Name());
+				    "fabricator: ALTER TABLE ADD COLUMN \"%s\" with a DEFAULT that arrives NULL is refused. A "
+				    "default DuckDB does not parse as a plain constant (a boolean, a DATE/TIMESTAMP literal, a "
+				    "BLOB — anything it wraps in a CAST) is rewritten into three statements: add the column with "
+				    "DEFAULT NULL, UPDATE the existing rows, then SET DEFAULT. Only the first reaches this catalog, "
+				    "and it is indistinguishable from an honest DEFAULT NULL — while the UPDATE needs a primary "
+				    "key or unique index this table may not have, which would leave the column added and empty. Use "
+				    "ADD COLUMN IF NOT EXISTS \"%s\" … DEFAULT …, which skips the rewrite and carries the "
+				    "value; or write the literal as a STRING (DEFAULT '2024-01-01'); or add the column and then "
+				    "ALTER TABLE … ALTER COLUMN \"%s\" SET DEFAULT ….",
+				    ac.new_column.Name(), ac.new_column.Name(), ac.new_column.Name());
 			}
 		}
 		break;

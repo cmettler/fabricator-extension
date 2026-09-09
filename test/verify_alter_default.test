@@ -55,6 +55,11 @@ ALTER TABLE q.dbo.ad_a ADD COLUMN d DOUBLE DEFAULT 1.5;
 # row below — so the two failures name different causes instead of both landing on whichever came first.
 # It is also the honest ordering: an insert honouring a declared default is wrong on ANY reading of the
 # semantics, where backfill is the contested half.
+#
+# ⚠ SINCE THE §5 READ-BACK, `a`'s VALUE HERE NO LONGER COMES FROM SQL SERVER — the default is reported to
+# DuckDB, so its INSERT binder substitutes its own copy of the literal for the omitted column. Same value,
+# so the assertion is unchanged and still catches a dropped default; but the row no longer proves the
+# SERVER applied anything. The row that still does is in §5, on a column whose default is WITHHELD.
 statement ok
 INSERT INTO q.dbo.ad_a (i) VALUES (2);
 
@@ -184,20 +189,85 @@ WHERE name = 'b';
 ----
 <none>
 
-# ═══ §5  ⚠ CHARACTERIZATION: a column default is NOT reported in DuckDB's metadata ════════════════════
-# PRE-EXISTING and unrelated to the fix above — the catalog never reads column defaults back from the
-# provider, so `information_schema.columns.column_default` is NULL even for a column that demonstrably has
-# one on the server (§2 shows `((10))` for the same column). It is equally true of a CREATE-time default.
+# ═══ §5  THE READ-BACK: a LITERAL default is reported, a non-literal one is WITHHELD ═════════════════
+# ⚠⚠ THIS REPLACES A CHARACTERIZATION THAT ASSERTED THE OPPOSITE. Until the read-back was built this
+# section pinned `column_default IS NOT NULL` at ZERO for a table whose columns demonstrably carry ((10))
+# and (N'x') on the server (§2 reads them straight out of sys.default_constraints), precisely so that
+# implementing it would arrive as a FAILED ASSERTION rather than as a surprise. It did. The rows are
+# REPLACED rather than deleted, because falsifying them IS the change announcing itself.
 #
-# ⚠ Pinned rather than fixed because it is a different mechanism (the table-schema crossing would have to
-# carry defaults as Arrow field metadata) and a different decision. No mutant of ours kills this row; its
-# value is that the day it is fixed, this assertion fails and names what changed.
+# ⚠⚠ LITERALS ONLY, AND THAT IS A SEMANTIC DECISION RATHER THAN A SHORTFALL. A default on a DuckDB column
+# is not display metadata — bind_insert.cpp SUBSTITUTES it for a column the statement OMITS. For a literal
+# that is the same value the server would have applied anyway; for `getdate()` it would be the CLIENT's
+# clock instead of the server's, i.e. a silently different row, and for a function DuckDB does not have it
+# would be a bind error on a statement that works today. So the host keeps only what DuckDB parses as a
+# single CONSTANT expression and drops everything else. That is the line DuckDB draws for ITSELF:
+# transform_alter_table.cpp splits ADD COLUMN … DEFAULT on exactly ExpressionClass::CONSTANT.
 
-query I
-SELECT count(*) FROM information_schema.columns
-WHERE table_catalog = 'q' AND table_name = 'ad_a' AND column_default IS NOT NULL;
+query TT
+SELECT column_name, coalesce(column_default, '(none)') FROM information_schema.columns
+WHERE table_catalog = 'q' AND table_name = 'ad_a' AND column_name IN ('i', 'a', 'b', 'c', 'd', 'e', 'f')
+ORDER BY column_name;
 ----
-0
+a	10
+b	'x'
+c	'2024-01-01'
+d	1.5
+e	7
+f	''
+i	(none)
+
+# ⚠ `f` is the empty-vs-absent pair in one query: DEFAULT '' is a VALUE a caller can set and reads back as
+# '', while `i` has no default constraint at all and reads back as absent. A build that conflated them
+# would answer (none) for both.
+
+# ⚠⚠ THE WITHHELD HALF, and it needs a NON-LITERAL default that only the server can produce — DuckDB
+# refuses ADD COLUMN … DEFAULT getdate() long before we see it, so the constraint is created server-side.
+statement ok
+SELECT fabricator_exec('q', 'ALTER TABLE dbo.ad_a ADD nl datetime2 CONSTRAINT df_ad_nl DEFAULT getdate()');
+
+# ⚠ A LITERAL one added the SAME way, and this is the row that gates the CACHE rather than the rule. The
+# provider reads every default in ONE database-wide query and caches it per catalog, so a default created
+# OUT OF BAND is invisible until something drops that cache — which is what fabricator_refresh_cache is for
+# and what it did NOT do until GetTables was made to invalidate. Without the pair, `nl` reading as withheld
+# proves nothing: a cache that has never heard of either column answers withheld for both.
+statement ok
+SELECT fabricator_exec('q', 'ALTER TABLE dbo.ad_a ADD ob int CONSTRAINT df_ad_ob DEFAULT ((42))');
+
+statement ok
+SELECT fabricator_refresh_cache('q');
+
+query T
+SELECT coalesce(column_default, '(withheld)') FROM information_schema.columns
+WHERE table_catalog = 'q' AND table_name = 'ad_a' AND column_name = 'ob';
+----
+42
+
+# THE POSITIVE CONTROL: the server really does carry that default, so the (withheld) below is a decision of
+# ours and not an empty read. Without this row the assertion would pass equally on a build where the whole
+# defaults query had stopped returning anything.
+query T
+SELECT definition FROM fabricator_query('q', 'SELECT c.name AS name, dc.definition AS definition FROM sys.columns c JOIN sys.default_constraints dc ON dc.parent_object_id = c.object_id AND dc.parent_column_id = c.column_id WHERE c.object_id = OBJECT_ID(''dbo.ad_a'')')
+WHERE name = 'nl';
+----
+(getdate())
+
+query T
+SELECT coalesce(column_default, '(withheld)') FROM information_schema.columns
+WHERE table_catalog = 'q' AND table_name = 'ad_a' AND column_name = 'nl';
+----
+(withheld)
+
+# ⚠⚠ AND WITHHOLDING KEEPS THE BEHAVIOUR THAT MATTERS: an INSERT omitting `nl` still gets the SERVER's
+# clock, because nothing was reported for DuckDB to substitute. This is the row the whole literals-only
+# rule exists to protect — report getdate() and this value starts coming from the client instead.
+statement ok
+INSERT INTO q.dbo.ad_a (i) VALUES (99);
+
+query IT
+SELECT a, CASE WHEN nl IS NOT NULL THEN 'server-applied' ELSE 'null' END FROM q.dbo.ad_a WHERE i = 99;
+----
+10	server-applied
 
 # ═══ §6  Delta REFUSES a default rather than dropping it ══════════════════════════════════════════════
 # ⚠ Delta records a column default through the `allowColumnDefaults` writer feature and the
@@ -229,6 +299,15 @@ query II
 SELECT i, l FROM lake.main.ad;
 ----
 1	NULL
+
+# ⚠ AND DELTA REPORTS NO DEFAULT EITHER, which is the read side of the same decision rather than a separate
+# one: a provider that cannot RECORD a default has no business reporting one. ColumnDefaults() is left at
+# its null-returning default there, so the doc carries no column_defaults key at all.
+query I
+SELECT count(*) FROM information_schema.columns
+WHERE table_catalog = 'lake' AND table_name = 'ad' AND column_default IS NOT NULL;
+----
+0
 
 # ═══ §7  Teardown ════════════════════════════════════════════════════════════════════════════════════
 

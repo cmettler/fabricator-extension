@@ -71,6 +71,7 @@ See [SQL Server external tables on S3](#sql-server-external-tables-on-s3).
 | | PRIMARY KEY / UNIQUE / NOT NULL / literal DEFAULT on CREATE | ✅ |
 | | `ALTER TABLE … ADD COLUMN … DEFAULT <literal>` | ✅ SQL Server (backfills, like DuckDB) — see the note below |
 | | `COMMENT ON TABLE` / `COMMENT ON COLUMN` (+ read-back in `duckdb_tables()` / `duckdb_columns()`) | ✅ SQL Server + Delta — see the note below |
+| | Column DEFAULT read-back in `information_schema.columns.column_default` | ✅ SQL Server, **literals only** — see the note below |
 | | `CREATE TABLE … WITH (…)` options (per-table Delta properties / write tuning / feature flags) | ✅ |
 | | CHECK constraints, non-literal DEFAULTs | ❌ (use `fabricator_exec`) |
 | **S3 external tables** | `INSERT` into a detected SQL Server S3 **Delta/Parquet** external table → routed to storage | ✅ |
@@ -801,10 +802,26 @@ SELECT column_name, comment FROM duckdb_columns() WHERE table_name = 't';
 >
 > ⚠ `COMMENT ON VIEW` is refused for a provider-declared view, and `COMMENT ON` is not supported at all on
 > the DAX provider (read-only) — in both cases there is nowhere on the far side to store it.
+
+**Column defaults are reported too**, in `information_schema.columns.column_default` (and
+`duckdb_columns()`), for a SQL Server catalog:
+
+```sql
+ALTER TABLE mssql.staging.t ALTER COLUMN qty SET DEFAULT 10;
+SELECT column_name, column_default FROM information_schema.columns
+ WHERE table_catalog = 'mssql' AND table_name = 't';
+-- qty | 10
+```
+
+> ⚠ **LITERALS ONLY.** A default that is an expression — `getdate()`, `newid()`, `CONVERT(...)` — reads back
+> as NULL, i.e. it looks like a column with no default. That is deliberate: DuckDB's INSERT binder
+> SUBSTITUTES a reported default for a column your statement omits, so reporting `getdate()` would stamp the
+> rows with **your client's clock instead of the server's**. Withholding costs nothing — the server still
+> applies its own default, exactly as before. Delta reports no defaults at all, because it cannot store one.
 >
-> ⚠ A column default is **not reported** in `information_schema.columns.column_default` — the catalog does
-> not read defaults back from the provider. The default is really there; DuckDB's metadata just does not
-> show it.
+> ⚠ A default changed OUTSIDE this session (or a table created outside it) is picked up on re-ATTACH or
+> after `fabricator_refresh_cache('<catalog>')`, not immediately — the whole database's defaults and
+> comments are read once per catalog and cached.
 
 For SQL Server-specific features (IDENTITY, CHECK, indexes, FKs, non-literal DEFAULTs), use
 `fabricator_exec`.

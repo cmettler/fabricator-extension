@@ -178,6 +178,16 @@ struct FabricatorTableDetails {
 	//! CASE-INSENSITIVELY; a name that matches no column is IGNORED (a provider may report a comment on a
 	//! column an object filter or a pending ALTER has removed from this entry's schema).
 	vector<std::pair<string, string>> column_comments;
+	//! Per-column DEFAULT expressions as the provider's own text, already normalised out of its dialect
+	//! (SQL Server strips its wrapping parens and the N'' prefix). Resolved like the comments above.
+	//!
+	//! ⚠⚠ THIS IS NOT INERT METADATA — DuckDB's INSERT BINDER CONSUMES IT. `bind_insert.cpp`'s
+	//! `ExpandDefaultExpression` substitutes `column.DefaultValue().Copy()` for an omitted column, so a
+	//! reported default stops the PROVIDER applying its own and starts DuckDB sending a copy of the
+	//! expression. Equivalent for a literal; a DIFFERENT VALUE for `getdate()` (the client's clock, not the
+	//! server's) and a bind error for a function DuckDB does not have. Hence the host accepts ONLY a single
+	//! CONSTANT expression and withholds everything else — see ApplyColumnDefault.
+	vector<std::pair<string, string>> column_defaults;
 };
 
 //! Reads the table's row identity + virtual columns from the session's `table_info` stream. Errors bubble
