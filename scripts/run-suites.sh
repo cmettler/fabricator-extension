@@ -662,7 +662,7 @@ case "$TIER" in
         # 55 since 2026-09-08: + verify_alter_default (ADD COLUMN ... DEFAULT). SQL Server's ALTER TABLE
         # had essentially NO gate before it -- the only catalog-level ADD COLUMN in the tree was a setup
         # line in a locking test -- which is exactly how a silently dropped DEFAULT survived.
-        : "${MIN_SUITES:=56}"
+        : "${MIN_SUITES:=57}"
         # 1424 since 2026-08-01: verify_exec_invalidate_cache 10 -> 21, for the OUT-OF-BAND DROP path Ã¢ÂÂ the
         # catalog's self-heal, documented in CLAUDE.md and until now covered by NOTHING. The service tier ran
         # 44/44 green while that path was broken, which is why the section exists. It must run with
@@ -1012,7 +1012,10 @@ case "$TIER" in
         # 3316 since 2026-09-09: verify_alter_default 59 -> 82, the column_default read-back (literals
         #   only) replacing ITS write-only characterization, plus the out-of-band pair that gates the
         #   provider metadata cache being dropped on refresh. 3293 + 23 exactly.
-        : "${MIN_ASSERTIONS:=3316}"
+        # 3379 since 2026-09-09: a NEW suite verify_alter_mssql (63) — rename table/column, drop column,
+        #   change type, SET/DROP NOT NULL. Everything SQL Server's ALTER emits except DEFAULT and
+        #   COMMENT ON was ungated. 3316 + 63 exactly; MIN_SUITES 56 -> 57 with it.
+        : "${MIN_ASSERTIONS:=3379}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

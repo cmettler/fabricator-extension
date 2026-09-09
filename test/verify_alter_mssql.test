@@ -1,0 +1,267 @@
+# name: test/verify_alter_mssql.test
+# description: The REST of SQL Server's ALTER TABLE — rename column, drop column, change type, SET/DROP
+#              NOT NULL, rename table. verify_alter_default owns DEFAULT and verify_comment_on_mssql owns
+#              COMMENT ON; every other kind this provider emits was UNGATED until this suite, which is how
+#              a silently-dropped DEFAULT survived long enough to be user-reported. Needs MSSQL_TESTDB_DSN.
+#
+#              ⚠⚠ ASSERTED ON THE SERVER, not only through DuckDB's view — the lesson verify_alter_default
+#              paid for. `sys.columns` / `sys.objects` via fabricator_query is what distinguishes "the
+#              catalog thinks it happened" from "it happened": a rename that only re-keyed our cache, or a
+#              drop that only evicted an entry, would pass a DuckDB-only assertion.
+#
+#              ⚠⚠ THE TWO LOAD-BEARING SECTIONS ARE §3 AND §4, AND NEITHER ASSERTS THAT THE DDL WORKED.
+#              They assert what the DDL must NOT have changed. SQL Server's ALTER COLUMN defaults to
+#              NULLable when the statement is silent, and it must restate the type — so the emitter
+#              reconstructs BOTH from the catalog. Lose either and you get a silent data-model change: a
+#              NOT NULL quietly dropped (every existing row still satisfies it, nothing fails), or a column
+#              retyped as a side effect of a nullability toggle. A "did the statement succeed" test cannot
+#              see either one.
+# group: [fabricator]
+
+require fabricator
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS q (TYPE fabricator);
+
+# ═══ §0  Setup ════════════════════════════════════════════════════════════════════════════════════════
+# `k` is NOT NULL because §3 needs a constraint that can be silently lost. The SIZED columns are created
+# SERVER-SIDE on purpose and §4 says why: a DuckDB VARCHAR carries no length, so a column created through
+# the catalog arrives as nvarchar(MAX) and the sized-varchar half of §4 is not expressible at all — the
+# section would pass vacuously. `dec1` is the one that matters most there: it is the kind whose type
+# parameters can be lost SILENTLY.
+
+statement ok
+CREATE OR REPLACE TABLE q.dbo.am_t (k INTEGER NOT NULL, s VARCHAR, n INTEGER);
+
+statement ok
+SELECT fabricator_exec('q', 'ALTER TABLE dbo.am_t ADD sized varchar(50) NULL, dec1 decimal(9,2) NULL');
+
+statement ok
+SELECT fabricator_refresh_cache('q');
+
+statement ok
+INSERT INTO q.dbo.am_t VALUES (1, 'x', 7, '0123456789012345678901234567890123456789', 123.45);
+
+# The server's own picture, so every section below can assert against it BY NAME. An assertion on a raw
+# `column_id` would keep passing after an unrelated schema change, which is exactly the kind of vacuous
+# pass this suite exists to avoid.
+statement ok
+CREATE OR REPLACE VIEW cols AS
+  SELECT * FROM fabricator_query('q',
+    'SELECT c.name AS col, t.name AS typ, c.max_length AS len, c.precision AS prec, c.scale AS scl,
+            c.is_nullable AS nul
+       FROM sys.columns c JOIN sys.types t ON t.user_type_id = c.user_type_id
+      WHERE c.object_id = OBJECT_ID(N''dbo.am_t'')');
+
+query TTT
+SELECT col, typ, nul FROM cols WHERE col IN ('k', 'sized', 'dec1') ORDER BY col;
+----
+dec1	decimal	true
+k	int	false
+sized	varchar	true
+
+# ═══ §1  RENAME COLUMN ════════════════════════════════════════════════════════════════════════════════
+# ⚠ Emitted as `EXEC sp_rename …, 'COLUMN'`, NOT as an ALTER — so this pins a different code path from
+# every other section. @objname may be schema-qualified; @newname must NOT be, and passing a qualified new
+# name does not fail, it creates an object whose NAME contains a dot.
+
+statement ok
+ALTER TABLE q.dbo.am_t RENAME COLUMN n TO n_renamed;
+
+# BOTH names asserted: the new one present AND the old one gone. Asserting only the new one would pass on a
+# server that had somehow ended up with both.
+query T
+SELECT col FROM cols WHERE col IN ('n', 'n_renamed');
+----
+n_renamed
+
+# The host's own view must agree — a rename RE-KEYS the cached entry (both names evicted, the type carried
+# across) where every other kind refreshes in place, so this is the half that could go stale.
+query T
+SELECT column_name FROM information_schema.columns
+WHERE table_catalog = 'q' AND table_name = 'am_t' AND column_name IN ('n', 'n_renamed');
+----
+n_renamed
+
+# ═══ §2  DROP COLUMN, and the IF EXISTS guard as a NO-OP ══════════════════════════════════════════════
+
+statement ok
+ALTER TABLE q.dbo.am_t DROP COLUMN n_renamed;
+
+query I
+SELECT count(*) FROM cols WHERE col = 'n_renamed';
+----
+0
+
+# ⚠ The guard is emitted as `DROP COLUMN IF EXISTS`, so dropping a column that is already gone must
+# SUCCEED rather than error. Run it against the column §2 just removed — the honest shape of the no-op.
+statement ok
+ALTER TABLE q.dbo.am_t DROP COLUMN IF EXISTS n_renamed;
+
+query I
+SELECT count(*) FROM cols WHERE col = 'n_renamed';
+----
+0
+
+# ═══ §3  ⚠⚠ CHANGE TYPE PRESERVES NULLABILITY ════════════════════════════════════════════════════════
+# THE MUTANT: emit the ALTER COLUMN without restating nullability. SQL Server then defaults the column to
+# NULLable, so `k` silently stops being NOT NULL — and nothing fails, because every existing row still has
+# a value. The constraint is simply gone, and the next NULL insert succeeds where it should not.
+#
+# ⚠ `k` is NOT NULL, which is what makes this discriminating: on a nullable column the mutant and the fix
+# produce the identical result.
+
+statement ok
+ALTER TABLE q.dbo.am_t ALTER COLUMN k TYPE BIGINT;
+
+query TTT
+SELECT col, typ, nul FROM cols WHERE col = 'k';
+----
+k	bigint	false
+
+# The BEHAVIOUR behind that flag, so the section does not rest on metadata alone: a NULL must still be
+# refused. Without the restatement this insert SUCCEEDS.
+#
+# ⚠ The message is SqlBulkCopy's own client-side check rather than a server error — and it is still
+# evidence, because SqlBulkCopy reads the DESTINATION column's nullability from the server to make it. The
+# text is pinned so the row cannot pass on some unrelated failure, which an empty expectation would allow.
+statement error
+INSERT INTO q.dbo.am_t (k, s) VALUES (NULL, 'nope');
+----
+does not allow DBNull.Value
+
+# ═══ §4  ⚠⚠ SET / DROP NOT NULL PRESERVES THE TYPE ═══════════════════════════════════════════════════
+# The mirror image of §3, and the sharper of the two. SQL Server's ALTER COLUMN must RESTATE the type, so
+# the emitter reconstructs it from the catalog (`ColumnTypeInfo(...).fullType`, not `.dataType`). Drop the
+# PARAMETERS and a statement that says nothing about types silently retypes the column.
+#
+# ⚠⚠ THE DECIMAL COMES FIRST, AND THE ORDER IS THE POINT — the two column kinds fail DIFFERENTLY, measured:
+#   • decimal(9,2) -> `decimal` reconstructs as decimal(18,0): the ALTER SUCCEEDS and 123.45 becomes 123.
+#     SILENT DATA LOSS, no error anywhere.
+#   • varchar(50) -> `varchar` reconstructs as varchar(1): SQL Server REFUSES the statement outright
+#     ("String or binary data would be truncated"), because the existing 40-char value does not fit.
+# So the varchar is protected by the server and the decimal is not. With the varchar first, its loud
+# failure MASKS the decimal case and the mutant dies on a `statement ok` instead of on the corruption it
+# causes. Decimal first, and the mutant dies on the precision row with 18/0 where 9/2 is expected.
+#
+# ⚠ Both columns are created SERVER-SIDE in §0 for a reason: a DuckDB VARCHAR carries no length and a
+# DuckDB DECIMAL(9,2) does, but a catalog-created VARCHAR arrives as nvarchar(MAX) — so a table built
+# entirely through the catalog cannot express the sized-varchar half at all.
+
+statement ok
+ALTER TABLE q.dbo.am_t ALTER COLUMN dec1 SET NOT NULL;
+
+query TTII
+SELECT col, typ, prec, scl FROM cols WHERE col = 'dec1';
+----
+dec1	decimal	9	2
+
+# ⚠ AND THE VALUE, which is what makes the metadata row mean something: decimal(18,0) rounds 123.45 to 123,
+# and that is visible here even to someone who later "corrects" the precision assertion.
+query T
+SELECT dec1::VARCHAR FROM q.dbo.am_t WHERE k = 1;
+----
+123.45
+
+statement ok
+ALTER TABLE q.dbo.am_t ALTER COLUMN sized SET NOT NULL;
+
+query TTI
+SELECT col, typ, len FROM cols WHERE col = 'sized';
+----
+sized	varchar	50
+
+query I
+SELECT length(sized) FROM q.dbo.am_t WHERE k = 1;
+----
+40
+
+query TT
+SELECT col, nul FROM cols WHERE col IN ('sized', 'dec1') ORDER BY col;
+----
+dec1	false
+sized	false
+
+# DROP NOT NULL is the same emitter with the flag flipped, so it owes the same preservation assertion.
+statement ok
+ALTER TABLE q.dbo.am_t ALTER COLUMN sized DROP NOT NULL;
+
+query TTIT
+SELECT col, typ, len, nul FROM cols WHERE col = 'sized';
+----
+sized	varchar	50	true
+
+# ═══ §5  A ROLLED-BACK ALTER LEAVES NO STALE SCHEMA ═══════════════════════════════════════════════════
+# `RollbackTransaction` invalidates the catalog cache, which matters because the ALTER paths re-fetch
+# columns EAGERLY on the transaction's own connection (the fix for the dbt-incremental concurrent
+# schema-evolution deadlock) — so a rolled-back ALTER has already put the UNCOMMITTED schema in the cache.
+# Recorded but unasserted before this suite.
+
+statement ok
+BEGIN;
+
+statement ok
+ALTER TABLE q.dbo.am_t RENAME COLUMN sized TO sized_x;
+
+statement ok
+ROLLBACK;
+
+query T
+SELECT col FROM cols WHERE col IN ('sized', 'sized_x');
+----
+sized
+
+# The host's view must not be stale either — this is the half the cache invalidation owns.
+query T
+SELECT column_name FROM information_schema.columns
+WHERE table_catalog = 'q' AND table_name = 'am_t' AND column_name IN ('sized', 'sized_x');
+----
+sized
+
+# A rolled-back DROP is the destructive direction of the same property.
+statement ok
+BEGIN;
+
+statement ok
+ALTER TABLE q.dbo.am_t DROP COLUMN sized;
+
+statement ok
+ROLLBACK;
+
+query IT
+SELECT length(sized), dec1::VARCHAR FROM q.dbo.am_t WHERE k = 1;
+----
+40	123.45
+
+# ═══ §6  RENAME TABLE — last, because it invalidates the `cols` view above ════════════════════════════
+# ⚠ `EXEC sp_rename` again, with the same qualified/unqualified asymmetry.
+
+statement ok
+ALTER TABLE q.dbo.am_t RENAME TO am_t2;
+
+query T
+SELECT name FROM fabricator_query('q',
+  'SELECT name FROM sys.objects WHERE name IN (''am_t'', ''am_t2'') AND type = ''U''');
+----
+am_t2
+
+# The re-key, on the host side: the OLD name gone and the NEW one present in ONE query, so a build that
+# added the new entry without evicting the old would fail rather than half-pass.
+query T
+SELECT table_name FROM information_schema.tables
+WHERE table_catalog = 'q' AND table_name IN ('am_t', 'am_t2');
+----
+am_t2
+
+# And the data is still there under the new name — the rename must not have gone through a copy.
+query IT
+SELECT length(sized), dec1::VARCHAR FROM q.dbo.am_t2 WHERE k = 1;
+----
+40	123.45
+
+# ═══ §7  Teardown ═════════════════════════════════════════════════════════════════════════════════════
+
+statement ok
+DROP TABLE q.dbo.am_t2;
