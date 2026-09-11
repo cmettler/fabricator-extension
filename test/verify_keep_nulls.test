@@ -1,0 +1,228 @@
+# name: test/verify_keep_nulls.test
+# description: `mssql_keep_nulls` / the `keep_nulls` ATTACH option — whether a NULL we send is written as
+#              NULL, or replaced by the target column's DEFAULT constraint.
+#
+#              ⚠⚠ IT IS A SETTING RATHER THAN A FIX, AND THAT IS FORCED. DuckDB's binder collapses an
+#              explicit NULL and an explicit DEFAULT keyword into the SAME typed NULL before our sink sees
+#              the chunk (bind_insert.cpp's ExpandDefaultExpression), so nothing at this layer can tell them
+#              apart and no single policy is right for both. TRUE serves the explicit NULL; FALSE serves
+#              VALUES (..., DEFAULT) on a default we do not report to DuckDB. §1 and §4 are the same four
+#              spellings under the two values, which is the only honest way to show a trade rather than a fix.
+#
+#              ⚠ DEFAULT TRUE is a deliberate divergence from SqlBulkCopy's own default, in the conformant
+#              direction: plain T-SQL stores NULL when you write NULL. Before this setting existed, every
+#              INSERT/CTAS/COPY through this provider silently substituted the column's default instead.
+#              Needs MSSQL_TESTDB_DSN.
+# group: [fabricator]
+
+require fabricator
+
+require-env MSSQL_TESTDB_DSN
+
+# ⚠ Declared so ${FABRICATOR_DELTA_WRITE_DIR} INTERPOLATES in §2 — without the require-env, sqllogictest
+# leaves the literal in place and the COPY fails with a path that contains the variable name.
+require-env FABRICATOR_DELTA_WRITE_DIR
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS q (TYPE fabricator);
+
+# ═══ §0  Setup ════════════════════════════════════════════════════════════════════════════════════════
+# TWO defaulted columns, and the pair is load-bearing throughout: `lit` has a LITERAL default (so the
+# column_default read-back REPORTS it to DuckDB) and `expr` has an EXPRESSION default (so it is WITHHELD).
+# That is what makes the DEFAULT-keyword rows below discriminate — see §1.
+#
+# Created server-side because DuckDB's CREATE cannot express a non-literal default at all.
+
+statement ok
+CREATE OR REPLACE TABLE q.dbo.kn_t (k INTEGER);
+
+statement ok
+SELECT fabricator_exec('q', 'ALTER TABLE dbo.kn_t ADD lit int CONSTRAINT df_kn_l DEFAULT ((10)), expr datetime2 CONSTRAINT df_kn_e DEFAULT getdate()');
+
+statement ok
+SELECT fabricator_refresh_cache('q');
+
+# The setting is registered and UNSET, exactly like its sibling mssql_materialize — so the effective TRUE
+# comes from the resolver rather than from DuckDB's registry. Pinned as a pair so the two cannot drift, and
+# so nobody reads "(unset)" as "off".
+query TT
+SELECT name, coalesce(value, '(unset)') FROM duckdb_settings()
+WHERE name IN ('mssql_keep_nulls', 'mssql_materialize') ORDER BY name;
+----
+mssql_keep_nulls	(unset)
+mssql_materialize	(unset)
+
+# ═══ §1  THE DEFAULT (true) — all four spellings ══════════════════════════════════════════════════════
+# ⚠⚠ ROW k=2 IS THE ONE THIS SETTING EXISTS FOR: an explicit NULL must be stored as NULL. Before this,
+# it silently became 10 / a getdate() timestamp — the statement the caller wrote and the row that landed
+# disagreeing, with nothing failing. MUTANT 1 (never pass KeepNulls) dies on that row.
+#
+# ⚠ The other three rows are the CONTROLS that make it a trade rather than a blanket win:
+#   k=1 omits both      -> the server applies both defaults. UNAFFECTED by this flag (§6 proves why).
+#   k=3 DEFAULT on expr -> NULL, and that is the ONE cell TRUE costs. DuckDB turns the keyword into a typed
+#                          NULL, and `expr`'s default is withheld, so it is indistinguishable from k=2.
+#   k=4 DEFAULT on lit  -> 10, because `lit`'s default IS reported, so DuckDB substitutes the literal
+#                          itself. This is what the column_default read-back buys here.
+
+statement ok
+INSERT INTO q.dbo.kn_t (k) VALUES (1);
+
+statement ok
+INSERT INTO q.dbo.kn_t (k, lit, expr) VALUES (2, NULL, NULL);
+
+statement ok
+INSERT INTO q.dbo.kn_t (k, expr) VALUES (3, DEFAULT);
+
+statement ok
+INSERT INTO q.dbo.kn_t (k, lit) VALUES (4, DEFAULT);
+
+query ITT
+SELECT k, coalesce(lit::VARCHAR, 'NULL'),
+       CASE WHEN expr IS NULL THEN 'NULL' ELSE 'server-ts' END
+FROM q.dbo.kn_t ORDER BY k;
+----
+1	10	server-ts
+2	NULL	NULL
+3	10	NULL
+4	10	server-ts
+
+# ═══ §2  COPY FROM — the second, independent instance ═════════════════════════════════════════════════
+# ⚠ Worth its own section because it is the likelier way to meet this: a CSV with BLANK fields is an
+# ordinary export, and before the setting every blank silently became the column's default. The same bulk
+# path, reached by a different statement kind.
+
+statement ok
+COPY (SELECT 5 AS k, NULL::INTEGER AS lit, NULL::TIMESTAMP AS expr)
+  TO '${FABRICATOR_DELTA_WRITE_DIR}/kn.csv' (FORMAT csv, HEADER);
+
+statement ok
+COPY q.dbo.kn_t FROM '${FABRICATOR_DELTA_WRITE_DIR}/kn.csv' (FORMAT csv, HEADER);
+
+query ITT
+SELECT k, coalesce(lit::VARCHAR, 'NULL'),
+       CASE WHEN expr IS NULL THEN 'NULL' ELSE 'server-ts' END
+FROM q.dbo.kn_t WHERE k = 5;
+----
+5	NULL	NULL
+
+# ═══ §3  THE `keep_nulls` ATTACH OPTION ══════════════════════════════════════════════════════════════
+# A SECOND catalog over the SAME database, differing only in the option — which is the whole assertion, and
+# the reason no SET appears until §4: a SET outranks the option, so testing the option under one would be
+# vacuous. MUTANT 3 (ignore the ATTACH option) dies here.
+#
+# ⚠ Attached AFTER the table exists, deliberately: two attaches of one database keep SEPARATE catalog
+# caches, so a catalog attached earlier would not see a table created through the other one.
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS qold (TYPE fabricator, keep_nulls false);
+
+statement ok
+INSERT INTO qold.dbo.kn_t (k, lit, expr) VALUES (6, NULL, NULL);
+
+query ITT
+SELECT k, coalesce(lit::VARCHAR, 'NULL'),
+       CASE WHEN expr IS NULL THEN 'NULL' ELSE 'server-ts' END
+FROM q.dbo.kn_t WHERE k = 6;
+----
+6	10	server-ts
+
+# THE CONTROL, in the same breath: the DEFAULT catalog still keeps NULLs. Without it, row 6 would pass
+# equally on a build where KeepNulls had stopped being applied anywhere at all.
+statement ok
+INSERT INTO q.dbo.kn_t (k, lit, expr) VALUES (7, NULL, NULL);
+
+query ITT
+SELECT k, coalesce(lit::VARCHAR, 'NULL'),
+       CASE WHEN expr IS NULL THEN 'NULL' ELSE 'server-ts' END
+FROM q.dbo.kn_t WHERE k = 7;
+----
+7	NULL	NULL
+
+# ═══ §4  `SET mssql_keep_nulls=false` — the opt-out, and the trade in the other direction ═════════════
+# MUTANT 2 (resolver ignores the SET) dies on row 8.
+
+statement ok
+SET mssql_keep_nulls=false;
+
+statement ok
+INSERT INTO q.dbo.kn_t (k, lit, expr) VALUES (8, NULL, NULL);
+
+statement ok
+INSERT INTO q.dbo.kn_t (k, expr) VALUES (9, DEFAULT);
+
+# ⚠⚠ ROW 9 IS WHAT FALSE BUYS, and it is why this is a setting: `VALUES (..., DEFAULT)` on a column whose
+# default is an EXPRESSION applies the server's value here, where §1's row 3 got NULL. Neither value of the
+# flag is right for both spellings.
+query ITT
+SELECT k, coalesce(lit::VARCHAR, 'NULL'),
+       CASE WHEN expr IS NULL THEN 'NULL' ELSE 'server-ts' END
+FROM q.dbo.kn_t WHERE k IN (8, 9) ORDER BY k;
+----
+8	10	server-ts
+9	10	server-ts
+
+# ═══ §5  PRECEDENCE: the SET outranks the ATTACH option, in BOTH directions ══════════════════════════
+# The session is still false. A catalog attached with `keep_nulls true` must therefore still REPLACE — a
+# resolver that consulted the option first would keep the NULL.
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS qtrue (TYPE fabricator, keep_nulls true);
+
+statement ok
+INSERT INTO qtrue.dbo.kn_t (k, lit, expr) VALUES (10, NULL, NULL);
+
+query ITT
+SELECT k, coalesce(lit::VARCHAR, 'NULL'),
+       CASE WHEN expr IS NULL THEN 'NULL' ELSE 'server-ts' END
+FROM q.dbo.kn_t WHERE k = 10;
+----
+10	10	server-ts
+
+# And the other direction: with the session set TRUE, the `keep_nulls false` catalog keeps NULLs.
+statement ok
+SET mssql_keep_nulls=true;
+
+statement ok
+INSERT INTO qold.dbo.kn_t (k, lit, expr) VALUES (11, NULL, NULL);
+
+query ITT
+SELECT k, coalesce(lit::VARCHAR, 'NULL'),
+       CASE WHEN expr IS NULL THEN 'NULL' ELSE 'server-ts' END
+FROM q.dbo.kn_t WHERE k = 11;
+----
+11	NULL	NULL
+
+# ═══ §6  ⚠ CHARACTERIZATION: an OMITTED column is unaffected by this flag ════════════════════════════
+# MEASURED on both values, and it is the fact that corrected the first analysis of this defect: an omitted
+# column is NEVER SENT — DuckDB's column_index_map leaves it out of the batch entirely — so it never
+# becomes a NULL for SqlBulkCopy to replace, and the server applies its own default either way. It holds
+# even for `expr`, whose default is withheld, which is what makes it discriminating.
+#
+# ⚠ No mutant of ours can kill this: it is DuckDB's behaviour, not ours. Its value is that the day it
+# changes, this row fails and names what moved — and the earlier belief that KeepNulls would break the
+# omitted case (it does not) is exactly the kind of error it exists to prevent.
+
+statement ok
+INSERT INTO q.dbo.kn_t (k) VALUES (12);
+
+statement ok
+SET mssql_keep_nulls=false;
+
+statement ok
+INSERT INTO q.dbo.kn_t (k) VALUES (13);
+
+query ITT
+SELECT k, coalesce(lit::VARCHAR, 'NULL'),
+       CASE WHEN expr IS NULL THEN 'NULL' ELSE 'server-ts' END
+FROM q.dbo.kn_t WHERE k IN (12, 13) ORDER BY k;
+----
+12	10	server-ts
+13	10	server-ts
+
+# ═══ §7  Teardown ════════════════════════════════════════════════════════════════════════════════════
+
+statement ok
+SET mssql_keep_nulls=true;
+
+statement ok
+DROP TABLE q.dbo.kn_t;

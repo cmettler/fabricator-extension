@@ -88,6 +88,19 @@ public sealed class SqlServerBackend : IProvider
                      "Set false to keep streaming instead: needs ALLOW_SNAPSHOT_ISOLATION on the database, and " +
                      "the scan then reads a committed snapshot (no read-your-writes). Overrides the per-catalog " +
                      "materialize ATTACH option"),
+                // ⚠⚠ DEFAULT TRUE, AND THAT IS A DELIBERATE DIVERGENCE FROM SqlBulkCopy's OWN DEFAULT — see
+                // ResolveKeepNulls for the measurements. Plain T-SQL stores NULL when you write NULL; without
+                // this flag SqlBulkCopy substitutes the column's DEFAULT instead, so the statement the caller
+                // wrote and the row that lands disagree, silently.
+                Bool("mssql_keep_nulls",
+                     "fabricator: write a NULL as NULL (default true). SqlBulkCopy, which every INSERT/CTAS/" +
+                     "COPY on this provider streams through, otherwise REPLACES a source NULL with the target " +
+                     "column's DEFAULT constraint — so INSERT ... VALUES (1, NULL) and a CSV with blank fields " +
+                     "would silently store the default instead of NULL. Set false for that older behaviour, " +
+                     "which is also the only way to make VALUES (..., DEFAULT) apply a non-literal server " +
+                     "default (see the column_default read-back: an expression default is not reported to " +
+                     "DuckDB, so that spelling reaches us as an ordinary NULL). Overrides the per-catalog " +
+                     "keep_nulls ATTACH option"),
                 Str("mssql_default_table_type",
                     "fabricator: created-table storage — '' (rowstore, default) | 'clustered columnstore' " +
                     "(CCI, box/Azure SQL; Fabric/Synapse tables are columnstore already so it is a no-op there)"),
@@ -623,6 +636,9 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
     // ATTACH option `materialize true|false` (default true). See ResolveMaterialize; a SET mssql_materialize
     // overrides it per session, the same precedence as isolation_level and command_timeout.
     private readonly bool? _materialize;
+    // ATTACH option `keep_nulls true|false` (default TRUE). See ResolveKeepNulls; a SET mssql_keep_nulls
+    // overrides it per session, the same precedence as materialize and isolation_level.
+    private readonly bool? _keepNulls;
     // ATTACH option `command_timeout <seconds>` (0 = infinite, default): the catalog default SqlCommand.CommandTimeout
     // for scans/DML/bulk. A SET mssql_command_timeout overrides it per session (ResolveCommandTimeout).
     private readonly int _commandTimeout;
@@ -738,6 +754,9 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
                         break;
                     case "materialize":
                         _materialize = !(string.Equals(val, "false", StringComparison.OrdinalIgnoreCase) || val == "0");
+                        break;
+                    case "keep_nulls":
+                        _keepNulls = !(string.Equals(val, "false", StringComparison.OrdinalIgnoreCase) || val == "0");
                         break;
                     // ⚠ ADDED WITH CHANGE B, and it RESTORES a capability that change would otherwise have
                     // removed. MARS used to be frozen per catalog at its first connect, so attaching twice
@@ -1636,6 +1655,35 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
     }
 
     /// <summary>
+    /// Whether a NULL we send is written as NULL. <c>SET mssql_keep_nulls</c> wins if set, else this
+    /// catalog's <c>keep_nulls</c> ATTACH option, else TRUE.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>⚠⚠ TRUE IS A DIVERGENCE FROM SqlBulkCopy's DEFAULT, AND IT IS THE CONFORMANT DIRECTION.</b>
+    /// Without <c>KeepNulls</c> SqlClient replaces a source NULL with the destination column's DEFAULT.
+    /// MEASURED with a control: through the catalog <c>VALUES (4, NULL, NULL)</c> stored <c>10</c> and a
+    /// <c>getdate()</c> timestamp, while the byte-identical statement as plain T-SQL through
+    /// <c>fabricator_exec</c> stored <c>NULL, NULL</c>; and a COPY of a CSV whose field was BLANK stored
+    /// <c>99</c>. So the old default made this provider disagree with plain SQL on the commonest spelling
+    /// there is, silently.</para>
+    /// <para><b>⚠ WHY IT IS A SETTING RATHER THAN A FIX.</b> DuckDB's binder collapses an explicit NULL and
+    /// an explicit <c>DEFAULT</c> keyword into the SAME typed NULL before our sink sees the chunk
+    /// (<c>ExpandDefaultExpression</c>), so no policy can be right for both and nothing here can tell them
+    /// apart. TRUE serves the explicit NULL; FALSE serves <c>VALUES (..., DEFAULT)</c> on a default we do
+    /// not report to DuckDB (an EXPRESSION default — a literal one is reported, so DuckDB substitutes it and
+    /// that spelling works under either value). The cost of TRUE is that ONE cell.</para>
+    /// <para><b>⚠ AN OMITTED COLUMN IS UNAFFECTED EITHER WAY, and that is measured rather than assumed</b>
+    /// — DuckDB's <c>column_index_map</c> leaves it out of the batch entirely, so it never becomes a NULL we
+    /// send and the server applies its own default. Both values of this flag give the identical result
+    /// there, including for a column whose default is an expression.</para>
+    /// </remarks>
+    internal bool ResolveKeepNulls()
+    {
+        var set = ProviderSettingsStore.Instance.GetBool(SqlServerBackend.ProviderName, "mssql_keep_nulls");
+        return set ?? _keepNulls ?? true;
+    }
+
+    /// <summary>
     /// Did someone ASK for <c>materialize=false</c> (via <c>SET</c> or the ATTACH option), as opposed to it
     /// resolving false from the MARS-derived default?
     /// </summary>
@@ -2136,6 +2184,14 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
             if (checkConstraints)
             {
                 options |= SqlBulkCopyOptions.CheckConstraints;
+            }
+            // ⚠ Applied to INSERT, CTAS and COPY alike — the semantic is "a NULL in the source is a NULL",
+            // which does not vary by statement kind. On a CTAS it is a NO-OP by construction (a freshly
+            // created table has no DEFAULT constraints for a NULL to be replaced by — measured), so the
+            // paths it changes are INSERT and COPY into an existing table.
+            if (ResolveKeepNulls())
+            {
+                options |= SqlBulkCopyOptions.KeepNulls;
             }
 
             // THE STAGED `COPY INTO` PATH (warehouse engines, opt-in via mssql_copy_into_staging). Placed
