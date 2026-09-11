@@ -3674,8 +3674,59 @@ void FabricatorSchemaEntry::Scan(ClientContext &context, CatalogType type,
 		// consumer's job either way — it only makes them INVISIBLE to duckdb_columns(),
 		// information_schema.columns and everything built on them. MEASURED: with views omitted here,
 		// duckdb_columns() reported the catalog's tables and none of its views.
-		for (auto &entry : table_types_) {
-			auto catalog_entry = GetOrCreateEntry(context, entry.first);
+		//
+		// ⚠⚠ SNAPSHOT THE NAMES FIRST — ITERATING table_types_ DIRECTLY HERE WAS A CRASH, and the branch
+		// for SCALAR_FUNCTION_ENTRY twenty lines below has guarded the identical hazard all along
+		// ("may evict a stale entry, which would invalidate an iterator"). GetOrCreateEntry ERASES from
+		// table_types_ when a table is established absent, so the range-for was positioned on the element
+		// it deleted and the following ++ read a freed node.
+		//
+		// ⚠ Undefined rather than reliably fatal, which is why it survived: with one erase on a small map
+		// the freed node usually still holds the right next-pointer. MEASURED on a catalog carrying twenty
+		// INVALID views (each raising a 208 that was misread as absence): duckdb_tables() SEGFAULTED on
+		// THREE RUNS IN FOUR, and the fourth printed the right answer. A production database reported the
+		// same symptom with two of them.
+		vector<string> table_names;
+		{
+			lock_guard<mutex> lock(entry_lock_);
+			table_names.reserve(table_types_.size());
+			for (auto &entry : table_types_) {
+				table_names.push_back(entry.first);
+			}
+		}
+		for (auto &table_name : table_names) {
+			// ⚠⚠ ENUMERATION IS BEST-EFFORT OVER MANY OBJECTS; A DIRECT REFERENCE IS NOT. A table that
+			// cannot be materialized — an INVALID view, one the principal cannot read, one whose types we
+			// cannot map — must not take the whole listing down with it, because a listing is what dbt and
+			// every BI tool run BEFORE they do anything. `SELECT * FROM db.s.that_view` still fails, loudly
+			// and with the provider's own message: this catch is scoped to the scan.
+			//
+			// ⚠ It is deliberately NOT silent. Each skip logs a WARNING naming the object and the reason,
+			// so a catalog that has quietly stopped listing half its tables says so — the alternative is
+			// the empty-result-as-success failure this file records elsewhere.
+			optional_ptr<CatalogEntry> catalog_entry;
+			try {
+				catalog_entry = GetOrCreateEntry(context, table_name);
+			} catch (std::exception &ex) {
+				ErrorData error(ex);
+				// ⚠⚠ THREE KINDS ARE NOT "this one table is broken" AND MUST NOT BE SWALLOWED.
+				//   INTERRUPT — the user cancelled. Eating it per table means Ctrl-C does nothing while a
+				//               large catalog enumerates, which is exactly the catalog someone cancels.
+				//   FATAL / INTERNAL — the database is invalidated; continuing would mask that and report a
+				//               partial listing as a successful one.
+				// Everything else is a per-object failure, which is what this catch exists for.
+				if (error.Type() == ExceptionType::INTERRUPT || error.Type() == ExceptionType::FATAL ||
+				    error.Type() == ExceptionType::INTERNAL) {
+					throw;
+				}
+				// ⚠ RawMessage(), not what(): a duckdb exception serializes itself as a JSON envelope, so
+				// what() would bury the one useful sentence — the name of the object that is really
+				// missing — inside {"exception_type":...,"exception_message":...} in a WARNING.
+				DUCKDB_LOG_WARNING(context,
+				                   StringUtil::Format("fabricator: table '%s.%s' skipped during enumeration: %s",
+				                                      name, table_name, error.RawMessage()));
+				continue;
+			}
 			if (catalog_entry) {
 				callback(*catalog_entry);
 			}

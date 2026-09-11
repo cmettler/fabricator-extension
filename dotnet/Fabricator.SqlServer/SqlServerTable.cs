@@ -33,8 +33,27 @@ public sealed partial class SqlServerCatalog
 
     /// <summary>The table's Arrow schema from a zero-row describe (<c>SELECT * … WHERE 1 = 0</c>) on the
     /// metadata connection (read-your-writes — a just-created table must be visible in its own
-    /// transaction). Absence = SQL Server error 208, classified as <see cref="ObjectNotFoundException"/>;
-    /// see the kind-2 adapter's remarks in SqlServerBackend.cs for why 208 and only 208.</summary>
+    /// transaction).</summary>
+    /// <remarks>
+    /// <para><b>⚠⚠ ERROR 208 DOES NOT MEAN "THIS OBJECT IS MISSING" — it means SOME object named in the
+    /// statement is, and for a VIEW that is usually a different one.</b> An INVALID view (one whose
+    /// underlying table or column has been dropped) raises 208 naming the REFERENT, plus a second line
+    /// <c>"Could not use view or function 'x' because of binding errors"</c>. Attributing that to the view
+    /// itself is a wrong answer about an object that plainly exists — and a destructive one, because the
+    /// host treats <see cref="ObjectNotFoundException"/> as established absence and ERASES the name from
+    /// the catalog.</para>
+    /// <para><b>⚠⚠ MEASURED, and it crashed the process rather than merely misreporting.</b> A production
+    /// database with a handful of invalid views segfaulted <c>duckdb_tables()</c> — 3 runs in 4 on a
+    /// 20-invalid-view reproduction — because the erase fired while the enumeration was iterating the very
+    /// map it erases from. The iterator bug is fixed separately in <c>FabricatorSchemaEntry::Scan</c>; this
+    /// is the half that stops a live object being reported as absent in the first place.</para>
+    /// <para><b>⚠ SO ABSENCE IS ESTABLISHED, NOT INFERRED</b> — the same rule the 2026-08-01 fix wrote down
+    /// and this site then broke by proxy: ask the server whether the object exists. ONE extra round trip,
+    /// on the failure path only.</para>
+    /// <para><b>⚠ AND WHEN THE PROBE ITSELF FAILS WE CLAIM NOTHING.</b> Unknown is not absence, so the
+    /// original 208 is surfaced with SQL Server's own message rather than converted into a
+    /// "does not exist" the caller would act on.</para>
+    /// </remarks>
     internal Schema ColumnsSchemaCore(string schemaName, string tableName)
     {
         try
@@ -45,7 +64,41 @@ public sealed partial class SqlServerCatalog
         }
         catch (Microsoft.Data.SqlClient.SqlException ex) when (ex.Number == InvalidObjectNameError)
         {
+            if (ObjectStillExists(schemaName, tableName) != false)
+            {
+                // It exists (or we could not find out): report what the SERVER said. The message names the
+                // object that is really missing, which is the one piece of information a user needs and the
+                // one the old "table does not exist" threw away.
+                throw new InvalidOperationException(
+                    $"fabricator: '{schemaName}.{tableName}' exists but cannot be described — it is most " +
+                    $"likely an INVALID view (a table or column it references has been dropped or renamed). " +
+                    $"SQL Server said: {ex.Message}", ex);
+            }
             throw new ObjectNotFoundException("table", $"{schemaName}.{tableName}", ex);
+        }
+    }
+
+    /// <summary>TRUE if the object is present, FALSE if it is provably absent, NULL if the question could
+    /// not be answered. Used only to classify a 208; the three-way answer is the point, because treating an
+    /// unanswerable probe as "absent" is exactly the inference this exists to stop.</summary>
+    /// <remarks>⚠ The identifiers are BRACKETED inside the literal: <c>OBJECT_ID</c> parses a multi-part
+    /// NAME, so an object whose name contains a dot would otherwise resolve to nothing and be reported as
+    /// absent — the failure mode this whole method exists to prevent, arriving by a different route.</remarks>
+    private bool? ObjectStillExists(string schemaName, string tableName)
+    {
+        var literal = "N'" + (Quote(schemaName) + "." + Quote(tableName)).Replace("'", "''") + "'";
+        try
+        {
+            foreach (var row in ReadMetadataRows(
+                         $"SELECT CASE WHEN OBJECT_ID({literal}) IS NULL THEN '0' ELSE '1' END", 1))
+            {
+                return row[0] == "1";
+            }
+            return null;
+        }
+        catch (Exception)
+        {
+            return null;
         }
     }
 

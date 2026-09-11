@@ -1,0 +1,221 @@
+# name: test/verify_invalid_objects.test
+# description: Catalog enumeration survives objects it cannot describe — user-reported against a production
+#              database whose INVALID views (a referenced table or column dropped) made `duckdb_tables()`
+#              fail outright.
+#
+#              ⚠⚠ THREE DISTINCT DEFECTS, and only the first one is what it looked like:
+#                1. SQL Server's error 208 was read as "THIS object is missing". It is not — it names SOME
+#                   object in the statement, and for an invalid VIEW that is the REFERENT. So a live view
+#                   was reported absent, and the host ERASED it from the catalog on that word.
+#                2. That erase fired while `Scan` was iterating the very map it erases from, so the
+#                   range-for's iterator was invalidated and the following ++ read a freed node. MEASURED:
+#                   SEGFAULT on THREE RUNS IN FOUR over twenty invalid views; the fourth printed the right
+#                   answer. Undefined, not reliably fatal — which is why it survived until a large
+#                   production catalog hit it.
+#                3. Nothing made enumeration tolerant of a single table it cannot materialize, and a
+#                   listing is what dbt and every BI tool run BEFORE they do anything.
+#
+#              ⚠⚠ DEFECT 2 IS THE ONE THIS SUITE CANNOT RELIABLY CATCH, and §4 says so at length rather
+#              than implying it does: undefined behaviour is not a wrong answer, so whether it manifests is
+#              the allocator's business. What IS measured is recorded there — the original segfaulted 3
+#              runs in 4, and with ONLY the snapshot fix (classification deliberately reverted, so every
+#              erase still fires) the same probe is clean 6 of 6. Needs MSSQL_TESTDB_DSN.
+# group: [fabricator]
+
+require fabricator
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS q (TYPE fabricator);
+
+# ═══ §0  Build an INVALID view: one over a table that is then dropped ═════════════════════════════════
+# Created and broken SERVER-SIDE, because it is a state DuckDB's own DDL cannot express — and because the
+# drop must NOT go through the catalog, or the cache would learn about it.
+
+statement ok
+SELECT fabricator_exec('q', 'DROP VIEW IF EXISTS dbo.io_vw');
+
+statement ok
+SELECT fabricator_exec('q', 'DROP TABLE IF EXISTS dbo.io_base');
+
+statement ok
+SELECT fabricator_exec('q', 'CREATE TABLE dbo.io_base (a int, b varchar(10))');
+
+statement ok
+SELECT fabricator_exec('q', 'CREATE VIEW dbo.io_vw AS SELECT a, b FROM dbo.io_base');
+
+statement ok
+SELECT fabricator_exec('q', 'DROP TABLE dbo.io_base');
+
+statement ok
+SELECT fabricator_refresh_cache('q');
+
+# THE PREMISE, asserted rather than assumed: the view EXISTS on the server. Everything below is about an
+# object that is present and undescribable, not about a missing one.
+query TT
+SELECT name, type_desc FROM fabricator_query('q',
+  'SELECT name, type_desc FROM sys.objects WHERE name = ''io_vw''');
+----
+io_vw	VIEW
+
+# ═══ §1  ENUMERATION SURVIVES ════════════════════════════════════════════════════════════════════════
+# MUTANT 3 (remove the per-table catch in Scan) dies here: the invalid view's error propagates and takes
+# the whole listing with it.
+#
+# ⚠ Asserted as "a known-good table is listed" rather than as a COUNT — a count would be brittle against
+# whatever else the shared test database holds, and it would not distinguish "enumeration worked" from
+# "enumeration returned nothing".
+
+statement ok
+CREATE OR REPLACE TABLE q.dbo.io_ok (x INTEGER);
+
+statement ok
+SELECT fabricator_refresh_cache('q');
+
+query T
+SELECT table_name FROM information_schema.tables
+WHERE table_catalog = 'q' AND table_name = 'io_ok';
+----
+io_ok
+
+# duckdb_columns() is the sharper surface: it scans TABLE_ENTRY and materializes EVERY entry, so it is the
+# one a single undescribable object is likeliest to take down.
+query I
+SELECT count(*) FROM duckdb_columns() WHERE database_name = 'q' AND table_name = 'io_ok';
+----
+1
+
+# ═══ §2  ⚠ CHARACTERIZATION: the invalid view is OMITTED from the listing ═════════════════════════════
+# It cannot appear: a catalog entry needs columns and the server will not describe it. Recorded as a
+# limitation rather than a goal — the alternative (failing the listing) is what this suite exists to stop,
+# and the WARNING in duckdb_logs is what keeps the omission from being silent.
+
+query I
+SELECT count(*) FROM information_schema.tables
+WHERE table_catalog = 'q' AND table_name = 'io_vw';
+----
+0
+
+# ═══ §3  A DIRECT REFERENCE FAILS LOUDLY, NAMING THE REAL CULPRIT ════════════════════════════════════
+# ⚠⚠ THE MESSAGE IS THE ASSERTION. Before the fix this said "Table with name io_vw does not exist!" — a
+# wrong answer about an object that plainly exists, which sends the reader to check spelling and
+# permissions instead of to the dropped table. Now it names `io_base`, which is the one fact that resolves
+# the problem. MUTANT 2 (classify every 208 as absence) dies here.
+
+statement error
+SELECT * FROM q.dbo.io_vw;
+----
+io_base
+
+# The explanation is part of the contract, not decoration: a reader who has never met an invalid view needs
+# to be told what the state IS, not only which object is missing.
+statement error
+SELECT * FROM q.dbo.io_vw;
+----
+exists but cannot be described
+
+# ═══ §4  ⚠⚠ THE ITERATOR FIX, GATED ON ITS OWN — and it needs NO invalid view ═════════════════════════
+# This is the section that matters most, because once §3's classification is fixed an invalid view no
+# longer triggers the erase at all — so the invalid-view scenario STOPS exercising the crash. The pure test
+# is a table that is GENUINELY absent at enumeration time: discovered into the cache, then dropped OUT OF
+# BAND, so `GetOrCreateEntry` establishes absence and erases the name from the map `Scan` is iterating.
+#
+# ⚠⚠ AND IT DOES NOT RELIABLY KILL THE MUTANT — said here rather than implied, because a gate that claims
+# coverage it does not have is worse than an honest gap. Reverting the snapshot (iterating table_types_
+# directly again) SURVIVES this section on 3 runs of 3, and still survived at FORTY dropped tables. The
+# defect is UNDEFINED BEHAVIOUR, not a wrong answer: the freed node usually still holds a usable
+# next-pointer, so whether it manifests depends on allocator reuse rather than on anything the suite can
+# arrange. A test that waits for UB to bite would be flaky in CI, which is worse than no test.
+#
+# ⚠⚠ WHAT IS MEASURED INSTEAD, and it is stronger than this section could be: the ORIGINAL code SEGFAULTED
+# duckdb_tables() on THREE RUNS IN FOUR over a catalog of twenty invalid views, and with the snapshot fix
+# in place — but the CLASSIFICATION deliberately reverted, so all twenty erases still fire — the same
+# probe is clean on SIX RUNS OF SIX. That isolates the crash to the snapshot fix and nothing else.
+#
+# ⚠ There are TWO use-after-frees here, not one, which is why the fix is a snapshot rather than a
+# reordering: `table_types_.erase(table_name)` frees the node, and when the loop passed `entry.first` that
+# argument was a REFERENCE INTO THAT NODE's key — used twice more on the following lines — as well as
+# invalidating the iterator the range-for was about to increment.
+#
+# ⚠ `mssql_exec_invalidate_cache` is OFF by default, which is what makes this constructible: the DROPs
+# below do not refresh the catalog, so the names survive in the cache until enumeration asks for them.
+
+statement ok
+SELECT fabricator_exec('q', 'DROP TABLE IF EXISTS dbo.io_g1');
+
+statement ok
+SELECT fabricator_exec('q', 'DROP TABLE IF EXISTS dbo.io_g2');
+
+statement ok
+SELECT fabricator_exec('q', 'DROP TABLE IF EXISTS dbo.io_g3');
+
+statement ok
+SELECT fabricator_exec('q', 'DROP TABLE IF EXISTS dbo.io_g4');
+
+statement ok
+CREATE OR REPLACE TABLE q.dbo.io_g1 (x INTEGER);
+
+statement ok
+CREATE OR REPLACE TABLE q.dbo.io_g2 (x INTEGER);
+
+statement ok
+CREATE OR REPLACE TABLE q.dbo.io_g3 (x INTEGER);
+
+statement ok
+CREATE OR REPLACE TABLE q.dbo.io_g4 (x INTEGER);
+
+statement ok
+SELECT fabricator_refresh_cache('q');
+
+# All four are in the cache now. Drop them BEHIND the catalog's back.
+statement ok
+SELECT fabricator_exec('q', 'DROP TABLE dbo.io_g1');
+
+statement ok
+SELECT fabricator_exec('q', 'DROP TABLE dbo.io_g2');
+
+statement ok
+SELECT fabricator_exec('q', 'DROP TABLE dbo.io_g3');
+
+statement ok
+SELECT fabricator_exec('q', 'DROP TABLE dbo.io_g4');
+
+# Enumerating now establishes absence for all four and erases each while the scan is mid-iteration.
+query I
+SELECT count(*) FROM duckdb_columns() WHERE database_name = 'q' AND table_name = 'io_ok';
+----
+1
+
+# And they really are gone from the listing afterwards — the erase is CORRECT behaviour for a genuinely
+# absent table, so this pins that the fix changed only WHEN it is safe to do it, not whether it happens.
+query I
+SELECT count(*) FROM information_schema.tables
+WHERE table_catalog = 'q' AND table_name IN ('io_g1', 'io_g2', 'io_g3', 'io_g4');
+----
+0
+
+# ═══ §5  ⚠ THE ABSENCE PATH STILL WORKS — the control for §3's change ════════════════════════════════
+# §3 narrowed what counts as "absent", so this is the row that proves it did not narrow it to nothing.
+# A table that is genuinely gone must still read as absent, which is what `CREATE TABLE IF NOT EXISTS` and
+# `CREATE OR REPLACE` depend on.
+
+statement ok
+CREATE TABLE IF NOT EXISTS q.dbo.io_g1 (x INTEGER);
+
+query T
+SELECT table_name FROM information_schema.tables
+WHERE table_catalog = 'q' AND table_name = 'io_g1';
+----
+io_g1
+
+# ═══ §6  Teardown ════════════════════════════════════════════════════════════════════════════════════
+
+statement ok
+SELECT fabricator_exec('q', 'DROP VIEW IF EXISTS dbo.io_vw');
+
+statement ok
+DROP TABLE q.dbo.io_ok;
+
+statement ok
+DROP TABLE q.dbo.io_g1;

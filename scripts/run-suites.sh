@@ -662,7 +662,7 @@ case "$TIER" in
         # 55 since 2026-09-08: + verify_alter_default (ADD COLUMN ... DEFAULT). SQL Server's ALTER TABLE
         # had essentially NO gate before it -- the only catalog-level ADD COLUMN in the tree was a setup
         # line in a locking test -- which is exactly how a silently dropped DEFAULT survived.
-        : "${MIN_SUITES:=58}"
+        : "${MIN_SUITES:=59}"
         # 1424 since 2026-08-01: verify_exec_invalidate_cache 10 -> 21, for the OUT-OF-BAND DROP path Ã¢ÂÂ the
         # catalog's self-heal, documented in CLAUDE.md and until now covered by NOTHING. The service tier ran
         # 44/44 green while that path was broken, which is why the section exists. It must run with
@@ -1018,7 +1018,10 @@ case "$TIER" in
         # 3447 since 2026-09-10: a NEW suite verify_keep_nulls (68) — mssql_keep_nulls / the keep_nulls
         #   ATTACH option, now DEFAULTING TRUE so a NULL we send is written as NULL instead of being
         #   replaced by the column's DEFAULT. 3379 + 68 exactly; MIN_SUITES 57 -> 58 with it.
-        : "${MIN_ASSERTIONS:=3447}"
+        # 3483 since 2026-09-11: a NEW suite verify_invalid_objects (36) — catalog enumeration survives
+        #   objects it cannot describe (an INVALID view). User-reported as a production listing failure;
+        #   it was two use-after-frees plus a 208 misread as absence. 3447 + 36 exactly; MIN_SUITES 58 -> 59.
+        : "${MIN_ASSERTIONS:=3483}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

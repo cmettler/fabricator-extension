@@ -424,6 +424,21 @@ SELECT s.name, o.amount
   FROM mssql.dbo.people s JOIN mssql.sales.orders o ON o.order_id = 1000 + s.id;
 ```
 
+> **Objects the server cannot describe are skipped, not fatal.** The commonest case is an **invalid view**
+> on SQL Server — one whose underlying table or column has been dropped or renamed. Such an object is left
+> out of the listing and a warning naming it is written to `duckdb_logs`; everything else enumerates
+> normally. Referencing it directly still fails, with SQL Server's own message naming the object that is
+> really missing:
+>
+> ```
+> fabricator: 'dbo.vwSPRatings' exists but cannot be described — it is most likely an INVALID view
+> (a table or column it references has been dropped or renamed).
+> SQL Server said: Invalid object name 'dbo.SomeDroppedTable'.
+> ```
+>
+> To see what was skipped: `SET logging_storage = 'memory';` then
+> `SELECT message FROM duckdb_logs WHERE message LIKE '%skipped during enumeration%';`
+
 ## Query Execution & Pushdown
 
 Results stream directly into DuckDB. The extension pushes work to SQL Server:
