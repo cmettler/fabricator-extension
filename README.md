@@ -1444,7 +1444,7 @@ A plugin's global functions are registered while the extension loads, so a plugi
 available the **next time** DuckDB loads fabricator — not in the running session. See
 [docs/plugin-system.md](docs/plugin-system.md).
 
-#### Templates — `fluid_render(...)`, `fluid_query(...)`, `fluid_query_batch(...)` and `fluid_query_lateral(...)`
+#### Templates — `fluid_render(...)`, `fluid_query(...)`, `fluid_query_batch(...)`, `fluid_query_inout(...)` and `fluid_query_lateral(...)`
 
 The **Fluid / Liquid template engine** is **built in** — it ships inside the extension and needs no
 configuration. It contributes three global functions, all taking a params bag that is a DuckDB `STRUCT`
@@ -2135,6 +2135,33 @@ this, and one that reads it in Liquid pays a single round trip. `{% for r in inp
 `{{ input_table.size }}` see **this group's** rows (this chunk's, for `fluid_query_lateral`) — the SQL view
 and the Liquid value are repointed together. Your own `{% assign input_table = … %}` shadows the Liquid name;
 the SQL object is a separate namespace and keeps the rows.
+
+**`fluid_query_inout(template, <input> [, params := …])` is the STREAMING sibling** — the same body on the
+table-in-out exchange instead of the collector. It renders **once per input chunk** and emits that chunk's
+rows before reading the next, so **only one chunk is held at a time**. Reach for it when the input is large
+and each chunk can be handled on its own:
+
+```sql
+SELECT count(*) AS renders, sum(chunk_rows)::BIGINT AS rows
+FROM fluid_query_inout(
+  'SELECT (SELECT count(*) FROM input_table)::BIGINT AS chunk_rows',
+  (SELECT * FROM range(5000) t(n)));
+-- renders | rows
+-- 3       | 5000        -- fluid_query_batch over the same input: 1 render, 5000 rows
+```
+
+> ⚠ **There is no `batchsize`, and that is inherent rather than an omission.** The streaming operator cannot
+> hold output back until the input ends — its all-input-done hook is handed no data, so anything held back
+> is discarded — so a render is exactly one DuckDB chunk and how the input divides into chunks is not yours
+> to choose. If the statement must see the whole relation, or an exact row count per render, use
+> `fluid_query_batch`, which buffers the input and can therefore group it.
+>
+> ⚠ **An empty input renders nothing here, and once on `fluid_query_batch`.** With no rows there are no
+> chunks; the collector still renders once, because a template is a statement *generator* whose output need
+> not depend on the rows. If you need the generator to fire regardless, use the collector.
+>
+> Everything else matches: `params`, `input_table` as both a temp table and a Liquid value, `is_bind`,
+> projection, the refusal of `publish()`, and SQL state carrying between renders while Liquid state does not.
 
 **`is_bind` is true for exactly one render: the one that determines the output columns.** DuckDB needs a
 table function's schema before it runs anything, so the template is rendered once against an *empty*

@@ -3939,3 +3939,92 @@ then arrives as a failed assertion naming the step rather than as a surprise in 
 
 `verify_plugin_fluid` is HERMETIC. The tags need a real provider catalog to mean anything, so adding a
 `require-env` there would move **759** assertions out of the hermetic tier to gate 22.
+
+## 30. ✅ AS BUILT (2026-09-11) — `fluid_query_inout`, the STREAMING sibling of the collector
+
+User-asked: *"implement a fluid_query_inout similar to the collector version fluid_query_batch but not as a
+collector this time as a streaming table in/out function."* It is the item §19 recorded as deliberately
+still open — *"a bounded-memory batched variant is the SAME body registered on the streaming in-out"*.
+
+C#-only, **NO ABI change and NO C++ change**: `IProvider.GlobalInOutFunctions` already existed as a DIM and
+the global in-out kind has been supported since ABI v46/v47. Gate: `verify_plugin_fluid` 759 → **794** (§35),
+hermetic floor 9088 → **9123**, THREE mutants each killed at its own row.
+
+```sql
+SELECT * FROM fluid_query_inout('SELECT n, n * 2 AS dbl FROM input_table',
+                                (SELECT * FROM (VALUES (1), (2), (3)) t(n)));
+```
+
+### 30.1 What it buys, and what it cannot do — both forced by the operator
+
+**BOUNDED MEMORY is the whole point.** A collector must buffer its ENTIRE input before the first render;
+that is inherent to a collector and is true even at a small `batchsize`, which is why §19 records that
+parameter as being about how many rows each render SEES and never about memory. This surface holds one
+chunk at a time.
+
+**And it cannot render over the whole input, which is why there is no `batchsize`.** The streaming in-out's
+all-input-done hook is handed no `DataChunk`, so output held back until input EOF is DRAINED AND DISCARDED
+(docs/inout-collector-mode.md) — so a group spanning chunks is inexpressible, and **the chunk IS the batch**.
+How the input divides into chunks is DuckDB's business.
+
+⚠ It is a SEPARATE registration rather than a mode of `fluid_query_batch`, and that is not a style choice:
+`kind` is fixed at REGISTRATION, so one name cannot switch operators by parameter. §19 records the same
+constraint for the lateral.
+
+**MEASURED, the contrast that defines the pair** — the template reports its own input size, so each output
+row IS one render:
+
+| over `range(5000)` | renders | rows | biggest render |
+|---|---|---|---|
+| `fluid_query_inout` | **3** | 5000 | 2048 |
+| `fluid_query_batch` | **1** | 5000 | 5000 |
+
+### 30.2 ⚠⚠ AN EMPTY INPUT DIVERGES, and it is a real semantic difference rather than an oversight
+
+`fluid_query_inout` over an empty relation renders **NOTHING**; `fluid_query_batch` renders **ONCE**
+(measured, and gated as a pair so neither half reads as an accident). With no rows there are no chunks, and
+a render is per chunk — while the collector renders once because a template is a statement GENERATOR whose
+output need not depend on the rows. **A caller who needs the generator to fire regardless wants the
+collector.**
+
+### 30.3 What is identical, and why that is structural rather than careful
+
+`params`, `input_table` as both a temp table and a lazy Liquid value, `is_bind`, the projection hint and
+wrapper, the `publish()` refusal, and the SQL-state-carries / Liquid-state-does-not split (measured here
+too: a temp-table counter reads 1, 2, 3 across chunks while a `{% assign %}` counter reads 1, 1, 1).
+
+They are identical **by construction**: the second surface arrived with `FluidRelationInput`, into which the
+schema probe, the projection wrapper, the drift check, the publish refusal and the empty-input creation were
+EXTRACTED rather than copied. Each of those is load-bearing in a way a reader would not guess — the
+`LIMIT 0` wrapper is also what REQUIRES the generated statement to be a subquery-usable SELECT, `Wrap` IS
+the projection pushdown — so a divergence between the two would be a silent behaviour difference, not a
+compile error.
+
+⚠ It also required moving `InOutExchange.EmptyBatch` (the length-0 sentinel) from `Fabricator.Bridge` to
+`Fabricator.Common`, and that was a PRE-EXISTING gap rather than a new need: `StaticInOutFunction` already
+lived in Common and its own documentation told authors to yield `InOutExchange.EmptyBatch`, while the helper
+sat in an assembly a plugin deliberately does not reference. **A plugin deriving from that base could not
+write the one thing the base requires of it.** The namespace is unchanged, so not one call site moved.
+
+### 30.4 ⚠ DRIFT IS CAUGHT BY TWO MECHANISMS, and which fires depends on HOW the render drifted
+
+Found by writing the gate: the expected message was wrong the first time.
+
+- A **RENAMED** column is caught by the **WRAPPER** — it selects the declared names from the generated
+  statement, so the inner bind fails naming the column, before any row is produced.
+- A **RETYPED** column keeps its name, so the wrapper binds happily and only **`Verify`** can see it.
+
+Both are gated. Without the second row `Verify` would have been untested here, and a reader would assume one
+check covered both — mutant 3 (drop the drift check) survives the first row and dies on the second.
+
+### 30.5 The mutants
+
+| mutant | dies at | actual |
+|---|---|---|
+| stage the input only once | the defining-contrast row | `1  6144  1` — 3 renders each seeing the FIRST chunk's 2048 rows |
+| bind the lazy Liquid value once | the both-paths-agree row | `0  1  5000` — SQL correct, Liquid stale |
+| drop the drift check | the RETYPED-drift row | "Query unexpectedly succeeded" |
+
+⚠ The first two die on DIFFERENT rows and for different reasons, which is what separates "the temp table is
+stale" from "the Liquid value is stale" — the agreement row alone could not, because a build where BOTH are
+stale still reports them as agreeing. The `sum` and the `max(sql_n) > 1` control are what catch that.

@@ -64,10 +64,7 @@ internal sealed class FluidQueryBatchFunction : ICollectorFunction
 {
     internal const string FunctionName = "fluid_query_batch";
 
-    /// <summary>The name the template reads its rows under.</summary>
-    private const string InputTable = "input_table";
-
-    /// <summary>Where every input row is staged; <see cref="InputTable"/> is a view over a slice of it.</summary>
+    /// <summary>Where every input row is staged; <see cref="FluidRelationInput.InputTable"/> is a view over a slice of it.</summary>
     private const string StagingTable = "__fab_input";
 
     /// <summary>The staging row number, which is what makes a group an EXACT <c>batchsize</c> rows.</summary>
@@ -75,9 +72,6 @@ internal sealed class FluidQueryBatchFunction : ICollectorFunction
 
     /// <summary>Any input column under this prefix would collide with the staging machinery.</summary>
     private const string ReservedPrefix = "__fab";
-
-    /// <summary>The template variable naming the output columns the caller actually reads.</summary>
-    internal const string ProjectedVariable = "projected";
 
     private const string PublishRefusal =
         "publish() cannot be used here — " + FunctionName + " runs the rendered statement on the template's "
@@ -102,7 +96,7 @@ internal sealed class FluidQueryBatchFunction : ICollectorFunction
 
     public ICollectorFunctionBinding Bind(RecordBatch? args, Schema inputSchema)
     {
-        var template = ReadTemplate(args);
+        var template = FluidRelationInput.ReadTemplate(FunctionName, args);
         long? batchSize = ReadBatchSize(args);
         // ⚠⚠ CAPTURED, not retained: the args batch belongs to the framework and its lifetime ends with this
         // call, while the groups render much later. FluidValueModel.Capture is eager all the way down, so
@@ -128,98 +122,14 @@ internal sealed class FluidQueryBatchFunction : ICollectorFunction
             ?? throw new InvalidOperationException(
                 $"{FunctionName} needs the hosting DuckDB to determine its output columns, and it is not "
                 + "available here.");
-        var ctx = NewContext(probe, parameters, isBind: true);
-        CreateEmptyInput(probe, inputSchema);
+        var ctx = FluidRelationInput.NewContext(FunctionName, probe, parameters, isBind: true);
+        FluidRelationInput.CreateEmptyInput(probe, inputSchema);
         // ⚠ Bound at the probe too, EMPTY, so `{{ input_table.size }}` answers 0 here rather than failing.
         // A name that resolves at scan and not at bind is the split this plugin already records as a trap.
-        FluidHostQuery.BindLazyRelation(ctx, InputTable);
+        FluidHostQuery.BindLazyRelation(ctx, FluidRelationInput.InputTable);
         var generated = FluidEngine.RenderOn(FunctionName, template, ctx);
-        var outputSchema = DescribeGenerated(probe, generated);
+        var outputSchema = FluidRelationInput.DescribeGenerated(FunctionName, probe, generated);
         return new Binding(template, parameters, batchSize, inputSchema, outputSchema);
-    }
-
-    /// <summary>Builds the render context every render of one execution shares.</summary>
-    private static TemplateContext NewContext(FluidRenderSession session,
-                                              object? parameters,
-                                              bool isBind,
-                                              Schema? projectedSchema = null)
-    {
-        var ctx = FluidEngine.NewRenderContext(FunctionName, PublishRefusal, session, c =>
-        {
-            FluidValueModel.SetVariable(c, FluidValueModel.BagVariable, parameters);
-        });
-        ctx.SetValue(FluidEngine.IsBindVariable, isBind);
-        if (projectedSchema is not null)
-        {
-            // ⚠ The template may use it or ignore it: the wrapper narrows the result either way, so a
-            // template that never reads `projected` is correct and merely does more work. NOT bound during
-            // the schema probe — there is no projection yet, the bind is what the planner narrows — so a
-            // template reading it branches on is_bind.
-            FluidValueModel.SetVariable(ctx, ProjectedVariable,
-                                        projectedSchema.FieldsList.Select(f => f.Name).ToArray());
-        }
-        return ctx;
-    }
-
-    /// <summary>
-    /// The generated statement as this function runs it: exactly the columns this plan reads, named.
-    /// </summary>
-    /// <remarks>
-    /// ⚠⚠ NAMING THEM IS THE PROJECTION PUSHDOWN — MEASURED, DuckDB prunes an unreferenced expression inside
-    /// a subquery, so a narrowed outer SELECT makes the TEMPLATE'S OWN statement stop computing what nobody
-    /// reads. It is applied even with no projection, so the drift behaviour does not depend on the caller's
-    /// SELECT list: an EXTRA column is dropped either way, and a missing or renamed one fails at the inner
-    /// bind naming the column.
-    /// </remarks>
-    private static string Wrap(string generated, Schema keep) =>
-        $"SELECT {string.Join(", ", keep.FieldsList.Select(f => DuckSql.QuoteIdent(f.Name)))} FROM ({generated})";
-
-    /// <summary>The schema of <paramref name="generated"/> without producing a row of it.</summary>
-    /// <remarks>
-    /// ⚠ Wrapped in <c>SELECT * FROM (…) LIMIT 0</c>, the same shape <c>Publish</c> uses, which does two
-    /// jobs: it binds without scanning, and it REQUIRES the generated statement to be a SELECT usable as a
-    /// subquery. Running the statement bare would silently accept a DDL or DML and declare whatever shape
-    /// the engine reports for it.
-    /// </remarks>
-    private static Schema DescribeGenerated(FluidRenderSession session, string generated)
-    {
-        if (string.IsNullOrWhiteSpace(generated))
-        {
-            throw new ArgumentException(
-                $"{FunctionName}: the template rendered nothing. It must render a SELECT — under "
-                + $"{FluidEngine.IsBindVariable} too, where a `SELECT … LIMIT 0` of the right columns is the "
-                + "usual answer.");
-        }
-        using var stream = session.Query($"SELECT * FROM ({generated}) LIMIT 0");
-        return stream.Schema;
-    }
-
-    private static void CreateEmptyInput(FluidRenderSession session, Schema inputSchema)
-    {
-        // ⚠ Via a zero-row named source rather than rendered DDL: writing `CREATE TABLE t(a VARCHAR, …)`
-        // needs an Arrow→DuckDB type-name table by hand, which is the second type mapping this codebase
-        // keeps refusing to maintain. DuckDB derives the columns from the Arrow schema instead.
-        var token = session.RegisterRows(inputSchema);
-        try
-        {
-            session.ExecuteNonQuery(
-                $"CREATE OR REPLACE TEMP TABLE {DuckSql.QuoteIdent(InputTable)} AS "
-                + $"SELECT * FROM fabricator_scan({DuckSql.Literal(token)})");
-        }
-        finally
-        {
-            session.ReleaseRows(token);
-        }
-    }
-
-    private static string ReadTemplate(RecordBatch? args)
-    {
-        if (FluidValueModel.ArgColumn(args, "template") is not StringArray templates || templates.Length == 0
-            || templates.IsNull(0))
-        {
-            throw new ArgumentException($"{FunctionName}: 'template' must be a non-NULL VARCHAR");
-        }
-        return templates.GetString(0);
     }
 
     private static long? ReadBatchSize(RecordBatch? args)
@@ -259,9 +169,7 @@ internal sealed class FluidQueryBatchFunction : ICollectorFunction
 
         /// <summary>The columns a given projection narrows this binding's output to.</summary>
         private Schema Narrow(IReadOnlyList<int>? projected) =>
-            projected is { Count: > 0 } && projected.Count != OutputSchema.FieldsList.Count
-                ? new Schema(projected.Select(i => OutputSchema.FieldsList[i]).ToList(), metadata: null)
-                : OutputSchema;
+            FluidRelationInput.Narrow(OutputSchema, projected);
 
         // ⚠ DECLARING that this binding HONOURS the hint: the exchange's stream schema is read before its
         // first batch, so narrowing the output without saying so here would have the host read narrow
@@ -284,7 +192,7 @@ internal sealed class FluidQueryBatchFunction : ICollectorFunction
             using var session = FluidRenderSession.TryCreate()
                 ?? throw new InvalidOperationException(
                     $"{FunctionName} needs the hosting DuckDB, which is not available here.");
-            var ctx = NewContext(session, _parameters, isBind: false, outputSchema);
+            var ctx = FluidRelationInput.NewContext(FunctionName, session, _parameters, isBind: false, outputSchema);
 
             long staged = await StageInputAsync(session, allInput, ct).ConfigureAwait(false);
             // ⚠ `staged > size` rather than `staged > 0`, so a batchsize at or above the row count is ONE
@@ -300,7 +208,7 @@ internal sealed class FluidQueryBatchFunction : ICollectorFunction
                 // ⚠⚠ A FRESH lazy value per group, because it CACHES: one carried across groups would
                 // serve group 1's rows to every later group, silently. The SQL view and the Liquid value
                 // are repointed together, so the two access paths cannot disagree about which group it is.
-                FluidHostQuery.BindLazyRelation(ctx, InputTable);
+                FluidHostQuery.BindLazyRelation(ctx, FluidRelationInput.InputTable);
                 var generated = FluidEngine.RenderOn(FunctionName, _template, ctx);
                 if (string.IsNullOrWhiteSpace(generated))
                 {
@@ -308,8 +216,8 @@ internal sealed class FluidQueryBatchFunction : ICollectorFunction
                         $"{FunctionName}: the template rendered nothing for group {g + 1} of {groups}; "
                         + "it must render a SELECT.");
                 }
-                using var stream = session.Query(Wrap(generated, outputSchema));
-                Verify(stream.Schema, outputSchema);
+                using var stream = session.Query(FluidRelationInput.Wrap(generated, outputSchema));
+                FluidRelationInput.Verify(FunctionName, "group", stream.Schema, outputSchema);
                 while (true)
                 {
                     var batch = await stream.ReadNextRecordBatchAsync(ct).ConfigureAwait(false);
@@ -395,7 +303,7 @@ internal sealed class FluidQueryBatchFunction : ICollectorFunction
                 body += $" WHERE {seq} >= {lo} AND {seq} < {lo + size}";
             }
             session.ExecuteNonQuery(
-                $"CREATE OR REPLACE TEMP VIEW {DuckSql.QuoteIdent(InputTable)} AS {body}");
+                $"CREATE OR REPLACE TEMP VIEW {DuckSql.QuoteIdent(FluidRelationInput.InputTable)} AS {body}");
         }
 
         /// <summary>The staging schema: the seq column then the input's own.</summary>
@@ -404,51 +312,6 @@ internal sealed class FluidQueryBatchFunction : ICollectorFunction
             var fields = new List<Field> { new(SeqColumn, Int64Type.Default, nullable: false) };
             fields.AddRange(inputSchema.FieldsList);
             return new Schema(fields, metadata: null);
-        }
-
-        /// <summary>
-        /// Refuses a group whose statement produced a different shape from the one declared at bind.
-        /// </summary>
-        /// <remarks>
-        /// ⚠⚠ NOT defensive: the template renders anew for every group and may legitimately render DIFFERENT
-        /// SQL, so a group producing different columns is reachable from an ordinary template. The host
-        /// builds its Arrow→DuckDB converters from the DECLARED schema and reads batches through them, so an
-        /// unchecked mismatch is read as DATA.
-        /// <para>⚠ Count, names and type IDs — the same three the host's own declared-source check compares,
-        /// and with the same limit: a change of type PARAMETERS alone (decimal(9,2) to decimal(18,4)) passes.
-        /// Apache.Arrow's IArrowType.Equals is REFERENCE equality, so a fuller comparison needs a structural
-        /// comparer this codebase has already noted is worth consolidating.</para>
-        /// </remarks>
-        private static void Verify(Schema arrived, Schema declared)
-        {
-            string? problem = null;
-            if (arrived.FieldsList.Count != declared.FieldsList.Count)
-            {
-                problem = $"{arrived.FieldsList.Count} columns where {declared.FieldsList.Count} were declared";
-            }
-            else
-            {
-                for (int i = 0; i < declared.FieldsList.Count && problem is null; i++)
-                {
-                    var d = declared.FieldsList[i];
-                    var a = arrived.FieldsList[i];
-                    if (!string.Equals(d.Name, a.Name, StringComparison.Ordinal))
-                    {
-                        problem = $"column {i + 1} is named '{a.Name}' where '{d.Name}' was declared";
-                    }
-                    else if (d.DataType.TypeId != a.DataType.TypeId)
-                    {
-                        problem = $"column '{d.Name}' is {a.DataType.Name} where {d.DataType.Name} was declared";
-                    }
-                }
-            }
-            if (problem is not null)
-            {
-                throw new InvalidOperationException(
-                    $"{FunctionName}: a rendered statement produced {problem}. Every group must produce the "
-                    + $"columns the schema-probe render declared — branch on {FluidEngine.IsBindVariable} to "
-                    + "declare them, and keep every other branch to that same shape.");
-            }
         }
 
         public void Dispose()

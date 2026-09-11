@@ -605,7 +605,10 @@ case "$TIER" in
         #   catalog_entry_type INVALID, so the table form's entry-type check cannot cover it.
         # 9088 since 2026-09-08: verify_comment_on 40 -> 53, the COMMENT ON read-back (section 8).
         #   9075 + 13 exactly, so no other suite moved.
-        : "${MIN_ASSERTIONS:=9088}"
+        # 9123 since 2026-09-11: verify_plugin_fluid 759 -> 794, §35 — fluid_query_inout, the STREAMING
+        #   sibling of the fluid_query_batch collector (one render per INPUT CHUNK, bounded memory).
+        #   9088 + 35 exactly; no new suite file, so MIN_SUITES stays 76.
+        : "${MIN_ASSERTIONS:=9123}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

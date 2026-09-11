@@ -4007,3 +4007,162 @@ true	6	0
 
 statement ok
 DROP TABLE it_lat;
+
+# §35 — `fluid_query_inout`: THE STREAMING SIBLING OF THE COLLECTOR. Same body, registered on the
+# table-in-out exchange instead of the collector, so the template renders once per INPUT CHUNK and that
+# chunk's rows are emitted before the next is read. What it buys is BOUNDED MEMORY — the collector must
+# buffer the WHOLE input before its first render, inherent to a collector and true even at a small
+# batchsize. What it costs is the whole-input render, which is why there is no `batchsize` here: this
+# operator's all-input-done hook is handed no DataChunk, so output held back until EOF is drained and
+# discarded, and a group that spans chunks is therefore inexpressible.
+#
+# ⚠ It shares FluidRelationInput with the collector — the schema probe, the projection wrapper, the drift
+# check and the publish refusal are ONE implementation, extracted when this surface arrived rather than
+# copied, because a second copy of those four is what would drift.
+
+statement ok
+SET fluid_template_root = '';
+
+# --- BOTH ARE TABLE FUNCTIONS, pinned as a pair so a registration that lost one is visible.
+query TT
+SELECT function_name, function_type FROM duckdb_functions()
+WHERE function_name IN ('fluid_query_batch', 'fluid_query_inout') GROUP BY 1, 2 ORDER BY 1;
+----
+fluid_query_batch	table
+fluid_query_inout	table
+
+query II
+SELECT n, dbl FROM fluid_query_inout(
+  'SELECT n, n * 2 AS dbl FROM input_table',
+  (SELECT * FROM (VALUES (1), (2), (3)) t(n))) ORDER BY n;
+----
+1	2
+2	4
+3	6
+
+# --- ⚠⚠ THE DEFINING CONTRAST, and the only row that distinguishes the two operators: over the SAME input
+# the in-out renders MANY times and the collector ONCE. The template reports its own input size, so each
+# output row IS one render. `max <= 2048` pins that a render never sees more than one DuckDB chunk, and the
+# sum pins that no row is lost or double-counted across them. The exact render COUNT is deliberately not
+# asserted — how the input divides into chunks is DuckDB's business.
+query III
+SELECT count(*) > 1, sum(chunk_rows)::BIGINT, max(chunk_rows) <= 2048
+FROM fluid_query_inout(
+  'SELECT (SELECT count(*) FROM input_table)::BIGINT AS chunk_rows',
+  (SELECT * FROM range(5000) t(n)));
+----
+true	5000	true
+
+query II
+SELECT count(*), sum(chunk_rows)::BIGINT
+FROM fluid_query_batch(
+  'SELECT (SELECT count(*) FROM input_table)::BIGINT AS chunk_rows',
+  (SELECT * FROM range(5000) t(n)));
+----
+1	5000
+
+# --- ⚠⚠ AN EMPTY INPUT RENDERS NOTHING HERE AND ONCE ON THE COLLECTOR — a real divergence, pinned as a
+# PAIR so neither half can be read as an accident. With no rows there are no chunks, and a render is per
+# chunk; the collector renders once because a template is a statement GENERATOR whose output need not
+# depend on the rows. A caller who needs the generator to fire regardless wants the collector.
+query II
+SELECT
+  (SELECT count(*) FROM fluid_query_inout('SELECT 1 AS x', (SELECT * FROM range(0) t(n)))),
+  (SELECT count(*) FROM fluid_query_batch('SELECT 1 AS x', (SELECT * FROM range(0) t(n))));
+----
+0	1
+
+# --- The params bag, the same STRUCT/MAP/JSON one every other surface takes.
+query I
+SELECT scaled FROM fluid_query_inout(
+  'SELECT n * {{ params.mul }} AS scaled FROM input_table',
+  (SELECT * FROM (VALUES (2), (5)) t(n)), params := {'mul': 10}) ORDER BY scaled;
+----
+20
+50
+
+# --- ⚠⚠ SQL STATE CARRIES BETWEEN CHUNKS, LIQUID STATE DOES NOT — the same split the collector measures
+# per group, and for the same reason: one session and one TemplateContext per EXECUTION, but Fluid renders
+# into a child scope and pops it. The temp-table counter climbing while the Liquid counter stays at 1 is
+# what makes this a measurement rather than two unrelated assertions.
+query II
+SELECT ctr, liq FROM fluid_query_inout(
+  '{% exec %}CREATE TEMP TABLE IF NOT EXISTS c35(k INTEGER); INSERT INTO c35 VALUES (1);{% endexec %}
+   {% assign l = 0 %}{% assign l = l | plus: 1 %}
+   SELECT (SELECT count(*) FROM c35)::BIGINT AS ctr, {{ l }}::BIGINT AS liq',
+  (SELECT * FROM range(5000) t(n))) ORDER BY ctr;
+----
+1	1
+2	1
+3	1
+
+# --- ⚠⚠ THE ROW THAT KILLS A STALE `input_table`: both access paths, per chunk, and they must AGREE. The
+# SQL count comes from the temp table and the `.size` from the Liquid value, which CACHES — so a build that
+# created the table once, or bound the lazy value once, serves the FIRST chunk's rows to every later render
+# and the two numbers stop tracking each other. `max(sql_n) > 1` is the control that there really was more
+# than one chunk; without it a single-chunk run would satisfy the agreement vacuously.
+query III
+SELECT bool_and(sql_n = fluid_n), max(sql_n) > 1, sum(sql_n)::BIGINT
+FROM fluid_query_inout(
+  'SELECT (SELECT count(*) FROM input_table)::BIGINT AS sql_n, '
+  || '{{ input_table.size }}::BIGINT AS fluid_n FROM input_table LIMIT 1',
+  (SELECT * FROM range(5000) t(n)));
+----
+true	true	5000
+
+# --- Projection: the caller's narrowed SELECT list reaches the wrapper, and the template is TOLD what it
+# is. Not bound during the schema probe — there is no projection until the bind — so the template branches
+# on is_bind, which is also what makes this row exercise both renders.
+query I
+SELECT b FROM fluid_query_inout(
+  'SELECT n AS a, n * 2 AS b, n * 3 AS c FROM input_table',
+  (SELECT * FROM (VALUES (1), (2)) t(n))) ORDER BY b;
+----
+2
+4
+
+query I
+SELECT cols FROM fluid_query_inout(
+  '{% if is_bind %}SELECT 0::BIGINT AS cols{% else %}'
+  || 'SELECT {{ projected | size }}::BIGINT AS cols FROM input_table LIMIT 1{% endif %}',
+  (SELECT * FROM (VALUES (1)) t(n)));
+----
+1
+
+# --- ⚠⚠ DRIFT IS CAUGHT BY TWO DIFFERENT MECHANISMS, and which one fires depends on HOW the render
+# drifted — worth pinning as a pair, because the first row alone would leave the second mechanism untested
+# and a reader would assume one check covers both. The template renders anew per chunk and may legitimately
+# render DIFFERENT SQL, so a chunk producing a different shape is reachable from an ordinary template; the
+# host builds its converters from the DECLARED schema, so an unchecked mismatch is read as DATA. The
+# temp-table counter is what makes the SECOND render differ from the first.
+#
+# A RENAMED column is caught by the WRAPPER, which selects the declared names from the generated statement
+# — so the inner bind fails naming the column, before any row is produced.
+statement error
+SELECT * FROM fluid_query_inout(
+  '{% exec %}CREATE TEMP TABLE IF NOT EXISTS d35(k INTEGER); INSERT INTO d35 VALUES (1);{% endexec %}'
+  || '{% query c %}SELECT count(*) AS n FROM d35{% endquery %}'
+  || 'SELECT 1::BIGINT AS {% if c[0].n > 1 %}drifted{% else %}first{% endif %}',
+  (SELECT * FROM range(5000) t(n)));
+----
+not found in FROM clause
+
+# A RETYPED column keeps its name, so the wrapper binds happily and only Verify can see it. This is the row
+# that gates Verify itself.
+statement error
+SELECT * FROM fluid_query_inout(
+  '{% exec %}CREATE TEMP TABLE IF NOT EXISTS e35(k INTEGER); INSERT INTO e35 VALUES (1);{% endexec %}'
+  || '{% query c %}SELECT count(*) AS n FROM e35{% endquery %}'
+  || '{% if c[0].n > 1 %}SELECT 1::VARCHAR AS v{% else %}SELECT 1::BIGINT AS v{% endif %}',
+  (SELECT * FROM range(5000) t(n)));
+----
+Every chunk must produce
+
+# --- publish() is refused here for the same measured reason as on the collector: this surface runs the
+# rendered statement on the template's OWN connection, so scanning a publication re-enters it mid-query and
+# DEADLOCKS rather than raising the one-live-result error. Refused by name, so the hang is unreachable.
+statement error
+SELECT * FROM fluid_query_inout('SELECT * FROM {{ publish("x") }}',
+                                (SELECT * FROM (VALUES (1)) t(n)));
+----
+publish() cannot be used here

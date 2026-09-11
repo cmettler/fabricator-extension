@@ -50,6 +50,14 @@ public sealed class FluidPluginBackend : IProvider
     public IEnumerable<ICollectorFunction> GlobalCollectorFunctions =>
         new ICollectorFunction[] { new FluidQueryBatchFunction() };
 
+    // ⚠ The STREAMING sibling of the collector: the same body on the table-in-out exchange, rendering once
+    // per INPUT CHUNK so only one chunk is held at a time. A SEPARATE registration and not a mode, because
+    // `kind` is fixed at registration — one name cannot switch operators by parameter. What it cannot do is
+    // the collector's whole-input render: this operator's all-input-done hook is handed no DataChunk, so
+    // output held back until EOF is drained and discarded. Hence no `batchsize` here.
+    public IEnumerable<IInOutFunction> GlobalInOutFunctions =>
+        new IInOutFunction[] { new FluidQueryInOutFunction() };
+
     // ⚠ The CORRELATED sibling of the collector, and a different operator rather than a mode of it: `kind` is
     // fixed at registration, so one name could not switch between them by parameter. It is PARALLEL, which is
     // what it buys and also what costs it the collector's cross-chunk state.
