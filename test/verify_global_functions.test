@@ -591,3 +591,104 @@ query IT
 SELECT count(*), min(tag) FROM fabricator_inout_va((SELECT * FROM range(4) t(n)), 'agg');
 ----
 4	agg
+
+# ---- AN ABANDONED GATE TENURE IS RELEASED AT PIPELINE TEARDOWN ----
+#
+# ⚠⚠ THIS WAS A DEADLOCK, reachable from the most ordinary SQL there is. The exchange operator holds its
+# gate across a HAVE_MORE_OUTPUT return and releases it only on its NEXT invocation (SENTINEL/END) — so a
+# LIMIT satisfied before it is pulled again ABANDONS the tenure, and the finalize hook then blocks on it.
+# The fix releases from the in-out's local-state destructor, which three MEASUREMENTS say is the right
+# place: a local state dies BEFORE OperatorFinalize, it dies ON THE THREAD THAT TOOK ITS OWN LOCK (which is
+# what makes unlock() there legal at all), and FinishEof runs on a FOREIGN thread.
+#
+# ⚠ NOT "any bare LIMIT": the trigger is a limit satisfied before the operator is pulled again. Over four
+# rows, LIMIT 1 and LIMIT 4 fail while LIMIT 10 does not — so the first two are the repro and the rest are
+# controls, and a build that only ever released on the END path passes the controls happily.
+query IT
+SELECT n, tag FROM fabricator_inout_va((SELECT * FROM range(4) t(n)), 'base') LIMIT 1;
+----
+0	base
+
+# the BOUNDARY: the limit is satisfied exactly at the batch, so the operator is still never pulled again.
+query I
+SELECT count(*) FROM (SELECT n FROM fabricator_inout_va((SELECT * FROM range(4) t(n)), 'base') LIMIT 4);
+----
+4
+
+# CONTROL — LIMIT past the end. The operator IS pulled again, hits END and releases the tenure itself, which
+# is the path that always worked; without this row the two above could pass on a build that had simply
+# stopped streaming.
+query I
+SELECT count(*) FROM (SELECT n FROM fabricator_inout_va((SELECT * FROM range(4) t(n)), 'base') LIMIT 10);
+----
+4
+
+# CONTROL — ORDER BY is a pipeline BREAKER, so the in-out is drained to END before the limit applies. This
+# is the spelling every other suite happens to use, which is exactly why none of them caught the deadlock.
+query IT
+SELECT n, tag FROM fabricator_inout_va((SELECT * FROM range(4) t(n)), 'base') ORDER BY n LIMIT 1;
+----
+0	base
+
+statement ok
+SET threads = 8;
+
+# ⚠⚠ THE LOAD-BEARING ROW, and the one an earlier attempt at this fix would have FAILED. That attempt had
+# FinishEof recognise and adopt its own tenure, which works only when the finalize hook runs on the holding
+# thread — MEASURED to be the minority case. Here the tenure is abandoned on a branch thread while finalize
+# runs on a different one, so an owner-based fix does not merely miss it: it BLOCKS, turning a loud error
+# into a silent hang. A single-branch probe cannot see any of that.
+query I
+SELECT count(*) FROM (
+  SELECT n FROM fabricator_inout_va((SELECT * FROM range(300) t(n)), 'a')
+  UNION ALL
+  SELECT n FROM fabricator_inout_va((SELECT * FROM range(300) t(n)), 'b')
+  UNION ALL
+  SELECT n FROM fabricator_inout_va((SELECT * FROM range(300) t(n)), 'c')
+  LIMIT 5
+);
+----
+5
+
+# ⚠⚠ NOTE WHAT THE ROW ABOVE DOES **NOT** TEST, because the obvious reading is wrong: a UNION of SEPARATE
+# in-out CALLS gives each call its OWN gate, so those branches never contend. MEASURED — instrumenting the
+# lock with (gate address, thread id) showed THREE gates, one thread each. It is still load-bearing for the
+# FOREIGN-THREAD property (three separate finalizes, each on a thread that is not the holder), but it says
+# nothing about contention, and a gate that claimed otherwise would be the vacuous kind.
+#
+# ⚠⚠ THIS is the contended shape: a multi-branch UNION ALL as the INPUT to ONE call — ONE gate, several
+# branch pipelines. MEASURED on the same instrument: ONE gate, THREE distinct threads. It is also the shape
+# the table-in-out work found problematic originally (`PhysicalUnion::BuildPipelines` may run branches
+# SEQUENTIALLY, so a test here proves nothing unless the contention is verified rather than assumed).
+query I
+SELECT count(*) FROM fabricator_inout_va((
+  SELECT n FROM range(200) t(n)
+  UNION ALL
+  SELECT n FROM range(200) t(n)
+  UNION ALL
+  SELECT n FROM range(200) t(n)), 'x');
+----
+600
+
+# ⚠⚠ AND THE SHARP ONE: a LIMIT cuts that contended input short, so a tenure is abandoned WHILE OTHER BRANCH
+# THREADS ARE BLOCKED INSIDE gate.lock(). That is the case where an unreleased tenure could deadlock teardown
+# against a blocked branch, and it is the reason the release must happen at local-state destruction.
+query I
+SELECT count(*) FROM (SELECT n FROM fabricator_inout_va((
+  SELECT n FROM range(400) t(n) UNION ALL SELECT n FROM range(400) t(n)
+  UNION ALL SELECT n FROM range(400) t(n) UNION ALL SELECT n FROM range(400) t(n)), 'x') LIMIT 37);
+----
+37
+
+# ⚠ And the gate still SERIALIZES under that real contention — the fix adds a release path, so a regression
+# would show as interleaved or lost branches rather than as a failure. The sum is exact or it is broken.
+query II
+SELECT count(*), sum(n) FROM fabricator_inout_va((
+  SELECT n FROM range(500) t(n)
+  UNION ALL
+  SELECT n FROM range(500) t(n)), 'x');
+----
+1000	249500
+
+statement ok
+RESET threads;

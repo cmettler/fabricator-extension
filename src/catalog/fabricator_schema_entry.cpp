@@ -2328,7 +2328,31 @@ struct FabricatorExchangeBindData : public TableFunctionData {
 };
 
 struct FabricatorExchangeLocalState : public LocalTableFunctionState {
+	FabricatorExchangeGlobalState *gstate = nullptr; // set at init_local; outlives every local state
 	bool owns_gate = false; // this thread holds the gate for the current input chunk's cycle
+
+	//! ⚠⚠ RELEASES AN ABANDONED TENURE, and without it an early-stopped pipeline DEADLOCKS OR HANGS.
+	//!
+	//! The operator holds the gate across a HAVE_MORE_OUTPUT return and releases it only on its NEXT
+	//! invocation (SENTINEL/END) — so a LIMIT satisfied before it is pulled again leaves the tenure open
+	//! forever, and `FinishEof` then blocks on it. MEASURED: `SELECT … FROM my_inout(…) LIMIT 1`.
+	//!
+	//! ⚠ THREE FACTS MAKE THIS THE RIGHT RELEASE POINT, and all three were MEASURED rather than assumed,
+	//! because the obvious alternative (have FinishEof recognise and adopt its own tenure) was built and is
+	//! STRICTLY WORSE — it fixes nothing in the common case and converts the error into a HANG:
+	//!   1. a local state is destroyed BEFORE the finalize operator's OperatorFinalize runs, so the gate is
+	//!      already free when FinishEof arrives;
+	//!   2. it is destroyed ON THE THREAD THAT TOOK ITS OWN LOCK — which is what makes unlock() here legal
+	//!      at all, since a std::mutex may only be unlocked by its owner;
+	//!   3. FinishEof runs on a FOREIGN thread (measured: `verify_plugin_fluid`, 15 calls, never the
+	//!      holder), which is exactly why an owner-adoption fix could not work.
+	//! See docs/fluid-templating.md §37.5-§37.7.
+	~FabricatorExchangeLocalState() override {
+		if (owns_gate && gstate) {
+			owns_gate = false;
+			gstate->gate.unlock();
+		}
+	}
 };
 
 // Host-side INPUT stream callbacks. private_data == the global state. Only the current gate-holder sets the
@@ -2522,8 +2546,11 @@ unique_ptr<GlobalTableFunctionState> FabricatorExchangeInitGlobal(ClientContext 
 }
 
 unique_ptr<LocalTableFunctionState> FabricatorExchangeInitLocal(ExecutionContext &, TableFunctionInitInput &,
-                                                              GlobalTableFunctionState *) {
-	return make_uniq<FabricatorExchangeLocalState>();
+                                                              GlobalTableFunctionState *global_state) {
+	auto state = make_uniq<FabricatorExchangeLocalState>();
+	// The destructor needs it to release an abandoned tenure; the global state outlives every local state.
+	state->gstate = &global_state->Cast<FabricatorExchangeGlobalState>();
+	return std::move(state);
 }
 
 // The gate-based operator. The gate is held across the whole chunk cycle (multiple Execute calls during

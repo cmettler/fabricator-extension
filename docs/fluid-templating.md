@@ -4128,14 +4128,61 @@ locked it, and this gate is not a critical section — it is a **TOKEN acquired 
 released in a LATER one**, whose holder may never run again. No amount of owner tracking fixes an abandoned
 token, because the only thread permitted to release it is the one that will not run.
 
-⇒ a real fix needs a different primitive: `mutex` + `condition_variable` + a `taken` flag, which ANY thread
-may release. `FinishEof` can then reclaim an abandoned token — safe at `OperatorFinalize`, where every input
-pipeline has completed and no operator call is in flight — and thread identity drops out of the design.
-
-⚠ **A gate for it MUST include the FOREIGN-thread case** — a `LIMIT` over a parallel `UNION ALL`, repeated.
-A single-branch probe cannot see it, and that is precisely what made the first attempt look correct: the
-`LIMIT` battery, the parallel-serialization check and `verify_global_functions` were all green while the
-fluid suite hung.
+⇒ the conclusion drawn at the time was that a real fix needs a different PRIMITIVE — `mutex` +
+`condition_variable` + a `taken` flag, releasable by ANY thread. **That turned out to be unnecessary; see
+§37.7, where two further measurements produced a smaller fix.** What survives from this section is the
+diagnosis, not the prescription.
 
 ⚠⚠ On glibc the same-thread re-lock is UNDEFINED BEHAVIOUR rather than a thrown error, so the Linux symptom
 is likely worse than the Windows one — the same asymmetry recorded for `entry_lock_`.
+
+### 37.7 ✅ THE FIX: release the abandoned tenure from the LOCAL STATE DESTRUCTOR
+
+No new primitive, no thread-identity assumption, and `FinishEof` untouched. `FabricatorExchangeLocalState`
+gained a pointer to its global state and a destructor that unlocks the gate when `owns_gate` is still set.
+
+**THREE MEASUREMENTS MAKE IT THE RIGHT RELEASE POINT, and none of them had been taken before:**
+
+| measured | why it matters |
+|---|---|
+| a local state is destroyed **BEFORE** `OperatorFinalize` | the gate is already free when `FinishEof` arrives, so nothing has to reclaim it |
+| it is destroyed **ON THE THREAD THAT TOOK ITS OWN LOCK** (3/3 single-branch, 3/3 parallel) | this is what makes `unlock()` there LEGAL — a `std::mutex` may only be unlocked by its owner |
+| `FinishEof` runs on a **FOREIGN** thread | the reason §37.6's owner-adoption could never work, restated as a positive result |
+
+⚠⚠ **THE SECOND ROW IS THE ONE THAT DECIDES BETWEEN THE TWO DESIGNS.** Had the destructor run on a foreign
+thread, `std::mutex` would have been unusable there too and the condvar token of §37.6 would have been
+required. It does not, so the token change — a concurrency-primitive swap in the exchange operator — was
+avoided entirely. **Measure the release point before designing the release mechanism.**
+
+**⚠⚠ A STRUCTURAL FACT THE PARALLEL TRACE EXPOSED, worth having before reasoning about this operator again:
+each `my_inout(…)` call in a UNION is a SEPARATE table function instance with its OWN gate.** The trace
+showed three threads each holding `owns_gate = 1` at once, which is impossible for one mutex — so branches of
+a union do not contend with each other at all, and the gate serializes WITHIN one call. Three separate
+finalizes, three separate gates.
+
+**Gate:** `verify_global_functions` 178 → **189**. One mutant (empty the destructor body) dies at the
+`LIMIT 1` repro row after 178 pass, reproducing the original `resource deadlock would occur`.
+
+⚠ **One load-bearing row is the FOREIGN-THREAD one** — a `LIMIT` over a `UNION ALL` of separate calls —
+because it is the row §37.6's attempt would have failed. Every single-branch probe was green while that
+attempt hung the fluid suite, so a gate without this row would certify the broken fix again.
+
+⚠⚠ **BUT THAT ROW DOES NOT TEST CONTENTION, AND THE FIRST VERSION OF THIS GATE CLAIMED IT DID.** A `UNION`
+of SEPARATE in-out calls gives each call its OWN gate — MEASURED by instrumenting the lock with (gate
+address, thread id): **THREE gates, one thread each**. So those branches never compete, and a row described
+as "the gate serializing parallel branches" was asserting something it could not observe.
+
+⚠⚠ **THE CONTENDED SHAPE IS A MULTI-BRANCH UNION AS THE *INPUT* TO ONE CALL** — one gate, several branch
+pipelines. Same instrument: **ONE gate, THREE distinct threads.** That is also the shape the original
+table-in-out work found problematic, and it is where the sharpest case lives: a `LIMIT` cutting a contended
+input short abandons a tenure **while other branch threads are blocked inside `gate.lock()`**, which is
+precisely what could deadlock teardown against a blocked branch. MEASURED: 20/20 clean at six branches and
+`threads = 8`, plus 10/10 on the three-branch form.
+
+⚠ **AND THE CONTENTION MUST BE VERIFIED, NEVER ASSUMED**, because `PhysicalUnion::BuildPipelines` may run
+branches SEQUENTIALLY — a passing test over a union that happened to run on one thread proves nothing. The
+(gate, tid) instrument is the cheap way to establish it; without it this gate would have been the vacuous
+kind twice over.
+
+⚠ The two controls (`LIMIT` past the end, and `ORDER BY … LIMIT`) are not decoration: they are the paths that
+ALWAYS worked, so a build that released only on the END path passes them happily and fails the repro rows.

@@ -614,7 +614,15 @@ case "$TIER" in
         #   rows can catch an off-by-one in the wire map). 9123 + 16 + 14 exactly, so no other suite moved;
         #   MIN_SUITES stays 76. Service unchanged at 59/59 -- 3483, which is the behaviour-neutrality
         #   claim for the `_each` forms and the collector, both reached by the same registration change.
-        : "${MIN_ASSERTIONS:=9153}"
+        # 9164 since 2026-09-12: verify_global_functions 178 -> 189 — an abandoned in-out GATE TENURE is
+        #   released at pipeline teardown, so a LIMIT satisfied before the operator is pulled again no
+        #   longer deadlocks (it did on every streaming in-out, `_each` forms included). 9153 + 11 exactly.
+        #   ⚠ Its load-bearing rows are (a) the FOREIGN-THREAD case — a LIMIT over a UNION of SEPARATE
+        #   calls, which an earlier fix would have failed while passing every single-branch probe — and
+        #   (b) the CONTENDED case, a multi-branch UNION as the INPUT to ONE call. ⚠⚠ Those are DIFFERENT
+        #   shapes: (a) gives each call its OWN gate (measured: 3 gates, 1 thread each) and tests no
+        #   contention at all, while (b) is ONE gate with 3 threads. 9153 + 13 exactly.
+        : "${MIN_ASSERTIONS:=9166}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh
