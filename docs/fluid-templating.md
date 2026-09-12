@@ -4092,20 +4092,50 @@ beside it as the control) and the `projected` variable itself.
 where `min(q) FROM (SELECT p AS q, a FROM …)` still narrowed to `p` alone because DuckDB prunes `a` straight
 through the subquery. Both columns have to be CONSUMED for a row to exercise the unnarrowed path.
 
-### 37.5 ⚠⚠ A pre-existing deadlock this work found and did NOT fix
+### 37.5 ⚠⚠ A pre-existing deadlock this work found, and an attempted fix that was measured WRONG
 
-A bare `LIMIT` above ANY streaming in-out — no projection involved — fails with **`Invalid Error: resource
+A `LIMIT` above ANY streaming in-out — no projection involved — fails with **`Invalid Error: resource
 deadlock would occur`**. MEASURED on `fluid_query_inout` and on `fabricator_inout_va`, and **reproduced on a
 binary built from HEAD with this change absent**, which is what attributes it elsewhere.
 
-The operator returns `HAVE_MORE_OUTPUT` while holding `FabricatorExchangeGlobalState::gate`; a `LIMIT`
-satisfies itself and the pipeline stops pulling, so the gate is never released, and `OperatorFinalize` →
-`ExchangeHolder::Finish` → `FinishEof` takes `lock_guard<mutex>` on that same gate from the same thread.
+The operator returns `HAVE_MORE_OUTPUT` while holding `FabricatorExchangeGlobalState::gate` and releases it
+only on its NEXT invocation (SENTINEL or END), so a pipeline that stops early ABANDONS the tenure;
+`OperatorFinalize` → `ExchangeHolder::Finish` → `FinishEof` then tries to take that same gate.
 
-⚠ `ORDER BY … LIMIT` is FINE and is the reason this went unnoticed: an `ORDER BY` is a pipeline breaker, so
-the in-out is drained fully before the limit applies. Only a BARE limit cuts the pipeline mid-stream.
+⚠⚠ **NOT "any bare `LIMIT`", which is how this was first written down.** The trigger is a limit satisfied
+BEFORE the operator is pulled again. MEASURED over a 4-row input: `LIMIT` 1, 3 and 4 all fail, and
+**`LIMIT 10` is FINE** — the operator is pulled again, hits END, and releases the tenure itself.
+`ORDER BY … LIMIT` is fine for the same reason: a pipeline breaker drains the in-out to END before the limit
+applies, which is the spelling every suite happens to use and why none of them caught this.
 
-⚠⚠ MSVC's `std::mutex` detects the same-thread re-lock and throws. **Re-locking a non-recursive mutex is
-UNDEFINED BEHAVIOUR on glibc and typically HANGS**, so the Linux symptom is probably worse than the Windows
-one — the same asymmetry recorded for `entry_lock_`. Not fixed here: it is pre-existing, generic to the
-exchange, and belongs in its own change with its own gate.
+### 37.6 ⚠⚠ The owner-tracking fix: BUILT, MEASURED INSUFFICIENT, REVERTED
+
+The obvious fix is to record which thread holds the gate so `FinishEof` can ADOPT its own tenure instead of
+re-locking. It was built (2026-09-12) and reverted, and the reason is worth more than the code was.
+
+**There are TWO shapes, and the first write-up asserted only one.**
+
+| who runs `FinishEof` | symptom | measured on |
+|---|---|---|
+| the thread HOLDING the tenure | `EDEADLK` — MSVC detects the same-thread re-lock and throws | single-branch `fabricator_inout_va … LIMIT 1`, thread-id probe: `op LOCK tid=N`, no unlock, `FinishEof WANTS gate tid=N` |
+| a DIFFERENT thread | blocks forever on a tenure nobody will release — a silent **HANG** | the whole of `verify_plugin_fluid`: **15 `FinishEof` calls, `owns=1` ZERO times** |
+
+⚠⚠ So owner tracking fixes the loud case and converts the silent one from an error into a hang — measured,
+the fluid suite hung at 400 s where it had merely failed. **Strictly worse than the bug.**
+
+⚠⚠ **THE PRIMITIVE IS THE PROBLEM, NOT THE TRACKING.** `std::mutex` may only be unlocked by the thread that
+locked it, and this gate is not a critical section — it is a **TOKEN acquired in one `Execute` call and
+released in a LATER one**, whose holder may never run again. No amount of owner tracking fixes an abandoned
+token, because the only thread permitted to release it is the one that will not run.
+
+⇒ a real fix needs a different primitive: `mutex` + `condition_variable` + a `taken` flag, which ANY thread
+may release. `FinishEof` can then reclaim an abandoned token — safe at `OperatorFinalize`, where every input
+pipeline has completed and no operator call is in flight — and thread identity drops out of the design.
+
+⚠ **A gate for it MUST include the FOREIGN-thread case** — a `LIMIT` over a parallel `UNION ALL`, repeated.
+A single-branch probe cannot see it, and that is precisely what made the first attempt look correct: the
+`LIMIT` battery, the parallel-serialization check and `verify_global_functions` were all green while the
+fluid suite hung.
+
+⚠⚠ On glibc the same-thread re-lock is UNDEFINED BEHAVIOUR rather than a thrown error, so the Linux symptom
+is likely worse than the Windows one — the same asymmetry recorded for `entry_lock_`.
