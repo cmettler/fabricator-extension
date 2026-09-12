@@ -608,7 +608,13 @@ case "$TIER" in
         # 9123 since 2026-09-11: verify_plugin_fluid 759 -> 794, §35 — fluid_query_inout, the STREAMING
         #   sibling of the fluid_query_batch collector (one render per INPUT CHUNK, bounded memory).
         #   9088 + 35 exactly; no new suite file, so MIN_SUITES stays 76.
-        : "${MIN_ASSERTIONS:=9123}"
+        # 9153 since 2026-09-12: projection pushdown through the STREAMING in-out exchange --
+        #   verify_plugin_fluid 794 -> 810 (§36, the callee that HONOURS the hint) and
+        #   verify_global_functions 164 -> 178 (§the callee that IGNORES it, which is the only one whose
+        #   rows can catch an off-by-one in the wire map). 9123 + 16 + 14 exactly, so no other suite moved;
+        #   MIN_SUITES stays 76. Service unchanged at 59/59 -- 3483, which is the behaviour-neutrality
+        #   claim for the `_each` forms and the collector, both reached by the same registration change.
+        : "${MIN_ASSERTIONS:=9153}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

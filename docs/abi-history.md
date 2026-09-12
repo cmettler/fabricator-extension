@@ -80,8 +80,17 @@ Full record + the corrections above: [provider-query-parameters.md](provider-que
 
 **User-asked** right after v86: the collector half of the same feature. `inout_exchange_open` takes
 `(const int32_t *projected, int32_t projected_count)` — the only crossing between `inout_bind` and the first
-output pull. Advertised for COLLECTORS ONLY; the streaming exchange passes an empty projection, so the two
-paths stay distinguishable at the call site.
+output pull. Advertised for COLLECTORS ONLY at the time; the streaming exchange passed an empty projection,
+so the two paths stayed distinguishable at the call site.
+
+> **⚠ SUPERSEDED 2026-09-12 — THE STREAMING EXCHANGE ADVERTISES IT TOO, AND NO ABI VERSION MOVED.** The
+> entry has carried the argument since this version and the managed pump has always forwarded it; what was
+> missing was on the HOST side only — `tf.projection_pushdown` was `is_collector`, so a streaming in-out's
+> get was never narrowed and there was nothing to hint. Both exchange registrations now set the flag (the
+> global one, and the catalog-bound one every provider-declared `_each` resolves through), so the sentence
+> "for collectors" describes this version's scope and not today's behaviour. Nothing about the crossing
+> changed, which is why this is a note here rather than a v89.
+
 
 **⚠⚠ One thing differs from v86 and it needed an extra member.** A lateral returns a fresh stream per
 `lateral_call`, so the host can tell a narrowed answer from a full one by looking at a batch. A collector's

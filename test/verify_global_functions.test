@@ -542,3 +542,52 @@ query T
 SELECT DISTINCT tag FROM fabricator_inout_va((SELECT 1 AS n), 'base', note := 'only_named');
 ----
 base/only_named
+
+# ---- PROJECTION PUSHDOWN ON THE STREAMING EXCHANGE: the callee that IGNORES the hint ----
+#
+# ⚠⚠ THIS IS THE SECTION THAT TESTS THE WIRE MAP, and it is the only one that can. A hint is a HINT: a
+# callee may honour it and declare the narrow schema (fluid_query_inout does — verify_plugin_fluid §36), or
+# ignore it and keep producing its full width, in which case the HOST picks the projected columns out of the
+# wire. fabricator_inout_va overrides neither DIM, so it takes the second path — and because a callee that
+# honours the hint has an IDENTITY map, its own rows can never catch an off-by-one. This one can.
+#
+# The two columns are deliberately of DIFFERENT TYPES (BIGINT n, VARCHAR tag): reading `tag` alone narrows to
+# wire column 1, so a build that dropped the map and drained straight through would put n's BIGINT into the
+# single VARCHAR output slot.
+query T
+SELECT DISTINCT tag FROM fabricator_inout_va((SELECT * FROM range(3) t(n)), 'base', 7, 'x');
+----
+base:7+x
+
+# The other side of the map: reading `n` alone narrows to wire column 0. Both directions, because a map that
+# is simply the identity would pass the first row and fail here.
+query I
+SELECT n FROM fabricator_inout_va((SELECT * FROM range(3) t(n)), 'base') ORDER BY n;
+----
+0
+1
+2
+
+# THE CONTROL, and it is load-bearing: with every column read there is NO projection, so the drain goes
+# straight through. Without it the two rows above would be equally true of a build where the exchange had
+# stopped producing its second column at all.
+query IT
+SELECT n, tag FROM fabricator_inout_va((SELECT * FROM range(3) t(n)), 'base') ORDER BY n;
+----
+0	base
+1	base
+2	base
+
+# A column read TWICE and one read not at all — the narrowed list is not a prefix, and the same wire column
+# feeds two output slots.
+query TT
+SELECT tag, tag FROM fabricator_inout_va((SELECT 1 AS n), 'base', 5);
+----
+base:5	base:5
+
+# An AGGREGATE over one column: the shape where DuckDB prunes hardest, and the count must still be the input
+# row count rather than whatever the narrowed drain happened to set as its cardinality.
+query IT
+SELECT count(*), min(tag) FROM fabricator_inout_va((SELECT * FROM range(4) t(n)), 'agg');
+----
+4	agg

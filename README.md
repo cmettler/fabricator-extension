@@ -2162,6 +2162,11 @@ FROM fluid_query_inout(
 >
 > Everything else matches: `params`, `input_table` as both a temp table and a Liquid value, `is_bind`,
 > projection, the refusal of `publish()`, and SQL state carrying between renders while Liquid state does not.
+>
+> ⚠ **It only computes the columns you select**, as on the other two surfaces: the generated statement is
+> narrowed to the columns your query actually reads, so an expensive expression in a column you did not
+> select is never evaluated, and the template can read the list as `projected` (unset during the schema
+> probe, so branch on `is_bind`).
 
 **`is_bind` is true for exactly one render: the one that determines the output columns.** DuckDB needs a
 table function's schema before it runs anything, so the template is rendered once against an *empty*

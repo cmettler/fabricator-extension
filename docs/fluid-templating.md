@@ -3545,8 +3545,9 @@ structurally simpler, because a collector has no correlated columns. Gate `verif
 
 `inout_exchange_open` gains `(projected, count)` — the only crossing between `inout_bind` and the first
 output pull, exactly as `lateral_open` was for §24. Still a HINT; still discriminated so a collector that
-knows nothing about it keeps working. Advertised for COLLECTORS ONLY: the streaming exchange passes an empty
-projection, so the two paths stay distinguishable at the call site.
+knows nothing about it keeps working. Advertised for COLLECTORS ONLY at the time: the streaming exchange
+passed an empty projection, so the two paths stayed distinguishable at the call site. **⚠ That last sentence
+is SUPERSEDED — see §37, which gave the streaming exchange the same hint with no ABI change.**
 
 ⚠⚠ **The difference is WHERE the shape is declared.** A lateral's result is a fresh stream per `Call`, so the
 host could tell the two shapes apart by looking at a batch. A collector's output crosses as ONE stream whose
@@ -4028,3 +4029,83 @@ check covered both — mutant 3 (drop the drift check) survives the first row an
 ⚠ The first two die on DIFFERENT rows and for different reasons, which is what separates "the temp table is
 stale" from "the Liquid value is stale" — the agreement row alone could not, because a build where BOTH are
 stale still reports them as agreeing. The `sum` and the `max(sql_n) > 1` control are what catch that.
+
+---
+
+## 37. Projection pushdown through the STREAMING IN-OUT (2026-09-12)
+
+User-asked after reading §30 back and finding the hint listed among what `fluid_query_inout` shares with the
+collector: **it was wired and inert.** C++-only, **no ABI change** — the entry has carried the argument since
+v87 and `InOutExchangeStream` has always declared `ProjectedOutputSchema(projected)` and forwarded `projected`
+to `DoExchange`. What was missing was one host-side flag.
+
+Gate `verify_plugin_fluid` 794 → **810** (§36) and `verify_global_functions` 164 → **178**; two mutants, each
+killed at its own SUITE.
+
+### 37.1 Why it was inert, and how little was missing
+
+`tf.projection_pushdown` was `is_collector`, so `RemoveColumnsFromLogicalGet` — which gates on exactly that
+flag and on nothing about `in_out_function` — never narrowed a streaming in-out's get, and
+`InOutExchangeOpen` was handed `vector<int32_t>()` at the call site. Both exchange registrations set the flag
+now: the GLOBAL one (`fluid_query_inout`, `fabricator_inout_va`) and the CATALOG-BOUND one, which is where
+every provider-declared `_each` resolves.
+
+⚠ The two registrations are separate call sites and could have been enabled independently. They were enabled
+together deliberately: the mechanism is identical, the ignore-the-hint fallback makes it safe for a callee
+that has never heard of it, and two exchange registrations disagreeing about their own optimizer contract is
+the kind of inconsistency someone trips over later.
+
+### 37.2 The rule now exists once
+
+`FabricatorProjectionHint(column_ids, output_width)` is shared by the exchange and the collector, which had
+carried its own copy. EMPTY deliberately means two things — the caller reads every column in order, or the
+get carries a column we do not declare (a virtual column, a correlated passthrough) that cannot be indexed
+into the callee's schema — because both want the same answer: send the full width.
+
+### 37.3 ⚠⚠ The gate that matters is the callee that IGNORES the hint
+
+`fluid_query_inout` HONOURS it, so its wire map is the IDENTITY and **its own rows cannot catch an
+off-by-one** — §24's lesson, reproduced exactly. The row that tests the map is in `verify_global_functions`,
+over `fabricator_inout_va`, which overrides neither DIM: two columns of DIFFERENT types (`BIGINT n`,
+`VARCHAR tag`), so reading `tag` alone narrows to wire column 1 and a build that drained straight through
+would put `n` into the single VARCHAR slot.
+
+MEASURED, and the split is the point:
+
+| mutant | `verify_plugin_fluid` | `verify_global_functions` |
+|---|---|---|
+| the global exchange stops advertising the flag | **dies** at the payoff row, 800 passed | passes 178 — no hint ⇒ full width ⇒ still correct |
+| drain by position, wire map ignored | passes **810** — identity map | **dies** at line 474, 141 passed |
+
+⚠ Mutant 2 is killed by a **PRE-EXISTING** assertion (`SELECT count(*), min(tag) FROM fabricator_inout_va`),
+because enabling pushdown made an existing row depend on the new map. The rows added here kill it too — and
+they do so with `INTERNAL Error: Attempted to dereference unique_ptr that is NULL`, so getting the map wrong
+is a CRASH rather than a wrong value.
+
+### 37.4 ⚠ What the payoff row measures, and what no row can
+
+Selecting one column proves nothing — §25's lesson, unchanged: DuckDB projects above the operator either way.
+What is asserted is the PAYOFF (an unread column holding `error()` is never evaluated, with the read-both case
+beside it as the control) and the `projected` variable itself.
+
+⚠ And the projection is **what is READ, not what the inner SELECT list says** — measured while writing §36,
+where `min(q) FROM (SELECT p AS q, a FROM …)` still narrowed to `p` alone because DuckDB prunes `a` straight
+through the subquery. Both columns have to be CONSUMED for a row to exercise the unnarrowed path.
+
+### 37.5 ⚠⚠ A pre-existing deadlock this work found and did NOT fix
+
+A bare `LIMIT` above ANY streaming in-out — no projection involved — fails with **`Invalid Error: resource
+deadlock would occur`**. MEASURED on `fluid_query_inout` and on `fabricator_inout_va`, and **reproduced on a
+binary built from HEAD with this change absent**, which is what attributes it elsewhere.
+
+The operator returns `HAVE_MORE_OUTPUT` while holding `FabricatorExchangeGlobalState::gate`; a `LIMIT`
+satisfies itself and the pipeline stops pulling, so the gate is never released, and `OperatorFinalize` →
+`ExchangeHolder::Finish` → `FinishEof` takes `lock_guard<mutex>` on that same gate from the same thread.
+
+⚠ `ORDER BY … LIMIT` is FINE and is the reason this went unnoticed: an `ORDER BY` is a pipeline breaker, so
+the in-out is drained fully before the limit applies. Only a BARE limit cuts the pipeline mid-stream.
+
+⚠⚠ MSVC's `std::mutex` detects the same-thread re-lock and throws. **Re-locking a non-recursive mutex is
+UNDEFINED BEHAVIOUR on glibc and typically HANGS**, so the Linux symptom is probably worse than the Windows
+one — the same asymmetry recorded for `entry_lock_`. Not fixed here: it is pre-existing, generic to the
+exchange, and belongs in its own change with its own gate.

@@ -2227,6 +2227,31 @@ struct FabricatorExchangeGlobalState : public GlobalTableFunctionState {
 	ClientProperties props;
 	string input_error;
 	ExchangeHolder *holder = nullptr;
+	//! This execution's projection hint (EMPTY = none) and, when the callee IGNORED it, the wire column
+	//! carrying each output column. Per EXECUTION, not per binding — unlike the collector's, which lives on
+	//! its holder because OpenExchange runs in a later phase.
+	vector<int32_t> projected;
+	vector<idx_t> wire_map;
+
+	//! Drain one slice into `output`, picking the projected columns out when the callee ignored the hint.
+	//!
+	//! ⚠ The scratch chunk is FRESH per drain and `output` REFERENCES its vectors, which keeps them alive by
+	//! refcount after it goes out of scope — the same reason the collector's DrainMapped and the lateral's
+	//! DrainOwned allocate rather than reusing a member: a reused chunk's Reset() restores the same buffers,
+	//! so the next drain would overwrite rows already handed downstream.
+	void DrainMapped(ClientContext &context, DataChunk &output) {
+		if (wire_map.empty()) {
+			reader->Drain(output); // the exchange already produced exactly these columns
+			return;
+		}
+		DataChunk wire;
+		wire.Initialize(Allocator::Get(context), reader->Types());
+		reader->Drain(wire);
+		for (idx_t c = 0; c < wire_map.size() && c < output.ColumnCount(); c++) {
+			output.data[c].Reference(wire.data[wire_map[c]]);
+		}
+		output.SetCardinality(wire.size());
+	}
 
 	idx_t MaxThreads() const override {
 		return 1; // intra-pipeline cap; parallel UNION branches are separate pipelines (serialized by the gate)
@@ -2297,6 +2322,9 @@ struct FabricatorExchangeBindData : public TableFunctionData {
 	vector<LogicalType> input_types;
 	vector<string> input_names;
 	shared_ptr<ExchangeHolder> holder;
+	//! The binding's FULL declared output width — what a narrowed column list indexes INTO. Kept because
+	//! `return_types` is the host's and is already narrowed by the time init_global runs.
+	idx_t output_width = 0;
 };
 
 struct FabricatorExchangeLocalState : public LocalTableFunctionState {
@@ -2417,7 +2445,34 @@ unique_ptr<FunctionData> FabricatorExchangeBind(ClientContext &context, TableFun
 		names.push_back(child.name ? string(child.name) : "column" + to_string(i));
 		return_types.push_back(arrow_table.GetColumns().at((idx_t)i)->GetDuckType());
 	}
+	bind_data->output_width = return_types.size();
 	return std::move(bind_data);
+}
+
+//! The narrowed column list as a projection HINT, or EMPTY for "send the full width".
+//!
+//! ⚠ EMPTY deliberately conflates two situations, because they want the same answer: the caller reads every
+//! column in order (so there is nothing to narrow), or the get carries a column we do not declare — a virtual
+//! column, or a correlated passthrough — which cannot be indexed into the callee's own schema.
+//!
+//! Shared by the streaming exchange and the collector rather than written twice: the two differ only in WHERE
+//! they stash the result, and a rule written twice is a rule that drifts.
+static vector<int32_t> FabricatorProjectionHint(const vector<column_t> &column_ids, idx_t output_width) {
+	bool identity = column_ids.size() == output_width;
+	for (idx_t i = 0; i < column_ids.size() && identity; i++) {
+		identity = column_ids[i] == i;
+	}
+	if (identity) {
+		return vector<int32_t>();
+	}
+	vector<int32_t> projected;
+	for (auto id : column_ids) {
+		if (id >= output_width) {
+			return vector<int32_t>();
+		}
+		projected.push_back((int32_t)id);
+	}
+	return projected;
 }
 
 unique_ptr<GlobalTableFunctionState> FabricatorExchangeInitGlobal(ClientContext &context,
@@ -2444,11 +2499,22 @@ unique_ptr<GlobalTableFunctionState> FabricatorExchangeInitGlobal(ClientContext 
 	// DuckDB's transaction). The id rides the per-thread ambient; also re-set in the Execute function (the
 	// connection is opened lazily on the first output pull there). See docs/transaction-concurrency.md.
 	FabricatorSetActiveTxn(nullptr, context);
-	// ⚠ NO PROJECTION: the STREAMING exchange does not advertise projection_pushdown (only the collector
-	// does), so its get is never narrowed and there is nothing to hint. Passing an empty list keeps this
-	// path byte-identical to what it was before ABI v87.
-	fabricator::InOutExchangeOpen(bind.holder->binding, input_stream, vector<int32_t>(), output_stream);
+	// ⚠ THE PROJECTION, read here because TableFunctionInitInput is the only place the narrowed column list
+	// is handed to us, and the exchange is opened in this same call — so unlike the collector there is
+	// nothing to stash it on: hint, open, and classify the reply all happen together.
+	gstate->projected = FabricatorProjectionHint(input.column_ids, bind.output_width);
+	fabricator::InOutExchangeOpen(bind.holder->binding, input_stream, gstate->projected, output_stream);
 	gstate->reader = make_uniq<fabricator::ArrowStreamReader>(context, output_stream);
+	// ⚠⚠ TWO LEGAL SHAPES, told apart by the WIDTH THE STREAM DECLARES rather than by a batch — the same rule
+	// the collector uses, and for the same reason: the schema is read before the first batch, so a callee that
+	// produces NO rows must still be classifiable. A callee that honoured the hint declares the narrow schema
+	// and the drain goes straight through; one that ignored it declares its full schema and the host picks the
+	// projected columns out, which is what lets this ship without touching a single existing in-out callee.
+	if (!gstate->projected.empty() && gstate->reader->Types().size() != gstate->projected.size()) {
+		for (auto idx : gstate->projected) {
+			gstate->wire_map.push_back((idx_t)idx);
+		}
+	}
 
 	lock_guard<mutex> guard(bind.holder->lock);
 	bind.holder->active = gstate.get();
@@ -2490,7 +2556,7 @@ OperatorResultType FabricatorExchangeFunction(ExecutionContext &context, TableFu
 		}
 		// Drain a pending output array (one C# batch may exceed STANDARD_VECTOR_SIZE).
 		if (g.reader->HasPending()) {
-			g.reader->Drain(output);
+			g.DrainMapped(context.client, output);
 			return OperatorResultType::HAVE_MORE_OUTPUT;
 		}
 		auto pr = g.reader->Pull();
@@ -2506,7 +2572,7 @@ OperatorResultType FabricatorExchangeFunction(ExecutionContext &context, TableFu
 			output.SetCardinality(0);
 			return OperatorResultType::FINISHED;
 		}
-		g.reader->Drain(output);
+		g.DrainMapped(context.client, output);
 		return OperatorResultType::HAVE_MORE_OUTPUT;
 	} catch (...) {
 		if (l.owns_gate) {
@@ -2784,22 +2850,7 @@ unique_ptr<GlobalTableFunctionState> FabricatorCollectorInitGlobal(ClientContext
 	// ⚠ THE PROJECTION, read here because TableFunctionInitInput is the only place the narrowed column list
 	// is handed to us, and stashed on the holder because OpenExchange (which needs it) runs later, in the
 	// Source phase. `output_width` is the binding's FULL declared width — column_ids indexes into it.
-	holder.projected.clear();
-	{
-		bool identity = input.column_ids.size() == bind.output_width;
-		for (idx_t i = 0; i < input.column_ids.size() && identity; i++) {
-			identity = input.column_ids[i] == i;
-		}
-		if (!identity) {
-			for (auto id : input.column_ids) {
-				if (id >= bind.output_width) {
-					holder.projected.clear(); // a virtual column: we declare none, so treat as "no projection"
-					break;
-				}
-				holder.projected.push_back((int32_t)id);
-			}
-		}
-	}
+	holder.projected = FabricatorProjectionHint(input.column_ids, bind.output_width);
 	// Reset per-execution holder state (a prepared statement may re-execute on the shared holder). Release the
 	// prior reader FIRST (its C# dispose releases the prior producer's exported stream) before replacing the
 	// producer with a fresh one for this execution.
@@ -3058,9 +3109,10 @@ void RegisterFabricatorGlobalFunctions(ExtensionLoader &loader) {
 				                  is_collector ? FabricatorCollectorInitGlobal : FabricatorExchangeInitGlobal,
 				                  is_collector ? FabricatorCollectorInitLocal : FabricatorExchangeInitLocal);
 				tf.in_out_function = is_collector ? FabricatorCollectorFunction : FabricatorExchangeFunction;
-				// ⚠ COLLECTORS ONLY (ABI v87). The streaming exchange does not advertise it — its
-				// inout_exchange_open is passed an empty projection — so the two paths stay distinguishable.
-				tf.projection_pushdown = is_collector;
+				// ⚠ BOTH KINDS. The collector got this at ABI v87 and the streaming exchange followed; the
+				// ABI entry always carried the argument, so neither needed a bump. A callee may honour the
+				// hint or return its full schema — the host tells them apart by the declared width.
+				tf.projection_pushdown = true;
 				auto fn_info = make_shared_ptr<FabricatorTableFunctionInfo>();
 				fn_info->handle = nullptr; // global marker
 				fn_info->schema = "";
@@ -3431,6 +3483,10 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateCustomInOutFunction
 	TableFunction inout(func_name, {}, nullptr, FabricatorExchangeBind, FabricatorExchangeInitGlobal,
 	                    FabricatorExchangeInitLocal);
 	inout.in_out_function = FabricatorExchangeFunction;
+	// ⚠ Reaches every provider-declared `_each` too (AddInOutFunction resolves here), and none of them
+	// override the projected overload — so they declare their full schema and the host picks the columns
+	// out. That fallback is what makes enabling it here a pure narrowing of what crosses the boundary.
+	inout.projection_pushdown = true;
 	auto fn_info = make_shared_ptr<FabricatorTableFunctionInfo>();
 	fn_info->handle = handle_;
 	fn_info->schema = name;

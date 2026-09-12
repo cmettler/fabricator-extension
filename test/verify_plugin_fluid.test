@@ -4166,3 +4166,76 @@ SELECT * FROM fluid_query_inout('SELECT * FROM {{ publish("x") }}',
                                 (SELECT * FROM (VALUES (1)) t(n)));
 ----
 publish() cannot be used here
+
+# ============================================================================================
+# §36 — PROJECTION PUSHDOWN through the STREAMING IN-OUT, the fluid_query_inout half of §31.
+#
+# The streaming exchange did not advertise projection pushdown when fluid_query_inout shipped: the ABI entry
+# has carried the argument since v87, the managed pump has always forwarded it, and the host passed an empty
+# list — so this binding's ProjectedOutputSchema was wired and inert. Now both exchange registrations set the
+# flag (the global one and the catalog-bound one every provider-declared `_each` resolves through), and no
+# ABI version moved, because nothing about the crossing changed.
+#
+# ⚠⚠ SELECTING ONE COLUMN IS NOT EVIDENCE OF ANYTHING — §31's lesson, and it applies unchanged here. The
+# assertions below are the PAYOFF (an unread column's work does not happen) and the `projected` variable.
+# ⚠⚠ THE WIRE MAP IS TESTED IN verify_global_functions, NOT HERE, and it has to be: fluid_query_inout
+# HONOURS the hint, so its map is the identity and its own rows cannot catch an off-by-one. The callee that
+# ignores the hint is fabricator_inout_va, and its section is beside its own tests.
+# ============================================================================================
+
+# --- the control: both columns read, so there is no projection to apply. ---
+query II
+SELECT n, b FROM fluid_query_inout(
+  'SELECT i AS n, 2::INTEGER AS b FROM input_table', (SELECT * FROM range(3) t(i))) ORDER BY n;
+----
+0	2
+1	2
+2	2
+
+# --- ⚠⚠ THE PAYOFF: the unread column holds error() and is never evaluated, because the wrapper names only
+# the projected columns and DuckDB prunes the rest of the subquery. ---
+query I
+SELECT n FROM fluid_query_inout(
+  'SELECT i AS n, error(''EVALUATED'') AS b FROM input_table', (SELECT * FROM range(3) t(i))) ORDER BY n;
+----
+0
+1
+2
+
+# --- and reading it DOES raise, without which the row above proves only that error() had stopped working. ---
+statement error
+SELECT b FROM fluid_query_inout(
+  'SELECT i AS n, error(''EVALUATED'') AS b FROM input_table', (SELECT * FROM range(3) t(i)));
+----
+<REGEX>:.*EVALUATED.*
+
+# --- the template is told, under the same name as on the other two surfaces. Two of three columns read. ---
+query II
+SELECT p, a FROM fluid_query_inout(
+  '{% if is_bind %}SELECT NULL::VARCHAR AS p, 1 AS a, 2 AS b{% else %}SELECT ''{{ projected | join: "|" }}'' AS p, 1 AS a, 2 AS b{% endif %} FROM input_table',
+  (SELECT * FROM range(1) t(i)));
+----
+p|a	1
+
+# --- a column read TWICE and one not at all: the narrowed list is not a prefix of the declared schema. ---
+query II
+SELECT a, a FROM fluid_query_inout(
+  'SELECT i AS n, 9::INTEGER AS a FROM input_table', (SELECT * FROM range(1) t(i)));
+----
+9	9
+
+# --- ⚠ the projection is per CALL SITE, so ONE statement can narrow the same template two different ways,
+# and each render must see its own list rather than the first one bound.
+#
+# ⚠⚠ THE PROJECTION IS WHAT IS READ, NOT WHAT THE INNER SELECT LIST SAYS — measured, and it is what this row
+# got wrong first: written as `min(q) FROM (SELECT p AS q, a FROM …)` the right-hand side still narrowed to
+# `p` alone, because DuckDB prunes `a` straight through the subquery. Both columns have to be CONSUMED. ---
+query TT
+SELECT (SELECT p FROM fluid_query_inout(
+          '{% if is_bind %}SELECT NULL::VARCHAR AS p, 1 AS a{% else %}SELECT ''{{ projected | join: "|" }}'' AS p, 1 AS a{% endif %} FROM input_table',
+          (SELECT * FROM range(1) t(i)))),
+       (SELECT p || '/' || a::VARCHAR FROM fluid_query_inout(
+          '{% if is_bind %}SELECT NULL::VARCHAR AS p, 1 AS a{% else %}SELECT ''{{ projected | join: "|" }}'' AS p, 1 AS a{% endif %} FROM input_table',
+          (SELECT * FROM range(1) t(i))));
+----
+p	p|a/1
