@@ -65,7 +65,7 @@ internal sealed class FluidQueryInOutFunction : IInOutFunction
         // ⚠ The table input may sit BETWEEN positionals — DuckDB pushes a placeholder for the subquery slot
         // — which is what lets the template stay first and read like fluid_query_batch's.
         Params.TableInput("input"),
-        // The same bag fluid_query and fluid_render take: STRUCT, MAP or a JSON string.
+        // The same bag fluid_replacement_query and fluid_render take: STRUCT, MAP or a JSON string.
         Params.Named("params", NullType.Default),
         // ⚠⚠ NO `batchsize`, and its ABSENCE is the contract rather than an omission: a render is one input
         // chunk, and holding rows back to fill a group would need a tail this operator cannot emit.

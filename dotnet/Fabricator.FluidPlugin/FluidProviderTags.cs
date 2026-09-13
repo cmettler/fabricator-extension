@@ -38,13 +38,13 @@ namespace Fabricator.FluidPlugin;
 /// ⚠⚠ <b>THE SELECT-ONLY GUARD DOES NOT TRANSFER, AND THAT IS ACCEPTED RATHER THAN OVERLOOKED (user
 /// decision, 2026-09-06).</b> <c>{% query %}</c> refuses a non-SELECT using DuckDB's OWN parser, because a
 /// bind REPEATS and happens WITHOUT execution. For provider SQL there is no parser we can ask, and
-/// <c>fabricator_query</c> runs writes happily — so <c>{% provider_query %}</c> inside <c>fluid_query</c> can
+/// <c>fabricator_query</c> runs writes happily — so <c>{% provider_query %}</c> inside <c>fluid_replacement_query</c> can
 /// write to another engine's database at BIND time, repeatedly. The cost is PINNED as asserted behaviour in
 /// <c>verify_plugin_fluid</c> rather than described, which is the same treatment <c>{% exec %}</c>'s
 /// bind-repetition already gets.
 /// </para>
 /// <para>
-/// The precedent is exact: an <c>exec()</c> refusal in <c>fluid_query</c> was BUILT and then DELETED, because
+/// The precedent is exact: an <c>exec()</c> refusal in <c>fluid_replacement_query</c> was BUILT and then DELETED, because
 /// §11.1a MEASURED that it was already walk-aroundable by nesting a writing scalar inside a SELECT. A refusal
 /// anyone can nest around is a speed bump for the accident, not a boundary — and it reads as a defence.
 /// ⛔ Do NOT "fix" this by matching a leading keyword on the body: that is the measured-broken prefix check,

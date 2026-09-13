@@ -16,12 +16,12 @@ namespace Fabricator.FluidPlugin;
 /// rendered WITH A RELATION IN HAND, once for the whole input or once per <c>batchsize</c> rows, with each
 /// rendered statement run and its rows returned.
 ///
-/// <para>Where <see cref="FluidQueryFunction"/> renders from CONSTANTS at bind time and lets DuckDB run the
+/// <para>Where <see cref="FluidReplacementQueryFunction"/> renders from CONSTANTS at bind time and lets DuckDB run the
 /// result (<c>bind_replace</c>), this renders from DATA at execution time and runs the result itself. That
 /// is the whole difference and it is also the whole cost: the call does not disappear into the caller's
 /// plan, so every output row crosses Arrow. <b>Reach for it only when the SQL TEXT must depend on the
 /// input</b> — a table name, a pivot list, a per-tenant fan-out. If the generated statement is the same
-/// whatever the rows are, <c>fluid_query</c> plus an ordinary join is strictly better.</para>
+/// whatever the rows are, <c>fluid_replacement_query</c> plus an ordinary join is strictly better.</para>
 /// </summary>
 /// <remarks>
 /// <para>
@@ -87,9 +87,9 @@ internal sealed class FluidQueryBatchFunction : ICollectorFunction
         // name rather than failing somewhere inside the parser.
         Params.Positional("template", StringType.Default, nullable: false),
         // ⚠ The table input may sit BETWEEN positionals — DuckDB pushes a placeholder for the subquery slot
-        // — which is what lets the template stay first and read like fluid_query's.
+        // — which is what lets the template stay first and read like fluid_replacement_query's.
         Params.TableInput("input"),
-        // The same bag fluid_query and fluid_render take: STRUCT, MAP or a JSON string.
+        // The same bag fluid_replacement_query and fluid_render take: STRUCT, MAP or a JSON string.
         Params.Named("params", NullType.Default),
         Params.Named("batchsize", Int64Type.Default),
     }, metadata: null);

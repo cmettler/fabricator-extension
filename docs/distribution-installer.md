@@ -501,7 +501,7 @@ So the Core's output is a working install, not just well-formed bytes.
 **A single 61 MB `fabricator.duckdb_extension` now installs and runs itself on Windows**, verified
 against the official `duckdb==1.5.5` wheel with an empty extension directory and no environment
 variables (`test/distribution/smoke_distribution.py`, 15 checks — 12 until 2026-09-01, when the bundled
-Fluid plugin added two, and 15 once `fluid_query` added a third: its sqlgen registration is a
+Fluid plugin added two, and 15 once `fluid_replacement_query` added a third: its sqlgen registration is a
 SECOND path through the plugin scan, which the render check cannot cover):
 
 ```

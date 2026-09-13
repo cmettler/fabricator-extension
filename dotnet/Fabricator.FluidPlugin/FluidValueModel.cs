@@ -20,7 +20,7 @@ namespace Fabricator.FluidPlugin;
 /// template.
 ///
 /// <para>It is deliberately one type rather than one per function. <c>fluid_render</c> produces TEXT and
-/// <c>fluid_query</c> produces SQL, but a params bag means the same thing in both, and two mappings that
+/// <c>fluid_replacement_query</c> produces SQL, but a params bag means the same thing in both, and two mappings that
 /// drifted would make the same JSON render differently depending on which function you called.</para>
 ///
 /// <para><b>⚠⚠ THE MEASUREMENT THIS FILE EXISTS FOR — Fluid 3.0.0-beta.7 understands
@@ -30,7 +30,7 @@ namespace Fabricator.FluidPlugin;
 /// and <c>{% if d.i &gt; 1 %}</c> with <c>i = 3</c> takes the ELSE branch, <c>{{ d.money | plus: 1 }}</c>
 /// with 19.99 renders <c>1</c>, <c>{% if d.s == 'x' %}</c> with <c>s = "x"</c> is FALSE, and summing an array
 /// in a loop yields 0. The leaves arrive as opaque nodes, so they format faithfully and compare as nothing.
-/// <b>A render-only test suite passes 100% against that.</b> For <c>fluid_query</c>, where the rendered text
+/// <b>A render-only test suite passes 100% against that.</b> For <c>fluid_replacement_query</c>, where the rendered text
 /// IS the SQL, a wrong <c>{% if %}</c> branch is a wrong statement — so the converter below is load-bearing
 /// rather than an optimisation, and <c>verify_plugin_fluid</c> asserts COMPARISON and ARITHMETIC precisely
 /// because rendering cannot tell the two builds apart.</para>
@@ -58,7 +58,7 @@ internal static class FluidValueModel
         // handling — member access, iteration, .size, indexing, all MEASURED correct without us.
         o.ValueConverters.Add(v => v is JsonValue jv ? JsonLeaf(jv) : null);
 
-        // Rendered text becomes SQL in fluid_query, so give the author an explicit way to say "quote this".
+        // Rendered text becomes SQL in fluid_replacement_query, so give the author an explicit way to say "quote this".
         // NOT automatic: a template must be able to emit raw SQL fragments — that is the entire point of a
         // SQL-generating function — so quoting is opt-in per interpolation and loudly documented.
         o.Filters.AddFilter("sql", (input, _, ctx) =>
@@ -68,7 +68,7 @@ internal static class FluidValueModel
         // of the same name is per-context (FluidEngine); the caller travels in AmbientValues.
         o.Filters.AddFilter(FluidHostQuery.FunctionName, FluidHostQuery.Filter);
         // ⚠ The write-side twin, registered unconditionally on the SHARED options like query's. It is
-        // available on BOTH surfaces; in fluid_query that means it writes during BINDING, which repeats —
+        // available on BOTH surfaces; in fluid_replacement_query that means it writes during BINDING, which repeats —
         // see FluidHostExec.
         o.Filters.AddFilter(FluidHostExec.FunctionName, FluidHostExec.Filter);
         o.Filters.AddFilter("sql_ident", (input, _, ctx) =>
@@ -93,7 +93,7 @@ internal static class FluidValueModel
         SetVariable(ctx, BagVariable, CaptureBag(paramsCol, row));
         // ⚠ The SAME bag on the SQL side, as `getvariable('params')`. The factory closes over the LIVE
         // column, which is safe on the two surfaces reaching here and ONLY on them: fluid_render and
-        // fluid_query both render INSIDE the call that owns these arguments, so the connection — and hence
+        // fluid_replacement_query both render INSIDE the call that owns these arguments, so the connection — and hence
         // the copy — can only be opened while they are still alive. The three deferred surfaces bind their
         // own, already-copied, batch instead.
         FluidRenderSession.For(ctx)?.BindVariable(BagVariable, () => CopyBagRow(paramsCol, row));
@@ -356,7 +356,7 @@ internal static class FluidValueModel
     /// <remarks>
     /// ⚠ Without this the failure is Fluid's own <c>OverflowException("Value was either too large or too
     /// small for a Decimal")</c> — raised mid-render, naming neither the parameter nor the value — or, worse,
-    /// a SILENT zero. In <c>fluid_query</c> a silent zero is a wrong number spliced into a SQL statement, so
+    /// a SILENT zero. In <c>fluid_replacement_query</c> a silent zero is a wrong number spliced into a SQL statement, so
     /// refusing is the only safe direction.
     /// </remarks>
     private static object Number(double d, string where)
@@ -477,7 +477,7 @@ internal static class FluidValueModel
     /// ⚠⚠ THE KIND IS THE WHOLE FIX, and it is not the knob it looks like. `Date32Array.GetDateTime` returns
     /// a DateTime with `Kind = Unspecified`, which Fluid resolves against the machine's LOCAL zone — so on a
     /// UTC+2 box `DATE '2026-09-01'` rendered as **`2026-08-31 22:00:00Z`**, the PREVIOUS DAY, and
-    /// `fluid_query` would have spliced that wrong date into a statement.
+    /// `fluid_replacement_query` would have spliced that wrong date into a statement.
     /// <para>⚠ `TemplateOptions.TimeZone` does NOT fix it — MEASURED, an Unspecified midnight renders
     /// identically under `TimeZoneInfo.Utc` and under the local zone, because the conversion happens where
     /// the DateTime is turned into a DateTimeOffset. Setting that option was the obvious one-line fix and it

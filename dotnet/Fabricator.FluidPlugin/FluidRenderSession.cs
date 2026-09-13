@@ -47,7 +47,7 @@ namespace Fabricator.FluidPlugin;
 /// ⚠ <b>The scope is the RENDER, not the statement.</b> Two rows of one <c>fluid_render</c> call are two
 /// renders and therefore two connections: a temp table made by one row is invisible to the next, which is
 /// the correct reading of "a rendered template" and keeps a per-row scalar from accumulating state. For
-/// <c>fluid_query</c> one bind is one render.
+/// <c>fluid_replacement_query</c> one bind is one render.
 /// </para>
 /// <para>
 /// ⚠ <b>It does not widen what a template may do.</b> Every statement still goes through the same
@@ -101,7 +101,7 @@ internal sealed class FluidRenderSession : IDisposable
     /// </para>
     /// <para>
     /// ⚠⚠ <b>THE FACTORY MUST NOT CLOSE OVER ANYTHING SHORTER-LIVED THAN THIS SESSION.</b> It runs at
-    /// pin-open, which is INSIDE the call for <c>fluid_render</c> and <c>fluid_query</c> — their args are
+    /// pin-open, which is INSIDE the call for <c>fluid_render</c> and <c>fluid_replacement_query</c> — their args are
     /// still alive, so those may slice live Arrow — and LONG AFTER the bind for the three deferred surfaces,
     /// whose execution session is created once their arguments are already freed. Those must close over a
     /// COPY; <see cref="FluidValueModel.CopyBagRow"/> is it.
@@ -145,7 +145,7 @@ internal sealed class FluidRenderSession : IDisposable
     /// template's own staged temp tables — as a named Arrow source, returning the token.
     /// </summary>
     /// <remarks>
-    /// ⚠⚠ The publication OUTLIVES this session, and it has to: <c>fluid_query</c> renders during
+    /// ⚠⚠ The publication OUTLIVES this session, and it has to: <c>fluid_replacement_query</c> renders during
     /// <c>bind_replace</c>, so by the time the generated SQL is parsed — let alone scanned — <see
     /// cref="Dispose"/> has already run. It works because the connection is REFERENCE-COUNTED: an
     /// unscanned publication holds the handle open, so <see cref="Dispose"/> gives up the render's claim

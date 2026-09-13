@@ -41,7 +41,7 @@ daxeval(expression := '…', params := '{"a": 40}')         -- a JSON string, pa
 ```
 
 with the reason recorded at the declaration: *"a fixed VARCHAR here would force DuckDB to stringify a struct
-before we ever saw it."* `fluid_render` / `fluid_query` take the same shape. ⇒ **the surface shape is already
+before we ever saw it."* `fluid_render` / `fluid_replacement_query` take the same shape. ⇒ **the surface shape is already
 decided; only the ABI is missing.**
 
 ⚠ **Two DAX facts are easy to conflate and are not the same mechanism.** `EVALUATE TOPN(0, {table})` is how a
@@ -177,13 +177,13 @@ REPEATS and happens WITHOUT execution — measured: `EXPLAIN` fires it, defining
 that view fires it again. For provider SQL there is no parser we can ask, and `fabricator_query` runs writes
 happily (that is how the double-execution bug was measured: one call left two rows).
 
-⇒ **`{% provider_query %}` inside `fluid_query` could perform a write on someone else's database at bind
+⇒ **`{% provider_query %}` inside `fluid_replacement_query` could perform a write on someone else's database at bind
 time, repeatedly, with nothing to stop it.** Three options, and this must be a decision rather than a
 discovery:
 
 1. **Accept and document**, as `exec()` was — the two tag names are an author *assertion*. Honest, unenforced,
    and consistent with §11.1a's finding that the host-side refusal was already walk-aroundable by nesting.
-2. **Refuse `{% provider_query %}` in `fluid_query`** (bind-time surface) and permit it only in
+2. **Refuse `{% provider_query %}` in `fluid_replacement_query`** (bind-time surface) and permit it only in
    `fluid_render`. ⚠ Does not make it safe — a volatile scalar is evaluated PER ROW instead.
 3. **Ask the provider to classify.** No provider has a parser surface today; adding one is a bigger change
    than (A).
@@ -453,8 +453,8 @@ SERVICE tier), two mutants each killed at its own row. **Full record, including 
 
 ### 7.1 §3.1 IS SETTLED: option 1, accept and document (user, 2026-09-06)
 
-The SELECT-only guard does not transfer, so a provider tag inside `fluid_query` writes at BIND time,
-repeatedly. **MEASURED**: an `EXPLAIN` of a `fluid_query` containing `{% provider_exec %}INSERT …` takes the
+The SELECT-only guard does not transfer, so a provider tag inside `fluid_replacement_query` writes at BIND time,
+repeatedly. **MEASURED**: an `EXPLAIN` of a `fluid_replacement_query` containing `{% provider_exec %}INSERT …` takes the
 target 0 → **1**, and the statement that DOES execute takes it 1 → **2**.
 
 The reasoning the user took is the one §3.1 listed first, and it is the same one that DELETED the `exec()`
@@ -462,7 +462,7 @@ refusal: §11.1a MEASURED that a host-side refusal was already walk-aroundable b
 inside a SELECT, so a refusal anyone can nest around is a speed bump for the accident that READS as a
 defence. ⇒ the cost is PINNED as asserted behaviour rather than described.
 
-⚠ Option 2 (refuse in `fluid_query`) was rejected on its own terms as well as on precedent: `fluid_render` is
+⚠ Option 2 (refuse in `fluid_replacement_query`) was rejected on its own terms as well as on precedent: `fluid_render` is
 a VOLATILE scalar, so it is evaluated PER ROW instead of per bind — a different multiplier, not none.
 
 ### 7.2 What the build added to §3

@@ -1444,10 +1444,10 @@ A plugin's global functions are registered while the extension loads, so a plugi
 available the **next time** DuckDB loads fabricator — not in the running session. See
 [docs/plugin-system.md](docs/plugin-system.md).
 
-#### Templates — `fluid_render(...)`, `fluid_query(...)`, `fluid_query_batch(...)`, `fluid_query_inout(...)` and `fluid_query_lateral(...)`
+#### Templates — `fluid_render(...)`, `fluid_replacement_query(...)`, `fluid_query_batch(...)`, `fluid_query_inout(...)` and `fluid_query_lateral(...)`
 
 The **Fluid / Liquid template engine** is **built in** — it ships inside the extension and needs no
-configuration. It contributes three global functions, all taking a params bag that is a DuckDB `STRUCT`
+configuration. It contributes six global functions, all taking a params bag that is a DuckDB `STRUCT`
 (preferred — typed, no quoting), a `MAP`, a JSON string, a `LIST`, or a plain scalar.
 
 **`fluid_render(template, params)`** renders a template to **text**:
@@ -1460,22 +1460,26 @@ SELECT fluid_render('{% if params.x > 1 %}big{% else %}small{% endif %}', '{"x":
 -- big
 ```
 
-**`fluid_query(template [, params := …])`** renders a template to **SQL** — the result is a relation, and the
+**`fluid_replacement_query(template [, params := …])`** renders a template to **SQL** — the result is a relation, and the
 rendered text *is* the statement:
 
 ```sql
-SELECT * FROM fluid_query('SELECT {{ params.n }} AS n', params := {'n': 7});
+SELECT * FROM fluid_replacement_query('SELECT {{ params.n }} AS n', params := {'n': 7});
 -- 7
 
 -- The COLUMN LIST comes from the argument, so the output schema differs per call:
-SELECT * FROM fluid_query(
+SELECT * FROM fluid_replacement_query(
   'SELECT {% for c in params.cols %}{{ c | sql_ident }}{% unless forloop.last %}, {% endunless %}{% endfor %}
    FROM (SELECT 1 AS a, 2 AS b, 3 AS c)',
   params := {'cols': ['a','c']});
 -- a=1, c=3
 ```
 
-`params` is optional, so `fluid_query('SELECT 1')` works. The call **disappears at bind time**: DuckDB
+> **The name says which mechanism it is.** DuckDB calls this a *replacement* scan: the call is replaced
+> at bind by the statement the template generated. It was called `fluid_query` until 2026-09-13; that
+> name is being reused for a different function, so this is a **breaking** rename with no alias.
+
+`params` is optional, so `fluid_replacement_query('SELECT 1')` works. The call **disappears at bind time**: DuckDB
 substitutes the generated statement for it, so the generated SQL's own scans keep their full projection and
 filter pushdown, parallelism and join reordering, and nothing streams through the bridge at execution. That
 also means the generator runs during binding, repeatedly and without executing anything — an `EXPLAIN`, a
@@ -1491,7 +1495,7 @@ also means the generator runs during binding, repeatedly and without executing a
 > Both are allow-lists: a value with no provably safe rendering is refused by name rather than interpolated.
 >
 > ```sql
-> SELECT * FROM fluid_query('SELECT {{ params.v | sql }} AS v', params := {'v': 'O''Brien'});
+> SELECT * FROM fluid_replacement_query('SELECT {{ params.v | sql }} AS v', params := {'v': 'O''Brien'});
 > -- O'Brien   (not a syntax error, and not an injection)
 > ```
 
@@ -1625,7 +1629,7 @@ to DuckDB as a value rather than rendered into the statement. A bag with no memb
 > set, and an unset variable reads as NULL — so `getvariable('params') IS NULL` asks in SQL what
 > `{% if params %}` asks in Liquid.
 >
-> ⚠ In **`fluid_query`** it is readable from an explicit `{% query %}` / `{% exec %}` block, **not** from the
+> ⚠ In **`fluid_replacement_query`** it is readable from an explicit `{% query %}` / `{% exec %}` block, **not** from the
 > statement the template generates — that statement is bound by your own connection. Interpolate params into
 > generated SQL directly (`{{ params.n }}`), which is what the template is for. In `fluid_query_batch`,
 > `fluid_query_lateral` and `fluid_query_inout` the generated statement **does** see it, because those run it
@@ -1648,13 +1652,13 @@ SELECT fluid_render(
 -- eu=15 us=25
 ```
 
-Inside `fluid_query` this runs while the statement is being **bound**, so the database can decide what the
+Inside `fluid_replacement_query` this runs while the statement is being **bound**, so the database can decide what the
 generated SQL — and therefore the result's own column list — should be:
 
 ```sql
 CREATE TABLE wanted AS SELECT * FROM (VALUES ('region',1),('amt',2)) v(col,ord);
 
-SELECT * FROM fluid_query(
+SELECT * FROM fluid_replacement_query(
   'SELECT {% assign rs = query("SELECT col FROM wanted ORDER BY ord") %}
    {% for r in rs %}{{ r.col | sql_ident }}{% unless forloop.last %}, {% endunless %}{% endfor %}
    FROM orders ORDER BY amt');
@@ -1766,14 +1770,14 @@ SELECT fluid_render('{{ exec("CREATE TABLE m AS SELECT 1 AS c; INSERT INTO m VAL
 -- 1        (and m now has 2 rows)
 ```
 
-> ⚠⚠ **`exec()` works in `fluid_query` too — and there a write MULTIPLIES.** A `fluid_query` template is
+> ⚠⚠ **`exec()` works in `fluid_replacement_query` too — and there a write MULTIPLIES.** A `fluid_replacement_query` template is
 > rendered while DuckDB is *binding*, and binding repeats and happens without executing. Measured, one
 > counter through four steps that execute nothing you wrote:
 >
 > | step | rows written |
 > |---|---|
-> | `EXPLAIN SELECT * FROM fluid_query('… {{ exec("INSERT …") }} …')` | 1 |
-> | merely `CREATE VIEW v AS SELECT * FROM fluid_query(…)` | 2 |
+> | `EXPLAIN SELECT * FROM fluid_replacement_query('… {{ exec("INSERT …") }} …')` | 1 |
+> | merely `CREATE VIEW v AS SELECT * FROM fluid_replacement_query(…)` | 2 |
 > | one `SELECT … FROM v` | 3 |
 > | a second `SELECT … FROM v` | 4 |
 >
@@ -1790,7 +1794,7 @@ SELECT fluid_render('{{ exec("CREATE TABLE m AS SELECT 1 AS c; INSERT INTO m VAL
 > happens, and the generated SQL reads the state *before* it.
 >
 > ```sql
-> SELECT c FROM fluid_query('{% assign _ = exec("UPDATE t SET c = 42") %}SELECT c FROM t');
+> SELECT c FROM fluid_replacement_query('{% assign _ = exec("UPDATE t SET c = 42") %}SELECT c FROM t');
 > -- 1     the generated SQL reads the old value
 > SELECT c FROM t;
 > -- 42    the write was real
@@ -1802,7 +1806,7 @@ SELECT fluid_render('{{ exec("CREATE TABLE m AS SELECT 1 AS c; INSERT INTO m VAL
 > statement still reports `Table with name t does not exist!` (helpfully adding *"Did you mean memory.t"* —
 > it exists, just not for that statement).
 >
-> **Use two statements**: `exec()` in one, the read in the next. So `exec()` inside `fluid_query` is for
+> **Use two statements**: `exec()` in one, the read in the next. So `exec()` inside `fluid_replacement_query` is for
 > side effects the *generated SQL* does not itself read — an audit row, a log line, staging for later.
 >
 > ⚠ **But the template's OWN `query()` does see it** — see the next section. What cannot see it is the SQL
@@ -1845,7 +1849,7 @@ SELECT fluid_render('{% if params.go %}{% exec %}DELETE FROM staging{% endexec %
 -- skipped       (and nothing was deleted)
 ```
 
-> ⚠ **Interpolation inside the block is RAW**, exactly as in `fluid_query` and for the same reason — a
+> ⚠ **Interpolation inside the block is RAW**, exactly as in `fluid_replacement_query` and for the same reason — a
 > template must be able to emit object names and whole fragments. Use `{{ v | sql }}` for a value and
 > `{{ n | sql_ident }}` for an identifier. Splicing a raw string containing a quote gives a parser error
 > rather than a silent injection, but that is not a substitute.
@@ -1893,7 +1897,7 @@ follow it exactly as in `{% query %}`: `{% exec n limit: 100 %}`. The number is 
 >
 > ⚠ It obeys the same rules as the function: it refuses a `SELECT`, it runs on the render's own connection
 > (so a `{% exec %}CREATE TEMP TABLE …{% endexec %}` is readable by a later `query()` in the same
-> template), and inside `fluid_query` it still runs at **bind** time, with the multiplication described
+> template), and inside `fluid_replacement_query` it still runs at **bind** time, with the multiplication described
 > above. A `{% break %}` inside the block leaves a half-rendered statement, which is discarded rather than
 > executed.
 
@@ -1923,7 +1927,7 @@ and is refused by name rather than reaching the provider as an empty catalog. Th
 
 > ⚠ **The SELECT-only guard does not apply here, and that is deliberate.** `{% query %}` refuses a
 > non-`SELECT` by asking DuckDB's parser; there is no such parser for another engine's dialect, so a
-> `{% provider_exec %}` inside `fluid_query` runs at **bind** time — which repeats, including on `EXPLAIN`
+> `{% provider_exec %}` inside `fluid_replacement_query` runs at **bind** time — which repeats, including on `EXPLAIN`
 > and on every use of a view built over it. Use `fluid_render` for a write unless you want that
 > multiplication, and treat the two tag names as your own assertion about what the body does.
 
@@ -1967,7 +1971,7 @@ to write. Everything after it, in the whole template, neither renders nor runs.
 SELECT fluid_render('A{% ret %}B', NULL);            -- A
 SELECT fluid_render('A{% break %}B', NULL);          -- AB  (break is ignored outside a loop)
 
-SELECT * FROM fluid_query('SELECT 7 AS v{% ret %} WHERE 1=0');
+SELECT * FROM fluid_replacement_query('SELECT 7 AS v{% ret %} WHERE 1=0');
 -- 7        -- the WHERE was never rendered, so the statement is `SELECT 7 AS v`
 ```
 
@@ -1988,13 +1992,13 @@ SELECT fluid_render('{% for i in (1..5) %}{{ i }}{% if i > 2 %}{% ret %}{% endif
 > though standard Liquid isolates its scope.
 
 It takes no arguments (`{% ret 1 %}` is a parse error) and works on every surface — `fluid_render`,
-`fluid_query`, `fluid_query_batch` and `fluid_query_lateral`.
+`fluid_replacement_query`, `fluid_query_batch` and `fluid_query_lateral`.
 
 **`publish(name)` hands a table the template STAGED to the SQL it is generating.** This is the piece that
-makes multi-step staging inside `fluid_query` useful: stage with `{% exec %}`, then scan the result.
+makes multi-step staging inside `fluid_replacement_query` useful: stage with `{% exec %}`, then scan the result.
 
 ```sql
-SELECT * FROM fluid_query('
+SELECT * FROM fluid_replacement_query('
 {% exec lo: 1, hi: 5 %}
   CREATE TEMP TABLE _result AS SELECT i AS n, i * i AS sq FROM range($lo, $hi) t(i)
 {% endexec %}
@@ -2026,7 +2030,7 @@ struct stays a struct — which is the difference from building a `VALUES` list 
 > ⚠ **Two publications from the SAME template cannot be scanned in one statement** — both stream from the
 > render's single connection, which allows one live result at a time, so it fails (loudly, never silently).
 > Two ways round it, whichever fits: put the join in `{% exec %}` and publish one relation — better anyway,
-> since the work stays inside DuckDB — or use two separate `fluid_query` calls, which are two connections.
+> since the work stays inside DuckDB — or use two separate `fluid_replacement_query` calls, which are two connections.
 
 > ⚠ A publication that is never scanned — an `EXPLAIN` renders the template and never runs it — keeps the
 > render's connection, and the staged table with it, until 32 further publications reclaim it; a scan of a
@@ -2035,7 +2039,7 @@ struct stays a struct — which is the difference from building a `VALUES` list 
 > ⚠ For a **single** query a `WITH … AS MATERIALIZED` CTE inside the generated SQL is still better — it
 > needs no publication at all and keeps the whole relation inside one DuckDB plan:
 > ```sql
-> SELECT * FROM fluid_query('
+> SELECT * FROM fluid_replacement_query('
 > WITH _result AS MATERIALIZED (SELECT i AS n, i*i AS sq FROM range(1, 5) t(i))
 > SELECT * FROM _result');
 > ```
@@ -2089,18 +2093,18 @@ SELECT fluid_render(
 -- v=7
 ```
 
-This is what makes multi-step generation work on the `fluid_query` surface: stage, read the result back,
+This is what makes multi-step generation work on the `fluid_replacement_query` surface: stage, read the result back,
 and interpolate it into the SQL you generate.
 
 ```sql
-SELECT * FROM fluid_query(
+SELECT * FROM fluid_replacement_query(
   '{% assign _    = exec("CREATE TEMP TABLE s AS SELECT 3 AS a UNION ALL SELECT 4") %}'
   '{% assign rows = query("SELECT sum(a) AS t FROM s") %}'
   'SELECT {{ rows[0].t }} AS staged');
 -- staged = 7
 ```
 
-> ⚠ **The scope is ONE render.** For `fluid_query` that is one bind; for `fluid_render`, which is a
+> ⚠ **The scope is ONE render.** For `fluid_replacement_query` that is one bind; for `fluid_render`, which is a
 > scalar, it is **one row** — so three rows are three connections, and a temp table made by one row is
 > invisible to the next. That is deliberate: it is what keeps a per-row scalar from accumulating state, and
 > what makes rendering on several threads safe.
@@ -2113,13 +2117,13 @@ SELECT * FROM fluid_query(
 > ⚠ Nothing is opened unless the template actually calls `query()` or `exec()`, so a template that runs no
 > SQL costs nothing.
 
-> ⚠⚠ **And staging into a *temporary* table is what makes this safe on the `fluid_query` surface.** A
+> ⚠⚠ **And staging into a *temporary* table is what makes this safe on the `fluid_replacement_query` surface.** A
 > writing template behind a view writes on *every use* (the table above) — but each bind gets its own
 > connection and its own temporary catalog, so the same `CREATE TEMP TABLE` simply runs again. Measured, a
 > view over such a template used twice:
 >
 > ```sql
-> CREATE VIEW v AS SELECT * FROM fluid_query(
+> CREATE VIEW v AS SELECT * FROM fluid_replacement_query(
 >   '{% assign _ = exec("CREATE TEMP TABLE st AS SELECT 5 AS a") %}'
 >   '{% assign r = query("SELECT a FROM st") %}'
 >   'SELECT {{ r[0].a }} AS staged');
@@ -2175,7 +2179,7 @@ inside SQL string literals:
 SET fluid_template_root = 's3://analytics/templates';
 
 -- templates/dims/customer.liquid holds:  SELECT id, name FROM customers WHERE region = {{ region | sql }}
-SELECT * FROM fluid_query('{% include ''dims/customer'' %}', params := {'region': 'eu'});
+SELECT * FROM fluid_replacement_query('{% include ''dims/customer'' %}', params := {'region': 'eu'});
 ```
 
 The included template shares the caller's variables, and it may include others in turn.
@@ -2189,7 +2193,7 @@ The included template shares the caller's variables, and it may include others i
 
 > ⚠ **Use `SET GLOBAL` for the root if the template runs through `fluid_query_batch` or
 > `fluid_query_lateral`.** A plain session-scoped `SET fluid_template_root` reaches `fluid_render` and
-> `fluid_query`, but those two resolve part of their work where the session-scoped value is not visible, and
+> `fluid_replacement_query`, but those two resolve part of their work where the session-scoped value is not visible, and
 > a relative include then fails with *"no root is set"* — at bind for the batch form, at call time for the
 > lateral. `SET GLOBAL` works on every surface, and an absolute include path needs no root at all.
 
@@ -2202,7 +2206,7 @@ The file is read the same way `query()` runs SQL — on its own connection — s
 template above 1 MiB is refused, and a missing include reports every path it asked for.
 
 **`fluid_query_batch(template, <input> [, params := …] [, batchsize := …])` renders a template WITH A
-RELATION IN HAND** and runs the statement it produces. Where `fluid_query` renders from constants at bind
+RELATION IN HAND** and runs the statement it produces. Where `fluid_replacement_query` renders from constants at bind
 time, this renders from *data* at execution time — so the SQL text itself can depend on the rows.
 
 ```sql
@@ -2338,12 +2342,12 @@ SELECT (SELECT count(*) FROM acc)::BIGINT AS groups_so_far, count(*)::BIGINT AS 
 > controls how many rows each *render* sees, never how much memory the function uses. This is inherent: a
 > function that may render once over everything cannot know it has everything until the input ends.
 
-> ⚠ **`publish()` is refused here**, and unlike in `fluid_query` you do not need it: this function runs the
+> ⚠ **`publish()` is refused here**, and unlike in `fluid_replacement_query` you do not need it: this function runs the
 > generated statement on the template's own connection, so a table `{% exec %}` staged is simply in scope —
 > `SELECT * FROM my_staged_table`. (`publish` exists to carry a relation to a *different* connection.)
 
-> ⚠ **Prefer `fluid_query` plus an ordinary join when the generated SQL does not depend on the data.** This
-> function does not disappear into the caller's plan the way `fluid_query` does, so its rows cross the
+> ⚠ **Prefer `fluid_replacement_query` plus an ordinary join when the generated SQL does not depend on the data.** This
+> function does not disappear into the caller's plan the way `fluid_replacement_query` does, so its rows cross the
 > managed boundary and it gets no pushdown. It earns its cost only when the SQL *text* must vary.
 
 > ⚠ An input column whose name begins `__fab` is refused — the function needs that prefix for its own
@@ -2421,7 +2425,7 @@ FROM people p, fluid_query_lateral(
 > ⚠ `publish()` is refused here too, for the same reason and with the same answer: select the staged table
 > directly.
 
-**Which to reach for.** `fluid_query` when the SQL does not depend on the data (it disappears into your
+**Which to reach for.** `fluid_replacement_query` when the SQL does not depend on the data (it disappears into your
 plan, and nothing beats that). `fluid_query_lateral` when the statement is *per row* and the result belongs
 beside the outer row. `fluid_query_batch` when the template needs the whole relation, or needs to
 accumulate across it.

@@ -26,7 +26,7 @@ namespace Fabricator.FluidPlugin;
 /// </para>
 /// <para>
 /// ⚠⚠ <b>It refuses anything that is not a SELECT, and that is a correctness requirement rather than a
-/// policy.</b> A template may be rendered at BIND (<c>fluid_query</c> is a sqlgen function), and a bind
+/// policy.</b> A template may be rendered at BIND (<c>fluid_replacement_query</c> is a sqlgen function), and a bind
 /// REPEATS and happens WITHOUT execution — MEASURED, a bind-time write fires on <c>EXPLAIN</c> of a
 /// statement that never runs, and again on merely defining a view over it. So a writing <c>query</c> would
 /// mutate where nobody asked, invisibly. See docs/fluid-templating.md §8.3 and §9.

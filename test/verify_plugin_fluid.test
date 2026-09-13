@@ -40,10 +40,10 @@ SELECT count(*) FROM fabricator_plugins() WHERE provider = 'fluid';
 # a build that both bundled AND published it would register twice, and every render below would still pass.
 query II
 SELECT function_name, count(*) FROM duckdb_functions()
-WHERE function_name IN ('fluid_render', 'fluid_query') GROUP BY 1 ORDER BY 1;
+WHERE function_name IN ('fluid_render', 'fluid_replacement_query') GROUP BY 1 ORDER BY 1;
 ----
-fluid_query	1
 fluid_render	1
+fluid_replacement_query	1
 
 # ============================================================================================
 # IT IS A PROVIDER THAT HOSTS NO CATALOG
@@ -201,7 +201,7 @@ SELECT fluid_render('{% if %}', '{}');
 <REGEX>:.*template parse error.*
 
 # ============================================================================================
-# fluid_query — the template IS the SQL (slice 1)
+# fluid_replacement_query — the template IS the SQL (slice 1)
 #
 # A SQL-GENERATING table function (ISqlTableFunction): at BIND time DuckDB hands the generator the call's
 # constant arguments and SUBSTITUTES the returned SELECT for the call. So the output schema is arg-dependent
@@ -210,30 +210,30 @@ SELECT fluid_render('{% if %}', '{}');
 # ============================================================================================
 
 query II
-SELECT DISTINCT function_name, function_type FROM duckdb_functions() WHERE function_name = 'fluid_query';
+SELECT DISTINCT function_name, function_type FROM duckdb_functions() WHERE function_name = 'fluid_replacement_query';
 ----
-fluid_query	table
+fluid_replacement_query	table
 
 # `params` is NAMED and OPTIONAL, so a template with no variables needs no bag at all.
 query II
-SELECT * FROM fluid_query('SELECT 1 AS a, ''x'' AS b');
+SELECT * FROM fluid_replacement_query('SELECT 1 AS a, ''x'' AS b');
 ----
 1	x
 
 query I
-SELECT * FROM fluid_query('SELECT {{ params.n }} AS n', params := {'n': 7});
+SELECT * FROM fluid_replacement_query('SELECT {{ params.n }} AS n', params := {'n': 7});
 ----
 7
 
 query I
-SELECT * FROM fluid_query('SELECT {% if params.big %}999{% else %}1{% endif %} AS v', params := '{"big":true}');
+SELECT * FROM fluid_replacement_query('SELECT {% if params.big %}999{% else %}1{% endif %} AS v', params := '{"big":true}');
 ----
 999
 
 # An explicit NULL bag is the same as none — the ANY-declared slot carries an untyped NULL (see the
 # fluid_render assertion above for why that crossing is worth pinning).
 query I
-SELECT * FROM fluid_query('SELECT 1 AS v', params := NULL);
+SELECT * FROM fluid_replacement_query('SELECT 1 AS v', params := NULL);
 ----
 1
 
@@ -243,14 +243,14 @@ SELECT * FROM fluid_query('SELECT 1 AS v', params := NULL);
 # schema. A macro cannot express this; a marshaled table function would have to declare one schema up front.
 
 query II
-SELECT * FROM fluid_query(
+SELECT * FROM fluid_replacement_query(
   'SELECT {% for c in params.cols %}{{ c | sql_ident }}{% unless forloop.last %}, {% endunless %}{% endfor %} FROM (SELECT 1 AS a, 2 AS b, 3 AS c)',
   params := {'cols': ['a','c']});
 ----
 1	3
 
 query I
-SELECT count(*) FROM (DESCRIBE SELECT * FROM fluid_query(
+SELECT count(*) FROM (DESCRIBE SELECT * FROM fluid_replacement_query(
   'SELECT {% for c in params.cols %}{{ c | sql_ident }}{% unless forloop.last %}, {% endunless %}{% endfor %} FROM (SELECT 1 AS a, 2 AS b, 3 AS c)',
   params := {'cols': ['a','b','c']}));
 ----
@@ -265,17 +265,17 @@ SELECT count(*) FROM (DESCRIBE SELECT * FROM fluid_query(
 # Leaves arrive as opaque nodes: they format faithfully and compare as nothing.
 #
 # ⇒ EVERY RENDER ASSERTION IN THIS FILE PASSES ON A BUILD WITH NO CONVERTER. These do not. And because
-# fluid_query's rendered text IS the statement, a wrong {% if %} branch there is a wrong SQL statement — the
+# fluid_replacement_query's rendered text IS the statement, a wrong {% if %} branch there is a wrong SQL statement — the
 # silent-wrong-answer class, not a formatting nit. See FluidValueModel's header for the full measurement.
 # ============================================================================================
 
 query I
-SELECT * FROM fluid_query('SELECT {% if params.n > 5 %}''big''{% else %}''small''{% endif %} AS c', params := '{"n":7}');
+SELECT * FROM fluid_replacement_query('SELECT {% if params.n > 5 %}''big''{% else %}''small''{% endif %} AS c', params := '{"n":7}');
 ----
 big
 
 query I
-SELECT * FROM fluid_query('SELECT {{ params.n | plus: 1 }} AS v', params := '{"n":41}');
+SELECT * FROM fluid_replacement_query('SELECT {{ params.n | plus: 1 }} AS v', params := '{"n":41}');
 ----
 42
 
@@ -359,24 +359,24 @@ SELECT fluid_render('{{ params.n }}', {'n': 1e100::DOUBLE});
 # ============================================================================================
 
 query I
-SELECT * FROM fluid_query('SELECT {{ params.v | sql }} AS v', params := {'v': 'O''Brien'});
+SELECT * FROM fluid_replacement_query('SELECT {{ params.v | sql }} AS v', params := {'v': 'O''Brien'});
 ----
 O'Brien
 
 # A quote in an IDENTIFIER, likewise doubled rather than breaking the statement.
 query I
-SELECT column_name FROM (DESCRIBE SELECT * FROM fluid_query('SELECT 1 AS {{ params.n | sql_ident }}', params := {'n': 'we"ird'}));
+SELECT column_name FROM (DESCRIBE SELECT * FROM fluid_replacement_query('SELECT 1 AS {{ params.n | sql_ident }}', params := {'n': 'we"ird'}));
 ----
 we"ird
 
 # nil renders as SQL NULL, not as the empty string (which would be a syntax error, or worse, '').
 query I
-SELECT * FROM fluid_query('SELECT {{ params.v | sql }} AS v', params := {'v': NULL::VARCHAR});
+SELECT * FROM fluid_replacement_query('SELECT {{ params.v | sql }} AS v', params := {'v': NULL::VARCHAR});
 ----
 NULL
 
 statement error
-SELECT * FROM fluid_query('SELECT {{ params.v | sql }}', params := {'v': [1,2]});
+SELECT * FROM fluid_replacement_query('SELECT {{ params.v | sql }}', params := {'v': [1,2]});
 ----
 <REGEX>:.*cannot render a.*as a SQL literal.*
 
@@ -390,21 +390,21 @@ SELECT * FROM fluid_query('SELECT {{ params.v | sql }}', params := {'v': [1,2]})
 statement ok
 CREATE TABLE fq_t AS SELECT i AS id, i%7 AS g, 'v'||i AS v FROM range(1000) s(i);
 
-# Projection AND filter reach the base table; `fluid_query` appears nowhere.
+# Projection AND filter reach the base table; `fluid_replacement_query` appears nowhere.
 query II
-EXPLAIN SELECT id FROM fluid_query('SELECT * FROM fq_t WHERE g = {{ params.g }}', params := {'g': 3});
+EXPLAIN SELECT id FROM fluid_replacement_query('SELECT * FROM fq_t WHERE g = {{ params.g }}', params := {'g': 3});
 ----
 physical_plan	<REGEX>:.*SEQ_SCAN.*fq_t.*Projections: id.*Filters: g=3.*
 
 query I
-SELECT count(*) FROM fluid_query('SELECT * FROM fq_t WHERE g = {{ params.g }}', params := {'g': 3});
+SELECT count(*) FROM fluid_replacement_query('SELECT * FROM fq_t WHERE g = {{ params.g }}', params := {'g': 3});
 ----
 143
 
 # A VIEW over it re-binds on every use — the generator's contract is "deterministic and side-effect free,
 # because binds repeat and happen without execution".
 statement ok
-CREATE VIEW fq_v AS SELECT * FROM fluid_query('SELECT id FROM fq_t WHERE g = {{ params.g }}', params := {'g': 5});
+CREATE VIEW fq_v AS SELECT * FROM fluid_replacement_query('SELECT id FROM fq_t WHERE g = {{ params.g }}', params := {'g': 5});
 
 query I
 SELECT count(*) FROM fq_v;
@@ -455,7 +455,7 @@ SELECT '[' || fluid_render('{{ n }}', 'not json') || ']';
 
 # A template that renders to nothing is refused by the shared sqlgen plumbing, naming the function.
 statement error
-SELECT * FROM fluid_query('   ');
+SELECT * FROM fluid_replacement_query('   ');
 ----
 <REGEX>:.*generated no SQL.*
 
@@ -468,7 +468,7 @@ SELECT * FROM fluid_query('   ');
 # ============================================================================================
 
 statement ok
-PREPARE fq_p AS SELECT * FROM fluid_query('SELECT {{ params.n }} AS n', params := ?);
+PREPARE fq_p AS SELECT * FROM fluid_replacement_query('SELECT {{ params.n }} AS n', params := ?);
 
 query I
 EXECUTE fq_p({'n': 1});
@@ -486,7 +486,7 @@ EXECUTE fq_p({'n': 2});
 # pinning because it is surprising: a prepared statement is normally a fixed plan with a fixed result shape.
 # Here the re-bind re-renders the template, so the column LIST is whatever this EXECUTE's bag says.
 statement ok
-PREPARE fq_pc AS SELECT * FROM fluid_query(
+PREPARE fq_pc AS SELECT * FROM fluid_replacement_query(
   'SELECT {% for c in params.cols %}{{ c | sql_ident }}{% unless forloop.last %}, {% endunless %}{% endfor %} FROM (SELECT 1 AS a, 2 AS b, 3 AS c)',
   params := ?);
 
@@ -506,7 +506,7 @@ statement ok
 SET VARIABLE fq_cols = ['a','c'];
 
 query II
-SELECT * FROM fluid_query(
+SELECT * FROM fluid_replacement_query(
   'SELECT {% for c in params.cols %}{{ c | sql_ident }}{% unless forloop.last %}, {% endunless %}{% endfor %} FROM (SELECT 1 AS a, 2 AS b, 3 AS c)',
   params := {'cols': getvariable('fq_cols')});
 ----
@@ -517,7 +517,7 @@ SELECT * FROM fluid_query(
 #
 # ⚠⚠ A DATE USED TO RENDER THE PREVIOUS DAY. `Date32Array.GetDateTime` returns a DateTime with
 # `Kind = Unspecified`, which Fluid resolves against the machine's LOCAL zone, so on a UTC+2 box
-# `DATE '2026-09-01'` rendered as `2026-08-31 22:00:00Z` — and fluid_query would have spliced that wrong
+# `DATE '2026-09-01'` rendered as `2026-08-31 22:00:00Z` — and fluid_replacement_query would have spliced that wrong
 # date into a statement. The fix is the KIND (`DateTime.SpecifyKind(..., Utc)`).
 #
 # ⚠ `TemplateOptions.TimeZone` is NOT the fix and setting it changes nothing — MEASURED, an Unspecified
@@ -574,13 +574,13 @@ later
 # ⚠ Asserted by TYPE and by INSTANT rather than by rendered text: a TIMESTAMPTZ's display form depends on
 # the session timezone, so pinning the string would make this suite report the runner's locale.
 query I
-SELECT typeof(raw) FROM fluid_query('SELECT {{ params.d | sql }} AS raw', params := {'d': DATE '2026-09-01'});
+SELECT typeof(raw) FROM fluid_replacement_query('SELECT {{ params.d | sql }} AS raw', params := {'d': DATE '2026-09-01'});
 ----
 TIMESTAMP WITH TIME ZONE
 
 query I
 SELECT raw = TIMESTAMPTZ '2026-09-01 00:00:00+00'
-FROM fluid_query('SELECT {{ params.d | sql }} AS raw', params := {'d': DATE '2026-09-01'});
+FROM fluid_replacement_query('SELECT {{ params.d | sql }} AS raw', params := {'d': DATE '2026-09-01'});
 ----
 true
 
@@ -642,19 +642,19 @@ SET TimeZone = 'America/New_York';
 # ⚠ THE SILENT WRONG DAY, asserted as the value it actually produces. Pinning the truth is what makes this
 # a warning to a reader rather than a wish, and it is where a future DuckDB change would surface.
 query I
-SELECT * FROM fluid_query('SELECT {{ params.d | sql }}::DATE AS d', params := {'d': DATE '2026-09-01'});
+SELECT * FROM fluid_replacement_query('SELECT {{ params.d | sql }}::DATE AS d', params := {'d': DATE '2026-09-01'});
 ----
 2026-08-31
 
 query I
-SELECT * FROM fluid_query('SELECT strftime({{ params.d | sql }}, ''%Y-%m-%d'') AS d', params := {'d': DATE '2026-09-01'});
+SELECT * FROM fluid_replacement_query('SELECT strftime({{ params.d | sql }}, ''%Y-%m-%d'') AS d', params := {'d': DATE '2026-09-01'});
 ----
 2026-08-31
 
 # ---- SAFE ROUTE 1: name the timezone. Works for a genuine TIMESTAMP too, and preserves the instant. ----
 
 query I
-SELECT * FROM fluid_query('SELECT ({{ params.d | sql }} AT TIME ZONE ''UTC'')::DATE AS d',
+SELECT * FROM fluid_replacement_query('SELECT ({{ params.d | sql }} AT TIME ZONE ''UTC'')::DATE AS d',
                           params := {'d': DATE '2026-09-01'});
 ----
 2026-09-01
@@ -665,13 +665,13 @@ SELECT * FROM fluid_query('SELECT ({{ params.d | sql }} AT TIME ZONE ''UTC'')::D
 # it needs no ICU.
 
 query I
-SELECT typeof(d) FROM fluid_query('SELECT {{ params.d | date: "%Y-%m-%d" | sql }}::DATE AS d',
+SELECT typeof(d) FROM fluid_replacement_query('SELECT {{ params.d | date: "%Y-%m-%d" | sql }}::DATE AS d',
                                   params := {'d': DATE '2026-09-01'});
 ----
 DATE
 
 query I
-SELECT * FROM fluid_query('SELECT {{ params.d | date: "%Y-%m-%d" | sql }}::DATE AS d',
+SELECT * FROM fluid_replacement_query('SELECT {{ params.d | date: "%Y-%m-%d" | sql }}::DATE AS d',
                           params := {'d': DATE '2026-09-01'});
 ----
 2026-09-01
@@ -751,13 +751,13 @@ statement ok
 CREATE TABLE fq_cols AS SELECT * FROM (VALUES ('alpha',1),('beta',2)) v(nm,ord);
 
 query II
-SELECT * FROM fluid_query('SELECT {% assign rs = query("SELECT nm FROM fq_cols ORDER BY ord") %}{% for r in rs %}{{ r.nm | sql }} AS {{ r.nm | sql_ident }}{% unless forloop.last %}, {% endunless %}{% endfor %}');
+SELECT * FROM fluid_replacement_query('SELECT {% assign rs = query("SELECT nm FROM fq_cols ORDER BY ord") %}{% for r in rs %}{{ r.nm | sql }} AS {{ r.nm | sql_ident }}{% unless forloop.last %}, {% endunless %}{% endfor %}');
 ----
 alpha	beta
 
 # ⚠ The COLUMN NAMES are the assertion, not the values: they can only have come from the bind-time read.
 query II
-SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM fluid_query('SELECT {% assign rs = query("SELECT nm FROM fq_cols ORDER BY ord") %}{% for r in rs %}1 AS {{ r.nm | sql_ident }}{% unless forloop.last %}, {% endunless %}{% endfor %}')) ORDER BY column_name;
+SELECT column_name, column_type FROM (DESCRIBE SELECT * FROM fluid_replacement_query('SELECT {% assign rs = query("SELECT nm FROM fq_cols ORDER BY ord") %}{% for r in rs %}1 AS {{ r.nm | sql_ident }}{% unless forloop.last %}, {% endunless %}{% endfor %}')) ORDER BY column_name;
 ----
 alpha	INTEGER
 beta	INTEGER
@@ -779,13 +779,13 @@ CREATE TABLE fq_audit AS SELECT 1 AS n;
 # ⚠ The `<REGEX>:` form on the physical_plan row, because EXPLAIN cannot be a subquery source
 # (Parser Error) — the convention this suite already uses a few sections up.
 query II
-EXPLAIN SELECT * FROM fluid_query('SELECT {% assign rs = query("SELECT nm FROM fq_cols ORDER BY ord") %}{% for r in rs %}1 AS {{ r.nm | sql_ident }}{% unless forloop.last %}, {% endunless %}{% endfor %}');
+EXPLAIN SELECT * FROM fluid_replacement_query('SELECT {% assign rs = query("SELECT nm FROM fq_cols ORDER BY ord") %}{% for r in rs %}1 AS {{ r.nm | sql_ident }}{% unless forloop.last %}, {% endunless %}{% endfor %}');
 ----
 physical_plan	<REGEX>:.*alpha.*beta.*
 
 # ...and in that same position a WRITE is refused.
 statement error
-EXPLAIN SELECT * FROM fluid_query('SELECT 1 AS x {% assign r = query("INSERT INTO fq_audit VALUES (99)") %}');
+EXPLAIN SELECT * FROM fluid_replacement_query('SELECT 1 AS x {% assign r = query("INSERT INTO fq_audit VALUES (99)") %}');
 ----
 runs SELECT statements only
 
@@ -1048,10 +1048,10 @@ SELECT fluid_render('{% assign a = query("SELECT 1 AS v") %}{% assign b = "SELEC
 ----
 12
 
-# The filter form works at BIND inside fluid_query, exactly as the function form does — with its parameter
+# The filter form works at BIND inside fluid_replacement_query, exactly as the function form does — with its parameter
 # deciding the generated SQL.
 query I
-SELECT * FROM fluid_query('SELECT {% assign rs = "SELECT amt FROM fq_orders WHERE id = $i" | query: i: 2 %}{% for r in rs %}{{ r.amt }}{% endfor %} AS a');
+SELECT * FROM fluid_replacement_query('SELECT {% assign rs = "SELECT amt FROM fq_orders WHERE id = $i" | query: i: 2 %}{% for r in rs %}{{ r.amt }}{% endfor %} AS a');
 ----
 25
 
@@ -1264,17 +1264,17 @@ above the 1048576-byte ceiling
 
 # --- the payoff ----------------------------------------------------------------------------
 # ⚠⚠ THIS IS WHAT SLICE 4 EXISTS FOR: a SQL fragment lives in a file and any number of statements share it.
-# The include resolves at RENDER, which for fluid_query is inside BIND — so the generated SQL, and with it
+# The include resolves at RENDER, which for fluid_replacement_query is inside BIND — so the generated SQL, and with it
 # the output SCHEMA, comes out of a file on storage.
 query I
-SELECT n FROM fluid_query('{% include ''frag'' %}', params := {'n': 41});
+SELECT n FROM fluid_replacement_query('{% include ''frag'' %}', params := {'n': 41});
 ----
 41
 
 # ⚠ And the same fragment with a different parameter, so the assertion above cannot pass on a build that
 # ignored the bag and hard-coded a constant.
 query I
-SELECT n FROM fluid_query('{% include ''frag'' %}', params := {'n': 7});
+SELECT n FROM fluid_replacement_query('{% include ''frag'' %}', params := {'n': 7});
 ----
 7
 
@@ -1329,9 +1329,9 @@ SELECT fluid_render('{% assign r = query("SELECT v FROM t") %}{% for x in r %}{{
 7
 
 # ⚠ And it reaches the BIND-TIME surface too, which is the one that decides a statement's output SCHEMA:
-# fluid_query renders while DuckDB is binding, so an unqualified name there resolves the caller's way.
+# fluid_replacement_query renders while DuckDB is binding, so an unqualified name there resolves the caller's way.
 query I
-SELECT v FROM fluid_query('{% assign r = query("SELECT v FROM t") %}SELECT {% for x in r %}{{ x.v }}{% endfor %} AS v');
+SELECT v FROM fluid_replacement_query('{% assign r = query("SELECT v FROM t") %}SELECT {% for x in r %}{{ x.v }}{% endfor %} AS v');
 ----
 7
 
@@ -1347,7 +1347,7 @@ RESET search_path;
 # that is not a SELECT, exec() refuses everything that is.
 #
 # exec() is available on BOTH surfaces (user decision, 2026-09-02). In
-# fluid_render it runs at EXECUTE time; in fluid_query it runs during
+# fluid_render it runs at EXECUTE time; in fluid_replacement_query it runs during
 # bind_replace -- while DuckDB is BINDING -- and a bind REPEATS and happens
 # WITHOUT execution. The section below therefore PINS that multiplication as
 # known behaviour rather than refusing it, which is a stronger record than
@@ -1374,8 +1374,8 @@ SELECT count(*) FROM ex_aud;
 ----
 3
 
-# --- it works in fluid_query too, and THIS IS WHERE THE COST LIVES ---
-# ⚠⚠ THE POINT OF THIS BLOCK: a write inside a fluid_query template happens at
+# --- it works in fluid_replacement_query too, and THIS IS WHERE THE COST LIVES ---
+# ⚠⚠ THE POINT OF THIS BLOCK: a write inside a fluid_replacement_query template happens at
 # BIND, and binds repeat. Each step below is asserted against a FRESH counter so
 # the multiplication is visible as three separate facts rather than one total.
 
@@ -1384,7 +1384,7 @@ CREATE TABLE ex_bind(id INTEGER);
 
 # STEP 1 -- EXPLAIN of a statement that EXECUTES NOTHING still performs the write.
 statement ok
-EXPLAIN SELECT * FROM fluid_query('SELECT {{ exec("INSERT INTO ex_bind VALUES (1)") }} AS n');
+EXPLAIN SELECT * FROM fluid_replacement_query('SELECT {{ exec("INSERT INTO ex_bind VALUES (1)") }} AS n');
 
 query I
 SELECT count(*) FROM ex_bind;
@@ -1394,7 +1394,7 @@ SELECT count(*) FROM ex_bind;
 # STEP 2 -- merely DEFINING a view over it performs it again. Nothing has been
 # selected from the view at this point.
 statement ok
-CREATE VIEW ex_v AS SELECT * FROM fluid_query('SELECT {{ exec("INSERT INTO ex_bind VALUES (2)") }} AS n');
+CREATE VIEW ex_v AS SELECT * FROM fluid_replacement_query('SELECT {{ exec("INSERT INTO ex_bind VALUES (2)") }} AS n');
 
 query I
 SELECT count(*) FROM ex_bind;
@@ -1443,7 +1443,7 @@ INSERT INTO ex_prep VALUES (1);
 # state; the second shows the write was real. Either alone is misleading -- a 1
 # by itself would look like exec() had not run.
 query I
-SELECT c FROM fluid_query('{% assign _ = exec("UPDATE ex_prep SET c = 42") %}SELECT c FROM ex_prep');
+SELECT c FROM fluid_replacement_query('{% assign _ = exec("UPDATE ex_prep SET c = 42") %}SELECT c FROM ex_prep');
 ----
 1
 
@@ -1457,7 +1457,7 @@ SELECT c FROM ex_prep;
 # ⚠ Note the error names the table as absent even though it now exists, which is
 # what makes this worth pinning rather than describing.
 statement error
-SELECT * FROM fluid_query('{% assign _ = exec("CREATE OR REPLACE TABLE ex_late AS SELECT 1 AS c") %}SELECT c FROM ex_late');
+SELECT * FROM fluid_replacement_query('{% assign _ = exec("CREATE OR REPLACE TABLE ex_late AS SELECT 1 AS c") %}SELECT c FROM ex_late');
 ----
 does not exist
 
@@ -1471,15 +1471,15 @@ SELECT count(*) FROM ex_late;
 # ⚠ The usable shape is therefore a SEPARATE statement: exec() in one, the read
 # in the next. Pinned so the workaround is not folklore.
 query I
-SELECT c FROM fluid_query('SELECT c FROM ex_prep');
+SELECT c FROM fluid_replacement_query('SELECT c FROM ex_prep');
 ----
 42
 
-# ⚠ POSITIVE CONTROL for the whole block: query() still works in fluid_query, so
+# ⚠ POSITIVE CONTROL for the whole block: query() still works in fluid_replacement_query, so
 # the counts above are exec() firing rather than the template surface behaving
 # oddly in some other way.
 query I
-SELECT n FROM fluid_query('SELECT {{ query("SELECT 41 + 1 AS v")[0].v }} AS n');
+SELECT n FROM fluid_replacement_query('SELECT {{ query("SELECT 41 + 1 AS v")[0].v }} AS n');
 ----
 42
 
@@ -1689,10 +1689,10 @@ SELECT fluid_render('{% assign ddl = "CREATE TEMP TABLE perrow AS SELECT " | app
 30
 
 # --- the sqlgen surface gets it too, i.e. at BIND time ---
-# ⚠ fluid_query renders while DuckDB is BINDING, so this also pins that a pinned connection is
+# ⚠ fluid_replacement_query renders while DuckDB is BINDING, so this also pins that a pinned connection is
 # usable from inside the binder — the place where the ambient-clobbering hazard of ABI v80 lives.
 query I
-SELECT * FROM fluid_query('{% assign _ = exec("CREATE TEMP TABLE s2 AS SELECT 3 AS a UNION ALL SELECT 4") %}{% assign rows = query("SELECT sum(a) AS t FROM s2") %}SELECT {{ rows[0].t }} AS staged');
+SELECT * FROM fluid_replacement_query('{% assign _ = exec("CREATE TEMP TABLE s2 AS SELECT 3 AS a UNION ALL SELECT 4") %}{% assign rows = query("SELECT sum(a) AS t FROM s2") %}SELECT {{ rows[0].t }} AS staged');
 ----
 7
 
@@ -1727,13 +1727,13 @@ SELECT fluid_render('{{ exec("SELECT 1") }}', NULL);
 exec() runs WRITES only, and this statement is a SELECT
 
 # --- ⚠⚠ STAGING INTO A TEMP TABLE IS IDEMPOTENT UNDER BIND REPETITION; A REAL TABLE IS NOT ---
-# This is the property that makes the temp-table idiom the RIGHT one on the fluid_query surface
+# This is the property that makes the temp-table idiom the RIGHT one on the fluid_replacement_query surface
 # rather than merely the tidy one. §11 measured that a writing template behind a VIEW writes on
 # EVERY use (1 -> 2 -> 3 -> 4). A per-render connection turns that from a footgun into a non-issue
 # for staging specifically: each bind gets its own temporary catalog, so the same CREATE runs again
 # harmlessly. Staging into a REAL table hits the multiplication head-on and fails.
 statement ok
-CREATE VIEW v_stage AS SELECT * FROM fluid_query('{% assign _ = exec("CREATE TEMP TABLE st AS SELECT 5 AS a") %}{% assign r = query("SELECT a FROM st") %}SELECT {{ r[0].a }} AS staged');
+CREATE VIEW v_stage AS SELECT * FROM fluid_replacement_query('{% assign _ = exec("CREATE TEMP TABLE st AS SELECT 5 AS a") %}{% assign r = query("SELECT a FROM st") %}SELECT {{ r[0].a }} AS staged');
 
 query I
 SELECT staged FROM v_stage;
@@ -1753,7 +1753,7 @@ SELECT staged FROM v_stage;
 # It is pinned because it is the reason to reach for a TEMP table, and because a change in DuckDB's
 # bind repetition should arrive as a failed assertion naming this shape rather than as a surprise.
 statement ok
-CREATE VIEW w_stage AS SELECT * FROM fluid_query('{% assign _ = exec("CREATE TABLE realst AS SELECT 5 AS a") %}{% assign r = query("SELECT a FROM realst") %}SELECT {{ r[0].a }} AS staged');
+CREATE VIEW w_stage AS SELECT * FROM fluid_replacement_query('{% assign _ = exec("CREATE TABLE realst AS SELECT 5 AS a") %}{% assign r = query("SELECT a FROM realst") %}SELECT {{ r[0].a }} AS staged');
 
 statement error
 SELECT staged FROM w_stage;
@@ -1818,7 +1818,7 @@ v=11
 
 # --- and on the sqlgen surface, i.e. at BIND time ---
 query I
-SELECT * FROM fluid_query('{% exec %}CREATE TEMP TABLE blk_q AS SELECT 4 AS a UNION ALL SELECT 5{% endexec %}{% assign r = query("SELECT sum(a) AS t FROM blk_q") %}SELECT {{ r[0].t }} AS total');
+SELECT * FROM fluid_replacement_query('{% exec %}CREATE TEMP TABLE blk_q AS SELECT 4 AS a UNION ALL SELECT 5{% endexec %}{% assign r = query("SELECT sum(a) AS t FROM blk_q") %}SELECT {{ r[0].t }} AS total');
 ----
 9
 
@@ -1848,7 +1848,7 @@ SELECT count(*) FROM blk_brk;
 0
 
 # --- interpolation inside the block is RAW: `| sql` is what makes a VALUE safe ---
-# ⚠ Same rule as fluid_query, and for the same reason: a template must be able to emit object
+# ⚠ Same rule as fluid_replacement_query, and for the same reason: a template must be able to emit object
 # names and whole fragments, so `{{ x }}` cannot escape. The failure mode is a PARSER ERROR
 # rather than a silent injection, which is the safe direction but not a substitute for `| sql`.
 statement error
@@ -1946,7 +1946,7 @@ total=42
 
 # --- and on the sqlgen surface, i.e. at BIND time ---
 query I
-SELECT * FROM fluid_query('{% query cols %}SELECT 7 AS seven{% endquery %}SELECT {{ cols[0].seven }} AS n');
+SELECT * FROM fluid_replacement_query('{% query cols %}SELECT 7 AS seven{% endquery %}SELECT {{ cols[0].seven }} AS n');
 ----
 7
 
@@ -2462,7 +2462,7 @@ x
 
 # --- the headline: the user's own example, verbatim in shape ---
 query II
-SELECT * FROM fluid_query('
+SELECT * FROM fluid_replacement_query('
 {% exec arg1: 1, arg2: 5 %}
 create temporary table _result as
 SELECT i AS n, i * i AS sq FROM range($arg1, $arg2) t(i)
@@ -2480,7 +2480,7 @@ select * from {{ publish(''_result'') }}
 # literal renderer REFUSES a LIST outright, and collapses every temporal to TIMESTAMPTZ (§22). A DATE
 # that stays a DATE and a STRUCT that stays a STRUCT is the property publish() exists for. ---
 query III
-SELECT typeof(d), typeof(xs), typeof(s) FROM fluid_query('
+SELECT typeof(d), typeof(xs), typeof(s) FROM fluid_replacement_query('
 {% exec %}CREATE TEMP TABLE _t AS SELECT DATE ''2023-01-02'' AS d, [1,2,3] AS xs, {''a'': 7} AS s{% endexec %}
 SELECT * FROM {{ publish(''_t'') }}
 ');
@@ -2488,7 +2488,7 @@ SELECT * FROM {{ publish(''_t'') }}
 DATE	INTEGER[]	STRUCT(a INTEGER)
 
 query III
-SELECT d, xs[2], s.a FROM fluid_query('
+SELECT d, xs[2], s.a FROM fluid_replacement_query('
 {% exec %}CREATE TEMP TABLE _t2 AS SELECT DATE ''2023-01-02'' AS d, [1,2,3] AS xs, {''a'': 7} AS s{% endexec %}
 SELECT * FROM {{ publish(''_t2'') }}
 ');
@@ -2514,7 +2514,7 @@ true
 # publish on the same render — which is what shows the publication does not hold the pin's one live
 # result stream open (a second statement on a pin with a live stream is refused, §12). ---
 query III
-SELECT * FROM fluid_query('
+SELECT * FROM fluid_replacement_query('
 {% exec %}CREATE TEMP TABLE s1 AS SELECT i AS n FROM range(1,6) t(i){% endexec %}
 {% exec %}CREATE TEMP TABLE s2 AS SELECT n, n*10 AS ten FROM s1 WHERE n % 2 = 1{% endexec %}
 {% assign scan = publish(''s2'') %}
@@ -2531,7 +2531,7 @@ SELECT *, {{ chk[0].c }} AS staged_rows FROM {{ scan }}
 # this repo has paid for twice. One token, two references. ⚠ Note the fix its message names (publish again)
 # is itself bounded by the row below it — two publications in ONE template cannot be scanned together. ---
 statement error
-SELECT count(*) FROM fluid_query('
+SELECT count(*) FROM fluid_replacement_query('
 {% exec %}CREATE TEMP TABLE _t3 AS SELECT 1 AS a{% endexec %}
 {% assign p = publish(''_t3'') %}
 SELECT * FROM {{ p }} x JOIN {{ p }} y ON x.a = y.a
@@ -2555,7 +2555,7 @@ can be scanned ONCE
 # all three ARE the property under test — a loud refusal — and pinning which one arrives would be pinning
 # DuckDB's plan choice.
 statement error
-SELECT count(*) FROM fluid_query('
+SELECT count(*) FROM fluid_replacement_query('
 {% exec %}CREATE TEMP TABLE _t4 AS SELECT 1 AS a UNION ALL SELECT 2{% endexec %}
 SELECT * FROM {{ publish(''_t4'') }} x JOIN {{ publish(''_t4'') }} y ON x.a = y.a
 ');
@@ -2563,14 +2563,14 @@ SELECT * FROM {{ publish(''_t4'') }} x JOIN {{ publish(''_t4'') }} y ON x.a = y.
 <REGEX>:.*(open result stream|closed pending query result|scanned ONCE).*
 
 # --- POSITIVE CONTROL 1, and the first workaround: TWO SEPARATE RENDERS are two separate pins, so two
-# fluid_query calls in one statement each publish and scan happily. Without a control, the refusal above
+# fluid_replacement_query calls in one statement each publish and scan happily. Without a control, the refusal above
 # would be equally true of a build where publish() had stopped working altogether. ---
 query I
 SELECT count(*) FROM
-  (SELECT * FROM fluid_query('{% exec %}CREATE TEMP TABLE pa AS SELECT 1 AS k UNION ALL SELECT 2{% endexec %}
+  (SELECT * FROM fluid_replacement_query('{% exec %}CREATE TEMP TABLE pa AS SELECT 1 AS k UNION ALL SELECT 2{% endexec %}
 SELECT * FROM {{ publish(''pa'') }}')) x
 JOIN
-  (SELECT * FROM fluid_query('{% exec %}CREATE TEMP TABLE pb AS SELECT 1 AS k UNION ALL SELECT 2{% endexec %}
+  (SELECT * FROM fluid_replacement_query('{% exec %}CREATE TEMP TABLE pb AS SELECT 1 AS k UNION ALL SELECT 2{% endexec %}
 SELECT * FROM {{ publish(''pb'') }}')) y ON x.k = y.k;
 ----
 2
@@ -2579,7 +2579,7 @@ SELECT * FROM {{ publish(''pb'') }}')) y ON x.k = y.k;
 # relation. This keeps the work in DuckDB instead of shipping two relations out and back, so it is the
 # answer to reach for rather than a consolation. ---
 query I
-SELECT count(*) FROM fluid_query('
+SELECT count(*) FROM fluid_replacement_query('
 {% exec %}CREATE TEMP TABLE ja AS SELECT 1 AS k UNION ALL SELECT 2{% endexec %}
 {% exec %}CREATE TEMP TABLE jb AS SELECT 1 AS k UNION ALL SELECT 2{% endexec %}
 {% exec %}CREATE TEMP TABLE jj AS SELECT ja.k FROM ja JOIN jb ON ja.k = jb.k{% endexec %}
@@ -2592,7 +2592,7 @@ SELECT * FROM {{ publish(''jj'') }}
 # 1,000,000-row ceiling the buffered design needed. The relation streams and the scan's disposal releases
 # it, so the only limit is what DuckDB itself can stream. (Cheap: ~0.5 s.) ---
 query II
-SELECT count(*), sum(n) FROM fluid_query('
+SELECT count(*), sum(n) FROM fluid_replacement_query('
 {% exec %}CREATE TEMP TABLE bigpub AS SELECT i AS n FROM range(1200000) t(i){% endexec %}
 SELECT * FROM {{ publish(''bigpub'') }}
 ');
@@ -2604,7 +2604,7 @@ SELECT * FROM {{ publish(''bigpub'') }}
 # the one we kept, the first is reclaimed AND SAYS SO — the message naming the cause is the fix this
 # section was written for, since unregistering on eviction gave only "no named source registered". ---
 statement error
-SELECT * FROM fluid_query('
+SELECT * FROM fluid_replacement_query('
 {% exec %}CREATE TEMP TABLE _t5 AS SELECT 1 AS a{% endexec %}
 {% assign first = publish(''_t5'') %}
 {% for i in (1..33) %}{% assign _ = publish(''_t5'') %}{% endfor %}
@@ -2615,7 +2615,7 @@ was reclaimed
 
 # --- CONTROL: the identical shape with five extra publications is UNDER the cap and still works ---
 query I
-SELECT * FROM fluid_query('
+SELECT * FROM fluid_replacement_query('
 {% exec %}CREATE TEMP TABLE _t6 AS SELECT 1 AS a{% endexec %}
 {% assign first = publish(''_t6'') %}
 {% for i in (1..5) %}{% assign _ = publish(''_t6'') %}{% endfor %}
@@ -2630,7 +2630,7 @@ SELECT * FROM {{ first }}
 # plan assertion in this tree uses. It also asserts more — publish()'s rendered scan reached the PLAN.
 # CHARACTERIZATION of DuckDB's bind repetition, not of our code. ---
 query II
-EXPLAIN SELECT * FROM fluid_query('
+EXPLAIN SELECT * FROM fluid_replacement_query('
 {% exec %}CREATE TEMP TABLE _t7 AS SELECT 1 AS a{% endexec %}
 SELECT * FROM {{ publish(''_t7'') }}
 ');
@@ -2639,7 +2639,7 @@ physical_plan	<REGEX>:.*FABRICATOR_SCAN.*
 
 # --- a name that is not there fails naming the table AND the SELECT we built from it ---
 statement error
-SELECT * FROM fluid_query('SELECT * FROM {{ publish(''nosuchstaged'') }}');
+SELECT * FROM fluid_replacement_query('SELECT * FROM {{ publish(''nosuchstaged'') }}');
 ----
 Table with name nosuchstaged does not exist
 
@@ -2654,7 +2654,7 @@ statement ok
 CREATE TABLE "pub odd" AS SELECT 5 AS a;
 
 query I
-SELECT * FROM fluid_query('SELECT * FROM {{ publish(''pub odd'') }}');
+SELECT * FROM fluid_replacement_query('SELECT * FROM {{ publish(''pub odd'') }}');
 ----
 5
 
@@ -2664,7 +2664,7 @@ SELECT * FROM fluid_query('SELECT * FROM {{ publish(''pub odd'') }}');
 # multi-step row above asserts. ⚠ Laziness removes SIZE as the discriminator (there is no row cap); it
 # does not remove this one. ---
 query II
-SELECT count(*), sum(sq) FROM fluid_query('
+SELECT count(*), sum(sq) FROM fluid_replacement_query('
 {% assign lo = 1 %}{% assign hi = 5 %}
 WITH _result AS MATERIALIZED (
   SELECT i AS n, i * i AS sq FROM range({{ lo }}, {{ hi }}) t(i)
@@ -2692,7 +2692,7 @@ SELECT * FROM _result');
 # --- exactly ONE batch: the target is met precisely, and the next get_next must not re-Fetch a closed
 # result. sum(0..122879) = 122879*122880/2 = 7549685760 ---
 query II
-SELECT count(*), sum(n) FROM fluid_query('
+SELECT count(*), sum(n) FROM fluid_replacement_query('
 {% exec %}CREATE TEMP VIEW bb1 AS SELECT i AS n FROM range(0, 122880) t(i){% endexec %}
 SELECT * FROM {{ publish(''bb1'') }}
 ');
@@ -2701,7 +2701,7 @@ SELECT * FROM {{ publish(''bb1'') }}
 
 # --- ONE OVER: a full batch plus a 1-row tail, which is the short-tail path ---
 query II
-SELECT count(*), sum(n) FROM fluid_query('
+SELECT count(*), sum(n) FROM fluid_replacement_query('
 {% exec %}CREATE TEMP VIEW bb2 AS SELECT i AS n FROM range(0, 122881) t(i){% endexec %}
 SELECT * FROM {{ publish(''bb2'') }}
 ');
@@ -2710,7 +2710,7 @@ SELECT * FROM {{ publish(''bb2'') }}
 
 # --- ONE UNDER: the target is NEVER met, so the loop must exit on EOF with a partial batch appended ---
 query II
-SELECT count(*), sum(n) FROM fluid_query('
+SELECT count(*), sum(n) FROM fluid_replacement_query('
 {% exec %}CREATE TEMP VIEW bb3 AS SELECT i AS n FROM range(0, 122879) t(i){% endexec %}
 SELECT * FROM {{ publish(''bb3'') }}
 ');
@@ -2719,7 +2719,7 @@ SELECT * FROM {{ publish(''bb3'') }}
 
 # --- SEVERAL batches plus a tail, so the loop runs more than once in one stream ---
 query II
-SELECT count(*), sum(n) FROM fluid_query('
+SELECT count(*), sum(n) FROM fluid_replacement_query('
 {% exec %}CREATE TEMP VIEW bb4 AS SELECT i AS n FROM range(0, 300000) t(i){% endexec %}
 SELECT * FROM {{ publish(''bb4'') }}
 ');
@@ -2728,7 +2728,7 @@ SELECT * FROM {{ publish(''bb4'') }}
 
 # --- ⚠ EMPTY: zero rows must not accumulate anything, and the first get_next is already EOF ---
 query II
-SELECT count(*), coalesce(sum(n), -1) FROM fluid_query('
+SELECT count(*), coalesce(sum(n), -1) FROM fluid_replacement_query('
 {% exec %}CREATE TEMP VIEW bb5 AS SELECT i AS n FROM range(0, 122880) t(i) WHERE i < 0{% endexec %}
 SELECT * FROM {{ publish(''bb5'') }}
 ');
@@ -2739,7 +2739,7 @@ SELECT * FROM {{ publish(''bb5'') }}
 # column relative to another would keep the counts right and the pairing wrong. n and its double must
 # still agree on every row, checked by an aggregate that can only hold if they do. ---
 query I
-SELECT count(*) FROM fluid_query('
+SELECT count(*) FROM fluid_replacement_query('
 {% exec %}CREATE TEMP VIEW bb6 AS SELECT i AS n, i * 2 AS d FROM range(0, 200000) t(i){% endexec %}
 SELECT * FROM {{ publish(''bb6'') }}
 ') WHERE d <> n * 2;
@@ -2811,7 +2811,7 @@ SELECT tag, n FROM fluid_query_batch('
 ----
 g	3
 
-# --- the params bag reaches the template, in the STRUCT spelling fluid_query takes. ---
+# --- the params bag reaches the template, in the STRUCT spelling fluid_replacement_query takes. ---
 query II
 SELECT pre, n FROM fluid_query_batch(
   'SELECT {{ params.pre | sql }} AS pre, count(*)::BIGINT AS n FROM input_table',
@@ -2850,7 +2850,7 @@ SELECT {{ seen }}::BIGINT AS grp, count(*)::BIGINT AS n FROM input_table',
 
 # --- THE CASE THAT JUSTIFIES THE FUNCTION: the SQL TEXT depends on the DATA. A driver relation names the
 # tables; the template reads it with {% query %} and fans out one UNION ALL branch per row. Nothing about
-# this is expressible through fluid_query, whose render sees only constants. ---
+# this is expressible through fluid_replacement_query, whose render sees only constants. ---
 statement ok
 CREATE TABLE fqb_t1 AS SELECT 1 AS v;
 
@@ -2883,7 +2883,7 @@ SELECT n FROM fluid_query_batch('SELECT count(*)::BIGINT AS n FROM input_table',
 # --- ⚠⚠ publish() IS REFUSED, AND THE REFUSAL REPLACES A HANG. This surface runs the generated statement
 # on the render's OWN pinned connection, so scanning a publication re-enters that connection while it is
 # mid-query — MEASURED to deadlock (2 min, killed) rather than to raise the one-live-result error, while
-# the identical template through fluid_query returns in seconds. A test that reproduced the hazard would
+# the identical template through fluid_replacement_query returns in seconds. A test that reproduced the hazard would
 # HANG the tier instead of failing it, so what is pinned is the refusal. ---
 statement error
 SELECT * FROM fluid_query_batch('
@@ -2892,11 +2892,11 @@ SELECT * FROM {{ publish(''pubs'') }}', (SELECT * FROM range(2) t(i)));
 ----
 publish() cannot be used here
 
-# --- the same publish() is still ALLOWED in fluid_query, where the caller's plan scans it on a different
+# --- the same publish() is still ALLOWED in fluid_replacement_query, where the caller's plan scans it on a different
 # connection. Without this row the refusal above would pass equally on a build where publish had simply
 # stopped working. ---
 query I
-SELECT a FROM fluid_query('
+SELECT a FROM fluid_replacement_query('
 {% exec %}CREATE TEMP TABLE pubok AS SELECT 7 AS a{% endexec %}
 SELECT * FROM {{ publish(''pubok'') }}');
 ----
@@ -3046,10 +3046,10 @@ SELECT fluid_render('top={{ params }} nested={{ params.params }} other={{ params
 ----
 top={"params":inner,"x":1} nested=inner other=1
 
-# --- it is the SAME bag on every surface, because all three go through one walk. fluid_query renders at
+# --- it is the SAME bag on every surface, because all three go through one walk. fluid_replacement_query renders at
 # BIND from constants ... ---
 query II
-SELECT * FROM fluid_query('SELECT {{ params.n }} AS viadot, {{ params.n | plus: 1 }} AS viaplus',
+SELECT * FROM fluid_replacement_query('SELECT {{ params.n }} AS viadot, {{ params.n | plus: 1 }} AS viaplus',
                           params := {'n': 4});
 ----
 4	5
@@ -3502,10 +3502,10 @@ A
 statement ok
 DROP TABLE ret_aud;
 
-# --- IN fluid_query IT TRUNCATES THE GENERATED STATEMENT, which is the point of having it on that surface:
+# --- IN fluid_replacement_query IT TRUNCATES THE GENERATED STATEMENT, which is the point of having it on that surface:
 # the ` WHERE 1=0` is never rendered, so the statement that runs is `SELECT 7 AS v`. ---
 query I
-SELECT * FROM fluid_query('SELECT 7 AS v{% ret %} WHERE 1=0');
+SELECT * FROM fluid_replacement_query('SELECT 7 AS v{% ret %} WHERE 1=0');
 ----
 7
 
@@ -4371,22 +4371,22 @@ SELECT DISTINCT f.g FROM (VALUES (1), (2)) t(n), fluid_query_lateral(
 ----
 ch
 
-# --- ⚠ fluid_query: its {% query %} BODY sees the variable, because that runs on the pin. ---
+# --- ⚠ fluid_replacement_query: its {% query %} BODY sees the variable, because that runs on the pin. ---
 query T
-SELECT body_saw FROM fluid_query(
+SELECT body_saw FROM fluid_replacement_query(
   '{% query r %}SELECT getvariable(''params'').region AS g{% endquery %}SELECT ''{{ r[0].g }}'' AS body_saw',
   params := {'region': 'se'});
 ----
 se
 
-# --- ⚠⚠ AND THE BOUNDARY, WHICH IS BY DESIGN: in fluid_query the variable is readable from an explicit
+# --- ⚠⚠ AND THE BOUNDARY, WHICH IS BY DESIGN: in fluid_replacement_query the variable is readable from an explicit
 # {% query %} / {% exec %} block and NOT from the generated statement. That statement is returned as text
 # and bound by the CALLER's connection — a different ClientContext, and therefore a different variable map.
 # Nothing is lost: a template that GENERATES SQL interpolates its params into it directly, which is what the
 # template language is for. The three surfaces above differ precisely because WE run their generated
 # statement, on the same pin the blocks use. ---
 query T
-SELECT typeof(v) FROM fluid_query('SELECT getvariable(''params'') AS v', params := {'region': 'se'});
+SELECT typeof(v) FROM fluid_replacement_query('SELECT getvariable(''params'') AS v', params := {'region': 'se'});
 ----
 "NULL"
 

@@ -17,8 +17,8 @@ namespace Fabricator.FluidPlugin;
 /// </summary>
 /// <remarks>
 /// <para>
-/// <b>⚠⚠ IT IS AVAILABLE ON BOTH SURFACES — USER DECISION (2026-09-02) — AND IN <c>fluid_query</c> IT WRITES
-/// DURING BINDING, WHICH MULTIPLIES.</b> A <c>fluid_query</c> template is rendered during
+/// <b>⚠⚠ IT IS AVAILABLE ON BOTH SURFACES — USER DECISION (2026-09-02) — AND IN <c>fluid_replacement_query</c> IT WRITES
+/// DURING BINDING, WHICH MULTIPLIES.</b> A <c>fluid_replacement_query</c> template is rendered during
 /// <c>bind_replace</c>, and a bind REPEATS and happens WITHOUT execution. MEASURED, one audit table through
 /// three steps that execute nothing the caller wrote: <c>EXPLAIN</c> of a never-run statement gives
 /// <b>1</b>; merely defining a VIEW over it gives <b>2</b>; ONE <c>SELECT</c> from that view gives <b>3</b>.
@@ -26,7 +26,7 @@ namespace Fabricator.FluidPlugin;
 /// because it works in testing, where the statement runs once.
 /// </para>
 /// <para>
-/// ⚠ <b>An earlier build REFUSED this in <c>fluid_query</c> behind a fail-closed opt-in, and that mechanism
+/// ⚠ <b>An earlier build REFUSED this in <c>fluid_replacement_query</c> behind a fail-closed opt-in, and that mechanism
 /// was DELETED rather than left defaulted-on</b> — with both surfaces permitting exec it would have been
 /// vestigial machinery that reads as a restriction while restricting nothing. What justified removing it
 /// beyond the decision: the refusal never made bind-time writes impossible, only inconvenient.
@@ -36,7 +36,7 @@ namespace Fabricator.FluidPlugin;
 /// recorded in §11.1: a per-render permission ambient, fail-closed, set by the surface.
 /// </para>
 /// <para>
-/// ⚠ <b>For DDL, prefer <c>fluid_render</c> anyway</b> — not because <c>fluid_query</c> refuses, but
+/// ⚠ <b>For DDL, prefer <c>fluid_render</c> anyway</b> — not because <c>fluid_replacement_query</c> refuses, but
 /// because a bind you did not ask for is a write you did not ask for.
 /// </para>
 /// <para>

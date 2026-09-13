@@ -24,7 +24,11 @@
 Preserved close to verbatim, because the sketches are design input and the reasoning behind them is not
 recoverable from the code.
 
-### 1.1 `fluid_query` — a global **sqlgen** table function
+### 1.1 `fluid_replacement_query` — a global **sqlgen** table function
+
+> ⚠ Named `fluid_query` when this was written; renamed 2026-09-13 (§41), and the
+> historical sections were swept with it because the old name is REUSED for a different
+> function (§42). See §41.2 for why that inverts this file's usual convention.
 
 Accepts a template and a JSON argument; the rendered text IS the SQL. Fluid can reach a
 `System.Text.Json` `JsonNode` directly, so `JsonToClr` (the hand-rolled mapper `fluid_render` uses)
@@ -109,7 +113,7 @@ an ABI crossing, or where the ambient still flows from one. `AsyncLocal`, so it 
 
 ## 3. ⚠⚠ THE HAZARD TO SETTLE BEFORE BUILDING §1.2 OR §1.4 — **MEASURED AND CLOSED, see §8**
 
-**A sqlgen function renders at BIND.** So a Fluid `query` function used inside `fluid_query` would run
+**A sqlgen function renders at BIND.** So a Fluid `query` function used inside `fluid_replacement_query` would run
 `host_query` *while DuckDB is binding a statement* — re-entrant query execution during bind. This project
 has been bitten by that class twice: the ABI v80 scalar-bind ambient SIGSEGV under `OPTIMIZE`, and the
 standing rule *never call anything that BINDS while holding `entry_lock_`*.
@@ -123,7 +127,7 @@ one thing: the probe found a hazard neither branch below anticipated — a bind-
 The original framing was:
 
 - If bind-time `host_query` is safe ⇒ `query` works in both `fluid_render` (execute time) and
-  `fluid_query` (bind time).
+  `fluid_replacement_query` (bind time).
 - If it is not ⇒ **`query` is available at execute time and REFUSED at bind time**, which is a real
   asymmetry the surface has to state rather than hide.
 
@@ -131,7 +135,7 @@ The original framing was:
 
 | slice | contents | why here |
 |---|---|---|
-| **1** ✅ | `fluid_query` + **the value model**: the `ValueConverters` mapping, and the Arrow→`FluidValue` wrapping (`ArrowStruct : IFluidIndexable`, name AND index access, nested list → enumerable). BUILT — see §7 | Slices 3 and 5 both reuse the value model, so it was built ONCE here. Needed no new ABI and no new seam, exactly as §2 predicted |
+| **1** ✅ | `fluid_replacement_query` + **the value model**: the `ValueConverters` mapping, and the Arrow→`FluidValue` wrapping (`ArrowStruct : IFluidIndexable`, name AND index access, nested list → enumerable). BUILT — see §7 | Slices 3 and 5 both reuse the value model, so it was built ONCE here. Needed no new ABI and no new seam, exactly as §2 predicted |
 | **2** ✅ | **Probe** bind-time `host_query` (§3) — DONE, see §8 | One measurement; it came back PERMISSIVE, and added a SELECT-only refusal to slice 3's scope |
 | **3** ✅ | `HostQueryTransport` seam in Abstractions + the Fluid `query` function. BUILT — see §9 | Needs 1's row wrapping and 2's verdict |
 | **4** ✅ | `ITemplateFileProvider` — BUILT, see §10. ⚠ **NOT over a host-FS seam**: one was built and MEASURED unusable (a global function has no ambient opener), so it reads `read_blob` over slice 3's `HostQueryTransport` | Predicted independent of 3; it turned out to DEPEND on 3 |
@@ -165,20 +169,22 @@ The original framing was:
   DuckDB function through it. Re-derive the case for it AFTER slice 3, rather than inheriting it from this
   list.
 
-## 7. Slice 1 AS BUILT (2026-09-01) — `fluid_query` + the shared value model
+## 7. Slice 1 AS BUILT (2026-09-01) — `fluid_replacement_query` + the shared value model
+
+> ⚠ Written as `fluid_query`; renamed 2026-09-13 — see §41.2.
 
 C#-only, NO ABI change, NO C++ change, no bridge change: `IBackend.GlobalSqlTableFunctions` already existed,
 which is the §2 finding paying out immediately. Three new files in the plugin
-(`FluidValueModel.cs`, `FluidEngine.cs`, `FluidQueryFunction.cs`); `FluidPlugin.cs` keeps only the two
+(`FluidValueModel.cs`, `FluidEngine.cs`, `FluidReplacementQueryFunction.cs`); `FluidPlugin.cs` keeps only the two
 `IBackend` members and the render function. Gate `verify_plugin_fluid` **23 → 89**, seven mutants each killed
 at its own assertion.
 
 ```sql
-SELECT * FROM fluid_query('SELECT {{ n }} AS n', params := {'n': 7});
+SELECT * FROM fluid_replacement_query('SELECT {{ n }} AS n', params := {'n': 7});
 ```
 
 `template` is positional and NON-nullable; **`params` is NAMED and optional** (the `fabricator_sql_seq(2,
-cols := 3)` precedent), so a template with no variables is simply `fluid_query('SELECT 1')`. It takes the
+cols := 3)` precedent), so a template with no variables is simply `fluid_replacement_query('SELECT 1')`. It takes the
 same bag `fluid_render` does — a STRUCT, a MAP, or a JSON string — because a params bag has to mean the
 same thing in both.
 
@@ -201,7 +207,7 @@ probe that COMPARES and does ARITHMETIC can see it.** Bound with no value conver
 The leaves arrive as opaque nodes: they format faithfully and compare as nothing. ⇒ **every render assertion
 in `verify_plugin_fluid` passes on a build with no converter**, which is why the suite now asserts comparison
 and arithmetic on BOTH the JSON and the Arrow path, and why mutant M1 (drop the converter) is the one that
-justifies the file. For `fluid_query` a wrong `{% if %}` branch is a wrong SQL STATEMENT, not a formatting
+justifies the file. For `fluid_replacement_query` a wrong `{% if %}` branch is a wrong SQL STATEMENT, not a formatting
 nit.
 
 ⚠ The control that makes this a measurement rather than a guess: `d.Root` / `d.Parent` / `d.Options` do NOT
@@ -302,7 +308,7 @@ at all: nothing in the plan mentions dates.
 **A DATE RENDERED THE PREVIOUS DAY.** On a UTC+2 box, `fluid_render('{{ d }}', {'d': DATE '2026-09-01'})`
 returned **`2026-08-31 22:00:00Z`**. `Date32Array.GetDateTime` returns a `DateTime` with
 `Kind = Unspecified`, which Fluid resolves against the machine's LOCAL zone. Pre-existing, and made worse by
-this slice: `fluid_query` would splice that wrong date into a statement. Fixed by stamping the Kind
+this slice: `fluid_replacement_query` would splice that wrong date into a statement. Fixed by stamping the Kind
 (`DateTime.SpecifyKind(..., DateTimeKind.Utc)`); mutant M6.
 
 ⚠ **BOTH OBVIOUS FIXES WERE MEASURED AND BOTH ARE WRONG** — worth recording, because each looks like the
@@ -414,13 +420,13 @@ with the reference it already has; that is not luck, it is the same property §2
 
 ### 7.6 The sqlgen properties, gated
 
-MEASURED via `EXPLAIN`: `SELECT id FROM fluid_query('SELECT * FROM fq_t WHERE g = {{ g }}', params := {'g': 3})`
+MEASURED via `EXPLAIN`: `SELECT id FROM fluid_replacement_query('SELECT * FROM fq_t WHERE g = {{ g }}', params := {'g': 3})`
 plans as a bare `SEQ_SCAN` on `fq_t` with `Projections: id` and `Filters: g=3`. The call is GONE and both
 pushdowns reached the base table — the property that separates sqlgen from a marshaled table function, and
 one no row assertion can see. ⚠ `EXPLAIN` cannot be a subquery source, so the gate uses the sqllogictest
 `<REGEX>:` form on the `physical_plan` row.
 
-A VIEW over `fluid_query` re-binds on every use, which is why `GenerateSql` must stay deterministic and
+A VIEW over `fluid_replacement_query` re-binds on every use, which is why `GenerateSql` must stay deterministic and
 side-effect-free — and it is exactly why slice 3's Fluid `query` function is a separate question (§3) rather
 than a free addition.
 
@@ -449,7 +455,7 @@ case. Both of these work and both are gated:
 - **Nothing asserts thread safety.** `TemplateOptions`, the `FluidParser` and the parsed-template cache are
   shared across a batch and across concurrent scans; the reasoning is that all three are read-only after
   construction (`ConcurrentDictionary` for the cache), not that a test proved it.
-- **`fluid_query` is service-tier only**, because the hermetic tier's plugin root is empty by design — so a
+- **`fluid_replacement_query` is service-tier only**, because the hermetic tier's plugin root is empty by design — so a
   hermetic run says nothing about any of this.
 
 ### 7.8 What slice 1 leaves for the rest
@@ -458,7 +464,7 @@ case. Both of these work and both are gated:
   slice 3 adds only the list-of-rows and the transport.
 - §3's bind-time hazard is UNCHANGED and still unmeasured — nothing in slice 1 executes SQL, it only
   generates text. Slice 2 is still the next thing.
-- ⚠ `fluid_query` gives §3 a sharper edge than the plan anticipated: a Fluid `query` inside `fluid_query`
+- ⚠ `fluid_replacement_query` gives §3 a sharper edge than the plan anticipated: a Fluid `query` inside `fluid_replacement_query`
   would execute SQL inside `bind_replace`, i.e. during the binder's own walk, not merely "during bind".
 
 ## 8. Slice 2 — the bind-time `host_query` PROBE: MEASURED SAFE (2026-09-01)
@@ -466,7 +472,7 @@ case. Both of these work and both are gated:
 **§3's hazard is CLOSED, and the answer is the permissive one.** Bind-time `host_query` neither deadlocks nor
 crashes, and — the part §3 did not anticipate — its transaction semantics are the SAME at bind and at
 execute, so there is no asymmetry for the surface to state. `query` can exist in BOTH `fluid_render`
-(execute time) and `fluid_query` (bind time). **Slice 3 is unblocked in its simple form.**
+(execute time) and `fluid_replacement_query` (bind time). **Slice 3 is unblocked in its simple form.**
 
 Method: a THROWAWAY `ISqlTableFunction` (`fabricator_bind_probe(sql)`) in `Fabricator.SqlServer` whose
 `GenerateSql` calls `Host.Query` and splices the scalar result into the generated SQL — i.e. a real
@@ -644,7 +650,7 @@ A template can ask the database what SQL to generate, **at bind time** — MEASU
 statement decided by rows read during `bind_replace`:
 
 ```sql
-SELECT * FROM fluid_query('SELECT {% assign rs = query("SELECT nm FROM cols ORDER BY ord") %}
+SELECT * FROM fluid_replacement_query('SELECT {% assign rs = query("SELECT nm FROM cols ORDER BY ord") %}
   {% for r in rs %}{{ r.nm | sql }} AS {{ r.nm | sql_ident }}{% unless forloop.last %}, {% endunless %}{% endfor %}');
 -- columns: alpha, beta  — names that exist only in `cols`
 ```
@@ -923,7 +929,7 @@ each killed at its own assertion.
 
 ```sql
 SET GLOBAL fluid_template_root = 's3://analytics/templates';
-SELECT * FROM fluid_query('{% include ''dims/customer'' %}', params := {'region': 'eu'});
+SELECT * FROM fluid_replacement_query('{% include ''dims/customer'' %}', params := {'region': 'eu'});
 ```
 
 ### 10.1 ⚠⚠ THE PLAN SAID "A `HostFs` SEAM". ONE WAS BUILT, AND IT CANNOT WORK FROM HERE
@@ -944,7 +950,7 @@ Fatal error. 0xC0000005
 
 **Every `fs_*` host callback takes the calling operator's `ClientContext` as its opener and dereferences it
 (`auto *ctx = reinterpret_cast<ClientContext *>(opener); FileSystem::GetFileSystem(*ctx)`), and a GLOBAL
-function has no ambient opener established.** Both `fluid_render` (a global scalar) and `fluid_query`
+function has no ambient opener established.** Both `fluid_render` (a global scalar) and `fluid_replacement_query`
 (a global sqlgen table function) are exactly that. So the blocker was never the assembly the type lives in —
 **it is that the AMBIENT the seam needs is not established for global functions**, which §2 could not see
 because it was reasoning about references rather than about call context.
@@ -989,14 +995,14 @@ catalog and scan crossings and **not from a global scalar's execute**.
    `arrow_ingest.cpp`, where a table function's bind and scan DO call `set_active_opener`. It came back
    negative, so I recorded the whole thing as an invention. ⚠ **A single negative probe of a plausible
    candidate is not a refutation of the class.**
-3. **Then the right probe found it in one statement.** `fluid_query` — whose sqlgen `bind_replace` runs on
+3. **Then the right probe found it in one statement.** `fluid_replacement_query` — whose sqlgen `bind_replace` runs on
    the BINDER's thread, the same thread that later evaluates the scalar — leaks where a table function's
    scan (a worker thread) does not:
 
    | between `SET` and `fluid_render('{% include … %}')` | result |
    |---|---|
    | nothing | **fails** — "no root is set" |
-   | `SELECT * FROM fluid_query('SELECT 1 AS x')` | **renders** |
+   | `SELECT * FROM fluid_replacement_query('SELECT 1 AS x')` | **renders** |
 
    ⇒ the original claim was RIGHT, the retraction was WRONG, and only the third attempt had a
    DISCRIMINATOR. The lesson is not "trust the first instinct": it is that steps 1 and 2 were both
@@ -1157,7 +1163,7 @@ the code:
 - **Slice 5 (§1.4) should still be RE-DERIVED, not inherited** — §9.9's reasoning is unchanged.
 - **The ambient gap (10.2) is the real follow-on**, and it is not Fluid's: until a global function can reach
   the host filesystem and its own session's settings, every plugin has the same two limitations.
-- ⚠ A per-call `template_root` argument was considered and not built. It is clean for `fluid_query` (a named
+- ⚠ A per-call `template_root` argument was considered and not built. It is clean for `fluid_replacement_query` (a named
   table-function parameter) and awkward for `fluid_render` (a scalar, so a third parameter means a second
   arity), and the global setting plus absolute paths covers the cases. Revisit if the process-wide scope
   becomes a real complaint rather than an aesthetic one.
@@ -1178,19 +1184,19 @@ SELECT fluid_render('deleted={{ "DELETE FROM t WHERE g = $g" | exec: g: "eu" }}'
 It also gives `IHostQuery.ExecuteNonQuery` its first caller — the member §8.2a of docs/plugin-services.md
 recorded as ungated hours earlier.
 
-### 11.1 ⚠⚠ IT IS AVAILABLE ON BOTH SURFACES (user decision) — AND IN `fluid_query` A WRITE MULTIPLIES
+### 11.1 ⚠⚠ IT IS AVAILABLE ON BOTH SURFACES (user decision) — AND IN `fluid_replacement_query` A WRITE MULTIPLIES
 
 **User, 2026-09-02: *"no problem to have a exec() in render or query."*** The first build refused `exec()` in
-`fluid_query` behind a fail-closed opt-in; that mechanism is DELETED. What replaces it is not silence — the
+`fluid_replacement_query` behind a fail-closed opt-in; that mechanism is DELETED. What replaces it is not silence — the
 gate now PINS the cost as asserted behaviour, which is a stronger record than a refusal plus prose.
 
-A `fluid_query` template renders inside `bind_replace`, and a bind REPEATS and happens WITHOUT execution.
+A `fluid_replacement_query` template renders inside `bind_replace`, and a bind REPEATS and happens WITHOUT execution.
 **MEASURED, one counter through four steps that execute nothing the caller wrote:**
 
 | step | rows written |
 |---|---|
-| `EXPLAIN SELECT * FROM fluid_query('… {{ exec("INSERT …") }} …')` | **1** |
-| merely `CREATE VIEW v AS SELECT * FROM fluid_query(…)` | **2** |
+| `EXPLAIN SELECT * FROM fluid_replacement_query('… {{ exec("INSERT …") }} …')` | **1** |
+| merely `CREATE VIEW v AS SELECT * FROM fluid_replacement_query(…)` | **2** |
 | one `SELECT count(*) FROM v` | **3** |
 | a second `SELECT count(*) FROM v` | **4** |
 
@@ -1211,18 +1217,18 @@ inconvenient: see §11.1a, where a write reached bind time through `query()` bef
 **To restore a restriction**, the design is here rather than in git history: a per-render permission carried
 as a `TemplateContext.AmbientValues` flag (it cannot be a captured variable — the FILTER form is registered
 once on the shared `TemplateOptions`), **fail-closed**, set by each surface. ⚠ And do NOT derive it from the
-caller's NAME: an unrecognised name reads as "not `fluid_query`" and would be ALLOWED, so a surface added
+caller's NAME: an unrecognised name reads as "not `fluid_replacement_query`" and would be ALLOWED, so a surface added
 later would default to the dangerous answer.
 
 ### 11.1b ⚠⚠ A STATEMENT CANNOT SEE THE WRITE ITS OWN TEMPLATE MADE — so "prepare then select" DOES NOT WORK
 
-**Found by asking what `exec()` in `fluid_query` is actually FOR, once it was permitted — i.e. by trying the
+**Found by asking what `exec()` in `fluid_replacement_query` is actually FOR, once it was permitted — i.e. by trying the
 pattern a user would try first, rather than only testing the hazard.** MEASURED 2026-09-02:
 
 ```sql
 CREATE TABLE ex_prep(c INTEGER); INSERT INTO ex_prep VALUES (1);
 
-SELECT c FROM fluid_query('{% assign _ = exec("UPDATE ex_prep SET c = 42") %}SELECT c FROM ex_prep');
+SELECT c FROM fluid_replacement_query('{% assign _ = exec("UPDATE ex_prep SET c = 42") %}SELECT c FROM ex_prep');
 --> 1     the generated SQL reads the OLD state
 SELECT c FROM ex_prep;
 --> 42    the write was real
@@ -1237,7 +1243,7 @@ thing to remember.
 **And therefore a template cannot create a table the same statement selects from:**
 
 ```sql
-SELECT * FROM fluid_query('{% assign _ = exec("CREATE OR REPLACE TABLE t AS SELECT 1 AS c") %}SELECT c FROM t');
+SELECT * FROM fluid_replacement_query('{% assign _ = exec("CREATE OR REPLACE TABLE t AS SELECT 1 AS c") %}SELECT c FROM t');
 --> Catalog Error: Table with name t does not exist!  Did you mean "memory.t"?
 ```
 
@@ -1248,7 +1254,7 @@ rather than described, precisely because the message points away from the cause.
 ⚠ **What works is a SEPARATE statement**: `exec()` in one, the read in the next. Gated, so the workaround is
 not folklore.
 
-⇒ **so what is `exec()` in `fluid_query` good for?** Side effects the statement does not itself read —
+⇒ **so what is `exec()` in `fluid_replacement_query` good for?** Side effects the statement does not itself read —
 audit rows, logging, staging for a LATER statement — plus the ordinary case of a template that writes and
 returns a count. Not for preparing data the generated SQL consumes. ⚠ That is a real narrowing of the
 capability, and it is nobody's fault: it is the connection model, and it would be there whether or not
@@ -1266,7 +1272,7 @@ outer transaction has not yet touched**:
 
 ```sql
 ATTACH ':memory:' AS scratch;
-SELECT * FROM fluid_query('
+SELECT * FROM fluid_replacement_query('
 {% exec %}CREATE OR REPLACE TABLE scratch.st AS SELECT 42 AS a{% endexec %}
 SELECT * FROM scratch.st');
 --> a = 42        the SAME statement reads what its own template just created
@@ -1291,7 +1297,7 @@ one explicit transaction, same table shape, the only difference being one preced
 ```sql
 BEGIN;
 SELECT count(*) FROM scratch.seed;      -- touch the catalog FIRST
-SELECT * FROM fluid_query('{% exec %}CREATE OR REPLACE TABLE scratch.st2 …{% endexec %}
+SELECT * FROM fluid_replacement_query('{% exec %}CREATE OR REPLACE TABLE scratch.st2 …{% endexec %}
                            SELECT * FROM scratch.st2');
 --> Catalog Error: Table with name st2 does not exist!
 -- CONTROL: the identical transaction WITHOUT that first read --> a = 8
@@ -1299,7 +1305,7 @@ SELECT * FROM fluid_query('{% exec %}CREATE OR REPLACE TABLE scratch.st2 …{% e
 
 ⚠⚠ **So it is a TIMING artefact, not a supported route, and it must not be recommended or gated as a
 feature.** It breaks on anything that touches the staging catalog earlier in the same transaction — a
-preceding statement, a second `fluid_query` reading the same scratch catalog, a view whose body references
+preceding statement, a second `fluid_replacement_query` reading the same scratch catalog, a view whose body references
 it — and it breaks by raising a catalog error that names the table it just created, i.e. §11.1b's own
 misleading message. What it is good for is understanding WHY the sound route has to be a TABLE FUNCTION
 (§17.12): a marshaled scan reads through its own connection and asks the caller's catalog nothing, so the
@@ -1315,8 +1321,8 @@ Found by asking whether the boundary can be nested around, rather than assuming 
 SELECT json_serialize_sql('SELECT fabricator_host_exec(''INSERT INTO aud VALUES (1)'')');
 --> error = false, i.e. it IS a SELECT, which is CORRECT
 
--- so a fluid_query template reaches a write through query(), AT BIND TIME
-SELECT * FROM fluid_query(
+-- so a fluid_replacement_query template reaches a write through query(), AT BIND TIME
+SELECT * FROM fluid_replacement_query(
   'SELECT {{ query("SELECT fabricator_host_exec(''INSERT INTO aud VALUES (1)'') AS c")[0].c }} AS n');
 --> aud goes 0 -> 1
 ```
@@ -1336,7 +1342,7 @@ projection.
   reachable before `exec()` existed.
 - Same conclusion §10.4 reached one level down about the template ROOT — *ergonomics, not a sandbox* — for
   the same reason: **the renderer can already run SQL.** Anyone who can call `fluid_render` or
-  `fluid_query` can call `fabricator_exec` directly.
+  `fluid_replacement_query` can call `fabricator_exec` directly.
 - ⚠ **Do NOT "fix" it by blacklisting function names in the classified SQL.** That is the prefix-check
   anti-pattern in a new costume: an allow-list of safe functions is unmaintainable, and a deny-list is
   defeated by a macro, a view, or a name we do not ship.
@@ -1416,7 +1422,7 @@ description, not the behaviour.
 
 ### 11.6 What is pinned, and the honest gaps
 
-Gated: the write and its count; **the four-step bind-time multiplication in `fluid_query`** (each step
+Gated: the write and its count; **the four-step bind-time multiplication in `fluid_replacement_query`** (each step
 against a fresh counter, so it reads as three facts rather than one total) with a `query()`-still-works
 POSITIVE CONTROL beside it and an assertion that the *other* table was untouched; `EXPLAIN` not writing on
 the `fluid_render` side; both SELECT refusals; the syntax-error path; the DDL/CTAS/host_exec triple;
@@ -1455,7 +1461,7 @@ fact. It is really two:
 
 The first was an artefact of every call opening its own connection; the second is the snapshot the outer
 statement already holds, and no connection change touches it. §11.1b's conclusion — *"exec() in
-fluid_query is for side effects the statement does not itself read"* — therefore still holds for the
+fluid_replacement_query is for side effects the statement does not itself read"* — therefore still holds for the
 OUTER statement and no longer holds within the template.
 
 MEASURED, one render:
@@ -1480,7 +1486,7 @@ there is nothing to clean up.
 per classification — go through it.
 
 1. **Semantics**: "a rendered template" is what was asked for. For `fluid_render` that is per ROW;
-   for `fluid_query`, one bind.
+   for `fluid_replacement_query`, one bind.
 2. **Thread safety, by construction**: a DuckDB connection is single-threaded by contract and
    `fluid_render` is a VOLATILE scalar that may be evaluated on several threads at once. Each render
    builds its own `TemplateContext`, hence its own session, so nothing is shared. ⚠ Do NOT hoist it to a
@@ -1753,7 +1759,7 @@ exactly that assertion after 267 pass.
 
 ### 13.6 ⚠ Interpolation inside the block is RAW
 
-Same rule as `fluid_query`, for the same reason: a template must be able to emit object names and whole
+Same rule as `fluid_replacement_query`, for the same reason: a template must be able to emit object names and whole
 fragments, so `{{ x }}` cannot escape. Use `{{ v | sql }}` for a VALUE and `{{ n | sql_ident }}` for an
 identifier. The failure mode without it is a PARSER ERROR rather than a silent injection (gated:
 `O'Brien` spliced raw gives *"unterminated quoted string"*), which is the safe direction but not a
@@ -1771,7 +1777,7 @@ would silently break one of them.
 
 ## 14. `fabricator_render` IS NOW `fluid_render` (2026-09-03, BREAKING, no alias)
 
-User-asked. The function is contributed by the Fluid provider and its sibling was already `fluid_query`, so
+User-asked. The function is contributed by the Fluid provider and its sibling was already `fluid_replacement_query`, so
 the `fluid_` prefix is the one that describes it; `fabricator_*` is the core/host namespace
 (`fabricator_query`, `fabricator_exec`, `fabricator_host_query`, `fabricator_plugins`). Per this repo's
 standing convention for renames — the `fabricator` rename, `IArrow*`, `ITable`, `IProvider` — **no alias is
@@ -1782,8 +1788,8 @@ comments. The bulk of the work was the 133 occurrences in `verify_plugin_fluid.t
 
 ⚠ **It silently changed an ORDER BY, which is the one thing a mechanical rename can break.**
 `verify_plugin_fluid`'s registration check does
-`… WHERE function_name IN ('fluid_render','fluid_query') GROUP BY 1 ORDER BY 1` — and
-`fabricator_render` sorted BEFORE `fluid_query` while `fluid_render` sorts AFTER it, so the expected rows
+`… WHERE function_name IN ('fluid_render','fluid_replacement_query') GROUP BY 1 ORDER BY 1` — and
+`fabricator_render` sorted BEFORE `fluid_replacement_query` while `fluid_render` sorts AFTER it, so the expected rows
 had to swap. Caught by running the suite; a rename that only compiles is not a rename that passes.
 
 ### 14.1 ⚠ Older dated records deliberately keep the old spelling
@@ -2025,7 +2031,7 @@ lifted for this path.
    `FROM orders` in the same render read the template's rows rather than the catalog's — silently. That is
    either the feature or a serious trap depending on who is writing the template; it needs a deliberate
    answer (a required prefix? refuse a name the catalog already resolves?).
-2. **Bind repetition on the sqlgen surface.** A `fluid_query` template renders per BIND, so the
+2. **Bind repetition on the sqlgen surface.** A `fluid_replacement_query` template renders per BIND, so the
    registration repeats — harmless if each bind has its own connection (it does), but it means the cost is
    paid per bind, not per execution.
 
@@ -2371,7 +2377,7 @@ pointer we would need to adjust our parameter types or use a string handle which
 session. then there s question about owndership/lifetime management and not leaking memory."* The shape:
 
 ```sql
-SELECT * FROM fluid_query('
+SELECT * FROM fluid_replacement_query('
 {% exec arg1: 1, arg2: 5 %}
 create temporary table _result as
 SELECT i AS n, i * i AS sq FROM range($arg1, $arg2) t(i)
@@ -2383,10 +2389,10 @@ select * from fluid_table(this, ''_result'')
 ### 18.1 ⚠⚠ THE HANDLE QUESTION IS A NON-ISSUE, AND MEASURING IT FIRST IS WHAT SHRINKS THE FEATURE
 
 The transport the sketch reaches for **already exists, already takes a STRING, and already binds from inside
-`fluid_query`'s generated SQL.** Measured 2026-09-04:
+`fluid_replacement_query`'s generated SQL.** Measured 2026-09-04:
 
 ```sql
-SELECT count(*) FROM fluid_query('SELECT * FROM fabricator_scan(''fabricator_demo_numbers'')');
+SELECT count(*) FROM fluid_replacement_query('SELECT * FROM fabricator_scan(''fabricator_demo_numbers'')');
 --> 3                     a named-source scan inside GENERATED SQL binds and runs
 
 SELECT * FROM fabricator_scan('fabricator_demo_lazy');   --> prior_invocations = 0
@@ -2422,7 +2428,7 @@ SELECT * FROM {{ publish('_result') }}
 
 ### 18.2 ⚠⚠ THE ONE FACT THAT DECIDES IT: THE SESSION IS ALREADY DEAD BY THE TIME THE SCAN RUNS
 
-`FluidEngine.Render` holds the session in a `using var`, and `fluid_query` renders inside `GenerateSql`,
+`FluidEngine.Render` holds the session in a `using var`, and `fluid_replacement_query` renders inside `GenerateSql`,
 i.e. in `bind_replace`. So:
 
 | # | event | session |
@@ -2455,16 +2461,16 @@ Two owners, because one is not enough:
   signal. This is the `InOutSessionHolder` pattern: an RAII backstop on every teardown path.
 
 ⚠⚠ **AND THE RECORDED OBJECTIONS TO A LONGER-LIVED SESSION DO NOT APPLY IF THE CHANGE IS SCOPED TO
-`fluid_query`.** `FluidRenderSession`'s remarks give two, and both are about `fluid_render`:
+`fluid_replacement_query`.** `FluidRenderSession`'s remarks give two, and both are about `fluid_render`:
 
 1. *the session is captured at OPEN, so a connection outliving its unit of work hands every later user the
    FIRST one's session* — measured as a WRONG VALUE (a render under `Asia/Kolkata` reporting the first
-   render's zone). Scoping the session to ONE BIND of ONE `fluid_query` call keeps the capture correct: it is
+   render's zone). Scoping the session to ONE BIND of ONE `fluid_replacement_query` call keeps the capture correct: it is
    captured at that bind, for that bind's statement, and shared with nobody.
 2. *thread safety, since a volatile scalar may be evaluated on several threads* — `fluid_render` is that
    scalar; `GenerateSql` is called once per bind, single-threaded.
 
-⇒ **extend the lifetime for `fluid_query` only; leave `fluid_render` per-render.** That is what turns a
+⇒ **extend the lifetime for `fluid_replacement_query` only; leave `fluid_render` per-render.** That is what turns a
 correctness-bearing rework into a contained one.
 
 ### 18.5 ⚠ PARTLY SUPERSEDED BY §18.8 — three costs, and buffering removed the first two
@@ -2478,7 +2484,7 @@ correctness-bearing rework into a contained one.
 2. **The rows ROUND-TRIP** DuckDB(pin) → Arrow → managed → Arrow → DuckDB(caller), for data already sitting
    in DuckDB's own memory in the same process. This tree's own number for that boundary is ~3x against a
    native read (0.203 s vs 0.592 s on a 6M-row aggregate), so it is a real cost on a large `_result`.
-3. **Binds REPEAT.** §11 measured a view over a writing `fluid_query` writing on EVERY use (1 → 2 → 3 → 4).
+3. **Binds REPEAT.** §11 measured a view over a writing `fluid_replacement_query` writing on EVERY use (1 → 2 → 3 → 4).
    Each bind would open its own pin, re-run the DDL and register its own token — self-consistent, but N
    concurrent pinned DuckDB connections in the worst case.
 
@@ -2488,7 +2494,7 @@ correctness-bearing rework into a contained one.
 no round trip, full pushdown, one statement (measured 2026-09-04):
 
 ```sql
-SELECT count(*), sum(sq) FROM fluid_query('
+SELECT count(*), sum(sq) FROM fluid_replacement_query('
 {% assign lo = 1 %}{% assign hi = 5 %}
 WITH _result AS MATERIALIZED (
   SELECT i AS n, i * i AS sq FROM range({{ lo }}, {{ hi }}) t(i)
@@ -2705,7 +2711,7 @@ ALTERNATION over both, because which one wins is DuckDB's plan choice and not ou
 
 **TWO WORKAROUNDS, both measured, and the second is better than what it replaces:**
 
-1. **Two separate renders are two separate pins** — two `fluid_query` calls in one statement each publish
+1. **Two separate renders are two separate pins** — two `fluid_replacement_query` calls in one statement each publish
    and scan happily (gated, joins to 2).
 2. **Do the join inside `{% exec %}` and publish ONE relation** (gated, joins to 2). This keeps the work in
    DuckDB rather than shipping two relations out through Arrow and back, so it is the answer to reach for.
@@ -2736,7 +2742,7 @@ explanation (the missing projection pushdown). Decomposed at 100M rows, threads=
 | (c) publication, 1 column | 2.381 s | 7.7x |
 | (b) publication, 2 columns | 3.906 s | 12.7x |
 
-⇒ **projection was only the (c)→(b) gap; ~6x was the boundary itself.** (a) is fast because `fluid_query`'s
+⇒ **projection was only the (c)→(b) gap; ~6x was the boundary itself.** (a) is fast because `fluid_replacement_query`'s
 call DISAPPEARS at bind — the physical plan is `RANGE → PROJECTION(n) → UNGROUPED_AGGREGATE`, so `sq` is
 pruned and `i*i` is never computed for a single row.
 
@@ -2762,7 +2768,7 @@ pushdown has no such obstacle.
 
 ## 19. ✅ AS BUILT (2026-09-05) — `fluid_query_batch`: a template rendered WITH A RELATION
 
-`fluid_query_batch(template, <input> [, params := …] [, batchsize := …])`. Where `fluid_query` renders from
+`fluid_query_batch(template, <input> [, params := …] [, batchsize := …])`. Where `fluid_replacement_query` renders from
 CONSTANTS at bind time and hands the result to DuckDB (`bind_replace`), this renders from DATA at execution
 time and runs the result itself. **User-designed**, over two rounds: the first sketch was a LATERAL
 `fluid_query_each(template, params, vararg …)`; the user re-cut it as an in-out taking a TABLE, then
@@ -2793,9 +2799,9 @@ why `batchsize` had to live on the collector rather than selecting between the t
 ### 19.2 ⚠⚠ THE MEASUREMENT THAT SHAPED IT: the user's own sketch HANGS
 
 The sketch ended `select * from {{ publish('_result') }}`. MEASURED: **2 minutes, killed, 13.5 s CPU**,
-while the identical template through `fluid_query` returns in seconds as the control.
+while the identical template through `fluid_replacement_query` returns in seconds as the control.
 
-The mechanism is re-entrancy. In `fluid_query` the caller's plan scans the publication on a DIFFERENT
+The mechanism is re-entrancy. In `fluid_replacement_query` the caller's plan scans the publication on a DIFFERENT
 connection; here **we** run the generated statement on the render's own pinned connection, so the
 publication's factory opens a second query on the connection that is mid-query. It deadlocks rather than
 raising the one-live-result refusal.
@@ -2810,7 +2816,7 @@ applied: a policy defaulting to "allowed" makes a surface added later inherit th
 silently, which is the same trap as branching on the caller's NAME.
 
 ⚠ A test that reproduced the hang would HANG the tier rather than fail it, so what §25 pins is the
-REFUSAL, with the still-allowed `fluid_query` publish beside it as the positive control.
+REFUSAL, with the still-allowed `fluid_replacement_query` publish beside it as the positive control.
 
 ### 19.3 The input table needs NO ABI change — measured
 
@@ -2846,7 +2852,7 @@ host builds its Arrow→DuckDB converters from the declared schema). So the colu
 trust. What `is_bind` genuinely buys is skipping expensive or side-effecting setup — binds REPEAT, once per
 view use and once per prepared re-execution.
 
-⚠ It is defined ONLY in this surface's renders. In `fluid_query` there is no second kind of render to tell
+⚠ It is defined ONLY in this surface's renders. In `fluid_replacement_query` there is no second kind of render to tell
 it apart from, so leaving it undefined (falsy) is the honest answer rather than picking a value.
 
 ⚠ Every group's arriving schema is verified against the declaration (count, names, type IDs — the same
@@ -2901,7 +2907,7 @@ branch two lines below already resolved the SQLNULL sentinel against the value t
 failed in BOTH directions: supplied, *"Failed to cast value … -> NULL"*; omitted, an untyped NULL that
 Apache.Arrow refuses (*"Length must equal null count"*, the v80-recorded hostility). Fixed with a shared
 `FabricatorResolveAnyArg` applied to both branches. **Latent rather than shipped-broken:
-`fluid_query_batch` is the first in-tree in-out or collector to declare one** (`fluid_query` is sqlgen, a
+`fluid_query_batch` is the first in-tree in-out or collector to declare one** (`fluid_replacement_query` is sqlgen, a
 different marshal).
 
 **(b) ⚠⚠ The in-out and collector BINDS established no ambients — a dangling `ClientContext *`.**
@@ -2974,7 +2980,7 @@ The bag was readable ONLY through its members, so it had to HAVE members. Everyt
 ⚠⚠ **The LIST row is the one that makes this a fix rather than sugar.** A JSON array at least said no; a
 DuckDB LIST matched no `case` in the switch and bound nothing, so a template reading it rendered EMPTY with
 no error anywhere — the silent-wrong-answer class. It is also the shape a caller reaches for most naturally
-from SQL (`params := ['a','b']`), and `fluid_query` splices what it renders into a STATEMENT.
+from SQL (`params := ['a','b']`), and `fluid_replacement_query` splices what it renders into a STATEMENT.
 
 ⚠⚠ **The member spread is GONE (§20.5)** — this section's table describes what the bag binding ADDED, and
 the spread's removal is the second half of the same change. `{{ n }}` renders empty; `{{ params.n }}` is
@@ -3001,7 +3007,7 @@ the only variable the bag binds, and a member of any name is reachable only thro
   would hide a typo in the caller's own JSON. Only the *object-only* half of the refusal was lifted.
 - **A NULL bag binds nothing at all**, `params` included, so `{% if params %}` is how a template asks
   whether one was passed. Gated.
-- **One walk, three surfaces.** `fluid_render`, `fluid_query` and `fluid_query_batch` all go through
+- **One walk, three surfaces.** `fluid_render`, `fluid_replacement_query` and `fluid_query_batch` all go through
   `Capture`, so the bag cannot mean different things depending on which function you called — the reason
   this file's header gives for having one value model at all. `fluid_query_batch` gets it through the same
   CAPTURE that makes its params outlive the bind, which is only safe because the walk is eager (§19.6).
@@ -3390,7 +3396,7 @@ have released the include's in its place and Liquid state would have started car
 
 ### 23.6 Where it works
 
-Every surface, because they all go through `RenderOn`: `fluid_render`, `fluid_query` (where it TRUNCATES the
+Every surface, because they all go through `RenderOn`: `fluid_render`, `fluid_replacement_query` (where it TRUNCATES the
 generated statement — `'SELECT 7 AS v{% ret %} WHERE 1=0'` runs `SELECT 7 AS v`), `fluid_query_batch` and
 `fluid_query_lateral`. Inside an `{% exec %}` or `{% query %}` body it discards the body, which is the rule a
 `{% break %}` in those blocks already followed: half a statement is a different statement.
@@ -3407,7 +3413,7 @@ plain `SET` (session scope) and a relative `{% include %}`:
 | surface | resolves? |
 |---|---|
 | `fluid_render` | ✓ |
-| `fluid_query` | ✓ |
+| `fluid_replacement_query` | ✓ |
 | `fluid_query_batch` — at BIND | ✗ *"no root is set"* |
 | `fluid_query_batch` — at SCAN | ✓ |
 | `fluid_query_lateral` — at CALL | ✗ |
@@ -3910,9 +3916,9 @@ then fail on the `: 7`, because `ZeroOrOne` does not retry its empty branch once
 
 `{% query %}` refuses a non-SELECT using DuckDB's OWN parser, because a bind REPEATS and happens WITHOUT
 execution. For provider SQL there is no parser we can ask, and `fabricator_query` runs writes happily — so a
-provider tag inside `fluid_query` writes at BIND time, repeatedly.
+provider tag inside `fluid_replacement_query` writes at BIND time, repeatedly.
 
-**MEASURED**: an `EXPLAIN` of a `fluid_query` containing `{% provider_exec %}INSERT …{% endprovider_exec %}`
+**MEASURED**: an `EXPLAIN` of a `fluid_replacement_query` containing `{% provider_exec %}INSERT …{% endprovider_exec %}`
 takes the target table 0 → **1**, and the statement that DOES execute takes it 1 → **2**.
 
 **Accepted (user decision, 2026-09-06)**, for the reason the `exec()` refusal was DELETED: §11.1a MEASURED
@@ -4240,7 +4246,7 @@ connection is opened.** `fluid_render` is a per-ROW scalar, so binding eagerly w
 of every template — including the overwhelming majority that run no SQL at all.
 
 ⚠⚠ **THE FACTORY MUST NOT CLOSE OVER ANYTHING SHORTER-LIVED THAN THE SESSION, and the surfaces split on
-exactly this.** `fluid_render` and `fluid_query` render INSIDE the call that owns their arguments, so they may
+exactly this.** `fluid_render` and `fluid_replacement_query` render INSIDE the call that owns their arguments, so they may
 slice live Arrow. The three deferred surfaces create their EXECUTION session long after `Bind`'s arguments are
 freed — the same fact that makes `CaptureBag` eager — so they must close over a COPY. That is
 `FluidValueModel.CopyBagRow`, a one-row slice put through an IPC round trip.
@@ -4256,8 +4262,8 @@ callback (§22's measured crash).
 
 ### 38.4 The boundary, which is by design
 
-⚠⚠ **In `fluid_query` the variable is readable from an explicit `{% query %}` / `{% exec %}` block and NOT
-from the generated statement** (user-confirmed 2026-09-13: *"in fluid_query the getvariable should only work
+⚠⚠ **In `fluid_replacement_query` the variable is readable from an explicit `{% query %}` / `{% exec %}` block and NOT
+from the generated statement** (user-confirmed 2026-09-13: *"in fluid_replacement_query the getvariable should only work
 in an explicit {%query/exec %}"*). That statement is returned as TEXT and bound by the CALLER's connection — a
 different `ClientContext`, therefore a different variable map. MEASURED: `typeof` reports `"NULL"` there.
 Nothing is lost — a template that GENERATES SQL interpolates its params into it directly, which is what the
@@ -4268,7 +4274,7 @@ statement, on the same pin the blocks use.
 `{% exec %}` — which does see the variable — and `publish()` the result. MEASURED:
 
 ```sql
-SELECT * FROM fluid_query(
+SELECT * FROM fluid_replacement_query(
   '{% exec %}CREATE TEMP TABLE p AS SELECT getvariable(''params'').region AS g{% endexec %}'
   || 'SELECT * FROM {{ publish(''p'') }}', params := {'region': 'eu'});
 -- eu
@@ -4590,3 +4596,53 @@ announcing itself.
 RETURNS is not resolvable, because `query()` runs that text on its own connection and DuckDB keeps variables
 per-`ClientContext`. That is §39.4's boundary and is inherent to returning text — the variable works inside
 the render's own `{% query %}` / `{% exec %}` blocks, which is what the reporter actually meant.
+
+---
+
+## 41. ✅ AS BUILT (2026-09-13) — the rename: `fluid_query` → `fluid_replacement_query`
+
+BREAKING, no alias, following this repo's convention (the `IArrow*` and `fabricator_render` → `fluid_render`
+precedents). The name `fluid_query` is then free for the new TABLE function of §42.
+
+### 41.1 Why the new name is the accurate one
+
+Today's function is an `ISqlTableFunction`, and **its call DISAPPEARS at bind**: `generate_table_sql` →
+`bind_replace` → a `SubqueryRef`, so DuckDB binds the generated statement DIRECTLY and nothing crosses
+Arrow at execution. Measured long ago and still true — a `fluid_replacement_query` over a table plans as a
+bare `SEQ_SCAN` carrying `Projections: id` and `Filters: g=3`, the call itself gone from the plan.
+
+"Replacement" is DuckDB's own word for that mechanism, so the name now says which of the five surfaces this
+is. It also removes a standing confusion: `fluid_query_batch` / `_inout` / `_lateral` read as variants of
+`fluid_query` and are nothing of the kind — they run their statement themselves, where this one hands it to
+the caller's planner.
+
+### 41.2 ⚠⚠ THE DATED RECORDS WERE UPDATED, WHICH INVERTS THIS FILE'S OWN CONVENTION — because the name is REUSED
+
+Every previous rename here left older dated records spelling the OLD name, with one note saying so
+(`fabricator_render`, the `IArrow*` set). **That is right only when the old name then denotes NOTHING.**
+Here `fluid_query` immediately becomes a DIFFERENT function, so a dated record left saying `fluid_query`
+would not read as "this function under its former name" — it would read as a statement about the new table
+function, which is false in almost every particular (bind-time vs execute-time, no Arrow vs every row
+crossing, no declared schema vs a probed one).
+
+⇒ **when a renamed name is REUSED, sweep the historical records too.** §1.1 and §7 above therefore describe
+what is now `fluid_replacement_query`, under that name, although they are dated before it existed.
+
+### 41.3 What it cost, and the one thing that broke
+
+~300 sites, of which exactly ONE is code (`Name => "fluid_replacement_query"`); the rest are doc comments,
+the gate and the docs. Proven a pure substitution by the masking check — strip the renamed tokens out of
+`git diff -U0` and every removed line is byte-identical to its added counterpart — **zero unpaired lines**.
+
+⚠ **It silently changed an `ORDER BY`, exactly as the `fluid_render` rename did**, and the gate caught it:
+the registration check selects `… IN ('fluid_render', 'fluid_replacement_query') … ORDER BY 1`, and where
+`fluid_query` sorted BEFORE `fluid_render` (`q` < `r`), `fluid_replacement_query` sorts AFTER it
+(`fluid_re**n**` < `fluid_re**p**`). The expected rows had to swap. A rename that merely compiles is not a
+rename that passes.
+
+⚠ The masking check needs its diff-header filter written as `^--- a/` / `^+++ b/`, not as a bare `^---`: a
+sqllogictest comment line begins `--`, so in a unified diff a removed one renders as `--- …` and a lazy
+filter discards it, reporting a false unpaired line.
+
+Gate: `verify_plugin_fluid` **873, unchanged** — which is the honest outcome for a rename, and is why §41.3
+rather than an assertion count is the evidence here.

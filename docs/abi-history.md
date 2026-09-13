@@ -396,7 +396,7 @@ is inherited is name and time RESOLUTION.
   `fabricator_host_query`, asserted through an **unqualified `FROM t`**, which fails both ways — a build that
   applies nothing cannot resolve it, and one that applies it wrongly raises.
 - `verify_plugin_fluid` **177 → 188** (service): the same two through a template's `query()`, plus the
-  bind-time surface (`fluid_query`), where an unqualified name decides the statement's output SCHEMA.
+  bind-time surface (`fluid_replacement_query`), where an unqualified name decides the statement's output SCHEMA.
 - **Mutant 1** — the transport passes `clientSession: 0` — dies at the template's TimeZone row.
 - **Mutant 2** — `SET_DIRECTLY` restored — dies at the unqualified `FROM t` with the original INTERNAL error.
 
@@ -463,7 +463,7 @@ depending on what ran before it. **MEASURED with a one-statement discriminator**
 | | `SET fluid_template_root = …` then `fabricator_render('{% include … %}')` |
 |---|---|
 | nothing in between | **fails** — "no root is set" |
-| one `SELECT * FROM fluid_query('SELECT 1 AS x')` in between | **renders** |
+| one `SELECT * FROM fluid_replacement_query('SELECT 1 AS x')` in between | **renders** |
 
 ⚠ **The leaked OPENER is the sharper half.** It is a raw `ClientContext *` whose connection may already be
 gone, so a global scalar doing host-FS IO could dereference a dangling pointer — the `table_stats`

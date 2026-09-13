@@ -16,7 +16,7 @@ namespace Fabricator.FluidPlugin;
 /// <summary>
 /// The parser and the parsed-template cache, shared by every function in this plugin.
 /// <para>Parse-once / render-many: a template is usually a constant literal across a batch (and, for
-/// <c>fluid_query</c>, across every re-bind of a view or prepared statement), so the parsed, thread-safe
+/// <c>fluid_replacement_query</c>, across every re-bind of a view or prepared statement), so the parsed, thread-safe
 /// <see cref="IFluidTemplate"/> is cached by template text.</para>
 /// </summary>
 internal static class FluidEngine
@@ -202,7 +202,7 @@ internal static class FluidEngine
         // (RequireCatalog), which is the loud half of that trade.
         //
         // ⚠⚠ THE SELECT-ONLY GUARD DOES NOT TRANSFER AND THAT IS A DECISION (user, 2026-09-06): there is no
-        // provider parser to ask, so a write inside fluid_query happens at BIND time, repeatedly. Accepted
+        // provider parser to ask, so a write inside fluid_replacement_query happens at BIND time, repeatedly. Accepted
         // and PINNED as asserted behaviour, exactly as {% exec %}'s bind-repetition is. See
         // FluidProviderTags for the precedent that settles it.
         parser.RegisterParserBlock(
@@ -368,12 +368,12 @@ internal static class FluidEngine
         // actually called rather than the template machinery.
         ctx.SetValue(FluidHostQuery.FunctionName,
                      new FunctionValue((args, c) => FluidHostQuery.Execute(caller, args, c)));
-        // ⚠ Available on BOTH surfaces by user decision. In fluid_query it therefore writes during BINDING,
+        // ⚠ Available on BOTH surfaces by user decision. In fluid_replacement_query it therefore writes during BINDING,
         // which repeats — see FluidHostExec for the measured 1 -> 2 -> 3.
         ctx.SetValue(FluidHostExec.FunctionName,
                      new FunctionValue((args, c) => FluidHostExec.Execute(caller, args, c)));
         // ⚠ publish() RENDERS SQL (a fabricator_scan call), so it is only meaningful where the render IS a
-        // statement — i.e. in fluid_query. Registered on both surfaces anyway: branching on the caller name
+        // statement — i.e. in fluid_replacement_query. Registered on both surfaces anyway: branching on the caller name
         // is what the exec() decision rejected, and in fluid_render the result is merely inert text.
         ctx.SetValue(FluidHostPublish.FunctionName,
                      new FunctionValue((args, c) => FluidHostPublish.Execute(caller, args, c)));

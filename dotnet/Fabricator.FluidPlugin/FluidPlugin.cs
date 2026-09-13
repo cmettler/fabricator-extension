@@ -11,7 +11,7 @@ namespace Fabricator.FluidPlugin;
 /// <summary>
 /// The Fluid/Liquid template engine, packaged as a plugin. It exposes no catalog (ATTACH throws) and exists
 /// purely to contribute connection-free GLOBAL functions: <c>fluid_render</c> (template → TEXT) and
-/// <c>fluid_query</c> (template → SQL, i.e. a RELATION).
+/// <c>fluid_replacement_query</c> (template → SQL, i.e. a RELATION).
 /// <para><b>Why it is a plugin rather than part of a backend.</b> It lived in <c>Fabricator.SqlServer</c>,
 /// which put a template engine — and the <c>Fluid.Core</c> package — inside the SQL Server backend, where it
 /// has nothing to do with SQL Server and rode into every shipped payload whether or not anyone rendered a
@@ -45,7 +45,7 @@ public sealed class FluidPluginBackend : IProvider
         new IScalarFunction[] { new FluidRenderFunction(), new FluidScalarFunction() };
 
     public IEnumerable<ISqlTableFunction> GlobalSqlTableFunctions =>
-        new ISqlTableFunction[] { new FluidQueryFunction() };
+        new ISqlTableFunction[] { new FluidReplacementQueryFunction() };
 
     // ⚠ A COLLECTOR, not a streaming in-out, and forced: fluid_query_batch's default renders once over the
     // WHOLE input, which the streaming operator cannot express — its all-input-done hook is handed no
@@ -104,7 +104,7 @@ public sealed class FluidPluginBackend : IProvider
 /// no tags are registered, and only the variables bound here are reachable — there is no CLR member
 /// traversal.</para>
 /// <para>The params bag, the number model and the nested-value handling are
-/// <see cref="FluidValueModel"/>'s, shared with <see cref="FluidQueryFunction"/> so the same bag cannot mean
+/// <see cref="FluidValueModel"/>'s, shared with <see cref="FluidReplacementQueryFunction"/> so the same bag cannot mean
 /// two different things depending on which function received it.</para>
 /// </summary>
 internal sealed class FluidRenderFunction : IScalarFunction
@@ -135,7 +135,7 @@ internal sealed class FluidRenderFunction : IScalarFunction
             }
             int row = i;
             // ⚠ This surface renders at EXECUTE time (a VOLATILE scalar, never folded into the plan), so a
-            // writing template here runs once per ROW rather than once per BIND. fluid_query permits exec
+            // writing template here runs once per ROW rather than once per BIND. fluid_replacement_query permits exec
             // too, where it runs during binding — see FluidHostExec.
             // publishRefusal: null — a publication made here is never scanned (this surface produces TEXT
             // that nobody binds), so it is pointless rather than dangerous, and refusing a harmless call

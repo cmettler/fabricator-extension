@@ -9,14 +9,14 @@ using Fabricator.Bridge;
 namespace Fabricator.FluidPlugin;
 
 /// <summary>
-/// <c>fluid_query(template [, params := …])</c> — a SQL-GENERATING table function whose SQL is a Liquid
+/// <c>fluid_replacement_query(template [, params := …])</c> — a SQL-GENERATING table function whose SQL is a Liquid
 /// template. The rendered text IS the statement: at BIND time DuckDB hands the generator the call's constant
 /// arguments and SUBSTITUTES the returned SELECT for the call (<c>bind_replace</c>, the <c>query_table()</c>
 /// mechanism), so nothing streams through C# at execution and the generated SQL's own scans keep their full
 /// pushdown, parallelism and join reordering.
 ///
 /// <para>Where <see cref="FluidRenderFunction"/> makes TEXT from a template, this makes a RELATION:
-/// <c>SELECT * FROM fluid_query('SELECT {{ n }} AS n', params := {'n': 1})</c>. The output schema falls out
+/// <c>SELECT * FROM fluid_replacement_query('SELECT {{ n }} AS n', params := {'n': 1})</c>. The output schema falls out
 /// of binding the generated SQL, so it may differ per call with nothing declared here.</para>
 ///
 /// <para><b>⚠ WHAT IS AND IS NOT QUOTED.</b> <c>{{ x }}</c> interpolates RAW, deliberately — a template must
@@ -34,9 +34,9 @@ namespace Fabricator.FluidPlugin;
 /// function (the follow-on slice) is a separate question rather than a free addition: it would execute SQL
 /// during someone else's bind. See docs/fluid-templating.md §3.
 /// </remarks>
-internal sealed class FluidQueryFunction : ISqlTableFunction
+internal sealed class FluidReplacementQueryFunction : ISqlTableFunction
 {
-    public string Name => "fluid_query";
+    public string Name => "fluid_replacement_query";
 
     public Schema Parameters => new(new[]
     {
@@ -54,11 +54,11 @@ internal sealed class FluidQueryFunction : ISqlTableFunction
         int t = args.Schema.GetFieldIndex("template");
         if (t < 0 || args.Column(t) is not StringArray templates || templates.Length == 0 || templates.IsNull(0))
         {
-            throw new ArgumentException("fluid_query: 'template' must be a non-NULL VARCHAR");
+            throw new ArgumentException("fluid_replacement_query: 'template' must be a non-NULL VARCHAR");
         }
 
         // ⚠ BY NAME, not by position: a named parameter is present only when SUPPLIED, so its column index
-        // depends on the call site. Absent => no variables, which is a legitimate call (`fluid_query('SELECT 1')`).
+        // depends on the call site. Absent => no variables, which is a legitimate call (`fluid_replacement_query('SELECT 1')`).
         int p = args.Schema.GetFieldIndex("params");
         var bag = p >= 0 ? args.Column(p) : null;
 

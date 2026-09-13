@@ -36,7 +36,7 @@ namespace Fabricator.FluidPlugin;
 /// <para>
 /// <b>⚠ IT RENDERS SQL, so it must be interpolated RAW</b> — <c>{{ publish('t') }}</c>, never
 /// <c>{{ publish('t') | sql }}</c>, which would quote the whole scan into a string literal. That is the
-/// same rule <c>fluid_query</c> already documents for every <c>{{ }}</c>: interpolation is raw because a
+/// same rule <c>fluid_replacement_query</c> already documents for every <c>{{ }}</c>: interpolation is raw because a
 /// template must be able to emit fragments, and DATA goes through the <c>sql</c> filters.
 /// </para>
 /// <para>

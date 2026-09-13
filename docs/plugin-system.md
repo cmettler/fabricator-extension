@@ -269,9 +269,9 @@ so that conditional dissolves rather than being solved.
 registered during `Extension::Load()`, so the plugin must be in a plugin root at load time — installing it
 mid-session surfaces it only at the next start.
 
-**⚠ SINCE 2026-09-01 IT ALSO SHIPS A GLOBAL *SQLGEN* FUNCTION — `fluid_query(template [, params := …])` —
+**⚠ SINCE 2026-09-01 IT ALSO SHIPS A GLOBAL *SQLGEN* FUNCTION — `fluid_replacement_query(template [, params := …])` —
 and that is a SECOND registration path, not a second function.** `fabricator_render` arrives through
-`IBackend.GlobalScalarFunctions` and becomes a DuckDB scalar; `fluid_query` arrives through
+`IBackend.GlobalScalarFunctions` and becomes a DuckDB scalar; `fluid_replacement_query` arrives through
 `IBackend.GlobalSqlTableFunctions` and becomes a `bind_replace` TABLE function whose call disappears at bind.
 **This is the first plugin in the tree to use the latter at all**, so it is the first evidence that the
 plugin scan carries a provider's sqlgen declarations as well as its scalars — which is why the distribution
