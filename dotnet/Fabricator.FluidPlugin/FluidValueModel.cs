@@ -209,23 +209,62 @@ internal static class FluidValueModel
         return i >= 0 ? args.Column(i) : null;
     }
 
-    /// <summary>Parses a JSON params bag. ANY root is accepted — object, array or scalar.</summary>
+    /// <summary>
+    /// A VARCHAR params bag: parsed as JSON when it is JSON, and taken as a plain string when it is not.
+    /// ANY JSON root is accepted — object, array or scalar.
+    /// </summary>
     /// <remarks>
+    /// <para>
     /// ⚠ It used to REFUSE anything but an object, because members were the only thing a bag could
     /// contribute. With the bag itself bound under <see cref="BagVariable"/> that refusal would reject a
     /// perfectly usable value: `'[1,2]'` is `params[0]`, `params.size`, `{% for x in params %}`.
-    /// Invalid JSON is still an error — a VARCHAR bag IS JSON, and quietly treating unparseable text as a
-    /// string would hide a typo in the caller's own JSON.
+    /// </para>
+    /// <para>
+    /// ⚠⚠ <b>AND IT USED TO REFUSE A PLAIN STRING, which was a real inconsistency</b> (user, 2026-09-13):
+    /// every other scalar bag works — <c>5</c>, <c>current_timestamp</c>, a BLOB — while VARCHAR alone was
+    /// reinterpreted, so <c>fluid_render(t, 'result')</c> failed with a JSON parse error. The type cannot
+    /// settle it: DuckDB only exports its JSON type as <c>arrow.json</c> when
+    /// <c>arrow_lossless_conversion</c> is on (<c>arrow_converter.cpp</c>: <i>"we only export it as json if
+    /// arrow_lossless_conversion = True"</i>), and this boundary forces that OFF for an unrelated,
+    /// load-bearing reason — with it on, DuckDB exports BOOLEAN as Int8 and the SQL Server mapper emits
+    /// SMALLINT instead of BIT. MEASURED: a <c>::JSON</c> bag reaches here indistinguishable from VARCHAR.
+    /// </para>
+    /// <para>
+    /// ⚠⚠ <b>SO THE CONTENT DECIDES — BUT A PARSE FAILURE IS STILL AN ERROR WHERE THE CALLER PLAINLY MEANT
+    /// JSON.</b> Text beginning <c>{</c> or <c>[</c> is an object or array attempt, and the commonest bag
+    /// mistake is a malformed one (a missing brace); binding <c>'{"x": 5'</c> as a STRING would leave every
+    /// <c>{{ params.x }}</c> rendering empty with nothing failing. Everything else is JSON if it parses —
+    /// which keeps <c>'5'</c>, <c>'true'</c> and <c>'"result"'</c> meaning exactly what they did — and a
+    /// plain string otherwise.
+    /// </para>
     /// </remarks>
-    private static JsonNode? ParseParamsJson(string json)
+    private static object? ParseParamsJson(string json)
     {
+        bool looksStructured = false;
+        foreach (var c in json)
+        {
+            if (char.IsWhiteSpace(c))
+            {
+                continue;
+            }
+            looksStructured = c == '{' || c == '[';
+            break;
+        }
         try
         {
             return JsonNode.Parse(json);
         }
         catch (JsonException ex)
         {
-            throw new ArgumentException($"fabricator: params is not valid JSON: {ex.Message}", ex);
+            if (looksStructured)
+            {
+                throw new ArgumentException(
+                    $"fabricator: params starts with '{(looksStructured ? json.TrimStart()[0] : ' ')}' so it "
+                    + $"is read as JSON, and it is not valid JSON: {ex.Message}", ex);
+            }
+            // ⚠ NOT an error: a bag that is not trying to be an object or an array is just a value, and a
+            // VARCHAR value is a string. `{% if params %}` and `{{ params }}` then work as for any scalar.
+            return json;
         }
     }
 

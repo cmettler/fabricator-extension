@@ -4540,3 +4540,53 @@ bare `select 42` would yield one row whatever the chunk size and fail the cardin
 So a `__fab_rows` placeholder now appears **only when the call has no per-row arguments** — structural, not a
 row key, invisible in every call that has any. The naming-rule row is what pins that: it lists
 `counter,n,arg_2,arg_3` and nothing else.
+
+## 40. ✅ AS BUILT (2026-09-13) — a VARCHAR params bag is JSON only when it IS JSON
+
+**User-raised**, from a real failure: `fluid_render('…', 'result')` died with *"params is not valid JSON:
+'r' is an invalid start of a value"*. Their framing was the right one — *"i can pass a simple 5 or a
+current_timestamp as params but a varchar is assumed to be json … it is better to allow a varchar as a
+varchar"*. C#-only in the plugin; it changes every Fluid surface at once, because they share one `CaptureBag`.
+
+### 40.1 The type cannot settle it — measured, and it was the first thing tried
+
+The principled version of the ask is *"detect the JSON type on the arrow extension schema"*, i.e. let
+`'{"x":5}'::JSON` mean JSON and a bare VARCHAR mean a string. **That is not available.** DuckDB registers
+`arrow.json` as an Arrow extension type — but exports it only under `arrow_lossless_conversion`
+(`arrow_converter.cpp:120`: *"we only export it as json if arrow_lossless_conversion = True"*), and this
+boundary forces that OFF in `BoundaryClientProperties` for an unrelated, load-bearing reason: with it on
+DuckDB exports BOOLEAN as Arrow `Int8`, and the SQL Server mapper then emits `SMALLINT` (1/0) instead of
+`BIT`. That is pinned by `verify_arrow_lossless`.
+
+⚠ MEASURED twice: a `::JSON` argument reaches the managed side indistinguishable from a plain VARCHAR. ⚠ And
+the obvious suspect — our own staging rebuilding each `Field` from its type and dropping the metadata — was
+tested and is NOT the cause; carrying the metadata through changed nothing.
+
+⚠ One of those measurements was VOID and caught: the publish had failed on a file lock, so it read the stale
+payload. **Verify the publish, not the exit code.**
+
+### 40.2 So the CONTENT decides — with one exception that keeps the typo loud
+
+A VARCHAR bag parses as JSON if it can, and is a plain string otherwise. **Except** that text beginning `{`
+or `[` is plainly an object or array attempt, so a parse failure there stays an ERROR naming the rule.
+
+That exception is the whole safety of the change. The commonest bag mistake is a malformed object — a
+missing brace — and binding `'{"x": 5'` as a STRING would leave every `{{ params.x }}` rendering empty with
+nothing failing. Pure sniffing would have lost that.
+
+| bag | before | after |
+|---|---|---|
+| `'{"x":5}'` | object | object |
+| `'{"x": 5'` | error | **error**, naming the rule |
+| `'5'`, `'true'`, `'"result"'` | JSON scalar | unchanged |
+| `'result'` | error | **plain string** |
+
+⚠ Two gate rows asserting the old refusal were REPLACED rather than deleted — falsifying them is the change
+announcing itself.
+
+### 40.3 What it does not fix
+
+⚠ The report also contained a second, unrelated thing: `getvariable('params')` in the text `fluid_render`
+RETURNS is not resolvable, because `query()` runs that text on its own connection and DuckDB keeps variables
+per-`ClientContext`. That is §39.4's boundary and is inherent to returning text — the variable works inside
+the render's own `{% query %}` / `{% exec %}` blocks, which is what the reporter actually meant.

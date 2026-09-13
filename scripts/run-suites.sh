@@ -655,7 +655,16 @@ case "$TIER" in
         #   ⚠⚠ Removing it EXPOSED a second purpose it had been serving silently: with NO tail arguments the
         #   relation has zero columns, and Apache.Arrow cannot represent a zero-FIELD schema in either
         #   direction. A `__fab_rows` placeholder now appears ONLY in that case — structural, not a row key.
-        : "${MIN_ASSERTIONS:=9223}"
+        # 2026-09-13: verify_plugin_fluid 867 -> 873. A VARCHAR params bag is JSON when it IS JSON and a
+        #   plain STRING when it is not — removing a real inconsistency (5, current_timestamp and a BLOB all
+        #   worked as scalar bags while VARCHAR alone was reinterpreted). ⚠ The TYPE cannot settle it:
+        #   DuckDB exports its JSON type as arrow.json only under arrow_lossless_conversion, which this
+        #   boundary forces OFF for an unrelated load-bearing reason (BOOLEAN would export as Int8 and the
+        #   SQL Server mapper would emit SMALLINT instead of BIT) — measured, a ::JSON bag arrives
+        #   indistinguishable from VARCHAR.
+        #   ⚠⚠ A parse failure is STILL an error where the text begins { or [ — a malformed object is the
+        #   commonest bag mistake, and binding it as a string leaves every {{ params.x }} empty silently.
+        : "${MIN_ASSERTIONS:=9229}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

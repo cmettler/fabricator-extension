@@ -443,10 +443,12 @@ SELECT fluid_render('{{ params.p[0] }}/{{ params.p[1] }}', {'p': {'x': 1, 'y': 2
 ----
 1/2
 
-statement error
-SELECT fluid_render('{{ n }}', 'not json');
+# ⚠ This row USED to assert that 'not json' was REFUSED. It is now a plain STRING bag (see the params-bag
+# section at the end of this file); `{{ n }}` still renders empty, because the member spread is gone.
+query T
+SELECT '[' || fluid_render('{{ n }}', 'not json') || ']';
 ----
-<REGEX>:.*params is not valid JSON.*
+[]
 
 # NOTE: '[1,2]' used to be REFUSED here ("params JSON must be an OBJECT"). It is now bound as the whole
 # bag -- see the JSON-array row in the params-bag section at the end of this file, which replaces this one.
@@ -3062,12 +3064,42 @@ SELECT tag, n FROM fluid_query_batch(
 ----
 g	3
 
-# --- invalid JSON is STILL an error. A VARCHAR bag IS JSON, so quietly binding unparseable text as a plain
-# string would hide a typo in the caller's own JSON — the one refusal worth keeping. ---
-statement error
+# --- ⚠⚠ A VARCHAR BAG IS JSON WHEN IT IS JSON, AND A PLAIN STRING WHEN IT IS NOT. This row REPLACES one
+# asserting that 'not json' was REFUSED — falsifying it is the change announcing itself.
+#
+# The inconsistency it removes: every other scalar bag already worked (5, current_timestamp, a BLOB) while
+# VARCHAR alone was reinterpreted, so `fluid_render(t, 'result')` failed with a JSON parse error. ⚠ The TYPE
+# cannot settle it — DuckDB exports its JSON type as arrow.json only under arrow_lossless_conversion, which
+# this boundary forces OFF for an unrelated, load-bearing reason (with it on, BOOLEAN exports as Int8 and the
+# SQL Server mapper emits SMALLINT instead of BIT). MEASURED: a ::JSON bag arrives indistinguishable. ---
+query T
 SELECT fluid_render('{{ params }}', 'not json');
 ----
-<REGEX>:.*params is not valid JSON.*
+not json
+
+# --- ⚠⚠ BUT A PARSE FAILURE IS STILL AN ERROR WHERE THE CALLER PLAINLY MEANT JSON: text beginning { or [ is
+# an object or array attempt, and a malformed one is the commonest bag mistake. Binding '{"x": 5' as a STRING
+# would leave every {{ params.x }} rendering empty with nothing failing — so that half of the old refusal is
+# kept, and the message says which rule applied. ---
+statement error
+SELECT fluid_render('{{ params.x }}', '{"x": 5');
+----
+<REGEX>:.*starts with .* so it is read as JSON.*
+
+statement error
+SELECT fluid_render('{{ params[0] }}', '[1,2');
+----
+<REGEX>:.*starts with .* so it is read as JSON.*
+
+# --- ⚠ And every spelling that already worked still means what it did: an object, an array, and the JSON
+# SCALARS. `'5'` must still be a NUMBER — `| plus: 1` is what proves it is not the string "5". ---
+query TTTT
+SELECT fluid_render('{{ params.x }}', '{"x":5}'),
+       fluid_render('{{ params[1] }}', '[7,8]'),
+       fluid_render('{{ params | plus: 1 }}', '5'),
+       fluid_render('{{ params }}', '"result"');
+----
+5	8	6	result
 
 # --- a NULL bag binds nothing at all, `params` included, so `{% if params %}` is the way to ask. ---
 query I

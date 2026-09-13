@@ -1591,8 +1591,12 @@ SELECT fluid_render('v={{ params | plus: 1 }}', 41);
 
 > ⚠ A member literally named `params` does not win: `{{ params }}` is always the bag, and the member is
 > reachable as `{{ params.params }}`. A NULL bag binds nothing at all, `params` included, so
-> `{% if params %}` is how you ask whether one was passed. A VARCHAR bag is still parsed as JSON, and
-> unparseable text is still an error rather than a string.
+> `{% if params %}` is how you ask whether one was passed.
+>
+> ⚠ **A VARCHAR bag is JSON when it is JSON, and a plain string when it is not** — so `'{"x":5}'` is an
+> object and `'result'` is the string `result`. The one exception: text beginning `{` or `[` is plainly an
+> object or array attempt, so a malformed one (`'{"x": 5'`) is an error rather than a string — otherwise
+> every `{{ params.x }}` would render empty with nothing failing.
 
 **The bag is also a DuckDB variable, so the template's own SQL can read it** — `getvariable('params')` inside
 any `{% query %}` or `{% exec %}` block, without interpolating it as text or re-passing it as a block
