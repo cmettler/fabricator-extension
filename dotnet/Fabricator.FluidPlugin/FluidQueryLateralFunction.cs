@@ -133,7 +133,11 @@ internal sealed class FluidQueryLateralFunction : ILateralFunction
         // ⚠⚠ CAPTURED, not retained: the args batch belongs to the framework and its lifetime ends with this
         // call, while the renders happen much later on other threads. FluidValueModel.CaptureBag is eager
         // all the way down, so what comes back holds no Arrow memory.
-        var parameters = FluidValueModel.CaptureBag(FluidValueModel.ArgColumn(args, "params"), 0);
+        var bag = FluidValueModel.ArgColumn(args, "params");
+        var parameters = FluidValueModel.CaptureBag(bag, 0);
+        // ⚠ COPIED for the same reason, and it must be: each pipeline thread stages the SQL variable when
+        // its own session opens a connection, long after this batch is gone.
+        var paramsRows = FluidValueModel.CopyBagRow(bag, 0);
 
         foreach (var f in inputSchema.FieldsList)
         {
@@ -156,22 +160,26 @@ internal sealed class FluidQueryLateralFunction : ILateralFunction
             ?? throw new InvalidOperationException(
                 $"{FunctionName} needs the hosting DuckDB to determine its output columns, and it is not "
                 + "available here.");
-        var ctx = NewContext(probe, parameters, isBind: true);
+        var ctx = NewContext(probe, parameters, paramsRows, isBind: true);
         CreateEmptyInput(probe, stagedSchema);
         // ⚠ Bound at the probe too, EMPTY — see fluid_query_batch's twin.
         FluidHostQuery.BindLazyRelation(ctx, InputTable);
         var generated = FluidEngine.RenderOn(FunctionName, template, ctx);
         var outputSchema = DescribeGenerated(probe, generated);
-        return new Binding(template, parameters, stagedSchema, outputSchema);
+        return new Binding(template, parameters, paramsRows, stagedSchema, outputSchema);
     }
 
     /// <summary>Builds the render context one session's renders share.</summary>
-    private static TemplateContext NewContext(FluidRenderSession session, object? parameters, bool isBind)
+    private static TemplateContext NewContext(FluidRenderSession session, object? parameters,
+                                              RecordBatch? paramsRows, bool isBind)
     {
         var ctx = FluidEngine.NewRenderContext(FunctionName, PublishRefusal, session, c =>
         {
             FluidValueModel.SetVariable(c, FluidValueModel.BagVariable, parameters);
         });
+        // ⚠ The same bag on the SQL side. A COPY, because this session's connection opens on a pipeline
+        // thread long after Bind's arguments were freed — see FluidRenderSession.BindVariable.
+        session.BindVariable(FluidValueModel.BagVariable, () => paramsRows);
         ctx.SetValue(FluidEngine.IsBindVariable, isBind);
         return ctx;
     }
@@ -290,12 +298,15 @@ internal sealed class FluidQueryLateralFunction : ILateralFunction
     {
         private readonly string _template;
         private readonly object? _parameters;
+        private readonly RecordBatch? _paramsRows;
         private readonly Schema _stagedSchema;
 
-        internal Binding(string template, object? parameters, Schema stagedSchema, Schema outputSchema)
+        internal Binding(string template, object? parameters, RecordBatch? paramsRows,
+                         Schema stagedSchema, Schema outputSchema)
         {
             _template = template;
             _parameters = parameters;
+            _paramsRows = paramsRows;
             _stagedSchema = stagedSchema;
             OutputSchema = outputSchema;
         }
@@ -308,7 +319,7 @@ internal sealed class FluidQueryLateralFunction : ILateralFunction
         public ILateralSession Open() => Open(null);
 
         public ILateralSession Open(IReadOnlyList<int>? projected) =>
-            new Session(_template, _parameters, _stagedSchema, OutputSchema, projected);
+            new Session(_template, _parameters, _paramsRows, _stagedSchema, OutputSchema, projected);
 
         public void Dispose()
         {
@@ -323,8 +334,8 @@ internal sealed class FluidQueryLateralFunction : ILateralFunction
         private readonly FluidRenderSession _session;
         private readonly TemplateContext _ctx;
 
-        internal Session(string template, object? parameters, Schema stagedSchema, Schema outputSchema,
-                         IReadOnlyList<int>? projected)
+        internal Session(string template, object? parameters, RecordBatch? paramsRows,
+                         Schema stagedSchema, Schema outputSchema, IReadOnlyList<int>? projected)
         {
             _template = template;
             _stagedSchema = stagedSchema;
@@ -337,7 +348,7 @@ internal sealed class FluidQueryLateralFunction : ILateralFunction
             _session = FluidRenderSession.TryCreate()
                 ?? throw new InvalidOperationException(
                     $"{FunctionName} needs the hosting DuckDB, which is not available here.");
-            _ctx = NewContext(_session, parameters, isBind: false);
+            _ctx = NewContext(_session, parameters, paramsRows, isBind: false);
             // ⚠⚠ AND THE TEMPLATE IS TOLD, so it can skip work the SQL pruning above cannot reach — an
             // {% exec %}, a {% query %}, a join or an include it would otherwise write. Using it is OPTIONAL:
             // the wrapper narrows the result either way, so a template that ignores `projected` is correct

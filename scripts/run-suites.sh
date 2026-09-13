@@ -622,7 +622,14 @@ case "$TIER" in
         #   (b) the CONTENDED case, a multi-branch UNION as the INPUT to ONE call. ⚠⚠ Those are DIFFERENT
         #   shapes: (a) gives each call its OWN gate (measured: 3 gates, 1 thread each) and tests no
         #   contention at all, while (b) is ONE gate with 3 threads. 9153 + 13 exactly.
-        : "${MIN_ASSERTIONS:=9166}"
+        # 2026-09-13: verify_plugin_fluid 810 -> 828. §37 — the params bag is also a DuckDB VARIABLE on
+        #   the render's pinned connection, so a template's SQL reads `getvariable('params')` instead of
+        #   having the bag interpolated as text or re-passed as a block argument. Staged through a named
+        #   Arrow source, so it is TYPE-EXACT (a DATE stays a DATE, a DECIMAL(9,2) stays exact) where
+        #   rendering would need a second SQL type ladder. 9166 + 18 exactly.
+        #   ⚠ Its sharpest row is PER-ROW on fluid_render: each row has its own session AND its own bag, so
+        #   a build that staged the params COLUMN without picking the row passes every other row here.
+        : "${MIN_ASSERTIONS:=9184}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

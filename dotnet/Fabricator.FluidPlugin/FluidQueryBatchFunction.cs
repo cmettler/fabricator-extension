@@ -101,7 +101,11 @@ internal sealed class FluidQueryBatchFunction : ICollectorFunction
         // ⚠⚠ CAPTURED, not retained: the args batch belongs to the framework and its lifetime ends with this
         // call, while the groups render much later. FluidValueModel.Capture is eager all the way down, so
         // what comes back holds no Arrow memory.
-        var parameters = FluidValueModel.CaptureBag(FluidValueModel.ArgColumn(args, "params"), 0);
+        var bag = FluidValueModel.ArgColumn(args, "params");
+        var parameters = FluidValueModel.CaptureBag(bag, 0);
+        // ⚠ COPIED for the same reason, and it must be: the SQL variable is staged when the execution
+        // session opens its connection, by which time this batch is long gone.
+        var paramsRows = FluidValueModel.CopyBagRow(bag, 0);
 
         foreach (var f in inputSchema.FieldsList)
         {
@@ -122,14 +126,15 @@ internal sealed class FluidQueryBatchFunction : ICollectorFunction
             ?? throw new InvalidOperationException(
                 $"{FunctionName} needs the hosting DuckDB to determine its output columns, and it is not "
                 + "available here.");
-        var ctx = FluidRelationInput.NewContext(FunctionName, probe, parameters, isBind: true);
+        var ctx = FluidRelationInput.NewContext(FunctionName, probe, parameters, isBind: true,
+                                                paramsRows: paramsRows);
         FluidRelationInput.CreateEmptyInput(probe, inputSchema);
         // ⚠ Bound at the probe too, EMPTY, so `{{ input_table.size }}` answers 0 here rather than failing.
         // A name that resolves at scan and not at bind is the split this plugin already records as a trap.
         FluidHostQuery.BindLazyRelation(ctx, FluidRelationInput.InputTable);
         var generated = FluidEngine.RenderOn(FunctionName, template, ctx);
         var outputSchema = FluidRelationInput.DescribeGenerated(FunctionName, probe, generated);
-        return new Binding(template, parameters, batchSize, inputSchema, outputSchema);
+        return new Binding(template, parameters, paramsRows, batchSize, inputSchema, outputSchema);
     }
 
     private static long? ReadBatchSize(RecordBatch? args)
@@ -152,14 +157,16 @@ internal sealed class FluidQueryBatchFunction : ICollectorFunction
     {
         private readonly string _template;
         private readonly object? _parameters;
+        private readonly RecordBatch? _paramsRows;
         private readonly long? _batchSize;
         private readonly Schema _inputSchema;
 
-        internal Binding(string template, object? parameters,
+        internal Binding(string template, object? parameters, RecordBatch? paramsRows,
                          long? batchSize, Schema inputSchema, Schema outputSchema)
         {
             _template = template;
             _parameters = parameters;
+            _paramsRows = paramsRows;
             _batchSize = batchSize;
             _inputSchema = inputSchema;
             OutputSchema = outputSchema;
@@ -192,7 +199,8 @@ internal sealed class FluidQueryBatchFunction : ICollectorFunction
             using var session = FluidRenderSession.TryCreate()
                 ?? throw new InvalidOperationException(
                     $"{FunctionName} needs the hosting DuckDB, which is not available here.");
-            var ctx = FluidRelationInput.NewContext(FunctionName, session, _parameters, isBind: false, outputSchema);
+            var ctx = FluidRelationInput.NewContext(FunctionName, session, _parameters, isBind: false,
+                                                    outputSchema, _paramsRows);
 
             long staged = await StageInputAsync(session, allInput, ct).ConfigureAwait(false);
             // ⚠ `staged > size` rather than `staged > 0`, so a batchsize at or above the row count is ONE

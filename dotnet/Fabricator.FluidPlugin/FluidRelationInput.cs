@@ -44,16 +44,21 @@ internal static class FluidRelationInput
         + "staged table directly (SELECT * FROM my_table).";
 
     /// <summary>Builds the render context every render of one execution shares.</summary>
+    /// <param name="paramsRows">The params bag as a one-row batch, exposed to the render's SQL as
+    /// <c>getvariable('params')</c>. ⚠ It must be a COPY (<see cref="FluidValueModel.CopyBagRow"/>): both
+    /// surfaces create their execution session long after their bind arguments are freed.</param>
     internal static TemplateContext NewContext(string functionName,
                                                FluidRenderSession session,
                                                object? parameters,
                                                bool isBind,
-                                               Schema? projectedSchema = null)
+                                               Schema? projectedSchema = null,
+                                               RecordBatch? paramsRows = null)
     {
         var ctx = FluidEngine.NewRenderContext(functionName, PublishRefusal(functionName), session, c =>
         {
             FluidValueModel.SetVariable(c, FluidValueModel.BagVariable, parameters);
         });
+        session.BindVariable(FluidValueModel.BagVariable, () => paramsRows);
         ctx.SetValue(FluidEngine.IsBindVariable, isBind);
         if (projectedSchema is not null)
         {

@@ -2,9 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // See LICENSE in the project root for license information.
 
+using System.IO;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using Apache.Arrow;
+using Apache.Arrow.Ipc;
 using Apache.Arrow.Types;
 using Fabricator.Bridge;
 using Fluid;
@@ -86,8 +88,16 @@ internal static class FluidValueModel
     /// <param name="paramsCol">The ANY-declared argument column: a STRUCT, a MAP, a JSON string, a LIST, a
     /// scalar, or all-null.</param>
     /// <param name="row">Which row of that column supplies this call's variables.</param>
-    internal static void Bind(TemplateContext ctx, IArrowArray? paramsCol, int row) =>
+    internal static void Bind(TemplateContext ctx, IArrowArray? paramsCol, int row)
+    {
         SetVariable(ctx, BagVariable, CaptureBag(paramsCol, row));
+        // ⚠ The SAME bag on the SQL side, as `getvariable('params')`. The factory closes over the LIVE
+        // column, which is safe on the two surfaces reaching here and ONLY on them: fluid_render and
+        // fluid_query both render INSIDE the call that owns these arguments, so the connection — and hence
+        // the copy — can only be opened while they are still alive. The three deferred surfaces bind their
+        // own, already-copied, batch instead.
+        FluidRenderSession.For(ctx)?.BindVariable(BagVariable, () => CopyBagRow(paramsCol, row));
+    }
 
     /// <summary>
     /// The params bag as a PLAIN VALUE, so a caller can bind it to a context LATER — after the Arrow batch
@@ -136,6 +146,49 @@ internal static class FluidValueModel
             // case at all and bind nothing SILENTLY.
             _ => ReadCell(paramsCol, row),
         };
+    }
+
+    /// <summary>
+    /// The params bag as a ONE-ROW Arrow batch whose single column is named <see cref="BagVariable"/> —
+    /// the form <see cref="FluidRenderSession.BindVariable"/> stages back into DuckDB, so the same bag a
+    /// template reads as <c>{{ params.x }}</c> is also readable from its SQL as
+    /// <c>getvariable('params').x</c>. <see langword="null"/> when no bag was passed, which leaves the
+    /// variable UNSET — and an unset variable already reads as NULL, so nothing is lost by not writing one.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// ⚠⚠ <b>DEEP-COPIED, via an IPC round trip, and both halves of that are load-bearing.</b> The bag
+    /// arrives as one cell of a BORROWED args batch, so the deferred surfaces — whose execution session is
+    /// created long after their bind arguments are freed — would otherwise stage released memory. And the
+    /// round trip NORMALISES the slice: a sliced Arrow array carries an offset its children do not, whereas
+    /// an IPC message is self-contained by construction, so what DuckDB imports cannot depend on how
+    /// Apache.Arrow happens to represent a view. A bag is a handful of scalars, so the copy is noise.
+    /// </para>
+    /// <para>
+    /// ⚠ The sliced view is deliberately NOT disposed: its buffers are the CALLER'S, shared with the batch
+    /// it was cut from, and disposing a view of an imported array is the double-release that surfaces as an
+    /// access violation inside Apache.Arrow's own release callback. Only the returned COPY is ours.
+    /// </para>
+    /// </remarks>
+    internal static RecordBatch? CopyBagRow(IArrowArray? paramsCol, int row)
+    {
+        if (paramsCol is null or NullArray || row >= paramsCol.Length || paramsCol.IsNull(row))
+        {
+            return null;
+        }
+        var schema = new Schema(new[] { new Field(BagVariable, paramsCol.Data.DataType, nullable: true) },
+                                null);
+        var view = new RecordBatch(schema,
+                                   new[] { ArrowArrayFactory.BuildArray(paramsCol.Data.Slice(row, 1)) }, 1);
+        var ms = new MemoryStream();
+        using (var w = new ArrowStreamWriter(ms, schema, leaveOpen: true))
+        {
+            w.WriteRecordBatch(view);
+            w.WriteEnd();
+        }
+        ms.Position = 0;
+        using var r = new ArrowStreamReader(ms);
+        return r.ReadNextRecordBatch();
     }
 
     /// <summary>

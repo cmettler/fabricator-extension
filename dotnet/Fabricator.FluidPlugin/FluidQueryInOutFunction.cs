@@ -77,7 +77,11 @@ internal sealed class FluidQueryInOutFunction : IInOutFunction
         // ⚠⚠ CAPTURED, not retained: the args batch belongs to the framework and its lifetime ends with this
         // call, while the chunks render much later. FluidValueModel.Capture is eager all the way down, so
         // what comes back holds no Arrow memory.
-        var parameters = FluidValueModel.CaptureBag(FluidValueModel.ArgColumn(args, "params"), 0);
+        var bag = FluidValueModel.ArgColumn(args, "params");
+        var parameters = FluidValueModel.CaptureBag(bag, 0);
+        // ⚠ COPIED for the same reason, and it must be: the SQL variable is staged when the execution
+        // session opens its connection, by which time this batch is long gone.
+        var paramsRows = FluidValueModel.CopyBagRow(bag, 0);
 
         // ⚠⚠ THE OUTPUT SCHEMA IS WHAT THE TEMPLATE ACTUALLY PRODUCES, not what it claims. The probe renders
         // with is_bind = true against an EMPTY input_table and asks DuckDB to bind the result; a template may
@@ -88,24 +92,28 @@ internal sealed class FluidQueryInOutFunction : IInOutFunction
             ?? throw new InvalidOperationException(
                 $"{FunctionName} needs the hosting DuckDB to determine its output columns, and it is not "
                 + "available here.");
-        var ctx = FluidRelationInput.NewContext(FunctionName, probe, parameters, isBind: true);
+        var ctx = FluidRelationInput.NewContext(FunctionName, probe, parameters, isBind: true,
+                                                paramsRows: paramsRows);
         FluidRelationInput.CreateEmptyInput(probe, inputSchema);
         // ⚠ Bound at the probe too, EMPTY, so `{{ input_table.size }}` answers 0 here rather than failing.
         FluidHostQuery.BindLazyRelation(ctx, FluidRelationInput.InputTable);
         var generated = FluidEngine.RenderOn(FunctionName, template, ctx);
         var outputSchema = FluidRelationInput.DescribeGenerated(FunctionName, probe, generated);
-        return new Binding(template, parameters, outputSchema);
+        return new Binding(template, parameters, paramsRows, outputSchema);
     }
 
     private sealed class Binding : IInOutFunctionBinding
     {
         private readonly string _template;
         private readonly object? _parameters;
+        private readonly RecordBatch? _paramsRows;
 
-        internal Binding(string template, object? parameters, Schema outputSchema)
+        internal Binding(string template, object? parameters, RecordBatch? paramsRows,
+                         Schema outputSchema)
         {
             _template = template;
             _parameters = parameters;
+            _paramsRows = paramsRows;
             OutputSchema = outputSchema;
         }
 
@@ -139,7 +147,7 @@ internal sealed class FluidQueryInOutFunction : IInOutFunction
                 ?? throw new InvalidOperationException(
                     $"{FunctionName} needs the hosting DuckDB, which is not available here.");
             var ctx = FluidRelationInput.NewContext(FunctionName, session, _parameters, isBind: false,
-                                                    outputSchema);
+                                                    outputSchema, _paramsRows);
 
             await foreach (var chunk in input.WithCancellation(ct).ConfigureAwait(false))
             {

@@ -4186,3 +4186,129 @@ kind twice over.
 
 ⚠ The two controls (`LIMIT` past the end, and `ORDER BY … LIMIT`) are not decoration: they are the paths that
 ALWAYS worked, so a build that released only on the END path passes them happily and fails the repro rows.
+
+---
+
+## 38. ✅ AS BUILT (2026-09-13) — the params bag is a DuckDB VARIABLE too
+
+**User-asked:** *"could we additionally expose/set the `params` as a duckdb variable `params` on the fluid
+render pinned duckdb session so it is easier to access it via a sql query?"* — yes. C#-only IN THE PLUGIN:
+**no ABI change, no C++ change, no bridge change.** Gate `verify_plugin_fluid` 810 → **828** (the suite's §37), hermetic
+floor 9166 → **9184**, three mutants each killed at its own row.
+
+The same bag a template reads as `{{ params.x }}` is now staged onto the render's pinned connection, so its
+SQL can read it as a VALUE:
+
+```sql
+SELECT fluid_render(
+  '{% query r %}SELECT * FROM sales WHERE region = getvariable(''params'').region{% endquery %}{{ r.size }}',
+  {'region': 'eu'});
+```
+
+It is available on **all five surfaces** inside `{% query %}` / `{% exec %}` bodies, and additionally to the
+GENERATED statement on `fluid_query_batch`, `fluid_query_lateral` and `fluid_query_inout` — those three run
+that statement on the same pin.
+
+### 38.1 Why a named Arrow source and not rendered SQL
+
+⚠⚠ **`SET VARIABLE params = (SELECT "params" FROM fabricator_scan('<token>'))`, never a rendered literal —
+and that is what makes it TYPE-EXACT.** MEASURED: a bag of `{'d': DATE '2024-03-05', 'm': 19.99::DECIMAL(9,2)}`
+comes back as `STRUCT(d DATE, m DECIMAL(9,2))` and `m * 2` is exactly `39.98`. Rendering instead would mean a
+second SQL type ladder — and `DuckSql.Literal`, the one we have, collapses every temporal to TIMESTAMPTZ and
+REFUSES a LIST or a STRUCT by name. It is the same argument that produced `publish()` (§18).
+
+⚠ **The bound-parameter route the provider tags use is CLOSED here, measured:** `SET VARIABLE` **cannot be
+prepared** (`Parser Error: syntax error at or near "SET"`), and the host's parameterised `host_query` path is
+`Prepare` + `Execute`. The named-source staging is the only faithful route, and it is the one
+`FluidRelationInput.CreateEmptyInput` already uses for `input_table`.
+
+### 38.2 Scope: it cannot collide with anything, and it dies with the render
+
+⚠ DuckDB keeps variables in **`ClientConfig::user_variables`**, a per-`ClientContext` map — so the variable is
+scoped to this render's connection. MEASURED in both directions and both pinned in the suite's §37: a variable set on the
+pin is invisible to the NEXT render, and one set by the CALLER's session is invisible on the pin. That is why
+the fixed name `params` needs no escape hatch.
+
+⚠ `getvariable` resolves at BIND time into a `BoundConstantExpression`, taking its return type from the
+value — which is what makes `getvariable('params').region` bind at all. The variable is staged when the
+connection opens, i.e. before any statement of the render is prepared.
+
+### 38.3 Lazy, and the lifetime rule that forced a copy
+
+⚠⚠ **`FluidRenderSession.BindVariable` takes a FACTORY, and nothing is read or staged until the render's
+connection is opened.** `fluid_render` is a per-ROW scalar, so binding eagerly would copy a bag for every row
+of every template — including the overwhelming majority that run no SQL at all.
+
+⚠⚠ **THE FACTORY MUST NOT CLOSE OVER ANYTHING SHORTER-LIVED THAN THE SESSION, and the surfaces split on
+exactly this.** `fluid_render` and `fluid_query` render INSIDE the call that owns their arguments, so they may
+slice live Arrow. The three deferred surfaces create their EXECUTION session long after `Bind`'s arguments are
+freed — the same fact that makes `CaptureBag` eager — so they must close over a COPY. That is
+`FluidValueModel.CopyBagRow`, a one-row slice put through an IPC round trip.
+
+⚠ The round trip also NORMALISES the slice: a sliced Arrow array carries an offset its children do not, so an
+IPC message — self-contained by construction — is what keeps the result from depending on how Apache.Arrow
+happens to represent a view. **The per-row gate row is what proves it picks the right cell**; mutant 2, which
+always slices row 0, passes every other row in the suite's §37 and dies exactly there.
+
+⚠ The sliced view is deliberately NOT disposed: its buffers are the caller's, and disposing a view of an
+imported array is the double-release that surfaces as an access violation inside Apache.Arrow's own release
+callback (§22's measured crash).
+
+### 38.4 The boundary, which is by design
+
+⚠⚠ **In `fluid_query` the variable is readable from an explicit `{% query %}` / `{% exec %}` block and NOT
+from the generated statement** (user-confirmed 2026-09-13: *"in fluid_query the getvariable should only work
+in an explicit {%query/exec %}"*). That statement is returned as TEXT and bound by the CALLER's connection — a
+different `ClientContext`, therefore a different variable map. MEASURED: `typeof` reports `"NULL"` there.
+Nothing is lost — a template that GENERATES SQL interpolates its params into it directly, which is what the
+template language is for. The three deferred surfaces differ precisely because WE run their generated
+statement, on the same pin the blocks use.
+
+⚠ And there IS a route through it when the params must reach a RELATION rather than a literal: stage inside
+`{% exec %}` — which does see the variable — and `publish()` the result. MEASURED:
+
+```sql
+SELECT * FROM fluid_query(
+  '{% exec %}CREATE TEMP TABLE p AS SELECT getvariable(''params'').region AS g{% endexec %}'
+  || 'SELECT * FROM {{ publish(''p'') }}', params := {'region': 'eu'});
+-- eu
+```
+
+⚠ Not separately gated: it is a composition of two mechanisms each pinned on its own (the suite's §37 block row and
+its publish rows), so there is nothing here that could break without one of those failing first.
+
+### 38.5 The JSON asymmetry, stated rather than normalised
+
+⚠ A **JSON-string** bag stays a `VARCHAR` variable, while Liquid PARSES it so `{{ params.region }}` works in
+both spellings. The bag is staged as the caller wrote it. **Prefer the STRUCT spelling** — the same advice
+`fabricator_query`'s bag already carries. Pinned as a characterization in the suite's §37.
+
+⚠⚠ **CASTING IT TO DuckDB'S `JSON` TYPE WAS CONSIDERED AND IS NOT TAKEN — and the first write-up of this gave
+the WRONG reason** (*"normalising would mean inventing DuckDB types for JSON's four scalar kinds"*). That
+argument is about JSON → **STRUCT**, where `1` could be INTEGER or BIGINT and `1.5` DOUBLE or DECIMAL; it says
+nothing about the `JSON` type, which is VARCHAR-backed and invents nothing. Three MEASURED reasons stand in
+its place, and the first is the one that decides it:
+
+1. **It would not unify the two spellings — it would make them differ SILENTLY.** Dot access DOES work on a
+   JSON value, but `getvariable('p').region` yields **`"eu"`** — a quoted JSON scalar — where the STRUCT
+   spelling yields **`eu`**. So auto-casting would replace today's LOUD binder error with a value that is
+   subtly wrong in string comparisons and concatenation. `->>'region'` is the unquoted accessor.
+2. **`::JSON` needs the json extension**, measured: `Catalog Error: Type with name "JSON" is not in the
+   catalog, but it exists in the json extension.` We cannot guarantee it on the render's pin, so the cast
+   would have to be conditional — making the variable's TYPE depend on the environment, and on a `LOAD json`
+   that may land BETWEEN two renders.
+3. **"Preserve what the caller declared" is not available either**: DuckDB's own Arrow export DROPS
+   JSON-ness. MEASURED — `fabricator_host_query` over a `::JSON` column reports `VARCHAR`, while the same
+   value never leaving DuckDB reports `JSON`. A `::JSON` bag reaches us as a plain string whatever the caller
+   wrote, so there is no declaration left to honour.
+
+⚠ **The capability already exists and needs no code from us** — the author opts in, knowing their own
+environment. Both MEASURED: `getvariable('params')::JSON->>'region'` inline, or one
+`SET VARIABLE pj = getvariable('params')::JSON` in an `exec` block and dot access on `pj` throughout.
+
+⚠ The bag needs no MEMBERS: a LIST is indexable as `getvariable('params')[1]` and a bare scalar arrives as a
+scalar, matching the lifting the Liquid side gained when the member spread was removed (§20).
+
+⚠ **No bag ⇒ no statement.** An unset DuckDB variable already reads as NULL, so writing one would buy nothing
+and cost a round trip on every render that passed no params. `getvariable('params') IS NULL` is how SQL asks
+what `{% if params %}` asks in Liquid.

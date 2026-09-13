@@ -4239,3 +4239,135 @@ SELECT (SELECT p FROM fluid_query_inout(
           (SELECT * FROM range(1) t(i))));
 ----
 p	p|a/1
+
+# =====================================================================================================
+# §37 — THE PARAMS BAG IS A DuckDB VARIABLE TOO: `getvariable('params')` in the render's own SQL.
+#
+# The same bag a template reads as `{{ params.x }}` is staged onto the render's PINNED connection, so its
+# SQL can read it as a VALUE instead of having it interpolated as text or re-passed as a block argument.
+#
+# ⚠⚠ STAGED THROUGH A NAMED ARROW SOURCE, NEVER RENDERED AS SQL TEXT, and the typed row below is what
+# proves it: a DATE stays a DATE and a DECIMAL(9,2) stays exact, where `| sql` collapses every temporal to
+# TIMESTAMPTZ and REFUSES a LIST or a STRUCT outright. Rendering would have meant a second SQL type ladder.
+#
+# ⚠ The variable lives in DuckDB's `ClientConfig::user_variables`, a PER-ClientContext map, so it is scoped
+# to this render's connection: it cannot collide with anything the caller has, and it dies with the render.
+# Both directions are pinned below.
+# =====================================================================================================
+
+# --- ⚠⚠ TYPE FIDELITY, and this is the load-bearing row: `STRUCT(d DATE, m DECIMAL(9,2))` comes back
+# unchanged and 19.99 * 2 is EXACTLY 39.98. A build that reached DuckDB by rendering the bag as text would
+# report a TIMESTAMPTZ here, or refuse the struct entirely. ---
+query T
+SELECT fluid_render('{% query r %}SELECT typeof(getvariable(''params'')) AS t, getvariable(''params'').m * 2 AS m{% endquery %}{{ r[0].t }}|{{ r[0].m }}',
+                    {'d': DATE '2024-03-05', 'm': 19.99::DECIMAL(9,2)});
+----
+STRUCT(d DATE, m DECIMAL(9,2))|39.98
+
+# --- ⚠ ONE bag, TWO surfaces, and they must agree — the Liquid side and the SQL side of the same render. ---
+query T
+SELECT fluid_render('{% query r %}SELECT getvariable(''params'').n + 1 AS v{% endquery %}liquid={{ params.n }} sql={{ r[0].v }}',
+                    {'n': 41});
+----
+liquid=41 sql=42
+
+# --- ⚠⚠ PER ROW, and it is the sharpest row in the section: fluid_render is a per-ROW scalar, so each row
+# has its own session AND its own bag. A build that staged the params COLUMN without picking this row — or
+# picked row 0 every time — answers 0,0,0 here while every other row in this section still passes. ---
+query T
+SELECT fluid_render('{% query r %}SELECT getvariable(''params'').k AS k{% endquery %}{{ r[0].k }}',
+                    {'k': i}) FROM range(3) t(i);
+----
+0
+1
+2
+
+# --- ⚠ NO BAG ⇒ the variable is never written, and an unset DuckDB variable already reads as NULL. So
+# `getvariable('params') IS NULL` is how SQL asks what `{% if params %}` asks in Liquid. ---
+query T
+SELECT fluid_render('{% query r %}SELECT typeof(getvariable(''params'')) AS t{% endquery %}{{ r[0].t }}', NULL);
+----
+"NULL"
+
+# --- ⚠ The bag needs no MEMBERS: whatever shape it has is what the variable has. A LIST is indexable and a
+# bare scalar arrives as a scalar — the same lifting the Liquid side gained when the member spread went. ---
+query TT
+SELECT fluid_render('{% query r %}SELECT getvariable(''params'')[1] AS a{% endquery %}{{ r[0].a }}', [10, 20]),
+       fluid_render('{% query r %}SELECT typeof(getvariable(''params'')) AS t{% endquery %}{{ r[0].t }}', 7);
+----
+10	INTEGER
+
+# --- ⚠⚠ A CHARACTERIZATION, and the one asymmetry to know: a JSON-STRING bag stays a VARCHAR here, while
+# Liquid PARSES it so `{{ params.region }}` works in both spellings. The bag is staged as the caller wrote
+# it. Prefer the STRUCT spelling.
+#
+# CASTING IT TO DuckDB'S `JSON` TYPE IS DELIBERATELY NOT DONE, and the reason is NOT that JSON's scalar kinds
+# cannot be mapped -- that is the JSON -> STRUCT argument and does not apply to the VARCHAR-backed JSON type.
+# It is that dot access on a JSON value returns a QUOTED scalar (`"eu"`) where the STRUCT spelling returns
+# `eu`, so auto-casting would trade today's LOUD binder error for a silently different VALUE. Plus `::JSON`
+# needs the json extension, which would make the variable's TYPE depend on the environment. The author opts
+# in instead: getvariable('params')::JSON->>'region'. See docs/fluid-templating.md section 38.5. ---
+query T
+SELECT fluid_render('{% query r %}SELECT typeof(getvariable(''params'')) AS t, getvariable(''params'') AS v{% endquery %}{{ r[0].t }}|{{ r[0].v }}',
+                    '{"region": "no"}');
+----
+VARCHAR|{"region": "no"}
+
+# --- ⚠⚠ THE THREE DEFERRED SURFACES READ IT FROM THE GENERATED STATEMENT ITSELF — they run that statement
+# on the render's own pin, so the variable is in scope for it and not merely for a {% query %} body.
+#
+# ⚠ These are also the lifetime proof. All three create their EXECUTION session long after their bind
+# arguments have been freed, so the bag they stage must be a COPY; a build that kept a view of the original
+# Arrow reads released memory here rather than answering. ---
+query TI
+SELECT g, n FROM fluid_query_batch(
+  'SELECT getvariable(''params'').region AS g, count(*) AS n FROM input_table',
+  (SELECT * FROM range(4) t(i)), params := {'region': 'eu'});
+----
+eu	4
+
+query T
+SELECT DISTINCT g FROM fluid_query_inout(
+  'SELECT getvariable(''params'').region AS g FROM input_table',
+  (SELECT * FROM (VALUES (1), (2)) t(n)), params := {'region': 'uk'});
+----
+uk
+
+query T
+SELECT DISTINCT f.g FROM (VALUES (1), (2)) t(n), fluid_query_lateral(
+  'SELECT i.__fab_row, getvariable(''params'').region AS g FROM input_table i', {'region': 'ch'}, t.n) f;
+----
+ch
+
+# --- ⚠ fluid_query: its {% query %} BODY sees the variable, because that runs on the pin. ---
+query T
+SELECT body_saw FROM fluid_query(
+  '{% query r %}SELECT getvariable(''params'').region AS g{% endquery %}SELECT ''{{ r[0].g }}'' AS body_saw',
+  params := {'region': 'se'});
+----
+se
+
+# --- ⚠⚠ AND THE BOUNDARY, WHICH IS BY DESIGN: in fluid_query the variable is readable from an explicit
+# {% query %} / {% exec %} block and NOT from the generated statement. That statement is returned as text
+# and bound by the CALLER's connection — a different ClientContext, and therefore a different variable map.
+# Nothing is lost: a template that GENERATES SQL interpolates its params into it directly, which is what the
+# template language is for. The three surfaces above differ precisely because WE run their generated
+# statement, on the same pin the blocks use. ---
+query T
+SELECT typeof(v) FROM fluid_query('SELECT getvariable(''params'') AS v', params := {'region': 'se'});
+----
+"NULL"
+
+# --- ⚠⚠ COLLISION-FREEDOM, which is what makes the fixed name `params` safe: a variable of the CALLER's is
+# NOT visible on the render's pin, so nothing of the user's can be read as the bag and nothing we set can be
+# read by them. The pin is a fresh ClientContext and only its TimeZone and search path are inherited. ---
+statement ok
+SET VARIABLE params = 'from-the-caller';
+
+query T
+SELECT fluid_render('{% query r %}SELECT typeof(getvariable(''params'')) AS t{% endquery %}{{ r[0].t }}', NULL);
+----
+"NULL"
+
+statement ok
+RESET VARIABLE params;

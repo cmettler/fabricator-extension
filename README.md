@@ -1525,6 +1525,42 @@ SELECT fluid_render('v={{ params | plus: 1 }}', 41);
 > `{% if params %}` is how you ask whether one was passed. A VARCHAR bag is still parsed as JSON, and
 > unparseable text is still an error rather than a string.
 
+**The bag is also a DuckDB variable, so the template's own SQL can read it** — `getvariable('params')` inside
+any `{% query %}` or `{% exec %}` block, without interpolating it as text or re-passing it as a block
+argument:
+
+```sql
+SELECT fluid_render(
+  '{% query r %}SELECT getvariable(''params'').region AS g{% endquery %}{{ r[0].g }}',
+  {'region': 'eu', 'n': 7});
+-- eu
+```
+
+The value keeps its type: a `DATE` stays a `DATE` and a `DECIMAL(9,2)` stays exact, because the bag is handed
+to DuckDB as a value rather than rendered into the statement. A bag with no members works too —
+`getvariable('params')[1]` for a `LIST`, and a bare scalar arrives as a scalar.
+
+> ⚠ **A JSON-string bag stays a `VARCHAR` here**, while Liquid parses it — so `{{ params.region }}` works for
+> both spellings and `getvariable('params').region` only for the `STRUCT` one. Prefer the `STRUCT` form. For
+> a JSON bag, cast it yourself: `getvariable('params')::JSON->>'region'`, or re-declare it once with
+> `{% exec %}SET VARIABLE pj = getvariable('params')::JSON{% endexec %}`. It is deliberately not cast for
+> you -- dot access on a JSON value returns a *quoted* scalar (`"eu"`, not `eu`), and the cast needs the
+> `json` extension loaded.
+>
+> ⚠ The variable is scoped to **that render's own connection**: it cannot collide with a variable of yours
+> (yours is not visible inside a render either), and it is gone when the render ends. With no bag it is never
+> set, and an unset variable reads as NULL — so `getvariable('params') IS NULL` asks in SQL what
+> `{% if params %}` asks in Liquid.
+>
+> ⚠ In **`fluid_query`** it is readable from an explicit `{% query %}` / `{% exec %}` block, **not** from the
+> statement the template generates — that statement is bound by your own connection. Interpolate params into
+> generated SQL directly (`{{ params.n }}`), which is what the template is for. In `fluid_query_batch`,
+> `fluid_query_lateral` and `fluid_query_inout` the generated statement **does** see it, because those run it
+> on the template's own connection.
+>
+> If the params have to reach a *relation* there, stage it in `{% exec %}` — which does see the variable —
+> and `publish()` the result.
+
 The bag can come from SQL rather than a literal — `params := ?` in a prepared statement (DuckDB re-binds
 every `EXECUTE`, so the template is re-rendered and even the **column list may differ between two executes of
 one prepared statement**), or `params := {'cols': getvariable('cols')}` to drive it from a session variable.
