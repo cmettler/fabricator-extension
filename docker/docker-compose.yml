@@ -57,7 +57,16 @@ services:
       start_period: 20s
 
   minio:
-    image: minio/minio:latest
+    # ⚠⚠ quay.io, NOT Docker Hub, and it is not interchangeable. `minio/minio` and `minio/mc` on Docker Hub
+    # became UNPULLABLE — "pull access denied ... repository does not exist or may require 'docker login'" —
+    # MEASURED 2026-09-13 both on a CI runner and from a developer box, and a PINNED older tag is gone too,
+    # so it is the repository that went rather than the tag. quay.io is MinIO's other official registry and
+    # serves both images.
+    #
+    # ⚠ It broke the SCHEDULED service tier from 2026-09-12 while local runs kept passing on an image cached
+    # since 2026-07-30. That is the usual shape: only a clean machine pulls, so only CI notices. Do not read
+    # a green local service tier as evidence that the rig can be provisioned from scratch.
+    image: quay.io/minio/minio:latest
     # Survive a host reboot. Without this the containers exit and STAY exited — which happened on
     # 2026-07-30 (an overnight OS update rebooted the box) and surfaced only as the whole service tier
     # failing at each suite's first ATTACH with 'error 258: server not found'. `unless-stopped` rather
@@ -83,7 +92,7 @@ services:
 
   # One-shot bucket bootstrap: creates the `fabricator` test bucket (idempotent).
   createbucket:
-    image: minio/mc:latest
+    image: quay.io/minio/mc:latest
     depends_on:
       minio:
         condition: service_healthy
