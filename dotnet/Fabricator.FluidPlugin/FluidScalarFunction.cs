@@ -121,7 +121,7 @@ internal sealed class FluidScalarFunction : IScalarFunction
 
         // The staged shape: the row number the wrap orders by, then the per-row arguments under the names the
         // template addresses. Built from the DECLARED arity so the probe and every chunk agree.
-        var stagedSchema = StagedSchema(args.Count);
+        var stagedSchema = StagedSchema(args);
 
         using var probe = FluidRenderSession.TryCreate()
             ?? throw new InvalidOperationException(
@@ -138,14 +138,34 @@ internal sealed class FluidScalarFunction : IScalarFunction
     /// chunk and the staged relation is rebuilt from THAT batch. The bind-time shape exists so the probe can
     /// bind the expression's column NAMES, which is all it needs.
     /// </remarks>
-    private static Schema StagedSchema(int declaredCount)
+    private static Schema StagedSchema(ScalarBindArgs args)
     {
         var fields = new List<Field> { new(FluidScalarBinding.RowColumn, Int64Type.Default, nullable: false) };
-        for (int i = 2; i < declaredCount; i++)
+        for (int i = 2; i < args.Count; i++)
         {
-            fields.Add(new Field("arg_" + (i - 2), StringType.Default, nullable: true));
+            fields.Add(new Field(ArgColumnName(args.Values!, i), StringType.Default, nullable: true));
         }
         return new Schema(fields, metadata: null);
+    }
+
+    /// <summary>The staged name of the i-th argument column — the one the host marshalled it under.</summary>
+    /// <remarks>
+    /// ⚠⚠ TAKEN FROM THE BATCH, never rebuilt as <c>arg_&lt;k&gt;</c>: a tail argument written
+    /// <c>name := expr</c> arrives under <c>name</c> (the host resolves the alias at bind — see
+    /// FabricatorCallArgName), and rebuilding the positional name here would throw that away and leave the
+    /// template referencing a column that does not exist. BIND and EXECUTE must agree, so both go through
+    /// this.
+    /// </remarks>
+    internal static string ArgColumnName(RecordBatch args, int index)
+    {
+        var name = args.Schema.FieldsList[index].Name;
+        if (string.Equals(name, FluidScalarBinding.RowColumn, StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                FunctionName + ": an argument cannot be named '" + FluidScalarBinding.RowColumn
+                + "' — that column carries the staged row number. Choose another name.");
+        }
+        return name;
     }
 
     /// <summary>
@@ -331,7 +351,8 @@ internal sealed class FluidScalarBinding : IScalarFunctionBinding
         columns.Add(rows.Build());
         for (int c = 2; c < args.ColumnCount; c++)
         {
-            fields.Add(new Field("arg_" + (c - 2), args.Schema.FieldsList[c].DataType, nullable: true));
+            fields.Add(new Field(FluidScalarFunction.ArgColumnName(args, c),
+                                 args.Schema.FieldsList[c].DataType, nullable: true));
             columns.Add(args.Column(c));
         }
         // ⚠ BORROWED, like every other RegisterRows caller: the argument columns belong to the framework and

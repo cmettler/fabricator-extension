@@ -1505,8 +1505,18 @@ SELECT n, fluid_scalar(
 -- {'a': 2}, {'a': 3}, …   a real STRUCT(a INTEGER), not text
 ```
 
-`template` and `params` are **bind-time constants**; everything after them is per-row, staged as
-`input_table` and addressable as `arg_0`, `arg_1`, …. Under `is_bind` the template renders a SELECT of the
+`template` and `params` are **bind-time constants**; everything after them is per-row and is staged as
+`input_table`. **Name an argument and the column takes that name** — `counter := i` is readable as `counter`
+rather than `arg_0`:
+
+```sql
+SELECT i, fluid_scalar(
+  '{% if is_bind %}select NULL::BIGINT'
+  '{% else %}select counter * 2 from input_table{% endif %}', NULL, counter := i) FROM range(5) t(i);
+```
+
+A plain column reference names itself too (`n` is `n`); anything else — a computed expression, a function
+call, a literal — is `arg_0`, `arg_1`, … counted over the whole tail. Under `is_bind` the template renders a SELECT of the
 result type — `select NULL::<type>` is the usual answer — and DuckDB binding that statement is what
 determines the type. Any type DuckDB can express works, with nothing lost: `STRUCT(a INTEGER, b VARCHAR)`,
 `DECIMAL(9,2)` with its scale, `INTEGER[]`, `MAP(VARCHAR, INTEGER)`. The template writes its own `select`;
@@ -1536,6 +1546,10 @@ SELECT typeof(fluid_scalar(
 > ⚠ The declared type is **authoritative**: the expression is cast to it, so `42` under a declared `BIGINT`
 > is fine. A conversion that cannot happen fails with DuckDB's own message; a lossy but legal one (a `DOUBLE`
 > expression under a declared `BIGINT`) truncates silently, exactly as a declared column type does.
+>
+> ⚠ A named argument **documents** an argument; it does not **move** it. `fluid_scalar(tpl, counter := 7, 2)`
+> still binds `7` as the params bag — DuckDB discards the name for dispatch on any scalar, built-ins
+> included (`upper(zzz := 'a')` returns `A`). Order is always positional.
 >
 > ⚠ The template's SQL runs on its own connection, so it cannot see your **TEMP** tables — use a regular
 > table. The `params` bag is available both as `{{ params.x }}` and as `getvariable('params')`.

@@ -535,10 +535,16 @@ struct ScalarBindingHolder {
 
 struct FabricatorScalarBindData : public FunctionData {
 	shared_ptr<ScalarBindingHolder> holder;
+	//! The argument column names THIS call site marshals under — resolved at bind, because a tail argument
+	//! written `name := expr` is named by its alias and the registration-time declaration cannot know it.
+	//! ⚠ Bind and execute MUST agree on these: the managed side reads some columns by name, so a disagreement
+	//! is a wrong column rather than an error.
+	vector<string> arg_names;
 
 	unique_ptr<FunctionData> Copy() const override {
 		auto c = make_uniq<FabricatorScalarBindData>();
 		c->holder = holder;
+		c->arg_names = arg_names;
 		return std::move(c);
 	}
 	bool Equals(const FunctionData &other_p) const override {
@@ -611,6 +617,30 @@ static string FabricatorArgName(const vector<string> &decl_names, idx_t varargs_
 		return decl_names[varargs_index] + "_" + to_string(i - varargs_index);
 	}
 	return i < decl_names.size() ? decl_names[i] : "arg" + to_string(i);
+}
+
+//! The name of the i-th ACTUAL argument AT THIS CALL SITE: as FabricatorArgName, except that a TAIL argument
+//! written `name := expr` is called `name`.
+//!
+//! ⚠⚠ THE NAME SURVIVES AS THE ARGUMENT'S ALIAS, which is the only reason this is possible.
+//! Transformer::TransformNamedArg rewrites `name := expr` into `expr` with SetAlias(name) — so for a SCALAR
+//! the argument stays POSITIONAL and the name is carried on the expression. DuckDB's own struct_pack reads
+//! it the same way, which is what makes `struct_pack(a := 1)` a STRUCT(a …).
+//!
+//! ⚠ TAIL SLOTS ONLY, deliberately. A declared parameter must keep its DECLARED name because the managed
+//! side reads those BY NAME (FluidValueModel.ArgColumn(args, "template")); letting `foo := '…'` rename the
+//! template slot would break that read at a distance. A tail name is positional-fallback anyway, so an alias
+//! is strictly better information there.
+//!
+//! ⚠ It does NOT make a named argument reorder — `f(a := 1, 2)` still binds 1 first, because DuckDB
+//! discarded the name for dispatch long before this. That asymmetry is DuckDB's, not ours, and cannot be
+//! fixed here: a built-in scalar behaves identically (`upper(zzz := 'a')` returns 'A').
+static string FabricatorCallArgName(const vector<string> &decl_names, idx_t varargs_index, idx_t i,
+                                    const Expression &arg) {
+	if (varargs_index != DConstants::INVALID_INDEX && i >= varargs_index && arg.HasAlias()) {
+		return arg.GetAlias();
+	}
+	return FabricatorArgName(decl_names, varargs_index, i);
 }
 
 //! Refuses a variadic tail on a function kind that cannot carry one — AGGREGATES only, now that scalar,
@@ -733,7 +763,7 @@ static unique_ptr<FunctionData> FabricatorScalarBind(ClientContext &context, Sca
 			}
 		}
 		arg_types.push_back(marshal_type);
-		arg_names.push_back(FabricatorArgName(info.arg_names, info.varargs_index, i));
+		arg_names.push_back(FabricatorCallArgName(info.arg_names, info.varargs_index, i, arg));
 		arg_constant.push_back(folded ? '1' : '0');
 		arg_values.push_back(std::move(value));
 	}
@@ -813,6 +843,9 @@ static unique_ptr<FunctionData> FabricatorScalarBind(ClientContext &context, Sca
 
 	auto bind_data = make_uniq<FabricatorScalarBindData>();
 	bind_data->holder = std::move(holder);
+	// Carried so EXECUTE marshals under the same names BIND resolved — a tail argument's alias is a property
+	// of the call site, which the registration-time declaration the exec lambda captured cannot know.
+	bind_data->arg_names = std::move(arg_names);
 	return std::move(bind_data);
 }
 
@@ -835,6 +868,12 @@ static ScalarFunction BuildFabricatorScalarFunction(FabricatorHandle handle, con
 		auto &ctx = state.GetContext();
 		idx_t row_count = args.size();
 
+		// The binding was resolved once, at bind, and is reused for every chunk. It rides the bound
+		// expression's FunctionData, which is the only channel a non-capturing-identity exec has — and it is
+		// also where THIS call site's argument names live, so it has to be read before they are used.
+		auto &func_expr = state.expr.Cast<BoundFunctionExpression>();
+		auto &bind_data = func_expr.bind_info->Cast<FabricatorScalarBindData>();
+
 		// Marshal the arg chunk -> a one-batch Arrow stream using the chunk's ACTUAL column types (not the
 		// declared signature): for a SQLNULL-sentinel ("accept any value") param declared as ANY, DuckDB passes
 		// the value UNCAST, so the runtime type (a STRUCT, a VARCHAR, …) is what must be appended. For a
@@ -842,9 +881,19 @@ static ScalarFunction BuildFabricatorScalarFunction(FabricatorHandle handle, con
 		auto actual_types = args.GetTypes();
 		// Name the ACTUAL columns, not the declared ones: a VARIADIC call is wider than its declaration, and
 		// the producer pairs names with types positionally — a short name list would misdescribe the batch.
+		//
+		// ⚠⚠ FROM THE BIND DATA when it describes this call, not recomputed: a TAIL argument written
+		// `name := expr` is named by its ALIAS, which only the bind saw. Recomputing from the captured
+		// DECLARATION would name it `<tail>_<k>` here and `name` there, and the managed side reads some
+		// columns BY NAME — so the two must not be allowed to disagree. The declaration is the fallback for
+		// any shape whose bind data does not describe the chunk.
 		vector<string> marshal_names;
-		for (idx_t c = 0; c < actual_types.size(); c++) {
-			marshal_names.push_back(FabricatorArgName(arg_names, varargs_index, c));
+		if (bind_data.arg_names.size() == actual_types.size()) {
+			marshal_names = bind_data.arg_names;
+		} else {
+			for (idx_t c = 0; c < actual_types.size(); c++) {
+				marshal_names.push_back(FabricatorArgName(arg_names, varargs_index, c));
+			}
 		}
 
 		// ── ZERO-ARGUMENT SCALAR: send one throwaway column ──────────────────────────────────────────
@@ -899,10 +948,6 @@ static ScalarFunction BuildFabricatorScalarFunction(FabricatorHandle handle, con
 		producer.AddBatch(array);
 		producer.Finish();
 
-		// The binding was resolved once, at bind, and is reused for every chunk. It rides the bound
-		// expression's FunctionData, which is the only channel a non-capturing-identity exec has.
-		auto &func_expr = state.expr.Cast<BoundFunctionExpression>();
-		auto &bind_data = func_expr.bind_info->Cast<FabricatorScalarBindData>();
 		ArrowArrayStream out;
 		std::memset(&out, 0, sizeof(out));
 		fabricator::ScalarFnExecute(bind_data.holder->binding, *producer.Stream(), MakeCallContext(ctx), out);

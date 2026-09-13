@@ -4401,7 +4401,7 @@ CREATE TEMP TABLE fs_t AS SELECT * FROM (VALUES (1), (2), (3)) v(n);
 query ITT
 SELECT n, s::VARCHAR, typeof(s) FROM (
   SELECT n, fluid_scalar(
-    '{% if is_bind %}select NULL::STRUCT(a INTEGER){% else %}select {''a'': arg_0 + 1} from input_table{% endif %}',
+    '{% if is_bind %}select NULL::STRUCT(a INTEGER){% else %}select {''a'': n + 1} from input_table{% endif %}',
     NULL, n) AS s FROM fs_t) z ORDER BY n;
 ----
 1	{'a': 2}	STRUCT(a INTEGER)
@@ -4425,7 +4425,7 @@ BIGINT	DECIMAL(9,2)
 query IT
 SELECT sum(v)::BIGINT, typeof(any_value(v)) FROM (
   SELECT fluid_scalar(
-    '{% if is_bind %}select NULL::BIGINT{% else %}select arg_0 * 10 + arg_1 from input_table{% endif %}',
+    '{% if is_bind %}select NULL::BIGINT{% else %}select i * 10 + arg_1 from input_table{% endif %}',
     NULL, i, i + 1) AS v FROM range(5) t(i));
 ----
 115	BIGINT
@@ -4441,7 +4441,7 @@ SELECT sum(v)::BIGINT, typeof(any_value(v)) FROM (
 query II
 SELECT count(*), sum(CASE WHEN v = i * 2 THEN 0 ELSE 1 END)::BIGINT FROM (
   SELECT i, fluid_scalar(
-    '{% if is_bind %}select NULL::BIGINT{% else %}select arg_0 * 2 from input_table{% endif %}',
+    '{% if is_bind %}select NULL::BIGINT{% else %}select i * 2 from input_table{% endif %}',
     NULL, i) AS v FROM range(5000) t(i));
 ----
 5000	0
@@ -4469,7 +4469,7 @@ Could not convert string 'not a number' to INT64
 # a silent short read would be a wrong answer for every row after it. ---
 statement error
 SELECT fluid_scalar(
-  '{% if is_bind %}select NULL::BIGINT{% else %}select arg_0 from input_table limit 1{% endif %}', NULL, n)
+  '{% if is_bind %}select NULL::BIGINT{% else %}select n from input_table limit 1{% endif %}', NULL, n)
 FROM fs_t;
 ----
 values for
@@ -4484,7 +4484,7 @@ exactly ONE column
 # cannot depend on row data. The message says so rather than failing somewhere downstream. ---
 statement error
 SELECT fluid_scalar(
-  '{% if is_bind %}select NULL::BIGINT{% else %}select arg_0 from input_table{% endif %}' || n::VARCHAR,
+  '{% if is_bind %}select NULL::BIGINT{% else %}select n from input_table{% endif %}' || n::VARCHAR,
   NULL, n) FROM fs_t;
 ----
 the template must be a constant
@@ -4492,7 +4492,7 @@ the template must be a constant
 # --- ⚠ A NON-CONSTANT params bag likewise, and the message points at where per-row values belong. ---
 statement error
 SELECT fluid_scalar(
-  '{% if is_bind %}select NULL::BIGINT{% else %}select arg_0 from input_table{% endif %}', {'t': n}, n)
+  '{% if is_bind %}select NULL::BIGINT{% else %}select n from input_table{% endif %}', {'t': n}, n)
 FROM fs_t;
 ----
 must be a constant
@@ -4501,7 +4501,7 @@ must be a constant
 query II
 SELECT (SELECT count(*) FROM (
           SELECT fluid_scalar(
-            '{% if is_bind %}select NULL::BIGINT{% else %}select arg_0 from input_table{% endif %}',
+            '{% if is_bind %}select NULL::BIGINT{% else %}select i from input_table{% endif %}',
             NULL, i) FROM range(0) t(i))),
        (SELECT fluid_scalar(
           '{% if is_bind %}select NULL::BIGINT{% else %}select 42 from input_table{% endif %}', NULL));
@@ -4516,3 +4516,75 @@ SELECT fluid_scalar(
   {'tag': 'eu'});
 ----
 eu=eu
+
+# --- ⚠⚠ A NAMED ARGUMENT NAMES ITS input_table COLUMN. `counter := i` is readable as `counter` instead of
+# `arg_0`, which is the difference between a template that reads and one that counts positions.
+#
+# The name survives because DuckDB's parser rewrites `name := expr` into `expr` with SetAlias(name) — the
+# same route struct_pack(a := 1) takes to its field name — and the host resolves that alias at BIND, for TAIL
+# slots only. ---
+query II
+SELECT i, v FROM (
+  SELECT i, fluid_scalar(
+    '{% if is_bind %}select NULL::BIGINT{% else %}select counter * getvariable(''params'') from input_table{% endif %}',
+    2, counter := i) AS v FROM range(3) t(i)) z ORDER BY i;
+----
+0	0
+1	2
+2	4
+
+# --- ⚠ MIXED: a named tail argument and an unnamed one in the same call. The unnamed one keeps its
+# POSITIONAL name, and position is counted over the whole tail — so this is arg_1, not arg_0. ---
+query I
+SELECT fluid_scalar(
+  '{% if is_bind %}select NULL::BIGINT{% else %}select counter * 100 + arg_1 from input_table{% endif %}',
+  NULL, counter := 7, 3);
+----
+703
+
+# --- ⚠ An UNNAMED literal keeps its POSITIONAL name, arg_0, arg_1, … exactly as before. ---
+query I
+SELECT fluid_scalar(
+  '{% if is_bind %}select NULL::BIGINT{% else %}select arg_0 + arg_1 from input_table{% endif %}',
+  NULL, 10, 5);
+----
+15
+
+# --- ⚠⚠ THE WHOLE NAMING RULE IN ONE ASSERTION, because it has FOUR cases and only measuring shows where
+# the line falls. DuckDB aliases a genuine COLUMN REFERENCE (so `n` names itself, qualified or not) and
+# nothing else — a computed expression, a function call and a literal all carry no alias and stay positional.
+# An explicit `name :=` always wins.
+#
+# ⚠ That is a better rule than fluid_query_lateral's, whose wire columns are named by the rendered EXPRESSION
+# TEXT and so produce names like `(t.n + 1)` that have to be quoted to reference. Here an argument is either
+# self-naming or positional; there is no unusable third case.
+#
+# ⚠ POSITION IS COUNTED OVER THE WHOLE TAIL, not over the unnamed ones: the literal below is arg_3, not
+# arg_1. A build that numbered only the positional ones would answer `arg_0,arg_1` here. ---
+#
+# ⚠ The name list is fetched through a scalar SUBQUERY so the statement stays a per-row projection —
+# string_agg on its own is an aggregate and is (correctly) refused by the cardinality check above. ---
+query T
+SELECT DISTINCT fluid_scalar(
+  '{% if is_bind %}select NULL::VARCHAR{% else %}select (select string_agg(column_name, '','') from (describe select * from input_table)) from input_table{% endif %}',
+  NULL, counter := 1, n, n + 1, 9) FROM fs_t;
+----
+__fab_row,counter,n,arg_2,arg_3
+
+# --- ⚠ The staged row-number column cannot be shadowed: refused by name at bind. ---
+statement error
+SELECT fluid_scalar(
+  '{% if is_bind %}select NULL::BIGINT{% else %}select 1 from input_table{% endif %}', NULL, __fab_row := 1);
+----
+cannot be named '__fab_row'
+
+# --- ⚠⚠ A CHARACTERIZATION OF DuckDB, AND A TRAP WORTH PINNING: a named argument to a SCALAR does NOT
+# reorder. DuckDB discards the name for dispatch (a built-in does the same — `upper(zzz := 'a')` returns 'A')
+# and binds POSITIONALLY, so `counter := 7` in the params slot IS the params bag and the 2 after it becomes
+# arg_0. 2 * 10 + 7 = 27. Naming an argument therefore documents it; it never moves it. ---
+query I
+SELECT fluid_scalar(
+  '{% if is_bind %}select NULL::BIGINT{% else %}select arg_0 * 10 + getvariable(''params'') from input_table{% endif %}',
+  counter := 7, 2);
+----
+27

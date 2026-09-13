@@ -4431,3 +4431,55 @@ committed state on a separate connection. Use a regular table.
 
 ⚠ The function is VOLATILE (the default), so it is never constant-folded. That is correct — a template may
 call `query()` or `exec()` — but it means DuckDB will not hoist a call whose arguments are all constant.
+
+### 39.9 ✅ Named arguments name their `input_table` column (2026-09-13, user-asked)
+
+*"when such a name parameter is used, can we use this name as col name in the input_table?"* — yes, and it
+needed one C++ change plus its managed half. No ABI change.
+
+```sql
+SELECT i, fluid_scalar(
+  '{% if is_bind %}select NULL::BIGINT'
+  '{% else %}select counter * getvariable(''params'') from input_table{% endif %}',
+  2, counter := i) FROM range(5000) t(i);
+```
+
+⚠⚠ **THE NAME SURVIVES AS THE ARGUMENT'S ALIAS, which is the only reason this is possible.** DuckDB's
+`Transformer::TransformNamedArg` rewrites `name := expr` into `expr` with `SetAlias(name)`, so for a SCALAR
+the argument stays POSITIONAL and the name rides the expression. DuckDB's own `struct_pack(a := 1)` reads it
+the same way — that is the existence proof that a scalar's bind can see it.
+
+⚠ **TAIL SLOTS ONLY**, deliberately: a declared parameter must keep its declared name because the managed
+side reads those BY NAME (`ArgColumn(args, "template")`), so letting `foo := '…'` rename the template slot
+would break that read at a distance.
+
+⚠ **Bind and execute must agree**, so the resolved names ride the bind data
+(`FabricatorScalarBindData.arg_names`) rather than being recomputed in the execute lambda from the
+registration-time declaration — which could not know a call site's alias. A disagreement there is a wrong
+COLUMN, not an error.
+
+#### The naming rule has four cases, and only measuring showed where the line falls
+
+| argument | staged column |
+|---|---|
+| `counter := i` | `counter` |
+| `n`, `fs_t.n` (a column reference) | `n` |
+| `n + 1`, `upper('x')`, a literal | `arg_<k>` |
+
+⚠⚠ **DuckDB aliases a genuine COLUMN REFERENCE too** — which is why a bare `n` names itself. That was a
+surprise mid-build (it broke a gate row asserting `arg_0`) and it is the better behaviour: **this rule is
+strictly nicer than `fluid_query_lateral`'s**, whose wire columns are named by the rendered EXPRESSION TEXT
+and so produce names like `(t.n + 1)` that must be quoted to reference. Here an argument is either
+self-naming or positional; there is no unusable third case.
+
+⚠ POSITION IS COUNTED OVER THE WHOLE TAIL, not over the unnamed ones: in
+`f(tpl, NULL, counter := 1, n, n + 1, 9)` the literal is `arg_3`, not `arg_1`.
+
+⚠ `__fab_row` is refused as an argument name — it carries the staged row number.
+
+#### ⚠⚠ A named argument does NOT reorder, and that trap is DuckDB's
+
+`fluid_scalar(tpl, counter := 7, 2)` binds **7 as the params bag** and 2 as the first tail argument: DuckDB
+discards the name for dispatch and binds positionally. A built-in behaves identically — `upper(zzz := 'a')`
+returns `A`, and `upper(any_nonsense := 'a')` does too. So naming an argument DOCUMENTS it; it never moves
+it, and it is not validated against anything. Pinned as a characterization.
