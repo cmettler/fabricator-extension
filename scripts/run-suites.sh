@@ -629,7 +629,16 @@ case "$TIER" in
         #   rendering would need a second SQL type ladder. 9166 + 18 exactly.
         #   ⚠ Its sharpest row is PER-ROW on fluid_render: each row has its own session AND its own bag, so
         #   a build that staged the params COLUMN without picking the row passes every other row here.
-        : "${MIN_ASSERTIONS:=9184}"
+        # 2026-09-13: verify_plugin_fluid 828 -> 854. §38 — `fluid_scalar`: a template rendered to a SQL
+        #   SELECT that DuckDB evaluates over the per-row args, whose RETURN TYPE the template declares
+        #   itself via its `is_bind` render (`select NULL::<type>`). No type mapping of ours anywhere — the
+        #   type is whatever DuckDB binds that statement to. 9184 + 26 exactly.
+        #   ⚠ Its payoff row is the result TYPE following the CONSTANT params (BIGINT vs DECIMAL(9,2) from
+        #   ONE registered function); its correctness row is 5000-row alignment across chunks.
+        #   ⚠ The template writes its OWN `select` and the wrap adds none, so CARDINALITY is enforced (one
+        #   column, row count == chunk) while ORDER is the template's contract — a plain projection over
+        #   input_table preserves it, measured, but a reordering statement must carry __fab_row.
+        : "${MIN_ASSERTIONS:=9210}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

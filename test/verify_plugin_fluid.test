@@ -4371,3 +4371,148 @@ SELECT fluid_render('{% query r %}SELECT typeof(getvariable(''params'')) AS t{% 
 
 statement ok
 RESET VARIABLE params;
+
+# =====================================================================================================
+# §38 — `fluid_scalar`: a template rendered to a SQL SELECT, whose RETURN TYPE the template declares.
+#
+# `fluid_scalar(template, params, arg_0, arg_1, …)`. The template and the bag are BIND-TIME CONSTANTS;
+# everything after them is per-row and is staged as `input_table`, addressable as arg_0, arg_1, ….
+#
+# ⚠⚠ THE TYPE COMES FROM DuckDB BINDING THE TEMPLATE'S OWN SQL — there is no type mapping here, which is the
+# whole point. The `is_bind` render is a SELECT of the result type (`select NULL::<type>`), described the way
+# the relation surfaces describe their generated statement. The template writes its own `select`; nothing
+# here prepends one.
+#
+# ⚠⚠ CARDINALITY AND ORDER ARE THE TEMPLATE'S CONTRACT, which is the cost of the statement form: a scalar
+# owes exactly ONE value per input row IN INPUT ORDER, and a rendered SELECT can change both. ENFORCED here:
+# one output column, and a row count equal to the chunk's. NOT enforced: order. A plain projection over
+# input_table preserves it (measured, incl. a correlated subquery over 3000 rows and under
+# SET GLOBAL preserve_insertion_order = false); a statement that can reorder must carry __fab_row through
+# and ORDER BY it.
+#
+# ⚠ ONE RENDER PER CHUNK, not per row: Liquid decides the SHAPE from the constant params, DuckDB computes
+# every row. So the template cannot branch on a row VALUE in Liquid — it emits SQL that does.
+# =====================================================================================================
+
+statement ok
+CREATE TEMP TABLE fs_t AS SELECT * FROM (VALUES (1), (2), (3)) v(n);
+
+# --- The template declares a STRUCT and produces it: a real struct, not text. ---
+query ITT
+SELECT n, s::VARCHAR, typeof(s) FROM (
+  SELECT n, fluid_scalar(
+    '{% if is_bind %}select NULL::STRUCT(a INTEGER){% else %}select {''a'': arg_0 + 1} from input_table{% endif %}',
+    NULL, n) AS s FROM fs_t) z ORDER BY n;
+----
+1	{'a': 2}	STRUCT(a INTEGER)
+2	{'a': 3}	STRUCT(a INTEGER)
+3	{'a': 4}	STRUCT(a INTEGER)
+
+# --- ⚠⚠ THE PAYOFF ROW: the RESULT TYPE follows the CONSTANT PARAMS, from ONE registered function. A build
+# that fixed the return type at registration cannot make these two calls differ, and neither can one that
+# ignores the is_bind render. This is the whole feature in one assertion. ---
+query TT
+SELECT typeof(a), typeof(b) FROM (
+  SELECT fluid_scalar('{% if is_bind %}select NULL::{{ params.t }}{% else %}select arg_0 from input_table{% endif %}',
+                      {'t':'BIGINT'}, 7) AS a,
+         fluid_scalar('{% if is_bind %}select NULL::{{ params.t }}{% else %}select arg_0 from input_table{% endif %}',
+                      {'t':'DECIMAL(9,2)'}, 7) AS b);
+----
+BIGINT	DECIMAL(9,2)
+
+# --- Several per-row args, and ARITHMETIC on the result — which only works because it is a real BIGINT and
+# not rendered text. ---
+query IT
+SELECT sum(v)::BIGINT, typeof(any_value(v)) FROM (
+  SELECT fluid_scalar(
+    '{% if is_bind %}select NULL::BIGINT{% else %}select arg_0 * 10 + arg_1 from input_table{% endif %}',
+    NULL, i, i + 1) AS v FROM range(5) t(i));
+----
+115	BIGINT
+
+# --- ⚠⚠ THE CORRECTNESS ROW: every value must pair with ITS OWN input, across many chunks. 5000 rows is
+# several DuckDB vectors, so this is where a lost row or a changed cardinality shows. A misalignment here is
+# a WRONG ANSWER with nothing failing.
+#
+# CAVEAT, so it is not read as proving more than it does: the wrap does NOT order, so this row passing rests
+# on DuckDB preserving a projection's order — which it does, measured separately for a correlated-subquery
+# expression over 3000 rows and under SET GLOBAL preserve_insertion_order = false. What it DOES enforce is
+# the row count. ---
+query II
+SELECT count(*), sum(CASE WHEN v = i * 2 THEN 0 ELSE 1 END)::BIGINT FROM (
+  SELECT i, fluid_scalar(
+    '{% if is_bind %}select NULL::BIGINT{% else %}select arg_0 * 2 from input_table{% endif %}',
+    NULL, i) AS v FROM range(5000) t(i));
+----
+5000	0
+
+# --- ⚠⚠ THE CAST IS WHAT MAKES is_bind A DECLARATION RATHER THAN A THING TO MATCH. Without it a template
+# declaring BIGINT and selecting the literal 42 is REFUSED, because 42 is INTEGER — so every literal's type
+# would have to be written twice and kept in step. The declared type is authoritative instead, coerced
+# through DuckDB's own cast. ---
+query IT
+SELECT v, typeof(v) FROM (
+  SELECT fluid_scalar(
+    '{% if is_bind %}select NULL::BIGINT{% else %}select 42 from input_table{% endif %}', NULL) AS v);
+----
+42	BIGINT
+
+# --- ⚠ But a conversion that genuinely cannot happen still fails, in DuckDB's own words rather than ours —
+# the cast is a coercion, not a silencer. ---
+statement error
+SELECT fluid_scalar(
+  '{% if is_bind %}select NULL::BIGINT{% else %}select ''not a number'' from input_table{% endif %}', NULL);
+----
+Could not convert string 'not a number' to INT64
+
+# --- ⚠ A statement that changes CARDINALITY is refused by name: a scalar owes exactly one value per row, and
+# a silent short read would be a wrong answer for every row after it. ---
+statement error
+SELECT fluid_scalar(
+  '{% if is_bind %}select NULL::BIGINT{% else %}select arg_0 from input_table limit 1{% endif %}', NULL, n)
+FROM fs_t;
+----
+values for
+
+# --- ⚠ More than one output column is refused at BIND, where it is cheap to say so. ---
+statement error
+SELECT fluid_scalar('{% if is_bind %}select NULL::BIGINT, NULL::BIGINT{% else %}select 1, 2{% endif %}', NULL);
+----
+exactly ONE column
+
+# --- ⚠ A NON-CONSTANT template is refused BY NAME at bind: the result type is part of the PLAN, so it
+# cannot depend on row data. The message says so rather than failing somewhere downstream. ---
+statement error
+SELECT fluid_scalar(
+  '{% if is_bind %}select NULL::BIGINT{% else %}select arg_0 from input_table{% endif %}' || n::VARCHAR,
+  NULL, n) FROM fs_t;
+----
+the template must be a constant
+
+# --- ⚠ A NON-CONSTANT params bag likewise, and the message points at where per-row values belong. ---
+statement error
+SELECT fluid_scalar(
+  '{% if is_bind %}select NULL::BIGINT{% else %}select arg_0 from input_table{% endif %}', {'t': n}, n)
+FROM fs_t;
+----
+must be a constant
+
+# --- An EMPTY input yields no rows rather than failing, and ZERO per-row arguments is a legal call. ---
+query II
+SELECT (SELECT count(*) FROM (
+          SELECT fluid_scalar(
+            '{% if is_bind %}select NULL::BIGINT{% else %}select arg_0 from input_table{% endif %}',
+            NULL, i) FROM range(0) t(i))),
+       (SELECT fluid_scalar(
+          '{% if is_bind %}select NULL::BIGINT{% else %}select 42 from input_table{% endif %}', NULL));
+----
+0	42
+
+# --- ⚠ The bag reaches BOTH sides here too, exactly as §37 pins for the other surfaces: Liquid reads it
+# while rendering, and the render's SQL reads it as getvariable('params'). The two must agree. ---
+query T
+SELECT fluid_scalar(
+  '{% if is_bind %}select NULL::VARCHAR{% else %}select ''{{ params.tag }}='' || getvariable(''params'').tag from input_table{% endif %}',
+  {'tag': 'eu'});
+----
+eu=eu

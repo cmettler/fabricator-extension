@@ -123,6 +123,15 @@ internal sealed class FluidRenderSession : IDisposable
     {
         _variableName = name;
         _variableRows = rows;
+        // ⚠⚠ IF THIS SESSION HAS ALREADY OPENED ITS CONNECTION, STAGE IT NOW — Pin() applies a binding only
+        // at OPEN, so a caller that ran any statement BEFORE binding would otherwise get a variable that is
+        // never set. MEASURED: fluid_scalar staged its input relation before building its render context and
+        // read getvariable('params') as NULL — a silent wrong value, not an error, and the kind of implicit
+        // ordering contract that bites the next caller rather than the one who wrote it.
+        if (_pinned is not null)
+        {
+            ApplyVariable(_pinned);
+        }
     }
 
     /// <summary>Runs <paramref name="sql"/> on this render's connection; the caller disposes the stream.</summary>

@@ -1495,6 +1495,51 @@ also means the generator runs during binding, repeatedly and without executing a
 > -- O'Brien   (not a syntax error, and not an injection)
 > ```
 
+**`fluid_scalar(template, params, arg0, arg1, …)`** renders a template to a **SQL SELECT** that DuckDB
+evaluates over the per-row arguments — and the template declares its own **return type**:
+
+```sql
+SELECT n, fluid_scalar(
+  '{% if is_bind %}select NULL::STRUCT(a INTEGER)'
+  '{% else %}select {''a'': arg_0 + 1} from input_table{% endif %}', NULL, n) FROM t;
+-- {'a': 2}, {'a': 3}, …   a real STRUCT(a INTEGER), not text
+```
+
+`template` and `params` are **bind-time constants**; everything after them is per-row, staged as
+`input_table` and addressable as `arg_0`, `arg_1`, …. Under `is_bind` the template renders a SELECT of the
+result type — `select NULL::<type>` is the usual answer — and DuckDB binding that statement is what
+determines the type. Any type DuckDB can express works, with nothing lost: `STRUCT(a INTEGER, b VARCHAR)`,
+`DECIMAL(9,2)` with its scale, `INTEGER[]`, `MAP(VARCHAR, INTEGER)`. The template writes its own `select`;
+nothing is prepended for you, so the `is_bind` render is a statement you can paste into a shell and run.
+
+Because the type comes from the *template*, one registered function serves many result types — including a
+type chosen by the constant params:
+
+```sql
+SELECT typeof(fluid_scalar(
+  '{% if is_bind %}select NULL::{{ params.t }}{% else %}select arg_0 from input_table{% endif %}',
+  {'t': 'DECIMAL(9,2)'}, 7));
+-- DECIMAL(9,2)
+```
+
+> ⚠ The template renders **one SQL expression per chunk**, not once per row: Liquid decides the *shape* of
+> the computation from the constant params, and DuckDB computes every row. So the template cannot branch on
+> a row value in Liquid — emit SQL that branches instead. Use `fluid_render` when you want Liquid itself to
+> run per row.
+>
+> ⚠ A scalar owes exactly **one value per row, in input order**, and with a rendered statement that is
+> partly your contract. Enforced for you: exactly one output column, and a row count equal to the chunk's —
+> a statement that changes cardinality is refused by name. Not enforced: **order**. A plain projection over
+> `input_table` preserves it, but a statement that can reorder (a join that fans out, an aggregate) must
+> carry `__fab_row` through and `ORDER BY` it.
+>
+> ⚠ The declared type is **authoritative**: the expression is cast to it, so `42` under a declared `BIGINT`
+> is fine. A conversion that cannot happen fails with DuckDB's own message; a lossy but legal one (a `DOUBLE`
+> expression under a declared `BIGINT`) truncates silently, exactly as a declared column type does.
+>
+> ⚠ The template's SQL runs on its own connection, so it cannot see your **TEMP** tables — use a regular
+> table. The `params` bag is available both as `{{ params.x }}` and as `getvariable('params')`.
+
 **The bag is bound WHOLE, under the name `params`** — `{{ params.n }}`, `{{ params[0] }}`,
 `{{ params.size }}`:
 

@@ -4312,3 +4312,122 @@ scalar, matching the lifting the Liquid side gained when the member spread was r
 ⚠ **No bag ⇒ no statement.** An unset DuckDB variable already reads as NULL, so writing one would buy nothing
 and cost a round trip on every render that passed no params. `getvariable('params') IS NULL` is how SQL asks
 what `{% if params %}` asks in Liquid.
+
+---
+
+## 39. ✅ AS BUILT (2026-09-13) — `fluid_scalar`: a template whose RETURN TYPE it declares itself
+
+**User-designed.** The opening question was whether `fluid_query_lateral`'s constant/literal argument split
+could work for a custom SCALAR — `fluid_scalar(const template, const params, arg1 … argN)` — with `is_bind`
+returning the result type. It can, and the user's own refinement is what made it clean: *"in a is_bind block
+i would just like to return the return type with e.g. `select null::struct<a integer>`"*.
+
+C#-only IN THE PLUGIN: **no ABI change, no C++ change, no bridge change.** Gate `verify_plugin_fluid`
+828 → **852** (the suite's §38), hermetic floor 9184 → **9208**, three mutants — two killed at their own
+rows, **one deliberately recorded as a survivor**.
+
+```sql
+SELECT n, fluid_scalar(
+  '{% if is_bind %}select NULL::STRUCT(a INTEGER)'
+  '{% else %}select {''a'': arg_0 + 1} from input_table{% endif %}', NULL, n) FROM t;
+-- {'a': 2}, {'a': 3}, …   typed STRUCT(a INTEGER), not text
+```
+
+⚠ **The template writes its own `select` and nothing is prepended for it** (user directive, 2026-09-13:
+*"actually change this to use explicit selects … don't add the select part yourself"*). The `is_bind` render
+is therefore a statement that can be pasted into a shell and run, which is the point of the spelling.
+
+### 39.1 The machinery was already there — ABI v80's scalar bind session
+
+Nothing new was needed at the ABI. `IScalarFunction.Result` is `Field?`: **null registers the function as
+`ANY` and requires `Bind` to resolve a type per call site.** `ScalarBindArgs` carries the argument values
+plus an `IsConstant` mask. `fabricator_parse` has shipped as the demonstration of exactly this since v80.
+What `fluid_scalar` adds is that the type comes from **binding the template's own SQL** rather than from a
+name the caller passes.
+
+⚠ A scalar needs no `Params.Constant`. That style exists because a LATERAL's arguments become an input
+relation, so a constant needs a channel of its own; a scalar's constants arrive for free in the mask.
+
+### 39.2 No type ladder anywhere — the reason to prefer this design
+
+⚠⚠ The `is_bind` render is an EXPRESSION of the result type, wrapped and described exactly the way the three
+relation surfaces describe their generated statement. So the type is **whatever DuckDB binds that expression
+to**: `STRUCT(a INTEGER, b VARCHAR)`, `DECIMAL(9,2)` with its scale, `INTEGER[]`, `MAP(VARCHAR, INTEGER)` —
+all MEASURED intact. The rejected alternative was rendering a type NAME and parsing it, which is a second SQL
+type ladder; this codebase has declined to maintain one three times.
+
+⚠ DuckDB also names its own type back in a form that re-parses (`DESCRIBE` → `STRUCT(a INTEGER, b VARCHAR)`),
+which is what the execute cast uses. It is never the template's own text.
+
+### 39.3 Cardinality and order are the template's contract — the cost of the statement form
+
+⚠⚠ A scalar owes exactly ONE value per input row IN INPUT ORDER, and a rendered SELECT can change both: a
+join that fans out or an aggregate MISALIGNS every row, which is a wrong answer with nothing failing.
+
+**Enforced here**: exactly ONE output column (at bind, where it is cheap to say so) and a row count equal to
+the chunk's — a statement that changes cardinality is refused by name rather than producing a silent short
+read. **Not enforced**: ORDER.
+
+⚠ A plain projection over `input_table` preserves order — MEASURED, including for a correlated-subquery
+expression over 3000 rows and under `SET GLOBAL preserve_insertion_order = false`, both ZERO misaligned. So
+the ordinary shape is safe, and a statement that can genuinely reorder must carry `__fab_row` through and
+`ORDER BY` it; the staged relation provides that column.
+
+⚠ An earlier build wrapped a bare EXPRESSION instead, which made 1:1 structural rather than policed. It was
+changed on the user's directive; what is lost is the ordering guarantee, and what is gained is that the
+template reads as SQL.
+
+### 39.4 The cast is what makes `is_bind` a DECLARATION
+
+⚠⚠ Without it, a template declaring `NULL::BIGINT` and rendering the literal `42` is **REFUSED**, because
+`42` is INTEGER — so the author would have to write every literal's type twice and keep the two in step.
+The execute wrap casts to the declared type instead, using DuckDB's own cast, which makes the declaration
+authoritative. Mutant B (drop the cast) dies at exactly that row after 844 pass.
+
+⚠ A conversion that genuinely cannot happen still fails, in DuckDB's words:
+`Could not convert string 'not a number' to INT64`. ⚠ The cost is that a LOSSY but legal conversion is
+silent — a DOUBLE expression under a declared BIGINT truncates — which is what a declared column type does
+everywhere in SQL.
+
+### 39.5 One render per CHUNK, and a fresh connection with it
+
+⚠ **Per chunk, not per row** (user decision). Liquid decides the SHAPE of the computation from the constant
+params; DuckDB computes every row natively. That is what makes it cheaper than `fluid_render` for per-row
+work, and also why the template cannot branch on a row VALUE in Liquid — at render time there is no row. It
+emits SQL that branches instead.
+
+⚠⚠ **A pinned connection is NOT available here.** The binding is shared across pipeline threads — this
+plugin already records that a volatile scalar may be evaluated on several threads at once, which is why
+`FluidRenderSession` is per-render — and a DuckDB connection is single-threaded by contract. So the session
+is built inside `Invoke` and disposed with it. MEASURED: 200,000 rows at `threads = 8`, zero wrong. The cost
+is one connection per 2048 rows, far cheaper than the per-CALL connections every `query()` paid before v84.
+
+### 39.6 ⚠⚠ What the alignment row does and does not prove
+
+The wrap no longer orders — the template owns its statement — so the 5000-row alignment row passing rests on
+DuckDB preserving a projection's order. That was MEASURED separately, against a build with the ordering
+removed: a correlated-subquery expression over 3000 rows, and the same under
+`SET GLOBAL preserve_insertion_order = false`, both ZERO misaligned.
+
+**So do not read that row as proving ordering is enforced.** What it enforces is the ROW COUNT; order is the
+template's contract, and the ordinary shape happens to be safe.
+
+### 39.7 A bug the build found, fixed at the root
+
+⚠⚠ `getvariable('params')` came back **NULL** inside `fluid_scalar`. `FluidRenderSession.BindVariable` only
+applied its binding when `Pin()` OPENED the connection, and this function staged its input relation before
+building the render context — so the connection was already open and the variable was never set. A silent
+wrong value, not an error.
+
+Fixed in `BindVariable` rather than only at the call site: it now stages immediately when the connection is
+already open. The implicit "declare before you run anything" ordering contract is gone, which is the kind
+that bites the next caller rather than the one who wrote it.
+
+### 39.8 Two limitations worth knowing
+
+⚠ The template's SQL runs on its OWN connection, so it **cannot see the caller's TEMP tables** — measured
+(`Table with name lookup does not exist!`). Same rule `query()` already follows: the render's SQL reads
+committed state on a separate connection. Use a regular table.
+
+⚠ The function is VOLATILE (the default), so it is never constant-folded. That is correct — a template may
+call `query()` or `exec()` — but it means DuckDB will not hoist a call whose arguments are all constant.

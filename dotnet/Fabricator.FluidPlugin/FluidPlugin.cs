@@ -38,8 +38,11 @@ public sealed class FluidPluginBackend : IProvider
     /// </summary>
     public bool HostsCatalog => false;
 
+    // ⚠ fluid_scalar is the TYPED sibling of fluid_render, and a different model rather than a mode: it
+    // renders ONCE PER CHUNK into a SQL EXPRESSION that DuckDB evaluates over the per-row arguments, and its
+    // RESULT TYPE is whatever the template's `is_bind` expression binds to (ABI v80's scalar bind session).
     public IEnumerable<IScalarFunction> GlobalScalarFunctions =>
-        new IScalarFunction[] { new FluidRenderFunction() };
+        new IScalarFunction[] { new FluidRenderFunction(), new FluidScalarFunction() };
 
     public IEnumerable<ISqlTableFunction> GlobalSqlTableFunctions =>
         new ISqlTableFunction[] { new FluidQueryFunction() };
