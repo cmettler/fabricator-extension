@@ -671,18 +671,31 @@ static void FabricatorRefuseVarArgs(const string &func_name, const char *kind, c
 static void FabricatorExpandVarArgs(idx_t varargs_index, const vector<string> &decl_names,
                                     const vector<LogicalType> &decl_types, const vector<Value> &values,
                                     vector<string> &out_names, vector<LogicalType> &out_types) {
+	// ⚠ A SQLNULL-DECLARED slot takes the VALUE'S OWN TYPE, in the prefix exactly as in the tail. The
+	// sentinel means "accept any value" and is REGISTERED as ANY, so DuckDB inserts no cast and the runtime
+	// type is the only thing the marshal can use. Resolving only the tail is what made fluid_query's
+	// positional `params` bag unusable: the slot stayed SQLNULL, so the marshal's DefaultCastAs failed with
+	// "Unimplemented type for cast (STRUCT(who VARCHAR) -> NULL)". An UNTYPED NULL leaves it SQLNULL, which
+	// is deliberate — FixNullTypedChildren carries that across, and "you passed an untyped NULL" is
+	// information a bind may want.
+	auto resolve = [](const LogicalType &declared, const Value &v) {
+		return declared.id() == LogicalTypeId::SQLNULL ? v.type() : declared;
+	};
 	out_names.clear();
 	out_types.clear();
 	if (varargs_index == DConstants::INVALID_INDEX) {
 		out_names = decl_names;
 		out_types = decl_types;
+		for (idx_t i = 0; i < out_types.size() && i < values.size(); i++) {
+			out_types[i] = resolve(out_types[i], values[i]);
+		}
 		return;
 	}
 	auto tail_type = FabricatorVarArgsType(decl_types[varargs_index]);
 	for (idx_t i = 0; i < values.size(); i++) {
 		out_names.push_back(FabricatorArgName(decl_names, varargs_index, i));
 		if (i < varargs_index) {
-			out_types.push_back(decl_types[i]);
+			out_types.push_back(resolve(decl_types[i], values[i]));
 			continue;
 		}
 		// An ANY tail keeps the supplied value's OWN type — DuckDB inserted no cast, so the runtime type is
@@ -800,17 +813,10 @@ static unique_ptr<FunctionData> FabricatorScalarBind(ClientContext &context, Sca
 		ArrowAppender appender(arg_types, 1, properties, extension_types);
 		appender.Append(chunk, 0, 1, 1);
 		ArrowArray array = appender.Finalize();
-		// ⚠ An Arrow NULL-typed child must report null_count == length, and DuckDB does not set it:
-		// ArrowNullData::Append only bumps row_count and its Finalize only clears n_buffers, so the array
-		// crosses with null_count 0 and Apache.Arrow refuses it ("Length must equal null count"). Only an
-		// ANY-declared parameter can still be SQLNULL here (a concrete one was cast above), which is why
-		// this is reachable at all. Patch it rather than dropping the argument: "you passed an untyped NULL"
-		// is exactly the kind of thing a bind resolving a result type needs to know.
-		for (idx_t c = 0; c < arg_types.size() && (int64_t)c < array.n_children; c++) {
-			if (arg_types[c].id() == LogicalTypeId::SQLNULL && array.children[c]) {
-				array.children[c]->null_count = array.children[c]->length;
-			}
-		}
+		// ⚠ Only an ANY-declared parameter can still be SQLNULL here (a concrete one was cast above), which
+		// is why this is reachable at all. Patch it rather than dropping the argument: "you passed an
+		// untyped NULL" is exactly the kind of thing a bind resolving a result type needs to know.
+		fabricator::FixNullTypedChildren(array, arg_types);
 		fabricator::ArrowProducer producer(arg_types, arg_names, properties);
 		producer.AddBatch(array);
 		producer.Finish();
@@ -932,17 +938,10 @@ static ScalarFunction BuildFabricatorScalarFunction(FabricatorHandle handle, con
 			appender.Append(args, 0, row_count, row_count);
 		}
 		ArrowArray array = appender.Finalize();
-		// ⚠ PRE-EXISTING DEFECT, fixed here rather than worked around: an Arrow NULL-typed child must report
-		// null_count == length, and DuckDB does not set it (ArrowNullData::Append only bumps row_count; its
-		// Finalize only clears n_buffers), so Apache.Arrow refuses the batch with "Length must equal null
-		// count". Reachable whenever an ANY-declared parameter is handed an untyped NULL literal —
+		// ⚠ Reachable whenever an ANY-declared parameter is handed an untyped NULL literal —
 		// `fabricator_render('tpl', NULL)` failed this way long before the bind session existed, and no suite
 		// covered it (the one NULL in the suites sat in a VARCHAR-declared position, which DuckDB casts).
-		for (idx_t c = 0; c < actual_types.size() && (int64_t)c < array.n_children; c++) {
-			if (actual_types[c].id() == LogicalTypeId::SQLNULL && array.children[c]) {
-				array.children[c]->null_count = array.children[c]->length;
-			}
-		}
+		fabricator::FixNullTypedChildren(array, actual_types);
 
 		fabricator::ArrowProducer producer(actual_types, marshal_names, properties);
 		producer.AddBatch(array);
@@ -1911,7 +1910,11 @@ unique_ptr<FunctionData> FabricatorTableFunctionBind(ClientContext &context, Tab
 		chunk.SetCardinality(1);
 		ArrowAppender appender(arg_types, 1, properties, extension_types);
 		appender.Append(chunk, 0, 1, 1);
-		return appender.Finalize();
+		ArrowArray array = appender.Finalize();
+		// ⚠ An ANY-declared parameter handed a bare NULL — `fluid_query('…', NULL)` — crosses as a NULL-typed
+		// child DuckDB leaves at null_count 0, which Apache.Arrow refuses. See FixNullTypedChildren.
+		fabricator::FixNullTypedChildren(array, arg_types);
+		return array;
 	};
 
 	// 1) Bind the call (Phase 5 session model): tablefn_bind resolves the output schema (-> return types),
@@ -2228,7 +2231,9 @@ unique_ptr<TableRef> FabricatorSqlGenBindReplace(ClientContext &context, TableFu
 		chunk.SetCardinality(1);
 		ArrowAppender appender(arg_types, 1, properties, extension_types);
 		appender.Append(chunk, 0, 1, 1);
-		producer.AddBatch(appender.Finalize());
+		ArrowArray array = appender.Finalize();
+		fabricator::FixNullTypedChildren(array, arg_types); // an ANY parameter given a bare NULL
+		producer.AddBatch(array);
 		producer.Finish();
 		sql = fabricator::GenerateTableSql(info.handle, info.schema, info.func, info.catalog_name,
 		                                   producer.Stream());
@@ -2478,7 +2483,9 @@ unique_ptr<FunctionData> FabricatorExchangeBind(ClientContext &context, TableFun
 		auto extension_types = ArrowTypeExtensionData::GetExtensionTypes(context, arg_types);
 		ArrowAppender appender(arg_types, 1, props, extension_types);
 		appender.Append(chunk, 0, 1, 1);
-		arg_producer.AddBatch(appender.Finalize());
+		ArrowArray array = appender.Finalize();
+		fabricator::FixNullTypedChildren(array, arg_types); // an ANY parameter given a bare NULL
+		arg_producer.AddBatch(array);
 		arg_producer.Finish();
 		args_ptr = arg_producer.Stream();
 	}
@@ -2875,7 +2882,9 @@ unique_ptr<FunctionData> FabricatorCollectorBind(ClientContext &context, TableFu
 		auto extension_types = ArrowTypeExtensionData::GetExtensionTypes(context, arg_types);
 		ArrowAppender appender(arg_types, 1, props, extension_types);
 		appender.Append(chunk, 0, 1, 1);
-		arg_producer.AddBatch(appender.Finalize());
+		ArrowArray array = appender.Finalize();
+		fabricator::FixNullTypedChildren(array, arg_types); // an ANY parameter given a bare NULL
+		arg_producer.AddBatch(array);
 		arg_producer.Finish();
 		args_ptr = arg_producer.Stream();
 	}
@@ -3272,7 +3281,13 @@ void RegisterFabricatorGlobalFunctions(ExtensionLoader &loader) {
 				for (idx_t k = 0; k < arg_types.size(); k++) {
 					auto style = k < arg_styles.size() ? arg_styles[k] : FabricatorParamStyle::POSITIONAL;
 					if (style != FabricatorParamStyle::NAMED && style != FabricatorParamStyle::VARARGS) {
-						positional.push_back(arg_types[k]);
+						// ⚠ The SQLNULL sentinel means ANY here too. It was honoured for a NAMED parameter
+						// (below) and for every scalar, and NOT for a POSITIONAL one — so a slot declared
+						// "accept any value" registered as LogicalType::SQLNULL, which accepts a NULL
+						// LITERAL and nothing else. Latent until fluid_query declared the first one: its
+						// `params` bag took `fluid_query(t, NULL)` and REFUSED `fluid_query(t, {'a': 1})`,
+						// with the signature printed back as `fluid_query(VARCHAR, "NULL")`.
+						positional.push_back(FabricatorVarArgsType(arg_types[k]));
 					}
 				}
 				TableFunction tf(fn_name, positional, fabricator::ArrowStreamScan, FabricatorTableFunctionBind,
@@ -3439,7 +3454,8 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateTableFunction(Clien
 		for (idx_t i = 0; i < arg_types.size(); i++) {
 			auto style = i < arg_styles.size() ? arg_styles[i] : FabricatorParamStyle::POSITIONAL;
 			if (style != FabricatorParamStyle::NAMED && style != FabricatorParamStyle::VARARGS) {
-				positional.push_back(arg_types[i]);
+				// ⚠ SQLNULL => ANY, same sentinel and same reason as the global registration path.
+				positional.push_back(FabricatorVarArgsType(arg_types[i]));
 			}
 		}
 	}

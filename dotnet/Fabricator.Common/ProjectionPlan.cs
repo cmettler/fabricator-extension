@@ -12,7 +12,14 @@ namespace Fabricator.Bridge;
 /// answer <c>SupportsProjectionPushdown</c> = true.
 /// </summary>
 /// <remarks>
-/// <para><b>ONE resolver, used twice on purpose.</b> <see cref="TableFunctionBindingAdapter"/> declares the stream's
+/// ⚠ IT LIVES IN <c>Fabricator.Common</c> RATHER THAN THE BRIDGE, AND THAT IS WHAT KEEPS IT ONE COPY: a
+/// PLUGIN honouring the projection hint has to narrow by exactly the rule the host declared with, and a
+/// plugin does not reference the Bridge. Re-deriving it plugin-side would put the SIGSEGV below one edit
+/// away in a second assembly. (Moved 2026-09-13 for <c>fluid_query</c>; it needs no host state, which is
+/// the membership rule for Common.)
+/// </remarks>
+/// <remarks>
+/// <para><b>ONE resolver, used twice on purpose.</b> <c>TableFunctionBindingAdapter</c> (in the Bridge) declares the stream's
 /// schema with it and the binding builds its read with it, so the batches and the declared schema cannot
 /// disagree — and a disagreement is not an error here, it is <c>arrow_ingest</c> reading past the end
 /// (SIGSEGV). Two independent derivations of "which columns, in what order" would be one edit away from
@@ -33,7 +40,7 @@ namespace Fabricator.Bridge;
 /// not an option); or a requested name is not in the schema, which means the two sides disagree about what
 /// this function returns and the safe reading is to send everything and let DuckDB sort it out.</para>
 /// </remarks>
-internal static class ProjectionPlan
+public static class ProjectionPlan
 {
     /// <summary>The projected fields in DECLARED order, or null when the full schema must be used.</summary>
     public static IReadOnlyList<Field>? Resolve(Schema full, IReadOnlyList<string>? requested)

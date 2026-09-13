@@ -127,4 +127,21 @@ private:
 	bool finished_ = false;
 };
 
+//! Patches every NULL-TYPED child of a freshly finalized args array to report `null_count == length`.
+//!
+//! ⚠⚠ WITHOUT IT AN UNTYPED NULL LITERAL CANNOT CROSS AT ALL. An Arrow null-typed array must report
+//! `null_count == length`, and DuckDB does not set it — `ArrowNullData::Append` only bumps `row_count` and
+//! its `Finalize` only clears `n_buffers` — so Apache.Arrow refuses the whole batch with
+//! *"Length must equal null count"*, an error naming neither the function nor the argument.
+//!
+//! ⚠ It is reachable from exactly one shape: an ANY-declared parameter (the SQLNULL sentinel) handed a bare
+//! `NULL`, which DuckDB does not cast. A concretely-typed parameter is cast before it gets here.
+//!
+//! ⚠⚠ CALL IT AT EVERY ARGS MARSHAL. It was written twice inline, for the scalar bind and the scalar
+//! execute, and the other FIVE marshals (table-function bind, sqlgen, the in-out and collector binds, the
+//! lateral bind) each carried the same latent defect until `fluid_query` tripped the table one. A no-op when
+//! no type is SQLNULL, so it is safe to call unconditionally — which is what makes "every marshal" a rule
+//! somebody can actually follow.
+void FixNullTypedChildren(ArrowArray &array, const duckdb::vector<duckdb::LogicalType> &types);
+
 } // namespace fabricator

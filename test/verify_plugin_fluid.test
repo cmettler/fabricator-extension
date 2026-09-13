@@ -4650,3 +4650,235 @@ SELECT typeof(fluid_scalar(
   NULL, n, d, m)) FROM fs_typed;
 ----
 DECIMAL(9,2)
+
+# =====================================================================================================
+# §39 — `fluid_query`: the ORDINARY table function of the pair, with the pushed FILTER + PROJECTION
+#       handed to the template.
+#
+# ⚠⚠ WHAT IT BUYS IS NOT "PUSHDOWN". fluid_replacement_query's call disappears at bind, so ITS pushdown
+# is already full and free. This one RUNS the statement, which is what lets the template SEE the
+# predicate and fold it into what it generates — reachable where the optimiser cannot see through the
+# generated SQL (an aggregate, a volatile call, a remote read).
+#
+# ⚠⚠ IT IS A HINT THE TEMPLATE MAY IGNORE, and §39.1 is the row that pins it: the host leaves every
+# pushed predicate in the plan, so a template that never mentions `filters` is CORRECT, just slower.
+# =====================================================================================================
+
+statement ok
+CREATE TABLE fqtf_t AS SELECT i::BIGINT AS k, (i % 3)::BIGINT AS g, 'row' || i AS nm FROM range(10) r(i);
+
+# --- §39.0 ⚠⚠ A REGULAR TABLE, NOT A TEMP ONE, AND THE ROW BELOW IS WHY. This surface runs the generated
+# statement on the RENDER'S OWN pinned connection, which has its own temporary catalog — so the caller's
+# TEMP tables are invisible to the template, exactly as they are to `query()` and to fluid_scalar. Written
+# with a TEMP table the whole section fails at its first row with "Table with name fqtf_t does not exist",
+# an error that points at the template rather than at the connection boundary. ---
+statement ok
+CREATE TEMP TABLE fqtf_invisible AS SELECT 1 AS a;
+
+statement error
+SELECT * FROM fluid_query('SELECT * FROM fqtf_invisible', NULL);
+----
+<REGEX>:.*fqtf_invisible does not exist.*
+
+# --- §39.1 ⚠⚠ THE SAFETY ROW, AND IT MUST COME FIRST: a template that ignores the hint entirely still
+# returns exactly the right rows, because DuckDB re-applies. Everything below is an optimisation on top
+# of this; if this row ever fails the feature is not slower, it is WRONG.
+#
+# ⚠ It is a CHARACTERIZATION of the HOST: what keeps it true is FabricatorComplexFilterPushdown leaving the
+# predicates in the plan, which no mutant of the plugin can change. Measured — flipping the binding's
+# SupportsFilterPushdown to true passes this row and the whole section, because nothing reads that flag. ---
+query I
+SELECT count(*) FROM fluid_query('SELECT * FROM fqtf_t', NULL) WHERE k > 7;
+----
+2
+
+# --- §39.2 the whole pushed predicate, rendered BY DuckDB (quoted identifier, inlined literal). ---
+query T
+SELECT DISTINCT note FROM fluid_query(
+  '{% if is_bind %}SELECT 0::BIGINT AS k, ''''::VARCHAR AS note'
+  '{% else %}SELECT k, {{ filter_sql | sql }} AS note FROM fqtf_t{% endif %}', NULL)
+WHERE k > 7;
+----
+"k" > 7
+
+# --- §39.3 ⚠⚠ THE CONJUNCTS ARE TYPED, and `f.value > 5` is what proves it: a value that merely RENDERED
+# correctly (the JsonNode failure mode this plugin records) would take the ELSE branch. The column and the
+# operator come with it, which is what a template needs to pick a partition. ---
+query T
+SELECT DISTINCT note FROM fluid_query(
+  '{% if is_bind %}SELECT 0::BIGINT AS k, 0::BIGINT AS g, ''''::VARCHAR AS note'
+  '{% else %}SELECT k, g, ''n={{ filters.size }}{% for f in filters %}|{{ f.column }} {{ f.op }} {{ f.value }}{% if f.value > 5 %} BIG{% endif %}{% endfor %}'' AS note FROM fqtf_t{% endif %}', NULL)
+WHERE k > 6 AND g = 1;
+----
+n=2|k > 6 BIG|g = 1
+
+# --- §39.4 ⚠⚠ AN `OR` CONTRIBUTES NO CONJUNCTS, AND THIS IS THE CORRECTNESS ROW OF THE WHOLE SECTION.
+# A branch of a disjunction is NOT true of every row the query wants, so a template "restricting to the
+# partition k = 1" would DROP the k = 9 rows — a wrong answer the host cannot catch, since re-applying a
+# predicate cannot bring back rows the template never read. `filter_sql` still carries it WHOLE, where
+# splicing it is safe: that pairing is the point, not the empty list on its own. ---
+query T
+SELECT DISTINCT note FROM fluid_query(
+  '{% if is_bind %}SELECT 0::BIGINT AS k, ''''::VARCHAR AS note'
+  '{% else %}SELECT k, ''n={{ filters.size }} sql={{ filter_sql }}'' AS note FROM fqtf_t{% endif %}', NULL)
+WHERE k = 1 OR k = 9;
+----
+n=0 sql=("k" = 1 OR "k" = 9)
+
+# --- §39.5 IN arrives as one conjunct whose value is a LIST. ---
+query T
+SELECT DISTINCT note FROM fluid_query(
+  '{% if is_bind %}SELECT 0::BIGINT AS k, ''''::VARCHAR AS note'
+  '{% else %}SELECT k, ''{% for f in filters %}{{ f.op }}:{% for v in f.value %}{{ v }},{% endfor %}{% endfor %}'' AS note FROM fqtf_t{% endif %}', NULL)
+WHERE k IN (1, 2, 3);
+----
+in:1,2,3,
+
+# --- §39.6 no filter at all: an EMPTY list and an empty string, never nil — so `filters.size` answers 0
+# rather than making a template branch on existence. ---
+query T
+SELECT DISTINCT note FROM fluid_query(
+  '{% if is_bind %}SELECT ''''::VARCHAR AS note'
+  '{% else %}SELECT ''n={{ filters.size }} sql=[{{ filter_sql }}]'' AS note FROM fqtf_t{% endif %}', NULL);
+----
+n=0 sql=[]
+
+# --- §39.7 ⚠⚠ THE VALUE MODEL IS THIS PLUGIN'S, NOT THE BRIDGE'S, AND ONLY A TEMPORAL SHOWS IT. Read with
+# ArrowValueReader.ReadScalar — which is what the Bridge's own filter readers use — a DATE arrives
+# Kind=Unspecified and Fluid resolves it against the MACHINE's zone; FluidValueModel.ReadCell stamps it UTC.
+#
+# ⚠⚠ ONLY `raw` DISCRIMINATES, AND THE FIRST VERSION OF THIS ROW ASSERTED ONLY `fmt` — where the mutant
+# SURVIVED. MEASURED side by side on a UTC+2 box: the Bridge reader gives raw=[2026-09-12 22:00:00Z] (the
+# PREVIOUS DAY, the recorded trap) and `| date: "%Y-%m-%d"` converts it BACK through the context zone to
+# [2026-09-13] — so the formatted half is identical under both readers and pins nothing. `fmt` is kept
+# beside it precisely to record that: a reader who adds a temporal assertion here should not reach for the
+# filtered form. ⚠ The raw value is machine-INDEPENDENT with the fix (Kind=Utc renders the instant); it is
+# the MUTANT whose output moves with the box's zone, so this kills east of UTC and may not west of it. ---
+statement ok
+CREATE TABLE fqtf_d AS SELECT DATE '2026-09-13' AS day, 1::BIGINT AS v;
+
+query T
+SELECT DISTINCT note FROM fluid_query(
+  '{% if is_bind %}SELECT NULL::DATE AS day, ''''::VARCHAR AS note'
+  '{% else %}SELECT day, ''{% for f in filters %}raw=[{{ f.value }}] fmt=[{{ f.value | date: "%Y-%m-%d" }}]{% endfor %}'' AS note FROM fqtf_d{% endif %}', NULL)
+WHERE day = DATE '2026-09-13';
+----
+raw=[2026-09-13 00:00:00Z] fmt=[2026-09-13]
+
+# --- §39.8 the DuckDB variables: `filters` as a typed LIST(STRUCT) and `projected` as VARCHAR[], both on
+# the render's own pinned connection. ⚠ `value` there is the value's TEXT, rendered by DuckDB from the
+# typed constant — a string arrives UNQUOTED — because a heterogeneous list has no homogeneous typed form. ---
+query T
+SELECT DISTINCT note FROM fluid_query(
+  '{% if is_bind %}SELECT 0::BIGINT AS k, ''''::VARCHAR AS note'
+  '{% else %}SELECT k, (SELECT typeof(getvariable(''filters'')) || '' / '' || getvariable(''filters'')[1].column'
+  ' || getvariable(''filters'')[1].op || getvariable(''filters'')[1].value || '' / '' || getvariable(''projected'')::VARCHAR) AS note FROM fqtf_t{% endif %}', NULL)
+WHERE k > 7;
+----
+STRUCT("column" VARCHAR, op VARCHAR, "value" VARCHAR)[] / k>7 / [k, note]
+
+# --- §39.9 ⚠ `projected` is what the plan READS, not what the inner SELECT lists — so a column the caller
+# never consumes is absent from both the variable and the Fluid value. ---
+query T
+SELECT DISTINCT note FROM fluid_query(
+  '{% if is_bind %}SELECT 0::BIGINT AS k, ''''::VARCHAR AS note'
+  '{% else %}SELECT k, ''{{ projected | join: "+" }}'' AS note FROM fqtf_t{% endif %}', NULL)
+WHERE k > 7;
+----
+k+note
+
+# --- §39.10 the tail arguments are BIND-TIME CONSTANTS staged as input_table under arg_0, arg_1, …
+# ⚠ DETERMINISTIC, unlike fluid_query_lateral's wire names (which fall back to rendered expression text),
+# and NOT renameable: `name := v` on a TABLE function is a NAMED PARAMETER to DuckDB, so the value leaves
+# the positional list entirely. That is DuckDB's rule, pinned below as a characterization. ---
+query IT
+SELECT * FROM fluid_query('SELECT arg_0 AS a, arg_1 AS b FROM input_table', NULL, 42, 'hi');
+----
+42	hi
+
+statement error
+SELECT * FROM fluid_query('SELECT 1 AS a', NULL, counter := 7);
+----
+<REGEX>:.*Invalid named parameter "counter".*
+
+# --- §39.11 the empty-input_table case: a call with NO tail arguments still renders, because a zero-FIELD
+# Arrow schema cannot cross and a placeholder column stands in. ---
+query I
+SELECT a FROM fluid_query('SELECT 7 AS a', NULL);
+----
+7
+
+# --- §39.12 the params bag is the same bag every other surface takes, reachable both ways. ---
+query T
+SELECT note FROM fluid_query(
+  'SELECT ''{{ params.who }}'' || (SELECT getvariable(''params'').who) AS note', {'who': 'eu'});
+----
+eueu
+
+# --- §39.13 ⚠ A DRIFTING RENDER IS REFUSED, not read as data: the host builds its converters from the
+# schema the BIND render declared, so a scan render producing a different type would be reinterpreted. ---
+statement error
+SELECT * FROM fluid_query(
+  '{% if is_bind %}SELECT 0::INTEGER AS k{% else %}SELECT k FROM fqtf_t{% endif %}', NULL);
+----
+<REGEX>:.*int64 where int32 was declared.*
+
+# --- §39.15 ⚠⚠ THE FILTER IS DELIVERED PER EXECUTION, NOT FROZEN AT BIND — and a prepared statement is the
+# sharpest way to show it: ONE binding, re-executed, and the predicate the template sees follows the
+# parameter. A build that captured the filter on the binding would answer "k" > 7 twice. ---
+statement ok
+CREATE TABLE fqtf_v AS SELECT i::BIGINT AS k FROM range(10) r(i);
+
+statement ok
+PREPARE fqtf_p AS SELECT DISTINCT note FROM fluid_query(
+  '{% if is_bind %}SELECT 0::BIGINT AS k, ''''::VARCHAR AS note'
+  '{% else %}SELECT k, ''{{ filter_sql }}'' AS note FROM fqtf_v{% endif %}', NULL) WHERE k > ?;
+
+query T
+EXECUTE fqtf_p(7);
+----
+"k" > 7
+
+query T
+EXECUTE fqtf_p(3);
+----
+"k" > 3
+
+# --- §39.16 ⚠⚠ AN `EXPLAIN` COSTS ZERO SCAN RENDERS, WHICH IS A REAL DIVERGENCE FROM
+# fluid_replacement_query AND THE BETTER SIDE OF IT. There every render IS the bind, so §11 measures an
+# EXPLAIN of a writing template performing the write; here the bind render resolves the schema and the SCAN
+# render — the one the template's own side effects live in — never happens. So this surface HAS a dry run.
+# ⚠ The bind render still runs, so a side effect placed in the is_bind branch would still fire. ---
+statement ok
+CREATE TABLE fqtf_aud(n INTEGER);
+
+statement ok
+EXPLAIN SELECT * FROM fluid_query(
+  '{% if is_bind %}SELECT 0::BIGINT AS k'
+  '{% else %}{% assign _ = exec("INSERT INTO fqtf_aud VALUES (1)") %}SELECT k FROM fqtf_v{% endif %}', NULL);
+
+query I
+SELECT count(*) FROM fqtf_aud;
+----
+0
+
+query I
+SELECT count(*) FROM fluid_query(
+  '{% if is_bind %}SELECT 0::BIGINT AS k'
+  '{% else %}{% assign _ = exec("INSERT INTO fqtf_aud VALUES (1)") %}SELECT k FROM fqtf_v{% endif %}', NULL);
+----
+10
+
+query I
+SELECT count(*) FROM fqtf_aud;
+----
+1
+
+# --- §39.14 both names coexist and each is registered ONCE. ⚠ The pair is the point: a build that had
+# simply renamed one into the other would pass every row above. ---
+query TI
+SELECT function_name, count(*) FROM duckdb_functions()
+WHERE function_name IN ('fluid_query', 'fluid_replacement_query') GROUP BY 1 ORDER BY 1;
+----
+fluid_query	1
+fluid_replacement_query	1

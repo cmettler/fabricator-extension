@@ -4646,3 +4646,212 @@ filter discards it, reporting a false unpaired line.
 
 Gate: `verify_plugin_fluid` **873, unchanged** — which is the honest outcome for a rename, and is why §41.3
 rather than an assertion count is the evidence here.
+
+---
+
+## 42. ✅ AS BUILT (2026-09-13) — `fluid_query`: the table function that HANDS the template its filter
+
+`fluid_query(template, params, arg0, arg1, …)` — the signature is `fluid_query_lateral`'s (user's ask). It
+renders, runs the statement itself, and gives the template the scan's pushed FILTER and PROJECTION.
+
+```sql
+SELECT * FROM fluid_query(
+  '{% if is_bind %}SELECT 0::BIGINT AS k, ''''::VARCHAR AS note
+   {% else %}SELECT k, {{ filter_sql | sql }} AS note FROM t{% endif %}', NULL)
+WHERE k > 7;
+-- note = "k" > 7
+```
+
+**C#-only in the plugin plus three small host fixes** (below). NO ABI change: the global `table` kind has
+carried `projection_pushdown` AND `pushdown_complex_filter` since it was written.
+
+### 42.1 ⚠⚠ IT DOES NOT BUY "PUSHDOWN" — say so, or the feature reads as redundant
+
+`fluid_replacement_query` DISAPPEARS at bind, so DuckDB binds the generated statement directly and its
+pushdown is already FULL AND FREE — better than any hint can be. What this one buys is that **the template
+SEES the predicate**. DuckDB can only push a filter through what it can see through; an aggregate, a
+volatile call, a remote read or an opaque function in the generated statement all stop it. A template that
+is HANDED the predicate can fold it into the thing the optimiser cannot reach into — a remote `WHERE`, a
+partition choice, a narrower scan.
+
+⇒ **reach for `fluid_replacement_query` unless the template needs to ACT on the predicate.** It is cheaper on
+every axis (no Arrow crossing, no declared schema, no drift check).
+
+### 42.2 ⚠⚠ THE MECHANISM WAS ALREADY THERE, AND MEASURING THAT FIRST IS WHAT KEPT THIS SMALL
+
+Before writing anything, a probe against the existing `fabricator_seq` global table function with
+`Fabricator.Pushdown` logging on:
+
+```
+pushdown_complex_filter: 2 expr in [(value > 3) ; (squared < 200)] -> 2 pushed;
+  native_filter=["value" > 3 AND "squared" < 200]
+```
+
+So a global table function ALREADY receives the projection and the filter, and `native_filter` is a
+**DuckDB-dialect predicate with quoted identifiers and inlined literals, rendered by DuckDB itself**
+(`Value::ToSQLString`). Nothing had to be built at the ABI, in C++, or in the pushdown serializer. ⚠ The
+callback fires MORE THAN ONCE per plan (it clears and rebuilds each time) — expected, and harmless.
+
+### 42.3 What the template gets
+
+| name | Fluid value | DuckDB variable |
+|---|---|---|
+| `filters` | list of `{ column, op, value }`, value TYPED | ✅ `STRUCT("column" VARCHAR, "op" VARCHAR, "value" VARCHAR)[]` |
+| `filter_sql` | the whole predicate as DuckDB SQL | ❌ deliberately not |
+| `projected` | list of column names | ✅ `VARCHAR[]` |
+| `params` | as everywhere | ✅ (unchanged, §38) |
+
+`filter_sql` is **not** a variable on purpose: it is TEXT to splice into the generated statement, which is a
+Liquid job, and as a variable it could not be used as a predicate anyway (`WHERE getvariable('filter_sql')`
+is a boolean test OF THE STRING). `filters` and `projected` ARE variables because they are DATA a SQL
+expression can transform — which is what the user asked for ("sometimes transformation via sql is usefull").
+
+None of the three exists at BIND: the planner has not run. A template reading them branches on `is_bind`,
+the same split `projected` already had on the other relation surfaces.
+
+### 42.4 ⚠⚠ ONLY THE TOP-LEVEL `AND` CONJUNCTS ARE OFFERED — the one correctness rule in the feature
+
+A conjunct of the whole predicate is true of every row the query wants, so a template may narrow by it. **A
+branch of an `OR` is not.** Flattening `a = 1 OR b = 2` into two entries and letting a template "restrict to
+the partition a = 1" DROPS every row where `b = 2` — and the host cannot catch it, because re-applying a
+predicate cannot bring back rows the template never read.
+
+So a disjunction contributes NOTHING to `filters`, while `filter_sql` still carries it WHOLE, where splicing
+it is safe. **That pairing is the design, not the empty list on its own**, and the gate asserts both halves
+in one row (`n=0 sql=("k" = 1 OR "k" = 9)`). Mutant A — recurse into `or` children — dies exactly there,
+after 879 pass.
+
+A node whose constant could not be read is dropped for the same reason: a missing constant is not a
+predicate against NULL.
+
+### 42.5 ⚠⚠ THREE HOST DEFECTS IT EXPOSED, ALL LATENT, ALL FIXED HERE
+
+Each was unreachable until a function declared the shape that reaches it.
+
+1. **An ANY-declared parameter given a bare `NULL` could not cross at ALL — at FIVE of seven args marshals.**
+   An Arrow null-typed child must report `null_count == length` and DuckDB does not set it, so Apache.Arrow
+   refuses the batch with *"Length must equal null count"*. The scalar bind and the scalar execute each
+   carried an INLINE copy of the patch; the table-function bind, the sqlgen bind, the in-out bind, the
+   collector bind and the lateral bind did not. `fluid_query('…', NULL)` tripped the table one on its first
+   call. ⇒ one shared `fabricator::FixNullTypedChildren`, called at **every** args marshal (a no-op when no
+   type is SQLNULL, which is what makes "every marshal" a rule somebody can follow).
+
+2. **The SQLNULL→ANY sentinel was honoured for NAMED table parameters and not for POSITIONAL ones.** A slot
+   declared "accept any value" registered as `LogicalType::SQLNULL`, which accepts a NULL LITERAL and nothing
+   else: `fluid_query(t, NULL)` bound and `fluid_query(t, {'a': 1})` was refused, with the signature printed
+   back as `fluid_query(VARCHAR, "NULL")`. Purely additive to fix — `fluid_query` is the only function in the
+   tree that declares one.
+
+3. **`FabricatorExpandVarArgs` resolved ANY against the value in the TAIL and not in the PREFIX**, so even
+   with (2) fixed the marshal cast to the sentinel: *"Unimplemented type for cast (STRUCT(who VARCHAR) ->
+   NULL)"*. The prefix now resolves the same way the tail always has.
+
+⚠ (2) and (3) are the same sentinel read in two places and a third — the lesson is the recorded one:
+**a protocol constant honoured in some positions and not others registers a DIFFERENT function, silently.**
+
+### 42.6 ⚠⚠ A PLUGIN CANNOT CAPTURE THE AMBIENT, SO ITS HOST WORK MUST BE EAGER
+
+The first build created the render session inside the async iterator, as `fluid_query_batch` does, and
+SIGSEGV'd at `HostFs.OpenConnection`: an iterator's body does not begin until the first batch PULL, which is
+a **different ABI crossing on a different thread**, and the ambients are `AsyncLocal` per crossing. That is
+the recorded rule ("a global table function must read every ambient in `Execute()`, never in the iterator")
+in its third instance.
+
+⚠ The Bridge's own readers solve it by CAPTURING — `var opener = AmbientOpener.Current` — and handing the
+value to their lazy stream. **A plugin cannot: `AmbientOpener` lives in `Fabricator.Bridge`, which a plugin
+deliberately does not reference.** So doing the work eagerly is not a workaround, it is the available correct
+shape. ⚠ `fluid_query_batch` and `fluid_query_inout` are unaffected because their operators establish the
+ambients differently; do not "harmonise" this into an iterator.
+
+Two consequences worth keeping:
+
+- The session is DISPOSED before a single row is read, which is safe because a host connection is
+  REFERENCE-COUNTED and the result stream holds its own reference — the same property `publish()` is built
+  on. The temporary catalog holding `input_table` therefore outlives the handle.
+- The returned sequence is a HAND-WRITTEN enumerable, not an `async` iterator, so its `DisposeAsync` runs
+  even when it was never MOVED. A compiler-generated iterator that is never pulled runs no `finally`, and a
+  scan that binds without pulling (a `LIMIT 0`, a short-circuited join) would leak the open result.
+
+### 42.7 ⚠⚠ `ProjectionPlan` MOVED TO `Fabricator.Common` — one resolver, or a SIGSEGV one edit away
+
+`TableFunctionBindingAdapter` narrows the stream's DECLARED schema with `ProjectionPlan`, and this binding
+must emit exactly that. A second derivation of "which columns, in what order" is not a wrong answer, it is
+`arrow_ingest` reading past the end. It was `internal` to the Bridge, which a plugin does not reference, so
+it moved to Common (it needs no host state — the membership rule).
+
+⚠ `FilterConstants` was moved too and then **moved back**: the plugin needs its OWN value reader
+(`FluidValueModel.ReadCell`, not `ArrowValueReader.ReadScalar` — §42.8), so sharing it would have been motion
+with no user.
+
+### 42.8 ⚠⚠ A SURVIVING MUTANT SHOWED THE DATE ROW WAS ASSERTING THE WRONG HALF
+
+The values go through `FluidValueModel.ReadCell`, this plugin's documented superset — it stamps a date
+`DateTimeKind.Utc`, without which a DATE renders as the PREVIOUS DAY east of UTC. Mutant B swapped in the
+Bridge's `ArrowValueReader.ReadScalar` and **SURVIVED**, because the row asserted
+`{{ f.value | date: "%Y-%m-%d" }}`.
+
+MEASURED side by side on a UTC+2 box:
+
+| reader | `{{ f.value }}` | `{{ f.value \| date: "%Y-%m-%d" }}` |
+|---|---|---|
+| `ReadScalar` (mutant) | `2026-09-12 22:00:00Z` ← previous day | `2026-09-13` |
+| `ReadCell` (shipped) | `2026-09-13 00:00:00Z` | `2026-09-13` |
+
+**The `date:` filter converts the error BACK through the context zone**, so the formatted half is identical
+under both readers and pins nothing. Asserting the RAW value kills the mutant after 883 pass. ⚠ The correct
+value is machine-INDEPENDENT (Kind=Utc renders the instant); it is the MUTANT whose output moves with the
+box's zone, so this row kills east of UTC and may not west of it — stated in the suite rather than left to
+be discovered.
+
+⇒ the general form, third time in this file: **a row that renders a value through a normalising filter is
+not testing the value.**
+
+### 42.9 ⚠⚠ A MUTANT THAT SURVIVED FOR A GOOD REASON, AND THE COMMENT IT CORRECTED
+
+Mutant C set `SupportsFilterPushdown => true` — the flag that claims "my rows are already filtered, stop
+re-applying" — and **passed all 896 assertions**. Its own contract doc says why: *"NOTHING READS THIS FLAG
+TODAY"*.
+
+So the class comment claiming `false` was what kept §39.1 correct was WRONG. What keeps it correct is the
+HOST: `FabricatorComplexFilterPushdown` leaves every predicate in the plan. The `false` is a statement of a
+guarantee we do not make, and it becomes dropped rows the day the flag is honoured — which is a reason to
+get it right by READING rather than by testing. Both the code comment and the gate's §39.1 comment were
+rewritten to say that.
+
+### 42.10 Smaller things, each measured
+
+- **The tail arguments are bind-time constants**, staged as `input_table` under `arg_0`, `arg_1`, … —
+  deterministic, unlike `fluid_query_lateral`'s wire names (rendered expression text). ⚠⚠ **A caller cannot
+  rename them with `name := expr` the way `fluid_scalar` allows**: MEASURED, DuckDB reads `name := v` on a
+  TABLE function as a NAMED PARAMETER and removes the value from the positional list entirely. The alias
+  never reaches a table function's bind. That asymmetry is DuckDB's.
+- **`params` is POSITIONAL here**, matching the lateral (the user's ask) rather than
+  `fluid_replacement_query`'s `params :=`. So `fluid_query('SELECT 1')` does not bind; write
+  `fluid_query('SELECT 1', NULL)`.
+- **The template cannot see the caller's TEMP tables** — it runs on the render's own pinned connection, the
+  same boundary `query()` and `fluid_scalar` have. Pinned, because the error ("Table with name … does not
+  exist") points at the template rather than at the connection.
+- **The variable's `value` is rendered BY DuckDB**, from the staged typed constant (`CAST(v<i> AS VARCHAR)`),
+  not by a renderer of ours: the one we have (`DuckSql.Literal`) collapses every temporal to TIMESTAMPTZ and
+  refuses a LIST or STRUCT by name. ⚠ It is the value's TEXT, not a SQL literal — a string arrives UNQUOTED.
+- **An empty filter set is an empty LIST, not an unset variable** (`[]::STRUCT(…)[]`), so `len(...)` answers
+  0 for every scan. The params bag goes the other way — absent means absent — because a bag has no natural
+  empty value.
+- A struct-member conjunct IS offered in `filters` although `filter_sql` omits it (the host emits no SQL
+  twin for one, because a column-mapped table's nested children carry PHYSICAL names in storage). Safe, and
+  the one place the two views disagree.
+
+### 42.11 Two properties worth knowing, both measured
+
+- **The filter is delivered PER EXECUTION, not frozen at bind.** ONE binding re-executed as a prepared
+  statement sees the predicate follow the parameter (`"k" > 7`, then `"k" > 3`). A view re-binds and gets the
+  right one each time.
+- **⚠⚠ An `EXPLAIN` costs ZERO scan renders, which is a real divergence from `fluid_replacement_query` and
+  the better side of it.** There every render IS the bind, so §11 measures an `EXPLAIN` of a writing template
+  performing the write; here the bind render resolves the schema and the SCAN render — where a template's own
+  side effects live — never happens. **So this surface has a dry run.** ⚠ The bind render still runs, so a
+  side effect placed in the `is_bind` branch still fires.
+
+Gate: `verify_plugin_fluid` 873 → **905** (§39), hermetic floor 9229 → **9261**. Four mutants: A (OR
+flattened) dies after 879, B (the Bridge's value reader) after 883, D (never declare the variables) after
+884; C (claim filter pushdown) SURVIVES, for the reason in §42.9.

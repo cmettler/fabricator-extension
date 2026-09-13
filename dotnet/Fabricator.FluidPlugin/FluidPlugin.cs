@@ -47,6 +47,13 @@ public sealed class FluidPluginBackend : IProvider
     public IEnumerable<ISqlTableFunction> GlobalSqlTableFunctions =>
         new ISqlTableFunction[] { new FluidReplacementQueryFunction() };
 
+    // ⚠ fluid_query is the ORDINARY table function of the pair, and the distinction is not "pushdown":
+    // fluid_replacement_query's call disappears at bind, so ITS pushdown is already full and free. This one
+    // RUNS the statement, which is what lets the host hand the template the pushed filter + projection to
+    // fold into what it generates — reachable only where the optimiser cannot see through the generated SQL.
+    public IEnumerable<ITableFunction> GlobalTableFunctions =>
+        new ITableFunction[] { new FluidQueryTableFunction() };
+
     // ⚠ A COLLECTOR, not a streaming in-out, and forced: fluid_query_batch's default renders once over the
     // WHOLE input, which the streaming operator cannot express — its all-input-done hook is handed no
     // DataChunk, so output held back until input EOF is drained and discarded.

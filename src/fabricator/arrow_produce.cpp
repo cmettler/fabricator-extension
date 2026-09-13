@@ -245,4 +245,12 @@ void ArrowProducer::Release(ArrowArrayStream *stream) {
 	stream->release = nullptr;
 }
 
+void FixNullTypedChildren(ArrowArray &array, const duckdb::vector<duckdb::LogicalType> &types) {
+	for (duckdb::idx_t c = 0; c < types.size() && (int64_t)c < array.n_children; c++) {
+		if (types[c].id() == duckdb::LogicalTypeId::SQLNULL && array.children[c]) {
+			array.children[c]->null_count = array.children[c]->length;
+		}
+	}
+}
+
 } // namespace fabricator

@@ -664,7 +664,17 @@ case "$TIER" in
         #   indistinguishable from VARCHAR.
         #   ⚠⚠ A parse failure is STILL an error where the text begins { or [ — a malformed object is the
         #   commonest bag mistake, and binding it as a string leaves every {{ params.x }} empty silently.
-        : "${MIN_ASSERTIONS:=9229}"
+        # 2026-09-13: verify_plugin_fluid 873 -> 905. The NEW `fluid_query` — an ordinary TABLE function
+        #   (today's sqlgen one was renamed fluid_replacement_query in the same series) that runs its own
+        #   statement and hands the template the pushed FILTER and PROJECTION, as Fluid values and as DuckDB
+        #   variables.
+        #   ⚠⚠ WHAT IT BUYS IS NOT "PUSHDOWN": the replacement form's call disappears at bind, so ITS
+        #   pushdown is already full and free. This one lets the TEMPLATE SEE the predicate and fold it into
+        #   what it generates, which is reachable where the optimiser cannot see through the generated SQL.
+        #   ⚠ The load-bearing gate row is §39.4: an OR contributes NO conjuncts, because a branch of a
+        #   disjunction is not true of every row and a template narrowing by it would DROP rows the host
+        #   cannot bring back.
+        : "${MIN_ASSERTIONS:=9261}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

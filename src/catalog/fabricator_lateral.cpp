@@ -504,7 +504,9 @@ unique_ptr<FunctionData> LateralBind(ClientContext &context, TableFunctionBindIn
 		auto ext = ArrowTypeExtensionData::GetExtensionTypes(context, arg_types);
 		ArrowAppender appender(arg_types, 1, props, ext);
 		appender.Append(chunk, 0, 1, 1);
-		arg_producer.AddBatch(appender.Finalize());
+		ArrowArray array = appender.Finalize();
+		fabricator::FixNullTypedChildren(array, arg_types); // an ANY parameter given a bare NULL
+		arg_producer.AddBatch(array);
 		arg_producer.Finish();
 		args_ptr = arg_producer.Stream();
 	}

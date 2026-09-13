@@ -1444,10 +1444,10 @@ A plugin's global functions are registered while the extension loads, so a plugi
 available the **next time** DuckDB loads fabricator — not in the running session. See
 [docs/plugin-system.md](docs/plugin-system.md).
 
-#### Templates — `fluid_render(...)`, `fluid_replacement_query(...)`, `fluid_query_batch(...)`, `fluid_query_inout(...)` and `fluid_query_lateral(...)`
+#### Templates — `fluid_render(...)`, `fluid_replacement_query(...)`, `fluid_query(...)`, `fluid_scalar(...)`, `fluid_query_batch(...)`, `fluid_query_inout(...)` and `fluid_query_lateral(...)`
 
 The **Fluid / Liquid template engine** is **built in** — it ships inside the extension and needs no
-configuration. It contributes six global functions, all taking a params bag that is a DuckDB `STRUCT`
+configuration. It contributes seven global functions, all taking a params bag that is a DuckDB `STRUCT`
 (preferred — typed, no quoting), a `MAP`, a JSON string, a `LIST`, or a plain scalar.
 
 **`fluid_render(template, params)`** renders a template to **text**:
@@ -1477,7 +1477,7 @@ SELECT * FROM fluid_replacement_query(
 
 > **The name says which mechanism it is.** DuckDB calls this a *replacement* scan: the call is replaced
 > at bind by the statement the template generated. It was called `fluid_query` until 2026-09-13; that
-> name is being reused for a different function, so this is a **breaking** rename with no alias.
+> name now belongs to a different function (below), so this is a **breaking** rename with no alias.
 
 `params` is optional, so `fluid_replacement_query('SELECT 1')` works. The call **disappears at bind time**: DuckDB
 substitutes the generated statement for it, so the generated SQL's own scans keep their full projection and
@@ -1498,6 +1498,58 @@ also means the generator runs during binding, repeatedly and without executing a
 > SELECT * FROM fluid_replacement_query('SELECT {{ params.v | sql }} AS v', params := {'v': 'O''Brien'});
 > -- O'Brien   (not a syntax error, and not an injection)
 > ```
+
+**`fluid_query(template, params, arg0, arg1, …)`** also renders a template to SQL, but **runs the statement
+itself** — which is what lets it hand the template the scan's pushed **filter** and **projection**:
+
+```sql
+SELECT * FROM fluid_query(
+  '{% if is_bind %}SELECT 0::BIGINT AS k, ''''::VARCHAR AS note
+   {% else %}SELECT k, {{ filter_sql | sql }} AS note FROM t{% endif %}', NULL)
+WHERE k > 7;
+-- note = "k" > 7
+```
+
+> ⚠ **This does not buy you "pushdown" — `fluid_replacement_query` already has more of it.** That one's call
+> disappears at bind, so DuckDB pushes straight into the generated statement. What `fluid_query` buys is that
+> the **template sees the predicate and can act on it**, which matters exactly where the optimiser cannot see
+> through what the template generated: an aggregate, a volatile call, a remote read. Use it to fold the
+> predicate into a remote `WHERE`, a partition choice or a narrower scan — otherwise prefer
+> `fluid_replacement_query`, which is cheaper on every axis.
+
+At **scan time** (not at bind — the planner has not run, so branch on `is_bind`) the template gets:
+
+| name | as a Fluid value | as a DuckDB variable |
+|---|---|---|
+| `filters` | list of `{ column, op, value }`, the value **typed** | `getvariable('filters')` — `STRUCT("column" VARCHAR, "op" VARCHAR, "value" VARCHAR)[]` |
+| `filter_sql` | the whole predicate as DuckDB SQL | — (it is text to splice; as a variable it could not be used as a predicate) |
+| `projected` | the output columns this plan reads | `getvariable('projected')` — `VARCHAR[]` |
+
+```sql
+-- act on one conjunct: read ONLY the partition the predicate names
+CREATE TABLE part_20260913 AS SELECT DATE '2026-09-13' AS day, 7::BIGINT AS v;
+CREATE TABLE part_20260912 AS SELECT DATE '2026-09-12' AS day, 99::BIGINT AS v;
+
+SELECT * FROM fluid_query(
+  '{% if is_bind %}SELECT NULL::DATE AS day, 0::BIGINT AS v
+   {% else %}SELECT * FROM {% for f in filters %}{% if f.column == "day" %}part_{{ f.value | date: "%Y%m%d" }}{% endif %}{% endfor %}{% endif %}', NULL)
+WHERE day = DATE '2026-09-13';
+-- 2026-09-13 | 7     — part_20260912 is never opened
+```
+
+> ⚠⚠ **It is a hint you may ignore, and only the top-level `AND` conjuncts are offered.** DuckDB re-applies
+> every pushed predicate whatever the template did, so a template that never mentions `filters` is *correct*,
+> just slower. A branch of an `OR` is deliberately **absent** from `filters`: it is not true of every row, so
+> narrowing by it would drop rows. `filter_sql` still carries the whole predicate, where splicing it is safe.
+
+> ⚠ **Unlike `fluid_replacement_query`, this one has a dry run.** There every render *is* the bind, so an
+> `EXPLAIN` re-renders the template and any `{% exec %}` in it writes. Here `EXPLAIN` resolves the schema
+> from the `is_bind` render and never performs the scan render, so a template's side effects stay put.
+
+The tail arguments are **bind-time constants**, staged as `input_table` under `arg_0`, `arg_1`, …
+⚠ Unlike `fluid_scalar`, they **cannot** be renamed with `name := v`: DuckDB reads that as a *named
+parameter* on a table function, so the value never reaches the call. `params` is positional here (matching
+`fluid_query_lateral`), so write `fluid_query('SELECT 1', NULL)`.
 
 **`fluid_scalar(template, params, arg0, arg1, …)`** renders a template to a **SQL SELECT** that DuckDB
 evaluates over the per-row arguments — and the template declares its own **return type**:
