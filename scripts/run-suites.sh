@@ -629,10 +629,10 @@ case "$TIER" in
         #   rendering would need a second SQL type ladder. 9166 + 18 exactly.
         #   ⚠ Its sharpest row is PER-ROW on fluid_render: each row has its own session AND its own bag, so
         #   a build that staged the params COLUMN without picking the row passes every other row here.
-        # 2026-09-13: verify_plugin_fluid 828 -> 865. §38 — `fluid_scalar`: a template rendered to a SQL
+        # 2026-09-13: verify_plugin_fluid 828 -> 867. §38 — `fluid_scalar`: a template rendered to a SQL
         #   SELECT that DuckDB evaluates over the per-row args, whose RETURN TYPE the template declares
         #   itself via its `is_bind` render (`select NULL::<type>`). No type mapping of ours anywhere — the
-        #   type is whatever DuckDB binds that statement to. 9184 + 37 exactly.
+        #   type is whatever DuckDB binds that statement to. 9184 + 39 exactly.
         #   ⚠ Its payoff row is the result TYPE following the CONSTANT params (BIGINT vs DECIMAL(9,2) from
         #   ONE registered function); its correctness row is 5000-row alignment across chunks.
         #   ⚠ The template writes its OWN `select` and the wrap adds none, so CARDINALITY is enforced (one
@@ -644,7 +644,18 @@ case "$TIER" in
         #   ⚠⚠ DuckDB aliases a genuine COLUMN REFERENCE too, so `n` names itself while a computed
         #   expression, a function call and a literal stay positional. Better than the lateral's rule, which
         #   names wire columns by rendered EXPRESSION TEXT and so yields unquotable names like `(t.n + 1)`.
-        : "${MIN_ASSERTIONS:=9221}"
+        #   ⚠ input_table is available at BIND, EMPTY and FULLY TYPED (§26's capability for this surface), so
+        #   a template can derive its RESULT TYPE from its INPUT types. Real types rather than placeholders
+        #   because an ANY varargs tail gets NO CAST, so the host marshals each tail argument as the
+        #   expression's own type — exactly what execute delivers.
+        #   ⚠ input_table holds the ARGUMENTS AND NOTHING ELSE. An always-present `__fab_row` staging column
+        #   was dropped (user: "not that useful... it is only needed in fluid lateral" — correct: a row key is
+        #   a LATERAL concept, where 1->N output needs provenance; a scalar is 1:1 and needs none). A template
+        #   that must re-sort passes its own key as an argument (`rn := row_number() over ()`), measured.
+        #   ⚠⚠ Removing it EXPOSED a second purpose it had been serving silently: with NO tail arguments the
+        #   relation has zero columns, and Apache.Arrow cannot represent a zero-FIELD schema in either
+        #   direction. A `__fab_rows` placeholder now appears ONLY in that case — structural, not a row key.
+        : "${MIN_ASSERTIONS:=9223}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

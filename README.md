@@ -1516,7 +1516,17 @@ SELECT i, fluid_scalar(
 ```
 
 A plain column reference names itself too (`n` is `n`); anything else — a computed expression, a function
-call, a literal — is `arg_0`, `arg_1`, … counted over the whole tail. Under `is_bind` the template renders a SELECT of the
+call, a literal — is `arg_0`, `arg_1`, … counted over the whole tail.
+
+`input_table` is also available **at bind**, empty but with the real column names and types, so a template
+can build its SELECT list — and its result type — from the input schema rather than hard-coding either:
+
+```sql
+SELECT typeof(fluid_scalar(
+  '{% query q %}describe select * from input_table{% endquery %}'
+  'select NULL::{{ q[3].column_type }} from input_table', NULL, n, d, m)) FROM t;
+-- the type of the third argument, whatever it is
+``` Under `is_bind` the template renders a SELECT of the
 result type — `select NULL::<type>` is the usual answer — and DuckDB binding that statement is what
 determines the type. Any type DuckDB can express works, with nothing lost: `STRUCT(a INTEGER, b VARCHAR)`,
 `DECIMAL(9,2)` with its scale, `INTEGER[]`, `MAP(VARCHAR, INTEGER)`. The template writes its own `select`;
@@ -1540,8 +1550,8 @@ SELECT typeof(fluid_scalar(
 > ⚠ A scalar owes exactly **one value per row, in input order**, and with a rendered statement that is
 > partly your contract. Enforced for you: exactly one output column, and a row count equal to the chunk's —
 > a statement that changes cardinality is refused by name. Not enforced: **order**. A plain projection over
-> `input_table` preserves it, but a statement that can reorder (a join that fans out, an aggregate) must
-> carry `__fab_row` through and `ORDER BY` it.
+> `input_table` preserves it; a statement that can reorder should order by a key of its own — pass one as an
+> argument, e.g. `rn := row_number() over ()`, then `order by rn`.
 >
 > ⚠ The declared type is **authoritative**: the expression is cast to it, so `42` under a declared `BIGINT`
 > is fine. A conversion that cannot happen fails with DuckDB's own message; a lossy but legal one (a `DOUBLE`

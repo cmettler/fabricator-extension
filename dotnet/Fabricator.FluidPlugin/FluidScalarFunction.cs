@@ -44,7 +44,9 @@ namespace Fabricator.FluidPlugin;
 /// refused by name). What is NOT enforced is ORDER. A plain projection over <c>input_table</c> preserves it
 /// — MEASURED, including for a correlated-subquery expression over 3000 rows and under
 /// <c>SET GLOBAL preserve_insertion_order = false</c> — so the ordinary shape is safe. A statement that can
-/// reorder must carry <c>__fab_row</c> through and <c>ORDER BY</c> it; the staged relation provides it.
+/// reorder must order by a key of its own — pass one as an ordinary argument
+/// (<c>rn := row_number() over ()</c>, then <c>order by rn</c>), which is MEASURED to work and is better
+/// than a key injected here: it is explicit, named by the author, and costs nothing when unneeded.
 /// </para>
 /// <para>
 /// ⚠ <b>ONE RENDER PER CHUNK, not per row</b> (user decision). Liquid decides the SHAPE of the computation —
@@ -133,17 +135,31 @@ internal sealed class FluidScalarFunction : IScalarFunction
 
     /// <summary>The staged input's columns: the row number, then <c>arg_0 … arg_{n-1}</c>.</summary>
     /// <remarks>
-    /// ⚠ Every argument column is declared as the SQLNULL sentinel's Arrow type at bind because the bind sees
-    /// only PRE-CAST values and a non-constant slot carries a placeholder; the real types arrive with each
-    /// chunk and the staged relation is rebuilt from THAT batch. The bind-time shape exists so the probe can
-    /// bind the expression's column NAMES, which is all it needs.
+    /// <para>
+    /// ⚠⚠ <b>THE REAL ARGUMENT TYPES, not placeholders — so the bind-time <c>input_table</c> has the shape
+    /// every chunk will have, and a template can derive its RESULT TYPE from its INPUT types.</b> That is
+    /// the same capability the two relation surfaces have (§26), and it is available here for a reason
+    /// specific to the tail: this function declares an <c>ANY</c> varargs tail, so DuckDB inserts NO CAST and
+    /// the host marshals each tail argument as the EXPRESSION'S OWN TYPE — which is therefore exactly what
+    /// execute will deliver. A concrete-typed parameter would not have this property, because DuckDB casts
+    /// it after the bind returns.
+    /// </para>
+    /// <para>
+    /// ⚠ A NON-CONSTANT argument still has a real TYPE here even though its VALUE is a placeholder — the
+    /// type comes from the expression, the value from folding. Only the value is unavailable at bind.
+    /// </para>
     /// </remarks>
     private static Schema StagedSchema(ScalarBindArgs args)
     {
-        var fields = new List<Field> { new(FluidScalarBinding.RowColumn, Int64Type.Default, nullable: false) };
+        var fields = new List<Field>();
         for (int i = 2; i < args.Count; i++)
         {
-            fields.Add(new Field(ArgColumnName(args.Values!, i), StringType.Default, nullable: true));
+            fields.Add(new Field(ArgColumnName(args.Values!, i),
+                                 args.Values!.Schema.FieldsList[i].DataType, nullable: true));
+        }
+        if (fields.Count == 0)
+        {
+            fields.Add(new Field(PlaceholderColumn, Int64Type.Default, nullable: false));
         }
         return new Schema(fields, metadata: null);
     }
@@ -155,18 +171,30 @@ internal sealed class FluidScalarFunction : IScalarFunction
     /// FabricatorCallArgName), and rebuilding the positional name here would throw that away and leave the
     /// template referencing a column that does not exist. BIND and EXECUTE must agree, so both go through
     /// this.
+    /// <para>
+    /// ⚠ No name is reserved. <c>input_table</c> holds the ARGUMENTS AND NOTHING ELSE, so every column in it
+    /// is one the caller named or positioned.
+    /// </para>
     /// </remarks>
-    internal static string ArgColumnName(RecordBatch args, int index)
-    {
-        var name = args.Schema.FieldsList[index].Name;
-        if (string.Equals(name, FluidScalarBinding.RowColumn, StringComparison.Ordinal))
-        {
-            throw new InvalidOperationException(
-                FunctionName + ": an argument cannot be named '" + FluidScalarBinding.RowColumn
-                + "' — that column carries the staged row number. Choose another name.");
-        }
-        return name;
-    }
+    internal static string ArgColumnName(RecordBatch args, int index) => args.Schema.FieldsList[index].Name;
+
+    /// <summary>
+    /// The one column <c>input_table</c> carries when the call has NO per-row arguments.
+    /// </summary>
+    /// <remarks>
+    /// ⚠⚠ STRUCTURAL, not a row key, and it is required: Apache.Arrow (23.0.0) cannot represent a ZERO-FIELD
+    /// schema across the C interface in either direction — both raise <c>ArgumentNullException('fields')</c>,
+    /// which this codebase already records for the zero-argument SCALAR case. <c>input_table</c> must also
+    /// carry the chunk's ROW COUNT, so it cannot simply be omitted: a bare <c>select 42</c> would yield one
+    /// row whatever the chunk size and fail the cardinality check.
+    /// <para>
+    /// ⚠ It appears ONLY when there are no arguments, so it is invisible in every call that has any — which
+    /// is why an always-present staging column was dropped (user: "__fab_row is not that useful"). Do not
+    /// treat it as an ordering key: a template that needs one passes its own
+    /// (<c>rn := row_number() over ()</c>).
+    /// </para>
+    /// </remarks>
+    internal const string PlaceholderColumn = "__fab_rows";
 
     /// <summary>
     /// Renders with <c>is_bind</c> and asks DuckDB what that expression's type is — as an Arrow type for the
@@ -239,9 +267,6 @@ internal sealed class FluidScalarFunction : IScalarFunction
 /// re-renders with.</summary>
 internal sealed class FluidScalarBinding : IScalarFunctionBinding
 {
-    /// <summary>The staged row number the wrap orders by — the only guarantee that row i in equals row i out.</summary>
-    internal const string RowColumn = "__fab_row";
-
     private const string ValueColumn = "__fab_value";
 
     private readonly string _template;
@@ -287,8 +312,9 @@ internal sealed class FluidScalarBinding : IScalarFunctionBinding
     /// nothing to it.</b> Order therefore rests on DuckDB preserving a projection's row order, which it does
     /// — MEASURED, including for a correlated-subquery expression over 3000 rows and under
     /// <c>SET GLOBAL preserve_insertion_order = false</c>, both ZERO misaligned. A template whose statement
-    /// can genuinely reorder must carry <c>__fab_row</c> through and <c>ORDER BY</c> it. The gate's
-    /// alignment row covers the ordinary shape; it does not prove the unusual one.
+    /// can genuinely reorder must order by a key of its OWN — passed as an ordinary argument, e.g.
+    /// <c>rn := row_number() over ()</c> then <c>order by rn</c>. The gate's alignment row covers the
+    /// ordinary shape; it does not prove the unusual one.
     /// </para>
     /// <para>
     /// ⚠ The single column is aliased POSITIONALLY (<c>t(x)</c>) rather than by name, so the wrap needs no
@@ -341,19 +367,25 @@ internal sealed class FluidScalarBinding : IScalarFunctionBinding
     /// </remarks>
     private string StageArgs(FluidRenderSession session, RecordBatch args)
     {
-        var fields = new List<Field> { new(RowColumn, Int64Type.Default, nullable: false) };
+        var fields = new List<Field>();
         var columns = new List<IArrowArray>();
-        var rows = new Int64Array.Builder().Reserve(args.Length);
-        for (int i = 0; i < args.Length; i++)
-        {
-            rows.Append(i);
-        }
-        columns.Add(rows.Build());
         for (int c = 2; c < args.ColumnCount; c++)
         {
             fields.Add(new Field(FluidScalarFunction.ArgColumnName(args, c),
                                  args.Schema.FieldsList[c].DataType, nullable: true));
             columns.Add(args.Column(c));
+        }
+        if (fields.Count == 0)
+        {
+            // ⚠ See FluidScalarFunction.PlaceholderColumn: a zero-FIELD Arrow schema cannot cross, and this
+            // relation is also what carries the chunk's row count.
+            fields.Add(new Field(FluidScalarFunction.PlaceholderColumn, Int64Type.Default, nullable: false));
+            var rows = new Int64Array.Builder().Reserve(args.Length);
+            for (int i = 0; i < args.Length; i++)
+            {
+                rows.Append(i);
+            }
+            columns.Add(rows.Build());
         }
         // ⚠ BORROWED, like every other RegisterRows caller: the argument columns belong to the framework and
         // are neither copied nor disposed here, which is why the token is released in the caller's finally.

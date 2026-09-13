@@ -4569,14 +4569,7 @@ SELECT DISTINCT fluid_scalar(
   '{% if is_bind %}select NULL::VARCHAR{% else %}select (select string_agg(column_name, '','') from (describe select * from input_table)) from input_table{% endif %}',
   NULL, counter := 1, n, n + 1, 9) FROM fs_t;
 ----
-__fab_row,counter,n,arg_2,arg_3
-
-# --- ⚠ The staged row-number column cannot be shadowed: refused by name at bind. ---
-statement error
-SELECT fluid_scalar(
-  '{% if is_bind %}select NULL::BIGINT{% else %}select 1 from input_table{% endif %}', NULL, __fab_row := 1);
-----
-cannot be named '__fab_row'
+counter,n,arg_2,arg_3
 
 # --- ⚠⚠ A CHARACTERIZATION OF DuckDB, AND A TRAP WORTH PINNING: a named argument to a SCALAR does NOT
 # reorder. DuckDB discards the name for dispatch (a built-in does the same — `upper(zzz := 'a')` returns 'A')
@@ -4588,3 +4581,40 @@ SELECT fluid_scalar(
   counter := 7, 2);
 ----
 27
+
+# --- ⚠⚠ `input_table` IS AVAILABLE AT BIND, EMPTY AND FULLY TYPED — the same capability §26 pins for the two
+# relation surfaces, so a template can build its SELECT list, and its RESULT TYPE, from the INPUT SCHEMA.
+#
+# ⚠ The types are REAL, not placeholders, and that is specific to the tail: this function declares an ANY
+# varargs tail, so DuckDB inserts NO CAST and the host marshals each tail argument as the EXPRESSION'S OWN
+# type — which is therefore exactly what execute delivers.
+#
+# ⚠⚠ THIS ROW PINS THE **EXECUTE**-TIME SHAPE AND NOT THE BIND-TIME ONE, corrected after a mutant said so:
+# the template has no is_bind branch, so it renders twice, but the OUTPUT comes from the execute render
+# alone. A build with placeholder types at bind passes this row unchanged. The row BELOW is the one that
+# proves the bind-time view, because the declared type comes from the bind render and nothing else.
+#
+# ⚠ A non-constant argument has a real TYPE at bind even though its VALUE is a placeholder there.
+#
+# ⚠ `|`-separated, not space-separated: sqllogictest splits a result ROW on WHITESPACE, so a one-column value
+# containing spaces is read as several values and never matches. ---
+statement ok
+CREATE TEMP TABLE fs_typed AS SELECT 1::INTEGER AS n, DATE '2024-03-05' AS d, 19.99::DECIMAL(9,2) AS m;
+
+query T
+SELECT fluid_scalar(
+  '{% query q %}describe select * from input_table{% endquery %}select ''{% for r in q %}{{ r.column_name }}:{{ r.column_type }}|{% endfor %}''::VARCHAR from input_table',
+  NULL, n, d, m) FROM fs_typed;
+----
+n:INTEGER|d:DATE|m:DECIMAL(9,2)|
+
+# --- ⚠⚠ THE PAYOFF, AND THE ONLY ROW HERE THAT SEES THE BIND-TIME TYPES: the RESULT TYPE is derived from an
+# INPUT type, with no is_bind branch and nothing about DECIMAL(9,2) written in the template. The declared
+# type comes from the BIND render, so a build whose bind-time input_table carried placeholder types declares
+# VARCHAR and this row fails — measured, it is where mutant E dies after 867 pass. ---
+query T
+SELECT typeof(fluid_scalar(
+  '{% query q %}describe select * from input_table{% endquery %}select NULL::{{ q[2].column_type }} from input_table',
+  NULL, n, d, m)) FROM fs_typed;
+----
+DECIMAL(9,2)

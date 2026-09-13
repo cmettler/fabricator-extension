@@ -4370,8 +4370,9 @@ read. **Not enforced**: ORDER.
 
 ⚠ A plain projection over `input_table` preserves order — MEASURED, including for a correlated-subquery
 expression over 3000 rows and under `SET GLOBAL preserve_insertion_order = false`, both ZERO misaligned. So
-the ordinary shape is safe, and a statement that can genuinely reorder must carry `__fab_row` through and
-`ORDER BY` it; the staged relation provides that column.
+the ordinary shape is safe, and a statement that can genuinely reorder must order by a key of its OWN, passed
+as an ordinary argument (`rn := row_number() over ()`, then `order by rn` — measured, 3000 rows, zero
+misaligned).
 
 ⚠ An earlier build wrapped a bare EXPRESSION instead, which made 1:1 structural rather than policed. It was
 changed on the user's directive; what is lost is the ordering guarantee, and what is gained is that the
@@ -4483,3 +4484,59 @@ self-naming or positional; there is no unusable third case.
 discards the name for dispatch and binds positionally. A built-in behaves identically — `upper(zzz := 'a')`
 returns `A`, and `upper(any_nonsense := 'a')` does too. So naming an argument DOCUMENTS it; it never moves
 it, and it is not validated against anything. Pinned as a characterization.
+
+### 39.10 ✅ `input_table` is available at BIND, empty and fully typed (2026-09-13, user-asked)
+
+*"similar to the fluid table functions could we make an empty input_table available at bind with the
+vargs?"* — it already was, with the right column NAMES; what it lacked was the right TYPES. One managed
+line. So a template can now derive its SELECT list **and its result type** from the input schema, which is
+the capability §26 pins for the two relation surfaces.
+
+```sql
+-- the result type comes from the INPUT type; nothing about DECIMAL(9,2) is written in the template,
+-- and there is no is_bind branch at all
+SELECT typeof(fluid_scalar(
+  '{% query q %}describe select * from input_table{% endquery %}'
+  'select NULL::{{ q[3].column_type }} from input_table', NULL, n, d, m)) FROM fs_typed;
+-- DECIMAL(9,2)
+```
+
+⚠⚠ **THE TYPES ARE REAL AT BIND, AND THAT IS SPECIFIC TO THE TAIL.** `fluid_scalar` declares an `ANY`
+varargs tail, so DuckDB inserts **no cast** and the host marshals each tail argument as the EXPRESSION'S OWN
+type (`fabricator_schema_entry.cpp`: *"an ANY tail gets no cast, so the expression's own type is what execute
+will see"*). A concrete-typed parameter would NOT have this property — DuckDB casts it after the bind
+returns, so bind and execute would legitimately differ.
+
+⚠ A NON-CONSTANT argument has a real TYPE at bind even though its VALUE is a placeholder: the type comes from
+the expression, the value from folding. Only the value is missing.
+
+⚠⚠ **A MUTANT CORRECTED THE GATE'S OWN COMMENT, which is the useful part.** The "shape" row renders the same
+text on both sides and I wrote that its passing therefore proved the two views AGREE. It does not: the OUTPUT
+comes from the EXECUTE render alone, and a build with placeholder bind-time types passes it unchanged.
+Mutant E (placeholder types) survives that row and dies at the one BELOW it — the derived-result-type row —
+because a declared type can only come from the bind render. The comments now say which row proves what.
+
+### 39.11 ✅ `input_table` holds the arguments and nothing else (2026-09-13, user-asked)
+
+*"i think the __fab_row is not that useful in fluid_scalar?"* — correct, and the follow-up is the reason
+why: *"it is only needed in fluid lateral"*. **A row key is a LATERAL concept.** A lateral is 1→N, so every
+output row must say which input produced it or the correlated columns cannot be stamped; a scalar is 1:1 by
+construction and needs no provenance at all.
+
+What the column was doing here was narrower than it looked. The wrap stopped ordering when the template took
+over writing its own `select` (§39.3), so nothing in the code used it — its only remaining purpose was as an
+ordering key a re-sorting template could use. And that is self-servable: **the caller passes their own key as
+an ordinary argument**, which is MEASURED to work (`rn := row_number() over ()` then `order by rn`, 3000
+rows, zero misaligned) and is better than an injected one — explicit, named by the author, and absent when
+unneeded. Against that it cost a reserved name, a refusal, and a column visible in every
+`describe input_table`.
+
+⚠⚠ **REMOVING IT EXPOSED A SECOND PURPOSE IT HAD BEEN SERVING SILENTLY.** With no tail arguments the staged
+relation has ZERO columns, and Apache.Arrow (23.0.0) cannot represent a zero-FIELD schema across the C
+interface in either direction — the same `ArgumentNullException('fields')` the zero-argument SCALAR case
+already records. `input_table` also carries the chunk's ROW COUNT, so it cannot simply be omitted either: a
+bare `select 42` would yield one row whatever the chunk size and fail the cardinality check.
+
+So a `__fab_rows` placeholder now appears **only when the call has no per-row arguments** — structural, not a
+row key, invisible in every call that has any. The naming-rule row is what pins that: it lists
+`counter,n,arg_2,arg_3` and nothing else.
