@@ -26,6 +26,43 @@ public static class DuckSql
         "\"" + (identifier ?? throw new ArgumentNullException(nameof(identifier))).Replace("\"", "\"\"") + "\"";
 
     /// <summary>
+    /// The inverse of <see cref="QuoteIdent"/> for a WHOLE-string quoted identifier:
+    /// <c>"my ""odd"" tbl"</c> → <c>my "odd" tbl</c>. Anything else — a bare name, a qualified
+    /// <c>a.b</c>, or a multi-part <c>"a"."b"</c> — is returned UNCHANGED.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// ⚠⚠ <b>IT DECLINES WHAT IT CANNOT DECIDE, and that is the design rather than a gap.</b>
+    /// <c>"a"."b"</c> both starts and ends with a quote and is TWO identifiers; stripping the outer pair
+    /// yields <c>a"."b</c>, a name nobody wrote. The test is that every interior quote belongs to a
+    /// DOUBLED pair — if removing the doubled pairs leaves a lone quote, the string is not one quoted
+    /// identifier.
+    /// </para>
+    /// <para>
+    /// ⚠ It does NOT reduce a qualified name to its last part. A dot may live INSIDE quotes
+    /// (<c>"a.b"</c> is ONE identifier), so splitting on dots needs a real parser, and half-parsing
+    /// renames things silently — the failure mode that makes <c>| json</c> the wrong tool for quoting.
+    /// </para>
+    /// <para>
+    /// ⚠ Round-trips with <see cref="QuoteIdent"/> for EVERY input: <c>UnquoteIdent(QuoteIdent(x)) == x</c>.
+    /// </para>
+    /// </remarks>
+    public static string UnquoteIdent(string identifier)
+    {
+        var s = identifier ?? throw new ArgumentNullException(nameof(identifier));
+        if (s.Length < 2 || s[0] != '"' || s[s.Length - 1] != '"')
+        {
+            return s;
+        }
+        var inner = s.Substring(1, s.Length - 2);
+        if (inner.Replace("\"\"", string.Empty).Contains('"'))
+        {
+            return s;   // a lone interior quote ⇒ not a single quoted identifier
+        }
+        return inner.Replace("\"\"", "\"");
+    }
+
+    /// <summary>
     /// Quotes a possibly-qualified NAME part by part: <c>QuoteName("db", "dbo", "sales")</c> →
     /// <c>"db"."dbo"."sales"</c>. Empty/null parts are skipped, so an unqualified name or an absent catalog
     /// works with the same call.

@@ -1491,8 +1491,19 @@ also means the generator runs during binding, repeatedly and without executing a
 >
 > - `{{ v | sql }}` — a SQL **literal** (quoted string, invariant-culture number, typed date/time, `NULL`)
 > - `{{ n | sql_ident }}` — a quoted **identifier**
+> - `{{ n | unquote_ident }}` — the inverse, for a name that arrives ALREADY quoted
 >
-> Both are allow-lists: a value with no provably safe rendering is refused by name rather than interpolated.
+> The first two are allow-lists: a value with no provably safe rendering is refused by name rather than
+> interpolated.
+>
+> `unquote_ident` turns `"my ""odd"" tbl"` back into `my "odd" tbl`, so
+> `{{ n | unquote_ident | sql_ident }}` normalises a caller-supplied identifier however it was written.
+> ⚠ It **declines what it cannot decide**, which is the point: `"a"."b"` is TWO identifiers, so it is left
+> alone rather than mangled into `a"."b`, and a qualified `db.schema.t` keeps all its parts (a dot can live
+> inside quotes, so reducing it to a last part needs a real parser).
+>
+> ⚠ **Do not reach for `| json` to quote an identifier.** It escapes as `"od"d"` — a *different*
+> identifier — and it looks correct for every name that happens to contain no quote.
 >
 > ```sql
 > SELECT * FROM fluid_replacement_query('SELECT {{ params.v | sql }} AS v', params := {'v': 'O''Brien'});

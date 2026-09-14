@@ -693,7 +693,11 @@ case "$TIER" in
         #   fully typed `rows` is staged at BIND, which is what lets a template omit `is_bind` entirely.
         #   ⚠ It is a VIEW over the registered Arrow batch rather than a materialized copy — measured 0.002 s
         #   vs 0.034 s on a 300k-row group — and the double-reference row is what makes that legitimate.
-        : "${MIN_ASSERTIONS:=9337}"
+                # 2026-09-14: 9337 -> 9343. verify_plugin_fluid 981 -> 987 (§40.11) — the `unquote_ident` filter,
+        #   the inverse of sql_ident, for a name that arrives already quoted. ⚠ Its load-bearing rows are
+        #   the ones it REFUSES: `"a"."b"` is two identifiers, and stripping the outer pair would rename a
+        #   relation to `a"."b` with nothing failing. Logic lives in DuckSql (tier-0, floor 258 -> 278).
+        : "${MIN_ASSERTIONS:=9343}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

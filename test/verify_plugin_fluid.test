@@ -5130,3 +5130,22 @@ SELECT fluid_aggregate('select (select count(*) from rows) * 1000 + (select sum(
 FROM (SELECT * FROM fagg_t ORDER BY a LIMIT 4);
 ----
 4006
+
+# --- §40.11 `unquote_ident`, the inverse of `sql_ident` ---------------------------------------------
+# ⚠⚠ THE LOAD-BEARING ROWS ARE THE ONES IT REFUSES. Stripping the outer quotes of `"a"."b"` yields
+# `a"."b` — an identifier nobody wrote — and a template that renames a relation that way fails NOWHERE.
+# ⚠ A qualified name keeps all its parts: a dot can live INSIDE quotes, so reducing it to a last part
+# needs a real parser. ⚠ Do NOT reach for `| json` to quote an identifier: it escapes as "od"d",
+# a DIFFERENT identifier, and it looks correct for every name that contains no quote. ---
+query TTTTTT
+SELECT * FROM fluid_replacement_query('SELECT
+  {{ params.a | unquote_ident | sql }} AS bare,
+  {{ params.b | unquote_ident | sql }} AS quoted,
+  {{ params.c | unquote_ident | sql }} AS embedded,
+  {{ params.d | unquote_ident | sql }} AS two_parts,
+  {{ params.e | unquote_ident | sql }} AS qualified,
+  {{ params.c | unquote_ident | sql_ident | sql }} AS requoted',
+  params := {'a': 'px_one', 'b': '"odd name"', 'c': '"od""d"',
+             'd': '"a"."b"', 'e': 'memory.main.px_two'});
+----
+px_one	odd name	od"d	"a"."b"	memory.main.px_two	"od""d"

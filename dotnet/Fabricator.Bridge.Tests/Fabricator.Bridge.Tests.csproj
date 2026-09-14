@@ -112,6 +112,11 @@
       makes silent — set_default's JSON null (DEFAULT NULL) versus an absent key, and an EMPTY `columns`
       array, which is the RESET spelling and must not read as "no list".
     -->
+    <!-- DuckSql: BCL-only quoting helpers. QuoteIdent/UnquoteIdent are a round-trip pair, and the
+         declining cases (a multi-part "a"."b", a qualified a.b) are exactly what a test has to pin —
+         guessing there renames a relation silently. -->
+    <Compile Include="..\Fabricator.Abstractions\DuckSql.cs"
+             Link="Linked\DuckSql.cs" />
     <Compile Include="..\Fabricator.Abstractions\AlterTableSpec.cs"
              Link="Linked\AlterTableSpec.cs" />
     <!--

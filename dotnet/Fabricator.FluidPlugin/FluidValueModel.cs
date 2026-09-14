@@ -75,6 +75,12 @@ internal static class FluidValueModel
         o.Filters.AddFilter(FluidHostExec.FunctionName, FluidHostExec.Filter);
         o.Filters.AddFilter("sql_ident", (input, _, ctx) =>
             new ValueTask<FluidValue>(new StringValue(DuckSql.QuoteIdent(input.ToStringValue(ctx)), encode: false)));
+        // The inverse, for a name that arrives ALREADY quoted — `{{ n | unquote_ident | sql_ident }}` is how
+        // a template normalises a caller-supplied identifier. ⚠ It declines the ambiguous shapes rather than
+        // guessing (`"a"."b"` is two identifiers, not one); see DuckSql.UnquoteIdent.
+        o.Filters.AddFilter("unquote_ident", (input, _, ctx) =>
+            new ValueTask<FluidValue>(
+                new StringValue(DuckSql.UnquoteIdent(input.ToStringValue(ctx)), encode: false)));
 
         // {% include %} / {% render %} resolve through DuckDB's FileSystem against fluid_template_root.
         // ⚠ ONE instance on the shared static, and safe here where a per-render FILTER would not be: Fluid
