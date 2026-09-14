@@ -1167,7 +1167,15 @@ ArrowArray BuildUpdateBatch(FabricatorAggregateBindData &bind, Vector &key_vec, 
 	auto extension_types = ArrowTypeExtensionData::GetExtensionTypes(*bind.context, types);
 	ArrowAppender appender(types, count, bind.properties, extension_types);
 	appender.Append(batch, 0, count, count);
-	return appender.Finalize();
+	ArrowArray array = appender.Finalize();
+	// ⚠ The EIGHTH site of the untyped-NULL class, and the only one that is a DATA marshal rather than an
+	// args marshal — which is why the first sweep missed it. An ANY-declared parameter handed a bare NULL
+	// resolves to SQLNULL at bind, so its update column is NULL-typed and DuckDB leaves null_count at 0;
+	// Apache.Arrow then refuses the whole batch ("Length must equal null count"). Reachable from
+	// `fluid_aggregate(tpl, NULL, v)` — a constant the binding already holds, still marshalled per row
+	// because the ABI sends every declared argument.
+	fabricator::FixNullTypedChildren(array, types);
+	return array;
 }
 
 // Fast mode: marshal [id ++ inputs] and send to agg_update.
@@ -1370,12 +1378,111 @@ void FabricatorAggregateInit(const AggregateFunction &function, data_ptr_t state
 }
 
 unique_ptr<FunctionData> FabricatorAggregateBind(ClientContext &context, AggregateFunction &function,
-                                               vector<unique_ptr<Expression>> &) {
+                                               vector<unique_ptr<Expression>> &arguments) {
 	auto &info = function.function_info->Cast<FabricatorAggregateFunctionInfo>();
 	auto bind_data = make_uniq<FabricatorAggregateBindData>();
 	bind_data->holder = make_shared_ptr<AggSessionHolder>();
-	bind_data->holder->session = fabricator::AggOpen(info.handle, info.schema, info.func);
-	bind_data->arg_types = info.arg_types;
+
+	// ⚠⚠ AN AGGREGATE'S SESSION IS OPENED HERE, i.e. ONCE PER CALL SITE — which is what makes a per-call-site
+	// RESULT TYPE expressible (ABI v89). DuckDB passes `function` BY VALUE into this bind and moves the
+	// mutated copy into the BoundAggregateExpression (FunctionBinder::BindAggregateFunction), so a type set
+	// below really becomes the expression's type.
+	//
+	// ⚠ The ambients are NOT established here, for exactly the reason FabricatorScalarBind records: an
+	// aggregate binds wherever it is CALLED, so overwriting an outer operation's context would leave that
+	// operation resolving one that is gone.
+	auto properties = fabricator::BoundaryClientProperties(context);
+	vector<LogicalType> arg_types;
+	vector<string> arg_names;
+	vector<Value> arg_values;
+	string arg_constant;
+	for (idx_t i = 0; i < arguments.size(); i++) {
+		auto &arg = *arguments[i];
+		// A still-unresolved prepared-statement parameter can neither be folded nor typed, so the bind must
+		// be DEFERRED — the same mechanism (and the same reason) as the scalar bind.
+		if (arg.HasParameter() || arg.return_type.id() == LogicalTypeId::UNKNOWN) {
+			throw ParameterNotResolvedException();
+		}
+		// Marshal as the DECLARED type wherever it is concrete: DuckDB inserts exactly that cast immediately
+		// after this bind returns (CastToFunctionArguments), so the bind's view of an argument AGREES with
+		// the batch update will see. An ANY parameter gets no cast, so the expression's own type is right.
+		LogicalType marshal_type = arg.return_type;
+		if (i < function.arguments.size() && function.arguments[i].id() != LogicalTypeId::ANY &&
+		    function.arguments[i].id() != LogicalTypeId::INVALID) {
+			marshal_type = function.arguments[i];
+		}
+		bool folded = false;
+		Value value(marshal_type); // NULL placeholder for a runtime expression
+		if (arg.IsFoldable()) {
+			try {
+				value = ExpressionExecutor::EvaluateScalar(context, arg).DefaultCastAs(marshal_type);
+				folded = true;
+			} catch (std::exception &) {
+				// Folding (or casting) a constant expression can fail (1/0). Not a bind failure — report the
+				// slot as runtime and let it surface where it does today.
+				folded = false;
+				value = Value(marshal_type);
+			}
+		}
+		arg_types.push_back(marshal_type);
+		arg_names.push_back(FabricatorArgName(info.arg_names, DConstants::INVALID_INDEX, i));
+		arg_constant.push_back(folded ? '1' : '0');
+		arg_values.push_back(std::move(value));
+	}
+
+	ArrowSchema result_schema {};
+	std::memset(&result_schema, 0, sizeof(result_schema));
+	if (arg_types.empty()) {
+		// A zero-argument aggregate: pass NO stream. A zero-FIELD Arrow schema cannot cross in either
+		// direction (Apache.Arrow throws on 'fields') — the same rule every other args marshal follows.
+		bind_data->holder->session =
+		    fabricator::AggOpen(info.handle, info.schema, info.func, nullptr, arg_constant,
+		                        MakeCallContext(context), result_schema);
+	} else {
+		DataChunk chunk;
+		chunk.Initialize(Allocator::DefaultAllocator(), arg_types);
+		for (idx_t c = 0; c < arg_values.size(); c++) {
+			chunk.SetValue(c, 0, arg_values[c]);
+		}
+		chunk.SetCardinality(1);
+		auto extension_types = ArrowTypeExtensionData::GetExtensionTypes(context, arg_types);
+		ArrowAppender appender(arg_types, 1, properties, extension_types);
+		appender.Append(chunk, 0, 1, 1);
+		ArrowArray array = appender.Finalize();
+		fabricator::FixNullTypedChildren(array, arg_types); // an ANY parameter given a bare NULL
+		fabricator::ArrowProducer producer(arg_types, arg_names, properties);
+		producer.AddBatch(array);
+		producer.Finish();
+		bind_data->holder->session = fabricator::AggOpen(info.handle, info.schema, info.func, producer.Stream(),
+		                                                arg_constant, MakeCallContext(context), result_schema);
+	}
+
+	vector<LogicalType> result_types;
+	vector<string> result_names;
+	fabricator::ReadArrowSchema(context, result_schema, result_types, result_names);
+	if (result_types.size() != 1) {
+		throw BinderException(
+		    "fabricator aggregate function \"%s\" bound %llu result columns; exactly one is required", info.func,
+		    (uint64_t)result_types.size());
+	}
+	// The UNRESOLVED sentinel means "my result is the DECLARED type", which the registered function already
+	// carries — so leaving it alone is the whole handling, and a fixed-type aggregate pays nothing.
+	if (result_types[0].id() != LogicalTypeId::SQLNULL && result_types[0].id() != LogicalTypeId::ANY) {
+		function.SetReturnType(result_types[0]);
+	}
+	if (function.GetReturnType().id() == LogicalTypeId::ANY) {
+		// Neither the declaration nor the bind produced a type. Refuse HERE, naming the function: an
+		// unresolved ANY flowing onward gets no further validation and would fail far from its cause.
+		throw BinderException(
+		    "fabricator aggregate function \"%s\" declares no return type and its bind did not resolve one",
+		    info.func);
+	}
+	// ⚠⚠ THE RESOLVED TYPES, not the declaration: an ANY-declared parameter is SQLNULL in `info.arg_types`,
+	// and BuildUpdateBatch types the update columns from this vector. Handing it the declaration would
+	// marshal a STRUCT argument as a NULL-typed column — a batch the managed import then reads through the
+	// wrong converters. The managed UpdateSchema is built from the SAME resolved types (it reads them off
+	// the bind-args batch's own schema), so the two sides cannot disagree.
+	bind_data->arg_types = arg_types.empty() ? info.arg_types : arg_types;
 	bind_data->arg_names = info.arg_names;
 	bind_data->properties = fabricator::BoundaryClientProperties(context);
 	bind_data->context = &context;
@@ -1537,7 +1644,23 @@ static AggregateFunction BuildFabricatorAggregateFunction(FabricatorHandle handl
 	// and a callback here cannot safely reach the bind data at plan teardown (see the comment above — it was
 	// a use-after-free that faulted on POSIX and hid on Windows). The managed accumulators are freed by
 	// AggSessionHolder's agg_close instead.
-	AggregateFunction fn(func_name, arg_types, return_type, FabricatorAggregateStateSize, FabricatorAggregateInit,
+	// ⚠ SQLNULL is the "resolved per call site" sentinel (IAggregateFunction.Result == null), and it must be
+	// registered as ANY: DuckDB's binder would otherwise accept the aggregate only where a NULL-typed result
+	// is acceptable. FabricatorAggregateBind then replaces it — and REFUSES by name if it did not, so an
+	// unresolved ANY never reaches the plan. Same sentinel and same handling as the scalar path.
+	if (return_type.id() == LogicalTypeId::SQLNULL) {
+		return_type = LogicalType::ANY;
+	}
+	// ⚠ And the same sentinel on a PARAMETER means "accept any value" — registered as SQLNULL it would take a
+	// NULL literal and nothing else, which is what made `fluid_aggregate(tpl, NULL, struct_pack(...))` fail
+	// to bind with the signature printed back as `fluid_aggregate(VARCHAR, "NULL", "NULL")`. The BIND then
+	// resolves each such slot against the value that arrived (see bind_data->arg_types there), which is what
+	// the update marshal and the managed UpdateSchema both need.
+	vector<LogicalType> registered_args = arg_types;
+	for (auto &t : registered_args) {
+		t = FabricatorVarArgsType(t);
+	}
+	AggregateFunction fn(func_name, registered_args, return_type, FabricatorAggregateStateSize, FabricatorAggregateInit,
 	                     FabricatorAggregateUpdate, FabricatorAggregateCombine, FabricatorAggregateFinalize,
 	                     FunctionNullHandling::DEFAULT_NULL_HANDLING, FabricatorAggregateSimpleUpdate,
 	                     FabricatorAggregateBind, nullptr);

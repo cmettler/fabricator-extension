@@ -4882,3 +4882,148 @@ WHERE function_name IN ('fluid_query', 'fluid_replacement_query') GROUP BY 1 ORD
 ----
 fluid_query	1
 fluid_replacement_query	1
+
+# =====================================================================================================
+# §40 — `fluid_aggregate`: a template rendered ONCE PER GROUP, whose RESULT TYPE it declares itself.
+#
+# ⚠⚠ THE TYPE IS THE POINT, and it is what needed ABI v89: an aggregate's session is opened from its
+# BIND — once per call site — so the `is_bind` render can declare a type the way fluid_scalar does.
+# Before v89 an aggregate's return type was fixed at REGISTRATION and nothing could vary it.
+#
+# ⚠ It renders TEXT where fluid_scalar renders SQL, and that is forced rather than chosen: a scalar's
+# rows live in DuckDB, an aggregate's live in the accumulator, so there is nothing for DuckDB to
+# evaluate them with. The reduction happens in Liquid; the declared type is applied by a CAST.
+# =====================================================================================================
+
+statement ok
+CREATE TABLE fagg_t AS SELECT i % 3 AS g, i::BIGINT AS a, 'v' || i AS b FROM range(9) r(i);
+
+# --- §40.1 the use case it was asked for: an md5 over each group's rows. ⚠ `rows` is the group, as Fluid
+# values, so the hash is computed in Liquid with no SQL at all. ---
+query IT
+SELECT g, fluid_aggregate(
+  '{% if is_bind %}select NULL::VARCHAR'
+  '{% else %}{% capture s %}{% for r in rows %}{{ r.a }}|{{ r.b }};{% endfor %}{% endcapture %}{{ s | md5 }}{% endif %}',
+  NULL, struct_pack(a := a, b := b) ORDER BY a) AS h
+FROM fagg_t GROUP BY g ORDER BY g;
+----
+0	79172c4e532577b57f10d3513d40fe6a
+1	151b6c04cb18b03a93142cf2fd9bdf21
+2	bbcbd31a7317cc77aa53255f9f088604
+
+# --- §40.2 ⚠⚠ THE TYPE COMES FROM THE TEMPLATE, AND THESE ROWS ARE THE WHOLE FEATURE. Three different
+# declarations from three different templates, one function. A build whose return type were still fixed at
+# registration answers the SAME type for all three. ---
+query TT
+SELECT typeof(fluid_aggregate('{% if is_bind %}select NULL::BIGINT{% else %}{{ rows.size }}{% endif %}', NULL, a)) AS t1,
+       typeof(fluid_aggregate('{% if is_bind %}select NULL::DECIMAL(9,2){% else %}12.34{% endif %}', NULL, a)) AS t2
+FROM fagg_t;
+----
+BIGINT	DECIMAL(9,2)
+
+# --- §40.3 ⚠ A STRUCT result, which the host's boxed result-column ladder CANNOT build — the binding hands
+# over the column DuckDB's own CAST produced instead (IAggregateBinding.FinalizeColumn). Without that hook
+# this row fails with "custom aggregate result type StructType is not supported". ---
+query TT
+SELECT typeof(fluid_aggregate('{% if is_bind %}select NULL::STRUCT(n INTEGER, s VARCHAR)'
+                              '{% else %}{''n'': {{ rows.size }}, ''s'': ''x''}{% endif %}', NULL, a)) AS t,
+       fluid_aggregate('{% if is_bind %}select NULL::STRUCT(n INTEGER, s VARCHAR)'
+                       '{% else %}{''n'': {{ rows.size }}, ''s'': ''x''}{% endif %}', NULL, a)::VARCHAR AS v
+FROM fagg_t;
+----
+STRUCT(n INTEGER, s VARCHAR)	{'n': 9, 's': x}
+
+# --- §40.4 ⚠⚠ THE DETERMINISM ROW. An aggregate is UNORDERED by definition, so a hash over `rows` only
+# repeats if the caller orders it — and DuckDB's aggregate ORDER BY does reach Update in order, which is the
+# fact that makes the feature usable for hashing at all. DESC and ASC must differ. ---
+query TT
+SELECT fluid_aggregate('{% if is_bind %}select NULL::VARCHAR{% else %}{% for r in rows %}{{ r }},{% endfor %}{% endif %}',
+                       NULL, a ORDER BY a DESC) AS d,
+       fluid_aggregate('{% if is_bind %}select NULL::VARCHAR{% else %}{% for r in rows %}{{ r }},{% endfor %}{% endif %}',
+                       NULL, a ORDER BY a ASC) AS s
+FROM fagg_t WHERE g = 1;
+----
+7,4,1,	1,4,7,
+
+# --- §40.5 the same function under a WINDOW, which is the other half of "can it be used with GROUP BY?".
+# ⚠ A moving frame re-finalizes per row, so this also pins that the binding survives being finalized many
+# times — and that its per-group `rows` is REBOUND rather than carried (a stale bind would report 9 here). ---
+query II
+SELECT a, fluid_aggregate('{% if is_bind %}select NULL::BIGINT{% else %}{{ rows.size }}{% endif %}', NULL, a)
+  OVER (ORDER BY a ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS n FROM fagg_t ORDER BY a LIMIT 4;
+----
+0	1
+1	2
+2	2
+3	2
+
+# ⚠ DISTINCT over the WHOLE table, not a filtered one-row-per-partition shape: with one row per partition
+# every value is its own group and the row would pass on a build that ignored PARTITION BY entirely.
+query IT
+SELECT DISTINCT g, fluid_aggregate('{% if is_bind %}select NULL::VARCHAR{% else %}{% for r in rows %}{{ r }};{% endfor %}{% endif %}',
+                                   NULL, a ORDER BY a) OVER (PARTITION BY g) AS s
+FROM fagg_t ORDER BY g;
+----
+0	0;3;6;
+1	1;4;7;
+2	2;5;8;
+
+# --- §40.6 ⚠ A GROUP BY whose chunk spans SEVERAL groups takes the host's gather path, which used to refuse
+# every type outside a fixed list — a STRUCT argument failed there, and so did the NULL-typed `params`
+# constant. Same hashes as §40.1, which is what shows the gather is faithful and not merely unrefused. ---
+query IT
+SELECT g, fluid_aggregate(
+  '{% if is_bind %}select NULL::VARCHAR'
+  '{% else %}{% capture s %}{% for r in rows %}{{ r.a }}|{{ r.b }};{% endfor %}{% endcapture %}{{ s | md5 }}{% endif %}',
+  NULL, struct_pack(a := a, b := b)) AS h
+FROM fagg_t GROUP BY g ORDER BY g;
+----
+0	79172c4e532577b57f10d3513d40fe6a
+1	151b6c04cb18b03a93142cf2fd9bdf21
+2	bbcbd31a7317cc77aa53255f9f088604
+
+# --- §40.7 an EMPTY input still finalizes: DuckDB finalizes a state it never updated, and the template sees
+# an empty `rows` rather than being skipped — so it may still have something to say. ---
+query I
+SELECT fluid_aggregate('{% if is_bind %}select NULL::BIGINT{% else %}{{ rows.size }}{% endif %}', NULL, a) AS n
+FROM fagg_t WHERE 1 = 0;
+----
+0
+
+# --- §40.8 the params bag is the same bag every other Fluid surface takes. ---
+query T
+SELECT fluid_aggregate('{% if is_bind %}select NULL::VARCHAR{% else %}{{ params.who }}-{{ rows.size }}{% endif %}',
+                       {'who': 'eu'}, a) AS s FROM fagg_t;
+----
+eu-9
+
+# --- §40.9 ⚠ A render that produces NOTHING is NULL — the same value a group with nothing to say gets. ---
+query I
+SELECT count(*) FROM (
+  SELECT fluid_aggregate('{% if is_bind %}select NULL::VARCHAR{% else %}{% endif %}', NULL, a) AS s FROM fagg_t
+) WHERE s IS NULL;
+----
+1
+
+# --- §40.10 the template must be a CONSTANT: the result type is part of the PLAN, so it cannot depend on a
+# row value. Refused by name rather than resolved from whatever row happened to be first. ---
+statement error
+SELECT fluid_aggregate(b, NULL, a) FROM fagg_t;
+----
+<REGEX>:.*template must be a constant.*
+
+# --- §40.11 ⚠ A template that declares no type under is_bind is refused THERE, not left as an unresolved
+# ANY flowing into the plan to fail somewhere unrelated. ---
+statement error
+SELECT fluid_aggregate('{% if is_bind %}{% else %}x{% endif %}', NULL, a) FROM fagg_t;
+----
+<REGEX>:.*rendered nothing under is_bind.*
+
+# --- §40.12 ⚠⚠ ONE per-row argument, and that is DuckDB's limit rather than a choice: a variadic tail is
+# REFUSED on aggregates, because the update crossing rebuilds its batch schema from the DECLARATION and has
+# no per-call-site width. Several columns go in ONE struct_pack — pinned here so the workaround is not
+# folklore. ---
+statement error
+SELECT fluid_aggregate('{% if is_bind %}select NULL::VARCHAR{% else %}x{% endif %}', NULL, a, b) FROM fagg_t;
+----
+<REGEX>:.*No function matches.*

@@ -12,6 +12,103 @@
 > parsed with our own vcpkg yyjson, retiring the `ReadCapabilityFlag` string-find). v74 below is the
 > follow-on that finished the same job for ALTER.
 
+## v89 (2026-09-14) — `agg_open` becomes the aggregate's BIND: a per-CALL-SITE result type
+
+**User-asked** (*"a fluid_aggregate must at bind be able to supply the return_type"*), and the answer is yes
+for a structural reason worth stating first: **`agg_open` is already called from DuckDB's aggregate BIND**
+(`FabricatorAggregateBind`), so a session exists per CALL SITE rather than per function. Everything else
+follows from teaching that one entry to carry the call.
+
+```c
+int32_t (*agg_open)(FabricatorHandle handle, const char *schema, const char *func,
+                    struct ArrowArrayStream *args, const char *arg_constant, FabricatorHandle opener,
+                    int64_t session, int64_t txn, struct ArrowSchema *out_result,
+                    FabricatorHandle *out_session, char **err);
+```
+
+`args` (nullable) is a 1-row stream of the call's arguments and `arg_constant` the folded-constant mask —
+the same pair, with the same partiality, that `scalarfn_bind` takes since v80. `out_result` receives the
+RESOLVED result field; an Arrow NULL type there is the UNRESOLVED sentinel, meaning *"my declared type
+stands"*, so a fixed-type aggregate pays one exported schema and no decision.
+
+### Why DuckDB allows it at all
+
+`FunctionBinder::BindAggregateFunction` takes `AggregateFunction bound_function` **BY VALUE**, hands it to
+the bind callback, and moves the mutated copy into the `BoundAggregateExpression`. So `function.SetReturnType(…)`
+inside the bind really does become the expression's type — the same mechanism `ScalarFunction` uses, and it
+was already reachable: our bind had received `vector<unique_ptr<Expression>> &arguments` all along and
+ignored it.
+
+### Managed contract
+
+- `IAggregateFunction.Result` is now `Field?` — null registers the aggregate as `ANY` and obliges `Bind`.
+- `IAggregateFunction.Bind(ScalarBindArgs) → IAggregateBinding` is a DIM returning `StaticAggregateBinding`,
+  so an aggregate with a fixed type implements nothing new. `IAggregateBinding` supplies the result field and
+  creates this call's accumulators.
+- `IAggregateSession.ResolvedResult` (DIM, null = the declaration stands) is how the host reads the type back
+  regardless of which path opened the session.
+- `IProviderCatalog.AggOpen(schema, func, ScalarBindArgs)` is a DIM delegating to the 2-arg form. ⚠ Chaining
+  is safe HERE — unlike v88's parameter bag, where a default that dropped it would have run the statement
+  unparameterised — because an aggregate declaring a fixed `Result` has nothing to resolve, and one that
+  does not gets a binding that THROWS by name rather than a wrong type.
+- `IAggregateBinding.FinalizeColumn(object?[]) → IArrowArray?` (DIM, null = the host's default) lets a
+  binding hand over a finished result COLUMN. See "the result ladder" below.
+
+### ⚠⚠ FOUR THINGS ONLY BUILDING IT SETTLED
+
+1. **The SQLNULL sentinel had to be honoured for the aggregate's PARAMETERS as well as its return type.**
+   Registered as SQLNULL, an "accept any value" slot takes a NULL LITERAL and nothing else — measured as
+   `fluid_aggregate(VARCHAR, "NULL", "NULL")` refusing `struct_pack(...)`. This is the THIRD place that same
+   sentinel had to be taught (positional table params and `FabricatorExpandVarArgs`' prefix were the first
+   two, one day earlier): **a protocol constant honoured in some positions and not others registers a
+   DIFFERENT function, silently.**
+
+2. **The bind must hand the RESOLVED argument types on, and BOTH sides must use them.** `BuildUpdateBatch`
+   types the update columns from `bind_data->arg_types` and the managed `AggregateSession` rebuilds the batch
+   schema from its own declaration — so with an ANY parameter the two disagreed: a STRUCT argument marshalled
+   as a NULL-typed column. The bind now stores the per-call types and `AggregateSession` takes them off the
+   bind-args batch's own schema, so the two cannot drift.
+
+3. **`agg_open` needed the CALL CONTEXT, not just the arguments.** A bind that touches the host — to resolve
+   a type, which is the whole point — opens a connection, and the aggregate path establishes no ambients
+   anywhere. Without it: `host_connection_open failed: Attempted to dereference unique_ptr that is NULL`, and
+   **the first aggregate in a statement worked while the second did not**, which is the signature of
+   inheriting whatever the last crossing left. The managed handler now establishes and RESTORES the scope
+   (`CallScope`), exactly as `scalarfn_bind` does and for exactly the reason recorded there: an aggregate
+   binds wherever it is CALLED, so the host must not assign the ambients around it.
+
+4. **⚠ UPDATE, COMBINE AND FINALIZE STILL CARRY NO CONTEXT**, and that is not an oversight to fix casually —
+   it is why a binding that needs host access must acquire it AT BIND and keep it. `fluid_aggregate` creates
+   its render session there and holds it for the call site; `AggregateSession.Close` disposes the binding at
+   plan teardown (`agg_close`), which is the only teardown signal there is.
+
+### The two type ladders it retired
+
+Both were hand-written per-Arrow-type `switch`es in `AggregateSession`, and an ANY-declared argument makes
+any fixed list wrong by construction — the type is whatever the CALL SITE passed.
+
+- **`GatherRows`** (splitting one update batch across several groups) refused everything outside eight
+  primitives, so a STRUCT argument or a NULL-typed constant failed the moment a chunk spanned two groups —
+  i.e. under ordinary `GROUP BY` and under every windowed frame. It now falls back to slice-each-row +
+  `ArrowArrayConcatenator.Concatenate`, which is type-agnostic. ⚠ `NullArray` keeps an explicit case because
+  the concatenator refuses it (*"Concatenation for null is not supported yet"*), and a NULL-typed column is
+  ORDINARY here rather than exotic.
+- **`BuildResultColumn`** could not build a STRUCT/LIST/MAP result at all. `FinalizeColumn` lets a binding
+  supply the column instead — `fluid_aggregate` hands over the one DuckDB's own CAST produced, so a template
+  may declare `STRUCT(n INTEGER, s VARCHAR)` and get exactly that.
+
+### ⚠ The `Field` → `Field?` trap, for the second time in this file
+
+Making `Result` nullable produced `CS8602` at two sites that DEREFERENCED it while building the function
+inventory — and one of them is inside `list_global_functions`, where **a single throw drops EVERY global
+function**. The symptom was `fluid_aggregate does not exist` with `fluid_render` gone too, three layers from
+the cause. That is precisely what v80 recorded when `IScalarFunction.Result` became nullable. ⚠ And the
+warnings are invisible on an up-to-date project: `dotnet build --no-incremental` is what shows them.
+
+Full record of the consumer: [fluid-templating.md](fluid-templating.md) §43.
+
+---
+
 ## v88 (2026-09-06) — `execute_query` / `execute_dml` take a PARAMETER BAG
 
 **User-asked** (*"i think fabricator_query/fabricator_execute ABI version with parameter binding would be

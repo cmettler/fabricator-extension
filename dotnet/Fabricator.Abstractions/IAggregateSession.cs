@@ -26,6 +26,16 @@ public interface IAggregateSession
     /// </summary>
     Schema UpdateSchema { get; }
 
+    /// <summary>
+    /// The result field this call site RESOLVED, or <c>null</c> => the function's declared type stands.
+    /// </summary>
+    /// <remarks>
+    /// ⚠ The same UNRESOLVED sentinel the scalar bind uses, and it is what lets the default cost nothing: a
+    /// session that resolves no type says so, and the host leaves the registered return type alone rather
+    /// than re-deriving one it already has.
+    /// </remarks>
+    Field? ResolvedResult => null;
+
     /// <summary>Applies one update batch: column 0 = int64 state_id, columns 1.. = argument values.</summary>
     void Update(RecordBatch idPlusArgs);
 

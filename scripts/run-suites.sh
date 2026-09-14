@@ -674,7 +674,15 @@ case "$TIER" in
         #   ⚠ The load-bearing gate row is §39.4: an OR contributes NO conjuncts, because a branch of a
         #   disjunction is not true of every row and a template narrowing by it would DROP rows the host
         #   cannot bring back.
-        : "${MIN_ASSERTIONS:=9261}"
+        # 2026-09-14: verify_plugin_fluid 905 -> 944. `fluid_aggregate` — a template rendered ONCE PER
+        #   GROUP with that group's rows in hand, reducing them to one value whose TYPE the template declares
+        #   (ABI v89: agg_open became the aggregate's BIND, so the result type is resolved per CALL SITE).
+        #   ⚠ It renders TEXT where fluid_scalar renders SQL, and that is forced: an aggregate's rows live in
+        #   the accumulator, so there is nothing for DuckDB to evaluate them with.
+        #   ⚠ The load-bearing gate row is §40.4: an aggregate is UNORDERED, so a hash over `rows` repeats
+        #   only if the caller writes ORDER BY — DESC and ASC must differ, or the feature is not usable for
+        #   the hashing it was asked for.
+        : "${MIN_ASSERTIONS:=9300}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

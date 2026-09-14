@@ -1388,14 +1388,17 @@ void TableFnClose(FabricatorHandle binding) {
 	}
 }
 
-FabricatorHandle AggOpen(FabricatorHandle handle, const std::string &schema, const std::string &func) {
+FabricatorHandle AggOpen(FabricatorHandle handle, const std::string &schema, const std::string &func,
+                         ArrowArrayStream *args, const std::string &arg_constant, const CallContext &call,
+                         ArrowSchema &out_result) {
 	const FabricatorVTable &vt = GetBridge();
 	if (!vt.agg_open) {
 		throw duckdb::IOException("Fabricator: bridge does not provide agg_open");
 	}
 	FabricatorHandle session = nullptr;
 	char *err = nullptr;
-	int32_t rc = vt.agg_open(handle, schema.c_str(), func.c_str(), &session, &err);
+	int32_t rc = vt.agg_open(handle, schema.c_str(), func.c_str(), args, arg_constant.c_str(), call.opener,
+	                         call.session, call.txn_id, &out_result, &session, &err);
 	if (rc != FABRICATOR_OK) {
 		ThrowManagedError(vt, err, "Fabricator: agg_open failed");
 	}

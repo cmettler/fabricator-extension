@@ -3,6 +3,7 @@
 // See LICENSE in the project root for license information.
 
 using Apache.Arrow;
+using Apache.Arrow.Types;
 using Apache.Arrow.Ipc;
 
 namespace Fabricator.Bridge;
@@ -96,9 +97,9 @@ public static class GlobalFunctions
             : throw new ArgumentException($"fabricator: no global SQL-generating table function '{name}'");
 
     /// <summary>Open a session for a global aggregate by name (the handle-0 agg_open path). Throws if none.</summary>
-    public static IAggregateSession ResolveAggregate(string name) =>
+    public static IAggregateSession ResolveAggregate(string name, ScalarBindArgs? args = null) =>
         AggregateMap.Value.TryGetValue(name, out var a)
-            ? new AggregateSession(a)
+            ? new AggregateSession(a, args)
             : throw new ArgumentException($"fabricator: no global aggregate function '{name}'");
 
     /// <summary>The positional/cost parameter schema for ANY global function by name (the handle-0
@@ -128,7 +129,12 @@ public static class GlobalFunctions
         // A pure scalar's field carries the CONSISTENT tag (fabricator.volatile = "0") so the C++
         // registration folds constants — see ScalarFunctionMetadata.
         if (ScalarMap.Value.TryGetValue(name, out var s)) { return ScalarFunctionMetadata.DeclaredReturnField(s); }
-        if (AggregateMap.Value.TryGetValue(name, out var a)) { return a.Result; }
+        // ⚠ A null Result is the "resolved per call site" sentinel: report it as Arrow NULL, which the C++
+        // registration maps to ANY and the aggregate bind then replaces. Same carrier the scalar path uses.
+        if (AggregateMap.Value.TryGetValue(name, out var a))
+        {
+            return a.Result ?? new Field("result", NullType.Default, nullable: true);
+        }
         throw new ArgumentException($"fabricator: global function '{name}' has no scalar return type");
     }
 

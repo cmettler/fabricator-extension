@@ -175,7 +175,9 @@ public sealed class CatalogFunctionSet
             // An aggregate cannot declare a tail (refused at registration), so VarArgsTypeName is always
             // empty here — passed anyway so the row is built the same way as every other kind's.
             Emit(f.SchemaName, f.Name, f.SupportsSpill ? "aggregate_spill" : "aggregate",
-                 Params.DeclaredCount(f.Parameters), f.Result.DataType.Name,
+                 // ⚠ NULL Result = "resolved per call site" (ABI v89); this column is diagnostic, so report
+                 // nothing rather than dereferencing — a throw here fails the whole functions listing.
+                 Params.DeclaredCount(f.Parameters), f.Result?.DataType.Name ?? string.Empty,
                  Params.VarArgsTypeName(f.Parameters));
         }
         return rows;

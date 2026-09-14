@@ -24,23 +24,51 @@ namespace Fabricator.Bridge;
 public sealed class AggregateSession : IAggregateSession
 {
     private readonly IAggregateFunction _fn;
+    private readonly IAggregateBinding _binding;
+    private readonly Field _result;
     private readonly Schema _updateSchema;
+    private readonly Schema _argSchema;
     private readonly ConcurrentDictionary<long, IAggregateState> _states = new();
 
-    public AggregateSession(IAggregateFunction fn)
+    /// <param name="args">
+    /// This call site's constant arguments, or null when the host sent none. ⚠ A session is opened from
+    /// DuckDB's aggregate BIND, once per call site, which is what makes a per-call-site result type possible.
+    /// </param>
+    public AggregateSession(IAggregateFunction fn, ScalarBindArgs? args = null)
     {
         _fn = fn;
-        var fields = new List<Field>(fn.Parameters.FieldsList.Count + 1)
+        _binding = fn.Bind(args ?? new ScalarBindArgs(null, null));
+        // ⚠ Resolved ONCE, here, rather than read per finalize: the binding is the call site's, and asking
+        // it again on every finalize would let a stateful binding answer differently for two vectors of the
+        // same query — a result column whose type changed mid-scan, which the host reads as DATA.
+        _result = _binding.Result;
+        // ⚠⚠ THE ARGUMENT TYPES COME FROM THE BIND'S OWN BATCH WHEN THERE IS ONE, NOT FROM THE DECLARATION.
+        // An ANY-declared parameter (the SQLNULL sentinel) has no type until a call site supplies one, and
+        // the host types the update columns from the SAME resolved types — so building this schema from the
+        // declaration would import a STRUCT argument through a NULL-typed converter. With no bind args (an
+        // older host, or a zero-argument aggregate) the declaration is all there is, and for a concretely
+        // typed aggregate the two are identical anyway.
+        var declared = args?.Values?.Schema.FieldsList is { Count: > 0 } bound
+                       && bound.Count == fn.Parameters.FieldsList.Count
+            ? bound
+            : fn.Parameters.FieldsList;
+        var fields = new List<Field>(declared.Count + 1)
         {
             new Field("state_id", Int64Type.Default, nullable: false),
         };
-        fields.AddRange(fn.Parameters.FieldsList);
+        fields.AddRange(declared);
         _updateSchema = new Schema(fields, null);
+        // ⚠ The ARGUMENT schema the author sees is the resolved one too, so a template/accumulator reading
+        // column types gets what actually arrives rather than the sentinel.
+        _argSchema = new Schema(declared, null);
     }
 
     public Schema UpdateSchema => _updateSchema;
 
-    private IAggregateState StateFor(long id) => _states.GetOrAdd(id, _ => _fn.CreateState());
+    /// <summary>This call site's resolved result field — always concrete, since the binding supplied it.</summary>
+    public Field? ResolvedResult => _result;
+
+    private IAggregateState StateFor(long id) => _states.GetOrAdd(id, _ => _binding.CreateState());
 
     public void Update(RecordBatch idPlusArgs)
     {
@@ -82,7 +110,7 @@ public sealed class AggregateSession : IAggregateSession
         }
         if (single)
         {
-            stateFor(first).Update(new RecordBatch(_fn.Parameters, argCols, rows));
+            stateFor(first).Update(new RecordBatch(_argSchema, argCols, rows));
             return;
         }
 
@@ -104,7 +132,7 @@ public sealed class AggregateSession : IAggregateSession
             {
                 gathered[c] = GatherRows(argCols[c], kv.Value);
             }
-            using var batch = new RecordBatch(_fn.Parameters, gathered, kv.Value.Count);
+            using var batch = new RecordBatch(_argSchema, gathered, kv.Value.Count);
             stateFor(kv.Key).Update(batch);
         }
     }
@@ -128,7 +156,7 @@ public sealed class AggregateSession : IAggregateSession
 
     public IArrowArrayStream Finalize(RecordBatch ids)
     {
-        var resultSchema = new Schema(new[] { _fn.Result }, null);
+        var resultSchema = new Schema(new[] { _result }, null);
         using (ids)
         {
             var idCol = (Int64Array)ids.Column(0);
@@ -138,10 +166,12 @@ public sealed class AggregateSession : IAggregateSession
             {
                 // Absent id => a fresh accumulator => the empty-group value. Do NOT insert it (finalize
                 // must not grow the map), just finalize a throwaway.
-                var state = _states.TryGetValue(idCol.GetValue(i) ?? 0, out var s) ? s : _fn.CreateState();
+                var state = _states.TryGetValue(idCol.GetValue(i) ?? 0, out var s) ? s : _binding.CreateState();
                 values[i] = state.Finalize();
             }
-            var col = BuildResultColumn(_fn.Result.DataType, values);
+            // The binding FIRST: it may already have the column (a type the boxed ladder below cannot
+            // build, or one DuckDB produced), in which case re-deriving it is both lossy and pointless.
+            var col = _binding.FinalizeColumn(values) ?? BuildResultColumn(_result.DataType, values);
             return new InMemoryArrayStream(resultSchema, new[] { new RecordBatch(resultSchema, new[] { col }, rows) });
         }
     }
@@ -158,7 +188,13 @@ public sealed class AggregateSession : IAggregateSession
         }
     }
 
-    public void Close() => _states.Clear();
+    public void Close()
+    {
+        _states.Clear();
+        // ⚠ The binding may own per-call-site resources — a render session, a pinned connection — acquired
+        // where the ambients allowed it. This is the plan-teardown signal (agg_close), and the only one.
+        (_binding as IDisposable)?.Dispose();
+    }
 
     // ---- Spillable mode: state lives as bytes in DuckDB's blob (not in _states); each call rehydrates a
     // transient accumulator, applies, and re-serializes. The serialized-state column is a single BLOB. ----
@@ -167,7 +203,7 @@ public sealed class AggregateSession : IAggregateSession
 
     private IAggregateState LoadOrFresh(BinaryArray states, int i)
     {
-        var s = _fn.CreateState();
+        var s = _binding.CreateState();
         if (!states.IsNull(i))
         {
             s.Load(states.GetBytes(i));
@@ -233,7 +269,7 @@ public sealed class AggregateSession : IAggregateSession
 
     public IArrowArrayStream FinalizeSpill(RecordBatch states)
     {
-        var resultSchema = new Schema(new[] { _fn.Result }, null);
+        var resultSchema = new Schema(new[] { _result }, null);
         using (states)
         {
             var arr = (BinaryArray)states.Column(0);
@@ -243,7 +279,9 @@ public sealed class AggregateSession : IAggregateSession
             {
                 values[i] = LoadOrFresh(arr, i).Finalize(); // NULL row => fresh => empty-group value
             }
-            var col = BuildResultColumn(_fn.Result.DataType, values);
+            // The binding FIRST: it may already have the column (a type the boxed ladder below cannot
+            // build, or one DuckDB produced), in which case re-deriving it is both lossy and pointless.
+            var col = _binding.FinalizeColumn(values) ?? BuildResultColumn(_result.DataType, values);
             return new InMemoryArrayStream(resultSchema, new[] { new RecordBatch(resultSchema, new[] { col }, n) });
         }
     }
@@ -302,9 +340,33 @@ public sealed class AggregateSession : IAggregateSession
                 foreach (var r in rows) { var v = a.GetValue(r); if (v is null) b.AppendNull(); else b.Append(v.Value); }
                 return b.Build();
             }
+            case NullArray:
+                // ⚠ EXPLICIT, because the concatenator below refuses it ("Concatenation for null is not
+                // supported yet") — and a NULL-typed column is ORDINARY here, not exotic: an ANY-declared
+                // parameter handed a bare NULL literal (`fluid_aggregate(tpl, NULL, v)`) is exactly that,
+                // marshalled per row because the ABI sends every declared argument.
+                return new NullArray(rows.Count);
+
             default:
-                throw new NotSupportedException(
-                    $"fabricator: custom aggregate argument type {src.Data.DataType} is not supported");
+            {
+                // ⚠⚠ TYPE-AGNOSTIC FALLBACK: slice each wanted row and concatenate. Slower than the typed
+                // cases above (one slice per row, so reach for a typed case if a hot argument shows up here)
+                // but correct for EVERY Arrow type — STRUCT, LIST, temporal, NULL, extension. That matters
+                // because an ANY-declared parameter's type is whatever the CALL SITE passed, so no fixed
+                // list can cover it: `fluid_aggregate(tpl, NULL, struct_pack(...))` sends a STRUCT and a
+                // NULL-typed constant through here, and it used to fail with "type ... is not supported"
+                // the moment one update batch spanned two groups.
+                if (rows.Count == 0)
+                {
+                    return ArrowArrayFactory.BuildArray(src.Data.Slice(0, 0));
+                }
+                var parts = new List<IArrowArray>(rows.Count);
+                foreach (var r in rows)
+                {
+                    parts.Add(ArrowArrayFactory.BuildArray(src.Data.Slice(r, 1)));
+                }
+                return ArrowArrayConcatenator.Concatenate(parts);
+            }
         }
     }
 

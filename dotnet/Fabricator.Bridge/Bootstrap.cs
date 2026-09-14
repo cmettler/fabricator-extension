@@ -91,7 +91,7 @@ public static unsafe class Bootstrap
                             () => OneRowStream(probeSchema, Interlocked.Increment(ref _lazyOpens) - 1),
                             probeSchema);
 
-        vtable->AbiVersion = 88;
+        vtable->AbiVersion = 89;
         vtable->OpenCatalog = &OpenCatalog;
         vtable->CloseCatalog = &CloseCatalog;
         vtable->ExecuteQuery = &ExecuteQuery;
@@ -1982,7 +1982,13 @@ public static unsafe class Bootstrap
                 stringOrder.Append("0");
                 body.Append(string.Empty);
                 paramCount.Append(fn.Parameters.FieldsList.Count);
-                returnType.Append(fn.Result.DataType.Name);
+                // ⚠ NULL = "resolved per call site" (ABI v89). This column is DIAGNOSTIC — the C++ loop
+                // reads the precise type from get_function_return_schema — so an unresolved one says so
+                // rather than dereferencing. ⚠⚠ A throw HERE drops EVERY global function, since one
+                // exception fails the whole list_global_functions crossing: that is how the v80 Field? change
+                // made `hilbert_index does not exist` appear three layers from its cause, and this is the
+                // same trap one kind over.
+                returnType.Append(fn.Result?.DataType.Name ?? string.Empty);
                 rows++;
             }
             // SQL-GENERATING table functions (v68): registered with bind_replace only — the call is rewritten
@@ -2168,21 +2174,50 @@ public static unsafe class Bootstrap
         new(new[] { new Field("slot", Int64Type.Default, false), new Field("source", BinaryType.Default, true) }, null);
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static int AggOpen(nint handle, byte* schema, byte* func, nint* outSession, byte** err)
+    private static int AggOpen(nint handle, byte* schema, byte* func, CArrowArrayStream* args, byte* argConstant,
+                               nint opener, long session, long txn, CArrowSchema* outResult, nint* outSession,
+                               byte** err)
     {
         try
         {
-            if (outSession is null)
+            // ⚠ ESTABLISHED AND RESTORED here, not assigned by a preceding set_active_opener: an aggregate
+            // binds wherever it is CALLED, so overwriting an outer operation's context would leave that
+            // operation resolving one that is gone. Same rule, same mechanism as scalarfn_bind — and without
+            // it a bind that reaches the host (to resolve a result type, say) dereferences whatever the last
+            // crossing left: MEASURED as `host_connection_open failed: Attempted to dereference unique_ptr
+            // that is NULL`, on the SECOND aggregate in one statement, the first having worked by luck.
+            using var scope = new CallScope(opener, session, txn);
+            if (outSession is null || outResult is null)
             {
                 return FabricatorStatus.InvalidArgument;
             }
+            // `args` (nullable) is a 1-row stream of the call's arguments; `argConstant` says which slots hold
+            // a REAL value ('1') rather than a NULL placeholder for a runtime expression. Same pair, same
+            // meaning and same partiality as scalarfn_bind's — see ScalarBindArgs.
+            RecordBatch? argsBatch = null;
+            if (args is not null)
+            {
+                using var argStream = CArrowArrayStreamImporter.ImportArrayStream(args); // we own it
+                argsBatch = argStream.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult();
+            }
+            var mask = Marshal.PtrToStringUTF8((nint)argConstant) ?? string.Empty;
+            var constant = new bool[argsBatch?.ColumnCount ?? 0];
+            for (int i = 0; i < constant.Length && i < mask.Length; i++)
+            {
+                constant[i] = mask[i] == '1';
+            }
+            var bindArgs = new ScalarBindArgs(argsBatch, constant);
             var f = Marshal.PtrToStringUTF8((nint)func) ?? string.Empty;
             // handle == 0 => a connection-free GLOBAL aggregate: open a session from the global registry by name.
-            var session = handle == 0
-                ? GlobalFunctions.ResolveAggregate(f)
+            var aggSession = handle == 0
+                ? GlobalFunctions.ResolveAggregate(f, bindArgs)
                 : (Handles.Resolve<IProviderCatalog>(handle) ?? ProviderRegistry.Active.OpenCatalog(string.Empty, string.Empty))
-                    .AggOpen(Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty, f);
-            *outSession = Handles.Alloc(session);
+                    .AggOpen(Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty, f, bindArgs);
+            // ⚠ A session that resolved nothing reports the Arrow NULL sentinel, which the host reads as
+            // "the declared type stands" — so the default path costs one exported schema and no decision.
+            var resultField = aggSession.ResolvedResult ?? new Field("result", NullType.Default, nullable: true);
+            CArrowSchemaExporter.ExportSchema(new Schema(new[] { resultField }, null), outResult);
+            *outSession = Handles.Alloc(aggSession);
             return FabricatorStatus.Ok;
         }
         catch (Exception ex)

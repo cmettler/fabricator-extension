@@ -586,6 +586,20 @@ public interface IProviderCatalog : IDisposable
         throw NotHosted("aggregate", schemaName, functionName);
 
     /// <summary>
+    /// As <see cref="AggOpen(string,string)"/>, plus THIS CALL SITE's constant arguments — which is what lets
+    /// a catalog aggregate resolve its result type per call (<see cref="IAggregateFunction.Bind"/>).
+    /// </summary>
+    /// <remarks>
+    /// ⚠ The default DISCARDS the arguments and delegates, so a provider that resolves nothing per call site
+    /// needs no change. Chaining is safe HERE — unlike the query-parameter case, where a default that dropped
+    /// its bag would have run the statement unparameterised — because an aggregate that declares a fixed
+    /// <see cref="IAggregateFunction.Result"/> has nothing to resolve, and one that does not gets a binding
+    /// that THROWS by name (<see cref="StaticAggregateBinding"/>) rather than a wrong type.
+    /// </remarks>
+    IAggregateSession AggOpen(string schemaName, string functionName, ScalarBindArgs args) =>
+        AggOpen(schemaName, functionName);
+
+    /// <summary>
     /// Creates a table whose columns are described by <paramref name="columns"/>
     /// (a non-nullable field maps to NOT NULL). The backend maps Arrow types to
     /// provider types and runs the provider CREATE TABLE. When

@@ -446,8 +446,25 @@ typedef struct FabricatorVTable {
 	// Open a managed aggregate session for (schema, func). On success *out_session
 	// receives an opaque handle (a fresh Dictionary<id, accumulator>). Closed via
 	// agg_close when the bound plan is torn down.
-	int32_t (*agg_open)(FabricatorHandle handle, const char *schema, const char *func, FabricatorHandle *out_session,
-	                    char **err);
+	//
+	// v89: it is ALSO the aggregate's BIND. `args` (nullable) is a 1-row stream of the
+	// call's arguments and `arg_constant` a mask ('1' = a folded constant whose value is
+	// real, '0' = a runtime expression whose slot holds a NULL placeholder) — the same
+	// pair scalarfn_bind takes. `out_result` is filled with the RESOLVED result field;
+	// an Arrow NULL type there is the UNRESOLVED sentinel, meaning "my declared type
+	// stands", so a fixed-type aggregate costs nothing.
+	//
+	// A session is opened ONCE PER CALL SITE (DuckDB's aggregate bind), which is what
+	// makes a per-call-site result type expressible at all.
+	//
+	// ⚠ It carries the CALL CONTEXT (opener / session / txn) and the managed side ESTABLISHES AND RESTORES
+	// it, exactly as scalarfn_bind does — an aggregate binds wherever it is CALLED, so the host must not
+	// assign the ambients around it. Without this a bind that touches the host (to resolve a type, say)
+	// dereferences whatever context the last crossing left.
+	int32_t (*agg_open)(FabricatorHandle handle, const char *schema, const char *func,
+	                    struct ArrowArrayStream *args, const char *arg_constant, FabricatorHandle opener,
+	                    int64_t session, int64_t txn, struct ArrowSchema *out_result,
+	                    FabricatorHandle *out_session, char **err);
 
 	// Update: `batch` is an N-row Arrow array whose column 0 is an int64 "state_id"
 	// and columns 1.. are the argument values (in param order). The managed side
@@ -1326,7 +1343,7 @@ typedef struct FabricatorHostServices {
 // state blob is this many bytes + a 4-byte length prefix). Serialize() must fit within it.
 #define FABRICATOR_AGG_SPILL_CAP 1024
 
-#define FABRICATOR_ABI_VERSION 88
+#define FABRICATOR_ABI_VERSION 89
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(FabricatorVTable) as seen

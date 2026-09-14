@@ -119,8 +119,11 @@ public unsafe struct FabricatorVTable
     // (inout_open / inout_push / inout_finish / inout_abort were removed at ABI v31 — every `_each` form now
     //  runs on the streaming exchange: inout_bind / inout_exchange_open / inout_bind_close below.)
 
-    // int32 agg_open(void* handle, const char* schema, const char* func, void** out_session, char** err)
-    public delegate* unmanaged[Cdecl]<nint, byte*, byte*, nint*, byte**, int> AggOpen;
+    // v89: int32 agg_open(void* handle, const char* schema, const char* func, ArrowArrayStream* args,
+    //                      const char* arg_constant, ArrowSchema* out_result, void** out_session, char** err)
+    // It is the aggregate's BIND as well as its session open — one session per CALL SITE, which is what lets
+    // the result type be resolved from the call's constant arguments.
+    public delegate* unmanaged[Cdecl]<nint, byte*, byte*, CArrowArrayStream*, byte*, nint, long, long, CArrowSchema*, nint*, byte**, int> AggOpen;
 
     // int32 agg_update(void* session, ArrowArray* batch, char** err)  -- batch = [int64 id ++ params]
     public delegate* unmanaged[Cdecl]<nint, CArrowArray*, byte**, int> AggUpdate;

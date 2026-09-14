@@ -241,26 +241,9 @@ internal sealed class FluidScalarFunction : IScalarFunction
                 + schema.FieldsList.Count + ".");
         }
         return (new Field("result", schema.FieldsList[0].DataType, nullable: true),
-                DescribeTypeName(probe, expression));
+                FluidScalarBinding.DescribeTypeName(probe, expression, FunctionName));
     }
 
-    /// <summary>DuckDB's own name for the bind expression's type.</summary>
-    private static string DescribeTypeName(FluidRenderSession probe, string expression)
-    {
-        using var stream = probe.Query(
-            "SELECT column_type FROM (DESCRIBE " + FluidScalarBinding.WrapBind(expression) + ")");
-        var batch = stream.ReadNextRecordBatchAsync().GetAwaiter().GetResult();
-        using (batch)
-        {
-            var name = batch is { Length: > 0 } ? (batch.Column(0) as StringArray)?.GetString(0) : null;
-            if (string.IsNullOrWhiteSpace(name))
-            {
-                throw new InvalidOperationException(
-                    FunctionName + ": could not determine the result type of the bind render.");
-            }
-            return name!;
-        }
-    }
 }
 
 /// <summary>One bound <c>fluid_scalar</c> call site: the resolved result type plus the constants every chunk
@@ -297,6 +280,29 @@ internal sealed class FluidScalarBinding : IScalarFunctionBinding
     /// being accepted and described as whatever shape the engine reports for it.
     /// </remarks>
     internal static string WrapBind(string statement) => $"SELECT * FROM ({statement}) LIMIT 0";
+
+    /// <summary>DuckDB's own NAME for the bind render's type — the text the execute-time cast splices.</summary>
+    /// <remarks>
+    /// ⚠ Shared by <c>fluid_scalar</c> and <c>fluid_aggregate</c>, which resolve their result type the same
+    /// way. It re-parses in a CAST by construction because DuckDB produced it (<c>DESCRIBE</c>); it is never
+    /// the template's own text, so a template declaring <c>NULL::DECIMAL(9,2)</c> gets that scale back rather
+    /// than whatever it happened to write.
+    /// </remarks>
+    internal static string DescribeTypeName(FluidRenderSession probe, string statement, string caller)
+    {
+        using var stream = probe.Query("SELECT column_type FROM (DESCRIBE " + WrapBind(statement) + ")");
+        var batch = stream.ReadNextRecordBatchAsync().GetAwaiter().GetResult();
+        using (batch)
+        {
+            var name = batch is { Length: > 0 } ? (batch.Column(0) as StringArray)?.GetString(0) : null;
+            if (string.IsNullOrWhiteSpace(name))
+            {
+                throw new InvalidOperationException(
+                    caller + ": could not determine the result type of the bind render.");
+            }
+            return name!;
+        }
+    }
 
     /// <summary>Wraps the per-chunk render: casts the template's single column to the declared type.</summary>
     /// <remarks>

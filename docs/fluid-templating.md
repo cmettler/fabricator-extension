@@ -4855,3 +4855,109 @@ rewritten to say that.
 Gate: `verify_plugin_fluid` 873 → **905** (§39), hermetic floor 9229 → **9261**. Four mutants: A (OR
 flattened) dies after 879, B (the Bridge's value reader) after 883, D (never declare the variables) after
 884; C (claim filter pushdown) SURVIVES, for the reason in §42.9.
+
+---
+
+## 43. ✅ AS BUILT (2026-09-14) — `fluid_aggregate`: a template rendered once per GROUP, typing itself
+
+`fluid_aggregate(template, params, value)` — the group's rows reach the template as `rows`, and the
+`is_bind` render declares the result type.
+
+```sql
+SELECT g, fluid_aggregate(
+  '{% if is_bind %}select NULL::VARCHAR
+   {% else %}{% capture s %}{% for r in rows %}{{ r.a }}|{{ r.b }};{% endfor %}{% endcapture %}
+   {{ s | md5 }}{% endif %}',
+  NULL, struct_pack(a := a, b := b) ORDER BY a) AS h
+FROM t GROUP BY g;
+```
+
+Needed **ABI v89** — see [abi-history.md](abi-history.md) §v89 for the host half, which is most of the work.
+
+### 43.1 ⚠⚠ IT RENDERS TEXT WHERE `fluid_scalar` RENDERS SQL, AND THAT IS FORCED
+
+A scalar's rows live in DuckDB, so its template emits an expression DuckDB evaluates over them. **An
+aggregate's rows live in the accumulator** — there is nothing for DuckDB to evaluate them *with*. So the
+reduction happens in Liquid and the render IS the value; the declared type is applied afterwards by a CAST.
+
+A template that wants SQL can still have it (`{% query %}` / `{% exec %}` work in any render) but that is one
+statement per GROUP, so it is the author's explicit choice rather than the function's shape.
+
+### 43.2 The type really does come from the template
+
+MEASURED, one function, three call sites:
+
+| template declares | `typeof(...)` |
+|---|---|
+| `select NULL::BIGINT` | `BIGINT` |
+| `select NULL::DECIMAL(9,2)` | `DECIMAL(9,2)` — scale intact |
+| `select NULL::STRUCT(n INTEGER, s VARCHAR)` | `STRUCT(n INTEGER, s VARCHAR)`, value `{'n': 9, 's': x}` |
+
+No type ladder anywhere: the `is_bind` render is a SELECT DuckDB binds, and the type name the execute-time
+cast splices comes from `DESCRIBE` — DuckDB rendering its own type, so it re-parses by construction. The
+helper is literally `fluid_scalar`'s (`FluidScalarBinding.DescribeTypeName`, shared rather than copied).
+
+⚠ The cast is **one statement per FINALIZE CALL** — a whole vector of groups, not one per group — and is
+skipped entirely when the declared type is VARCHAR, which is the common case. So the ordinary hash template
+runs with no SQL at all.
+
+### 43.3 ⚠⚠ ORDER IS THE CALLER'S, AND FOR HASHING THAT IS THE WHOLE USABILITY QUESTION
+
+An aggregate is unordered by definition, so a hash over `rows` repeats between runs only if the caller says
+`fluid_aggregate(tpl, NULL, v ORDER BY k)`. **MEASURED that DuckDB's aggregate `ORDER BY` reaches `Update`
+in order** — `ORDER BY a DESC` arrives `7,4,1` where ASC arrives `1,4,7` — which is what makes the feature
+usable for the md5 case at all. Without it, parallel aggregation and combine order decide the value, and it
+changes between runs with nothing failing. §40.4 is the gate row.
+
+### 43.4 It works with GROUP BY *and* windows
+
+The user's second question. MEASURED: `GROUP BY`, `OVER (PARTITION BY g)`, and a moving frame
+(`ROWS BETWEEN 1 PRECEDING AND CURRENT ROW` reports 1, 2, 2, 2). The moving frame also pins that the binding
+survives many finalizes and that `rows` is REBOUND per group — a value bound once would report the whole
+partition every time.
+
+⚠ Both of those paths go through the host's multi-group GATHER, which is where two type ladders had to be
+retired (§v89). Before that, a STRUCT argument worked *ungrouped* and failed the moment a chunk held two
+groups — which is the shape almost every real query has.
+
+### 43.5 ⚠⚠ ONE per-row argument, and it is DuckDB's limit rather than a choice
+
+A variadic tail is REFUSED on aggregates alone (`FabricatorRefuseVarArgs`): the update crossing sends a bare
+`ArrowArray` with no schema and the managed side rebuilds it from the DECLARATION, so there is no
+per-call-site width — and `agg_open` carries no arity. Lifting it is an ABI question and a live OOB trap in
+`BuildUpdateBatch` (it loops the actual arity while indexing the declared vector).
+
+**So several columns go in ONE `struct_pack(a := a, b := b)`, and the template reads `r.a`, `r.b`.** That is
+the user's own suggestion and it is the right shape: MEASURED, a STRUCT parameter registers as
+`STRUCT(a BIGINT, b VARCHAR)` and marshals correctly in both directions.
+
+⚠ The declared STRUCT is a CONCRETE type, so a given call site is tied to one row shape —
+`fluid_aggregate(tpl, NULL, t)` over a whole row fails to bind when `t`'s shape differs. The declaration is
+`ANY`, so each call site's shape is resolved at bind; what cannot vary is *within* one call site.
+
+### 43.6 Smaller things, each measured
+
+- **An EMPTY render is NULL**, which is also what a group with nothing to say gets. A group that was never
+  updated still renders, with an empty `rows` — DuckDB finalizes states it never updated, and a template may
+  legitimately have something to say about an empty group.
+- **The accumulator holds the group's rows**, so this is NOT spillable and a high-cardinality `GROUP BY`
+  holds every group's rows in managed memory. Inherent: a reduction expressed in Liquid cannot be folded
+  incrementally, because the template runs once and only at the end.
+- **The template must be a CONSTANT** — the result type is part of the PLAN, so it cannot depend on a row
+  value. Refused by name rather than resolved from whichever row came first.
+- **The values go through `FluidValueModel.ReadCell`**, this plugin's value model, so a DATE in `rows`
+  renders like a DATE in `params` rather than as the previous day east of UTC.
+- ⚠ **A lock guards the render**, and it is required rather than defensive: one binding serves the whole call
+  site, a `TemplateContext` is not thread-safe and a DuckDB connection is single-threaded, while DuckDB may
+  finalize different vectors on different threads. UPDATE deliberately touches none of it, so the parallel
+  half of aggregation stays parallel.
+
+### 43.7 ⚠ What it buys over what already worked — state it, or the function looks redundant
+
+`md5(string_agg(fluid_render(...), ';' ORDER BY a))` already does the headline example, measured, in both
+`GROUP BY` and window form. What `fluid_aggregate` adds is that the template sees the **whole group at
+once** — so it can branch on the group, emit something that is not a concatenation, and **declare a result
+type that is not VARCHAR**. Where the reduction really is "render per row, then join", the existing spelling
+is cheaper and should be preferred.
+
+Gate: `verify_plugin_fluid` 905 → **944** (§40), hermetic floor 9261 → **9300**.

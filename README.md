@@ -1444,10 +1444,10 @@ A plugin's global functions are registered while the extension loads, so a plugi
 available the **next time** DuckDB loads fabricator — not in the running session. See
 [docs/plugin-system.md](docs/plugin-system.md).
 
-#### Templates — `fluid_render(...)`, `fluid_replacement_query(...)`, `fluid_query(...)`, `fluid_scalar(...)`, `fluid_query_batch(...)`, `fluid_query_inout(...)` and `fluid_query_lateral(...)`
+#### Templates — `fluid_render(...)`, `fluid_replacement_query(...)`, `fluid_query(...)`, `fluid_scalar(...)`, `fluid_aggregate(...)`, `fluid_query_batch(...)`, `fluid_query_inout(...)` and `fluid_query_lateral(...)`
 
 The **Fluid / Liquid template engine** is **built in** — it ships inside the extension and needs no
-configuration. It contributes seven global functions, all taking a params bag that is a DuckDB `STRUCT`
+configuration. It contributes eight global functions, all taking a params bag that is a DuckDB `STRUCT`
 (preferred — typed, no quoting), a `MAP`, a JSON string, a `LIST`, or a plain scalar.
 
 **`fluid_render(template, params)`** renders a template to **text**:
@@ -2256,6 +2256,50 @@ The included template shares the caller's variables, and it may include others i
 The file is read the same way `query()` runs SQL — on its own connection — so a location authorised by a
 **persistent** secret works, while one authorised by a `CREATE SECRET` of the calling session does not. A
 template above 1 MiB is refused, and a missing include reports every path it asked for.
+
+**`fluid_aggregate(template, params, value)`** renders a template **once per group**, with that group's rows
+in hand, reducing them to **one value whose type the template declares**:
+
+```sql
+CREATE TABLE t AS SELECT i % 3 AS g, i::BIGINT AS a, 'v' || i AS b FROM range(9) r(i);
+
+SELECT g, fluid_aggregate(
+  '{% if is_bind %}select NULL::VARCHAR
+   {% else %}{% capture s %}{% for r in rows %}{{ r.a }}|{{ r.b }};{% endfor %}{% endcapture %}{{ s | md5 }}{% endif %}',
+  NULL, struct_pack(a := a, b := b) ORDER BY a) AS h
+FROM t GROUP BY g ORDER BY g;
+-- 0 | 79172c4e532577b57f10d3513d40fe6a
+-- 1 | 151b6c04cb18b03a93142cf2fd9bdf21
+-- 2 | bbcbd31a7317cc77aa53255f9f088604
+```
+
+The group's rows are `rows`; `template` and `params` are bind-time constants. It works under **`GROUP BY` and
+under `OVER (...)`**, including a moving frame:
+
+```sql
+SELECT a, fluid_aggregate('{% if is_bind %}select NULL::BIGINT{% else %}{{ rows.size }}{% endif %}', NULL, a)
+  OVER (ORDER BY a ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS n FROM t ORDER BY a;
+-- 1, 2, 2, 2, …
+```
+
+> ⚠⚠ **An aggregate is unordered, so write `ORDER BY` if the result depends on row order** — as a hash does.
+> `fluid_aggregate(tpl, NULL, v ORDER BY k)` reaches the template in that order; without it, parallel
+> aggregation decides, and the value changes between runs with nothing failing.
+
+Like `fluid_scalar`, the **`is_bind` render declares the result type** — and it is a real DuckDB type, so
+`DECIMAL(9,2)` keeps its scale and a `STRUCT(n INTEGER, s VARCHAR)` comes back as a struct, not text. Unlike
+`fluid_scalar` it renders **text** rather than SQL, because an aggregate's rows live in the extension rather
+than in DuckDB — the reduction happens in Liquid, and the declared type is applied by a cast afterwards.
+
+> ⚠ **One per-row argument.** DuckDB does not allow a variadic aggregate here, so pass several columns as one
+> `struct_pack(a := a, b := b)` and read `r.a`, `r.b` in the template.
+>
+> ⚠ **It holds each group's rows in memory** (a Liquid reduction cannot be folded incrementally), so it does
+> not spill — think before using it on a very high-cardinality `GROUP BY`.
+>
+> ⚠ **Where the reduction is really "render per row, then join", prefer what already works:**
+> `md5(string_agg(fluid_render(...), ';' ORDER BY a))` is cheaper. `fluid_aggregate` earns its keep when the
+> template needs the whole group at once, or a result type that is not `VARCHAR`.
 
 **`fluid_query_batch(template, <input> [, params := …] [, batchsize := …])` renders a template WITH A
 RELATION IN HAND** and runs the statement it produces. Where `fluid_replacement_query` renders from constants at bind

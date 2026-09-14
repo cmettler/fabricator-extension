@@ -414,7 +414,12 @@ void GetFunctionOutputSchema(FabricatorHandle handle, const std::string &schema,
 // -----------------------------------------------------------------------------
 
 // Open a managed aggregate session for `schema.func`. Returns an opaque session handle.
-FabricatorHandle AggOpen(FabricatorHandle handle, const std::string &schema, const std::string &func);
+//! Opens an aggregate session AND binds the call site (ABI v89): `args` (nullable) is a 1-row stream of the
+//! call's arguments, `arg_constant` the folded-constant mask, and `out_result` receives the RESOLVED result
+//! field — an Arrow NULL type there means "the declared type stands".
+FabricatorHandle AggOpen(FabricatorHandle handle, const std::string &schema, const std::string &func,
+                         ArrowArrayStream *args, const std::string &arg_constant, const CallContext &call,
+                         ArrowSchema &out_result);
 
 // Update: `batch` = [int64 state_id ++ argument columns], N rows (consumed/released by
 // the managed side, which groups by id and folds each group into its accumulator).

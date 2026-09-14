@@ -68,6 +68,13 @@ public sealed class FluidPluginBackend : IProvider
     public IEnumerable<IInOutFunction> GlobalInOutFunctions =>
         new IInOutFunction[] { new FluidQueryInOutFunction() };
 
+    // ⚠ The template renders ONCE PER GROUP with that group's rows in hand, reducing them to ONE value whose
+    // TYPE it declares itself (ABI v89 — an aggregate's session is opened from its BIND, once per call site).
+    // Unlike fluid_scalar it renders TEXT rather than SQL, and that is forced: an aggregate's rows live in the
+    // accumulator, so there is nothing for DuckDB to evaluate them with.
+    public IEnumerable<IAggregateFunction> GlobalAggregateFunctions =>
+        new IAggregateFunction[] { new FluidAggregateFunction() };
+
     // ⚠ The CORRELATED sibling of the collector, and a different operator rather than a mode of it: `kind` is
     // fixed at registration, so one name could not switch between them by parameter. It is PARALLEL, which is
     // what it buys and also what costs it the collector's cross-chunk state.
