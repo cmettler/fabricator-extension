@@ -237,8 +237,23 @@ internal static class FluidHostQuery
     /// <summary>
     /// Binds <paramref name="name"/> in Liquid as a LAZY read of the SQL object of that name on the render's
     /// connection — the way an implicit relation (<c>input_table</c>) becomes readable BOTH as SQL and as a
-    /// Fluid value without being copied into either.
+    /// Fluid value.
     /// </summary>
+    /// <remarks>
+    /// ⚠⚠ <b>FORCING IT IS A FULL COPY, and this remark used to claim the opposite</b> ("without being copied
+    /// into either"). It is not copied into SQL — the relation is already there — but the Fluid side runs
+    /// <c>SELECT * FROM &lt;name&gt;</c> and materialises EVERY CELL into a <see cref="EagerStruct"/>, which
+    /// has to be eager because the batch is disposed as the result is consumed. So a template that touches
+    /// the relation in Liquid pays a round trip plus one <c>FluidValue</c> per cell, capped at
+    /// <see cref="MaxRows"/>. The laziness means an untouched relation costs NOTHING; it does not mean a
+    /// touched one is cheap.
+    /// </remarks>
+    /// <remarks>
+    /// ⚠ <c>fluid_aggregate</c> deliberately does NOT use this: its rows are retained Arrow that it owns, so
+    /// it binds wrappers over the live arrays (<see cref="ArrowStruct"/>) instead — no query, and no cell
+    /// copied for a STRUCT row. The call-scoped surfaces could do the same, since their chunk is alive for
+    /// the whole call; see docs/fluid-templating.md §43.8.1a.
+    /// </remarks>
     /// <remarks>
     /// ⚠⚠ <b>CALL IT BEFORE EVERY RENDER THAT REPOINTS THE OBJECT, never once per session.</b> The value
     /// CACHES its read, which is what keeps one render consistent — and is exactly why a value carried
