@@ -344,10 +344,11 @@ internal sealed class FluidScalarBinding : IScalarFunctionBinding
         // order that reads correctly.
         var ctx = FluidRelationInput.NewContext(FluidScalarFunction.FunctionName, session, _parameters,
                                                 isBind: false, paramsRows: _paramsRows);
-        var staged = StageArgs(session, args);
+        // ⚠ NOT disposed: its columns are the framework's chunk, borrowed for this call.
+        var relation = BuildArgsRelation(args);
+        var staged = FluidRelationInput.StageLive(session, ctx, FluidRelationInput.InputTable, relation);
         try
         {
-            FluidHostQuery.BindLazyRelation(ctx, FluidRelationInput.InputTable);
             var expression = FluidEngine.RenderOn(FluidScalarFunction.FunctionName, _template, ctx);
             if (string.IsNullOrWhiteSpace(expression))
             {
@@ -364,14 +365,14 @@ internal sealed class FluidScalarBinding : IScalarFunctionBinding
         }
     }
 
-    /// <summary>Stages this chunk's arguments as <c>input_table</c>, row number first.</summary>
+    /// <summary>Builds this chunk's arguments as the relation <c>input_table</c> exposes.</summary>
     /// <remarks>
     /// ⚠ Built from THIS batch's columns, so the argument types are the post-cast ones DuckDB actually
     /// delivers rather than the placeholder shapes the bind saw. The first two columns (template, params) are
     /// dropped: they are constants the template already has, and carrying them would make <c>arg_0</c> mean
     /// the template.
     /// </remarks>
-    private string StageArgs(FluidRenderSession session, RecordBatch args)
+    private static RecordBatch BuildArgsRelation(RecordBatch args)
     {
         var fields = new List<Field>();
         var columns = new List<IArrowArray>();
@@ -395,12 +396,7 @@ internal sealed class FluidScalarBinding : IScalarFunctionBinding
         }
         // ⚠ BORROWED, like every other RegisterRows caller: the argument columns belong to the framework and
         // are neither copied nor disposed here, which is why the token is released in the caller's finally.
-        var batch = new RecordBatch(new Schema(fields, metadata: null), columns, args.Length);
-        var token = session.RegisterRows(batch);
-        session.ExecuteNonQuery(
-            $"CREATE OR REPLACE TEMP TABLE {DuckSql.QuoteIdent(FluidRelationInput.InputTable)} AS "
-            + $"SELECT * FROM fabricator_scan({DuckSql.Literal(token)})");
-        return token;
+        return new RecordBatch(new Schema(fields, metadata: null), columns, args.Length);
     }
 
     /// <summary>Drains the one result column, checking it is the shape this call site promised.</summary>

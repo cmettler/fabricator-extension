@@ -5029,9 +5029,10 @@ nothing"*, then *"i thought we have some factories to work around this"* — and
   the registration must outlive every statement that reads it. `StagedRows` is that scope (`using`), and
   releasing early is mutation-tested — it dies at the first row that reads `rows`.
 
-⇒ **the four sibling surfaces could plausibly drop their copies too**, and this is the evidence for it. Not
-done here: `fluid_query_batch` genuinely needs a table (it row-numbers the input and slices it by range), and
-changing four surfaces is not a change to smuggle into an aggregate's feature.
+⇒ **the four sibling surfaces could plausibly drop their copies too**, and this is the evidence for it.
+**✅ TAKEN for the three call-scoped ones — see §44**, which also records why `fluid_query_batch` must keep
+both copies (its chunks are borrowed and freed, and `__fab_seq` needs a materialized relation) and why the
+Liquid side turned out to be the bigger half.
 
 #### 43.8.1a ⚠ What converting the siblings would and would NOT cost — and I had one of them backwards
 
@@ -5104,3 +5105,71 @@ inside `fluid_aggregate` is now in the same class, while keeping the whole-group
 Gate: `verify_plugin_fluid` 946 → **981** (§40.10), hermetic floor 9302 → **9337**. Four mutants, each killed
 at its own point: no bind-time staging (947), stale group rows (955), no `UNNEST` (948), token released
 before the statement (947).
+
+## 44. ✅ AS BUILT (2026-09-14) — the call-scoped surfaces stage a VIEW and read LIVE Arrow
+
+§43.8.1a's follow-up, taken. `fluid_scalar`, `fluid_query_lateral` and `fluid_query_inout` no longer copy
+their input twice: the relation is a **view over the registered batch** instead of a materialized temp
+table, and the Liquid `input_table` reads **that same batch** instead of re-querying DuckDB.
+
+**User-directed** (*"we have the rows in memory as arrow/recordbatch anyway"* … *"the idea of arrow is to
+avoid copying data.. analyse all fluid functions where you unnecessarily duplicate data"*). One shared
+helper, `FluidRelationInput.StageLive`, so the rule exists ONCE rather than in three copies.
+
+### 44.1 What each surface was paying, and what the collector is NOT
+
+| surface | staged | Liquid `input_table` | converted |
+|---|---|---|---|
+| `fluid_scalar` | chunk → temp table | re-query + eager per-cell copy | **yes** |
+| `fluid_query_lateral` | chunk + row id → temp table | same | **yes** |
+| `fluid_query_inout` | chunk → temp table | same | **yes** |
+| `fluid_query_batch` | chunk → `__fab_input` | reads the staged table | **no — and it must not be** |
+| `fluid_query` (table fn) | tail ARGS → temp table | same | no: one row of constants |
+
+**⚠⚠ THE COLLECTOR IS THE ONE THAT MUST KEEP BOTH, and the reason is not performance.** Its chunks are
+BORROWED and freed as they are consumed, so the data has to leave managed memory — the copy into
+`__fab_input` IS that move, not a duplicate of it — and `__fab_seq` row numbering plus exact `batchsize`
+range slicing need a materialized relation. Its `input_table` was already a view over a range of it.
+
+### 44.2 ⚠⚠ The release point is the whole difficulty, and it differs per surface
+
+The view holds the TOKEN, not the data, so the registration must outlive every statement that reads it.
+That is a lifetime the temp-table form did not have — it could release immediately, because the copy was
+already made.
+
+- **`fluid_scalar` needed NOTHING**: it already released in a `finally` after the statement, because its
+  staged batch borrows the framework's columns. The conversion there is genuinely a one-word change plus
+  returning the batch.
+- **`fluid_query_lateral`** released eagerly inside its staging helper; the release moved to a `finally`
+  around `Call`, which is safe because that method drains its result stream before returning.
+- **⚠⚠ `fluid_query_inout` needed a `finally` around a `yield return` loop**, because it hands batches to
+  the consumer lazily AND the consumer may ABANDON the iteration — a `LIMIT` above a streaming in-out is a
+  recorded path (limitation 1.25). Releasing after the loop would leak a named source per chunk on that
+  path; C# allows `yield return` inside a `try`/`finally`, which is what makes the correct shape available.
+
+### 44.3 Measured, same data, identical answers
+
+200 000 rows for the scalar and in-out, 100 000 correlated values for the lateral. ⚠ Only LIKE-FOR-LIKE
+slots are compared: within one script the first query of each kind pays plan warm-up, which is why the
+lateral's own sql-vs-liquid pair must not be read against each other.
+
+| | old | new |
+|---|---|---|
+| scalar, SQL-only | 0.098 / 0.091 s | 0.085 / 0.090 s |
+| scalar, touches `input_table` in Liquid | 0.241 / 0.286 s | **0.117 / 0.120 s** (~2.2×) |
+| lateral, touches it in Liquid | 0.086 / 0.093 s | **0.033 s** (~2.7×) |
+| in-out, touches it in Liquid | 0.402 / 0.262 s | **0.110 / 0.112 s** (~2.4–3.6×) |
+
+⇒ **the Liquid side was the bigger half by far**, as §43.8.1a predicted: removing the round trip and the
+per-cell `EagerStruct` copy beats removing the Arrow→DuckDB staging copy. The SQL-only rows move by ~5-15%.
+
+### 44.4 ⚠ It adds no assertions, and the mutant is what establishes coverage
+
+The change is behaviour-neutral by construction, so there is nothing new to assert about an ANSWER — the
+claim is that both tiers are IDENTICAL (hermetic **76/76 — 9337**, unchanged). What needed covering is the
+new LIFETIME, and it already is: a mutant releasing the token eagerly — exactly what the temp-table form
+could afford — dies at an EXISTING row, `verify_plugin_fluid` line 3178 after 476 assertions.
+
+⚠ A second property now holds that did not before and is gated on the aggregate rather than here: the
+Liquid value and the SQL relation are the SAME batch, so they cannot disagree. `BindLazyRelation` re-queried
+DuckDB and could in principle have answered about something else.

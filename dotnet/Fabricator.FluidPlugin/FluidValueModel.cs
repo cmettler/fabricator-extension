@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // See LICENSE in the project root for license information.
 
+using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using Apache.Arrow;
@@ -277,6 +279,37 @@ internal static class FluidValueModel
     /// which matters more than usual because the Fluid pin is a PRERELEASE: an internal null-handling branch
     /// is exactly the kind of thing that moves between betas, and it would move SILENTLY.</para>
     /// </remarks>
+    /// <summary>The rows of a LIVE batch as a Fluid array — wrappers over the Arrow, with no cell copied.</summary>
+    /// <remarks>
+    /// <para>
+    /// ⚠⚠ <b><see cref="ArrowStruct"/>, not <c>EagerStruct</c>, and the difference is the whole point.</b>
+    /// The eager one exists because <c>FluidHostQuery.ReadRows</c> disposes each batch as it consumes it, so
+    /// a row there cannot hold the arrays and every cell must be copied into a <c>FluidValue</c>. Where the
+    /// batch is ALIVE for the render — a per-chunk surface's own input — a row can be three references and
+    /// an int, reading its members from the Arrow on access.
+    /// </para>
+    /// <para>
+    /// ⚠ <b>The caller owes the batch's lifetime.</b> The rows read from it whenever the template touches
+    /// them, so it must outlive the render. Disposing it first is a NullReferenceException on the first cell
+    /// (Apache.Arrow nulls a disposed batch's arrays) — loud and deterministic, not the silent native class.
+    /// </para>
+    /// <para>
+    /// ⚠ <c>columns</c> is hoisted out of the row loop: <c>batch.Arrays</c> is an enumerable, so
+    /// materialising it per row would allocate one list per row on a path whose whole point is many rows.
+    /// </para>
+    /// </remarks>
+    internal static FluidValue RowsOver(RecordBatch batch)
+    {
+        var fields = batch.Schema.FieldsList;
+        var columns = batch.Arrays.ToList();
+        var rows = new List<FluidValue>(batch.Length);
+        for (int r = 0; r < batch.Length; r++)
+        {
+            rows.Add(new DictionaryValue(new ArrowStruct(fields, columns, r)));
+        }
+        return new ArrayValue(rows);
+    }
+
     internal static void SetVariable(TemplateContext ctx, string name, object? value)
     {
         if (value is null)

@@ -360,12 +360,19 @@ internal sealed class FluidQueryLateralFunction : ILateralFunction
 
         public LateralResult Call(RecordBatch input)
         {
-            StageInput(input);
-            // ⚠⚠ A FRESH lazy value per CHUNK, for the same reason the collector needs one per group: the
-            // value caches, so one carried across calls would serve the first chunk's rows to all of them.
+            // ⚠ NOT disposed: its columns are the framework's `input`, which it disposes itself when Call
+            // returns. Only the row-id column is ours.
+            var relation = BuildRelation(input);
+            // ⚠⚠ A FRESH staging per CHUNK — the Liquid value caches, so one carried across calls would
+            // serve the first chunk's rows to all of them.
             // ⚠ Thread-confined by construction — this session, its connection and this context all belong
             // to one pipeline thread, so nothing here is shared with a concurrent call.
-            FluidHostQuery.BindLazyRelation(_ctx, InputTable);
+            // ⚠⚠ The token is released in the finally BELOW, not here: the relation is a VIEW over the
+            // registered batch, so the registration must outlive the statement that reads it. Safe because
+            // this call consumes its result stream before returning; see docs/fluid-templating.md §43.8.1a.
+            var token = FluidRelationInput.StageLive(_session, _ctx, InputTable, relation);
+            try
+            {
             var generated = FluidEngine.RenderOn(FunctionName, _template, _ctx);
             if (string.IsNullOrWhiteSpace(generated))
             {
@@ -417,9 +424,14 @@ internal sealed class FluidQueryLateralFunction : ILateralFunction
                 }
                 throw;
             }
+            }
+            finally
+            {
+                _session.ReleaseRows(token);
+            }
         }
 
-        /// <summary>Copies this call's rows into <see cref="InputTable"/>, numbered from 0.</summary>
+        /// <summary>Builds this call's rows as the relation <see cref="InputTable"/> exposes, numbered from 0.</summary>
         /// <remarks>
         /// ⚠⚠ The row id is built HERE, in Arrow, rather than by a <c>row_number()</c> in the staging SQL —
         /// because unlike <c>fluid_query_batch</c>'s grouping key it has to IDENTIFY an input row, not merely
@@ -428,7 +440,7 @@ internal sealed class FluidQueryLateralFunction : ILateralFunction
         /// <para>⚠ The staged batch is BORROWED and must not be disposed: its columns are the framework's
         /// <paramref name="input"/>, which it disposes itself when <see cref="Call"/> returns.</para>
         /// </remarks>
-        private void StageInput(RecordBatch input)
+        private RecordBatch BuildRelation(RecordBatch input)
         {
             var ids = new Int64Array.Builder().Reserve(input.Length);
             for (int i = 0; i < input.Length; i++)
@@ -441,18 +453,7 @@ internal sealed class FluidQueryLateralFunction : ILateralFunction
             {
                 columns[c + 1] = input.Column(c);
             }
-            var staged = new RecordBatch(_stagedSchema, columns, input.Length);
-            var token = _session.RegisterRows(staged);
-            try
-            {
-                _session.ExecuteNonQuery(
-                    $"CREATE OR REPLACE TEMP TABLE {DuckSql.QuoteIdent(InputTable)} AS "
-                    + $"SELECT * FROM fabricator_scan({DuckSql.Literal(token)})");
-            }
-            finally
-            {
-                _session.ReleaseRows(token);
-            }
+            return new RecordBatch(_stagedSchema, columns, input.Length);
         }
 
         /// <summary>Joins the drained parts into one batch and splits off the provenance column.</summary>

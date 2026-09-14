@@ -160,54 +160,46 @@ internal sealed class FluidQueryInOutFunction : IInOutFunction
                     // into DuckDB now and the batch is released, rather than being accumulated the way the
                     // collector must. The framework frees a chunk's Arrow buffers once consumed, so holding
                     // one past this point would be a use-after-free as well as a memory cost.
-                    DefineInput(session, chunk);
-                    // ⚠⚠ A FRESH lazy value per chunk, because it CACHES: one carried across chunks would
-                    // serve the first chunk's rows to every later one, silently. The SQL table and the Liquid
-                    // value are repointed together, so the two access paths cannot disagree.
-                    FluidHostQuery.BindLazyRelation(ctx, FluidRelationInput.InputTable);
-                    var generated = FluidEngine.RenderOn(FunctionName, _template, ctx);
-                    if (string.IsNullOrWhiteSpace(generated))
+                    // ⚠⚠ A FRESH staging per chunk, because the Liquid value CACHES: one carried across
+                    // chunks would serve the first chunk's rows to every later one, silently. The SQL
+                    // relation and the Liquid value are the SAME batch, so the two access paths cannot
+                    // disagree at all.
+                    var token = FluidRelationInput.StageLive(session, ctx, FluidRelationInput.InputTable,
+                                                             chunk);
+                    try
                     {
-                        throw new ArgumentException(
-                            $"{FunctionName}: the template rendered nothing for an input chunk; it must "
-                            + "render a SELECT.");
-                    }
-                    using var stream = session.Query(FluidRelationInput.Wrap(generated, outputSchema));
-                    FluidRelationInput.Verify(FunctionName, "chunk", stream.Schema, outputSchema);
-                    while (true)
-                    {
-                        var batch = await stream.ReadNextRecordBatchAsync(ct).ConfigureAwait(false);
-                        if (batch is null)
+                        var generated = FluidEngine.RenderOn(FunctionName, _template, ctx);
+                        if (string.IsNullOrWhiteSpace(generated))
                         {
-                            break;
+                            throw new ArgumentException(
+                                $"{FunctionName}: the template rendered nothing for an input chunk; it must "
+                                + "render a SELECT.");
                         }
-                        yield return batch;
+                        using var stream = session.Query(FluidRelationInput.Wrap(generated, outputSchema));
+                        FluidRelationInput.Verify(FunctionName, "chunk", stream.Schema, outputSchema);
+                        while (true)
+                        {
+                            var batch = await stream.ReadNextRecordBatchAsync(ct).ConfigureAwait(false);
+                            if (batch is null)
+                            {
+                                break;
+                            }
+                            yield return batch;
+                        }
+                    }
+                    finally
+                    {
+                        // ⚠⚠ A `finally`, not a release after the loop — the relation is a VIEW over the
+                        // registered chunk, so the registration must outlive every batch this yields, and a
+                        // consumer may ABANDON the iteration (a LIMIT above a streaming in-out is a recorded
+                        // path). Releasing eagerly the way the temp-table form could would leave the view
+                        // pointing at nothing; not releasing at all would leak a named source per chunk.
+                        session.ReleaseRows(token);
                     }
                 }
                 chunk.Dispose();
                 // The per-input-chunk sentinel: NEED_MORE_INPUT.
                 yield return InOutExchange.EmptyBatch(outputSchema);
-            }
-        }
-
-        /// <summary>Points <c>input_table</c> at this chunk's rows.</summary>
-        /// <remarks>
-        /// ⚠ A TABLE rather than a view over staged rows, which is the whole structural difference from the
-        /// collector: there is nothing to stage, because the chunk is the group. It is replaced per chunk,
-        /// so at most one chunk's rows are in DuckDB at a time.
-        /// </remarks>
-        private static void DefineInput(FluidRenderSession session, RecordBatch chunk)
-        {
-            var token = session.RegisterRows(chunk);
-            try
-            {
-                session.ExecuteNonQuery(
-                    $"CREATE OR REPLACE TEMP TABLE {DuckSql.QuoteIdent(FluidRelationInput.InputTable)} AS "
-                    + $"SELECT * FROM fabricator_scan({DuckSql.Literal(token)})");
-            }
-            finally
-            {
-                session.ReleaseRows(token);
             }
         }
     }

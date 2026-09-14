@@ -126,6 +126,51 @@ internal static class FluidRelationInput
         }
     }
 
+    /// <summary>
+    /// Stages <paramref name="batch"/> as the SQL relation <paramref name="name"/> and binds the SAME rows
+    /// in Liquid — one relation, two readings, no copy of either. Returns the token the caller must release
+    /// once every statement that reads it has run.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// ⚠⚠ <b>A VIEW over the registered batch, not a materialized copy.</b> <c>RegisterRows</c> registers a
+    /// FACTORY, so each scan gets a fresh cursor over the same retained Arrow and the relation is
+    /// re-scannable — a statement may read it twice. MEASURED on the aggregate, which took this route first:
+    /// 0.002 s versus 0.034 s through a temp table on a 300k-row group, and a double read answers 4006 where
+    /// a single-use source answers 4000. ⚠ The "a bound input is SINGLE-USE" rule this repo records is about
+    /// <c>host_query</c>'s BOUND INPUTS — one raw stream — and reading it as covering named
+    /// <c>fabricator_scan</c> sources is what sends someone back to copying.
+    /// </para>
+    /// <para>
+    /// ⚠⚠ <b>THE TOKEN MUST OUTLIVE EVERY STATEMENT THAT READS THE VIEW</b>, because the view holds the
+    /// token rather than the data. That is safe for a surface whose generated statement is consumed inside
+    /// the call; a surface that returns a LAZILY PULLED result stream must tie the release to the stream's
+    /// disposal instead. See docs/fluid-templating.md §43.8.1a.
+    /// </para>
+    /// <para>
+    /// ⚠ The Liquid value reads the SAME batch, so the two views cannot disagree — where
+    /// <c>BindLazyRelation</c> re-queries DuckDB and could in principle answer about something else.
+    /// </para>
+    /// </remarks>
+    internal static string StageLive(FluidRenderSession session, TemplateContext ctx, string name,
+                                     RecordBatch batch)
+    {
+        var token = session.RegisterRows(batch);
+        try
+        {
+            session.ExecuteNonQuery(
+                $"CREATE OR REPLACE TEMP VIEW {DuckSql.QuoteIdent(name)} AS "
+                + $"SELECT * FROM fabricator_scan({DuckSql.Literal(token)})");
+        }
+        catch
+        {
+            session.ReleaseRows(token);
+            throw;
+        }
+        ctx.SetValue(name, new LazyRowsValue(() => FluidValueModel.RowsOver(batch)));
+        return token;
+    }
+
     internal static string ReadTemplate(string functionName, RecordBatch? args)
     {
         if (FluidValueModel.ArgColumn(args, "template") is not StringArray templates || templates.Length == 0
