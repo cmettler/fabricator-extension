@@ -4867,21 +4867,42 @@ flattened) dies after 879, B (the Bridge's value reader) after 883, D (never dec
 SELECT g, fluid_aggregate(
   '{% if is_bind %}select NULL::VARCHAR
    {% else %}{% capture s %}{% for r in rows %}{{ r.a }}|{{ r.b }};{% endfor %}{% endcapture %}
-   {{ s | md5 }}{% endif %}',
+   select md5({{ s | sql }}){% endif %}',
   NULL, struct_pack(a := a, b := b) ORDER BY a) AS h
 FROM t GROUP BY g;
 ```
 
 Needed **ABI v89** — see [abi-history.md](abi-history.md) §v89 for the host half, which is most of the work.
 
-### 43.1 ⚠⚠ IT RENDERS TEXT WHERE `fluid_scalar` RENDERS SQL, AND THAT IS FORCED
+### 43.1 ⚠⚠ THE NON-BIND RENDER IS A SELECT THAT IS EXECUTED — as on every other Fluid surface
 
-A scalar's rows live in DuckDB, so its template emits an expression DuckDB evaluates over them. **An
-aggregate's rows live in the accumulator** — there is nothing for DuckDB to evaluate them *with*. So the
-reduction happens in Liquid and the render IS the value; the declared type is applied afterwards by a CAST.
+**User-directed, and it replaced a first build that rendered TEXT and cast it** (*"the return value should be
+an explicit select again which is executed like in fluid scalar, batch, inout, query … this way no cast of
+the return value is needed"*). What the group's rows are FOR is the reduction, and the reduction is now
+DuckDB's:
 
-A template that wants SQL can still have it (`{% query %}` / `{% exec %}` work in any render) but that is one
-statement per GROUP, so it is the author's explicit choice rather than the function's shape.
+```liquid
+{{ s | md5 }}        →  select md5({{ s | sql }})
+```
+
+Three things fall out, and they are why this is the better shape rather than merely the consistent one:
+
+- **Nothing is parsed back out of text.** A STRUCT, LIST or MAP result is just a value DuckDB produced, so
+  there is no intermediate representation to get wrong.
+- **An empty render becomes an ERROR rather than NULL.** Under the text form those were the same thing, which
+  silently conflated *"this group has nothing to say"* with a template bug. A template that wants a different
+  answer for an empty group now says so: `{% if rows.size == 0 %}select NULL{% else %}…{% endif %}`.
+- **The reduction may use any DuckDB function**, not only what Liquid can express.
+
+⚠ **The CAST that remains is not the one that was removed.** `WrapExecute` still casts the statement's single
+column to the declared type — that is what makes the `is_bind` render a DECLARATION rather than a thing to
+match, so a template declaring `NULL::BIGINT` may render `select 42` without also writing INTEGER. What went
+away is parsing a rendered STRING into the declared type.
+
+⚠⚠ **The cost is ONE STATEMENT PER GROUP**, since the statements differ per group. MEASURED locally: ~14 µs
+for a trivial statement (10 000 groups in 0.14 s) and **~0.5 ms for a real hashing template** (2 000 groups in
+1.0 s, with 2 000 distinct hashes — so every statement ran). A few thousand groups is unremarkable; a hundred
+thousand is not this function's shape, which its memory already said.
 
 ### 43.2 The type really does come from the template
 
@@ -4937,9 +4958,9 @@ the user's own suggestion and it is the right shape: MEASURED, a STRUCT paramete
 
 ### 43.6 Smaller things, each measured
 
-- **An EMPTY render is NULL**, which is also what a group with nothing to say gets. A group that was never
-  updated still renders, with an empty `rows` — DuckDB finalizes states it never updated, and a template may
-  legitimately have something to say about an empty group.
+- **A group that was never updated still renders**, with an empty `rows` — DuckDB finalizes states it never
+  updated, and a template may legitimately have something to say about an empty group. It must still render a
+  SELECT (§43.1).
 - **The accumulator holds the group's rows**, so this is NOT spillable and a high-cardinality `GROUP BY`
   holds every group's rows in managed memory. Inherent: a reduction expressed in Liquid cannot be folded
   incrementally, because the template runs once and only at the end.
@@ -4960,4 +4981,126 @@ once** — so it can branch on the group, emit something that is not a concatena
 type that is not VARCHAR**. Where the reduction really is "render per row, then join", the existing spelling
 is cheaper and should be preferred.
 
-Gate: `verify_plugin_fluid` 905 → **944** (§40), hermetic floor 9261 → **9300**.
+Gate: `verify_plugin_fluid` 905 → **946** (§40), hermetic floor 9261 → **9302**. ⚠ §40.9 REPLACES a
+row asserting that an empty render was NULL — falsifying it is the change announcing itself.
+
+### 43.8 ✅ AS BUILT (2026-09-14) — `rows` is a SQL RELATION too, so the reduction can happen in DuckDB
+
+**User-asked** (*"can we make the rows table available at bind? then this would work: `select max(t) from
+rows t`"*). It can, and their example is now the shape the function is best at:
+
+```sql
+SELECT g, fluid_aggregate('select max(t) from rows t',
+                          NULL, struct_pack(a := a, b := b) ORDER BY a) AS h
+FROM t GROUP BY g;
+```
+
+**⚠⚠ NOTE WHAT IS ABSENT: there is no `is_bind` BRANCH.** The result type is derived by binding that very
+statement against an **EMPTY, fully typed `rows`** staged at bind — MEASURED that `DESCRIBE` over it answers
+`STRUCT(a BIGINT, b VARCHAR)`. That is the property `fluid_scalar`'s empty `input_table` has (§26), arriving
+here; a template only owes a `{% if is_bind %}` when its statement's type cannot be derived from the input.
+
+**⚠⚠ IT FALSIFIES §43's OWN OPENING CLAIM, which called the text rendering FORCED.** That paragraph read:
+*"an AGGREGATE's rows live in the accumulator, so there is nothing for DuckDB to evaluate them WITH"*. The
+premise was true and the conclusion was not — the accumulator's rows can be handed BACK to DuckDB, which is
+all staging is. It was never forced; it was unimplemented, and describing it as forced is how an
+unimplemented thing becomes a permanent limitation.
+
+#### 43.8.1 ⚠⚠ A VIEW over the registered batch, NOT a materialized copy — user-corrected, twice
+
+The first build wrote `CREATE OR REPLACE TEMP TABLE rows AS SELECT …`, matching what **every other relation
+surface does** (`fluid_query_batch`, `_inout`, `_lateral`, `fluid_query`, and
+`FluidRelationInput.CreateEmptyInput` all materialize, then release the token in a `finally`). The user
+pushed back twice — *"we have the rows in memory as arrow/recordbatch anyway, so mapping as a table costs
+nothing"*, then *"i thought we have some factories to work around this"* — and both times they were right.
+
+- **`RegisterRows` registers a FACTORY**: `Host.RegisterSource(token, () => new BorrowedBatchStream(schema,
+  rows), schema)`. Each scan calls it and gets a FRESH cursor over the same retained Arrow, so a view over
+  `fabricator_scan(token)` is **re-scannable**. MEASURED: a statement reading `rows` twice answers 4006
+  (`count(*) * 1000 + sum`), where a single-use source would answer 4000.
+- **⚠⚠ THE RULE I INVOKED AGAINST IT WAS ABOUT A DIFFERENT MECHANISM.** This repo records "a bound input is
+  SINGLE-USE" — that is `host_query`'s `inputs`, which wrap ONE raw `ArrowArrayStream *`, a cursor. Reading
+  it as covering `fabricator_scan` named sources is what sends you back to copying. **Two mechanisms, one
+  sentence, opposite answers.**
+- **MEASURED, same query, same data**: a 300 000-row group costs **0.002 s** through the view and **0.034 s**
+  through the temp table; 2000 small groups cost 0.003 s vs 0.004 s. So the copy is pure loss on big groups
+  and noise on small ones.
+- **⚠ The price is a LIFETIME obligation the table did not have**: the view holds the TOKEN, not the data, so
+  the registration must outlive every statement that reads it. `StagedRows` is that scope (`using`), and
+  releasing early is mutation-tested — it dies at the first row that reads `rows`.
+
+⇒ **the four sibling surfaces could plausibly drop their copies too**, and this is the evidence for it. Not
+done here: `fluid_query_batch` genuinely needs a table (it row-numbers the input and slices it by range), and
+changing four surfaces is not a change to smuggle into an aggregate's feature.
+
+#### 43.8.1a ⚠ What converting the siblings would and would NOT cost — and I had one of them backwards
+
+The per-chunk surfaces divide by **when the result is pulled**, not by what the template selects. A
+pass-through `select * from input_table` is fine under a view in every one of them, and so is reading the
+relation twice (§43.8.1's 4006 row).
+
+- **Call-scoped** — `fluid_scalar`, `fluid_query_lateral`, the collector — read the generated statement to
+  completion inside the call, so a view needs only a `using` scope.
+- **Lazily pulled** — `fluid_query_inout` (an async iterator) and `fluid_query` (it returns a live result
+  stream the host pulls after `Execute` returns) — need the release tied to the STREAM's disposal rather
+  than to the end of the method. That is a solved shape here, not a blocker: it is what `publish()` already
+  does, holding a reference so the connection dies with the last result stream. ⚠ `fluid_query` is not worth
+  converting anyway — its staged `input_table` is the tail ARGUMENTS, one row of bind-time constants.
+
+**⚠⚠ AND THE ONE BEHAVIOUR CHANGE IS A FIX, NOT A COST — I first listed it as the price of converting, and
+measuring it reversed the sign.** The case is a template doing `{% exec %}CREATE VIEW v AS SELECT * FROM
+input_table{% endexec %}` and then generating `select * from v`. Under a temp table that does not error — and
+it does not work either: **MEASURED that DuckDB re-binds a view at scan time, so a view created against
+`input_table` in one chunk reads the NEXT chunk's rows after the `CREATE OR REPLACE`** (1, then 2). So the
+capability being "lost" is one that silently answers about the wrong chunk; under a view-backed
+`input_table` the same template fails loudly with an unregistered source instead. A template that really
+wants the rows to outlive the chunk should ask for a copy explicitly
+(`CREATE TEMP TABLE snapshot AS SELECT * FROM input_table`), which is honest about what it is doing.
+
+#### 43.8.2 The shape: a STRUCT argument becomes COLUMNS
+
+`UNNEST(value)`, so the SQL relation and the Liquid value agree — `{{ r.a }}` in Liquid is `a` in SQL. That
+is what makes `struct_pack(a := a, b := b)`, the documented way to pass several columns to an aggregate
+(§43.5), arrive as a two-column relation rather than one column of structs. A non-struct argument stays ONE
+column named `value`, the parameter's own name.
+
+⚠ MEASURED that `UNNEST` keeps the column TYPES on an EMPTY relation (which is what makes bind-time type
+derivation work at all) and turns a NULL struct row into a row of NULL fields rather than dropping it.
+
+#### 43.8.3 ⚠⚠ The staging is PER GROUP and happens at FINALIZE, not at render
+
+Every group RENDERS before any group RUNS — DuckDB finalizes a whole vector of states, then the host asks for
+the column — so a relation staged at render time would be overwritten by the next group and **every statement
+would read the LAST group's rows: a wrong answer with nothing failing**. The rows therefore travel with the
+statement (`GroupPlan`) and are staged immediately before it runs. Mutation-tested.
+
+#### 43.8.4 The Liquid `rows` value is LAZY now, and the two readings cost very differently
+
+User-asked (*"is the rows fluidvalue lazy as input_table in the other fluid functions?"*) — it was not, and a
+code comment already claimed it was, which is the worse half. It is a `LazyRowsValue` over the retained
+batches, so a template that reads the group only in SQL pays **no per-row boxing at all**.
+
+⚠ It is lazy over the ARROW BATCHES rather than over the staged relation, unlike `input_table` elsewhere
+(§28), and that is forced by the ordering above: at render time there is no relation yet.
+
+**MEASURED on one 300 000-row group, the template being the only variable:**
+
+| the template reads | time |
+|---|---|
+| neither `rows` in Liquid nor in SQL | **0.020 s** |
+| `rows` in SQL (stages the view) | **0.034 s** → **0.002 s** once it became a view |
+| `rows` in Liquid (forces the boxing) | **0.123 s** |
+
+**⚠⚠ AND THE HEADLINE USE CASE IS TWO TO THREE ORDERS OF MAGNITUDE FASTER IN SQL.** The same md5 over 2000
+groups, interleaved L/S/L/S so warm-up cannot explain it: **2.901 s / 2.591 s in Liquid** versus **0.014 s /
+0.005 s in SQL** — and the two spellings agree hash-for-hash on all 50 groups of a control run. So
+`select md5(string_agg(a || '|' || b, ';' ORDER BY a) || ';') from rows` is not merely the tidier way to
+write §43's example, it is the way to write it.
+
+⚠ §43.7 said the cheaper spelling for "render per row, then join" is
+`md5(string_agg(fluid_render(...), ';' ORDER BY a))`. That still holds against the LIQUID form; the SQL form
+inside `fluid_aggregate` is now in the same class, while keeping the whole-group view and the declared type.
+
+Gate: `verify_plugin_fluid` 946 → **981** (§40.10), hermetic floor 9302 → **9337**. Four mutants, each killed
+at its own point: no bind-time staging (947), stale group rows (955), no `UNNEST` (948), token released
+before the statement (947).

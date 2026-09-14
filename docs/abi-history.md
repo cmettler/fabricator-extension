@@ -94,8 +94,10 @@ any fixed list wrong by construction — the type is whatever the CALL SITE pass
   the concatenator refuses it (*"Concatenation for null is not supported yet"*), and a NULL-typed column is
   ORDINARY here rather than exotic.
 - **`BuildResultColumn`** could not build a STRUCT/LIST/MAP result at all. `FinalizeColumn` lets a binding
-  supply the column instead — `fluid_aggregate` hands over the one DuckDB's own CAST produced, so a template
-  may declare `STRUCT(n INTEGER, s VARCHAR)` and get exactly that.
+  supply the column instead — `fluid_aggregate` builds it by RUNNING each group's rendered SELECT and
+  concatenating the one-row results, so a template may declare `STRUCT(n INTEGER, s VARCHAR)` and get exactly
+  that. ⚠ That hook is what made it possible to drop the text intermediate entirely a day later: with the
+  column coming from DuckDB, there is nothing to parse back.
 
 ### ⚠ The `Field` → `Field?` trap, for the second time in this file
 

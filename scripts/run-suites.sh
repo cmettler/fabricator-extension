@@ -682,7 +682,18 @@ case "$TIER" in
         #   ⚠ The load-bearing gate row is §40.4: an aggregate is UNORDERED, so a hash over `rows` repeats
         #   only if the caller writes ORDER BY — DESC and ASC must differ, or the feature is not usable for
         #   the hashing it was asked for.
-        : "${MIN_ASSERTIONS:=9300}"
+        # 2026-09-14 (same day): 944 -> 946. fluid_aggregate's non-bind render became a SELECT that is
+        #   EXECUTED, like every other Fluid surface (user-directed) — so the value is whatever DuckDB
+        #   computes and nothing is parsed back out of text. ⚠ §40.9 REPLACES a row asserting an empty render
+        #   was NULL: it is an ERROR now, because under the text form "nothing to say" and "template bug"
+        #   were the same thing.
+        # 2026-09-14: 9302 -> 9337. verify_plugin_fluid 946 -> 981 (§40.10) — `rows` is a SQL RELATION as
+        #   well as a Liquid value, so a fluid_aggregate template can reduce its group IN SQL. A STRUCT
+        #   argument is expanded into columns (UNNEST), so `{{ r.a }}` in Liquid is `a` in SQL; an EMPTY,
+        #   fully typed `rows` is staged at BIND, which is what lets a template omit `is_bind` entirely.
+        #   ⚠ It is a VIEW over the registered Arrow batch rather than a materialized copy — measured 0.002 s
+        #   vs 0.034 s on a 300k-row group — and the double-reference row is what makes that legitimate.
+        : "${MIN_ASSERTIONS:=9337}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

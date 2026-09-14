@@ -2,10 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // See LICENSE in the project root for license information.
 
+using System.Collections.Generic;
+using System.Linq;
 using Apache.Arrow;
 using Apache.Arrow.Types;
 using Fabricator.Bridge;
 using Fluid;
+using Fluid.Values;
 
 namespace Fabricator.FluidPlugin;
 
@@ -19,7 +22,7 @@ namespace Fabricator.FluidPlugin;
 /// SELECT g, fluid_aggregate(
 ///   '{% if is_bind %}select NULL::VARCHAR'
 ///   '{% else %}{% capture s %}{% for r in rows %}{{ r.a }}|{{ r.b }};{% endfor %}{% endcapture %}'
-///   '{{ s | md5 }}{% endif %}', NULL, struct_pack(a := a, b := b)) FROM t GROUP BY g;
+///   'select md5({{ s | sql }}){% endif %}', NULL, struct_pack(a := a, b := b)) FROM t GROUP BY g;
 /// </code>
 /// </para>
 /// <para>
@@ -39,15 +42,22 @@ namespace Fabricator.FluidPlugin;
 /// per-call-site type expressible at all.
 /// </para>
 /// <para>
-/// ⚠ <b>The rendered text is CAST to the declared type by DuckDB</b>, in ONE statement per finalize call
-/// (a whole vector of groups), not one per group — and skipped entirely when the declared type is VARCHAR,
-/// which is the common case. Rendering the value and parsing it HERE would be a second type ladder; this
-/// codebase has refused to maintain one four times.
+/// ⚠⚠ <b>THE NON-BIND RENDER IS A SELECT THAT IS EXECUTED, exactly as on every other Fluid surface</b>
+/// (user-directed). The VALUE is whatever DuckDB computes, so nothing is parsed back out of text: a STRUCT,
+/// LIST or MAP result is just a value, and the reduction may use any DuckDB function rather than only what
+/// Liquid can express. ⚠ The CAST that remains is <c>WrapExecute</c>'s — the one that makes the
+/// <c>is_bind</c> render a DECLARATION rather than a thing to match — not the text→type parse that went.
 /// </para>
 /// <para>
-/// ⚠ <b>An EMPTY render is NULL</b>, which is also what a group that was never updated finalizes to. A
-/// template that means the empty STRING must say so (<c>{{ s | default: '' }}</c> renders empty too — use a
-/// sentinel and strip it, or declare VARCHAR and accept the equivalence).
+/// ⚠⚠ <b>ONE STATEMENT PER GROUP</b>: the statements differ per group, which is the point, so they cannot be
+/// folded into one. MEASURED locally at ~14 µs for a trivial statement and <b>~0.5 ms</b> for a real hashing
+/// one. That bounds this to modest group counts — which its memory already did, since the accumulator holds
+/// every group's rows and cannot spill.
+/// </para>
+/// <para>
+/// ⚠ <b>An EMPTY render is an ERROR, not NULL.</b> Every group must render a SELECT, including one that was
+/// never updated; <c>{% if rows.size == 0 %}select NULL{% else %}…{% endif %}</c> is how an empty group gets
+/// a different answer. (It used to mean NULL, which silently conflated "nothing to say" with a template bug.)
 /// </para>
 /// <para>
 /// ⚠⚠ <b>ROW ORDER IS THE CALLER'S, AND IT MATTERS HERE MORE THAN ANYWHERE ELSE IN THIS PLUGIN.</b> An
@@ -69,6 +79,10 @@ internal sealed class FluidAggregateFunction : IAggregateFunction
 
     /// <summary>The group's rows, as a Fluid list of the per-row <c>value</c> arguments.</summary>
     internal const string RowsVariable = "rows";
+
+    /// <summary>The single relation column's name when the per-row argument is NOT a struct.</summary>
+    /// <remarks>⚠ The declared parameter's own name, so SQL and the signature agree.</remarks>
+    internal const string RowsValueColumn = "value";
 
     public string Name => FunctionName;
 
@@ -141,8 +155,16 @@ internal sealed class FluidAggregateFunction : IAggregateFunction
                 + "available here.");
         try
         {
-            var (result, typeName) = DescribeResult(session, template!, parameters, paramsRows);
-            return new FluidAggregateBinding(template!, parameters, paramsRows, result, typeName, session);
+            // ⚠⚠ THE RESOLVED per-row TYPE, taken from the CALL's own arguments rather than from the
+            // declaration — the parameter is declared ANY (the SQLNULL sentinel), so the declaration says
+            // nothing about what this call site passes. It is what shapes `rows`: a STRUCT becomes a
+            // multi-column relation, anything else a single column.
+            var valueField = args.Count > FluidAggregateBinding.ValueColumn && args.Values is { } v
+                ? v.Schema.FieldsList[FluidAggregateBinding.ValueColumn]
+                : new Field(FluidAggregateFunction.RowsValueColumn, NullType.Default, nullable: true);
+            var (result, typeName) = DescribeResult(session, template!, parameters, paramsRows, valueField);
+            return new FluidAggregateBinding(template!, parameters, paramsRows, result, typeName, valueField,
+                                             session);
         }
         catch
         {
@@ -157,8 +179,10 @@ internal sealed class FluidAggregateFunction : IAggregateFunction
     /// CAST by construction. It is never the template's own text.
     /// </remarks>
     private static (Field Result, string TypeName) DescribeResult(FluidRenderSession probe, string template,
-                                                                  object? parameters, RecordBatch? paramsRows)
+                                                                  object? parameters, RecordBatch? paramsRows,
+                                                                  Field valueField)
     {
+
         var ctx = FluidRelationInput.NewContext(FunctionName, probe, parameters, isBind: true,
                                                 paramsRows: paramsRows);
         // ⚠ `rows` is bound EMPTY at bind, so `{{ rows.size }}` answers 0 rather than failing — a name that
@@ -172,6 +196,12 @@ internal sealed class FluidAggregateFunction : IAggregateFunction
                 + " = true. It must render a SELECT of the result type there — `select NULL::<type>` is the "
                 + "usual answer, e.g. select NULL::VARCHAR.");
         }
+        // ⚠⚠ THE EMPTY RELATION IS WHAT LETS A TEMPLATE SKIP `is_bind` ENTIRELY. `select max(t) from rows t`
+        // has a type only because `rows` exists HERE with its real COLUMN TYPES and no rows — MEASURED that
+        // DESCRIBE over exactly that answers STRUCT(a INTEGER, b VARCHAR). Without it the probe would fail on
+        // a missing table and every such template would owe a hand-written `{% if is_bind %}select NULL::…`.
+        // Same property fluid_scalar's empty input_table has, for the same reason.
+        using var staged = FluidAggregateBinding.StageRows(probe, valueField, rows: null);
         // ⚠⚠ SCOPED: this session's connection is PINNED and a pinned connection allows ONE live result, so
         // the type-name query below is a SECOND statement on it. Leaving this stream open is refused by name.
         Schema schema;
@@ -217,104 +247,314 @@ internal sealed class FluidAggregateBinding : IAggregateBinding, IDisposable
     private readonly object? _parameters;
     private readonly RecordBatch? _paramsRows;
     private readonly string _typeName;
-    private readonly bool _needsCast;
+    private readonly Field _valueField;
     private FluidRenderSession? _session;
     private TemplateContext? _ctx;
 
     internal FluidAggregateBinding(string template, object? parameters, RecordBatch? paramsRows,
-                                   Field result, string typeName, FluidRenderSession session)
+                                   Field result, string typeName, Field valueField,
+                                   FluidRenderSession session)
     {
         _template = template;
         _parameters = parameters;
         _paramsRows = paramsRows;
         _typeName = typeName;
+        _valueField = valueField;
         _session = session;
         Result = result;
-        // ⚠ VARCHAR needs no cast, and that is the common case — so an ordinary hash/summary template runs
-        // with NO SQL at all. Everything else is cast by DuckDB, once per finalize call.
-        _needsCast = result.DataType.TypeId != ArrowTypeId.String;
     }
 
     public Field Result { get; }
 
     public IAggregateState CreateState() => new FluidAggregateState(this);
 
-    /// <summary>Renders one group's value; null when the render is empty (an absent value).</summary>
-    internal string? Render(IReadOnlyList<object?> rows)
+    /// <summary>Renders one group's SELECT. ⚠ The template must render one — an empty render is refused.</summary>
+    internal string Render(IReadOnlyList<RecordBatch> batches)
     {
         lock (_gate)
         {
             var ctx = Context();
+            // ⚠⚠ LAZY, like `input_table` on every other relation surface: a template that reads the group
+            // only in SQL — which is now the natural way to write one — pays NO per-row boxing at all. It
+            // matters more here than elsewhere, because this runs once per GROUP.
+            //
+            // ⚠ It is lazy over the retained ARROW BATCHES rather than over the staged relation, and that is
+            // forced: every group RENDERS before any group is staged (see FinalizeColumn), so there is no
+            // relation to read here yet. The other surfaces stage first and can point their lazy value at the
+            // temp table; the content is the same either way.
+            //
             // ⚠ REBOUND PER GROUP, because a Fluid value is bound INTO the context: one bound at creation
             // would serve the FIRST group's rows to every later group — right shape, wrong rows, no error.
             // The same rule the collector's input_table records.
-            FluidValueModel.SetVariable(ctx, FluidAggregateFunction.RowsVariable, rows);
+            FluidValueModel.SetVariable(
+                ctx, FluidAggregateFunction.RowsVariable,
+                new LazyRowsValue(() => FluidValue.Create(ReadRows(batches), ctx.Options)));
             var text = FluidEngine.RenderOn(FluidAggregateFunction.FunctionName, _template, ctx);
-            return string.IsNullOrEmpty(text) ? null : text;
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                throw new InvalidOperationException(
+                    FluidAggregateFunction.FunctionName + ": the template rendered nothing for a group. It "
+                    + "must render a SELECT for every group, including an EMPTY one — branch on `rows.size` "
+                    + "if an empty group needs a different answer (`select NULL` is the usual one).");
+            }
+            return text;
         }
     }
 
     /// <summary>
-    /// Converts one finalize call's rendered texts to the declared type — ONE statement for the whole vector
-    /// of groups, or none at all when the declared type is VARCHAR.
+    /// Runs each group's rendered SELECT and returns the finished column — one row per group, in state order.
     /// </summary>
     /// <remarks>
-    /// ⚠⚠ THE CAST IS DuckDB'S, deliberately: parsing the text here would be a second SQL type ladder, and
-    /// the one this plugin has (<c>DuckSql.Literal</c>) collapses every temporal to TIMESTAMPTZ and refuses a
-    /// LIST or a STRUCT by name. Staging the texts and casting them means a template may declare
-    /// <c>DECIMAL(9,2)</c> with its scale, a <c>STRUCT(a INTEGER)</c> or a LIST and get exactly that back.
+    /// <para>
+    /// ⚠⚠ <b>THE STATEMENT IS EXECUTED, so the VALUE is whatever DuckDB computes — there is no text
+    /// intermediate and nothing is parsed back</b> (user-directed: *"the return value should be an explicit
+    /// select again which is executed like in fluid scalar, batch, inout, query"*). That is what makes every
+    /// Fluid surface's non-bind render mean the same thing, and it removes a whole class of question: a
+    /// STRUCT, LIST or MAP result is just a value DuckDB produced, an empty render is a template error rather
+    /// than a silent NULL, and the template can reach any DuckDB function for the reduction itself.
+    /// </para>
+    /// <para>
+    /// ⚠ <b>The CAST stays, and it is not the cast that was removed.</b> It is
+    /// <c>FluidScalarBinding.WrapExecute</c>'s — the one that makes the <c>is_bind</c> render a DECLARATION
+    /// rather than a thing to match, so a template declaring <c>NULL::BIGINT</c> may render <c>select 42</c>
+    /// without also writing INTEGER. What went away is parsing a rendered STRING into the declared type.
+    /// </para>
+    /// <para>
+    /// ⚠⚠ <b>ONE STATEMENT PER GROUP, and that is the cost to know before reaching for this.</b> The
+    /// statements differ per group — that is the point — so they cannot be folded into one. MEASURED on a
+    /// local in-memory table: a TRIVIAL statement is ~14 µs per group (10 000 groups in 0.14 s), and a real
+    /// hashing template that embeds its group's rows is <b>~0.5 ms per group</b> (2 000 groups in 1.0 s,
+    /// with 2 000 distinct hashes — so every statement really did run). ⇒ a few thousand groups is
+    /// unremarkable; a hundred thousand is not this function's shape, which its MEMORY already said, since
+    /// the accumulator holds every group's rows and cannot spill. Where the reduction is really "render per
+    /// row, then join", <c>md5(string_agg(fluid_render(...), ';' ORDER BY k))</c> stays far cheaper.
+    /// </para>
+    /// <para>
+    /// ⚠ Each group's result must be exactly ONE ROW. A statement that produces none or several would
+    /// mis-align every later group's value — a wrong ANSWER, not an error — so it is refused by name.
+    /// </para>
     /// </remarks>
     public IArrowArray? FinalizeColumn(object?[] values)
     {
-        if (!_needsCast || values.Length == 0)
+        if (values.Length == 0)
         {
-            return null; // VARCHAR: the rendered text IS the value, so the host's default builds it
+            return null; // nothing to finalize; the host's default builds an empty column
         }
         lock (_gate)
         {
-            var builder = new StringArray.Builder();
-            foreach (var v in values)
-            {
-                if (v is string t) { builder.Append(t); } else { builder.AppendNull(); }
-            }
-            var batch = new RecordBatch(
-                new Schema(new[] { new Field("v", StringType.Default, nullable: true) }, null),
-                new IArrowArray[] { builder.Build() }, values.Length);
             var session = Session();
-            var token = session.RegisterRows(batch);
-            try
+            var parts = new List<IArrowArray>(values.Length);
+            for (int i = 0; i < values.Length; i++)
             {
-                using var stream = session.Query(
-                    $"SELECT CAST(v AS {_typeName}) AS v FROM fabricator_scan({DuckSql.Literal(token)})");
-                var parts = new List<IArrowArray>();
-                int got = 0;
-                while (true)
+                if (values[i] is not GroupPlan plan)
                 {
-                    var next = stream.ReadNextRecordBatchAsync().GetAwaiter().GetResult();
-                    if (next is null) { break; }
-                    parts.Add(next.Column(0));
-                    got += next.Length;
-                }
-                if (got != values.Length)
-                {
-                    // ⚠ A short read would MIS-ALIGN every later group's value — a wrong ANSWER, not an
-                    // error. The cast is a projection over a staged relation, so it cannot legitimately
-                    // change cardinality; checking costs nothing and the failure is otherwise invisible.
                     throw new InvalidOperationException(
-                        $"{FluidAggregateFunction.FunctionName}: the result cast returned {got} values for "
-                        + $"{values.Length} groups.");
+                        $"{FluidAggregateFunction.FunctionName}: group {i} produced no statement.");
                 }
-                // ⚠⚠ THE COLUMN DuckDB BUILT, handed over as-is. Reading it back into boxed objects and
-                // rebuilding would reintroduce exactly the per-type ladder this design exists to avoid, and
-                // would refuse a STRUCT, a LIST or a MAP — types a template may legitimately declare.
-                return parts.Count == 1 ? parts[0] : ArrowArrayConcatenator.Concatenate(parts);
+                // ⚠⚠ STAGED HERE, NOT AT RENDER, and that is forced: every group renders BEFORE any group
+                // runs (DuckDB finalizes a whole vector of states, then the host asks for the column), so a
+                // relation staged at render time would be overwritten by the next group and every statement
+                // would read the LAST group's rows — a wrong answer with nothing failing. The rows therefore
+                // travel with the statement in GroupPlan and are staged immediately before it runs.
+                using var staged = StageRows(session, _valueField, plan.Rows);
+                using var stream = session.Query(WrapExecute(plan.Statement));
+                var batch = stream.ReadNextRecordBatchAsync().GetAwaiter().GetResult();
+                if (batch is null || batch.Length != 1)
+                {
+                    throw new InvalidOperationException(
+                        $"{FluidAggregateFunction.FunctionName}: a group's statement produced "
+                        + $"{batch?.Length ?? 0} rows where exactly 1 is required. An aggregate owes ONE "
+                        + "value per group.");
+                }
+                // ⚠⚠ COPIED, because this column must outlive its stream: the `using` closes the result
+                // before the NEXT group's statement runs (a pinned connection allows ONE live result), and
+                // the concatenation below reads every part long after that. Whether an imported stream's
+                // already-returned batch is self-owning is a question about Apache.Arrow's internals —
+                // guessing it wrong is a use-after-free this codebase records as INVISIBLE on Windows and
+                // Linux, so it is not a question worth answering by hoping.
+                parts.Add(FluidFilterModel.Copy(batch).Column(0));
+                if (stream.ReadNextRecordBatchAsync().GetAwaiter().GetResult() is { } extra)
+                {
+                    extra.Dispose();
+                    throw new InvalidOperationException(
+                        $"{FluidAggregateFunction.FunctionName}: a group's statement produced more than one "
+                        + "batch. An aggregate owes ONE value per group.");
+                }
+                // ⚠ The group's rows are done with: released here rather than at Dispose so peak memory is
+                // one group's rows past the point they are consumed, not every group's at once.
+                plan.Release();
             }
-            finally
+            return parts.Count == 1 ? parts[0] : ArrowArrayConcatenator.Concatenate(parts);
+        }
+    }
+
+    /// <summary>One group's finished work: the SELECT it rendered, and the rows that SELECT reads.</summary>
+    /// <remarks>
+    /// ⚠ The two must travel TOGETHER — see the staging note in <see cref="FinalizeColumn"/>. Splitting them
+    /// (the statement through the host, the rows on the binding) is exactly the shape that makes every group
+    /// read the last group's rows.
+    /// </remarks>
+    internal sealed class GroupPlan
+    {
+        internal GroupPlan(string statement, IReadOnlyList<RecordBatch> rows)
+        {
+            Statement = statement;
+            Rows = rows;
+        }
+
+        internal string Statement { get; }
+
+        internal IReadOnlyList<RecordBatch> Rows { get; }
+
+        internal void Release()
+        {
+            foreach (var b in Rows)
             {
-                session.ReleaseRows(token);
+                b.Dispose();
             }
         }
     }
+
+    /// <summary>
+    /// (Re)creates the temp relation the rendered SELECT reads as <c>rows</c> — this group's rows, or an
+    /// EMPTY one when the group has none.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// ⚠⚠ <b>A STRUCT argument is EXPANDED into columns</b> (<c>UNNEST</c>), so the SQL relation and the
+    /// Liquid value agree: <c>{{ r.a }}</c> in Liquid is <c>a</c> in SQL. That is what makes
+    /// <c>struct_pack(a := a, b := b)</c> — the documented way to pass several columns to an aggregate —
+    /// arrive as a two-column relation rather than as one column of structs. A non-struct argument stays a
+    /// single column under the parameter's own name.
+    /// </para>
+    /// <para>
+    /// ⚠ The expansion is DuckDB's, not ours: <c>UNNEST</c> over an Arrow struct column. MEASURED to keep the
+    /// column TYPES on an EMPTY relation (which is what lets the bind probe derive a result type from it) and
+    /// to turn a NULL struct row into a row of NULL fields rather than dropping it.
+    /// </para>
+    /// <para>
+    /// ⚠⚠ <b>A VIEW over the registered batch, NOT a materialized copy — the rows are already in memory as
+    /// Arrow, so exposing them as a relation costs no data movement at all.</b> It is re-scannable because
+    /// <c>RegisterRows</c> registers a FACTORY (<c>() =&gt; new BorrowedBatchStream(schema, rows)</c>), so
+    /// each scan gets a fresh cursor over the same retained batch. ⚠ The single-use rule this codebase
+    /// records elsewhere is about <c>host_query</c>'s BOUND INPUTS, which wrap one raw stream — a different
+    /// mechanism. A statement reading <c>rows</c> twice is gated below.
+    /// </para>
+    /// <para>
+    /// ⚠ An EMPTY group still gets the relation. A group DuckDB never updated is still finalized, and a
+    /// template whose SELECT reads <c>rows</c> must not fail on it — it should return whatever that statement
+    /// says about no rows (<c>max</c> of nothing is NULL).
+    /// </para>
+    /// </remarks>
+    internal static StagedRows StageRows(FluidRenderSession session, Field valueField,
+                                         IReadOnlyList<RecordBatch>? rows)
+    {
+        var (batch, owned) = rows is null ? (null, false) : Combine(rows);
+        string? token = null;
+        try
+        {
+            token = batch is null
+                ? session.RegisterRows(new Schema(new[] { valueField }, null))
+                : session.RegisterRows(batch);
+            session.ExecuteNonQuery(
+                $"CREATE OR REPLACE TEMP VIEW {DuckSql.QuoteIdent(FluidAggregateFunction.RowsVariable)} "
+                + $"AS SELECT {RowsProjection(valueField)} FROM "
+                + $"fabricator_scan({DuckSql.Literal(token)})");
+            return new StagedRows(session, token, owned ? batch : null);
+        }
+        catch
+        {
+            if (token is not null)
+            {
+                session.ReleaseRows(token);
+            }
+            if (owned)
+            {
+                batch?.Dispose();
+            }
+            throw;
+        }
+    }
+
+    /// <summary>The registration behind a staged <c>rows</c> view, released when the statement is done.</summary>
+    /// <remarks>
+    /// ⚠⚠ <b>The token must outlive every statement that reads the view</b> — the view holds the token, not
+    /// the data, so releasing it first turns the next scan into "no named source registered". That is why
+    /// staging hands one of these back instead of releasing in its own <c>finally</c>.
+    /// </remarks>
+    internal sealed class StagedRows : System.IDisposable
+    {
+        private readonly FluidRenderSession _session;
+        private readonly string _token;
+        private readonly RecordBatch? _owned;
+
+        internal StagedRows(FluidRenderSession session, string token, RecordBatch? owned)
+        {
+            _session = session;
+            _token = token;
+            _owned = owned;
+        }
+
+        public void Dispose()
+        {
+            _session.ReleaseRows(_token);
+            _owned?.Dispose();
+        }
+    }
+
+    /// <summary>The single-column relation's projection: struct fields expanded, anything else as itself.</summary>
+    private static string RowsProjection(Field valueField) =>
+        valueField.DataType is StructType
+            ? $"UNNEST({DuckSql.QuoteIdent(valueField.Name)})"
+            : DuckSql.QuoteIdent(valueField.Name);
+
+    /// <summary>One batch for the whole group (null when it has no rows), and whether WE allocated it.</summary>
+    /// <remarks>
+    /// ⚠ The commonest group is ONE batch, and it is handed STRAIGHT THROUGH — the state already owns it and
+    /// copying it here would make staging cost a full round trip per group for nothing. <c>owned</c> is what
+    /// keeps that safe: only a batch this method built gets disposed by the caller.
+    /// </remarks>
+    private static (RecordBatch? Batch, bool Owned) Combine(IReadOnlyList<RecordBatch> rows)
+    {
+        if (rows.Count == 0)
+        {
+            return (null, false);
+        }
+        if (rows.Count == 1)
+        {
+            return (rows[0], false);
+        }
+        var col = ArrowArrayConcatenator.Concatenate(rows.Select(b => b.Column(0)).ToList());
+        return (new RecordBatch(rows[0].Schema, new[] { col }, col.Length), true);
+    }
+
+    /// <summary>The Liquid <c>rows</c> value: each row's argument as this plugin's value model reads it.</summary>
+    /// <remarks>
+    /// ⚠ <c>ReadCell</c>, so a DATE in <c>rows</c> renders like a DATE in <c>params</c> (it stamps
+    /// <c>DateTimeKind.Utc</c>, without which a date renders as the PREVIOUS DAY east of UTC).
+    /// ⚠ Built HERE rather than at update: a template that only reads <c>rows</c> in SQL pays no boxing.
+    /// </remarks>
+    private static List<object?> ReadRows(IReadOnlyList<RecordBatch> batches)
+    {
+        var rows = new List<object?>();
+        foreach (var b in batches)
+        {
+            var col = b.Column(0);
+            for (int i = 0; i < b.Length; i++)
+            {
+                rows.Add(FluidValueModel.ReadCell(col, i));
+            }
+        }
+        return rows;
+    }
+
+    /// <summary>Wraps one group's render: casts its single column to the type the bind render declared.</summary>
+    /// <remarks>
+    /// ⚠ Positional alias (<c>t(x)</c>), so the wrap needs no knowledge of what the template called its
+    /// column — the same shape, and the same reasoning, as <c>FluidScalarBinding.WrapExecute</c>.
+    /// </remarks>
+    private string WrapExecute(string statement) =>
+        $"SELECT CAST(x AS {_typeName}) AS v FROM ({statement}) t(x)";
 
     // ⚠ Created at BIND and handed in — see the note there. Never created lazily: by update/finalize the
     // ambients a connection needs are gone.
@@ -343,31 +583,63 @@ internal sealed class FluidAggregateBinding : IAggregateBinding, IDisposable
 internal sealed class FluidAggregateState : IAggregateState
 {
     private readonly FluidAggregateBinding _binding;
-    private readonly List<object?> _rows = new();
+    private readonly List<RecordBatch> _batches = new();
 
     internal FluidAggregateState(FluidAggregateBinding binding) => _binding = binding;
 
+    /// <summary>
+    /// Retains the group's rows in ARROW form — one single-column batch per update, COPIED.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// ⚠⚠ <b>COPIED, and not optionally.</b> The caller owns the batch it hands us and disposes it when
+    /// <c>Update</c> returns, and its columns may be SLICES of a larger chunk. Keeping either past the call
+    /// is the use-after-free class this codebase records as invisible on Windows and Linux, so it goes
+    /// through the plugin's established IPC copier.
+    /// </para>
+    /// <para>
+    /// ⚠ Only the VALUE column is copied. <c>template</c> and <c>params</c> occupy their declared slots in
+    /// every update batch, so copying the whole thing would duplicate a constant string per row.
+    /// </para>
+    /// <para>
+    /// ⚠⚠ <b>Arrow rather than CLR values, which is what makes <c>rows</c> a SQL relation possible at all.</b>
+    /// It used to read each cell into a boxed object here; a staged relation needs the Arrow data, and
+    /// rebuilding it from boxed values would be an Arrow type ladder — the thing this function's own history
+    /// records retiring twice. The Liquid <c>rows</c> value is built from these batches at RENDER instead, so
+    /// there is ONE representation and the boxing is paid only by a template that actually reads rows in
+    /// Liquid — the value is LAZY, so a SQL-only template never pays it.
+    /// </para>
+    /// </remarks>
     public void Update(RecordBatch args)
     {
-        var col = args.Column(FluidAggregateBinding.ValueColumn);
-        for (int i = 0; i < args.Length; i++)
+        if (args.Length == 0)
         {
-            // ⚠ ReadCell, this plugin's value model — so a DATE in `rows` renders like a DATE in `params`
-            // (it stamps DateTimeKind.Utc, without which a date renders as the PREVIOUS DAY east of UTC).
-            _rows.Add(FluidValueModel.ReadCell(col, i));
+            return;
         }
+        var field = args.Schema.FieldsList[FluidAggregateBinding.ValueColumn];
+        // ⚠ NOT disposed: this wrapper's column belongs to the caller's batch. Copy() reads it and returns
+        // a batch that owns its own memory.
+        var one = new RecordBatch(new Schema(new[] { field }, null),
+                                  new[] { args.Column(FluidAggregateBinding.ValueColumn) }, args.Length);
+        _batches.Add(FluidFilterModel.Copy(one));
     }
 
     /// <summary>⚠ APPEND, preserving each partial's own order — see the ordering note on the function.</summary>
-    public void Combine(IAggregateState source) => _rows.AddRange(((FluidAggregateState)source)._rows);
+    public void Combine(IAggregateState source) => _batches.AddRange(((FluidAggregateState)source)._batches);
 
     /// <summary>
-    /// This group's value as TEXT; the binding casts a whole vector of them at once (FinalizeBatch).
+    /// This group's rendered SELECT; the binding RUNS it (and every other group's) to build the column.
     /// </summary>
     /// <remarks>
-    /// ⚠ A group that was never updated renders with an EMPTY <c>rows</c> rather than short-circuiting to
-    /// NULL: DuckDB finalizes states it never updated, and a template may legitimately have something to say
-    /// about an empty group (a hash of nothing, a literal). Rendering nothing is still NULL.
+    /// ⚠ A group that was never updated still renders, with an EMPTY <c>rows</c> — DuckDB finalizes states it
+    /// never updated, and a template may legitimately have something to say about an empty group. It must
+    /// still render a SELECT; <c>{% if rows.size == 0 %}select NULL{% else %}…{% endif %}</c> is how an empty
+    /// group gets a different answer.
+    /// <para>
+    /// ⚠ Rendering here and EXECUTING in the binding is not an arbitrary split: the statement must run on the
+    /// call site's own session, which only the binding holds, and running it here would put one query inside
+    /// each state's finalize with no chance to check the column's shape across groups.
+    /// </para>
     /// </remarks>
-    public object? Finalize() => _binding.Render(_rows);
+    public object? Finalize() => new FluidAggregateBinding.GroupPlan(_binding.Render(_batches), _batches);
 }

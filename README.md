@@ -2265,13 +2265,19 @@ CREATE TABLE t AS SELECT i % 3 AS g, i::BIGINT AS a, 'v' || i AS b FROM range(9)
 
 SELECT g, fluid_aggregate(
   '{% if is_bind %}select NULL::VARCHAR
-   {% else %}{% capture s %}{% for r in rows %}{{ r.a }}|{{ r.b }};{% endfor %}{% endcapture %}{{ s | md5 }}{% endif %}',
+   {% else %}{% capture s %}{% for r in rows %}{{ r.a }}|{{ r.b }};{% endfor %}{% endcapture %}
+   select md5({{ s | sql }}){% endif %}',
   NULL, struct_pack(a := a, b := b) ORDER BY a) AS h
 FROM t GROUP BY g ORDER BY g;
 -- 0 | 79172c4e532577b57f10d3513d40fe6a
 -- 1 | 151b6c04cb18b03a93142cf2fd9bdf21
 -- 2 | bbcbd31a7317cc77aa53255f9f088604
 ```
+
+Like every other Fluid surface, the **non-bind render is a SELECT that gets executed** — the value is
+whatever DuckDB computes, so the reduction can use any DuckDB function and nothing is parsed back out of
+text. Every group must render one, including an empty group:
+`{% if rows.size == 0 %}select NULL{% else %}…{% endif %}`.
 
 The group's rows are `rows`; `template` and `params` are bind-time constants. It works under **`GROUP BY` and
 under `OVER (...)`**, including a moving frame:
@@ -2287,15 +2293,34 @@ SELECT a, fluid_aggregate('{% if is_bind %}select NULL::BIGINT{% else %}{{ rows.
 > aggregation decides, and the value changes between runs with nothing failing.
 
 Like `fluid_scalar`, the **`is_bind` render declares the result type** — and it is a real DuckDB type, so
-`DECIMAL(9,2)` keeps its scale and a `STRUCT(n INTEGER, s VARCHAR)` comes back as a struct, not text. Unlike
-`fluid_scalar` it renders **text** rather than SQL, because an aggregate's rows live in the extension rather
-than in DuckDB — the reduction happens in Liquid, and the declared type is applied by a cast afterwards.
+`DECIMAL(9,2)` keeps its scale and a `STRUCT(n INTEGER, s VARCHAR)` comes back as a struct, not text.
+
+**The group's rows are also a SQL relation called `rows`**, so the reduction can happen in DuckDB rather than
+in Liquid — which is usually what you want:
+
+```sql
+SELECT g, fluid_aggregate('select max(t) from rows t',
+                          NULL, struct_pack(a := a, b := b) ORDER BY a) AS h
+FROM t GROUP BY g ORDER BY g;
+-- 0 | {'a': 6, 'b': v6}   …
+```
+
+Note there is **no `is_bind` branch**: the result type is worked out by binding that same statement against an
+empty, fully typed `rows`, so a template only needs `is_bind` when its type cannot be derived from the input.
+A `struct_pack(...)` argument arrives as **columns** (`{{ r.a }}` in Liquid is `a` in SQL); any other argument
+is a single column named `value`.
+
+> ⚠⚠ **Prefer the SQL form for anything heavy.** The md5 example above, written in Liquid and in SQL over
+> `rows`, produces identical hashes — and over 2000 groups takes **~2.6 s in Liquid versus ~0.01 s in SQL**.
+> The SQL spelling is:
+> `select md5(string_agg(a || '|' || b, ';' ORDER BY a) || ';') from rows`
 
 > ⚠ **One per-row argument.** DuckDB does not allow a variadic aggregate here, so pass several columns as one
 > `struct_pack(a := a, b := b)` and read `r.a`, `r.b` in the template.
 >
-> ⚠ **It holds each group's rows in memory** (a Liquid reduction cannot be folded incrementally), so it does
-> not spill — think before using it on a very high-cardinality `GROUP BY`.
+> ⚠ **It runs one statement per group, and holds each group's rows in memory** — measured at ~0.5 ms per
+> group for a hashing template, and it cannot spill. Both point the same way: a few thousand groups is fine,
+> a hundred thousand is not what this is for.
 >
 > ⚠ **Where the reduction is really "render per row, then join", prefer what already works:**
 > `md5(string_agg(fluid_render(...), ';' ORDER BY a))` is cheaper. `fluid_aggregate` earns its keep when the

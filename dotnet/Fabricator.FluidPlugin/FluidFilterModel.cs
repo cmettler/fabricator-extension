@@ -262,7 +262,14 @@ internal static class FluidFilterModel
         }
     }
 
-    private static RecordBatch Copy(RecordBatch batch)
+    /// <summary>A batch that owns its own memory, via an IPC round trip.</summary>
+    /// <remarks>
+    /// ⚠ The established copier in this plugin (the shape <c>FluidValueModel.CopyBagRow</c> uses). Reach for
+    /// it whenever a batch must outlive the stream it came from: whether an imported stream's already-returned
+    /// batches are self-owning is a question about Apache.Arrow's internals, and guessing it wrong is a
+    /// use-after-free that this codebase records as INVISIBLE on Windows and Linux.
+    /// </remarks>
+    internal static RecordBatch Copy(RecordBatch batch)
     {
         var ms = new MemoryStream();
         using (var w = new ArrowStreamWriter(ms, batch.Schema, leaveOpen: true))
