@@ -2813,6 +2813,66 @@ Both flavours appear in `duckdb_functions()` with `function_type` `macro` or `ta
 > self-contained (expressions, or queries over built-ins), and use a SQL-generating table function when the
 > body must reach into its own catalog's tables.
 
+### Relation zipping: `table_zip` / `query_zip`
+
+Two **global table macros** that `POSITIONAL JOIN` several relations side by side — `pandas.concat(axis=1)`
+for DuckDB. They ship in `Fabricator.Functions`, whose bodies live as real `.sql` files under
+`dotnet/Fabricator.Functions/Macros/`.
+
+```sql
+CREATE TABLE za AS SELECT i AS id, 'a' || i AS v FROM range(3) r(i);
+CREATE TABLE zb AS SELECT i * 10 AS id, 'b' || i AS v FROM range(3) r(i);
+
+SELECT * FROM table_zip(['^z.$']);
+-- ┌───────┬─────────┬───────┬─────────┐
+-- │  id   │    v    │ id_1  │   v_1   │
+-- │     0 │ a0      │     0 │ b0      │
+-- │     1 │ a1      │    10 │ b1      │
+-- │     2 │ a2      │    20 │ b2      │
+```
+
+Duplicate column names need no handling: the generated statement is bound as a **subquery**, so DuckDB
+uniquifies the names itself (`id`, `id_1`, …) — collision-safe even against a real column already named
+`id_1`.
+
+**`table_zip(patterns [, similar_to := true] [, as_structs := false] [, rowid_begin := …] [, rowid_end := …])`**
+
+| option | meaning |
+|---|---|
+| `similar_to := true` (default) | each entry is a DuckDB `SIMILAR TO` pattern — a **full-match** regex, so `_` and `%` are literal and a substring match is `.*foo.*`. Tables **and views** are matched, system objects excluded. |
+| `similar_to := false` | entries are relation names used **as is** (`db.schema.t`, or a pre-quoted `"odd name"`), with no catalog lookup. |
+| `as_structs := true` | one column per relation, each a `STRUCT` of that relation's columns, named after the relation. |
+| `rowid_begin` / `rowid_end` | restrict every relation to a range of DuckDB `rowid`s. Independent and both optional. |
+
+Relations are ordered by **position in the list**, then by name within one pattern; a relation matching
+several patterns appears **once**, at its earliest position.
+
+**`query_zip(queries [, as_structs := false])`** is the same thing over subqueries. A `LIST` zips them
+anonymously; a `MAP` names them, and the name becomes a column prefix — or the struct name under
+`as_structs`:
+
+```sql
+SELECT * FROM query_zip(['SELECT 1 AS a', 'SELECT 2 AS b']);            -- a | b
+SELECT * FROM query_zip({'x': 'SELECT 1 AS a', 'y': 'SELECT 2 AS b'});  -- x_a | y_b
+SELECT * FROM query_zip({'x': 'SELECT 1 AS a'}, as_structs := true);    -- x  STRUCT(a INTEGER)
+```
+
+> ⚠⚠ **A positional join pairs rows by POSITION, and it is your job to know that means something.** There is
+> no join condition, so the relations must be row-aligned — typically because they were produced together.
+> Nothing checks this, and a mismatch is a wrong answer rather than an error.
+>
+> ⚠ **`rowid_begin` / `rowid_end` are INCLUSIVE — `BETWEEN` semantics.** `rowid_begin := 3, rowid_end := 6`
+> yields rowids 3, 4, 5 **and 6**, so adjacent chunks do **not** compose: the next range must start at 7, not
+> reuse 6. The filter is applied to *every* relation, not one — a positional join has nothing for a predicate
+> to propagate through.
+>
+> ⚠ A **view** works with `rowid_*` only if it exposes a `rowid` column
+> (`CREATE VIEW v AS SELECT rowid AS rowid, * FROM t`); otherwise DuckDB says so by name.
+>
+> ⚠ Under `similar_to := true` the catalog is read on the render's **own** connection, so the caller's
+> **TEMP** relations are invisible to the pattern match. Name them with `similar_to := false`, which renders
+> them verbatim into a statement the caller binds.
+
 ### Provider views
 
 A provider can also ship **views** bound into an attached catalog's schemas. Unlike a macro, a view is a

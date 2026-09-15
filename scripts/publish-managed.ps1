@@ -133,6 +133,16 @@ Publish-Project $deltaBuiltinProj "Fabricator.Delta"
 $fluidProj = Join-Path $PSScriptRoot "../dotnet/Fabricator.FluidPlugin/Fabricator.FluidPlugin.csproj" | Resolve-Path
 Publish-Project $fluidProj "Fabricator.FluidPlugin"
 
+# Fabricator.Functions: global DuckDB MACROS shipped as `Macros/*.sql` (table_zip, query_zip). A BUILT-IN
+# provider assembly like Fluid above, discovered by the same `Fabricator*.dll` glob, so THIS LINE IS THE
+# ONLY THING THAT PUTS IT IN THE PAYLOAD.
+# /!\ IT DEPENDS ON Fabricator.FluidPlugin AT CALL TIME, not at load time: every macro body is a
+# fluid_replacement_query, and DuckDB binds a macro body LAZILY. So the two publishes are independent and
+# their ORDER is irrelevant -- but a payload carrying this and not Fluid registers the macros happily and
+# answers "Table Function with name fluid_replacement_query does not exist" at the first call site.
+$functionsProj = Join-Path $PSScriptRoot "../dotnet/Fabricator.Functions/Fabricator.Functions.csproj" | Resolve-Path
+Publish-Project $functionsProj "Fabricator.Functions"
+
 # Optional third provider: Fabricator.DeltaRs (delta-rs via delta-dotnet). Published into the SAME fabricator/
 # dir so the bridge discovers it by assembly name. Brings DeltaLake.dll + the two native Rust DLLs
 # (delta_rs_bridge.dll / delta_kernel_ffi.dll, ~240 MB) — hence opt-in via -IncludeDeltaRs.

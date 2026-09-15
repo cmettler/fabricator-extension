@@ -167,7 +167,11 @@ case "$TIER" in
         # plugin root, and the derived lists reclassified it on their own. The service tier loses the same
         # run. Its 234 assertions now run on all THREE platforms instead of linux-only, which matters here
         # more than usual: its temporal assertions read TimeZoneInfo.Local.
-        : "${MIN_SUITES:=76}"
+        # 77 since 2026-09-15: verify_functions_zip — the NEW Fabricator.Functions provider, whose only
+        # contribution is global DuckDB MACROS shipped as Macros/*.sql (table_zip, query_zip). Its §1
+        # registration row is the ONLY thing that sees a delivery failure: the embed, the publish line and
+        # the macro body all fail QUIETLY, surfacing at a call site as "… does not exist".
+        : "${MIN_SUITES:=77}"
         # 5656 since 2026-08-02: verify_delta_catalog_transactions 943 -> 944 Ã¢ÂÂ ROLLBACK now RECLAIMS the
         # data files the transaction eagerly wrote (EW #52's DiscardDataFilesAsync) instead of leaving them
         # for VACUUM. +2, not +1: that suite is one of the DOUBLED ones below, so an assertion added to it
@@ -697,7 +701,12 @@ case "$TIER" in
         #   the inverse of sql_ident, for a name that arrives already quoted. ⚠ Its load-bearing rows are
         #   the ones it REFUSES: `"a"."b"` is two identifiers, and stripping the outer pair would rename a
         #   relation to `a"."b` with nothing failing. Logic lives in DuckSql (tier-0, floor 258 -> 278).
-        : "${MIN_ASSERTIONS:=9343}"
+        # 2026-09-15: 9343 -> 9410. The NEW verify_functions_zip (+67) — table_zip / query_zip, the
+        #   Fabricator.Functions macro library. No other suite moved. ⚠ Two rows there are the ones to keep:
+        #   §6's TEMP table (the catalog lookup runs on the RENDER's connection, the generated statement on
+        #   the CALLER's — nothing else can see that split) and §10's count(*) refusals (DuckDB PRUNES a
+        #   projected error(), so in the SELECT list a typo answered count(*) with 1 instead of raising).
+        : "${MIN_ASSERTIONS:=9410}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

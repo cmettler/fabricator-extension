@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // See LICENSE in the project root for license information.
 
+using System;
+using Microsoft.Extensions.Logging;
+
 namespace Fabricator.Bridge;
 
 /// <summary>
@@ -197,18 +200,41 @@ public static class ProviderRegistry
             // load-bearing and its comment had to warn against prepending. BuiltInDefaultProvider names
             // "sqlserver" outright now, which is what made the glob safe — alphabetically the first
             // provider found would be `dax`, and before it the Bridge's own StubBackend.
-            names = "Fabricator.SqlServer,Fabricator.AnalysisServices,Fabricator.DeltaRs,Fabricator.Delta,Fabricator.FluidPlugin";
+            names = "Fabricator.SqlServer,Fabricator.AnalysisServices,Fabricator.DeltaRs,Fabricator.Delta,Fabricator.FluidPlugin,Fabricator.Functions";
         }
         foreach (var assemblyName in names.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
         {
+            System.Reflection.Assembly assembly;
             try
             {
-                var assembly = System.Reflection.Assembly.Load(assemblyName);
+                assembly = System.Reflection.Assembly.Load(assemblyName);
+            }
+            catch (Exception ex)
+            {
+                // ORDINARY: the default list names optional assemblies (Fabricator.DeltaRs ships only under
+                // -IncludeDeltaRs), so "not there" is the normal state and must not read as a fault. Debug.
+                FabricatorLog.CreateLogger("Fabricator.Bridge").LogDebug(
+                    "provider assembly {Assembly} not loaded: {Error}", assemblyName, ex.Message);
+                continue;
+            }
+            try
+            {
                 RegisterProvidersFrom(assembly, map);
             }
-            catch
+            catch (Exception ex)
             {
-                // Assembly missing/unloadable — skip it; fall back to the stub below if nothing registered.
+                // ⚠⚠ A DIFFERENT CASE ENTIRELY, AND IT USED TO BE INVISIBLE. The assembly IS here and its
+                // registration THREW -- a type initializer, a drift guard, a contract mismatch -- so every
+                // provider it declares is silently absent and the user learns at a call site that some
+                // function "does not exist", with nothing anywhere naming the assembly. MEASURED while
+                // building Fabricator.Functions: a deliberately broken macro resource made BOTH its macros
+                // vanish from duckdb_functions() with no signal at all.
+                // ⚠ WARNED, NOT FATAL, deliberately: one bad provider must not cost the user every other
+                // one, which is the same trade FetchCapabilities' catch already makes.
+                FabricatorLog.CreateLogger("Fabricator.Bridge").LogWarning(
+                    "provider assembly {Assembly} loaded but registered NOTHING: {Type}: {Error}. Every "
+                    + "provider and global function it declares is absent.",
+                    assemblyName, ex.GetType().Name, ex.Message);
             }
         }
         ScanPluginDirectories(map);

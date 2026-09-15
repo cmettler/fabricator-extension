@@ -1,0 +1,259 @@
+# name: test/verify_functions_zip.test
+# description: Fabricator.Functions — the global DuckDB MACROS shipped as Macros/*.sql (table_zip, query_zip).
+#              Gates BOTH halves: that the embedded-resource DELIVERY works at all, and what the two macros
+#              mean. See dotnet/Fabricator.Functions/FunctionsProvider.cs and the header of each .sql file.
+# group: [fabricator]
+
+require fabricator
+
+# ⚠⚠ `require json` IS LOAD-BEARING, NOT HYGIENE. table_zip's catalog lookup is a `{% query %}` block,
+# and the Fluid plugin classifies every such body with `json_serialize_sql` (DuckDB's own parser) before
+# running it -- fail-closed, so with json absent EVERY call is refused and the section reads as a broken
+# FEATURE rather than a missing REQUIRE. `unittest` does NOT auto-load extensions; `duckdb.exe` does, which
+# is why this passes in the shell either way. The recorded trap, hit again here.
+require json
+
+# NOTE: no ATTACH and no require-env. These are GLOBAL macros on a bare loaded extension — and they are
+# built on fluid_replacement_query, which is a BUILT-IN provider (not a plugin), so they resolve with the
+# hermetic tier's empty FABRICATOR_PLUGIN_DIR.
+
+# ==============================================================================================
+# §1  REGISTRATION — the delivery path is QUIET, so it gets its own assertion.
+# ==============================================================================================
+# ⚠⚠ THIS SECTION IS NOT CEREMONY. Three independent things must all have happened for a macro here to
+# exist, and NONE of them fails loudly:
+#   · the <EmbeddedResource Include="Macros/*.sql" /> item matched the file;
+#   · publish-managed.ps1 put Fabricator.Functions in the payload (the glob discovers what was PUBLISHED,
+#     so that one line IS the declaration — delete it and both macros vanish with no error anywhere);
+#   · MacroDefinition's own contract says a statement that does not parse "is skipped with a WARNING at
+#     load", so a macro whose body stopped parsing is simply absent.
+# Every one of those surfaces at a CALL SITE as "… does not exist", three layers from the cause.
+
+query TT
+SELECT function_name, function_type FROM duckdb_functions()
+ WHERE function_name IN ('table_zip', 'query_zip') ORDER BY 1;
+----
+query_zip	table_macro
+table_zip	table_macro
+
+statement ok
+CREATE TABLE zq_a AS SELECT i AS id, 'A' || i AS v FROM range(3) r(i);
+
+statement ok
+CREATE TABLE zq_b AS SELECT i * 10 AS id, 'B' || i AS v FROM range(3) r(i);
+
+# ==============================================================================================
+# §2  table_zip — the zip itself, and DuckDB's own column disambiguation
+# ==============================================================================================
+# The two relations share BOTH column names. We deliberately do NOT dedupe them ourselves: a
+# fluid_replacement_query DISAPPEARS at bind (generate_table_sql -> bind_replace -> SubqueryRef), so its
+# output is bound as a SUBQUERY and DuckDB uniquifies a subquery's names itself. That is strictly better
+# than a hand-rolled scheme, because it is collision-safe even against a real column already named id_1.
+
+query ITIT
+SELECT * FROM table_zip(['^zq_.$']);
+----
+0	A0	0	B0
+1	A1	10	B1
+2	A2	20	B2
+
+# The names DuckDB chose — pinned, because they are the contract a caller writes against.
+# (DESCRIBE IS usable as a subquery source, unlike EXPLAIN — worth knowing, since the two read alike.)
+query T
+SELECT column_name FROM (DESCRIBE SELECT * FROM table_zip(['^zq_.$']));
+----
+id
+v
+id_1
+v_1
+
+# ==============================================================================================
+# §3  ORDER — list position first, then name WITHIN one pattern
+# ==============================================================================================
+# The two rules are separable only if alphabetical order and list order DISAGREE, which is why zq_b is
+# named first here. Each row below would pass on a build implementing only the other rule.
+
+# list position wins over name
+query TT
+SELECT v, v_1 FROM table_zip(['zq_b', 'zq_a']) LIMIT 1;
+----
+B0	A0
+
+# name orders within ONE pattern
+query TT
+SELECT v, v_1 FROM table_zip(['zq_.']) LIMIT 1;
+----
+A0	B0
+
+# ==============================================================================================
+# §4  DEDUPE — a relation matching several patterns appears ONCE, at its EARLIEST position
+# ==============================================================================================
+# zq_a matches pattern 1 AND pattern 2. Two columns, not three, and A first.
+
+query TT
+SELECT v, v_1 FROM table_zip(['zq_a', 'zq_.']) LIMIT 1;
+----
+A0	B0
+
+# ==============================================================================================
+# §5  VIEWS ARE INCLUDED
+# ==============================================================================================
+
+statement ok
+CREATE VIEW zq_v AS SELECT 'V' || i AS v FROM range(3) r(i);
+
+query T
+SELECT * FROM table_zip(['zq_v']) LIMIT 1;
+----
+V0
+
+# ==============================================================================================
+# §6  similar_to := false — names AS IS, no catalog lookup
+# ==============================================================================================
+# ⚠⚠ THE TEMP TABLE IS THE DISCRIMINATOR, and it pins a split nothing else can see: the CATALOG LOOKUP
+# runs on the render's OWN pinned connection (so a TEMP relation is invisible to it), while the GENERATED
+# STATEMENT is bound by the CALLER (so a TEMP relation is perfectly visible there). A build that did the
+# lookup on the caller's connection would pass every other row in this file and fail the first of these.
+
+statement ok
+CREATE TEMP TABLE zq_tmp AS SELECT 'T' || i AS v FROM range(3) r(i);
+
+statement error
+SELECT * FROM table_zip(['zq_tmp']);
+----
+no table or view matched
+
+query T
+SELECT * FROM table_zip(['zq_tmp'], similar_to := false) LIMIT 1;
+----
+T0
+
+# ==============================================================================================
+# §7  as_structs — ONE column per relation, named after it
+# ==============================================================================================
+
+query TT
+SELECT za.v, zb.v FROM (SELECT * FROM table_zip(['^zq_[ab]$'], as_structs := true)) t(za, zb) LIMIT 1;
+----
+A0	B0
+
+query TT
+SELECT column_name, column_type
+  FROM (DESCRIBE SELECT * FROM table_zip(['^zq_[ab]$'], as_structs := true));
+----
+zq_a	STRUCT(id BIGINT, v VARCHAR)
+zq_b	STRUCT(id BIGINT, v VARCHAR)
+
+# ==============================================================================================
+# §8  rowid_begin / rowid_end — INCLUSIVE, i.e. BETWEEN semantics
+# ==============================================================================================
+# ⚠ Both ends are IN the range. The three rows below are the whole contract: begin only, end only, both.
+# ⚠ The filter goes on EVERY relation, not one — POSITIONAL JOIN has no join condition, so there is
+#   nothing for a predicate to propagate through. The v/v_1 pairing is what shows both were filtered: a
+#   build filtering only the first relation would answer A1|B0, i.e. MISALIGNED rows, not fewer rows.
+
+query TT
+SELECT v, v_1 FROM table_zip(['^zq_[ab]$'], rowid_begin := 1);
+----
+A1	B1
+A2	B2
+
+query TT
+SELECT v, v_1 FROM table_zip(['^zq_[ab]$'], rowid_end := 1);
+----
+A0	B0
+A1	B1
+
+query TT
+SELECT v, v_1 FROM table_zip(['^zq_[ab]$'], rowid_begin := 1, rowid_end := 1);
+----
+A1	B1
+
+# ⚠⚠ ADJACENT RANGES DO NOT COMPOSE, and that is the cost of BETWEEN rather than a defect. [0,1] and [1,2]
+# BOTH contain rowid 1, so chunking must step the next begin PAST the previous end. Pinned so nobody
+# writes a chunked reader against half-open semantics this does not have.
+query I
+SELECT count(*) FROM (
+  SELECT v FROM table_zip(['zq_a'], rowid_begin := 0, rowid_end := 1)
+  INTERSECT
+  SELECT v FROM table_zip(['zq_a'], rowid_begin := 1, rowid_end := 2));
+----
+1
+
+# A VIEW filters iff it EXPOSES a rowid column; one that does not fails in DuckDB's own words, which name
+# the column AND the candidates. No check of ours would say it better.
+statement ok
+CREATE VIEW zq_vr AS SELECT rowid AS rowid, 'W' || v AS w FROM zq_a;
+
+query IT
+SELECT * FROM table_zip(['zq_vr'], rowid_begin := 2);
+----
+2	WA2
+
+statement error
+SELECT * FROM table_zip(['zq_v'], rowid_begin := 1);
+----
+rowid
+
+# ==============================================================================================
+# §9  query_zip — the QUERY sibling
+# ==============================================================================================
+
+query II
+SELECT * FROM query_zip(['SELECT 1 AS a', 'SELECT 2 AS b']);
+----
+1	2
+
+# A MAP gives each query an ALIAS, which becomes a column-name PREFIX …
+query T
+SELECT column_name
+  FROM (DESCRIBE SELECT * FROM query_zip({'x': 'SELECT 1 AS a', 'y': 'SELECT 2 AS b'}));
+----
+x_a
+y_b
+
+# … and the STRUCT name under as_structs.
+query TT
+SELECT column_name, column_type FROM (DESCRIBE
+  SELECT * FROM query_zip({'x': 'SELECT 1 AS a', 'y': 'SELECT 2 AS b'}, as_structs := true));
+----
+x	STRUCT(a INTEGER)
+y	STRUCT(b INTEGER)
+
+# ==============================================================================================
+# §10  THE REFUSALS SURVIVE PROJECTION PRUNING — the row this section exists for
+# ==============================================================================================
+# ⚠⚠ EVERY REFUSAL IS `SELECT 1 AS zip_error WHERE error(...)`, NOT `SELECT error(...)`, AND ONLY A
+# count(*) ROW CAN SEE THE DIFFERENCE. DuckDB PRUNES a projected column nobody reads, so with the error in
+# the SELECT list a typo'd pattern answered count(*) with **1** — the one row of the degenerate statement —
+# instead of raising. MEASURED both ways: `SELECT count(*) FROM (SELECT error('boom'))` returns 1, the same
+# thing as a WHERE raises. A filter must be evaluated, so it cannot be pruned away.
+# ⚠ A `SELECT *` row here would pass under EITHER form, which is exactly why these are count(*).
+
+statement error
+SELECT count(*) FROM table_zip(['no_such_relation_anywhere']);
+----
+no table or view matched
+
+# ⚠ The two branches refuse an empty list in their own words — the catalog branch has nothing MATCHED,
+# the as-is branch has nothing GIVEN — so both are asserted rather than one standing in for the other.
+statement error
+SELECT count(*) FROM table_zip([]);
+----
+no table or view matched
+
+statement error
+SELECT count(*) FROM table_zip([], similar_to := false);
+----
+no relation names given
+
+statement error
+SELECT count(*) FROM query_zip([]);
+----
+no queries given
+
+# The positive control: with the WHERE form in place an ordinary count(*) still answers.
+query I
+SELECT count(*) FROM table_zip(['zq_a']);
+----
+3

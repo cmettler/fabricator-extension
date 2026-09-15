@@ -1,0 +1,39 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Library</OutputType>
+    <RootNamespace>Fabricator.Functions</RootNamespace>
+    <AssemblyName>Fabricator.Functions</AssemblyName>
+    <Description>
+      Useful global MACROS, shipped as real SQL files rather than C# string literals. A connection-free
+      IProvider that hosts no catalog and contributes only DuckDB macros.
+
+      ⚠ IT IS A BUILT-IN PROVIDER ASSEMBLY, NOT A PLUGIN — the same shape as Fabricator.FluidPlugin and for
+      the same measured reason: FABRICATOR_PLUGIN_DIR REPLACES the plugin roots rather than extending them
+      (PluginPaths.ResolveRoots returns early), so anything shipped as a bundled plugin silently disappears
+      for a user who sets that variable to load their own. These macros are documented as available out of
+      the box, so they must not depend on a plugin root existing.
+
+      ⚠⚠ IT DEPENDS ON THE FLUID PROVIDER AT CALL TIME, not at load time: every macro here is built on
+      fluid_replacement_query. A macro BODY is bound lazily by DuckDB, so registration order does not matter
+      and a narrowed FABRICATOR_BACKEND_ASSEMBLY that drops Fabricator.FluidPlugin leaves these macros
+      REGISTERED BUT UNCALLABLE — failing at first use with "Table Function with name
+      fluid_replacement_query does not exist" rather than at load.
+    </Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- The contract only: no Common, no Bridge. A macro provider marshals nothing. -->
+    <ProjectReference Include="..\Fabricator.Abstractions\Fabricator.Abstractions.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- ⚠ The macros are REAL SQL FILES (Macros/*.sql), embedded and loaded by FunctionsProvider.LoadMacros
+         — which drift-guards each one (its file name must equal its CREATE MACRO name) and REFUSES an empty
+         set. Both guards exist because the DELIVERY path fails quietly: MacroDefinition's own contract says
+         a statement that does not parse "is skipped with a warning at load", so a macro that silently did
+         not register answers "… does not exist" at the call site, three layers from the cause. -->
+    <EmbeddedResource Include="Macros\*.sql" />
+  </ItemGroup>
+
+</Project>
