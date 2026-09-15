@@ -163,6 +163,51 @@ public class DecisionRuleParserTests
         => Assert.Equal("CHARINDEX('x', col) > 0",
             DecisionRuleParser.ParseCondition("CHARINDEX('x', ?) > 0", "col", DmnDialect.TSql));
 
+    // ── every leading comparison operator ────────────────────────────────────────────────────────────
+    // The documented theory above covers `>`, `>=` and `<>`; these are the rest of what LeadingOperator
+    // matches. ⚠ The operator is passed THROUGH verbatim rather than normalised — `!=` stays `!=` — which
+    // is right for every dialect here and is what keeps the emitted SQL the author's own.
+    [Theory]
+    [InlineData("< 18", "age", "age < 18")]
+    [InlineData("<= 18", "age", "age <= 18")]
+    [InlineData("!= 'x'", "region", "region != 'x'")]
+    [InlineData("= 5", "age", "age = 5")]
+    public void Every_leading_operator(string cell, string column, string expected)
+        => Assert.Equal(expected, DecisionRuleParser.ParseCondition(cell, column));
+
+    // ── a FULL condition detected by a KEYWORD rather than an operator ───────────────────────────────
+    // ⚠ These reach IsFullCondition through its KEYWORD list, not its operator list, so a cell carrying no
+    // comparison sign at all still passes through instead of being quoted. Without that path a LIKE cell
+    // would render as an equality against its own text — valid SQL that is always false.
+    [Theory]
+    [InlineData("@region LIKE 'E%'", "region", "region LIKE 'E%'")]
+    [InlineData("@region ILIKE 'e%'", "region", "region ILIKE 'e%'")]
+    [InlineData("@region REGEXP '^E'", "region", "region REGEXP '^E'")]
+    [InlineData("@age BETWEEN 1 AND 2", "age", "age BETWEEN 1 AND 2")]
+    public void A_keyword_makes_a_cell_a_full_condition(string cell, string column, string expected)
+        => Assert.Equal(expected, DecisionRuleParser.ParseCondition(cell, column));
+
+    // ⚠⚠ A CHARACTERIZATION, and the kind of edge worth knowing before someone writes it into a rules
+    // table: the numeric test has NO EXPONENT form, so `1e5` is not a number and falls through to the
+    // string fallback. The ported engine's regex is identical, so this is FAITHFUL rather than a defect —
+    // but a cell reading `= 1e5` compares against the TEXT. Write `100000`, or a cast, which IS detected
+    // as an expression.
+    [Fact]
+    public void Scientific_notation_is_not_a_number()
+    {
+        Assert.Equal("'1e5'", DecisionRuleParser.ParseValue("1e5"));
+        Assert.Equal("1e5::DOUBLE", DecisionRuleParser.ParseValue("1e5::DOUBLE"));
+    }
+
+    // ⚠ FALSE completes the three keyword literals; the theory above covers TRUE and NULL. All three are
+    // upper-cased, so a rules table written in lower case still renders canonical SQL.
+    [Theory]
+    [InlineData("false", "FALSE")]
+    [InlineData("False", "FALSE")]
+    [InlineData("null", "NULL")]
+    public void Keyword_literals_are_upper_cased(string cell, string expected)
+        => Assert.Equal(expected, DecisionRuleParser.ParseValue(cell));
+
     // ── the reference prefix ─────────────────────────────────────────────────────────────────────────
     // ⚠⚠ IT EXISTS FOR ONE MEASURED DuckDB RULE: a macro PARAMETER shadows a column of the same name
     // anywhere in the body, so a generated macro whose parameter is `age` and whose preprocessing CTE also

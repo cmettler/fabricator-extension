@@ -733,7 +733,14 @@ case "$TIER" in
         #   by the cell parser and REFUSED by the renderer while only the DuckDB statement template
         #   exists, so a caller cannot get a DuckDB macro back that pretends to be T-SQL. ⚠ That gate row
         #   is what slice 3 DELETES, not edits.
-        : "${MIN_ASSERTIONS:=9599}"
+        # 2026-09-16: 9599 -> 9642. verify_decision_render 136 -> 179 — the coverage audit the user asked
+        #   for (§9-§14). What was MISSING rather than thin: the `Any` hit policy and
+        #   `_any_hitpolicy_violations_` (zero rows), aggregate-mode output EXCLUSION (§5 gives every
+        #   output a preprocessing expression, so it could not reach that branch), NON-aggregate output
+        #   postprocessing (§3 gives outputs none and §5 gives them all aggregates, so neither reaches
+        #   the ordinary scalar postprocess), the `In_` parameter-name stripping, a blank-direction column
+        #   being IGNORED, sparse `rulepos`, and `decisiontable_hk`.
+        : "${MIN_ASSERTIONS:=9642}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

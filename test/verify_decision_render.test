@@ -432,3 +432,202 @@ query T
 SELECT dmn_condition('in [1,2,3]', 'age', 'tsql', '');
 ----
 age IN (1, 2, 3)
+
+# ==============================================================================================
+# §9  THE MACRO'S SHAPE — which columns become PARAMETERS, and in what order.
+# ==============================================================================================
+# ⚠⚠ THIS IS THE ONLY ASSERTION THAT SEES A COLUMN BEING IGNORED. A `Comment`-style column (blank
+# direction) contributes no parameter and no output — but a build that turned it into an INPUT would
+# still pass every answer row in this file, because its rules cells are blank and a blank cell is a
+# WILDCARD. So the shape has to be asserted directly.
+#
+# ⚠ A MACRO's parameter list is DETERMINISTIC, unlike a FUNCTION's. The recorded trap — that
+# `duckdb_functions().parameters` lists NAMED parameters in an unordered_map's iteration order, so it
+# differs by platform — is about `TableFunction::named_parameters`. A macro's `parameters` is a
+# `vector` and its `default_parameters` an `InsertionOrderPreservingMap`, both order-preserving. Read
+# out of duckdb_functions.cpp, not assumed.
+
+statement ok
+CREATE TABLE shape (rulepos INT, In_region VARCHAR, note VARCHAR, age VARCHAR, decision VARCHAR);
+
+statement ok
+INSERT INTO shape VALUES
+    (-2, 'in',      NULL,        'in',      'out'),
+    (-1, 'VARCHAR', NULL,        'INTEGER', 'VARCHAR'),
+    ( 1, 'EU',      'ignore me', '> 18',    'euro'),
+    ( 2, '',        NULL,        '',        'other');
+
+statement ok
+SELECT fabricator_host_exec(decision_render('shape', name := 'ev_shape'));
+
+# `In_region` → `region` (the prefix is stripped from the PARAMETER, never from the column), `note` is
+# ignored entirely, `decision` is an OUTPUT, and `hit_policy` is always last.
+query T
+SELECT list_aggregate(parameters, 'string_agg', ',') FROM duckdb_functions() WHERE function_name = 'ev_shape';
+----
+region,age,hit_policy
+
+# ⚠ The behaviour half: the stripped name is what the CALLER uses, and it still matches on the column.
+query IT
+SELECT rulepos, decision FROM ev_shape(region := 'EU', age := 30);
+----
+1	euro
+
+# ==============================================================================================
+# §10  THE `Any` HIT POLICY — overlapping rules that DISAGREE.
+# ==============================================================================================
+# ⚠⚠ THE TWO ROWS ARE EACH OTHER'S CONTROL, and neither means anything alone: `Any` reports a problem
+# only when overlapping rules produce DIFFERENT outputs, so a build that always reported one, and a
+# build that never did, are separated only by having both shapes here.
+
+statement ok
+CREATE TABLE anyt (rulepos INT, region VARCHAR, decision VARCHAR);
+
+statement ok
+INSERT INTO anyt VALUES (-2,'in','out'), (-1,'VARCHAR','VARCHAR'),
+    (1,'EU','same'), (2,'EU','same'), (3,'US','a'), (4,'US','b');
+
+statement ok
+SELECT fabricator_host_exec(decision_render('anyt', name := 'ev_any'));
+
+# Two rules match and AGREE ⇒ no violation, no error. (`_total_hits_` is still 2 — Any reports, it does
+# not deduplicate.)
+query IIT
+SELECT _total_hits_, _any_hitpolicy_violations_, coalesce(_model_error_, '<none>')
+  FROM ev_any('EU', hit_policy := 'Any');
+----
+2	0	<none>
+
+# Two rules match and DISAGREE ⇒ the violation count is the extra distinct output, and Any says so.
+query IIT
+SELECT _total_hits_, _any_hitpolicy_violations_, coalesce(_model_error_, '<none>')
+  FROM ev_any('US', hit_policy := 'Any');
+----
+2	1	Model Error: Overlapping rules hit with different outputs!
+
+# ⚠ `_any_hitpolicy_violations_` is computed for EVERY policy — it is an output column, not an Any-only
+# one — and only the MESSAGE is policy-dependent. Pinned so the two cannot be conflated.
+query IT
+SELECT _any_hitpolicy_violations_, coalesce(_model_error_, '<none>') FROM ev_any('US');
+----
+1	<none>
+
+# ==============================================================================================
+# §11  AGGREGATE MODE — an output with NO preprocessing is EXCLUDED but still computed.
+# ==============================================================================================
+# ⚠⚠ THE TWO HALVES ARE ONE RULE AND BOTH MATTER. Such a column cannot be collapsed (there is no
+# GROUP BY, so a bare column beside an aggregate is a binder error), so it is dropped from the result
+# — but the INNER CASE still computes it, which is the only reason an aggregate over ANOTHER output
+# can reference it. §5's table gives every output a preprocessing expression, so it cannot reach this.
+
+statement ok
+CREATE TABLE aggx (rulepos INT, region VARCHAR, decision VARCHAR, risk VARCHAR);
+
+statement ok
+INSERT INTO aggx VALUES (-2,'in','out','out'), (-1,'VARCHAR','VARCHAR','DOUBLE'),
+    (0,NULL,'arg_max(?,risk)',NULL), (1,'EU','a','1.0'), (2,'','b','5.0');
+
+statement ok
+SELECT fabricator_host_exec(decision_render('aggx', name := 'ev_aggx'));
+
+# `arg_max(decision, risk)` picks the decision at the HIGHEST risk — so rule 2's 'b', which is only
+# reachable because `risk` is still computed inside.
+query TT
+SELECT rulepos, decision FROM ev_aggx('EU');
+----
+1,2	b
+
+# ... and `risk` itself is gone from the result. ⚠ This is the assertion that would pass vacuously if
+# written as "select the columns I expect": it has to reference the ABSENT one.
+statement error
+SELECT risk FROM ev_aggx('EU');
+----
+risk
+
+# ==============================================================================================
+# §12  OUTPUT POSTPROCESSING WITHOUT AGGREGATES — the expression, then the datatype cast.
+# ==============================================================================================
+# ⚠ §3's table has no output preprocessing and §5's is all aggregates, so the ordinary scalar
+# postprocess — `cast((upper(label)) as VARCHAR)` — is reached by neither.
+
+statement ok
+CREATE TABLE postx (rulepos INT, v VARCHAR, label VARCHAR, n VARCHAR);
+
+statement ok
+INSERT INTO postx VALUES (-2,'in','out','out'), (-1,'VARCHAR','VARCHAR','INTEGER'),
+    (0,NULL,'upper(?)',NULL), (1,'','abc','42');
+
+statement ok
+SELECT fabricator_host_exec(decision_render('postx', name := 'ev_postx'));
+
+# `label` goes through its postprocess AND its cast; `n` through the cast alone. Without the
+# postprocess `label` would be 'abc', which is the discrimination.
+query TI
+SELECT label, n FROM ev_postx('anything');
+----
+ABC	42
+
+# ⚠ `?` in an OUTPUT preprocessing expression is the OUTPUT column, not the input — the opposite of
+# its meaning in an input preprocessing expression. Pinned structurally, because an implementation
+# that substituted the input would still produce runnable SQL.
+query T
+SELECT regexp_matches(decision_render('postx'), 'cast\(\(upper\(label\)\) as VARCHAR\) AS label')::VARCHAR;
+----
+true
+
+# ==============================================================================================
+# §13  SPARSE `rulepos` — the rule numbers are the table's OWN, not 1..N.
+# ==============================================================================================
+# ⚠⚠ THIS IS A DELIBERATE IMPROVEMENT ON THE PORTED ENGINE, so it is pinned rather than left to luck.
+# That one emits `generate_series(1, <count>)`, which for rules numbered 1, 5, 9 would invent slots
+# 2 and 3 that match EVERYTHING (an input CASE falls through to `ELSE 1=1`) and would never reach rule
+# 9 at all. The rule numbers are enumerated from the table instead.
+
+statement ok
+CREATE TABLE sparsr (rulepos INT, region VARCHAR, decision VARCHAR);
+
+statement ok
+INSERT INTO sparsr VALUES (-2,'in','out'), (-1,'VARCHAR','VARCHAR'),
+    (1,'EU','one'), (5,'US','five'), (9,'','nine');
+
+statement ok
+SELECT fabricator_host_exec(decision_render('sparsr', name := 'ev_sparse'));
+
+query T
+SELECT regexp_matches(decision_render('sparsr'), 'VALUES \(1\), \(5\), \(9\)\)')::VARCHAR;
+----
+true
+
+# Rule 9 exists and is reachable — under generate_series(1,3) it would not be.
+query IT
+SELECT rulepos, decision FROM ev_sparse('JP');
+----
+9	nine
+
+query IT
+SELECT rulepos, decision FROM ev_sparse('EU', hit_policy := 'RuleOrder') ORDER BY rulepos;
+----
+1	one
+9	nine
+
+# ==============================================================================================
+# §14  `decisiontable_hk` — the decision table's identity.
+# ==============================================================================================
+# ⚠ It is a property of the RULES, not of the rendered macro, so renaming the macro must not move it
+# and changing one cell must. ⚠ The 32-hex match is the hash because nothing else in these fixtures is
+# 32 hex characters long.
+
+statement ok
+CREATE TABLE hk_b (rulepos INT, region VARCHAR, decision VARCHAR);
+
+statement ok
+INSERT INTO hk_b VALUES (-2,'in','out'), (-1,'VARCHAR','VARCHAR'),
+    (1,'EU','one'), (5,'US','five'), (9,'','NINE');
+
+query TT
+SELECT regexp_extract(decision_render('sparsr'), '([0-9a-f]{32})', 1)
+     = regexp_extract(decision_render('sparsr', name := 'other_name'), '([0-9a-f]{32})', 1),
+       regexp_extract(decision_render('sparsr'), '([0-9a-f]{32})', 1)
+     = regexp_extract(decision_render('hk_b'), '([0-9a-f]{32})', 1);
+----
+true	false

@@ -195,7 +195,7 @@ jobs:
           # 258 since 2026-09-08: + the two COMMENT ON kinds. Their `comment` key is REQUIRED and its value
           #   NULLABLE (null = REMOVE the comment), so an absent key would be indistinguishable from an
           #   instruction to remove one -- the same distinction again, on a third kind.
-          EXPECTED_MINIMUM: 389
+          EXPECTED_MINIMUM: 401
         run: |
           total=$(grep -oE 'Total:[[:space:]]+[0-9]+' bridge-test-output.txt | grep -oE '[0-9]+' | head -1)
           if [ -z "$total" ]; then
