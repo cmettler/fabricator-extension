@@ -1113,48 +1113,11 @@ internal sealed class CdcChangesBinding : ITableFunctionBinding
     /// <c>true</c> would make the one case where a silent mismatch is most likely the one case not checked.
     /// </para>
     /// </remarks>
+    //! Drift detection asks "is this the same SCHEMA?", so nested field NAMES MATTER — a renamed field IS
+    //! the drift this is looking for. The comparison itself now lives in Fabricator.Common, shared with the
+    //! Delta UPDATE path, which asks the OPPOSITE question and passes false.
     private static bool SameType(IArrowType a, IArrowType b)
-    {
-        if (ReferenceEquals(a, b))
-        {
-            return true;
-        }
-        if (a.TypeId != b.TypeId)
-        {
-            return false;
-        }
-        switch (a, b)
-        {
-            case (Decimal128Type x, Decimal128Type y):
-                return x.Precision == y.Precision && x.Scale == y.Scale;
-            case (Decimal256Type x, Decimal256Type y):
-                return x.Precision == y.Precision && x.Scale == y.Scale;
-            case (TimestampType x, TimestampType y):
-                return x.Unit == y.Unit && string.Equals(x.Timezone, y.Timezone, StringComparison.Ordinal);
-            case (Time32Type x, Time32Type y):
-                return x.Unit == y.Unit;
-            case (Time64Type x, Time64Type y):
-                return x.Unit == y.Unit;
-            case (FixedSizeBinaryType x, FixedSizeBinaryType y):
-                return x.ByteWidth == y.ByteWidth;
-            case (NestedType x, NestedType y):
-                if (x.Fields.Count != y.Fields.Count)
-                {
-                    return false;
-                }
-                for (int i = 0; i < x.Fields.Count; i++)
-                {
-                    if (!string.Equals(x.Fields[i].Name, y.Fields[i].Name, StringComparison.Ordinal)
-                        || !SameType(x.Fields[i].DataType, y.Fields[i].DataType))
-                    {
-                        return false;
-                    }
-                }
-                return true;
-            default:
-                return true;
-        }
-    }
+        => ArrowTypeCompare.SameType(a, b, namesMatter: true);
 
     /// <summary>
     /// A type rendered WITH its parameters. ⚠ <c>IArrowType.Name</c> alone renders <c>decimal(9,2)</c> and

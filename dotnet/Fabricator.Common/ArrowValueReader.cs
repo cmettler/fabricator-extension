@@ -111,6 +111,25 @@ public static class ArrowValueReader
             }
             return dict;
         }
+        if (array is ListArray l)
+        {
+            // ⚠ A LIST is read as object?[] purely so a STRUCT CONTAINING ONE can be walked — the Delta
+            // UPDATE's NOT NULL check recurses through struct children, and without this arm a struct with a
+            // list field threw before the check could look at anything. It is NOT a route for writing a list
+            // back: the write path hands a matching Arrow array through untouched (ArrowTypeCompare), and
+            // BuildArray — the inverse of ReadScalar — deliberately still has no list case, so a list that
+            // needed a genuine type conversion is refused rather than silently rebuilt through boxes.
+            // ⚠ GetSlicedValues does the offset arithmetic: a list's child array holds EVERY row's elements
+            // concatenated, so row i occupies [offset(i), offset(i+1)) — indexing the child directly by the
+            // row index would read another row's elements.
+            var slice = l.GetSlicedValues(index);
+            var items = new object?[slice.Length];
+            for (int i = 0; i < items.Length; i++)
+            {
+                items[i] = ReadScalarDeep(slice, i);
+            }
+            return items;
+        }
         return ReadScalar(array, index);
     }
 }

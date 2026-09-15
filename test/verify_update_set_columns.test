@@ -133,23 +133,72 @@ SELECT id, st.b FROM w.main.t WHERE id = 2;
 2	y
 
 # ==============================================================================================
-# §7  A SEPARATE, STILL-OPEN DEFECT — pinned so the two are never conflated
+# §7  A NESTED SET VALUE IS WRITTEN, ON BOTH UPDATE PATHS
 # ==============================================================================================
-# ⚠⚠ THE OVERRIDE DOES NOT MAKE THIS STATEMENT WORK, AND THAT IS NOT A FAILURE OF THE OVERRIDE. The Delta
-# provider cannot READ a LIST SET value at all: `UpdateInput.Value` goes through
-# ArrowValueReader.ReadScalarDeep, which handles STRUCT and delegates everything else to ReadScalar, and
-# ReadScalar refuses a list. So on this provider every statement that triggered the expansion ALSO fails
-# for an unrelated reason — which is exactly why the sections above assert the PLAN and not an answer.
-# ⚠ The two fixes are independent: this one is a provider-side gap (read + rebuild + the nullability check
-# + the CDF images), the override is a host-side binder one. Whoever closes this should delete this row.
+# ⚠⚠ THIS SECTION REPLACES ONE THAT ASSERTED THE REFUSAL, and falsifying it is the change announcing
+# itself. Until 2026-09-15 `UPDATE … SET <a list>` died with "unsupported filter value type List" — a
+# message naming a FILTER although it was the SET value — because both UPDATE paths round-tripped every SET
+# value through CLR boxes and neither ladder had a list case. They now hand a matching Arrow array through.
+#
+# ⚠⚠ BOTH PATHS ARE ASSERTED AND THAT IS NOT PADDING. Autocommit rebuilds the SET column; an explicit
+# transaction goes through BufferUpdateRows, which MERGES the new values with the untouched rows row by row
+# — a different mechanism (concatenate + take, versus a straight passthrough). Fixing one and not the other
+# would make the same statement work outside a transaction and fail inside one, which this repo records as
+# harder to notice than a feature that never works at all.
+
+statement ok
+UPDATE w.main.t SET tags = ['q', 'r'] WHERE id = 0;
+
+statement ok
+UPDATE w.main.t SET m = MAP{'z': 9} WHERE id = 0;
+
+# A STRUCT containing a list — the recursive case, which also exercises the nullability walk below.
+statement ok
+UPDATE w.main.t SET stl = {'a': 9, 'l': ['z']} WHERE id = 0;
+
+# The buffered path.
+statement ok
+BEGIN;
+
+statement ok
+UPDATE w.main.t SET tags = ['x', 'y', 'z'] WHERE id = 2;
+
+statement ok
+COMMIT;
+
+# ⚠ The UNTOUCHED rows and columns are the control: the buffered merge picks per row between the new value
+# and the existing one, so a broken index would corrupt exactly these rather than the updated cells.
+query ITTT
+SELECT id, tags::VARCHAR, m::VARCHAR, stl::VARCHAR FROM w.main.t ORDER BY id;
+----
+0	[q, r]	{z=9}	{'a': 9, 'l': [z]}
+1	[a, b]	{k=1}	{'a': 1, 'l': [p]}
+2	[x, y, z]	{k=2}	{'a': 2, 'l': [p]}
+
+# ==============================================================================================
+# §8  NOT NULL IS STILL ENFORCED — the control for the nullability path this touched
+# ==============================================================================================
+# ⚠⚠ THE FIX CHANGED HOW THAT CHECK READS ITS VALUE. It used to box every SET value to hand it to
+# DeltaNullability; it now boxes only for a STRUCT (the one shape whose CONTENTS are inspected) and asks the
+# Arrow array directly otherwise. So the check is on a new code path for every scalar column, and this is
+# what proves it still fires — a silently-dropped NOT NULL would be a wrong answer, not an error.
+
+statement ok
+CREATE OR REPLACE TABLE w.main.nn (id BIGINT, req VARCHAR NOT NULL);
+
+statement ok
+INSERT INTO w.main.nn VALUES (1, 'a');
 
 statement error
-UPDATE w.main.t SET tags = ['q'] WHERE id = 1;
+UPDATE w.main.nn SET req = NULL WHERE id = 1;
 ----
-unsupported filter value type List
+NOT NULL
 
-# The control that makes the row above mean what it says: the table is fine and still readable.
+# …and a legitimate value still lands, so the row above is the constraint firing rather than UPDATE failing.
+statement ok
+UPDATE w.main.nn SET req = 'b' WHERE id = 1;
+
 query IT
-SELECT id, tags FROM w.main.t WHERE id = 1;
+SELECT id, req FROM w.main.nn;
 ----
-1	[a, b]
+1	b

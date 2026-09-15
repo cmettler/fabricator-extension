@@ -3962,6 +3962,32 @@ public sealed class DeltaCatalog : IProviderCatalog
                     newCols[c] = batch.Column(c); // unchanged column (batch owns its buffers — safe to alias)
                     continue;
                 }
+                // ⚠⚠ THIS IS AN ELEMENT-WISE MERGE OF TWO ARROW ARRAYS — per row, the NEW value if this row
+                // is in the update set, else the row's EXISTING value. Done with boxed values it is a trivial
+                // loop, which is why it was written that way; the price was that it only worked for the types
+                // the scalar ladder enumerates, so a LIST column could not be updated at all.
+                // Expressed in Arrow it is CONCATENATE the two columns, then TAKE with an index that points
+                // at the old half for untouched rows and the new half for updated ones — type-agnostic, so a
+                // list, a map or a nested struct costs nothing extra.
+                // ⚠ Only when the two types AGREE. Where they differ the boxing path below is the thing doing
+                // the conversion, and Concatenate would refuse them anyway.
+                var oldCol = batch.Column(c);
+                var newCol = updates.Values!.Column(slot);
+                if (oldCol.Data.DataType.TypeId != ArrowTypeId.Null
+                    && ArrowTypeCompare.SameType(oldCol.Data.DataType, newCol.Data.DataType, namesMatter: false))
+                {
+                    var joined = ArrowArrayConcatenator.Concatenate(new List<IArrowArray> { oldCol, newCol });
+                    var idx = new int[batch.Length];
+                    for (int i = 0; i < batch.Length; i++)
+                    {
+                        long rid = i < rids.Length ? rids[i] : -1;
+                        // ⚠ The updated half starts at oldCol's length, so an updated row's index is
+                        // batch.Length + its row in the updates batch.
+                        idx[i] = updates.RowByRid.TryGetValue(rid, out int ur) ? batch.Length + ur : i;
+                    }
+                    newCols[c] = EngineeredWood.Arrow.ArrowCompute.Take(joined, idx);
+                    continue;
+                }
                 var values = new List<object?>(batch.Length);
                 for (int i = 0; i < batch.Length; i++)
                 {
@@ -5001,10 +5027,23 @@ public sealed class DeltaCatalog : IProviderCatalog
             {
                 continue;
             }
+            // ⚠⚠ ONLY A STRUCT NEEDS THE VALUE. ValidateSetValue inspects CONTENTS for exactly one shape —
+            // a struct's children against their declared nullability — and for every other type it acts on
+            // nothing but null-ness, which the Arrow array answers directly. Boxing regardless is what made a
+            // LIST SET value fail HERE, in a nullability check, before the write path had any say.
+            var nullCol = updates.Values!.Column(j);
+            bool needsValue = targetField.DataType is Apache.Arrow.Types.StructType;
             for (int r = 0; r < updates.Count; r++)
             {
-                // Boxed for the duration of the check only — the value is not retained anywhere.
-                DeltaNullability.ValidateSetValue(updates.Value(r, j), targetField, tableName);
+                if (needsValue)
+                {
+                    // Boxed for the duration of the check only — the value is not retained anywhere.
+                    DeltaNullability.ValidateSetValue(updates.Value(r, j), targetField, tableName);
+                }
+                else if (nullCol.IsNull(r))
+                {
+                    DeltaNullability.ValidateSetValue(null, targetField, tableName);
+                }
             }
         }
 
@@ -5045,6 +5084,21 @@ public sealed class DeltaCatalog : IProviderCatalog
             // of every row being boxed up front and held. BuildArray's TARGET-TYPE conversion is preserved
             // exactly — an incoming array of a different width or unit is still converted through the boxed
             // value — which is why the incoming Arrow column is not simply handed through here.
+            // ⚠⚠ IF NOTHING NEEDS CONVERTING, HAND THE ARRAY THROUGH. The box-and-rebuild below exists for
+            // ONE job — the target-type conversion described above — so when the incoming type already IS the
+            // target it was doing a full CLR round trip to produce the array it started with, and refusing
+            // every type the scalar ladder does not enumerate (a LIST, a MAP) on the way. ⚠ Names do not
+            // matter here: a list's child is labelled `item` by Arrow and `element` by the parquet spec, so
+            // two faithful converters describing one VARCHAR[] disagree on it while the layout is identical.
+            // ⚠ The SCHEMA field takes the ARRAY's own type, not the target's, so the batch cannot describe
+            // itself differently from what it holds.
+            var incoming = updates.Values!.Column(j);
+            if (ArrowTypeCompare.SameType(incoming.Data.DataType, field.DataType, namesMatter: false))
+            {
+                updArrays.Add(incoming);
+                updFields.Add(new Field(field.Name, incoming.Data.DataType, nullable: true, field.Metadata));
+                continue;
+            }
             var vals = new List<object?>(updates.Count);
             for (int r = 0; r < updates.Count; r++)
             {

@@ -712,7 +712,11 @@ case "$TIER" in
         #   projected error(), so in the SELECT list a typo answered count(*) with 1 instead of raising).
         # 2026-09-15: 9410 -> 9442. The NEW verify_update_set_columns (+32). No other suite moved, which
         #   is the behaviour-neutrality claim for a change to the UPDATE binder on EVERY fabricator table.
-        : "${MIN_ASSERTIONS:=9442}"
+        # 2026-09-15: 9442 -> 9463. verify_update_set_columns 32 -> 53 — the Delta UPDATE hands a MATCHING
+        #   Arrow SET column through instead of round-tripping every value through CLR boxes, so a LIST / MAP
+        #   / nested SET value is writable at all (§7, both UPDATE paths) and the NOT NULL check that used to
+        #   ride that boxing has its own control (§8).
+        : "${MIN_ASSERTIONS:=9463}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh
