@@ -171,7 +171,11 @@ case "$TIER" in
         # contribution is global DuckDB MACROS shipped as Macros/*.sql (table_zip, query_zip). Its §1
         # registration row is the ONLY thing that sees a delivery failure: the embed, the publish line and
         # the macro body all fail QUIETLY, surfacing at a call site as "… does not exist".
-        : "${MIN_SUITES:=77}"
+        # 78 since 2026-09-15: verify_update_set_columns — FabricatorTableEntry overrides
+        # BindUpdateConstraints so an UPDATE assigning a LIST/MAP/… column stops projecting the WHOLE ROW.
+        # ⚠ It asserts the PLAN, never an answer: the expanded columns are assigned their own values, so
+        # the row is identical either way and no row assertion can see the difference.
+        : "${MIN_SUITES:=78}"
         # 5656 since 2026-08-02: verify_delta_catalog_transactions 943 -> 944 Ã¢ÂÂ ROLLBACK now RECLAIMS the
         # data files the transaction eagerly wrote (EW #52's DiscardDataFilesAsync) instead of leaving them
         # for VACUUM. +2, not +1: that suite is one of the DOUBLED ones below, so an assertion added to it
@@ -706,7 +710,9 @@ case "$TIER" in
         #   §6's TEMP table (the catalog lookup runs on the RENDER's connection, the generated statement on
         #   the CALLER's — nothing else can see that split) and §10's count(*) refusals (DuckDB PRUNES a
         #   projected error(), so in the SELECT list a typo answered count(*) with 1 instead of raising).
-        : "${MIN_ASSERTIONS:=9410}"
+        # 2026-09-15: 9410 -> 9442. The NEW verify_update_set_columns (+32). No other suite moved, which
+        #   is the behaviour-neutrality claim for a change to the UPDATE binder on EVERY fabricator table.
+        : "${MIN_ASSERTIONS:=9442}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

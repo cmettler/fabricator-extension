@@ -19,6 +19,11 @@
 #include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/logging/logger.hpp"
+#include "duckdb/planner/binder.hpp"
+#include "duckdb/planner/constraints/bound_check_constraint.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/planner/operator/logical_projection.hpp"
+#include "duckdb/planner/operator/logical_update.hpp"
 #include "duckdb/planner/tableref/bound_at_clause.hpp"
 #include "duckdb/planner/expression/bound_between_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
@@ -966,6 +971,112 @@ unique_ptr<BaseStatistics> FabricatorTableEntry::GetStatistics(ClientContext &co
 
 TableStorageInfo FabricatorTableEntry::GetStorageInfo(ClientContext &context) {
 	return TableStorageInfo();
+}
+
+//! Decides which EXTRA columns an UPDATE has to project beyond the ones it assigns.
+//!
+//! This is `TableCatalogEntry::BindUpdateConstraints` MINUS ONE BRANCH. Everything else is reproduced
+//! verbatim, deliberately: each remaining rule is either still live for us or costs nothing, and a
+//! re-derived version would drift from upstream silently.
+//!
+//! ⚠⚠ THE BRANCH THAT IS GONE, AND WHY. The base ends with:
+//!
+//!     // we also convert any updates on LIST columns into delete + insert
+//!     for (auto &col_index : update.columns) {
+//!         if (!GetColumns().GetColumn(col_index).Type().SupportsRegularUpdate()) {
+//!             update.update_is_del_and_insert = true; break;
+//!         }
+//!     }
+//!
+//! and `update_is_del_and_insert` then projects EVERY PHYSICAL COLUMN. `SupportsRegularUpdate()` is false
+//! for LIST / ARRAY / MAP / UNION / VARIANT / GEOMETRY, and for a STRUCT containing any of those
+//! (`duckdb/src/common/types.cpp`). The reason is DuckDB's own row-group storage — a LIST cannot be patched
+//! in place, so the row is rewritten — and it says NOTHING about a table we update by COLUMN NAME over a
+//! wire protocol.
+//!
+//! MEASURED before the override, on a 5-column Delta table whose `tags` is `VARCHAR[]`:
+//!
+//!     UPDATE t SET label = 'X'      ->  PROJECTION: 'X', rowid                     (1 set column)
+//!     UPDATE t SET tags  = ['q']    ->  PROJECTION: ['q'], #1, #2, #3, #4, rowid   (the whole row)
+//!
+//! ⚠ AND NOTHING ON THE WIRE SAYS WHICH HAPPENED. `execute_update` carries a set-column COUNT and their
+//! names; it does not carry "DuckDB expanded this". So a provider that diffs the incoming row to decide
+//! what actually changed — which is what a provider with a writable wide metadata table must do — cannot
+//! tell a user-written 17-column SET from an expanded one-column SET. That is the defect this removes;
+//! reported from `fabricator-grist`, where a single non-writable column anywhere in the expanded row turns
+//! a supported statement into a refusal.
+//!
+//! ⚠ THERE IS NO FLAG TO SET INSTEAD. `LogicalType::SupportsRegularUpdate()` is a plain switch on the type
+//! id — not virtual, and it never sees a catalog — so the first thing one reaches for (declare "my nested
+//! types update fine") does not exist. This virtual is the only hook.
+//!
+//! WHAT IS KEPT, and why each one rather than "a fabricator table cannot hit it":
+//!
+//!   · CHECK constraints. A fabricator table carries none today (`GetOrCreateEntry` builds its
+//!     `CreateTableInfo` from columns alone, and a CHECK is refused at CREATE), so the loop is a no-op over
+//!     an empty vector. Kept because it costs nothing and because the day a table DOES carry one, dropping
+//!     this would silently stop projecting the columns the constraint needs to be checked against.
+//!   · `return_chunk`. `FabricatorCatalog::PlanUpdate` refuses `UPDATE ... RETURNING` outright — but at
+//!     PHYSICAL PLANNING, i.e. after this runs, so the branch is still reachable during bind. ⚠ Kept
+//!     deliberately rather than deleted as unreachable: an override that quietly stopped projecting the row
+//!     would turn today's clean refusal into a WRONG ANSWER the day RETURNING lands.
+//!   · Index columns. `FabricatorTableEntry::GetStorageInfo` returns a default-constructed
+//!     `TableStorageInfo`, so `index_info` is empty and this loop cannot fire — there are no LOCAL indexes
+//!     on a remote-backed table. Kept for the same reason as the CHECK loop: it is the base's rule, it is
+//!     free, and it starts working on its own if we ever report indexes.
+//!
+//! ⚠ `update_is_del_and_insert` IS STILL SET when the index loop fires, and must be. Nothing in this repo
+//! READS it (`grep -rn update_is_del_and_insert src/` is empty), so leaving it false changes no fabricator
+//! behaviour on its own — but `LogicalUpdate::RewriteInPlaceUpdates` sets it during plan DESERIALIZATION
+//! for a type that no longer supports in-place updates, so an execution path must not assume it is false.
+//!
+//! ⚠⚠ BEFORE CHANGING THIS, RE-VERIFY RATHER THAN TRUST THE PARAGRAPHS ABOVE — every one of them is a fact
+//! about code that lives elsewhere: that `GetStorageInfo` still reports no indexes, that a fabricator table
+//! still cannot carry a CHECK, and that `PlanUpdate` still refuses RETURNING. And re-read
+//! `FabricatorModifyTarget::set_child_indices`, which is documented NOT positional: changing how many
+//! columns get bound is exactly the kind of change that invalidates that.
+void FabricatorTableEntry::BindUpdateConstraints(Binder &binder, LogicalGet &get, LogicalProjection &proj,
+                                                 LogicalUpdate &update, ClientContext &context) {
+	// CHECK constraints: a constraint over several columns needs all of them projected, even the ones the
+	// statement does not assign, so the check can be evaluated (`CHECK(i + j < 10)` updating only `i`).
+	auto bound_constraints = binder.BindConstraints(constraints, name, columns);
+	for (auto &constraint : bound_constraints) {
+		if (constraint->type == ConstraintType::CHECK) {
+			auto &check = constraint->Cast<BoundCheckConstraint>();
+			LogicalUpdate::BindExtraColumns(*this, get, proj, update, check.bound_columns);
+		}
+	}
+	// RETURNING: the caller may ask for any column of the updated row, so the whole row must be available.
+	if (update.return_chunk) {
+		physical_index_set_t all_columns;
+		for (auto &column : GetColumns().Physical()) {
+			all_columns.insert(column.Physical());
+		}
+		LogicalUpdate::BindExtraColumns(*this, get, proj, update, all_columns);
+	}
+	// An update touching an indexed column becomes delete+insert, which needs every column.
+	update.update_is_del_and_insert = false;
+	TableStorageInfo table_storage_info = GetStorageInfo(context);
+	for (auto index : table_storage_info.index_info) {
+		for (auto &column : update.columns) {
+			if (index.column_set.find(column.index) != index.column_set.end()) {
+				update.update_is_del_and_insert = true;
+				break;
+			}
+		}
+	}
+
+	// ⚠⚠ THE BASE'S LIST/ARRAY/MAP/UNION/VARIANT/GEOMETRY LOOP IS DELIBERATELY ABSENT HERE. See the remark
+	// above: it exists for DuckDB's row-group storage and has no meaning for a remote table updated by
+	// column name. Re-adding it makes a one-column UPDATE arrive at the provider as the whole row again.
+
+	if (update.update_is_del_and_insert) {
+		physical_index_set_t all_columns;
+		for (auto &column : GetColumns().Physical()) {
+			all_columns.insert(column.Physical());
+		}
+		LogicalUpdate::BindExtraColumns(*this, get, proj, update, all_columns);
+	}
 }
 
 virtual_column_map_t FabricatorTableEntry::GetVirtualColumns() const {

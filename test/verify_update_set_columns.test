@@ -1,0 +1,155 @@
+# name: test/verify_update_set_columns.test
+# description: An UPDATE must hand the provider the columns it ASSIGNS — not the whole row. DuckDB's base
+#              TableCatalogEntry::BindUpdateConstraints turns an update that assigns a LIST / ARRAY / MAP /
+#              UNION / VARIANT / GEOMETRY column (or a STRUCT containing one) into a delete+insert and
+#              therefore projects EVERY physical column; that rule is about DuckDB's own row-group storage
+#              and is meaningless for a remote table updated by column NAME. FabricatorTableEntry overrides
+#              the method, keeping every other base rule. Set FABRICATOR_DELTA_WRITE_DIR. Local FS.
+# group: [fabricator]
+
+require fabricator
+
+# The Delta catalog's default engine is native_write, so DuckDB's own COPY writes the data files.
+require parquet
+
+require-env FABRICATOR_DELTA_WRITE_DIR
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/setcols' AS w (TYPE fabricator, PROVIDER 'delta', column_mapping 'none');
+
+# Every type that trips the base rule has a column here, plus scalars to be expanded INTO — the expansion
+# is invisible on a one-column table, so the width is load-bearing.
+statement ok
+CREATE OR REPLACE TABLE w.main.t AS
+SELECT i AS id, 'n' || i AS label, ['a', 'b'] AS tags, MAP{'k': i} AS m,
+       {'a': i, 'b': 'x'} AS st, {'a': i, 'l': ['p']} AS stl, i * 2 AS extra, 'z' AS pad
+FROM range(3) r(i);
+
+# ==============================================================================================
+# HOW THESE ASSERTIONS WORK — read this before adding one.
+# ==============================================================================================
+# ⚠⚠ THE SET-COLUMN COUNT IS NOT OBSERVABLE FROM SQL. It crosses the ABI as `execute_update`'s setCount
+# and changes no ANSWER: the expanded columns are assigned their OWN values, so the row ends up identical.
+# What the expansion DOES change is the PLAN, and the scan's own `Projections` is the cleanest handle on
+# it — an expanded UPDATE has to read every column it is about to write back, so the scan widens with it.
+#
+# ⚠ EXPLAIN cannot be a subquery source (nor a COPY source), hence the <REGEX>: form on the physical_plan
+# row. `(FORMAT json)` is used rather than the ASCII tree because the JSON renders the projection as ONE
+# exact string — `"Projections": "id"` cannot match `"Projections": "id label tags …"`, where the ASCII
+# box would need a regex over column padding.
+#
+# ⚠ §2's second row asserts the PROJECTION's own expressions instead, from the ASCII tree, because that is
+# the thing being fixed rather than a consequence of it. `[^#]*` is what discriminates: an expanded plan
+# puts `#1 #2 #3 …` bound references between the assigned value and the rowid.
+
+# ==============================================================================================
+# §1  BASELINE — a scalar SET was never expanded. This is the shape every section below must match.
+# ==============================================================================================
+
+query II
+EXPLAIN (FORMAT json) UPDATE w.main.t SET label = 'X' WHERE id = 1;
+----
+physical_plan	<REGEX>:.*"Projections": "id".*
+
+# ==============================================================================================
+# §2  LIST — the case the override exists for
+# ==============================================================================================
+
+query II
+EXPLAIN (FORMAT json) UPDATE w.main.t SET tags = ['q'] WHERE id = 1;
+----
+physical_plan	<REGEX>:.*"Projections": "id".*
+
+# The SET expressions themselves: the assigned value, then the rowid, with nothing in between.
+query II
+EXPLAIN UPDATE w.main.t SET tags = ['q'] WHERE id = 1;
+----
+physical_plan	<REGEX>:.*PROJECTION.*\['q'\][^#]*rowid.*
+
+# ==============================================================================================
+# §3  THE OTHER TRIGGERING TYPES — MAP, and a STRUCT that CONTAINS a list
+# ==============================================================================================
+# ⚠ These are not padding. `SupportsRegularUpdate()` is false for six type ids and recurses into STRUCT
+# children, so a build that special-cased LIST alone would pass §2 and fail here.
+
+query II
+EXPLAIN (FORMAT json) UPDATE w.main.t SET m = MAP{'z': 9} WHERE id = 1;
+----
+physical_plan	<REGEX>:.*"Projections": "id".*
+
+query II
+EXPLAIN (FORMAT json) UPDATE w.main.t SET stl = {'a': 9, 'l': ['z']} WHERE id = 1;
+----
+physical_plan	<REGEX>:.*"Projections": "id".*
+
+# ==============================================================================================
+# §4  WHERE THE LINE FALLS — a STRUCT of SCALARS never triggered it
+# ==============================================================================================
+# ⚠ A CHARACTERIZATION of DuckDB's rule, not of ours: `SupportsRegularUpdate()` returns TRUE for a struct
+# whose children all support it, so this row reads the same before and after the override. It is here so
+# that the sections above cannot be mistaken for "nested types are special to us" — the split is the
+# base's, and this is the half we never had to touch.
+
+query II
+EXPLAIN (FORMAT json) UPDATE w.main.t SET st = {'a': 9, 'b': 'y'} WHERE id = 1;
+----
+physical_plan	<REGEX>:.*"Projections": "id".*
+
+# ==============================================================================================
+# §5  MERGE — the same binding, and it has to be asserted separately
+# ==============================================================================================
+# ⚠ `WHEN MATCHED THEN UPDATE` is lowered to the same LogicalUpdate and reads its SET values through the
+# same FabricatorFillUpdateSetColumns, so it goes through this override too — but MERGE shares ONE
+# projection across its actions, so a change to how many columns get bound lands here differently than in
+# a plain UPDATE. ⚠ Two scans in this plan (target and source); the target's is the one asserted.
+
+query II
+EXPLAIN (FORMAT json) MERGE INTO w.main.t USING (SELECT 1 AS k) s ON t.id = s.k
+  WHEN MATCHED THEN UPDATE SET tags = ['m'];
+----
+physical_plan	<REGEX>:.*"Projections": "id".*
+
+# ==============================================================================================
+# §6  BEHAVIOUR PRESERVATION — the override drops a branch, so what it must NOT change is the answer
+# ==============================================================================================
+
+statement ok
+UPDATE w.main.t SET label = 'X', extra = 99 WHERE id = 1;
+
+query ITI
+SELECT id, label, extra FROM w.main.t ORDER BY id;
+----
+0	n0	0
+1	X	99
+2	n2	4
+
+# A struct SET still lands correctly (the §4 path, which the override leaves alone).
+statement ok
+UPDATE w.main.t SET st = {'a': 9, 'b': 'y'} WHERE id = 2;
+
+query IT
+SELECT id, st.b FROM w.main.t WHERE id = 2;
+----
+2	y
+
+# ==============================================================================================
+# §7  A SEPARATE, STILL-OPEN DEFECT — pinned so the two are never conflated
+# ==============================================================================================
+# ⚠⚠ THE OVERRIDE DOES NOT MAKE THIS STATEMENT WORK, AND THAT IS NOT A FAILURE OF THE OVERRIDE. The Delta
+# provider cannot READ a LIST SET value at all: `UpdateInput.Value` goes through
+# ArrowValueReader.ReadScalarDeep, which handles STRUCT and delegates everything else to ReadScalar, and
+# ReadScalar refuses a list. So on this provider every statement that triggered the expansion ALSO fails
+# for an unrelated reason — which is exactly why the sections above assert the PLAN and not an answer.
+# ⚠ The two fixes are independent: this one is a provider-side gap (read + rebuild + the nullability check
+# + the CDF images), the override is a host-side binder one. Whoever closes this should delete this row.
+
+statement error
+UPDATE w.main.t SET tags = ['q'] WHERE id = 1;
+----
+unsupported filter value type List
+
+# The control that makes the row above mean what it says: the table is fine and still readable.
+query IT
+SELECT id, tags FROM w.main.t WHERE id = 1;
+----
+1	[a, b]

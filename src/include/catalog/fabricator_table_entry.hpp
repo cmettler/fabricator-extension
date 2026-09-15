@@ -50,6 +50,22 @@ public:
 	unique_ptr<BaseStatistics> GetStatistics(ClientContext &context, column_t column_id) override;
 	TableStorageInfo GetStorageInfo(ClientContext &context) override;
 
+	//! The base decides which EXTRA columns an UPDATE must project. We take every one of its rules except
+	//! ONE: it turns an update that assigns a LIST / ARRAY / MAP / UNION / VARIANT / GEOMETRY column (or a
+	//! STRUCT containing any of those) into a delete+insert and therefore projects the WHOLE ROW.
+	//!
+	//! ⚠⚠ THAT RULE IS ABOUT DuckDB'S OWN ROW-GROUP STORAGE — you cannot patch a LIST in place — AND IT HAS
+	//! NOTHING TO SAY ABOUT A REMOTE TABLE WE UPDATE BY COLUMN NAME OVER A WIRE PROTOCOL. Inherited, it made
+	//! a one-column UPDATE arrive at the provider as every column of the row, with NOTHING on the wire
+	//! saying which happened — so a provider that diffs the incoming row to decide what really changed
+	//! cannot tell "the user set 17 columns" from "DuckDB expanded one".
+	//!
+	//! ⚠ `LogicalType::SupportsRegularUpdate()` is NOT virtual and takes no catalog, so there is no flag an
+	//! entry can set to opt out — overriding this method is the only hook. See the .cpp for the per-branch
+	//! reasoning and for what must be re-verified before changing it.
+	void BindUpdateConstraints(Binder &binder, LogicalGet &get, LogicalProjection &proj, LogicalUpdate &update,
+	                           ClientContext &context) override;
+
 	//! SQL Server tables are exposed without a DuckDB rowid (no row-identity
 	//! virtual column), so count(*)/scans don't require projection pushdown.
 	virtual_column_map_t GetVirtualColumns() const override;
