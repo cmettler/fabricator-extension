@@ -115,6 +115,11 @@
     <!-- DuckSql: BCL-only quoting helpers. QuoteIdent/UnquoteIdent are a round-trip pair, and the
          declining cases (a multi-part "a"."b", a qualified a.b) are exactly what a test has to pin —
          guessing there renames a relation silently. -->
+    <!-- The decision-table cell parser. PURE: BCL + regex, no host, no DuckDB — which is exactly why it
+         is C# rather than a recursive CTE or a Liquid macro, and why its whole grammar can be gated here in
+         two minutes instead of by rendering and executing SQL. -->
+    <Compile Include="..\Fabricator.Functions\DecisionRuleParser.cs"
+             Link="Linked\DecisionRuleParser.cs" />
     <Compile Include="..\Fabricator.Abstractions\DuckSql.cs"
              Link="Linked\DuckSql.cs" />
     <Compile Include="..\Fabricator.Abstractions\AlterTableSpec.cs"
