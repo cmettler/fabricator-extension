@@ -175,7 +175,11 @@ case "$TIER" in
         # BindUpdateConstraints so an UPDATE assigning a LIST/MAP/… column stops projecting the WHOLE ROW.
         # ⚠ It asserts the PLAN, never an answer: the expanded columns are assigned their own values, so
         # the row is identical either way and no row assertion can see the difference.
-        : "${MIN_SUITES:=78}"
+        # 79 since 2026-09-16: verify_decision_render — DMN-like decision TABLES rendered into the SQL of
+        # a DuckDB TABLE MACRO (decision_render + the dmn_* parser scalars). Its §1 is the same delivery
+        # gate table_zip's is: the macro rides an <EmbeddedResource>, the scalars ride
+        # IProvider.GlobalScalarFunctions, and every way either can fail to arrive is SILENT.
+        : "${MIN_SUITES:=79}"
         # 5656 since 2026-08-02: verify_delta_catalog_transactions 943 -> 944 Ã¢ÂÂ ROLLBACK now RECLAIMS the
         # data files the transaction eagerly wrote (EW #52's DiscardDataFilesAsync) instead of leaving them
         # for VACUUM. +2, not +1: that suite is one of the DOUBLED ones below, so an assertion added to it
@@ -716,7 +720,20 @@ case "$TIER" in
         #   Arrow SET column through instead of round-tripping every value through CLR boxes, so a LIST / MAP
         #   / nested SET value is writable at all (§7, both UPDATE paths) and the NOT NULL check that used to
         #   ride that boxing has its own control (§8).
-        : "${MIN_ASSERTIONS:=9463}"
+        # 2026-09-16: 9463 -> 9597. verify_decision_render (134, NEW) — decision_render renders a decision
+        #   table into a TABLE MACRO's SQL. ⚠ Its §4 is the load-bearing section and the reason the whole
+        #   suite exists: a DuckDB MACRO PARAMETER SHADOWS A COLUMN OF THE SAME NAME, so input
+        #   preprocessing is silently INERT unless every reference is QUALIFIED — computed, never read,
+        #   every rule matching the raw argument, nothing failing. The first three probes taken while it
+        #   WAS broken all passed, because value-PRESERVING preprocessing (floor(40) is 40) cannot
+        #   discriminate. Two mutants: dropping the qualification dies at §4's first row after 60, and
+        #   qualifying only the cell's own column (not its @refs) survives that and dies at the
+        #   cross-column row after 62.
+        # 2026-09-16: 9597 -> 9599. verify_decision_render 134 -> 136 — `dialect := 'tsql'` is RECOGNISED
+        #   by the cell parser and REFUSED by the renderer while only the DuckDB statement template
+        #   exists, so a caller cannot get a DuckDB macro back that pretends to be T-SQL. ⚠ That gate row
+        #   is what slice 3 DELETES, not edits.
+        : "${MIN_ASSERTIONS:=9599}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

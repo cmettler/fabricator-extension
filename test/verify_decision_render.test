@@ -1,0 +1,434 @@
+# name: test/verify_decision_render.test
+# description: decision_render — a DMN-like decision TABLE rendered into the SQL of a DuckDB TABLE MACRO.
+#              Gates the three-language split end to end: the C# cell parser (dmn_condition / dmn_value),
+#              the set-based introspection, and the Liquid shape. See
+#              dotnet/Fabricator.Functions/Macros/decision_render.sql and DecisionRuleParser.cs.
+# group: [fabricator]
+
+require fabricator
+
+# ⚠⚠ `require json` IS LOAD-BEARING TWICE OVER, and `unittest` does NOT auto-load extensions (the shell
+# does, which is why every probe of this passed interactively either way). First: every `{% query %}` body
+# is classified with `json_serialize_sql` before it runs — FAIL-CLOSED, so with json absent every render is
+# refused and this file reads as a broken FEATURE rather than a missing REQUIRE. Second: §7's JSON rules
+# source is literally from_json/json_structure. The recorded trap, hit again here.
+require json
+
+# ⚠ §7 writes a parquet rules file to prove a non-csv FILE source resolves. Same trap, same reason: the
+# runner does not auto-load, so without this the COPY fails as a missing FEATURE.
+require parquet
+
+# The file-source section writes a csv and a parquet; this is the scratch directory CI provides, and
+# declaring it is also what makes ${FABRICATOR_DELTA_WRITE_DIR} interpolate below.
+require-env FABRICATOR_DELTA_WRITE_DIR
+
+# ==============================================================================================
+# §1  REGISTRATION — the delivery path is QUIET, so it gets its own assertion.
+# ==============================================================================================
+# ⚠ Same reasoning as verify_functions_zip §1: the macro rides an <EmbeddedResource>, the scalars ride
+# IProvider.GlobalScalarFunctions, and NONE of the ways either can fail to arrive is loud. Each surfaces at
+# a call site as "… does not exist", layers from the cause.
+
+query TT
+SELECT function_name, function_type FROM duckdb_functions()
+ WHERE function_name IN ('decision_render', 'dmn_condition', 'dmn_value', 'dmn_is_aggregate',
+                         'dmn_relation')
+ GROUP BY 1, 2 ORDER BY 1;
+----
+decision_render	macro
+dmn_condition	scalar
+dmn_is_aggregate	scalar
+dmn_relation	scalar
+dmn_value	scalar
+
+# ==============================================================================================
+# §2  THE PARSER, CALLABLE FROM SQL — which is what lets the introspection be set-based.
+# ==============================================================================================
+# The grammar itself is pinned OFFLINE in tier 0 (DecisionRuleParserTests). What this section gates is the
+# SEAM: that the Arrow marshalling of each argument works and that `ref_prefix` reaches the parser.
+
+query TTTT
+SELECT dmn_condition('EU, US', 'region', 'duckdb', ''),
+       dmn_condition('[21 .. 65]', 'age', 'duckdb', ''),
+       dmn_value('@amount * 0.01', 'duckdb', ''),
+       dmn_is_aggregate('EXP(SUM(LOG(?)))')::VARCHAR;
+----
+region IN ('EU', 'US')	age >= 21 AND age <= 65	amount * 0.01	true
+
+# ⚠⚠ THE ref_prefix ROW. It exists for ONE measured DuckDB rule (see §4): every reference to an input has
+# to be QUALIFIED, and a cell's own column and its @refs must be qualified the SAME way or a cross-column
+# rule reads one value while the column's own cell reads another.
+query TT
+SELECT dmn_condition('> @age', 'preprocessed.amount', 'duckdb', 'preprocessed.'),
+       dmn_value('@amount / @age', 'duckdb', 'preprocessed.');
+----
+preprocessed.amount > preprocessed.age	preprocessed.amount / preprocessed.age
+
+# A NULL cell is a WILDCARD for a condition and an ABSENCE for a value — the two are different questions
+# and get different answers. Pinned because "both NULL" and "both TRUE" are each a plausible reading.
+query TT
+SELECT dmn_condition(NULL, 'age', 'duckdb', ''), coalesce(dmn_value(NULL, 'duckdb', ''), '<null>');
+----
+TRUE	<null>
+
+# ==============================================================================================
+# §3  THE DOCUMENTED EXAMPLE — the ported engine's own decision table and its own published answers.
+# ==============================================================================================
+# ⚠ The expected values here are taken from decision-rules-py's CLAUDE.md, not from what this
+# implementation happens to produce, so the port is pinned against the thing it was ported FROM.
+
+statement ok
+CREATE TABLE dr (rulepos INT, region VARCHAR, age VARCHAR, amount VARCHAR,
+                 decision VARCHAR, risk VARCHAR, label VARCHAR, Comment VARCHAR);
+
+statement ok
+INSERT INTO dr VALUES
+    (-2, 'in',      'in',         'in',      'out',     'out',              'out',              NULL),
+    (-1, 'VARCHAR', 'FLOAT',      'FLOAT',   'VARCHAR', 'DOUBLE',           'VARCHAR',          NULL),
+    ( 0,  NULL,     'floor(?)',   '?',       NULL,      NULL,               NULL,               NULL),
+    ( 1, 'EU, US',  '> 18',       '< 10000', 'approve', '@amount * 0.0001', '@region',          NULL),
+    ( 2, 'US',      '[21 .. 65]', '> 5000',  'review',  '@age * 0.01',      '@age::varchar',    NULL),
+    ( 3, 'not RU',  '',           '<= 1000', 'approve', '0.2',              'low',              NULL),
+    ( 4, '',        '',           '> @age',  'flag',    '@amount / @age',   '@amount::varchar', NULL),
+    ( 5, '',        '',           '',        'reject',  '1.0',              'default',          NULL);
+
+statement ok
+SELECT fabricator_host_exec(decision_render('dr', name := 'eval_dr'));
+
+# `JP, 40, 500` — the documented First-match answer.
+query ITRT
+SELECT rulepos, decision, risk, label FROM eval_dr('JP', 40, 500);
+----
+3	approve	0.2	low
+
+# ... and the documented RuleOrder set, which is the same three rules the aggregate example collapses.
+query ITRTI
+SELECT rulepos, decision, risk, label, _total_hits_
+  FROM eval_dr('JP', 40, 500, hit_policy := 'RuleOrder') ORDER BY rulepos;
+----
+3	approve	0.2	low	3
+4	flag	12.5	500	3
+5	reject	1.0	default	3
+
+# A rule whose condition is a comma LIST and whose outputs are expressions over the inputs.
+query ITRT
+SELECT rulepos, decision, risk, label FROM eval_dr('EU', 25, 5000);
+----
+1	approve	0.5	EU
+
+# The hit-policy model errors. ⚠ Unique and Any still return the FIRST row — the policy is reported, not
+# enforced by dropping rows — so a build that silently returned nothing would fail here rather than pass.
+query IT
+SELECT rulepos, _model_error_ FROM eval_dr('JP', 40, 500, hit_policy := 'Unique');
+----
+3	Model Error: More than one rule hit for this input!
+
+# ⚠ THE NO-ERROR CONTROL, and finding an input for it is the point: rule 5 is an UNCONDITIONAL catch-all,
+# so almost every input hits several rules. Only 'RU' (fails rule 3), with amount <= age (fails rule 4) and
+# outside rules 1-2, hits exactly one. Without this row, "Unique reports an error" would be equally true of
+# a build that reported one for every input.
+query IT
+SELECT rulepos, coalesce(_model_error_, '<none>') FROM eval_dr('RU', 50, 10, hit_policy := 'Unique');
+----
+5	<none>
+
+# ⚠⚠ WHEN NOTHING MATCHES, THE TWO MODES DIVERGE, and it is worth pinning because the difference is
+# surprising: a NON-aggregate macro yields ZERO ROWS (there is nothing for the outer SELECT to read), while
+# an aggregate one yields ONE row of NULLs — which is the only way `_model_error_` can ever report 'No
+# default rule defined'. That branch is therefore UNREACHABLE in a non-aggregate macro, by construction.
+
+statement ok
+CREATE TABLE nodef (rulepos INT, region VARCHAR, decision VARCHAR);
+
+statement ok
+INSERT INTO nodef VALUES (-2,'in','out'), (-1,'VARCHAR','VARCHAR'), (1,'EU','euro');
+
+statement ok
+SELECT fabricator_host_exec(decision_render('nodef', name := 'eval_nodef'));
+
+query I
+SELECT count(*) FROM eval_nodef('JP');
+----
+0
+
+statement ok
+CREATE TABLE nodefa (rulepos INT, region VARCHAR, decision VARCHAR);
+
+statement ok
+INSERT INTO nodefa VALUES (-2,'in','out'), (-1,'VARCHAR','VARCHAR'), (0,NULL,'max(?)'), (1,'EU','euro');
+
+statement ok
+SELECT fabricator_host_exec(decision_render('nodefa', name := 'eval_nodefa'));
+
+query IT
+SELECT count(*), any_value(_model_error_) FROM eval_nodefa('JP');
+----
+1	No default rule defined
+
+# ==============================================================================================
+# §4  ⚠⚠ THE SECTION THIS FILE EXISTS FOR: INPUT PREPROCESSING MUST REACH THE RULES.
+# ==============================================================================================
+# A DuckDB MACRO PARAMETER SHADOWS A COLUMN OF THE SAME NAME ANYWHERE IN THE BODY. MEASURED on a two-line
+# macro: with a CTE aliasing `upper(x) AS x`, a bare `x` downstream yields the ARGUMENT while `p.x` yields
+# the preprocessed value. So the renderer QUALIFIES every input reference, and if it ever stops, input
+# preprocessing becomes silently INERT — computed, never read, every rule matching the raw argument.
+#
+# ⚠⚠ NOTHING FAILS WHEN THAT HAPPENS, which is why this section is written the way it is. The first three
+# probes taken while it WAS broken all passed, because they used value-PRESERVING preprocessing
+# (`floor(40)` is 40, `upper('JP')` is 'JP') and so could not discriminate. §3 above has the same blind
+# spot by construction. Only preprocessing that CHANGES the value can see this.
+
+statement ok
+CREATE TABLE pp (rulepos INT, region VARCHAR, other VARCHAR, decision VARCHAR);
+
+statement ok
+INSERT INTO pp VALUES
+    (-2, 'in',       'in',      'out'),
+    (-1, 'VARCHAR',  'VARCHAR', 'VARCHAR'),
+    ( 0, 'upper(?)', NULL,      NULL),
+    ( 1, 'EU',       '',        'euro'),
+    ( 2, '',         '@region', 'same-as-region'),
+    ( 3, '',         '',        'other');
+
+statement ok
+SELECT fabricator_host_exec(decision_render('pp', name := 'eval_pp'));
+
+# The column's OWN cell against the preprocessed value: 'eu' must reach rule 1 through upper().
+# Without qualification this answers rule 3 / 'other'.
+query IT
+SELECT rulepos, decision FROM eval_pp('eu', 'zz');
+----
+1	euro
+
+# ⚠ THE CROSS-COLUMN HALF, and it is a SEPARATE assertion because a fix that qualified only the cell's own
+# column would pass the row above and fail here: `@region` must resolve to the PREPROCESSED region, so
+# 'xy' preprocessed to 'XY' equals the literal 'XY' passed as `other`.
+query IT
+SELECT rulepos, decision FROM eval_pp('xy', 'XY');
+----
+2	same-as-region
+
+# ⚠ The structural half, which no ANSWER can see: the rendered text must qualify. A build that emitted
+# bare references would still produce runnable SQL — that is exactly the failure mode.
+query TT
+SELECT regexp_matches(decision_render('pp'), 'preprocessed\.region')::VARCHAR,
+       regexp_matches(decision_render('pp'), 'WHEN 1 THEN preprocessed\.region = ''EU''')::VARCHAR;
+----
+true	true
+
+# ==============================================================================================
+# §5  AGGREGATE MODE — output preprocessing containing an aggregate collapses every match to one row.
+# ==============================================================================================
+# ⚠ Detection scans EVERY call, not the outermost, so `max(round(?,2))` counts. The documented answers for
+# this table are `'3,4,5'` / flag / 12.5 / low.
+
+statement ok
+CREATE TABLE dra (rulepos INT, region VARCHAR, age VARCHAR, amount VARCHAR,
+                  decision VARCHAR, risk VARCHAR, label VARCHAR);
+
+statement ok
+INSERT INTO dra VALUES
+    (-2, 'in',      'in',         'in',      'out',             'out',              'out'),
+    (-1, 'VARCHAR', 'FLOAT',      'FLOAT',   'VARCHAR',         'DOUBLE',           'VARCHAR'),
+    ( 0, '(select * from (select upper(?) a) as x)', 'floor(?)', '?',
+                                             'arg_max(?,risk)', 'max(round(?,2))',  'max(?)'),
+    ( 1, 'EU, US',  '> 18',       '< 10000', 'approve',         '@amount * 0.0001', '@region'),
+    ( 2, 'US',      '[21 .. 65]', '> 5000',  'review',          '@age * 0.01',      '@age::varchar'),
+    ( 3, 'not RU',  '',           '<= 1000', 'approve',         '0.2',              'low'),
+    ( 4, '',        '',           '> @age',  'flag',            '@amount / @age',   '@amount::varchar'),
+    ( 5, '',        '',           '',        'reject',          '1.0',              'default');
+
+statement ok
+SELECT fabricator_host_exec(decision_render('dra', name := 'eval_dra'));
+
+# ⚠ The DEFAULT hit policy flips to RuleOrder in aggregate mode — an aggregate over one row is pointless,
+# so this call takes no hit_policy and must still collapse three rules.
+query TTRT
+SELECT rulepos, decision, risk, label FROM eval_dra('JP', 40, 500);
+----
+3,4,5	flag	12.5	low
+
+# ⚠ A SCALAR-SUBSELECT preprocessing is NOT a lateral — it is parenthesised, so it stays in the SELECT
+# list. This row is also the one that proves `upper()` ran: lowercase 'jp' must behave like 'JP'.
+query TTRT
+SELECT rulepos, decision, risk, label FROM eval_dra('jp', 40, 500);
+----
+3,4,5	flag	12.5	low
+
+query TT
+SELECT rulepos, decision FROM eval_dra('JP', 40, 500, hit_policy := 'First');
+----
+3	approve
+
+# ==============================================================================================
+# §6  SELECT-STYLE PREPROCESSING — a LEFT JOIN LATERAL, which EXPANDS one input into N rows.
+# ==============================================================================================
+
+statement ok
+CREATE TABLE latr (rulepos INT, region VARCHAR, decision VARCHAR);
+
+statement ok
+INSERT INTO latr VALUES
+    (-2, 'in', 'out'), (-1, 'VARCHAR', 'VARCHAR'),
+    ( 0, 'select unnest(str_split(?, '','')) a', NULL),
+    ( 1, 'EU', 'euro'), ( 2, 'US', 'dollar'), ( 3, '', 'other');
+
+statement ok
+SELECT fabricator_host_exec(decision_render('latr', name := 'eval_lat'));
+
+# 'EU,US,JP' expands to three rows: rule 1 matches one, rule 2 another, and the wildcard rule 3 all three.
+# ⚠ A build that put the expansion in the SELECT list instead of a LATERAL yields ONE row, not five.
+query ITI
+SELECT rulepos, decision, _total_hits_
+  FROM eval_lat('EU,US,JP', hit_policy := 'RuleOrder') ORDER BY rulepos, decision;
+----
+1	euro	5
+2	dollar	5
+3	other	5
+3	other	5
+3	other	5
+
+# ==============================================================================================
+# §7  WHERE THE RULES COME FROM — a table, a file, JSON text, a verbatim relation.
+# ==============================================================================================
+# ⚠ The CLASSIFIER is pinned offline in tier 0; what this section gates is that each form really RESOLVES
+# against DuckDB — a `read_csv` option name or a `from_json` shape we cannot test is a branch that fails at
+# the call site, which is the whole reason dmn_relation keeps to forms measured on the shipped build.
+
+statement ok
+CREATE TABLE src (rulepos INT, region VARCHAR, decision VARCHAR);
+
+statement ok
+INSERT INTO src VALUES (-2,'in','out'),(-1,'VARCHAR','VARCHAR'),(1,'EU','euro'),(2,'','other');
+
+statement ok
+COPY src TO '${FABRICATOR_DELTA_WRITE_DIR}/dmn_rules.csv' (FORMAT csv, HEADER);
+
+statement ok
+COPY src TO '${FABRICATOR_DELTA_WRITE_DIR}/dmn_rules.parquet' (FORMAT parquet);
+
+statement ok
+SELECT fabricator_host_exec(decision_render('${FABRICATOR_DELTA_WRITE_DIR}/dmn_rules.csv', name := 'ev_csv'));
+
+statement ok
+SELECT fabricator_host_exec(decision_render('${FABRICATOR_DELTA_WRITE_DIR}/dmn_rules.parquet', name := 'ev_pq'));
+
+statement ok
+SELECT fabricator_host_exec(decision_render('[{"rulepos":-2,"region":"in","decision":"out"},{"rulepos":-1,"region":"VARCHAR","decision":"VARCHAR"},{"rulepos":1,"region":"EU","decision":"euro"},{"rulepos":2,"region":"","decision":"other"}]', name := 'ev_json'));
+
+statement ok
+SELECT fabricator_host_exec(decision_render('(VALUES (-2,''in'',''out''),(-1,''VARCHAR'',''VARCHAR''),(1,''EU'',''euro''),(2,'''',''other'')) v(rulepos, region, decision)', source := 'sql', name := 'ev_sql'));
+
+# All four render the SAME decision table, so all four must answer identically — which is the property the
+# classifier exists to deliver: the introspection never learns where its rows came from.
+query TTTT
+SELECT (SELECT decision FROM ev_csv('EU')), (SELECT decision FROM ev_pq('EU')),
+       (SELECT decision FROM ev_json('EU')), (SELECT decision FROM ev_sql('EU'));
+----
+euro	euro	euro	euro
+
+query TTTT
+SELECT (SELECT decision FROM ev_csv('JP')), (SELECT decision FROM ev_pq('JP')),
+       (SELECT decision FROM ev_json('JP')), (SELECT decision FROM ev_sql('JP'));
+----
+other	other	other	other
+
+# ⚠⚠ THE CSV ROW IS THE ONE WITH A MEASURED REASON BEHIND IT. Without `all_varchar = true` the sniffer
+# types a column of bare numbers as BIGINT, and the cells stop being text. This table's `rulepos` is the
+# only all-numeric column, so the discriminating shape is a rules column whose every cell is a number.
+statement ok
+CREATE TABLE numsrc (rulepos INT, score VARCHAR, decision VARCHAR);
+
+statement ok
+INSERT INTO numsrc VALUES (-2,'in','out'),(-1,'INTEGER','VARCHAR'),(1,'42','matched'),(2,'','other');
+
+statement ok
+COPY numsrc TO '${FABRICATOR_DELTA_WRITE_DIR}/dmn_num.csv' (FORMAT csv, HEADER);
+
+statement ok
+SELECT fabricator_host_exec(decision_render('${FABRICATOR_DELTA_WRITE_DIR}/dmn_num.csv', name := 'ev_num'));
+
+query TT
+SELECT (SELECT decision FROM ev_num(42)), (SELECT decision FROM ev_num(7));
+----
+matched	other
+
+# ==============================================================================================
+# §8  THE REFUSALS — every one names its own cause, because the answer here is SQL a caller will RUN.
+# ==============================================================================================
+
+statement ok
+CREATE TABLE noin (rulepos INT, a VARCHAR);
+
+statement ok
+INSERT INTO noin VALUES (-2,'out'),(1,'x');
+
+statement error
+SELECT decision_render('noin');
+----
+no column is marked 'in'
+
+statement ok
+CREATE TABLE noout (rulepos INT, a VARCHAR);
+
+statement ok
+INSERT INTO noout VALUES (-2,'in'),(1,'x');
+
+statement error
+SELECT decision_render('noout');
+----
+no column is marked 'out'
+
+statement ok
+CREATE TABLE norules (rulepos INT, a VARCHAR, b VARCHAR);
+
+statement ok
+INSERT INTO norules VALUES (-2,'in','out');
+
+statement error
+SELECT decision_render('norules');
+----
+no rules
+
+# ⚠ A decision column becomes a MACRO PARAMETER, so it has to be a bare identifier. Refusing here beats
+# rendering a CREATE MACRO that cannot parse — the caller would meet the failure with no idea which column.
+statement ok
+CREATE TABLE badname (rulepos INT, "a b" VARCHAR, dec VARCHAR);
+
+statement ok
+INSERT INTO badname VALUES (-2,'in','out'),(1,'x','y');
+
+statement error
+SELECT decision_render('badname');
+----
+must be bare identifiers
+
+statement error
+SELECT decision_render('dr', source := 'nope');
+----
+is not one of auto, table, file, json, sql
+
+statement error
+SELECT decision_render('');
+----
+the rules argument is empty
+
+statement error
+SELECT decision_render('dr', dialect := 'oracle');
+----
+is not one of duckdb, tsql
+
+# ⚠⚠ `tsql` IS RECOGNISED BY THE PARSER AND REFUSED BY THE RENDERER, which is the honest split while only
+# one statement template exists: the cell vocabulary is dialect-aware, the SHAPE below it is a DuckDB
+# CREATE MACRO. Rendering it under 'tsql' would return a statement no SQL Server can run while LOOKING
+# like the argument was honoured. ⚠ This row is what must be DELETED when slice 3 lands, not edited.
+statement error
+SELECT decision_render('dr', dialect := 'tsql');
+----
+statement template is not built yet
+
+# ... while the parser itself still answers for T-SQL, which is what slice 3 will build on.
+query T
+SELECT dmn_condition('in [1,2,3]', 'age', 'tsql', '');
+----
+age IN (1, 2, 3)

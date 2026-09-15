@@ -120,6 +120,11 @@
          two minutes instead of by rendering and executing SQL. -->
     <Compile Include="..\Fabricator.Functions\DecisionRuleParser.cs"
              Link="Linked\DecisionRuleParser.cs" />
+    <!-- The rules-SOURCE classifier, and it is here for the SAME reason as the parser beside it: it emits
+         SQL TEXT THAT GETS SPLICED into a generated statement, so every branch (relation name / file /
+         JSON / verbatim) is worth pinning where no DuckDB, no rules table and no render are involved. -->
+    <Compile Include="..\Fabricator.Functions\DecisionRuleSource.cs"
+             Link="Linked\DecisionRuleSource.cs" />
     <Compile Include="..\Fabricator.Abstractions\DuckSql.cs"
              Link="Linked\DuckSql.cs" />
     <Compile Include="..\Fabricator.Abstractions\AlterTableSpec.cs"

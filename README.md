@@ -2873,6 +2873,104 @@ SELECT * FROM query_zip({'x': 'SELECT 1 AS a'}, as_structs := true);    -- x  ST
 > **TEMP** relations are invisible to the pattern match. Name them with `similar_to := false`, which renders
 > them verbatim into a statement the caller binds.
 
+### Decision tables: `decision_render`
+
+A **decision table** is a relation: one row per rule, columns split into inputs and outputs, plus three
+metadata rows. `decision_render` turns one into the **SQL text of a DuckDB `TABLE MACRO`** that evaluates it —
+DMN-like, with hit policies. It returns text and creates nothing, so you can read it before running it.
+
+| `rulepos` | row |
+|---|---|
+| `-2` | **direction** — `in`, `out`, or blank (the column is ignored, e.g. a `Comment`) |
+| `-1` | **datatypes** — the macro parameter's type, and the output cast |
+| `0` | **pre/post-processing** — optional; `?` is the column, `@other` another column |
+| `>= 1` | **the rules**, in evaluation order |
+
+```sql
+CREATE TABLE decision_rules (rulepos INT, region VARCHAR, age VARCHAR, amount VARCHAR,
+                             decision VARCHAR, risk VARCHAR, label VARCHAR, Comment VARCHAR);
+INSERT INTO decision_rules VALUES
+    (-2, 'in',      'in',         'in',      'out',     'out',              'out',              NULL),
+    (-1, 'VARCHAR', 'FLOAT',      'FLOAT',   'VARCHAR', 'DOUBLE',           'VARCHAR',          NULL),
+    ( 0,  NULL,     'floor(?)',   '?',       NULL,      NULL,               NULL,               NULL),
+    ( 1, 'EU, US',  '> 18',       '< 10000', 'approve', '@amount * 0.0001', '@region',          NULL),
+    ( 2, 'US',      '[21 .. 65]', '> 5000',  'review',  '@age * 0.01',      '@age::varchar',    NULL),
+    ( 3, 'not RU',  '',           '<= 1000', 'approve', '0.2',              'low',              NULL),
+    ( 4, '',        '',           '> @age',  'flag',    '@amount / @age',   '@amount::varchar', NULL),
+    ( 5, '',        '',           '',        'reject',  '1.0',              'default',          NULL);
+
+-- Look at the generated macro ...
+SELECT decision_render('decision_rules', name := 'evaluate_row');
+
+-- ... then create it and evaluate.
+SELECT fabricator_host_exec(decision_render('decision_rules', name := 'evaluate_row'));
+
+SELECT rulepos, decision, risk, label FROM evaluate_row('JP', 40, 500);
+--   3 | approve | 0.2 | low
+SELECT rulepos, decision FROM evaluate_row('JP', 40, 500, hit_policy := 'RuleOrder');
+--   3 | approve     4 | flag     5 | reject
+```
+
+Each **cell** is a small expression language:
+
+| cell | condition |
+|---|---|
+| `> 18`, `<> 'x'` | comparison |
+| `EU, US` | `region IN ('EU', 'US')` |
+| `between 21 and 65`, `between min(1) and max(100)` | `BETWEEN`, bounds may be expressions |
+| `[21 .. 65]`, `(0 .. 100]` | DMN FEEL ranges, inclusive/exclusive per bracket |
+| `in [1,2,3]` / `in (1,2,3)` | explicit list; brackets stay a DuckDB `LIST` |
+| `not RU` | negation |
+| `> @age` | compare against another input |
+| `contains(?, 'x')`, `@age*2 > min(1)+1` | a condition you write in full; `?` is the column |
+| blank, `*` | wildcard — matches anything |
+
+Outputs are value expressions (`approve`, `42`, `@amount * 0.01`, `@age::varchar`). The generated macro takes
+a `hit_policy` parameter — `First` (default), `RuleOrder`, `Unique`, `Any` — and returns `_total_hits_`,
+`_any_hitpolicy_violations_`, `_model_error_` and a `decisiontable_hk` identity hash beside your outputs.
+When an output's `rulepos = 0` expression contains an aggregate (`max(?)`, `arg_max(?,risk)`,
+`EXP(SUM(LOG(?)))`), the table switches to **aggregate mode**: every matching rule collapses into one row and
+the default policy becomes `RuleOrder`.
+
+**Where the rules come from.** `decision_render` accepts four forms and picks between the first three itself:
+
+```sql
+SELECT decision_render('decision_rules');                  -- a relation name, or db.main.rules
+SELECT decision_render('/data/rules.csv');                 -- a file: csv, parquet, json, ...
+SELECT decision_render('[{"rulepos":-2,"region":"in"}]');  -- JSON text (array of objects)
+SELECT decision_render('read_xlsx(''r.xlsx'')', source := 'sql');   -- any relation expression
+```
+
+`source := 'auto'|'table'|'file'|'json'|'sql'` overrides the choice; `hit_policy :=` changes the default
+baked into the generated macro. `dialect :=` selects the target — the cell parser already answers for
+`tsql`, but only the `duckdb` statement template exists, so `decision_render(..., dialect := 'tsql')` is
+refused by name rather than handing back a DuckDB macro that pretends to be T-SQL.
+
+The parser is also callable on its own, which is the quickest way to see what a cell means:
+
+```sql
+SELECT dmn_condition('[21 .. 65]', 'age', 'duckdb', '');   -- age >= 21 AND age <= 65
+SELECT dmn_value('@amount * 0.01', 'duckdb', '');          -- amount * 0.01
+SELECT dmn_is_aggregate('EXP(SUM(LOG(?)))');               -- true
+SELECT dmn_relation('rules.csv', 'auto');                  -- read_csv('rules.csv', all_varchar = true)
+```
+
+> ⚠⚠ **A decision table is CODE, not data.** An expression cell is passed through into the generated SQL, so
+> a rule may call any function the engine has — that is the feature, and it means the rules relation is a
+> **trusted authoring surface**, exactly like a template. Never build one from user input.
+>
+> ⚠ A decision column becomes a macro **parameter**, so its name must be a bare identifier. `decision_render`
+> refuses by name otherwise rather than emitting a `CREATE MACRO` that cannot parse.
+>
+> ⚠ Rules held in a **TEMP** table are invisible: the introspection runs on the render's own connection. Use a
+> regular table, a file, or JSON.
+>
+> ⚠ `source := 'table'` still reads a **dotted** name as qualified — `rules.csv` becomes `"rules"."csv"`. A
+> relation literally *named* `rules.csv` needs `source := 'sql'` with the name pre-quoted.
+>
+> ⚠ Rendering costs three small queries and DuckDB **repeats binds**, so do not put a `decision_render` behind
+> a view and expect it to run once. Render once, create the macro, then call the macro.
+
 ### Provider views
 
 A provider can also ship **views** bound into an attached catalog's schemas. Unlike a macro, a view is a

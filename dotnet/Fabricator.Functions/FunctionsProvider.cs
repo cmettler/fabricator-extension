@@ -43,6 +43,16 @@ public sealed class FunctionsProvider : IProvider
 
     public IEnumerable<MacroDefinition> GlobalMacros => Declared;
 
+    /// <summary>
+    /// The decision-table parser and source classifier, callable from SQL — see <see cref="DecisionFunctions"/>.
+    /// </summary>
+    /// <remarks>
+    /// ⚠ Same non-throwing rule as <see cref="LoadMacros"/> and for the same measured reason: the host reads
+    /// this inside <c>list_global_functions</c>, where ONE throw drops every global function in the process.
+    /// Nothing here can throw — it constructs four objects and returns them — and it must stay that way.
+    /// </remarks>
+    public IEnumerable<IScalarFunction> GlobalScalarFunctions => DecisionFunctions.All;
+
     public IProviderCatalog OpenCatalog(string connectionString, string optionsJson) =>
         throw new NotSupportedException(
             "functions: a macro library, not a catalog (global macros only).");

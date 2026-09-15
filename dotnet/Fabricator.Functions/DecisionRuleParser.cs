@@ -89,6 +89,24 @@ public static class DecisionRuleParser
     /// StackOverflowException, which no catch can turn back into an error message.</summary>
     private const int MaxDepth = 32;
 
+    /// <summary>Maps a SQL-level dialect name onto <see cref="DmnDialect"/>, refusing an unknown one BY NAME.</summary>
+    /// <remarks>
+    /// ⚠ An EMPTY or absent name means DuckDB — the surface's own default — rather than an error, so a
+    /// caller who never mentions a dialect never has to. What is refused is a name that was MEANT to select
+    /// something: a silent fallback there would render the wrong dialect's SQL and say nothing.
+    /// </remarks>
+    public static DmnDialect ParseDialect(string? dialect)
+    {
+        var d = (dialect ?? string.Empty).Trim();
+        if (d.Length == 0 || d.Equals("duckdb", StringComparison.OrdinalIgnoreCase)) return DmnDialect.DuckDb;
+        if (d.Equals("tsql", StringComparison.OrdinalIgnoreCase)
+            || d.Equals("mssql", StringComparison.OrdinalIgnoreCase)
+            || d.Equals("sqlserver", StringComparison.OrdinalIgnoreCase)) return DmnDialect.TSql;
+
+        throw new InvalidOperationException(
+            $"decision rule: dialect '{d}' is not one of duckdb, tsql.");
+    }
+
     /// <summary>
     /// Parses an INPUT CONDITION cell into a SQL boolean expression over <paramref name="column"/>.
     /// </summary>
@@ -99,10 +117,11 @@ public static class DecisionRuleParser
     /// <para>⚠ ORDER IS LOAD-BEARING IN ONE PLACE: the FEEL range is matched BEFORE the comma check, or
     /// <c>[0 .. func(1,2,?)]</c> is split on the argument comma and parsed as a three-item IN list.</para>
     /// </remarks>
-    public static string ParseCondition(string? cell, string column, DmnDialect dialect = DmnDialect.DuckDb)
-        => ParseCondition(cell, column, dialect, 0);
+    public static string ParseCondition(string? cell, string column, DmnDialect dialect = DmnDialect.DuckDb,
+                                        string? refPrefix = null)
+        => ParseCondition(cell, column, dialect, refPrefix ?? string.Empty, 0);
 
-    private static string ParseCondition(string? cell, string column, DmnDialect dialect, int depth)
+    private static string ParseCondition(string? cell, string column, DmnDialect dialect, string refPrefix, int depth)
     {
         if (depth > MaxDepth)
         {
@@ -125,7 +144,7 @@ public static class DecisionRuleParser
             var lead = PlaceholderAtStart.Match(expr);
             if (lead.Success)
             {
-                return ParseCondition(lead.Groups[1].Value, column, dialect, depth + 1);
+                return ParseCondition(lead.Groups[1].Value, column, dialect, refPrefix, depth + 1);
             }
             expr = expr.Replace("?", column);
         }
@@ -133,14 +152,14 @@ public static class DecisionRuleParser
         var not = NotPrefix.Match(expr);
         if (not.Success)
         {
-            return $"NOT ({ParseCondition(not.Groups[1].Value, column, dialect, depth + 1)})";
+            return $"NOT ({ParseCondition(not.Groups[1].Value, column, dialect, refPrefix, depth + 1)})";
         }
 
         var inList = InList.Match(expr);
         if (inList.Success)
         {
             var (open, close) = ListBrackets(inList.Groups[1].Value, inList.Groups[3].Value, dialect);
-            return $"{column} IN {open}{string.Join(", ", ParseListItems(inList.Groups[2].Value, dialect))}{close}";
+            return $"{column} IN {open}{string.Join(", ", ParseListItems(inList.Groups[2].Value, dialect, refPrefix))}{close}";
         }
 
         // ⚠ BEFORE the comma check — see the remark on ParseCondition.
@@ -149,43 +168,43 @@ public static class DecisionRuleParser
         {
             var lowOp = range.Groups[1].Value == "[" ? ">=" : ">";
             var highOp = range.Groups[4].Value == "]" ? "<=" : "<";
-            var low = ParseCondition($"{lowOp} {range.Groups[2].Value.Trim()}", column, dialect, depth + 1);
-            var high = ParseCondition($"{highOp} {range.Groups[3].Value.Trim()}", column, dialect, depth + 1);
+            var low = ParseCondition($"{lowOp} {range.Groups[2].Value.Trim()}", column, dialect, refPrefix, depth + 1);
+            var high = ParseCondition($"{highOp} {range.Groups[3].Value.Trim()}", column, dialect, refPrefix, depth + 1);
             return $"{low} AND {high}";
         }
 
         if (HasTopLevelComma(expr))
         {
-            return $"{column} IN ({string.Join(", ", ParseListItems(expr, dialect))})";
+            return $"{column} IN ({string.Join(", ", ParseListItems(expr, dialect, refPrefix))})";
         }
 
         var between = BetweenAnd.Match(expr);
         if (between.Success)
         {
-            var lo = ParseValue(between.Groups[1].Value.Trim(), dialect);
-            var hi = ParseValue(between.Groups[2].Value.Trim(), dialect);
+            var lo = ParseValue(between.Groups[1].Value.Trim(), dialect, refPrefix, depth + 1);
+            var hi = ParseValue(between.Groups[2].Value.Trim(), dialect, refPrefix, depth + 1);
             return $"{column} BETWEEN {lo} AND {hi}";
         }
 
         var op = LeadingOperator.Match(expr);
         if (op.Success)
         {
-            return $"{column} {op.Groups[1].Value} {ParseValue(op.Groups[2].Value.Trim(), dialect)}";
+            return $"{column} {op.Groups[1].Value} {ParseValue(op.Groups[2].Value.Trim(), dialect, refPrefix, depth + 1)}";
         }
 
         // A bare function call is a condition the author wrote in full — resolve @refs and pass through.
         if (FunctionCallAtStart.IsMatch(expr))
         {
-            return ResolveRefs(expr);
+            return ResolveRefs(expr, refPrefix);
         }
 
         // A COMPLETE condition (`@age*2 > min(1)+1`) — pass through with @refs resolved.
         if (IsFullCondition(expr))
         {
-            return ResolveRefs(expr);
+            return ResolveRefs(expr, refPrefix);
         }
 
-        return $"{column} = {ParseValue(expr, dialect)}";
+        return $"{column} = {ParseValue(expr, dialect, refPrefix, depth + 1)}";
     }
 
     /// <summary>
@@ -198,10 +217,11 @@ public static class DecisionRuleParser
     /// EXPRESSION passes through with <c>@refs</c> resolved; a parenthesised cell is parsed INSIDE and
     /// re-wrapped; and only what survives all of that is quoted as a string literal.
     /// </remarks>
-    public static string ParseValue(string? cell, DmnDialect dialect = DmnDialect.DuckDb)
-        => ParseValue(cell, dialect, 0);
+    public static string ParseValue(string? cell, DmnDialect dialect = DmnDialect.DuckDb,
+                                    string? refPrefix = null)
+        => ParseValue(cell, dialect, refPrefix ?? string.Empty, 0);
 
-    private static string ParseValue(string? cell, DmnDialect dialect, int depth)
+    private static string ParseValue(string? cell, DmnDialect dialect, string refPrefix, int depth)
     {
         if (depth > MaxDepth)
         {
@@ -213,7 +233,7 @@ public static class DecisionRuleParser
 
         if (BareColumnRef.IsMatch(val))
         {
-            return val.Substring(1);
+            return refPrefix + val.Substring(1);
         }
         if (val.Length >= 2 && val.StartsWith("'", StringComparison.Ordinal) && val.EndsWith("'", StringComparison.Ordinal))
         {
@@ -231,11 +251,11 @@ public static class DecisionRuleParser
         }
         if (IsValueExpression(val))
         {
-            return ResolveRefs(val);
+            return ResolveRefs(val, refPrefix);
         }
         if (val.Length >= 2 && val.StartsWith("(", StringComparison.Ordinal) && val.EndsWith(")", StringComparison.Ordinal))
         {
-            return $"({ParseValue(val.Substring(1, val.Length - 2), dialect, depth + 1)})";
+            return $"({ParseValue(val.Substring(1, val.Length - 2), dialect, refPrefix, depth + 1)})";
         }
         // ⚠ The ONLY place a cell becomes a LITERAL. Doubling the quote is the complete escape for a SQL
         // string in every dialect here — there is no backslash escaping to also handle.
@@ -270,19 +290,41 @@ public static class DecisionRuleParser
     /// <remarks>⚠ @refs and quoted strings are stripped FIRST, so `'a+b'` is a string and `@a+@b` is not.</remarks>
     private static bool IsValueExpression(string val)
     {
-        var stripped = QuotedString.Replace(ResolveRefs(val), string.Empty);
+        var stripped = QuotedString.Replace(ResolveRefs(val, string.Empty), string.Empty);
         return AnyFunctionCall.IsMatch(stripped) || ValueOperators.IsMatch(stripped);
     }
 
     /// <summary>A COMPLETE condition: it already contains a comparison operator or a condition keyword.</summary>
     private static bool IsFullCondition(string val)
     {
-        var stripped = QuotedString.Replace(ResolveRefs(val), string.Empty);
+        var stripped = QuotedString.Replace(ResolveRefs(val, string.Empty), string.Empty);
         return ComparisonOperators.IsMatch(stripped) || ConditionKeywords.IsMatch(stripped);
     }
 
     /// <summary><c>@name</c> → <c>name</c>. A column reference always resolves to the bare column name.</summary>
-    private static string ResolveRefs(string expr) => ColumnRef.Replace(expr, "$1");
+    /// <summary>Resolves <c>@name</c> to <paramref name="refPrefix"/> + <c>name</c>.</summary>
+    /// <remarks>
+    /// <para>
+    /// ⚠⚠ THE PREFIX EXISTS FOR ONE MEASURED DuckDB RULE: <b>a macro PARAMETER shadows a column of the same
+    /// name anywhere in the macro's body</b>, so a generated macro whose parameter is <c>age</c> and whose
+    /// preprocessing CTE also produces <c>age</c> reads the RAW PARAMETER everywhere downstream — the
+    /// preprocessed value is computed and silently never used. MEASURED both ways: a bare reference yields
+    /// the parameter, and a QUALIFIED one (<c>preprocessed.age</c>) yields the CTE column. So the renderer
+    /// qualifies, and <c>@refs</c> have to be qualified with it or a cross-column rule would read one value
+    /// while the column's own cell read another.
+    /// </para>
+    /// <para>
+    /// ⚠ A <see cref="System.Text.RegularExpressions.MatchEvaluator"/> rather than a <c>"$1"</c> replacement
+    /// string, because the prefix is caller-supplied text and <c>$</c> is a substitution metacharacter there.
+    /// </para>
+    /// <para>
+    /// ⚠ The two DETECTORS (<see cref="IsValueExpression"/>, <see cref="IsFullCondition"/>) deliberately call
+    /// this with an EMPTY prefix: they strip refs only to decide WHICH branch a cell takes, and that decision
+    /// must not depend on how references are spelled.
+    /// </para>
+    /// </remarks>
+    private static string ResolveRefs(string expr, string refPrefix) =>
+        ColumnRef.Replace(expr, m => refPrefix + m.Groups[1].Value);
 
     /// <summary>
     /// TRUE when the cell has a comma at the TOP level — i.e. one that separates list items rather than
@@ -313,12 +355,12 @@ public static class DecisionRuleParser
         return false;
     }
 
-    private static List<string> ParseListItems(string raw, DmnDialect dialect)
+    private static List<string> ParseListItems(string raw, DmnDialect dialect, string refPrefix)
     {
         var items = new List<string>();
         foreach (var item in raw.Split(','))
         {
-            items.Add(ParseValue(item.Trim(), dialect));
+            items.Add(ParseValue(item.Trim(), dialect, refPrefix, 0));
         }
         return items;
     }

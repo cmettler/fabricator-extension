@@ -163,6 +163,70 @@ public class DecisionRuleParserTests
         => Assert.Equal("CHARINDEX('x', col) > 0",
             DecisionRuleParser.ParseCondition("CHARINDEX('x', ?) > 0", "col", DmnDialect.TSql));
 
+    // ── the reference prefix ─────────────────────────────────────────────────────────────────────────
+    // ⚠⚠ IT EXISTS FOR ONE MEASURED DuckDB RULE: a macro PARAMETER shadows a column of the same name
+    // anywhere in the body, so a generated macro whose parameter is `age` and whose preprocessing CTE also
+    // produces `age` reads the RAW ARGUMENT everywhere downstream — the preprocessed value is computed and
+    // silently never used. MEASURED both ways on a two-line macro: bare `x` yields the argument, `p.x`
+    // yields the CTE column. The renderer therefore QUALIFIES, and @refs have to be qualified with it.
+    [Theory]
+    [InlineData("> @age", "preprocessed.amount", "preprocessed.amount > preprocessed.age")]
+    [InlineData("@age*2 > min(1)+1", "preprocessed.age", "preprocessed.age*2 > min(1)+1")]
+    [InlineData("[0 .. @age]", "preprocessed.amount",
+                "preprocessed.amount >= 0 AND preprocessed.amount <= preprocessed.age")]
+    public void Ref_prefix_qualifies_every_column_reference(string cell, string column, string expected)
+        => Assert.Equal(expected, DecisionRuleParser.ParseCondition(cell, column, DmnDialect.DuckDb, "preprocessed."));
+
+    [Theory]
+    [InlineData("@amount / @age", "preprocessed.amount / preprocessed.age")]
+    [InlineData("@col", "preprocessed.col")]
+    [InlineData("@age::varchar", "preprocessed.age::varchar")]
+    public void Ref_prefix_reaches_value_expressions_too(string cell, string expected)
+        => Assert.Equal(expected, DecisionRuleParser.ParseValue(cell, DmnDialect.DuckDb, "preprocessed."));
+
+    // ⚠⚠ THE PREFIX MUST NOT CHANGE WHICH BRANCH A CELL TAKES, only the text emitted. The two detectors
+    // strip @refs before matching, so they are called with an EMPTY prefix deliberately — otherwise a
+    // prefix containing a dot (or worse, an operator) could reclassify a cell. This row is the control: a
+    // bare string is still QUOTED, not mistaken for an expression, whatever the prefix.
+    [Fact]
+    public void Ref_prefix_does_not_reclassify_a_cell()
+    {
+        Assert.Equal("'approve'", DecisionRuleParser.ParseValue("approve", DmnDialect.DuckDb, "preprocessed."));
+        Assert.Equal("preprocessed.region = 'RU'",
+            DecisionRuleParser.ParseCondition("RU", "preprocessed.region", DmnDialect.DuckDb, "preprocessed."));
+    }
+
+    // ⚠ A `$` in the prefix must not be read as a regex substitution token — the prefix is caller-supplied
+    // text, and the replacement goes through a MatchEvaluator rather than a "$1" replacement string.
+    [Fact]
+    public void A_dollar_in_the_prefix_is_literal()
+        => Assert.Equal("$p$age", DecisionRuleParser.ParseValue("@age", DmnDialect.DuckDb, "$p$"));
+
+    // An absent prefix is the ordinary bare resolution — the default every other test here relies on.
+    [Fact]
+    public void No_prefix_resolves_bare()
+        => Assert.Equal("amount / age", DecisionRuleParser.ParseValue("@amount / @age"));
+
+    // ── the dialect name ─────────────────────────────────────────────────────────────────────────────
+    [Theory]
+    [InlineData(null, DmnDialect.DuckDb)]
+    [InlineData("", DmnDialect.DuckDb)]
+    [InlineData("DuckDB", DmnDialect.DuckDb)]
+    [InlineData("tsql", DmnDialect.TSql)]
+    [InlineData("MSSQL", DmnDialect.TSql)]
+    [InlineData("sqlserver", DmnDialect.TSql)]
+    public void Dialect_names_are_case_insensitive(string? name, DmnDialect expected)
+        => Assert.Equal(expected, DecisionRuleParser.ParseDialect(name));
+
+    // ⚠ An unknown dialect is refused rather than defaulting to DuckDB: it was written to SELECT a target,
+    // and a silent fallback would render the wrong dialect's SQL and say nothing.
+    [Fact]
+    public void An_unknown_dialect_is_refused_by_name()
+    {
+        var ex = Assert.Throws<InvalidOperationException>(() => DecisionRuleParser.ParseDialect("oracle"));
+        Assert.Contains("duckdb, tsql", ex.Message, StringComparison.Ordinal);
+    }
+
     // ── the guard ────────────────────────────────────────────────────────────────────────────────────
     // ⚠ A malformed cell must fail with a SENTENCE. A StackOverflowException cannot be caught, so it would
     // take the whole process down rather than failing one statement.
