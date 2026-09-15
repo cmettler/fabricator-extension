@@ -81,7 +81,45 @@ public static class DecisionRuleParser
     private static readonly Regex AnyFunctionCall = new(@"\b[a-zA-Z_]\w*\s*\(");
     private static readonly Regex ValueOperators = new(@"[+*/%]|\|\||::");
     private static readonly Regex ComparisonOperators = new(@">=|<=|<>|!=|(?<![<>!])=|(?<!=)[><](?!=)");
-    private static readonly Regex ConditionKeywords = new(@"\b(?:BETWEEN|LIKE|ILIKE|REGEXP|IN)\b", RegexOptions.IgnoreCase);
+    /// <summary>
+    /// The operator KEYWORDS that make a cell a complete condition rather than a value to compare against.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>⚠⚠ A MISSING KEYWORD IS A SILENT WRONG ANSWER AND A SPURIOUS ONE IS A LOUD ERROR, WHICH IS WHY
+    /// THIS LIST IS DELIBERATELY GENEROUS.</b> Undetected, a cell like <c>@region SIMILAR TO 'E.*'</c> falls
+    /// to the string fallback and renders <c>region = '@region SIMILAR TO ''E.*'''</c> — valid SQL that is
+    /// ALWAYS FALSE, with nothing failing anywhere. Over-detected, a bare data value containing one of these
+    /// words passes through as raw SQL and the target engine refuses it at CREATE time. MEASURED both ways:
+    /// <c>MADE IN USA</c> already passes through today (the <c>IN</c> entry), and the escape is to QUOTE the
+    /// cell — <c>'MADE IN USA'</c> renders <c>origin = 'MADE IN USA'</c>. ⚠ The word boundaries do their job:
+    /// <c>LIKED</c> is still quoted as a value.
+    /// </para>
+    /// <para>
+    /// <b>⚠ IT IS A UNION ACROSS DIALECTS, AND THAT IS CORRECT BECAUSE IT DETECTS RATHER THAN TRANSLATES.</b>
+    /// A keyword the target lacks simply means the cell passes through and the target complains about the
+    /// author's own SQL. MEASURED on the shipped builds: <c>SIMILAR TO</c>, <c>GLOB</c> and <c>ILIKE</c> are
+    /// DuckDB's and not T-SQL's; <c>REGEXP</c> is NEITHER — it is an infix operator in MySQL/SQLite and came
+    /// in with the ported engine (SQL Server 2025 has no <c>REGEXP</c> operator and no <c>REGEXP_LIKE</c>
+    /// function on this rig, and DuckDB rejects the infix form outright). It stays anyway: removing it would
+    /// turn a cell that names it from a loud error back into a silently-false comparison.
+    /// </para>
+    /// <para>
+    /// ⚠ <c>ILIKE</c> is listed separately rather than left to <c>LIKE</c>: there is no word boundary between
+    /// <c>I</c> and <c>LIKE</c>, so <c>\bLIKE\b</c> does not match it. The negated forms need no entries —
+    /// <c>NOT LIKE</c> / <c>NOT SIMILAR TO</c> / <c>NOT GLOB</c> all contain their base keyword.
+    /// </para>
+    /// <para>
+    /// ⚠ The <c>IS …</c> forms are matched as PHRASES, not as a bare <c>IS</c>, which keeps a data value
+    /// containing the word from being mistaken for an operator. <c>IS NULL</c> is the most natural cell a
+    /// decision table has (does this field have a value at all?) and was in this hole until 2026-09-16.
+    /// </para>
+    /// </remarks>
+    private static readonly Regex ConditionKeywords = new(
+        @"\b(?:BETWEEN|LIKE|ILIKE|REGEXP|GLOB|IN)\b"
+        + @"|\bSIMILAR\s+TO\b"
+        + @"|\bIS\s+(?:NOT\s+)?(?:NULL|DISTINCT\s+FROM)\b",
+        RegexOptions.IgnoreCase);
     private static readonly Regex NamedFunctionCall = new(@"\b([a-zA-Z_]\w*)\s*\(");
 
     /// <summary>⚠ Guards the three recursion points against a pathological cell. A rule is authored, so a

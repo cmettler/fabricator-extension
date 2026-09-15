@@ -208,6 +208,61 @@ public class DecisionRuleParserTests
     public void Keyword_literals_are_upper_cased(string cell, string expected)
         => Assert.Equal(expected, DecisionRuleParser.ParseValue(cell));
 
+    // ── the DuckDB pattern-matching and NULL operators ───────────────────────────────────────────────
+    // ⚠⚠ EVERY ONE OF THESE WAS IN A HOLE UNTIL 2026-09-16, and the hole is the dangerous kind: with the
+    // keyword undetected the cell falls to the string fallback and renders an equality against its own
+    // TEXT — valid SQL that is ALWAYS FALSE, with nothing failing. MEASURED before the fix:
+    // `@region SIMILAR TO 'E.*'` rendered `region = '@region SIMILAR TO ''E.*'''`.
+    [Theory]
+    [InlineData("@region SIMILAR TO 'E.*'", "region", "region SIMILAR TO 'E.*'")]
+    [InlineData("@region NOT SIMILAR TO 'E.*'", "region", "region NOT SIMILAR TO 'E.*'")]
+    [InlineData("@region GLOB 'E*'", "region", "region GLOB 'E*'")]
+    [InlineData("@region IS NULL", "region", "region IS NULL")]
+    [InlineData("@region IS NOT NULL", "region", "region IS NOT NULL")]
+    [InlineData("@region IS DISTINCT FROM @other", "region", "region IS DISTINCT FROM other")]
+    [InlineData("@region IS NOT DISTINCT FROM @other", "region", "region IS NOT DISTINCT FROM other")]
+    public void Pattern_and_null_operators_are_full_conditions(string cell, string column, string expected)
+        => Assert.Equal(expected, DecisionRuleParser.ParseCondition(cell, column));
+
+    // ⚠ `?` works in these too — but ONLY when it is not the FIRST thing in the cell. Writing
+    // `? SIMILAR TO 'E.*'` takes the placeholder-at-start branch instead and loses the column; that is the
+    // characterization two tests below, and this row is its positive counterpart.
+    [Theory]
+    [InlineData("upper(?) IS NULL", "region", "upper(region) IS NULL")]
+    [InlineData("coalesce(?, 'x') SIMILAR TO 'E.*'", "region", "coalesce(region, 'x') SIMILAR TO 'E.*'")]
+    public void The_placeholder_works_inside_a_keyword_condition(string cell, string column, string expected)
+        => Assert.Equal(expected, DecisionRuleParser.ParseCondition(cell, column));
+
+    // ⚠⚠ THE COST OF A GENEROUS KEYWORD LIST, PINNED SO IT IS A CHOICE RATHER THAN A SURPRISE. A bare data
+    // value containing one of these words is read as an OPERATOR and passed through as raw SQL, which the
+    // target engine then refuses at CREATE time. That is the SAFE direction — the alternative is a silently
+    // false comparison — and the escape is to QUOTE the cell. ⚠ This is pre-existing behaviour of the `IN`
+    // entry, not something the 2026-09-16 widening introduced.
+    [Fact]
+    public void A_data_value_containing_a_keyword_passes_through_and_quoting_is_the_escape()
+    {
+        Assert.Equal("MADE IN USA", DecisionRuleParser.ParseCondition("MADE IN USA", "origin"));
+        Assert.Equal("origin = 'MADE IN USA'", DecisionRuleParser.ParseCondition("'MADE IN USA'", "origin"));
+        // ⚠ The word boundaries do their job: a word CONTAINING a keyword is still a value.
+        Assert.Equal("status = 'LIKED'", DecisionRuleParser.ParseCondition("LIKED", "status"));
+        Assert.Equal("status = 'GLOBAL'", DecisionRuleParser.ParseCondition("GLOBAL", "status"));
+    }
+
+    // ⚠⚠ A CHARACTERIZATION OF A PRE-EXISTING PARSER EDGE, NOT A BEHAVIOUR THIS FILE ENDORSES. `?` at the
+    // START delegates the REMAINDER to the parser, which is right for a value form (`? >=a` ⇒ col >= 'a')
+    // and loses the column when the remainder is a FULL CONDITION. It is not new — LIKE has been in the
+    // keyword list from the beginning and behaves the same way — and it is NOT fixed here, because the
+    // obvious fix (substitute instead of delegate) was measured to break the T-SQL bracket rewrite for
+    // `? in [1,2,3]`, where delegation is what reaches ListBrackets.
+    // ⇒ WRITE `@col IS NULL` OR EMBED THE PLACEHOLDER (`upper(?) IS NULL`). Both are asserted above.
+    [Fact]
+    public void Placeholder_at_the_start_of_a_keyword_condition_loses_the_column()
+    {
+        Assert.Equal("LIKE 'E%'", DecisionRuleParser.ParseCondition("? LIKE 'E%'", "region"));
+        Assert.Equal("IS NULL", DecisionRuleParser.ParseCondition("? IS NULL", "region"));
+        Assert.Equal("SIMILAR TO 'E.*'", DecisionRuleParser.ParseCondition("? SIMILAR TO 'E.*'", "region"));
+    }
+
     // ── the reference prefix ─────────────────────────────────────────────────────────────────────────
     // ⚠⚠ IT EXISTS FOR ONE MEASURED DuckDB RULE: a macro PARAMETER shadows a column of the same name
     // anywhere in the body, so a generated macro whose parameter is `age` and whose preprocessing CTE also

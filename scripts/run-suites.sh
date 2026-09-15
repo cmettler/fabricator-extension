@@ -740,7 +740,14 @@ case "$TIER" in
         #   postprocessing (§3 gives outputs none and §5 gives them all aggregates, so neither reaches
         #   the ordinary scalar postprocess), the `In_` parameter-name stripping, a blank-direction column
         #   being IGNORED, sparse `rulepos`, and `decisiontable_hk`.
-        : "${MIN_ASSERTIONS:=9642}"
+        # 2026-09-16: 9642 -> 9657. verify_decision_render 179 -> 194 (§15) — the cell parser's operator
+        #   KEYWORD list gained SIMILAR TO, GLOB and IS [NOT] NULL / IS [NOT] DISTINCT FROM (user-asked:
+        #   "duck has this 'similar to' would it fit here, too?"). ⚠ It is the DANGEROUS direction that was
+        #   broken: an undetected keyword falls to the string fallback and renders an equality against the
+        #   cell's own TEXT — valid SQL, always FALSE, nothing failing. One fixture discriminates all of
+        #   them; the mutant (the old list) dies at §15's first row after 182 with the wildcard rule
+        #   answering instead.
+        : "${MIN_ASSERTIONS:=9657}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

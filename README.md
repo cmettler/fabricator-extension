@@ -2922,6 +2922,8 @@ Each **cell** is a small expression language:
 | `in [1,2,3]` / `in (1,2,3)` | explicit list; brackets stay a DuckDB `LIST` |
 | `not RU` | negation |
 | `> @age` | compare against another input |
+| `@region LIKE 'E%'`, `SIMILAR TO`, `GLOB`, `ILIKE` | pattern matching, passed through to the engine |
+| `@region IS NULL`, `@a IS NOT DISTINCT FROM @b` | NULL tests and null-safe comparison |
 | `contains(?, 'x')`, `@age*2 > min(1)+1` | a condition you write in full; `?` is the column |
 | blank, `*` | wildcard — matches anything |
 
@@ -2958,6 +2960,17 @@ SELECT dmn_relation('rules.csv', 'auto');                  -- read_csv('rules.cs
 > ⚠⚠ **A decision table is CODE, not data.** An expression cell is passed through into the generated SQL, so
 > a rule may call any function the engine has — that is the feature, and it means the rules relation is a
 > **trusted authoring surface**, exactly like a template. Never build one from user input.
+>
+> ⚠ A cell is recognised as a *condition* — rather than a value to compare against — when it carries a
+> comparison operator or one of `BETWEEN`, `LIKE`, `ILIKE`, `GLOB`, `SIMILAR TO`, `REGEXP`, `IN`,
+> `IS [NOT] NULL`, `IS [NOT] DISTINCT FROM`. The list is a **union across dialects** and is a detector, not
+> a translator: a keyword the target lacks just means the cell passes through and the target complains. The
+> cost is that a bare data value containing one of those words is read as an operator and refused at
+> `CREATE` time — **quote the cell** (`'MADE IN USA'`) to force it back to a literal.
+>
+> ⚠ `?` at the *start* of a cell delegates the rest for value treatment (`? >= a` → `col >= 'a'`), so it
+> does **not** work in front of one of those keywords. Write `@col IS NULL`, or embed the placeholder
+> (`upper(?) IS NULL`).
 >
 > ⚠ A decision column becomes a macro **parameter**, so its name must be a bare identifier. `decision_render`
 > refuses by name otherwise rather than emitting a `CREATE MACRO` that cannot parse.

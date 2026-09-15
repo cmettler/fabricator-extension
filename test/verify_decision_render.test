@@ -631,3 +631,66 @@ SELECT regexp_extract(decision_render('sparsr'), '([0-9a-f]{32})', 1)
      = regexp_extract(decision_render('hk_b'), '([0-9a-f]{32})', 1);
 ----
 true	false
+
+# ==============================================================================================
+# §15  THE PATTERN-MATCHING AND NULL OPERATORS, END TO END.
+# ==============================================================================================
+# ⚠⚠ ONE FIXTURE DISCRIMINATES ALL OF THEM AT ONCE, and that is the point: until 2026-09-16 the keyword
+# list held only BETWEEN / LIKE / ILIKE / REGEXP / IN, so every rule below fell to the string fallback
+# and rendered an equality against its own TEXT — `region = '@region IS NULL'` — which is valid SQL that
+# is ALWAYS FALSE. Every one of the five inputs would therefore have answered 'other', with nothing
+# failing anywhere. That is the failure mode this section exists to keep out.
+#
+# ⚠ `IS NULL` is the most natural cell a decision table has (does this field have a value at all?), and
+# `IS [NOT] DISTINCT FROM` is the null-safe comparison — MEASURED present on BOTH DuckDB and SQL Server
+# 2025, which makes it one of the few in that list that is genuinely portable.
+
+statement ok
+CREATE TABLE kw (rulepos INT, region VARCHAR, other VARCHAR, decision VARCHAR);
+
+statement ok
+INSERT INTO kw VALUES
+    (-2, 'in',                        'in',                                  'out'),
+    (-1, 'VARCHAR',                   'VARCHAR',                             'VARCHAR'),
+    ( 1, '@region IS NULL',           '',                                    'missing'),
+    ( 2, '@region SIMILAR TO ''E.*''','',                                    'europe'),
+    ( 3, '@region GLOB ''US*''',      '',                                    'america'),
+    ( 4, '',                          '@other IS NOT DISTINCT FROM @region', 'null-safe-equal'),
+    ( 5, '',                          '',                                    'other');
+
+statement ok
+SELECT fabricator_host_exec(decision_render('kw', name := 'ev_kw'));
+
+query IT
+SELECT rulepos, decision FROM ev_kw(NULL, 'x');
+----
+1	missing
+
+query IT
+SELECT rulepos, decision FROM ev_kw('EU', 'x');
+----
+2	europe
+
+query IT
+SELECT rulepos, decision FROM ev_kw('USA', 'x');
+----
+3	america
+
+query IT
+SELECT rulepos, decision FROM ev_kw('JP', 'JP');
+----
+4	null-safe-equal
+
+# ⚠ THE CONTROL. Without it every row above would be equally true of a build where the keywords were
+# detected but the CONDITIONS never matched anything — 'other' has to remain reachable.
+query IT
+SELECT rulepos, decision FROM ev_kw('JP', 'zz');
+----
+5	other
+
+# The structural half: the cell is passed THROUGH as a condition, not quoted into an equality.
+query TT
+SELECT regexp_matches(decision_render('kw'), 'WHEN 1 THEN preprocessed\.region IS NULL')::VARCHAR,
+       regexp_matches(decision_render('kw'), 'region = ''@region')::VARCHAR;
+----
+true	false
