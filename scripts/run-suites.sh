@@ -758,7 +758,13 @@ case "$TIER" in
         #   pass also found and fixed a real defect: the `?` substitution was a blind string.Replace and
         #   CORRUPTED a `?` inside a quoted literal — `GLOB 'US?'` rendered `region GLOB 'USregion'`, and
         #   `?` is GLOB's single-character WILDCARD, so that was a silently DIFFERENT pattern.
-        : "${MIN_ASSERTIONS:=9668}"
+        # 2026-09-16: 9668 -> 9672. verify_decision_render 205 -> 209 — `rulepos` IS THE ORDERING, 1..N
+        #   with no gaps (user: "you invented the rulenumber. the orig just assumed the rule ordering as
+        #   rule number on purpose"). ⚠ The generated macro is back to ONE spelling, `generate_series(1,
+        #   N)`, which is also what keeps a 50-rule table from rendering 50 literals — but the assumption
+        #   is CHECKED rather than silent, because a slot corresponding to no rule is a PHANTOM that
+        #   matches every input (`ELSE 1=1`) and answers all-NULL, so under `First` it would WIN.
+        : "${MIN_ASSERTIONS:=9672}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

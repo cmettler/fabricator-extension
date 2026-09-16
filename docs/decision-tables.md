@@ -25,7 +25,13 @@ the shipped build.
 | `>= 1` | **the rules**, in evaluation order | `EU, US`, `> 18`, `approve` |
 
 A blank direction means the column is ignored entirely — a `Comment` column contributes no parameter and no
-output. Rule numbers need not be contiguous: `1, 5, 9` is fine, and only those three exist.
+output.
+
+> **⚠ `rulepos` IS THE ORDERING, so it must run `1..N` with no gaps** — the rule *number* is the rule
+> *order*. A gap is refused by name rather than assumed away: a generated slot that corresponds to no rule
+> is a **phantom rule** — every input condition falls through to `ELSE 1=1`, so it matches *every* input,
+> while the outputs answer all-NULL. Under `First` a phantom would win. (The ported engine makes the same
+> assumption but does not check it.)
 
 ```sql
 CREATE TABLE decision_rules (rulepos INT, region VARCHAR, age VARCHAR, amount VARCHAR,
@@ -274,10 +280,10 @@ Measured against the ported engine, so the list is complete rather than impressi
 | Excel / Grist loading | out of scope — that is *authoring*, not evaluation |
 | `varchar(max)` in the datatypes row | **not normalised.** Measured: DuckDB accepts `varchar(50)`, `nvarchar(50)` and `char(3)`, and rejects only the `(max)` spelling (`Parser Error: Expected a constant as type modifier`). The ported engine normalises SQL-Server types when targeting DuckDB; we do not, which matters only for a rules table authored against SQL Server. Belongs with the T-SQL work. |
 
-Things that exist **here** and not in the ported engine: sparse `rulepos` (it emits `generate_series(1,N)`,
-which for rules `1, 5, 9` invents matching-everything slots and never reaches rule 9); `SIMILAR TO`, `GLOB`
-and the `IS` operators; a blank output cell rendering `NULL`; four rules sources; and the qualification that
-makes input preprocessing actually reach the rules.
+Things that exist **here** and not in the ported engine: `SIMILAR TO`, `GLOB` and the `IS` operators; a
+blank output cell rendering `NULL`; four rules sources; the qualification that makes input preprocessing
+actually reach the rules; and the `rulepos` contiguity CHECK — the same assumption, but verified instead of
+assumed, so a mis-numbered table is refused rather than quietly evaluating a phantom rule.
 
 ---
 
@@ -291,5 +297,6 @@ makes input preprocessing actually reach the rules.
 
 The suite's sections map to this page: §3 the ported engine's own documented answers, §4 preprocessing
 reaching the rules, §5 aggregate mode, §6 the LATERAL expansion, §7 the four rules sources, §8 the refusals,
-§9 the macro's shape, §10 the `Any` policy, §11 aggregate exclusion, §12 output postprocessing, §13 sparse
-`rulepos`, §14 `decisiontable_hk`, §15 the pattern and NULL operators.
+§9 the macro's shape, §10 the `Any` policy, §11 aggregate exclusion, §12 output postprocessing, §13 the
+`rulepos` contiguity rule, §14 `decisiontable_hk`, §15 the pattern and NULL operators, §16 a blank output
+cell.

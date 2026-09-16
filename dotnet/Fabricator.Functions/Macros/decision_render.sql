@@ -192,7 +192,15 @@ SELECT
     (SELECT count(*) FROM m3 WHERE dir = 'out') AS n_outputs,
     (SELECT count(*) FROM rp)                   AS n_rules,
     (SELECT bool_or(has_aggregate) FROM m3)     AS has_aggregate,
-    (SELECT string_agg('(' || rulepos || ')', ', ' ORDER BY rulepos) FROM rp) AS rulepos_values,
+    -- ⚠⚠ `rulepos` IS THE ORDERING, so it must be 1..N WITH NO GAPS — the ported engine's assumption,
+    -- and a deliberate one. What is NOT inherited is assuming it SILENTLY: `generate_series(1, <count>)`
+    -- over a table numbered 1, 5, 9 generates slots 1, 2, 3, and a slot that corresponds to no rule is a
+    -- PHANTOM — every input CASE falls through to `ELSE 1=1`, so it matches EVERYTHING, while the output
+    -- CASE has no branch for it and answers all-NULL. Under `First` a phantom can therefore WIN, and
+    -- rules 5 and 9 are never reached at all. So the assumption is CHECKED and a gap is refused by name.
+    (SELECT CASE WHEN count(*) = max(rulepos) AND min(rulepos) = 1 THEN NULL
+                 ELSE string_agg(rulepos::VARCHAR, ', ' ORDER BY rulepos) END
+     FROM rp) AS bad_rulepos,
     (SELECT string_agg(col, ', ' ORDER BY ord) FROM m3 WHERE dir = 'out')     AS out_names_csv,
 
     -- the macro's own parameter list
@@ -278,6 +286,9 @@ SELECT
 {%- elsif p.n_outputs == 0 -%}
     {%- capture _m -%}decision_render: no column is marked 'out' by the direction row (rulepos = -2) of {{ params.rules }}.{%- endcapture -%}
     {%- query _e m: _m -%}SELECT 1 AS e WHERE error($m){%- endquery -%}
+{%- elsif p.bad_rulepos != blank -%}
+    {%- capture _m -%}decision_render: rulepos is the rule ORDERING and must run 1..N with no gaps, but {{ params.rules }} has {{ p.bad_rulepos }}. A gap would generate a rule slot matching every input and returning NULLs.{%- endcapture -%}
+    {%- query _e m: _m -%}SELECT 1 AS e WHERE error($m){%- endquery -%}
 {%- elsif p.n_rules == 0 -%}
     {%- capture _m -%}decision_render: {{ params.rules }} has metadata rows but no rules (no row with rulepos >= 1).{%- endcapture -%}
     {%- query _e m: _m -%}SELECT 1 AS e WHERE error($m){%- endquery -%}
@@ -302,7 +313,7 @@ WITH preprocessed AS (
     {{ p.pre_from_sql }}
 {%- endif %}
 ), rules AS (
-    SELECT * FROM (VALUES {{ p.rulepos_values }}) r(rulepos)
+    SELECT rulepos FROM generate_series(1, {{ p.n_rules }}) r(rulepos)
 ), matched AS (
     SELECT
         {{ p.out_case_sql }},

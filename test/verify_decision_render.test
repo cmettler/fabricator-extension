@@ -585,58 +585,89 @@ SELECT regexp_matches(decision_render('postx'), 'cast\(\(upper\(label\)\) as VAR
 true
 
 # ==============================================================================================
-# §13  SPARSE `rulepos` — the rule numbers are the table's OWN, not 1..N.
+# §13  `rulepos` IS THE ORDERING — 1..N, no gaps.
 # ==============================================================================================
-# ⚠⚠ THIS IS A DELIBERATE IMPROVEMENT ON THE PORTED ENGINE, so it is pinned rather than left to luck.
-# That one emits `generate_series(1, <count>)`, which for rules numbered 1, 5, 9 would invent slots
-# 2 and 3 that match EVERYTHING (an input CASE falls through to `ELSE 1=1`) and would never reach rule
-# 9 at all. The rule numbers are enumerated from the table instead.
+# ⚠⚠ THE ASSUMPTION IS THE PORTED ENGINE'S AND IS DELIBERATE: the rule NUMBER is the rule ORDER, so it
+# runs 1..N. What is not inherited is assuming it SILENTLY. `generate_series(1, <count>)` over a table
+# numbered 1, 5, 9 generates slots 1, 2, 3 — and a slot that corresponds to NO rule is a PHANTOM: every
+# input CASE falls through to `ELSE 1=1`, so it matches EVERY input, while the output CASE has no branch
+# for it and answers all-NULL. Under `First` a phantom can WIN, and rules 5 and 9 are never reached.
+# ⇒ the assumption is CHECKED, and a gap is refused BY NAME.
 
 statement ok
-CREATE TABLE sparsr (rulepos INT, region VARCHAR, decision VARCHAR);
+CREATE TABLE contig (rulepos INT, region VARCHAR, decision VARCHAR);
 
 statement ok
-INSERT INTO sparsr VALUES (-2,'in','out'), (-1,'VARCHAR','VARCHAR'),
-    (1,'EU','one'), (5,'US','five'), (9,'','nine');
+INSERT INTO contig VALUES (-2,'in','out'), (-1,'VARCHAR','VARCHAR'),
+    (1,'EU','one'), (2,'US','two'), (3,'','three');
 
 statement ok
-SELECT fabricator_host_exec(decision_render('sparsr', name := 'ev_sparse'));
+SELECT fabricator_host_exec(decision_render('contig', name := 'ev_contig'));
 
+# ⚠ The compact form, which is the whole reason the assumption is worth keeping: a 50-rule table renders
+# `generate_series(1, 50)` rather than fifty literals.
 query T
-SELECT regexp_matches(decision_render('sparsr'), 'VALUES \(1\), \(5\), \(9\)\)')::VARCHAR;
+SELECT regexp_matches(decision_render('contig'), 'FROM generate_series\(1, 3\) r\(rulepos\)')::VARCHAR;
 ----
 true
 
-# Rule 9 exists and is reachable — under generate_series(1,3) it would not be.
 query IT
-SELECT rulepos, decision FROM ev_sparse('JP');
-----
-9	nine
-
-query IT
-SELECT rulepos, decision FROM ev_sparse('EU', hit_policy := 'RuleOrder') ORDER BY rulepos;
+SELECT rulepos, decision FROM ev_contig('EU');
 ----
 1	one
-9	nine
+
+query IT
+SELECT rulepos, decision FROM ev_contig('JP');
+----
+3	three
+
+# ⚠⚠ THE GAP IS REFUSED, and this row is what stands between a mis-numbered table and a phantom rule
+# quietly winning. ⚠ It is also the reason the refusal message names the NUMBERS: the fix is to renumber,
+# and a message that only said "invalid" would not say what to renumber.
+statement ok
+CREATE TABLE gappy (rulepos INT, region VARCHAR, decision VARCHAR);
+
+statement ok
+INSERT INTO gappy VALUES (-2,'in','out'), (-1,'VARCHAR','VARCHAR'),
+    (1,'EU','one'), (5,'US','five'), (9,'','nine');
+
+statement error
+SELECT decision_render('gappy');
+----
+must run 1..N with no gaps
+
+# ⚠ A table not starting at 1 is the same fault — slot 1 would be the phantom — and is caught by the same
+# rule. Without this row the check could be a bare count comparison and still pass.
+statement ok
+CREATE TABLE fromtwo (rulepos INT, region VARCHAR, decision VARCHAR);
+
+statement ok
+INSERT INTO fromtwo VALUES (-2,'in','out'), (-1,'VARCHAR','VARCHAR'),
+    (2,'EU','one'), (3,'','two');
+
+statement error
+SELECT decision_render('fromtwo');
+----
+must run 1..N with no gaps
 
 # ==============================================================================================
 # §14  `decisiontable_hk` — the decision table's identity.
 # ==============================================================================================
-# ⚠ It is a property of the RULES, not of the rendered macro, so renaming the macro must not move it
-# and changing one cell must. ⚠ The 32-hex match is the hash because nothing else in these fixtures is
-# 32 hex characters long.
+# ⚠ It is a property of the RULES, not of the rendered macro, so renaming the macro must not move it and
+# changing one cell must. ⚠ The 32-hex match is the hash because nothing else in these fixtures is 32 hex
+# characters long.
 
 statement ok
 CREATE TABLE hk_b (rulepos INT, region VARCHAR, decision VARCHAR);
 
 statement ok
 INSERT INTO hk_b VALUES (-2,'in','out'), (-1,'VARCHAR','VARCHAR'),
-    (1,'EU','one'), (5,'US','five'), (9,'','NINE');
+    (1,'EU','one'), (2,'US','two'), (3,'','THREE');
 
 query TT
-SELECT regexp_extract(decision_render('sparsr'), '([0-9a-f]{32})', 1)
-     = regexp_extract(decision_render('sparsr', name := 'other_name'), '([0-9a-f]{32})', 1),
-       regexp_extract(decision_render('sparsr'), '([0-9a-f]{32})', 1)
+SELECT regexp_extract(decision_render('contig'), '([0-9a-f]{32})', 1)
+     = regexp_extract(decision_render('contig', name := 'other_name'), '([0-9a-f]{32})', 1),
+       regexp_extract(decision_render('contig'), '([0-9a-f]{32})', 1)
      = regexp_extract(decision_render('hk_b'), '([0-9a-f]{32})', 1);
 ----
 true	false
