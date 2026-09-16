@@ -747,7 +747,12 @@ case "$TIER" in
         #   cell's own TEXT — valid SQL, always FALSE, nothing failing. One fixture discriminates all of
         #   them; the mutant (the old list) dies at §15's first row after 182 with the wildcard rule
         #   answering instead.
-        : "${MIN_ASSERTIONS:=9657}"
+        # 2026-09-16: 9657 -> 9659. verify_decision_render 194 -> 196 — a decision cell may now write a
+        #   keyword condition with THE COLUMN IMPLICIT ON THE LEFT (`IS NULL`, `LIKE 'E%'`), which is what
+        #   a cell IS: a predicate fragment about its own column, exactly like `> 18` / `between` / `in`.
+        #   ⚠ The §2 equivalence row (both spellings, one meaning) is the cheap kill — the mutant dies
+        #   there after 16 assertions, long before the end-to-end section.
+        : "${MIN_ASSERTIONS:=9659}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

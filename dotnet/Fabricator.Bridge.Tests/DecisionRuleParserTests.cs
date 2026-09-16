@@ -224,9 +224,9 @@ public class DecisionRuleParserTests
     public void Pattern_and_null_operators_are_full_conditions(string cell, string column, string expected)
         => Assert.Equal(expected, DecisionRuleParser.ParseCondition(cell, column));
 
-    // ⚠ `?` works in these too — but ONLY when it is not the FIRST thing in the cell. Writing
-    // `? SIMILAR TO 'E.*'` takes the placeholder-at-start branch instead and loses the column; that is the
-    // characterization two tests below, and this row is its positive counterpart.
+    // ⚠ `?` EMBEDDED in a keyword condition substitutes the column where it stands, which is a different
+    // rule from `?` at the START (that one delegates — see the theory further down, where the leading
+    // keyword then supplies the column anyway).
     [Theory]
     [InlineData("upper(?) IS NULL", "region", "upper(region) IS NULL")]
     [InlineData("coalesce(?, 'x') SIMILAR TO 'E.*'", "region", "coalesce(region, 'x') SIMILAR TO 'E.*'")]
@@ -248,20 +248,61 @@ public class DecisionRuleParserTests
         Assert.Equal("status = 'GLOBAL'", DecisionRuleParser.ParseCondition("GLOBAL", "status"));
     }
 
-    // ⚠⚠ A CHARACTERIZATION OF A PRE-EXISTING PARSER EDGE, NOT A BEHAVIOUR THIS FILE ENDORSES. `?` at the
-    // START delegates the REMAINDER to the parser, which is right for a value form (`? >=a` ⇒ col >= 'a')
-    // and loses the column when the remainder is a FULL CONDITION. It is not new — LIKE has been in the
-    // keyword list from the beginning and behaves the same way — and it is NOT fixed here, because the
-    // obvious fix (substitute instead of delegate) was measured to break the T-SQL bracket rewrite for
-    // `? in [1,2,3]`, where delegation is what reaches ListBrackets.
-    // ⇒ WRITE `@col IS NULL` OR EMBED THE PLACEHOLDER (`upper(?) IS NULL`). Both are asserted above.
+    // ── the column is IMPLICIT ON THE LEFT ───────────────────────────────────────────────────────────
+    // ⚠⚠ THIS IS WHAT A DECISION-TABLE CELL IS: a predicate FRAGMENT about its own column. `> 18` means
+    // `age > 18`, so `IS NULL` must mean `age IS NULL`. The same family as the leading-operator, BETWEEN
+    // and IN rules, which have prepended the column all along — these keywords were missing from it, so a
+    // bare cell rendered the column-less fragment `IS NULL`.
+    [Theory]
+    [InlineData("IS NULL", "region", "region IS NULL")]
+    [InlineData("IS NOT NULL", "region", "region IS NOT NULL")]
+    [InlineData("LIKE 'E%'", "region", "region LIKE 'E%'")]
+    [InlineData("ILIKE 'e%'", "region", "region ILIKE 'e%'")]
+    [InlineData("SIMILAR TO 'E.*'", "region", "region SIMILAR TO 'E.*'")]
+    [InlineData("GLOB 'US*'", "region", "region GLOB 'US*'")]
+    [InlineData("IS DISTINCT FROM @other", "region", "region IS DISTINCT FROM other")]
+    [InlineData("IS NOT DISTINCT FROM @other", "region", "region IS NOT DISTINCT FROM other")]
+    public void A_leading_keyword_takes_the_column_on_its_left(string cell, string column, string expected)
+        => Assert.Equal(expected, DecisionRuleParser.ParseCondition(cell, column));
+
+    // ⚠ The right-hand side goes through the VALUE parser, exactly as a leading operator's does — so an
+    // unquoted word is quoted rather than spliced as an identifier.
     [Fact]
-    public void Placeholder_at_the_start_of_a_keyword_condition_loses_the_column()
-    {
-        Assert.Equal("LIKE 'E%'", DecisionRuleParser.ParseCondition("? LIKE 'E%'", "region"));
-        Assert.Equal("IS NULL", DecisionRuleParser.ParseCondition("? IS NULL", "region"));
-        Assert.Equal("SIMILAR TO 'E.*'", DecisionRuleParser.ParseCondition("? SIMILAR TO 'E.*'", "region"));
-    }
+    public void A_leading_keywords_right_hand_side_is_a_value()
+        => Assert.Equal("region LIKE 'E5'", DecisionRuleParser.ParseCondition("LIKE E5", "region"));
+
+    // ⚠ `NOT` needs no entry of its own: the not-prefix rule runs first and WRAPS, which is equivalent for
+    // NULL and non-NULL alike. Pinned so nobody adds a redundant `NOT LIKE` alternative.
+    [Fact]
+    public void Not_wraps_a_leading_keyword_condition()
+        => Assert.Equal("NOT (region like 'E%')", DecisionRuleParser.ParseCondition("not like 'E%'", "region"));
+
+    // ⚠⚠ THE TRAILING WORD BOUNDARY IS LOAD-BEARING: without it a FUNCTION whose name starts with one of
+    // these keywords would be read as an operator and mangled.
+    [Theory]
+    [InlineData("REGEXP_MATCHES(?, 'x')", "region", "REGEXP_MATCHES(region, 'x')")]
+    [InlineData("LIKELY(?)", "region", "LIKELY(region)")]
+    public void A_function_name_starting_with_a_keyword_is_not_an_operator(string cell, string column, string expected)
+        => Assert.Equal(expected, DecisionRuleParser.ParseCondition(cell, column));
+
+    // ⚠⚠ THIS REPLACES A CHARACTERIZATION THAT SAID THE OPPOSITE, and falsifying it is the change
+    // announcing itself. `?` at the start DELEGATES the remainder, and the remainder is now a leading
+    // keyword — so the column arrives after all, through the rule above rather than through the
+    // delegation. No change was needed to the delegation itself, which is why the T-SQL bracket rewrite
+    // for `? in [1,2,3]` is unaffected.
+    [Theory]
+    [InlineData("? IS NULL", "region", "region IS NULL")]
+    [InlineData("? LIKE 'E%'", "region", "region LIKE 'E%'")]
+    [InlineData("? SIMILAR TO 'E.*'", "region", "region SIMILAR TO 'E.*'")]
+    public void A_placeholder_before_a_keyword_still_gets_the_column(string cell, string column, string expected)
+        => Assert.Equal(expected, DecisionRuleParser.ParseCondition(cell, column));
+
+    // ⚠ The prefix applies here too, or a keyword cell would read the raw macro argument while its
+    // neighbours read the preprocessed value.
+    [Fact]
+    public void A_leading_keyword_is_qualified_like_everything_else()
+        => Assert.Equal("preprocessed.region IS NULL",
+            DecisionRuleParser.ParseCondition("IS NULL", "preprocessed.region", DmnDialect.DuckDb, "preprocessed."));
 
     // ── the reference prefix ─────────────────────────────────────────────────────────────────────────
     // ⚠⚠ IT EXISTS FOR ONE MEASURED DuckDB RULE: a macro PARAMETER shadows a column of the same name

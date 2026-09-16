@@ -73,6 +73,42 @@ public static class DecisionRuleParser
     private static readonly Regex FeelRange = new(@"^([\[\(])\s*(.+?)\s*\.\.\s*(.+?)\s*([\]\)])$", RegexOptions.Singleline);
     private static readonly Regex BetweenAnd = new(@"^between\s+(.+)\s+and\s+(.+)$", RegexOptions.IgnoreCase | RegexOptions.Singleline);
     private static readonly Regex LeadingOperator = new(@"^(!=|<>|>=|<=|>|<|=)\s*(.+)$", RegexOptions.Singleline);
+    /// <summary>
+    /// An operator KEYWORD at the start of a cell, where the column is implicit on the LEFT.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>⚠⚠ THE IMPLICIT LEFT-HAND COLUMN IS THE WHOLE POINT OF A DECISION-TABLE CELL</b> — a cell is a
+    /// predicate FRAGMENT about its own column, so <c>&gt; 18</c> means <c>age &gt; 18</c> and
+    /// <c>IS NULL</c> must mean <c>age IS NULL</c>. This is the same family as
+    /// <see cref="LeadingOperator"/>, <see cref="BetweenAnd"/> and <see cref="InList"/>, which have
+    /// prepended the column all along; these keywords were simply missing from it, so a bare
+    /// <c>IS NULL</c> cell rendered the column-less fragment <c>IS NULL</c>.
+    /// </para>
+    /// <para>
+    /// ⚠ The right-hand side goes through <see cref="ParseValue"/>, exactly as
+    /// <see cref="LeadingOperator"/>'s does — so <c>LIKE E5</c> quotes to <c>region LIKE 'E5'</c> and
+    /// <c>IS DISTINCT FROM @other</c> resolves the ref. A pattern containing <c>%</c> or <c>*</c> must be
+    /// QUOTED by the author, because those are value operators and an unquoted <c>E%</c> reads as an
+    /// expression — the same rule every other value position here follows.
+    /// </para>
+    /// <para>
+    /// ⚠ <c>NOT</c> needs no entry: <see cref="NotPrefix"/> runs first and wraps, so <c>NOT LIKE 'x'</c>
+    /// becomes <c>NOT (region LIKE 'x')</c> — equivalent for NULL and non-NULL alike. <c>IS NOT NULL</c>
+    /// and <c>IS NOT DISTINCT FROM</c> DO need theirs, since they do not start with <c>NOT</c>.
+    /// </para>
+    /// <para>
+    /// ⚠ <c>IN</c> is deliberately absent — <see cref="InList"/> already prepends the column for the
+    /// bracketed forms and the comma check covers the bare list.
+    /// </para>
+    /// <para>
+    /// ⚠ The trailing <c>\b</c> is load-bearing: without it <c>REGEXP_MATCHES(?, 'x')</c> and
+    /// <c>LIKELY(?)</c> would be read as operators and mangled into <c>col REGEXP _MATCHES(…)</c>.
+    /// </para>
+    /// </remarks>
+    private static readonly Regex LeadingConditionKeyword = new(
+        @"^(LIKE|ILIKE|GLOB|REGEXP|SIMILAR\s+TO|IS\s+(?:NOT\s+)?NULL|IS\s+(?:NOT\s+)?DISTINCT\s+FROM)\b",
+        RegexOptions.IgnoreCase);
     private static readonly Regex FunctionCallAtStart = new(@"^[a-zA-Z_]\w*\s*\(");
     private static readonly Regex ColumnRef = new(@"@(\w+)");
     private static readonly Regex BareColumnRef = new(@"^@\w+$");
@@ -228,6 +264,17 @@ public static class DecisionRuleParser
         if (op.Success)
         {
             return $"{column} {op.Groups[1].Value} {ParseValue(op.Groups[2].Value.Trim(), dialect, refPrefix, depth + 1)}";
+        }
+
+        // ⚠⚠ THE COLUMN IS IMPLICIT ON THE LEFT, exactly as it is for `> 18` / `between` / `in (…)` just
+        // above. A cell is a predicate FRAGMENT about its own column, so `IS NULL` is `col IS NULL`.
+        var keyword = LeadingConditionKeyword.Match(expr);
+        if (keyword.Success)
+        {
+            var rest = expr.Substring(keyword.Length).Trim();
+            return rest.Length == 0
+                ? $"{column} {keyword.Groups[1].Value}"
+                : $"{column} {keyword.Groups[1].Value} {ParseValue(rest, dialect, refPrefix, depth + 1)}";
         }
 
         // A bare function call is a condition the author wrote in full — resolve @refs and pass through.

@@ -64,6 +64,15 @@ SELECT dmn_condition('> @age', 'preprocessed.amount', 'duckdb', 'preprocessed.')
 ----
 preprocessed.amount > preprocessed.age	preprocessed.amount / preprocessed.age
 
+# ⚠ THE TWO SPELLINGS OF A KEYWORD CONDITION MEAN THE SAME THING: the column may be left IMPLICIT (the
+# natural cell) or written out with an explicit `@ref`. Asserting them side by side is what keeps the
+# leading-keyword rule and the full-condition detector from drifting apart.
+query TT
+SELECT dmn_condition('IS NULL', 'region', 'duckdb', ''),
+       dmn_condition('@region IS NULL', 'region', 'duckdb', '');
+----
+region IS NULL	region IS NULL
+
 # A NULL cell is a WILDCARD for a condition and an ABSENCE for a value — the two are different questions
 # and get different answers. Pinned because "both NULL" and "both TRUE" are each a plausible reading.
 query TT
@@ -641,6 +650,11 @@ true	false
 # is ALWAYS FALSE. Every one of the five inputs would therefore have answered 'other', with nothing
 # failing anywhere. That is the failure mode this section exists to keep out.
 #
+# ⚠⚠ THE CELLS ARE WRITTEN IN THE NATURAL FORM, WITH THE COLUMN IMPLICIT ON THE LEFT — which is what a
+# decision-table cell IS. `> 18` means `age > 18`, so `IS NULL` means `region IS NULL`; the column is
+# supplied by the same rule that supplies it for a leading operator, BETWEEN or IN. Gating the explicit
+# `@region IS NULL` spelling instead would have left the form everybody actually writes untested.
+#
 # ⚠ `IS NULL` is the most natural cell a decision table has (does this field have a value at all?), and
 # `IS [NOT] DISTINCT FROM` is the null-safe comparison — MEASURED present on BOTH DuckDB and SQL Server
 # 2025, which makes it one of the few in that list that is genuinely portable.
@@ -652,10 +666,10 @@ statement ok
 INSERT INTO kw VALUES
     (-2, 'in',                        'in',                                  'out'),
     (-1, 'VARCHAR',                   'VARCHAR',                             'VARCHAR'),
-    ( 1, '@region IS NULL',           '',                                    'missing'),
-    ( 2, '@region SIMILAR TO ''E.*''','',                                    'europe'),
-    ( 3, '@region GLOB ''US*''',      '',                                    'america'),
-    ( 4, '',                          '@other IS NOT DISTINCT FROM @region', 'null-safe-equal'),
+    ( 1, 'IS NULL',                   '',                                    'missing'),
+    ( 2, 'SIMILAR TO ''E.*''',        '',                                    'europe'),
+    ( 3, 'GLOB ''US*''',              '',                                    'america'),
+    ( 4, '',                          'IS NOT DISTINCT FROM @region',        'null-safe-equal'),
     ( 5, '',                          '',                                    'other');
 
 statement ok

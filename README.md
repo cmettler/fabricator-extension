@@ -2922,8 +2922,8 @@ Each **cell** is a small expression language:
 | `in [1,2,3]` / `in (1,2,3)` | explicit list; brackets stay a DuckDB `LIST` |
 | `not RU` | negation |
 | `> @age` | compare against another input |
-| `@region LIKE 'E%'`, `SIMILAR TO`, `GLOB`, `ILIKE` | pattern matching, passed through to the engine |
-| `@region IS NULL`, `@a IS NOT DISTINCT FROM @b` | NULL tests and null-safe comparison |
+| `LIKE 'E%'`, `SIMILAR TO 'E.*'`, `GLOB 'US*'`, `ILIKE` | pattern matching |
+| `IS NULL`, `IS NOT NULL`, `IS NOT DISTINCT FROM @other` | NULL tests and null-safe comparison |
 | `contains(?, 'x')`, `@age*2 > min(1)+1` | a condition you write in full; `?` is the column |
 | blank, `*` | wildcard — matches anything |
 
@@ -2961,6 +2961,10 @@ SELECT dmn_relation('rules.csv', 'auto');                  -- read_csv('rules.cs
 > a rule may call any function the engine has — that is the feature, and it means the rules relation is a
 > **trusted authoring surface**, exactly like a template. Never build one from user input.
 >
+> ⚠ **The column is implicit on the left of a cell** — `> 18` means `age > 18`, and so do `IS NULL`,
+> `LIKE 'E%'`, `between 1 and 5` and `in (1,2)`. Writing it out explicitly (`@age IS NULL`) means the same
+> thing, which is useful when the condition compares two columns.
+>
 > ⚠ A cell is recognised as a *condition* — rather than a value to compare against — when it carries a
 > comparison operator or one of `BETWEEN`, `LIKE`, `ILIKE`, `GLOB`, `SIMILAR TO`, `REGEXP`, `IN`,
 > `IS [NOT] NULL`, `IS [NOT] DISTINCT FROM`. The list is a **union across dialects** and is a detector, not
@@ -2968,11 +2972,7 @@ SELECT dmn_relation('rules.csv', 'auto');                  -- read_csv('rules.cs
 > cost is that a bare data value containing one of those words is read as an operator and refused at
 > `CREATE` time — **quote the cell** (`'MADE IN USA'`) to force it back to a literal.
 >
-> ⚠ `?` at the *start* of a cell delegates the rest for value treatment (`? >= a` → `col >= 'a'`), so it
-> does **not** work in front of one of those keywords. Write `@col IS NULL`, or embed the placeholder
-> (`upper(?) IS NULL`).
->
-> ⚠ A decision column becomes a macro **parameter**, so its name must be a bare identifier. `decision_render`
+⚠ A decision column becomes a macro **parameter**, so its name must be a bare identifier. `decision_render`
 > refuses by name otherwise rather than emitting a `CREATE MACRO` that cannot parse.
 >
 > ⚠ Rules held in a **TEMP** table are invisible: the introspection runs on the render's own connection. Use a
