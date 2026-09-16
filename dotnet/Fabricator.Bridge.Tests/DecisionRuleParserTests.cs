@@ -248,6 +248,25 @@ public class DecisionRuleParserTests
         Assert.Equal("status = 'GLOBAL'", DecisionRuleParser.ParseCondition("GLOBAL", "status"));
     }
 
+    // ── the `?` placeholder is substituted OUTSIDE quotes only ───────────────────────────────────────
+    // ⚠⚠ A BLIND string.Replace CORRUPTS THE AUTHOR'S PATTERN, and GLOB is what made it likely: `?` is
+    // GLOB's single-character WILDCARD, so `GLOB 'US?'` used to render `region GLOB 'USregion'` — a
+    // silently DIFFERENT pattern, not a syntax error. The ported engine still does the blind replace.
+    [Theory]
+    [InlineData("GLOB 'US?'", "region", "region GLOB 'US?'")]
+    [InlineData("LIKE 'why?%'", "region", "region LIKE 'why?%'")]
+    [InlineData("contains(?, 'a?b')", "region", "contains(region, 'a?b')")]
+    public void A_placeholder_inside_a_literal_is_left_alone(string cell, string column, string expected)
+        => Assert.Equal(expected, DecisionRuleParser.ParseCondition(cell, column));
+
+    // ⚠ The CONTROL: substitution outside quotes is untouched by the fix. Without these rows the theory
+    // above would pass equally on a build that had stopped substituting at all.
+    [Theory]
+    [InlineData("5 >=?", "col", "5 >=col")]
+    [InlineData("coalesce(?, 'x') = 'y'", "col", "coalesce(col, 'x') = 'y'")]
+    public void A_placeholder_outside_a_literal_still_substitutes(string cell, string column, string expected)
+        => Assert.Equal(expected, DecisionRuleParser.ParseCondition(cell, column));
+
     // ── the column is IMPLICIT ON THE LEFT ───────────────────────────────────────────────────────────
     // ⚠⚠ THIS IS WHAT A DECISION-TABLE CELL IS: a predicate FRAGMENT about its own column. `> 18` means
     // `age > 18`, so `IS NULL` must mean `age IS NULL`. The same family as the leading-operator, BETWEEN

@@ -752,7 +752,13 @@ case "$TIER" in
         #   a cell IS: a predicate fragment about its own column, exactly like `> 18` / `between` / `in`.
         #   ⚠ The §2 equivalence row (both spellings, one meaning) is the cheap kill — the mutant dies
         #   there after 16 assertions, long before the end-to-end section.
-        : "${MIN_ASSERTIONS:=9659}"
+        # 2026-09-16: 9659 -> 9668. verify_decision_render 196 -> 205 — the parser VERIFICATION pass
+        #   (user: "this decision rule impl will be a fundamental peace in prod"). §16 pins that a blank
+        #   OUTPUT cell is SQL NULL, a deliberate divergence from the ported engine, which raises. The
+        #   pass also found and fixed a real defect: the `?` substitution was a blind string.Replace and
+        #   CORRUPTED a `?` inside a quoted literal — `GLOB 'US?'` rendered `region GLOB 'USregion'`, and
+        #   `?` is GLOB's single-character WILDCARD, so that was a silently DIFFERENT pattern.
+        : "${MIN_ASSERTIONS:=9668}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

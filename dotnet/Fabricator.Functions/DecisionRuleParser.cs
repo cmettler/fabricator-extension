@@ -190,6 +190,30 @@ public static class DecisionRuleParser
     /// every rule that leaves a column open.
     /// <para>⚠ ORDER IS LOAD-BEARING IN ONE PLACE: the FEEL range is matched BEFORE the comma check, or
     /// <c>[0 .. func(1,2,?)]</c> is split on the argument comma and parsed as a three-item IN list.</para>
+    /// <para>
+    /// <b>THE DISPATCH, IN ORDER.</b> Each branch below carries CONTEXT / PARSES / SAMPLE / TEST; this is
+    /// the index. Every sample is on column <c>age</c> or <c>region</c>.
+    /// <code>
+    ///  #  branch              a cell that reaches it        renders
+    ///  1  wildcard            (blank), *                    TRUE
+    ///  2  placeholder         ? >=a  /  5 >=?               age >= 'a'  /  5 >=age
+    ///  3  not                 not RU                        NOT (region = 'RU')
+    ///  4  IN list             in (1,2)  /  in [1,2]         age IN (1, 2)  /  age IN [1, 2]
+    ///  5  FEEL range          [21 .. 65]                    age >= 21 AND age &lt;= 65
+    ///  6  comma list          EU, US                        region IN ('EU', 'US')
+    ///  7  BETWEEN             between 21 and 65             age BETWEEN 21 AND 65
+    ///  8  leading operator    &gt; 18                           age &gt; 18
+    ///  9  leading keyword     IS NULL  /  LIKE 'E%'         age IS NULL  /  age LIKE 'E%'
+    /// 10  function call       contains(?, 'x')              contains(region, 'x')
+    /// 11  full condition      @age*2 &gt; min(1)+1             age*2 &gt; min(1)+1
+    /// 12  fallback (value)    EU                            region = 'EU'
+    /// </code>
+    /// </para>
+    /// <para>
+    /// ⚠ <b>THE COLUMN IS IMPLICIT ON THE LEFT</b> for branches 4, 5, 6, 7, 8, 9 and 12 — that is what a
+    /// decision-table cell IS. Branches 10 and 11 are the ones where the author wrote the left-hand side
+    /// out, so nothing is prepended.
+    /// </para>
     /// </remarks>
     public static string ParseCondition(string? cell, string column, DmnDialect dialect = DmnDialect.DuckDb,
                                         string? refPrefix = null)
@@ -203,12 +227,31 @@ public static class DecisionRuleParser
                 $"decision rule: expression nests deeper than {MaxDepth} levels for column '{column}' — "
                 + "this is almost certainly a malformed cell rather than a real rule.");
         }
+        // ─── 1. WILDCARD ──────────────────────────────────────────────────────────────────────────
+        // CONTEXT : any input cell. A decision table leaves a column open far more often than not.
+        // PARSES  : null, empty, whitespace, `*`
+        // SAMPLE  : ``            on `age`  ⇒  TRUE
+        // TEST    : Wildcard_matches_anything
+        // ⚠ It MUST be TRUE. Anything else silently NARROWS every rule that leaves a column open, and
+        //   the renderer additionally OMITS a wildcard WHEN branch entirely (verify_decision_render §13).
         var expr = cell?.Trim();
         if (string.IsNullOrEmpty(expr) || expr == "*")
         {
             return "TRUE";
         }
 
+        // ─── 2. PLACEHOLDER ───────────────────────────────────────────────────────────────────────
+        // CONTEXT : any input cell that names its own column explicitly.
+        // PARSES  : `?` AT THE START  — delegates the REST, so it gets ordinary VALUE treatment
+        //           `?` ANYWHERE ELSE — substitutes the column name and parsing continues (RAW: the
+        //                                author is writing SQL from here on)
+        // SAMPLE  : `? >=a`             on `col`  ⇒  col >= 'a'
+        //           `5 >=?`             on `col`  ⇒  5 >=col     (no space — a literal replace)
+        //           `contains(?, 'x')`  on `col`  ⇒  contains(col, 'x')
+        // TEST    : Placeholder_delegates_at_start_and_substitutes_elsewhere
+        //           A_placeholder_inside_a_literal_is_left_alone
+        // ⚠ Delegation is what lets `? IS NULL` work: the remainder is a LEADING KEYWORD (branch 9),
+        //   which supplies the column itself. See A_placeholder_before_a_keyword_still_gets_the_column.
         if (expr.Contains('?'))
         {
             // `?` AT THE START delegates the REST to the parser, so the remainder gets ordinary value
@@ -220,15 +263,32 @@ public static class DecisionRuleParser
             {
                 return ParseCondition(lead.Groups[1].Value, column, dialect, refPrefix, depth + 1);
             }
-            expr = expr.Replace("?", column);
+            expr = SubstitutePlaceholder(expr, column);
         }
 
+        // ─── 3. NOT ───────────────────────────────────────────────────────────────────────────────
+        // CONTEXT : any input cell; the operand is re-parsed as a whole cell (RECURSION POINT).
+        // PARSES  : `not <cell>`
+        // SAMPLE  : `not RU`        on `region`  ⇒  NOT (region = 'RU')
+        //           `not like 'E%'` on `region`  ⇒  NOT (region like 'E%')
+        // TEST    : Documented_condition_forms, Not_wraps_a_leading_keyword_condition
+        // ⚠ It needs WHITESPACE after `not`, so `NOTEBOOK` is still a value. But `not applicable` IS
+        //   read as a negation — quote the cell (`'not applicable'`) to force a literal.
         var not = NotPrefix.Match(expr);
         if (not.Success)
         {
             return $"NOT ({ParseCondition(not.Groups[1].Value, column, dialect, refPrefix, depth + 1)})";
         }
 
+        // ─── 4. EXPLICIT IN LIST ──────────────────────────────────────────────────────────────────
+        // CONTEXT : any input cell. The column is implicit on the left.
+        // PARSES  : `in (a,b)` and `in [a,b]`
+        // SAMPLE  : `in (1,2,3,4)` on `age`  ⇒  age IN (1, 2, 3, 4)
+        //           `in [1,2,3,4]` on `age`  ⇒  age IN [1, 2, 3, 4]   (DuckDB LIST)
+        //                                    ⇒  age IN (1, 2, 3, 4)   (T-SQL — no list literal)
+        // TEST    : Documented_condition_forms, Bracketed_in_list_stays_a_list_on_duckdb,
+        //           Bracketed_in_list_becomes_parentheses_on_tsql
+        // ⚠⚠ THE BRACKET REWRITE IS THE ONLY CONSTRUCT THE DIALECT CHANGES — see DmnDialect.
         var inList = InList.Match(expr);
         if (inList.Success)
         {
@@ -236,7 +296,16 @@ public static class DecisionRuleParser
             return $"{column} IN {open}{string.Join(", ", ParseListItems(inList.Groups[2].Value, dialect, refPrefix))}{close}";
         }
 
-        // ⚠ BEFORE the comma check — see the remark on ParseCondition.
+        // ─── 5. DMN FEEL RANGE ────────────────────────────────────────────────────────────────────
+        // CONTEXT : any input cell. Each BOUND is re-parsed as its own comparison (RECURSION POINT).
+        // PARSES  : `[a .. b]` `(a .. b]` `[a .. b)` `(a .. b)` — bracket picks >=/> and <=/<
+        // SAMPLE  : `[21 .. 65]`  on `age`     ⇒  age >= 21 AND age <= 65
+        //           `(0 .. 100]`  on `age`     ⇒  age > 0 AND age <= 100
+        //           `[0 .. @age]` on `amount`  ⇒  amount >= 0 AND amount <= age
+        // TEST    : Documented_condition_forms, Feel_range_wins_over_comma_splitting
+        // ⚠⚠ BEFORE the comma check, and that ORDER IS LOAD-BEARING: `[0 .. func(1,2,?)]` would
+        //   otherwise split on the ARGUMENT comma into a three-item IN list — which is still VALID SQL,
+        //   so nothing downstream would notice.
         var range = FeelRange.Match(expr);
         if (range.Success)
         {
@@ -247,11 +316,23 @@ public static class DecisionRuleParser
             return $"{low} AND {high}";
         }
 
+        // ─── 6. BARE COMMA LIST ───────────────────────────────────────────────────────────────────
+        // CONTEXT : any input cell. The commonest membership spelling in a real decision table.
+        // PARSES  : `a, b, c` — TOP-LEVEL commas only (quotes and parentheses are skipped)
+        // SAMPLE  : `EU, US`    on `region`  ⇒  region IN ('EU', 'US')
+        //           `'a,b,c'`   on `region`  ⇒  region = 'a,b,c'   (quoted: ONE value)
+        // TEST    : Documented_condition_forms, Function_argument_comma_is_not_a_list
         if (HasTopLevelComma(expr))
         {
             return $"{column} IN ({string.Join(", ", ParseListItems(expr, dialect, refPrefix))})";
         }
 
+        // ─── 7. BETWEEN ───────────────────────────────────────────────────────────────────────────
+        // CONTEXT : any input cell. Both bounds are VALUES, so they may be expressions.
+        // PARSES  : `between <lo> and <hi>`
+        // SAMPLE  : `between 21 and 65`            on `age`  ⇒  age BETWEEN 21 AND 65
+        //           `between min(1) and max(100)`  on `age`  ⇒  age BETWEEN min(1) AND max(100)
+        // TEST    : Documented_condition_forms
         var between = BetweenAnd.Match(expr);
         if (between.Success)
         {
@@ -260,14 +341,33 @@ public static class DecisionRuleParser
             return $"{column} BETWEEN {lo} AND {hi}";
         }
 
+        // ─── 8. LEADING COMPARISON OPERATOR ───────────────────────────────────────────────────────
+        // CONTEXT : any input cell. The right-hand side is a VALUE, so a bare word gets QUOTED.
+        // PARSES  : `!= <v>` `<> <v>` `>= <v>` `<= <v>` `> <v>` `< <v>` `= <v>`
+        // SAMPLE  : `> 18`    on `age`     ⇒  age > 18
+        //           `> @age`  on `amount`  ⇒  amount > age
+        //           `<> 'x'`  on `region`  ⇒  region <> 'x'
+        // TEST    : Documented_condition_forms, Every_leading_operator
+        // ⚠ The operator is passed through VERBATIM rather than normalised — `!=` stays `!=`.
         var op = LeadingOperator.Match(expr);
         if (op.Success)
         {
             return $"{column} {op.Groups[1].Value} {ParseValue(op.Groups[2].Value.Trim(), dialect, refPrefix, depth + 1)}";
         }
 
-        // ⚠⚠ THE COLUMN IS IMPLICIT ON THE LEFT, exactly as it is for `> 18` / `between` / `in (…)` just
-        // above. A cell is a predicate FRAGMENT about its own column, so `IS NULL` is `col IS NULL`.
+        // ─── 9. LEADING OPERATOR KEYWORD ──────────────────────────────────────────────────────────
+        // CONTEXT : any input cell. Same family as 4/7/8 — THE COLUMN IS IMPLICIT ON THE LEFT, which is
+        //           what a decision-table cell IS: a predicate fragment about its own column.
+        // PARSES  : LIKE ILIKE GLOB REGEXP | SIMILAR TO | IS [NOT] NULL | IS [NOT] DISTINCT FROM
+        // SAMPLE  : `IS NULL`           on `region`  ⇒  region IS NULL
+        //           `LIKE 'E%'`         on `region`  ⇒  region LIKE 'E%'
+        //           `SIMILAR TO 'E.*'`  on `region`  ⇒  region SIMILAR TO 'E.*'
+        //           `LIKE E5`           on `region`  ⇒  region LIKE 'E5'   (the RHS is a VALUE)
+        // TEST    : A_leading_keyword_takes_the_column_on_its_left,
+        //           A_leading_keywords_right_hand_side_is_a_value,
+        //           A_function_name_starting_with_a_keyword_is_not_an_operator
+        // ⚠ A pattern containing `%` or `*` must be QUOTED by the author — those are value operators,
+        //   so an unquoted `E%` reads as an expression and passes through raw.
         var keyword = LeadingConditionKeyword.Match(expr);
         if (keyword.Success)
         {
@@ -277,18 +377,40 @@ public static class DecisionRuleParser
                 : $"{column} {keyword.Groups[1].Value} {ParseValue(rest, dialect, refPrefix, depth + 1)}";
         }
 
-        // A bare function call is a condition the author wrote in full — resolve @refs and pass through.
+        // ─── 10. FUNCTION CALL AT THE START ───────────────────────────────────────────────────────
+        // CONTEXT : an input cell where the author wrote the WHOLE condition, so NOTHING is prepended.
+        // PARSES  : `name(` at position 0
+        // SAMPLE  : `contains(?, 'foo')`      on `col`  ⇒  contains(col, 'foo')
+        //           `CHARINDEX('x', ?) > 0`   on `col`  ⇒  CHARINDEX('x', col) > 0   (T-SQL vocabulary)
+        // TEST    : Documented_condition_forms, Cell_function_vocabulary_is_never_translated
+        // ⚠ The cell's FUNCTION VOCABULARY is never translated between dialects — that is the feature.
         if (FunctionCallAtStart.IsMatch(expr))
         {
             return ResolveRefs(expr, refPrefix);
         }
 
-        // A COMPLETE condition (`@age*2 > min(1)+1`) — pass through with @refs resolved.
+        // ─── 11. COMPLETE CONDITION ───────────────────────────────────────────────────────────────
+        // CONTEXT : an input cell whose LEFT-HAND SIDE is written out, so nothing is prepended. This is
+        //           the counterpart of branch 9: `IS NULL` vs `@region IS NULL` mean the same thing.
+        // PARSES  : anything carrying a comparison operator or one of ConditionKeywords
+        // SAMPLE  : `@age*2 > min(1)+1`  on `age`     ⇒  age*2 > min(1)+1
+        //           `@region IS NULL`    on `region`  ⇒  region IS NULL
+        // TEST    : Documented_condition_forms, A_keyword_makes_a_cell_a_full_condition,
+        //           Pattern_and_null_operators_are_full_conditions
+        //           (and verify_decision_render §2's equivalence row, which asserts 9 and 11 agree)
+        // ⚠ A data value containing one of those keywords lands here and passes through as RAW SQL,
+        //   which the target refuses at CREATE time — the SAFE direction. Quote the cell to escape.
         if (IsFullCondition(expr))
         {
             return ResolveRefs(expr, refPrefix);
         }
 
+        // ─── 12. FALLBACK: EQUALITY AGAINST A VALUE ───────────────────────────────────────────────
+        // CONTEXT : any input cell that reached the end — the commonest cell of all.
+        // PARSES  : whatever is left, as a VALUE (see ParseValue for how it is typed or quoted)
+        // SAMPLE  : `EU`   on `region`  ⇒  region = 'EU'
+        //           `42`   on `age`     ⇒  age = 42
+        // TEST    : Documented_condition_forms
         return $"{column} = {ParseValue(expr, dialect, refPrefix, depth + 1)}";
     }
 
@@ -301,6 +423,35 @@ public static class DecisionRuleParser
     /// passes through; <c>TRUE</c>/<c>FALSE</c>/<c>NULL</c> pass through; anything detected as an
     /// EXPRESSION passes through with <c>@refs</c> resolved; a parenthesised cell is parsed INSIDE and
     /// re-wrapped; and only what survives all of that is quoted as a string literal.
+    /// <para>
+    /// <b>WHERE IT IS CALLED FROM — four value POSITIONS, not just the output cell.</b> Getting this wrong
+    /// is how a rule ends up comparing against the TEXT of an expression.
+    /// <code>
+    /// an OUTPUT cell                 decision / risk / label   ⇒  ParseValue(cell)
+    /// the RHS of a leading operator  `> 18`                    ⇒  ParseValue("18")
+    /// a BETWEEN bound                `between min(1) and 5`    ⇒  ParseValue("min(1)"), ParseValue("5")
+    /// an IN / comma list item        `EU, US`                  ⇒  ParseValue("EU"), ParseValue("US")
+    /// the RHS of a leading keyword   `LIKE E5`                 ⇒  ParseValue("E5")
+    /// </code>
+    /// </para>
+    /// <para>
+    /// <b>THE DISPATCH, IN ORDER.</b> Each branch below carries CONTEXT / PARSES / SAMPLE / TEST.
+    /// <code>
+    ///  #  branch            a cell that reaches it     renders
+    ///  1  bare @ref         @age                       age
+    ///  2  quoted string     'approve'                  'approve'
+    ///  3  number            42, -3, 0.5                42, -3, 0.5
+    ///  4  keyword literal   true, null                 TRUE, NULL
+    ///  5  expression        @amount * 0.01             amount * 0.01
+    ///  6  parenthesised     (func(@x))                 (func(x))
+    ///  7  fallback (quote)  approve                    'approve'
+    /// </code>
+    /// </para>
+    /// <para>
+    /// ⚠ <c>?</c> IS NOT SUBSTITUTED HERE. In an output cell it has no meaning; in an output
+    /// PREPROCESSING expression it means the OUTPUT COLUMN and is substituted by the renderer, not by the
+    /// parser (<c>decision_render.sql</c>, <c>post_select_sql</c>).
+    /// </para>
     /// </remarks>
     public static string ParseValue(string? cell, DmnDialect dialect = DmnDialect.DuckDb,
                                     string? refPrefix = null)
@@ -316,34 +467,83 @@ public static class DecisionRuleParser
         }
         var val = (cell ?? string.Empty).Trim();
 
+        // ─── 1. BARE COLUMN REFERENCE ─────────────────────────────────────────────────────────────
+        // CONTEXT : any value position. The ONLY place refPrefix is applied outside ResolveRefs.
+        // PARSES  : `@name` and nothing else
+        // SAMPLE  : `@col`  ⇒  col        (or `preprocessed.col` when a prefix is in force)
+        // TEST    : Documented_value_forms, Ref_prefix_reaches_value_expressions_too
         if (BareColumnRef.IsMatch(val))
         {
             return refPrefix + val.Substring(1);
         }
+        // ─── 2. ALREADY-QUOTED STRING ─────────────────────────────────────────────────────────────
+        // CONTEXT : any value position. This is ALSO the author's ESCAPE HATCH: quoting a cell forces it
+        //           to be a literal, past every keyword and comma rule above.
+        // PARSES  : text that starts and ends with a single quote
+        // SAMPLE  : `'approve'`  ⇒  'approve'
+        //           `'a,b,c'`    ⇒  'a,b,c'        (the comma is data, not a list separator)
+        // TEST    : Documented_value_forms, Documented_condition_forms,
+        //           A_data_value_containing_a_keyword_passes_through_and_quoting_is_the_escape
         if (val.Length >= 2 && val.StartsWith("'", StringComparison.Ordinal) && val.EndsWith("'", StringComparison.Ordinal))
         {
             return val;
         }
+        // ─── 3. NUMBER ────────────────────────────────────────────────────────────────────────────
+        // CONTEXT : any value position.
+        // PARSES  : optional sign, digits, optional decimal point — NO EXPONENT
+        // SAMPLE  : `42` ⇒ 42     `-3` ⇒ -3     `0.5` ⇒ 0.5
+        // TEST    : Documented_value_forms, Scientific_notation_is_not_a_number
+        // ⚠ `1e5` is therefore NOT a number and falls to branch 7 — `= 1e5` compares against the TEXT.
+        //   FAITHFUL to the ported engine (identical regex). Write `100000` or `1e5::DOUBLE`.
         if (NumericLiteral.IsMatch(val))
         {
             return val;
         }
+        // ─── 4. KEYWORD LITERAL ───────────────────────────────────────────────────────────────────
+        // CONTEXT : any value position. Upper-cased, so a lower-case rules table renders canonical SQL.
+        // PARSES  : TRUE / FALSE / NULL, any casing
+        // SAMPLE  : `true` ⇒ TRUE     `null` ⇒ NULL
+        // TEST    : Documented_value_forms, Keyword_literals_are_upper_cased
+        // ⚠ A `NULL` OUTPUT cell is rendered by the RENDERER, not here: a blank output cell becomes SQL
+        //   NULL in decision_render's introspection, which is a question about the DATA, not the grammar.
         if (val.Equals("TRUE", StringComparison.OrdinalIgnoreCase)
             || val.Equals("FALSE", StringComparison.OrdinalIgnoreCase)
             || val.Equals("NULL", StringComparison.OrdinalIgnoreCase))
         {
             return val.ToUpperInvariant();
         }
+        // ─── 5. SQL EXPRESSION ────────────────────────────────────────────────────────────────────
+        // CONTEXT : any value position. THIS IS THE BRANCH THAT MAKES A DECISION TABLE *CODE*: whatever
+        //           the target engine can compute may appear in a cell, and it is passed through.
+        // PARSES  : a function call, a binary operator (+ - is NOT one; see below), or a `::` cast
+        // SAMPLE  : `@amount * 0.01`   ⇒  amount * 0.01
+        //           `@age::varchar`    ⇒  age::varchar
+        //           `'20010101'::date` ⇒  '20010101'::date
+        // TEST    : Documented_value_forms
+        // ⚠ @refs and quoted strings are STRIPPED before the test, so `'a+b'` is a string and `@a+@b` is
+        //   an expression. ⚠ The operator set is `+ * / % || ::` — a LEADING `-` is a number (branch 3).
         if (IsValueExpression(val))
         {
             return ResolveRefs(val, refPrefix);
         }
+        // ─── 6. PARENTHESISED ─────────────────────────────────────────────────────────────────────
+        // CONTEXT : any value position. The inside is re-parsed as a whole value (RECURSION POINT).
+        // PARSES  : `( … )`
+        // SAMPLE  : `(func(@x))`  ⇒  (func(x))
+        // TEST    : Documented_value_forms, Pathological_nesting_fails_with_a_message
         if (val.Length >= 2 && val.StartsWith("(", StringComparison.Ordinal) && val.EndsWith(")", StringComparison.Ordinal))
         {
             return $"({ParseValue(val.Substring(1, val.Length - 2), dialect, refPrefix, depth + 1)})";
         }
-        // ⚠ The ONLY place a cell becomes a LITERAL. Doubling the quote is the complete escape for a SQL
-        // string in every dialect here — there is no backslash escaping to also handle.
+        // ─── 7. FALLBACK: QUOTE AS A STRING LITERAL ───────────────────────────────────────────────
+        // CONTEXT : any value position. THE ONLY PLACE A CELL BECOMES A LITERAL — everything above is
+        //           passed through, which is why a decision table is CODE rather than data.
+        // PARSES  : whatever is left
+        // SAMPLE  : `approve`   ⇒  'approve'
+        //           `O'Brien`   ⇒  'O''Brien'
+        // TEST    : Documented_value_forms, Bare_string_is_quoted_and_escaped
+        // ⚠ Doubling the quote is the COMPLETE escape for a SQL string in both dialects here — there is
+        //   no backslash escaping to also handle.
         return "'" + val.Replace("'", "''") + "'";
     }
 
@@ -420,6 +620,51 @@ public static class DecisionRuleParser
     /// <c>'a,b,c'</c> stay one string and <c>func(1,2)</c> stay one call. Hand-written rather than a regex
     /// because nesting is not a regular language.
     /// </remarks>
+    /// <summary>
+    /// Replaces every <c>?</c> placeholder OUTSIDE a quoted string literal with <paramref name="column"/>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>⚠⚠ THE QUOTE AWARENESS IS A FIX, NOT A FLOURISH, AND `GLOB` IS WHAT MADE IT MATTER.</b> A blind
+    /// <c>string.Replace</c> — which is what the ported engine does and what this did until 2026-09-16 —
+    /// rewrites a <c>?</c> that belongs to the AUTHOR'S PATTERN. MEASURED before the fix:
+    /// <c>GLOB 'US?'</c> became <c>region GLOB 'USregion'</c>, and <c>?</c> is GLOB's single-character
+    /// WILDCARD, so that is a silently different pattern rather than a syntax error. <c>LIKE 'why?%'</c>
+    /// and <c>contains(?, 'a?b')</c> were corrupted the same way.
+    /// </para>
+    /// <para>
+    /// ⚠ <c>''</c> inside a literal is SQL's escape for one quote and is handled by the flip-flop: the pair
+    /// toggles out and straight back in, so the scanner stays inside the literal — which is the same rule
+    /// <see cref="HasTopLevelComma"/> relies on.
+    /// </para>
+    /// <para>
+    /// Sample: <c>contains(?, 'a?b')</c> over column <c>region</c> ⇒ <c>contains(region, 'a?b')</c>.
+    /// Pinned by <c>DecisionRuleParserTests.A_placeholder_inside_a_literal_is_left_alone</c>.
+    /// </para>
+    /// </remarks>
+    private static string SubstitutePlaceholder(string expr, string column)
+    {
+        var sb = new StringBuilder(expr.Length + column.Length);
+        bool inQuote = false;
+        foreach (var ch in expr)
+        {
+            if (ch == '\'')
+            {
+                inQuote = !inQuote;
+                sb.Append(ch);
+            }
+            else if (ch == '?' && !inQuote)
+            {
+                sb.Append(column);
+            }
+            else
+            {
+                sb.Append(ch);
+            }
+        }
+        return sb.ToString();
+    }
+
     private static bool HasTopLevelComma(string s)
     {
         bool inQuote = false;

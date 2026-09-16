@@ -708,3 +708,34 @@ SELECT regexp_matches(decision_render('kw'), 'WHEN 1 THEN preprocessed\.region I
        regexp_matches(decision_render('kw'), 'region = ''@region')::VARCHAR;
 ----
 true	false
+
+# ==============================================================================================
+# §16  A BLANK OUTPUT CELL IS SQL `NULL`.
+# ==============================================================================================
+# ⚠⚠ A DELIBERATE DIVERGENCE FROM THE PORTED ENGINE, which RAISES on a NULL output cell (its
+# normaliser calls re.sub on None). The decision is made in the INTROSPECTION rather than in the value
+# parser, because "what does an empty cell mean" is a question about the DATA — and for an output the
+# honest answer is absence. ⚠ An empty STRING and a NULL are treated alike, which is the same rule an
+# INPUT cell follows for the wildcard.
+
+statement ok
+CREATE TABLE blankout (rulepos INT, region VARCHAR, a VARCHAR, b VARCHAR);
+
+statement ok
+INSERT INTO blankout VALUES (-2,'in','out','out'), (-1,'VARCHAR','VARCHAR','VARCHAR'),
+    (1,'EU','','set'), (2,'',NULL,'other');
+
+statement ok
+SELECT fabricator_host_exec(decision_render('blankout', name := 'ev_blank'));
+
+# ⚠ `b` is the CONTROL — without it "a is NULL" would be equally true of a build where every output had
+# stopped being computed.
+query ITT
+SELECT rulepos, coalesce(a, '<null>'), coalesce(b, '<null>') FROM ev_blank('EU');
+----
+1	<null>	set
+
+query ITT
+SELECT rulepos, coalesce(a, '<null>'), coalesce(b, '<null>') FROM ev_blank('JP');
+----
+2	<null>	other
