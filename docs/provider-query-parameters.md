@@ -478,3 +478,202 @@ existing `Run`. That held exactly. Three things it did not say:
   classifies and the one the provider executes are different statements.
 * **The catalog is an EXPRESSION**, so `'mssql'` and `params.cat` both work — and a BARE word, the spelling
   someone will try first, evaluates to nil and is refused by name.
+
+## Appendix — records moved verbatim from CLAUDE.md (2026-09-18)
+
+CLAUDE.md carried these as-built records inline until it grew to 10,776 lines — a file loaded into every
+session's context. They are moved here VERBATIM; CLAUDE.md keeps each entry's summary head plus a pointer to
+this section. The one edit made on the way: a link that pointed into the docs directory is rewritten relative
+to this directory, so it still resolves from here.
+
+- **⚠⚠ `fabricator_query` / `fabricator_exec` TAKE A PARAMETER BAG — ABI **v88**, BUILT 2026-09-06 (user-asked:
+  "i think fabricator_query/fabricator_execute ABI version with parameter binding would be beneficial?").
+  C++ + C#. Gate `verify_raw_query` 34 → **85** (service tier), two mutants each killed at its own row. Full
+  records: [docs/provider-query-parameters.md](provider-query-parameters.md) §5 (as built) +
+  [docs/abi-history.md](abi-history.md) §v88.**
+  `fabricator_query(cat, sql, params := {'r': 'eu'})` and `fabricator_exec(cat, sql, {'new': 'uk'})` — values
+  reach the provider as bound parameters, never as text. It closes the gap §1.1 of the design note names: DAX's
+  `daxeval` grew its OWN bag *because* `fabricator_query` had none, so the provider with the weakest schema
+  story had parameter binding and the one with real `SqlParameter` support did not.
+  - **⚠⚠ THE WIRE AND THE CONTRACT ARE DIFFERENT SHAPES, and the design note conflated them — that is the
+    decision the whole slice turns on.** The wire is the `daxeval` shape (ONE row, ONE column named `params`,
+    holding the `params :=` argument exactly as written, since it is declared `ANY`); the CONTRACT is
+    `host_query`'s (one row, one column PER PARAMETER, named); `ProviderParameters` normalises between them,
+    host-side. ⇒ the STRUCT-vs-JSON branch exists in ONE language, C++ exports one DuckDB `Value` and knows
+    nothing about bags, and no provider sees the question. The note's version would have put a JSON→Arrow
+    type ladder in C++.
+  - **⚠ IT IS AN `ArrowArrayStream *`, NOT the `ArrowArray *` the note wrote — and that DISSOLVED the note's
+    own lifetime warning.** A stream is the house form for a 1-row args batch (`scalarfn_bind`,
+    `tablefn_bind`), built from a STACK `ArrowProducer` the callee consumes before the call returns. The
+    substance still holds and is honoured: `QueryBind` holds the `Value` and re-exports PER INVOCATION,
+    because `PopulateReturnSchema` runs the factory at BIND and the scan runs it again — one exported stream
+    serving both is the recorded `BuildFilterValues` use-after-free, invisible on Windows and Linux.
+  - **⚠⚠ THE DEFAULT DIM REFUSES; CHAINING WOULD HAVE SHIPPED A SILENT DEFECT.** The note's
+    `ExecuteQuery(sql, parameters) => ExecuteQuery(sql)` runs the statement with the parameters DISCARDED —
+    parameterised as far as the caller knows, unparameterised as far as the server is concerned, nothing
+    failing. So the default throws by name (*"DeltaCatalog does not support query parameters …"*), which also
+    makes the note's separate slice A3 (a per-provider Delta/deltars refusal) **unnecessary — it is
+    structural now**. ⚠ `DescribeQuery` is the deliberate exception and answers `null`: null already means
+    "I cannot describe this", the caller then EXECUTES, and the execution is where the refusal lives.
+  - **⚠⚠ THE NOTE'S §2.2 HAZARD IS NARROWER THAN STATED, AND ITS OBSERVABLE EXISTS — I concluded it did not,
+    and was wrong.** A describe that LACKS the parameters does not produce a schema MISMATCH: it fails to
+    compile, returns null, and the caller falls back to EXECUTING to learn the schema — same schema, same
+    rows, so no assertion about the RESULT can see it. What CAN is a **side effect at BIND**:
+    `EXPLAIN SELECT * FROM fabricator_query(…,'INSERT … VALUES (@v); SELECT 1', params := {'v':3})` leaves
+    **0** rows when the describe succeeded and **1** when it fell back. Mutant A (null bag to the describe
+    only) passes §9 and §10 in full and dies at exactly that row after 46 assertions. ⚠ `EXPLAIN` must be
+    STANDALONE — it cannot be a subquery source — the recorded trap, walked into while hunting this very
+    observable, which made a first attempt VOID.
+  - **⚠ `fabricator_exec` TAKES THE BAG POSITIONALLY, and the note is wrong about it twice.** It said to
+    change "both its registrations (it ships as a table function AND a scalar under one name)" — that is
+    `fabricator_host_exec`; `fabricator_exec` has only ever had ONE, a SCALAR. And **a DuckDB scalar carries
+    no named parameters at all**, so `params :=` is inexpressible there: it is a `ScalarFunctionSet` with
+    `{VARCHAR,VARCHAR}` and `{VARCHAR,VARCHAR,ANY}` sharing one body.
+  - **⚠ THE TWO BAG SPELLINGS ARE NOT EQUALLY FAITHFUL, and it is JSON's property rather than a shortcut.**
+    A STRUCT's children ARE the parameters — no conversion, so precision/scale/unit/zone survive — while JSON
+    has four scalar kinds. MEASURED and pinned: `{'a': 41}` binds INTEGER, `'{"a": 41}'` binds BIGINT.
+    ⚠ The JSON ladder is int64 BEFORE double (2^53+1 survives exactly); writing it as
+    `TryGetInt64(out l) ? l : GetDouble()` unifies to double and loses every large integer — the defect this
+    repo shipped once in `JsonToClr`.
+  - **⚠ A `DateTime` IS PINNED TO `datetime2`, and the two surfaces now share ONE helper**
+    (`SqlServerCatalog.MakeParameter`, which `FilterWhereBuilder` also calls). SqlClient infers the legacy
+    `datetime` (~3.33 ms) and ROUNDS before the server sees the value: in the pushdown that cost a predicate
+    its never-erases property, HERE it is simply a WRONG VALUE. Mutant C (drop the pin) passes 49 and dies at
+    the temporal row.
+  - **⚠⚠ A MUTATION-RUN TRAP THAT VOIDED ONE LEG: `Move-Item` PRESERVES the file's mtime**, so restoring a
+    mutated source can leave it looking OLDER than the DLL built from the mutant and MSBuild skips the
+    rebuild. Mutant C's first run silently re-measured mutant A — **and the tell was that it produced mutant
+    A's numbers EXACTLY** (same line, same 46 passed). Touch the file after restoring.
+  - ⚠ The gate's Delta control needs **`require parquet`**: under the default `native_write` engine DuckDB's
+    own COPY writes the parquet, and `unittest` does not auto-load extensions, so it failed as a missing
+    FEATURE rather than a missing REQUIRE.
+  - **✅ A2 (DAX) BUILT THE SAME DAY, C#-only, no ABI change — and its SECOND half is a bug fix with nothing
+    to do with parameters. Full record: [docs/provider-query-parameters.md](provider-query-parameters.md)
+    §6.** (a) `DaxCatalog.ExecuteQuery` used to THROW *"raw query not supported yet (slice 1)"* — a message
+    about a slice long since finished — so `fabricator_query` against a DAX catalog did not work at all; it
+    now delegates to the `StreamCommand` `daxeval` already uses. (b) `daxeval`'s bag decoder is the HOST's.
+    - **⚠⚠ (b) FIXED A SILENT PRECISION LOSS IN THE SHIPPED DAX PROVIDER, and it is the FOURTH appearance of
+      this exact pattern here.** `JsonScalar` read `e.TryGetInt64(out var l) ? l : e.GetDouble()`, whose
+      branches C# unifies to **double**, so the int64 branch never had any effect. MEASURED on the pattern in
+      isolation: `9007199254740993` comes back as a `Double` valued `…992`. (`JsonToClr` shipped the same
+      thing; `ArrowValueReader.ReadTimestamp` shipped its sibling.)
+    - **⚠ THE UNIFICATION IS ALSO HOW THAT BAG ACQUIRED A GATE IT COULD NOT OTHERWISE HAVE** — `verify_dax`
+      needs Power BI Desktop and is manual, while the shared ladder is pinned by `verify_raw_query` §9 on the
+      service tier. ⇒ **when a manual-tier surface and a gated one implement one rule, unifying them is a
+      coverage change, not just tidiness.**
+    - ⚠ THREE behaviour changes, all safe-direction: a nested JSON value is REFUSED rather than passed as its
+      raw JSON text (a value the caller never wrote, arriving as a plausible-looking string — its own comment
+      called it *"unusual"*); a duplicate name is refused rather than collapsed; a MAP/LIST is refused naming
+      its type instead of dying inside `ArrowValueReader` as *"unsupported filter value type Map"*.
+    - **⚠ `Normalize` IS APPLIED AT THE ENTRY POINT, EXACTLY ONCE, and doing it twice fails SILENTLY**:
+      `daxeval` gets the RAW args batch (a `params` column) and must normalise; `ExecuteQuery(sql, bag)` gets
+      an already-normalised one and must not — a second pass looks for a `params` column, finds none, and
+      yields an EMPTY bag rather than an error.
+    - **✅ VERIFIED LIVE THE SAME DAY (the user started a local Power BI Desktop): `verify_dax` 29 → **66**,
+      all green, and EVERY blind-written row held — including the `9007199254740993` one, so the precision fix
+      is verified end to end rather than on the pattern alone.**
+    - **⚠⚠ RUNNING IT FOUND TWO MORE REGRESSIONS THAT ONLY A LIVE MODEL COULD, and both break everything
+      EXCEPT targeted access — the SQL Server discovery defect's shape again. Full record:
+      [docs/dax-provider.md](dax-provider.md) §LIVE VALIDATION.**
+      - **`daxevaltable` / `daxeach` HAD LOST THEIR `{TABLE}` INPUT** to the unified parameter protocol
+        (2026-08-02): a field's STYLE rides in Arrow metadata and an unflagged field is POSITIONAL, so a bare
+        `expression` VARCHAR registered as `daxevaltable(VARCHAR)` — no TABLE parameter, `expression` not even
+        named — and DuckDB bound the input RELATION as a scalar subquery (*"Subquery returns 2 columns -
+        expected 1"*). ⚠ **Omitting the style does not FAIL, it registers a DIFFERENT FUNCTION**, which is why
+        the signature is now pinned rather than only the behaviour. ⚠ `daxeval` is the control and is
+        deliberately untouched (kind `proc`, whose args the host makes named by construction).
+      - **ONE UNSUPPORTED `$SYSTEM` DMV BROKE FULL ENUMERATION.** The curated list is what WE know how to
+        surface, not what every server HAS, and a listed-but-absent DMV is materialized during enumeration —
+        so `TMSCHEMA_PARTITION_SOURCES` (one of eighteen, absent on Power BI Desktop) failed
+        `duckdb_tables()`, `duckdb_columns()` AND `information_schema.tables` while a hand-written query
+        worked. Fixed by ASKING THE SERVER: `$SYSTEM.DISCOVER_SCHEMA_ROWSETS` narrows the list, one round
+        trip per catalog, cached; measured to name exactly the one missing DMV. ⚠ **A failure to ask is not
+        an answer** — if that discovery query fails, the FULL curated list is used, because "I could not find
+        out" must not become "this server has nothing".
+    - **⚠ BOTH FIXES ARE MUTATION-TESTED against the live model**: reverting the param schema dies at the
+      `daxevaltable` BEHAVIOUR row after 14 assertions (reproducing the original binder error exactly — the
+      stronger kill, and the new SIGNATURE row exists for a drift that does not break that call); dropping the
+      `DISCOVER_SCHEMA_ROWSETS` narrowing dies at the first enumeration row after 52, with the original text.
+    - **⚠ THE STRUCT-vs-JSON BAG ASYMMETRY IS SHARPER ON DAX THAN ON SQL SERVER and is now pinned there** —
+      it shows in the RESULT TYPE rather than only in what was sent: `{'d': 19.99::DECIMAL(9,2)}` reaches DAX
+      as `DECIMAL(19,4)` (a Currency, exact) while `'{"d": 19.99}'` arrives as `DOUBLE`, and a
+      `DATE '2024-03-05'` arrives as `TIMESTAMP_MS` where JSON has no date kind at all. That is the clearest
+      statement of why the docs say to prefer the STRUCT form. ⚠ `fabricator_query` also reaches the `$SYSTEM`
+      DMVs, not just DAX — one `StreamCommand` serves both — which is pinned too.
+    - **⚠⚠ THE TRANSFERABLE HALF IS ABOUT THE TIER, NOT THE CODE: `verify_dax` is MANUAL, so nothing between
+      the 2026-08-02 protocol migration and 2026-09-06 could have caught the first defect.** Treat a long gap
+      since the last run as a reason to EXPECT rot rather than as confirmation, and run it whenever a model is
+      available.
+    - **⚠⚠ STILL UNCOVERED AND LIVE-ONLY: `dax_refresh` / `dax_refresh_table` / `dax_refresh_partition`
+      EXECUTION.** Their REGISTRATIONS are pinned (the full `dax*` inventory row), and they go through the
+      migrated `Params.Combine` path and were correct as found — but the TMSL generation, the XMLA round trip
+      and the job-status polling have never been run by any suite. ⚠ Deliberately not run: a refresh
+      re-queries the model's data sources and leaves it in a different state, so it needs the user present
+      and the narrowest target (ONE partition of a small table), never a full model refresh.
+  - **✅ SLICE B BUILT THE SAME DAY — `{% provider_query %}` / `{% provider_exec %}`, a Fluid body in ANOTHER
+    ENGINE's dialect. C#-only IN THE PLUGIN: no ABI, no C++, no bridge. Gate: a NEW suite
+    `verify_plugin_fluid_provider` (**22**, SERVICE tier), two mutants each killed at its own row. Full
+    record: [docs/fluid-templating.md](fluid-templating.md) §29 +
+    [docs/provider-query-parameters.md](provider-query-parameters.md) §7.**
+    `{% provider_query 'mssql' r region: 'eu' %}SELECT … WHERE region = @region{% endprovider_query %}`.
+    - **WRAP AND DELEGATE, no new mechanism**: the rendered body is embedded in a `fabricator_query` /
+      `fabricator_exec` call which the `{% query %}` path runs, so the value model, the row cap and the
+      per-render pinned connection are shared. ⚠ **What the tag buys is that the body stops being a quoted
+      string ARGUMENT** — multi-line, `{% for %}` inside, no escaping; the same argument that justified
+      `{% exec %}` over `exec("…")`. ⚠ An option on the existing block (`{% query r catalog: … %}`) was
+      REJECTED: `materialize:` changes where the rows GO, a catalog option would change which engine PARSES
+      the body, and an option that silently switches dialect is the runs-and-means-something-different shape.
+    - **⚠⚠ §3.1 IS SETTLED — option 1, ACCEPT AND DOCUMENT (user, 2026-09-06) — and the cost is MEASURED and
+      PINNED rather than described.** The SELECT-only guard cannot transfer (there is no provider parser to
+      ask), so a provider tag inside `fluid_replacement_query` writes at BIND time, repeatedly: an `EXPLAIN` of a
+      `fluid_replacement_query` containing `{% provider_exec %}INSERT …` takes the target **0 → 1**, and the statement
+      that DOES execute takes it **1 → 2**. Accepted for the reason that DELETED the `exec()` refusal —
+      §11.1a measured it was already walk-aroundable by nesting a writing scalar in a SELECT, so a refusal
+      anyone can nest around is a speed bump that READS as a defence. ⛔ Do NOT "fix" it with a leading-keyword
+      check on the body (§9.2's measured-broken prefix check).
+    - **⚠⚠ `{% provider_exec %}` GOES THROUGH THE **QUERY** PATH, AND IT MUST — which is §3.1 in miniature.**
+      Its wrapper is `SELECT fabricator_exec(…)`, a SELECT by construction, so `{% exec %}`'s classifier would
+      REFUSE it. **The statement DuckDB classifies and the statement the provider executes are not the same
+      statement**, which is exactly why no classifier of ours can guard the provider's side.
+    - **⚠ THE BAG CROSSES AS DuckDB BOUND PARAMETERS THE WHOLE WAY** — `params := struct_pack("a" := $a)`,
+      never a rendered literal, MEASURED to bind and keep its types (`int32`/`varchar`) BEFORE anything was
+      built. The alternative is `DuckSql.Literal`, which is DuckDB DIALECT: it coincides with T-SQL for
+      strings and integers and diverges for booleans, blobs and temporals. ⚠ `fabricator_query` takes the bag
+      NAMED and `fabricator_exec` POSITIONALLY (a DuckDB scalar has no named parameters); mutant A, sending
+      the query bag positionally, dies at the first parameter row after 4 assertions.
+    - **⚠ THE CATALOG IS AN EXPRESSION, not an identifier** — `'mssql'` and `params.cat` both work, because
+      it is an INPUT and a bare identifier in an input position reads as a Liquid variable to anyone who has
+      written Liquid. The cost is that `{% provider_query mssql r %}` — the spelling someone tries FIRST —
+      evaluates to nil, so it is refused BY NAME pointing at the quoted form. ⚠ The result name is REQUIRED on
+      query and OPTIONAL on exec, matching `{% query %}` vs `{% exec %}`, with `{% exec %}`'s same negative
+      lookahead so `{% provider_exec 'c' x: 7 %}` does not take `x` as the name.
+    - ⚠ The count is read from an ALIASED column (`AS affected`): without it the column is named by its own
+      expression text — the whole `fabricator_exec(...)` call. Mutant C (drop the alias) dies at the count row
+      after 6 assertions.
+    - **⚠⚠ A SUITE TRAP THAT COST HALF AN HOUR, AND IT IS THIS FILE'S OWN RULE BEING BROKEN AGAIN: `require
+      json` IS LOAD-BEARING** (the classifier is `json_serialize_sql`, and `unittest` does not auto-load), so
+      without it EVERY provider tag is refused fail-closed and the suite reads as a broken FEATURE. **The
+      runner's terse failure — `explicitly with message: 0` — hid it, and the FULL output had the whole error
+      all along; a narrow `grep` was discarding it.** ⚠ Also: **sqllogictest splits a result ROW on
+      WHITESPACE**, so a one-column value containing spaces is read as several values and never matches —
+      every rendered assertion in the suite is `|`-separated for that reason.
+    - **⚠⚠ OPEN, AND USER-SURFACED (2026-09-07, "was it fluid_replacement_query or fluid_query_batch?"): THE TAGS ARE
+      GATED ON TWO SURFACES OF FOUR.** `fluid_render` carries §1-§4 (the substance) and `fluid_replacement_query` carries
+      §5 (the bind-time write ONLY); **`fluid_query_batch` and `fluid_query_lateral` have NO provider-tag
+      coverage at all** — not even that the tags work there, though they should, since all four go through
+      one `RunCaptured` and one `FluidRenderSession`.
+      - **⚠ IT IS NOT COSMETIC: THE MULTIPLIER DIFFERS ON EACH, AND NOTHING ASSERTS THE OTHER TWO.**
+        `fluid_replacement_query` multiplies by BINDS; `fluid_query_batch` renders PER GROUP at scan *and* binds a schema
+        probe; `fluid_query_lateral` renders PER CHUNK, in PARALLEL, on several sessions at once. ⇒ a
+        `{% provider_exec %}` on the lateral issues CONCURRENT provider writes from several pipeline threads,
+        which nothing built or measured here says anything about. **That is the row worth running first.**
+      - ⚠ A practical consequence of §5 worth keeping: on `fluid_replacement_query` there is NO dry run. Every render IS
+        the bind, so `EXPLAIN` — the reflex for seeing what a template generated — is itself a provider write,
+        and `is_bind` exists only in `fluid_query_batch` (where there are two kinds of render to tell apart).
+        A writing template behind a VIEW writes on every use, and looking at it counts as a use.
+      - ⚠ §5's own comment claimed the count was "the number of BINDS plus this one"; its two rows disprove
+        that (two binds gave 2, not 3) and it is corrected — executing adds nothing beyond its own bind. Only
+        those two steps are MEASURED for the provider tags; the four-step view chain is exec()'s recorded
+        measurement, inherited by shared mechanism.
+    - **⚠ THE GATE IS ITS OWN SUITE because `verify_plugin_fluid` is HERMETIC**: the tags need a real provider
+      catalog, so a `require-env` there would have moved 759 assertions out of the hermetic tier to gate 22.

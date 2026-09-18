@@ -391,3 +391,47 @@ minting). Step **3** is the strategic multiplier — a single `onelake://` DuckD
 (Delta + Excel/JSON/CSV/parquet + `COPY`) and is what the native reader needs — but it is the largest lift and is
 gated on adopting the native Multifile-Delta model. Step **4** is optional polish. **Nothing built** — design note only;
 `FabricLakehouse` (direct DFS SDK for discovery + DROP) is the working precedent to generalize.
+
+## Appendix — records moved verbatim from CLAUDE.md (2026-09-18)
+
+CLAUDE.md carried these as-built records inline until it grew to 10,776 lines — a file loaded into every
+session's context. They are moved here VERBATIM; CLAUDE.md keeps each entry's summary head plus a pointer to
+this section. The one edit made on the way: a link that pointed into the docs directory is rewritten relative
+to this directory, so it still resolves from here.
+
+- **THE HOST-FS PATH NOW HAS A PER-IO INSTRUMENT, AND IT IMMEDIATELY FOUND THAT THE ONELAKE MICRO-GET FIX HAD
+  NEVER REACHED IT — BUILT 2026-08-20 (C#-only, no ABI), user-directed. Full record:
+  [docs/filesystem-bridge.md](filesystem-bridge.md) §Per-IO instrumentation.**
+  `Fabricator.Host.Fs`, Debug-gated, on `DuckDbTableFileSystem` (`list` WITH the entry count, `open`,
+  `exists`, `read-all`, `delete`), `DuckDbRandomAccessFile` (`read @off+len`, `read-ranges xN`) and — only
+  for what it does ITSELF via the SDK — `S3CommitFileSystem` (the conditional PUT's **won/LOST**, and
+  `rename-dir`). ⚠ Its delegating members are deliberately NOT instrumented: they forward to the inner host
+  FS, which logs to the same category, so doing both would double every line of a timeline.
+  - **⚠ THE DEFECT: a 4-row table with a 218-commit log cost 73 IO ops on `s3://`, 57 of them RANGED READS
+    of 8-55 bytes — 17,236 bytes in 57 requests — all on ONE ~17 KB checkpoint parquet.** That is
+    byte-for-byte the 2026-08-16 OneLake finding (~63 GETs at ~180 ms ≈ 12 s, the whole "log replay" span),
+    and `AdlsGen2TableFileSystem`'s `BufferedReadMax = 16 MB` fixed it THERE only. **Every `s3://` root, and
+    every `abfss://` root WITHOUT a named credential, still paid it.** Now **57 ranged reads → 0, 73 IO ops
+    → 17.**
+  - **⚠ THE CLAIM IS THE REQUEST COUNT, NOT THE CLOCK.** MinIO on localhost: 1.43 → 1.32 s, within noise.
+    At the ~180 ms per remote request measured for OneLake, 56 saved round trips ≈ 10 s per table open. A
+    local A/B cannot show this and saying it did would be the confounded-comparison error again.
+  - **⚠ GATED ON REMOTE ROOTS (`_root.Contains("://")`) — a refinement the ADLS twin did not need**, being
+    remote by construction. This filesystem also serves LOCAL roots (the whole hermetic tier), where a
+    per-call round trip is free and buffering a whole file to answer a small read is pure waste. CONTROL
+    measured: a local root still shows 0 buffered and 4 ranged reads ⇒ local behaviour unchanged BY
+    CONSTRUCTION. ⚠ Above the cap true ranged reads stay: the codec engine reads DATA files through this
+    handle, so a column-pruned read of a big file must not download all of it.
+  - **⚠ DuckDB'S OWN LOGGING IS THE BETTER BYTE-LEVEL INSTRUMENT and was the user's suggestion:**
+    `SET logging_level='TRACE'; SET enabled_log_types='FileSystem,HTTP'; SET enable_logging=true` emits
+    `{"fs":"S3FileSystem","path":…,"op":"READ","bytes":…,"pos":…}` per operation. What it cannot say is which
+    DELTA operation caused the IO. Read together: **DuckDB's for what, ours for why.** ⚠ Those entries do NOT
+    reach `duckdb_logs` — its storage defaults to stdout.
+  - **⚠⚠ AND THE SLOWDOWN THAT PROMPTED THE WHOLE INVESTIGATION DID NOT EXIST** — see the backgrounded-`sleep`
+    entry in the build-and-test traps. `verify_delta_catalog_s3` takes **196 s** (196 assertions) and the whole
+    hermetic tier **414 s**; the gap analysis over the suite's span found the largest gap between IO events to
+    be **1.2 s**, with gaps ≥1 s totalling **1%** — i.e. no dead time at all. The bucket-accumulation theory,
+    the MinIO health checks and the "CPU rate decay" were analysis of a polling artifact. What survives is the
+    instrument, this fix, and one small real number: a 218-commit log costs ~0.6 s per scan of that table
+    (≈2.7 ms per dead commit) — maintenance, not a performance problem, so **do NOT clean the S3 bucket as a
+    "fix"**.

@@ -453,3 +453,62 @@ valid UTF-8, rather than mojibake.
     per-pool mutexed; reading settings off a `ClientContext` from a pool thread is what every `HostFs` call
     already does) — **not measured**.
 
+## Appendix — records moved verbatim from CLAUDE.md (2026-09-18)
+
+CLAUDE.md carried these as-built records inline until it grew to 10,776 lines — a file loaded into every
+session's context. They are moved here VERBATIM; CLAUDE.md keeps each entry's summary head plus a pointer to
+this section. The one edit made on the way: a link that pointed into the docs directory is rewritten relative
+to this directory, so it still resolves from here.
+
+- **A MANAGED HTTP CALL GOES THROUGH DuckDB'S OWN STACK — BUILT 2026-08-18 (ABI v76, ADDITIVE; C++ + C#),
+  user-directed. Full record: [docs/http-transport.md](http-transport.md), whose Appendix also holds
+  this entry verbatim (2026-08-23); gate `verify_http_transport` 21 (service tier).** `DuckDbHttpHandler` is
+  an ordinary .NET `HttpMessageHandler` whose transport is `HTTPUtil`, so a PLUGIN calling a REST API
+  inherits the `TYPE http` secret whose SCOPE covers the URL, plus `ca_cert_file`, `http_proxy*`,
+  `http_timeout` and the retry knobs, instead of carrying its own. SQL surface
+  `fabricator_http_request(url [, method :=] [, headers :=] [, body :=])`. It lives in
+  `Fabricator.Abstractions`, so a plugin reaches it with the reference it ALREADY HAS.
+  - **⚠⚠ httpfs IS A HARD PREREQUISITE AND I SHIPPED THIS WITHOUT NOTICING — BOTH CI TIERS ARE
+    STRUCTURALLY BLIND TO IT.** `extension_config.cmake` links httpfs STATICALLY into the test binaries and
+    the shell, so it is always loaded there; the SHIPPED single-file artifact is the opposite. Measured
+    against a stock wheel with only fabricator loaded: **every request, GET included, failed with `'https'
+    scheme is not supported`** — naming neither httpfs nor the fix. Only httpfs' `Load` calls
+    `SetHTTPUtil`, and the built-in fallback does GET alone and reads **NO SECRETS AT ALL**, so a
+    half-working configuration would apply no credential while looking fine. Fixed by auto-loading httpfs at
+    REQUEST time (never during `Extension::Load`) and REFUSING with `INSTALL httpfs; LOAD httpfs;`
+    otherwise. **The lesson: when a feature depends on ANOTHER extension, the statically-linked dev binary
+    is the one environment guaranteed not to show it — test the wheel.**
+  - **⚠ A DOUBT BORROWED FROM A NEIGHBOURING CASE NEEDS ITS OWN CHECK.** The design doc's "gating question"
+    (would a loadable link `HTTPUtil`?) was never gating — `EXTENSION_STATIC_BUILD=1` has been in the
+    configure line from the beginning, and under it `DUCKDB_API` is defined EMPTY. It was inherited from the
+    v73 yyjson note, whose real obstacle was C++ NAMESPACING. It pointed at the wrong risk while the real
+    prerequisite went unexamined.
+  - **⚠ THE LIFETIME RULE THIS CORRECTED, and it is the general one: CAPTURE-AND-RE-ESTABLISH FOR VALUES,
+    RESOLVE-PER-USE FOR POINTERS.** The handler used to CAPTURE the opener at construction, which this file
+    called load-bearing — it is the opposite. A catalog is DATABASE-scoped and outlives the connection that
+    attached it, so a held `ClientContext *` dangles (the `table_stats` SIGSEGV class). The transport now
+    resolves the ambient PER REQUEST and the handler holds nothing — which is also more CORRECT for secrets,
+    since a user may create one after the ATTACH.
+  - **⚠ TWO UPSTREAM BEHAVIOURS A CALLER MUST COMPENSATE FOR:** a secret's `extra_http_headers` are sent
+    TWICE unless `HTTPFSParams::pre_merged_headers` is set, which **defaults to FALSE** (so the default is
+    correct only for a caller that bypasses the base constructor, and there is none) — we merge them
+    ourselves and CLEAR the set; and **POST's response body arrives in `PostRequestInfo::buffer_out`, NOT
+    `HTTPResponse::body`**, so reading `response->body` returns an EMPTY body for every POST while every
+    other method works.
+  - **⚠ `try_request` IS NARROWER THAN IT LOOKS, ESTABLISHED BY A MUTANT THAT SURVIVED**: DuckDB returns any
+    NON-RETRYABLE response directly whatever the flag says, so 404/401/403 were always rows. It governs only
+    the RETRYABLE set — and is therefore **NOT GATED**, which the suite says rather than implying coverage.
+  - **What cannot cross, and it is DuckDB's model rather than our shortcut**: ONE VALUE PER HEADER NAME in
+    both directions (so `Set-Cookie` is unrepresentable — hence no cookies), bodies FULLY BUFFERED both ways
+    (a paging REST reader must page, not stream), only GET/PUT/HEAD/DELETE/POST (PATCH refused BY NAME —
+    sending it as a POST would corrupt a write while looking like it worked).
+  - **⚠ THE CREDENTIAL WIN AND THE TRANSPORT WIN ARE SEPARABLE, and my first write-up overstated it**: the
+    `TYPE http` secret carries a STATIC credential and performs no OAuth2 exchange (`CLIENT_ID` is a Binder
+    Error), so a static-key API deletes its whole credential surface while an OAuth2 one keeps its own secret
+    type and gets only the transport. This REVERSES an earlier note telling that plugin its `SecretFields`
+    were the wrong shape — they are right.
+  - **⚠ A DECISION LEFT OPEN ON PURPOSE: `fabricator_http_request` IS UNGATED.** Anyone who can run SQL here
+    can send any of the five methods to any URL with whatever matching secret — PUT/POST/DELETE included.
+    That exceeds what httpfs alone exposes and sits well inside what this extension already permits
+    (`fabricator_exec`, `fabricator_install_plugin`). Documented in the README rather than silently settled
+    either way. Note the TRANSPORT is not the exposure: a plugin using it already runs in-process code.

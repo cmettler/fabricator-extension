@@ -2231,3 +2231,55 @@ about the parallel sink changes that.
   - Gates: hermetic **71/71 — 7558** AND service **50/50 — 2028**, both IDENTICAL to baseline — the whole
     claim for a change that alters PLANS on every provider.
 
+## Appendix — records moved verbatim from CLAUDE.md (2026-09-18)
+
+CLAUDE.md carried these as-built records inline until it grew to 10,776 lines — a file loaded into every
+session's context. They are moved here VERBATIM; CLAUDE.md keeps each entry's summary head plus a pointer to
+this section. The one edit made on the way: a link that pointed into the docs directory is rewritten relative
+to this directory, so it still resolves from here.
+
+- **SCAN + WRITE CONCURRENCY — all of it, with every measurement and every wrong turn, lives in
+  [docs/scan-concurrency.md](scan-concurrency.md) (§1–§10). Compressed out of here 2026-08-23.**
+  Status: **DONE and measured.** A scan uses every thread (`MaxThreads()` was hardcoded to 1 — §2, ~1.95x
+  CPU-bound and ~11% WORSE on a merge-bound GROUP BY, say both); order-preserving plans get a parallel
+  collector (`get_partition_data` — §5, 2729 → 1197 ms streaming, 5133 → 1859 ms unioned); a scan whose
+  PULL blocks hands its worker back instead of parking on the mutex (§5f, two managed scans unioned
+  2.06 → 1.03 s); and **every write sink declares itself parallel** (§7c — CTAS 3.49 → 2.13 s, INSERT
+  3.29 → 1.98, DELETE 3.22 → 1.36, UPDATE 7.15 → 5.00, COPY 3.41 → 2.07 with `preserve_insertion_order`
+  off). `order_preservation_type` was analysed and **NOT adopted** (§7d), and the managed→host wake for a
+  parked sink is **CLOSED by measurement, not deferred** (§7c — a co-tenant loses ~11–23%, which is
+  ordinary contention, not starvation).
+  - **⚠⚠ THE ONE TRAP TO READ BEFORE MEASURING ANYTHING HERE, because it produced FOUR confident wrong
+    answers in one session and the user caught two of them: PICK THE RIGHT INSTRUMENT (§6).** A per-row
+    **SCALAR** measures INTRA-branch parallelism; a **TABLE FUNCTION** measures whether union BRANCHES
+    overlap; a scalar + single source + no union measures whether the WRITE SINK is parallel. **None of
+    the three transfers to the others**, and a wrong pick yields a confident wrong answer rather than a
+    null result. Twice I read a scalar's result as a statement about inter-branch concurrency.
+  - **⚠ `range()` IS A SINGLE-THREADED SOURCE** — it voided three separate probes (a `count(*)` over it
+    runs on the caller's own thread and needs no worker at all). A parallel co-tenant needs a DuckDB
+    NATIVE table; a parallel-sink probe needs a fabricator TABLE, never `range()`.
+  - **⚠ `sum()`, NEVER `count(*)`**: DuckDB PRUNES a projected column no aggregate consumes, so
+    `count(*)` over an instrument evaluates it ZERO times and the measurement reads as instant
+    parallelism with the instrument never called. Third distinct appearance of that trap in this file.
+  - **⚠ THE REMOTE PAYOFF IS MEASURED AND IT IS NIL (§7e)** — every remote shape is FLAT in `SET threads`
+    because it is latency-bound (0.5–3.7 s of CPU inside a ~6 s wall). The 1.6–2.4x LOCAL wins stand; do
+    not re-claim a remote one. ⚠ My first two runs there said 3.7x and BOTH were void — the variable was
+    RUN POSITION (OneLake first-touch ~12–17 s), so a remote A/B must interleave 1,4,1,4 after a real
+    warm-up. One strong positive did survive: staged `COPY INTO` is ~6x faster than TDS (6.2–7.5 vs
+    37.9–39.8 s), which supersedes an older, much closer pair.
+  - **⚠ RE-EVALUATE THE WHOLE FILE AT THE DuckDB 2.0 / `main` BUMP** (§7c, user-raised): "closed" means
+    closed at TODAY'S cost, and `main` has roughly DOUBLED the async surface — files touching
+    `async_result` 10 → 19, `AsyncTask`/`AsyncResult` 17 → 34 — and already carries the pattern the wake
+    needs under another name (`ReadAheadJobCompletion.TryPark(const InterruptState &)`, and a SINK has an
+    `InterruptState`). Re-derive the wake, §5f's 1–16 ms backoff and §10 item 6 (prefetch) TOGETHER there.
+  - Instruments, all shipped: `plug_sleep(millis)` (per-ROW, scalar), `plug_slow_range(rows, millis)`
+    (per-BATCH, source-side) and the pure-C++ `fabricator_wait(rows, millis[, threads, hold_lock,
+    async_wait])` — which has no Arrow, no bridge and no plugin, so a scheduling answer from it cannot be
+    blamed on our machinery. ⚠ On Windows the sleep floor is the ~15 ms timer tick, so a 1 ms argument
+    lies by 15x. Gates: `verify_wait` 31 (mechanism) + `verify_plugin` 97 (the production path), both
+    mutation-tested, each with a LOWER-bound positive control in front of its ratio.
+  - **⚠ THE ROUTING ITSELF IS NOT GATED and the suites say so** rather than implying coverage: no row
+    moves, nothing prints the chosen collector (`EXPLAIN ANALYZE` reports only `Total Time`), and proving
+    parallelism needs an UPPER bound on time — the flaky direction. What stands behind it is both tiers
+    IDENTICAL with every plan-sensitive suite at its exact prior count, plus the measurements and the
+    source chain. A regression here would be silent and SLOW, never wrong.

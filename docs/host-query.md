@@ -807,3 +807,252 @@ the scalar's volatility, removing the `schema_factory`, and ignoring a source's 
 Tiers on the final payload: hermetic **74/74 — 8250** (8183 + exactly this suite's 67, which is what shows no
 other suite moved) and service **54/54 — 3162** unchanged, since `verify_host_query` is hermetic — that run
 is the regression check for the C# Bridge change, not a floor bump.
+
+## Appendix — records moved verbatim from CLAUDE.md (2026-09-18)
+
+CLAUDE.md carried these as-built records inline until it grew to 10,776 lines — a file loaded into every
+session's context. They are moved here VERBATIM; CLAUDE.md keeps each entry's summary head plus a pointer to
+this section. The one edit made on the way: a link that pointed into the docs directory is rewritten relative
+to this directory, so it still resolves from here.
+
+- **⚠⚠ NAMED ARROW INPUTS ARE **TEMPORARY** VIEWS NOW — a SHIPPED DEFECT, measured and FIXED 2026-09-03
+  (C++-only, NO ABI change). It came out of the `{% query %}`-by-name analysis and is much bigger than
+  that feature. Gate `verify_delta_catalog_filter_modes` 39 → **55**, hermetic floor 8555 → **8571**, one
+  mutant. Full record: [docs/host-query.md](host-query.md) §Named Arrow inputs are TEMPORARY views;
+  the analysis it came from is [docs/fluid-templating.md](fluid-templating.md) §17.**
+  - **THE DEFECT.** `duckdb_arrow_scan` ends in `CreateView(name, replace: true, temporary: FALSE)`
+    (`duckdb/src/main/capi/arrow-c.cpp:425`), so every bound input became an ordinary CATALOG view in the
+    user's own `memory.main` — outliving the connection AND the stream whose raw pointer it stores.
+    `MakeHostQueryStream` registers them itself now (`RegisterArrowInputView` = that same upstream body
+    with `temporary` flipped; its factory pair is in an anonymous namespace and unlinkable, hence the copy).
+  - **⚠⚠ IT IS A SIGSEGV REACHABLE FROM ORDINARY SQL, NOT UNTIDINESS — MEASURED.** `SELECT
+    dbo.cf_host_sum(1)` (10) then `SELECT * FROM in0` ⇒ **exit 139**, on the demo name and on a production
+    one (`__fabricator_scan_batch_1`) alike. And it ACCUMULATED: three filtered SELECTs ⇒ three views, one
+    per statement, unbounded.
+  - **⚠ REACHABILITY IS NARROWER THAN THE MECHANISM — establish it PER PATH, because the one prediction
+    I made before measuring was wrong and it was the alarming one.** I expected the buffered-overlay branch
+    to leak under the DEFAULT `PROVIDER 'delta'`, i.e. on the configuration almost everyone runs; **it does
+    not** (measured with the same Debug control — under `native_read` the filter goes into `read_parquet`'s
+    WHERE and no input is bound). What DOES leak: `HostBatchFilter` (codec Delta + exact pushdown) and
+    `cf_host_sum` (fixed name `in0`, no drop). Every other input site already worked around it with a
+    unique name plus an explicit DROP.
+  - **⚠⚠ THE ANSWER WAS ALREADY IN THE TREE, WITH A MEASUREMENT, AND TWO DOCS CONTRADICTED EACH OTHER.**
+    `BoundInput` (`SingleScanArrowStream.cs`) documents *"a CATALOG-level view … outliving the connection …
+    MEASURED: six concurrent Delta writers, and five of the six failed"*, while host-query.md's data-in
+    section said "connection-scoped … no name collisions, no lifetime ambiguity". The one describing the
+    MECHANISM was the wrong one. ⇒ **grep the tree for the property before designing a probe for it.**
+  - **✅ IT DISSOLVED AN APPARATUS THAT EXISTED IN TWO COPIES — RETIRED in the follow-on commit, −171
+    lines over SEVEN call sites in three assemblies** (`HostBatchFilter`, `HostParquetStaging`,
+    `ExternalTableRouting`, `DeltaCatalog`'s sort input, `NativeParquetDataFileWriter` ×2, and
+    `DeltaNativeReader`'s per-file + batched forms), plus the `BatchPlan.ViewNames` / `BatchQueryOwner`
+    plumbing that existed only to carry names to the drop. `BoundInput` and `DeltaNativeReader`'s duplicate
+    `NextViewName`/`DropViews` are gone; every site takes a FIXED name again.
+    - **⚠⚠ THE INVARIANT IS ENFORCED, NOT ASSUMED, AND EVERY SITE SAYS SO** — a bound input is a TEMPORARY
+      view on that call's OWN fresh connection, and named inputs are REFUSED on a pinned connection, so no
+      two host queries share a temp catalog. **Lifting that refusal is exactly what brings the race back**
+      (measured, twice: six concurrent Delta writers ⇒ FIVE failed; and `FABRICATOR_DELTA_PREFETCH=8` +
+      `FABRICATOR_DELTA_BATCH_MIN_FILES=0` ⇒ every scan failed). The note is at the CALL SITES, not only in
+      the docs, because that is where the trap would spring.
+    - ⚠ **`SingleScanArrowStream` STAYS** — the single-use property is the STREAM's, not the view's.
+    - **⚠⚠ WHAT PROVES A REMOVAL, when there is no new behaviour to assert: the gate written for the fix got
+      STRONGER without changing a character.** `starts_with(view_name, '__fab') = 0` used to be satisfiable
+      two ways — temp-ness OR the drops; with the drops gone only temp-ness can. ⚠ It covered the CODEC path
+      only, so the retirement adds the NATIVE half (`verify_delta_catalog_native_write` 147 → **148**, after
+      a plain CTAS and a PARTITIONED write = both COPY sites). Mutation-tested TOGETHER: `temporary:false`
+      kills BOTH, each at its own line (native 305 after 147 pass, codec 172 after 53).
+  - **⚠ THE GATE'S FIRST VERSION WAS VACUOUS AND PASSED ON BOTH BUILDS.** `LIKE '\_\_fab%' ESCAPE ''`
+    lost its escape character on the way into the file (`ESCAPE ''`), so it matched nothing. Only the
+    MUTATION TEST caught it. It is `starts_with(view_name, '__fab')` now — no metacharacters, cannot fail
+    that way. ⚠ And the row count is NOT a control for this path: the section's positive control is an
+    `EXPLAIN` showing exact mode has ERASED the filter (no `FILTER` operator), which is what makes the
+    correct answer evidence that `HostBatchFilter` ran at all.
+  - **⚠⚠ STILL OPEN — LIFTING THE v84 REFUSAL, and asking how the fix would work found the TRUE reason it
+    exists (the stated one is false, §17.6).** `HostQueryStream` declares `inputs` FIRST so they die LAST,
+    after `conn`; on a FRESH connection that is airtight (`conn` is the only reference ⇒ the Connection,
+    and its temp catalog, dies first). **On a PIN the two lifetimes DIVERGE** — `conn` is a `shared_ptr`
+    COPY, so releasing the result stream destroys `OwnedArrowInputs` while the Connection lives on, leaving
+    a temp view pointing at released streams: today's defect again, scoped to the render.
+    ⇒ **REWRITE the refusal's message and comments when lifting, do NOT just delete them** — a reader who
+    sees only "the stated reason was measured false" would conclude there was nothing there.
+    docs/fluid-templating.md §17.11.
+  - **⚠⚠ A BOUND INPUT IS SINGLE-USE, AND THAT CHANGES THE FIX (user-raised: "is such a temp view +
+    arrow_scan one single scan or can such a view be queried several times?").** The VIEW is re-queryable;
+    the DATA is not — `ProduceArrowScan` runs per scan (`duckdb/src/function/table/arrow.cpp:142`) and our
+    factory, like upstream's, wraps THE SAME `ArrowArrayStream *`, a cursor. So a second reference binds,
+    plans, and returns **zero rows silently**. Unrelated to temp-vs-catalog; the tree already carries two
+    mitigations (`HostBatchFilter`'s `WITH … AS MATERIALIZED`, and `SingleScanArrowStream`, which THROWS on
+    a second end-of-stream because for a DV anti-join zero rows is *deleted rows coming back*).
+    **⚠⚠ NOW MEASURED, with the dedup trap avoided.** A throwaway C#-only edit made `cf_host_sum` run
+    `(SELECT count(v) FROM in0) * 100 + coalesce((SELECT sum(v) FROM in0), -1)` — DIFFERENT aggregates, so
+    the common-subplan optimiser cannot fold the two references into one scan. Answer: **399**, i.e.
+    `count` ran first and saw all **4** rows, `sum` ran second and saw **NONE** (NULL ⇒ -1). Replayable
+    would have been 410, one-scan-deduped 410 as well — so 399 proves BOTH that the view was scanned twice
+    AND that the second scan was empty. Probe reverted.
+    - **⚠⚠ AND FOR THE FLUID CASE NEITHER OPTION IS NEEDED — MEASURED, and it retires the whole A/B choice
+      I had set up (user-asked: "who and when is IHostConnection.Bind called?").** Tracing it showed the
+      premise was never checked: a `{% query t %}` result does NOT have to be shipped BACK INTO DuckDB as
+      Arrow, because **we own the SQL text**. `CREATE TEMP TABLE "t" AS (body)` on the per-render pinned
+      connection, then `SELECT * FROM "t"` to fill the Fluid variable — **C#-only in the plugin: no ABI, no
+      C++, no lifetime machinery, no v84 lift.** ⚠ THE MECHANISM ALREADY SHIPS: `{% exec %}CREATE TEMP
+      TABLE t AS …{% endexec %}` + `{% query u %}… FROM t{% endquery %}` answers `n=4 s=100` TODAY, and two
+      blocks reading one staged table answer `a=3 b=6` — re-scannable, which a bound Arrow input is not.
+      v84's pinned connection is the enabling piece and `verify_plugin_fluid` §12 already gates it, so what
+      is missing is only ERGONOMICS. ⚠ It sharpens §17.5's hazard: `t` becomes a TEMP TABLE name and a temp
+      table SHADOWS a catalog table on that connection. **A and B remain the answer only where the data
+      originates in C# and we own no SQL producing it** (a plugin pushing a table in).
+    - **⛔ DEFERRED BY DECISION (user, 2026-09-04): "the query + automatic CTAS is not needed for now,
+      maybe revisit later". DO NOT pick this up as pending work.** ⚠ It costs nothing to defer because the
+      MECHANISM ALREADY SHIPS and is gated — `{% exec %}CREATE TEMP TABLE t AS …{% endexec %}` then
+      `{% query u %}… FROM t{% endquery %}` works today on the per-render pinned connection (measured
+      `n=4 s=100`; a staged table read twice gives `a=3 b=6`). Only WHO WRITES THE CTAS is deferred.
+      ⚠ If revisited, the open question is NOT the plumbing: `t` becomes a TEMP TABLE name and a temp table
+      SHADOWS a catalog table of that name on the connection, silently. Settle that deliberately.
+      ⚠ The A/B option analysis below is BACKGROUND now — it still applies to the DIFFERENT, still-open
+      case of data originating in C# with no SQL of ours producing it.
+    - ⇒ **PREFER MATERIALIZING OVER OWNING THE BATCHES, which is the opposite of what §17.3/§17.10 say.**
+      Making the session own the batches does NOT make `{% query u %}SELECT … FROM t{% endquery %}` work —
+      the second reference is empty however long the stream lives. `CREATE TEMP TABLE t AS SELECT * FROM
+      <bound view>` on the pinned connection releases the stream at once and leaves an ordinary
+      re-scannable relation that dies with the render ⇒ **the ownership problem, and the reason the v84
+      refusal was hard to lift, both disappear.** Not considered when §17.3 was written. docs §17.11.
+  - **⚠⚠ IT PERSISTED INTO A FILE-BACKED DATABASE AND THE CRASH SURVIVES A RESTART — MEASURED on the
+    pre-fix build, and it is why this is a README item and not just a fix.** Against a `.duckdb` FILE (not
+    the in-memory default): `cf_host_sum` ⇒ 10, the view lands in **`probe.main`** (the FILE), a FRESH
+    process reopens it (`in0_views = 1` ⇒ it was SERIALIZED), and `SELECT * FROM in0` ⇒ **exit 139**,
+    dereferencing a pointer from a process that no longer exists. ⇒ a file written by a pre-fix build can
+    hold a **permanently poisoned view**. Remediation is one line and is SAFE — `DROP VIEW IF EXISTS`
+    does not scan, verified against the poisoned file — but the user has to know to run it, so the README
+    carries the check (`view_name = 'in0' OR starts_with(view_name, '__fab')`).
+  - ⚠ The root `ArrowSchema` that `RegisterArrowInputView` fills is never released — replicated verbatim
+    from upstream, which does not release it either. Left alone on purpose: the children's release
+    callbacks are the CALLER's and are restored afterwards, so releasing the root risks a double free, and
+    an ownership fix does not belong in a scope fix.
+  - **⚠⚠ THE PROPOSAL THIS CAME FROM (`{% query t %}` then `FROM t`) IS STILL UNBUILT, and its premise was
+    wrong: the named-source/replacement-scan machinery is GLOBAL** — the scan is registered on the
+    DatabaseInstance (`fabricator_host_query.cpp:910`) and the registry is a process-static
+    `ConcurrentDictionary` (`Host.cs:244`), so `{% query t %}` would publish `t` process-wide while
+    `fluid_render` is a VOLATILE scalar evaluated per row on several threads. The right half is the v84
+    pinned connection, via a host SERVICE (`IHostConnection.Bind(name, batches)`) rather than a static —
+    `Host.RegisterSource` is in `Fabricator.Bridge`, which a plugin does not reference. ⚠ SETTLE FIRST: a
+    bound name SHADOWS a real table on that connection, silently.
+
+- **⚠⚠ `fabricator_host_query` USED TO EXECUTE ITS SQL TWICE — FOUND AND ✅ FIXED 2026-09-01 (C++-only, no
+  ABI). It was the SAME shipped defect fixed for `fabricator_query` in `0acd679`, and the comment justifying
+  it pointed at that very function. Gate `verify_host_query` 31 → **98** across the whole pass (53 at the
+  describe fix, 92 with `fabricator_host_exec`, 98 with the named-source declared schema), FIVE mutants
+  each killed at its own assertion; hermetic **74/74 — 8250** (8183 + exactly this suite's 67, so no other
+  suite moved). Full record:
+  [docs/host-query.md](host-query.md).** MEASURED before: one call of
+  `SELECT * FROM fabricator_host_query('INSERT INTO audit VALUES (1)')` left **2 rows**, and DDL failed its
+  second run *"already exists"* from a statement issued once. After: 1 row.
+  - **⚠⚠ THE COMMENT WAS STALE IN ITS LOAD-BEARING CLAUSE, and that is the transferable part.**
+    `HostQueryBind` read *"PopulateReturnSchema runs the factory once for the schema; the scan runs it again
+    for the data — LIKE THE OTHER FABRICATOR TABLE FUNCTIONS."* True when written; `fabricator_query` was
+    fixed precisely so it no longer does this, so the sibling it appealed to had become the COUNTER-EXAMPLE.
+    **A justification by analogy ages when the analogue is fixed, and nothing re-checks it.**
+  - **⚠ SQL SURFACE ONLY — the C# `Host.Query` always ran ONCE** (measured: the slice-2 bind probe wrote
+    exactly one row per bind). The doubling was `PopulateReturnSchema` running the bind factory for the
+    output schema, i.e. the TABLE FUNCTION's bind, which only the SQL surface has.
+  - **THE FIX: `bind_data->schema_factory` filled from a PREPARED statement** — the existing "the bound
+    object can describe itself" seam. Cheaper than `fabricator_query`'s, which needed the provider to
+    describe remote SQL (`sp_describe_first_result_set`); DuckDB describes its own statements natively.
+    ⚠ **The describe and the execute must BIND IDENTICALLY** or the declared schema and the delivered batches
+    could disagree (the scan reads batches through converters built from the DECLARED schema), so the session
+    application was factored into ONE `ApplyHostQuerySession` both call, and both derive the Arrow schema the
+    same way.
+  - **⚠ A DOCUMENTED FALLBACK, NOT A SILENT ONE**: `Prepare` handles ONE statement while `SendQuery`
+    accepts several, so multi-statement calls fall back to the old path and keep their PRE-EXISTING
+    behaviour rather than becoming bind errors. Pinned as the value it really produces (two rows from one
+    call).
+    - **⚠⚠ "STILL WORKS" WAS TOO KIND AND I HAD TO CORRECT IT (user-prompted).** Double execution means a
+      NON-IDEMPOTENT prefix FAILS: `'CREATE TABLE mk …; SELECT * FROM mk'` creates mk on the describe run
+      and collides with itself on the data run. UNCHANGED from before the fix — everything double-executed
+      then, so it failed identically — and it is also why describing cannot be MADE to work there rather
+      than merely being unimplemented: **the last statement's schema can depend on the earlier statements'
+      effects**, so there is nothing to describe until they have run. Gated as the failure it is.
+  - ⚠ A bind/parse error now surfaces at BIND rather than mid-scan — the same change `fabricator_query`'s fix
+    made.
+  - **⚠⚠ `fabricator_scan` WAS NOT THE SAME DEFECT, AND I WROTE IT UP TWICE AS "the identical shape" BEFORE
+    READING THE C# SIDE. ✅ NOW FIXED ANYWAY (C#-only, no ABI, no C++).** `Host.RegisterSource` registers a
+    **factory** (`Func<IArrowArrayStream>`), and `PopulateReturnSchema` opens a stream, reads `get_schema`
+    and releases it **without ever pulling a batch** — so the bind executes nothing the caller wrote, it
+    INVOKES THE FACTORY. Cost is entirely the factory's business: lazy ones are nearly free, eager ones
+    repeat their work, side-effecting ones repeat their effect. **The lesson is the recurring one: I twice
+    described a defect by ANALOGY to the one next to it instead of reading the second implementation.**
+    - **THE REAL DEFECT WAS THE CONTRACT.** `RegisterSource`'s doc said the factory *"is invoked per scan"*.
+      It is invoked once per BIND and once per SCAN, and binds REPEAT (every use of a view, every EXECUTE of
+      a prepared statement). That is the sentence an author would write an expensive or side-effecting
+      factory against.
+    - **THE FIX IS AN OPTIONAL DECLARED SCHEMA**: `RegisterSource(name, factory, schema)` returns a wrapper
+      answering the schema from the declaration and opening the real stream on the FIRST PULL, which the bind
+      never performs ⇒ the factory runs EXACTLY ONCE, by the scan. ⚠ My earlier claim that this needed
+      "plausibly an ABI addition" was wrong: it assumed C++ would have to ask for a schema directly, and it
+      does not — the laziness lives behind `OpenNamedInput`, which already returns a stream.
+    - **⚠ THE DECLARATION IS VERIFIED ON FIRST PULL** (count, names, `TypeId`), because the host builds its
+      converters from the DECLARED schema and reads batches through them — a mismatch would be read as DATA.
+      ⚠ It does NOT compare type PARAMETERS (`decimal(18,4)` vs `decimal(9,2)` passes): `IArrowType.Equals`
+      is REFERENCE equality, so real structural comparison needs a hand-written comparer, and
+      `SqlServerCdcReader.SameType` is one — private to another assembly. **Consolidating the two into the
+      bridge is the right follow-up; a second copy was not worth adding inside an unrelated change.**
+    - **⚠ THE COST IS INVISIBLE IN ORDINARY DATA, so two INSTRUMENTS ship** (the `fabricator_wait`
+      precedent): `fabricator_demo_eager` (no schema) and `fabricator_demo_lazy` (declared) each yield one
+      row — how many times its own factory ran before this invocation. Read twice, the DELTA is the
+      invocations one bound scan costs. MEASURED **eager 1,3 (delta 2); lazy 0,1 (delta 1)** — the leading
+      **0** is the whole claim. Same mechanism both sides, so baseline and fix come from ONE comparison.
+      Mutation-tested: ignoring the declaration turns that 0 into a 1.
+    - **⚠ A LATER DIRECTION, RECORDED NOT BUILT (user, 2026-09-01): the REPLACEMENT SCAN mechanism will want
+      revisiting, and the shape it likely needs is a LOOKUP function plus a SCHEMA function rather than eager
+      per-name registration** — the host asking "do you have a source called X, and what is its schema"
+      instead of the provider enumerating every name up front, which the current dictionary cannot express
+      for a large or dynamic source set. The declared-schema overload is a STEP TOWARD it rather than a
+      detour: it already separates *what the columns are* from *producing the data*, which is exactly the
+      split a lookup+schema pair formalises. Revisit both together.
+  - **✅ AND IT GREW A SIBLING THE SAME DAY: `fabricator_host_exec(sql)` (user-proposed, C++-only, no ABI)**
+    — one `BIGINT` column, `affected`. **It exists BECAUSE of the fallback above**: `host_query` must declare
+    its output columns at BIND, which for arbitrary SQL means preparing the statement, which DuckDB cannot do
+    for several statements in one string nor when a later statement's schema depends on an earlier one's
+    effects. exec's schema is FIXED, so it describes nothing, prepares nothing, and **runs its SQL EXACTLY
+    ONCE whatever it is** — measured: `'CREATE TABLE t AS SELECT 1 AS c; INSERT INTO t VALUES (2)'` FAILS
+    through host_query and yields 2 rows through exec. That contrast is the assertion that justifies the
+    function.
+    - **⚠ THE COUNT IS ASKED OF THE STATEMENT** via DuckDB's own `StatementReturnType::CHANGED_ROWS`, NOT
+      inferred from column types — so a `SELECT` returning one BIGINT does not get its first value mistaken
+      for a count. Mutation-tested: the type-inference shortcut dies at the DDL assertion.
+    - **⚠ A CTAS REPORTS 0 THOUGH IT CREATED ROWS** — DuckDB does not classify CREATE as a row-count
+      statement, and 0 also matches `Host.ExecuteNonQuery`'s existing contract ("DML → a 1-row BIGINT Count;
+      DDL → 0"), so the SQL surface and the C# one agree. Pinned WITH that reason, because it reads as a bug
+      otherwise. For several statements the count is the LAST one's (`SendQuery` returns the last result).
+    - **⚠ THE RESULT IS NORMALISED, NOT PASSED THROUGH.** Whatever the statement returns is discarded.
+      Without that the fixed schema would be a LIE — a `SELECT` would declare one BIGINT and deliver
+      something else, and the scan reads batches through converters built from the DECLARED schema.
+    - **⚠⚠ IT SHIPS AS BOTH A TABLE FUNCTION AND A SCALAR UNDER ONE NAME (the scalar added the same day,
+      user-directed, for symmetry with `fabricator_exec`). MEASURED that DuckDB PERMITS this** — a scalar and
+      a table function live in different catalog sets, so each resolves in its own syntactic position and
+      neither shadows the other. Pinned, because it is not obvious and a change would make one spelling
+      silently stop resolving. Both go through ONE execution path (`RunHostExec`), so the count rule, the
+      session handling and the error prefix cannot drift.
+      - **⚠ PREFER THE TABLE FORM FOR DDL, and the reason is measured.** The scalar is `VOLATILE` and that
+        is LOAD-BEARING: without it DuckDB constant-folds over constant arguments at PLAN time, so
+        `EXPLAIN SELECT fabricator_host_exec('INSERT …')` performs the insert for a statement that executes
+        nothing — mutation-tested, dropping the volatility makes exactly that assertion read 1 instead of 0.
+        **What volatile does NOT prevent is PER-ROW evaluation**: `… FROM range(3)` performs three inserts.
+        The table form runs once per scan whatever the cardinality.
+      - **⚠ MEASURING THE PER-ROW HAZARD NEEDS AN AGGREGATE THAT CONSUMES THE COLUMN, and my first probe
+        was VOID for exactly the reason this file already records.** With `count(*)` DuckDB PRUNES a
+        projected column no aggregate reads, so the scalar was evaluated ZERO times and the probe "showed"
+        no per-row execution — the opposite of the truth, while passing. `sum()` reads the value; three
+        evaluations, three rows. Fourth appearance of that trap in this file.
+      - ⚠ A NULL statement yields NULL, not 0 — "no statement" and "zero rows affected" are different
+        claims, and the gate says so.
+  - **⚠⚠ BUILDING IT EXPOSED A USE-AFTER-FREE IN THE host_query FIX ITSELF, WHICH BOTH GREEN TIERS HAD
+    ALREADY PASSED.** `ClientProperties` holds an `optional_ptr<ClientContext>` that `ToArrowSchema`
+    dereferences, and the schema_factory captured props derived from a `describe_conn` DESTROYED at the end
+    of the enclosing block — before `PopulateReturnSchema` calls the factory. It surfaced only because
+    host_exec used a DEFAULT-constructed `ClientProperties`, whose unset pointer fails LOUDLY
+    ("Attempting to dereference an optional pointer that is not set"); the dangling one had been silent.
+    Both factories now OWN their connection for the stream's life. ⚠ Third instance of this file's standing
+    rule that a use-after-free is invisible on the platform you develop on — here it was invisible on all of
+    them, and an unrelated crash is what found it.
+  - **⚠ ONLY A COUNTING ASSERTION CAN SEE THIS.** Every "the rows are right" test in `verify_host_query`
+    passed with the defect fully present — which is how it survived, and the same reason
+    `verify_raw_query` had to be written for `fabricator_query`.

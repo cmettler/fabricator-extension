@@ -1625,3 +1625,318 @@ propagates out → fails the statement → DuckDB rolls it back. This is the pro
       plain `SqlBulkCopy` path on a no-MARS engine remains broken inside an explicit transaction, and
       `SET mssql_materialize='false'` remains its workaround (measured above).
 
+## Appendix — records moved verbatim from CLAUDE.md (2026-09-18)
+
+CLAUDE.md carried these as-built records inline until it grew to 10,776 lines — a file loaded into every
+session's context. They are moved here VERBATIM; CLAUDE.md keeps each entry's summary head plus a pointer to
+this section. The one edit made on the way: a link that pointed into the docs directory is rewritten relative
+to this directory, so it still resolves from here.
+
+- **⚠ A PINNED SCAN FEEDING A SAME-CATALOG BULK WRITE IS BROKEN WHENEVER MARS IS OFF — mapped 2026-08-10,
+  then largely FIXED by the bulk deferral the same day. The settings × engine × statement matrix (11 rows,
+  every one measured live) is [docs/transactions.md](transactions.md) §5.6a, which also holds this
+  entry verbatim in its Appendix (2026-08-23).** Symptom on Fabric: `BEGIN; INSERT INTO wh.t …; CREATE TABLE
+  wh.u AS SELECT … FROM wh.t; COMMIT;` dies after ~30 s with `Execution Timeout Expired` or an SSL/TLS
+  handshake failure, and the aborted transaction then reports the far less helpful `208: Invalid object
+  name`.
+  - **MARS IS THE WHOLE STORY.** The bulk's consumer called `WriteToServer` as soon as it started, so the
+    scan's reader and the load held the pinned connection CONCURRENTLY by construction; MARS is what lets
+    them coexist. **⇒ `SET mssql_mars='false'` REPRODUCES IT ON BOX in under a second with 15 rows**, which
+    is what makes it a service-tier gate — and its absence is why the hazard had only ever been seen on
+    Fabric.
+  - **✅ THE FIX: `BulkSession`'s consumer WAITS for the first batch OR end-of-stream before touching the
+    backend**, so the load always acquires SECOND. **The failure was at ACQUISITION, not release**, and
+    whoever asks second loses — measured in BOTH directions (*"There is already an open DataReader"* when the
+    scan asked second, *"does not support MultipleActiveResultSets"* when the load did), plus a 30 s timeout
+    when the loser waits. Two of my explanations before that were wrong.
+    - **⚠ IT MUST BE "BATCH **OR** COMPLETION", NEVER "BATCH"** — a zero-row source completes the channel
+      without ever writing, so waiting for a batch alone hangs forever on a shape that still has to CREATE
+      the table.
+    - **AND IT MADE READ-YOUR-WRITES REACHABLE WITHOUT MARS**, which this file twice recorded as impossible:
+      `mssql_mars='false'` + `mssql_materialize='true'` went **0 of 8 → 8 of 8** with the CTAS seeing its
+      own uncommitted rows (15 vs the pooled default's 10).
+  - **⚠ I FIRST RECORDED THE OPPOSITE OFF ONE RUN.** Box was written into the matrix as ✅ ("drains in ~1 ms
+    and wins the race"), with a whole latency-race model on top. The byte-identical script then gave 0/8.
+    The mechanism IS a race — box just does not reliably win it either, and **the single green run was the
+    rare outcome promoted to a fact.** A flaky failure sampled once is indistinguishable from a pass.
+  - **⚠ CTAS AND INSERT DIVERGE ON IDENTICAL SETTINGS** — the CTAS's scan logs `pooled`, the INSERT's logs
+    `pinned`, because the routing turns on whether the transaction's connection EXISTS YET when the scan
+    starts, and the two operators initialise their sink in a different order relative to the source. So a
+    marked scan pins or pools by statement KIND, which no setting expresses.
+  - **⚠ `read_isolation='snapshot'` DOES NOT RESCUE IT and makes it worse** (its whole job is to route the
+    read onto the transaction's connection, which is exactly what must not happen while a bulk holds it).
+    `SET mssql_materialize='false'` DOES make it run — and silently changes the answer (10 rows where 15
+    were expected), trading a loud hang for a quiet wrong result.
+  - **⚠ THE "REAL FIX" — HOISTING THE SINK'S DDL INTO `begin_bulk` — WAS BUILT, MEASURED AND REVERTED. Do
+    not rebuild it without reading this.** The ordering premise was CORRECT and is measured (`ddl 15.101 →
+    scan 15.368`, and the 30 s timeout became an immediate self-explanatory error). It broke a shape that
+    WORKED, through a side effect nothing in the design predicted: `PrepareBulkTarget` must call
+    `BeginWrite()` to get the transaction's connection, which MATERIALISES that connection EARLIER — so a
+    marked scan then finds one to pin to where it previously went POOLED. **⇒ the scan's ROUTING is a hidden
+    dependency of WHEN the connection is first opened**, which is invisible from the call site and exactly
+    the coupling a "pure ordering fix" is assumed not to have.
+  - The staged `COPY INTO` path never meets the hazard at all (its scan streams POOLED and its load is a
+    separate statement after the scan has finished), and is also ~6x faster than TDS.
+
+In-flight / planned refactors (all C#-only unless noted; tests stay green per slice):
+
+- **THE SAME-CATALOG READ+WRITE MARK NAMES THE SINK — the PROVIDER decides (2026-08-10, C++ + C#, no ABI
+  bump). Full record: [docs/transactions.md](transactions.md) §5.9.** The host emitted
+  `"materialize":true`; it now emits `"sink":{"schema","table","kind"}` and `SinkRequiresDrainedScan` answers
+  on the provider side. Presence alone carries what the boolean said (`ScanSpec.HasSink`).
+  - **⚠ IT IS A FIX, NOT A TIDY-UP — MEASURED.** `INSERT INTO <SQL Server external table> SELECT … FROM <same
+    catalog>` drained **200 000 rows** into memory to protect against a `SqlBulkCopy` that never runs: an
+    external table's INSERT routes to STORAGE. After: the `mssql scan: drained to memory` mark is ABSENT, the
+    write still shows `delta bulk: streamed to files`, and the same 200001 rows land. The drain has no spill
+    (~1 byte of working set per byte of result), so this was the whole source buffered for nothing.
+  - **⚠ THE QUESTION IS "DOES THE DRAIN BUY ANYTHING", NOT "IS A BULK LOAD COMING" — and getting that wrong
+    would have been a silent regression.** With MARS OFF an ordinary scan reaches the pinned connection ONLY
+    via the drain, so dropping it there costs READ-YOUR-WRITES on the SOURCE and, where this transaction has
+    written that table, converts a working statement into limitation 1.15's refusal. Hence
+    `if (!_marsEnabled) return true;` BEFORE the external check. Verified both ways on one shape: **MARS on ⇒
+    0 drains, MARS off ⇒ 1 drain**, both landing 200001 rows.
+  - ⚠ Restricted to `kind = "insert"` — a CTAS/replace over an external table is not the storage-write shape
+    (`BulkInsert`'s own guard is `!createTable && !replace`). Cost is nil: `DetectExternalTable` is cached and
+    returns null immediately on a warehouse engine, and `BulkInsert` makes the same call moments later.
+  - **⚠ WHAT IS NOT GATED, and the honest split.** `verify_mssql_s3_polybase` 252 → **263** pins the RESULT of
+    the INSERT-SELECT shape — which NOTHING covered before, because every earlier external INSERT in that
+    suite is `INSERT … VALUES` and so has no scan to mark. It does NOT assert the streaming (invisible from
+    SQL). **The dangerous direction already has a gate**: streaming a scan whose sink really does bulk-load
+    fails `verify_read_write_same_catalog` with 595 at its 30k+ sections.
+  - ⚠ Adding rows to that suite broke a LATER count of the same Delta location (3 → 5). A suite that re-counts
+    a shared location downstream is not append-safe; check for later assertions on the same object.
+  - **The sink is SINGULAR by construction** — DuckDB gives a plan one sink and MERGE INTO's operators all
+    address one target; the READ set needs no transport, since each scan already passes its own `touchKey`.
+
+- **THE FABRIC `COPY INTO` LOAD PATH — BUILT 2026-08-10 as an OPT-IN (`mssql_copy_into_staging` / the
+  `copy_into_staging` ATTACH option; C#-only, no ABI). Full record:
+  [docs/transactions.md](transactions.md) §5.9.** Name a storage location this extension may stage
+  temporary parquet in and a bulk write on a WAREHOUSE engine writes it there with DuckDB's own parallel
+  writer (`COPY … TO <dir> (FORMAT parquet, PER_THREAD_OUTPUT true)`), then loads the folder with ONE
+  `COPY INTO` — the rows never cross TDS. New: `Fabricator.Bridge/OneLakeStagingLocation.cs`,
+  `Fabricator.Bridge/HostParquetStaging.cs` (provider-agnostic), `Fabricator.SqlServer/WarehouseCopyInto.cs`.
+  - **THE LOCATION IS THE SWITCH, and there is deliberately NO size threshold.** There is no defensible
+    default for "where may this extension write temporary files", so the option that names it is the opt-in.
+    A threshold would need the row count, which is unknown until the stream has been consumed — and
+    `COPY INTO` costs seconds of fixed overhead, so guessing wrong on a small INSERT is a pessimisation.
+  - **⚠ THE COLUMN LIST IS NEVER OMITTED — correctness, not clarity.** Without one, `COPY INTO` maps source
+    fields to target columns **by ORDINAL**, so an INSERT whose stream is ordered differently from the table
+    loads every value into the wrong column and SUCCEEDS. Naming the columns in the stream's own order makes
+    the ordinal and by-name readings agree, since the staged parquet is written in that order.
+  - **⚠ A HIDDEN STAGING SEGMENT FAILS SILENTLY, so it is REFUSED AT ATTACH.** `COPY INTO` SKIPS files
+    beginning `_` or `.` — a root like `Files/_stage` stages perfectly, the load succeeds, and NOTHING is
+    inserted. Same for a lakehouse `Tables/` root (loose parquet there surfaces as a broken managed table).
+    ⚠ **The `Tables/` check tests the SECOND path segment**: on OneLake the FILESYSTEM is the workspace, so
+    the path reads `<item>/<area>/…`. My first version tested segment 0, never fired, and its own offline
+    test is what caught it — the same payoff `FabricSqlEndpointHost`'s tests gave on their first run.
+  - **⚠ It runs on the SAME connection and transaction `SqlBulkCopy` would have used**, so an explicit
+    `BEGIN … ROLLBACK` still governs it. A separate connection — the original sketch — would commit the load
+    independently of the DuckDB transaction, i.e. a behaviour change dressed as an implementation detail.
+    ⚠ Whether Fabric permits `COPY INTO` inside an explicit transaction is **UNMEASURED**; the reference is
+    silent on it.
+  - **⚠ `KeepIdentity` has NO `COPY INTO` equivalent** ⇒ refused, naming the way back (explicit IDENTITY
+    values would otherwise be replaced by engine-generated ones). `checkConstraints` needs no guard: a
+    warehouse enforces no CHECK or FOREIGN KEY constraint at all, so that flag is already vacuous there.
+  - **⚠ Configured on an engine with no `COPY INTO` it is IGNORED, not refused** — a `SET` spans every
+    catalog in the session, so a dbt project attaching Fabric beside box must not have its box writes fail
+    on a setting never aimed at them. The ATTACH option is parsed before any connection exists, so the
+    engine is not yet known there either.
+  - **✅ VALIDATED LIVE 2026-08-10** (Fabric `Test Warehouse`, SP auth): a 50 000-row CTAS staged to OneLake
+    and loaded, every value correct (`count 50000`, `sum(a) 1249975000`, `sum(c) 1874962500.0`, `min(b) v0`).
+    **Both defects it found were invisible to reading:**
+    - **⚠ ON ONELAKE THE WORKSPACE AND ITEM MUST BE GUIDs — and the two spellings differ ONLY at the far
+      end.** A display-name root stages parquet perfectly (our writer resolves names) and the `COPY INTO`
+      then fails with **`13840: Access token couldn't be fetched for storage path '…' as it's an unsupported
+      URL or cause of a transient error`** — naming neither names nor GUIDs, and reading like a permissions
+      problem. The byte-identical GUID path loads. In hindsight the reference said so: its example is
+      `…/<workspaceId>/<lakehouseId>/Files/`, `Id` in both placeholders. **Now refused at ATTACH**, naming
+      the GUID form and `fabric.workspaces()` / `fabric.items()`. Resolving names ourselves is possible
+      (`FabricApiClient` does it for the `fabric.*` functions) and deliberately not done — it would cost a
+      REST listing at ATTACH and a Fabric credential on a path that has neither.
+    - **⚠ `RemoveDirectory` IS UNIMPLEMENTED ON abfss ⇒ every load LEAKED its staged parquet** on the one
+      platform this runs on. Fixed with a per-file glob-and-remove fallback — **the same shape
+      `DeltaCatalog.RemoveTableFolder` already needed** for `DROP TABLE` on abfss and s3, whose comment even
+      names abfss. **The precedent was in the tree the whole time; the leak was found by RUNNING the
+      feature, not by reading for it.**
+    - Incidentally: a failed load leaves **NO table** (`sys.tables` = 0 after the 13840 failure), so the
+      CTAS's CREATE rolls back with it — unlike the Delta CTAS's two commits (limitation 1.5).
+  - **THE DRAIN IS NARROWED AND STREAMING IS THE DEFAULT HERE (2026-08-10, MEASURED — user-prompted).** A
+    same-catalog 1M-row CTAS on Fabric: streaming **14.5 / 15.3 / 15.4 / 16.1 s** vs drained **16.8 / 17.4 /
+    28.9 s** (no overlap between the sets), ~27% less CPU (4.5 s vs 6.2 s user) and **484 MB of allocation
+    avoided**. Draining serialises the SQL read and the parquet write; both legs are network-bound.
+    - **⚠ THE DRAIN WAS BUYING NOTHING IN THAT SHAPE — sharper than "it was slower": BOTH legs logged the
+      scan as `pooled`.** On an autocommit CTAS the transaction's connection does not exist yet when the
+      scan starts, so `materialize` had nothing to pin to and bought neither read-your-writes nor 595
+      protection, only the copy.
+    - **⚠ IT NEVER DRAINS, AND SURRENDERING READ-YOUR-WRITES IS A DELIBERATE PRODUCT DECISION (user,
+      2026-08-10), not an oversight.** A staged load is chosen for BULK — the point is to move bytes, not to
+      observe this transaction's own uncommitted rows — so the scan reads a committed snapshot and streams.
+      MEASURED inside an explicit transaction that had just written the source: **0 drains, 0 failures, every
+      query pooled, 10 rows** (the committed state; the 5 uncommitted rows are deliberately invisible).
+    - **⚠ AN INTERMEDIATE VERSION DRAINED WHEN THE TRANSACTION HAD WRITTEN THE SCANNED TABLE, and removing it
+      was not just simplification — it was ACTIVELY HARMFUL.** Draining pins the scan onto the WRITE
+      connection, where it collides with the sink's own `CREATE TABLE` (issued from the bulk's BACKGROUND
+      thread) on a no-MARS engine: 30 s hang, dead transaction. Measured both ways — drained ⇒ hang,
+      streaming ⇒ commits. ⚠ That collision is PRE-EXISTING and not ours (the same shape fails identically
+      with no staging, on the plain `SqlBulkCopy` path), so this does not FIX it, it declines to walk into it.
+    - ⚠ It needs no `mssql_materialize='false'`: that setting reaches the same place by another route
+      (`snapshotRead`, pooled at SNAPSHOT) and is the workaround for the NON-staged path.
+    - `PooledScanSelfBlockReason` / `TransactionHasWritten` survive the removal as a factoring of
+      `EnsureScanCannotSelfBlock` — worth keeping, since the refusal still needs exactly that question.
+  - Gate `test/verify_copy_into_staging.test` (**30**, service tier), **mutation-tested with two mutants,
+    each killed at its own section**. ⚠ **The load itself is in NEITHER CI tier** — no engine the service
+    tier can reach has `COPY INTO`, so the positive leg is manual against live Fabric, like `verify_dax`.
+    §2 pins the thing that IS assertable: a valid Fabric staging location on a BOX attach changes nothing.
+    ⚠ Its COPY leg needs `(FORMAT mssql)` — a bare `COPY … TO '<string>'` is a FILE target in DuckDB, so
+    without it the statement writes a CSV named after the table and succeeds.
+
+- **CROSS-STATEMENT READ STABILITY — BUILT 2026-08-09 as an OPT-IN (`mssql_read_isolation` / the
+  `read_isolation` ATTACH option; C#-only, no ABI). Full record: [docs/transactions.md](transactions.md)
+  §5.8.** `BEGIN; SELECT count(*) FROM t; SELECT count(*) FROM t; COMMIT;` used to return DIFFERENT answers
+  under a concurrent committer with **no setting that changed it**. MEASURED: unset **3 → 4**, `'snapshot'`
+  **4 → 4** while the writer committed a fifth row (its own count is the control).
+  - **⚠ OPT-IN IS A REQUIREMENT, NOT A DEFAULT POSITION (user, explicit).** It holds a connection AND an open
+    transaction for the DuckDB transaction's life — pool pressure under `dbt --threads N` — plus a tempdb
+    version store growing for that duration under SNAPSHOT. Never inferred, never on by observation.
+  - **⚠ IT DELIBERATELY DID NOT REUSE `isolation_level`.** That option exists and today scopes table-in-out
+    sessions only, so widening it would have switched this on for everyone who had ever set it — inferring the
+    cost above from an unrelated past request.
+  - **(a) A READ now creates the pin** (`EnsureTxnConnection`, factored out of `BeginWrite`). That was the
+    whole problem: on Fabric a pinned transaction at transaction-scoped SNAPSHOT already existed on every
+    write transaction and delivered nothing, because ordinary reads never routed onto it.
+  - **(b) ONE resolver picks the level** (`ResolveTxnIsolation`), used by the read pin AND `BeginWrite`. With
+    two, the level would depend on whether a READ or a WRITE touched the catalog first — opened once by
+    whichever came first, silently keeping that level.
+  - **(c) ⚠ ON A NO-MARS ENGINE, DRAINING IS NOT ENOUGH — found by measurement, not design.** Two scalar
+    subqueries over one table start in the **same millisecond on two threads**, so the second `ExecuteReader`
+    lands while the first is still draining: *"The connection does not support MultipleActiveResultSets"*. It
+    needs a per-transaction `ExecGate` serializing execute+drain as well. So on Fabric/Synapse the opt-in
+    trades streaming multi-ref reads for consistency — they are mutually exclusive there.
+  - **⚠ EXEMPTING A CHECK MUST BE PAID FOR BY GUARANTEEING THE CONDITION IT CHECKED FOR.** The opt-in makes
+    the §5.5 MARS-off precheck stand down (a read on the transaction's own connection cannot wait on that
+    transaction's locks), so the routing sets `pinned` DIRECTLY instead of going through the `materialize`
+    gate below it — routed that way, a later change to that gate would send the scan POOLED with the check
+    already disabled, which is limitation 1.15's **unbounded hang**, not an error. It is also now a FOURTH
+    remedy in 1.15's message, by a different mechanism than the other three: it does not make the pooled read
+    safe, it stops the read being pooled.
+  - **⚠ THE PROBE IS GATED ON THE OPT-IN, NOT ON THE LEVEL.** `DefaultWriteIsolation` is `"snapshot"` on
+    Fabric/Synapse-serverless, so checking `ALLOW_SNAPSHOT_ISOLATION` whenever the level is Snapshot would add
+    a round trip to EVERY write transaction on the one engine where snapshot is the only level there is.
+  - Refusals, both because the alternative is a silently wrong view: a bad level fails the **ATTACH** (not the
+    first `SELECT`, by which point the failing statement mentions nothing about isolation), and
+    `mssql_materialize=false` + `mssql_read_isolation` is refused as contradictory.
+  - **✅ VERIFIED LIVE ON FABRIC 2026-08-09 — the last open question of §5.2/§5.4 is CLOSED.** Fabric
+    Warehouse, SP auth: control **3 → 4**, opt-in **4 → 4** while a second process committed a fifth row
+    (table held **5** while both reads returned 4), both reads logging `pinned txn=3` — two reads on ONE
+    Fabric connection, impossible through our routing before this option. So the documented transaction-scoped
+    SNAPSHOT does hold through us.
+    - **⚠ On Fabric the option's VALUE changes nothing — its whole effect is the PINNING.**
+      `DefaultWriteIsolation` is already `snapshot` there, so this is the cleanest evidence that (a) was the
+      substance and (b) bookkeeping.
+    - ⚠ The window must be LONG (a Fabric connect costs seconds, so the writer needs room to land inside);
+      a 40 s `WAITFOR DELAY` was used, and **`WAITFOR DELAY` IS supported on Fabric Warehouse**.
+  - **⚠ FOUND WHILE RUNNING IT, UNRELATED — full catalog ENUMERATION WAS BROKEN on that Fabric
+    Warehouse** — `duckdb_tables()` / a cache refresh failed with *"15871: 'managed_delta_table_forks' is not
+    supported"*. **Targeted access was unaffected**
+    (`SELECT … FROM w.dbo.t` and `fabricator_exec` DDL/DML all worked), which is why the isolation
+    experiment could still run. **✅ DIAGNOSED AND FIXED 2026-08-25, and it was OURS rather than Fabric's:**
+    `TablesSql` joined `sys.tables`/`sys.views` to `sys.schemas` with NO schema predicate while `SchemasSql`
+    one line above it had one, so the `sys` schema's seven Fabric-internal views were listed and one of them
+    cannot be described. Full record in the top-level entry under "Next up". ⚠ The lesson from the sixteen
+    days it sat here: **"a Fabric-side object our discovery SQL trips over" named the SYMPTOM and quietly
+    assigned the CAUSE to the other side, which is why nobody looked** — the object was real, and the reason
+    we were asking about it was ours.
+  - Gate `test/verify_read_isolation.test` (**47**, service tier), mutation-tested with three mutants each
+    killed at its own section. ⚠ **The headline property is NOT in it** — proving it needs a concurrent writer
+    and sqllogictest drives connections sequentially; what it pins is the ROUTING, via the sharp observable
+    that with MARS off a self-written table is unreadable unless the read joined the transaction. The third
+    mutant (drop the `ExecGate`) survives **40 assertions** before the concurrent-scan section catches it.
+  - ⚠ **The suite ALTERNATED pass/fail before its ATTACH order was fixed**, and the cause is worth knowing
+    generally: two attaches of ONE database each keep their own catalog cache, so a table created through the
+    first is invisible to a cache the second populated earlier. A failing run never reached its `DROP`, so the
+    next run's discovery found the leftover table and passed.
+
+- **A SINGLE STATEMENT IS NOT A READ-CONSISTENCY BOUNDARY EITHER, on box without RCSI — MEASURED 2026-08-09,
+  12 trials. Full record: [docs/transactions.md](transactions.md) §5.7; limitation 1.17.** One statement
+  referencing a table twice reported **150000 and 155000**, and a single scan returned a FRACTION of one
+  committed transaction (**2036 / 2376 / 3770** of 5000 rows).
+  - **⚠ PINNING DOES NOT BUY IT, and I recorded the opposite from ONE run before repeating.** The first pinned
+    trial came back consistent; three trials then diverged 3/3. MARS is interleaved-serial, so the scans share
+    one SESSION while each stays its own server STATEMENT, and READ COMMITTED is scoped to the statement.
+  - **⚠ IT IS NOT THE `materialize=false` OPT-OUT** — a plain `SELECT` is never marked by
+    `MaterializeOwnScans` (called only from `PlanInsert`/`PlanCreateTableAs`), so this is the DEFAULT
+    configuration; §5.6 had framed the question that way and was wrong.
+  - **RCSI fixes it 6/6, both routings**, including a 12.4 s scan that ignored a commit landing 2.7 s into it.
+    A DATABASE option — nothing here selects it, and `materialize=false` demands the OTHER prerequisite.
+  - Method, reusable: the two subqueries must project **different columns** or the common-subplan optimizer
+    dedups them into one scan and the measurement is vacuous; a **self-join cannot show it** (a hash join
+    drains its build side before the probe opens — no held window); and the ASYMMETRIC projection is what
+    creates the window at all (154 ms vs 12.4 s), because equal scans start in the same millisecond.
+  - **⚠ FABRIC IS IMMUNE — MEASURED LIVE 2026-08-09, and it FALSIFIED the derivation the matrix used for three
+    cells.** The same shape returns **155000/155000** there, with the commit PROVEN inside the window (writer
+    server time `22:37:22.66`→`23.70`; reader's fast scan released `22:37:11.2`, slow scan `22:37:47.4`) and
+    the table going 155000 → **160000**. Both scans were `pooled` on two connections at the same millisecond,
+    i.e. §5.6 row 5 exactly. **The axis is VERSIONED-vs-not, not pooled-vs-pinned**: two connections are fine
+    when reads are versioned (their snapshots are taken at the same instant), and one connection does not save
+    you when they are not. The matrix's ❌ for rows 3–5 came from "separate connections ⇒ separate snapshots"
+    and was wrong; rows 4 and 5 are now ✅ and row 3 splits by engine.
+  - **⚠ ROWS 3 AND 4 MEASURED AS ONE A/B (box), each leg the other's control.** One statement,
+    `INSERT INTO dst SELECT (SELECT count(a) FROM src), (SELECT count(pad) FROM src)` — both scans MARKED
+    because `src` is in the sink's own catalog — with a writer committing mid-statement, run twice:
+    `materialize=false` ⇒ **150000/150000 AGREE**; `materialize=true` ⇒ **155000/160000 DIVERGE**. Only the
+    flag differs, so the difference is attributable — **and that is what PROVES the false leg took the
+    SNAPSHOT route**, since nothing logs the `SET TRANSACTION ISOLATION LEVEL SNAPSHOT` (separate unlogged
+    command) and its absence from the log proves nothing.
+    - ⚠ **Incidental, and it contradicts an assumption in the 595 story: the marked scans logged `pooled`,
+      not `pinned`** — the scalar subqueries execute BEFORE the INSERT sink initialises, so the bulk session
+      has not pinned yet. Row 3's "pinned" describes the `INSERT … SELECT … FROM t` shape 595 is about. The
+      verdict is unaffected (pooled and pinned READ COMMITTED are both unversioned), but **which connection a
+      marked scan uses is per-plan-shape and should be checked, not assumed.**
+  - No gate: it is the database's behaviour, not ours, and sqllogictest runs connections sequentially.
+
+- **READ+WRITE OF ONE CATALOG IN ONE STATEMENT FAILED ON BOX AT SCALE — FIXED 2026-08-08 (C++ + C#, NO ABI
+  bump). `INSERT INTO t SELECT … FROM t` raised `595: Bulk Insert with another outstanding result set
+  should be run with XACT_ABORT on`.** Full record: [docs/transactions.md](transactions.md) §5.1.
+  Cause: the bulk session pins the connection at operator INIT, before the scan streams, so with MARS on the
+  scan reuses that connection and the bulk copy starts with the reader still open.
+  - **⚠ SIZE-DEPENDENT, WHICH IS WHY EVERY SUITE WAS GREEN.** Measured on a `(INTEGER, VARCHAR)` row:
+    **500 → 20k rows PASS; 30k / 50k / 75k / 100k FAIL.** Below ~one buffered result the scan drains first
+    and nothing collides. **A read+write test at "a few rows" asserts nothing about this.** Fails in
+    AUTOCOMMIT too, not just inside `BEGIN`.
+  - **⚠ MARS IS NOT WHAT SAVES US, IT IS WHAT BREAKS US** — and this reverses the obvious reading. The
+    pooled-scan routing we do only BECAUSE Fabric/Synapse lack MARS is the correct half: Fabric returned
+    **200000/200000** at the same 100k seed while box failed.
+  - **⚠ TWO OBVIOUS FIXES ARE MEASURED WRONG.** `READ_COMMITTED_SNAPSHOT ON` changes NOTHING (595 fires
+    identically — snapshot isolation fixes readers BLOCKING writers, and nothing here blocks; a lock
+    conflict would be a wait or 1205). `SET XACT_ABORT ON` is **VOID, not negative** — it was never
+    established that the SET reached the connection the bulk used.
+  - Fix: `FabricatorCatalog::MaterializeOwnScans` walks the physical plan in `PlanInsert`/`PlanCreateTableAs`
+    and marks fabricator scans whose table belongs to THIS catalog; the mark rides `spec_json` as
+    `"materialize":true` (free-form ⇒ no ABI bump); `SqlServerBackend` drains **and disposes** the reader.
+    - **⚠ THE DISPOSE IS LOAD-BEARING, NOT THE BUFFERING** — `DbDataReaderArrowStream` closed its reader only
+      in `Dispose()`, and the scan releases its Arrow stream in the global state's DESTRUCTOR (query
+      teardown, not pipeline end), so a merely-BLOCKING plan operator would leave a drained-but-OPEN reader,
+      which SQL Server still counts as outstanding.
+      - **⚠ SUPERSEDED 2026-08-09 — THE STREAM NOW RELEASES AT END OF RESULT SET** (see the eager-close entry
+        below). **This fix is unaffected**: here the scan and the bulk are PIPELINED, so the reader is open
+        *while* the bulk consumes it and no eager close can reach it. What changed is the deferred design —
+        a blocking operator is now sufficient ON ITS OWN.
+    - **Both payoffs from one change**: box stops failing AND, since a drained scan leaves no outstanding
+      reader, it may use the PINNED connection without MARS ⇒ **read-your-writes RESTORED on Fabric**
+      (measured 8 / `selfcopy 4`, was 7 / 3).
+    - **Ours is NARROWER than upstream's**: `MaterializePostgresScans`/`MaterializeMySQLScans` match the
+      function NAME and so materialise every scan of their type — including one from a DIFFERENT attached
+      database. We match bind-data type **plus catalog identity**, so another catalog's scan keeps streaming.
+    - Provider-agnostic: only `SqlServerBackend` reads the flag; Delta/DAX/DeltaRs parse the spec and ignore
+      it, which is right — a provider holding no connection has nothing to collide.
+    - **`max_threads = 1` is NOT needed** though postgres sets it: ours already declares
+      `MaxThreads() { return 1; }` ("a single Arrow C stream is consumed serially"). Checked, not assumed.
+  - ⚠ **COST: the whole source is BUFFERED IN MEMORY, no spill.** Parity with postgres/mysql (neither
+    spills — both just tell the client library to buffer), but it trades a hard failure at scale for a
+    memory cost at scale, and the ceiling is UNMEASURED. Better design, deliberately deferred: a
+    `ColumnDataCollection`-backed operator (DuckDB would spill) **plus** eager close-on-exhaustion — the
+    operator alone was insufficient per the DISPOSE note. **⚠ THE SECOND HALF IS BUILT (2026-08-09), so the
+    operator IS now sufficient on its own** and this is a one-part change that would swap the unbounded
+    in-memory buffer for DuckDB's spilling. Re-priced, not merely still-open.
+  - Gate `test/verify_read_write_same_catalog.test` (**68**, service tier); the small-table control is
+    load-bearing — without it the others could pass by self-insert having stopped working entirely.

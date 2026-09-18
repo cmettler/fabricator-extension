@@ -1972,3 +1972,46 @@ wrong; (3) **tenant-admin APIs are out entirely** — different consent model, d
       timestamp column throws rather than yielding NULLs that look like "the service returned nothing");
       `fab_delta_info` was moved onto it deliberately, because it is the only function on that path with a
       HERMETIC gate. Gate: all **11** service suites over the six kinds green + hermetic 62/5573.
+
+## Appendix — records moved verbatim from CLAUDE.md (2026-09-18)
+
+CLAUDE.md carried these as-built records inline until it grew to 10,776 lines — a file loaded into every
+session's context. They are moved here VERBATIM; CLAUDE.md keeps each entry's summary head plus a pointer to
+this section. The one edit made on the way: a link that pointed into the docs directory is rewritten relative
+to this directory, so it still resolves from here.
+
+- **FABRIC REST API FUNCTIONS (`fabric.*`) — the whole curated set is BUILT; P0/P1/P2 + semantic models +
+  XMLA live-validated, P3 WIRED BUT NOT LIVE (no git-connected workspace / pipeline / mirrored DB on this
+  tenant). Full record: [docs/fabric-api-functions.md](fabric-api-functions.md) — §9c as-built, §9h the
+  SQL Server binding, §9j variable libraries, §9k Spark sessions, §9l the `fabric` schema move, §9m the
+  fan-out verdict per function, §9n the inferred ATTACH options, §10 the API sweep with a verdict per area;
+  the `CLAUDE.md` entry was moved verbatim into its Appendix 2026-08-23.** 51 functions over
+  `Microsoft.Fabric.Api` (+ the Power BI REST half for semantic-model refresh), in their own **`fabric`
+  SCHEMA** on a OneLake Delta attach or a Fabric SQL endpoint attach.
+  - **⚠ THE RULES THAT GENERALISE, worth having before opening the doc:**
+    - **A REST payload accepted with 202 may be SILENTLY IGNORED.** Notebook parameters must ride
+      `executionData.parameters`; the generic top-level `parameters[]` array is accepted and does nothing,
+      so a hand-rolled call looks like it works while the notebook runs on defaults. Proof required reading
+      the values BACK out of the notebook's own output.
+    - **⚠ A SHARED SIDE-CHANNEL READ AFTER N EXPERIMENTS MEASURES ONLY THE LAST.** Two parameter shapes
+      were submitted in sequence and the result file read once — so the ignored shape's output was
+      attributed to BOTH, concluding "neither works". Clear the marker and read PER experiment.
+    - **A GUARD AROUND A CALL RETURNING A LAZY SEQUENCE GUARDS NOTHING** — `PageableResponse<T>` requests
+      during ENUMERATION, i.e. outside the try. Hence `WrapList`, which materialises inside the guard.
+    - **AN AZURE EXTENSIBLE ENUM has an implicit conversion FROM string**, so `cond ? Policy.X : null`
+      infers `string` and throws `ArgumentNullException` at run time. Annotate `(Policy?)null`.
+    - **A `TimestampArray.Builder` DEFAULTS TO MILLISECOND** while our columns declare MICROSECOND — that
+      made EVERY timestamp on 15 hand-rolled sites read as January 1970, through live validation of every
+      affected function, because nobody looked at the times. Build FROM the declared field
+      (`FabricRowBuilder`) instead.
+    - **A "0 rows" ANSWER IS OFTEN IDENTITY SCOPE, NOT ABSENCE** — connections carry their own role
+      assignments, so an SP sees only its own. Do not report absence from an empty list.
+    - **⚠ SP SUPPORT IS PER-API AND THE ERROR NAMES THE WRONG CAUSE**: notebook CREATION, variable-library
+      CREATION and `ResetShortcutCache` all return `FeatureNotAvailable`/`PrincipalTypeNotSupported` for a
+      service principal — the feature IS available, the principal type is not. Everything AFTER creation
+      automates fine, so those stay one-time human actions.
+    - **`status='NotRun'` from a SQL-endpoint refresh means ALREADY IN SYNC, not failure** — a hook
+      asserting `='Success'` fails on a healthy refresh. Assert `<>'Failure'`.
+    - `variable` is declared **CONSISTENT** on purpose (our scalar default is VOLATILE, and a volatile
+      function is never folded, so the default would cost one long-running operation PER ROW); every WRITE
+      function must stay VOLATILE or it may run at bind, once for N rows, or be elided.

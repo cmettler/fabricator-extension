@@ -847,3 +847,196 @@ isolate Apache.Arrow and break every Arrow-typed call).
     - **STILL NOT BUILT**: archive signature/checksum verification (`Hashing` exists in
       `Fabricator.Installer.Core` and nothing consumes it here).
 
+## Appendix — records moved verbatim from CLAUDE.md (2026-09-18)
+
+CLAUDE.md carried these as-built records inline until it grew to 10,776 lines — a file loaded into every
+session's context. They are moved here VERBATIM; CLAUDE.md keeps each entry's summary head plus a pointer to
+this section. The one edit made on the way: a link that pointed into the docs directory is rewritten relative
+to this directory, so it still resolves from here.
+
+- **⚠⚠ `fluid_render` LEFT THE CORE — it is `Fabricator.FluidPlugin` now (2026-09-01, user-directed:
+  "move fluid fluid_render into its own Fluid Plugin"). C#-only, NO ABI change, NO bridge change, and
+  BREAKING for anyone using it: it is OPT-IN. Full record:
+  [docs/plugin-system.md](plugin-system.md) §The FLUID plugin.**
+  - **THE MOVE NEEDED NOTHING NEW.** A plugin contributes global scalars through the same
+    `IBackend.GlobalScalarFunctions` a backend does, so the whole feature is a csproj, an `IBackend` with one
+    function, and deletions. What it REMOVES is the interesting half: `Fluid.dll`, `Parlot.dll` and
+    `TimeZoneConverter.dll` are MEASURED gone from `build/release/extension/fabricator/fabricator`, and
+    [docs/aot-bridge.md](aot-bridge.md)'s risk **R2** (Parlot's compiled mode needs
+    `System.Linq.Expressions`) is RETIRED — dissolved rather than solved, and it returns verbatim the day
+    anyone wants the plugin under AOT.
+  - **✅ IT SHIPS — the BUNDLED ROOT, added the same day (user-directed: "write it into
+    pack-distribution.ps1"). C#-only + PowerShell, no ABI.** `PluginPaths.BundledRelativeRoot` (`plugins`)
+    makes `<managed>/plugins/` a DEFAULT search root and `pack-distribution.ps1` step **2b** builds each
+    bundled plugin and copies its assemblies there.
+    - **⚠⚠ PACKAGING ALONE WOULD HAVE DONE NOTHING, and that is the thing to know before touching this.**
+      `ResolveRoots` returned only `FABRICATOR_PLUGIN_DIR` or `~/.duckdb/fabricator/plugins` — neither is
+      where a payload extracts — so copying the plugin into the artifact without the bundled root would have
+      shipped bytes nobody scans. The payload IS the core loadable plus the managed directory, so inside it
+      is the only place a plugin CAN live.
+    - **⚠ IT DOES NOT CONTRADICT `DefaultRelativeRoot`'s "not under the managed dir" rule; the distinction
+      is OWNERSHIP.** That rule protects a USER-installed plugin, which `dotnet publish` would delete (the
+      2026-08-18 SqlClient mechanism). A bundled plugin is part of the artifact and is rewritten by every
+      pack, so being wiped by a publish is correct. ⇒ **step 2b MUST run AFTER `publish-managed.ps1` and
+      BEFORE the pack**, and a plugin staged earlier is silently absent from the artifact.
+    - **⚠⚠ BUNDLED IS SEARCHED LAST — AND IT SHIPPED THE OTHER WAY ROUND FOR AN HOUR, ON A JUSTIFICATION
+      THAT WAS SIMPLY FALSE. User-found, by asking an unrelated question.** The plugin scan is
+      **FIRST-ROOT-WINS**: `RegisterBackendsFrom(..., refuseCollisions: true)` THROWS on a duplicate provider
+      name, so the later root's copy is reported `rejected` and never overwrites. I had justified
+      bundled-first with `BackendRegistry.Add` being `map[name] = backend`, i.e. last-wins — **which
+      describes the BUILT-IN registration path and not the plugin one** — so as shipped the bundled copy won
+      and a user's install was REJECTED, the exact opposite of the stated intent.
+      - **MEASURED, two roots holding the same plugin: first `loaded`, second `rejected` with "plugin
+        provider name collision".** ⚠ The FIRST run of that probe was VOID and said `loaded 1, rejected 0` —
+        both roots were MSYS `/tmp` paths, which .NET resolves under `D:	mp`, so only one root existed. The
+        tell was `root_missing 1` in the report. Same trap `run-suites.sh` documents for the collide fixture;
+        use `cygpath -w`.
+      - ⇒ **the normal consequence to expect**: installing your own copy of a bundled plugin produces a
+        `rejected` row for the shipped one. Honest, not a fault — and far better than the reverse, which was
+        silent.
+      - **The transferable bit: two registration paths share one `Add`, and only one of them is last-wins.**
+        Reading `Add` alone gives the wrong answer for the plugin path; the flag at the CALL SITE is what
+        decides. Mutation-tested — reversing the order kills exactly one tier-0 test.
+    - **⚠ `FABRICATOR_PLUGIN_DIR` REPLACES the bundled root too, and that is a real footgun kept on
+      purpose**: a user setting it to add their own plugin silently loses `fluid_render`. The
+      alternative — a bundled root surviving the override — would make the HERMETIC tier's plugin set depend
+      on whether anyone had run a pack into that build tree, destroying the property the empty-directory
+      trick exists for. Pinned by its own tier-0 test that says so.
+    - **⛔ AN EXTEND SPELLING (`FABRICATOR_PLUGIN_DIR_EXTEND=1`) WAS PROPOSED AND DECLINED (user, same
+      day). Do not re-propose it as an obvious ergonomic win — the ORDERING FIX is what dissolved the
+      need.** With the user root searched before the bundled one, a plugin dropped in
+      `~/.duckdb/fabricator/plugins` wins over a shipped copy while the other bundled plugins stay present,
+      so the dev/test case needs no variable at all. Extend would have traded the hermetic tier's
+      exclusivity guarantee for something a `,`-separated list already expresses.
+    - The managed dir comes from **the bridge assembly's own location**, NOT `FABRICATOR_MANAGED_DIR`: that
+      variable is an INPUT to `clr_host` and is ABSENT whenever the host used its default (an `fabricator/`
+      folder next to the loaded module) — which is the common case and the one the distribution takes.
+    - **MEASURED end to end**: with `FABRICATOR_PLUGIN_DIR` unset, `fabricator_plugins()` reports
+      `loaded fluid` with its root under the managed dir and render answers. ⚠ My "empty HOME" control did
+      NOT work — .NET reads the Windows known-folder, so `USERPROFILE`/`HOME` did not redirect the user root
+      — and the result is attributable only because that root reported **`root_missing`**, i.e. provably
+      empty. Right answer, wrong control; say which.
+    - Gates: tier-0 `PluginPathsTests` **240 → 244** (floor bumped in `installer-core.yml`) and the
+      distribution smoke **12 → 15 checks** (14 at the move; +1 when slice 1 added `fluid_replacement_query`, whose
+      sqlgen registration is a SECOND path the render check cannot cover). ⚠ The smoke attributes by **ROOT**, not by render working: that
+      session sets no environment variables, so the per-user root is searched too and a developer with Fluid
+      installed there would make a bare "does render work" check pass on an artifact shipping nothing.
+  - **⚠⚠ THE TRAP EVERY FUTURE PLUGIN WITH A DEPENDENCY WILL MEET, and this build walked straight into it: a
+    LIBRARY does not copy its NuGet closure to the output directory.** `CopyLocalLockFileAssemblies` defaults
+    to FALSE for libraries — package assemblies are materialised only by `dotnet publish`, which is how
+    `Fabricator.SqlServer` got Fluid. **A plugin has no publish step**; its build OUTPUT is what a plugin root
+    points at. MEASURED: the first build produced `Fabricator.FluidPlugin.dll` and nothing else, which loads
+    fine and dies at the first render with a `FileNotFoundException`.
+    - **And the fix summons the opposite hazard.** With it set, `Apache.Arrow` (transitive through
+      Abstractions) is copied too — the "aligned dependency closure" hazard, i.e. a plugin handing the host
+      Arrow types from a second, non-assignable copy. `ExcludeAssets="runtime"` on explicit `Apache.Arrow`
+      **and** `Apache.Arrow.Scalars` references keeps the compile reference and drops the copy. ⚠
+      `ExcludeAssets` does NOT flow to a transitive dependency, so the companion must be named separately.
+  - **⚠⚠ THE FLUID PIN IS A PRERELEASE — `Fluid.Core 3.0.0-beta.7` (2026-09-01, user-directed), because v3.0
+    has no stable package.** ⇒ a bump here is a CODE-COMPATIBILITY question, not a routine version bump, and
+    `verify_plugin_fluid` is what answers it. Go to stable 3.0.0 when it ships. ⚠ Note **2.40.0** also
+    exists — the plugin was created pinned at 2.31.0, i.e. already behind.
+    - **⚠ THE USER FIRST ASKED TO REFERENCE A LOCAL CLONE (`D:
+eposluid`) AND THEN FOUND THE BETA
+      PACKAGE, WHICH IS THE BETTER ANSWER — record why, because the clone will be tempting again.** A
+      sibling-path `ProjectReference` pins NOTHING, no clone but the author's can build it (the exact shape
+      this repo converted engineered-wood and DuckDB.ExtensionKit AWAY from), and the only way to keep CI
+      green would be a conditional fallback to the 2.31.0 package — under which **CI gates a DIFFERENT Fluid
+      than the developer runs**, which is worse than a red tier because it is silent.
+    - **⚠⚠ THE BUMP CHANGED AN ANNOTATION UNDER US AND A COMPILER WARNING IS WHAT FOUND IT.** v3 declares
+      `TemplateContext.SetValue(string, object)` NON-nullable (CS8604 ×2) while its body still maps null to
+      `NilValue.Instance` — read in Fluid's source, so nothing was ever at risk. **But the suite had no
+      assertion either way, and a NULL is ORDINARY here** (a STRUCT field can be NULL; JSON has `null`). The
+      plugin now routes null to the `FluidValue` overload ITSELF rather than depending on that internal
+      branch — an internal null-handling branch is exactly what moves between betas, and silently. Three
+      assertions added (NULL struct field / JSON null / nil is FALSY); MEASURED: all render empty, and
+      `{% if a %}` takes the else branch. Gate 20 → **23**, service floor 3089 → **3092**.
+    - ⚠ The closure GREW: `System.Linq.Async` is a v3 net8.0 dependency. Six assemblies either way.
+  - **⚠ IT IS THE FIRST PLUGIN WITH A PRIVATE PACKAGE CLOSURE, which is why it is worth having in-tree
+    beyond the move.** `Fabricator.SamplePlugin` is pure IL, so nothing had ever exercised
+    `BackendRegistry.InstallPluginResolver` actually LOADING a plugin's own NuGet closure out of the plugin
+    folder — the resolver's only test was the case with nothing to resolve. Fluid pulls SIX assemblies, none
+    of them in the bridge payload any more, so **any successful render IS the closure resolving**.
+  - **⚠ IT REFERENCES `Fabricator.Abstractions` ONLY, and pays ~20 lines for it.** `ArrowValueReader` lives
+    in `Fabricator.Bridge` and `IScalarFunction`'s own doc says it is available "if a provider references the
+    bridge" — a plugin has neither. So the plugin carries a local `ArrowScalar.Read` with the same type
+    coverage. Widening the reference to save the lines would make the in-tree example stop demonstrating the
+    surface the out-of-tree plugins (`fabricator-sustainalytics` and friends) actually have.
+  - **⚠⚠ THE GATE WORK WAS THE REAL COST, and two things had to MOVE rather than be deleted.**
+    `verify_global_functions` is HERMETIC and the hermetic tier points `FABRICATOR_PLUGIN_DIR` at an EMPTY
+    directory on purpose, so a plugin function cannot be asserted there at all.
+    - The nine render assertions moved verbatim to **`test/verify_plugin_fluid.test` (20, service tier)**.
+      The runner gives that ONE suite `build/plugins/fluid` and nothing else, because two of its assertions
+      (exactly one loaded provider; exactly one `fluid_render` registration) say NOTHING with the
+      tier's normal root also in scope. **The single-registration one is what pins the MOVE rather than the
+      behaviour** — a build that merely ADDED the plugin while leaving the first-party copy in place passes
+      every render assertion.
+    - **⚠ `fluid_render`'s `params` was the ONLY ANY-declared non-varargs global scalar parameter in the
+      tree**, so the untyped-NULL-in-ANY regression (the ABI v80 finding: DuckDB exports an Arrow null-typed
+      array with `null_count = 0` and Apache.Arrow refuses it) had no carrier left. Re-homed onto the VARARGS
+      tail — `fabricator_va_concat('-', 1, NULL, 'x')` → `1-NULL-x` — which registers as the same
+      `LogicalType::ANY` and is likewise never cast. **MEASURED before the substitution was made, not
+      assumed.**
+    - `verify_global_functions`'s ABI v80 POSITIVE CONTROL named `fluid_render` as its fixed-return
+      example and now names surviving ones; `verify_plugin`'s "a built-in global coexists with a plugin's"
+      assertion used render, **which stopped meaning anything the day render itself became a plugin** — it
+      needs a FIRST-PARTY function, so it is `fabricator_va_concat` now.
+  - Floors: hermetic **8197 → 8183** (a DOWNWARD bump — `verify_global_functions` 178 → 164; the assertions
+    moved, they were not lost) and service **53 → 54 runs / 3069 → 3089** (3069 + exactly the new suite's 20).
+  - ⚠ `publish-managed.ps1` was run with **`-Clean`**, which is the standing rule after MOVING a
+    PackageReference between assemblies — the same hazard that once silently deleted all five SqlClient DLLs.
+
+- **THE PLUGIN SYSTEM — scan report, default root, recursive search, INSTALL and UNINSTALL: ALL BUILT
+  2026-08-18 (C#-only, no ABI). Full record moved verbatim to
+  [docs/plugin-system.md](plugin-system.md) Appendix (2026-08-23).** A default root
+  `~/.duckdb/fabricator/plugins` (`FABRICATOR_PLUGIN_DIR` still wins and REPLACES it), a RECURSIVE search
+  (it was top-level only, so an installed layout was never seen), `SELECT * FROM fabricator_plugins()`,
+  `fabricator_install_plugin(archive [, root :=] [, replace :=])` +
+  `fabricator_uninstall_plugin(name [, version :=] [, root :=])` behind the
+  `fabricator_allow_plugin_install` setting, and a REFUSAL when a plugin claims a registered provider's
+  name. Gates: `verify_plugin` 97 + `verify_plugin_install` 45 (service, mutation-tested) + tier-0
+  `PluginPathsTests`/`PluginPackageTests`.
+  - **⚠⚠ THE STANDING RULE THIS PRODUCED, and it is not plugin-specific: A GLOBAL TABLE FUNCTION MUST READ
+    EVERY AMBIENT IN `Execute()`, NEVER IN THE ITERATOR.** `fabricator_install_plugin` read its
+    session-scoped opt-in inside an async ITERATOR body — which runs at the first BATCH PULL, a different
+    ABI crossing, on whatever thread DuckDB pulls from. `AmbientOpener`/`ProviderSettingsStore.CurrentSession`
+    are `AsyncLocal` PER CROSSING, so it legitimately saw session 0 and fell back to the GLOBAL layer where
+    the registration default `false` sits ⇒ **an enabled function reported itself disabled**,
+    NON-DETERMINISTICALLY (refused at the third call in one build and the fourth in another), and **it
+    passed the first time it was run**. Capture in `Execute()`, re-establish at the top of the iterator.
+  - **⚠ A MUTANT THAT DIES IN THE RIGHT PLACE FOR THE WRONG REASON IS A LEAD, NOT A KILL** — chasing that
+    instead of banking it is what exposed the bug above.
+  - **⚠ THE DIAGNOSTIC IS THE LOAD-BEARING PART**: `ScanPluginDirectories` ends every candidate in a
+    `catch`, so FOUR distinct states were ONE silence — `root_missing` (the commonest, and such roots were
+    previously FILTERED AWAY), `rejected` (+ the exception), `no_backend` (the ordinary state of a private
+    DEPENDENCY, so it must not read as failure), `shared` (a deliberate skip, so it must be visible).
+  - **⚠ THE DEFAULT ROOT IS DELIBERATELY NOT UNDER THE MANAGED DIR** — `dotnet publish` DELETES files its
+    own previous publish wrote whose closure no longer contains them (measured: it silently removed five
+    SqlClient DLLs hours earlier the same day), so a plugin installed there is wiped with no error.
+  - **⚠ CANDIDATE ORDER IS LOAD-BEARING** (first registration under a name wins, and `Directory`
+    enumeration order is filesystem-dependent) ⇒ sorted by path, so *which plugin wins* is a property of
+    the configuration rather than of the disk. And **no cap on the count**, deliberately: a silent
+    truncation would read as "covered everything".
+  - **⚠ THREE RE-SCAN HAZARDS, because the scan had NEVER run twice in one process**: the "shared" skip
+    would DROP every already-loaded plugin (subtract what we loaded ourselves); the dependency resolver
+    CAPTURED its probe directories; and `_defaultProvider` must NOT be cleared or an install silently
+    re-points every call site carrying no provider name.
+  - **⚠ INSTALL/UNINSTALL IS A MOVE, NOT A DELETE** — a loaded assembly is LOCKED on Windows and the
+    bridge's ALC is not collectible, so a version directory can be renamed but not removed. Hence
+    stage-then-`Directory.Move` (a put-if-absent race, EXACT on Windows and conditional on Unix) and
+    uninstall into `<root>/.trash/<guid>` with a later sweep. The row reports `removed` (out of the scan —
+    the only real failure when false) separately from `purged` (bytes gone, ordinarily FALSE): collapsing
+    them would make the normal outcome look like a failure.
+  - **THE RELOAD SPLIT, established from source**: a PROVIDER and its catalog-bound functions resolve at
+    ATTACH, so install-and-use in ONE session works via `BackendRegistry.Invalidate()`; **GLOBAL functions
+    cannot be added mid-session by any trick** — `RegisterFunction` is permitted only during
+    `Extension::Load()`, DuckDB has NO unload API at all, re-`LOAD` is a no-op, and the maps are `Lazy<>`
+    per PROCESS. The suite pins both halves.
+  - **⚠⚠ THE DEFAULT ROOT BROKE THE HERMETIC TIER'S DEFINING PROPERTY** and I caught it only by asking what
+    an UNSET variable now MEANS: the runner UNSET `FABRICATOR_PLUGIN_DIR`, which once a default exists means
+    *scan the developer's home* — MACHINE STATE, in a tier whose own comment says the clearing exists so the
+    set is "PROVABLY hermetic". It points at an empty `mktemp -d` now. Measured with a true A/B (same
+    binary, plugin in the real home): **unset ⇒ 2 plugin functions visible; empty dir ⇒ 0.** A green tier
+    would have proved nothing — it is equally true of a machine with no plugins.
+  - **STILL NOT BUILT**: per-plugin ALC isolation, and archive signature/checksum verification (`Hashing`
+    exists in `Fabricator.Installer.Core` and nothing consumes it).

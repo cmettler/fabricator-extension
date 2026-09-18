@@ -5173,3 +5173,1871 @@ could afford — dies at an EXISTING row, `verify_plugin_fluid` line 3178 after 
 ⚠ A second property now holds that did not before and is gated on the aggregate rather than here: the
 Liquid value and the SQL relation are the SAME batch, so they cannot disagree. `BindLazyRelation` re-queried
 DuckDB and could in principle have answered about something else.
+
+## Appendix — records moved verbatim from CLAUDE.md (2026-09-18)
+
+CLAUDE.md carried these as-built records inline until it grew to 10,776 lines — a file loaded into every
+session's context. They are moved here VERBATIM; CLAUDE.md keeps each entry's summary head plus a pointer to
+this section. The one edit made on the way: a link that pointed into the docs directory is rewritten relative
+to this directory, so it still resolves from here.
+
+- **⚠⚠ THE CALL-SCOPED FLUID SURFACES STOPPED COPYING THEIR INPUT TWICE — BUILT 2026-09-14 (user-directed:
+  *"we have the rows in memory as arrow/recordbatch anyway"* … *"the idea of arrow is to avoid copying
+  data.. analyse all fluid functions where you unnecessarily duplicate data"*). C#-only in the plugin, NO
+  ABI change. `fluid_scalar`, `fluid_query_lateral` and `fluid_query_inout` now stage a VIEW over the
+  registered batch instead of a temp table, and bind the Liquid `input_table` over THAT SAME batch instead
+  of re-querying DuckDB. ONE shared helper (`FluidRelationInput.StageLive`). Full record:
+  [docs/fluid-templating.md](fluid-templating.md) §44.**
+  - **⚠⚠ THE LIQUID SIDE WAS THE BIGGER HALF, which is not where I would have looked.** `BindLazyRelation`
+    ran `SELECT * FROM input_table` and built an `EagerStruct` PER ROW whose constructor copies EVERY CELL
+    into a `FluidValue` — a round trip plus a full CLR materialization, for data still alive in Arrow one
+    frame up. MEASURED (identical answers, like-for-like slots): a template touching `input_table` in Liquid
+    goes **0.241/0.286 → 0.117/0.120 s** (scalar), **0.086/0.093 → 0.033 s** (lateral), **0.402/0.262 →
+    0.110/0.112 s** (in-out). SQL-only rows move ~5-15%.
+  - **⚠ `EagerStruct` IS RIGHT WHERE IT LIVES** — `FluidHostQuery.ReadRows` disposes each batch as it
+    consumes it, so a row there CANNOT hold the arrays. `ArrowStruct` (3 refs + an int, reading members from
+    the live Arrow on access) is available only where the batch outlives the render, which is exactly the
+    call-scoped surfaces' own chunk. Do not "unify" them.
+  - **⚠⚠ `fluid_query_batch` MUST KEEP BOTH COPIES and it is not a perf trade**: its chunks are BORROWED and
+    freed as consumed, so the copy into `__fab_input` IS the move out of managed memory rather than a
+    duplicate of it, and `__fab_seq` + exact `batchsize` slicing need a materialized relation. ⇒ **the
+    premise that the collector "collects all input and copies it again" is wrong** — it never collects into
+    managed memory at all, and its `input_table` was already a view.
+  - **⚠⚠ THE RELEASE POINT IS THE WHOLE DIFFICULTY and it differs per surface.** A view holds the TOKEN, not
+    the data, so the registration must outlive every statement reading it — a lifetime the temp-table form
+    did not have. `fluid_scalar` needed NOTHING (it already released in a `finally` after its statement);
+    the lateral's release moved out of its staging helper into a `finally` around `Call`; and **the in-out
+    needed a `finally` around a `yield return` LOOP**, because it yields lazily and a consumer may ABANDON
+    the iteration (a `LIMIT` above a streaming in-out — limitation 1.25). Releasing after the loop would
+    leak a named source per chunk on that path.
+  - **⚠ IT ADDS NO ASSERTIONS, AND A MUTANT IS WHAT ESTABLISHES COVERAGE.** Behaviour-neutral by
+    construction, so the claim is that both tiers are IDENTICAL (hermetic **76/76 — 9337**, unchanged). The
+    new LIFETIME is already covered: releasing the token eagerly dies at an EXISTING row
+    (`verify_plugin_fluid` line 3178, after 476).
+  - ⚠ `fluid_query` (the table function) was deliberately NOT converted — its staged `input_table` is the
+    tail ARGUMENTS, one row of bind-time constants, so there is nothing to save.
+
+- **⚠⚠ `fluid_aggregate` — A TEMPLATE RENDERED ONCE PER GROUP, WHOSE RESULT TYPE IT DECLARES. BUILT
+  2026-09-14 (user-asked, after an analysis pass: *"a fluid_aggregate must at bind be able to supply the
+  return_type! If it is possible then lets build it"*). It IS possible, for one structural reason:
+  **`agg_open` is already called from DuckDB's aggregate BIND**, so a session exists per CALL SITE. ABI
+  **v89** teaches that entry to carry the call. Gate `verify_plugin_fluid` 905 → **946** (§40), hermetic
+  floor 9261 → **9302**, four mutants each killed at its own row. Full records:
+  [docs/abi-history.md](abi-history.md) §v89 + [docs/fluid-templating.md](fluid-templating.md)
+  §43.**
+  - **⚠⚠ THE NON-BIND RENDER IS A SELECT THAT IS EXECUTED, like every other Fluid surface — and this
+    REPLACED a first build that rendered TEXT and cast it (user-directed the same day: *"the return value
+    should be an explicit select again which is executed like in fluid scalar, batch, inout, query … this
+    way no cast of the return value is needed"*).** `{{ s | md5 }}` became `select md5({{ s | sql }})`.
+    Three things fall out and they are why it is BETTER rather than merely consistent: nothing is parsed
+    back out of text (a STRUCT/LIST/MAP result is just a value DuckDB produced); an EMPTY render becomes an
+    ERROR rather than NULL, which un-conflates *"this group has nothing to say"* from a template bug; and
+    the reduction may use any DuckDB function rather than only what Liquid expresses.
+    - **⚠ THE CAST THAT REMAINS IS NOT THE ONE THAT WENT.** `WrapExecute` still casts the statement's single
+      column to the declared type — `fluid_scalar`'s, and its own comment records why: it is what makes the
+      `is_bind` render a DECLARATION rather than a thing to MATCH, so a template declaring `NULL::BIGINT`
+      may render `select 42` without also writing INTEGER. What went is parsing a rendered STRING.
+    - **⚠⚠ THE COST IS ONE STATEMENT PER GROUP and it is MEASURED rather than guessed — I first wrote
+      "~1 ms" from a guess and had to correct it.** Locally: ~14 µs for a trivial statement (10 000 groups
+      in 0.14 s) and **~0.5 ms for a real hashing template** (2 000 groups in 1.0 s, with 2 000 DISTINCT
+      hashes, which is what proves every statement ran rather than being deduplicated). ⇒ a few thousand
+      groups is unremarkable; a hundred thousand is not this function's shape — which its MEMORY already
+      said, so the two limits agree.
+  - **⚠⚠ `rows` IS A SQL RELATION TOO, SO THE REDUCTION CAN HAPPEN IN DuckDB — user-asked 2026-09-14
+    (*"can we make the rows table available at bind? then this would work: `select max(t) from rows t`"*).
+    Gate `verify_plugin_fluid` 946 → **981** (§40.10), floor 9302 → **9337**, four mutants. Full record:
+    [docs/fluid-templating.md](fluid-templating.md) §43.8.**
+    - **⚠⚠ IT FALSIFIES THIS ENTRY'S OWN FIRST CLAIM, which called the text rendering FORCED**: *"an
+      aggregate's rows live in the accumulator, so there is nothing for DuckDB to evaluate them WITH."* The
+      premise was true, the conclusion was not — the accumulator's rows can be handed BACK to DuckDB, which
+      is all staging is. It was never forced, it was unimplemented; **describing an unimplemented thing as
+      forced is how it becomes a permanent limitation.**
+    - **⚠⚠ THE USER'S EXAMPLE NEEDS NO `is_bind` BRANCH AT ALL**, which is the point: an EMPTY, fully typed
+      `rows` is staged at BIND, so `DESCRIBE` over `select max(t) from rows t` answers
+      `STRUCT(a BIGINT, b VARCHAR)` — `fluid_scalar`'s empty-`input_table` property (§26) arriving here.
+    - **⚠⚠ A VIEW OVER THE REGISTERED BATCH, NOT A MATERIALIZED COPY — and I built the copy first, matching
+      four sibling surfaces, then was corrected TWICE.** `RegisterRows` registers a **FACTORY**
+      (`() => new BorrowedBatchStream(schema, rows)`), so each scan gets a FRESH cursor over the same
+      retained Arrow ⇒ a view is re-scannable. **MEASURED: a statement reading `rows` twice answers 4006
+      where a single-use source answers 4000**; and the same query costs **0.002 s (view) vs 0.034 s
+      (table)** on a 300k-row group. ⚠ **The rule I invoked against it is about a DIFFERENT MECHANISM** —
+      "a bound input is SINGLE-USE" is `host_query`'s `inputs`, one raw stream; `fabricator_scan` named
+      sources are factories. One sentence, two mechanisms, opposite answers.
+      - ⇒ **the four sibling surfaces could plausibly drop their copies too** (`fluid_query_batch` cannot —
+        it row-numbers and range-slices), and this is the evidence. Deliberately NOT done here.
+      - ⚠ The price is a LIFETIME the table did not have: the view holds the TOKEN, not the data, so the
+        registration must outlive every statement reading it (`StagedRows`). Releasing early is mutated.
+    - **⚠⚠ STAGED PER GROUP AT FINALIZE, NOT AT RENDER — every group renders BEFORE any group runs**, so a
+      relation staged at render time leaves every statement reading the LAST group's rows: a wrong answer
+      with nothing failing. The rows travel with the statement (`GroupPlan`). Mutation-tested.
+    - **A STRUCT argument is EXPANDED into COLUMNS** (`UNNEST`), so `{{ r.a }}` in Liquid is `a` in SQL —
+      which is what makes `struct_pack` (the documented multi-column idiom) arrive as a real relation. A
+      non-struct argument stays ONE column named `value`. ⚠ MEASURED that `UNNEST` keeps column TYPES on an
+      EMPTY relation (what makes the bind probe work) and turns a NULL struct into NULL fields.
+    - **⚠⚠ AND THE HEADLINE USE CASE IS TWO TO THREE ORDERS OF MAGNITUDE FASTER IN SQL.** The same md5 over
+      2000 groups, interleaved L/S/L/S: **2.901 / 2.591 s in Liquid vs 0.014 / 0.005 s in SQL**, agreeing
+      hash-for-hash on a 50-group control. ⇒ the SQL spelling is not tidier, it is the one to write.
+    - **⚠ The Liquid `rows` value is LAZY now** (user-asked: *"is the rows fluidvalue lazy as input_table in
+      the other fluid functions?"* — it was not, **and a code comment already claimed it was**, which is the
+      worse half). MEASURED on one 300k group, the template the only variable: reads NEITHER **0.020 s**,
+      reads it in SQL **0.002 s**, reads it in LIQUID **0.123 s**. ⚠ Lazy over the ARROW BATCHES, not over
+      the staged relation as `input_table` is (§28) — forced by the ordering above.
+  - **⚠⚠ DuckDB PASSES `AggregateFunction` BY VALUE INTO THE BIND and moves the mutated copy into the
+    `BoundAggregateExpression`** (`FunctionBinder::BindAggregateFunction`), so `SetReturnType` there really
+    becomes the expression's type. Our bind had been receiving `vector<unique_ptr<Expression>> &arguments`
+    all along and IGNORING it — the capability was one parameter away the whole time.
+  - **MEASURED, one function, three call sites**: `select NULL::BIGINT` ⇒ BIGINT, `select
+    NULL::DECIMAL(9,2)` ⇒ DECIMAL(9,2) with its scale, `select NULL::STRUCT(n INTEGER, s VARCHAR)` ⇒ that
+    struct, value `{'n': 9, 's': x}`. No type ladder anywhere: the `is_bind` render is a SELECT DuckDB
+    binds, and the cast's type NAME comes from `DESCRIBE` (DuckDB rendering its own type, so it re-parses by
+    construction). The helper is literally `fluid_scalar`'s, SHARED rather than copied.
+  - **⚠⚠ ONE PER-ROW ARGUMENT, AND THE USER'S OWN SUGGESTION IS THE RIGHT SHAPE.** A variadic tail is
+    REFUSED on aggregates alone: the update crossing sends a bare `ArrowArray` whose schema the managed side
+    rebuilds from the DECLARATION, so there is no per-call-site width, and `agg_open` carries no arity.
+    Several columns go in ONE `struct_pack(a := a, b := b)`; MEASURED that a STRUCT parameter registers as
+    `STRUCT(a BIGINT, b VARCHAR)` and marshals in both directions. ⚠ The declared STRUCT is CONCRETE per
+    call site (the declaration is ANY, resolved at bind), so one call site is tied to one row shape.
+  - **⚠⚠ ORDER IS THE CALLER'S, AND FOR HASHING THAT IS THE WHOLE USABILITY QUESTION.** An aggregate is
+    unordered by definition, so a hash over `rows` repeats between runs only with
+    `fluid_aggregate(tpl, NULL, v ORDER BY k)`. **MEASURED that DuckDB's aggregate `ORDER BY` reaches
+    `Update` IN ORDER** — DESC arrives `7,4,1` where ASC arrives `1,4,7` — which is what makes the md5 case
+    work at all. Without it, parallel aggregation and combine order decide the value, silently. §40.4.
+  - **BOTH of the user's questions answered YES, measured**: `GROUP BY`, `OVER (PARTITION BY g)`, and a
+    moving frame (`ROWS BETWEEN 1 PRECEDING AND CURRENT ROW` ⇒ 1, 2, 2, 2). ⚠ Both go through the host's
+    MULTI-GROUP gather, which is where the ladders below had to go — before that a STRUCT argument worked
+    UNGROUPED and failed the moment a chunk held two groups, i.e. on the shape almost every real query has.
+  - **⚠⚠ THE THIRD PLACE THE SQLNULL SENTINEL HAD TO BE TAUGHT, one day after the first two.** An
+    "accept any value" PARAMETER registered as SQLNULL takes a NULL LITERAL and nothing else — printed back
+    as `fluid_aggregate(VARCHAR, "NULL", "NULL")` refusing a `struct_pack`. ⇒ **a protocol constant honoured
+    in some positions and not others registers a DIFFERENT function, silently.** And the bind must hand the
+    RESOLVED types on: `BuildUpdateBatch` types the update columns from them while `AggregateSession`
+    rebuilt its batch schema from the declaration, so an ANY parameter had the two sides disagreeing — a
+    STRUCT argument marshalled as a NULL-typed column. Both now read the same resolved types.
+  - **⚠⚠ `agg_open` NEEDED THE CALL CONTEXT, NOT JUST THE ARGUMENTS — and the symptom names it: THE FIRST
+    AGGREGATE IN A STATEMENT WORKED AND THE SECOND DID NOT.** A bind that touches the host (to resolve a
+    type, which is the point) opens a connection, and the aggregate path establishes no ambients anywhere:
+    `host_connection_open failed: Attempted to dereference unique_ptr that is NULL`. That
+    first-works-second-fails shape IS the signature of inheriting whatever the last crossing left. The
+    managed handler now establishes and RESTORES the scope (`CallScope`), as `scalarfn_bind` does.
+  - **⚠⚠ UPDATE / COMBINE / FINALIZE STILL CARRY NO CONTEXT, and that is load-bearing rather than a gap to
+    close casually: a binding needing host access must acquire it AT BIND and keep it.** `fluid_aggregate`
+    creates its render session there and holds it for the call site (one connection per call site, and NONE
+    is opened for a pure-Liquid template since the session is lazy about its connection);
+    `AggregateSession.Close` disposes the binding at `agg_close`, the only teardown signal there is. Same
+    conclusion `fluid_query` reached hours earlier — **a plugin cannot capture the ambient, because
+    `AmbientOpener` lives in `Fabricator.Bridge`, which a plugin deliberately does not reference.**
+  - **TWO HAND-WRITTEN TYPE LADDERS RETIRED, and an ANY-declared argument is why neither could ever be
+    right**: the type is whatever the CALL SITE passed. `GatherRows` (splitting one update batch across
+    groups) refused everything outside eight primitives and now falls back to slice-each-row +
+    `ArrowArrayConcatenator.Concatenate`; ⚠ `NullArray` keeps an explicit case because the concatenator
+    refuses it (*"Concatenation for null is not supported yet"*) and a NULL-typed column is ORDINARY here.
+    `BuildResultColumn` could not build a STRUCT/LIST/MAP at all, so `IAggregateBinding.FinalizeColumn` lets
+    a binding hand over the column DuckDB's own CAST produced.
+  - **⚠⚠ THE `Field` → `Field?` TRAP FIRED AGAIN, IN THE SAME CROSSING AS v80.** Making
+    `IAggregateFunction.Result` nullable produced CS8602 at two inventory sites, one of them inside
+    `list_global_functions` — where a single throw drops **EVERY** global function. The symptom was
+    `fluid_aggregate does not exist` with `fluid_render` gone too, three layers from the cause. ⚠ And the
+    warnings are invisible on an up-to-date project: **`dotnet build --no-incremental` is what shows them**,
+    which is exactly what v80's record says and what I had to rediscover.
+  - **⚠ WHAT IT BUYS OVER WHAT ALREADY WORKED — say it, or the function reads as redundant.**
+    `md5(string_agg(fluid_render(...), ';' ORDER BY a))` already does the headline example, MEASURED, in
+    both GROUP BY and window form. `fluid_aggregate` adds that the template sees the WHOLE GROUP at once —
+    so it can branch on the group, emit something that is not a concatenation, and declare a result type
+    that is not VARCHAR. Where the reduction really is "render per row, then join", the existing spelling is
+    cheaper and should be preferred.
+  - ⚠ Smaller measured things: a group that was never updated still renders, with an empty `rows` (DuckDB
+    finalizes states it never updated) and must still render a SELECT — `{% if rows.size == 0 %}select
+    NULL{% else %}…{% endif %}` is how it gets its own answer; the accumulator HOLDS the
+    group's rows, so this is NOT spillable and a high-cardinality GROUP BY keeps every group's rows in
+    managed memory (inherent — a Liquid reduction cannot be folded incrementally); the template must be a
+    CONSTANT, since the result type is part of the PLAN; values go through `FluidValueModel.ReadCell`, so a
+    DATE in `rows` renders like a DATE in `params`; and a LOCK guards the render because one binding serves
+    the whole call site while DuckDB may finalize different vectors on different threads — UPDATE
+    deliberately touches none of it, so the parallel half of aggregation stays parallel.
+
+- **⚠⚠ `fluid_query` IS NOW AN ORDINARY TABLE FUNCTION AND THE OLD ONE IS `fluid_replacement_query` —
+  BUILT 2026-09-13 (user-designed), TWO commits: the BREAKING rename, then the new function. The new one
+  runs its own statement and HANDS THE TEMPLATE the scan's pushed FILTER and PROJECTION, as Fluid values and
+  as DuckDB variables. C#-only in the plugin apart from THREE latent host defects it exposed (below); NO ABI
+  change. Gate `verify_plugin_fluid` 873 → **905**, hermetic floor 9229 → **9261**, four mutants — and TWO
+  of them are the useful ones because one SURVIVED and one killed the wrong thing. Full record:
+  [docs/fluid-templating.md](fluid-templating.md) §41 (the rename) + §42 (as built).**
+  - **⚠⚠ IT DOES NOT BUY "PUSHDOWN", AND SAYING SO IS THE FIRST THING THE DOCS HAD TO DO.**
+    `fluid_replacement_query` DISAPPEARS at bind (`generate_table_sql` → `bind_replace` → a `SubqueryRef`),
+    so DuckDB binds the generated statement DIRECTLY and its pushdown is already FULL AND FREE — better than
+    any hint can be. What the new one buys is that the TEMPLATE SEES the predicate: DuckDB can only push
+    through what it can see through, and an aggregate, a volatile call, a remote read or an opaque function
+    in the generated statement all stop it. ⇒ **prefer the replacement form unless the template needs to ACT
+    on the predicate** (a remote WHERE, a partition choice, a narrower scan).
+  - **⚠⚠ THE MECHANISM WAS ALREADY THERE, AND PROBING IT FIRST IS WHAT KEPT THIS SMALL.** Before writing
+    anything, `fabricator_seq` under `Fabricator.Pushdown` logging: *"2 expr in [(value > 3) ; (squared <
+    200)] -> 2 pushed; native_filter=["value" > 3 AND "squared" < 200]"*. So a GLOBAL `table`-kind function
+    already receives both channels (`fabricator_schema_entry.cpp:3457,3479`), and `native_filter` is a
+    **DuckDB-dialect predicate with quoted identifiers and inlined literals rendered by DuckDB itself**
+    (`Value::ToSQLString`). Nothing was needed at the ABI, in the serializer, or in the C++ scan.
+  - **THE SURFACE**: `filters` (top-level conjuncts as `{column, op, value}`, value TYPED) and `projected`
+    are BOTH a Fluid value and a DuckDB variable; `filter_sql` (the whole predicate) is a Fluid value ONLY —
+    deliberately, since it is TEXT to splice and `WHERE getvariable('filter_sql')` is a boolean test OF THE
+    STRING. None exists at BIND (the planner has not run), so a template reading them branches on `is_bind`.
+  - **⚠⚠ ONLY THE TOP-LEVEL `AND` CONJUNCTS ARE OFFERED — the one correctness rule, and mutant A's row.**
+    A branch of an `OR` is NOT true of every row, so flattening `a = 1 OR b = 2` and letting a template
+    "restrict to the partition a = 1" DROPS the `b = 2` rows — and the host CANNOT catch it, because
+    re-applying a predicate cannot bring back rows the template never read. A disjunction contributes
+    NOTHING to `filters` while `filter_sql` carries it WHOLE; **the pairing is the design, not the empty
+    list**, and the gate asserts both halves in one row.
+  - **⚠⚠ THREE LATENT HOST DEFECTS IT EXPOSED, all fixed here, each unreachable until a function declared
+    the shape that reaches it:**
+    1. **An ANY-declared parameter given a bare `NULL` could not cross AT ALL, at FIVE of seven args
+       marshals.** An Arrow null-typed child must report `null_count == length` and DuckDB does not set it
+       (*"Length must equal null count"*). The scalar bind and scalar execute each carried an INLINE copy of
+       the patch; the table-function bind, the sqlgen bind, the in-out bind, the collector bind and the
+       lateral bind did not. ⇒ ONE shared `fabricator::FixNullTypedChildren` called at EVERY args marshal —
+       a no-op when no type is SQLNULL, which is what makes "every marshal" a rule somebody can follow.
+    2. **The SQLNULL→ANY sentinel was honoured for NAMED table parameters and not for POSITIONAL ones**, so
+       a slot declared "accept any value" registered as `LogicalType::SQLNULL` — accepting a NULL LITERAL and
+       nothing else (`fluid_query(t, {'a':1})` refused, signature printed back as `fluid_query(VARCHAR,
+       "NULL")`). Purely additive: `fluid_query` is the ONLY function in the tree declaring one.
+    3. **`FabricatorExpandVarArgs` resolved ANY against the value in the TAIL and not in the PREFIX**, so
+       even with (2) fixed the marshal cast to the sentinel (*"Unimplemented type for cast (STRUCT(who
+       VARCHAR) -> NULL)"*).
+    ⇒ (2) and (3) are one sentinel read in two places: **a protocol constant honoured in some positions and
+    not others registers a DIFFERENT function, silently** — the rule `FabricatorRefuseVarArgs` already states
+    for a missing `switch` case.
+  - **⚠⚠ A PLUGIN CANNOT CAPTURE THE AMBIENT, SO ITS HOST WORK MUST BE EAGER — and the first build SIGSEGV'd
+    proving it.** Creating the render session inside the async iterator (as `fluid_query_batch` does) died at
+    `HostFs.OpenConnection`: an iterator's body begins at the first batch PULL, a DIFFERENT ABI crossing on a
+    different thread, and the ambients are `AsyncLocal` per crossing. That is the recorded rule in its THIRD
+    instance. ⚠ The Bridge's own readers capture (`var opener = AmbientOpener.Current`) and hand the value to
+    their lazy stream; **`AmbientOpener` lives in `Fabricator.Bridge`, which a plugin deliberately does not
+    reference**, so eager is not a workaround but the available correct shape. Do not "harmonise" it back.
+    - ⚠ Two consequences kept: the session is DISPOSED before a row is read (safe — a host connection is
+      REFERENCE-COUNTED and the result stream holds its own reference, the property `publish()` rests on), and
+      the returned sequence is a HAND-WRITTEN enumerable so its `DisposeAsync` runs even when never MOVED (a
+      compiler-generated iterator that is never pulled runs no `finally`, and a `LIMIT 0` above it would leak
+      the open result).
+  - **⚠ `ProjectionPlan` MOVED TO `Fabricator.Common` (public).** The host narrows the DECLARED stream schema
+    with it and this binding must emit exactly that; a second derivation of "which columns, in what order" is
+    not a wrong answer but `arrow_ingest` reading past the end. ⚠ `FilterConstants` was moved too and MOVED
+    BACK — the plugin needs its OWN value reader, so sharing it would have been motion with no user.
+  - **⚠⚠ MUTANT B SURVIVED FIRST AND SHOWED THE DATE ROW WAS ASSERTING THE WRONG HALF.** Values go through
+    `FluidValueModel.ReadCell` (this plugin's superset — it stamps `DateTimeKind.Utc`), not the Bridge's
+    `ArrowValueReader.ReadScalar`. Swapping them passed, because the row asserted
+    `{{ f.value | date: "%Y-%m-%d" }}`. MEASURED side by side on a UTC+2 box: the Bridge reader gives
+    **`raw=[2026-09-12 22:00:00Z]`** — the PREVIOUS DAY — and the `date:` filter converts it BACK through the
+    context zone to `2026-09-13`, identical under both. ⇒ **a row that renders a value through a NORMALISING
+    filter is not testing the value.** Asserting the RAW value kills it after 883. ⚠ The correct value is
+    machine-INDEPENDENT; it is the MUTANT whose output moves with the box's zone, so that row kills east of
+    UTC and may not west of it — stated in the suite rather than left to be discovered.
+  - **⚠⚠ MUTANT C SURVIVED FOR A GOOD REASON AND CORRECTED A COMMENT I HAD JUST WRITTEN.** Setting
+    `SupportsFilterPushdown => true` — the flag claiming "my rows are already filtered, stop re-applying" —
+    passes all 896 assertions, because **nothing reads it** (its own contract doc says so, and I had written
+    the opposite one file away). What keeps the safety row correct is the HOST leaving every predicate in the
+    plan. ⇒ the `false` is a statement of a guarantee we do not make, and it becomes dropped rows the day the
+    flag is honoured — **a reason to get it right by READING rather than by testing.** Both the code comment
+    and the gate's §39.1 comment were rewritten to say that.
+  - **⚠ THE RENAME (§41) SWEPT THE DATED RECORDS, WHICH INVERTS THIS REPO'S CONVENTION — because the name is
+    REUSED.** Every previous rename here left older dated records spelling the OLD name; that is right only
+    when the old name then denotes NOTHING. Here `fluid_query` immediately became a DIFFERENT function, so a
+    dated record left saying `fluid_query` would read as a statement about the table function and be false in
+    almost every particular. ⚠ It also silently changed an `ORDER BY` (the `fluid_render` rename's trap,
+    exactly): `fluid_query` sorted BEFORE `fluid_render`, `fluid_replacement_query` sorts AFTER it.
+  - ⚠ Smaller measured things: the tail args are bind-time constants staged as `arg_0`, `arg_1`, … and
+    **CANNOT be renamed with `name := v`** (DuckDB reads that as a NAMED PARAMETER on a table function and
+    removes the value from the positional list — so `fluid_scalar`'s alias rule does NOT transfer); `params`
+    is POSITIONAL here, matching the lateral, so `fluid_query('SELECT 1')` does not bind; the template cannot
+    see the caller's TEMP tables (its own pinned connection — pinned in the gate, because the error names the
+    template rather than the boundary); the variable's `value` is rendered BY DuckDB from the staged typed
+    constant (`CAST(v<i> AS VARCHAR)`) rather than by `DuckSql.Literal`, which collapses temporals and
+    refuses LIST/STRUCT; and an empty filter set is an empty LIST (`[]::STRUCT(…)[]`), not an unset variable,
+    so `len(...)` answers 0 for every scan.
+
+- **⚠⚠ A VARCHAR PARAMS BAG IS JSON ONLY WHEN IT *IS* JSON — BUILT 2026-09-13 (user-raised from a real
+  failure: `fluid_render('…','result')` died with "params is not valid JSON"). C#-only in the plugin, and it
+  changes EVERY Fluid surface at once because they share one `CaptureBag`. Gate `verify_plugin_fluid`
+  867 → **873**, floor 9223 → **9229**. Full record:
+  [docs/fluid-templating.md](fluid-templating.md) §40.**
+  - **THE INCONSISTENCY IT REMOVES, and the user's framing was the right one**: `5`, `current_timestamp` and
+    a BLOB all worked as bare scalar bags while VARCHAR ALONE was reinterpreted as JSON.
+  - **⚠⚠ THE PRINCIPLED VERSION — "detect the json type on the arrow extension schema" — IS NOT AVAILABLE,
+    and that is worth knowing before anyone proposes it again.** DuckDB registers `arrow.json`, but exports
+    it ONLY under `arrow_lossless_conversion` (`arrow_converter.cpp:120`: *"we only export it as json if
+    arrow_lossless_conversion = True"*), and `BoundaryClientProperties` forces that OFF for an unrelated,
+    LOAD-BEARING reason — with it on, DuckDB exports BOOLEAN as Arrow `Int8` and the SQL Server mapper emits
+    `SMALLINT` (1/0) instead of `BIT`, which `verify_arrow_lossless` pins. **MEASURED: a `::JSON` bag reaches
+    the managed side indistinguishable from VARCHAR.**
+    - ⚠ The obvious suspect — our own staging rebuilding each `Field` from its TYPE and dropping the metadata
+      where `ARROW:extension:name` lives — was TESTED and is not the cause: carrying the metadata through
+      changed nothing. It is DuckDB's export.
+    - ⚠ One of those measurements was VOID and caught: the publish had FAILED on a file lock (a leftover
+      `duckdb.exe`), so it read the stale payload and "confirmed" the result. **Verify the publish succeeded,
+      never the exit code of the shell around it.**
+  - **⚠⚠ SO THE CONTENT DECIDES — WITH ONE EXCEPTION THAT IS THE WHOLE SAFETY OF THE CHANGE.** Text beginning
+    `{` or `[` is plainly an object/array attempt, so a parse failure THERE stays an ERROR naming the rule.
+    The commonest bag mistake is a malformed object (a missing brace), and binding `'{"x": 5'` as a STRING
+    would leave every `{{ params.x }}` rendering empty with nothing failing. **Pure sniffing — which is what
+    was proposed — would have lost that**; the guard is one condition.
+  - ⚠ Every spelling that worked still means what it did (`'{"x":5}'`, `'[7,8]'`, `'5'`, `'true'`,
+    `'"result"'`), and `'5'` is gated with `| plus: 1` because only arithmetic separates a NUMBER from the
+    string "5". TWO gate rows asserting the old refusal were REPLACED, not deleted.
+  - ⚠ It does NOT fix the OTHER half of the same report: `getvariable('params')` in the text `fluid_render`
+    RETURNS is unresolvable, because `query()` runs that text on its own connection (§39.4's boundary,
+    inherent to returning text). The variable works inside the render's own blocks, which is what the
+    reporter actually meant.
+
+- **⚠⚠ `fluid_scalar` — A TEMPLATE RENDERED TO A SQL SELECT, WHOSE RETURN TYPE THE TEMPLATE DECLARES.
+  BUILT 2026-09-13 (user-designed). C#-only IN THE PLUGIN: NO ABI change, NO C++ change, NO bridge change.
+  Gate `verify_plugin_fluid` 828 → **865** (§38), hermetic floor 9184 → **9221**, three mutants run against
+  the earlier expression form (two killed at their own rows; the ordering one SURVIVED, which is what showed
+  the ORDER BY was never load-bearing and made the statement form a cheaper trade than it looked). Full record:
+  [docs/fluid-templating.md](fluid-templating.md) §39.**
+  `fluid_scalar(template, params, arg_0 … arg_N)`; under `is_bind` the template renders a SELECT of the
+  result type (`select NULL::STRUCT(a INTEGER)`), otherwise the SELECT that computes it over `input_table`.
+  - **⚠⚠ IT NEEDED NOTHING NEW AT THE ABI — v80's scalar bind session already does this, and `fabricator_parse`
+    is its shipped demonstration.** `IScalarFunction.Result` is `Field?` (null ⇒ registered as ANY, the bind
+    must supply a type) and `ScalarBindArgs` carries the values plus an `IsConstant` MASK. ⚠ A scalar needs no
+    `Params.Constant` — that style exists because a LATERAL's args become an input relation; a scalar's
+    constants arrive in the mask for free.
+  - **⚠⚠ NO TYPE LADDER ANYWHERE, and that is what the user's design bought.** My first scoping had the
+    template render a TYPE NAME which we would parse — a second SQL type ladder. Theirs renders SQL that
+    DuckDB binds, so the type is whatever DuckDB says: `STRUCT(a INTEGER, b VARCHAR)`, `DECIMAL(9,2)`
+    with its scale, `INTEGER[]`, `MAP(VARCHAR, INTEGER)` — all MEASURED intact. ⚠ DuckDB also names its own
+    type back re-parseably (`DESCRIBE` ⇒ `STRUCT(a INTEGER, b VARCHAR)`), which is what the execute cast
+    splices; it is never the template's own text.
+  - **⚠⚠ THE TEMPLATE WRITES ITS OWN `select` AND NOTHING IS PREPENDED — user directive mid-build
+    (*"actually change this to use explicit selects … don't add the select part yourself"*), REVERSING an
+    expression-only form I had built first.** I chose the bare expression because it makes 1:1 STRUCTURAL (a
+    projection over N staged rows yields N rows); the statement form gives that up and reads as SQL you can
+    paste and run, which is what the `is_bind` render is for.
+  - **⚠⚠ SO CARDINALITY AND ORDER ARE THE TEMPLATE'S CONTRACT NOW, and only one of them is enforced.**
+    ENFORCED: exactly ONE output column (at bind) and a row count equal to the chunk's — a statement that
+    changes cardinality is refused by name rather than producing a silent short read. NOT ENFORCED: ORDER.
+    ⚠ A plain projection over `input_table` preserves it — MEASURED against a build with the ordering
+    removed, incl. a correlated-subquery expression over 3000 rows and under
+    `SET GLOBAL preserve_insertion_order = false`, both ZERO misaligned — so the ordinary shape is safe and a
+    reordering statement must carry `__fab_row` through and `ORDER BY` it. **Do not read the gate's 5000-row
+    alignment row as proving ordering; it proves the COUNT.**
+  - **⚠⚠ THE CAST IS WHAT MAKES `is_bind` A DECLARATION RATHER THAN A THING TO MATCH — found by RUNNING it.**
+    Without it a template declaring `NULL::BIGINT` and rendering the literal `42` is REFUSED, because `42` is
+    INTEGER, so every literal's type would have to be written twice and kept in step. The execute wrap casts
+    to the declared type through DuckDB's own cast. Mutant B dies at exactly that row after 844 pass. ⚠ A
+    genuinely impossible conversion still fails in DuckDB's words; a LOSSY but legal one is silent, as a
+    declared column type is everywhere in SQL.
+  - **⚠ ONE RENDER PER CHUNK (user decision), AND A FRESH CONNECTION WITH IT.** Liquid decides the SHAPE from
+    the constant params; DuckDB computes every row — so the template cannot branch on a row VALUE in Liquid,
+    it emits SQL that does. ⚠⚠ **A PINNED connection is NOT available**: the binding is shared across pipeline
+    threads (this plugin already records that a volatile scalar may be evaluated on several at once, which is
+    why `FluidRenderSession` is per-render) and a DuckDB connection is single-threaded. MEASURED 200,000 rows
+    at `threads = 8`, zero wrong.
+  - **⚠⚠ A BUG THE BUILD FOUND AND FIXED AT THE ROOT: `getvariable('params')` WAS NULL INSIDE IT.**
+    `FluidRenderSession.BindVariable` applied its binding only when `Pin()` OPENED the connection, and this
+    function staged its input relation BEFORE building the render context — so the connection was already open
+    and the variable was never set. A silent wrong value, not an error. Fixed in `BindVariable` (stage
+    immediately when the connection is already open) rather than only at the call site, because the implicit
+    "declare before you run anything" ordering contract is the kind that bites the NEXT caller.
+  - ⚠ Two limitations, both measured: the template's SQL runs on its OWN connection so it **cannot see the
+    caller's TEMP tables** (`Table with name lookup does not exist!` — same rule `query()` follows; use a
+    regular table), and the function is VOLATILE so it is never constant-folded (correct — a template may call
+    `query()`/`exec()`).
+  - **⚠⚠ A NAMED ARGUMENT NAMES ITS `input_table` COLUMN — added 2026-09-13 the same day (user-asked: "when
+    such a name parameter is used, can we use this name as col name in the input_table?"). C++ + C#, NO ABI
+    change.** `counter := i` is readable as `counter` instead of `arg_0`. Gate `verify_plugin_fluid`
+    854 → **865**, floor 9210 → **9221**.
+    - **⚠⚠ THE NAME SURVIVES AS THE ARGUMENT'S ALIAS, AND MY FIRST TWO PROBES SAID THE OPPOSITE.** They
+      showed an ARBITRARY name is accepted (`zzz_nonsense := 7` works) and that `counter := 7, 2` binds
+      POSITIONALLY — from which I nearly concluded the name is discarded. It is not: DuckDB's
+      `Transformer::TransformNamedArg` rewrites `name := expr` into `expr` with **`SetAlias(name)`**, so the
+      argument stays positional and the NAME rides the expression. **`struct_pack(a := 1)` is the existence
+      proof** that a scalar's bind can read it — ⇒ when a probe says "the name does nothing", check whether
+      it is merely doing nothing *for dispatch*.
+    - **⚠ TAIL SLOTS ONLY** (`FabricatorCallArgName`): a declared parameter must keep its DECLARED name
+      because the managed side reads those BY NAME (`ArgColumn(args, "template")`), so letting
+      `foo := '…'` rename the template slot would break that read at a distance.
+    - **⚠⚠ BIND AND EXECUTE MUST AGREE, so the resolved names ride the BIND DATA**
+      (`FabricatorScalarBindData.arg_names`) instead of being recomputed in the execute lambda from the
+      registration-time declaration — which cannot know a call site's alias. A disagreement there is a wrong
+      COLUMN, not an error. The execute lambda now reads its bind data FIRST, before naming anything.
+    - **⚠⚠ DuckDB ALIASES A GENUINE COLUMN REFERENCE TOO, which I did not expect and which BROKE AN EXISTING
+      GATE ROW (`arg_0` became `n`).** Measured rule, four cases: `counter := i` ⇒ `counter`; `n` / `fs_t.n`
+      ⇒ `n`; `n + 1`, `upper('x')`, a literal ⇒ `arg_<k>`. **User-confirmed as the right behaviour** ("this
+      is actually fine when n is used"), and it is **strictly nicer than `fluid_query_lateral`'s rule**,
+      which names wire columns by rendered EXPRESSION TEXT and so yields unquotable names like `(t.n + 1)`.
+      Here an argument is either self-naming or positional — there is no unusable third case.
+      ⚠ POSITION IS COUNTED OVER THE WHOLE TAIL: in `f(tpl, NULL, counter := 1, n, n + 1, 9)` the literal is
+      `arg_3`, not `arg_1`. Pinned in one assertion, because the rule has four cases and only measuring
+      showed where the line falls.
+    - **⚠⚠ A NAMED ARGUMENT DOES NOT REORDER, AND THAT TRAP IS DuckDB'S — pinned as a characterization.**
+      `fluid_scalar(tpl, counter := 7, 2)` binds **7 as the params bag**: the name is discarded for dispatch
+      and binding is positional. A built-in is identical (`upper(zzz := 'a')` returns `A`). So naming
+      DOCUMENTS an argument, never moves it, and is validated against nothing.
+    - ⚠ `__fab_row` is refused as an argument name (it carries the staged row number), and
+      `fabricator_va_concat` is unaffected — it reads its tail positionally, so an alias changes nothing
+      there (checked, both spellings).
+  - **⚠⚠ `input_table` IS AVAILABLE AT BIND, EMPTY AND FULLY TYPED — added 2026-09-13 (user-asked: "could we
+    make an empty input_table available at bind with the vargs?"). It ALREADY WAS, with the right NAMES; what
+    it lacked was the right TYPES.** One managed line. So a template can derive its SELECT list AND its
+    RESULT TYPE from the input schema — §26's capability for this surface. Gate 865 → **868**, floor 9221 →
+    **9224**.
+    - **⚠ THE TYPES ARE REAL AT BIND ONLY BECAUSE THE TAIL IS `ANY`**: DuckDB inserts NO CAST there, so the
+      host marshals each tail argument as the EXPRESSION'S OWN type — which is exactly what execute
+      delivers. A CONCRETE-typed parameter would not have this property (DuckDB casts it after the bind
+      returns), so do not generalise it. ⚠ A non-constant argument has a real TYPE at bind though its VALUE
+      is a placeholder — type from the expression, value from folding.
+    - **⚠⚠ A MUTANT CORRECTED THE GATE'S OWN COMMENT.** The "shape" row renders the same text on both sides
+      and I wrote that its passing proved the two views AGREE. It does not — the OUTPUT comes from the
+      EXECUTE render alone, so a placeholder-typed bind passes it unchanged. Mutant E SURVIVES that row and
+      dies at the derived-result-type row below it, because a declared type can only come from the BIND
+      render. **A row that renders at both times does not thereby test both times.**
+  - **⚠⚠ `input_table` HOLDS THE ARGUMENTS AND NOTHING ELSE — the always-present `__fab_row` staging column
+    was DROPPED 2026-09-13 (user: "i think the __fab_row is not that useful in fluid_scalar?" … "it is only
+    needed in fluid lateral").** They are right on both counts. **A ROW KEY IS A LATERAL CONCEPT**: a lateral
+    is 1→N so every output row must say which input produced it, while a scalar is 1:1 by construction and
+    needs no provenance. Gate 868 → **867**, floor 9224 → **9223**.
+    - ⚠ Nothing used it: the wrap stopped ordering when the template took over writing its own `select`, so
+      its only remaining purpose was as an ordering key for a re-sorting template — and that is
+      SELF-SERVABLE. The caller passes their own (`rn := row_number() over ()`, then `order by rn`),
+      MEASURED over 3000 rows with zero misaligned, which is better than an injected key: explicit, named by
+      the author, and absent when unneeded. Against that it cost a reserved name, a refusal, and a column in
+      every `describe input_table`.
+    - **⚠⚠ REMOVING IT EXPOSED A SECOND PURPOSE IT HAD BEEN SERVING SILENTLY, and the zero-argument gate row
+      is what caught it.** With NO tail arguments the staged relation has ZERO columns, and Apache.Arrow
+      cannot represent a zero-FIELD schema across the C interface in either direction — the same
+      `ArgumentNullException('fields')` the zero-argument SCALAR case already records. ⚠ And `input_table`
+      also carries the chunk's ROW COUNT, so omitting it is not an option either: a bare `select 42` yields
+      ONE row whatever the chunk size and fails the cardinality check. ⇒ a `__fab_rows` placeholder appears
+      ONLY when there are no per-row arguments — structural, not a row key. **When removing a column that
+      "nothing uses", check what its mere PRESENCE was guaranteeing.**
+  - **⚠ WHAT IT ADDS OVER WHAT ALREADY WORKED, measured before building so the value was known rather than
+    assumed**: per-row args were ALREADY expressible through the params bag (it is a COLUMN, evaluated per
+    row), and `fabricator_parse(fluid_render(…), 'bigint')` ALREADY produced a typed result. The genuinely new
+    thing is that the TEMPLATE declares its type, so an `{% include %}`d template file carries its own output
+    type and the call site cannot drift from it.
+
+- **⚠⚠ THE PARAMS BAG IS A DuckDB VARIABLE TOO — `getvariable('params')` in the render's own SQL. BUILT
+  2026-09-13 (user-asked). C#-only IN THE PLUGIN: NO ABI change, NO C++ change, NO bridge change. Gate
+  `verify_plugin_fluid` 810 → **828** (§37), hermetic floor 9166 → **9184**, THREE mutants each killed at its
+  own row. Full record: [docs/fluid-templating.md](fluid-templating.md) §38.**
+  - **⚠⚠ STAGED THROUGH A NAMED ARROW SOURCE, NEVER RENDERED AS TEXT, and that is the whole design.**
+    `SET VARIABLE params = (SELECT "params" FROM fabricator_scan('<tok>'))` — the shape
+    `FluidRelationInput.CreateEmptyInput` already uses for `input_table`. MEASURED type-exact: a bag of
+    `{'d': DATE …, 'm': 19.99::DECIMAL(9,2)}` reads back as `STRUCT(d DATE, m DECIMAL(9,2))` with `m * 2` =
+    39.98. Rendering would mean a SECOND SQL type ladder, and the one we have (`DuckSql.Literal`) collapses
+    every temporal to TIMESTAMPTZ and REFUSES a LIST or a STRUCT by name.
+  - **⚠⚠ THE BOUND-PARAMETER ROUTE IS CLOSED, and measuring it first is what avoided building the wrong
+    thing: `SET VARIABLE` CANNOT BE PREPARED** (`Parser Error: syntax error at or near "SET"`), while the
+    host's parameterised `host_query` path is `Prepare` + `Execute`. So the provider tags' `struct_pack($a)`
+    trick does not transfer here.
+  - **⚠⚠ SCOPE IS FREE AND IT IS WHAT MAKES THE FIXED NAME SAFE: DuckDB keeps variables in
+    `ClientConfig::user_variables`, a per-`ClientContext` map** — read out of the source, then MEASURED IN
+    BOTH DIRECTIONS: a variable set on the pin is invisible to the NEXT render, and one set by the CALLER's
+    session is invisible on the pin. So `params` can collide with nothing of the user's, and it dies with the
+    render. Both pinned in §37.
+  - ⚠ `getvariable` resolves at BIND time into a `BoundConstantExpression` and takes its return type from the
+    VALUE — which is what makes `getvariable('params').region` bind at all. The variable is staged when the
+    connection opens, i.e. before any statement of the render is prepared.
+  - **⚠⚠ LAZY VIA A FACTORY, AND THE LIFETIME RULE SPLITS THE SURFACES — this is the part to not get wrong.**
+    `FluidRenderSession.BindVariable(name, Func<RecordBatch?>)` reads nothing until the pin opens, because
+    `fluid_render` is a per-ROW scalar and an eager copy would run for every row of every template, including
+    the majority that run no SQL. **The factory must not close over anything shorter-lived than the session**:
+    `fluid_render`/`fluid_replacement_query` render INSIDE the call that owns their args (so they may slice LIVE Arrow),
+    while the three deferred surfaces create their EXECUTION session long after `Bind`'s args are freed — the
+    same fact that makes `CaptureBag` eager — so they close over a COPY (`FluidValueModel.CopyBagRow`).
+  - **⚠ THE COPY IS A SLICE + AN IPC ROUND TRIP, and the round trip is not just for the copy**: it NORMALISES
+    the slice, since a sliced Arrow array carries an offset its children do not. **The PER-ROW gate row is
+    what proves the right cell is picked** — mutant 2 (always slice row 0) passes every other row in §37 and
+    dies exactly there, after 813. ⚠ The sliced VIEW is deliberately not disposed — its buffers are the
+    caller's, and disposing a view of an imported array is the double-release that faults inside
+    Apache.Arrow's own release callback.
+  - **⚠⚠ THE BOUNDARY IS BY DESIGN, user-confirmed mid-build (*"in fluid_replacement_query the getvariable should only
+    work in an explicit {%query/exec %}"*).** In `fluid_replacement_query` the variable is readable from a `{% query %}` /
+    `{% exec %}` block and NOT from the GENERATED statement — that statement is returned as TEXT and bound by
+    the CALLER's connection, a different `ClientContext` and therefore a different variable map (MEASURED:
+    `typeof` = `"NULL"`). The three deferred surfaces DO see it from their generated statement because WE run
+    it on the pin. Both halves pinned, the second as a characterization.
+    - ⚠ **There IS a route through it, MEASURED**: stage inside `{% exec %}` (which DOES see the variable)
+      and `publish()` the staged table. Documented rather than separately gated — it composes two mechanisms
+      each pinned on its own, so nothing there can break without one of those failing first.
+  - ⚠ A **JSON-string** bag stays a VARCHAR while Liquid PARSES it, so `getvariable('params').region` works
+    only for the STRUCT spelling — the documented "prefer STRUCT" asymmetry. A LIST and a bare SCALAR bag
+    both work. **No bag ⇒ NO statement**: an unset variable already reads as NULL, so writing one buys
+    nothing.
+  - **⚠⚠ MY FIRST JUSTIFICATION FOR NOT CASTING A JSON BAG TO DuckDB'S `JSON` TYPE WAS WRONG, user-challenged
+    (*"I did not understand why we need 'inventing DuckDB types'"*) — and they were right.** "Inventing
+    DuckDB types for JSON's four scalar kinds" is the JSON → **STRUCT** argument (is `1` INTEGER or BIGINT?);
+    the `JSON` TYPE is VARCHAR-backed and invents nothing. THREE real reasons stand in its place, all
+    measured, and the FIRST is what decides it:
+    1. **It would not unify the spellings, it would make them differ SILENTLY.** Dot access DOES work on a
+       JSON value — but `getvariable('p').region` yields `"eu"` (a QUOTED JSON scalar) where a STRUCT yields
+       `eu`. So auto-casting swaps today's LOUD binder error for a value that is subtly wrong in any string
+       comparison or concatenation. `->>'region'` is the unquoted accessor.
+    2. **`::JSON` NEEDS THE json EXTENSION** — `Catalog Error: Type with name "JSON" is not in the catalog,
+       but it exists in the json extension.` So the cast would have to be CONDITIONAL, making the variable's
+       TYPE depend on the environment — and on a `LOAD json` landing BETWEEN two renders.
+    3. **"Preserve what the caller declared" is UNAVAILABLE**: DuckDB's OWN Arrow export drops JSON-ness.
+       MEASURED — `fabricator_host_query` over a `::JSON` column reports VARCHAR while the direct value
+       reports JSON — so a `::JSON` bag reaches us as a plain string whatever the caller wrote.
+    ⚠ The capability already exists with NO code from us, and both spellings are measured:
+    `getvariable('params')::JSON->>'region'` inline, or one `SET VARIABLE pj = getvariable('params')::JSON`
+    in an exec block and dot access on `pj` thereafter.
+  - **⚠ THE SECOND HALF OF THE SAME QUESTION — "make the fluid params lazy like input_table" — IS ALREADY
+    SATISFIED ON THE LIQUID SIDE AND MUST NOT BE MADE LAZY.** `{{ params.region }}` already works for a JSON
+    bag (`CaptureBag` parses it), so there is nothing to gain; and `CaptureBag`'s EAGERNESS is load-bearing —
+    its own doc records that the three deferred surfaces' bind args are freed before their renders run, so a
+    lazy leaf would read a disposed batch. `input_table`'s laziness is a different thing: it is lazy over a
+    DuckDB RELATION that lives in the database, not over borrowed Arrow.
+  - **⚠ MUTANTS: 1** (`Bind` never declares it) dies at the FIRST §37 row after exactly 810 — the section
+    boundary; **2** (always slice row 0) at the per-row row after 813; **3** (the shared deferred-surface
+    context never declares it) at the batch row after 819, leaving the `fluid_render` rows alone — which is
+    what shows the lateral's own wiring is a SEPARATE line.
+  - **⚠⚠ A TRAP RE-EARNED: `nohup … &` COMBINED WITH THE HARNESS'S OWN BACKGROUNDING PRODUCES A FAKE
+    COMPLETION.** The task reported "completed (exit code 0)" seconds after launch while the tier was still
+    running (`Get-CimInstance Win32_Process` showed the `run-suites` bash alive, log 0 bytes from block
+    buffering). CLAUDE.md already records the rule — launch a tier with `run_in_background` ALONE — and I
+    used both anyway. **Acting on that notification would have started a second concurrent tier**, which is
+    the recorded way to void two runs at once.
+
+- **⚠⚠ `fluid_query_inout` — THE STREAMING SIBLING OF THE COLLECTOR. BUILT 2026-09-11 (user-asked). C#-only,
+  NO ABI change and NO C++ change. Gate `verify_plugin_fluid` 759 → **794** (§35), hermetic floor
+  9088 → **9123**, THREE mutants each killed at its own row. Full record:
+  [docs/fluid-templating.md](fluid-templating.md) §30.** It is the item §19 recorded as deliberately
+  still open — *"a bounded-memory batched variant is the SAME body registered on the streaming in-out"*.
+  - **IT NEEDED NOTHING NEW**: `IProvider.GlobalInOutFunctions` is already a DIM and the global in-out kind
+    has been supported since ABI v46/v47, so the whole feature is one class plus one registration line.
+  - **⚠⚠ WHAT IT BUYS IS BOUNDED MEMORY, AND WHAT IT CANNOT DO IS FORCED BY THE OPERATOR.** A collector
+    buffers its ENTIRE input before the first render (true even at a small `batchsize` — that parameter is
+    about how many rows each render SEES, never about memory); this holds ONE CHUNK at a time. The price is
+    that there is **no `batchsize` and no whole-input render**: the all-input-done hook is handed no
+    `DataChunk`, so output held back until EOF is DRAINED AND DISCARDED, and **the chunk IS the batch**.
+    ⚠ A SEPARATE registration rather than a mode, because `kind` is fixed at REGISTRATION — the same
+    constraint the lateral records.
+  - **MEASURED, the contrast that defines the pair** (the template reports its own input size, so each
+    output row IS one render): over `range(5000)`, `fluid_query_inout` = **3 renders** / 5000 rows /
+    biggest 2048, `fluid_query_batch` = **1 render** / 5000 rows.
+  - **⚠⚠ AN EMPTY INPUT RENDERS NOTHING HERE AND ONCE ON THE COLLECTOR** — a real divergence, gated as a
+    PAIR so neither half reads as an accident. No rows ⇒ no chunks ⇒ no renders; the collector renders once
+    because a template is a statement GENERATOR whose output need not depend on the rows.
+  - **⚠⚠ THE SHARED RULES WERE EXTRACTED, NOT COPIED — `FluidRelationInput`.** The schema probe, the
+    projection wrapper, the drift check, the publish refusal and the empty-input creation now exist ONCE.
+    Each is load-bearing in a way a reader would not guess (the `LIMIT 0` wrapper is also what REQUIRES the
+    generated statement to be a subquery-usable SELECT; `Wrap` IS the projection pushdown), so a second copy
+    would drift into a SILENT behaviour difference rather than a compile error.
+  - **⚠ IT MOVED `InOutExchange.EmptyBatch` FROM Bridge TO Common, AND THAT WAS A PRE-EXISTING GAP.**
+    `StaticInOutFunction` already lived in Common and its own docs told authors to yield
+    `InOutExchange.EmptyBatch` — while the helper sat in Bridge, which a plugin deliberately does not
+    reference. **A plugin deriving from that base could not write the one thing the base requires of it.**
+    Namespace unchanged (the Abstractions/Common convention), so not one call site moved.
+  - **⚠⚠ DRIFT IS CAUGHT BY TWO DIFFERENT MECHANISMS, found by writing the gate and getting the expected
+    message WRONG.** A RENAMED column is caught by the WRAPPER (it selects the declared names, so the inner
+    bind fails naming the column) and never reaches `Verify`; a RETYPED column keeps its name, binds
+    happily, and only `Verify` sees it. Both are gated — without the second row `Verify` would be untested
+    here and a reader would assume one check covered both.
+  - ⚠ The two stale-state mutants die on DIFFERENT rows, which is what separates "the temp TABLE is stale"
+    (dies on the contrast row at `1 6144 1`) from "the LIQUID value is stale" (dies on the agreement row at
+    `0 1 5000`). The agreement row ALONE could not: a build where both are stale still reports them as
+    agreeing, which is why the `sum` and the `max(sql_n) > 1` control are in that row.
+  - **⚠⚠ PROJECTION PUSHDOWN — BUILT 2026-09-12 (user-directed, after asking whether it was implemented and
+    being told it was wired and INERT here). C++-ONLY, NO ABI change. Gates `verify_plugin_fluid` 794 →
+    **810** (§36) and `verify_global_functions` 164 → **178**; TWO mutants, each killed at its own SUITE.
+    Full record: [docs/fluid-templating.md](fluid-templating.md) §37.**
+    - **THE WHOLE GAP WAS ONE HOST-SIDE FLAG.** The ABI entry has carried the argument since v87,
+      `InOutExchangeStream` has always declared `ProjectedOutputSchema(projected)` and forwarded `projected`
+      to `DoExchange`, and `IInOutFunctionBinding` has always declared both DIMs — but
+      `tf.projection_pushdown` was `is_collector`, so the get was never narrowed and the call site passed an
+      empty list. ⚠ Verified by READING the two gates rather than assuming: `RemoveColumnsFromLogicalGet`
+      keys on that flag and on nothing about `in_out_function`, and the `LOGICAL_GET` case narrows the get
+      BEFORE recursing into a table-in-out's child.
+    - ⚠ BOTH exchange registrations, deliberately: the GLOBAL one and the CATALOG-BOUND one every
+      provider-declared `_each` resolves through. They are separate call sites and could have been split;
+      the ignore-the-hint fallback makes the second safe, and two registrations disagreeing about their own
+      optimizer contract is what someone trips over later.
+    - **⚠⚠ THE GATE THAT MATTERS IS THE CALLEE THAT IGNORES THE HINT — §24's lesson, reproduced exactly.**
+      `fluid_query_inout` HONOURS it, so its wire map is the IDENTITY and its own rows CANNOT catch an
+      off-by-one: mutant 2 (drain by position) passes `verify_plugin_fluid` at **810** and dies in
+      `verify_global_functions`. The discriminating callee is `fabricator_inout_va`, whose two columns are
+      of DIFFERENT types. ⚠ It is killed there by a **PRE-EXISTING** row (`count(*), min(tag)`), because
+      enabling pushdown made an existing assertion depend on the new map; the added rows kill it too, with
+      an `INTERNAL Error: … unique_ptr that is NULL` — so a wrong map is a CRASH, not a wrong value.
+    - ⚠ Mutant 1 (the flag reverted) dies at fluid's PAYOFF row after 800 pass and leaves
+      `verify_global_functions` GREEN at 178 — the honest split, since with no hint everything is full width
+      and still correct.
+    - **⚠ THE PROJECTION IS WHAT IS *READ*, NOT WHAT THE INNER SELECT LIST SAYS** — measured while writing
+      §36, where `min(q) FROM (SELECT p AS q, a FROM …)` still narrowed to `p` alone because DuckDB prunes
+      `a` straight through the subquery. A row meaning to exercise the UNNARROWED path must CONSUME both.
+    - **⚠⚠ IT FOUND A PRE-EXISTING DEADLOCK — limitation 1.25 — AND THE OBVIOUS FIX FOR IT IS MEASURED
+      WRONG. Full record: [docs/fluid-templating.md](fluid-templating.md) §37.5 + §37.6.** A `LIMIT`
+      above ANY streaming in-out gives `Invalid Error: resource deadlock would occur`; MEASURED on
+      `fluid_query_inout` and `fabricator_inout_va`, and **reproduced on a binary built from HEAD with the
+      projection change absent**, which is what attributes it elsewhere. The operator returns
+      `HAVE_MORE_OUTPUT` holding the gate and releases it only on its NEXT invocation, so an early-stopped
+      pipeline ABANDONS the tenure and `FinishEof` then tries to take it.
+      - **⚠⚠ NOT "a bare LIMIT" — that was the first write-up and it is too coarse.** MEASURED over 4 rows:
+        `LIMIT` 1/3/4 fail, **`LIMIT 10` is FINE** (the operator is pulled again, hits END, releases).
+        `ORDER BY … LIMIT` is fine for the same reason, which is why no suite caught it.
+      - **⚠⚠ TWO SHAPES, AND THE SAME-THREAD ONE IS THE MINORITY.** Same thread ⇒ `EDEADLK`, which MSVC
+        throws (measured on single-branch `fabricator_inout_va` with a thread-id probe). FOREIGN thread ⇒ it
+        BLOCKS on a tenure nobody will release, i.e. a silent HANG — and instrumenting the whole of
+        `verify_plugin_fluid` gave **15 `FinishEof` calls, `owns=1` ZERO times**.
+      - **⚠⚠ SO OWNER TRACKING IS INSUFFICIENT — BUILT, MEASURED, REVERTED (2026-09-12).** Making
+        `FinishEof` ADOPT its own tenure fixes the loud case and turns the silent one into a HANG (the fluid
+        suite hung at 400 s where it had merely failed). **`std::mutex` may only be unlocked by its owner**,
+        and the gate is a TOKEN acquired in one `Execute` and released in a LATER one whose holder may never
+        run again. ⇒ the fix needs a different PRIMITIVE (mutex + condvar + a `taken` flag, releasable by
+        any thread), not more tracking. ⚠ A gate MUST cover the FOREIGN-thread case (a `LIMIT` over a
+        parallel `UNION ALL`) — a single-branch probe cannot see it, which is exactly what made the first
+        attempt look correct while the fluid suite hung.
+      - ⚠ On glibc the same-thread re-lock is UB rather than an error, so Linux is likely worse.
+
+- **⚠⚠ `fluid_query_lateral(template, params, <per-row columns…>)` — A TEMPLATE RENDERED ONCE PER INPUT
+  CHUNK, CORRELATED, PARALLEL. BUILT 2026-09-05 (user-designed; their hint "laterals currently don't
+  support named args, so params must be positional" settled the signature). C#-only IN THE PLUGIN: NO ABI
+  change, NO C++ change, NO bridge change. Gate `verify_plugin_fluid` 459 → **563**, hermetic floor
+  8735 → **8839**, two mutants each killed at its own assertion. Full record:
+  [docs/fluid-templating.md](fluid-templating.md) §22.**
+  - **⚠⚠ THE MOST USEFUL RESULT IS A MUTANT THAT KILLED WORTHLESSLY FIRST — 50 of the gate's 104 new
+    assertions exist because of it (§22.8).** `origin[i] = 0` (ignore the projected `__fab_row` entirely)
+    passed every provenance row and died only at the LAST assertion in the section. **A lateral call with
+    ONE input column is delivered ONE OUTER ROW AT A TIME**, and with a chunk of one row the only valid
+    provenance index IS 0 — so a constant was correct. MEASURED with a template reporting its own chunk
+    size: one input column ⇒ 1,1,1; **TWO input columns ⇒ 1,2,2**. Every provenance row now runs on the
+    two-column shape over six rows, with **`max(chunk) > 1` as the control** (only `> 1`, never the sizes —
+    the grouping is DuckDB's scheduling), and the sharpest row is a template that REORDERS its own output,
+    which is the one shape where "position in the output" and "the real mapping" disagree. ⇒ **a gate over
+    a batched interface is only as good as the batch it actually gets, and nothing in the SQL says what
+    that is.**
+  - **IT NEEDED NOTHING NEW, which is the payoff of two earlier slices**: `Params.Constant` (2026-08-29)
+    and the LATERAL variadic tail (2026-08-31) compose exactly as predicted — `[Constant template]
+    [Constant params][VarArgs input]` registers as `[ANY, ANY] varargs ANY`, the constants are stripped BY
+    INDEX so the tail has nothing to contend with, and `RegisterRows` / the pinned-connection
+    `fabricator_scan` / the `is_bind` + `LIMIT 0` probe / the `publish()` refusal all transferred verbatim
+    from `fluid_query_batch`.
+  - **⚠⚠ PROVENANCE IS THE CONTRACT AND IT COST WHAT WAS PREDICTED.** `input_table` carries `__fab_row`
+    first and **the generated statement must project it**; it is stripped from the result, so
+    `SELECT * FROM input_table` is the identity template. Refused AT BIND, naming the column — a
+    mis-attributed row is a wrong answer with nothing failing. An index outside `[0, chunk)` is refused
+    with the VALUE at call time (the host checks this too and precisely; the managed check exists for the
+    MESSAGE, since only this side knows the number came from a projected `__fab_row`).
+  - **⚠⚠ THE NAMING ANSWER IS BETTER THAN THE DESIGN'S, AND THE DESIGN'S ADVICE WAS MEASURABLY WORSE.**
+    The recorded plan said a caller wanting clean names "passes ONE struct … whose FIELD names are carried
+    in the Arrow schema". MEASURED: that struct arrives as ONE column named
+    **`main.struct_pack(a := t.id, b := t.n)`**, which has to be quoted verbatim to address. The real
+    answer is a **positional column alias**, ordinary SQL, identical in both call shapes:
+    `SELECT r AS __fab_row, a * b AS s FROM (SELECT * FROM input_table) AS q(r, a, b)`. ⚠ Note the id is
+    re-aliased BACK — the requirement is on the OUTPUT column's name, not the input's.
+  - **⚠⚠ AND THE `col<N>` FALLBACK IS THE ARGUMENT POSITION, NOT THE INPUT POSITION.** MEASURED: `t.n`
+    arrives as `n`, `t.n + 1` as `(t.n + 1)`, `upper('x')` as `upper('x')`; a LITERAL call has no
+    expression text and falls back to `col<SLOT>`, so with the two constants ahead of it the FIRST input
+    column of `f('tpl','null',7,'x')` is **`col2`**. Gated as a PAIR (correlated vs literal) because
+    neither half says anything about the other.
+  - **⚠⚠ `params` CANNOT BE `NULL` — the no-bag spelling is the JSON `'null'`.** A bind-time constant that
+    arrives NULL is REFUSED by the host, and rightly: in the correlated shape an explicit NULL is
+    indistinguishable from a fold that FAILED, which is the one thing that refusal exists to catch.
+    MEASURED: `'null'` binds and the bag is NIL (`{% if params %}` false), `'{}'` binds and is TRUTHY, a
+    STRUCT `{'mul': 10}` survives the correlated shape. All four gated, the last three as the control —
+    the refusal alone would be equally true of a build where constants had stopped arriving.
+  - **⚠⚠ THE FIRST BUILD SHIPPED A USE-AFTER-FREE AND IT FAULTED NOWHERE NEAR ITS CAUSE:
+    `0xC0000005` inside `Apache.Arrow.C.CArrowArrayExporter.ReleaseArray`, two frames, nothing naming the
+    plugin.** The result was built over `parts[0]`'s columns and a `finally` then disposed every part. Fix
+    is an ownership rule at the seam: SEVERAL parts ⇒ the concatenator allocated every output column, so
+    release them all; ONE part ⇒ the output columns ARE that part's, so hand the batch on undisposed and
+    release only the provenance column. ⚠ Disposing a single column is not a trick —
+    `RecordBatch.Dispose` IS "dispose the columns", so this is that performed selectively, each array once.
+    ⚠ And it is a `catch`, not a `finally`: only the failure path may free blindly.
+  - **⚠ ITS GATE IS THE 6000-ROW CHECKSUM**, because a small result exercises only the single-part branch.
+    A fan-out exceeding one Arrow batch is the path that would truncate silently.
+  - **⚠ NO STATE CARRIES BETWEEN CHUNKS, unlike the collector — and it is NOT gated.** The operator is
+    PARALLEL (one `FluidRenderSession`, one DuckDB connection and one temporary catalog per pipeline
+    thread), so which rows reach which session is the scheduler's business; asserting it would be flaky in
+    one direction and vacuous in the other. Documented on the class instead. Use `fluid_query_batch` to
+    accumulate — it is sequential by construction. ⚠ What IS measured is that several sessions at once are
+    CORRECT, which is the half that could break (each issues `CREATE OR REPLACE TEMP TABLE input_table`
+    under the SAME name, so a shared catalog would have them overwriting one another): **50,000 distinct
+    correlated values at `threads = 8` ⇒ 50,000 rows, `sum` exactly 2,499,950,000.** Not in the suite.
+  - ⚠ Incidental cleanup in the same pass: `ArgColumn` (read a bind arg BY NAME) was a private copy in the
+    collector and is now `FluidValueModel.ArgColumn`, shared — the rule cannot exist in two versions. And
+    the two STALE doc comments flagged on 2026-08-31 (`ParamStyle.VarArgs`'s remark and `Params.Validate`'s
+    refusal, both saying varargs are "deferred for lateral and in-out") are CORRECTED: every kind but
+    AGGREGATES takes a tail, and an aggregate cannot because its update crossing rebuilds the batch schema
+    from the declaration.
+  - **⚠⚠ PROJECTION PUSHDOWN IS BUILT — ABI v86, 2026-09-06 (user-directed: "build 1+2+(a). couldn't we
+    just include a fluid `projected` as well and the template is free to use it or not?"). C++ + ABI + C#.
+    Gate `verify_plugin_fluid` 599 → **677**, hermetic floor 8875 → **8953**, one mutant. Full record:
+    [docs/fluid-templating.md](fluid-templating.md) §24 + [docs/abi-history.md](abi-history.md)
+    §v86.**
+    - **TWO OPTIMIZER FACTS MADE IT CHEAP, both read at the pin.** `UNUSED_COLUMNS` runs at
+      `optimizer.cpp:222`, BEFORE optimizer extensions at `:331`, so our own rewrite already sees the
+      narrowed `column_ids` and needs no new plan pass; and `GetAnyColumn()` falls through to `return 0` for
+      a get with no virtual columns, so the all-pruned case (`SELECT count(*) FROM t, f(…)`) can never hand
+      us an empty list or a rowid sentinel. `lateral_open` is the ONLY crossing in the window between bind
+      and execution, which is what fixes where it rides.
+    - **⚠⚠ IT IS A HINT, AND THAT IS WHAT LET IT SHIP WITHOUT TOUCHING ONE EXISTING LATERAL.** A callee may
+      honour it or return its full declared schema; the host discriminates by COLUMN COUNT and validates
+      types either way, in the wire check that was ALREADY the trust boundary. So
+      `ILateralFunctionBinding.Open(IReadOnlyList<int>?)` is a DIM, not a signature change — the alternative
+      would have meant real narrowing logic in seven in-tree demos and three out-of-tree plugins to buy
+      nothing they need.
+    - **⚠⚠ THE MUTANT INVERTED WHICH ASSERTION MATTERS.** Emitting by position instead of through the wire
+      map passes **630** assertions — including EVERY `fluid_query_lateral` projection row — and dies at the
+      `fabricator_lat_span` row. Because fluid HONOURS the hint its map is the IDENTITY, so its own rows
+      cannot catch the off-by-one at all. **The row that tests the map is the one where the callee IGNORES
+      the hint**, and without a demo that does so this would have shipped with a vacuous gate.
+    - **THE PAYOFF IS THE INNER STATEMENT, not the wire.** MEASURED before building: DuckDB prunes an
+      unreferenced expression inside a subquery (`SELECT a FROM (SELECT i AS a, error('X') AS b FROM
+      range(3))` returns three rows; referencing `b` raises), so a wrapper naming only the projected columns
+      makes the TEMPLATE'S OWN statement stop computing what nobody reads. Gated as that pair.
+    - **⚠⚠ THE USER'S QUESTION CORRECTED MY OBJECTION TO (b).** I had argued exposing `projected` to the
+      template inverts the schema contract. TRUE without (a), FALSE with it: the wrapper NORMALISES the
+      shape whatever the template did — ignore it and the extras are dropped, use it and the wrapper selects
+      what is there, render fewer and DuckDB's binder fails naming the column. So it is genuinely optional,
+      which is what was asked. ⚠ Not bound during the schema probe (no projection exists yet), so a template
+      reading it branches on `is_bind`.
+    - **⚠ A BEHAVIOUR CHANGE IT FORCED, and the gate is stronger for it**: selecting BY NAME instead of
+      `* EXCLUDE` means a chunk rendering an EXTRA column now has it DROPPED where it used to be refused.
+      Harmless by construction (nobody can read a column absent from the declared schema), and the hazard
+      that check existed for is now structurally impossible rather than caught — by-name selection means the
+      batch reaching the host always has exactly the declared columns in the declared order. MISSING,
+      RENAMED and RETYPED are all still refused; §28's one drift row became four.
+    - ⚠ NOT done: filter pushdown (`filter_prune` stays off, which is also why `projection_ids` stays empty
+      and the eligibility check can keep bailing on it). ⚠ A same-width REORDERING would defeat the managed
+      side's count-based test; it cannot arise because `RemoveColumnsFromLogicalGet` preserves order, but
+      that is an assumption about DuckDB, recorded rather than guarded.
+  - **⚠ ALREADY TRUE, NOW STATED AND PINNED (2026-09-06, user-asked: "could we make the input_table
+    available as an empty table at bind time (is_bind)? This enables building the outputschema not only
+    dependent on params but also on the input_table schema"): IT ALREADY IS, on both surfaces.** Both binds
+    call `CreateEmptyInput` BEFORE the `is_bind` render, so a template can `DESCRIBE` the empty
+    `input_table` and build its SELECT list from the answer. MEASURED: one template over
+    `(SELECT 1 AS alpha, 'x' AS beta)` yields `out_alpha`/`out_beta`, and the SAME template over
+    `(SELECT 7 AS gamma)` yields `out_gamma`. Gate `verify_plugin_fluid` 702 → **716**, floor 8978 →
+    **8992**; NO code change. Full record: [docs/fluid-templating.md](fluid-templating.md) §26.
+    - ⚠ **Worth PINNING rather than merely documenting**: `CreateEmptyInput`'s stated purpose is letting the
+      probe BIND the generated statement, so the schema being DERIVABLE from it is a second-order effect of
+      the ORDERING — a refactor moving the create past the render would take it away silently.
+    - ⚠ The discriminating row is the SAME template over a DIFFERENT input: a single-input assertion passes
+      equally on a build with the names hardcoded.
+    - ⚠ It composes with `projected`: the probe has the INPUT schema but NOT the projection, which does not
+      exist until after the bind. So a template may derive its FULL shape from the input at bind and narrow
+      that shape per call.
+  - **⚠⚠ AND THE SAME FOR THE COLLECTOR — ABI v87, 2026-09-06 (user-asked: "should be possible to add
+    `projected` to fluid_query_batch?"). Gate `verify_plugin_fluid` 677 → **702**, floor 8953 → **8978**,
+    one mutant. Full record: [docs/fluid-templating.md](fluid-templating.md) §25.**
+    - `inout_exchange_open` gains the hint, for COLLECTORS ONLY **at the time** (the streaming exchange
+      passed an empty projection) — ⚠ **SUPERSEDED 2026-09-12: the exchange advertises it too now, with NO
+      ABI change; see the `fluid_query_inout` entry's projection sub-entry.** ⚠⚠ **One thing differs from
+      the lateral and needed an extra member**: a collector's output
+      crosses as ONE stream whose schema is read BEFORE the first batch — an EMPTY result must be
+      classifiable too — so a callee that narrows must DECLARE it via
+      `ICollectorFunctionBinding.ProjectedOutputSchema(projected)`, a DIM returning the full schema by
+      default. Overriding `Collect` alone would have the host read narrow batches through wide converters.
+    - **⚠⚠ THE PROBE THAT PROVED NOTHING, and it is the most useful thing in the pass.**
+      `SELECT b FROM fluid_query_batch(…)` returns one column WHETHER OR NOT the get was narrowed, because
+      DuckDB projects above the operator either way — so it passed happily while the projection reached
+      NOTHING: `projection_pushdown` had been set on the CATALOG registration and `fluid_query_batch` is a
+      GLOBAL collector, registered on a different path. ⇒ **the only evidence of pushdown is work NOT
+      HAPPENING, or the projection itself; the shape of the result is not evidence.**
+    - **⚠⚠ AND THE FIRST EXPLANATION FOR IT WAS WRONG, killed by the gate.** The same probe under
+      `SELECT DISTINCT` also showed all columns, which fits DuckDB's `everything_referenced = true` rule for
+      a plain distinct — a real rule that was NOT the cause. Re-measured after the registration fix, DISTINCT
+      narrows fine; the row asserting otherwise FAILED and was deleted rather than adjusted. **A plausible
+      mechanism that fits one observation is not a measurement** — this file's own recurring error.
+    - ⚠ The payoff row must NOT aggregate: the schema probe renders against an EMPTY `input_table`, and a
+      `count(*)` produces a row — and evaluates the `error()` — at BIND, failing the row for a reason
+      unrelated to projection.
+    - ⚠ Same mutant lesson (dies at `fabricator_collect_sum` after 690 pass) and same drift relaxation:
+      `fluid_query_batch` had NO wrapper before and now always wraps, so an EXTRA column is dropped where it
+      was refused. **The wrapper is applied even with no projection, deliberately** — otherwise the drift
+      behaviour would depend on the caller's SELECT list.
+  - **⚠⚠ MY "STILL OPEN" LIST WAS WRONG ON TWO OF THREE — user-corrected 2026-09-05 ("batchsize-like
+    control not needed and i don't know if projection pushdown is even supported by duckdb for laterals").**
+    ⛔ **A `batchsize`-like control is NOT WANTED — do not build it.** And **projection pushdown is a
+    SETTLED DECISION, not an open item**: DuckDB DOES support it for this shape (one flag,
+    `TableFunction::projection_pushdown`; `RemoveUnusedColumns` gates on exactly that at
+    `remove_unused_columns.cpp:720`, for ANY `LOGICAL_GET` — the visitor even has a branch recursing into a
+    get's child *"e.g., table in out functions"*), and the reason it is OFF is OURS and was already written
+    into `fabricator_lateral.cpp`'s header: narrowing the get would need the callee-original column indices
+    captured at rewrite time and threaded through as the wire projection, *"where an off-by-one reads a
+    callee column into a correlated column's slot: wrong data, no error"*. ⚠ Plus a second cost that note
+    omits: `LateralIsEligible` BAILS when `projection_ids` is non-empty (`:757`), so setting the flag today
+    would silently drop every projected lateral onto the ROW-BY-ROW path — two changes, not one. ⚠ It has
+    NOTHING to do with `publish`'s obstacle (a lazily projected stream delivering fewer columns than its
+    DECLARED schema); I conflated them. **The one genuinely open item is the input rows as a Fluid VALUE**,
+    which `{% query %}` over `input_table` already does in one statement.
+
+- **⚠⚠ `{% query name materialize: 'view'|'table' %}` — LEAVE THE RESULT ON THE CONNECTION **AND** BIND THE
+  NAME LAZILY. BUILT 2026-09-06 in two rounds (user-asked, then user-directed after they proposed the
+  opposite mechanism and agreed the inversion was better). C#-only IN THE PLUGIN: no ABI, no C++. Gate
+  `verify_plugin_fluid` 716 → 729 → **737**, hermetic floor 8992 → 9005 → **9013**, two mutants each killed
+  at its own assertion. Full record: [docs/fluid-templating.md](fluid-templating.md) §27.**
+  - With `materialize:` set the rows are left on the render's pin as a TEMP object a later block can read AND
+    the identifier is still bound in Liquid — as a `LazyRowsValue` that runs `SELECT * FROM "name"` on the
+    pin at FIRST ACCESS and caches. `materialize: null` stays the default and is unchanged.
+  - **⚠⚠ THE USER'S PROPOSED MECHANISM WAS THE MIRROR IMAGE AND WAS DECLINED ON COST, NOT ON SAFETY — and
+    one premise of it was RIGHT in a way worth keeping.** They proposed retaining the `RecordBatch`es for the
+    render, registering them back as a scannable temp view, and mapping cells lazily. It is mechanically
+    feasible (`IHostQuery.RegisterRows` documents that scanning one token twice is fine, which a bound Arrow
+    INPUT cannot promise), and the earlier failure of a lazy wrapper really is LOUD rather than silent
+    (Apache.Arrow nulls a disposed batch's arrays ⇒ `NullReferenceException` on the first cell read, every
+    platform). What kills it is that it is **two crossings and a full buffer to reach a place the rows
+    already were**: `materialize:` is a CTAS, so nothing crosses the ABI, nothing is capped and DuckDB
+    spills, while the round trip would reintroduce `query()`'s 1,000,000-row cap on the one path whose point
+    is a relation too big for Liquid — the same trade `publish()` measured and reversed. It would also make
+    the temp object UNCONDITIONAL, so §27.4's shadowing would stop being opt-in. ⇒ **keep the rows in DuckDB
+    and make the LIQUID side lazy over them.**
+  - **⚠⚠ `fluid:` IS GONE, BREAKING, NO ALIAS — the lazy bind made it vestigial.** It defaulted to "no
+    materialize" and `fluid: true` asked for both while RUNNING THE BODY TWICE; with binding free there is
+    nothing left to opt out of and the body runs ONCE in every spelling. ⚠ It is no longer a reserved name,
+    so it falls through to the bound parameters and fails LOUDLY (*"excess parameters: 1"*, named
+    POSITIONALLY because a body with no `$named` params falls back to positional binding). §33 pins that.
+  - **⚠⚠ §33'S ROW ASSERTING THE OPPOSITE WAS REPLACED, NOT DELETED** — it pinned *"materializing means the
+    rows went to SQL instead of to Liquid"* (`{{ v }}` empty), which was true of the first build and IS the
+    assumption this change lifts. Falsifying it is the change announcing itself.
+  - **⚠⚠ A VIEW IS EVALUATED AT THE ACCESS AND A TABLE AT THE BLOCK — MEASURED, and it is the row that proves
+    the read is deferred**: a view over a table, an `{% exec %}` updating it, then the first Liquid access ⇒
+    the NEW value (7 where the block saw 1); the identical template with `'table'` reads 1. ⚠ The `'table'`
+    leg is a CONTROL, not a second proof — an eager bind reports 1 there too. Mutant A (eager bind) dies at
+    the view row after 721 pass; mutant B (drop the cache) at the cache row after 725.
+  - **⚠ I WROTE A FLAKE INTO THE GATE AND CAUGHT IT BY READING THE COMMENT AGAINST THE EXPECTED VALUE**: the
+    two legs were two `fluid_render` calls in ONE `SELECT`, which does not pin an order, so whether the second
+    saw the first's UPDATE was DuckDB's business. It PASSED. Each row sets its own starting value and renders
+    once now. The shape is already recorded in this file and was walked into anyway.
+  - **⚠⚠ A TABLE CAN CARRY THE BLOCK'S NAMED ARGUMENTS AND A VIEW CANNOT — MEASURED, DuckDB's rule.** A CTAS
+    with a bound parameter works; the same body as a view is refused with *"Unexpected prepared parameter.
+    This type of statement can't be prepared!"*, because a view STORES its body. Refused at the tag naming
+    the mode and pointing at `'table'` — and refused whenever named args are supplied with `'view'`, not only
+    when the body references them, since the narrower rule would depend on the body.
+  - **⚠⚠ A BUG MY OWN SHORTCUT CREATED**: `materialize: null` failed with *"excess parameters"* because
+    `ReadQueryOptionsAsync` returned the argument list UNCHANGED when nothing was taken — which cannot tell an
+    ABSENT option from one PRESENT AND NULL, and `null` is the documented default. Always rebuilt now; §33's
+    second row is the discriminator.
+  - **⚠⚠ THE SHADOWING HAZARD THIS FILE SAID TO "SETTLE DELIBERATELY" IS SETTLED, and both halves are
+    MEASURED**: a materialized name DOES shadow a catalog table of that name for the rest of the render (99
+    over a table holding 1), and the catalog table is UNTOUCHED afterwards because the temp object dies with
+    the render's connection. ⇒ accepted: the name is the author's own identifier, the blast radius ends with
+    the render, and it happens ONLY when the author asks for it — which is the half the declined mechanism
+    would have lost.
+  - ⚠ It is ERGONOMICS over something that already shipped (`{% exec %}CREATE TEMP TABLE …{% endexec %}` then
+    `{% query %}`); what it adds is that the body stays a `{% query %}` body — still SELECT-classified, still
+    parameterised the same way — and, after the second round, that choosing the destination no longer means
+    choosing between SQL and Liquid. This is the deferred "query + automatic CTAS" in its EXPLICIT form.
+  - ⚠ `materialize` is now the ONE reserved argument name, joining `{% print %}`'s `delim`/`rowdelim`. The
+    option is EVALUATED, so `materialize: params.mode` works. ⚠ The lazy read is deliberately NOT classified:
+    it is `SELECT * FROM` a quoted identifier composed by `ReadMaterialized`, with no template text in it.
+
+- **⚠⚠ `input_table` IS A LAZY FLUID VALUE TOO — the same inversion, second surface. BUILT 2026-09-06
+  (user-asked: "yes lazy fluid makes also sense for input_table"). C#-only IN THE PLUGIN: no ABI, no C++,
+  and NO new mechanism — it is `LazyRowsValue` pointed at the temp object each surface already creates.
+  Gate `verify_plugin_fluid` 737 → **758**, hermetic floor 9013 → **9034**, one mutant. Full record:
+  [docs/fluid-templating.md](fluid-templating.md) §28.**
+  - Both surfaces and both probes: `fluid_query_batch` per GROUP, `fluid_query_lateral` per CHUNK, and the
+    schema probe on each (where the relation is EMPTY). `{{ input_table.size }}`,
+    `{% for r in input_table %}` and `SELECT … FROM input_table` all name the same rows.
+  - **⚠⚠ THE LOAD-BEARING PROPERTY IS FRESHNESS PER RENDER, NOT LAZINESS.** The value CACHES — which is what
+    keeps one render consistent, and is exactly why it must be REBUILT before every render that repoints the
+    object. One bound per session serves the FIRST group's rows to every later group: right column names,
+    right shape, wrong rows, no error anywhere. `BindLazyRelation` is called immediately after
+    `DefineGroupView` / `StageInput`, so the SQL view and the Liquid value are repointed together and the two
+    paths cannot disagree about which group they are in. §34's first row is the discriminator — SQL count and
+    Liquid `.size` per group, and the numbers CHANGE (2, 2, 1 at `batchsize := 2` over five rows) where a
+    session-scoped value reports 2, 2, 2. The mutant dies there after 742 pass.
+  - **⚠ THE LATERAL NEEDED NOTHING EXTRA DESPITE BEING PARALLEL**: one session, one connection and one
+    `TemplateContext` per pipeline thread, so a per-call `SetValue` on that thread's context is
+    thread-confined by construction.
+  - **⚠⚠ RETAINING THE INPUT BATCHES INSTEAD WOULD HAVE BEEN A USE-AFTER-FREE, not merely expensive** —
+    `IHostQuery.RegisterRows` documents the rows as **borrowed, not adopted**, and the framework frees a
+    collector's input chunk once consumed. So §27.1's cost argument and this one point the same way for
+    different reasons, and this half is the stronger of the two.
+  - ⚠ It costs NOTHING unless the template reads it: the rows were already staged in DuckDB (`__fab_input`
+    for the collector, a temp table for the lateral), so there is no copy and no crossing added.
+  - **⚠ THE `bind_saw_0` ROW IS A CHARACTERIZATION and the suite says so** — it pins that the probe's
+    `input_table` is EMPTY rather than sampled, by rendering the size into the output COLUMN NAME so a wrong
+    value would be refused by the drift check. No mutant of ours reaches it: removing the bind-time binding
+    makes `{{ input_table.size }}` render EMPTY, so the probe's own SQL fails to parse and §34's FIRST row
+    catches it. **A mutant dying in the right section is not the same as a mutant dying at the row you aimed
+    it at** — check which, and relabel rather than claim coverage.
+  - ⚠ A template's own `{% assign input_table = … %}` SHADOWS ours (we bind before the render — the safe
+    direction) and only on the Liquid side; the SQL object is a different namespace and keeps the rows.
+    Asserted as a pair. ⚠ It IS a behaviour change, not a pure addition: the name previously resolved to
+    nothing in Liquid, so a template rendering `{{ input_table }}` used to get an empty string.
+
+- **⚠⚠ `{% ret %}` — END THE RENDER HERE, KEEP WHAT WAS WRITTEN. BUILT 2026-09-05 (user-asked). C#-only IN
+  THE PLUGIN: NO ABI change, NO C++ change, NO bridge change. Gate `verify_plugin_fluid` 563 → **599**,
+  hermetic floor 8839 → **8875**, three mutants. Full record:
+  [docs/fluid-templating.md](fluid-templating.md) §23.**
+  - **⚠⚠ IT HAD TO BE AN EXCEPTION, AND BOTH ALTERNATIVES ARE MEASURED WRONG.** Liquid's `Completion` has
+    three values and `FluidTemplate.RenderAsync` — the ROOT — awaits each statement's completion and NEVER
+    INSPECTS IT, so `A{% break %}B` renders **AB** and only a `{% for %}` consumes a Break at all; a
+    completion-based `ret` is silently ignored exactly where it is wanted. The other candidate — an
+    IFluidOutput wrapper that discards writes after the tag — produces the same TEXT while every statement
+    after it still RUNS, so an `{% exec %}` below a `{% ret %}` would still write. **"Stop" has to mean
+    stop**, and the gate pins it (audit table at 0). ⇒ a private `FluidEarlyReturn`, caught in `RenderOn`.
+  - **⚠⚠ CATCHING IT MEANT OWNING THE OUTPUT, WHICH DRAGGED IN THE CHILD SCOPE — the part that would have
+    been easy to lose.** Fluid's `Render(ctx)` builds the StringWriter INSIDE itself, so `RenderOn` now
+    renders into its own `TextWriterFluidOutput` — i.e. reproduces that extension rather than calling it,
+    `EnterChildScope`/`ReleaseScope` included. That pair is what makes a `{% assign %}` NOT survive a
+    render, which `fluid_query_batch` measures and §25 pins. **Mutant G (drop both) dies after 423
+    assertions at a PRE-EXISTING §25 assertion** — the stronger kill, since the property was already
+    correctness-bearing and this change would have quietly broken it.
+  - **⚠⚠ THE DESIGN NOTE'S "THE TAG MUST FLUSH, BECAUSE THE CATCH SITE CANNOT" IS FALSE AT THIS PIN, for a
+    reason this file already records once**: `TextWriterFluidOutput.DisposeAsync` flushes, which is what let
+    an earlier `{% exec %}` flush-mutant SURVIVE. The tag flushes nothing; the catch site does. ⚠ And the
+    flush is NARROWER than "the output buffers" — `FluidTemplate.RenderAsync` ends with a flush of its own,
+    so an ordinary render needs nothing from us and **the EXCEPTION is what skips it**. Mutant D (drop the
+    flush) passes **563** and dies at the FIRST `{% ret %}` assertion, which is what shows it serves that
+    path and only that path.
+  - **⚠⚠ THE ONE DIVERGENCE FROM SCRIBAN, PINNED RATHER THAN DESCRIBED: inside an `{% include %}` it ends
+    the WHOLE render, not just the included page** (measured, with a no-`ret` control beside it;
+    `{% render %}` behaves identically although standard Liquid isolates its scope). Fluid renders an
+    include as a NESTED `FluidTemplate` whose root discards completions the same way, so stopping just the
+    include would mean re-implementing `{% include %}` and its whole grammar. ⚠ Arguably the better reading
+    HERE — an include is a FRAGMENT of the statement being built, not a function call — but it is a
+    divergence from the thing it emulates, so it is asserted.
+  - ⚠ The scope stack stays BALANCED when the exception unwinds: `{% for %}`, `{% include %}` and
+    `{% render %}` all release their child scope in a `finally` (read at the pin), and it is MEASURED where
+    it would bite — three `fluid_query_batch` groups on one shared context, each unwinding out of a loop,
+    counter reading 1, 1, 1.
+  - ⚠ Works on every surface (all four go through `RenderOn`); in `fluid_replacement_query` it TRUNCATES the generated
+    statement. Takes no arguments — Fluid says so at PARSE.
+  - **⚠⚠ A SEPARATE, PRE-EXISTING FINDING IT SURFACED AND DID NOT FIX: a SESSION-scoped
+    `fluid_template_root` does not reach every surface.** MEASURED with a relative `{% include %}`:
+    `fluid_render` ✓, `fluid_replacement_query` ✓, **`fluid_query_batch` FAILS AT BIND and works at SCAN**,
+    `fluid_query_lateral` FAILS AT CALL. **Workaround, complete and measured: `SET GLOBAL`.** ⚠ The
+    bind/scan SPLIT is what makes it diagnosable, and it took a three-way A/B: with BOTH layers set the
+    collector renders the SESSION value, while with the session layer alone its BIND fails — so the bind
+    reads the global layer. Confirmed by an `{% if is_bind %}` branch that avoids the include at bind, which
+    renders correctly under a session-only root and which no other explanation predicts. Same class as the
+    slice-4 finding that a plain `SET` was invisible to `fluid_render` (fixed for scalars by ABI v82); both
+    crossings DO call `FabricatorSetActiveTxn`, which sets the settings session, so the mechanism is there
+    and something defeats it. ⚠ Its own change — the v80 record warns the ambient plumbing is delicate.
+
+- **⚠ PARENTHESES ARE ENABLED ON THE FLUID PARSER (2026-09-05, user-asked): `AllowParentheses = true`
+  beside `AllowFunctions` in `FluidEngine.CreateParser`. One line. Gate `verify_plugin_fluid` 455 →
+  **459**, hermetic floor 8731 → **8735**, one mutant. Full record:
+  [docs/fluid-templating.md](fluid-templating.md) §21.**
+  - **⚠⚠ IT IS NOT A CONVENIENCE — LIQUID HAS NO OPERATOR PRECEDENCE and evaluates strictly RIGHT TO LEFT,
+    so `a or b and c` is `a or (b and c)`.** MEASURED on one bag (a true, b false, c false): ungrouped
+    answers **yes**, `(a or b) and c` answers **no**. ⇒ the grouped condition was INEXPRESSIBLE, not merely
+    clumsy — and a template that generates SQL is exactly where a mixed and/or condition turns up. §27 pins
+    the pair WITH the ungrouped row as the control (the grouped `no` alone would be equally true of a build
+    where the condition had stopped evaluating at all).
+  - ⚠ A PARSER option, not a `TemplateContext` one (the user's phrasing was "on the templatecontexts"), so
+    it must be set where the parser is BUILT: templates are cached by TEXT, and one parsed before the option
+    was set would stay cached — rejected — for the process's life. Same rule the `{% exec %}` registration
+    records. ⚠ Fluid names the option in its own parse error, which is how the need surfaces at all.
+  - ⚠ Both parser options are on at once and a function call is itself parenthesised, so §27 also pins that
+    `query(...)` still parses — enabling grouping did not disturb the call syntax it depends on.
+
+- **⚠⚠ THE FLUID PARAMS BAG IS NOW BOUND WHOLE TOO, under the name `params` — `params.x`, `params[0]`,
+  `params.size`. BUILT 2026-09-05 (user-asked: "let us lift this … assign params to variable name
+  `params`"). C#-only in the plugin, ONE function (`FluidValueModel.Capture`); NO ABI, NO C++. Gate
+  `verify_plugin_fluid` 443 → **455**, hermetic floor 8719 → **8731**, two mutants. Full record:
+  [docs/fluid-templating.md](fluid-templating.md) §20.**
+  - **⚠⚠ THE ASSUMPTION IT LIFTS COST MORE THAN ERGONOMICS, and the LIST row is why it is a FIX.** The bag
+    was readable only through its MEMBERS, so it had to HAVE members: a JSON array was REFUSED outright
+    (*"params JSON must be an OBJECT"*) and **a DuckDB `LIST` matched no case in the walk and bound NOTHING,
+    SILENTLY** — a template reading it rendered empty with no error anywhere. That is the silent-wrong-answer
+    class, on the shape a caller reaches for most naturally from SQL (`params := ['a','b']`), and in
+    `fluid_replacement_query` what renders empty is spliced into a STATEMENT. A bare scalar was equally silent.
+  - **⚠⚠ THE MEMBER SPREAD IS GONE — user decision the same day, BREAKING, NO ALIAS.** `{{ n }}` renders
+    EMPTY; `{{ params.n }}` is the only spelling. Shipped ADDITIVE first (the literal ask and the reversible
+    half), then removed on the user's "yes, only this spelling". ⚠ **`is_bind` STAYS TOP LEVEL** (user
+    preference, and what `fluid_query_batch` already did) — it is a host AMBIENT, not a member, and with the
+    spread gone it can no longer be shadowed by a member of the same name (MEASURED beforehand that the
+    ambient already won and the member stayed reachable as `params.is_bind`).
+  - **⚠⚠ MY BLAST-RADIUS ESTIMATE WAS WRONG BY ~8x AND CORRECTING IT IS WHAT MADE THE DECISION INFORMED.**
+    I said "~a dozen gate rows"; MEASURED, `verify_plugin_fluid` passes a bag at **~98 call sites** (48
+    positional struct/MAP literals, 29 `params := …`, 21 JSON-string bags) of 278 `fluid_*` calls, plus 8
+    README examples. The wrong figure had already reached the summary, a commit message and the doc.
+  - **⚠⚠ HOW A ~100-SITE REWRITE WAS MADE SAFE, worth reusing: MEMBER-DRIVEN, NOT IDENTIFIER-DRIVEN.** For
+    each sqllogictest block the member names come from that block's OWN bag literals, and only those names
+    are rewritten — which is what keeps LOOP VARIABLES out of it (`{% for c in cols %}{{ c }}` rewrites
+    `cols`, leaves `c`, because `c` is not a member). Two passes (the second for bags written `{v: …}`
+    rather than `{'v': …}`) covered 98 regions; **the SUITE then found the rest, and each was a case the
+    script could not have known**: five CROSS-BLOCK sites where the bag arrives as `params := ?` or belongs
+    to the INCLUDING render, and one FALSE POSITIVE — `{{ d | date: "%Y-%m-%d" }}` became `%Y-%m-%params.d`,
+    the lookbehind having guarded `.` and word chars but not `%`. ⇒ **a rewrite this size cannot be
+    eyeballed; the suite has to be the oracle**, and every failure named its own line.
+  - **⚠ THE ASSERTION COUNT DID NOT MOVE (455) ACROSS THE REMOVAL, which is why the removal needed a row of
+    its OWN.** Templates were rewritten, not assertions added — so §26's first row is now
+    `bare=[{{ n }}] dot={{ params.n }}` expecting `bare=[] dot=7`. Without it nothing would notice the
+    spread coming back; every other row passes just as happily with it. Mutation-tested (restoring the
+    STRUCT spread dies exactly there after 442 pass).
+  - ⚠ `params[0]` is FREE and not a second mechanism — Fluid resolves an index by asking `TryGetValue` for
+    the KEY `"0"`, and `EagerStruct` already has the int-parse fallback `ArrowStruct` documents. ⚠ `ArrowMap`
+    deliberately does NOT, so `params[0]` on a MAP does not resolve; pinned as an asymmetry rather than
+    papered over.
+  - ⚠ UNCHANGED on purpose: invalid JSON is still an ERROR (a VARCHAR bag IS JSON, and binding unparseable
+    text as a string would hide a typo in the caller's own JSON — only the *object-only* half was lifted);
+    a NULL bag binds nothing at all, `params` included, so `{% if params %}` is how to ask.
+  - **⚠⚠ `.size` AND `params[0]` ALONE WOULD NOT HAVE CAUGHT A BROKEN BUILD** — the header of
+    `FluidValueModel` records that a `JsonNode` bound with no converter RENDERS CORRECTLY WHILE COMPUTING
+    WRONG. So §26's JSON-array row asserts a `{% for %}` **SUM** and the scalar row asserts `| plus: 1`.
+    Arithmetic is the only thing separating a real value from one that merely renders like one.
+  - ⚠ The row pinning *"params JSON must be an OBJECT"* is REPLACED, not deleted — that refusal WAS the
+    assumption being lifted, so falsifying it is the change announcing itself; a note at the old site points
+    at its replacement. ⚠ And my first expected value for the shadowing row was WRONG (copied from a
+    one-member probe into a two-member row) — compute or RUN an expectation, never transcribe one.
+
+- **⚠⚠ `fluid_query_batch(template, <input> [, params :=] [, batchsize :=])` — A TEMPLATE RENDERED WITH A
+  RELATION IN HAND, and its statement run. BUILT 2026-09-05 (user-designed over two rounds; the user's own
+  correction — "whole table does not work, we have a special collector function for this" — settled the
+  mechanism). C# in the plugin + two host members + ONE C++ marshal fix; **NO ABI change**. Gate
+  `verify_plugin_fluid` 397 → **443**, hermetic **75/75 — 8719** (8673 + exactly 46, so no other suite
+  moved), THREE mutants each killed at its own assertion. Full record:
+  [docs/fluid-templating.md](fluid-templating.md) §19.**
+  - **⚠⚠ IT IS A COLLECTOR AND THAT IS FORCED.** The default — no `batchsize`, ONE render over the whole
+    input — emits nothing until input EOF, and the streaming in-out operator CANNOT express that: its only
+    all-input-done hook is handed no `DataChunk`, so output held back until EOF is DRAINED AND DISCARDED.
+    ⚠ `kind` is fixed at REGISTRATION, so one name cannot switch operators by parameter — which is why
+    `batchsize` lives on the collector rather than selecting between the two. ⚠ The price is inherent:
+    **the whole input is buffered before the first render**, even at a small `batchsize`, so `batchsize` is
+    about how many rows each RENDER sees and NEVER about memory.
+  - **⚠⚠ THE USER'S OWN SKETCH HANGS, AND MEASURING IT SHAPED THE SURFACE.** A `publish()` of a staged
+    table inside it deadlocks — 2 min, killed, 13.5 s CPU — while the identical template through
+    `fluid_replacement_query` returns in seconds as the control. `fluid_replacement_query`'s publication is scanned by the CALLER's
+    plan on a DIFFERENT connection; here WE run the generated statement on the render's own pin, so the
+    publication's factory opens a second query on the connection already mid-query. ⇒ **`publish()` is
+    REFUSED by name here**, and nothing is lost — a publication carries a relation ACROSS a connection
+    boundary and there is none: selecting the staged table directly just works. ⚠ A test reproducing the
+    hang would HANG the tier, so what is pinned is the refusal, with the still-allowed `fluid_replacement_query`
+    publish beside it as the positive control.
+  - **⚠⚠ THE INPUT TABLE NEEDED NO ABI CHANGE, and one measurement is why: `fabricator_scan` RESOLVES ON A
+    PINNED CONNECTION** (a `{% query %}` on a render's pin read `fabricator_demo_numbers`' 3 rows). The
+    named-source registry is process-global and the replacement scan lives on the DatabaseInstance, so rows
+    go managed → `Host.RegisterSource` → a `CREATE TEMP TABLE … AS SELECT * FROM fabricator_scan(<tok>)` on
+    the pin. That SIDESTEPS the obvious route rather than negotiating with it — named Arrow INPUTS are
+    refused on a pinned connection, and lifting that re-opens host-query.md §17.6's lifetime hazard. Two
+    new DIMs on `IHostQuery`: `RegisterRows(RecordBatch)` (⚠ **BORROWED, not adopted** — nothing copies or
+    disposes it, which is what makes it usable from a collector whose chunks it does not own) and
+    `RegisterRows(Schema)` for an EMPTY relation, which exists because spelling the columns in SQL would
+    mean an Arrow→DuckDB type-name table by hand. ⚠ The Bridge's stream is deliberately NOT
+    `InMemoryArrayStream`, whose `Dispose` disposes the batches it was given. **It also closes
+    host-query.md §17.11's open case** (data originating in C# with no SQL of ours producing it).
+  - **⚠ `is_bind` SELECTS WHAT TO RENDER; THE SCHEMA COMES FROM BINDING WHAT WAS RENDERED.** The user
+    proposed it as a way to DECLARE the columns; what ships takes them from wrapping the generated
+    statement in a `LIMIT 0` subquery — Publish's own probe, which binds without scanning AND requires a
+    subquery-usable SELECT. A declaration written twice drifts, and the drift would be read as DATA. What
+    the flag genuinely buys is skipping expensive setup, since binds REPEAT. ⚠ Defined ONLY here: in
+    `fluid_replacement_query` there is no second kind of render to tell it apart from.
+  - **⚠ EXACT SLICING NEEDED A STAGING TABLE.** Rows are copied into `__fab_input` with a `__fab_seq` row
+    number as they arrive and `input_table` is a temp VIEW over a RANGE of it — so `batchsize := 2` over 5
+    rows is 2, 2, 1, not "at least 2 rounded up to an input chunk" (batch-aligned grouping would make
+    `batchsize := 1` mean 2048). A view, so no second copy. And the rows must leave managed memory
+    immediately anyway: the collector frees a chunk's Arrow buffers once consumed, so accumulating batches
+    to form a group would be a use-after-free. ⚠ An input column named `__fab*` is refused at bind; an
+    EMPTY input still renders ONCE (the template is a generator and its output need not depend on the rows).
+  - **⚠⚠ A CLAIM I WROTE INTO THE CODE COMMENTS AND THE PROBE FALSIFIED:** one shared `TemplateContext` does
+    NOT make a Liquid `{% assign %}` carry between groups — Fluid renders into a CHILD SCOPE and pops it.
+    MEASURED in one run: a per-group counter read **1, 1, 1** where a temp-table counter read **1, 2, 3**.
+    ⇒ **SQL state carries, Liquid state does not**, and the half the user asked for ("keeping state e.g. in
+    temp tables") is the half that works. Both are pinned, the Liquid one as a CHARACTERIZATION test no
+    mutant of ours can kill. ⚠ The context is per EXECUTION, not per binding (a binding is reused across
+    prepared re-executions), which is also why the params bag is CAPTURED rather than retained — safe
+    because `ReadCell` is eager all the way down, checked rather than assumed.
+  - **⚠⚠ TWO PRE-EXISTING DEFECTS IT EXPOSED, BOTH LATENT UNTIL THE FIRST CALLER.**
+    (a) `FabricatorMarshalInOutArgs`'s NAMED branch pushed the DECLARED type unconditionally while the
+    POSITIONAL branch two lines below already resolved the SQLNULL/ANY sentinel — so an ANY-declared NAMED
+    parameter was unusable in BOTH directions (supplied: *"Failed to cast value … -> NULL"*; omitted: the
+    untyped NULL Apache.Arrow refuses). `fluid_query_batch` is the FIRST in-tree in-out/collector to declare
+    one. (b) **`FabricatorExchangeBind` and `FabricatorCollectorBind` established NO AMBIENTS** while their
+    `InitGlobal`s did, so managed code in the author's `Bind()` read whatever the last crossing left — a
+    dangling `ClientContext *`, MEASURED as `host_connection_open failed: vector too long` and NON-ZERO, so
+    the null guard waved it through. ⚠ `FabricatorSetActiveTxn`'s own comment already named "a global
+    collector/in-out" as its case; the bind sites were simply missed. ⚠ Its mutant kills reliably but at a
+    VARYING line — the signature of the bug it guards, not a weak gate. ⚠ The EXCHANGE half of the fix is
+    UNGATED: no in-tree in-out binding does host work in `Bind`.
+  - **⚠⚠ A PRE-EXISTING CI FLAKE FOUND ON THE WAY, in `verify_plugin_fluid` §23, now fixed.** The
+    two-publications-in-one-statement row pinned an alternation over TWO plan-dependent messages; a THIRD is
+    reachable (the SINGLE-USE refusal — one token scanned twice rather than two at once). MEASURED **~1 run
+    in 6**, and ATTRIBUTED rather than guessed: it reproduces against the UNMODIFIED suite file, while the
+    same statement run ALONE gives "open result stream" 10/10. Alternation widened; all three ARE the
+    property under test (a loud refusal).
+  - **⚠⚠ A HARNESS TRAP THAT VOIDED A MUTATION RUN: `verify_plugin_fluid` is NOT RE-RUNNABLE against the
+    same `FABRICATOR_DELTA_WRITE_DIR`.** First run passes, every later one with the SAME directory fails at
+    the no-root include refusal. Invisible in CI because `run-suites.sh` gives each suite a fresh scratch
+    dir — and my first mutant loop reused one, so three runs of ONE mutant died at three DIFFERENT lines.
+    **A fresh-dir control is what separated the mutant from the harness.** Use a fresh `mktemp -d` per run.
+  - **STILL OPEN, deliberately:** the LATERAL form (parallel, host-stamped correlated columns) needs a
+    mandatory row id in every generated statement plus a naming rule, since a lateral's wire columns are
+    named by their rendered EXPRESSION TEXT (`(t.a + 1)`, `CAST(5 AS SMALLINT)`) — a STRUCT argument would
+    dissolve the naming half; a bounded-memory batched variant is the SAME body registered on the streaming
+    in-out; and exposing the rows as a Fluid VALUE would save a round trip that a `{% query %}` over
+    `input_table` already does in one statement.
+  - ⚠ Two STALE doc comments found and NOT fixed (they belong to a separate pass): `ParamStyle.VarArgs`'s
+    remark and `Params.Validate`'s refusal message both say varargs are "deferred for lateral and in-out",
+    which the `allowVarArgs` doc six lines above contradicts and both lateral registration sites disprove
+    (`allowVarArgs: true`).
+
+- **⚠⚠ `publish(name)` — A TABLE THE TEMPLATE STAGED BECOMES THE RELATION THE GENERATED SQL SCANS. BUILT
+  2026-09-04 (user-asked, and the user chose this spelling over their own `fluid_table(this,'_result')`
+  sketch). C#-only: NO ABI change, NO C++ change, and NO new SQL function — it renders a call to the
+  `fabricator_scan` that already existed. Gate `verify_plugin_fluid` 344 → **386** (→ **397** with ABI v85's
+  §24), hermetic floor 8620 → **8662** → **8673**, THREE mutants each killed at its own assertion. Full record:
+  [docs/fluid-templating.md](fluid-templating.md) §18 (§18.8 as built).**
+  `SELECT * FROM {{ publish('_result') }}` after an `{% exec %}CREATE TEMP TABLE _result AS …{% endexec %}`.
+  - **⚠⚠ NOTHING ELSE CAN CARRY A STAGED RELATION, AND CHASING THE ALTERNATIVE CORRECTED A SHIPPED DOC.** A
+    TEMP table belongs to the ClientContext that made it; a REAL table created during `bind_replace` is
+    invisible to the statement being bound. **But §11.1b's "a template cannot create a table the same
+    statement selects from" is NARROWER than it says** — MEASURED, an ATTACHed catalog the outer transaction
+    has not yet touched DOES see it (`a = 42`), and it is **not** qualification that decides it (qualified
+    `memory.qt` fails, bare fails, `USE scratch` + bare fails). The discriminator is **whether the
+    transaction has already touched that catalog** — `MetaTransaction`'s lazy per-`AttachedDatabase`
+    transaction start — proven with the pair that isolates it: one explicit transaction, one preceding
+    `SELECT count(*) FROM scratch.seed` ⇒ the identical statement FAILS; without it ⇒ `a = 8`. ⇒ **a timing
+    artefact, never a route** (docs §11.1b-i), and it is the argument FOR a table function: a marshaled scan
+    asks the caller's catalog nothing, so the snapshot rule cannot reach it.
+  - **⚠⚠ IT IS LAZY (user-directed after reading the first build: "i actually would have prefered a lazy
+    approach without buffering and automatic release of resources after scan") — AND MY FOUR REASONS FOR
+    BUFFERING WERE ONE AND A HALF. Full correction: docs §18.9.** The lead argument — *a lazy publication
+    would hold the pin's ONE live stream and poison every later `query()`/`exec()` in the same render* — is
+    **plainly WRONG**: a lazy publication opens nothing at publish time, and the stream opens at SCAN time,
+    by which point the render is over and there are no later calls to poison. The single-threaded-connection
+    reason collapses into the same case (MEASURED: 500k rows at `threads=8` invokes the factory ONCE), and
+    the Bridge-only-service reason was NEUTRAL (true of either design).
+    - **⚠⚠ AND THE MEASUREMENT I CITED FOR THE LEAD REASON WAS VACUOUS** — *"a `{% query %}` AND an
+      `{% exec %}` after a publish both still work"* passes on the LAZY build too (re-measured), because a
+      lazy publish leaves no live stream either. **A measurement both designs satisfy is not evidence for
+      one of them.**
+    - **⚠⚠ THE ONE REAL REASON — the pin must outlive the render — WAS MUCH CHEAPER THAN PRICED, BECAUSE
+      THE REFCOUNT ALREADY EXISTS IN C++ FROM v84.** `Host.HostConnection.Dispose`'s own remark: *"safe with
+      result streams still outstanding: each holds its own reference to the underlying connection, so it
+      dies with the last of them"*. ⇒ once `Query` has RETURNED, nothing managed need keep the connection
+      alive — the stream does, and the staged temp table's catalog lives exactly as long. So only the HANDLE
+      must survive the render, which is a plain refcount on `PinnedHostConnection` released **the moment
+      `Query` returns**, and there is NO wrapper stream at all. ⚠ `Dispose` must be IDEMPOTENT or an
+      over-decrement closes the connection under an unscanned publication.
+    - **THE WIN, MEASURED: NO ROW CAP.** 3,000,000 rows through one publication, checksum exact, where the
+      buffered build refused above 1,000,000. Gated at 1.2M (~0.5 s).
+    - **⚠⚠ THE COST, AND IT IS A CAPABILITY THE BUFFERED BUILD HAD: two publications from ONE template
+      cannot be scanned in one statement** — both stream from the render's single pin, which allows one live
+      result. MEASURED, and the message is PLAN-DEPENDENT: the JOIN spelling gives our v84 refusal, the
+      `UNION ALL` spelling gives DuckDB's *"closed pending query result"*. **Neither is silent**, which is
+      what makes the trade acceptable, and the gate's expected text is an ALTERNATION over both because
+      which one wins is DuckDB's plan choice. TWO workarounds, both gated: two separate `fluid_replacement_query` calls
+      are two pins; or do the join in `{% exec %}` and publish ONE relation — **better anyway**, since the
+      work stays inside DuckDB instead of crossing Arrow twice.
+    - ⚠ **A serializing lock was REJECTED** (the measured JOIN opens both streams before draining either, so
+      blocking the second deadlocks whenever the executor needs it first — and a hang is worse than an
+      error), and **a hybrid — lazy for the first publication, buffered for the rest — was DECLINED**: it
+      makes memory behaviour depend on the ORDER of `publish()` calls, the "runs and means something
+      different" shape this file keeps warning about.
+    - ⚠ The other cost INVERTED rather than disappearing: an unscanned publication now holds a **DuckDB
+      connection and its staged table** until the eviction cap reclaims it, where buffering held **rows in
+      managed memory** under a row cap. Same cap, different resource; `EXPLAIN` is the routine producer.
+  - **⚠⚠ THE DECLARED-SCHEMA OVERLOAD OF `Host.RegisterSource` IS THE KEYSTONE, not an optimisation.** It is
+    what makes a BIND answer from the declaration instead of opening a stream to learn the columns — and
+    since a publication is SINGLE-USE, a bind that opened one would CONSUME it. **Mutant A (drop the schema)
+    dies at the FIRST §23 assertion after exactly 344 pass**, i.e. at the section boundary.
+  - **⚠ SINGLE-USE, failing LOUDLY** — one token, two references is an ERROR naming the fix, never zero rows
+    (the silent-short-read class). ⚠ The fix its message names (publish again) is itself bounded by the
+    two-publications limitation above, and the gate says so.
+  - **⚠⚠ MUTANT D IS THE ONE THAT PINS LAZINESS: the publication takes no pin reference ⇒ dies at the FIRST
+    §23 assertion after exactly 344 pass, with `Cannot access a disposed object. Object name:
+    'HostConnection'`** — the pin closes at end of render and the scan cannot issue its query. The mechanism
+    named by its own failure. (Mutant A, dropping the declared schema, dies at the same boundary; mutant C,
+    never evicting, at 376.)
+  - **⚠⚠ THE EVICTION CAP IS A ROUTINE PATH, NOT A DEFENSIVE ONE, and its first version named the token but
+    not the cause.** Managed code cannot observe "the caller's statement finished", and **an `EXPLAIN`
+    renders the template and never scans**, so an unscanned publication is reclaimed as the oldest of 32.
+    The first build UNREGISTERED on eviction ⇒ the factory was never reached ⇒ the generic *"no named source
+    registered as '__fabpub_…'"*. **Measuring that path is what showed it was wrong**; evicted tokens now
+    stay registered as bounded TOMBSTONES so they explain themselves. Mutant C (never evict) dies there
+    after 372 pass.
+  - **⚠⚠ WHAT JUSTIFIES IT OVER `{% print sql_literal %}`, MEASURED AND GATED AS A CONTRAST: TYPES SURVIVE**,
+    because the rows never become SQL text. `DATE` → `DATE`, `[1,2,3]` → `INTEGER[]`, `{'a':7}` →
+    `STRUCT(a INTEGER)` — where the literal renderer collapses every temporal to TIMESTAMPTZ and REFUSES a
+    list or struct by name (the refusal is asserted immediately below the publish row).
+  - **⚠ AND IT IS NARROWER THAN THE EXAMPLE SUGGESTS — the sketch's own body is a single SELECT, which a
+    `WITH … AS MATERIALIZED` CTE does better on every axis** (no buffer, no Arrow round trip, full pushdown;
+    measured 4 rows / sum 30, and gated so the choice is not folklore). `publish` earns its keep for a
+    relation computed in SEVERAL steps.
+  - ⚠ ONE identifier, quoted (`publish('pub odd')` works; a DOTTED name is one identifier and fails as
+    "table does not exist"). Token is an opaque `__fabpub_<32 hex>`, never an address — it goes into SQL
+    TEXT, where a copyable re-runnable address is the use-after-free class §17 exists to have closed.
+    Registered on BOTH surfaces and inert in `fluid_render` (text nobody binds, per row); not refused,
+    because branching on the caller's name is what the `exec()` decision rejected.
+  - **⚠ TWO TRAPS PAID FOR.** `dotnet build dotnet/Fabricator.FluidPlugin` **DOES NOT COMPILE THE BRIDGE**
+    (the plugin deliberately references only Abstractions + Common), so a missing `using Apache.Arrow.Ipc;`
+    reported *"Build succeeded"* and failed at `publish-managed.ps1` — build the Bridge or publish before
+    believing a green plugin build. And **`EXPLAIN` cannot be a subquery source**, a recorded trap walked
+    into anyway; the gate uses the `<REGEX>:` form on `physical_plan`, which is also stronger (it asserts
+    the rendered scan reached the PLAN).
+  - **⚠⚠ AND THE USER THEN MEASURED IT SLOW, WHICH FOUND THE REAL COST AND CORRECTED MY DIAGNOSIS —
+    ABI v85 (2026-09-04). Their billion-row publication took ~20 s where the same relation left in the
+    generated SQL took 2.15 s, and they pointed out that dropping to ONE COLUMN barely helped, which
+    rejected my first explanation (the missing projection pushdown).** Decomposed at 100M rows: no boundary
+    **0.308 s**, `fabricator_host_query` 1 col 1.861 s, publication 1 col 2.381 s, publication 2 cols
+    3.906 s ⇒ **projection was only the last gap; ~6x was the BOUNDARY.**
+    - **THE CAUSE: the exported Arrow batch was ONE DuckDB `DataChunk` — 2048 rows** — so a billion rows
+      crossed as ~488,000 batches, each paying a mutex acquisition, an `ArrowAppender` copy, an import, an
+      export and converter setup, **because the exported batch IS the morsel of a parallel Arrow scan**.
+      `HostQueryGetNext`'s own comment had recorded the win as DEFERRED, with the reason, and an env hook
+      that produced the numbers.
+    - **FIXED by ABI v85** — `host_query` takes `batch_rows`; a publication asks for a row group (122880).
+      **MEASURED: the user's query ~20 s → 7.89 s.** ⚠ Their TWO-column form went 27 s → 20.3 s, less,
+      because with the per-batch overhead gone the un-pruned column is now dominant.
+    - **⚠⚠ IT CAN NEVER BE A BETTER DEFAULT AND THAT IS THE DESIGN: A BATCH IS ALSO A FILE.** EW writes one
+      parquet file per input batch and this service feeds WRITERS (the OPTIMIZE recluster's ORDER BY,
+      sorted-by writes) — a row-group default made `verify_delta_clustered_optimize` collapse 80000 rows
+      into ONE file, `delta.targetFileSize` silently unhonoured (147 passed at one chunk, 1 failed at
+      122880). ⇒ only the CALLER knows; **a publication is the consumer for which a big batch is
+      unambiguously safe**, its stream being scanned into the caller's DuckDB and never written.
+    - ⚠ `FABRICATOR_HOST_QUERY_BATCH_ROWS` still OVERRIDES the caller when SET, **including to 0**, and
+      "unset" is distinguished from "set to 0" for exactly that — an experiment hook code can silently
+      outvote is not one.
+    - ⚠ **The batch size is NOT observable from SQL**, so the gate pins what is: the accumulation loop's
+      boundaries (exactly one batch / one over / one under / several plus a tail / empty / a multi-column
+      boundary, since a per-column appender bug keeps the counts right and the pairing wrong). **Before v85
+      that loop was reachable only through the env var, which no suite sets** — so it had never run here.
+  - **⚠ STILL OPEN, deliberately:** a per-statement release would retire the eviction cap but needs the C++
+    bind data's destructor to report through the ABI (an ABI change); a `publish`-a-query form would cover
+    qualified and computed sources; and **projection pushdown through a publication is now the biggest
+    remaining cost for a WIDE relation** — the obstacle is the DECLARED SCHEMA, the same mechanism that
+    makes laziness work (a projected stream delivers fewer columns than declared and trips the
+    mismatch check). Filter pushdown has no such obstacle and is the cheaper half.
+
+- **⚠⚠ THE FLUID `exec()` — BUILT 2026-09-02 (user-asked: "i want a exec() in fluid as well"). C#-only, in
+  the PLUGIN: NO ABI change, NO C++ change, NO bridge change. Full record:
+  [docs/fluid-templating.md](fluid-templating.md) §11.** Gate `verify_plugin_fluid` **188 → 234** (service **54/54 — 3318**),
+  THREE mutants each killed at its own assertion; hermetic **74/74 — 8259** (unchanged — no hermetic suite
+  loads this plugin) and service **54/54 — 3302** = 3272 + exactly this suite's 30, which is what shows no
+  other suite moved. It also gives `IHostQuery.ExecuteNonQuery` its first caller, closing the gap recorded
+  hours earlier.
+  - **⚠⚠ IT IS AVAILABLE ON BOTH SURFACES — USER DECISION, 2026-09-02: "no problem to have a exec() in
+    render or query". THE FIRST BUILD REFUSED IT IN `fluid_replacement_query` AND THAT MECHANISM IS DELETED.** What
+    replaces it is not silence: the gate PINS the cost as asserted behaviour, which is a stronger record
+    than a refusal plus prose.
+    - **A `fluid_replacement_query` write MULTIPLIES, and the last two rows are the ones that bite.** MEASURED, one
+      counter through four steps that execute nothing the caller wrote: `EXPLAIN` of a never-run statement
+      ⇒ **1**; merely `CREATE VIEW` over it ⇒ **2**; one `SELECT` from that view ⇒ **3**; a SECOND select
+      ⇒ **4**. ⇒ **a writing template behind a view writes ON EVERY USE** — and it looks fine in testing,
+      where the statement runs once. `EXPLAIN` writing is merely startling.
+    - **`fluid_render` differs for a reason worth keeping straight**: it is a VOLATILE scalar (the
+      `IScalarFunction` default, not overridden), so DuckDB never folds it into the PLAN — `EXPLAIN` of a
+      render containing `exec()` leaves the table unchanged (measured). **Its multiplier is ROWS, not
+      binds**: 3 rows ⇒ 3 writes, gated.
+    - **⚠ WHY THE MECHANISM WAS DELETED RATHER THAN DEFAULTED ON.** With both surfaces permitting exec, an
+      `allowExec` every caller passes `true` is vestigial machinery that READS as a restriction while
+      restricting nothing. And the refusal never made bind-time writes impossible, only inconvenient — see
+      the §11.1a entry below, where a write reached bind time through `query()` before `exec()` existed.
+    - **TO RESTORE A RESTRICTION the design is recorded in §11.1 rather than left in git history**: a
+      per-render permission as a `TemplateContext.AmbientValues` flag (it cannot be a captured variable —
+      the FILTER form is registered once on the shared `TemplateOptions`), **fail-closed**, set by each
+      surface. ⚠ Do NOT derive it from the caller's NAME: an unrecognised name reads as "not fluid_replacement_query"
+      and would be ALLOWED, so a surface added later would default to the dangerous answer.
+    - **⚠⚠ AND A STATEMENT CANNOT SEE THE WRITE ITS OWN TEMPLATE MADE — "prepare then select" DOES NOT
+      WORK (§11.1b, found by asking what exec() in `fluid_replacement_query` is FOR once it was permitted, i.e. by
+      trying the pattern a user would try first rather than only the hazard).** MEASURED: a template's
+      `UPDATE … SET c = 42` leaves the generated SQL reading **1** while the table holds **42** afterwards.
+      `exec()` runs on its own connection and the outer statement's snapshot predates the commit — the
+      MIRROR of §9's documented `query()` rule, from the same one-connection fact rather than a second rule.
+      - ⇒ **a template CANNOT create a table the same statement selects from**: the CREATE commits and the
+        statement still says *"Table with name t does not exist!"*, helpfully adding *"Did you mean
+        memory.t"* — it exists, just not for that statement. ⚠ Gated WITH an assertion that it really was
+        created, so the refusal reads as a VISIBILITY result rather than a failed CREATE; the message points
+        away from the cause, which is why it is pinned rather than described.
+      - ⇒ **`exec()` in `fluid_replacement_query` is for side effects the statement does not itself read** — audit rows,
+        logging, staging for a LATER statement. The workaround (two statements) is gated so it is not
+        folklore. ⚠ A real narrowing of the capability, and nobody's fault: it is the connection model, and
+        it would be there whether or not exec had ever been refused at bind.
+      - ⚠ `{{ exec(…) }}` INTERPOLATES the count into the generated SQL (measured: `1SELECT c FROM t`, a
+        parser error), so a template writing for effect must use `{% assign _ = exec(…) %}`.
+    - ⚠ **The multiplication block is a CHARACTERIZATION test and the suite says so** — it pins DuckDB's
+      bind repetition, which is not ours to implement, so no mutant of ours can kill it. Its value is that a
+      change there arrives as a failed assertion naming the step rather than as a surprise in someone's
+      audit table.
+  - **⚠⚠ THE REFUSAL STOPS THE ACCIDENT, NOT A DETERMINED CALLER — AND THE HOLE PRE-DATES `exec()`
+    (measured 2026-09-02, §11.1a; found by asking whether the boundary can be nested around).** The
+    classifier calls `SELECT fabricator_host_exec('INSERT …')` a SELECT — CORRECTLY, it is one — so a
+    `fluid_replacement_query` template reaches a write through `query()` **at BIND time** (measured: an audit table went
+    0 → 1). ⇒ `query()`'s rule prevents a statement-level write, NOT a write performed by a FUNCTION inside a
+    SELECT, and no question one could put to DuckDB's parser would catch a volatile writing scalar in a
+    projection.
+    - ⇒ **it is the reason the refusal was worth DELETING rather than defending.** A refusal anyone could
+      walk around by nesting a scalar was never a boundary, only a speed bump for the accident — and with it
+      gone the accident is PINNED as asserted behaviour instead, which is at least honest about what happens.
+    - It does NOT weaken the case for `exec()` — it is the MEASURED form of "exec grants no authority a
+      caller did not already have". Same conclusion §10.4 reached about the template ROOT one level down,
+      for the same reason: the renderer can already run SQL.
+    - ⛔ **Do NOT "fix" it by blacklisting function names in the classified SQL** — the prefix-check
+      anti-pattern in a new costume, defeated by a macro, a view, or a name we do not ship. Deliberately
+      UNGATED: a test asserting the bypass works would pin a behaviour we would happily lose.
+  - **⚠ IT REFUSES A `SELECT`, and the reason is a WRONG NUMBER rather than a hazard.** `query()` refuses
+    everything that is not a SELECT, `exec()` everything that is — ONE mechanism (`FluidHostQuery.Classify`,
+    DuckDB's own parser), two opposite policies, so they cannot drift on what "a SELECT" means. Managed code
+    cannot ask for `StatementReturnType::CHANGED_ROWS`, so the count is INFERRED from the first column when
+    it is an Int64.
+    - **⚠⚠ MEASURED with the refusal removed, and the trap is NARROWER than "any SELECT" while the narrow
+      version is the LIKELY one:** `SELECT count(*) FROM range(99)` reports **99**, `SELECT 42::BIGINT`
+      reports 42, and **`SELECT 42` reports 0** (an INT32 literal fails the Int64 test), as does
+      `SELECT 'x'`. My first write-up claimed `exec('SELECT 42')` would render 42 — it renders 0, so pinning
+      only that case would have motivated the refusal with a HARMLESS example. Both are asserted.
+  - **⚠⚠ A MEASURED DIVERGENCE BETWEEN THE TWO `exec` SURFACES, and a doc that was WRONG on both sides.**
+    Same statement, side by side: `CREATE TABLE c AS SELECT * FROM range(7)` reports **7** through the Fluid
+    `exec()` and **0** through `fabricator_host_exec` (which asks the engine); pure DDL is 0 on both.
+    Unclosable from managed code, and it must NOT be closed by matching a leading keyword — that is §9.2's
+    measured-broken prefix check. **Both `ExecuteNonQuery` docs said "DDL → 0", INCLUDING the one I wrote
+    the same day, and both were wrong for a CTAS** — mine was copied from the C++ surface's recorded
+    behaviour instead of measured on the path it documents. Asserted as a triple in the gate.
+  - **⚠ MULTI-STATEMENT: §9.2's recorded claim that the classifier "refuses multi-statement input" is
+    IMPRECISE, corrected in §11.5.** MEASURED: `SELECT 1; SELECT 2` classifies as a SELECT (accepted), while
+    `SELECT 1; INSERT …`, `SELECT 1; DROP TABLE t` and `CREATE …; INSERT …` are all refused. ⇒ the SAFETY
+    property is intact in BOTH directions and is better than the old description — an all-SELECT sequence is
+    harmless to `query()`, and any sequence containing a write reaches `exec()`, which is exactly the
+    several-statements case exec exists for (the parameterised path cannot do it: `Prepare` takes one
+    statement).
+  - **⚠ TWO COUNT PATHS, ONE RULE, and the gate asserts they AGREE (2 / 2)** — bare form via
+    `ExecuteNonQuery`, parameterised form via `Query` + a local read, because `ExecuteNonQuery` has no
+    parameter overload. A rule written twice can drift; mutant C makes the parameterised path report 0 and
+    dies at the filter-form assertion.
+  - ⚠ NOT gated, and §11.6 says so: that `exec()` grants no authority a caller lacked (an argument about the
+    surface, not an observable), and the refusal under `{% include %}` from REMOTE storage (no hermetic
+    fixture has a remote root — §10's standing gap).
+
+- **⚠⚠ A FLUID ARRAY BINDS AS A SQL LIST — BUILT 2026-09-04 (user-asked, after hitting the refusal with
+  `{% query result3 arg: input %}SELECT a: unnest($arg){% endquery %}`). C#-only IN THE PLUGIN: no ABI, no
+  C++, no bridge. Gate `verify_plugin_fluid` 296 → **307**, hermetic floor 8572 → **8583**, two mutants.
+  Full record: [docs/fluid-templating.md](fluid-templating.md) §Values.**
+  - **⚠⚠ THE REFUSAL WAS OURS, NOT DuckDB'S, AND ONE MEASUREMENT SETTLED IT**: `PREPARE p AS SELECT a:
+    unnest($1); EXECUTE p([1,2,3,4,5])` yields five rows — and DuckDB does not even need the parameter
+    typed. The docs had asserted *"DuckDB has no parameter form for them here"*, which was simply false.
+  - ⚠ **The READ direction already supported arrays** (`FluidValueModel.ReadList` handles `ListArray` /
+    `LargeListArray` / `FixedSizeListArray`); the gap was one-directional, in `ToParameter` alone.
+  - **⚠⚠ ONE ELEMENT KIND PER LIST, because an Arrow list is TYPED.** A mixed list is REFUSED by name
+    rather than coerced: the only common representation is text, and turning `5` into `'5'` silently
+    changes what the statement compares. NULLs carry no kind, so they mix with anything. ⚠ The mixed case
+    is reachable ONLY through the JSON parameter form — a DuckDB LIST is homogeneous, so `{v: [1,'a']}`
+    fails in DuckDB's own struct construction first. Nested arrays/structs refused (the scalar ladder's
+    one-level rule). EMPTY or all-NULL ⇒ VARCHAR, the same choice the scalar NULL case makes.
+  - **⚠⚠ THE BUILD REPRODUCED THIS FILE'S OWN JANUARY-1970 TRAP IN A NEW PLACE, AND ONLY A DATE ELEMENT
+    SHOWED IT.** `ListArray.Builder.ValueBuilder` does NOT carry a `TimestampType`'s UNIT into the builder
+    it creates, so values were stored as MILLISECONDS under a field declaring MICROSECONDS and
+    `DATE '2023-01-02'` read back as **1970-01-20 09:36:57.6**. Numbers, strings and booleans have nothing
+    to get wrong, so a battery without a date would have shipped it. Fixed by building the values array
+    with an explicitly typed builder and assembling the `ListArray` by hand. ⚠ The gate asserts the
+    INSTANT (`epoch(...)::BIGINT`), never rendered text — a TIMESTAMPTZ renders in the session's zone, so
+    pinning the string would assert the runner's locale.
+  - **⚠⚠ THE GATE CAUGHT THAT I HAD FALSIFIED A SHIPPED ASSERTION, which is the change announcing itself.**
+    `verify_plugin_fluid` pinned *"has no SQL parameter form"* for the FILTER spelling. It is REPLACED (the
+    list now binds and `len($a)` answers 3), not deleted — the row's purpose is that the filter and block
+    forms share ONE conversion table, so whatever a list does in one it must do in the other.
+  - Mutants: dropping the `Array` case dies at that REPLACED assertion after 145 pass (before §17 runs at
+    all, which is what shows both spellings share the mechanism); using the builder's default timestamp
+    unit dies at the date assertion after 301 pass.
+
+- **⚠⚠ THE `{% query name %}` BLOCK — the body is SQL, and the RESULT IS A RESULT SET. BUILT 2026-09-03
+  (user-asked, and the requirement stated sharply: "where result is the result set and not some rendered
+  as a single varchar, i.e. like a function call result"). C#-only IN THE PLUGIN: NO ABI, NO C++, NO
+  bridge. Gate `verify_plugin_fluid` 275 → **285**, hermetic floor 8534 → **8544**, ONE mutant aimed at
+  exactly that requirement. Full record: [docs/fluid-templating.md](fluid-templating.md) §15.**
+  - **⚠ THE SKETCH'S SPELLING IS NOT EXPRESSIBLE, and what ships is the nearest Liquid idiom.** The request
+    wrote `{% assign result = query %}…{% endquery %}`; Liquid's `assign` parses `identifier = EXPRESSION`
+    and terminates at `%}`, so a block body can never be its operand. `{% query result %}` is an IDENTIFIER
+    block — **`{% capture %}`'s own shape**, i.e. Liquid's established precedent for "run this block and
+    bind the result to a name". `RegisterIdentifierBlock` exists at our pinned 3.0.0-beta.7.
+  - **IT IS THE SAME VALUE THE FUNCTION RETURNS, BY CONSTRUCTION** — `RunCaptured` calls the same
+    `FluidHostQuery.Run` as `query()` and `| query:`, so all three yield one `ArrayValue` of indexable rows
+    and cannot drift on the classifier, the row cap, the value model or the pinned connection.
+  - **⚠⚠ THE ASSERTIONS THAT SEPARATE A RESULT SET FROM A STRING, and only some of them do:**
+    `r[0].a`/`r[0].b`/`r.size` address BY COLUMN NAME; `r[0].a | plus: 1` → **2** proves it is a NUMBER;
+    `{% if r[0].a > 0 %}` → **yes** proves it COMPARES as one; `{% for %}` over 3 rows sums to 6.
+    ⚠ **The comparison is the load-bearing one and §7 says why: a broken value model RENDERS CORRECTLY
+    WHILE COMPUTING WRONG**, so a render-only assertion cannot tell the two apart. Mutant F (bind the
+    captured TEXT instead of the rows) dies at the FIRST §14 assertion after 275 pass — the user's
+    requirement expressed as a test.
+  - **⚠⚠ AND BOTH BLOCKS NOW TAKE OPTIONAL NAMED ARGUMENTS, BOUND AS PARAMETERS (user-asked the same
+    day: "could we eventually allow optional named args … which could be used for parameter binding?").**
+    `{% query t region: 'eu', min: 10 %}` binds `$region`/`$min`; `{% exec x: 7, y: 8 %}` likewise. Gate
+    285 → **296**, floor 8544 → **8555**, one mutant. Full record: docs/fluid-templating.md §16.
+    - **THE MECHANISM IS THE ARTICLE'S** (deanebarker.net/tech/fluid/parser-tags-blocks, which the user
+      supplied): `Identifier` and `ArgumentsList` are **`protected readonly`** on `FluidParser`, so a
+      SUBCLASS is the only way to compose them into a block header. ⚠ TWO of its details are STALE against
+      our pin and were checked with `git show v3.0.0-beta.7:` rather than against the local clone (which is
+      at `main`, AHEAD of us): the registration is `RegisterParserBlock`, NOT `RegisterTagBlock`, and the
+      list is `IReadOnlyList<FilterArgument>`, not `List`.
+    - **⚠⚠ FLUID'S OWN GRAMMAR, WHICH DECIDES THE COMMA — and the request's exact syntax does NOT parse.**
+      `ArgumentsList` is `Separated(Comma, …)`, so args are comma-separated and there must be at least one
+      (`ZeroOrOne` is what makes the list optional; without it every bare `{% query t %}` stops parsing).
+      MEASURED: `{% query t arg1: 1 arg2: 2 %}` gives *"Invalid query tag at (1:9)"*. A separator-free
+      grammar IS buildable (`LogicalExpression` is also protected) and was DELIBERATELY not built — it
+      would be a grammar only this plugin speaks, where `a: 1, b: 2` is what every other named-argument
+      site in Liquid uses. Pinned as a CHARACTERIZATION test, since it is the form people write first.
+    - **ONE CONVERSION TABLE, THREE SPELLINGS**: a tag's args arrive UNEVALUATED (name + expression) where
+      a filter's arrive evaluated, so `BuildBlockParametersAsync` evaluates each and hands it to the SAME
+      `ToParameter` — the int64/decimal ladder, the UTC date stamp and the LIST/STRUCT/MAP refusal cannot
+      drift. ⚠ POSITIONAL args REFUSED, duplicates refused locally as well as by the host.
+    - **⚠ THE LOAD-BEARING ASSERTION IS THE INJECTION PAIR**: `region: "eu' OR 1=1 --"` answers **0**
+      where splicing answers 3, with `"eu"` → **2** beside it — without the control the 0 is equally true
+      of a build where the parameter never arrived. Mutant G (ignore the args) dies at §15's first
+      assertion after 285 pass.
+    - **⚠⚠ IT MADE A DOCUMENTED LIMITATION FALSE, which is the thing to watch.** §15.3 read *"No
+      parameters — an identifier block has nowhere to put named arguments"*: true of an IDENTIFIER block,
+      false of what Fluid can express, i.e. a limitation of the CHOICE rather than of the library — the
+      kind of sentence that hardens into a fact if nobody re-reads it. Corrected in the doc, the README,
+      the suite's own comment and here.
+  - **THE CAPTURE IS NOW ONE HELPER** (`FluidEngine.CaptureBodyAsync`) shared by both blocks — not tidiness:
+    it is where §13.4's flush-before-read subtlety and the partial-body rule live, and a second copy is
+    where they come back. ⚠ All THREE spellings of `query` coexist (block, function, filter), as for `exec`.
+
+- **⚠⚠ THE `{% exec %}` BLOCK + THE `fabricator_render` → `fluid_render` RENAME — BOTH 2026-09-03,
+  user-asked. C#-only IN THE PLUGIN: NO ABI change, NO C++ change, NO bridge change. The rename is
+  BREAKING with NO ALIAS. Gate `verify_plugin_fluid` 256 → **275**, hermetic floor 8515 → **8534**, two
+  mutants. Full record: [docs/fluid-templating.md](fluid-templating.md) §13 (block) + §14 (rename).**
+  - **THE BLOCK renders its body to a SEPARATE output, runs the captured text as SQL, and emits NOTHING** —
+    the shape the user specified. It is what makes a REAL statement writable from a template: multi-line,
+    with `{% for %}`/`{% if %}` inside it, and **no quote-escaping**, where `exec("…")` needs the whole
+    statement as one escaped string argument. It is also naturally CONDITIONAL — an unreached `{% exec %}`
+    runs nothing, because the tag is a statement in the tree rather than an argument that had to be
+    evaluated to build a call.
+  - **⚠ EVERYTHING DOWNSTREAM OF THE CAPTURE IS SHARED WITH THE FUNCTION FORM** (`ExecuteCaptured` → the
+    same empty-body guard, the same classifier, the same per-render pinned connection), so the two
+    spellings cannot drift on what counts as a write. A `{% exec %}` staging a TEMP table is readable by a
+    later `query()` in the same template — gated, and that assertion needs BOTH features at once.
+    ⚠ The count is DISCARDED (a block renders nothing); the function form is still how you get the number.
+  - **⚠⚠ THREE FACTS READ OUT OF THE PINNED FLUID, not the clone.** The signature is `IFluidOutput`, not
+    `TextWriter` (the user's sketch was the 2.x shape); `BufferFluidOutput` is `internal` while
+    `TextWriterFluidOutput` is public; and `Render(template, context)` passes `NullEncoder.Default`.
+    ⚠ **The local clone at `D:\repos\fluid` is at `main`, AHEAD of our `3.0.0-beta.7` pin**, so every
+    signature was read via `git show v3.0.0-beta.7:…` — the same "CI gates a different Fluid than the
+    developer runs" hazard this file already records about referencing a local clone.
+  - **⚠⚠ A MUTANT SURVIVED AND THE CODE CHANGED, NOT THE COMMENT — the most useful result here.** The first
+    version read the captured text AFTER the `await using`, and a mutant dropping `FlushAsync()` SURVIVED
+    because `TextWriterFluidOutput.DisposeAsync` flushes; the comment calling the flush "MANDATORY" was
+    simply wrong. Fixed by RESTRUCTURING — the text is read INSIDE the scope right after the flush, which is
+    what Fluid's own `{% capture %}` source generator does — so the dependency is explicit and local rather
+    than resting on disposal order. Re-run, the same mutant dies at the first block assertion after 257
+    pass. ⇒ **when a mutant survives, the honest fix is sometimes to make the step NECESSARY rather than to
+    delete it.**
+  - **⚠ A PARTIALLY RENDERED BODY IS NOT EXECUTED**: a `{% break %}` inside the block (of an enclosing
+    `{% for %}`) leaves half a statement, and half a statement is a different statement — the completion is
+    propagated instead. MEASURED zero rows; mutant E (run it anyway) dies at exactly that assertion.
+  - **⚠ INTERPOLATION INSIDE THE BLOCK IS RAW**, same rule and same reason as `fluid_replacement_query` (a template must
+    be able to emit object names and whole fragments). `{{ v | sql }}` for a value. Gated: `O'Brien` spliced
+    raw gives *"unterminated quoted string"* — the safe direction, and not a substitute.
+  - ⚠ The parser is built by a METHOD now, so the tag is registered BEFORE anything can be parsed: templates
+    are cached by TEXT, so one parsed before registration would be cached with `{% exec %}` unrecognised for
+    the process's life. ⚠ All THREE spellings of `exec` coexist (block, function, filter) because tags and
+    expressions are different grammars in Fluid — pinned, since a change would silently break one.
+  - **THE RENAME: `fabricator_render` → `fluid_render`, no alias.** The function is contributed by the Fluid
+    provider and its sibling was already `fluid_replacement_query`; `fabricator_*` is the core/host namespace. **⚠ The
+    code change is ONE LINE** (`FluidRenderFunction.Name`) — everything else in the plugin was doc comments;
+    the bulk was 133 occurrences in the suite and 20 in the README.
+    - **⚠⚠ IT SILENTLY CHANGED AN `ORDER BY`, which is the one thing a mechanical rename can break.** The
+      registration check does `… IN ('fluid_render','fluid_replacement_query') GROUP BY 1 ORDER BY 1`, and
+      `fabricator_render` sorted BEFORE `fluid_replacement_query` while `fluid_render` sorts AFTER it — so the expected
+      rows had to swap. Caught by RUNNING the suite; a rename that only compiles is not a rename that passes.
+    - ⚠ **Older dated records deliberately KEEP the old spelling** (`docs/abi-history.md` §v80/§v82,
+      `docs/feature-history.md`, `docs/plugin-system.md` §The FLUID plugin, and the floor-bump comments in
+      `run-suites.sh`) — the convention every previous rename here followed. Every `fabricator_render` in a
+      dated record is this function under its former name; said once in fluid-templating.md §14.1 rather
+      than annotated at each site.
+  - ⚠ Twice in this pass a leftover `duckdb.exe` from my own `-batch -c` probe held the payload DLLs: once
+    it failed the C++ LINK (`LNK1104: cannot open file 'duckdb.exe'`) and once it failed
+    `publish-managed.ps1` while the suite then measured the STALE payload and "passed". **Check
+    `Get-Process duckdb` before a build or a publish**, and never read a suite result from a run whose
+    publish you did not verify.
+
+- **FLUID TEMPLATING — SLICES 1, 2, 3 AND 4 DONE (`fluid_replacement_query` + the shared value model; the bind-time
+  probe; `HostQueryTransport` + the Fluid `query`; `{% include %}` from any storage — 2026-09-01/02);
+  SLICE 5 PLANNED, and §10.8 says RE-DERIVE it rather than inherit it.
+  Full plan, the user's own code sketches, and the as-built record with every measurement:
+  [docs/fluid-templating.md](fluid-templating.md) §7.** C#-only, NO ABI change, NO C++ change — because
+  `IBackend.GlobalSqlTableFunctions` already existed, which is §2's finding paying out immediately. Gate
+  `verify_plugin_fluid` **23 → 89**, seven mutants each killed at its own assertion.
+  `SELECT * FROM fluid_replacement_query('SELECT {{ n }} AS n', params := {'n': 7})` — `template` positional, **`params`
+  NAMED and optional** (the `fabricator_sql_seq(2, cols := 3)` precedent), taking the same STRUCT / MAP / JSON
+  bag `fluid_render` does.
+  - **⚠⚠ THE FINDING THE SLICE TURNS ON, and it inverts the obvious reading of the first probe: Fluid
+    3.0.0-beta.7 understands `System.Text.Json`'s `JsonNode` NATIVELY, and that support RENDERS CORRECTLY
+    WHILE COMPUTING WRONG.** Bound with no `ValueConverter`, MEASURED: `{{ d.i }}` → `3`, `{{ d.big }}` exact,
+    `{{ d.o.a.b }}` / `d.arr[1]` / `d.arr.size` / `{% for %}` all right — and `{% if d.i > 1 %}` with `i = 3`
+    takes the **ELSE** branch, `{% if d.s == 'x' %}` with `s = "x"` is **FALSE**, `{{ d.money | plus: 1 }}`
+    with 19.99 renders **`1`**, and summing an array in a loop gives **`0`**. The leaves arrive as opaque
+    nodes: they format faithfully and compare as nothing. ⇒ **a render-only suite passes 100% against that**,
+    so `verify_plugin_fluid` now asserts COMPARISON and ARITHMETIC on both the JSON and the Arrow path.
+    For `fluid_replacement_query` a wrong `{% if %}` branch is a wrong SQL STATEMENT.
+    - ⚠ The control that makes it a measurement: `d.Root`/`d.Parent`/`d.Options` do NOT resolve, so it is
+      real `JsonNode` support and not reflection over its CLR members.
+    - **⚠ THE TRANSFERABLE RULE: a probe that only RENDERS values cannot distinguish a working value model
+      from a broken one.** My first read of that probe was "the converter may be unnecessary" — the exact
+      opposite of the truth, and it took one line of arithmetic to overturn.
+  - **⚠⚠ A SHIPPED BUG IT FOUND, and it is THIS REPO'S OWN DOCUMENTED TRAP one method away from where the
+    trap is already written down.** `JsonToClr` read `e.TryGetInt64(out var l) ? l : e.GetDouble()`, whose
+    branches C# unifies to **double** (long→double is implicit, not the reverse), so **the int64 branch had
+    never had any effect** and every JSON integer went through a double. MEASURED:
+    `fluid_render('{{ n }}', '{"n":9007199254740993}')` returned **9007199254740990** while the same
+    value as a DuckDB BIGINT returned it exactly — two losses compounding, the silent widening plus Fluid's
+    `Convert.ToDecimal(double)`, which keeps 15 significant digits. **`ReadTimestamp`, in the same file,
+    carries a comment explaining exactly this hazard** ("the explicit `(object)` casts are load-bearing").
+    Invisible for every integer under 2^53, i.e. every integer a test happens to use.
+  - **THE NUMBER LADDER IS `int64` → `decimal` → REFUSE, and the user's `GetDecimal()` sketch is the middle
+    rung rather than the whole answer.** int64 first keeps big integers off the double path; decimal second
+    is what keeps `19.99` at `19.99`; double last only reaches the refusal. **⚠ Fluid's number model IS
+    decimal** (`Convert.ToDecimal` is literally what it calls), so a magnitude outside it cannot be
+    represented at all: `1e100` used to raise Fluid's own *"Value was either too large or too small for a
+    Decimal"* naming neither parameter nor value, and **`1e-30` rendered as `0`** — a silently wrong number
+    spliced into a SQL statement. Both are refused now, naming the value and its JSON path.
+    - **⚠ `TryGetDecimal` SUCCEEDS for `1e-30` and returns ZERO — decimal's RANGE is not its RESOLUTION.**
+      Hence an explicit underflow check (mutant M4), with a real `0` asserted beside it as the positive
+      control, without which the check would pass equally on a build refusing every zero.
+    - **⚠ A CONSEQUENCE PINNED AS A DECISION: `3.0` now renders `3.0` where the double path rendered `3`.**
+      Better for a function emitting SQL (the literal keeps its type), but it IS a change to
+      `fluid_render`'s output.
+    - ⚠ NOT fixed and not fixable here: a genuine CLR `double` has ~17 significant digits and Fluid keeps 15.
+  - **THE ARROW HALF IS THE ROW WRAPPER SLICE 3 NEEDS, built once as the plan required.**
+    `FluidValueModel.ReadCell` is a deliberate SUPERSET of `ArrowValueReader.ReadScalar` (Bridge-only, so
+    unreachable from a plugin) with the nested cases the bridge's reader has no counterpart for — it exists
+    for FILTER values, which are scalars by construction. `ArrowStruct : IFluidIndexable`, `ArrowMap`, lists.
+    - **⚠ ORDINAL ACCESS IS FREE AND IS NOT A SECOND MECHANISM — MEASURED: Fluid resolves `r[0]` by asking
+      `TryGetValue` for the KEY `"0"`**, so an int-parse fallback IS index access. A member genuinely named
+      `0` wins, which is the right precedence.
+    - **⚠ `TryGetValue` must return FALSE for an unknown member, never a nil value** — false is what lets
+      Fluid answer `.size` itself, and a real member then shadows it, which is again the right way round.
+    - **⚠⚠ `MapArray` DERIVES FROM `ListArray` in Apache.Arrow**, so a `case ListArray` arm matches a MAP
+      first. The compiler caught it here (CS8120) — but the other order is not an error, it is a silently
+      WRONG SHAPE: a MAP arrives as a list of key/value structs, which renders and iterates happily while
+      every lookup by key fails. Mutant M3.
+    - ⚠ `DictionaryValue` exposes neither `Keys` nor `TryGetValue` publicly, so spreading a bag's members
+      means holding the `IFluidIndexable`, not unwrapping the `FluidValue`.
+  - **`{{ x }}` INTERPOLATES RAW, DELIBERATELY** — a template must be able to emit object names, predicates
+    and whole fragments, which is the only reason to generate SQL from a template. Data goes through two
+    allow-list filters following the `fabricator_va_values` precedent: `{{ v | sql }}` → `DuckSql.Literal`,
+    `{{ n | sql_ident }}` → `DuckSql.QuoteIdent`. ⚠ `DuckSql` is in `Fabricator.Abstractions`, so the plugin
+    reaches it with the reference it already has — the same property §2 is about.
+  - **THE sqlgen PROPERTY IS GATED, and no row assertion can see it**: MEASURED via `EXPLAIN`, a
+    `fluid_replacement_query` over a table plans as a bare `SEQ_SCAN` with `Projections: id` and `Filters: g=3` — the
+    call is GONE and both pushdowns reached the base table. ⚠ `EXPLAIN` cannot be a subquery source, so the
+    gate uses the `<REGEX>:` form on the `physical_plan` row.
+  - **⚠⚠ TEMPORALS: ONE WRONG VALUE FIXED, ONE WRONG COMPARISON SURFACED — found by probing edge cases
+    after the slice was otherwise finished, which is the only reason they were found at all (nothing in the
+    plan mentions dates). Full record: docs/fluid-templating.md §7.4a.** A **DATE RENDERED THE PREVIOUS
+    DAY** (`2026-09-01` → `2026-08-31 22:00:00Z` on a UTC+2 box): `Date32Array.GetDateTime` returns
+    `Kind = Unspecified`, which Fluid resolves against the machine's LOCAL zone. Pre-existing, and made
+    worse by this slice, since `fluid_replacement_query` would splice the wrong date into a statement. Fixed by stamping
+    `DateTimeKind.Utc`. **⚠ BOTH OBVIOUS FIXES WERE MEASURED AND BOTH ARE WRONG:**
+    `TemplateOptions.TimeZone = Utc` changes NOTHING (the conversion happens where the DateTime becomes a
+    DateTimeOffset), and returning `DateOnly` is WORSE (Fluid has no support for it — a culture-dependent
+    `09/01/2026` string). A BLOB rendered as `9798`, the concatenated decimal bytes; it is lowercase hex now.
+    - **⚠⚠ FLUID DOES NOT ORDER TEMPORALS AT ALL and this is NOT fixed — gated and documented instead.**
+      MEASURED with controls: `>` and `<` are BOTH false for two different dates while `==`/`!=` behave, and
+      numbers/strings compare fine with the same operators. So `{% if d > cutoff %}` silently takes the ELSE
+      branch. Workaround gated: format to ISO, compare strings. **⚠ An ISO-STRING value model WOULD fix it
+      and was deliberately NOT taken** — measured to fix comparison AND improve rendering with `| date:`
+      still working, but a date would stop BEING a date, which is a user-visible semantic change to put to
+      the user rather than smuggle into this slice. The measurement is done; the choice is one edit away.
+      - **⚠ I BRIEFLY CALLED THE TIMEZONE TRAP "the strongest argument" FOR SWITCHING AND THAT WAS AN
+        OVERSTATEMENT**, corrected once the user stated the UTC-session convention: at `TimeZone = 'UTC'`
+        the trap does not fire at all, so it supports the case only for a deviating session. **What remains
+        decisive is the ORDERING gap**, which no timezone setting touches.
+      - **⚠⚠ AND THERE IS NOW A REASON TO WAIT: FLUID'S MAIN BRANCH CARRIES TIMEZONE WORK THAT
+        3.0.0-beta.7 DOES NOT** (user-reported 2026-09-01; not verified here). If it lands and touches
+        ordering or the date model, switching to ISO strings now could be work undone, or a divergence from
+        an upstream fix. **Take the next Fluid bump FIRST, re-run `verify_plugin_fluid`'s temporal
+        assertions, and re-derive from what they then say** — they pin today's behaviour exactly, so a
+        change arrives as a failed assertion naming the value rather than as a silently different rendering.
+        ⚠ If they move, re-derive §7.4a rather than editing the expected values to match.
+      - ⚠ Re-derive before slice 3 either way: it puts whole query ROWS through the same value model, which
+        multiplies whichever choice is made.
+    - **⚠⚠ `| sql` collapses every temporal to TIMESTAMPTZ, AND GETTING A DATE BACK OUT IS A SILENT
+      TIMEZONE TRAP.** Anything that reads a TIMESTAMPTZ without NAMING a timezone reads it in the SESSION's
+      timezone — `::DATE`, `::TIMESTAMP::DATE`, `date_trunc`, `strftime`, `extract`/`date_part` — so in a
+      session west of UTC every one yields the PREVIOUS DAY with no error (MEASURED under
+      `America/New_York`; `Australia/Sydney` agrees with UTC, which is why one timezone is not a test).
+      That is DuckDB behaving correctly; our TIMESTAMPTZ representation is what makes it a trap. TWO SAFE
+      ROUTES, both gated: name the zone (`(… AT TIME ZONE 'UTC')::DATE`, which also serves a genuine
+      TIMESTAMP and preserves the instant) or never build a TIMESTAMPTZ
+      (`{{ d | date: "%Y-%m-%d" | sql }}::DATE`, which additionally needs no ICU).
+      - **⚠⚠ THE STANDING CONVENTION, user-stated 2026-09-01 and now in the README's Quick Start:
+        A CLIENT SHOULD ALWAYS `SET TimeZone = 'UTC'` IN A DuckDB SESSION**, because that is what the Delta
+        protocol stores and accepts. ⚠ It is NOT DuckDB's default — with ICU loaded the default is the
+        SYSTEM zone (MEASURED `Europe/Berlin` on this box). Under UTC every route above agrees (measured:
+        `{{ d | sql }}::DATE` answers 2026-09-01), so the trap belongs to a session that DEVIATES from the
+        recommended configuration. It is gated anyway — "the normal path is safe" is exactly the reasoning
+        under which a trap survives unrecorded. ⚠ The convention is BROADER than Fluid:
+        `fabricator_host_query` inherits the session zone, and every TIMESTAMPTZ surface reads it, which is
+        why the README states it once in Quick Start rather than per-feature.
+      - **⚠⚠ TWO DIFFERENT CLOCKS, AND ONLY ONE IS NEUTRALISED BY THAT CONVENTION.** The DATE-renders-
+        previous-day bug is the **.NET** side reading `TimeZoneInfo.Local`, i.e. the OS zone of the machine
+        running the extension — setting DuckDB's `TimeZone` does NOT affect it, so the `AsUtc` fix stands
+        regardless of deployment. This trap is the **DuckDB session** zone. Same symptom, different clocks,
+        different fixes; do not let one be cited as covering the other.
+      - **⚠⚠ A CORRECTION WORTH CARRYING, because the wrong version reached FIVE places before the USER
+        caught it — no test did.** This was first recorded as *"DuckDB has NO `TIMESTAMPTZ -> DATE` cast"*,
+        from a suite failure reading *"Conversion Error: Unimplemented type for cast"*. **The cast exists;
+        it needs ICU, and `unittest` does not auto-load extensions** — the suite had no `require icu`, so a
+        missing REQUIRE presented as a missing FEATURE. This file already records the opposite direction (a
+        `require` for something NOT compiled in SKIPS silently, so the suite passes vacuously); this is the
+        same hazard the other way round and it is worse, because it reads as a definite negative result
+        about the engine and gets written down as one. ⇒ **before recording "DuckDB cannot do X" from a
+        suite failure, check what the suite LOADED.**
+      - ⚠ The raw `| sql` output is asserted by TYPE and INSTANT rather than rendered text (a TIMESTAMPTZ's
+        display depends on session timezone, so pinning the string would report the runner's locale), and
+        the timezone section SETS `America/New_York` — under the runner's default UTC every route agrees
+        and the section would pass while saying nothing.
+  - **DRIVING THE BAG FROM SQL WORKS BOTH WAYS, and it is the first thing anyone will ask** (a sqlgen
+    generator sees constant VALUES, never expressions): **`params := ?`** in a prepared statement re-binds
+    per EXECUTE, so ⚠ **the OUTPUT SCHEMA may differ between two EXECUTEs of ONE prepared statement** —
+    measured, one column vs three, which is surprising enough to pin since a prepared statement normally has
+    a fixed result shape (the same property the lateral bind-time constants recorded for `f(t.n, ?)`); and
+    **`getvariable()`** reads the bag from a session variable, the idiom the CDC reader documents for
+    carrying a cursor — so a template-driven pipeline needs no client and no spliced literal.
+  - **✅ SLICE 4 IS DONE (2026-09-02) — `{% include %}` / `{% render %}` from any storage the host can reach.
+    C#-only IN THE PLUGIN: NO ABI change, NO C++ change, NO bridge change. Full record:
+    [docs/fluid-templating.md](fluid-templating.md) §10.** Gate `verify_plugin_fluid` **147 → 174**,
+    four mutants each killed at its own assertion.
+    `SET GLOBAL fluid_template_root = 's3://analytics/templates';` then
+    `SELECT * FROM fluid_replacement_query('{% include ''dims/customer'' %}', params := {'region': 'eu'})`.
+    - **⚠⚠ THE PLAN SAID "A `HostFs` SEAM". ONE WAS BUILT AND IT KILLED THE PROCESS.** §2's table blames the
+      ASSEMBLY (`HostFs` lives in the Bridge), and §4 scheduled slice 4 as "the same seam pattern". A
+      `HostFileTransport` was written to exactly the `HostHttpTransport` shape, the bridge filled it in at
+      boot, and the first include died: **`0xC0000005` at `HostFs.OpenRead` ← `GetFileInfoAsync` ←
+      `ScalarFnExecute`.** Every `fs_*` host callback dereferences the calling operator's `ClientContext`, and
+      **a GLOBAL function has no ambient opener** — which both `fluid_render` (global scalar) and
+      `fluid_replacement_query` (global sqlgen) are. **The blocker was never the assembly; it is the AMBIENT**, which §2
+      could not see because it reasoned about references rather than about call context. Its own corollary
+      already said it (*"usable only … where the ambient still flows from one"*) and neither of us read it
+      that way. **The seam was DELETED rather than shipped unreachable.**
+    - **⚠⚠ THE SAME MISSING AMBIENT MAKES A PLAIN `SET` UNRELIABLE, AND IT IS NON-DETERMINISTIC.** The root is
+      the setting `fluid_template_root` — **the first setting any PLUGIN declares** (a plugin's
+      `IBackend.Settings` ride the same `BackendRegistry.All()` path a backend's do; measured present in
+      `duckdb_settings()`). Provider settings register SESSION-scoped (v69) and `ProviderSettingsStore`
+      resolves session-then-global from `CurrentSession`, **the same absent ambient**. The chain, read from
+      source: `SET x = v` resolves AUTOMATIC against `FABRICATOR_SETTING_DEFAULT_SCOPE` = SESSION, so the
+      trampoline writes under `SessionKeyFor(&context)` (the ClientContext ADDRESS); `GetString` consults
+      that layer only when `CurrentSession != 0` and otherwise reads the global bucket, which `SET GLOBAL`
+      writes under key 0; and `CurrentSession` is an `AsyncLocal<long>` assigned ONLY by `set_active_opener`,
+      which C++ calls from catalog and scan crossings, never from a global scalar's execute. **MEASURED
+      reproducibly — a two-statement suite, the shell, and the full suite in two shapes: a plain `SET` is
+      INVISIBLE, while `current_setting()` reports it throughout**, which is what makes it a trap rather
+      than an error. ⇒ the refusal names **`SET GLOBAL`** explicitly.
+      - **⚠⚠ A CORRECTION, AND THE WRONG VERSION REACHED FOUR PLACES BEFORE IT WAS CHECKED (user-caught,
+        2026-09-02, by asking me to explain the mechanism).** This entry first claimed the behaviour was
+        NON-DETERMINISTIC — invisible in a small session, visible after unrelated statements — and explained
+        it by `SetActiveOpener` assigning the ambients and never clearing them, so an earlier crossing on the
+        same thread would leave `CurrentSession` set. **That story was invented to fit ONE observation and it
+        does not survive testing.** The observation was real (an intermediate build's includes rendered after
+        a plain `SET`) and it DOES NOT REPRODUCE: the direct test — a `fabricator_plugins()` call immediately
+        before the `SET`, i.e. a fabricator table function whose bind AND scan really do call
+        `set_active_opener` (`arrow_ingest.cpp:265`, `:1005`) — came back NEGATIVE, and so did reconstructing
+        the original suite shape on a clean bridge. The one run is UNEXPLAINED and nothing rests on it.
+        ⚠ The trap it illustrates is this file's own recurring one: **an anomaly seen once, explained by a
+        plausible mechanism, and written down as measured.** The tell was available immediately — I had TWO
+        negative shell probes in hand when I wrote it and read them as "weak tests" rather than as evidence.
+      - **⚠ THE UNDERLYING GAP IS NOT FIXED AND IS BIGGER THAN FLUID: a global function reaches neither the
+        host filesystem nor its own session's settings.** Fixing it means establishing the ambients around
+        `scalarfn_execute` and the sqlgen bind **with SAVE/RESTORE** — and the v80 record is the warning, not
+        the recipe: pushing them at a scalar BIND crashed under `OPTIMIZE` because a scalar binds inside
+        whatever an outer operation is running, so it CLOBBERED the outer ambient. C++ cannot read the managed
+        `AsyncLocal` back today, so a correct version needs a paired push/pop. Its own change.
+    - **✅ AND A PRE-EXISTING CRASH IT EXPOSED, FIXED IN ITS OWN COMMIT (C++-only, no ABI): none of the nine
+      `fs_*` host callbacks null-checked the opener, while their sibling `HostHttpRequest` always has**
+      (*"http_request requires a client context (no ambient opener)"*). So any managed caller reaching the
+      filesystem without an ambient got an access violation instead of a message. ⚠ UNGATED and the code says
+      so — nothing in tree currently calls an `fs_*` callback without an ambient, so no statement reaches it.
+    - **WHAT SHIPS: `read_blob` over slice 3's `HostQueryTransport`** — `SELECT content, size, last_modified
+      FROM read_blob($path)`. It needs no ambient (`Host.Query` opens its own connection) **and it is better
+      on the merits, all four MEASURED**: `read_blob` on a missing file returns **ZERO ROWS** rather than
+      throwing, so **absence is ESTABLISHED by the engine** instead of guessed from a message — decisive here,
+      because the host has no `fs_exists` and Fluid's normal behaviour is to probe a path that is *supposed*
+      to be missing; it reports **`size`**, so the 1 MiB ceiling is checked against the file; it reports
+      **`last_modified`**, so `TemplateSourceInfo.LastModified` carries a REAL time where a filesystem seam
+      has none (this repo shipped the alternative once — `DuckDbTableFileSystem`'s hardcoded epoch); and the
+      path crosses as a **BOUND PARAMETER** (`read_blob($path)` binds), so it never becomes SQL text — slice
+      3's named-parameter work paying out immediately. ⚠ The cost, stated: the read inherits every `query()`
+      limitation, so a location authorised by a TEMPORARY secret of the calling session is unreadable.
+    - **⚠⚠ FLUID'S FILE-PROVIDER CONTRACT, measured on 3.0.0-beta.7 — it is `Fluid.ITemplateFileProvider`,
+      NOT `Microsoft.Extensions.FileProviders.IFileProvider`** (that is what the DEFAULT
+      `FileProviderTemplateFileProvider` wraps). **It receives the `TemplateContext`**, which is what makes
+      ONE instance on the shared static `TemplateOptions` SAFE where the `query` FILTER needed a warning — the
+      root, the cache and the tried-path record travel per call. Called at **RENDER, never at PARSE** (zero
+      calls during `TryParse`), so the parse-once cache is unaffected. **⚠⚠ IT PROBES TWICE PER INCLUDE**
+      (`a`, then `a.liquid`) — two round trips on remote storage for an author who omits the extension — **and
+      the BARE probe WINS when both files exist**, the opposite of what a `.liquid` convention suggests
+      (gated as a discriminating pair). Not-found is `null`. Two includes of one file made FOUR provider calls,
+      so caching is OURS. `{% render %}` uses the same provider and, unlike standard Liquid, is **not**
+      scope-isolated in this beta. A cyclic include stops at `MaxRecursion` (100) after ~200 calls.
+    - **⚠⚠ THE ROOT IS ERGONOMICS, NOT A SANDBOX, and the suite says so rather than letting the refusals imply
+      otherwise.** An ABSOLUTE path is allowed and needs no root. Confining an include would protect nothing:
+      the template's renderer can already run SQL, and slice 3's `query()` reads any path the host can open.
+      What is refused is refused for PREDICTABILITY — `..` (resolves against a root the author may not see),
+      and `* ? [ ]` (**`read_blob` GLOBS**: `he*` matches one file today and another the day one is added).
+    - **⚠⚠ TWO MUTANTS SURVIVED FIRST AND BOTH TAUGHT SOMETHING.** (1) The BOM-stripping branch was a REAL
+      survivor — `TemplateSourceInfo` takes a STREAM factory and Fluid reads it with a `StreamReader`, which
+      strips a UTF-8 BOM itself, so our branch was inert; **DELETED**, and the provider now streams the raw
+      bytes (one fewer decode/re-encode round trip). ⚠ Fluid does NOT strip a BOM from a template passed as a
+      STRING (measured), so `fluid_render` on a BOM-prefixed literal keeps it. (2) The absolute-path
+      mutant survived **three times for three different reasons**, and only the last is about the code: the
+      anchor had a `\\` and **never applied** (the build succeeded and the suite passed IDENTICALLY — exactly
+      what a no-op mutation looks like; a control mutation that makes `Resolve` always throw is what proved
+      the harness sound); then `if (false && A || B || C)` **still fires on B and C** — precedence, not code;
+      and then it survived legitimately because **on Windows the join `<root>/C:/Users/…/hello.liquid`
+      OPENS** (measured), so the assertion had to move to where NO ROOT EXISTS. ⇒ **an assertion that depends
+      on a path NOT resolving is platform-dependent; assert the refusal instead.**
+    - ⚠ Two gate mechanics worth reusing: the first `COPY` uses **`PER_THREAD_OUTPUT` because that is what
+      CREATES the directory** (a plain COPY to a file path does not create its parent, and the runner's
+      scratch dir need not exist from DuckDB's point of view), and it is **`rtrim(x, chr(10))`, not
+      `trim(x)`** — DuckDB's one-argument `trim` removes SPACES and leaves the newline COPY appends.
+    - ⚠ NOT GATED, and the suite says so: the per-render read cache (no answer changes; no read count is
+      observable from SQL) and the reader's multi-match refusal (a mutant survives — `Resolve` refuses glob
+      metacharacters first, so only a ROOT containing one could reach it).
+    - ⚠ A per-call `template_root` argument was considered and NOT built: clean for `fluid_replacement_query` (a named
+      table-function parameter), awkward for `fluid_render` (a scalar, so a third parameter means a
+      second arity). Revisit if the process-wide scope becomes a real complaint.
+  - **✅ SLICE 3 IS DONE (2026-09-01) — `HostQueryTransport` + the Fluid `query(sql)` function. C#-only,
+    NO ABI change, NO C++ change. Full record: [docs/fluid-templating.md](fluid-templating.md) §9.**
+    Gate `verify_plugin_fluid` **93 → 131**, four mutants each killed at its own assertion; service floor
+    3162 → **3200** (3162 + 38 exactly). The seam is `HostHttpTransport`'s shape copied deliberately — one
+    static delegate in `Fabricator.Abstractions`, filled in by `Bootstrap` at boot — so a plugin reaches
+    `host_query` with the reference it already has, and §2's prediction pays out a second time.
+    - **⚠⚠ THE SELECT-ONLY REFUSAL §8.3 REQUIRED IS NOT THE EASY PART, AND THE TWO MECHANISMS ANYONE WOULD
+      REACH FOR FIRST ARE BOTH BROKEN — MEASURED.** A PREFIX CHECK (`starts with SELECT`/`WITH`) admits
+      `WITH x AS (SELECT 1) INSERT INTO t SELECT * FROM x`, a write beginning with `WITH`. Wrapping as
+      `SELECT * FROM (<sql>)` is worse than useless: it refuses every HONEST non-SELECT
+      (INSERT/DELETE/UPDATE/CREATE/DROP/ATTACH/COPY/PRAGMA/SET, all Parser Errors with the row count
+      unchanged) and is defeated by the ADVERSARIAL one —
+      **`SELECT 1) ; INSERT INTO aud VALUES (99); SELECT * FROM (SELECT 2` performed the insert, and a
+      `DROP TABLE` variant DROPPED THE TABLE.** It is string concatenation, so it has an escape by
+      construction. **A mechanism that refuses the accident and admits the attack is worse than none,
+      because it reads as a defence.**
+    - **WHAT SHIPS IS `json_serialize_sql` — DuckDB's OWN PARSER — WITH THE SQL AS A BOUND PARAMETER**, and
+      it announces the rule itself: *"Only SELECT statements can be serialized to json!"*. MEASURED: it
+      refuses both escapes, refuses multi-statement input, refuses the `WITH … INSERT` shape, and **PARSES
+      ONLY** — a target table's row count is unchanged by classifying a `DELETE` against it.
+      - ⚠ **The cast is REQUIRED**: `json_serialize_sql(?)` cannot resolve its overload from an untyped
+        parameter (*"first argument must be a VARCHAR"*). It is `?::VARCHAR`. Found by RUNNING it — and it
+        arrived as a REFUSAL rather than a crash, i.e. the fail-closed rule working before it was
+        deliberately tested.
+      - ⚠ **An EMPTY string classifies as NO ERROR** (it parses to zero statements), so the classifier
+        ALONE would wave it through. Guarded separately, before the classifier.
+      - ⚠ **The engine's own message is surfaced verbatim**, because the check conflates two causes
+        otherwise: a non-SELECT and a real syntax error (`syntax error at or near "SELEC"`). Reporting "not
+        a SELECT" for a typo sends the author to the wrong place.
+      - ⚠ **It FAILS CLOSED** — `json` unavailable or host unreachable ⇒ REFUSED, never run. An
+        unenforceable check must fail closed.
+      - **⚠ THE COST, stated rather than hidden: some READ-ONLY statements are refused too.** `PIVOT` and
+        `EXPLAIN` are not serializable — and for `PIVOT` that holds even wrapped in a subquery, where it
+        would otherwise EXECUTE, so it is unreachable in any spelling. `DESCRIBE`/`SUMMARIZE`/`VALUES`/
+        `TABLE t`/`FROM t`/CTEs/set ops all pass. Conservative in this direction is the correct trade.
+    - **THE PAYOFF, and it is what slice 2 was run to permit: a template asks the database what SQL to
+      generate, AT BIND TIME** — measured, a `fluid_replacement_query` whose output SCHEMA is decided by rows read
+      during `bind_replace` (columns named `alpha`, `beta`, names existing only in the queried table).
+    - **⚠⚠ THE GATE IS A PAIR AND NEITHER HALF ALONE SAYS ANYTHING.** The refusal is asserted at §8.3's
+      sharpest point — `EXPLAIN` of a statement that never executes — and *"the write did not happen"* is
+      **equally true of a build where bind-time `query()` had stopped working altogether**. So a POSITIVE
+      CONTROL sits immediately above it: an `EXPLAIN` whose plan carries column names that could only come
+      from a bind-time read. ⚠ It uses the `<REGEX>:` form on the `physical_plan` row because **`EXPLAIN`
+      cannot be a subquery source** — the convention this very suite already used a few sections up, and
+      which I re-derived the hard way.
+    - **ROWS REUSE SLICE 1's VALUE MODEL, as §6 required — ONE type, ONE lookup rule.** `ArrowStruct` gained
+      a `RecordBatch` constructor rather than growing a sibling, so a result row and a STRUCT cell resolve
+      members identically (name, then an int-parse ORDINAL, then FALSE so Fluid can answer `.size`).
+      - **⚠⚠ A MUTANT CORRECTED MY OWN CODE COMMENT, which is the most useful thing in the slice.** Cells
+        are read EAGERLY because the batches are disposed as the result is consumed; I wrote that holding
+        one would be "a use-after-free … invisible on the platform you develop on". **It is NOT that
+        class** — Apache.Arrow nulls a disposed `RecordBatch`'s arrays, so it fails LOUDLY with a
+        `NullReferenceException` on the first cell read, deterministically, and the mutant died at the very
+        FIRST `query()` assertion. Right line, wrong reason, and only running it showed which.
+      - ⚠ A row cap that **ERRORS** at 1,000,000 rather than truncating — a silent truncation is a wrong
+        ANSWER, where the cap only turns an out-of-memory into a sentence. No knob yet.
+    - **⚠ `AllowFunctions` IS OFF IN FLUID BY DEFAULT AND IS A PARSER-LEVEL GATE**: without
+      `new FluidParser(new FluidParserOptions { AllowFunctions = true })`, `query('…')` is a PARSE error
+      (*"Functions are not allowed"*) rather than a missing function at render — the failure appears one
+      layer away from its cause.
+    - **⚠ `require json` IS LOAD-BEARING IN THE SUITE, not hygiene.** The classifier is
+      `json_serialize_sql` and `unittest` does NOT auto-load extensions, so without the directive every
+      `query()` call is refused (fail-closed) and the section reads as a broken FEATURE rather than a
+      missing REQUIRE — this file's own recorded trap, and the directive says so.
+    - §8.2's transaction visibility is now GATED with its control: inside `BEGIN; INSERT …;` the statement's
+      own scan sees the uncommitted row and `query()` does not; after `COMMIT` it does, which is what makes
+      the middle assertion a visibility result rather than a broken read.
+    - **⚠⚠ NAMED PARAMETER BINDING — `sql | query: a: 1` binding `$a` — ADDED THE SAME DAY (user-raised:
+      "how do we create a params object where the name members are used for param binding by name? or we
+      need to add dictionary creation support into fluid"). C# AND C++, still NO ABI change. Gate 131 →
+      **147**, three further mutants. THE ANSWER IS THAT FLUID ALREADY HAS NAMED ARGUMENTS — ON FILTERS —
+      so NOTHING was added to Fluid. Full record: docs/fluid-templating.md §9.10.** MEASURED on beta.7:
+      `query('s', a: 5)` is a PARSE error and `{'a':1}`/`{a:1}` do not parse either (no dict literal), while
+      `'s' | q: a: 5` parses AND arrives with its names. ⇒ `FunctionArguments.Names`/`HasNamed` — the
+      members that make named FUNCTION arguments look supported — are populated by the FILTER grammar only.
+      - **⚠⚠ THE HOST HALF NEEDED NO ABI CHANGE BECAUSE THE NAMES WERE ALREADY CROSSING.** DuckDB has
+        `$name` and `PreparedStatement::Execute(case_insensitive_map_t<BoundParameterData>&, bool)`; the
+        params `RecordBatch` carries its column names in the Arrow schema; and `ArrowStreamReader` walked
+        that schema for TYPES while never capturing `children[i]->name`. So host_query bound positionally
+        for the whole life of that overload because **nothing had read the names**, not because they were
+        absent — the same shape as the `fabricator_functions()` finding.
+      - **⚠⚠ THE STATEMENT SELECTS THE BINDING, NOT THE BATCH, AND MY FIRST RULE WAS WRONG IN A WAY ONLY
+        THE TIER SHOWED.** It read "every column has a non-empty name ⇒ bind by name" — but an Arrow field
+        practically ALWAYS has a name, so that test is nearly always true and it silently switched EVERY
+        existing caller to name-binding. `cf_host_param` sends columns `p0`/`p1` against positional `?` and
+        broke (*"Values were not provided for … parameters: 1, 2"*), falsifying my own "keeps the original
+        positional behaviour byte-for-byte". ⚠ **I had also concluded there were NO in-tree callers of the
+        params overload — from a grep I truncated with `head -10`.** The rule now matches the batch's names
+        against the statement's own `named_param_map` (a `?` statement names its parameters "1", "2", … so
+        `p0`/`p1` cannot match); a SUBSET is enough, because requiring equal sizes falls back to positional
+        and makes DuckDB report every parameter missing including the supplied one. Duplicate names are
+        REFUSED, not collapsed.
+      - **⚠ THE POSITIONAL BRANCH IS NOW UNREACHABLE FROM ANY IN-TREE CALLER and is therefore UNGATED** —
+        every in-tree producer names its columns. Kept for an out-of-tree plugin using `?`; the suite says
+        so rather than implying coverage.
+      - **⚠⚠ THE CHANGE BROKE THE CLASSIFIER, AND THAT IS THE MECHANISM ANNOUNCING ITSELF.** §9.2's
+        classifier read `json_serialize_sql(?::VARCHAR)` while sending a batch whose column is named `sql`,
+        so the instant named binding landed it failed with *"Values were not provided for the following
+        prepared statement parameters: 1"*. Fixed by naming the placeholder `$sql`. **A params batch's field
+        names are now LOAD-BEARING**, which they never were before.
+      - Values are an ALLOW-LIST crossing as VALUES rather than text: number → BIGINT when integral (Fluid's
+        number model IS decimal, so even `10` arrives as one) else DECIMAL(38, scale) keeping `19.99`
+        exact; string/bool/date (stamped UTC, §7.4a's rule on the way out) / nil → NULL VARCHAR; a
+        LIST/STRUCT/MAP is REFUSED BY NAME (⚠ **the LIST half stopped being true on 2026-09-04** — see the
+        list-parameter entry under "Next up"). ⚠ POSITIONAL filter arguments are REFUSED rather than ignored —
+        Fluid permits mixing them, and dropping one silently would run the statement with a parameter the
+        author believed they had supplied.
+      - **THE LOAD-BEARING GATE ASSERTION IS THE INJECTION ONE, WITH ITS CONTROL**: `region: "eu' OR 1=1
+        --"` answers **0** where splicing would answer 3, and the same statement with `"eu"` answers 2 —
+        without which the 0 would be equally true of a build where the parameter never arrived.
+      - **⚠ MUTANT A (never bind by name) dies at the FIRST query() rather than at a parameter assertion**,
+        because the classifier itself now binds by name — strong coverage, broad kill. Hence MUTANT B:
+        names in order, VALUES reversed, so a one-parameter call is unaffected and a two-parameter one
+        binds wrongly (*"Could not convert string 'eu' to INT32"*). ⚠ My FIRST attempt at B reversed the
+        name at the INSERT but not at the duplicate CHECK, so it tripped my own guard instead of
+        demonstrating a wrong binding — it killed at the right line for the wrong reason.
+    - **⚠⚠ `Host.Query`'s PARAMETERISED overload HAD NO IN-TREE CALLER until slice 3's classifier
+      (user-raised) — every other caller uses the bare form or the named-Arrow-`inputs` form.** Read from
+      `fabricator_host_query.cpp`: with `params` the host runs `conn->Prepare(sql)` then
+      `prepared->Execute(values)` — a REAL prepared statement, **one Arrow COLUMN per parameter, bound
+      positionally** against `?` / `$1`, so the value never becomes SQL text. ⚠ Only **row 0** is read, an
+      **empty batch binds all-NULL** rather than erroring, an **untyped `?` may fail overload resolution**
+      (hence `?::VARCHAR`), and — the one that bites — **passing parameters restricts you to ONE
+      statement**, because the no-params branch is `SendQuery` and this one is `Prepare`. That is the same
+      asymmetry that forced `fabricator_host_query`'s fallback and motivated `fabricator_host_exec`.
+    - **⚠ §1.4 (DuckDB functions callable from inside Fluid) SHOULD BE RE-DERIVED, NOT INHERITED** — §6
+      already flagged it and slice 3 strengthens it: a template that can run SQL can already call any DuckDB
+      function through `query()`, so the remaining case is ergonomic rather than capability.
+    - Slice 4 (`ITemplateFileProvider`) needs the same seam shape for `HostFs`; `HostQueryTransport` is now
+      a second worked example and the two should look alike.
+  - **✅ SLICE 2 IS DONE (2026-09-01) — THE BIND-TIME `host_query` HAZARD IS MEASURED AND THE ANSWER IS
+    PERMISSIVE. Full record: [docs/fluid-templating.md](fluid-templating.md) §8.** A THROWAWAY
+    `ISqlTableFunction` calling `Host.Query` from `GenerateSql` (i.e. a real host query while DuckDB binds),
+    run under timeouts so a deadlock would surface as one. **FOURTEEN shapes, none failed**: constant, a
+    DuckDB table, inside a VIEW (bind repeats), inside a transaction, `EXPLAIN`/`DESCRIBE` (bind without
+    execute), NESTED (a bind-time host query calling the probe again), a prepared statement re-bound per
+    EXECUTE, our OWN attached catalog, bind-read + outer scan of the same table, and CTAS into that catalog.
+    ⚠ The catalog cases are THREE levels deep by construction — `PROVIDER 'delta'` defaults `native_read` on,
+    so the Delta scan issues its own `Host.Query` per file. Probe REMOVED afterwards
+    (`CustomFunctions.cs` byte-identical to HEAD; `duckdb_functions()` reports 0).
+    - **⚠ IT DOES NOT REPEAL THE CLASS.** The two incidents §3 cited (the ABI v80 scalar-bind ambient
+      SIGSEGV under OPTIMIZE; the `entry_lock_` rule) are about holding an AMBIENT or a LOCK across a
+      re-entry, and `Host.Query` opens its own connection and scope. The probe answered the specific
+      question, not the general one.
+    - **⚠ TRANSACTION VISIBILITY IS A REAL LIMITATION AND IS *NOT* BIND-SPECIFIC — measured with a control.**
+      Inside `BEGIN; INSERT …;` the statement's own scan sees **109** while BOTH `fabricator_host_query` at
+      execute time AND the bind probe see **10**; after COMMIT, 109. Identical on a PLAIN DuckDB table ⇒ it
+      is `host_query` opening its own connection, not something bind introduces. That is what makes the
+      surface symmetric: ONE rule to document, not two. A template cannot observe the writes of the
+      transaction running it.
+    - **⚠⚠ THE HAZARD IT FOUND, WHICH NEITHER BRANCH OF §3 ANTICIPATED, AND IT CONSTRAINS SLICE 3'S SURFACE:
+      A BIND-TIME WRITE FIRES ON `EXPLAIN`.** Counting rows in an audit table: `EXPLAIN` of a
+      never-executed statement ⇒ **1**; merely `CREATE VIEW` over it ⇒ **2**; each USE of that view ⇒ **3**.
+      ⇒ **slice 3's Fluid `query` must REFUSE anything that is not a SELECT**, decided on the STATEMENT KIND
+      BEFORE execution — a catch afterwards is too late, the write has happened. Not a new rule:
+      `ISqlTableFunction`'s own contract already requires `GenerateSql` to be deterministic and
+      side-effect-free BECAUSE binds repeat and happen without execution.
+    - ⚠ Slice 3 still needs §2's `HostQueryTransport` seam regardless — the probe reached `Host.Query` only
+      because it lived in a FIRST-PARTY assembly. The plugin still cannot.
+  - **⚠ SLICE 2's ORIGINAL FRAMING, now superseded by the result above:** — nothing in slice 1 executes SQL, it only
+    generates text. If anything `fluid_replacement_query` sharpens §3: a Fluid `query` inside it would execute SQL
+    *inside `bind_replace`*, i.e. during the binder's own walk, not merely "during bind".

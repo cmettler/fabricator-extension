@@ -1507,3 +1507,52 @@
     it is a stable join key — with the caveat that a mismatch would silently DROP that file's rows, so any
     such join needs a `LEFT JOIN` plus an `error()` on an unmatched file. And the residual per-row cost is
     the Arrow hand-back, which no batching of any shape touches.
+
+## Appendix — records moved verbatim from CLAUDE.md (2026-09-18)
+
+CLAUDE.md carried these as-built records inline until it grew to 10,776 lines — a file loaded into every
+session's context. They are moved here VERBATIM; CLAUDE.md keeps each entry's summary head plus a pointer to
+this section. The one edit made on the way: a link that pointed into the docs directory is rewritten relative
+to this directory, so it still resolves from here.
+
+- **THE DELTA NATIVE READ PATH — the whole performance story, and it is LONG: moved verbatim to
+  [docs/delta-read-path.md](delta-read-path.md) (2026-08-23).** Read it before touching
+  `DeltaNativeReader`/`BatchPlan`, before quoting any remote figure, and before adding a fifth form.
+  What happened, in one paragraph: the profiled Fabric `LIMIT 1` went **291 s → 8.8 s** across a dozen
+  C#-only fixes — the per-transaction table cache, the AT-version double build, the bind-time schema
+  probe, preferring the cheap `schema`-map form over `union_by_name`, pushing the bare `LIMIT` and then
+  `ORDER BY … LIMIT`, echoing literal globs with zero IO, buffering a ≤16 MB checkpoint in ONE request
+  instead of ~63 micro-GETs, seeding known file sizes + declaring immutability, and adding the union and
+  partition-only batched forms. There are now **FOUR batched forms**, routed by the PROJECTION rather
+  than by the table.
+  - **THE STANDING RULES IT PRODUCED — these are the reusable part and they generalise past Delta:**
+    - **EVERY COLUMN OF A BOUND HOST-QUERY INPUT MUST BE READ BY THE GENERATED SQL.** A projection that
+      is not a PREFIX of a bound Arrow stream's columns SEGFAULTS `duckdb_arrow_scan` (reproduced on
+      plain v1.5.5 with no extensions — [docs/duckdb-upstream-issues.md](duckdb-upstream-issues.md)
+      §2), and wrapping the query in a subquery / CTE / even a MATERIALIZED CTE does NOT help, because
+      projection pushdown goes straight through all three. Add a bound column only together with the SQL
+      that reads it.
+    - **A FIGURE QUOTED FROM AN EARLIER ENTRY IS A MEASUREMENT WITH AN EXPIRY DATE.** Three separate
+      claims here were argued from numbers that two earlier fixes had already collected — the worst
+      overstated its own win by ~6x. Re-take a remote number in the same session you argue from it.
+    - **A REMOTE A/B NEEDS INTERLEAVED LEGS (1,4,1,4) AFTER A REAL WARM-UP**, because OneLake
+      first-touch costs ~12–17 s that the second statement does not pay: "threads=1 then 4" said 3.7x
+      and REVERSING the order inverted the result. Two orders only prove that position matters.
+    - **`SELECT count(*)` ON A DELTA TABLE IS ANSWERED FROM THE LOG** and opens no data file, so it
+      warms nothing and measures nothing about a read. A parquet aggregate the FOOTER can answer is not
+      a read either — that trap produced three false "it works" results in one session.
+    - **`duckdb_logs` IS THE WRONG INSTRUMENT FOR A COUNT** (it flushes per-thread lazily, and
+      `disable_logging()` does not flush) — make the callee report its own numbers as DATA. A
+      `count(*) > 0` log assertion is fine; a COUNT over log lines is not.
+    - **INSTRUMENT THE SEAM; DO NOT REASON ABOUT THE OWNERSHIP MODEL.** A stream bound as a host-query
+      input is Disposed when the query finishes — INSIDE `RunCopy`, before it returns — so state parked
+      on it and read back afterwards is silently gone. That shipped as a 636-row DATA LOSS presenting as
+      a layout bug; the probe line, not review, is what found it.
+    - **A GATE HERE CAN ONLY PIN THE ROUTING, never the answer** — all four forms are correct, so a row
+      assertion passes whichever one ran. Assert the `delta native batch:` Debug line, and keep a
+      NEGATIVE control (a DV table must still take `union_by_name`) or "it took the cheap form" would
+      pass equally on a build where the expensive one had stopped being reachable.
+  - Gates: `verify_delta_batched_read` **399** (hermetic, run at `MIN_FILES=1`), `verify_delta_native_scan`
+    89, `verify_delta_statistics` 27, `verify_delta_catalog_time_travel` 98, `verify_delta_autocommit_pin`
+    75. The `s3://` leg of `verify_delta_catalog_s3` is the only CI coverage of a batched
+    `read_parquet([…])` against object storage.

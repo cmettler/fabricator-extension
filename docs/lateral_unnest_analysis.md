@@ -1050,3 +1050,54 @@ side only asks `IsNull` before refusing, so the carrier type is irrelevant.
     de-duplication finding above) and is a `batch_rows` value rather than a log count. `ORDER BY ALL` is still
     mandatory — because the PLAN promises no order, not because we declared `NO_ORDER`.
 
+## Appendix — records moved verbatim from CLAUDE.md (2026-09-18)
+
+CLAUDE.md carried these as-built records inline until it grew to 10,776 lines — a file loaded into every
+session's context. They are moved here VERBATIM; CLAUDE.md keeps each entry's summary head plus a pointer to
+this section. The one edit made on the way: a link that pointed into the docs directory is rewritten relative
+to this directory, so it still resolves from here.
+
+- **⚠⚠ LATERAL BIND-TIME CONSTANTS — `Params.Constant("name")` + the host scalar `const_arg(…)` — BUILT
+  2026-08-29 (C++ + C#, NO ABI bump; the `constant` param style is an additive metadata value). Full
+  record: [docs/lateral_unnest_analysis.md](lateral_unnest_analysis.md) §9. Gate: `verify_lateral`
+  168 → 211 (hermetic floor 8003 → 8046), one mutant killed at its own assertion. Committed as `2e41b2a`
+  (+ the §5 doc pointer `8c17f3b`), unpushed — `git log @{u}..HEAD` is the authority.** A lateral function's output schema can now depend on a per-call constant: the author declares
+  `Params.Constant("fields")` and reads the typed value in `Bind`'s `args`; the slot is stripped from the
+  input schema and from every `Session.Call` chunk. Callers: a BARE constant in the literal shape
+  (`f(7, 'x,y')` — the folded value reaches the bind via `input.inputs`), `const_arg('x,y')` in the
+  correlated shape (its v80 bind parks the value in `CapturedConstants` and smuggles the key through its
+  result TYPE — `STRUCT("__fab_const_<md5>": VARCHAR)` — past the binder's args→input-relation rewrite).
+  - **⚠⚠ SAME DAY, SECOND SLICE (uncommitted): A BARE CONSTANT NOW WORKS IN THE CORRELATED SHAPE TOO** —
+    `FROM t, f(t.n, 'x,y')` — so `const_arg` became the explicit/always-works spelling rather than a
+    requirement. Mechanism: the rewrite turns the constant into an input COLUMN whose rendered NAME is the
+    parsed expression's own rendering (`input_table_names[slot]` — MEASURED faithful: `'it''s'` keeps its
+    escaping, `5::SMALLINT` → `CAST(5 AS SMALLINT)`, `upper('ab')` folds to the right value);
+    `TryFoldRenderedConstant` (fabricator_lateral.cpp) re-parses it, binds via DuckDB's **ConstantBinder**
+    (refuses columns), folds (refuses volatiles), and accepts only when the folded TYPE equals the slot's
+    bound type — every guard failure falls back to the const_arg refusal. Gate `verify_lateral` 211 → 221;
+    hermetic floor 8046 → 8056; service unchanged.
+  - **⚠ THE SQLGEN-DECOY VARIANT IS DEAD, MEASURED, NOT MERELY UNCHOSEN** (user-proposed: a bind_replace
+    function rewriting `f_test(t.n, 'x,y')` → `f(t.n, const_arg('x,y'))`): a sqlgen function is a STANDARD
+    table function and the binder refuses a column argument BEFORE bind_replace runs (*"does not support
+    lateral join column parameters"*), and `generate_table_sql` receives only constant VALUES, never
+    expressions. The probe that killed it (a throwaway lateral echoing its input schema names) is also what
+    established the text channel's faithfulness. Documented residual: a column whose quoted NAME parses as
+    a constant of the column's own type would be mis-captured — needs an identifier with embedded quotes;
+    the type guard kills everything less pathological. Full record: lateral_unnest_analysis.md §9.
+  - **⚠⚠ THE LIFECYCLE IS MEASURED, NOT TASTE: an entry is removable only when CONSUMED *and*
+    UNREFERENCED.** Dispose-only release breaks the LITERAL shape (the binder folds the argument and
+    discards the bound scalar BEFORE the consumer's bind — the prototype shipped that and every
+    literal-shape call missed); consume-only leaks on the correlated shape. DuckDB re-binds every EXECUTE
+    (measured — the PREPARE-time plan is torn down), so state drains to zero after every statement.
+  - **⚠⚠ THE BUILD FIXED TWO PRE-EXISTING v79 SHARP EDGES in `fabricator_lateral.cpp`** — DuckDB's two
+    call shapes disagree about `input_table_types` in OPPOSITE directions
+    (`bind_table_function.cpp:425-457`): correlated RELABELS to the declared type without casting the child
+    (→ `Vector::Reference` INTERNAL error that INVALIDATED the whole database), literal reports the
+    PRE-cast type while delivering the POST-cast value. Fixed by normalizing to the DECLARATION (ANY slots
+    keep the bound type — that is what carries the capture struct) + cast-at-seam in `LateralSession::Call`.
+  - ⚠ Naming was MY pick over the user's suggestion (`Params.LateralConst`/`lat_const_arg`): "constant" is
+    the repo's own word for bind-time args and `const_arg` reads in SQL; a word-boundary rename is trivial
+    if the user prefers theirs.
+  - Consumers: `fabricator_lat_fields` (host, type-generic demo: VARCHAR names / int count / LIST) and the
+    sample plugin's `plug_lat_fields` (ZERO plugin-side machinery — the prototype's dictionary/scalar/count
+    probe were deleted as superseded).

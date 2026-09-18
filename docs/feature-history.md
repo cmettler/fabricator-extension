@@ -2247,3 +2247,1119 @@ a C++ "gate" mutex; the lock moved C#→C++. Commits `ca111e7` (ABI), `49f9a1d` 
     that section exists.
   - Gates: hermetic **66/66 — 6367**; the three engine-doubled delta suites also re-run with
     `GROUP_BYTES=1` at identical assertion counts.
+
+## Appendix — records moved verbatim from CLAUDE.md (2026-09-18)
+
+CLAUDE.md carried these as-built records inline until it grew to 10,776 lines — a file loaded into every
+session's context. They are moved here VERBATIM; CLAUDE.md keeps each entry's summary head plus a pointer to
+this section. The one edit made on the way: a link that pointed into the docs directory is rewritten relative
+to this directory, so it still resolves from here.
+
+- **⚠⚠ AN `UPDATE` THAT SETS A *LIST* COLUMN HANDED THE PROVIDER THE WHOLE ROW AS SET COLUMNS — 17 instead
+  of 1. ANALYSED 2026-09-15 from `fabricator-grist`, ✅ FIXED THE SAME DAY by the virtual override this repo
+  did not have. No ABI change; C++ only. ⚠ THE AS-BUILT RECORD IS THE LAST SUB-ENTRY — read it first; the
+  analysis below it is intact and still accurate, and one thing it could not know is that on THIS tree every
+  triggering type is also one the Delta provider cannot write (limitation 1.26).** A provider that diffs the incoming row to decide what actually
+  changed cannot tell "the user set 17 columns" from "DuckDB expanded one", and there is nothing on the
+  wire that says which happened.
+  - **THE MEASUREMENT.** Instrumented `ExecuteUpdate` in the Grist plugin and ran two statements against
+    the same column of the same table (`_columns`, whose `choices` attribute is `VARCHAR[]`):
+    ```
+    UPDATE … SET label   = 'Stat'                  ->  setColumnCount=1  of 2  ->  [label, col_ref]
+    UPDATE … SET choices = ['open','doing']        ->  setColumnCount=17 of 18 ->
+        [choices, table_id, col_id, label, type, duckdb_type, type_known, kind, is_writable,
+         is_formula, formula, ref_table, timezone, description, is_hidden, col_ref, parent_pos, col_ref]
+    ```
+    ⚠ Note `col_ref` appears **twice** — once as SET column 15 and once as the trailing key. That is
+    consistent with `BindExtraColumns(all_columns)` adding every physical column including the one the key
+    is derived from; worth a look while you are in there, because a provider that maps SET columns by NAME
+    will see a duplicate.
+  - **⚠ IT IS NOT THIS REPO'S BUG — the forwarding is faithful.** `FabricatorCatalog::PlanUpdate`
+    (`src/catalog/fabricator_catalog.cpp:626`) calls `FabricatorFillUpdateSetColumns(op.table, op.columns,
+    op.expressions, target)` (`:590`), and `set_count = target.set_columns.size()`
+    (`src/dml/fabricator_modify.cpp:35`). So we send exactly what `LogicalUpdate::columns` holds. **DuckDB
+    put 17 in there.**
+  - **THE CAUSE, in DuckDB core** — `src/catalog/catalog_entry/table_catalog_entry.cpp`,
+    `TableCatalogEntry::BindUpdateConstraints`:
+    ```cpp
+    // we also convert any updates on LIST columns into delete + insert
+    for (auto &col_index : update.columns) {
+        auto &column = GetColumns().GetColumn(col_index);
+        if (!column.Type().SupportsRegularUpdate()) { update.update_is_del_and_insert = true; break; }
+    }
+    if (update.update_is_del_and_insert) {
+        physical_index_set_t all_columns;                      // every physical column
+        LogicalUpdate::BindExtraColumns(*this, get, proj, update, all_columns);
+    }
+    ```
+    ⚠⚠ **`LogicalType::SupportsRegularUpdate()` (`src/common/types.cpp:706`) IS NOT VIRTUAL AND TAKES NO
+    CATALOG** — it is a switch on the type id: `LIST` / `ARRAY` / `MAP` / `UNION` / `VARIANT` / `GEOMETRY`
+    are false unconditionally, `STRUCT` is false if any child is. So **there is no flag a catalog entry can
+    set** to declare "my nested types update fine", which is the first thing one reaches for. The rule is
+    about DuckDB's own row-group storage — you cannot patch a LIST in place — and it has nothing to say
+    about a provider that updates a list column BY NAME over a wire protocol.
+  - **✅ THE HOOK THAT *IS* AVAILABLE: `TableCatalogEntry::BindUpdateConstraints` IS `virtual`**
+    (`src/include/duckdb/catalog/catalog_entry/table_catalog_entry.hpp:120`), and **`grep -rn
+    BindUpdateConstraints src/` over THIS repo finds nothing** — so the fabricator table entry inherits the
+    base and gets all of the above. An override is the fix. For a fabricator table all four base reasons
+    are vacuous or handled elsewhere:
+    | base step | for a fabricator table |
+    |---|---|
+    | CHECK constraints -> `BindExtraColumns(check.bound_columns)` | fabricator tables declare no constraints |
+    | `update.return_chunk` -> all columns | `PlanUpdate` already throws *"fabricator: UPDATE ... RETURNING is not supported yet"* |
+    | index columns -> del+insert | no LOCAL indexes on a remote-backed table |
+    | **LIST columns -> del+insert** | ⚠ **the only one that fires**, and the reason does not apply |
+  - **TWO MEASUREMENTS THAT MAKE THE OVERRIDE SAFE, both worth re-running rather than trusting:**
+    - **`update_is_del_and_insert` is read NOWHERE in this repo** (`grep -rn update_is_del_and_insert src/`
+      is empty). Nothing downstream of the planner branches on it, so leaving it false changes no
+      fabricator behaviour — it only changes how many columns the binder projects.
+    - **The OTHER `SupportsRegularUpdate` call site is not the bind path.**
+      `LogicalUpdate::RewriteInPlaceUpdates` (`src/planner/operator/logical_update.cpp:51-70`, sets the flag
+      at `:198`) is plan-DESERIALIZATION compatibility — its own comment reads *"Okay, we are reading an old
+      plan version that has in-place updates for a type that no longer supports it."* It cannot fire for a
+      freshly bound statement, but it WILL fire for a deserialized plan, so an override must not assume the
+      flag is always false at execution time.
+  - **⚠ WHAT TO VERIFY BEFORE SHIPPING THE OVERRIDE** — each of these is the base behaviour you would be
+    dropping:
+    - `GetStorageInfo(context).index_info` really is empty for a fabricator table (the index branch);
+    - the `constraints` vector really is empty (the CHECK branch) — if a fabricator table can ever carry a
+      CHECK, that branch must be KEPT, not skipped;
+    - keep the `return_chunk` branch as-is rather than deleting it: `PlanUpdate` refuses RETURNING today,
+      and an override that silently stopped projecting the row would turn a clean refusal into a wrong
+      answer the day RETURNING lands;
+    - **MERGE.** `src/catalog/fabricator_merge_into.cpp:23` says *"the only thing that had to move was WHERE an
+      UPDATE reads its SET values from (see `FabricatorFillUpdateSetColumns`)"* — so a `WHEN MATCHED THEN
+      UPDATE` setting a LIST column goes through the same binding. Test it explicitly;
+    - `FabricatorModifyTarget::set_child_indices` is documented **NOT positional** (`SET x = DEFAULT`
+      contributes no projection column; a MERGE shares one projection across actions). Changing how many
+      columns get bound is exactly the kind of change that invalidates a "not positional" assumption — the
+      comment at `src/include/dml/fabricator_modify.hpp:48-53` is the one to re-read.
+  - **THE DOWNSTREAM SYMPTOM, for a reproducer.** In `fabricator-grist`, `_columns` is a writable metadata
+    table whose `choices` attribute is `VARCHAR[]`. Because the whole row arrives, the plugin's
+    "is this cell actually changed?" diff has to cover EVERY column, and a single field missing from that
+    switch turns a supported statement into a refusal:
+    ```
+    UPDATE g."doc"._columns SET choices = ['open','doing','done'] WHERE table_id = 'T' AND col_id = 'Status';
+    -- grist: '_columns.parent_pos' is not writable
+    ```
+    ⚠ The plugin can and will work around it (that diff is exactly what it is for) — the point is that
+    **every provider with a writable wide table has to**, and none of them can see why the row grew.
+  - **⚠ THE LESSER FIX, if the expansion has to stay:** forward `update_is_del_and_insert` over the ABI on
+    `execute_update`, so a provider can DISTINGUISH a user-written 17-column SET from an expanded 1-column
+    one. Strictly worse than not expanding — the provider still receives and must ignore 16 columns — but
+    it is additive, it needs no behaviour change, and it is the only thing that helps the cases where the
+    expansion is legitimate and unavoidable (RETURNING, CHECK constraints, real indexes).
+  - **⚠ Measured against `build/release` on `v1.5-variegata` (`dfa6872`); `fabricator-grist` compiles
+    against pin `afda880`.** The plugin-side half (the missing diff field) is being fixed in that repo
+    independently and does NOT depend on this — the two are worth keeping separate, because the plugin fix
+    is needed anyway for the paths that expand for legitimate reasons.
+
+
+  - **✅ BUILT 2026-09-15 — `FabricatorTableEntry::BindUpdateConstraints` overrides the base, keeping every
+    rule except the LIST one. C++-only, NO ABI change. Gate: a NEW hermetic suite
+    `verify_update_set_columns` (**32**), floors 9410 → **9442** and MIN_SUITES 77 → **78**, one mutant.**
+    - **MEASURED, on the 5-column Delta table the analysis above describes** — and the `EXPLAIN (FORMAT
+      json)` split is sharper than the ASCII tree, which is what the gate uses: **before, the scan's
+      `"Projections"` renders as a JSON ARRAY and the PROJECTION carries FOUR `#N` bound references between
+      the assigned value and the rowid; after, it is the scalar string `"Projections": "id"` and the
+      projection is `['q'], rowid`** — identical in shape to the scalar-SET control.
+    - **⚠ THE `col_ref` DUPLICATE THE ANALYSIS FLAGGED GOES WITH IT, at no extra cost.** The scan's
+      `Projections: id, id, …` collapses to `id`, because the duplicate was the key column appearing once
+      as an expanded SET column and once as the key. It was never a second defect — it was this one seen
+      from the scan side.
+    - **⚠⚠ AND IT MAKES NO IN-TREE STATEMENT START WORKING, WHICH IS THE HONEST FRAMING.** Every type that
+      trips the base rule (LIST/ARRAY/MAP/UNION/VARIANT/GEOMETRY, and a STRUCT containing one) is ALSO a
+      type the Delta provider cannot read as a SET value — see **limitation 1.26**, found by building this
+      and deliberately NOT folded in. So on Delta the statement failed before and fails after, 16 unwanted
+      columns earlier. The value is for a provider that CAN write such a column (grist), plus not shipping
+      a row's worth of columns nobody asked for.
+      - ⇒ **that is why the gate asserts the PLAN and not an answer, and the suite says so.** It is also why
+        the two are separate commits: bundling the provider fix would have made this change's
+        behaviour-neutrality claim untestable — the same reasoning the EW pin and the SqlServer discovery
+        fix were split under.
+    - **⚠ EVERY OTHER BASE BRANCH IS REPRODUCED VERBATIM, and each for a stated reason rather than because
+      it is unreachable** — the CHECK loop (a fabricator table carries no constraints today, so it is a
+      no-op over an empty vector), the `return_chunk` branch (⚠ `PlanUpdate` refuses RETURNING, but at
+      PHYSICAL planning, i.e. AFTER this runs — deleting it would turn a clean refusal into a wrong answer
+      the day RETURNING lands), and the index loop (`GetStorageInfo` returns a default `TableStorageInfo`,
+      so `index_info` is empty — there are no LOCAL indexes on a remote-backed table). All three verified
+      in this tree rather than assumed, and the .cpp remark says to re-verify rather than trust it.
+    - **⚠ THE MUTANT IS THE DELETED LOOP, RESTORED: it dies at §2's first row after exactly 5 assertions —
+      the §1 scalar baseline — with the pre-fix array rendering.** That baseline is load-bearing: without
+      it, "the projection is narrow" would pass equally on a build where the plan had stopped projecting
+      anything at all.
+    - ⚠ §3 asserts MAP and a STRUCT-CONTAINING-A-LIST beside the LIST case, because `SupportsRegularUpdate`
+      covers six type ids and recurses into struct children — a build special-casing LIST alone passes §2
+      and fails there. §4 pins a STRUCT of SCALARS as a CHARACTERIZATION (it returns TRUE, so it never
+      expanded and reads the same either way), so the sections above cannot be misread as "nested types are
+      special to us": the split is DuckDB's.
+    - ⚠ MERGE is asserted separately (§5), as the checklist demanded — `WHEN MATCHED THEN UPDATE` lowers to
+      the same `LogicalUpdate` and the same `FabricatorFillUpdateSetColumns`, but shares ONE projection
+      across its actions. ⚠ Its plan has TWO scans (target and source); the target's is the one asserted.
+    - ⚠ `set_child_indices` is UNAFFECTED, which was the sharpest item on the pre-ship list: it is filled
+      from each bound expression's own `BoundReferenceExpression::index`, never from an ordinal, so fewer
+      bound columns changes the indices consistently rather than shifting them. §6's two answer rows are
+      the check — a multi-column SET and a struct SET, both landing correctly.
+    - ⚠ **The lesser fix (forward `update_is_del_and_insert` over the ABI) was NOT taken and should stay
+      unbuilt unless the expansion has to come back**: it would leave the provider receiving and ignoring
+      the extra columns, and the cases where the expansion is legitimate (RETURNING, CHECK constraints,
+      real indexes) are exactly the branches this override KEEPS.
+    - ⚠ Two traps re-earned while measuring it: **`EXPLAIN` cannot be a subquery source NOR a `COPY`
+      source** (so the JSON plan cannot be written to a file and parsed — the regex on the `physical_plan`
+      row is the only route), and a restored mutant must be written by something that UPDATES THE MTIME or
+      ninja skips the rebuild and the next run silently re-measures the mutant.
+
+  - **✅ AND THE PROVIDER-SIDE GAP IT EXPOSED IS FIXED TOO — SAME DAY, ITS OWN COMMIT (user-directed: *"take
+    the Arrow-passthrough fix"*). `UPDATE … SET <a LIST / MAP / nested column>` now WORKS on Delta, on both
+    update paths. C#-only, no ABI, no C++. Gate `verify_update_set_columns` 32 → **53**, floor 9442 →
+    **9463**. Limitation 1.26 lived for about three hours.**
+    - **⚠⚠ THE REFUSAL WAS A CLR ROUND TRIP, NOT A PROPERTY OF THE FORMAT OR THE WRITER — which is what the
+      user's question forced out ("with native_write there should be no limits at all"), and they were
+      right.** `native_write` only decides who writes the parquet BYTES; the refusal happened earlier, while
+      assembling the post-image IN MANAGED CODE. Both paths boxed every SET value and rebuilt an Arrow array
+      from the boxes, and neither ladder (`ReadScalar` out, `BuildArray` back) has a list case.
+    - **⚠ THE ROUND TRIP EXISTS FOR ONE REAL JOB AND THE CODE SAYS SO** — a TARGET-TYPE conversion, so an
+      incoming INT32 or a differently-united timestamp still lands as the column's declared type. ⇒ the fix
+      is to do it only when there IS something to convert: **when the incoming Arrow type already matches
+      the target STRUCTURALLY, hand the array through.** `BuildArray` still has NO list case, deliberately —
+      a list needing a genuine conversion is REFUSED rather than silently rebuilt through boxes.
+    - **⚠⚠ THE TWO PATHS NEEDED DIFFERENT FIXES, AND ONLY ASKING "where is ReadScalarDeep actually used?"
+      FOUND THE SECOND ONE.** It has exactly TWO call sites, both in the Delta UPDATE: `ExecuteUpdate`
+      rebuilds a SET column (a straight PASSTHROUGH), while `BufferUpdateRows` — the EXPLICIT-TRANSACTION
+      path — MERGES the new values with the untouched rows ROW BY ROW, which is a CONCATENATE + TAKE, not a
+      passthrough. ⇒ fixing only the first would have made one statement work in autocommit and fail inside
+      `BEGIN … COMMIT`: the "honoured on some writes and not others" asymmetry this file records as harder
+      to notice than a feature that never works (the `delta.checkpointInterval` lesson).
+    - **⚠ A THIRD SITE HID IN THE NOT NULL CHECK, and it fired FIRST.** `DeltaNullability.ValidateSetValue`
+      inspects a value's CONTENTS for exactly one shape — a struct's children — and for everything else acts
+      on nothing but null-ness. It boxed regardless, so a list died in a NULLABILITY CHECK before the write
+      path had any say. It now boxes only for a STRUCT and asks the Arrow array otherwise. ⚠ That puts every
+      scalar column's NOT NULL enforcement on a new code path, which is why §8 exists as its control.
+    - **⚠ NESTED FIELD NAMES ARE COMPARED LOOSELY, AND THAT IS THE ONE JUDGEMENT CALL.** Arrow labels a
+      list's child `item` while the parquet spec calls it `element`, so the two converters that meet here
+      (DuckDB's export, engineered-wood's Delta→Arrow) can describe ONE `VARCHAR[]` and disagree on a LABEL
+      while the layout is identical. The passthrough asks "may I hand this array over?", for which a label
+      is irrelevant. ⚠ MEASURED rather than assumed: the passthrough FIRES, so on this pin they agree — the
+      loose comparison is insurance, not the thing that made it work.
+    - **✅ IT CLOSED THE `Host.cs:351` FOLLOW-UP INSTEAD OF ADDING A THIRD COPY.** `IArrowType.Equals` is
+      REFERENCE equality, so every caller needing real equality hand-writes one, and that note already said
+      consolidating `SqlServerCdcReader.SameType` into the bridge was the right move. It is now
+      `Fabricator.Common/ArrowTypeCompare.SameType(a, b, namesMatter)` — ⚠⚠ **the flag is not a convenience:
+      CDC drift detection wants names to MATTER (a renamed field IS the drift) and the passthrough wants
+      them IGNORED, so there is deliberately no default.**
+    - ⚠ NOT mutation-tested, and the suite says what stands in its place: the same statements were MEASURED
+      failing before the change and passing after, and each leg is structurally forced onto its own path (a
+      `BEGIN … COMMIT` cannot reach the autocommit rebuild). ⚠ The untouched rows in §7 are the real control
+      — a wrong index in the concat+take would corrupt THOSE, not the updated cells.
+
+- **⚠⚠ SESSION RECORD 2026-09-12 — FOUR COMMITS, PUSHED (`59277bf..0a22d8b` on `v1.5-variegata`), NOTHING
+  LEFT OPEN. ⚠ `git log` is the authority, not this prose.**
+  - `43a8991` fluid_query_inout (message amended: the projection hint was NOT shared with the collector then)
+  - `61c6575` **projection pushdown through the STREAMING in-out exchange** — C++-only, NO ABI bump.
+    Hermetic **76/76 — 9153**, service **59/59 — 3483**. Gates `verify_plugin_fluid` §36 (810) +
+    `verify_global_functions` (178). Full record: [docs/fluid-templating.md](fluid-templating.md) §37.
+  - `19a207c` doc-only: limitation 1.25 corrected (see below).
+  - `0a22d8b` **the in-out gate deadlock FIXED** — released from the local state destructor. Hermetic
+    **76/76 — 9166**, service **59/59 — 3483** (unchanged, which is the `_each` claim).
+  - **⚠ `duckdb` shows ` m` and must NEVER be staged** — it is the user's own `CREATE_NEW`/`ExclusiveCreate`
+    work.
+  - **✅ THE LIMIT DEADLOCK IS FIXED (limitation 1.25 / fluid-templating.md §37.5-§37.7)** — released from
+    the in-out's LOCAL STATE DESTRUCTOR; no new primitive, no thread-identity assumption, `FinishEof`
+    untouched. Gate `verify_global_functions` 178 → **191**, one mutant dying at the `LIMIT 1` row.
+    **⚠⚠ THE FIRST ATTEMPT (owner tracking) WAS STRICTLY WORSE THAN THE BUG** — built, measured, reverted.
+    The measurements below are what made the second attempt small, and what a THIRD must not re-derive:
+    - the trigger is a LIMIT satisfied BEFORE the operator is pulled again (`LIMIT 10` over 4 rows is FINE);
+    - `FinishEof` runs on a FOREIGN thread almost always (`verify_plugin_fluid`: 15 calls, `owns=1` ZERO);
+    - `std::mutex` can only be unlocked by its owner, and the gate is a TOKEN whose holder may never run
+      again ⇒ the PRIMITIVE is wrong, not the tracking;
+    - **a gate MUST cover the foreign-thread case (a LIMIT over a parallel `UNION ALL`)** — every
+      single-branch probe was green while the fluid suite hung, which is what made the bad fix look right.
+    - **⚠⚠ THE TOKEN DESIGN (mutex + condvar + a `taken` flag) WAS NOT NEEDED, and the measurement that
+      retired it is the transferable part: `~FabricatorExchangeLocalState` runs BEFORE `OperatorFinalize`
+      AND ON THE THREAD THAT TOOK ITS OWN LOCK** (3/3 single-branch, 3/3 parallel). The second half is what
+      makes `unlock()` legal there — had the destructor been foreign, `std::mutex` would have been unusable
+      and the condvar swap would have been forced. **Measure the release POINT before designing the release
+      MECHANISM.**
+    - **⚠⚠ THE TWO MULTI-BRANCH SHAPES ARE NOT THE SAME THING, and the first version of the gate conflated
+      them (user-caught: *"did you test a multi branch input (union alls) as well"*).** A `UNION` of
+      SEPARATE in-out CALLS gives each call its OWN gate — MEASURED with a (gate address, thread id)
+      instrument: **3 gates, 1 thread each**, i.e. NO contention, though it stays load-bearing for the
+      FOREIGN-THREAD property. The CONTENDED shape is a multi-branch `UNION` as the **INPUT** to ONE call:
+      **1 gate, 3 threads**, which is also the shape the original 4g table-in-out work found problematic.
+      Both are in the gate now, each labelled with what it does and does not prove.
+    - **⚠⚠ CONTENTION MUST BE VERIFIED, NEVER ASSUMED** — `PhysicalUnion::BuildPipelines` may run branches
+      SEQUENTIALLY, so a green test over a union that happened to run on one thread proves nothing. The
+      (gate, tid) instrument is the cheap check; without it this gate was vacuous twice over. ⚠ Twice this
+      session a "parallel" test proved nothing and BOTH times the USER caught it, not me.
+  - **ENVIRONMENT NOTES PAID FOR THIS SESSION** (each cost a wrong result): build C++ ONLY via the
+    PowerShell tool with an absolute-path `.bat` calling vcvars64 (`cmd /c` from Git Bash exits 0 having
+    built NOTHING); kill any leftover `unittest.exe` before a build or it fails `LNK1104`; `verify_plugin_fluid`
+    needs `FABRICATOR_PLUGIN_DIR` at an EMPTY dir or it fails on the provider list; and **never `^`-anchor a
+    grep over unittest output** — it writes progress without a trailing newline, which silently hid the
+    `op LOCK` line and cost a wrong mechanism.
+
+- **⚠⚠ THE INVALID-VIEW ENUMERATION FIX IS COMMITTED as `59277bf` (2026-09-11) and UNPUSHED. Its full
+  record is the "AN INVALID VIEW CRASHED CATALOG ENUMERATION" entry further down; this is the handoff so a
+  fresh session does not re-derive it.**
+  - **SIX FILES**: `src/catalog/fabricator_schema_entry.cpp` (snapshot the names + per-table catch +
+    rethrow INTERRUPT/FATAL/INTERNAL), `dotnet/Fabricator.SqlServer/SqlServerTable.cs` (classify 208 by
+    asking `OBJECT_ID`), `test/verify_invalid_objects.test` (NEW, 36), `scripts/run-suites.sh` (floors),
+    `docs/known-limitations.md` (1.24), `README.md` (the Catalog Integration note). ⚠ `duckdb` stays
+    MODIFIED and must NEVER be staged — that is the user's own `CREATE_NEW`/`ExclusiveCreate` work.
+  - **MEASURED ON THE SHIPPING BINARY** (both tiers re-run AFTER the rethrow guard was added, because the
+    first pair had measured the pre-guard build): hermetic **76/76 — 9088** (unchanged) and service
+    **59/59 — 3483** (3447 + 36 exactly). Floors already bumped to 59 / 3483.
+  - ⚠ **A SEQUENCING TRAP PAID FOR HERE: do not rebuild C++ while a tier is running.** The link failed with
+    `LNK1104` because the running `unittest.exe` was locked — which was LUCKY: had it succeeded, both
+    in-flight tiers would have silently switched binaries mid-run and their results would have been void
+    without saying so. Same family as the recorded leftover-`duckdb.exe` lock, but the failure mode is a
+    VOID MEASUREMENT rather than a failed build.
+  - ⚠ Non-finding, recorded so nobody re-investigates: the user's `readonly true` ATTACH option IS honoured
+    (DuckDB accepts that spelling for `READ_ONLY` — measured: a CREATE is refused with *"attached in
+    read-only mode"*). I asserted the opposite from the options list WITHOUT measuring and had to retract it.
+
+- **⚠⚠ THE 2026-09-08 USER-DIRECTED PAIR IS DONE — BOTH (A) and (B). (A) the `column_default` read-back
+  (its record is the entry below, `581b598`), and (B) the ALTER gates (this entry). It also produced two
+  findings recorded separately: the upstream-issues §7 RETRACTION — there was no DuckDB bug — and the
+  `KeepNulls` NULL-replacement defect, limitation 1.23, which is NOT fixed and wants its own change.**
+
+  **⚠ AND THE `KeepNulls` DEFECT IT FOUND IS ALSO FIXED (2026-09-10, `mssql_keep_nulls`, entry below) —
+  as a SETTING, because it is not solveable as a policy.**
+
+  **⚠ WHAT IS STILL OPEN:** the ONE residual of that setting (`VALUES (…, DEFAULT)` on an EXPRESSION
+  default stores NULL under the new default — inherent, since the binder collapses it with an explicit
+  NULL); `ALTER` under CDC (a captured column cannot be renamed at all, `Msg 4928` — unasserted); and the
+  warehouse leg of both ALTER gates plus `supports_default_constraints`, all UNMEASURABLE here for want of
+  a live warehouse.
+
+  **(B) IS BUILT — a NEW SERVICE SUITE `test/verify_alter_mssql.test` (**63**), covering rename table,
+  rename column, drop column, change type and SET/DROP NOT NULL. Floors 3316 → **3379** and MIN_SUITES
+  56 → **57**. TWO mutants, each killed at its own row. SQL Server's ALTER now has TWO gates
+  (`verify_alter_default` owns DEFAULT, `verify_comment_on_mssql` owns COMMENT ON, this owns the rest);
+  before 2026-09-08 it had NONE, which is how a silently-dropped DEFAULT survived to be user-reported.**
+  - **⚠⚠ THE TWO LOAD-BEARING SECTIONS ASSERT WHAT THE DDL MUST *NOT* HAVE CHANGED, which is the whole
+    reason the kinds were worth gating rather than smoke-testing.** SQL Server's `ALTER COLUMN` defaults to
+    NULLable when the statement is silent AND must restate the type, so the emitter reconstructs both from
+    the catalog. Each loss is a SILENT data-model change that "did the statement succeed" cannot see:
+    - **§3 — CHANGE TYPE PRESERVES NULLABILITY.** Mutant 1 (drop the restatement) dies at the nullability
+      row after 25 pass, with `k bigint 1`: the type changed CORRECTLY and the NOT NULL was gone, every
+      existing row still satisfying it. Backed by a behaviour row (a NULL insert must still be refused).
+    - **§4 — SET/DROP NOT NULL PRESERVES THE TYPE.** Mutant 2 (`.dataType` instead of `.fullType`, which is
+      the natural slip — both are fields of the same tuple) dies at the precision row after 30 pass, with
+      `dec1 decimal 18 0` where `9 2` is expected.
+  - **⚠⚠ THE ORDER INSIDE §4 IS LOAD-BEARING AND MEASURING IS WHAT SET IT — the two column kinds fail
+    DIFFERENTLY, and my first write-up had the hazard backwards.** I had recorded "reconstructing `varchar`
+    without its length yields varchar(1) and TRUNCATES". MEASURED: it does NOT truncate — SQL Server
+    REFUSES the statement (*"String or binary data would be truncated"*) because the existing 40-char value
+    does not fit. The DECIMAL is the silent one: `decimal(9,2)` → `decimal(18,0)` SUCCEEDS and turns 123.45
+    into **123**. ⇒ with the varchar first its loud failure MASKS the decimal case and mutant 2 dies on a
+    `statement ok` rather than on the corruption it causes. Decimal first, and it dies on the precision row.
+    **This is "order the assertions so mutants separate" again, and the ordering could only come from
+    running both.**
+  - **⚠ BOTH SIZED COLUMNS ARE CREATED SERVER-SIDE, and the section says why: a DuckDB `VARCHAR` carries no
+    length**, so a catalog-created column arrives as `nvarchar(MAX)` and the sized-varchar half is
+    UNREACHABLE through the catalog — the section would pass vacuously. `fabricator_exec` + a
+    `fabricator_refresh_cache` is what makes it expressible.
+  - ⚠ Everything is asserted ON THE SERVER (`sys.columns`/`sys.objects`/`sys.types` through a
+    `fabricator_query` view) as well as through DuckDB's view, because a rename that only re-keyed our cache
+    would pass a DuckDB-only assertion. The RENAME sections assert BOTH names in one query (new present, old
+    gone), so a build that added an entry without evicting the old one fails rather than half-passes.
+  - ⚠ RENAME goes through **`sp_rename`, not `ALTER TABLE … RENAME`**, so those sections pin a different
+    code path; `@objname` may be schema-qualified while `@newname` must not be. §6 does the TABLE rename
+    LAST, because it invalidates the `cols` view every earlier section reads.
+  - ⚠ §5 pins the rolled-back ALTER, recorded-but-unasserted until now: the ALTER paths re-fetch columns
+    EAGERLY on the transaction's own connection (the dbt-incremental deadlock fix), so a rolled-back ALTER
+    has already put the UNCOMMITTED schema in the cache — asserted on both the server and the host's view.
+  - **⚠ THE `statement error` TEXT IS PINNED, not left empty.** The NULL-insert refusal surfaces as
+    SqlBulkCopy's own client-side *"does not allow DBNull.Value"* rather than a server error — still
+    evidence, because SqlBulkCopy reads the destination column's nullability from the server to make it, but
+    an empty expectation would have accepted ANY failure.
+  - ⚠ NOT covered, and the suite does not imply otherwise: `ALTER` under CDC (a captured column cannot be
+    renamed at all — `Msg 4928`), and the warehouse engines.
+
+- **⚠⚠ THE `column_default` READ-BACK — BUILT 2026-09-09 (user-directed; the LITERALS-ONLY shape put to the
+  user and chosen). C++ + C#, NO ABI bump (one ADDITIVE key on the `table_info` doc, the comments'
+  precedent). `information_schema.columns.column_default` and `duckdb_columns()` now report a SQL Server
+  column's default. Gate `verify_alter_default` 59 → **82**, service floor 3293 → **3316**, TWO mutants each
+  killed at its OWN row — and the FIRST one SURVIVED, which is where the value of the pass is.**
+  - **⚠⚠ LITERALS ONLY, AND IT IS A SEMANTIC DECISION WITH NO SAFE MIDDLE.** `bind_insert.cpp`'s
+    `ExpandDefaultExpression` SUBSTITUTES `column.DefaultValue().Copy()` for a column the statement OMITS, so
+    reporting a default stops the SERVER applying its own and starts DuckDB sending a copy of the expression.
+    Equivalent for a literal; for `getdate()` it is the CLIENT's clock — a silently different row — and for a
+    function DuckDB lacks it is a bind error on a statement that works today.
+    - **⚠ "Report it but stop the binder using it" IS NOT AVAILABLE, checked rather than assumed**: one grep
+      over `HasDefaultValue()`/`DefaultValue()` shows display (`duckdb_columns`, `pragma_table_info`, the
+      CREATE-SQL renderer) and semantics (`bind_insert` ×2, `bind_create_table`, `data_table`, `appender`,
+      the C API) reading the SAME field.
+    - **⚠⚠ THE RULE IS DuckDB'S OWN LINE, not ours**: `transform_alter_table.cpp` splits `ADD COLUMN …
+      DEFAULT` on `ExpressionClass::CONSTANT`. Corroborated on a NATIVE table, where `DEFAULT true` and
+      `DEFAULT DATE '…'` render as `CAST('t' AS BOOLEAN)` / `CAST('2024-01-01' AS "DATE")` — casts, not
+      constants. So `ApplyColumnDefault` parses the provider's text and keeps a single CONSTANT, dropping
+      everything else; a parse failure is CAUGHT and dropped, because nothing may throw during entry
+      materialization (an unreported default is a missing row, a failed materialization is an unreadable
+      TABLE).
+    - **⚠ WITHHOLDING COSTS NOTHING AT INSERT TIME, measured and gated**: with nothing reported the server
+      applies its own default — a withheld `getdate()` column still gets the server's clock on an INSERT
+      that omits it. That row is the one the whole rule exists to protect.
+  - **DIALECT NORMALISATION IS THE PROVIDER'S, THE POLICY IS THE HOST'S — one policy point.** SQL Server
+    hands over `((10))` / `(N'2024-01-01')` / `(getdate())`; `NormaliseDefault` peels BALANCED outer parens
+    (a naive starts-with-`(`-ends-with-`)` test would mangle `(1)+(2)` into `1)+(2`, which could then parse
+    as something ELSE rather than fail) and the `N` prefix, then sends everything. The host decides.
+  - **⚠⚠ THE FIRST MUTANT SURVIVED, AND CHASING IT FOUND A REAL PRODUCT GAP — the most useful result of the
+    pass.** Mutant B (honour ANY expression class) passed the whole suite, because the `getdate()` column
+    was added OUT OF BAND via `fabricator_exec` and **the provider's database-wide cache had never heard of
+    it**: the `(withheld)` row was passing on a stale cache rather than on the rule. ⇒ `fabricator_refresh_
+    cache` did NOT drop the comment/default cache, so a comment or default changed out of band — or a whole
+    TABLE created out of band — stayed invisible for the life of the ATTACH.
+    - **FIXED at the one honest hook: `GetTables()` invalidates it.** `FabricatorCatalog::RefreshCache` calls
+      `DiscoverTables`, and that crossing is reached from exactly TWO places — the ATTACH (cache unset
+      anyway) and refresh_cache. Entry materialization goes through `table_open`/`table_info`, so it costs
+      nothing per enumeration.
+    - **⚠ IT FALSIFIED A COMMENT I WROTE THE DAY BEFORE.** The cache's own doc claimed staleness was "the
+      same contract `_externalInfo` documents: … shows up on re-ATTACH or after fabricator_refresh_cache" —
+      and `_externalInfo` neither documents that nor lives in that file, and the refresh half was simply
+      false. Replaced with what is true, plus how it became true.
+    - ⇒ the gate needed a PAIR: one out-of-band default that is a LITERAL (must be reported) beside the
+      non-literal one (must be withheld). Without it, "withheld" proves nothing — a cache that never heard
+      of either column answers withheld for both. Mutant B now dies on the non-literal row (`getdate()`),
+      mutant C (drop the invalidation) on the literal row beside it (`(withheld)` where 42 is expected).
+  - **⚠ A NEW CAPABILITY, deliberately SEPARATE from the comments' one**: `SupportsDefaultConstraints =>
+    !IsWarehouse` (`supports_default_constraints`), because extended properties and DEFAULT constraints are
+    different catalog surfaces and a future engine may have one without the other. UNMEASURED on a warehouse,
+    conservative by choice, and a capability gate rather than a probe for the recorded §6.5 reason.
+    ⚠ It broke `verify_server_profile`'s property COUNT (17 → **18**) — which is the point of that
+    assertion, and the SECOND time in two days it has caught exactly this. Bump it in the same commit.
+  - ⚠ Delta reports NONE (`ColumnDefaults()` left at its null-returning DIM) because engineered-wood
+    implements no part of the column-default writer feature — the same reason the WRITE side refuses there.
+    Asserted, so the two halves cannot drift.
+  - ⚠ `verify_alter_default` §5 was a CHARACTERIZATION pinning the absence; it is REPLACED, not deleted,
+    because falsifying it is the change announcing itself. Same treatment as `verify_comment_on_mssql` §5.
+
+- **⚠⚠ `mssql_keep_nulls` — A NULL IS WRITTEN AS NULL NOW, DEFAULT TRUE. BUILT 2026-09-10 (user-directed:
+  *"i think this is not solveable we should make KeepNulls configureable"* — and the premise is right, it is
+  not solveable as a policy). C#-only, NO ABI change. **BEHAVIOUR-CHANGING**: the previous behaviour was the
+  replacement. Gate: a NEW service suite `verify_keep_nulls` (**68**), floors 3379 → **3447** and MIN_SUITES
+  57 → **58**, THREE mutants each killed at its own section. Full record: limitation 1.23 (rewritten from
+  a defect row into a fixed-by-setting row) + the README's settings and ATTACH tables.**
+  - **THE DEFECT IT CLOSES, measured with the control that isolates the write path:** through the catalog
+    `INSERT … VALUES (4, NULL, NULL)` stored `10` and a `getdate()` timestamp, while the byte-identical
+    statement as plain T-SQL through `fabricator_exec` stored `NULL, NULL`; and a COPY of a CSV with a
+    **BLANK field** stored `99`. `SqlBulkCopy` without `KeepNulls` replaces a source NULL with the
+    destination column's DEFAULT, so this provider disagreed with plain SQL on the commonest spelling there
+    is — silently, on both INSERT and COPY.
+  - **⚠⚠ IT IS A SETTING BECAUSE NO POLICY CAN BE RIGHT: DuckDB's binder COLLAPSES an explicit NULL and an
+    explicit `DEFAULT` keyword into the SAME typed NULL** (`ExpandDefaultExpression`) before our sink sees
+    the chunk. TRUE serves the explicit NULL; FALSE serves `VALUES (…, DEFAULT)` on a default we do not
+    report. **There is no third option** — by the time `PlanInsert` runs the substitution has happened, so
+    we cannot even REFUSE the ambiguous case, which would otherwise have been the better answer.
+  - **⚠⚠ TWO OF THE THREE SURFACES THE USER ASKED FOR DO NOT EXIST, and both were established by
+    measurement rather than argued:**
+    - a **COPY option** is NOT EXPRESSIBLE — `COPY … FROM … (…)` options are consumed by the SOURCE format,
+      and the CSV reader refuses `keep_nulls` by name before anything reaches our insert side;
+    - a **CTAS `WITH` option** would parse (that bag is ours) but is VACUOUS: a CTAS-created table carries
+      **ZERO** default constraints (measured), and no statement both creates a table with defaults and
+      bulk-loads into it. DuckDB's `INSERT` has no options clause at all.
+    - ⇒ the buildable shape is the established pair: `SET mssql_keep_nulls` + a `keep_nulls` ATTACH option,
+      precedence SET ?? ATTACH ?? true, exactly like `materialize` / `read_isolation` / `command_timeout`.
+  - **⚠ THE DEFAULT IS THE CONFORMANT DIRECTION AND DIVERGES FROM SqlBulkCopy's OWN DEFAULT deliberately**
+    (user decision, offered against keeping the old behaviour): plain T-SQL stores NULL when you write NULL.
+    The cost is exactly ONE cell — `VALUES (…, DEFAULT)` on an EXPRESSION default now stores NULL — and it
+    is pinned in the gate as §1 row 3 beside §4 row 9, i.e. the same spelling under both values, which is
+    the only honest way to show a TRADE rather than a fix.
+  - **⚠⚠ AN OMITTED COLUMN IS UNAFFECTED BY EITHER VALUE, and getting this wrong cost a day.** DuckDB's
+    `column_index_map` leaves it out of the batch entirely, so it never becomes a NULL to replace and the
+    server applies its own default — measured on BOTH values, including for a withheld default, and pinned
+    as a CHARACTERIZATION (§6) that no mutant of ours can kill.
+    - **⚠ MY EARLIER CLAIM THAT `KeepNulls` "WOULD BREAK THE OMITTED-COLUMN CASE" WAS WRONG, and it is the
+      reason this looked unfixable.** I read `ExpandDefaultExpression`, saw "a column with no reported
+      default gets a typed NULL", and never checked WHICH CALLER reaches it — it serves the explicit
+      `DEFAULT` KEYWORD (via `TryReplaceDefaultExpression` on `ExpressionType::VALUE_DEFAULT`), not
+      omission. **The lesson is this file's most-repeated one: a mechanism assembled from a function whose
+      callers you have not read.** One probe build settled it in minutes, and the wrong version had already
+      reached a commit message, a limitations row and this file.
+  - ⚠ Applied to INSERT, CTAS and COPY alike — the semantic does not vary by statement kind — and it is a
+    NO-OP on a CTAS by construction (no defaults on a fresh table). The two paths it changes are INSERT and
+    COPY into an existing table.
+  - ⚠ Two gate mechanics worth reusing: **`require-env FABRICATOR_DELTA_WRITE_DIR` is what makes
+    `${…}` INTERPOLATE** (without it sqllogictest leaves the literal in the path and the COPY fails naming
+    the variable), and the ATTACH-option section must come BEFORE any `SET`, because a SET outranks the
+    option and would make that test vacuous.
+  - ⚠ `duckdb_settings()` shows it as `(unset)` until someone sets it, exactly like `mssql_materialize` —
+    the effective TRUE comes from the resolver, not from DuckDB's registry. Pinned as a pair so nobody reads
+    "(unset)" as "off".
+
+- **⚠⚠ `COMMENT ON TABLE` / `COMMENT ON COLUMN` — BUILT 2026-09-08 (user-asked "i think we don't support
+  this yet?", then "yes build it"). C++ + C#, NO ABI bump (two ADDITIVE kinds on `table_alter`).
+  WRITE-ONLY by decision; the read-back is slice 2. Gates: a NEW hermetic suite `verify_comment_on` (**39**)
+  + a NEW service suite `verify_comment_on_mssql` (**39**), tier-0 252 → **258**, TWO mutants each killed at
+  its own row. Full records: the README's DDL note, [docs/known-limitations.md](known-limitations.md)
+  1.21, [docs/warehouse-support.md](warehouse-support.md) §6.7.**
+  It was refused in BOTH directions before: the write failed with *"fabricator: only ALTER TABLE is
+  supported"* and `duckdb_tables().comment` was NULL even for a comment already set on the server.
+  - **⚠⚠ IT ARRIVES AS ITS OWN `AlterType`s, NOT AS AN ALTER TABLE VARIANT — which is the whole reason it was
+    refused and the one structural fact to know.** `COMMENT ON TABLE` is `AlterType::SET_COMMENT`
+    (`SetCommentInfo`: `entry_catalog_type` + `comment_value`) and `COMMENT ON COLUMN` is
+    **`AlterType::SET_COLUMN_COMMENT`** (`SetColumnCommentInfo`: `column_name` + `comment_value`) — two
+    DIFFERENT types, and NEITHER is an `AlterTableInfo`. So they must be dispatched BEFORE
+    `FabricatorSchemaEntry::Alter`'s `info.Cast<AlterTableInfo>()`, which is why they live in their own
+    `AlterComment` method rather than as cases in that switch. The old guard was `info.type !=
+    AlterType::ALTER_TABLE`, so it caught both and said the one thing that reads as "the statement is wrong".
+  - **⚠⚠ THE DELTA COLUMN COMMENT IS A SURGICAL `JsonNode` EDIT OF `metaData.schemaString`, AND A TYPED ROUND
+    TRIP WOULD BE THE SILENT-CORRUPTION CLASS.** A column comment lives in the field's `metadata.comment` —
+    the SAME dictionary where **column mapping keeps `delta.columnMapping.physicalName` and `.id`**, and
+    column mapping is the DEFAULT here. Deserialising the schema into engineered-wood's typed model and
+    re-serialising it could drop any key that model does not represent, and losing a physical name makes the
+    existing data files unreadable **with nothing failing at the time of the ALTER**. `JsonNode` preserves
+    every property it does not touch, so the blast radius is the one key being set. MEASURED preserved, and
+    **mutant B (replace the field's metadata object wholesale) dies at exactly the `phys_kept` row after 14
+    assertions pass** — which is what makes that row, not the comment row, the load-bearing one.
+    - ⚠ The suite proves it from the DATA side too, because a metadata assertion alone would not: values are
+      read back, and an INSERT after the rewrite proves the WRITE path still matches. **⚠ `count(*)` proves
+      NOTHING on Delta** — it is answered from the log and opens no data file (this file's own recorded trap).
+    - ⚠ Matched on the LOGICAL `name`, which is correct BECAUSE column mapping keeps the physical name in
+      metadata; and top-level only, because `SetColumnCommentInfo` carries a single column name so a nested
+      field is not expressible in the statement.
+  - **⚠⚠ IT IS THE OPPOSITE OF THE `ADD COLUMN … DEFAULT` CASE, and that is worth stating because the reflex
+    is to expect another Delta refusal.** There, Delta records a column default through the
+    `allowColumnDefaults` writer feature and EW implements NONE of it, so the refusal had to stand. Here BOTH
+    halves are representable with **NO EW change**: `MetadataAction.Description` is a first-class field, and
+    `field.Metadata` is a generic `Dictionary<string,string>` — which is exactly where the protocol puts a
+    column comment, so delta-spark reads both back. **Check the far side's surface before assuming the
+    previous answer generalises.**
+  - **⚠⚠ SQL SERVER NEEDS THREE PROCS, NOT ONE, and it is the engine's shape rather than ours.** A comment is
+    the **`MS_Description`** extended property (what SSMS's *Description* box writes, so it interoperates):
+    `sp_addextendedproperty` FAILS when the property exists (15233), `sp_updateextendedproperty` FAILS when it
+    does not, and removal is a third proc. So `COMMENT ON` is an UPSERT-OR-REMOVE, composed as ONE guarded
+    batch (`IF EXISTS(…) EXEC update … ELSE EXEC add …`) — one round trip, and no check-then-act race
+    between a separate probe and the write. **Mutant C (only ever add) dies at the upsert row after 14 pass.**
+    - ⚠ Guarded on BOTH sides: removing a comment that is not there is a NO-OP, which is what
+      `COMMENT ON … IS NULL` does on DuckDB's own tables. Asserted twice so it is idempotence being pinned.
+    - ⚠ `minor_id` addresses the COLUMN (0 = the object); the gate resolves it back to a NAME through
+      `sys.columns`, because an assertion on the raw ordinal would pass silently if the wrong column were
+      commented after a schema change.
+  - **⚠ THE WIRE'S `comment` KEY IS REQUIRED WITH A NULLABLE VALUE — the empty-vs-absent trap, THIRD
+    occurrence in this class.** `IS NULL` REMOVES a comment, so absent and null mean different things and only
+    one of them is expressible by a value alone. Same rule `set_default` follows; the first two were `arg2`'s
+    `"-"` vs `"b"`+base64 and `add_column`'s OPTIONAL `default`. Tier-0 pins all of it offline.
+  - **⚠ THE WAREHOUSE GATE IS §6.5's RULE APPLIED IN ADVANCE, AND IT IS UNMEASURED BY CHOICE.**
+    `ServerProfile.SupportsExtendedProperties => !IsWarehouse` (surfaced as `supports_extended_properties` in
+    `fabricator_server_info`). Extended properties are not part of the warehouse surface — user-flagged:
+    *"MS_Description for fabric warehouse might not be available yet. Same for fabric lakehouse"*.
+    ⚠ **Edition 11 cannot tell a Fabric Warehouse from a Lakehouse SQL endpoint**, so the gate necessarily
+    covers both and a measurement on one would not settle the other. ⚠ It REFUSES rather than attempting: on
+    those engines a failing statement inside an explicit transaction ABORTS it, so letting the server answer
+    costs the caller their whole transaction. ⚠ No live warehouse here, so it is CONSERVATIVE rather than
+    measured — §6.7 carries the one-line check to run if one becomes available.
+  - **⚠ A DEFECT I WROTE AND CAUGHT BEFORE COMPILING: user identifiers spliced into a `string.Format` FORMAT
+    STRING.** The proc arguments were assembled with a `{0}` placeholder while `level2`/schema/table were
+    concatenated in BEFORE formatting — so a quoted DuckDB identifier containing `{` would make the format
+    string itself malformed. Plain concatenation now. (Escaping proper is fine: doubling the single quote is
+    the COMPLETE escape for a T-SQL literal — there is no backslash escaping to also handle — which is what
+    makes composing these calls safe for arbitrary comment text. The gate uses `O'Brien's` to prove it.)
+  - **⚠ `SET_COMMENT` IS SHARED BY EVERY COMMENTABLE CATALOG TYPE** (TABLE / VIEW / INDEX / SEQUENCE / TYPE /
+    MACRO), so `entry_catalog_type` has to be CHECKED rather than assumed — otherwise a provider-declared VIEW
+    would be forwarded as though it were a table. Refused by name (measured: *"… not View"*).
+  - **⚠ ADDING A ROW TO `ServerProfile.Properties()` BREAKS `verify_server_profile`, WHICH IS THE POINT — and
+    it caught me, for the SECOND time in this file's history.** That suite pins the property COUNT
+    (16 → **17** here; an earlier addition took it 14 → 15), and every OTHER reader of
+    `fabricator_server_info` filters by NAME so none of them notices. ⇒ the count assertion is the ONLY thing
+    that sees a capability appear or disappear without its gate being updated, so **bump it in the same
+    commit** — and the cost of not doing so is a full service tier: the failing run reports an assertion
+    total that is an UNDERCOUNT (a failing suite stops), which this file already forbids using as a floor,
+    so the tier has to be re-run rather than reasoned about.
+
+  - **⚠ THE GATE HAD TO READ THE FAR SIDE, because there is no read-back — and the mechanism is reusable.**
+    Delta: `read_text` over `_delta_log/*.json`, split on newlines, keep the NEWEST line carrying
+    `$.metaData.id` (a metaData action REPLACES the previous one, so an older one says nothing about now),
+    then `json_extract_string`. ⚠ **`require json` is LOAD-BEARING** — `unittest` does not auto-load, and
+    without it the whole suite fails as a missing FUNCTION rather than a missing REQUIRE. SQL Server:
+    `fabricator_query` over `sys.extended_properties`.
+  - **⚠ SLICE 1's "STILL OPEN: the READ-BACK" IS DONE — same day. Its guess at the MECHANISM was wrong and is
+    worth keeping for that reason: it said comments would ride "the table-schema crossing as Arrow field
+    metadata". The Delta COLUMN comments do exactly that (for free), but the channel is `table_info`, and the
+    reason is in the slice-2 entry below.**
+  - **⚠⚠ SLICE 2 — THE READ-BACK — BUILT 2026-09-08 the same day (user: "continue with read part"). C++ + C#,
+    NO ABI bump (two ADDITIVE keys on the `table_info` doc). `duckdb_tables().comment` and
+    `duckdb_columns().comment` now report the provider's own comment, including one somebody ELSE set (SSMS's
+    Description box, Spark's `COMMENT ON`). Gates: `verify_comment_on` 40 → **53**, `verify_comment_on_mssql`
+    39 → **52**; TWO mutants, and the second has a CONTROL that makes it attributable.**
+    - **⚠⚠ A COMMENT CANNOT BE LAZY THE WAY STATISTICS ARE, AND THAT SINGLE FACT DETERMINED THE WHOLE
+      DESIGN.** `table_stats` exists as a SEPARATE entry the host calls at first SCAN precisely so entry
+      materialization — i.e. catalog ENUMERATION — never pays a stats query; `TableSession.StatsJson`'s own
+      doc says so. A comment has no such option: DuckDB copies `CreateTableInfo::comment` in the
+      `TableCatalogEntry` CONSTRUCTOR (`table_catalog_entry.cpp:31`) and `duckdb_tables()` reads the ENTRY, so
+      the value must exist BEFORE the entry does. There is no later hook. ⇒ it rides `table_info`, which IS
+      the enumeration crossing, ⇒ **a provider needing IO for it owes a per-CATALOG cache rather than a
+      per-table query**, or every full enumeration costs one round trip per table.
+    - **⚠⚠ THE DELTA COLUMN COMMENTS COST NOTHING, AND THE REASON IS ONE GREP: the Arrow schema ALREADY
+      CARRIES THEM.** engineered-wood's `SchemaConverter.ToArrowField` copies each `StructField`'s metadata
+      onto the Arrow field VERBATIM — its `FilterArrowMetadata` is write-direction only and strips just
+      `PARQUET:*` — and `comment` is where the Delta protocol puts a column comment. So `ColumnComments()` is
+      a read of the schema the binding already fetched, it works through COLUMN MAPPING (the default) because
+      the schema carries the LOGICAL name, and it is AS-OF correct for a time-travel entry for free.
+    - **⚠⚠ I BUILT A CACHE FOR IT ON A COST CLAIM THAT WAS FALSE, AND THE MUTANT DELETED THE CACHE.** The
+      `Schema` getter does NOT memoize (each access re-opens), so I restructured it into a `ResolveSchema()`
+      wrapper that cached the comments, justified as "otherwise this DOUBLES the `_delta_log` reads of every
+      table during enumeration — the OneLake cost". **MEASURED with the per-IO instrument
+      (`FABRICATOR_LOG_LEVEL=Debug`, counting `Fabricator.Host.Fs` lines around a `duckdb_tables()`): a
+      2-table enumeration is 10 ops (4 list + 6 read-all) on BOTH builds — identical** — because the table
+      open is already SHARED for the statement. The restructure was REVERTED and the justification rewritten
+      to say what was measured, per this file's own rule (the `IHostLog.Log` mutant that survived and
+      simplified the code). ⚠ The instrument and the numbers are in the code comment so nobody re-adds it
+      without re-measuring.
+    - **⚠ THE SQL SERVER SIDE IS A DIFFERENT QUERY SHAPE, NOT A CACHE OVER A SHARED RESOURCE, which is why it
+      stands where the Delta one did not.** Its column fetch is `SELECT * FROM t WHERE 1 = 0` — a describe
+      that CANNOT carry an extended property — so comments need their own query, and a per-table one would be
+      one round trip per table on the enumeration path this provider has already been burned by twice (the
+      OneLake slowness; the 15871 discovery defect). It asks ONCE, database-wide
+      (`sys.extended_properties` joined to `sys.objects`/`sys.schemas`/`sys.columns`), and caches per catalog.
+    - **⚠⚠ READ-YOUR-OWN-WRITES NEEDS TWO INDEPENDENT INVALIDATIONS, and the mutants prove they are
+      independent.** The PROVIDER's database-wide comment cache must be dropped at the write site, and the
+      HOST's catalog ENTRY must be evicted — miss either and `COMMENT ON t IS 'x'` followed by a read reports
+      the PREVIOUS value in the same session. Mutant G (no entry eviction) kills BOTH suites at their FIRST
+      read-back row (Delta 210 after 39 pass, SQL Server 162 after 34); mutant F (no provider cache drop)
+      kills the SQL Server suite at the same row **with Delta GREEN at 53 as the control** — which is what
+      makes it a provider-specific attribution rather than two failures that happen to look alike.
+    - **⚠⚠ IT FIRED A NOTE I HAD LEFT MYSELF, WHICH IS THE PAYOFF OF WRITING THE PREDICTION DOWN.**
+      `AlterComment` shipped in slice 1 with "⚠ NO refresh(), deliberately … The day comments are surfaced,
+      this needs the same refresh(info.name) the column kinds do, or the cached entry keeps the old comment."
+      That day was the same day. The comment is now REPLACED (not softened) with what is true, and the
+      eviction rule was extracted into a shared `RefreshEntry` so ALTER and COMMENT ON cannot drift on it.
+    - **⚠ THE STRUCT RENAME COLLIDED WITH A NAME 140 LINES UP IN THE SAME HEADER, and my collision check was
+      SELF-DEFEATING.** `FabricatorTableRowIdentity` stopped describing its contents once comments joined it,
+      so I renamed it `FabricatorTableInfo` — which `catalog_tables` has used for a DISCOVERED table all
+      along. The compiler said *"use of undefined type"* at a `for` loop, which points nowhere near the
+      cause. ⚠ **The grep I "verified" with was `grep -rn FabricatorTableInfo src/ | grep -v fabricator_metadata`
+      — I excluded the very file I was editing.** It is `FabricatorTableDetails` now, and the header says why
+      the obvious name was unavailable. **A collision check must include the file you are changing.**
+    - **⚠ RESTORING A C++ SOURCE IS NOT RESTORING THE BINARY, and a C#-only rebuild in the same command line
+      HIDES it.** Mutant F's first run was VOID: I restored `fabricator_schema_entry.cpp`, ran
+      `dotnet build` (which succeeded, looking like "the build ran") and measured — with `unittest.exe` still
+      carrying mutant G. **The tell was the CONTROL**: Delta failed with mutant G's exact signature (40
+      assertions, 39 passed) on a mutant that cannot reach Delta. Same class as the recorded `Move-Item` mtime
+      trap; rebuild C++ explicitly after restoring a C++ mutant.
+    - ⚠ Two smaller things, both deliberate: an unmatched column name in `column_comments` is IGNORED rather
+      than an error (a provider may report a comment for a column a pending ALTER or an object filter has
+      removed from this entry's schema, and refusing there would make a stale comment break MATERIALIZATION);
+      and the table comment carries a `has_comment` flag beside it because an EMPTY comment is a value a
+      caller can set (`COMMENT ON TABLE t IS ''`) — the empty-vs-absent rule, fourth occurrence.
+    - **⚠ STILL OPEN, and narrower than before: a TABLE comment is not reported for a Delta TIME-TRAVEL (`AT`)
+      entry.** An AT binding takes its schema from `GetSchemaAt`, which does not carry `description`, so
+      reporting the CURRENT comment on a historical entry would be a WRONG answer rather than a missing one —
+      null is the honest choice. COLUMN comments are unaffected (they ride the AS-OF schema). Closing it means
+      threading the description through `GetSchemaAt` too.
+
+- **⚠⚠ `ALTER TABLE … ADD COLUMN … DEFAULT <literal>` WAS ACCEPTED AND SILENTLY DROPPED — user-reported
+  2026-09-08 ("i think we don't support a default when adding a column"), FIXED. C++ + C#, NO ABI change.
+  Gate: a NEW suite `verify_alter_default` (**59**, SERVICE tier), three mutants each killed at its OWN row.
+  Full records: [docs/duckdb-upstream-issues.md](duckdb-upstream-issues.md) §7 (the DuckDB half) +
+  the README's DDL note.**
+  MEASURED before anything was built: the column appeared, existing rows were NULL, **and every later insert
+  omitting the column was NULL too** — on BOTH providers — while DuckDB's own table backfills AND applies it.
+  The C++ `ADD_COLUMN` render read only `Name()` and `Type()`, never `DefaultValue()`.
+  - **⚠⚠ THE USER WAS RIGHT ABOUT NOT NULL AND MY FIRST MEASUREMENT WAS THE WRONG CASE.** I measured a
+    NULLABLE column (existing rows NULL) and reported that SQL Server does not backfill; they said it does.
+    Both are true and the split is the rule: **NOT NULL + DEFAULT backfills automatically** (measured, and
+    metadata-only since 2012), **NULLABLE + DEFAULT does not** unless `WITH VALUES` (measured). ⇒ **a claim
+    about "SQL Server's behaviour" that does not say WHICH NULLABILITY is half a claim.**
+  - **⚠ THE EMIT IS ONE FORM UNCONDITIONALLY, and a measurement is what made it one: DuckDB REFUSES
+    `ADD COLUMN … NOT NULL DEFAULT` outright** (*"Adding columns with constraints not yet supported"*), so
+    the NOT NULL shape can never arrive — the only possible shape is NULLABLE, which is exactly the one
+    needing `WITH VALUES`. Without checking that, this would have grown a nullability branch for an
+    unreachable case. ⚠ `NOT NULL DEFAULT 10 WITH VALUES` is valid T-SQL anyway (measured), so the
+    unconditional form is safe rather than lucky.
+  - **⚠ BACKFILL IS A USER DECISION AND THEY MADE IT** (match DuckDB, "even though it is very expensive").
+    `WITH VALUES` is O(table) where the plain form is metadata-only; that is the price of a catalog table
+    answering the same statement the same way a native one does.
+  - **⚠⚠ THE SHARP FINDING — DuckDB LOSES A CAST-WRAPPED DEFAULT BEFORE THE CATALOG SEES IT, and it made a
+    partial fix WORSE THAN NONE.** Probing the expression we are handed: a BARE literal survives (`10`,
+    `1.5`, `1.50`, `'x'`, and `'2024-01-01'` written as a STRING) while ANYTHING the parser wraps in a CAST
+    arrives as a `VALUE_CONSTANT` holding **NULL** — `true`, `CAST(1 AS BOOLEAN)`, `DATE '2024-01-01'`,
+    `TIMESTAMP '…'`, `'\x41'::BLOB`. So the first working build emitted `DEFAULT (NULL)` for `DEFAULT true`:
+    the very defect being fixed, reintroduced one layer in.
+    - **THE CONTROL that makes it DuckDB's rather than ours: `ALTER COLUMN … SET DEFAULT` carries the SAME
+      boolean and date correctly** (measured: `((1))` and `(N'2024-01-01')` on the server) **through the SAME
+      helper**, and DuckDB's own table is unaffected. ⇒ localised to `AddColumnInfo`, not to our literal
+      handling. Recorded as upstream-issues §7, **NOT FILED** — it needs a repro with no third-party
+      extension, which is that file's own standing rule.
+    - **⚠⚠ REFUSED, AS ONE RULE RATHER THAN A TYPE LIST.** A lost value is INDISTINGUISHABLE from an honest
+      `DEFAULT NULL` (both a NULL constant), so any NULL arrival on `add_column` is refused by name. A list
+      of "types whose literals get cast" would be enumerated from measurements and could MISS one (UUID,
+      ENUM, a nested type) — **and a missed type is a silent wrong answer again**, which is the whole thing
+      being avoided. The cost is only the NO-OP spelling: `DEFAULT NULL` on a nullable column asks for what
+      it already does.
+  - **⚠ `DefaultLiteral` COULD NOT CARRY THE STATE — the empty-vs-absent trap, SECOND occurrence in the same
+    class.** Null means "DEFAULT NULL" on `set_default` (where the key is REQUIRED) and "no default" on
+    `add_column` (where it is OPTIONAL), so `AlterTableSpec` grew `HasDefault` read from key PRESENCE. The
+    class's own comment already warns about this for `arg2`'s `"-"` vs `"b"`+base64; it arrived again on a new
+    kind. ⚠ Asserted on the SERVER, the only place it is visible: an absent default has NO
+    `sys.default_constraints` row, `DEFAULT ''` has one holding `(N'')`.
+  - **⚠⚠ SQL SERVER'S `ALTER TABLE` HAD ESSENTIALLY NO GATE, WHICH IS WHY THIS SURVIVED.** The only
+    catalog-level `ADD COLUMN` in the whole tree was one SETUP line in a locking test, asserting nothing
+    about the ALTER; Delta's ALTER has three suites. `verify_alter_default` is SQL Server's first. **⚠ The
+    rest of SQL Server ALTER (rename table/column, drop column, change type, SET/DROP NOT NULL) is STILL
+    ungated** — that is a standing gap, not something this fixed.
+  - **⚠ A REUSABLE GATE TECHNIQUE: ORDER THE ASSERTIONS SO THE MUTANTS SEPARATE.** As first written, "the
+    default is dropped" and "`WITH VALUES` is missing" both died at the same row, because backfill was
+    asserted first and fails under either. Asserting the INSERT first splits them — mutant A dies at the
+    insert row after 8 assertions, B at the backfill row after 13, C (drop the NULL refusal) at the boolean
+    row after 35. It is also the honest ordering: an insert honouring a declared default is wrong on ANY
+    reading, where backfill is the contested half.
+  - **⚠ DELTA REFUSES rather than dropping, and the reason is checked rather than assumed:** Delta records a
+    column default through the `allowColumnDefaults` writer feature and the `CURRENT_DEFAULT`/
+    `EXISTS_DEFAULT` field-metadata keys, and **engineered-wood implements NONE of them** (grepped: zero
+    hits; every `defaultValue`/`ColumnDefault` hit in that tree is ORC or Avro). ⇒ **the user's plan to
+    backfill on Delta behind a setting cannot be made correct**: with no way to RECORD the default, a
+    backfill leaves the first N rows carrying it and every later insert NULL, with nothing saying one was
+    declared and nothing marking which rows were written — unrepairable afterwards. Retiring the refusal
+    needs EW support FIRST.
+  - **⚠ STILL OPEN, PRE-EXISTING, and now pinned as a CHARACTERIZATION (§5 of the suite): a column default is
+    NOT reported in `information_schema.columns.column_default`** — the catalog never reads defaults back
+    from the provider, so a column with a demonstrable `((10))` on the server shows NULL in DuckDB's
+    metadata. Equally true of a CREATE-time default, so it predates this. A different mechanism (the
+    table-schema crossing would carry them as Arrow field metadata) and a different decision.
+
+- **⚠⚠ THE ARROW STREAM'S ERROR STRING WAS READ AFTER THE STREAM WAS RELEASED — a read-after-free on
+  every bind-time schema failure, latent since the file was written and made REACHABLE by the
+  2026-08-24 lazy-describe fix. ✅ FIXED 2026-08-26 (C++-only, no ABI). FOUND BY THE SCHEDULED LINUX
+  INTEGRATION TIER (run `32928853715`) AND STRUCTURALLY INVISIBLE ON WINDOWS, which is why the local
+  service tier was green through it for two days.**
+  - **THE SHAPE.** `PopulateReturnSchema` and the three bind sites beside it did
+    `msg = stream.get_last_error(&stream); stream.release(&stream); throw IOException(... + msg ...)`.
+    The two CI failures were `statement error` assertions whose query failed correctly but whose
+    MESSAGE arrived as garbage: `verify_raw_query:118` expected *"Invalid column name 'nosuchcolumn'"*
+    and `verify_mssql_s3_polybase:200` expected *"Column mapping"*.
+  - **⚠⚠ THE MECHANISM IS THE EXPORTER'S OWN SOURCE, NOT AN INFERENCE — and that is what makes this a
+    settled fact rather than a plausible story.** `apache/arrow-dotnet`'s
+    `CArrowArrayStreamExporter.Release` → `ExportedArrayStream.Free` → `Dispose()` →
+    `ReleaseLastError()` → **`Marshal.FreeHGlobal((IntPtr)LastError)`**, where `LastError` is exactly
+    the `byte*` that `get_last_error` returns. Release frees the message BY CONSTRUCTION. ⚠ The C#
+    Arrow sources live in **`apache/arrow-dotnet`**, not `apache/arrow` — the latter 404s.
+  - **⚠⚠ WHY ONLY LINUX SAW IT, and the observation and the source agree exactly.** Windows `HeapFree`
+    typically leaves the bytes intact, so the correct message survives the free and every Windows run
+    passes; glibc writes tcache metadata into the freed chunk immediately, so its first bytes become
+    POINTERS — which is precisely what CI printed: short, high-byte, and **DIFFERENT PER CALL**
+    (`%�sU` in one suite, `c�7^U.V` in the other). ⇒ **third instance of this project's
+    standing rule** (macOS `ArrowProducer`, macOS aggregate-state destructor): *a use-after-free is
+    invisible on the platform you develop on, so a green local run is not evidence.*
+  - **⚠⚠ WHY IT SURFACED NOW rather than in the year the bug existed.** Before the lazy describe
+    (`0acd679`), `fabricator_query`'s bind called `bind_data.factory(...)`, which EXECUTED the query
+    inside the ABI crossing — a broken query threw there through `ThrowManagedError` with a proper
+    message, and `get_schema` could never fail. Making the stream lazy moved the first failure onto
+    `get_schema` + the stream's error buffer, i.e. onto the dormant path. **The two failing assertions
+    are the very ones the describe fix ADDED to pin its new bind-time error behaviour** — the gate
+    worked, one tier later than the change.
+  - **FIXED AT ALL FOUR SITES** by copying into a `std::string` before release: `arrow_ingest.cpp`
+    (`PopulateReturnSchema` — raw query + catalog scan binds), `fabricator_lateral.cpp` (lateral bind),
+    and `fabricator_schema_entry.cpp` × 2 (in-out exchange + collector binds).
+  - **⚠ THE OTHER FIVE `get_last_error` CALLERS ARE CORRECT AND WERE SWEPT rather than assumed** —
+    each builds its message while the stream is still ALIVE, its owner releasing later
+    (`arrow_ingest.cpp` 168/1002/1118/1148/1174). **`ThrowManagedError` is correct too**: it appends
+    `err` into the message BEFORE calling `free_error`. So the four bind sites were the only instance.
+  - ⚠ Releasing the STREAM does not invalidate the SCHEMA `get_schema` filled — that is a separately
+    owned `ArrowSchema` with its own release callback, held by `ArrowSchemaWrapper`. The surrounding
+    code was right about that; only the error string was wrong.
+  - **⚠ THE GATE IS THE LINUX TIER AND NOTHING ELSE, and the suites say so rather than implying
+    coverage.** `verify_raw_query:118` and `verify_mssql_s3_polybase:200` already assert the message
+    text so no new test is owed — but **both pass on Windows with the bug fully present**, so the local
+    tiers (service **54/54 — 3011**, hermetic **74/74 — 8003**, both at their floors) are a
+    NO-REGRESSION result and NOT evidence of the fix.
+  - **✅ PROVEN ON LINUX (integration run `32966403735`, dispatched on `e0523a1`): both suites pass at
+    their FULL counts — `verify_raw_query` 34 and `verify_mssql_s3_polybase` 263** — where the
+    scheduled run one commit earlier failed both. ⚠ **That run is nonetheless RED**, on
+    `verify_session_tag:146`, which is the recurring pre-existing flake recorded under the CI section
+    and cannot be reached by an Arrow error-string change. **Read the per-suite lines, not the run's
+    conclusion** — the tier's verdict says nothing about which suite moved.
+
+- **⚠⚠ THE TIERS REPORTED AND THE SERVICE ONE FOUND A REGRESSION IN THE `fabricator_query` FIX ITSELF —
+  ✅ FIXED 2026-08-24, commit `00bd30e` (C#-only, no ABI). Hermetic was 74/74 — 8003 GREEN as predicted; service came back
+  52/54 with `verify_session_tag` failing at line 77, the assertion whose own comment says "this is what
+  fails without the pin, and it fails by returning NULL rather than by erroring".**
+  - **THE DEFECT: deferring the execution ACROSS A CROSSING dropped the ambients.** `AmbientTransaction` /
+    `ProviderSettingsStore.CurrentSession` / `AmbientOpener` are `AsyncLocal` PER CROSSING. The old eager
+    stream executed inside `execute_query`, where `ArrowStreamInitGlobal` had just established them; the lazy
+    one executes at the first `get_next`, where nothing has. So `catalog.ExecuteQuery` saw txn 0, found no
+    pinned connection, and ran the caller's SQL on a POOLED one — **outside the user's transaction**.
+  - **MEASURED A/B, the capture being the only variable**: inside `BEGIN` after a DuckDB-managed write,
+    `fabricator_query('q','SELECT @@TRANCOUNT')` returned **0 before the fix and 1 after**. The session tag
+    was the cheap symptom; the real one is that **read-your-writes was silently gone for every raw query in a
+    transaction**.
+  - **⚠ THIS IS THE SECOND INSTANCE OF ONE RULE, so treat it as general rather than as a table-function
+    quirk.** The first was `fabricator_install_plugin` reading a session-scoped opt-in inside an async
+    iterator. **A LAZY BODY MUST BE HANDED THE AMBIENTS ITS OWN CROSSING CAPTURED — never read them where it
+    runs.** Both failed by returning a WRONG ANSWER rather than erroring, and the plugin one was
+    non-deterministic on top.
+  - **⚠ MAKING A PATH LAZY IS A CROSSING CHANGE, AND THE REVIEW QUESTION IS "WHOSE AMBIENTS?"** Nothing about
+    the describe fix looked transactional — it is a schema optimisation — which is exactly why the ambient
+    question was never asked. Its commit message reasoned carefully about schema agreement and about
+    null-vs-throw, and said nothing about the ambients.
+  - Gate: `verify_raw_query` 27 → **34**, new §8. ⚠ It asserts **`@@TRANCOUNT`, deliberately, because it is
+    LOCK-FREE**: the obvious probe — read a row this transaction inserted — would BLOCK on the uncommitted
+    row's lock when run pooled under READ COMMITTED, so a regression would HANG the suite rather than fail it
+    (limitation 1.15). A test that hangs on regression is worse than no test. Its autocommit control (0) is
+    load-bearing: without it, "1" would be equally satisfied by a build reporting a constant.
+  - **⚠ THE SECTION WAS FLAKY FIRST, and the cause is a reusable trap: `rq_probe` is created by
+    `fabricator_exec`, so THE CATALOG NEVER LEARNS ABOUT IT** (`mssql_exec_invalidate_cache` off by default —
+    MEASURED absent from `duckdb_tables()` 3/3 after its own CREATE). A catalog-level `INSERT INTO
+    q.dbo.rq_probe` therefore only binds if a PREVIOUS run left the table behind, so the section **ALTERNATED
+    pass/fail** — the identical signature `verify_read_isolation` once had, for the identical reason (a
+    failing run never reaches its teardown). Fixed by giving §8 its own table created THROUGH the catalog;
+    4/4 green from a cleaned server afterwards.
+  - ⚠ `verify_session_tag` then failed ONCE at line **146** — a DIFFERENT assertion, and it is the one-off
+    flake already recorded further down this file. 25 assertions, green 3/3 afterwards. Do not conflate the
+    two: line 77 was mine, line 146 is the pre-existing one.
+
+- **⚠⚠ `fabricator_query` USED TO EXECUTE ITS SQL TWICE — a shipped defect, user-found and ✅ FIXED 2026-08-24, commit `0acd679` (C#-only, NO ABI change). Gate `test/verify_raw_query.test` 27, mutation-tested (the eager stream dies at §1 with "Expected 1, Actual 2").**
+  MEASURED: `SELECT * FROM fabricator_query('db','INSERT INTO dbo.twice VALUES (1); SELECT 1 AS x')` left
+  **2 rows**; the same INSERT through `fabricator_exec` left 1 and reported `affected = 1`.
+  - **CAUSE.** `fabricator_query` is a TABLE function, so DuckDB needs its column types at BIND. The C++ bind
+    sets only `bind_data->factory`, and `PopulateReturnSchema` (`arrow_ingest.cpp:263`) therefore calls that
+    factory to get a stream just to read `get_schema` — i.e. a full execution — then the scan executes again.
+    `DbDataReaderArrowStream`'s constructor takes an ALREADY-EXECUTED `DbDataReader` and reads
+    `reader.GetColumnSchema()`, so the stream cannot exist without executing.
+  - **⚠⚠ THE UNCOMFORTABLE PART: BOTH HALVES OF THE FIX WERE ALREADY IN THE TREE, WIRED TO OTHER CALLERS.**
+    `sp_describe_first_result_set` is used — for STORED PROCS only (`SqlServerBackend.cs:3841`); and
+    `bind_data->schema_factory`, whose own comment is *"The bound object can describe itself — ask it instead
+    of executing it"*, is used — for CATALOG TABLE SCANS only (`fabricator_table_entry.cpp:884`).
+    `fabricator_query` fell between them, and nothing in the tree uses `CommandBehavior.SchemaOnly`.
+  - **THE FIX IS MEASURED SOUND before being built:** `EXEC sys.sp_describe_first_result_set @tsql =
+    N'INSERT INTO dbo.twice VALUES (1); SELECT 1 AS x, CAST(2 AS BIGINT) AS y'` left **0 rows** — the INSERT
+    did not run — and reported both columns correctly with types and nullability. So a describe gives the
+    schema for exactly the batch shape that currently double-executes.
+  - **AS BUILT, and it needed NO ABI change.** The C ArrowArrayStream has SEPARATE `get_schema` and
+    `get_next` callbacks, and `PopulateReturnSchema` calls only `get_schema` then releases ⇒ a LAZY stream
+    works: `get_schema` describes (`CommandBehavior.SchemaOnly`), `get_next` executes once. Scope it to
+    **`Bootstrap.ExecuteQuery`** (the raw `fabricator_query` ABI handler) so the many internal C# callers of
+    `catalog.ExecuteQuery` — `ReadMetadataRows` and friends — keep executing directly and do NOT gain a
+    describe round trip they do not need.
+  - **BOTH DOUBTS RESOLVED BY MEASUREMENT.** (1) The exporter IS lazy — it fills a `get_schema` FUNCTION
+    POINTER, so no ABI entry was needed. (2) The fallback works and the split is now MEASURED: a plain
+    SELECT, **dynamic SQL** (`sp_executesql`), a `DECLARE` prologue, a UNION and a **CDC change-table read**
+    all DESCRIBE (single execution); a `SELECT … INTO #t; SELECT … FROM #t` batch FALLS BACK (still two, i.e.
+    unchanged). ⚠ What makes reporting a described schema to DuckDB acceptable is CONSTRUCTION, not care:
+    both answers are built by `SqlArrowMapping.ToArrowField` from a `DbColumn`, so describe and execute run
+    the SAME mapping and cannot diverge through a hand-written type table.
+  - **⚠ A BEHAVIOUR CHANGE WORTH KNOWING: a broken query now fails at BIND**, with SQL Server's own message
+    (`Invalid column name 'x'`) instead of mid-scan. Better, and pinned (§5) — because only the message text
+    distinguishes "the describe refused this shape" (fall back, null) from "the describe surfaced a real
+    error" (throw). Swallowing the second would make every broken query cost a wasted execution first.
+  - **⚠⚠ THE FIX ITSELF SHIPPED A REGRESSION FOR ONE TIER RUN (fixed in `00bd30e`) — the deferral dropped the AsyncLocal
+    ambients, so a raw query inside a transaction ran POOLED.** See the entry above; the standing rule it
+    confirms is that a lazy body must be handed the ambients its own crossing captured.
+  - **⚠ It was a PRE-EXISTING defect independent of CDC** and got its OWN commit. Every `fabricator_query`
+    user was paying it: any side effect doubled, any expensive SELECT costing twice.
+  - **⚠ IT ALSO STRENGTHENS THE CDC READER'S OPTION A**, which is a connection worth keeping: A2 was "emit
+    `FROM fabricator_query('db','<our T-SQL>')`", so under this defect A2 would read the change table TWICE
+    per statement — on top of losing the measured pushdown. Two independent arguments for A now.
+  - ⚠ **THE SUITE IS THE OTHER HALF OF THE FIX, and its absence is why the defect shipped.** Nothing owned
+    these two functions: 29 suites USE `fabricator_query`, none was ABOUT it. Only a COUNTING assertion can
+    see a double execution — every "the rows are right" test in the tree passes either way, which is exactly
+    how it went unnoticed. `verify_raw_query` also now documents the remaining fallback, the bind-time error
+    change, and `fabricator_exec`'s JOIN-ONLY transaction semantics (both README-documented as of this fix).
+
+- **USER-DIRECTED 2026-08-18: (1) REMOVE THE MFR SPIKE — ✅ DONE (ABI v75); (2) SPLIT `Fabricator.Bridge`
+  BY ASSEMBLY — ✅ PHASE A DONE (`Fabricator.Delta`), PHASE B (`Fabricator.Fabric`) SCOPED.** The facts are
+  recorded here because they were established by measurement in-session and are not derivable from the code.
+  - **PHASE A AS BUILT (2026-08-18, C#-only, no ABI): `Fabricator.Delta` — 24 files / ~19.4k lines out of
+    Bridge, which drops from ~36k to 54 root files + `FabricApi/` 17.** Bridge no longer references the
+    **engineered-wood submodule** or **AWSSDK.S3**. Same `Fabricator.Bridge` NAMESPACE (the user's "split by
+    assembly, group by directory, keep the namespace"), following the `Fabricator.Abstractions` precedent —
+    which is why the move needed ZERO `using` churn across six projects.
+    - **THE SET IS DEFINED BY A PROPERTY, NOT A NAME PREFIX: a file is Delta iff it needs engineered-wood**,
+      plus the closure of files whose every consumer is already in the set. That is what the assembly exists
+      to move, so it is the only defensible membership rule — and it puts `AdlsGen2TableFileSystem`,
+      `DuckDbTableFileSystem`, `S3CommitFileSystem`, `ExternalTableRouting`, `ArrowColumnMappingRename` and
+      `VariantTransport` in Delta despite none of them being named `Delta*`, while leaving `AdlsCredential`,
+      `VariantMarker`, `DeltaFunctions`, `DeltaParquetProperties`, `DeltaCatalogInfoFunction` and
+      `OneLakeStagingLocation` in Bridge because they need no EW and have Bridge-side or sibling consumers.
+    - **⚠⚠ THE CLOSURE MUST COUNT THE SIBLING ASSEMBLIES AS CONSUMERS, AND MY FIRST ONE DID NOT.**
+      Run over Bridge alone it proposed moving `ArrowValueReader` and `CatalogMacroMetadata` — which
+      `Fabricator.SqlServer`, `.AnalysisServices` and `.DeltaRs` use in 9 files between them. Moving either
+      would have broken three assemblies. **A closure is only as good as its consumer set; enumerate every
+      project that references the one you are carving up.**
+    - **`Fabricator.SqlServer` → `Fabricator.Delta` IS A REAL DEPENDENCY, not a split artifact**:
+      `SqlServerBackend` calls `ExternalTableRouting` at 7 sites (a SQL Server EXTERNAL TABLE's INSERT and
+      identity-keyed UPDATE/DELETE are routed to storage, i.e. they ARE Delta writes) and its
+      `CustomFunctions` registers the four Delta global functions. `Fabricator.DeltaRs` → Delta likewise
+      (`DeltaFunctions`, `FabricLakehouse`). Both gained a ProjectReference.
+    - **`InternalsVisibleTo("Fabricator.Delta")` rather than making ~20 host types public.** The split is a
+      dependency boundary, not an API boundary; widening `HostFs`/`BoundInput`/`HostBatchFilter`/
+      `ParquetTuning`/the ambients to `public` would have grown the plugin-visible surface for a project-file
+      reason. It departs from the `DeltaFunctions`-made-public precedent deliberately — that was ONE type
+      crossing to an opt-in provider. All 77 errors from the move were `CS0122`, i.e. exactly this.
+    - **⚠ USER-VISIBLE BEHAVIOUR CHANGE, and no suite can catch it: setting `FABRICATOR_BACKEND_ASSEMBLY`
+      NOW BOUNDS THE DELTA PROVIDER TOO.** It used to be hard-registered UNCONDITIONALLY after the scan, so
+      it was present whatever the variable said; a narrow override like
+      `FABRICATOR_BACKEND_ASSEMBLY=Fabricator.SqlServer` now silently loses `PROVIDER 'delta'`. The failure
+      is a clean unknown-provider error at ATTACH rather than a wrong answer, and the tiers never set the
+      variable narrowly, so this is documented (docs/dax-provider.md §Discovery) rather than gated.
+    - **⚠ `BackendRegistry`'s hard `Add(map, new DeltaBackend())` is GONE — Delta is discovered by name
+      like every other provider, and `Fabricator.Delta` is APPENDED LAST to the default
+      `FABRICATOR_BACKEND_ASSEMBLY` list.** The old comment said it was registered after the scan "so a
+      scanned provider stays the default"; that was not decoration, because `Default()` falls through to
+      `map.Values.Distinct().First()` — Dictionary INSERTION order. Position in that string is now what keeps
+      SqlServer the default; prepend Delta and it silently stops being.
+    - **`OneLakeForwardFs` STAYS IN BRIDGE and that is the one deliberate compromise.** Ten `onelake_*` ABI
+      entries in `Bootstrap.cs` call it, so the VFS is ABI SURFACE; it needs no EW, so it can stay. Bridge
+      therefore keeps `Azure.Storage.Files.DataLake` + `Azure.Identity` + the three `Fabric*Credential` files.
+      Its one `FabricLakehouse` mention is a DOC COMMENT, which is what makes this work — otherwise Bridge
+      would need `Microsoft.Fabric.Api` too.
+    - Gates: all six assemblies build; hermetic + service tiers; and a smoke proving the DISCOVERED provider
+      still works (CTAS 500 / UPDATE 10 / DELETE 9 ⇒ 491 rows, 10 updated). ⚠ Publish needs **`-Clean`** —
+      this is exactly the moved-PackageReference hazard measured hours earlier.
+      **CI tier 1 is GREEN ON ALL THREE PLATFORMS** (osx_arm64 20m44s / linux_amd64 19m37s / windows_amd64
+      35m37s, run `32152100109`), which closes the caveat this entry shipped with: a brand-new csproj is
+      exactly the kind of thing that trips on Linux or macOS, and only CI could settle it.
+  - **PHASE B, NOT BUILT: extract `Fabricator.Fabric` (`FabricApi/`, 17 files, `Microsoft.Fabric.Api`).**
+    Measured prerequisite: with the Delta files gone, `FabricApi/` needs only `Host` and
+    `FabricCredentialResolver` from the Bridge core, and NOTHING in the core needs `FabricApi/` — so
+    Fabric → Bridge one-way, no cycle. It could not be done first: while the Delta files sat in Bridge,
+    `DeltaCatalog` used `FabricApiClient`, which would have made Bridge → Fabric → Bridge.
+  - **(2) IS SCOPED FROM THE SOURCE — a three-way coupling scan, comments and string literals stripped,
+    every TYPE the candidate set declares grepped against the other two sets (script kept in the session
+    scratchpad; re-derive it, do not trust this summary).** Sets: core 46 files / Delta 31 / Fabric
+    (`FabricApi/`) 17. Results:
+
+    | direction | real references |
+    |---|---|
+    | CORE → FABRIC | **NONE** ⇒ `Fabricator.Fabric` extracts with ZERO change to Bridge |
+    | FABRIC → DELTA | **NONE** ⇒ the layering holds, no cycle |
+    | CORE → DELTA | **exactly TWO** — `BackendRegistry` → `DeltaBackend`, and `Bootstrap` → `OneLakeForwardFs` |
+
+    ⇒ **`Fabricator.Fabric` ← `Fabricator.Delta` ← `Fabricator.Bridge`**, each keeping the
+    `Fabricator.Bridge` NAMESPACE per the user's "split by assembly, group by directory, keep the namespace".
+    **Phase it: extracting `Fabricator.Fabric` alone is mechanical and needs no code change at all.**
+    - **⚠⚠ MY FIRST SCAN SAID "the only Bridge→Delta reference is `new DeltaBackend()`" AND THAT WAS
+      WRONG — the pattern was `\bDelta[A-Z]`, which cannot see `DuckDbTableFileSystem`, `S3CommitFileSystem`
+      or `OneLakeForwardFs`.** It is this file's own recorded error in a new costume: a backwards grep
+      encodes the searcher's assumed naming and returns a plausible, incomplete answer. **The right method
+      is the one above — enumerate the types the PROVIDER set DECLARES, then grep the consumers for those.**
+      Two further traps it exposed: doc comments dominate the raw hits (strip `///` and `//` or the signal
+      drowns), and private nested helper names (`Binding`, `Handle`, `State`, `Entry`, `Options`, `Row`)
+      collide across dozens of files and must be excluded or everything looks coupled to everything.
+    - **⚠ `Bootstrap` → `OneLakeForwardFs` IS THE REAL DESIGN QUESTION, and it was not anticipated.** Ten
+      ABI entries (`onelake_open`/`_read`/`_close`/`_glob`/`_exists`/`_open_write`/`_write`/`_close_write`/
+      `_remove`/`_rename`) are `[UnmanagedCallersOnly]` handlers in `Bootstrap.cs` that call
+      `OneLakeForwardFs` + its nested `Handle`/`WriteHandle`. So the `onelake://` VFS is part of the ABI
+      SURFACE while its implementation needs Azure DataLake + Fabric credentials. Three ways out, none free:
+      (a) let Bridge reference `Fabricator.Fabric` (no cycle, but Bridge keeps the Azure/Fabric packages —
+      most of the point lost); (b) move those handlers into the provider assembly and have `Bootstrap` fill
+      the slots through a discovered hook (clean, but NOT the mechanical rename the user asked for);
+      (c) keep `OneLakeForwardFs` in Bridge and accept that the VFS is host surface. **Decide this before
+      moving any file** — it determines which of the three assemblies carries
+      `Azure.Storage.Files.DataLake`.
+    - `HostFileSystem.cs` is NOT a Delta file despite sitting next to them: `HostFs` is used by
+      `Bootstrap`, `Host`, `HostBatchFilter`, `HostParquetStaging`, `InterruptScope` and
+      `SingleScanArrowStream`. It stays in Bridge.
+    - **⚠ ORDER IS LOAD-BEARING IN `BackendRegistry`, and the comment says why in a way easy to undo.**
+      `Add(map, new DeltaBackend())` is deliberately AFTER the assembly scan so a scanned provider
+      (SqlServer) stays the default — `Default()` falls through to `map.Values.Distinct().First()`, i.e.
+      Dictionary INSERTION order. So `Fabricator.Delta` must be APPENDED to the end of the default
+      `FABRICATOR_BACKEND_ASSEMBLY` list (`Fabricator.SqlServer,Fabricator.AnalysisServices,
+      Fabricator.DeltaRs`), never prepended, or SqlServer silently stops being the default.
+    - **THE "FREE WIN" IS TAKEN (Bridge no longer declares `Microsoft.Data.SqlClient` +
+      `.Extensions.Azure`) — AND IT WAS NOT FREE. It broke the published payload, silently, and finding
+      that is worth more than the win.** The greps were right about CODE: nothing in Bridge uses either
+      package (the only two matches are a comment saying *"rather than reference Microsoft.Data.SqlClient"*
+      and `FabricSqlEndpointHost.cs` saying it hand-parses *"to stay BCL-only"*), the csproj justification
+      naming *"the SQL Server backend + the DAX SQL-endpoint path"* is stale in both halves, all four
+      assemblies compile without it, and `Fabricator.SqlServer` declares both itself.
+      - **⚠⚠ AND THE PAYLOAD LOST ALL FIVE SqlClient DLLs ANYWAY. MEASURED, with a control both
+        directions: reference present ⇒ 5 files in `build/release/extension/fabricator/fabricator`;
+        removed ⇒ ZERO — while `Fabricator.SqlServer.dll` itself stayed.** So the SQL Server provider would
+        have shipped unable to open a connection.
+      - **THE MECHANISM, isolated rather than guessed:** several projects publish into ONE directory, and
+        `dotnet publish` REMOVES what its own previous publish wrote and its current closure no longer
+        contains. `Fabricator.AnalysisServices` publishes LAST and used to pull SqlClient transitively via
+        Bridge; once Bridge dropped it, its publish DELETED the five files `Fabricator.SqlServer` had just
+        written. Proof: into a FRESH dir the identical two publishes keep all five, and a `-Clean` publish
+        of the real script restores them.
+      - **⚠ IT IS INVISIBLE WHERE IT MATTERS — nothing fails to compile, and the HERMETIC TIER NEVER
+        TOUCHES SQL SERVER, so only the service tier catches it.** Same shape as the SqlClient 7.0 Entra
+        finding: a dependency defect both CI tiers can be green through.
+      - **`publish-managed.ps1` GAINED `-Clean`**, documented beside the existing mode-change clean (the
+        same class of problem, which is why that one already existed). Not unconditional: a self-contained
+        payload is ~250 MB and the common loop is a C#-only edit. **Standing rule for the split: after
+        MOVING a PackageReference between assemblies, publish with `-Clean` and then run the SERVICE
+        tier** — the split moves several packages, so this will fire again.
+      - **⚠⚠ AND IT FIRED AGAIN 2026-09-08, WITH NO PackageReference HAVING MOVED — SO THE RULE IS TOO
+        NARROW: a MUTATION-TESTING ROUND TRIGGERS IT TOO.** After publishing mutant payloads to a scratch
+        `-ExtensionDir` and then republishing the restored source to the REAL directory, the payload held
+        `Fabricator.SqlServer.dll` and its `deps.json` still declaring `Microsoft.Data.SqlClient/7.0.2`
+        while **all five SqlClient DLLs were gone** — AnalysisServices' 14-file Azure closure survived,
+        i.e. the later publish deleted the earlier one's files. `-Clean` restored all five.
+        - **⚠⚠ THE SYMPTOM NAMES THE CONNECTION STRING, NOT THE PAYLOAD**, which is what makes it expensive:
+          an ATTACH fails with *"open_catalog failed: A data source must be specified in the connection
+          string"*, on a connstr the service tier had accepted minutes earlier. **The discriminator is
+          `PROVIDER 'sqlserver'` on the same ATTACH**, which answers *"unknown provider 'sqlserver'.
+          Registered providers: dax, engineeredwooddelta, dlrest"* — naming the real fault in one line.
+          Reach for that before doubting the connstr, docker or the secret.
+        - ⚠ **The assembly being PRESENT is what disguises it**: `BackendRegistry` skips an unloadable name
+          on purpose, so a provider whose own DLL is there and whose closure is not is reported as ABSENT
+          rather than as broken. `ls <payload> | grep -ic sqlclient` ⇒ must be **5**.
+        - ⇒ **restated: publish with `-Clean` after ANY round of publishes that did not all target the same
+          directory**, mutation testing included — not only after moving a package.
+  - **(1) ✅ DONE 2026-08-18 — ABI v75, breaking, no aliases. Hermetic 69/69 — 7499, i.e. 7558 minus exactly
+    the 59 assertions of the two deleted suites, so NO surviving suite moved. Full as-built:
+    [docs/abi-history.md](abi-history.md) §v75. ⚠ ONE THING THE SCOPING DID NOT ANTICIPATE: fabricator
+    now calls `ExtensionHelper::AutoLoadExtension` NOWHERE** — the only call lived inside this registration,
+    and `docs/distribution-installer.md` cited it as the in-tree proof that chain-loading during load is
+    lock-safe, so that citation was re-anchored to DuckDB's own source. Original scoping, kept because every
+    fact in it held:
+  - **`fabricator_delta_mfr_scan` REMOVAL — ⚠ IT IS NOT DEAD CODE, and the user's first framing ("dead <!-- check-docs:ignore (REMOVED at ABI v75; naming it IS the point) -->
+    code from a multifile reader we only tested but never used") is half right.** It IS registered
+    (`loader.RegisterFunction`), IS deletion-vector correct, and carries **59 assertions in two hermetic
+    suites** (`verify_delta_mfr_scan` 36 + `verify_delta_mfr_dv` 23) green in both tiers. It is ABSENT from <!-- check-docs:ignore (REMOVED at ABI v75; naming it IS the point) -->
+    the README — a spike that shipped by accident, the `fabricator_delta_native_scan` pattern again, except
+    that one was WRONG and this one is correct and covered. ⚠ Its header comment *"Slice 1a: file list only
+    (no DV / partition / pushdown yet)"* is STALE — DV landed in slice 1b.
+    - To remove: `src/fabricator/fabricator_delta_mfr.{cpp,hpp}` + its registration; the `delta_list_files` <!-- check-docs:ignore (REMOVED at ABI v75; naming it IS the point) -->
+      ABI entry (`abi.h`, `clr_host.{hpp,cpp}`, `Abi.cs`, `Bootstrap.cs` → `DeltaReader.ListScanFilesJson`);
+      both suites; floors **71 → 69** and **7558 → 7499**. **ABI bump (v75), breaking.**
+    - **Upside for the split**: it deletes the LAST core→Delta coupling outright instead of abstracting it
+      (the only others were `BackendRegistry`'s `new DeltaBackend()`; everything else was comments).
+    - **⚠ COST, stated once so it is not re-discovered as a surprise**: it discards the working prototype of
+      the "form (b)" architecture (`MultiFileList` carrying OpenFileInfos from the snapshot — duckdb-iceberg's
+      shape), which this file records as the durable read-path form. MEASURED 2026-08-18: native parquet does
+      the same 6M-row aggregate in **0.203 s** vs **0.592 s** best-tuned through our Arrow boundary — so form
+      (b) is worth ~3x where batch/thread tuning got 31%. "Move it to C# as a custom function" is NOT an
+      option: the whole point is DuckDB's C++ MultiFileReader doing the read, and the C# version of that idea
+      already exists and IS the production path (`DeltaNativeReader`).
+  - **(2) THE ASSEMBLY SPLIT — "split by assembly, group by directory, KEEP the namespace" (user, 2026-08-18).**
+    That follows the precedent already in the tree: `Fabricator.Abstractions` is a SEPARATE ASSEMBLY in the
+    SAME `Fabricator.Bridge` namespace ("Same Fabricator.Bridge namespace — assembly split only"), and
+    `FabricApi/` already groups 21 files by directory without a namespace of its own. Regrouping into
+    namespaces would fight that decision and churn `using`s across four assemblies for no dependency benefit.
+    - **MEASURED composition** (96 files / 36 221 lines): **Delta provider 20 files / 17 892 / 49.4%**;
+      **Fabric REST API 21 / 7 625 / 21.1%**; ABI+hosting 13 / 3 596; storage FS 12 / 3 058; function
+      machinery 16 / 1 813; Arrow interop 12 / 1 513; DML/bulk 2 / 724. **~70% of "Bridge" is two tenants
+      that are not the bridge**; the genuinely shared remainder is ~10.7k lines.
+    - **The shared part is REAL, not hypothetical**: 18 Bridge types are used by 2+ of the other provider
+      assemblies (`ArrowValueReader` in 10 files, `InterruptScope`, `InMemoryArrayStream`, `BackendRegistry`,
+      `InOutExchange`, `DbDataReaderArrowStream`, `CatalogFunctionSet`, `AmbientTransaction`/`AmbientOpener`,
+      `StaticTableFunction`, `ColumnAppender`, `ArrowDataReader`, …).
+    - **Delta is the anomaly and the code admits it**: every other backend is a separate assembly discovered
+      by reflection (`FABRICATOR_BACKEND_ASSEMBLY`, default `Fabricator.SqlServer,Fabricator.AnalysisServices,
+      Fabricator.DeltaRs`); Delta alone is hard-registered at `BackendRegistry.cs:124` with the comment *"The
+      built-in Delta provider lives in the Bridge (alongside DeltaReader / engineered-wood), so it isn't
+      [discovered]"*.
+    - **The cost is not aesthetic**: Bridge project-references the **engineered-wood submodule** and packages
+      **Microsoft.Fabric.Api / Azure.Identity / Azure.Storage.Files.DataLake / AWSSDK.S3** for those two
+      tenants — which is exactly what `Fabricator.Bridge.Tests.csproj` cites as the reason tier 0 CANNOT
+      reference Bridge and must link individual source files.
+    - **FREE WIN, do it first and independently**: `Microsoft.Data.SqlClient` + `.Extensions.Azure` appear
+      UNUSED by Bridge (the only two matches are a comment saying *"rather than reference
+      Microsoft.Data.SqlClient"* and a file that deliberately hand-rolls a connstr parse to stay BCL-only),
+      and `Fabricator.SqlServer` declares both itself.
+    - ⚠ **`DeltaCatalog.cs` depends on the Fabric REST API** (OneLake discovery), so Delta and Fabric cannot
+      be split as independent peers — Delta would reference Fabric, or the OneLake bits stay with Delta.
+    - ⚠ **`clr_host.cpp` hardcodes `Fabricator.Bridge.dll` and `Fabricator.Bridge.Bootstrap`**, so BRIDGE
+      keeps its name (a split moves Delta OUT). A new assembly needs its own `Publish-Project` line in
+      `publish-managed.ps1`, as DeltaRs already has, and the `FABRICATOR_BACKEND_ASSEMBLY` default list
+      updated. Unchecked: whether the extraction compiles without a circular reference, and the AOT plan's
+      source-generator design ([docs/aot-bridge.md](aot-bridge.md)), which assumes the current registry.
+    - Incidental: 47 empty `dotnet/Fabricator.Bridge/duckdb_unittest_tempdir/<pid>/` dirs, untracked and NOT
+      gitignored (git cannot show them — it does not track empty dirs).
+
+- **SqlClient PINNED TO 7.0.2 (2026-08-10, user-asked; was 6.0.2) — AND IT NEEDED A SECOND PACKAGE THAT NO
+  CI TIER WOULD HAVE DEMANDED.** `Microsoft.Data.SqlClient` 7.0 **MOVED the Entra (Azure AD) authentication
+  providers out of the core package** into `Microsoft.Data.SqlClient.Extensions.Azure`, so every
+  `Authentication=Active Directory …` connection string — Fabric Warehouse via a service principal, the
+  Fabric SQL endpoint, Azure SQL with Entra, the ambient notebook token — fails at CONNECT with *"Cannot find
+  an authentication provider for 'ActiveDirectoryServicePrincipal'"*. Added at the same version (they ship as
+  a matched pair), which forced **`Azure.Identity` 1.13.2 → 1.21.0** (the extension requires ≥ 1.18.0; the
+  downgrade surfaces as `NU1605`, an error here because warnings-as-errors is on).
+  - **⚠ NEITHER CI TIER CAN CATCH ITS ABSENCE, and that is the durable lesson: the docker rig authenticates
+    with `sa`/password, so tier 1 and tier 2 stay GREEN — 48/48 — 1867 — while every Entra attach in the
+    product is broken.** It surfaced only by re-running a LIVE Fabric shape after the bump. Any future
+    SqlClient bump needs a live Entra attach before it is believed, and the same hole exists for anything
+    else auth-shaped.
+  - Gates after the bump: service **48/48 — 1867** and hermetic **67/67 — 6895**, both IDENTICAL to the
+    pre-bump counts ⇒ behaviour-preserving on everything the tiers reach.
+  - ⚠ `7.1.0-preview2` exists and is deliberately NOT taken: a preview does not belong in the shipped
+    dependency. Note [docs/aot-bridge.md](aot-bridge.md) records the AOT SKU as targeting 7.1+, so that
+    plan's pin and this one will need reconciling when 7.1 ships stable.
+
+- **`MERGE INTO` — BUILT + GATED 2026-08-05 (C++-only, no ABI bump). Full record moved verbatim to
+  [docs/feature-history.md](feature-history.md) §MERGE INTO (2026-08-23).** One override,
+  `FabricatorCatalog::PlanMergeInto` (`src/catalog/fabricator_merge_into.cpp`), lifted the shared refusal
+  for EVERY provider at once; DuckDB lowers each action to the same `Logical{Update,Delete,Insert}` the
+  standalone statement produces, so MERGE INHERITS our rowid DML rather than re-deriving it. Gates
+  `verify_merge_into` **209 × 2 engine legs** (hermetic) + `verify_merge_into_mssql` **106** (service).
+  - **⚠⚠ IT SHIPPED A SILENT-DATA-DESTRUCTION BUG FOR HALF A DAY, and the shape of the miss is the point:
+    the hazard needs several affected rows in ONE FILE, with the DELETE FIRST.** On Delta ×
+    `deletion_vectors=false` × autocommit × ≥2 mutating actions, every action consumed rowids from ONE join
+    scan while committing separately — so a copy-on-write DELETE renumbered the rows a later action had
+    already addressed. Measured: two conditional deletes left `2, 3` — id3 NOT deleted, **id4 DESTROYED**,
+    exit 0. Every test missed it because with a row per file a rewrite renumbers nothing, and both tiers
+    were GREEN throughout. **The user's one question was worth more than the whole suite run.**
+  - **THE FIX: a merge carrying ≥2 row-addressing actions is FORCED TO BUFFER, even in autocommit** — set
+    at EXECUTION time (`GetGlobalSinkState`), never at plan time, because a prepared statement's plan is
+    reused across transactions. Scoped to `rowid_actions >= 2 && entry.HasVirtualRowId()`: the hazard needs
+    a TRANSIENT (file, position) rowid, so where identity is real key columns (SQL Server) it is immune and
+    forcing there only cost the external-table capability.
+  - **⚠ THE COUNT EXCLUDES `INSERT` — counting every MUTATING action refused the commonest merge shape**
+    (`WHEN MATCHED UPDATE` + `WHEN NOT MATCHED INSERT`) on a non-DV table where it had always been correct.
+    An INSERT addresses no existing rows, so it can neither renumber nor hold targets. **The smell is TWO
+    OPERATIONS ADDRESSING PRE-EXISTING ROWS — not "two commits"**, which tracks neither risk nor atomicity
+    (a CTAS is two commits with no hazard; a `CREATE OR REPLACE … AS SELECT` is one).
+  - **⚠ The `!HasRowId()` guard is required for EVERY merge, including an INSERT-ONLY one** — DuckDB tests
+    the rowid column for NULL to decide matched-vs-not, so with no rowid `row_id_start` points ONE PAST the
+    chunk and `ComputeMatches` reads out of bounds: `INTERNAL Error`, then the database is FATALLY
+    INVALIDATED. Refuse at plan time, where it can still be a message.
+  - **⚠ `parallel` MUST stay false**: every action shares ONE global sink state, and `PhysicalMergeInto`
+    drives our operators MANUALLY rather than as a pipeline.
+  - Atomicity is the TRANSACTION's, not the statement's: autocommit yields ONE COMMIT PER ACTION on Delta
+    (so the change feed is SPLIT across versions), `BEGIN; MERGE; COMMIT;` fuses them into one with an exact
+    pre/post-image pair. `commitInfo.operation` is `TRANSACTION` for a fused merge and NOTHING we write
+    ever says `MERGE`, so a foreign consumer keying on that will not match us.
+  - **STILL OPEN**: the SQL Server half is correct but runs as per-row DML, not a server-side T-SQL `MERGE`
+    (a pushdown needs source AND target in the same catalog); `ON CONFLICT` is lowered to a MERGE by the
+    binder since 1.5.x and still fails because `GetStorageInfo` advertises no uniqueness — semantically
+    CORRECT on Delta, and on SQL Server the remaining work is `GetStorageInfo`, not the merge hook.
+
+- **THE UPDATE POST-IMAGE GROUPED FLUSH — DONE 2026-08-06 (C#-only, no ABI). ⚠ IT DOES NOT FIX "UPDATE
+  MEMORY", AND THE MEASUREMENT SAYING SO IS THE MOST USEFUL THING ABOUT IT. Full record moved verbatim to
+  [docs/feature-history.md](feature-history.md) §The UPDATE post-image grouped flush (2026-08-23).**
+  Both UPDATE paths used to accumulate EVERY post-image batch (and every pre-image on a CDF table) before
+  writing anything; they now write a group's worth as the read-back streams and keep only the actions. Still
+  exactly ONE commit. Threshold `DeltaReader.UpdateGroupBytes` = 64 MiB, env-overridable.
+  - **MEASURED, on the shape that favours it most (600k × 16 VARCHAR): managed heap peak 327 → 171 MB** and
+    now bounded by the GROUP rather than the statement — but **process peak working set only 614 → 548 MB**,
+    and on a NARROW table it does not fire at all (**449 MB either way**). So the earlier "~474 MB per 1M
+    matched rows" figure was never mostly this. Flush count costs nothing measurable (71 flushes is as fast
+    as 5).
+  - **⚠ THE ACTUAL DOMINANT TERM, found by instrumenting the working set along the path: ~180 MB is spent
+    BEFORE the read-back begins**, in `ExecuteUpdate`'s `Dictionary<long, object?[]>` of **BOXED** SET
+    values. MEASURED with a control that isolates it — same table, every row touched, only the SET count
+    differing: **DELETE (rowids only, no boxes) 204 MB / UPDATE 1 column 454 MB / UPDATE 3 columns 651 MB**
+    ⇒ **~98 BYTES PER 8-BYTE BIGINT VALUE**, a ~12x representation overhead, and a 3.2x TIME gap. The DELETE
+    floor is what makes it OURS rather than DuckDB's.
+  - **NEXT FIX (scoped, not built): keep the SET values in ARROW form instead of boxing.** Four constraints
+    found while scoping, each of which makes the naive version wrong: **the incoming batches CANNOT be
+    RETAINED** (`Materialize` does a full IPC round-trip precisely because "the source batches may be freed
+    after consumption"), `ArrowArrayConcatenator.Concatenate` DOES exist and is public (an earlier note here
+    said otherwise — that came from reading ONE class's surface and generalising, the same backwards-search
+    error), `updates[rid] = vals` DEDUPLICATES last-write-wins and sets the reported row count, and the
+    boxing is currently also doing a TYPE CONVERSION.
+  - **⚠ IT IS INERT ON THE BUFFERED PATH, and this entry claimed otherwise until it was measured.** Same
+    table, same 60k UPDATE, threshold forced to 1 byte: **autocommit 30 group flushes, buffered 1.** The
+    mechanism is NOT autocommit-vs-buffered but WHICH READER: DuckDB's `read_parquet` yields 2048-row
+    vectors, engineered-wood's codec reader yields **one batch per ROW GROUP** — and the buffered read-back
+    opens with a bare `DeltaWriter.Options()`, passing no `dataFileReader`, so it takes the codec reader
+    ALWAYS. **When two callers of one method behave differently, diff what they CONSTRUCT it with before
+    diffing the call.**
+  - **⚠ FILE LAYOUT IS UNCHANGED BY CONSTRUCTION** — `WriteDataFilesAsync` writes one parquet file per
+    (input batch × partition), so N read-back batches become N data files whether they arrive in one call or
+    a hundred. That is what makes the grouping free rather than a trade-off.
+  - **⚠ THE ALL-OR-NOTHING ROW-ID RULE HAD TO MOVE EARLIER** (a group is written before later groups' ids
+    are known), so it is decided from the FILES — every selected file has a `baseRowId` — which is the same
+    condition and costs a dictionary lookup. Where it cannot be established the threshold is DISABLED and
+    the statement buffers whole, byte-identically: **a legacy table keeps its old behaviour instead of
+    acquiring new semantics from a memory fix.**
+  - **⚠ GATE: `verify_delta_update_grouped` (72), and the runner must FORCE the threshold** — no hermetic
+    suite comes within two orders of magnitude of 64 MiB, so without
+    `FABRICATOR_DELTA_UPDATE_GROUP_BYTES=1` on that ONE suite the grouped path ships with ZERO coverage;
+    `unset` for every other suite is load-bearing in the other direction too. It passes IDENTICALLY at the
+    default threshold, and that equivalence is the point. Mutation-tested: not clearing the per-group
+    pre-images **survives 51 assertions** before the CDF section catches 12144 pre-images for 6000 rows.

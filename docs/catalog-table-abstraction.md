@@ -1001,3 +1001,56 @@ so the option is not lost, nothing motivates it today.
       ownership; the de-facto contract is THE BINDING OWNS ARGS (retain freely, dispose with the
       binding) — worth a sentence when that file is next touched.
 
+## Appendix — records moved verbatim from CLAUDE.md (2026-09-18)
+
+CLAUDE.md carried these as-built records inline until it grew to 10,776 lines — a file loaded into every
+session's context. They are moved here VERBATIM; CLAUDE.md keeps each entry's summary head plus a pointer to
+this section. The one edit made on the way: a link that pointed into the docs directory is rewritten relative
+to this directory, so it still resolves from here.
+
+- **THE CATALOG/TABLE ABSTRACTION: `get_metadata` IS RETIRED — ✅ COMPLETE 2026-08-15 (user-directed).
+  Every slice (1a/1b/2/3, 4a–4d, 5) is BUILT; the design, the eight load-bearing subtleties (§3), the
+  migration order and every per-slice as-built note live in
+  [docs/catalog-table-abstraction.md](catalog-table-abstraction.md), whose Appendix now also holds
+  this entry verbatim (2026-08-23). READ §3 BEFORE TOUCHING ANY OF IT.** The user's framing: no
+  provider-specific function defined in C++; an `ITable` like `ITableFunction` but binding a TRANSACTION
+  (+ the AT clause) instead of args; clean breaks, no compat layers; state owned where it belongs. As
+  shipped: catalog discovery is five dedicated typed ABI entries, per-table work is a
+  `table_open/schema/info/stats/scan/alter/close` SESSION (ABI v72/v73/v74), and the 16-kind multiplexer,
+  `scan_table` and the kind enum are GONE.
+  - **⚠ THE RULES THAT GENERALISE, and each cost something to learn:**
+    - **BIND IS STATE, SCAN IS REQUEST.** `Bind(txn, at?)` must NOT take a scan spec — the spec does not
+      EXIST at bind time (DuckDB builds `LogicalGet` with all columns and no filters; statics arrive at
+      optimization, dynamic/join filters only at scan global-init), our `table_scan` crossing already
+      carries the COMPLETE spec at the earliest moment it exists, and one binding is memoized per
+      (txn × table) serving N scans with DIFFERENT specs (self-join, prepared-statement re-execution).
+    - **A HANDLE MAY WRAP ONLY STATELESS DEFINITION** — the C++ entry owns it for its life (graveyard
+      included), so every call re-binds against the ambient txn via `ResolveTransaction(txnId)`. That is
+      what makes an entry-lifetime handle trivially safe.
+    - **REMOVAL IS THE INVERSE OF THE ADDITIVE NO-BUMP RULE**: deleting a metadata kind needs a version
+      bump even though no signature changed, because a stale loadable would send the old kind and get the
+      provider's empty-table fallback — silently wrong instead of loudly mismatched.
+    - **A DEVIATION JUSTIFIED BY AN IMPOSSIBILITY THAT IS REALLY A DEPENDENCY-COST CHOICE MUST SAY SO.**
+      v72 avoided JSON claiming a loadable cannot link yyjson; true of DuckDB's VENDORED copy (C++-namespaced,
+      not `DUCKDB_API`-exported) and an overclaim about JSON — v73 carries our OWN vcpkg yyjson and retires
+      the `ReadCapabilityFlag` string-find hack. Name the cost; do not dress it as a limit.
+    - **A NAMED PARAMETER THAT IS A RESERVED WORD IS A PARSER ERROR** — hence
+      `starting_version`/`ending_version`, not `from`/`to` (the design doc's own example had it wrong).
+    - **A MECHANISM-ONLY CHANGE NEEDS A MECHANISM ASSERTION**: where correctness is identical either way,
+      gate on the observable (the pushed filter in the per-file `read_parquet` SQL, the pin line count),
+      because no row assertion can see it and the mutant would otherwise survive.
+  - **⚠ THE `ITable`/`ITableBinding` RENAME (2026-08-15, breaking for plugin authors, no aliases)**: the
+    short name had landed on the wrong half — the shared definition is `ITable` (completing the
+    `ITableFunction` symmetry) and the bound object is `ITableBinding` (mirroring `ITableFunctionBinding`).
+    `*TableDefinition` concrete names STAY (`DeltaTable` would collide with engineered-wood's), `IBoundTable`
+    was deliberately NOT reused, and `DeltaRsCatalog.cs` needed hand-editing because delta-dotnet has its
+    own `ITable`.
+  - **FOLLOW-ON, agreed and NOT built: per-table / per-column EXACT filter pushdown.**
+    `exact_filter_pushdown` is catalog-grain today, which is too coarse the day a catalog hosts a table that
+    cannot apply filters exactly. ⚠ Only the EXACT flag is correctness-bearing (best-effort never erases,
+    and projection is per-table optional by construction). Two seams, both verified against source: an
+    optional per-table key in the v73 `table_info` doc (right timing — `GetScanFunction` builds a FRESH
+    TableFunction per table REFERENCE), and **`TableFunction.supports_pushdown_type`**, consulted at
+    physical planning WITH the bind data per column, which is the ONLY route for a REGISTERED (global)
+    function since its flag is fixed at registration. Deferred until a non-uniform table exists — shipping
+    it now would be an untestable flag.

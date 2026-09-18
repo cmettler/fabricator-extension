@@ -734,3 +734,34 @@ a `schema`-vs-plain timing comparison showed a 10x difference that disappeared e
 `sum(length(s))`.
 
 Force a real decode (`sum(…)`, `sum(length(…))`) in every control on this surface.
+
+## Appendix — records moved verbatim from CLAUDE.md (2026-09-18)
+
+CLAUDE.md carried these as-built records inline until it grew to 10,776 lines — a file loaded into every
+session's context. They are moved here VERBATIM; CLAUDE.md keeps each entry's summary head plus a pointer to
+this section. The one edit made on the way: a link that pointed into the docs directory is rewritten relative
+to this directory, so it still resolves from here.
+
+- **⚠⚠ upstream-issues §7 IS RETRACTED — there was no DuckDB bug, and the retraction is worth more than the
+  finding was (2026-09-09).** It recorded *"a cast-wrapped column DEFAULT is flattened to NULL in the
+  AlterInfo a FOREIGN catalog receives"*. Every MEASUREMENT in it reproduces; the INFERENCE was wrong.
+  - **THE REAL MECHANISM: `transform_alter_table.cpp` deliberately REWRITES `ADD COLUMN … DEFAULT <non-
+    constant>` into THREE statements** — add with `DEFAULT NULL`, `UPDATE` to materialise, `SET DEFAULT` to
+    reinstate — so a WAL replay cannot re-evaluate `random()`/`current_timestamp` differently. We see
+    statement 1 of 3, legitimately carrying NULL.
+  - **⚠⚠ THE "CONTROL" WAS PART OF THE MECHANISM IT WAS CONTROLLING FOR.** The finding rested on *"`ALTER
+    COLUMN … SET DEFAULT` carries the same boolean correctly, which localises it to `AddColumnInfo`"* — that
+    IS statement 3 of the same rewrite. **A control drawn from inside the process under test cannot
+    discriminate.**
+  - **THE DISCRIMINATOR IS ONE KEYWORD**: `ADD COLUMN IF NOT EXISTS c BOOLEAN DEFAULT true` takes the
+    `missing_ok` branch, skips the rewrite, and lands `((1))` on the server with the existing row backfilled.
+    Same statement, same type, one keyword from the spelling that "loses" it.
+  - **THE REFUSAL STAYS, on a corrected reason (user decision: fix the reasoning, keep the behaviour).** At
+    statement 1 an honest `DEFAULT NULL` and the placeholder are the same NULL constant, and accepting it
+    hands the caller a sequence that completes only sometimes: statement 2 is an UPDATE, and on a table with
+    no PK/unique/identity our rowid requirement REFUSES it (measured), leaving the column added,
+    unbackfilled and defaultless behind a statement that failed with an error about UPDATE. The code comment,
+    the error MESSAGE (which now names `IF NOT EXISTS`) and the gate's §3 comment are all rewritten.
+  - **THE LESSON, and this file now carries it twice**: three things were measured correctly and assembled
+    into a wrong mechanism. The missing step was reading the 20 lines that PRODUCE the `AlterInfo`, rather
+    than inferring a cause from the shape of the symptom.

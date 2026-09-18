@@ -624,3 +624,177 @@ addition (a put-if-absent commit-write) or our own commit step that calls a put-
 **Net:** the folder-as-catalog-root + read + INSERT + CREATE is a small, well-fitting slice that reuses the
 provider architecture wholesale; DELETE/UPDATE is where the one real choice (rowid→DV vs predicate, + UPDATE
 SET) lives. Build when a Delta write-back need is concrete (the DirectLake-write path is the likely driver).
+
+## Appendix — records moved verbatim from CLAUDE.md (2026-09-18)
+
+CLAUDE.md carried these as-built records inline until it grew to 10,776 lines — a file loaded into every
+session's context. They are moved here VERBATIM; CLAUDE.md keeps each entry's summary head plus a pointer to
+this section. The one edit made on the way: a link that pointed into the docs directory is rewritten relative
+to this directory, so it still resolves from here.
+
+- **EVERY DELTA TABLE WAS PLANNED WITH NO CARDINALITY — FIXED 2026-08-17 (C#-only, no ABI; user-flagged).**
+  `DeltaTableBinding.ApproximateRowCount()` returned `null`, so `FabricatorScanCardinality` returned
+  `nullptr` and `EXPLAIN` showed **no `~N rows` line at all** on any Delta scan (verified by mutation — the
+  estimates vanish from the plan entirely). It now sums the LOG: `add.GetNumRecords()` per active file minus
+  `add.DeletionVector?.Cardinality`, so it opens **no data file and no DV file**, and it is **EXACT** despite
+  the interface's name because the log is the authority on which rows are live. Gate
+  `verify_delta_statistics` **27** (hermetic), two mutants each killed at its own section.
+  - **⚠⚠ IT SHIPPED A SIGSEGV AND ITS OWN GREEN TIER RUN WAS LUCK — FIXED 2026-08-17 (C++, one call).**
+    Making this crossing DO IO exposed that `FabricatorTableEntry::BuildScanFunction` called
+    `FetchTableStats` with **NO ambient established**, which was correct while the answer came from
+    provider state alone (SQL Server reads DMVs over the txn's CONNECTION; Delta reported nothing). Opening
+    the table reaches the host FileSystem through the OPENER, and with none set the managed side falls back
+    to the last `ClientContext *` it saw — a DANGLING POINTER once that connection is gone. MEASURED:
+    `verify_delta_catalog_transactions` on the CODEC leg crashed **5 runs in 6** with `0xC0000005` inside
+    `HostFs.Glob`; **0 in 6** with `ApproximateRowCount` reverted to `null`, which is what attributes the
+    crash to the IO rather than to the statistic. Fixed with `FabricatorSetActiveTxn` (the pair — the crash
+    proves only the opener, but `table_stats` is CONNECTION-using on SQL Server, so a leftover txn ambient
+    is the same latent class). Exactly the hazard `DuckDbTableFileSystem`'s own comment predicts about its
+    cached-opener fallback, and the one that made `RollbackTransaction` set an opener once rollback did IO.
+    - ⚠ **No deterministic gate exists** — the failure needs an ambient that is provably stale, which no
+      statement can arrange. The transactions suite is the empirical backstop (5-in-6); the guarantee is
+      structural.
+    - **⚠ AND THE DIAGNOSIS COST TWO SELF-INFLICTED WRONG ANSWERS, both worth remembering.** (1) The
+      attribution experiment PUBLISHES a mutant bridge; I restored the SOURCE and did not REPUBLISH, so the
+      next three results — including an 8-of-8 I read as proof the fix worked, and a tier failure I read as
+      a regression the fix caused — all measured the mutant. **A managed change is not in effect until
+      `publish-managed.ps1` has run; the binary, not the file, is what the test loads.** (2) From that
+      contaminated failure I concluded the txn ambient made stats read PENDING (statless) files and wrote a
+      detailed explanation into a permanent code comment. Tested afterwards: false — statistics passes at
+      27 either way. **Deleted rather than softened.**
+  - **⚠ THE STUB'S COMMENT WAS WRONG IN BOTH HALVES, and that is the transferable part.** It read: *"No
+    row-count statistics surfaced (a snapshot COULD sum file stats, but nothing consumes it yet and
+    enumeration must stay cheap — §3 item 5)."* (a) The CONSUMER had existed all along —
+    `FabricatorScanCardinality` → `NodeStatistics`, and **SQL Server had been feeding it** from
+    `sys.dm_db_partition_stats` since the callback was written. (b) Enumeration never asks: the host fetches
+    stats LAZILY in `BuildScanFunction`, i.e. only for a table about to be SCANNED, whose open the
+    transaction's shared cache then serves — §3 item 5 is about entry materialization, which this is
+    deliberately kept off. **A stub whose comment says "nothing consumes this yet" is a claim about a
+    consumer, and it ages the moment somebody wires one. Check the consumer, not the comment.**
+  - **The arithmetic is the SAME one `DeltaNativeReader.LiveRowCount` already used** for the partition-only
+    batched form, where it was measured against ground truth on live Fabric tables (89 files ⇒ 659,278; a
+    200-file table with DVs ⇒ 9,968). What is trusted is `numRecords`, the writer's declared count — the same
+    contract Delta's own log-answered `count(*)` rests on; the DV term is a cardinality the descriptor
+    STATES, so the vector's positions are never decoded.
+  - **NULL IS ALL-OR-NOTHING**: one active file whose writer declared no `numRecords` makes the whole answer
+    unknown rather than a silent under-count. Delta's own rule for its `count(*)` optimization, and the right
+    one here because the consumer is the PLANNER — an estimate wrong by an unknown amount steers join
+    ordering worse than the absence DuckDB already handles. ⚠ NOT gated: constructing a stats-less file from
+    SQL is not possible (`AddFile.GetNumRecords`'s own doc names the shape — a checkpoint written with
+    `delta.checkpoint.writeStatsAsJson=false`).
+  - **⚠ THE ESTIMATE IS FETCHED ONCE PER CATALOG ENTRY AND A DML DOES NOT EVICT IT**, so within one session
+    it stays at its first value (measured: 1500 → DELETE 200 → still 1500; a fresh ATTACH reports 1300).
+    Same as SQL Server, harmless because this feeds costing only — but a gate written without the re-attach
+    asserts the STALE number and passes for the wrong reason, which is why §2 detaches.
+  - **NDV stays EMPTY and that is a genuine ABSENCE, not an omission**: a Delta `add`'s stats carry
+    min/max/nullCount per column but NO distinct count, so there is nothing in the log to report. Pinned
+    INDIRECTLY (§5) — an equality filter falls to DuckDB's DEFAULT 20% selectivity, so 20 000 rows estimate
+    4 000; the day someone reports NDV that becomes 400 and the section fails.
+  - **⛔ MIN/MAX IS DECIDED AND CLOSED — WE REPORT THE APPROXIMATE ROW COUNT ONLY (user, 2026-08-17: "we
+    should only return approx row count as the other are too dangerous"). Do NOT re-open it as "the obvious
+    next one"; read the three reasons below first, because two of them were only found by trying to justify
+    building it.** The decision needed no code change — the row count is what ships and min/max was already
+    `CreateUnknown` — so what was done instead is DURABILITY: `FabricatorScanStatistics`'s comment used to
+    justify withholding bounds with a SQL-SERVER-SPECIFIC reason ("sampled, possibly-stale stats are not
+    exact bounds"), which invites precisely the wrong inference — that a provider whose stats ARE exact may
+    report them. It now carries the real, provider-agnostic reasons (comment-only, proven by the masking
+    check, no rebuild). **NDV STAYS on SQL Server**: it feeds `cardinality_estimator.cpp`'s join-order
+    denominators, i.e. the same estimation-only class as the row count, so dropping it would cost plan
+    quality for no safety gain.
+    - **⚠ The history of how the risk was mis-priced, kept because each step was wrong in a different way.
+      My first write-up (in this entry and in commit `199b850`'s message) OVERSTATED it ON A FALSE PREMISE —
+      user-corrected with "yes but we still prune the files with EW", which is decisive: the trust is ALREADY
+      EXTENDED.**
+    `DeltaFilePruner` SKIPS files on exactly these stats, and skipping a file that does contain matches is a
+    wrong ANSWER — so reporting them to DuckDB extends no new trust, it re-uses an existing one.
+    - **The claim that was wrong: "string stats are TRUNCATED (32 chars) ⇒ a truncated max is NOT an upper
+      bound".** Read the writer: `StatsCollector.TruncateMaxString` returns *the prefix with its last
+      incrementable char bumped by one* and **returns null — omitting the stat — when no char can be
+      incremented**; `TruncateMinString` backs off a surrogate pair so the prefix stays a lower bound. EW's
+      own evaluator states the invariant: *"Truncated bounds are still safe (stored_min ≤ actual_min,
+      stored_max ≥ actual_max)"*. They are WIDENED bounds, not raw truncations.
+    - **Verified in DuckDB before conceding, because the two uses are not obviously equivalent** — and all
+      three checks came out safe: (a) outward widening is sound for BOTH filter directions (`ALWAYS_FALSE`
+      needs `v ∉ [min',max']`, which widening only makes rarer; `ALWAYS_TRUE` for `x > 5` needs `min' > 5`
+      and `min' ≤ true_min`, which implies it) — widening can only make the optimizer conclude LESS;
+      (b) `compressed_materialization.cpp` also reads min/max, to pick a NARROWER physical type, where the
+      dangerous direction is a bound too NARROW (values overflow) — widening never does that; (c) **strings
+      are fine too**: DuckDB keeps only an **8-byte prefix** (`MAX_STRING_MINMAX_SIZE`) and `CheckZonemap`
+      compares `MinValue(max_len, size)` bytes, i.e. a PREFIX comparison — which is what makes DuckDB's own
+      truncation sound and composes correctly with an already-incremented bound.
+    - **⚠ A CONSTRAINT THAT SURVIVES: EW prunes PER FILE, DuckDB needs an AGGREGATE.** Min-of-mins /
+      max-of-maxes is a bound only if EVERY active file carries the stat — one stats-less file and the
+      table-wide range bounds nothing, which is exactly where `compressed_materialization` would then choose
+      an overflowing type. Same all-or-nothing rule the row count already uses, from the same walk.
+    - **⚠⚠ AND THAT WAS NOWHERE NEAR SUFFICIENT — the user asked "could explicit txn + DML +
+      read-your-own-writes make these statistics produce a false result set?" and the answer for min/max is
+      YES, by TWO routes, both MEASURED 2026-08-17. This is the objection that actually holds, and it is not
+      the one I first raised.** The reason "we already prune with EW" does not transfer: **EW's pruner is
+      immune because its BOUNDS and its ROWS come from the SAME snapshot** — pending rows never reach it —
+      while DuckDB's filter pruning would sit **ABOVE our read-your-own-writes overlay**, so its bounds must
+      be sound for the OVERLAID result, not for the snapshot they were read from.
+      - **ROUTE A — buffered DML inside a transaction.** Committed `x ∈ [1,100]`; `BEGIN; INSERT VALUES
+        (1000); SELECT count(*) WHERE x > 500;` correctly returns **1** (the overlay), while the log-derived
+        stats describe only the committed files (`Estimated Cardinality: 100`). Reported bounds `[1,100]`
+        ⇒ `FILTER_ALWAYS_FALSE` ⇒ **0 rows instead of 1**, silently.
+      - **ROUTE B — no transaction at all, and WORSE for that reason: the ENTRY STATS LATCH.** Stats are
+        fetched ONCE per catalog entry (`stats_fetched_` in `BuildScanFunction`) and a DML never evicts the
+        entry. MEASURED: after a fully COMMITTED autocommit `INSERT VALUES (1000)`, the entry still reports
+        100. Stale bounds outlive the write that invalidated them. ⚠ **This is the same latch documented one
+        commit earlier as "harmless because this feeds costing only" — true of the row count, correctness-
+        fatal the moment min/max joins it.**
+      - ⇒ the gate list for the slice is (1) WITHHOLD bounds for any table with pending buffered writes in
+        this transaction (or widen over the pending files, which we would have to stat ourselves), (2)
+        INVALIDATE the entry's cached stats on DML — nothing does that today, deliberately — and only then
+        (3) the all-files-have-stats rule.
+      - **⚠ AND THE SHARPEST CONSUMER IS NOT FILTER PRUNING — it is `CanUsePerfectHashAggregate`**
+        (`plan_aggregate.cpp:117`), which requires `NumericStats::HasMinMax` and SIZES A HASH TABLE from
+        `Max - Min`. Reporting min/max puts EVERY integer GROUP BY column on that path, where a too-narrow
+        bound is worse than a wrong filter decision. `CreateUnknown` — what we report today — is the
+        `return false` that keeps us out (`if (!NumericStats::HasMinMax(nstats)) return false;`).
+      - **⚠⚠ THE LATCH IS A SQL SERVER PROBLEM TOO — user-observed 2026-08-17, and their framing is SHARPER
+        than the Delta one: "an other external process could invalidate the sql server stats and the duckdb
+        catalog is then stale".** Correct, and it generalises the finding out of Delta entirely.
+        `stats_fetched_` is a ONE-SHOT latch on an entry that lives for the SESSION
+        (`fabricator_table_entry.hpp:99`, whose own comment says "Cached for the entry's lifetime").
+        - **Today: plan quality, NOT correctness, on BOTH providers** — and for the same structural reason as
+          the Delta row count: only `estimated_cardinality` (never `max_cardinality`) and
+          `SetDistinctCount` (never min/max) are reported, and every consumer of those is estimation
+          (`cardinality_estimator.cpp` uses distinct counts for join-order denominators).
+        - **Three ways the SQL Server case is WORSE than ours:** (a) the staleness driver is a THIRD PARTY,
+          so the window is unbounded AND unobservable — another process loading 100M rows leaves us costing
+          against the first scan's numbers and nothing here can notice; (b) the existing invalidation covers
+          **DDL, not DML** by construction (`mssql_exec_invalidate_cache` is a DDL heuristic); (c) a stats
+          fetch there is 2 round trips, which is exactly WHY it was latched — so the fix is not simply
+          "re-read per bind".
+        - **Escape hatch that already exists and was undocumented for this purpose:**
+          `fabricator_refresh_cache('<cat>')` / `fabricator_invalidate_cache('<cat>','<regex>')` rebuild the
+          entry, so `stats_fetched_` resets and the next scan re-reads. Added to the README, because a user
+          hitting bad plans after an external load had no way to know statistics were cached at all.
+        - ⇒ **stats invalidation is a PROVIDER-AGNOSTIC PREREQUISITE of the min/max slice, not a nicety.**
+          Shapes worth weighing: report bounds only when provably current (fetched within the SAME statement
+          — abandoning the latch for bounds specifically, which is always safe since withholding is safe); a
+          provider-declared "stats are cheap" capability on the v71 capability JSON, letting Delta re-read
+          per bind (free-ish — it is opening the table anyway and the per-txn cache serves it) while SQL
+          Server keeps the latch; or a TTL. **The general lesson, third time in this thread: the latch was
+          designed against a payload that could not be wrong, and every argument for it silently assumed
+          that property.**
+      - **The row count is UNEXPOSED, and now shown structurally rather than asserted**: `FabricatorScan
+        Cardinality` uses the ONE-ARG `NodeStatistics(idx_t)`, which sets `has_max_cardinality = false`, so
+        we supply only the ESTIMATE and never the hard upper bound that IS correctness-bearing
+        (`read_file.cpp` sets that one; `propagate_join` multiplies maxima). Corroborated by the most extreme
+        wrong estimate reachable: a table CREATED INSIDE THE TRANSACTION reports **cardinality 0** while
+        `count(*)` returns **5**, right answer.
+    - Incidentally: `DeltaFilePruner.IsMinExact`/`IsMaxExact` are hardcoded `true` with NO comment against a
+      writer that widens. Checked for unsoundness — the only two rules consulting exactness are the
+      `min == max == v` shapes, and outward widening forces `min' = max' = v ⇒ true min = max = v`. Sound
+      but undocumented; NOT a defect to report.
+    - What the build still costs (why it is a slice, not a follow-on line): typed bounds have to cross the
+      `table_stats` JSON faithfully per type family and be rebuilt into `BaseStatistics` C++-side
+      (`NumericStats::SetMin/SetMax`, `StringStats::SetMin/SetMax` — both `DUCKDB_API`), plus the null flags
+      (never claim no-nulls unless every file reports `nullCount = 0`), plus a gate whose job is proving no
+      row is dropped. **The generalisable lesson: I priced a risk from ONE side of a boundary. The other
+      side — our own pruner — had been paying it for months.**
+  - Observable only through `EXPLAIN (FORMAT json)`'s `"Estimated Cardinality"`: it never changes an ANSWER,
+    so no row assertion can see it. ⚠ `EXPLAIN` cannot be used as a subquery source (`Parser Error`), so the
+    gate uses the sqllogictest `<REGEX>:` form on the `physical_plan` row, as DuckDB's own explain tests do.

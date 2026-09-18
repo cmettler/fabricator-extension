@@ -3976,3 +3976,682 @@ Two properties follow, and both are worth stating because neither is a guess:
 - **The handoff rides in the ROWS** (`_position` on the baseline rows), so if the rows do not land neither
   does the cursor — which is the same reason §20 records that an EMPTY table snapshots to no rows and
   therefore to no handoff.
+
+## Appendix — records moved verbatim from CLAUDE.md (2026-09-18)
+
+CLAUDE.md carried these as-built records inline until it grew to 10,776 lines — a file loaded into every
+session's context. They are moved here VERBATIM; CLAUDE.md keeps each entry's summary head plus a pointer to
+this section. The one edit made on the way: a link that pointed into the docs directory is rewritten relative
+to this directory, so it still resolves from here.
+
+- **SQL SERVER CDC — THE DESIGN LIST IS EMPTY: every slice is built, including `'fill'`/`'null'`, which
+  §15.9 had scheduled "last, if ever" and the user asked for on 2026-08-25. Read §16, §17, §18, §19, §20,
+  §21, §22 AND §24-§27 (as built) BEFORE §15,
+  because between them they REFUTE eight of §15's claims and RE-SCOPE its slice list — §20.2 in particular
+  kills the exactly-once step §5 is built around, and §22.6 RETRACTS a follow-on §21.2 proposed.**
+  As-built:
+  §13 (slice 1), §14 (slice 2), **§16 (slice 3, the reader)**,
+  **§17 (slice 4, the hidden name + ownership marker + `enable := true`)**,
+  **§18 (slice 5, `_capture_instance` + the in-window DDL check, which absorbed slice 6)**,
+  **§19 (slice 7, the two-instance boundary)**, **§20 (slice 8, the initial-snapshot leg)**,
+  **§21 (slice 9, the timestamp bounds + `images := 'both'`)**, **§22 (slice 8b, `resync`)**,
+  **§24 (`_changed_columns`)**, **§25 (`inc_position`/`dec_position`)**, **§26 (`ddl_history()` /
+  `lsn_time_mapping()`)**, **§27 (`'null'`/`'fill'`)**;
+  [docs/abi-history.md](abi-history.md) §v81 for the ABI entry slice 2 needed. Slices 3, 4, 5, 7, 8,
+  9 and 8b needed **NO ABI change** — all seven are C#-only.
+  - **⚠⚠ FOUR MORE, ALL USER-REQUESTED 2026-08-25 — and CDC's design list is now EMPTY.** `inc_position`/
+    `dec_position` (§25), `ddl_history()`/`lsn_time_mapping()` (§26), and `on_schema_change := 'null'`/
+    `'fill'` (§27), the two modes §15.9 had scheduled "last, if ever". C#-only, NO ABI change. Gate
+    `verify_mssql_cdc` 630 → **725**, four mutants.
+    - **⚠⚠ `fn_cdc_increment_lsn`/`decrement_lsn` WRAP SILENTLY AND WE REFUSE INSTEAD — MEASURED:**
+      `decrement(0x00…00)` answers `0xFF…FF` and `increment(0xFF…FF)` answers `0x00…00`, i.e. the OPPOSITE
+      END of the range. As a window bound that is not a neighbouring position, and the zero LSN is
+      additionally what `fn_cdc_get_min_lsn` answers for an instance that does not exist (§19), so it would
+      surface as an unrelated diagnostic three steps later. ⚠ Computed in C#, not by the server — a scalar
+      runs per BATCH, so a round trip there would put a server call on every chunk; the gate runs ours
+      BESIDE SQL Server's own in one statement across carries and borrows, which is what makes that safe.
+      ⚠ A 21-byte `_position` is REFUSED: stepping its LSN would skip the other rows at that LSN, and
+      `starting_position` is already exclusive at full granularity. ⚠ CONSISTENT, not VOLATILE, so a call
+      over constants FOLDS — which is what makes it usable as a table-function argument at all.
+    - **⚠⚠ `ddl_history()`/`lsn_time_mapping()` MUST USE DYNAMIC SQL, and that is forced**: a batch
+      REFERENCING `cdc.ddl_history` fails at COMPILE when CDC is not enabled, so an `IF <enabled> … ELSE …`
+      does NOT guard it — the whole batch is rejected before the IF runs (§18.3 records the same fact
+      costing the drift check its own round trip). `sp_executesql` defers the compile, which is what lets
+      them answer EMPTY rather than `Msg 208`. ⚠ The inner statement rides as a PARAMETER, never spliced.
+      ⚠ `NOLOCK` (user-asked, and right): the capture job writes both tables continuously. The cost is a
+      dirty read, acceptable for an advisory answer and exactly why the reader's own drift check does NOT
+      call these. ⚠ Bounds are the READER's (starting exclusive, ending inclusive) so the same cursor
+      answers "which DDLs are in the window I am about to read" — a second convention would be a trap.
+    - **⚠⚠ `'null'`/`'fill'` RUN ON ONE MECHANISM, AND A MEASUREMENT IS WHAT MADE IT SMALL.** An uncaptured
+      column must appear with the SOURCE column's type or the arrival check refuses every row; a bare NULL
+      describes as `int` (§19.3) and rendering the type by hand is the SQL type table this feature has twice
+      refused to build. MEASURED: `(SELECT TOP 0 f.s FROM t f)` describes as `varchar(37)`, `decimal(9,2)`,
+      `datetime2(3)` for the respective columns. So `'null'` is `TOP 0` and `'fill'` is `TOP 1` with a key
+      predicate — the SAME shape, no type name written anywhere.
+    - **⚠⚠ THE DEFECT THEY EXPOSED ON THEIR FIRST RUN: `ChecksSchemaDrift` KEYS ON `!= 'ignore'`, which was
+      right while every mode either REFUSED or IGNORED and stopped being right the moment a mode ANSWERED.**
+      Both modes projected the column correctly and the statement then failed with *"1 schema change landed
+      INSIDE this window"* — they would have been USELESS. Fixed with `AbsorbsColumnSetChanges`: a
+      `required_column_update = 0` DDL (an ADD or a DROP) is absorbed because the projection expresses it; a
+      TYPE change still refuses, because the projection says nothing about it.
+    - **⚠ `'fill'`'s COST IS UNCHANGED FROM §15.9 AND IS NOW ASSERTED RATHER THAN DESCRIBED.** The gate's
+      fixture makes the TORN ROW visible: an `insert` row carries `region = 'eu'` although the column did
+      not exist at that instant, and a `delete` row fills NULL because the source row is gone. No later
+      change event ever corrects a filled value — the column is not captured. ⚠ It REFUSES without a
+      CAPTURED key (no PK and no unique index is a legitimate configuration), naming `'null'`, which needs
+      none; the same table under `'null'` is the control.
+    - ⚠ The key is the SOURCE's, from `sys.indexes` — NOT the index CDC recorded, because §16.7 measured
+      `sp_cdc_help_change_data_capture` LEAKING the previous row's `index_column_list`.
+    - ⚠ Declared order is the SOURCE's, so a consumer whose target matches it keeps working across the
+      drift; a column the instance captures but the source has dropped is APPENDED, not lost; every
+      projected column is declared NULLABLE (always NULL under `'null'`, NULL for a delete under `'fill'`);
+      and the update mask still decodes against the CAPTURED set, since an uncaptured column has no bit.
+  - **⚠⚠ THE POOL-ISOLATION QUESTION (user-raised): `Pooling=false` and a distinct `Application Name` BOTH
+    WORK, MEASURED — and the restore STAYS.** With `Max Pool Size=1`: after a leak the same pool reports
+    isolation level **5 (Snapshot)**, a different `Application Name` reports **2 (ReadCommitted)** — a
+    genuinely separate pool — and `Pooling=false` never leaks. It does not simplify: `SqlServerSnapshotStream`
+    must exist anyway (it owns the connection and commits the transaction), `Pooling=false` costs a full
+    connect per snapshot read on a leg that opens TWO, `Application Name` is the CONSUMPTION-ATTRIBUTION
+    vector so hijacking it splits a dbt run across two program names, and both only CONTAIN the leak — fatal
+    for the other fixed site, whose connections are the ORDINARY read pool.
+    - **⚠⚠ THE QUESTION FOUND A REAL HOLE IN MY OWN COMMENT.** The catch around the restore said *"SqlClient
+      retires a broken connection rather than pooling it"* — true of a BROKEN one, silent about a HEALTHY
+      connection whose reset failed for another reason, and `Dispose()` RETURNS a healthy connection to the
+      pool. That path leaked exactly what the class exists to prevent. Now calls `SqlConnection.ClearPool`
+      there — the only tool SqlClient offers, blunt and acceptable because it should never fire.
+    - ⚠ The class is `SqlServerSnapshotStream`; the CDC READER was not designed around the leak. The leak
+      was found while building the snapshot LEG (§20.6).
+  - **⚠⚠ SLICE 8b (§22): `on_schema_change := 'resync'` — AND IT EXPOSED A DEFECT IN THE DOCUMENTED RESUME
+    IDIOM, THEN RETRACTED A FOLLOW-ON I HAD WRITTEN INTO §21.2 THE SAME DAY.** When the captured set no
+    longer matches the source (a column was ADDED, so it is not captured and every read silently omits it),
+    a resync creates a fresh instance and answers with a BASELINE of the whole table in the new shape plus a
+    handoff. C#-only, NO ABI change. Gate `verify_mssql_cdc` 559 → **604**, six mutants.
+    - **⚠⚠ IT KEYS ON A METADATA COMPARISON AT BIND, NOT ON THE IN-WINDOW DDL CHECK, and that is FORCED
+      rather than chosen.** A resync changes the DECLARED output schema, and widening one mid-execute is
+      exactly what the arrival check refuses — so the decision cannot wait for the window. It costs NOTHING
+      extra: the source's columns already ride the bind query's nullability read and the captured set is the
+      describe's own output. ⚠ ONLY AN ADDED COLUMN triggers it — a DROP would be LOST by re-capturing and a
+      TYPE change propagates on its own — and when nothing is stale it falls through to `'error'`, so a
+      drift it cannot repair is still refused rather than swallowed.
+    - **⚠⚠ IT FORCES THE SNAPSHOT LEG.** A new instance starts capturing NOW, so its changes alone would
+      silently begin at the resync instant and LOSE everything before — a short read with nothing failing.
+      A lower bound beside it is REFUSED (a cursor and a fresh baseline are two different reads).
+    - **⚠⚠ TWO REFUSALS ARE POLICY, NOT LIMITS:** already TWO instances (SQL Server's cap — making room
+      means DISABLING the older and destroying unread history, so the message names the operator action
+      instead), and an instance we did NOT create (`fabricator_source` unmarked ⇒ not ours, full stop; a
+      full-table snapshot on a DBA's configuration is not a SELECT's call).
+    - **⚠⚠ THE DEFECT IT EXPOSED: THE EMITTED HANDOFF WAS NOT RESUMABLE ON A FRESH INSTANCE.** The handoff
+      is `fn_cdc_get_max_lsn()` (the capture WATERMARK, which LAGS) while a just-enabled instance's floor is
+      ABOVE it. `CdcResolveWindow` clamps for the SAME statement, but the position PRINTED on the baseline
+      rows was the raw watermark — so the documented "take the handoff out of the rows and hand it back"
+      idiom produced a below-floor bound and a refusal blaming a cleanup job that never ran. Fixed by
+      emitting the CLAMPED position, i.e. at the cursor's source rather than teaching callers a workaround.
+      - **⚠ MY FIRST VERSION OF THAT FIX READ THE WRONG FUNCTION AND SILENTLY DID NOTHING**: it clamped
+        against `fn_cdc_get_min_lsn`, which §1.6a MEASURED as transiently NULL for a newly enabled instance
+        while `start_lsn` is already set — and a resync creates its instance moments before, so NULL is the
+        NORMAL answer there. `cdc.change_tables.start_lsn` is what answers immediately. ⚠ This does NOT
+        contradict §1.6a's rule against substituting start_lsn for the FLOOR: there it would assert a
+        retention floor the engine declined to state; here the question is which POSITION to hand back,
+        where too HIGH is bounded by the snapshot (at-least-once, never loss).
+    - **⚠⚠ AND IT RETRACTS §21.2's "OBVIOUS FOLLOW-ON" AS MEASURABLY IMPOSSIBLE — I built it and the GATE
+      caught it.** §21.2 proposed telling "the cleanup job removed those changes" from "the instance did not
+      exist yet" via *nothing was purged iff `min_lsn <= start_lsn`*. MEASURED:
+      `sp_cdc_cleanup_change_table` MOVES `cdc.change_tables.start_lsn` up ALONG WITH the floor — they are
+      the same value — so the test is vacuously true and building it **DELETED THE BELOW-FLOOR REFUSAL
+      ENTIRELY**, i.e. a silent short read wherever changes really had been purged. §18's pre-check
+      assertion is what failed; without it the regression was invisible, because no row moves and the reads
+      it breaks are the ones nobody has yet. **CDC keeps no record separating the two causes. Do not
+      re-propose it.**
+    - **⚠ THE SECOND NAME IS `fab_<h>_b`, and §17.3 deliberately deferred the shape to here.** Two canonical
+      names per table; a resync takes whichever the survivor is not using, which is deterministic with no
+      probing because the two-instance case is refused outright. The gate asserts the RELATIONSHIP
+      (`max = min || '_b'`), never the literal — hard-coding it would pin the DIGEST, which §17.3 says may
+      change without migration.
+    - **⚠ THE RE-BIND NAMES THE NEW INSTANCE, and omitting it SILENTLY UNDOES the resync** — the table now
+      has two, so a bare re-bind takes slice 7's UNION path and reads the old history in the old shape
+      beside the new. It also passes `'error'` rather than `'resync'`, so ONE resync per statement is
+      STRUCTURAL rather than incidental.
+    - **⚠ A TWO-SUBQUERY ASSERTION IN ONE STATEMENT DOES NOT PIN AN ORDER, and one of mine passed on a false
+      premise because of it.** `SELECT (SELECT count(*) FROM changes(…)), (SELECT count(*) FROM
+      cdc.tables())` lets DuckDB evaluate the second BEFORE the first, so the instance count could be read
+      before the DDL that changes it. Where the ORDER is the assertion, write two statements.
+  - **⚠⚠ SLICE 9 (§21): TIMESTAMP BOUNDS + `images := 'both'` — AND IT DIAGNOSED A PRE-EXISTING SHIPPED
+    DEFECT IN SHARED CODE THAT HAS NEVER WORKED AS ITS OWN COMMENT SAYS.** `starting_timestamp` /
+    `ending_timestamp` (resolved by `sys.fn_cdc_map_time_to_lsn` inside the batch that resolves the window,
+    so free), the `'both'` image mode, and the `_update_mask` column that makes `'both'` readable. C#-only,
+    NO ABI change. Gate `verify_mssql_cdc` 476 → **559**, five mutants each killed at its own assertion.
+    - **⚠⚠ `ArrowValueReader.ReadTimestamp` HAS NEVER RETURNED A `DateTime`, and its comment says it does.**
+      `return string.IsNullOrEmpty(type.Timezone) ? ts.UtcDateTime : ts;` — C#'s conditional operator
+      unifies its branches and there is an implicit `DateTime → DateTimeOffset` conversion (not the
+      reverse), so the expression's natural type is `DateTimeOffset` and the `DateTime` branch is converted
+      straight back. **It FAILED SILENTLY**: `starting_timestamp := TIMESTAMP '2099-01-01'` bound cleanly,
+      ran, and returned EVERY row, because `as DateTime?` on a boxed `DateTimeOffset` is null and an absent
+      bound is a legitimate state. A test asking only "does it bind" would have passed.
+      - ✅ **FIXED the same day in its own commit (docs §23), and it needed a SECOND change nobody would
+        have predicted.** The one-line fix (`? (object)ts.UtcDateTime : (object)ts`) made the value a real
+        `DateTime` — at which point **SqlClient's inference maps it to the LEGACY `datetime` type (~3.33 ms)
+        and ROUNDS THE BOUND**. MEASURED over 3400 consecutive microsecond offsets: 1732 round DOWN
+        (harmless — pushdown may be a SUPERSET, DuckDB re-applies) and **1667 round UP, which makes the
+        pushed predicate STRICTER so rows are dropped on the SERVER and never reach the re-application**.
+        ⚠⚠ **THE ONE-LINE "OBVIOUS" FIX WOULD HAVE SHIPPED SILENT DATA LOSS**, and the hazard was
+        unreachable BEFORE it only because the bug itself preserved full precision. `FilterWhereBuilder` now
+        pins `SqlDbType.DateTime2`. Gate `verify_filter_pushdown` 6 → **17**, two mutants: the inference one
+        returns **0 rows where 4 was expected**, the ternary one leaves all 13 row assertions PASSING and
+        dies only on the parameter type — which is the honest split, since a `DateTimeOffset` really was
+        precise.
+      - ⚠ **The COST of the original bug was a PLAN, never a wrong answer** — say it that way. Against an
+        indexed `datetime2` column: `datetime2` gives a direct `Index Seek` that PARALLELISES,
+        `datetimeoffset` goes through `GetRangeWithMismatchedTypes` (constant scan + nested loop computing an
+        equivalent range) and did not. Still a seek, so a pessimisation rather than the table scan a
+        non-SARGable predicate would cause.
+      - ⚠ Found by INSTRUMENTING the seam: the probe printed `tzNull=True isNullOrEmpty=True
+        kind=DateTimeOffset`, i.e. the branch condition was TRUE and the wrong type came out anyway — which
+        is what killed every hypothesis about the Arrow type. Three hypotheses about DuckDB's export were
+        wrong before that line.
+    - **⚠⚠ BOTH TIMESTAMP BOUNDS ARE INCLUSIVE AND A `_position` IS NOT — the asymmetry IS the design.** A
+      position is a RESUME TOKEN (the row it names has been read ⇒ exclusive); a timestamp is an INSTANT the
+      caller has read nothing of ⇒ `smallest greater than or equal` / `largest less than or equal`. Two
+      bounds on the SAME side are REFUSED rather than reconciled ("the tighter of the two" is unpredictable);
+      mixing sides is allowed. The gate asserts the operator by handing a row's own `_commit_timestamp` back
+      as `starting_timestamp` — inclusive returns that row, `smallest greater than` returns nothing.
+    - **⚠⚠ THE CLOCK GAP IS REAL, SILENT, AND IT BIT THE FIRST README EXAMPLE I WROTE.** MEASURED in one
+      statement: a DuckDB session on `Europe/Berlin` reports `now()::TIMESTAMP` = `12:07:46` while the same
+      instant's `SYSDATETIME()` on the server is `10:07:46`. So `starting_timestamp := now() - INTERVAL 1
+      HOUR` names a window TWO HOURS IN THE SERVER'S FUTURE and returns **zero rows, silently** — the exact
+      failure mode this surface exists to prevent, produced by the most natural thing a caller can write.
+      ⚠ It also made two gate assertions pass FOR THE WRONG REASON (they depended on the session being EAST
+      of the server); they use `now() + INTERVAL 1 DAY` now, so they test the bound rather than the rig's
+      geography. Take the instant from the DATA (`_commit_timestamp` is already the server's clock) or from
+      the server, never from the client.
+    - **⚠ A BOUND THAT MAPS TO NOTHING IS AN EMPTY WINDOW; ONE BELOW THE RETENTION FLOOR IS REFUSED — and
+      the message names BOTH causes because the read cannot tell them apart.** `fn_cdc_map_time_to_lsn`
+      resolves against the DATABASE-wide `cdc.lsn_time_mapping` while the floor belongs to the INSTANCE, so
+      an old timestamp on a recently captured table maps below the floor with **nothing having been lost**
+      (measured). An earlier wording asserted "removed by the cleanup job" — true of one cause, a
+      fabrication about the other. Refusing is the safe half: discriminating properly needs `start_lsn`
+      beside the floor (nothing was purged iff `min_lsn <= start_lsn`), one more column in a batch that
+      already runs — deliberately not taken, so a false alarm never becomes a silent short read.
+    - **⚠⚠ NO PLACEHOLDER IS SUBSTITUTED FOR THE MAX-COLUMN TRAP, and that reverses the industry answer the
+      design note recorded.** A `varchar(max)` column an UPDATE did not touch is NOT STORED in that update's
+      BEFORE image (reproduced end to end; the AFTER image keeps it). A placeholder IS A VALUE, so it is
+      indistinguishable from a row that genuinely holds it — inventing data to signal missing data.
+      `_update_mask` makes it DECIDABLE instead, the same rule `_capture_instance IS NULL` uses for a
+      baseline row. Gated WITH its control: a second update that DID touch the column carries the real prior
+      value.
+    - **⚠ `_update_mask` IS NEVER NULL IN A CHANGE ROW — MEASURED, and it corrects the plausible story** I
+      had already written into the code. An insert and a delete have no "columns changed" to report, so
+      nullable looked obviously right; SQL Server reports ALL of them (`0x0F` on four columns, `0x03FF` on
+      ten). It is declared like its three neighbours — a per-CHANGE fact only a SNAPSHOT row lacks.
+    - **✅ AND THE MASK IS NOW DECODED FOR THE CALLER: `_changed_columns LIST<VARCHAR>` (docs §24), added
+      the same day.** `list_contains(_changed_columns, 'notes')` answers §1.5's MAX-column question by NAME
+      — no ordinal, no bit index, no byte order — which is worth shipping precisely BECAUSE the recipe below
+      is easy to get wrong. The raw mask still ships; this is the answer most callers want. Gate +26, two
+      mutants (front-indexed bytes; an empty list instead of NULL).
+      - **⚠ KEYED BY CAPTURE INSTANCE, not one list** — a union read's two instances need not share ordinals
+        and the aligned output order is NEITHER of theirs, so `_capture_instance` picks the map per row (a
+        third job for the column §18.2 shipped early). An unknown instance yields NULL, never a guess.
+      - **⚠ ORDINAL `i` IS THE `i`-th CAPTURED COLUMN — MEASURED**: an explicit
+        `@captured_column_list='d,b,a'` comes back as 1=a, 2=b, 3=d (SQL Server normalises to source order)
+        and the TVF emits that same order, so the declared columns ARE the map at no extra round trip.
+      - **⚠ IT GOES AT THE END OF THE SCHEMA, not into the metadata block.** `meta` indexes BOTH the SQL
+        columns and the declared ones, and a C#-computed column with no SQL counterpart would split it into
+        two counts across six sites — which shifts every captured column by one, silently.
+      - **⚠⚠ THE DECORATOR DERIVES ITS SCHEMA FROM THE INNER STREAM, and taking the plan's DECLARATION
+        would have made the ARRIVAL CHECK VACUOUS** (it would compare the declaration to itself). Caught in
+        design, ungatable — every fixture has matching shapes.
+      - ⚠ NULL, not an empty list, for a baseline row: "this update changed nothing" and "this row is not an
+        update" are different claims.
+    - **⚠⚠ THE MULTI-BYTE MASK LAYOUT IS NOT WHAT §1.4 IMPLIES.** §1.4's "bit index = ordinal − 1,
+      little-endian within each byte" is true and says NOTHING about byte order. MEASURED on ten columns:
+      ordinal 2 ⇒ `0x0002`, ordinal 9 ⇒ `0x0100` — so **ordinals 1-8 live in the LAST byte**. The mask is a
+      big-endian bit string over the WHOLE varbinary, and the natural `floor((ord-1)/8)` picks the wrong
+      end, silently mis-reading every table with more than eight captured columns. Recipe, measured and
+      gated against its naive twin: `get_bit(_update_mask::BIT, (8 * octet_length(_update_mask) -
+      <ordinal>)::INTEGER)` — ⚠ the `::INTEGER` is required, `get_bit(BIT, BIGINT)` is a binder error.
+    - **⚠ `sys.fn_cdc_is_bit_set` / `sys.fn_cdc_get_column_ordinal` WORK** (§11 listed them UNVERIFIED):
+      ordinal 3 for `notes`, NULL for an unknown name, and agreement with the DuckDB recipe row for row.
+      ⚠ The `sp_cdc_enable_table` warning *"Update mask evaluation will be disabled in net_changes_function
+      because the CLR configuration option is disabled"* does NOT affect them — it is about the NET changes
+      function, which this reader does not wrap.
+    - **⚠ `_update_mask` is CONDITIONAL on the mode**, departing from the one-way-door rule
+      `_capture_instance` shipped under. The precedent is next door: `_commit_timestamp` is already an opt-in
+      that adds a column. Gated by asserting the column does not resolve at all in the default mode.
+    - ⚠ The snapshot leg's mask literal needs an explicit `CONVERT(varbinary(128), NULL)` — the THIRD
+      instance of the trap slice 8 measured twice. A bare NULL describes as `int`, the legs' schemas differ,
+      and the arrival check refuses EVERY snapshot.
+  - **⚠⚠ SLICE 8 (§20): THE INITIAL-SNAPSHOT LEG — `include := 'snapshot'` / `'snapshot+changes'`, §5's
+    two-connection protocol. AND ITS STEP 2 TURNED OUT TO BE UNAVAILABLE IN THE CONFIGURATION EVERYBODY RUNS,
+    which re-scopes what the leg promises.** One connection takes a SHARED `TABLOCK, HOLDLOCK` (writers
+    frozen, readers not) and reads the handoff `P0 = fn_cdc_get_max_lsn()`; a second pins a SNAPSHOT view
+    INSIDE that window; the lock is released and the table is then read at leisure from the pinned view.
+    Re-measured end to end with every control firing (writer BLOCKED inside the window; B still reporting the
+    pre-write state after the release and after a writer landed an INSERT and an UPDATE; the stream from P0
+    delivering EXACTLY those two changes).
+    - **⚠⚠ `EXEC sys.sp_cdc_scan` UNDER THE LOCK — §5.1's step 2, the thing that buys exactly-once — CANNOT
+      RUN while the capture job is in its DEFAULT continuous mode. MEASURED: 150 attempts across 6 trials
+      over 61 s, ZERO successes, all `Msg 22903`.** The holder was IDENTIFIED rather than guessed —
+      `SQLAgent - TSQL JobStep … status=running command=WAITFOR … sp_cdc_scan` — i.e. **`continuous = 1` is
+      ONE long-lived `sp_cdc_scan` invocation that loops internally, so the job holds `sp_replcmds` even
+      while idle.** There is no window to retry into. ⚠ This CORRECTS §10.2a's "~1 failure in 57", which is
+      the rate for a probe COMPETING for one scan, not for a caller who needs one to succeed; and §5.3's
+      "retry, or on a busy server skip step 2" — it is not about busy servers.
+      - **The positive control, without which the above is just a broken probe: with the capture job STOPPED
+        the identical call succeeds in 3 ms.** (Trials 1–2 after the stop still failed — the stop is
+        ASYNCHRONOUS.)
+      - ⇒ **ONE attempt, never a retry loop** (retrying is measured waste AND would spend the time holding a
+        table lock, the one thing §5.2 forbids), **a failure does not fail the read**, and it logs at Warning
+        into `duckdb_logs` so which guarantee a read got is answerable in SQL. **exactly-once when the scan
+        runs, at-least-once otherwise; never loss.** The attempt still pays: it costs 2 ms and SUCCEEDS
+        wherever the job is not continuous — notably **Azure SQL Database, which has no agent at all**.
+      - **⚠ A failing `sp_cdc_scan` does NOT poison the transaction, and that had to be established** or the
+        protocol would be unbuildable (the lock would be gone before P0 was read): after the 22903,
+        `XACT_STATE()=1`, `@@TRANCOUNT=1`, the OBJECT/S lock still granted, a concurrent writer still blocked.
+        §17.2 measured a DIFFERENT statement failure killing an ambient transaction outright, which is why
+        this was worth measuring.
+    - **⚠⚠ IT FOUND A PRE-EXISTING SHIPPED DEFECT THAT IS NEITHER CDC-SPECIFIC NOR MINE: SNAPSHOT ISOLATION
+      LEAKS THROUGH THE CONNECTION POOL.** MEASURED with `Max Pool Size=1` so the next open is provably the
+      same physical connection: `before ReadCommitted` → inside the txn `Snapshot` → **after COMMIT
+      `Snapshot`** (session-scoped, outlives the transaction) → **next open from the pool `Snapshot`** → with
+      an explicit restore `ReadCommitted`. **BOTH spellings leak**, and the bare `SET` is the one the shipped
+      `mssql_materialize=false` route uses — whose own comment asserted *"`sp_reset_connection` puts the
+      isolation level back to the default"*. It does not. That comment's CONCLUSION was right (set it every
+      open), so nothing downstream was wrong; what the wrong reason hid is the level travelling the OTHER
+      way, out of our read into whatever runs next on that connection.
+      - **Mostly invisible — a later READ at SNAPSHOT returns the same rows, versioned. What is NOT invisible
+        is a DDL inside an explicit transaction: `Msg 3964`.** That is how it was found —
+        `cdc.changes(enable := true, include := 'snapshot+changes')` failed on its own `sp_cdc_enable_table`
+        several statements after the snapshot leg leaked the level.
+      - Fixed in BOTH places by one class (`SqlServerSnapshotStream`, owns the connection and restores
+        `READ COMMITTED` before releasing it). Fixing only the new one would have been the half-fix this file
+        keeps recording.
+      - **⚠ THE OBVIOUS PROBE GAVE THE WRONG READING and I nearly took it**: "run a DDL on the reused
+        connection" came back **OK in both directions**, because a DDL is refused only INSIDE an explicit
+        transaction and the probe ran it in autocommit. The session-level readings are the measurement.
+    - **⚠ THE HANDOFF IS `P0 ‖ 0xFF × 11`, AND THE PADDING IS NOT DECORATION.** P0 is the capture WATERMARK,
+      so every change AT it is already in the snapshot; the cursor predicate is `lsn > cur OR (lsn = cur AND
+      (seq > cur_seq OR (seq = cur_seq AND op > cur_op)))`, so ZERO padding would ADMIT every row at that
+      LSN. MEASURED, and it is the gate's discriminator: same LSN, `0xFF`-padded ⇒ **0 rows**, zero-padded ⇒
+      **1 row** (the fixture's own DELETE, the last captured transaction) — the duplicate itself.
+      - ⚠ **The padding and the changes half's cursor predicate are two halves of ONE guarantee**: mutants A
+        and B die at the SAME assertion with the same extra row. Unlike §19.4's deliberately-redundant pair,
+        neither is redundant here.
+    - **⚠ `_capture_instance IS NULL` IS THE BASELINE DISCRIMINATOR** — a snapshot row came from the SOURCE,
+      not from a capture instance, and a change row's value is a parameter that is never null. So one rule,
+      no new column, re-using what §18.2 shipped. `_change_type='insert'` + `_operation=2` (Delta's own
+      spelling for a baseline, so a CDF consumer needs no new branch); `_commit_lsn`/`_seq_val`/
+      `_commit_timestamp` NULL (state, not an event). Ordering still works — `ORDER BY _position`.
+    - **⚠⚠ TWO EXPLICIT `CONVERT`s ARE LOAD-BEARING, AND MEASURED**: a CASE over a CONSTANT operation folds
+      to **`varchar(6)`** where the real list gives `varchar(16)`, and `binary + binary` describes as
+      **`varbinary(21)`** not `binary(21)`. Without them the declared schema DIFFERS from the change read's
+      and the arrival check refuses EVERY snapshot. The snapshot list still goes through the same
+      `CdcMetadataSelectList`, so names/order/count come from one place.
+    - **⚠ THE SELF-BLOCK REFUSAL IS UNCONDITIONAL, unlike the pooled-scan hazard next door** — MARS,
+      `mssql_read_isolation` and RCSI all stand that one down and NONE helps a `TABLOCK`: the lock must be on
+      a connection of its own (its point is a COMMIT we time), and a lock REQUEST is not a read, so
+      versioning does not exempt it. **⚠ MEASURED that without the guard it HANGS rather than fails**
+      (`mssql_command_timeout` defaults to 0 = infinite; the mutant ran past ten minutes) ⇒ **the gate's
+      section sets `mssql_command_timeout = 10` so a regression FAILS in ten seconds instead of stalling the
+      tier.** A suite that hangs on regression is worse than no suite.
+    - **⚠ THE HANDOFF IS CLAMPED UP TO THE INSTANCE'S FLOOR, on the handoff path only.** The handoff is the
+      DATABASE-wide watermark while the floor is the INSTANCE's earliest readable position, so a freshly
+      enabled instance legitimately starts ABOVE it — and refusing there (what a plain below-floor
+      `starting_position` correctly does) would refuse exactly `enable := true, include := 'snapshot+changes'`.
+      Nothing is skipped: what lies between is history the instance never captured and the snapshot carries
+      its state.
+    - **⚠ `on_schema_change := 'resync'` IS NOT IN THIS SLICE, deliberately** (§15.12 pairs them). The leg is
+      a mechanism; `resync` is a POLICY that destroys history — §15.11: at most TWO instances, so the second
+      drift must DISABLE the oldest and take its unread history with it. That has to be opt-in, which makes
+      it a decision rather than a mode.
+    - **⚠ AN EMPTY TABLE SNAPSHOTS TO NO ROWS AND THEREFORE TO NO HANDOFF**, so the documented
+      take-the-cursor-out-of-the-rows idiom yields NULL — which means "absent" rather than an error, and the
+      next read replays from the retention floor. Redundant rather than wrong (the table was empty at the
+      pin), but it is §3.4's trap in a new hat, and `'snapshot+changes'` does not have it. Gated at §29g,
+      which also carries the only assertion on the lock over an EMPTY table.
+    - **NOT COVERED, and the suite says so**: the exactly-once path (needs the capture job stopped — a
+      database-wide operator action that would change every other suite's behaviour), a NON-EMPTY changes
+      half within ONE statement (needs a concurrent writer; sqllogictest is sequential), the at-least-once
+      warning's text (it depends on rig state an operator can change), and the two-connection protocol as
+      such (no row can show a lock was taken and released).
+  - **⚠⚠ SLICE 7 (§19): A TABLE'S TWO CAPTURE INSTANCES NOW READ AS ONE STREAM, and it RETIRED BOTH items
+    §18.1 deferred — the name-alignment is BUILT and `WidenArrowType` is DISSOLVED.** The boundary is
+    DERIVED (`cdc.change_tables.end_lsn` is NULL for both, re-measured) as **`fn_cdc_get_min_lsn(newer)`**
+    rather than `change_tables.start_lsn`, and that choice is retention-correctness rather than taste: the
+    cleanup job RAISES that floor, and the purged range is exactly what the newer instance can no longer
+    answer for while the older one still covers it. Older leg `< split`, newer leg `>= split`.
+    - **⚠⚠ THE UNION IS IN T-SQL, AND THAT IS THE THIRD OPTION §15.8 NEVER CONSIDERED.** It weighed "align in
+      DuckDB SQL, widening free" against "align in C#, widen ourselves" and recommended the second because
+      the reader is marshaled — but we GENERATE T-SQL, so the alignment can happen on the SERVER: one
+      statement, one describe, one stream, no C#-side batch surgery, and SQL Server's own type precedence
+      does the widening.
+    - **⚠⚠ AND §15.8's WIDENING RULE WAS WRONG. MEASURED: `decimal(9,0) ∪ decimal(5,4)` → `decimal(13,4)`,
+      not the `decimal(9,4)` that "max precision, max scale" gives** — 13 is `max(integral digits) +
+      max(scale)`, and at (9,4) a nine-integral-digit value OVERFLOWS. The helper this slice inherited would
+      have silently lost data on a shape the server gets right for free.
+    - **⚠⚠ AND IT HAS NO REACHABLE CASE AT ALL, which is stronger than "no caller yet".** MEASURED: an
+      `ALTER COLUMN <type>` is propagated by the capture job to **BOTH** change tables (~2 s), so two
+      instances CONVERGE; a column captured by one is NULL-filled; a drop-and-re-add is a CONFLICT, not a
+      widening. Nothing is left for a widener to do.
+    - **⚠⚠ A BARE `NULL` IN ONE UNION BRANCH TAKES THE OTHER BRANCH'S TYPE — MEASURED**, and it removes the
+      last reason to render SQL type names. `varchar(50) UNION ALL NULL` describes as `varchar(50)`, NOT the
+      `int` a bare `SELECT NULL` gives on its own (which would have made the other branch fail to convert).
+    - **⚠⚠ `fn_cdc_get_min_lsn` ANSWERS `0x0000000000000000000` — NOT NULL — FOR AN INSTANCE IT DOES NOT
+      KNOW** (and for a NULL argument). Zero is a well-formed LSN below every real one, so **as a floor** it
+      passes the §2.1 pre-check trivially and reaches the misleading 313, and **as a split it is worse**:
+      every row falls in the newer leg, which lacks the pre-boundary changes ⇒ a SHORT read with nothing
+      failing. Guarded on both paths (the one-instance guard is a small pre-existing hole this exposed), and
+      distinguishable from §1.6a's transient NULL, so the two get different answers.
+    - **⚠ A DDL AT OR BELOW THE BOUNDARY IS ABSORBED** — the second instance exists BECAUSE of it and the
+      union carries both shapes — so the drift check's lower bound becomes `max(from, split)`. MEASURED both
+      halves: the ADD/DROP that motivated the instance land below its `start_lsn`, one issued afterwards
+      lands above and still refuses. ⚠ `cdc.ddl_history` has ONE ROW PER (DDL × instance) incl. DDLs
+      predating the newer instance (back-filled), so the query is DISTINCT; and it is populated
+      ASYNCHRONOUSLY too, lagging the change rows, so a gate must wait for the ddl_history ROW.
+    - **⚠ A GENUINE TYPE CONFLICT IS REFUSED AT BIND, on the captured type NAMES, at zero extra cost.**
+      MEASURED that a drop-and-re-add really produces `varchar(20)` vs `int`, that SQL Server's union
+      describes it as `int`, and that the read then dies mid-scan with *"Conversion failed …"*. **That is not
+      good enough because the error fires on an unconvertible VALUE, not on the conflict** — historical text
+      that happens to be numeric converts quietly and the two eras silently stop meaning the same thing.
+    - **⚠ THE STATEMENT IS COMPOSED AT BIND while the window is resolved at EXECUTE, so BOTH legs are always
+      in it** — hence CLAMPED TVF arguments (a degenerate leg gets a one-LSN window, never a backwards one,
+      because the TVF answers an inverted window with the 313) PLUS explicit predicates. The two are
+      REDUNDANT in any fixture with no row at exactly the split, so the gate can only kill removing BOTH —
+      which produces *"Expected 4 rows, but got 6"*, the double count itself. Deliberate: the failure guarded
+      is a silent wrong answer.
+    - **⚠ A ROW COUNT CANNOT DISCRIMINATE A UNION READ, and the gate is built around that.** The OLDER
+      instance never stops capturing, so reading it alone returns EVERY row — the same four — just without
+      the newer instance's column. The load-bearing assertion is on VALUES no single instance can produce
+      together (`v` from the older, `region` from the newer, in one result).
+    - **⚠ `_capture_instance` IS WHAT MAKES THE NULLs DECIDABLE**, which is exactly what §18.2 shipped it
+      early for: `region` NULL on an older-instance row means "not captured then", the same NULL on a
+      newer-instance row means the value IS NULL. Gated as two counts side by side.
+    - **⚠ A user-visible transient: for up to one polling interval after a second instance is enabled the
+      boundary does not exist** (§1.6a's NULL floor IS the split) and the read says "retry" rather than
+      guessing. Substituting `change_tables.start_lsn` would be right only until cleanup runs. The suite
+      carries floor WAITS for this, and one assertion goes through `DESCRIBE` (which binds without
+      executing) for the same reason.
+    - `cdc.min_position('<table>')` answers again for a two-instance table — the OLDER floor, i.e. where the
+      union's readable range starts; NULL if either floor is unknown (unknown wins over min).
+  - **⚠ SLICE 5's FLOOR BUMP WAS A SEPARATE COMMIT, deliberately.** `3df16cf` left
+    `scripts/run-suites.sh` untouched because the tier was RUNNING and editing a script bash is
+    incrementally reading kills the run; the floor moved to 2524 once it landed. **The transferable bit: a
+    floor bump cannot be in the same commit as the change it measures unless you are willing to wait for the
+    tier before committing at all** — and a floor left below the actual silently tolerates a regression that
+    size, so it is owed, not optional.
+  - **✅ THE SERVICE FLOOR IS 2992, TAKEN FROM A GREEN RUN (2026-08-25, own commit)** — the four
+    user-requested items took `verify_mssql_cdc` 630 → **725** and the clean tier came back
+    **54/54 — 2992 ALL GREEN**; 2897 + 95 = 2992 exactly, i.e. the CDC suite's whole delta and no
+    other suite moved. Hermetic is still **8003**. The 2897 entry it supersedes:
+  - **✅ THE SERVICE FLOOR WAS 2897, TAKEN FROM A GREEN RUN (2026-08-25, own commit)** — `_changed_columns`
+    took `verify_mssql_cdc` 604 → **630** and the timestamp-parameter fix took `verify_filter_pushdown`
+    6 → **17**; the clean tier came back **54/54 — 2897 ALL GREEN** and 2860 + 26 + 11 = 2897 exactly, which
+    is what shows no other suite moved. Hermetic is still **8003** — unchanged even though
+    `ArrowValueReader` is shared with Delta's filter pushdown, which is the reason it was re-run rather than
+    assumed. The 2860 entry it supersedes:
+  - **✅ THE SERVICE FLOOR WAS 2860, TAKEN FROM A GREEN RUN (2026-08-25, own commit)** — slices 9 and 8b took
+    `verify_mssql_cdc` 476 → 559 → 604 and the clean tier came back **54/54 — 2860 ALL GREEN**, with
+    `verify_session_tag` at its full 25. ⚠ The arithmetic CORROBORATED it afterwards rather than producing
+    it: 2732 + (604 − 476) = 2860 exactly, which is what shows no other suite moved. Hermetic is unchanged
+    at **8003** (no hermetic suite touches SQL Server). The 2732 entry it supersedes:
+  - **✅ THE SERVICE FLOOR WAS 2732, TAKEN FROM A GREEN RUN (2026-08-25, own commit).** `scripts/run-suites.sh`
+    read `MIN_ASSERTIONS:=2607` — slice 7's number — while slice 8 had added 125 to `verify_mssql_cdc`
+    (351 → 476). The clean tier came back **54/54 — 2732 ALL GREEN**, with `verify_session_tag` at its full
+    25 (the recorded intermittent did not fire). Hermetic is unchanged at **8003** and needed no bump.
+    - **⚠ THE NUMBER CAME FROM THE RUN, AND THE ARITHMETIC ONLY CORROBORATED IT AFTERWARDS** — which is the
+      order that matters, because while the slice was being finished two arithmetic routes to it disagreed
+      by 8. The earlier tier with CDC at 460 totalled 2716, and 2716 + 16 = 2732 ✓; the other data point
+      (2707, with `verify_session_tag` failing at 8 of 25) does NOT reconcile by adding back its 17, because
+      a FAILING suite stops at the failure and its remaining assertions are never counted. **A total taken
+      from a run with any failure in it is not a floor candidate at all** — it is an undercount of unknown
+      size, and treating it as one is how a floor lands below the actual.
+  - **Commits so far:** `5778c9e` (slice 1), `4c99b44` (slice 2 + ABI v81), `7e514af` (the `capture_now`
+    rename), `1b13a68` (the redesign, docs only), **`cf8f60b` (slice 3, the reader)** and **`61162c4`
+    (slice 4)**, **`3df16cf` (slice 5)** and `9fea9d9` (its floor bump), **`7ace17c` (slice 7, the
+    two-instance boundary — floor bump INCLUDED this time, because the tier's own 2607 was in hand before
+    committing)**, **`7a4aae7` (slice 8, the initial-snapshot leg — + the pre-existing pooled
+    snapshot-isolation leak it found, and the change read's pin opt-out; ⚠ the service FLOOR bump is a
+    SEPARATE commit this time, because the tier that produced the number came back with the recorded
+    `verify_session_tag` intermittent and had to be re-run)**, `e85e011` (that floor bump, 2607 → **2732**
+    from a green 54/54 run) and **slice 9** — as of 2026-08-25 (the user has not asked to push;
+    `git log @{u}..HEAD` is the authority for both the count and the shas, not this list).
+  - **Gates: `test/verify_mssql_cdc.test` 105 → 182 (slice 3) → 239 (slice 4) → 268 (slice 5) → 351
+    (slice 7) → 476 (slice 8) → 559 (slice 9) → 604 (slice 8b) → 630 (`_changed_columns`) → 725 (the four
+    user-requested items)** (service tier), THIRTY-SEVEN mutants, each killed at its own assertion — and
+    slice 3's mutant 1 (drop the
+    retention-floor check) dies SHOWING the raw 313 the pre-check exists to replace. ⚠ **One mutant SURVIVED
+    at first** and that is item 4 below.
+  - **⚠⚠ SLICE 4 (§17): THE CAPTURE-INSTANCE NAME IS GENERATED AND HIDDEN, AND IT REMOVES A DEFECT.**
+    `fab_<16 hex of MD5 over schema.table>` = 20 chars (MD5 per the user, 2026-08-25 — it is a NAME, not a security boundary, and a collision costs a REFUSAL rather than a wrong answer). MEASURED both ways: SQL Server's own default is
+    `<schema>_<table>`, the limit is EXACTLY 100 characters, so a 100-char table produced a 104-char name and
+    **`Msg 22927 … exceeds the length limit of 100 characters`** — `cdc.enable` failing with an error about a
+    name the user never chose, escapable only via the knob we wanted to hide. The same table enables fine
+    with a generated name.
+    - **⚠⚠ ANY STABLE DIGEST WILL DO, but NEVER `string.GetHashCode()`** — .NET randomizes string hash codes
+      PER PROCESS, so a GetHashCode name would differ every run and present as a caching bug. ⚠ The gate
+      CANNOT catch that specific mistake (one process ⇒ GetHashCode is stable); it catches a generator that
+      is not a function of the name at all, by disable→re-enable→same name.
+    - **⚠ SWITCHING THE DIGEST IS SAFE, and that falls out of the table-keyed idempotence** rather than
+      luck: the name is computed ONLY when creating, so a table captured under an older digest is still
+      found, reported and read — no migration, no orphan. ⇒ standing rule: **never PARSE the name to recover
+      the table**; `cdc.tables()` and the `fabricator_source` marker are the mapping.
+    - **⚠ NOT lower-cased, deliberately**: normalising case would collide two genuinely different tables on
+      a case-SENSITIVE collation, reintroducing the very defect. Nothing is lost because idempotence keys on
+      the TABLE.
+  - **⚠⚠ A DEFAULT `cdc.enable` NOW KEYS ON THE TABLE, AND THAT IS A CORRECTNESS FIX, NOT ERGONOMICS.** It
+    used to key on the capture INSTANCE. True for an explicitly named second instance — still how you ask for
+    one — and fatal as a default: **a bare enable that silently added a second instance makes
+    `cdc.changes('<that table>')` AMBIGUOUS**, and the reader refuses rather than picking one (§2.2). ⚠ The
+    gate's discriminating row is a DIFFERENT SPELLING (`DBO.CDC_GEN` after `dbo.cdc_gen`) — a name-keyed
+    build hashes differently and creates a second; the plain repeat passes on both builds.
+  - **⚠⚠ THE OWNERSHIP MARKER AND ITS TRANSACTION — all three states MEASURED.** Extended property
+    `fabricator_source` on the instance's `fn_cdc_get_all_changes_*`, valued with the resolved
+    `schema.table`, surfaced as a new `cdc.tables()` column (non-NULL ⇒ ours).
+
+    | context | on a FAILED marker write |
+    |---|---|
+    | autocommit, plain batch | the enable **SURVIVES** unmarked — the outcome to avoid |
+    | autocommit + our own `BEGIN/COMMIT` | the enable is **ROLLED BACK** — atomic, and what ships |
+    | inside an AMBIENT txn, via a savepoint | **unusable** — the error kills the whole transaction before a `CATCH` can act (`XACT_STATE()=0`, `@@TRANCOUNT=0`) |
+
+    ⇒ `IF @@TRANCOUNT = 0 BEGIN TRANSACTION`. ⚠ **NO fallback treats an UNMARKED instance as ours** — that
+    would silently adopt a DBA's instance, which slice 8's `resync` would be entitled to drop. The gate's
+    load-bearing row is the NULL one.
+  - **⚠ `enable := true` RUNS THE DDL AT EXECUTE, so bind stays side-effect-free** — an `EXPLAIN` /
+    `DESCRIBE` / `CREATE VIEW` captures NOTHING (gated). Affordable only because the declared schema is
+    derived from the SOURCE, via the SAME metadata expression shape rendered over literals — MEASURED
+    identical types. ⚠ **THE FIRST READ IS ZERO ROWS, NOT AN ERROR**: for an instance we just created,
+    `start_lsn` is now and "nothing readable yet" is a FACT, where for one we did not create a NULL floor is
+    genuinely unknowable. ⚠ **IT DOES NOT BACKFILL** — rows written before the enable are invisible, gated
+    rather than left to prose.
+  - **⚠⚠ SLICE 5 (§18) WAS RE-SCOPED, AND THE REASON GENERALISES: an "infrastructure" slice whose only
+    visible behaviour is a REGRESSION is not ready to be built.** §15.12 called it "name-alignment with
+    widening + `_capture_instance`". Only `_capture_instance` shipped; the alignment's NULL-fill would have
+    replaced a LOUD failure with a silently all-NULL column, and §15.9's own reasoning says NULL asserts
+    "this row had no value" where the truth is "we never captured it" — decidable ONLY when
+    `_capture_instance` VARIES, i.e. two instances. `WidenArrowType` had no caller for the same reason. Both
+    moved into slice 7; **slice 6's DDL detection was pulled FORWARD** in their place, because it delivers
+    the signal slice 5 was meant to make decidable.
+  - **⚠ `_capture_instance` SHIPS ON EVERY ROW NOW PURELY BECAUSE ADDING A COLUMN LATER IS BREAKING** — it
+    decides nothing until slice 7. Any further output column has the same one-way property; add it before
+    anyone writes `INSERT INTO staging SELECT * FROM cdc.changes(…)`.
+  - **⚠⚠ `on_schema_change := 'error'` IS THE DEFAULT, and the case it exists for is the SILENT one**: a
+    column ADDED mid-window is NOT captured, so the read omits it and a pipeline loses a field with nothing
+    failing. MEASURED: all three DDL kinds land in `cdc.ddl_history` with an `ddl_lsn` comparable to the
+    window bounds and `required_column_update = 1` for exactly the type change.
+    - **⚠ IT CANNOT SHARE THE WINDOW-RESOLUTION BATCH** — that batch must survive CDC being DISABLED between
+      bind and execute, and a batch REFERENCING `cdc.ddl_history` fails at COMPILE when the schema is gone
+      (the same fact the suite's §0 teardown is built around). So it costs its own round trip, taken only
+      when the window is non-empty and the mode is not `'ignore'`.
+    - **⚠ THE LSN RANGE IS THE POINT, and a mutant proves it**: checking the table's whole DDL history
+      instead makes the table read as "poisoned forever", and the suite dies at "a read that STARTS after
+      the DDL is clean again".
+  - Tiers on the final payload: service **54/54 — 2524** (2495 + exactly the CDC suite's 29, so NO other
+    suite moved) and hermetic **74/74 — 8003** (unchanged, as predicted — no hermetic suite touches SQL
+    Server).
+  - **⚠ THE SUITE WAITS FOR THE CAPTURE JOB rather than forcing a scan**, because `cdc.capture_now()`
+    contends for the database's single log-scan session (~1 failure in 57, MEASURED) and §14 records why
+    stopping the job first is not available there. ⚠ It waits for the WATERMARK as well as the rows: a row
+    is not readable until `fn_cdc_get_max_lsn()` covers it, so waiting only for COUNT leaves a race whose
+    symptom is a SHORT READ — a wrong answer rather than a failure.
+  - **⚠ RIG HYGIENE FOR ANY CDC WORK, and it is not optional:** every probe runs in a THROWAWAY database
+    (`cdcprobe`) that is DROPPED afterwards, and the rig is then verified back to **0 CDC-enabled databases
+    and 0 `cdc.%` jobs** — otherwise the capture job keeps scanning between runs and a later, unrelated
+    suite fails. ⚠ `msdb.dbo.cdc_jobs` EXISTS only while some database has CDC enabled, so read job config
+    through `sys.sp_cdc_help_jobs`, never that table (it is `Msg 208` on a clean server).
+  - **THE FOURTEEN SHIPPED FUNCTIONS** (all in the catalog's `cdc` schema, all SQL-Server-only):
+    `cdc.tables()` / `cdc.max_position()` / `cdc.min_position(src)` / `cdc.health()` (slice 1, inspection),
+    `cdc.enable_database()` / `cdc.enable(src, …)` / `cdc.disable(src, …)` / `cdc.capture_now()` / `cdc.retire_previous_instance(src)` (slice 2 + §29, setup),
+    and **`cdc.changes(src [, starting_position :=] [, ending_position :=] [, starting_timestamp :=]
+    [, ending_timestamp :=] [, capture_instance :=] [, images :=] [, commit_timestamp :=] [, enable :=]
+    [, on_schema_change :=] [, include :=])`**
+    (slices 3-9, the reader — output columns `_change_type`/`_position`/`_commit_lsn`/`_seq_val`/
+    `_operation`/`_capture_instance` + optional `_commit_timestamp`/`_update_mask`/`_changed_columns`;
+    `include` is `'changes'` (default) | `'snapshot'` | `'snapshot+changes'`;
+    `images` is `'after'` (default) | `'both'`; `on_schema_change` is `'error'` (default) | `'ignore'` |
+    `'resync'` | `'null'` | `'fill'`), plus **`cdc.inc_position`/`cdc.dec_position`** (scalars) and
+    **`cdc.ddl_history()`/`cdc.lsn_time_mapping()`** (table functions) — FOURTEEN in all.
+  - **⚠⚠ `cdc.retire_previous_instance(src)` — BUILT 2026-08-25 (C#-only, no ABI), user-requested; and the
+    question that came with it MEASURED that A RESYNC IS NOT IDEMPOTENT UNDER FAILURE.** Docs §29; gate
+    `verify_mssql_cdc` 725 → **735**, two mutants.
+    - **⚠ IT IS A TABLE FUNCTION RETURNING THE `(target, changed, detail)` REPORT, NOT A SCALAR** — asked
+      for as a scalar, and deliberately not one: every other CDC DDL surface is that report, a DESTRUCTIVE
+      call should say what it destroyed, and a scalar is the wrong shape for DDL in principle (DuckDB may
+      FOLD a CONSISTENT scalar at plan time or run a VOLATILE one PER ROW). `inc_position`/`dec_position`
+      are scalars precisely because they touch nothing.
+    - **⚠⚠ "OLDER" IS THE UNION READ'S OWN TOTAL ORDER — `start_lsn, create_date, capture_instance` — and
+      MUST NEVER BECOME A SORT BY NAME.** The generated names are a digest plus a `_b` discriminator and a
+      resync takes whichever the survivor is not using, so `fab_<h>` is the NEWER one whenever the previous
+      resync went the other way: a name sort is wrong half the time and right often enough to look correct.
+      Mutant 1 (order DESC) passes the `changed = true` assertion and dies at the SURVIVOR assertion, which
+      is why that one is separate and compares against the name §32b resumed from.
+    - ⚠ Fewer than two instances is a REPORTED NO-OP rather than an error (the goal is "leave this table
+      with one instance", and a table already there is a success — erroring would break the obvious
+      retire-then-resync sequence); an instance we did not create is REFUSED, checked on the OLDER one
+      alone, since that is the one being destroyed.
+    - **⚠⚠ THE MEASURED FINDING, AND IT WAS AN ACCIDENT: A RESYNC'S DDL COMMITS WHILE ITS ROWS DO NOT, SO A
+      FAILED MATERIALIZATION CANNOT BE RETRIED.** The probe's resync created the second instance and then
+      failed on the forced snapshot leg (the throwaway database lacked `ALLOW_SNAPSHOT_ISOLATION`) — both
+      instances present, ZERO rows returned — and re-running the identical statement was REFUSED with the
+      two-instance message. That is the shape of ANY failed resync materialization, not an artefact of that
+      error.
+      - **⚠⚠ AND THE REFUSAL'S OWN ADVICE IS WRONG FOR THAT CASE**: it says to disable the older instance,
+        which is right once consumers have caught up and DESTRUCTIVE here — the consumer never got the
+        baseline, so its cursor is still inside the OLD instance and retiring it destroys the history
+        between that cursor and the resync. The recovery is to re-read with `'error'`/`'ignore'` plus
+        `include := 'snapshot+changes'`: both instances exist, so an ordinary read already spans them in the
+        aligned shape and a fresh snapshot leg supplies a new baseline and handoff. Left as DOCUMENTATION
+        rather than a message change, because the refusal cannot tell the two situations apart and the
+        common one is the one it already describes.
+    - **⚠ A PLAIN SNAPSHOT LEG *IS* FULLY RE-RUNNABLE, and the asymmetry is the answer worth carrying**:
+      `include := 'snapshot'`/`'snapshot+changes'` without a resync performs NO DDL and consumes nothing —
+      no server-side record, no acknowledgement, no cursor of ours — so a retry takes a FRESH snapshot at a
+      new instant with a later handoff. It is all-or-nothing per attempt (no resuming a half-written one),
+      and the handoff rides IN THE ROWS, so if the rows do not land neither does the cursor.
+  - **⚠⚠ THE PURE-SQL CURSOR IDIOM EXISTS AFTER ALL, AND THE DOC HAD CONCLUDED IT DID NOT — `SET VARIABLE`
+    + `getvariable()`. MEASURED 2026-08-24, three spellings:** an inline scalar subquery is refused as a
+    table-function argument (already known) **AND as an `EXECUTE` argument** (`Only scalar parameters, named
+    parameters or NULL supported for EXECUTE` — NEW, and it closes the "NOT measured" note §3.4 shipped
+    with, in the direction opposite to its guess); a scalar FUNCTION CALL **is** legal as an `EXECUTE`
+    argument; and `SET VARIABLE cur = (SELECT …)` + `changes(…, starting_position := getvariable('cur'))`
+    binds, which is the one that reads the cursor OUT OF A TABLE. ⇒ a resumable pipeline needs no client and
+    no spliced literal. Full record: docs §16.2, and the README teaches this idiom.
+  - **⚠⚠ FIVE THINGS BUILDING IT ESTABLISHED THAT READING COULD NOT (docs §16.4):**
+    1. **`IArrowType.Equals` IS REFERENCE EQUALITY**, so the bind-vs-execute type check fired on EVERY
+       well-formed read — *"declared 'amount' decimal128 … arrived as 'amount' decimal128"*, a message
+       comparing two identical renderings. Apache.Arrow overrides `Equals` on none of its type classes. Fixed
+       with a structural comparer that also renders precision/scale, since `IArrowType.Name` prints
+       `decimal(9,2)` and `decimal(18,4)` identically. ⚠ A singleton like `StringType.Default` would have
+       masked it — a DECIMAL column in the probe is what exposed it.
+    2. **DuckDB DROPS a table function's declared NULLABILITY**, measured three ways (`DESCRIBE` over the
+       function, a CTAS from it, `duckdb_columns()` over that table) — all report nullable, including a
+       column declared NOT NULL. So §1.2/§3.3's source-vs-change-table split is UNASSERTABLE; the reader
+       still declares it (honest, and free — it rides the round trip that resolves the capture instance) and
+       the suite SAYS SO rather than implying coverage.
+    3. **§15.7's "the first call after an auto-enable always returns zero rows" is WRONG in an
+       already-capturing database** — there the new instance has a NULL *floor*, not a NULL watermark, so
+       the honest answer is the retry error. It holds only for the FIRST instance in a freshly CDC-enabled
+       database.
+    4. **A SURVIVING MUTANT narrowed the inverted-window branch.** A caught-up consumer produces
+       `from == to`, whose rows the exclusive SQL predicate removes — `from > to` needs an EXPLICIT
+       `ending_position` below the cursor. Gated with exactly that shape, after which the mutant dies.
+    5. A DESCRIBE of the reader's own statement works, parameters and all — which is what makes bind and
+       execute share ONE type mapping.
+  - **⚠ THE PRE-CHECK IS THE FEATURE, and mutant 1 proves it by producing the raw 313** (*"An insufficient
+    number of arguments were supplied for the procedure or function cdc.fn_cdc_get_all_changes_ ... ."* on a
+    call with THREE arguments, where the `...` is a LITERAL placeholder object name). Every bad window —
+    purged cursor, bound above the watermark, inverted, even a misspelled option — is that one
+    unattributable message, so the pre-check is the ONLY channel a user has.
+  - **⚠⚠ THE CHANGE READ RUNS POOLED — TRUE SINCE 2026-08-25, AND THIS ENTRY USED TO ASSERT IT WHEN IT WAS
+    ONLY TRUE IN AUTOCOMMIT (user-raised: *"we don't need this for cdc.changes, shouldn't we just use a
+    pooled connection?"*).** The REASONING was always right — the capture job populates a change table
+    asynchronously from COMMITTED log records, so read-your-writes buys a change reader NOTHING on any
+    connection, while pinning holds a long streaming reader on the write connection (the 595 hazard). What
+    was wrong was the FACT, and it was asserted from the ARGUMENT `readYourWrites: false` without checking
+    what `RouteScan` does with it. **MEASURED from the route log, same statement: autocommit `route=pooled`,
+    but inside a transaction that had written the source `route=pin (MARS)`** (rule 3) — and under
+    `mssql_read_isolation` with MARS off it was pinned AND DRAINED (rule 2), buffering a whole change window
+    into memory. Fixed with a `pooledOnly` route flag (RouteScan rule 1b), gated at §29h with the pinned
+    window resolution as the positive control, and mutation-tested.
+    - **⚠ IT INTRODUCES NO SELF-BLOCK HAZARD, established rather than hoped**: `DescribeQuery` already opens
+      its OWN pooled connection unconditionally, so `cdc.changes` cannot even BIND unless the change table is
+      visible to a pooled connection — a capture instance enabled in an uncommitted transaction fails there
+      first, with a sentence saying so.
+    - The WINDOW resolution deliberately goes the other way and KEEPS the pin, because a capture instance
+      enabled in this transaction IS visible to it. Both halves are in the §29h log assertions.
+    - **⚠ THE TRANSFERABLE BIT: an argument name is not a route.** `readYourWrites: false` is one input to
+      four rules, two of which pin regardless. Read `RouteScan`, or log the route, before writing down which
+      connection anything uses.
+  - **⚠ NO `ORDER BY` is emitted.** The change table's clustered index is
+    `(__$start_lsn, __$command_id, __$seqval, __$operation)`, so ordering by our 3-tuple would insert a real
+    SORT rather than ride the index, and DuckDB does not promise to preserve a table function's row order
+    anyway. `ORDER BY _position` is the documented, correct way to ask.
+  - **✅ THE `cdc.tables()` DEFECT IS FIXED** (docs §15.14/§16.7): the ALL-TABLES form of
+    `sp_cdc_help_change_data_capture` LEAKS the previous row's `index_column_list` onto a row with no index,
+    so an index-less capture instance was reported as having one. Nulled when `index_name IS NULL`; gated
+    with an indexed instance beside it as the positive control AND as what makes the mutant die (the leak
+    copies the PREVIOUS row, so the probe table is named to sort LAST).
+  - **⚠⚠ THE GATE IS `ServerProfile.SupportsCdc => !IsWarehouse`, AND IT READS THE EDITION, NOT THE
+    HOSTNAME.** That is load-bearing: Fabric SQL Database is a real SQL engine and DOES support CDC, while a
+    Fabric Warehouse / Lakehouse SQL endpoint (both edition 11) and Synapse dedicated (6) do not. A future
+    "simplification" to `!IsFabricEndpoint` would be WRONG. It must also stay a capability gate and never
+    become a try/catch probe — on a warehouse a swallowed statement failure ABORTS the transaction
+    (warehouse-support.md §6.5, the dbt 15225 defect).
+  - **⚠ THE SURFACE IS ABSENT ON A WAREHOUSE, NOT PRESENT-AND-REFUSING** — a deliberate departure from the
+    design's §0.1 (docs §13.1). Nothing is registered and the `cdc` schema is not appended, which makes
+    "never issue a CDC statement there" true BY CONSTRUCTION. What a user on those engines reads instead is
+    `supports_cdc = false` from `fabricator_server_info()`, which `verify_server_profile` asserts.
+  - **⚠⚠ FOUR MEASURED FACTS ANY FURTHER SLICE MUST NOT GET WRONG:**
+    1. With CDC not enabled, `sys.fn_cdc_get_max_lsn()` **RAISES `208 Invalid object name
+       'cdc.lsn_time_mapping'`** — it does NOT return NULL (the design's §1.6 said otherwise). Every CDC call
+       is guarded on `sys.databases.is_cdc_enabled`; the suite carries that raw 208 as its positive control.
+    2. **`fn_cdc_get_min_lsn` is transiently NULL for a newly enabled instance** while that instance's
+       `start_lsn` is already set — the floor is UNKNOWABLE, not absent. **A NULL floor must NOT be read as
+       "no lower bound"**, and do not substitute `start_lsn`. ⚠ TWO CALLS IN ONE STATEMENT CAN STRADDLE THE
+       TRANSITION — measured, 1 run in 14 — so no assertion may depend on the floor's VALUE.
+    3. **A stale cursor and a malformed call are the SAME error** (`313`), naming neither.
+    4. **`__$command_id` is ABSENT from the TVF output** (8 columns), which is what proves the 21-byte
+       resume position `(start_lsn ‖ seqval ‖ operation)` is COMPLETE.
+  - **⚠⚠ USE THE TVF, NEVER THE CHANGE TABLE, and SQL Server says so IN METADATA**: the seven cdc tables,
+    the four placeholders AND the change table are `is_ms_shipped = 1`; the generated per-instance TVFs are
+    the ONLY `is_ms_shipped = 0` objects in that schema. The TVF also VALIDATES (313) where a direct table
+    read silently returns what survived. And the reader is **marshaled C#, not a SQL rewrite** — a third
+    option (emitting `FROM db.cdc.fn_cdc_get_all_changes_x(...)`, which MEASURED as binding with full
+    pushdown) dies on §5's two-connection snapshot protocol, and the user's *"don't rely on the duckdb
+    catalog"* is the independent second reason.
+  - **⚠⚠ THE CHANGE TABLE'S SCHEMA IS NOT FROZEN, which I asserted as a reassurance and the measurement
+    inverted:** `ALTER COLUMN <type>` IS propagated, asynchronously, by the capture job
+    (`ddl_history.required_column_update = 1`); ADD/DROP are not; and a captured COLUMN **cannot be renamed
+    at all** (`Msg 4928 … because it is 'REPLICATED'`). A TABLE rename IS allowed and CDC follows it via
+    `source_object_id` — which is why an extended property may be the OWNERSHIP MARKER but never the
+    resolution. The reader FAILS LOUDLY on a type that moved between bind and execute; ⚠ that check is
+    UNGATED because no suite can arrange the race, and §15.13's open number is exactly that window's width.
+  - **⚠ THE `LEFT JOIN cdc.lsn_time_mapping` QUESTION IS SETTLED: it serves EXACTLY ONE OUTPUT COLUMN,
+    `_commit_timestamp`, so it is behind a named PARAMETER.** MEASURED: DuckDB does NOT eliminate an unused
+    LEFT JOIN, and a `PRIMARY KEY` on the right side does not change that — so "emit it always and let
+    projection pushdown prune it" would make every caller pay both scans. The default window read is ONE
+    change-table scan.
+  - **NOT COVERED, and the suites say so:** `cdc.capture_now()`'s success path and its translated 22903 (both
+    need winning a race against a live capture job), the v81 explicit-transaction gap, `health()`'s Azure SQL
+    Database and no-`VIEW SERVER STATE` branches, the reader's declared nullability (invisible from SQL), a
+    mid-statement type change, and permissions generally (the rig is `sa`).
+  - ⚠ `duckdb_functions().parameters` shows a positional argument as `col0`, not by name. Cosmetic; check
+    whether that is general to positional params before a later slice declares more of them.

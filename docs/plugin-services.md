@@ -1575,3 +1575,427 @@ an existing substring match rather than adding one.
    `IsAvailable` gave.** ⚠ The load-bearing half is what `Publish()` does NOT do: a capability the host did
    not register is simply absent, rather than present as an implementation that always throws — otherwise
    "the host cannot do this" and "the call was wrong" become the same failure.
+
+## Appendix — records moved verbatim from CLAUDE.md (2026-09-18)
+
+CLAUDE.md carried these as-built records inline until it grew to 10,776 lines — a file loaded into every
+session's context. They are moved here VERBATIM; CLAUDE.md keeps each entry's summary head plus a pointer to
+this section. The one edit made on the way: a link that pointed into the docs directory is rewritten relative
+to this directory, so it still resolves from here.
+
+- **⚠⚠ CORE PROVIDERS ARE DISCOVERED BY GLOB (`Fabricator*.dll` in the managed dir), AND THE PROVIDER
+  MANIFEST IS RETIRED UNBUILT — 2026-09-02, user-proposed ("instead of a manifest what about just listing
+  `fabricator*.dll`"). C#-only, NO ABI change, NO C++ change. Gates: hermetic **75/75 — 8497** and service
+  **53/53 — 3108**, both unchanged. Full record: [docs/plugin-services.md](plugin-services.md) §13.**
+  - **THE DEFECT BOTH WERE AIMED AT: the declared provider set was a HARDCODED C# STRING, so one fact lived
+    in two files that had to agree** — a `Publish-Project` line in `publish-managed.ps1` and a name in
+    `ProviderRegistry`. Forget either and the provider is SILENTLY ABSENT, because `Discover()` skips an
+    unloadable name on purpose. Fluid becoming a built-in hit exactly that, hours earlier. **A manifest
+    fixes it by adding a THIRD artifact; the glob fixes it by removing the SECOND — the publish IS the
+    declaration.** No format, no parser, no version, nothing to keep in step.
+  - **⚠ IT KEEPS THE WHITELIST PROPERTY, which is the only reason a list existed. MEASURED: the managed
+    directory holds 261 DLLs, EIGHT of them `Fabricator.*`** — so the glob narrows by 32× and nothing
+    reflects over the .NET runtime, the Azure SDK, Arrow or engineered-wood. ⚠ The NAME becomes CONTRACT: a
+    built-in provider assembly must be `Fabricator.*`.
+  - **⚠⚠ IT WAS ONLY SAFE AFTER THE DEFAULT STOPPED BEING POSITIONAL, and that is the part to know.**
+    `Default()` fell through to `map.Values.Distinct().First()` (Dictionary INSERTION order) and discovery
+    set `_defaultProvider` from the first provider found — which the hardcoded list's own comment had to
+    warn about. Alphabetically the glob finds `Fabricator.Bridge`'s **public `StubBackend`** first and
+    `Fabricator.AnalysisServices` next, with `Fabricator.SqlServer` LAST ⇒ it would have made `stub` or
+    `dax` the default for every call site carrying no `PROVIDER`, silently. Two fixes, both improvements on
+    their own: a NAMED `BuiltInDefaultProvider = "sqlserver"` (user: "sqlserver as default makes sense"),
+    with discovery no longer assigning `_defaultProvider` at all; and `StubBackend` excluded BY TYPE (it is
+    the hand-registered last-resort fallback, never a provider) rather than by skipping its assembly.
+  - **MEASURED with a clean environment**: `Registered providers: dax, engineeredwooddelta, sqlserver`
+    (stub correctly absent; fluid registered but filtered from the ATTACH hint by `HostsCatalog`), and an
+    `ATTACH … (TYPE fabricator)` with NO `PROVIDER` reaching SQL Server.
+  - **⚠ AND IT IS GATED, in the ONE place that can see a discovered SET: `verify_plugin_fluid`'s
+    unknown-provider control now pins the hint verbatim** (a `<REGEX>:` tightening an existing substring
+    match, so **238 assertions either way** — no floor moves). The listed order IS the glob's, alphabetical
+    by ASSEMBLY name, so the assertion also documents why the default had to be named.
+    **Mutation-tested: dropping the `StubBackend` exclusion kills it at that line after 6 pass.**
+    ⚠ It does NOT kill a glob that returns EMPTY — that falls back to the hardcoded list, which on this
+    payload names the same three; only reading the code separates those routes. ⚠ Hermetic-only, because
+    it depends on that tier's EMPTY plugin root.
+  - **⚠ `FABRICATOR_BACKEND_ASSEMBLY` still REPLACES the glob** (the narrow-the-search property a rig
+    needs): measured, `=Fabricator.SqlServer` ⇒ `sqlserver, dlrest` — built-ins narrowed to one while a
+    user PLUGIN still loads, i.e. the two mechanisms stay independent. The hardcoded list survives as a
+    FALLBACK for a host that cannot locate its managed directory. Top-level only, because the one
+    subdirectory there is the bundled PLUGIN root, which the plugin scan owns.
+  - ⇒ **`FABRICATOR_BACKEND_ASSEMBLY` IS NOW FREE TO RENAME** to `FABRICATOR_PROVIDER_ASSEMBLY`: it stays
+    an override and is no longer a list anyone edits, so the reason the rename was deferred is gone.
+
+- **⚠⚠ FLUID IS A BUILT-IN PROVIDER, NOT A PLUGIN — and `IBackend` IS NOW `IProvider`. BUILT 2026-09-02
+  (user-directed: "i find the fluid usefull so we could add it as builtin functions instead of seperate
+  plugin but leave as a seperate project?", then "interface + backendregistry"). C#-only apart from build
+  files; NO ABI change, NO C++ CODE change. Gates: hermetic 74/74 — 8259 → **75/75 — 8497**, service
+  54/54 — 3339 → **53/53 — 3108**. Full record: [docs/plugin-services.md](plugin-services.md) §12.**
+  - **⚠⚠ WHAT MOVED IT WAS A FOOTGUN, NOT TIDINESS, AND IT WAS MEASURED ON THE USER'S OWN MACHINE.**
+    `PluginPaths.ResolveRoots` RETURNS EARLY when `FABRICATOR_PLUGIN_DIR` is set, so the variable REPLACES
+    the plugin roots rather than extending them — and the bundled root's ONLY occupant was Fluid, the one
+    capability the README documents as available out of the box. With the user's real setting
+    (`FABRICATOR_PLUGIN_DIR` = their dlrest build) `fluid_render` did not exist; now both work.
+    ⚠ The replace-not-extend behaviour is CORRECT and stays (a rig that narrows the search must actually
+    get a narrow search); what was wrong is that something users expect to be present depended on it.
+  - **THE MOVE IS THREE EDITS AND THE PROJECT STAYS SEPARATE**, which is what keeps the AOT cost contained:
+    aot-bridge.md risk R2 (Parlot needs `System.Linq.Expressions`) is handled by the AOT SKU dropping one
+    entry from the provider list. `publish-managed.ps1` gains a `Publish-Project` line; the assembly is
+    APPENDED to the default `FABRICATOR_BACKEND_ASSEMBLY` list; `pack-distribution.ps1` step 2b is deleted.
+    - ⚠ **APPENDED, never prepended** — `Default()` is `map.Values.Distinct().First()`, i.e. insertion
+      order, and Fluid declares a provider name while hosting no catalog.
+    - ⚠ **NOTHING ELSE REFERENCES `Fabricator.FluidPlugin`** (unlike `Fabricator.Delta`, which rides in on
+      SqlServer's publish), so without that publish line the assembly is ABSENT and both functions vanish
+      with no error anywhere — `Discover()` skips an unloadable name on purpose. The one silent regression.
+  - **`HostsCatalog` (a DIM defaulting to `true`, checked in `ProviderRegistry.Resolve`) exists because
+    `IProvider` is the ONLY surface that can contribute a global function** — so a template engine must
+    present as a provider and implement `OpenCatalog`/`BuildConnectionString` as throws. Declaring `false`
+    changes WHERE the failure happens: `ATTACH … PROVIDER 'fluid'` now says *"hosts no catalog and cannot be
+    ATTACHed — it contributes global functions only"* instead of failing inside `OpenCatalog` and surfacing
+    as *"MSSQL connection validation failed"*, a connection error naming the wrong subsystem.
+    ⚠ Every `Resolve` caller wants a catalog, which makes it the right funnel; the unknown-provider hint now
+    lists only ATTACHABLE providers. ⚠ Defaulting to `true` is deliberate — a `false` default would make a
+    provider that forgot to override it unattachable, a silent removal. ⚠ The C++ ATTACH wrapper still nests
+    it in `MSSQL connection validation failed: {…}`; that envelope is a pre-existing wart.
+  - **⚠⚠ THE CLOSURE FIXTURE, because Fluid was the ONLY proof and it stopped being a plugin.**
+    `Fabricator.SamplePlugin` is pure IL, so "any successful render IS the closure resolving" was the only
+    thing gating a plugin's private dependency shipping beside it — and `pack-distribution`'s "more than one
+    assembly" assertion went with the bundling. `Fabricator.SamplePlugin.Support` is a SIBLING PROJECT (not
+    a NuGet package: that would add a supply-chain surface to a test asset, a second version to align with
+    the host's Arrow, and it would have to be one the host does NOT ship or the scan skips it as `shared`).
+    - **⚠⚠ THE MARKER IS A METHOD, NOT A `const` — that IS the fixture.** C# bakes a `const` into the
+      CALLER's IL, so the plugin would answer correctly with the support assembly ABSENT and the test would
+      pass while proving nothing: the exact failure mode it exists to detect.
+    - **⚠ It found a second defect: the plugin ARCHIVE carried one hard-coded file**, so
+      `fabricator_install_plugin` would have installed a plugin that could not run. Payload computed from
+      `ReferenceCopyLocalPaths` now; `verify_plugin_install` pins `files = 2`.
+    - ⚠ A blanket *"nothing was rejected"* assertion FAILED on a dev machine — a stale `publish/` subdir
+      holds a second copy of the plugin and is correctly refused as a name collision. That asserts a
+      property of the DIRECTORY, not the code; scoped to the support assembly instead.
+  - **THE RENAME: `IBackend` → `IProvider`, `IBackendCatalog` → `IProviderCatalog`, `BackendRegistry` →
+    `ProviderRegistry`, `RegisterBackendsFrom` → `RegisterProvidersFrom`. 196 occurrences over 52 files;
+    `FABRICATOR_BACKEND_ASSEMBLY` DELIBERATELY UNCHANGED** (the manifest work might have redefined it —
+    superseded hours later by the glob entry above, which frees the rename). Concrete class names STAY (`SqlServerBackend`, `DeltaBackend`,
+    `StubBackend`) — the `*TableDefinition` precedent.
+    - **⚠ `IPlugin` was considered and REJECTED for a concrete reason**: "plugin" already means the
+      DISTRIBUTION unit here, and `RegisterProvidersFrom` loops over EVERY type in an assembly, so one
+      plugin can contain several providers — `IPlugin` would make "how many plugins are in this plugin?" a
+      real question. ⇒ **the model that survives is the user's own: a plugin is a distribution; it contains
+      one or more providers; providers are either DECLARED (core) or DISCOVERED (user-installed).**
+    - Masking check: **0 unpaired lines across the 43 files the rename ALONE touched.** ⚠ The other 9 could
+      not be checked in isolation because the rename landed on top of uncommitted Fluid work — a sequencing
+      error against this repo's own rule; splitting afterwards would have produced a non-compiling
+      intermediate commit, the shared set including `ProviderRegistry.cs` itself.
+  - **⚠⚠ AND IT DEMONSTRATED CONTRACT SKEW LIVE, which is worth more than the rename.** Mid-work the
+    service tier failed with `plug_greet does not exist`: the sample plugin had been rebuilt against
+    `IProvider` while the PAYLOAD still declared `IBackend`. The report named it —
+    `ReflectionTypeLoadException: Could not load type 'Fabricator.Bridge.IProvider' from assembly
+    'Fabricator.Abstractions, Version=1.0.0.0'` — i.e. §11.2's reasoning HAPPENING: a simple-name match at
+    identical `AssemblyVersion`, failing on a member that moved. Had the version floated it would have been
+    a `FileLoadException` naming a VERSION instead of the absent type, which is the worse error.
+    ⚠ It is exactly what the three out-of-tree plugins hit the moment they repin.
+
+- **⚠⚠ THE PLUGIN SERVICE LOCATOR — STEP 1 BUILT 2026-09-02 (user-directed: "i am fine for an easy solution
+  with `GetService<T>()` which works for the duckdb filesystem,http and host query/exec"). C#-only, NO ABI
+  change, NO C++ change, BREAKING for out-of-tree plugins. **BOTH STEPS ARE NOW BUILT** — step 2
+  (`Fabricator.Common`), §7.4a's `IHostLog` and the NuGet packaging on the same day. Full record:
+  [docs/plugin-services.md](plugin-services.md) §7 (the plan) + §8 (the locator) + §9 (Common) + §10
+  (`IHostLog`) + §11 (versioning + packages), the last four all as built.**
+  Gate `verify_plugin` 97 → **112**; `verify_plugin_fluid` **188** and `verify_http_transport` **21** both
+  UNCHANGED, which is the behaviour-neutrality claim for the two capabilities that already had callers;
+  hermetic **74/74 — 8259** (IDENTICAL to the previous floor) and service **54/54 — 3272** = 3257 + exactly
+  this suite's 15, which is what shows no other suite moved. ONE mutant, killed at its own assertion.
+  - `FabricatorServices` (Abstractions) — `Register<T>` / `Get<T>` / `GetRequired<T>` / `IsAvailable<T>` over
+    a `ConcurrentDictionary`, plus `Provider` as a BCL `System.IServiceProvider`. Three interfaces
+    (`IHostFileSystem` / `IHostHttp` / `IHostQuery`), three Bridge implementations, published by
+    `HostServices.Publish()` at boot. **`HostHttpTransport` and `HostQueryTransport` are DELETED** — no
+    aliases, the `IArrow*` precedent.
+  - **✅ `GetService<T>()` / `GetRequiredService<T>()` OVER `IServiceProvider` SHIPPED (same day,
+    user-asked) — `FabricatorServiceProviderExtensions`, two extension methods, no new dependency. §8.5.**
+    `FabricatorServices.Get<T>()` stays the primary API; these serve the case the locator was shaped around,
+    handing `Provider` to code that wants an `IServiceProvider`.
+    - **⚠⚠ THE NAMES ARE DELIBERATELY MEDI's, so a plugin referencing MEDI too sees an AMBIGUITY (CS0121)
+      if it imports both namespaces — and that is the right trade AND the right failure mode.** Familiarity
+      is the only thing MEDI was ever wanted for here; a plugin that references MEDI already HAS these
+      methods, so ours are redundant for it; and a COMPILE error with a one-line fix beats a second
+      vocabulary nobody knows. Never a silent wrong resolution.
+    - ⚠ MEASURED that it reaches no in-tree project (all seven assemblies, zero errors) and the reason is
+      CHECKED rather than inferred: **no file in `dotnet/` imports
+      `Microsoft.Extensions.DependencyInjection` at all**. ⚠ MEDI IS in the published payload transitively,
+      so the collision becomes reachable the day someone imports it.
+    - **⚠ GATED BY CONSTRUCTION, WITH NO NEW ASSERTION: the sample plugin's two service-backed scalars now
+      resolve by DIFFERENT routes** — `plug_read_file` via `FabricatorServices.GetRequired<T>()`,
+      `plug_glob_count` via `Provider.GetRequiredService<T>()` — so each existing assertion gates one route.
+      Mutation-tested: an extension that resolves nothing kills `plug_glob_count` AFTER both
+      `plug_read_file` assertions pass, which is what shows the routes are independent. `verify_plugin`
+      stays at **112**; a count that does not move is the honest outcome for a change that adds no answer.
+  - **⚠ IT IS A LOCATOR AND THE CONTRACT IS THE BCL `IServiceProvider`, both settled by measurement rather
+    than taste** (§3.4): a plugin is discovered by reflection and instantiated PARAMETERLESS, so constructor
+    injection would change the discovery contract and every out-of-tree plugin's constructor; and a BUILT
+    MEDI provider is IMMUTABLE where `BackendRegistry.Invalidate()` re-scans, which is what makes
+    `fabricator_install_plugin` usable in the session that installs. Injection can be added on top later; it
+    cannot be un-added.
+  - **⚠⚠ `IHostFileSystem` SHIPPED, AND WHAT DECIDED IT WAS ABI v82 — the plan had left it open for want of
+    a gate.** Slice 4 of the Fluid work built a `HostFileTransport` to exactly the HTTP seam's shape and the
+    first include died with **`0xC0000005`** inside `HostFs.OpenRead`, because every `fs_*` host callback
+    dereferences the calling operator's `ClientContext` and a GLOBAL function had none. v82 gives the scalar
+    crossings `(opener, session, txn)` ⇒ the gate is **`plug_read_file` / `plug_glob_count` in
+    `Fabricator.SamplePlugin`**, and it is **the FIRST in-tree proof that the v82 ambient reaches a PLUGIN**.
+    "A plugin reads a file through DuckDB's own filesystem" is a claim about two mechanisms at once and
+    neither had a test before.
+    - ⚠ What the gate does NOT cover, and the suite says so: the interesting half of routing through the
+      host is that the same call reaches `s3://` or `abfss://` with the CALLING SESSION's secrets, and no
+      hermetic fixture has a remote root.
+    - **⚠ `read_blob` through `IHostQuery` STAYS the better tool where ABSENCE is an ordinary outcome** (zero
+      rows rather than a throw, plus `size` and `last_modified`), so the Fluid template provider was
+      deliberately NOT switched onto the filesystem now that one exists — fluid-templating.md §10.3 has all
+      four measured reasons. `IHostFileSystem` is for a path you expect to exist.
+  - **✅ `IHostQuery.ExecuteNonQuery` IS GATED — the Fluid `exec()` is its first caller** (see the entry
+    below). It was ungated for a few hours, which §8.2a records.
+  - **✅ MUTATION-TESTED, AND THE MESSAGE WAS PREDICTED BEFORE THE RUN: pass `0` instead of
+    `AmbientOpener.Current` in `HostFileSystemService.ReadAllBytes` ⇒ dies at line 519, the FIRST
+    `plug_read_file` assertion, after 100 pass, with `fs_open_read requires a client context (no ambient
+    opener)`.** So the gate does not merely read a file, it reads it THROUGH THE CALLER'S `ClientContext` —
+    which is what makes it a proof about v82 rather than a coincidence. ⚠ Both legs published to a SCRATCH
+    `-ExtensionDir`, leaving the tier-measured payload untouched (the shared `build/release` payload is
+    contended). ⚠ It also gives the same-day `fs_*` null-opener guard its FIRST demonstrated reachable path —
+    still ungated in normal operation, but shown converting an access violation into a sentence.
+  - **⚠ A DIAGNOSIS ERROR WORTH KEEPING (user-corrected: "Visual Studio is currently running an update in
+    the background").** Publishing failed for an hour with `NETSDK1045: … does not support targeting .NET
+    10.0`; the observations were right (only 9.x SDKs, no 10.x in `host/fxr`, `sdk/10.0.203` an empty
+    leftover) and I wrote the cause down as *"the .NET 10 SDK was UNINSTALLED"*, which implies somebody must
+    reinstall it. It was a VS update caught between removing 10.0.203 and installing **10.0.400**.
+    ⇒ **a build environment that changes UNDER a session is more likely mid-UPDATE than mid-uninstall, and
+    the two call for opposite responses** (wait vs escalate). The tell was in my own output: an "uninstall"
+    that leaves a version-numbered `Roslyn` folder behind is a partially completed REPLACEMENT.
+    - **⚠ THE SDK MOVE IS NOT MEASUREMENT-NEUTRAL and the tiers were NOT re-run on it.** Both tiers were
+      measured on a **10.0.203** payload; the mutation control on a **10.0.400** payload answers the same
+      `verify_plugin` 112, which is ONE SUITE, not a tier. ⚠ `build/release`'s payload is therefore built by
+      an SDK no longer on the machine — deliberately left that way so the committed evidence and the payload
+      match. The next publish will differ.
+    - **⚠⚠ THE SAME UPDATE MOVED THE MSVC TOOLSET (`14.50.35717` → `14.51.36231`, old one GONE), so the
+      existing `build/release` tree can no longer build C++.** See the build-and-test traps for the one-line
+      pre-build check; it is invisible to a C#-only change and waits for the next session that touches the
+      extension.
+  - **FOUR THINGS BUILDING IT ESTABLISHED:** (1) `HostFs` had no read-all, so one was added THERE (the
+    unsafe wrapper class is its home), checking the ceiling against the file's SIZE **before** reading and
+    FAILING rather than truncating; (2) **⚠ `Array.Empty<byte>()` DOES NOT COMPILE inside
+    `Fabricator.Bridge`** — `Apache.Arrow.Array` and `System.Array` are both in scope (CS0104); (3)
+    `Publish()` registers only what the host supports, so `GetRequired<T>()` names the interface and *"the
+    host cannot do this"* stays distinguishable from *"the call was wrong"*; (4) the glob JSON is parsed in
+    the BRIDGE, so a plugin gets `HostFileEntry` and never the host's wire format — ⚠ `Size` is **-1** when
+    the listing carries none, NOT 0, because a local filesystem reports no size (DuckDB's `FileSystem` has
+    no path-stat) and a 0 would read as "empty file".
+  - **⚠ THE FRAMING THAT MADE THE DESIGN RIGHT, worth keeping: the constraint was WEIGHT, not visibility.**
+    `ArrowValueReader`, `Host`, `AmbientOpener`, `InterruptScope`, `FabricatorLog`, `MemoryProbe` are ALL
+    ALREADY `public` in `Fabricator.Bridge` — a plugin cannot use them because it does not REFERENCE Bridge,
+    and it does not because that drags Azure.Storage.Files.DataLake + Azure.Identity + Microsoft.Fabric.Api
+    into every plugin build. ⇒ interfaces in Abstractions, implementations in Bridge, resolution by
+    interface. **And the corollary that decides step 2: a capability needing NO host state is a LIBRARY, not
+    a service** — it should be code a plugin REFERENCES, which is what `Fabricator.Common` is for.
+  - **⚠ CROSS-PLUGIN IS OUT OF SCOPE BY DECISION (user): "plugin->plugin is the exception and creating a
+    shared assembly is the better solution"** — the plugins ship their own shared assembly, the host ships
+    nothing new. The hard part there was never the locator, it is TYPE IDENTITY (§3.3): a structurally
+    identical interface from a second copy is a DIFFERENT dictionary key and resolution simply misses.
+  - **⚠ `FormatError`'s `GetProperty("Number")` duck-type is a DIFFERENT problem** with an answer already
+    designed (`IBackend.GetErrorNumber` DIM, docs/aot-bridge.md). Do not conflate it with this.
+  - **✅ STEP 2 — `Fabricator.Common` — BUILT 2026-09-02 (C#-only, no ABI, no C++). Nine files left Bridge:
+    eight to a new `Fabricator.Common`, `ObjectNotFoundException` to ABSTRACTIONS. COMPILE COST ZERO (0
+    errors, the same 8 pre-existing warnings). Full record: §9.** `Fabricator.Common` references Abstractions
+    and NOTHING else, keeps the `Fabricator.Bridge` NAMESPACE (so not one `using` moved), and reaches the
+    payload with **no `publish-managed.ps1` line** — a ProjectReference is transitive, which is also why the
+    four in-tree providers needed no edit at all.
+    - **⚠⚠ THE PLAN PREDICTED "a batch of visibility errors" AND THERE WERE NONE — the cheap pre-flight
+      check for any future carve-out is the reason.** All eight movers were **already `public`**, because
+      `Fabricator.SqlServer`/`.Delta`/`.DeltaRs`/`.AnalysisServices` are separate assemblies and had been
+      using them for months. ⇒ the "13 newly public types widen a contract with no version number" cost is
+      about **one thirteenth** of what §7.4a priced: the only genuinely new public surface is ONE METHOD
+      (`ArrowValueReader.ReadTimestamp`). **Grep the candidates' visibility and their existing cross-assembly
+      users before pricing a move.**
+    - **⚠ FOUR OF THE THIRTEEN DID NOT MOVE, and the question that decided three of them generalises: is
+      this called BY a provider, or called ON a provider's declaration?** `AggregateSession` moved because a
+      provider's `AggOpen` returns one; `SqlGen` did NOT, because the host calls it on the declaration during
+      `bind_replace` and a provider never calls it. Also staying: `ChannelArrowStream` (internal bulk-write
+      machinery), `DescribedArrowStream` (exists only for the host's bind-vs-scan split), `SqlDdl` (a signal
+      the HOST acts on).
+    - **⚠⚠ THE ACCEPTANCE TEST HAD TO BE RE-DERIVED — ITS TARGET NO LONGER EXISTED, AND ITS SUCCESSOR IS NOT
+      SUBSTITUTABLE.** §7.4 said "delete the FluidPlugin's local `ArrowScalar.Read` duplicate". There is no
+      `ArrowScalar` any more: it grew into `FluidValueModel.ReadCell`, a **documented SUPERSET** differing
+      from `ArrowValueReader.ReadScalar` on floats (the decimal ladder), blobs (hex not `byte[]`), dates (the
+      `DateTimeKind.Utc` stamp) and every nested type — and **three of those four are GATED**, the date one
+      being the renders-the-previous-day fix. ⇒ **a test written as "delete the duplicate" can age into
+      "delete the fix".**
+      - **What shipped instead is `ReadTimestamp`, and it is the better target on the merits**: a
+        character-for-character copy including the two explicit `(object)` casts that fix a defect which
+        **shipped for four months**. Now `ArrowValueReader.ReadTimestamp` (public for exactly this caller),
+        reached through a Common reference **with NO Bridge reference added** — the property the test exists
+        to check. ⚠ **Of the two duplicates in that file the one worth removing was the one that looked least
+        urgent: the size of a duplicate says nothing about the cost of its divergence.**
+      - ⚠ `Private="false"` verified by MEASUREMENT, not by reading the csproj: `build/plugins/fluid/` still
+        holds exactly its previous seven DLLs and the archive still ships seven.
+      - ⚠ NOT done, deliberately: no consumer manufactured in `Fabricator.SamplePlugin` — it casts to the
+        concrete Arrow array type, which is correct for a typed signature, and routing that through
+        `ArrowValueReader` would box every value for nothing.
+    - **⚠⚠ §7.4a's "13 → 16" IS MEASURED WRONG ON TWO OF THE THREE, AND ITS OWN CAVEAT IS WHAT SHOWED IT
+      ("`DbDataReaderArrowStream` also takes an `InterruptScope`, so check that before counting it in").
+      The real number is 13 → 14.** `InterruptScope` calls `HostFs.CanInterrupt`/`IsInterrupted`, so it can
+      never leave Bridge ⇒ `DbDataReaderArrowStream` is blocked TRANSITIVELY; and `SingleScanArrowStream`
+      shares its FILE with a `Host.Query` caller (and is internal Bridge machinery either way). Only
+      `MemoryProbe` becomes movable.
+      - ⇒ **`IHostLog`'s justification is NOT "it unblocks the deferred three" — it is the CAPABILITY**: a
+        plugin has no way to log anywhere a user can see, because `duckdb_logs` is reached through the
+        `host_log` ABI callback. Decide it on that, not on a migration argument that did not survive contact.
+        (Its `IsEnabled(level)` requirement stands unchanged and IS in the shipped interface.)
+      - ⚠ **A closure check must be TRANSITIVE.** §7.4a's rule was "a file needing a Bridge internal cannot
+        move"; the real rule is "a file needing a type that needs a Bridge internal cannot move either", and
+        a one-level scan reports `DbDataReaderArrowStream` as clean.
+    - **⚠ What no test can see: WHERE a type lives.** Both tiers can only show the move broke nothing — the
+      masking check is what proves it was a move, and **git itself asserts it** (`git diff -M --numstat`
+      reports **8 of the 9 files as 0-changed-line renames**; the ninth is `ArrowValueReader.cs`, whose whole
+      diff is `private`→`public` plus five doc lines). What proves the move ACHIEVED something is the
+      deletion above plus the FluidPlugin's csproj having two ProjectReferences rather than three.
+    - The decisions §7.4a settled and the build kept: **the registry stays in ABSTRACTIONS** (Common must
+      remain optional, so it cannot be needed to resolve a host service); **`DuckSql`/`DuckDbHttpHandler`
+      stay in Abstractions** (user: "doesn't matter today"); **`ObjectNotFoundException` goes to
+      ABSTRACTIONS** — every provider is REQUIRED to throw it, so it is contract, not convenience.
+    - **⚠⚠ "make Bridge's internals visible in Common" IS IMPOSSIBLE, not merely unnecessary.** Bridge
+      references Common, so a reference back is a project CYCLE, and `InternalsVisibleTo` only grants access
+      to code that already HAS a reference. ⇒ **that impossibility IS the membership rule** — a type needing
+      the running host does not move, it becomes a SERVICE.
+  - **✅ `IHostLog` — §7.4a's THIRD QUESTION, BUILT 2026-09-02 (C#-only, no ABI, no C++). Gate
+    `verify_plugin` 112 → **133**, three mutants each killed at its own assertion — and a FOURTH that
+    SURVIVED and corrected the code. Service **54/54 — 3339** (3318 + exactly this suite's 21, so no other
+    suite moved); hermetic **74/74 — 8259** unchanged, that tier's plugin root being an EMPTY directory on
+    purpose. Full record: §10.** ⚠ **Nothing user-visible ships** — `plug_log` is in
+    `Fabricator.SamplePlugin`, a test fixture (`pack-distribution.ps1` bundles only Fluid), so the README
+    owes nothing; `IHostLog` is a plugin-AUTHOR surface. `IHostLog.GetLogger(category)` →
+    `IHostLogger.IsEnabled(level)` / `.Log(level, message)`, over `FabricatorLog`. It is what lets a plugin
+    reach `duckdb_logs` at all — the route runs through the `host_log` reverse callback, and a plugin cannot
+    reference `FabricatorLog` because its whole surface is MEL.
+    - **⚠ BUILT ON THE CAPABILITY ARGUMENT, NOT THE MIGRATION ONE** — §9.5 measured the "it unblocks the
+      deferred three" half false. `MemoryProbe` was deliberately NOT moved with it: it is a diagnostic for
+      OUR heavy paths, so moving it would be motion to demonstrate the interface rather than to serve anyone.
+    - **⚠⚠ IT EXPOSES `IsEnabled(level)`, WHICH WAS THE NON-NEGOTIABLE PART.** `MemoryProbe` gates every
+      mark on it and this file records that it MUST stay that way (`Environment.WorkingSet` queries OS
+      counters, and some marks sit in per-group loops); a log-only interface would force losing the gate or
+      computing eagerly. **That constraint is also what made it a FACTORY rather than one
+      `Log(category, level, message)` method**: the category is fixed per call site while the level check
+      happens per event, often in a per-batch loop, so a one-method interface would re-resolve the category
+      every time and make the cheap gate look expensive enough to skip. ⚠ Formatting moves caller-side and
+      loses nothing — both sinks are message-string based already.
+    - **⚠ REGISTERED UNCONDITIONALLY, unlike the other three services.** There is no capability to test:
+      `FabricatorLog` always has somewhere to put an event, and `duckdb_logs` is an ADDITIONAL sink rather
+      than a precondition. So a plugin can always log; it may log into the void, which is what the host's own
+      categories get too.
+    - **⚠⚠ `IsEnabled` IS A REAL ANSWER AND THE PAIR IS Trace/Debug — MEASURED.** `debug` ⇒ true, `trace` ⇒
+      **false**, because `EnableHostForwarding` promotes a `NullLoggerFactory` to one whose minimum is Debug.
+      Without that pair the boolean would be worthless (a build returning constant `true` passes everything
+      else — mutant B is exactly that). ⚠ It is the ONE assertion a developer's own environment can move:
+      `FABRICATOR_LOG_LEVEL=trace` makes it answer true. Neither CI tier sets that variable.
+    - **⚠⚠ TWO `duckdb_logs` COLUMNS CARRY WHAT THE MESSAGE CANNOT — MEASURED: `log_level` is `WARNING`
+      (not `WARN`) and `type` is the CATEGORY (`Fabricator.SamplePlugin`).** A level mapping that slipped by
+      one still delivers every message, so only `log_level` can see it; and `type` is what makes a plugin's
+      output attributable rather than lost among `QueryLog` / `Fabricator.Bridge`.
+    - **⚠⚠ AND `duckdb_logs` IS EMPTY IN THE SHELL UNLESS YOU `SET logging_storage = 'memory'` — worth
+      knowing for ANY future probe.** The default storage is stdout, so `duckdb.exe` PRINTS every event
+      (which looks like success) while `SELECT count(*) FROM duckdb_logs` answers **0**. `unittest` needs no
+      such setting. A probe in the wrong environment reads as "the service does not work".
+    - **⚠⚠ THE FOURTH MUTANT SURVIVED AND THAT IS THE MOST USEFUL RESULT: a defensive mechanism justified by
+      a hazard nobody measured is indistinguishable from a necessary one until you delete it.** `Log` shipped
+      for an hour as `Log(_log, level, "{Message}", message)`, on the theory that braces in a message would
+      otherwise be mangled. Removing the indirection passes all 133 assertions — MEL builds a format parser
+      only when the argument array is NON-EMPTY, so a zero-argument call returns the string untouched. The
+      code was simplified to match the measurement, and the braces assertion is relabelled a CHARACTERIZATION
+      test of MEL that no mutant of ours can kill.
+  - **✅ VERSIONING + NuGet PACKAGES — BUILT 2026-09-02 (user-directed: "i think a nuget is a good idea. it
+    could just be an local artifacts folder for the moment"). C# + build files, NO ABI change and NO C++
+    CODE change — two CMake files now READ a version they used to state. Gate: tier-0
+    `Fabricator.Bridge.Tests` **244 → 249**, two mutants. Full record: §11.**
+    - **⚠⚠ THE VERSION LIVES IN `./VERSION` AND NOWHERE ELSE, AND THAT IS A FIX RATHER THAN NEW MACHINERY.**
+      It was TWO literals (`CMakeLists.txt`'s `FABRICATOR_EXTENSION_VERSION`, `extension_config.cmake`'s
+      `EXTENSION_VERSION`) and this file recorded that bumping both is easy to miss — while the prose
+      tracking the number went stale FOUR times. The managed side needed the same number, so a third literal
+      would have made a known problem worse; all three read the file instead. ⚠ `CMAKE_CURRENT_LIST_DIR`,
+      NOT `CMAKE_CURRENT_SOURCE_DIR` — both files are processed from DuckDB's build. **VERIFIED IN
+      `build.ninja`** (`FABRICATOR_VERSION=\"0.0.13\"` and `EXTENSION_VERSION="0.0.13"`), which a CONFIGURE
+      was enough to establish — no full build needed.
+    - **⚠⚠ `AssemblyVersion` IS PINNED AT `1.0.0.0` AND MUST STAY THERE.** `<Version>` alone would drive it
+      too, moving the contract's ASSEMBLY IDENTITY every release — and the loader was read before deciding:
+      the plugin scan skips a host assembly by SIMPLE NAME, `InstallPluginResolver` probes by simple name,
+      and `Fabricator.Abstractions` is already loaded in the bridge's ALC before any plugin is scanned. ⇒
+      **the running host's copy always wins whatever a plugin compiled against**, and letting the version
+      float risks trading that for a `FileLoadException` at load — a WORSE failure, because it names a
+      version instead of the member that is absent. What moves is `InformationalVersion` / `PackageVersion`,
+      which are DIAGNOSTIC: **skew stays REPORTABLE without becoming ENFORCED.**
+      - ⚠ `FabricatorVersion.Contract` (Abstractions, public) TRIMS at the `+`: the SDK appends the commit
+        sha, and a manifest written from another checkout would carry a different one for the same contract.
+    - **⚠⚠ TWO EXTERNAL FACTS, BOTH CHECKED RATHER THAN RECALLED, and each decides a rung of the ladder.**
+      (1) `Fabricator.Abstractions` is FREE on nuget.org but **the bare `Fabricator` ID is TAKEN** by an
+      unrelated package (0.3.2–0.5.0), so a `Fabricator.*` PREFIX RESERVATION is unlikely — publishing
+      unreserved works, or use a distinct prefix; **neither binds until something is published there**, which
+      is why the ID decision is deferred rather than made. (2) **GitHub Packages requires a token to install
+      even PUBLIC packages** (their own docs: *"You need an access token to publish, install, and delete
+      private, internal, and public packages"*) ⇒ it looks like a public feed and is not one. Ladder: local
+      `artifacts/` (**done**) → attach the `.nupkg` to the GitHub Release `distribution.yml` already drafts
+      (**done, §11.9**) → nuget.org when a third party needs it (**not done**).
+    - **⚠ THE RELEASE RUNG NEEDED ITS OWN JOB, AND THE NARROWING OF A GLOB IT WOULD OTHERWISE HAVE BROKEN.**
+      The packages are platform-INDEPENDENT, so packing them inside the (platform × SKU) matrix would
+      produce FOUR identical artifacts whose upload names collide — the same hazard that matrix already had
+      to solve for the ZIPs. And `release` looped `artifacts/*/` while ERRORING on any directory without a
+      `fabricator.duckdb_extension`, so the new `nuget-packages/` artifact would have failed the RELEASE job
+      rather than the new one; it globs `artifacts/fabricator-*/` now. ⚠ **NO SUBMODULES** in that job
+      (Abstractions needs only Apache.Arrow) — worth preserving rather than an optimisation: **a package
+      that needed a submodule would be one a plugin author could not reproduce.**
+      ⚠ **UNVERIFIED IN CI and it cannot be verified from here** — the YAML parses, the job graph is right,
+      and the script runs on Windows with no Windows-only constructs, but the job runs only on a dispatch or
+      a tag push. **The first dispatch is the test.**
+    - **⚠ THE SKEW REPORT REPORTS AND DOES NOT GATE, and refusing would be a STRICTER rule than the
+      runtime's own.** `PluginPackage.ContractSkew(declared, running)` appends a note to the install row's
+      `detail`. Nothing binds on the number, so a skewed plugin loads and fails only on a member it uses that
+      moved — while the version now moves EVERY release, most of which change nothing a given plugin touches,
+      so a gate would refuse working plugins. ⚠ ABSENT says NOTHING, not "unknown" (the field is optional and
+      every older archive has none); an empty RUNNING version is silent too, since that is OUR build being
+      wrong and reporting the plugin would blame the wrong side.
+      - **⚠⚠ IT RETIRED A JUSTIFICATION, NOT A DECISION — the distinction is the point.** `PluginPackage`'s
+        doc said the field was ungated because *"nothing in this repo versions `Fabricator.Abstractions` …
+        so a comparison would either pass always or fail always"*. That reason is now FALSE and the
+        conclusion is unchanged, for a better reason. Both the class doc and the tier-0 test's summary were
+        rewritten: **a stale justification for a live decision is how the decision gets reversed by someone
+        reading it.**
+      - **⚠ IT IS TIER-0-TESTABLE ONLY BECAUSE IT IS A PURE FUNCTION TAKING BOTH VERSIONS.** Written first
+        inside `PluginInstall` reading `FabricatorVersion.Contract` directly, it was untestable offline — an
+        install test can produce only the "equal" outcome, the fixture being built from this same tree.
+        Moving it to `PluginPackage` ("the decidable half … deliberately free of file I/O") pinned all three.
+      - ⚠ `verify_plugin_install` CANNOT see any of this and its count is unchanged: manifest and host both
+        say `0.0.13`, so the note is correctly silent.
+    - **⚠ `dotnet pack` ON A PROJECT WHOSE `IsPackable` IS FALSE SUCCEEDS AND EMITS NOTHING**, so
+      `scripts/pack-nuget.ps1` ASSERTS the `.nupkg` exists rather than trusting the exit code. `IsPackable`
+      is false for the whole `dotnet/` folder; only Abstractions and Common opt back in.
+    - Both packages carry **net10.0 + net8.0** (a net8.0-only plugin resolves), `Common → Abstractions` is a
+      real package dependency, and **`Apache.Arrow`'s version becomes NuGet's problem** instead of a comment
+      in each plugin's csproj saying "must track Abstractions' (23.0.0)".
+    - **✅ THE CONSUMING SIDE IS PROVEN (§11.8) — and it CORRECTED my migration note in BOTH directions.** A
+      throwaway net8.0 project with a `nuget.config` naming `artifacts/` and ONE
+      `PackageReference Include="Fabricator.Common"` restores and compiles against `FabricatorVersion`,
+      `ArrowValueReader`, `FabricatorServices` and Arrow types — so a plugin really can build with no
+      checkout of this repo. What I got wrong, measured over three builds: (1) *"a package reference copies
+      to output by DEFAULT"* is **FALSE for a library** — neither form copies; it is
+      `CopyLocalLockFileAssemblies=true`, which every plugin sets to get its OWN deps, that makes the
+      contract copy too; (2) `ExcludeAssets="runtime"` on the **top-level** package suppresses the **WHOLE
+      transitive closure** (Abstractions + Apache.Arrow + Apache.Arrow.Scalars) — the OPPOSITE of the
+      FluidPlugin's recorded *"ExcludeAssets does not flow to a transitive dependency"*, and **both are
+      true**: there Apache.Arrow arrives through a PROJECT reference, which a PackageReference's
+      ExcludeAssets does not govern. ⇒ **package-rooted and project-rooted closures behave differently, and
+      the migration crosses from one to the other — so it gets SIMPLER, one attribute replacing the pair.**
+      ⚠ **The sustainalytics edit is BLOCKED on rung 3, and the reason is not effort (§11.10).** (a) A LOCAL
+      folder feed is LESS reproducible than the submodule it replaces — that repo builds today after one
+      documented `git submodule update --init`, whereas a `PackageReference` resolved from `artifacts/`
+      makes anyone else clone THIS repo anyway AND run `pack-nuget.ps1`. (b) It would bundle a MECHANISM
+      change with a CONTRACT upgrade: that plugin pins `6897c8c` (2026-08-29), predating the locator,
+      Common, `IHostLog` and the BREAKING transport deletion, so a failure could be either — which is why
+      the EW pin bump and the SqlServer fix were deliberately two commits. ⇒ **publish a release carrying
+      the packages → repin onto the new contract as its own change → then swap the reference.** ⚠ That repo
+      has NO CI, so nothing would break loudly; the argument has to be made deliberately rather than
+      discovered by a red build.
+  - ⚠ **BREAKING for the three out-of-tree plugins** (`fabricator-sustainalytics`, `-quantax`, `-dlrest`):
+    `HostHttpTransport.Send` / `HostQueryTransport.Query` are gone. They pin by sha and migrate at their
+    next bump.

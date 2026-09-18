@@ -572,3 +572,157 @@ in 49 s, which it had never been.
 - **Auto-detect vs explicit-only** for the connection mode: recommend auto from the profile with an
   explicit override.
 - **Collation guidance** to publish in the README for OneLake users (the §4 trade-off).
+
+## Appendix — records moved verbatim from CLAUDE.md (2026-09-18)
+
+CLAUDE.md carried these as-built records inline until it grew to 10,776 lines — a file loaded into every
+session's context. They are moved here VERBATIM; CLAUDE.md keeps each entry's summary head plus a pointer to
+this section. The one edit made on the way: a link that pointed into the docs directory is rewritten relative
+to this directory, so it still resolves from here.
+
+- **⚠⚠ CATALOG DISCOVERY ENUMERATED SCHEMAS IT HAD ALREADY EXCLUDED — ✅ FIXED 2026-08-25 (C#-only, no ABI).
+  It made FULL ENUMERATION IMPOSSIBLE on Fabric Warehouse, and therefore every dbt run there, for sixteen
+  days. Gate `verify_catalog_filter` 7 → 16 (service), mutation-tested.** User-prompted: *"can we somehow
+  catch this IO Error … 'managed_delta_table_forks' is not supported"*.
+  - **THE DEFECT IS ONE POLICY WRITTEN TWICE WITH ONE COPY INCOMPLETE.** `SchemasSql` has always excluded
+    the system schemas and the fixed database roles (`sys`, `INFORMATION_SCHEMA`, `guest`, `db_owner`, …);
+    `TablesSql` joined `sys.tables`/`sys.views` to `sys.schemas` **with no `WHERE` at all**, one line below
+    it. So objects were listed in schemas discovery never returned. Both now share ONE `ExcludedSchemas`
+    constant, which is the actual fix — the previous shape could drift again by construction.
+  - **⚠⚠ IT DID NOT MERELY ADD ORPHAN ENTRIES — IT RESURRECTED THE EXCLUDED SCHEMA.** MEASURED on box: a
+    view created in `guest` came back in `duckdb_tables()` **and** `duckdb_schemas()` showed `guest`,
+    because the catalog materializes a schema to hold any listed table. So the missing predicate silently
+    UNDID `SchemasSql`.
+  - **⚠⚠ ON BOX IT CHANGED NO ANSWER AND ON FABRIC IT WAS FATAL — which is exactly why it survived, and it
+    is the reason a box-only tier could never have caught it.** MEASURED: on SQL Server 2025 the same
+    `TablesSql` returns `dbo` and **nothing else** (a real SQL Server does not surface its system views
+    through `sys.views` for a user database). On a Fabric Warehouse it returns **`dbo` 53, `sys` 7,
+    `queryinsights` 6** — the seven being Fabric's internal Delta plumbing (`managed_delta_tables`,
+    `managed_delta_table_forks`, `external_delta_tables`, `sys_dw_schemas`, …) — and Fabric **refuses to
+    describe** one of them, reproduced directly with `SELECT TOP 0 * FROM sys.managed_delta_table_forks` ⇒
+    `Msg 15871 … is not supported`. Materializing the catalog therefore threw, so `duckdb_tables()`,
+    `information_schema.tables` and every cache refresh failed — and **dbt introspects before it builds**,
+    so no model was ever reached.
+  - **⚠⚠ THE ANSWER TO "CAN WE CATCH IT" IS NO, AND THAT IS THE INTERESTING PART.** A `try`/`catch` around
+    the per-table schema fetch is the obvious shape and it is the one this project FORBIDS: on a warehouse
+    engine a statement that fails inside an explicit transaction ABORTS the whole transaction
+    (warehouse-support.md §6.5 — the dbt `15225` defect came from exactly that), so swallowing would leave
+    a poisoned transaction surfacing somewhere unrelated. **Do not issue the statement; do not swallow its
+    failure.** Filtering satisfies the standing rule instead of fighting it.
+  - **⚠ `queryinsights` IS DELIBERATELY KEPT.** It is Fabric's documented query-history surface, not
+    internal plumbing, and a user may legitimately read it. Post-fix enumeration answers **59** = 53 + 6.
+  - **✅ THE PAYOFF, MEASURED: `dbt run --target fabric --threads 4` is PASS=4/4 in 49 s** — the Fabric
+    Warehouse dbt target has NEVER completed before. Before the fix the identical command died in 32 s with
+    the 15871 at `table_schema`.
+  - **⚠ THE GATE NEEDED A FIXTURE OR IT WOULD HAVE BEEN VACUOUS**, since box surfaces no system views: it
+    CREATES a view in `guest` — an excluded schema a view really can be created in — and asserts it appears
+    in neither `duckdb_tables()` nor `duckdb_schemas()`, with **`dbo` still populated as the positive
+    control** (without which the assertion passes equally on a build where discovery returns nothing).
+    Mutation-tested: removing the predicate again dies at exactly that assertion, 10 passing before it.
+  - **⚠⚠ THE PRIOR RECORD NAMED THE SYMPTOM AND ASSIGNED THE CAUSE TO THE OTHER SIDE, WHICH IS WHY NOBODY
+    LOOKED FOR SIXTEEN DAYS.** The 2026-08-09 note read *"a Fabric-side object our TABLES discovery SQL now
+    trips over … not diagnosed further"*. Every word is true and the framing is wrong: the object is real
+    and Fabric's, but **the reason we were asking about it was ours**, and one look at the two adjacent
+    query constants would have shown it. **When a failure names a foreign object, the question is still
+    why WE referenced it.**
+  - ⚠ Two process notes from doing it, both already in this file as rules and both re-earned: a mutation
+    test whose publish FAILED reported the suite GREEN (it measured the old payload — verify the publish,
+    not the exit code); and the publish failed because **another session on this machine was running
+    `unittest.exe` against a DIFFERENT repo through the SAME `build/release` payload**, so the shared
+    output is contended. Publishing to a scratch `-ExtensionDir` is how the mutant was run without
+    disturbing it.
+
+- **THE AMBIENT CREDENTIAL NOW REACHES THE DELTA CATALOG ON FABRIC COMPUTE (2026-08-11, C#-only) — before
+  this, EVERY secret-less notebook attach to `abfss://…onelake…` had a NON-ATOMIC COMMIT.** `_adlsCredential`
+  came only from the base64 marker `DeltaBackend.BuildConnectionString` appends from the secret the ATTACH
+  *names*, so the documented credential-free Fabric story arrived at `TableFileSystems.Create` with null and
+  fell through to the host FS — duckdb-azure, whose `ExclusiveCreate` is a client-side existence check, not a
+  conditional PUT (the measured 41-of-48 shape). `DeltaCatalog`'s constructor now adopts
+  `FabricCredentialResolver.AmbientChain()` when the root is OneLake, no secret was named, and
+  `FabricNotebookCredential.IsAvailable`.
+  - **⚠ READS WERE ALWAYS FINE, WHICH IS WHY NOBODY NOTICED.** `DeltaReader.ToReadableRoot` rewrites an
+    `abfss://…onelake…` root to `onelake://` so DuckDB's native reader uses our VFS — but **that rewrite is
+    READER-ONLY**, and `TablePath()` hands the commit path the root exactly as attached. Reads went one way
+    and commits the other.
+  - **⚠ THE TWO ARE NOT COMPETING FILESYSTEMS, and thinking they were cost a wrong plan.**
+    `AdlsGen2TableFileSystem` (engineered-wood's `ITableFileSystem`, used for the Delta LOG) and
+    `OneLakeForwardFs` (the DuckDB VFS behind `onelake://`, used for DATA files) are two consumers of the
+    SAME Azure DataLake SDK against the same endpoint — the former was literally renamed from
+    `OneLakeDataLakeFileSystem`. "Route commits through `onelake://`" is a category error: the commit never
+    goes through a DuckDB VFS at all.
+  - **⚠ SCOPED TO `IsAvailable`, NOT TO abfss:// GENERALLY.** For a plain ADLS account the status quo is that
+    duckdb-azure does the IO with whatever azure secret is in SCOPE; adopting an ambient credential there
+    could turn a working attach into an auth failure when the ambient identity has no RBAC on the account. On
+    Fabric compute the ambient token IS the documented credential and there is no in-scope-secret story to
+    break. A NAMED secret still wins — this only fills the gap where there was nothing.
+  - **✅ VALIDATED LIVE IN A FABRIC NOTEBOOK (2026-08-11).** A secretless `abfss://…onelake…` ATTACH,
+    CREATE + INSERT: **`{"rows":[50,1225],"rows_after_insert":55,"fs_direct_sdk":20,
+    "commit_guard_off_warnings":0,"verdict":"ATOMIC (direct SDK)"}`** — 20 log lines naming
+    `AdlsGen2TableFileSystem`, zero fallback warnings. So the ambient token both SELECTS the direct SDK and
+    AUTHENTICATES against OneLake.
+  - Predicted first by SIMULATING Fabric on box: `IsAvailable` keys on two ENV VARS
+    (`AZURE_FABRIC_TOKEN_SERVICE_URL`, `MSNOTEBOOKUTILS_TRIDENT_SESSION_TOKEN`), so setting them flips the
+    selection — "commit guard is OFF" **1 → 0** with the env var as the only variable. ⚠ That proved the
+    SELECTION only (the fake vars point at no token service); the notebook run is what proved the TOKEN.
+  - **⚠ THE PROBE HAD TO BE EXTENDED TO WRITE, AND THAT IS THE WHOLE REASON THIS SURVIVED.** The existing
+    `delta ATTACH abfss ambient (no secret)` step only READ — and reads were always fine, because
+    `ToReadableRoot` sends them through `onelake://`. A read-only probe of a read-only-correct path proves
+    nothing about the commit.
+  - **⚠ `scratchpad/fabricnb`'s two halves had drifted apart, costing a wasted run.** The driver's UPLOAD
+    side still supported the raw-loadable + payload-zip override (`FABRICNB_ARTIFACT`/`FABRICNB_PAYLOAD`)
+    while the NOTEBOOK side had been rewritten for the single-file artifact and no longer unpacked the zip.
+    The run then loaded the raw artifact against a STALE managed dir from an earlier run, whose missing
+    `Fabricator.SqlServer.dll` made `clr_host` fall back to `Fabricator.Bridge.dll` (no runtimeconfig) and
+    fail `AppArgNotRunnable` (0x80008094) — cascading into 18 meaningless failures. `stage()` now handles
+    BOTH shapes, wipes the managed dir first, and ASSERTS `has_composition_assembly` up front so the same
+    fault is named at its cause instead of surfacing as a hostfxr code three steps later.
+  - ⚠ `OneLakeForwardFs`'s XML doc still says an empty credential set yields `DefaultAzureCredential`; the
+    code calls `AmbientChain()` (notebook token first). Stale prose that sent an earlier analysis down the
+    wrong path — worth fixing.
+  - README gained a **"Running inside a Fabric notebook"** section (the secret-shape table + the two ⚠ boxes);
+    it had NO notebook documentation at all before, despite ambient auth being shipped and live-validated.
+
+- **Fabric-notebook AMBIENT AUTH — DONE + validated live.** All three providers work with ZERO
+  credentials on Fabric compute via `FabricNotebookCredential` (the trident token service; per-scope
+  refreshing tokens); azure `access_token` secrets consumed for SQL. Pinned gap: a STATIC storage-token
+  secret cannot serve the fabric+storage audiences for abfss ATTACH — use ambient. Full as-built record (moved verbatim from here): [docs/feature-history.md](feature-history.md).
+  - **⚠ IT WAS PYTHON-NOTEBOOK-ONLY UNTIL 2026-08-13, AND THE WRITE-UP ABOVE NEVER SAID SO.** On a
+    **PySpark** notebook a secretless `abfss://` ATTACH failed with `DefaultAzureCredential`'s entire
+    "no credential source" chain, because `IsAvailable` tested two ENV VARS and **all four
+    `AZURE_FABRIC_*` / `MSNOTEBOOKUTILS_*` variables are MISSING on Spark** (measured live; and
+    `notebookutils.configs` does not even exist there). The env vars are a PYTHON-RUNTIME MIRROR, not the
+    platform's contract.
+    - **The coverage claim was never wrong about what it tested, only about what it implied**: the probe
+      notebook is `language_group: jupyter_python`, and the 2026-07-12 PySpark run predates the ambient
+      credential — the part of it recorded as "credential-free" was the **fuse mount**, which is POSIX IO
+      and needs no token, so it never exercised this path at all.
+    - **Fix**: `IsAvailable` now asks the QUESTION (can I name the token service, do I hold a session
+      token?) instead of testing one spelling of the answer, sourcing both from files the class ALREADY
+      reads — `.trident-context` → `trident.session.token`, `tokenservice.config.json` →
+      `tokenServiceEndpoint`.
+    - **⚠ THE CONFIG FILE'S `tokenServiceEndpoint` IS THE BARE ORIGIN, NOT THE ENDPOINT, and assuming
+      otherwise cost a VOID experiment**: minting against it returned **404 on every request INCLUDING the
+      control**, which reads like a rejected token and is really a wrong route. The real URL is
+      `origin + "/api/v1/proxy" + <path of trident.lakehouse.tokenservice.endpoint> + "/access"` — derived
+      by running the SAME probe on a Python kernel of the same capacity and diffing. New BCL-only
+      `FabricTokenServiceUrl` composes it; ⚠ it SLICES the path rather than parsing it, because the
+      DOUBLED slash in `.../automatic//token` is load-bearing and `Uri` may normalise it away.
+    - **⚠ The config file's OWN `sessionToken` is refused for availability, and that is now MEASURED
+      rather than inherited from a comment**: minting with it returns **401
+      SignedPayloadValidationException** while the `.trident-context` token returns 200, same session,
+      seconds apart. Accepting it would flip the selection and fail at MINT time — a clear error traded
+      for a confusing one.
+    - **Validated by running the SHIPPED CLASS on a real PySpark session** (a 1.5 MB framework-dependent
+      console that LINKS `FabricNotebookCredential.cs`, so it tests what ships rather than a Python
+      replica of it): `IsAvailable: true`, `chosen_credential: FabricNotebookCredential`, and all three
+      audiences minting with real expiries. ⚠ The FULL extension path (DuckDB → ABI → `DeltaCatalog` →
+      ATTACH) is NOT re-validated on PySpark — that needs a linux C++ build, and both linux trees predate
+      ABI v69. Everything downstream of `AmbientChain()` was already validated on Python.
+    - ⚠ **`x-ms-client-tenant-id` turns out NOT to be required**: the trident-context session token is not
+      a JWT we can read `tid` from, so the C# omits the header — and the mint still returns 200. A Python
+      probe that supplied it from `trident.tenant.id` would have hidden that, which is why running the real
+      class mattered.
+    - Gate: tier-0 `TokenServiceUrlTests` (+12, floor 155 → **167**), pinning the composition against BOTH
+      measured literals and the doubled slash. The credential itself cannot be gated offline (it needs the
+      live token service), so the tier-0 test covers the one part that is pure string derivation — the part
+      that was wrong.

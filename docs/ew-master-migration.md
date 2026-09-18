@@ -4091,3 +4091,132 @@ if that is impossible, and then **make our amendments clear IN THE CODE**.
 - **Decision gate:** drop the branch for a `PackageReference` when the patch set is variant-transport-only AND
   #24157 is fixed. Until then the branch is correct, not a failure.
 
+## Appendix — records moved verbatim from CLAUDE.md (2026-09-18)
+
+CLAUDE.md carried these as-built records inline until it grew to 10,776 lines — a file loaded into every
+session's context. They are moved here VERBATIM; CLAUDE.md keeps each entry's summary head plus a pointer to
+this section. The one edit made on the way: a link that pointed into the docs directory is rewritten relative
+to this directory, so it still resolves from here.
+
+- **`delta.checkpointInterval` WAS ACCEPTED, STORED AND IGNORED — FIXED 2026-08-08 (one EW patch).**
+  MEASURED: `CREATE TABLE … WITH ("delta.checkpointInterval" = '25')` writes the value into the v0 `metaData`
+  and the table was still checkpointed at **10 and 20**. It is in `DeltaWithOptions.CanonicalKeys`, so we
+  advertise it on the `WITH` surface AND persist it where another engine reads and believes it — which makes
+  ignoring it worse than not accepting it: a table declaring 100 got ten times the checkpoint objects its
+  owner asked for. `DeltaTable` now resolves the interval from `snapshot.Metadata.Configuration`, falling
+  back to the code-level `DeltaTableOptions.CheckpointInterval`.
+  - **⚠ THE FIRST VERSION FIXED ONLY ONE OF TWO TRIGGERS, and every test here passed anyway — found by
+    CUTTING THE UPSTREAM OFFER (2026-08-08).** `DeltaTable` checkpoints from two independent places: the
+    commit loop's `LogCommitOptions`, and `CommitWriteAsync`'s own `_options.CheckpointInterval` check.
+    Resolving the property inside the `LogCommitOptions` initialiser covered the first and missed the
+    second — and since every path THIS host takes goes through the committer, `verify_delta_tblproperties`
+    and the EW tests were all green while the batch write path silently kept ignoring the property.
+    Honoured on some writes and not others is harder to notice than ignored everywhere. Now resolved ONCE
+    into a `_checkpointInterval` field so the two cannot drift.
+    - **The generalisable bit: porting a change to a tree that does NOT share this host's call shape is a
+      completeness test.** The identical three tests failed on bare upstream. Nothing about reading our own
+      diff would have shown it, because our own callers are not a representative sample of the API's.
+  - **⚠ `CheckpointInterval = 0` remains an ABSOLUTE caller override** — it means "never checkpoint", and a
+    table property must not switch it back on or a host that owns checkpointing on its own schedule starts
+    racing one it did not ask for. Its own test.
+  - Resolved once per OPEN, so a later `set_tblproperties` takes effect on the next open — the same
+    granularity as every other configuration read there. A malformed value is IGNORED, not fatal: this is a
+    declaration read from a table someone else may have written, and refusing to open over it would turn a
+    bad property into an unreadable table.
+  - Gates: EW `DmlCheckpointTests` 837 → **840 × 3 TFMs** (declared / fallback CONTROL / the zero override;
+    two mutants, each killed at its own test) and `verify_delta_tblproperties` 58 → **84**, which pins the
+    WITH → table-config → engineered-wood chain the EW tests cannot see, mutation-tested.
+    - **⚠ ITS CONTROL IS THE LOAD-BEARING HALF**: two tables take IDENTICAL statements and differ only in the
+      property, so "the declaring table has no checkpoint at v10" cannot pass by checkpointing having simply
+      stopped working.
+    - **⚠ EACH INSERT MUST BE ITS OWN STATEMENT.** One bulk `INSERT … SELECT r FROM range(2, 27)` is ONE
+      commit, so the first version of this section reached v2, neither interval fired, and it passed for the
+      wrong reason. Counting the on-disk versions is what caught it.
+  - ⇒ `delta.logRetentionDuration` was the last accepted-but-unread Delta property, and it was BUILT the
+    next day — see the offer list, item 4.
+
+- **VACUUM WAS BLIND BELOW THE TABLE ROOT — FIXED 2026-08-08 (C# + one EW patch). On a PARTITIONED table it
+  reclaimed NOTHING.** `ITableFileSystem.ListAsync` globbed `<root>/<prefix>*` — ONE LEVEL — in all three of
+  our filesystems, each with a comment justifying it as *"the Delta log is flat"*. True of the log; false of
+  the OTHER caller. `VacuumExecutor` lists the whole table ROOT to find files no version references, so it
+  only ever collected orphans sitting at the root, and everything under `col=value/` grew forever.
+  - **MEASURED both ways**: a backdated orphan in `p=a/` survived `VACUUM RETAIN 0 HOURS` while an identical
+    one at the root was collected; after the fix, 3 collected including the partition one, table intact.
+  - **⚠ IT IS OURS, NOT UPSTREAM'S — established by reading EW's OWN implementation.** `LocalTableFileSystem`
+    enumerates with `SearchOption.AllDirectories`, so RECURSIVE is the contract every consumer is written
+    against and EW's suite runs them that way. We narrowed an interface silently, and the only consumer that
+    would have noticed is the one nobody tested. **Before deciding whose bug an interface mismatch is, read
+    the reference implementation** — the doc comment on `ListAsync` says nothing about recursion.
+  - Fix: host FS glob `<root>/<prefix>**`; ADLS `GetPathsAsync(recursive: true)`; S3 delegates to the host FS.
+    ⚠ MEASURED that `**` also returns the prefix's own level, and that for a FILENAME-fragment prefix `pre**`
+    behaves exactly like `pre*` — so the shape no Delta caller uses cannot change.
+  - **⚠ THE RECURSION FIX IS UNSAFE ALONE, and that is what closed upstream issue #54.** With recursion and
+    the old two-directory exclusion, VACUUM DELETED a planted `_myindex/i.parquet` (measured). So
+    `VacuumExecutor` gained Delta's HIDDEN-NAME rule: a path component beginning `_` or `.` is left alone at
+    any depth — applied PER COMPONENT and to FILES as well as directories, which is what Delta does
+    (`DeltaFileOperations.recursiveListDirs` filters on `getPath.getName` at every level).
+    - **⚠ PARTITION DIRECTORIES ARE THE EXCEPTION and without it the rule silently stops collecting**: a
+      partition column may be named `_region`, so `_region=eu/` is a hidden NAME holding live data. Matched
+      against the snapshot's declared partition columns, never by looking for `=`.
+    - **We diverge from Delta on TWO names, deliberately and conservatively**: Delta UN-hides `_delta_index`
+      and `_change_data` so both ARE collected; we keep both. There is no CDF keep-set here (the snapshot
+      does not track `cdc` actions) and an index this library does not write is one it cannot know is dead.
+      ⚠ So #54's own example (`_delta_index`) is the one case where Delta AGREES with collecting — the real
+      exposure was every OTHER `_`-prefixed name.
+  - **⚠ THE PROBE NEEDED TWO CORRECTIONS, both the standard traps.** First run: `0 files deleted` — VOID, not
+    a negative, because a DV DELETE leaves nothing unreferenced; it needed an OPTIMIZE for a positive
+    control. Second: the planted files were seconds old and `RETAIN 0 HOURS` keeps anything not STRICTLY
+    older than the cutoff, so they were ineligible rather than protected. Only backdating discriminated.
+  - Gates: EW `VacuumTests` 835 → **837 × 3 TFMs** (both mutation-tested; the first-component-only mutant
+    also kills the pre-existing CDF-preservation test, which is independent evidence the new rule subsumes
+    the old `_change_data` exclusion) and `verify_delta_catalog_optimize` 40 → **56**, mutation-tested by
+    reverting the glob. ⚠ **The gate must assert a file INSIDE a partition directory** — an unpartitioned
+    VACUUM test passes with the bug fully present. ⚠ And the glob is `*=a/`, not `p=a/`: column mapping is on
+    by default, so the partition directory carries the PHYSICAL column name. ⚠ **The ADLS half is in NEITHER
+    CI tier** (`verify_delta_catalog_adls` is manual/live-account).
+
+- **⚠ CROSS-ENGINE `commitInfo.isBlindAppend` — BOTH HALVES NOW DONE (reading 2026-08-01, writing
+  2026-08-08). Full record: [docs/delta-transactions.md](delta-transactions.md) §10.6 +
+  [docs/ew-master-migration.md](ew-master-migration.md) §isBlindAppend §4a, and this entry verbatim in
+  delta-transactions.md's Appendix (2026-08-23).**
+  - **THE READING half was wrong in the UNSAFE direction and is fixed**: `ConflictChecker.IsBlindAppend`
+    INFERRED blind-append from action shape ("only AddFiles"), so another engine's `INSERT … SELECT` from the
+    same table — which only adds but READ — was treated as blind and we skipped a check we owe. It now
+    CONSUMES the flag when present and falls back to the inference only when absent.
+    - **⚠ "FIXED" MEANS FOR *DECLARED* COMMITS ONLY — we still DIVERGE FROM DELTA on the absent case, in the
+      weaker direction.** Delta is `getOrElse(false)`: absent ⇒ NOT blind, examined even under
+      WriteSerializable. Delta even COMPUTES an `onlyAddFiles` and pointedly does NOT use it for this — so
+      our fallback is precisely the inference Delta declined to make. Ours is a deliberate back-compat choice
+      (EW emits no flag itself, so `getOrElse(false)` would make ordinary EW-to-EW concurrent appends start
+      conflicting), **NOT a claim of parity. Do not describe the reading half as "matching Delta".**
+  - **THE WRITING half: we now EMIT the flag, and the blocker was resolved by making the claim EXPLICIT
+    rather than derived.** `LogCommitRequest.IsBlindAppend` is a `bool?` the CALLER states; **`null` writes
+    NO FIELD.** Sourcing it from EW's read set would have been wrong: `CommitDataFilesAsync` hardcodes
+    `Reads = ReadSet.Blind`, and **a DEFAULTED `ReadSet.Blind` means "this caller said nothing", not "this
+    caller declares it read nothing"** — writing a spec field off a default turns every silent caller into an
+    assertive one.
+  - **⚠ THE `false` ROW IS THE LOAD-BEARING ONE.** Delta's definition is CONJUNCTIVE (`onlyAddFiles &&
+    !dependsOnFiles`), so the anti-join incremental shape — `INSERT INTO t SELECT … FROM t …`, i.e. the
+    standard dbt-incremental/dedupe pattern — emits only AddFiles and is still NOT blind. A wrong `true`
+    there is the UNSAFE direction: another engine SKIPS a check it owes. Measured under
+    `write_serializable`: buffered blind append ⇒ `true`, that shape ⇒ `false`, autocommit ⇒ absent.
+  - **⚠ AUTOCOMMIT DECLARES NOTHING — a REMAINING GAP, not a design choice to admire.** Scan-time read
+    recording is gated on `IsExplicit`, so autocommit records nothing and an append there is
+    indistinguishable from the anti-join shape. Absent ⇒ Delta reads "not blind" ⇒ spurious aborts, which is
+    the SAFE direction. Closing it means extending read recording to autocommit; ours, not upstream's.
+  - **⚠ A BUG THE FIRST VERSION HAD, found by measuring rather than review: `_txnBuffer.Remove(txnId)` CLEARS
+    the explicit marker, and `CommitTransaction` calls it BEFORE the flush** — so reading `IsExplicit` after
+    it is always false and the declaration silently degraded to "say nothing": green, and quietly never
+    emitting the flag it exists to emit. (Same ordering fact as the `ITransaction` slice's
+    removal-before-completion contract.)
+  - **SCOPE, because it is narrower than "fixes the aborts"**: it changes NOTHING under `serializable`
+    (Delta examines blind appends there by design — that abort is CORRECT), and **Fabric Spark's DDL REFUSES
+    to SET `WriteSerializable`** (`requirement failed: … must be Serializable` — it is a Databricks
+    extension), so the tables this helps are ones WE stamped. Spark HONOURS a stamped value, it just cannot
+    write one.
+  - **⚠ METHOD, and the reason this took four attempts: the experiment was VOID FOUR TIMES and each void
+    looked like a clean "no conflict".** The overlap window must be PROVEN (Spark naming the concurrent
+    version), never assumed; our end needed ~20 s to fire, most of the DELETE's life, so the writer must be
+    PRE-ATTACHED and the DELETE made genuinely expensive (`id % 7 = 3` rewrites nearly every file).
+    Re-creating the table did NOT help — the warmth that matters is the SPARK CLUSTER's, so each level needs
+    its own run in the cold first slot.

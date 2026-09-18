@@ -1430,3 +1430,258 @@ script via `cmd /c`, which MSYS rewrites into a path — `cmd` then starts INTER
 `D:eposabricator-extension>` prompt where ninja output belongs. This trap is already recorded in
 `CLAUDE.md`; it is repeated here because a surviving mutant is normally read as a weak gate, and here it
 meant the opposite. **Drive every C++ build from the PowerShell tool.**
+
+## Appendix — records moved verbatim from CLAUDE.md (2026-09-18)
+
+CLAUDE.md carried these as-built records inline until it grew to 10,776 lines — a file loaded into every
+session's context. They are moved here VERBATIM; CLAUDE.md keeps each entry's summary head plus a pointer to
+this section. The one edit made on the way: a link that pointed into the docs directory is rewritten relative
+to this directory, so it still resolves from here.
+
+- **⚠⚠ VARIADIC PARAMETERS — `Params.VarArgs` — BUILT 2026-08-31 for SCALAR + TABLE + SQLGEN (user-scoped:
+  "let's try it with scalars+table function+sqlgen and defer in-out+lateral"). C# + C++, NO ABI bump (the
+  style is an additive `fabricator.param_style` value, the `Params.Constant` precedent). Full record:
+  [docs/custom-functions-design.md](custom-functions-design.md) §13. Gates: `verify_global_functions`
+  118 → **145**, `verify_sqlgen` 59 → **76**, `verify_custom_functions` 89 → **101**; hermetic
+  **74/74 — 8126** (8082 + 27 + 17 exactly, so no other suite moved); FOUR mutants, each killed at its own
+  assertion. Uncommitted; `git status` is the authority.**
+  - **THE MECHANISM IS DuckDB'S OWN, and its shape is the whole design**: `varargs` is ONE `LogicalType` on
+    `SimpleFunction` (shared by scalar/table/aggregate), `arguments` is a FIXED PREFIX = the MINIMUM arity,
+    every argument past it must implicitly cast to `varargs`, and there is NO maximum
+    (`BindVarArgsFunctionCost`). So our declaration's tail field is NOT one of `tf.arguments` — it names the
+    tail's TYPE.
+  - **⚠⚠ THE SCALAR PATH WAS ALREADY ARITY-DRIVEN AND NOBODY KNEW.** The exec reads `args.GetTypes()`
+    ("the chunk's ACTUAL column types, not the declared signature") and the bind loops the ACTUAL
+    `arguments` with `i < bound_function.arguments.size()` guards and an `arg<i>` name fallback — both
+    written for OTHER reasons (the ANY sentinel; a zero-arg call). Only the DECLARATION was missing. Same
+    shape as the `_last_checkpoint`/`sp_describe` finding: **both halves of the fix were already in the
+    tree, wired to other callers.**
+  - **⚠⚠ THE TRAP THE FEATURE IS BUILT AROUND: every args marshal initializes a `DataChunk` from the
+    DECLARED types and then loops the SUPPLIED values.** A variadic call has MORE values than declared
+    types, so each marshal writes past its chunk. `FabricatorExpandVarArgs` widens the declaration to the
+    actual call first; a non-variadic function comes back byte-identical, so no call site needs a second
+    branch. THREE marshals needed it (the TVF bind's pure-positional branch, its mixed positional+named
+    branch, the sqlgen `bind_replace`) — found by reading them, not by a failure.
+  - **⚠ IT MADE A PRE-EXISTING DEFECT REACHABLE**: a sqlgen function with minimum arity 0 — which only a
+    variadic one can have — crossed as a ZERO-FIELD Arrow schema, which Apache.Arrow refuses in both
+    directions. `FabricatorSqlGenBindReplace` constructed its `ArrowProducer` unconditionally. Fixed by
+    passing NO stream, the same rule `FabricatorTableFunctionBind` has always had; it was simply
+    unreachable on that path until a generator could take zero arguments.
+  - **⚠⚠ A `switch` WITH NO VARARGS CASE DOES NOT IGNORE THE DECLARATION — IT REGISTERS THE TAIL AS AN
+    ORDINARY `ANY` ARGUMENT.** The function then binds, runs, and does not do what its declaration says. So
+    the DEFERRED kinds refuse EXPLICITLY at registration (`FabricatorRefuseVarArgs` for in-out/collector +
+    both aggregate sites; a throw in `FabricatorMakeLateralFunction`; `Params.Validate(allowVarArgs:)` in
+    C# on top for lateral). ⚠ For a GLOBAL declaration the throw is swallowed by the registration loop's
+    own `continue` (one bad declaration must not fail extension load), so the function is ABSENT rather
+    than misregistered — loud at call time, and the behaviour a table-input on a lateral already had.
+  - **⚠ VALIDATION IS DELIBERATELY *NOT* IN `GetFunctionParamSchema`**, the one crossing that sees every
+    declaration: the host treats ANY failure there as "the function is stale" and silently DROPS it, so a
+    declaration bug would present as a function that does not exist. Loud in the right place beats early in
+    the wrong one.
+  - **⚠ A CONCRETE TAIL IS NOT "ANYTHING, COERCED" — MEASURED, and my own doc comment claimed otherwise
+    until it was run.** DuckDB applies ordinary implicit-cast rules per tail argument: a `BIGINT` tail takes
+    `(1, 2::SMALLINT, 3::TINYINT)` and REFUSES `(1, 3.0)` at bind (DECIMAL→BIGINT is lossy). The ANY tail is
+    the declaration that accepts anything.
+  - **⚠⚠ THE FIRST MUTATION RUN REPORTED ALL FOUR MUTANTS AS SURVIVORS AND WAS VOID** — it drove the build
+    from bash via `cmd /c`, the trap this file already records: MSYS rewrites the `/c` SWITCH into a path,
+    `cmd` starts INTERACTIVELY, reads EOF and exits **0** having built nothing, so each "mutant" was the
+    clean binary re-tested. The tell is a bare `D:\repos\fabricator-extension>` PROMPT where ninja output
+    belongs. **A surviving mutant normally means a weak gate; here it meant no build happened.** Re-run
+    through the PowerShell tool, all four died.
+  - **⚠⚠ THE SECOND-SITE GAP — CLOSED FOR ALL FIVE CATALOG KINDS (2026-08-31, user-directed), AND IT FOUND
+    TWO DEFECTS, ONE OF THEM OURS. Gate `verify_custom_functions` 101 → **134**; service floor 3023 → 3056
+    (3023 + 33 exactly). Full record: custom-functions-design.md §13.8.** A declaration form that only ever
+    ships GLOBAL looks covered while the ATTACH-TIME path is untested — and here one kind was BROKEN on the
+    catalog site while working on the global one, which no amount of reading found.
+    - **DEFECT 1, PRE-EXISTING, and its own comment predicted it.** `CatalogFunctionSet.ParamSchema` omitted
+      in-out/collector ⇒ the param-schema fetch yielded nothing ⇒ `GetOrCreateCustomInOutFunction` caught and
+      fell back to the bare `{TABLE}` signature, **silently dropping the whole declaration** (a
+      `[TableInput][Positional][VarArgs]` in-out registered as `[TABLE]`). The site read *"would silently
+      drop one that did. Left alone"* — accurate when written, a trap for the first function to declare a
+      cost arg. Fixed with `TryInOut`/`TryCollector`.
+      - ⚠ **NO error and NO failed crossing** — my first diagnosis was "the catch swallowed a throw" and the
+        failed-crossing log was EMPTY, because nothing threw; the fetch just returned one parameter. ⚠ A
+        stale APPEND-MODE `FABRICATOR_LOG_FILE` from a previous session nearly misled me on top (its
+        `GetFunctionParamSchema failed: 'fields'` lines were from July). **Use a fresh log path.**
+      - ⚠ Safe only because it is behaviour-NEUTRAL in-tree: all three catalog in-outs + the one collector
+        declare ONLY their table input, so the declaration reproduces the fallback's `[TABLE]`. Proven by
+        `verify_table_inout` 63 / `verify_collector` 40 unmoved, not by inspection.
+    - **DEFECT 2, OURS, AND THE GLOBAL PATH CONCEALED IT COMPLETELY.** With defect 1 fixed, `varargs` came
+      back as `"NULL"` (SQLNULL rendered, not absence): the in-out signature case decided the SQLNULL→ANY
+      mapping through `named_any_for_null`, a flag that exists for NAMED parameters alone. The catalog path
+      passes it FALSE ⇒ an ANY tail registered as `varargs = SQLNULL`, which only a NULL literal casts to, so
+      every real argument failed to bind. The GLOBAL path passes TRUE, which is why `fabricator_inout_va`
+      worked. Now `FabricatorVarArgsType(types[i])` — unconditional; the sentinel belongs to the DECLARATION,
+      not the caller.
+    - **⇒ THE TRANSFERABLE RULE: a shared helper reached through two call sites with DIFFERENT FLAG VALUES is
+      two code paths, and gating one of them is gating one of them.**
+  - **⚠ ON DuckDB'S OWN INVENTORY (user asked whether some are wrongly marked): they are not — `varargs`
+    there is an OVERLOAD-RESOLUTION device, not an arity contract.** MEASURED: `cardinality(MAP{'a':1}, 42,
+    'junk')` binds through the variadic path and is refused by cardinality's OWN bind; `to_json()`,
+    `struct_insert()`, `array_value()` register with minimum arity **0** and enforce the real rule in their
+    bind; `hash(1,2,3)` and `list_concat()` are genuinely variadic. `duckdb_functions().varargs` reports the
+    REGISTRATION faithfully — several functions register permissively on purpose and pay only a worse error
+    message. 43 scalar + 4 table; `ANY` 37, `ANY[]` 6, `T` 2 (the 1.5 template system), `JSON` 1,
+    `VARCHAR[]` 1.
+  - **⚠⚠ LATERAL TAKES ONE TOO — BUILT THE SAME DAY, AND THE DEFERRAL ABOVE RESTED ON A CLAIM I NEVER
+    CHECKED (user-raised: "the position of the Params.Const args could be at the front as well … then
+    VarArgs at the end should work almost out of the box"). Both halves MEASURED before anything was built.
+    Gate `verify_lateral` 247 → **285**.** The deferral said constants are "also trailing", so a tail would
+    contend with them. **Nothing in the code says trailing**: `LateralBind` tests `declared_constant[i]` per
+    ACTUAL slot, `wire_slots` is just the non-constant indices, `LateralConstants.Validate` matches by NAME,
+    `Params.Validate` gives Constant no ordering rule, and the demo reads `GetFieldIndex`. It was the
+    DEMOS' convention. `fabricator_lat_front(fields, n)` — constant FIRST — works with **zero code changes**
+    in both call shapes.
+    - **A LATERAL TAIL IS A DIFFERENT MECHANISM AND THAT IS WHY IT WAS NEARLY FREE**: a scalar/table/sqlgen
+      tail widens the ARGS BATCH; a lateral's widens the **WIRE**, and `LateralBind` was already written
+      against the ACTUAL call (`arg_width` = `input.input_table_types.size()`, every declaration lookup
+      guarded `i < declared_*.size()`), so surplus slots were legal by construction. Two changes:
+      `FabricatorMakeLateralFunction` sets `tf.varargs` instead of throwing, and the `col_type`
+      normalization takes the tail's declared type for slots PAST the declaration (`declared_tail`) — an ANY
+      tail needs nothing, a CONCRETE one would otherwise normalize only its FIRST argument and leave the
+      rest at their bound types, which is the `Vector::Reference` crash class.
+    - **⚠ A NEW REACHABLE SHAPE: THE EMPTY WIRE.** `[CONSTANT][TAIL]` called with no tail arguments has ZERO
+      wire columns, which the operator had never seen. MEASURED to land on the pre-existing "needs at least
+      one PER-ROW argument" BinderException cleanly in BOTH shapes; the message now names the tail. Probed
+      with a THROWAWAY function that was deleted after measuring.
+    - **⚠⚠ AND SO DO IN-OUT / COLLECTOR — same day, same shape of error on my part (user-raised: "varargs
+      in table in out should not be pumped into the table input stream, they should be part of standard
+      function arguments"). Exactly so, and it is what the code already implied.** An in-out's per-row input
+      is its `{TABLE}` argument ALONE; its positional/named parameters are CONSTANTS resolved at bind and
+      marshaled into the 1-row args batch (`GfMixFunction` reads `factor`/`bias` there). So an in-out tail
+      is the **ARGS-BATCH** mechanism — the scalar/table/sqlgen one, already built — and the input stream is
+      untouched. **I had applied LATERAL's property to a kind that does not have it.** Gate
+      `verify_global_functions` 145 → **160**.
+      - **⚠ IT HAD TO BE BUILT, NOT MERELY UNBLOCKED**: `FabricatorMarshalInOutArgs` walks the DECLARATION
+        and indexes into the values, so surplus arguments were **SILENTLY DROPPED** — no crash, no error,
+        just a function not receiving what the caller wrote.
+      - `{TABLE}` + varargs resolves in DuckDB, read in source THEN measured: `GetTableFunctionBindType`
+        keys `has_table_parameter` on `function.arguments` containing TABLE (whatever `varargs` says), the
+        subquery contributes `LogicalTypeId::TABLE` + an empty `Value`, and the rest is costed against
+        `varargs`.
+      - The load-bearing gate assertion is the ROW COUNT: 3 input rows in, 3 out, with the tail changing only
+        the tag — a tail pumped into the input stream would move it.
+    - **⚠ A NAMED PARAMETER AFTER THE TAIL — the one combination the marshals had never been asked for, gated
+      2026-08-31 (`verify_global_functions` 160 → **178**).** The rule is "the tail is the last POSITIONAL
+      parameter"; named parameters are a separate namespace and may follow. What had to be right is the
+      INTERLEAVING — the tail branch sets `positional_index = input.inputs.size()`, so a named lookup that
+      depended on it would read the wrong slot or none. MEASURED on BOTH marshals (`FabricatorTableFunctionBind`
+      mixed branch and `FabricatorMarshalInOutArgs`): tail+named, named with NO tail, and tail with no named
+      byte-identical to before the parameter existed. It WORKED unchanged — but "wired and never exercised"
+      next to index bookkeeping is not a state to leave a gate in.
+    - **⛔ STILL REFUSED: AGGREGATES ALONE** (`FabricatorRefuseVarArgs` at both registration sites).
+      **ANALYSED 2026-08-31 at the user's request and DELIBERATELY NOT BUILT — it is the ONE kind that would
+      need an ABI BUMP, which is what settles it** (full record: custom-functions-design.md §13.5). Every
+      other kind is no-bump because the callee sees the actual width; the aggregate crossing sends a BARE
+      `ArrowArray` with no schema and the managed side reconstructs it from `AggregateSession.UpdateSchema`,
+      built ONCE from the DECLARATION, while `agg_open` has no argument for the bound arity. Four sites, not
+      two (builder / `BuildUpdateBatch` / `UpdateSchema` / the ABI entry).
+      - **⚠⚠ AND THERE IS A TRAP WAITING AT `BuildUpdateBatch`**: it loops `input_count` (the ACTUAL arity)
+        while indexing `bind.arg_types[i]` (the DECLARED vector) — an OOB `vector::operator[]` past the
+        declaration, whose garbage LogicalType then feeds `Reference` ⇒ the `Vector::Reference used on
+        vector of different type` INTERNAL error that INVALIDATES the database. **Unreachable today only
+        because the refusal blocks it**, so it is DOCUMENTED rather than guarded (a defensive check on an
+        unreachable path is untestable).
+      - ⚠ **DuckDB ships ZERO variadic aggregates** (43 scalar, 4 table, 0 aggregate), so we would be the
+        first user of that binder path. Highest cost of any kind, weakest payoff — a homogeneous aggregate
+        over N values is what a LIST argument already does well.
+    - **⚠⚠ THE TRANSFERABLE POINT IS NOT ABOUT VARARGS: a deferral justified by a property nobody measured
+      can outlive its reason indefinitely, because the note reads as settled and gets CITED rather than
+      re-tested.** Both claims fell to one probe each, and the first needed no code at all. I had written
+      that deferral into three places (CLAUDE.md, the design doc, a C++ comment) the same day — and then
+      repeated the mistake for IN-OUT in the very same sentence, which is the part worth remembering: ONE
+      unmeasured property got generalised across two kinds at once, and both fell to one probe each.
+  - **⚠ AN UPSTREAM RENDERING GAP FOUND WHILE GATING IT, recorded as
+    [docs/duckdb-upstream-issues.md](duckdb-upstream-issues.md) §6 and NOT filed**: a TABLE function's
+    `varargs` is OMITTED from the "Candidate functions" list while a scalar's renders `[TYPE...]`, so a
+    failed call describes a variadic table function as fixed-arity. Stock repro with a control pair
+    (`concat_ws()` renders the tail, `test_vector_types()` and `enable_profiling(1)` do not). ⚠ The lateral
+    gate therefore asserts the candidate DuckDB ACTUALLY prints — asserting the correct-but-absent rendering
+    would fail forever against behaviour that is not ours.
+  - **⚠⚠ `fabricator_functions()` NOW REPORTS VARIADICITY (2026-08-31, user-directed) — and the widening it
+    needed closed a PRE-EXISTING PROVIDER DIVERGENCE nobody was looking for. Gate `verify_functions` 67 →
+    **105**. NO C++ and NO ABI change.** `param_count` counted the tail as one ordinary parameter, so a
+    variadic function reported a number that was neither its minimum nor its maximum (`f(label, …)` said 2
+    while accepting one argument or twenty) and looked exactly like an exact arity. Now `param_count` is the
+    MINIMUM arity (tail excluded) and a new `varargs` column names the tail's type, EMPTY when not variadic —
+    DuckDB's own split.
+    - **⚠ NO C++ because `DiscoverFunctions` reads only the first three columns and SAYS SO** ("the trailing
+      columns are ignored"), and `fabricator_functions()` takes its schema FROM the stream
+      (`PopulateReturnSchema`). Both were checked before the design was chosen, not after.
+    - **⚠⚠ THE DIVERGENCE: `FunctionsMetadata.StreamSchema` carried THREE columns while the SQL Server
+      catalog assembled the SAME declarations as a FIVE-column T-SQL `UNION ALL`** — so `param_count` and
+      `return_type` were reported on a SQL Server catalog and NOT on Delta / DAX / delta-rs, for identical
+      declarations. Invisible from C++ for exactly the two reasons above. Widened to six for every provider.
+    - **⚠ An ANY tail renders `"any"`, not the Arrow null type's own `Name` (`"null"`)** — reported verbatim
+      that would read as "no varargs", i.e. the opposite of the truth.
+    - **⚠⚠ TWO SELF-INFLICTED PROCESS FAILURES, both worth carrying.** (1) A multi-edit python script that
+      ASSERTS-THEN-WRITES AT THE END loses EVERY earlier edit when a late anchor fails — and redoing them by
+      hand missed one, leaving the session-tag UNION branch at five columns, which fails the whole ATTACH
+      with SQL Server **error 205** (unequal expression counts). (2) Checking whether the published DLL
+      carried the change with an ASCII `grep -a` returned **0 for the probe AND 0 for the control** — .NET
+      strings are UTF-16, so the METHOD was void, not the answer. The control is the only reason that was
+      caught; re-run as `utf-16-le` bytes.
+    - ⚠ What PINS the T-SQL branch is not a row assertion but **SQL Server itself**: every UNION branch must
+      have equal arity, so a branch left at five fails the ATTACH and NOTHING in the suite runs. The gate says
+      so rather than implying its own row does the work.
+  - **⚠ WHAT IT IS WORTH, so a future session does not widen it reflexively: a `LIST` parameter already
+    covers the HOMOGENEOUS case** (`f(['a','b'])`). A tail buys HETEROGENEOUS, individually-typed arguments
+    — which is exactly what DuckDB's own variadics are (`printf`, `format`, `concat_ws`, `struct_pack`,
+    `row`, `create_sort_key`), and why every demo mixes types at the call site.
+
+- **THE `_each` MOVE: the PROVIDER declares its per-row form, the host stopped inventing one — DONE
+  2026-08-02 (user-directed).** `FabricatorSchemaEntry::AddTableFunction` used to synthesise a
+  `<name>_each` table-in-out alias for **every `table`-kind function of every provider**. That made a
+  SQL-Server semantic (CROSS APPLY / per-row EXEC) the HOST's business and produced entries that can only
+  fail wherever there is nothing to apply per row — **measured: 30 of the 70 names on a Fabric attach were
+  dead `_each` siblings**, all advertised in `duckdb_functions()`.
+  - Now: `SqlServerBackend.FunctionsSql` emits `<routine>_each` itself as an ordinary **`inout`**
+    declaration (only for routines that TAKE parameters — nothing to apply per row otherwise), and it
+    arrives through `AddInOutFunction` like any other provider-declared in-out. **No new kind was needed**:
+    the unified param protocol lets the declaration carry a `Params.TableInput` field, which is what made
+    the whole thing expressible.
+  - **The `_each` SUFFIX IS NOW A PROVIDER CONVENTION** (`SqlServerCatalog.EachSuffix` + `StripEach`): the
+    provider chose the name, so the provider strips it to find the underlying routine. The host does not
+    know the convention exists. A provider may name its per-row form anything.
+  - DELETED from the host: the synthesis, the `inout_functions_` alias map, and `GetOrCreateInOutFunction`
+    (54 lines) — the latter redundant because `SqlServerTvfEach` already computes the echo schema
+    (input columns ++ TVF output) in C#, so the ordinary custom-in-out path serves it.
+  - Gate `verify_functions` 15 → **27**: the `_each` is declared (`kind='inout'`) beside its routine AND
+    still applies it per row, plus **zero** `cf%_each` — a C#-authored table function has nothing to apply
+    per row and must get none. ⚠ The `cf_*` count asserted just above it is that check's POSITIVE CONTROL,
+    and the `LIKE … ESCAPE` pattern was itself verified to match a synthetic name — a
+    mangled escape made it pass for the wrong reason once.
+
+- **THE UNIFIED PARAMETER PROTOCOL — DONE 2026-08-02 (behaviour-preserving, no ABI bump). Full record
+  moved verbatim to [docs/custom-functions-design.md](custom-functions-design.md) §12 (2026-08-23).**
+  A function declares **ONE parameter schema** whose every field carries its STYLE in Arrow field metadata
+  (`fabricator.param_style` = `named` | `table`; ABSENT ⇒ positional), replacing a split `Parameters` +
+  `NamedParameters` pair plus a third `InputSchema` on the in-out/collector kinds.
+  `dotnet/Fabricator.Abstractions/ParamStyle.cs` (`ParamStyle` / `Params`) is the whole protocol; C++ reads
+  it as `FabricatorParamStyle`. Why: the split forced every consumer to reconstruct one ordering rule, and
+  a host that got the NULL substitution off by one would corrupt a POSITIONAL value rather than error —
+  with one schema, position IS declaration order and that bug cannot be written.
+  - **⚠ BOTH ordering rules are DuckDB's, not ours** (verified in `bind_table_function.cpp`): unnamed
+    parameters cannot follow named ones, and a table function may have at most ONE subquery parameter.
+    `Params.Validate` moves those from CALL time to DECLARATION time. Named on a SCALAR is a declaration
+    ERROR (DuckDB `ScalarFunction` has no named-parameter concept), never silently ignored.
+  - **⚠ A named parameter must not be a DuckDB RESERVED WORD** — `offset :=` is a *parser* error, which
+    reads as a broken function rather than a bad name. (Same trap later cost the `delta.*` bounds their
+    obvious names: `from`/`to` are reserved, hence `starting_version`/`ending_version`.)
+  - **⚠ THE COMPILER FINDS ALMOST NONE OF THIS.** Removing an interface member leaves `override`s of a
+    BASE-CLASS member compiling happily as DEAD CODE — ~25 declarations would have silently stopped being
+    read. The gate is a GREP (zero live `fabricator.named`), not a green build.
+  - **⚠ DO NOT SCRIPT STRUCTURAL EDITS TO C#** — a brace-matching insertion loop ran away here (no damage;
+    it never reached its write). A single-pass anchored insertion with an explicit class→interface map is
+    the safe form.
+  - **⚠ Apache.Arrow 23 cannot even CONSTRUCT `new StructType(empty)`** — `ArgumentNullException('fields')`
+    on a non-null EMPTY list, and it fires in a STATIC FIELD INITIALIZER, taking down `CustomFunctions` and
+    silently dropping every global function registered after it. The visible symptom was an unrelated table
+    function "not existing". Extends the known zero-field hostility one step earlier than export/import.
+  - **TWO SHIPPED DEFECTS IT EXPOSED, both invisible to the tiers**, which is why the gate now asserts the
+    SIGNATURE itself: `input` leaked into in-out/collector signatures as an extra OPTIONAL named parameter
+    (breaks no call, so nothing failed), and unflagged fields silently became POSITIONAL so
+    `fabricator_delta_write(…, path := '…')` stopped binding. Only asserting the signature can catch
+    "accepts an argument the implementation never receives".
+  - Gates: hermetic 63/63 — 5685 and service 44/44 — 1458; the refactor ALONE came out at 5664/1446,
+    IDENTICAL to pre-refactor, which is the behaviour-preservation claim.

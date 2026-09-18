@@ -3491,3 +3491,270 @@ and would be `FabricTableFunctionBinding` under this convention.
   **BOTH** `FABRICATOR_ABI_VERSION` in `abi.h` AND `vtable->AbiVersion = N` in `Bootstrap.Initialize`,
   else the host throws "ABI version mismatch". Adding an *enum value* (e.g. a new metadata/alter kind)
   is additive and needs NO bump.
+
+## Appendix — records moved verbatim from CLAUDE.md (2026-09-18)
+
+CLAUDE.md carried these as-built records inline until it grew to 10,776 lines — a file loaded into every
+session's context. They are moved here VERBATIM; CLAUDE.md keeps each entry's summary head plus a pointer to
+this section. The one edit made on the way: a link that pointed into the docs directory is rewritten relative
+to this directory, so it still resolves from here.
+
+- **⚠⚠ GLOBAL FUNCTIONS NOW GET THEIR CALLER'S CONTEXT — ABI **v82** (the scalar crossings) and **v83**
+  (`host_query` may run AS the caller's session). BUILT 2026-09-02, user-directed and user-diagnosed
+  ("problem is the set_active_open/trx stuff not implemented for global functions. read_blob can access the
+  filesystem so we should also. and the context for the session sessions"). Full records:
+  [docs/abi-history.md](abi-history.md) §v82 + §v83. Gates: `verify_delta_clustered_optimize` 147 × 2
+  engines, `verify_host_query` 98 → **107**, `verify_plugin_fluid` 177 → **188**; hermetic **74/74 — 8259**,
+  service **54/54 — 3257**; THREE mutants each killed at its own assertion.**
+  - **⚠⚠ A GLOBAL SCALAR WAS THE ONE CROSSING IN THE TREE WITH NO AMBIENTS AT ALL, and the boundary is
+    EXACT** — sqlgen's `bind_replace`, `tablefn_*`, the ALTER paths and every catalog crossing call
+    `FabricatorSetActiveTxn`, so a global TABLE function has both the host-FS opener and the settings
+    session while a global SCALAR had neither. So it could not read a file through the host FileSystem and
+    could not see a session-scoped provider setting.
+  - **⚠⚠ THE FIX IS A PARAMETER + A MANAGED-SIDE RESTORE, AND v80's RECORD IS WHY.** `scalarfn_bind`/
+    `_execute` take `(opener, session, txn_id)` and the handlers wrap the call in `CallScope`. A bare
+    `set_active_opener` before the call is what v80 tried and it SIGSEGV'd at `OPTIMIZE main.c1`: a scalar
+    is evaluated WHEREVER IT IS CALLED, including inside a nested host query an OUTER operation is running
+    while it holds the ambient, so assigning without restoring leaves that operation resolving a
+    `ClientContext` that is gone. Only the managed side can restore an `AsyncLocal`. **MUTATION-TESTED:
+    `Dispose` emptied ⇒ exit 127 with three lines of output and no assertions, byte-for-byte v80's
+    signature; with it, 147 assertions on both engine legs.**
+  - **⚠⚠ WHAT IT REPLACED WAS WORSE THAN NOTHING — THE SCALAR INHERITED WHATEVER THE LAST BINDER LEFT.**
+    MEASURED with a one-statement discriminator: a plain `SET fluid_template_root` is invisible to
+    `fluid_render`, and putting ONE `SELECT * FROM fluid_replacement_query('SELECT 1 AS x')` between them makes it
+    visible, because sqlgen's `bind_replace` sets the ambients on the BINDER's thread and never clears
+    them. ⚠ The leaked OPENER is the sharper half: a raw `ClientContext *` whose connection may be gone, so
+    a global scalar doing host-FS IO could dereference a dangling pointer — the `table_stats`
+    use-after-free class, which the same day's fs_* null guard CANNOT catch because the pointer is not null.
+  - **⚠ CONSEQUENCE: slice 4's `SET GLOBAL` REQUIREMENT IS GONE** (a plain session `SET` reaches a plugin's
+    global scalar), and so is the `SET GLOBAL TimeZone` advice recorded hours earlier — superseded by v83.
+  - **v83: `host_query` gains an OPTIONAL `client_context`** — 0 = a clean session (the pre-v83 behaviour),
+    non-zero = the caller's, whose **TimeZone** and **catalog search path** are copied onto the fresh
+    connection. `Host.Query(sql, parameters, inputs, clientSession)`; `HostQueryTransport` passes the
+    ambient, so a plugin and a Fluid template's `query()` inherit without asking. **It closes
+    [docs/host-query.md](host-query.md) §OPEN, BOTH items.** ⚠ The search path is ONE thing to copy,
+    not three — `current_catalog()`, `current_schema()` and `search_path` read the same object. ⚠ It does
+    NOT make the query part of the caller's TRANSACTION; still a fresh connection, still COMMITTED reads.
+  - **⚠⚠ AND BOTH OBVIOUS API ROUTES TO APPLY A SEARCH PATH ARE MEASURED WRONG.** `Set(paths,
+    SET_DIRECTLY)` (what shipped) refuses an entry whose catalog is empty — and a captured entry
+    legitimately has one, because a bare `SET search_path='x'` stores `path.catalog =
+    GetDefault().catalog`, which with nothing previously set is `INVALID_CATALOG`, and **`#define
+    INVALID_CATALOG ""`**. `Set(paths, SET_SCHEMAS)` resolves that by calling `Catalog::GetSchema`, which
+    needs an ACTIVE TRANSACTION a fresh idle connection has not got — one INTERNAL error traded for
+    another. What ships is `conn.Query("SET search_path=…")`, which begins its own transaction and resolves
+    exactly as the caller's own `SET` did; two layers of quoting, both DuckDB's own. ⚠ A failed apply is
+    FATAL, unlike the TimeZone fallback beside it: otherwise the statement fails later as "table not found"
+    naming a table that plainly exists.
+  - **⚠⚠ A MUTANT SURVIVED FIRST AND THE SECTION WAS PASSING FOR THE WRONG REASON — the reusable part.**
+    `USE memory.hq_s` earlier in `verify_host_query` leaves a FULLY QUALIFIED entry, and DuckDB resolves a
+    later bare `SET search_path=` against it, so the captured entry had a real catalog and `SET_DIRECTLY`
+    accepted it happily: the assertion asserted nothing. A `RESET search_path` first is load-bearing.
+    ⚠ **The bug reproduced instantly in the shell and NOT in the suite, which is the shape to watch for: a
+    repro that works everywhere except in the test is usually the test's own prior state.**
+
+- **⚠⚠ THE PINNED HOST CONNECTION — ABI **v84**, BUILT 2026-09-03 (user-asked, with the shape given:
+  "con=host.connection() / con.query() / con.dispose()", so "a exec() could create a temporary table on
+  this connection which could be queried in the same render session"). C++ + C#. Full records:
+  [docs/abi-history.md](abi-history.md) §v84, [docs/host-query.md](host-query.md) §PINNED
+  CONNECTIONS, [docs/fluid-templating.md](fluid-templating.md) §12.** Gate `verify_plugin_fluid`
+  238 → **256**; hermetic floor 8497 → **8515**; `verify_host_query` **107** unchanged, which is the
+  behaviour-neutrality claim for the fresh-connection path.
+  - **`host_query` gains a `connection` parameter (0 = fresh, as before) and two entries appear beside it**
+    — `host_connection_open` / `host_connection_close`. Managed: `Host.OpenConnection()` →
+    `Host.HostConnection : IDisposable`; plugin contract `IHostQuery.OpenConnection()` → `IHostConnection`
+    **DEFAULT-implemented, so a published contract gained a member without breaking a plugin** — and with
+    NO capability probe beside it (see below).
+  - **⚠⚠ IT IS NOT "A FASTER FRESH CONNECTION" — a multi-step managed job is INEXPRESSIBLE without it.**
+    MEASURED before building: a TEMP table is invisible from any other connection, a `SET` persists per
+    connection and does not leak, and a temp table is dropped by its own `ROLLBACK`. So "stage, then read"
+    could never work across fresh connections whatever the timing, and a temp table is the right
+    intermediate precisely because nothing else can see it and closing the connection destroys it — no
+    name in the shared catalog, no cleanup.
+  - **⚠⚠ THE ONE HAZARD, AND IT IS A SILENT SHORT READ, WHICH IS WHY THE HOST REFUSES.**
+    `ClientContext::InitialCleanup` — called by EVERY query path, its own comment being *"Cleanup any open
+    results"* — closes the connection's active streaming result. MEASURED: the abandoned stream then
+    reports **an empty batch**, i.e. end-of-stream, so the first query's remaining rows are LOST with no
+    error anywhere (the same pair on two DIFFERENT connections continues correctly). A second statement on
+    a pinned connection with a live stream is therefore REFUSED, naming the cause. ⚠ UNREACHABLE from
+    Fluid, which reads eagerly and disposes before returning, so the refusal carries no test — said in the
+    docs rather than implying coverage.
+  - **⚠ THE HANDLE OWNS A `shared_ptr` AND EVERY RESULT STREAM HOLDS ITS OWN** (the v66 `out_interrupt`
+    idiom reused), so closing the handle while a stream is outstanding is SAFE — the `Connection` dies
+    with the last of them rather than under a live stream. That removes the use-after-free class this file
+    records as invisible on the platform you develop on. `HostQueryStream::conn` became a `shared_ptr`;
+    a fresh-connection call ends at a refcount of one, so nothing changed for it.
+  - **⚠ TWO DELIBERATE REFUSALS.** Named Arrow INPUTS on a pinned connection (a `duckdb_arrow_scan` view
+    is CONNECTION-scoped, so it would outlive the call and collide with the next name — refusing beats
+    leaking a view), and re-applying the v83 session per query (it would undo a `SET` performed THROUGH
+    the pin, which is one of the reasons to pin).
+  - **⚠⚠ THAT SECOND ONE HAS A CONSEQUENCE I DID NOT ANTICIPATE, and a mutant found it: the session is
+    captured at OPEN, so a connection outliving its unit of work hands every later user the FIRST one's
+    session.** MEASURED with a process-wide session: a render under `Asia/Kolkata` reported the zone the
+    FIRST render had seen, failing a PRE-EXISTING v83 assertion. **A wrong VALUE, not stale scratch
+    state** — which is the sharpest of the three reasons the Fluid engine scopes its connection to ONE
+    RENDER (the others being that "a rendered template" is what was asked for, and thread safety by
+    construction, since a volatile scalar may be evaluated on several threads at once).
+  - **THE FLUID SIDE: `FluidRenderSession`, created per render in `FluidEngine.Render`, LAZILY.** Both
+    `query()` and `exec()` — and the CLASSIFIER, so one connection per render rather than one per
+    classification — go through it. ⚠ Lazy is load-bearing rather than an optimisation: `fluid_render`
+    is evaluated PER ROW, so an eager open would cost one per row for every template, including the
+    overwhelming majority that run no SQL.
+  - **⚠⚠ IT SPLITS §11.1b INTO THE TWO FACTS IT ALWAYS WAS.** That entry measured that "a statement cannot
+    see the write its own template made" and treated it as one rule. The template's own later `query()`
+    was an artefact of per-call connections and now SEES it; the SURROUNDING statement still cannot,
+    because its snapshot predates the commit. ⇒ **stage for the TEMPLATE to read and interpolate (gated
+    on both surfaces), never for the generated SQL to `SELECT FROM`.**
+  - **⚠ THE GATE'S DISCRIMINATOR IS A *TEMP* TABLE, and a plain table would not be one** — a plain table is
+    COMMITTED by `exec()`, so a fresh-connection `query()` would see it too and the assertion would pass on
+    the OLD behaviour. The sharpest assertion is the per-row one: three rows each create the SAME
+    temp-table name with different values and each reads its own back (10/20/30), which on one shared
+    connection would fail as "already exists".
+  - **⚠⚠ MUTATION-TESTED, AND THE MOST USEFUL RESULT IS THE ONE THAT SURVIVED.** A (never pin) dies at the
+    first §12 assertion after 238 pass. C (one session process-wide) dies at a PRE-EXISTING assertion,
+    which is stronger than dying at mine — per-render scoping was already correctness-bearing — and was
+    independently MEASURED to be caught by §12's own "next render" assertion (the second render read
+    `leaked=7` under that mutant). **B (never dispose) SURVIVED, and it was the WRONG MUTANT: isolation
+    comes from building a NEW session per render, not from disposing one, so a no-op `Dispose()` passes
+    everything.** What `Dispose()` prevents is a native connection LEAK — one per render for the process's
+    life — which no SQL assertion can observe. Recorded in the suite rather than left to be re-derived.
+  - **⚠⚠ AND IT MADE THE `fluid_replacement_query` BIND-REPETITION FOOTGUN A NON-ISSUE FOR STAGING — measured, and it
+    is what makes the temp-table idiom RIGHT rather than merely tidy.** §11 measured that a writing
+    template behind a VIEW writes on EVERY use (1 → 2 → 3 → 4). A view over a TEMP-staging template used
+    twice answers **5 and 5**, because each bind gets its own connection and its own temporary catalog, so
+    the same CREATE simply runs again; the same shape staging into a REAL table dies with *"Table with
+    name realst already exists!"* at the FIRST select (the `CREATE VIEW` already bound once). Both gated
+    — ⚠ the real-table row is a CHARACTERIZATION test of DuckDB's bind repetition, so no mutant of ours
+    can kill it; it is pinned because it is the REASON to reach for a temp table.
+  - **⚠⚠ IT PINS UNCONDITIONALLY — A FALLBACK WAS REMOVED, AND THE REASON GENERALISES (user-questioned:
+    "i actual thought fluids render would pin the connection?").** The first build consulted
+    `IHostQuery.CanPinConnection` and degraded to a fresh connection per call when false. Wrong twice: the
+    Fluid provider is a BUILT-IN published beside the bridge, so it cannot meet an older host and the
+    branch was DEAD (its own comment said so) — and had it fired, `exec()` and `query()` would QUIETLY
+    STOP SHARING, i.e. a template that runs and means something different with nothing failing.
+    ⚠ The same question also caught a WRONG MESSAGE on the interface's default implementation — it claimed
+    to be about an old HOST, which cannot reach managed code at all (the C++ side refuses a
+    version-mismatched bridge at boot); the default fires only when an IMPLEMENTATION did not override the
+    member, i.e. a plugin author's test double, which is the only reason it exists.
+  - **⚠⚠ AND THE PROBE ITSELF IS GONE — user decision the same day ("we don't need any fallbacks with
+    CanPinConnection"), and the principle it leaves behind is worth more than the member was.**
+    `CanPinConnection` was built on all THREE layers (`IHostQuery`, `Host`, `HostFs`) and all three are
+    DELETED, because a probe exists only so a caller can DEGRADE. ⇒ **a capability probe is worth having
+    exactly when the DEGRADED PATH IS STILL RIGHT.** `Host.CanQuery` STAYS and has a dozen real callers:
+    a provider that cannot reach the host engine falls back to its own parquet reader and still answers
+    CORRECTLY — slower, not different. Failing to pin gives statements that quietly stop sharing a
+    connection, i.e. a DIFFERENT answer with nothing failing. ⚠ What remains is a null GUARD inline in
+    `HostFs.OpenConnection` (a zeroed services block yields a sentence rather than a null-pointer call),
+    and nothing branches on it.
+  - **⚠ THE VERSION GUARD EARNED ITS KEEP IMMEDIATELY**: `abi.h` was bumped and
+    `Bootstrap.Initialize`'s `vtable->AbiVersion` was not, so the first run died with
+    `ABI version mismatch (host=84, bridge=83)` before anything else could go wrong — this file's own
+    "bump BOTH" rule demonstrating itself. Without it the symptom would have been a call through a shifted
+    signature.
+  - ⚠ Incidental, and worth knowing for any probe: a leftover `duckdb.exe` from an earlier batch probe held
+    a LOCK on the shell binary, so the link failed with `LNK1104: cannot open file 'duckdb.exe'` while
+    every object file compiled fine. Check `Get-Process duckdb` before blaming the build.
+
+- **⚠ THE FUNCTION-CONTRACT CLEANUP — THREE COMMITS 2026-08-28 (`8d3dbed`/`167030c`/`5c65fa8`), C#-only,
+  NO ABI change, BREAKING for plugin authors (no aliases — the `IArrow*` precedent). Full record:
+  [docs/abi-history.md](abi-history.md) §The function-kind naming normalization + the v80 SUPERSEDED
+  note.** What a session needs to know:
+  - **`IBackendCatalog.ScalarFnBind` IS GONE — `GetScalarFunction(schema, name)` returns the scalar's
+    DEFINITION (`IScalarFunction?`, null = not hosted, refused BY NAME host-side) and the HOST binds per
+    call site** (the `GetTable` split: catalogs resolve definitions, binding is the host's per-call act).
+    `ScalarBindingHandle` is Bridge-INTERNAL now; the copy-pasted `new ScalarBindingHandle(fn,
+    fn.Bind(args))` left all five providers. The `scalarfn_*` ABI entries and C++ are untouched.
+  - **Every function member of `IBackendCatalog` has a throwing default with ONE wording**
+    (`IBackendCatalog.NotHosted`), justified by the declared-set rule `LateralBind` shipped under — so
+    DAX/DeltaRs/Stub deleted their refusal stubs, and a provider hosting no functions of a kind implements
+    nothing. ⚠ The user's `AbstractBackendCatalog` idea was resolved as DIMs instead: an abstract base would
+    cost single inheritance (providers implement several interfaces on one class) and add a second coupling
+    surface for plugins, while DIMs were already this interface's pattern (`CapabilitiesJson`, `LateralBind`,
+    `GenerateTableSql`, `Initialize`). ⚠ DML/DDL/txn members deliberately did NOT get refusal DIMs — the
+    declared-set justification does not hold there (any user can run INSERT against any catalog), so a
+    read-only-catalog convenience remains a possible follow-up, weighed separately.
+  - **The naming rule: `I<Kind>Function` → `Bind` → `I<Kind>FunctionBinding` (+ `ICatalog<Kind>Function`),
+    kinds = the decl vocabulary** (`scalar`/`table`/`inout`/`collector`/`lateral`/`aggregate`), mirroring
+    `ITable`→`ITableBinding`. Renames: `IInOutBinding`→`IInOutFunctionBinding`,
+    `ICollectorBinding`→`ICollectorFunctionBinding`, `ILateralBinding`→`ILateralFunctionBinding`,
+    `ICollectorTableFunction`→`ICollectorFunction`, `ICatalogCollectorTableFunction`→
+    `ICatalogCollectorFunction`, `ILateralTableFunction`→`ILateralFunction`.
+  - **`Bound` left the vocabulary: `IBoundTableFunction` → `ITableFunctionSession`** (with
+    `BindingBoundTableFunction`→`TableFunctionBindingAdapter`, `TvfBoundTableFunction`→
+    `TvfTableFunctionSession`, `DaxEvalBoundTableFunction`→`DaxEvalTableFunctionSession`). The convention:
+    **`…FunctionBinding` = what an author's `Bind` returns (author contract); `…Session` = what the ABI
+    handle holds (host/transport contract)**; in-out/lateral hold their binding directly because the author
+    contract suffices there. ⚠ Unifying discovered TVFs under `ITableFunction` to delete the session layer
+    was considered and REJECTED (stream-native TVF/daxeval; `MapResultByName=false` has no author-side
+    home) — do not re-propose it as an obvious simplification.
+  - Both rename passes proven mechanical by the masking check; historical rename-record passages in
+    abi-history.md / global-functions.md / this file DELIBERATELY keep the old names. ⚠ The three plugin
+    repos (`fabricator-sustainalytics`, `fabricator-quantax`, `fabricator-dlrest`) pin this repo by sha and
+    each hand-writes exactly the deleted boilerplate — they migrate at their next pin bump (drop
+    `ScalarFnBind` for `GetScalarFunction`, delete refusal stubs the DIMs now cover, mechanical renames).
+
+- **`catalog_init` — THE PROVIDER INIT HOOK. ✅ BUILT 2026-08-20 (ABI v78, ADDITIVE; C++ + C#), user-directed
+  ("we need a function on backend at attach time where context/session is set to do some init before the
+  other gettables and so on are called"). Gate `verify_catalog_init` 14 (hermetic), mutation-tested. Full
+  record: [docs/abi-history.md](abi-history.md) §v78.** `IBackendCatalog.Initialize()` (a DIM no-op),
+  called from `LoadCatalog` right after `FabricatorSetActiveTxn` and BEFORE every discovery crossing.
+  - **⚠⚠ THE GAP IT CLOSES IS A CONTRACT GAP, AND THE ACCIDENT IT REPLACES IS THE FINDING.** `open_catalog`
+    runs with NO ambients because it only CONSTRUCTS (measured — `fabricator_storage.cpp:211`'s mutant), so a
+    provider needing a context had to hang its setup off whichever discovery call ran FIRST — **and that
+    order is not part of the contract**. In practice `get_capabilities` became the de-facto init hook by
+    being first, which is how **SQL Server's first CONNECT came to happen inside a call documented as
+    reading a doc of booleans** (`CapabilitiesJson` → `Profile.IsBinaryCollation` → `EnsureProfile()`).
+  - **⚠ EXCEPTIONS PROPAGATE, and that is the PLACEMENT not the entry.** The call sits ABOVE
+    `DiscoverSchemas` and nothing in `LoadCatalog` wraps it — the only `catch` there is scoped to the
+    capability read BELOW it, which is what makes the placement safe rather than lucky. MEASURED:
+    `IO Error: MSSQL connection validation failed: … catalog_init failed: 258: …` and `duckdb_databases()`
+    has NO such row.
+    - **⚠⚠ THE INJECTED FAULT WAS NOT THE ONE I NAMED — the recurring error of this project in its purest
+      form.** I wrote this up as "measured with a bad password". Error **258** is *"a network-related or
+      instance-specific error … the wait operation timed out"* = an UNREACHABLE SERVER; a rejected credential
+      is **18456 "Login failed for user"**. The docker stack had stopped without my noticing, so the probe
+      injected unreachability — the same stoppage then failed every SQL Server suite of the service tier,
+      which is how it surfaced. **The MECHANISM claim survives untouched** (`Initialize()` →
+      `EnsureProfile()` → connect → throw → propagate → wrapped → no catalog is ONE path whatever broke the
+      connection, and the message names `catalog_init` either way). ⚠ The tell sat in the output the whole
+      time and I read past it: **a wrong password cannot produce a TIMEOUT.**
+    - **✅ RE-MEASURED PROPERLY once the stack was back, and WITH THE CONTROL THE FIRST PROBE HAD NONE OF:**
+      leg A attaches with the CORRECT password (so the server is provably reachable — that is what makes leg
+      B mean anything), then leg B uses a genuinely wrong password against that same server ⇒
+      **`catalog_init failed: 18456: Login failed for user 'sa'.`** and `duckdb_databases()` has NO such row.
+      Both legs of the failure surface are measured now. **The missing half was never the assertion, it was
+      the control** — which is the same lesson as the §2 secret-scope A/B and the `verify_mars_off_same_catalog`
+      §0 positive control.
+  - **⚠⚠ AND THE REAL HOLE WAS ONE CALL OVER FROM WHERE IT WAS EXPECTED — worth keeping because the expected
+    failure was NOT reachable.** The motivating worry ("a bad credential yields a successfully attached,
+    EMPTY catalog") could not happen: `DiscoverSchemas` is not one of the swallowing calls, so the same
+    fault already failed the ATTACH at `catalog_schemas` with no catalog created (measured on the mutant
+    build, with that same unreachable-server fault — see the correction above). What WAS broken is `FetchCapabilities`' `catch (...)`, which guards TWO unrelated things — a
+    provider that cannot answer (fine, defaults are the safe direction) and a TRANSIENT failure of whatever
+    it needs to answer. The second **disabled string ORDER BY+LIMIT pushdown and exact filter pushdown for
+    the CATALOG'S WHOLE LIFE with no signal anywhere.** It now WARNS naming the catalog and what is off, and
+    is deliberately STILL NOT FATAL: the defaults are CORRECT, merely slower, so turning a degradation into
+    a failed ATTACH is the worse trade. **Made visible, not made fatal.**
+  - **⚠ LAZY INIT MUST NOT BE REMOVED IN FAVOUR OF THIS.** A catalog reached through `fabricator_query` /
+    `fabricator_exec` with a raw connstr, or a transient one built by `COPY … (FORMAT delta)`, never goes
+    through `LoadCatalog` and so never receives the call. `SqlServerCatalog.Initialize()` is
+    `=> EnsureProfile()` and that method KEEPS its double-checked guard — an eager, well-placed TRIGGER, not
+    a replacement.
+  - **What it costs: nothing new.** That connection was already paid inside the ATTACH statement; what
+    changes is WHERE it happens and therefore what a failure SAYS.
+  - **⚠ THE GATE CAN ONLY PIN THE CROSSING ORDER, and the suite says so rather than implying more** — the
+    change moves WHERE work happens, not WHAT any answer is, so no row assertion can distinguish the two
+    (hermetic came out at 7705 + exactly 14, i.e. no other suite moved). Two instrument notes recorded in
+    it: assert the MANAGED line (`abi catalog_init`), never the host's, since the host's proves only that it
+    CALLED; and compare with `<=` not `<`, because **`duckdb_logs` has NO sequence column** (I reached for a
+    `log_id` that does not exist — the columns are context_id / scope / connection_id / transaction_id /
+    query_id / thread_id / timestamp / type / log_level / message) and on Delta, whose `Initialize` is a
+    no-op, init and the first discovery call can share a microsecond. `<=` still catches the regression:
+    moving the call after discovery lands it STRICTLY later.
+  - **⚠ NAMING, and it is the reason this hook was asked for: `OpenCatalog` CANNOT OPEN ANYTHING** — no
+    opener, no session, construction only. It should be `CreateCatalog`, with `Open`/`Initialize` taking the
+    name that describes opening. Bundle it with the `opener` → `client_context` rename above: both are the
+    same mistake, a name describing the first consumer or the hoped-for role rather than what the thing does.
+  - ⚠ Pre-existing wart this surfaced, NOT introduced and NOT fixed: an ATTACH-time crossing failure nests
+    JSON inside a string (`MSSQL connection validation failed: {"exception_type":"IO","exception_message":…}`)
+    because `ThrowManagedError` throws a `duckdb::IOException` and `FabricatorAttach` re-wraps `ex.what()`.
+    Every managed crossing that fails during load reads that way.

@@ -768,3 +768,185 @@ gap arose in the first place: **a declaration surface that only ever ships on on
   onto the body's references (`view_binder->entry_retriever.SetAtClause(entry_at_clause)`), so
   `FROM v AT (VERSION => n)` time-travels what the view READS. Consuming it in `LookupEntry` would instead
   try to time-travel the DECLARATION, which has no versions.
+
+## Appendix — records moved verbatim from CLAUDE.md (2026-09-18)
+
+CLAUDE.md carried these as-built records inline until it grew to 10,776 lines — a file loaded into every
+session's context. They are moved here VERBATIM; CLAUDE.md keeps each entry's summary head plus a pointer to
+this section. The one edit made on the way: a link that pointed into the docs directory is rewritten relative
+to this directory, so it still resolves from here.
+
+- **⚠⚠ `Fabricator.Functions` — A BUILT-IN PROVIDER WHOSE ONLY CONTRIBUTION IS GLOBAL MACROS, SHIPPED AS
+  REAL `Macros/*.sql` FILES. BUILT 2026-09-15 (user-directed: *"let us add a seperate plugin project for
+  such useful global functions `Fabricator.Functions`. look at fabricator-grist repo. there we put all
+  macros as sql into a macros subfolder which are added as a resource"*). C#-only, NO ABI change, NO C++
+  change. First occupants: `table_zip` / `query_zip`, developed interactively against the real extension
+  over the preceding session. Gate: a NEW hermetic suite `verify_functions_zip` (**67**), floors
+  9343 → **9410** and MIN_SUITES 76 → **77**, three mutants. Hermetic **77/77 — 9410**, i.e. 9343 + 67
+  exactly, which is the behaviour-neutrality claim for the `ProviderRegistry` change below — it touches
+  EVERY provider's discovery.**
+  - **⚠⚠ A THROW FROM `GlobalMacros` REMOVES EVERY GLOBAL FUNCTION IN THE PROCESS — MEASURED, and it is
+    why the drift guard I wrote first had to be REVERSED into a warning.** `list_global_functions` reads
+    every provider's `GlobalMacros`, so one throw there drops the lot: with a single macro file renamed,
+    **`table_zip` AND `query_zip` AND `fluid_render` AND `fluid_scalar` all vanished**. After the rewrite
+    the same mutant leaves `table_zip` at 0 and every one of the others at 1. ⇒ **the blast radius of a
+    guard is part of the guard**, and a throwing one here is STRICTLY WORSE than the quiet failure it was
+    meant to catch — everything disappears, and the cause is named only in a log nobody has enabled.
+    - It is the **v80/v89 `Field?` trap reached from a new direction**, which is what makes it worth
+      recording rather than merely fixing: that record says *"a single throw inside `list_global_functions`
+      drops EVERY global function"*, and I re-derived it by measurement instead of reading it.
+    - ⚠ **`Activator.CreateInstance` DOES NOT trigger the static initializer here** — a class with no
+      explicit static constructor is `beforefieldinit`, so `Declared` initialised at the first STATIC FIELD
+      read, i.e. inside `get_GlobalMacros()`, one crossing later than the registry's construction site.
+      That is why a catch around the registration could not see it.
+  - **THE DELIVERY PATH IS QUIET IN THREE INDEPENDENT WAYS, and §1 of the gate is the only thing that sees
+    any of them**: the `<EmbeddedResource Include="Macros/*.sql" />` item matching nothing, the
+    `publish-managed.ps1` line being absent (the glob discovers what was PUBLISHED, so that one line IS the
+    declaration), and `MacroDefinition`'s own contract — *"a statement that does not parse is skipped with a
+    warning at load"*. All three surface at a CALL SITE as *"… does not exist"*, three layers from the
+    cause. ⇒ the registration row is not ceremony; it is the whole delivery gate.
+  - **⚠⚠ A REFUSAL IN A PROJECTION IS SWALLOWED BY `count(*)` — a NEW instance of this file's most-repeated
+    trap, and the first where it made a REFUSAL vacuous rather than a measurement.** Both macros refused
+    bad input with `SELECT error('…')`; DuckDB PRUNES a projected column nobody reads, so
+    `SELECT count(*) FROM table_zip(['typo'])` answered **1** — the one row of the degenerate statement —
+    instead of raising. MEASURED both ways: `SELECT count(*) FROM (SELECT error('boom'))` returns 1,
+    `… FROM (SELECT 1 AS x WHERE error('boom'))` raises. Every refusal is now
+    `SELECT 1 AS zip_error WHERE error(…)`, because **a filter must be evaluated**.
+    - ⚠ **Only a `count(*)` row can see the difference** — a `SELECT *` assertion passes under EITHER form,
+      which is exactly why §10 is written with `count(*)` and says so. Mutant C (one refusal back in the
+      projection) passes **62** assertions and dies at exactly that row.
+  - **✅ AND IT CLOSED A GENUINELY SILENT HOST PATH ON THE WAY (C#-only): built-in provider discovery
+    swallowed a throwing assembly with NO LOG AT ALL.** `ProviderRegistry`'s loop had one bare `catch`
+    covering two very different cases; it now splits them — **Debug** for an assembly that will not LOAD
+    (ordinary: the default list names `Fabricator.DeltaRs`, which ships only under `-IncludeDeltaRs`, so
+    "not there" is the normal state) and **Warning** for one that loaded and whose registration THREW,
+    naming the assembly and the exception. ⚠ **It is UNGATED and it did NOT catch the macro case** (see the
+    `beforefieldinit` note above) — it is an independent fix to a real hole, not this feature's guard, and
+    the code says so rather than implying coverage.
+  - **⚠ THE WARNING REACHES THE SINK AT THAT POINT IN STARTUP, MEASURED rather than hoped**: with one macro
+    renamed the file sink carries `WARN [Fabricator.Functions] functions: Macros/tablezip.sql declares
+    CREATE MACRO 'table_zip' …`, i.e. `FabricatorServices.Get<IHostLog>()` is already published during
+    global-function registration. My own code comment had guessed the opposite and was corrected to what
+    was measured.
+  - **⚠⚠ THE GATE'S SHARPEST ROW IS A TEMP TABLE, and it pins a split nothing else can see:** under
+    `similar_to := true` the CATALOG LOOKUP runs on the render's OWN pinned connection (so a TEMP relation
+    is invisible to it) while the GENERATED STATEMENT is bound by the CALLER (so the same TEMP relation is
+    perfectly visible under `similar_to := false`). A build doing the lookup on the caller's connection
+    passes every other row in the file.
+  - ⚠ Two smaller measured things worth keeping: **`DESCRIBE` IS usable as a subquery source** (unlike
+    `EXPLAIN`, whose refusal this file already records — the two read alike and behave differently), and
+    **`require json` is LOAD-BEARING again** — `table_zip`'s catalog lookup is a `{% query %}` block, the
+    Fluid classifier is `json_serialize_sql`, and `unittest` does not auto-load, so without it EVERY call
+    is refused fail-closed and the suite reads as a broken FEATURE rather than a missing REQUIRE. Third
+    occurrence.
+  - ⚠ **It depends on `Fabricator.FluidPlugin` AT CALL TIME, not at load time** — every macro body is a
+    `fluid_replacement_query` and DuckDB binds a macro body LAZILY, so the two publishes are independent
+    and their ORDER is irrelevant; a payload carrying this and not Fluid registers the macros happily and
+    fails at the first call site.
+  - ⚠ The three mutants, each killed at its own row: **A** (a macro file renamed so its name disagrees with
+    its `CREATE MACRO`) and **B** (the `EmbeddedResource` item matching nothing) both die at §1's
+    registration row after **0** pass — the delivery gate doing its whole job — each naming its own cause in
+    the log; **C** is the projection-form refusal above, at 62.
+  - ⚠ Wiring, both of which are the ONLY place their fact is stated: a `Publish-Project` line in
+    `publish-managed.ps1` (the publish IS the declaration) and `Fabricator.Functions` appended — never
+    prepended — to `ProviderRegistry`'s hardcoded FALLBACK list, which matters only for a host that cannot
+    locate its managed directory.
+
+- **`ViewDefinition` — a PROVIDER-DECLARED VIEW. ✅ BUILT 2026-08-19 (ABI v77, ADDITIVE; C++ + C#),
+  user-raised. Gates: `verify_views_catalog` **59** (hermetic, three mutants each killed at its own section)
+  + `verify_functions` 27 → **34** (service) for the SECOND provider — mutation-tested.
+  Full record: [docs/macros-and-sqlgen-functions.md](macros-and-sqlgen-functions.md) §5.** A provider
+  declares one complete `CREATE VIEW` statement (`IBackend.CatalogViews`); the host parses it and binds it
+  into the ATTACHed catalog's schema, where it resolves as an ordinary relation `db.schema.v`.
+  - **IT IS SAFER THAN A CATALOG MACRO, not merely parallel to it, and that is why it was worth building.**
+    `bind_basetableref.cpp:309-311` anchors a view body's search path to the VIEW's OWN catalog+schema —
+    exactly the hazard §1.4 records for macros (a macro body binds in the CALLER's context, so an
+    unqualified table reference silently resolves against the caller's catalog) and cannot fix. So a view
+    needs NO ATTACH alias threaded in, closing the gap §1.4 hands off to `ISqlTableFunction`.
+    - **MEASURED WITH A DECOY, which is what makes it a measurement**: a table in the lake AND an
+      identically-named one in the caller's default catalog; the view returns the LAKE's row. Without the
+      decoy the same assertion is equally true of a build with no anchoring at all.
+    - **⚠ THE ANCHORING IS FREE — WE DO NOT ARRANGE IT, and a comment claiming we did SURVIVED review and
+      was killed by its own mutant.** `GetOrCreateView` overwrites `info->catalog`/`info->schema`, written
+      up as "load-bearing: the binder derives the search path from these two fields". Removing both lines
+      leaves the whole suite GREEN, decoy included — the binder reads `ParentCatalog()`/`ParentSchema()`,
+      which come from the `ViewCatalogEntry` CONSTRUCTOR args. They are kept for a different, real reason
+      (the entry must not describe itself as living somewhere else). **A line in the right place is easy to
+      justify with the wrong reason.**
+  - **⚠⚠ THE PRE-BUILD ANALYSIS GOT THE ONE FACT THAT MATTERED BACKWARDS: `CreateViewInfo::FromCreateView`
+    BINDS** (`create_view_info.cpp:93-94` — `Binder::CreateBinder` then `BindCreateViewInfo`). It was
+    recorded here as *"parses and rewrites catalog/schema; it never binds"*, and EVERY consequence drawn
+    from that — no ordering problem, the deadlock dodged — was unearned. So the build does NOT use it:
+    `GetOrCreateView` parses ONLY (the `GetOrCreateMacro` shape) and leaves `types`/`names` empty, which is
+    what constructs the entry **UNBOUND** (`view_catalog_entry.cpp:20-34`); DuckDB binds lazily at first use.
+    With that, the consequences hold and are gated — declaration order is irrelevant in BOTH directions, and
+    `duckdb_views()` does NOT bind (`column_count IS NULL`, asserted on a fresh attach before anything
+    touches a view), which is what keeps enumerating a OneLake catalog's views off the `_delta_log`.
+  - **⚠⚠ THE DEADLOCK IS REAL AND ITS MANIFESTATION IS WORSE THAN A HANG — MEASURED.** Binding while holding
+    `entry_lock_` re-enters `LookupEntry` → `GetOrCreateEntry`/`GetOrCreateMacro` → the same non-recursive
+    mutex. Mutant (eager `BindView`): **MSVC throws `resource deadlock would occur`**, our best-effort catch
+    turns it into a SKIP, and **every view whose body touches the catalog is SILENTLY DROPPED while a
+    constant-only one survives** — so a smoke test on the trivial view passes and precisely the views that
+    justify the feature are gone. On glibc the same re-lock is UB and typically HANGS. **STANDING RULE:
+    never call anything that BINDS while holding `entry_lock_`.**
+  - **⚠ THE DEFECT THE BUILD PRODUCED, invisible to review and to every other assertion: `duckdb_columns()`
+    returned NOTHING for views.** I wrote that views must not be reported under the `TABLE_ENTRY` scan
+    because *"DuckDB's own catalogs keep the two apart the same way"* — **the exact opposite of the truth**.
+    `DuckSchemaEntry::GetCatalogSet` (`duck_schema_entry.cpp:386-388`) puts VIEW_ENTRY and TABLE_ENTRY in
+    ONE `CatalogSet`, so a TABLE_ENTRY scan yields both and every consumer filters by the entry's ACTUAL
+    type — and **`duckdb_columns()` scans `TABLE_ENTRY` ALONE** (`duckdb_columns.cpp:91`) and handles both.
+    Omitting views there does not keep them out of `duckdb_tables()` (that filter is the consumer's job
+    either way); it only makes them invisible to `duckdb_columns()` / `information_schema.columns`. Fixed by
+    reporting from BOTH scans; mutation-tested — reverting dies at §7 after 39 pass, i.e. no ANSWER moves.
+  - **NAME COLLISION: REFUSED, and the "refuse at declaration" of the analysis moved to LOOKUP.** Views share
+    the `TABLE_ENTRY` lookup with discovered tables, so one must win and either winner is a wrong ANSWER.
+    `AddView` drops a colliding declaration and records the name; `LookupEntry` throws naming BOTH sides.
+    Refusing the ATTACH would destroy an otherwise working catalog over one bad declaration — not what the
+    macro path or the plugin scan do. ⚠ Only as good as ENUMERATION: an ATTACH `table_filter` can hide a
+    table that still exists, and then the view wins silently (accepted — establishing absence would cost a
+    probe per declared view). ⚠ Manufacturing the collision from SQL needs the table written with the
+    catalog UNATTACHED (`COPY … TO '<root>/<name>' (FORMAT delta)`).
+  - **NOT redundant with a zero-arg `ISqlTableFunction`**: a view is a RELATION — `duckdb_views()` /
+    `duckdb_columns()` list it, dbt and BI tools enumerate it, and it can go anywhere a table can.
+  - **⚠ THE SECOND-PROVIDER GAP, and why it existed: `cm_pct`, the SQL Server catalog-bound MACRO, is gated
+    NOWHERE.** A declaration surface that only ever ships on one provider LOOKS covered — the hermetic suite
+    proves the host mechanism and says nothing about whether a second backend's declarations arrive. Closed
+    for views (`verify_functions` +7, mutation-tested); still open for macros. ⚠ That section must re-ATTACH,
+    because the one above it DETACHes — without a live catalog its bare-name refusal would assert only that
+    nothing is attached, which is the vacuous-pass shape.
+  - Two smaller things measured: `information_schema.tables` classifies a declared view as **VIEW** and the
+    provider's real tables as **BASE TABLE** (gated, with the table as the control — that is the surface dbt
+    and BI tools read); and the **AT clause is deliberately not consumed** on the view branch, because DuckDB
+    PROPAGATES it through the view onto the body's references, so `FROM v AT (VERSION => n)` time-travels what
+    the view READS rather than the declaration.
+  - Delta ships three demo declarations (constants / over a catalog-bound MACRO / over a table that need not
+    exist), SQL Server one; DAX/DeltaRs/Stub answer empty. `IBackendCatalog.GetViews()` is REQUIRED, like
+    `GetMacros()` — costs the in-tree plugin nothing, which implements `IBackend` only.
+
+- **PROVIDER-DECLARED DuckDB MACROS — DONE (no ABI bump; decl kind `macro` + body column).** DuckDB
+  parses the full CREATE MACRO grammar; registered into the SYSTEM catalog at load; injection-free by
+  construction. [docs/macros-and-sqlgen-functions.md](macros-and-sqlgen-functions.md) §1;
+  verify_macros 41 + verify_plugin 10. Full as-built record (moved verbatim from here): [docs/feature-history.md](feature-history.md).
+  - **CATALOG-BOUND (attach-time) macros — DONE (2026-07-30, no ABI bump; new metadata kind 15).** Resolve
+    as `db.schema.m(…)`; the old "§2 covers it" dismissal was **half wrong** and that half is what got
+    built. Works by the pattern we already ship: a macro entry returned from `LookupEntry` is expanded
+    normally, because DuckDB looks up `SCALAR_FUNCTION_ENTRY`/`TABLE_FUNCTION_ENTRY` and then dispatches on
+    the entry's ACTUAL type — the same one-namespace fact that forces our scalar lookup to surface custom
+    aggregates. **A schema gives NAMESPACING, not resolution scope**: expansion captures no search path, so
+    an unqualified table reference in the body resolves in the CALLER's context (silent wrong table, not an
+    error) — so sqlgen (§2) really is the answer for a table macro naming its own catalog, but sqlgen is
+    TABLE-valued only, so it is NO answer for a per-catalog **scalar** helper, and the 4e custom scalar is
+    marshaled where a macro crosses nothing. Gate `verify_macros_catalog` 50 (hermetic); full record in
+    [docs/macros-and-sqlgen-functions.md](macros-and-sqlgen-functions.md) §1.4.
+    **Three traps worth carrying forward:** (1) the body rides its **own metadata kind**, NOT a column on
+    the FUNCTIONS stream — that stream is built as **T-SQL executed on the server**, so a column there would
+    have shipped a local declaration to SQL Server and back and made declaring a macro depend on server
+    reachability (and offered nothing to the SQL-less Delta catalog); reading the producer is what caught
+    it. (2) `GetOrCreateMacro` MUST filter by wanted kind: the binder `Cast<>`s on the entry type without
+    checking, so handing a scalar lookup a table macro is an unchecked bad cast. (3) macros must be emitted
+    by the **SCALAR/TABLE_FUNCTION** `Scan`s, since those are the only types `duckdb_functions()` asks for
+    (it switches on the actual type itself). Also fixed en route: a latent OOB read in `ReadStringTable`
+    (asks for N columns, and a provider answering an unimplemented kind returns its 1-column `_ =>`
+    fallback — a Delta catalog does exactly that for FUNCTIONS, which asks for 3). The check is per BATCH
+    and only when `length > 0`; validating the SCHEMA's width instead **broke every Delta ATTACH**, so that
+    leniency is load-bearing, not merely tolerated.

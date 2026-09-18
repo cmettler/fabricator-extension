@@ -1461,3 +1461,342 @@ transactional semantics.
     DELETE genuinely expensive (a ~200-row delete finished in <17 s; `id % 7 = 3` rewrites nearly every file).
     Re-creating the table did NOT help — the warmth that matters is the SPARK CLUSTER's, so whichever leg runs
     second is fast; each level needs its own run in the cold first slot (`sparkprobe conflict <Level>`).
+
+## Appendix — records moved verbatim from CLAUDE.md (2026-09-18)
+
+CLAUDE.md carried these as-built records inline until it grew to 10,776 lines — a file loaded into every
+session's context. They are moved here VERBATIM; CLAUDE.md keeps each entry's summary head plus a pointer to
+this section. The one edit made on the way: a link that pointed into the docs directory is rewritten relative
+to this directory, so it still resolves from here.
+
+- **⚠ REVERSED 2026-08-11 (user decision): the Delta catalog default is `write_serializable` again.** The
+  entry below is the record of the 2026-08-01 flip and its measurement, ALL OF WHICH STILL HOLDS — Fabric
+  Spark really does commit at `Serializable` and really does refuse to SET `WriteSerializable`, so on a
+  table declaring no level we are once more the more permissive writer and the effective guarantee depends
+  on which engine wrote last. What changed is which side of that trade-off we take: **row-level concurrency
+  is a `write_serializable`-ONLY relaxation**, so under `serializable` concurrent disjoint-row DML on one
+  file conflicts instead of composing. `isolation_level 'serializable'` on the ATTACH restores the aligned
+  behaviour, and a table's own `delta.isolationLevel` still outranks the catalog either way.
+  - ⚠ **It also makes `ExemptRowLevelFromWholeTableRead` LIVE again.** The Bridge sets that opt-in
+    UNCONDITIONALLY while EW's gate is `exempt && rowLevel && isolationLevel != Serializable`, so under the
+    2026-08-01 default it was IGNORED and the over-broad case was unreachable — the entry below says
+    "INERT UNDER OUR DEFAULT", and that sentence is now FALSE. `BEGIN; SELECT avg(x) FROM t;
+    DELETE FROM t WHERE x > 42; COMMIT;` is exempted although the row-level validation covers only the
+    REMOVED rows. Reasoned, not measured, and no longer inert.
+
+- **THE DELTA ISOLATION DEFAULT FLIP — DONE (2026-08-01, behaviour-breaking for CONCURRENT writers).** The
+  catalog default is now **`serializable`** (was `write_serializable`), because the measurement below showed
+  the old default made us the WEAKER writer than Fabric Spark on any table that declares no level — so the
+  effective guarantee depended on which engine wrote. Single-writer behaviour is unchanged; concurrent
+  read-write transactions now conflict-abort against a matching blind append where they used to commute.
+  Explicit `isolation_level 'write_serializable'` restores the old behaviour, and a table's own
+  `delta.isolationLevel` still overrides the catalog.
+  - **⚠ The biggest practical effect is NOT the blind-append rule — ROW-LEVEL CONCURRENCY is a
+    WriteSerializable-ONLY relaxation**, so under the new default concurrent disjoint-row DML on one file
+    CONFLICTS where it used to compose. Three suites caught it the moment the default moved. Users who rely
+    on that must attach `isolation_level 'write_serializable'` (one option, old behaviour).
+  - **The ATTACH option is now the FALLBACK EVERYWHERE — it was not.** "Table property wins, catalog default
+    applies only when the table is silent" held in the buffered path (`PendingSerializable`) but NOT in the
+    autocommit rowid DELETE, which read the catalog flag directly. So `delta.isolationLevel = Serializable`
+    + ATTACH `write_serializable` behaved INCONSISTENTLY on ONE table: strict inside BEGIN..COMMIT,
+    row-level-relaxed for a bare DELETE. Both now route through one `EffectiveSerializable`. The old defence
+    ("a single autocommit statement has no cross-statement reads to serialize, so it is only a resilience
+    knob") is true about the SEMANTICS and beside the point about the CONTRACT — a table that has DECLARED
+    Serializable must not be weakened by a local option.
+    - **NOT TEST-COVERED, which is why it survived:** `rowLevelRetry` only bites when that statement's own
+      commit races, and sqllogictest runs connections SEQUENTIALLY — a bare autocommit DELETE has no window
+      between its scan and its commit. Every row-level scenario drives the BUFFERED path instead. Exercising
+      it needs separate processes (`scratchpad/iso_race.sh`); the suite carries a note saying so rather than
+      pretending coverage.
+    - En route: `ExecuteDelete` now reads the table config ONCE and derives both `enableDeletionVectors` and
+      the isolation level (each helper opens the table separately, so adding the isolation read naively would
+      have cost a SECOND `_delta_log` LIST per DELETE on OneLake/S3).
+  - **The automatic create-time stamp is GONE (not inverted — removed).** A CREATE used to bake the
+    catalog's ATTACH level into the table. That conflates a per-catalog BEHAVIOUR knob with a durable
+    per-table DECLARATION, and since the property WINS over any catalog, the stamp made an attach-time
+    choice permanent AND silently overrode a DIFFERENT catalog's explicit setting on the same table later —
+    measured: with the stamp in place, attaching one path twice at two levels stopped honoring the second,
+    which is exactly the composition our level-contrast suites rely on. Declaring a level is now explicit
+    and per-table (`WITH ("delta.isolationLevel"=…)` or `fabricator_delta_set_tblproperties`), and that is
+    the spelling to use when Spark must honor the looser level (it HONORS a stamped WriteSerializable even
+    though its DDL refuses to set it). `CreateConfig`'s `serializable` parameter is now inert — removing it
+    is a mechanical ~6-signature cleanup left for later, deliberately not mixed into a behaviour change.
+
+- **PLAIN (non-OneLake) ADLS Gen2 SUPPORT — BUILT + LIVE-VALIDATED 2026-08-02. Full record:
+  [docs/delta-transactions.md](delta-transactions.md) §8.4; gate `test/verify_delta_catalog_adls.test`
+  (**55**, manual/live-account tier — ⚠ this line read **140** until 2026-08-07, a number transcribed from
+  the `verify_mssql_adls_polybase` gate beside it. The suite has said 55 since the commit that added it
+  (`33eb3e1`) and has never changed. Caught by RUNNING it and disbelieving the shortfall; a wrong gate
+  number is worse than none, because the next person reads a green 55 as a suite that aborted).** A Delta catalog on `abfss://<fs>@<account>.dfs.core.windows.net/…` —
+  a plain storage account, not a Fabric lakehouse. It LOOKED like it already worked (attach, discovery,
+  CTAS, INSERT, DELETE, DROP and both parquet directions through duckdb-azure all passed first try); two
+  things did not.
+  - **The core insight: TRANSPORT and CATALOG had been conflated in one predicate.** `IsOneLake` was
+    answering both "how do we do IO here" and "is there a Fabric catalog to ask". Split into
+    **`AdlsPath.IsAdlsGen2`** (the ADLS Gen2 DFS transport — selects the filesystem, the directory ops and
+    the commit primitive) and **`FabricLakehouse.IsOneLake`** (a Fabric lakehouse — keeps Unity Catalog
+    discovery, the schema-enabled flag, the `fabric.*` functions). **Every OneLake root is an ADLS root;
+    the converse is false.** The direct-SDK filesystem was NEVER OneLake-specific — it always parsed its
+    endpoint host out of the `abfss://` path — so only the gate said otherwise; renamed
+    `OneLakeDataLakeFileSystem` → `AdlsGen2TableFileSystem` so the name stops claiming a restriction the
+    code does not have. **OneLake behaviour is unchanged** (re-validated live: 21 tables via UC REST, and a
+    full CTAS/INSERT/DELETE/DROP round trip).
+  - **⚠ A CAPABILITY PROBE CAN RULE A BACKEND OUT; IT CANNOT RULE ONE IN.** `fabricator_fs_write_probe`
+    reports duckdb-azure's `EXCLUSIVE_CREATE` as WORKING on abfss (it really does throw on an existing
+    file) — and it is a **client-side existence check**, so it races. Measured, 6 writers × 8 commits:
+    unguarded **41 of 48 landed, six of the seven losses silent**; with the secret NAMED **48/48** with
+    commit versions fully interleaved across writers (so contention was real). Note this is the OPPOSITE
+    detectability from the S3 case (§8.3), where the probe fails and no concurrency is needed to see it.
+  - **RENAME TABLE was impossible** (`AzureDfsStorageFileSystem: MoveFile is not implemented!`) — which
+    breaks a dbt table model on EVERY re-deploy, since its swap is two renames. One mechanism fixes this
+    and the commit race together: a credentialed abfss root now takes the DFS-native ops OneLake always
+    took (`UseAdlsDirectoryOps`). Mutation-tested — reverting the gate to `IsOneLake` kills the suite at
+    exactly that line with the original error.
+  - **New: `AdlsCredential` (Entra token OR shared key).** Everything ADLS-facing had assumed a
+    `TokenCredential`; a plain account commonly ships as an account key or a storage connection string.
+    **⚠ State the asymmetry the right way round: a plain ADLS account accepts BOTH** (Entra via RBAC is
+    fully supported there and is the better practice) — **OneLake is Entra-ONLY.** So the shape follows the
+    SECRET, not the kind of account, with an `entraOnly` guard so a secret carrying a `connection_string`
+    cannot silently downgrade a Fabric attach to key auth OneLake would reject, and an explicitly
+    configured service principal outranking key material for the same reason in reverse.
+  - **Naming the secret is load-bearing, exactly as on S3** — the credential reaches us only via the marker
+    `BuildConnectionString` appends, which runs only when the ATTACH NAMES a secret; an azure secret merely
+    in scope still authenticates duckdb-azure's DATA IO, so the unsafe shape reads, writes and passes every
+    single-writer test. The S3 attach warning was generalized to cover it (`WarnIfUnguardedRemoteWrite`).
+  - Discovery for such a root walks DFS DIRECTORIES (`AdlsTableDiscovery`) — there is no Unity Catalog for
+    a storage account. The host glob also works here (unlike OneLake, where duckdb-azure's mid-path
+    wildcard is broken), so this is O(tables) vs O(commit files), not a correctness fix — and the suite
+    says so rather than implying it pins the mechanism.
+  - **No new URI scheme, and `onelake://` is untouched**: duckdb-azure handles `abfss://` parquet READ and
+    WRITE (both measured), so native_read/native_write need no VFS of ours. `onelake://` stays Fabric-only.
+  - **`COPY … TO 'abfss://…' (FORMAT delta)` routes through our filesystem too — and the first pass got this
+    WRONG and wrote the mistake up as a trade-off.** It shipped on the host-FS path justified as "no `SECRET`
+    clause, one statement, one commit". But *"has no SECRET clause"* described the PLUMBING, not a
+    constraint: with `FORMAT delta` we build the catalog ourselves and know the target is abfss, so we can
+    resolve a credential exactly as the `onelake://` FS already does. **A limitation that is really an
+    unimplemented case must not be documented as a design decision** — that is how a gap becomes permanent.
+    Fixed by `BuildConnectionStringFromScopedSecret` (C++): a SCOPE match, not a name (a DuckDB secret's
+    scope IS a path prefix, and azure secrets cover `abfss://` by default, so the common case needs no user
+    action), with **no "any secret of this type" fallback** — guessing among accounts is how a write lands
+    somewhere unintended. Note this ALSO fixes it for OneLake, where a COPY had the same gap.
+    - ⚠ **Deliberately NOT applied to ATTACH, because trying it surfaced a hazard**: in
+      `fabricator_storage.cpp` the `provider` may be EMPTY (no `PROVIDER` option — inferred later from the
+      scheme), and an empty provider resolves to the DEFAULT backend, whose azure branch merges the fields
+      into a **SQL Server** connstr — mangling the abfss path and breaking an attach that works today. COPY
+      is safe only because its provider is hardcoded `"delta"`.
+    - ⚠ **The filesystem choice is INVISIBLE from SQL**, so a `Fabricator.Delta.Fs` Debug line now names it
+      per table open. That log + a negative control is what actually verified the routing (secret in scope ⇒
+      `AdlsGen2TableFileSystem`; no secret ⇒ `DuckDbTableFileSystem`); the suite's COPY section can only
+      assert the round trip and says so rather than implying it pins the route.
+
+- **ISOLATION + ONELAKE MULTI-WRITER — MEASURED LIVE 2026-07-31; one bug FIXED, one gap OPEN. Full record:
+  [docs/delta-transactions.md](delta-transactions.md) §8.1 (multi-writer) + §10.6 (Spark isolation).**
+  Two long-standing claims in this file were wrong, and both were beliefs never measured.
+  - **`write_serializable` is DATABRICKS' default, NOT Spark's** — every "Spark's default too" here was FALSE.
+    Fabric Spark 4.1.1 records **`Serializable`** for its own commits AND its DDL validator **REJECTS**
+    `delta.isolationLevel='WriteSerializable'` outright (`requirement failed: … must be Serializable`) at CREATE
+    *and* ALTER; `SnapshotIsolation` likewise; only `Serializable` is accepted. Controls both fired, and the two
+    negative controls fail DIFFERENTLY (`'Bogus'` doesn't parse at all) — so OSS Delta knows the enum and it is
+    the *table-property validator* that admits one value. **Consequence: on a shared table with the property
+    ABSENT we apply WriteSerializable while Fabric Spark applies Serializable — we are the more permissive.**
+    ATTACH `isolation_level 'serializable'` to match Fabric Spark. A `WriteSerializable` value WE stamp is
+    **honored** by Spark (it read, INSERTed, DELETEd, and recorded `WriteSerializable` for its own commits) — it
+    just can't SET it, so such a table's isolation is only manageable via `fabricator_delta_set_tblproperties`.
+    We deliberately do NOT block the stamp. Corrected in README + `DeltaCatalog`/`DeltaTxnBuffer`/
+    `DeltaGlobalTableFunction` comments + `verify_delta_tblproperties`.
+  - **OneLake multi-writer was "safe" by INFERENCE only** (its §8 row carried no numbers while local/S3 did).
+    Now measured: **no lost writes ever** (versions always unique+contiguous, all groups complete), but
+    **low contention never exercises the guard** — 32 commits over 4 processes produced ZERO conflicts, so a
+    green low-contention run proves nothing about put-if-absent. Forcing contention (8 writers × 12 tiny
+    commits) reproducibly broke writers.
+  - **BUG FIXED (EW `CheckpointReader`, on `fabricator-patches`): `_last_checkpoint` is an advisory HINT and was
+    treated as authoritative.** It is updated by NON-ATOMIC overwrite, so a concurrent reader can see it at
+    **zero bytes** → `JsonDocument.Parse` → *"The input does not contain any JSON tokens"* → a **failed COMMIT
+    caused by a file that carries no truth**. Now empty/invalid/field-less ⇒ treated as absent (fall back to
+    listing the log, which is what the Delta protocol requires). Gate `verify_delta_last_checkpoint` (34,
+    hermetic, MUTATION-TESTED); the live 8×12 shape went from 1–2 failures per run to **96/96 clean**.
+  - **SECOND BUG ROOT-CAUSED + FIXED — and it is the SAME root object as the first.** A raw Azure **412
+    `ConditionNotMet`** escaped `complete_bulk` (never became a `DeltaConflictException` ⇒ no retry ⇒ the
+    statement failed). Mechanism: `OneLakeDataLakeFileSystem.ReadAllBytesAsync` used `OpenReadAsync`, i.e.
+    Azure's **lazy `LazyLoadingReadOnlyStream`**, which fetches a blob in successive RANGE requests and
+    **pins the ETag, sending `If-Match` on the later ones** — so a `_last_checkpoint` overwritten in place
+    mid-read TEARS. Both multi-writer failures are therefore one root cause (that file being overwritten
+    non-atomically) by two mechanisms: *empty content* (the parse guards) and a *torn ranged read* (this);
+    the parse guards could never catch the 412, which is thrown by the READ, before parsing. Fixed in two
+    layers: `ReadAllBytesAsync` now does ONE unconditional `ReadContentAsync` (a single request cannot tear,
+    and `ITableFileSystem` documents the method as being for SMALL files), plus `ReadLastCheckpointAsync`
+    treats **any** read failure as "no hint" (cancellation excepted).
+    - **A WRONG hypothesis is recorded on purpose.** The obvious suspect was `CreateAsync` catching only 409
+      while `RenameAsync` catches 409|412. `scratchpad/adlsprobe` **falsified it deterministically** (no race
+      needed): on live OneLake a conditional CREATE and a conditional RENAME onto an existing path both raise
+      **409 `PathAlreadyExists`**, never 412 — so 409-only was already correct there. That falsification is
+      what redirected the search to "something is sending an ETag precondition".
+    - **⚠ THE TRAP: a client library can add a conditional header you never wrote.** Our source contains no
+      `IfMatch` on any read path, so grepping for it "proved" the wrong thing — `OpenRead` inserts it
+      internally. Only a stack trace showed this, which is why the log sink now appends the inner-exception
+      chain + full **stack trace at `Debug`** (it used to log type + message only: *what* failed, never
+      *where*). With that in place the failure reproduced on the FIRST attempt and named its own site.
+      Harness: `ATTEMPTS=N bash scratchpad/hunt412.sh`. Verified after the fix: the same 10×15 shape ran
+      **150/150 commits with zero 412s**.
+    - **UNEXPLAINED, unrelated, and seen repeatedly — do not mistake it for a lost commit:** in several runs a
+      single `duckdb.exe` finished ALL its work (last commit logged, every version landed) and then **did not
+      exit**, blocking the harness's `wait`. Observed both before and after these fixes and on runs with no
+      errors, so it is a teardown issue on the OneLake+hosted-CLR path. Not investigated.
+  - **Diagnostic gap closed en route:** the txn-buffer flush's OCC retry was a SILENT `catch`, so multi-writer
+    behaviour was unobservable — a run whose writers merely serialized looked exactly like one where the guard
+    rejected and retried. It now logs `delta flush …: commit conflict — reopening at latest (attempt n/16)`.
+  - **Method notes worth reusing:** at `Warning` level a conflict-free run leaves an EMPTY log, which is
+    indistinguishable from a broken sink ⇒ log at `Information` so the per-commit lines are a POSITIVE CONTROL;
+    and `rm *.log` does NOT match `*.fablog`, which silently mixed a previous run's counts into a later one.
+
+- **Eager-write DeltaTxnBuffer — ALL SLICES DONE (A, B, C1–C3, D + edge lifts).** Data files always land
+  on storage at statement time; the buffer holds ACTIONS. **"Rollback = invisible orphans for VACUUM" is
+  now HISTORICAL — as of 2026-08-02 a ROLLBACK RECLAIMS the bytes, via two mechanisms with different
+  owners** (full record: [docs/delta-transactions.md](delta-transactions.md) §7):
+  (a) the flush's transaction is `await using`, so a flush that does not commit takes back what EW's OWN
+  writers staged — e.g. the deletion vector of a buffered DELETE (`StageRowDeletesAsync` writes it before
+  the commit is judged). ⚠ Safe only from EW #49; at #46 the same line would have deleted COMMITTED data.
+  Measured — a small delete's vector is INLINE, so the orphan only reproduces above the 1 KB roaring
+  threshold. Gate verify_delta_txn_version §9 (65).
+  (b) `RollbackTransaction` calls EW #52's **`DiscardDataFilesAsync`** on the eagerly-written DATA files,
+  the class (a) structurally could not touch — EW's provenance rule never collects a host-written file, so
+  the host has to name them. ⚠ This needed a C++ fix first: `FabricatorTransactionManager::
+  RollbackTransaction` **never set an opener**, so it held a STALE `ClientContext*` — harmless while
+  rollback did no IO, a use-after-free the moment it does any. It now takes its own short-lived connection
+  like the commit path, and clears the opener to 0 (there is no caller context to restore). Never throws:
+  a failed discard logs and leaves the orphan, i.e. the old behaviour. Gate
+  verify_delta_catalog_transactions 943 → 944, mutation-tested. Both gates mutation-tested. Incl.
+  S3 multi-writer conditional-PUT commits (SECRET-routed), the dbt table-swap RENAME fix, buffered
+  IDENTITY/CDF/same-txn-DML, and the partitioned×native_read partition-column bug fix. Gate
+  verify_delta_catalog_transactions (now 941); semantics [docs/delta-transactions.md](delta-transactions.md).
+  Still immediate by design: identity creates, DROP/OPTIMIZE/VACUUM, CREATE-OR-REPLACE/partition-overwrite.
+  - **⚠ A CREATE-PLUS-DATA IS NOT ATOMIC — TWO VERSIONS, AND IN PLAIN AUTOCOMMIT TOO, NOT JUST IN A TRANSACTION**
+    (measured 2026-08-03; **scope corrected 2026-08-04** — [docs/delta-transactions.md](delta-transactions.md)
+    §7.1, [docs/known-limitations.md](known-limitations.md) 1.5/1.6). v0 = `protocol`+`metaData` (an EMPTY
+    table), v1 = the data. **⚠ This was recorded here and in §7.1 as a BUFFERED-FLUSH property, which hid the common
+    case**: a plain autocommit `CREATE TABLE … AS SELECT` produces the identical two commits by a DIFFERENT path
+    (`DeltaWriter.WriteAsync` → `OpenOrCreateAsync` commits v0, then `table.WriteAsync` v1), so the statement it
+    most often applies to has no `BEGIN` in sight. Consequences: a concurrent reader can observe the empty table,
+    and **a data-write failure leaves an empty committed table behind a statement the user saw fail** — the inverse
+    of every other flush path (reasoned from the measured shape, not itself measured).
+    - **What protects it today is STRUCTURAL, not luck: every reachable failure fires BEFORE v0**, because the
+      Arrow→Delta schema conversion is a PRECONDITION of the create (`OpenOrCreateAsync` cannot be called without a
+      Delta schema). Measured: a `TIMESTAMP_NS` column and an `INTERVAL` column both refuse with NO table created.
+      The residue is a DATA-write/commit failure (storage, permission, disk full, network), which has no
+      compensation — `WriteAsync`'s `finally` only disposes; a commit CONFLICT is retried, other failures are not.
+    - **⚠ A SEPARATE, BIGGER BUG WAS FOUND WHILE DOCUMENTING THIS AND IS NOW FIXED (2026-08-04): the shared
+      C++ layer NEVER CHECKED `ERROR_ON_CONFLICT`**, so a plain create reached the provider as an ordinary create
+      — `FabricatorSchemaEntry::CreateTable` handled `REPLACE_ON_CONFLICT` (drop first) and `IGNORE_ON_CONFLICT`
+      (forward the flag) and passed everything else through. On Delta, `OpenOrCreateAsync` then just OPENED the
+      existing table, so **two** shapes succeeded while doing nothing: `CREATE TABLE t AS SELECT` wrote no rows and
+      kept the OLD data (measured with a positive control — 10-row table + a CTAS of 2 rows ⇒ still 10 rows, exit 0;
+      the same shape on DuckDB's own table errored), and **`CREATE TABLE t (a INTEGER, b VARCHAR)` silently IGNORED
+      THE DECLARED SCHEMA**. ⚠ That second half was NOT in the original write-up — it surfaced only from running both
+      shapes instead of reasoning about the CTAS one, which is the same lesson as the mode-`Overwrite` correction
+      below. Now refused with DuckDB's own `CatalogException::EntryAlreadyExists`, so both the message and its
+      structured `ENTRY_ALREADY_EXISTS` extra-info match every other DuckDB catalog; `OR REPLACE` / `IF NOT EXISTS`
+      untouched. Gates `verify_delta_catalog_write` (+12, engine-doubled) + `verify_ctas_text_type` (+8), both
+      mutation-tested (the mutant dies at the first assertion with *"Query unexpectedly succeeded"*).
+      - **⚠ THE SCOPE QUESTION IS SETTLED AND THE ANSWER IS NOT UNIFORM** — this file previously recorded it as
+        UNVERIFIED. **SQL Server was never in the dangerous half**: its own `CREATE TABLE` rejects a duplicate, so
+        no write was ever lost; the user just got the raw provider error (`2714: There is already an object named
+        …`), which reads as a SQL Server problem rather than an ordinary catalog conflict. **DAX is structurally
+        exempt** (its provider refuses CREATE outright). So the silent data-keeping was Delta-ONLY while the
+        confusing message was SHARED — one fix covers both, and the gate spans both tiers because they share the
+        code path, not because they shared the symptom.
+      - The existence oracle is **`GetOrCreateEntry`, not a bare `table_types_` lookup**: a table can exist without
+        being in the discovered name list, because an ATTACH `table_filter` bounds ENUMERATION only and that path
+        fetches BY NAME. Pinned by making the gate's conflict against a table that exists on storage and has NOT
+        been read through the attach. It is also the call the successful create already makes, so the
+        materialization cost is paid only on the conflict path.
+      - **⚠ THE MECHANISM IS NOT WHAT IT LOOKS LIKE — the two symptoms have DIFFERENT OWNERS, and an earlier
+        write-up of this (mine) attributed both to Delta.** `PhysicalPlanGenerator::CreatePlan(LogicalCreateTable&)`
+        (`duckdb/src/execution/physical_plan/plan_create_table.cpp:37`) probes for an existing entry and, finding
+        one with a non-REPLACE conflict action, routes the statement to a bare `PhysicalCreateTable` — **DISCARDING
+        THE CHILD PLAN, i.e. the SELECT.** Proven directly rather than read: `EXPLAIN CREATE TABLE IF NOT EXISTS m
+        AS SELECT * FROM range(1000000)` over an existing table prints a physical plan of `CREATE_TABLE` ALONE,
+        no scan in it. So **"no rows written" was DuckDB's plan downgrade, not the provider swallowing a write** —
+        the write was never planned; only "no error" was ours.
+      - Two consequences. **`mode = Overwrite` was never REACHED in the broken shape**: `overwrite = createTable ||
+        replace` (`DeltaCatalog.cs:2039`) sits on the `begin_bulk` path under `FabricatorPhysicalCreateTableAs`, and
+        the downgrade bypasses that operator entirely — so it is not merely "correct given DuckDB should have
+        rejected the conflict first" (the weaker claim recorded here before), it is OFF THE PATH. And **one check
+        covers BOTH the plain CREATE and the CTAS** by DuckDB's design, not by luck: it delegates the conflict
+        decision to the catalog and funnels both spellings into the operator that asks the catalog.
+    - **Not a protocol limit** — Delta permits `protocol`+`metaData`+`add` in v0 — but an EW API-shape one, and
+      THREE doors are locked the same way: `StartTransaction` is an INSTANCE method needing `OpenAsync`,
+      `CreateAsync` writes v0 at once, and `CommitDataFilesAsync` (whose `extraActions` could carry
+      metaData+protocol) is ALSO an instance method. So a transaction that creates its table is inexpressible;
+      fixing it needs an upstream static/factory form.
+    - **✅ THE CHEAP IMPROVEMENT IS BUILT — 2026-08-17 (C#-only, no ABI). `DeltaWriter.TryCreateFilesFirst`,
+      called from `BulkInsert` ahead of the ordinary `native_write` streaming path.** An autocommit CTAS on a
+      table that does not exist writes its data files FIRST and creates+commits after. It does NOT reduce the
+      version count (that needs the upstream static/factory form above); the residual window is the two
+      ADJACENT log writes. Gate `verify_delta_ctas_ordering` **57** (hermetic), two mutants each killed at its
+      own section.
+      - **THE MEASUREMENT, and it converts limitation 1.5's residue from REASONED to MEASURED — which is worth
+        more than the fix.** That row said *"a failure of the data write leaves an empty committed table behind
+        a statement the user saw fail … reasoned from the measured shape, NOT itself measured (injecting the
+        failure was not attempted)"*. Injected with **`error()` mid-stream** (row 1.9M of 2M), three runs per
+        leg, the reorder the only variable: **create-first leaves 1 commit file 3/3; files-first leaves 0
+        3/3**, and a fresh ATTACH then sees `duckdb_tables()` = 0 with a direct reference erroring "does not
+        exist". `error()` is the reusable trick — it makes a storage-class failure injectable from pure SQL.
+      - **⚠ SIZE THE INJECTION OR THE TEST IS VACUOUS.** At 10k rows the mutant left NOTHING either (the fault
+        reaches `complete_bulk` before the bulk consumer starts, since `BulkSession` waits for the first batch
+        OR end-of-stream), so the section would have passed with the bug fully present. Measured threshold: at
+        **50k rows failing at 47.5k the writer is reached 3/3**, which is what the suite uses.
+      - **⚠ `TryStreamCreateFiles` HAD BEEN DEAD CODE since hoist slice 5** deleted the buffered-CTAS branch
+        that called it — so the note's "the shape it already implements for the buffered path" described a path
+        that no longer existed. Giving the orphan a caller was strictly better than writing a second copy.
+      - **⚠ THIS ITEM'S OWN PREDICTION OF AN ENGINE DIVERGENCE WAS WRONG, AND IT POINTS THE OTHER WAY.** It
+        said the codec provider "has no DuckDB writer to stage with ⇒ it would make the engines DIVERGE on
+        failure semantics where today they agree. Say so in the slice that takes it." The premise was that the
+        codec creates first. **It does not** — it MATERIALIZES the whole stream and only then calls `Write`, so
+        a mid-stream SOURCE failure fails before any create: measured 3/3, **no folder at all**. The change
+        makes the engines CONVERGE. ⚠ Shape-specific: on a STORAGE failure the order reverses again (the
+        codec's create precedes its file writes, ours now follows them), so the reordered native path is the
+        safer of the two there. **The lesson is the one this file keeps recording: a divergence predicted from
+        one path's shape needs the OTHER path measured before it is written down as a cost.**
+      - **⚠ THE PARTITIONED CORRECTION BELOW HELD.** ~~"non-partitioned-only today"~~ was already retracted —
+        the restriction is `TryWriteStreamingCoreAsync`'s, NOT `TryStreamCreateFiles`', which partitions via
+        `RunCopyPartitioned` (one `COPY … PARTITION_BY`). Confirmed as built: a partitioned CTAS reorders and
+        lands its Hive layout in one COPY (gate §1).
+      - **What it declines**, by evaluating `SupportsExternalDataFileCommit`'s three conditions on the inputs
+        the create is about to be handed (there is no snapshot yet): IcebergCompat, an identity column, and a
+        declared CHECK constraint / invariant / generated column. **Only the constraint branch is reachable
+        from SQL** (`WITH ("delta.constraints.x"='…')` — measured, and it routes to the collect path), so only
+        it is gated; iceberg is refused earlier by the feature-property guard and identity is not expressible
+        on a CTAS. Removing the check fails LOUDLY (EW refuses the commit), not silently — that is the mutant.
+      - **⚠ The concurrent-create guard is DEFENSIVE, not gated**: `OpenOrCreateAsync` ignores
+        `preAssignedSchema` when the table already exists (by design, so a crashed CTAS can be retried), so a
+        table created in our window would carry DIFFERENT column-mapping physical names and our files would
+        read ALL-NULL. `EnsurePreAssignedLayoutAdopted` throws instead. sqllogictest is sequential, so no suite
+        can produce it.
+    - **⚠ THE ORPHAN IS UNCONDITIONAL ONCE v0 LANDS AND WE DO NOT COMPENSATE — and a version-checked delete is
+      NOT the fix (measured 2026-08-04).** Both paths put the create OUTSIDE the guarded region and both
+      `finally` blocks only DISPOSE; only a commit CONFLICT is retried. `RollbackTransaction` cannot help — it
+      reclaims DATA FILES, and `DiscardBufferedFiles` OPENS the table to do so, presupposing it exists.
+      "Check the version, delete if still 0" races any writer committing v1 in the window (a plain INSERT from
+      another connection — `dbt --threads N` is a fleet of them — or a foreign engine): deleting just
+      `…0.json` leaves the table UNREADABLE (measured error names the missing version) though recoverable by
+      hand, while deleting the whole FOLDER destroys the other writer's data irreversibly AND is the worse
+      scope because a recursive delete is atomic on NO backend here (on S3 `DropTable` goes file-by-file), so
+      it can partially complete and leave a log referencing removed files. **⚠ BUT THE OBJECTION IS AUTHORITY,
+      NOT ATOMICITY, and the first draft of this note led with atomicity — which does not survive one
+      comparison: `DROP TABLE` is the SAME unconditional recursive folder delete** (`DeltaCatalog.DropTable` →
+      `HostFs.RemoveDir`, S3 per-file fallback swallowing per-object errors) **and we ship it.** The separator
+      is CONSENT: DROP destroys a table the USER NAMED with the user present, and re-running it finishes a
+      partial one (losing a concurrent writer's rows IS what DROP means — no Delta engine has a transactional
+      DROP); the compensation would infer destruction from a failure WE caused, on a path the user asked us to
+      CREATE, with a third-party victim who ran only an INSERT and nobody to notice. **The safe primitive is
+      deleting the files you WROTE by name** (`DiscardDataFilesAsync` refuses anything a FRESH log references —
+      needing no authority beyond our own write, which is the real reason it is acceptable) — and it is
+      legitimate only AFTER the reorder above, when the folder is not yet a table (nothing is discoverable at a
+      path with no `_delta_log`; a competing CREATE races on commit-0, a put-if-absent, not on our bytes).
+      Full record: [docs/delta-transactions.md](delta-transactions.md) §7.1.
+    - **⚠ Temp-name-then-rename does NOT fix the version count** (the temp table still gets v0 then v1) — it only
+      hides both from readers of the final name. And it costs an O(bytes) commit on S3 (rename = ListObjectsV2 +
+      CopyObject per key + DeleteObjects) and LOSES the conditional create: today two concurrent `CREATE TABLE t`
+      race on commit-0, a put-if-absent, while a rename is unconditional on the backends where §8.5 applies —
+      so the second rename would silently destroy the first table. Assessed and REJECTED 2026-08-04.
+  Full as-built record (moved verbatim from here): [docs/feature-history.md](feature-history.md).
