@@ -1,7 +1,8 @@
 # name: test/verify_decision_render.test
-# description: decision_render — a DMN-like decision TABLE rendered into the SQL of a DuckDB TABLE MACRO.
-#              Gates the three-language split end to end: the C# cell parser (dmn_condition / dmn_value),
-#              the set-based introspection, and the Liquid shape. See
+# description: decision_render — a DMN-like decision TABLE rendered into the SQL of a DuckDB macro, in
+#              the two forms that can take VARYING input: a SCALAR macro over a STRUCT (per row) and a
+#              TABLE macro over a whole relation. Gates the three-language split end to end: the C# cell
+#              parser (dmn_condition / dmn_value), the set-based introspection, and the Liquid shape. See
 #              dotnet/Fabricator.Functions/Macros/decision_render.sql and DecisionRuleParser.cs.
 # group: [fabricator]
 
@@ -21,6 +22,15 @@ require parquet
 # The file-source section writes a csv and a parquet; this is the scratch directory CI provides, and
 # declaring it is also what makes ${FABRICATOR_DELTA_WRITE_DIR} interpolate below.
 require-env FABRICATOR_DELTA_WRITE_DIR
+
+# ⚠ READING A SCALAR RESULT IS VERBOSE, so these two shorthands stand in for `union_extract` almost
+# everywhere below. §18 pins the raw API they wrap — without that, a build whose union members were
+# named or tagged differently would sail through every row in this file.
+statement ok
+CREATE MACRO one(v) AS union_extract(v, 'single');
+
+statement ok
+CREATE MACRO many(v) AS union_extract(v, 'many');
 
 # ==============================================================================================
 # §1  REGISTRATION — the delivery path is QUIET, so it gets its own assertion.
@@ -44,47 +54,83 @@ dmn_value	scalar
 # ==============================================================================================
 # §2  THE PARSER, CALLABLE FROM SQL — which is what lets the introspection be set-based.
 # ==============================================================================================
-# The grammar itself is pinned OFFLINE in tier 0 (DecisionRuleParserTests). What this section gates is the
-# SEAM: that the Arrow marshalling of each argument works and that `ref_prefix` reaches the parser.
 
-query TTTT
-SELECT dmn_condition('EU, US', 'region', 'duckdb', ''),
-       dmn_condition('[21 .. 65]', 'age', 'duckdb', ''),
-       dmn_value('@amount * 0.01', 'duckdb', ''),
-       dmn_is_aggregate('EXP(SUM(LOG(?)))')::VARCHAR;
+query T
+SELECT dmn_condition('> 18', 'age', 'duckdb', '');
 ----
-region IN ('EU', 'US')	age >= 21 AND age <= 65	amount * 0.01	true
+age > 18
 
-# ⚠⚠ THE ref_prefix ROW. It exists for ONE measured DuckDB rule (see §4): every reference to an input has
-# to be QUALIFIED, and a cell's own column and its @refs must be qualified the SAME way or a cross-column
-# rule reads one value while the column's own cell reads another.
-query TT
-SELECT dmn_condition('> @age', 'preprocessed.amount', 'duckdb', 'preprocessed.'),
-       dmn_value('@amount / @age', 'duckdb', 'preprocessed.');
+query T
+SELECT dmn_condition('EU, US', 'region', 'duckdb', '');
 ----
-preprocessed.amount > preprocessed.age	preprocessed.amount / preprocessed.age
+region IN ('EU', 'US')
 
-# ⚠ THE TWO SPELLINGS OF A KEYWORD CONDITION MEAN THE SAME THING: the column may be left IMPLICIT (the
-# natural cell) or written out with an explicit `@ref`. Asserting them side by side is what keeps the
-# leading-keyword rule and the full-condition detector from drifting apart.
+query T
+SELECT dmn_condition('[21 .. 65]', 'age', 'duckdb', '');
+----
+age >= 21 AND age <= 65
+
+query T
+SELECT dmn_condition('not RU', 'region', 'duckdb', '');
+----
+NOT (region = 'RU')
+
+query T
+SELECT dmn_condition('between min(1) and max(100)', 'n', 'duckdb', '');
+----
+n BETWEEN min(1) AND max(100)
+
+query T
+SELECT dmn_condition('contains(?, ''x'')', 'region', 'duckdb', '');
+----
+contains(region, 'x')
+
+query T
+SELECT dmn_condition('@age*2 > min(1)+1', 'n', 'duckdb', '');
+----
+age*2 > min(1)+1
+
+# ⚠ THE EQUIVALENCE ROW, and it is the cheapest kill in the file: a cell whose left-hand side is written
+# out and the same cell in the NATURAL form (column implicit on the left) must render the same thing.
+# The two are served by DIFFERENT mechanisms — the full-condition DETECTOR and the leading-keyword rule —
+# and a build that lost the second one dies here, 150 assertions before §15's end-to-end rows.
 query TT
-SELECT dmn_condition('IS NULL', 'region', 'duckdb', ''),
-       dmn_condition('@region IS NULL', 'region', 'duckdb', '');
+SELECT dmn_condition('@region IS NULL', 'region', 'duckdb', ''),
+       dmn_condition('IS NULL', 'region', 'duckdb', '');
 ----
 region IS NULL	region IS NULL
 
-# A NULL cell is a WILDCARD for a condition and an ABSENCE for a value — the two are different questions
-# and get different answers. Pinned because "both NULL" and "both TRUE" are each a plausible reading.
+# The value parser — an expression passes through, a bare string is quoted.
 query TT
-SELECT dmn_condition(NULL, 'age', 'duckdb', ''), coalesce(dmn_value(NULL, 'duckdb', ''), '<null>');
+SELECT dmn_value('@amount * 0.0001', 'duckdb', ''), dmn_value('approve', 'duckdb', '');
 ----
-TRUE	<null>
+amount * 0.0001	'approve'
+
+# ⚠ Aggregate detection scans EVERY call, not the outermost.
+query TTT
+SELECT dmn_is_aggregate('max(round(?,2))')::VARCHAR, dmn_is_aggregate('upper(?)')::VARCHAR,
+       dmn_is_aggregate(NULL)::VARCHAR;
+----
+true	false	false
+
+# ⚠ The `?` substitution is QUOTE-AWARE — a `?` inside a string literal is the literal's own character.
+# GLOB is what makes this reachable rather than theoretical: `?` is GLOB's single-character WILDCARD, so
+# a blind replace produces a silently DIFFERENT pattern rather than a syntax error.
+query TT
+SELECT dmn_condition('GLOB ''US?''', 'region', 'duckdb', ''),
+       dmn_condition('contains(?, ''a?b'')', 'region', 'duckdb', '');
+----
+region GLOB 'US?'	contains(region, 'a?b')
 
 # ==============================================================================================
-# §3  THE DOCUMENTED EXAMPLE — the ported engine's own decision table and its own published answers.
+# §3  THE DOCUMENTED EXAMPLE — the ported engine's own decision table, in BOTH forms.
 # ==============================================================================================
 # ⚠ The expected values here are taken from decision-rules-py's CLAUDE.md, not from what this
 # implementation happens to produce, so the port is pinned against the thing it was ported FROM.
+#
+# ⚠⚠ THE TWO FORMS MUST AGREE ROW FOR ROW. That is the property this section is really for: one decision
+# table, two generated macros, one answer. They are built from ONE introspection and differ only in the
+# statement wrapped around it, so a divergence means a fragment leaked a form-specific assumption.
 
 statement ok
 CREATE TABLE dr (rulepos INT, region VARCHAR, age VARCHAR, amount VARCHAR,
@@ -102,33 +148,96 @@ INSERT INTO dr VALUES
     ( 5, '',        '',           '',        'reject',  '1.0',              'default',          NULL);
 
 statement ok
-SELECT fabricator_host_exec(decision_render('dr', name := 'eval_dr'));
+SELECT fabricator_host_exec(decision_render('dr', name := 'dr_s'));
 
-# `JP, 40, 500` — the documented First-match answer.
-query ITRT
-SELECT rulepos, decision, risk, label FROM eval_dr('JP', 40, 500);
+statement ok
+SELECT fabricator_host_exec(decision_render('dr', name := 'dr_t', form := 'table'));
+
+statement ok
+CREATE TABLE dr_in (id INT, region VARCHAR, age DOUBLE, amount DOUBLE);
+
+statement ok
+INSERT INTO dr_in VALUES (1, 'JP', 40, 500), (2, 'EU', 25, 5000), (3, 'RU', 50, 10);
+
+# `JP, 40, 500` — the documented First-match answer, from the SCALAR form.
+# ⚠ `risk` is ROUNDED here and the reason is worth knowing: this table declares `amount FLOAT`, the
+# rendered CASE therefore unifies to FLOAT, and `cast(… as DOUBLE)` widens 0.2f to 0.20000000298023224.
+# The ported engine's published `0.2` comes from its ROW_EVAL macro, whose typed parameters are only a
+# NULL default and never reach the value — ours applies the declared type, so the artefact is REAL and is
+# pinned raw two rows below rather than hidden here.
+query TTRT
+SELECT one(v).rulepos, one(v).decision, round(one(v).risk, 4), one(v).label
+FROM (SELECT dr_s({'region': 'JP', 'age': 40, 'amount': 500}) AS v);
 ----
 3	approve	0.2	low
 
-# ... and the documented RuleOrder set, which is the same three rules the aggregate example collapses.
-query ITRTI
-SELECT rulepos, decision, risk, label, _total_hits_
-  FROM eval_dr('JP', 40, 500, hit_policy := 'RuleOrder') ORDER BY rulepos;
+# ... and the SAME input through the TABLE form.
+query ITRT
+SELECT rulepos, decision, round(risk, 4), label FROM dr_t('dr_in') WHERE id = 1;
 ----
-3	approve	0.2	low	3
-4	flag	12.5	500	3
-5	reject	1.0	default	3
+3	approve	0.2	low
+
+# ⚠ THE RAW VALUE, pinned once so the FLOAT consequence above is a recorded behaviour and not a rounding
+# that quietly papers over a wrong answer — and pinned in BOTH forms, because the declared input type
+# reaching only one of them is exactly the divergence §3 exists to catch.
+query TT
+SELECT one(dr_s({'region': 'JP', 'age': 40, 'amount': 500})).risk::VARCHAR,
+       (SELECT risk::VARCHAR FROM dr_t('dr_in') WHERE id = 1);
+----
+0.20000000298023224	0.20000000298023224
+
+# The documented RuleOrder set — three rules, which the SCALAR form returns as its `many` member.
+query TTRT
+SELECT u.rulepos, u.decision, round(u.risk, 4), u.label
+FROM (SELECT dr_s({'region': 'JP', 'age': 40, 'amount': 500}, hit_policy := 'RuleOrder') AS v),
+     unnest(many(v)) AS t(u)
+ORDER BY u.rulepos;
+----
+3	approve	0.2	low
+4	flag	12.5	500.0
+5	reject	1.0	default
+
+# ... and as three ROWS from the table form. ⚠ `label` is '500.0' rather than '500' for the same reason
+# the risk row above is: `@amount::varchar` renders a FLOAT.
+query ITRT
+SELECT rulepos, decision, round(risk, 4), label
+FROM dr_t('dr_in', hit_policy := 'RuleOrder') WHERE id = 1 ORDER BY rulepos;
+----
+3	approve	0.2	low
+4	flag	12.5	500.0
+5	reject	1.0	default
 
 # A rule whose condition is a comma LIST and whose outputs are expressions over the inputs.
-query ITRT
-SELECT rulepos, decision, risk, label FROM eval_dr('EU', 25, 5000);
+query TTRT
+SELECT one(v).rulepos, one(v).decision, round(one(v).risk, 4), one(v).label
+FROM (SELECT dr_s({'region': 'EU', 'age': 25, 'amount': 5000}) AS v);
 ----
 1	approve	0.5	EU
 
+# ⚠⚠ THE WHOLE POINT OF BOTH FORMS, AND THE REASON THE OLD ONE WAS REPLACED: the input is DATA. A macro
+# ARGUMENT is a bind-time constant, so the form this replaced could only ever be called with literals —
+# one decision per call site. Here one call site decides a whole relation, per row, in each form.
+query ITT
+SELECT id, one(v).rulepos, one(v).decision
+FROM (SELECT id, dr_s({'region': region, 'age': age, 'amount': amount}) AS v FROM dr_in)
+ORDER BY id;
+----
+1	3	approve
+2	1	approve
+3	5	reject
+
+query IIT
+SELECT id, rulepos, decision FROM dr_t('dr_in') ORDER BY id;
+----
+1	3	approve
+2	1	approve
+3	5	reject
+
 # The hit-policy model errors. ⚠ Unique and Any still return the FIRST row — the policy is reported, not
 # enforced by dropping rows — so a build that silently returned nothing would fail here rather than pass.
-query IT
-SELECT rulepos, _model_error_ FROM eval_dr('JP', 40, 500, hit_policy := 'Unique');
+query TT
+SELECT one(v).rulepos, one(v)._model_error_
+FROM (SELECT dr_s({'region': 'JP', 'age': 40, 'amount': 500}, hit_policy := 'Unique') AS v);
 ----
 3	Model Error: More than one rule hit for this input!
 
@@ -136,54 +245,29 @@ SELECT rulepos, _model_error_ FROM eval_dr('JP', 40, 500, hit_policy := 'Unique'
 # so almost every input hits several rules. Only 'RU' (fails rule 3), with amount <= age (fails rule 4) and
 # outside rules 1-2, hits exactly one. Without this row, "Unique reports an error" would be equally true of
 # a build that reported one for every input.
-query IT
-SELECT rulepos, coalesce(_model_error_, '<none>') FROM eval_dr('RU', 50, 10, hit_policy := 'Unique');
+query TT
+SELECT one(v).rulepos, coalesce(one(v)._model_error_, '<none>')
+FROM (SELECT dr_s({'region': 'RU', 'age': 50, 'amount': 10}, hit_policy := 'Unique') AS v);
 ----
 5	<none>
 
-# ⚠⚠ WHEN NOTHING MATCHES, THE TWO MODES DIVERGE, and it is worth pinning because the difference is
-# surprising: a NON-aggregate macro yields ZERO ROWS (there is nothing for the outer SELECT to read), while
-# an aggregate one yields ONE row of NULLs — which is the only way `_model_error_` can ever report 'No
-# default rule defined'. That branch is therefore UNREACHABLE in a non-aggregate macro, by construction.
-
-statement ok
-CREATE TABLE nodef (rulepos INT, region VARCHAR, decision VARCHAR);
-
-statement ok
-INSERT INTO nodef VALUES (-2,'in','out'), (-1,'VARCHAR','VARCHAR'), (1,'EU','euro');
-
-statement ok
-SELECT fabricator_host_exec(decision_render('nodef', name := 'eval_nodef'));
-
-query I
-SELECT count(*) FROM eval_nodef('JP');
-----
-0
-
-statement ok
-CREATE TABLE nodefa (rulepos INT, region VARCHAR, decision VARCHAR);
-
-statement ok
-INSERT INTO nodefa VALUES (-2,'in','out'), (-1,'VARCHAR','VARCHAR'), (0,NULL,'max(?)'), (1,'EU','euro');
-
-statement ok
-SELECT fabricator_host_exec(decision_render('nodefa', name := 'eval_nodefa'));
-
 query IT
-SELECT count(*), any_value(_model_error_) FROM eval_nodefa('JP');
+SELECT rulepos, coalesce(_model_error_, '<none>')
+FROM dr_t('dr_in', hit_policy := 'Unique') WHERE id = 3;
 ----
-1	No default rule defined
+5	<none>
 
 # ==============================================================================================
 # §4  ⚠⚠ THE SECTION THIS FILE EXISTS FOR: INPUT PREPROCESSING MUST REACH THE RULES.
 # ==============================================================================================
-# A DuckDB MACRO PARAMETER SHADOWS A COLUMN OF THE SAME NAME ANYWHERE IN THE BODY. MEASURED on a two-line
-# macro: with a CTE aliasing `upper(x) AS x`, a bare `x` downstream yields the ARGUMENT while `p.x` yields
-# the preprocessed value. So the renderer QUALIFIES every input reference, and if it ever stops, input
-# preprocessing becomes silently INERT — computed, never read, every rule matching the raw argument.
+# The renderer QUALIFIES every input reference (`preprocessed.region`). It was written for macro-parameter
+# shadowing, which cannot arise now that the inputs are DATA — and it is STILL load-bearing, for a second
+# measured reason: in the TABLE form the rule predicates sit in a LATERAL beside the output CASEs, and a
+# LOCAL SELECT ALIAS BEATS A CORRELATED OUTER COLUMN OF THE SAME NAME. With an output column named like an
+# input, an unqualified predicate compares against that output EXPRESSION and the rule silently never fires.
 #
-# ⚠⚠ NOTHING FAILS WHEN THAT HAPPENS, which is why this section is written the way it is. The first three
-# probes taken while it WAS broken all passed, because they used value-PRESERVING preprocessing
+# ⚠⚠ NOTHING FAILS WHEN QUALIFICATION IS LOST, which is why this section is written the way it is. The
+# first three probes taken while it WAS broken all passed, because they used value-PRESERVING preprocessing
 # (`floor(40)` is 40, `upper('JP')` is 'JP') and so could not discriminate. §3 above has the same blind
 # spot by construction. Only preprocessing that CHANGES the value can see this.
 
@@ -200,30 +284,56 @@ INSERT INTO pp VALUES
     ( 3, '',         '',        'other');
 
 statement ok
-SELECT fabricator_host_exec(decision_render('pp', name := 'eval_pp'));
+SELECT fabricator_host_exec(decision_render('pp', name := 'pp_s'));
+
+statement ok
+SELECT fabricator_host_exec(decision_render('pp', name := 'pp_t', form := 'table'));
+
+statement ok
+CREATE TABLE pp_in (id INT, region VARCHAR, other VARCHAR);
+
+statement ok
+INSERT INTO pp_in VALUES (1, 'eu', 'zz'), (2, 'xy', 'XY');
 
 # The column's OWN cell against the preprocessed value: 'eu' must reach rule 1 through upper().
 # Without qualification this answers rule 3 / 'other'.
-query IT
-SELECT rulepos, decision FROM eval_pp('eu', 'zz');
+query TT
+SELECT one(v).rulepos, one(v).decision FROM (SELECT pp_s({'region': 'eu', 'other': 'zz'}) AS v);
 ----
 1	euro
 
 # ⚠ THE CROSS-COLUMN HALF, and it is a SEPARATE assertion because a fix that qualified only the cell's own
 # column would pass the row above and fail here: `@region` must resolve to the PREPROCESSED region, so
 # 'xy' preprocessed to 'XY' equals the literal 'XY' passed as `other`.
-query IT
-SELECT rulepos, decision FROM eval_pp('xy', 'XY');
+query TT
+SELECT one(v).rulepos, one(v).decision FROM (SELECT pp_s({'region': 'xy', 'other': 'XY'}) AS v);
 ----
 2	same-as-region
 
+# Both halves again through the TABLE form, where the correlated-vs-alias hazard actually lives.
+query IIT
+SELECT id, rulepos, decision FROM pp_t('pp_in') ORDER BY id;
+----
+1	1	euro
+2	2	same-as-region
+
+# ⚠ THE PASSTHROUGH CARRIES THE PREPROCESSED VALUE, not the raw one — measured, and it is what makes the
+# table form's output self-explaining: the row says which value the rules actually saw.
+query IT
+SELECT id, region FROM pp_t('pp_in') ORDER BY id;
+----
+1	EU
+2	XY
+
 # ⚠ The structural half, which no ANSWER can see: the rendered text must qualify. A build that emitted
 # bare references would still produce runnable SQL — that is exactly the failure mode.
-query TT
+query TTT
 SELECT regexp_matches(decision_render('pp'), 'preprocessed\.region')::VARCHAR,
-       regexp_matches(decision_render('pp'), 'WHEN 1 THEN preprocessed\.region = ''EU''')::VARCHAR;
+       regexp_matches(decision_render('pp'), 'WHEN 1 THEN preprocessed\.region = ''EU''')::VARCHAR,
+       regexp_matches(decision_render('pp', form := 'table'),
+                      'WHEN 1 THEN preprocessed\.region = ''EU''')::VARCHAR;
 ----
-true	true
+true	true	true
 
 # ==============================================================================================
 # §5  AGGREGATE MODE — output preprocessing containing an aggregate collapses every match to one row.
@@ -248,26 +358,56 @@ INSERT INTO dra VALUES
     ( 5, '',        '',           '',        'reject',          '1.0',              'default');
 
 statement ok
-SELECT fabricator_host_exec(decision_render('dra', name := 'eval_dra'));
+SELECT fabricator_host_exec(decision_render('dra', name := 'dra_s'));
+
+statement ok
+SELECT fabricator_host_exec(decision_render('dra', name := 'dra_t', form := 'table'));
+
+statement ok
+CREATE TABLE dra_in (id INT, region VARCHAR, age DOUBLE, amount DOUBLE);
+
+# ⚠ Row 2 is lowercase 'jp' on purpose — see the scalar-subselect note below.
+statement ok
+INSERT INTO dra_in VALUES (1, 'JP', 40, 500), (2, 'jp', 40, 500);
 
 # ⚠ The DEFAULT hit policy flips to RuleOrder in aggregate mode — an aggregate over one row is pointless,
 # so this call takes no hit_policy and must still collapse three rules.
 query TTRT
-SELECT rulepos, decision, risk, label FROM eval_dra('JP', 40, 500);
+SELECT one(v).rulepos, one(v).decision, round(one(v).risk, 4), one(v).label
+FROM (SELECT dra_s({'region': 'JP', 'age': 40, 'amount': 500}) AS v);
 ----
 3,4,5	flag	12.5	low
 
-# ⚠ A SCALAR-SUBSELECT preprocessing is NOT a lateral — it is parenthesised, so it stays in the SELECT
-# list. This row is also the one that proves `upper()` ran: lowercase 'jp' must behave like 'JP'.
 query TTRT
-SELECT rulepos, decision, risk, label FROM eval_dra('jp', 40, 500);
+SELECT rulepos, decision, round(risk, 4), label FROM dra_t('dra_in') WHERE id = 1;
+----
+3,4,5	flag	12.5	low
+
+# ⚠⚠ IN AGGREGATE MODE THE SCALAR FORM ALWAYS ANSWERS `single` — there is nothing left for `many` to
+# carry once every match has been collapsed, whatever the hit policy says.
+query T
+SELECT union_tag(dra_s({'region': 'JP', 'age': 40, 'amount': 500}, hit_policy := 'RuleOrder'));
+----
+single
+
+# ⚠ A SCALAR-SUBSELECT preprocessing is NOT a lateral — it is parenthesised, so it stays in the SELECT
+# list. Row 2 is also the one that proves `upper()` ran: lowercase 'jp' must behave like 'JP'.
+query TTRT
+SELECT rulepos, decision, round(risk, 4), label FROM dra_t('dra_in') WHERE id = 2;
 ----
 3,4,5	flag	12.5	low
 
 query TT
-SELECT rulepos, decision FROM eval_dra('JP', 40, 500, hit_policy := 'First');
+SELECT one(v).rulepos, one(v).decision
+FROM (SELECT dra_s({'region': 'JP', 'age': 40, 'amount': 500}, hit_policy := 'First') AS v);
 ----
 3	approve
+
+query IT
+SELECT id, rulepos FROM dra_t('dra_in', hit_policy := 'First') ORDER BY id;
+----
+1	3
+2	3
 
 # ==============================================================================================
 # §6  SELECT-STYLE PREPROCESSING — a LEFT JOIN LATERAL, which EXPANDS one input into N rows.
@@ -283,13 +423,23 @@ INSERT INTO latr VALUES
     ( 1, 'EU', 'euro'), ( 2, 'US', 'dollar'), ( 3, '', 'other');
 
 statement ok
-SELECT fabricator_host_exec(decision_render('latr', name := 'eval_lat'));
+SELECT fabricator_host_exec(decision_render('latr', name := 'lat_s'));
+
+statement ok
+SELECT fabricator_host_exec(decision_render('latr', name := 'lat_t', form := 'table'));
+
+statement ok
+CREATE TABLE lat_in (id INT, region VARCHAR);
+
+statement ok
+INSERT INTO lat_in VALUES (1, 'EU,US,JP');
 
 # 'EU,US,JP' expands to three rows: rule 1 matches one, rule 2 another, and the wildcard rule 3 all three.
 # ⚠ A build that put the expansion in the SELECT list instead of a LATERAL yields ONE row, not five.
-query ITI
-SELECT rulepos, decision, _total_hits_
-  FROM eval_lat('EU,US,JP', hit_policy := 'RuleOrder') ORDER BY rulepos, decision;
+query TTT
+SELECT u.rulepos, u.decision, u._total_hits_
+FROM (SELECT lat_s({'region': 'EU,US,JP'}, hit_policy := 'RuleOrder') AS v), unnest(many(v)) AS t(u)
+ORDER BY u.rulepos, u.decision;
 ----
 1	euro	5
 2	dollar	5
@@ -297,12 +447,36 @@ SELECT rulepos, decision, _total_hits_
 3	other	5
 3	other	5
 
+# ⚠⚠ THE TWO FORMS DIVERGE HERE, DELIBERATELY AND FAITHFULLY, AND IT IS THE ONE PLACE THEY DO. The scalar
+# form expands INSIDE one evaluation, so all five hits belong to a single call and `_total_hits_` is 5.
+# The table form expands in `preprocessed`, i.e. BEFORE the per-row lateral — so one input row becomes
+# three INPUT ROWS, each decided on its own, and `_total_hits_` is that row's own count. The ported engine
+# splits the same way; what would be a defect is a form that silently did the other one.
+query TIT
+SELECT region, rulepos, decision FROM lat_t('lat_in', hit_policy := 'RuleOrder')
+ORDER BY rulepos, region;
+----
+EU	1	euro
+US	2	dollar
+EU	3	other
+JP	3	other
+US	3	other
+
+query TI
+SELECT region, _total_hits_ FROM lat_t('lat_in') ORDER BY region;
+----
+EU	2
+JP	1
+US	2
+
 # ==============================================================================================
 # §7  WHERE THE RULES COME FROM — a table, a file, JSON text, a verbatim relation.
 # ==============================================================================================
 # ⚠ The CLASSIFIER is pinned offline in tier 0; what this section gates is that each form really RESOLVES
 # against DuckDB — a `read_csv` option name or a `from_json` shape we cannot test is a branch that fails at
 # the call site, which is the whole reason dmn_relation keeps to forms measured on the shipped build.
+# ⚠ The rules SOURCE and the rendered FORM are independent, so this section renders scalars only; §17 and
+# §18 cover the forms.
 
 statement ok
 CREATE TABLE src (rulepos INT, region VARCHAR, decision VARCHAR);
@@ -331,14 +505,14 @@ SELECT fabricator_host_exec(decision_render('(VALUES (-2,''in'',''out''),(-1,''V
 # All four render the SAME decision table, so all four must answer identically — which is the property the
 # classifier exists to deliver: the introspection never learns where its rows came from.
 query TTTT
-SELECT (SELECT decision FROM ev_csv('EU')), (SELECT decision FROM ev_pq('EU')),
-       (SELECT decision FROM ev_json('EU')), (SELECT decision FROM ev_sql('EU'));
+SELECT one(ev_csv({'region':'EU'})).decision, one(ev_pq({'region':'EU'})).decision,
+       one(ev_json({'region':'EU'})).decision, one(ev_sql({'region':'EU'})).decision;
 ----
 euro	euro	euro	euro
 
 query TTTT
-SELECT (SELECT decision FROM ev_csv('JP')), (SELECT decision FROM ev_pq('JP')),
-       (SELECT decision FROM ev_json('JP')), (SELECT decision FROM ev_sql('JP'));
+SELECT one(ev_csv({'region':'JP'})).decision, one(ev_pq({'region':'JP'})).decision,
+       one(ev_json({'region':'JP'})).decision, one(ev_sql({'region':'JP'})).decision;
 ----
 other	other	other	other
 
@@ -358,7 +532,7 @@ statement ok
 SELECT fabricator_host_exec(decision_render('${FABRICATOR_DELTA_WRITE_DIR}/dmn_num.csv', name := 'ev_num'));
 
 query TT
-SELECT (SELECT decision FROM ev_num(42)), (SELECT decision FROM ev_num(7));
+SELECT one(ev_num({'score':42})).decision, one(ev_num({'score':7})).decision;
 ----
 matched	other
 
@@ -399,8 +573,9 @@ SELECT decision_render('norules');
 ----
 no rules
 
-# ⚠ A decision column becomes a MACRO PARAMETER, so it has to be a bare identifier. Refusing here beats
-# rendering a CREATE MACRO that cannot parse — the caller would meet the failure with no idea which column.
+# ⚠ A decision column names a struct field and a relation column, so it has to be a bare identifier.
+# Refusing here beats rendering a CREATE MACRO that cannot parse — the caller would meet the failure with
+# no idea which column.
 statement ok
 CREATE TABLE badname (rulepos INT, "a b" VARCHAR, dec VARCHAR);
 
@@ -409,6 +584,20 @@ INSERT INTO badname VALUES (-2,'in','out'),(1,'x','y');
 
 statement error
 SELECT decision_render('badname');
+----
+must be bare identifiers
+
+# ⚠ ... and the STRIPPED name has to be one too: a column named `In_` alone leaves nothing behind, which
+# would render `input['']`. Caught by the same check, which is why it names the column rather than the
+# parameter — the fix is to rename the column.
+statement ok
+CREATE TABLE badstrip (rulepos INT, In_ VARCHAR, dec VARCHAR);
+
+statement ok
+INSERT INTO badstrip VALUES (-2,'in','out'),(1,'x','y');
+
+statement error
+SELECT decision_render('badstrip');
 ----
 must be bare identifiers
 
@@ -427,6 +616,21 @@ SELECT decision_render('dr', dialect := 'oracle');
 ----
 is not one of duckdb, tsql
 
+# ⚠⚠ AN UNKNOWN `form` IS REFUSED BY NAME rather than defaulting, because the two forms are not
+# substitutable: silently rendering a scalar where a table macro was asked for hands back a statement
+# that creates the wrong KIND of object, and the caller meets that at their own call site.
+statement error
+SELECT decision_render('dr', form := 'lateral');
+----
+is not one of 'scalar'
+
+# ⚠ `batch` is the ported engine's name for the table form and is accepted, because anyone reading that
+# project will type it.
+query T
+SELECT regexp_matches(decision_render('dr', form := 'batch'), 'MACRO decision_eval\(input_table')::VARCHAR;
+----
+true
+
 # ⚠⚠ `tsql` IS RECOGNISED BY THE PARSER AND REFUSED BY THE RENDERER, which is the honest split while only
 # one statement template exists: the cell vocabulary is dialect-aware, the SHAPE below it is a DuckDB
 # CREATE MACRO. Rendering it under 'tsql' would return a statement no SQL Server can run while LOOKING
@@ -443,12 +647,11 @@ SELECT dmn_condition('in [1,2,3]', 'age', 'tsql', '');
 age IN (1, 2, 3)
 
 # ==============================================================================================
-# §9  THE MACRO'S SHAPE — which columns become PARAMETERS, and in what order.
+# §9  THE TWO SHAPES — what becomes a parameter, a struct field, a column, and what is IGNORED.
 # ==============================================================================================
-# ⚠⚠ THIS IS THE ONLY ASSERTION THAT SEES A COLUMN BEING IGNORED. A `Comment`-style column (blank
-# direction) contributes no parameter and no output — but a build that turned it into an INPUT would
-# still pass every answer row in this file, because its rules cells are blank and a blank cell is a
-# WILDCARD. So the shape has to be asserted directly.
+# ⚠⚠ THIS IS THE ONLY SECTION THAT SEES A COLUMN BEING IGNORED. A `note`-style column (blank direction)
+# contributes nothing — but a build that turned it into an INPUT would still pass every answer row in this
+# file, because its rules cells are blank and a blank cell is a WILDCARD. So the shape is asserted directly.
 #
 # ⚠ A MACRO's parameter list is DETERMINISTIC, unlike a FUNCTION's. The recorded trap — that
 # `duckdb_functions().parameters` lists NAMED parameters in an unordered_map's iteration order, so it
@@ -467,20 +670,49 @@ INSERT INTO shape VALUES
     ( 2, '',        NULL,        '',        'other');
 
 statement ok
-SELECT fabricator_host_exec(decision_render('shape', name := 'ev_shape'));
+SELECT fabricator_host_exec(decision_render('shape', name := 'sh_s'));
 
-# `In_region` → `region` (the prefix is stripped from the PARAMETER, never from the column), `note` is
-# ignored entirely, `decision` is an OUTPUT, and `hit_policy` is always last.
+statement ok
+SELECT fabricator_host_exec(decision_render('shape', name := 'sh_t', form := 'table'));
+
+# ⚠⚠ NEITHER FORM TAKES THE INPUTS AS PARAMETERS — that is the change this whole rewrite is: a macro
+# argument is a bind-time constant, so the inputs had to become DATA. What is left is the data and the
+# policy, and `hit_policy` is always last.
+query TT
+SELECT (SELECT list_aggregate(parameters, 'string_agg', ',') FROM duckdb_functions() WHERE function_name = 'sh_s'),
+       (SELECT list_aggregate(parameters, 'string_agg', ',') FROM duckdb_functions() WHERE function_name = 'sh_t');
+----
+input,hit_policy	input_table,hit_policy
+
+# ⚠⚠ THE SCALAR FORM'S RESULT TYPE IS ITS WHOLE CONTRACT, so it is pinned verbatim — one assertion that
+# sees every part of the shape at once: `In_region` stripped to `region`, `note` absent, `decision` present,
+# the fixed columns, and BOTH union members carrying the same struct.
 query T
-SELECT list_aggregate(parameters, 'string_agg', ',') FROM duckdb_functions() WHERE function_name = 'ev_shape';
+SELECT typeof(sh_s({'region': 'EU', 'age': 30}));
 ----
-region,age,hit_policy
+UNION(single STRUCT(decisiontable_hk VARCHAR, rulepos VARCHAR, decision VARCHAR, _total_hits_ BIGINT, _any_hitpolicy_violations_ BIGINT, _model_error_ VARCHAR), many STRUCT(decisiontable_hk VARCHAR, rulepos VARCHAR, decision VARCHAR, _total_hits_ BIGINT, _any_hitpolicy_violations_ BIGINT, _model_error_ VARCHAR)[])
 
-# ⚠ The behaviour half: the stripped name is what the CALLER uses, and it still matches on the column.
-query IT
-SELECT rulepos, decision FROM ev_shape(region := 'EU', age := 30);
+statement ok
+CREATE TABLE sh_in (id INT, region VARCHAR, age INT, extra VARCHAR);
+
+statement ok
+INSERT INTO sh_in VALUES (1, 'EU', 30, 'carried');
+
+# ⚠⚠ THE TABLE FORM'S CONTRACT: the inputs come back PREPROCESSED, every other column of the input
+# relation rides through UNTOUCHED, and the decision follows. The passthrough is what lets a key column
+# come back beside the answer, so its presence and its ORDER are asserted, not assumed.
+query T
+SELECT string_agg(column_name, ',') FROM (DESCRIBE SELECT * FROM sh_t('sh_in'));
 ----
-1	euro
+region,age,id,extra,decisiontable_hk,rulepos,decision,_total_hits_,_any_hitpolicy_violations_,_model_error_
+
+# ⚠ The behaviour half: the stripped name is what the CALLER uses, in both forms, and it still matches on
+# the column.
+query TIT
+SELECT one(sh_s({'region': 'EU', 'age': 30})).decision,
+       (SELECT rulepos FROM sh_t('sh_in')), (SELECT extra FROM sh_t('sh_in'));
+----
+euro	1	carried
 
 # ==============================================================================================
 # §10  THE `Any` HIT POLICY — overlapping rules that DISAGREE.
@@ -497,27 +729,44 @@ INSERT INTO anyt VALUES (-2,'in','out'), (-1,'VARCHAR','VARCHAR'),
     (1,'EU','same'), (2,'EU','same'), (3,'US','a'), (4,'US','b');
 
 statement ok
-SELECT fabricator_host_exec(decision_render('anyt', name := 'ev_any'));
+SELECT fabricator_host_exec(decision_render('anyt', name := 'any_s'));
+
+statement ok
+SELECT fabricator_host_exec(decision_render('anyt', name := 'any_t', form := 'table'));
+
+statement ok
+CREATE TABLE any_in (id INT, region VARCHAR);
+
+statement ok
+INSERT INTO any_in VALUES (1,'EU'), (2,'US');
 
 # Two rules match and AGREE ⇒ no violation, no error. (`_total_hits_` is still 2 — Any reports, it does
 # not deduplicate.)
 query IIT
-SELECT _total_hits_, _any_hitpolicy_violations_, coalesce(_model_error_, '<none>')
-  FROM ev_any('EU', hit_policy := 'Any');
+SELECT one(v)._total_hits_, one(v)._any_hitpolicy_violations_, coalesce(one(v)._model_error_, '<none>')
+FROM (SELECT any_s({'region':'EU'}, hit_policy := 'Any') AS v);
 ----
 2	0	<none>
 
 # Two rules match and DISAGREE ⇒ the violation count is the extra distinct output, and Any says so.
 query IIT
-SELECT _total_hits_, _any_hitpolicy_violations_, coalesce(_model_error_, '<none>')
-  FROM ev_any('US', hit_policy := 'Any');
+SELECT one(v)._total_hits_, one(v)._any_hitpolicy_violations_, coalesce(one(v)._model_error_, '<none>')
+FROM (SELECT any_s({'region':'US'}, hit_policy := 'Any') AS v);
 ----
 2	1	Model Error: Overlapping rules hit with different outputs!
+
+query IIIT
+SELECT id, _total_hits_, _any_hitpolicy_violations_, coalesce(_model_error_, '<none>')
+FROM any_t('any_in', hit_policy := 'Any') ORDER BY id;
+----
+1	2	0	<none>
+2	2	1	Model Error: Overlapping rules hit with different outputs!
 
 # ⚠ `_any_hitpolicy_violations_` is computed for EVERY policy — it is an output column, not an Any-only
 # one — and only the MESSAGE is policy-dependent. Pinned so the two cannot be conflated.
 query IT
-SELECT _any_hitpolicy_violations_, coalesce(_model_error_, '<none>') FROM ev_any('US');
+SELECT one(v)._any_hitpolicy_violations_, coalesce(one(v)._model_error_, '<none>')
+FROM (SELECT any_s({'region':'US'}) AS v);
 ----
 1	<none>
 
@@ -525,8 +774,8 @@ SELECT _any_hitpolicy_violations_, coalesce(_model_error_, '<none>') FROM ev_any
 # §11  AGGREGATE MODE — an output with NO preprocessing is EXCLUDED but still computed.
 # ==============================================================================================
 # ⚠⚠ THE TWO HALVES ARE ONE RULE AND BOTH MATTER. Such a column cannot be collapsed (there is no
-# GROUP BY, so a bare column beside an aggregate is a binder error), so it is dropped from the result
-# — but the INNER CASE still computes it, which is the only reason an aggregate over ANOTHER output
+# GROUP BY over it, so a bare column beside an aggregate is a binder error), so it is dropped from the
+# result — but the INNER CASE still computes it, which is the only reason an aggregate over ANOTHER output
 # can reference it. §5's table gives every output a preprocessing expression, so it cannot reach this.
 
 statement ok
@@ -537,21 +786,41 @@ INSERT INTO aggx VALUES (-2,'in','out','out'), (-1,'VARCHAR','VARCHAR','DOUBLE')
     (0,NULL,'arg_max(?,risk)',NULL), (1,'EU','a','1.0'), (2,'','b','5.0');
 
 statement ok
-SELECT fabricator_host_exec(decision_render('aggx', name := 'ev_aggx'));
+SELECT fabricator_host_exec(decision_render('aggx', name := 'aggx_s'));
+
+statement ok
+SELECT fabricator_host_exec(decision_render('aggx', name := 'aggx_t', form := 'table'));
+
+statement ok
+CREATE TABLE aggx_in (id INT, region VARCHAR);
+
+statement ok
+INSERT INTO aggx_in VALUES (1,'EU');
 
 # `arg_max(decision, risk)` picks the decision at the HIGHEST risk — so rule 2's 'b', which is only
 # reachable because `risk` is still computed inside.
 query TT
-SELECT rulepos, decision FROM ev_aggx('EU');
+SELECT one(v).rulepos, one(v).decision FROM (SELECT aggx_s({'region':'EU'}) AS v);
+----
+1,2	b
+
+query TT
+SELECT rulepos, decision FROM aggx_t('aggx_in');
 ----
 1,2	b
 
 # ... and `risk` itself is gone from the result. ⚠ This is the assertion that would pass vacuously if
 # written as "select the columns I expect": it has to reference the ABSENT one.
 statement error
-SELECT risk FROM ev_aggx('EU');
+SELECT risk FROM aggx_t('aggx_in');
 ----
 risk
+
+# ⚠ The scalar form drops it from the RESULT TYPE, which is the same rule seen through its own surface.
+query T
+SELECT typeof(aggx_s({'region':'EU'})) LIKE '%risk%';
+----
+false
 
 # ==============================================================================================
 # §12  OUTPUT POSTPROCESSING WITHOUT AGGREGATES — the expression, then the datatype cast.
@@ -567,22 +836,40 @@ INSERT INTO postx VALUES (-2,'in','out','out'), (-1,'VARCHAR','VARCHAR','INTEGER
     (0,NULL,'upper(?)',NULL), (1,'','abc','42');
 
 statement ok
-SELECT fabricator_host_exec(decision_render('postx', name := 'ev_postx'));
+SELECT fabricator_host_exec(decision_render('postx', name := 'post_s'));
+
+statement ok
+SELECT fabricator_host_exec(decision_render('postx', name := 'post_t', form := 'table'));
+
+statement ok
+CREATE TABLE post_in (v VARCHAR);
+
+statement ok
+INSERT INTO post_in VALUES ('anything');
 
 # `label` goes through its postprocess AND its cast; `n` through the cast alone. Without the
 # postprocess `label` would be 'abc', which is the discrimination.
 query TI
-SELECT label, n FROM ev_postx('anything');
+SELECT one(v).label, one(v).n FROM (SELECT post_s({'v':'anything'}) AS v);
+----
+ABC	42
+
+query TI
+SELECT label, n FROM post_t('post_in');
 ----
 ABC	42
 
 # ⚠ `?` in an OUTPUT preprocessing expression is the OUTPUT column, not the input — the opposite of
 # its meaning in an input preprocessing expression. Pinned structurally, because an implementation
-# that substituted the input would still produce runnable SQL.
-query T
-SELECT regexp_matches(decision_render('postx'), 'cast\(\(upper\(label\)\) as VARCHAR\) AS label')::VARCHAR;
+# that substituted the input would still produce runnable SQL. ⚠ The table form reads that output out of
+# the lateral it joined, so there the same fragment is `ranked.label` — one plan, one form-dependent
+# prefix, and both spellings are pinned so neither can drift into the other.
+query TT
+SELECT regexp_matches(decision_render('postx'), 'cast\(\(upper\(label\)\) as VARCHAR\) AS label')::VARCHAR,
+       regexp_matches(decision_render('postx', form := 'table'),
+                      'cast\(\(upper\(ranked\.label\)\) as VARCHAR\) AS label')::VARCHAR;
 ----
-true
+true	true
 
 # ==============================================================================================
 # §13  `rulepos` IS THE ORDERING — 1..N, no gaps.
@@ -602,22 +889,24 @@ INSERT INTO contig VALUES (-2,'in','out'), (-1,'VARCHAR','VARCHAR'),
     (1,'EU','one'), (2,'US','two'), (3,'','three');
 
 statement ok
-SELECT fabricator_host_exec(decision_render('contig', name := 'ev_contig'));
+SELECT fabricator_host_exec(decision_render('contig', name := 'ct_s'));
 
 # ⚠ The compact form, which is the whole reason the assumption is worth keeping: a 50-rule table renders
-# `generate_series(1, 50)` rather than fifty literals.
-query T
-SELECT regexp_matches(decision_render('contig'), 'FROM generate_series\(1, 3\) r\(rulepos\)')::VARCHAR;
+# `generate_series(1, 50)` rather than fifty literals — in both forms.
+query TT
+SELECT regexp_matches(decision_render('contig'), 'FROM generate_series\(1, 3\) r\(rulepos\)')::VARCHAR,
+       regexp_matches(decision_render('contig', form := 'table'),
+                      'FROM generate_series\(1, 3\) r\(rulepos\)')::VARCHAR;
 ----
-true
+true	true
 
-query IT
-SELECT rulepos, decision FROM ev_contig('EU');
+query TT
+SELECT one(ct_s({'region':'EU'})).rulepos, one(ct_s({'region':'EU'})).decision;
 ----
 1	one
 
-query IT
-SELECT rulepos, decision FROM ev_contig('JP');
+query TT
+SELECT one(ct_s({'region':'JP'})).rulepos, one(ct_s({'region':'JP'})).decision;
 ----
 3	three
 
@@ -653,9 +942,9 @@ must run 1..N with no gaps
 # ==============================================================================================
 # §14  `decisiontable_hk` — the decision table's identity.
 # ==============================================================================================
-# ⚠ It is a property of the RULES, not of the rendered macro, so renaming the macro must not move it and
-# changing one cell must. ⚠ The 32-hex match is the hash because nothing else in these fixtures is 32 hex
-# characters long.
+# ⚠ It is a property of the RULES, not of the rendered macro, so renaming the macro must not move it,
+# rendering the OTHER FORM must not move it, and changing one cell must. ⚠ The 32-hex match is the hash
+# because nothing else in these fixtures is 32 hex characters long.
 
 statement ok
 CREATE TABLE hk_b (rulepos INT, region VARCHAR, decision VARCHAR);
@@ -664,13 +953,15 @@ statement ok
 INSERT INTO hk_b VALUES (-2,'in','out'), (-1,'VARCHAR','VARCHAR'),
     (1,'EU','one'), (2,'US','two'), (3,'','THREE');
 
-query TT
+query TTT
 SELECT regexp_extract(decision_render('contig'), '([0-9a-f]{32})', 1)
      = regexp_extract(decision_render('contig', name := 'other_name'), '([0-9a-f]{32})', 1),
        regexp_extract(decision_render('contig'), '([0-9a-f]{32})', 1)
+     = regexp_extract(decision_render('contig', form := 'table'), '([0-9a-f]{32})', 1),
+       regexp_extract(decision_render('contig'), '([0-9a-f]{32})', 1)
      = regexp_extract(decision_render('hk_b'), '([0-9a-f]{32})', 1);
 ----
-true	false
+true	true	false
 
 # ==============================================================================================
 # §15  THE PATTERN-MATCHING AND NULL OPERATORS, END TO END.
@@ -704,34 +995,38 @@ INSERT INTO kw VALUES
     ( 5, '',                          '',                                    'other');
 
 statement ok
-SELECT fabricator_host_exec(decision_render('kw', name := 'ev_kw'));
+SELECT fabricator_host_exec(decision_render('kw', name := 'kw_s'));
 
-query IT
-SELECT rulepos, decision FROM ev_kw(NULL, 'x');
-----
-1	missing
+statement ok
+SELECT fabricator_host_exec(decision_render('kw', name := 'kw_t', form := 'table'));
 
-query IT
-SELECT rulepos, decision FROM ev_kw('EU', 'x');
-----
-2	europe
+statement ok
+CREATE TABLE kw_in (id INT, region VARCHAR, other VARCHAR);
 
-query IT
-SELECT rulepos, decision FROM ev_kw('USA', 'x');
-----
-3	america
+statement ok
+INSERT INTO kw_in VALUES (1, NULL, 'x'), (2, 'EU', 'x'), (3, 'USA', 'x'), (4, 'JP', 'JP'), (5, 'JP', 'zz');
 
-query IT
-SELECT rulepos, decision FROM ev_kw('JP', 'JP');
+# ⚠ THE LAST ROW IS THE CONTROL. Without it every row above would be equally true of a build where the
+# keywords were detected but the CONDITIONS never matched anything — 'other' has to remain reachable.
+query IIT
+SELECT id, rulepos, decision FROM kw_t('kw_in') ORDER BY id;
 ----
-4	null-safe-equal
+1	1	missing
+2	2	europe
+3	3	america
+4	4	null-safe-equal
+5	5	other
 
-# ⚠ THE CONTROL. Without it every row above would be equally true of a build where the keywords were
-# detected but the CONDITIONS never matched anything — 'other' has to remain reachable.
-query IT
-SELECT rulepos, decision FROM ev_kw('JP', 'zz');
+# ... and the same five through the scalar form, which is where a NULL input actually travels as data.
+query ITT
+SELECT id, one(v).rulepos, one(v).decision
+FROM (SELECT id, kw_s({'region': region, 'other': other}) AS v FROM kw_in) ORDER BY id;
 ----
-5	other
+1	1	missing
+2	2	europe
+3	3	america
+4	4	null-safe-equal
+5	5	other
 
 # The structural half: the cell is passed THROUGH as a condition, not quoted into an equality.
 query TT
@@ -757,16 +1052,229 @@ INSERT INTO blankout VALUES (-2,'in','out','out'), (-1,'VARCHAR','VARCHAR','VARC
     (1,'EU','','set'), (2,'',NULL,'other');
 
 statement ok
-SELECT fabricator_host_exec(decision_render('blankout', name := 'ev_blank'));
+SELECT fabricator_host_exec(decision_render('blankout', name := 'bl_s'));
 
 # ⚠ `b` is the CONTROL — without it "a is NULL" would be equally true of a build where every output had
 # stopped being computed.
-query ITT
-SELECT rulepos, coalesce(a, '<null>'), coalesce(b, '<null>') FROM ev_blank('EU');
+query TTT
+SELECT one(v).rulepos, coalesce(one(v).a, '<null>'), coalesce(one(v).b, '<null>')
+FROM (SELECT bl_s({'region':'EU'}) AS v);
 ----
 1	<null>	set
 
-query ITT
-SELECT rulepos, coalesce(a, '<null>'), coalesce(b, '<null>') FROM ev_blank('JP');
+query TTT
+SELECT one(v).rulepos, coalesce(one(v).a, '<null>'), coalesce(one(v).b, '<null>')
+FROM (SELECT bl_s({'region':'JP'}) AS v);
 ----
 2	<null>	other
+
+# ==============================================================================================
+# §17  THE TABLE FORM'S CONTRACT — a named relation in, its own columns back out.
+# ==============================================================================================
+# ⚠ `input_table` reaches `query_table()`, so it is a bind-time constant NAMING a relation. Three
+# spellings are measured to work and are pinned, because "pass the table" is the first thing a caller
+# tries and the failure of a wrong one is a binder error about a column that does not exist.
+
+statement ok
+CREATE TABLE tf (rulepos INT, region VARCHAR, decision VARCHAR);
+
+statement ok
+INSERT INTO tf VALUES (-2,'in','out'), (-1,'VARCHAR','VARCHAR'), (1,'EU','euro'), (2,'','other');
+
+statement ok
+SELECT fabricator_host_exec(decision_render('tf', name := 'tf_t', form := 'table'));
+
+statement ok
+CREATE TABLE tf_in (id INT, region VARCHAR);
+
+statement ok
+INSERT INTO tf_in VALUES (1,'EU'), (2,'JP');
+
+# A string, a qualified string, and the bare identifier — all three name the same relation.
+query TTT
+SELECT (SELECT decision FROM tf_t('tf_in') WHERE id = 1),
+       (SELECT decision FROM tf_t('main.tf_in') WHERE id = 1),
+       (SELECT decision FROM tf_t(tf_in) WHERE id = 1);
+----
+euro	euro	euro
+
+# ⚠⚠ THE INPUT RELATION MUST CARRY A COLUMN PER INPUT, and the failure is LOUD and names it — which is
+# the property worth pinning, because the alternative (a silently absent input matching every wildcard)
+# is the failure mode this whole file is written against.
+statement ok
+CREATE TABLE tf_bad (id INT, regio VARCHAR);
+
+statement error
+SELECT * FROM tf_t('tf_bad');
+----
+region
+
+# ⚠ A relation with NO rows answers with no rows — the decision is evaluated per input row, so there is
+# nothing to decide. (The scalar form's empty analogue is §18's no-match NULL.)
+statement ok
+CREATE TABLE tf_empty (id INT, region VARCHAR);
+
+query I
+SELECT count(*) FROM tf_t('tf_empty');
+----
+0
+
+# ==============================================================================================
+# §18  THE SCALAR FORM'S CONTRACT — a UNION, and which member the hit policy picks.
+# ==============================================================================================
+# ⚠ §3–§16 read the result through the `one`/`many` shorthands at the top of this file. THIS section uses
+# the raw API, so the tags and member names are pinned literally rather than through a wrapper that would
+# hide a rename.
+
+statement ok
+SELECT fabricator_host_exec(decision_render('tf', name := 'tf_s'));
+
+# First / Unique / Any ⇒ `single`. RuleOrder on a NON-aggregate table ⇒ `many`.
+query TTTT
+SELECT union_tag(tf_s({'region':'EU'})),
+       union_tag(tf_s({'region':'EU'}, hit_policy := 'Unique')),
+       union_tag(tf_s({'region':'EU'}, hit_policy := 'Any')),
+       union_tag(tf_s({'region':'EU'}, hit_policy := 'RuleOrder'));
+----
+single	single	single	many
+
+query TT
+SELECT union_extract(tf_s({'region':'EU'}), 'single').decision,
+       len(union_extract(tf_s({'region':'EU'}, hit_policy := 'RuleOrder'), 'many'));
+----
+euro	2
+
+# ⚠⚠ NO MATCH AT ALL IS NULL, not an empty struct — measured, and it needs a table with no catch-all rule
+# to reach, since one unconditional rule makes every input a hit. ⚠ It is also why
+# `_model_error_ = 'No default rule defined'` is UNREACHABLE in a non-aggregate scalar: there is no row
+# left to carry it. Under RuleOrder the answer is a `many` whose LIST is NULL, which is a different shape
+# and is pinned beside it.
+
+statement ok
+CREATE TABLE nodef (rulepos INT, region VARCHAR, decision VARCHAR);
+
+statement ok
+INSERT INTO nodef VALUES (-2,'in','out'), (-1,'VARCHAR','VARCHAR'), (1,'EU','euro');
+
+statement ok
+SELECT fabricator_host_exec(decision_render('nodef', name := 'nodef_s'));
+
+statement ok
+SELECT fabricator_host_exec(decision_render('nodef', name := 'nodef_t', form := 'table'));
+
+query TTT
+SELECT nodef_s({'region':'JP'}) IS NULL,
+       union_tag(nodef_s({'region':'JP'}, hit_policy := 'RuleOrder')),
+       union_extract(nodef_s({'region':'JP'}, hit_policy := 'RuleOrder'), 'many') IS NULL;
+----
+true	many	true
+
+# ⚠ The table form's answer to the same input is a ROW with NULL decision columns — a LEFT JOIN that found
+# nothing — not a missing row. Its `_model_error_` is therefore reachable where the scalar's is not.
+query TTT
+SELECT region, coalesce(decision, '<null>'), coalesce(_model_error_, '<none>')
+FROM nodef_t('tf_in') WHERE region = 'JP';
+----
+JP	<null>	No default rule defined
+
+# ⚠⚠ AN OUTPUT WITH NO DECLARED DATATYPE IS VARCHAR IN THE SCALAR FORM AND ITS VALUE IS CAST, where the
+# table form keeps whatever the cell expression produced. That is inherent — a UNION type has to be
+# spelled out, and nothing short of executing the generated SQL would say what the cells produce — and the
+# escape is the datatypes row. Both halves are pinned because the divergence is otherwise invisible.
+
+statement ok
+CREATE TABLE untyped (rulepos INT, region VARCHAR, n VARCHAR, m VARCHAR);
+
+statement ok
+INSERT INTO untyped VALUES (-2,'in','out','out'), (-1,'VARCHAR',NULL,'INTEGER'), (1,'','41 + 1','41 + 1');
+
+statement ok
+SELECT fabricator_host_exec(decision_render('untyped', name := 'ut_s'));
+
+statement ok
+SELECT fabricator_host_exec(decision_render('untyped', name := 'ut_t', form := 'table'));
+
+query TT
+SELECT typeof(one(ut_s({'region':'EU'})).n), typeof(one(ut_s({'region':'EU'})).m);
+----
+VARCHAR	INTEGER
+
+query TT
+SELECT (SELECT typeof(n) FROM ut_t('tf_in') LIMIT 1), (SELECT typeof(m) FROM ut_t('tf_in') LIMIT 1);
+----
+INTEGER	INTEGER
+
+# ... and the VALUE survives the coercion either way, which is what makes the type note a caveat rather
+# than a defect.
+query TTT
+SELECT one(ut_s({'region':'EU'})).n, one(ut_s({'region':'EU'})).m::VARCHAR,
+       (SELECT n::VARCHAR FROM ut_t('tf_in') LIMIT 1);
+----
+42	42	42
+
+# ==============================================================================================
+# §19  `is_temporary` — one token, and the one path it cannot take.
+# ==============================================================================================
+# It renders `CREATE OR REPLACE TEMPORARY MACRO`, so the macro lives in the `temp` catalog and dies with
+# the session. Both forms take it.
+
+query TT
+SELECT regexp_matches(decision_render('dr', name := 'tx', is_temporary := true),
+                      '^CREATE OR REPLACE TEMPORARY MACRO tx\(input,')::VARCHAR,
+       regexp_matches(decision_render('dr', name := 'tx', form := 'table', is_temporary := true),
+                      '^CREATE OR REPLACE TEMPORARY MACRO tx\(input_table,')::VARCHAR;
+----
+true	true
+
+# ⚠ The DEFAULT is off, which is the control for the two rows above — without it they would be equally
+# true of a build that had started rendering TEMPORARY unconditionally.
+query TT
+SELECT regexp_matches(decision_render('dr', name := 'tx'), 'TEMPORARY')::VARCHAR,
+       regexp_matches(decision_render('dr', name := 'tx', form := 'table'), 'TEMPORARY')::VARCHAR;
+----
+false	false
+
+# ⚠⚠ IT CHANGES EXACTLY ONE TOKEN AND NOTHING ELSE, which is the whole claim and is cheaper to assert
+# than to re-derive: strip `TEMPORARY ` back out of the temporary render and it must be BYTE-IDENTICAL to
+# the plain one, in both forms. (It also catches a second occurrence appearing anywhere in the body.)
+query TT
+SELECT replace(decision_render('dr', name := 'tx', is_temporary := true), 'TEMPORARY ', '')
+     = decision_render('dr', name := 'tx'),
+       replace(decision_render('dr', name := 'tx', form := 'table', is_temporary := true), 'TEMPORARY ', '')
+     = decision_render('dr', name := 'tx', form := 'table');
+----
+true	true
+
+# ⚠⚠ THE TRAP, AND IT IS SILENT: A TEMPORARY MACRO CREATED THROUGH `fabricator_host_exec` IS INVISIBLE TO
+# THE CALLER AND IS THEN GONE. That function runs on its OWN connection, whose `temp` catalog dies with
+# it — so the call reports SUCCESS (0) and nothing exists afterwards. There is no error to notice, which
+# is why it is pinned here rather than left to a doc line: a temporary macro must be executed BY THE
+# CALLER, on the caller's own connection.
+#
+# ⚠ MEASURED end to end the other way round, outside this file (sqllogictest cannot execute rendered
+# text on its own connection): rendering both forms with `is_temporary := true`, writing them out and
+# `.read`-ing them back in ONE shell session creates both in `temp.main` and both answer correctly.
+
+query I
+SELECT fabricator_host_exec(decision_render('dr', name := 'tmp_trap', is_temporary := true));
+----
+0
+
+query I
+SELECT count(*) FROM duckdb_functions() WHERE function_name = 'tmp_trap';
+----
+0
+
+# ⚠ THE CONTROL, and the section is worthless without it: the SAME call without the flag must really
+# create the macro. Otherwise "it does not exist" would be equally true of a build in which
+# fabricator_host_exec had stopped working altogether.
+
+query I
+SELECT fabricator_host_exec(decision_render('dr', name := 'tmp_ctl'));
+----
+0
+
+query I
+SELECT count(*) FROM duckdb_functions() WHERE function_name = 'tmp_ctl';
+----
+1

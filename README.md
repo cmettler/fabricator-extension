@@ -2876,13 +2876,13 @@ SELECT * FROM query_zip({'x': 'SELECT 1 AS a'}, as_structs := true);    -- x  ST
 ### Decision tables: `decision_render`
 
 A **decision table** is a relation: one row per rule, columns split into inputs and outputs, plus three
-metadata rows. `decision_render` turns one into the **SQL text of a DuckDB `TABLE MACRO`** that evaluates it —
+metadata rows. `decision_render` turns one into the **SQL text of a DuckDB macro** that evaluates it —
 DMN-like, with hit policies. It returns text and creates nothing, so you can read it before running it.
 
 | `rulepos` | row |
 |---|---|
 | `-2` | **direction** — `in`, `out`, or blank (the column is ignored, e.g. a `Comment`) |
-| `-1` | **datatypes** — the macro parameter's type, and the output cast |
+| `-1` | **datatypes** — the input cast, and the output cast |
 | `0` | **pre/post-processing** — optional; `?` is the column, `@other` another column |
 | `>= 1` | **the rules**, in evaluation order |
 
@@ -2898,18 +2898,48 @@ INSERT INTO decision_rules VALUES
     ( 3, 'not RU',  '',           '<= 1000', 'approve', '0.2',              'low',              NULL),
     ( 4, '',        '',           '> @age',  'flag',    '@amount / @age',   '@amount::varchar', NULL),
     ( 5, '',        '',           '',        'reject',  '1.0',              'default',          NULL);
-
--- Look at the generated macro ...
-SELECT decision_render('decision_rules', name := 'evaluate_row');
-
--- ... then create it and evaluate.
-SELECT fabricator_host_exec(decision_render('decision_rules', name := 'evaluate_row'));
-
-SELECT rulepos, decision, risk, label FROM evaluate_row('JP', 40, 500);
---   3 | approve | 0.2 | low
-SELECT rulepos, decision FROM evaluate_row('JP', 40, 500, hit_policy := 'RuleOrder');
---   3 | approve     4 | flag     5 | reject
 ```
+
+**Two forms, because the input has to be data.** A DuckDB macro *argument* is a bind-time constant, so a
+macro whose parameters were the decision's inputs could only ever be called with literals. `form :=` picks
+how the input arrives instead:
+
+```sql
+-- form := 'scalar' (the default): a STRUCT in, a UNION out, evaluated PER ROW anywhere
+SELECT decision_render('decision_rules', name := 'evaluate');          -- read it ...
+SELECT fabricator_host_exec(decision_render('decision_rules', name := 'evaluate'));   -- ... then create it
+
+SELECT c.id, union_extract(evaluate({'region': c.region, 'age': c.age, 'amount': c.amount}),
+                           'single').decision
+FROM customers c;
+
+-- form := 'table': a whole relation in, its own columns back out beside the decision
+SELECT fabricator_host_exec(
+    decision_render('decision_rules', name := 'evaluate_batch', form := 'table'));
+
+SELECT * FROM evaluate_batch('customers');
+--  region | age | amount | id | ... | rulepos | decision | risk | label | _total_hits_ | ...
+```
+
+| | `'scalar'` | `'table'` |
+|---|---|---|
+| signature | `f(input [, hit_policy])` | `f(input_table [, hit_policy])` |
+| input | a STRUCT, one per row | a relation **name** — `'customers'`, `'main.customers'`, or bare `customers` |
+| result | one `UNION(single STRUCT(...), many STRUCT(...)[])` value | real columns, plus every non-input column of the relation |
+| read it with | `union_tag`, `union_extract(v,'single')`, `unnest(union_extract(v,'many'))` | ordinary SQL |
+| `RuleOrder` | the `many` member | one row per matching rule |
+| no match | `NULL` | the input row with NULL decision columns |
+
+**`is_temporary := true`** renders `CREATE OR REPLACE **TEMPORARY** MACRO` instead, for either form, so the
+macro dies with the session rather than being written into the database. It changes that one token and
+nothing else.
+
+> ⚠⚠ **A temporary macro created through `fabricator_host_exec` is invisible to you and is then gone** —
+> the call returns `0`, the success code, and nothing exists afterwards. That function runs on its *own*
+> connection, whose `temp` catalog dies with it. So a temporary macro has to be executed **by you, on your
+> own connection**: read the text back and run it (`con.execute(con.sql(render).fetchone()[0])`, the
+> shell's `.read`, a dbt pre-hook). That is this function's primary use anyway — `fabricator_host_exec` is
+> the convenience path, and it is the one path `is_temporary` cannot take.
 
 Each **cell** is a small expression language:
 
@@ -2972,8 +3002,16 @@ SELECT dmn_relation('rules.csv', 'auto');                  -- read_csv('rules.cs
 > cost is that a bare data value containing one of those words is read as an operator and refused at
 > `CREATE` time — **quote the cell** (`'MADE IN USA'`) to force it back to a literal.
 >
-⚠ A decision column becomes a macro **parameter**, so its name must be a bare identifier. `decision_render`
-> refuses by name otherwise rather than emitting a `CREATE MACRO` that cannot parse.
+> ⚠ A decision column names a struct field and a relation column, so it must be a bare identifier.
+> `decision_render` refuses by name otherwise rather than emitting a `CREATE MACRO` that cannot parse.
+>
+> ⚠ **The `'table'` form needs a column per input in the input relation, named as the input is** — it
+> replaces those and passes `* EXCLUDE (...)` through, so a missing one is a binder error naming it. In
+> aggregate mode it groups by every passed-through column, so carry a key if two input rows could be equal.
+>
+> ⚠ **An output with no declared datatype is `VARCHAR` in the `'scalar'` form** and its value is cast — a
+> UNION type has to be spelled out. Declare the type in the `rulepos = -1` row if that matters. The
+> `'table'` form keeps whatever the cell expression produced.
 >
 > ⚠ Rules held in a **TEMP** table are invisible: the introspection runs on the render's own connection. Use a
 > regular table, a file, or JSON.
@@ -2983,6 +3021,44 @@ SELECT dmn_relation('rules.csv', 'auto');                  -- read_csv('rules.cs
 >
 > ⚠ Rendering costs three small queries and DuckDB **repeats binds**, so do not put a `decision_render` behind
 > a view and expect it to run once. Render once, create the macro, then call the macro.
+
+### Decision tables whose definition is data: `decision_eval`
+
+`decision_render` renders a decision table you know at authoring time. **`decision_eval` takes the
+definition as a per-row value**, so a thousand rows may carry a thousand different rule sets and each is
+decided by its own. The answer is always **JSON**.
+
+```sql
+SELECT r.id, decision_eval(r.rules_json, {'region': r.region, 'age': r.age})->'single'->>'decision'
+FROM records r;
+```
+
+| argument | |
+|---|---|
+| `def` | the decision table as **JSON text** — the same shape `decision_render`'s JSON source takes; NULL ⇒ NULL |
+| `input` | a **STRUCT** carrying one field per input the table declares |
+| `hit_policy` | **per row**; NULL (the default) means the table's own default |
+
+The hit policy's shape is carried in the JSON **key**, so the caller can still tell them apart:
+
+```
+{"single": {decisiontable_hk, rulepos, <your outputs>, _total_hits_, …}}   First / Unique / Any
+{"many":  [{…}, {…}]}                                                      RuleOrder
+```
+
+> ⚠⚠ **The result is always `JSON` whatever the definition says, and that is what makes the function
+> possible.** A scalar's result type is fixed at bind, where no row value exists — so a function whose
+> answer depended on a per-row definition could not be typed at all.
+>
+> ⚠⚠ **The input struct must carry every input the definition names**, and a column has one type — so
+> definitions that vary per row must agree on their *inputs*; what varies is the *rules*. A definition
+> naming an input the struct lacks fails loudly.
+>
+> ⚠ **It renders once per distinct definition per row-batch** — measured at ~54 ms per 2048-row chunk,
+> i.e. ~26 µs a row. **If every row shares one decision table, do not use this**: render it once with
+> `decision_render(…, form := 'table')` and call that macro, which was measured at ~7 µs a row.
+> `docs/decision-tables.md` §11 has the full cost breakdown and the two optimisations that measurement
+> rejected.
 
 ### Provider views
 

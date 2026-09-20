@@ -1,0 +1,244 @@
+# name: test/verify_decision_eval.test
+# description: decision_eval(def, input [, hit_policy]) — a DMN-like decision table that arrives AS DATA,
+#              one per row, answered as JSON. Built on fluid_scalar: the template reads the DISTINCT
+#              definitions out of each chunk, renders each into a TEMPORARY macro named by its md5, and
+#              emits one SELECT that dispatches every row to its own. See
+#              dotnet/Fabricator.Functions/Macros/decision_eval.sql.
+# group: [fabricator]
+
+require fabricator
+
+# ⚠ The result is JSON and every assertion below reads it with JSON operators; the rendered CREATE also
+# reaches decision_render, whose `{% query %}` bodies are classified with json_serialize_sql. Without this
+# the file reads as a broken FEATURE rather than a missing REQUIRE — the recorded trap.
+require json
+
+# ==============================================================================================
+# §1  REGISTRATION — the delivery path is QUIET, so it gets its own assertion.
+# ==============================================================================================
+# ⚠ It rides an <EmbeddedResource> like every macro in this provider, and a macro that failed to register
+# surfaces at a call site as "… does not exist", layers from the cause.
+
+query TT
+SELECT function_name, function_type FROM duckdb_functions()
+ WHERE function_name IN ('decision_eval', 'decision_render') GROUP BY 1, 2 ORDER BY 1;
+----
+decision_eval	macro
+decision_render	macro
+
+# ==============================================================================================
+# §2  THE WHOLE POINT: THE DEFINITION IS DATA, SO IT MAY DIFFER PER ROW.
+# ==============================================================================================
+# ⚠⚠ Rows 1 and 2 carry the SAME rule set and differ only in their input; row 3 carries a DIFFERENT one.
+# A build that rendered one definition and applied it to everything passes rows 1-2 and fails row 3, which
+# is why the two rule sets disagree on the same input value.
+
+statement ok
+CREATE TABLE recs (id INT, def VARCHAR, inp STRUCT(region VARCHAR, age INTEGER));
+
+statement ok
+INSERT INTO recs VALUES
+ (1, '[{"rulepos":-2,"region":"in","age":"in","decision":"out"},{"rulepos":-1,"region":"VARCHAR","age":"INTEGER","decision":"VARCHAR"},{"rulepos":1,"region":"EU","age":"> 18","decision":"euro-adult"},{"rulepos":2,"region":"","age":"","decision":"other"}]', {'region':'EU','age':30}),
+ (2, '[{"rulepos":-2,"region":"in","age":"in","decision":"out"},{"rulepos":-1,"region":"VARCHAR","age":"INTEGER","decision":"VARCHAR"},{"rulepos":1,"region":"EU","age":"> 18","decision":"euro-adult"},{"rulepos":2,"region":"","age":"","decision":"other"}]', {'region':'EU','age':10}),
+ (3, '[{"rulepos":-2,"region":"in","age":"in","decision":"out"},{"rulepos":-1,"region":"VARCHAR","age":"INTEGER","decision":"VARCHAR"},{"rulepos":1,"region":"EU","age":"> 18","decision":"EU-IS-DIFFERENT-HERE"},{"rulepos":2,"region":"","age":"","decision":"fallback"}]', {'region':'EU','age':30}),
+ (4, NULL, {'region':'EU','age':30});
+
+query IT
+SELECT id, coalesce(decision_eval(def, inp)->'single'->>'decision', '<null>') FROM recs ORDER BY id;
+----
+1	euro-adult
+2	other
+3	EU-IS-DIFFERENT-HERE
+4	<null>
+
+# ⚠ THE NULL DEFINITION IS A NULL ANSWER, not a failure — and it is the row that keeps the generated CASE
+# honest: it falls through with no WHEN matching.
+query T
+SELECT decision_eval(def, inp) IS NULL FROM recs WHERE id = 4;
+----
+true
+
+# ⚠⚠ A CHUNK IN WHICH *EVERY* DEFINITION IS NULL IS THE ONLY THING THAT REACHES THE EMPTY-DISPATCH
+# GUARD, and row 4 above cannot: its chunk carries real definitions too. Without the guard the template
+# renders `CASE x END` with no WHEN, which is a syntax error — so this is the difference between a NULL
+# answer and a failed statement.
+
+statement ok
+CREATE TABLE allnull (id INT, def VARCHAR, inp STRUCT(region VARCHAR));
+
+statement ok
+INSERT INTO allnull VALUES (1, NULL, {'region':'EU'}), (2, NULL, {'region':'US'});
+
+query II
+SELECT count(*), count(decision_eval(def, inp)) FROM allnull;
+----
+2	0
+
+# ⚠⚠ THE RESULT TYPE IS `JSON` FOR EVERY DEFINITION, which is what makes the function possible: a scalar's
+# type is fixed at BIND, where no row value exists. ⚠ The cast is applied by the MACRO, not by the
+# template — the JSON alias does not survive the Arrow boundary, so the template's own `::JSON` comes back
+# as VARCHAR. Measured; without the macro-level cast this row reads VARCHAR.
+query T
+SELECT typeof(decision_eval(def, inp)) FROM recs WHERE id = 1;
+----
+JSON
+
+# The documented shape: the hit policy's member name is the JSON KEY, so a caller can tell them apart.
+query TT
+SELECT json_keys(decision_eval(def, inp))[1],
+       decision_eval(def, inp)->'single'->>'_total_hits_'
+FROM recs WHERE id = 1;
+----
+single	2
+
+# ⚠ `decisiontable_hk` identifies the DEFINITION, so rows 1 and 2 (same rules) must agree and row 3 must
+# not. Without this, "the definition is per row" would be equally true of a build that re-rendered the
+# same table three times.
+query TT
+SELECT (SELECT decision_eval(def, inp)->'single'->>'decisiontable_hk' FROM recs WHERE id = 1)
+     = (SELECT decision_eval(def, inp)->'single'->>'decisiontable_hk' FROM recs WHERE id = 2),
+       (SELECT decision_eval(def, inp)->'single'->>'decisiontable_hk' FROM recs WHERE id = 1)
+     = (SELECT decision_eval(def, inp)->'single'->>'decisiontable_hk' FROM recs WHERE id = 3);
+----
+true	false
+
+# ==============================================================================================
+# §3  `hit_policy` IS PER ROW — it reaches the generated macro as an argument, not as a render option.
+# ==============================================================================================
+
+query TT
+SELECT json_keys(decision_eval(def, inp, hit_policy := 'RuleOrder'))[1],
+       json_array_length(decision_eval(def, inp, hit_policy := 'RuleOrder')->'many')
+FROM recs WHERE id = 1;
+----
+many	2
+
+# ⚠⚠ THE ROW THAT PROVES IT IS PER ROW AND NOT PER CALL SITE: one statement, one chunk, two policies.
+# A build that baked the policy into the render would return the same member for both.
+query IT
+SELECT id, json_keys(decision_eval(def, inp,
+                                   hit_policy := CASE WHEN id = 1 THEN 'RuleOrder' ELSE 'First' END))[1]
+FROM recs WHERE id IN (1, 3) ORDER BY id;
+----
+1	many
+3	single
+
+# NULL means the definition's own default, which for a non-aggregate table is First.
+query T
+SELECT json_keys(decision_eval(def, inp, hit_policy := NULL))[1] FROM recs WHERE id = 1;
+----
+single
+
+# ==============================================================================================
+# §4  IT LEAVES NOTHING BEHIND — the macros are TEMPORARY and die with the chunk's connection.
+# ==============================================================================================
+# ⚠⚠ THIS IS THE ASSERTION THAT KEEPS THE DESIGN HONEST. The obvious way to make this faster is to create
+# the macros PERSISTENTLY so a later chunk can reuse them — which would make an ordinary SELECT write
+# database objects. Measured and rejected (it is worth only ~15%, because the `duckdb_functions()` lookup
+# costs most of what it saves). If anyone implements that, this row fails and the trade-off gets looked at.
+
+query I
+SELECT count(*) FROM duckdb_functions() WHERE function_name LIKE 'fab_dmn_%';
+----
+0
+
+# ... and the control: the evaluation really did happen in between.
+query T
+SELECT decision_eval(def, inp)->'single'->>'decision' FROM recs WHERE id = 1;
+----
+euro-adult
+
+query I
+SELECT count(*) FROM duckdb_functions() WHERE function_name LIKE 'fab_dmn_%';
+----
+0
+
+# ==============================================================================================
+# §5  MORE THAN ONE CHUNK — the render repeats per chunk, and the answers must not.
+# ==============================================================================================
+# ⚠ A `fluid_scalar` session opens a FRESH CONNECTION per chunk, so the temporary macros die between
+# chunks and every chunk renders again. That is a COST, not a correctness problem — and this section is
+# what says so: 5000 rows is three chunks, and the answer must be the same in all of them.
+
+statement ok
+CREATE TABLE many_recs (id INT, def VARCHAR, inp STRUCT(region VARCHAR, age INTEGER));
+
+statement ok
+INSERT INTO many_recs
+SELECT i,
+  CASE WHEN i % 2 = 0
+       THEN '[{"rulepos":-2,"region":"in","age":"in","decision":"out"},{"rulepos":-1,"region":"VARCHAR","age":"INTEGER","decision":"VARCHAR"},{"rulepos":1,"region":"EU","age":"> 18","decision":"even-rules"},{"rulepos":2,"region":"","age":"","decision":"even-other"}]'
+       ELSE '[{"rulepos":-2,"region":"in","age":"in","decision":"out"},{"rulepos":-1,"region":"VARCHAR","age":"INTEGER","decision":"VARCHAR"},{"rulepos":1,"region":"EU","age":"> 18","decision":"odd-rules"},{"rulepos":2,"region":"","age":"","decision":"odd-other"}]'
+  END,
+  {'region':'EU','age': CASE WHEN i % 4 < 2 THEN 30 ELSE 10 END}
+FROM generate_series(1, 5000) g(i);
+
+# Two definitions × two inputs = exactly four distinct answers, and every row must land in the right one.
+query TI
+SELECT decision_eval(def, inp)->'single'->>'decision' AS d, count(*)
+FROM many_recs GROUP BY 1 ORDER BY 1;
+----
+even-other	1250
+even-rules	1250
+odd-other	1250
+odd-rules	1250
+
+# ⚠ ... and still nothing left behind after three chunks' worth of temporary macros.
+query I
+SELECT count(*) FROM duckdb_functions() WHERE function_name LIKE 'fab_dmn_%';
+----
+0
+
+# ==============================================================================================
+# §6  AGGREGATE MODE TRAVELS THROUGH — the definition decides, not the caller.
+# ==============================================================================================
+# ⚠ An aggregate table collapses every match into ONE row, so its answer is always the `single` member
+# whatever the policy, and `rulepos` is the comma-joined list. Pinned here because the JSON is the only
+# window a decision_eval caller has onto that behaviour.
+
+statement ok
+CREATE TABLE aggrecs (id INT, def VARCHAR, inp STRUCT(region VARCHAR));
+
+statement ok
+INSERT INTO aggrecs VALUES
+ (1, '[{"rulepos":-2,"region":"in","decision":"out"},{"rulepos":-1,"region":"VARCHAR","decision":"VARCHAR"},{"rulepos":0,"region":null,"decision":"string_agg(?, ''|'')"},{"rulepos":1,"region":"EU","decision":"a"},{"rulepos":2,"region":"","decision":"b"}]', {'region':'EU'});
+
+query TTT
+SELECT json_keys(decision_eval(def, inp))[1],
+       decision_eval(def, inp)->'single'->>'rulepos',
+       decision_eval(def, inp)->'single'->>'decision'
+FROM aggrecs;
+----
+single	1,2	a|b
+
+# ==============================================================================================
+# §7  THE REFUSALS ARE THE RENDERER'S OWN, and they arrive at the call site rather than being swallowed.
+# ==============================================================================================
+
+statement ok
+CREATE TABLE badrecs (id INT, def VARCHAR, inp STRUCT(region VARCHAR));
+
+statement ok
+INSERT INTO badrecs VALUES
+ (1, '[{"rulepos":-2,"region":"out"},{"rulepos":1,"region":"x"}]', {'region':'EU'});
+
+statement error
+SELECT decision_eval(def, inp) FROM badrecs;
+----
+no column is marked 'in'
+
+# ⚠⚠ THE INPUT STRUCT MUST CARRY EVERY INPUT THE DEFINITION NAMES, and the failure is LOUD — which is the
+# property worth pinning, because the alternative (a silently missing input matching every wildcard) is
+# the failure mode the whole decision-table gate is written against.
+
+statement ok
+CREATE TABLE shortrecs (id INT, def VARCHAR, inp STRUCT(region VARCHAR));
+
+statement ok
+INSERT INTO shortrecs VALUES
+ (1, '[{"rulepos":-2,"region":"in","age":"in","decision":"out"},{"rulepos":-1,"region":"VARCHAR","age":"INTEGER","decision":"VARCHAR"},{"rulepos":1,"region":"EU","age":"> 18","decision":"euro-adult"},{"rulepos":2,"region":"","age":"","decision":"other"}]', {'region':'EU'});
+
+statement error
+SELECT decision_eval(def, inp) FROM shortrecs;
+----
+Could not find key

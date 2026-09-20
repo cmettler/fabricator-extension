@@ -179,7 +179,13 @@ case "$TIER" in
         # a DuckDB TABLE MACRO (decision_render + the dmn_* parser scalars). Its §1 is the same delivery
         # gate table_zip's is: the macro rides an <EmbeddedResource>, the scalars ride
         # IProvider.GlobalScalarFunctions, and every way either can fail to arrive is SILENT.
-        : "${MIN_SUITES:=79}"
+        # 80 since 2026-09-20: verify_decision_eval — decision_eval(def, input [, hit_policy]) -> JSON,
+        # a decision table that arrives AS DATA, one per row. Its own suite rather than a section of
+        # verify_decision_render because it is a different surface: a fluid_scalar whose template renders
+        # the DISTINCT definitions of each chunk into TEMPORARY macros named by md5. ⚠ §4 asserts that it
+        # leaves NONE of them behind — the obvious speed-up is to make them persistent, which would make an
+        # ordinary SELECT write database objects; measured worth only ~15%, so that row is the guard.
+        : "${MIN_SUITES:=80}"
         # 5656 since 2026-08-02: verify_delta_catalog_transactions 943 -> 944 Ã¢ÂÂ ROLLBACK now RECLAIMS the
         # data files the transaction eagerly wrote (EW #52's DiscardDataFilesAsync) instead of leaving them
         # for VACUUM. +2, not +1: that suite is one of the DOUBLED ones below, so an assertion added to it
@@ -764,7 +770,35 @@ case "$TIER" in
         #   N)`, which is also what keeps a 50-rule table from rendering 50 literals — but the assumption
         #   is CHECKED rather than silent, because a slot corresponding to no rule is a PHANTOM that
         #   matches every input (`ELSE 1=1`) and answers all-NULL, so under `First` it would WIN.
-        : "${MIN_ASSERTIONS:=9672}"
+        # 2026-09-20: 9672 -> 9859. verify_decision_render 209 -> 396 — the rendered macro is now TWO
+        #   FORMS and the original one is GONE (user: "the macro rendered with current decision_render is
+        #   the least usefull one as the input values are static ... only a scalar macro and a table macro
+        #   which takes the input values as a table makes sense"). ⚠⚠ A DuckDB MACRO ARGUMENT IS A
+        #   BIND-TIME CONSTANT, so a macro whose parameters were the decision INPUTS could only ever be
+        #   called with literals — and all 209 of the old assertions did exactly that, which is why a
+        #   209-assertion gate could not see that the surface was unusable. `form :=` scalar (a STRUCT in,
+        #   a UNION out, per row) | table (query_table, the input relation's own columns back out). ⚠ The
+        #   two forms disagreed while being built — the ported engine casts inputs to the declared datatype
+        #   only in its scalar template — so the table form gained a `casted` CTE; mutant A dies at exactly
+        #   that row after 43. 9672 - 209 + 396 = 9859 exactly, so no other suite moved.
+        # 2026-09-20: 9859 -> 9869. verify_decision_render 396 -> 406 — an optional `is_temporary`
+        #   renders CREATE OR REPLACE TEMPORARY MACRO, for either form (user-asked). ⚠⚠ It ships with a
+        #   SILENT trap that §19 pins: a TEMPORARY macro created through fabricator_host_exec is INVISIBLE
+        #   to the caller and then GONE — the call returns 0, the success code, and nothing exists
+        #   afterwards, because that function runs on its OWN connection whose temp catalog dies with it.
+        #   So §19 asserts the trap WITH the non-temporary call beside it as the control; the temporary
+        #   path itself is covered structurally (the token, and that it is the ONLY difference), because
+        #   sqllogictest cannot execute rendered text on its own connection — which is exactly what a temp
+        #   macro needs. ⚠ Mutant E (TEMPORARY unconditional) dies at §3 assertion 35, not at §19: every
+        #   macro in the file is created through host_exec, so under it they all vanish.
+        # 2026-09-20: 9869 -> 9925. A NEW suite, verify_decision_eval (56) — see the MIN_SUITES note
+        #   above. 9869 + 56 exactly, so no other suite moved. ⚠⚠ The numbers that shaped it, measured
+        #   rather than argued: per 2048-row chunk the RENDER is 32 ms, the CREATE 0.75 ms and a host round
+        #   trip 0.35 ms — so inlining the decisions instead of creating macros would save 1.4%, and the
+        #   only real lever (caching the render) needs a store surviving a chunk, which fluid_scalar has
+        #   not got (fresh connection per chunk). Three mutants: the empty-dispatch guard, the per-row
+        #   dispatch, and hit_policy reaching the generated macro.
+        : "${MIN_ASSERTIONS:=9925}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh
