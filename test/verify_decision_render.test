@@ -611,11 +611,6 @@ SELECT decision_render('');
 ----
 the rules argument is empty
 
-statement error
-SELECT decision_render('dr', dialect := 'oracle');
-----
-is not one of duckdb, tsql
-
 # ⚠⚠ AN UNKNOWN `form` IS REFUSED BY NAME rather than defaulting, because the two forms are not
 # substitutable: silently rendering a scalar where a table macro was asked for hands back a statement
 # that creates the wrong KIND of object, and the caller meets that at their own call site.
@@ -631,16 +626,23 @@ SELECT regexp_matches(decision_render('dr', form := 'batch'), 'MACRO decision_ev
 ----
 true
 
-# ⚠⚠ `tsql` IS RECOGNISED BY THE PARSER AND REFUSED BY THE RENDERER, which is the honest split while only
-# one statement template exists: the cell vocabulary is dialect-aware, the SHAPE below it is a DuckDB
-# CREATE MACRO. Rendering it under 'tsql' would return a statement no SQL Server can run while LOOKING
-# like the argument was honoured. ⚠ This row is what must be DELETED when slice 3 lands, not edited.
-statement error
-SELECT decision_render('dr', dialect := 'tsql');
+# ⚠⚠ THERE IS NO `dialect` PARAMETER ANY MORE — SLICE 3 LANDED. This macro renders DuckDB and
+# `decision_render_tsql` renders SQL Server. Two rows used to sit here refusing `oracle` and `tsql`, and
+# the second carried the note "this row is what must be DELETED when slice 3 lands, not edited" — this
+# is that deletion. ⚠ Removing the parameter cannot break a call that ever worked: the only value it
+# accepted was `duckdb`, and every other one was refused.
+# ⚠ Asserted POSITIVELY on the parameter list rather than on the binder's refusal: it says exactly what
+# the surface IS, and the refusal message echoes the offending query text, so matching `dialect` in it
+# would pass for the wrong reason. (A macro's parameter list is a vector and therefore deterministic —
+# the recorded unordered_map trap is about a FUNCTION's named parameters, not a macro's.)
+query T
+SELECT list_aggregate(parameters, 'string_agg', ',') FROM duckdb_functions()
+ WHERE function_name = 'decision_render' GROUP BY 1;
 ----
-statement template is not built yet
+rules,name,form,is_temporary,source,hit_policy
 
-# ... while the parser itself still answers for T-SQL, which is what slice 3 will build on.
+# ... while the PARSER still takes a dialect — that is what decision_render_tsql passes 'tsql' to, and
+# it is the reason the CELL GRAMMAR cannot drift between the two engines.
 query T
 SELECT dmn_condition('in [1,2,3]', 'age', 'tsql', '');
 ----
@@ -1176,6 +1178,40 @@ SELECT region, coalesce(decision, '<null>'), coalesce(_model_error_, '<none>')
 FROM nodef_t('tf_in') WHERE region = 'JP';
 ----
 JP	<null>	No default rule defined
+
+# ⚠⚠ `RuleOrder` MEANS EVERY MATCHING RULE **IN rulepos ORDER**, AND THE `many` LIST OWES THAT ORDER.
+# It did not deliver it: `list()` is an unordered aggregate, and the list came back 1, 3, 2. Found on
+# 2026-09-20 by rendering the SAME decision table for T-SQL and diffing the two engines' JSON — nothing
+# in this file could see it, because EVERY assertion that reads `many` sorts it first (§3's unnest, §6's).
+#
+# ⚠⚠ TWELVE RULES, NOT THREE, AND THE ASSERTION DOES NOT SORT. Both halves are the point: `rulepos` is a
+# VARCHAR inside the struct (the UNION declares one type for it, and aggregate mode makes that a
+# comma-joined list), so ordering it as TEXT puts rule 10 before rule 2 — which three rules cannot show.
+
+statement ok
+CREATE TABLE ord12 (rulepos INT, region VARCHAR, decision VARCHAR);
+
+statement ok
+INSERT INTO ord12 VALUES (-2,'in','out'), (-1,'VARCHAR','VARCHAR');
+
+statement ok
+INSERT INTO ord12 SELECT i, '', 'd' || i FROM generate_series(1,12) g(i);
+
+statement ok
+SELECT fabricator_host_exec(decision_render('ord12', name := 'ord12_s'));
+
+query T
+SELECT list_aggregate(list_transform(many(v), x -> x.rulepos), 'string_agg', ',')
+FROM (SELECT ord12_s({'region':'EU'}, hit_policy := 'RuleOrder') AS v);
+----
+1,2,3,4,5,6,7,8,9,10,11,12
+
+# ⚠ The control: all twelve really did match, so the row above is ordering twelve elements rather than
+# reporting a short list that happens to be sorted.
+query T
+SELECT len(many(ord12_s({'region':'EU'}, hit_policy := 'RuleOrder')));
+----
+12
 
 # ⚠⚠ AN OUTPUT WITH NO DECLARED DATATYPE IS VARCHAR IN THE SCALAR FORM AND ITS VALUE IS CAST, where the
 # table form keeps whatever the cell expression produced. That is inherent — a UNION type has to be

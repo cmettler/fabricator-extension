@@ -2974,9 +2974,9 @@ SELECT decision_render('read_xlsx(''r.xlsx'')', source := 'sql');   -- any relat
 ```
 
 `source := 'auto'|'table'|'file'|'json'|'sql'` overrides the choice; `hit_policy :=` changes the default
-baked into the generated macro. `dialect :=` selects the target — the cell parser already answers for
-`tsql`, but only the `duckdb` statement template exists, so `decision_render(..., dialect := 'tsql')` is
-refused by name rather than handing back a DuckDB macro that pretends to be T-SQL.
+baked into the generated macro. There is no `dialect` parameter — this one renders DuckDB, and for
+**SQL Server** you use `decision_render_tsql` (below), a separate function because the two statement
+templates share almost nothing.
 
 The parser is also callable on its own, which is the quickest way to see what a cell means:
 
@@ -3059,6 +3059,53 @@ The hit policy's shape is carried in the JSON **key**, so the caller can still t
 > `decision_render(…, form := 'table')` and call that macro, which was measured at ~7 µs a row.
 > `docs/decision-tables.md` §11 has the full cost breakdown and the two optimisations that measurement
 > rejected.
+
+### Decision tables on SQL Server: `decision_render_tsql`
+
+The same decision table, rendered as a **T-SQL function** instead of a DuckDB macro. Separate from
+`decision_render` because the statement templates share almost nothing — but the *cell parser* is the
+same one, so the rule grammar cannot drift between the two engines.
+
+```sql
+-- render, then deploy it to SQL Server
+SELECT fabricator_exec('mycat', decision_render_tsql('decision_rules', name := 'dbo.evaluate'));
+
+SELECT dbo.evaluate('{"region":"EU","age":30}', DEFAULT);
+-- {"single":{"decisiontable_hk":"…","rulepos":"1","decision":"approve",…}}
+```
+
+Both forms take **one input row**, and `input` chooses how it arrives — orthogonal to `form`, so all
+four combinations render:
+
+| `form := 'scalar'` (default) | `form := 'table'` |
+|---|---|
+| `RETURNS NVARCHAR(MAX)` — JSON out | `RETURNS TABLE` — an inline table-valued function |
+| `RuleOrder` ⇒ a JSON array | `RuleOrder` ⇒ one row per matching rule |
+
+```sql
+-- input := 'typed' gives one parameter per decision input
+SELECT c.id, d.decision FROM customers c CROSS APPLY dbo.evaluate(c.region, c.age, DEFAULT) d;
+```
+
+> ⚠⚠ **JSON input survives a rules change**: pass the whole record, wider than the decision table
+> needs, and `OPENJSON … WITH` takes only the keys it knows. Add an input to the rules, re-render, and
+> the **call site is untouched**. **Typed input is easier to call** and type-checks at CREATE time, but
+> its signature changes when the decision table gains an input. The answer is identical either way.
+
+> ⚠⚠ **The JSON matches the DuckDB scalar form byte for byte** — same keys, same order, same
+> `decisiontable_hk` — so one caller reads `->'single'->>'decision'` on either engine. That parity is
+> gated by deploying both and diffing.
+>
+> ⚠⚠ **The datatypes row must carry T-SQL type names**, since it becomes the `OPENJSON … WITH` column
+> list: write `FLOAT`, `INT`, `BIT`, not DuckDB's `DOUBLE` or `BOOLEAN`. One spelling is corrected for
+> you because it fails *silently*: a bare `VARCHAR`/`NVARCHAR` means length **one** in T-SQL, so both are
+> widened to `(MAX)`. A length you wrote yourself is left alone.
+>
+> ⚠ Needs **SQL Server 2022+** (`GENERATE_SERIES`), and `CREATE OR ALTER FUNCTION` must be the first
+> statement of its batch — run the rendered text on its own.
+>
+> ⚠ An inline TVF cannot carry `ORDER BY`, so the table form does not order its rows under `RuleOrder`;
+> the caller orders. The scalar form does order, because `FOR JSON` permits it.
 
 ### Provider views
 

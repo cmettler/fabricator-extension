@@ -1,5 +1,5 @@
 -- decision_render(rules [, name := 'decision_eval'] [, form := 'scalar'] [, is_temporary := false]
---                       [, dialect := 'duckdb'] [, source := 'auto'] [, hit_policy := NULL])
+--                       [, source := 'auto'] [, hit_policy := NULL])
 --   Renders a DMN-like DECISION TABLE into the SQL TEXT of a DuckDB MACRO that evaluates it.
 --   It returns TEXT and creates nothing: run it, read it, then execute it yourself.
 --
@@ -78,7 +78,11 @@
 --     ⚠ A rules relation held in a TEMP table is INVISIBLE here: `{% query %}` runs on the render's
 --       OWN pinned connection, not the caller's. Use a regular table, a file, or JSON.
 --
---   `name` — the macro name to render. `dialect` — `duckdb` (default) or `tsql`.
+--   `name` — the macro name to render.
+--   ⚠ THERE IS NO `dialect` PARAMETER: this macro renders DuckDB, full stop. It had one until
+--     2026-09-20, and the only thing it ever did was REFUSE every value but `duckdb` — so removing
+--     it cannot break a call that worked. SQL Server is `decision_render_tsql`, which is a separate
+--     macro because the statement templates share almost nothing.
 --   `hit_policy` — the DEFAULT baked into the generated macro; NULL (default) means `RuleOrder` when
 --     the table is in aggregate mode and `First` otherwise. The generated macro takes `hit_policy` as
 --     a parameter either way, so this only chooses what an unqualified call does.
@@ -134,7 +138,7 @@
 --   ⚠ EVERY REFUSAL RAISES rather than returning a diagnostic STRING, because the answer here is SQL
 --     TEXT: a caller is about to execute it, and text that merely describes a problem would be run.
 CREATE OR REPLACE MACRO decision_render(rules, name := 'decision_eval', form := 'scalar',
-                                        is_temporary := false, dialect := 'duckdb', source := 'auto',
+                                        is_temporary := false, source := 'auto',
                                         hit_policy := NULL::VARCHAR) AS
 fluid_render($$
 {%- comment -%}
@@ -156,20 +160,6 @@ fluid_render($$
 {%- endif -%}
 {%- assign is_table = false -%}
 {%- if fm == 'table' -%}{%- assign is_table = true -%}{%- endif -%}
-
-{%- comment -%}
-  ⚠⚠ THE DIALECT SELECTS THE CELL VOCABULARY *AND* THE STATEMENT SHAPE, AND ONLY THE FIRST HALF IS
-  DIALECT-AWARE TODAY. The parser already renders `IN (a,b)` for T-SQL, but everything below is a DuckDB
-  MACRO. Rendering that under `dialect := 'tsql'` would hand back a statement no SQL Server can run while
-  LOOKING like it honoured the argument — so it is refused BY NAME until the second template exists.
-  ⚠ An unrecognised dialect is NOT caught here: it falls through to the parser, whose message names the
-  valid set.
-{%- endcomment -%}
-{%- assign _dl = params.dialect | default: 'duckdb' | downcase -%}
-{%- if _dl == 'tsql' or _dl == 'mssql' or _dl == 'sqlserver' -%}
-    {%- capture _m -%}decision_render: dialect '{{ params.dialect }}' is recognised by the cell parser but its statement template is not built yet — only 'duckdb' can be rendered.{%- endcapture -%}
-    {%- query _e m: _m -%}SELECT 1 AS e WHERE error($m){%- endquery -%}
-{%- endif -%}
 
 {%- comment -%}
   1/3 — the relation TEXT. dmn_relation classifies the rules argument (name / file / JSON / verbatim)
@@ -223,7 +213,7 @@ fluid_render($$
     CONTRACT: dmn_condition cannot throw on an ordinary cell (its only throw is the depth guard), so
     even an eagerly-evaluated branch on an output cell costs nothing but the call.
 {%- endcomment -%}
-{%- query _plan d: params.dialect, opfx: opfx, ind: ind -%}
+{%- query _plan d: 'duckdb', opfx: opfx, ind: ind -%}
 WITH r AS (SELECT * FROM {{ rel }}),
 meta AS (
     {%- for c in _cols %}
@@ -582,13 +572,17 @@ FROM final_rows
   ⚠ BOTH branches are rendered and the HIT POLICY — a macro ARGUMENT, so not known until the call —
   picks one at runtime, which is why this is a UNION rather than two macros. `as_single` takes the
   first surviving row; under RuleOrder `filtered` kept them all and `as_many` lists them.
+  ⚠⚠ THE `ORDER BY` INSIDE `list()` IS LOAD-BEARING: RuleOrder means every matching rule IN rulepos
+  ORDER, and an unordered aggregate does not promise that — MEASURED returning 1, 3, 2. ⚠ And it casts,
+  because `rulepos` is a VARCHAR by then (the UNION struct declares one type for it, and aggregate mode
+  makes that a comma-joined list) — ordering it as text would put rule 10 before rule 2.
   ⚠ NO MATCH: `filtered` is empty, so under First the whole subquery yields no row and the macro
   returns NULL; under RuleOrder it returns a `many` whose list is NULL.
 {%- endcomment %}
 , as_single AS (
     SELECT {{ lit }} AS val FROM final_rows LIMIT 1
 ), as_many AS (
-    SELECT list({{ lit }}) AS val FROM final_rows
+    SELECT list({{ lit }} ORDER BY CAST(rulepos AS INTEGER)) AS val FROM final_rows
 )
 SELECT (
     SELECT union_value(single := val)::{{ ut }}
@@ -604,5 +598,5 @@ SELECT (
 )
 {%- endif -%}
 $$, params := {'rules': rules, 'name': name, 'form': form, 'is_temporary': is_temporary,
-               'dialect': dialect, 'source': source,
+               'source': source,
                'hit_policy': hit_policy});

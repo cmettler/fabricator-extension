@@ -798,7 +798,23 @@ case "$TIER" in
         #   only real lever (caching the render) needs a store surviving a chunk, which fluid_scalar has
         #   not got (fresh connection per chunk). Three mutants: the empty-dispatch guard, the per-row
         #   dispatch, and hit_policy reaching the generated macro.
-        : "${MIN_ASSERTIONS:=9925}"
+        # 2026-09-20: 9925 -> 9931. verify_decision_render 406 -> 412 — a REGRESSION GATE for a real bug
+        #   in the shipped scalar form: `RuleOrder`'s `many` list was UNORDERED (`list()` is an unordered
+        #   aggregate; measured 1, 3, 2). ⚠⚠ Nothing in that file could see it because EVERY assertion
+        #   reading `many` sorted it first — a test that sorts the thing whose ORDER it checks is vacuous
+        #   for order. Found by rendering the same table for T-SQL and diffing the two engines' JSON.
+        #   ⚠ The gate uses TWELVE rules and does not sort: `rulepos` is a VARCHAR in the struct, so
+        #   ordering it as TEXT puts rule 10 before rule 2, which three rules cannot show. Mutant I dies
+        #   there printing 1,10,11,12,2,3,4,5,6,7,8,9.
+        # 2026-09-20: 9931 -> 9930, a DELIBERATE DROP OF ONE. verify_decision_render 412 -> 411:
+        #   `decision_render` lost its `dialect` parameter (slice 3 landed, so SQL Server is
+        #   decision_render_tsql). The two rows that refused `oracle` and `tsql` are DELETED — which is
+        #   what the second one's own note instructed — and ONE row replaces them, asserting the
+        #   parameter list POSITIVELY. ⚠ Removing it cannot break a call that ever worked: `duckdb` was
+        #   the only value it accepted. ⚠ Asserted on the parameter list rather than on the binder's
+        #   refusal, because that message echoes the offending query text and would match for the wrong
+        #   reason.
+        : "${MIN_ASSERTIONS:=9930}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh
@@ -855,7 +871,14 @@ case "$TIER" in
         # 55 since 2026-09-08: + verify_alter_default (ADD COLUMN ... DEFAULT). SQL Server's ALTER TABLE
         # had essentially NO gate before it -- the only catalog-level ADD COLUMN in the tree was a setup
         # line in a locking test -- which is exactly how a silently dropped DEFAULT survived.
-        : "${MIN_SUITES:=59}"
+        # 60 since 2026-09-20: verify_decision_render_tsql — decision_render_tsql, the same decision
+        # table rendered as a SQL Server FUNCTION (a scalar returning JSON, and an inline TVF; both take
+        # ONE input row as JSON). ⚠ SERVICE tier rather than hermetic because every section DEPLOYS the
+        # rendered text to the docker SQL Server and RUNS it — a renderer whose output has never been
+        # executed is worth very little. ⚠ Its §10 drops the functions it created: they are catalog
+        # objects on the shared TestDB, and a later suite enumerating this catalog would otherwise see
+        # them (the cheap version of the MinIO/external-table lesson).
+        : "${MIN_SUITES:=60}"
         # 1424 since 2026-08-01: verify_exec_invalidate_cache 10 -> 21, for the OUT-OF-BAND DROP path Ã¢ÂÂ the
         # catalog's self-heal, documented in CLAUDE.md and until now covered by NOTHING. The service tier ran
         # 44/44 green while that path was broken, which is why the section exists. It must run with
@@ -1214,7 +1237,21 @@ case "$TIER" in
         # 3483 since 2026-09-11: a NEW suite verify_invalid_objects (36) — catalog enumeration survives
         #   objects it cannot describe (an INVALID view). User-reported as a production listing failure;
         #   it was two use-after-frees plus a 208 misread as absence. 3447 + 36 exactly; MIN_SUITES 58 -> 59.
-        : "${MIN_ASSERTIONS:=3483}"
+        # 2026-09-20: 3483 -> 3555. A NEW suite, verify_decision_render_tsql (72) — see the MIN_SUITES
+        #   note above. 3483 + 72 exactly, so no other suite moved. ⚠⚠ Its §5 compares the two engines'
+        #   JSON as STRINGS for the same rules, which is what found the DuckDB `many`-ordering bug that
+        #   the hermetic suite could not see: string equality pins the key ORDER, the null handling and
+        #   the value TYPES at once. Mutants: the IIF wrapping (T-SQL has no boolean type), the bare
+        #   VARCHAR widening (length ONE in T-SQL — that one still DEPLOYS and dies on a wrong answer),
+        #   and INCLUDE_NULL_VALUES (FOR JSON drops NULL keys, losing _model_error_).
+        # 2026-09-20: 3555 -> 3572. verify_decision_render_tsql 72 -> 89 — `input := 'json' | 'typed'`,
+        #   orthogonal to `form` (the body is shared, so only the `params` derived table differs; a third
+        #   `form` value would have needed a fourth for the typed scalar). ⚠⚠ The trade-off is why both
+        #   exist and it runs both ways: JSON lets the caller pass a record WIDER than the rules need, so
+        #   adding an input leaves every call site untouched; typed is easier to call but its signature
+        #   moves with the decision table. The answer is asserted BYTE-IDENTICAL on the scalar pair,
+        #   which is what makes `input` a delivery choice rather than a second semantics.
+        : "${MIN_ASSERTIONS:=3572}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

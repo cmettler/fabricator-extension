@@ -1,0 +1,413 @@
+# name: test/verify_decision_render_tsql.test
+# description: decision_render_tsql — a DMN-like decision table rendered into the T-SQL of a SQL Server
+#              FUNCTION, in two forms that both take ONE input row as JSON: a SCALAR (JSON in, JSON out)
+#              and an inline TVF. Every section below DEPLOYS the rendered text to a real SQL Server and
+#              runs it, because a renderer whose output has never been executed is worth very little.
+#              See dotnet/Fabricator.Functions/Macros/decision_render_tsql.sql.
+# group: [fabricator]
+#
+# ⚠⚠ THE HEADLINE IS §5: THE SAME RULES MUST ANSWER THE SAME JSON ON BOTH ENGINES. That is what makes
+#   the T-SQL side a port rather than a second implementation — and it is not decoration. Running that
+#   comparison for the first time on 2026-09-20 found a real bug in the DuckDB side, already committed:
+#   its `many` list was UNORDERED, and every assertion in verify_decision_render sorted the list before
+#   looking at it, so nothing there could see it.
+
+require fabricator
+
+# The cross-engine comparison reads both answers as JSON, and the DuckDB half renders through
+# decision_render, whose `{% query %}` bodies are classified with json_serialize_sql.
+require json
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+SET VARIABLE dsn = '${MSSQL_TESTDB_DSN}';
+
+# ==============================================================================================
+# §1  REGISTRATION — the delivery path is QUIET, so it gets its own assertion.
+# ==============================================================================================
+
+query TT
+SELECT function_name, function_type FROM duckdb_functions()
+ WHERE function_name IN ('decision_render_tsql', 'decision_render') GROUP BY 1, 2 ORDER BY 1;
+----
+decision_render	macro
+decision_render_tsql	macro
+
+# ==============================================================================================
+# §2  THE FIXTURE, AND THE RENDER IS T-SQL RATHER THAN DuckDB.
+# ==============================================================================================
+# ⚠ The datatypes row carries T-SQL spellings — `INT`, not `INTEGER` — because it becomes the
+# `OPENJSON … WITH` column list. `VARCHAR` is deliberately written WITHOUT a length; §9 is about that.
+
+statement ok
+CREATE TABLE dr (rulepos INT, region VARCHAR, age VARCHAR, decision VARCHAR, score VARCHAR);
+
+statement ok
+INSERT INTO dr VALUES
+    (-2, 'in',       'in',        'out',      'out'),
+    (-1, 'VARCHAR',  'INT',       'VARCHAR',  'INT'),
+    ( 0,  NULL,      'floor(?)',  NULL,       NULL),
+    ( 1, 'EU, US',   '> 18',      'approve',  '10'),
+    ( 2, 'not RU',   '',          'review',   '20'),
+    ( 3, '',         '',          'reject',   '30');
+
+# ⚠⚠ THE T-SQL SHAPE, ASSERTED STRUCTURALLY — and `IIF(…, 1, 0) … END = 1` is the one that matters:
+# T-SQL HAS NO BOOLEAN TYPE, so a CASE cannot yield a predicate the way DuckDB's does. A build that
+# emitted DuckDB's shape here would not compile, but this row says which difference is meant.
+query TTTT
+SELECT regexp_matches(decision_render_tsql('dr'), 'CREATE OR ALTER FUNCTION')::VARCHAR,
+       regexp_matches(decision_render_tsql('dr'), 'IIF\(i\.region IN \(''EU'', ''US''\), 1, 0\)')::VARCHAR,
+       regexp_matches(decision_render_tsql('dr'), 'OPENJSON\(@input\)')::VARCHAR,
+       regexp_matches(decision_render_tsql('dr'), 'GENERATE_SERIES\(1, 3\)')::VARCHAR;
+----
+true	true	true	true
+
+# ⚠ The two forms differ in their RETURNS clause and nothing else about their wrapper.
+query TT
+SELECT regexp_matches(decision_render_tsql('dr'), 'RETURNS NVARCHAR\(MAX\)')::VARCHAR,
+       regexp_matches(decision_render_tsql('dr', form := 'table'), 'RETURNS TABLE')::VARCHAR;
+----
+true	true
+
+# ==============================================================================================
+# §3  THE SCALAR FORM, DEPLOYED AND RUN ON SQL SERVER.
+# ==============================================================================================
+
+statement ok
+SELECT fabricator_exec(getvariable('dsn'), decision_render_tsql('dr', name := 'dbo.dmn_s'));
+
+query TTT
+SELECT j->'single'->>'rulepos', j->'single'->>'decision', j->'single'->>'score'
+FROM (SELECT j::JSON AS j FROM fabricator_query(getvariable('dsn'),
+        'SELECT dbo.dmn_s(''{"region":"EU","age":30}'', DEFAULT) AS j'));
+----
+1	approve	10
+
+# ⚠ 'JP' fails rule 1's region list but passes rule 2's `not RU`; 'RU' falls to the catch-all. Without
+# both rows, "it returns a decision" would be equally true of a build that always returned rule 1.
+query TT
+SELECT (SELECT (j::JSON)->'single'->>'decision' FROM fabricator_query(getvariable('dsn'),
+          'SELECT dbo.dmn_s(''{"region":"JP","age":30}'', DEFAULT) AS j')),
+       (SELECT (j::JSON)->'single'->>'decision' FROM fabricator_query(getvariable('dsn'),
+          'SELECT dbo.dmn_s(''{"region":"RU","age":5}'', DEFAULT) AS j'));
+----
+review	reject
+
+# ⚠⚠ INPUT PREPROCESSING MUST REACH THE RULES HERE TOO, and it needs preprocessing that CHANGES the
+# value to show it — the same blind spot verify_decision_render §4 records. `floor(?)` on the fixture
+# above cannot discriminate (its `age` is an INT already), so this is its own table: 'eu' must match the
+# rule `EU` through `UPPER(?)`. A build where preprocessing was inert answers 'other'.
+
+statement ok
+CREATE TABLE prep (rulepos INT, region VARCHAR, decision VARCHAR);
+
+statement ok
+INSERT INTO prep VALUES (-2,'in','out'), (-1,'VARCHAR','VARCHAR'),
+    (0,'UPPER(?)',NULL), (1,'EU','euro'), (2,'','other');
+
+statement ok
+SELECT fabricator_exec(getvariable('dsn'), decision_render_tsql('prep', name := 'dbo.dmn_prep'));
+
+query TT
+SELECT (SELECT (j::JSON)->'single'->>'decision' FROM fabricator_query(getvariable('dsn'),
+          'SELECT dbo.dmn_prep(''{"region":"eu"}'', DEFAULT) AS j')),
+       (SELECT (j::JSON)->'single'->>'decision' FROM fabricator_query(getvariable('dsn'),
+          'SELECT dbo.dmn_prep(''{"region":"zz"}'', DEFAULT) AS j'));
+----
+euro	other
+
+# ==============================================================================================
+# §4  THE TABLE FORM — an inline TVF over the same one input row.
+# ==============================================================================================
+
+statement ok
+SELECT fabricator_exec(getvariable('dsn'), decision_render_tsql('dr', name := 'dbo.dmn_t', form := 'table'));
+
+# ⚠ It returns the PREPROCESSED input columns beside the decision, exactly as the DuckDB table form
+# does — so `age` comes back 30, not the raw JSON value.
+query TITT
+SELECT region, age, rulepos, decision FROM fabricator_query(getvariable('dsn'),
+    'SELECT region, age, rulepos, decision FROM dbo.dmn_t(''{"region":"EU","age":30}'', DEFAULT)');
+----
+EU	30	1	approve
+
+# Under RuleOrder it returns one ROW per matching rule rather than a JSON array.
+query IT
+SELECT rulepos, decision FROM fabricator_query(getvariable('dsn'),
+    'SELECT rulepos, decision FROM dbo.dmn_t(''{"region":"EU","age":30}'', ''RuleOrder'') ORDER BY rulepos');
+----
+1	approve
+2	review
+3	reject
+
+# ==============================================================================================
+# §5  ⚠⚠ CROSS-ENGINE PARITY — THE SAME RULES, THE SAME JSON, BYTE FOR BYTE.
+# ==============================================================================================
+# This is the section the file exists for. One rules table, rendered twice; the answers must be equal
+# as STRINGS, which also pins the key order, the null handling and the value types.
+#
+# ⚠ `decisiontable_hk` is the same md5 on both sides because both hash the same cells the same way —
+# so a divergence here would also mean the two renderers disagree about what the decision table IS.
+
+statement ok
+SELECT fabricator_host_exec(decision_render('dr', name := 'dmn_duck'));
+
+query TT
+SELECT to_json(dmn_duck({'region':'EU','age':30}))::VARCHAR =
+       (SELECT j FROM fabricator_query(getvariable('dsn'),
+          'SELECT dbo.dmn_s(''{"region":"EU","age":30}'', DEFAULT) AS j')),
+       to_json(dmn_duck({'region':'RU','age':5}, hit_policy := 'Unique'))::VARCHAR =
+       (SELECT j FROM fabricator_query(getvariable('dsn'),
+          'SELECT dbo.dmn_s(''{"region":"RU","age":5}'', ''Unique'') AS j'));
+----
+true	true
+
+# ⚠ ... and under RuleOrder, where the answer is a LIST. This is the comparison that found the DuckDB
+# ordering bug: both sides must agree on the ORDER as well as the content.
+query T
+SELECT to_json(dmn_duck({'region':'EU','age':30}, hit_policy := 'RuleOrder'))::VARCHAR =
+       (SELECT j FROM fabricator_query(getvariable('dsn'),
+          'SELECT dbo.dmn_s(''{"region":"EU","age":30}'', ''RuleOrder'') AS j'));
+----
+true
+
+# ⚠⚠ THE CONTROL, and without it every row above would be equally true of two engines that both
+# answered NULL: the compared value has to be a real decision.
+query T
+SELECT to_json(dmn_duck({'region':'EU','age':30}))->'single'->>'decision';
+----
+approve
+
+# ==============================================================================================
+# §6  `RuleOrder` ORDER, PAST RULE 9, UNSORTED — on both engines.
+# ==============================================================================================
+# ⚠⚠ TWELVE RULES BECAUSE THREE CANNOT SEE IT: `rulepos` is a string inside the JSON, so ordering it as
+# TEXT puts rule 10 before rule 2. And the assertion must NOT sort — sorting is precisely what hid the
+# DuckDB bug this pair of renderers was found to share.
+
+statement ok
+CREATE TABLE dr12 (rulepos INT, region VARCHAR, decision VARCHAR);
+
+statement ok
+INSERT INTO dr12 VALUES (-2,'in','out'), (-1,'VARCHAR','VARCHAR');
+
+statement ok
+INSERT INTO dr12 SELECT i, '', 'd' || i FROM generate_series(1,12) g(i);
+
+statement ok
+SELECT fabricator_exec(getvariable('dsn'), decision_render_tsql('dr12', name := 'dbo.dmn12'));
+
+query T
+SELECT list_aggregate(json_extract_string(j, '$.many[*].rulepos'), 'string_agg', ',')
+FROM (SELECT j FROM fabricator_query(getvariable('dsn'),
+        'SELECT dbo.dmn12(''{"region":"EU"}'', ''RuleOrder'') AS j'));
+----
+1,2,3,4,5,6,7,8,9,10,11,12
+
+# ==============================================================================================
+# §7  AGGREGATE MODE — the collapse, and the member that survives it.
+# ==============================================================================================
+# ⚠ An aggregate table answers `single` whatever the policy says, because every match has already been
+# collapsed into one row. That is baked at RENDER time on both engines.
+
+statement ok
+CREATE TABLE dra (rulepos INT, region VARCHAR, decision VARCHAR);
+
+statement ok
+INSERT INTO dra VALUES (-2,'in','out'), (-1,'VARCHAR','VARCHAR'),
+    (0, NULL, 'STRING_AGG(?, ''|'')'), (1,'EU','a'), (2,'','b');
+
+statement ok
+SELECT fabricator_exec(getvariable('dsn'), decision_render_tsql('dra', name := 'dbo.dmn_agg'));
+
+query TTT
+SELECT json_keys(j::JSON)[1], (j::JSON)->'single'->>'rulepos', (j::JSON)->'single'->>'decision'
+FROM (SELECT j FROM fabricator_query(getvariable('dsn'),
+        'SELECT dbo.dmn_agg(''{"region":"EU"}'', DEFAULT) AS j'));
+----
+single	1,2	a|b
+
+# ==============================================================================================
+# §8  ⚠⚠ A BARE `VARCHAR` MEANS LENGTH **ONE** IN T-SQL, AND THAT FAILS SILENTLY.
+# ==============================================================================================
+# A rules table authored for DuckDB declares `VARCHAR`, which is THE string type there. Rendered into a
+# T-SQL `OPENJSON … WITH` column definition unchanged, it becomes varchar(1) — every input truncated to
+# its first character, no error anywhere, every multi-character rule silently failing to match. So both
+# bare spellings are widened to (MAX). The ported engine passes them through.
+#
+# ⚠ §2's fixture already declares a bare `VARCHAR`, so §3 and §5 would BOTH have failed had the widening
+# not worked — but they would have failed confusingly. This section names the cause.
+
+query TT
+SELECT regexp_matches(decision_render_tsql('dr'), 'region VARCHAR\(MAX\) ''\$\.region''')::VARCHAR,
+       regexp_matches(decision_render_tsql('dr'), 'region VARCHAR ''')::VARCHAR;
+----
+true	false
+
+# ⚠ A length the AUTHOR wrote is left exactly as written — the widening must not rewrite an intent.
+statement ok
+CREATE TABLE drlen (rulepos INT, region VARCHAR, decision VARCHAR);
+
+statement ok
+INSERT INTO drlen VALUES (-2,'in','out'), (-1,'VARCHAR(50)','NVARCHAR(30)'), (1,'EU','euro'), (2,'','other');
+
+query TT
+SELECT regexp_matches(decision_render_tsql('drlen'), 'region VARCHAR\(50\) ''\$\.region''')::VARCHAR,
+       regexp_matches(decision_render_tsql('drlen'), 'CAST\(ranked\.decision AS NVARCHAR\(30\)\)')::VARCHAR;
+----
+true	true
+
+# ==============================================================================================
+# §9  NO MATCH, AND THE REFUSALS.
+# ==============================================================================================
+
+statement ok
+CREATE TABLE nodef (rulepos INT, region VARCHAR, decision VARCHAR);
+
+statement ok
+INSERT INTO nodef VALUES (-2,'in','out'), (-1,'VARCHAR','VARCHAR'), (1,'EU','euro');
+
+statement ok
+SELECT fabricator_exec(getvariable('dsn'), decision_render_tsql('nodef', name := 'dbo.dmn_nodef'));
+
+# ⚠ `FOR JSON PATH` over zero rows yields NULL, so the scalar answers NULL — matching the DuckDB scalar.
+query TT
+SELECT j IS NULL, (SELECT j2 IS NOT NULL FROM fabricator_query(getvariable('dsn'),
+        'SELECT dbo.dmn_nodef(''{"region":"EU"}'', DEFAULT) AS j2'))
+FROM (SELECT j FROM fabricator_query(getvariable('dsn'),
+        'SELECT dbo.dmn_nodef(''{"region":"JP"}'', DEFAULT) AS j'));
+----
+true	true
+
+statement error
+SELECT decision_render_tsql('dr', form := 'batch');
+----
+is not one of 'scalar'
+
+statement error
+SELECT decision_render_tsql('nodef', form := 'lateral');
+----
+is not one of 'scalar'
+
+# The refusals a decision table earns whichever engine it is rendered for.
+statement ok
+CREATE TABLE noin_t (rulepos INT, a VARCHAR);
+
+statement ok
+INSERT INTO noin_t VALUES (-2,'out'),(1,'x');
+
+statement error
+SELECT decision_render_tsql('noin_t');
+----
+no column is marked 'in'
+
+statement ok
+CREATE TABLE gappy_t (rulepos INT, region VARCHAR, decision VARCHAR);
+
+statement ok
+INSERT INTO gappy_t VALUES (-2,'in','out'), (-1,'VARCHAR','VARCHAR'), (1,'EU','one'), (5,'','five');
+
+statement error
+SELECT decision_render_tsql('gappy_t');
+----
+must run 1..N with no gaps
+
+# ==============================================================================================
+# §10  `input := 'typed'` — ONE FUNCTION PARAMETER PER DECISION INPUT.
+# ==============================================================================================
+# ⚠⚠ THE TRADE-OFF IS WHY BOTH EXIST, and it runs in both directions (user's own framing): a JSON input
+# lets the CALLER pass a wide record and survive a rules change — add an input to the decision table,
+# re-render, and the call site is untouched, because `OPENJSON … WITH` reads only the keys it was told
+# about. A TYPED input is easier to call and type-checks at CREATE time, but its signature changes when
+# the decision table gains an input, so every call site changes with it.
+#
+# ⚠ `input` is ORTHOGONAL to `form`, so all four combinations render; the body is shared and only the
+# `params` derived table differs.
+
+statement ok
+SELECT fabricator_exec(getvariable('dsn'),
+    decision_render_tsql('dr', name := 'dbo.dmn_st', input := 'typed'));
+
+statement ok
+SELECT fabricator_exec(getvariable('dsn'),
+    decision_render_tsql('dr', name := 'dbo.dmn_tt', form := 'table', input := 'typed'));
+
+# The typed signature: one parameter per input, in declaration order, hit_policy last.
+query TT
+SELECT regexp_matches(decision_render_tsql('dr', input := 'typed'),
+                      '@region VARCHAR\(MAX\),
+    @age INT,
+    @hit_policy')::VARCHAR,
+       regexp_matches(decision_render_tsql('dr', input := 'typed'), 'OPENJSON')::VARCHAR;
+----
+true	false
+
+# ⚠⚠ THE ANSWER MUST NOT DEPEND ON HOW THE ROW ARRIVED — byte for byte on the scalar pair. This is the
+# assertion that makes `input` a delivery choice rather than a second semantics.
+query T
+SELECT j FROM fabricator_query(getvariable('dsn'), $q$
+    SELECT CASE WHEN dbo.dmn_s('{"region":"EU","age":30}', DEFAULT)
+                   = dbo.dmn_st('EU', 30, DEFAULT) THEN 'identical' ELSE 'DIFFER' END AS j $q$);
+----
+identical
+
+# ⚠ The typed TVF is what a CROSS APPLY over a real table looks like — the shape the typed form exists
+# for. Its three rows also re-prove the rules really fire (rule 1, 2 and the catch-all).
+query TIT
+SELECT region, rulepos, decision FROM fabricator_query(getvariable('dsn'), $q$
+    SELECT c.region, d.rulepos, d.decision
+    FROM (VALUES ('EU',30),('JP',30),('RU',5)) AS c(region, age)
+    CROSS APPLY dbo.dmn_tt(c.region, c.age, DEFAULT) d $q$)
+ORDER BY region;
+----
+EU	1	approve
+JP	2	review
+RU	3	reject
+
+# ⚠⚠ THE JSON FORM'S OWN POINT, MEASURED: a field the decision table never mentions rides along
+# IGNORED. That is what lets a caller pass a whole wide record and keep working when the rules change.
+# ⚠ Asserted as an EQUALITY against the same call without them, rather than against a pasted literal:
+# the claim is "the extra fields make no difference", and a hardcoded answer would also be pinning the
+# hash and every other field for no reason.
+query T
+SELECT j FROM fabricator_query(getvariable('dsn'), $q$
+    SELECT CASE WHEN dbo.dmn_s('{"region":"EU","age":30}', DEFAULT)
+                   = dbo.dmn_s('{"region":"EU","age":30,"unused":"whatever","also_unused":1}', DEFAULT)
+                THEN 'ignored' ELSE 'CHANGED THE ANSWER' END AS j $q$);
+----
+ignored
+
+# ⚠ The control: a field the rules DO mention still matters, so the row above is not merely saying that
+# the function ignores its input.
+query T
+SELECT j FROM fabricator_query(getvariable('dsn'), $q$
+    SELECT CASE WHEN dbo.dmn_s('{"region":"EU","age":30}', DEFAULT)
+                   = dbo.dmn_s('{"region":"RU","age":30}', DEFAULT)
+                THEN 'SAME' ELSE 'differs' END AS j $q$);
+----
+differs
+
+statement error
+SELECT decision_render_tsql('dr', input := 'struct');
+----
+is not one of 'json'
+
+# ==============================================================================================
+# §11  CLEAN UP — the functions are catalog objects on a SHARED database.
+# ==============================================================================================
+# ⚠ Left behind, they would be discovered by every later suite that enumerates this catalog's functions.
+# The recorded MinIO/external-table lesson, in a cheaper form: leave the rig as you found it.
+
+statement ok
+SELECT fabricator_exec(getvariable('dsn'),
+    'DROP FUNCTION IF EXISTS dbo.dmn_s; DROP FUNCTION IF EXISTS dbo.dmn_t;
+     DROP FUNCTION IF EXISTS dbo.dmn12; DROP FUNCTION IF EXISTS dbo.dmn_agg;
+     DROP FUNCTION IF EXISTS dbo.dmn_nodef; DROP FUNCTION IF EXISTS dbo.dmn_prep;
+     DROP FUNCTION IF EXISTS dbo.dmn_st; DROP FUNCTION IF EXISTS dbo.dmn_tt;');
+
+query I
+SELECT count(*) FROM fabricator_query(getvariable('dsn'),
+    'SELECT name FROM sys.objects WHERE name LIKE ''dmn[_]%'' OR name = ''dmn12''');
+----
+0

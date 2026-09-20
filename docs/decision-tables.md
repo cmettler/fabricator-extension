@@ -5,6 +5,7 @@ metadata rows. `decision_render` turns one into the SQL text of a DuckDB **macro
 DMN-like, with hit policies, preprocessing and aggregate collapse. It renders in **two forms**: a *scalar*
 macro that decides one row at a time, and a *table* macro that decides a whole relation (§2). When the
 **definition itself is data** — one per row — `decision_eval` evaluates it directly and answers JSON (§11).
+For **SQL Server**, `decision_render_tsql` renders the same table as a T-SQL function (§12).
 
 It is a port of `D:\repos\decision-rules-py`. That project's own `CLAUDE.md` remains the best description of
 the *model*; this page is the description of what **ships here**, with every behaviour below measured against
@@ -378,9 +379,9 @@ Measured against the ported engine, so the list is complete rather than impressi
 
 | | status |
 |---|---|
-| **T-SQL inline table-valued function** | **not built**. `decision_render(dialect := 'tsql')` is refused by name rather than returning a DuckDB macro that pretends to be T-SQL. The *cell parser* already answers for T-SQL, so what is missing is a second statement template, not a second parser. |
+| ~~T-SQL~~ | **BUILT** (2026-09-20) as `decision_render_tsql` — §12. `decision_render` has no `dialect` parameter at all now: it renders DuckDB, and the T-SQL statement template lives in its own macro. |
 | Excel / Grist loading | out of scope — that is *authoring*, not evaluation |
-| `varchar(max)` in the datatypes row | **not normalised.** Measured: DuckDB accepts `varchar(50)`, `nvarchar(50)` and `char(3)`, and rejects only the `(max)` spelling (`Parser Error: Expected a constant as type modifier`). The ported engine normalises SQL-Server types when targeting DuckDB; we do not, which matters only for a rules table authored against SQL Server. Belongs with the T-SQL work. |
+| `varchar(max)` in the datatypes row, when targeting **DuckDB** | **not normalised.** Measured: DuckDB accepts `varchar(50)`, `nvarchar(50)` and `char(3)`, and rejects only the `(max)` spelling (`Parser Error: Expected a constant as type modifier`). The ported engine normalises SQL-Server types when targeting DuckDB; we do not, which matters only for a rules table authored against SQL Server. ⚠ The *reverse* direction IS handled — see §12 on the bare `VARCHAR` that means length one in T-SQL. |
 
 Things that exist **here** and not in the ported engine: `SIMILAR TO`, `GLOB` and the `IS` operators; a
 blank output cell rendering `NULL`; four rules sources; the qualification that makes input preprocessing
@@ -467,7 +468,110 @@ anyone will propose here:
 
 ---
 
-## 12. Where the tests are
+## 12. T-SQL: `decision_render_tsql`
+
+The same decision table, rendered for **SQL Server** instead of DuckDB. It is a separate macro from
+`decision_render` — the statement templates have almost nothing in common, and keeping them apart keeps
+both readable. What is *not* separate is the part that matters: `dmn_condition` / `dmn_value` /
+`dmn_is_aggregate` are the same C# parser called with `'tsql'`, so the **cell grammar cannot drift**
+between the two engines.
+
+```sql
+SELECT decision_render_tsql('decision_rules', name := 'dbo.evaluate');
+-- then run that text on SQL Server
+SELECT fabricator_exec('mycat', decision_render_tsql('decision_rules', name := 'dbo.evaluate'));
+```
+
+**Both forms take one input row** — there is no batch form here.
+
+| `form := 'scalar'` (default) | `form := 'table'` |
+|---|---|
+| `RETURNS NVARCHAR(MAX)` — JSON out | `RETURNS TABLE` — an inline TVF |
+| one value, composable per row | the preprocessed input columns beside the decision |
+| `RuleOrder` ⇒ a JSON array | `RuleOrder` ⇒ one row per matching rule |
+
+### `input` — how that row arrives, and why both ways exist
+
+`input` is **orthogonal** to `form`, so all four combinations render; the body is shared and only the
+`params` derived table differs.
+
+| | |
+|---|---|
+| `input := 'json'` (default) | one `@input NVARCHAR(MAX)` document, read with `OPENJSON … WITH` |
+| `input := 'typed'` | one function parameter per decision input, typed from the datatypes row |
+
+```sql
+-- json
+SELECT * FROM dbo.evaluate('{"region":"EU","age":30}', DEFAULT);
+
+-- typed  →  CREATE OR ALTER FUNCTION dbo.evaluate(@region VARCHAR(MAX), @age INT, @hit_policy …)
+SELECT c.id, d.decision FROM customers c CROSS APPLY dbo.evaluate(c.region, c.age, DEFAULT) d;
+```
+
+> **⚠⚠ THE TRADE-OFF RUNS IN BOTH DIRECTIONS, AND IT IS THE WHOLE REASON BOTH EXIST.**
+>
+> **JSON survives a rules change.** Pass the whole record — wider than the decision table needs — and
+> `OPENJSON … WITH` reads only the keys it was told about. Add an input to the rules, re-render, and
+> **the call site is untouched**. A field the rules never mention rides along ignored (measured).
+>
+> **Typed is easier to call** and type-checks at CREATE time rather than at OPENJSON time — but its
+> signature changes when the decision table gains an input, so every call site changes with it.
+>
+> ⚠ Whichever you pick the **answer is identical** — measured byte for byte on the scalar pair.
+
+### ⚠⚠ The JSON matches the DuckDB scalar form byte for byte
+
+That is the property worth having, and it is gated: the same rules answer the same JSON on both engines,
+so a caller reads `->'single'->>'decision'` either way, and `decisiontable_hk` is the same md5 on both
+sides. Getting there needed three things that are easy to miss:
+
+- **`FOR JSON PATH, INCLUDE_NULL_VALUES`.** `FOR JSON` drops NULL keys by default, so `_model_error_`
+  simply vanished from the object whenever there was no error — which is almost always.
+- **`ORDER BY CAST(rulepos AS INT)` before `FOR JSON`.** `RuleOrder` means every matching rule *in
+  rulepos order*, and `FOR JSON PATH` has no inherent order. The cast matters past rule 9.
+- **`rulepos` as a string.** DuckDB's UNION struct must declare one type for it and aggregate mode makes
+  that a comma-joined list, so the T-SQL scalar casts to match. (The table form keeps it an integer on
+  both engines.)
+
+> ⚠ Running that comparison for the first time found a **bug in the DuckDB side**: its `many` list was
+> unordered. Every assertion that read the list had sorted it first, so nothing in the DuckDB suite could
+> see it. Cross-engine comparison is the test that had no blind spot.
+
+### What T-SQL forces
+
+- **⚠⚠ There is no boolean type**, so a `CASE` cannot return a predicate. Every rule condition is
+  rendered `IIF(<cond>, 1, 0)` and the `CASE` compared `= 1`. This is *the* structural difference from
+  the DuckDB template; get it wrong and the function does not compile.
+- `OPENJSON(@input) WITH (…)` replaces the struct unpacking, `OUTER APPLY` replaces `LEFT JOIN LATERAL`,
+  and `GENERATE_SERIES(1, N)` enumerates the rules — which needs **SQL Server 2022+** (compat 160).
+- **An inline TVF cannot carry `ORDER BY`**, so the table form does not order its rows under `RuleOrder`
+  — the caller orders. (The scalar form can, because `FOR JSON` is present.)
+- `CREATE OR ALTER FUNCTION` must be the **first statement of its batch**, so run the rendered text on
+  its own.
+
+### ⚠⚠ The datatypes row must carry T-SQL type names
+
+It becomes the `OPENJSON … WITH` column list and the output `CAST`. `DOUBLE` and `BOOLEAN` are DuckDB
+spellings and fail loudly at CREATE (*"Type DOUBLE is not a defined system type"*) — write `FLOAT`,
+`BIT`, `INT`, `DATE`.
+
+> **⚠⚠ One spelling is fixed rather than passed through, because it fails SILENTLY.** A bare `VARCHAR`
+> or `NVARCHAR` in a T-SQL column definition means length **one**. A rules table authored for DuckDB —
+> where `VARCHAR` *is* the string type — would therefore truncate every input to its first character,
+> with nothing failing anywhere and every multi-character rule quietly not matching. Both bare spellings
+> are widened to `(MAX)`. A length you wrote yourself (`VARCHAR(50)`) is left exactly as written. The
+> ported engine passes these through untouched; this is a deliberate deviation.
+
+### Divergences from the DuckDB pair
+
+| | |
+|---|---|
+| no match, `RuleOrder` | T-SQL answers `NULL`; DuckDB answers `{"many": null}` — `FOR JSON` over zero rows is NULL, and there is no row left to carry anything |
+| `RuleOrder` row order, table form | unordered in T-SQL (an inline TVF cannot `ORDER BY`); the caller orders |
+
+---
+
+## 13. Where the tests are
 
 | what | where |
 |---|---|
@@ -475,6 +579,7 @@ anyone will propose here:
 | the rules-source classifier, offline | `dotnet/Fabricator.Bridge.Tests/DecisionRuleSourceTests.cs` |
 | the renderer end to end | `test/verify_decision_render.test` |
 | `decision_eval` end to end | `test/verify_decision_eval.test` |
+| the T-SQL renderer, deployed to a real SQL Server | `test/verify_decision_render_tsql.test` (service tier) |
 
 The suite's sections map to this page: §3 the ported engine's own documented answers in both forms, §4
 preprocessing reaching the rules, §5 aggregate mode, §6 the LATERAL expansion and how the two forms diverge
