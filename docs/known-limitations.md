@@ -47,7 +47,7 @@ authority, and its comments record what each raise bought. Anything they cover w
 | ~~1.25~~ | **FIXED 2026-09-12.** A `LIMIT` satisfied BEFORE a streaming in-out operator was pulled again used to fail with `Invalid Error: resource deadlock would occur` — `SELECT … FROM my_inout(…) LIMIT 1` — on `fluid_query_inout`, the first-party global in-outs and every provider-declared `_each`. ⚠ It was never "any bare `LIMIT`": over a 4-row input `LIMIT` 1/3/4 failed and **`LIMIT 10` was fine**, because the operator is then pulled again, hits END and releases; `ORDER BY … LIMIT` was fine for the same reason (a pipeline breaker drains it to END first), which is why no suite caught it | **The operator holds its gate across a `HAVE_MORE_OUTPUT` return and releases it only on its NEXT invocation, so an early-stopped pipeline ABANDONED the tenure and the finalize hook then blocked on it.** Fixed by releasing from the in-out's LOCAL STATE DESTRUCTOR — no new primitive, no thread-identity assumption, `FinishEof` untouched. ⚠⚠ **THE FIRST ATTEMPT WAS STRICTLY WORSE THAN THE BUG AND IS WORTH KNOWING ABOUT:** having `FinishEof` recognise and ADOPT its own tenure fixes only the case where the finalize hook runs on the holding thread — MEASURED to be the MINORITY (`verify_plugin_fluid`: 15 calls, `owns=1` **zero** times) — and converts the rest from a loud `EDEADLK` into a silent HANG (that suite hung at 400 s where it had merely failed). It was built, measured and reverted. ⚠⚠ **THREE MEASUREMENTS MADE THE DESTRUCTOR THE RIGHT PLACE**, and the second is what avoided a concurrency-primitive swap: a local state dies BEFORE `OperatorFinalize`; it dies ON THE THREAD THAT TOOK ITS OWN LOCK (so `unlock()` there is legal, since a `std::mutex` may only be unlocked by its owner); and `FinishEof` runs on a FOREIGN thread. ⚠ Gate: `verify_global_functions` 178 → **189**, one mutant dying at the `LIMIT 1` row after 178 pass — and its LOAD-BEARING row is the FOREIGN-THREAD case (a `LIMIT` over a parallel `UNION ALL`), because every single-branch probe was green while the first attempt hung. Full record: [fluid-templating.md](fluid-templating.md) §37.5-§37.7 |
 | ~~1.20~~ | **WITHDRAWN 2026-08-22 — there was no defect. The raw loadable loads fine in a stock DuckDB 1.5.5 wheel; what crashed was MY TEST VENV.** Kept as a row rather than deleted because the methodology lesson is worth more than the row was: **before recording a defect seen in a local environment, verify the environment is the one users have.** | Bounded by loading a CI-BUILT artifact (the v0.0.11 windows Standalone asset) on this machine — it segfaulted too, which excluded our build tree — and then in a FRESH venv holding only the official `duckdb==1.5.5` wheel, where **both** the CI artifact and our local loadable load and report `0.0.11`. The culprit: the probe venv had duckdb pip-installed **from a local source tree** (`direct_url.json` = `file:///.../scratchpad/pyduck`, a `project(duckdb_python)` checkout), so its engine is a different build of the same version — 41,451,008 bytes against the official wheel's 37,374,464, and `Requires-Python >=3.11` against `>=3.10`. A version MATCH with an ABI MISMATCH is exactly a crash at load. ⚠ Note the sequence of my own errors: probe -> record a limitation -> narrow it twice -> discover it was never real. The CI evidence that made me downgrade it was right, and still not the same thing as bounding it. ⚠ Consequence worth keeping: dbt-duckdb and the notebook flow are UNAFFECTED, and `pyarrow` was tested and exonerated |
 | ~~1.26~~ | **FIXED 2026-09-15, hours after it was recorded.** `UPDATE … SET <a LIST / MAP / nested column>` was refused on the Delta provider with *"unsupported filter value type List"* — a message naming a FILTER although it was the SET value. It now works, on BOTH update paths | **The refusal was never a property of the format or of the writer — it was a CLR round trip.** Both UPDATE paths boxed every SET value and rebuilt an Arrow array from the boxes, and neither ladder (`ReadScalar` out, `BuildArray` back) had a list case. ⚠ The round trip exists for ONE real job, which the code states: a target-type conversion, so an incoming INT32 or a differently-united timestamp still lands as the column's declared type. So the fix is to do it only when there IS something to convert — when the incoming Arrow type already matches the target STRUCTURALLY, the array is handed through. ⚠⚠ **The two paths needed DIFFERENT fixes and fixing one alone would have been the worse outcome**: autocommit rebuilds a column (a passthrough), while an explicit transaction MERGES new values with untouched rows row by row in `BufferUpdateRows` (a concatenate + take). Same statement, and it would have worked outside a transaction and failed inside one. ⚠ Names are compared loosely on purpose — Arrow labels a list's child `item` and the parquet spec calls it `element`, so two faithful converters describing one `VARCHAR[]` disagree on a LABEL while the layout is identical; `ArrowTypeCompare.SameType` takes a `namesMatter` flag because CDC drift detection wants the opposite answer. ⚠ `BuildArray` still has NO list case, deliberately: a list needing a genuine conversion is REFUSED rather than silently rebuilt through boxes. Gate: `verify_update_set_columns` §7 (both paths, with the untouched rows as the control) and §8 (NOT NULL still enforced — the check used to ride that boxing) |
-| 1.27 | ⚠⚠ **A pushed filter beside a differently-typed `OR` raises a DuckDB INTERNAL error and INVALIDATES THE DATABASE** — the assertion-failure class, so the connection dies, not just the statement. `… WHERE region = 'EU' AND (age IN (18,21) OR age IS NULL)` over a `fluid_query`. **NOT FIXED.** Measured 2026-09-21 — the flip test, the workaround and where to look: [§1.27 in full](#127-in-full--the-flip-test-and-where-to-look) |
+| ~~1.27~~ | **FIXED 2026-09-21.** Projecting any column other than the first from `fabricator_host_query` / `fabricator_host_exec` / `fabricator_scan` wrote it into the wrong output slot — INTERNAL error and an invalidated database when the types differed, a **segfault** when they did not. Three missing `projection_pushdown` flags. One-line repro, the corrections to the first diagnosis, and why reading could not find it: [§1.27 in full](#127-fixed-2026-09-21--projecting-a-column-that-is-not-the-first-on-three-host-table-functions) |
 
 **On 1.5 — what protects you today.** Two mechanisms now, and the second was built on 2026-08-17.
 
@@ -218,87 +218,72 @@ any rule in the host.
 ---
 
 
-### 1.27 in full — the flip test, and where to look
+### ~~1.27~~ FIXED 2026-09-21 — projecting a column that is not the first, on three host table functions
 
-A scan of a fabricator table function that gets **one pushable filter** plus a **non-pushable disjunction on
-a column of a different type** fails with
+Kept because the shape of the diagnosis is worth more than the fix, and because **the version of this
+entry written before the root cause was found was wrong in three places** — each wrong in the direction
+of making it look smaller and narrower than it was.
 
-```
-INTERNAL Error: Vector::Reference used on vector of different type (source INTEGER referenced VARCHAR)
-```
+**THE ROOT CAUSE, one sentence:** `fabricator_host_query`, `fabricator_host_exec` and `fabricator_scan`
+never set `TableFunction::projection_pushdown`, while the `ArrowStreamScan` they share fills the output
+chunk by walking `output_column_ids` and writing slot *k* from `output_source_pos[k]` — which is correct
+only when DuckDB has **narrowed** the chunk to the projected columns. Without the flag DuckDB returns a
+**full-width** chunk while still reporting the needed subset in `column_ids`, so the *k*-th needed column
+lands in slot *k*: the wrong slot for any projection that is not a prefix from 0.
 
-after which the connection is dead: *"database has been invalidated because of a previous fatal error"*.
-This is the assertion-failure class, so it takes the whole database down, not just the statement.
-
-**Minimal reproduction** — five lines, no catalog, no provider, no decision table:
-
-```sql
-SELECT * FROM fluid_query($fab$
-  SELECT r AS region, a AS age
-  FROM (VALUES ('EU', 18), ('EU', 21), ('US', 18), ('EU', NULL)) t(r, a)
-$fab$, NULL)
-WHERE region = 'EU' AND (age IN (18, 21) OR age IS NULL);
-```
-
-**⚠⚠ It is POSITIONAL, and the flip test is what shows that** — the error names whichever pair of types the
-two columns have, in the order they appear:
-
-| predicate | result |
-|---|---|
-| `region = 'EU' AND (age IN (18,21) OR age IS NULL)` | `source INTEGER referenced VARCHAR` |
-| `age = 18 AND (region = 'EU' OR region IS NULL)` | `source VARCHAR referenced INTEGER` |
-| `region = 'EU' AND (region = 'US' OR region IS NULL)` | **ok** |
-| `age = 18 AND (age = 21 OR age IS NULL)` | **ok** |
-
-So a filter value is being read at the wrong index of the staged constants batch. Same-type cases pass
-**vacuously** — the mixup happens there too and is invisible, which is why this went unnoticed.
-
-⚠ **The projection is irrelevant**, checked rather than assumed: `SELECT *`, one column, two columns and
-all four all fail identically, and both single-predicate halves pass on their own. It is the *predicate
-shape* alone.
-
-⚠ **Pre-existing and not decision-table-specific.** It was found while running a README example for
-`decision_coverage`, but that macro never mentions `filters` or `projected` — the reproduction above uses
-only `fluid_query`, which nothing in that work touched.
-
-⚠ **Not yet attributed to a line.** The staging path is `LiveFilterNode` / `SerializeLiveFilters`
-(`src/fabricator/arrow_ingest.cpp`) into `BuildFilterValues`, consumed by `FluidFilterModel.DeclareVariables`
-(`dotnet/Fabricator.FluidPlugin/FluidFilterModel.cs`), whose `SET VARIABLE filters = …` is the statement the
-host reports failing. The OR branch's scratch-vector handling reads correctly on inspection, so the
-mismatch is somewhere between the emitted `v<n>` indexes and the batch those columns arrive in — **find it by
-instrumenting the two, not by reading further**; this page already records what a backwards read costs.
-
-### ⚠⚠ `fluid_replacement_query` AVOIDS IT ENTIRELY — and for an eligible function that is a FIX, not a workaround
-
-User-suggested, and measured the same day. `fluid_query` is an ordinary table function, so the scan's
-pushed filters are marshalled through the host — which is where the mis-indexing happens.
-`fluid_replacement_query` is `bind_replace`: **the call DISAPPEARS at bind into a subquery**, so there is
-no pushdown marshalling to get wrong, and DuckDB pushes the predicate into the generated SQL itself.
+**The repro is one line, and it has nothing to do with filters, Fluid or decision tables:**
 
 ```sql
--- the crashing repro, one word changed — correct answer, connection alive
-SELECT * FROM fluid_replacement_query($fab$ SELECT r AS region, a AS age
-  FROM (VALUES ('EU',18),('EU',21),('US',18),('EU',NULL)) t(r,a) $fab$)
-WHERE region = 'EU' AND (age IN (18,21) OR age IS NULL);
+SELECT b FROM fabricator_host_query('SELECT 5 AS a, ''x'' AS b');
+-- before: INTERNAL Error: Vector::Reference used on vector of different type … database invalidated
 ```
 
-**`decision_check` was moved onto it** and the shape that killed the connection
-(`WHERE col = 'age' AND (rulepos IN (1,2) OR rulepos IS NULL)`) now answers correctly.
+| shape | before | after |
+|---|---|---|
+| `SELECT *` | ok | ok |
+| `SELECT a` (the FIRST column) | ok | ok |
+| `SELECT b` (second, different types) | INTERNAL error, **database invalidated** | ok |
+| `SELECT b` (second, SAME types) | **SEGFAULT (exit 139)** | ok |
+| `SELECT c, b` (out of order) | broken | ok |
+| `SELECT count(*)` (empty projection) | ok | ok |
 
-> **⚠⚠ THE ELIGIBILITY TEST IS "DOES THE RENDER LEAVE ANYTHING ON THE CONNECTION", NOT "ARE THE
-> ARGUMENTS CONSTANT"** — and getting that wrong is measurable rather than subtle. `decision_coverage`
-> has constant arguments too, and moving it broke immediately: it `exec()`s a TEMP MACRO that the
-> generated SQL then CALLS, and under bind_replace the render runs on its **own** connection while the
-> spliced SQL runs on the **caller's**, so *"Table Function with name `fab_cov_<md5>` does not exist!"*.
-> It therefore stays on `fluid_query` and stays exposed — escaping would need `decision_render` to emit
-> the table form's body as an inlinable subquery rather than a `CREATE MACRO`.
+> **⚠⚠ THE FIRST WRITE-UP SAID "every same-type case passes VACUOUSLY". THAT WAS WRONG, AND IT IS THE
+> correction worth carrying:** a same-type subset does not pass, it **segfaults** — `Vector::Reference`
+> accepts the wrong column when the types agree, and the slot that was never written is read afterwards.
+> So the two failure modes are an invalidated database and a dead process, and the *type mismatch* was
+> merely the louder of the two. "Passes vacuously" was inferred from the absence of an error message in a
+> pipeline that had already died.
 >
-> ⚠ A **per-row** surface cannot take this path either: `fluid_replacement_query`'s arguments are
-> bind-time constants, which is the recorded reason it was rejected as the *evaluation* surface.
+> **⚠⚠ IT WAS ALSO NOT A FILTER BUG, AND THE FILTER MODEL WAS INNOCENT.** The original report came through
+> `fluid_query` with `WHERE region = 'EU' AND (age IN (18,21) OR age IS NULL)`, and the flip test — the
+> message naming whichever pair of types the two columns had — made "a filter value is read at the wrong
+> index of the staged constants batch" look certain. It was not: the disjunction is *dropped* from the
+> conjuncts while its constants stay staged, so the emitted statement references a **subset** of the
+> staged columns, and that is all the OR ever contributed. Dumping the statement showed the indexes were
+> **correct** (`region = idx:1` against a `[Int32, String]` batch, rendering `CAST(v1 AS VARCHAR)`).
+>
+> **⚠⚠ AND ONE OF MY OWN INTERMEDIATE READINGS WAS AN ARTEFACT OF THE PROBE.** A first dump piped through
+> `tr ',' '\n'` split the statement mid-item and appeared to show `region` referencing `v0`, the integer —
+> which "confirmed" the stale-index theory. Printing the conjuncts properly showed the opposite. *A probe
+> whose output you reformat can manufacture the very finding you are looking for.*
 
-**Otherwise:** rewrite the disjunction so it does not sit beside a pushable filter on a differently-typed
-column — `WHERE region = 'EU' AND coalesce(age IN (18,21), age IS NULL)` and
-`WHERE region = 'EU' AND age IS NOT DISTINCT FROM …` both avoid it, as does filtering in two steps.
+**⚠ WHY IT SURVIVED:** `SELECT *` and `SELECT <first column>` both work whatever the bug does, because
+position 0 maps to slot 0 — and those are what every existing test and almost all real usage do. Every
+other `ArrowStreamScan` registration in the tree already set the flag; `fabricator_query`'s carries the
+comment *"arrow_ingest maps requested columns; required"*, so this exact defect had been found and fixed
+there once and these three were missed.
+
+**⚠ HOW IT WAS FOUND, since reading did not do it:** four passes of reading the filter model, the mapping
+and the ingest all concluded the code was correct. One env-gated `Printer::Print` at the mapping site
+settled it in a single run — `out_cols=2[INTEGER,VARCHAR] … output_column_ids=[1] output_source_pos=[1]`,
+i.e. a two-wide chunk being filled at slot 0. *To establish what a code path actually does, instrument
+it.* This page already said so for a different bug.
+
+**Gate:** `test/verify_host_query.test` (the projection section, +17 → 124), with `SELECT *` and
+`SELECT a` kept as the controls. Two mutants, each killed at its own row: removing the `host_query` flag
+dies at the mixed-type row, removing the `fabricator_scan` flag dies at the `publish()` row.
+⚠ The third flag (`fabricator_host_exec`) is **ungated** — it has one column, so only the empty
+projection differs and a mutant removing it survives. It is set for the contract, not for a test.
 
 ---
 ## 2. Claimed but NOT measured — treat as unproven

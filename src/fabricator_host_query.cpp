@@ -1021,12 +1021,25 @@ void RegisterHostQuery(ExtensionLoader &loader) {
 	// PhysicalBufferedBatchCollector instead of the single-threaded PhysicalBufferedCollector.
 	// See ArrowStreamGetPartitionData + docs/scan-concurrency.md.
 	fn.get_partition_data = fabricator::ArrowStreamGetPartitionData;
+	// ⚠⚠ REQUIRED, NOT AN OPTIMISATION. `ArrowStreamScan` fills the output chunk by walking
+	// `output_column_ids` and writing slot k from `output_source_pos[k]`, which is only correct when
+	// DuckDB has NARROWED the chunk to the projected columns. Without this flag DuckDB hands back a
+	// FULL-WIDTH chunk while still reporting the needed subset in column_ids, so the k-th needed
+	// column lands in slot k — the wrong slot for any projection that is not a prefix from 0.
+	// MEASURED before the fix: `SELECT b FROM fabricator_host_query('SELECT 5 AS a, ''x'' AS b')`
+	// raised INTERNAL "Vector::Reference used on vector of different type" and INVALIDATED the
+	// database; with both columns the SAME type it SEGFAULTED instead (slot 1 never written).
+	// Every other ArrowStreamScan registration already set it — see fabricator_extension.cpp:629,
+	// whose comment says "required". These three were missed.
+	fn.projection_pushdown = true;
 	loader.RegisterFunction(fn);
 
 	// fabricator_host_exec(sql) — the DDL/DML sibling. Fixed one-BIGINT output, so no describe is needed and
 	// the statement runs EXACTLY ONCE, including several statements in one string (see docs/host-query.md).
 	TableFunction exec_fn("fabricator_host_exec", {LogicalType::VARCHAR}, fabricator::ArrowStreamScan,
 	                      HostExecBind, fabricator::ArrowStreamInitGlobal, fabricator::ArrowStreamInitLocal);
+	// See the note on fabricator_host_query above: required, not an optimisation.
+	exec_fn.projection_pushdown = true;
 	loader.RegisterFunction(exec_fn);
 
 	// The SCALAR spelling of the same function, for symmetry with fabricator_exec (also a VOLATILE scalar).
@@ -1044,6 +1057,8 @@ void RegisterHostQuery(ExtensionLoader &loader) {
 	// PhysicalBufferedBatchCollector instead of the single-threaded PhysicalBufferedCollector.
 	// See ArrowStreamGetPartitionData + docs/scan-concurrency.md.
 	scan.get_partition_data = fabricator::ArrowStreamGetPartitionData;
+	// See the note on fabricator_host_query above: required, not an optimisation.
+	scan.projection_pushdown = true;
 	loader.RegisterFunction(scan);
 }
 

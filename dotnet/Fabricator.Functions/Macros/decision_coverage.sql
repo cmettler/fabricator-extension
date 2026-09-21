@@ -41,11 +41,9 @@ CREATE OR REPLACE MACRO decision_coverage(rules, source := 'auto', max_cases := 
 --   `fluid_replacement_query` (bind_replace) the render runs on its own connection while the
 --   spliced SQL runs on the CALLER's, so the macro is invisible — MEASURED: *"Table Function with
 --   name fab_cov_<md5> does not exist!"* at the first real query.
---   ⚠ The cost of staying here is REAL: this function is therefore exposed to the pushdown crash in
---     known-limitations.md §1.27 (a pushable filter beside a differently-typed `OR` invalidates the
---     database). Filter its output in an outer query, or in two steps, until that is fixed.
---   ⚠ Escaping it needs decision_render to emit the table form's BODY as an inlinable subquery
---     rather than a CREATE MACRO — a new render mode, not a substitution.
+--   ⚠ It used to cost something real — this function was exposed to the projection defect in
+--     known-limitations.md §1.27 — but that is FIXED (three missing `projection_pushdown` flags), so
+--     staying on `fluid_query` now costs nothing.
 SELECT * FROM fluid_query($$
 {%- comment -%}
   1/3 — the relation, and the column names. Same two steps decision_render takes, for the same reasons.

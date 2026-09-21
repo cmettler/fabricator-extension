@@ -3174,11 +3174,6 @@ SELECT issue, region, age, matched_rules FROM decision_coverage('bands') WHERE r
 >
 > ⚠ The case count is the **product** of the per-column counts, so it is bounded by `max_cases`
 > (100 000) and the refusal names the number it would have generated.
->
-> ⚠⚠ **Filter its output in an outer query, not in the same `WHERE`.** A pushable filter sitting beside
-> a differently-typed `OR` — `WHERE region = 'EU' AND (age IN (18,21) OR age IS NULL)` — currently trips
-> a DuckDB internal error that ends the connection
-> ([known-limitations.md](docs/known-limitations.md) §1.27). `decision_check` is not affected.
 
 Full reference, including what each verdict means and why one bad datatype reports once rather than
 poisoning the whole report: [docs/decision-tables.md](docs/decision-tables.md).

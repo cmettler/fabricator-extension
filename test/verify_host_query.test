@@ -11,6 +11,10 @@ require fabricator
 # resolve the extension from disk, and fails on a bare runner.
 require icu
 
+# The publish()/exec() rows at the end need json_serialize_sql (exec() classifies the statement
+# with it). ⚠ Forgetting this fails LOUDLY; requiring an extension the binary lacks SKIPS SILENTLY.
+require json
+
 # Basic round-trip: a literal projection run on a fresh host connection.
 query II
 SELECT x, y FROM fabricator_host_query('SELECT 42 AS x, ''hi'' AS y');
@@ -624,3 +628,101 @@ RESET search_path;
 
 statement ok
 RESET TimeZone;
+
+# ============================================================================================
+# PROJECTING A COLUMN THAT IS NOT THE FIRST — the missing `projection_pushdown` flag.
+# ============================================================================================
+# ⚠⚠ USER-REPORTED 2026-09-21 as a crash in `fluid_query`, and the cause was three registrations
+# in `src/fabricator_host_query.cpp` that never set `TableFunction::projection_pushdown`.
+# `ArrowStreamScan` fills the output chunk by walking `output_column_ids` and writing slot k from
+# `output_source_pos[k]` — correct ONLY when DuckDB has NARROWED the chunk to the projected
+# columns. Without the flag DuckDB hands back a FULL-WIDTH chunk while still reporting the needed
+# subset in column_ids, so the k-th needed column lands in slot k.
+#
+# ⚠⚠ MEASURED BEFORE THE FIX, and the two failure modes are why this had to be gated rather than
+# just fixed: with the two columns of DIFFERENT types it raised INTERNAL "Vector::Reference used on
+# vector of different type" and INVALIDATED THE DATABASE; with the SAME type it SEGFAULTED (exit
+# 139), because slot 1 was never written. Neither is recoverable and neither names the cause.
+#
+# ⚠ `SELECT *` and `SELECT <first column>` both passed throughout, which is exactly why it survived:
+# position 0 maps to slot 0 whatever the bug does. Those two rows are the CONTROL — without them a
+# build that had stopped returning rows at all would satisfy the rest of this section.
+
+# The control: the shapes that ALWAYS worked, so the rows below are a judgement and not a build
+# that merely answers something.
+query IT
+SELECT * FROM fabricator_host_query('SELECT 5 AS a, ''x'' AS b');
+----
+5	x
+
+query I
+SELECT a FROM fabricator_host_query('SELECT 5 AS a, ''x'' AS b');
+----
+5
+
+# ⚠⚠ THE ROW THAT WAS AN INTERNAL ERROR: the SECOND column of a mixed-type result.
+query T
+SELECT b FROM fabricator_host_query('SELECT 5 AS a, ''x'' AS b');
+----
+x
+
+# ⚠⚠ THE ROW THAT WAS A SEGFAULT: the second column when BOTH are the same type. A crash rather
+# than a wrong answer, so nothing downstream could have caught it.
+query T
+SELECT b FROM fabricator_host_query('SELECT ''q'' AS a, ''w'' AS b');
+----
+w
+
+# ⚠ OUT OF ORDER and skipping one, which is the general case the prefix rows cannot cover.
+query IT
+SELECT c, b FROM fabricator_host_query('SELECT 5 AS a, ''x'' AS b, 7 AS c');
+----
+7	x
+
+# ⚠ NO columns needed at all — the empty projection, which a narrowed chunk has to get right too.
+query I
+SELECT count(*) FROM fabricator_host_query('SELECT 5 AS a, ''x'' AS b');
+----
+1
+
+# ⚠⚠ `fabricator_scan` over a registered source has the SAME defect and the same fix, reached here
+# through `publish()` — a template stages a mixed-type relation and the generated SQL selects only
+# its second column. This is the shape the user's `fluid_query` report actually bottomed out in.
+query T
+SELECT * FROM fluid_replacement_query($fab$
+{%- exec %}CREATE OR REPLACE TEMP TABLE _pp AS SELECT 5 AS v0, 'EU' AS v1{% endexec -%}
+SELECT v1 FROM {{ publish('_pp') }}
+$fab$);
+----
+EU
+
+# ⚠ ... and the first column still works through the same path (the control for the row above).
+query I
+SELECT * FROM fluid_replacement_query($fab$
+{%- exec %}CREATE OR REPLACE TEMP TABLE _pp2 AS SELECT 5 AS v0, 'EU' AS v1{% endexec -%}
+SELECT v0 FROM {{ publish('_pp2') }}
+$fab$);
+----
+5
+
+# ⚠⚠ AND THE USER'S ORIGINAL REPORT, end to end: a pushable filter beside a differently-typed OR.
+# The OR's constant is staged but its conjunct is dropped, so the emitted statement references a
+# SUBSET of the staged columns — which is what dragged `fabricator_scan`'s projection into it.
+query TI
+SELECT * FROM fluid_query($fab$ SELECT r AS region, a AS age
+  FROM (VALUES ('EU',18),('EU',21),('US',18),('EU',NULL)) t(r,a) $fab$, NULL)
+WHERE region = 'EU' AND (age IN (18,21) OR age IS NULL) ORDER BY age NULLS LAST;
+----
+EU	18
+EU	21
+EU	NULL
+
+# ⚠⚠ `fabricator_host_exec` got the same flag and it is DELIBERATELY UNGATED — say so rather than
+# implying coverage. It has ONE column, so there is no "second column" to project and only the empty
+# projection differs; a mutant removing that third flag SURVIVES this whole suite. It is set anyway
+# because `ArrowStreamScan`'s contract requires it and a future column added to this function would
+# otherwise break silently — but nothing here proves it, and this row is the closest anything comes.
+query I
+SELECT count(*) FROM fabricator_host_exec('CREATE OR REPLACE TABLE hq_pp AS SELECT 1');
+----
+1

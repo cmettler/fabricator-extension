@@ -649,13 +649,6 @@ exactly the ones the rules talk about, plus the points either side:
 
 ---
 
-> ⚠⚠ **Filter its output in an OUTER query.** A pushable filter beside a differently-typed `OR` in the
-> same `WHERE` trips a DuckDB internal error that invalidates the connection
-> ([known-limitations.md](known-limitations.md) §1.27). `decision_check` escapes it by being built on
-> `fluid_replacement_query`; this one cannot, because it stages a temp macro the generated SQL calls.
-
----
-
 ## 14. `decision_check` — what the table compiles to
 
 One row per cell, with the SQL it becomes and a verdict.

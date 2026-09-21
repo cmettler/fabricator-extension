@@ -55,15 +55,11 @@
 --   ⚠ ONE host round trip per non-wildcard cell (~0.35 ms), which is why this is a review tool for a
 --     decision table's worth of cells rather than something to put in a hot path.
 --
--- ⚠⚠ IT IS BUILT ON `fluid_replacement_query`, NOT `fluid_query`, AND THAT IS A CORRECTNESS
---   CHOICE (user-suggested 2026-09-21: *"maybe you can use the replacement query instead"*).
---   `fluid_query` is an ordinary table function, so the scan's pushed filters are marshalled through
---   the host — and a pushable filter beside a differently-typed `OR` hits a DuckDB INTERNAL error
---   that INVALIDATES THE DATABASE (known-limitations.md §1.27). MEASURED on this very function:
---   `WHERE col = 'age' AND (rulepos IN (1,2) OR rulepos IS NULL)` killed the connection before, and
---   answers correctly now. `fluid_replacement_query` is `bind_replace` — the call DISAPPEARS at bind
---   into a subquery — so there is no pushdown marshalling to get wrong, and DuckDB pushes the
---   predicate into the generated SQL itself.
+-- ⚠ IT IS BUILT ON `fluid_replacement_query`, NOT `fluid_query` (user-suggested 2026-09-21:
+--   *"maybe you can use the replacement query instead"*). It was adopted to dodge the projection
+--   defect in known-limitations.md §1.27, which is now FIXED — so the reason it STAYS is the
+--   remaining merit: `fluid_replacement_query` is `bind_replace`, the call DISAPPEARS at bind into a
+--   subquery, and DuckDB then pushes the caller's predicate into the generated SQL itself.
 --   ⚠ It is available here ONLY because this function's arguments are BIND-TIME CONSTANTS (a rules
 --     relation and a source mode). A per-row surface cannot take this path — the recorded rejection
 --     of `fluid_replacement_query` as the EVALUATION surface still stands.

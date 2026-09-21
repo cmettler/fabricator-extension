@@ -874,7 +874,22 @@ case "$TIER" in
         #   Four mutants, each at its own row: R (metadata rows dropped) §5, S (postprocessing bound
         #   against the inputs only) the correct-output row, U (no VARCHAR fallback) §6's
         #   other-columns-still-checked row, T (no `not checked`) the row after it.
-        : "${MIN_ASSERTIONS:=10023}"
+        # 2026-09-21: 10023 -> 10040. verify_host_query 107 -> 124 — the projection section, from a
+        #   USER-REPORTED crash. `fabricator_host_query` / `_host_exec` / `fabricator_scan` never set
+        #   TableFunction::projection_pushdown, while the ArrowStreamScan they share fills the output
+        #   chunk by walking output_column_ids and writing slot k from output_source_pos[k] — correct
+        #   ONLY when DuckDB has NARROWED the chunk. Without the flag DuckDB returns a FULL-WIDTH chunk
+        #   while still reporting the needed subset, so the k-th needed column lands in slot k.
+        #   ⚠⚠ TWO failure modes and BOTH are fatal: different types raised INTERNAL "Vector::Reference
+        #   used on vector of different type" and INVALIDATED THE DATABASE; the SAME type SEGFAULTED
+        #   (slot 1 never written). An earlier note of mine called the same-type case "vacuous" — wrong,
+        #   and wrong in the direction that made it look smaller.
+        #   ⚠ `SELECT *` and `SELECT <first column>` work whatever the bug does (position 0 -> slot 0),
+        #   which is why it survived and why both are kept as the CONTROLS.
+        #   Mutants: removing the host_query flag dies at the mixed-type row, removing the
+        #   fabricator_scan flag dies at the publish() row. The host_exec flag is UNGATED (one column,
+        #   so only the empty projection differs) and the suite says so rather than implying coverage.
+        : "${MIN_ASSERTIONS:=10040}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh
