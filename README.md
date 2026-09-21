@@ -3107,6 +3107,82 @@ SELECT c.id, d.decision FROM customers c CROSS APPLY dbo.evaluate(c.region, c.ag
 > ⚠ An inline TVF cannot carry `ORDER BY`, so the table form does not order its rows under `RuleOrder`;
 > the caller orders. The scalar form does order, because `FOR JSON` permits it.
 
+### Checking a decision table: `decision_check` and `decision_coverage`
+
+A decision table is code, and its two failure modes are both **silent**: a cell that does not mean what it
+looks like, and an input combination nobody wrote a rule for. Neither raises anything — you get a wrong
+answer or a NULL. These two functions are the answer to each.
+
+**`decision_check(rules)` — what every cell compiles to.** One row per cell, plus the metadata rows,
+with the SQL it becomes and a verdict:
+
+```sql
+SELECT rulepos, col, cell, sql, verdict FROM decision_check('decision_rules');
+-- rulepos | col    | cell             | sql                                 | verdict
+--      -1 | age    | FLOAT            | CAST(NULL AS FLOAT)                 | ok
+--       0 | age    | floor(?)         | (floor(age))                        | ok
+--       1 | region | EU, US           | preprocessed.region IN ('EU', 'US') | ok
+--       1 | risk   | @amount * 0.0001 | preprocessed.amount * 0.0001        | ok
+--       2 | age    | [21 .. 65]       | preprocessed.age >= 21 AND prep...  | ok
+```
+
+A table with two faults in it — one that parses and means the wrong thing, one that parses and
+resolves to nothing:
+
+```sql
+-- rules: (1, 'COLLATE "C"', '> @aege', 'yes'), (2, '', '', 'no')
+SELECT rulepos, col, cell, sql, verdict FROM decision_check('suspect') WHERE verdict <> 'ok';
+-- 1 | age    | > @aege     | preprocessed.age > preprocessed.aege | does not bind: … Binder Error …
+-- 1 | region | COLLATE "C" | preprocessed.region = 'COLLATE "C"'  | reads as a condition
+```
+
+> **⚠⚠ Its real value is the `sql` column, not the verdicts.** "What does this table actually compile
+> to" cannot be answered by reading the rules. Being a **relation**, it can be reviewed in a PR, diffed
+> between two versions of a rules table, or stored beside the decision it produced.
+>
+> **⚠⚠ It binds.** Every rendered cell is compiled against a typed-NULL context built from the
+> datatypes row, so a mistyped column (`@aege`), an unknown function (`contain`) or a type mismatch is
+> reported **per cell** with the engine's own sentence — including DuckDB's *"did you mean"* — instead
+> of arriving as one binder error at CREATE time. It binds via `EXPLAIN`, so nothing executes.
+>
+> **⚠⚠ It covers the metadata rows, where a fault costs more.** The datatypes row becomes a `CAST` in
+> every rule of its column and the pre/postprocessing row wraps every rule of its column, so one
+> mistake there breaks the column rather than one rule.
+>
+> ⚠ One host round trip per non-wildcard cell (~0.35 ms): a review tool, not something for a hot path.
+
+**`decision_coverage(rules)` — the input combinations you forgot.** It mines boundary values out of the
+rules themselves (every literal, its neighbours, NULL, and a string matching nothing), evaluates every
+combination, and reports the ones that fall through or that two rules claim with different answers:
+
+```sql
+-- rules: (1,'EU, US','[0 .. 17]','minor'), (2,'EU, US','[21 .. 65]','adult'),
+--        (3,'EU','[21 .. 65]','euro-adult')
+SELECT issue, region, age, matched_rules FROM decision_coverage('bands') WHERE region = 'EU';
+-- issue   | region | age    | matched_rules
+-- gap     | EU     |     18 | []       -- [0 .. 17] and [21 .. 65] do not tile
+-- gap     | EU     |     66 | []       -- nothing past the top band
+-- gap     | EU     |   NULL | []       -- every rule is a comparison; NULL decides nothing
+-- overlap | EU     |     21 | [2, 3]   -- two rules match and disagree
+```
+
+> **⚠ It is not a completeness proof** — it is a finite, mechanical search of the places errors live.
+> A hole at 19 between two mined boundaries is not reached.
+>
+> ⚠ A final unconditional rule is **not** an overlap; that is what `First` means. Rules whose input
+> cells are all blank are excluded, or the commonest idiom in the language would flag itself.
+>
+> ⚠ The case count is the **product** of the per-column counts, so it is bounded by `max_cases`
+> (100 000) and the refusal names the number it would have generated.
+>
+> ⚠⚠ **Filter its output in an outer query, not in the same `WHERE`.** A pushable filter sitting beside
+> a differently-typed `OR` — `WHERE region = 'EU' AND (age IN (18,21) OR age IS NULL)` — currently trips
+> a DuckDB internal error that ends the connection
+> ([known-limitations.md](docs/known-limitations.md) §1.27). `decision_check` is not affected.
+
+Full reference, including what each verdict means and why one bad datatype reports once rather than
+poisoning the whole report: [docs/decision-tables.md](docs/decision-tables.md).
+
 ### Provider views
 
 A provider can also ship **views** bound into an attached catalog's schemas. Unlike a macro, a view is a

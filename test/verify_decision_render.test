@@ -639,7 +639,7 @@ query T
 SELECT list_aggregate(parameters, 'string_agg', ',') FROM duckdb_functions()
  WHERE function_name = 'decision_render' GROUP BY 1;
 ----
-rules,name,form,is_temporary,source,hit_policy
+rules,name,form,is_temporary,strict,source,hit_policy
 
 # ... while the PARSER still takes a dialect — that is what decision_render_tsql passes 'tsql' to, and
 # it is the reason the CELL GRAMMAR cannot drift between the two engines.
@@ -1314,3 +1314,86 @@ query I
 SELECT count(*) FROM duckdb_functions() WHERE function_name = 'tmp_ctl';
 ----
 1
+
+# ==============================================================================================
+# §20  THE STRICT AUDIT — the parser decides, the ENGINE'S parser audits the decision.
+# ==============================================================================================
+# ⚠⚠ THIS IS THE ONLY SILENT BUG CLASS THIS FILE HAS. A cell the parser does not recognise falls to the
+# string fallback and renders an equality against its own TEXT — valid SQL that is ALWAYS FALSE, with
+# nothing failing anywhere. The keyword list has been correct since §15 was written, but A LIST CAN
+# ALWAYS HAVE A GAP and the engine's parser cannot. So for every DISTINCT input cell the parser QUOTED,
+# `strict := true` (the default) asks DuckDB whether `<column> <cell>` would have parsed as a condition.
+#
+# ⚠ IT AUDITS RATHER THAN PROMOTES, deliberately: letting the probe turn such a cell INTO a condition
+# would create the mirror-image silent failure — a genuine literal that happens to parse would quietly
+# become a predicate. Refusing cannot invent a wrong answer.
+
+statement ok
+CREATE TABLE audit_t (rulepos INT, region VARCHAR, decision VARCHAR);
+
+statement ok
+INSERT INTO audit_t VALUES (-2,'in','out'), (-1,'VARCHAR','VARCHAR'),
+    (1,'COLLATE "C"','x'), (2,'','y');
+
+statement error
+SELECT decision_render('audit_t');
+----
+read as LITERALS but are valid CONDITIONS
+
+# ⚠ The message NAMES the cell, because the fix is to rewrite that cell and a message that only said
+# "a cell is ambiguous" would not say which.
+statement error
+SELECT decision_render('audit_t');
+----
+COLLATE
+
+# ⚠⚠ BOTH ESCAPES, and they are the same two every other ambiguity in this renderer offers. QUOTE the
+# cell to mean it literally ...
+statement ok
+CREATE TABLE audit_q (rulepos INT, region VARCHAR, decision VARCHAR);
+
+statement ok
+INSERT INTO audit_q VALUES (-2,'in','out'), (-1,'VARCHAR','VARCHAR'),
+    (1,'''COLLATE "C"''','x'), (2,'','y');
+
+query T
+SELECT regexp_matches(decision_render('audit_q'), 'preprocessed\.region = ''COLLATE')::VARCHAR;
+----
+true
+
+# ... or render anyway.
+query T
+SELECT regexp_matches(decision_render('audit_t', strict := false), 'MACRO decision_eval')::VARCHAR;
+----
+true
+
+# ⚠ THE CONTROL: an ordinary table of plain literals must be untouched by the audit. Without this row,
+# "strict refuses" would be equally true of a build that refused everything.
+query T
+SELECT regexp_matches(decision_render('dr'), 'MACRO decision_eval')::VARCHAR;
+----
+true
+
+# ⚠⚠ THE GAP THE AUDIT FOUND ON ITS FIRST REAL TABLE: `IS TRUE` / `IS FALSE` / `IS UNKNOWN` were missing
+# from the keyword list — `IS NULL` and `IS [NOT] DISTINCT FROM` were there, these were not — so a
+# BOOLEAN input whose cell read `IS TRUE` rendered `flag = 'IS TRUE'`. Always false, silent, and exactly
+# the shape §15 was written against. Fixed in the parser; this section is why it was noticed.
+
+statement ok
+CREATE TABLE flags (rulepos INT, flag VARCHAR, decision VARCHAR);
+
+statement ok
+INSERT INTO flags VALUES (-2,'in','out'), (-1,'BOOLEAN','VARCHAR'), (1,'IS TRUE','yes'), (2,'','no');
+
+statement ok
+SELECT fabricator_host_exec(decision_render('flags', name := 'ev_flags'));
+
+query TT
+SELECT one(ev_flags({'flag': true})).decision, one(ev_flags({'flag': false})).decision;
+----
+yes	no
+
+query T
+SELECT regexp_matches(decision_render('flags'), 'WHEN 1 THEN preprocessed\.flag IS TRUE')::VARCHAR;
+----
+true

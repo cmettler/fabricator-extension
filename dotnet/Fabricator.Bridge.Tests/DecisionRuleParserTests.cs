@@ -221,7 +221,24 @@ public class DecisionRuleParserTests
     [InlineData("@region IS NOT NULL", "region", "region IS NOT NULL")]
     [InlineData("@region IS DISTINCT FROM @other", "region", "region IS DISTINCT FROM other")]
     [InlineData("@region IS NOT DISTINCT FROM @other", "region", "region IS NOT DISTINCT FROM other")]
+    // ⚠⚠ IS TRUE / IS FALSE / IS UNKNOWN were in the same hole IS NULL was in until 2026-09-16, and they
+    // were found on 2026-09-20 by the STRICT AUDIT rather than by reading the list — `IS TRUE` on a
+    // BOOLEAN input rendered `flag = 'IS TRUE'`, always false and silent. A keyword list can always have
+    // a gap; that is why the audit exists as well as this row.
+    [InlineData("@flag IS TRUE", "flag", "flag IS TRUE")]
+    [InlineData("@flag IS NOT TRUE", "flag", "flag IS NOT TRUE")]
+    [InlineData("@flag IS FALSE", "flag", "flag IS FALSE")]
+    [InlineData("@flag IS UNKNOWN", "flag", "flag IS UNKNOWN")]
     public void Pattern_and_null_operators_are_full_conditions(string cell, string column, string expected)
+        => Assert.Equal(expected, DecisionRuleParser.ParseCondition(cell, column));
+
+    // ⚠ The NATURAL spelling too — the column implicit on the left, which is what a cell IS. The
+    // equivalence with the written-out form above is what §2 of verify_decision_render asserts.
+    [Theory]
+    [InlineData("IS TRUE", "flag", "flag IS TRUE")]
+    [InlineData("IS NOT FALSE", "flag", "flag IS NOT FALSE")]
+    [InlineData("IS UNKNOWN", "flag", "flag IS UNKNOWN")]
+    public void Boolean_is_predicates_take_the_column_on_their_left(string cell, string column, string expected)
         => Assert.Equal(expected, DecisionRuleParser.ParseCondition(cell, column));
 
     // ⚠ `?` EMBEDDED in a keyword condition substitutes the column where it stands, which is a different

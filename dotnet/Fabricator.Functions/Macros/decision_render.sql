@@ -138,7 +138,7 @@
 --   ⚠ EVERY REFUSAL RAISES rather than returning a diagnostic STRING, because the answer here is SQL
 --     TEXT: a caller is about to execute it, and text that merely describes a problem would be run.
 CREATE OR REPLACE MACRO decision_render(rules, name := 'decision_eval', form := 'scalar',
-                                        is_temporary := false, source := 'auto',
+                                        is_temporary := false, strict := true, source := 'auto',
                                         hit_policy := NULL::VARCHAR) AS
 fluid_render($$
 {%- comment -%}
@@ -262,11 +262,17 @@ cells AS (
     {%- endfor %}
 ),
 parsed AS (
-    SELECT c.col, m3.ord, c.rulepos, m3.dir,
+    SELECT c.col, m3.ord, c.rulepos, m3.dir, c.cell,
            (c.cell IN ('', '*')) AS wild,
            CASE WHEN m3.dir = 'in'  THEN dmn_condition(c.cell, 'preprocessed.' || m3.param, $d, 'preprocessed.')
                 WHEN c.cell = ''    THEN 'NULL'
-                ELSE dmn_value(c.cell, $d, 'preprocessed.') END AS sql
+                ELSE dmn_value(c.cell, $d, 'preprocessed.') END AS sql,
+           -- ⚠⚠ DID THE PARSER FALL THROUGH TO A QUOTED LITERAL? Reconstructed EXACTLY rather than
+           -- guessed: the fallback renders `<col> = '<cell, quotes doubled>'`, so rebuilding that and
+           -- comparing identifies the branch the parser took. MEASURED to separate `EU` (fallback) from
+           -- `= 5`, `> 18`, `EU, US`, `not RU`, `IS NULL` and `42` (all other branches).
+           dmn_condition(c.cell, 'preprocessed.' || m3.param, $d, 'preprocessed.')
+             = 'preprocessed.' || m3.param || ' = ''' || replace(c.cell, '''', '''''') || '''' AS is_fb
     FROM cells c JOIN m3 ON m3.col = c.col
     WHERE m3.dir IN ('in', 'out')
 ),
@@ -305,6 +311,11 @@ SELECT
                  ELSE string_agg(rulepos::VARCHAR, ', ' ORDER BY rulepos) END
      FROM rp) AS bad_rulepos,
     (SELECT string_agg(col, ', ' ORDER BY ord) FROM m3 WHERE dir = 'out')     AS out_names_csv,
+
+    -- ⚠⚠ THE STRICT AUDIT'S INPUT: every DISTINCT input cell the parser QUOTED AS A LITERAL. Distinct
+    -- because the verdict depends only on the cell TEXT, which is what keeps the probe cheap — measured
+    -- at ~0.1 ms each, so a table's worth of distinct cells costs a few ms rather than tens.
+    (SELECT list(DISTINCT cell) FROM parsed WHERE dir = 'in' AND NOT wild AND is_fb) AS suspect_cells,
 
     -- SCALAR form only: the `params` CTE that unpacks the input STRUCT into named, cast columns
     (SELECT string_agg('input[''' || param || ''']' || coalesce('::' || dt, '') || ' AS ' || param,
@@ -404,6 +415,51 @@ SELECT
 {%- elsif p.n_rules == 0 -%}
     {%- capture _m -%}decision_render: {{ params.rules }} has metadata rows but no rules (no row with rulepos >= 1).{%- endcapture -%}
     {%- query _e m: _m -%}SELECT 1 AS e WHERE error($m){%- endquery -%}
+{%- endif -%}
+
+{%- comment -%}
+  ⚠⚠ THE STRICT AUDIT — `strict := true` (the DEFAULT). THE PARSER STILL DECIDES; THE ENGINE'S OWN
+  PARSER AUDITS THE DECISION. For every DISTINCT input cell the parser QUOTED AS A LITERAL, ask DuckDB
+  whether `<column> <cell>` would have parsed as a CONDITION. If it would, the cell almost certainly
+  meant to be one and was misread — so it is REFUSED BY NAME rather than rendered as an equality
+  against its own text.
+
+  ⚠⚠ THIS IS THE BUG CLASS THE WHOLE FILE IS WRITTEN AGAINST, and it is the only one that is SILENT.
+  Before the keyword list learned `SIMILAR TO`, a cell reading `SIMILAR TO 'E.*'` rendered
+  `region = 'SIMILAR TO ''E.*'''` — valid SQL that is ALWAYS FALSE, with nothing failing anywhere. The
+  list has been correct since, but a LIST CAN ALWAYS HAVE A GAP and the engine's parser cannot.
+
+  ⚠ IT AUDITS RATHER THAN REPLACES, deliberately. Letting the probe PROMOTE a cell to a condition would
+  create the mirror-image silent failure — a genuine literal that happens to parse would quietly become
+  a predicate. Refusing cannot invent a wrong answer; it can only ask the author to be explicit.
+
+  ⚠ THE TAIL, MEASURED AND ACCEPTED: a cell that parses as a non-boolean EXPRESSION is flagged too —
+  `COLLATE "C"` parses (and even binds) in this position. Contrived as a band label, and the escape is
+  the same one every other ambiguity here has: QUOTE THE CELL.
+
+  ⚠ `json_serialize_sql` RETURNS its errors rather than throwing, which is what makes one query able to
+  judge every cell at once; and it takes a CONSTANT, which is why the probes are generated here from
+  the plan's list rather than computed set-based over the cells.
+{%- endcomment -%}
+{%- if params.strict and p.suspect_cells and p.suspect_cells.size > 0 -%}
+    {%- capture _probe -%}
+        {%- for c in p.suspect_cells -%}
+            {%- unless forloop.first %} UNION ALL {% endunless -%}
+            {%- capture _one -%}SELECT CASE WHEN dmn_c {{ c }} THEN 1 END{%- endcapture -%}
+            SELECT {{ c | sql }} AS cell, NOT (json_serialize_sql({{ _one | sql }})->>'error')::BOOLEAN AS reads_as_condition
+        {%- endfor -%}
+    {%- endcapture -%}
+    {%- query _verdict -%}{{ _probe }}{%- endquery -%}
+    {%- assign bad = '' -%}
+    {%- for v in _verdict -%}
+        {%- if v.reads_as_condition -%}
+            {%- capture bad -%}{{ bad }}{% unless bad == blank %}, {% endunless %}`{{ v.cell }}`{%- endcapture -%}
+        {%- endif -%}
+    {%- endfor -%}
+    {%- if bad != blank -%}
+        {%- capture _m -%}decision_render: these input cells were read as LITERALS but are valid CONDITIONS in DuckDB, which would render an equality against the cell's own text — always false, and silent: {{ bad }}. Write the condition in a form the cell parser knows, or QUOTE the cell to mean it literally. Pass strict := false to render anyway.{%- endcapture -%}
+        {%- query _e m: _m -%}SELECT 1 AS e WHERE error($m){%- endquery -%}
+    {%- endif -%}
 {%- endif -%}
 
 {%- comment -%}
@@ -598,5 +654,6 @@ SELECT (
 )
 {%- endif -%}
 $$, params := {'rules': rules, 'name': name, 'form': form, 'is_temporary': is_temporary,
+               'strict': strict,
                'source': source,
                'hit_policy': hit_policy});

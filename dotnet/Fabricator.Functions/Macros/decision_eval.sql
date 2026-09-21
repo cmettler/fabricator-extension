@@ -54,6 +54,12 @@
 --     it saves. It also makes a SELECT write database objects, which is a surprise nobody asked for.
 --     A real in-memory cache belongs in a C# scalar function, where the store is an ordinary static
 --     dictionary and the lookup is free; that is the version to build if 26 us a row is too slow.
+--   ⚠⚠ SINCE 2026-09-20 EACH RENDER ALSO RUNS decision_render's STRICT AUDIT, and it is ON here on
+--     purpose: a definition arriving as DATA is exactly the one nobody rendered by hand, so it is the
+--     one most likely to carry a cell the parser misreads. MEASURED cost of leaving it on: 20480 rows
+--     0.647 -> **0.817 s**, i.e. ~17 ms per chunk (+26%), because the audit re-answers the same
+--     question once per chunk. ⇒ if that bites, the obvious next step is to let this macro pass
+--     `strict` through so a caller who has already validated a definition can turn it off.
 --   => **If every row shares ONE decision table, do not use this.** Render it once with
 --     decision_render and call the macro — `form := 'table'` decides a whole relation in one pass and
 --     was measured at ~7 us a row, roughly four times faster.

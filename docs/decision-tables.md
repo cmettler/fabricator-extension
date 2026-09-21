@@ -184,6 +184,33 @@ An input cell is a **predicate fragment about its own column**, with the column 
 | `?` placeholder | `contains(?, 'x')` | `contains(region, 'x')` |
 | cross-column ref | `> @age` | `amount > age` |
 
+### ⚠⚠ The strict audit — `strict := true`
+
+An unrecognised cell is the one **silent** failure this engine has: it falls to the string fallback and
+renders an equality against its own *text*, which is valid SQL that is always false. The keyword list
+below is correct today, but **a list can always have a gap and the engine's parser cannot**. So for
+every distinct input cell the parser quoted as a literal, `decision_render` asks DuckDB whether
+`<column> <cell>` would have parsed as a *condition* — and refuses by name if it would.
+
+```
+decision_render: these input cells were read as LITERALS but are valid CONDITIONS in DuckDB, which
+would render an equality against the cell's own text — always false, and silent: `COLLATE "C"`.
+Write the condition in a form the cell parser knows, or QUOTE the cell to mean it literally.
+Pass strict := false to render anyway.
+```
+
+> **⚠ It audits rather than promotes**, deliberately. Letting the probe turn such a cell *into* a
+> condition would create the mirror-image silent failure — a genuine literal that happens to parse
+> would quietly become a predicate. Refusing cannot invent a wrong answer.
+>
+> ⚠ **The tail, measured and accepted**: a cell that parses as a non-boolean *expression* is flagged too
+> (`COLLATE "C"` parses, and even binds, in that position). Contrived as a band label, and the escape is
+> the usual one — quote the cell.
+>
+> ⚠⚠ **It found a live gap on its first real table**: `IS TRUE` / `IS FALSE` / `IS UNKNOWN` were missing
+> from the keyword list — `IS NULL` and `IS [NOT] DISTINCT FROM` were there, these were not — so a
+> BOOLEAN input whose cell read `IS TRUE` rendered `flag = 'IS TRUE'`. Now parsed properly.
+
 ### Things worth knowing before you author a table
 
 - **A missing operator keyword is the dangerous direction.** An unrecognised keyword falls to the string
@@ -571,7 +598,156 @@ spellings and fail loudly at CREATE (*"Type DOUBLE is not a defined system type"
 
 ---
 
-## 13. Where the tests are
+## 13. `decision_coverage` — the combinations you forgot
+
+The strict audit (§2) answers *"is this cell understood"*. This answers *"is every input covered"* —
+the harder half, and where DMN is generally weakest, because a forgotten combination fails **silently**:
+a NULL decision, or whichever rule happened to be first.
+
+```sql
+SELECT * FROM decision_coverage('decision_rules');
+-- issue   | region | age | matched_rules
+-- gap     | EU     | 18  | []
+-- overlap | EU     | 21  | [2, 3]
+```
+
+| `issue` | |
+|---|---|
+| `gap` | **no** rule matches — the decision is NULL and nobody asked for that |
+| `overlap` | two **specific** rules match and disagree, so which wins depends on rule order |
+
+`matched_rules` names them, which is what makes a row actionable. An empty result means every generated
+case is covered, once or consistently.
+
+### The cases are mined out of the rules themselves
+
+Each input cell is rendered to SQL and its **literals are read back out**, so the values tried are
+exactly the ones the rules talk about, plus the points either side:
+
+| | |
+|---|---|
+| every string literal in that column's cells | `'EU'`, `'US'` |
+| every number, **and ±1** | `18` → `17, 18, 19` |
+| `NULL` | the case everyone forgets |
+| one string matching no literal | `'__dmn_no_match__'` |
+
+> **⚠⚠ The ±1 is the whole point for bands.** `[0 .. 17]` and `[21 .. 65]` *look* complete until you try
+> 18. No cell is malformed and nothing in the rules says the bands must tile, so no parser can see it —
+> only evaluating the boundary can.
+>
+> **⚠⚠ A catch-all is not an overlap.** A final unconditional rule overlaps every other rule and
+> disagrees with it — that is what `First` *means*. Measured before this was handled: an ordinary
+> two-band table plus an `otherwise` reported three overlaps, i.e. the commonest idiom in the language
+> flagged itself. Rules whose every input cell is blank are therefore excluded from the overlap test.
+>
+> ⚠ **It is not a completeness proof** — it is a finite, mechanical search of the places errors live.
+> The hole `18..20` is found at 18 and 20 because those are adjacent to literals; 19 is not generated.
+>
+> ⚠ **It is a cross product**, so the case count is the product of the per-column counts. `max_cases`
+> (default 100000) refuses and names the count rather than hanging. Past four or five inputs you want
+> pairwise coverage, which this does not do.
+
+---
+
+> ⚠⚠ **Filter its output in an OUTER query.** A pushable filter beside a differently-typed `OR` in the
+> same `WHERE` trips a DuckDB internal error that invalidates the connection
+> ([known-limitations.md](known-limitations.md) §1.27). `decision_check` escapes it by being built on
+> `fluid_replacement_query`; this one cannot, because it stages a temp macro the generated SQL calls.
+
+---
+
+## 14. `decision_check` — what the table compiles to
+
+One row per cell, with the SQL it becomes and a verdict.
+
+```sql
+SELECT * FROM decision_check('decision_rules');
+-- rulepos | col    | direction | cell        | sql                                 | verdict
+--      -1 | age    | in        | INTEGER     | CAST(NULL AS INTEGER)               | ok
+--       0 | label  | out       | upper(?)    | (upper(label))                      | ok
+--       1 | region | in        | EU, US      | preprocessed.region IN ('EU', 'US') | ok
+--       2 | region | in        | COLLATE "C" | preprocessed.region = 'COLLATE "C"' | reads as a condition
+```
+
+| `verdict` | |
+|---|---|
+| `ok` | the cell compiles to what it looks like |
+| `reads as a condition` | quoted as a literal, but the engine would have parsed `<column> <cell>` as a **condition** — the silent failure `decision_render` refuses on |
+| `does not bind:` … | the cell's SQL does not resolve — a mistyped column, an unknown function, a type mismatch — followed by the engine's own message |
+| `not checked:` … | this column's **datatypes** row does not bind, so nothing about its cells can be judged — see the cry-wolf note below |
+
+> **⚠⚠ Its real value is the `sql` column, not the verdicts.** "What does this decision table actually
+> compile to" cannot be answered by reading the rules — and being a **relation**, this can be reviewed,
+> diffed between two versions of a rules table, or stored beside the decision it produced. It covers
+> **output** cells too, which the strict audit does not.
+>
+> **⚠⚠ It binds.** Every cell's SQL is bound against a typed-NULL context built from the datatypes row
+> — `FROM (SELECT NULL::VARCHAR AS region, NULL::INTEGER AS age) AS preprocessed` — so a mistyped
+> column, an unknown function or a type mismatch is reported **per cell**, with the engine's own
+> sentence, instead of arriving as one binder error against generated SQL at CREATE time.
+>
+> **⚠⚠ This page previously said the bind layer was impossible, and that was wrong.** The measurement
+> behind it was right — a bind error does throw, and `PREPARE` raises rather than deferring — but the
+> conclusion was not: a throw only needs somewhere to be *caught*, and a C# scalar is somewhere.
+> `dmn_bind_check(sql)` wraps the attempt in a `try` and returns NULL or the message, which makes it an
+> ordinary per-row expression and therefore set-based here. *"It cannot be done"* meant *"it cannot be
+> done in Liquid"*.
+>
+> ⚠ It binds via `EXPLAIN`, so a cell calling a function with side effects cannot fire one — and it
+> costs one host round trip per non-wildcard cell (~0.35 ms), which is why this is a review tool rather
+> than something for a hot path.
+>
+> ⚠ `reads as a condition` still has its tail: a cell that binds as a non-boolean *expression* is
+> reported too (`COLLATE "C"` does). Read the `sql` column — that is what it is for.
+
+### ⚠⚠ The metadata rows are checked too, and a fault in one is worse
+
+User-raised: *"we could check the outputs as well, as these can also be expressions?"* Output **cells**
+already were — §4's rendering is what `decision_check` reports, and a typo in one binds like any other.
+What was **not** covered is the two rows that apply to a whole **column**:
+
+| row | what a fault there costs |
+|---|---|
+| `rulepos = -1`, the datatype | becomes a `CAST` in **every rule** of that column |
+| `rulepos = 0`, pre/postprocessing | an expression wrapped around **every rule** of that column |
+
+Measured before this existed: `uppr(?)` in a postprocessing row produced **no row here at all** and
+surfaced later as one binder error at CREATE. One wrong cell breaks one rule; one wrong metadata row
+breaks the column.
+
+> ⚠ `?` means different things by direction — the **input** column in a preprocessing expression, the
+> **output** column in a postprocessing one — so the two are rendered separately and the postprocessing
+> probe binds against a context that carries the outputs as well. Bound against the inputs alone,
+> `round(?, 1)` on an output would report a phantom *"column score does not exist"* on a table with
+> nothing wrong with it.
+
+### ⚠⚠ One bad datatype reports once — the cry-wolf case
+
+The datatypes row builds the very context everything else is bound against, so a bad type poisons the
+check itself. Measured with the naive version: one `INTEGERR` made **five of six rows** report *"Type
+with name INTEGERR does not exist"* — one mistake, five rows — and the single row that escaped did so
+**arbitrarily** (a fallback-literal cell binds against its own inline context, not this one). A checker
+that reports five things for one mistake trains you to ignore it, which is the same failure
+[`decision_coverage`](#13-decision_coverage--the-combinations-you-forgot) avoids for catch-all rules.
+
+So the type is bind-checked **as the context is built**, and an unusable one falls back to `VARCHAR`:
+
+- every **other** column is still checked, rather than being blinded by a fault in a third column;
+- the `rulepos = -1` row still reports the real fault, **once**, with the type's own name;
+- that column's own cells read `not checked: the datatypes row for <col> does not bind`, rather than
+  carrying a verdict the substitution invented (`Cannot compare values of type VARCHAR and INTEGER` is
+  a sentence about the substitute, not about the rules).
+
+⚠ It costs one round trip per **column**, not per cell.
+
+> ⚠ **Residual, stated rather than chased:** a cell in a *good* column that references a *bad* one
+> (`@age` where `age` carries the unusable type) binds against the substitute, so it can still report a
+> spurious type complaint. Per-column is the right granularity — suppressing every column that any
+> other column mentions would blind the report again — and the row naming the root cause sorts first.
+
+---
+
+## 15. Where the tests are
 
 | what | where |
 |---|---|
@@ -580,6 +756,8 @@ spellings and fail loudly at CREATE (*"Type DOUBLE is not a defined system type"
 | the renderer end to end | `test/verify_decision_render.test` |
 | `decision_eval` end to end | `test/verify_decision_eval.test` |
 | the T-SQL renderer, deployed to a real SQL Server | `test/verify_decision_render_tsql.test` (service tier) |
+| `decision_coverage` end to end | `test/verify_decision_coverage.test` |
+| `decision_check` end to end | `test/verify_decision_check.test` |
 
 The suite's sections map to this page: §3 the ported engine's own documented answers in both forms, §4
 preprocessing reaching the rules, §5 aggregate mode, §6 the LATERAL expansion and how the two forms diverge

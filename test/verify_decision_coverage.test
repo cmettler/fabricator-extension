@@ -1,0 +1,162 @@
+# name: test/verify_decision_coverage.test
+# description: decision_coverage(rules) — finds the input combinations a decision table FORGETS (gap) or
+#              DOUBLE-COVERS with disagreeing rules (overlap), by mining boundary cases out of the rules
+#              themselves and evaluating every one. See
+#              dotnet/Fabricator.Functions/Macros/decision_coverage.sql.
+# group: [fabricator]
+#
+# ⚠⚠ THIS IS THE HALF THE STRICT AUDIT CANNOT REACH. The audit answers "is this cell understood"; this
+#   answers "is every input covered", which is where DMN is generally weakest — a forgotten combination
+#   fails SILENTLY, as a NULL decision or as whichever rule happened to be first.
+#   ⚠ It is NOT a completeness proof. It is a finite, mechanical search of the places errors live.
+
+require fabricator
+
+require json
+
+# ==============================================================================================
+# §1  REGISTRATION.
+# ==============================================================================================
+
+query TT
+SELECT function_name, function_type FROM duckdb_functions()
+ WHERE function_name = 'decision_coverage' GROUP BY 1, 2;
+----
+decision_coverage	table_macro
+
+# ==============================================================================================
+# §2  A GAP BETWEEN BANDS — the case the ±1 boundary values exist for.
+# ==============================================================================================
+# ⚠⚠ `[0 .. 17]` and `[21 .. 65]` LOOK complete until you try 18. Nothing in the rules text says the
+# bands must tile, and no cell is malformed, so no parser can see this — only evaluating the boundary
+# can. The mined values come from the rules themselves: 0, 17, 21, 65 and each of their neighbours.
+
+statement ok
+CREATE TABLE bands (rulepos INT, region VARCHAR, age VARCHAR, decision VARCHAR);
+
+statement ok
+INSERT INTO bands VALUES
+    (-2,'in','in','out'), (-1,'VARCHAR','INTEGER','VARCHAR'),
+    (1,'EU, US','[0 .. 17]','minor'),
+    (2,'EU, US','[21 .. 65]','adult'),
+    (3,'EU','[21 .. 65]','euro-adult');
+
+# The hole is 18..20, and 18 and 20 are what the mined boundaries reach (19 is not adjacent to any
+# literal, which is exactly the limitation this technique has and does not hide).
+query TI
+SELECT issue, age FROM decision_coverage('bands')
+WHERE region = 'EU' AND age IN (18, 20) ORDER BY age;
+----
+gap	18
+gap	20
+
+# ⚠ NULL is generated deliberately and is a REAL gap here: every rule is a comparison, and a comparison
+# against NULL is NULL, so this table decides nothing for a missing input.
+query T
+SELECT issue FROM decision_coverage('bands') WHERE region = 'EU' AND age IS NULL;
+----
+gap
+
+# ==============================================================================================
+# §3  AN OVERLAP — and `matched_rules` NAMES the rules that collide.
+# ==============================================================================================
+# ⚠ Rules 2 and 3 both match EU/21-65 and disagree ('adult' vs 'euro-adult'), so which one wins depends
+# on rule ORDER. Reporting the rule numbers is what makes the row actionable — "something overlaps"
+# would not say what to edit.
+
+query TTT
+SELECT issue, age::VARCHAR, matched_rules::VARCHAR FROM decision_coverage('bands')
+WHERE issue = 'overlap' AND age = 21;
+----
+overlap	21	[2, 3]
+
+# ==============================================================================================
+# §4  ⚠⚠ A CATCH-ALL IS NOT AN OVERLAP, AND THIS IS THE ROW THAT KEEPS THE TOOL USABLE.
+# ==============================================================================================
+# A final unconditional rule overlaps EVERY other rule and disagrees with it — that is what `First`
+# MEANS. MEASURED before this was handled: an ordinary two-band table plus an `otherwise` reported THREE
+# overlaps, i.e. the commonest idiom in the language flagged itself. A checker that cries wolf on the
+# normal case trains you to ignore it.
+# ⇒ rules whose every input cell is blank are excluded from the overlap test, and an overlap counts only
+#   when TWO SPECIFIC rules match.
+
+statement ok
+CREATE TABLE tiled (rulepos INT, age VARCHAR, decision VARCHAR);
+
+statement ok
+INSERT INTO tiled VALUES (-2,'in','out'), (-1,'INTEGER','VARCHAR'),
+    (1,'< 18','minor'), (2,'>= 18','adult'), (3,'','unknown');
+
+query I
+SELECT count(*) FROM decision_coverage('tiled');
+----
+0
+
+# ⚠⚠ THE CONTROL, and §4 is worthless without it: the same table WITHOUT the catch-all must still report
+# its one real gap. Otherwise "reports nothing" would be equally true of a build that had stopped
+# looking. `< 18` and `>= 18` tile the integers, so NULL is the only hole left.
+
+statement ok
+CREATE TABLE nocatch (rulepos INT, age VARCHAR, decision VARCHAR);
+
+statement ok
+INSERT INTO nocatch VALUES (-2,'in','out'), (-1,'INTEGER','VARCHAR'),
+    (1,'< 18','minor'), (2,'>= 18','adult');
+
+query TT
+SELECT issue, coalesce(age::VARCHAR, '<null>') FROM decision_coverage('nocatch');
+----
+gap	<null>
+
+# ==============================================================================================
+# §5  THE VALUES ARE MINED FROM THE RULES — including a string that matches nothing.
+# ==============================================================================================
+# ⚠ A string column needs a value matching NO literal or a forgotten `else` is invisible: with rules for
+# 'EU' and 'US' only, nothing in the rules text ever mentions 'JP'. The sentinel supplies it.
+
+statement ok
+CREATE TABLE regions (rulepos INT, region VARCHAR, decision VARCHAR);
+
+statement ok
+INSERT INTO regions VALUES (-2,'in','out'), (-1,'VARCHAR','VARCHAR'),
+    (1,'EU','euro'), (2,'US','dollar');
+
+query TT
+SELECT issue, region FROM decision_coverage('regions') WHERE region NOT IN ('EU','US') ORDER BY region;
+----
+gap	__dmn_no_match__
+
+# ⚠ ... and the values the rules DO mention are covered, so they are absent from the report.
+query I
+SELECT count(*) FROM decision_coverage('regions') WHERE region IN ('EU','US');
+----
+0
+
+# ==============================================================================================
+# §6  THE SIZE GUARD — a cross product, refused rather than run.
+# ==============================================================================================
+# ⚠ The case count is the PRODUCT of the per-column counts. Refusing names the number, because the
+# failure mode otherwise is a query that looks like it hung.
+
+statement error
+SELECT * FROM decision_coverage('bands', max_cases := 5);
+----
+over the max_cases limit
+
+# ⚠ The refusal names the count too, so the caller can judge whether to raise the limit or cover fewer
+# inputs at a time.
+statement error
+SELECT * FROM decision_coverage('bands', max_cases := 5);
+----
+generate 52 cases
+
+statement ok
+CREATE TABLE noin_c (rulepos INT, a VARCHAR);
+
+statement ok
+INSERT INTO noin_c VALUES (-2,'out'),(1,'x');
+
+statement error
+SELECT * FROM decision_coverage('noin_c');
+----
+no column marked 'in'

@@ -1,0 +1,266 @@
+# name: test/verify_decision_check.test
+# description: decision_check(rules) — one row per cell showing what it COMPILES TO, with a verdict.
+#              The reviewable artifact for a decision table. See
+#              dotnet/Fabricator.Functions/Macros/decision_check.sql.
+# group: [fabricator]
+#
+# ⚠⚠ ITS REAL VALUE IS THE `sql` COLUMN, not the verdicts: "what does this decision table actually
+#   compile to" cannot be answered by reading the rules, and it is the question that matters when the
+#   rules are a production artifact. Being a RELATION, it can be reviewed, diffed between two versions
+#   of a rules table, or stored beside the decision it produced.
+
+require fabricator
+
+require json
+
+query TT
+SELECT function_name, function_type FROM duckdb_functions()
+ WHERE function_name = 'decision_check' GROUP BY 1, 2;
+----
+decision_check	table_macro
+
+statement ok
+CREATE TABLE mixed (rulepos INT, region VARCHAR, age VARCHAR, decision VARCHAR);
+
+statement ok
+INSERT INTO mixed VALUES
+    (-2,'in','in','out'), (-1,'VARCHAR','INTEGER','VARCHAR'),
+    (1,'EU, US','> 18','approve'),
+    (2,'COLLATE "C"','','suspicious'),
+    (3,'','','@age * 2');
+
+# ==============================================================================================
+# §1  EVERY CELL, AND THE SQL IT BECOMES — inputs AND outputs.
+# ==============================================================================================
+# ⚠ The rendering comes from the SAME parser the generated macro uses, so this reports what will
+# actually run rather than a second opinion about it.
+
+query TT
+SELECT cell, sql FROM decision_check('mixed') WHERE rulepos = 1 AND col = 'region';
+----
+EU, US	preprocessed.region IN ('EU', 'US')
+
+# ⚠ OUTPUT cells too, which the strict audit does not cover: a `@ref` resolves, a bare word is quoted.
+query TT
+SELECT (SELECT sql FROM decision_check('mixed') WHERE rulepos = 3 AND col = 'decision'),
+       (SELECT sql FROM decision_check('mixed') WHERE rulepos = 1 AND col = 'decision');
+----
+preprocessed.age * 2	'approve'
+
+# ⚠ A WILDCARD compiles to TRUE and is reported as such — so "this rule ignores this column" is visible
+# rather than being an absent row the reader has to notice.
+query TT
+SELECT sql, verdict FROM decision_check('mixed') WHERE rulepos = 3 AND col = 'region';
+----
+TRUE	ok
+
+# One row per cell of every rule for both directions, PLUS the metadata rows (§5) — 3 rules x 3
+# columns, and 3 datatype rows.
+query I
+SELECT count(*) FROM decision_check('mixed');
+----
+12
+
+# ==============================================================================================
+# §2  THE VERDICT — the one SILENT failure mode, reported rather than refused.
+# ==============================================================================================
+# ⚠⚠ `decision_render` REFUSES a cell that was quoted but reads as a condition (strict := true). Here it
+# is REPORTED, which is the difference between the two surfaces: the renderer must not emit something
+# silently wrong, while this one is for reviewing a whole table at once — including the cells that are
+# fine.
+
+query TTT
+SELECT cell, sql, verdict FROM decision_check('mixed') WHERE verdict <> 'ok';
+----
+COLLATE "C"	preprocessed.region = 'COLLATE "C"'	reads as a condition
+
+# ⚠ THE CONTROL: everything else is `ok`, so the row above is a judgement rather than a build that
+# flags whatever it is shown.
+query I
+SELECT count(*) FROM decision_check('mixed') WHERE verdict = 'ok';
+----
+11
+
+# ⚠⚠ A TABLE WITH NOTHING WRONG REPORTS NOTHING WRONG — and the count proves it still looked.
+statement ok
+CREATE TABLE clean_c (rulepos INT, region VARCHAR, decision VARCHAR);
+
+statement ok
+INSERT INTO clean_c VALUES (-2,'in','out'), (-1,'VARCHAR','VARCHAR'),
+    (1,'EU','euro'), (2,'not RU','other'), (3,'','rest');
+
+query II
+SELECT count(*) FILTER (WHERE verdict <> 'ok'), count(*) FROM decision_check('clean_c');
+----
+0	8
+
+# ==============================================================================================
+# §3  IT BINDS — the layer parsing cannot reach.
+# ==============================================================================================
+# ⚠⚠ Every cell's SQL is bound against a TYPED-NULL context built from the datatypes row, so a mistyped
+# column, an unknown function or a type mismatch is reported PER CELL with the engine's own sentence,
+# instead of surfacing as one binder error against generated SQL at CREATE time.
+#
+# ⚠⚠ THIS WAS FIRST SHIPPED AS "IMPOSSIBLE", AND THE CORRECTION IS THE POINT. A bind error really does
+# throw, and PREPARE really does raise rather than defer — both measured. But a throw only needs
+# somewhere to be CAUGHT, and a C# scalar is somewhere: `dmn_bind_check` wraps the attempt in a try and
+# returns NULL or the message, which makes it an ordinary per-row expression. "It cannot be done"
+# meant "it cannot be done in Liquid".
+
+statement ok
+CREATE TABLE binder (rulepos INT, age VARCHAR, note VARCHAR, decision VARCHAR);
+
+statement ok
+INSERT INTO binder VALUES (-2,'in','in','out'), (-1,'INTEGER','VARCHAR','VARCHAR'),
+    (1,'> @aege','','typo-in-a-ref'),
+    (2,'','contain(?, ''x'')','typo-in-a-function'),
+    (3,'','','ok');
+
+# ⚠ A mistyped column reference — the cell parses perfectly and means nothing.
+query TT
+SELECT cell, verdict LIKE 'does not bind:%' FROM decision_check('binder')
+WHERE rulepos = 1 AND col = 'age';
+----
+> @aege	true
+
+# ⚠ ... and the engine's own sentence is carried through, because "does not bind" without the reason
+# would send the reader back to the generated SQL, which is what this function exists to avoid.
+query T
+SELECT verdict LIKE '%aege%' FROM decision_check('binder') WHERE rulepos = 1 AND col = 'age';
+----
+true
+
+# A misspelled FUNCTION, which no amount of parsing can catch — DuckDB even suggests the right one.
+query TT
+SELECT verdict LIKE 'does not bind:%', verdict LIKE '%contains%'
+FROM decision_check('binder') WHERE rulepos = 2 AND col = 'note';
+----
+true	true
+
+# ⚠ THE CONTROL: the rest of that same table binds, so the rows above are a judgement rather than a
+# build that reports everything.
+query I
+SELECT count(*) FROM decision_check('binder') WHERE verdict = 'ok';
+----
+10
+
+# ==============================================================================================
+# §4  IT AGREES WITH THE RENDERER, which is what makes it a review tool rather than a second opinion.
+# ==============================================================================================
+# ⚠ The same cell that `decision_check` calls `reads as a condition` is the one `decision_render`
+# refuses. If these two ever disagree, one of them is lying about what the macro will do.
+
+statement error
+SELECT decision_render('mixed');
+----
+read as LITERALS but are valid CONDITIONS
+
+# ... and the cell it names is the cell this reports.
+query T
+SELECT cell FROM decision_check('mixed') WHERE verdict = 'reads as a condition';
+----
+COLLATE "C"
+
+# ==============================================================================================
+# §5  THE METADATA ROWS ARE CHECKED TOO — and a fault in one is WORSE than a fault in a cell.
+# ==============================================================================================
+# ⚠⚠ User-raised (*"we could check the outputs as well, as these can also be expressions?"*). Output
+# CELLS were already covered — §1 shows their SQL and §3's `binder` table proves a typo in one is
+# reported. What was NOT covered is the rows that apply to a whole COLUMN: `rulepos = -1` (the datatype,
+# which becomes a CAST in every rule) and `rulepos = 0` (pre/postprocessing, an expression wrapped
+# around every rule). MEASURED before this: `uppr(?)` in a postprocessing row produced NO ROW here at
+# all and surfaced later as one binder error at CREATE.
+
+statement ok
+CREATE TABLE outs (rulepos INT, region VARCHAR, age VARCHAR, label VARCHAR, score VARCHAR);
+
+statement ok
+INSERT INTO outs VALUES (-2,'in','in','out','out'),
+    (-1,'VARCHAR','INTEGER','VARCHAR','DOUBLE'),
+    (0,'','floor(?)','uppr(?)','round(?, 1)'),
+    (1,'EU','> 18','yes','0.5'),
+    (2,'','','no','0.25');
+
+# ⚠⚠ A POSTPROCESSING typo, reported against the row that carries it.
+query TTT
+SELECT col, sql, verdict LIKE 'does not bind:%' FROM decision_check('outs')
+WHERE rulepos = 0 AND col = 'label';
+----
+label	(uppr(label))	true
+
+# ⚠⚠ THE `?` MEANS DIFFERENT THINGS BY DIRECTION, which is why the two are rendered separately: in a
+# PREPROCESSING row it is the INPUT column, in a POSTPROCESSING row the OUTPUT column. `upper(?)` on an
+# output binds only against a context carrying the outputs — bound against the inputs alone it would
+# report a phantom "column does not exist" on a perfectly good expression.
+query TT
+SELECT sql, verdict FROM decision_check('outs') WHERE rulepos = 0 AND col = 'age';
+----
+(floor(age))	ok
+
+# ⚠⚠ ... and this is the row that makes that load-bearing: a CORRECT postprocessing expression on an
+# OUTPUT column. Bound against the inputs alone it would report a phantom "column score does not
+# exist", i.e. the checker inventing a fault in a table that has none.
+query TT
+SELECT sql, verdict FROM decision_check('outs') WHERE rulepos = 0 AND col = 'score';
+----
+(round(score, 1))	ok
+
+# ⚠ THE CONTROL: exactly one thing is wrong in that table, so the row above is a judgement.
+query I
+SELECT count(*) FROM decision_check('outs') WHERE verdict <> 'ok';
+----
+1
+
+# The datatypes row appears as the CAST it becomes.
+query TT
+SELECT cell, sql FROM decision_check('outs') WHERE rulepos = -1 AND col = 'age';
+----
+INTEGER	CAST(NULL AS INTEGER)
+
+# ==============================================================================================
+# §6  ⚠⚠ ONE BAD DATATYPE REPORTS ONCE — the cry-wolf case, and it took a second mechanism.
+# ==============================================================================================
+# The datatypes row builds the very context every other cell is bound against, so a bad type poisons
+# the check itself. MEASURED with the naive version: one `INTEGERR` made FIVE of six rows report
+# "Type with name INTEGERR does not exist" — one mistake, five rows — and the single row that escaped
+# did so ARBITRARILY (a fallback-literal cell binds against its own inline context).
+# ⇒ the type is bind-checked as the context is built and an unusable one falls back to VARCHAR, so
+#   every OTHER column is still checked; and the affected column's own cells are marked `not checked`
+#   rather than being given a verdict the substitution invented.
+
+statement ok
+CREATE TABLE baddt (rulepos INT, region VARCHAR, age VARCHAR, label VARCHAR);
+
+statement ok
+INSERT INTO baddt VALUES (-2,'in','in','out'), (-1,'VARCHAR','INTEGERR','VARCHAR'),
+    (1,'EU','> 18','yes');
+
+# The fault is reported on the row that carries it, carrying the type's own name.
+query TT
+SELECT col, verdict LIKE '%INTEGERR%' FROM decision_check('baddt')
+WHERE rulepos = -1 AND verdict LIKE 'does not bind:%';
+----
+age	true
+
+# ⚠⚠ THE POINT OF THE FALLBACK, and it comes FIRST so it has a mutant of its own: the OTHER columns
+# are still checked, so one broken type does not blind the whole report. Without it these were
+# casualties of a fault in a third column.
+query I
+SELECT count(*) FROM decision_check('baddt') WHERE col <> 'age' AND verdict <> 'ok';
+----
+0
+
+# ⚠⚠ ... and the cell that CANNOT be judged says so, instead of being given a fault the VARCHAR
+# substitution invented (`Cannot compare values of type VARCHAR and INTEGER` — a sentence about the
+# substitute, not about the rules).
+query TT
+SELECT sql, verdict FROM decision_check('baddt') WHERE rulepos = 1 AND col = 'age';
+----
+preprocessed.age > 18	not checked: the datatypes row for age does not bind
+
+# ⚠⚠ ... so ONE mistake produces exactly ONE "does not bind". The naive version produced five, and
+# the one row that escaped did so arbitrarily.
+query I
+SELECT count(*) FROM decision_check('baddt') WHERE verdict LIKE 'does not bind:%';
+----
+1

@@ -47,6 +47,7 @@ authority, and its comments record what each raise bought. Anything they cover w
 | ~~1.25~~ | **FIXED 2026-09-12.** A `LIMIT` satisfied BEFORE a streaming in-out operator was pulled again used to fail with `Invalid Error: resource deadlock would occur` — `SELECT … FROM my_inout(…) LIMIT 1` — on `fluid_query_inout`, the first-party global in-outs and every provider-declared `_each`. ⚠ It was never "any bare `LIMIT`": over a 4-row input `LIMIT` 1/3/4 failed and **`LIMIT 10` was fine**, because the operator is then pulled again, hits END and releases; `ORDER BY … LIMIT` was fine for the same reason (a pipeline breaker drains it to END first), which is why no suite caught it | **The operator holds its gate across a `HAVE_MORE_OUTPUT` return and releases it only on its NEXT invocation, so an early-stopped pipeline ABANDONED the tenure and the finalize hook then blocked on it.** Fixed by releasing from the in-out's LOCAL STATE DESTRUCTOR — no new primitive, no thread-identity assumption, `FinishEof` untouched. ⚠⚠ **THE FIRST ATTEMPT WAS STRICTLY WORSE THAN THE BUG AND IS WORTH KNOWING ABOUT:** having `FinishEof` recognise and ADOPT its own tenure fixes only the case where the finalize hook runs on the holding thread — MEASURED to be the MINORITY (`verify_plugin_fluid`: 15 calls, `owns=1` **zero** times) — and converts the rest from a loud `EDEADLK` into a silent HANG (that suite hung at 400 s where it had merely failed). It was built, measured and reverted. ⚠⚠ **THREE MEASUREMENTS MADE THE DESTRUCTOR THE RIGHT PLACE**, and the second is what avoided a concurrency-primitive swap: a local state dies BEFORE `OperatorFinalize`; it dies ON THE THREAD THAT TOOK ITS OWN LOCK (so `unlock()` there is legal, since a `std::mutex` may only be unlocked by its owner); and `FinishEof` runs on a FOREIGN thread. ⚠ Gate: `verify_global_functions` 178 → **189**, one mutant dying at the `LIMIT 1` row after 178 pass — and its LOAD-BEARING row is the FOREIGN-THREAD case (a `LIMIT` over a parallel `UNION ALL`), because every single-branch probe was green while the first attempt hung. Full record: [fluid-templating.md](fluid-templating.md) §37.5-§37.7 |
 | ~~1.20~~ | **WITHDRAWN 2026-08-22 — there was no defect. The raw loadable loads fine in a stock DuckDB 1.5.5 wheel; what crashed was MY TEST VENV.** Kept as a row rather than deleted because the methodology lesson is worth more than the row was: **before recording a defect seen in a local environment, verify the environment is the one users have.** | Bounded by loading a CI-BUILT artifact (the v0.0.11 windows Standalone asset) on this machine — it segfaulted too, which excluded our build tree — and then in a FRESH venv holding only the official `duckdb==1.5.5` wheel, where **both** the CI artifact and our local loadable load and report `0.0.11`. The culprit: the probe venv had duckdb pip-installed **from a local source tree** (`direct_url.json` = `file:///.../scratchpad/pyduck`, a `project(duckdb_python)` checkout), so its engine is a different build of the same version — 41,451,008 bytes against the official wheel's 37,374,464, and `Requires-Python >=3.11` against `>=3.10`. A version MATCH with an ABI MISMATCH is exactly a crash at load. ⚠ Note the sequence of my own errors: probe -> record a limitation -> narrow it twice -> discover it was never real. The CI evidence that made me downgrade it was right, and still not the same thing as bounding it. ⚠ Consequence worth keeping: dbt-duckdb and the notebook flow are UNAFFECTED, and `pyarrow` was tested and exonerated |
 | ~~1.26~~ | **FIXED 2026-09-15, hours after it was recorded.** `UPDATE … SET <a LIST / MAP / nested column>` was refused on the Delta provider with *"unsupported filter value type List"* — a message naming a FILTER although it was the SET value. It now works, on BOTH update paths | **The refusal was never a property of the format or of the writer — it was a CLR round trip.** Both UPDATE paths boxed every SET value and rebuilt an Arrow array from the boxes, and neither ladder (`ReadScalar` out, `BuildArray` back) had a list case. ⚠ The round trip exists for ONE real job, which the code states: a target-type conversion, so an incoming INT32 or a differently-united timestamp still lands as the column's declared type. So the fix is to do it only when there IS something to convert — when the incoming Arrow type already matches the target STRUCTURALLY, the array is handed through. ⚠⚠ **The two paths needed DIFFERENT fixes and fixing one alone would have been the worse outcome**: autocommit rebuilds a column (a passthrough), while an explicit transaction MERGES new values with untouched rows row by row in `BufferUpdateRows` (a concatenate + take). Same statement, and it would have worked outside a transaction and failed inside one. ⚠ Names are compared loosely on purpose — Arrow labels a list's child `item` and the parquet spec calls it `element`, so two faithful converters describing one `VARCHAR[]` disagree on a LABEL while the layout is identical; `ArrowTypeCompare.SameType` takes a `namesMatter` flag because CDC drift detection wants the opposite answer. ⚠ `BuildArray` still has NO list case, deliberately: a list needing a genuine conversion is REFUSED rather than silently rebuilt through boxes. Gate: `verify_update_set_columns` §7 (both paths, with the untouched rows as the control) and §8 (NOT NULL still enforced — the check used to ride that boxing) |
+| 1.27 | ⚠⚠ **A pushed filter beside a differently-typed `OR` raises a DuckDB INTERNAL error and INVALIDATES THE DATABASE** — the assertion-failure class, so the connection dies, not just the statement. `… WHERE region = 'EU' AND (age IN (18,21) OR age IS NULL)` over a `fluid_query`. **NOT FIXED.** Measured 2026-09-21 — the flip test, the workaround and where to look: [§1.27 in full](#127-in-full--the-flip-test-and-where-to-look) |
 
 **On 1.5 — what protects you today.** Two mechanisms now, and the second was built on 2026-08-17.
 
@@ -216,6 +217,90 @@ any rule in the host.
 
 ---
 
+
+### 1.27 in full — the flip test, and where to look
+
+A scan of a fabricator table function that gets **one pushable filter** plus a **non-pushable disjunction on
+a column of a different type** fails with
+
+```
+INTERNAL Error: Vector::Reference used on vector of different type (source INTEGER referenced VARCHAR)
+```
+
+after which the connection is dead: *"database has been invalidated because of a previous fatal error"*.
+This is the assertion-failure class, so it takes the whole database down, not just the statement.
+
+**Minimal reproduction** — five lines, no catalog, no provider, no decision table:
+
+```sql
+SELECT * FROM fluid_query($fab$
+  SELECT r AS region, a AS age
+  FROM (VALUES ('EU', 18), ('EU', 21), ('US', 18), ('EU', NULL)) t(r, a)
+$fab$, NULL)
+WHERE region = 'EU' AND (age IN (18, 21) OR age IS NULL);
+```
+
+**⚠⚠ It is POSITIONAL, and the flip test is what shows that** — the error names whichever pair of types the
+two columns have, in the order they appear:
+
+| predicate | result |
+|---|---|
+| `region = 'EU' AND (age IN (18,21) OR age IS NULL)` | `source INTEGER referenced VARCHAR` |
+| `age = 18 AND (region = 'EU' OR region IS NULL)` | `source VARCHAR referenced INTEGER` |
+| `region = 'EU' AND (region = 'US' OR region IS NULL)` | **ok** |
+| `age = 18 AND (age = 21 OR age IS NULL)` | **ok** |
+
+So a filter value is being read at the wrong index of the staged constants batch. Same-type cases pass
+**vacuously** — the mixup happens there too and is invisible, which is why this went unnoticed.
+
+⚠ **The projection is irrelevant**, checked rather than assumed: `SELECT *`, one column, two columns and
+all four all fail identically, and both single-predicate halves pass on their own. It is the *predicate
+shape* alone.
+
+⚠ **Pre-existing and not decision-table-specific.** It was found while running a README example for
+`decision_coverage`, but that macro never mentions `filters` or `projected` — the reproduction above uses
+only `fluid_query`, which nothing in that work touched.
+
+⚠ **Not yet attributed to a line.** The staging path is `LiveFilterNode` / `SerializeLiveFilters`
+(`src/fabricator/arrow_ingest.cpp`) into `BuildFilterValues`, consumed by `FluidFilterModel.DeclareVariables`
+(`dotnet/Fabricator.FluidPlugin/FluidFilterModel.cs`), whose `SET VARIABLE filters = …` is the statement the
+host reports failing. The OR branch's scratch-vector handling reads correctly on inspection, so the
+mismatch is somewhere between the emitted `v<n>` indexes and the batch those columns arrive in — **find it by
+instrumenting the two, not by reading further**; this page already records what a backwards read costs.
+
+### ⚠⚠ `fluid_replacement_query` AVOIDS IT ENTIRELY — and for an eligible function that is a FIX, not a workaround
+
+User-suggested, and measured the same day. `fluid_query` is an ordinary table function, so the scan's
+pushed filters are marshalled through the host — which is where the mis-indexing happens.
+`fluid_replacement_query` is `bind_replace`: **the call DISAPPEARS at bind into a subquery**, so there is
+no pushdown marshalling to get wrong, and DuckDB pushes the predicate into the generated SQL itself.
+
+```sql
+-- the crashing repro, one word changed — correct answer, connection alive
+SELECT * FROM fluid_replacement_query($fab$ SELECT r AS region, a AS age
+  FROM (VALUES ('EU',18),('EU',21),('US',18),('EU',NULL)) t(r,a) $fab$)
+WHERE region = 'EU' AND (age IN (18,21) OR age IS NULL);
+```
+
+**`decision_check` was moved onto it** and the shape that killed the connection
+(`WHERE col = 'age' AND (rulepos IN (1,2) OR rulepos IS NULL)`) now answers correctly.
+
+> **⚠⚠ THE ELIGIBILITY TEST IS "DOES THE RENDER LEAVE ANYTHING ON THE CONNECTION", NOT "ARE THE
+> ARGUMENTS CONSTANT"** — and getting that wrong is measurable rather than subtle. `decision_coverage`
+> has constant arguments too, and moving it broke immediately: it `exec()`s a TEMP MACRO that the
+> generated SQL then CALLS, and under bind_replace the render runs on its **own** connection while the
+> spliced SQL runs on the **caller's**, so *"Table Function with name `fab_cov_<md5>` does not exist!"*.
+> It therefore stays on `fluid_query` and stays exposed — escaping would need `decision_render` to emit
+> the table form's body as an inlinable subquery rather than a `CREATE MACRO`.
+>
+> ⚠ A **per-row** surface cannot take this path either: `fluid_replacement_query`'s arguments are
+> bind-time constants, which is the recorded reason it was rejected as the *evaluation* surface.
+
+**Otherwise:** rewrite the disjunction so it does not sit beside a pushable filter on a differently-typed
+column — `WHERE region = 'EU' AND coalesce(age IN (18,21), age IS NULL)` and
+`WHERE region = 'EU' AND age IS NOT DISTINCT FROM …` both avoid it, as does filtering in two steps.
+
+---
 ## 2. Claimed but NOT measured — treat as unproven
 
 | # | claim | why it is unproven, and what would settle it |

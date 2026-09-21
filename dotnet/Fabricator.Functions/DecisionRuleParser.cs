@@ -107,7 +107,7 @@ public static class DecisionRuleParser
     /// </para>
     /// </remarks>
     private static readonly Regex LeadingConditionKeyword = new(
-        @"^(LIKE|ILIKE|GLOB|REGEXP|SIMILAR\s+TO|IS\s+(?:NOT\s+)?NULL|IS\s+(?:NOT\s+)?DISTINCT\s+FROM)\b",
+        @"^(LIKE|ILIKE|GLOB|REGEXP|SIMILAR\s+TO|IS\s+(?:NOT\s+)?(?:NULL|TRUE|FALSE|UNKNOWN|DISTINCT\s+FROM))\b",
         RegexOptions.IgnoreCase);
     private static readonly Regex FunctionCallAtStart = new(@"^[a-zA-Z_]\w*\s*\(");
     private static readonly Regex ColumnRef = new(@"@(\w+)");
@@ -154,7 +154,7 @@ public static class DecisionRuleParser
     private static readonly Regex ConditionKeywords = new(
         @"\b(?:BETWEEN|LIKE|ILIKE|REGEXP|GLOB|IN)\b"
         + @"|\bSIMILAR\s+TO\b"
-        + @"|\bIS\s+(?:NOT\s+)?(?:NULL|DISTINCT\s+FROM)\b",
+        + @"|\bIS\s+(?:NOT\s+)?(?:NULL|TRUE|FALSE|UNKNOWN|DISTINCT\s+FROM)\b",
         RegexOptions.IgnoreCase);
     private static readonly Regex NamedFunctionCall = new(@"\b([a-zA-Z_]\w*)\s*\(");
 
@@ -358,7 +358,8 @@ public static class DecisionRuleParser
         // ─── 9. LEADING OPERATOR KEYWORD ──────────────────────────────────────────────────────────
         // CONTEXT : any input cell. Same family as 4/7/8 — THE COLUMN IS IMPLICIT ON THE LEFT, which is
         //           what a decision-table cell IS: a predicate fragment about its own column.
-        // PARSES  : LIKE ILIKE GLOB REGEXP | SIMILAR TO | IS [NOT] NULL | IS [NOT] DISTINCT FROM
+        // PARSES  : LIKE ILIKE GLOB REGEXP | SIMILAR TO | IS [NOT] NULL|TRUE|FALSE|UNKNOWN
+        //           | IS [NOT] DISTINCT FROM
         // SAMPLE  : `IS NULL`           on `region`  ⇒  region IS NULL
         //           `LIKE 'E%'`         on `region`  ⇒  region LIKE 'E%'
         //           `SIMILAR TO 'E.*'`  on `region`  ⇒  region SIMILAR TO 'E.*'

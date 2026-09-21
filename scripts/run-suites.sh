@@ -185,7 +185,18 @@ case "$TIER" in
         # the DISTINCT definitions of each chunk into TEMPORARY macros named by md5. ⚠ §4 asserts that it
         # leaves NONE of them behind — the obvious speed-up is to make them persistent, which would make an
         # ordinary SELECT write database objects; measured worth only ~15%, so that row is the guard.
-        : "${MIN_SUITES:=80}"
+        # 81 since 2026-09-20: verify_decision_coverage — decision_coverage(rules), which finds the
+        # input combinations a decision table FORGETS (gap) or double-covers with DISAGREEING rules
+        # (overlap). ⚠⚠ It is the half the strict audit cannot reach: the audit asks "is this cell
+        # understood", this asks "is every input covered", which is where DMN is weakest. The cases are
+        # MINED OUT OF THE RULES — every literal in a cell, every number +/-1, NULL, and one string
+        # matching nothing — then evaluated in ONE pass through the table form.
+        # 82 since 2026-09-21: verify_decision_check — decision_check(rules), one row per cell showing
+        # what it COMPILES TO plus a verdict. ⚠ Its value is the `sql` column: "what does this decision
+        # table actually compile to" cannot be answered by reading the rules, and being a RELATION it can
+        # be reviewed, diffed between two versions, or stored beside the decision it produced. It covers
+        # OUTPUT cells, which the strict audit does not.
+        : "${MIN_SUITES:=82}"
         # 5656 since 2026-08-02: verify_delta_catalog_transactions 943 -> 944 Ã¢ÂÂ ROLLBACK now RECLAIMS the
         # data files the transaction eagerly wrote (EW #52's DiscardDataFilesAsync) instead of leaving them
         # for VACUUM. +2, not +1: that suite is one of the DOUBLED ones below, so an assertion added to it
@@ -814,7 +825,56 @@ case "$TIER" in
         #   the only value it accepted. ⚠ Asserted on the parameter list rather than on the binder's
         #   refusal, because that message echoes the offending query text and would match for the wrong
         #   reason.
-        : "${MIN_ASSERTIONS:=9930}"
+        # 2026-09-20: 9930 -> 9945. verify_decision_render 411 -> 426 — THE STRICT AUDIT (`strict :=
+        #   true`, the default): for every DISTINCT input cell the parser QUOTED as a literal, ask
+        #   DuckDB whether `<column> <cell>` would have parsed as a CONDITION, and refuse BY NAME if it
+        #   would. ⚠⚠ That is the only SILENT bug class here — an unrecognised cell renders an equality
+        #   against its own text, always false, nothing failing. ⚠ It AUDITS rather than promotes:
+        #   letting the probe turn such a cell into a condition would create the mirror-image silent
+        #   failure. ⚠⚠ It found a live gap on its first real table — `IS TRUE`/`IS FALSE`/`IS UNKNOWN`
+        #   were missing from the keyword list, so a BOOLEAN input reading `IS TRUE` rendered
+        #   `flag = 'IS TRUE'`. Fixed in the parser (tier-0 433 -> 440). Mutant N (audit disabled) dies
+        #   at the first refusal row.
+        # 2026-09-20: 9945 -> 9974. A NEW suite, verify_decision_coverage (29) — see the MIN_SUITES
+        #   note above. ⚠⚠ Its §4 is the row that keeps the tool usable: a CATCH-ALL rule overlaps every
+        #   other rule and disagrees with it, which is what `First` MEANS — so without excluding
+        #   wildcard-only rules from the overlap test, an ordinary two-band table plus an `otherwise`
+        #   reported THREE overlaps. MEASURED, and a checker that cries wolf on the commonest idiom in
+        #   the language trains you to ignore it. Mutant O (exclusion removed) dies there.
+        #   ⚠ It reports matched_rules, not just a count: "rules 2 and 3 collide" is actionable where
+        #   "something overlaps" is not.
+        # 2026-09-21: 9974 -> 9995. A NEW suite, verify_decision_check (21) — see MIN_SUITES above.
+        #   ⚠⚠ Its clean-table CONTROL earned its place immediately: the first verdict chain reported
+        #   every ordinary literal (`EU`) as "does not parse", because a quoted literal is EXPECTED not
+        #   to parse as a condition and the fallback branch has to answer for BOTH outcomes before the
+        #   malformed test runs. A control that asserts "nothing is wrong here, and N cells were still
+        #   examined" is what caught it. Mutant P (every cell reported ok) dies at §2.
+        #   ⚠⚠ IT BINDS, via dmn_bind_check — and this comment first said that was IMPOSSIBLE, which was
+        #   wrong (user-challenged). A bind error DOES throw and PREPARE DOES raise rather than defer,
+        #   both measured; what the conclusion missed is that a throw only needs somewhere to be CAUGHT,
+        #   and a C# scalar is somewhere. "It cannot be done" meant "not in Liquid".
+        # 2026-09-21: 9995 -> 10003. verify_decision_check 21 -> 29 — the BIND layer (§3), added after
+        #   the impossibility claim above was corrected. It catches what parsing provably cannot,
+        #   including the case this tree recorded as unreachable: MADE IN USA -> "Referenced column USA
+        #   not found". Mutant Q (dmn_bind_check always reporting success) dies there.
+        # 2026-09-21: 10003 -> 10023. verify_decision_check 29 -> 49 — the METADATA ROWS (§5/§6),
+        #   user-raised ("we could check the outputs as well, as these can also be expressions?").
+        #   ⚠⚠ Output CELLS were already covered; what was not is the rows that apply to a whole
+        #   COLUMN — rulepos = -1 (a CAST in every rule) and rulepos = 0 (an expression wrapped around
+        #   every rule). MEASURED: `uppr(?)` in a postprocessing row produced NO ROW at all and
+        #   surfaced later as one binder error at CREATE. One wrong cell breaks one rule; one wrong
+        #   metadata row breaks the column.
+        #   ⚠⚠ AND IT NEEDED A SECOND MECHANISM, because the first version cried wolf: the datatypes
+        #   row builds the very context everything else is bound against, so one `INTEGERR` made FIVE
+        #   of six rows report it — and the single row that escaped did so ARBITRARILY (a
+        #   fallback-literal cell binds against its own inline context). The type is now bind-checked
+        #   as the context is built, an unusable one falls back to VARCHAR so every OTHER column is
+        #   still checked, and the affected column's own cells read `not checked` rather than carrying
+        #   a verdict the substitution invented.
+        #   Four mutants, each at its own row: R (metadata rows dropped) §5, S (postprocessing bound
+        #   against the inputs only) the correct-output row, U (no VARCHAR fallback) §6's
+        #   other-columns-still-checked row, T (no `not checked`) the row after it.
+        : "${MIN_ASSERTIONS:=10023}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

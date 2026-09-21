@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // See LICENSE in the project root for license information.
 
+using System;
 using System.Collections.Generic;
 using Apache.Arrow;
 using Apache.Arrow.Types;
@@ -39,6 +40,7 @@ internal static class DecisionFunctions
         new IScalarFunction[]
         {
             new DmnConditionFunction(),
+            new DmnBindCheckFunction(),
             new DmnValueFunction(),
             new DmnIsAggregateFunction(),
             new DmnRelationFunction(),
@@ -208,5 +210,118 @@ internal sealed class DmnRelationFunction : IScalarFunction
                 sources.IsNull(i) ? null : sources.GetString(i)));
         }
         return b.Build();
+    }
+}
+
+/// <summary>
+/// <c>dmn_bind_check(sql)</c> — NULL if that statement BINDS against the hosting DuckDB, otherwise the
+/// binder's own message. The layer parsing cannot reach: a mistyped column, an unknown function, a type
+/// mismatch.
+/// </summary>
+/// <remarks>
+/// <para>
+/// ⚠⚠ <b>IT EXISTS BECAUSE A BIND ERROR THROWS, AND THE ONLY PLACE THAT CAN CATCH ONE IS HERE.</b> A
+/// failing <c>{% query %}</c> propagates and kills the whole render, so a Liquid template cannot loop
+/// probes; and <c>json_serialize_sql</c>, which does return its errors instead of throwing, only PARSES.
+/// Wrapping the attempt in a C# <c>try</c> turns "throws" into "returns a message", which is what makes
+/// the check usable PER CELL and therefore set-based from SQL:
+/// <code>
+/// SELECT cell, dmn_bind_check('SELECT CASE WHEN ' || sql || ' THEN 1 END') FROM cells;
+/// </code>
+/// ⚠ An earlier note in this tree claimed the bind layer was impossible. It is not; it was in the wrong
+/// LANGUAGE. MEASURED beforehand: <c>PREPARE</c> raises at prepare time rather than deferring, so the
+/// throw is real — what was missing was somewhere to catch it.
+/// </para>
+/// <para>
+/// ⚠ <b>EXPLAIN, not execution.</b> The statement is bound and planned but never run, so a cell calling a
+/// function with side effects cannot fire one during a check. It also costs less.
+/// </para>
+/// <para>
+/// ⚠ ONE HOST ROUND TRIP PER ROW (~0.35 ms measured), so this is for a decision table's worth of cells,
+/// not for a column of a large relation. It is <see cref="IsVolatile"/> for that reason too: the answer
+/// depends on the catalog, not only on the argument.
+/// </para>
+/// </remarks>
+internal sealed class DmnBindCheckFunction : IScalarFunction
+{
+    public string Name => "dmn_bind_check";
+
+    public Schema Parameters => new(new[] { DecisionFunctions.Str("sql") }, metadata: null);
+
+    public Field Result => new("bind_error", StringType.Default, nullable: true);
+
+    /// <summary>⚠ The catalog can change between calls, so this is never folded.</summary>
+    public bool IsVolatile => true;
+
+    public IArrowArray Invoke(RecordBatch args)
+    {
+        var sqls = (StringArray)args.Column(0);
+        var b = new StringArray.Builder().Reserve(args.Length);
+        var host = FabricatorServices.Get<IHostQuery>();
+
+        for (int i = 0; i < args.Length; i++)
+        {
+            if (sqls.IsNull(i) || string.IsNullOrWhiteSpace(sqls.GetString(i)))
+            {
+                b.AppendNull();
+                continue;
+            }
+            if (host is null)
+            {
+                b.Append("dmn_bind_check: no host query service is available in this session");
+                continue;
+            }
+            try
+            {
+                // ⚠ The stream must be DRAINED (and disposed) or the error may not have surfaced yet —
+                // Query returns lazily, and a binder error is raised when the plan is built.
+                using var stream = host.Query("EXPLAIN " + sqls.GetString(i));
+                while (stream.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult() is { } batch)
+                {
+                    batch.Dispose();
+                }
+                b.AppendNull();
+            }
+            catch (Exception ex)
+            {
+                b.Append(Flatten(ex.Message));
+            }
+        }
+        return b.Build();
+    }
+
+    /// <summary>The engine's own sentence, on one line.</summary>
+    /// <remarks>
+    /// ⚠ The host wraps a failure in a JSON envelope (<c>host host_query failed: {"exception_type":…,
+    /// "exception_message":"…"}</c>), so the useful sentence is unwrapped out of it — a verdict column
+    /// reading <c>{"exception_type":"IO",…</c> would bury the one thing the reader needs. The raw text is
+    /// kept when it is not an envelope, because an unrecognised shape must not become an empty verdict.
+    /// </remarks>
+    private static string Flatten(string message)
+    {
+        var line = message;
+        const string key = "\"exception_message\":\"";
+        var at = line.IndexOf(key, StringComparison.Ordinal);
+        if (at >= 0)
+        {
+            var i = at + key.Length;
+            var sb = new System.Text.StringBuilder();
+            while (i < line.Length && line[i] != '"')
+            {
+                if (line[i] == (char)92 && i + 1 < line.Length)
+                {
+                    var c = line[i + 1];
+                    sb.Append(c == 'n' || c == 'r' || c == 't' ? ' ' : c);
+                    i += 2;
+                    continue;
+                }
+                sb.Append(line[i]);
+                i++;
+            }
+            if (sb.Length > 0) { line = sb.ToString(); }
+        }
+        line = line.Replace((char)13, ' ').Replace((char)10, ' ').Trim();
+        while (line.Contains("  ")) { line = line.Replace("  ", " "); }
+        return line.Length > 300 ? line.Substring(0, 300) : line;
     }
 }
