@@ -78,18 +78,25 @@ def test_fresh_install(duckdb, artifact: str) -> None:
             str(fluid_rows),
         )
         check(
-            con.execute("select fluid_render('builtin {{ who }}', {'who': 'provider'})").fetchone()[0]
+            con.execute(
+                "select fluid_render('builtin {{ params.who }}', {'who': 'provider'})").fetchone()[0]
             == "builtin provider",
             "the built-in Fluid renders (its package closure shipped in the managed directory)",
         )
         # /!\ A SECOND REGISTRATION PATH, not a second spelling of the one above. fluid_render arrives
-        # through IBackend.GlobalScalarFunctions and is registered as a DuckDB scalar; fluid_query arrives
-        # through GlobalSqlTableFunctions and is registered as a bind_replace TABLE function. Fluid is the
-        # only shipped provider using the latter at all, so a packaging or registration fault that reached
-        # only the sqlgen path would leave the check above passing.
+        # through IBackend.GlobalScalarFunctions and is registered as a DuckDB scalar;
+        # fluid_replacement_query arrives through GlobalSqlTableFunctions and is registered as a
+        # bind_replace TABLE function. Fluid is the only shipped provider using the latter at all, so a
+        # packaging or registration fault that reached only the sqlgen path would leave the check above
+        # passing.
+        # /!\ IT MUST STAY THE bind_replace FUNCTION. This used to call `fluid_query`, which was RENAMED
+        # to `fluid_replacement_query` and the name reused for an ORDINARY table function — so "fixing"
+        # this to the new `fluid_query` would silently stop covering the registration path the comment
+        # above says it exists to cover.
         check(
             con.execute(
-                "select * from fluid_query('select {{ n }} as n', params := {'n': 41})"
+                "select * from fluid_replacement_query("
+                "'select {{ params.n }} as n', params := {'n': 41})"
             ).fetchone()[0] == 41,
             "the built-in Fluid's SQL-generating table function binds and its generated SQL runs",
         )
