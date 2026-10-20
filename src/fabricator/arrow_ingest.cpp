@@ -359,17 +359,17 @@ static void SqlIdentIngest(const string &s, string &out) {
 // the scan to apply them: the join/topn re-applies), so returning false for them is always safe.
 static bool RenderTableFilter(const TableFilter &f, const string &qcol, string &out) {
 	switch (f.filter_type) {
-	case TableFilterType::OPTIONAL_FILTER: {
-		auto &opt = f.Cast<OptionalFilter>();
+	case TableFilterType::LEGACY_OPTIONAL_FILTER: {
+		auto &opt = f.Cast<LegacyOptionalFilter>();
 		if (!opt.child_filter) {
 			return false;
 		}
 		return RenderTableFilter(*opt.child_filter, qcol, out); // optional: fine to skip if child unrenderable
 	}
-	case TableFilterType::DYNAMIC_FILTER: {
-		// A runtime join/topn bound: DynamicFilter::ToString is a debug string, so reach the resolved inner
-		// ConstantFilter under the shared lock. Not yet materialized => skip (best-effort pruning).
-		auto &dyn = f.Cast<DynamicFilter>();
+	case TableFilterType::LEGACY_DYNAMIC_FILTER: {
+		// A runtime join/topn bound: LegacyDynamicFilter::ToString is a debug string, so reach the resolved inner
+		// LegacyConstantFilter under the shared lock. Not yet materialized => skip (best-effort pruning).
+		auto &dyn = f.Cast<LegacyDynamicFilter>();
 		if (!dyn.filter_data) {
 			return false;
 		}
@@ -380,9 +380,9 @@ static bool RenderTableFilter(const TableFilter &f, const string &qcol, string &
 		out += dyn.filter_data->filter->ToString(qcol);
 		return true;
 	}
-	case TableFilterType::BLOOM_FILTER:
-		return false; // probabilistic; not exact SQL — always OptionalFilter-wrapped, so skip-safe
-	case TableFilterType::STRUCT_EXTRACT: {
+	case TableFilterType::LEGACY_BLOOM_FILTER:
+		return false; // probabilistic; not exact SQL — always LegacyOptionalFilter-wrapped, so skip-safe
+	case TableFilterType::LEGACY_STRUCT_EXTRACT: {
 		// A struct-member filter (`WHERE (s).a = 5`, erased into the set under exact mode): rebase the
 		// child filter onto an explicit struct_extract — exact DuckDB SQL and robust to member names the
 		// bare ToString dot form (`"s".a`) would mis-quote. NOTE: on a COLUMN-MAPPED table this SQL still
@@ -390,7 +390,7 @@ static bool RenderTableFilter(const TableFilter &f, const string &qcol, string &
 		// children carry physical names inside the files) — that pre-existing combination fails loudly at
 		// the per-file bind; the fix belongs in the C# native reader (rebuild mapped structs logically).
 		// The codec exact path is fine: its per-batch filter runs over logically-renamed batches.
-		auto &sf = f.Cast<StructFilter>();
+		auto &sf = f.Cast<LegacyStructFilter>();
 		string member;
 		if (!sf.child_name.empty()) {
 			member = "struct_extract(" + qcol + ", '";
@@ -406,15 +406,15 @@ static bool RenderTableFilter(const TableFilter &f, const string &qcol, string &
 		}
 		return RenderTableFilter(*sf.child_filter, member, out);
 	}
-	case TableFilterType::CONJUNCTION_AND:
-	case TableFilterType::CONJUNCTION_OR: {
-		// Recurse per child (do NOT use ToString: a child may be an OptionalFilter/DynamicFilter whose
+	case TableFilterType::LEGACY_CONJUNCTION_AND:
+	case TableFilterType::LEGACY_CONJUNCTION_OR: {
+		// Recurse per child (do NOT use ToString: a child may be an LegacyOptionalFilter/LegacyDynamicFilter whose
 		// ToString is not plain SQL — "optional: …" — and would leak into the predicate).
-		bool is_and = f.filter_type == TableFilterType::CONJUNCTION_AND;
-		// ConjunctionFilter (the base holding child_filters) has no ::TYPE, so Cast<> the concrete subtype.
-		const ConjunctionFilter &conj =
-		    is_and ? static_cast<const ConjunctionFilter &>(f.Cast<ConjunctionAndFilter>())
-		           : static_cast<const ConjunctionFilter &>(f.Cast<ConjunctionOrFilter>());
+		bool is_and = f.filter_type == TableFilterType::LEGACY_CONJUNCTION_AND;
+		// LegacyConjunctionFilter (the base holding child_filters) has no ::TYPE, so Cast<> the concrete subtype.
+		const LegacyConjunctionFilter &conj =
+		    is_and ? static_cast<const LegacyConjunctionFilter &>(f.Cast<LegacyConjunctionAndFilter>())
+		           : static_cast<const LegacyConjunctionFilter &>(f.Cast<LegacyConjunctionOrFilter>());
 		vector<string> parts;
 		for (auto &child : conj.child_filters) {
 			string cs;
@@ -499,12 +499,12 @@ static void LiveJsonColumnRef(const vector<string> &path, string &out) {
 static bool LiveFilterNode(const TableFilter &f, vector<string> &path, const LogicalType &type,
                            vector<Value> &constants, bool string_order_pushable, string &out) {
 	switch (f.filter_type) {
-	case TableFilterType::OPTIONAL_FILTER: {
-		auto &opt = f.Cast<OptionalFilter>();
+	case TableFilterType::LEGACY_OPTIONAL_FILTER: {
+		auto &opt = f.Cast<LegacyOptionalFilter>();
 		return opt.child_filter && LiveFilterNode(*opt.child_filter, path, type, constants, string_order_pushable, out);
 	}
-	case TableFilterType::DYNAMIC_FILTER: {
-		auto &dyn = f.Cast<DynamicFilter>();
+	case TableFilterType::LEGACY_DYNAMIC_FILTER: {
+		auto &dyn = f.Cast<LegacyDynamicFilter>();
 		if (!dyn.filter_data) {
 			return false;
 		}
@@ -514,8 +514,8 @@ static bool LiveFilterNode(const TableFilter &f, vector<string> &path, const Log
 		}
 		return LiveFilterNode(*dyn.filter_data->filter, path, type, constants, string_order_pushable, out);
 	}
-	case TableFilterType::CONSTANT_COMPARISON: {
-		auto &cf = f.Cast<ConstantFilter>();
+	case TableFilterType::LEGACY_CONSTANT_COMPARISON: {
+		auto &cf = f.Cast<LegacyConstantFilter>();
 		const char *tok = LiveCmpToken(cf.comparison_type);
 		if (!tok || cf.constant.IsNull()) {
 			return false;
@@ -532,16 +532,16 @@ static bool LiveFilterNode(const TableFilter &f, vector<string> &path, const Log
 		out += ",\"val\":" + to_string(idx) + "}";
 		return true;
 	}
-	case TableFilterType::IS_NULL:
-	case TableFilterType::IS_NOT_NULL:
+	case TableFilterType::LEGACY_IS_NULL:
+	case TableFilterType::LEGACY_IS_NOT_NULL:
 		out += "{\"op\":\"";
-		out += f.filter_type == TableFilterType::IS_NULL ? "is_null" : "is_not_null";
+		out += f.filter_type == TableFilterType::LEGACY_IS_NULL ? "is_null" : "is_not_null";
 		out += "\",";
 		LiveJsonColumnRef(path, out);
 		out += "}";
 		return true;
-	case TableFilterType::IN_FILTER: {
-		auto &in = f.Cast<InFilter>();
+	case TableFilterType::LEGACY_IN_FILTER: {
+		auto &in = f.Cast<LegacyInFilter>();
 		if (in.values.empty()) {
 			return false;
 		}
@@ -563,8 +563,8 @@ static bool LiveFilterNode(const TableFilter &f, vector<string> &path, const Log
 		out += "]}";
 		return true;
 	}
-	case TableFilterType::STRUCT_EXTRACT: {
-		auto &sf = f.Cast<StructFilter>();
+	case TableFilterType::LEGACY_STRUCT_EXTRACT: {
+		auto &sf = f.Cast<LegacyStructFilter>();
 		if (type.id() != LogicalTypeId::STRUCT) {
 			return false;
 		}
@@ -580,12 +580,12 @@ static bool LiveFilterNode(const TableFilter &f, vector<string> &path, const Log
 		path.pop_back();
 		return ok;
 	}
-	case TableFilterType::CONJUNCTION_AND:
-	case TableFilterType::CONJUNCTION_OR: {
-		bool is_and = f.filter_type == TableFilterType::CONJUNCTION_AND;
-		const ConjunctionFilter &conj =
-		    is_and ? static_cast<const ConjunctionFilter &>(f.Cast<ConjunctionAndFilter>())
-		           : static_cast<const ConjunctionFilter &>(f.Cast<ConjunctionOrFilter>());
+	case TableFilterType::LEGACY_CONJUNCTION_AND:
+	case TableFilterType::LEGACY_CONJUNCTION_OR: {
+		bool is_and = f.filter_type == TableFilterType::LEGACY_CONJUNCTION_AND;
+		const LegacyConjunctionFilter &conj =
+		    is_and ? static_cast<const LegacyConjunctionFilter &>(f.Cast<LegacyConjunctionAndFilter>())
+		           : static_cast<const LegacyConjunctionFilter &>(f.Cast<LegacyConjunctionOrFilter>());
 		vector<string> parts;
 		// Constants appended by a dropped OR branch must not leak — stage into a scratch vector first.
 		vector<Value> scratch = constants;

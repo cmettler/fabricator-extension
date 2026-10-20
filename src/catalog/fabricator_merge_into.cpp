@@ -39,7 +39,9 @@
 #include "dml/fabricator_insert.hpp"
 #include "dml/fabricator_modify.hpp"
 
+#include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp" // 2.0: needed as a complete type here
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/execution/operator/persistent/physical_merge_into.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
@@ -103,8 +105,8 @@ static unique_ptr<MergeIntoOperator> PlanFabricatorMergeAction(FabricatorCatalog
 
 		FabricatorInsertTarget target;
 		target.returning = false; // MERGE ... RETURNING is refused below.
-		target.schema_name = op.table.schema.name;
-		target.table_name = op.table.name;
+		target.schema_name = op.table.schema.name.GetIdentifierName();
+		target.table_name = op.table.name.GetIdentifierName();
 		target.columns = op.table.GetColumns().GetColumnNames();
 		for (auto &col : op.table.GetColumns().Logical()) {
 			target.column_types.push_back(col.Type());

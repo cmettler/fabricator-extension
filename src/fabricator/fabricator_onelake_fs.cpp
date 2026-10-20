@@ -92,7 +92,7 @@ std::string ResolveCredJson(const std::string &path, optional_ptr<FileOpener> op
 				json += ",";
 			}
 			first = false;
-			json += "\"" + EscapeJson(field.first) + "\":\"" + EscapeJson(field.second.ToString()) + "\"";
+			json += "\"" + EscapeJson(field.first.GetIdentifierName()) + "\":\"" + EscapeJson(field.second.ToString()) + "\"";
 		}
 		json += "}";
 		return json;

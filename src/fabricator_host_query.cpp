@@ -326,7 +326,7 @@ void HostQueryRelease(ArrowArrayStream *stream) {
 // stream, then read the output schema from it (PopulateReturnSchema runs the factory once for the schema;
 // the scan runs it again for the data — like the other fabricator table functions).
 unique_ptr<FunctionData> HostQueryBind(ClientContext &context, TableFunctionBindInput &input,
-                                       vector<LogicalType> &return_types, vector<string> &names) {
+                                       vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto sql = input.inputs[0].GetValue<string>();
 	auto db = context.db; // shared_ptr<DatabaseInstance>; the fresh connection is opened on it per run
 	auto bind_data = make_uniq<fabricator::ArrowStreamBindData>();
@@ -564,7 +564,7 @@ static void HostExecScalarFunction(DataChunk &args, ExpressionState &state, Vect
 // Bind: the output schema is FIXED, so it is declared outright — no prepare, no execution, nothing to get
 // wrong. This is why exec runs its statement exactly once where query cannot always.
 unique_ptr<FunctionData> HostExecBind(ClientContext &context, TableFunctionBindInput &input,
-                                      vector<LogicalType> &return_types, vector<string> &names) {
+                                      vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto sql = input.inputs[0].GetValue<string>();
 	auto db = context.db;
 	auto bind_data = make_uniq<fabricator::ArrowStreamBindData>();
@@ -939,7 +939,7 @@ void HostQueryInterruptFreeService(void *interrupt_handle) {
 // fabricator_scan(name) — scan an ambient named source (registered in C# via Host.RegisterSource). The factory
 // asks the managed registry for a fresh stream by name (OpenNamedInput); reuses the arrow_ingest scan path.
 static unique_ptr<FunctionData> NamedScanBind(ClientContext &context, TableFunctionBindInput &input,
-                                              vector<LogicalType> &return_types, vector<string> &names) {
+                                              vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto name = input.inputs[0].GetValue<string>();
 	auto bind_data = make_uniq<fabricator::ArrowStreamBindData>();
 	bind_data->factory = [name](const fabricator::ArrowScanRequest &, ArrowArrayStream &out) {
@@ -1048,7 +1048,7 @@ void RegisterHostQuery(ExtensionLoader &loader) {
 	// the one to reach for with DDL. See docs/host-query.md.
 	ScalarFunction exec_scalar("fabricator_host_exec", {LogicalType::VARCHAR}, LogicalType::BIGINT,
 	                           HostExecScalarFunction);
-	exec_scalar.stability = FunctionStability::VOLATILE;
+	exec_scalar.GetStability() = FunctionStability::VOLATILE;
 	loader.RegisterFunction(exec_scalar);
 
 	TableFunction scan("fabricator_scan", {LogicalType::VARCHAR}, fabricator::ArrowStreamScan, NamedScanBind,

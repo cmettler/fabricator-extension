@@ -377,7 +377,7 @@ int32_t HostIsInterrupted(FabricatorHandle opener) {
 	if (!ctx) {
 		return 0;
 	}
-	return ctx->interrupted ? 1 : 0;
+	return ctx->IsInterrupted() ? 1 : 0;
 }
 
 void InstallHostFsServices() {
@@ -410,7 +410,7 @@ struct FsSpikeBindData : public TableFunctionData {
 };
 
 unique_ptr<FunctionData> FsSpikeBind(ClientContext &, TableFunctionBindInput &input, vector<LogicalType> &return_types,
-                                     vector<string> &names) {
+                                     vector<Identifier> &names) {
 	auto bind_data = make_uniq<FsSpikeBindData>();
 	bind_data->path = input.inputs[0].GetValue<string>();
 	return_types.push_back(LogicalType::VARCHAR);
@@ -458,7 +458,7 @@ struct FsWriteProbeBindData : public TableFunctionData {
 };
 
 unique_ptr<FunctionData> FsWriteProbeBind(ClientContext &, TableFunctionBindInput &input,
-                                          vector<LogicalType> &return_types, vector<string> &names) {
+                                          vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto bind_data = make_uniq<FsWriteProbeBindData>();
 	bind_data->base = input.inputs[0].GetValue<string>();
 	return_types.push_back(LogicalType::VARCHAR);

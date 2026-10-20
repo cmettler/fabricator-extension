@@ -662,6 +662,26 @@ static void FabricatorRefuseVarArgs(const string &func_name, const char *kind, c
 	}
 }
 
+// DuckDB 2.0 moved a function DEFINITION's declared parameter types onto its FunctionSignature: there is no
+// `arguments` vector and no `varargs` field any more (those names now belong to the BOUND form,
+// BoundSimpleFunction). This answers the one question every call site here asks — "what type did the
+// function DECLARE for slot i" — and reproduces the OLD contract exactly: the leading non-variadic
+// parameters are the fixed prefix (the old `arguments`), and everything past it takes the VAR_POSITIONAL
+// parameter's type (the old `varargs`). INVALID means "declared nothing for this slot".
+static LogicalType FabricatorDeclaredArgType(const FunctionSignature &sig, idx_t i) {
+	auto &params = sig.GetParameters();
+	idx_t fixed = 0;
+	while (fixed < params.size() && params[fixed].GetKind() != FunctionParameterKind::VAR_POSITIONAL) {
+		fixed++;
+	}
+	if (i < fixed) {
+		return params[i].GetType();
+	}
+	auto tail = sig.GetArgs();
+	return tail ? tail->GetType() : LogicalType(LogicalTypeId::INVALID);
+}
+
+
 //! Widens a declared (names, types) pair to the ACTUAL positional width of a variadic call, given the
 //! supplied values. A NON-VARIADIC function comes back byte-identical to its declaration, so callers need
 //! no second branch.
@@ -740,7 +760,7 @@ static unique_ptr<FunctionData> FabricatorScalarBind(ClientContext &context, Sca
 		// must be DEFERRED: PREPARE p AS SELECT f(?) cannot yet know what f returns. This is the mechanism
 		// DuckDB provides for exactly that (getvariable / strptime throw it too); without it the parameter
 		// would silently arrive as an UNKNOWN-typed placeholder and be reported as a runtime slot.
-		if (arg.HasParameter() || arg.return_type.id() == LogicalTypeId::UNKNOWN) {
+		if (arg.HasParameter() || arg.GetReturnType().id() == LogicalTypeId::UNKNOWN) {
 			throw ParameterNotResolvedException();
 		}
 		// Marshal as the DECLARED parameter type wherever that is concrete. DuckDB is about to insert
@@ -749,16 +769,13 @@ static unique_ptr<FunctionData> FabricatorScalarBind(ClientContext &context, Sca
 		// a cast. It also keeps an untyped NULL literal off the SQLNULL path below: `f(NULL, …)` against a
 		// declared VARCHAR parameter is a VARCHAR null here, exactly as at execute. Where the parameter is
 		// ANY there is no cast, so the expression's own type is what execute sees too.
-		LogicalType marshal_type = arg.return_type;
-		if (i < bound_function.arguments.size() && bound_function.arguments[i].id() != LogicalTypeId::ANY &&
-		    bound_function.arguments[i].id() != LogicalTypeId::INVALID) {
-			marshal_type = bound_function.arguments[i];
-		} else if (i >= bound_function.arguments.size() && bound_function.varargs.IsValid() &&
-		           bound_function.varargs.id() != LogicalTypeId::ANY) {
-			// A VARIADIC tail argument: past the fixed prefix there is no `arguments[i]` to read, and the
-			// cast DuckDB is about to insert targets `varargs`. Same reasoning as the branch above — an ANY
-			// tail gets no cast, so the expression's own type is what execute will see.
-			marshal_type = bound_function.varargs;
+		LogicalType marshal_type = arg.GetReturnType();
+		// One lookup now covers both the fixed prefix and the VARIADIC tail: past the prefix there is no
+		// per-slot type to read and the cast DuckDB is about to insert targets the tail's type instead.
+		// An ANY declaration gets no cast either way, so the expression's own type is what execute sees.
+		auto declared = FabricatorDeclaredArgType(bound_function.GetSignature(), i);
+		if (declared.id() != LogicalTypeId::ANY && declared.id() != LogicalTypeId::INVALID) {
+			marshal_type = declared;
 		}
 		bool folded = false;
 		Value value(marshal_type); // NULL placeholder for a runtime expression
@@ -989,7 +1006,9 @@ static ScalarFunction BuildFabricatorScalarFunction(FabricatorHandle handle, con
 	if (varargs_index != DConstants::INVALID_INDEX) {
 		// The declared parameters BEFORE the tail are now the MINIMUM arity; DuckDB accepts any number of
 		// further arguments, each implicitly cast to this type (ANY => no cast at all).
-		fn.varargs = FabricatorVarArgsType(arg_types[varargs_index]);
+		// 2.0: no `varargs` field. A variadic tail is a VAR_POSITIONAL parameter on the signature; the
+		// leading declared parameters stay the minimum arity exactly as before.
+		fn.GetSignature().AddArgs("args", FabricatorVarArgsType(arg_types[varargs_index]));
 	}
 	// Identity for the bind callback, which is a raw function pointer and cannot capture.
 	auto fn_info = make_shared_ptr<FabricatorScalarFunctionInfo>();
@@ -1400,16 +1419,16 @@ unique_ptr<FunctionData> FabricatorAggregateBind(ClientContext &context, Aggrega
 		auto &arg = *arguments[i];
 		// A still-unresolved prepared-statement parameter can neither be folded nor typed, so the bind must
 		// be DEFERRED — the same mechanism (and the same reason) as the scalar bind.
-		if (arg.HasParameter() || arg.return_type.id() == LogicalTypeId::UNKNOWN) {
+		if (arg.HasParameter() || arg.GetReturnType().id() == LogicalTypeId::UNKNOWN) {
 			throw ParameterNotResolvedException();
 		}
 		// Marshal as the DECLARED type wherever it is concrete: DuckDB inserts exactly that cast immediately
 		// after this bind returns (CastToFunctionArguments), so the bind's view of an argument AGREES with
 		// the batch update will see. An ANY parameter gets no cast, so the expression's own type is right.
-		LogicalType marshal_type = arg.return_type;
-		if (i < function.arguments.size() && function.arguments[i].id() != LogicalTypeId::ANY &&
-		    function.arguments[i].id() != LogicalTypeId::INVALID) {
-			marshal_type = function.arguments[i];
+		LogicalType marshal_type = arg.GetReturnType();
+		auto declared = FabricatorDeclaredArgType(function.GetSignature(), i);
+		if (declared.id() != LogicalTypeId::ANY && declared.id() != LogicalTypeId::INVALID) {
+			marshal_type = declared;
 		}
 		bool folded = false;
 		Value value(marshal_type); // NULL placeholder for a runtime expression
@@ -1922,7 +1941,7 @@ struct TableFnBindState {
 // output schema (return types) + pushdown + an opaque binding, then a scan factory runs tablefn_execute over
 // that binding per execution (which streams the result rows). See TableFnBindState + abi.h.
 unique_ptr<FunctionData> FabricatorTableFunctionBind(ClientContext &context, TableFunctionBindInput &input,
-                                                   vector<LogicalType> &return_types, vector<string> &names) {
+                                                   vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto &info = input.info->Cast<FabricatorTableFunctionInfo>();
 	FabricatorHandle handle = info.handle;
 	string schema_name = info.schema;
@@ -2232,6 +2251,16 @@ static void FabricatorMarshalInOutArgs(const FabricatorTableFunctionInfo &info, 
 static void FabricatorBuildInOutSignature(const vector<string> &names, const vector<LogicalType> &types,
                                           const vector<FabricatorParamStyle> &styles, TableFunction &tf,
                                           bool named_any_for_null = false) {
+	// ⚠⚠ DuckDB 2.0 keeps POSITIONAL, VARIADIC and NAMED parameters in ONE ORDERED LIST on the signature,
+	// where 1.5 kept `arguments`, `varargs` and `named_parameters` in three SEPARATE containers. Order was
+	// therefore irrelevant before and is LOAD-BEARING now: everything that reads a declared slot
+	// (FabricatorDeclaredArgType) takes the LEADING NON-VARIADIC parameters as the fixed prefix. So the
+	// variadic tail must come after every positional, and the keyword-only parameters after the tail — a
+	// named parameter emitted early would be counted INTO the prefix and shift every slot. Hence: collect
+	// first, emit in order. This compiles either way, which is exactly why it is spelled out here.
+	vector<LogicalType> positional;
+	vector<std::pair<string, LogicalType>> named;
+	LogicalType tail(LogicalTypeId::INVALID);
 	for (idx_t i = 0; i < names.size(); i++) {
 		auto style = i < styles.size() ? styles[i] : FabricatorParamStyle::POSITIONAL;
 		switch (style) {
@@ -2252,21 +2281,32 @@ static void FabricatorBuildInOutSignature(const vector<string> &names, const vec
 			// varargs = SQLNULL on the CATALOG path, which only a NULL literal casts to — so every real
 			// argument failed to bind while the GLOBAL path, which passes the flag true, worked. Found by
 			// the catalog-bound gate; the type sentinel is a property of the DECLARATION, not of the caller.
-			tf.varargs = FabricatorVarArgsType(types[i]);
+			tail = FabricatorVarArgsType(types[i]);
 			break;
 		case FabricatorParamStyle::TABLE_INPUT:
 			// The DECLARED type (a struct of the expected input columns) is ours alone: DuckDB only ever
 			// accepts LogicalType::TABLE here, so any column-level check would be a bind-time one of our own.
-			tf.arguments.push_back(LogicalType::TABLE);
+			positional.push_back(LogicalType::TABLE);
 			break;
 		case FabricatorParamStyle::NAMED:
-			tf.named_parameters[names[i]] =
-			    (named_any_for_null && types[i].id() == LogicalTypeId::SQLNULL) ? LogicalType::ANY : types[i];
+			named.emplace_back(names[i], (named_any_for_null && types[i].id() == LogicalTypeId::SQLNULL)
+			                                 ? LogicalType::ANY
+			                                 : types[i]);
 			break;
 		default:
-			tf.arguments.push_back(types[i]);
+			positional.push_back(types[i]);
 			break;
 		}
+	}
+	auto &sig = tf.GetSignature();
+	for (auto &t : positional) {
+		sig.AddParameter(t);
+	}
+	if (tail.id() != LogicalTypeId::INVALID) {
+		sig.AddArgs("args", tail);
+	}
+	for (auto &n : named) {
+		sig.AddKeywordOnly(n.first, n.second);
 	}
 }
 
@@ -2278,6 +2318,7 @@ void FabricatorBuildSqlGenSignature(const vector<string> &all_names, const vecto
                                     vector<string> &arg_names,
                                     vector<LogicalType> &arg_types, idx_t *out_varargs_index) {
 	vector<LogicalType> positional;
+	LogicalType sig_tail(LogicalTypeId::INVALID);
 	if (out_varargs_index) {
 		*out_varargs_index = DConstants::INVALID_INDEX;
 	}
@@ -2292,7 +2333,7 @@ void FabricatorBuildSqlGenSignature(const vector<string> &all_names, const vecto
 			// NOT an argument slot — it names the TYPE of every argument past the declared ones. It stays in
 			// the DECLARATION (arg_names/arg_types) because FabricatorSqlGenBindReplace expands it per call;
 			// only `tf.arguments` must omit it, or DuckDB would demand a value for the tail itself.
-			tf.varargs = FabricatorVarArgsType(all_types[k]);
+			sig_tail = FabricatorVarArgsType(all_types[k]);
 			if (out_varargs_index) {
 				*out_varargs_index = arg_names.size();
 			}
@@ -2302,7 +2343,15 @@ void FabricatorBuildSqlGenSignature(const vector<string> &all_names, const vecto
 		arg_names.push_back(all_names[k]);
 		arg_types.push_back(type);
 	}
-	tf.arguments = positional;
+	// 2.0: one ordered parameter list — positionals first, then the variadic tail (see
+	// FabricatorBuildInOutSignature for why the order is load-bearing).
+	auto &sig = tf.GetSignature();
+	for (auto &t : positional) {
+		sig.AddParameter(t);
+	}
+	if (sig_tail.id() != LogicalTypeId::INVALID) {
+		sig.AddArgs("args", sig_tail);
+	}
 }
 
 unique_ptr<TableRef> FabricatorSqlGenBindReplace(ClientContext &context, TableFunctionBindInput &input) {
@@ -2561,7 +2610,7 @@ void ExchangeInputRelease(ArrowArrayStream *stream) {
 
 // Bind: resolve the binding + its full output schema via inout_bind (no cost args for custom in-out yet).
 unique_ptr<FunctionData> FabricatorExchangeBind(ClientContext &context, TableFunctionBindInput &input,
-                                              vector<LogicalType> &return_types, vector<string> &names) {
+                                              vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto &info = input.info->Cast<FabricatorTableFunctionInfo>();
 	// ⚠⚠ THE AMBIENTS, and the BIND needs them as much as the scan does: this crossing runs the author's
 	// Bind(), which may reach the host — open a pinned connection, read a file, resolve a setting. Without
@@ -2960,7 +3009,7 @@ void CollectorHolder::OpenExchange(ClientContext &context) {
 // but stores a CollectorHolder + the output types for the Source). Cost args (named parameters) marshaled the
 // same way so a collector can take constant args (e.g. a future daxevaltable).
 unique_ptr<FunctionData> FabricatorCollectorBind(ClientContext &context, TableFunctionBindInput &input,
-                                               vector<LogicalType> &return_types, vector<string> &names) {
+                                               vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto &info = input.info->Cast<FabricatorTableFunctionInfo>();
 	// ⚠⚠ THE AMBIENTS, and the BIND needs them as much as the scan does: this crossing runs the author's
 	// Bind(), which may reach the host — open a pinned connection, read a file, resolve a setting. Without
@@ -3337,8 +3386,8 @@ void RegisterFabricatorGlobalFunctions(ExtensionLoader &loader) {
 				} catch (std::exception &) {
 					// no cost args
 				}
-				if (tf.arguments.empty()) {
-					tf.arguments.push_back(LogicalType::TABLE);
+				if (tf.GetArguments().empty()) {
+					tf.GetArguments().push_back(LogicalType::TABLE);
 				}
 				tf.function_info = std::move(fn_info);
 				loader.RegisterFunction(tf);

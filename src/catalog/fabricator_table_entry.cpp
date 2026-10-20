@@ -62,8 +62,14 @@ public:
 	// (read_parquet-on-DuckDB) path; both are always produced together so they cannot diverge.
 	bool Serialize(const Expression &e, string &out, string &sql) {
 		switch (e.GetExpressionClass()) {
-		case ExpressionClass::BOUND_COMPARISON:
-			return Comparison(e.Cast<BoundComparisonExpression>(), out, sql);
+		case ExpressionClass::BOUND_FUNCTION:
+			// DuckDB 2.0 lowered comparisons onto BoundFunctionExpression, so this class now carries BOTH
+			// comparisons and ordinary functions (struct_extract among them). IsComparison is the only
+			// discriminator; a non-comparison function is not a predicate we can serialize.
+			if (!BoundComparisonExpression::IsComparison(e)) {
+				return false;
+			}
+			return Comparison(e.Cast<BoundFunctionExpression>(), out, sql);
 		case ExpressionClass::BOUND_OPERATOR:
 			return Operator(e.Cast<BoundOperatorExpression>(), out, sql);
 		case ExpressionClass::BOUND_CONJUNCTION:
@@ -135,10 +141,10 @@ private:
 		}
 		auto &ref = e.Cast<BoundColumnRefExpression>();
 		auto &cols = get_.GetColumnIds();
-		if (ref.binding.column_index >= cols.size()) {
+		if (ref.Binding().column_index >= cols.size()) {
 			return false;
 		}
-		auto &ci = cols[ref.binding.column_index];
+		auto &ci = cols[ref.Binding().column_index];
 		if (!ci.HasPrimaryIndex() || ci.HasChildren()) {
 			return false; // struct sub-field / non-numeric ref: not pushed
 		}
@@ -147,7 +153,7 @@ private:
 			return false;
 		}
 		name = get_.names[table_col];
-		type = ref.return_type;
+		type = ref.GetReturnType();
 		return true;
 	}
 
@@ -161,13 +167,13 @@ private:
 		if (e.GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
 			auto &func = e.Cast<BoundFunctionExpression>();
 			if ((func.function.name != "struct_extract" && func.function.name != "struct_extract_at") ||
-			    func.children.size() != 2 || !func.bind_info) {
+			    func.GetChildren().size() != 2 || !func.bind_info) {
 				return false;
 			}
-			if (!ColumnPath(*func.children[0], path, type)) {
+			if (!ColumnPath(*func.GetChildren()[0], path, type)) {
 				return false;
 			}
-			auto &parent_type = func.children[0]->return_type;
+			auto &parent_type = func.GetChildren()[0]->GetReturnType();
 			if (parent_type.id() != LogicalTypeId::STRUCT) {
 				return false; // VARIANT member access etc.: not a plain struct path
 			}
@@ -177,7 +183,7 @@ private:
 				return false;
 			}
 			path.push_back(members[member].first);
-			type = e.return_type;
+			type = e.GetReturnType();
 			return true;
 		}
 		string name;
@@ -270,23 +276,25 @@ private:
 		return idx;
 	}
 
-	bool Comparison(const BoundComparisonExpression &cmp, string &out, string &sql) {
+	bool Comparison(const BoundFunctionExpression &cmp, string &out, string &sql) {
 		auto type = cmp.GetExpressionType();
 		const Expression *col = nullptr;
 		const Expression *constant = nullptr;
 		bool flipped = false;
-		auto lc = cmp.left->GetExpressionClass();
-		auto rc = cmp.right->GetExpressionClass();
+		auto &lhs = BoundComparisonExpression::Left(cmp);
+		auto &rhs = BoundComparisonExpression::Right(cmp);
+		auto lc = lhs.GetExpressionClass();
+		auto rc = rhs.GetExpressionClass();
 		// Column side = a plain column ref OR a struct_extract chain (ColumnPath validates the shape).
 		auto is_col_side = [](ExpressionClass c) {
 			return c == ExpressionClass::BOUND_COLUMN_REF || c == ExpressionClass::BOUND_FUNCTION;
 		};
 		if (is_col_side(lc) && rc == ExpressionClass::BOUND_CONSTANT) {
-			col = cmp.left.get();
-			constant = cmp.right.get();
+			col = &lhs;
+			constant = &rhs;
 		} else if (is_col_side(rc) && lc == ExpressionClass::BOUND_CONSTANT) {
-			col = cmp.right.get();
-			constant = cmp.left.get();
+			col = &rhs;
+			constant = &lhs;
 			flipped = true;
 		} else {
 			return false;
@@ -303,7 +311,7 @@ private:
 		if (!tok || !SafeForType(tok, coltype)) {
 			return false;
 		}
-		auto &value = constant->Cast<BoundConstantExpression>().value;
+		auto &value = constant->Cast<BoundConstantExpression>().GetValue();
 		if (value.IsNull()) {
 			return false; // `col <op> NULL` is unknown; leave it to DuckDB
 		}
@@ -331,12 +339,12 @@ private:
 	bool Operator(const BoundOperatorExpression &op, string &out, string &sql) {
 		auto type = op.GetExpressionType();
 		if (type == ExpressionType::OPERATOR_IS_NULL || type == ExpressionType::OPERATOR_IS_NOT_NULL) {
-			if (op.children.size() != 1) {
+			if (op.GetChildren().size() != 1) {
 				return false;
 			}
 			vector<string> path;
 			LogicalType coltype;
-			if (!ColumnPath(*op.children[0], path, coltype)) {
+			if (!ColumnPath(*op.GetChildren()[0], path, coltype)) {
 				return false;
 			}
 			out = "{\"op\":\"";
@@ -355,20 +363,20 @@ private:
 			// children[0] = column, children[1..] = constants (IN-rewriting runs after
 			// filter pushdown, so IN is still a single operator here). IN is positive
 			// equality => superset-safe for all types (incl VARCHAR).
-			if (op.children.size() < 2) {
+			if (op.GetChildren().size() < 2) {
 				return false;
 			}
 			vector<string> path;
 			LogicalType coltype;
-			if (!ColumnPath(*op.children[0], path, coltype)) {
+			if (!ColumnPath(*op.GetChildren()[0], path, coltype)) {
 				return false;
 			}
 			vector<Value> values;
-			for (idx_t i = 1; i < op.children.size(); i++) {
-				if (op.children[i]->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
+			for (idx_t i = 1; i < op.GetChildren().size(); i++) {
+				if (op.GetChildren()[i]->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
 					return false;
 				}
-				auto &v = op.children[i]->Cast<BoundConstantExpression>().value;
+				auto &v = op.GetChildren()[i]->Cast<BoundConstantExpression>().GetValue();
 				if (v.IsNull()) {
 					return false;
 				}
@@ -413,7 +421,7 @@ private:
 		}
 		vector<string> parts;
 		vector<string> sql_parts;
-		for (auto &child : conj.children) {
+		for (auto &child : conj.GetChildren()) {
 			string js, cs;
 			if (Serialize(*child, js, cs)) {
 				parts.push_back(std::move(js));
@@ -485,8 +493,8 @@ private:
 		    b.upper->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
 			return false;
 		}
-		auto &lo = b.lower->Cast<BoundConstantExpression>().value;
-		auto &hi = b.upper->Cast<BoundConstantExpression>().value;
+		auto &lo = b.lower->Cast<BoundConstantExpression>().GetValue();
+		auto &hi = b.upper->Cast<BoundConstantExpression>().GetValue();
 		if (lo.IsNull() || hi.IsNull()) {
 			return false;
 		}
@@ -635,7 +643,7 @@ FabricatorTableEntry::~FabricatorTableEntry() {
 }
 
 // NOTE on struct filters under exact mode (filter_pushdown=true): a `WHERE (s).a = 5` becomes an
-// erased StructFilter in the TableFilterSet, which the scan MUST apply — RenderTableFilter
+// erased LegacyStructFilter in the TableFilterSet, which the scan MUST apply — RenderTableFilter
 // (arrow_ingest.cpp) renders it as struct_extract SQL. DuckDB's `supports_pushdown_type` veto (pull
 // struct filters back out of the scan) was tried and REJECTED: it requires `filter_prune`-maintained
 // projection_ids, and DuckDB's veto path (plan_get.cpp) corrupts rowid DML plans whose projection_ids

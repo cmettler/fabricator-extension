@@ -357,7 +357,7 @@ static bool TryFoldRenderedConstant(ClientContext &context, TableFunctionBindInp
 }
 
 unique_ptr<FunctionData> LateralBind(ClientContext &context, TableFunctionBindInput &input,
-                                    vector<LogicalType> &return_types, vector<string> &names) {
+                                    vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto &info = input.info->Cast<LateralFunctionInfo>();
 	auto bind_data = make_uniq<LateralBindData>();
 	bind_data->handle = info.handle;
@@ -974,7 +974,8 @@ TableFunction FabricatorMakeLateralFunction(FabricatorHandle handle, const strin
 			// version of this comment claimed constants were "trailing" and used that to defer the whole
 			// feature; nothing in the code said so, and a front-constant lateral was measured before this
 			// was built.
-			tf.varargs = type;
+			// 2.0: a variadic tail is a VAR_POSITIONAL parameter on the signature, not a `varargs` field.
+			tf.GetSignature().AddArgs("args", type);
 			continue;
 		}
 		if (style == FabricatorParamStyle::NAMED) {
@@ -988,7 +989,7 @@ TableFunction FabricatorMakeLateralFunction(FabricatorHandle handle, const strin
 			                            "Declare an in-out function instead if it needs a table argument.",
 			                            func_name, arg_names[i]);
 		} else {
-			tf.arguments.push_back(type);
+			tf.GetArguments().push_back(type);
 		}
 	}
 	info->handle = handle;

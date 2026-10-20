@@ -73,7 +73,7 @@ struct WaitLocalState : public LocalTableFunctionState {
 };
 
 unique_ptr<FunctionData> WaitBind(ClientContext &context, TableFunctionBindInput &input,
-                                  vector<LogicalType> &return_types, vector<string> &names) {
+                                  vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto result = make_uniq<WaitBindData>();
 	auto rows = input.inputs[0].GetValue<int64_t>();
 	auto millis = input.inputs[1].GetValue<int64_t>();

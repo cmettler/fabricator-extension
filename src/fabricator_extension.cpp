@@ -295,7 +295,7 @@ struct FabricatorTestScanBindData : public fabricator::ArrowStreamBindData {
 };
 
 static unique_ptr<FunctionData> TestScanBind(ClientContext &context, TableFunctionBindInput &input,
-                                             vector<LogicalType> &return_types, vector<string> &names) {
+                                             vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto sql = input.inputs[0].GetValue<string>();
 
 	auto bind_data = make_uniq<FabricatorTestScanBindData>();
@@ -356,7 +356,7 @@ struct FabricatorQueryBindData : public fabricator::ArrowStreamBindData {
 };
 
 static unique_ptr<FunctionData> QueryBind(ClientContext &context, TableFunctionBindInput &input,
-                                          vector<LogicalType> &return_types, vector<string> &names) {
+                                          vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto connection_string = input.inputs[0].GetValue<string>();
 	auto sql = input.inputs[1].GetValue<string>();
 
@@ -404,7 +404,7 @@ struct FabricatorFunctionsBindData : public fabricator::ArrowStreamBindData {
 };
 
 static unique_ptr<FunctionData> FunctionsBind(ClientContext &context, TableFunctionBindInput &input,
-                                              vector<LogicalType> &return_types, vector<string> &names) {
+                                              vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto connection = input.inputs[0].GetValue<string>();
 
 	auto bind_data = make_uniq<FabricatorFunctionsBindData>();
@@ -423,7 +423,7 @@ static unique_ptr<FunctionData> FunctionsBind(ClientContext &context, TableFunct
 // collation + the derived flags driving connection mode + type mapping) as
 // (property, value) rows. Diagnostic; the profile is detected in the C# backend.
 static unique_ptr<FunctionData> ServerInfoBind(ClientContext &context, TableFunctionBindInput &input,
-                                               vector<LogicalType> &return_types, vector<string> &names) {
+                                               vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto connection = input.inputs[0].GetValue<string>();
 
 	auto bind_data = make_uniq<FabricatorFunctionsBindData>();
@@ -651,7 +651,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 		         {LogicalType::VARCHAR, LogicalType::VARCHAR},
 		         {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::ANY}}) {
 			ScalarFunction exec_fn("fabricator_exec", signature, LogicalType::BIGINT, FabricatorExecFunction);
-			exec_fn.stability = FunctionStability::VOLATILE;
+			exec_fn.GetStability() = FunctionStability::VOLATILE;
 			exec_set.AddFunction(exec_fn);
 		}
 		loader.RegisterFunction(exec_set);
@@ -661,7 +661,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	{
 		ScalarFunction refresh_fn("fabricator_refresh_cache", {LogicalType::VARCHAR}, LogicalType::BOOLEAN,
 		                          FabricatorRefreshCacheFunction);
-		refresh_fn.stability = FunctionStability::VOLATILE;
+		refresh_fn.GetStability() = FunctionStability::VOLATILE;
 		loader.RegisterFunction(refresh_fn);
 	}
 
@@ -677,7 +677,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 		for (auto &arg_types : signatures) {
 			ScalarFunction fn("fabricator_invalidate_cache", arg_types, LogicalType::BOOLEAN,
 			                  FabricatorRefreshCacheFunction);
-			fn.stability = FunctionStability::VOLATILE;
+			fn.GetStability() = FunctionStability::VOLATILE;
 			set.AddFunction(fn);
 		}
 		loader.RegisterFunction(set);

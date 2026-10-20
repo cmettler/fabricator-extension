@@ -17,6 +17,7 @@
 #include "catalog/fabricator_txn_util.hpp"
 #include "duckdb/common/arrow/arrow_appender.hpp"
 #include "duckdb/common/types/vector.hpp"
+#include "duckdb/common/vector/struct_vector.hpp" // 2.0 split vector.hpp; StructVector lives here now
 #include "duckdb/function/table/arrow/arrow_duck_schema.hpp"
 #include "duckdb/main/client_context.hpp"
 
