@@ -616,7 +616,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// (params := {'a': 1}) or a JSON string (params := '{"a": 1}') — the daxeval/fluid_render convention.
 	// A fixed VARCHAR would force DuckDB to stringify a struct before we ever saw it.
 	// ⚠ `params` is a RESERVED argument name on this function from here on.
-	query_fn.named_parameters["params"] = LogicalType::ANY;
+	query_fn.GetSignature().AddKeywordOnly("params", LogicalType::ANY);
 	loader.RegisterFunction(query_fn);
 
 	// fabricator_functions(catalog|connstr) — lists discovered routines (diagnostic).

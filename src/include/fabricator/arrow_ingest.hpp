@@ -251,7 +251,7 @@ duckdb::string BuildSchemaOnlySpec(const duckdb::string &at_unit, const duckdb::
 // releasing it. Fills `return_types`/`names` and bind_data.arrow_table.
 void PopulateReturnSchema(duckdb::ClientContext &context, ArrowStreamBindData &bind_data,
                           duckdb::vector<duckdb::LogicalType> &return_types,
-                          duckdb::vector<duckdb::string> &names);
+                          duckdb::vector<duckdb::Identifier> &names);
 
 // Reads a bare Arrow schema (e.g. filled by get_function_*_schema) into DuckDB return types + names.
 // Consumes/releases `arrow_schema` (moves it into an ArrowSchemaWrapper). For schema-only metadata fetches.

@@ -38,7 +38,7 @@ inline std::string PartitionColumnsArg(
 			continue;
 		}
 		std::string col;
-		if (k->type == duckdb::ExpressionType::COLUMN_REF) {
+		if (k->GetExpressionType() == duckdb::ExpressionType::COLUMN_REF) {
 			col = k->Cast<duckdb::ColumnRefExpression>().GetColumnName();
 		} else {
 			col = k->GetName();
@@ -101,10 +101,10 @@ inline std::string TableOptionsArg(
 	bool first = true;
 	for (auto &kv : options) {
 		const duckdb::ParsedExpression *expr = kv.second.get();
-		if (expr && expr->type == duckdb::ExpressionType::OPERATOR_CAST) {
+		if (expr && expr->GetExpressionType() == duckdb::ExpressionType::OPERATOR_CAST) {
 			expr = expr->Cast<duckdb::CastExpression>().child.get();
 		}
-		if (!expr || expr->type != duckdb::ExpressionType::VALUE_CONSTANT) {
+		if (!expr || expr->GetExpressionType() != duckdb::ExpressionType::VALUE_CONSTANT) {
 			throw duckdb::BinderException("CREATE TABLE WITH option \"%s\" must be a constant value", kv.first);
 		}
 		auto &val = expr->Cast<duckdb::ConstantExpression>().value;

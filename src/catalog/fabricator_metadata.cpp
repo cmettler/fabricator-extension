@@ -301,7 +301,13 @@ void FetchTableSchema(ClientContext &context, FabricatorHandle catalog_handle, F
 	// explicit transaction must see the uncommitted CREATE, so key the read to the active txn — the session
 	// binds against this ambient (a table opened WITH an AT clause then answers the AS-OF layout).
 	FabricatorSetActiveTxn(catalog_handle, context);
-	fabricator::PopulateReturnSchema(context, bind_data, types, names);
+	// Same as the table-entry path: the helper speaks Identifiers, this one works in strings.
+	vector<Identifier> schema_names;
+	fabricator::PopulateReturnSchema(context, bind_data, types, schema_names);
+	names.clear();
+	for (auto &n : schema_names) {
+		names.push_back(n.GetIdentifierName());
+	}
 }
 
 FabricatorTableDetails FetchTableInfo(FabricatorHandle table_handle) {

@@ -455,7 +455,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateEntry(ClientContext
 	} else if (rowid_indices.size() > 1) {
 		child_list_t<LogicalType> children;
 		for (auto idx : rowid_indices) {
-			children.push_back(make_pair(names[idx], types[idx]));
+			children.push_back(make_pair(Identifier(names[idx]), types[idx]));
 		}
 		rowid_type = LogicalType::STRUCT(std::move(children));
 	} else if (virtual_rowid_columns.size() > 1) {
@@ -463,7 +463,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateEntry(ClientContext
 		// of BIGINTs keyed by the virtual names.
 		child_list_t<LogicalType> children;
 		for (auto &vn : virtual_rowid_columns) {
-			children.push_back(make_pair(vn, LogicalType::BIGINT));
+			children.push_back(make_pair(Identifier(vn), LogicalType::BIGINT));
 		}
 		rowid_type = LogicalType::STRUCT(std::move(children));
 	}
@@ -1063,8 +1063,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateScalarFunction(Clie
 	    FabricatorVarArgsIndex(func_name, arg_names, arg_styles));
 
 	CreateScalarFunctionInfo info(std::move(fn));
-	info.catalog = catalog.GetName();
-	info.schema = name;
+	info.SetQualification(catalog.GetName(), Identifier(name));
 	auto entry = make_uniq<ScalarFunctionCatalogEntry>(catalog, *this, info);
 	auto &ref = *entry;
 	function_entries_[func_name] = std::move(entry);
@@ -1729,8 +1728,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateAggregateFunction(C
 	AggregateFunctionSet set(func_name);
 	set.AddFunction(fn);
 	CreateAggregateFunctionInfo info(std::move(set));
-	info.catalog = catalog.GetName();
-	info.schema = name;
+	info.SetQualification(catalog.GetName(), Identifier(name));
 	auto entry = make_uniq<AggregateFunctionCatalogEntry>(catalog, *this, info);
 	auto &ref = *entry;
 	aggregate_function_entries_[func_name] = std::move(entry);
@@ -1760,7 +1758,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateMacro(ClientContext
 		// DuckDB's OWN parser owns the macro grammar — so named-parameter defaults, overload sets and
 		// `AS TABLE <query>` all work, and the parsed statement is what tells us which KIND this is. Same route
 		// as the global registration; only the qualification handling differs (below).
-		Parser parser(context.GetParserOptions());
+		Parser parser(context);
 		parser.ParseQuery(decl->second);
 		if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::CREATE_STATEMENT) {
 			throw ParserException("expected a single CREATE MACRO statement");
@@ -1780,8 +1778,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateMacro(ClientContext
 		// body because those land in the system catalog's main schema. A catalog-bound macro must carry THIS
 		// catalog's ATTACH alias (chosen by the user at ATTACH time, so a static declaration cannot state it) and
 		// this schema. Do not copy the global branch's validation into this path: it asserts the inverse.
-		info->catalog = catalog.GetName();
-		info->schema = name;
+		info->SetQualification(catalog.GetName(), Identifier(name));
 		// NOT `internal`: that marks a system/built-in entry, which is right for the load-time global macros and
 		// wrong for a catalog entry (none of our other catalog entries set it either).
 		if (info->type == CatalogType::TABLE_MACRO_ENTRY) {
@@ -1834,7 +1831,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateView(ClientContext 
 		// DuckDB's OWN parser owns the CREATE VIEW grammar, so column aliases (`CREATE VIEW v(a,b) AS ...`)
 		// and every SELECT form work without us knowing anything about them. It also fills info->sql with the
 		// statement text (parser.cpp:368), which is what duckdb_views().sql reports.
-		Parser parser(context.GetParserOptions());
+		Parser parser(context);
 		parser.ParseQuery(decl->second);
 		if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::CREATE_STATEMENT) {
 			throw ParserException("expected a single CREATE VIEW statement");
@@ -1862,8 +1859,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateView(ClientContext 
 		// What these two lines DO buy is that the entry describes itself consistently: CreateInfo's
 		// catalog/schema feed GetInfo() / ToSQL() / duckdb_views().sql, so a provider that shipped a
 		// QUALIFIED body would otherwise leave an entry living here while claiming to live somewhere else.
-		info->catalog = catalog.GetName();
-		info->schema = name;
+		info->SetQualification(catalog.GetName(), Identifier(name));
 		// Belt and braces: a parsed CREATE VIEW carries no bound types, and empty types is what selects the
 		// UNBOUND construction path. Stating it means a future parser change cannot quietly bind us.
 		info->types.clear();
@@ -1969,7 +1965,7 @@ unique_ptr<FunctionData> FabricatorTableFunctionBind(ClientContext &context, Tab
 					break;
 				}
 			}
-			arg_names.push_back(kv.first);
+			arg_names.push_back(kv.first.GetIdentifierName());
 			arg_types.push_back(declared);
 			arg_values.push_back(kv.second);
 		}
@@ -2123,9 +2119,11 @@ unique_ptr<FunctionData> FabricatorTableFunctionBind(ClientContext &context, Tab
 // Parse a generated statement into a subquery ref — the shape query_table() uses (query_function.cpp's
 // ParseSubquery): exactly one SELECT statement. A PIVOT without an explicit IN list parses to a
 // MultiStatement and is rejected here, same as upstream.
-unique_ptr<TableRef> FabricatorParseGeneratedSelect(const string &sql, const ParserOptions &options,
+// 2.0: takes the ClientContext rather than ParserOptions — ClientContext::GetParserOptions() is private
+// now, and Parser has a context-taking constructor that is the canonical spelling in DuckDB's own code.
+unique_ptr<TableRef> FabricatorParseGeneratedSelect(const string &sql, ClientContext &context,
                                                    const string &fn_name) {
-	Parser parser(options);
+	Parser parser(context);
 	parser.ParseQuery(sql);
 	if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::SELECT_STATEMENT) {
 		throw BinderException("fabricator function \"%s\" must generate exactly one SELECT statement (a PIVOT "
@@ -2228,7 +2226,7 @@ static void FabricatorMarshalInOutArgs(const FabricatorTableFunctionInfo &info, 
 	// named parameter DuckDB accepted is passed through, so an undeclared-but-bound arg is not lost.
 	if (info.arg_names.empty()) {
 		for (auto &kv : input.named_parameters) {
-			arg_names.push_back(kv.first);
+			arg_names.push_back(kv.first.GetIdentifierName());
 			arg_types.push_back(kv.second.type());
 			arg_values.push_back(kv.second);
 		}
@@ -2306,7 +2304,7 @@ static void FabricatorBuildInOutSignature(const vector<string> &names, const vec
 		sig.AddArgs("args", tail);
 	}
 	for (auto &n : named) {
-		sig.AddKeywordOnly(n.first, n.second);
+		sig.AddKeywordOnly(Identifier(n.first), n.second);
 	}
 }
 
@@ -2318,6 +2316,7 @@ void FabricatorBuildSqlGenSignature(const vector<string> &all_names, const vecto
                                     vector<string> &arg_names,
                                     vector<LogicalType> &arg_types, idx_t *out_varargs_index) {
 	vector<LogicalType> positional;
+	vector<std::pair<string, LogicalType>> sig_named;
 	LogicalType sig_tail(LogicalTypeId::INVALID);
 	if (out_varargs_index) {
 		*out_varargs_index = DConstants::INVALID_INDEX;
@@ -2326,7 +2325,9 @@ void FabricatorBuildSqlGenSignature(const vector<string> &all_names, const vecto
 		auto style = k < styles.size() ? styles[k] : FabricatorParamStyle::POSITIONAL;
 		auto type = all_types[k].id() == LogicalTypeId::SQLNULL ? LogicalType::ANY : all_types[k];
 		if (style == FabricatorParamStyle::NAMED) {
-			tf.named_parameters[all_names[k]] = type;
+			// collected, not emitted here: a keyword-only parameter must follow the variadic tail, or it
+			// would be counted into the fixed prefix (see FabricatorBuildInOutSignature).
+			sig_named.emplace_back(all_names[k], type);
 			continue;
 		}
 		if (style == FabricatorParamStyle::VARARGS) {
@@ -2352,6 +2353,9 @@ void FabricatorBuildSqlGenSignature(const vector<string> &all_names, const vecto
 	if (sig_tail.id() != LogicalTypeId::INVALID) {
 		sig.AddArgs("args", sig_tail);
 	}
+	for (auto &n : sig_named) {
+		sig.AddKeywordOnly(Identifier(n.first), n.second);
+	}
 }
 
 unique_ptr<TableRef> FabricatorSqlGenBindReplace(ClientContext &context, TableFunctionBindInput &input) {
@@ -2372,7 +2376,7 @@ unique_ptr<TableRef> FabricatorSqlGenBindReplace(ClientContext &context, TableFu
 	FabricatorExpandVarArgs(info.varargs_index, info.arg_names, info.arg_types, arg_values, arg_names,
 	                        arg_types);
 	for (auto &kv : input.named_parameters) {
-		arg_names.push_back(kv.first);
+		arg_names.push_back(kv.first.GetIdentifierName());
 		arg_types.push_back(kv.second.type());
 		arg_values.push_back(kv.second);
 	}
@@ -2410,7 +2414,7 @@ unique_ptr<TableRef> FabricatorSqlGenBindReplace(ClientContext &context, TableFu
 		sql = fabricator::GenerateTableSql(info.handle, info.schema, info.func, info.catalog_name,
 		                                   producer.Stream());
 	}
-	return FabricatorParseGeneratedSelect(sql, context.GetParserOptions(), info.func);
+	return FabricatorParseGeneratedSelect(sql, context, info.func);
 }
 
 
@@ -2628,7 +2632,7 @@ unique_ptr<FunctionData> FabricatorExchangeBind(ClientContext &context, TableFun
 	bind_data->holder = make_shared_ptr<ExchangeHolder>();
 	for (idx_t i = 0; i < input.input_table_types.size(); i++) {
 		bind_data->input_types.push_back(input.input_table_types[i]);
-		bind_data->input_names.push_back(input.input_table_names[i]);
+		bind_data->input_names.push_back(input.input_table_names[i].GetIdentifierName());
 	}
 
 	auto props = fabricator::BoundaryClientProperties(context);
@@ -2690,7 +2694,7 @@ unique_ptr<FunctionData> FabricatorExchangeBind(ClientContext &context, TableFun
 	ArrowTableFunction::PopulateArrowTableSchema(context, arrow_table, schema_root.arrow_schema);
 	for (int64_t i = 0; i < schema_root.arrow_schema.n_children; i++) {
 		auto &child = *schema_root.arrow_schema.children[i];
-		names.push_back(child.name ? string(child.name) : "column" + to_string(i));
+		names.push_back(Identifier(child.name ? string(child.name) : "column" + to_string(i)));
 		return_types.push_back(arrow_table.GetColumns().at((idx_t)i)->GetDuckType());
 	}
 	bind_data->output_width = return_types.size();
@@ -3028,7 +3032,7 @@ unique_ptr<FunctionData> FabricatorCollectorBind(ClientContext &context, TableFu
 	auto &holder = *bind_data->holder;
 	for (idx_t i = 0; i < input.input_table_types.size(); i++) {
 		holder.input_types.push_back(input.input_table_types[i]);
-		holder.input_names.push_back(input.input_table_names[i]);
+		holder.input_names.push_back(input.input_table_names[i].GetIdentifierName());
 	}
 
 	auto props = fabricator::BoundaryClientProperties(context);
@@ -3089,7 +3093,7 @@ unique_ptr<FunctionData> FabricatorCollectorBind(ClientContext &context, TableFu
 	ArrowTableFunction::PopulateArrowTableSchema(context, arrow_table, schema_root.arrow_schema);
 	for (int64_t i = 0; i < schema_root.arrow_schema.n_children; i++) {
 		auto &child = *schema_root.arrow_schema.children[i];
-		names.push_back(child.name ? string(child.name) : "column" + to_string(i));
+		names.push_back(Identifier(child.name ? string(child.name) : "column" + to_string(i)));
 		return_types.push_back(arrow_table.GetColumns().at((idx_t)i)->GetDuckType());
 	}
 	bind_data->output_width = return_types.size();
@@ -3471,14 +3475,14 @@ void RegisterFabricatorGlobalFunctions(ExtensionLoader &loader) {
 				if (varargs_index != DConstants::INVALID_INDEX) {
 					// The declared parameters before the tail become the MINIMUM arity; DuckDB then accepts any
 					// number of further arguments, each implicitly cast to this type (ANY => no cast at all).
-					tf.varargs = FabricatorVarArgsType(arg_types[varargs_index]);
+					tf.GetSignature().AddArgs("args", FabricatorVarArgsType(arg_types[varargs_index]));
 				}
 				tf.projection_pushdown = true;
 				tf.pushdown_complex_filter = FabricatorComplexFilterPushdown;
 				for (idx_t k = 0; k < arg_names.size(); k++) {
 					if (k < arg_styles.size() && arg_styles[k] == FabricatorParamStyle::NAMED) {
 						auto t = arg_types[k].id() == LogicalTypeId::SQLNULL ? LogicalType::ANY : arg_types[k];
-						tf.named_parameters[arg_names[k]] = t;
+						tf.GetSignature().AddKeywordOnly(Identifier(arg_names[k]), t);
 					}
 				}
 				auto fn_info = make_shared_ptr<FabricatorTableFunctionInfo>();
@@ -3532,7 +3536,7 @@ void RegisterFabricatorGlobalFunctions(ExtensionLoader &loader) {
 				// Registered into the SYSTEM catalog, like a built-in: bare fn(...) in every database, no ATTACH.
 				// Nothing crosses back at runtime — the binder expands it. See docs/macros-and-sqlgen-functions.md.
 				try {
-					Parser parser(context.GetParserOptions());
+					Parser parser(context);
 					parser.ParseQuery(bodies[i]);
 					if (parser.statements.size() != 1 ||
 					    parser.statements[0]->type != StatementType::CREATE_STATEMENT) {
@@ -3552,8 +3556,7 @@ void RegisterFabricatorGlobalFunctions(ExtensionLoader &loader) {
 						    "a provider macro must be unqualified (or main-qualified) — got catalog '%s' schema '%s'",
 						    info->catalog, info->schema);
 					}
-					info->catalog = INVALID_CATALOG;
-					info->schema = DEFAULT_SCHEMA;
+					info->SetQualification(Identifier::InvalidCatalog(), Identifier::DefaultSchema());
 					info->internal = true; // a provider-shipped entry, like a built-in (BuiltinFunctions parity)
 					info->on_conflict = OnCreateConflict::ERROR_ON_CONFLICT; // a clash must be visible, not silent
 					loader.RegisterFunction(*info);
@@ -3640,7 +3643,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateTableFunction(Clien
 	if (varargs_index != DConstants::INVALID_INDEX) {
 		// The declared parameters before the tail become the MINIMUM arity; DuckDB then accepts any number of
 		// further arguments, each implicitly cast to this type (ANY => no cast at all).
-		tf.varargs = FabricatorVarArgsType(arg_types[varargs_index]);
+		tf.GetSignature().AddArgs("args", FabricatorVarArgsType(arg_types[varargs_index]));
 	}
 	tf.projection_pushdown = true;
 	if (is_proc) {
@@ -3649,7 +3652,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateTableFunction(Clien
 			// as a SQLNULL-typed field — there is no Arrow type for ANY, so SQLNULL is the agreed marker.
 			// Register it as ANY so DuckDB passes any literal (a STRUCT, a VARCHAR, …) through UNCAST.
 			auto t = arg_types[i].id() == LogicalTypeId::SQLNULL ? LogicalType::ANY : arg_types[i];
-			tf.named_parameters[arg_names[i]] = t;
+			tf.GetSignature().AddKeywordOnly(Identifier(arg_names[i]), t);
 		}
 	} else {
 		// A provider-declared NAMED parameter on a non-proc function: register it so `fn(x, flag := true)`
@@ -3657,7 +3660,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateTableFunction(Clien
 		for (idx_t i = 0; i < arg_names.size(); i++) {
 			if (i < arg_styles.size() && arg_styles[i] == FabricatorParamStyle::NAMED) {
 				auto t = arg_types[i].id() == LogicalTypeId::SQLNULL ? LogicalType::ANY : arg_types[i];
-				tf.named_parameters[arg_names[i]] = t;
+				tf.GetSignature().AddKeywordOnly(Identifier(arg_names[i]), t);
 			}
 		}
 		// Best-effort filter pushdown into the TVF (reuses the table scan's serializer; the
@@ -3682,8 +3685,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateTableFunction(Clien
 	tf.function_info = std::move(fn_info);
 
 	CreateTableFunctionInfo info(std::move(tf));
-	info.catalog = catalog.GetName();
-	info.schema = name;
+	info.SetQualification(catalog.GetName(), Identifier(name));
 	auto entry = make_uniq<TableFunctionCatalogEntry>(catalog, *this, info);
 	auto &ref = *entry;
 	table_function_entries_[func_name] = std::move(entry);
@@ -3728,8 +3730,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateSqlTableFunction(Cl
 	tf.function_info = std::move(fn_info);
 
 	CreateTableFunctionInfo info(std::move(tf));
-	info.catalog = catalog.GetName();
-	info.schema = name;
+	info.SetQualification(catalog.GetName(), Identifier(name));
 	auto entry = make_uniq<TableFunctionCatalogEntry>(catalog, *this, info);
 	auto &ref = *entry;
 	table_function_entries_[func_name] = std::move(entry);
@@ -3774,8 +3775,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateCustomInOutFunction
 	inout.function_info = std::move(fn_info);
 
 	CreateTableFunctionInfo info(std::move(inout));
-	info.catalog = catalog.GetName();
-	info.schema = name;
+	info.SetQualification(catalog.GetName(), Identifier(name));
 	auto entry = make_uniq<TableFunctionCatalogEntry>(catalog, *this, info);
 	auto &ref = *entry;
 	table_function_entries_[func_name] = std::move(entry);
@@ -3807,8 +3807,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateLateralFunction(Cli
 	auto fn = FabricatorMakeLateralFunction(handle_, name, func_name, std::move(arg_names), std::move(arg_types),
 	                                        std::move(arg_styles));
 	CreateTableFunctionInfo info(std::move(fn));
-	info.catalog = catalog.GetName();
-	info.schema = name;
+	info.SetQualification(catalog.GetName(), Identifier(name));
 	auto entry = make_uniq<TableFunctionCatalogEntry>(catalog, *this, info);
 	auto &ref = *entry;
 	table_function_entries_[func_name] = std::move(entry);
@@ -3854,8 +3853,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateCustomCollectorFunc
 	collector.function_info = std::move(fn_info);
 
 	CreateTableFunctionInfo info(std::move(collector));
-	info.catalog = catalog.GetName();
-	info.schema = name;
+	info.SetQualification(catalog.GetName(), Identifier(name));
 	auto entry = make_uniq<TableFunctionCatalogEntry>(catalog, *this, info);
 	auto &ref = *entry;
 	table_function_entries_[func_name] = std::move(entry);
@@ -4285,10 +4283,10 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::CreateTable(CatalogTransaction
 		}
 		// Unwrap one CAST level (e.g. boolean literals parse as CAST(... AS BOOLEAN)).
 		const ParsedExpression *expr = &col.DefaultValue();
-		if (expr->type == ExpressionType::OPERATOR_CAST) {
+		if (expr->GetExpressionType() == ExpressionType::OPERATOR_CAST) {
 			expr = expr->Cast<CastExpression>().child.get();
 		}
-		if (!expr || expr->type != ExpressionType::VALUE_CONSTANT) {
+		if (!expr || expr->GetExpressionType() != ExpressionType::VALUE_CONSTANT) {
 			continue; // literals only
 		}
 		auto &val = expr->Cast<ConstantExpression>().value;

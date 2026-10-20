@@ -333,7 +333,10 @@ static bool TryFoldRenderedConstant(ClientContext &context, TableFunctionBindInp
 		return false;
 	}
 	try {
-		auto exprs = Parser::ParseExpressionList(text, context.GetParserOptions());
+		// 2.0: ParseExpressionList is an instance method and the parser takes the context directly
+		// (ClientContext::GetParserOptions is private now).
+		Parser expr_parser(context);
+		auto exprs = expr_parser.ParseExpressionList(text);
 		if (exprs.size() != 1) {
 			return false;
 		}
@@ -959,6 +962,13 @@ TableFunction FabricatorMakeLateralFunction(FabricatorHandle handle, const strin
 	// (falling into the else below — Params.Constant declares the Arrow null type), and LateralBind resolves
 	// its VALUE into the managed args batch instead of the wire (the literal shape's folded parameter, or
 	// the rendered-text fold above).
+	// 2.0 keeps POSITIONAL, VARIADIC and NAMED parameters in ONE ORDERED list, so these are collected and
+	// emitted in a fixed order below — positionals, then the tail, then keyword-only. Emitting them in
+	// DECLARATION order (as 1.5's three separate containers allowed) would put the tail mid-list and count
+	// named parameters into the fixed prefix. See FabricatorBuildInOutSignature in fabricator_schema_entry.cpp.
+	vector<LogicalType> sig_positional;
+	vector<std::pair<string, LogicalType>> sig_named;
+	LogicalType sig_tail(LogicalTypeId::INVALID);
 	for (idx_t i = 0; i < arg_names.size(); i++) {
 		auto style = i < arg_styles.size() ? arg_styles[i] : FabricatorParamStyle::POSITIONAL;
 		auto type = arg_types[i].id() == LogicalTypeId::SQLNULL ? LogicalType::ANY : arg_types[i];
@@ -975,11 +985,11 @@ TableFunction FabricatorMakeLateralFunction(FabricatorHandle handle, const strin
 			// feature; nothing in the code said so, and a front-constant lateral was measured before this
 			// was built.
 			// 2.0: a variadic tail is a VAR_POSITIONAL parameter on the signature, not a `varargs` field.
-			tf.GetSignature().AddArgs("args", type);
+			sig_tail = type;
 			continue;
 		}
 		if (style == FabricatorParamStyle::NAMED) {
-			tf.named_parameters[arg_names[i]] = type;
+			sig_named.emplace_back(arg_names[i], type);
 		} else if (style == FabricatorParamStyle::TABLE_INPUT) {
 			// A lateral function has no input TABLE — its arguments ARE the input. Declaring one would build a
 			// {TABLE} signature the correlated spelling cannot bind against, so refuse at registration rather
@@ -989,8 +999,18 @@ TableFunction FabricatorMakeLateralFunction(FabricatorHandle handle, const strin
 			                            "Declare an in-out function instead if it needs a table argument.",
 			                            func_name, arg_names[i]);
 		} else {
-			tf.GetArguments().push_back(type);
+			sig_positional.push_back(type);
 		}
+	}
+	auto &sig = tf.GetSignature();
+	for (auto &t : sig_positional) {
+		sig.AddParameter(t);
+	}
+	if (sig_tail.id() != LogicalTypeId::INVALID) {
+		sig.AddArgs("args", sig_tail);
+	}
+	for (auto &n : sig_named) {
+		sig.AddKeywordOnly(Identifier(n.first), n.second);
 	}
 	info->handle = handle;
 	info->schema = schema_name;

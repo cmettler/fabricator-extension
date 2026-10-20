@@ -257,7 +257,7 @@ unique_ptr<FunctionData> ArrowStreamBindData::Copy() const {
 }
 
 void PopulateReturnSchema(ClientContext &context, ArrowStreamBindData &bind_data,
-                          vector<LogicalType> &return_types, vector<string> &names) {
+                          vector<LogicalType> &return_types, vector<Identifier> &names) {
 	// Produce a throwaway stream solely to read the schema, then release it. A bare
 	// request (no projection/filter) => the provider reports the full column set.
 	// Set the active host-FS opener (this context) so a global host-FS table function (a lakehouse reader)

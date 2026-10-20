@@ -912,8 +912,14 @@ TableFunction FabricatorTableEntry::BuildScanFunction(ClientContext &context, un
 
 	// Build the Arrow column converters + verify the result schema.
 	vector<LogicalType> return_types;
+	// PopulateReturnSchema reports column names as Identifiers (its callers are mostly 2.0 binds); this is
+	// an internal path that works in strings, so convert once here.
+	vector<Identifier> schema_names;
+	fabricator::PopulateReturnSchema(context, *data, return_types, schema_names);
 	vector<string> names;
-	fabricator::PopulateReturnSchema(context, *data, return_types, names);
+	for (auto &n : schema_names) {
+		names.push_back(n.GetIdentifierName());
+	}
 
 	// Align the cached NDV map to the column order (parallel to names; -1 = unknown).
 	data->column_ndv.assign(data->names.size(), -1);
