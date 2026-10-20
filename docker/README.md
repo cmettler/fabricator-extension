@@ -32,9 +32,16 @@ pwsh docker/provision.ps1
 ## Why TLS
 
 SQL Server's `s3://` connector requires HTTPS (no HTTP bypass exists). MinIO auto-enables TLS from
-`docker/certs/{public.crt,private.key}` mounted at `/root/.minio/certs`; SQL Server trusts the
-self-signed cert via the mount at `/var/opt/mssql/security/ca-certificates/minio.crt` (read once at
+`docker/certs/{public.crt,private.key}` mounted at **`/certs`** (the Bitnami image's certs dir — it was
+`/root/.minio/certs` on the official image, see the compose comment on why we moved); SQL Server trusts
+the self-signed cert via the mount at `/var/opt/mssql/security/ca-certificates/minio.crt` (read once at
 process start — restart the `sqlserver` service after rotating certs).
+
+⚠ `docker/certs/CAs/public.crt` is a third file and it is **load-bearing, not a duplicate**: the image's
+`setup.sh` copies that folder into the bundled `mc` client's trust store, and `mc` is what
+`MINIO_DEFAULT_BUCKETS` uses to create the `fabricator` bucket — over HTTPS, against this same cert.
+Without it the container starts **healthy** and the bucket is silently absent. `generate-certs.ps1`
+writes it; the certs are gitignored, so nothing else will.
 
 ## SQL Server 2025 + S3 notes
 
