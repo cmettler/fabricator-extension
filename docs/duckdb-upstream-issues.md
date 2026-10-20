@@ -352,6 +352,22 @@ per query; recorded so it is not re-discovered as a mystery rather than because 
 
 ## 4. `FILE_FLAGS_EXCLUSIVE_CREATE` is SILENTLY IGNORED on Windows — no put-if-absent primitive
 
+**⚠⚠ RESOLVED UPSTREAM — IT IS IN `v2.0-cyanoptera`, AND IT IS NOT IN THE 1.5 LINE. Verified by CONTENT
+(2026-10-20), never by PR state, which is the rule this file already carries.** `src/common/local_file_system.cpp`
+on the 2.0 branch has both halves: `flags.ExclusiveCreate()` → `CREATE_NEW`, tested FIRST in the `open_write`
+block, and a `ReturnNullIfExists()` arm accepting `ERROR_FILE_EXISTS` **and** `ERROR_ALREADY_EXISTS`. The same
+file at tag **`v1.5.6` contains ZERO occurrences of `CREATE_NEW`**, so everything under "What it costs us"
+below is still live for anything built on the 1.5 line — including the bump this note was written during.
+- **The local working-tree patch in the `duckdb` submodule is DELETED (2026-10-20, user decision: 2.0 is the
+  destination, and the 1.5 gap is accepted).** ⚠ It had **never reached a shipped artifact** — CI checks the
+  submodule out clean at the pinned sha — so it only ever made THIS machine behave unlike every build we
+  release. Deleting it ends a hidden dev-vs-shipped divergence rather than taking something from users, which
+  is the part worth carrying: *a patch that lives only in a submodule working tree is not a fix, it is a
+  divergence*. `git show v2.0-cyanoptera:src/common/local_file_system.cpp` is the durable copy.
+- ⚠ The "make the failure classifiable" ask in the tail below is only **half** answered upstream: a caller
+  setting `NULL_IF_EXISTS` now gets a null handle instead of locale-dependent prose, but a plain exclusive
+  create still throws a stringified Win32 error with no structured errno.
+
 **Status: FIXED, VALIDATED, AND SUBMITTED — [duckdb/duckdb#24612](https://github.com/duckdb/duckdb/pull/24612)
 (draft, 2026-08-08), from `cmettler/duckdb@fix/windows-exclusive-create` (`f894841e`) off `duckdb/main`
 (`e500d778`).** No existing DuckDB issue or PR mentioned `EXCLUSIVE_CREATE`. This is the cause of

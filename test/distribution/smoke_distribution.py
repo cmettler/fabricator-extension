@@ -5,7 +5,7 @@ Deliberately NOT a sqllogictest: the repo's `unittest` binary statically embeds 
 chain-loaded core would collide with already-registered functions there. This must run against a
 STOCK DuckDB whose python wheel version matches the core the artifact was built for.
 
-    pip install duckdb==1.5.5
+    pip install duckdb==1.5.6
     python test/distribution/smoke_distribution.py build/distribution/windows_amd64/fabricator.duckdb_extension
 
 Covers: fresh install into an empty extension directory with no environment variables; the CLR

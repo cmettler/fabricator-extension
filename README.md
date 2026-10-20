@@ -148,8 +148,8 @@ because it only checks a marker file and loads the already-extracted core. Nothi
 DuckDB's extension directory.
 
 **Pick the artifact matching your DuckDB build.** The inner extension is compiled against DuckDB's
-C++ internals, so it is tied to an exact DuckDB version and platform — `v1.5.5` / `windows_amd64`,
-`v1.5.5` / `linux_amd64`, and so on. A mismatch is refused immediately, with a message naming the
+C++ internals, so it is tied to an exact DuckDB version and platform — `v1.5.6` / `windows_amd64`,
+`v1.5.6` / `linux_amd64`, and so on. A mismatch is refused immediately, with a message naming the
 version you are running, **before anything is written to disk**. Two flavours per platform:
 
 | flavour | requires | measured size |
@@ -5012,7 +5012,7 @@ Dependencies — four git submodules, all pinned by SHA. **Init non-recursively:
 git submodule update --init          # NOT --recursive — see engineered-wood below
 ```
 
-- **`duckdb@v1.5.5`** + **`extension-ci-tools`** — the DuckDB source + build tooling, both
+- **`duckdb@v1.5.6`** + **`extension-ci-tools`** — the DuckDB source + build tooling, both
   `shallow = true` so the checkout stays small. Neither has a `branch =` line, so
   `git submodule update --remote` can't silently move the pin to an unreleased tip; bump them by
   checking out a new SHA and committing the gitlink.
@@ -5051,7 +5051,7 @@ cmake -G Ninja -DEXTENSION_STATIC_BUILD=1 `
 cmake --build build/release --target fabricator_loadable_extension duckdb shell
 ```
 
-Add `-DOVERRIDE_GIT_DESCRIBE=v1.5.5` if you need the loadable to declare its DuckDB version for
+Add `-DOVERRIDE_GIT_DESCRIBE=v1.5.6` if you need the loadable to declare its DuckDB version for
 loading into an official DuckDB build (the shallow clone has no tag context, so it otherwise
 reports `v0.0.1` and the official engine rejects it).
 

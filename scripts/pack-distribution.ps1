@@ -32,7 +32,7 @@ param(
     [string]$Platform,
 
     # DuckDB version the CORE is built against. This is an exact requirement at load time.
-    [string]$DuckDbVersion = 'v1.5.5',
+    [string]$DuckDbVersion = 'v1.5.6',
 
     [string]$FabricatorVersion = '0.0.1',
 
