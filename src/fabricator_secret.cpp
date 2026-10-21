@@ -174,7 +174,7 @@ string BuildConnectionStringFromSecret(ClientContext &context, const string &sec
 		                      secret_name, secret_name);
 	}
 	auto &secret = *entry->secret;
-	const string secret_type = secret.GetType();
+	const string secret_type = secret.GetType().GetIdentifierName();
 	auto &kv = static_cast<const KeyValueSecret &>(secret);
 
 	// Hand all of the secret's fields to the owning backend, which owns the connection-string format AND
@@ -191,7 +191,7 @@ string BuildConnectionStringFromSecret(ClientContext &context, const string &sec
 			json += ",";
 		}
 		first = false;
-		json += "\"" + EscapeJson(field.first) + "\":\"" + EscapeJson(field.second.ToString()) + "\"";
+		json += "\"" + EscapeJson(field.first.GetIdentifierName()) + "\":\"" + EscapeJson(field.second.ToString()) + "\"";
 	}
 	json += "}";
 
@@ -224,7 +224,7 @@ string BuildConnectionStringFromScopedSecret(ClientContext &context, const strin
 				json += ",";
 			}
 			first = false;
-			json += "\"" + EscapeJson(field.first) + "\":\"" + EscapeJson(field.second.ToString()) + "\"";
+			json += "\"" + EscapeJson(field.first.GetIdentifierName()) + "\":\"" + EscapeJson(field.second.ToString()) + "\"";
 		}
 		json += "}";
 		return fabricator::BuildConnectionString(provider, secret_type, json, path);

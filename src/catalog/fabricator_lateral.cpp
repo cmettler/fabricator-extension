@@ -401,7 +401,9 @@ unique_ptr<FunctionData> LateralBind(ClientContext &context, TableFunctionBindIn
 	vector<Value> const_values;
 	bind_data->arg_width = input.input_table_types.size();
 	for (idx_t i = 0; i < input.input_table_types.size(); i++) {
-		auto slot_name = i < input.input_table_names.size() ? input.input_table_names[i] : string();
+		// input_table_names are Identifiers in 2.0; this works in strings.
+		auto slot_name = i < input.input_table_names.size() ? input.input_table_names[i].GetIdentifierName()
+		                                                    : string();
 		if (!slot_name.empty()) {
 			all_names_empty = false;
 		}
