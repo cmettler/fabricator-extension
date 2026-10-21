@@ -70,10 +70,12 @@ public interface IHostQuery
     /// DDL (<c>CREATE TABLE z(a INTEGER)</c>) yields <c>0</c>, and a <b>CTAS yields the rows it created</b>
     /// (<c>CREATE TABLE c AS SELECT * FROM range(7)</c> → <b>7</b>).
     /// <para>
-    /// ⚠ <b>That last case DIVERGES from the SQL-surface <c>fabricator_host_exec</c>, which answers 0</b>,
-    /// because the C++ side can ask DuckDB's <c>StatementReturnType::CHANGED_ROWS</c> and managed code
-    /// cannot. An earlier version of this doc claimed the CTAS yielded 0 here too; it was copied from the
-    /// other surface rather than measured on this one.
+    /// ⚠ That last case USED TO DIVERGE from the SQL-surface <c>fabricator_host_exec</c>, which answered
+    /// <c>0</c>, because the C++ side asks DuckDB's <c>StatementReturnType::CHANGED_ROWS</c> and managed
+    /// code cannot. <b>On DuckDB 2.0 the two AGREE</b>: upstream now classifies a CTAS as a row-count
+    /// statement, so the SQL surface reports the rows created too (a plain <c>CREATE TABLE b(x INT)</c> and
+    /// a <c>DROP</c> still report 0 on both). An even earlier version of this doc claimed the CTAS yielded
+    /// 0 here as well; that was copied from the other surface rather than measured on this one.
     /// </para>
     /// <para>
     /// ⚠ It follows that a SELECT returning one BIGINT reports that VALUE as a "count". A caller for whom

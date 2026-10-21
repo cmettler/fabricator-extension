@@ -322,15 +322,19 @@ SELECT * FROM fabricator_host_exec('DELETE FROM he_t WHERE n > 1');
 
 # DDL reports 0 and, again, happens once — twice would collide with itself.
 #
-# ⚠ A CTAS REPORTS 0 THOUGH IT CREATED A ROW, and that is deliberate rather than an oversight. The count is
-# asked of the statement via DuckDB's own StatementReturnType, which does not classify CREATE as a
-# row-count statement; it also matches Host.ExecuteNonQuery's existing contract ("DML -> a 1-row BIGINT
-# Count; DDL -> 0"), so the SQL surface and the C# one agree. Inferring from column types instead would
-# report 1 here — which is exactly where the mutant for that shortcut dies.
+# ⚠⚠ A CTAS REPORTS THE ROWS IT CREATED — CHANGED ON DuckDB 2.0, where it answered 0 before. The count is
+# still asked of the statement via DuckDB's own StatementReturnType (never inferred from column types);
+# what moved is upstream's CLASSIFICATION — 2.0 calls a CTAS a row-count statement, while a plain
+# `CREATE TABLE b(x INT)` and a `DROP` still report 0 (measured, all three).
+#
+# ⚠ This CLOSES a divergence rather than opening one: IHostQuery.ExecuteNonQuery already reported the rows
+# a CTAS created (it INFERS the count from the result shape and cannot ask the statement), so on 1.5 the
+# two surfaces disagreed on exactly this case and now they agree. The doc comment on ExecuteNonQuery that
+# recorded the divergence has been corrected with it.
 query I
 SELECT * FROM fabricator_host_exec('CREATE TABLE he_made AS SELECT 42 AS v');
 ----
-0
+1
 
 query I
 SELECT v FROM he_made;

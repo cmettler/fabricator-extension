@@ -642,9 +642,13 @@ FabricatorTableEntry::FabricatorTableEntry(Catalog &catalog, SchemaCatalogEntry 
                                        FabricatorHandle table_handle, vector<idx_t> rowid_columns,
                                        LogicalType rowid_type, vector<string> virtual_rowid_columns,
                                        vector<std::pair<string, LogicalType>> provider_virtual_columns)
-    : TableCatalogEntry(catalog, schema, info), table_handle_(table_handle),
+    : TableCatalogEntry(catalog, schema, info), columns_(std::move(info.columns)), table_handle_(table_handle),
       rowid_columns_(std::move(rowid_columns)), virtual_rowid_columns_(std::move(virtual_rowid_columns)),
       provider_virtual_columns_(std::move(provider_virtual_columns)), rowid_type_(std::move(rowid_type)) {
+}
+
+const ColumnList &FabricatorTableEntry::GetColumns() const {
+	return columns_;
 }
 
 FabricatorTableEntry::~FabricatorTableEntry() {
@@ -816,7 +820,8 @@ static unique_ptr<FunctionData> FabricatorScanDeserialize(Deserializer &deserial
 	}
 
 	unique_ptr<FunctionData> bind_data;
-	function = fabricator_entry->GetScanFunction(context, bind_data);
+	// 2.0: deserialize is handed a BoundTableFunction; our scan hands back the DEFINITION.
+	function = BoundTableFunction(fabricator_entry->GetScanFunction(context, bind_data));
 	auto &data = bind_data->Cast<fabricator::ArrowStreamBindData>();
 
 	deserializer.ReadProperty(103, "filter_json", data.filter_json);

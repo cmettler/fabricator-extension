@@ -455,7 +455,7 @@ PhysicalOperator &FabricatorCatalog::PlanCreateTableAs(ClientContext &context, P
 	info.schema_name = create_info.GetQualifiedName().Schema().GetIdentifierName();
 	info.table_name = create_info.GetQualifiedName().Name().GetIdentifierName();
 	for (auto &col : create_info.columns.Logical()) {
-		info.column_names.push_back(col.Name());
+		info.column_names.push_back(col.Name().GetIdentifierName());
 		info.column_types.push_back(col.Type());
 	}
 	info.replace = op.info->base->on_conflict == OnCreateConflict::REPLACE_ON_CONFLICT;

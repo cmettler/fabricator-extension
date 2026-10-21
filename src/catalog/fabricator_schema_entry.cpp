@@ -1068,7 +1068,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateScalarFunction(Clie
 	// declaration throws HERE rather than in the fetch above — it is a declaration bug, not a stale name, and
 	// the catch above would turn it into a silent "function does not exist".
 	ScalarFunction fn = BuildFabricatorScalarFunction(
-	    handle_, name, func_name, arg_types, arg_names, return_type, is_volatile,
+	    handle_, name.GetIdentifierName(), func_name, arg_types, arg_names, return_type, is_volatile,
 	    FabricatorVarArgsIndex(func_name, arg_names, arg_styles));
 
 	CreateScalarFunctionInfo info(std::move(fn));
@@ -1538,7 +1538,7 @@ void FabricatorAggregateUpdate(Vector inputs[], AggregateInputData &aggr_input_d
 		return;
 	}
 	Vector id_vec(LogicalType::BIGINT);
-	ReadStateIds(state, count, FlatVector::GetData<int64_t>(id_vec));
+	ReadStateIds(state, count, FlatVector::GetDataMutable<int64_t>(id_vec));
 	MarshalAggUpdate(bind, id_vec, inputs, input_count, count);
 }
 
@@ -1754,7 +1754,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateAggregateFunction(C
 	AggregateFunction fn =
 	    BuildFabricatorAggregateFunction(handle_, name.GetIdentifierName(), func_name, arg_types, arg_names, return_type, spillable);
 
-	AggregateFunctionSet set(Identifier(func_name));
+	AggregateFunctionSet set{Identifier(func_name)}; // braces: parens here are a most-vexing parse
 	set.AddFunction(fn);
 	CreateAggregateFunctionInfo info(std::move(set));
 	info.SetQualification(catalog.GetName(), Identifier(name));
@@ -2332,8 +2332,14 @@ static void FabricatorBuildInOutSignature(const vector<string> &names, const vec
 	if (tail.id() != LogicalTypeId::INVALID) {
 		sig.AddArgs("args", tail);
 	}
+	// ⚠⚠ THE `Value()` DEFAULT IS WHAT KEEPS THIS PARAMETER OPTIONAL. DuckDB 2.0 treats a keyword-only
+	// parameter WITHOUT a default as REQUIRED (1.5's `named_parameters` were always optional), so
+	// omitting it fails to bind at all — measured: `fluid_replacement_query('…')` reported *no function
+	// matches … (STRING_LITERAL)* while the same call WITH `params :=` bound. A NULL default is exactly
+	// equivalent to absence here, because the marshalling already substitutes NULL for an omitted named
+	// argument; FillNamedDefaults simply does that substitution one layer earlier.
 	for (auto &n : named) {
-		sig.AddKeywordOnly(Identifier(n.first), n.second);
+		sig.AddKeywordOnly(Identifier(n.first), n.second, Value());
 	}
 }
 
@@ -2383,7 +2389,7 @@ void FabricatorBuildSqlGenSignature(const vector<string> &all_names, const vecto
 		sig.AddArgs("args", sig_tail);
 	}
 	for (auto &n : sig_named) {
-		sig.AddKeywordOnly(Identifier(n.first), n.second);
+		sig.AddKeywordOnly(Identifier(n.first), n.second, Value()); // optional: see the note above
 	}
 }
 
@@ -3511,7 +3517,7 @@ void RegisterFabricatorGlobalFunctions(ExtensionLoader &loader) {
 				for (idx_t k = 0; k < arg_names.size(); k++) {
 					if (k < arg_styles.size() && arg_styles[k] == FabricatorParamStyle::NAMED) {
 						auto t = arg_types[k].id() == LogicalTypeId::SQLNULL ? LogicalType::ANY : arg_types[k];
-						tf.GetSignature().AddKeywordOnly(Identifier(arg_names[k]), t);
+						tf.GetSignature().AddKeywordOnly(Identifier(arg_names[k]), t, Value()); // optional (2.0: a default is what makes it so)
 					}
 				}
 				auto fn_info = make_shared_ptr<FabricatorTableFunctionInfo>();
@@ -3686,7 +3692,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateTableFunction(Clien
 			// as a SQLNULL-typed field — there is no Arrow type for ANY, so SQLNULL is the agreed marker.
 			// Register it as ANY so DuckDB passes any literal (a STRUCT, a VARCHAR, …) through UNCAST.
 			auto t = arg_types[i].id() == LogicalTypeId::SQLNULL ? LogicalType::ANY : arg_types[i];
-			tf.GetSignature().AddKeywordOnly(Identifier(arg_names[i]), t);
+			tf.GetSignature().AddKeywordOnly(Identifier(arg_names[i]), t, Value()); // optional (2.0: a default is what makes it so)
 		}
 	} else {
 		// A provider-declared NAMED parameter on a non-proc function: register it so `fn(x, flag := true)`
@@ -3694,7 +3700,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateTableFunction(Clien
 		for (idx_t i = 0; i < arg_names.size(); i++) {
 			if (i < arg_styles.size() && arg_styles[i] == FabricatorParamStyle::NAMED) {
 				auto t = arg_types[i].id() == LogicalTypeId::SQLNULL ? LogicalType::ANY : arg_types[i];
-				tf.GetSignature().AddKeywordOnly(Identifier(arg_names[i]), t);
+				tf.GetSignature().AddKeywordOnly(Identifier(arg_names[i]), t, Value()); // optional (2.0: a default is what makes it so)
 			}
 		}
 		// Best-effort filter pushdown into the TVF (reuses the table scan's serializer; the
@@ -4611,7 +4617,7 @@ void FabricatorSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &inf
 		request.kind = "add_column";
 		request.column = ac.new_column.Name().GetIdentifierName();
 		request.guard = ac.if_column_not_exists;
-		carry_type(ac.new_column.Type(), ac.new_column.Name());
+		carry_type(ac.new_column.Type(), ac.new_column.Name().GetIdentifierName());
 		// ⚠⚠ THE DEFAULT MUST BE CARRIED, and dropping it was SILENT: the column appeared, existing rows
 		// were NULL, and every LATER insert omitting it was NULL too, while DuckDB's own table both
 		// backfills and applies the default. Measured 2026-09-08 on SQL Server AND Delta.
@@ -4694,7 +4700,7 @@ void FabricatorSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &inf
 			request.path.push_back(p.GetIdentifierName());
 		}
 		request.guard = af.if_field_not_exists;
-		carry_type(af.new_field.Type(), af.new_field.Name());
+		carry_type(af.new_field.Type(), af.new_field.Name().GetIdentifierName());
 		break;
 	}
 	case AlterTableType::REMOVE_FIELD: {

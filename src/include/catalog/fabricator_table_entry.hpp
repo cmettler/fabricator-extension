@@ -50,6 +50,12 @@ public:
 	unique_ptr<BaseStatistics> GetStatistics(ClientContext &context, column_t column_id) override;
 	TableStorageInfo GetStorageInfo(ClientContext &context) override;
 
+	//! 2.0 made this pure virtual and dropped the base's `columns` member, so every table entry owns its
+	//! own column list now (DuckTableEntry does the same). Ours is moved out of the CreateTableInfo the
+	//! catalog built from the provider's schema crossing and is immutable for the entry's life — an ALTER
+	//! REBUILDS the entry rather than editing it in place.
+	const ColumnList &GetColumns() const override;
+
 	//! The base decides which EXTRA columns an UPDATE must project. We take every one of its rules except
 	//! ONE: it turns an update that assigns a LIST / ARRAY / MAP / UNION / VARIANT / GEOMETRY column (or a
 	//! STRUCT containing any of those) into a delete+insert and therefore projects the WHOLE ROW.
@@ -104,6 +110,8 @@ private:
 	TableFunction BuildScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data,
 	                                optional_ptr<BoundAtClause> at_clause);
 
+	//! The table's columns (2.0: owned here, see GetColumns). Declared FIRST so it is initialized first.
+	ColumnList columns_;
 	//! The owned table-session handle (see the constructor note). Never null for a live entry.
 	FabricatorHandle table_handle_;
 	//! Indices (in table column order) of the rowid/PK columns; empty => no rowid.

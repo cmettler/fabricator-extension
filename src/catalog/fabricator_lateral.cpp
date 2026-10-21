@@ -794,7 +794,7 @@ public:
 //! sits above it and resolves column bindings by (table_index, column_index). Get that wrong and it is a
 //! binder error at best, the wrong columns at worst.
 struct LateralBatchedLogical : public LogicalExtensionOperator {
-	idx_t table_index = 0;
+	TableIndex table_index; // 2.0: typed table index
 	vector<column_t> projected_input;
 	vector<LogicalType> callee_types;
 	vector<ColumnBinding> callee_bindings;
@@ -802,8 +802,9 @@ struct LateralBatchedLogical : public LogicalExtensionOperator {
 	//! The indices, into the binding's declared output schema, this plan reads. EMPTY = all of them.
 	vector<int32_t> projected;
 
-	vector<idx_t> GetTableIndex() const override {
-		return vector<idx_t> {table_index};
+	// 2.0: table indexes are a typed TableIndex, not a bare idx_t.
+	vector<TableIndex> GetTableIndex() const override {
+		return vector<TableIndex> {TableIndex(table_index)};
 	}
 
 	vector<ColumnBinding> GetColumnBindings() override {
@@ -923,7 +924,7 @@ void RewriteLateralNodes(unique_ptr<LogicalOperator> &op) {
 	// the eligibility check) LogicalGet produces exactly (table_index, i), and constructing them here avoids
 	// depending on call order relative to the moves below.
 	for (idx_t i = 0; i < base; i++) {
-		node->callee_bindings.emplace_back(get.table_index, i);
+		node->callee_bindings.emplace_back(get.table_index, ProjectionIndex(i)); // 2.0: explicit index type
 		node->callee_types.push_back(get.types[i]);
 	}
 	node->projected_input = std::move(get.projected_input);
@@ -1011,8 +1012,14 @@ TableFunction FabricatorMakeLateralFunction(FabricatorHandle handle, const strin
 	if (sig_tail.id() != LogicalTypeId::INVALID) {
 		sig.AddArgs("args", sig_tail);
 	}
+	// ⚠⚠ THE `Value()` DEFAULT IS WHAT KEEPS THIS PARAMETER OPTIONAL. DuckDB 2.0 treats a keyword-only
+	// parameter WITHOUT a default as REQUIRED (1.5's `named_parameters` were always optional), so
+	// omitting it fails to bind at all — measured: `fluid_replacement_query('…')` reported *no function
+	// matches … (STRING_LITERAL)* while the same call WITH `params :=` bound. A NULL default is exactly
+	// equivalent to absence here, because the marshalling already substitutes NULL for an omitted named
+	// argument; FillNamedDefaults simply does that substitution one layer earlier.
 	for (auto &n : sig_named) {
-		sig.AddKeywordOnly(Identifier(n.first), n.second);
+		sig.AddKeywordOnly(Identifier(n.first), n.second, Value());
 	}
 	info->handle = handle;
 	info->schema = schema_name;

@@ -10,6 +10,12 @@ duckdb_extension_load(fabricator
     EXTENSION_VERSION "${FABRICATOR_EXTENSION_VERSION}"
     LOAD_TESTS
 )
+# ⚠ DuckDB 2.0 REMOVED `DONT_LINK` and INVERTED the default: `duckdb_extension_load` now only BUILDS an
+# extension, and static linking into duckdb.exe / unittest.exe is opt-in per extension. Without this call the
+# build is green, the loadable is produced, and every `.test` file silently SKIPS with `require fabricator` —
+# which reads as a missing managed bridge, not as a link-configuration change. `json`/`icu`/`parquet` keep
+# working through it because DuckDB's own extension/extension_config.cmake lists them.
+duckdb_extension_statically_link(fabricator)
 
 # Statically build + link the core `json` extension into the test binaries so the DuckDB `JSON` type is
 # available. This build reports version v0.0.1, so `json` can't be autoloaded from the extension repo
@@ -36,3 +42,4 @@ duckdb_extension_load(httpfs
     GIT_URL https://github.com/duckdb/duckdb-httpfs
     GIT_TAG 77392a72077a85897db2519fae11e2c0da972b8a
 )
+duckdb_extension_statically_link(httpfs)

@@ -182,7 +182,11 @@ static unique_ptr<FunctionData> CopyToBind(ClientContext &context, CopyFunctionB
 		throw BinderException("mssql COPY: catalog '%s' is not a fabricator catalog", bind_data->catalog_name);
 	}
 	bind_data->handle = catalog.Cast<FabricatorCatalog>().GetHandle();
-	bind_data->column_names = names;
+	// names arrive as Identifiers in 2.0; our bind data works in strings.
+	bind_data->column_names.clear();
+	for (auto &n : names) {
+		bind_data->column_names.push_back(n.GetIdentifierName());
+	}
 	bind_data->column_types = sql_types;
 	BindCommonCopyOptions(input.info.options, *bind_data, "mssql");
 	return std::move(bind_data);
@@ -226,7 +230,11 @@ static unique_ptr<FunctionData> DeltaCopyToBind(ClientContext &context, CopyFunc
 	bind_data->schema_name = "main";                 // flat layout
 	bind_data->table_name = path.substr(slash + 1);
 
-	bind_data->column_names = names;
+	// names arrive as Identifiers in 2.0; our bind data works in strings.
+	bind_data->column_names.clear();
+	for (auto &n : names) {
+		bind_data->column_names.push_back(n.GetIdentifierName());
+	}
 	bind_data->column_types = sql_types;
 
 	// MODE — the Spark/delta-rs write-disposition vocabulary:

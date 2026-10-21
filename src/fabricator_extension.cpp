@@ -616,7 +616,13 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// (params := {'a': 1}) or a JSON string (params := '{"a": 1}') — the daxeval/fluid_render convention.
 	// A fixed VARCHAR would force DuckDB to stringify a struct before we ever saw it.
 	// ⚠ `params` is a RESERVED argument name on this function from here on.
-	query_fn.GetSignature().AddKeywordOnly("params", LogicalType::ANY);
+		// ⚠⚠ THE `Value()` DEFAULT IS WHAT KEEPS THIS PARAMETER OPTIONAL. DuckDB 2.0 treats a keyword-only
+	// parameter WITHOUT a default as REQUIRED (1.5's `named_parameters` were always optional), so
+	// omitting it fails to bind at all — measured: `fluid_replacement_query('…')` reported *no function
+	// matches … (STRING_LITERAL)* while the same call WITH `params :=` bound. A NULL default is exactly
+	// equivalent to absence here, because the marshalling already substitutes NULL for an omitted named
+	// argument; FillNamedDefaults simply does that substitution one layer earlier.
+query_fn.GetSignature().AddKeywordOnly("params", LogicalType::ANY, Value());
 	loader.RegisterFunction(query_fn);
 
 	// fabricator_functions(catalog|connstr) — lists discovered routines (diagnostic).

@@ -15,6 +15,7 @@
 #include "duckdb/common/arrow/arrow_converter.hpp"
 #include "duckdb/function/table/arrow/arrow_duck_schema.hpp"
 #include "duckdb/common/arrow/arrow_wrapper.hpp" // ArrowArrayStreamWrapper (our arrow_scan factory)
+#include "duckdb/function/table/arrow.hpp" // ArrowScanFactory (2.0: arrow_scan takes bind info)
 #include "duckdb/function/table/arrow.hpp"       // ArrowStreamParameters + the factory typedefs
 #include "duckdb/main/relation.hpp"              // Relation::CreateView(name, replace, TEMPORARY)
 #include "duckdb/function/replacement_scan.hpp"
@@ -630,25 +631,38 @@ void FabricatorEmptySchemaRelease(ArrowSchema *schema) {
 	schema->release = nullptr;
 }
 
-unique_ptr<ArrowArrayStreamWrapper> FabricatorArrowStreamProduce(uintptr_t stream_factory_ptr,
-                                                                 ArrowStreamParameters &) {
-	auto *stream = reinterpret_cast<ArrowArrayStream *>(stream_factory_ptr);
-	auto ret = make_uniq<ArrowArrayStreamWrapper>();
-	ret->arrow_array_stream = *stream;
-	ret->arrow_array_stream.release = FabricatorEmptyStreamRelease;
-	return ret;
-}
+// ⚠⚠ 2.0 REPLACED `arrow_scan`'s THREE POINTER ARGUMENTS with an `ArrowScanFactory` handed in as BIND INFO
+// (`Connection::TableFunction(name, args, named_args, bind_info)`); the function now declares NO arguments
+// at all, so the old call failed to bind with *"No function matches … arrow_scan(POINTER, POINTER, POINTER)
+// … Candidate functions: arrow_scan()"*. The two methods below are VERBATIM the two free callbacks this
+// replaced, and the NON-OWNING contract they exist for is unchanged: the CALLER owns `stream`, so the
+// stream's and the schema's release callbacks are neutralised before DuckDB can reach them.
+struct FabricatorArrowScanFactory : public ArrowScanFactory {
+	explicit FabricatorArrowScanFactory(ArrowArrayStream &stream_p) : stream(stream_p) {
+	}
 
-void FabricatorArrowStreamGetSchema(ArrowArrayStream *stream, ArrowSchema &schema) {
-	stream->get_schema(stream, &schema);
-	// Nulling the ROOT release stops ArrowSchemaWrapper's destructor freeing a schema the caller owns; the
-	// children are covered by the backup dance below. (Upstream does exactly this, for the same reason.)
-	schema.release = nullptr;
-}
+	void GetSchema(ArrowSchema &schema) override {
+		stream.get_schema(&stream, &schema);
+		// Nulling the ROOT release stops ArrowSchemaWrapper's destructor freeing a schema the caller owns;
+		// the children are covered by the backup dance in RegisterArrowInputView.
+		schema.release = nullptr;
+	}
+
+	unique_ptr<ArrowArrayStreamWrapper> ProduceStream(ArrowStreamParameters &) override {
+		auto ret = make_uniq<ArrowArrayStreamWrapper>();
+		ret->arrow_array_stream = stream;
+		ret->arrow_array_stream.release = FabricatorEmptyStreamRelease;
+		return ret;
+	}
+
+	//! NOT owned — see the class comment. Its lifetime is the OwnedArrowInputs holder's, which outlives the
+	//! view because the result stream owns it.
+	ArrowArrayStream &stream;
+};
 
 // Registers `stream` as a TEMPORARY view named `name` on `conn`. Returns false on any failure, which is the
 // same signal `duckdb_arrow_scan`'s DuckDBError gave the caller.
-bool RegisterArrowInputView(Connection &conn, const string &name, ArrowArrayStream *stream) {
+bool RegisterArrowInputView(Connection &conn, const string &name, ArrowArrayStream *stream, string &error) {
 	// Back up and neutralise the IMMEDIATE children's release callbacks so DuckDB cannot release the
 	// caller's schema children on its behalf. Arrow releases are not recursive, so immediate children are
 	// the whole job — upstream's comment, and its dance, reproduced verbatim.
@@ -664,12 +678,16 @@ bool RegisterArrowInputView(Connection &conn, const string &name, ArrowArrayStre
 	}
 	bool ok = true;
 	try {
-		conn.TableFunction("arrow_scan",
-		                   {Value::POINTER(reinterpret_cast<uintptr_t>(stream)),
-		                    Value::POINTER(reinterpret_cast<uintptr_t>(FabricatorArrowStreamProduce)),
-		                    Value::POINTER(reinterpret_cast<uintptr_t>(FabricatorArrowStreamGetSchema))})
+		conn.TableFunction("arrow_scan", {}, {}, make_shared_ptr<FabricatorArrowScanFactory>(*stream))
 		    ->CreateView(Identifier(name), /*replace=*/true, /*temporary=*/true);
+	} catch (const std::exception &ex) {
+		// ⚠ The REASON is carried out rather than swallowed: this used to be a bare `catch (...)` and the
+		// caller's "failed to register input view '<name>'" named no cause at all — which cost a debugging
+		// round on the 2.0 port, where every Delta write failed here and the message said nothing about why.
+		error = ErrorData(ex).RawMessage();
+		ok = false;
 	} catch (...) {
+		error = "unknown error";
 		ok = false;
 	}
 	for (idx_t i = 0; i < n_children; i++) {
@@ -730,8 +748,10 @@ void MakeHostQueryStream(DatabaseInstance &db, const string &sql, ArrowArrayStre
 	// them.
 	auto owned_inputs = make_uniq<OwnedArrowInputs>();
 	for (auto &in : inputs) {
-		if (!RegisterArrowInputView(*conn, in.name, owned_inputs->Adopt(in.stream))) {
-			throw IOException("fabricator_host_query: failed to register input view '" + in.name + "'");
+		string register_error;
+		if (!RegisterArrowInputView(*conn, in.name, owned_inputs->Adopt(in.stream), register_error)) {
+			throw IOException("fabricator_host_query: failed to register input view '" + in.name +
+			                  "': " + register_error);
 		}
 	}
 	unique_ptr<QueryResult> result;
@@ -775,26 +795,43 @@ void MakeHostQueryStream(DatabaseInstance &db, const string &sql, ArrowArrayStre
 			by_name = !names[c].empty() && declared.find(Identifier(names[c])) != declared.end();
 		}
 		if (by_name) {
-			case_insensitive_map_t<BoundParameterData> named;
+			identifier_map_t<BoundParameterData> named; // 2.0: Execute keys by Identifier
 			for (idx_t c = 0; c < values.size(); c++) {
-				if (named.find(names[c]) != named.end()) {
+				if (named.find(Identifier(names[c])) != named.end()) {
 					throw IOException("fabricator_host_query: duplicate parameter name '" + names[c] +
 					                  "' in the bound parameters");
 				}
-				named.emplace(names[c], BoundParameterData(values[c]));
+				named.emplace(Identifier(names[c]), BoundParameterData(values[c]));
 			}
 			// Streaming result: it references the prepared statement, so the holder keeps `prepared` alive.
-			result = prepared->Execute(named, /*allow_stream_result=*/true);
+			// ⚠ 2.0: `Submit` is the streaming half of the old `Execute(..., allow_stream_result)`; the
+			// `allow_stream_result` flag is gone and `Execute` now always materialises. Streaming is
+			// load-bearing here for the same reason as the unprepared path below.
+			result = prepared->Submit(named);
 		} else {
-			result = prepared->Execute(values, /*allow_stream_result=*/true);
+			result = prepared->Submit(values);
 		}
 	} else {
-		// ⚠ 2.0: `Submit` is the STREAMING half of the old SendQuery (`Query` materialises). Streaming is
-		// load-bearing here — see the file header: the arrow scan holds a raw pointer into the caller's
-		// struct, and bounded memory for large results is the whole point. ⚠ Submit accepts ONE statement,
-		// so a caller passing several now gets a LOUD error where 1.5 ran them all; host_query's contract
-		// is a single result-producing query, and failing loudly beats materialising silently.
-		result = conn->Submit(sql); // streaming (lazy Fetch) — bounded memory for large results
+		// ⚠⚠ 2.0 SPLIT THE OLD `SendQuery` AND YOU CANNOT HAVE BOTH HALVES: `Submit` STREAMS but accepts ONE
+		// statement, `Query` accepts several but MATERIALISES. 1.5's SendQuery did both, and this function
+		// relies on each property in a different case — so the split is resolved PER CALL rather than once.
+		//
+		// Streaming is load-bearing for the ordinary single-statement call (see the file header: the arrow
+		// scan holds a raw pointer into the caller's struct, and bounded memory for large results is the
+		// whole point), so that case takes `Submit`.
+		//
+		// ⚠ The multi-statement case is the DOCUMENTED FALLBACK pinned by verify_host_query (the same shape
+		// the bind's describe falls back on, double execution included). `Submit` would turn it into a LOUD
+		// `Cannot prepare multiple statements at once!` — a working call becoming an error, which is the one
+		// outcome the fallback exists to avoid. It takes `Query`, i.e. it now MATERIALISES. That is a real
+		// cost and it is bounded to this shape: a multi-statement call could never be described, so nothing
+		// streams it by design, and only the LAST statement's result is returned either way.
+		auto statements = conn->ExtractStatements(sql); // throws on a parse error, as the execution would
+		if (statements.size() > 1) {
+			result = conn->Query(sql); // several statements: materialises, returns the last one's result
+		} else {
+			result = conn->Submit(sql); // streaming (lazy Fetch) — bounded memory for large results
+		}
 	}
 	if (result->HasError()) { // bind/plan errors surface here; runtime errors surface during Fetch (get_next)
 		throw IOException("fabricator_host_query: " + result->GetError());

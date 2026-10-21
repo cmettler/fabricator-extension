@@ -6,6 +6,8 @@
 //                         Fabricator — Arrow stream ingestion (impl)
 //===----------------------------------------------------------------------===//
 
+#include "duckdb/common/enum_util.hpp"
+#include "duckdb/common/printer.hpp"
 #include "fabricator/arrow_ingest.hpp"
 
 #include "fabricator/arrow_produce.hpp"
@@ -24,6 +26,9 @@
 // incomplete types here (the old header only forward-declares them now).
 #include "duckdb/planner/table_filter_set.hpp"
 #include "duckdb/planner/filter/table_filter_functions.hpp"
+#include "duckdb/planner/expression_iterator.hpp"
+#include "duckdb/planner/expression/bound_conjunction_expression.hpp"
+#include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/filter/optional_filter.hpp"
 #include "duckdb/planner/filter/dynamic_filter.hpp"
 #include "duckdb/planner/filter/conjunction_filter.hpp"
@@ -298,8 +303,15 @@ void PopulateReturnSchema(ClientContext &context, ArrowStreamBindData &bind_data
 	}
 
 	// Build DuckDB's per-column Arrow converters, then derive names + DuckDB types + nullability.
-	ReadSchemaColumns(context, bind_data.schema_root.arrow_schema, bind_data.arrow_table, return_types, names,
-	                  &bind_data.column_nullable);
+	// ReadSchemaColumns speaks strings (its other caller is the function-metadata path); a 2.0 bind
+	// reports Identifiers, so convert here rather than typing the helper to one of its two callers.
+	vector<string> schema_names;
+	ReadSchemaColumns(context, bind_data.schema_root.arrow_schema, bind_data.arrow_table, return_types,
+	                  schema_names, &bind_data.column_nullable);
+	names.clear();
+	for (auto &n : schema_names) {
+		names.push_back(Identifier(n));
+	}
 	if (return_types.empty()) {
 		throw IOException("Fabricator: result schema has no columns");
 	}
@@ -315,7 +327,9 @@ BindInfo ArrowStreamGetBindInfo(TableFunctionGetBindInfoInput &input) { // 2.0: 
 	auto bind_data = input.bind_data;
 	auto &data = bind_data->Cast<ArrowStreamBindData>();
 	if (data.table) {
-		return BindInfo(const_cast<TableCatalogEntry &>(*data.table));
+		// 2.0 dropped BindInfo's TableCatalogEntry member, so the classification is all that is left to
+		// report; nothing in the engine reads the entry back out of a BindInfo any more.
+		return BindInfo(ScanType::TABLE);
 	}
 	return BindInfo(ScanType::EXTERNAL);
 }
@@ -361,6 +375,60 @@ static void SqlIdentIngest(const string &s, string &out) {
 		}
 	}
 	out += '"';
+}
+
+// ---- Internal table-filter functions must never reach a host query ----------------------------------
+// ⚠⚠ DuckDB 2.0 renders OPTIONAL / BLOOM / DYNAMIC / PREFIX-RANGE / SELECTIVITY filters as calls to
+// INTERNAL scalar functions (`__internal_tablefilter_optional`, …) whose bind THROWS
+// *"Table filter functions are for internal use only!"*. They are reachable from here because 2.0's
+// optimizer hands us an EXPRESSION_FILTER whose tree embeds them, where 1.5 handed the legacy wrapper
+// shapes this file strips by TYPE. Measured on a join: the rendered predicate was
+// `(("id" >= 2) AND (__internal_tablefilter_optional("id") AND __internal_tablefilter_optional("id")))`,
+// which binds nowhere.
+// All five are "not required for query correctness" (DuckDB re-applies every predicate above the scan),
+// so DROPPING them is superset-safe — the same rule the legacy branches already apply by returning false.
+static bool ContainsTableFilterFunction(const Expression &e) {
+	if (e.GetExpressionClass() == ExpressionClass::BOUND_FUNCTION &&
+	    TableFilterFunctions::IsTableFilterFunction(e.Cast<BoundFunctionExpression>().Function())) {
+		return true;
+	}
+	bool found = false;
+	ExpressionIterator::EnumerateChildren(e, [&](const Expression &child) {
+		if (!found && ContainsTableFilterFunction(child)) {
+			found = true;
+		}
+	});
+	return found;
+}
+
+//! Returns a copy of `e` with the internal filter functions pruned, or nullptr when nothing
+//! correctness-bearing survives. Pruning happens ONLY under an AND — dropping a branch of an OR would
+//! NARROW the result (lose rows), and an argument of a comparison has no meaning without it.
+static unique_ptr<Expression> PruneTableFilterFunctions(const Expression &e) {
+	if (!ContainsTableFilterFunction(e)) {
+		return e.Copy();
+	}
+	if (e.GetExpressionType() == ExpressionType::CONJUNCTION_AND) {
+		vector<unique_ptr<Expression>> kept;
+		for (auto &child : e.Cast<BoundConjunctionExpression>().GetChildren()) {
+			auto pruned = PruneTableFilterFunctions(*child);
+			if (pruned) {
+				kept.push_back(std::move(pruned));
+			}
+		}
+		if (kept.empty()) {
+			return nullptr;
+		}
+		if (kept.size() == 1) {
+			return std::move(kept[0]);
+		}
+		auto conj = make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_AND);
+		for (auto &k : kept) {
+			conj->GetChildrenMutable().push_back(std::move(k));
+		}
+		return std::move(conj);
+	}
+	return nullptr;
 }
 
 // Render one live TableFilter to a DuckDB SQL predicate on `qcol` (an already-quoted identifier). Returns
@@ -471,7 +539,13 @@ static bool RenderTableFilter(const TableFilter &f, const string &qcol, string &
 		if (!expr) {
 			return false;
 		}
-		out += expr->ToString();
+		// ⚠ An EXPRESSION_FILTER's tree may embed internal table-filter functions — see
+		// PruneTableFilterFunctions. Unpruned they render SQL that binds NOWHERE.
+		auto pruned = PruneTableFilterFunctions(*expr);
+		if (!pruned) {
+			return false;
+		}
+		out += pruned->ToString();
 		return true;
 	}
 	}
@@ -762,7 +836,17 @@ static string RenderLiveFilters(const ArrowStreamBindData &bind_data, TableFunct
 		string qcol;
 		SqlIdentIngest(col_name, qcol);
 		string rendered;
-		if (RenderTableFilter(entry.Filter(), qcol, rendered) && !rendered.empty()) {
+		bool ok = RenderTableFilter(entry.Filter(), qcol, rendered);
+		// ⚠ SHIPPED, env-gated, like the Fabricator.Memory marks and the Arrow liveness registry: what a
+		// pushed filter RENDERS TO is invisible from SQL (a predicate that silently fails to render is a
+		// performance regression with no message, and one that renders WRONG binds nowhere). This print is
+		// what found the EXPRESSION_FILTER/internal-function defect in minutes after four passes of reading
+		// had not — and it is the instrument the EXPRESSION_FILTER migration will need.
+		if (getenv("FABRICATOR_DUMP_FILTERS")) {
+			Printer::Print("FILTER type=" + EnumUtil::ToString(entry.Filter().filter_type) +
+			               " rendered=" + (ok ? "yes" : "no") + " sql=[" + rendered + "]");
+		}
+		if (ok && !rendered.empty()) {
 			conds.push_back(std::move(rendered));
 		}
 	}

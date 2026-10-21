@@ -196,9 +196,9 @@ void RegisterFabricatorWait(ExtensionLoader &loader) {
 	// `SET preserve_insertion_order=false` reaches PhysicalBufferedCollector(parallel=true).
 	// See docs/scan-concurrency.md §5.
 	fn.get_partition_data = WaitGetPartitionData;
-	fn.GetSignature().AddKeywordOnly("hold_lock", LogicalType::BOOLEAN); // see WaitBindData: inverts the control
-	fn.GetSignature().AddKeywordOnly("threads", LogicalType::BIGINT); // override what MaxThreads() reports; see WaitBindData
-	fn.GetSignature().AddKeywordOnly("async_wait", LogicalType::BOOLEAN); // hand the worker back; see WaitBindData
+	fn.GetSignature().AddKeywordOnly("hold_lock", LogicalType::BOOLEAN, Value()); // see WaitBindData: inverts the control
+	fn.GetSignature().AddKeywordOnly("threads", LogicalType::BIGINT, Value()); // override what MaxThreads() reports; see WaitBindData
+	fn.GetSignature().AddKeywordOnly("async_wait", LogicalType::BOOLEAN, Value()); // hand the worker back; see WaitBindData
 	loader.RegisterFunction(fn);
 }
 

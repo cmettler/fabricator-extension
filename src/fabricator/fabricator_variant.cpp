@@ -49,7 +49,7 @@ unique_ptr<Expression> BindVariantConversion(ClientContext &context, const char 
 	return expr;
 }
 
-void ExecuteConversion(ClientContext &context, Expression &expr, Vector &input, idx_t count, Vector &result) {
+void ExecuteConversion(ClientContext &context, Expression &expr, const Vector &input, idx_t count, Vector &result) {
 	if (count > STANDARD_VECTOR_SIZE) {
 		// The extension conversion machinery materializes internal vectors of one standard chunk (see
 		// ColumnArrowToDuckDB / ArrowAppendData::AppendChild), so this cannot legitimately trigger; a clear
@@ -108,7 +108,8 @@ void VariantArrowToDuck(ClientContext &context, Vector &source, Vector &result, 
 
 // VARIANT -> transport blob (Arrow export / appenders): variant_to_parquet_variant gives the unshredded
 // struct<metadata, value>; the two halves are concatenated into the single transport blob.
-void VariantDuckToArrow(ClientContext &context, Vector &source, Vector &result, idx_t count) {
+// 2.0: cast_duck_arrow_t takes a CONST source (the arrow-to-duck direction still does not).
+void VariantDuckToArrow(ClientContext &context, const Vector &source, Vector &result, idx_t count) {
 	auto expr = BindVariantConversion(context, "variant_to_parquet_variant", LogicalType::VARIANT());
 	Vector transport(expr->GetReturnType(), count);
 	ExecuteConversion(context, *expr, source, count, transport);
