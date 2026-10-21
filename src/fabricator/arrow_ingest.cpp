@@ -18,6 +18,10 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/database.hpp" // DatabaseInstance::NumberOfThreads — the scan's MaxThreads
 #include "duckdb/planner/table_filter.hpp"
+// 2.0 split these out of table_filter.hpp; without them DynamicFilterData / TableFilterSet are
+// incomplete types here (the old header only forward-declares them now).
+#include "duckdb/planner/table_filter_set.hpp"
+#include "duckdb/planner/filter/table_filter_functions.hpp"
 #include "duckdb/planner/filter/optional_filter.hpp"
 #include "duckdb/planner/filter/dynamic_filter.hpp"
 #include "duckdb/planner/filter/conjunction_filter.hpp"

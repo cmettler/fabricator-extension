@@ -62,20 +62,26 @@ public:
 	// (read_parquet-on-DuckDB) path; both are always produced together so they cannot diverge.
 	bool Serialize(const Expression &e, string &out, string &sql) {
 		switch (e.GetExpressionClass()) {
-		case ExpressionClass::BOUND_FUNCTION:
-			// DuckDB 2.0 lowered comparisons onto BoundFunctionExpression, so this class now carries BOTH
-			// comparisons and ordinary functions (struct_extract among them). IsComparison is the only
-			// discriminator; a non-comparison function is not a predicate we can serialize.
-			if (!BoundComparisonExpression::IsComparison(e)) {
-				return false;
+		case ExpressionClass::BOUND_FUNCTION: {
+			// DuckDB 2.0 lowered BOTH comparisons and BETWEEN onto BoundFunctionExpression, so this class now
+			// carries them alongside ordinary functions (struct_extract among them). The two discriminators
+			// are disjoint: IsComparison covers exactly the eight binary comparison types (read from
+			// comparison.cpp, which deliberately excludes BETWEEN), and a range is COMPARE_BETWEEN.
+			// ⚠ COMPARE_NOT_BETWEEN is deliberately NOT handled — refusing is always superset-safe, since
+			// DuckDB re-applies every predicate anyway.
+			auto &fexpr = e.Cast<BoundFunctionExpression>();
+			if (BoundComparisonExpression::IsComparison(e)) {
+				return Comparison(fexpr, out, sql);
 			}
-			return Comparison(e.Cast<BoundFunctionExpression>(), out, sql);
+			if (e.GetExpressionType() == ExpressionType::COMPARE_BETWEEN) {
+				return Between(fexpr, out, sql);
+			}
+			return false;
+		}
 		case ExpressionClass::BOUND_OPERATOR:
 			return Operator(e.Cast<BoundOperatorExpression>(), out, sql);
 		case ExpressionClass::BOUND_CONJUNCTION:
 			return Conjunction(e.Cast<BoundConjunctionExpression>(), out, sql);
-		case ExpressionClass::BOUND_BETWEEN:
-			return Between(e.Cast<BoundBetweenExpression>(), out, sql);
 		default:
 			return false;
 		}
@@ -480,28 +486,35 @@ private:
 		return true;
 	}
 
-	bool Between(const BoundBetweenExpression &b, string &out, string &sql) {
+	// DuckDB 2.0 lowered BETWEEN onto BoundFunctionExpression, exactly as it did comparisons; the old class
+	// name is now a struct of static helpers over that. Same shape as Comparison() above.
+	bool Between(const BoundFunctionExpression &b, string &out, string &sql) {
 		vector<string> path;
 		LogicalType coltype;
-		if (!ColumnPath(*b.input, path, coltype)) {
+		if (!BoundBetweenExpression::HasValidBindData(b)) {
+			return false;
+		}
+		auto &lower = BoundBetweenExpression::LowerBound(b);
+		auto &upper = BoundBetweenExpression::UpperBound(b);
+		if (!ColumnPath(BoundBetweenExpression::Input(b), path, coltype)) {
 			return false;
 		}
 		if (coltype.id() == LogicalTypeId::VARCHAR && !string_order_pushable_) {
 			return false; // string range: collation-dependent ordering, not superset-safe (unless byte-ordered)
 		}
-		if (b.lower->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT ||
-		    b.upper->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
+		if (lower.GetExpressionClass() != ExpressionClass::BOUND_CONSTANT ||
+		    upper.GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
 			return false;
 		}
-		auto &lo = b.lower->Cast<BoundConstantExpression>().GetValue();
-		auto &hi = b.upper->Cast<BoundConstantExpression>().GetValue();
+		auto &lo = lower.Cast<BoundConstantExpression>().GetValue();
+		auto &hi = upper.Cast<BoundConstantExpression>().GetValue();
 		if (lo.IsNull() || hi.IsNull()) {
 			return false;
 		}
 		idx_t lo_idx = AddConstant(lo);
 		idx_t hi_idx = AddConstant(hi);
-		const char *lo_op = b.lower_inclusive ? ">=" : ">";
-		const char *hi_op = b.upper_inclusive ? "<=" : "<";
+		const char *lo_op = BoundBetweenExpression::LowerInclusive(b) ? ">=" : ">";
+		const char *hi_op = BoundBetweenExpression::UpperInclusive(b) ? "<=" : "<";
 		out = "{\"op\":\"and\",\"children\":[{\"op\":\"compare\",\"cmp\":\"";
 		out += lo_op;
 		out += "\",";

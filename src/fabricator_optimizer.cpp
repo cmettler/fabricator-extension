@@ -75,15 +75,15 @@ bool ResolveOrderColumn(const Expression &expr, LogicalGet &get, LogicalProjecti
 	const Expression *e = &expr;
 	if (proj) {
 		if (e->GetExpressionClass() == ExpressionClass::BOUND_REF) {
-			auto idx = e->Cast<BoundReferenceExpression>().index;
+			auto idx = e->Cast<BoundReferenceExpression>().Index();
 			if (idx >= proj->expressions.size()) {
 				return false;
 			}
 			e = proj->expressions[idx].get();
 		} else if (e->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
 			auto &cr = e->Cast<BoundColumnRefExpression>();
-			if (cr.binding.table_index == proj->table_index && cr.binding.column_index < proj->expressions.size()) {
-				e = proj->expressions[cr.binding.column_index].get();
+			if (cr.Binding().table_index == proj->table_index && cr.Binding().column_index < proj->expressions.size()) {
+				e = proj->expressions[cr.Binding().column_index].get();
 			}
 		}
 	}
@@ -91,12 +91,12 @@ bool ResolveOrderColumn(const Expression &expr, LogicalGet &get, LogicalProjecti
 	idx_t col_ids_index;
 	if (e->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
 		auto &cr = e->Cast<BoundColumnRefExpression>();
-		if (cr.binding.table_index != get.table_index) {
+		if (cr.Binding().table_index != get.table_index) {
 			return false;
 		}
-		col_ids_index = cr.binding.column_index;
+		col_ids_index = cr.Binding().column_index;
 	} else if (e->GetExpressionClass() == ExpressionClass::BOUND_REF) {
-		col_ids_index = e->Cast<BoundReferenceExpression>().index;
+		col_ids_index = e->Cast<BoundReferenceExpression>().Index();
 	} else {
 		return false;
 	}

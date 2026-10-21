@@ -110,7 +110,7 @@ struct FabricatorCopyGlobalState : public GlobalFunctionData {
 struct FabricatorCopyLocalState : public LocalFunctionData {};
 
 static bool GetBoolOption(const case_insensitive_map_t<vector<Value>> &options, const string &key, bool fallback) {
-	auto it = options.find(key);
+	auto it = options.find(Identifier(key));
 	if (it == options.end() || it->second.empty()) {
 		return fallback;
 	}
@@ -123,7 +123,7 @@ static bool GetBoolOption(const case_insensitive_map_t<vector<Value>> &options, 
 }
 
 // A string COPY option (e.g. SCHEMA_MODE 'merge'|'overwrite'); empty when absent.
-static string GetStringOption(const case_insensitive_map_t<vector<Value>> &options, const string &key) {
+static string GetStringOption(const identifier_map_t<vector<Value>> &options, const string &key) {
 	auto it = options.find(key);
 	if (it == options.end() || it->second.empty() || it->second[0].IsNull()) {
 		return string();
@@ -176,7 +176,7 @@ static unique_ptr<FunctionData> CopyToBind(ClientContext &context, CopyFunctionB
 	auto bind_data = make_uniq<FabricatorCopyBindData>();
 	ParseTarget(input.info.file_path, bind_data->catalog_name, bind_data->schema_name, bind_data->table_name);
 
-	auto &catalog = Catalog::GetCatalog(context, bind_data->catalog_name);
+	auto &catalog = Catalog::GetCatalog(context, Identifier(bind_data->catalog_name));
 	if (!FabricatorCatalog::Is(catalog)) {
 		throw BinderException("mssql COPY: catalog '%s' is not a fabricator catalog", bind_data->catalog_name);
 	}
@@ -429,7 +429,7 @@ static void CopyToFinalize(ClientContext &context, FunctionData &bind_data_p, Gl
 
 	// Register the target in the attached catalog so it's queryable immediately
 	// (also invalidates any stale cached entry, e.g. for CREATE_TABLE/REPLACE).
-	auto &catalog = Catalog::GetCatalog(context, bind_data.catalog_name);
+	auto &catalog = Catalog::GetCatalog(context, Identifier(bind_data.catalog_name));
 	if (FabricatorCatalog::Is(catalog)) {
 		auto schema = catalog.GetSchema(context, bind_data.schema_name, OnEntryNotFound::RETURN_NULL);
 		if (schema) {

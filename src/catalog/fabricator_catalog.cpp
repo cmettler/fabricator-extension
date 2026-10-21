@@ -6,6 +6,7 @@
 //                         fabricator — catalog (impl)
 //===----------------------------------------------------------------------===//
 
+#include "duckdb/logging/logger.hpp" // 2.0: DUCKDB_LOG_* macros live here
 #include "catalog/fabricator_catalog.hpp"
 #include "catalog/fabricator_partition_util.hpp"
 
@@ -109,7 +110,7 @@ void FabricatorCatalog::LoadCatalog(ClientContext &context) {
 			return *it->second;
 		}
 		CreateSchemaInfo info;
-		info.schema = schema_name;
+		info.SetSchema(Identifier(schema_name));
 		auto entry = make_uniq<FabricatorSchemaEntry>(*this, info, handle_);
 		auto &ref = *entry;
 		schemas_[schema_name] = std::move(entry);
@@ -223,7 +224,7 @@ void FabricatorCatalog::RefreshCache(ClientContext &context) {
 			return *it->second;
 		}
 		CreateSchemaInfo info;
-		info.schema = schema_name;
+		info.SetSchema(Identifier(schema_name));
 		auto entry = make_uniq<FabricatorSchemaEntry>(*this, info, handle_);
 		auto &ref = *entry;
 		schemas_[schema_name] = std::move(entry);
@@ -356,13 +357,13 @@ optional_ptr<CatalogEntry> FabricatorCatalog::CreateSchema(CatalogTransaction tr
 		FabricatorSetActiveTxn(handle_, *transaction.context);
 	}
 	if (info.on_conflict == OnCreateConflict::REPLACE_ON_CONFLICT) {
-		fabricator::DropSchema(handle_, info.schema, /*if_exists=*/true);
+		fabricator::DropSchema(handle_, info.GetQualifiedName().Schema().GetIdentifierName(), /*if_exists=*/true);
 	}
 	bool if_not_exists = info.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT;
-	fabricator::CreateSchema(handle_, info.schema, if_not_exists);
+	fabricator::CreateSchema(handle_, info.GetQualifiedName().Schema().GetIdentifierName(), if_not_exists);
 
 	lock_guard<mutex> lock(schema_lock_);
-	auto it = schemas_.find(info.schema);
+	auto it = schemas_.find(info.GetQualifiedName().Schema().GetIdentifierName());
 	if (it != schemas_.end()) {
 		if (info.on_conflict != OnCreateConflict::REPLACE_ON_CONFLICT) {
 			return it->second.get(); // already present (IGNORE / ERROR-but-cached)
@@ -372,15 +373,15 @@ optional_ptr<CatalogEntry> FabricatorCatalog::CreateSchema(CatalogTransaction tr
 	}
 	auto entry = make_uniq<FabricatorSchemaEntry>(*this, info, handle_);
 	auto &ref = *entry;
-	schemas_[info.schema] = std::move(entry);
+	schemas_[info.GetQualifiedName().Schema().GetIdentifierName()] = std::move(entry);
 	return &ref;
 }
 void FabricatorCatalog::DropSchema(ClientContext &context, DropInfo &info) {
 	bool if_exists = info.if_not_found == OnEntryNotFound::RETURN_NULL;
 	FabricatorSetActiveTxn(handle_, context);
-	fabricator::DropSchema(handle_, info.name, if_exists);
+	fabricator::DropSchema(handle_, info.GetQualifiedName().Name().GetIdentifierName(), if_exists);
 	lock_guard<mutex> lock(schema_lock_);
-	auto it = schemas_.find(info.name);
+	auto it = schemas_.find(info.GetQualifiedName().Name().GetIdentifierName());
 	if (it != schemas_.end()) {
 		retired_schemas_.push_back(std::move(it->second)); // retire, never destroy (see header)
 		schemas_.erase(it);
@@ -448,10 +449,10 @@ static bool FabricatorParallelWrite(ClientContext &context, optional_ptr<Physica
 PhysicalOperator &FabricatorCatalog::PlanCreateTableAs(ClientContext &context, PhysicalPlanGenerator &planner,
                                                      LogicalCreateTable &op, PhysicalOperator &plan) {
 	auto &create_info = op.info->base->Cast<CreateTableInfo>();
-	MarkSinkOnOwnScans(plan, create_info.schema, create_info.table, "create");
+	MarkSinkOnOwnScans(plan, create_info.GetQualifiedName().Schema().GetIdentifierName(), create_info.table, "create");
 
 	FabricatorCtasInfo info;
-	info.schema_name = create_info.schema;
+	info.GetQualifiedName().Schema().GetIdentifierName()_name = create_info.GetQualifiedName().Schema().GetIdentifierName();
 	info.table_name = create_info.table;
 	for (auto &col : create_info.columns.Logical()) {
 		info.column_names.push_back(col.Name());
@@ -462,7 +463,7 @@ PhysicalOperator &FabricatorCatalog::PlanCreateTableAs(ClientContext &context, P
 	info.sort_columns = fabricator::PartitionColumnsArg(create_info.sort_keys);           // native SORTED BY (→ CLUSTER BY)
 	info.options_json = fabricator::TableOptionsArg(create_info.options);                 // WITH (key='value', ...)
 	info.handle = handle_;
-	info.schema_entry = &op.schema.Cast<FabricatorSchemaEntry>();
+	info.GetQualifiedName().Schema().GetIdentifierName()_entry = &op.schema.Cast<FabricatorSchemaEntry>();
 	info.parallel = FabricatorParallelWrite(context, &plan);
 
 	vector<LogicalType> result_types {LogicalType::BIGINT};
@@ -570,7 +571,7 @@ PhysicalOperator &FabricatorCatalog::PlanDelete(ClientContext &context, Physical
 	// "the last column": a mark-join DELETE (WHERE x [NOT] IN (subquery)) feeds the raw FILTER output
 	// [cols..., rowid, mark] into the sink, so the last column is the BOOLEAN mark.
 	if (!op.expressions.empty() && op.expressions[0]->GetExpressionType() == ExpressionType::BOUND_REF) {
-		target.rowid_child_index = op.expressions[0]->Cast<BoundReferenceExpression>().index;
+		target.rowid_child_index = op.expressions[0]->Cast<BoundReferenceExpression>().Index();
 	}
 	// DuckDB's OWN PhysicalDelete/PhysicalUpdate declare ParallelSink() == true UNCONDITIONALLY, which is the
 	// precedent here rather than something to argue with; we keep the same plan-time gate as the write sinks so
@@ -619,7 +620,7 @@ void FabricatorFillUpdateSetColumns(TableCatalogEntry &table, const vector<Physi
 		}
 		target.set_columns.push_back(col_name);
 		target.set_types.push_back(types[columns[i].index]);
-		target.set_child_indices.push_back(expr.Cast<BoundReferenceExpression>().index);
+		target.set_child_indices.push_back(expr.Cast<BoundReferenceExpression>().Index());
 	}
 }
 
