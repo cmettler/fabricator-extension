@@ -158,7 +158,7 @@ static void ParseTarget(const string &path, string &catalog, string &schema, str
 }
 
 // The COPY options shared by both formats (CREATE_TABLE / REPLACE / SCHEMA_MODE / PARTITION_OVERWRITE).
-static void BindCommonCopyOptions(const case_insensitive_map_t<vector<Value>> &options,
+static void BindCommonCopyOptions(const identifier_map_t<vector<Value>> &options,
                                   FabricatorCopyBindData &bind_data, const char *fmt) {
 	bind_data.create_table = GetBoolOption(options, "CREATE_TABLE", true);
 	bind_data.replace = GetBoolOption(options, "REPLACE", false);

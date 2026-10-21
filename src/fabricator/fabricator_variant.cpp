@@ -86,7 +86,7 @@ void VariantArrowToDuck(ClientContext &context, Vector &source, Vector &result, 
 	};
 
 	Vector patched(LogicalType::BLOB, count);
-	auto p_data = FlatVector::GetData<string_t>(patched);
+	auto p_data = FlatVector::GetDataMutable<string_t>(patched);
 	for (idx_t i = 0; i < count; i++) {
 		if (row_is_null(i)) {
 			p_data[i] = StringVector::AddStringOrBlob(
@@ -98,7 +98,7 @@ void VariantArrowToDuck(ClientContext &context, Vector &source, Vector &result, 
 
 	auto expr = BindVariantConversion(context, "variant_bytes_to_variant", LogicalType::BLOB);
 	ExecuteConversion(context, *expr, patched, count, result);
-	auto &result_validity = FlatVector::Validity(result);
+	auto &result_validity = result.GetValidityMask(); // written below; FlatVector::Validity is const in 2.0
 	for (idx_t i = 0; i < count; i++) {
 		if (row_is_null(i)) {
 			result_validity.SetInvalid(i);
@@ -126,8 +126,8 @@ void VariantDuckToArrow(ClientContext &context, Vector &source, Vector &result, 
 	UnifiedVectorFormat src_fmt;
 	source.ToUnifiedFormat(count, src_fmt);
 
-	auto out_data = FlatVector::GetData<string_t>(result);
-	auto &out_validity = FlatVector::Validity(result);
+	auto out_data = FlatVector::GetDataMutable<string_t>(result);
+	auto &out_validity = result.GetValidityMask(); // written below; FlatVector::Validity is const in 2.0
 	for (idx_t i = 0; i < count; i++) {
 		auto midx = meta_fmt.sel->get_index(i);
 		auto vidx = val_fmt.sel->get_index(i);
