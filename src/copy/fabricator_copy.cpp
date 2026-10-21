@@ -431,7 +431,7 @@ static void CopyToFinalize(ClientContext &context, FunctionData &bind_data_p, Gl
 	// (also invalidates any stale cached entry, e.g. for CREATE_TABLE/REPLACE).
 	auto &catalog = Catalog::GetCatalog(context, Identifier(bind_data.catalog_name));
 	if (FabricatorCatalog::Is(catalog)) {
-		auto schema = catalog.GetSchema(context, bind_data.schema_name, OnEntryNotFound::RETURN_NULL);
+		auto schema = catalog.GetSchema(context, Identifier(bind_data.schema_name), OnEntryNotFound::RETURN_NULL);
 		if (schema) {
 			schema->Cast<FabricatorSchemaEntry>().AddTable(bind_data.table_name, "BASE TABLE");
 		}

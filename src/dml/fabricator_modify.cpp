@@ -92,7 +92,7 @@ static void ReferenceKeyColumns(DataChunk &out, idx_t out_offset, DataChunk &src
 	} else {
 		auto &entries = StructVector::GetEntries(src.data[rowid_col]);
 		for (idx_t i = 0; i < key_count; i++) {
-			out.data[out_offset + i].Reference(*entries[i]);
+			out.data[out_offset + i].Reference(entries[i]);
 		}
 	}
 }

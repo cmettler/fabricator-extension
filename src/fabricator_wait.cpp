@@ -167,7 +167,7 @@ void WaitFunc(ClientContext &context, TableFunctionInput &data, DataChunk &outpu
 
 	auto count = MinValue<idx_t>(STANDARD_VECTOR_SIZE, bind_data.rows - start);
 	output.SetCardinality(count);
-	auto ids = FlatVector::GetData<int64_t>(output.data[0]);
+	auto ids = FlatVector::GetDataMutable<int64_t>(output.data[0]);
 	for (idx_t i = 0; i < count; i++) {
 		ids[i] = NumericCast<int64_t>(start + i);
 	}

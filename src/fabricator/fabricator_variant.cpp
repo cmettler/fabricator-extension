@@ -116,8 +116,8 @@ void VariantDuckToArrow(ClientContext &context, Vector &source, Vector &result, 
 	auto &entries = StructVector::GetEntries(transport);
 	D_ASSERT(entries.size() >= 2);
 	UnifiedVectorFormat meta_fmt, val_fmt;
-	entries[0]->ToUnifiedFormat(count, meta_fmt);
-	entries[1]->ToUnifiedFormat(count, val_fmt);
+	entries[0].ToUnifiedFormat(count, meta_fmt);
+	entries[1].ToUnifiedFormat(count, val_fmt);
 	auto meta_data = UnifiedVectorFormat::GetData<string_t>(meta_fmt);
 	auto val_data = UnifiedVectorFormat::GetData<string_t>(val_fmt);
 	auto &row_validity = FlatVector::Validity(transport);

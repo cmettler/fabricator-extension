@@ -42,13 +42,13 @@ ScanMatch FindScan(LogicalOperator &node) {
 	auto *child = node.children[0].get();
 	if (child->type == LogicalOperatorType::LOGICAL_GET) {
 		auto &g = child->Cast<LogicalGet>();
-		if (g.function.name == "fabricator_scan") {
+		if (g.function.GetName() == "fabricator_scan") {
 			m.get = &g;
 		}
 	} else if (child->type == LogicalOperatorType::LOGICAL_PROJECTION && child->children.size() == 1 &&
 	           child->children[0]->type == LogicalOperatorType::LOGICAL_GET) {
 		auto &g = child->children[0]->Cast<LogicalGet>();
-		if (g.function.name == "fabricator_scan") {
+		if (g.function.GetName() == "fabricator_scan") {
 			m.get = &g;
 			m.proj = &child->Cast<LogicalProjection>();
 		}
