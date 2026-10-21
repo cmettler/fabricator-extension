@@ -1009,15 +1009,38 @@ static ScalarFunction BuildFabricatorScalarFunction(FabricatorHandle handle, con
 	if (return_type.id() == LogicalTypeId::SQLNULL) {
 		return_type = LogicalType::ANY;
 	}
-	// 2.0: the name is a ctor argument (an Identifier), not an assignable field.
-	ScalarFunction fn(Identifier(fn_name), sig_types, return_type, exec, FabricatorScalarBind);
+	// ⚠⚠ 2.0: THE PARAMETERS ARE DECLARED BY NAME, AS `STANDARD` — DO NOT GO BACK TO THE TYPES-ONLY CTOR.
+	// That ctor names them `col0`, `col1`, … and marks them POSITIONAL_ONLY, which 2.0 ENFORCES: a caller
+	// writing `fluid_render('tpl', params := {...})` is then refused with *"No function matches … Candidate
+	// functions: fluid_render(col0 VARCHAR, col1 ANY, /)"*, and that spelling is the documented surface and
+	// is what our own generated macros use. `STANDARD` is 2.0's positional-OR-keyword kind (Python's), which
+	// is the 1.5 behaviour plus a real name in `duckdb_functions().parameters`.
+	// ⚠ An argument the provider did not NAME stays positional-only — a name that was never declared must
+	// not become callable, and `AddParameter(type)` is exactly that fallback.
+	FunctionSignature sig;
+	idx_t sig_pos = 0;
+	for (idx_t i = 0; i < arg_types.size(); i++) {
+		if (i == varargs_index) {
+			continue;
+		}
+		if (sig_pos < arg_names.size() && !arg_names[sig_pos].empty()) {
+			sig.AddParameter(Identifier(arg_names[sig_pos]), sig_types[sig_pos]);
+		} else {
+			sig.AddParameter(sig_types[sig_pos]);
+		}
+		sig_pos++;
+	}
 	if (varargs_index != DConstants::INVALID_INDEX) {
-		// The declared parameters BEFORE the tail are now the MINIMUM arity; DuckDB accepts any number of
+		// The declared parameters BEFORE the tail are the MINIMUM arity; DuckDB accepts any number of
 		// further arguments, each implicitly cast to this type (ANY => no cast at all).
 		// 2.0: no `varargs` field. A variadic tail is a VAR_POSITIONAL parameter on the signature; the
 		// leading declared parameters stay the minimum arity exactly as before.
-		fn.GetSignature().AddArgs("args", FabricatorVarArgsType(arg_types[varargs_index]));
+		sig.AddArgs("args", FabricatorVarArgsType(arg_types[varargs_index]));
 	}
+	sig.SetReturnType(return_type);
+	// 2.0: the name is a ctor argument (an Identifier), not an assignable field.
+	ScalarFunction fn(Identifier(fn_name), std::move(sig), exec);
+	fn.SetBindCallback(FabricatorScalarBind);
 	// Identity for the bind callback, which is a raw function pointer and cannot capture.
 	auto fn_info = make_shared_ptr<FabricatorScalarFunctionInfo>();
 	fn_info->handle = handle;
@@ -4496,7 +4519,10 @@ void FabricatorSchemaEntry::AlterComment(CatalogTransaction transaction, AlterIn
 	if (info.type == AlterType::SET_COLUMN_COMMENT) {
 		auto &column_info = info.Cast<SetColumnCommentInfo>();
 		request.kind = "set_column_comment";
-		request.column = column_info.GetColumnName().GetIdentifierName();
+		// ⚠ 2.0: SetColumnCommentInfo does NOT override AlterInfo::GetColumnName(), which returns an EMPTY
+		// Identifier by default — so the inherited accessor silently yields nothing and the provider refuses
+		// the alter for a missing column. The member is the only carrier here.
+		request.column = column_info.column_name.GetIdentifierName();
 		comment = column_info.comment_value;
 	} else {
 		auto &entry_info = info.Cast<SetCommentInfo>();

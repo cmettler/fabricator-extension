@@ -323,6 +323,17 @@ void PopulateReturnSchema(ClientContext &context, ArrowStreamBindData &bind_data
 	}
 }
 
+// ⚠⚠ 2.0: `LogicalGet::GetTable()` ASKS THE FUNCTION — `if (!function.get_table_entry) return nullptr;` —
+// where 1.5 derived the entry from the bind data itself. Without this callback every catalog scan looks like
+// a non-table to the binder, and UPDATE/DELETE are refused with *"Can only delete from base table"* even
+// though the plan is a perfectly ordinary scan of one. The entry is already on our bind data.
+optional_ptr<TableCatalogEntry> ArrowStreamGetTableEntry(optional_ptr<const FunctionData> bind_data) {
+	if (!bind_data) {
+		return nullptr;
+	}
+	return bind_data->Cast<ArrowStreamBindData>().table;
+}
+
 BindInfo ArrowStreamGetBindInfo(TableFunctionGetBindInfoInput &input) { // 2.0: takes an input struct
 	auto bind_data = input.bind_data;
 	auto &data = bind_data->Cast<ArrowStreamBindData>();

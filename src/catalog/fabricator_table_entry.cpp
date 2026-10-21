@@ -996,6 +996,7 @@ TableFunction FabricatorTableEntry::BuildScanFunction(ClientContext &context, un
 	function.cardinality = FabricatorScanCardinality;
 	function.statistics = FabricatorScanStatistics;
 	function.get_bind_info = fabricator::ArrowStreamGetBindInfo;
+	function.get_table_entry = fabricator::ArrowStreamGetTableEntry; // 2.0: or the binder sees no base table
 	return function;
 }
 
