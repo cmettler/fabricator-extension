@@ -726,7 +726,7 @@ static void FabricatorExpandVarArgs(idx_t varargs_index, const vector<string> &d
 
 static unique_ptr<FunctionData> FabricatorScalarBind(ClientContext &context, ScalarFunction &bound_function,
                                                     vector<unique_ptr<Expression>> &arguments) {
-	auto &info = bound_function.function_info->Cast<FabricatorScalarFunctionInfo>();
+	auto &info = bound_function.GetExtraFunctionInfo().Cast<FabricatorScalarFunctionInfo>();
 
 	// ⚠⚠ THE AMBIENTS (txn + host-FS opener) ARE DELIBERATELY *NOT* ESTABLISHED HERE, and this is the one
 	// place a scalar bind differs from every other bind in the tree. Do NOT "fix" it by adding
@@ -1382,13 +1382,13 @@ void AggFinalizeSpillImpl(FabricatorAggregateBindData &bind, Vector &state, Vect
 }
 
 idx_t FabricatorAggregateStateSize(const AggregateFunction &function) {
-	auto &info = function.function_info->Cast<FabricatorAggregateFunctionInfo>();
+	auto &info = function.GetExtraFunctionInfo().Cast<FabricatorAggregateFunctionInfo>();
 	// Spillable: a fixed, pointer-free serialized-state blob ([uint32 len][data]); else an int64 id.
 	return info.spillable ? (sizeof(uint32_t) + FABRICATOR_AGG_SPILL_CAP) : sizeof(int64_t);
 }
 
 void FabricatorAggregateInit(const AggregateFunction &function, data_ptr_t state) {
-	auto &info = function.function_info->Cast<FabricatorAggregateFunctionInfo>();
+	auto &info = function.GetExtraFunctionInfo().Cast<FabricatorAggregateFunctionInfo>();
 	if (info.spillable) {
 		Store<uint32_t>(AGG_SPILL_SENTINEL, state); // fresh/uninitialized; no C# call needed at init
 	} else {
@@ -1398,7 +1398,7 @@ void FabricatorAggregateInit(const AggregateFunction &function, data_ptr_t state
 
 unique_ptr<FunctionData> FabricatorAggregateBind(ClientContext &context, AggregateFunction &function,
                                                vector<unique_ptr<Expression>> &arguments) {
-	auto &info = function.function_info->Cast<FabricatorAggregateFunctionInfo>();
+	auto &info = function.GetExtraFunctionInfo().Cast<FabricatorAggregateFunctionInfo>();
 	auto bind_data = make_uniq<FabricatorAggregateBindData>();
 	bind_data->holder = make_shared_ptr<AggSessionHolder>();
 
@@ -1679,7 +1679,7 @@ static AggregateFunction BuildFabricatorAggregateFunction(FabricatorHandle handl
 	for (auto &t : registered_args) {
 		t = FabricatorVarArgsType(t);
 	}
-	AggregateFunction fn(func_name, registered_args, return_type, FabricatorAggregateStateSize, FabricatorAggregateInit,
+	AggregateFunction fn(Identifier(func_name), registered_args, return_type, FabricatorAggregateStateSize, FabricatorAggregateInit,
 	                     FabricatorAggregateUpdate, FabricatorAggregateCombine, FabricatorAggregateFinalize,
 	                     FunctionNullHandling::DEFAULT_NULL_HANDLING, FabricatorAggregateSimpleUpdate,
 	                     FabricatorAggregateBind, nullptr);
@@ -1690,7 +1690,7 @@ static AggregateFunction BuildFabricatorAggregateFunction(FabricatorHandle handl
 	fn_info->arg_types = arg_types;
 	fn_info->arg_names = arg_names;
 	fn_info->spillable = spillable;
-	fn.function_info = std::move(fn_info);
+	fn.SetExtraFunctionInfo(std::move(fn_info));
 	return fn;
 }
 
@@ -1773,7 +1773,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateMacro(ClientContext
 		// The declared name must agree with the discovered one: we cache under the DISCOVERED name and hand the
 		// entry straight to the binder, so a mismatch would leave one of the two names permanently unreachable.
 		if (!StringUtil::CIEquals(info->GetQualifiedName().Name().GetIdentifierName(), macro_name)) {
-			throw ParserException("declared macro name '%s' does not match the discovered name '%s'", info->name,
+			throw ParserException("declared macro name '%s' does not match the discovered name '%s'", info->GetQualifiedName().Name().GetIdentifierName(),
 			                      macro_name);
 		}
 		// QUALIFICATION IS OVERWRITTEN HERE — the OPPOSITE of the global registration, which rejects a qualified
@@ -3363,7 +3363,7 @@ void RegisterFabricatorGlobalFunctions(ExtensionLoader &loader) {
 				// (in-out) or Sink+Source (collector) operator, with handle = 0 so the bind resolves the binding
 				// against the C# global registry by name (mirrors GetOrCreateCustomInOut/CollectorFunction).
 				bool is_collector = kind == "collector";
-				TableFunction tf(fn_name, {}, nullptr,
+				TableFunction tf(Identifier(fn_name), {}, nullptr,
 				                  is_collector ? FabricatorCollectorBind : FabricatorExchangeBind,
 				                  is_collector ? FabricatorCollectorInitGlobal : FabricatorExchangeInitGlobal,
 				                  is_collector ? FabricatorCollectorInitLocal : FabricatorExchangeInitLocal);
@@ -3468,7 +3468,7 @@ void RegisterFabricatorGlobalFunctions(ExtensionLoader &loader) {
 						positional.push_back(FabricatorVarArgsType(arg_types[k]));
 					}
 				}
-				TableFunction tf(fn_name, positional, fabricator::ArrowStreamScan, FabricatorTableFunctionBind,
+				TableFunction tf(Identifier(fn_name), positional, fabricator::ArrowStreamScan, FabricatorTableFunctionBind,
 				                 fabricator::ArrowStreamInitGlobal, fabricator::ArrowStreamInitLocal);
 				// Declares batch-index support, which is what routes an order-preserving plan to the PARALLEL
 				// PhysicalBufferedBatchCollector instead of the single-threaded PhysicalBufferedCollector.
@@ -3517,7 +3517,7 @@ void RegisterFabricatorGlobalFunctions(ExtensionLoader &loader) {
 				vector<string> arg_names;
 				vector<LogicalType> arg_types;
 				idx_t sqlgen_varargs_index = DConstants::INVALID_INDEX;
-				TableFunction tf(fn_name, {}, nullptr, nullptr);
+				TableFunction tf(Identifier(fn_name), {}, nullptr, nullptr);
 				FabricatorBuildSqlGenSignature(all_names, all_types, styles, tf, arg_names, arg_types,
 				                               &sqlgen_varargs_index);
 				tf.bind_replace = FabricatorSqlGenBindReplace;
@@ -3640,7 +3640,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateTableFunction(Clien
 			}
 		}
 	}
-	TableFunction tf(func_name, positional, fabricator::ArrowStreamScan, FabricatorTableFunctionBind,
+	TableFunction tf(Identifier(func_name), positional, fabricator::ArrowStreamScan, FabricatorTableFunctionBind,
 	                 fabricator::ArrowStreamInitGlobal, fabricator::ArrowStreamInitLocal);
 	// Declares batch-index support, which is what routes an order-preserving plan to the PARALLEL
 	// PhysicalBufferedBatchCollector instead of the single-threaded PhysicalBufferedCollector.
@@ -3720,7 +3720,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateSqlTableFunction(Cl
 	vector<string> arg_names;
 	vector<LogicalType> arg_types;
 	idx_t sqlgen_varargs_index = DConstants::INVALID_INDEX;
-	TableFunction tf(func_name, {}, nullptr, nullptr);
+	TableFunction tf(Identifier(func_name), {}, nullptr, nullptr);
 	FabricatorBuildSqlGenSignature(all_names, all_types, styles, tf, arg_names, arg_types,
 	                               &sqlgen_varargs_index);
 	tf.bind_replace = FabricatorSqlGenBindReplace;
@@ -3747,7 +3747,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateCustomInOutFunction
                                                                               const string &func_name) {
 	// Phase 6: custom C# in-out runs on the streaming exchange operator (gate + two pull streams, no
 	// per-chunk materialization). Discovered-TVF `_each` + procs stay on the push model for now.
-	TableFunction inout(func_name, {}, nullptr, FabricatorExchangeBind, FabricatorExchangeInitGlobal,
+	TableFunction inout(Identifier(func_name), {}, nullptr, FabricatorExchangeBind, FabricatorExchangeInitGlobal,
 	                    FabricatorExchangeInitLocal);
 	inout.in_out_function = FabricatorExchangeFunction;
 	// ⚠ Reaches every provider-declared `_each` too (AddInOutFunction resolves here), and none of them
@@ -3829,7 +3829,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateLateralFunction(Cli
 // Caller holds entry_lock_.
 optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateCustomCollectorFunction(ClientContext &context,
                                                                                   const string &func_name) {
-	TableFunction collector(func_name, {}, nullptr, FabricatorCollectorBind,
+	TableFunction collector(Identifier(func_name), {}, nullptr, FabricatorCollectorBind,
 	                        FabricatorCollectorInitGlobal, FabricatorCollectorInitLocal);
 	collector.in_out_function = FabricatorCollectorFunction;
 	// ⚠ ABI v87: DuckDB narrows the get to the columns the caller reads and the callee is told at
@@ -4336,12 +4336,12 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::CreateTable(CatalogTransaction
 	// that path fetches by name. It costs nothing extra either way — the CreatePlan probe above resolves
 	// through this same function, so on the conflict path the entry is already cached, and a non-conflicting
 	// create pays only a table_types_ miss.
-	if (base.on_conflict == OnCreateConflict::ERROR_ON_CONFLICT && GetOrCreateEntry(context, base.table)) {
-		throw CatalogException::EntryAlreadyExists(CatalogType::TABLE_ENTRY, base.table);
+	if (base.on_conflict == OnCreateConflict::ERROR_ON_CONFLICT && GetOrCreateEntry(context, base.GetQualifiedName().Name().GetIdentifierName())) {
+		throw CatalogException::EntryAlreadyExists(CatalogType::TABLE_ENTRY, base.GetQualifiedName().Name().GetIdentifierName());
 	}
 
 	if (replace) {
-		fabricator::DropTable(handle_, name, base.table, /*if_exists=*/true);
+		fabricator::DropTable(handle_, name, base.GetQualifiedName().Name().GetIdentifierName(), /*if_exists=*/true);
 	}
 
 	// Native CREATE TABLE ... PARTITIONED BY (cols): the column names (comma-separated) go to the provider
@@ -4360,12 +4360,12 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::CreateTable(CatalogTransaction
 	fabricator::ArrowProducer producer(types, names, fabricator::BoundaryClientProperties(context));
 	producer.SetNullability(nullable);
 	producer.Finish();
-	fabricator::CreateTable(handle_, name, base.table, *producer.Stream(), if_not_exists, pk_arg, unique_arg,
+	fabricator::CreateTable(handle_, name, base.GetQualifiedName().Name().GetIdentifierName(), *producer.Stream(), if_not_exists, pk_arg, unique_arg,
 	                      defaults_arg, partition_arg, sort_arg, identity_arg, options_arg);
 
 	// Register the new table (also invalidates any cached entry) and return it.
-	AddTable(base.table, "BASE TABLE");
-	return GetOrCreateEntry(context, base.table);
+	AddTable(base.GetQualifiedName().Name().GetIdentifierName(), "BASE TABLE");
+	return GetOrCreateEntry(context, base.GetQualifiedName().Name().GetIdentifierName());
 }
 optional_ptr<CatalogEntry> FabricatorSchemaEntry::CreateFunction(CatalogTransaction, CreateFunctionInfo &) {
 	ReadOnly("CREATE FUNCTION");
@@ -4402,12 +4402,12 @@ void FabricatorSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
 	}
 	bool if_exists = info.if_not_found == OnEntryNotFound::RETURN_NULL;
 	FabricatorSetActiveTxn(handle_, context);
-	fabricator::DropTable(handle_, name, info.name, if_exists);
+	fabricator::DropTable(handle_, name, info.GetQualifiedName().Name().GetIdentifierName(), if_exists);
 
 	lock_guard<mutex> lock(entry_lock_);
-	table_types_.erase(info.name);
-	RetireErase(entries_, info.name, retired_entries_);
-	RetireAtEntriesFor(at_entries_, info.name, retired_entries_);
+	table_types_.erase(info.GetQualifiedName().Name().GetIdentifierName());
+	RetireErase(entries_, info.GetQualifiedName().Name().GetIdentifierName(), retired_entries_);
+	RetireAtEntriesFor(at_entries_, info.GetQualifiedName().Name().GetIdentifierName(), retired_entries_);
 }
 // (The hand-rolled JsonPathArray helper died with ABI v74: FabricatorRenderAlterJson owns every string in
 //  the request now. It escaped only `"` and `\`, so a legal DuckDB identifier carrying a control character
@@ -4496,16 +4496,16 @@ void FabricatorSchemaEntry::AlterComment(CatalogTransaction transaction, AlterIn
 	// work recorded. Refused with the reason instead.
 	{
 		lock_guard<mutex> lock(entry_lock_);
-		if (views_.find(info.name) != views_.end()) {
+		if (views_.find(info.GetQualifiedName().Name().GetIdentifierName()) != views_.end()) {
 			throw NotImplementedException(
 			    "fabricator: COMMENT ON is not supported for \"%s\": it is a provider-declared view, which is a "
 			    "declaration the provider owns — there is nowhere to store a comment.",
-			    info.name);
+			    info.GetQualifiedName().Name().GetIdentifierName());
 		}
 	}
-	auto entry = GetOrCreateEntry(context, info.name);
+	auto entry = GetOrCreateEntry(context, info.GetQualifiedName().Name().GetIdentifierName());
 	if (!entry) {
-		throw CatalogException("fabricator: COMMENT ON: table \"%s\" does not exist", info.name);
+		throw CatalogException("fabricator: COMMENT ON: table \"%s\" does not exist", info.GetQualifiedName().Name().GetIdentifierName());
 	}
 	fabricator::TableAlter(entry->Cast<FabricatorTableEntry>().TableHandle(),
 	                       FabricatorRenderAlterJson(request), nullptr);
@@ -4514,7 +4514,7 @@ void FabricatorSchemaEntry::AlterComment(CatalogTransaction transaction, AlterIn
 	// a comment is part of the CatalogEntry — so without this eviction the entry keeps the old one and
 	// `COMMENT ON t IS 'x'; SELECT comment FROM duckdb_tables()` reports the PREVIOUS value in the same
 	// session. The note this replaces predicted exactly that and said what to do about it.
-	RefreshEntry(context, info.name);
+	RefreshEntry(context, info.GetQualifiedName().Name().GetIdentifierName());
 }
 
 void FabricatorSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {

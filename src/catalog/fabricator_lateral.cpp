@@ -949,7 +949,7 @@ void LateralOptimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator>
 TableFunction FabricatorMakeLateralFunction(FabricatorHandle handle, const string &schema_name,
                                            const string &func_name, vector<string> arg_names,
                                            vector<LogicalType> arg_types, vector<FabricatorParamStyle> arg_styles) {
-	TableFunction tf(func_name, {}, nullptr, LateralBind, nullptr, LateralInitLocal);
+	TableFunction tf(Identifier(func_name), {}, nullptr, LateralBind, nullptr, LateralInitLocal);
 	tf.in_out_function = LateralInOutFunction;
 	// ⚠ See the header note: this narrows the get, and the wire map in LateralSession::Call is what keeps a
 	// narrowed get from landing a callee column in a correlated column's slot.
