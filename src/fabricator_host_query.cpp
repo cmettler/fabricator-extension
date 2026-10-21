@@ -26,6 +26,7 @@
 #include "duckdb/main/connection.hpp"
 #include "duckdb/logging/logger.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
+#include "duckdb/parser/literal.hpp" // 2.0: ConstantExpression takes a Literal
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/tableref/table_function_ref.hpp"
 
@@ -974,7 +975,8 @@ static unique_ptr<TableRef> NamedSourceReplacement(ClientContext &, ReplacementS
 	}
 	auto table_function = make_uniq<TableFunctionRef>();
 	vector<unique_ptr<ParsedExpression>> children;
-	children.push_back(make_uniq<ConstantExpression>(Value(input.table_name)));
+	// 2.0: ConstantExpression(const Value &) is = delete; a parser constant is built from a Literal.
+	children.push_back(make_uniq<ConstantExpression>(Literal::String(input.table_name)));
 	table_function->function = make_uniq<FunctionExpression>("fabricator_scan", std::move(children));
 	table_function->alias = Identifier(input.table_name);
 	return std::move(table_function);

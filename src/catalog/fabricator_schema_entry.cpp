@@ -394,7 +394,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateEntry(ClientContext
 
 	CreateTableInfo info(QualifiedName(catalog.GetName(), name, Identifier(table_name)));
 	for (idx_t i = 0; i < names.size(); i++) {
-		info.columns.AddColumn(ColumnDefinition(names[i], types[i]));
+		info.columns.AddColumn(ColumnDefinition(Identifier(names[i]), types[i]));
 	}
 
 	// Row identity + provider virtual columns + the COMMENT ON read-back — ONE table_info crossing.

@@ -215,9 +215,9 @@ PhysicalOperator &FabricatorCatalog::PlanMergeInto(ClientContext &context, Physi
 	// changed. Whether a merge could then go parallel is a SEPARATE decision, not a consequence of this one.
 	// DuckDB's own DuckCatalog reaches false for a third reason (it disables parallelism as soon as there are
 	// two appends); DuckLake passes true because its per-action operators are parallel-safe.
-	auto &result = planner.Make<PhysicalMergeInto>(op.types, std::move(actions), op.row_id_start, op.source_marker,
-	                                               /*parallel=*/false, op.return_chunk);
-	result.children.push_back(plan);
+	// 2.0: the child operator is a CONSTRUCTOR argument now, not pushed onto children afterwards.
+	auto &result = planner.Make<PhysicalMergeInto>(op.types, plan, std::move(actions), op.row_id_start,
+	                                               op.source_marker, /*parallel=*/false, op.return_chunk);
 	return result;
 }
 
