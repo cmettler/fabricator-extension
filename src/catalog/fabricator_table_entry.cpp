@@ -158,7 +158,7 @@ private:
 		if (table_col >= get_.names.size()) {
 			return false;
 		}
-		name = get_.names[table_col];
+		name = get_.names[table_col].GetIdentifierName();
 		type = ref.GetReturnType();
 		return true;
 	}
@@ -188,7 +188,7 @@ private:
 			if (member >= members.size()) {
 				return false;
 			}
-			path.push_back(members[member].first);
+			path.push_back(members[member].first.GetIdentifierName());
 			type = e.GetReturnType();
 			return true;
 		}

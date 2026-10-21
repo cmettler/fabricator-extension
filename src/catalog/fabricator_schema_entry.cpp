@@ -1001,8 +1001,8 @@ static ScalarFunction BuildFabricatorScalarFunction(FabricatorHandle handle, con
 	if (return_type.id() == LogicalTypeId::SQLNULL) {
 		return_type = LogicalType::ANY;
 	}
-	ScalarFunction fn(sig_types, return_type, exec, FabricatorScalarBind);
-	fn.name = fn_name;
+	// 2.0: the name is a ctor argument (an Identifier), not an assignable field.
+	ScalarFunction fn(Identifier(fn_name), sig_types, return_type, exec, FabricatorScalarBind);
 	if (varargs_index != DConstants::INVALID_INDEX) {
 		// The declared parameters BEFORE the tail are now the MINIMUM arity; DuckDB accepts any number of
 		// further arguments, each implicitly cast to this type (ANY => no cast at all).
@@ -1957,7 +1957,7 @@ unique_ptr<FunctionData> FabricatorTableFunctionBind(ClientContext &context, Tab
 		for (auto &kv : input.named_parameters) {
 			LogicalType declared = kv.second.type();
 			for (idx_t i = 0; i < info.arg_names.size(); i++) {
-				if (StringUtil::CIEquals(info.arg_names[i], kv.first)) {
+				if (StringUtil::CIEquals(info.arg_names[i], kv.first.GetIdentifierName())) {
 					// A SQLNULL-declared param is the "accept any value" marker (registered as ANY):
 					// keep the supplied value's RUNTIME type so a STRUCT bag (or a VARCHAR, …) marshals
 					// across as its real Arrow type, not coerced to the declared type.
@@ -2198,7 +2198,7 @@ static void FabricatorMarshalInOutArgs(const FabricatorTableFunctionInfo &info, 
 		if (style == FabricatorParamStyle::NAMED) {
 			Value v(declared);
 			for (auto &kv : input.named_parameters) {
-				if (StringUtil::CIEquals(info.arg_names[i], kv.first)) {
+				if (StringUtil::CIEquals(info.arg_names[i], kv.first.GetIdentifierName())) {
 					v = kv.second;
 					break;
 				}
@@ -3392,8 +3392,8 @@ void RegisterFabricatorGlobalFunctions(ExtensionLoader &loader) {
 				} catch (std::exception &) {
 					// no cost args
 				}
-				if (tf.GetArguments().empty()) {
-					tf.GetArguments().push_back(LogicalType::TABLE);
+				if (tf.GetSignature().GetParameterCount() == 0) {
+					tf.GetSignature().AddParameter(LogicalType::TABLE);
 				}
 				tf.function_info = std::move(fn_info);
 				loader.RegisterFunction(tf);
@@ -4293,7 +4293,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::CreateTable(CatalogTransaction
 		// Unwrap one CAST level (e.g. boolean literals parse as CAST(... AS BOOLEAN)).
 		const ParsedExpression *expr = &col.DefaultValue();
 		if (expr->GetExpressionType() == ExpressionType::OPERATOR_CAST) {
-			expr = expr->Cast<CastExpression>().child.get();
+			expr = &expr->Cast<CastExpression>().Child();
 		}
 		if (!expr || expr->GetExpressionType() != ExpressionType::VALUE_CONSTANT) {
 			continue; // literals only
@@ -4423,7 +4423,7 @@ void FabricatorSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
 // literal distinguishable from an absent key, which the old "-"/"b"+base64 arg2 spelling needed base64 for.
 static void CarryDefault(FabricatorAlterRequest &request, const ParsedExpression *expr) {
 	if (expr->GetExpressionType() == ExpressionType::OPERATOR_CAST) {
-		expr = expr->Cast<CastExpression>().child.get();
+		expr = &expr->Cast<CastExpression>().Child();
 	}
 	if (!expr || expr->GetExpressionType() != ExpressionType::VALUE_CONSTANT) {
 		throw NotImplementedException("fabricator: only literal column DEFAULTs are supported");
@@ -4714,7 +4714,7 @@ void FabricatorSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &inf
 				throw NotImplementedException(
 				    "fabricator: SET SORTED BY has no sort direction — use plain column names");
 			}
-			if (!order.expression || order.expression->type != ExpressionType::COLUMN_REF) {
+			if (!order.expression || order.expression->GetExpressionType() != ExpressionType::COLUMN_REF) {
 				throw NotImplementedException("fabricator: SET SORTED BY accepts plain column names only");
 			}
 			request.columns.push_back(order.expression->Cast<ColumnRefExpression>().GetColumnName());
