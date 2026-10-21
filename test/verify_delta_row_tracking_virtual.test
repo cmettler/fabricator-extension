@@ -259,13 +259,30 @@ CREATE TABLE lake4.main.cdp (id BIGINT, region VARCHAR, s VARCHAR) PARTITIONED B
 statement ok
 INSERT INTO lake4.main.cdp SELECT r, CASE WHEN r % 2 = 0 THEN 'US' ELSE 'EU' END, 'v' || r FROM range(4) t(r);
 
+# ⚠⚠ THIS ROW USED TO PIN THE LITERAL ID 2, AND THAT WAS PINNING A WRITE ORDER DELTA DOES NOT PROMISE.
+# baseRowId is assigned per FILE at commit, so which partition gets 0 and which gets 2 is decided by the
+# order the partitioned COPY emits its files. MEASURED: DuckDB 2.0 commits EU first (baseRowId 0) and US
+# second (2) where 1.5.6 commits US first — so the LOGS differ while both READS are correct for their own
+# log. What row tracking actually promises is that an id is STABLE once assigned, which is what this now
+# asserts: the id is captured before the merge-on-read UPDATE and compared after it.
+statement ok
+SET VARIABLE cdp_rid_before = (SELECT __delta_row_id FROM lake4.main.cdp WHERE id = 1);
+
 statement ok
 UPDATE lake4.main.cdp SET s = 'mor' WHERE id = 1;
 
-query II
-SELECT id, __delta_row_id FROM lake4.main.cdp WHERE id = 1;
+query IT
+SELECT id, __delta_row_id = getvariable('cdp_rid_before') FROM lake4.main.cdp WHERE id = 1;
 ----
-1	2
+1	true
+
+# ⚠ The control that stops the row above passing vacuously: a captured NULL would compare NULL (not
+# true), but a table whose ids had ALL collapsed to one value would still satisfy it — so the ids must
+# also still be four DISTINCT non-null values.
+query II
+SELECT count(*), count(DISTINCT __delta_row_id) FROM lake4.main.cdp WHERE __delta_row_id IS NOT NULL;
+----
+4	4
 
 query TTIT
 SELECT _change_type, region, id, s FROM lake4.delta.changes('main.cdp', starting_version := 2) ORDER BY _change_type;

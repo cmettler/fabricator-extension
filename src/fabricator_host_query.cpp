@@ -744,7 +744,24 @@ bool RegisterArrowInputView(Connection &conn, const string &name, ArrowArrayStre
 	}
 	bool ok = true;
 	try {
-		conn.TableFunction("arrow_scan", {}, {}, make_shared_ptr<FabricatorArrowScanFactory>(*stream))
+		// ⚠⚠ `arrow_scan_dumb`, NOT `arrow_scan`, AND THAT ONE WORD IS A WRONG-ANSWER FIX ON 2.0.
+		// DuckDB 2.0's `ArrowToDuckDB` indexes the incoming arrow array BY POSITION
+		// (`arrow_scan_is_projected` defaults to TRUE), i.e. `arrow_scan` assumes the factory's
+		// ProduceStream HONOURED `parameters.projected_columns` and returned a NARROWED stream. Ours hands
+		// back the caller's stream whole — as does DuckDB's own `CArrowScanFactory` behind the public
+		// `duckdb_arrow_scan`, which has the identical defect — so any projection that is not the identity
+		// reads the WRONG CHILD, silently. MEASURED on a Delta row-tracking read: a metadata view
+		// [fn, base_row_id, commit_version] projected down to {fn, commit_version} delivered `base_row_id`
+		// as the commit version, so `__delta_row_commit_version` answered 24 (a baseRowId) where the log
+		// says 8 — no error anywhere, and 1.5.6 answers 8 on the same files.
+		// `arrow_scan_dumb` is upstream's OWN variant for exactly this case: same bind, same scan, with
+		// projection and filter pushdown off, so `column_ids` is the identity and positional indexing is
+		// correct again. ⚠ The cost is that a named input now crosses whole — no column pruning and no
+		// filter pushdown INTO the view. Our named inputs are small by construction (the per-file metadata
+		// and deletion-vector views, and bulk-write inputs that are consumed in full anyway), and a wrong
+		// column is not a trade. The alternative — a projecting wrapper around the caller's stream — is
+		// what would buy the pushdown back, and it is the only reason to revisit this line.
+		conn.TableFunction("arrow_scan_dumb", {}, {}, make_shared_ptr<FabricatorArrowScanFactory>(*stream))
 		    ->CreateView(Identifier(name), /*replace=*/true, /*temporary=*/true);
 	} catch (const std::exception &ex) {
 		// ⚠ The REASON is carried out rather than swallowed: this used to be a bare `catch (...)` and the
