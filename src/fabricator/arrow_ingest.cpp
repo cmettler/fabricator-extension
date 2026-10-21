@@ -35,6 +35,11 @@
 #include "duckdb/planner/filter/constant_filter.hpp"
 #include "duckdb/planner/filter/in_filter.hpp"
 #include "duckdb/planner/filter/struct_filter.hpp"
+#include "duckdb/planner/filter/expression_filter.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression/bound_operator_expression.hpp"
+#include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/function/scalar/struct_functions.hpp" // struct_extract / struct_extract_at names
 #include "duckdb/transaction/meta_transaction.hpp"
 
 #include <algorithm>
@@ -684,6 +689,264 @@ static void LiveJsonColumnRef(const vector<string> &path, string &out) {
 	out += ']';
 }
 
+// ---- EXPRESSION_FILTER -> FilterNode JSON -------------------------------------------------------------
+// ⚠⚠ ON 2.0 THIS IS THE ONLY LIVE SHAPE, so without it the structured PRUNING channel is DEAD: the legacy
+// cases below never fire and the `default: return false` beneath them swallowed every filter. MEASURED
+// before: `verify_delta_late_materialization` rendered the SQL predicate correctly
+// (`("_metadata.row_id" = 1099511627781)`) while the Delta pruner's `rowid prune files 3 -> 1` line was
+// ABSENT — results stay correct (DuckDB re-applies every predicate above the scan), so the only symptom is
+// work not being skipped. On 1.5 the comment "EXPRESSION_FILTER: not convertible" was true, because the
+// type never arrived.
+// This mirrors the SQL renderer's walk one level lower, over the EXPRESSION rather than the TableFilter:
+// comparisons via BoundComparisonExpression, AND/OR via BoundConjunctionExpression, IS [NOT] NULL and IN via
+// BoundOperatorExpression, struct members via struct_extract(_at), and the internal filter wrappers via the
+// same RecoverFilterFunction the SQL channel uses. Anything else is DROPPED, which only ever widens.
+
+//! Resolve `e` as the filter's COLUMN SUBJECT, appending any struct member names it traverses to `path` and
+//! reporting the leaf type. An ExpressionFilter binds its column as `BoundReferenceExpression(type, 0)`
+//! (ExpressionFilter::CreateComparisonFilter), and a single-column filter carries NO `column_indexes`
+//! (TableFilterSet::PushFilter refuses one that does) — so index 0 is this entry's own column.
+//! ⚠ The CALLER restores `path`. Members are pushed on the way back OUT of the recursion, so they land
+//! outermost-first (`s`, `a`, `b`) exactly as the legacy LEGACY_STRUCT_EXTRACT branch builds them.
+//! Anything computed (a cast, an arithmetic expression) returns false: there is no stats key to prune on.
+static bool LiveExprSubject(const Expression &e, const LogicalType &type, vector<string> &path,
+                            LogicalType &leaf) {
+	if (e.GetExpressionClass() == ExpressionClass::BOUND_REF) {
+		if (e.Cast<BoundReferenceExpression>().Index() != 0) {
+			return false;
+		}
+		leaf = type;
+		return true;
+	}
+	if (e.GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
+		return false;
+	}
+	auto &fn = e.Cast<BoundFunctionExpression>();
+	const auto name = fn.Function().GetName();
+	const bool by_name = name == StructExtractFun::Name;
+	if ((!by_name && name != StructExtractAtFun::Name) || fn.GetChildren().size() != 2) {
+		return false;
+	}
+	auto &key = *fn.GetChildren()[1];
+	if (key.GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
+		return false;
+	}
+	const auto &key_val = key.Cast<BoundConstantExpression>().GetValue();
+	if (key_val.IsNull()) {
+		return false;
+	}
+	LogicalType parent;
+	if (!LiveExprSubject(*fn.GetChildren()[0], type, path, parent)) {
+		return false;
+	}
+	if (parent.id() != LogicalTypeId::STRUCT) {
+		return false;
+	}
+	auto &members = StructType::GetChildTypes(parent);
+	idx_t member_idx = members.size();
+	if (by_name) {
+		// ⚠ Push the STRUCT TYPE's spelling, never the key literal's: the member name IS the parquet/stats
+		// key, so a case-insensitive match must still emit the name the provider can look up.
+		const auto wanted = StringUtil::Lower(key_val.ToString());
+		for (idx_t i = 0; i < members.size(); i++) {
+			if (StringUtil::Lower(members[i].first.GetIdentifierName()) == wanted) {
+				member_idx = i;
+				break;
+			}
+		}
+	} else {
+		// struct_extract_at is 1-BASED (its own doc says so).
+		// 2.0: DefaultTryCastAs RETURNS an optional<Value> (the out-param overload now takes an error string).
+		auto pos_val = key_val.DefaultTryCastAs(LogicalType::BIGINT);
+		if (!pos_val.has_value()) {
+			return false;
+		}
+		const auto pos = pos_val->GetValue<int64_t>();
+		if (pos >= 1 && (idx_t)pos <= members.size()) {
+			member_idx = (idx_t)(pos - 1);
+		}
+	}
+	if (member_idx >= members.size()) {
+		return false;
+	}
+	path.push_back(members[member_idx].first.GetIdentifierName());
+	leaf = members[member_idx].second;
+	return true;
+}
+
+//! Serialize one EXPRESSION_FILTER expression node into a FilterNode JSON object. Same contract as
+//! LiveFilterNode: false = not convertible, which is skip-safe for the pruning consumer.
+static bool LiveExprNode(const Expression &e, vector<string> &path, const LogicalType &type,
+                         vector<Value> &constants, bool string_order_pushable, string &out) {
+	// The internal filter wrappers first: recover the predicate they hide (the SQL channel's
+	// RecoverFilterFunction verbatim, rebinding onto the wrapper's OWN argument so a struct subject
+	// survives), else drop. Dropping only widens under an AND; an OR below refuses outright.
+	if (e.GetExpressionClass() == ExpressionClass::BOUND_FUNCTION &&
+	    TableFilterFunctions::IsTableFilterFunction(e.Cast<BoundFunctionExpression>().Function())) {
+		auto &wrapper = e.Cast<BoundFunctionExpression>();
+		BoundReferenceExpression fallback(type, 0ULL);
+		const Expression &subject =
+		    wrapper.GetChildren().empty() ? static_cast<const Expression &>(fallback) : *wrapper.GetChildren()[0];
+		auto recovered = RecoverFilterFunction(wrapper, subject);
+		if (!recovered) {
+			return false;
+		}
+		// A recovered child may itself be wrapped (an optional filter around a dynamic one).
+		return LiveExprNode(*recovered, path, type, constants, string_order_pushable, out);
+	}
+	const idx_t base = path.size();
+	switch (e.GetExpressionClass()) {
+	case ExpressionClass::BOUND_CONJUNCTION: {
+		const bool is_and = e.GetExpressionType() == ExpressionType::CONJUNCTION_AND;
+		if (!is_and && e.GetExpressionType() != ExpressionType::CONJUNCTION_OR) {
+			return false;
+		}
+		vector<string> parts;
+		// Constants appended by a dropped OR branch must not leak — stage into a scratch vector first.
+		vector<Value> scratch = constants;
+		for (auto &child : e.Cast<BoundConjunctionExpression>().GetChildren()) {
+			string cs;
+			if (LiveExprNode(*child, path, type, scratch, string_order_pushable, cs) && !cs.empty()) {
+				parts.push_back(std::move(cs));
+			} else if (!is_and) {
+				return false; // OR: dropping a branch would narrow (unsafe for pruning)
+			}
+			// AND: dropping a child only widens (superset) — fine.
+		}
+		if (parts.empty()) {
+			return false;
+		}
+		constants = std::move(scratch);
+		if (parts.size() == 1) {
+			out += parts[0];
+			return true;
+		}
+		out += "{\"op\":\"";
+		out += is_and ? "and" : "or";
+		out += "\",\"children\":[";
+		for (idx_t i = 0; i < parts.size(); i++) {
+			if (i) {
+				out += ',';
+			}
+			out += parts[i];
+		}
+		out += "]}";
+		return true;
+	}
+	case ExpressionClass::BOUND_OPERATOR: {
+		auto &op = e.Cast<BoundOperatorExpression>();
+		auto &children = op.GetChildren();
+		if (children.empty()) {
+			return false;
+		}
+		LogicalType leaf;
+		if (!LiveExprSubject(*children[0], type, path, leaf)) {
+			path.resize(base);
+			return false;
+		}
+		bool ok = false;
+		switch (e.GetExpressionType()) {
+		case ExpressionType::OPERATOR_IS_NULL:
+		case ExpressionType::OPERATOR_IS_NOT_NULL:
+			if (children.size() == 1) {
+				out += "{\"op\":\"";
+				out += e.GetExpressionType() == ExpressionType::OPERATOR_IS_NULL ? "is_null" : "is_not_null";
+				out += "\",";
+				LiveJsonColumnRef(path, out);
+				out += "}";
+				ok = true;
+			}
+			break;
+		case ExpressionType::COMPARE_IN: {
+			// ⚠ COMPARE_NOT_IN deliberately falls to the default: refusing is always superset-safe.
+			vector<Value> vals;
+			for (idx_t i = 1; i < children.size(); i++) {
+				if (children[i]->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
+					vals.clear();
+					break;
+				}
+				const auto &v = children[i]->Cast<BoundConstantExpression>().GetValue();
+				if (v.IsNull()) {
+					vals.clear();
+					break;
+				}
+				vals.push_back(v);
+			}
+			if (vals.empty()) {
+				break;
+			}
+			out += "{\"op\":\"in\",";
+			LiveJsonColumnRef(path, out);
+			out += ",\"vals\":[";
+			for (idx_t i = 0; i < vals.size(); i++) {
+				if (i) {
+					out += ',';
+				}
+				out += to_string(constants.size());
+				constants.push_back(vals[i]);
+			}
+			out += "]}";
+			ok = true;
+			break;
+		}
+		default:
+			break;
+		}
+		path.resize(base);
+		return ok;
+	}
+	case ExpressionClass::BOUND_FUNCTION: {
+		// ⚠ A COMPARISON IS A FUNCTION EXPRESSION ON 2.0 — IsComparison covers exactly the eight binary
+		// comparison types (BETWEEN is excluded; it arrives as COMPARE_BETWEEN, which we do not handle).
+		if (!BoundComparisonExpression::IsComparison(e)) {
+			return false;
+		}
+		auto &cmp_expr = e.Cast<BoundFunctionExpression>();
+		auto &left = BoundComparisonExpression::Left(cmp_expr);
+		auto &right = BoundComparisonExpression::Right(cmp_expr);
+		auto cmp = e.GetExpressionType();
+		optional_ptr<const Expression> subject;
+		optional_ptr<const BoundConstantExpression> konst;
+		if (right.GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
+			subject = left;
+			konst = right.Cast<BoundConstantExpression>();
+		} else if (left.GetExpressionClass() == ExpressionClass::BOUND_CONSTANT) {
+			subject = right;
+			konst = left.Cast<BoundConstantExpression>();
+			cmp = FlipComparisonExpression(cmp); // the constant was on the LEFT
+		} else {
+			return false; // column-to-column: no constant to prune against
+		}
+		const char *tok = LiveCmpToken(cmp);
+		if (!tok || konst->GetValue().IsNull()) {
+			return false;
+		}
+		LogicalType leaf;
+		if (!LiveExprSubject(*subject, type, path, leaf)) {
+			path.resize(base);
+			return false;
+		}
+		bool ok = true;
+		if (leaf.id() == LogicalTypeId::VARCHAR && !string_order_pushable && string(tok) != "=") {
+			ok = false; // string ordering: only pushable for a byte-ordered source
+		}
+		if (ok) {
+			idx_t idx = constants.size();
+			constants.push_back(konst->GetValue());
+			out += "{\"op\":\"compare\",\"cmp\":\"";
+			out += tok;
+			out += "\",";
+			LiveJsonColumnRef(path, out);
+			out += ",\"val\":" + to_string(idx) + "}";
+		}
+		path.resize(base);
+		return ok;
+	}
+	default:
+		return false;
+	}
+}
+
 // Serialize one live TableFilter on the column identified by `path` (leaf type `type`) into a FilterNode
 // JSON object, appending its constants to `constants`. Returns false = not convertible (skip-safe for the
 // pruning consumer). String ordering comparisons are gated like the bind-time serializer.
@@ -816,8 +1079,21 @@ static bool LiveFilterNode(const TableFilter &f, vector<string> &path, const Log
 		out += "]}";
 		return true;
 	}
+	case TableFilterType::EXPRESSION_FILTER: {
+		// 2.0's optimizer hands us THIS and nothing else; the block above says why the old
+		// "not convertible" default was silently fatal to pruning.
+		auto &ef = f.Cast<ExpressionFilter>();
+		// ⚠ A single-column filter carries no `column_indexes` (TableFilterSet::PushFilter refuses one
+		// that does) and a multi-column filter lives in TableFilterSet::multi_column_filters, which this
+		// iteration never reaches. A non-empty one here would mean the subject is NOT this entry's column,
+		// so refuse rather than prune on the wrong one.
+		if (!ef.expr || !ef.column_indexes.empty()) {
+			return false;
+		}
+		return LiveExprNode(*ef.expr, path, type, constants, string_order_pushable, out);
+	}
 	default:
-		return false; // EXPRESSION_FILTER / BLOOM_FILTER: not convertible (bloom is pruning-only anyway)
+		return false; // BLOOM_FILTER / anything new: not convertible (bloom is probabilistic anyway)
 	}
 }
 
