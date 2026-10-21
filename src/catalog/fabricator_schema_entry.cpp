@@ -955,7 +955,7 @@ static ScalarFunction BuildFabricatorScalarFunction(FabricatorHandle handle, con
 			DataChunk rows;
 			rows.Initialize(Allocator::Get(ctx), actual_types, MaxValue<idx_t>(row_count, 1));
 			// 2.0: a constant Reference declares how many rows it covers.
-			rows.data[0].Reference(Value::BOOLEAN(false), MaxValue<idx_t>(row_count, 1));
+			rows.data[0].Reference(Value::BOOLEAN(false), count_t(MaxValue<idx_t>(row_count, 1)));
 			rows.data[0].Flatten(row_count);
 			rows.SetCardinality(row_count);
 			appender.Append(rows, 0, row_count, row_count);
@@ -1389,23 +1389,32 @@ void AggFinalizeSpillImpl(FabricatorAggregateBindData &bind, Vector &state, Vect
 	}
 }
 
-idx_t FabricatorAggregateStateSize(const AggregateFunction &function) {
-	auto &info = function.GetExtraFunctionInfo().Cast<FabricatorAggregateFunctionInfo>();
+// 2.0: takes an AggregateStateInput; the extra info hangs off the bound function's DEFINITION.
+idx_t FabricatorAggregateStateSize(AggregateStateInput &input) {
+	auto &info = input.function.GetDefinition()->GetExtraFunctionInfo().Cast<FabricatorAggregateFunctionInfo>();
 	// Spillable: a fixed, pointer-free serialized-state blob ([uint32 len][data]); else an int64 id.
 	return info.spillable ? (sizeof(uint32_t) + FABRICATOR_AGG_SPILL_CAP) : sizeof(int64_t);
 }
 
-void FabricatorAggregateInit(const AggregateFunction &function, data_ptr_t state) {
-	auto &info = function.GetExtraFunctionInfo().Cast<FabricatorAggregateFunctionInfo>();
-	if (info.spillable) {
-		Store<uint32_t>(AGG_SPILL_SENTINEL, state); // fresh/uninitialized; no C# call needed at init
-	} else {
-		Store<int64_t>(info.counter.fetch_add(1, std::memory_order_relaxed), state);
+// ⚠ 2.0 made initialize BATCHED: it is handed `count` states instead of one. The per-state work is
+// unchanged — in particular each state still takes its OWN id from the counter, which is what the
+// one-call-per-state contract used to give us.
+void FabricatorAggregateInit(AggregateStateInput &input, data_ptr_t *states, idx_t count) {
+	auto &info = input.function.GetDefinition()->GetExtraFunctionInfo().Cast<FabricatorAggregateFunctionInfo>();
+	for (idx_t i = 0; i < count; i++) {
+		if (info.spillable) {
+			Store<uint32_t>(AGG_SPILL_SENTINEL, states[i]); // fresh/uninitialized; no C# call needed at init
+		} else {
+			Store<int64_t>(info.counter.fetch_add(1, std::memory_order_relaxed), states[i]);
+		}
 	}
 }
 
-unique_ptr<FunctionData> FabricatorAggregateBind(ClientContext &context, AggregateFunction &function,
-                                               vector<unique_ptr<Expression>> &arguments) {
+// 2.0: one input struct instead of (context, function, arguments) — same shape as the scalar bind.
+unique_ptr<FunctionData> FabricatorAggregateBind(BindAggregateFunctionInput &input) {
+	auto &context = input.GetClientContext();
+	auto &function = input.GetBoundFunction();
+	auto &arguments = input.GetArguments();
 	auto &info = function.GetExtraFunctionInfo().Cast<FabricatorAggregateFunctionInfo>();
 	auto bind_data = make_uniq<FabricatorAggregateBindData>();
 	bind_data->holder = make_shared_ptr<AggSessionHolder>();
@@ -1434,7 +1443,7 @@ unique_ptr<FunctionData> FabricatorAggregateBind(ClientContext &context, Aggrega
 		// after this bind returns (CastToFunctionArguments), so the bind's view of an argument AGREES with
 		// the batch update will see. An ANY parameter gets no cast, so the expression's own type is right.
 		LogicalType marshal_type = arg.GetReturnType();
-		auto declared = FabricatorDeclaredArgType(function.GetSignature(), i);
+		auto declared = FabricatorDeclaredArgType(function.GetDefinition()->GetSignature(), i);
 		if (declared.id() != LogicalTypeId::ANY && declared.id() != LogicalTypeId::INVALID) {
 			marshal_type = declared;
 		}
@@ -1597,8 +1606,10 @@ void FabricatorAggregateCombine(Vector &source, Vector &target, AggregateInputDa
 
 // Produce each group's result. `state` may be CONSTANT (ungrouped) or FLAT (grouped). The managed side
 // returns one column of `count` results in id order (an absent id => a fresh accumulator => empty value).
-void FabricatorAggregateFinalize(Vector &state, AggregateInputData &aggr_input_data, Vector &result, idx_t count,
-                               idx_t offset) {
+// 2.0: finalize takes AggregateFinalizeInputData, which DERIVES from AggregateInputData (it adds the
+// finalize-local state), so the body is unchanged.
+void FabricatorAggregateFinalize(Vector &state, AggregateFinalizeInputData &aggr_input_data, Vector &result,
+                                 idx_t count, idx_t offset) {
 	if (count == 0) {
 		return;
 	}
@@ -1689,8 +1700,16 @@ static AggregateFunction BuildFabricatorAggregateFunction(FabricatorHandle handl
 	}
 	AggregateFunction fn(Identifier(func_name), registered_args, return_type, FabricatorAggregateStateSize, FabricatorAggregateInit,
 	                     FabricatorAggregateUpdate, FabricatorAggregateCombine, FabricatorAggregateFinalize,
-	                     FunctionNullHandling::DEFAULT_NULL_HANDLING, FabricatorAggregateSimpleUpdate,
-	                     FabricatorAggregateBind, nullptr);
+	                     // ⚠⚠ 2.0 REMOVED the simple-update slot entirely and put `cluster_update` in its
+	                     // place — a DIFFERENT contract: simple-update folded a batch into ONE state, a
+	                     // cluster update folds into a CLUSTERED SET (ClusteredAggr). Passing nullptr is
+	                     // CORRECT, not a stopgap for correctness: DuckDB then drives the general `update`
+	                     // path, which we implement. What is lost is the fast path for a single state.
+	                     // ⇒ FabricatorAggregateSimpleUpdate is unwired for now; wiring a real cluster
+	                     // update is its own piece of work, not part of this port.
+	                     // ⚠ The NAMED ctor has no null_handling parameter (the unnamed one does); we passed
+	                     // DEFAULT_NULL_HANDLING, i.e. the default, so dropping it is behaviour-neutral.
+	                     nullptr, FabricatorAggregateBind, nullptr);
 	auto fn_info = make_shared_ptr<FabricatorAggregateFunctionInfo>();
 	fn_info->handle = handle;
 	fn_info->schema = schema_name;
@@ -1735,7 +1754,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateAggregateFunction(C
 	AggregateFunction fn =
 	    BuildFabricatorAggregateFunction(handle_, name.GetIdentifierName(), func_name, arg_types, arg_names, return_type, spillable);
 
-	AggregateFunctionSet set(func_name);
+	AggregateFunctionSet set(Identifier(func_name));
 	set.AddFunction(fn);
 	CreateAggregateFunctionInfo info(std::move(set));
 	info.SetQualification(catalog.GetName(), Identifier(name));

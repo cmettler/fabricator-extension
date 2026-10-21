@@ -172,7 +172,8 @@ static void BindCommonCopyOptions(const identifier_map_t<vector<Value>> &options
 }
 
 static unique_ptr<FunctionData> CopyToBind(ClientContext &context, CopyFunctionBindInput &input,
-                                           const vector<string> &names, const vector<LogicalType> &sql_types) {
+                                           const vector<Identifier> &names,
+                                           const vector<LogicalType> &sql_types) {
 	auto bind_data = make_uniq<FabricatorCopyBindData>();
 	ParseTarget(input.info.file_path, bind_data->catalog_name, bind_data->schema_name, bind_data->table_name);
 
@@ -202,7 +203,8 @@ static unique_ptr<FunctionData> CopyToBind(ClientContext &context, CopyFunctionB
 // does NOT roll back with a surrounding DuckDB BEGIN/ROLLBACK (the transient catalog has no transaction
 // manager). A failure discards the parked buffer (nothing committed).
 static unique_ptr<FunctionData> DeltaCopyToBind(ClientContext &context, CopyFunctionBindInput &input,
-                                                const vector<string> &names, const vector<LogicalType> &sql_types) {
+                                                const vector<Identifier> &names,
+                                           const vector<LogicalType> &sql_types) {
 	auto bind_data = make_uniq<FabricatorCopyBindData>();
 	bind_data->transient_delta = true;
 
