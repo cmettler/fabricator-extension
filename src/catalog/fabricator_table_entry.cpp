@@ -172,8 +172,8 @@ private:
 	bool ColumnPath(const Expression &e, vector<string> &path, LogicalType &type) {
 		if (e.GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
 			auto &func = e.Cast<BoundFunctionExpression>();
-			if ((func.function.name != "struct_extract" && func.function.name != "struct_extract_at") ||
-			    func.GetChildren().size() != 2 || !func.bind_info) {
+			if ((func.Function().GetName() != "struct_extract" && func.Function().GetName() != "struct_extract_at") ||
+			    func.GetChildren().size() != 2 || !func.BindInfo()) {
 				return false;
 			}
 			if (!ColumnPath(*func.GetChildren()[0], path, type)) {
@@ -183,7 +183,7 @@ private:
 			if (parent_type.id() != LogicalTypeId::STRUCT) {
 				return false; // VARIANT member access etc.: not a plain struct path
 			}
-			auto member = func.bind_info->Cast<StructExtractBindData>().index;
+			auto member = func.BindInfo()->Cast<StructExtractBindData>().index;
 			auto &members = StructType::GetChildTypes(parent_type);
 			if (member >= members.size()) {
 				return false;
@@ -803,7 +803,8 @@ static unique_ptr<FunctionData> FabricatorScanDeserialize(Deserializer &deserial
 	auto table = deserializer.ReadProperty<string>(102, "table");
 
 	auto &context = deserializer.Get<ClientContext &>();
-	auto &catalog_entry = Catalog::GetEntry<TableCatalogEntry>(context, catalog, schema, table);
+	auto &catalog_entry = Catalog::GetEntry<TableCatalogEntry>(context, Identifier(catalog), Identifier(schema),
+	                                                           Identifier(table));
 	if (catalog_entry.type != CatalogType::TABLE_ENTRY) {
 		throw SerializationException("fabricator_scan: cannot find table for %s.%s", schema, table);
 	}
@@ -842,8 +843,8 @@ TableFunction FabricatorTableEntry::BuildScanFunction(ClientContext &context, un
 	auto data = make_uniq<fabricator::ArrowStreamBindData>();
 	auto table_handle = table_handle_;
 	// The managed side builds the provider SELECT for the whole table.
-	string schema_name = schema.name;
-	string table_name = name;
+	string schema_name = schema.name.GetIdentifierName();
+	string table_name = name.GetIdentifierName();
 
 	// Optimizer statistics — row count + per-column NDV in ONE lazy table_stats crossing (fetched once,
 	// cached on the entry). Best-effort: a stats failure (e.g. missing VIEW DATABASE STATE) must not break

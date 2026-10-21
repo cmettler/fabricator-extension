@@ -109,7 +109,7 @@ struct FabricatorCopyGlobalState : public GlobalFunctionData {
 
 struct FabricatorCopyLocalState : public LocalFunctionData {};
 
-static bool GetBoolOption(const case_insensitive_map_t<vector<Value>> &options, const string &key, bool fallback) {
+static bool GetBoolOption(const identifier_map_t<vector<Value>> &options, const string &key, bool fallback) {
 	auto it = options.find(Identifier(key));
 	if (it == options.end() || it->second.empty()) {
 		return fallback;

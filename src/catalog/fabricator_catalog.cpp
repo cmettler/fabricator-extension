@@ -449,11 +449,11 @@ static bool FabricatorParallelWrite(ClientContext &context, optional_ptr<Physica
 PhysicalOperator &FabricatorCatalog::PlanCreateTableAs(ClientContext &context, PhysicalPlanGenerator &planner,
                                                      LogicalCreateTable &op, PhysicalOperator &plan) {
 	auto &create_info = op.info->base->Cast<CreateTableInfo>();
-	MarkSinkOnOwnScans(plan, create_info.GetQualifiedName().Schema().GetIdentifierName(), create_info.table, "create");
+	MarkSinkOnOwnScans(plan, create_info.GetQualifiedName().Schema().GetIdentifierName(), create_info.GetQualifiedName().Name().GetIdentifierName(), "create");
 
 	FabricatorCtasInfo info;
-	info.GetQualifiedName().Schema().GetIdentifierName()_name = create_info.GetQualifiedName().Schema().GetIdentifierName();
-	info.table_name = create_info.table;
+	info.schema_name = create_info.GetQualifiedName().Schema().GetIdentifierName();
+	info.table_name = create_info.GetQualifiedName().Name().GetIdentifierName();
 	for (auto &col : create_info.columns.Logical()) {
 		info.column_names.push_back(col.Name());
 		info.column_types.push_back(col.Type());
@@ -463,7 +463,7 @@ PhysicalOperator &FabricatorCatalog::PlanCreateTableAs(ClientContext &context, P
 	info.sort_columns = fabricator::PartitionColumnsArg(create_info.sort_keys);           // native SORTED BY (→ CLUSTER BY)
 	info.options_json = fabricator::TableOptionsArg(create_info.options);                 // WITH (key='value', ...)
 	info.handle = handle_;
-	info.GetQualifiedName().Schema().GetIdentifierName()_entry = &op.schema.Cast<FabricatorSchemaEntry>();
+	info.schema_entry = &op.schema.Cast<FabricatorSchemaEntry>();
 	info.parallel = FabricatorParallelWrite(context, &plan);
 
 	vector<LogicalType> result_types {LogicalType::BIGINT};
@@ -477,12 +477,12 @@ PhysicalOperator &FabricatorCatalog::PlanInsert(ClientContext &context, Physical
 	// INSERT ... SELECT reading this same catalog: name the sink on those scans so the provider can decide
 	// whether to drain them. `plan` is null for INSERT ... VALUES, which reads nothing and needs no mark.
 	if (plan) {
-		MarkSinkOnOwnScans(*plan, op.table.schema.name, op.table.name, "insert");
+		MarkSinkOnOwnScans(*plan, op.table.schema.name.GetIdentifierName(), op.table.name.GetIdentifierName(), "insert");
 	}
 	FabricatorInsertTarget target;
 	target.returning = op.return_chunk;
-	target.schema_name = op.table.schema.name;
-	target.table_name = op.table.name;
+	target.schema_name = op.table.schema.name.GetIdentifierName();
+	target.table_name = op.table.name.GetIdentifierName();
 
 	auto all_names = op.table.GetColumns().GetColumnNames();
 	vector<LogicalType> all_types;
