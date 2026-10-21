@@ -2015,7 +2015,7 @@ unique_ptr<FunctionData> FabricatorTableFunctionBind(ClientContext &context, Tab
 				arg_values.push_back(v);
 				continue;
 			}
-			auto supplied = input.named_parameters.find(info.arg_names[i]);
+			auto supplied = input.named_parameters.find(Identifier(info.arg_names[i]));
 			if (supplied != input.named_parameters.end()) {
 				arg_types.push_back(declared.id() == LogicalTypeId::SQLNULL ? supplied->second.type() : declared);
 				arg_names.push_back(info.arg_names[i]);
@@ -4345,7 +4345,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::CreateTable(CatalogTransaction
 	// through this same function, so on the conflict path the entry is already cached, and a non-conflicting
 	// create pays only a table_types_ miss.
 	if (base.on_conflict == OnCreateConflict::ERROR_ON_CONFLICT && GetOrCreateEntry(context, base.GetQualifiedName().Name().GetIdentifierName())) {
-		throw CatalogException::EntryAlreadyExists(CatalogType::TABLE_ENTRY, base.GetQualifiedName().Name().GetIdentifierName());
+		throw CatalogException::EntryAlreadyExists(CatalogType::TABLE_ENTRY, base.GetQualifiedName().Name());
 	}
 
 	if (replace) {
@@ -4749,7 +4749,7 @@ void FabricatorSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &inf
 			if (!key || key->GetExpressionType() != ExpressionType::COLUMN_REF) {
 				throw NotImplementedException("fabricator: SET PARTITIONED BY accepts plain column names only");
 			}
-			request.columns.push_back(key->Cast<ColumnRefExpression>().GetColumnName());
+			request.columns.push_back(key->Cast<ColumnRefExpression>().GetColumnName().GetIdentifierName());
 		}
 		break;
 	}

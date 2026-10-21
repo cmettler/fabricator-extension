@@ -304,7 +304,11 @@ void PopulateReturnSchema(ClientContext &context, ArrowStreamBindData &bind_data
 		throw IOException("Fabricator: result schema has no columns");
 	}
 	bind_data.return_types = return_types;
-	bind_data.names = names; // remember for projection/filter column-name mapping
+	// our bind data keeps plain strings; DuckDB reports Identifiers.
+	bind_data.names.clear();
+	for (auto &n : names) {
+		bind_data.names.push_back(n.GetIdentifierName());
+	}
 }
 
 BindInfo ArrowStreamGetBindInfo(TableFunctionGetBindInfoInput &input) { // 2.0: takes an input struct
@@ -606,7 +610,7 @@ static bool LiveFilterNode(const TableFilter &f, vector<string> &path, const Log
 			return false;
 		}
 		// Member name from the struct type at the bound index (exact case — matches parquet/stats keys).
-		path.push_back(members[sf.child_idx].first);
+		path.push_back(members[sf.child_idx].first.GetIdentifierName());
 		bool ok = sf.child_filter &&
 		          LiveFilterNode(*sf.child_filter, path, members[sf.child_idx].second, constants,
 		                         string_order_pushable, out);
@@ -1086,7 +1090,7 @@ static void BuildRowId(const vector<idx_t> &sources, DataChunk &all_columns, Vec
 	out.SetVectorType(VectorType::FLAT_VECTOR);
 	auto &entries = StructVector::GetEntries(out);
 	for (idx_t i = 0; i < sources.size(); i++) {
-		entries[i]->Reference(all_columns.data[sources[i]]);
+		entries[i].Reference(all_columns.data[sources[i]]);
 	}
 }
 
