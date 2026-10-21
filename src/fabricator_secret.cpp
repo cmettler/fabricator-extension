@@ -95,7 +95,7 @@ void RegisterProviderSecrets(ExtensionLoader &loader) {
 		// Register one DuckDB secret type (+ its config creation function) per distinct declared secret_type.
 		for (auto &entry : g_secret_types) {
 			SecretType type;
-			type.name = entry.first;
+			type.name = Identifier(entry.first);
 			type.deserializer = KeyValueSecret::Deserialize<KeyValueSecret>;
 			type.default_provider = "config";
 			loader.RegisterSecretType(type);
@@ -105,7 +105,7 @@ void RegisterProviderSecrets(ExtensionLoader &loader) {
 			create_func.provider = "config";
 			create_func.function = CreateProviderSecret;
 			for (auto &field : entry.second.fields) {
-				create_func.named_parameters[field.name] = field.type;
+				create_func.named_parameters[Identifier(field.name)] = field.type;
 			}
 			loader.RegisterFunction(std::move(create_func));
 		}

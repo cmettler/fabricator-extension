@@ -4584,7 +4584,7 @@ void FabricatorSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &inf
 	case AlterTableType::ADD_COLUMN: {
 		auto &ac = table_info.Cast<AddColumnInfo>();
 		request.kind = "add_column";
-		request.column = ac.new_column.Name();
+		request.column = ac.new_column.Name().GetIdentifierName();
 		request.guard = ac.if_column_not_exists;
 		carry_type(ac.new_column.Type(), ac.new_column.Name());
 		// ⚠⚠ THE DEFAULT MUST BE CARRIED, and dropping it was SILENT: the column appeared, existing rows
@@ -4648,7 +4648,7 @@ void FabricatorSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &inf
 	case AlterTableType::REMOVE_COLUMN: {
 		auto &rc = table_info.Cast<RemoveColumnInfo>();
 		request.kind = "drop_column";
-		request.column = rc.removed_column;
+		request.column = rc.removed_column.GetIdentifierName();
 		request.guard = rc.if_column_exists;
 		break;
 	}
@@ -4664,7 +4664,10 @@ void FabricatorSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &inf
 		// CONTAINING struct's; the new field's name + type ride the type channel, exactly like ADD_COLUMN.
 		auto &af = table_info.Cast<AddFieldInfo>();
 		request.kind = "add_field";
-		request.path = af.column_path;
+		request.path.clear();
+		for (auto &p : af.column_path) {
+			request.path.push_back(p.GetIdentifierName());
+		}
 		request.guard = af.if_field_not_exists;
 		carry_type(af.new_field.Type(), af.new_field.Name());
 		break;
@@ -4672,14 +4675,20 @@ void FabricatorSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &inf
 	case AlterTableType::REMOVE_FIELD: {
 		auto &rf = table_info.Cast<RemoveFieldInfo>();
 		request.kind = "drop_field";
-		request.path = rf.column_path;
+		request.path.clear();
+		for (auto &p : rf.column_path) {
+			request.path.push_back(p.GetIdentifierName());
+		}
 		request.guard = rf.if_column_exists;
 		break;
 	}
 	case AlterTableType::RENAME_FIELD: {
 		auto &rf = table_info.Cast<RenameFieldInfo>();
 		request.kind = "rename_field";
-		request.path = rf.column_path;
+		request.path.clear();
+		for (auto &p : rf.column_path) {
+			request.path.push_back(p.GetIdentifierName());
+		}
 		request.new_name = rf.new_name;
 		break;
 	}
@@ -4764,7 +4773,7 @@ void FabricatorSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &inf
 		table_types_.erase(table);
 		RetireErase(entries_, table, retired_entries_);
 		RetireAtEntriesFor(at_entries_, table, retired_entries_);
-		table_types_[rt.new_table_name] = type;
+		table_types_[rt.new_table_name.GetIdentifierName()] = type;
 		RetireErase(entries_, rt.new_table_name, retired_entries_);
 		RetireAtEntriesFor(at_entries_, rt.new_table_name, retired_entries_);
 	} else {

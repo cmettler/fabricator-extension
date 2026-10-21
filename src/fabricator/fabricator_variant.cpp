@@ -110,7 +110,7 @@ void VariantArrowToDuck(ClientContext &context, Vector &source, Vector &result, 
 // struct<metadata, value>; the two halves are concatenated into the single transport blob.
 void VariantDuckToArrow(ClientContext &context, Vector &source, Vector &result, idx_t count) {
 	auto expr = BindVariantConversion(context, "variant_to_parquet_variant", LogicalType::VARIANT());
-	Vector transport(expr->return_type, count);
+	Vector transport(expr->GetReturnType(), count);
 	ExecuteConversion(context, *expr, source, count, transport);
 
 	auto &entries = StructVector::GetEntries(transport);
