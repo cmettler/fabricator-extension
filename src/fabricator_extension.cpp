@@ -651,7 +651,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 		         {LogicalType::VARCHAR, LogicalType::VARCHAR},
 		         {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::ANY}}) {
 			ScalarFunction exec_fn("fabricator_exec", signature, LogicalType::BIGINT, FabricatorExecFunction);
-			exec_fn.GetStability() = FunctionStability::VOLATILE;
+			exec_fn.SetStability(FunctionStability::VOLATILE);
 			exec_set.AddFunction(exec_fn);
 		}
 		loader.RegisterFunction(exec_set);
@@ -661,7 +661,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	{
 		ScalarFunction refresh_fn("fabricator_refresh_cache", {LogicalType::VARCHAR}, LogicalType::BOOLEAN,
 		                          FabricatorRefreshCacheFunction);
-		refresh_fn.GetStability() = FunctionStability::VOLATILE;
+		refresh_fn.SetStability(FunctionStability::VOLATILE);
 		loader.RegisterFunction(refresh_fn);
 	}
 
@@ -677,7 +677,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 		for (auto &arg_types : signatures) {
 			ScalarFunction fn("fabricator_invalidate_cache", arg_types, LogicalType::BOOLEAN,
 			                  FabricatorRefreshCacheFunction);
-			fn.GetStability() = FunctionStability::VOLATILE;
+			fn.SetStability(FunctionStability::VOLATILE);
 			set.AddFunction(fn);
 		}
 		loader.RegisterFunction(set);

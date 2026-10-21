@@ -803,8 +803,8 @@ void MakeHostQueryStream(DatabaseInstance &db, const string &sql, ArrowArrayStre
 	st->pin = std::move(pinned); // null unless PINNED; keeps the pin alive for this stream's life
 	st->conn = std::move(conn);
 	st->prepared = std::move(prepared);
-	st->types = result->types;
-	for (auto &n : result->names) {
+	st->types = result->GetTypes();
+	for (auto &n : result->GetNames()) {
 		st->names.push_back(n.GetIdentifierName());
 	}
 	st->batch_rows = batch_rows; // the caller's morsel-size request (ABI v85); 0 = one DataChunk

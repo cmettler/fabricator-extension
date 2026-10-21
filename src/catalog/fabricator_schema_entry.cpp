@@ -309,7 +309,8 @@ static void ApplyColumnDefault(ColumnDefinition &column, const string &text) {
 		return;
 	}
 	try {
-		auto expressions = Parser::ParseExpressionList(text);
+		Parser default_parser(context);
+		auto expressions = default_parser.ParseExpressionList(text);
 		if (expressions.size() != 1 || expressions[0]->GetExpressionClass() != ExpressionClass::CONSTANT) {
 			return; // a function, a cast, an operator — anything DuckDB would re-evaluate on our behalf
 		}
@@ -1151,7 +1152,7 @@ void ReadStateIds(Vector &state, idx_t count, int64_t *out) {
 // Marshal a single-column int64 Arrow batch from `ids` (no extension types — BIGINT has none).
 ArrowArray BuildIdBatch(const ClientProperties &props, const int64_t *ids, idx_t count) {
 	Vector id_vec(LogicalType::BIGINT);
-	auto data = FlatVector::GetData<int64_t>(id_vec);
+	auto data = FlatVector::GetDataMutable<int64_t>(id_vec);
 	for (idx_t i = 0; i < count; i++) {
 		data[i] = ids[i];
 	}
@@ -1209,7 +1210,7 @@ void MarshalAggUpdate(FabricatorAggregateBindData &bind, Vector &id_vec, Vector 
 
 // Fill a BLOB Vector with the current serialized state of each group blob (sentinel => NULL).
 void FillBlobVector(Vector &vec, const data_ptr_t *blobs, idx_t count) {
-	auto data = FlatVector::GetData<string_t>(vec);
+	auto data = FlatVector::GetDataMutable<string_t>(vec);
 	for (idx_t i = 0; i < count; i++) {
 		uint32_t len = Load<uint32_t>(blobs[i]);
 		if (len == AGG_SPILL_SENTINEL) {
@@ -1277,7 +1278,7 @@ void AggUpdateSpillImpl(FabricatorAggregateBindData &bind, Vector inputs[], idx_
 	std::unordered_map<data_ptr_t, idx_t> slot_of;
 	vector<data_ptr_t> group_blobs;
 	Vector slot_vec(LogicalType::BIGINT);
-	auto slot_data = FlatVector::GetData<int64_t>(slot_vec);
+	auto slot_data = FlatVector::GetDataMutable<int64_t>(slot_vec);
 	for (idx_t i = 0; i < count; i++) {
 		data_ptr_t blob = ptrs[sdata.sel->get_index(i)];
 		auto it = slot_of.find(blob);
@@ -1314,7 +1315,7 @@ void AggCombineSpillImpl(FabricatorAggregateBindData &bind, Vector &source, Vect
 	vector<data_ptr_t> target_blobs;
 	vector<data_ptr_t> source_blobs(count);
 	Vector slot_vec(LogicalType::BIGINT);
-	auto slot_data = FlatVector::GetData<int64_t>(slot_vec);
+	auto slot_data = FlatVector::GetDataMutable<int64_t>(slot_vec);
 	for (idx_t i = 0; i < count; i++) {
 		data_ptr_t tgt = tptr[tf.sel->get_index(i)];
 		auto it = slot_of.find(tgt);
@@ -1533,7 +1534,7 @@ void FabricatorAggregateSimpleUpdate(Vector inputs[], AggregateInputData &aggr_i
 	}
 	auto &bind = aggr_input_data.bind_data->Cast<FabricatorAggregateBindData>();
 	Vector key_vec(LogicalType::BIGINT);
-	auto data = FlatVector::GetData<int64_t>(key_vec);
+	auto data = FlatVector::GetDataMutable<int64_t>(key_vec);
 	if (bind.spillable) {
 		// All rows fold into the single state `state`: one group (slot 0).
 		for (idx_t i = 0; i < count; i++) {
@@ -1569,8 +1570,8 @@ void FabricatorAggregateCombine(Vector &source, Vector &target, AggregateInputDa
 	ReadStateIds(source, count, src.data());
 	Vector tgt_vec(LogicalType::BIGINT);
 	Vector src_vec(LogicalType::BIGINT);
-	auto tgt_data = FlatVector::GetData<int64_t>(tgt_vec);
-	auto src_data = FlatVector::GetData<int64_t>(src_vec);
+	auto tgt_data = FlatVector::GetDataMutable<int64_t>(tgt_vec);
+	auto src_data = FlatVector::GetDataMutable<int64_t>(src_vec);
 	for (idx_t i = 0; i < count; i++) {
 		tgt_data[i] = tgt[i];
 		src_data[i] = src[i];
