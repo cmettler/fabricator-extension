@@ -366,7 +366,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateEntry(ClientContext
 			handle = nullptr;
 			return h;
 		}
-	} table_guard {fabricator::TableOpen(handle_, name, table_name, at_unit, at_value)};
+	} table_guard {fabricator::TableOpen(handle_, name.GetIdentifierName(), table_name, at_unit, at_value)};
 
 	vector<string> names;
 	vector<LogicalType> types;
@@ -1047,7 +1047,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateScalarFunction(Clie
 	try {
 		FetchFunctionParamSchema(context, handle_, name.GetIdentifierName(), func_name, arg_names, arg_types,
 		                         &arg_styles);
-		return_type = FetchFunctionReturnType(context, handle_, name, func_name, &is_volatile);
+		return_type = FetchFunctionReturnType(context, handle_, name.GetIdentifierName(), func_name, &is_volatile);
 	} catch (std::exception &) {
 		// The discovered name is stale — the function no longer exists on the server
 		// (e.g. dropped out-of-band). Treat it as not-found rather than erroring.
@@ -1714,7 +1714,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateAggregateFunction(C
 	try {
 		FetchFunctionParamSchema(context, handle_, name.GetIdentifierName(), func_name, arg_names, arg_types,
 		                         &arg_styles);
-		return_type = FetchFunctionReturnType(context, handle_, name, func_name);
+		return_type = FetchFunctionReturnType(context, handle_, name.GetIdentifierName(), func_name);
 	} catch (std::exception &) {
 		// Stale discovery (the function no longer exists) — treat as not-found, like the scalar path.
 		aggregate_functions_.erase(func_name);
@@ -1725,7 +1725,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateAggregateFunction(C
 	// Outside the catch above: a malformed declaration is a bug to report, not a stale name to drop.
 	FabricatorRefuseVarArgs(func_name, "aggregate", arg_names, arg_styles);
 	AggregateFunction fn =
-	    BuildFabricatorAggregateFunction(handle_, name, func_name, arg_types, arg_names, return_type, spillable);
+	    BuildFabricatorAggregateFunction(handle_, name.GetIdentifierName(), func_name, arg_types, arg_names, return_type, spillable);
 
 	AggregateFunctionSet set(func_name);
 	set.AddFunction(fn);
@@ -3710,7 +3710,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateSqlTableFunction(Cl
 	vector<LogicalType> all_types;
 	vector<FabricatorParamStyle> styles;
 	try {
-		FetchFunctionParamSchema(context, handle_, name, func_name, all_names, all_types, &styles);
+		FetchFunctionParamSchema(context, handle_, name.GetIdentifierName(), func_name, all_names, all_types, &styles);
 	} catch (std::exception &) {
 		// Stale discovery (the provider no longer declares it) — treat as not-found, like the other paths.
 		sql_table_functions_.erase(func_name);
@@ -3813,7 +3813,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateLateralFunction(Cli
 		custom_lateral_functions_.erase(func_name);
 		return nullptr;
 	}
-	auto fn = FabricatorMakeLateralFunction(handle_, name, func_name, std::move(arg_names), std::move(arg_types),
+	auto fn = FabricatorMakeLateralFunction(handle_, name.GetIdentifierName(), func_name, std::move(arg_names), std::move(arg_types),
 	                                        std::move(arg_styles));
 	CreateTableFunctionInfo info(std::move(fn));
 	info.SetQualification(catalog.GetName(), Identifier(name));
@@ -4342,7 +4342,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::CreateTable(CatalogTransaction
 	}
 
 	if (replace) {
-		fabricator::DropTable(handle_, name, base.GetQualifiedName().Name().GetIdentifierName(), /*if_exists=*/true);
+		fabricator::DropTable(handle_, name.GetIdentifierName(), base.GetQualifiedName().Name().GetIdentifierName(), /*if_exists=*/true);
 	}
 
 	// Native CREATE TABLE ... PARTITIONED BY (cols): the column names (comma-separated) go to the provider
@@ -4361,7 +4361,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::CreateTable(CatalogTransaction
 	fabricator::ArrowProducer producer(types, names, fabricator::BoundaryClientProperties(context));
 	producer.SetNullability(nullable);
 	producer.Finish();
-	fabricator::CreateTable(handle_, name, base.GetQualifiedName().Name().GetIdentifierName(), *producer.Stream(), if_not_exists, pk_arg, unique_arg,
+	fabricator::CreateTable(handle_, name.GetIdentifierName(), base.GetQualifiedName().Name().GetIdentifierName(), *producer.Stream(), if_not_exists, pk_arg, unique_arg,
 	                      defaults_arg, partition_arg, sort_arg, identity_arg, options_arg);
 
 	// Register the new table (also invalidates any cached entry) and return it.
@@ -4403,7 +4403,7 @@ void FabricatorSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
 	}
 	bool if_exists = info.if_not_found == OnEntryNotFound::RETURN_NULL;
 	FabricatorSetActiveTxn(handle_, context);
-	fabricator::DropTable(handle_, name, info.GetQualifiedName().Name().GetIdentifierName(), if_exists);
+	fabricator::DropTable(handle_, name.GetIdentifierName(), info.GetQualifiedName().Name().GetIdentifierName(), if_exists);
 
 	lock_guard<mutex> lock(entry_lock_);
 	table_types_.erase(info.GetQualifiedName().Name().GetIdentifierName());
