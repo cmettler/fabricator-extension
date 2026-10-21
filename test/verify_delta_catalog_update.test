@@ -82,30 +82,55 @@ SELECT id, name, amt FROM lake2.main.t ORDER BY id;
 5	a5	51
 
 # ==============================================================================================
-# SET <col> = DEFAULT is REFUSED — and this is a regression gate for silent data corruption, not a
-# note about a missing feature. The operator reads each SET value out of the child chunk at the
-# position the bound expression names; a DEFAULT contributes NO column to the binder's projection, so
-# reading positions 0..n-1 instead (which is what this used to do) shifts every SET value after the
-# DEFAULT by one. Measured before the fix, on the very shape below but with all-BIGINT columns: the
-# statement SUCCEEDED and committed a = 5, b = <rowid> where the correct answer is a = 99, b = 5.
-# Where the shifted types happen to differ it was an INTERNAL error that fatally invalidated the
-# database instead. Either way nothing said the update was wrong.
+# SET <col> = DEFAULT — a regression gate for silent data corruption, not a note about a missing
+# feature. The operator reads each SET value out of the child chunk at the position the bound
+# expression NAMES; reading positions 0..n-1 instead (which is what this used to do) shifts every SET
+# value after a DEFAULT by one. Measured on the very shape below but with all-BIGINT columns: the
+# statement SUCCEEDED and committed a = 5, b = <rowid> where the correct answer is a = <default>,
+# b = 5; where the shifted types happen to differ it was an INTERNAL error that fatally invalidated
+# the database instead. Either way nothing said the update was wrong.
+#
+# ⚠⚠ THIS SECTION USED TO ASSERT A REFUSAL AND NOW ASSERTS THE ANSWER — DuckDB 2.0 REMOVED THE REASON
+# FOR REFUSING. On 1.5 a DEFAULT contributed NO projection column, which is what made the ordinal and
+# the named position disagree. 2.0's `Binder::BindUpdateSet` pushes the column's bound default INTO
+# the projection and emits an ordinary reference to it, so a DEFAULT is just another projected value.
+# Asserting the three VALUES is a strictly stronger gate than the refusal was: a shift of any kind
+# lands a wrong number in b or c, which the refusal could never have seen.
 statement ok
 CREATE TABLE lake2.main.defcol (a BIGINT DEFAULT 99, b BIGINT, c INTEGER);
 
 statement ok
 INSERT INTO lake2.main.defcol VALUES (1, 2, 3);
 
-statement error
+statement ok
 UPDATE lake2.main.defcol SET a = DEFAULT, b = 5;
-----
-SET a = DEFAULT is not supported
 
-# The refused statement changed nothing.
+# ⚠ `a` reads NULL, not 99, and that is the DELTA PROVIDER rather than this statement: it records no
+# column defaults at all (`duckdb_columns().column_default` is NULL for every column of this table),
+# so an INSERT omitting `a` writes NULL too — the two surfaces AGREE, which is what makes NULL the
+# right expectation here rather than a swallowed defect. The load-bearing half of this row is b and
+# c: b must be 5 (the value named AFTER the default, i.e. the one a shift would move) and c must
+# still be 3 (untouched).
 query III
 SELECT a, b, c FROM lake2.main.defcol;
 ----
-1	2	3
+NULL	5	3
+
+# The same shape with the DEFAULT in the MIDDLE — a shift there moves two values, not one, and the
+# INTEGER column makes a type-crossing shift loud instead of silent.
+statement ok
+CREATE TABLE lake2.main.defmid (a BIGINT, b BIGINT DEFAULT 7, c INTEGER);
+
+statement ok
+INSERT INTO lake2.main.defmid VALUES (1, 2, 3);
+
+statement ok
+UPDATE lake2.main.defmid SET a = 11, b = DEFAULT, c = 33;
+
+query III
+SELECT a, b, c FROM lake2.main.defmid;
+----
+11	NULL	33
 
 # An ordinary multi-column UPDATE on the same table still works — this is the positive control that
 # says the check above rejects the DEFAULT specifically and not every multi-assignment update.

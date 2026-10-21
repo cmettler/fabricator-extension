@@ -600,17 +600,18 @@ void FabricatorFillUpdateSetColumns(TableCatalogEntry &table, const vector<Physi
 	for (idx_t i = 0; i < columns.size(); i++) {
 		auto &expr = *expressions[i];
 		const auto &col_name = names[columns[i].index];
-		if (expr.GetExpressionType() == ExpressionType::VALUE_DEFAULT) {
-			// Upstream's PhysicalUpdate evaluates the column's bound default here. We do not carry the
-			// defaults into the operator, and reading the ordinal instead is what USED to happen: a DEFAULT
-			// contributes no projection column, so every later SET value silently shifted one position
-			// (measured: an INTERNAL error + a fatally invalidated database when the shifted types differ,
-			// and WRONG DATA committed with exit 0 when they coincide). Refuse instead.
-			throw NotImplementedException(
-			    "fabricator: UPDATE ... SET %s = DEFAULT is not supported — write the default value "
-			    "explicitly",
-			    col_name);
-		}
+		// ⚠⚠ `SET <col> = DEFAULT` USED TO BE REFUSED HERE, AND DuckDB 2.0 REMOVED THE REASON.
+		// On 1.5 a DEFAULT contributed NO projection column, so reading the ordinal shifted every later SET
+		// value by one — measured as an INTERNAL error plus a fatally invalidated database when the shifted
+		// types differed, and WRONG DATA committed with exit 0 when they coincided. 2.0's `Binder::
+		// BindUpdateSet` now PUSHES the column's bound default into the projection and emits an ordinary
+		// column reference to it (bind_update.cpp), so a DEFAULT is just another projected value and the
+		// position rule below is exact for it. The refusal is therefore gone, and what protects us is the
+		// generic check beneath: anything that is not a reference into the binder's own projection is
+		// refused, which a VALUE_DEFAULT reaching here would now be.
+		// ⚠ A provider that does not RECORD column defaults (Delta: `column_default` is NULL for every
+		// column) resolves the default to NULL — the same answer an INSERT omitting the column already
+		// gives on that table, so the two surfaces agree rather than one of them being wrong.
 		if (expr.GetExpressionType() != ExpressionType::BOUND_REF) {
 			// The binder always emits a reference into its own projection (Binder::BindUpdateSet), and the
 			// column-binding resolver rewrites it to a BOUND_REF before physical planning. Anything else
