@@ -888,7 +888,7 @@ TableFunction FabricatorTableEntry::BuildScanFunction(ClientContext &context, un
 	// Time travel: record `FROM t AT (...)` (a bind-time constant) so the scan spec carries it to the
 	// provider (SQL Server: FOR SYSTEM_TIME AS OF for "timestamp"; "version" is rejected managed-side).
 	if (at_clause) {
-		data->at_unit = at_clause->Unit();
+		data->at_unit = at_clause->Unit().GetIdentifierName();
 		data->at_value = at_clause->GetValue().ToString();
 	}
 

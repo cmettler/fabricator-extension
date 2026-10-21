@@ -330,7 +330,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateEntry(ClientContext
 	// context-free Scan() overload, which walks entries_ directly.
 	string at_unit, at_value, at_key;
 	if (at) {
-		at_unit = at->Unit();
+		at_unit = at->Unit().GetIdentifierName();
 		at_value = at->GetValue().ToString();
 		at_key = AtEntryKey(table_name, at_unit, at_value);
 		auto at_cached = at_entries_.find(at_key);
@@ -779,7 +779,8 @@ static unique_ptr<FunctionData> FabricatorScalarBind(BindScalarFunctionInput &in
 		// One lookup now covers both the fixed prefix and the VARIADIC tail: past the prefix there is no
 		// per-slot type to read and the cast DuckDB is about to insert targets the tail's type instead.
 		// An ANY declaration gets no cast either way, so the expression's own type is what execute sees.
-		auto declared = FabricatorDeclaredArgType(bound_function.GetSignature(), i);
+		// a BOUND function points at its DEFINITION; the signature lives there.
+		auto declared = FabricatorDeclaredArgType(bound_function.GetDefinition()->GetSignature(), i);
 		if (declared.id() != LogicalTypeId::ANY && declared.id() != LogicalTypeId::INVALID) {
 			marshal_type = declared;
 		}
@@ -4693,7 +4694,7 @@ void FabricatorSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &inf
 		for (auto &p : rf.column_path) {
 			request.path.push_back(p.GetIdentifierName());
 		}
-		request.new_name = rf.new_name;
+		request.new_name = rf.new_name.GetIdentifierName();
 		break;
 	}
 	case AlterTableType::SET_NOT_NULL: {
@@ -4733,7 +4734,8 @@ void FabricatorSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &inf
 			if (!order.expression || order.expression->GetExpressionType() != ExpressionType::COLUMN_REF) {
 				throw NotImplementedException("fabricator: SET SORTED BY accepts plain column names only");
 			}
-			request.columns.push_back(order.expression->Cast<ColumnRefExpression>().GetColumnName());
+			request.columns.push_back(
+			    order.expression->Cast<ColumnRefExpression>().GetColumnName().GetIdentifierName());
 		}
 		break;
 	}
@@ -4744,7 +4746,7 @@ void FabricatorSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &inf
 		request.kind = "set_partitioned_by";
 		request.has_columns = true;
 		for (auto &key : sp.partition_keys) {
-			if (!key || key->type != ExpressionType::COLUMN_REF) {
+			if (!key || key->GetExpressionType() != ExpressionType::COLUMN_REF) {
 				throw NotImplementedException("fabricator: SET PARTITIONED BY accepts plain column names only");
 			}
 			request.columns.push_back(key->Cast<ColumnRefExpression>().GetColumnName());
@@ -4778,8 +4780,8 @@ void FabricatorSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &inf
 		RetireErase(entries_, table, retired_entries_);
 		RetireAtEntriesFor(at_entries_, table, retired_entries_);
 		table_types_[rt.new_table_name.GetIdentifierName()] = type;
-		RetireErase(entries_, rt.new_table_name, retired_entries_);
-		RetireAtEntriesFor(at_entries_, rt.new_table_name, retired_entries_);
+		RetireErase(entries_, rt.new_table_name.GetIdentifierName(), retired_entries_);
+		RetireAtEntriesFor(at_entries_, rt.new_table_name.GetIdentifierName(), retired_entries_);
 	} else {
 		refresh(table);
 	}
