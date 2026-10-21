@@ -1068,7 +1068,7 @@ void FabricatorTableEntry::BindUpdateConstraints(Binder &binder, LogicalGet &get
                                                  LogicalUpdate &update, ClientContext &context) {
 	// CHECK constraints: a constraint over several columns needs all of them projected, even the ones the
 	// statement does not assign, so the check can be evaluated (`CHECK(i + j < 10)` updating only `i`).
-	auto bound_constraints = binder.BindConstraints(constraints, name, columns);
+	auto bound_constraints = binder.BindConstraints(GetConstraints(), name, GetColumns());
 	for (auto &constraint : bound_constraints) {
 		if (constraint->type == ConstraintType::CHECK) {
 			auto &check = constraint->Cast<BoundCheckConstraint>();

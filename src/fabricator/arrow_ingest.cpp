@@ -404,9 +404,11 @@ static bool RenderTableFilter(const TableFilter &f, const string &qcol, string &
 		// The codec exact path is fine: its per-batch filter runs over logically-renamed batches.
 		auto &sf = f.Cast<LegacyStructFilter>();
 		string member;
-		if (!sf.child_name.empty()) {
+		// 2.0: child_name is an Identifier; iterate its raw characters.
+		auto sf_child = sf.child_name.GetIdentifierName();
+		if (!sf_child.empty()) {
 			member = "struct_extract(" + qcol + ", '";
-			for (char c : sf.child_name) {
+			for (char c : sf_child) {
 				member += c;
 				if (c == '\'') {
 					member += '\''; // SQL string-literal escape
