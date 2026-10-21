@@ -232,7 +232,7 @@ struct ArrowStreamBindData : public duckdb::TableFunctionData {
 
 // get_bind_info callback so DuckDB can recover the table entry from a scan
 // (LogicalGet::GetTable()); enables UPDATE/DELETE on catalog tables.
-duckdb::BindInfo ArrowStreamGetBindInfo(const duckdb::optional_ptr<duckdb::FunctionData> bind_data);
+duckdb::BindInfo ArrowStreamGetBindInfo(duckdb::TableFunctionGetBindInfoInput &input);
 
 // The spec_json for a SCHEMA-ONLY describe: `{"schema_only":true}` plus the AT clause when the reference is
 // a time-travel one, so the table is described AS OF the requested version rather than at latest.

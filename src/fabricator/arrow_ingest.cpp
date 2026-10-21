@@ -306,7 +306,8 @@ void PopulateReturnSchema(ClientContext &context, ArrowStreamBindData &bind_data
 	bind_data.names = names; // remember for projection/filter column-name mapping
 }
 
-BindInfo ArrowStreamGetBindInfo(const optional_ptr<FunctionData> bind_data) {
+BindInfo ArrowStreamGetBindInfo(TableFunctionGetBindInfoInput &input) { // 2.0: takes an input struct
+	auto bind_data = input.bind_data;
 	auto &data = bind_data->Cast<ArrowStreamBindData>();
 	if (data.table) {
 		return BindInfo(const_cast<TableCatalogEntry &>(*data.table));

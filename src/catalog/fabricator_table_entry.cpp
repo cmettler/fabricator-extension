@@ -757,7 +757,7 @@ static vector<column_t> FabricatorScanRowIdColumns(ClientContext &context, optio
 // since two scans of the same table with different pushdown must not collapse either. Scans that ARE
 // identical still dedup, which for a remote provider is a real win — one round trip, two consumers.
 static void FabricatorScanSerialize(Serializer &serializer, const optional_ptr<FunctionData> bind_data_p,
-                                    const TableFunction &function) {
+                                    const BoundTableFunction &function) { // 2.0: BoundTableFunction
 	auto &bind_data = bind_data_p->Cast<fabricator::ArrowStreamBindData>();
 	if (!bind_data.table) {
 		// Only the catalog scan installs these callbacks, and it always has a backing entry. A raw
@@ -797,7 +797,8 @@ static void FabricatorScanSerialize(Serializer &serializer, const optional_ptr<F
 // false) and is unrelated to it. Making it work would mean registering a zero-arg `fabricator_scan`
 // catalog function, which would also make it user-callable — not done. Kept correct-if-reached so that
 // whenever that lookup does resolve, this rebuilds a working scan rather than a half-initialized one.
-static unique_ptr<FunctionData> FabricatorScanDeserialize(Deserializer &deserializer, TableFunction &function) {
+static unique_ptr<FunctionData> FabricatorScanDeserialize(Deserializer &deserializer,
+                                                          BoundTableFunction &function) { // 2.0: BoundTableFunction
 	auto catalog = deserializer.ReadProperty<string>(100, "catalog");
 	auto schema = deserializer.ReadProperty<string>(101, "schema");
 	auto table = deserializer.ReadProperty<string>(102, "table");

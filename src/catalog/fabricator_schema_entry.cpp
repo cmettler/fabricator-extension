@@ -1045,7 +1045,8 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateScalarFunction(Clie
 	LogicalType return_type;
 	bool is_volatile = true;
 	try {
-		FetchFunctionParamSchema(context, handle_, name, func_name, arg_names, arg_types, &arg_styles);
+		FetchFunctionParamSchema(context, handle_, name.GetIdentifierName(), func_name, arg_names, arg_types,
+		                         &arg_styles);
 		return_type = FetchFunctionReturnType(context, handle_, name, func_name, &is_volatile);
 	} catch (std::exception &) {
 		// The discovered name is stale — the function no longer exists on the server
@@ -1711,7 +1712,8 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateAggregateFunction(C
 	vector<FabricatorParamStyle> arg_styles;
 	LogicalType return_type;
 	try {
-		FetchFunctionParamSchema(context, handle_, name, func_name, arg_names, arg_types, &arg_styles);
+		FetchFunctionParamSchema(context, handle_, name.GetIdentifierName(), func_name, arg_names, arg_types,
+		                         &arg_styles);
 		return_type = FetchFunctionReturnType(context, handle_, name, func_name);
 	} catch (std::exception &) {
 		// Stale discovery (the function no longer exists) — treat as not-found, like the scalar path.
@@ -1770,7 +1772,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateMacro(ClientContext
 		auto info = unique_ptr_cast<CreateInfo, CreateMacroInfo>(std::move(create.info));
 		// The declared name must agree with the discovered one: we cache under the DISCOVERED name and hand the
 		// entry straight to the binder, so a mismatch would leave one of the two names permanently unreachable.
-		if (!StringUtil::CIEquals(info->name, macro_name)) {
+		if (!StringUtil::CIEquals(info->GetQualifiedName().Name().GetIdentifierName(), macro_name)) {
 			throw ParserException("declared macro name '%s' does not match the discovered name '%s'", info->name,
 			                      macro_name);
 		}
@@ -1843,7 +1845,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateView(ClientContext 
 		auto info = unique_ptr_cast<CreateInfo, CreateViewInfo>(std::move(create.info));
 		// The declared name must agree with the discovered one — we cache under the DISCOVERED name and hand
 		// the entry straight to the binder, so a mismatch leaves one of the two permanently unreachable.
-		if (!StringUtil::CIEquals(info->view_name, view_name)) {
+		if (!StringUtil::CIEquals(info->GetViewName().GetIdentifierName(), view_name)) {
 			throw ParserException("declared view name '%s' does not match the discovered name '%s'",
 			                      info->view_name, view_name);
 		}
@@ -3550,8 +3552,11 @@ void RegisterFabricatorGlobalFunctions(ExtensionLoader &loader) {
 					auto info = unique_ptr_cast<CreateInfo, CreateMacroInfo>(std::move(create.info));
 					// Provider namespacing belongs in the NAME (fabricator_*), not a schema/catalog: these land
 					// in the system catalog's main schema. Reject a foreign qualification rather than ignore it.
-					if (!info->catalog.empty() ||
-					    !(info->schema.empty() || StringUtil::CIEquals(info->schema, DEFAULT_SCHEMA))) {
+					// 2.0: catalog/schema live in the CreateInfo's QualifiedName.
+					auto info_catalog = info->GetQualifiedName().Catalog().GetIdentifierName();
+					auto info_schema = info->GetQualifiedName().Schema().GetIdentifierName();
+					if (!info_catalog.empty() ||
+					    !(info_schema.empty() || StringUtil::CIEquals(info_schema, DEFAULT_SCHEMA))) {
 						throw ParserException(
 						    "a provider macro must be unqualified (or main-qualified) — got catalog '%s' schema '%s'",
 						    info->catalog, info->schema);
@@ -3607,7 +3612,8 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateTableFunction(Clien
 	vector<LogicalType> arg_types;
 	vector<FabricatorParamStyle> arg_styles;
 	try {
-		FetchFunctionParamSchema(context, handle_, name, func_name, arg_names, arg_types, &arg_styles);
+		FetchFunctionParamSchema(context, handle_, name.GetIdentifierName(), func_name, arg_names, arg_types,
+		                         &arg_styles);
 	} catch (std::exception &) {
 		// Stale discovery (dropped out-of-band) — treat as not-found.
 		table_functions_.erase(func_name);
@@ -3761,7 +3767,8 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateCustomInOutFunction
 		vector<string> arg_names;
 		vector<LogicalType> arg_types;
 		vector<FabricatorParamStyle> arg_styles;
-		FetchFunctionParamSchema(context, handle_, name, func_name, arg_names, arg_types, &arg_styles);
+		FetchFunctionParamSchema(context, handle_, name.GetIdentifierName(), func_name, arg_names, arg_types,
+		                         &arg_styles);
 		FabricatorBuildInOutSignature(arg_names, arg_types, arg_styles, inout);
 		fn_info->arg_names = std::move(arg_names);
 		fn_info->arg_types = std::move(arg_types);
@@ -3792,7 +3799,8 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateLateralFunction(Cli
 	vector<LogicalType> arg_types;
 	vector<FabricatorParamStyle> arg_styles;
 	try {
-		FetchFunctionParamSchema(context, handle_, name, func_name, arg_names, arg_types, &arg_styles);
+		FetchFunctionParamSchema(context, handle_, name.GetIdentifierName(), func_name, arg_names, arg_types,
+		                         &arg_styles);
 	} catch (std::exception &) {
 		// Stale declaration (a cache refresh dropped it) — treat as not-found rather than registering a
 		// function with no arguments, which for a lateral function is uncallable by construction.
@@ -3839,7 +3847,8 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateCustomCollectorFunc
 		vector<string> arg_names;
 		vector<LogicalType> arg_types;
 		vector<FabricatorParamStyle> arg_styles;
-		FetchFunctionParamSchema(context, handle_, name, func_name, arg_names, arg_types, &arg_styles);
+		FetchFunctionParamSchema(context, handle_, name.GetIdentifierName(), func_name, arg_names, arg_types,
+		                         &arg_styles);
 		FabricatorBuildInOutSignature(arg_names, arg_types, arg_styles, collector, /*named_any_for_null=*/true);
 		fn_info->arg_names = std::move(arg_names);
 		fn_info->arg_types = std::move(arg_types);
