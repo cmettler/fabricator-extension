@@ -124,7 +124,7 @@ static bool GetBoolOption(const identifier_map_t<vector<Value>> &options, const 
 
 // A string COPY option (e.g. SCHEMA_MODE 'merge'|'overwrite'); empty when absent.
 static string GetStringOption(const identifier_map_t<vector<Value>> &options, const string &key) {
-	auto it = options.find(key);
+	auto it = options.find(Identifier(key));
 	if (it == options.end() || it->second.empty() || it->second[0].IsNull()) {
 		return string();
 	}

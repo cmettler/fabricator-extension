@@ -667,7 +667,7 @@ bool RegisterArrowInputView(Connection &conn, const string &name, ArrowArrayStre
 		                   {Value::POINTER(reinterpret_cast<uintptr_t>(stream)),
 		                    Value::POINTER(reinterpret_cast<uintptr_t>(FabricatorArrowStreamProduce)),
 		                    Value::POINTER(reinterpret_cast<uintptr_t>(FabricatorArrowStreamGetSchema))})
-		    ->CreateView(name, /*replace=*/true, /*temporary=*/true);
+		    ->CreateView(Identifier(name), /*replace=*/true, /*temporary=*/true);
 	} catch (...) {
 		ok = false;
 	}
@@ -771,7 +771,7 @@ void MakeHostQueryStream(DatabaseInstance &db, const string &sql, ArrowArrayStre
 		// Binding by name and letting DuckDB name only what is genuinely absent is the better error.
 		bool by_name = !values.empty() && names.size() == values.size();
 		for (idx_t c = 0; by_name && c < names.size(); c++) {
-			by_name = !names[c].empty() && declared.find(names[c]) != declared.end();
+			by_name = !names[c].empty() && declared.find(Identifier(names[c])) != declared.end();
 		}
 		if (by_name) {
 			case_insensitive_map_t<BoundParameterData> named;
@@ -976,7 +976,7 @@ static unique_ptr<TableRef> NamedSourceReplacement(ClientContext &, ReplacementS
 	vector<unique_ptr<ParsedExpression>> children;
 	children.push_back(make_uniq<ConstantExpression>(Value(input.table_name)));
 	table_function->function = make_uniq<FunctionExpression>("fabricator_scan", std::move(children));
-	table_function->alias = input.table_name;
+	table_function->alias = Identifier(input.table_name);
 	return std::move(table_function);
 }
 
@@ -1063,7 +1063,7 @@ void RegisterHostQuery(ExtensionLoader &loader) {
 	// the one to reach for with DDL. See docs/host-query.md.
 	ScalarFunction exec_scalar("fabricator_host_exec", {LogicalType::VARCHAR}, LogicalType::BIGINT,
 	                           HostExecScalarFunction);
-	exec_scalar.GetStability() = FunctionStability::VOLATILE;
+	exec_scalar.SetStability(FunctionStability::VOLATILE);
 	loader.RegisterFunction(exec_scalar);
 
 	TableFunction scan("fabricator_scan", {LogicalType::VARCHAR}, fabricator::ArrowStreamScan, NamedScanBind,

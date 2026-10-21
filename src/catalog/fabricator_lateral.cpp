@@ -477,7 +477,7 @@ unique_ptr<FunctionData> LateralBind(ClientContext &context, TableFunctionBindIn
 		}
 		Value v(info.arg_types[i]);
 		for (auto &kv : input.named_parameters) {
-			if (StringUtil::CIEquals(info.arg_names[i], kv.first)) {
+			if (StringUtil::CIEquals(info.arg_names[i], kv.first.GetIdentifierName())) {
 				v = kv.second;
 				break;
 			}
@@ -545,7 +545,7 @@ unique_ptr<FunctionData> LateralBind(ClientContext &context, TableFunctionBindIn
 	ArrowTableFunction::PopulateArrowTableSchema(context, arrow_table, schema_root.arrow_schema);
 	for (int64_t i = 0; i < schema_root.arrow_schema.n_children; i++) {
 		auto &child = *schema_root.arrow_schema.children[i];
-		names.push_back(child.name ? string(child.name) : "column" + to_string(i));
+		names.push_back(Identifier(child.name ? string(child.name) : "column" + to_string(i)));
 		return_types.push_back(arrow_table.GetColumns().at((idx_t)i)->GetDuckType());
 	}
 	if (return_types.empty()) {
