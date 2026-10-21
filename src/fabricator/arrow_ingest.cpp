@@ -412,17 +412,93 @@ static bool ContainsTableFilterFunction(const Expression &e) {
 	return found;
 }
 
+//! ⚠⚠ RECOVER WHAT THE WRAPPER HIDES BEFORE DROPPING IT. An internal filter function is not always a dead
+//! end: the OPTIONAL wrappers carry the real child predicate in their bind data, and the DYNAMIC one carries
+//! the live join bound. On 1.5 those arrived as their own TableFilter TYPES and this file rendered them; on
+//! 2.0 they arrive INSIDE an EXPRESSION_FILTER, so pruning alone silently gives up the pushdown —
+//! MEASURED: a join over a Delta table rendered NOTHING (`rendered=no`, the whole expression being one
+//! dynamic-filter call) where 1.5 spliced the join bound into the per-file `read_parquet` WHERE.
+//! Returns the recovered predicate, or nullptr when there is genuinely nothing to render.
+//! ⚠⚠ A RECOVERED CHILD IS BOUND TO `#0`, NOT TO OUR COLUMN. The wrappers build their child against a
+//! `BoundReferenceExpression(type, 0)` (CreateOptionalFilterExpression), so rendering it verbatim emits
+//! `#0` and the generated SQL does not PARSE — measured as a Parser error from the host query. Every bound
+//! reference in the recovered tree is therefore rebound onto the scan's column expression.
+static void RebindReferencesToColumn(Expression &e, const Expression &column) {
+	ExpressionIterator::EnumerateChildren(e, [&](unique_ptr<Expression> &child) {
+		if (child && child->GetExpressionClass() == ExpressionClass::BOUND_REF) {
+			child = column.Copy();
+		} else if (child) {
+			RebindReferencesToColumn(*child, column);
+		}
+	});
+}
+
+static unique_ptr<Expression> RecoverFilterFunction(const BoundFunctionExpression &f, const Expression &column) {
+	const auto name = f.Function().GetName();
+	if (name == DynamicFilterScalarFun::NAME) {
+		if (!f.BindInfo()) {
+			return nullptr;
+		}
+		auto &data = f.BindInfo()->Cast<DynamicFilterFunctionData>();
+		// `initialized` is atomic; not yet materialized => nothing to push, which is always safe for a
+		// dynamic filter. ToExpression takes its OWN shared lock (table_filter_dynamic_function.cpp), so
+		// none is taken here.
+		if (!data.filter_data || !data.filter_data->initialized || f.GetChildren().empty()) {
+			return nullptr;
+		}
+		return data.filter_data->ToExpression(*f.GetChildren()[0]);
+	}
+	if (name == OptionalFilterScalarFun::NAME) {
+		if (!f.BindInfo()) {
+			return nullptr;
+		}
+		auto &data = f.BindInfo()->Cast<OptionalFilterFunctionData>();
+		if (!data.child_filter_expr) {
+			return nullptr;
+		}
+		auto child = data.child_filter_expr->Copy();
+		RebindReferencesToColumn(*child, column);
+		return child;
+	}
+	if (name == SelectivityOptionalFilterScalarFun::NAME) {
+		if (!f.BindInfo()) {
+			return nullptr;
+		}
+		auto &data = f.BindInfo()->Cast<SelectivityOptionalFilterFunctionData>();
+		// ⚠ On 2.0 a HASH JOIN's bound arrives here as a PREFIX-RANGE child, which is probabilistic and has
+		// no readable bounds (`PrefixRangeFilter` exposes only `LookupRange`), so it drops one level down.
+		// That is upstream's choice of filter, not a gap in this recovery — a min/max dynamic filter (TopN,
+		// LIMIT) still recovers and still renders.
+		if (!data.child_filter_expr) {
+			return nullptr;
+		}
+		auto child = data.child_filter_expr->Copy();
+		RebindReferencesToColumn(*child, column);
+		return child;
+	}
+	return nullptr; // bloom / prefix-range: probabilistic, never exact SQL — drop
+}
+
 //! Returns a copy of `e` with the internal filter functions pruned, or nullptr when nothing
 //! correctness-bearing survives. Pruning happens ONLY under an AND — dropping a branch of an OR would
 //! NARROW the result (lose rows), and an argument of a comparison has no meaning without it.
-static unique_ptr<Expression> PruneTableFilterFunctions(const Expression &e) {
+static unique_ptr<Expression> PruneTableFilterFunctions(const Expression &e, const Expression &column) {
 	if (!ContainsTableFilterFunction(e)) {
 		return e.Copy();
+	}
+	if (e.GetExpressionClass() == ExpressionClass::BOUND_FUNCTION &&
+	    TableFilterFunctions::IsTableFilterFunction(e.Cast<BoundFunctionExpression>().Function())) {
+		auto recovered = RecoverFilterFunction(e.Cast<BoundFunctionExpression>(), column);
+		if (!recovered) {
+			return nullptr;
+		}
+		// The recovered child may itself be wrapped (an optional filter around a dynamic one).
+		return PruneTableFilterFunctions(*recovered, column);
 	}
 	if (e.GetExpressionType() == ExpressionType::CONJUNCTION_AND) {
 		vector<unique_ptr<Expression>> kept;
 		for (auto &child : e.Cast<BoundConjunctionExpression>().GetChildren()) {
-			auto pruned = PruneTableFilterFunctions(*child);
+			auto pruned = PruneTableFilterFunctions(*child, column);
 			if (pruned) {
 				kept.push_back(std::move(pruned));
 			}
@@ -552,7 +628,7 @@ static bool RenderTableFilter(const TableFilter &f, const string &qcol, string &
 		}
 		// ⚠ An EXPRESSION_FILTER's tree may embed internal table-filter functions — see
 		// PruneTableFilterFunctions. Unpruned they render SQL that binds NOWHERE.
-		auto pruned = PruneTableFilterFunctions(*expr);
+		auto pruned = PruneTableFilterFunctions(*expr, col);
 		if (!pruned) {
 			return false;
 		}
@@ -854,8 +930,18 @@ static string RenderLiveFilters(const ArrowStreamBindData &bind_data, TableFunct
 		// what found the EXPRESSION_FILTER/internal-function defect in minutes after four passes of reading
 		// had not — and it is the instrument the EXPRESSION_FILTER migration will need.
 		if (getenv("FABRICATOR_DUMP_FILTERS")) {
+			// The UNPRUNED expression too: "rendered=no" alone cannot say whether the filter was a wrapper
+			// we dropped, a shape we cannot render, or absent — and those want different fixes.
+			string raw;
+			try {
+				BoundColumnRefExpression probe(Identifier(qcol), LogicalType::ANY, ColumnBinding());
+				auto e = entry.Filter().ToExpression(probe);
+				raw = e ? e->ToString() : "<null>";
+			} catch (...) {
+				raw = "<throws>";
+			}
 			Printer::Print("FILTER type=" + EnumUtil::ToString(entry.Filter().filter_type) +
-			               " rendered=" + (ok ? "yes" : "no") + " sql=[" + rendered + "]");
+			               " rendered=" + (ok ? "yes" : "no") + " sql=[" + rendered + "] raw=[" + raw + "]");
 		}
 		if (ok && !rendered.empty()) {
 			conds.push_back(std::move(rendered));
