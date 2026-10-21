@@ -740,6 +740,162 @@ it twice.
 
 ---
 
+## 8. `ROW_GROUP_SIZE` is SILENTLY IGNORED below ~8192 when the COPY's source supplies batch indexes — a 2.0 regression
+
+**DuckDB 2.0 (`v2.0-cyanoptera`); 1.5.6 does the right thing.** A `COPY … TO … (FORMAT parquet,
+ROW_GROUP_SIZE n)` whose source hands the copy BATCH INDEXES — i.e. the plan is `PhysicalBatchCopyToFile`,
+which `read_parquet`, a table scan and `duckdb_arrow_scan` all produce — writes **one row group per source
+batch** instead of merging them to `n`, for any `n` below roughly four vectors. No warning, no error; the
+option is simply inert and the file's row groups come out at the source's granularity.
+
+### Repro — stock wheel, no extension
+
+```sql
+-- a source whose batches are one vector each
+COPY (SELECT i, 'v'||i AS s FROM range(20000) t(i)) TO 'small.parquet' (FORMAT parquet, ROW_GROUP_SIZE 2048);
+SELECT count(DISTINCT row_group_id) FROM parquet_metadata('small.parquet');   -- 10
+
+-- now ask for 5000-row row groups while copying it
+COPY (SELECT * FROM read_parquet('small.parquet')) TO 'merged.parquet' (FORMAT parquet, ROW_GROUP_SIZE 5000);
+SELECT count(DISTINCT row_group_id) FROM parquet_metadata('merged.parquet');
+-- 2.0   : 10   (unchanged — ROW_GROUP_SIZE had no effect)
+-- 1.5.6 :  4   (merged, 6144/6144/6144/1568)
+```
+
+### The controls that turn this into a report
+
+**(a) It is a THRESHOLD, not a total failure.** Same 2048-row source, sweeping `ROW_GROUP_SIZE` on 2.0:
+
+| ROW_GROUP_SIZE | row groups | max rows/group |
+|---|---|---|
+| 1000 | 10 | 2048 |
+| 4096 | 10 | 2048 |
+| 5000 | 10 | 2048 |
+| 8192 | 3 | 8192 |
+| 10000 | 2 | 10240 |
+| 20480 | 1 | 20000 |
+| 122880 (the default) | 1 | 20000 |
+
+The cut sits at `4 * STANDARD_VECTOR_SIZE`. That matches the batch analyzer's tolerance: a source batch
+within **two vectors** of the requested size is accepted as-is and written as its own row group, and with
+`ROW_GROUP_SIZE 5000` the requested size is itself only two vectors, so a one-vector batch always qualifies.
+⚠ Note the option does not act as a CAP either — `ROW_GROUP_SIZE 1000` does not split a 2048-row batch.
+The source's boundaries win in both directions.
+
+**(b) It is the BATCH path specifically, which is what makes it easy to miss.** The same request against a
+source with NO batch index (`range()` directly) honours the option on 2.0: 4 row groups of
+6144/6144/6144/1568. So the option works, is not misspelled, and is not being dropped at bind — it reaches
+the writer and is then overruled by the source's batching.
+
+**(c) The default is unaffected**, which is why this does not show up as a general layout regression:
+`ROW_GROUP_SIZE` defaults to 122880, which is far above the threshold.
+
+### Why it matters here
+
+Our Delta native write is `COPY (SELECT … FROM <registered arrow view>) TO <file> (FORMAT parquet, …)`, and
+the arrow view always supplies batch indexes (that is what preserves insertion order under a parallel scan).
+So the user-facing `parquet_row_group_size` write option became inert for any value below ~8192 — accepted,
+persisted into the Delta table's configuration, and then ignored by the writer. Gated in
+`test/verify_with_options.test` §1, whose comment names this entry; the suite now asks for 10000 so the row
+still gates that the option reaches the writer at all.
+
+---
+
+## 9. A VARIANT-less `NULL` column exports as an Arrow null array with `null_count = 0`
+
+**DuckDB 2.0.** The Arrow spec says a null array's `null_count` **is** its length. `ArrowNullData` leaves it
+at 0, so a strict Arrow consumer rejects the batch. Apache.Arrow (C#) does, with
+*"Length must equal null count (Parameter 'data')"* — i.e. an exported result containing an untyped NULL
+column kills the consumer rather than yielding nulls.
+
+### Repro
+
+```sql
+SELECT NULL AS v;         -- DESCRIBE: 2.0 says `v null`, 1.5.6 said `v integer`
+```
+
+Export that result over the Arrow C data interface and read it with a consumer that validates the layout.
+
+### The controls
+
+**(a) The TYPE change is deliberate and is not the bug.** 1.5.6 bound `SELECT NULL AS v` as INTEGER at bind
+time; 2.0 keeps `"null"`. That alone is defensible — it is the export's `null_count` that violates the spec.
+
+**(b) It is the null TYPE, not nulls in general.** `SELECT NULL::INTEGER AS v` exports an INT32 array with
+`null_count = 1` and is accepted.
+
+**(c) It is not exotic.** Our decision-table macros render a blank output cell as a bare `NULL`, so an
+ordinary user query hits it.
+
+### What we do about it
+
+`PromoteNullColumns` restores 1.5's observable type at our own boundary (the values are constant NULL by
+construction, so nothing is lost). That is a workaround in our code, not a fix: any other consumer of
+DuckDB's Arrow export has the same exposure.
+
+---
+
+## 10. `arrow_scan` reads the WRONG COLUMN when the factory does not narrow the stream — silent, 2.0
+
+⚠ **STATUS: measured through our own `ArrowScanFactory`, NOT yet through the stock C API.** The mechanism
+below is read from DuckDB's source and the behaviour is measured end to end here; the C-API half is an
+INFERENCE from the code and must be reproduced with a small C program before this is filed. It is written
+up now because the mechanism is exact and the workaround is in our tree.
+
+### The mechanism, read from 2.0's source
+
+`ArrowTableFunction::ArrowToDuckDB` indexes the incoming arrow array **by position**:
+
+```cpp
+auto arrow_array_idx = arrow_scan_is_projected ? idx : col_idx;          // src/function/table/arrow.cpp
+static void ArrowToDuckDB(..., bool arrow_scan_is_projected = true, ...); // arrow.hpp — DEFAULTS to true
+```
+
+So `arrow_scan` assumes the `ArrowScanFactory` honoured `parameters.projected_columns` and produced a
+stream narrowed to the projected columns in projection order. A factory that hands back the caller's
+stream whole therefore has column *k* of the result read from arrow child *k* of the **full** array: the
+values are of the right type and the query succeeds, they are simply the wrong column's.
+
+⚠ **`CArrowScanFactory`, behind the public `duckdb_arrow_scan`, is such a factory** —
+`src/main/capi/v1/arrow-c.cpp`'s `ProduceStream` takes `parameters` and never reads it. That is the
+inference above: every C-API-registered stream should be exposed to this, and the Python path should not
+be, because DuckDB's own Python factory passes `projected_columns.columns` into the reader it builds.
+
+### What was MEASURED, with the controls
+
+Our named Arrow inputs (the per-file metadata and deletion-vector views the Delta native reader binds)
+were registered with `arrow_scan` and a factory shaped exactly like `CArrowScanFactory`. On a Delta
+row-tracking read of a metadata view `[fn, base_row_id, commit_version]`:
+
+| what was projected | `__delta_row_commit_version` | correct? |
+|---|---|---|
+| `__delta_row_id` + the version | **24** (a `baseRowId`) | ✗ — the log says 8 |
+| the version alone | 8 | ✓ |
+| `s` + the version | 8 | ✓ |
+| all rows, no filter | 8 | ✓ |
+
+**(a) Forcing an UNREAD column into the view breaks a shape that was correct.** With `base_row_id` emitted
+but not referenced by the generated SQL, the `s` + version shape flips from 8 to **24** — i.e. the symptom
+follows the arrow view's column COUNT, not the query's text.
+
+**(b) SWAPPING the two columns in the view fixes the failing shape** (24 → 8), which is what identifies the
+read as positional rather than by name.
+
+**(c) 1.5.6 answers 8 for every one of those shapes, on the same files and the same C# stream**, so this is
+a 2.0 change and not a long-standing defect in our view construction.
+
+**(d) The C# side was exonerated before the C++ side was blamed**: a probe printing the built metadata, and
+a second one running `SELECT * FROM <the view>` back through the host, both showed `base_row_id = 24,11`
+and `commit_version = 8,1` — correct, and correctly ordered, on the way in.
+
+### Our workaround
+
+`arrow_scan_dumb` — upstream's own variant, same bind and same scan with projection and filter pushdown
+off, so `column_ids` is the identity and positional indexing is right again. The cost is that a named
+input crosses whole. The real fix, ours or upstream's, is a factory that narrows the produced stream.
+
+---
+
 ## Not a bug, but pinned here because it wasted time three times
 
 `read_parquet` answers `count(*)` — and `count(<col>)` — from parquet footer metadata without decoding the

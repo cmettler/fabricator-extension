@@ -1539,11 +1539,14 @@ SELECT fluid_render('{{ exec("INSER INTO ex_aud VALUES (1)") }}', NULL);
 cannot parse
 
 # --- the count rule, pinned as the DISCRIMINATING TRIPLE it is ---
-# ⚠⚠ MEASURED, and it CORRECTS what this repo previously recorded: pure DDL is
-# 0, but a CTAS reports the rows it CREATED (7), where the SQL-surface
-# fabricator_host_exec answers 0 for the same statement. The managed path infers
-# the count from the result shape; only C++ can ask DuckDB's CHANGED_ROWS. The
-# divergence is asserted here rather than left latent.
+# ⚠⚠ THE THIRD ROW USED TO READ 0, AND DuckDB 2.0 CLOSED THE DIVERGENCE IT PINNED.
+# Pure DDL is 0 and a CTAS reports the rows it CREATED (7) on BOTH surfaces now.
+# The managed path has always INFERRED the count from the result shape; the SQL
+# surface ASKS the statement (StatementReturnType::CHANGED_ROWS), and 2.0 began
+# classifying a CTAS as a row-count statement — so what moved is upstream, not
+# either of ours. The triple stays because it still DISCRIMINATES: plain DDL must
+# stay 0 while both CTAS rows report 7, and a regression in either direction
+# breaks exactly one of these three rows.
 query I
 SELECT fluid_render('{{ exec("CREATE TABLE ex_z(a INTEGER)") }}', NULL);
 ----
@@ -1557,7 +1560,7 @@ SELECT fluid_render('{{ exec("CREATE TABLE ex_c AS SELECT * FROM range(7)") }}',
 query I
 SELECT fabricator_host_exec('CREATE TABLE ex_c3 AS SELECT * FROM range(7)');
 ----
-0
+7
 
 # --- SEVERAL STATEMENTS in one call: what the no-parameter path buys ---
 # The parameterised path cannot do this (the host prepares it, and Prepare takes
@@ -1854,10 +1857,13 @@ SELECT count(*) FROM blk_brk;
 # ⚠ Same rule as fluid_replacement_query, and for the same reason: a template must be able to emit object
 # names and whole fragments, so `{{ x }}` cannot escape. The failure mode is a PARSER ERROR
 # rather than a silent injection, which is the safe direction but not a substitute for `| sql`.
+# ⚠ DuckDB 2.0 REWORDED THIS PARSER ERROR — "unterminated quoted string" became "unterminated string
+# literal". Wording only; the CLAIM is unchanged and is what the row is for: a raw `{{ }}` splice of a
+# value containing a quote fails LOUDLY at the parser rather than injecting silently.
 statement error
 SELECT fluid_render('{% exec %}INSERT INTO blk VALUES (9, {{ params.v }}){% endexec %}ok', {'v': 'O''Brien'});
 ----
-unterminated quoted string
+unterminated string literal
 
 # --- the block obeys the SAME classifier as the function ---
 # ⚠ One mechanism, two spellings: the block cannot drift from exec() on what counts as a write.
@@ -4568,14 +4574,29 @@ SELECT i, v FROM (
 1	2
 2	4
 
-# --- ⚠ MIXED: a named tail argument and an unnamed one in the same call. The unnamed one keeps its
-# POSITIONAL name, and position is counted over the whole tail — so this is arg_1, not arg_0. ---
+# --- ⚠⚠ MIXED: a named tail argument and an unnamed one in the same call. THIS ROW USED TO PUT THE
+# UNNAMED ONE LAST (`counter := 7, 3`) and pin it as `arg_1`, because position was counted over the WHOLE
+# tail. DuckDB 2.0 REFUSES that call outright — *"Positional argument '3' cannot follow named arguments in
+# function call"* — which is Python's rule and follows from 2.0's single ordered parameter vector. So the
+# unnamed argument now has to come FIRST, and with it the old claim goes VACUOUS rather than wrong: when
+# every unnamed argument must precede every named one, its index among the unnamed ones and its index in
+# the whole tail can no longer differ. What is still worth pinning is that the two KINDS compose at all,
+# and that the unnamed one keeps its positional name. ---
 query I
+SELECT fluid_scalar(
+  '{% if is_bind %}select NULL::BIGINT{% else %}select counter * 100 + arg_0 from input_table{% endif %}',
+  NULL, 3, counter := 7);
+----
+703
+
+# ⚠ And the refusal itself, pinned so a future DuckDB that allows the old spelling again is noticed here
+# rather than in whatever breaks downstream.
+statement error
 SELECT fluid_scalar(
   '{% if is_bind %}select NULL::BIGINT{% else %}select counter * 100 + arg_1 from input_table{% endif %}',
   NULL, counter := 7, 3);
 ----
-703
+cannot follow named arguments
 
 # --- ⚠ An UNNAMED literal keeps its POSITIONAL name, arg_0, arg_1, … exactly as before. ---
 query I
@@ -4594,28 +4615,56 @@ SELECT fluid_scalar(
 # TEXT and so produce names like `(t.n + 1)` that have to be quoted to reference. Here an argument is either
 # self-naming or positional; there is no unusable third case.
 #
-# ⚠ POSITION IS COUNTED OVER THE WHOLE TAIL, not over the unnamed ones: the literal below is arg_3, not
-# arg_1. A build that numbered only the positional ones would answer `arg_0,arg_1` here. ---
+# ⚠ POSITION IS COUNTED OVER THE WHOLE TAIL, not over the anonymous ones: `n + 1` below is arg_1, not
+# arg_0, because the SELF-NAMING `n` ahead of it still occupies position 0. A build that numbered only the
+# anonymous arguments would answer `n,arg_0,arg_1` here.
+#
+# ⚠⚠ THE NAMED ARGUMENT MOVED TO THE END, and that is DuckDB 2.0's rule rather than a rewrite of the
+# claim: a positional argument may no longer FOLLOW a named one (*"Positional argument 'n' cannot follow
+# named arguments in function call"*), which is Python's ordering and comes with 2.0's single ordered
+# parameter vector. The claim survives the move intact because `n` is self-naming — which is exactly why
+# this fixture, unlike the two-argument one above, still discriminates.
 #
 # ⚠ The name list is fetched through a scalar SUBQUERY so the statement stays a per-row projection —
 # string_agg on its own is an aggregate and is (correctly) refused by the cardinality check above. ---
 query T
 SELECT DISTINCT fluid_scalar(
   '{% if is_bind %}select NULL::VARCHAR{% else %}select (select string_agg(column_name, '','') from (describe select * from input_table)) from input_table{% endif %}',
-  NULL, counter := 1, n, n + 1, 9) FROM fs_t;
+  NULL, n, n + 1, 9, counter := 1) FROM fs_t;
 ----
-counter,n,arg_2,arg_3
+n,arg_1,arg_2,counter
 
-# --- ⚠⚠ A CHARACTERIZATION OF DuckDB, AND A TRAP WORTH PINNING: a named argument to a SCALAR does NOT
-# reorder. DuckDB discards the name for dispatch (a built-in does the same — `upper(zzz := 'a')` returns 'A')
-# and binds POSITIONALLY, so `counter := 7` in the params slot IS the params bag and the 2 after it becomes
-# arg_0. 2 * 10 + 7 = 27. Naming an argument therefore documents it; it never moves it. ---
+# --- ⚠⚠ THIS SECTION USED TO PIN A TRAP, AND DuckDB 2.0 RETIRED IT. On 1.5 a scalar DISCARDED an
+# argument's name for dispatch and bound POSITIONALLY, so `fluid_scalar(tpl, counter := 7, 2)` quietly put
+# 7 in the PARAMS slot and made the 2 arg_0 — a name that documented nothing and moved nothing. MEASURED on
+# both builds with a BUILT-IN, which is where the behaviour really lives: `upper(zzz := 'a')` returns 'A'
+# on 1.5.6 and is a BINDER ERROR on 2.0, naming the real parameter (`upper(string VARCHAR)`).
+#
+# So a wrong name now FAILS LOUDLY instead of silently filling a slot, which is the better direction and is
+# what these three rows pin: the undeclared name is refused, the DECLARED ones bind, and binding them by
+# name is equivalent to binding them by position. ---
+statement error
+SELECT fluid_scalar(
+  '{% if is_bind %}select NULL::BIGINT{% else %}select 1{% endif %}',
+  counter := 7);
+----
+No function matches
+
 query I
 SELECT fluid_scalar(
-  '{% if is_bind %}select NULL::BIGINT{% else %}select arg_0 * 10 + getvariable(''params'') from input_table{% endif %}',
-  counter := 7, 2);
+  '{% if is_bind %}select NULL::BIGINT{% else %}select getvariable(''params'')::BIGINT{% endif %}',
+  params := 7);
 ----
-27
+7
+
+# ⚠ The control for the row above: by NAME and by POSITION must give the same answer, or "the name binds
+# the declared parameter" would be satisfied by a build that had simply ignored it again.
+query I
+SELECT fluid_scalar(
+  '{% if is_bind %}select NULL::BIGINT{% else %}select getvariable(''params'')::BIGINT{% endif %}',
+  7);
+----
+7
 
 # --- ⚠⚠ `input_table` IS AVAILABLE AT BIND, EMPTY AND FULLY TYPED — the same capability §26 pins for the two
 # relation surfaces, so a template can build its SELECT list, and its RESULT TYPE, from the INPUT SCHEMA.

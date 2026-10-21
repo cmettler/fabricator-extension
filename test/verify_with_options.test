@@ -22,7 +22,7 @@ ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/optlake' AS lake (TYPE fabricator, PROVIDE
 
 statement ok
 CREATE OR REPLACE TABLE lake.main.tuned
-  WITH (parquet_compression='zstd', parquet_row_group_size=5000)
+  WITH (parquet_compression='zstd', parquet_row_group_size=10000)
 AS SELECT i, 'v' || i AS s FROM range(20000) t(i);
 
 query I
@@ -36,10 +36,18 @@ WHERE compression <> '';
 ----
 ZSTD
 
+# ⚠⚠ 10000, NOT 5000 — AND THAT IS AN UPSTREAM LIMIT, NOT A WEAKENED GATE (DuckDB 2.0; see
+# docs/duckdb-upstream-issues.md §3). When the COPY's source supplies BATCH INDEXES — ours always does, so
+# the plan is PhysicalBatchCopyToFile — 2.0 accepts a source batch whose size is within TWO VECTORS of the
+# requested one and writes it as its own row group, so any ROW_GROUP_SIZE below ~4 x STANDARD_VECTOR_SIZE
+# (8192) is swallowed whole. MEASURED on stock DuckDB with no extension loaded, read_parquet over 2048-row
+# row groups: 1000/4096/5000 all give 10 groups of 2048, 8192 gives 3, 10000 gives 2, 20480 gives 1 — while
+# 1.5.6 merges 5000 to 4. The option itself still reaches the writer, which is what this row gates; the
+# DEFAULT (122880) is unaffected, measured at 2 groups of 122880.
 query I
 SELECT count(DISTINCT row_group_id) FROM parquet_metadata('${FABRICATOR_DELTA_WRITE_DIR}/optlake/tuned/*.parquet');
 ----
-4
+2
 
 # precedence: WITH beats the delta_write_options session setting; the setting still applies when no WITH
 statement ok
@@ -758,22 +766,19 @@ SELECT count(*) FROM lake.main.allkeys;
 ----
 201
 
-# ---- 8g. ⚠ PERSISTING row_group_size_bytes MAKES EVERY LATER NATIVE WRITE NEED preserve_insertion_order ----
-# Found by writing this suite, and it is the one persisted key with a session prerequisite. DuckDB's binder
-# refuses ROW_GROUP_SIZE_BYTES while preserving insertion order — which is fine for a per-statement option
-# (the user sets the flag in the same breath) and becomes a PROPERTY OF THE TABLE once persisted: a plain
-# INSERT that names nothing now fails until the session opts out. We deliberately do NOT set the flag on our
-# own COPY connection — it would silently break SORTED BY writes — so DuckDB's error surfaces, which is the
-# right outcome but is worth pinning so a future change cannot quietly start swallowing it.
-
-statement ok
-SET preserve_insertion_order=false;
+# ---- 8g. row_group_size_bytes NO LONGER NEEDS preserve_insertion_order — DuckDB 2.0 LIFTED IT ----
+# ⚠⚠ THIS SECTION USED TO PIN THE OPPOSITE, and the reversal is upstream's, not ours. On 1.5.6 DuckDB's
+# binder REFUSED ROW_GROUP_SIZE_BYTES while preserving insertion order, which made this the one persisted
+# key with a SESSION PREREQUISITE: a plain INSERT naming nothing inherited the declaration and failed until
+# the session opted out. MEASURED on both builds with stock DuckDB and no extension loaded,
+# `COPY (SELECT 1 AS i) TO 'x.parquet' (FORMAT parquet, ROW_GROUP_SIZE_BYTES 1048576)` — 1.5.6:
+# *"Binder Error: ROW_GROUP_SIZE_BYTES does not work while preserving insertion order"*; 2.0: accepted.
+# So the trap is GONE and the declaration is now an ordinary persisted key. We still do NOT set
+# preserve_insertion_order on our own COPY connection — it would silently break SORTED BY writes — which is
+# precisely why the lift matters here: the escape we used to document is no longer needed to insert at all.
 
 statement ok
 CREATE OR REPLACE TABLE lake.main.rgb WITH (parquet_row_group_size_bytes=1048576) AS SELECT i::BIGINT AS id FROM range(100) r(i);
-
-statement ok
-RESET preserve_insertion_order;
 
 query II
 SELECT property, value FROM lake.delta.tblproperties('main.rgb')
@@ -781,18 +786,23 @@ WHERE property LIKE 'fabricator.parquet.%' ORDER BY property;
 ----
 fabricator.parquet.row_group_size_bytes	1048576
 
-# The trap itself: a plain INSERT naming no options inherits the declaration and hits DuckDB's binder.
-statement error
+# The former trap, inverted: a plain INSERT naming no options inherits the declaration and now SUCCEEDS with
+# insertion order preserved. ⚠ The count row beneath it is what keeps this from passing vacuously — an
+# INSERT that silently wrote nothing would satisfy `statement ok` on its own.
+statement ok
 INSERT INTO lake.main.rgb SELECT 999::BIGINT;
-----
-preserve_insertion_order
 
-# ...and the documented escape works.
+query I
+SELECT count(*) FROM lake.main.rgb;
+----
+101
+
+# ...and the former escape is still accepted, so a caller that sets it loses nothing.
 statement ok
 SET preserve_insertion_order=false;
 
 statement ok
-INSERT INTO lake.main.rgb SELECT 999::BIGINT;
+INSERT INTO lake.main.rgb SELECT 1001::BIGINT;
 
 statement ok
 RESET preserve_insertion_order;
@@ -800,7 +810,7 @@ RESET preserve_insertion_order;
 query I
 SELECT count(*) FROM lake.main.rgb;
 ----
-101
+102
 
 # The CODEC engine has no such constraint — it maps the key to RowGroupMaxBytes with no DuckDB binder
 # involved — so the same declaration is written without any session flag.
@@ -813,7 +823,7 @@ INSERT INTO lakec2.main.rgb SELECT 1000::BIGINT;
 query I
 SELECT count(*) FROM lakec2.main.rgb;
 ----
-102
+103
 
 statement ok
 DETACH lakec2;

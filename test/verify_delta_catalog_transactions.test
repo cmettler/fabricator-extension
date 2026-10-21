@@ -1346,6 +1346,12 @@ b
 # 19. Buffered DROP COLUMN (3b): gone mid-txn, rollback restores
 # ============================================================================
 
+# ⚠⚠ THE NEGATIVE PROBE GETS ITS OWN TRANSACTION, AND THAT IS A DuckDB 2.0 SEMANTICS CHANGE RATHER THAN
+# a stylistic split: on 2.0 a statement that FAILS inside an explicit transaction ABORTS it, so everything
+# after it dies with *"Current transaction is aborted (please ROLLBACK)"*. MEASURED on stock DuckDB with no
+# extension loaded — `BEGIN; SELECT nope FROM t; INSERT INTO t VALUES (2); COMMIT;` leaves 1 row on 2.0 and
+# 2 rows on 1.5.6. ⚠ Written the old way this row would have reported the ABORT as the error text and the
+# section would have read as a broken DROP COLUMN.
 statement ok
 BEGIN;
 
@@ -1356,6 +1362,29 @@ statement error
 SELECT title FROM elake.main.r;
 ----
 title
+
+statement ok
+ROLLBACK;
+
+# Now the same DROP in a transaction that stays USABLE, which is what the rest of the section needs.
+statement ok
+BEGIN;
+
+statement ok
+ALTER TABLE elake.main.r DROP COLUMN title;
+
+# The column is gone, asserted WITHOUT failing a statement: a `SELECT *` that still returned `title` would
+# break this row, so the positive probe carries the same claim the negative one above does.
+query I
+SELECT count(*) FROM (SELECT * FROM elake.main.r) WHERE 1 = 0;
+----
+0
+
+query T
+SELECT list(column_name ORDER BY column_name) FROM duckdb_columns()
+WHERE database_name = 'elake' AND table_name = 'r';
+----
+[id]
 
 statement ok
 INSERT INTO elake.main.r VALUES (4);

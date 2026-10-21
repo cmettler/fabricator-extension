@@ -1762,7 +1762,7 @@ exactly that assertion after 267 pass.
 Same rule as `fluid_replacement_query`, for the same reason: a template must be able to emit object names and whole
 fragments, so `{{ x }}` cannot escape. Use `{{ v | sql }}` for a VALUE and `{{ n | sql_ident }}` for an
 identifier. The failure mode without it is a PARSER ERROR rather than a silent injection (gated:
-`O'Brien` spliced raw gives *"unterminated quoted string"*), which is the safe direction but not a
+`O'Brien` spliced raw gives *"unterminated string literal"*), which is the safe direction but not a
 substitute.
 
 ### 13.7 ⚠ Registration is on the shared parser, and it must precede any parse
@@ -6609,7 +6609,7 @@ to this directory, so it still resolves from here.
     propagated instead. MEASURED zero rows; mutant E (run it anyway) dies at exactly that assertion.
   - **⚠ INTERPOLATION INSIDE THE BLOCK IS RAW**, same rule and same reason as `fluid_replacement_query` (a template must
     be able to emit object names and whole fragments). `{{ v | sql }}` for a value. Gated: `O'Brien` spliced
-    raw gives *"unterminated quoted string"* — the safe direction, and not a substitute.
+    raw gives *"unterminated string literal"* — the safe direction, and not a substitute.
   - ⚠ The parser is built by a METHOD now, so the tag is registered BEFORE anything can be parsed: templates
     are cached by TEXT, so one parsed before registration would be cached with `{% exec %}` unrecognised for
     the process's life. ⚠ All THREE spellings of `exec` coexist (block, function, filter) because tags and
