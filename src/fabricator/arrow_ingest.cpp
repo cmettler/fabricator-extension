@@ -18,6 +18,7 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/database.hpp" // DatabaseInstance::NumberOfThreads — the scan's MaxThreads
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/common/vector/struct_vector.hpp" // 2.0 split vector.hpp
 #include "duckdb/planner/table_filter.hpp"
 // 2.0 split these out of table_filter.hpp; without them DynamicFilterData / TableFilterSet are
 // incomplete types here (the old header only forward-declares them now).
@@ -531,11 +532,18 @@ static bool LiveFilterNode(const TableFilter &f, vector<string> &path, const Log
 		if (!dyn.filter_data) {
 			return false;
 		}
-		lock_guard<mutex> lock(dyn.filter_data->lock);
-		if (!dyn.filter_data->initialized || !dyn.filter_data->filter) {
+		// ⚠ 2.0 reshaped DynamicFilterData: there is no inner `filter` to forward any more, it holds
+		// comparison_type + constant directly. Rebuilding the equivalent LegacyConstantFilter keeps this
+		// pruning path alive rather than dropping it (dropping would be SAFE — nothing relies on a dynamic
+		// filter — but it would silently lose the pruning this exists for).
+		// ⚠ `constant` is DUCKDB_GUARDED_BY(lock), so it is read under the SHARED lock — the same one
+		// DynamicFilterData::ToExpression takes internally. `initialized` is atomic and needs none.
+		if (!dyn.filter_data->initialized) {
 			return false; // not yet materialized: nothing to prune with
 		}
-		return LiveFilterNode(*dyn.filter_data->filter, path, type, constants, string_order_pushable, out);
+		annotated_shared_lock<annotated_shared_mutex> dyn_guard(dyn.filter_data->lock);
+		LegacyConstantFilter resolved(dyn.filter_data->comparison_type, dyn.filter_data->constant);
+		return LiveFilterNode(resolved, path, type, constants, string_order_pushable, out);
 	}
 	case TableFilterType::LEGACY_CONSTANT_COMPARISON: {
 		auto &cf = f.Cast<LegacyConstantFilter>();

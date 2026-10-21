@@ -449,8 +449,8 @@ static void FabricatorExecFunction(DataChunk &args, ExpressionState &state, Vect
 	auto &context = state.GetContext();
 	auto count = args.size();
 	result.SetVectorType(VectorType::FLAT_VECTOR);
-	auto result_data = FlatVector::GetData<int64_t>(result);
-	auto &validity = FlatVector::Validity(result);
+	auto result_data = FlatVector::GetDataMutable<int64_t>(result);
+	auto &validity = FlatVector::ValidityMutable(result);
 
 	// Opt-in: invalidate the attached catalog's cache after a DDL statement so a later
 	// read / CREATE IF NOT EXISTS sees the real server-side state. Whether a statement
@@ -520,7 +520,7 @@ static void FabricatorRefreshCacheFunction(DataChunk &args, ExpressionState &sta
 	auto &context = state.GetContext();
 	auto count = args.size();
 	result.SetVectorType(VectorType::FLAT_VECTOR);
-	auto result_data = FlatVector::GetData<bool>(result);
+	auto result_data = FlatVector::GetDataMutable<bool>(result);
 	for (idx_t i = 0; i < count; i++) {
 		auto value = args.GetValue(0, i);
 		if (value.IsNull()) {
