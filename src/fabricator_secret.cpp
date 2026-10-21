@@ -53,15 +53,15 @@ case_insensitive_map_t<SecretTypeDecl> g_secret_types;
 // stores the declared fields' supplied values (redacting the marked ones). Validation is deferred to the
 // managed build_connection_string (provider-specific), so a missing/invalid field surfaces at connect time.
 static unique_ptr<BaseSecret> CreateProviderSecret(ClientContext &context, CreateSecretInput &input) {
-	auto it = g_secret_types.find(input.type);
+	auto it = g_secret_types.find(input.type.GetIdentifierName());
 	if (it == g_secret_types.end()) {
 		throw InvalidInputException("fabricator: unknown secret type '%s'", input.type);
 	}
 	auto result = make_uniq<KeyValueSecret>(input.scope, input.type, input.provider, input.name);
 	for (auto &field : it->second.fields) {
-		result->TrySetValue(field.name, input); // no-op when the key was not supplied
+		result->TrySetValue(Identifier(field.name), input); // no-op when the key was not supplied
 		if (field.redact) {
-			result->redact_keys.insert(field.name);
+			result->redact_keys.insert(Identifier(field.name));
 		}
 	}
 	return std::move(result);

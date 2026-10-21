@@ -17,6 +17,7 @@
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/database.hpp" // DatabaseInstance::NumberOfThreads — the scan's MaxThreads
+#include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/table_filter.hpp"
 // 2.0 split these out of table_filter.hpp; without them DynamicFilterData / TableFilterSet are
 // incomplete types here (the old header only forward-declares them now).
@@ -371,17 +372,22 @@ static bool RenderTableFilter(const TableFilter &f, const string &qcol, string &
 		return RenderTableFilter(*opt.child_filter, qcol, out); // optional: fine to skip if child unrenderable
 	}
 	case TableFilterType::LEGACY_DYNAMIC_FILTER: {
-		// A runtime join/topn bound: LegacyDynamicFilter::ToString is a debug string, so reach the resolved inner
-		// LegacyConstantFilter under the shared lock. Not yet materialized => skip (best-effort pruning).
+		// A runtime join/topn bound. ⚠ 2.0 reshaped DynamicFilterData: there is no inner `filter` to reach
+		// any more — it holds comparison_type + constant and builds the expression itself, TAKING ITS OWN
+		// SHARED LOCK inside ToExpression (verified in table_filter_dynamic_function.cpp). So we must NOT
+		// lock here, which also removes the manual lock_guard this used to need.
+		// `initialized` is atomic, so reading it unlocked is fine; not yet materialized => skip, which is
+		// always safe for a dynamic filter (nothing relies on the scan applying it).
 		auto &dyn = f.Cast<LegacyDynamicFilter>();
-		if (!dyn.filter_data) {
+		if (!dyn.filter_data || !dyn.filter_data->initialized) {
 			return false;
 		}
-		lock_guard<mutex> lock(dyn.filter_data->lock);
-		if (!dyn.filter_data->initialized || !dyn.filter_data->filter) {
+		BoundColumnRefExpression dyn_col(Identifier(qcol), LogicalType::ANY, ColumnBinding());
+		auto dyn_expr = dyn.filter_data->ToExpression(dyn_col);
+		if (!dyn_expr) {
 			return false;
 		}
-		out += dyn.filter_data->filter->ToString(qcol);
+		out += dyn_expr->ToString();
 		return true;
 	}
 	case TableFilterType::LEGACY_BLOOM_FILTER:
@@ -443,11 +449,23 @@ static bool RenderTableFilter(const TableFilter &f, const string &qcol, string &
 		out += ')';
 		return true;
 	}
-	default:
+	default: {
 		// Constant / IN / IS [NOT] NULL / expression: DuckDB's own render == exact SQL for the
 		// read_parquet (DuckDB) target. These are the MANDATORY (erased-from-plan) filters we must apply.
-		out += f.ToString(qcol);
+		// ⚠ 2.0 REMOVED TableFilter::ToString — a filter now only knows how to build an EXPRESSION
+		// (ToExpression), so the render goes through that: a BoundColumnRefExpression whose ALIAS is the
+		// quoted column renders as exactly that name (BoundColumnRefExpression::ToString returns the alias),
+		// and the resulting expression renders itself. Still DuckDB's own rendering, just one step later.
+		// ⚠ The TEXT may differ from 1.5's in spacing/parenthesisation; it must stay valid DuckDB SQL for
+		// read_parquet, which is what the filter-pushdown suites check.
+		BoundColumnRefExpression col(Identifier(qcol), LogicalType::ANY, ColumnBinding());
+		auto expr = f.ToExpression(col);
+		if (!expr) {
+			return false;
+		}
+		out += expr->ToString();
 		return true;
+	}
 	}
 }
 

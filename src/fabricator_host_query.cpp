@@ -494,7 +494,7 @@ int64_t RunHostExec(DatabaseInstance &db, const string &sql, const HostQuerySess
 	// return one BIGINT column does not get its first value mistaken for one.
 	// ⚠ For several statements, SendQuery returns the LAST one's result — so the count is the LAST
 	// statement's, which is the only one that could be meant.
-	if (result->properties.return_type == StatementReturnType::CHANGED_ROWS) {
+	if (result->GetStatementProperties().return_type == StatementReturnType::CHANGED_ROWS) {
 		auto chunk = result->Fetch();
 		if (chunk && chunk->size() > 0) {
 			auto v = chunk->GetValue(0, 0);
@@ -554,8 +554,8 @@ static void HostExecScalarFunction(DataChunk &args, ExpressionState &state, Vect
 	auto session = CaptureSession(context);
 	auto count = args.size();
 	result.SetVectorType(VectorType::FLAT_VECTOR);
-	auto result_data = FlatVector::GetData<int64_t>(result);
-	auto &validity = FlatVector::Validity(result);
+	auto result_data = FlatVector::GetDataMutable<int64_t>(result);
+	auto &validity = FlatVector::ValidityMutable(result);
 	for (idx_t i = 0; i < count; i++) {
 		auto sql_value = args.GetValue(0, i);
 		if (sql_value.IsNull()) {
