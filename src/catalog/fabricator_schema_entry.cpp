@@ -309,7 +309,8 @@ static void ApplyColumnDefault(ColumnDefinition &column, const string &text) {
 		return;
 	}
 	try {
-		Parser default_parser(context);
+		// no ClientContext in scope here; the builtin parser is 2.0's context-free entry point.
+		auto default_parser = Parser::GetBuiltinParser();
 		auto expressions = default_parser.ParseExpressionList(text);
 		if (expressions.size() != 1 || expressions[0]->GetExpressionClass() != ExpressionClass::CONSTANT) {
 			return; // a function, a cast, an operator — anything DuckDB would re-evaluate on our behalf
@@ -391,7 +392,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateEntry(ClientContext
 		return nullptr;
 	}
 
-	CreateTableInfo info(catalog.GetName(), name, table_name);
+	CreateTableInfo info(catalog.GetName(), name, Identifier(table_name));
 	for (idx_t i = 0; i < names.size(); i++) {
 		info.columns.AddColumn(ColumnDefinition(names[i], types[i]));
 	}
@@ -639,7 +640,7 @@ static string FabricatorArgName(const vector<string> &decl_names, idx_t varargs_
 static string FabricatorCallArgName(const vector<string> &decl_names, idx_t varargs_index, idx_t i,
                                     const Expression &arg) {
 	if (varargs_index != DConstants::INVALID_INDEX && i >= varargs_index && arg.HasAlias()) {
-		return arg.GetAlias();
+		return arg.GetAlias().GetIdentifierName();
 	}
 	return FabricatorArgName(decl_names, varargs_index, i);
 }
@@ -896,7 +897,7 @@ static ScalarFunction BuildFabricatorScalarFunction(FabricatorHandle handle, con
 		// expression's FunctionData, which is the only channel a non-capturing-identity exec has — and it is
 		// also where THIS call site's argument names live, so it has to be read before they are used.
 		auto &func_expr = state.expr.Cast<BoundFunctionExpression>();
-		auto &bind_data = func_expr.bind_info->Cast<FabricatorScalarBindData>();
+		auto &bind_data = func_expr.BindInfo()->Cast<FabricatorScalarBindData>();
 
 		// Marshal the arg chunk -> a one-batch Arrow stream using the chunk's ACTUAL column types (not the
 		// declared signature): for a SQLNULL-sentinel ("accept any value") param declared as ANY, DuckDB passes
@@ -4576,8 +4577,8 @@ void FabricatorSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &inf
 	case AlterTableType::RENAME_COLUMN: {
 		auto &rc = table_info.Cast<RenameColumnInfo>();
 		request.kind = "rename_column";
-		request.column = rc.old_name;
-		request.new_name = rc.new_name;
+		request.column = rc.old_name.GetIdentifierName();
+		request.new_name = rc.new_name.GetIdentifierName();
 		break;
 	}
 	case AlterTableType::ADD_COLUMN: {
