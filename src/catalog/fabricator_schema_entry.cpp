@@ -3776,8 +3776,8 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateCustomInOutFunction
 	} catch (std::exception &) {
 		// Unresolvable param schema: fall back to the bare table-input form so the function stays callable.
 	}
-	if (inout.arguments.empty()) {
-		inout.arguments.push_back(LogicalType::TABLE);
+	if (inout.GetSignature().GetParameterCount() == 0) {
+		inout.GetSignature().AddParameter(LogicalType::TABLE);
 	}
 	inout.function_info = std::move(fn_info);
 
@@ -3856,8 +3856,8 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateCustomCollectorFunc
 	} catch (std::exception &) {
 		// Unresolvable param schema: fall back to the bare table-input form so the function stays callable.
 	}
-	if (collector.arguments.empty()) {
-		collector.arguments.push_back(LogicalType::TABLE);
+	if (collector.GetSignature().GetParameterCount() == 0) {
+		collector.GetSignature().AddParameter(LogicalType::TABLE);
 	}
 	collector.function_info = std::move(fn_info);
 
@@ -4422,10 +4422,10 @@ void FabricatorSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
 // key carries the literal's TEXT and a JSON null for DEFAULT NULL; a JSON string keeps an EMPTY-string
 // literal distinguishable from an absent key, which the old "-"/"b"+base64 arg2 spelling needed base64 for.
 static void CarryDefault(FabricatorAlterRequest &request, const ParsedExpression *expr) {
-	if (expr->type == ExpressionType::OPERATOR_CAST) {
+	if (expr->GetExpressionType() == ExpressionType::OPERATOR_CAST) {
 		expr = expr->Cast<CastExpression>().child.get();
 	}
-	if (!expr || expr->type != ExpressionType::VALUE_CONSTANT) {
+	if (!expr || expr->GetExpressionType() != ExpressionType::VALUE_CONSTANT) {
 		throw NotImplementedException("fabricator: only literal column DEFAULTs are supported");
 	}
 	auto &val = expr->Cast<ConstantExpression>().value;
@@ -4652,8 +4652,8 @@ void FabricatorSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &inf
 	case AlterTableType::ALTER_COLUMN_TYPE: {
 		auto &ct = table_info.Cast<ChangeColumnTypeInfo>();
 		request.kind = "column_type";
-		request.column = ct.column_name;
-		carry_type(ct.target_type, ct.column_name);
+		request.column = ct.GetColumnName().GetIdentifierName();
+		carry_type(ct.target_type, ct.GetColumnName().GetIdentifierName());
 		break;
 	}
 	case AlterTableType::ADD_FIELD: {
@@ -4683,18 +4683,18 @@ void FabricatorSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &inf
 	case AlterTableType::SET_NOT_NULL: {
 		auto &sn = table_info.Cast<SetNotNullInfo>();
 		request.kind = "set_not_null";
-		request.column = sn.column_name;
+		request.column = sn.GetColumnName().GetIdentifierName();
 		break;
 	}
 	case AlterTableType::DROP_NOT_NULL: {
 		auto &dn = table_info.Cast<DropNotNullInfo>();
 		request.kind = "drop_not_null";
-		request.column = dn.column_name;
+		request.column = dn.GetColumnName().GetIdentifierName();
 		break;
 	}
 	case AlterTableType::SET_DEFAULT: {
 		auto &sd = table_info.Cast<SetDefaultInfo>();
-		request.column = sd.column_name;
+		request.column = sd.GetColumnName().GetIdentifierName();
 		if (!sd.expression) {
 			request.kind = "drop_default"; // DROP DEFAULT is SET DEFAULT with no expression
 			break;

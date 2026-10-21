@@ -655,8 +655,8 @@ static string SerializeLiveFilters(const ArrowStreamBindData &bind_data, TableFu
 		return string();
 	}
 	vector<string> parts;
-	for (auto &entry : input.filters->filters) {
-		idx_t key = entry.first;
+	for (auto entry : *input.filters) {
+		idx_t key = entry.GetIndex();
 		if (key >= input.column_ids.size()) {
 			continue;
 		}
@@ -689,7 +689,7 @@ static string SerializeLiveFilters(const ArrowStreamBindData &bind_data, TableFu
 		vector<string> path {col_name};
 		const LogicalType &type = col_type;
 		string node;
-		if (LiveFilterNode(*entry.second, path, type, constants, bind_data.string_order_pushable, node) &&
+		if (LiveFilterNode(entry.Filter(), path, type, constants, bind_data.string_order_pushable, node) &&
 		    !node.empty()) {
 			parts.push_back(std::move(node));
 		}
@@ -721,8 +721,8 @@ static string RenderLiveFilters(const ArrowStreamBindData &bind_data, TableFunct
 		return string();
 	}
 	vector<string> conds;
-	for (auto &entry : input.filters->filters) {
-		idx_t key = entry.first;
+	for (auto entry : *input.filters) {
+		idx_t key = entry.GetIndex();
 		if (key >= input.column_ids.size()) {
 			continue;
 		}
@@ -748,7 +748,7 @@ static string RenderLiveFilters(const ArrowStreamBindData &bind_data, TableFunct
 		string qcol;
 		SqlIdentIngest(col_name, qcol);
 		string rendered;
-		if (RenderTableFilter(*entry.second, qcol, rendered) && !rendered.empty()) {
+		if (RenderTableFilter(entry.Filter(), qcol, rendered) && !rendered.empty()) {
 			conds.push_back(std::move(rendered));
 		}
 	}
