@@ -65,8 +65,13 @@ require json
 
 # The serialized OPTIMIZED plan mentions the generated SQL's own source (`range`) and contains NO fabricator
 # function at all: the call was replaced at bind, so execution never re-enters the extension.
+#
+# ⚠ WHERE the plan JSON names the function moved on DuckDB 2.0 — a LOGICAL_GET carried `"name":"range"` and
+# now carries `"qname":{"path":["system","main","range"],...}`, i.e. the QUALIFIED name. Only the probe
+# string changed; both halves of the claim are unchanged and still measured, and the second half
+# (`has_fabricator = false`) is the one that would catch a build where bind_replace stopped firing.
 query II
-SELECT p LIKE '%"name":"range"%' AS is_native_range, p ILIKE '%fabricator%' AS has_fabricator
+SELECT p LIKE '%"path":["system","main","range"%' AS is_native_range, p ILIKE '%fabricator%' AS has_fabricator
 FROM (SELECT json_serialize_plan('SELECT * FROM fabricator_sql_seq(3)', optimize := true)::VARCHAR AS p);
 ----
 true	false

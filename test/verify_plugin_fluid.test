@@ -391,10 +391,13 @@ statement ok
 CREATE TABLE fq_t AS SELECT i AS id, i%7 AS g, 'v'||i AS v FROM range(1000) s(i);
 
 # Projection AND filter reach the base table; `fluid_replacement_query` appears nowhere.
+# ⚠ DuckDB 2.0 RE-RENDERS EXPLAIN: operator titles are title-cased (`SEQ_SCAN` -> `Seq Scan`,
+# `PROJECTION` -> `Projection`) and a filter is spaced (`g=3` -> `g = 3`). The PLAN is unchanged; only
+# its text is. A plan that stopped being pushed down would still fail this.
 query II
 EXPLAIN SELECT id FROM fluid_replacement_query('SELECT * FROM fq_t WHERE g = {{ params.g }}', params := {'g': 3});
 ----
-physical_plan	<REGEX>:.*SEQ_SCAN.*fq_t.*Projections: id.*Filters: g=3.*
+physical_plan	<REGEX>:.*Seq Scan.*fq_t.*Projections: id.*Filters: g = 3.*
 
 query I
 SELECT count(*) FROM fluid_replacement_query('SELECT * FROM fq_t WHERE g = {{ params.g }}', params := {'g': 3});

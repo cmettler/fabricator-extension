@@ -960,6 +960,12 @@ true
 
 # 11d. NEGATIVE: a filter suppresses the pushed limit (the host-side arrow_ingest gate, pinned end to
 #      end). The positive witness: the scan ran WITH the filter and top=- (the host never emitted it).
+#
+# ⚠ THE PREDICATE TEXT MOVED ON DuckDB 2.0 — `"id">5` became `("id" > 5)` — and that is RENDERING, not
+# behaviour: 2.0 removed `TableFilter::ToString`, so RenderTableFilter builds the filter's EXPRESSION and
+# lets THAT render itself (arrow_ingest.cpp), which spaces and parenthesises differently. The pushdown
+# itself is unchanged and this assertion is what proves it still reaches the generated SQL — it is the
+# only `where=[...]` text pinned anywhere in the suites, so there was nothing else to keep in step.
 query I
 SELECT count(*) FROM (SELECT id FROM b.main.route_plain WHERE id > 5 LIMIT 4) t;
 ----
@@ -968,7 +974,7 @@ SELECT count(*) FROM (SELECT id FROM b.main.route_plain WHERE id > 5 LIMIT 4) t;
 query I
 SELECT count(*) > 0 FROM duckdb_logs
 WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native scan%'
-  AND message LIKE '%route_plain%' AND message LIKE '%where=["id">5]%' AND message LIKE '%top=-%';
+  AND message LIKE '%route_plain%' AND message LIKE '%where=[("id" > 5)]%' AND message LIKE '%top=-%';
 ----
 true
 

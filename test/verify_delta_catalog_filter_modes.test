@@ -144,10 +144,13 @@ ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/fmodes' AS codec_x (TYPE fabricator, PROVI
 # so it will NOT re-apply, and on the codec path the only thing left that can apply it is
 # HostBatchFilter. A `static` catalog plans the same query with a FILTER above the scan instead.
 # ⚠ EXPLAIN cannot be a subquery source, hence the <REGEX>: form on the physical_plan row.
+# ⚠ DuckDB 2.0 RE-RENDERS EXPLAIN: operator titles are title-cased (`SEQ_SCAN` -> `Seq Scan`,
+# `PROJECTION` -> `Projection`) and a filter is spaced (`g=3` -> `g = 3`). The PLAN is unchanged; only
+# its text is. A plan that stopped being pushed down would still fail this.
 query II
 EXPLAIN SELECT count(*) FROM codec_x.main.t WHERE id > 495;
 ----
-physical_plan	<REGEX>:.*FABRICATOR_SCAN.*Filters: id>495.*
+physical_plan	<REGEX>:.*FABRICATOR_SCAN.*Filters: id > 495.*
 
 # ...and the answer is exact, so it really did run.
 query IT

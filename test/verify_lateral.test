@@ -888,16 +888,19 @@ SELECT tail_sum FROM fabricator_lat_span('q', 1, 2::SMALLINT, 3::TINYINT);
 # omitted from the candidate list while a scalar's is rendered `[TYPE...]`. That is upstream and reproduces
 # on stock (docs/duckdb-upstream-issues.md §6); asserting the correct-but-absent rendering here would fail
 # forever against behaviour that is not ours.
+# ⚠ DuckDB 2.0 names an UNTYPED LITERAL's type as such in the message — `VARCHAR, INTEGER` became
+# `STRING_LITERAL, INTEGER_LITERAL` — while the third argument, which carries a real DECIMAL type, is
+# unchanged. The REFUSAL is the claim here and it is unchanged; only the rendering moved.
 statement error
 SELECT tail_sum FROM fabricator_lat_span('q', 1, 3.7);
 ----
-<REGEX>:.*No function matches.*fabricator_lat_span\(VARCHAR, INTEGER, DECIMAL\(2,1\)\).*
+<REGEX>:.*No function matches.*fabricator_lat_span\(STRING_LITERAL, INTEGER_LITERAL, DECIMAL\(2,1\)\).*
 
 # Below the declared prefix DuckDB refuses before the bind is reached.
 statement error
 SELECT * FROM fabricator_lat_span('x');
 ----
-<REGEX>:.*No function matches.*fabricator_lat_span\(VARCHAR\).*
+<REGEX>:.*No function matches.*fabricator_lat_span\(STRING_LITERAL\).*
 
 statement ok
 DROP TABLE lat_pos;

@@ -61,10 +61,13 @@ EXPLAIN (FORMAT json) UPDATE w.main.t SET tags = ['q'] WHERE id = 1;
 physical_plan	<REGEX>:.*"Projections": "id".*
 
 # The SET expressions themselves: the assigned value, then the rowid, with nothing in between.
+# ⚠ DuckDB 2.0 RE-RENDERS EXPLAIN: operator titles are title-cased (`SEQ_SCAN` -> `Seq Scan`,
+# `PROJECTION` -> `Projection`) and a filter is spaced (`g=3` -> `g = 3`). The PLAN is unchanged; only
+# its text is. A plan that stopped being pushed down would still fail this.
 query II
 EXPLAIN UPDATE w.main.t SET tags = ['q'] WHERE id = 1;
 ----
-physical_plan	<REGEX>:.*PROJECTION.*\['q'\][^#]*rowid.*
+physical_plan	<REGEX>:.*Projection.*\['q'\][^#]*rowid.*
 
 # ==============================================================================================
 # §3  THE OTHER TRIGGERING TYPES — MAP, and a STRUCT that CONTAINS a list

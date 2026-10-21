@@ -90,6 +90,9 @@ struct HostQueryStream {
 	unique_ptr<PreparedStatement> prepared; // kept alive for the param path (the streaming result references it)
 	unique_ptr<QueryResult> result;         // a StreamQueryResult — fetched lazily (bounded memory)
 	vector<LogicalType> types;
+	//! Columns whose declared type was SQLNULL and is reported as INTEGER instead — see
+	//! PromoteNullColumns. Empty on every ordinary query.
+	vector<idx_t> promoted_null_columns;
 	vector<string> names;
 	string last_error;
 	//! The stream has seen its EOF. Load-bearing ONLY when batches accumulate several chunks: a Fetch that
@@ -167,6 +170,33 @@ void ApplyHostQuerySession(Connection &conn, const HostQuerySession *session) {
 			tz_result.reset();
 		}
 	}
+}
+
+//! ⚠⚠ A BARE `NULL` COLUMN CANNOT CROSS THIS BOUNDARY AS AN ARROW NULL ARRAY — promote it to INTEGER,
+//! which is EXACTLY what DuckDB 1.5 did for us at BIND.
+//!
+//! 1.5 typed `SELECT NULL AS v` as INTEGER (`DESCRIBE` says `v integer`); 2.0 keeps the `"null"` type, so
+//! the column now reaches ArrowConverter as `LogicalTypeId::SQLNULL` and exports with format `n`. DuckDB's
+//! `ArrowNullData` sets `n_buffers = 0` and leaves `null_count` at **0**, while the Arrow spec says a null
+//! array's null_count IS its length — so Apache.Arrow's importer refuses it with
+//! *"Length must equal null count (Parameter 'data')"*, i.e. a host query with an untyped NULL column kills
+//! the managed caller. MEASURED on both lines: `fluid_render('{% assign rs = query("SELECT NULL AS v") %}…')`
+//! renders on 1.5.6 and throws on 2.0.
+//!
+//! ⚠ This is NOT a cast of VALUES — every row of such a column is null by construction, so the promoted
+//! column is a constant NULL and nothing can be lost. It restores the 1.5 OBSERVABLE type rather than
+//! inventing one.
+//! ⚠ The underlying export is an upstream defect (null_count should be the length); promoting here is the
+//! fix we can make on our own side, and it keeps the boundary's declared types stable across the two lines.
+inline bool PromoteNullColumns(duckdb::vector<LogicalType> &types) {
+	bool promoted = false;
+	for (auto &t : types) {
+		if (t.id() == LogicalTypeId::SQLNULL) {
+			t = LogicalType::INTEGER;
+			promoted = true;
+		}
+	}
+	return promoted;
 }
 
 struct HostQuerySchemaStream {
@@ -283,9 +313,44 @@ int HostQueryGetNext(ArrowArrayStream *stream, ArrowArray *out) {
 		}();
 		const idx_t target_rows = env_override.set ? env_override.rows : st->batch_rows;
 		ArrowAppender appender(st->types, target_rows > 0 ? target_rows : chunk->size(), props, extension_types);
+		// A promoted NULL column must be APPENDED as the type it is now declared as. Every row of it is null
+		// by construction, so a CONSTANT-NULL vector of the promoted type carries it exactly; the other
+		// columns are referenced, not copied. Costs nothing on an ordinary query — the list is empty.
+		DataChunk promoted;
+		if (!st->promoted_null_columns.empty()) {
+			promoted.InitializeEmpty(st->types);
+		}
+		auto append_chunk = [&](DataChunk &src) {
+			if (st->promoted_null_columns.empty()) {
+				appender.Append(src, 0, src.size(), src.size());
+				return;
+			}
+			// ⚠ Reference only the columns whose type is UNCHANGED: `Vector::Reference` validates the type,
+			// so referencing a SQLNULL source into the promoted INTEGER slot raises *"Vector::Reference used
+			// on vector of different type"*. The promoted slots are written directly instead.
+			for (idx_t c = 0; c < src.ColumnCount(); c++) {
+				bool is_promoted = false;
+				for (auto p : st->promoted_null_columns) {
+					if (p == c) {
+						is_promoted = true;
+						break;
+					}
+				}
+				if (is_promoted) {
+					// A NULL Value of the promoted type: Reference makes it a CONSTANT vector, which needs no
+					// buffer of its own (InitializeEmpty allocates none, so writing one by hand would
+					// dereference a null shared_ptr).
+					promoted.data[c].Reference(Value(st->types[c]), count_t(src.size())); // 2.0: count_t is explicit
+				} else {
+					promoted.data[c].Reference(src.data[c]);
+				}
+			}
+			promoted.SetCardinality(src.size());
+			appender.Append(promoted, 0, promoted.size(), promoted.size());
+		};
 		idx_t appended = 0;
 		while (true) {
-			appender.Append(*chunk, 0, chunk->size(), chunk->size());
+			append_chunk(*chunk);
 			appended += chunk->size();
 			if (target_rows == 0 || appended >= target_rows) {
 				break; // one-chunk mode, or the target is met
@@ -371,6 +436,7 @@ unique_ptr<FunctionData> HostQueryBind(ClientContext &context, TableFunctionBind
 		// the factory, i.e. where it failed before. See docs/host-query.md.
 		if (!prepared->HasError() && !prepared->GetTypes().empty()) {
 			auto types = prepared->GetTypes();
+			PromoteNullColumns(types); // the DECLARED schema must agree with what get_next appends
 			vector<string> col_names;
 			for (auto &n : prepared->GetNames()) {
 				col_names.push_back(n.GetIdentifierName());
@@ -842,6 +908,12 @@ void MakeHostQueryStream(DatabaseInstance &db, const string &sql, ArrowArrayStre
 	st->conn = std::move(conn);
 	st->prepared = std::move(prepared);
 	st->types = result->GetTypes();
+	for (idx_t c = 0; c < st->types.size(); c++) {
+		if (st->types[c].id() == LogicalTypeId::SQLNULL) {
+			st->promoted_null_columns.push_back(c); // the appender needs to know which chunk columns to replace
+		}
+	}
+	PromoteNullColumns(st->types); // see the helper: an Arrow null array does not survive the crossing
 	for (auto &n : result->GetNames()) {
 		st->names.push_back(n.GetIdentifierName());
 	}

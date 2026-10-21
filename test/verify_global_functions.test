@@ -383,14 +383,20 @@ FROM duckdb_functions() WHERE function_name = 'fabricator_va_concat';
 # spells the tail — which is the other half of "the registration really is variadic".
 #
 # ⚠ The RENDERING changed on DuckDB 2.0 — `fabricator_va_concat(VARCHAR, [ANY...])` became
-# `fabricator_va_concat(sep VARCHAR, *args ANY)`, i.e. upstream now NAMES the parameters (Python's
-# spelling). The BEHAVIOUR is unchanged: a zero-argument call is still refused at bind because one
+# `fabricator_va_concat(sep VARCHAR, *args ANY, **kwargs ANY)`, i.e. upstream now NAMES the parameters
+# (Python's spelling). The BEHAVIOUR is unchanged: a zero-argument call is still refused at bind because one
 # positional is required. Only the expected text moved, and the assertion still pins the tail (`*args`),
 # which is what makes it evidence of a variadic registration rather than a fixed-arity one.
+#
+# ⚠⚠ THE `**kwargs` IS OURS AND IT IS BEHAVIOUR-PRESERVING RATHER THAN A WIDENING — see
+# BuildFabricatorScalarFunction. 1.5 accepted `f(a, name := v)` on ANY scalar because a scalar had no named
+# parameters at all and DuckDB simply IGNORED the label, passing the value positionally; 2.0 VALIDATES the
+# name, so the declaration is what keeps the call working. MEASURED: `fabricator_va_concat('|', 1, foo := 2)`
+# answers `1|2` on both lines. What the declaration adds is that the signature now SAYS so.
 statement error
 SELECT fabricator_va_concat();
 ----
-<REGEX>:.*fabricator_va_concat\(sep VARCHAR, \*args ANY\).*
+<REGEX>:.*fabricator_va_concat\(sep VARCHAR, \*args ANY, \*\*kwargs ANY\).*
 
 # Zero tail arguments is a legal call (the minimum is satisfied) and yields the empty join.
 query I
