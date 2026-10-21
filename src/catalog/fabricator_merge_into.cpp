@@ -176,11 +176,17 @@ PhysicalOperator &FabricatorCatalog::PlanMergeInto(ClientContext &context, Physi
 	// One row-addressing action needs none of this: there is nothing for it to collide with, so it keeps the
 	// direct per-statement path and a non-DV table loses no capability.
 	idx_t rowid_actions = 0;
+	idx_t writing_actions = 0;
 	for (auto &condition_entry : op.actions) {
 		for (auto &action : condition_entry.second) {
 			if (action->action_type == MergeActionType::MERGE_UPDATE ||
 			    action->action_type == MergeActionType::MERGE_DELETE) {
 				rowid_actions++;
+			}
+			if (action->action_type == MergeActionType::MERGE_UPDATE ||
+			    action->action_type == MergeActionType::MERGE_DELETE ||
+			    action->action_type == MergeActionType::MERGE_INSERT) {
+				writing_actions++; // see serialize_actions at the Make<> below — ALL writers count there
 			}
 		}
 	}
@@ -215,9 +221,27 @@ PhysicalOperator &FabricatorCatalog::PlanMergeInto(ClientContext &context, Physi
 	// changed. Whether a merge could then go parallel is a SEPARATE decision, not a consequence of this one.
 	// DuckDB's own DuckCatalog reaches false for a third reason (it disables parallelism as soon as there are
 	// two appends); DuckLake passes true because its per-action operators are parallel-safe.
-	// 2.0: the child operator is a CONSTRUCTOR argument now, not pushed onto children afterwards.
+	// 2.0: the child operator is a CONSTRUCTOR argument now, not pushed onto children afterwards — and
+	// there is a NEW trailing `serialize_actions`, which is what makes the actions run ONE AFTER THE OTHER
+	// instead of as concurrent action pipelines.
+	//
+	// ⚠⚠ DuckDB's OWN planner derives it from `append_count > 1`, counting only INSERT and del-and-insert
+	// UPDATE — i.e. from "two operators APPEND to the same table". That rule is right for a DuckDB table and
+	// WRONG for us: EVERY writing action of ours — INSERT, UPDATE and DELETE alike — goes to ONE remote
+	// table through ONE provider session and fuses into ONE commit, so any two of them running as concurrent
+	// action pipelines can lose each other's work. Hence ALL writers count here, not just the appends.
+	//
+	// MEASURED on 2.0, and the two shapes failed DIFFERENTLY, which is what shows the wider rule is needed:
+	//   · two DELETEs (`WHEN MATCHED AND s.id = 1 … WHEN MATCHED AND s.id = 3 …`) lost one row OUTRIGHT —
+	//     3 rows where 2 were expected, deterministically.
+	//   · UPDATE + INSERT on a change-data-feed table lost the `update_preimage` row from the feed in
+	//     roughly HALF of runs — a RACE, so a narrower rule keyed on the rowid actions alone (which counts
+	//     1 here) left it flaky rather than fixing it.
+	// Both are Delta-provider only: the same statements on a DuckDB table are correct, which is what shows
+	// the loss is ours and not upstream's.
 	auto &result = planner.Make<PhysicalMergeInto>(op.types, plan, std::move(actions), op.row_id_start,
-	                                               op.source_marker, /*parallel=*/false, op.return_chunk);
+	                                               op.source_marker, /*parallel=*/false, op.return_chunk,
+	                                               /*serialize_actions=*/writing_actions >= 2);
 	return result;
 }
 

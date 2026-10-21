@@ -115,7 +115,12 @@ inline std::string TableOptionsArg(
 			out += ",";
 		}
 		first = false;
-		out += "\"" + EscapeJsonString(kv.first) + "\":\"" + EscapeJsonString(val.ToString()) + "\"";
+		// ⚠⚠ `.text`, NEVER `Literal::ToString()`. 2.0 replaced `ConstantExpression::value` (a `Value`)
+		// with a `Literal`, whose ToString RENDERS SQL THAT PARSES BACK — i.e. a string literal comes out
+		// WITH ITS QUOTES. The managed side quotes for itself, so ToString double-quotes: measured as
+		// *"unknown mode ''id''"* and *"unknown codec ''zstd''"*. `text` is the DECODED content
+		// (quotes stripped, '' collapsed) and is what the Value used to give.
+		out += "\"" + EscapeJsonString(kv.first) + "\":\"" + EscapeJsonString(val.text) + "\"";
 	}
 	out += "}";
 	return out;

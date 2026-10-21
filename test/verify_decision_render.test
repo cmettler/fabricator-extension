@@ -1201,7 +1201,7 @@ statement ok
 SELECT fabricator_host_exec(decision_render('ord12', name := 'ord12_s'));
 
 query T
-SELECT list_aggregate(list_transform(many(v), x -> x.rulepos), 'string_agg', ',')
+SELECT list_aggregate(list_transform(many(v), lambda x: x.rulepos), 'string_agg', ',')
 FROM (SELECT ord12_s({'region':'EU'}, hit_policy := 'RuleOrder') AS v);
 ----
 1,2,3,4,5,6,7,8,9,10,11,12

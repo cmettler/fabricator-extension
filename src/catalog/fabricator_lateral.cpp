@@ -1007,6 +1007,9 @@ TableFunction FabricatorMakeLateralFunction(FabricatorHandle handle, const strin
 	}
 	auto &sig = tf.GetSignature();
 	for (auto &t : sig_positional) {
+		// Positional-only (`colN`) — a LATERAL's arguments are passed by position from the correlated
+		// expressions and the provider's own names are carried in the bind data, not the signature. See
+		// BuildFabricatorScalarFunction for the case where naming them IS load-bearing.
 		sig.AddParameter(t);
 	}
 	if (sig_tail.id() != LogicalTypeId::INVALID) {

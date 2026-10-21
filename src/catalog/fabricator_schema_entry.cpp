@@ -1036,6 +1036,16 @@ static ScalarFunction BuildFabricatorScalarFunction(FabricatorHandle handle, con
 		// 2.0: no `varargs` field. A variadic tail is a VAR_POSITIONAL parameter on the signature; the
 		// leading declared parameters stay the minimum arity exactly as before.
 		sig.AddArgs("args", FabricatorVarArgsType(arg_types[varargs_index]));
+		// ⚠⚠ AND A `**kwargs` BESIDE IT, because a tail argument written `name := expr` is how a CALLER
+		// NAMES a column of the args batch — our own generated macros rely on it
+		// (`fluid_scalar(tpl, NULL, dmn_def := def)`), and `FabricatorScalarBindData::arg_names` carries
+		// those aliases to the exec. 1.5 accepted the spelling because a scalar had no named parameters at
+		// all and DuckDB simply ignored the label; 2.0 VALIDATES it, so without this the call is refused at
+		// bind. `VAR_KEYWORD` collects exactly the unmatched `name := value` arguments and KEEPS their names
+		// (FunctionBinder's parameter-kind dispatch), which is the half the alias contract needs.
+		// ⚠ Scoped to a VARIADIC declaration on purpose: giving a FIXED-arity scalar `**kwargs` would newly
+		// accept argument names it never declared, which is a widening rather than a port.
+		sig.AddKwargs("kwargs", FabricatorVarArgsType(arg_types[varargs_index]));
 	}
 	sig.SetReturnType(return_type);
 	// 2.0: the name is a ctor argument (an Identifier), not an assignable field.
@@ -4363,7 +4373,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::CreateTable(CatalogTransaction
 		if (val.IsNull()) {
 			defaults_arg += "-";
 		} else {
-			string text = val.ToString();
+			string text = val.text; // raw literal content, see the note in fabricator_partition_util.hpp
 			defaults_arg += Blob::ToBase64(string_t(text.c_str(), (uint32_t)text.size()));
 		}
 	}
@@ -4489,7 +4499,7 @@ static void CarryDefault(FabricatorAlterRequest &request, const ParsedExpression
 	request.has_default = true;
 	request.default_is_null = val.IsNull();
 	if (!request.default_is_null) {
-		request.default_literal = val.ToString();
+		request.default_literal = val.text; // raw: the provider quotes it (SqlServerBackend.RenderDefaultBySqlType)
 	}
 }
 

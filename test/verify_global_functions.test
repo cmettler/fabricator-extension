@@ -381,10 +381,16 @@ FROM duckdb_functions() WHERE function_name = 'fabricator_va_concat';
 
 # The declared prefix is the MINIMUM arity: below it DuckDB refuses at bind, and its candidate rendering
 # spells the tail — which is the other half of "the registration really is variadic".
+#
+# ⚠ The RENDERING changed on DuckDB 2.0 — `fabricator_va_concat(VARCHAR, [ANY...])` became
+# `fabricator_va_concat(sep VARCHAR, *args ANY)`, i.e. upstream now NAMES the parameters (Python's
+# spelling). The BEHAVIOUR is unchanged: a zero-argument call is still refused at bind because one
+# positional is required. Only the expected text moved, and the assertion still pins the tail (`*args`),
+# which is what makes it evidence of a variadic registration rather than a fixed-arity one.
 statement error
 SELECT fabricator_va_concat();
 ----
-<REGEX>:.*fabricator_va_concat\(VARCHAR, \[ANY\.\.\.\]\).*
+<REGEX>:.*fabricator_va_concat\(sep VARCHAR, \*args ANY\).*
 
 # Zero tail arguments is a legal call (the minimum is satisfied) and yields the empty join.
 query I

@@ -123,10 +123,15 @@ SELECT (SELECT count(*) FROM oracle_batched), (SELECT count(*) FROM oracle_rowwi
 #    pass on a build where the rewrite never fired.
 # ============================================================================
 
+# ⚠⚠ THE RENDERING CHANGED ON DuckDB 2.0 and the NEGATIVE assertions below are why this matters: EXPLAIN
+# now TITLE-CASES an operator's name, so `FABRICATOR_LATERAL_BATCHED` prints as `Fabricator Lateral
+# Batched`. Our operator still REPORTS the upper-case name (fabricator_lateral.cpp) — only the display
+# moved. Left unported, the positive assertion fails LOUDLY while the two `<!REGEX>` ones below would pass
+# VACUOUSLY, i.e. the kill switch and the uncorrelated shape would stop being checked at all.
 query II
 EXPLAIN SELECT w.id, r.i FROM wide w, fabricator_lat_repeat(w.n, w.times) r;
 ----
-physical_plan	<REGEX>:.*FABRICATOR_LATERAL_BATCHED.*
+physical_plan	<REGEX>:.*Fabricator Lateral Batched.*
 
 statement ok
 SET fabricator_batched_lateral = false;
@@ -135,7 +140,7 @@ SET fabricator_batched_lateral = false;
 query II
 EXPLAIN SELECT w.id, r.i FROM wide w, fabricator_lat_repeat(w.n, w.times) r;
 ----
-physical_plan	<!REGEX>:.*FABRICATOR_LATERAL_BATCHED.*
+physical_plan	<!REGEX>:.*Fabricator Lateral Batched.*
 
 statement ok
 SET fabricator_batched_lateral = true;
@@ -145,7 +150,7 @@ SET fabricator_batched_lateral = true;
 query II
 EXPLAIN SELECT * FROM fabricator_lat_repeat(7, 3);
 ----
-physical_plan	<!REGEX>:.*FABRICATOR_LATERAL_BATCHED.*
+physical_plan	<!REGEX>:.*Fabricator Lateral Batched.*
 
 # ============================================================================
 # 5. PROOF OF BATCHING. Result equivalence proves correctness and says NOTHING about whether anything was
