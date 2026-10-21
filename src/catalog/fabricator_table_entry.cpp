@@ -1120,7 +1120,8 @@ virtual_column_map_t FabricatorTableEntry::GetVirtualColumns() const {
 	// shadows the virtual one (TableBinding only maps a virtual name that isn't already taken).
 	for (idx_t i = 0; i < provider_virtual_columns_.size(); i++) {
 		result.insert(make_pair(fabricator::ProviderVirtualBase() + i,
-		                        TableColumn(provider_virtual_columns_[i].first, provider_virtual_columns_[i].second)));
+		                        TableColumn(Identifier(provider_virtual_columns_[i].first),
+		                                    provider_virtual_columns_[i].second)));
 	}
 	// Otherwise no virtual columns (no DuckDB rowid) — scans then don't require
 	// projection pushdown for the virtual column.

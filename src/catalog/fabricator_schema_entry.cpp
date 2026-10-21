@@ -954,7 +954,8 @@ static ScalarFunction BuildFabricatorScalarFunction(FabricatorHandle handle, con
 			// children loop), so `row_count` above is the true row count.
 			DataChunk rows;
 			rows.Initialize(Allocator::Get(ctx), actual_types, MaxValue<idx_t>(row_count, 1));
-			rows.data[0].Reference(Value::BOOLEAN(false));
+			// 2.0: a constant Reference declares how many rows it covers.
+			rows.data[0].Reference(Value::BOOLEAN(false), MaxValue<idx_t>(row_count, 1));
 			rows.data[0].Flatten(row_count);
 			rows.SetCardinality(row_count);
 			appender.Append(rows, 0, row_count, row_count);
