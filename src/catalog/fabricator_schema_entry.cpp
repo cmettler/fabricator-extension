@@ -392,7 +392,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateEntry(ClientContext
 		return nullptr;
 	}
 
-	CreateTableInfo info(catalog.GetName(), name, Identifier(table_name));
+	CreateTableInfo info(QualifiedName(catalog.GetName(), name, Identifier(table_name)));
 	for (idx_t i = 0; i < names.size(); i++) {
 		info.columns.AddColumn(ColumnDefinition(names[i], types[i]));
 	}
@@ -726,8 +726,12 @@ static void FabricatorExpandVarArgs(idx_t varargs_index, const vector<string> &d
 	}
 }
 
-static unique_ptr<FunctionData> FabricatorScalarBind(ClientContext &context, ScalarFunction &bound_function,
-                                                    vector<unique_ptr<Expression>> &arguments) {
+// 2.0: the bind callback takes ONE input struct instead of (context, function, arguments). The three
+// values are pulled out here so the body below is unchanged.
+static unique_ptr<FunctionData> FabricatorScalarBind(BindScalarFunctionInput &input) {
+	auto &context = input.GetClientContext();
+	auto &bound_function = input.GetBoundFunction();
+	auto &arguments = input.GetArguments();
 	auto &info = bound_function.GetExtraFunctionInfo().Cast<FabricatorScalarFunctionInfo>();
 
 	// ⚠⚠ THE AMBIENTS (txn + host-FS opener) ARE DELIBERATELY *NOT* ESTABLISHED HERE, and this is the one
@@ -4221,7 +4225,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::CreateTable(CatalogTransaction
 	vector<LogicalType> types;
 	string identity_arg;
 	for (auto &col : base.columns.Logical()) {
-		names.push_back(col.Name());
+		names.push_back(col.Name().GetIdentifierName());
 		types.push_back(col.Type());
 		if (col.Generated()) {
 			if (!identity_arg.empty()) {
