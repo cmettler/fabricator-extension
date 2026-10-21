@@ -369,7 +369,10 @@ unique_ptr<FunctionData> HostQueryBind(ClientContext &context, TableFunctionBind
 		// the factory, i.e. where it failed before. See docs/host-query.md.
 		if (!prepared->HasError() && !prepared->GetTypes().empty()) {
 			auto types = prepared->GetTypes();
-			auto col_names = prepared->GetNames();
+			vector<string> col_names;
+			for (auto &n : prepared->GetNames()) {
+				col_names.push_back(n.GetIdentifierName());
+			}
 			// ⚠ The factory opens and CONFIGURES its own connection rather than capturing one: the props
 			// derived from it must match the execute path's, and a TimeZone difference would change a
 			// TIMESTAMPTZ column's Arrow type — so the same session is applied here as there.
@@ -761,7 +764,7 @@ void MakeHostQueryStream(DatabaseInstance &db, const string &sql, ArrowArrayStre
 		// ⚠ Duplicate names are NOT silently collapsed: case_insensitive_map_t would keep the LAST value and
 		// bind a parameter the caller never intended, so they are refused by name.
 		const auto &names = reader.Names();
-		const auto &declared = prepared->named_param_map;
+		const auto &declared = prepared->GetNamedParameterMap();
 		// ⚠ A SUBSET is enough, deliberately: requiring declared.size() == values.size() would send a call
 		// that supplies only some of the statement's parameters down the POSITIONAL path, where DuckDB then
 		// reports every parameter as missing ("… parameters: a, b") including the one that WAS supplied.
@@ -801,7 +804,9 @@ void MakeHostQueryStream(DatabaseInstance &db, const string &sql, ArrowArrayStre
 	st->conn = std::move(conn);
 	st->prepared = std::move(prepared);
 	st->types = result->types;
-	st->names = result->names;
+	for (auto &n : result->names) {
+		st->names.push_back(n.GetIdentifierName());
+	}
 	st->batch_rows = batch_rows; // the caller's morsel-size request (ABI v85); 0 = one DataChunk
 	st->result = std::move(result);
 	st->stream.get_schema = HostQueryGetSchema;

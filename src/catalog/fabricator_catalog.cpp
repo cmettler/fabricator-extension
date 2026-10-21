@@ -535,8 +535,8 @@ FabricatorModifyTarget FabricatorBuildModifyTarget(TableCatalogEntry &table) {
 		    entry.name);
 	}
 	FabricatorModifyTarget target;
-	target.schema_name = entry.schema.name;
-	target.table_name = entry.name;
+	target.schema_name = entry.schema.name.GetIdentifierName();
+	target.table_name = entry.name.GetIdentifierName();
 	if (entry.HasVirtualRowId()) {
 		// Virtual rowid (Delta `_metadata.row_id`): the key columns are provider-supplied, not in the schema.
 		const auto &rowid_type = entry.RowIdType();

@@ -1847,7 +1847,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateView(ClientContext 
 		// the entry straight to the binder, so a mismatch leaves one of the two permanently unreachable.
 		if (!StringUtil::CIEquals(info->GetViewName().GetIdentifierName(), view_name)) {
 			throw ParserException("declared view name '%s' does not match the discovered name '%s'",
-			                      info->view_name, view_name);
+			                      info->GetViewName().GetIdentifierName(), view_name);
 		}
 		// Re-qualified onto THIS catalog + schema, same as a catalog macro.
 		//
@@ -3559,7 +3559,8 @@ void RegisterFabricatorGlobalFunctions(ExtensionLoader &loader) {
 					    !(info_schema.empty() || StringUtil::CIEquals(info_schema, DEFAULT_SCHEMA))) {
 						throw ParserException(
 						    "a provider macro must be unqualified (or main-qualified) — got catalog '%s' schema '%s'",
-						    info->catalog, info->schema);
+						    info->GetQualifiedName().Catalog().GetIdentifierName(),
+						    info->GetQualifiedName().Schema().GetIdentifierName());
 					}
 					info->SetQualification(Identifier::InvalidCatalog(), Identifier::DefaultSchema());
 					info->internal = true; // a provider-shipped entry, like a built-in (BuiltinFunctions parity)
@@ -3677,7 +3678,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateTableFunction(Clien
 	}
 	auto fn_info = make_shared_ptr<FabricatorTableFunctionInfo>();
 	fn_info->handle = handle_;
-	fn_info->schema = name;
+	fn_info->schema = name.GetIdentifierName();
 	fn_info->func = func_name;
 	fn_info->arg_types = arg_types;
 	fn_info->arg_names = arg_names;
@@ -3727,12 +3728,12 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateSqlTableFunction(Cl
 	auto fn_info = make_shared_ptr<FabricatorTableFunctionInfo>();
 	fn_info->varargs_index = sqlgen_varargs_index;
 	fn_info->handle = handle_;
-	fn_info->schema = name;
+	fn_info->schema = name.GetIdentifierName();
 	fn_info->func = func_name;
 	fn_info->arg_types = arg_types;
 	fn_info->arg_names = arg_names;
 	fn_info->is_proc = false;
-	fn_info->catalog_name = catalog.GetName(); // the ATTACH alias — only known here
+	fn_info->catalog_name = catalog.GetName().GetIdentifierName(); // the ATTACH alias — only known here
 	tf.function_info = std::move(fn_info);
 
 	CreateTableFunctionInfo info(std::move(tf));
@@ -3756,7 +3757,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateCustomInOutFunction
 	inout.projection_pushdown = true;
 	auto fn_info = make_shared_ptr<FabricatorTableFunctionInfo>();
 	fn_info->handle = handle_;
-	fn_info->schema = name;
+	fn_info->schema = name.GetIdentifierName();
 	fn_info->func = func_name;
 	fn_info->is_proc = false;
 	// The signature comes from the DECLARED parameter styles: the table input is one of them now, so it is no
@@ -3838,7 +3839,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateCustomCollectorFunc
 	collector.projection_pushdown = true;
 	auto fn_info = make_shared_ptr<FabricatorTableFunctionInfo>();
 	fn_info->handle = handle_;
-	fn_info->schema = name;
+	fn_info->schema = name.GetIdentifierName();
 	fn_info->func = func_name;
 	fn_info->is_proc = false;
 	// Signature from the declared styles (see FabricatorBuildInOutSignature): the table input is a declared
@@ -4298,7 +4299,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::CreateTable(CatalogTransaction
 		if (!expr || expr->GetExpressionType() != ExpressionType::VALUE_CONSTANT) {
 			continue; // literals only
 		}
-		auto &val = expr->Cast<ConstantExpression>().value;
+		auto &val = expr->Cast<ConstantExpression>().GetLiteral();
 		if (!defaults_arg.empty()) {
 			defaults_arg += " ";
 		}
@@ -4428,7 +4429,7 @@ static void CarryDefault(FabricatorAlterRequest &request, const ParsedExpression
 	if (!expr || expr->GetExpressionType() != ExpressionType::VALUE_CONSTANT) {
 		throw NotImplementedException("fabricator: only literal column DEFAULTs are supported");
 	}
-	auto &val = expr->Cast<ConstantExpression>().value;
+	auto &val = expr->Cast<ConstantExpression>().GetLiteral();
 	request.has_default = true;
 	request.default_is_null = val.IsNull();
 	if (!request.default_is_null) {
@@ -4462,7 +4463,7 @@ void FabricatorSchemaEntry::AlterComment(CatalogTransaction transaction, AlterIn
 	if (info.type == AlterType::SET_COLUMN_COMMENT) {
 		auto &column_info = info.Cast<SetColumnCommentInfo>();
 		request.kind = "set_column_comment";
-		request.column = column_info.column_name;
+		request.column = column_info.GetColumnName().GetIdentifierName();
 		comment = column_info.comment_value;
 	} else {
 		auto &entry_info = info.Cast<SetCommentInfo>();
@@ -4534,7 +4535,7 @@ void FabricatorSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &inf
 	FabricatorSetActiveTxn(handle_, context); // every ALTER below joins this txn's connection
 	fabricator::SetActiveOpener(reinterpret_cast<FabricatorHandle>(&context), fabricator::SessionKeyFor(&context)); // host-FS opener for a Delta-catalog ALTER
 	auto &table_info = info.Cast<AlterTableInfo>();
-	const string &table = table_info.name;
+	const auto table = table_info.GetQualifiedName().Name().GetIdentifierName();
 
 	// Refresh the cached entry AFTER an ALTER. We don't just evict-and-wait-for-lazy-refetch: the lazy
 	// re-fetch would be triggered by whatever binds the table next — and under dbt that is a SEPARATE
@@ -4568,7 +4569,7 @@ void FabricatorSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &inf
 	case AlterTableType::RENAME_TABLE: {
 		auto &rt = table_info.Cast<RenameTableInfo>();
 		request.kind = "rename_table";
-		request.new_name = rt.new_table_name;
+		request.new_name = rt.new_table_name.GetIdentifierName();
 		break;
 	}
 	case AlterTableType::RENAME_COLUMN: {
