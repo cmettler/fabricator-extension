@@ -888,6 +888,59 @@ a 2.0 change and not a long-standing defect in our view construction.
 a second one running `SELECT * FROM <the view>` back through the host, both showed `base_row_id = 24,11`
 and `commit_version = 8,1` — correct, and correctly ordered, on the way in.
 
+### The projection DuckDB actually asks for — measured at the factory, both registrations
+
+A probe in `FabricatorArrowScanFactory::ProduceStream` printing `parameters.projected_columns.columns`,
+on the same Delta row-tracking query, switching only the registered function:
+
+```
+arrow_scan       PROBE projected=[fn,commit_version]                filters=none   -> answers 24  (WRONG)
+arrow_scan_dumb  PROBE projected=[fn,base_row_id,commit_version]    filters=none   -> answers 8   (right)
+```
+
+So DuckDB **did** prune `base_row_id` out of a three-column view — a NON-PREFIX subset `{0,2}` — even
+though the generated SQL references it, and the factory then handed back all three children. Position 1 of
+the request landed on child 1 (`base_row_id`) instead of child 2. ⚠ That is the SAME SHAPE as §2, which on
+1.5.6 SEGFAULTED; 2.0 reads it silently instead. **§2 and this entry are one bug with two symptoms.**
+
+### The FILTER half of the same contract, and why `arrow_scan_dumb` closes it too
+
+`arrow_scan` declares `filter_pushdown = true`, and DuckDB's optimizer **removes** a filter from the plan
+once it is fully pushed — `pushdown_get.cpp` ends the generic-expression loop with `filters.erase_at(i)` on
+`FilterPushdownResult::PUSHED_DOWN_FULLY`, and `GenerateTableScanFilters` moves the rest into
+`get.table_filters`. The scan is then trusted to apply them.
+
+**DuckDB's arrow scan never applies them.** `parameters.filters` is handed to the factory and
+`ArrowScanLocalState::filters` is *stored and never read* — grep-verified across `arrow.cpp` and
+`arrow_conversion.cpp`. pyarrow's factory satisfies the contract; `CArrowScanFactory` does not, and neither
+did ours. ⇒ a TableFilter pushed into such a view is **silently dropped**, i.e. too many rows.
+
+⚠ **Not reached in practice here, and that IS measured**: with the probe armed across all 76 hermetic
+suites, **1162 named-input scans in 58 suites reported `filters=none` without exception** — so our
+generated SQL never puts a constant predicate directly on one of these views, and the hazard was latent.
+`arrow_scan_dumb` (`filter_pushdown = false`, `filter_prune = false`) removes it by construction.
+⚠⚠ THE FIRST ATTEMPT AT THIS SWEEP MEASURED NOTHING AND LOOKED LIKE A CLEAN RESULT: `run-suites.sh`
+captures each suite's output into a variable and prints it only on FAILURE (line 1580), so the probe's
+lines were discarded and the count came back ZERO — indistinguishable from "no filters anywhere". The
+rerun drives the suites directly and keeps stderr; the 1162 lines ARE the positive control.
+⚠ The sweep covers the HERMETIC tier only. A plugin calling `Host.Query` with its own wide input and a
+WHERE is the shape that would both reach the filter path and make the lost projection pushdown matter.
+
+### Why `arrow_scan_dumb` is the right shape and not a retreat
+
+`ArrowScanBindDumb` sets `projection_pushdown_enabled = false`, and `ArrowScanInitLocalInternal` then does
+`result->column_ids.clear()` — which makes `ArrowToDuckDB` fall back to the identity. **That is exactly
+what our own `fabricator_scan` has always done**: `ArrowStreamInitLocal` clears `column_ids` too, ingests
+every column of the actual result, and projects by NAME-resolved positions computed at bind
+(`output_source_pos`). The two paths now share one invariant instead of disagreeing about it.
+
+⚠ The two paths and what each is for, since the split is easy to lose:
+
+| path | function | projection | used by |
+|---|---|---|---|
+| ours | `fabricator_scan` | narrowed AT THE PRODUCER, mapped BY NAME | the catalog scan, fluid's `input_table`, `publish()` |
+| copied | `RegisterArrowInputView` | identity, no pushdown (since `arrow_scan_dumb`) | `Host.Query(sql, inputs)` named inputs — the Delta metadata and deletion-vector views, bulk-write inputs |
+
 ### Our workaround
 
 `arrow_scan_dumb` — upstream's own variant, same bind and same scan with projection and filter pushdown

@@ -714,7 +714,26 @@ struct FabricatorArrowScanFactory : public ArrowScanFactory {
 		schema.release = nullptr;
 	}
 
-	unique_ptr<ArrowArrayStreamWrapper> ProduceStream(ArrowStreamParameters &) override {
+	//! ⚠⚠ SHIPPED, env-gated, and it earned that the way the other probes in this tree did: what DuckDB
+	//! ASKS a named input for is invisible from SQL, and when the answer stopped being the identity the
+	//! symptom was a WRONG COLUMN with no error (see RegisterArrowInputView below). One getenv per scan.
+	//! `FABRICATOR_DUMP_ARROW_SCAN=1` prints the projection in request order and whether filters arrived;
+	//! under `arrow_scan_dumb` the projection MUST be the full column list, in schema order — anything
+	//! narrower or reordered means the positional contract is back and the values are suspect.
+	unique_ptr<ArrowArrayStreamWrapper> ProduceStream(ArrowStreamParameters &params) override {
+		if (getenv("FABRICATOR_DUMP_ARROW_SCAN")) {
+			string msg = "fabricator arrow input: projected=[";
+			for (idx_t i = 0; i < params.projected_columns.columns.size(); i++) {
+				if (i) {
+					msg += ",";
+				}
+				msg += params.projected_columns.columns[i];
+			}
+			msg += "] filters=";
+			msg += params.filters ? string("yes") : string("none");
+			msg += "\n";
+			fputs(msg.c_str(), stderr);
+		}
 		auto ret = make_uniq<ArrowArrayStreamWrapper>();
 		ret->arrow_array_stream = stream;
 		ret->arrow_array_stream.release = FabricatorEmptyStreamRelease;
@@ -755,12 +774,18 @@ bool RegisterArrowInputView(Connection &conn, const string &name, ArrowArrayStre
 		// as the commit version, so `__delta_row_commit_version` answered 24 (a baseRowId) where the log
 		// says 8 — no error anywhere, and 1.5.6 answers 8 on the same files.
 		// `arrow_scan_dumb` is upstream's OWN variant for exactly this case: same bind, same scan, with
-		// projection and filter pushdown off, so `column_ids` is the identity and positional indexing is
-		// correct again. ⚠ The cost is that a named input now crosses whole — no column pruning and no
-		// filter pushdown INTO the view. Our named inputs are small by construction (the per-file metadata
-		// and deletion-vector views, and bulk-write inputs that are consumed in full anyway), and a wrong
-		// column is not a trade. The alternative — a projecting wrapper around the caller's stream — is
-		// what would buy the pushdown back, and it is the only reason to revisit this line.
+		// projection and filter pushdown off (`ArrowScanBindDumb` -> `column_ids.clear()`), so the identity
+		// is restored and positional indexing is correct again. ⚠ THAT IS THE SAME INVARIANT OUR OWN
+		// `fabricator_scan` HAS ALWAYS RELIED ON — `ArrowStreamInitLocal` clears `column_ids` too, ingests
+		// every column and projects BY NAME — so the two arrow paths now agree instead of disagreeing.
+		// ⚠ The cost is that a named input crosses WHOLE. MEASURED rather than waved through: with the
+		// probe above armed across all 76 hermetic suites, 1162 named-input scans in 58 suites reported
+		// **filters=none** without exception, so nothing is lost to the filter half; and the projections
+		// are 1-3 column metadata/deletion-vector views plus bulk-write inputs that the COPY consumes in
+		// full anyway (widest seen: 14 columns, all of them read). The alternative — a projecting wrapper
+		// around the caller's stream — is what would buy the pushdown back, and it is the only reason to
+		// revisit this line. ⚠ The sweep covers the HERMETIC tier only; a plugin calling Host.Query with
+		// its own wide input and a WHERE is the shape that would make the pushdown worth having.
 		conn.TableFunction("arrow_scan_dumb", {}, {}, make_shared_ptr<FabricatorArrowScanFactory>(*stream))
 		    ->CreateView(Identifier(name), /*replace=*/true, /*temporary=*/true);
 	} catch (const std::exception &ex) {
