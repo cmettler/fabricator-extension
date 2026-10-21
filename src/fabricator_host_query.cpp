@@ -477,9 +477,14 @@ int64_t RunHostExec(DatabaseInstance &db, const string &sql, const HostQuerySess
 	auto conn = make_uniq<Connection>(db); // FRESH connection: own context/transaction, as host_query does
 	ApplyHostQuerySession(*conn, session);
 
-	// SendQuery rather than Query: several statements in one string all run (which is the case exec exists
-	// for), and a caller who passes a SELECT anyway streams rather than materialising the whole thing.
-	auto result = conn->SendQuery(sql);
+	// ⚠ DuckDB 2.0 SPLIT the old SendQuery in two and we cannot have both halves any more: `Query` runs
+	// SEVERAL statements (verified — ClientContext::Query loops them and returns the last one's result) but
+	// MATERIALISES, while `Submit` streams and accepts a SINGLE statement only. Multi-statement is what exec
+	// exists for, so `Query` it is.
+	// ⚠ THE COST, stated rather than hidden: a caller who passes a big SELECT to host_exec now materialises
+	// it where 1.5 streamed. Only the LAST statement's result is touched here (for the row count), so the
+	// exposure is that one result; if it ever matters, Submit is the streaming path for a single statement.
+	auto result = conn->Query(sql);
 	if (result->HasError()) {
 		throw IOException("fabricator_host_exec: " + result->GetError());
 	}
@@ -780,7 +785,12 @@ void MakeHostQueryStream(DatabaseInstance &db, const string &sql, ArrowArrayStre
 			result = prepared->Execute(values, /*allow_stream_result=*/true);
 		}
 	} else {
-		result = conn->SendQuery(sql); // streaming (lazy Fetch) — bounded memory for large results
+		// ⚠ 2.0: `Submit` is the STREAMING half of the old SendQuery (`Query` materialises). Streaming is
+		// load-bearing here — see the file header: the arrow scan holds a raw pointer into the caller's
+		// struct, and bounded memory for large results is the whole point. ⚠ Submit accepts ONE statement,
+		// so a caller passing several now gets a LOUD error where 1.5 ran them all; host_query's contract
+		// is a single result-producing query, and failing loudly beats materialising silently.
+		result = conn->Submit(sql); // streaming (lazy Fetch) — bounded memory for large results
 	}
 	if (result->HasError()) { // bind/plan errors surface here; runtime errors surface during Fetch (get_next)
 		throw IOException("fabricator_host_query: " + result->GetError());

@@ -50,7 +50,7 @@ namespace duckdb {
 // is treated as a connection string and a fresh handle is opened (owns=true).
 // This mirrors the C++ mssql extension's mssql_scan/mssql_exec ergonomics.
 static FabricatorHandle ResolveConnection(ClientContext &context, const string &conn_or_name, bool &owns) {
-	auto db = DatabaseManager::Get(context).GetDatabase(context, conn_or_name);
+	auto db = DatabaseManager::Get(context).GetDatabase(context, Identifier(conn_or_name));
 	if (db) {
 		auto &catalog = db->GetCatalog();
 		if (FabricatorCatalog::Is(catalog)) {
@@ -256,7 +256,7 @@ static void RegisterProviderSettings(ExtensionLoader &loader) {
 
 			// The scope is passed EXPLICITLY although it is also DuckDB's default for extension options, so
 			// that it and the trampoline's AUTOMATIC resolution read from one constant and cannot drift.
-			config.AddExtensionOption(name, desc, lt, default_value, g_setting_trampolines[slot],
+			config.AddExtensionOption(Identifier(name), desc, lt, default_value, g_setting_trampolines[slot],
 			                          FABRICATOR_SETTING_DEFAULT_SCOPE);
 
 			// Seed the managed store with the default so reads see it before any SET. Session 0: a
@@ -505,7 +505,7 @@ static void FabricatorExecFunction(DataChunk &args, ExpressionState &state, Vect
 
 		// owns == false => the arg named an attached fabricator catalog whose cache we own.
 		if (invalidate_on_ddl && schema_may_change && !owns) {
-			auto db = DatabaseManager::Get(context).GetDatabase(context, conn_name);
+			auto db = DatabaseManager::Get(context).GetDatabase(context, Identifier(conn_name));
 			if (db && FabricatorCatalog::Is(db->GetCatalog())) {
 				db->GetCatalog().Cast<FabricatorCatalog>().RefreshCache(context);
 			}
@@ -527,7 +527,7 @@ static void FabricatorRefreshCacheFunction(DataChunk &args, ExpressionState &sta
 			throw InvalidInputException("fabricator_refresh_cache: catalog name is required (got NULL)");
 		}
 		auto name = StringValue::Get(value);
-		auto &catalog = Catalog::GetCatalog(context, name);
+		auto &catalog = Catalog::GetCatalog(context, Identifier(name));
 		if (!FabricatorCatalog::Is(catalog)) {
 			throw BinderException("fabricator_refresh_cache: catalog '%s' is not a fabricator catalog (type: %s)", name,
 			                      catalog.GetCatalogType());

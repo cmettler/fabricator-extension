@@ -5,6 +5,7 @@
 #include "fabricator/fabricator_variant.hpp"
 
 #include "duckdb/common/arrow/arrow_converter.hpp"
+#include "duckdb/common/vector/struct_vector.hpp" // 2.0 split vector.hpp
 #include "duckdb/common/arrow/arrow_type_extension.hpp"
 #include "duckdb/common/arrow/schema_metadata.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
