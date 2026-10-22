@@ -1326,7 +1326,26 @@ case "$TIER" in
         #   adding an input leaves every call site untouched; typed is easier to call but its signature
         #   moves with the decision table. The answer is asserted BYTE-IDENTICAL on the scalar pair,
         #   which is what makes `input` a delivery choice rather than a second semantics.
-        : "${MIN_ASSERTIONS:=3572}"
+        # 2026-10-22: 3572 -> 3586, THE PORT TO DuckDB 2.0 — the first service-tier run on 2.0 at all,
+        #   60/60 — 3586, zero skipped. ⚠ NO PER-SUITE DELTA IS CLAIMED: there is no 2.0 baseline to
+        #   subtract from, so the figure is the measured total and nothing else. The suites that changed
+        #   in the port, each for an UPSTREAM behaviour change rather than a feature of ours:
+        #   verify_delta_catalog_s3 (199 per leg) — 2.0 no longer BUMPS a remote s3:// ATTACH to read-only
+        #     under AUTOMATIC (measured on both builds via duckdb_databases().readonly: 1.5.6 true, 2.0
+        #     false), so the plainest spelling of all is now a WRITABLE secret-less S3 catalog and the
+        #     unguarded-write warning had to widen from READ_WRITE to "not read-only". ⚠ The row that
+        #     used to assert "read-only mode" is what noticed it; a READ_ONLY attach stays exempt.
+        #   verify_granular_types (26) — CAST(TIMESTAMP_NS AS TIMESTAMP) ROUNDS on 2.0 where it truncated,
+        #     half-away-from-zero, and .9999999 CARRIES into the seconds field. Upstream and defensible
+        #     for a lossy narrowing cast, so it is PINNED here rather than worked around.
+        #   verify_stored_procs (25) — 2.0's FillNamedDefaults inserts every KEYWORD_ONLY parameter that
+        #     HAS a default before any bind sees it, and our proc parameters all carry one because that
+        #     is the only thing making a 2.0 keyword-only parameter optional. So an omitted parameter was
+        #     indistinguishable from an explicit NULL and the EXEC named every one, defeating SQL Server's
+        #     OWN defaults. ⚠⚠ A WRONG ANSWER, not an error: same proc, same statement, 1.5.6 answered 60
+        #     and 2.0 answered NULL. The fix reads the PARSED call instead of the filled map.
+        #   verify_custom_functions (135) — the varargs candidate line that 2.0 renders differently.
+        : "${MIN_ASSERTIONS:=3586}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2
