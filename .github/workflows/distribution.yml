@@ -47,13 +47,17 @@ env:
   # ONE source of truth. These two must agree: the version stamped into the artifact's footer and the
   # wheel the smoke test loads it into. A mismatch is precisely what the compatibility gate rejects,
   # so deriving both from one variable removes the possibility of a confusing false failure.
-  # ⚠⚠ THIS TIER CANNOT RUN FOR THE 2.0 LINE YET, AND THE REASON IS NOT THIS FILE: there is no released
-  # DuckDB 2.0 PyPI wheel, so the smoke step below has nothing to load the artifact into. The other three
-  # workflows gained `v2.0-cyanoptera` in their branch lists; this one is TAG-triggered, so nothing fires
-  # until someone cuts a `v*` tag — and a `v0.1.0-duckdb2.0.0` tag would fail HERE, at the smoke step,
-  # with the artifact itself perfectly fine. Bump both values together when the 2.0 wheel ships.
-  DUCKDB_VERSION: v1.5.6
-  DUCKDB_WHEEL: 1.5.6
+  # ⚠⚠ THESE TWO ARE THE 2.0 LINE'S VALUES AND MUST NOT BE COPIED BACK TO v1.5-variegata, where they are
+  # v1.5.6 / 1.5.6. DuckDB 2.0.0 was released 2026-10-21 and the PyPI wheel exists, which is what makes this
+  # tier runnable for this branch at all — it was blocked until then, with the artifact perfectly fine and
+  # only the smoke step having nothing to load it into.
+  # ⚠⚠ AND `DUCKDB_VERSION` IS NOW THE ONLY WAY TO GET A RELEASE VERSION STRING. 2.0 stopped deriving the
+  # engine version from `git describe`: CMakeLists reads `scripts/ci/release_version.txt` ("2.0") and
+  # appends `-dev<commit count>` unless DUCKDB_EXPLICIT_VERSION is set — which is exactly what this value
+  # becomes, via the action's `override-git-describe`. A tagged checkout alone yields `v2.0.0-dev64553`,
+  # which a stock wheel rejects. (On 1.5 the tag was enough; that note in CLAUDE.md is 1.5-only now.)
+  DUCKDB_VERSION: v2.0.0
+  DUCKDB_WHEEL: 2.0.0
 
 defaults:
   run:
