@@ -490,9 +490,57 @@ PhysicalOperator &FabricatorCatalog::PlanInsert(ClientContext &context, Physical
 		all_types.push_back(col.Type());
 	}
 	if (op.column_index_map.empty()) {
-		// INSERT without a column list: all columns in table order.
-		target.columns = all_names;
-		target.column_types = all_types;
+		// ⚠⚠ AN EMPTY MAP NO LONGER MEANS "NO COLUMN LIST" ON 2.0, AND READING IT THAT WAY WRITES NULL
+		// OVER A SERVER-SIDE DEFAULT. `LogicalInsert::column_index_map` is marked *"Deprecated: only
+		// populated by older versions"* — 2.0's BINDER builds the defaults projection itself
+		// (`Binder::ResolveInputProjection`), so by the time a catalog plans the insert the child is always
+		// FULL WIDTH and an omitted column already carries whatever default DuckDB knows for it. For a
+		// foreign table that is NULL whenever we WITHHOLD the default, which is exactly the case the
+		// literals-only read-back exists to protect: a server `getdate()` must be applied BY THE SERVER.
+		//
+		// ⚠⚠ MEASURED on 1.5.6 vs 2.0, same statement, same table: `INSERT INTO t (i) VALUES (1)` with a
+		// `DEFAULT getdate()` column left the server's clock on 1.5.6 and wrote NULL on 2.0; an IDENTITY
+		// column failed outright (*"Column 'OrderID' does not allow DBNull.Value"*), which is the loud half
+		// of the same defect.
+		//
+		// ⚠ THE DISCRIMINATOR IS THE MOVED-FROM DEFAULT, and it is exact rather than heuristic:
+		// ResolveInputProjection does `std::move(insert.bound_defaults[storage_idx])` for a column the user
+		// OMITTED and passes it BY REFERENCE for a column the user NAMED. So a null entry here means
+		// "omitted" and nothing else. MEASURED on all three shapes:
+		//     INSERT t (i) VALUES (1)              -> defaults = [live, MOVED, MOVED]
+		//     INSERT t (i, nl, s) VALUES (2, …)    -> defaults = [live, live, live]
+		//     INSERT t VALUES (3, …)               -> defaults = [live, live, live]
+		// ⚠ It reads a moved-from unique_ptr, i.e. an upstream implementation detail rather than a
+		// contract — which is why `verify_keep_nulls` and `verify_identity` gate it directly, and why the
+		// fallback below is to send EVERY column (1.5's behaviour for a list-less insert), never to guess.
+		//
+		// ⚠ WHAT THIS DELIBERATELY DOES NOT COVER, because nothing can at this layer: an EXPLICIT
+		// `VALUES (…, DEFAULT)`. `Binder::ExpandDefaultExpression` rewrites that keyword in the PARSED tree
+		// — before any plan exists — into `ConstantExpression::FromValue(Value(type))`, a typed NULL, for
+		// any column whose default DuckDB does not know. It is then identical to a written NULL. ⚠ That is
+		// NOT a regression: measured identical on 1.5.6, and verify_keep_nulls already pins it as the one
+		// cell `mssql_keep_nulls` costs.
+		const auto physical_count = op.table.GetColumns().PhysicalColumnCount();
+		const bool defaults_usable = op.bound_defaults.size() == physical_count;
+		for (auto &col : op.table.GetColumns().Physical()) {
+			const auto logical = col.Logical().index;
+			if (defaults_usable && !op.bound_defaults[col.StorageOid()]) {
+				continue; // omitted by the statement: leave it out so the PROVIDER applies its own default
+			}
+			target.columns.push_back(all_names[logical]);
+			target.column_types.push_back(all_types[logical]);
+			target.source_columns.push_back(logical);
+		}
+		if (target.columns.size() == all_names.size()) {
+			target.source_columns.clear(); // identity: nothing to narrow
+		}
+		if (target.columns.empty()) {
+			// Every column omitted (INSERT ... DEFAULT VALUES): send the lot, as 1.5 did, rather than an
+			// empty column list the bulk cannot describe.
+			target.columns = all_names;
+			target.column_types = all_types;
+			target.source_columns.clear();
+		}
 	} else {
 		// Preserve the INSERT statement's column order (source index order).
 		vector<std::pair<idx_t, idx_t>> col_pairs;

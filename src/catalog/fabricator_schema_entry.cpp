@@ -1050,6 +1050,8 @@ static ScalarFunction BuildFabricatorScalarFunction(FabricatorHandle handle, con
 	sig.SetReturnType(return_type);
 	// 2.0: the name is a ctor argument (an Identifier), not an assignable field.
 	ScalarFunction fn(Identifier(fn_name), std::move(sig), exec);
+	// 2.0: a discovered provider UDF executes over the ABI and can surface any provider error.
+	fn.SetFallible();
 	fn.SetBindCallback(FabricatorScalarBind);
 	// Identity for the bind callback, which is a raw function pointer and cannot capture.
 	auto fn_info = make_shared_ptr<FabricatorScalarFunctionInfo>();
@@ -4488,6 +4490,26 @@ void FabricatorSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
 // ⚠ Only LITERAL defaults, with ONE cast unwrapped (a boolean parses as CAST(… AS BOOLEAN)). The "default"
 // key carries the literal's TEXT and a JSON null for DEFAULT NULL; a JSON string keeps an EMPTY-string
 // literal distinguishable from an absent key, which the old "-"/"b"+base64 arg2 spelling needed base64 for.
+//! The ONE column a `vector<Identifier> column_path` names, or a refusal.
+//! ⚠ 2.0 gave SET/DROP NOT NULL and SET DEFAULT a nested field PATH; our provider surface takes a single
+//! column, so a deeper path is refused BY NAME rather than flattened to its head — applying a nested
+//! constraint to the enclosing column would be a wrong DDL committed without complaint.
+static string SingleColumnOfPath(const vector<Identifier> &path, const char *what) {
+	if (path.size() != 1) {
+		string rendered;
+		for (idx_t i = 0; i < path.size(); i++) {
+			if (i) {
+				rendered += ".";
+			}
+			rendered += path[i].GetIdentifierName();
+		}
+		throw NotImplementedException(
+		    "fabricator: %s on a nested field (%s) is not supported — only a top-level column is", what,
+		    path.empty() ? "<empty path>" : rendered.c_str());
+	}
+	return path[0].GetIdentifierName();
+}
+
 static void CarryDefault(FabricatorAlterRequest &request, const ParsedExpression *expr) {
 	if (expr->GetExpressionType() == ExpressionType::OPERATOR_CAST) {
 		expr = &expr->Cast<CastExpression>().Child();
@@ -4663,52 +4685,18 @@ void FabricatorSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &inf
 		// column with a default. That is what lets the SQL Server side emit ONE form unconditionally.
 		if (ac.new_column.HasDefaultValue()) {
 			CarryDefault(request, &ac.new_column.DefaultValue());
-			// ⚠⚠ A NULL-ARRIVING DEFAULT IS REFUSED. The value really is absent from the AlterInfo we are
-			// handed — but NOT because DuckDB lost it, which is what this comment and the gate beside it used to
-			// claim. CORRECTED 2026-09-09 by reading transform_alter_table.cpp and then measuring.
-			//
-			// ⚠⚠ THE REAL MECHANISM: `ADD COLUMN … DEFAULT <expr>` where <expr> is not an
-			// ExpressionClass::CONSTANT is DELIBERATELY REWRITTEN by the parser into THREE statements —
-			//   1. ADD COLUMN col <type> DEFAULT NULL   ← the only one that reaches this code
-			//   2. UPDATE t SET col = <expr>            ← materialises the value for the existing rows
-			//   3. ALTER col SET DEFAULT <expr>         ← reinstates the real default
-			// so that a WAL replay cannot re-evaluate `random()`/`current_timestamp` into a different answer.
-			// `true`, `DATE '…'`, `TIMESTAMP '…'` and `'A'::BLOB` all take that path because DuckDB parses
-			// each as a CAST rather than a constant — its OWN table renders those defaults as `CAST('t' AS
-			// BOOLEAN)` / `CAST('2024-01-01' AS "DATE")`, which is the same line drawn twice.
-			//
-			// ⇒ what reaches us is statement 1 of 3, legitimately carrying DEFAULT NULL. Two measurements pin it:
-			// `ADD COLUMN IF NOT EXISTS c BOOLEAN DEFAULT true` skips the rewrite entirely (missing_ok takes the
-			// old path) and lands ((1)) on the server, and running the three statements BY HAND against a keyed
-			// table reproduces the correct end state — ((1)) plus the backfilled row.
-			//
-			// ⚠ SO WHY STILL REFUSE? Because at statement 1 an honest `DEFAULT NULL` and the rewrite's placeholder
-			// are the SAME NULL constant, and accepting it hands the caller a sequence that completes only
-			// sometimes: statement 2 is an UPDATE, and on a table with no PK/unique/identity our rowid requirement
-			// REFUSES it — measured — leaving the column added, unbackfilled and defaultless behind a statement
-			// that failed with an error about UPDATE. Refusing at statement 1 is a clean failure with no partial
-			// state, and every workaround the message names does work.
-			//
-			// ⚠ ONE RULE RATHER THAN A TYPE LIST, deliberately: enumerating "types whose literals get cast" could
-			// MISS one (UUID, ENUM, a nested type), and a missed type is a silent wrong answer.
-			//
-			// ⚠ The cost is only the NO-OP spelling. `DEFAULT NULL` on an added NULLABLE column asks for what the
-			// column already does, and DuckDB refuses `ADD COLUMN … NOT NULL DEFAULT` outright, so nothing
-			// expressible here needs it. SET DEFAULT carries every type correctly (measured: a boolean lands as
-			// ((1)), a date as (N'2024-01-01')) — it is statement 3 of that very rewrite.
-			if (request.default_is_null) {
-				throw NotImplementedException(
-				    "fabricator: ALTER TABLE ADD COLUMN \"%s\" with a DEFAULT that arrives NULL is refused. A "
-				    "default DuckDB does not parse as a plain constant (a boolean, a DATE/TIMESTAMP literal, a "
-				    "BLOB — anything it wraps in a CAST) is rewritten into three statements: add the column with "
-				    "DEFAULT NULL, UPDATE the existing rows, then SET DEFAULT. Only the first reaches this catalog, "
-				    "and it is indistinguishable from an honest DEFAULT NULL — while the UPDATE needs a primary "
-				    "key or unique index this table may not have, which would leave the column added and empty. Use "
-				    "ADD COLUMN IF NOT EXISTS \"%s\" … DEFAULT …, which skips the rewrite and carries the "
-				    "value; or write the literal as a STRING (DEFAULT '2024-01-01'); or add the column and then "
-				    "ALTER TABLE … ALTER COLUMN \"%s\" SET DEFAULT ….",
-				    ac.new_column.Name(), ac.new_column.Name(), ac.new_column.Name());
-			}
+			// ⚠⚠ THE NULL-ARRIVING-DEFAULT REFUSAL THAT STOOD HERE IS GONE — DuckDB 2.0 REMOVED ITS REASON.
+			// On 1.5 `ADD COLUMN … DEFAULT <expr>` where <expr> was not an ExpressionClass::CONSTANT was
+			// DELIBERATELY REWRITTEN by the parser into three statements — (1) ADD COLUMN DEFAULT NULL,
+			// (2) UPDATE the existing rows, (3) SET DEFAULT — and only (1) reached a foreign catalog, where an
+			// honest `DEFAULT NULL` and the rewrite's placeholder are the SAME NULL constant. Accepting it would
+			// have handed the caller a sequence that completes only sometimes, because (2) is an UPDATE and our
+			// rowid requirement refuses one on a table with no PK/unique/identity.
+			// ⚠ MEASURED ON 2.0, on a table with NO key at all: `ADD COLUMN g BOOLEAN DEFAULT true` lands with
+			// the real value — `column_default` reads 1, the pre-existing row reads true (so the backfill
+			// happened) and a later INSERT omitting the column reads true. A rewrite whose (2) we would refuse
+			// cannot have run, so the value now reaches us directly and a NULL constant means what it says.
+			// Gate: verify_alter_default §3, which asserts those three values where it used to assert a refusal.
 		}
 		break;
 	}
@@ -4759,21 +4747,31 @@ void FabricatorSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &inf
 		request.new_name = rf.new_name.GetIdentifierName();
 		break;
 	}
+	// ⚠⚠ SET/DROP NOT NULL AND SET DEFAULT ADDRESS A FIELD **PATH** ON 2.0, NOT A COLUMN — and that is a
+	// MODEL change rather than a rename, which is why these three do NOT override `AlterInfo::
+	// GetColumnName()`: it returns ONE Identifier and they now carry `vector<Identifier> column_path`, so
+	// a nested `ALTER ... ALTER COLUMN s.a SET NOT NULL` is expressible where it was not.
+	// ⚠ The inherited accessor therefore yields the base's EMPTY Identifier silently, which surfaces far
+	// away inside the PROVIDER as *"ALTER TABLE (set_not_null) is missing its 'column'"* — reading like our
+	// bug rather than an upstream move. Same class as the SetColumnCommentInfo case above.
+	// ⚠ A path LONGER than one element is REFUSED rather than flattened: our provider surface takes a
+	// single column, and silently applying a nested constraint to the top-level column would be a wrong
+	// DDL, not a missing feature.
 	case AlterTableType::SET_NOT_NULL: {
 		auto &sn = table_info.Cast<SetNotNullInfo>();
 		request.kind = "set_not_null";
-		request.column = sn.GetColumnName().GetIdentifierName();
+		request.column = SingleColumnOfPath(sn.column_path, "SET NOT NULL");
 		break;
 	}
 	case AlterTableType::DROP_NOT_NULL: {
 		auto &dn = table_info.Cast<DropNotNullInfo>();
 		request.kind = "drop_not_null";
-		request.column = dn.GetColumnName().GetIdentifierName();
+		request.column = SingleColumnOfPath(dn.column_path, "DROP NOT NULL");
 		break;
 	}
 	case AlterTableType::SET_DEFAULT: {
 		auto &sd = table_info.Cast<SetDefaultInfo>();
-		request.column = sd.GetColumnName().GetIdentifierName();
+		request.column = SingleColumnOfPath(sd.column_path, "SET/DROP DEFAULT");
 		if (!sd.expression) {
 			request.kind = "drop_default"; // DROP DEFAULT is SET DEFAULT with no expression
 			break;

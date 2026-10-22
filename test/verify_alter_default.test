@@ -123,23 +123,43 @@ SELECT f = '' AS is_empty, f IS NULL AS is_null FROM q.dbo.ad_a WHERE i = 1;
 # ⚠ ONE RULE, NOT A TYPE LIST: a list of "types whose literals get cast" would be enumerated from
 # measurements and could MISS one (UUID, ENUM, a nested type), and a missed type is silent again.
 
-statement error
+# ⚠⚠ DuckDB 2.0 FIXED THE LOSS, SO THESE ROWS ASSERT THE VALUE WHERE THEY USED TO ASSERT A REFUSAL.
+# MEASURED on 2.0: `ADD COLUMN g BOOLEAN DEFAULT true` arrives with the real value — `duckdb_columns()
+# .column_default` reads 1 (SQL Server's BIT), the BACKFILLED row reads true, and a later INSERT omitting
+# the column reads true as well. The refusal was never about our extraction; it existed because the value
+# was already gone by the time a FOREIGN catalog saw the AlterInfo.
+# ⚠ Asserting the three VALUES is strictly stronger than the refusal was: a value that silently reverted
+# to NULL — the defect this whole suite exists for — breaks a row here, which "it was refused" never could.
+
+statement ok
 ALTER TABLE q.dbo.ad_a ADD COLUMN g BOOLEAN DEFAULT true;
-----
-arrives NULL is refused
 
-statement error
+statement ok
 ALTER TABLE q.dbo.ad_a ADD COLUMN h TIMESTAMP DEFAULT TIMESTAMP '2024-01-01 10:00:00';
-----
-arrives NULL is refused
 
-# ⚠ Including the honest DEFAULT NULL, which is the cost of the one-rule form — and it is a NO-OP request: a
-# nullable column already defaults to NULL, and DuckDB refuses `ADD COLUMN … NOT NULL DEFAULT` outright, so
-# nothing expressible here needs the spelling.
-statement error
-ALTER TABLE q.dbo.ad_a ADD COLUMN k INTEGER DEFAULT NULL;
+# ⚠ The BACKFILL is the half a `column_default` read cannot see: the row already existed when the column
+# was added, so a declaration that landed in the catalog but not in the data would still pass a metadata
+# check.
+query TT
+SELECT g, h FROM q.dbo.ad_a WHERE i = 1;
 ----
-arrives NULL is refused
+true	2024-01-01 10:00:00
+
+# ⚠ … and the later INSERT is the other half: it exercises the stored DEFAULT rather than the backfill.
+# ⚠ i = 98, not 99: §6 below inserts 99 and reads it back, and this table has no key, so the row cannot
+# be deleted again (UPDATE/DELETE need a PK here — which is itself asserted elsewhere in this suite).
+statement ok
+INSERT INTO q.dbo.ad_a (i) VALUES (98);
+
+query TT
+SELECT g, h FROM q.dbo.ad_a WHERE i = 98;
+----
+true	2024-01-01 10:00:00
+
+# ⚠ An honest DEFAULT NULL is a NO-OP request and stays accepted: a nullable column already defaults to
+# NULL, and DuckDB refuses `ADD COLUMN … NOT NULL DEFAULT` outright, so nothing expressible here needs it.
+statement ok
+ALTER TABLE q.dbo.ad_a ADD COLUMN k INTEGER DEFAULT NULL;
 
 # ⚠ THE WORKAROUND THE MESSAGE NAMES, asserted so it is not folklore: the same date as a STRING literal is
 # carried. §1 already proved the value lands; this is the pair that makes the refusal actionable.

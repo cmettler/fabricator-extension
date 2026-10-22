@@ -21,6 +21,15 @@ struct FabricatorInsertTarget {
 	string table_name;
 	vector<string> columns;
 	vector<LogicalType> column_types;
+	//! The CHILD CHUNK column each of `columns` reads, when the two differ.
+	//! ⚠⚠ THEY DIFFER SINCE DuckDB 2.0, and an empty vector here means "identity" (the common case).
+	//! 2.0's binder hands every insert a FULL-WIDTH child — a column the statement omitted arrives
+	//! carrying whatever default DuckDB knows, which is NULL for a default we withhold. PlanInsert drops
+	//! those columns so the PROVIDER applies its own default (a server `getdate()`, an IDENTITY), and the
+	//! sink must then read the surviving columns from their ORIGINAL chunk positions rather than
+	//! positionally. Reading positionally is not a wrong value but a type error — measured as
+	//! *"Expected unified vector format of type INT32, but found type INT64"*, which is the loud kind.
+	vector<idx_t> source_columns;
 	//! INSERT ... RETURNING: the operator emits the inserted rows (all table
 	//! columns) via OUTPUT INSERTED.* instead of a single rows-affected count.
 	bool returning = false;

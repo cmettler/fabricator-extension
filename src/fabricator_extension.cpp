@@ -576,7 +576,15 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// COPY ... TO 'mssql://...' (FORMAT mssql)
 	RegisterFabricatorCopyFunction(loader);
 
-	loader.RegisterFunction(ScalarFunction("fabricator_version", {}, LogicalType::VARCHAR, FabricatorVersionFunction));
+	// ⚠⚠ 2.0 REQUIRES THIS OF ANY SCALAR THAT CAN THROW. `ThrowNonFallibleFunctionError` turns an
+	// ordinary runtime error from an unmarked function into an INTERNAL error — measured as
+	// *"Scalar function \"fabricator_invalidate_cache\" threw an execution error, but the function is
+	// not marked as fallible"*, which buries the real message (a bad regex) under a mechanism nobody
+	// asked about. Every scalar here crosses the ABI into a provider, so every one of them can throw.
+	// ⚠ The flag is not cosmetic: dictionary-expression caching, filter pushdown and TRY all read it.
+	ScalarFunction version_fn("fabricator_version", {}, LogicalType::VARCHAR, FabricatorVersionFunction);
+	version_fn.SetFallible();
+	loader.RegisterFunction(version_fn);
 	loader.RegisterFunction(
 	    ScalarFunction("fabricator_managed_dir", {}, LogicalType::VARCHAR, FabricatorManagedDirFunction));
 
@@ -659,6 +667,7 @@ query_fn.GetSignature().AddKeywordOnly("params", LogicalType::ANY, Value());
 		         {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::ANY}}) {
 			ScalarFunction exec_fn("fabricator_exec", signature, LogicalType::BIGINT, FabricatorExecFunction);
 			exec_fn.SetStability(FunctionStability::VOLATILE);
+			exec_fn.SetFallible(); // see the note on fabricator_version
 			exec_set.AddFunction(exec_fn);
 		}
 		loader.RegisterFunction(exec_set);
@@ -669,6 +678,7 @@ query_fn.GetSignature().AddKeywordOnly("params", LogicalType::ANY, Value());
 		ScalarFunction refresh_fn("fabricator_refresh_cache", {LogicalType::VARCHAR}, LogicalType::BOOLEAN,
 		                          FabricatorRefreshCacheFunction);
 		refresh_fn.SetStability(FunctionStability::VOLATILE);
+		refresh_fn.SetFallible(); // see the note on fabricator_version
 		loader.RegisterFunction(refresh_fn);
 	}
 
@@ -685,6 +695,7 @@ query_fn.GetSignature().AddKeywordOnly("params", LogicalType::ANY, Value());
 			ScalarFunction fn("fabricator_invalidate_cache", arg_types, LogicalType::BOOLEAN,
 			                  FabricatorRefreshCacheFunction);
 			fn.SetStability(FunctionStability::VOLATILE);
+			fn.SetFallible(); // see the note on fabricator_version
 			set.AddFunction(fn);
 		}
 		loader.RegisterFunction(set);

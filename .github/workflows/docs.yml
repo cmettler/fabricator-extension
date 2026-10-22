@@ -16,13 +16,13 @@ name: docs
 
 on:
   push:
-    branches: [v1.5-variegata]
+    branches: [v1.5-variegata, v2.0-cyanoptera]
     paths:
       - '**.md'
       - scripts/check-docs.sh
       - .github/workflows/docs.yml
   pull_request:
-    branches: [v1.5-variegata]
+    branches: [v1.5-variegata, v2.0-cyanoptera]
     paths:
       - '**.md'
       - scripts/check-docs.sh

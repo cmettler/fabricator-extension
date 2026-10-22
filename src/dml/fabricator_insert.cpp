@@ -108,8 +108,20 @@ SinkResultType FabricatorPhysicalInsert::Sink(ExecutionContext &context, DataChu
 	if (chunk.size() == 0) {
 		return SinkResultType::NEED_MORE_INPUT;
 	}
+	// ⚠ NARROW FIRST when the statement omitted columns — see FabricatorInsertTarget::source_columns.
+	// A reference-only projection: no data is copied, the vectors are shared with `chunk`.
+	DataChunk narrowed;
+	optional_ptr<DataChunk> source = chunk;
+	if (!target_.source_columns.empty()) {
+		narrowed.InitializeEmpty(target_.column_types);
+		for (idx_t i = 0; i < target_.source_columns.size(); i++) {
+			narrowed.data[i].Reference(chunk.data[target_.source_columns[i]]);
+		}
+		narrowed.SetCardinality(chunk.size());
+		source = narrowed;
+	}
 	ArrowAppender appender(target_.column_types, chunk.size(), gstate.properties, gstate.extension_types);
-	appender.Append(chunk, 0, chunk.size(), chunk.size());
+	appender.Append(*source, 0, source->size(), source->size());
 	ArrowArray array = appender.Finalize();
 	if (target_.returning) {
 		// RETURNING accumulates the rows; the OUTPUT result is read back at Finalize.

@@ -28,7 +28,7 @@ name: extension
 
 on:
   push:
-    branches: [v1.5-variegata]
+    branches: [v1.5-variegata, v2.0-cyanoptera]
     paths:
       - src/**
       - test/**
@@ -51,7 +51,7 @@ on:
       - .github/workflows/extension.yml
       - .github/actions/build-extension/**
   pull_request:
-    branches: [v1.5-variegata]
+    branches: [v1.5-variegata, v2.0-cyanoptera]
     paths:
       - src/**
       - test/**

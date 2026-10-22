@@ -38,7 +38,7 @@ on:
   # path filter that misses the very change the gate exists to guard. Tier 0 is two minutes, so
   # running it for any Bridge edit is the cheap side of that trade.
   push:
-    branches: [v1.5-variegata]
+    branches: [v1.5-variegata, v2.0-cyanoptera]
     paths:
       - dotnet/Fabricator.Installer.Core/**
       - dotnet/Fabricator.Installer.Core.Tests/**
@@ -47,7 +47,7 @@ on:
       - dotnet/Directory.Build.props
       - .github/workflows/installer-core.yml
   pull_request:
-    branches: [v1.5-variegata]
+    branches: [v1.5-variegata, v2.0-cyanoptera]
     paths:
       - dotnet/Fabricator.Installer.Core/**
       - dotnet/Fabricator.Installer.Core.Tests/**

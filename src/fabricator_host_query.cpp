@@ -1217,6 +1217,7 @@ void RegisterHostQuery(ExtensionLoader &loader) {
 	ScalarFunction exec_scalar("fabricator_host_exec", {LogicalType::VARCHAR}, LogicalType::BIGINT,
 	                           HostExecScalarFunction);
 	exec_scalar.SetStability(FunctionStability::VOLATILE);
+	exec_scalar.SetFallible(); // 2.0: an unmarked throw becomes an INTERNAL error (fabricator_extension.cpp)
 	loader.RegisterFunction(exec_scalar);
 
 	TableFunction scan("fabricator_scan", {LogicalType::VARCHAR}, fabricator::ArrowStreamScan, NamedScanBind,
