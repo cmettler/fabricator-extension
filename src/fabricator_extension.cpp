@@ -322,10 +322,51 @@ static unique_ptr<FunctionData> TestScanBind(ClientContext &context, TableFuncti
 //
 // ⚠ No Arrow type extensions are registered for the appender ({}): a parameter is a scalar the provider
 // binds, and an extension-typed one (e.g. VARIANT) has no meaning as a provider parameter.
-static unique_ptr<fabricator::ArrowProducer> MakeParamsStream(const Value &params, ClientProperties props) {
-	if (params.IsNull()) {
+//! Replaces every SQLNULL leaf of `type` with INTEGER, at any depth, or returns it unchanged.
+//! ⚠⚠ AN UNTYPED NULL CANNOT CROSS THE C DATA INTERFACE ON 2.0. 1.5 resolved `NULL` to INTEGER at BIND;
+//! 2.0 keeps the type `"null"`, which exports as a true Arrow null array — and DuckDB's `ArrowNullData`
+//! leaves `null_count` at 0 where the Arrow spec says a null array's null_count IS its length, so
+//! Apache.Arrow refuses the batch with *"Length must equal null count (Parameter 'data')"*. MEASURED here
+//! as `params := {'v': NULL}` killing `fabricator_query` outright. Same defect and same remedy as
+//! PromoteNullColumns on the host-query result path (docs/duckdb-upstream-issues.md §9); INTEGER is not an
+//! arbitrary pick — it is exactly the type 1.5 gave such a value, so the provider sees what it always saw.
+//! ⚠ Nothing is lost: the value is NULL by construction, so only its DECLARED type changes.
+static LogicalType PromoteNullLeaves(const LogicalType &type) {
+	switch (type.id()) {
+	case LogicalTypeId::SQLNULL:
+		return LogicalType::INTEGER;
+	case LogicalTypeId::STRUCT: {
+		child_list_t<LogicalType> children;
+		bool changed = false;
+		for (auto &c : StructType::GetChildTypes(type)) {
+			auto promoted = PromoteNullLeaves(c.second);
+			changed = changed || promoted != c.second;
+			children.emplace_back(c.first, std::move(promoted));
+		}
+		return changed ? LogicalType::STRUCT(std::move(children)) : type;
+	}
+	case LogicalTypeId::LIST: {
+		auto child = PromoteNullLeaves(ListType::GetChildType(type));
+		return child == ListType::GetChildType(type) ? type : LogicalType::LIST(std::move(child));
+	}
+	case LogicalTypeId::MAP: {
+		auto k = PromoteNullLeaves(MapType::KeyType(type));
+		auto v = PromoteNullLeaves(MapType::ValueType(type));
+		return k == MapType::KeyType(type) && v == MapType::ValueType(type)
+		           ? type
+		           : LogicalType::MAP(std::move(k), std::move(v));
+	}
+	default:
+		return type;
+	}
+}
+
+static unique_ptr<fabricator::ArrowProducer> MakeParamsStream(const Value &params_in, ClientProperties props) {
+	if (params_in.IsNull()) {
 		return nullptr;
 	}
+	auto promoted_type = PromoteNullLeaves(params_in.type());
+	const Value params = promoted_type == params_in.type() ? params_in : params_in.DefaultCastAs(promoted_type);
 	vector<LogicalType> types {params.type()};
 	vector<string> names {"params"};
 	DataChunk chunk;

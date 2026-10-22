@@ -58,6 +58,17 @@ SELECT total FROM spdb.dbo.usp_opt(base := 10, bonus := 5);
 ----
 15
 
+# ⚠⚠ AN EXPLICIT NULL IS NOT THE SAME AS OMITTING — and this row is what proves the discriminator reads
+# the CALL rather than the VALUE. DuckDB 2.0's `FillNamedDefaults` puts every optional keyword parameter
+# into `named_parameters` before any bind sees it, so an omitted parameter and `bonus := NULL` arrive as
+# the same typed NULL; the bind therefore reads the PARSED argument list (2.0's `FunctionArgument` carries
+# its own name) to see which names the caller actually wrote. A build that instead skipped NULL-VALUED
+# parameters would pass the row above and answer 60 here.
+query I
+SELECT total FROM spdb.dbo.usp_opt(base := 10, bonus := NULL);
+----
+NULL
+
 # OUTPUT params are returned as flat columns (no struct nesting) plus the integer RETURN
 # value; the proc's own result set, if any, is ignored. Inputs are still named.
 query III

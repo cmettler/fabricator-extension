@@ -66,6 +66,9 @@
 #include "duckdb/parser/parsed_data/drop_info.hpp"
 #include "duckdb/planner/parsed_data/bound_create_table_info.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
+#include "duckdb/parser/expression/function_expression.hpp"
+#include "duckdb/parser/tableref/table_function_ref.hpp"
+#include "duckdb/common/case_insensitive_map.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 
 #include <atomic>
@@ -2015,8 +2018,37 @@ unique_ptr<FunctionData> FabricatorTableFunctionBind(ClientContext &context, Tab
 	vector<LogicalType> arg_types;
 	vector<string> arg_names;
 	vector<Value> arg_values;
+	// ⚠⚠ WHICH NAMES THE CALL ACTUALLY WROTE — AND ON 2.0 `named_parameters` NO LONGER ANSWERS THAT.
+	// `FunctionSignature::FillNamedDefaults` inserts every KEYWORD_ONLY parameter that HAS A DEFAULT into
+	// the map before any bind sees it, and our proc parameters all carry a `Value()` default because that
+	// is the only thing that makes a 2.0 keyword-only parameter optional (there is no separate flag —
+	// `HasDefaultValue()` IS the optionality test in FunctionBinder). So an omitted parameter arrives
+	// looking exactly like one the caller passed as NULL.
+	// ⚠⚠ THE CONSEQUENCE WAS A WRONG ANSWER, NOT AN ERROR: the proc EXEC named every parameter, so SQL
+	// Server could not apply its OWN default. MEASURED on the same statement, same proc
+	// (`@bonus INT = 50`): 1.5.6 emitted `EXEC [dbo].[usp_opt] @base = @p0` and answered 60; 2.0 emitted
+	// `@base = @p0, @bonus = @p1` and answered NULL.
+	// ⇒ read the PARSED call instead. 2.0 gives a FunctionExpression a `vector<FunctionArgument>` where
+	// each argument carries its own `name`, so `f(base := 10)` is distinguishable from a filled default by
+	// construction — no value comparison, so an EXPLICIT `bonus := NULL` still passes NULL.
+	// ⚠ When the parsed form is not reachable (a shape that is not a FunctionExpression) the set stays
+	// UNKNOWN and every entry is emitted, which is 2.0's current behaviour rather than a guess.
+	bool call_names_known = false;
+	case_insensitive_set_t call_names;
+	if (is_proc && input.ref.function &&
+	    input.ref.function->GetExpressionClass() == ExpressionClass::FUNCTION) {
+		call_names_known = true;
+		for (auto &arg : input.ref.function->Cast<FunctionExpression>().GetArguments()) {
+			if (arg.HasName()) {
+				call_names.insert(arg.GetName().GetIdentifierName());
+			}
+		}
+	}
 	if (is_proc) {
 		for (auto &kv : input.named_parameters) {
+			if (call_names_known && !call_names.count(kv.first.GetIdentifierName())) {
+				continue; // DuckDB filled this default; the caller never wrote it — let the SERVER default win
+			}
 			LogicalType declared = kv.second.type();
 			for (idx_t i = 0; i < info.arg_names.size(); i++) {
 				if (StringUtil::CIEquals(info.arg_names[i], kv.first.GetIdentifierName())) {

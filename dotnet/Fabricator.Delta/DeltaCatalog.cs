@@ -477,13 +477,21 @@ public sealed class DeltaCatalog : IProviderCatalog
     /// client-side existence CHECK, so it races. A capability probe cannot distinguish those; only a
     /// concurrent run can.</para>
     ///
-    /// <para>Gated on READ_WRITE specifically, not on "not read-only": a remote root under
-    /// <c>AUTOMATIC</c> may be bumped to read-only by DuckDB, and warning about a catalog that will never
-    /// write is how a real warning gets trained away. Asking for write access is the deliberate act.</para>
+    /// <para><b>⚠⚠ GATED ON "NOT READ-ONLY", AND IT USED TO BE GATED ON READ_WRITE ALONE — DuckDB 2.0
+    /// REMOVED THE REASON FOR THE NARROWER TEST AND TURNED IT INTO A HOLE.</b> On 1.5 a remote <c>s3://</c>
+    /// attach with no <c>READ_ONLY</c> clause was BUMPED to read-only by DuckDB, so an AUTOMATIC catalog
+    /// could never reach the unguarded commit path and warning about it would have trained the warning
+    /// away for nothing. MEASURED on both builds, same ATTACH, reading
+    /// <c>duckdb_databases().readonly</c>: 1.5.6 reports <c>true</c>, 2.0 reports <c>false</c>.
+    /// ⇒ on 2.0 the plainest spelling of all — <c>ATTACH 's3://…' AS x (TYPE fabricator, PROVIDER
+    /// 'delta')</c> — is a WRITABLE, secret-less S3 catalog, which is exactly the configuration that loses
+    /// commits in silence; under the old gate it was also the one spelling that got no warning.
+    /// ⚠ READ_ONLY is still exempt, and that is the whole of the original argument that survives: a
+    /// catalog that cannot write cannot reach the commit path.</para>
     /// </summary>
     private void WarnIfUnguardedRemoteWrite(string? accessMode)
     {
-        if (!string.Equals(accessMode, "read_write", System.StringComparison.OrdinalIgnoreCase))
+        if (string.Equals(accessMode, "read_only", System.StringComparison.OrdinalIgnoreCase))
         {
             return;
         }

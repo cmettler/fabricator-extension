@@ -58,14 +58,36 @@ CREATE TABLE gtlake.main.ns_direct AS SELECT id, dt2_7 FROM db.dbo.gt;
 cannot be written to Delta
 
 # The documented workaround, and the reason the refusal is not merely obstructive: cast to a microsecond
-# TIMESTAMP and the 7th digit is dropped BY THE CAST, where the caller can see it happen.
+# TIMESTAMP and the 7th digit goes BY THE CAST, where the caller can see it happen.
+#
+# ⚠⚠ SINCE DuckDB 2.0 THAT CAST ROUNDS WHERE IT USED TO TRUNCATE, AND THIS ROW IS WHAT FOUND IT.
+# MEASURED on both builds with the same literal, so it is upstream and not ours —
+# CAST(TIMESTAMP_NS '…' AS TIMESTAMP):
+#   .1234564 → .123456 on both           (rounds down, indistinguishable from truncation)
+#   .1234565 → .123456 on 1.5.6, .123457 on 2.0
+#   .1234575 → .123457 on 1.5.6, .123458 on 2.0   (so it is half-AWAY-FROM-ZERO, not banker's)
+#   .9999999 → .999999 on 1.5.6, but 12:34:57 on 2.0 — THE CARRY REACHES THE SECONDS FIELD
+# ⇒ the workaround still loses exactly the 7th digit and still does it visibly, which is all the
+# refusal above promises; what a caller must no longer assume is that the surviving 6 digits are a
+# PREFIX of the original. Rounding is the defensible behaviour for a lossy narrowing cast, so this is
+# recorded rather than worked around — and the carry case is the one worth knowing, because a value a
+# microsecond short of the next second comes back AS the next second.
 statement ok
 CREATE TABLE gtlake.main.us_cast AS SELECT id, CAST(dt2_7 AS TIMESTAMP) AS ts FROM db.dbo.gt;
 
 query IT
 SELECT id, ts::VARCHAR FROM gtlake.main.us_cast;
 ----
-1	2024-01-02 12:34:56.123456
+1	2024-01-02 12:34:56.123457
+
+# ⚠ The two cases the fixture cannot reach — pinned as plain casts so a silent return to truncation
+# (or a switch to banker's rounding) is caught here rather than in whatever reads such a table next.
+# No server round trip: the claim is about DuckDB's cast, which is where the loss happens.
+query TT
+SELECT CAST(TIMESTAMP_NS '2024-01-02 12:34:56.1234565' AS TIMESTAMP)::VARCHAR,
+       CAST(TIMESTAMP_NS '2024-01-02 12:34:56.9999999' AS TIMESTAMP)::VARCHAR;
+----
+2024-01-02 12:34:56.123457	2024-01-02 12:34:57
 
 statement ok
 DETACH gtlake;

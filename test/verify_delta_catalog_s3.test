@@ -523,12 +523,14 @@ DETACH rns;
 # every single-writer test — only the COMMIT guard is missing, because the
 # credential marker rides on the secret the ATTACH NAMES.
 #
-# Gated on READ_WRITE and not on "not read-only" ON PURPOSE, and the third
-# attach below is why that is not merely conservative: DuckDB BUMPS a remote
-# s3:// attach to read-only under AUTOMATIC (measured — a CREATE against it
-# fails with "attached in read-only mode"), so an AUTOMATIC catalog can never
-# reach the unguarded commit path and warning about it would train the warning
-# away for nothing.
+# ⚠⚠ GATED ON "NOT READ-ONLY" SINCE DuckDB 2.0, AND IT USED TO BE GATED ON
+# READ_WRITE ALONE. The narrower gate rested on DuckDB BUMPING a remote s3://
+# attach to read-only under AUTOMATIC, which made an AUTOMATIC catalog unable
+# to reach the unguarded commit path. 2.0 DROPPED THAT BUMP — measured on both
+# builds with the same ATTACH, reading duckdb_databases().readonly: 1.5.6 says
+# true, 2.0 says false. So the plainest spelling of all is now a WRITABLE,
+# secret-less S3 catalog, and under the old gate it was the one spelling that
+# got NO warning. Two warnings are owed here now, not one.
 # ----------------------------------------------------------------------------
 
 statement ok
@@ -541,30 +543,55 @@ ATTACH 's3://fabricator/warnprobe' AS wunguarded (TYPE fabricator, PROVIDER '${D
 statement ok
 ATTACH 's3://fabricator/warnprobe' AS wguarded (TYPE fabricator, PROVIDER '${DELTA_PROVIDER}', SECRET minio_s3, READ_ONLY false);
 
-# AUTOMATIC (no READ_ONLY clause) — DuckDB makes it read-only, so no warning is owed
+# AUTOMATIC (no READ_ONLY clause) — WRITABLE on 2.0, so a warning IS owed
 statement ok
 ATTACH 's3://fabricator/warnprobe' AS wauto (TYPE fabricator, PROVIDER '${DELTA_PROVIDER}');
 
-# exactly ONE warning, naming the remedy
+# TWO warnings: the explicit READ_WRITE root and the AUTOMATIC one. The guarded root stays silent, which
+# is what keeps this from being "warn about everything".
 query I
 SELECT count(*) FROM duckdb_logs
 WHERE message LIKE '%s3 root attached READ_WRITE with no named SECRET%'
   AND message LIKE '%Add SECRET <name> to the ATTACH%';
 ----
-1
+2
 
-# and it named the UNGUARDED root, not one of the other two
+# ⚠ and it names the ROOT in each case, which is what makes a warning actionable. TWO now (the explicit
+# READ_WRITE attach and the AUTOMATIC one); the GUARDED attach on the same root stays silent, so this
+# count is also the control that the gate keys on the missing SECRET and not merely on the scheme.
 query I
 SELECT count(*) FROM duckdb_logs
 WHERE message LIKE '%delta attach s3://fabricator/warnprobe%no named SECRET%';
 ----
-1
+2
 
-# the AUTOMATIC attach really is read-only — the reason it is exempt
-statement error
-CREATE TABLE wauto.main.nope (id INTEGER);
+# ⚠ … and the AUTOMATIC attach really IS writable on 2.0, which is the measurement the gate change rests
+# on. The row that stood here asserted the opposite ("read-only mode") and was the first thing to notice
+# the bump was gone. A READ_ONLY attach is still exempt — the next rows are that control.
+query I
+SELECT readonly FROM duckdb_databases() WHERE database_name = 'wauto';
 ----
-read-only mode
+false
+
+statement ok
+ATTACH 's3://fabricator/warnprobe' AS wro (TYPE fabricator, PROVIDER '${DELTA_PROVIDER}', READ_ONLY true);
+
+# still TWO — the read-only attach adds none, which is the whole of the original exemption that survives.
+#
+# ⚠⚠ THE `delta attach %` PREFIX IS LOAD-BEARING, NOT TIDINESS: at debug level `duckdb_logs` also records
+# the STATEMENTS, so a LIKE pattern that quotes the message it hunts for MATCHES ITS OWN QUERY TEXT once an
+# earlier assertion has run with the same literal. Measured: this row read 3 and the third "warning" was
+# the previous assertion's SQL. The two rows above are safe only by accident of ordering — they run before
+# any query carrying that literal.
+query I
+SELECT count(*) FROM duckdb_logs
+WHERE message LIKE 'delta attach %'
+  AND message LIKE '%s3 root attached READ_WRITE with no named SECRET%';
+----
+2
+
+statement ok
+DETACH wro;
 
 statement ok
 DETACH wunguarded;

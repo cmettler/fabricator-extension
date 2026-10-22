@@ -287,10 +287,15 @@ SELECT cdb.dbo.cf_va_sum(1, 2::SMALLINT, 3::TINYINT);
 # …and a cast DuckDB will NOT make implicitly is refused at BIND, exactly as for a declared parameter. This
 # is the assertion that keeps "a concrete tail" from being read as "anything, coerced" — the ANY tail is
 # what accepts anything, and the two are different declarations.
+#
+# ⚠ DuckDB 2.0 RENDERS THE VARIADIC CANDIDATE PYTHON-STYLE: `cf_va_sum(*args BIGINT, **kwargs BIGINT)`
+# where 1.5.6 printed `cf_va_sum([BIGINT...])`. Wording only — the REFUSAL, which is what this row is for,
+# is unchanged on both. The regex still pins the declared tail TYPE, so a build that widened the tail to
+# ANY (the mistake the row guards against) would still break it.
 statement error
 SELECT cdb.dbo.cf_va_sum(1, 3.0);
 ----
-<REGEX>:.*cf_va_sum\(\[BIGINT\.\.\.\]\).*
+<REGEX>:.*cf_va_sum\(\*args BIGINT.*
 
 # A tail argument may be a column, evaluated per row.
 query I
