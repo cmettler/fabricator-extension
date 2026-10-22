@@ -487,15 +487,23 @@ internal static class DeltaWriter
     /// the Arrow C data interface to DuckDB — read as 128-bit over the 4/8-byte buffer ⇒ corruption; the
     /// widening is lossless, EW's decoders sign-extend). An optional row-group <paramref name="filter"/>
     /// (+ bloom probing) composes on top.</summary>
-    internal static ParquetReadOptions ReadOptions(EngineeredWood.Expressions.Predicate? filter = null) =>
-        filter is null
-            ? ParquetReadOptions.Default with { DecimalOutput = DecimalOutputKind.Decimal128 }
-            : new ParquetReadOptions
-            {
-                Filter = filter,
-                FilterUseBloomFilters = true,
-                DecimalOutput = DecimalOutputKind.Decimal128,
-            };
+    /// <para>⚠⚠ THE PREDICATE DOES NOT BELONG HERE, AND SINCE EW 987a0ce SETTING IT THROWS. A Filter on the
+    /// TABLE's options would apply to EVERY read of a data file, compaction and DML rewrites included — i.e.
+    /// a rewrite would silently drop the rows the predicate excludes. EW turned that footgun into a refusal
+    /// (<c>DeltaTable.cs</c>: "it would apply to every read of a data file"), which is what broke sixteen
+    /// hermetic suites on the bump. The predicate now rides <c>DeltaReadOptions.Filter</c> on the READ, where
+    /// it prunes files AND row groups; every call site here already passes it there.</para>
+    /// <para>⚠ <c>FilterUseBloomFilters</c> STAYS, and is now set UNCONDITIONALLY — it is the policy knob,
+    /// not the predicate: <c>DeltaReadOptions</c>'s own doc says its Filter probes bloom filters "when
+    /// ParquetReadOptions.FilterUseBloomFilters is set". It defaults to FALSE, so leaving it off the no-filter
+    /// branch (where it used to live) would have silently retired bloom refinement — a pruning regression with
+    /// no message. With no filter there is nothing to probe, so setting it always costs nothing.</para>
+    internal static ParquetReadOptions ReadOptions() =>
+        ParquetReadOptions.Default with
+        {
+            FilterUseBloomFilters = true,
+            DecimalOutput = DecimalOutputKind.Decimal128,
+        };
 
     internal static DeltaTableOptions Options(DeltaWriteSpec? spec = null,
                                               IDataFileWriter? dataFileWriter = null,

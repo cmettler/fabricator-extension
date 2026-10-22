@@ -790,8 +790,11 @@ internal static class DeltaReader
     /// Streams the Delta table at <paramref name="path"/> lazily (one <see cref="RecordBatch"/> at a time, no
     /// materialization). <paramref name="columns"/> (null =&gt; all) is the projection — engineered-wood reads
     /// only those columns. <paramref name="filter"/> (null =&gt; none) is pushed for <b>file + row-group
-    /// skipping</b>: it drives both the Delta file pruner (<c>ReadAllAsync(columns, filter)</c>) and the
-    /// per-file Parquet row-group/stats pruner (via <c>ParquetReadOptions.Filter</c>). engineered-wood does not
+    /// skipping</b>: it rides <c>DeltaReadOptions.Filter</c> (which <c>ReadAllAsync(columns, filter)</c> fills
+    /// for us), and that one predicate drives BOTH the Delta file pruner and the per-file Parquet
+    /// row-group/stats pruner. ⚠ It used to be passed a second time as
+    /// <c>DeltaTableOptions.ParquetReadOptions.Filter</c>; EW now REFUSES that, because a filter on the table's
+    /// options applies to every data-file read including compaction and DML rewrites. engineered-wood does not
     /// re-apply the predicate per row, so the result is a superset — DuckDB re-applies above the scan.
     /// <paramref name="opener"/> (the operator's ClientContext) must stay valid for the whole scan; it does —
     /// the ClientContext lives for the whole table-function execution.
@@ -801,7 +804,7 @@ internal static class DeltaReader
     {
         var fs = TableFileSystems.Create(opener, path);
         // Row-group pruning (bloom-refined) + the Decimal128 widening ride the shared read options.
-        var options = DeltaWriter.Options() with { ParquetReadOptions = DeltaWriter.ReadOptions(filter) };
+        var options = DeltaWriter.Options();
         return StreamImpl(opener, fs, options, columns, filter, ct);
     }
 
@@ -891,7 +894,7 @@ internal static class DeltaReader
     {
         var fs = TableFileSystems.Create(opener, path);
         // Row-group pruning (bloom-refined) + the Decimal128 widening ride the shared read options.
-        var options = DeltaWriter.Options() with { ParquetReadOptions = DeltaWriter.ReadOptions(filter) };
+        var options = DeltaWriter.Options();
         return StreamWithRowIdsImpl(opener, fs, options, columns, filter, ct);
     }
 
@@ -1469,7 +1472,7 @@ internal static class DeltaReader
     {
         var fs = TableFileSystems.Create(opener, path);
         // Row-group pruning (bloom-refined) + the Decimal128 widening ride the shared read options.
-        var options = DeltaWriter.Options() with { ParquetReadOptions = DeltaWriter.ReadOptions(filter) };
+        var options = DeltaWriter.Options();
         return StreamAtImpl(opener, fs, options, columns, filter, unit, value, ct);
     }
 
@@ -1779,7 +1782,7 @@ internal static class DeltaReader
     {
         var fs = TableFileSystems.Create(opener, path);
         // Row-group pruning (bloom-refined) + the Decimal128 widening ride the shared read options.
-        var options = DeltaWriter.Options() with { ParquetReadOptions = DeltaWriter.ReadOptions(filter) };
+        var options = DeltaWriter.Options();
         return StreamWithRowIdsAtImpl(opener, fs, options, columns, filter, unit, value, ct);
     }
 
