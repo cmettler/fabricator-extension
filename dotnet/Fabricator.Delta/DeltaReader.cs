@@ -680,7 +680,7 @@ internal static class DeltaReader
         {
             // Variant fields cross the C ABI in the ew.variant_transport LEAF-binary transport form (EW
             // master advertises the canonical VariantType) — align the bind schema with the batches.
-            return VariantMarker.ToTransportSchema(open.Table.ArrowSchema);
+            return open.Table.ArrowSchema;
         }
         finally
         {
@@ -751,7 +751,7 @@ internal static class DeltaReader
             bool rowTracking = cfg is not null
                 && cfg.TryGetValue("delta.enableRowTracking", out var v)
                 && string.Equals(v, "true", System.StringComparison.OrdinalIgnoreCase);
-            return (VariantMarker.ToTransportSchema(open.Table.ArrowSchema), rowTracking, metadata.Description);
+            return (open.Table.ArrowSchema, rowTracking, metadata.Description);
         }
         finally
         {
@@ -778,7 +778,7 @@ internal static class DeltaReader
         var (open, shared) = await OpenForReadAsync(opener, path, bound).ConfigureAwait(false);
         try
         {
-            return (VariantMarker.ToTransportSchema(open.Table.ArrowSchema), open.Table.CurrentSnapshot.Version);
+            return (open.Table.ArrowSchema, open.Table.CurrentSnapshot.Version);
         }
         finally
         {
@@ -836,7 +836,7 @@ internal static class DeltaReader
                     : ArrowColumnMappingRename.RenameBatch(batch, nested, toPhysical: false);
                 // Canonical VariantArray -> the ew.variant_transport leaf blob the C ABI carries. EW emits
                 // canonical now (VariantColumnCoercion, UNPATCHED); flattening at the boundary is ours.
-                yield return VariantTransport.ToTransport(mapped);
+                yield return mapped; // canonical — DuckDB 2.0 imports arrow.parquet.variant itself
             }
         }
         finally
@@ -915,7 +915,7 @@ internal static class DeltaReader
                 var mapped = nested is null
                     ? batch
                     : ArrowColumnMappingRename.RenameBatch(batch, nested, toPhysical: false);
-                yield return VariantTransport.ToTransport(mapped); // canonical -> ew.variant_transport blob
+                yield return mapped; // canonical — DuckDB 2.0 imports arrow.parquet.variant itself
             }
         }
         finally
@@ -1245,10 +1245,10 @@ internal static class DeltaReader
             // so a canonical read-back column would not match its replacement.
             if (metadata == DeltaRowMetadata.None)
             {
-                yield return VariantTransport.ToTransport(batch);
+                yield return batch;
                 continue;
             }
-            yield return VariantTransport.ToTransport(StripMetadata(batch, rowIdsOut, sourceTrackingOut));
+            yield return StripMetadata(batch, rowIdsOut, sourceTrackingOut);
         }
     }
 
@@ -1452,7 +1452,7 @@ internal static class DeltaReader
         try
         {
             var snap = await ResolveSnapshotAsync(open.Table, unit, value, default).ConfigureAwait(false);
-            return VariantMarker.ToTransportSchema(snap.ArrowSchema);
+            return snap.ArrowSchema;
         }
         finally
         {
@@ -1490,7 +1490,7 @@ internal static class DeltaReader
                 var mapped = nested is null
                     ? batch
                     : ArrowColumnMappingRename.RenameBatch(batch, nested, toPhysical: false);
-                yield return VariantTransport.ToTransport(mapped);
+                yield return mapped; // canonical — DuckDB 2.0 imports arrow.parquet.variant itself
             }
         }
         finally
@@ -1805,7 +1805,7 @@ internal static class DeltaReader
                 var mapped = nested is null
                     ? batch
                     : ArrowColumnMappingRename.RenameBatch(batch, nested, toPhysical: false);
-                yield return VariantTransport.ToTransport(mapped); // canonical -> ew.variant_transport blob
+                yield return mapped; // canonical — DuckDB 2.0 imports arrow.parquet.variant itself
             }
         }
         finally

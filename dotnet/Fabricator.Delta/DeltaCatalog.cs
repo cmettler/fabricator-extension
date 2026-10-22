@@ -3422,9 +3422,10 @@ public sealed class DeltaCatalog : IProviderCatalog
         pending.PendingMetadata = change.Metadata;
         pending.PendingProtocol = MergeProtocol(pending.PendingProtocol, change.ProtocolUpgrade);
         pending.PendingDeltaSchema = change.NewSchema;
-        // Transport form: the overlay serves bind schemas, which cross the C ABI (variant = tagged binary).
-        pending.PendingArrowSchema = VariantMarker.ToTransportSchema(
-            EngineeredWood.DeltaLake.Schema.SchemaConverter.ToArrowSchema(change.NewSchema));
+        // ⚠ No transport rewrite since DuckDB 2.0: EW's VariantType exports over the C ABI as the
+        // canonical arrow.parquet.variant struct, which 2.0 imports as VARIANT on its own.
+        pending.PendingArrowSchema =
+            EngineeredWood.DeltaLake.Schema.SchemaConverter.ToArrowSchema(change.NewSchema);
         pending.HasAlter = true;
         pending.AlterOps.Add(op);
     }
@@ -5093,6 +5094,18 @@ public sealed class DeltaCatalog : IProviderCatalog
             // ⚠ The SCHEMA field takes the ARRAY's own type, not the target's, so the batch cannot describe
             // itself differently from what it holds.
             var incoming = updates.Values!.Column(j);
+            // ⚠ VARIANT: the SET value arrives as the CANONICAL STORAGE STRUCT, because Apache.Arrow's C#
+            // importer does not materialise an extension type from the field metadata — while the target
+            // field is Apache.Arrow's VariantType. Wrap rather than box-and-rebuild: the layout already IS
+            // the storage, and the boxed scalar ladder below has no VARIANT arm at all (it refused with
+            // "unsupported SET column type Extension"). The field stays VariantType, so the batch still
+            // describes itself as what it holds.
+            if (field.DataType is VariantType vt)
+            {
+                updArrays.Add(incoming as VariantArray ?? new VariantArray(incoming));
+                updFields.Add(new Field(field.Name, vt, nullable: true, field.Metadata));
+                continue;
+            }
             if (ArrowTypeCompare.SameType(incoming.Data.DataType, field.DataType, namesMatter: false))
             {
                 updArrays.Add(incoming);

@@ -38,7 +38,6 @@ set(EXTENSION_SOURCES
     src/fabricator_optimizer.cpp
     src/fabricator/clr_host.cpp
     src/fabricator/fabricator_onelake_fs.cpp
-    src/fabricator/fabricator_variant.cpp
     src/fabricator/arrow_ingest.cpp
     src/fabricator/scan_wait.cpp
     src/fabricator/arrow_produce.cpp

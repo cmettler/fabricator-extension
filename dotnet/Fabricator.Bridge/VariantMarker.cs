@@ -26,45 +26,29 @@ public static class VariantMarker
     /// <summary>The Arrow field-metadata key carrying an extension type's name.</summary>
     public const string ExtensionNameKey = "ARROW:extension:name";
 
-    /// <summary>The fabricator variant transport's extension name.</summary>
-    public const string ExtensionName = "ew.variant_transport";
-
-    /// <summary>True when <paramref name="field"/> carries the fabricator variant transport marker.</summary>
-    public static bool IsVariantArrowField(Field field) =>
-        field.Metadata is { } md
-        && md.TryGetValue(ExtensionNameKey, out var ext)
-        && string.Equals(ext, ExtensionName, System.StringComparison.Ordinal);
+    /// <summary>The CANONICAL parquet-variant extension name. ⚠ This was <c>ew.variant_transport</c>
+    /// until DuckDB 2.0: the private leaf-blob transport existed because a nested extension type crashed
+    /// DuckDB's <c>ArrowAppender::FinalizeChild</c>, and 2.0 registers
+    /// <c>arrow.parquet.variant</c> itself with the canonical <c>struct&lt;metadata, value&gt;</c>
+    /// storage — which is the shape the transport was invented to avoid.</summary>
+    public const string ExtensionName = "arrow.parquet.variant";
 
     /// <summary>
-    /// Converts an EW-advertised Arrow schema to the TRANSPORT form the C ABI carries: every
-    /// <see cref="VariantType"/> field (EW master's canonical model for a Delta <c>variant</c>) becomes a
-    /// BINARY field tagged with the <see cref="ExtensionName"/> marker, at any nesting depth. The batch
-    /// side needs no counterpart — EW's read pipeline already emits transport blobs under
-    /// <c>DeltaTableOptions.VariantTransportBlob</c>; this aligns the SCHEMA surface (bind schemas,
-    /// stream schemas) with those batches. A schema without variant returns unchanged.
+    /// True when <paramref name="field"/> is a VARIANT — either as Apache.Arrow's
+    /// <see cref="VariantType"/> (what engineered-wood models it as) or as a struct carrying the canonical
+    /// extension NAME in its field metadata (what crosses the C data interface, because Apache.Arrow's C#
+    /// importer does not materialise the extension type from the metadata — MEASURED: a CREATE committed
+    /// a Delta <c>struct&lt;metadata:binary,value:binary&gt;</c> instead of <c>variant</c> when this
+    /// detector only knew the type).
     /// </summary>
-    public static Schema ToTransportSchema(Schema schema)
-    {
-        List<Field>? converted = null;
-        var fields = schema.FieldsList;
-        for (int i = 0; i < fields.Count; i++)
-        {
-            var f = ToTransportField(fields[i]);
-            if (!ReferenceEquals(f, fields[i]) && converted is null)
-            {
-                converted = new List<Field>(fields.Count);
-                for (int j = 0; j < i; j++)
-                {
-                    converted.Add(fields[j]);
-                }
-            }
-            converted?.Add(f);
-        }
-        return converted is null ? schema : new Schema(converted, schema.Metadata);
-    }
+    public static bool IsVariantArrowField(Field field) =>
+        field.DataType is VariantType
+        || (field.Metadata is { } md
+            && md.TryGetValue(ExtensionNameKey, out var ext)
+            && string.Equals(ext, ExtensionName, System.StringComparison.Ordinal));
 
     /// <summary>
-    /// The inverse of <see cref="ToTransportSchema"/>: every transport-marked BINARY field becomes a
+    /// Gives engineered-wood the type it needs: every canonical-MARKED field becomes a
     /// canonical <see cref="VariantType"/> field with the marker stripped, at any nesting depth. This is
     /// what lets engineered-wood's <c>SchemaConverter</c> run UNPATCHED — upstream already maps
     /// <see cref="VariantType"/> to Delta <c>variant</c> and <c>variant</c> back to
@@ -95,10 +79,15 @@ public static class VariantMarker
     /// field, and the marker is the ONLY thing distinguishing a variant from an ordinary blob there.</summary>
     public static Field ToCanonicalField(Field field)
     {
+        if (field.DataType is VariantType)
+        {
+            return field; // already canonical — nothing to do
+        }
         if (IsVariantArrowField(field))
         {
-            // Strip the marker: the field is a real variant now, and a stale marker alongside VariantType
-            // would make ToTransportSchema's round trip ambiguous.
+            // A canonical-marked STRUCT arriving over the C data interface. Strip the marker and give EW
+            // the real type: its SchemaConverter maps `VariantType => PrimitiveType { TypeName = "variant" }`
+            // and will otherwise write a Delta STRUCT — into a metaData commit that cannot be revised.
             var meta = StripMarker(field.Metadata);
             return new Field(field.Name, VariantType.Default, field.IsNullable, meta);
         }
@@ -167,63 +156,4 @@ public static class VariantMarker
         }
     }
 
-    private static Field ToTransportField(Field field)
-    {
-        if (field.DataType is VariantType)
-        {
-            var meta = new Dictionary<string, string> { [ExtensionNameKey] = ExtensionName };
-            if (field.Metadata is { } src)
-            {
-                foreach (var kv in src)
-                {
-                    meta[kv.Key] = kv.Value;
-                }
-            }
-            return new Field(field.Name, BinaryType.Default, field.IsNullable, meta);
-        }
-        var t = ToTransportType(field.DataType);
-        return ReferenceEquals(t, field.DataType)
-            ? field
-            : new Field(field.Name, t, field.IsNullable, field.Metadata);
-    }
-
-    private static IArrowType ToTransportType(IArrowType type)
-    {
-        switch (type)
-        {
-            case StructType st:
-            {
-                List<Field>? converted = null;
-                for (int i = 0; i < st.Fields.Count; i++)
-                {
-                    var f = ToTransportField(st.Fields[i]);
-                    if (!ReferenceEquals(f, st.Fields[i]) && converted is null)
-                    {
-                        converted = new List<Field>(st.Fields.Count);
-                        for (int j = 0; j < i; j++)
-                        {
-                            converted.Add(st.Fields[j]);
-                        }
-                    }
-                    converted?.Add(f);
-                }
-                return converted is null ? type : new StructType(converted);
-            }
-            case ListType lt:
-            {
-                var elem = ToTransportField(lt.ValueField);
-                return ReferenceEquals(elem, lt.ValueField) ? type : new ListType(elem);
-            }
-            case MapType mt:
-            {
-                var key = ToTransportField(mt.KeyField);
-                var val = ToTransportField(mt.ValueField);
-                return ReferenceEquals(key, mt.KeyField) && ReferenceEquals(val, mt.ValueField)
-                    ? type
-                    : new MapType(key, val, mt.KeySorted);
-            }
-            default:
-                return type;
-        }
-    }
 }

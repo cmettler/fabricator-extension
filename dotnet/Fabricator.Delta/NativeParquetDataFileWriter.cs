@@ -86,7 +86,7 @@ internal sealed class NativeParquetDataFileWriter : IDataFileWriter
             // instead of a parquet VARIANT. Detecting that needs the DELTA schema, which is exactly the
             // four-layout problem the Bridge-side conversion exists to avoid; so if that option is ever set,
             // the fix is to pass the target's Delta schema in here, not to guess from the Arrow type.
-            first = VariantTransport.ToTransport(e.Current);
+            first = VariantTransport.ToDuckDb(e.Current);
         }
         catch
         {
@@ -131,7 +131,7 @@ internal sealed class NativeParquetDataFileWriter : IDataFileWriter
             yield return first; // already converted by the caller (its schema drives the COPY)
             while (await rest.MoveNextAsync().ConfigureAwait(false))
             {
-                yield return VariantTransport.ToTransport(rest.Current);
+                yield return VariantTransport.ToDuckDb(rest.Current);
             }
         }
         finally

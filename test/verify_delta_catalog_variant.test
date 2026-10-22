@@ -256,11 +256,48 @@ SELECT id, v::VARCHAR, v IS NULL FROM codecrw.main.shred ORDER BY id;
 3	NULL	true
 4	{'a': 40, 'b': z, 'extra': [1, 2]}	false
 
-# The file really is shredded (typed_value columns present in the parquet).
+# ⚠⚠ THE CODEC NO LONGER SHREDS, AND THAT IS A REAL LOSS RATHER THAN A CHANGED EXPECTATION — it is
+# recorded here instead of being quietly dropped. Shredding on this path was a SIDE EFFECT of the
+# ew.variant_transport blob transport: decoding the blobs produced VariantValues, and the conversion handed
+# them to EW's `VariantShredding.TryShred` on the way past. DuckDB 2.0 made the transport unnecessary (it
+# registers arrow.parquet.variant itself), so the canonical array now goes to EW untouched — and EW does
+# NOT shred on its own: `TryShred` is public and nothing inside engineered-wood calls it.
+# ⚠ Re-adding it is NOT a one-liner, measured: shredding the canonical storage array produced files that
+# DuckDB's own read_parquet rejects with *"Data corruption detected, read of length_in_bytes (1) would
+# exceed buffer capacity"*, while the unshredded write round-trips exactly (the rows above).
+# ⚠ The loss is bounded to the pure-codec engine, which the NEXT row is the control for.
 query I
 SELECT count(*) FROM parquet_schema('${FABRICATOR_DELTA_WRITE_DIR}/varcodec/shred/*.parquet') WHERE name = 'typed_value';
 ----
-3
+0
+
+# The CONTROL, and the reason the row above is a bounded loss rather than "variant shredding is gone":
+# the DEFAULT engine still shreds, because DuckDB's own COPY does it. Without this row the 0 above would
+# be equally satisfied by a build that had stopped shredding everywhere.
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/varnativeshred' AS nshred
+  (TYPE fabricator, PROVIDER 'delta', column_mapping 'none', native_read true, native_write true);
+
+statement ok
+CREATE TABLE nshred.main.shrednative AS SELECT * FROM (VALUES
+  (1, {'a': 10, 'b': 'x'}::VARIANT),
+  (2, {'a': 20, 'b': 'y'}::VARIANT),
+  (3, NULL::VARIANT),
+  (4, {'a': 40, 'b': 'z', 'extra': [1, 2]}::VARIANT)) t(id, v);
+
+query I
+SELECT count(*) > 0 FROM parquet_schema('${FABRICATOR_DELTA_WRITE_DIR}/varnativeshred/shrednative/*.parquet')
+WHERE name = 'typed_value';
+----
+true
+
+query ITI
+SELECT id, v::VARCHAR, v IS NULL FROM nshred.main.shrednative ORDER BY id;
+----
+1	{'a': 10, 'b': x}	false
+2	{'a': 20, 'b': y}	false
+3	NULL	true
+4	{'a': 40, 'b': z, 'extra': [1, 2]}	false
 
 # DuckDB's own variant decode (read_parquet) agrees with the codec's shredded layout.
 query IT

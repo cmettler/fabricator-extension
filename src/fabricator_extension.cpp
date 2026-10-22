@@ -15,7 +15,6 @@
 #include "fabricator/arrow_produce.hpp"
 #include "fabricator/clr_host.hpp"
 #include "fabricator/fabricator_onelake_fs.hpp"
-#include "fabricator/fabricator_variant.hpp"
 #include "catalog/fabricator_catalog.hpp"
 #include "catalog/fabricator_lateral.hpp"
 #include "catalog/fabricator_metadata.hpp"
@@ -591,9 +590,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// cannot interact, and keeping them apart means the kill switch cannot accidentally disable the in-out
 	// finalizer (whose EOF signal is not optional).
 	RegisterFabricatorLateralOptimizer(DBConfig::GetConfig(loader.GetDatabaseInstance()));
-	// VARIANT over the Arrow C boundary: registers the arrow.parquet.variant type extension so VARIANT
-	// crosses every export/import path as the tagged transport struct (see fabricator_variant.hpp).
-	fabricator::RegisterFabricatorVariantExtension(loader.GetDatabaseInstance());
+	// ⚠ NO VARIANT REGISTRATION HERE ANY MORE. We used to register an `ew.variant_transport` Arrow type
+	// extension (a LEAF binary carrying metadata||value) because the canonical struct<metadata,value>
+	// crashed DuckDB's ArrowAppender::FinalizeChild. DuckDB 2.0 registers `arrow.parquet.variant` itself,
+	// at DB startup — i.e. BEFORE extension load — so ours was already a no-op behind its
+	// HasArrowExtension guard, and the whole file is gone.
 
 	TableFunction test_scan("fabricator_test_scan", {LogicalType::VARCHAR}, fabricator::ArrowStreamScan, TestScanBind,
 	                        fabricator::ArrowStreamInitGlobal, fabricator::ArrowStreamInitLocal);
