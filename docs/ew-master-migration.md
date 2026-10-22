@@ -4010,7 +4010,7 @@ if that is impossible, and then **make our amendments clear IN THE CODE**.
     nothing about it; the constant is `VariantMarker.ExtensionName`, ours alone. Renaming it is safe in principle
     (it is an in-memory discriminator that never persists — the Delta schema records `variant` and the parquet
     file carries the canonical annotation) but it must change in LOCKSTEP with the C++ ArrowTypeExtension
-    registration in `src/fabricator/fabricator_variant.cpp`, so it is a C++-touching rename, deliberately not
+    registration in `src/fabricator/fabricator_variant.cpp`, so it is a C++-touching rename, deliberately not <!-- check-docs:ignore (DELETED 2026-10-22 with the variant transport; naming it IS the point) -->
     bundled into this pass.
   - Gates: EW Table.Tests **868 × {net10.0, net8.0, net472}** (871 − exactly the 3 deleted transport tests; the
     one whose SUBJECT is EW's — shred-on-write/reassemble-on-read — is already covered by upstream's own

@@ -960,7 +960,7 @@
   §"AS BUILT"**. `CREATE TABLE lake.s.t (v VARIANT)` / CTAS / INSERT / SELECT / **DV-DELETE** work under
   `native_read true, native_write true` (`test/verify_delta_catalog_variant.test`, 55; **delta-kernel reads
   the result** — the unverified-kernel risk is resolved). The mechanism is NOT the planned per-operator
-  pre-cast: **one `ArrowTypeExtension` registered at load** (`src/fabricator/fabricator_variant.cpp` —
+  pre-cast: **one `ArrowTypeExtension` registered at load** (`src/fabricator/fabricator_variant.cpp` — <!-- check-docs:ignore (DELETED 2026-10-22 with the variant transport; naming it IS the point) -->
   `RegisterFabricatorVariantExtension`; the exporter's `default:` branch consults the registry UNGATED by
   `arrow_lossless_conversion`) makes VARIANT cross EVERY Arrow boundary transparently (bulk/CTAS/COPY
   appenders, host-query result AND input streams — so the streaming COPY sees real VARIANT with no SQL cast —

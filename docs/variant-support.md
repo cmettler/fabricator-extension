@@ -11,7 +11,7 @@ is the remaining step. See "AS BUILT" below; the design sections after it are th
 1. **No per-operator pre-casts, no SQL wrapping — ONE Arrow type extension.** DuckDB's Arrow export hits its
    `default:` branch for VARIANT and consults the **`ArrowTypeExtension` registry UNCONDITIONALLY** (not
    gated on `arrow_lossless_conversion` — verified in `arrow_converter.cpp` `SetArrowFormat`). So
-   `RegisterFabricatorVariantExtension` (`src/fabricator/fabricator_variant.cpp`, registered at extension load,
+   `RegisterFabricatorVariantExtension` (`src/fabricator/fabricator_variant.cpp`, registered at extension load, <!-- check-docs:ignore (DELETED 2026-10-22 with the variant transport; naming it IS the point) -->
    idempotent) makes EVERY boundary crossing transparent: bulk INSERT/CTAS/COPY appenders, host-query result
    streams, create-table schema export, scan ingest, the catalog bind schema (`FetchTableColumns` →
    `PopulateArrowTableSchema` is registry-aware), and the host-query INPUT stream import (so the streaming
