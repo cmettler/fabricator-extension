@@ -12,6 +12,50 @@
 > parsed with our own vcpkg yyjson, retiring the `ReadCapabilityFlag` string-find). v74 below is the
 > follow-on that finished the same job for ALTER.
 
+## v90 (2026-10-23) — the catalog wire carries a SCHEMA PATH (DuckDB 2.0 nested schemas, slice 1)
+
+`catalog_schemas` and `catalog_tables` lead with a **`LIST<VARCHAR>` schema path**, outermost element
+first: `["a","b"]` is schema `b` nested inside `a`. **Behaviour-neutral** — every provider still emits
+depth-1 paths, so nothing nests yet; this is the shape, and slice 2 is the tree. Full plan and the value
+check: [nested-schemas.md](nested-schemas.md).
+
+- **`table_open` is UNCHANGED, deliberately.** At depth 1 a path IS a single name, so its signature holds
+  until nesting actually arrives — which kept the slice to TWO surfaces instead of four.
+  `catalog_functions` / `catalog_macros` / `catalog_views` stay flat for the same reason: those live in
+  TOP-LEVEL schemas and nothing puts them deeper.
+- **Why a bump at all, when no signature moved:** the stream's COLUMN TYPE changed. An old host reading a
+  list column through `ReadStringTable` is precisely the silent misread the version check exists to make
+  loud at boot.
+- **⚠ THE MANAGED CONTRACT MIGRATED BY DIM, SO NO OUT-OF-TREE PLUGIN BREAKS.**
+  `IProviderCatalog.GetSchemaPaths()` / `GetTablePaths()` default to
+  `SchemaPathAdapter.WidenFirstColumn(GetSchemas()/GetTables())`, wrapping a flat name as a depth-1 path.
+  The four plugins pin `Fabricator.Abstractions` by SHA and cannot be edited from here, so a default that
+  adapts them is the difference between a bump and a flag day. Only a nesting provider overrides. Same
+  idiom as `Initialize()` and the 3-arg `OpenCatalog`.
+- **⚠ `ReadPathTable` is a SIBLING of `ReadStringTable`, not a widening.** That one's contract is "all
+  UTF-8 columns" and EIGHT call sites rely on it; teaching it a second column shape would put a per-column
+  type decision in every caller, and that file already records an out-of-bounds hazard.
+- **⚠ A path is STRUCTURAL rather than a dotted string** because a schema NAME may legitimately contain a
+  dot — any encoding would need escaping at every boundary, and a provider that forgot would silently
+  split one schema into two.
+- **⚠ A NULL list is NO path, not a path of one empty name**, on both sides of the wire. "This row has no
+  schema" and "this row's schema is unnamed" stay different facts.
+
+**⚠⚠ IT SHIPPED A USE-AFTER-FREE FIRST, AND THE FAILURE'S SHAPE IS WHAT NAMED IT — 69 of 82 hermetic
+suites failed with `failed to read metadata batch`.** The adapter wrapped the source batch in `using`
+while handing its columns 1.. to the new `RecordBatch` BY REFERENCE, and `RecordBatch.Dispose()` disposes
+its columns — so the batch handed back pointed at freed arrays.
+- **The asymmetry IS the diagnosis**: `catalog_schemas` has ONE column and worked (its only column is
+  freshly built and shares nothing); `catalog_tables` has THREE and failed. **A one-provider smoke test
+  would have passed it**; it needed a stream wider than one column, which only the tier exercises broadly.
+- **The LOG discriminated, not the error text**: both crossings were recorded with NO `SetError`, so the
+  ABI call had succeeded and the fault was in PULLING a batch — i.e. in the adapter, not the wiring.
+- ⇒ **this is the argument for keeping a shape change behaviour-neutral.** It was a lifetime error in a
+  pure refactor, and the assertion-identical baseline is what caught it; bundled with the schema tree and
+  Delta's depth-aware discovery it would have been two unknowns at once.
+
+Gates: hermetic **82/82 — 10089** and service **60/60 — 3593**, BOTH identical to the pre-slice counts.
+
 ## v89 (2026-09-14) — `agg_open` becomes the aggregate's BIND: a per-CALL-SITE result type
 
 **User-asked** (*"a fluid_aggregate must at bind be able to supply the return_type"*), and the answer is yes
