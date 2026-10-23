@@ -91,7 +91,7 @@ public static unsafe class Bootstrap
                             () => OneRowStream(probeSchema, Interlocked.Increment(ref _lazyOpens) - 1),
                             probeSchema);
 
-        vtable->AbiVersion = 90;
+        vtable->AbiVersion = 91;
         vtable->OpenCatalog = &OpenCatalog;
         vtable->CloseCatalog = &CloseCatalog;
         vtable->ExecuteQuery = &ExecuteQuery;
@@ -535,8 +535,8 @@ public static unsafe class Bootstrap
         CatalogList(handle, outStream, err, "catalog_server_info", c => c.GetServerInfo());
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static int TableOpen(nint handle, byte* schema, byte* table, byte* atUnit, byte* atValue,
-                                 nint* outTable, byte** err)
+    private static int TableOpen(nint handle, byte** schemaPath, int schemaPathLen, byte* table, byte* atUnit,
+                                 byte* atValue, nint* outTable, byte** err)
     {
         try
         {
@@ -546,17 +546,27 @@ public static unsafe class Bootstrap
             }
             var catalog = Handles.Resolve<IProviderCatalog>(handle)
                           ?? ProviderRegistry.Active.OpenCatalog(string.Empty, string.Empty);
-            var schemaName = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
+            // The schema arrives as a PATH since v91 — an array of UTF-8 names, outermost first. Copied out
+            // here because the pointers are the HOST's and borrowed for the call only; a provider holding
+            // the strings on its ITable (every one of them does) would otherwise be reading freed memory.
+            var path = new string[schemaPathLen < 0 ? 0 : schemaPathLen];
+            for (int i = 0; i < path.Length; i++)
+            {
+                path[i] = Marshal.PtrToStringUTF8((nint)schemaPath[i]) ?? string.Empty;
+            }
             var tableName = Marshal.PtrToStringUTF8((nint)table) ?? string.Empty;
             var unit = Marshal.PtrToStringUTF8((nint)atUnit);
             var value = Marshal.PtrToStringUTF8((nint)atValue);
             TableAt? at = string.IsNullOrEmpty(unit) ? null : new TableAt(unit!, value ?? string.Empty);
-            BridgeLog.LogDebug("abi table_open: {Schema}.{Table} at={At}", schemaName, tableName, unit);
+            BridgeLog.LogDebug("abi table_open: {Schema}.{Table} at={At}", string.Join('.', path), tableName,
+                               unit);
 
             // No IO and no absence probe here: the handle wraps the DEFINITION (+ the reference's AT), and
             // absence is established by table_schema — the first actual read — exactly where the old kind-2
             // classified it. Opening cheap is load-bearing: enumeration materializes every table.
-            var session = new TableSession(catalog, catalog.GetTable(schemaName, tableName), at);
+            // ⚠ The path-taking overload is a DEFAULT INTERFACE METHOD that takes the LEAF, so a provider
+            // that has not heard of nesting behaves exactly as before — see IProviderCatalog.GetTable.
+            var session = new TableSession(catalog, catalog.GetTable(path, tableName), at);
             *outTable = Handles.Alloc(session);
             return FabricatorStatus.Ok;
         }

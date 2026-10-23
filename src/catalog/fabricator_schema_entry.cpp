@@ -90,6 +90,29 @@ FabricatorSchemaEntry::FabricatorSchemaEntry(Catalog &catalog, CreateSchemaInfo 
 // ⚠ parent_schema is set on the INFO before construction rather than afterwards: SchemaCatalogEntry reads
 // it in its own constructor to build the parent chain that GetSchemaPath()/GetQualifiedName() walk, so
 // assigning it later would leave an entry that reports itself as top-level.
+void FabricatorRefuseNestedWrite(const SchemaCatalogEntry &schema, const char *statement) {
+	if (!schema.GetParentSchema()) {
+		return;
+	}
+	throw NotImplementedException(
+	    "fabricator: %s is not supported in the NESTED schema \"%s\" — writes still address the provider by "
+	    "a single schema name, so this would silently target a different schema. Reading a nested schema "
+	    "works; writing into one does not yet (see docs/nested-schemas.md)",
+	    statement, schema.GetSchemaName());
+}
+
+// This entry's schema PATH as plain strings, outermost first — what table_open takes since v91.
+// ⚠ DuckDB's SchemaCatalogEntry::GetSchemaPath() walks the parent_schema chain, which is exactly why the
+// parent is a CONSTRUCTOR parameter: an entry given its parent afterwards would already have reported
+// itself as top-level here, and the provider would then be asked for the table under the wrong schema.
+vector<string> FabricatorSchemaEntry::SchemaPathStrings() const {
+	vector<string> path;
+	for (auto &segment : GetSchemaPath()) {
+		path.push_back(segment.GetIdentifierName());
+	}
+	return path;
+}
+
 FabricatorSchemaEntry &FabricatorSchemaEntry::GetOrCreateChildSchema(const string &name) {
 	auto it = child_schemas_.find(name);
 	if (it != child_schemas_.end()) {
@@ -259,6 +282,18 @@ void FabricatorSchemaEntry::ClearTables() {
 	RetireAll(table_function_entries_, retired_entries_);
 	RetireAll(aggregate_function_entries_, retired_entries_);
 	RetireAll(macro_entries_, retired_entries_);
+	ClearChildTables();
+}
+
+// ⚠ THE NESTED SCHEMAS GO TOO, and this is the half that is easy to miss: a child entry owns its own
+// table map, so a refresh that cleared only the parent would leave a nested table's STALE entry reachable
+// through the very walk LookupEntry performs. The three invalidation methods below each recurse for the
+// same reason. Children are reached OUTSIDE entry_lock_ (each child takes its own); child_schemas_ itself
+// is guarded by the catalog's schema_lock_, which every caller of these methods already holds.
+void FabricatorSchemaEntry::ClearChildTables() {
+	for (auto &child : child_schemas_) {
+		child.second->ClearTables();
+	}
 }
 
 void FabricatorSchemaEntry::InvalidateEntryCache() {
@@ -281,6 +316,9 @@ void FabricatorSchemaEntry::InvalidateEntryCache() {
 	// fetched state: it describes the referenced tables' columns as they were. Dropping the entry is the
 	// cheapest way to make a rolled-back or refreshed schema visible there too.
 	RetireAll(view_entries_, retired_entries_);
+	for (auto &child : child_schemas_) {
+		child.second->InvalidateEntryCache();
+	}
 }
 
 void FabricatorSchemaEntry::InvalidateMatching(const std::function<bool(const string &)> &matches) {
@@ -300,6 +338,9 @@ void FabricatorSchemaEntry::InvalidateMatching(const std::function<bool(const st
 	RetireMatching(aggregate_function_entries_, matches, retired_entries_);
 	RetireMatching(macro_entries_, matches, retired_entries_);
 	RetireMatching(view_entries_, matches, retired_entries_);
+	for (auto &child : child_schemas_) {
+		child.second->InvalidateMatching(matches);
+	}
 }
 
 // The cache key for a time-travel entry. US separators (0x1f) cannot occur in a SQL identifier or in the
@@ -393,7 +434,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::GetOrCreateEntry(ClientContext
 			handle = nullptr;
 			return h;
 		}
-	} table_guard {fabricator::TableOpen(handle_, name.GetIdentifierName(), table_name, at_unit, at_value)};
+	} table_guard {fabricator::TableOpen(handle_, SchemaPathStrings(), table_name, at_unit, at_value)};
 
 	vector<string> names;
 	vector<LogicalType> types;
@@ -4011,20 +4052,25 @@ void FabricatorSchemaEntry::RefuseViewTableCollision(const string &entry_name) {
 
 optional_ptr<CatalogEntry> FabricatorSchemaEntry::LookupEntry(CatalogTransaction transaction,
                                                             const EntryLookupInfo &lookup_info) {
-	if (!transaction.context) {
-		return nullptr;
-	}
 	auto type = lookup_info.GetCatalogType();
 	// DuckDB 2.0 nested schemas: `Catalog::LookupSchemaPath` finds the ROOT through the catalog's
 	// LookupSchema and then asks each PARENT for the next level with CatalogType::SCHEMA_ENTRY, casting
 	// what comes back to SchemaCatalogEntry. This branch is that call.
 	// ⚠ A miss returns null rather than throwing: the walk's caller decides, honouring its own
 	// OnEntryNotFound, and throwing here would turn an IF NOT EXISTS probe into an error.
-	// ⚠ child_schemas_ is empty for every provider today, so this answers null and the behaviour of every
-	// existing lookup is unchanged — the tree is representable before anything populates it.
+	//
+	// ⚠⚠ IT SITS ABOVE THE CONTEXT GUARD, AND THAT IS THE WHOLE FIX FOR A DEPTH-3 REFERENCE. Slice 2a put
+	// it below, where it was unreachable from the walk — MEASURED: `cat.a.b.t` reported *schema "a.b" does
+	// not exist* while `cat.a` and `cat.s.t` both resolved, because `Catalog::GetSchema` reaches here
+	// through a CatalogTransaction that carries NO ClientContext. Everything below this point needs a
+	// context (it materializes an entry from the provider); a child schema is already in memory, so it
+	// needs none. ⚠ A depth-2 layout cannot see this bug: it only ever asks the CATALOG for the root.
 	if (type == CatalogType::SCHEMA_ENTRY) {
 		auto it = child_schemas_.find(lookup_info.GetEntryName());
 		return it == child_schemas_.end() ? nullptr : optional_ptr<CatalogEntry>(it->second.get());
+	}
+	if (!transaction.context) {
+		return nullptr;
 	}
 	if (type == CatalogType::TABLE_ENTRY || type == CatalogType::VIEW_ENTRY) {
 		// A provider-declared VIEW resolves through the TABLE_ENTRY lookup, not a separate one:
@@ -4111,8 +4157,22 @@ void FabricatorSchemaEntry::ScanDeclaredViews(ClientContext &context,
 	}
 }
 
+// The nested child schemas, for BOTH Scan overloads. DuckDB's own SchemaCatalogEntry::ScanSchemaTree
+// walks a tree by asking each schema to Scan(SCHEMA_ENTRY), so answering it is what makes a nested schema
+// visible to any DuckDB-side traversal — our FabricatorCatalog::ScanSchemas recurses over child_schemas_
+// itself, but that is the catalog's entry point, not the only one.
+void FabricatorSchemaEntry::ScanChildSchemas(const std::function<void(CatalogEntry &)> &callback) {
+	for (auto &child : child_schemas_) {
+		callback(*child.second);
+	}
+}
+
 void FabricatorSchemaEntry::Scan(ClientContext &context, CatalogType type,
                                const std::function<void(CatalogEntry &)> &callback) {
+	if (type == CatalogType::SCHEMA_ENTRY) {
+		ScanChildSchemas(callback);
+		return;
+	}
 	if (type == CatalogType::VIEW_ENTRY) {
 		// duckdb_views() scans VIEW_ENTRY. Deliberately views ONLY, where the TABLE_ENTRY scan above reports
 		// both: DuckDB's shared set makes its own VIEW_ENTRY scan yield tables too, but every consumer of
@@ -4286,6 +4346,11 @@ void FabricatorSchemaEntry::Scan(ClientContext &context, CatalogType type,
 }
 
 void FabricatorSchemaEntry::Scan(CatalogType type, const std::function<void(CatalogEntry &)> &callback) {
+	if (type == CatalogType::SCHEMA_ENTRY) {
+		// Needs no materialization: a child schema entry exists from the moment discovery created it.
+		ScanChildSchemas(callback);
+		return;
+	}
 	// No context available: only report already-materialized entries.
 	lock_guard<mutex> lock(entry_lock_);
 	// macro_entries_ holds both kinds (the parse decides which), so reporting is filtered by entry type. Note
@@ -4342,6 +4407,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::CreateTable(CatalogTransaction
 	}
 	auto &context = *transaction.context;
 	auto &base = info.Base();
+	FabricatorRefuseNestedWrite(*this, "CREATE TABLE");
 	FabricatorSetActiveTxn(handle_, context); // CREATE (+ optional DROP for REPLACE) joins this txn's connection
 
 	// Column names + types, and per-column nullability (NOT NULL constraints). A DuckDB GENERATED column
@@ -4535,6 +4601,7 @@ void FabricatorSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
 		                              CatalogTypeToString(info.type));
 	}
 	bool if_exists = info.if_not_found == OnEntryNotFound::RETURN_NULL;
+	FabricatorRefuseNestedWrite(*this, "DROP TABLE");
 	FabricatorSetActiveTxn(handle_, context);
 	fabricator::DropTable(handle_, name.GetIdentifierName(), info.GetQualifiedName().Name().GetIdentifierName(), if_exists);
 
@@ -4675,6 +4742,11 @@ void FabricatorSchemaEntry::AlterComment(CatalogTransaction transaction, AlterIn
 }
 
 void FabricatorSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
+	// Refused on a nested schema for the same reason every other write is: the provider re-derives the
+	// table's storage path from the LEAF schema name. See FabricatorRefuseNestedWrite, whose own warning
+	// records that exempting this was a wrong call based on where the crossing rides rather than on what
+	// the callee does with it.
+	FabricatorRefuseNestedWrite(*this, "ALTER TABLE / COMMENT ON");
 	// COMMENT ON arrives as its OWN AlterTypes and carries no AlterTableInfo, so it is dispatched before the
 	// cast below rather than as a case in the switch.
 	if (info.type == AlterType::SET_COMMENT || info.type == AlterType::SET_COLUMN_COMMENT) {

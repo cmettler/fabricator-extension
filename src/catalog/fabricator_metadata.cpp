@@ -193,20 +193,14 @@ vector<vector<string>> ReadStringTable(ArrowArrayStream &stream, idx_t expected_
 	return result;
 }
 
-vector<string> DiscoverSchemas(FabricatorHandle handle) {
+vector<vector<string>> DiscoverSchemaPaths(FabricatorHandle handle) {
 	ArrowArrayStream stream;
 	std::memset(&stream, 0, sizeof(stream));
 	fabricator::CatalogSchemas(handle, stream);
-	// Depth-1 paths today: every provider emits single-element paths (the SchemaPathAdapter default), so
-	// this flattens to the name. Slice 2 is where a deeper path becomes a nested schema entry rather than
-	// being joined here -- see docs/nested-schemas.md.
-	auto table = ReadPathTable(stream, 1);
-	vector<string> names;
-	names.reserve(table.paths.size());
-	for (auto &path : table.paths) {
-		names.push_back(path.empty() ? string() : path.back());
-	}
-	return names;
+	// Handed on WHOLE now (slice 2b): the catalog walks the path, creating one entry per level. A provider
+	// that does not nest emits single-element paths (the SchemaPathAdapter default), so the walk makes
+	// exactly the one top-level entry the old flattening made -- see docs/nested-schemas.md.
+	return ReadPathTable(stream, 1).paths;
 }
 
 // RAII over a parsed yyjson document (yyjson_doc_free tolerates null).
@@ -256,9 +250,16 @@ vector<FabricatorTableInfo> DiscoverTables(FabricatorHandle handle) {
 
 	vector<FabricatorTableInfo> tables;
 	for (idx_t i = 0; i < table.paths.size(); i++) {
-		// As DiscoverSchemas: depth-1 for now, so the leaf IS the schema name.
+		// BOTH shapes are carried: the whole path (which the catalog walks to find/create the schema entry)
+		// and its LEAF, which is what the twenty existing schema_name consumers read. See the field's own
+		// warning in fabricator_metadata.hpp for why the leaf stays.
 		auto &path = table.paths[i];
-		tables.push_back({path.empty() ? string() : path.back(), table.columns[0][i], table.columns[1][i]});
+		FabricatorTableInfo info;
+		info.schema_path = path;
+		info.schema_name = path.empty() ? string() : path.back();
+		info.table_name = table.columns[0][i];
+		info.table_type = table.columns[1][i];
+		tables.push_back(std::move(info));
 	}
 	return tables;
 }

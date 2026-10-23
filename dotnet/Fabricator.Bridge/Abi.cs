@@ -279,9 +279,12 @@ public unsafe struct FabricatorVTable
     public delegate* unmanaged[Cdecl]<nint, CArrowArrayStream*, byte**, int> CatalogServerInfo;
 
     // ---- the table session (ABI v72) — mirrors tablefn_*; see abi.h for the full contract.
-    // int32 table_open(void* handle, const char* schema, const char* table, const char* at_unit,
-    //                  const char* at_value, void** out_table, char** err)
-    public delegate* unmanaged[Cdecl]<nint, byte*, byte*, byte*, byte*, nint*, byte**, int> TableOpen;
+    // int32 table_open(void* handle, const char* const* schema_path, int32 schema_path_len,
+    //                  const char* table, const char* at_unit, const char* at_value,
+    //                  void** out_table, char** err)
+    // ⚠ schema_path is an ARRAY of UTF-8 names, OUTERMOST FIRST (v91, was a single `const char* schema`);
+    // one element for every provider that does not declare supports_nested_schemas.
+    public delegate* unmanaged[Cdecl]<nint, byte**, int, byte*, byte*, byte*, nint*, byte**, int> TableOpen;
     // int32 table_schema(void* table, ArrowArrayStream* out, char** err) — zero-row stream whose SCHEMA is
     // the table's column layout; NOT_FOUND status = established absence.
     public delegate* unmanaged[Cdecl]<nint, CArrowArrayStream*, byte**, int> TableSchema;

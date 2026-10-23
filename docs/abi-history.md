@@ -12,6 +12,43 @@
 > parsed with our own vcpkg yyjson, retiring the `ReadCapabilityFlag` string-find). v74 below is the
 > follow-on that finished the same job for ALTER.
 
+## v91 (2026-10-23) — `table_open` takes a SCHEMA PATH (DuckDB 2.0 nested schemas, slice 2b)
+
+`table_open(handle, const char *schema, …)` became
+`table_open(handle, const char *const *schema_path, int32_t schema_path_len, …)` — an array of UTF-8
+names, OUTERMOST FIRST, the same shape the `catalog_schemas` / `catalog_tables` streams have carried as
+`LIST<VARCHAR>` since v90, and for the same reason: a schema name may legitimately contain a dot, so any
+joined spelling would need escaping at every boundary and a provider that forgot would silently split one
+schema into two. A SIGNATURE change on one existing entry, hence the bump (both halves —
+`FABRICATOR_ABI_VERSION` in `abi.h`, `vtable->AbiVersion` in `Bootstrap.cs`).
+
+It is the entry v90 deliberately left alone: at depth 1 a path IS a name, so slice 1 could put the path
+on the discovery wire and stay behaviour-neutral. A nested table makes that false.
+
+**NO out-of-tree plugin breaks, and that is by construction rather than by luck.** The managed contract
+gains `IProviderCatalog.GetTable(IReadOnlyList<string> schemaPath, string tableName)` as a DEFAULT
+INTERFACE METHOD whose body is `GetTable(schemaPath[^1], tableName)`. A provider that has never heard of
+nesting receives a one-element path and resolves exactly the name it always did; the four out-of-tree
+plugins pin `Fabricator.Abstractions` by SHA and cannot be edited from here, which is what makes a DIM
+the only acceptable shape for this kind of widening. Only `DeltaCatalog` overrides it.
+
+- ⚠ **An override is MANDATORY for a provider that declares `supports_nested_schemas`**: with the default,
+  `cat.a.b.t` resolves to whatever `b.t` means — a different table, reported as success.
+- ⚠ The host passes **a null pointer with length 0** for an empty path rather than a one-element array of
+  `""`, keeping "no schema" distinct from "a schema whose name is empty" on this crossing too — the same
+  distinction `SchemaPathAdapter` makes in the other direction.
+- ⚠ The path's strings are **borrowed for the call**. The managed handler copies them out, because every
+  provider's `ITable` holds its names; reading them later would be reading freed memory.
+
+**⚠⚠ THE OTHER EIGHT TABLE CROSSINGS STILL CARRY A FLAT `const char *schema`, AND THE HOST REFUSES RATHER
+THAN SENDING A LEAF.** `create_table`, `drop_table`, `begin_bulk`, `execute_update`, `execute_delete`,
+`insert_returning`, `create_schema`, `drop_schema` — plus `table_alter`, which rides THIS session but
+whose managed handler re-derives the storage path from the definition's leaf schema name. Handing any of
+them a nested schema's leaf does not fail; it addresses a DIFFERENT, same-named top-level schema. So
+`FabricatorRefuseNestedWrite` refuses each by name and nesting is read-only until they are widened.
+Full record, including the four defects building it surfaced: [nested-schemas.md](nested-schemas.md)
+§Slice 2b.
+
 ## v90 (2026-10-23) — the catalog wire carries a SCHEMA PATH (DuckDB 2.0 nested schemas, slice 1)
 
 `catalog_schemas` and `catalog_tables` lead with a **`LIST<VARCHAR>` schema path**, outermost element

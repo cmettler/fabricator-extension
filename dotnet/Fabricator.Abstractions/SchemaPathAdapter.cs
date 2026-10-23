@@ -47,6 +47,82 @@ public static class SchemaPathAdapter
         return new Widened(source, name);
     }
 
+    /// <summary>
+    /// Builds a discovery stream whose FIRST column is a <c>LIST&lt;VARCHAR&gt;</c> schema path and whose
+    /// remaining columns are UTF-8 — the shape <c>catalog_schemas</c> / <c>catalog_tables</c> carry since
+    /// ABI v90, built from REAL paths rather than widened from flat names.
+    /// </summary>
+    /// <remarks>⚠ For a provider that genuinely nests. One that does not should leave
+    /// <see cref="IProviderCatalog.GetSchemaPaths"/> / <see cref="IProviderCatalog.GetTablePaths"/> alone
+    /// and let the default widen its flat stream; there is nothing to gain from building the same depth-1
+    /// paths by hand. Every column must have the same length as <paramref name="paths"/>.</remarks>
+    public static IArrowArrayStream PathTable(string pathName, IReadOnlyList<IReadOnlyList<string>> paths,
+                                              params (string Name, IReadOnlyList<string> Values)[] columns)
+    {
+        var fields = new List<Field>(columns.Length + 1)
+        {
+            new(pathName, new ListType(new Field("item", StringType.Default, nullable: true)), nullable: true),
+        };
+        var pathBuilder = new ListArray.Builder(StringType.Default);
+        var elements = (StringArray.Builder)pathBuilder.ValueBuilder;
+        foreach (var path in paths)
+        {
+            pathBuilder.Append();
+            foreach (var segment in path)
+            {
+                elements.Append(segment);
+            }
+        }
+        var arrays = new List<IArrowArray>(columns.Length + 1) { pathBuilder.Build() };
+        foreach (var (name, values) in columns)
+        {
+            if (values.Count != paths.Count)
+            {
+                throw new ArgumentException(
+                    $"SchemaPathAdapter.PathTable: column '{name}' has {values.Count} values for " +
+                    $"{paths.Count} paths", nameof(columns));
+            }
+            fields.Add(new Field(name, StringType.Default, nullable: true));
+            var b = new StringArray.Builder();
+            foreach (var v in values)
+            {
+                b.Append(v);
+            }
+            arrays.Add(b.Build());
+        }
+        var schema = new Schema(fields, null);
+        return new OneBatch(schema, new RecordBatch(schema, arrays, paths.Count));
+    }
+
+    private sealed class OneBatch : IArrowArrayStream
+    {
+        private RecordBatch? _batch;
+
+        public OneBatch(Schema schema, RecordBatch batch)
+        {
+            Schema = schema;
+            _batch = batch;
+        }
+
+        public Schema Schema { get; }
+
+        public ValueTask<RecordBatch?> ReadNextRecordBatchAsync(CancellationToken ct = default)
+        {
+            var b = _batch;
+            _batch = null;
+            return new ValueTask<RecordBatch?>(b);
+        }
+
+        // The batch is handed to the CONSUMER on the first read, so disposing here would free arrays it
+        // still owns — the same ownership rule the Widened wrapper's big warning records. Only an
+        // UNCONSUMED batch is ours to drop.
+        public void Dispose()
+        {
+            _batch?.Dispose();
+            _batch = null;
+        }
+    }
+
     private sealed class Widened : IArrowArrayStream
     {
         private readonly IArrowArrayStream _source;

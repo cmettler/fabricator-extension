@@ -1,0 +1,263 @@
+# name: test/verify_delta_nested_schemas.test
+# description: Delta folder-as-catalog with the `nested_schemas true` ATTACH option — the directory tree UNDER the
+#              root IS the schema tree, to any depth (DuckDB 2.0 nested schemas), so <root>/sales/eu/deep resolves
+#              as cat.sales.eu.deep. Nesting is READ-ONLY in this slice: every write crossing still addresses the
+#              provider by a single schema name, so the host REFUSES writes into a nested schema by name rather than
+#              silently targeting the wrong folder. Set FABRICATOR_DELTA_WRITE_DIR to a WRITABLE base. Local FS.
+# group: [fabricator]
+
+require fabricator
+
+require parquet
+
+require-env FABRICATOR_DELTA_WRITE_DIR
+
+# ── §1 setup. The tree is built with ORDINARY two-level attaches at successively deeper SUB-ROOTS, because a
+#    nested `CREATE SCHEMA a.b` is one of the statements this slice refuses — the layout has to come from the
+#    storage, which is exactly the shape the feature is for.
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/nested/nl' AS lvl1 (TYPE fabricator, PROVIDER 'delta', schemas true);
+
+statement ok
+CREATE SCHEMA lvl1.sales;
+
+statement ok
+CREATE TABLE lvl1.sales.orders AS SELECT 1 AS id, 'eu' AS region;
+
+statement ok
+CREATE TABLE lvl1.main.flat AS SELECT 7 AS v;
+
+statement ok
+DETACH lvl1;
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/nested/nl/sales' AS lvl2 (TYPE fabricator, PROVIDER 'delta', schemas true);
+
+statement ok
+CREATE SCHEMA lvl2.eu;
+
+statement ok
+CREATE TABLE lvl2.eu.deep AS SELECT 42 AS v;
+
+statement ok
+DETACH lvl2;
+
+# ── §2 the TWO-LEVEL CONTROL: the identical tree WITHOUT the option behaves exactly as it always has.
+#    Without it this suite could not tell "nesting works" from "the layout changed for everyone".
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/nested/nl' AS flatlk (TYPE fabricator, PROVIDER 'delta', schemas true);
+
+query II
+SELECT id, region FROM flatlk.sales.orders;
+----
+1	eu
+
+# `eu` is a folder under sales/, and WITHOUT nesting it is not a schema at all.
+statement error
+SELECT * FROM flatlk.sales.eu.deep;
+----
+does not exist
+
+# The capability is OFF, so a dotted schema argument stays a LITERAL name rather than a path.
+statement error
+SELECT * FROM flatlk."sales.eu".deep;
+----
+does not exist
+
+statement ok
+DETACH flatlk;
+
+# ── §3 the nested attach: discovery reports the TREE, intermediate levels included.
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/nested/nl' AS lk (TYPE fabricator, PROVIDER 'delta', nested_schemas true);
+
+query I
+SELECT schema_name FROM duckdb_schemas() WHERE database_name='lk' ORDER BY 1;
+----
+delta
+eu
+main
+sales
+
+query II
+SELECT schema_name, table_name FROM duckdb_tables() WHERE database_name='lk' ORDER BY 1,2;
+----
+eu	deep
+main	flat
+sales	orders
+
+# ── §4 resolution. Depth 1, 2 and 3 all answer.
+query I
+SELECT v FROM lk.main.flat;
+----
+7
+
+query II
+SELECT id, region FROM lk.sales.orders;
+----
+1	eu
+
+query I
+SELECT v FROM lk.sales.eu.deep;
+----
+42
+
+# ⚠ THE ASSERTION THAT PROVES IT IS REAL NESTING: the LEAF alone must NOT resolve. If `eu` had been
+# registered as another TOP-LEVEL schema — which is what a flattening bug produces, and what duckdb_schemas()
+# above cannot tell apart, since it prints a child by its own name — this would succeed.
+statement error
+SELECT v FROM lk.eu.deep;
+----
+schema "eu" does not exist
+
+# ── §5 writes into a nested schema are REFUSED BY NAME. A silently wrong folder is the failure this guards.
+statement error
+INSERT INTO lk.sales.eu.deep VALUES (99);
+----
+is not supported in the NESTED schema
+
+statement error
+UPDATE lk.sales.eu.deep SET v = 1;
+----
+is not supported in the NESTED schema
+
+statement error
+DELETE FROM lk.sales.eu.deep;
+----
+is not supported in the NESTED schema
+
+statement error
+CREATE TABLE lk.sales.eu.born AS SELECT 1 AS x;
+----
+is not supported in the NESTED schema
+
+statement error
+DROP TABLE lk.sales.eu.deep;
+----
+is not supported in the NESTED schema
+
+statement error
+ALTER TABLE lk.sales.eu.deep ADD COLUMN z INTEGER;
+----
+is not supported in the NESTED schema
+
+# ⚠ COMMENT ON never reaches our refusal: DuckDB's PARSER caps that statement at three qualifications
+#    ("Too many qualifications found"), so a nested target cannot even be spelled. Pinned as the parser's
+#    error rather than ours, because asserting our message here would have been a lie about which layer
+#    stops it — and the day upstream lifts the cap, this row fails and sends the reader to the refusal.
+statement error
+COMMENT ON TABLE lk.sales.eu.deep IS 'hi';
+----
+Too many qualifications found
+
+statement error
+CREATE SCHEMA lk.sales.west;
+----
+CREATE SCHEMA with a nested path is not supported
+
+statement error
+DROP SCHEMA lk.sales.eu;
+----
+DROP SCHEMA with a nested path is not supported
+
+# ── §6 the POSITIVE CONTROL for §5: at depth 1 every one of those still works. Without this the refusals
+#    would pass equally in a build where writing had broken altogether.
+statement ok
+INSERT INTO lk.sales.orders VALUES (2, 'us');
+
+query I
+SELECT count(*) FROM lk.sales.orders;
+----
+2
+
+statement ok
+ALTER TABLE lk.sales.orders ADD COLUMN note VARCHAR;
+
+statement ok
+CREATE TABLE lk.sales.born AS SELECT 5 AS x;
+
+statement ok
+DROP TABLE lk.sales.born;
+
+statement ok
+CREATE SCHEMA lk.west;
+
+statement ok
+DROP SCHEMA lk.west;
+
+# ── §7 the data really is where the path says. A read at depth 3 after a depth-1 write must be unaffected —
+#    the two tables share a leaf-name prefix only in the WRONG resolution.
+query I
+SELECT v FROM lk.sales.eu.deep;
+----
+42
+
+statement ok
+DETACH lk;
+
+# ── §8 re-attach: the tree is storage, not session state.
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/nested/nl' AS lk2 (TYPE fabricator, PROVIDER 'delta', nested_schemas true);
+
+query I
+SELECT v FROM lk2.sales.eu.deep;
+----
+42
+
+query I
+SELECT count(*) FROM lk2.sales.orders;
+----
+2
+
+statement ok
+DETACH lk2;
+
+# ── §9 a ROOT-LEVEL Delta table is NOT discovered under nested_schemas (every level is a real directory, so a
+#    table needs at least one). It is skipped with a WARNING rather than refused; `schemas true` does not
+#    discover one either, so this is not a regression — it is the behaviour being pinned.
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/nested/rootonly' AS r1 (TYPE fabricator, PROVIDER 'delta');
+
+statement ok
+CREATE TABLE r1.main.loose AS SELECT 3 AS v;
+
+statement ok
+DETACH r1;
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/nested/rootonly' AS r2 (TYPE fabricator, PROVIDER 'delta', nested_schemas true);
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name='r2';
+----
+0
+
+statement ok
+DETACH r2;
+
+# The SAME root attached FLAT still sees it — the control proving the table exists and §9 measured a layout
+# rule rather than a broken write.
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/nested/rootonly' AS r3 (TYPE fabricator, PROVIDER 'delta');
+
+query I
+SELECT v FROM r3.main.loose;
+----
+3
+
+statement ok
+DETACH r3;
+
+# ── §10 "main" is an ORDINARY directory under nested_schemas, not the synthetic schema of root-level tables.
+#    That is the whole reason §9 skips rather than synthesizes: `CREATE TABLE cat.main.t` under `schemas true`
+#    makes a REAL <root>/main/ folder, so a synthetic "main" would have collided with the commonest layout.
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/nested/nl' AS lk3 (TYPE fabricator, PROVIDER 'delta', nested_schemas true);
+
+query I
+SELECT v FROM lk3.main.flat;
+----
+7
+
+statement ok
+DETACH lk3;

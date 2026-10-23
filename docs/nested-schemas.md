@@ -1,6 +1,9 @@
 # Nested schemas (DuckDB 2.0) — the plan, and what is built
 
-**Status (2026-10-23): SLICE 0 BUILT (the capability, inert). Slices 1 and 2 NOT started.**
+**Status (2026-10-23): SLICES 0, 1, 2a AND 2b BUILT — a Delta root attached with `nested_schemas true`
+resolves `cat.a.b.t` to any depth. Nesting is READ-ONLY: every write into a nested schema is REFUSED by
+name, because only `table_open` carries a path (ABI v91) and the eight write crossings still carry one
+flat schema name. Slice 2c (widen those) and slice 3 (DAX per-model `system`) NOT started.**
 User-directed, from <https://duckdb.org/docs/2.0/sql/statements/create_schema#nested-schemas>. Scope
 decided by the user: a **full ABI change** carrying a schema PATH, Delta on **local FS + plain ADLS/S3**,
 with Fabric's `Tables/` area and SQL Server deliberately excluded.
@@ -142,33 +145,100 @@ existing changes. Hermetic **82/82 — 10089**, identical.
   field; `CreateSchemaInfo` instead encodes the parent in its QUALIFIED NAME, and exposes
   `ParentSchemas()` / `IsNested()`.)
 
-### ⏳ Slice 2b — NEXT, and the point at which something actually nests
+### ✅ Slice 2b — something actually nests (BUILT 2026-10-23, ABI v90 -> v91, READ-ONLY)
 
-**Nothing below is started.** In order:
+`ATTACH … (PROVIDER 'delta', nested_schemas true)` and `cat.a.b.t` resolves, scans, and reports its
+nesting in `duckdb_schemas()`. Gate: a NEW hermetic suite `verify_delta_nested_schemas` (**65**), floors
+10089 -> **10154** and MIN_SUITES 82 -> **83**. Hermetic **83/83 — 10154**, i.e. 10089 + exactly 65, which
+is the behaviour-neutrality claim for everything the slice touched outside the new option.
 
-1. **`FabricatorTableInfo` gains `schema_path` ALONGSIDE `schema_name`** (the leaf). Measured: 20
-   consumers of `.schema_name`, and the split is favourable — functions/macros/views use
-   `schemas_.find(schema_name)` against the TOP-LEVEL map, which stays correct because they do not nest.
-   Only `ensure_schema(table.schema_name)` needs the path. Replacing the field outright would touch all
-   20 for no gain.
-2. **`DiscoverSchemas` / `DiscoverTables` stop flattening.** Both currently do `path.back()` with a
-   comment pointing here; they return the whole path instead.
-3. **`ensure_schema` walks the path**, calling `GetOrCreateChildSchema` per level (the two identical
-   lambdas in `LoadCatalog` ~L114 and `RefreshCache` ~L228 — keep them in step or factor them).
-4. **`table_open` takes a path — THIS IS THE ABI v90 -> v91 BUMP.** Deferred out of slice 1 because at
-   depth 1 a path IS a name; a nested table makes that false. Bump BOTH `FABRICATOR_ABI_VERSION` in
-   `abi.h` and `vtable->AbiVersion` in `Bootstrap.cs`.
-5. **Delta discovery goes depth-aware**, local FS first (the System.IO walk already recurses — cheapest),
-   then S3/ADLS. ⚠ The object-store glob is a FIXED-depth pattern (`"/*/*/_delta_log/*.json"` vs
-   `"/*/_delta_log/*.json"`) and `_schemas` is a BOOLEAN, so this is a strategy change, not a parameter.
-   ⚠ Measure before choosing recursive-glob vs repeated globs: this repo records ~85 ms per active file
-   on S3 and a per-match cost in `HostFsGlob`.
-6. **Delta declares `supports_nested_schemas`** in its capability JSON (`DeltaCatalog` ~L1073) — and ONLY
-   then, since the flag is what makes DuckDB offer `a.b`.
-7. **Gates**: a table at depth 3 resolving as `cat.a.b.t`; `duckdb_schemas()` showing the nesting; a
-   two-level control proving the existing layouts are unchanged; and a mutant.
+**What is on the wire.** `table_open` takes `const char *const *schema_path, int32_t schema_path_len`
+instead of one `const char *schema` — the v91 bump, both halves (`FABRICATOR_ABI_VERSION`,
+`vtable->AbiVersion`). The managed contract gains `IProviderCatalog.GetTable(IReadOnlyList<string>,
+string)` as a DEFAULT INTERFACE METHOD that takes the LEAF, so an un-migrated provider — the four
+out-of-tree plugins included, which pin `Fabricator.Abstractions` by SHA — is byte-for-byte unaffected.
 
-⚠ Do NOT turn the capability on before steps 1-5, and keep SQL Server + Fabric `Tables/` off permanently.
+**What is in the host.** `DiscoverSchemaPaths`/`DiscoverTables` stop flattening;
+`FabricatorCatalog::EnsureSchemaPathLocked` walks a path creating one entry per level (ONE function, not
+the two identical lambdas it replaced — LoadCatalog and RefreshCache must register the same tree or a
+refresh reshapes the catalog); `ScanSchemas` and both `Scan` overloads report the tree;
+`ClearTables`/`InvalidateEntryCache`/`InvalidateMatching` recurse into children.
+`FabricatorTableInfo` gained `schema_path` ALONGSIDE `schema_name` — measured 20 consumers of the leaf,
+and the ones that matter (functions, macros, views) resolve against the TOP-LEVEL map and are correct
+*because* they do not nest.
+
+**What is in the provider.** `nested_schemas` is OPT-IN and REFUSED on a OneLake root (Fabric's `Tables/`
+is defined as exactly two levels). It supersedes `schemas` rather than extending it: nested mode is the
+`schemas` layout generalised, so at depth 1 the two discover the identical thing. Local roots walk
+directories (O(dirs) syscalls, stopping at any directory holding a `_delta_log` — a table's own
+subdirectories are its data/partition folders); object stores take ONE recursive `**` glob.
+
+#### ⚠⚠ NESTING IS READ-ONLY, BY A LOUD REFUSAL RATHER THAN BY OMISSION
+
+Only `table_open` takes a path. `create_table` / `drop_table` / `begin_bulk` / `execute_update` /
+`execute_delete` / `insert_returning` / `create_schema` / `drop_schema` still carry one `const char
+*schema`, and handing them a nested schema's LEAF does not fail — it resolves to a DIFFERENT, same-named
+top-level schema, or creates the table one level too shallow. `FabricatorRefuseNestedWrite` refuses each
+BY NAME instead. Reads nest; writes say so.
+
+- **⚠ ALTER and COMMENT ON are refused too, and my first version exempted them on a WRONG argument** —
+  that they ride `table_alter` on the table SESSION, which was opened with the full path. The entry does;
+  the managed side then calls `AlterTable(spec, definition.SchemaName, TableName)` and re-derives the
+  storage path from the leaf, exactly like the flat crossings. **Found by reading the callee**, which is
+  the rule this repo already records, after the SCAN was caught doing the same thing.
+- ⚠ `COMMENT ON` never reaches the refusal anyway: DuckDB's PARSER caps it at three qualifications. The
+  gate pins the parser's error, not ours — asserting ours would misname the layer that stops it.
+
+#### ⚠⚠ FOUR DEFECTS, AND THREE OF THEM WERE SILENT OR MISLEADING
+
+1. **`FabricatorCatalog::LookupSchema` never WALKED the path, and that is the one that made depth 3
+   impossible.** It did a straight `schemas_.find()`, which answers only the FIRST level. `DuckCatalog`
+   delegates to `Catalog::LookupSchemaPath` with a root-lookup lambda and nothing else; omitting that is
+   omitting the walk. MEASURED: `cat.a.b.t` reported *schema "a.b" does not exist* while `cat.a` and
+   `cat.s.t` both resolved. ⚠ **A two-level layout cannot see this** — its lookups never go past the root,
+   which is why slices 1 and 2a stayed green with it missing.
+2. **Slice 2a's `SCHEMA_ENTRY` branch sat BELOW the `!transaction.context` guard**, so it was unreachable
+   from the walk: `Catalog::GetSchema` reaches `LookupEntry` through a CatalogTransaction carrying no
+   ClientContext. Everything below that guard materializes an entry from the provider and genuinely needs
+   a context; a child schema is already in memory and needs none.
+3. **THE SCAN RE-DERIVED THE PATH FROM THE LEAF.** `DeltaTableBinding.Scan` called
+   `Catalog.ScanCore(SchemaName, TableName, …)`, which recomputes `TablePath`. MEASURED in the bridge log,
+   and the shape is the instructive part: `table_open` and the describe both used `<root>/a/b/t1`, then
+   the scan opened `<root>/b/t1` and reported *"No Delta table found"*. The binding's own `Path` is the
+   identity everything else on it already keys on; the scan was the one member that did not use it.
+4. **⚠⚠ THE PATH OVERLOAD OF `TablePath` BROKE THE *FLAT* LAYOUT — a regression in code that only exists
+   for nesting.** Since v91 the host calls `GetTable(path, …)` for EVERY table, so a depth-1 path reaches
+   the path overload too; joining it unconditionally put a plain `PROVIDER 'delta'` catalog's tables at
+   `<root>/main/<table>`. MEASURED: the attach wrote `<root>/loose` and then looked for
+   `<root>/main/loose`, so the table vanished on re-attach. A depth-1 path now DELEGATES to the
+   name overload, which is where the flat/schemas/OneLake question has always been answered.
+
+#### ⚠⚠ "main" IS AN ORDINARY DIRECTORY HERE, AND A SMOKE TEST KILLED THE OTHER DESIGN
+
+The first version gave a ROOT-LEVEL table the synthetic schema `main` (the flat layout's rule) and
+resolved `["main"]` back to the root. A five-line smoke test ended it: `CREATE TABLE cat.main.t` under
+`schemas true` makes a REAL `<root>/main/` folder, so the commonest existing layout would have collided
+with the synthetic name on the very first ATTACH, and one of the two sets of tables would have read from
+the wrong directory with nothing failing. ⇒ every segment is a real directory, and a Delta table sitting
+directly under the root is SKIPPED with a warning naming it. That is not a regression: `schemas true`
+does not discover one either (its glob is two levels deep). Both halves are gated, with the same root
+attached FLAT as the control proving the table exists.
+
+#### Measured, and not measured
+
+- `**` matches zero or more directory levels in DuckDB's **local** glob — measured directly, including
+  that a depth-1 table still matches. ⚠ The httpfs/azure glob implementations are a different code path
+  and are **NOT** measured here, so the object-store leg of nested discovery is reasoned, not tested.
+- The plain-ADLS SDK fast path (`AdlsTableDiscovery`) is deliberately not used for nested roots: its walk
+  is fixed at one or two levels. Nested ADLS pays the glob — correct, and slower.
+- Depth is capped at 16 levels and REFUSES rather than truncating; silently not discovering a table is
+  the failure mode the whole feature exists to avoid.
+
+#### What slice 2c would be
+
+Widen the eight write crossings to carry a path (each needs a managed DIM, same shape as `GetTable`), and
+give `AlterTable` the binding's resolved path instead of its leaf name. Then the refusals go, and
+`CREATE SCHEMA a.b` can create a directory instead of being refused.
 
 ### Slice 2 — as originally planned
 

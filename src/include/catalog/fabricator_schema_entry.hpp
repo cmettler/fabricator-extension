@@ -35,6 +35,23 @@ void RegisterFabricatorInOutFinalizer(DBConfig &config);
 //! Currently scalar only (table/in-out kinds are a later slice). See docs/global-functions.md.
 void RegisterFabricatorGlobalFunctions(ExtensionLoader &loader);
 
+//! Refuses `statement` when `schema` is NESTED (has a parent), and does nothing otherwise.
+//!
+//! ⚠⚠ IT EXISTS BECAUSE THE WRITE CROSSINGS STILL CARRY A FLAT SCHEMA NAME. Only `table_open` takes a
+//! path (ABI v91); create_table / drop_table / begin_bulk / execute_update / execute_delete /
+//! insert_returning / create_schema / drop_schema each take one `const char *schema`, and handing them a
+//! nested schema's LEAF would not fail — it would resolve to a DIFFERENT, same-named top-level schema, or
+//! create the table one level too shallow. A silently wrong target is the failure class this codebase
+//! keeps paying for, so the boundary is LOUD instead. Reads nest; writes refuse.
+//!
+//! ⚠⚠ ALTER AND COMMENT ON ARE REFUSED TOO, AND MY FIRST VERSION EXEMPTED THEM ON A WRONG ARGUMENT —
+//! that they ride the `table_alter` entry of the table SESSION, which was opened with the full path.
+//! The ENTRY does, but the managed side then calls `AlterTable(spec, definition.SchemaName, TableName)`
+//! and re-derives the storage path from the LEAF name, exactly like the flat crossings. Found by reading
+//! the callee rather than the entry, after the SCAN was caught doing the same thing (and the scan is the
+//! half that was MEASURED: it described `<root>/a/b/t1` and then read `<root>/b/t1`).
+void FabricatorRefuseNestedWrite(const SchemaCatalogEntry &schema, const char *statement);
+
 class FabricatorSchemaEntry : public SchemaCatalogEntry {
 public:
 	//! \param parent_schema the enclosing schema for a NESTED schema (DuckDB 2.0), else null. It is a
@@ -55,6 +72,11 @@ public:
 	//! every entry's `ParentSchema()` is a REFERENCE into its schema entry, so destroying a parent while a
 	//! child (or a child's table) is still reachable is the use-after-free this codebase already records.
 	FabricatorSchemaEntry &GetOrCreateChildSchema(const string &name);
+
+	//! This entry's schema PATH as plain strings, outermost first — depth 1 for a top-level schema. What
+	//! the `table_open` crossing takes since ABI v91, and what tells a nested schema from a flat one at
+	//! every host-side refusal (the write crossings still carry a flat name).
+	vector<string> SchemaPathStrings() const;
 
 	//! The child schemas, by name. Empty unless the provider emitted paths deeper than one.
 	const case_insensitive_map_t<unique_ptr<FabricatorSchemaEntry>> &ChildSchemas() const {
@@ -166,8 +188,19 @@ public:
 
 private:
 	//! Nested child schemas, OWNED by this entry so a parent always outlives its children (see
-	//! GetOrCreateChildSchema). Empty for every provider today: nothing emits a path deeper than one.
+	//! GetOrCreateChildSchema). Empty unless the provider emitted a path deeper than one, which needs the
+	//! `supports_nested_schemas` capability.
+	//! \warning Guarded by the CATALOG's `schema_lock_`, not by `entry_lock_`: it is written only by
+	//! GetOrCreateChildSchema, whose single caller (FabricatorCatalog::EnsureSchemaPathLocked) runs under
+	//! that lock for the whole discovery pass, and read only by callers that already hold it.
 	case_insensitive_map_t<unique_ptr<FabricatorSchemaEntry>> child_schemas_;
+
+	//! Recurses ClearTables into every child schema — see the comment on the definition.
+	void ClearChildTables();
+
+	//! Reports every child schema to `callback` — the CatalogType::SCHEMA_ENTRY answer of both Scan
+	//! overloads, which is how DuckDB's own ScanSchemaTree walks a nested catalog.
+	void ScanChildSchemas(const std::function<void(CatalogEntry &)> &callback);
 
 	//! COMMENT ON TABLE / COMMENT ON COLUMN. Its own method rather than a case in Alter's switch because
 	//! those arrive as AlterType::SET_COMMENT / SET_COLUMN_COMMENT and carry NO AlterTableInfo — so they

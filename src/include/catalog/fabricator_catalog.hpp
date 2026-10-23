@@ -209,6 +209,20 @@ private:
 	bool exact_filter_pushdown_ = false;
 	mutex schema_lock_;
 	case_insensitive_map_t<unique_ptr<FabricatorSchemaEntry>> schemas_;
+
+	//! Finds — creating each missing level — the schema entry at `path`, outermost element first, and
+	//! returns the LEAF. A one-element path is the flat case and touches only `schemas_`; deeper levels
+	//! become child entries (FabricatorSchemaEntry::GetOrCreateChildSchema), which is what makes DuckDB
+	//! report `cat.a.b.t` for a table registered under `["a","b"]`.
+	//! \warning THE CALLER MUST ALREADY HOLD `schema_lock_` — both call sites (LoadCatalog, RefreshCache)
+	//! take it for the whole discovery pass, so taking it here would self-deadlock.
+	//! \warning An EMPTY path yields the entry for the empty schema name, which is what the two lambdas
+	//! this replaced did with `path.back()` on an empty path. A provider emitting one is already in error;
+	//! inventing a different answer here would only move where it surfaces.
+	//! \warning It is ONE function rather than the two identical lambdas it replaced BECAUSE they were
+	//! identical and had to stay so: LoadCatalog and RefreshCache must register the same tree or a refresh
+	//! silently reshapes the catalog.
+	FabricatorSchemaEntry &EnsureSchemaPathLocked(const vector<string> &path);
 	// GRAVEYARD: evicted schema entries are RETIRED, never destroyed mid-session — binders hold raw
 	// pointers across the lock, AND every (possibly retired) table entry's ParentSchema() is a reference
 	// into its FabricatorSchemaEntry, so schemas must outlive their entries. Freed at catalog teardown.

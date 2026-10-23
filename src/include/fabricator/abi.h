@@ -932,13 +932,30 @@ typedef struct FabricatorVTable {
 	// which the per-transaction invalidation already owns. table_close in the entry DESTRUCTOR (teardown),
 	// best-effort: it frees a GCHandle, nothing more.
 	// -------------------------------------------------------------------------
-	// Resolve (schema, table) to a table-session handle. `at_unit`/`at_value` (NULL/empty => none) carry the
-	// reference's AT clause — part of the handle's IDENTITY, matching the C++ side where AT entries live in
-	// their own map (time travel is a property of a reference). NO IO and NO absence probe: absence is
-	// established by table_schema, the first actual read — same contract as the old kind-2, one entry over.
-	// Cheap opening is load-bearing: catalog enumeration materializes every table.
-	int32_t (*table_open)(FabricatorHandle handle, const char *schema, const char *table, const char *at_unit,
-	                      const char *at_value, FabricatorHandle *out_table, char **err);
+	// Resolve (schema PATH, table) to a table-session handle. `at_unit`/`at_value` (NULL/empty => none)
+	// carry the reference's AT clause — part of the handle's IDENTITY, matching the C++ side where AT
+	// entries live in their own map (time travel is a property of a reference). NO IO and NO absence probe:
+	// absence is established by table_schema, the first actual read — same contract as the old kind-2, one
+	// entry over. Cheap opening is load-bearing: catalog enumeration materializes every table.
+	//
+	// ⚠ `schema_path` IS AN ARRAY OF `schema_path_len` UTF-8 NAMES, OUTERMOST FIRST (v91, was a single
+	// `const char *schema`). `["a","b"]` is the schema `b` nested inside `a` — the same shape, and for the
+	// same reason, as the LIST<VARCHAR> the catalog_schemas / catalog_tables streams carry since v90: a
+	// schema name may legitimately contain a dot, so any joined spelling would need escaping at every
+	// boundary and a provider that forgot would silently split one schema into two.
+	// ⚠ EVERY provider that does not declare `supports_nested_schemas` receives exactly one element, which
+	// is the name the old parameter carried. The managed default (IProviderCatalog.GetTable over a path)
+	// takes the LEAF, so an un-migrated provider — including the out-of-tree plugins, which pin
+	// Fabricator.Abstractions by SHA — is byte-for-byte unaffected.
+	// ⚠ The WRITE crossings below (create_table / drop_table / begin_bulk / execute_update /
+	// execute_delete / insert_returning / create_schema / drop_schema) still carry a FLAT `const char
+	// *schema`, and the host REFUSES each of them on a schema deeper than one rather than passing a leaf
+	// that would resolve to the wrong place. ALTER and COMMENT ON are refused too, although they ride THIS
+	// session: table_alter hands the provider the definition's leaf schema NAME, so it re-derives the same
+	// wrong path. Nesting is READ-ONLY until all of that is widened.
+	int32_t (*table_open)(FabricatorHandle handle, const char *const *schema_path, int32_t schema_path_len,
+	                      const char *table, const char *at_unit, const char *at_value,
+	                      FabricatorHandle *out_table, char **err);
 	// The table's column layout: a ZERO-ROW stream whose Arrow schema is the answer — the kind-2 carrier
 	// kept deliberately (PopulateReturnSchema is the proven import path incl. VARIANT extension types; a
 	// bare ArrowSchema would fork the type conversion for zero gain). Binds against the ambient txn, so a
@@ -1348,7 +1365,7 @@ typedef struct FabricatorHostServices {
 // state blob is this many bytes + a 4-byte length prefix). Serialize() must fit within it.
 #define FABRICATOR_AGG_SPILL_CAP 1024
 
-#define FABRICATOR_ABI_VERSION 90
+#define FABRICATOR_ABI_VERSION 91
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(FabricatorVTable) as seen

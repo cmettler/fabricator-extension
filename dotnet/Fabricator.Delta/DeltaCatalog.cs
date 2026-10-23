@@ -245,6 +245,20 @@ public sealed class DeltaCatalog : IProviderCatalog
     // DROP all schema-aware). Default false = the flat <root>/<table>, "main"-only layout. Ignored for OneLake
     // (its layout is driven by the lakehouse's schema-enabled flag, not this option).
     private readonly bool _schemas;
+    // ATTACH option `nested_schemas true`: the directory tree UNDER the root IS the schema tree, to any
+    // depth — a directory holding a `_delta_log` is a TABLE, anything else is one more schema level. This is
+    // what makes DuckDB 2.0's `cat.a.b.t` resolve (docs/nested-schemas.md); the host only offers that syntax
+    // when the capability doc below declares `supports_nested_schemas`, which this option is what turns on.
+    //
+    // ⚠ It SUPERSEDES `schemas` rather than extending it: a one-level layout discovers at depth 1 exactly as
+    // `schemas true` does, and a flat layout puts its tables in "main" exactly as the default does — so the
+    // two option values stay independent and `schemas` is simply not consulted while this is on.
+    // ⚠ OPT-IN, and it must stay so. Recursing by DEFAULT would reclassify any non-table directory sitting
+    // beside the tables of an EXISTING two-level lakehouse as a schema, which is a catalog-shape change
+    // nobody asked for.
+    // ⚠ REFUSED on a OneLake root: Fabric's Tables/ area is defined as exactly two levels, so offering a
+    // syntax that resolves to nothing there would be worse than not offering it.
+    private readonly bool _nestedSchemas;
     // Per-catalog write-tuning DEFAULTS from the ATTACH options (overlaid by the session delta_write_options
     // setting at write time). Null => engineered-wood's default. See ResolveWriteSpec.
     private readonly string? _defaultCompression;
@@ -339,6 +353,12 @@ public sealed class DeltaCatalog : IProviderCatalog
     public ITable GetTable(string schemaName, string tableName) =>
         new DeltaTableDefinition(this, schemaName, tableName);
 
+    /// <summary>The path-addressed form (ABI v91). Overridden rather than left to the interface's
+    /// leaf-taking default because this provider CAN nest: with the default, <c>cat.a.b.t</c> would resolve
+    /// to whatever <c>b.t</c> means — a different table, reported as success.</summary>
+    public ITable GetTable(IReadOnlyList<string> schemaPath, string tableName) =>
+        new DeltaTableDefinition(this, schemaPath, tableName);
+
     /// <summary>Binds (schema, table) against the AMBIENT transaction — the metadata/scan adapters' path
     /// onto the object model. Ambient txn 0 (a genuinely transaction-free context) yields a transient
     /// caller-owned binding, matching the old null-scope behaviour.</summary>
@@ -406,6 +426,7 @@ public sealed class DeltaCatalog : IProviderCatalog
         _inCommitTimestampsOnCreate = ParseBoolOption(optionsJson, "in_commit_timestamps");
         _changeDataFeedOnCreate = ParseBoolOption(optionsJson, "change_data_feed");
         _schemas = ParseBoolOption(optionsJson, "schemas");
+        _nestedSchemas = ParseBoolOption(optionsJson, "nested_schemas");
         _defaultCompression = ParseStringOption(optionsJson, "compression");
         _defaultRowGroupSize = ParseIntOption(optionsJson, "row_group_size");
         _defaultBloomColumns = ParseListOption(optionsJson, "bloom_filter_columns");
@@ -609,7 +630,27 @@ public sealed class DeltaCatalog : IProviderCatalog
     /// <summary>True when this catalog uses the two-level <c>&lt;root&gt;/&lt;schema&gt;/&lt;table&gt;</c> layout:
     /// a schema-enabled OneLake lakehouse, OR a non-OneLake root with the <c>schemas true</c> ATTACH option.
     /// (<see cref="OneLake"/> is null for non-OneLake roots, so the two arms are mutually exclusive.)</summary>
-    private bool SchemaLayout => OneLake()?.SchemaEnabled == true || (OneLake() is null && _schemas);
+    private bool SchemaLayout => OneLake()?.SchemaEnabled == true || (OneLake() is null && (_schemas || _nestedSchemas));
+
+    /// <summary>True when this catalog discovers a schema TREE (the <c>nested_schemas</c> ATTACH option on a
+    /// non-OneLake root). Checked here rather than at the option read because <see cref="OneLake"/> resolves
+    /// lazily — the root's shape is not known in the constructor.</summary>
+    private bool NestedLayout
+    {
+        get
+        {
+            if (!_nestedSchemas)
+            {
+                return false;
+            }
+            if (OneLake() is not null)
+            {
+                throw Unsupported("ATTACH option nested_schemas on a OneLake root (Fabric's Tables/ area is "
+                                  + "exactly two levels — use the lakehouse's own schema-enabled flag)");
+            }
+            return true;
+        }
+    }
 
     private static bool ParseBoolOption(string? optionsJson, string key) =>
         ParseBoolOption(optionsJson, key, defaultValue: false);
@@ -1045,6 +1086,29 @@ public sealed class DeltaCatalog : IProviderCatalog
     internal string TablePath(string schema, string table) =>
         SchemaLayout ? _root + "/" + schema + "/" + table : _root + "/" + table;
 
+    /// <summary>The storage directory of a table addressed by its full SCHEMA PATH (outermost first) — the
+    /// nested-layout form of <see cref="TablePath(string,string)"/>.</summary>
+    /// <remarks>
+    /// ⚠⚠ EVERY SEGMENT IS A REAL DIRECTORY, "main" INCLUDED, which makes nested mode exactly the
+    /// <c>schemas</c> layout generalised to any depth — at depth 1 the two produce the identical path.
+    /// An earlier version gave a ROOT-LEVEL table the synthetic schema "main" (the FLAT layout's rule) and
+    /// resolved <c>["main"]</c> to the root; a smoke test killed it, because <c>CREATE TABLE
+    /// cat.main.t</c> under <c>schemas true</c> makes a REAL <c>&lt;root&gt;/main/</c> folder — so the
+    /// commonest existing layout would have collided with the synthetic name on the very first ATTACH.
+    /// Root-level tables are skipped instead (see DiscoverNestedTables), exactly as <c>schemas true</c>
+    /// already skips them — but LOUDLY.
+    /// </remarks>
+    internal string TablePath(IReadOnlyList<string> schemaPath, string table) =>
+        // ⚠⚠ A DEPTH-1 PATH DELEGATES TO THE NAME OVERLOAD RATHER THAN JOINING. Since ABI v91 the host
+        // calls THIS one for every table, nested or not, so joining unconditionally put a FLAT catalog's
+        // tables at <root>/main/<table> — MEASURED as exactly that: a plain `PROVIDER 'delta'` attach wrote
+        // <root>/loose and then looked for <root>/main/loose, so the table vanished on re-attach. Depth 1
+        // is the layout question the name overload already answers (flat vs schemas vs OneLake); only a
+        // deeper path, which no layout but nested_schemas can produce, is a literal directory chain.
+        schemaPath.Count <= 1
+            ? TablePath(schemaPath.Count == 0 ? MainSchema : schemaPath[0], table)
+            : _root + "/" + string.Join("/", schemaPath) + "/" + table;
+
     // The host-consumed capability doc (ABI v71, read once at ATTACH). `exact_filter_pushdown` is derived
     // from the SAME _pushdownMode the diagnostic ServerInfo row reads, so the two surfaces cannot drift.
     //
@@ -1068,10 +1132,26 @@ public sealed class DeltaCatalog : IProviderCatalog
     // correct because DuckDB re-applies its own TopN. What must never happen is a provider honouring the
     // LIMIT while dropping the ORDER BY — the reader's own gate is what prevents that (see
     // DeltaNativeReader's suffix construction), not this declaration.
+    //
+    // `supports_nested_schemas` rides the `nested_schemas` ATTACH option and nothing else. It is the switch
+    // that makes DuckDB offer `cat.a.b.t` at all, so declaring it without the depth-aware discovery below
+    // would offer a syntax that resolves to nothing — which is why the option drives both.
     public string CapabilitiesJson
-        => _pushdownMode == PushdownMode.Exact
-            ? "{\"exact_filter_pushdown\":true,\"is_binary_collation\":true,\"null_order_expressible\":true}"
-            : "{\"is_binary_collation\":true,\"null_order_expressible\":true}";
+    {
+        get
+        {
+            var caps = "\"is_binary_collation\":true,\"null_order_expressible\":true";
+            if (_pushdownMode == PushdownMode.Exact)
+            {
+                caps = "\"exact_filter_pushdown\":true," + caps;
+            }
+            if (NestedLayout)
+            {
+                caps += ",\"supports_nested_schemas\":true";
+            }
+            return "{" + caps + "}";
+        }
+    }
 
     // ── catalog discovery (the five dedicated list members — ABI v72; the kind multiplexer is gone). The
     // per-TABLE questions live on the typed ITableBinding members (DeltaTableBinding), reached through the host's
@@ -1082,6 +1162,61 @@ public sealed class DeltaCatalog : IProviderCatalog
     public IArrowArrayStream GetSchemas() => SingleColumn("schema_name", CatalogSchemaNames());
 
     public IArrowArrayStream GetTables() => DiscoverTables();
+
+    // ── the PATH-shaped discovery (ABI v90). Overridden ONLY because this provider can nest: without
+    // nested_schemas both members fall back to the interface default, which widens the flat streams above
+    // into depth-1 paths — byte-identical to what they emitted before paths existed.
+    public IArrowArrayStream GetSchemaPaths() => NestedLayout
+        ? SchemaPathAdapter.PathTable("schema_path", NestedSchemaPaths())
+        : SchemaPathAdapter.WidenFirstColumn(GetSchemas(), "schema_path");
+
+    public IArrowArrayStream GetTablePaths()
+    {
+        if (!NestedLayout)
+        {
+            return SchemaPathAdapter.WidenFirstColumn(GetTables(), "schema_path");
+        }
+        var tables = DiscoverNestedTables();
+        var paths = new List<IReadOnlyList<string>>(tables.Count);
+        var names = new List<string>(tables.Count);
+        var types = new List<string>(tables.Count);
+        foreach (var (path, table) in tables)
+        {
+            paths.Add(path);
+            names.Add(table);
+            types.Add("BASE TABLE");
+        }
+        return SchemaPathAdapter.PathTable("schema_path", paths, ("table_name", names), ("table_type", types));
+    }
+
+    /// <summary>Every schema PATH a nested root advertises: the synthetic "main", each discovered table's
+    /// own path AND every PREFIX of it, plus the <c>delta</c> function namespace.</summary>
+    /// <remarks>⚠ The PREFIXES matter: <c>a/b/t</c> makes <c>a.b</c> a schema, but it also makes <c>a</c>
+    /// one, and a level the provider does not advertise would exist only because the host happens to create
+    /// intermediate entries while registering the table. Advertising them keeps `duckdb_schemas()` honest
+    /// about a level that holds nothing but other levels.
+    /// ⚠ An EMPTY directory level is still not discovered, for the same reason an empty schema is not in
+    /// the flat layout: nothing under it carries a `_delta_log` to find.</remarks>
+    private List<IReadOnlyList<string>> NestedSchemaPaths()
+    {
+        var seen = new SortedSet<string>(System.StringComparer.Ordinal) { MainSchema };
+        var paths = new List<IReadOnlyList<string>>();
+        foreach (var (path, _) in DiscoverNestedTables())
+        {
+            for (int depth = 1; depth <= path.Length; depth++)
+            {
+                seen.Add(string.Join("/", path[..depth]));
+            }
+        }
+        // The function namespace is FLAT by construction — delta.checkpoint() and friends are declared, not
+        // discovered, so they can never sit under a nested level.
+        seen.Add(DeltaFunctions.SchemaName);
+        foreach (var key in seen)
+        {
+            paths.Add(key.Split('/'));
+        }
+        return paths;
+    }
 
     // Provider-declared CATALOG-BOUND custom functions (schema_name, name, kind). Built IN MEMORY —
     // unlike SqlServerCatalog, this provider has no SQL engine to assemble a discovery query with, and
@@ -1410,6 +1545,20 @@ public sealed class DeltaCatalog : IProviderCatalog
             }
             return new List<string>(schemas);
         }
+        if (NestedLayout)
+        {
+            // ⚠ TOP-LEVEL names only, and that is the right answer here rather than a shortcut. This list
+            // drives the `__all__` expansion of catalog MACROS and VIEWS, which the host resolves against
+            // its TOP-LEVEL schema map (they do not nest — see FabricatorTableInfo.schema_name). Returning
+            // a deeper level would declare a macro into a schema the host would then fail to find, and
+            // dropping it silently is exactly how a declaration goes missing with no message.
+            var top = new SortedSet<string>(System.StringComparer.Ordinal) { MainSchema };
+            foreach (var (path, _) in DiscoverNestedTables())
+            {
+                top.Add(path[0]);
+            }
+            return new List<string>(top);
+        }
         if (ol is null && _schemas)
         {
             // schemas-mode local/S3: schemas = the <root>/<schema>/ subfolders that contain a table, plus "main"
@@ -1558,6 +1707,134 @@ public sealed class DeltaCatalog : IProviderCatalog
         return outList;
     }
 
+    /// <summary>The deepest schema nesting <c>nested_schemas</c> will walk. A guard against a runaway
+    /// recursion over a tree that is not a lakehouse at all (an ATTACH pointed at a home directory), not a
+    /// protocol limit — it REFUSES rather than truncates, because silently not discovering a table is the
+    /// failure mode this whole feature exists to avoid.</summary>
+    private const int MaxNestedDepth = 16;
+
+    /// <summary>Discovers (schema PATH, table) pairs under a <c>nested_schemas</c> root: the directory tree
+    /// IS the schema tree, and a directory holding a <c>_delta_log</c> is a TABLE rather than one more
+    /// level. Nested mode is the <c>schemas</c> layout generalised: every segment is a real directory, so
+    /// at depth 1 the two discover exactly the same thing.</summary>
+    /// <remarks>
+    /// <para>⚠⚠ A DELTA TABLE SITTING DIRECTLY UNDER THE ROOT IS SKIPPED, WITH A WARNING NAMING IT. Every
+    /// schema segment here is a real directory, so a root-level table has no directory to name its schema
+    /// — and <c>schemas true</c>, which nested mode generalises, does not discover one either (its glob is
+    /// two levels deep). Giving it the synthetic "main" instead was tried and is WRONG: <c>schemas</c>
+    /// mode creates a real <c>&lt;root&gt;/main/</c> folder for <c>cat.main.t</c>, so the synthetic name
+    /// would collide with the commonest existing layout and one of the two sets of tables would read from
+    /// the wrong directory with nothing failing. Skipping is the honest answer; the warning is what keeps
+    /// it from being silent.</para>
+    /// <para>⚠ The local walk is O(dirs) syscalls; the object-store leg is ONE recursive glob
+    /// (<c>**</c>), which is O(commit files) and therefore the expensive shape this repo already records
+    /// (~85 ms per active file on S3). One listing rather than one per level is the cheaper of the two
+    /// available spellings. ⚠ <c>**</c> is MEASURED against DuckDB's LOCAL glob (it matches zero or more
+    /// levels, so a depth-1 table is found too); the httpfs/azure implementations are a different code path
+    /// and are NOT measured here.</para>
+    /// <para>⚠ The plain-ADLS SDK fast path (AdlsTableDiscovery) is deliberately NOT used: its walk is
+    /// fixed at one or two levels. Nested ADLS therefore pays the glob — correct, and slower.</para>
+    /// <para>⚠ UNCACHED, and called several times per ATTACH (the schema paths, the table paths, and
+    /// SchemaNames for the function / macro / view expansions) — exactly as <see cref="DiscoverTablePairs"/>
+    /// already is, so this is not a new rule being broken. It costs more HERE than there on an object
+    /// store, because each call is a recursive glob rather than a fixed-depth one. A per-ATTACH memo is
+    /// the obvious fix and is deliberately not in this slice: it needs the same invalidation the rest of
+    /// the discovery path does not have yet.</para>
+    /// </remarks>
+    private List<(string[] Path, string Table)> DiscoverNestedTables()
+    {
+        var found = new List<(string[] Path, string Table)>();
+        if (System.IO.Directory.Exists(_root))
+        {
+            WalkNested(_root, new List<string>(), found);
+        }
+        else
+        {
+            var json = HostFs.Glob(Opener(), _root + "/**/_delta_log/*.json");
+            var rootPrefix = Normalize(_root) + "/";
+            var seen = new HashSet<string>(System.StringComparer.Ordinal);
+            using var doc = JsonDocument.Parse(json);
+            foreach (var el in doc.RootElement.EnumerateArray())
+            {
+                var path = Normalize(el.GetProperty("path").GetString() ?? string.Empty);
+                int marker = path.IndexOf("/_delta_log/", System.StringComparison.Ordinal);
+                if (marker < 0 || !path.StartsWith(rootPrefix, System.StringComparison.Ordinal))
+                {
+                    continue;
+                }
+                // <root>/<seg>/…/<table>/_delta_log/… — everything between the root and _delta_log, split.
+                var relative = path.Substring(rootPrefix.Length, marker - rootPrefix.Length);
+                var segments = relative.Split('/');
+                if (segments[segments.Length - 1].Length == 0)
+                {
+                    continue;
+                }
+                if (!seen.Add(relative))
+                {
+                    continue; // one entry per TABLE, not per commit file
+                }
+                if (segments.Length == 1)
+                {
+                    WarnRootTable(segments[0]);
+                    continue;
+                }
+                found.Add((segments[..^1], segments[segments.Length - 1]));
+            }
+        }
+
+        foreach (var (schemaPath, table) in found)
+        {
+            if (schemaPath.Length > MaxNestedDepth)
+            {
+                throw Unsupported($"a schema nested {schemaPath.Length} levels deep (table '{table}'); "
+                                  + $"nested_schemas walks at most {MaxNestedDepth}");
+            }
+        }
+        found.Sort((x, y) =>
+        {
+            int c = string.CompareOrdinal(string.Join("/", x.Path), string.Join("/", y.Path));
+            return c != 0 ? c : string.CompareOrdinal(x.Table, y.Table);
+        });
+        return found;
+    }
+
+    private void WarnRootTable(string table) =>
+        _log.LogWarning(
+            "delta nested_schemas: the Delta table '{Table}' sits directly under the root and is NOT "
+            + "discovered — every schema level is a real directory here, so a table needs at least one. "
+            + "Move it under a schema folder, or attach without nested_schemas.", table);
+
+    private void WalkNested(string dir, List<string> prefix, List<(string[] Path, string Table)> found)
+    {
+        if (prefix.Count > MaxNestedDepth)
+        {
+            throw Unsupported($"a directory nested more than {MaxNestedDepth} levels under the root "
+                              + "(nested_schemas stops there rather than walking an arbitrary tree)");
+        }
+        foreach (var child in System.IO.Directory.EnumerateDirectories(dir))
+        {
+            var name = System.IO.Path.GetFileName(child);
+            if (string.Equals(name, "_delta_log", System.StringComparison.Ordinal))
+            {
+                continue;
+            }
+            if (System.IO.Directory.Exists(System.IO.Path.Combine(child, "_delta_log")))
+            {
+                // A table's own subdirectories are its data / partition folders, never schemas: stop here.
+                if (prefix.Count == 0)
+                {
+                    WarnRootTable(name);
+                    continue;
+                }
+                found.Add((prefix.ToArray(), name));
+                continue;
+            }
+            prefix.Add(name);
+            WalkNested(child, prefix, found);
+            prefix.RemoveAt(prefix.Count - 1);
+        }
+    }
+
     /// <summary>Discovers (schema, table) pairs. OneLake → the DFS-resolved list. Non-OneLake → globs the Delta
     /// commit files: flat <c>&lt;root&gt;/*/_delta_log/*.json</c> (schema "main") or, in <c>schemas</c> mode, the
     /// two-level <c>&lt;root&gt;/*/*/_delta_log/*.json</c> (the segment before <c>_delta_log</c> = table, the one
@@ -1666,11 +1943,16 @@ public sealed class DeltaCatalog : IProviderCatalog
                                        IArrowArrayStream? filterValues) =>
         BindAmbient(schemaName, tableName).Scan(specJson, filterValues);
 
+    /// <param name="resolvedPath">The table's storage directory when the CALLER already has it — a bound
+    /// table does, and on a nested root it is the only correct source: re-deriving from the LEAF schema
+    /// name lands one or more levels too shallow. MEASURED as exactly that before this parameter existed:
+    /// `cat.a.b.t1` opened and described `&lt;root&gt;/a/b/t1` and then SCANNED `&lt;root&gt;/b/t1`, which
+    /// reported "No Delta table found". Null = derive from the names, which is right everywhere else.</param>
     internal IArrowArrayStream ScanCore(string schemaName, string tableName, string? specJson,
-                                        IArrowArrayStream? filterValues)
+                                        IArrowArrayStream? filterValues, string? resolvedPath = null)
     {
         var opener = Opener();
-        var path = TablePath(schemaName, tableName);
+        var path = resolvedPath ?? TablePath(schemaName, tableName);
         // Push the FILTER into engineered-wood file/row-group skipping (superset-safe; DuckDB re-applies).
         // Projection is left to DuckDB above the scan (the full schema is returned, mapped by name) — same as
         // the global fabricator_delta_scan; column-pruning into parquet would need a projected-schema stream.
@@ -3035,7 +3317,11 @@ public sealed class DeltaCatalog : IProviderCatalog
     public void CreateSchema(string s, bool ie)
     {
         InvalidateReadCache();
-        if (_schemas && OneLake() is null && !string.Equals(s, MainSchema, System.StringComparison.Ordinal))
+        // `_nestedSchemas` counts too: a TOP-LEVEL schema on a nested root is the same <root>/<s>/ folder.
+        // A NESTED `CREATE SCHEMA a.b` never reaches here — the host refuses it, because create_schema
+        // carries one name and would make the folder in the wrong place (see FabricatorRefuseNestedWrite).
+        if ((_schemas || _nestedSchemas) && OneLake() is null &&
+            !string.Equals(s, MainSchema, System.StringComparison.Ordinal))
         {
             HostFs.CreateDir(Opener(), _root + "/" + s); // recursive mkdir; idempotent
         }
@@ -5219,7 +5505,7 @@ public sealed class DeltaCatalog : IProviderCatalog
     public void DropSchema(string s, bool ie)
     {
         InvalidateReadCache();
-        if (_schemas && OneLake() is null)
+        if ((_schemas || _nestedSchemas) && OneLake() is null)
         {
             if (string.Equals(s, MainSchema, System.StringComparison.Ordinal))
             {

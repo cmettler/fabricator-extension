@@ -20,6 +20,14 @@ namespace duckdb {
 
 //! A discovered table (or view) — any provider, via catalog_tables.
 struct FabricatorTableInfo {
+	//! The FULL schema path, outermost first — `["a","b"]` is schema `b` nested inside `a`. Depth 1 for
+	//! every provider that does not declare `supports_nested_schemas`.
+	vector<string> schema_path;
+	//! The LEAF schema name, i.e. `schema_path.back()` (empty for an empty path).
+	//! \warning KEPT BESIDE the path rather than replaced by it, deliberately: twenty consumers read this
+	//! field, and the ones that matter — functions, macros, views — resolve against the catalog's TOP-LEVEL
+	//! `schemas_` map and are correct exactly because they do not nest. Only table registration walks the
+	//! path. Replacing the field would have touched all twenty for no gain.
 	string schema_name;
 	string table_name;
 	string table_type; // "BASE TABLE" | "VIEW"
@@ -29,8 +37,10 @@ struct FabricatorTableInfo {
 //! Consumes and releases the stream. Returns rows[r][c].
 vector<vector<string>> ReadStringTable(ArrowArrayStream &stream, idx_t expected_cols);
 
-//! Discovers the attached catalog's schemas (catalog_schemas) — every provider, not just SQL Server.
-vector<string> DiscoverSchemas(FabricatorHandle handle);
+//! Discovers the attached catalog's schemas (catalog_schemas) as PATHS, outermost element first. A
+//! provider that does not nest emits one single-element path per schema, which is what every provider
+//! does until it declares `supports_nested_schemas`.
+vector<vector<string>> DiscoverSchemaPaths(FabricatorHandle handle);
 
 //! The host-consumed capability flags for an open catalog (ABI v71, `get_capabilities`) — the typed
 //! replacement for grepping the diagnostic catalog_server_info (property, value) stream. An
@@ -56,9 +66,12 @@ struct FabricatorCapabilities {
 	//! whose namespace is genuinely two-part must leave it off: SQL Server has schema.table and nothing
 	//! deeper, and Fabric's Tables/ area is defined as exactly two levels. Turning it on there would make
 	//! DuckDB offer a syntax that resolves to nothing.
-	//! \warning It is read but NOT YET ACTED ON: carrying a real path needs the catalog_* streams to carry
-	//! one (they are flat UTF-8 today, read by the single ReadStringTable) and table_open to take one.
-	//! See docs/nested-schemas.md (the slice plan) before wiring the rest.
+	//! \warning It is READ-ONLY nesting. The catalog_* streams carry a real path (v90) and table_open takes
+	//! one (v91), so a nested table RESOLVES and SCANS — but every WRITE crossing still carries a flat
+	//! schema name, so the host REFUSES CREATE/DROP TABLE, INSERT, UPDATE/DELETE and CREATE/DROP SCHEMA on
+	//! a nested schema rather than handing over a leaf that would address the wrong place
+	//! (FabricatorRefuseNestedWrite) — ALTER and COMMENT ON included, since the provider re-derives the
+	//! storage path from the leaf there too. See docs/nested-schemas.md.
 	bool supports_nested_schemas = false;
 };
 

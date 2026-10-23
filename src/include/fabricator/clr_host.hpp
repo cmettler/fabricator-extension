@@ -239,8 +239,12 @@ void CatalogServerInfo(FabricatorHandle handle, ArrowArrayStream &out);
 // doc (rendered by FabricatorRenderAlterJson) plus the optional `column` type-channel stream, which the
 // managed side consumes when present. TableClose is best-effort and never throws (it runs from the entry
 // destructor at teardown).
-FabricatorHandle TableOpen(FabricatorHandle handle, const std::string &schema, const std::string &table,
-                           const std::string &at_unit = "", const std::string &at_value = "");
+//! \param schema_path the schema as a PATH, outermost element first (ABI v91). Depth 1 for every provider
+//! that does not declare `supports_nested_schemas`, in which case it is exactly the name the pre-v91
+//! `schema` parameter carried.
+FabricatorHandle TableOpen(FabricatorHandle handle, const std::vector<std::string> &schema_path,
+                           const std::string &table, const std::string &at_unit = "",
+                           const std::string &at_value = "");
 void TableSchema(FabricatorHandle table, ArrowArrayStream &out);
 std::string TableInfo(FabricatorHandle table);
 std::string TableStats(FabricatorHandle table);

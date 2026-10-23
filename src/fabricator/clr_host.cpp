@@ -745,15 +745,25 @@ void CatalogServerInfo(FabricatorHandle handle, ArrowArrayStream &out) {
 	CatalogList(handle, out, "catalog_server_info", GetBridge().catalog_server_info);
 }
 
-FabricatorHandle TableOpen(FabricatorHandle handle, const std::string &schema, const std::string &table,
-                           const std::string &at_unit, const std::string &at_value) {
+FabricatorHandle TableOpen(FabricatorHandle handle, const std::vector<std::string> &schema_path,
+                           const std::string &table, const std::string &at_unit, const std::string &at_value) {
 	const FabricatorVTable &vt = GetBridge();
 	if (!vt.table_open) {
 		throw duckdb::IOException("Fabricator: bridge does not provide table_open");
 	}
+	// The path crosses as an array of borrowed UTF-8 pointers (v91). `schema_path` outlives the call, so
+	// nothing is copied; an EMPTY path passes a null pointer with length 0 rather than a one-element array
+	// of "", which keeps "no schema" distinct from "a schema whose name is empty" on this crossing too.
+	std::vector<const char *> path_ptrs;
+	path_ptrs.reserve(schema_path.size());
+	for (const auto &segment : schema_path) {
+		path_ptrs.push_back(segment.c_str());
+	}
 	char *err = nullptr;
 	FabricatorHandle out_table = nullptr;
-	int32_t rc = vt.table_open(handle, schema.c_str(), table.c_str(), at_unit.empty() ? nullptr : at_unit.c_str(),
+	int32_t rc = vt.table_open(handle, path_ptrs.empty() ? nullptr : path_ptrs.data(),
+	                           static_cast<int32_t>(path_ptrs.size()), table.c_str(),
+	                           at_unit.empty() ? nullptr : at_unit.c_str(),
 	                           at_value.empty() ? nullptr : at_value.c_str(), &out_table, &err);
 	if (rc != FABRICATOR_OK) {
 		ThrowManagedError(vt, err, "Fabricator: table_open failed");

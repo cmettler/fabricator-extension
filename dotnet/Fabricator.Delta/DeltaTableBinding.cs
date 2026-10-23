@@ -17,10 +17,23 @@ internal sealed class DeltaTableDefinition : ITable
 {
     private readonly DeltaCatalog _catalog;
 
+    private readonly IReadOnlyList<string>? _schemaPath;
+
     internal DeltaTableDefinition(DeltaCatalog catalog, string schemaName, string tableName)
     {
         _catalog = catalog;
         SchemaName = schemaName;
+        TableName = tableName;
+    }
+
+    /// <summary>The path-addressed form (ABI v91). <see cref="SchemaName"/> stays the LEAF, which is what
+    /// the log lines and <see cref="DeltaTableBinding.SetNames"/> report; the PATH is what resolves the
+    /// storage directory, and the two differ only on a nested root.</summary>
+    internal DeltaTableDefinition(DeltaCatalog catalog, IReadOnlyList<string> schemaPath, string tableName)
+    {
+        _catalog = catalog;
+        _schemaPath = schemaPath;
+        SchemaName = schemaPath.Count == 0 ? string.Empty : schemaPath[schemaPath.Count - 1];
         TableName = tableName;
     }
 
@@ -36,7 +49,12 @@ internal sealed class DeltaTableDefinition : ITable
     /// </summary>
     public ITableBinding Bind(ITransaction? transaction, TableAt? at = null)
     {
-        string path = _catalog.TablePath(SchemaName, TableName);
+        // ⚠ The PATH overload when we have one: on a nested root the leaf alone resolves to a different
+        // directory, and this `path` string is the identity EVERYTHING downstream keys on (the buffer, the
+        // snapshot pin, the open-table reuse) — so getting it wrong is a wrong table, not an error.
+        string path = _schemaPath is null
+            ? _catalog.TablePath(SchemaName, TableName)
+            : _catalog.TablePath(_schemaPath, TableName);
         if (at is null && transaction is DeltaTransaction dt)
         {
             var bound = dt.GetOrCreate(path);
@@ -546,7 +564,9 @@ internal sealed class DeltaTableBinding : ITableBinding
     public IArrowArrayStream Scan(string? specJson, IArrowArrayStream? filterValues) =>
         Catalog.ScanCore(
             SchemaName ?? throw new InvalidOperationException("delta bound table: scan before Bind named it"),
-            TableName!, specJson, filterValues);
+            // ⚠ `Path` is the authority, NOT the two names — it is the identity everything else on this
+            // binding already keys on, and on a nested root the leaf name resolves elsewhere entirely.
+            TableName!, specJson, filterValues, Path);
 
     /// <summary>Caller-owned (transient) bindings only — a memoized binding is disposed by its owning
     /// transaction's <see cref="DeltaTransaction.Complete"/>. Releases the held EW machinery and buffered

@@ -279,6 +279,23 @@ public interface IProviderCatalog : IDisposable
     ITable GetTable(string schemaName, string tableName);
 
     /// <summary>
+    /// The definition of one table addressed by its full SCHEMA PATH, outermost element first (ABI v91):
+    /// <c>["a","b"]</c> is the schema <c>b</c> nested inside <c>a</c>.
+    /// </summary>
+    /// <remarks>
+    /// <para>⚠⚠ THE DEFAULT TAKES THE LEAF, WHICH IS WHY THIS IS NOT A BREAKING CHANGE. A provider that
+    /// does not nest receives a one-element path, so the leaf IS the name <see cref="GetTable(string,
+    /// string)"/> has always been given — identical behaviour, and the four OUT-OF-TREE PLUGINS (which pin
+    /// <c>Fabricator.Abstractions</c> by SHA and cannot be edited from here) keep working untouched.</para>
+    /// <para>⚠ Override only together with <c>supports_nested_schemas</c> in
+    /// <see cref="CapabilitiesJson"/>. Without the capability the host never builds a path deeper than
+    /// one, so an override would simply never see one; with it and WITHOUT an override, the default would
+    /// silently resolve <c>a.b.t</c> as if it were <c>b.t</c> — which is a wrong table, not an error.</para>
+    /// </remarks>
+    ITable GetTable(IReadOnlyList<string> schemaPath, string tableName) =>
+        GetTable(schemaPath.Count == 0 ? string.Empty : schemaPath[schemaPath.Count - 1], tableName);
+
+    /// <summary>
     /// Resolves a DuckDB transaction id (the <c>set_active_txn</c> ambient) to this catalog's
     /// <see cref="ITransaction"/> for a table BIND — the table session's one question per call. The
     /// semantics are each provider's OWN ambient-resolution rules and deliberately differ: SQL Server

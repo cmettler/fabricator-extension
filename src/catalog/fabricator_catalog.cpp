@@ -54,6 +54,29 @@ FabricatorCatalog::~FabricatorCatalog() {
 	fabricator::CloseCatalog(handle_);
 }
 
+FabricatorSchemaEntry &FabricatorCatalog::EnsureSchemaPathLocked(const vector<string> &path) {
+	// Level 0 lives in the catalog's own map; every deeper level is a CHILD of the one before it. The two
+	// identical lambdas this replaced only ever did the first half, because every provider emitted
+	// single-element paths -- which is still true of every provider that does not declare
+	// supports_nested_schemas, so for them this is byte-for-byte the old behaviour.
+	const string root_name = path.empty() ? string() : path.front();
+	FabricatorSchemaEntry *current;
+	auto it = schemas_.find(root_name);
+	if (it != schemas_.end()) {
+		current = it->second.get();
+	} else {
+		CreateSchemaInfo info;
+		info.SetSchema(Identifier(root_name));
+		auto entry = make_uniq<FabricatorSchemaEntry>(*this, info, handle_);
+		current = entry.get();
+		schemas_[root_name] = std::move(entry);
+	}
+	for (idx_t i = 1; i < path.size(); i++) {
+		current = &current->GetOrCreateChildSchema(path[i]);
+	}
+	return *current;
+}
+
 void FabricatorCatalog::LoadCatalog(ClientContext &context) {
 	lock_guard<mutex> lock(schema_lock_);
 
@@ -106,26 +129,13 @@ void FabricatorCatalog::LoadCatalog(ClientContext &context) {
 		                                GetName(), ex.what()));
 	}
 
-	auto ensure_schema = [&](const string &schema_name) -> FabricatorSchemaEntry & {
-		auto it = schemas_.find(schema_name);
-		if (it != schemas_.end()) {
-			return *it->second;
-		}
-		CreateSchemaInfo info;
-		info.SetSchema(Identifier(schema_name));
-		auto entry = make_uniq<FabricatorSchemaEntry>(*this, info, handle_);
-		auto &ref = *entry;
-		schemas_[schema_name] = std::move(entry);
-		return ref;
-	};
-
 	// schema_filter / table_filter are applied provider-side now (DiscoverSchemas/DiscoverTables already
 	// return only matches), so register everything discovered.
-	for (auto &schema_name : DiscoverSchemas(handle_)) {
-		ensure_schema(schema_name);
+	for (auto &schema_path : DiscoverSchemaPaths(handle_)) {
+		EnsureSchemaPathLocked(schema_path);
 	}
 	for (auto &table : DiscoverTables(handle_)) {
-		ensure_schema(table.schema_name).AddTable(table.table_name, table.table_type);
+		EnsureSchemaPathLocked(table.schema_path).AddTable(table.table_name, table.table_type);
 	}
 	// Discovered routines (scalar UDFs / TVFs / procs / custom in-out & aggregates) register onto their
 	// schema — but ONLY a schema already registered above. The managed schema_filter keeps non-matching
@@ -220,19 +230,6 @@ void FabricatorCatalog::RefreshCache(ClientContext &context) {
 	// Set the active host-FS opener for re-discovery (see LoadCatalog).
 	FabricatorSetActiveTxn(handle_, context);
 
-	auto ensure_schema = [&](const string &schema_name) -> FabricatorSchemaEntry & {
-		auto it = schemas_.find(schema_name);
-		if (it != schemas_.end()) {
-			return *it->second;
-		}
-		CreateSchemaInfo info;
-		info.SetSchema(Identifier(schema_name));
-		auto entry = make_uniq<FabricatorSchemaEntry>(*this, info, handle_);
-		auto &ref = *entry;
-		schemas_[schema_name] = std::move(entry);
-		return ref;
-	};
-
 	// Drop every cached table (so dropped tables vanish + columns re-fetch), then
 	// re-run discovery to pick up tables created out-of-band (e.g. via fabricator_exec).
 	for (auto &entry : schemas_) {
@@ -240,11 +237,11 @@ void FabricatorCatalog::RefreshCache(ClientContext &context) {
 	}
 	// schema_filter / table_filter are applied provider-side now (DiscoverSchemas/DiscoverTables already
 	// return only matches), so register everything discovered.
-	for (auto &schema_name : DiscoverSchemas(handle_)) {
-		ensure_schema(schema_name);
+	for (auto &schema_path : DiscoverSchemaPaths(handle_)) {
+		EnsureSchemaPathLocked(schema_path);
 	}
 	for (auto &table : DiscoverTables(handle_)) {
-		ensure_schema(table.schema_name).AddTable(table.table_name, table.table_type);
+		EnsureSchemaPathLocked(table.schema_path).AddTable(table.table_name, table.table_type);
 	}
 	// Discovered routines (scalar UDFs / TVFs / procs / custom in-out & aggregates) register onto their
 	// schema — but ONLY a schema already registered above. The managed schema_filter keeps non-matching
@@ -325,11 +322,24 @@ optional_ptr<SchemaCatalogEntry> FabricatorCatalog::LookupSchema(CatalogTransact
                                                               const EntryLookupInfo &schema_lookup,
                                                               OnEntryNotFound if_not_found) {
 	lock_guard<mutex> lock(schema_lock_);
-	auto it = schemas_.find(schema_lookup.GetEntryName());
-	if (it != schemas_.end()) {
-		return it->second.get();
+	// ⚠⚠ THE WALK IS THIS FUNCTION'S JOB, not the caller's — `DuckCatalog::LookupSchema` does exactly the
+	// same delegation, and omitting it is what made a depth-3 reference unresolvable. MEASURED before the
+	// fix: `cat.a.b.t` reported *schema "a.b" does not exist* while `cat.a` and `cat.s.t` both resolved,
+	// because a straight `schemas_.find()` answers only the FIRST level and every deeper one needs
+	// `FabricatorSchemaEntry::LookupEntry(SCHEMA_ENTRY)` per level. A two-level layout cannot see it: its
+	// lookups never go past the root, which is why slices 1 and 2a stayed green while this was missing.
+	auto resolved = LookupSchemaPath(transaction, schema_lookup, OnEntryNotFound::RETURN_NULL,
+	                                 [&](const EntryLookupInfo &root) -> optional_ptr<CatalogEntry> {
+		                                 auto it = schemas_.find(root.GetEntryName());
+		                                 return it == schemas_.end() ? nullptr
+		                                                             : optional_ptr<CatalogEntry>(it->second.get());
+	                                 });
+	if (resolved) {
+		return resolved;
 	}
 	if (if_not_found == OnEntryNotFound::THROW_EXCEPTION) {
+		// Our own message, kept rather than letting LookupSchemaPath throw DuckDB's MissingEntry: suites
+		// pin this text, and the walk is asked for RETURN_NULL precisely so the choice stays here.
 		throw BinderException("fabricator: schema \"%s\" not found", schema_lookup.GetEntryName());
 	}
 	return nullptr;
@@ -337,8 +347,20 @@ optional_ptr<SchemaCatalogEntry> FabricatorCatalog::LookupSchema(CatalogTransact
 
 void FabricatorCatalog::ScanSchemas(ClientContext &context, std::function<void(SchemaCatalogEntry &)> callback) {
 	lock_guard<mutex> lock(schema_lock_);
+	// ⚠ THE WHOLE TREE, not just the top level — `duckdb_schemas()` and `information_schema.schemata` are
+	// built on this, so reporting only the roots would make a nested schema queryable (the binder walks
+	// LookupEntry) yet INVISIBLE to every listing. DuckCatalog delegates the same walk to
+	// SchemaCatalogEntry::ScanSchemaTree; ours recurses over child_schemas_ directly, which keeps the
+	// traversal inside the lock we already hold and does not depend on our own Scan() reporting
+	// SCHEMA_ENTRY. Depth is bounded by the provider's own path depth.
+	std::function<void(FabricatorSchemaEntry &)> visit = [&](FabricatorSchemaEntry &schema) {
+		callback(schema);
+		for (auto &child : schema.ChildSchemas()) {
+			visit(*child.second);
+		}
+	};
 	for (auto &entry : schemas_) {
-		callback(*entry.second);
+		visit(*entry.second);
 	}
 }
 
@@ -355,6 +377,16 @@ string FabricatorCatalog::GetDBPath() {
 }
 
 optional_ptr<CatalogEntry> FabricatorCatalog::CreateSchema(CatalogTransaction transaction, CreateSchemaInfo &info) {
+	// ⚠ `CREATE SCHEMA a.b` is REFUSED, and refusing is the point. DuckDB 2.0 offers the syntax the moment
+	// SupportsNestedSchemas() is true, and this function would otherwise make a FLAT entry called "b" and
+	// ask the provider for a schema called "b" — so the statement would report success and create the
+	// wrong thing. Discovery is what nests today (the provider walks its own storage); declaring one from
+	// SQL needs create_schema to take a path, which is the same widening the write crossings need.
+	if (info.IsNested()) {
+		throw NotImplementedException(
+		    "fabricator: CREATE SCHEMA with a nested path is not supported — a nested schema is DISCOVERED "
+		    "from the provider's own layout, not declared here (see docs/nested-schemas.md)");
+	}
 	if (transaction.context) {
 		FabricatorSetActiveTxn(handle_, *transaction.context);
 	}
@@ -379,6 +411,35 @@ optional_ptr<CatalogEntry> FabricatorCatalog::CreateSchema(CatalogTransaction tr
 	return &ref;
 }
 void FabricatorCatalog::DropSchema(ClientContext &context, DropInfo &info) {
+	// Same refusal as CreateSchema, for the same reason: `drop_schema` carries ONE name, so a nested path
+	// would drop the same-named TOP-LEVEL schema instead — a destructive statement hitting the wrong
+	// target.
+	//
+	// ⚠⚠ THE PATH LENGTH IS NOT THE TEST, AND NEITHER IS StripCatalog() — both were tried and both refused
+	// an ORDINARY `DROP SCHEMA <catalog>.<schema>`. The path's shape depends on whether nested schemas are
+	// ON: without them a schema drop is built as (catalog, EMPTY schema, name) and arrives as
+	// `["lake", "", "staging"]` (three elements, measured at verify_delta_catalog_schemas:104); with them
+	// the same statement arrives as `["lk", "west"]` (two, no placeholder) while a genuinely nested drop is
+	// `["lk", "sales", "eu"]`. So the only reliable reading is COMPONENT BY COMPONENT: drop a leading
+	// element that is this catalog's own name, ignore empty placeholders, and count what is left BEFORE the
+	// final name. Anything greater than zero is a nested path.
+	auto &drop_path = info.GetQualifiedName().Path();
+	idx_t first = 0;
+	if (drop_path.size() > 1 &&
+	    StringUtil::Lower(drop_path[0].GetIdentifierName()) == StringUtil::Lower(GetName().GetIdentifierName())) {
+		first = 1;
+	}
+	idx_t schema_levels = 0;
+	for (idx_t i = first; i + 1 < drop_path.size(); i++) {
+		if (!drop_path[i].empty()) {
+			schema_levels++;
+		}
+	}
+	if (schema_levels > 0) {
+		throw NotImplementedException(
+		    "fabricator: DROP SCHEMA with a nested path is not supported — it would address the provider by "
+		    "the leaf name alone and drop a different schema (see docs/nested-schemas.md)");
+	}
 	bool if_exists = info.if_not_found == OnEntryNotFound::RETURN_NULL;
 	FabricatorSetActiveTxn(handle_, context);
 	fabricator::DropSchema(handle_, info.GetQualifiedName().Name().GetIdentifierName(), if_exists);
@@ -454,6 +515,7 @@ PhysicalOperator &FabricatorCatalog::PlanCreateTableAs(ClientContext &context, P
 	MarkSinkOnOwnScans(plan, create_info.GetQualifiedName().Schema().GetIdentifierName(), create_info.GetQualifiedName().Name().GetIdentifierName(), "create");
 
 	FabricatorCtasInfo info;
+	FabricatorRefuseNestedWrite(op.info->schema, "CREATE TABLE AS");
 	info.schema_name = create_info.GetQualifiedName().Schema().GetIdentifierName();
 	info.table_name = create_info.GetQualifiedName().Name().GetIdentifierName();
 	for (auto &col : create_info.columns.Logical()) {
@@ -483,6 +545,7 @@ PhysicalOperator &FabricatorCatalog::PlanInsert(ClientContext &context, Physical
 	}
 	FabricatorInsertTarget target;
 	target.returning = op.return_chunk;
+	FabricatorRefuseNestedWrite(op.table.schema, "INSERT");
 	target.schema_name = op.table.schema.name.GetIdentifierName();
 	target.table_name = op.table.name.GetIdentifierName();
 
@@ -584,6 +647,7 @@ FabricatorModifyTarget FabricatorBuildModifyTarget(TableCatalogEntry &table) {
 		    "Table '%s' has neither (use fabricator_exec for set-based UPDATE/DELETE)",
 		    entry.name);
 	}
+	FabricatorRefuseNestedWrite(entry.schema, "UPDATE/DELETE");
 	FabricatorModifyTarget target;
 	target.schema_name = entry.schema.name.GetIdentifierName();
 	target.table_name = entry.name.GetIdentifierName();

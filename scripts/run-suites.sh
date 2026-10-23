@@ -196,7 +196,11 @@ case "$TIER" in
         # table actually compile to" cannot be answered by reading the rules, and being a RELATION it can
         # be reviewed, diffed between two versions, or stored beside the decision it produced. It covers
         # OUTPUT cells, which the strict audit does not.
-        : "${MIN_SUITES:=82}"
+        # 83 since 2026-10-23: verify_delta_nested_schemas — the `nested_schemas true` ATTACH option, where
+        # the directory tree UNDER a Delta root IS the schema tree (DuckDB 2.0 nested schemas). ⚠ Its
+        # load-bearing row is the one asserting the LEAF alone does NOT resolve: duckdb_schemas() prints a
+        # child by its own name, so a flattening bug is invisible in the listing and visible only there.
+        : "${MIN_SUITES:=83}"
         # 5656 since 2026-08-02: verify_delta_catalog_transactions 943 -> 944 Ã¢ÂÂ ROLLBACK now RECLAIMS the
         # data files the transaction eagerly wrote (EW #52's DiscardDataFilesAsync) instead of leaving them
         # for VACUUM. +2, not +1: that suite is one of the DOUBLED ones below, so an assertion added to it
@@ -903,7 +907,11 @@ case "$TIER" in
         #   ⚠ The MIN is kept on purpose: a truncated min is a prefix too, so it stays a valid LOWER bound.
         #   That asymmetry is pinned, and §3b keeps an exact column as the control — "maxValues is empty"
         #   alone would pass on a build that had stopped writing statistics at all.
-        : "${MIN_ASSERTIONS:=10089}"
+        # 2026-10-23: 10089 -> 10154. A NEW suite, verify_delta_nested_schemas (65) — see MIN_SUITES above.
+        #   10089 + 65 exactly, which is the behaviour-neutrality claim for ABI v91 and the schema-path
+        #   plumbing: no provider emits a path deeper than one unless `nested_schemas` is on, so nothing
+        #   that existed before this suite moved by a single assertion.
+        : "${MIN_ASSERTIONS:=10154}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh
