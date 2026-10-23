@@ -14,6 +14,8 @@ require fabricator
 
 require parquet
 
+require json
+
 require-env FABRICATOR_DELTA_WRITE_DIR
 
 # ============================================================================
@@ -142,3 +144,70 @@ query II
 EXPLAIN (FORMAT json) SELECT * FROM s2.main.big WHERE k = 7;
 ----
 physical_plan	<REGEX>:.*"Estimated Cardinality": "4000".*
+
+# ============================================================================
+# 3. A TRUNCATED MAX IS DROPPED FROM add.stats; A TRUNCATED MIN IS KEPT.
+#
+#    ⚠⚠ DuckDB truncates string statistics at ~255 characters and does NOT round the truncated value up, so
+#    the max RETURN_STATS reports is a PREFIX of the real one — and a prefix sorts BELOW what it prefixes.
+#    MEASURED before the fix: a 2003-character value ending "ZZZ" produced a Delta maxValues entry of 255
+#    'a's. That claims the file holds nothing above it, so a reader pruning on the stats SKIPS the file and
+#    SILENTLY RETURNS NONE OF ITS ROWS — the same failure shape as inverted statistics, in our own writer.
+#
+#    ⚠ PRE-EXISTING rather than a DuckDB 2.0 regression: the truncation always happened. What 2.0 added is
+#    `max_is_exact` (1.5.6's RETURN_STATS emitted only min/max/null_count/num_values/column_size_bytes), so
+#    until now there was no way to tell a truncated max from a real one.
+#
+#    ⚠ THE ASYMMETRY IS THE ASSERTION, not an accident: a truncated MIN is a prefix too, so it sorts BELOW
+#    the true minimum and stays a valid LOWER bound. Asserting only "maxValues is empty" would pass equally
+#    on a build that had stopped writing statistics altogether, which is why the min is pinned beside it and
+#    why §3b keeps an exact column as the control.
+# ============================================================================
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/trunc' AS s3 (TYPE fabricator, PROVIDER 'delta', READ_ONLY false);
+
+statement ok
+CREATE TABLE s3.main.longstr AS SELECT repeat('a', 2000) || 'ZZZ' AS s;
+
+# the untrustworthy max is ABSENT ...
+query I
+SELECT count(*) FROM (
+  SELECT unnest(json_keys(json_extract(stats, '$.maxValues'))) AS k
+  FROM (SELECT add->>'stats' AS stats
+        FROM read_json('${FABRICATOR_DELTA_WRITE_DIR}/trunc/longstr/_delta_log/*.json')
+        WHERE add IS NOT NULL)
+);
+----
+0
+
+# ... while the min, which IS a valid lower bound, survives. Without this row the section would pass on a
+# build that wrote no statistics at all.
+query I
+SELECT count(*) FROM (
+  SELECT unnest(json_keys(json_extract(stats, '$.minValues'))) AS k
+  FROM (SELECT add->>'stats' AS stats
+        FROM read_json('${FABRICATOR_DELTA_WRITE_DIR}/trunc/longstr/_delta_log/*.json')
+        WHERE add IS NOT NULL)
+);
+----
+1
+
+# ============================================================================
+# 3b. THE CONTROL: an EXACT column keeps both bounds, so the drop above is targeted rather than blanket.
+# ============================================================================
+
+statement ok
+CREATE TABLE s3.main.shortstr AS SELECT 'hello' AS s, 7 AS n;
+
+query II
+WITH src AS (
+  SELECT add->>'stats' AS stats
+  FROM read_json('${FABRICATOR_DELTA_WRITE_DIR}/trunc/shortstr/_delta_log/*.json')
+  WHERE add IS NOT NULL
+)
+SELECT
+  (SELECT count(*) FROM (SELECT unnest(json_keys(json_extract(stats, '$.minValues'))) FROM src)),
+  (SELECT count(*) FROM (SELECT unnest(json_keys(json_extract(stats, '$.maxValues'))) FROM src));
+----
+2	2

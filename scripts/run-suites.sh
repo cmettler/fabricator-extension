@@ -889,7 +889,21 @@ case "$TIER" in
         #   Mutants: removing the host_query flag dies at the mixed-type row, removing the
         #   fabricator_scan flag dies at the publish() row. The host_exec flag is UNGATED (one column,
         #   so only the empty projection differs) and the suite says so rather than implying coverage.
-        : "${MIN_ASSERTIONS:=10040}"
+        # 2026-10-23: 10040 -> 10089, and the jump is TWO things, which is why it is not 10040 + 7.
+        #   ⚠⚠ THE PORT TO DuckDB 2.0 NEVER BUMPED THIS FLOOR. It took hermetic 10040 -> 10082 and left the
+        #   floor at the 1.5.6 number, so for the whole port the tier carried 42 assertions of SLACK — a
+        #   regression losing up to 42 of them would have passed. Found by bumping for the +7 below and
+        #   noticing the measured total did not match the arithmetic. ⇒ when a port moves a tier, the floor
+        #   moves with it, in the same commit.
+        #   +7: verify_delta_statistics 27 -> 34 — a truncated MAX is dropped from add.stats. DuckDB
+        #   truncates string statistics at ~255 chars WITHOUT rounding up, so the max it reports is a
+        #   PREFIX, which sorts BELOW the real one; writing it into Delta's maxValues makes a pruning reader
+        #   SKIP the file and silently return none of its rows. PRE-EXISTING — only the `max_is_exact` flag
+        #   is new (DuckDB 2.0; 1.5.6's RETURN_STATS had no way to say so).
+        #   ⚠ The MIN is kept on purpose: a truncated min is a prefix too, so it stays a valid LOWER bound.
+        #   That asymmetry is pinned, and §3b keeps an exact column as the control — "maxValues is empty"
+        #   alone would pass on a build that had stopped writing statistics at all.
+        : "${MIN_ASSERTIONS:=10089}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

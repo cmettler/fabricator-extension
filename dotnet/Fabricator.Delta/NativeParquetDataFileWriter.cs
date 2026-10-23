@@ -449,6 +449,7 @@ internal sealed class NativeParquetDataFileWriter : IDataFileWriter
                 var kind = KindFor(schema.GetFieldByIndex(fi).DataType);
 
                 string? min = null, max = null;
+                bool maxExact = true;
                 long? nulls = null;
                 int iStart = innerMaps.ValueOffsets[e];
                 int iEnd = innerMaps.ValueOffsets[e + 1];
@@ -459,8 +460,27 @@ internal sealed class NativeParquetDataFileWriter : IDataFileWriter
                     if (sv is null) continue;
                     if (sn == "min") min = sv;
                     else if (sn == "max") max = sv;
+                    else if (sn == "max_is_exact") maxExact = !string.Equals(sv, "false", StringComparison.OrdinalIgnoreCase);
                     else if (sn == "null_count" && long.TryParse(sv, out var n)) nulls = n;
                 }
+
+                // ⚠⚠ AN INEXACT MAX IS NOT A VALID UPPER BOUND, SO IT IS DROPPED. DuckDB truncates string
+                // statistics at ~255 characters and does NOT round the truncated value up, so the max it
+                // reports is a PREFIX of the real one — and a prefix sorts BELOW what it prefixes. MEASURED:
+                // a 2003-character value ending "ZZZ" reported a 255-character max of just 'a's. Writing that
+                // into Delta's maxValues claims the file holds nothing above it, so a reader pruning on the
+                // stats SKIPS the file and silently returns none of its rows.
+                // ⚠ PRE-EXISTING, not a 2.0 regression: the truncation always happened: `max_is_exact` is new
+                // in DuckDB 2.0 (1.5.6 emitted only min/max/null_count/num_values/column_size_bytes), so until
+                // now there was no way to tell a truncated max from a real one.
+                // ⚠ THE MIN IS DELIBERATELY KEPT, and the asymmetry is the whole point: a truncated min is a
+                // prefix too, so it sorts BELOW the true minimum and remains a valid LOWER bound. Dropping it
+                // would cost pruning for no correctness gain.
+                // ⚠ Omitting beats delta-spark's other option (incrementing the truncated value into a real
+                // upper bound) only in that it cannot be wrong; if max pruning on long strings ever matters,
+                // that is the follow-up.
+                if (!maxExact) max = null;
+
                 cols.Add((col, kind, min, max, nulls));
             }
 
