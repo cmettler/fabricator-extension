@@ -126,7 +126,51 @@ Carry a path everywhere, with **every provider still emitting depth-1 paths**, s
 - **the claim to test is arithmetic: both tiers come back ASSERTION-IDENTICAL.** That is the whole reason
   this is its own slice — a combined slice could not prove the refactor disturbed nothing.
 
-### Slice 2 — actual nesting
+### ✅ Slice 2a — the host can REPRESENT a tree (BUILT 2026-10-23, still inert)
+
+`FabricatorSchemaEntry` owns `child_schemas_` and forwards a parent to `SchemaCatalogEntry`;
+`LookupEntry` answers `CatalogType::SCHEMA_ENTRY`, which is the call `Catalog::LookupSchemaPath` makes on
+each parent. **`child_schemas_` is empty for every provider**, so the branch answers null and nothing
+existing changes. Hermetic **82/82 — 10089**, identical.
+
+- **Ownership gives the lifetime ordering for free.** A parent cannot be destroyed while holding a live
+  child, and every entry's `ParentSchema()` is a REFERENCE into its schema entry — the use-after-free the
+  catalog's retire-don't-destroy graveyard already exists to prevent. No second graveyard was needed.
+- **⚠ The parent is a CONSTRUCTOR PARAMETER on `SchemaCatalogEntry`, not a field set afterwards.** It is
+  stored at construction and `GetSchemaPath()` walks that chain, so an entry given its parent later would
+  already have reported itself top-level. (First attempt wrote `info.parent_schema = this`, inventing a
+  field; `CreateSchemaInfo` instead encodes the parent in its QUALIFIED NAME, and exposes
+  `ParentSchemas()` / `IsNested()`.)
+
+### ⏳ Slice 2b — NEXT, and the point at which something actually nests
+
+**Nothing below is started.** In order:
+
+1. **`FabricatorTableInfo` gains `schema_path` ALONGSIDE `schema_name`** (the leaf). Measured: 20
+   consumers of `.schema_name`, and the split is favourable — functions/macros/views use
+   `schemas_.find(schema_name)` against the TOP-LEVEL map, which stays correct because they do not nest.
+   Only `ensure_schema(table.schema_name)` needs the path. Replacing the field outright would touch all
+   20 for no gain.
+2. **`DiscoverSchemas` / `DiscoverTables` stop flattening.** Both currently do `path.back()` with a
+   comment pointing here; they return the whole path instead.
+3. **`ensure_schema` walks the path**, calling `GetOrCreateChildSchema` per level (the two identical
+   lambdas in `LoadCatalog` ~L114 and `RefreshCache` ~L228 — keep them in step or factor them).
+4. **`table_open` takes a path — THIS IS THE ABI v90 -> v91 BUMP.** Deferred out of slice 1 because at
+   depth 1 a path IS a name; a nested table makes that false. Bump BOTH `FABRICATOR_ABI_VERSION` in
+   `abi.h` and `vtable->AbiVersion` in `Bootstrap.cs`.
+5. **Delta discovery goes depth-aware**, local FS first (the System.IO walk already recurses — cheapest),
+   then S3/ADLS. ⚠ The object-store glob is a FIXED-depth pattern (`"/*/*/_delta_log/*.json"` vs
+   `"/*/_delta_log/*.json"`) and `_schemas` is a BOOLEAN, so this is a strategy change, not a parameter.
+   ⚠ Measure before choosing recursive-glob vs repeated globs: this repo records ~85 ms per active file
+   on S3 and a per-match cost in `HostFsGlob`.
+6. **Delta declares `supports_nested_schemas`** in its capability JSON (`DeltaCatalog` ~L1073) — and ONLY
+   then, since the flag is what makes DuckDB offer `a.b`.
+7. **Gates**: a table at depth 3 resolving as `cat.a.b.t`; `duckdb_schemas()` showing the nesting; a
+   two-level control proving the existing layouts are unchanged; and a mutant.
+
+⚠ Do NOT turn the capability on before steps 1-5, and keep SQL Server + Fabric `Tables/` off permanently.
+
+### Slice 2 — as originally planned
 
 - host: schema TREE + parent links; `FabricatorSchemaEntry::LookupEntry` answers `SCHEMA_ENTRY`; the
   graveyard keeps parents alive at least as long as children
