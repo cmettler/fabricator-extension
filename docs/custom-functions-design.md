@@ -1427,9 +1427,99 @@ the earlier one simply reports first.
 **⚠ THE FIRST MUTATION RUN WAS VOID AND REPORTED ALL FOUR AS SURVIVORS.** It drove the build from a bash
 script via `cmd /c`, which MSYS rewrites into a path — `cmd` then starts INTERACTIVELY, reads EOF and exits
 **0** having built nothing, so each "mutant" was the clean binary tested again. The tell is a bare
-`D:eposabricator-extension>` prompt where ninja output belongs. This trap is already recorded in
+`D:
+eposabricator-extension>` prompt where ninja output belongs. This trap is already recorded in
 `CLAUDE.md`; it is repeated here because a surviving mutant is normally read as a weak gate, and here it
 meant the opposite. **Drive every C++ build from the PowerShell tool.**
+
+## 14. AGGREGATE STATE EXPORT (`EXPORT_STATE`) — A NOTE, NOTHING BUILT AND NOTHING DECIDED (2026-10-23)
+
+User-raised, from DuckDB **#23376** (*"Add support for state export to ordered aggregates"*), with the
+framing that settles what the feature is FOR: *"reuse already aggregated data in rollups or other running
+aggregates"*. That is the partial-aggregate pattern — pre-aggregate once, persist the intermediate state,
+combine states later at a coarser granularity — the same idea as ClickHouse's `AggregateFunction` columns,
+Postgres's aggregate `serialize`/`deserialize`, or a stored HLL/t-digest sketch.
+
+**⚠ IT IS NOT AN ORDERED-AGGREGATE FEATURE, which is the first thing to get straight.** #23376's own text
+says the generic export/import code ALREADY existed and that it merely became reachable for ordered
+aggregates once #23231 put them on the `list` infrastructure. `EXPORT_STATE` applies to aggregates
+generally.
+
+### Where we stand today: it is REFUSED, and that is correct
+
+MEASURED on 2.0:
+
+```
+SELECT adb.dbo.cf_median(val) EXPORT_STATE FROM …;
+-- Not implemented Error: Aggregate function "cf_median" does not have a state type callback
+--                        defined - cannot export state
+```
+
+DuckDB requires an opt-in callback (`AggregateFunction::SetStructStateExport`, i.e.
+`callbacks.get_state_type`); we define none, so it refuses. **Refusing is the right answer for the DEFAULT
+path and must stay**: a non-spill custom aggregate's DuckDB-side state is an **int64 HANDLE** into a
+session-local C# dictionary, so an exported "state" would be a number meaningless in any other session —
+and actively dangerous if imported somewhere that happened to have a live id of the same value. Pinned by
+`verify_custom_aggregates`.
+
+### What we already have, and it is more than it looks
+
+**The spillable mode (`IAggregateFunction.SupportsSpill`, ABI v26) IS the rollup primitive**, built for a
+different reason — external GROUP BY — and tested:
+
+| our member | what it does | rollup role |
+|---|---|---|
+| `UpdateSpill(groupStates BLOB, rows)` -> BLOB | fold rows into a serialized state | pre-aggregate |
+| `CombineSpill(targetStates BLOB, [slot, source BLOB])` -> BLOB | **merge two serialized states** | roll up |
+| `FinalizeSpill(states BLOB)` -> result | materialise the answer | read |
+
+`IAggregateState.Serialize()` is documented as *"a compact, SELF-CONTAINED byte form"*. So the semantics of
+partial aggregation are already ours; what is missing is only a surface.
+
+### ⚠⚠ WHY DuckDB CHOSE A TYPED LAYOUT RATHER THAN OPAQUE BYTES — and why that is the crux for us
+
+`aggregate_get_state_type_t` returns an `AggregateStateLayout`: a `LogicalType` plus `total_state_size`,
+with `AggregateFieldKind` members (`PRIMITIVE` / `STRUCT` / `OPTIONAL_VALUE` / `SORT_KEY` / `LIST`) each at
+a `field_offset` into the raw state buffer. DuckDB reads the state out of ITS OWN buffer through that
+description — which is why `string_agg` exports as a `list<struct>` rather than as a blob.
+
+Four things that buys, none of which an opaque blob gives:
+
+1. **It is a first-class VALUE** — inspectable, comparable, and storable in a typed column.
+2. **Export/import is written ONCE, generically.** Every aggregate that declares a layout gets it free,
+   which is exactly why #23376 could call ordered-aggregate export *"relatively straightforward"*.
+3. **Portability.** Raw C-struct bytes are not portable across platforms; a typed value is.
+4. **Versioning is visible.** A blob has no schema, so a changed state shape is undetectable; a layout
+   changes in the open.
+
+⚠ **AND IT CUTS AT US PRECISELY.** Our 1 KB blob was designed for SPILLING, where opacity is free because
+the bytes never leave the process or the build. PERSISTING a rollup state is the opposite scope, and there
+opacity costs all four of the above. The blob is the right shape for the job it was built for and the wrong
+shape for this one — which is the real reason this is a design decision rather than a wiring task.
+
+### The two shapes, and what decides between them
+
+- **(a) Implement DuckDB's `get_state_type`.** Native `EXPORT_STATE`, and our partial states compose with
+  DuckDB's own aggregates. ⚠ But its layout model assumes DuckDB owns and understands the state bytes,
+  while our ABI exists to hide them; the honest mapping is one opaque field, which forfeits most of what
+  the typed model is for. ⚠ And every exported state would be a FIXED 1 KB whatever it holds — poor when
+  the use case is persisting one state per group per bucket.
+- **(b) Our own partial-aggregate surface** — export a state as a `BLOB` column, combine two blobs,
+  finalize. Built from the three primitives above, no `state_type` callback, stores compactly in a Delta
+  column. ⚠ Does NOT interoperate with DuckDB's `EXPORT_STATE`, so our partial states could not be mixed
+  with `sum()`'s.
+
+⇒ **(b) looks better IF the goal is rollups in a Delta/SQL workflow; (a) is right if the goal is composing
+with DuckDB's own aggregate machinery.** The use case decides, and it is not decided.
+
+### Constraints to carry into either design
+
+- **The 1 KB cap bounds who can participate.** Additive states fit (sum, product, bit_or, count, min/max,
+  a small sketch); HOLISTIC ones cannot (median, concat) — their state is the full collection. ⚠ Note
+  DuckDB's own export has no such cap (`string_agg` exports a list), so the cap is OURS, from the spill
+  design, not inherent to the idea.
+- **Only `cf_sum_spill` sets `SupportsSpill` today**, so the demo surface is one function.
+- Whatever is built, the DEFAULT (non-spill) path must keep refusing — see above.
 
 ## Appendix — records moved verbatim from CLAUDE.md (2026-09-18)
 
