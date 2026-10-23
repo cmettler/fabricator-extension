@@ -1489,7 +1489,56 @@ about the parallel sink changes that.
 
 ## 10. Open, and unmeasured
 
-1. **Can `preserve_insertion_order=false` be dropped now? — there is now a NAMED REASON TO EXPECT NOT, found
+1. **✅ CLOSED 2026-10-23, AND THE ANSWER IS NO — ON DuckDB 2.0 THE SET ACQUIRED A SECOND JOB IT NEVER HAD ON
+   1.5, SO DROPPING IT COSTS MORE THERE, NOT LESS.** User-raised from DuckDB **PR #24117**, *"Parallelize
+   `UNION ALL` branches when `preserve_insertion_order` is false"* (`b97d697b029`). The whole change is one
+   line in `PhysicalUnion::BuildPipelines`:
+
+   ```cpp
+   - if (sink->SinkOrderDependent()) {
+   + if (Settings::Get<PreserveInsertionOrderSetting>(current.GetClientContext()) && sink->SinkOrderDependent()) {
+   ```
+
+   Union branch pipelines used to take order DEPENDENCIES — i.e. run one after another — whenever the sink
+   was order-dependent. On 2.0 that applies only if `preserve_insertion_order` is ALSO true. So the setting
+   now unlocks BRANCH PARALLELISM for a union, which on 1.5 it could not do at all.
+
+   - **⚠⚠ IT REACHES US EXACTLY, and the reachability is a closed list rather than a hope.** The change fires
+     only when `sink->SinkOrderDependent()` is true, and the sinks that return true are **`PhysicalLimit`,
+     `PhysicalLimitPercent`, `PhysicalCopyToFile`, `PhysicalInsert`** (grepped, not assumed). BOTH of our union
+     shapes are on that list: the native Delta WRITE is literally `COPY … TO`, and the READ path pushes a bare
+     `LIMIT` (docs/delta-read-path.md). An ungrouped aggregate is NOT order-dependent — which is why the first
+     benchmark below showed nothing.
+   - **MEASURED, four reps per cell, same six 400k-row parquet files unioned and written with `COPY … TO`,
+     `threads=8`, local FS — the shape our native write emits:**
+
+     | build | `preserve_insertion_order=true` | `=false` | what the SET buys |
+     |---|---|---|---|
+     | 1.5.6 | 0.291 s | 0.218 s | 25% |
+     | **2.0** | 0.270 s | **0.123 s** | **55%** |
+
+     ⇒ the same statement at the setting WE ALREADY FORCE is **0.218 → 0.123 s, ~44% faster on 2.0**, and
+     removing the SET would now cost 55% rather than 25%.
+   - **⚠ TWO WRONG READINGS ON THE WAY, both worth keeping because each is a reusable trap.**
+     (a) **The first benchmark measured nothing and looked conclusive.** `SELECT max(md5(md5(s)))` over the
+     union showed no true/false gap on either build — because an ungrouped aggregate's sink is not
+     order-dependent, so branches were never serialized and the change could not apply. **A benchmark that
+     does not satisfy the condition under test reports "no effect" in exactly the same words as a real
+     null result.** Find the CONDITION in the source first, then build the workload around it.
+     (b) **Two reps said "no gain on 1.5" and four reps said 25%.** The two-rep reading was noise, and it
+     would have made the 2.0 story look like a pure win over a flat baseline instead of 25% → 55%.
+   - ⚠ Scope of the claim: LOCAL filesystem, 2.4M rows, one shape. It does NOT update the recorded REMOTE
+     figures (94.5 s → 7.5 s), which are about remote IO — a different mechanism entirely.
+   - ⚠ What has NOT changed is the correctness half: the batched reader's contract is still that row order
+     across files is not preserved, so the SET remains correctness-neutral there, and "inherit it from the
+     outer session" would still be strictly WORSE than forcing it (a user on the DuckDB default would pay the
+     penalty for an order guarantee this reader never made). The ORIGINAL analysis of that, and of why the
+     batch-index fix did not make the SET redundant, follows — it is unchanged and still correct; 2.0 simply
+     added a second, larger reason to keep the SET.
+
+   **The original note, kept because its mechanism is still the live one on 1.5:**
+
+   **There is now a NAMED REASON TO EXPECT NOT, found
    2026-08-22 (user-raised).** The SET's value was routing away from the SINGLE-THREADED
    `PhysicalBufferedCollector`, which `GetResultCollector` picks when `UseBatchIndex` is false. The obvious
    reading — "§5's `get_partition_data` fixed that, so the SET is redundant" — does NOT transfer, because the
