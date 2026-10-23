@@ -2894,6 +2894,187 @@ to the inference (backwards-compatible); (2) Delta parity — believe the flag, 
 changes conflict behaviour for every flag-less writer, so it wants a release note).
 
 
+## THE 2026-10-23 BUMP — `e515a2b → 987a0ce`, SIXTY-NINE commits, still ZERO patches (a fast-forward). ⚠⚠ IT IS NOT A HOUSEKEEPING BUMP: it carries a SILENT-CORRECTNESS FIX for files our own codec writer produced, and it BROKE sixteen hermetic suites on arrival.
+
+**Gates.** Compile cost **zero** (no errors, no new warnings — every warning is a pre-existing Fluid
+obsolescence one). EW `DeltaLake.Tests` **608/608, ZERO skipped, × 3 TFMs** (was 593 — the suite grew).
+EW `DeltaLake.Table.Tests` **1345 passed / 124 skipped / 0 failed × 3 TFMs** (was 853/114; the suite grew
+by 515 tests, and every skip is under `Tests.Interop.*`, the pyspark/delta-rs tier — counted, not assumed,
+because "more skips on a bump" is the shape a real regression takes). Hermetic **82/82 — 10082** and
+service **60/60 — 3586**, BOTH assertion-identical to the previous pin, which is the behaviour-neutrality
+claim; `verify_mssql_s3_polybase` at its full **263**, which is the foreign-reader half a hermetic run
+cannot give you.
+
+### ⚠⚠ THE METHOD IS THE MOST REUSABLE THING HERE — classify a change by HOW IT WOULD FAIL, not by what it touches
+
+Three classes, and only the third needs human work:
+
+| class | caught by | cost |
+|---|---|---|
+| A — signature/API removal | the compiler | free |
+| B — behaviour on a path a suite exercises | the tiers | free |
+| **C — everything else** | **nothing** | **the whole job** |
+
+Class C is: a new OPT-IN hook we do not subscribe to (compiles AND tests clean), a flipped DEFAULT, a new
+refusal on an untested path, and pruning changes that leave results correct. **Reading 69 commit subjects
+is a poor detector for class C, and this bump proves it**: the maintenance-failure hook (below) was IN the
+first subject grep's output and got skimmed past; the USER found it by reading `doc/delta-concurrency.md`.
+
+⇒ **the sweep that works, in order:**
+1. **A PUBLIC-SURFACE DIFF of the option records we construct** — mechanical and EXHAUSTIVE over our
+   contact area, which subject-reading is not. Extract `public … { get` from `DeltaTableOptions`,
+   `DeltaReadOptions`, `ParquetReadOptions`, `ParquetWriteOptions` at both revisions and diff. Then read
+   each new member's DEFAULT: a new opt-in is inert, a flipped default reaches us. This is the same
+   technique §RUN THE PUBLIC-SURFACE AUDIT FIRST records for a merge, applied to options rather than methods.
+2. **The changed `*.md`** (`git diff --stat <old>..<new> -- '*.md'`). EW's docs explain WHY, which is what
+   decides reachability — and `doc/known-issues.md` is where it keeps what is BROKEN. The biggest finding
+   in this bump came from there and from nowhere else.
+3. **Tests: SKIP as a sweep.** They prove EW works; they do not say what WE must change. Read one only to
+   settle the exact semantics of something we already know we use.
+
+**What the surface diff found — SEVEN new members, and the defaults are the whole story:**
+
+| member | default | reaches us? |
+|---|---|---|
+| `DeltaTableOptions.OnPostCommitMaintenanceFailure` | null | **YES** — see below; now subscribed |
+| `DeltaTableOptions.AllowWritesWithoutUniversalFormatConversion` | false | no — the escape hatch for the new UniForm write refusal (`879c370`), and UniForm is unreachable for us: nothing in our source sets `icebergCompat`, and every "uniform" hit in the tree is the English word |
+| `DeltaTableOptions.ChangeFeedSchemaFromVersionChecksum` | false | no — opt-in |
+| `ParquetWriteOptions.WritePageIndex` | **true** | **YES** — WRITE side, so it changes what we produce, checkpoints included (EW writes those on EVERY engine, `native_write` too). Covered for real rather than vacuously: `verify_mssql_s3_polybase` passed at 263 with it on |
+| `ParquetReadOptions.FilterUsePageIndex` | **true** | **YES** — codec read pruning (`ff57020`) |
+| `ParquetReadOptions.FilterUseDictionaries` | **true** | **YES** — codec read pruning (`f6dccff`) |
+| `ParquetReadOptions.MaxPageUncompressedSize` | null | no — but ⚠ it is an AVAILABLE decompression-bomb guard we do not use: a compressed page declares its own uncompressed size and zstd has no useful bound, so one page can ask for 2 GiB. Worth setting if we ever read parquet we did not write |
+| `ParquetReadOptions.ColumnChunkFilePath` | **`Refuse`** | a new REFUSAL default — a chunk whose `file_path` says it lives in another file. Unreachable for valid Delta (one file per `add`), so it is a safety net rather than a behaviour change |
+
+⚠ `c466fb6` also flipped `DataPageRowCountLimit` to **20,000 rows** (write side, matching parquet-mr and
+parquet-cpp, so it moves our output TOWARD what foreign readers expect; files +0.1–0.3%). **Its gate passes
+VACUOUSLY** — it only splits a row group ABOVE 20,000 rows and the interop tables are far smaller;
+`verify_delta_clustered_optimize` at 80,000 rows is the nearest thing to real coverage. Say so rather than
+claiming the foreign-reader gate covered it.
+
+### ⚠⚠⚠ THE FINDING THAT MATTERS MOST: FILES OUR CODEC WRITER ALREADY PRODUCED CAN HAVE INVERTED STATISTICS
+
+`doc/known-issues.md`: *"Files written by EngineeredWood 0.3.0 and earlier can have inverted decimal and
+unsigned-integer statistics."* Until `#398` the writer ordered chunk min/max by PHYSICAL type, comparing
+FIXED_LEN_BYTE_ARRAY decimals (every `Decimal128`/`Decimal256` column) as unsigned bytes and
+`UInt32`/`UInt64` as signed. **A chunk holding decimals of BOTH SIGNS, or unsigned values on both sides of
+2^31 / 2^63, recorded a minimum ABOVE its maximum.** The values are correct; only the statistics are wrong.
+
+- **THE DATE ARITHMETIC IS THE POINT, and it was MEASURED with `git merge-base --is-ancestor`, not read off
+  a changelog.** The fix is `edabc29`, **2026-09-26**. Our previous pin `e515a2b` is **2026-09-18** ⇒ it
+  PREDATES the fix. ⇒ **every file our codec writer produced up to and including the `v0.1.0-duckdb2.0.0`
+  artifact can carry them.** This bump fixes FUTURE writes only.
+- **EW's own reader is SAFE** — `StatisticsEvaluator` treats a minimum above the maximum as unknown and
+  reads the row group. **Every other reader is not**, and upstream MEASURED it: DataFusion 54 *"skips these
+  row groups and silently returns none of their rows"*. That means **our own default read path is exposed**:
+  `PROVIDER 'delta'` reads through DuckDB's `read_parquet`, which prunes on statistics — as do Spark and
+  SQL Server PolyBase.
+- **WHAT BOUNDS IT:** data files on the DEFAULT path are written by DuckDB's COPY under `native_write`, so
+  EW's writer never runs on them. The exposure is the **codec engine** (`PROVIDER 'engineeredwooddelta'`),
+  a decimal column of precision > 18 (FLBA) holding both signs in one row group, or a straddling uint.
+  Checkpoints are EW-written on every engine but the Delta action schema has no decimal/uint column.
+- ⚠ **`created_by` CANNOT IDENTIFY AN AFFECTED FILE** — released builds say just `EngineeredWood` on both
+  sides of the fix. So there is no cheap detector; the discriminator is provenance (which engine wrote it)
+  plus schema (does it have such a column).
+- ⇒ **the remedy for an existing table is to REWRITE it** (`OPTIMIZE` does), and that is a judgement call
+  about real tables, not something a bump performs. The rig's MinIO bucket holds affected files and they
+  are regenerable, so nothing there needs doing.
+
+### ⚠⚠ WHAT BROKE ON ARRIVAL: `DeltaTableOptions.ParquetReadOptions.Filter` IS NOW REFUSED — sixteen hermetic suites, ONE cause
+
+> *"it would apply to every read of a data file, including compaction and DML rewrites. Set
+> `DeltaReadOptions.Filter` on the read instead, which prunes files and row groups."*
+
+Upstream turned a real footgun into an error: a predicate on the TABLE's options would be applied during
+compaction and DML rewrites too, i.e. a rewrite would SILENTLY DROP the rows the predicate excludes. We had
+been setting it at four call sites. Chase the CLASS, not the suite — all sixteen were this.
+
+- **The migration is small because the filter was already being passed twice.** Every call site already
+  routes it through `DeltaReadOptions`: two build one explicitly, and `ReadAllAsync(columns, filter)` is
+  literally `ReadAsync(new DeltaReadOptions { Columns = columns, Filter = filter })`. **All four were
+  CHECKED, not assumed** — dropping it where it was not already passed would have lost pruning silently.
+- **⚠⚠ THE TRAP: `FilterUseBloomFilters` DEFAULTS TO FALSE AND LIVED ON THE HAD-A-FILTER BRANCH.** The
+  naive fix deletes that branch, which would have retired bloom refinement entirely — a pruning regression
+  with NO message, the exact class this file keeps paying for. It is set UNCONDITIONALLY now; the knob is
+  policy, not predicate, and `DeltaReadOptions`' own doc says its Filter probes blooms *"when
+  ParquetReadOptions.FilterUseBloomFilters is set"*. With no filter there is nothing to probe, so always
+  setting it costs nothing.
+
+### ⚠⚠ A FAILURE THAT STOPPED BEING LOUD: POST-COMMIT MAINTENANCE (`987a0ce`, #226)
+
+A version checksum, an interval checkpoint and log cleanup all run AFTER the commit is durable. EW used to
+THROW on their failure — failing a write that had already succeeded, which is the wrong answer — and now
+reports them through `DeltaTableOptions.OnPostCommitMaintenanceFailure`. **An unsubscribed callback reports
+nothing, so the bump silently converted wrong-and-loud into SILENT.**
+
+- **Why it matters here specifically, in EW's own words:** *"log cleanup only deletes what a checkpoint
+  covers, so such a table never reclaims anything and every open replays from its last good checkpoint, or
+  from version 0. Without a listener nothing says so."* That is EXACTLY the pathology this project measured
+  on S3 — ~10 ms per dead commit, ~85 ms per active file — and the note that an hourly dbt model would
+  accrue ~90 s of pure metadata per scan over a year. It would be diagnosed as "Delta is slow".
+- Subscribed in the ONE central helper (`DeltaWriter.Options()`, which every Delta path goes through) as a
+  `Fabricator.Delta.Write` **WARNING** — warning, not error, because the write succeeded; one failure is
+  noise and a repeated one is the disease.
+- **⚠ SYNCHRONOUS BY CONTRACT.** An `async` lambda there compiles to `async void`: what it throws after its
+  first `await` reaches the thread pool and ENDS THE PROCESS. EW swallows a synchronous throw, so our
+  logging cannot fail a committed write.
+- ⚠ **NOT GATED, and the honest reason:** forcing a post-commit checkpoint failure needs the filesystem to
+  fail at one specific moment. Wired for the contract, not proven by a test — the same status as the third
+  `projection_pushdown` flag.
+
+### ⚠⚠ ISOLATION: `delta.isolationLevel` IS HONOURED NOW, AND THE "NEVER WEAKER" RULE EXPOSED US
+
+`8c95642` — *"A table setting `delta.isolationLevel=Serializable` demands it of every data-changing commit,
+but EW never read the property: `StartTransaction()` defaulted to `WriteSerializable`, and could commit past
+a concurrent blind append matching its predicate, which Spark aborts."*
+
+- **OUR LAYER WAS ALREADY RIGHT and the first write-up of this overstated it.** `DeltaCatalog` reads the
+  table's own property (`EffectiveSerializable`) to decide the row-level DV retry, with a comment recording
+  that this was deliberately changed so an attach-time option cannot weaken a table's declaration. What was
+  broken was EW's own commit level. ⇒ the accurate claim is narrow: for a table that DECLARES Serializable,
+  our conflict CHECKING diverged from Spark under concurrency. A table declaring nothing is unaffected —
+  EW kept `absent = WriteSerializable`, which is our catalog default too.
+- **⚠⚠ THE RULE THAT REACHED US: a caller may ask for a STRONGER level, never a WEAKER one** — refused with
+  `ArgumentException`, deliberately BEFORE the contention check so it cannot read as intermittent. We passed
+  an EXPLICIT `WriteSerializable` at two `StartTransaction` sites, which staked every write on OUR parser
+  agreeing with EW's about what the table declares; a disagreement (an unusual key casing, a spelling one
+  side strips and the other does not) would have failed EVERY write to that table.
+  ⇒ we now pass **`null`** when we do not need Serializable, delegating the question to EW, which reads the
+  property itself. Asking for Serializable stays safe BY CONSTRUCTION — a table can only demand
+  WriteSerializable or Serializable, so Serializable is never the weaker request — which keeps the
+  ATTACH-level `isolation_level 'serializable'` raising an undeclared table.
+- **⚠ THE SERIALIZABLE ROW-LEVEL CHECK GOT STRICTER, AND THE TWO CHANGES COMPOSE.**
+  `KeepOnlyDataPreservingResolutions` became `EnsureNoDataChangeInResolvedLineage`: it THROWS rather than
+  narrowing, and follows a file's LINEAGE through `dataChange=false` rewrites, so compaction→UPDATE and
+  UPDATE→compaction are both caught. Before `8c95642` a declared-Serializable table never reached this path
+  at all, because the declaration was ignored. ⇒ such a table now sees MORE `DeltaConflictException`s; our
+  OCC retry loops absorb them, so the cost is availability, not correctness.
+- **⚠ THE `concurrentAppend` / `OpaquePredicate` PASSAGE DOES NOT REACH US — checked rather than assumed.**
+  It describes `DeltaTable.DeleteAsync(predicate)` / `UpdateAsync` and their delegate overloads (two
+  delegate UPDATEs on different files conflict, because each post-image is a non-blind add). **We call
+  neither family**: our only two `DeleteAsync` call sites are `ITableFileSystem.DeleteAsync(path)`,
+  filesystem deletes. Our DML composes `StageDataFilesAsync` / `CommitDataFilesAsync` /
+  `StageRowDeletesAsync` / `WriteAsync`, so our read-set is the UNCHANGED rule one bullet above it in
+  `delta-concurrency.md`: *"a DELETE's read-set is exactly the files it rewrites."*
+- ⚠ **ALL OF THE ABOVE IS REASONED, NOT MEASURED. No suite can produce a concurrent commit** — the same
+  standing limitation the `isBlindAppend` work carries. The tiers prove only that the single-writer path is
+  unbroken.
+
+### Other commits worth knowing, each with its reachability established by one grep
+
+- `93751de` — *"BufferedParquetWriter writes decimals big-endian; low-cardinality decimals were corrupt"*,
+  a genuine silent corruption. **It does NOT reach us**: `BufferedParquetWriter` appears nowhere in our
+  source. ⚠ The first grep for it said otherwise because it matched `bin/Release/*.dll` and the XML docs —
+  **build output is not a call site**, and an evidence grep must exclude `/bin/` and `/obj/`.
+- `65a69a6` — per-column parquet write options now translate LOGICAL → PHYSICAL names against the snapshot.
+  **This is the exact bug we REFUSED in August** (`parquet_bloom_filter_columns` was a silent no-op on a
+  column-mapped table — 0 of 10 chunks got a filter with mapping on, 10 of 10 with it off) and recorded as
+  *"the real fix is an upstream-shaped ask and is the right thing to do later."* Upstream did it. ⇒ the
+  refusal in the `WITH` layer can now be lifted; NOT done in this bump, and it wants its own gate.
+- `a684678`-class pruning fixes, the eight ALP commits and the vortex/Lance work: INERT. We reference
+  exactly ONE EW project, `EngineeredWood.DeltaLake.Table` (established by grepping the csprojs), set no
+  `ByteArrayEncoding`, and declare none of the new feature flags. ⚠ The standing rule is unchanged: do NOT
+  enable FSST/ALP/PFOR — unratified, and they contest encoding slots.
+
 ## THE 2026-08-11 BUMP — onto a FRESH branch off `upstream/main` (`154f800`), because the patch set RETIRED
 
 The branch model's stated goal, reached: **every one of our seven patches is upstream**, so the bump was not a
