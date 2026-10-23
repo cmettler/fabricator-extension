@@ -4761,6 +4761,9 @@ SELECT schema_name FROM duckdb_schemas() WHERE database_name = 'cat';
   a table needs at least one); it is skipped with a warning. `schemas true` does not discover one either.
 - Not available on a **OneLake** root: Fabric's `Tables/` area is defined as exactly two levels, and the
   ATTACH says so rather than offering a syntax that would resolve to nothing.
+- Works on **local filesystems and S3** (both measured end to end). On a local root discovery walks
+  directories; on an object store it is one recursive glob, which costs more — see the per-file figures
+  under [Delta read path](docs/delta-read-path.md) before pointing it at a large bucket.
 
 **Defaults** (when no options are given):
 

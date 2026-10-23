@@ -675,6 +675,102 @@ SELECT fabricator_exec('clean2', 'VACUUM main.t RETAIN 0 HOURS');
 statement ok
 DETACH clean2;
 
+# ==== NESTED SCHEMAS ON S3 (`nested_schemas true`) ====
+#
+# ⚠⚠ THIS SECTION EXISTS FOR ONE MEASUREMENT: the object-store leg of nested discovery is a RECURSIVE
+# glob (`<root>/**/_delta_log/*.json`), and `**` was only ever verified against DuckDB's LOCAL glob.
+# httpfs and azure are a different implementation, so until this ran, "nested schemas work on S3" was
+# REASONED and not tested — the gap docs/nested-schemas.md §Slice 2b records under "Measured, and not
+# measured". The depth-3 row below is the whole point: it can only pass if `**` spans two levels against
+# a real object store.
+#
+# ⚠ The tree is built by attaching SUB-ROOTS with the ordinary two-level layout, because a nested
+# `CREATE SCHEMA a.b` needs the nested attach that this section is testing — the layout has to come from
+# storage, which is the shape the feature is for.
+
+statement ok
+ATTACH 's3://fabricator/nested' AS ns1 (TYPE fabricator, PROVIDER '${DELTA_PROVIDER}',
+                                        SECRET minio_s3, READ_ONLY false, schemas true);
+
+statement ok
+CREATE SCHEMA IF NOT EXISTS ns1.sales;
+
+statement ok
+CREATE OR REPLACE TABLE ns1.sales.orders AS SELECT 1 AS id, 'eu' AS region;
+
+statement ok
+DETACH ns1;
+
+statement ok
+ATTACH 's3://fabricator/nested/sales' AS ns2 (TYPE fabricator, PROVIDER '${DELTA_PROVIDER}',
+                                              SECRET minio_s3, READ_ONLY false, schemas true);
+
+statement ok
+CREATE SCHEMA IF NOT EXISTS ns2.eu;
+
+statement ok
+CREATE OR REPLACE TABLE ns2.eu.deep AS SELECT 42 AS v;
+
+statement ok
+DETACH ns2;
+
+# THE MEASUREMENT: one recursive glob against httpfs finds a table two levels down.
+statement ok
+ATTACH 's3://fabricator/nested' AS nk (TYPE fabricator, PROVIDER '${DELTA_PROVIDER}',
+                                       SECRET minio_s3, READ_ONLY false, nested_schemas true);
+
+query II
+SELECT schema_name, table_name FROM duckdb_tables() WHERE database_name='nk' ORDER BY 1, 2;
+----
+eu	deep
+sales	orders
+
+query I
+SELECT v FROM nk.sales.eu.deep;
+----
+42
+
+# ⚠ The LEAF alone must NOT resolve — the row that tells real nesting from a flattened name, since
+# duckdb_tables() prints a child schema by its own name either way.
+statement error
+SELECT v FROM nk.eu.deep;
+----
+schema "eu" does not exist
+
+# Writes at depth 2 reach the right prefix (ABI v92). A wrong path would write to s3://fabricator/eu/...
+statement ok
+INSERT INTO nk.sales.eu.deep VALUES (7);
+
+query I
+SELECT count(*) FROM nk.sales.eu.deep;
+----
+2
+
+statement ok
+DELETE FROM nk.sales.eu.deep WHERE v = 7;
+
+query I
+SELECT v FROM nk.sales.eu.deep;
+----
+42
+
+statement ok
+DETACH nk;
+
+# ⚠ READ BACK THROUGH A SUB-ROOT ATTACHED FLAT — the control that the nested write landed where the PATH
+# says rather than one level too shallow. The nested catalog would happily read back its own mistake.
+statement ok
+ATTACH 's3://fabricator/nested/sales' AS nsub (TYPE fabricator, PROVIDER '${DELTA_PROVIDER}',
+                                               SECRET minio_s3, READ_ONLY false, schemas true);
+
+query I
+SELECT v FROM nsub.eu.deep;
+----
+42
+
+statement ok
+DETACH nsub;
+
 # ⚠ copyfmt is attached READ-ONLY above (an s3 ATTACH with no READ_ONLY clause is auto-bumped by DuckDB),
 # so the teardown needs its own writable attach — OPTIMIZE and VACUUM both COMMIT.
 statement ok

@@ -1391,7 +1391,16 @@ case "$TIER" in
         #   asserted: cf_concat is non-commutative, so without ORDER BY its answer is a scheduling accident.
         #   Also pins that EXPORT_STATE is REFUSED on a marshaled aggregate — correct, not a gap: our
         #   DuckDB-side state is an int64 HANDLE into a session-local C# dictionary.
-        : "${MIN_ASSERTIONS:=3593}"
+        # 2026-10-24: 3593 -> 3639. verify_delta_catalog_s3 199 -> 222, ENGINE-DOUBLED, so +46.
+        #   Nested schemas on S3, and the section exists for ONE measurement: the object-store leg of
+        #   nested discovery is a RECURSIVE `**` glob, which had only ever been verified against DuckDB's
+        #   LOCAL glob. httpfs is a different implementation, so until this ran the claim was REASONED.
+        #   It holds — one glob spans two levels against a real object store.
+        #   ⚠ FIRST SET TO 3645, FROM A PRE-CHANGE COUNT OF 196 TAKEN OUT OF PROSE. The tier's own log
+        #   said 199, so the growth is +23 per leg and not +26, and the floor check caught the six-
+        #   assertion gap on the next run — which is what it is for. Take the baseline from the PREVIOUS
+        #   RUN LOG, never from a number repeated in a doc: that has gone stale here four times already.
+        : "${MIN_ASSERTIONS:=3639}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

@@ -59,15 +59,43 @@ both become trees, and the graveyard's ordering rule (a schema entry must outliv
   each model its own `cat.<model>.system.<dmv>`: a genuine three-level need, from a provider with no
   directory tree at all. That it is not Delta-only is what justifies changing the ABI rather than encoding
   paths in strings.
+- **⚠⚠ RETRACTED 2026-10-24 — THE DAX ARGUMENT ABOVE IS WRONG, and it was wrong when it was written.**
+  It claimed *"two attached semantic models share ONE `cat.system`"*. They do not. A `DaxCatalog` is
+  scoped to exactly ONE Analysis Services DATABASE (`_catalog`, resolved at construction and applied with
+  `ChangeDatabase`), and an AS database holds exactly one Tabular model — `DiscoverModelNames()` reads
+  `$SYSTEM.TMSCHEMA_MODEL` and the constructor takes `[0]`. So one ATTACH is one model plus its own
+  `system`, and two attached models are two separate DuckDB CATALOGS (`a.system`, `b.system`) that cannot
+  collide. **The plural in the code's own comment ("the model name(s)") is what the claim was read off,
+  and the code beside it takes a single element.**
+  - ⚠ READ FROM THE CODE, NOT MEASURED: `verify_dax` is the manual tier (it needs a live Power BI
+    Desktop / SSAS / Fabric instance), so this is a source reading rather than a run. It is unambiguous
+    enough to retract on — `GetSchemas()` is literally `new[] { _modelName, SystemSchema }` — but anyone
+    with a live instance should confirm before relying on the retraction in the other direction.
+  - **⇒ NOTHING WAS BUILT FOR IT.** Nesting `system` under the model inside one catalog
+    (`cat.<model>.system.<dmv>`) would be a BREAKING rename of a working surface for no gain: the
+    grouping it buys is cosmetic, and `cat.system.<dmv>` already means exactly one thing.
+  - **⚠ THE REAL DAX CASE IS LARGER AND IS STILL OPEN: a WORKSPACE, not a model.** A Power BI workspace
+    XMLA endpoint exposes MANY databases (one per dataset), and `DiscoverDefaultCatalog` picks the FIRST
+    row of `$SYSTEM.DBSCHEMA_CATALOGS` and ignores the rest — so today you ATTACH once per dataset.
+    Nesting would let one ATTACH name the workspace and give `cat.<dataset>.<table>`, which is the grist
+    shape (`team -> workspace -> document -> tables`) and a genuine structural three-level need.
+    ⚠ It is NOT the small provider-side change §3 implied: the catalog would span several databases, so
+    the connection, every scan and the per-model function registrations each gain a database dimension.
+    Size it before promising it.
+  - ⇒ **grist remains the strongest argument for the feature**, and it is unaffected by this retraction:
+    its hierarchy is the product's own, so under a two-part model one of workspace/document MUST be
+    flattened into a compound name. The ABI work (v90/v91/v92) is done and is what that plugin needs.
+
 - **⚠⚠ AND THE CLEANEST FIT IS A PLUGIN, NOT A FIRST-PARTY PROVIDER (user, 2026-10-23):
   `fabricator-grist` is `team -> workspace -> document -> tables`.** ATTACH names the team, and
   `cat.<workspace>.<document>.<table>` falls straight out. Unlike Delta's ad-hoc trees this is not an
   unusual layout anyone could avoid — it is the product's OWN hierarchy, so under a two-part model one of
   workspace/document MUST be flattened into a compound schema name, which is exactly the kind of
   name-mangling this feature exists to remove.
-  ⇒ **THREE providers now want it and two of them are structurally three-level** (grist by design, DAX
-  per-model `system`), which is what turns "nice to have for odd Delta folders" into a real argument for
-  changing the ABI. ⚠ It also means the feature must work for an OUT-OF-TREE plugin, so whatever carries
+  ⇒ **TWO providers want it and grist is structurally three-level by design** (the DAX half of this
+  count is RETRACTED above; its real case — a workspace spanning datasets — is open but much larger).
+  That one of them is an out-of-tree PLUGIN is what still justifies changing the ABI rather than
+  encoding paths in strings. ⚠ It also means the feature must work for an OUT-OF-TREE plugin, so whatever carries
   the path has to be part of the published contract (`Fabricator.Abstractions`), not an internal detail —
   see the plugin/host build boundary in CLAUDE.md.
 - **⛔ SQL SERVER AND FABRIC `Tables/` MUST LEAVE THE CAPABILITY OFF.** Their namespace is genuinely
@@ -227,8 +255,16 @@ attached FLAT as the control proving the table exists.
 #### Measured, and not measured
 
 - `**` matches zero or more directory levels in DuckDB's **local** glob — measured directly, including
-  that a depth-1 table still matches. ⚠ The httpfs/azure glob implementations are a different code path
-  and are **NOT** measured here, so the object-store leg of nested discovery is reasoned, not tested.
+  that a depth-1 table still matches.
+- **⚠⚠ AND ON S3 TOO, MEASURED 2026-10-24 — this was the one open gap and it is closed.** The entry
+  below used to read *"the httpfs/azure glob is a different code path and is NOT measured, so the
+  object-store leg is reasoned, not tested"*. It is tested now: `verify_delta_catalog_s3` grew a nested
+  section (199 -> **222**, engine-doubled, so the service floor moved 3593 -> **3639**) whose depth-3
+  row can only pass if ONE `**` glob spans two levels against a real object store. Discovery, the
+  depth-3 read, an INSERT and a DELETE at depth 2 all pass on BOTH engine legs, and the write is read
+  back through a sub-root attached FLAT — the control that it landed where the path says.
+  ⚠ **AZURE is still unmeasured**: it is a third glob implementation, and no CI tier can reach a real
+  ADLS account (the `verify_delta_catalog_adls` suite is the manual/live-account tier).
 - The plain-ADLS SDK fast path (`AdlsTableDiscovery`) is deliberately not used for nested roots: its walk
   is fixed at one or two levels. Nested ADLS pays the glob — correct, and slower.
 - Depth is capped at 16 levels and REFUSES rather than truncating; silently not discovering a table is
@@ -294,9 +330,13 @@ day upstream lifts the cap.
   `schema_filter`, cache invalidation
 - gates, including the one that matters: a table at depth 3 resolving as `cat.a.b.t`
 
-### Slice 3 (optional, separate) — DAX per-model `system`
+### ⛔ Slice 3 — DAX per-model `system`: NOT BUILT, and the premise is RETRACTED (2026-10-24)
 
-Only worth doing once slice 2 exists; it is the semantic-model case in §3 and needs no Delta work.
+§3's DAX argument was wrong: a `DaxCatalog` is one Analysis Services DATABASE, which holds one model and
+one `system`, so two attached models are two DuckDB catalogs and never shared one. Nesting `system` under
+the model would be a breaking rename of a working surface for a cosmetic gain. See the retraction in §3
+for what was read, and for the DAX case that IS real and open — a workspace spanning many datasets,
+which is a far larger change than this slice described.
 
 ## 5. Traps already identified
 
