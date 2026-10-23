@@ -37,10 +37,29 @@ void RegisterFabricatorGlobalFunctions(ExtensionLoader &loader);
 
 class FabricatorSchemaEntry : public SchemaCatalogEntry {
 public:
-	FabricatorSchemaEntry(Catalog &catalog, CreateSchemaInfo &info, FabricatorHandle handle);
+	//! \param parent_schema the enclosing schema for a NESTED schema (DuckDB 2.0), else null. It is a
+	//! CONSTRUCTOR parameter rather than a field set afterwards because `SchemaCatalogEntry` stores it at
+	//! construction and `GetSchemaPath()` / `GetQualifiedName()` walk that chain — an entry given its
+	//! parent later would already have reported itself as top-level.
+	FabricatorSchemaEntry(Catalog &catalog, CreateSchemaInfo &info, FabricatorHandle handle,
+	                      optional_ptr<SchemaCatalogEntry> parent_schema = nullptr);
 
 	//! Registers a discovered table/view name (called at attach time).
 	void AddTable(const string &table_name, const string &table_type);
+
+	//! Returns the CHILD schema called `name`, creating it if absent (DuckDB 2.0 nested schemas).
+	//! \warning The child's `parent_schema` is set to this entry, which is what makes DuckDB's
+	//! `GetSchemaPath()` / `GetQualifiedName()` report `a.b.t` rather than a bare `b.t`.
+	//! \warning LIFETIME: a child is owned by its parent, so a parent necessarily outlives its children.
+	//! That ordering is load-bearing for the same reason the catalog's retire-don't-destroy graveyard is:
+	//! every entry's `ParentSchema()` is a REFERENCE into its schema entry, so destroying a parent while a
+	//! child (or a child's table) is still reachable is the use-after-free this codebase already records.
+	FabricatorSchemaEntry &GetOrCreateChildSchema(const string &name);
+
+	//! The child schemas, by name. Empty unless the provider emitted paths deeper than one.
+	const case_insensitive_map_t<unique_ptr<FabricatorSchemaEntry>> &ChildSchemas() const {
+		return child_schemas_;
+	}
 
 	//! Registers a discovered scalar UDF name (called at attach time). Exposed as a
 	//! DuckDB scalar function so `db.schema.func(args)` resolves; arg/return types and
@@ -146,6 +165,10 @@ public:
 	void Alter(CatalogTransaction transaction, AlterInfo &info) override;
 
 private:
+	//! Nested child schemas, OWNED by this entry so a parent always outlives its children (see
+	//! GetOrCreateChildSchema). Empty for every provider today: nothing emits a path deeper than one.
+	case_insensitive_map_t<unique_ptr<FabricatorSchemaEntry>> child_schemas_;
+
 	//! COMMENT ON TABLE / COMMENT ON COLUMN. Its own method rather than a case in Alter's switch because
 	//! those arrive as AlterType::SET_COMMENT / SET_COLUMN_COMMENT and carry NO AlterTableInfo — so they
 	//! must be dispatched before Alter's `info.Cast<AlterTableInfo>()`, which would otherwise be a bad cast.

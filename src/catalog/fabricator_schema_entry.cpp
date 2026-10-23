@@ -59,6 +59,7 @@
 #include "duckdb/catalog/catalog_entry/table_macro_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/view_catalog_entry.hpp"
 #include "duckdb/parser/parsed_data/create_macro_info.hpp"
+#include "duckdb/parser/parsed_data/create_schema_info.hpp"
 #include "duckdb/parser/parsed_data/create_view_info.hpp"
 #include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
@@ -77,8 +78,29 @@
 
 namespace duckdb {
 
-FabricatorSchemaEntry::FabricatorSchemaEntry(Catalog &catalog, CreateSchemaInfo &info, FabricatorHandle handle)
-    : SchemaCatalogEntry(catalog, info), handle_(handle) {
+FabricatorSchemaEntry::FabricatorSchemaEntry(Catalog &catalog, CreateSchemaInfo &info, FabricatorHandle handle,
+                                             optional_ptr<SchemaCatalogEntry> parent_schema)
+    : SchemaCatalogEntry(catalog, info, parent_schema), handle_(handle) {
+}
+
+// DuckDB 2.0 nested schemas. The child is OWNED here, which is what makes the lifetime safe without a
+// second graveyard: a parent cannot be destroyed while holding a live child, and every entry's
+// ParentSchema() is a REFERENCE into its schema entry — the exact shape of the use-after-free this file
+// already guards against for table entries.
+// ⚠ parent_schema is set on the INFO before construction rather than afterwards: SchemaCatalogEntry reads
+// it in its own constructor to build the parent chain that GetSchemaPath()/GetQualifiedName() walk, so
+// assigning it later would leave an entry that reports itself as top-level.
+FabricatorSchemaEntry &FabricatorSchemaEntry::GetOrCreateChildSchema(const string &name) {
+	auto it = child_schemas_.find(name);
+	if (it != child_schemas_.end()) {
+		return *it->second;
+	}
+	CreateSchemaInfo info;
+	info.SetSchema(Identifier(name));
+	auto child = make_uniq<FabricatorSchemaEntry>(catalog, info, handle_, this);
+	auto &ref = *child;
+	child_schemas_[name] = std::move(child);
+	return ref;
 }
 
 // Entry evictions RETIRE (never destroy): the lookup paths hand out raw pointers DuckDB's binder holds
@@ -3993,6 +4015,17 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::LookupEntry(CatalogTransaction
 		return nullptr;
 	}
 	auto type = lookup_info.GetCatalogType();
+	// DuckDB 2.0 nested schemas: `Catalog::LookupSchemaPath` finds the ROOT through the catalog's
+	// LookupSchema and then asks each PARENT for the next level with CatalogType::SCHEMA_ENTRY, casting
+	// what comes back to SchemaCatalogEntry. This branch is that call.
+	// ⚠ A miss returns null rather than throwing: the walk's caller decides, honouring its own
+	// OnEntryNotFound, and throwing here would turn an IF NOT EXISTS probe into an error.
+	// ⚠ child_schemas_ is empty for every provider today, so this answers null and the behaviour of every
+	// existing lookup is unchanged — the tree is representable before anything populates it.
+	if (type == CatalogType::SCHEMA_ENTRY) {
+		auto it = child_schemas_.find(lookup_info.GetEntryName());
+		return it == child_schemas_.end() ? nullptr : optional_ptr<CatalogEntry>(it->second.get());
+	}
 	if (type == CatalogType::TABLE_ENTRY || type == CatalogType::VIEW_ENTRY) {
 		// A provider-declared VIEW resolves through the TABLE_ENTRY lookup, not a separate one:
 		// Binder::Bind(BaseTableRef&) asks for TABLE_ENTRY and then switches on the entry's ACTUAL type
