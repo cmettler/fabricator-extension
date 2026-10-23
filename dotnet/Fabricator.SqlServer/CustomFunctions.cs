@@ -252,6 +252,7 @@ internal static class CustomFunctions
         new CfBitOrFunction(),
         new CfSumSpillFunction(),
         new CfMedianFunction(),
+        new CfConcatFunction(),
     };
 
     // Collector table-in-out functions (ICatalogCollectorFunction), singletons — surfaced as
@@ -377,6 +378,53 @@ internal sealed class CfMedianFunction : ICatalogAggregateFunction
             // Matches DuckDB's median (quantile_cont(0.5)): average the two middles for an even count.
             return n % 2 == 1 ? _values[n / 2] : (_values[n / 2 - 1] + _values[n / 2]) / 2.0;
         }
+    }
+}
+
+// Demo (aggregate, ORDER-SENSITIVE): dbo.cf_concat(x VARCHAR) -> VARCHAR, the inputs joined in the order the
+// aggregate saw them. It exists to cover a path nothing else here can reach.
+//
+// ⚠⚠ EVERY OTHER CUSTOM AGGREGATE IN THIS FILE IS COMMUTATIVE (product, bit_or, median, sum_spill), so an
+// `ORDER BY` inside the call cannot change their answer — which means none of them can tell a working
+// ordered-aggregate path from a broken one. DuckDB wraps ANY aggregate, marshaled ones included, in
+// SortedAggregateFunction when the call carries an ORDER BY (the plan then shows two arguments for this
+// one-argument function: the payload and the sort key), and that wrapper was REWRITTEN onto the list
+// infrastructure in DuckDB 2.0 (#23231). Until this function existed, the whole wrapper was untested here.
+//
+// ⚠ IT IS NON-COMMUTATIVE ON PURPOSE, and that makes it deterministic ONLY with an ORDER BY. Called bare,
+// under parallel partial-state merging, the result depends on how the groups were split and combined — so
+// the gate asserts the ORDERED form only, and asserts TWO different sort keys produce DIFFERENT strings.
+// Asserting one ordered answer alone would also pass on a wrapper that ignored the key and got lucky.
+//
+// ⚠ Combine appends the source AFTER this state, which is the only associative choice; it is still not
+// commutative, and that is the point rather than a defect.
+internal sealed class CfConcatFunction : ICatalogAggregateFunction
+{
+    public string SchemaName => "dbo";
+    public string Name => "cf_concat";
+    public Schema Parameters => new(new[] { new Field("x", StringType.Default, nullable: true) }, metadata: null);
+    public Field Result => new("concat", StringType.Default, nullable: true);
+    public IAggregateState CreateState() => new State();
+
+    private sealed class State : IAggregateState
+    {
+        private readonly List<string> _parts = new();
+
+        public void Update(RecordBatch args)
+        {
+            var x = (StringArray)args.Column(0);
+            for (int i = 0; i < args.Length; i++)
+            {
+                if (!x.IsNull(i))
+                {
+                    _parts.Add(x.GetString(i)); // copy out — the batch's buffers are freed after this returns
+                }
+            }
+        }
+
+        public void Combine(IAggregateState source) => _parts.AddRange(((State)source)._parts);
+
+        public object? Finalize() => _parts.Count == 0 ? null : string.Concat(_parts);
     }
 }
 

@@ -1359,7 +1359,21 @@ case "$TIER" in
         #     OWN defaults. ⚠⚠ A WRONG ANSWER, not an error: same proc, same statement, 1.5.6 answered 60
         #     and 2.0 answered NULL. The fix reads the PARSED call instead of the filled map.
         #   verify_custom_functions (135) — the varargs candidate line that 2.0 renders differently.
-        : "${MIN_ASSERTIONS:=3586}"
+        # 2026-10-23: 3586 -> 3593. verify_custom_aggregates 58 -> 65 — ORDERED custom aggregates
+        #   (`fn(x ORDER BY k)`), which nothing here could reach before. DuckDB wraps ANY aggregate in
+        #   SortedAggregateFunction when the call carries an ORDER BY, ours included, and 2.0 REWROTE that
+        #   wrapper onto the list infrastructure (#23231) — but every custom aggregate the provider had was
+        #   COMMUTATIVE (product, bit_or, median, sum_spill), so a broken wrapper and a working one gave the
+        #   same answer. A new order-SENSITIVE aggregate, cf_concat, is what makes the path observable.
+        #   ⚠ The risk it covers is ABI v89: agg_open doubles as the aggregate's BIND, relying on DuckDB
+        #   passing AggregateFunction BY VALUE and moving the mutated copy into the bound expression; had
+        #   BindSortedAggregate copied before that, the resolved result field would be lost.
+        #   ⚠ THREE sort keys are asserted, not one — a single ordered answer would also pass on a wrapper
+        #   that ignored the key and happened to deliver insertion order. The BARE call is deliberately NOT
+        #   asserted: cf_concat is non-commutative, so without ORDER BY its answer is a scheduling accident.
+        #   Also pins that EXPORT_STATE is REFUSED on a marshaled aggregate — correct, not a gap: our
+        #   DuckDB-side state is an int64 HANDLE into a session-local C# dictionary.
+        : "${MIN_ASSERTIONS:=3593}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

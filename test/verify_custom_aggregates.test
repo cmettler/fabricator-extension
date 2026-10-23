@@ -249,3 +249,64 @@ SELECT bool_and(abs(cf - duck) < 1e-9) FROM (
 );
 ----
 true
+
+# ============================================================================
+# ORDERED CUSTOM AGGREGATES — `fn(x ORDER BY k)` over a MARSHALED aggregate.
+#
+# DuckDB wraps ANY aggregate in SortedAggregateFunction when the call carries an ORDER BY, ours included:
+# the plan shows TWO arguments for this ONE-argument function (the payload and the sort key). That wrapper
+# was rewritten onto the `list` infrastructure in DuckDB 2.0 (#23231), and until cf_concat existed nothing
+# here could exercise it — every other custom aggregate in the provider (cf_product, cf_bit_or, cf_median,
+# cf_sum_spill) is COMMUTATIVE, so an ORDER BY cannot change its answer and a broken wrapper would look
+# identical to a working one.
+#
+# ⚠ The real risk this covers is ABI v89: agg_open doubles as the aggregate's BIND and relies on DuckDB
+# passing AggregateFunction BY VALUE and moving the mutated copy into the bound expression. Had
+# BindSortedAggregate copied the function before that mutation, the resolved result field would be lost.
+#
+# ⚠ TWO DIFFERENT SORT KEYS ARE ASSERTED, NOT ONE. A single ordered answer would also pass on a wrapper
+# that ignored the key and happened to deliver insertion order; three different keys giving three different
+# strings is what shows the key is honoured.
+#
+# ⚠ The BARE call is deliberately NOT asserted: cf_concat is non-commutative, so without an ORDER BY its
+# answer depends on how parallel partial states were split and merged. Pinning it would be pinning a
+# scheduling accident.
+# ============================================================================
+
+statement ok
+CREATE TEMP TABLE ordagg AS SELECT * FROM (VALUES (1,'c'),(2,'a'),(3,'b')) v(id, s);
+
+# sorted by the VALUE
+query T
+SELECT adb.dbo.cf_concat(s ORDER BY s) FROM ordagg;
+----
+abc
+
+# sorted by a DIFFERENT column — a wrapper that ignored the key would still say 'abc' here
+query T
+SELECT adb.dbo.cf_concat(s ORDER BY id) FROM ordagg;
+----
+cab
+
+# and descending, so neither ascending order nor insertion order can produce it by luck
+query T
+SELECT adb.dbo.cf_concat(s ORDER BY id DESC) FROM ordagg;
+----
+bac
+
+# the wrapper really is engaged: a ONE-argument aggregate planned with TWO arguments is
+# SortedAggregateFunction's payload+key shape
+query II
+EXPLAIN SELECT adb.dbo.cf_concat(s ORDER BY id) FROM ordagg;
+----
+physical_plan	<REGEX>:.*cf_concat\(#0, #1\).*
+
+# ⚠ EXPORT_STATE is REFUSED on a marshaled aggregate, and that is the correct answer rather than a gap.
+# DuckDB's state export is a general aggregate feature (2.0's #23376 only extended it to ORDERED
+# aggregates), but it requires an opt-in state-type callback. We define none — and must not: a non-spill
+# custom aggregate's DuckDB-side state is an int64 HANDLE into a session-local C# dictionary, so exporting
+# it would hand out a number that means nothing in any other session. Refusing cannot invent a wrong answer.
+statement error
+SELECT adb.dbo.cf_median(val) EXPORT_STATE FROM (VALUES (1.0)) v(val);
+----
+does not have a state type callback
