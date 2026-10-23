@@ -78,6 +78,21 @@ public:
 		return null_order_expressible_;
 	}
 
+	//! DuckDB 2.0 nested schemas: whether a dotted schema string may denote a PATH (`a.b` = schema `b`
+	//! inside schema `a`) rather than a literal schema named "a.b". Provider-declared through the
+	//! capability doc's `supports_nested_schemas`; DuckDB's own default is false and so is ours.
+	//! \warning A provider whose namespace is genuinely two-part must leave this OFF. SQL Server has
+	//! schema.table and nothing deeper, and Fabric's Tables/ area is defined as exactly two levels, so
+	//! turning it on there would make DuckDB offer a syntax that resolves to nothing.
+	//! \warning NOTHING DECLARES IT TRUE YET, and reporting it is only the first of the three things
+	//! nesting needs. The other two are structural: the `catalog_*` streams carry a flat UTF-8 schema
+	//! NAME (all five are read by the one `ReadStringTable`, which assumes every column is a string) and
+	//! `table_open` takes a `const char *schema`. Until those carry a path, a true here would let DuckDB
+	//! resolve `a.b` against a catalog that cannot express it.
+	bool SupportsNestedSchemas() const override {
+		return supports_nested_schemas_;
+	}
+
 	//! Whether an ATTACH object filter (schema_filter / table_filter / function_filter) is active. When set,
 	//! the discovered name list (per schema) is a FILTERED SUBSET, so a targeted lookup miss is ambiguous —
 	//! it may be a real object the filter merely excluded from ENUMERATION. The filter bounds enumeration
@@ -188,6 +203,7 @@ private:
 	std::atomic<bool> schema_may_change_ {false};
 	bool string_order_pushable_ = false;
 	bool null_order_expressible_ = false;
+	bool supports_nested_schemas_ = false;
 	//! Whether the provider applies pushed filters exactly (detected at LoadCatalog) => filter_pushdown=true
 	//! is safe on the scan (currently: Delta native_read only). See ExactFilterPushdown().
 	bool exact_filter_pushdown_ = false;

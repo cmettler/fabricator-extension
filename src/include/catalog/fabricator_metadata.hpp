@@ -49,6 +49,17 @@ struct FabricatorCapabilities {
 	//! and SQL Server orders NULLs first for ASC / last for DESC — so `NullOrderCompatible` must gate the
 	//! push. True for the Delta reader, whose ORDER BY is executed BY DuckDB, which spells both.
 	bool null_order_expressible = false;
+
+	//! The provider's schema names are PATHS, so `a.b` may denote a schema nested inside `a` rather than a
+	//! literal schema called "a.b" (DuckDB 2.0 nested schemas; `Catalog::SupportsNestedSchemas`).
+	//! \warning FALSE IS THE ONLY SAFE DEFAULT and it is what every provider reports today. A provider
+	//! whose namespace is genuinely two-part must leave it off: SQL Server has schema.table and nothing
+	//! deeper, and Fabric's Tables/ area is defined as exactly two levels. Turning it on there would make
+	//! DuckDB offer a syntax that resolves to nothing.
+	//! \warning It is read but NOT YET ACTED ON: carrying a real path needs the catalog_* streams to carry
+	//! one (they are flat UTF-8 today, read by the single ReadStringTable) and table_open to take one.
+	//! See docs/nested-schemas.md (the slice plan) before wiring the rest.
+	bool supports_nested_schemas = false;
 };
 
 //! Reads the catalog's capability doc (one flat JSON object of booleans). Called once at ATTACH
