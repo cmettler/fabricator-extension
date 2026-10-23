@@ -510,13 +510,29 @@ internal static class DeltaWriter
                                               IDataFileReader? dataFileReader = null) => DeltaTableOptions.Default with
     {
         ParquetReadOptions = ReadOptions(),
-        // NOTE: VariantTransportBlob is deliberately NOT set. The C++↔C# Arrow boundary does speak the
-        // ew.variant_transport LEAF-binary transport (one self-delimiting metadata++value blob per row — the
-        // canonical arrow.parquet.variant struct extension crashes DuckDB's ArrowAppender::FinalizeChild),
-        // but that flattening is now OURS: engineered-wood's read pipeline emits its canonical
-        // VariantArray via the UNPATCHED VariantColumnCoercion, and Fabricator.Bridge.VariantTransport
-        // converts at each boundary (read exits, the native-read seam, the write entries). Keeping the
-        // conversion on this side is what removes ~392 lines of patch from engineered-wood.
+        // ⚠⚠ WITHOUT THIS LISTENER A FAILING CHECKPOINT IS SILENT, and that is a change EW made in 987a0ce
+        // (#226). A version checksum, an interval checkpoint and log cleanup all run AFTER the commit is
+        // durable, so EW stopped throwing on them — failing a write that already succeeded was the wrong
+        // answer. But the replacement is a callback, and an unsubscribed callback reports nothing.
+        // ⚠ The cost of not listening is EXACTLY the pathology this repo already measured on S3: log cleanup
+        // deletes only what a checkpoint covers, so a table whose checkpoint fails every time reclaims
+        // nothing and replays its whole log on every open — ~10 ms per dead commit and ~85 ms per active
+        // file there. A dbt model committing hourly would accrue that for a year before anyone asked why.
+        // ⚠ SYNCHRONOUS BY CONTRACT: an async lambda here compiles to `async void`, and what it throws after
+        // its first await reaches the thread pool and ENDS THE PROCESS. EW swallows a synchronous throw.
+        // Warning, not error: the write succeeded. One failure is noise; a repeated one is the disease.
+        OnPostCommitMaintenanceFailure = static f => Log.LogWarning(
+            f.Exception,
+            "delta maintenance {Step} failed for v{Version}: the commit is durable, this is post-commit "
+            + "upkeep. Repeated failures stop the log being reclaimed and slow every later open.",
+            f.Step, f.Version),
+        // NOTE: VariantTransportBlob is deliberately NOT set, and the REASON changed with DuckDB 2.0.
+        // ⚠ It used to be that the canonical arrow.parquet.variant struct crashed DuckDB's
+        // ArrowAppender::FinalizeChild, so the boundary spoke a LEAF-binary `ew.variant_transport` blob that
+        // Fabricator.Bridge.VariantTransport flattened at each crossing. 2.0 ships canonical variant over
+        // Arrow (our own PR), so that workaround is GONE — the C++ registration is deleted and the marker
+        // with it. EW emits its canonical VariantArray and DuckDB imports it directly.
+        // What survives is only the instruction above: do not ask EW for the blob form.
         ParquetWriteOptions = new ParquetWriteOptions
         {
             OmitPathInSchema = false, // REQUIRED field — standard readers (DuckDB/arrow-rs/Fabric) reject without it
