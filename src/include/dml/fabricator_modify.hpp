@@ -37,6 +37,8 @@ void FabricatorFillUpdateSetColumns(TableCatalogEntry &table, const vector<Physi
 
 //! Shared target metadata for rowid-based DELETE/UPDATE.
 struct FabricatorModifyTarget {
+	//! The schema as a PATH, outermost first (ABI v92). Depth 1 unless the provider nests.
+	vector<string> schema_path;
 	string schema_name;
 	string table_name;
 	//! rowid/PK column names + types, in key order (1 = scalar rowid, >1 = compound).

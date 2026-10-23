@@ -90,16 +90,6 @@ FabricatorSchemaEntry::FabricatorSchemaEntry(Catalog &catalog, CreateSchemaInfo 
 // ⚠ parent_schema is set on the INFO before construction rather than afterwards: SchemaCatalogEntry reads
 // it in its own constructor to build the parent chain that GetSchemaPath()/GetQualifiedName() walk, so
 // assigning it later would leave an entry that reports itself as top-level.
-void FabricatorRefuseNestedWrite(const SchemaCatalogEntry &schema, const char *statement) {
-	if (!schema.GetParentSchema()) {
-		return;
-	}
-	throw NotImplementedException(
-	    "fabricator: %s is not supported in the NESTED schema \"%s\" — writes still address the provider by "
-	    "a single schema name, so this would silently target a different schema. Reading a nested schema "
-	    "works; writing into one does not yet (see docs/nested-schemas.md)",
-	    statement, schema.GetSchemaName());
-}
 
 // This entry's schema PATH as plain strings, outermost first — what table_open takes since v91.
 // ⚠ DuckDB's SchemaCatalogEntry::GetSchemaPath() walks the parent_schema chain, which is exactly why the
@@ -124,6 +114,21 @@ FabricatorSchemaEntry &FabricatorSchemaEntry::GetOrCreateChildSchema(const strin
 	auto &ref = *child;
 	child_schemas_[name] = std::move(child);
 	return ref;
+}
+
+FabricatorSchemaEntry *FabricatorSchemaEntry::FindChildSchema(const string &name) {
+	auto it = child_schemas_.find(name);
+	return it == child_schemas_.end() ? nullptr : it->second.get();
+}
+
+unique_ptr<FabricatorSchemaEntry> FabricatorSchemaEntry::ReleaseChildSchema(const string &name) {
+	auto it = child_schemas_.find(name);
+	if (it == child_schemas_.end()) {
+		return nullptr;
+	}
+	auto released = std::move(it->second);
+	child_schemas_.erase(it);
+	return released;
 }
 
 // Entry evictions RETIRE (never destroy): the lookup paths hand out raw pointers DuckDB's binder holds
@@ -4407,7 +4412,6 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::CreateTable(CatalogTransaction
 	}
 	auto &context = *transaction.context;
 	auto &base = info.Base();
-	FabricatorRefuseNestedWrite(*this, "CREATE TABLE");
 	FabricatorSetActiveTxn(handle_, context); // CREATE (+ optional DROP for REPLACE) joins this txn's connection
 
 	// Column names + types, and per-column nullability (NOT NULL constraints). A DuckDB GENERATED column
@@ -4541,7 +4545,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::CreateTable(CatalogTransaction
 	}
 
 	if (replace) {
-		fabricator::DropTable(handle_, name.GetIdentifierName(), base.GetQualifiedName().Name().GetIdentifierName(), /*if_exists=*/true);
+		fabricator::DropTable(handle_, SchemaPathStrings(), base.GetQualifiedName().Name().GetIdentifierName(), /*if_exists=*/true);
 	}
 
 	// Native CREATE TABLE ... PARTITIONED BY (cols): the column names (comma-separated) go to the provider
@@ -4560,7 +4564,7 @@ optional_ptr<CatalogEntry> FabricatorSchemaEntry::CreateTable(CatalogTransaction
 	fabricator::ArrowProducer producer(types, names, fabricator::BoundaryClientProperties(context));
 	producer.SetNullability(nullable);
 	producer.Finish();
-	fabricator::CreateTable(handle_, name.GetIdentifierName(), base.GetQualifiedName().Name().GetIdentifierName(), *producer.Stream(), if_not_exists, pk_arg, unique_arg,
+	fabricator::CreateTable(handle_, SchemaPathStrings(), base.GetQualifiedName().Name().GetIdentifierName(), *producer.Stream(), if_not_exists, pk_arg, unique_arg,
 	                      defaults_arg, partition_arg, sort_arg, identity_arg, options_arg);
 
 	// Register the new table (also invalidates any cached entry) and return it.
@@ -4601,9 +4605,8 @@ void FabricatorSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
 		                              CatalogTypeToString(info.type));
 	}
 	bool if_exists = info.if_not_found == OnEntryNotFound::RETURN_NULL;
-	FabricatorRefuseNestedWrite(*this, "DROP TABLE");
 	FabricatorSetActiveTxn(handle_, context);
-	fabricator::DropTable(handle_, name.GetIdentifierName(), info.GetQualifiedName().Name().GetIdentifierName(), if_exists);
+	fabricator::DropTable(handle_, SchemaPathStrings(), info.GetQualifiedName().Name().GetIdentifierName(), if_exists);
 
 	lock_guard<mutex> lock(entry_lock_);
 	table_types_.erase(info.GetQualifiedName().Name().GetIdentifierName());
@@ -4742,11 +4745,6 @@ void FabricatorSchemaEntry::AlterComment(CatalogTransaction transaction, AlterIn
 }
 
 void FabricatorSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
-	// Refused on a nested schema for the same reason every other write is: the provider re-derives the
-	// table's storage path from the LEAF schema name. See FabricatorRefuseNestedWrite, whose own warning
-	// records that exempting this was a wrong call based on where the crossing rides rather than on what
-	// the callee does with it.
-	FabricatorRefuseNestedWrite(*this, "ALTER TABLE / COMMENT ON");
 	// COMMENT ON arrives as its OWN AlterTypes and carries no AlterTableInfo, so it is dispatched before the
 	// cast below rather than as a case in the switch.
 	if (info.type == AlterType::SET_COMMENT || info.type == AlterType::SET_COLUMN_COMMENT) {
@@ -4947,6 +4945,32 @@ void FabricatorSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &inf
 				throw NotImplementedException("fabricator: SET PARTITIONED BY accepts plain column names only");
 			}
 			request.columns.push_back(key->Cast<ColumnRefExpression>().GetColumnName().GetIdentifierName());
+		}
+		break;
+	}
+	case AlterTableType::SET_TABLE_OPTIONS: {
+		// `ALTER TABLE t SET (key = value, …)` — the per-table write settings, the same vocabulary the
+		// CREATE TABLE WITH clause takes, which is why the values go through the SAME renderer
+		// (TableOptionsArg: constants only, one CAST level unwrapped, a LIST literal joined with commas).
+		// The host does not know what any key MEANS — the provider parses the ones it knows and must
+		// REJECT the rest, exactly as it does for WITH. Rendering here would be a second vocabulary.
+		auto &so = table_info.Cast<SetTableOptionsInfo>();
+		request.kind = "set_table_options";
+		request.has_options = true;
+		for (auto &kv : so.table_options) {
+			request.options.emplace_back(kv.first, fabricator::TableOptionValueText(kv.first, kv.second.get()));
+		}
+		break;
+	}
+	case AlterTableType::RESET_TABLE_OPTIONS: {
+		// `ALTER TABLE t RESET (key, …)` — remove the table's own override so the layer below (the session
+		// setting, then the ATTACH default, then the engine default) decides again. Names only; there is
+		// no value to render.
+		auto &ro = table_info.Cast<ResetTableOptionsInfo>();
+		request.kind = "reset_table_options";
+		request.has_reset_options = true;
+		for (auto &key : ro.table_options) {
+			request.reset_options.push_back(key.GetIdentifierName());
 		}
 		break;
 	}

@@ -911,7 +911,17 @@ case "$TIER" in
         #   10089 + 65 exactly, which is the behaviour-neutrality claim for ABI v91 and the schema-path
         #   plumbing: no provider emits a path deeper than one unless `nested_schemas` is on, so nothing
         #   that existed before this suite moved by a single assertion.
-        : "${MIN_ASSERTIONS:=10154}"
+        # 2026-10-23: 10154 -> 10168. ABI v92 gave the EIGHT write crossings a path too, so that suite's
+        #   §5 went from asserting nine REFUSALS to asserting the writes themselves plus a read-back
+        #   through a sub-root attached FLAT (65 -> 79). Same arithmetic claim: +14 and nothing else moved,
+        #   although this one touches every provider's write path rather than only the nesting one.
+        # 2026-10-23: 10168 -> 10196. verify_with_options 206 -> 234: `ALTER TABLE … SET (…) / RESET (…)`
+        #   (DuckDB 2.0's SET_TABLE_OPTIONS / RESET_TABLE_OPTIONS), plus the row that replaced a stale
+        #   REFUSAL — a column-list `CREATE TABLE t (…) WITH (parquet_compression=…)` used to be rejected
+        #   as "no write to apply to", which stopped being true when the tuning became a persisted table
+        #   property. ⚠ The load-bearing rows read a WRITTEN FILE: a property in the catalog proves only
+        #   that the key was stored, and the point of persisting it is that a LATER INSERT obeys it.
+        : "${MIN_ASSERTIONS:=10196}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

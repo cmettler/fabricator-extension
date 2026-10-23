@@ -12,6 +12,42 @@
 > parsed with our own vcpkg yyjson, retiring the `ReadCapabilityFlag` string-find). v74 below is the
 > follow-on that finished the same job for ALTER.
 
+## v92 (2026-10-23) — the WRITE crossings take a SCHEMA PATH (nested schemas, slice 2c)
+
+Eight entries lost their single `const char *schema` and took
+`const char *const *schema_path, int32_t schema_path_len` instead — outermost first, the shape v90 put on
+the discovery streams and v91 on `table_open`:
+
+`create_table` · `drop_table` · `begin_bulk` · `execute_update` · `execute_delete` · `insert_returning` ·
+`create_schema` · `drop_schema`
+
+For the two SCHEMA entries the path is the schema's OWN, so `CREATE SCHEMA a.b` arrives as `["a","b"]`
+and the provider creates the last level inside the ones before it. `bulk_insert` was deliberately NOT
+widened: it has had no C++ caller since the streaming bulk path replaced it.
+
+**`table_alter` is the one that needed no wire change at all**, and the reason is worth keeping: it rides
+the table SESSION, which `table_open` already opened with the full path. What was missing was purely
+managed — the handler passed the definition's LEAF name. Fixed with `ITable.SchemaPath` (a DIM defaulting
+to `[SchemaName]`) and an `IProviderCatalog.AlterTable` path overload.
+
+**Every managed widening is a DEFAULT INTERFACE METHOD that takes the leaf**, so an un-migrated provider —
+the four out-of-tree plugins included, which pin `Fabricator.Abstractions` by SHA — is byte-for-byte
+unaffected. ⚠ `DeltaCatalog` inverts the direction deliberately: it implements the PATH forms and derives
+the NAME forms from them, because the interface's leaf-taking default is precisely wrong for a provider
+that nests.
+
+- **⚠⚠ A DIM DEFAULT IS A SILENT FALLBACK, and that is how this slice's one real bug happened.**
+  `DeltaTableDefinition` carried a schema path and did not EXPOSE it, so `ITable.SchemaPath` fell through
+  to the default and ALTER alone kept resolving the wrong directory. MEASURED: every other statement on a
+  depth-2 table worked; `ALTER TABLE … ADD COLUMN` reported *"No Delta table found"*, which reads as a
+  missing table rather than a wrong path. Overriding a path-taking METHOD without overriding the path
+  PROPERTY leaves exactly one crossing wrong.
+- ⚠ The version was bumped in `abi.h` and not in `Bootstrap.cs` on the first pass. The check caught it at
+  the first ATTACH (*"ABI version mismatch (host=92, bridge=91)"*) — which is what the bump rule's "BOTH
+  halves" exists for.
+
+Full record: [nested-schemas.md](nested-schemas.md) §Slice 2c.
+
 ## v91 (2026-10-23) — `table_open` takes a SCHEMA PATH (DuckDB 2.0 nested schemas, slice 2b)
 
 `table_open(handle, const char *schema, …)` became
@@ -40,12 +76,11 @@ the only acceptable shape for this kind of widening. Only `DeltaCatalog` overrid
 - ⚠ The path's strings are **borrowed for the call**. The managed handler copies them out, because every
   provider's `ITable` holds its names; reading them later would be reading freed memory.
 
-**⚠⚠ THE OTHER EIGHT TABLE CROSSINGS STILL CARRY A FLAT `const char *schema`, AND THE HOST REFUSES RATHER
-THAN SENDING A LEAF.** `create_table`, `drop_table`, `begin_bulk`, `execute_update`, `execute_delete`,
-`insert_returning`, `create_schema`, `drop_schema` — plus `table_alter`, which rides THIS session but
-whose managed handler re-derives the storage path from the definition's leaf schema name. Handing any of
-them a nested schema's leaf does not fail; it addresses a DIFFERENT, same-named top-level schema. So
-`FabricatorRefuseNestedWrite` refuses each by name and nesting is read-only until they are widened.
+**⚠ AT v91 THE OTHER EIGHT TABLE CROSSINGS STILL CARRIED A FLAT `const char *schema`, and the host
+REFUSED rather than sending a leaf** — handing one a nested schema's leaf does not fail, it addresses a
+DIFFERENT, same-named top-level schema. **v92 widened all eight** (plus ALTER, managed-side), so the
+refusal and `FabricatorRefuseNestedWrite` are gone; this paragraph is kept because the REASON is the
+contract that still binds any future crossing that identifies a table.
 Full record, including the four defects building it surfaced: [nested-schemas.md](nested-schemas.md)
 §Slice 2b.
 

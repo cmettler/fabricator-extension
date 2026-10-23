@@ -677,30 +677,54 @@ int64_t BulkInsert(FabricatorHandle handle, const std::string &schema, const std
 	return affected;
 }
 
-int64_t ExecuteDelete(FabricatorHandle handle, const std::string &schema, const std::string &table,
-                      ArrowArrayStream &keys) {
+namespace {
+// Borrowed UTF-8 pointers for a schema PATH argument (ABI v91/v92). The caller's vector outlives the
+// crossing, so nothing is copied; an EMPTY path passes a null pointer with length 0 rather than a
+// one-element array of "", which keeps "no schema" distinct from "a schema whose name is empty".
+struct PathArgs {
+	std::vector<const char *> ptrs;
+	explicit PathArgs(const std::vector<std::string> &path) {
+		ptrs.reserve(path.size());
+		for (const auto &segment : path) {
+			ptrs.push_back(segment.c_str());
+		}
+	}
+	const char *const *Data() const {
+		return ptrs.empty() ? nullptr : ptrs.data();
+	}
+	int32_t Len() const {
+		return static_cast<int32_t>(ptrs.size());
+	}
+};
+} // namespace
+
+int64_t ExecuteDelete(FabricatorHandle handle, const std::vector<std::string> &schema_path,
+                      const std::string &table, ArrowArrayStream &keys) {
 	const FabricatorVTable &vt = GetBridge();
 	if (!vt.execute_delete) {
 		throw duckdb::IOException("Fabricator: bridge does not provide execute_delete");
 	}
 	int64_t affected = 0;
 	char *err = nullptr;
-	int32_t rc = vt.execute_delete(handle, schema.c_str(), table.c_str(), &keys, &affected, &err);
+	PathArgs path(schema_path);
+	int32_t rc = vt.execute_delete(handle, path.Data(), path.Len(), table.c_str(), &keys, &affected, &err);
 	if (rc != FABRICATOR_OK) {
 		ThrowManagedError(vt, err, "Fabricator: execute_delete failed");
 	}
 	return affected;
 }
 
-int64_t ExecuteUpdate(FabricatorHandle handle, const std::string &schema, const std::string &table, int32_t set_count,
-                      ArrowArrayStream &data) {
+int64_t ExecuteUpdate(FabricatorHandle handle, const std::vector<std::string> &schema_path,
+                      const std::string &table, int32_t set_count, ArrowArrayStream &data) {
 	const FabricatorVTable &vt = GetBridge();
 	if (!vt.execute_update) {
 		throw duckdb::IOException("Fabricator: bridge does not provide execute_update");
 	}
 	int64_t affected = 0;
 	char *err = nullptr;
-	int32_t rc = vt.execute_update(handle, schema.c_str(), table.c_str(), set_count, &data, &affected, &err);
+	PathArgs path(schema_path);
+	int32_t rc =
+	    vt.execute_update(handle, path.Data(), path.Len(), table.c_str(), set_count, &data, &affected, &err);
 	if (rc != FABRICATOR_OK) {
 		ThrowManagedError(vt, err, "Fabricator: execute_update failed");
 	}
@@ -1524,7 +1548,8 @@ void AggFinalizeSpill(FabricatorHandle session, ArrowArray &states, ArrowArraySt
 	}
 }
 
-void CreateTable(FabricatorHandle handle, const std::string &schema, const std::string &table, ArrowArrayStream &columns,
+void CreateTable(FabricatorHandle handle, const std::vector<std::string> &schema_path, const std::string &table,
+                 ArrowArrayStream &columns,
                  bool if_not_exists, const std::string &pk_columns, const std::string &unique_columns,
                  const std::string &defaults, const std::string &partition_columns, const std::string &sort_columns,
                  const std::string &identity_columns, const std::string &options_json) {
@@ -1533,7 +1558,8 @@ void CreateTable(FabricatorHandle handle, const std::string &schema, const std::
 		throw duckdb::IOException("Fabricator: bridge does not provide create_table");
 	}
 	char *err = nullptr;
-	int32_t rc = vt.create_table(handle, schema.c_str(), table.c_str(), &columns, if_not_exists ? 1 : 0,
+	PathArgs path(schema_path);
+	int32_t rc = vt.create_table(handle, path.Data(), path.Len(), table.c_str(), &columns, if_not_exists ? 1 : 0,
 	                             pk_columns.empty() ? nullptr : pk_columns.c_str(),
 	                             unique_columns.empty() ? nullptr : unique_columns.c_str(),
 	                             defaults.empty() ? nullptr : defaults.c_str(),
@@ -1546,37 +1572,41 @@ void CreateTable(FabricatorHandle handle, const std::string &schema, const std::
 	}
 }
 
-void DropTable(FabricatorHandle handle, const std::string &schema, const std::string &table, bool if_exists) {
+void DropTable(FabricatorHandle handle, const std::vector<std::string> &schema_path, const std::string &table,
+               bool if_exists) {
 	const FabricatorVTable &vt = GetBridge();
 	if (!vt.drop_table) {
 		throw duckdb::IOException("Fabricator: bridge does not provide drop_table");
 	}
 	char *err = nullptr;
-	int32_t rc = vt.drop_table(handle, schema.c_str(), table.c_str(), if_exists ? 1 : 0, &err);
+	PathArgs path(schema_path);
+	int32_t rc = vt.drop_table(handle, path.Data(), path.Len(), table.c_str(), if_exists ? 1 : 0, &err);
 	if (rc != FABRICATOR_OK) {
 		ThrowManagedError(vt, err, "Fabricator: drop_table failed");
 	}
 }
 
-void CreateSchema(FabricatorHandle handle, const std::string &schema, bool if_not_exists) {
+void CreateSchema(FabricatorHandle handle, const std::vector<std::string> &schema_path, bool if_not_exists) {
 	const FabricatorVTable &vt = GetBridge();
 	if (!vt.create_schema) {
 		throw duckdb::IOException("Fabricator: bridge does not provide create_schema");
 	}
 	char *err = nullptr;
-	int32_t rc = vt.create_schema(handle, schema.c_str(), if_not_exists ? 1 : 0, &err);
+	PathArgs path(schema_path);
+	int32_t rc = vt.create_schema(handle, path.Data(), path.Len(), if_not_exists ? 1 : 0, &err);
 	if (rc != FABRICATOR_OK) {
 		ThrowManagedError(vt, err, "Fabricator: create_schema failed");
 	}
 }
 
-void DropSchema(FabricatorHandle handle, const std::string &schema, bool if_exists) {
+void DropSchema(FabricatorHandle handle, const std::vector<std::string> &schema_path, bool if_exists) {
 	const FabricatorVTable &vt = GetBridge();
 	if (!vt.drop_schema) {
 		throw duckdb::IOException("Fabricator: bridge does not provide drop_schema");
 	}
 	char *err = nullptr;
-	int32_t rc = vt.drop_schema(handle, schema.c_str(), if_exists ? 1 : 0, &err);
+	PathArgs path(schema_path);
+	int32_t rc = vt.drop_schema(handle, path.Data(), path.Len(), if_exists ? 1 : 0, &err);
 	if (rc != FABRICATOR_OK) {
 		ThrowManagedError(vt, err, "Fabricator: drop_schema failed");
 	}
@@ -1617,20 +1647,22 @@ void RollbackTransaction(FabricatorHandle handle) {
 	}
 }
 
-void InsertReturning(FabricatorHandle handle, const std::string &schema, const std::string &table, ArrowArrayStream &in,
-                     ArrowArrayStream &out) {
+void InsertReturning(FabricatorHandle handle, const std::vector<std::string> &schema_path,
+                     const std::string &table, ArrowArrayStream &in, ArrowArrayStream &out) {
 	const FabricatorVTable &vt = GetBridge();
 	if (!vt.insert_returning) {
 		throw duckdb::IOException("Fabricator: bridge does not provide insert_returning");
 	}
 	char *err = nullptr;
-	int32_t rc = vt.insert_returning(handle, schema.c_str(), table.c_str(), &in, &out, &err);
+	PathArgs path(schema_path);
+	int32_t rc = vt.insert_returning(handle, path.Data(), path.Len(), table.c_str(), &in, &out, &err);
 	if (rc != FABRICATOR_OK) {
 		ThrowManagedError(vt, err, "Fabricator: insert_returning failed");
 	}
 }
 
-FabricatorHandle BeginBulk(FabricatorHandle handle, const std::string &schema, const std::string &table, bool create_table,
+FabricatorHandle BeginBulk(FabricatorHandle handle, const std::vector<std::string> &schema_path,
+                         const std::string &table, bool create_table,
                          bool replace, bool check_constraints, int64_t txn_id, ArrowSchema &schema_in,
                          const std::string &partition_columns, const std::string &sort_columns,
                          const std::string &schema_mode, bool partition_overwrite, const std::string &options_json) {
@@ -1640,7 +1672,8 @@ FabricatorHandle BeginBulk(FabricatorHandle handle, const std::string &schema, c
 	}
 	FabricatorHandle session = nullptr;
 	char *err = nullptr;
-	int32_t rc = vt.begin_bulk(handle, schema.c_str(), table.c_str(), create_table ? 1 : 0, replace ? 1 : 0,
+	PathArgs path(schema_path);
+	int32_t rc = vt.begin_bulk(handle, path.Data(), path.Len(), table.c_str(), create_table ? 1 : 0, replace ? 1 : 0,
 	                           check_constraints ? 1 : 0, txn_id, &schema_in,
 	                           partition_columns.empty() ? nullptr : partition_columns.c_str(),
 	                           sort_columns.empty() ? nullptr : sort_columns.c_str(),

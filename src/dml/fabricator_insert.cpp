@@ -90,7 +90,7 @@ unique_ptr<GlobalSinkState> FabricatorPhysicalInsert::GetGlobalSinkState(ClientC
 		// Set the host-FS opener so a host-FS provider (the Delta catalog) can write through DuckDB's
 		// FileSystem; the managed begin_bulk captures it + re-establishes it on the bulk consumer thread.
 		fabricator::SetActiveOpener(reinterpret_cast<FabricatorHandle>(&context), fabricator::SessionKeyFor(&context));
-		gstate->bulk_session = fabricator::BeginBulk(handle_, target_.schema_name, target_.table_name,
+		gstate->bulk_session = fabricator::BeginBulk(handle_, target_.schema_path, target_.table_name,
 		                                           /*create_table=*/false, /*replace=*/false,
 		                                           /*check_constraints=*/true,
 		                                           (int64_t)context.ActiveTransaction().global_transaction_id, schema);
@@ -161,7 +161,7 @@ SinkFinalizeType FabricatorPhysicalInsert::Finalize(Pipeline &pipeline, Event &e
 		ArrowArrayStream out;
 		std::memset(&out, 0, sizeof(out));
 		FabricatorSetActiveTxn(handle_, context);
-		fabricator::InsertReturning(handle_, target_.schema_name, target_.table_name, *gstate.producer->Stream(), out);
+		fabricator::InsertReturning(handle_, target_.schema_path, target_.table_name, *gstate.producer->Stream(), out);
 		gstate.returning_reader = make_uniq<fabricator::ArrowStreamReader>(context, out);
 	} else {
 		// Signal end-of-stream and wait for the background bulk load to drain. complete_bulk CONSUMES the

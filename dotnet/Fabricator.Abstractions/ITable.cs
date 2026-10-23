@@ -40,6 +40,14 @@ public interface ITable
     string SchemaName { get; }
     string TableName { get; }
 
+    /// <summary>The table's schema as a PATH, outermost element first — <c>["a","b"]</c> is the schema
+    /// <c>b</c> nested inside <c>a</c>.</summary>
+    /// <remarks>⚠ The default is the single-element path <c>[SchemaName]</c>, which is the whole truth for
+    /// every provider that does not declare <c>supports_nested_schemas</c>. It exists because ALTER needed
+    /// no WIRE change — it rides the table session, which was opened with the full path — but the provider
+    /// still has to be handed the path, and the definition is where the session keeps it.</remarks>
+    IReadOnlyList<string> SchemaPath => new[] { SchemaName };
+
     /// <summary>
     /// Binds this definition to a transaction, resolving STATE rather than args: the pinned snapshot, the
     /// transaction's pending CREATE/ALTER shape override, the connection borrow, and an AT-dependent schema.

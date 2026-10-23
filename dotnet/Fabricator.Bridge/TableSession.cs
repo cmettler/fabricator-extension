@@ -170,6 +170,8 @@ internal sealed class TableSession
     /// (no name pair on the wire) and the typed doc, not a relocation of the work: the providers read the
     /// AMBIENT transaction themselves, which is how Delta buffers a schema-evolution ALTER into an open
     /// transaction rather than committing it alone.</summary>
+    // ⚠ The definition's PATH, not its leaf SchemaName: on a nested root the leaf resolves to a different
+    // storage location, and this handler is where that was silently wrong before ABI v92.
     internal void Alter(AlterTableSpec spec, Field? column) =>
-        _catalog.AlterTable(spec, _definition.SchemaName, _definition.TableName, column);
+        _catalog.AlterTable(spec, _definition.SchemaPath, _definition.TableName, column);
 }

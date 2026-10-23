@@ -35,23 +35,6 @@ void RegisterFabricatorInOutFinalizer(DBConfig &config);
 //! Currently scalar only (table/in-out kinds are a later slice). See docs/global-functions.md.
 void RegisterFabricatorGlobalFunctions(ExtensionLoader &loader);
 
-//! Refuses `statement` when `schema` is NESTED (has a parent), and does nothing otherwise.
-//!
-//! ⚠⚠ IT EXISTS BECAUSE THE WRITE CROSSINGS STILL CARRY A FLAT SCHEMA NAME. Only `table_open` takes a
-//! path (ABI v91); create_table / drop_table / begin_bulk / execute_update / execute_delete /
-//! insert_returning / create_schema / drop_schema each take one `const char *schema`, and handing them a
-//! nested schema's LEAF would not fail — it would resolve to a DIFFERENT, same-named top-level schema, or
-//! create the table one level too shallow. A silently wrong target is the failure class this codebase
-//! keeps paying for, so the boundary is LOUD instead. Reads nest; writes refuse.
-//!
-//! ⚠⚠ ALTER AND COMMENT ON ARE REFUSED TOO, AND MY FIRST VERSION EXEMPTED THEM ON A WRONG ARGUMENT —
-//! that they ride the `table_alter` entry of the table SESSION, which was opened with the full path.
-//! The ENTRY does, but the managed side then calls `AlterTable(spec, definition.SchemaName, TableName)`
-//! and re-derives the storage path from the LEAF name, exactly like the flat crossings. Found by reading
-//! the callee rather than the entry, after the SCAN was caught doing the same thing (and the scan is the
-//! half that was MEASURED: it described `<root>/a/b/t1` and then read `<root>/b/t1`).
-void FabricatorRefuseNestedWrite(const SchemaCatalogEntry &schema, const char *statement);
-
 class FabricatorSchemaEntry : public SchemaCatalogEntry {
 public:
 	//! \param parent_schema the enclosing schema for a NESTED schema (DuckDB 2.0), else null. It is a
@@ -72,6 +55,16 @@ public:
 	//! every entry's `ParentSchema()` is a REFERENCE into its schema entry, so destroying a parent while a
 	//! child (or a child's table) is still reachable is the use-after-free this codebase already records.
 	FabricatorSchemaEntry &GetOrCreateChildSchema(const string &name);
+
+	//! The child schema called `name`, or null. Unlike GetOrCreateChildSchema it creates NOTHING, which is
+	//! what a DROP needs: materializing a level on the way to removing one would be absurd.
+	FabricatorSchemaEntry *FindChildSchema(const string &name);
+
+	//! Detaches the child schema called `name` and hands its ownership to the caller (null if absent).
+	//! \warning The caller MUST keep it alive — the catalog moves it into `retired_schemas_`. A child
+	//! entry is handed to DuckDB's binder as a raw pointer exactly like a top-level one, so destroying it
+	//! here is the use-after-free the graveyard exists to prevent.
+	unique_ptr<FabricatorSchemaEntry> ReleaseChildSchema(const string &name);
 
 	//! This entry's schema PATH as plain strings, outermost first — depth 1 for a top-level schema. What
 	//! the `table_open` crossing takes since ABI v91, and what tells a nested schema from a flat one at

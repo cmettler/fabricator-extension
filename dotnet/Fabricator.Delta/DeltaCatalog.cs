@@ -1083,6 +1083,12 @@ public sealed class DeltaCatalog : IProviderCatalog
     /// <summary>The Delta table folder for a (schema, table). A schema-enabled OneLake lakehouse stores tables at
     /// <c>&lt;root&gt;/&lt;schema&gt;/&lt;table&gt;</c>; everything else is flat <c>&lt;root&gt;/&lt;table&gt;</c>
     /// (the DuckDB schema is then the single "main", ignored).</summary>
+    /// <summary>The LAST element of a schema path — the name a log line, an error message or the
+    /// function-namespace guard wants. ⚠ NEVER the thing to resolve a DIRECTORY with: that is TablePath's
+    /// job, and taking the leaf there is precisely the nested-write bug ABI v92 exists to end.</summary>
+    internal static string SchemaLeaf(IReadOnlyList<string> schemaPath) =>
+        schemaPath.Count == 0 ? string.Empty : schemaPath[schemaPath.Count - 1];
+
     internal string TablePath(string schema, string table) =>
         SchemaLayout ? _root + "/" + schema + "/" + table : _root + "/" + table;
 
@@ -2638,11 +2644,14 @@ public sealed class DeltaCatalog : IProviderCatalog
     /// <summary>Streaming bulk write (INSERT / CTAS / COPY). Runs on the bulk consumer thread; the host-FS
     /// opener was re-established on it by BulkSession. createTable/replace => Overwrite (CTAS/REPLACE: the table
     /// becomes exactly these rows); otherwise Append (INSERT). One Delta commit. Returns rows written.</summary>
-    public long BulkInsert(string schemaName, string tableName, IArrowArrayStream data, bool createTable,
+    public long BulkInsert(IReadOnlyList<string> schemaPath, string tableName, IArrowArrayStream data, bool createTable,
                            bool replace, bool checkConstraints, long txnId, IReadOnlyList<string>? partitionColumns,
                            IReadOnlyList<string>? sortColumns, string? schemaMode, bool partitionOverwrite,
                            string? optionsJson)
     {
+        // The LEAF of the path, for the log lines and the messages below — the DIRECTORY is resolved
+        // from the whole path by TablePath, which is the only place the difference matters.
+        var schemaName = SchemaLeaf(schemaPath);
         InvalidateReadCache();
         var opener = Opener();
         _log.LogInformation("delta bulk {Schema}.{Table}: create={Create} replace={Replace} native_write={Native} partition_overwrite={PartOw}",
@@ -2661,7 +2670,7 @@ public sealed class DeltaCatalog : IProviderCatalog
             throw new System.ArgumentException(
                 "WITH options apply to CREATE TABLE [AS] — a plain append carries none.");
         }
-        var tablePath = TablePath(schemaName, tableName);
+        var tablePath = TablePath(schemaPath, tableName);
         // SORTED BY -> an ORDERED (clustered) write: an explicit CREATE/CTAS clause orders THIS write and
         // is persisted (fabricator.sortedBy) at create; an append with no clause re-applies the persisted
         // spec. The ORDER BY runs on the HOST engine (DuckDB's EXTERNAL, disk-spilling sort) over the live
@@ -3238,27 +3247,31 @@ public sealed class DeltaCatalog : IProviderCatalog
         return new Schema(fields, columns.Metadata);
     }
 
-    public void CreateTable(string schemaName, string tableName, Schema columns, bool ifNotExists,
+    public void CreateTable(IReadOnlyList<string> schemaPath, string tableName, Schema columns, bool ifNotExists,
                             string? primaryKey, string? uniques, string? defaults,
                             IReadOnlyList<string>? partitionColumns, IReadOnlyList<string>? sortColumns,
                             IReadOnlyList<string>? identityColumns, string? optionsJson)
     {
+        // The LEAF of the path, for the log lines and the messages below — the DIRECTORY is resolved
+        // from the whole path by TablePath, which is the only place the difference matters.
+        var schemaName = SchemaLeaf(schemaPath);
         InvalidateReadCache();
         RejectFunctionSchemaDdl(schemaName, $"CREATE TABLE {tableName}");
         // Commit 0 itself is metadata-only, but a variant table is unusable without the native paths — fail
         // the CREATE up front with the actionable ATTACH-option error rather than at the first INSERT/SELECT.
         EnsureVariantWritable(columns);
-        // CREATE TABLE ... WITH (...): per-table create-flag overrides + delta.*/fabricator.* properties.
-        // Write-TUNING keys are per-statement and an empty CREATE writes no data — reject them here rather
-        // than silently not applying them (use CTAS, or SET delta_write_options for later INSERTs).
+        // CREATE TABLE ... WITH (...): per-table create-flag overrides + delta.*/fabricator.* properties +
+        // the write TUNING, which PERSISTS as fabricator.parquet.* and governs every later write.
+        //
+        // ⚠⚠ THE TUNING USED TO BE REFUSED HERE, on the argument that "an empty CREATE writes no data, so
+        // reject rather than silently not apply". That reasoning was correct when it was written and went
+        // STALE the day the tuning became a persisted table property (2026-08-07): the declaration is not
+        // about this statement's write at all, it is about the table's storage format, which is exactly
+        // what a column-list CREATE has to be able to state. Lifting it also makes the form everyone
+        // writes — `CREATE TABLE t (…) WITH (parquet_compression = 'zstd')` — mean what it looks like.
+        // ⚠ ValidateSpecForEngine still runs inside ApplyWithOptions, so a key this ENGINE cannot honour
+        // is still refused rather than persisted as a promise nothing keeps.
         var withOpts = DeltaWithOptions.Parse(optionsJson);
-        if (withOpts is { HasWriteTuning: true })
-        {
-            throw new System.ArgumentException(
-                "WITH write-tuning options (parquet_compression / parquet_row_group_size / "
-                + "parquet_bloom_filter_columns) apply to the statement's write — use them on "
-                + "CREATE TABLE AS, or SET delta_write_options for later INSERTs.");
-        }
         var flags = EffectiveCreateFlags(withOpts);
         columns = WithIdentityMetadata(columns, identityColumns);
         // ⚠ HOIST SLICE 5: a CREATE inside an explicit transaction is now IMMEDIATE — it takes the very
@@ -3272,8 +3285,8 @@ public sealed class DeltaCatalog : IProviderCatalog
         // made, and ROLLBACK would then drop whatever happens to be at that path — someone else's table.
         long createTxn = AmbientTransaction.Current;
         bool markCreated = IsExplicitTxn(createTxn)
-                           && !TableExists(TablePath(schemaName, tableName));
-        ThrowIfPendingAppends(TablePath(schemaName, tableName), "CREATE (OR REPLACE) TABLE");
+                           && !TableExists(TablePath(schemaPath, tableName));
+        ThrowIfPendingAppends(TablePath(schemaPath, tableName), "CREATE (OR REPLACE) TABLE");
         // sortColumns (native SORTED BY): persisted as fabricator.sortedBy — every append then re-applies
         // the ORDER BY (see BulkInsert), keeping the table's files in the clustered layout.
         // identityColumns (the DuckDB `AS (0)` generated-column marker, v53): Delta has NATIVE identity —
@@ -3289,7 +3302,7 @@ public sealed class DeltaCatalog : IProviderCatalog
         {
             // (metadata already attached above — WithIdentityMetadata)
         }
-        DeltaWriter.Create(Opener(), TablePath(schemaName, tableName), columns, default,
+        DeltaWriter.Create(Opener(), TablePath(schemaPath, tableName), columns, default,
                               deletionVectors: flags.DeletionVectors,
                               inCommitTimestamps: flags.InCommitTimestamps,
                               changeDataFeed: flags.ChangeDataFeed,
@@ -3305,7 +3318,7 @@ public sealed class DeltaCatalog : IProviderCatalog
         if (markCreated)
         {
             // The create landed, so the transaction now owns this table and ROLLBACK may drop it.
-            _txns.GetOrCreate(createTxn).GetOrCreate(TablePath(schemaName, tableName)).CreatedInTxn = true;
+            _txns.GetOrCreate(createTxn).GetOrCreate(TablePath(schemaPath, tableName)).CreatedInTxn = true;
             _log.LogInformation("delta txn {Txn} created {Schema}.{Table} (rollback will drop it)",
                 createTxn, schemaName, tableName);
         }
@@ -3314,16 +3327,21 @@ public sealed class DeltaCatalog : IProviderCatalog
     /// <summary>CREATE SCHEMA. In <c>schemas</c> mode (non-OneLake) it materializes the <c>&lt;root&gt;/&lt;schema&gt;/</c>
     /// subfolder so a subsequent CREATE TABLE lands there (and the schema is rediscovered once it holds a table).
     /// Otherwise a no-op: OneLake schemas mirror the lakehouse, and the flat layout has only "main".</summary>
-    public void CreateSchema(string s, bool ie)
+    public void CreateSchema(IReadOnlyList<string> schemaPath, bool ie)
     {
+        // The whole path is the directory chain: `CREATE SCHEMA a.b` makes <root>/a/b. HostFs.CreateDir is
+        // a RECURSIVE mkdir, so an absent intermediate level is created with it — which matches what the
+        // statement asked for, since DuckDB only reaches here once it has resolved the parents.
+        var s = SchemaLeaf(schemaPath);
+        var relative = string.Join("/", schemaPath);
         InvalidateReadCache();
         // `_nestedSchemas` counts too: a TOP-LEVEL schema on a nested root is the same <root>/<s>/ folder.
         // A NESTED `CREATE SCHEMA a.b` never reaches here — the host refuses it, because create_schema
         // carries one name and would make the folder in the wrong place (see FabricatorRefuseNestedWrite).
         if ((_schemas || _nestedSchemas) && OneLake() is null &&
-            !string.Equals(s, MainSchema, System.StringComparison.Ordinal))
+            !(schemaPath.Count == 1 && string.Equals(s, MainSchema, System.StringComparison.Ordinal)))
         {
-            HostFs.CreateDir(Opener(), _root + "/" + s); // recursive mkdir; idempotent
+            HostFs.CreateDir(Opener(), _root + "/" + relative); // recursive mkdir; idempotent
         }
     }
     // Buffers are created lazily on the first buffered append; the explicit flag (v60) is recorded on the
@@ -4874,10 +4892,13 @@ public sealed class DeltaCatalog : IProviderCatalog
     /// (<see cref="FabricLakehouse.DeleteDirectory"/>) — DuckDB's azure FileSystem has no RemoveDirectory; local/S3
     /// use the host's recursive directory-delete callback. Idempotent (no error if missing), so
     /// <paramref name="ifExists"/> is satisfied either way.</summary>
-    public void DropTable(string schemaName, string tableName, bool ifExists)
+    public void DropTable(IReadOnlyList<string> schemaPath, string tableName, bool ifExists)
     {
+        // The LEAF of the path, for the log lines and the messages below — the DIRECTORY is resolved
+        // from the whole path by TablePath, which is the only place the difference matters.
+        var schemaName = SchemaLeaf(schemaPath);
         InvalidateReadCache();
-        _tableConfigCache.TryRemove(TablePath(schemaName, tableName), out _);
+        _tableConfigCache.TryRemove(TablePath(schemaPath, tableName), out _);
         long dropTxn = AmbientTransaction.Current;
         // CREATE + DROP inside one transaction still CANCELS OUT for the buffer — but the table IS on storage
         // now (hoist slice 5), so unlike before, the real drop below must actually run. Discard this
@@ -4889,18 +4910,18 @@ public sealed class DeltaCatalog : IProviderCatalog
         // version removed the entry UNCONDITIONALLY and BEFORE the guard, which made
         // `BEGIN; DELETE …; DROP TABLE …;` SUCCEED — the guard found nothing left to complain about. Caught by
         // verify_delta_catalog_transactions:339, which exists for exactly that shape.
-        if (TryTxn(dropTxn)?.Get(TablePath(schemaName, tableName)) is { CreatedInTxn: true } created)
+        if (TryTxn(dropTxn)?.Get(TablePath(schemaPath, tableName)) is { CreatedInTxn: true } created)
         {
             DeltaTxnBuffer.DisposeHeld(created);
             DeltaTxnBuffer.DisposeBatches(created);
-            TryTxn(dropTxn)?.RemoveTable(TablePath(schemaName, tableName));
+            TryTxn(dropTxn)?.RemoveTable(TablePath(schemaPath, tableName));
         }
-        ThrowIfPendingAppends(TablePath(schemaName, tableName), "DROP TABLE");
+        ThrowIfPendingAppends(TablePath(schemaPath, tableName), "DROP TABLE");
         _log.LogInformation("delta drop table {Schema}.{Table} (adls={Adls})",
             schemaName, tableName, UseAdlsDirectoryOps);
         // Any credentialed abfss:// root (OneLake included) takes the DFS-native recursive delete: DuckDB's
         // azure FileSystem implements no RemoveDirectory at all, so the host-FS path below cannot serve it.
-        RemoveTableFolder(TablePath(schemaName, tableName));
+        RemoveTableFolder(TablePath(schemaPath, tableName));
     }
 
     // The backend-specific recursive delete of a table folder, SHARED by DROP TABLE and by the rollback of a
@@ -5005,8 +5026,11 @@ public sealed class DeltaCatalog : IProviderCatalog
         return ids;
     }
 
-    public long ExecuteDelete(string schemaName, string tableName, IArrowArrayStream keys)
+    public long ExecuteDelete(IReadOnlyList<string> schemaPath, string tableName, IArrowArrayStream keys)
     {
+        // The LEAF of the path, for the log lines and the messages below — the DIRECTORY is resolved
+        // from the whole path by TablePath, which is the only place the difference matters.
+        var schemaName = SchemaLeaf(schemaPath);
         InvalidateReadCache();
         var opener = Opener();
         var ids = CollectRowIds(keys);
@@ -5014,7 +5038,7 @@ public sealed class DeltaCatalog : IProviderCatalog
         {
             return 0;
         }
-        var path = TablePath(schemaName, tableName);
+        var path = TablePath(schemaPath, tableName);
         // Explicit transaction (v60): BUFFER the delete — deletion-vector positions against the pinned base
         // version — and commit it fused with the transaction's other changes at COMMIT (atomic, rollback-able,
         // conflict-aborted if a concurrent writer moves the table). Autocommit keeps the direct per-statement
@@ -5283,11 +5307,14 @@ public sealed class DeltaCatalog : IProviderCatalog
         }
     }
 
-    public long ExecuteUpdate(string schemaName, string tableName, int setColumnCount, IArrowArrayStream data)
+    public long ExecuteUpdate(IReadOnlyList<string> schemaPath, string tableName, int setColumnCount, IArrowArrayStream data)
     {
+        // The LEAF of the path, for the log lines and the messages below — the DIRECTORY is resolved
+        // from the whole path by TablePath, which is the only place the difference matters.
+        var schemaName = SchemaLeaf(schemaPath);
         InvalidateReadCache();
         var opener = Opener();
-        var path = TablePath(schemaName, tableName);
+        var path = TablePath(schemaPath, tableName);
 
         // 1. Parse the update stream into ARROW: one compacted batch of [SET columns…, rowid] plus the
         // rowid -> row map. The stream drain is the sole async step, isolated in the helper so the rewrite
@@ -5498,20 +5525,68 @@ public sealed class DeltaCatalog : IProviderCatalog
         }
     }
 
+    // ── the NAME-addressed write contract, as thin shims onto the PATH-addressed one above.
+    //
+    // ⚠⚠ THE DIRECTION IS DELIBERATE AND IT IS THE OPPOSITE OF THE INTERFACE'S DEFAULT. IProviderCatalog
+    // declares the string form and DEFAULTS the path form to its LEAF, which is right for a provider that
+    // cannot nest — and exactly wrong here, where the leaf resolves to a different directory. So this
+    // provider implements the PATH form and derives the name form from it, never the other way round.
+    // A one-element path is what a flat or `schemas`-mode catalog has always had, and TablePath answers it
+    // identically, so these shims change nothing for them.
+    //
+    // ⚠ They are REACHABLE: the host calls the path form, but in-process callers (the global
+    // `fabricator_delta_*` functions, the COPY-to-path transient catalog) still address a table by name.
+
+    public long BulkInsert(string schemaName, string tableName, IArrowArrayStream data, bool createTable,
+                           bool replace, bool checkConstraints, long txnId,
+                           IReadOnlyList<string>? partitionColumns, IReadOnlyList<string>? sortColumns,
+                           string? schemaMode, bool partitionOverwrite, string? optionsJson) =>
+        BulkInsert(new[] { schemaName }, tableName, data, createTable, replace, checkConstraints, txnId,
+                   partitionColumns, sortColumns, schemaMode, partitionOverwrite, optionsJson);
+
+    public void CreateTable(string schemaName, string tableName, Schema columns, bool ifNotExists,
+                            string? primaryKey, string? uniques, string? defaults,
+                            IReadOnlyList<string>? partitionColumns, IReadOnlyList<string>? sortColumns,
+                            IReadOnlyList<string>? identityColumns, string? optionsJson) =>
+        CreateTable(new[] { schemaName }, tableName, columns, ifNotExists, primaryKey, uniques, defaults,
+                    partitionColumns, sortColumns, identityColumns, optionsJson);
+
+    public void DropTable(string schemaName, string tableName, bool ifExists) =>
+        DropTable(new[] { schemaName }, tableName, ifExists);
+
+    public long ExecuteDelete(string schemaName, string tableName, IArrowArrayStream keys) =>
+        ExecuteDelete(new[] { schemaName }, tableName, keys);
+
+    public long ExecuteUpdate(string schemaName, string tableName, int setColumnCount, IArrowArrayStream data) =>
+        ExecuteUpdate(new[] { schemaName }, tableName, setColumnCount, data);
+
+    public void CreateSchema(string schemaName, bool ifNotExists) =>
+        CreateSchema(new[] { schemaName }, ifNotExists);
+
+    public void DropSchema(string schemaName, bool ifExists) =>
+        DropSchema(new[] { schemaName }, ifExists);
+
+    public void AlterTable(AlterTableSpec spec, string schemaName, string tableName, Field? column) =>
+        AlterTable(spec, new[] { schemaName }, tableName, column);
+
     public IArrowArrayStream InsertReturning(string s, string t, IArrowArrayStream r) => throw Unsupported("INSERT ... RETURNING");
     /// <summary>DROP SCHEMA. In <c>schemas</c> mode (non-OneLake) it recursively removes the
     /// <c>&lt;root&gt;/&lt;schema&gt;/</c> subfolder (and every table under it). Unsupported otherwise (OneLake
     /// schemas mirror the lakehouse; the flat layout has only "main").</summary>
-    public void DropSchema(string s, bool ie)
+    public void DropSchema(IReadOnlyList<string> schemaPath, bool ie)
     {
+        var s = SchemaLeaf(schemaPath);
         InvalidateReadCache();
         if ((_schemas || _nestedSchemas) && OneLake() is null)
         {
-            if (string.Equals(s, MainSchema, System.StringComparison.Ordinal))
+            // ⚠ Only the TOP-LEVEL "main" is the undroppable default. A nested `a.main` is an ordinary
+            // directory, and refusing it because its leaf happens to be spelled "main" would be a rule
+            // about a NAME where the real rule is about a POSITION.
+            if (schemaPath.Count == 1 && string.Equals(s, MainSchema, System.StringComparison.Ordinal))
             {
                 throw Unsupported("DROP SCHEMA main (the default schema)");
             }
-            HostFs.RemoveDir(Opener(), _root + "/" + s); // recursive; idempotent
+            HostFs.RemoveDir(Opener(), _root + "/" + string.Join("/", schemaPath)); // recursive; idempotent
             return;
         }
         throw Unsupported("DROP SCHEMA");
@@ -5568,8 +5643,86 @@ public sealed class DeltaCatalog : IProviderCatalog
         }
     }
 
-    public void AlterTable(AlterTableSpec spec, string s, string t, Field? c)
+    /// <summary>The Delta table-configuration PROPERTY an <c>ALTER TABLE … SET/RESET (…)</c> option name
+    /// maps to. The vocabulary is the <c>CREATE TABLE … WITH (…)</c> one, both spellings, so the same
+    /// setting is written the same way whichever statement asks for it.</summary>
+    /// <remarks>
+    /// <para>⚠⚠ AN UNKNOWN KEY IS REFUSED, NEVER IGNORED — the rule the WITH clause already follows, and
+    /// here it matters more: a silently dropped <c>SET</c> leaves the author believing the table is being
+    /// written one way while every later INSERT writes it another, and nothing says so until someone reads
+    /// the files.</para>
+    /// <para>⚠ The CREATE-ONLY flags (deletion_vectors / row_tracking / change_data_feed /
+    /// in_commit_timestamps / column_mapping) are refused BY NAME with the reason, because they are real
+    /// WITH options and the natural assumption is that SET can change them. They enable a table FEATURE
+    /// and need a protocol upgrade, which is what <c>delta.set_tblproperties</c> refuses them for too.</para>
+    /// <para>⚠ A raw <c>fabricator.*</c> or <c>delta.*</c> property name passes through unchanged, which
+    /// is the escape hatch for anything this list does not spell — the same surface
+    /// <c>delta.set_tblproperties</c> offers, reachable now from DDL.</para>
+    /// </remarks>
+    private static string TableOptionProperty(string name, string verb)
     {
+        switch (name.ToLowerInvariant())
+        {
+            case "parquet_compression":
+            case "compression":
+                return ParquetTuning.CompressionKey;
+            case "parquet_row_group_size":
+            case "row_group_size":
+                return ParquetTuning.RowGroupSizeKey;
+            case "parquet_row_group_size_bytes":
+            case "row_group_size_bytes":
+                return ParquetTuning.RowGroupSizeBytesKey;
+            case "parquet_version":
+                return ParquetTuning.VersionKey;
+            case "parquet_dictionary_size_limit":
+            case "dictionary_size_limit":
+                return ParquetTuning.DictionarySizeLimitKey;
+            case "parquet_row_groups_per_file":
+            case "row_groups_per_file":
+                return ParquetTuning.RowGroupsPerFileKey;
+            case "parquet_file_size_bytes":
+            case "file_size_bytes":
+                return ParquetTuning.FileSizeBytesKey;
+            case "parquet_bloom_filter_columns":
+            case "bloom_filter_columns":
+                return ParquetTuning.BloomFilterColumnsKey;
+            case "parquet_compression_level":
+            case "compression_level":
+                return ParquetTuning.CompressionLevelKey;
+            case "parquet_bloom_filter_false_positive_ratio":
+            case "bloom_filter_false_positive_ratio":
+                return ParquetTuning.BloomFilterFppKey;
+            case "deletion_vectors":
+            case "row_tracking":
+            case "change_data_feed":
+            case "in_commit_timestamps":
+            case "column_mapping":
+                throw new NotSupportedException(
+                    $"ALTER TABLE {verb} ({name}): that enables a table FEATURE and needs a protocol "
+                    + "upgrade — set it at CREATE, via the ATTACH option or CREATE TABLE … WITH (…). "
+                    + "SET/RESET change the per-table WRITE TUNING only.");
+            default:
+                if (name.StartsWith(ParquetTuning.Prefix, StringComparison.OrdinalIgnoreCase)
+                    || name.StartsWith("delta.", StringComparison.OrdinalIgnoreCase))
+                {
+                    return name; // a raw property name, as delta.set_tblproperties takes
+                }
+                throw new NotSupportedException(
+                    $"ALTER TABLE {verb} ({name}): unknown table option. Supported: parquet_compression, "
+                    + "parquet_compression_level, parquet_row_group_size, parquet_row_group_size_bytes, "
+                    + "parquet_row_groups_per_file, parquet_file_size_bytes, parquet_dictionary_size_limit, "
+                    + "parquet_version, parquet_bloom_filter_columns, "
+                    + "parquet_bloom_filter_false_positive_ratio — or a raw 'fabricator.parquet.*' / "
+                    + "'delta.*' property name.");
+        }
+    }
+
+    public void AlterTable(AlterTableSpec spec, IReadOnlyList<string> schemaPath, string t, Field? c)
+    {
+        // The LEAF, for the log lines and the function-namespace guard; the DIRECTORY comes from the whole
+        // path via TablePath. ALTER needed no WIRE change for this — it rides the table session — but the
+        // path still had to REACH here, which it now does through ITable.SchemaPath.
+        var s = SchemaLeaf(schemaPath);
         InvalidateReadCache();
         // VARIANT: `c` arrives from the C ABI in TRANSPORT form (a BINARY field carrying the
         // ew.variant_transport marker), and every consumer of it below hands it to engineered-wood. Convert
@@ -5586,7 +5739,7 @@ public sealed class DeltaCatalog : IProviderCatalog
         long alterTxn = AmbientTransaction.Current;
         if (IsExplicitTxn(alterTxn))
         {
-            var alterPath = TablePath(s, t);
+            var alterPath = TablePath(schemaPath, t);
             switch (spec.Kind)
             {
                 case AlterTableKind.AddColumn:
@@ -5659,28 +5812,28 @@ public sealed class DeltaCatalog : IProviderCatalog
         // The pending-appends guard must therefore be SKIPPED for this case (buffered rows are expected);
         // it still applies to every other ALTER and to a table this transaction did not create.
         if (spec.Kind == AlterTableKind.RenameTable
-            && TryTxn(alterTxn)?.Get(TablePath(s, t)) is { CreatedInTxn: true } renCreated)
+            && TryTxn(alterTxn)?.Get(TablePath(schemaPath, t)) is { CreatedInTxn: true } renCreated)
         {
             string renTo = spec.RequireNewName();
-            string renNew = TablePath(s, renTo);
+            string renNew = TablePath(schemaPath, renTo);
             if (TryTxn(alterTxn)?.HasPending(renNew) == true || TableExists(renNew))
             {
                 throw new System.InvalidOperationException(
                     $"delta RENAME TABLE: '{renTo}' already exists.");
             }
             DeltaTxnBuffer.DisposeHeld(renCreated);
-            RenameTableFolder(TablePath(s, t), renNew);
-            if (TryTxn(alterTxn)?.RenameTable(TablePath(s, t), renNew) != true)
+            RenameTableFolder(TablePath(schemaPath, t), renNew);
+            if (TryTxn(alterTxn)?.RenameTable(TablePath(schemaPath, t), renNew) != true)
             {
                 throw new System.InvalidOperationException(
                     $"delta RENAME TABLE: the transaction's buffer entry for '{t}' could not be re-keyed.");
             }
-            _tableConfigCache.TryRemove(TablePath(s, t), out _);
+            _tableConfigCache.TryRemove(TablePath(schemaPath, t), out _);
             _log.LogInformation("delta txn {Txn} rename created table {Old} -> {New}",
-                alterTxn, TablePath(s, t), renNew);
+                alterTxn, TablePath(schemaPath, t), renNew);
             return;
         }
-        ThrowIfPendingAppends(TablePath(s, t), "ALTER TABLE");
+        ThrowIfPendingAppends(TablePath(schemaPath, t), "ALTER TABLE");
         _log.LogInformation("delta alter {Schema}.{Table}: kind={Kind} column={Column}", s, t,
                             AlterTableSpec.WireName(spec.Kind), spec.Column);
         switch (spec.Kind)
@@ -5703,7 +5856,7 @@ public sealed class DeltaCatalog : IProviderCatalog
                 var field = string.Equals(name, col.Name, System.StringComparison.Ordinal)
                     ? col
                     : new Field(name, col.DataType, col.IsNullable);
-                DeltaReader.AddColumn(Opener(), TablePath(s, t), field, default);
+                DeltaReader.AddColumn(Opener(), TablePath(schemaPath, t), field, default);
                 return;
             }
             case AlterTableKind.RenameColumn:
@@ -5711,7 +5864,7 @@ public sealed class DeltaCatalog : IProviderCatalog
                 // Metadata-only commit on a column-mapping table (the field keeps its physicalName +
                 // columnMapping.id); EW rejects a plain table (which would need a full rewrite). Opener
                 // threaded for the host-FS log write.
-                DeltaReader.RenameColumn(Opener(), TablePath(s, t), spec.RequireColumn(), spec.RequireNewName(),
+                DeltaReader.RenameColumn(Opener(), TablePath(schemaPath, t), spec.RequireColumn(), spec.RequireNewName(),
                                          default);
                 return;
             }
@@ -5719,7 +5872,7 @@ public sealed class DeltaCatalog : IProviderCatalog
             {
                 // Metadata-only commit on a column-mapping table (old files keep the physical column; readers
                 // reconcile it away); EW rejects a plain table (would need a full rewrite).
-                DeltaReader.DropColumn(Opener(), TablePath(s, t), spec.RequireColumn(), default);
+                DeltaReader.DropColumn(Opener(), TablePath(schemaPath, t), spec.RequireColumn(), default);
                 return;
             }
             case AlterTableKind.AddField:
@@ -5728,20 +5881,20 @@ public sealed class DeltaCatalog : IProviderCatalog
                 // backfill NULL on read via the recursive schema-evolution reconcile).
                 var col = c ?? throw new System.InvalidOperationException(
                     "delta ADD COLUMN (nested field) requires a field definition.");
-                DeltaReader.AddField(Opener(), TablePath(s, t), spec.RequirePath(), col, default);
+                DeltaReader.AddField(Opener(), TablePath(schemaPath, t), spec.RequirePath(), col, default);
                 return;
             }
             case AlterTableKind.RenameField:
             {
                 // `path` = the field's full path (requires column mapping).
-                DeltaReader.RenameField(Opener(), TablePath(s, t), spec.RequirePath(), spec.RequireNewName(),
+                DeltaReader.RenameField(Opener(), TablePath(schemaPath, t), spec.RequirePath(), spec.RequireNewName(),
                                         default);
                 return;
             }
             case AlterTableKind.DropField:
             {
                 // `path` = the field's full path (requires column mapping; readers reconcile old files).
-                DeltaReader.DropField(Opener(), TablePath(s, t), spec.RequirePath(), default);
+                DeltaReader.DropField(Opener(), TablePath(schemaPath, t), spec.RequirePath(), default);
                 return;
             }
             case AlterTableKind.RenameTable:
@@ -5753,9 +5906,9 @@ public sealed class DeltaCatalog : IProviderCatalog
                 // CopyObject rename (httpfs has no MoveFile; no data crosses the client); local → the host FS
                 // move (FileSystem::MoveFile, atomic). A secretless abfss:// / s3:// still throws cleanly
                 // (attach with a SECRET for rename support).
-                RenameTableFolder(TablePath(s, t), TablePath(s, newName));
-                _tableConfigCache.TryRemove(TablePath(s, t), out _);
-                _tableConfigCache.TryRemove(TablePath(s, newName), out _);
+                RenameTableFolder(TablePath(schemaPath, t), TablePath(schemaPath, newName));
+                _tableConfigCache.TryRemove(TablePath(schemaPath, t), out _);
+                _tableConfigCache.TryRemove(TablePath(schemaPath, newName), out _);
                 return;
             }
             case AlterTableKind.SetSortedBy:
@@ -5766,8 +5919,8 @@ public sealed class DeltaCatalog : IProviderCatalog
                 // (unpartitioned) the delta.clustering declaration — the ALTER CLUSTER BY analog; a
                 // partitioned table takes the property only (clustering + partitioning are mutually
                 // exclusive). Immediate/administrative, like set_tblproperties.
-                DeltaReader.SetSortedBy(Opener(), TablePath(s, t), spec.RequireColumns(), default);
-                _tableConfigCache.TryRemove(TablePath(s, t), out _); // the config changed — re-read on next write
+                DeltaReader.SetSortedBy(Opener(), TablePath(schemaPath, t), spec.RequireColumns(), default);
+                _tableConfigCache.TryRemove(TablePath(schemaPath, t), out _); // the config changed — re-read on next write
                 return;
             }
             case AlterTableKind.SetPartitionedBy:
@@ -5780,7 +5933,7 @@ public sealed class DeltaCatalog : IProviderCatalog
                 // COMMENT ON TABLE → metaData.description. Immediate/administrative, like set_tblproperties
                 // and SET SORTED BY: ONE metadata-only commit rather than something buffered into the
                 // transaction, because it changes no data and no file.
-                DeltaReader.SetTableComment(Opener(), TablePath(s, t), spec.Comment);
+                DeltaReader.SetTableComment(Opener(), TablePath(schemaPath, t), spec.Comment);
                 return;
             }
             case AlterTableKind.SetColumnComment:
@@ -5789,12 +5942,53 @@ public sealed class DeltaCatalog : IProviderCatalog
                 // puts a column comment, so Spark reads it back. Rewritten as a surgical JSON edit; see
                 // DeltaReader.RewriteColumnComment for why a typed round trip would be unsafe on a
                 // column-mapped table.
-                DeltaReader.SetColumnComment(Opener(), TablePath(s, t), spec.RequireColumn(), spec.Comment);
+                DeltaReader.SetColumnComment(Opener(), TablePath(schemaPath, t), spec.RequireColumn(), spec.Comment);
+                return;
+            }
+            case AlterTableKind.SetTableOptions:
+            case AlterTableKind.ResetTableOptions:
+            {
+                // ALTER TABLE t SET (key = value, …) / RESET (key, …) — the per-table write settings, as
+                // ONE metadata-only commit. Immediate and administrative, exactly like SET SORTED BY and
+                // delta.set_tblproperties next to it: nothing here changes a data file.
+                //
+                // ⚠ It is the DDL spelling of what `delta.set_tblproperties` already does, and both land
+                // in the same place — the `fabricator.parquet.*` table configuration that every later
+                // write reads (plain INSERT, the merge-on-read post-image, the copy-on-write rewrite, and
+                // OPTIMIZE's compaction output). That is the whole point of persisting them: before they
+                // were persisted, a table created `WITH (parquet_compression='zstd')` had its next plain
+                // INSERT write SNAPPY, so one table accumulated mixed compression.
+                bool reset = spec.Kind == AlterTableKind.ResetTableOptions;
+                var names = reset
+                    ? (IEnumerable<string>)spec.RequireResetOptions()
+                    : spec.RequireOptions().Keys;
+                var updates = new List<KeyValuePair<string, string?>>();
+                foreach (var name in names)
+                {
+                    // RESET is SET with a null value — the UNSET spelling SetTableProperties already takes,
+                    // which is why removing an override needs no second mechanism.
+                    var property = TableOptionProperty(name, reset ? "RESET" : "SET");
+                    updates.Add(new KeyValuePair<string, string?>(
+                        property, reset ? null : spec.RequireOptions()[name]));
+                }
+                if (updates.Count == 0)
+                {
+                    return; // the parser cannot produce an empty list; nothing to commit if it somehow does
+                }
+                var optPath = TablePath(schemaPath, t);
+                ThrowIfPendingAppends(optPath, reset ? "ALTER TABLE RESET" : "ALTER TABLE SET");
+                long optVersion = DeltaReader.SetTableProperties(Opener(), optPath, updates);
+                // Same eviction as set_tblproperties: fabricator.sortedBy and the parquet tuning share
+                // ONE config cache, so one removal covers both.
+                _tableConfigCache.TryRemove(optPath, out _);
+                _log.LogInformation("delta alter {Verb} options {Path}: {Count} option(s) -> v{Version}",
+                    reset ? "RESET" : "SET", optPath, updates.Count, optVersion);
                 return;
             }
             default:
                 throw Unsupported("ALTER TABLE (only ADD/RENAME/DROP COLUMN — top-level or nested struct field — "
-                                  + "SET/RESET SORTED BY, RENAME TABLE and COMMENT ON are supported on Delta)");
+                                  + "SET/RESET SORTED BY, SET/RESET table options, RENAME TABLE and "
+                                  + "COMMENT ON are supported on Delta)");
         }
     }
 

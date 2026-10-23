@@ -178,7 +178,7 @@ SinkFinalizeType FabricatorPhysicalDelete::Finalize(Pipeline &pipeline, Event &e
 	lock_guard<mutex> guard(gstate.lock);
 	gstate.producer->Finish();
 	FabricatorSetActiveTxn(handle_, context);
-	gstate.total = (idx_t)fabricator::ExecuteDelete(handle_, target_.schema_name, target_.table_name,
+	gstate.total = (idx_t)fabricator::ExecuteDelete(handle_, target_.schema_path, target_.table_name,
 	                                              *gstate.producer->Stream());
 	return SinkFinalizeType::READY;
 }
@@ -223,7 +223,7 @@ SinkFinalizeType FabricatorPhysicalUpdate::Finalize(Pipeline &pipeline, Event &e
 	lock_guard<mutex> guard(gstate.lock);
 	gstate.producer->Finish();
 	FabricatorSetActiveTxn(handle_, context);
-	gstate.total = (idx_t)fabricator::ExecuteUpdate(handle_, target_.schema_name, target_.table_name,
+	gstate.total = (idx_t)fabricator::ExecuteUpdate(handle_, target_.schema_path, target_.table_name,
 	                                              (int32_t)gstate.set_count, *gstate.producer->Stream());
 	return SinkFinalizeType::READY;
 }

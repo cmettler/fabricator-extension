@@ -223,6 +223,12 @@ private:
 	//! identical and had to stay so: LoadCatalog and RefreshCache must register the same tree or a refresh
 	//! silently reshapes the catalog.
 	FabricatorSchemaEntry &EnsureSchemaPathLocked(const vector<string> &path);
+
+	//! Removes the schema entry at `path` — a top-level one from `schemas_`, a nested one from its parent —
+	//! into the retire-don't-destroy graveyard. Creates NOTHING on the way: a drop of an absent schema is a
+	//! no-op here, with the provider having already answered for the if-exists semantics.
+	//! \warning THE CALLER MUST ALREADY HOLD `schema_lock_`.
+	void RetireSchemaPathLocked(const vector<string> &path);
 	// GRAVEYARD: evicted schema entries are RETIRED, never destroyed mid-session — binders hold raw
 	// pointers across the lock, AND every (possibly retired) table entry's ParentSchema() is a reference
 	// into its FabricatorSchemaEntry, so schemas must outlive their entries. Freed at catalog teardown.

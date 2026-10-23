@@ -40,6 +40,14 @@ internal sealed class DeltaTableDefinition : ITable
     public string SchemaName { get; }
     public string TableName { get; }
 
+    /// <summary>The definition's full schema path — what ALTER travels on.</summary>
+    /// <remarks>⚠ OVERRIDDEN, and forgetting it is a real bug rather than a missed nicety: the interface
+    /// default is the single-element <c>[SchemaName]</c>, so without this an ALTER on a nested table
+    /// addressed <c>&lt;root&gt;/&lt;leaf&gt;/&lt;table&gt;</c>. MEASURED as exactly that — every other
+    /// statement on a depth-2 table worked and `ALTER TABLE … ADD COLUMN` alone reported "No Delta table
+    /// found", which reads like a missing table rather than a wrong path.</remarks>
+    public IReadOnlyList<string> SchemaPath => _schemaPath ?? new[] { SchemaName };
+
     /// <summary>
     /// A plain bind against a live <see cref="DeltaTransaction"/> is MEMOIZED — it returns the
     /// transaction's one <see cref="DeltaTableBinding"/> for the path (which is also the append buffer, the

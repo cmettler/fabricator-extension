@@ -379,7 +379,7 @@ static unique_ptr<GlobalFunctionData> CopyToInitGlobal(ClientContext &context, F
 	auto *stream = gstate->producer->Stream();
 	stream->get_schema(stream, &schema);
 	fabricator::SetActiveOpener(reinterpret_cast<FabricatorHandle>(&context), fabricator::SessionKeyFor(&context)); // host-FS opener for a Delta-catalog COPY
-	gstate->bulk_session = fabricator::BeginBulk(handle, bind_data.schema_name, bind_data.table_name,
+	gstate->bulk_session = fabricator::BeginBulk(handle, {bind_data.schema_name}, bind_data.table_name,
 	                                           bind_data.create_table, bind_data.replace, /*check_constraints=*/false,
 	                                           gstate->txn_id, schema, bind_data.partition_columns,
 	                                           bind_data.sort_columns, bind_data.schema_mode,

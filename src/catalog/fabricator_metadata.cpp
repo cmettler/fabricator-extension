@@ -552,6 +552,24 @@ string FabricatorRenderAlterJson(const FabricatorAlterRequest &request) {
 	if (request.has_columns) {
 		add_arr("columns", request.columns);
 	}
+	if (request.has_options) {
+		// An OBJECT, not an array of pairs: the managed AlterTableSpec reads it as a map, and the option
+		// values are already rendered as their constant TEXT (TableOptionsArg's rule, same as the CREATE
+		// TABLE WITH clause — one CAST level unwrapped, a LIST literal joined with commas).
+		auto *obj = yyjson_mut_obj(doc);
+		for (auto &kv : request.options) {
+			// yyjson_mut_obj_put, not add_val: it takes a mut KEY, so the name is COPIED into the document.
+			// add_val borrows the char pointer, which is right for the literal keys above and wrong for a
+			// user-supplied one living in this vector.
+			yyjson_mut_obj_put(obj, yyjson_mut_strncpy(doc, kv.first.c_str(), kv.first.size()),
+			                   yyjson_mut_strncpy(doc, kv.second.c_str(), kv.second.size()));
+		}
+		yyjson_mut_obj_add_val(doc, root, "options", obj);
+	}
+	if (request.has_reset_options) {
+		// Its OWN key rather than reusing "options" with a different JSON type: one key, one shape.
+		add_arr("reset_options", request.reset_options);
+	}
 	if (request.guard) {
 		// The kind decides the SPELLING: the ADD kinds guard on absence, the DROP kinds on presence. Two
 		// honest keys rather than one overloaded flag bit — a doc that says "if_exists" on an ADD would be

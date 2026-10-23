@@ -66,12 +66,10 @@ struct FabricatorCapabilities {
 	//! whose namespace is genuinely two-part must leave it off: SQL Server has schema.table and nothing
 	//! deeper, and Fabric's Tables/ area is defined as exactly two levels. Turning it on there would make
 	//! DuckDB offer a syntax that resolves to nothing.
-	//! \warning It is READ-ONLY nesting. The catalog_* streams carry a real path (v90) and table_open takes
-	//! one (v91), so a nested table RESOLVES and SCANS — but every WRITE crossing still carries a flat
-	//! schema name, so the host REFUSES CREATE/DROP TABLE, INSERT, UPDATE/DELETE and CREATE/DROP SCHEMA on
-	//! a nested schema rather than handing over a leaf that would address the wrong place
-	//! (FabricatorRefuseNestedWrite) — ALTER and COMMENT ON included, since the provider re-derives the
-	//! storage path from the leaf there too. See docs/nested-schemas.md.
+	//! \warning Reads AND writes nest since ABI v92: the catalog_* streams carry a real path (v90),
+	//! table_open takes one (v91), and the eight write crossings take one too (v92). ALTER rides the table
+	//! session and gets its path on the MANAGED side, through `ITable.SchemaPath`. See
+	//! docs/nested-schemas.md.
 	bool supports_nested_schemas = false;
 };
 
@@ -276,6 +274,14 @@ struct FabricatorAlterRequest {
 	bool has_default = false;
 	bool default_is_null = false;
 	string default_literal;
+	//! SET (…) only: the option name -> constant TEXT pairs, exactly as the CREATE TABLE WITH clause
+	//! renders them (one CAST level unwrapped; a LIST literal joined with commas). Guarded by
+	//! `has_options` because SET with an empty list is a parser error, never a meaningful request.
+	vector<std::pair<string, string>> options;
+	bool has_options = false;
+	//! RESET (…) only: the option names to clear. Guarded by `has_reset_options` for the same reason.
+	vector<string> reset_options;
+	bool has_reset_options = false;
 	//! COMMENT ON only: emit the (required) "comment" key. `comment_is_null` is the REMOVE spelling
 	//! (`COMMENT ON TABLE t IS NULL`), which a missing key could not be told apart from — the same
 	//! required-key/nullable-value shape as `default`, for the same reason.

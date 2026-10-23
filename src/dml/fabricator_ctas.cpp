@@ -68,7 +68,7 @@ unique_ptr<GlobalSinkState> FabricatorPhysicalCreateTableAs::GetGlobalSinkState(
 	auto *stream = gstate->producer->Stream();
 	stream->get_schema(stream, &schema);
 	fabricator::SetActiveOpener(reinterpret_cast<FabricatorHandle>(&context), fabricator::SessionKeyFor(&context)); // host-FS opener for a Delta-catalog CTAS
-	gstate->bulk_session = fabricator::BeginBulk(info_.handle, info_.schema_name, info_.table_name,
+	gstate->bulk_session = fabricator::BeginBulk(info_.handle, info_.schema_path, info_.table_name,
 	                                           /*create_table=*/true, info_.replace, /*check_constraints=*/false,
 	                                           (int64_t)context.ActiveTransaction().global_transaction_id, schema,
 	                                           info_.partition_columns, info_.sort_columns, /*schema_mode=*/"",

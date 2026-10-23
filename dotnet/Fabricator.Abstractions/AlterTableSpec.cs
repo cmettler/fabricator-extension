@@ -34,6 +34,14 @@ public enum AlterTableKind
     SetComment,
     /// <summary><c>COMMENT ON COLUMN t.c IS '…'</c> (<c>AlterType.SET_COLUMN_COMMENT</c>).</summary>
     SetColumnComment,
+    /// <summary><c>ALTER TABLE t SET (key = value, …)</c> — per-table write settings, the SAME vocabulary
+    /// the <c>CREATE TABLE … WITH (…)</c> clause takes. <see cref="AlterTableSpec.Options"/> carries the
+    /// name → constant-TEXT pairs; the provider parses the keys it knows and MUST REJECT the rest.</summary>
+    SetTableOptions,
+    /// <summary><c>ALTER TABLE t RESET (key, …)</c> — remove the table's own override so the layer below
+    /// (session setting, then ATTACH default, then engine default) decides again.
+    /// <see cref="AlterTableSpec.ResetOptions"/> carries the names.</summary>
+    ResetTableOptions,
 }
 
 /// <summary>
@@ -106,6 +114,24 @@ public sealed class AlterTableSpec
     /// distinction this class already warns about one property up, arriving a second time on a new kind.
     /// </remarks>
     public bool HasDefault { get; init; }
+
+    /// <summary><see cref="AlterTableKind.SetTableOptions"/>: the option name → value TEXT pairs, rendered
+    /// by the host exactly as a <c>WITH</c> clause is (constants only, a LIST literal joined with commas).
+    /// Null for every other kind.</summary>
+    /// <remarks>⚠ The host does not know what any key MEANS. It renders and forwards; the PROVIDER owns
+    /// the vocabulary and must refuse an unknown key, because a silently ignored write setting is a table
+    /// written in a format nobody asked for.</remarks>
+    public IReadOnlyDictionary<string, string>? Options { get; init; }
+
+    /// <summary><see cref="AlterTableKind.ResetTableOptions"/>: the option names to clear.</summary>
+    public IReadOnlyList<string>? ResetOptions { get; init; }
+
+    /// <summary>The SET options, or a clear failure naming the kind.</summary>
+    public IReadOnlyDictionary<string, string> RequireOptions() => Options ?? throw MissingField("options");
+
+    /// <summary>The RESET option names, or a clear failure naming the kind.</summary>
+    public IReadOnlyList<string> RequireResetOptions() =>
+        ResetOptions ?? throw MissingField("reset_options");
 
     /// <summary>The target column's name, or a clear error when the doc omitted it.</summary>
     public string RequireColumn() => Column ?? throw MissingField("column");
@@ -200,6 +226,8 @@ public sealed class AlterTableSpec
             DefaultLiteral = defaultLiteral,
             HasDefault = hasDefault,
             Comment = comment,
+            Options = ReadStringMap(root, "options"),
+            ResetOptions = ReadStringList(root, "reset_options"),
         };
     }
 
@@ -223,6 +251,8 @@ public sealed class AlterTableSpec
         AlterTableKind.SetPartitionedBy => "set_partitioned_by",
         AlterTableKind.SetComment => "set_comment",
         AlterTableKind.SetColumnComment => "set_column_comment",
+        AlterTableKind.SetTableOptions => "set_table_options",
+        AlterTableKind.ResetTableOptions => "reset_table_options",
         _ => kind.ToString(),
     };
 
@@ -244,6 +274,8 @@ public sealed class AlterTableSpec
         "set_partitioned_by" => AlterTableKind.SetPartitionedBy,
         "set_comment" => AlterTableKind.SetComment,
         "set_column_comment" => AlterTableKind.SetColumnComment,
+        "set_table_options" => AlterTableKind.SetTableOptions,
+        "reset_table_options" => AlterTableKind.ResetTableOptions,
         _ => throw new InvalidOperationException($"fabricator: unknown ALTER TABLE kind '{wire}'."),
     };
 
@@ -251,6 +283,28 @@ public sealed class AlterTableSpec
         root.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String
             ? value.GetString()
             : null;
+
+    /// <summary>A flat JSON object of string values, or null when the key is absent. ⚠ A non-string value
+    /// is a HOST bug rather than user input — the renderer emits every option as TEXT — so it throws
+    /// instead of coercing, which would hide the disagreement.</summary>
+    private static IReadOnlyDictionary<string, string>? ReadStringMap(JsonElement root, string name)
+    {
+        if (!root.TryGetProperty(name, out var value) || value.ValueKind != JsonValueKind.Object)
+        {
+            return null;
+        }
+        var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var p in value.EnumerateObject())
+        {
+            if (p.Value.ValueKind != JsonValueKind.String)
+            {
+                throw new InvalidOperationException(
+                    $"fabricator: ALTER TABLE '{name}' entry '{p.Name}' must be a string.");
+            }
+            map[p.Name] = p.Value.GetString() ?? string.Empty;
+        }
+        return map;
+    }
 
     private static bool ReadBool(JsonElement root, string name) =>
         root.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.True;

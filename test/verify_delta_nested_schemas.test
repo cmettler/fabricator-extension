@@ -1,9 +1,9 @@
 # name: test/verify_delta_nested_schemas.test
 # description: Delta folder-as-catalog with the `nested_schemas true` ATTACH option — the directory tree UNDER the
 #              root IS the schema tree, to any depth (DuckDB 2.0 nested schemas), so <root>/sales/eu/deep resolves
-#              as cat.sales.eu.deep. Nesting is READ-ONLY in this slice: every write crossing still addresses the
-#              provider by a single schema name, so the host REFUSES writes into a nested schema by name rather than
-#              silently targeting the wrong folder. Set FABRICATOR_DELTA_WRITE_DIR to a WRITABLE base. Local FS.
+#              as cat.sales.eu.deep. READS and WRITES both nest since ABI v92; §7 re-reads the deep table through a
+#              sub-root attached FLAT, which is what proves a nested write landed in the right directory rather than
+#              one level too shallow. Set FABRICATOR_DELTA_WRITE_DIR to a WRITABLE base. Local FS.
 # group: [fabricator]
 
 require fabricator
@@ -110,58 +110,88 @@ SELECT v FROM lk.eu.deep;
 ----
 schema "eu" does not exist
 
-# ── §5 writes into a nested schema are REFUSED BY NAME. A silently wrong folder is the failure this guards.
-statement error
+# ── §5 WRITES INTO A NESTED SCHEMA (ABI v92). Every one of these was REFUSED by name in slice 2b, when
+#    only table_open carried a path; the eight write crossings carry one now. The assertion that matters is
+#    not that they succeed but that they land in the RIGHT directory, which §7 checks from the outside.
+statement ok
 INSERT INTO lk.sales.eu.deep VALUES (99);
-----
-is not supported in the NESTED schema
 
-statement error
-UPDATE lk.sales.eu.deep SET v = 1;
+query I
+SELECT count(*) FROM lk.sales.eu.deep;
 ----
-is not supported in the NESTED schema
+2
 
-statement error
-DELETE FROM lk.sales.eu.deep;
+statement ok
+UPDATE lk.sales.eu.deep SET v = 100 WHERE v = 99;
+
+query I
+SELECT v FROM lk.sales.eu.deep ORDER BY v;
 ----
-is not supported in the NESTED schema
+42
+100
 
-statement error
-CREATE TABLE lk.sales.eu.born AS SELECT 1 AS x;
+statement ok
+DELETE FROM lk.sales.eu.deep WHERE v = 100;
+
+query I
+SELECT v FROM lk.sales.eu.deep;
 ----
-is not supported in the NESTED schema
+42
 
-statement error
-DROP TABLE lk.sales.eu.deep;
+statement ok
+CREATE TABLE lk.sales.eu.born AS SELECT 'x' AS c;
+
+query I
+SELECT c FROM lk.sales.eu.born;
 ----
-is not supported in the NESTED schema
+x
 
-statement error
-ALTER TABLE lk.sales.eu.deep ADD COLUMN z INTEGER;
+statement ok
+ALTER TABLE lk.sales.eu.born ADD COLUMN z INTEGER;
+
+query I
+SELECT count(*) FROM duckdb_columns() WHERE database_name='lk' AND table_name='born';
 ----
-is not supported in the NESTED schema
+2
 
-# ⚠ COMMENT ON never reaches our refusal: DuckDB's PARSER caps that statement at three qualifications
-#    ("Too many qualifications found"), so a nested target cannot even be spelled. Pinned as the parser's
-#    error rather than ours, because asserting our message here would have been a lie about which layer
-#    stops it — and the day upstream lifts the cap, this row fails and sends the reader to the refusal.
+statement ok
+DROP TABLE lk.sales.eu.born;
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name='lk' AND table_name='born';
+----
+0
+
+# A NESTED CREATE SCHEMA makes the directory, and a table lands inside it.
+statement ok
+CREATE SCHEMA lk.sales.west;
+
+statement ok
+CREATE TABLE lk.sales.west.t AS SELECT 5 AS q;
+
+query I
+SELECT q FROM lk.sales.west.t;
+----
+5
+
+statement ok
+DROP SCHEMA lk.sales.west CASCADE;
+
+query I
+SELECT count(*) FROM duckdb_schemas() WHERE database_name='lk' AND schema_name='west';
+----
+0
+
+# ⚠ COMMENT ON is the ONE statement that still cannot reach a nested table, and the layer that stops it is
+#    DuckDB's PARSER, not us: it caps the statement at three qualifications. Pinned as the parser's error
+#    rather than ours — the day upstream lifts the cap, this row fails and sends the reader here.
 statement error
 COMMENT ON TABLE lk.sales.eu.deep IS 'hi';
 ----
 Too many qualifications found
 
-statement error
-CREATE SCHEMA lk.sales.west;
-----
-CREATE SCHEMA with a nested path is not supported
-
-statement error
-DROP SCHEMA lk.sales.eu;
-----
-DROP SCHEMA with a nested path is not supported
-
-# ── §6 the POSITIVE CONTROL for §5: at depth 1 every one of those still works. Without this the refusals
-#    would pass equally in a build where writing had broken altogether.
+# ── §6 THE DEPTH-1 CONTROL. Everything above must still work one level up — without this, a build that
+#    had broken writing altogether would look identical.
 statement ok
 INSERT INTO lk.sales.orders VALUES (2, 'us');
 
@@ -185,12 +215,30 @@ CREATE SCHEMA lk.west;
 statement ok
 DROP SCHEMA lk.west;
 
-# ── §7 the data really is where the path says. A read at depth 3 after a depth-1 write must be unaffected —
-#    the two tables share a leaf-name prefix only in the WRONG resolution.
+# ── §7 the data really is where the PATH says, checked from OUTSIDE the nested attach: the deep table is
+#    re-read through a sub-root attached FLAT at <root>/sales, where it is an ordinary two-level table. If a
+#    nested write had landed one level too shallow, this is the row that would miss it — the nested catalog
+#    would happily read back whatever it had written to the wrong place.
 query I
 SELECT v FROM lk.sales.eu.deep;
 ----
 42
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/nested/nl/sales' AS sub (TYPE fabricator, PROVIDER 'delta', schemas true);
+
+query I
+SELECT v FROM sub.eu.deep;
+----
+42
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name='sub' AND table_name='born';
+----
+0
+
+statement ok
+DETACH sub;
 
 statement ok
 DETACH lk;

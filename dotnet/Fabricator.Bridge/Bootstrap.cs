@@ -91,7 +91,7 @@ public static unsafe class Bootstrap
                             () => OneRowStream(probeSchema, Interlocked.Increment(ref _lazyOpens) - 1),
                             probeSchema);
 
-        vtable->AbiVersion = 91;
+        vtable->AbiVersion = 92;
         vtable->OpenCatalog = &OpenCatalog;
         vtable->CloseCatalog = &CloseCatalog;
         vtable->ExecuteQuery = &ExecuteQuery;
@@ -396,9 +396,23 @@ public static unsafe class Bootstrap
         }
     }
 
+    /// <summary>Copies a schema PATH argument (ABI v91/v92) out of the host's borrowed UTF-8 pointers.</summary>
+    /// <remarks>⚠ COPIED, not aliased: the pointers belong to the host and are valid for the call only,
+    /// while every provider holds the names it is given (on an ITable, in a log line, in a path it
+    /// caches). Depth 1 for every provider that does not declare <c>supports_nested_schemas</c>.</remarks>
+    private static string[] ReadSchemaPath(byte** schemaPath, int schemaPathLen)
+    {
+        var path = new string[schemaPathLen < 0 ? 0 : schemaPathLen];
+        for (int i = 0; i < path.Length; i++)
+        {
+            path[i] = Marshal.PtrToStringUTF8((nint)schemaPath[i]) ?? string.Empty;
+        }
+        return path;
+    }
+
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static int ExecuteDelete(nint handle, byte* schema, byte* table, CArrowArrayStream* keys, long* affected,
-                                     byte** err)
+    private static int ExecuteDelete(nint handle, byte** schemaPath, int schemaPathLen, byte* table,
+                                     CArrowArrayStream* keys, long* affected, byte** err)
     {
         try
         {
@@ -408,10 +422,10 @@ public static unsafe class Bootstrap
             }
             var catalog = Handles.Resolve<IProviderCatalog>(handle)
                           ?? ProviderRegistry.Active.OpenCatalog(string.Empty, string.Empty);
-            var schemaName = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
+            var path = ReadSchemaPath(schemaPath, schemaPathLen);
             var tableName = Marshal.PtrToStringUTF8((nint)table) ?? string.Empty;
             var stream = CArrowArrayStreamImporter.ImportArrayStream(keys);
-            long rows = catalog.ExecuteDelete(schemaName, tableName, stream);
+            long rows = catalog.ExecuteDelete(path, tableName, stream);
             if (affected is not null)
             {
                 *affected = rows;
@@ -426,8 +440,8 @@ public static unsafe class Bootstrap
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static int ExecuteUpdate(nint handle, byte* schema, byte* table, int setCount, CArrowArrayStream* data,
-                                     long* affected, byte** err)
+    private static int ExecuteUpdate(nint handle, byte** schemaPath, int schemaPathLen, byte* table, int setCount,
+                                     CArrowArrayStream* data, long* affected, byte** err)
     {
         try
         {
@@ -437,10 +451,10 @@ public static unsafe class Bootstrap
             }
             var catalog = Handles.Resolve<IProviderCatalog>(handle)
                           ?? ProviderRegistry.Active.OpenCatalog(string.Empty, string.Empty);
-            var schemaName = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
+            var path = ReadSchemaPath(schemaPath, schemaPathLen);
             var tableName = Marshal.PtrToStringUTF8((nint)table) ?? string.Empty;
             var stream = CArrowArrayStreamImporter.ImportArrayStream(data);
-            long rows = catalog.ExecuteUpdate(schemaName, tableName, setCount, stream);
+            long rows = catalog.ExecuteUpdate(path, tableName, setCount, stream);
             if (affected is not null)
             {
                 *affected = rows;
@@ -709,7 +723,8 @@ public static unsafe class Bootstrap
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static int CreateTable(nint handle, byte* schema, byte* table, CArrowArrayStream* columns, int ifNotExists,
+    private static int CreateTable(nint handle, byte** schemaPath, int schemaPathLen, byte* table,
+                                   CArrowArrayStream* columns, int ifNotExists,
                                    byte* pkColumns, byte* uniqueColumns, byte* defaults, byte* partitionColumns,
                                    byte* sortColumns, byte* identityColumns, byte* optionsJson, byte** err)
     {
@@ -721,7 +736,7 @@ public static unsafe class Bootstrap
             }
             var catalog = Handles.Resolve<IProviderCatalog>(handle)
                           ?? ProviderRegistry.Active.OpenCatalog(string.Empty, string.Empty);
-            var schemaName = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
+            var path = ReadSchemaPath(schemaPath, schemaPathLen);
             var tableName = Marshal.PtrToStringUTF8((nint)table) ?? string.Empty;
             var pk = Marshal.PtrToStringUTF8((nint)pkColumns);
             var uniques = Marshal.PtrToStringUTF8((nint)uniqueColumns);
@@ -734,7 +749,7 @@ public static unsafe class Bootstrap
             // We own the C stream; read its schema (the column layout) and release it. The text-column SQL
             // type (mssql_ctas_text_type / mssql_default_varchar_length) is read from the settings store in C#.
             using var stream = CArrowArrayStreamImporter.ImportArrayStream(columns);
-            catalog.CreateTable(schemaName, tableName, stream.Schema, ifNotExists != 0, pk, uniques, defaultSpec,
+            catalog.CreateTable(path, tableName, stream.Schema, ifNotExists != 0, pk, uniques, defaultSpec,
                                 partition, sort, identity, options);
             return FabricatorStatus.Ok;
         }
@@ -746,15 +761,16 @@ public static unsafe class Bootstrap
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static int DropTable(nint handle, byte* schema, byte* table, int ifExists, byte** err)
+    private static int DropTable(nint handle, byte** schemaPath, int schemaPathLen, byte* table, int ifExists,
+                                 byte** err)
     {
         try
         {
             var catalog = Handles.Resolve<IProviderCatalog>(handle)
                           ?? ProviderRegistry.Active.OpenCatalog(string.Empty, string.Empty);
-            var schemaName = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
+            var path = ReadSchemaPath(schemaPath, schemaPathLen);
             var tableName = Marshal.PtrToStringUTF8((nint)table) ?? string.Empty;
-            catalog.DropTable(schemaName, tableName, ifExists != 0);
+            catalog.DropTable(path, tableName, ifExists != 0);
             return FabricatorStatus.Ok;
         }
         catch (Exception ex)
@@ -765,14 +781,13 @@ public static unsafe class Bootstrap
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static int CreateSchema(nint handle, byte* schema, int ifNotExists, byte** err)
+    private static int CreateSchema(nint handle, byte** schemaPath, int schemaPathLen, int ifNotExists, byte** err)
     {
         try
         {
             var catalog = Handles.Resolve<IProviderCatalog>(handle)
                           ?? ProviderRegistry.Active.OpenCatalog(string.Empty, string.Empty);
-            var schemaName = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
-            catalog.CreateSchema(schemaName, ifNotExists != 0);
+            catalog.CreateSchema(ReadSchemaPath(schemaPath, schemaPathLen), ifNotExists != 0);
             return FabricatorStatus.Ok;
         }
         catch (Exception ex)
@@ -783,14 +798,13 @@ public static unsafe class Bootstrap
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static int DropSchema(nint handle, byte* schema, int ifExists, byte** err)
+    private static int DropSchema(nint handle, byte** schemaPath, int schemaPathLen, int ifExists, byte** err)
     {
         try
         {
             var catalog = Handles.Resolve<IProviderCatalog>(handle)
                           ?? ProviderRegistry.Active.OpenCatalog(string.Empty, string.Empty);
-            var schemaName = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
-            catalog.DropSchema(schemaName, ifExists != 0);
+            catalog.DropSchema(ReadSchemaPath(schemaPath, schemaPathLen), ifExists != 0);
             return FabricatorStatus.Ok;
         }
         catch (Exception ex)
@@ -801,8 +815,8 @@ public static unsafe class Bootstrap
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static int InsertReturning(nint handle, byte* schema, byte* table, CArrowArrayStream* input,
-                                       CArrowArrayStream* outStream, byte** err)
+    private static int InsertReturning(nint handle, byte** schemaPath, int schemaPathLen, byte* table,
+                                       CArrowArrayStream* input, CArrowArrayStream* outStream, byte** err)
     {
         try
         {
@@ -812,11 +826,11 @@ public static unsafe class Bootstrap
             }
             var catalog = Handles.Resolve<IProviderCatalog>(handle)
                           ?? ProviderRegistry.Active.OpenCatalog(string.Empty, string.Empty);
-            var schemaName = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
+            var path = ReadSchemaPath(schemaPath, schemaPathLen);
             var tableName = Marshal.PtrToStringUTF8((nint)table) ?? string.Empty;
 
             var rows = CArrowArrayStreamImporter.ImportArrayStream(input);
-            IArrowArrayStream returned = catalog.InsertReturning(schemaName, tableName, rows);
+            IArrowArrayStream returned = catalog.InsertReturning(path, tableName, rows);
             CArrowArrayStreamExporter.ExportArrayStream(returned, outStream);
             return FabricatorStatus.Ok;
         }
@@ -1148,7 +1162,8 @@ public static unsafe class Bootstrap
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static int BeginBulk(nint handle, byte* schema, byte* table, int createTable, int replace,
+    private static int BeginBulk(nint handle, byte** schemaPath, int schemaPathLen, byte* table, int createTable,
+                                 int replace,
                                  int checkConstraints, long txnId, CArrowSchema* schemaIn, byte* partitionColumns,
                                  byte* sortColumns, byte* schemaMode, int partitionOverwrite, byte* optionsJson,
                                  nint* outSession, byte** err)
@@ -1164,7 +1179,7 @@ public static unsafe class Bootstrap
             var arrowSchema = CArrowSchemaImporter.ImportSchema(schemaIn);
             var catalog = Handles.Resolve<IProviderCatalog>(handle)
                           ?? ProviderRegistry.Active.OpenCatalog(string.Empty, string.Empty);
-            var schemaName = Marshal.PtrToStringUTF8((nint)schema) ?? string.Empty;
+            var path = ReadSchemaPath(schemaPath, schemaPathLen);
             var tableName = Marshal.PtrToStringUTF8((nint)table) ?? string.Empty;
             var partition = SplitColumnList(Marshal.PtrToStringUTF8((nint)partitionColumns));
             var sort = SplitColumnList(Marshal.PtrToStringUTF8((nint)sortColumns));
@@ -1176,7 +1191,7 @@ public static unsafe class Bootstrap
             // through DuckDB's FileSystem on the consumer thread. The ClientContext stays valid for the
             // statement (complete_bulk blocks until the consumer finishes), so the opener is live at write time.
             var opener = AmbientOpener.Current;
-            var session = new BulkSession(catalog, schemaName, tableName, arrowSchema, createTable != 0, replace != 0,
+            var session = new BulkSession(catalog, path, tableName, arrowSchema, createTable != 0, replace != 0,
                                           checkConstraints != 0, txnId, opener, partition, sort, schemaModeStr,
                                           partitionOverwrite != 0, options);
             *outSession = Handles.Alloc(session);

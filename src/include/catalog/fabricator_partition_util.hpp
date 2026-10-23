@@ -21,6 +21,7 @@
 #include "duckdb/parser/expression/cast_expression.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
+#include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/parsed_expression.hpp"
 
 #include <string>
@@ -88,10 +89,63 @@ inline std::string EscapeJsonString(const std::string &s) {
 	return out;
 }
 
-// Serializes the CREATE TABLE [AS] ... WITH (key='value', ...) options clause as a flat JSON object
-// (all values rendered as their constant TEXT — the managed parsers take strings). Only CONSTANT values
-// are accepted (one CAST level unwrapped — boolean literals parse as CAST(... AS BOOLEAN)); anything
-// else throws. Empty options => "".
+// The TEXT of ONE table-option value, as both `CREATE TABLE ... WITH (...)` and `ALTER TABLE ... SET (...)`
+// render it. Constants only (one CAST level unwrapped — boolean literals parse as CAST(... AS BOOLEAN)); a
+// LIST literal is joined with commas, which is exactly the spelling the comma-separated options
+// (bloom_filter_columns, …) already take. Anything else throws.
+//
+// ⚠ ONE function for both statements ON PURPOSE. The option VOCABULARY lives in the provider, so the host's
+// only job is to turn an expression into text — and two renderers would be two chances for `SET` and `WITH`
+// to disagree about what `['a','b']` or a cast boolean means.
+//
+// ⚠⚠ `.text`, NEVER `Literal::ToString()`. 2.0 replaced `ConstantExpression::value` (a `Value`) with a
+// `Literal`, whose ToString RENDERS SQL THAT PARSES BACK — i.e. a string literal comes out WITH ITS QUOTES.
+// The managed side quotes for itself, so ToString double-quotes: measured as *"unknown mode ''id''"* and
+// *"unknown codec ''zstd''"*. `text` is the DECODED content (quotes stripped, '' collapsed).
+//
+// ⚠ A column name containing a comma cannot be expressed in a list either way; that limitation belongs to
+// the comma-separated form and is inherited here rather than introduced.
+inline std::string TableOptionValueText(const std::string &key, const duckdb::ParsedExpression *expr) {
+	if (expr && expr->GetExpressionType() == duckdb::ExpressionType::OPERATOR_CAST) {
+		expr = &expr->Cast<duckdb::CastExpression>().Child();
+	}
+	if (expr && expr->GetExpressionType() == duckdb::ExpressionType::FUNCTION) {
+		auto &fn = expr->Cast<duckdb::FunctionExpression>();
+		// DuckDB parses `['a','b']` as a `list_value(...)` call, not as a constant, so without this branch
+		// the DuckLake-style `SET (skip_stats_columns = ['payload'])` is refused as "not a constant".
+		// 2.0 encapsulated both: the name is an Identifier behind FunctionName() and the arguments are
+		// FunctionArgument wrappers behind GetArguments(), not bare child expressions.
+		if (fn.FunctionName().GetIdentifierName() == "list_value") {
+			std::string joined;
+			for (auto &arg : fn.GetArguments()) {
+				const duckdb::ParsedExpression *item = &arg.GetExpression();
+				if (item && item->GetExpressionType() == duckdb::ExpressionType::OPERATOR_CAST) {
+					item = &item->Cast<duckdb::CastExpression>().Child();
+				}
+				if (!item || item->GetExpressionType() != duckdb::ExpressionType::VALUE_CONSTANT) {
+					throw duckdb::BinderException("table option \"%s\": every list element must be a constant",
+					                              key);
+				}
+				if (!joined.empty()) {
+					joined += ",";
+				}
+				joined += item->Cast<duckdb::ConstantExpression>().GetLiteral().text;
+			}
+			return joined;
+		}
+	}
+	if (!expr || expr->GetExpressionType() != duckdb::ExpressionType::VALUE_CONSTANT) {
+		throw duckdb::BinderException("table option \"%s\" must be a constant value", key);
+	}
+	auto &val = expr->Cast<duckdb::ConstantExpression>().GetLiteral();
+	if (val.IsNull()) {
+		throw duckdb::BinderException("table option \"%s\" must not be NULL", key);
+	}
+	return val.text;
+}
+
+// Serializes a table-options clause as a flat JSON object of TEXT values (the managed parsers take
+// strings). Empty options => "".
 inline std::string TableOptionsArg(
     const duckdb::case_insensitive_map_t<duckdb::unique_ptr<duckdb::ParsedExpression>> &options) {
 	if (options.empty()) {
@@ -100,27 +154,12 @@ inline std::string TableOptionsArg(
 	std::string out = "{";
 	bool first = true;
 	for (auto &kv : options) {
-		const duckdb::ParsedExpression *expr = kv.second.get();
-		if (expr && expr->GetExpressionType() == duckdb::ExpressionType::OPERATOR_CAST) {
-			expr = &expr->Cast<duckdb::CastExpression>().Child();
-		}
-		if (!expr || expr->GetExpressionType() != duckdb::ExpressionType::VALUE_CONSTANT) {
-			throw duckdb::BinderException("CREATE TABLE WITH option \"%s\" must be a constant value", kv.first);
-		}
-		auto &val = expr->Cast<duckdb::ConstantExpression>().GetLiteral();
-		if (val.IsNull()) {
-			throw duckdb::BinderException("CREATE TABLE WITH option \"%s\" must not be NULL", kv.first);
-		}
 		if (!first) {
 			out += ",";
 		}
 		first = false;
-		// ⚠⚠ `.text`, NEVER `Literal::ToString()`. 2.0 replaced `ConstantExpression::value` (a `Value`)
-		// with a `Literal`, whose ToString RENDERS SQL THAT PARSES BACK — i.e. a string literal comes out
-		// WITH ITS QUOTES. The managed side quotes for itself, so ToString double-quotes: measured as
-		// *"unknown mode ''id''"* and *"unknown codec ''zstd''"*. `text` is the DECODED content
-		// (quotes stripped, '' collapsed) and is what the Value used to give.
-		out += "\"" + EscapeJsonString(kv.first) + "\":\"" + EscapeJsonString(val.text) + "\"";
+		out += "\"" + EscapeJsonString(kv.first) + "\":\"" +
+		       EscapeJsonString(TableOptionValueText(kv.first, kv.second.get())) + "\"";
 	}
 	out += "}";
 	return out;

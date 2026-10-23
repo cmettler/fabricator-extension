@@ -193,13 +193,15 @@ int64_t BulkInsert(FabricatorHandle handle, const std::string &schema, const std
 
 // rowid-based DELETE: `keys` carries the key column values (Arrow). The managed
 // side generates + runs the provider DELETE. Consumes/releases `keys`.
-int64_t ExecuteDelete(FabricatorHandle handle, const std::string &schema, const std::string &table,
-                      ArrowArrayStream &keys);
+//! \param schema_path the schema as a PATH, outermost first (ABI v92); depth 1 unless the provider
+//! declares `supports_nested_schemas`. Same shape, and same reason, as TableOpen's.
+int64_t ExecuteDelete(FabricatorHandle handle, const std::vector<std::string> &schema_path,
+                      const std::string &table, ArrowArrayStream &keys);
 
 // rowid-based UPDATE: `data` carries [set values..., key values...] (Arrow);
 // the first `set_count` columns are SET values. Consumes/releases `data`.
-int64_t ExecuteUpdate(FabricatorHandle handle, const std::string &schema, const std::string &table, int32_t set_count,
-                      ArrowArrayStream &data);
+int64_t ExecuteUpdate(FabricatorHandle handle, const std::vector<std::string> &schema_path,
+                      const std::string &table, int32_t set_count, ArrowArrayStream &data);
 
 // The provider reported FABRICATOR_NOT_FOUND: the object GENUINELY DOES NOT EXIST, as opposed to existing
 // and being unreadable. Derives from IOException so an uncaught one reads exactly as it did before.
@@ -285,20 +287,22 @@ void ListSecretFields(ArrowArrayStream &out);
 // maps Arrow types to provider types and runs CREATE TABLE. `defaults` carries
 // literal column DEFAULTs as space-separated "<index> <payload>" pairs (payload
 // = base64(value-text) or "-" for DEFAULT NULL). Consumes `columns`.
-void CreateTable(FabricatorHandle handle, const std::string &schema, const std::string &table, ArrowArrayStream &columns,
-                 bool if_not_exists, const std::string &pk_columns, const std::string &unique_columns,
+void CreateTable(FabricatorHandle handle, const std::vector<std::string> &schema_path, const std::string &table,
+                 ArrowArrayStream &columns, bool if_not_exists, const std::string &pk_columns, const std::string &unique_columns,
                  const std::string &defaults, const std::string &partition_columns = "",
                  const std::string &sort_columns = "", const std::string &identity_columns = "",
                  const std::string &options_json = "");
 
 // DDL: drop a table (`if_exists` suppresses the missing-table error).
-void DropTable(FabricatorHandle handle, const std::string &schema, const std::string &table, bool if_exists);
+void DropTable(FabricatorHandle handle, const std::vector<std::string> &schema_path, const std::string &table,
+               bool if_exists);
 
 // DDL: create a schema (`if_not_exists` guards creation).
-void CreateSchema(FabricatorHandle handle, const std::string &schema, bool if_not_exists);
+//! \param schema_path the NEW schema's own path — `CREATE SCHEMA a.b` is ["a","b"].
+void CreateSchema(FabricatorHandle handle, const std::vector<std::string> &schema_path, bool if_not_exists);
 
 // DDL: drop a schema (`if_exists` suppresses the missing-schema error).
-void DropSchema(FabricatorHandle handle, const std::string &schema, bool if_exists);
+void DropSchema(FabricatorHandle handle, const std::vector<std::string> &schema_path, bool if_exists);
 
 // (AlterTable was replaced at ABI v74 by TableAlter, declared with the other table-session wrappers.)
 
@@ -312,8 +316,8 @@ void RollbackTransaction(FabricatorHandle handle);
 // INSERT ... RETURNING: `in` carries the rows to insert (Arrow, field names = the
 // target columns; consumed by the managed side). Fills `out` with the inserted
 // rows (all table columns) from OUTPUT INSERTED.*.
-void InsertReturning(FabricatorHandle handle, const std::string &schema, const std::string &table, ArrowArrayStream &in,
-                     ArrowArrayStream &out);
+void InsertReturning(FabricatorHandle handle, const std::vector<std::string> &schema_path,
+                     const std::string &table, ArrowArrayStream &in, ArrowArrayStream &out);
 
 // -----------------------------------------------------------------------------
 // Streaming bulk-load (begin/push/complete). Unlike BulkInsert (which hands over a
@@ -327,8 +331,8 @@ void InsertReturning(FabricatorHandle handle, const std::string &schema, const s
 // `check_constraints` validates CHECK/FOREIGN KEY constraints during load (INSERT
 // semantics; SqlBulkCopy skips them by default — pass false for COPY/CTAS bulk speed).
 // Returns an opaque session handle to push batches into and complete later.
-FabricatorHandle BeginBulk(FabricatorHandle handle, const std::string &schema, const std::string &table, bool create_table,
-                         bool replace, bool check_constraints, int64_t txn_id, ArrowSchema &schema_in,
+FabricatorHandle BeginBulk(FabricatorHandle handle, const std::vector<std::string> &schema_path,
+                         const std::string &table, bool create_table, bool replace, bool check_constraints, int64_t txn_id, ArrowSchema &schema_in,
                          const std::string &partition_columns = "", const std::string &sort_columns = "",
                          const std::string &schema_mode = "", bool partition_overwrite = false,
                          const std::string &options_json = "");

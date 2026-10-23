@@ -502,12 +502,31 @@ public interface IProviderCatalog : IDisposable
                     bool checkConstraints, long txnId, IReadOnlyList<string>? partitionColumns,
                     IReadOnlyList<string>? sortColumns, string? schemaMode, bool partitionOverwrite,
                     string? optionsJson);
+    /// <summary>The path-addressed form (ABI v92): the schema as a PATH, outermost element first.</summary>
+    /// <remarks>⚠ The default takes the LEAF, so a provider that does not nest behaves exactly as before.
+    /// A provider declaring <c>supports_nested_schemas</c> must override it.</remarks>
+    long BulkInsert(IReadOnlyList<string> schemaPath, string tableName, IArrowArrayStream data, bool createTable,
+                    bool replace, bool checkConstraints, long txnId, IReadOnlyList<string>? partitionColumns,
+                    IReadOnlyList<string>? sortColumns, string? schemaMode, bool partitionOverwrite,
+                    string? optionsJson) =>
+        BulkInsert(schemaPath.Count == 0 ? string.Empty : schemaPath[schemaPath.Count - 1], tableName, data,
+                   createTable, replace, checkConstraints, txnId, partitionColumns, sortColumns, schemaMode,
+                   partitionOverwrite, optionsJson);
+
 
     /// <summary>
     /// rowid-based DELETE. <paramref name="keys"/> columns (named by Arrow field)
     /// are the key values to delete. Returns rows affected.
     /// </summary>
     long ExecuteDelete(string schemaName, string tableName, IArrowArrayStream keys);
+    /// <summary>The path-addressed form (ABI v92): the schema as a PATH, outermost element first.</summary>
+    /// <remarks>⚠ The default takes the LEAF, so a provider that does not nest behaves exactly as before —
+    /// see <see cref="GetTable(IReadOnlyList{string}, string)"/> for why every one of these widenings is a
+    /// DIM. A provider declaring <c>supports_nested_schemas</c> must override all of them, or a write will
+    /// silently address a different, same-named top-level schema.</remarks>
+    long ExecuteDelete(IReadOnlyList<string> schemaPath, string tableName, IArrowArrayStream keys) =>
+        ExecuteDelete(schemaPath.Count == 0 ? string.Empty : schemaPath[schemaPath.Count - 1], tableName, keys);
+
 
     /// <summary>
     /// rowid-based UPDATE. The first <paramref name="setColumnCount"/> columns of
@@ -515,6 +534,15 @@ public interface IProviderCatalog : IDisposable
     /// Returns rows affected.
     /// </summary>
     long ExecuteUpdate(string schemaName, string tableName, int setColumnCount, IArrowArrayStream data);
+    /// <summary>The path-addressed form (ABI v92): the schema as a PATH, outermost element first.</summary>
+    /// <remarks>⚠ The default takes the LEAF, so a provider that does not nest behaves exactly as before —
+    /// see <see cref="GetTable(IReadOnlyList{string}, string)"/> for why every one of these widenings is a
+    /// DIM. A provider declaring <c>supports_nested_schemas</c> must override all of them, or a write will
+    /// silently address a different, same-named top-level schema.</remarks>
+    long ExecuteUpdate(IReadOnlyList<string> schemaPath, string tableName, int setColumnCount,
+                       IArrowArrayStream data) =>
+        ExecuteUpdate(schemaPath.Count == 0 ? string.Empty : schemaPath[schemaPath.Count - 1], tableName, setColumnCount, data);
+
 
     /// <summary>
     /// Scans a table bound against the AMBIENT transaction — a C#-INTERNAL convenience over the object
@@ -673,15 +701,46 @@ public interface IProviderCatalog : IDisposable
                      string? uniques, string? defaults, IReadOnlyList<string>? partitionColumns,
                      IReadOnlyList<string>? sortColumns, IReadOnlyList<string>? identityColumns,
                      string? optionsJson);
+    /// <summary>The path-addressed form (ABI v92): the schema as a PATH, outermost element first.</summary>
+    /// <remarks>⚠ The default takes the LEAF, so a provider that does not nest behaves exactly as before.
+    /// A provider declaring <c>supports_nested_schemas</c> must override it.</remarks>
+    void CreateTable(IReadOnlyList<string> schemaPath, string tableName, Schema columns, bool ifNotExists,
+                     string? primaryKey, string? uniques, string? defaults,
+                     IReadOnlyList<string>? partitionColumns, IReadOnlyList<string>? sortColumns,
+                     IReadOnlyList<string>? identityColumns, string? optionsJson) =>
+        CreateTable(schemaPath.Count == 0 ? string.Empty : schemaPath[schemaPath.Count - 1], tableName, columns,
+                    ifNotExists, primaryKey, uniques, defaults, partitionColumns, sortColumns, identityColumns,
+                    optionsJson);
+
 
     /// <summary>Drops a table; <paramref name="ifExists"/> suppresses the missing-table error.</summary>
     void DropTable(string schemaName, string tableName, bool ifExists);
+    /// <summary>The path-addressed form (ABI v92): the schema as a PATH, outermost element first.</summary>
+    /// <remarks>⚠ The default takes the LEAF, so a provider that does not nest behaves exactly as before —
+    /// see <see cref="GetTable(IReadOnlyList{string}, string)"/> for why every one of these widenings is a
+    /// DIM. A provider declaring <c>supports_nested_schemas</c> must override all of them, or a write will
+    /// silently address a different, same-named top-level schema.</remarks>
+    void DropTable(IReadOnlyList<string> schemaPath, string tableName, bool ifExists) =>
+        DropTable(schemaPath.Count == 0 ? string.Empty : schemaPath[schemaPath.Count - 1], tableName, ifExists);
+
 
     /// <summary>Creates a schema; <paramref name="ifNotExists"/> guards creation.</summary>
     void CreateSchema(string schemaName, bool ifNotExists);
+    /// <summary>The path-addressed form (ABI v92) — here the path is the NEW schema's OWN, so
+    /// <c>CREATE SCHEMA a.b</c> arrives as <c>["a","b"]</c>.</summary>
+    /// <remarks>⚠ The default takes the LEAF, which for a non-nesting provider is the whole answer. One
+    /// that nests must override, or <c>CREATE SCHEMA a.b</c> makes a TOP-LEVEL schema called "b".</remarks>
+    void CreateSchema(IReadOnlyList<string> schemaPath, bool ifNotExists) =>
+        CreateSchema(schemaPath.Count == 0 ? string.Empty : schemaPath[schemaPath.Count - 1], ifNotExists);
+
 
     /// <summary>Drops a schema; <paramref name="ifExists"/> suppresses the missing-schema error.</summary>
     void DropSchema(string schemaName, bool ifExists);
+    /// <summary>The path-addressed form (ABI v92) — the DROPPED schema's own path.</summary>
+    /// <remarks>As <see cref="CreateSchema(IReadOnlyList{string}, bool)"/>: the default takes the leaf.</remarks>
+    void DropSchema(IReadOnlyList<string> schemaPath, bool ifExists) =>
+        DropSchema(schemaPath.Count == 0 ? string.Empty : schemaPath[schemaPath.Count - 1], ifExists);
+
 
     /// <summary>
     /// Enters transaction mode for this catalog. The backend pins a connection +
@@ -706,6 +765,15 @@ public interface IProviderCatalog : IDisposable
     /// stream (SQL Server <c>OUTPUT INSERTED.*</c>). Backs INSERT … RETURNING.
     /// </summary>
     IArrowArrayStream InsertReturning(string schemaName, string tableName, IArrowArrayStream rows);
+    /// <summary>The path-addressed form (ABI v92): the schema as a PATH, outermost element first.</summary>
+    /// <remarks>⚠ The default takes the LEAF, so a provider that does not nest behaves exactly as before —
+    /// see <see cref="GetTable(IReadOnlyList{string}, string)"/> for why every one of these widenings is a
+    /// DIM. A provider declaring <c>supports_nested_schemas</c> must override all of them, or a write will
+    /// silently address a different, same-named top-level schema.</remarks>
+    IArrowArrayStream InsertReturning(IReadOnlyList<string> schemaPath, string tableName,
+                                      IArrowArrayStream rows) =>
+        InsertReturning(schemaPath.Count == 0 ? string.Empty : schemaPath[schemaPath.Count - 1], tableName, rows);
+
 
     /// <summary>
     /// Alters a table. <paramref name="spec"/> is the typed request parsed from the <c>table_alter</c> doc;
@@ -720,4 +788,13 @@ public interface IProviderCatalog : IDisposable
     /// relocation of the implementation.
     /// </remarks>
     void AlterTable(AlterTableSpec spec, string schemaName, string tableName, Field? column);
+    /// <summary>The path-addressed form. ALTER needed NO wire change — it rides the table session, whose
+    /// definition already knows its path (<see cref="ITable.SchemaPath"/>) — but the provider still has to
+    /// be GIVEN it, which is what this overload is for.</summary>
+    /// <remarks>⚠ My first pass exempted ALTER from the nested-write refusal on the grounds that it rides
+    /// a path-carrying session. The ENTRY does; the handler then passed the definition's LEAF name and the
+    /// provider re-derived the wrong storage path. Reading the callee is what found it.</remarks>
+    void AlterTable(AlterTableSpec spec, IReadOnlyList<string> schemaPath, string tableName, Field? column) =>
+        AlterTable(spec, schemaPath.Count == 0 ? string.Empty : schemaPath[schemaPath.Count - 1], tableName, column);
+
 }

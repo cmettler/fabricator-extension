@@ -1,9 +1,9 @@
 # Nested schemas (DuckDB 2.0) — the plan, and what is built
 
-**Status (2026-10-23): SLICES 0, 1, 2a AND 2b BUILT — a Delta root attached with `nested_schemas true`
-resolves `cat.a.b.t` to any depth. Nesting is READ-ONLY: every write into a nested schema is REFUSED by
-name, because only `table_open` carries a path (ABI v91) and the eight write crossings still carry one
-flat schema name. Slice 2c (widen those) and slice 3 (DAX per-model `system`) NOT started.**
+**Status (2026-10-23): SLICES 0, 1, 2a, 2b AND 2c BUILT — a Delta root attached with `nested_schemas
+true` resolves `cat.a.b.t` to any depth, for READS AND WRITES. ABI v92. The only statement that still
+cannot name a nested table is `COMMENT ON`, and the layer that stops it is DuckDB's own parser. Slice 3
+(DAX per-model `system`) NOT started.**
 User-directed, from <https://duckdb.org/docs/2.0/sql/statements/create_schema#nested-schemas>. Scope
 decided by the user: a **full ABI change** carrying a schema PATH, Delta on **local FS + plain ADLS/S3**,
 with Fabric's `Tables/` area and SQL Server deliberately excluded.
@@ -234,11 +234,53 @@ attached FLAT as the control proving the table exists.
 - Depth is capped at 16 levels and REFUSES rather than truncating; silently not discovering a table is
   the failure mode the whole feature exists to avoid.
 
-#### What slice 2c would be
+#### What slice 2c did — SUPERSEDED, see the section below
 
-Widen the eight write crossings to carry a path (each needs a managed DIM, same shape as `GetTable`), and
-give `AlterTable` the binding's resolved path instead of its leaf name. Then the refusals go, and
-`CREATE SCHEMA a.b` can create a directory instead of being refused.
+It predicted the work exactly ("widen the eight write crossings, each needs a managed DIM, and give
+`AlterTable` the binding's resolved path") and got ONE thing wrong that cost a debugging round: it said
+`AlterTable` needed "the binding's resolved path", when what it needed was the DEFINITION's — and the
+definition had the path all along without exposing it.
+
+### ✅ Slice 2c — writes nest too (BUILT 2026-10-23, ABI v91 -> v92)
+
+The eight flat write crossings carry a schema PATH now, so the refusals slice 2b put in are GONE: INSERT,
+UPDATE, DELETE, CREATE/DROP TABLE, CREATE/DROP SCHEMA and ALTER all work on a nested schema.
+`verify_delta_nested_schemas` 65 -> **79** (its §5 went from asserting nine refusals to asserting the
+writes), floor 10154 -> **10168**.
+
+**The wire.** `create_table` / `drop_table` / `begin_bulk` / `execute_update` / `execute_delete` /
+`insert_returning` / `create_schema` / `drop_schema` each take
+`const char *const *schema_path, int32_t schema_path_len` in place of one `const char *schema`. For the
+two SCHEMA entries the path is the schema's OWN, so `CREATE SCHEMA a.b` arrives as `["a","b"]`.
+`bulk_insert` was left alone — it has had no C++ caller since the streaming bulk path replaced it.
+
+**`table_alter` needed NO wire change, and that is the part worth remembering.** It rides the table
+session, which was opened with the full path — but the managed handler then passed the definition's LEAF
+name and the provider re-derived the wrong directory. The fix is `ITable.SchemaPath` (a DIM defaulting to
+`[SchemaName]`) plus an `AlterTable` path overload. ⚠ Slice 2b had EXEMPTED ALTER from its refusal on
+exactly the wrong half of this: *where the crossing rides* rather than *what the callee does with it*.
+
+**Every managed widening is a DIM taking the leaf**, so the four out-of-tree plugins — which pin
+`Fabricator.Abstractions` by SHA — keep working untouched. ⚠ `DeltaCatalog` inverts the direction: it
+implements the PATH forms and derives the NAME forms from them, because for a provider that nests the
+interface's leaf-taking default is exactly the wrong way round.
+
+#### ⚠⚠ Two defects, and the second is the one worth carrying
+
+1. **The ABI version was bumped in `abi.h` and NOT in `Bootstrap.cs`.** Caught immediately and loudly by
+   the version check itself (*"ABI version mismatch (host=92, bridge=91)"*) — which is what that check is
+   for, and the reason the bump rule says BOTH halves.
+2. **⚠⚠ `DeltaTableDefinition` carried the path and did not EXPOSE it**, so ALTER kept taking the
+   interface default. MEASURED: every other statement on a depth-2 table worked and `ALTER TABLE … ADD
+   COLUMN` alone reported *"No Delta table found"* — a message that reads like a missing table rather
+   than a wrong path. A DIM default is a silent fallback by construction; overriding the property is not
+   optional for a provider that overrides the method.
+
+#### What is left
+
+`COMMENT ON` still cannot name a nested table: DuckDB's PARSER caps that statement at three
+qualifications, so it never reaches us. The gate pins the PARSER's error rather than ours, and fails the
+day upstream lifts the cap.
 
 ### Slice 2 — as originally planned
 

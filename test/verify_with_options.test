@@ -216,11 +216,27 @@ CREATE OR REPLACE TABLE lake.main.bad WITH (nonsense='x') AS SELECT 1 AS id;
 ----
 unknown CREATE TABLE WITH option 'nonsense'
 
-# write tuning has no write to apply to on an empty CREATE
-statement error
-CREATE TABLE lake.main.bad2 (id INTEGER) WITH (parquet_compression='zstd');
+# ⚠ A COLUMN-LIST CREATE WITH write tuning used to be REFUSED ("no write to apply to"), and that is no
+#   longer true: the tuning PERSISTS as fabricator.parquet.*, so the declaration is about the TABLE's
+#   storage format rather than about this statement. The assertion below is the stronger one the refusal
+#   replaced — the table is created empty and a LATER INSERT honours what the CREATE declared.
+statement ok
+CREATE OR REPLACE TABLE lake.main.declared (id INTEGER) WITH (parquet_compression='zstd');
+
+query I
+SELECT value FROM lake.delta.tblproperties('declared')
+WHERE property = 'fabricator.parquet.compression';
 ----
-apply to the statement's write
+zstd
+
+statement ok
+INSERT INTO lake.main.declared VALUES (1);
+
+query I
+SELECT DISTINCT compression FROM parquet_metadata('${FABRICATOR_DELTA_WRITE_DIR}/optlake/declared/*.parquet')
+WHERE compression <> '';
+----
+ZSTD
 
 # feature-enabling property spellings point at the explicit keys
 statement error
@@ -986,3 +1002,119 @@ DETACH lvc2;
 
 statement ok
 DETACH lv;
+
+# ==== 10. ALTER TABLE SET (…) / RESET (…) — the table options as DDL ====
+#
+# The same vocabulary as the WITH clause, landing in the same fabricator.parquet.* properties, so a table's
+# write settings can be CHANGED after it exists instead of only declared at CREATE. ⚠ The rows that matter
+# are the two that read a WRITTEN FILE: a property in the catalog proves only that the key was stored, and
+# the whole point of persisting it is that a LATER INSERT obeys it.
+
+statement ok
+CREATE OR REPLACE TABLE lake.main.opts (id INTEGER, payload VARCHAR);
+
+statement ok
+ALTER TABLE lake.main.opts SET (parquet_compression = 'zstd');
+
+query I
+SELECT value FROM lake.delta.tblproperties('opts') WHERE property = 'fabricator.parquet.compression';
+----
+zstd
+
+# THE LOAD-BEARING ROW: the write obeys what SET declared.
+statement ok
+INSERT INTO lake.main.opts VALUES (1, 'a');
+
+query I
+SELECT DISTINCT compression FROM parquet_metadata('${FABRICATOR_DELTA_WRITE_DIR}/optlake/opts/*.parquet')
+WHERE compression <> '';
+----
+ZSTD
+
+# A LIST literal is accepted and stored as the comma-separated spelling the WITH clause takes — DuckDB
+# parses ['a','b'] as a list_value() CALL rather than a constant, so this needs its own branch in the
+# renderer and would otherwise be refused as "not a constant".
+statement ok
+ALTER TABLE lake.main.opts SET (parquet_bloom_filter_columns = ['payload', 'id']);
+
+query I
+SELECT value FROM lake.delta.tblproperties('opts')
+WHERE property = 'fabricator.parquet.bloom_filter_columns';
+----
+payload,id
+
+# Several options in one statement, and one of them OVERWRITES an existing override.
+statement ok
+ALTER TABLE lake.main.opts SET (parquet_compression = 'gzip', parquet_row_group_size = 4096);
+
+query II
+SELECT property, value FROM lake.delta.tblproperties('opts')
+WHERE property IN ('fabricator.parquet.compression', 'fabricator.parquet.row_group_size') ORDER BY 1;
+----
+fabricator.parquet.compression	gzip
+fabricator.parquet.row_group_size	4096
+
+# RESET removes the override — and the NEXT write falls back to the engine default, which is the half a
+# property-count assertion cannot see.
+statement ok
+ALTER TABLE lake.main.opts RESET (parquet_compression);
+
+query I
+SELECT count(*) FROM lake.delta.tblproperties('opts') WHERE property = 'fabricator.parquet.compression';
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE lake.main.opts2 (id INTEGER);
+
+statement ok
+ALTER TABLE lake.main.opts2 SET (parquet_compression = 'zstd');
+
+statement ok
+ALTER TABLE lake.main.opts2 RESET (parquet_compression);
+
+statement ok
+INSERT INTO lake.main.opts2 VALUES (1);
+
+query I
+SELECT DISTINCT compression FROM parquet_metadata('${FABRICATOR_DELTA_WRITE_DIR}/optlake/opts2/*.parquet')
+WHERE compression <> '';
+----
+SNAPPY
+
+# The other options RESET did not name survive — otherwise "RESET removes it" could equally be "RESET
+# clears everything", which the rows above cannot tell apart.
+query I
+SELECT value FROM lake.delta.tblproperties('opts')
+WHERE property = 'fabricator.parquet.row_group_size';
+----
+4096
+
+# A raw property name passes through, which is the escape hatch for anything the vocabulary does not spell.
+statement ok
+ALTER TABLE lake.main.opts SET ("fabricator.parquet.compression" = 'gzip');
+
+query I
+SELECT value FROM lake.delta.tblproperties('opts') WHERE property = 'fabricator.parquet.compression';
+----
+gzip
+
+# ⚠ An UNKNOWN key is REFUSED, never ignored — the WITH clause's rule, and it matters more here: a
+# silently dropped SET leaves the author believing the table is written one way while every INSERT writes
+# it another, with nothing saying so until someone reads the files.
+statement error
+ALTER TABLE lake.main.opts SET (nonsense = 1);
+----
+unknown table option
+
+statement error
+ALTER TABLE lake.main.opts RESET (nonsense);
+----
+unknown table option
+
+# A CREATE-ONLY feature flag is refused BY NAME with the reason, because it IS a real WITH option and the
+# natural assumption is that SET can change it.
+statement error
+ALTER TABLE lake.main.opts SET (deletion_vectors = true);
+----
+enables a table FEATURE

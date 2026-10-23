@@ -39,10 +39,10 @@ public unsafe struct FabricatorVTable
     public delegate* unmanaged[Cdecl]<nint, byte*, byte*, int, int, CArrowArrayStream*, long*, byte**, int> BulkInsert;
 
     // int32 execute_delete(void* handle, const char* schema, const char* table, ArrowArrayStream* keys, int64* affected, char** err)
-    public delegate* unmanaged[Cdecl]<nint, byte*, byte*, CArrowArrayStream*, long*, byte**, int> ExecuteDelete;
+    public delegate* unmanaged[Cdecl]<nint, byte**, int, byte*, CArrowArrayStream*, long*, byte**, int> ExecuteDelete;
 
     // int32 execute_update(void* handle, const char* schema, const char* table, int32 set_count, ArrowArrayStream* data, int64* affected, char** err)
-    public delegate* unmanaged[Cdecl]<nint, byte*, byte*, int, CArrowArrayStream*, long*, byte**, int> ExecuteUpdate;
+    public delegate* unmanaged[Cdecl]<nint, byte**, int, byte*, int, CArrowArrayStream*, long*, byte**, int> ExecuteUpdate;
 
     // (get_metadata / scan_table were removed at ABI v72 — the 16-kind multiplexer and the name-pair scan
     //  are replaced by the dedicated catalog_* discovery entries and the table_* session at the end of this
@@ -53,16 +53,16 @@ public unsafe struct FabricatorVTable
     //                    int32 if_not_exists, const char* pk_columns, const char* unique_columns,
     //                    const char* defaults, const char* partition_columns, const char* sort_columns,
     //                    const char* identity_columns, const char* options_json, char** err)
-    public delegate* unmanaged[Cdecl]<nint, byte*, byte*, CArrowArrayStream*, int, byte*, byte*, byte*, byte*, byte*, byte*, byte*, byte**, int> CreateTable;
+    public delegate* unmanaged[Cdecl]<nint, byte**, int, byte*, CArrowArrayStream*, int, byte*, byte*, byte*, byte*, byte*, byte*, byte*, byte**, int> CreateTable;
 
     // int32 drop_table(void* handle, const char* schema, const char* table, int32 if_exists, char** err)
-    public delegate* unmanaged[Cdecl]<nint, byte*, byte*, int, byte**, int> DropTable;
+    public delegate* unmanaged[Cdecl]<nint, byte**, int, byte*, int, byte**, int> DropTable;
 
     // int32 create_schema(void* handle, const char* schema, int32 if_not_exists, char** err)
-    public delegate* unmanaged[Cdecl]<nint, byte*, int, byte**, int> CreateSchema;
+    public delegate* unmanaged[Cdecl]<nint, byte**, int, int, byte**, int> CreateSchema;
 
     // int32 drop_schema(void* handle, const char* schema, int32 if_exists, char** err)
-    public delegate* unmanaged[Cdecl]<nint, byte*, int, byte**, int> DropSchema;
+    public delegate* unmanaged[Cdecl]<nint, byte**, int, int, byte**, int> DropSchema;
 
     // (alter_table was removed at ABI v74 — it is TableAlter on the table session, at the end of this struct.)
 
@@ -72,13 +72,13 @@ public unsafe struct FabricatorVTable
     public delegate* unmanaged[Cdecl]<nint, byte**, int> RollbackTransaction;
 
     // int32 insert_returning(void* handle, const char* schema, const char* table, ArrowArrayStream* in, ArrowArrayStream* out, char** err)
-    public delegate* unmanaged[Cdecl]<nint, byte*, byte*, CArrowArrayStream*, CArrowArrayStream*, byte**, int> InsertReturning;
+    public delegate* unmanaged[Cdecl]<nint, byte**, int, byte*, CArrowArrayStream*, CArrowArrayStream*, byte**, int> InsertReturning;
 
     // int32 begin_bulk(void* handle, const char* schema, const char* table, int32 create_table, int32 replace,
     //                  int32 check_constraints, int64 txn_id, ArrowSchema* schema_in, const char* partition_columns,
     //                  const char* sort_columns, const char* schema_mode, int32 partition_overwrite,
     //                  const char* options_json, void** out_session, char** err)
-    public delegate* unmanaged[Cdecl]<nint, byte*, byte*, int, int, int, long, CArrowSchema*, byte*, byte*, byte*, int, byte*, nint*, byte**, int> BeginBulk;
+    public delegate* unmanaged[Cdecl]<nint, byte**, int, byte*, int, int, int, long, CArrowSchema*, byte*, byte*, byte*, int, byte*, nint*, byte**, int> BeginBulk;
 
     // int32 push_batch(void* session, ArrowArray* batch, char** err)
     public delegate* unmanaged[Cdecl]<nint, CArrowArray*, byte**, int> PushBatch;

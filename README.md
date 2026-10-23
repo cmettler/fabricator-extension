@@ -4380,8 +4380,9 @@ principal wins even if `PROVIDER` says something else:
 | `CREATE TABLE` / `INSERT` / CTAS / COPY (streaming bulk via the standard write path) | ✅ |
 | `DELETE` / `UPDATE` — rowid deletion-vectors / merge-on-read (default) or copy-on-write (`deletion_vectors false`) | ✅ |
 | `DROP TABLE`, `ALTER TABLE … ADD COLUMN`, `RENAME TABLE` (local + OneLake) | ✅ |
+| **Table options in DDL**: `CREATE … WITH (…)`, `ALTER TABLE … SET (…)`, `ALTER TABLE … RESET (…)` — persisted write tuning that governs every later write | ✅ |
 | Multi-schema: `schemas true` (local/S3 `<root>/<schema>/<table>`); schema-enabled OneLake lakehouses | ✅ |
-| **Nested** schemas (DuckDB 2.0): `nested_schemas true` — the directory tree under a local/S3/ADLS root IS the schema tree, so `<root>/a/b/t` reads as `cat.a.b.t` | ✅ READ-ONLY (writes into a schema deeper than one are refused by name) |
+| **Nested** schemas (DuckDB 2.0): `nested_schemas true` — the directory tree under a local/S3/ADLS root IS the schema tree, so `<root>/a/b/t` is `cat.a.b.t`, for reads and writes alike | ✅ (except `COMMENT ON`, which DuckDB's parser caps at three qualifications) |
 | Time travel: `FROM t AT (VERSION => n)` and `AT (TIMESTAMP => ts)` | ✅ |
 | Snapshots/history: `<catalog>.delta.snapshots('<schema.>table')` | ✅ |
 | **Exactly-once appends** (Delta application transactions / Spark `txnAppId`): `<catalog>.delta.set_transaction_version` + `.get_transaction_version` | ✅ |
@@ -4710,6 +4711,33 @@ also resolves without it via the always-on commit timestamp), `native_read true`
 (DuckDB's own Parquet reader/writer for data files), `isolation_level 'write_serializable'|'serializable'`.
 Any of these can also be set **per table** with `CREATE TABLE … WITH (…)` (above).
 
+#### Changing a table's write settings — `ALTER TABLE … SET / RESET`
+
+The write tuning is a **persisted table property**, so it can be declared at CREATE and changed later.
+All three statements take the same option names:
+
+```sql
+CREATE TABLE lake.events (id INTEGER, payload VARCHAR)
+  WITH (parquet_compression = 'zstd');
+
+ALTER TABLE lake.events SET (parquet_row_group_size = 4096);
+ALTER TABLE lake.events SET (parquet_bloom_filter_columns = ['payload', 'id']);
+ALTER TABLE lake.events RESET (parquet_compression);
+```
+
+- The declaration governs **every later write** — a plain `INSERT`, the merge-on-read post-image, a
+  copy-on-write rewrite, and `OPTIMIZE`'s compaction output — not just the statement that set it.
+- `RESET` removes the table's override, so the layer below decides again:
+  statement `WITH` → table property → `SET delta_write_options` → ATTACH default → engine default.
+- A **list literal** (`['a','b']`) is accepted wherever a comma-separated list is, in `WITH` and `SET`
+  alike.
+- An **unknown option is refused**, never ignored. So are the create-only feature flags
+  (`deletion_vectors`, `row_tracking`, `change_data_feed`, `in_commit_timestamps`, `column_mapping`):
+  they enable a table feature that needs a protocol upgrade, and the error says so.
+- A raw property name passes through (`SET ("fabricator.parquet.compression" = 'gzip')`), which is the
+  escape hatch for anything the vocabulary above does not spell — the same surface
+  `<catalog>.delta.set_tblproperties` offers, reachable from DDL.
+
 #### Nested schemas (`nested_schemas true`)
 
 DuckDB 2.0 lets a schema contain another schema. With this option the **directory tree under the Delta
@@ -4726,10 +4754,9 @@ SELECT schema_name FROM duckdb_schemas() WHERE database_name = 'cat';
 
 - It **supersedes `schemas`** rather than extending it: nested mode is the two-level layout generalised,
   so a one-level tree discovers exactly what `schemas true` discovers.
-- **Reads only.** A write into a schema deeper than one — `INSERT`, `UPDATE`, `DELETE`, `CREATE`/`DROP
-  TABLE`, `ALTER`, `CREATE`/`DROP SCHEMA` — is **refused with a message naming the schema**, because the
-  provider still addresses a table by a single schema name and the leaf alone would point somewhere else.
-  Everything at depth 1 works normally.
+- **Reads and writes.** `INSERT`, `UPDATE`, `DELETE`, `CREATE`/`DROP TABLE`, `ALTER` and
+  `CREATE`/`DROP SCHEMA` all work at any depth. The one exception is `COMMENT ON`, which DuckDB's parser
+  caps at three qualifications, so a nested table cannot be named in it at all.
 - A Delta table sitting **directly under the root** is not discovered (every level is a real directory, so
   a table needs at least one); it is skipped with a warning. `schemas true` does not discover one either.
 - Not available on a **OneLake** root: Fabric's `Tables/` area is defined as exactly two levels, and the

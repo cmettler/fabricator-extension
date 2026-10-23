@@ -377,26 +377,42 @@ string FabricatorCatalog::GetDBPath() {
 }
 
 optional_ptr<CatalogEntry> FabricatorCatalog::CreateSchema(CatalogTransaction transaction, CreateSchemaInfo &info) {
-	// ⚠ `CREATE SCHEMA a.b` is REFUSED, and refusing is the point. DuckDB 2.0 offers the syntax the moment
-	// SupportsNestedSchemas() is true, and this function would otherwise make a FLAT entry called "b" and
-	// ask the provider for a schema called "b" — so the statement would report success and create the
-	// wrong thing. Discovery is what nests today (the provider walks its own storage); declaring one from
-	// SQL needs create_schema to take a path, which is the same widening the write crossings need.
-	if (info.IsNested()) {
-		throw NotImplementedException(
-		    "fabricator: CREATE SCHEMA with a nested path is not supported — a nested schema is DISCOVERED "
-		    "from the provider's own layout, not declared here (see docs/nested-schemas.md)");
+	// The NEW schema's OWN path: the levels between the catalog and it, plus its own name. DuckDB offers
+	// `CREATE SCHEMA a.b` the moment SupportsNestedSchemas() is true, and since v92 create_schema carries
+	// the whole path, so the provider creates the last level inside the ones before it.
+	// ⚠ `ParentSchemas()` is DuckDB's own reader of the qualified name (it skips the catalog AND the empty
+	// trailing slot) — do not re-derive it from Path() by hand; the shape differs with and without nesting,
+	// which is exactly the trap DropSchema below records.
+	vector<string> new_path;
+	for (auto &parent : info.ParentSchemas()) {
+		new_path.push_back(parent.GetIdentifierName());
 	}
+	new_path.push_back(info.GetQualifiedName().Schema().GetIdentifierName());
+
 	if (transaction.context) {
 		FabricatorSetActiveTxn(handle_, *transaction.context);
 	}
 	if (info.on_conflict == OnCreateConflict::REPLACE_ON_CONFLICT) {
-		fabricator::DropSchema(handle_, info.GetQualifiedName().Schema().GetIdentifierName(), /*if_exists=*/true);
+		fabricator::DropSchema(handle_, new_path, /*if_exists=*/true);
 	}
 	bool if_not_exists = info.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT;
-	fabricator::CreateSchema(handle_, info.GetQualifiedName().Schema().GetIdentifierName(), if_not_exists);
+	fabricator::CreateSchema(handle_, new_path, if_not_exists);
 
 	lock_guard<mutex> lock(schema_lock_);
+	if (new_path.size() > 1) {
+		// NESTED: the entry belongs to its parent, not to schemas_. EnsureSchemaPathLocked makes any
+		// missing intermediate level, which matters because the provider was just asked to create the
+		// whole chain. ⚠ A REPLACE keeps the existing entry (the graveyard rule — a raw pointer may be
+		// held across bind→execute) and CLEARS its tables instead, which is what "replaced" has to mean
+		// for anything already materialized under it.
+		vector<string> parents(new_path.begin(), new_path.end() - 1);
+		auto &parent = EnsureSchemaPathLocked(parents);
+		auto &child = parent.GetOrCreateChildSchema(new_path.back());
+		if (info.on_conflict == OnCreateConflict::REPLACE_ON_CONFLICT) {
+			child.ClearTables();
+		}
+		return &child;
+	}
 	auto it = schemas_.find(info.GetQualifiedName().Schema().GetIdentifierName());
 	if (it != schemas_.end()) {
 		if (info.on_conflict != OnCreateConflict::REPLACE_ON_CONFLICT) {
@@ -411,45 +427,66 @@ optional_ptr<CatalogEntry> FabricatorCatalog::CreateSchema(CatalogTransaction tr
 	return &ref;
 }
 void FabricatorCatalog::DropSchema(ClientContext &context, DropInfo &info) {
-	// Same refusal as CreateSchema, for the same reason: `drop_schema` carries ONE name, so a nested path
-	// would drop the same-named TOP-LEVEL schema instead — a destructive statement hitting the wrong
-	// target.
+	// The dropped schema's OWN path, read COMPONENT BY COMPONENT.
 	//
-	// ⚠⚠ THE PATH LENGTH IS NOT THE TEST, AND NEITHER IS StripCatalog() — both were tried and both refused
-	// an ORDINARY `DROP SCHEMA <catalog>.<schema>`. The path's shape depends on whether nested schemas are
-	// ON: without them a schema drop is built as (catalog, EMPTY schema, name) and arrives as
+	// ⚠⚠ THE PATH LENGTH IS NOT A USABLE READING, AND NEITHER IS StripCatalog() — both were tried and both
+	// mis-classified an ORDINARY `DROP SCHEMA <catalog>.<schema>`. The shape depends on whether nested
+	// schemas are ON: without them a schema drop is built as (catalog, EMPTY schema, name) and arrives as
 	// `["lake", "", "staging"]` (three elements, measured at verify_delta_catalog_schemas:104); with them
-	// the same statement arrives as `["lk", "west"]` (two, no placeholder) while a genuinely nested drop is
-	// `["lk", "sales", "eu"]`. So the only reliable reading is COMPONENT BY COMPONENT: drop a leading
-	// element that is this catalog's own name, ignore empty placeholders, and count what is left BEFORE the
-	// final name. Anything greater than zero is a nested path.
+	// the same statement arrives as `["lk", "west"]` (two, no placeholder) while a genuinely nested drop
+	// is `["lk", "sales", "eu"]`. So: drop a leading element that is this catalog's own name, skip empty
+	// placeholders, and keep the rest — the last of which is the schema being dropped.
 	auto &drop_path = info.GetQualifiedName().Path();
 	idx_t first = 0;
 	if (drop_path.size() > 1 &&
 	    StringUtil::Lower(drop_path[0].GetIdentifierName()) == StringUtil::Lower(GetName().GetIdentifierName())) {
 		first = 1;
 	}
-	idx_t schema_levels = 0;
-	for (idx_t i = first; i + 1 < drop_path.size(); i++) {
+	vector<string> path;
+	for (idx_t i = first; i < drop_path.size(); i++) {
 		if (!drop_path[i].empty()) {
-			schema_levels++;
+			path.push_back(drop_path[i].GetIdentifierName());
 		}
 	}
-	if (schema_levels > 0) {
-		throw NotImplementedException(
-		    "fabricator: DROP SCHEMA with a nested path is not supported — it would address the provider by "
-		    "the leaf name alone and drop a different schema (see docs/nested-schemas.md)");
+	if (path.empty()) {
+		throw BinderException("fabricator: DROP SCHEMA names no schema");
 	}
 	bool if_exists = info.if_not_found == OnEntryNotFound::RETURN_NULL;
 	FabricatorSetActiveTxn(handle_, context);
-	fabricator::DropSchema(handle_, info.GetQualifiedName().Name().GetIdentifierName(), if_exists);
+	fabricator::DropSchema(handle_, path, if_exists);
 	lock_guard<mutex> lock(schema_lock_);
-	auto it = schemas_.find(info.GetQualifiedName().Name().GetIdentifierName());
-	if (it != schemas_.end()) {
-		retired_schemas_.push_back(std::move(it->second)); // retire, never destroy (see header)
-		schemas_.erase(it);
+	RetireSchemaPathLocked(path);
+}
+
+void FabricatorCatalog::RetireSchemaPathLocked(const vector<string> &path) {
+	// Retire, never destroy — the entry may be held as a raw pointer across bind→plan→execute, which is
+	// the use-after-free the catalog's graveyard exists to prevent. A child moves into the SAME graveyard
+	// as a top-level schema, so the parent stops owning it while it stays alive to the end of the catalog.
+	if (path.size() == 1) {
+		auto it = schemas_.find(path[0]);
+		if (it != schemas_.end()) {
+			retired_schemas_.push_back(std::move(it->second));
+			schemas_.erase(it);
+		}
+		return;
+	}
+	// Walk to the PARENT without creating anything: a drop must not materialize a level that is absent.
+	auto it = schemas_.find(path[0]);
+	if (it == schemas_.end()) {
+		return;
+	}
+	FabricatorSchemaEntry *parent = it->second.get();
+	for (idx_t i = 1; i + 1 < path.size(); i++) {
+		parent = parent->FindChildSchema(path[i]);
+		if (!parent) {
+			return;
+		}
+	}
+	if (auto retired = parent->ReleaseChildSchema(path.back())) {
+		retired_schemas_.push_back(std::move(retired));
 	}
 }
+
 ErrorData FabricatorCatalog::SupportsCreateTable(BoundCreateTableInfo &info) {
 	// Permit PARTITIONED BY (Delta partitions the data), SORTED BY (SQL Server maps it to a Fabric Warehouse
 	// WITH (CLUSTER BY (cols)) layout), AND the WITH (key='value', ...) options clause — the options cross the
@@ -515,7 +552,7 @@ PhysicalOperator &FabricatorCatalog::PlanCreateTableAs(ClientContext &context, P
 	MarkSinkOnOwnScans(plan, create_info.GetQualifiedName().Schema().GetIdentifierName(), create_info.GetQualifiedName().Name().GetIdentifierName(), "create");
 
 	FabricatorCtasInfo info;
-	FabricatorRefuseNestedWrite(op.info->schema, "CREATE TABLE AS");
+	info.schema_path = op.info->schema.Cast<FabricatorSchemaEntry>().SchemaPathStrings();
 	info.schema_name = create_info.GetQualifiedName().Schema().GetIdentifierName();
 	info.table_name = create_info.GetQualifiedName().Name().GetIdentifierName();
 	for (auto &col : create_info.columns.Logical()) {
@@ -545,7 +582,7 @@ PhysicalOperator &FabricatorCatalog::PlanInsert(ClientContext &context, Physical
 	}
 	FabricatorInsertTarget target;
 	target.returning = op.return_chunk;
-	FabricatorRefuseNestedWrite(op.table.schema, "INSERT");
+	target.schema_path = op.table.schema.Cast<FabricatorSchemaEntry>().SchemaPathStrings();
 	target.schema_name = op.table.schema.name.GetIdentifierName();
 	target.table_name = op.table.name.GetIdentifierName();
 
@@ -647,8 +684,8 @@ FabricatorModifyTarget FabricatorBuildModifyTarget(TableCatalogEntry &table) {
 		    "Table '%s' has neither (use fabricator_exec for set-based UPDATE/DELETE)",
 		    entry.name);
 	}
-	FabricatorRefuseNestedWrite(entry.schema, "UPDATE/DELETE");
 	FabricatorModifyTarget target;
+	target.schema_path = entry.schema.Cast<FabricatorSchemaEntry>().SchemaPathStrings();
 	target.schema_name = entry.schema.name.GetIdentifierName();
 	target.table_name = entry.name.GetIdentifierName();
 	if (entry.HasVirtualRowId()) {

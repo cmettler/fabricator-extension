@@ -173,15 +173,19 @@ typedef struct FabricatorVTable {
 	// rowid-based DELETE. `keys` is an Arrow stream whose columns (named by their
 	// Arrow field names) are the key column values to delete. The managed side
 	// generates the provider DELETE (parameterized). Takes ownership of `keys`.
-	int32_t (*execute_delete)(FabricatorHandle handle, const char *schema, const char *table,
-	                          struct ArrowArrayStream *keys, int64_t *affected, char **err);
+	// ⚠ `schema_path` / `schema_path_len`: the schema as an ARRAY of UTF-8 names, OUTERMOST FIRST (v92,
+	// was a single `const char *schema`). Depth 1 for every provider that does not declare
+	// `supports_nested_schemas`, in which case the one element IS the name the old parameter carried.
+	int32_t (*execute_delete)(FabricatorHandle handle, const char *const *schema_path, int32_t schema_path_len,
+	                          const char *table, struct ArrowArrayStream *keys, int64_t *affected, char **err);
 
 	// rowid-based UPDATE. `data` is an Arrow stream with the first `set_count`
 	// columns being the SET values and the remaining columns the key values
 	// (all named by Arrow field name). Managed side generates the provider
 	// UPDATE (parameterized). Takes ownership of `data`.
-	int32_t (*execute_update)(FabricatorHandle handle, const char *schema, const char *table, int32_t set_count,
-	                          struct ArrowArrayStream *data, int64_t *affected, char **err);
+	int32_t (*execute_update)(FabricatorHandle handle, const char *const *schema_path, int32_t schema_path_len,
+	                          const char *table, int32_t set_count, struct ArrowArrayStream *data,
+	                          int64_t *affected, char **err);
 
 	// (get_metadata / scan_table were removed at ABI v72 — replaced by the dedicated catalog_* discovery
 	//  entries and the table_* session at the end of this struct. Removing mid-struct slots shifts every
@@ -212,20 +216,26 @@ typedef struct FabricatorVTable {
 	// JSON object of string values ({"parquet_compression":"zstd", ...}). The PROVIDER parses the keys it
 	// knows (Delta: per-table write tuning + create-flag overrides + delta.*/fabricator.* properties) and
 	// REJECTS unknown keys — a WITH option is never silently ignored.
-	int32_t (*create_table)(FabricatorHandle handle, const char *schema, const char *table,
+	int32_t (*create_table)(FabricatorHandle handle, const char *const *schema_path, int32_t schema_path_len,
+	                        const char *table,
 	                        struct ArrowArrayStream *columns, int32_t if_not_exists, const char *pk_columns,
 	                        const char *unique_columns, const char *defaults, const char *partition_columns,
 	                        const char *sort_columns, const char *identity_columns, const char *options_json,
 	                        char **err);
 
 	// DDL: drop a table. `if_exists` suppresses the error when it is absent.
-	int32_t (*drop_table)(FabricatorHandle handle, const char *schema, const char *table, int32_t if_exists, char **err);
+	int32_t (*drop_table)(FabricatorHandle handle, const char *const *schema_path, int32_t schema_path_len,
+	                      const char *table, int32_t if_exists, char **err);
 
 	// DDL: create a schema. `if_not_exists` guards creation.
-	int32_t (*create_schema)(FabricatorHandle handle, const char *schema, int32_t if_not_exists, char **err);
+	// ⚠ Here the PATH is the new schema's OWN, so `CREATE SCHEMA a.b` arrives as ["a","b"] — the provider
+	// creates the last level inside the ones before it.
+	int32_t (*create_schema)(FabricatorHandle handle, const char *const *schema_path, int32_t schema_path_len,
+	                         int32_t if_not_exists, char **err);
 
 	// DDL: drop a schema. `if_exists` suppresses the error when it is absent.
-	int32_t (*drop_schema)(FabricatorHandle handle, const char *schema, int32_t if_exists, char **err);
+	int32_t (*drop_schema)(FabricatorHandle handle, const char *const *schema_path, int32_t schema_path_len,
+	                       int32_t if_exists, char **err);
 
 	// (alter_table was removed at ABI v74 — replaced by table_alter at the end of this struct, over the
 	//  table session's handle and one typed JSON doc.)
@@ -248,8 +258,9 @@ typedef struct FabricatorVTable {
 	// field names are the target column list); the managed side runs
 	// INSERT ... OUTPUT INSERTED.* and exports the inserted rows (all table
 	// columns, in table order) into *out. Consumes/releases `in`.
-	int32_t (*insert_returning)(FabricatorHandle handle, const char *schema, const char *table,
-	                            struct ArrowArrayStream *in, struct ArrowArrayStream *out, char **err);
+	int32_t (*insert_returning)(FabricatorHandle handle, const char *const *schema_path, int32_t schema_path_len,
+	                            const char *table, struct ArrowArrayStream *in, struct ArrowArrayStream *out,
+	                            char **err);
 
 	// -------------------------------------------------------------------------
 	// Streaming bulk-load (begin_bulk / push_batch / complete_bulk).
@@ -295,7 +306,8 @@ typedef struct FabricatorVTable {
 	// `options_json` (nullable, v67): the CREATE TABLE AS ... WITH (key='value', ...) options clause as a flat
 	// JSON object of string values, present only on a CTAS (a plain INSERT/COPY bulk passes NULL). Same
 	// provider-parses/rejects-unknown contract as create_table's options_json.
-	int32_t (*begin_bulk)(FabricatorHandle handle, const char *schema, const char *table, int32_t create_table,
+	int32_t (*begin_bulk)(FabricatorHandle handle, const char *const *schema_path, int32_t schema_path_len,
+	                      const char *table, int32_t create_table,
 	                      int32_t replace, int32_t check_constraints, int64_t txn_id, struct ArrowSchema *schema_in,
 	                      const char *partition_columns, const char *sort_columns, const char *schema_mode,
 	                      int32_t partition_overwrite, const char *options_json, FabricatorHandle *out_session,
@@ -947,12 +959,10 @@ typedef struct FabricatorVTable {
 	// is the name the old parameter carried. The managed default (IProviderCatalog.GetTable over a path)
 	// takes the LEAF, so an un-migrated provider — including the out-of-tree plugins, which pin
 	// Fabricator.Abstractions by SHA — is byte-for-byte unaffected.
-	// ⚠ The WRITE crossings below (create_table / drop_table / begin_bulk / execute_update /
-	// execute_delete / insert_returning / create_schema / drop_schema) still carry a FLAT `const char
-	// *schema`, and the host REFUSES each of them on a schema deeper than one rather than passing a leaf
-	// that would resolve to the wrong place. ALTER and COMMENT ON are refused too, although they ride THIS
-	// session: table_alter hands the provider the definition's leaf schema NAME, so it re-derives the same
-	// wrong path. Nesting is READ-ONLY until all of that is widened.
+	// ⚠ Since v92 the WRITE crossings carry a path too (create_table / drop_table / begin_bulk /
+	// execute_update / execute_delete / insert_returning / create_schema / drop_schema), so nesting is no
+	// longer read-only. `table_alter` is the one that needed NO wire change: it rides this session, and
+	// the path reaches the provider on the managed side through ITable.SchemaPath.
 	int32_t (*table_open)(FabricatorHandle handle, const char *const *schema_path, int32_t schema_path_len,
 	                      const char *table, const char *at_unit, const char *at_value,
 	                      FabricatorHandle *out_table, char **err);
@@ -1029,6 +1039,16 @@ typedef struct FabricatorVTable {
 	//   {"kind":"set_partitioned_by", "columns":["a","b"]}   ([] = RESET)
 	//   {"kind":"set_comment",                       "comment":<string|null>}   (COMMENT ON TABLE)
 	//   {"kind":"set_column_comment", "column":"c",  "comment":<string|null>}   (COMMENT ON COLUMN)
+	//   {"kind":"set_table_options",   "options":{"parquet_compression":"zstd", …}}
+	//   {"kind":"reset_table_options", "reset_options":["parquet_compression", …]}
+	// The last two are `ALTER TABLE t SET (…)` / `RESET (…)` (DuckDB 2.0's SET_TABLE_OPTIONS /
+	// RESET_TABLE_OPTIONS) — the per-table write settings, the SAME vocabulary the CREATE TABLE WITH
+	// clause takes, which is why the values are rendered by the SAME host function (TableOptionValueText:
+	// constants only, one CAST level unwrapped, a LIST literal joined with commas). The host does not know
+	// what any key MEANS: the provider parses the ones it knows and MUST REJECT the rest, exactly as it
+	// does for WITH — a silently ignored write setting is a table written in a format nobody asked for.
+	// ⚠ "options" is an OBJECT and "reset_options" an ARRAY, under their own names rather than one key of
+	// two shapes. ⚠ ADDITIVE: new doc kinds need no version bump (the enum-value rule).
 	// `path` is an ARRAY of segments rather than a joined string because a field name may contain dots.
 	// "default" is REQUIRED by set_default and carries the literal's TEXT, with JSON null for DEFAULT NULL —
 	// the two states the old arg2 encoded as "-" / "b"+base64(literal), a hack that existed only because a
@@ -1365,7 +1385,7 @@ typedef struct FabricatorHostServices {
 // state blob is this many bytes + a 4-byte length prefix). Serialize() must fit within it.
 #define FABRICATOR_AGG_SPILL_CAP 1024
 
-#define FABRICATOR_ABI_VERSION 91
+#define FABRICATOR_ABI_VERSION 92
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(FabricatorVTable) as seen

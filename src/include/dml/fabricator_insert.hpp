@@ -17,6 +17,8 @@ namespace duckdb {
 //! Target of an INSERT: qualified table + insert columns (names + types, in the
 //! INSERT statement's source order).
 struct FabricatorInsertTarget {
+	//! The schema as a PATH, outermost first (ABI v92). Depth 1 unless the provider nests.
+	vector<string> schema_path;
 	string schema_name;
 	string table_name;
 	vector<string> columns;

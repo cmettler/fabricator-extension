@@ -42,7 +42,7 @@ internal sealed class BulkSession
 
     public Schema Schema { get; }
 
-    public BulkSession(IProviderCatalog catalog, string schemaName, string tableName, Schema schema, bool createTable,
+    public BulkSession(IProviderCatalog catalog, IReadOnlyList<string> schemaName, string tableName, Schema schema, bool createTable,
                        bool replace, bool checkConstraints, long txnId, nint opener = 0,
                        IReadOnlyList<string>? partitionColumns = null, IReadOnlyList<string>? sortColumns = null,
                        string? schemaMode = null, bool partitionOverwrite = false, string? optionsJson = null)
