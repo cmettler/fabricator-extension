@@ -883,10 +883,15 @@ typedef struct FabricatorVTable {
 	// the per-provider unknown-kind fallback shapes, and (below) the name-pair-per-call table transport.
 	// All UTF-8 columns, read host-side with ReadStringTable.
 	// -------------------------------------------------------------------------
-	// One column: the user schema names (schema_filter applied provider-side; a Delta/Fabric catalog also
-	// advertises its function namespaces here — `delta`, `fabric`).
+	// One column, SINCE v90 a LIST<VARCHAR> SCHEMA PATH (outermost element first): ["a","b"] is schema `b`
+	// nested inside `a` (DuckDB 2.0 nested schemas). A depth-1 path is the ordinary top-level schema and is
+	// what every provider emits today. schema_filter applied provider-side; a Delta/Fabric catalog also
+	// advertises its function namespaces here — `delta`, `fabric`.
+	// ⚠ Read with ReadPathTable, NOT ReadStringTable — the latter's contract is all-UTF-8 columns.
+	// ⚠ A path is structural rather than a dotted string because a schema NAME may contain a dot.
 	int32_t (*catalog_schemas)(FabricatorHandle handle, struct ArrowArrayStream *out, char **err);
-	// Three columns: schema, table, type ("BASE TABLE"|"VIEW"). schema_filter/table_filter applied
+	// Three columns: schema path (LIST<VARCHAR> since v90, as catalog_schemas), table, type
+	// ("BASE TABLE"|"VIEW"). schema_filter/table_filter applied
 	// provider-side (they bound ENUMERATION only, never targeted access).
 	int32_t (*catalog_tables)(FabricatorHandle handle, struct ArrowArrayStream *out, char **err);
 	// Five columns: schema, name, kind, param_count, return_type (the host reads the first three).
@@ -1343,7 +1348,7 @@ typedef struct FabricatorHostServices {
 // state blob is this many bytes + a 4-byte length prefix). Serialize() must fit within it.
 #define FABRICATOR_AGG_SPILL_CAP 1024
 
-#define FABRICATOR_ABI_VERSION 89
+#define FABRICATOR_ABI_VERSION 90
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(FabricatorVTable) as seen

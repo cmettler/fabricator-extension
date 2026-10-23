@@ -56,6 +56,17 @@ both become trees, and the graveyard's ordering rule (a schema entry must outliv
   each model its own `cat.<model>.system.<dmv>`: a genuine three-level need, from a provider with no
   directory tree at all. That it is not Delta-only is what justifies changing the ABI rather than encoding
   paths in strings.
+- **⚠⚠ AND THE CLEANEST FIT IS A PLUGIN, NOT A FIRST-PARTY PROVIDER (user, 2026-10-23):
+  `fabricator-grist` is `team -> workspace -> document -> tables`.** ATTACH names the team, and
+  `cat.<workspace>.<document>.<table>` falls straight out. Unlike Delta's ad-hoc trees this is not an
+  unusual layout anyone could avoid — it is the product's OWN hierarchy, so under a two-part model one of
+  workspace/document MUST be flattened into a compound schema name, which is exactly the kind of
+  name-mangling this feature exists to remove.
+  ⇒ **THREE providers now want it and two of them are structurally three-level** (grist by design, DAX
+  per-model `system`), which is what turns "nice to have for odd Delta folders" into a real argument for
+  changing the ABI. ⚠ It also means the feature must work for an OUT-OF-TREE plugin, so whatever carries
+  the path has to be part of the published contract (`Fabricator.Abstractions`), not an internal detail —
+  see the plugin/host build boundary in CLAUDE.md.
 - **⛔ SQL SERVER AND FABRIC `Tables/` MUST LEAVE THE CAPABILITY OFF.** Their namespace is genuinely
   two-part; declaring nesting there would make DuckDB offer a syntax that resolves to nothing.
 
@@ -69,7 +80,40 @@ both become trees, and the graveyard's ordering rule (a schema entry must outliv
 **Nothing declares it true** — reporting the capability without the wire shape would let DuckDB resolve
 `a.b` against a catalog that cannot express it. Gate: hermetic **82/82 — 10089**, identical, i.e. inert.
 
-### Slice 1 — the wire shape (ABI v89 -> v90), BEHAVIOUR-NEUTRAL
+### ✅ Slice 1 — the wire shape (ABI v89 -> v90), BUILT 2026-10-23, BEHAVIOUR-NEUTRAL
+
+As planned below, with two deviations worth knowing:
+
+- **`table_open` was NOT changed.** At depth 1 a path IS a single name, so its signature holds until
+  slice 2 actually nests — which kept this slice to TWO surfaces (`catalog_schemas`, `catalog_tables`)
+  instead of four. `catalog_functions` / `catalog_macros` / `catalog_views` stay flat for the same reason:
+  functions, macros and views live in TOP-LEVEL schemas, and nothing yet puts them deeper.
+- **The managed contract migrated by DIM, so NO out-of-tree plugin breaks.** `GetSchemaPaths()` /
+  `GetTablePaths()` default to `SchemaPathAdapter.WidenFirstColumn(GetSchemas()/GetTables())`, wrapping a
+  flat name as a depth-1 path. A provider that has never heard of paths is unaffected and needs no repin —
+  which matters because the four plugins pin `Fabricator.Abstractions` by SHA. Only a nesting provider
+  overrides. Same idiom as `Initialize()` and the 3-arg `OpenCatalog`.
+
+**⚠⚠ THE SLICE SHIPPED A USE-AFTER-FREE FIRST, AND THE TIER'S FAILURE SHAPE IS WHAT NAMED IT — 69 of 82
+hermetic suites failed with `failed to read metadata batch`.** The adapter wrapped the source batch in
+`using` while handing its columns 1.. to the new `RecordBatch` BY REFERENCE; `RecordBatch.Dispose()`
+disposes its columns, so the returned batch pointed at freed arrays.
+- **The asymmetry is the diagnosis**: `catalog_schemas` has ONE column and worked (its only column is
+  freshly built and shares nothing); `catalog_tables` has THREE and failed. A one-provider smoke test
+  would have passed.
+- The LOG was the discriminator rather than the error text: both crossings were recorded with NO
+  `SetError`, so the ABI call itself had succeeded and the fault was in pulling a batch — i.e. in the
+  adapter, not the wiring.
+- ⇒ ownership of the shared columns passes to the returned batch, and the missing `using` carries the
+  measurement beside it so it is not "tidied up" later.
+- ⇒ **this is the argument for the slice being behaviour-neutral by design**: it was a lifetime error in
+  a pure refactor, and had it been bundled with the tree and Delta's discovery there would have been no
+  assertion-identical baseline to test it against.
+
+Gates: hermetic **82/82 — 10089** and service **60/60 — 3593**, BOTH identical to the pre-slice counts,
+which is the neutrality claim.
+
+### Slice 1 — as originally planned
 
 Carry a path everywhere, with **every provider still emitting depth-1 paths**, so nothing nests yet.
 

@@ -328,6 +328,33 @@ public interface IProviderCatalog : IDisposable
     /// provider-side (they bound ENUMERATION only, never targeted access).</summary>
     IArrowArrayStream GetTables();
 
+    /// <summary>
+    /// Catalog discovery — the schemas, as PATHS: one <c>LIST&lt;VARCHAR&gt;</c> column, outermost element
+    /// first, so <c>["a","b"]</c> is schema <c>b</c> nested inside <c>a</c> (DuckDB 2.0 nested schemas).
+    /// </summary>
+    /// <remarks>
+    /// <para>⚠⚠ THE DEFAULT ADAPTS <see cref="GetSchemas"/>, WHICH IS WHY THIS IS NOT A BREAKING CHANGE.
+    /// A provider that has not heard of paths keeps returning flat names and this wraps each one as a
+    /// single-element path — identical behaviour, and the four OUT-OF-TREE PLUGINS (which pin
+    /// <c>Fabricator.Abstractions</c> by SHA and cannot be edited from here) keep working untouched.
+    /// Override only to express real nesting.</para>
+    /// <para>⚠ Overriding is not enough on its own: the host only treats a deeper path as nesting when the
+    /// catalog also reports <c>supports_nested_schemas</c> in its capability doc. A provider whose
+    /// namespace is genuinely two-part (SQL Server, Fabric's <c>Tables/</c>) must do NEITHER.</para>
+    /// <para>⚠ A path is structural rather than a dotted string ON PURPOSE: a schema name may legitimately
+    /// contain a dot, so any encoding would have to be escaped and un-escaped at every boundary, and a
+    /// provider that forgot would silently split one schema into two.</para>
+    /// </remarks>
+    IArrowArrayStream GetSchemaPaths() => SchemaPathAdapter.WidenFirstColumn(GetSchemas(), "schema_path");
+
+    /// <summary>
+    /// Catalog discovery — the tables, with the schema as a PATH: <c>LIST&lt;VARCHAR&gt;</c> schema_path,
+    /// then the UTF-8 table and type (<c>"BASE TABLE"|"VIEW"</c>) columns.
+    /// </summary>
+    /// <remarks>As <see cref="GetSchemaPaths"/>: the default adapts <see cref="GetTables"/> by wrapping its
+    /// flat schema column as a single-element path, so an un-migrated provider is unaffected.</remarks>
+    IArrowArrayStream GetTablePaths() => SchemaPathAdapter.WidenFirstColumn(GetTables(), "schema_path");
+
     /// <summary>Discovered/declared routines: schema, name, kind, param_count, return_type (the host reads
     /// the first three).</summary>
     IArrowArrayStream GetFunctions();

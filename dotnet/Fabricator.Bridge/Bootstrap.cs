@@ -91,7 +91,7 @@ public static unsafe class Bootstrap
                             () => OneRowStream(probeSchema, Interlocked.Increment(ref _lazyOpens) - 1),
                             probeSchema);
 
-        vtable->AbiVersion = 89;
+        vtable->AbiVersion = 90;
         vtable->OpenCatalog = &OpenCatalog;
         vtable->CloseCatalog = &CloseCatalog;
         vtable->ExecuteQuery = &ExecuteQuery;
@@ -482,11 +482,11 @@ public static unsafe class Bootstrap
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
     private static int CatalogSchemas(nint handle, CArrowArrayStream* outStream, byte** err) =>
-        CatalogList(handle, outStream, err, "catalog_schemas", c => c.GetSchemas());
+        CatalogList(handle, outStream, err, "catalog_schemas", c => c.GetSchemaPaths());
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
     private static int CatalogTables(nint handle, CArrowArrayStream* outStream, byte** err) =>
-        CatalogList(handle, outStream, err, "catalog_tables", c => c.GetTables());
+        CatalogList(handle, outStream, err, "catalog_tables", c => c.GetTablePaths());
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
     private static int CatalogFunctions(nint handle, CArrowArrayStream* outStream, byte** err) =>

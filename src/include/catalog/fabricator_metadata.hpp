@@ -67,6 +67,20 @@ struct FabricatorCapabilities {
 //! catching and leaving every capability off.
 FabricatorCapabilities FetchCapabilities(FabricatorHandle handle);
 
+//! A discovery stream whose FIRST column is a `LIST<VARCHAR>` SCHEMA PATH (outermost element first) and
+//! whose remaining columns are UTF-8.
+struct PathTable {
+	//! One path per row. An EMPTY path means the row carried a NULL schema — distinct from a path of one
+	//! empty name, which is a schema whose name is the empty string.
+	vector<vector<string>> paths;
+	//! Columns 1.. of the stream, each indexed by row (so `columns[0]` is the stream's SECOND column).
+	vector<vector<string>> columns;
+};
+
+//! Reads a path-leading discovery stream. A SIBLING of `ReadStringTable` rather than a widening of it:
+//! that one's contract is "all UTF-8 columns" and eight call sites rely on it.
+PathTable ReadPathTable(ArrowArrayStream &stream, idx_t expected_cols);
+
 //! Discovers user tables + views across all schemas.
 vector<FabricatorTableInfo> DiscoverTables(FabricatorHandle handle);
 

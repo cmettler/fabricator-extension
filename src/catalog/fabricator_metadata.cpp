@@ -40,6 +40,97 @@ static string GetUtf8(const ArrowArray &column, int64_t row) {
 	return string(data + start, static_cast<size_t>(end - start));
 }
 
+// Reads one LIST<VARCHAR> cell — a SCHEMA PATH, outermost element first — from a column array.
+//
+// ⚠⚠ THIS EXISTS RATHER THAN WIDENING ReadStringTable, WHICH IS DELIBERATE. That function's contract is
+// "all UTF-8 columns" and EIGHT call sites depend on it; teaching it a second column shape would make
+// every one of them carry a per-column type decision, and this file already records an out-of-bounds
+// hazard in that area. A sibling keeps the string path byte-identical.
+//
+// ⚠ A NULL list is NO path (an empty vector), NOT a path of one empty name. The managed adapter
+// (SchemaPathAdapter) makes the same distinction in the other direction, so "this row has no schema" and
+// "this row's schema is unnamed" stay different facts.
+static vector<string> GetUtf8Path(const ArrowArray &column, int64_t row) {
+	vector<string> path;
+	int64_t i = column.offset + row;
+	if (column.buffers[0]) {
+		auto validity = reinterpret_cast<const uint8_t *>(column.buffers[0]);
+		if (!(validity[i / 8] & (1u << (i % 8)))) {
+			return path;
+		}
+	}
+	// A list column is [validity, offsets] with ONE child holding the concatenated elements; the child's
+	// own offset must be added, because a sliced batch shifts the child rather than the offsets.
+	auto offsets = reinterpret_cast<const int32_t *>(column.buffers[1]);
+	int32_t start = offsets[i];
+	int32_t end = offsets[i + 1];
+	if (column.n_children < 1 || !column.children || !column.children[0]) {
+		throw IOException("fabricator: schema path column has no child array");
+	}
+	const ArrowArray &elements = *column.children[0];
+	for (int32_t e = start; e < end; e++) {
+		path.push_back(GetUtf8(elements, e - static_cast<int32_t>(elements.offset)));
+	}
+	return path;
+}
+
+// A discovery stream whose FIRST column is a LIST<VARCHAR> schema path and whose remaining columns are
+// UTF-8. Returns the paths plus the trailing columns, each indexed by row.
+PathTable ReadPathTable(ArrowArrayStream &stream, idx_t expected_cols) {
+	PathTable result;
+	for (idx_t c = 1; c < expected_cols; c++) {
+		result.columns.emplace_back();
+	}
+
+	ArrowSchema schema;
+	std::memset(&schema, 0, sizeof(schema));
+	if (stream.get_schema(&stream, &schema) != 0) {
+		if (stream.release) {
+			stream.release(&stream);
+		}
+		throw IOException("fabricator: failed to read metadata schema");
+	}
+	if (schema.release) {
+		schema.release(&schema);
+	}
+
+	for (;;) {
+		ArrowArray batch;
+		std::memset(&batch, 0, sizeof(batch));
+		if (stream.get_next(&stream, &batch) != 0) {
+			if (stream.release) {
+				stream.release(&stream);
+			}
+			throw IOException("fabricator: failed to read metadata batch");
+		}
+		if (!batch.release) {
+			break; // end of stream
+		}
+		// Width checked before dereferencing children[], per BATCH, exactly as ReadStringTable does and for
+		// the same reason — a mis-shaped provider batch must fail as a message, not an out-of-bounds read.
+		if (batch.length > 0 && batch.n_children < static_cast<int64_t>(expected_cols)) {
+			batch.release(&batch);
+			if (stream.release) {
+				stream.release(&stream);
+			}
+			throw IOException("fabricator: metadata batch has %lld columns, expected at least %llu",
+			                  static_cast<long long>(batch.n_children),
+			                  static_cast<unsigned long long>(expected_cols));
+		}
+		for (int64_t row = 0; row < batch.length; row++) {
+			result.paths.push_back(GetUtf8Path(*batch.children[0], row));
+			for (idx_t c = 1; c < expected_cols; c++) {
+				result.columns[c - 1].push_back(GetUtf8(*batch.children[c], row));
+			}
+		}
+		batch.release(&batch);
+	}
+	if (stream.release) {
+		stream.release(&stream);
+	}
+	return result;
+}
+
 vector<vector<string>> ReadStringTable(ArrowArrayStream &stream, idx_t expected_cols) {
 	vector<vector<string>> result;
 	for (idx_t c = 0; c < expected_cols; c++) {
@@ -106,8 +197,16 @@ vector<string> DiscoverSchemas(FabricatorHandle handle) {
 	ArrowArrayStream stream;
 	std::memset(&stream, 0, sizeof(stream));
 	fabricator::CatalogSchemas(handle, stream);
-	auto rows = ReadStringTable(stream, 1);
-	return rows[0];
+	// Depth-1 paths today: every provider emits single-element paths (the SchemaPathAdapter default), so
+	// this flattens to the name. Slice 2 is where a deeper path becomes a nested schema entry rather than
+	// being joined here -- see docs/nested-schemas.md.
+	auto table = ReadPathTable(stream, 1);
+	vector<string> names;
+	names.reserve(table.paths.size());
+	for (auto &path : table.paths) {
+		names.push_back(path.empty() ? string() : path.back());
+	}
+	return names;
 }
 
 // RAII over a parsed yyjson document (yyjson_doc_free tolerates null).
@@ -153,11 +252,13 @@ vector<FabricatorTableInfo> DiscoverTables(FabricatorHandle handle) {
 	ArrowArrayStream stream;
 	std::memset(&stream, 0, sizeof(stream));
 	fabricator::CatalogTables(handle, stream);
-	auto rows = ReadStringTable(stream, 3);
+	auto table = ReadPathTable(stream, 3);
 
 	vector<FabricatorTableInfo> tables;
-	for (idx_t i = 0; i < rows[0].size(); i++) {
-		tables.push_back({rows[0][i], rows[1][i], rows[2][i]});
+	for (idx_t i = 0; i < table.paths.size(); i++) {
+		// As DiscoverSchemas: depth-1 for now, so the leaf IS the schema name.
+		auto &path = table.paths[i];
+		tables.push_back({path.empty() ? string() : path.back(), table.columns[0][i], table.columns[1][i]});
 	}
 	return tables;
 }
