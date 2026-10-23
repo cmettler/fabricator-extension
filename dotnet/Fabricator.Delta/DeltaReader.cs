@@ -3132,8 +3132,18 @@ internal static class DeltaReader
         // PINNED snapshot, so the commit's validation is unchanged; the only difference is that it stays open
         // across the read-back, holding a pin it already held. (Nothing re-opens the table in between, so
         // WriteDataFilesAsync' own CurrentSnapshot read is the same snapshot for every group.)
+        // ⚠⚠ NULL, NOT WriteSerializable, AND THAT IS A CORRECTNESS CHOICE SINCE EW 987a0ce. The table's
+        // delta.isolationLevel is a DEMAND ON EVERY WRITER: a caller may ask for a STRONGER level, and a
+        // weaker one is now refused with ArgumentException (deterministically, before the contention check,
+        // so it cannot read as intermittent). Passing an explicit WriteSerializable therefore stakes the
+        // write on OUR parser agreeing with EW's about what the table declares — and a disagreement (an
+        // unusual key casing, a spelling one side strips and the other does not) would fail every write to
+        // that table. Null delegates the question to EW, which reads the property itself.
+        // ⚠ Asking for Serializable stays safe by construction: the table can only demand WriteSerializable
+        // or Serializable, so Serializable is never the weaker request. That is the ATTACH-level
+        // `isolation_level 'serializable'` raising an undeclared table, which null alone would not do.
         await using var txn = table.StartTransaction(
-            snapshot, serializable ? IsolationLevel.Serializable : IsolationLevel.WriteSerializable);
+            snapshot, serializable ? IsolationLevel.Serializable : null);
         txn.Operation = "UPDATE";
 
         // ⚠ THE ALL-OR-NOTHING ROW-ID RULE NOW HAS TO BE DECIDED UP FRONT, BECAUSE A GROUP IS WRITTEN BEFORE
