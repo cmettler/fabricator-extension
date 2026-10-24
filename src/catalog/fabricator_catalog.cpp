@@ -36,6 +36,7 @@
 #include "duckdb/planner/parsed_data/bound_create_table_info.hpp"
 #include "duckdb/planner/operator/logical_delete.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
+#include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/common/enums/logical_operator_type.hpp"
 #include "duckdb/common/printer.hpp"
 #include <cstdlib>
@@ -734,37 +735,43 @@ static void DmlTrace(const string &message) {
 	}
 }
 
-static optional_ptr<PhysicalOperator> TryPlanDeleteWhere(ClientContext &context, PhysicalPlanGenerator &planner,
-                                                         LogicalDelete &op, Catalog &catalog,
-                                                         FabricatorHandle catalog_handle) {
-	if (op.return_chunk) {
-		DmlTrace("rowid path: RETURNING");
-		return nullptr; // RETURNING needs the deleted rows themselves
-	}
-	// The kill switch, and the reference oracle the differential gate runs against. Absent (no bridge) or on
-	// => the shortcut is allowed.
+// The kill switch, and the reference oracle the differential gates run against. Absent (no bridge) or on
+// => the shortcut is allowed.
+static bool DmlPushdownEnabled(ClientContext &context) {
 	Value enabled;
 	if (context.TryGetCurrentSetting("fabricator_dml_pushdown", enabled) && !enabled.IsNull() &&
 	    !enabled.GetValue<bool>()) {
 		DmlTrace("rowid path: fabricator_dml_pushdown = false");
-		return nullptr;
+		return false;
 	}
-	if (&op.table.ParentCatalog() != &catalog || op.children.size() != 1) {
-		DmlTrace("rowid path: not this catalog's single-child DELETE");
-		return nullptr;
-	}
-	// The ONE shape: [FILTER] -> scan of this very table. Anything else (a join for USING / IN (subquery),
-	// a projection, a second relation) keeps the rowid path. Measured on 2.0: the WHOLE WHERE survives as the
-	// FILTER's expressions because our pushdown never erases what it pushes.
-	auto *node = op.children[0].get();
-	vector<unique_ptr<Expression>> no_filters;
-	vector<unique_ptr<Expression>> *filters = &no_filters;
+	return true;
+}
+
+// The ONE shape both statements accept below their own top: [FILTER] -> a scan of this very table. Anything
+// else (a join for USING / FROM / IN (subquery), a second relation) keeps the rowid path. Measured on 2.0: the
+// WHOLE WHERE survives as the FILTER's expressions because our pushdown never erases what it pushes.
+// Returns the scan and points `filters` at the predicate (an empty list when there is no FILTER).
+// `filter_map` receives the FILTER's projection map, or null. ⚠ The FILTER's own expressions read the SCAN's
+// output, but its OUTPUT is narrowed by that map (plan_filter.cpp turns it into a projection), so anything
+// ABOVE it — an UPDATE's SET values — indexes the narrowed list and must be remapped through it before a
+// position means a scan column. Measured: `UPDATE … SET n = n + 1, v = 'z' WHERE id > 1` carries one.
+static optional_ptr<LogicalGet> FindExactScan(LogicalOperator &child, TableCatalogEntry &table,
+                                              vector<unique_ptr<Expression>> *&filters,
+                                              vector<unique_ptr<Expression>> &no_filters,
+                                              const vector<ProjectionIndex> *&filter_map) {
+	auto *node = &child;
+	filters = &no_filters;
+	filter_map = nullptr;
 	if (node->type == LogicalOperatorType::LOGICAL_FILTER) {
-		filters = &node->expressions;
+		auto &filter = node->Cast<LogicalFilter>();
 		if (node->children.size() != 1) {
 			DmlTrace("rowid path: filter with several children");
 			return nullptr;
 		}
+		if (filter.HasProjectionMap()) {
+			filter_map = &filter.projection_map;
+		}
+		filters = &node->expressions;
 		node = node->children[0].get();
 	}
 	if (node->type != LogicalOperatorType::LOGICAL_GET) {
@@ -772,37 +779,66 @@ static optional_ptr<PhysicalOperator> TryPlanDeleteWhere(ClientContext &context,
 		return nullptr;
 	}
 	auto &get = node->Cast<LogicalGet>();
-	if (get.GetTable().get() != &op.table) {
-		DmlTrace("rowid path: the scan is not of the DELETE's table");
+	if (get.GetTable().get() != &table) {
+		DmlTrace("rowid path: the scan is not of the statement's table");
 		return nullptr;
 	}
 	if (get.table_filters.HasFilters()) {
 		DmlTrace("rowid path: filters were erased into the scan");
 		return nullptr; // a filter erased into the scan would be invisible here, so never skip past one
 	}
+	return &get;
+}
+
+static string RenderPredicate(const vector<unique_ptr<Expression>> &filters) {
+	string predicate;
+	for (auto &f : filters) {
+		predicate += predicate.empty() ? "" : " AND ";
+		predicate += f->ToString();
+	}
+	return predicate;
+}
+
+static optional_ptr<PhysicalOperator> TryPlanDeleteWhere(ClientContext &context, PhysicalPlanGenerator &planner,
+                                                         LogicalDelete &op, Catalog &catalog,
+                                                         FabricatorHandle catalog_handle) {
+	if (op.return_chunk) {
+		DmlTrace("rowid path: RETURNING");
+		return nullptr; // RETURNING needs the deleted rows themselves
+	}
+	if (!DmlPushdownEnabled(context)) {
+		return nullptr;
+	}
+	if (&op.table.ParentCatalog() != &catalog || op.children.size() != 1) {
+		DmlTrace("rowid path: not this catalog's single-child DELETE");
+		return nullptr;
+	}
+	vector<unique_ptr<Expression>> no_filters;
+	vector<unique_ptr<Expression>> *filters = nullptr;
+	const vector<ProjectionIndex> *filter_map = nullptr; // irrelevant here: a DELETE reads nothing above it
+	auto get = FindExactScan(*op.children[0], op.table, filters, no_filters, filter_map);
+	if (!get) {
+		return nullptr;
+	}
 	auto &entry = op.table.Cast<FabricatorTableEntry>();
 	string json;
 	vector<Value> constants;
-	if (!FabricatorSerializeExactFilter(get, *filters, json, constants)) {
+	if (!FabricatorSerializeExactFilter(*get, *filters, json, constants)) {
 		DmlTrace("rowid path: the predicate does not render exactly");
 		return nullptr;
 	}
-	// Asked LAST: it is the one crossing on this path (cached per entry after the first DELETE).
-	if (!entry.SupportsDeleteWhere()) {
+	// Asked LAST: it is the one crossing on this path (cached per entry after the first DELETE/UPDATE).
+	if (!entry.DmlCapabilities().delete_where) {
 		DmlTrace("rowid path: the table does not support predicate DELETE");
 		return nullptr;
 	}
 	string spec = json.empty() ? "{}" : "{\"filter\":" + json + "}";
-	string predicate;
-	for (auto &f : *filters) {
-		predicate += predicate.empty() ? "" : " AND ";
-		predicate += f->ToString();
-	}
 	DmlTrace("delete-where: " + spec);
 	vector<LogicalType> result_types {LogicalType::BIGINT};
-	return planner.Make<FabricatorPhysicalDeleteWhere>(std::move(result_types), op.estimated_cardinality,
-	                                                   catalog_handle, entry.TableHandle(), std::move(spec),
-	                                                   std::move(constants), std::move(predicate));
+	return planner.Make<FabricatorPhysicalDmlWhere>(std::move(result_types), op.estimated_cardinality,
+	                                                catalog_handle, entry.TableHandle(), std::move(spec),
+	                                                std::move(constants), RenderPredicate(*filters),
+	                                                /*is_update=*/false, string());
 }
 
 PhysicalOperator &FabricatorCatalog::PlanDelete(ClientContext &context, PhysicalPlanGenerator &planner,
@@ -811,6 +847,109 @@ PhysicalOperator &FabricatorCatalog::PlanDelete(ClientContext &context, Physical
 		return *shortcut;
 	}
 	return Catalog::PlanDelete(context, planner, op);
+}
+
+// The UPDATE twin (ABI v94). Its child is ONE projection — the SET values, then the rowid — over the same
+// [FILTER] -> scan the DELETE takes (measured on 2.0: `UPDATE … SET n = n + 1 WHERE id > 5` plans as
+// UPDATE -> PROJECTION((n + 1), rowid) -> FILTER -> SCAN; the optimizer folds the binder's second projection
+// away). Each SET value must render exactly too (FabricatorSerializeExactValue); one that does not sends the
+// whole statement to the rowid path, exactly like a predicate conjunct.
+static optional_ptr<PhysicalOperator> TryPlanUpdateWhere(ClientContext &context, PhysicalPlanGenerator &planner,
+                                                         LogicalUpdate &op, Catalog &catalog,
+                                                         FabricatorHandle catalog_handle) {
+	if (op.return_chunk || op.capture_old_rows) {
+		DmlTrace("rowid path: RETURNING");
+		return nullptr;
+	}
+	if (!DmlPushdownEnabled(context)) {
+		return nullptr;
+	}
+	if (&op.table.ParentCatalog() != &catalog || op.children.size() != 1 ||
+	    op.columns.size() != op.expressions.size() || op.columns.empty()) {
+		DmlTrace("rowid path: not this catalog's single-child UPDATE");
+		return nullptr;
+	}
+	auto &proj = *op.children[0];
+	if (proj.type != LogicalOperatorType::LOGICAL_PROJECTION || proj.children.size() != 1) {
+		DmlTrace("rowid path: UPDATE child is " + LogicalOperatorToString(proj.type) + ", not one projection");
+		return nullptr;
+	}
+	vector<unique_ptr<Expression>> no_filters;
+	vector<unique_ptr<Expression>> *filters = nullptr;
+	const vector<ProjectionIndex> *filter_map = nullptr;
+	auto get = FindExactScan(*proj.children[0], op.table, filters, no_filters, filter_map);
+	if (!get) {
+		return nullptr;
+	}
+	auto &entry = op.table.Cast<FabricatorTableEntry>();
+	string filter_json;
+	vector<Value> constants;
+	if (!FabricatorSerializeExactFilter(*get, *filters, filter_json, constants)) {
+		DmlTrace("rowid path: the predicate does not render exactly");
+		return nullptr;
+	}
+	auto names = op.table.GetColumns().GetColumnNames();
+	string set_json = "[";
+	string assignments;
+	for (idx_t i = 0; i < op.columns.size(); i++) {
+		// op.expressions[i] is a position in the PROJECTION's output (the same rule the rowid path reads,
+		// FabricatorFillUpdateSetColumns); the value itself is that projection expression.
+		auto &ref = *op.expressions[i];
+		if (ref.GetExpressionType() != ExpressionType::BOUND_REF) {
+			DmlTrace("rowid path: SET target is not a projection reference");
+			return nullptr;
+		}
+		auto pos = ref.Cast<BoundReferenceExpression>().Index();
+		if (pos >= proj.expressions.size() || op.columns[i].index >= names.size()) {
+			DmlTrace("rowid path: SET target out of range");
+			return nullptr;
+		}
+		auto &value = *proj.expressions[pos];
+		// The value reads the FILTER's output; turn each position into the scan-output position it came from
+		// (a copy — the logical plan is still DuckDB's, and the rowid path may yet need it unchanged).
+		auto mapped = value.Copy();
+		bool mapped_ok = true;
+		if (filter_map) {
+			ExpressionIterator::VisitExpressionMutable<BoundReferenceExpression>(
+			    mapped, [&](BoundReferenceExpression &ref, unique_ptr<Expression> &) {
+				    if (ref.Index() >= filter_map->size()) {
+					    mapped_ok = false;
+					    return;
+				    }
+				    ref.IndexMutable() = (*filter_map)[ref.Index()].GetIndex();
+			    });
+		}
+		string value_json;
+		if (!mapped_ok || !FabricatorSerializeExactValue(*get, *mapped, value_json, constants)) {
+			DmlTrace("rowid path: a SET value does not render exactly");
+			return nullptr;
+		}
+		auto &col = names[op.columns[i].index];
+		set_json += i ? ",{\"col\":" : "{\"col\":";
+		set_json += "\"" + fabricator::EscapeJsonString(col) + "\"";
+		set_json += ",\"value\":" + value_json + "}";
+		assignments += (i ? ", " : "") + col + " = " + value.ToString();
+	}
+	set_json += "]";
+	if (!entry.DmlCapabilities().update_where) {
+		DmlTrace("rowid path: the table does not support predicate UPDATE");
+		return nullptr;
+	}
+	string spec = "{\"set\":" + set_json + (filter_json.empty() ? "" : ",\"filter\":" + filter_json) + "}";
+	DmlTrace("update-where: " + spec);
+	vector<LogicalType> result_types {LogicalType::BIGINT};
+	return planner.Make<FabricatorPhysicalDmlWhere>(std::move(result_types), op.estimated_cardinality,
+	                                                catalog_handle, entry.TableHandle(), std::move(spec),
+	                                                std::move(constants), RenderPredicate(*filters),
+	                                                /*is_update=*/true, std::move(assignments));
+}
+
+PhysicalOperator &FabricatorCatalog::PlanUpdate(ClientContext &context, PhysicalPlanGenerator &planner,
+                                              LogicalUpdate &op) {
+	if (auto shortcut = TryPlanUpdateWhere(context, planner, op, *this, handle_)) {
+		return *shortcut;
+	}
+	return Catalog::PlanUpdate(context, planner, op);
 }
 
 PhysicalOperator &FabricatorCatalog::PlanDelete(ClientContext &context, PhysicalPlanGenerator &planner,

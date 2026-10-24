@@ -1151,27 +1151,31 @@ typedef struct FabricatorVTable {
 	int32_t (*lateral_bind_close)(FabricatorHandle binding, char **err);
 
 	// -------------------------------------------------------------------------
-	// PREDICATE DML on the table session — ABI v93. A DELETE whose whole predicate renders EXACTLY runs as
-	// ONE provider statement (`DELETE FROM t WHERE …`) instead of scanning rowids and deleting by key.
-	// The host decides at PLAN time (FabricatorCatalog's plan-less PlanDelete), so both entries are lazy:
-	// neither is called during catalog enumeration.
+	// PREDICATE DML on the table session — ABI v93 (DELETE), v94 (UPDATE). A DELETE or UPDATE whose whole
+	// predicate — and, for UPDATE, every SET value — renders EXACTLY runs as ONE provider statement instead of
+	// scanning rowids and writing by key. The host decides at PLAN time (FabricatorCatalog's plan-less
+	// PlanDelete/PlanUpdate), so both entries are lazy: neither is called during catalog enumeration.
 	// -------------------------------------------------------------------------
 
 	// The table's DML capabilities as ONE JSON doc, owned UTF-8 in *out_json (host frees via free_error):
-	// {"delete_where": bool}. An absent key means false, so the doc can grow without a bump. Asked when a
-	// DELETE against the table is PLANNED, never at enumeration — a provider may probe here (SQL Server
-	// asks whether the table is an EXTERNAL table, whose DELETE is routed to storage instead).
+	// {"delete_where": bool, "update_where": bool}. An absent key means false, so the doc can grow without a
+	// bump. Asked when a DELETE/UPDATE against the table is PLANNED, never at enumeration — a provider may
+	// probe here (SQL Server asks whether the table is an EXTERNAL table, whose DML is routed to storage).
 	int32_t (*table_dml_info)(FabricatorHandle table, char **out_json, char **err);
 
-	// Delete every row matching the predicate in ONE statement. `spec_json` = {"filter": <FilterNode>} or
-	// {} for an unconditional DELETE; `filter_values` = the one-row constant batch the filter references by
-	// index (consumed by the managed side; may be NULL when there is no filter). *affected receives the
-	// provider's own count of deleted rows.
-	// ⚠ THE HOST ONLY SENDS AN EXACT PREDICATE — unlike a scan's filter, which may be a SUPERSET because
-	// DuckDB re-applies it, nothing re-checks a delete. Every conjunct must have rendered, and the callee
-	// must render every node it receives or FAIL; it must never drop one.
-	int32_t (*table_delete_where)(FabricatorHandle table, const char *spec_json,
-	                              struct ArrowArrayStream *filter_values, int64_t *affected, char **err);
+	// Run ONE predicate statement. `spec_json` = {"filter": <FilterNode>} (absent = every row), plus for an
+	// UPDATE "set": [{"col": name, "value": <value node>}] — its PRESENCE is what makes the statement an
+	// UPDATE, so a spec without it is a DELETE. A value node is {"op":"const","val":i} | {"op":"col","col":x}
+	// | {"op":"+|-|*","children":[a,b]}. `filter_values` = the one-row constant batch the filter AND the set
+	// values reference by index (consumed by the managed side; may be NULL). *affected = the provider's own
+	// count of rows written.
+	// ⚠ THE HOST ONLY SENDS EXACT TREES — unlike a scan's filter, which may be a SUPERSET because DuckDB
+	// re-applies it, nothing re-checks a write. Every node must have rendered, and the callee must render
+	// every node it receives or FAIL; it must never drop one.
+	// ⚠ v93 called this `table_delete_where` with no "set"; the bump to v94 is load-bearing, because a v93
+	// bridge handed an UPDATE spec would have run it as a DELETE.
+	int32_t (*table_dml_where)(FabricatorHandle table, const char *spec_json,
+	                           struct ArrowArrayStream *filter_values, int64_t *affected, char **err);
 } FabricatorVTable;
 
 // -----------------------------------------------------------------------------
@@ -1408,7 +1412,7 @@ typedef struct FabricatorHostServices {
 // state blob is this many bytes + a 4-byte length prefix). Serialize() must fit within it.
 #define FABRICATOR_AGG_SPILL_CAP 1024
 
-#define FABRICATOR_ABI_VERSION 93
+#define FABRICATOR_ABI_VERSION 94
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(FabricatorVTable) as seen

@@ -194,4 +194,18 @@ public interface ITableBinding : IDisposable
     /// which every conjunct rendered exactly — render every node or THROW, never drop one.</remarks>
     long DeleteWhere(FilterNode? filter, IArrowArrayStream? filterValues) =>
         throw new NotSupportedException("fabricator: this table does not support predicate DELETE");
+
+    /// <summary>Whether <see cref="UpdateWhere"/> can run an UPDATE on this table as ONE statement (ABI v94).
+    /// False by default — the rowid path. Asked when an UPDATE is PLANNED, never during enumeration.</summary>
+    bool SupportsUpdateWhere => false;
+
+    /// <summary>Apply <paramref name="set"/> to every row matching <paramref name="filter"/> (null = every row) in
+    /// ONE statement, on the AMBIENT transaction, and return the provider's own count of updated rows. The filter
+    /// and the SET values reference their constants by index into <paramref name="filterValues"/> (a one-row
+    /// batch; consume and dispose it).</summary>
+    /// <remarks>⚠ EXACT, like <see cref="DeleteWhere"/>: render every filter node AND every value node, or throw.
+    /// The host only sends integer arithmetic (<c>+ - *</c>) in a value; its operands are columns or constants.
+    /// </remarks>
+    long UpdateWhere(IReadOnlyList<SetAssignment> set, FilterNode? filter, IArrowArrayStream? filterValues) =>
+        throw new NotSupportedException("fabricator: this table does not support predicate UPDATE");
 }

@@ -183,13 +183,29 @@ internal sealed class TableSession
         {
             json.WriteStartObject();
             json.WriteBoolean("delete_where", t.SupportsDeleteWhere);
+            json.WriteBoolean("update_where", t.SupportsUpdateWhere);
             json.WriteEndObject();
         }
         return Encoding.UTF8.GetString(buffer.ToArray());
     });
 
-    /// <summary>The <c>table_delete_where</c> answer (ABI v93). <paramref name="specJson"/> is
-    /// <c>{"filter": …}</c> or <c>{}</c> for an unconditional DELETE.</summary>
-    internal long DeleteWhere(string specJson, IArrowArrayStream? filterValues) =>
-        With(t => t.DeleteWhere(ScanSpec.Parse(specJson)?.Filter, filterValues));
+    /// <summary>The <c>table_dml_where</c> answer (ABI v94). <paramref name="specJson"/> is a
+    /// <see cref="DmlSpec"/>: a <c>"set"</c> makes it an UPDATE, its absence a DELETE; no <c>"filter"</c> means
+    /// every row.</summary>
+    internal long DmlWhere(string specJson, IArrowArrayStream? filterValues)
+    {
+        var spec = DmlSpec.Parse(specJson);
+        // The PRESENCE of "set" is what makes it an UPDATE (abi.h). An empty list never comes from the host;
+        // refuse it rather than reading it as a DELETE.
+        if (spec.Set is { } set)
+        {
+            if (set.Count == 0)
+            {
+                filterValues?.Dispose();
+                throw new InvalidOperationException("fabricator: predicate UPDATE without SET assignments");
+            }
+            return With(t => t.UpdateWhere(set, spec.Filter, filterValues));
+        }
+        return With(t => t.DeleteWhere(spec.Filter, filterValues));
+    }
 }

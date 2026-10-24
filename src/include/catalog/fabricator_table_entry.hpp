@@ -9,6 +9,7 @@
 #pragma once
 
 #include "fabricator/abi.h"
+#include "catalog/fabricator_metadata.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 
@@ -34,6 +35,9 @@ void FabricatorComplexFilterPushdown(ClientContext &context, LogicalGet &get, Fu
 //! first thing it cannot render exactly; true with an empty `json` means "no predicate".
 bool FabricatorSerializeExactFilter(LogicalGet &get, const vector<unique_ptr<Expression>> &filters, string &json,
                                     vector<Value> &constants);
+//! One UPDATE … SET value under the same exact rule (ABI v94): a value-node JSON tree whose constants are
+//! APPENDED to `constants`, so the predicate and every SET value share one value batch. False = not exact.
+bool FabricatorSerializeExactValue(LogicalGet &get, const Expression &value, string &json, vector<Value> &constants);
 
 class FabricatorTableEntry : public TableCatalogEntry {
 public:
@@ -112,10 +116,10 @@ public:
 	const LogicalType &RowIdType() const {
 		return rowid_type_;
 	}
-	//! Whether the provider can run a DELETE on this table as ONE predicate statement (ABI v93
-	//! `table_dml_info`). Asked lazily, at the first DELETE PLANNED against this entry — never during
+	//! Whether the provider can run a DELETE / an UPDATE on this table as ONE predicate statement (ABI v94
+	//! `table_dml_info`). Asked lazily, at the first DELETE/UPDATE PLANNED against this entry — never during
 	//! enumeration — and cached for the entry's life (an ALTER or a refresh rebuilds the entry).
-	bool SupportsDeleteWhere();
+	const FabricatorDmlCapabilities &DmlCapabilities();
 
 private:
 	//! Shared body of both GetScanFunction overloads; `at_clause` (nullable) is the time-travel snapshot.
@@ -145,9 +149,10 @@ private:
 	//! Guards the ONE lazy `table_stats` crossing that fills both fields above (was two crossings —
 	//! kinds 4 + 5 — with a flag each). The map may legitimately stay empty.
 	bool stats_fetched_ = false;
-	//! Guards the lazy `table_dml_info` crossing below; -1 = not asked yet, 0/1 = the answer.
+	//! Guards the lazy `table_dml_info` crossing below.
 	std::mutex dml_info_lock_;
-	int8_t delete_where_ = -1;
+	bool dml_caps_fetched_ = false;
+	FabricatorDmlCapabilities dml_caps_;
 };
 
 } // namespace duckdb

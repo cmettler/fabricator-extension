@@ -1420,7 +1420,10 @@ case "$TIER" in
         #   whole predicate renders exactly runs as ONE statement (ABI v93). The load-bearing section is a
         #   DIFFERENTIAL against fabricator_dml_pushdown=false, so a widened predicate shows as a count or
         #   contents mismatch. 3639 + 60 = 3699 exactly, so no other suite moved.
-        : "${MIN_ASSERTIONS:=3699}"
+        # 2026-10-24: 3699 -> 3770. verify_dml_pushdown_mssql 60 -> 131: the UPDATE twin (ABI v94) — routing per
+        #   refusal, an eleven-statement differential against the kill switch AND a native-DuckDB reference,
+        #   overflow atomicity, transactions, no-PK. 3699 + 71 = 3770 exactly, so no other suite moved.
+        : "${MIN_ASSERTIONS:=3770}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

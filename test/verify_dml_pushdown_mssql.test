@@ -1,6 +1,7 @@
 # name: test/verify_dml_pushdown_mssql.test
-# description: A DELETE whose WHOLE predicate renders exactly runs as ONE SQL Server statement — no scan, no
-#              rowid (ABI v93; FabricatorCatalog's plan-less PlanDelete + FabricatorPhysicalDeleteWhere).
+# description: A DELETE or UPDATE whose WHOLE predicate (and, for UPDATE, every SET value) renders exactly runs as
+#              ONE SQL Server statement — no scan, no rowid (ABI v93/v94; FabricatorCatalog's plan-less
+#              PlanDelete/PlanUpdate + FabricatorPhysicalDmlWhere).
 #              Everything else keeps the rowid path. Needs MSSQL_TESTDB_DSN.
 #
 #              ⚠⚠ THE LOAD-BEARING SECTION IS §2, AND IT IS A DIFFERENTIAL. A scan's pushed filter may be a
@@ -280,7 +281,295 @@ DELETE FROM db.dbo.dp_on WHERE id = 20 RETURNING id;
 ----
 RETURNING
 
-# ═══ §5  Cleanup ═══════════════════════════════════════════════════════════════════════════════════════
+# ═══ §5  UPDATE setup (ABI v94) ═════════════════════════════════════════════════════════════════════════
+# The same discipline for UPDATE: the SET values must render exactly too. Two identical tables again, with one
+# column per admitted type and every arithmetic operand type SQL Server produces (SMALLINT, tinyint as
+# UTINYINT, INTEGER, BIGINT). id 1..40; n = NULL when id % 7 = 0, else id % 5; s = id; b = id % 200;
+# flag = id % 2; amount = id * 1.25; d = 2026-01-01 + id days; v = 'v' || (id % 3); big = id * 100.
 
 statement ok
-SELECT fabricator_exec('db', 'DROP TABLE dbo.dp_on; DROP TABLE dbo.dp_off; DROP TABLE dbo.dp_heap;');
+SELECT fabricator_exec('db', 'DROP TABLE IF EXISTS dbo.du_on; DROP TABLE IF EXISTS dbo.du_off;');
+
+statement ok
+SELECT fabricator_exec('db', 'CREATE TABLE dbo.du_on (id INT PRIMARY KEY, n INT NULL, s SMALLINT, b TINYINT, flag BIT,
+  amount DECIMAL(10,2), d DATE, v VARCHAR(20), big BIGINT);
+INSERT INTO dbo.du_on SELECT value, CASE WHEN value % 7 = 0 THEN NULL ELSE value % 5 END, value, value % 200,
+  value % 2, value * 1.25, DATEADD(day, value, ''2026-01-01''), ''v'' + CAST(value % 3 AS VARCHAR), CAST(value AS BIGINT) * 100
+  FROM GENERATE_SERIES(1, 40);
+SELECT * INTO dbo.du_off FROM dbo.du_on; ALTER TABLE dbo.du_off ADD PRIMARY KEY (id);');
+
+statement ok
+SELECT fabricator_refresh_cache('db');
+
+# ═══ §6  UPDATE routing ═════════════════════════════════════════════════════════════════════════════════
+
+# Integer arithmetic over a column, a VARCHAR constant, an exact predicate: the shortcut.
+query II
+EXPLAIN UPDATE db.dbo.du_on SET n = n + 1, v = 'z' WHERE id > 30;
+----
+physical_plan	<REGEX>:.*Fabricator Update Where.*
+
+# DECIMAL arithmetic: the binder wraps it in a CAST, and decimal precision rules differ between the engines.
+query II
+EXPLAIN UPDATE db.dbo.du_on SET amount = amount + 1 WHERE id = 1;
+----
+physical_plan	<!REGEX>:.*Fabricator Update Where.*
+
+# A function in a SET value.
+query II
+EXPLAIN UPDATE db.dbo.du_on SET v = upper(v) WHERE id = 1;
+----
+physical_plan	<!REGEX>:.*Fabricator Update Where.*
+
+# Division: DuckDB's `/` is FLOAT division (and casts back), T-SQL's integer `/` truncates — never the same.
+query II
+EXPLAIN UPDATE db.dbo.du_on SET n = n / 2 WHERE id = 1;
+----
+physical_plan	<!REGEX>:.*Fabricator Update Where.*
+
+# A VARCHAR predicate, exactly as for DELETE.
+query II
+EXPLAIN UPDATE db.dbo.du_on SET n = 0 WHERE v = 'v1';
+----
+physical_plan	<!REGEX>:.*Fabricator Update Where.*
+
+# UPDATE … FROM (a join under the UPDATE).
+query II
+EXPLAIN UPDATE db.dbo.du_on AS t SET n = 0 FROM (SELECT 1 AS k) x WHERE t.id = x.k;
+----
+physical_plan	<!REGEX>:.*Fabricator Update Where.*
+
+statement ok
+SET fabricator_dml_pushdown = false;
+
+query II
+EXPLAIN UPDATE db.dbo.du_on SET n = n + 1 WHERE id > 30;
+----
+physical_plan	<!REGEX>:.*Fabricator Update Where.*
+
+statement ok
+SET fabricator_dml_pushdown = true;
+
+# ═══ §7  The UPDATE differential — shortcut vs rowid path ═════════════════════════════════════════════════
+# The counts are DuckDB's own answers for the same sequence on a native table, so they are an oracle for the
+# rowid path as much as for the shortcut. Statements 8 and 9 take the rowid path inside the sequence.
+
+query I
+UPDATE db.dbo.du_on SET n = n + 1 WHERE id > 30;
+----
+10
+
+query I
+UPDATE db.dbo.du_on SET v = 'x', flag = false WHERE n IS NULL;
+----
+5
+
+query I
+UPDATE db.dbo.du_on SET s = s * 2 - 1 WHERE id BETWEEN 5 AND 9;
+----
+5
+
+query I
+UPDATE db.dbo.du_on SET big = big * 1000 + id WHERE flag = true;
+----
+17
+
+query I
+UPDATE db.dbo.du_on SET amount = 9.99, d = DATE '2030-01-01' WHERE id IN (1, 2, 3);
+----
+3
+
+query I
+UPDATE db.dbo.du_on SET n = id WHERE id < 4 OR id = 40;
+----
+4
+
+query I
+UPDATE db.dbo.du_on SET n = NULL WHERE id = 20;
+----
+1
+
+query I
+UPDATE db.dbo.du_on SET amount = amount + 1 WHERE id = 10;
+----
+1
+
+query I
+UPDATE db.dbo.du_on SET n = 0 WHERE v = 'v1' AND id < 15;
+----
+4
+
+query I
+UPDATE db.dbo.du_on SET b = b + 1 WHERE id = 7;
+----
+1
+
+# The SET column is also the predicate's column: both engines read the PRE-update value.
+query I
+UPDATE db.dbo.du_on SET n = n + 10 WHERE n > 2;
+----
+15
+
+statement ok
+SET fabricator_dml_pushdown = false;
+
+query I
+UPDATE db.dbo.du_off SET n = n + 1 WHERE id > 30;
+----
+10
+
+query I
+UPDATE db.dbo.du_off SET v = 'x', flag = false WHERE n IS NULL;
+----
+5
+
+query I
+UPDATE db.dbo.du_off SET s = s * 2 - 1 WHERE id BETWEEN 5 AND 9;
+----
+5
+
+query I
+UPDATE db.dbo.du_off SET big = big * 1000 + id WHERE flag = true;
+----
+17
+
+query I
+UPDATE db.dbo.du_off SET amount = 9.99, d = DATE '2030-01-01' WHERE id IN (1, 2, 3);
+----
+3
+
+query I
+UPDATE db.dbo.du_off SET n = id WHERE id < 4 OR id = 40;
+----
+4
+
+query I
+UPDATE db.dbo.du_off SET n = NULL WHERE id = 20;
+----
+1
+
+query I
+UPDATE db.dbo.du_off SET amount = amount + 1 WHERE id = 10;
+----
+1
+
+query I
+UPDATE db.dbo.du_off SET n = 0 WHERE v = 'v1' AND id < 15;
+----
+4
+
+query I
+UPDATE db.dbo.du_off SET b = b + 1 WHERE id = 7;
+----
+1
+
+query I
+UPDATE db.dbo.du_off SET n = n + 10 WHERE n > 2;
+----
+15
+
+statement ok
+SET fabricator_dml_pushdown = true;
+
+query I
+SELECT count(*) FROM (SELECT * FROM db.dbo.du_on EXCEPT SELECT * FROM db.dbo.du_off);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT * FROM db.dbo.du_off EXCEPT SELECT * FROM db.dbo.du_on);
+----
+0
+
+# And against the native-table reference, column by column — so a defect both paths shared would show too.
+query IIIIIIIII
+SELECT count(*), sum(id), sum(n), sum(s), sum(b), sum(CAST(flag AS INTEGER)), sum(amount), max(d), sum(big)
+FROM db.dbo.du_on;
+----
+40	820	260	850	821	17	1048.47	2030-01-01	33748637
+
+# ═══ §8  A failing shortcut statement changes nothing ══════════════════════════════════════════════════════
+# 40 * 1000 overflows SMALLINT. SQL Server aborts the whole statement (8115), so no row moves, exactly as the
+# rowid path fails before writing anything.
+
+statement error
+UPDATE db.dbo.du_on SET s = s * 1000 WHERE id >= 30;
+----
+Arithmetic overflow
+
+query I
+SELECT sum(s) FROM db.dbo.du_on;
+----
+850
+
+# ═══ §9  UPDATE in a transaction ═══════════════════════════════════════════════════════════════════════════
+
+statement ok
+BEGIN;
+
+query I
+UPDATE db.dbo.du_on SET n = -1 WHERE id = 5;
+----
+1
+
+query I
+SELECT n FROM db.dbo.du_on WHERE id = 5;
+----
+-1
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT n FROM db.dbo.du_on WHERE id = 5;
+----
+0
+
+statement ok
+BEGIN;
+
+query I
+UPDATE db.dbo.du_on SET n = n + 100 WHERE id = 5;
+----
+1
+
+statement ok
+COMMIT;
+
+query I
+SELECT * FROM fabricator_query('db', 'SELECT n FROM dbo.du_on WHERE id = 5');
+----
+100
+
+# ═══ §10  UPDATE on a table with NO primary key, and RETURNING ═════════════════════════════════════════════
+
+statement ok
+SET fabricator_dml_pushdown = false;
+
+statement error
+UPDATE db.dbo.dp_heap SET n = 9 WHERE id = 2;
+----
+primary key
+
+statement ok
+SET fabricator_dml_pushdown = true;
+
+query I
+UPDATE db.dbo.dp_heap SET n = 9 WHERE id = 2;
+----
+1
+
+query I
+SELECT n FROM db.dbo.dp_heap WHERE id = 2;
+----
+9
+
+statement error
+UPDATE db.dbo.du_on SET n = 1 WHERE id = 1 RETURNING id;
+----
+RETURNING
+
+# ═══ §11  Cleanup ═══════════════════════════════════════════════════════════════════════════════════════
+
+statement ok
+SELECT fabricator_exec('db', 'DROP TABLE dbo.dp_on; DROP TABLE dbo.dp_off; DROP TABLE dbo.dp_heap; DROP TABLE dbo.du_on; DROP TABLE dbo.du_off;');

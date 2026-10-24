@@ -549,24 +549,33 @@ INSERT INTO mssql.dbo.target SELECT id, name FROM read_csv('data.csv');
 -- INSERT … RETURNING uses OUTPUT INSERTED, so server-side IDENTITY/DEFAULT values come back.
 INSERT INTO mssql.dbo.target (name) VALUES ('Carol') RETURNING id, name;
 
--- UPDATE needs a rowid (PK or unique index; compound keys supported).
-UPDATE mssql.dbo.people SET salary = salary * 1.1 WHERE id = 1;
--- A DELETE whose whole WHERE translates exactly runs as ONE statement on the server (no rowid needed).
+-- An UPDATE or DELETE whose WHERE (and SET) translates exactly runs as ONE statement on the server.
+UPDATE mssql.dbo.people SET level = level + 1, title = 'Senior' WHERE id = 1;
 DELETE FROM mssql.dbo.people WHERE id = 3;
+-- Anything else takes the row-id path, which needs a PK or unique index (compound keys supported).
+UPDATE mssql.dbo.people SET salary = salary * 1.1 WHERE id = 1;
 ```
 
 INSERT streams through `SqlBulkCopy` with `CheckConstraints` enabled, so a CHECK / FOREIGN KEY
 violation fails just like a classic INSERT (CTAS/COPY skip constraint checking for bulk-load speed).
 `IDENTITY` columns are preserved when the source supplies them (`KeepIdentity`) and auto-generated
-otherwise. UPDATE requires a primary key or unique index (otherwise use `fabricator_exec`); neither UPDATE
-nor DELETE supports RETURNING.
+otherwise. Neither UPDATE nor DELETE supports RETURNING.
 
-A DELETE runs as ONE `DELETE FROM … WHERE …` on SQL Server — no scan, no row ids, so it also works on a
-table without a key — when **every** part of its WHERE translates exactly: comparisons, `IN`, `BETWEEN`,
-`IS [NOT] NULL`, `AND`/`OR` over columns of type BOOLEAN, the integer types, DECIMAL or DATE. Anything else
-(a VARCHAR comparison, whose meaning depends on the server collation; a float or timestamp; a subquery; one
-untranslatable conjunct) takes the row-id path, which still needs a key. `EXPLAIN` shows
-`FABRICATOR_DELETE_WHERE` when the shortcut is used. `SET fabricator_dml_pushdown = false` turns it off.
+A DELETE or UPDATE runs as ONE `DELETE FROM … WHERE …` / `UPDATE … SET … WHERE …` on SQL Server — no scan,
+no row ids, so it also works on a table without a key — when **every** part of it translates exactly:
+
+- the WHERE: comparisons, `IN`, `BETWEEN`, `IS [NOT] NULL`, `AND`/`OR` over columns of type BOOLEAN, the
+  integer types, DECIMAL or DATE;
+- each SET value (UPDATE): a constant (strings included), a column of one of those types, or integer
+  `+ - *` over them.
+
+Anything else takes the row-id path, which needs a primary key or unique index (otherwise use
+`fabricator_exec`): a VARCHAR comparison, whose meaning depends on the server collation; a float or timestamp;
+a function, a cast, division or DECIMAL arithmetic in a SET value; a subquery, `UPDATE … FROM`, or one
+untranslatable part. `EXPLAIN` shows `FABRICATOR_DELETE_WHERE` / `FABRICATOR_UPDATE_WHERE` when the shortcut is
+used, and `SET fabricator_dml_pushdown = false` turns it off. ⚠ One difference remains by design: a nested
+integer expression whose intermediate result overflows the column type fails on the row-id path (DuckDB keeps
+the type) and may succeed on the shortcut (SQL Server may widen) — never two different successful results.
 
 `UPDATE … SET col = DEFAULT` is not supported — write the default value explicitly.
 
@@ -3938,7 +3947,7 @@ Settings the extension itself owns rather than a provider, so they exist even wh
 | Setting | Status | Description |
 |---------|--------|-------------|
 | `fabricator_allow_plugin_install` | **Active** | Whether `fabricator_install_plugin()` (see [Function Reference](#function-reference)) may write plugin assemblies into a plugin root. **Default `false`**: an installed plugin is loaded into this process and runs with the extension's privileges, so it is opt-in rather than something a SQL statement can arrange on its own. Session-scoped like every other setting, so `RESET` closes it again |
-| `fabricator_dml_pushdown` | **Active** | Run a DELETE whose whole WHERE translates exactly as ONE statement on the provider — no scan, no row ids (see [INSERT / UPDATE / DELETE](#insert--update--delete)). **Default `true`**; `false` sends every DELETE down the row-id path, which is also the reference the shortcut is tested against |
+| `fabricator_dml_pushdown` | **Active** | Run a DELETE or UPDATE whose whole WHERE (and SET) translates exactly as ONE statement on the provider — no scan, no row ids (see [INSERT / UPDATE / DELETE](#insert--update--delete)). **Default `true`**; `false` sends every DELETE and UPDATE down the row-id path, which is also the reference the shortcut is tested against |
 
 ### Delta read tuning
 

@@ -40,6 +40,30 @@ internal sealed class FilterWhereBuilder
         _ => throw new NotSupportedException($"fabricator: unsupported filter op '{node.Op}'"),
     };
 
+    /// <summary>
+    /// Renders one SET value of a predicate UPDATE (ABI v94). Exact, never best-effort: an unknown node throws,
+    /// and the statement fails rather than writing a different value.
+    /// </summary>
+    /// <remarks>Arithmetic is parenthesised so the tree's own grouping is what SQL Server evaluates; the host
+    /// only sends INTEGER operands, whose results agree between the engines whenever both succeed.</remarks>
+    public string BuildValue(ValueNode node) => node.Op switch
+    {
+        "const" => Param(node.Val ?? throw new InvalidOperationException("const without val")),
+        "col" => "[" + (node.Col ?? throw new InvalidOperationException("col without name")).Replace("]", "]]") + "]",
+        "+" or "-" or "*" => Arithmetic(node),
+        _ => throw new NotSupportedException($"fabricator: unsupported SET value op '{node.Op}'"),
+    };
+
+    private string Arithmetic(ValueNode node)
+    {
+        var children = node.Children;
+        if (children is not { Count: 2 })
+        {
+            throw new InvalidOperationException($"arithmetic '{node.Op}' needs two operands");
+        }
+        return $"({BuildValue(children[0])} {node.Op} {BuildValue(children[1])})";
+    }
+
     private string Conjunction(FilterNode node, string sep)
     {
         var children = node.Children ?? throw new InvalidOperationException("conjunction without children");

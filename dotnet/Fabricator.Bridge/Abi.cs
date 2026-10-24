@@ -332,9 +332,9 @@ public unsafe struct FabricatorVTable
     // host frees via free_error. Lazy: asked when a DELETE is planned, never at enumeration.
     public delegate* unmanaged[Cdecl]<nint, byte**, byte**, int> TableDmlInfo;
 
-    // int32 table_delete_where(void* table, const char* spec_json, ArrowArrayStream* filter_values /*nullable*/,
+    // int32 table_dml_where(void* table, const char* spec_json, ArrowArrayStream* filter_values /*nullable*/,
     //                          int64_t* affected, char** err) — one predicate DELETE; the filter is EXACT.
-    public delegate* unmanaged[Cdecl]<nint, byte*, CArrowArrayStream*, long*, byte**, int> TableDeleteWhere;
+    public delegate* unmanaged[Cdecl]<nint, byte*, CArrowArrayStream*, long*, byte**, int> TableDmlWhere;
 }
 
 /// <summary>

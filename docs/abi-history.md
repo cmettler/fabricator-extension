@@ -12,6 +12,21 @@
 > parsed with our own vcpkg yyjson, retiring the `ReadCapabilityFlag` string-find). v74 below is the
 > follow-on that finished the same job for ALTER.
 
+## v94 (2026-10-24) — predicate UPDATE: `table_delete_where` becomes `table_dml_where`
+
+Same signature, renamed, and its spec gains an optional `"set": [{"col": name, "value": <value node>}]`. The
+PRESENCE of `set` makes the statement an UPDATE; a spec without it is a DELETE, exactly as before. A value
+node is `{"op":"const","val":i}` | `{"op":"col","col":x}` | `{"op":"+|-|*","children":[a,b]}`, with its
+constants in the same one-row batch the filter uses. `table_dml_info` gains `update_where`. Managed:
+`DmlSpec` / `SetAssignment` / `ValueNode` in Fabricator.Abstractions, and two more DIMs on `ITableBinding`
+(`SupportsUpdateWhere`, false; `UpdateWhere`, throws), so no provider or plugin has to implement anything.
+
+⚠ **The bump is load-bearing, not tidiness.** A v93 bridge reading a v94 UPDATE spec would have found its
+`filter`, ignored the `set` it does not know, and run the statement as a DELETE. The gate's second mutant is
+exactly that (the bridge ignoring `set`): it dies at the differential's second UPDATE, because the "UPDATE"
+deleted the rows the next statement expects to find. Full record:
+[duckdb-2.0-remote-execution.md](duckdb-2.0-remote-execution.md) §2.5.
+
 ## v93 (2026-10-24) — predicate DELETE on the table session
 
 Two entries APPENDED to the vtable, so no slot moved: `table_dml_info(table, out_json, err)` answers

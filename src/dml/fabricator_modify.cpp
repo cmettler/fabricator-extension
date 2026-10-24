@@ -144,7 +144,7 @@ static SourceResultType EmitCount(GlobalSinkState &sink_state, DataChunk &chunk)
 }
 
 //===----------------------------------------------------------------------===//
-// DELETE WHERE (ABI v93) — one predicate statement, no scan
+// DELETE / UPDATE WHERE (ABI v93/v94) — one predicate statement, no scan
 //===----------------------------------------------------------------------===//
 namespace {
 struct DeleteWhereSourceState : public GlobalSourceState {
@@ -153,44 +153,47 @@ struct DeleteWhereSourceState : public GlobalSourceState {
 };
 } // namespace
 
-FabricatorPhysicalDeleteWhere::FabricatorPhysicalDeleteWhere(PhysicalPlan &plan, vector<LogicalType> types,
-                                                             idx_t estimated_cardinality,
-                                                             FabricatorHandle catalog_handle,
-                                                             FabricatorHandle table_handle, string spec_json,
-                                                             vector<Value> constants, string predicate)
+FabricatorPhysicalDmlWhere::FabricatorPhysicalDmlWhere(PhysicalPlan &plan, vector<LogicalType> types,
+                                                       idx_t estimated_cardinality, FabricatorHandle catalog_handle,
+                                                       FabricatorHandle table_handle, string spec_json,
+                                                       vector<Value> constants, string predicate, bool is_update,
+                                                       string assignments)
     : PhysicalOperator(plan, PhysicalOperatorType::EXTENSION, std::move(types), estimated_cardinality),
       catalog_handle_(catalog_handle), table_handle_(table_handle), spec_json_(std::move(spec_json)),
-      constants_(std::move(constants)), predicate_(std::move(predicate)) {
+      constants_(std::move(constants)), predicate_(std::move(predicate)), is_update_(is_update),
+      assignments_(std::move(assignments)) {
 }
 
-InsertionOrderPreservingMap<string> FabricatorPhysicalDeleteWhere::ParamsToString() const {
+InsertionOrderPreservingMap<string> FabricatorPhysicalDmlWhere::ParamsToString() const {
 	InsertionOrderPreservingMap<string> result;
+	if (is_update_) {
+		result["Set"] = assignments_;
+	}
 	result["Predicate"] = predicate_.empty() ? "(none: every row)" : predicate_;
 	return result;
 }
 
-unique_ptr<GlobalSourceState> FabricatorPhysicalDeleteWhere::GetGlobalSourceState(ClientContext &context) const {
+unique_ptr<GlobalSourceState> FabricatorPhysicalDmlWhere::GetGlobalSourceState(ClientContext &context) const {
 	return make_uniq<DeleteWhereSourceState>();
 }
 
-SourceResultType FabricatorPhysicalDeleteWhere::GetDataInternal(ExecutionContext &context, DataChunk &chunk,
-                                                                OperatorSourceInput &input) const {
+SourceResultType FabricatorPhysicalDmlWhere::GetDataInternal(ExecutionContext &context, DataChunk &chunk,
+                                                             OperatorSourceInput &input) const {
 	auto &state = input.global_state.Cast<DeleteWhereSourceState>();
 	lock_guard<mutex> guard(state.lock);
 	if (state.done) {
 		return SourceResultType::FINISHED;
 	}
 	state.done = true;
-	// The transaction's pinned connection — the same routing the rowid DELETE takes in its Finalize.
+	// The transaction's pinned connection — the same routing the rowid DELETE/UPDATE takes in its Finalize.
 	FabricatorSetActiveTxn(catalog_handle_, context.client);
 	// ⚠ The producer is a LOCAL that must outlive the crossing: the managed side imports and disposes the
-	// stream INSIDE table_delete_where, which returns before this scope ends.
+	// stream INSIDE table_dml_where, which returns before this scope ends.
 	unique_ptr<fabricator::ArrowProducer> values;
 	if (!constants_.empty()) {
 		values = fabricator::FilterValueProducer(context.client, constants_);
 	}
-	auto affected =
-	    fabricator::TableDeleteWhere(table_handle_, spec_json_, values ? values->Stream() : nullptr);
+	auto affected = fabricator::TableDmlWhere(table_handle_, spec_json_, values ? values->Stream() : nullptr);
 	chunk.SetCardinality(1);
 	chunk.SetValue(0, 0, Value::BIGINT(affected));
 	return SourceResultType::FINISHED;

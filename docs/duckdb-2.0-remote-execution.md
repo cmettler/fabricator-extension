@@ -56,11 +56,58 @@ is wrapped as `SELECT * FROM <ref>`, replacing the original statement (`:1162-12
 | duckdb-postgres | NO (`Supports` answers only `IS_REMOTE` and `CONNECT`) | ctid scans for DELETE/UPDATE; `RemoteExecute(string)` for CONNECT only. Commit `37cea87` (2026-10-12) states the intent to move to it later |
 | ducklake | NO (calls only the static `StripCatalogName` helper, for stored view SQL) | its own scan + delete files |
 | duckdb-iceberg | NO | its own scan + positional / Puffin deletes |
+| **duckdb-mysql** | **YES — all four capabilities**, unconditionally | SELECT subtrees, UPDATE, DELETE and a subset of DDL are pushed as whole statements; see §1.3a |
 
 Its real consumer is DuckDB's own remote protocol: the **quack** extension together with the `CONNECT`
 statement (user, 2026-10-24 — quack is not checked out here, so that path was not read). No in-tree DuckDB
 test exercises it either: `test/extension/test_remote_optimizer.cpp` is an unrelated
 2024 OptimizerExtension demo that ships a serialized logical plan over a socket.
+
+### 1.3a duckdb-mysql: the one extension that uses it in earnest (read 2026-10-24, user-pointed)
+
+Read from the local clone `D:/repos/duckdb-mysql` (files below are in that repo). It is the worked example of
+what §1.4 sketches, and it confirms that sketch's costs rather than retiring them.
+
+- **Capabilities:** `MySQLCapabilities::Supports` answers true for IS_REMOTE, EXECUTE_QUERY_NODE,
+  EXECUTE_STATEMENT and CONNECT (`mysql_capabilities.cpp`). The switch `mysql_enable_remote_pushdown`
+  (default true) gates only `SupportsPushdown`, and it is read ONCE AT ATTACH — its tests detach, set and
+  re-attach.
+- **The vetoes are the bulk of the code**, all four `SupportsPushdown` overloads. Representative refusals:
+  TRY_CAST and casts MySQL treats leniently; string literals unless the server has a binary NO PAD
+  collation (literals are then written with `COLLATE <that collation>`); a function WHITELIST that
+  deliberately omits `/`, `round`, `upper`/`lower`, `now`, … ; QUALIFY, GROUP BY ALL, GROUPING SETS;
+  SEMI/ANTI/FULL/ASOF joins; time travel; **every INSERT** (only its SELECT part is pushed); UPDATE/DELETE
+  with RETURNING. Statements: CREATE TABLE (no CTAS, no TEMP, constrained constraint set), DROP TABLE (no
+  CASCADE), and four ALTER kinds.
+- **Rendering:** `MySQLSQLWriter` walks the PARSED, UNBOUND AST and writes MySQL dialect. `RemoteExecute`
+  returns a `TableFunctionRef` to `mysql_query(catalog, sql, suppress_dml_output := true, …)`, which DuckDB
+  binds in place of the statement (`WrapRemoteRef`). `mysql_query` PREPAREs at bind on the transaction's
+  connection, so pushed statements see the transaction's own writes.
+- **What it costs, confirming §1.4:**
+  - **No affected-row count.** With `suppress_dml_output` the statement's return type becomes NOTHING, so a
+    pushed UPDATE/DELETE reports no changed rows (its tests use `statement ok`). Our plan-less
+    `PlanDelete`/`PlanUpdate` (§2.4/§2.5) keeps DuckDB's count, because the statement IS bound locally.
+  - **Dialect drift lives in the writer.** DEFAULT/CHECK/generated expressions are written with DuckDB's
+    `ToString()`, ADD COLUMN writes the DuckDB type name, and a `main` schema is skipped by a TODO.
+  - **⚠ A real defect, worth not copying:** in the CREATE writer the `IGNORE_ON_CONFLICT` case has no
+    `break`, so `CREATE TABLE IF NOT EXISTS` falls through into the OR REPLACE branch and sends
+    `DROP TABLE IF EXISTS` first — it WIPES an existing table (`mysql_sql_writer.cpp` IGNORE_ON_CONFLICT case, at
+    `1bd5004`). The veto ADMITS that conflict mode (`mysql_capabilities.cpp`), and no pushdown test issues a
+    pushed `CREATE TABLE IF NOT EXISTS`, so it is reachable and untested. Read, not run; worth reporting
+    upstream.
+- **On the DuckDB side** (optimizer `REMOTE_PUSHDOWN`, before binding, only when a remote catalog is
+  attached): a subtree is pushed when it touches exactly ONE remote catalog — explicit qualification, or
+  an unqualified name that only one remote catalog in the search path has. Any local table, or two remote
+  catalogs, keeps it local; subqueries and set-operation children can be pushed on their own. Constant
+  subtrees are folded locally first, and kept local if folding would error.
+
+**What it means for us.** For DDL it adds nothing: our CREATE/ALTER/DROP already execute on the server,
+rendered in C# from BOUND information (types mapped by the provider, defaults read from the bound
+expression) — strictly better than a writer working from the unbound AST. For UPDATE/DELETE the plan-less
+route we built covers the same statements while keeping the row count and DuckDB's own binding. **The real
+prize is unchanged: SELECT** — a join or aggregate executed by SQL Server. duckdb-mysql shows the shape (a
+renderer plus a whitelist veto, a `fabricator_query`-like TableRef as the carrier) and the price (the veto
+surface IS the work).
 
 ### 1.4 What it would take for SQL Server, and why it is not first
 
@@ -167,7 +214,7 @@ base overload. It fires only for `[FILTER] → FABRICATOR_SCAN` of the target ta
 scan-level `table_filters`, the setting `fabricator_dml_pushdown` on, every filter expression serialized by
 the scan's own `FilterSerializer` in STRICT mode, and the table's binding answering `delete_where = true`
 (ABI `table_dml_info`; SQL Server says no for an EXTERNAL table, whose DELETE is routed to storage). The
-operator `FABRICATOR_DELETE_WHERE` sends the predicate through `table_delete_where`, and SQL Server renders it
+operator `FABRICATOR_DELETE_WHERE` sends the predicate through `table_delete_where` (`table_dml_where` since v94), and SQL Server renders it
 with the same `FilterWhereBuilder` the scan uses, so values are bound as parameters exactly as they are there.
 
 What strict mode refuses, so the shortcut cannot widen a predicate:
@@ -193,6 +240,42 @@ the same eight DELETEs on two identical tables, one with the shortcut and one wi
 the final contents compared; a ROLLBACK and a COMMIT; and the no-PK case. Two mutants, each killed at its own
 row: types not checked (dies at the VARCHAR routing row) and the AND-drop allowed (dies at the nested-AND row).
 
+### 2.5 UPDATE on SQL Server — BUILT (ABI v94, 2026-10-24)
+
+`FabricatorCatalog::PlanUpdate` (plan-less) tries `TryPlanUpdateWhere`. Its child is ONE projection — the SET
+values, then the rowid — over the same `[FILTER] -> FABRICATOR_SCAN` as DELETE. Every SET value must render
+exactly too (`FabricatorSerializeExactValue`), and one that does not sends the whole statement to the rowid
+path, like a predicate conjunct. Admitted values, and why each is exact:
+
+- a CONSTANT of an exact type or VARCHAR. Assigning a string is not a comparison, so the collation question
+  that keeps VARCHAR out of predicates does not arise, and the rowid path sends the same value as a parameter;
+- a COLUMN of an exact type: the server copies its own stored value;
+- integer `+ - *` (TINYINT/UTINYINT/SMALLINT/INTEGER/BIGINT operands). Both engines compute exact integer
+  arithmetic, so whenever both succeed they agree. They can differ only where an intermediate result
+  overflows: DuckDB keeps the operand type, SQL Server may widen. That is an error against a correct answer,
+  never two different answers. A single operation overflowing the column fails on both (measured: 8115 from
+  SQL Server, DuckDB's own overflow on the rowid path), and the failed statement changes no row.
+
+Refused: a CAST (the binder adds one whenever the value's type is not the column's, which is what keeps
+DECIMAL arithmetic out — DuckDB's and SQL Server's decimal precision rules differ), any other function,
+division (DuckDB's `/` is float division), `UPDATE … FROM`, RETURNING.
+
+**Found while building it: the FILTER carries a projection map.** `UPDATE … SET n = n + 1, v = 'z' WHERE
+id > 1` plans its FILTER with a `projection_map`, which `plan_filter.cpp` turns into a physical projection.
+The filter's OWN expressions still read the scan's output, but anything ABOVE it — the SET values — indexes
+the narrowed list. So each value is copied and its positions are mapped back through the map before they
+name a scan column. The first build refused every such UPDATE; a logical-plan dump (`explain_output =
+'optimized_only'`) had hidden the map, and `FABRICATOR_DUMP_DML=1` showed it on the first real run. A DELETE
+reads nothing above the filter, so the map is irrelevant there.
+
+Gate: `test/verify_dml_pushdown_mssql.test` grew to 131 (+71): routing for each refusal, an eleven-statement
+differential whose counts are DuckDB's own answers for the same sequence on a NATIVE table, so they are an
+oracle for both paths, plus a column-by-column checksum against that native result, statement atomicity on
+overflow, a ROLLBACK and a COMMIT, and UPDATE on a table without a key. Two mutants, both killed at the
+differential's second statement: SET values read without the projection-map remap (the first UPDATE wrote
+the wrong column), and the bridge running an UPDATE spec as a DELETE (the v94 bump's reason, see
+[abi-history.md](abi-history.md) §v94).
+
 ## 3. Scan-side 2.0 features worth adopting (mostly for Delta)
 
 | feature | API | who uses it | value for us |
@@ -217,7 +300,7 @@ honest answer rather than a silent `integer`.
 ## 4. Order of work
 
 1. **DELETE shortcut, SQL Server** — BUILT (§2.4).
-2. **UPDATE shortcut, SQL Server** — the same, with the SET-expression rules.
+2. **UPDATE shortcut, SQL Server** — BUILT (§2.5).
 3. **Delta metadata-only DELETE** — whole-file removal from partition values and exact statistics.
 4. **`get_partition_stats` for Delta** (COUNT/MIN/MAX from the log).
 5. **Remote optimizer spike for SQL Server** — `EXECUTE_QUERY_NODE` behind an ATTACH option, SELECT only

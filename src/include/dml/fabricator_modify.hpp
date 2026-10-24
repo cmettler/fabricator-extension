@@ -151,16 +151,19 @@ private:
 //! FabricatorCatalog's plan-less PlanDelete when the table can do it and the WHOLE predicate renders exactly
 //! (FabricatorSerializeExactFilter); otherwise that overload falls back to the rowid path. A pure SOURCE:
 //! no child, nothing scanned, no rowid read — one crossing, then the provider's own affected-row count.
-class FabricatorPhysicalDeleteWhere : public PhysicalOperator {
+class FabricatorPhysicalDmlWhere : public PhysicalOperator {
 public:
 	static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::EXTENSION;
 
-	FabricatorPhysicalDeleteWhere(PhysicalPlan &plan, vector<LogicalType> types, idx_t estimated_cardinality,
-	                              FabricatorHandle catalog_handle, FabricatorHandle table_handle, string spec_json,
-	                              vector<Value> constants, string predicate);
+	//! `is_update` only selects the operator's NAME and EXPLAIN params — the spec itself says which statement
+	//! it is (a "set" makes it an UPDATE). `assignments` is the SET clause as DuckDB renders it (empty for a
+	//! DELETE).
+	FabricatorPhysicalDmlWhere(PhysicalPlan &plan, vector<LogicalType> types, idx_t estimated_cardinality,
+	                           FabricatorHandle catalog_handle, FabricatorHandle table_handle, string spec_json,
+	                           vector<Value> constants, string predicate, bool is_update, string assignments);
 
 	string GetName() const override {
-		return "FABRICATOR_DELETE_WHERE";
+		return is_update_ ? "FABRICATOR_UPDATE_WHERE" : "FABRICATOR_DELETE_WHERE";
 	}
 	bool IsSource() const override {
 		return true;
@@ -177,6 +180,8 @@ private:
 	string spec_json_;
 	vector<Value> constants_;
 	string predicate_;
+	bool is_update_;
+	string assignments_;
 };
 
 } // namespace duckdb

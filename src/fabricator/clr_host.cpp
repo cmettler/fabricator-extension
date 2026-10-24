@@ -858,16 +858,16 @@ std::string TableDmlInfo(FabricatorHandle table) {
 	return TableJsonDoc(table, "table_dml_info", GetBridge().table_dml_info);
 }
 
-int64_t TableDeleteWhere(FabricatorHandle table, const std::string &spec_json, ArrowArrayStream *filter_values) {
+int64_t TableDmlWhere(FabricatorHandle table, const std::string &spec_json, ArrowArrayStream *filter_values) {
 	const FabricatorVTable &vt = GetBridge();
-	if (!vt.table_delete_where) {
-		throw duckdb::IOException("Fabricator: bridge does not provide table_delete_where");
+	if (!vt.table_dml_where) {
+		throw duckdb::IOException("Fabricator: bridge does not provide table_dml_where");
 	}
 	char *err = nullptr;
 	int64_t affected = 0;
-	int32_t rc = vt.table_delete_where(table, spec_json.c_str(), filter_values, &affected, &err);
+	int32_t rc = vt.table_dml_where(table, spec_json.c_str(), filter_values, &affected, &err);
 	if (rc != FABRICATOR_OK) {
-		ThrowManagedError(vt, err, "Fabricator: table_delete_where failed");
+		ThrowManagedError(vt, err, "Fabricator: table_dml_where failed");
 	}
 	return affected;
 }

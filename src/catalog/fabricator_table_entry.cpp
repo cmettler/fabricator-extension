@@ -97,7 +97,80 @@ public:
 		}
 	}
 
+	// One UPDATE … SET value, as a value-node tree (strict mode only, ABI v94):
+	//   {"op":"const","val":i} | {"op":"col","col":"x"} | {"op":"+|-|*","children":[a,b]}
+	// The same rule as the predicate: render EXACTLY or refuse. What is admitted, and why each is exact:
+	//   a CONSTANT of an exact type or VARCHAR — assigning a string is not a comparison, so the collation
+	//     question that keeps VARCHAR out of predicates does not arise, and the rowid path sends the very same
+	//     value as a parameter;
+	//   a COLUMN of an exact type — the server copies its own stored value;
+	//   integer + - * — both engines compute exact integer arithmetic, so whenever BOTH succeed they agree.
+	//     Where they can differ is only an intermediate OVERFLOW: DuckDB keeps the operand type, SQL Server may
+	//     widen, so a nested expression can fail here and succeed there — an error against a correct answer,
+	//     never two different answers. Division is out: DuckDB's `/` is float division.
+	// Anything else — a CAST (the binder adds one whenever the value's type is not the column's), a function, a
+	// DECIMAL or temporal operand — is refused, and the UPDATE keeps the rowid path.
+	bool SerializeValue(const Expression &e, string &out) {
+		if (!strict_) {
+			return false;
+		}
+		switch (e.GetExpressionClass()) {
+		case ExpressionClass::BOUND_CONSTANT: {
+			auto &type = e.GetReturnType();
+			if (!ExactType(type) && type.id() != LogicalTypeId::VARCHAR) {
+				return false;
+			}
+			out = "{\"op\":\"const\",\"val\":" + to_string(AddConstant(e.Cast<BoundConstantExpression>().GetValue())) +
+			      "}";
+			return true;
+		}
+		case ExpressionClass::BOUND_REF:
+		case ExpressionClass::BOUND_COLUMN_REF: {
+			string name;
+			LogicalType type;
+			if (!ColumnName(e, name, type) || !ExactType(type)) {
+				return false;
+			}
+			out = "{\"op\":\"col\",\"col\":";
+			JsonStr(name, out);
+			out += "}";
+			return true;
+		}
+		case ExpressionClass::BOUND_FUNCTION: {
+			auto &func = e.Cast<BoundFunctionExpression>();
+			auto &children = func.GetChildren();
+			string op = func.Function().GetName().GetIdentifierName();
+			if ((op != "+" && op != "-" && op != "*") || children.size() != 2 || !IntegerType(e.GetReturnType()) ||
+			    !IntegerType(children[0]->GetReturnType()) || !IntegerType(children[1]->GetReturnType())) {
+				return false;
+			}
+			string lhs, rhs;
+			if (!SerializeValue(*children[0], lhs) || !SerializeValue(*children[1], rhs)) {
+				return false;
+			}
+			out = "{\"op\":\"" + op + "\",\"children\":[" + lhs + "," + rhs + "]}";
+			return true;
+		}
+		default:
+			return false;
+		}
+	}
+
 private:
+	// The integer types SET arithmetic is admitted for (see SerializeValue). UTINYINT is SQL Server's tinyint.
+	static bool IntegerType(const LogicalType &type) {
+		switch (type.id()) {
+		case LogicalTypeId::TINYINT:
+		case LogicalTypeId::SMALLINT:
+		case LogicalTypeId::INTEGER:
+		case LogicalTypeId::BIGINT:
+		case LogicalTypeId::UTINYINT:
+			return true;
+		default:
+			return false;
+		}
+	}
+
 	static void JsonStr(const string &s, string &out) {
 		out += '"';
 		for (char c : s) {
@@ -753,12 +826,29 @@ bool FabricatorSerializeExactFilter(LogicalGet &get, const vector<unique_ptr<Exp
 	return true;
 }
 
-bool FabricatorTableEntry::SupportsDeleteWhere() {
-	lock_guard<mutex> guard(dml_info_lock_);
-	if (delete_where_ < 0) {
-		delete_where_ = FetchDeleteWhereCapability(table_handle_) ? 1 : 0;
+bool FabricatorSerializeExactValue(LogicalGet &get, const Expression &value, string &json, vector<Value> &constants) {
+	// A second serializer over the SAME constants vector: its indices continue after the predicate's, so the
+	// filter and every SET value share one value batch.
+	FilterSerializer ser(get, constants, /*string_order_pushable=*/false, /*strict=*/true);
+	json.clear();
+	if (ser.SerializeValue(value, json)) {
+		return true;
 	}
-	return delete_where_ == 1;
+	auto v = std::getenv("FABRICATOR_DUMP_DML");
+	if (v && *v && string(v) != "0") {
+		Printer::Print("[fabricator dml] SET value not exact: " + value.ToString() + " (" +
+		               ExpressionClassToString(value.GetExpressionClass()) + ")");
+	}
+	return false;
+}
+
+const FabricatorDmlCapabilities &FabricatorTableEntry::DmlCapabilities() {
+	lock_guard<mutex> guard(dml_info_lock_);
+	if (!dml_caps_fetched_) {
+		dml_caps_ = FetchDmlCapabilities(table_handle_);
+		dml_caps_fetched_ = true;
+	}
+	return dml_caps_;
 }
 
 FabricatorTableEntry::FabricatorTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateTableInfo &info,

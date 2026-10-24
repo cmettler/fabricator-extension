@@ -2338,9 +2338,9 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
         }
     }
 
-    /// <summary>Whether a DELETE on this table may run as ONE predicate statement (ABI v93). Not for an
-    /// EXTERNAL table: its DELETE is routed to storage by identity (ExecuteDelete above), and a plain T-SQL
-    /// DELETE against it fails. <see cref="DetectExternalTable"/> is cached and answers null at once on a
+    /// <summary>Whether a DELETE or UPDATE on this table may run as ONE predicate statement (ABI v93/v94). Not
+    /// for an EXTERNAL table: its DML is routed to storage by identity (ExecuteDelete/ExecuteUpdate), and a
+    /// plain T-SQL statement against it fails. <see cref="DetectExternalTable"/> is cached and answers null at once on a
     /// warehouse engine, so this costs at most one probe per table, at the first DELETE planned.</summary>
     internal bool SupportsDeleteWhereCore(string schemaName, string tableName) =>
         DetectExternalTable(schemaName, tableName) is null;
@@ -2354,7 +2354,19 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
     /// named. The returned count is SqlClient's, which — exactly like the rowid path's — includes rows a
     /// trigger affected.</remarks>
     internal long DeleteWhereCore(string schemaName, string tableName, FilterNode? filter,
-                                  IArrowArrayStream? filterValues)
+                                  IArrowArrayStream? filterValues) =>
+        DmlWhereCore(schemaName, tableName, null, filter, filterValues);
+
+    /// <summary>One <c>UPDATE [s].[t] SET … WHERE …</c> for exact trees (ABI v94) — no scan, no rowid. Same
+    /// routing, interrupt scope and parameter rule as <see cref="DeleteWhereCore"/>; the SET values are rendered
+    /// by the same <see cref="FilterWhereBuilder"/>, so a constant is bound exactly as a predicate constant is.
+    /// </summary>
+    internal long UpdateWhereCore(string schemaName, string tableName, IReadOnlyList<SetAssignment> set,
+                                  FilterNode? filter, IArrowArrayStream? filterValues) =>
+        DmlWhereCore(schemaName, tableName, set, filter, filterValues);
+
+    private long DmlWhereCore(string schemaName, string tableName, IReadOnlyList<SetAssignment>? set,
+                              FilterNode? filter, IArrowArrayStream? filterValues)
     {
         RecordTouch(schemaName, tableName, schemaChanged: false);
         var values = ReadFilterValues(filterValues); // consumes + disposes the stream
@@ -2365,17 +2377,33 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
             using var cmd = connection.CreateCommand();
             cmd.Transaction = transaction;
             cmd.CommandTimeout = ResolveCommandTimeout();
-            var sql = new StringBuilder("DELETE FROM ").Append(Quote(schemaName)).Append('.').Append(Quote(tableName));
+            var qualified = Quote(schemaName) + "." + Quote(tableName);
+            // ONE builder for the SET values and the predicate: they share the constant batch, and the builder
+            // numbers its parameters itself, so the two cannot collide.
+            var builder = new FilterWhereBuilder(values);
+            var sql = new StringBuilder();
+            if (set is null)
+            {
+                sql.Append("DELETE FROM ").Append(qualified);
+            }
+            else
+            {
+                sql.Append("UPDATE ").Append(qualified).Append(" SET ");
+                for (int i = 0; i < set.Count; i++)
+                {
+                    sql.Append(i == 0 ? "" : ", ").Append(Quote(set[i].Col)).Append(" = ")
+                       .Append(builder.BuildValue(set[i].Value));
+                }
+            }
             if (filter is not null)
             {
-                var builder = new FilterWhereBuilder(values);
                 sql.Append(" WHERE ").Append(builder.Build(filter));
-                cmd.Parameters.AddRange(builder.Parameters.ToArray());
             }
+            cmd.Parameters.AddRange(builder.Parameters.ToArray());
             cmd.CommandText = sql.ToString();
             if (Log.IsEnabled(LogLevel.Debug))
-                Log.LogDebug("dml {Schema}.{Table}: delete-where {Sql} [params={Count}]", schemaName, tableName,
-                             Trunc(cmd.CommandText), cmd.Parameters.Count);
+                Log.LogDebug("dml {Schema}.{Table}: {Kind}-where {Sql} [params={Count}]", schemaName, tableName,
+                             set is null ? "delete" : "update", Trunc(cmd.CommandText), cmd.Parameters.Count);
             return cmd.ExecuteNonQueryAsync(interrupt.Token).GetAwaiter().GetResult();
         }
         finally

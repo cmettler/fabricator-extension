@@ -242,11 +242,15 @@ FabricatorCapabilities FetchCapabilities(FabricatorHandle handle) {
 	return caps;
 }
 
-bool FetchDeleteWhereCapability(FabricatorHandle table) {
+FabricatorDmlCapabilities FetchDmlCapabilities(FabricatorHandle table) {
 	auto json = fabricator::TableDmlInfo(table);
 	YyjsonDocGuard guard(json);
-	auto *root = guard.Root();
-	return root && yyjson_get_bool(yyjson_obj_get(root, "delete_where"));
+	FabricatorDmlCapabilities caps;
+	if (auto *root = guard.Root()) {
+		caps.delete_where = yyjson_get_bool(yyjson_obj_get(root, "delete_where"));
+		caps.update_where = yyjson_get_bool(yyjson_obj_get(root, "update_where"));
+	}
+	return caps;
 }
 
 vector<FabricatorTableInfo> DiscoverTables(FabricatorHandle handle) {
