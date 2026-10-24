@@ -3947,6 +3947,7 @@ Settings the extension itself owns rather than a provider, so they exist even wh
 | Setting | Status | Description |
 |---------|--------|-------------|
 | `fabricator_allow_plugin_install` | **Active** | Whether `fabricator_install_plugin()` (see [Function Reference](#function-reference)) may write plugin assemblies into a plugin root. **Default `false`**: an installed plugin is loaded into this process and runs with the extension's privileges, so it is opt-in rather than something a SQL statement can arrange on its own. Session-scoped like every other setting, so `RESET` closes it again |
+| `fabricator_partition_stats` | **Active** | Answer an ungrouped `COUNT(*)` / `MIN` / `MAX` from table metadata instead of scanning — on Delta, the log's per-file counts and statistics (see [Delta Lake provider](#delta-lake-provider)). **Default `true`**; `false` always scans, which is also the reference the metadata answer is tested against |
 | `fabricator_dml_pushdown` | **Active** | Run a DELETE or UPDATE whose whole WHERE (and SET) translates exactly as ONE statement on the provider — no scan, no row ids (see [INSERT / UPDATE / DELETE](#insert--update--delete)). **Default `true`**; `false` sends every DELETE and UPDATE down the row-id path, which is also the reference the shortcut is tested against |
 
 ### Delta read tuning
@@ -4468,6 +4469,21 @@ it also runs log cleanup (commits the checkpoint covers that are older than `del
 deleted, exactly as an automatic checkpoint would; set `delta.enableExpiredLogCleanup` to `'false'` on the
 table to keep them), it is not free (it materialises the whole active-file set), and running it per commit
 just pays for checkpointing twice.
+
+**`COUNT(*)`, `MIN` and `MAX` from the log.** An ungrouped `SELECT count(*), min(x), max(x) FROM lake.main.t`
+is answered from the Delta log's per-file statistics without reading a data file; `EXPLAIN` then shows a
+`Column Data Scan` and no `Fabricator Scan`. The count is each file's `numRecords` minus its deletion
+vector's cardinality. Bounds are used only where they are values actually present in the table:
+
+- partition columns (integer, date, decimal, string), from a file that still has a live row;
+- integer, date and decimal data columns, from a file **without** a deletion vector (a deleted row may have
+  held the min or max).
+
+Everything else scans as before: string, timestamp and floating-point data columns (writers truncate or round
+their statistics), a file whose column is NULL in every row, and every statement inside a transaction that
+has written to the table (the log does not know those writes yet). Inside a transaction the answer is for the
+version the transaction pinned, `AT (VERSION => …)` for that version. `SET fabricator_partition_stats = false`
+always scans.
 
 > **Caveat if you also use `row_tracking true` and read the feed from another engine.** An `INSERT` run
 > inside an explicit `BEGIN … COMMIT` writes a `_change_data` file whose row-id columns are **NULL**, where

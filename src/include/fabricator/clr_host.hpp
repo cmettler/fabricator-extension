@@ -261,6 +261,9 @@ void TableClose(FabricatorHandle table) noexcept;
 std::string TableDmlInfo(FabricatorHandle table);
 int64_t TableDmlWhere(FabricatorHandle table, const std::string &spec_json, ArrowArrayStream *filter_values);
 
+// Partition statistics (ABI v95): the per-file count/bounds doc, or "{}" from an older bridge (no stats).
+std::string TablePartitionStats(FabricatorHandle table, const std::string &at_unit, const std::string &at_value);
+
 // Provider-declared settings (see docs/settings-architecture.md). ListSettings fills `out` with ALL
 // registered providers' declared settings (six string columns: provider, name, type, default, description,
 // min); the host registers each as a DuckDB extension option at load. SetSetting pushes a setting's value

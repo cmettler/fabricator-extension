@@ -358,6 +358,82 @@ public sealed class DeltaCatalog : IProviderCatalog
     /// transaction is ambient — the callee then opens untracked and the caller owns the disposal.</summary>
     internal DeltaTableBinding? ReadBound(string path) => AmbientTxn()?.GetOrCreate(path);
 
+    /// <summary>
+    /// Per-file statistics for the snapshot the SCAN of <paramref name="path"/> would read (ABI v95), or null
+    /// when they cannot stand in for it. Resolves the version the way <see cref="ScanNative"/> does — an
+    /// explicit AT, else the transaction's pin, else latest (and SEEDS the pin, so every later reference in
+    /// the statement or transaction reads the version these statistics describe).
+    /// </summary>
+    /// <remarks>⚠ NULL WHILE THE TRANSACTION HAS ANYTHING PENDING ON THE TABLE. A scan overlays buffered
+    /// appends, deletes and a pending ALTER; the log knows none of them, and a COUNT answered from it would
+    /// silently miss this transaction's own writes.</remarks>
+    internal IReadOnlyList<FileStatistics>? PartitionStatistics(string path, TableAt? at)
+    {
+        long txn = AmbientTransaction.Current;
+        string? unit = null, value = null;
+        bool seed = false;
+        if (at is { } a)
+        {
+            unit = a.Unit;
+            value = a.Value;
+        }
+        else
+        {
+            var entry = TryTxn(txn)?.Peek(path);
+            if (entry is not null && (entry.HasAny || entry.Files.Count > 0 || entry.Batches.Count > 0
+                                      || entry.HeldTxn is not null))
+            {
+                _log.LogDebug("delta partition stats {Path}: none — the transaction has pending writes", path);
+                return null;
+            }
+            if (IsExplicitTxn(txn))
+            {
+                // EXACTLY what ScanCore does for an explicit transaction's data read, and both halves matter.
+                // (1) It IS a read: an answer from the log replaces the scan but not its meaning, so the
+                // whole table joins the read set — without it `INSERT INTO t SELECT max(id) + 1 FROM t`
+                // commits as a blind append (MEASURED: verify_delta_catalog_transactions §42a answered
+                // isBlindAppend=true for exactly that statement) and a concurrent append can no longer
+                // conflict with it. Whole-table is a superset of whatever the aggregate's filter narrowed,
+                // which costs availability (more conflicts), never correctness.
+                // (2) The pin is the one the scan would use: the table's existing pin (normally seeded at
+                // LATEST by the bind-time schema probe, which runs before this), else the transaction's
+                // instant resolved for this table — ScanCore's own call, so the two cannot disagree.
+                var read = _txns.GetOrCreate(txn).GetOrCreate(path);
+                read.ReadWholeTable = true;
+                var opener = Opener();
+                long pin = read.PinVersion(
+                    inst => DeltaReader.ResolveVersionAsOf(opener, path, inst, _log), System.DateTime.UtcNow);
+                unit = "version";
+                value = pin.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            }
+            else if (entry?.PinnedVersion is { } pin)
+            {
+                unit = "version";
+                value = pin.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            }
+            else
+            {
+                seed = txn != 0;
+            }
+        }
+        var (files, version) = DeltaReader.GetFileStatistics(Opener(), path, unit, value, ReadBound(path));
+        if (files is null)
+        {
+            return null;
+        }
+        if (seed)
+        {
+            long pinned = _txns.GetOrCreate(txn).GetOrCreate(path).PinVersion(_ => version, System.DateTime.UtcNow);
+            if (pinned != version)
+            {
+                // A concurrent reference pinned a different version first; these describe the wrong one.
+                return null;
+            }
+        }
+        _log.LogDebug("delta partition stats {Path} v{Version}: {Count} files", path, version, files.Count);
+        return files;
+    }
+
     /// <summary>The Delta <see cref="ITable"/> — transient in the current transport (see the
     /// interface remarks); <see cref="DeltaTableDefinition.Bind"/> memoizes on the transaction.</summary>
     public ITable GetTable(string schemaName, string tableName) =>

@@ -12,6 +12,33 @@
 > parsed with our own vcpkg yyjson, retiring the `ReadCapabilityFlag` string-find). v74 below is the
 > follow-on that finished the same job for ALTER.
 
+## v95 (2026-10-24) — `table_partition_stats`: COUNT / MIN / MAX from metadata
+
+Appended to the table session: `table_partition_stats(table, at_unit, at_value, out_json, err)`, one JSON
+doc `{"files":[{"count":N,"cols":{"<column>":{"min":"..","max":"..","nulls":N,"exact":bool}}}]}`. The host
+installs it as the catalog scan's `TableFunction::get_partition_stats`, so DuckDB's
+`StatisticsPropagator::TryExecuteAggregates` can replace an ungrouped COUNT(*)/MIN/MAX with constants.
+Managed: `ITableBinding.PartitionStatistics()` (DIM, null = none) plus the `FileStatistics` /
+`ColumnStatistics` records in Fabricator.Abstractions; Delta implements it from the log. Kill switch
+`fabricator_partition_stats`.
+
+⚠ **The answer REPLACES the scan**, unlike every other statistic this extension reports (the row count and
+NDV only steer the planner). That is why the three reasons `FabricatorScanStatistics` withholds min/max
+(bounds from another snapshot than the buffered writes, stats latched on the entry, perfect-hash sizing) are
+answered here rather than inherited: the call is per statement, the provider answers for the scan's own
+pinned version and returns nothing while the transaction has pending writes on the table, and
+`get_partition_stats` does not feed perfect-hash aggregation.
+
+⚠ `exact` means VALUES PRESENT, not bounds. Delta bounds are sound for pruning (a truncated string max is
+rounded up) but not for MIN/MAX, so the provider claims exactness only for partition values of a file with a
+live row, and for integer/date/decimal data stats of a file without a deletion vector (and without
+`tightBounds: false`). The other two consumers of `get_partition_stats` were checked: the row-group pruner
+needs `set_scan_order`, which our scan does not set, and partitioned execution needs min/max in the GLOBAL
+`statistics`, which ours withholds — so neither acts on these.
+
+Gate `verify_delta_partition_stats` (130, both engines); it also needs the read-set rule, see
+[duckdb-2.0-remote-execution.md](duckdb-2.0-remote-execution.md) §3.1.
+
 ## v94 (2026-10-24) — predicate UPDATE: `table_delete_where` becomes `table_dml_where`
 
 Same signature, renamed, and its spec gains an optional `"set": [{"col": name, "value": <value node>}]`. The

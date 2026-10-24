@@ -335,6 +335,12 @@ public unsafe struct FabricatorVTable
     // int32 table_dml_where(void* table, const char* spec_json, ArrowArrayStream* filter_values /*nullable*/,
     //                          int64_t* affected, char** err) — one predicate DELETE; the filter is EXACT.
     public delegate* unmanaged[Cdecl]<nint, byte*, CArrowArrayStream*, long*, byte**, int> TableDmlWhere;
+
+    // --- partition statistics on the table session, ABI v95 ---
+
+    // int32 table_partition_stats(void* table, const char* at_unit, const char* at_value, char** out_json,
+    //                             char** err) — per-file count/bounds; owned UTF-8, host frees via free_error.
+    public delegate* unmanaged[Cdecl]<nint, byte*, byte*, byte**, byte**, int> TablePartitionStats;
 }
 
 /// <summary>

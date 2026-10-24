@@ -49,6 +49,11 @@ internal static class HostSettings
     /// identical. See docs/duckdb-2.0-remote-execution.md §2.</summary>
     public const string DmlPushdownName = "fabricator_dml_pushdown";
 
+    /// <summary>Answer an ungrouped <c>COUNT(*)</c> / <c>MIN</c> / <c>MAX</c> from the provider's per-file
+    /// metadata instead of scanning — ABI v95. Off, the scan always runs, which is the reference oracle the
+    /// differential gate compares against.</summary>
+    public const string PartitionStatsName = "fabricator_partition_stats";
+
     public static IEnumerable<ProviderSetting> Settings { get; } = new[]
     {
         new ProviderSetting(
@@ -72,6 +77,13 @@ internal static class HostSettings
             Description: "Run a DELETE whose whole WHERE translates exactly as one statement on the provider " +
                          "(no scan, no row ids). On by default; turn it off to use the row-id path, which is " +
                          "also the reference oracle for it."),
+        new ProviderSetting(
+            PartitionStatsName,
+            ProviderSettingType.Bool,
+            Default: true,
+            Description: "Answer an ungrouped COUNT(*), MIN or MAX from table metadata (Delta: the log's per-file " +
+                         "counts and statistics) instead of scanning. On by default; turn it off to always scan, " +
+                         "which is also the reference oracle for it."),
     };
 
     /// <summary>

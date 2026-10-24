@@ -1480,6 +1480,133 @@ internal static class DeltaReader
         }
     }
 
+    /// <summary>
+    /// Per-file statistics from the LOG alone (ABI v95): the live row count and, per column, bounds that are
+    /// VALUES PRESENT in the file — what lets DuckDB answer COUNT(*)/MIN/MAX without a scan. Also returns the
+    /// version described, so the caller can pin it.
+    /// </summary>
+    /// <remarks>
+    /// <para><b>What is claimed exact, and why nothing else is.</b></para>
+    /// <list type="bullet">
+    /// <item>A PARTITION column's value is the value of every row of the file, so it is exact whenever the file
+    /// has at least one live row — deletion vector or not. Text types the host casts exactly: integers, date,
+    /// decimal, string. NULL (and the empty / Hive-default spellings the reader also maps to NULL) is reported
+    /// as a NULL count with no bounds.</item>
+    /// <item>A DATA column's stats are exact only for a file with NO deletion vector (a vector may hide the row
+    /// that held the min or max — the spec's tightBounds) and only for integers, date and decimal. Strings are
+    /// truncated by writers, Spark's timestamps are millisecond-truncated, and float bounds skip NaN; each of
+    /// those is a valid BOUND but not the answer to MIN/MAX. An explicit <c>tightBounds: false</c> from any
+    /// writer disqualifies the file's data stats too.</item>
+    /// </list>
+    /// <para>The count is <c>numRecords</c> minus the vector's cardinality, as in <see cref="GetRowCount"/>; a
+    /// file with no <c>numRecords</c> reports an unknown count, and the host then cannot answer COUNT.</para>
+    /// </remarks>
+    internal static (IReadOnlyList<FileStatistics>? Files, long Version) GetFileStatistics(
+        nint opener, string path, string? unit, string? value, DeltaTableBinding? bound)
+        => GetFileStatisticsAsync(opener, path, unit, value, bound).GetAwaiter().GetResult();
+
+    private static async Task<(IReadOnlyList<FileStatistics>?, long)> GetFileStatisticsAsync(
+        nint opener, string path, string? unit, string? value, DeltaTableBinding? bound)
+    {
+        var (open, shared) = await OpenForReadAsync(opener, path, bound).ConfigureAwait(false);
+        try
+        {
+            var snap = unit is not null && value is not null
+                ? await ResolveSnapshotAsync(open.Table, unit, value, default).ConfigureAwait(false)
+                : open.Table.CurrentSnapshot;
+            var mode = EngineeredWood.DeltaLake.Schema.ColumnMapping.GetMode(snap.Metadata.Configuration);
+            var partitionCols = new HashSet<string>(snap.Metadata.PartitionColumns, StringComparer.Ordinal);
+            var fields = snap.Schema.Fields;
+            var result = new List<FileStatistics>(snap.ActiveFiles.Count);
+            foreach (var add in snap.ActiveFiles.Values)
+            {
+                long? live = add.GetNumRecords() is { } records
+                    ? records - (add.DeletionVector?.Cardinality ?? 0)
+                    : null;
+                string? statsJson = add.DeletionVector is null ? add.GetStatsJson() : null;
+                var stats = statsJson is not null && TightBounds(statsJson) ? ColumnStats.Parse(statsJson) : null;
+                var columns = new Dictionary<string, ColumnStatistics>(StringComparer.Ordinal);
+                foreach (var field in fields)
+                {
+                    if (live is not { } n || field.Type is not EngineeredWood.DeltaLake.Schema.PrimitiveType p)
+                    {
+                        continue;
+                    }
+                    string stored = EngineeredWood.DeltaLake.Schema.ColumnMapping.GetPhysicalName(field, mode);
+                    if (partitionCols.Contains(field.Name))
+                    {
+                        if (!ExactStatType(p.TypeName, partition: true))
+                        {
+                            continue;
+                        }
+                        var v = DeltaNativeReader.LookupPartitionValue(add.PartitionValues, field.Name, stored);
+                        columns[field.Name] = v is null
+                            ? new ColumnStatistics(null, null, n, false)
+                            : new ColumnStatistics(v, v, 0, n > 0);
+                        continue;
+                    }
+                    if (stats is null || !ExactStatType(p.TypeName, partition: false))
+                    {
+                        continue;
+                    }
+                    string? min = StatText(stats.MinValues, stored);
+                    string? max = StatText(stats.MaxValues, stored);
+                    long? nulls = stats.NullCount is { } nc && nc.TryGetValue(stored, out var c) ? c : null;
+                    if (min is null || max is null)
+                    {
+                        if (nulls == n)
+                        {
+                            columns[field.Name] = new ColumnStatistics(null, null, nulls, false); // all NULL
+                        }
+                        continue;
+                    }
+                    columns[field.Name] = new ColumnStatistics(min, max, nulls, n > 0);
+                }
+                result.Add(new FileStatistics(live, columns));
+            }
+            return (result, snap.Version);
+        }
+        finally
+        {
+            if (!shared) { await open.Table.DisposeAsync().ConfigureAwait(false); }
+        }
+    }
+
+    // Types whose text casts to EXACTLY the stored value. A partition value is the value itself, so strings
+    // qualify there; a data column's string stat may be a truncated prefix, so they do not.
+    private static bool ExactStatType(string typeName, bool partition) => typeName switch
+    {
+        "byte" or "short" or "integer" or "long" or "date" => true,
+        "string" => partition,
+        _ => typeName.StartsWith("decimal(", StringComparison.Ordinal),
+    };
+
+    private static string? StatText(IReadOnlyDictionary<string, System.Text.Json.JsonElement>? values, string key)
+    {
+        if (values is null || !values.TryGetValue(key, out var e))
+        {
+            return null;
+        }
+        return e.ValueKind switch
+        {
+            System.Text.Json.JsonValueKind.Number => e.GetRawText(),
+            System.Text.Json.JsonValueKind.String => e.GetString(),
+            _ => null,
+        };
+    }
+
+    // The spec's `tightBounds`: absent means tight. Parsed only when the key is present at all.
+    private static bool TightBounds(string statsJson)
+    {
+        if (!statsJson.Contains("tightBounds", StringComparison.Ordinal))
+        {
+            return true;
+        }
+        using var doc = System.Text.Json.JsonDocument.Parse(statsJson);
+        return !(doc.RootElement.TryGetProperty("tightBounds", out var t)
+                 && t.ValueKind == System.Text.Json.JsonValueKind.False);
+    }
+
     /// <summary>Time travel — the Arrow schema of the table AS OF a version/timestamp (the schema can differ from
     /// the latest, e.g. before an ADD COLUMN). <paramref name="unit"/> is "version" or "timestamp" (the DuckDB
     /// <c>AT</c> clause unit); <paramref name="value"/> is the BIGINT version or a parseable timestamp.</summary>

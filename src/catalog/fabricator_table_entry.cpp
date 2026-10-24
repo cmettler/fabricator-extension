@@ -39,6 +39,9 @@
 #include "duckdb/function/scalar/struct_utils.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/storage/statistics/base_statistics.hpp"
+#include "duckdb/storage/statistics/numeric_stats.hpp"
+#include "duckdb/storage/statistics/string_stats.hpp"
+#include "duckdb/function/partition_stats.hpp"
 #include "duckdb/storage/statistics/node_statistics.hpp"
 #include "duckdb/storage/table_storage_info.hpp"
 
@@ -949,6 +952,143 @@ static unique_ptr<BaseStatistics> FabricatorScanStatistics(ClientContext &contex
 	return make_uniq<BaseStatistics>(std::move(stats));
 }
 
+// ONE file's statistics, as DuckDB's aggregate rewrite reads them. Built once from the provider's doc and
+// immutable; keyed by PHYSICAL column index, which is what a StorageIndex carries.
+struct FabricatorPartitionRowGroup : public PartitionRowGroup {
+	struct Column {
+		unique_ptr<BaseStatistics> stats;
+		bool exact = false;
+	};
+	std::unordered_map<idx_t, Column> columns;
+
+	unique_ptr<BaseStatistics> GetColumnStatistics(const StorageIndex &storage_index) override {
+		// A struct member's index (children) is not something the provider reports.
+		if (storage_index.HasChildren()) {
+			return nullptr;
+		}
+		auto it = columns.find(storage_index.GetPrimaryIndex());
+		if (it == columns.end()) {
+			return nullptr;
+		}
+		return it->second.stats->ToUnique();
+	}
+	bool MinMaxIsExact(const StorageIndex &storage_index) override {
+		if (storage_index.HasChildren()) {
+			return false;
+		}
+		auto it = columns.find(storage_index.GetPrimaryIndex());
+		return it != columns.end() && it->second.exact;
+	}
+	bool HasPendingWrites() override {
+		// The provider answers with NO statistics when the transaction has pending writes on the table, so a
+		// row group that exists never has any.
+		return false;
+	}
+};
+
+// One column's statistics, or null when the text does not cast exactly to the column's type. Only the two
+// statistics kinds DuckDB's rewrite reads are built: NUMERIC (numbers and temporals) and VARCHAR.
+static unique_ptr<BaseStatistics> BuildPartitionColumnStats(const LogicalType &type,
+                                                           const FabricatorPartitionColumn &column,
+                                                           int64_t live_count) {
+	auto stats = BaseStatistics::CreateEmpty(type);
+	if (column.has_min_max) {
+		if (type.id() == LogicalTypeId::VARCHAR) {
+			// String bounds only as a CONSTANT: StringStats truncates a stored min/max, and FromConstant is the
+			// one call that records the value whole and marks it exact.
+			if (column.min != column.max) {
+				return nullptr;
+			}
+			StringStats::FromConstant(stats, string_t(column.min));
+		} else if (stats.GetStatsType() == StatisticsType::NUMERIC_STATS) {
+			// STRICT: a value that does not convert exactly (12.345 into DECIMAL(10,2)) is no statistic at all.
+			string error;
+			auto min = Value(column.min).DefaultTryCastAs(type, &error, true);
+			auto max = Value(column.max).DefaultTryCastAs(type, &error, true);
+			if (!min.has_value() || !max.has_value()) {
+				return nullptr;
+			}
+			NumericStats::SetMin(stats, *min);
+			NumericStats::SetMax(stats, *max);
+		} else {
+			return nullptr;
+		}
+	}
+	// Validity. A filter check reads it — `x > 5` is ALWAYS_TRUE only over a column with no NULLs — so an
+	// unknown count must say "both".
+	if (column.nulls < 0 || live_count < 0) {
+		stats.SetHasNull();
+		stats.SetHasNoNull();
+	} else {
+		if (column.nulls > 0) {
+			stats.SetHasNull();
+		}
+		if (column.nulls < live_count) {
+			stats.SetHasNoNull();
+		}
+	}
+	return make_uniq<BaseStatistics>(std::move(stats));
+}
+
+// The kill switch, and the reference oracle the differential gate runs against.
+static bool PartitionStatsEnabled(ClientContext &context) {
+	Value enabled;
+	return !(context.TryGetCurrentSetting("fabricator_partition_stats", enabled) && !enabled.IsNull() &&
+	         !enabled.GetValue<bool>());
+}
+
+// Per-file COUNT/MIN/MAX from the provider's metadata (ABI v95), so an ungrouped COUNT(*)/MIN/MAX over the
+// table is answered without a scan. The answer REPLACES the scan, so everything that could make it differ
+// from what the scan would return is the PROVIDER's to refuse (pending writes, a different snapshot); this
+// side only refuses what it cannot represent. Any failure means "no statistics", which runs the scan.
+//
+// ⚠ The three reasons FabricatorScanStatistics withholds min/max do not apply here, and that is why this
+// may report them: (1) the provider answers for the snapshot the scan would read and gives nothing while
+// the transaction has pending writes on the table; (2) it is asked per statement, never latched on the
+// entry; (3) perfect-hash aggregation sizes itself from `statistics`, not from these.
+static vector<PartitionStatistics> FabricatorScanPartitionStats(ClientContext &context, GetPartitionStatsInput &input) {
+	vector<PartitionStatistics> result;
+	if (!input.bind_data || !PartitionStatsEnabled(context)) {
+		return result;
+	}
+	auto &bind_data = input.bind_data->Cast<fabricator::ArrowStreamBindData>();
+	if (!bind_data.table) {
+		return result;
+	}
+	auto &entry = bind_data.table->Cast<FabricatorTableEntry>();
+	vector<FabricatorPartitionFile> files;
+	try {
+		FabricatorSetActiveTxn(entry.ParentCatalog().Cast<FabricatorCatalog>().GetHandle(), context);
+		files = FetchPartitionStats(entry.TableHandle(), bind_data.at_unit, bind_data.at_value);
+	} catch (...) {
+		return result;
+	}
+	auto &columns = entry.GetColumns();
+	for (auto &file : files) {
+		PartitionStatistics ps;
+		ps.count = file.count < 0 ? 0 : static_cast<idx_t>(file.count);
+		ps.count_type = file.count < 0 ? CountType::COUNT_APPROXIMATE : CountType::COUNT_EXACT;
+		auto row_group = make_shared_ptr<FabricatorPartitionRowGroup>();
+		for (auto &col : columns.Physical()) {
+			auto it = file.columns.find(col.Name().GetIdentifierName());
+			if (it == file.columns.end()) {
+				continue;
+			}
+			auto stats = BuildPartitionColumnStats(col.Type(), it->second, file.count);
+			if (!stats) {
+				continue;
+			}
+			FabricatorPartitionRowGroup::Column column;
+			column.stats = std::move(stats);
+			column.exact = it->second.exact && it->second.has_min_max;
+			row_group->columns[col.StorageOid()] = std::move(column);
+		}
+		ps.partition_row_group = std::move(row_group);
+		result.push_back(std::move(ps));
+	}
+	return result;
+}
+
 // Function-level rowid hook for DuckDB's late-materialization rewrite (distinct from the entry-level
 // GetRowIdColumns, which serves DML planning): declares that this scan's row identity is the standard
 // rowid virtual column. Only installed (with function.late_materialization) for scans whose rowid the
@@ -1208,6 +1348,7 @@ TableFunction FabricatorTableEntry::BuildScanFunction(ClientContext &context, un
 	}
 	function.cardinality = FabricatorScanCardinality;
 	function.statistics = FabricatorScanStatistics;
+	function.get_partition_stats = FabricatorScanPartitionStats;
 	function.get_bind_info = fabricator::ArrowStreamGetBindInfo;
 	function.get_table_entry = fabricator::ArrowStreamGetTableEntry; // 2.0: or the binder sees no base table
 	return function;

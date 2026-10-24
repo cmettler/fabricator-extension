@@ -512,6 +512,54 @@ FabricatorTableStats FetchTableStats(FabricatorHandle table_handle) {
 	return result;
 }
 
+vector<FabricatorPartitionFile> FetchPartitionStats(FabricatorHandle table_handle, const string &at_unit,
+                                                    const string &at_value) {
+	// {"files":[{"count":N, "cols":{"<column>":{"min":"..","max":"..","nulls":N,"exact":bool}}}]} — abi.h
+	// table_partition_stats. Anything malformed THROWS: the caller turns a throw into "no statistics", which
+	// is always safe (the scan runs), whereas a half-read doc could under-count.
+	auto json = fabricator::TablePartitionStats(table_handle, at_unit, at_value);
+	YyjsonDocGuard guard(json);
+	auto *root = guard.Root();
+	if (!root) {
+		throw IOException("fabricator: table_partition_stats returned malformed JSON: %s", json);
+	}
+	vector<FabricatorPartitionFile> result;
+	auto *files = yyjson_obj_get(root, "files");
+	if (!yyjson_is_arr(files)) {
+		return result;
+	}
+	size_t fidx, fmax;
+	yyjson_val *file;
+	yyjson_arr_foreach(files, fidx, fmax, file) {
+		FabricatorPartitionFile entry;
+		auto *count = yyjson_obj_get(file, "count");
+		if (yyjson_is_int(count)) {
+			entry.count = yyjson_get_sint(count);
+		}
+		size_t cidx, cmax;
+		yyjson_val *key, *val;
+		auto *cols = yyjson_obj_get(file, "cols"); // hoisted: the foreach macro multi-evaluates its argument
+		yyjson_obj_foreach(cols, cidx, cmax, key, val) {
+			FabricatorPartitionColumn column;
+			auto *min = yyjson_obj_get(val, "min");
+			auto *max = yyjson_obj_get(val, "max");
+			if (yyjson_is_str(min) && yyjson_is_str(max)) {
+				column.has_min_max = true;
+				column.min = string(yyjson_get_str(min), yyjson_get_len(min));
+				column.max = string(yyjson_get_str(max), yyjson_get_len(max));
+			}
+			auto *nulls = yyjson_obj_get(val, "nulls");
+			if (yyjson_is_int(nulls)) {
+				column.nulls = yyjson_get_sint(nulls);
+			}
+			column.exact = yyjson_get_bool(yyjson_obj_get(val, "exact"));
+			entry.columns[string(yyjson_get_str(key), yyjson_get_len(key))] = std::move(column);
+		}
+		result.push_back(std::move(entry));
+	}
+	return result;
+}
+
 string FabricatorRenderAlterJson(const FabricatorAlterRequest &request) {
 	// The ONE place the host WRITES an ABI JSON doc (table_info/table_stats/get_capabilities all flow the
 	// other way), so it is also the one place that needs yyjson's mutable API. Every string below is a

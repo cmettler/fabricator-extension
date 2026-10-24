@@ -200,7 +200,10 @@ case "$TIER" in
         # the directory tree UNDER a Delta root IS the schema tree (DuckDB 2.0 nested schemas). ⚠ Its
         # load-bearing row is the one asserting the LEAF alone does NOT resolve: duckdb_schemas() prints a
         # child by its own name, so a flattening bug is invisible in the listing and visible only there.
-        : "${MIN_SUITES:=83}"
+        # 85 since 2026-10-24: verify_delta_partition_stats, engine-doubled (+2 runs) — COUNT(*)/MIN/MAX
+        # answered from the Delta log (ABI v95). Each answer is asserted twice, from metadata and with
+        # `fabricator_partition_stats = false`, so the switch-off leg is the oracle for the other.
+        : "${MIN_SUITES:=85}"
         # 5656 since 2026-08-02: verify_delta_catalog_transactions 943 -> 944 Ã¢ÂÂ ROLLBACK now RECLAIMS the
         # data files the transaction eagerly wrote (EW #52's DiscardDataFilesAsync) instead of leaving them
         # for VACUUM. +2, not +1: that suite is one of the DOUBLED ones below, so an assertion added to it
@@ -937,7 +940,11 @@ case "$TIER" in
         #   as "no write to apply to", which stopped being true when the tuning became a persisted table
         #   property. ⚠ The load-bearing rows read a WRITTEN FILE: a property in the catalog proves only
         #   that the key was stored, and the point of persisting it is that a LATER INSERT obeys it.
-        : "${MIN_ASSERTIONS:=10333}"
+        # 2026-10-24: 10333 -> 10593. verify_delta_partition_stats (130) x 2 engine legs and nothing else:
+        #   10333 + 260 exactly. ⚠ The first tier run with it was RED in verify_delta_catalog_transactions
+        #   §42a: a metadata answer recorded no READ, so `INSERT INTO t SELECT max(id)+1 FROM t` committed as
+        #   a blind append. That suite is the read-set gate this feature leans on.
+        : "${MIN_ASSERTIONS:=10593}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh
@@ -1530,7 +1537,8 @@ case "$TIER" in
 test/verify_delta_catalog_transactions.test
 test/verify_delta_catalog_update.test
 test/verify_delta_catalog_delete.test
-test/verify_merge_into.test'
+test/verify_merge_into.test
+test/verify_delta_partition_stats.test'
         ;;
     service)
         DOUBLED='test/verify_delta_catalog_s3.test'

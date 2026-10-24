@@ -872,6 +872,24 @@ int64_t TableDmlWhere(FabricatorHandle table, const std::string &spec_json, Arro
 	return affected;
 }
 
+std::string TablePartitionStats(FabricatorHandle table, const std::string &at_unit, const std::string &at_value) {
+	const FabricatorVTable &vt = GetBridge();
+	if (!vt.table_partition_stats) {
+		return "{}"; // an older bridge: no statistics, so the scan runs
+	}
+	char *out_json = nullptr;
+	char *err = nullptr;
+	int32_t rc = vt.table_partition_stats(table, at_unit.c_str(), at_value.c_str(), &out_json, &err);
+	if (rc != FABRICATOR_OK) {
+		ThrowManagedError(vt, err, "Fabricator: table_partition_stats failed");
+	}
+	std::string result = out_json ? out_json : "";
+	if (out_json && vt.free_error) {
+		vt.free_error(out_json);
+	}
+	return result;
+}
+
 void TableScan(FabricatorHandle table, const std::string &spec_json, ArrowArrayStream *filter_values,
                ArrowArrayStream &out) {
 	const FabricatorVTable &vt = GetBridge();

@@ -22,6 +22,16 @@ public readonly record struct VirtualColumn(string Name, string DuckDbType);
 /// <summary>One column's approximate distinct-value count (optimizer costing only, never pruning).</summary>
 public readonly record struct NdvEntry(string ColumnName, long Ndv);
 
+/// <summary>One column of one file's metadata statistics (ABI v95). <paramref name="Min"/>/<paramref name="Max"/>
+/// are text the host casts to the column's type (null = unknown); <paramref name="NullCount"/> counts NULLs
+/// among the file's LIVE rows (null = unknown). <paramref name="Exact"/> claims both bounds are VALUES PRESENT
+/// among the live rows — not merely bounds.</summary>
+public readonly record struct ColumnStatistics(string? Min, string? Max, long? NullCount, bool Exact);
+
+/// <summary>One file's metadata statistics (ABI v95): its LIVE row count (null = unknown) and per-column
+/// statistics keyed by column name (a column that is absent has none).</summary>
+public sealed record FileStatistics(long? RowCount, IReadOnlyDictionary<string, ColumnStatistics> Columns);
+
 /// <summary>
 /// A table's per-catalog-entry DEFINITION — identity plus the bind factory; deliberately TRANSACTION-FREE
 /// (slice 4c of docs/catalog-table-abstraction.md §2.2/§2.3). The deliberate <c>ITableFunction</c> symmetry:
@@ -179,6 +189,15 @@ public interface ITableBinding : IDisposable
     /// current transport, the AT clause (which for an AT-bound instance matches the binding's own).
     /// </summary>
     IArrowArrayStream Scan(string? specJson, IArrowArrayStream? filterValues);
+
+    /// <summary>Per-file statistics read from metadata alone (ABI v95), which let the host answer an ungrouped
+    /// <c>COUNT(*)</c>/<c>MIN</c>/<c>MAX</c> without scanning. Null — the default — means none, and the scan
+    /// runs.</summary>
+    /// <remarks>⚠ THE ANSWER REPLACES THE SCAN. It must describe exactly what <see cref="Scan"/> would return
+    /// in the ambient transaction: the same snapshot, and nothing pending — answer null while the transaction
+    /// has buffered writes on the table. Claim <see cref="ColumnStatistics.Exact"/> only for values that are
+    /// actually present; a bound that is merely an upper or lower limit is not exact.</remarks>
+    IReadOnlyList<FileStatistics>? PartitionStatistics() => null;
 
     /// <summary>Whether <see cref="DeleteWhere"/> can run a DELETE on this table as ONE predicate statement
     /// (ABI v93). False by default, so a provider that does not implement it keeps the rowid path. Asked

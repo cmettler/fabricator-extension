@@ -310,11 +310,70 @@ host-query boundary promotes an untyped NULL to INTEGER the same way (`PromoteNu
 recorded durably, and Delta has no null type to map to — so a refusal or an explicit cast would be the
 honest answer rather than a silent `integer`.
 
+### 3.1 `get_partition_stats` for Delta — BUILT (ABI v95, 2026-10-24)
+
+`FabricatorScanPartitionStats` is the catalog scan's `get_partition_stats`; it asks the table session
+(`table_partition_stats`) for per-file statistics and builds one `PartitionRowGroup` per Delta file. DuckDB's
+`StatisticsPropagator::TryExecuteAggregates` then replaces an ungrouped COUNT(*)/MIN/MAX with constants:
+`EXPLAIN` shows a `Column Data Scan` and no `Fabricator Scan`. Kill switch `fabricator_partition_stats`.
+
+**The answer replaces the scan**, so the provider owns every reason it might differ:
+
+- **The snapshot.** An AT clause, else — in an explicit transaction — exactly `ScanCore`'s call (the
+  table's existing pin, else the transaction's first-read instant resolved for this table), else the
+  autocommit pin or latest, SEEDING the pin so later references read the version the statistics describe.
+  If a concurrent reference seeded a different version first, the answer is "no statistics".
+- **The read set.** An answer from the log is still a READ. In an explicit transaction it records a
+  whole-table read exactly as an unfiltered scan does, or `INSERT INTO t SELECT max(id) + 1 FROM t` commits as
+  a blind append and a concurrent append can no longer conflict with it. Found by the hermetic tier, not by
+  the feature's own gate: `verify_delta_catalog_transactions` §42a read `isBlindAppend: true` for exactly
+  that statement. Whole-table is a superset of what a filtered aggregate read, so the cost is availability
+  (more conflicts), never correctness.
+- **Pending writes.** A scan overlays the transaction's buffered appends, deletes and a pending ALTER; the log
+  knows none of them. Any of them on the table (or eagerly written files, buffered batches, a held EW
+  transaction) means no statistics.
+- **Exactness.** DuckDB's `MinMaxIsExact` means the bounds are values PRESENT in the rows, which is stronger
+  than what Delta statistics promise (bounds sound for pruning). Claimed only for: a partition value
+  (integer, date, decimal, string) of a file with at least one live row; integer/date/decimal data statistics
+  of a file with no deletion vector and no `tightBounds: false`. Strings are truncated by writers, Spark
+  timestamps are millisecond-truncated, float bounds skip NaN — each a bound, none an answer.
+- **Counts.** `numRecords` minus the deletion vector's cardinality; a file without `numRecords` reports an
+  unknown count, and DuckDB then does not answer COUNT.
+- **Validity.** The null count drives the filter check (`x > 5` is ALWAYS_TRUE only over a column with no
+  NULLs), so an unknown null count reports "may have NULLs and values".
+
+The other two consumers of `get_partition_stats` cannot act on these: the row-group pruner requires
+`set_scan_order` (not set by our scan), and partitioned execution requires min/max in the GLOBAL `statistics`
+callback, which `FabricatorScanStatistics` deliberately withholds.
+
+**Also found while building it, and NOT this feature's:** in an explicit transaction the scan reads a table
+first touched later in the transaction as of the transaction's first-read INSTANT — except when that
+statement is the entry's FIRST bind, whose schema probe (`SchemaProbe`) seeds the pin at LATEST first. So
+whether a commit that landed mid-transaction is visible depends on catalog-entry state. The metadata answer
+uses the same pin call and so agrees with the scan in both states; the gate warms the entry so both halves
+test the instant. Recorded as an open snapshot-isolation question.
+
+**Found while building it:** DuckDB itself declines a file whose column is NULL in every row
+(`TryGetValueFromStats` needs a min/max; there is a TODO for it). Two of my first gate assertions expected a
+metadata answer over such a column and were wrong, not the code.
+
+Gate `test/verify_delta_partition_stats.test` (130, engine-doubled): every answer is asserted twice, from
+metadata and with the switch off. Mutants, native engine:
+
+| mutant | result |
+|---|---|
+| pending writes ignored | killed, §6 (line 205) — the transaction's own insert went missing |
+| a partition file with no live row trusted | killed, §4 (line 147) — `min(region)` answered a deleted value |
+| a DV file's data bounds trusted AND `tightBounds` ignored | killed, §3 (line 134) — `max(id)` answered the deleted max |
+| a DV file's data bounds trusted (only) | SURVIVED — engineered-wood stamps `tightBounds: false` on every file it gives a vector, so the second check covers the first; both stay because other writers need not |
+| the explicit-transaction branch removed (latest pinned, no read recorded) | killed, §7b (line 285) — answered latest where the scan honours the instant; and `verify_delta_catalog_transactions` §42a (blind-append claim) |
+| the autocommit pin ignored | SURVIVED — inside a transaction the table's open is shared and was opened AT the pinned version, so `CurrentSnapshot` is already the pinned snapshot. The pin branch matters only when that cache declines (past the per-transaction open cap), which the gate does not reach |
+
 ## 4. Order of work
 
 1. **DELETE shortcut, SQL Server** — BUILT (§2.4).
 2. **UPDATE shortcut, SQL Server** — BUILT (§2.5).
 3. **Delta metadata-only DELETE** — whole-file removal from partition values and exact statistics.
-4. **`get_partition_stats` for Delta** (COUNT/MIN/MAX from the log).
+4. **`get_partition_stats` for Delta** — BUILT (§3.1).
 5. **Remote optimizer spike for SQL Server** — `EXECUTE_QUERY_NODE` behind an ATTACH option, SELECT only
    at first, with a T-SQL renderer and a veto for everything it cannot render.

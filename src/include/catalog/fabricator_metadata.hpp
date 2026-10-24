@@ -254,6 +254,27 @@ struct FabricatorTableStats {
 //! whole fetch as best-effort (a stats failure must not break the scan).
 FabricatorTableStats FetchTableStats(FabricatorHandle table_handle);
 
+//! One column of one file in the `table_partition_stats` doc (ABI v95). min/max are TEXT the host casts to
+//! the column's type; `exact` is the provider's claim that both are values present among the live rows.
+struct FabricatorPartitionColumn {
+	bool has_min_max = false;
+	string min;
+	string max;
+	int64_t nulls = -1; //! -1 = unknown
+	bool exact = false;
+};
+
+//! One file. `count` -1 = unknown.
+struct FabricatorPartitionFile {
+	int64_t count = -1;
+	std::unordered_map<string, FabricatorPartitionColumn> columns;
+};
+
+//! Parses the `table_partition_stats` doc. An empty result means NO statistics (the doc had no "files"),
+//! which is also what an older bridge yields.
+vector<FabricatorPartitionFile> FetchPartitionStats(FabricatorHandle table_handle, const string &at_unit,
+                                                    const string &at_value);
+
 //! One ALTER TABLE request for the `table_alter` crossing (ABI v74) — the C++ mirror of the managed
 //! `AlterTableSpec`. Deliberately one struct with a `kind` rather than a variant hierarchy: each kind fills
 //! only its own fields, and the renderer emits only what was filled, so the doc on the wire names its

@@ -1,0 +1,394 @@
+# name: test/verify_delta_partition_stats.test
+# description: An ungrouped COUNT(*) / MIN / MAX over a Delta table is answered from the LOG — per-file
+#              numRecords, deletion-vector cardinality, partition values and column statistics — with no scan
+#              (ABI v95 table_partition_stats -> TableFunction::get_partition_stats -> DuckDB's
+#              StatisticsPropagator::TryExecuteAggregates). The answer REPLACES the scan, so every section
+#              asserts the same value twice: once from metadata, once with `fabricator_partition_stats = false`,
+#              which always scans and is the oracle. Routing is asserted through EXPLAIN: a metadata answer
+#              plans as a `Column Data Scan` with no `Fabricator Scan` under it.
+#              What must NOT be answered from metadata, each with its own section: a bound that a deletion
+#              vector may have hidden, a partition file whose every row is deleted, a transaction's pending
+#              writes, a data-column string (writers truncate them), and a version other than the one the
+#              transaction pinned.
+#              Engine-parameterized (DELTA_PROVIDER): both writers' statistics are trusted, so both are gated.
+# group: [fabricator]
+
+require fabricator
+
+require parquet
+
+require-env FABRICATOR_DELTA_WRITE_DIR
+
+require-env DELTA_PROVIDER
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/pstats' AS lake (TYPE fabricator, PROVIDER '${DELTA_PROVIDER}', deletion_vectors true);
+
+# ============================================================================
+# 1. THREE FILES, ANSWERED FROM METADATA: count, integer / decimal / date bounds, the partition column.
+# ============================================================================
+
+statement ok
+CREATE TABLE lake.main.t (id INTEGER, amount DECIMAL(10,2), d DATE, s VARCHAR, region VARCHAR) PARTITIONED BY (region);
+
+statement ok
+INSERT INTO lake.main.t VALUES (1, 1.50, DATE '2026-01-01', 'a', 'eu'), (2, 2.50, DATE '2026-02-01', 'b', 'us');
+
+statement ok
+INSERT INTO lake.main.t VALUES (3, 3.25, DATE '2025-01-01', 'c', 'eu'), (9, 9.99, DATE '2027-01-01', 'z', 'ap');
+
+query II
+EXPLAIN SELECT count(*), min(id), max(id), min(amount), max(amount), min(d), max(d), min(region), max(region) FROM lake.main.t;
+----
+physical_plan	<!REGEX>:.*Fabricator Scan.*
+
+query IIIIIIIII
+SELECT count(*), min(id), max(id), min(amount), max(amount), min(d), max(d), min(region), max(region) FROM lake.main.t;
+----
+4	1	9	1.50	9.99	2025-01-01	2027-01-01	ap	us
+
+statement ok
+SET fabricator_partition_stats = false;
+
+query II
+EXPLAIN SELECT count(*) FROM lake.main.t;
+----
+physical_plan	<REGEX>:.*Fabricator Scan.*
+
+query IIIIIIIII
+SELECT count(*), min(id), max(id), min(amount), max(amount), min(d), max(d), min(region), max(region) FROM lake.main.t;
+----
+4	1	9	1.50	9.99	2025-01-01	2027-01-01	ap	us
+
+statement ok
+SET fabricator_partition_stats = true;
+
+# A DATA-column string is never claimed exact (writers truncate string statistics), so it scans.
+query II
+EXPLAIN SELECT max(s) FROM lake.main.t;
+----
+physical_plan	<REGEX>:.*Fabricator Scan.*
+
+query I
+SELECT max(s) FROM lake.main.t;
+----
+z
+
+# ============================================================================
+# 2. A PARTITION FILTER is decided per file from the partition value (native read pushes it as a table
+#    filter; the codec engine keeps it above the scan and scans). Either way the answer is the scan's.
+# ============================================================================
+
+query I
+SELECT count(*) FROM lake.main.t WHERE region = 'eu';
+----
+2
+
+statement ok
+SET fabricator_partition_stats = false;
+
+query I
+SELECT count(*) FROM lake.main.t WHERE region = 'eu';
+----
+2
+
+statement ok
+SET fabricator_partition_stats = true;
+
+# ============================================================================
+# 3. A DELETION VECTOR. The count stays metadata (numRecords minus the vector's cardinality), but a data
+#    column's bounds in that file may belong to a deleted row, so MIN/MAX over it scans.
+# ============================================================================
+
+statement ok
+DELETE FROM lake.main.t WHERE id = 2;
+
+query II
+EXPLAIN SELECT count(*) FROM lake.main.t;
+----
+physical_plan	<!REGEX>:.*Fabricator Scan.*
+
+query I
+SELECT count(*) FROM lake.main.t;
+----
+3
+
+query II
+EXPLAIN SELECT max(id) FROM lake.main.t;
+----
+physical_plan	<REGEX>:.*Fabricator Scan.*
+
+query III
+SELECT count(*), max(id), max(d) FROM lake.main.t;
+----
+3	9	2027-01-01
+
+# The row that held a file's max, deleted through a vector: the file's recorded max (10) is now a bound,
+# not a value, and answering from it would return 10.
+statement ok
+CREATE TABLE lake.main.dv AS SELECT i::INTEGER AS id FROM range(1, 11) r(i);
+
+statement ok
+DELETE FROM lake.main.dv WHERE id = 10;
+
+query II
+SELECT count(*), max(id) FROM lake.main.dv;
+----
+9	9
+
+# ============================================================================
+# 4. A PARTITION FILE WITH NO LIVE ROW. Its partition value is no longer in the table, so it cannot stand
+#    for MIN/MAX: deleting the only 'ap' row must move min(region) off 'ap'.
+# ============================================================================
+
+statement ok
+DELETE FROM lake.main.t WHERE region = 'ap';
+
+query III
+SELECT count(*), min(region), max(region) FROM lake.main.t;
+----
+2	eu	eu
+
+statement ok
+SET fabricator_partition_stats = false;
+
+query III
+SELECT count(*), min(region), max(region) FROM lake.main.t;
+----
+2	eu	eu
+
+statement ok
+SET fabricator_partition_stats = true;
+
+# ============================================================================
+# 5. NULLS: MIN/MAX ignore them. A file whose column is NULL in every row reports a null count and no bounds;
+#    DuckDB then declines the rewrite for that column itself (TryGetValueFromStats needs a min/max), so this
+#    section asserts values, not routing.
+# ============================================================================
+
+statement ok
+CREATE TABLE lake.main.n (id INTEGER, v BIGINT);
+
+statement ok
+INSERT INTO lake.main.n VALUES (1, NULL), (2, NULL);
+
+statement ok
+INSERT INTO lake.main.n VALUES (3, 30), (4, NULL), (5, 10);
+
+query III
+SELECT count(*), min(v), max(v) FROM lake.main.n;
+----
+5	10	30
+
+statement ok
+SET fabricator_partition_stats = false;
+
+query III
+SELECT count(*), min(v), max(v) FROM lake.main.n;
+----
+5	10	30
+
+statement ok
+SET fabricator_partition_stats = true;
+
+# ============================================================================
+# 6. PENDING WRITES: inside a transaction that has written to the table, the log does not describe what the
+#    scan returns (the overlay adds the buffered rows), so there are no statistics and the scan runs.
+# ============================================================================
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO lake.main.n VALUES (6, 1000);
+
+query II
+EXPLAIN SELECT count(*) FROM lake.main.n;
+----
+physical_plan	<REGEX>:.*Fabricator Scan.*
+
+query III
+SELECT count(*), min(v), max(v) FROM lake.main.n;
+----
+6	10	1000
+
+statement ok
+ROLLBACK;
+
+query III
+SELECT count(*), min(v), max(v) FROM lake.main.n;
+----
+5	10	30
+
+# ============================================================================
+# 7. THE PIN. A transaction that has read the table keeps reading that version while another connection
+#    commits; metadata must answer for the PINNED version, not the latest one.
+# ============================================================================
+
+statement ok con1
+BEGIN;
+
+query I con1
+SELECT count(*) FROM lake.main.n;
+----
+5
+
+statement ok con2
+INSERT INTO lake.main.n VALUES (7, 7000);
+
+# count(*) alone: max(v) scans here anyway (one file has v NULL in every row, see §5).
+query II con1
+EXPLAIN SELECT count(*) FROM lake.main.n;
+----
+physical_plan	<!REGEX>:.*Fabricator Scan.*
+
+query II con1
+SELECT count(*), max(v) FROM lake.main.n;
+----
+5	30
+
+statement ok con1
+COMMIT;
+
+query II
+SELECT count(*), max(v) FROM lake.main.n;
+----
+6	7000
+
+# 7b. A TABLE FIRST TOUCHED LATER IN THE TRANSACTION is read as of the transaction's first-read INSTANT,
+#     so a commit landing in between is invisible — to the scan, and so to the metadata answer. Same shape
+#     twice: from metadata, then with the switch off (the oracle).
+#     ⚠ The table's entry is bound once BEFORE either transaction, deliberately. The FIRST bind of an entry
+#     runs a schema probe that seeds the pin at LATEST, so a transaction that happens to bind the table for
+#     the first time reads latest instead (measured with the switch off). That is the scan's existing
+#     behaviour, not this feature's; warming the entry keeps both halves in the same state.
+
+statement ok
+CREATE TABLE lake.main.m AS SELECT i::INTEGER AS id FROM range(1, 4) r(i);
+
+query I con1
+SELECT count(*) FROM lake.main.m;
+----
+3
+
+statement ok con1
+BEGIN;
+
+query I con1
+SELECT count(*) FROM lake.main.t;
+----
+2
+
+statement ok con2
+INSERT INTO lake.main.m VALUES (100);
+
+query II con1
+SELECT count(*), max(id) FROM lake.main.m;
+----
+3	3
+
+statement ok con1
+COMMIT;
+
+statement ok con1
+SET fabricator_partition_stats = false;
+
+statement ok con1
+BEGIN;
+
+query I con1
+SELECT count(*) FROM lake.main.t;
+----
+2
+
+statement ok con2
+INSERT INTO lake.main.m VALUES (200);
+
+query II con1
+SELECT count(*), max(id) FROM lake.main.m;
+----
+4	100
+
+statement ok con1
+COMMIT;
+
+statement ok con1
+SET fabricator_partition_stats = true;
+
+query II
+SELECT count(*), max(id) FROM lake.main.m;
+----
+5	200
+
+# ============================================================================
+# 8. TIME TRAVEL: AT (VERSION => n) answers for that version.
+# ============================================================================
+
+query II
+SELECT count(*), max(v) FROM lake.main.n AT (VERSION => 1);
+----
+2	NULL
+
+query II
+SELECT count(*), max(v) FROM lake.main.n AT (VERSION => 2);
+----
+5	30
+
+statement ok
+SET fabricator_partition_stats = false;
+
+query II
+SELECT count(*), max(v) FROM lake.main.n AT (VERSION => 2);
+----
+5	30
+
+statement ok
+SET fabricator_partition_stats = true;
+
+# ============================================================================
+# 9. A COLUMN ADDED LATER: older files carry no statistics for it, so it scans, and the rows written before
+#    the ALTER read as NULL.
+# ============================================================================
+
+statement ok
+ALTER TABLE lake.main.n ADD COLUMN w INTEGER;
+
+statement ok
+INSERT INTO lake.main.n VALUES (8, 8, 80);
+
+query III
+SELECT count(*), min(w), max(w) FROM lake.main.n;
+----
+7	80	80
+
+# ============================================================================
+# 10. COPY-ON-WRITE: with deletion vectors off a DELETE rewrites the file, and the rewritten file's
+#     statistics are its own, so its bounds stay exact.
+# ============================================================================
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/pstats_cow' AS cow (TYPE fabricator, PROVIDER '${DELTA_PROVIDER}', deletion_vectors false);
+
+statement ok
+CREATE TABLE cow.main.c AS SELECT i::INTEGER AS id FROM range(1, 101) r(i);
+
+statement ok
+DELETE FROM cow.main.c WHERE id = 100;
+
+query II
+EXPLAIN SELECT count(*), max(id) FROM cow.main.c;
+----
+physical_plan	<!REGEX>:.*Fabricator Scan.*
+
+query II
+SELECT count(*), max(id) FROM cow.main.c;
+----
+99	99
+
+statement ok
+SET fabricator_partition_stats = false;
+
+query II
+SELECT count(*), max(id) FROM cow.main.c;
+----
+99	99

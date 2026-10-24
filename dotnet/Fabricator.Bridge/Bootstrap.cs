@@ -91,7 +91,7 @@ public static unsafe class Bootstrap
                             () => OneRowStream(probeSchema, Interlocked.Increment(ref _lazyOpens) - 1),
                             probeSchema);
 
-        vtable->AbiVersion = 94;
+        vtable->AbiVersion = 95;
         vtable->OpenCatalog = &OpenCatalog;
         vtable->CloseCatalog = &CloseCatalog;
         vtable->ExecuteQuery = &ExecuteQuery;
@@ -176,6 +176,7 @@ public static unsafe class Bootstrap
         vtable->LateralBindClose = &LateralBindClose;
         vtable->TableDmlInfo = &TableDmlInfo;
         vtable->TableDmlWhere = &TableDmlWhere;
+        vtable->TablePartitionStats = &TablePartitionStats;
         return FabricatorStatus.Ok;
     }
 
@@ -680,6 +681,28 @@ public static unsafe class Bootstrap
         catch (Exception ex)
         {
             values?.Dispose();
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int TablePartitionStats(nint table, byte* atUnit, byte* atValue, byte** outJson, byte** err)
+    {
+        try
+        {
+            if (outJson is null || Handles.Resolve<TableSession>(table) is not { } session)
+            {
+                return FabricatorStatus.InvalidArgument;
+            }
+            string unit = atUnit is null ? "" : Marshal.PtrToStringUTF8((nint)atUnit) ?? "";
+            string value = atValue is null ? "" : Marshal.PtrToStringUTF8((nint)atValue) ?? "";
+            TableAt? at = unit.Length == 0 ? null : new TableAt(unit, value);
+            *outJson = (byte*)Marshal.StringToCoTaskMemUTF8(session.PartitionStatsJson(at)); // host frees via free_error
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
             SetError(err, ex);
             return FabricatorStatus.Error;
         }

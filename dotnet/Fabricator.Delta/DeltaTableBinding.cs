@@ -563,6 +563,9 @@ internal sealed class DeltaTableBinding : ITableBinding
         DeltaReader.GetRowCount(Catalog.Opener(), Path, _at?.Unit, _at?.Value, Catalog.ReadBound(Path));
 
     /// <inheritdoc/>
+    public IReadOnlyList<FileStatistics>? PartitionStatistics() => Catalog.PartitionStatistics(Path, _at);
+
+    /// <inheritdoc/>
     /// <remarks>Empty, and unlike the row count above this one is a genuine ABSENCE rather than an omission:
     /// a Delta <c>add</c>'s stats carry min / max / nullCount per column but NO distinct-value estimate, so
     /// there is nothing in the log to report. Producing one would mean reading the data.</remarks>

@@ -39,11 +39,13 @@ internal sealed class TableSession
     /// binding afterwards when it is CALLER-OWNED per the <see cref="ITableBinding"/> ownership rule (no
     /// transaction, or an AT bind — a memoized transaction-owned binding is never disposed here).
     /// </summary>
-    private T With<T>(Func<ITableBinding, T> body)
+    private T With<T>(Func<ITableBinding, T> body) => With(body, _at);
+
+    private T With<T>(Func<ITableBinding, T> body, TableAt? at)
     {
         var txn = _catalog.ResolveTransaction(AmbientTransaction.Current);
-        var bound = _definition.Bind(txn, _at);
-        bool callerOwned = txn is null || _at is not null;
+        var bound = _definition.Bind(txn, at);
+        bool callerOwned = txn is null || at is not null;
         try
         {
             return body(bound);
@@ -174,6 +176,52 @@ internal sealed class TableSession
     // storage location, and this handler is where that was silently wrong before ABI v92.
     internal void Alter(AlterTableSpec spec, Field? column) =>
         _catalog.AlterTable(spec, _definition.SchemaPath, _definition.TableName, column);
+
+    /// <summary>The <c>table_partition_stats</c> answer (ABI v95). <paramref name="at"/> is the scan's AT
+    /// clause, which rides the SCAN rather than the handle, so it is passed per call. No <c>"files"</c> key
+    /// means no statistics.</summary>
+    internal string PartitionStatsJson(TableAt? at) => With(t =>
+    {
+        var files = t.PartitionStatistics();
+        using var buffer = new MemoryStream();
+        using (var json = new Utf8JsonWriter(buffer))
+        {
+            json.WriteStartObject();
+            if (files is not null)
+            {
+                json.WriteStartArray("files");
+                foreach (var file in files)
+                {
+                    json.WriteStartObject();
+                    if (file.RowCount is { } count)
+                    {
+                        json.WriteNumber("count", count);
+                    }
+                    json.WriteStartObject("cols");
+                    foreach (var pair in file.Columns)
+                    {
+                        json.WriteStartObject(pair.Key);
+                        if (pair.Value.Min is { } min && pair.Value.Max is { } max)
+                        {
+                            json.WriteString("min", min);
+                            json.WriteString("max", max);
+                        }
+                        if (pair.Value.NullCount is { } nulls)
+                        {
+                            json.WriteNumber("nulls", nulls);
+                        }
+                        json.WriteBoolean("exact", pair.Value.Exact);
+                        json.WriteEndObject();
+                    }
+                    json.WriteEndObject();
+                    json.WriteEndObject();
+                }
+                json.WriteEndArray();
+            }
+            json.WriteEndObject();
+        }
+        return Encoding.UTF8.GetString(buffer.ToArray());
+    }, at ?? _at);
 
     /// <summary>The <c>table_dml_info</c> answer (ABI v93): <c>{"delete_where": bool}</c>.</summary>
     internal string DmlInfoJson() => With(t =>

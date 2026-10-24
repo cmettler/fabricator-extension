@@ -1176,6 +1176,26 @@ typedef struct FabricatorVTable {
 	// bridge handed an UPDATE spec would have run it as a DELETE.
 	int32_t (*table_dml_where)(FabricatorHandle table, const char *spec_json,
 	                           struct ArrowArrayStream *filter_values, int64_t *affected, char **err);
+
+	// -------------------------------------------------------------------------
+	// PARTITION STATISTICS on the table session — ABI v95. Per-file row counts and column bounds read from
+	// metadata alone, so DuckDB can answer an ungrouped COUNT(*) / MIN / MAX without scanning
+	// (StatisticsPropagator::TryExecuteAggregates). Asked when a statement reading the table is OPTIMIZED,
+	// never at enumeration.
+	// -------------------------------------------------------------------------
+
+	// ONE JSON doc, owned UTF-8 in *out_json (host frees via free_error). `at_unit`/`at_value` are the
+	// reference's AT clause (empty = none). Shape:
+	//   {"files":[{"count":N, "cols":{"<column>":{"min":"<text>","max":"<text>","nulls":N,"exact":bool}}}]}
+	// An absent "files" means NO statistics (the scan runs). An absent "count" means that file's count is
+	// unknown. min/max are DuckDB-castable TEXT; an absent "nulls" means the null count is unknown.
+	// ⚠ THE ANSWER REPLACES THE SCAN, so it must describe exactly what the scan would return: the snapshot
+	// the scan would read (the same pin), with nothing pending in the transaction — a provider with buffered
+	// writes on the table answers with no "files". `count` is the LIVE row count. `exact` claims min and max
+	// are VALUES PRESENT among the file's live rows, not merely bounds; a provider that cannot say so sends
+	// false, and DuckDB then uses neither the bounds nor a filter check for that column.
+	int32_t (*table_partition_stats)(FabricatorHandle table, const char *at_unit, const char *at_value,
+	                                 char **out_json, char **err);
 } FabricatorVTable;
 
 // -----------------------------------------------------------------------------
@@ -1412,7 +1432,7 @@ typedef struct FabricatorHostServices {
 // state blob is this many bytes + a 4-byte length prefix). Serialize() must fit within it.
 #define FABRICATOR_AGG_SPILL_CAP 1024
 
-#define FABRICATOR_ABI_VERSION 94
+#define FABRICATOR_ABI_VERSION 95
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(FabricatorVTable) as seen
