@@ -3131,29 +3131,13 @@ public sealed class DeltaCatalog : IProviderCatalog
         }
         if (w.BloomFilterColumns is { } bloom)
         {
-            // ⚠ REFUSE UNDER COLUMN MAPPING — this option SILENTLY DID NOTHING on the DEFAULT table shape
-            // until 2026-08-07, and nothing caught it because no suite ever asserted that a bloom filter was
-            // written at all. engineered-wood matches BloomFilterColumns against the PARQUET path, and on a
-            // column-mapped table that path is the PHYSICAL name (`col-e090d9ee…`), never the logical one —
-            // measured: 0 of 10 column chunks got a filter with mapping on, 10 of 10 with it off.
-            //
-            // Refusing rather than fixing is deliberate and bounded: the physical names are assigned by the
-            // CREATE itself, and engineered-wood takes ParquetWriteOptions AT OPEN, so translating them needs
-            // either a two-phase open or an EW-side resolution against the Delta schema. Until then a loud
-            // error with the one-word workaround beats a knob that writes nothing.
-            //
-            // Only the WITH layer is refused. A `SET delta_write_options` bloom list spans every table in the
-            // session (some mapped, some not), and a PERSISTED one is a declaration a different engine may
-            // read — failing either would punish writes that never asked for anything here. Those two are
-            // logged instead, at Debug, by the persisted layer's drop reporting.
-            if (EffectiveCreateFlags(w).ColumnMapping
-                != EngineeredWood.DeltaLake.Schema.ColumnMappingMode.None)
-            {
-                throw new System.ArgumentException(
-                    "parquet_bloom_filter_columns names LOGICAL columns, but this table uses column mapping, "
-                    + "where the parquet files store PHYSICAL names — the filter would never be built. Add "
-                    + "column_mapping='none' to the same WITH clause, or drop the option.");
-            }
+            // Under column mapping too, since the 2026-10-23 engineered-wood bump (EW 65a69a6): EW translates
+            // every per-column write option from LOGICAL to PHYSICAL names against the snapshot it writes with,
+            // so a list naming `id` reaches the `col-<uuid>` leaf. Until then this option SILENTLY DID NOTHING on
+            // the default (mapped) table shape — 0 of 10 column chunks got a filter — and was REFUSED here from
+            // 2026-08-07. verify_with_options §9c measures the filter landing on a mapped table's file, through a
+            // CTAS, a later INSERT (the persisted property) and an UPDATE rewrite. ⚠ Codec engine only: on the
+            // native path DuckDB chooses bloom columns itself and the list is not rendered.
             spec = spec with { BloomFilterColumns = bloom };
         }
         if (w.RowGroupSizeBytes is { } rgb)

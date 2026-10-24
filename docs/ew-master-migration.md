@@ -3070,6 +3070,9 @@ a concurrent blind append matching its predicate, which Spark aborts."*
   column-mapped table — 0 of 10 chunks got a filter with mapping on, 10 of 10 with it off) and recorded as
   *"the real fix is an upstream-shaped ask and is the right thing to do later."* Upstream did it. ⇒ the
   refusal in the `WITH` layer can now be lifted; NOT done in this bump, and it wants its own gate.
+  **✅ LIFTED 2026-10-24** with that gate: `verify_with_options` §9c reads the files and requires the filter on
+  `id`'s chunks and on no other column's, across a CTAS, a later INSERT (the persisted property) and an UPDATE
+  rewrite — measured before writing it, every `id` chunk bloomed and none of the other column's.
 - `a684678`-class pruning fixes, the eight ALP commits and the vortex/Lance work: INERT. We reference
   exactly ONE EW project, `EngineeredWood.DeltaLake.Table` (established by grepping the csprojs), set no
   `ByteArrayEncoding`, and declare none of the new feature flags. ⚠ The standing rule is unchanged: do NOT

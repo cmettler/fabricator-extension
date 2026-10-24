@@ -940,22 +940,64 @@ CREATE OR REPLACE TABLE lv.main.bad WITH (parquet_bloom_filter_false_positive_ra
 ----
 between 0 and 1
 
-# ---- 9c. ⚠ parquet_bloom_filter_columns UNDER COLUMN MAPPING — was a SILENT NO-OP, now refused ----
-# engineered-wood matches the list against the PARQUET path, and on a column-mapped table that path is the
-# PHYSICAL name (`col-<uuid>`), never the logical one. MEASURED before the guard: 0 of 10 column chunks got
-# a filter with mapping on, 10 of 10 with it off. Column mapping is the DEFAULT, so the option did nothing
-# on the shape almost everyone has — and nothing caught it because no suite asserted a filter was written.
+# ---- 9c. parquet_bloom_filter_columns UNDER COLUMN MAPPING — a silent no-op, then refused, now WORKS ----
+# engineered-wood matched the list against the PARQUET path, which on a column-mapped table is the PHYSICAL
+# name (`col-<uuid>`): 0 of 10 column chunks got a filter with mapping on, 10 of 10 with it off — on the
+# DEFAULT table shape. It was refused from 2026-08-07. EW 65a69a6 (taken by the 2026-10-23 bump) translates
+# per-column write options logical -> physical against the snapshot it writes with, so it now works, and the
+# oracle is the FILE: the filter must be on `id`'s chunks and on no other column's.
 
 statement ok
 ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/optlvlc' AS lvc (TYPE fabricator, PROVIDER 'engineeredwooddelta');
 
-statement error
-CREATE OR REPLACE TABLE lvc.main.mapped WITH (parquet_bloom_filter_columns='id') AS SELECT (i%500)::BIGINT AS id FROM range(20000) r(i);
-----
-column mapping
+statement ok
+CREATE OR REPLACE TABLE lvc.main.mapped WITH (parquet_bloom_filter_columns='id') AS SELECT (i%500)::BIGINT AS id, (i%7)::BIGINT AS other FROM range(20000) r(i);
 
-# THE POSITIVE CONTROL, and it is what makes the refusal a guard rather than a blanket ban: with mapping
-# off the option works, and the filter is really in the file.
+# Mapped for real (physical leaf names), so this is not passing on the unmapped shape.
+query I
+SELECT count(*) FROM parquet_metadata('${FABRICATOR_DELTA_WRITE_DIR}/optlvlc/mapped/*.parquet')
+WHERE path_in_schema NOT LIKE 'col-%';
+----
+0
+
+# Every `id` chunk carries a filter and no other chunk does. Both leaves are physical names, so `id`'s is found
+# by its maximum (499; `other` stays below 7) — exactly one name, asserted first.
+query I
+SELECT count(*) FROM (SELECT DISTINCT path_in_schema FROM parquet_metadata('${FABRICATOR_DELTA_WRITE_DIR}/optlvlc/mapped/*.parquet') WHERE stats_max = '499');
+----
+1
+
+query III
+SELECT count(*) FILTER (WHERE path_in_schema IN (SELECT DISTINCT path_in_schema FROM parquet_metadata('${FABRICATOR_DELTA_WRITE_DIR}/optlvlc/mapped/*.parquet') WHERE stats_max = '499') AND bloom_filter_offset IS NULL),
+       count(*) FILTER (WHERE path_in_schema NOT IN (SELECT DISTINCT path_in_schema FROM parquet_metadata('${FABRICATOR_DELTA_WRITE_DIR}/optlvlc/mapped/*.parquet') WHERE stats_max = '499') AND bloom_filter_offset IS NOT NULL),
+       count(*) FILTER (WHERE path_in_schema IN (SELECT DISTINCT path_in_schema FROM parquet_metadata('${FABRICATOR_DELTA_WRITE_DIR}/optlvlc/mapped/*.parquet') WHERE stats_max = '499')) > 0
+FROM parquet_metadata('${FABRICATOR_DELTA_WRITE_DIR}/optlvlc/mapped/*.parquet');
+----
+0	0	true
+
+# The declaration persists, so a later INSERT (no WITH) and an UPDATE's rewritten files carry it too — the same
+# two assertions over every file the table now has. The rewrite files also hold `__delta_row_id`, which is
+# neither column and must stay filter-less.
+statement ok
+INSERT INTO lvc.main.mapped SELECT (i%500)::BIGINT, 1 FROM range(5000) r(i);
+
+statement ok
+UPDATE lvc.main.mapped SET other = 6 WHERE id = 3;
+
+query III
+SELECT count(*) FILTER (WHERE path_in_schema IN (SELECT DISTINCT path_in_schema FROM parquet_metadata('${FABRICATOR_DELTA_WRITE_DIR}/optlvlc/mapped/*.parquet') WHERE stats_max = '499') AND bloom_filter_offset IS NULL),
+       count(*) FILTER (WHERE path_in_schema NOT IN (SELECT DISTINCT path_in_schema FROM parquet_metadata('${FABRICATOR_DELTA_WRITE_DIR}/optlvlc/mapped/*.parquet') WHERE stats_max = '499') AND bloom_filter_offset IS NOT NULL),
+       count(DISTINCT file_name) FILTER (WHERE path_in_schema = '__delta_row_id') > 0
+FROM parquet_metadata('${FABRICATOR_DELTA_WRITE_DIR}/optlvlc/mapped/*.parquet');
+----
+0	0	true
+
+query II
+SELECT count(*), sum(other) FILTER (WHERE id = 3) FROM lvc.main.mapped;
+----
+25000	300
+
+# The unmapped shape keeps working, with the columns stored under their LOGICAL names.
 statement ok
 CREATE OR REPLACE TABLE lvc.main.nomap WITH (column_mapping='none', parquet_bloom_filter_columns='id') AS SELECT (i%500)::BIGINT AS id FROM range(20000) r(i);
 
@@ -966,8 +1008,6 @@ FROM parquet_metadata('${FABRICATOR_DELTA_WRITE_DIR}/optlvlc/nomap/*.parquet');
 ----
 1
 
-# ...and the columns really are stored under their LOGICAL names there, which is the mechanism the guard
-# is about rather than an incidental difference.
 query T
 SELECT DISTINCT path_in_schema FROM parquet_metadata('${FABRICATOR_DELTA_WRITE_DIR}/optlvlc/nomap/*.parquet');
 ----
