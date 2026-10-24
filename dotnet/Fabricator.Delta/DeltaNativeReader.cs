@@ -1306,11 +1306,14 @@ internal static class DeltaNativeReader
             foreach (var c in trackingCols)
             {
                 bool isId = string.Equals(c, RowTrackingIdColumn, StringComparison.Ordinal);
+                // The materialized column is stored under the name the table DECLARES (ours `__delta_row_id`,
+                // Spark `_row-id-col-<uuid>`); looking it up by the virtual name missed it on a Spark table.
+                string stored = isId ? listing.MaterializedRowIdName : listing.MaterializedRowCommitVersionName;
                 string derived = isId
                     ? "(__fab_f.base_row_id + __fab_rp.file_row_number)"
                     : "__fab_f.commit_version";
-                string expr = present.Contains(c)
-                    ? $"COALESCE(__fab_rp.{Quote(c)}, {derived})"
+                string expr = present.Contains(stored)
+                    ? $"COALESCE(__fab_rp.{Quote(stored)}, {derived})"
                     : derived;
                 inner.Add($"{expr} AS {Quote(c)}");
             }
@@ -1815,7 +1818,16 @@ internal static class DeltaNativeReader
     // predates (schema evolution) is emitted as a typed NULL instead of a mis-binding reference.
     private readonly record struct FileMapping(
         IReadOnlyDictionary<string, string>? LogToPhys,
-        FileNodes Nodes);
+        FileNodes Nodes,
+        string MaterializedRowId,
+        string MaterializedRowCommitVersion)
+    {
+        /// <summary>The STORED name of a row-tracking virtual column's materialized form in this table — the
+        /// table property's name, which is NOT the virtual name for a Spark-written table.</summary>
+        internal string MaterializedNameOf(string virtualName) =>
+            string.Equals(virtualName, RowTrackingIdColumn, StringComparison.Ordinal)
+                ? MaterializedRowId : MaterializedRowCommitVersion;
+    }
 
     private const char PathSep = ''; // joins stored-name path segments (names may contain dots)
 
@@ -1831,10 +1843,13 @@ internal static class DeltaNativeReader
                 ? $"(CAST({b.ToString(CultureInfo.InvariantCulture)} AS BIGINT) + file_row_number)" : null
             : f.CommitVersion is { } v
                 ? $"CAST({v.ToString(CultureInfo.InvariantCulture)} AS BIGINT)" : null;
-        bool hasMaterialized = fm.Nodes.Paths.Contains(name);
+        // ⚠ The STORED name comes from the table property, never from the virtual name — see
+        // NativeScanList.MaterializedRowIdName for the measured wrong answer the literal produced on Spark tables.
+        string stored = fm.MaterializedNameOf(name);
+        bool hasMaterialized = fm.Nodes.Paths.Contains(stored);
         if (hasMaterialized)
         {
-            return derived is null ? Quote(name) : $"COALESCE({Quote(name)}, {derived})";
+            return derived is null ? Quote(stored) : $"COALESCE({Quote(stored)}, {derived})";
         }
         return derived ?? "CAST(NULL AS BIGINT)";
     }
@@ -2387,8 +2402,8 @@ internal static class DeltaNativeReader
                                 // needs anyway): a skipped file costs the probe but never a data read.
                                 trackingFilter.FileVerdict(
                                     file,
-                                    idMaterialized: fm.Nodes.Paths.Contains(RowTrackingIdColumn),
-                                    versionMaterialized: fm.Nodes.Paths.Contains(RowTrackingVersionColumn),
+                                    idMaterialized: fm.Nodes.Paths.Contains(fm.MaterializedRowId),
+                                    versionMaterialized: fm.Nodes.Paths.Contains(fm.MaterializedRowCommitVersion),
                                     out bool skipFile, out trackingCond);
                                 if (skipFile)
                                 {
@@ -2449,11 +2464,13 @@ internal static class DeltaNativeReader
         var nodes = ProbeFileNodes(uri);
         if (listing.LogicalToPhysical is { } phys)
         {
-            return new FileMapping(phys, nodes);
+            return new FileMapping(phys, nodes, listing.MaterializedRowIdName,
+                                   listing.MaterializedRowCommitVersionName);
         }
         if (listing.LogicalToFieldId is not { } logToFid)
         {
-            return new FileMapping(null, nodes);
+            return new FileMapping(null, nodes, listing.MaterializedRowIdName,
+                                   listing.MaterializedRowCommitVersionName);
         }
         var map = new Dictionary<string, string>();
         foreach (var kv in logToFid)
@@ -2463,7 +2480,8 @@ internal static class DeltaNativeReader
                 map[kv.Key] = physName;
             }
         }
-        return new FileMapping(map.Count > 0 ? map : null, nodes);
+        return new FileMapping(map.Count > 0 ? map : null, nodes, listing.MaterializedRowIdName,
+                               listing.MaterializedRowCommitVersionName);
     }
 
     // The stored (in-file) name of a mapped field at ANY nesting level: id mode resolves through THIS file's

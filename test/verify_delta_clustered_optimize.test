@@ -698,3 +698,59 @@ SELECT count(*) FROM clake.main.cw;
 
 statement ok
 DETACH clake;
+
+# ============================================================================
+# 9. A SPARK-NAMED materialized row id survives a recluster (2026-10-24). The rewrite used to carry the
+#    materialized ids only when the table's declared names EQUALLED ours (`__delta_row_id` …), so on a
+#    Spark-written table — whose names are `_row-id-col-<uuid>` — every reclustered row got a NEW id. The
+#    Spark-style name is declared BEFORE any rewrite. SORTED BY orders each WRITE, so the two files are
+#    each sorted on k, and the recluster puts the second file's rows (k 0..49) ahead of the first's — the
+#    first file's rows MOVE, so an id that is not carried over visibly changes. Every id is captured before
+#    the recluster and compared after; a hand-computed expectation got the positions wrong.
+# ============================================================================
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/clustopt' AS lake (TYPE fabricator, PROVIDER 'delta', native_read true, native_write true);
+
+statement ok
+CREATE TABLE lake.main.rspark SORTED BY (k) AS SELECT i::BIGINT AS id, (99 - i)::BIGINT AS k FROM range(50) r(i);
+
+statement ok
+INSERT INTO lake.main.rspark SELECT i::BIGINT, (99 - i)::BIGINT FROM range(50, 100) r(i);
+
+statement ok
+SELECT * FROM lake.delta.set_tblproperties('main.rspark', '{"delta.rowTracking.materializedRowIdColumnName":"_row-id-col-spark","delta.rowTracking.materializedRowCommitVersionColumnName":"_row-commit-version-col-spark"}');
+
+statement ok
+CREATE TEMP TABLE rspark_before AS SELECT id, __delta_row_id AS rid FROM lake.main.rspark;
+
+query II
+SELECT count(*), count(DISTINCT rid) FROM rspark_before;
+----
+100	100
+
+query I
+SELECT fabricator_exec('lake', 'OPTIMIZE main.rspark');
+----
+0
+
+query I
+SELECT count(DISTINCT rowid >> 40) FROM lake.main.rspark;
+----
+1
+
+# The clustered file stores the ids under the DECLARED name...
+query I
+SELECT count(*) > 0 FROM parquet_schema('${FABRICATOR_DELTA_WRITE_DIR}/clustopt/rspark/*.parquet')
+WHERE name = '_row-id-col-spark';
+----
+true
+
+# ...and every row keeps the id it had before, although half of them moved.
+query II
+SELECT count(*), count(*) FILTER (WHERE r.__delta_row_id <> b.rid)
+FROM lake.main.rspark r JOIN rspark_before b USING (id);
+----
+100	0
+
+statement ok
+DETACH lake;

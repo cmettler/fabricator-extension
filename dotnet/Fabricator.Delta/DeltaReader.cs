@@ -426,6 +426,43 @@ internal static class DeltaReader
         /// reader's per-file presence handling: stored names, field ids and typed NULL backfill for
         /// columns/members a file predates (schema evolution).</summary>
         public EngineeredWood.DeltaLake.Schema.StructType? TableSchema { get; init; }
+
+        /// <summary>The STORED name of the materialized row-id column in this table's data files — the table's
+        /// <c>delta.rowTracking.materializedRowIdColumnName</c>, else the legacy literal
+        /// <c>__delta_row_id</c> a pre-1.0 engineered-wood writer used without declaring it.</summary>
+        /// <remarks>⚠ The property is the ONLY source of truth for this name. Our own tables declare the
+        /// literal, which is why reading the literal looked correct for so long; delta-spark generates
+        /// <c>_row-id-col-&lt;uuid&gt;</c> at enablement, and reading the literal there silently replaced every
+        /// rewritten row's original id with a derived one (MEASURED 2026-10-24 on a Fabric Spark table: rows
+        /// whose ids are 2, 3, 12 read back as 22, 20, 21). docs/known-limitations.md §2.x.</remarks>
+        public string MaterializedRowIdName { get; init; } = DeltaNativeReader.RowTrackingIdColumn;
+
+        /// <summary>As <see cref="MaterializedRowIdName"/>, for the commit version
+        /// (<c>delta.rowTracking.materializedRowCommitVersionColumnName</c>).</summary>
+        public string MaterializedRowCommitVersionName { get; init; } = DeltaNativeReader.RowTrackingVersionColumn;
+    }
+
+    /// <summary>The stored names of a table's materialized row-tracking columns, from its configuration:
+    /// the declared property where present, else the legacy literal.</summary>
+    internal static (string RowId, string Version) MaterializedTrackingNames(
+        IReadOnlyDictionary<string, string>? configuration)
+    {
+        string id = DeltaNativeReader.RowTrackingIdColumn;
+        string version = DeltaNativeReader.RowTrackingVersionColumn;
+        if (configuration is not null)
+        {
+            if (configuration.TryGetValue("delta.rowTracking.materializedRowIdColumnName", out var i)
+                && !string.IsNullOrEmpty(i))
+            {
+                id = i;
+            }
+            if (configuration.TryGetValue("delta.rowTracking.materializedRowCommitVersionColumnName", out var v)
+                && !string.IsNullOrEmpty(v))
+            {
+                version = v;
+            }
+        }
+        return (id, version);
     }
 
     /// <summary>Resolves the version whose commit is at/just-before <paramref name="instantUtc"/> (via the
@@ -644,12 +681,14 @@ internal static class DeltaReader
                 ? schemaForMaps : null;
             log.LogDebug("delta native list: {Path} v{Version} active={Active} scanned={Scanned} pruned={Pruned} colmap={Map}",
                 path, snap.Version, snap.ActiveFiles.Count, files.Count, pruned, mode);
+            var (matRowId, matVersion) = MaterializedTrackingNames(snap.Metadata.Configuration);
             return new NativeScanList
             {
                 Version = snap.Version,
                 PartitionColumns = snap.Metadata.PartitionColumns, Files = files, AnyUri = anyUri,
                 LogicalToPhysical = logicalToPhysical, LogicalToFieldId = logicalToFieldId,
                 MappedSchema = mappedSchema, TableSchema = schemaForMaps,
+                MaterializedRowIdName = matRowId, MaterializedRowCommitVersionName = matVersion,
             };
         }
     }
@@ -2275,11 +2314,17 @@ internal static class DeltaReader
         // id/version into the clustered file (the compaction preservation rule). Partition columns join the
         // INNER selection (FileSql renders them as typed literals — a cluster key may be one) but are
         // EXCLUDED from the written file (Delta layout: values live in add.partitionValues).
+        // ⚠ ANY declared names, not only ours. This used to require the names to EQUAL our literal
+        // `__delta_row_id` / `__delta_row_commit_version`, so on a SPARK-written table (whose names are
+        // `_row-id-col-<uuid>` …) the rewrite carried no materialized ids and every rewritten row was handed a
+        // NEW id — the same literal-name defect the reader had (docs/known-limitations.md §2.x). The file is
+        // written under the DECLARED names (see the projection below), which is what any reader looks up.
         bool materializeIds = snap.Metadata.Configuration is { } rtCfg
             && rtCfg.TryGetValue("delta.rowTracking.materializedRowIdColumnName", out var mrc)
-            && string.Equals(mrc, DeltaNativeReader.RowTrackingIdColumn, StringComparison.Ordinal)
+            && !string.IsNullOrEmpty(mrc)
             && rtCfg.TryGetValue("delta.rowTracking.materializedRowCommitVersionColumnName", out var mvc)
-            && string.Equals(mvc, DeltaNativeReader.RowTrackingVersionColumn, StringComparison.Ordinal);
+            && !string.IsNullOrEmpty(mvc);
+        var (matRowIdName, matVersionName) = MaterializedTrackingNames(snap.Metadata.Configuration);
         var dataCols = new List<string>(snap.Schema.Fields.Count + 2);
         foreach (var f in snap.Schema.Fields)
         {
@@ -2293,7 +2338,8 @@ internal static class DeltaReader
         var partSet = new HashSet<string>(snap.Metadata.PartitionColumns, StringComparer.OrdinalIgnoreCase);
 
         // The outermost projection renames logical → physical for the written file (data files carry physical
-        // names in BOTH mapping modes); the row-tracking columns keep their literal, unmapped names.
+        // names in BOTH mapping modes); the row-tracking columns are written under the table's DECLARED
+        // materialized names (they are not column-mapped).
         static string Q(string s) => "\"" + s.Replace("\"", "\"\"") + "\"";
         var select = new List<string>(dataCols.Count);
         foreach (var c in dataCols)
@@ -2303,7 +2349,11 @@ internal static class DeltaReader
                 continue;
             }
             var f = snap.Schema.Fields.FirstOrDefault(x => string.Equals(x.Name, c, StringComparison.Ordinal));
-            string phys = f is null ? c : EngineeredWood.DeltaLake.Schema.ColumnMapping.GetPhysicalName(f, mode);
+            // The tracking virtual columns are written under the table's DECLARED materialized names.
+            string phys = f is not null ? EngineeredWood.DeltaLake.Schema.ColumnMapping.GetPhysicalName(f, mode)
+                : string.Equals(c, DeltaNativeReader.RowTrackingIdColumn, StringComparison.Ordinal) ? matRowIdName
+                : string.Equals(c, DeltaNativeReader.RowTrackingVersionColumn, StringComparison.Ordinal) ? matVersionName
+                : c;
             select.Add(string.Equals(phys, c, StringComparison.Ordinal) ? Q(c) : $"{Q(c)} AS {Q(phys)}");
         }
         string projection = string.Join(", ", select);
@@ -2451,6 +2501,8 @@ internal static class DeltaReader
                 LogicalToFieldId = listing.LogicalToFieldId,
                 MappedSchema = listing.MappedSchema,
                 TableSchema = listing.TableSchema,
+                MaterializedRowIdName = listing.MaterializedRowIdName,
+                MaterializedRowCommitVersionName = listing.MaterializedRowCommitVersionName,
             };
             string source = BuildSource(DeltaNativeReader.FullTableSql(subListing, dataCols));
 
