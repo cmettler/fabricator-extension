@@ -749,6 +749,12 @@
       stats stay binary-truncated UTF-8, which is what EW's pruner compares), and Spark's default
       `UTF8_BINARY` = DuckDB's default VARCHAR order anyway.
 
+  **⚠⚠ 1.5-ONLY SINCE 2026-10-24: ON DuckDB 2.0 THE FULL FORM DOES USE THE `schema` MAP.** A NAME-keyed map
+  now composes with `file_row_number` and the field-id assertion is gone (measured on both builds —
+  [duckdb-upstream-issues.md](duckdb-upstream-issues.md) §1), so `TryFullForm` declares a name-keyed map:
+  no presence sweep, no footer read at bind, and structs served. ⚠ The REMOTE numbers in this file that
+  rank the full form against the union and plain forms were taken on the `union_by_name` full form and have
+  NOT been re-measured. The paragraph below is the 1.5 record:
   **⚠ AND THE FULL FORM CANNOT SIMPLY USE THE `schema` MAP INSTEAD** — that is settled and committed, do not
   re-derive it: a `MAP` is homogeneous in its key type AND the key type IS the matching mode (VARCHAR ⇒ by
   name, INTEGER ⇒ `BY_FIELD_ID`), so the call is forced to the HARDEST requirement in it. Virtual columns
@@ -936,7 +942,11 @@
       wrote it, so `union_by_name` in the full batched form is the only correct choice rather than a
       workaround for our own writer — and the `No default expression in FieldId Map` assertion in
       [docs/duckdb-upstream-issues.md](docs/duckdb-upstream-issues.md) §1 is reachable from a SPARK-written
-      table, which strengthens the report.
+      table, which strengthens the report. ⚠ **1.5-only**: on DuckDB 2.0 that assertion is fixed and the
+      full form uses a NAME-keyed map instead; what survives is that an ID-keyed map cannot reach these
+      columns at all. Their POSITION was measured 2026-10-24 (Fabric Spark: always LAST, row id before
+      commit version, both mapping modes; delta-spark's source, engineered-wood and our writer agree),
+      which keeps the 2.0 field-id mapper's silent-NULL defect (§11 there) out of reach.
     - **⚠ AND §1 IS NOW ROOT-CAUSED IN DuckDB's SOURCE, which explains all four of its controls.** Virtual
       columns carry an ICEBERG-RESERVED field id (`MultiFileReader::ORDINAL_FIELD_ID = 2147483645`,
       `FILENAME_FIELD_ID = 2147483646`) — so the `"2147483645"` in the name-keyed error is that constant,

@@ -3361,6 +3361,11 @@ SELECT table_name, status, error_message FROM lake.fabric.refresh_sql_endpoint()
 > `status <> 'Failure'` (or `error_code IS NULL`); asserting `status = 'Success'` fails on a healthy
 > refresh. On a schema-enabled lakehouse `table_name` is schema-qualified (`dbo.orders`).
 
+> ⚠ **What the endpoint will NOT show, however you refresh it** (measured 2026-10-24): a table written with
+> `column_mapping 'id'` is never exposed — silently, with no error — and a **struct column is dropped**
+> from every table, in every mapping mode (`SELECT s` answers `Invalid column name`). Keep the default
+> `column_mapping 'name'`, and flatten structs into scalar columns for any T-SQL consumer.
+
 > **In dbt, this hook must be non-transactional.** Delta commits land at DuckDB `COMMIT`, so an
 > in-transaction post-hook would refresh *before* the table exists. Use
 > `post_hook: [{sql: "SELECT count(*) FROM lake.fabric.refresh_sql_endpoint()", transaction: false}]`,
@@ -3963,16 +3968,19 @@ needs a row *position*, because that is the one thing only the file can supply:
 | only partition columns (`SELECT p, count(*)`) | answers from the log alone | **none** |
 | ordinary columns, no deletion vector in play | *declares* the schema up front | **none** |
 | ordinary columns, some files carry deletion vectors | the clean files as above, one extra branch per deleted file | one per *deleted* file |
-| anything needing a row position — `UPDATE`/`DELETE`, the row-tracking columns | *discovers* the schema from the files | **one per file, before the first row** |
+| anything needing a row position — `UPDATE`/`DELETE`, the row-tracking columns | *declares* the schema too, on DuckDB 2.0 builds | **none** (1.5 builds: one per file, before the first row) |
 
-The gap between declaring and discovering is the one to know about: measured on a Fabric lakehouse table
-with 89 active files, same query, same data, **0.5 s versus 34 s** — enough to take a `SELECT … LIMIT 1` on
-that table from 77 s to 47 s.
+On DuckDB **1.5** builds the last row is the one to know about: those scans have to *discover* the schema
+from the files, measured on a Fabric lakehouse table with 89 active files at **0.5 s versus 34 s** for the
+same query — enough to take a `SELECT … LIMIT 1` on that table from 77 s to 47 s. DuckDB 2.0 can read a
+row position alongside a declared schema, so on 2.0 builds every form declares it. ⚠ Tables using
+`column_mapping 'id'` take only the first row's shortcut; every other read of them goes file by file,
+on either line.
 
 Selecting a partition column is *not* one of the expensive cases, and neither is `SELECT *` on a partitioned
 table. (It was until 2026-08-17, and this section said so.) On remote storage a table where **any** file
-carries a deletion vector still sends ordinary reads to the discovering form unless the query pushes a plain
-`LIMIT`; locally it does not.
+carries a deletion vector still sends ordinary reads to the single-call form described in the last row
+unless the query pushes a plain `LIMIT`; locally it does not.
 
 On local storage none of this matters much, since opening a footer is nearly free. `OPTIMIZE` helps every
 form, because their costs scale with the number of active files — and on a heavily-deleted table it also
@@ -4782,7 +4790,7 @@ SELECT schema_name FROM duckdb_schemas() WHERE database_name = 'cat';
 | Option | Default | Effect |
 |--------|---------|--------|
 | `deletion_vectors` | **`true`** | DV / merge-on-read DELETE+UPDATE (+ row tracking); bumps the table to reader v3 |
-| `column_mapping` | **`'name'`** | writer v7; metadata-only RENAME / DROP COLUMN; Fabric T-SQL-endpoint compatible |
+| `column_mapping` | **`'name'`** | writer v7; metadata-only RENAME / DROP COLUMN; Fabric T-SQL-endpoint compatible. ⚠ An `'id'` table is **not exposed by the Fabric SQL endpoint at all** — it is silently skipped ([known limitations](docs/known-limitations.md#3-interop-constraints-that-are-permanent-not-bugs)) |
 | `native_read`, `native_write` | **from the PROVIDER name** | `PROVIDER 'delta'` ⇒ both **on** (DuckDB's Parquet reader/writer — the production path); `PROVIDER 'engineeredwooddelta'` ⇒ both **off** (pure-EW codec). Either is still settable explicitly on either spelling |
 | `change_data_feed`, `in_commit_timestamps`, `row_tracking` | `false` / off | opt-in |
 | `schemas` | `'none'` | flat layout; `'onelevel'` / `'nested'` opt in |

@@ -190,11 +190,20 @@ column has nowhere for one to live. Note the two naming schemes visible above �
 ⚠ **Only 1 of the 3 files carries them.** A rewrite MATERIALISES the ids it must preserve; plain appends do
 not. So a probe of an append-only table measures an absence, not an answer — the `UPDATE` is load-bearing.
 
-**Consequence**: `read_parquet(schema = map {<field id>: …})` is unusable on ANY row-tracking Delta table,
-whoever wrote it — not a quirk of engineered-wood's writer. That makes `union_by_name` the only correct
-choice for the full batched form (see `DeltaNativeReader.BatchPlan`), and it strengthens the DuckDB report in
-[duckdb-upstream-issues.md](duckdb-upstream-issues.md) §1: the `No default expression in FieldId Map`
-assertion is reachable from a Spark-written table, not only from ours.
+**Consequence on 1.5**: `read_parquet(schema = map {<field id>: …})` was unusable on ANY row-tracking Delta
+table, whoever wrote it, because of the `No default expression in FieldId Map` assertion
+([duckdb-upstream-issues.md](duckdb-upstream-issues.md) §1) — which is why the full batched form used
+`union_by_name`.
+
+**On DuckDB 2.0 (measured 2026-10-24)** that assertion is gone, and a NAME-keyed map composes with
+`file_row_number`, so the full form now declares a name-keyed `schema` map instead (`TryFullForm`). What still
+holds: an id-keyed map cannot reach these columns at all, because they carry no id — so id-mode tables stay off
+the batched forms. **Where they sit was measured too, and it matters for the 2.0 field-id mapper's silent-NULL
+defect ([duckdb-upstream-issues.md](duckdb-upstream-issues.md) §11):** Fabric Spark writes them LAST, row id
+before commit version, in both mapping modes — and one rewrite file carried only `_row-id-col-…`. delta-spark's
+source, engineered-wood's writer and our native writer agree. ⚠ Fabric's Spark (runtime 2.0) does not know
+`delta.enableIcebergCompatV3` at all — the one feature under which delta-spark stamps Iceberg's reserved field
+ids on these columns.
 
 ### 1.y ⚠ Fabric Warehouse time travel CANNOT span a schema change — a provider limit, not ours
 
@@ -296,6 +305,18 @@ projection differs and a mutant removing it survives. It is set for the contract
 
 ---
 
+### 2.x ⚠ SUSPECTED, NOT MEASURED — a SPARK-named materialized row id may be ignored by our reader
+
+Found by READING the code on 2026-10-24, while re-checking the row-tracking layout above. Our native reader
+looks for a materialized row id only under the LITERAL name `__delta_row_id` — the name OUR tables declare in
+`delta.rowTracking.materializedRowIdColumnName` (`RowTrackingExpr`, `TryFullForm`, and the clustered rewrite
+in `DeltaReader`, which gates on that exact name). Spark names it `_row-id-col-<uuid>` through the same
+property. If that reading is right, a Spark-written table whose rows Spark has rewritten (UPDATE / MERGE /
+OPTIMIZE) reports a DERIVED id (`baseRowId + file_row_number` of the NEW file) in `__delta_row_id` instead of
+the row's original one — a different stable id, with no error. ⚠ **To settle it:** a row-tracking table
+written by Fabric Spark, one UPDATE, then compare Spark's `_metadata.row_id` with ours for the updated rows.
+Same for `__delta_row_commit_version`.
+
 ## 3. Interop constraints that are permanent, not bugs
 
 - **SQL Server's `DELTA` reader is protocol 1.0 only.** A table it must read has to be written
@@ -308,6 +329,21 @@ projection differs and a mutant removing it survives. It is set for the contract
   catalog-managed/Unity-Catalog coordinator — the catalog arbitrates *which* commit wins version `v`, it does
   not buffer uncommitted work. So the host-side transaction buffer is permanent, not a workaround awaiting a
   better catalog.
+- **The Fabric SQL analytics endpoint does not read column-mapping `id` tables — and it now skips them
+  SILENTLY.** Measured 2026-10-24 on Fabric runtime 2.0 (Spark 4.1.1): three otherwise identical tables
+  written by Fabric Spark under `Tables/dbo/` at the same moment, mapping `none`, `name` and `id`. The first
+  two appeared in `sys.tables` within ~90 s and read correctly; the `id` table was **still absent after more
+  than five minutes**, and querying it answers `Invalid object name`. ⚠ On 2026-07-06 the same endpoint
+  REFUSED with *"Unsupported column mapping mode: id"*; it no longer says anything, so a user sees a missing
+  table rather than a reason. This is why `column_mapping` defaults to `'name'`, and it is the endpoint's
+  limit, not the table's: Spark, the Delta kernel and DuckDB read both modes. ⚠ Not measured: whether
+  `fabric.refresh_sql_endpoint()` reports such a table as a `Failure` with a message.
+- **The Fabric SQL analytics endpoint DROPS STRUCT columns.** Same measurement: a table declared
+  `(id INT, s STRUCT<x INT, y STRING>, v STRING)` is exposed as `id` and `v` only, in every column-mapping
+  mode, and `SELECT s` fails with `Invalid column name 's'`. Nothing reports the omission — the table is
+  listed and readable, one column short. A Delta table carrying a struct column therefore reaches T-SQL
+  consumers (and anything built on the endpoint) without it; flatten the struct into scalar columns if a
+  T-SQL reader needs the values. ⚠ Arrays and maps were not part of the probe.
 
 ---
 

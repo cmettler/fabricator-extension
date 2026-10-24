@@ -10,8 +10,10 @@
 #              §10 pins WHICH of the three batched forms a scan takes — the only thing a suite can assert there,
 #              since all forms are correct and a row assertion would pass either way. It matters because the
 #              plain (`schema` map) form declares its schema and opens NO parquet footer, the UNION form (mixed
-#              tables: the plain branch UNION ALL per-DV-file branches) opens exactly D, and the full
-#              (`union_by_name`) form opens one per file TWICE: 0.5 s vs 34 s on a live 89-file Fabric table.
+#              tables: the plain branch UNION ALL per-DV-file branches) opens exactly D, and the full form
+#              (rowid / deletion vectors / row tracking in ONE call) declares a `schema` map too since DuckDB
+#              2.0 — it was `union_by_name`, which opened every footer TWICE (0.5 s vs 34 s on a live
+#              89-file Fabric table).
 #              Set FABRICATOR_DELTA_WRITE_DIR. Local FS.
 # group: [fabricator]
 
@@ -590,7 +592,10 @@ SELECT count(*) FROM duckdb_views() WHERE view_name LIKE '\_\_fab%' ESCAPE '\';
 # 10. WHICH FORM IS CHOSEN — the ROUTING, which is the only thing a suite can pin here.
 #     Both forms are CORRECT, so an assertion on rows passes either way and a mutant that reverses the
 #     preference survives it. The observable is the generated SQL itself, through the Debug line
-#     `delta native batch: <sql>`: `schema = map` is the plain form, `union_by_name` is the full one.
+#     `delta native batch: <sql>`: `schema = map` WITHOUT `file_row_number` is the plain form, and
+#     `filename => true, file_row_number => true` side by side is the full one. ⚠ Until 2026-10-24 the full
+#     form was `union_by_name`; on DuckDB 2.0 it declares a `schema` map too, so `schema = map` alone no
+#     longer tells the two apart — the flag pair does, and nothing else emits it.
 #     Same shape as verify_delta_rename's engine assertion (read the artefact, not the answer).
 #
 #     WHY IT MATTERS: the full form pays TWO O(files) parquet-FOOTER sweeps before it reads a row —
@@ -613,7 +618,7 @@ INSERT INTO b.main.route_plain SELECT i::BIGINT, ('r' || i)::VARCHAR FROM range(
 # A DV-carrying table: three files, then a DELETE touching rows of ONE of them. The plain form can serve
 # the two clean files only, so this is the MIXED case — since 2026-08-16 it takes the UNION form: the
 # plain `schema = map` branch over the clean files UNION ALL one per-file branch per DV file, each branch
-# keeping its prunable DV bound. One query, no `union_by_name`, no O(N) footer sweep.
+# keeping its prunable DV bound. One query, and not the full form.
 statement ok
 CREATE TABLE b.main.route_dv AS SELECT i::BIGINT AS id, ('r' || i)::VARCHAR AS s FROM range(50) r(i);
 
@@ -658,7 +663,7 @@ true
 query I
 SELECT count(*) FROM duckdb_logs
 WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native batch%'
-  AND message LIKE '%route_plain%' AND message LIKE '%union_by_name%';
+  AND message LIKE '%route_plain%' AND message LIKE '%filename => true, file_row_number => true%';
 ----
 0
 
@@ -682,11 +687,11 @@ WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native batch%'
 true
 
 # ...and NOT the full form. This is the assertion the reversed-preference mutant dies at — a plan that
-# still sent one deletion vector's whole scan to `union_by_name` would pass every row assertion above.
+# still sent one deletion vector's whole scan to the full form would pass every row assertion above.
 query I
 SELECT count(*) FROM duckdb_logs
 WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native batch%'
-  AND message LIKE '%route_dv%' AND message LIKE '%union_by_name%';
+  AND message LIKE '%route_dv%' AND message LIKE '%filename => true, file_row_number => true%';
 ----
 0
 
@@ -731,8 +736,8 @@ SELECT count(*) FROM duckdb_views() WHERE view_name LIKE '\_\_fab%' ESCAPE '\';
 
 # THE FULL FORM'S OWN POSITIVE CONTROL: it must still be reachable, or every plain/union assertion
 # above would pass equally if the batch had silently become plain-or-nothing. A projected ROWID is a
-# shape neither the plain nor the union form serves (file_row_number under a name-keyed map), so it
-# routes to `union_by_name` — on this very table, so the pattern filters stay honest.
+# shape neither the plain nor the union form serves, so it routes to the full form — on this very table,
+# so the pattern filters stay honest.
 query III
 SELECT count(*), max(id), min(rowid) >= 0 FROM b.main.route_dv;
 ----
@@ -741,7 +746,7 @@ SELECT count(*), max(id), min(rowid) >= 0 FROM b.main.route_dv;
 query I
 SELECT count(*) > 0 FROM duckdb_logs
 WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native batch%'
-  AND message LIKE '%route_dv%' AND message LIKE '%union_by_name%';
+  AND message LIKE '%route_dv%' AND message LIKE '%filename => true, file_row_number => true%';
 ----
 true
 
@@ -839,7 +844,7 @@ true
 query I
 SELECT count(*) FROM duckdb_logs
 WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native batch%'
-  AND message LIKE '%rparts%' AND message LIKE '%union_by_name%';
+  AND message LIKE '%rparts%' AND message LIKE '%filename => true, file_row_number => true%';
 ----
 0
 
@@ -917,7 +922,7 @@ WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native batch%'
 ----
 true
 
-# ...and the FULL form (union_by_name) as well, reached via a projected rowid beside a data column
+# ...and the FULL form as well, reached via a projected rowid beside a data column
 # (probed: cols=[rowid,id] top=5 routes there; a rowid-ONLY projection would loop instead).
 query II
 SELECT r >= 0, id IS NOT NULL FROM (SELECT rowid AS r, id FROM b.main.route_dv LIMIT 5) t;
@@ -931,7 +936,7 @@ true	true
 query I
 SELECT count(*) > 0 FROM duckdb_logs
 WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native batch%'
-  AND message LIKE '%route_dv%' AND message LIKE '%union_by_name%' AND message LIKE '%LIMIT 5%';
+  AND message LIKE '%route_dv%' AND message LIKE '%filename => true, file_row_number => true%' AND message LIKE '%LIMIT 5%';
 ----
 true
 
@@ -1128,7 +1133,7 @@ WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native batch%'
 ----
 true
 
-# 12f. ...and the FULL form (union_by_name), reached by projecting the rowid beside the ordered column.
+# 12f. ...and the FULL form, reached by projecting the rowid beside the ordered column.
 #      ⚠ The rowid must be REFERENCED in the output, not merely selected in the subquery: the optimizer
 #      prunes an unused column, and with it the very thing that routes this to the full form — written
 #      that way the section passed its row assertion while silently pinning the union form again.
@@ -1142,7 +1147,7 @@ true	147
 query I
 SELECT count(*) > 0 FROM duckdb_logs
 WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native batch%'
-  AND message LIKE '%route_dv%' AND message LIKE '%union_by_name%'
+  AND message LIKE '%route_dv%' AND message LIKE '%filename => true, file_row_number => true%'
   AND message LIKE '%ORDER BY "id" DESC NULLS LAST LIMIT 3%';
 ----
 true
@@ -1187,20 +1192,19 @@ WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native scan%'
 true
 
 # ============================================================================
-# 13. THE PRESENCE PROBE ASKS ONE FILE (2026-08-17). The FULL form must know which stored names exist in
-#     SOME file, because `union_by_name` can only produce a column at least one file carries. That was a
-#     `parquet_schema([EVERY file])`, i.e. an O(files) FOOTER sweep — MEASURED 20.50 s over 89 remote files
-#     at ~230 ms each, and the larger half of that form's bind cost. But "is this name present" is answered
-#     the moment ONE file has it, so the newest file is probed first and the sweep runs only when that file
-#     does not carry everything the caller will look up. Correctness cannot turn on the guess: a name found
-#     in one file IS present, and anything else falls back.
-#     ⚠ The routing is invisible in the ROWS by construction — both paths compute the same presence set, so
-#     an answer assertion cannot distinguish them. The observable is the Debug line, which carries the
-#     probed file's URI precisely so a gate can scope it to a table.
+# 13. THE FULL FORM NEEDS NO PRESENCE PROBE (2026-10-24, DuckDB 2.0). It used to: `union_by_name` can
+#     only produce a column SOME file carries, so the form first asked which stored names existed — a
+#     `parquet_schema` footer probe, one file when that settled it and a sweep of EVERY file when not
+#     (MEASURED 20.50 s over 89 remote files). On 2.0 the full form DECLARES a `schema` map beside
+#     `file_row_number`, and a column a file lacks reads as the entry's NULL default — the backfill, with no
+#     file asked. ⚠ The rows below are the same rows this section always checked, because the danger they
+#     guard did not move: 13c's materialized row ids must still be READ where a file has them and DERIVED
+#     where it does not, now by the declared default instead of a presence answer.
 # ============================================================================
 
 # 13a. Uniform schema across 3 files: the newest carries everything, so one file answers.
-#      ⚠ TWO shape requirements, and BOTH were found by the section failing against them. The rowid must be
+#      ⚠ TWO shape requirements, and BOTH were found by the section failing against them (when this pinned
+#      the presence probe; they still decide which FORM runs, so they stay). The rowid must be
 #      PROJECTED but never FILTERED — a rowid predicate makes BatchPlan decline both batch forms and loop.
 #      And a DATA column must be genuinely USED (`sum(id)`), because a rowid-only projection is the
 #      count-via-rowid plan (`cols=[] rowid=True`), which the full form declines outright — written without
@@ -1212,13 +1216,14 @@ SELECT count(*), count(DISTINCT r), sum(id) FROM (SELECT rowid AS r, id FROM b.m
 
 query I
 SELECT count(*) > 0 FROM duckdb_logs
-WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native present%'
-  AND message LIKE '%route_plain%' AND message LIKE '%one file of 3 answered%';
+WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native batch%'
+  AND message LIKE '%route_plain%' AND message LIKE '%schema = map%'
+  AND message LIKE '%filename => true, file_row_number => true%';
 ----
 true
 
 # 13b. A column ADDED after every existing file was written: no file carries it, so the newest cannot
-#      answer and the sweep runs. The column still reads as a typed NULL — the backfill union_by_name needs.
+#      answer. It reads as a typed NULL — now the declared entry's default, with no file asked.
 statement ok
 CREATE TABLE b.main.pnadd AS SELECT i::BIGINT AS id FROM range(20) r(i);
 
@@ -1235,8 +1240,8 @@ SELECT count(*), count(extra), count(DISTINCT r) FROM (SELECT rowid AS r, id, ex
 
 query I
 SELECT count(*) > 0 FROM duckdb_logs
-WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native present%'
-  AND message LIKE '%pnadd%' AND message LIKE '%full sweep%';
+WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native batch%'
+  AND message LIKE '%pnadd%' AND message LIKE '%filename => true, file_row_number => true%';
 ----
 true
 
@@ -1281,10 +1286,39 @@ SELECT count(*), min(__delta_row_id), max(__delta_row_id) FROM b.main.trkmix WHE
 ----
 5	0	4
 
+# The materialized column is DECLARED with a NULL default (that is what makes a file lacking it fall
+# through to the derived id), and the scan is the full form.
 query I
 SELECT count(*) > 0 FROM duckdb_logs
-WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native present%'
-  AND message LIKE '%trkmix%' AND message LIKE '%full sweep%';
+WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native batch%'
+  AND message LIKE '%trkmix%' AND message LIKE '%filename => true, file_row_number => true%'
+  AND message LIKE '%''__delta_row_id'': {''name'': ''__delta_row_id'', ''type'': ''BIGINT'', ''default_value'': NULL}%';
+----
+true
+
+# 13d. STRUCTS ON THE FULL FORM (2026-10-24). `union_by_name` merged struct interiors rather than declaring
+#      them, so the full form DECLINED every struct-typed column and such a scan looped per file. Declared
+#      now, with the mapped interior rebuilt to logical member names — so a struct member can be filtered
+#      and summed on a rowid-carrying scan of a deletion-vector table, in ONE query.
+statement ok
+CREATE TABLE b.main.fstruct AS SELECT i::BIGINT AS id, {'x': i::BIGINT, 'y': 'v' || i} AS s FROM range(20) r(i);
+
+statement ok
+INSERT INTO b.main.fstruct SELECT i::BIGINT, {'x': i::BIGINT, 'y': 'v' || i} FROM range(20, 40) r(i);
+
+statement ok
+DELETE FROM b.main.fstruct WHERE id = 3;
+
+query III
+SELECT count(*), sum(x), min(r) >= 0
+FROM (SELECT rowid AS r, s.x AS x FROM b.main.fstruct WHERE s.x > 1) t;
+----
+37	776	true
+
+query I
+SELECT count(*) > 0 FROM duckdb_logs
+WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native batch%'
+  AND message LIKE '%fstruct%' AND message LIKE '%filename => true, file_row_number => true%';
 ----
 true
 

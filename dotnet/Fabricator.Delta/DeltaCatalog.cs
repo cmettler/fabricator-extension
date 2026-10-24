@@ -701,9 +701,11 @@ public sealed class DeltaCatalog : IProviderCatalog
     {
         var s = ParseStringOption(optionsJson, "column_mapping");
         // Default (option absent) = NAME mode: a later RENAME/DROP COLUMN is a metadata-only commit (no
-        // rewrite) out of the box, AND the table stays readable by the Fabric T-SQL endpoint — which REJECTS
-        // id-mode tables outright ("Unsupported column mapping mode: id"; validated live 2026-07-06) while
-        // Spark/kernel/DuckDB read both modes. Id mode remains opt-in (`column_mapping 'id'`) for its
+        // rewrite) out of the box, AND the table stays readable by the Fabric T-SQL endpoint — which does not
+        // read id-mode tables at all while Spark/kernel/DuckDB read both modes. Measured twice: 2026-07-06 it
+        // refused with "Unsupported column mapping mode: id"; 2026-10-24 (Fabric runtime 2.0) it SILENTLY
+        // SKIPS the table — never listed in sys.tables, "Invalid object name" when queried — while name- and
+        // none-mode twins written at the same moment synced within ~90 s (docs/known-limitations.md §3). Id mode remains opt-in (`column_mapping 'id'`) for its
         // field-id-based resolution; `column_mapping 'none'` gives a plain table (logical == physical name,
         // no protocol bump — e.g. a consumer that can't read a writer-v7 table).
         if (string.IsNullOrWhiteSpace(s)) { return EngineeredWood.DeltaLake.Schema.ColumnMappingMode.Name; }

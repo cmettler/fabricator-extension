@@ -239,6 +239,7 @@ internal static class DeltaNativeReader
         // the real query inside the pump. That second bind is free for the plain form (its schema is DECLARED,
         // so nothing is opened) and is the single most expensive span on a remote FULL-form scan — MEASURED
         // 20.66 s over 89 remote files, on top of the 20.50 s PresentNames already spent building the same SQL.
+        // (History since 2026-10-24: the full form now declares its schema as well, so neither cost exists.)
         // Nothing had to be added to make one open enough: `Host.Query` returns a lazily-streaming result whose
         // `.Schema` is available before a single row is fetched.
         // ⚠ It also collapses the bound Arrow INPUTS from two constructions to one — which is exactly the
@@ -389,7 +390,13 @@ internal static class DeltaNativeReader
     /// derived row-tracking id) stays on the loop here, but a per-file-CONSTANT join keyed on
     /// <c>filename</c> is available under this form. And field-id keys are not a free substitute for the
     /// position shapes: a file carrying NO parquet field ids raises <c>INTERNAL Error: No default expression
-    /// in FieldId Map</c>, and name mode does not require a writer to stamp them.</item>
+    /// in FieldId Map</c>, and name mode does not require a writer to stamp them.
+    /// <para>⚠ <b>ALL OF THIS IS 1.5 BEHAVIOUR. DuckDB 2.0 LIFTED IT</b> (measured 2026-10-24, same probes on
+    /// both builds): a VARCHAR-keyed map composes with <c>file_row_number</c>, the field-id-keyed one no
+    /// longer asserts (a missing default is now an ordinary named error), and nested members can be mapped
+    /// through <c>children</c> — which 1.5 accepted and silently IGNORED. <see cref="TryFullForm"/> already
+    /// uses it; the plain form still declines the position shapes because the full form serves them, not
+    /// because it cannot. docs/duckdb-upstream-issues.md §1.</para></item>
     /// <item><b>ID-mode column mapping is a CONTRACT gate, and the honest statement of it is narrower than it
     /// first looks.</b> This path resolves columns by NAME (the map key), while id mode's contract is that a
     /// reader matches by FIELD ID and the stored name is <i>not</i> authoritative — a legacy engineered-wood
@@ -568,6 +575,11 @@ internal static class DeltaNativeReader
             // all. On the profiled Fabric query that pair is 34 s of 77. Before this the expensive-to-attempt
             // form was the one tried first, and it SUCCEEDS on the commonest shape (a plain projection over
             // DV-free files with no rowid), so the cheap form was unreachable exactly where it wins most.
+            // ⚠ SINCE 2026-10-24 (DuckDB 2.0) THE FULL FORM DECLARES ITS SCHEMA TOO — no presence sweep, no
+            // footer read at bind — so the cost gap above is HISTORY. The order stays because the plain form is
+            // still the NARROWER SQL (no filename/file_row_number join), but the remote rankings that lean on
+            // the old gap (TryUnionForm's remote LIMIT gate) were measured against the union_by_name full form
+            // and have NOT been re-measured.
             var plain = TryPlainParts(listing, dataCols, wantRowId, wantsTracking, where, min);
             if (plain is not null)
             {
@@ -1087,62 +1099,54 @@ internal static class DeltaNativeReader
         }
 
         /// <summary>
-        /// The FULL single-call form: <c>read_parquet([…], schema = map {&lt;field id&gt;: …}, filename => true,
-        /// file_row_number => true)</c> with the deletion vectors bound as ONE <c>(filename, pos)</c> input and
-        /// the per-file constants (global ordinal for the rowid, partition values) as a second one, both wrapped
-        /// in <c>WITH … AS MATERIALIZED</c> CTEs so each single-use stream is scanned exactly once. Covers EVERY
+        /// The FULL single-call form: <c>read_parquet([every file], schema = map {&lt;stored name&gt;: …},
+        /// hive_partitioning => false, filename => true, file_row_number => true)</c>, with the deletion vectors
+        /// bound as ONE <c>(filename, pos)</c> input and the per-file constants (global ordinal for the rowid,
+        /// partition values, row-tracking constants) as a second one, both wrapped in
+        /// <c>WITH … AS MATERIALIZED</c> CTEs so each single-use stream is scanned exactly once. Covers EVERY
         /// file of the scan, deletion vectors included, so there is no loop left.
-        /// <para><b>⚠ IT USES <c>union_by_name</c>, NOT THE <c>schema</c> MAP, AND THAT IS FORCED BY A DuckDB
-        /// BUG</b> (reproduced on stock 1.5.5 with controls — docs/duckdb-upstream-issues.md §1; the assertion
-        /// INVALIDATES THE DATABASE, so it is not a containable error). The obvious route is a field-id-keyed map,
-        /// because <c>filename</c> / <c>file_row_number</c> compose with an INTEGER-keyed map and FAIL with a
-        /// VARCHAR-keyed one. But a field-id-keyed map plus <c>file_row_number</c> (specifically —
-        /// <c>filename</c> is unaffected) raises <c>INTERNAL Error: No default expression in FieldId Map</c>
-        /// whenever the FILE contains a column that has no field id — and a materialized <c>__delta_row_id</c> is exactly that
-        /// (row-tracking columns are not column-mapped, so they carry none). Row tracking is ON by default for
-        /// tables we create, and every merge-on-read post-image file has that column, so the field-id route is
-        /// unusable on the DEFAULT table shape. The same file reads fine with the map and NO virtual columns,
-        /// which is what makes it an upstream assertion bug rather than a contract.</para>
-        /// <para>So instead: <c>union_by_name => true</c> (which NULL-fills a column an older file predates — the
-        /// schema-evolution backfill the map's <c>default_value</c> would have given) plus an explicit
-        /// physical→logical alias projection. That needs no field ids, so there is nothing to probe and no
-        /// assertion to trip. It works because a NAME-mode physical name is FILE-INDEPENDENT; id mode is gated
-        /// off for the same reason as everywhere else.</para>
-        /// <para>⚠ The price is nested columns: <c>union_by_name</c> MERGES struct interiors rather than
-        /// declaring them, so a member no file carries cannot be projected at all (where the map's declared type
-        /// would have NULL-filled it). Struct-typed columns therefore stay on the plain form or the loop — which
-        /// is also what keeps the measured union struct hazard out of reach here.</para>
+        /// <para><b>⚠ DuckDB 2.0 ONLY — it is a NAME-keyed <c>schema</c> map beside <c>file_row_number</c>, which
+        /// 1.5 could not do.</b> On 1.5.x that combination failed (<i>"column 2147483645 … could not be found"</i>
+        /// — the virtual column's reserved id resolved by name) and the field-id-keyed one raised
+        /// <c>INTERNAL Error: No default expression in FieldId Map</c>, invalidating the database
+        /// (docs/duckdb-upstream-issues.md §1). So this form used <c>union_by_name</c>, which had to DISCOVER the
+        /// schema: a <c>parquet_schema([every file])</c> presence sweep to build the SQL, then the bind-time
+        /// <c>LIMIT 0</c> probe reading every footer again — MEASURED 20.50 s + 20.66 s over 89 remote files.
+        /// Both are gone. A DECLARED map needs no footer to bind, and a column a file lacks arrives as the
+        /// entry's <c>default_value</c> NULL — the schema-evolution backfill <c>union_by_name</c> gave, without
+        /// asking any file first. Measured on the 2.0 build: name map + <c>filename</c> + <c>file_row_number</c>
+        /// over files where only one carries a column ⇒ correct values, NULL where absent.</para>
+        /// <para><b>Row tracking needs no presence check any more, and that removes a wrong-answer hazard rather
+        /// than just a cost.</b> The materialized column (stored under its LITERAL name — materialized columns are
+        /// not column-mapped) is declared like any other entry, so a file that lacks it reads NULL and the
+        /// <c>COALESCE(materialized, baseRowId + file_row_number)</c> falls through to the derived id for exactly
+        /// that file. The old form had to ask which files carried it, and answering "absent" from a file that
+        /// lacked it silently derived NEW ids for rows that already had materialized ones (MEASURED: [20..24]
+        /// where [0..4] belong — verify_delta_batched_read §13c, which still guards the answer).</para>
+        /// <para><b>Structs are served now</b>, the way the plain form serves them: the declared type
+        /// NULL-fills a member no file carries, and <see cref="LogicalStructExpr"/> rebuilds a mapped struct's
+        /// interior with logical member names. <c>union_by_name</c> merged interiors instead of declaring them,
+        /// which is why this form used to decline every struct-typed column.</para>
+        /// <para>⚠ <b>ID-mode column mapping stays declined</b>: a name-keyed map cannot honour a contract whose
+        /// identity is the field id (case 2 in the class remarks), and a field-id map cannot reach the
+        /// materialized row-tracking columns, which carry no field id in any writer we know (measured on Fabric
+        /// Spark, delta-spark's source, engineered-wood and our own native writer — docs/known-limitations.md
+        /// §1.z). That is a separate slice.</para>
+        /// <para>⚠ It CASTs to the DECLARED Delta type, as the plain form does, where the old form took each
+        /// file's STORED type — on a type-widened table both forms now advertise the same type.</para>
         /// <para><b>⚠ It gives up the deletion vector's PRUNABLE BOUND</b>, which the per-file path emits
         /// alongside the exact anti-join so DuckDB can skip whole row groups — one WHERE cannot carry a
-        /// per-file range. That is a deliberate trade and the evidence is already in
-        /// <see cref="DvRangeCondition"/>: its own controlled A/B found the bound "demonstrably works and does
-        /// not show up in wall time" (2.17 s vs 2.21 s on 10M rows with 9M deleted), because marshalling and
-        /// hashing the vector dominates either way. Expect that to change where I/O dominates instead — remote
-        /// storage with a mostly-deleted file is the shape to re-measure before assuming this is free there.</para>
+        /// per-file range. <see cref="DvRangeCondition"/>'s own A/B found the bound costs nothing measurable in
+        /// wall time locally (2.17 s vs 2.21 s on 10M rows with 9M deleted); re-measure on remote storage with a
+        /// mostly-deleted file before assuming that holds there.</para>
         /// <para><b>⚠ EVERY COLUMN OF A BOUND INPUT MUST BE READ BY THIS SQL — a correctness invariant.</b> A
         /// bound input carrying a column DuckDB's projection PRUNES makes the scan ask for a NON-PREFIX column
-        /// set, which SEGFAULTS (confirmed upstream bug; repro <c>test/repro/duckdb_arrow_scan_nonprefix.c</c>,
-        /// docs/duckdb-upstream-issues.md §2). That is why <see cref="MetaStream"/> takes
-        /// <c>withFileOrdinal</c>: <c>file_ord</c> is emitted only when the rowid expression reads it. Partitioned
-        /// tables were gated off this form until that was understood — they are supported now, and stay
-        /// supported only as long as the invariant holds. ⚠ Do NOT try to fix a future unread column by
-        /// wrapping the query: a subquery, a plain CTE and even a MATERIALIZED one all still crash (measured —
-        /// projection pushdown goes straight through). Add a bound column only together with the SQL that
-        /// reads it.</para>
-        /// <para><b>ROW TRACKING IS SERVED HERE (lifted 2026-08-07)</b> —
-        /// <c>COALESCE(materialized, baseRowId + file_row_number)</c> for the id, the per-file
-        /// <c>defaultRowCommitVersion</c> for the version, with both constants riding the metadata input like
-        /// <c>file_ord</c>. It had been gated on a reason that went stale: <i>"a materialized
-        /// <c>__delta_row_id</c> is not column-mapped, so it has no field id to key by, and a DuckDB
-        /// <c>map</c> cannot mix INTEGER and VARCHAR keys"</i> — every clause of which is about the field-id
-        /// <c>schema</c> map this form ABANDONED when it moved to <c>union_by_name</c>. The gate was simply not
-        /// revisited when the mechanism under it changed, which is the "a stale justification stops the next
-        /// person looking" failure this codebase keeps recording. ⚠ What makes it work is that the materialized
-        /// column is stored under its LITERAL name, so one <c>present</c> lookup answers it for the whole list,
-        /// and <c>union_by_name</c> NULL-fills the files that lack it — which is exactly the COALESCE's
-        /// fallthrough for a scan that MIXES materialized and derived files (an UPDATE's post-image file
-        /// materializes; the untouched files do not). A rowid/tracking fast-path FILTER is still excluded, one
-        /// gate earlier: its whole value is per-file row-group pruning, and one call has one WHERE.</para>
+        /// set, which SEGFAULTS (docs/duckdb-upstream-issues.md §2). That is why <see cref="MetaStream"/> takes
+        /// <c>withFileOrdinal</c> / <c>withBaseRowId</c> / <c>withCommitVersion</c>: each is emitted only when
+        /// this SQL reads it. Add a bound column only together with the SQL that reads it.</para>
+        /// <para>⚠ Inner references are QUALIFIED with <c>__fab_rp</c>: the joined CTEs carry columns named
+        /// <c>fn</c>, <c>pos</c>, <c>file_ord</c>, <c>p0</c>…, and an unqualified user column of the same name
+        /// would be ambiguous.</para>
         /// </summary>
         private static BatchPlan? TryFullForm(
             DeltaReader.NativeScanList listing, IReadOnlyList<string> dataCols, bool wantRowId, string? where)
@@ -1151,8 +1155,6 @@ internal static class DeltaNativeReader
             {
                 return null;
             }
-            // ID mode + a struct is the measured silent-loss case (a struct interior is matched by NAME and cast,
-            // and only in id mode can a file's stored child names differ) — see case 2 in the class remarks.
             if (listing.LogicalToFieldId is not null)
             {
                 return null; // id mode: a file's stored names are its own vintage's — case 2
@@ -1160,19 +1162,16 @@ internal static class DeltaNativeReader
             bool nameMapped = listing.LogicalToPhysical is not null || listing.MappedSchema is not null;
 
             var partitionCols = new List<string>();
-            var entries = new List<string>(dataCols.Count);
+            var entries = new List<string>(dataCols.Count + 2);
             var inner = new List<string>(dataCols.Count + 2);
-            var wanted = new List<(string Logical, string Stored, DeltaSchema.StructField Field)>(dataCols.Count);
             var trackingCols = new List<string>(2);
             foreach (var c in dataCols)
             {
                 if (string.Equals(c, RowTrackingIdColumn, StringComparison.Ordinal)
                     || string.Equals(c, RowTrackingVersionColumn, StringComparison.Ordinal))
                 {
-                    // Virtual: not in the table schema at all. Its expression needs `present` (is the
-                    // materialized column stored in ANY file of this list?), which is resolved after this loop,
-                    // so only the name is recorded here. `inner` is order-insensitive — the outer SELECT names
-                    // its columns — so appending them later is free.
+                    // Virtual: not in the table schema. Its materialized form is declared below so a file
+                    // without it reads NULL — the COALESCE's fallthrough.
                     trackingCols.Add(c);
                     continue;
                 }
@@ -1185,30 +1184,38 @@ internal static class DeltaNativeReader
                 {
                     // Absent from the data files: the value comes from the bound per-file input, CAST to the
                     // column's declared type (the input carries every partition value as VARCHAR, since one
-                    // Arrow column cannot hold several columns' types).
-                    string type0;
+                    // Arrow column cannot hold several columns' types). Same fragment as the plain form's, so a
+                    // union of the two still aligns.
+                    string ptype;
                     try
                     {
-                        type0 = TypeText(field.Type);
+                        ptype = TypeText(field.Type);
                     }
                     catch (NotSupportedException)
                     {
                         return null;
                     }
-                    inner.Add($"CAST(__fab_f.{Quote("p" + partitionCols.Count)} AS {type0}) AS {Quote(c)}");
+                    inner.Add($"CAST(__fab_f.{Quote("p" + partitionCols.Count)} AS {ptype}) AS {Quote(c)}");
                     partitionCols.Add(c);
                     continue;
                 }
-                if (ContainsStructAnywhere(field.Type))
-                {
-                    // union_by_name merges struct interiors instead of declaring them, so a member no file
-                    // carries is unprojectable. The plain `schema`-map form handles nested columns; this one
-                    // does not pretend to.
-                    return null;
-                }
                 string stored = nameMapped ? PhysicalName(field) : field.Name;
-                entries.Add(stored);
-                wanted.Add((c, stored, field));
+                string type;
+                try
+                {
+                    type = PhysicalTypeText(field.Type, nameMapped);
+                }
+                catch (NotSupportedException)
+                {
+                    return null; // no CAST-target rendering (variant, or a type we do not map) — loop it
+                }
+                entries.Add($"{Literal(stored)}: {{'name': {Literal(c)}, 'type': {Literal(type)}, "
+                            + "'default_value': NULL}");
+                // `schema` renames only the TOP level, so a mapped struct's interior arrives physical — rebuild
+                // it with logical member names (a pushed struct-member predicate binds against this projection).
+                string src = "__fab_rp." + Quote(c);
+                var rebuilt = nameMapped ? LogicalStructExpr(field.Type, src) : null;
+                inner.Add($"{rebuilt ?? src} AS {Quote(c)}");
             }
             if (entries.Count == 0 && trackingCols.Count == 0)
             {
@@ -1218,69 +1225,6 @@ internal static class DeltaNativeReader
                 return null;
             }
             var files = listing.Files;
-            // ⚠ ONE presence query for the whole scan, and it is REQUIRED, not an optimisation.
-            // union_by_name can only produce a column that SOME file in the list carries; a column absent from
-            // every one of them is a BINDER ERROR ("Referenced column ... not found in FROM clause"). That is not
-            // an edge case: Delta-log pruning routinely drops the only file holding a newly-ADDed column, which
-            // is how `WHERE extra IS NULL` broke on a table whose other six files predate `extra`. So the
-            // columns present across the LIST are resolved up front and the rest become typed NULLs — the
-            // backfill the `schema` map's default_value would have given. parquet_schema takes the whole list, so
-            // this is one query per scan, never one per file — and since 2026-08-17 usually over ONE file, see
-            // PresentNames.
-            // ⚠ `present` HAS TWO CONSUMERS, and the second is read 50 lines further down: it decides the
-            // data columns' NULL-backfill here AND whether a materialized row-tracking column gets its
-            // COALESCE below. A materialized column is written by a REWRITE and not by a plain append, so on
-            // a row-tracking table it routinely lives in SOME file and not others — and reading it as absent
-            // silently derives new row ids for rows that already have materialized ones, i.e. a rewritten row
-            // loses the identity row tracking exists to preserve (MEASURED: ids [20,21,22,23,24] where
-            // [0,1,2,3,4] belong).
-            //
-            // A one-file probe cannot be trusted to settle that, so when a row-tracking virtual column is
-            // projected the fast path is DECLINED OUTRIGHT (null `queried` = sweep). Passing the tracking
-            // names in `queried` instead would also be SOUND — the early exit requires every queried name to
-            // be present — but it would make the routing depend on WHICH file happens to hold the highest
-            // ordinal, which is engineered-wood's active-file order and not commit recency. That is
-            // unpredictable in exactly the case where being wrong is a wrong ANSWER, and it makes the
-            // behaviour untestable: the same fixture swept in one session and took the fast path in another.
-            // The cost is nil in practice — the full form's common users are the rowid/DML, deletion-vector
-            // and partition shapes, none of which project a tracking column.
-            List<string>? queried = null;
-            if (trackingCols.Count == 0)
-            {
-                queried = new List<string>(wanted.Count);
-                foreach (var w in wanted)
-                {
-                    queried.Add(w.Stored);
-                }
-            }
-            var present = PresentNames(files, queried);
-            if (present is null)
-            {
-                return null;
-            }
-            foreach (var w in wanted)
-            {
-                string expr;
-                if (present.Contains(w.Stored))
-                {
-                    expr = string.Equals(w.Stored, w.Logical, StringComparison.Ordinal)
-                        ? Quote(w.Logical) : $"{Quote(w.Stored)} AS {Quote(w.Logical)}";
-                }
-                else
-                {
-                    string t;
-                    try
-                    {
-                        t = TypeText(w.Field.Type);
-                    }
-                    catch (NotSupportedException)
-                    {
-                        return null;
-                    }
-                    expr = $"CAST(NULL AS {t}) AS {Quote(w.Logical)}";
-                }
-                inner.Add(expr);
-            }
 
             bool anyDv = false;
             foreach (var f in files)
@@ -1295,24 +1239,19 @@ internal static class DeltaNativeReader
             // but with the per-file constants arriving on the bound input instead of being inlined:
             //   __delta_row_id             = COALESCE(materialized, baseRowId + file_row_number)
             //   __delta_row_commit_version = COALESCE(materialized, defaultRowCommitVersion)
-            // ⚠ Two things make the batched form work where the per-file one needed a footer probe. (a) The
-            // materialized column is stored under its LITERAL name (materialized columns are not column-mapped),
-            // so one `present` lookup over the whole list answers it — and `union_by_name` NULL-fills the files
-            // that lack it, which is precisely the COALESCE's fallthrough. (b) baseRowId / commitVersion are
-            // per-FILE constants, so they ride the metadata input like `file_ord`. A file with neither reads
-            // NULL, same as before.
+            // The materialized column is declared under its LITERAL name with a NULL default, so a file that
+            // lacks it falls through to the derived value — no presence query, and no way to answer "absent"
+            // for a file that has it.
             bool wantTrackId = ContainsName(trackingCols, RowTrackingIdColumn);
             bool wantTrackVersion = ContainsName(trackingCols, RowTrackingVersionColumn);
             foreach (var c in trackingCols)
             {
                 bool isId = string.Equals(c, RowTrackingIdColumn, StringComparison.Ordinal);
+                entries.Add($"{Literal(c)}: {{'name': {Literal(c)}, 'type': 'BIGINT', 'default_value': NULL}}");
                 string derived = isId
                     ? "(__fab_f.base_row_id + __fab_rp.file_row_number)"
                     : "__fab_f.commit_version";
-                string expr = present.Contains(c)
-                    ? $"COALESCE(__fab_rp.{Quote(c)}, {derived})"
-                    : derived;
-                inner.Add($"{expr} AS {Quote(c)}");
+                inner.Add($"COALESCE(__fab_rp.{Quote(c)}, {derived}) AS {Quote(c)}");
             }
             bool needsMeta = wantRowId || partitionCols.Count > 0 || trackingCols.Count > 0;
             if (wantRowId)
@@ -1347,13 +1286,15 @@ internal static class DeltaNativeReader
             }
             sb.Append(" FROM (SELECT ").Append(string.Join(", ", inner))
               .Append(" FROM read_parquet([").Append(string.Join(", ", files.Select(f => Literal(f.Uri))))
-              // hive_partitioning is OFF deliberately, and it is a correctness guard rather than the workaround
-              // it was first tried as (it does NOT cure the upstream non-prefix crash). DuckDB AUTO-DETECTS
-              // hive layout from the paths, so any directory of the form `x=y` anywhere in a table's path would
-              // inject a phantom column into the scan. The Delta log's partitionValues is the authoritative
-              // source — paths are opaque here and are never parsed.
-              .Append("], union_by_name => true, hive_partitioning => false, filename => true, "
-                     + "file_row_number => true) __fab_rp");
+              .Append("], schema = map {").Append(string.Join(", ", entries)).Append('}');
+            // hive_partitioning is OFF deliberately, as a correctness guard: DuckDB AUTO-DETECTS hive layout from
+            // the paths, so a directory of the form `x=y` anywhere in a table's path would inject a phantom
+            // column. A declared `schema` suppresses that already (measured on the plain form); the flag states
+            // it rather than relying on it, and the log's partitionValues stays the authoritative source.
+            // ⚠ `filename => true, file_row_number => true` side by side is unique to this form — the plain form
+            // carries only `filename`, a per-file branch only `file_row_number` — and verify_delta_batched_read's
+            // routing assertions match on exactly that text.
+            sb.Append(", hive_partitioning => false, filename => true, file_row_number => true) __fab_rp");
             if (needsMeta)
             {
                 // INNER join on the exact URI string we listed — `filename` was verified to echo it verbatim.
@@ -1405,128 +1346,6 @@ internal static class DeltaNativeReader
     /// batched form joins on <c>filename</c>. Sibling of <see cref="DvViewName"/>.</summary>
     internal const string MetaViewName = "__fab_files";
 
-
-    /// <summary>
-    /// The set of stored column names present in AT LEAST ONE of these files — the question
-    /// <c>union_by_name</c> forces, since it can only produce a column SOME file in the list carries.
-    /// Null when the query fails (fall back rather than guess at presence).
-    ///
-    /// <para><b>It asks ONE file first.</b> A full <c>parquet_schema([every file])</c> reads every FOOTER,
-    /// which on remote storage is the dominant cost of building the full form — MEASURED 20.50 s over 89
-    /// remote files at ~230 ms each. But the caller only ever asks "is this name present", and a name found
-    /// in one file is present, full stop. So probing the single newest file answers the whole question
-    /// whenever that file carries every name the caller will look up; otherwise the full sweep runs and
-    /// nothing is lost but one small probe.</para>
-    ///
-    /// <para><b>⚠ `queried` MUST list every name the caller will look up, and getting that wrong is a SILENT
-    /// WRONG ANSWER rather than a missed optimization.</b> The early exit is sound only because a name IN the
-    /// one-file set is guaranteed present in the full set too; a name ABSENT from it proves nothing. So if a
-    /// caller later consults a name that was not in `queried`, this can answer "absent" where the sweep would
-    /// have said "present". <b>Pass <c>null</c> to decline the fast path entirely</b> — which is what a
-    /// caller should do rather than reason its way to a list it is not sure is complete.</para>
-    ///
-    /// <para>⚠ "Newest" is the highest <c>Ordinal</c>, which is engineered-wood's active-file ordering and
-    /// NOT a guaranteed recency order — MEASURED: the same three-file fixture put the rewritten file last in
-    /// one session and the appended file last in another. That is fine for a HIT RATE (it is still the right
-    /// thing to guess at: files differ in schema exactly when a column was ADDED, and the files carrying an
-    /// added column are the later ones) and is precisely why the decision must never be load-bearing for an
-    /// ANSWER — see the caller's row-tracking note.</para>
-    /// </summary>
-    private static HashSet<string>? PresentNames(
-        IReadOnlyList<DeltaReader.NativeScanFile> files, IReadOnlyList<string>? queried)
-    {
-        if (queried is not null && files.Count > 1)
-        {
-            var newest = files[0];
-            for (int i = 1; i < files.Count; i++)
-            {
-                if (files[i].Ordinal > newest.Ordinal)
-                {
-                    newest = files[i];
-                }
-            }
-            var one = QueryPresentNames(new[] { newest });
-            if (one is not null && AllPresent(queried, one))
-            {
-                // The URI is what makes this line SCOPEABLE from a gate — it carries the table folder, and
-                // nothing else in the message identifies which scan decided what.
-                Log.LogDebug("delta native present: one file of {Count} answered {Names} names ({Uri})",
-                             files.Count, queried.Count, newest.Uri);
-                return one;
-            }
-            Log.LogDebug("delta native present: full sweep of {Count} files ({Uri})", files.Count, newest.Uri);
-            return QueryPresentNames(files);
-        }
-        if (files.Count > 1)
-        {
-            Log.LogDebug("delta native present: full sweep of {Count} files ({Uri})", files.Count, files[0].Uri);
-        }
-        return QueryPresentNames(files);
-    }
-
-    private static bool AllPresent(IReadOnlyList<string> queried, HashSet<string> present)
-    {
-        for (int i = 0; i < queried.Count; i++)
-        {
-            if (!present.Contains(queried[i]))
-            {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    // One `parquet_schema` over the given files: the DISTINCT stored names across all of them.
-    private static HashSet<string>? QueryPresentNames(IReadOnlyList<DeltaReader.NativeScanFile> files)
-    {
-        var sb = new StringBuilder("SELECT DISTINCT name FROM parquet_schema([");
-        for (int i = 0; i < files.Count; i++)
-        {
-            if (i > 0)
-            {
-                sb.Append(", ");
-            }
-            sb.Append("'").Append(files[i].Uri.Replace("'", "''")).Append("'");
-        }
-        sb.Append("])");
-        try
-        {
-            var names = new HashSet<string>(StringComparer.Ordinal);
-            using var s = Host.Query(sb.ToString());
-            while (true)
-            {
-                var batch = s.ReadNextRecordBatchAsync().AsTask().GetAwaiter().GetResult();
-                if (batch is null)
-                {
-                    break;
-                }
-                using (batch)
-                {
-                    var col = (StringArray)batch.Column(0);
-                    for (int i = 0; i < batch.Length; i++)
-                    {
-                        if (col.GetString(i) is { } n)
-                        {
-                            names.Add(n);
-                        }
-                    }
-                }
-            }
-            return names;
-        }
-        catch
-        {
-            return null;
-        }
-    }
-
-    private static bool ContainsStructAnywhere(DeltaSchema.DeltaDataType type) => type switch
-    {
-        DeltaSchema.StructType => true,
-        DeltaSchema.ArrayType at => ContainsStructAnywhere(at.ElementType),
-        DeltaSchema.MapType mt => ContainsStructAnywhere(mt.KeyType) || ContainsStructAnywhere(mt.ValueType),
-        _ => false,
-    };
 
     /// <summary>Every file's deletion-vector positions as ONE <c>(fn, pos)</c> stream — the single-input form the
     /// batched read anti-joins, replacing the per-file inline literal list whose cost is characterised on
@@ -2252,7 +2071,8 @@ internal static class DeltaNativeReader
             // schema is DECLARED, so nothing is opened) against 20.66 s for the full form's, on top of the
             // 20.50 s PresentNames already spent building the same SQL. Reversing BatchPlan.Build's preference
             // moved the common read onto the cheap side; this removes the duplicate bind from the expensive
-            // one, which is the rowid / DML / deletion-vector shapes.
+            // one, which is the rowid / DML / deletion-vector shapes. (Since 2026-10-24 the full form declares
+            // its schema as well, so that probe is no longer a footer read on either form.)
             return listing.MappedSchema is { } bms
                 ? ArrowColumnMappingRename.RenameSchema(batchStream.Schema, bms, toPhysical: false)
                 : batchStream.Schema;

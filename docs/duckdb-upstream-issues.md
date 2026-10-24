@@ -14,7 +14,30 @@ see §2, which is exactly that case and was nearly filed as a DuckDB bug.
 
 ## 1. `INTERNAL Error: No default expression in FieldId Map` — field-id `schema` + `file_row_number`
 
-**Status: reproduced on stock 1.5.5 AND ROOT-CAUSED in the source (§ below). Ready to file.**
+**Status: reproduced on stock 1.5.5 AND ROOT-CAUSED in the source (§ below). ⚠⚠ FIXED IN DuckDB 2.0 —
+do NOT file it (measured 2026-10-24, the same probes on our 1.5.6 and 2.0 builds side by side).** On 2.0
+the query below returns `(1, 0)`, and the same holds over several files where only some carry field ids.
+The missing-default path still exists, but it now throws an ordinary `InvalidInputException` that names the
+field (*"Field \"x\" (field id N) is missing from the file schema and has no default expression"*)
+instead of an internal error that invalidates the database. It is NOT backported: 1.5.6 still reproduces
+it exactly as recorded below.
+
+**The other `schema` limits we measured on 1.5 are lifted by 2.0 as well**, and they matter more to us than
+this one did:
+
+| shape | 1.5.6 | 2.0 |
+|---|---|---|
+| NAME-keyed map + `file_row_number` | fails — *"column 2147483645 … could not be found"* | ✅ |
+| a nested member mapped through the entry's 4th field `children`, by id or by name | **accepted and SILENTLY IGNORED** — the member reads NULL | ✅ |
+| a nested member no file carries, with a default | binder error | ✅ default applied |
+| `schema` + `union_by_name` / `hive_partitioning => true` | refused | still refused |
+| a column with NO field id, reached through an id-keyed map | impossible | still impossible |
+
+⚠ The `children` row is the dangerous half of 1.5: a map that LOOKS like it renames a struct member is
+silently a no-op there. On 2.0, `schema` and `file_row_number` moved from the parquet reader into the
+generic multi-file reader, which is where the fix lives (`multi_file_reader.cpp`'s `ParseSchemaMap`).
+What 2.0 enables for us is in `DeltaNativeReader.TryFullForm`'s remarks; the new upstream defect it exposes
+is §11.
 
 `read_parquet`'s `schema` parameter with **INTEGER** keys puts the reader in `BY_FIELD_ID` mode. Combined
 with `file_row_number => true`, it raises an internal assertion whenever the *file* contains at least one
@@ -948,6 +971,39 @@ off, so `column_ids` is the identity and positional indexing is right again. The
 input crosses whole. The real fix, ours or upstream's, is a factory that narrows the produced stream.
 
 ---
+
+## 11. An id-keyed `schema` map SILENTLY NULLs every column after the first one without a field id — 2.0
+
+**Status: reproduced on our 2.0 build 2026-10-24 with the control beside it, mechanism read from the source.
+NOT filed. Ready to file — it is a wrong answer with no error.**
+
+```sql
+-- 'noid' carries no field id and comes FIRST; 'a' carries field id 1 and comes after it
+COPY (SELECT 2 AS noid, 1 AS a) TO 'noidfirst.parquet' (FORMAT parquet, FIELD_IDS {a: 1});
+
+SELECT * FROM read_parquet('noidfirst.parquet',
+    schema = map {1: {'name': 'a', 'type': 'INTEGER', 'default_value': NULL}});
+-- a = NULL   (wrong — the file holds 1 under field id 1)
+-- with 'default_value': -1 the same query answers -1, i.e. the column is treated as ABSENT
+```
+
+**Control:** the same columns in the other order — the id'd column first, the id-less one after — read
+correctly (measured with id-less row-tracking columns trailing, nested `children` and `file_row_number` all
+present).
+
+**Cause** (`multi_file_column_mapper.cpp`, `FieldIdMapper`): building the field-id lookup stops at the FIRST
+local column without an identifier — `if (column.identifier.IsNull()) { break; }`, commented *"Extra columns
+at the end will not have a field_id"*. That is an assumption about the file's LAYOUT, and every column after
+the break is missing from the map, so it resolves to its default. `continue` is the obvious fix: an id-less
+column cannot be matched by id anyway, and skipping it costs nothing.
+
+**Why it does not reach us today, verified rather than assumed:** the only id-less columns in a Delta data
+file are the materialized row-tracking ones, and every writer we know appends them LAST — measured in files
+Fabric Spark wrote (`_row-id-col-…` then `_row-commit-version-col-…`, after all data columns, both mapping
+modes), read in delta-spark's source (`UpdateCommand`: `targetOutput ++ rowId ++ rowCommitVersion`; MERGE and
+OPTIMIZE the same, all via `withColumn`), in engineered-wood (`RowTrackingWriter.AddRowIdAndCommitVersion
+Columns` appends both) and in our native writer (keeps the batch's order). A writer that puts one first would
+make an id-keyed read return NULLs with no message.
 
 ## Not a bug, but pinned here because it wasted time three times
 

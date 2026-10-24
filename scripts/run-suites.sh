@@ -915,6 +915,9 @@ case "$TIER" in
         #   §5 went from asserting nine REFUSALS to asserting the writes themselves plus a read-back
         #   through a sub-root attached FLAT (65 -> 79). Same arithmetic claim: +14 and nothing else moved,
         #   although this one touches every provider's write path rather than only the nesting one.
+        # 2026-10-24: 10211 -> 10218. verify_delta_batched_read 399 -> 406: on DuckDB 2.0 the FULL batched form
+        #   declares a name-keyed `schema` map beside file_row_number instead of union_by_name + a presence
+        #   sweep; §13 re-pinned, §13d added (structs, which the old full form declined).
         # 2026-10-24: 10196 -> 10211. verify_delta_nested_schemas 79 -> 94 (§11): `schemas` became ONE
         #   three-way option ('none'|'onelevel'|'nested'), `nested_schemas` refused by name.
         # 2026-10-23: 10168 -> 10196. verify_with_options 206 -> 234: `ALTER TABLE … SET (…) / RESET (…)`
@@ -923,7 +926,7 @@ case "$TIER" in
         #   as "no write to apply to", which stopped being true when the tuning became a persisted table
         #   property. ⚠ The load-bearing rows read a WRITTEN FILE: a property in the catalog proves only
         #   that the key was stored, and the point of persisting it is that a LATER INSERT obeys it.
-        : "${MIN_ASSERTIONS:=10211}"
+        : "${MIN_ASSERTIONS:=10218}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh
