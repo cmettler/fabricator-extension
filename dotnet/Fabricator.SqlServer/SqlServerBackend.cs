@@ -1555,6 +1555,70 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
             : new SqlParameter(name, bound);
     }
 
+    /// <summary>
+    /// How a CLR <see cref="DateTime"/> must be bound for each of <paramref name="fields"/> when the value is
+    /// WRITTEN TO or COMPARED WITH that column of <c>[schema].[table]</c> — one entry per field, null where the
+    /// field carries no timestamps (or the column is not a legacy temporal type, which then takes
+    /// <see cref="MakeParameter"/>'s <c>datetime2</c>).
+    /// </summary>
+    /// <remarks>
+    /// <para><b>⚠⚠ NEITHER FIXED TYPE IS RIGHT FOR EVERY COLUMN, measured 2026-10-24 — so the binding follows the
+    /// column's declared type.</b> SqlClient infers legacy <c>datetime</c> for a <see cref="DateTime"/>
+    /// (≈3.33 ms resolution), so against a <c>datetime2</c> column the rowid UPDATE wrote
+    /// <c>12:00:00.1233333</c> for <c>.123456</c>, and a rowid DELETE/UPDATE keyed on a <c>datetime2</c>
+    /// column matched NOTHING — the rounded key equals no row — all with no error. Pinning <c>datetime2</c>
+    /// everywhere fixes those and breaks the mirror case: a legacy <c>datetime</c> column stores <c>.127</c> as
+    /// <c>.1266667</c>, so a <c>datetime2</c> parameter compares unequal (measured: 0 rows where a
+    /// <c>datetime</c> parameter matches 1) and a keyed DELETE on such a table would silently miss.</para>
+    /// <para>Read on the STATEMENT's own connection and transaction, so a table created or altered earlier in
+    /// the same transaction is described as it now is, and nothing blocks on our own schema lock. Only asked
+    /// when some field actually carries timestamps — every other statement pays nothing.</para>
+    /// </remarks>
+    private static System.Data.SqlDbType?[] DateTimeBindings(SqlConnection connection, SqlTransaction? transaction,
+                                                             string schemaName, string tableName,
+                                                             IReadOnlyList<Field> fields)
+    {
+        var result = new System.Data.SqlDbType?[fields.Count];
+        if (!fields.Any(f => f.DataType is TimestampType))
+        {
+            return result;
+        }
+        var types = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        using (var cmd = connection.CreateCommand())
+        {
+            cmd.Transaction = transaction;
+            cmd.CommandText = "SELECT c.name, TYPE_NAME(c.system_type_id) FROM sys.columns c " +
+                              "WHERE c.object_id = OBJECT_ID(@obj)";
+            cmd.Parameters.Add(MakeParameter("@obj", Quote(schemaName) + "." + Quote(tableName)));
+            using var reader = cmd.ExecuteReader();
+            while (reader.Read())
+            {
+                types[reader.GetString(0)] = reader.IsDBNull(1) ? "" : reader.GetString(1);
+            }
+        }
+        for (int i = 0; i < fields.Count; i++)
+        {
+            if (fields[i].DataType is not TimestampType || !types.TryGetValue(fields[i].Name, out var type))
+            {
+                continue;
+            }
+            result[i] = type.ToLowerInvariant() switch
+            {
+                "datetime" => System.Data.SqlDbType.DateTime,
+                "smalldatetime" => System.Data.SqlDbType.SmallDateTime,
+                "date" => System.Data.SqlDbType.Date,
+                _ => null,
+            };
+        }
+        return result;
+    }
+
+    /// <summary>A row value bound for its column (see <see cref="DateTimeBindings"/>).</summary>
+    private static SqlParameter BindColumnValue(string name, object? value, System.Data.SqlDbType? dateTimeType) =>
+        value is DateTime && dateTimeType is { } type
+            ? new SqlParameter(name, type) { Value = value }
+            : MakeParameter(name, value);
+
     // A short metadata read (e.g. FetchTableColumns / FetchRowIdColumns) that must see the transaction's
     // own uncommitted writes — e.g. CREATE TABLE then immediately re-fetch the new table's columns to build
     // the catalog entry. Unlike a data SCAN, it holds no long-lived reader, so it is safe on the pinned
@@ -2268,6 +2332,7 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
         {
         string qualified = Quote(schemaName) + "." + Quote(tableName);
         var keyColumns = keys.Schema.FieldsList.Select(f => f.Name).ToList();
+        var keyBindings = DateTimeBindings(connection, transaction, schemaName, tableName, keys.Schema.FieldsList);
 
         using var reader = new ArrowDataReader(keys);
         long total = 0;
@@ -2299,7 +2364,7 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
                     }
                     string pn = "@p" + p++;
                     sb.Append(Quote(keyColumns[c])).Append(" = ").Append(pn);
-                    cmd.Parameters.AddWithValue(pn, batch[r][c] ?? DBNull.Value);
+                    cmd.Parameters.Add(BindColumnValue(pn, batch[r][c], keyBindings[c]));
                 }
                 sb.Append(')');
             }
@@ -2376,6 +2441,7 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
         string qualified = Quote(schemaName) + "." + Quote(tableName);
         var columns = data.Schema.FieldsList.Select(f => f.Name).ToList();
         int keyStart = setColumnCount;
+        var bindings = DateTimeBindings(connection, transaction, schemaName, tableName, data.Schema.FieldsList);
 
         using var reader = new ArrowDataReader(data);
         long total = 0;
@@ -2393,7 +2459,7 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
                 }
                 string pn = "@s" + c;
                 sb.Append(Quote(columns[c])).Append(" = ").Append(pn);
-                cmd.Parameters.AddWithValue(pn, reader.IsDBNull(c) ? DBNull.Value : reader.GetValue(c));
+                cmd.Parameters.Add(BindColumnValue(pn, reader.IsDBNull(c) ? null : reader.GetValue(c), bindings[c]));
             }
             sb.Append(" WHERE ");
             for (int c = keyStart; c < columns.Count; c++)
@@ -2404,7 +2470,7 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
                 }
                 string pn = "@k" + c;
                 sb.Append(Quote(columns[c])).Append(" = ").Append(pn);
-                cmd.Parameters.AddWithValue(pn, reader.IsDBNull(c) ? DBNull.Value : reader.GetValue(c));
+                cmd.Parameters.Add(BindColumnValue(pn, reader.IsDBNull(c) ? null : reader.GetValue(c), bindings[c]));
             }
             cmd.CommandText = sb.ToString();
             if (Log.IsEnabled(LogLevel.Debug))
@@ -2440,6 +2506,7 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
             string qualified = Quote(schemaName) + "." + Quote(tableName);
             var columns = rows.Schema.FieldsList.Select(f => f.Name).ToList();
             string columnList = string.Join(", ", columns.Select(Quote));
+            var bindings = DateTimeBindings(connection, transaction, schemaName, tableName, rows.Schema.FieldsList);
 
             using var reader = new ArrowDataReader(rows);
             var batch = new List<object?[]>();
@@ -2472,7 +2539,7 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
                         }
                         string pn = "@p" + p++;
                         sb.Append(pn);
-                        cmd.Parameters.AddWithValue(pn, batch[r][c] ?? DBNull.Value);
+                        cmd.Parameters.Add(BindColumnValue(pn, batch[r][c], bindings[c]));
                     }
                     sb.Append(')');
                 }

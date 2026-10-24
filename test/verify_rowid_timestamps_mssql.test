@@ -1,0 +1,90 @@
+# name: test/verify_rowid_timestamps_mssql.test
+# description: Timestamps on the SQL Server ROWID DML path are bound as the column's own declared type.
+#              SqlClient infers legacy `datetime` (about 3.33 ms) for a .NET DateTime. Against a datetime2 column
+#              that ROUNDED a SET value and made a keyed DELETE/UPDATE match nothing, silently (0 rows, no error).
+#              Pinning datetime2 everywhere breaks the mirror case: a legacy `datetime` stores .127 as .1266667,
+#              so a datetime2 key compares unequal. The binding follows each column's declared type
+#              (SqlServerCatalog.DateTimeBindings). Backported from the 2.0 line, where this is §11 of
+#              verify_dml_pushdown_mssql. Needs the docker SQL Server (service tier).
+# group: [fabricator]
+
+require fabricator
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE fabricator);
+
+statement ok
+SELECT fabricator_exec('db', 'DROP TABLE IF EXISTS dbo.ts_u; DROP TABLE IF EXISTS dbo.ts_k; DROP TABLE IF EXISTS dbo.ts_l; DROP TABLE IF EXISTS dbo.ts_r;');
+
+statement ok
+SELECT fabricator_exec('db', 'CREATE TABLE dbo.ts_u (id INT PRIMARY KEY, ts DATETIME2(7), old DATETIME);
+INSERT INTO dbo.ts_u VALUES (1, ''2026-01-01'', ''2026-01-01'');
+CREATE TABLE dbo.ts_k (ts DATETIME2(7) PRIMARY KEY, v INT);
+INSERT INTO dbo.ts_k VALUES (''2026-01-01 12:00:00.123456'', 1), (''2026-01-01 12:00:00.124456'', 2), (''2026-01-01 12:00:00.125456'', 3);
+CREATE TABLE dbo.ts_l (ts DATETIME PRIMARY KEY, v INT);
+INSERT INTO dbo.ts_l VALUES (''2026-01-01 12:00:00.123'', 1), (''2026-01-01 12:00:00.127'', 2), (''2026-01-01 23:59:59.997'', 3);
+CREATE TABLE dbo.ts_r (id INT IDENTITY PRIMARY KEY, ts DATETIME2(7));');
+
+statement ok
+SELECT fabricator_refresh_cache('db');
+
+# A SET value: exact into datetime2; into a legacy datetime the SERVER rounds it, as any write into that type does.
+query I
+UPDATE db.dbo.ts_u SET ts = TIMESTAMP '2026-01-01 12:00:00.123456', old = TIMESTAMP '2026-01-01 12:00:00.123456' WHERE id = 1;
+----
+1
+
+query II
+SELECT * FROM fabricator_query('db', 'SELECT CONVERT(varchar(30), ts, 121) AS u, CONVERT(varchar(30), old, 121) AS o FROM dbo.ts_u');
+----
+2026-01-01 12:00:00.1234560	2026-01-01 12:00:00.123
+
+# A datetime2 KEY: the rowid DELETE and UPDATE must find their row. Rounded, both matched nothing and reported 0.
+query I
+DELETE FROM db.dbo.ts_k WHERE v = 2;
+----
+1
+
+query I
+UPDATE db.dbo.ts_k SET v = 30 WHERE v = 3;
+----
+1
+
+query II
+SELECT * FROM fabricator_query('db', 'SELECT CONVERT(varchar(30), ts, 121) AS k, v FROM dbo.ts_k ORDER BY v');
+----
+2026-01-01 12:00:00.1234560	1
+2026-01-01 12:00:00.1254560	30
+
+# A legacy datetime KEY — the mirror case, which a blanket datetime2 binding breaks.
+query I
+DELETE FROM db.dbo.ts_l WHERE v = 2;
+----
+1
+
+query I
+UPDATE db.dbo.ts_l SET v = 30 WHERE v = 3;
+----
+1
+
+query II
+SELECT * FROM fabricator_query('db', 'SELECT CONVERT(varchar(30), ts, 121) AS l, v FROM dbo.ts_l ORDER BY v');
+----
+2026-01-01 12:00:00.123	1
+2026-01-01 23:59:59.997	30
+
+# INSERT … RETURNING binds its values the same way, and echoes what was stored.
+query I
+INSERT INTO db.dbo.ts_r (ts) VALUES (TIMESTAMP '2026-01-01 12:00:00.123456') RETURNING strftime(ts, '%H:%M:%S.%f');
+----
+12:00:00.123456
+
+query I
+SELECT * FROM fabricator_query('db', 'SELECT CONVERT(varchar(30), ts, 121) AS r FROM dbo.ts_r');
+----
+2026-01-01 12:00:00.1234560
+
+statement ok
+SELECT fabricator_exec('db', 'DROP TABLE dbo.ts_u; DROP TABLE dbo.ts_k; DROP TABLE dbo.ts_l; DROP TABLE dbo.ts_r;');
