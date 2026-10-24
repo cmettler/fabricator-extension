@@ -675,7 +675,7 @@ SELECT fabricator_exec('clean2', 'VACUUM main.t RETAIN 0 HOURS');
 statement ok
 DETACH clean2;
 
-# ==== NESTED SCHEMAS ON S3 (`nested_schemas true`) ====
+# ==== NESTED SCHEMAS ON S3 (`schemas 'nested'`) ====
 #
 # ⚠⚠ THIS SECTION EXISTS FOR ONE MEASUREMENT: the object-store leg of nested discovery is a RECURSIVE
 # glob (`<root>/**/_delta_log/*.json`), and `**` was only ever verified against DuckDB's LOCAL glob.
@@ -717,7 +717,7 @@ DETACH ns2;
 # THE MEASUREMENT: one recursive glob against httpfs finds a table two levels down.
 statement ok
 ATTACH 's3://fabricator/nested' AS nk (TYPE fabricator, PROVIDER '${DELTA_PROVIDER}',
-                                       SECRET minio_s3, READ_ONLY false, nested_schemas true);
+                                       SECRET minio_s3, READ_ONLY false, schemas 'nested');
 
 query II
 SELECT schema_name, table_name FROM duckdb_tables() WHERE database_name='nk' ORDER BY 1, 2;

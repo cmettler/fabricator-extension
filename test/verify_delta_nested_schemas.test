@@ -1,5 +1,5 @@
 # name: test/verify_delta_nested_schemas.test
-# description: Delta folder-as-catalog with the `nested_schemas true` ATTACH option — the directory tree UNDER the
+# description: Delta folder-as-catalog with the `schemas 'nested'` ATTACH option — the directory tree UNDER the
 #              root IS the schema tree, to any depth (DuckDB 2.0 nested schemas), so <root>/sales/eu/deep resolves
 #              as cat.sales.eu.deep. READS and WRITES both nest since ABI v92; §7 re-reads the deep table through a
 #              sub-root attached FLAT, which is what proves a nested write landed in the right directory rather than
@@ -69,7 +69,7 @@ DETACH flatlk;
 
 # ── §3 the nested attach: discovery reports the TREE, intermediate levels included.
 statement ok
-ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/nested/nl' AS lk (TYPE fabricator, PROVIDER 'delta', nested_schemas true);
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/nested/nl' AS lk (TYPE fabricator, PROVIDER 'delta', schemas 'nested');
 
 query I
 SELECT schema_name FROM duckdb_schemas() WHERE database_name='lk' ORDER BY 1;
@@ -245,7 +245,7 @@ DETACH lk;
 
 # ── §8 re-attach: the tree is storage, not session state.
 statement ok
-ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/nested/nl' AS lk2 (TYPE fabricator, PROVIDER 'delta', nested_schemas true);
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/nested/nl' AS lk2 (TYPE fabricator, PROVIDER 'delta', schemas 'nested');
 
 query I
 SELECT v FROM lk2.sales.eu.deep;
@@ -260,7 +260,7 @@ SELECT count(*) FROM lk2.sales.orders;
 statement ok
 DETACH lk2;
 
-# ── §9 a ROOT-LEVEL Delta table is NOT discovered under nested_schemas (every level is a real directory, so a
+# ── §9 a ROOT-LEVEL Delta table is NOT discovered under schemas 'nested' (every level is a real directory, so a
 #    table needs at least one). It is skipped with a WARNING rather than refused; `schemas true` does not
 #    discover one either, so this is not a regression — it is the behaviour being pinned.
 statement ok
@@ -273,7 +273,7 @@ statement ok
 DETACH r1;
 
 statement ok
-ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/nested/rootonly' AS r2 (TYPE fabricator, PROVIDER 'delta', nested_schemas true);
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/nested/rootonly' AS r2 (TYPE fabricator, PROVIDER 'delta', schemas 'nested');
 
 query I
 SELECT count(*) FROM duckdb_tables() WHERE database_name='r2';
@@ -296,11 +296,11 @@ SELECT v FROM r3.main.loose;
 statement ok
 DETACH r3;
 
-# ── §10 "main" is an ORDINARY directory under nested_schemas, not the synthetic schema of root-level tables.
+# ── §10 "main" is an ORDINARY directory under schemas 'nested', not the synthetic schema of root-level tables.
 #    That is the whole reason §9 skips rather than synthesizes: `CREATE TABLE cat.main.t` under `schemas true`
 #    makes a REAL <root>/main/ folder, so a synthetic "main" would have collided with the commonest layout.
 statement ok
-ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/nested/nl' AS lk3 (TYPE fabricator, PROVIDER 'delta', nested_schemas true);
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/nested/nl' AS lk3 (TYPE fabricator, PROVIDER 'delta', schemas 'nested');
 
 query I
 SELECT v FROM lk3.main.flat;
@@ -309,3 +309,62 @@ SELECT v FROM lk3.main.flat;
 
 statement ok
 DETACH lk3;
+
+# ── §11 the `schemas` VALUES. One option, three states — 'none' | 'onelevel' | 'nested' — with true/false as
+#    PERMANENT spellings of 'onelevel'/'none' (§1 and §2 use `schemas true`). It replaced two booleans,
+#    `schemas` and `nested_schemas`, whose four combinations meant three things.
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/nested/nl' AS v1 (TYPE fabricator, PROVIDER 'delta', schemas 'onelevel');
+
+# 'onelevel' sees the two-level table (with §6's write in it) and NOT the depth-2 one.
+# ⚠ Under the old boolean read this value was silently FALSE (anything but "true" was), so this row is also
+#   the one that fails if the option ever stops being parsed as a three-way value.
+query II
+SELECT id, region FROM v1.sales.orders ORDER BY id;
+----
+1	eu
+2	us
+
+statement error
+SELECT * FROM v1.sales.eu.deep;
+----
+does not exist
+
+statement ok
+DETACH v1;
+
+# 'none' and `false` are the FLAT layout — the root-level table §9 planted, in "main".
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/nested/rootonly' AS v2 (TYPE fabricator, PROVIDER 'delta', schemas 'none');
+
+query I
+SELECT v FROM v2.main.loose;
+----
+3
+
+statement ok
+DETACH v2;
+
+statement ok
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/nested/rootonly' AS v3 (TYPE fabricator, PROVIDER 'delta', schemas false);
+
+query I
+SELECT v FROM v3.main.loose;
+----
+3
+
+statement ok
+DETACH v3;
+
+# An unknown value is REFUSED and names the three — never read as "off", which is what the boolean did.
+statement error
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/nested/nl' AS bad1 (TYPE fabricator, PROVIDER 'delta', schemas 'deep');
+----
+expected 'none', 'onelevel' or 'nested'
+
+# ⚠⚠ The retired key is REFUSED BY NAME, not ignored. ATTACH options are free-form, so a leftover
+#    `nested_schemas true` would otherwise attach FLAT and every nested table would simply be missing.
+statement error
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/nested/nl' AS bad2 (TYPE fabricator, PROVIDER 'delta', nested_schemas true);
+----
+use schemas 'nested'

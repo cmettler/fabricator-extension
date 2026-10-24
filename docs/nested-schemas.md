@@ -4,6 +4,15 @@
 true` resolves `cat.a.b.t` to any depth, for READS AND WRITES. ABI v92. The only statement that still
 cannot name a nested table is `COMMENT ON`, and the layer that stops it is DuckDB's own parser. Slice 3
 (DAX per-model `system`) NOT started.**
+
+> ⚠ **THE OPTION WAS RENAMED 2026-10-24: `nested_schemas true` IS NOW `schemas 'nested'`.** `schemas` and
+> `nested_schemas` were two booleans spelling three states, and setting both silently meant `nested`. One
+> option takes `'none' | 'onelevel' | 'nested'`, with `true`/`false` kept as PERMANENT spellings of
+> `'onelevel'`/`'none'` (every existing two-level ATTACH uses `schemas true`). `nested_schemas` is REFUSED
+> BY NAME rather than ignored — ATTACH options are free-form, so a leftover one would otherwise attach flat
+> and lose every nested table without a message. No alias: it shipped only in the unpublished v0.2.0
+> draft. The slice records below keep the old spelling because that is what they built and measured.
+> Gate: `verify_delta_nested_schemas` §11.
 User-directed, from <https://duckdb.org/docs/2.0/sql/statements/create_schema#nested-schemas>. Scope
 decided by the user: a **full ABI change** carrying a schema PATH, Delta on **local FS + plain ADLS/S3**,
 with Fabric's `Tables/` area and SQL Server deliberately excluded.

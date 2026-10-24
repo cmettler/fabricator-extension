@@ -55,8 +55,10 @@ SELECT v FROM lake.main.dup;
 statement ok
 DETACH lake;
 
+# ⚠ The RE-attach uses the three-way spelling `schemas 'onelevel'` on the tree `schemas true` wrote, so the
+# two spellings are proven to read the SAME layout. `true` stays a permanent spelling of 'onelevel'.
 statement ok
-ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/catalogschemas' AS lake (TYPE fabricator, PROVIDER 'delta', schemas true);
+ATTACH '${FABRICATOR_DELTA_WRITE_DIR}/catalogschemas' AS lake (TYPE fabricator, PROVIDER 'delta', schemas 'onelevel');
 
 query I
 SELECT v FROM lake.staging.dup;

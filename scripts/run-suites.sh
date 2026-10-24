@@ -915,13 +915,15 @@ case "$TIER" in
         #   §5 went from asserting nine REFUSALS to asserting the writes themselves plus a read-back
         #   through a sub-root attached FLAT (65 -> 79). Same arithmetic claim: +14 and nothing else moved,
         #   although this one touches every provider's write path rather than only the nesting one.
+        # 2026-10-24: 10196 -> 10211. verify_delta_nested_schemas 79 -> 94 (§11): `schemas` became ONE
+        #   three-way option ('none'|'onelevel'|'nested'), `nested_schemas` refused by name.
         # 2026-10-23: 10168 -> 10196. verify_with_options 206 -> 234: `ALTER TABLE … SET (…) / RESET (…)`
         #   (DuckDB 2.0's SET_TABLE_OPTIONS / RESET_TABLE_OPTIONS), plus the row that replaced a stale
         #   REFUSAL — a column-list `CREATE TABLE t (…) WITH (parquet_compression=…)` used to be rejected
         #   as "no write to apply to", which stopped being true when the tuning became a persisted table
         #   property. ⚠ The load-bearing rows read a WRITTEN FILE: a property in the catalog proves only
         #   that the key was stored, and the point of persisting it is that a LATER INSERT obeys it.
-        : "${MIN_ASSERTIONS:=10196}"
+        : "${MIN_ASSERTIONS:=10211}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

@@ -4381,8 +4381,8 @@ principal wins even if `PROVIDER` says something else:
 | `DELETE` / `UPDATE` — rowid deletion-vectors / merge-on-read (default) or copy-on-write (`deletion_vectors false`) | ✅ |
 | `DROP TABLE`, `ALTER TABLE … ADD COLUMN`, `RENAME TABLE` (local + OneLake) | ✅ |
 | **Table options in DDL**: `CREATE … WITH (…)`, `ALTER TABLE … SET (…)`, `ALTER TABLE … RESET (…)` — persisted write tuning that governs every later write | ✅ |
-| Multi-schema: `schemas true` (local/S3 `<root>/<schema>/<table>`); schema-enabled OneLake lakehouses | ✅ |
-| **Nested** schemas (DuckDB 2.0): `nested_schemas true` — the directory tree under a local/S3/ADLS root IS the schema tree, so `<root>/a/b/t` is `cat.a.b.t`, for reads and writes alike | ✅ (except `COMMENT ON`, which DuckDB's parser caps at three qualifications) |
+| Multi-schema: `schemas 'onelevel'` (= `schemas true`; local/S3 `<root>/<schema>/<table>`); schema-enabled OneLake lakehouses | ✅ |
+| **Nested** schemas (DuckDB 2.0): `schemas 'nested'` — the directory tree under a local/S3/ADLS root IS the schema tree, so `<root>/a/b/t` is `cat.a.b.t`, for reads and writes alike | ✅ (except `COMMENT ON`, which DuckDB's parser caps at three qualifications) |
 | Time travel: `FROM t AT (VERSION => n)` and `AT (TIMESTAMP => ts)` | ✅ |
 | Snapshots/history: `<catalog>.delta.snapshots('<schema.>table')` | ✅ |
 | **Exactly-once appends** (Delta application transactions / Spark `txnAppId`): `<catalog>.delta.set_transaction_version` + `.get_transaction_version` | ✅ |
@@ -4701,8 +4701,8 @@ Two more write options (also via `delta_write_options`):
   For append-time evolution via `INSERT`, use `ALTER TABLE ADD COLUMN` (supported) then `INSERT`.
 
 Delta ATTACH options: `PROVIDER 'delta'`, `SECRET <azure_sp>` (OneLake auth), `READ_ONLY false`
-(required for OneLake writes), `schemas true` (two-level layout on local/S3), `nested_schemas true` (the
-directory tree IS the schema tree, any depth — see below), `compression` / `row_group_size`
+(required for OneLake writes), `schemas 'none'|'onelevel'|'nested'` (how the directory tree under a
+local/S3/ADLS root maps to schemas — see below; `true` = `'onelevel'`, `false` = `'none'`), `compression` / `row_group_size`
 / `bloom_filter_columns` (write-tuning defaults — `bloom_filter_columns` is EW-codec-only; `native_write`
 blooms automatically, see [above](#partitioning--write-tuning)), `deletion_vectors true|false`,
 `column_mapping 'name'|'id'|'none'`, `row_tracking true`, `change_data_feed true` (CDF capture),
@@ -4738,27 +4738,39 @@ ALTER TABLE lake.events RESET (parquet_compression);
   escape hatch for anything the vocabulary above does not spell — the same surface
   `<catalog>.delta.set_tblproperties` offers, reachable from DDL.
 
-#### Nested schemas (`nested_schemas true`)
+#### Schema layouts (`schemas`) and nested schemas
 
-DuckDB 2.0 lets a schema contain another schema. With this option the **directory tree under the Delta
-root IS the schema tree**, to any depth: a directory holding a `_delta_log` is a *table*, anything else is
+One option says how the directory tree under a local, S3 or ADLS root maps to DuckDB schemas:
+
+| `schemas` | layout | table `<root>/…` resolves as |
+|---|---|---|
+| `'none'` (default; also `false`) | flat | `<root>/t` → `cat.main.t` |
+| `'onelevel'` (also `true`) | two levels | `<root>/s/t` → `cat.s.t` |
+| `'nested'` | the tree, any depth | `<root>/a/b/t` → `cat.a.b.t` |
+
+Any other value is refused. ⚠ The retired `nested_schemas true` is refused by name — it was replaced by
+`schemas 'nested'` before any published release.
+
+DuckDB 2.0 lets a schema contain another schema. With `schemas 'nested'` the **directory tree under the
+Delta root IS the schema tree**, to any depth: a directory holding a `_delta_log` is a *table*, anything else is
 one more schema level.
 
 ```sql
 -- <root>/sales/orders/_delta_log          -> cat.sales.orders
 -- <root>/sales/eu/deep/_delta_log         -> cat.sales.eu.deep
-ATTACH '/data/lake' AS cat (TYPE fabricator, PROVIDER 'delta', nested_schemas true);
+ATTACH '/data/lake' AS cat (TYPE fabricator, PROVIDER 'delta', schemas 'nested');
 SELECT * FROM cat.sales.eu.deep;
 SELECT schema_name FROM duckdb_schemas() WHERE database_name = 'cat';
 ```
 
-- It **supersedes `schemas`** rather than extending it: nested mode is the two-level layout generalised,
-  so a one-level tree discovers exactly what `schemas true` discovers.
+- `'nested'` **generalises `'onelevel'`**: a one-level tree discovers exactly what `'onelevel'` discovers.
+  They are still not interchangeable — `'nested'` changes how DuckDB resolves a dotted name, and on an
+  object store its discovery walks the whole tree where `'onelevel'` globs exactly two levels.
 - **Reads and writes.** `INSERT`, `UPDATE`, `DELETE`, `CREATE`/`DROP TABLE`, `ALTER` and
   `CREATE`/`DROP SCHEMA` all work at any depth. The one exception is `COMMENT ON`, which DuckDB's parser
   caps at three qualifications, so a nested table cannot be named in it at all.
 - A Delta table sitting **directly under the root** is not discovered (every level is a real directory, so
-  a table needs at least one); it is skipped with a warning. `schemas true` does not discover one either.
+  a table needs at least one); it is skipped with a warning. `'onelevel'` does not discover one either.
 - Not available on a **OneLake** root: Fabric's `Tables/` area is defined as exactly two levels, and the
   ATTACH says so rather than offering a syntax that would resolve to nothing.
 - Works on **local filesystems and S3** (both measured end to end). On a local root discovery walks
@@ -4772,7 +4784,8 @@ SELECT schema_name FROM duckdb_schemas() WHERE database_name = 'cat';
 | `deletion_vectors` | **`true`** | DV / merge-on-read DELETE+UPDATE (+ row tracking); bumps the table to reader v3 |
 | `column_mapping` | **`'name'`** | writer v7; metadata-only RENAME / DROP COLUMN; Fabric T-SQL-endpoint compatible |
 | `native_read`, `native_write` | **from the PROVIDER name** | `PROVIDER 'delta'` ⇒ both **on** (DuckDB's Parquet reader/writer — the production path); `PROVIDER 'engineeredwooddelta'` ⇒ both **off** (pure-EW codec). Either is still settable explicitly on either spelling |
-| `change_data_feed`, `in_commit_timestamps`, `row_tracking`, `schemas`, `nested_schemas` | `false` / off | opt-in |
+| `change_data_feed`, `in_commit_timestamps`, `row_tracking` | `false` / off | opt-in |
+| `schemas` | `'none'` | flat layout; `'onelevel'` / `'nested'` opt in |
 | `isolation_level` | **`write_serializable`** | Concurrent **disjoint-row DML on one file composes** instead of conflicting — row-level concurrency is a `write_serializable`-only relaxation, and it is why this is the default. ⚠ **It does NOT match Fabric Spark**, which commits at `Serializable` and whose DDL will not even set `WriteSerializable`: on a table that declares no `delta.isolationLevel` we are the more permissive writer, so the effective guarantee depends on which engine wrote last. Attach `isolation_level 'serializable'` to align. (Was `serializable` between 2026-08-01 and 2026-08-11.) |
 | `compression` | `snappy` | + auto dictionary encoding + always-on min/max stats |
 
