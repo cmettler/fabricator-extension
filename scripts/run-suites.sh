@@ -915,6 +915,8 @@ case "$TIER" in
         #   §5 went from asserting nine REFUSALS to asserting the writes themselves plus a read-back
         #   through a sub-root attached FLAT (65 -> 79). Same arithmetic claim: +14 and nothing else moved,
         #   although this one touches every provider's write path rather than only the nesting one.
+        # 2026-10-24: 10313 -> 10321. verify_delta_batched_read 475 -> 483 (§16f): the full form serves id mode
+        #   (rowid shapes) through the same field-id map; a projected row-tracking column keeps the loop.
         # 2026-10-24: 10296 -> 10313. verify_delta_batched_read 458 -> 475 (§16c/§16e): the rewrite seam stamps
         #   field ids on struct MEMBERS, so id-mode structs batch through an id-keyed `children` map.
         # 2026-10-24: 10262 -> 10296. verify_delta_batched_read 424 -> 458 (§16): id-mode tables take the plain
@@ -933,7 +935,7 @@ case "$TIER" in
         #   as "no write to apply to", which stopped being true when the tuning became a persisted table
         #   property. ⚠ The load-bearing rows read a WRITTEN FILE: a property in the catalog proves only
         #   that the key was stored, and the point of persisting it is that a LATER INSERT obeys it.
-        : "${MIN_ASSERTIONS:=10313}"
+        : "${MIN_ASSERTIONS:=10321}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

@@ -1278,7 +1278,8 @@
       Structs included: each member is declared under its own field id in an id-keyed `children` map, which
       needed the rewrite seam (`NativeParquetDataFileWriter`) to stamp MEMBER ids — it stamped the top level
       only until the same day (gate §16e). A list/map holding a struct stays on the loop (its element node has
-      no Delta id), and the full form stays name-keyed, because the materialized row-tracking columns carry no id. The test this
+      no Delta id). The full form takes the same id-keyed map for the rowid shapes (§16f); only a projected
+      row-tracking column keeps the loop, because its materialized form carries no id. The test this
       gate could never have is now `verify_delta_batched_read` §16: a FOREIGN-named file committed by hand under
       the same field ids, which a name-keyed mutant reads as `NULL NULL`. The union form inherits it (16d).
     - **⚠ AND THE DEFAULT COLUMN-MAPPING MODE IS `name`, NOT `id`** — measured off the `metaData` of a plain

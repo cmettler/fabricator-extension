@@ -398,8 +398,9 @@ internal static class DeltaNativeReader
     /// uses it; the plain form still declines the position shapes because the full form serves them, not
     /// because it cannot. docs/duckdb-upstream-issues.md §1.</para></item>
     /// <item><b>ID-mode column mapping — the plain form serves it BY FIELD ID since 2026-10-24 (DuckDB 2.0 takes an
-    /// INTEGER-keyed map), structs included via id-keyed <c>children</c>; a list/map holding a struct and the full
-    /// form stay on the loop.</b>
+    /// INTEGER-keyed map), structs included via id-keyed <c>children</c>, and so does the full form (the rowid
+    /// shapes). On the loop stay a list/map holding a struct and a projected row-tracking column, whose
+    /// materialized form has no field id to key by.</b>
     /// The paragraph below is why a NAME key is never used in id mode, and it still governs everything the
     /// id-keyed map does not cover. A name-keyed map resolves columns by NAME, while id mode's contract is that a
     /// reader matches by FIELD ID and the stored name is <i>not</i> authoritative — a legacy engineered-wood
@@ -1181,10 +1182,11 @@ internal static class DeltaNativeReader
             {
                 return null;
             }
-            if (listing.LogicalToFieldId is not null)
-            {
-                return null; // id mode: a file's stored names are its own vintage's — case 2
-            }
+            // ID mode keys the map by FIELD ID (IdMapEntry, the plain form's rule), which DuckDB 2.0 composes with
+            // `file_row_number` — so the rowid shapes batch too. ⚠ The row-tracking columns cannot join that map:
+            // no writer gives a materialized row-tracking column a field id, and one map takes one key type, so an
+            // id-mode scan projecting either of them stays on the per-file loop.
+            bool idMapped = listing.LogicalToFieldId is not null;
             bool nameMapped = listing.LogicalToPhysical is not null || listing.MappedSchema is not null;
 
             var partitionCols = new List<string>();
@@ -1198,6 +1200,10 @@ internal static class DeltaNativeReader
                 {
                     // Virtual: not in the table schema. Its materialized form is declared below so a file
                     // without it reads NULL — the COALESCE's fallthrough.
+                    if (idMapped)
+                    {
+                        return null; // no field id to declare it under — see above
+                    }
                     trackingCols.Add(c);
                     continue;
                 }
@@ -1223,6 +1229,17 @@ internal static class DeltaNativeReader
                     }
                     inner.Add($"CAST(__fab_f.{Quote("p" + partitionCols.Count)} AS {ptype}) AS {Quote(c)}");
                     partitionCols.Add(c);
+                    continue;
+                }
+                if (idMapped)
+                {
+                    // Members arrive under logical names through the id-keyed `children`, so no rebuild.
+                    if (IdMapEntry(field, c) is not { } idEntry)
+                    {
+                        return null;
+                    }
+                    entries.Add(idEntry);
+                    inner.Add($"__fab_rp.{Quote(c)} AS {Quote(c)}");
                     continue;
                 }
                 string stored = nameMapped ? PhysicalName(field) : field.Name;

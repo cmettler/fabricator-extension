@@ -1538,9 +1538,9 @@ WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native batch%'
 ----
 true
 
-# 15d. ID-MODE column mapping, which the full form declines and the plain form serves only by FIELD ID and only
-#      for primitives (section 16 — a name-keyed `schema` map is unsound against a file we did not write). This form resolves no stored name and opens no file, so it
-#      serves it — a capability gain, not an oversight of that gate.
+# 15d. ID-MODE column mapping, which the other batched forms serve only through a FIELD-ID-keyed map (section
+#      16 — a name-keyed `schema` map is unsound against a file we did not write). This form resolves no stored
+#      name and opens no file, so it needs neither.
 statement ok
 CREATE TABLE im.main.poid (id BIGINT, pidz VARCHAR) PARTITIONED BY (pidz);
 
@@ -1727,6 +1727,43 @@ query I
 SELECT count(*) >= 2 FROM duckdb_logs
 WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native batch%'
   AND message LIKE '%''children'': map {%' AND message LIKE '%''name'': ''renamed''%';
+----
+true
+
+# 16f. ROWID SHAPES in id mode take the FULL form: the field-id map beside `file_row_number`, which DuckDB 2.0
+#      composes (1.5 could not). A DELETE reads its rowids through exactly this, so removing one row and
+#      counting what is left checks the rowid end to end.
+query II
+SELECT count(DISTINCT rowid), sum((s).a) FROM im.main.t;
+----
+4	179
+
+query I
+SELECT count(*) > 0 FROM duckdb_logs
+WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native batch%'
+  AND message LIKE '%filename => true, file_row_number => true%' AND message LIKE '%''children'': map {%';
+----
+true
+
+statement ok
+DELETE FROM im.main.t WHERE ident = 3;
+
+query II
+SELECT count(*), sum(ident) FROM im.main.t;
+----
+3	7
+
+# ...while a ROW-TRACKING column keeps the per-file loop in id mode: no writer gives its materialized form a
+# field id, so it cannot be declared in an id-keyed map. The answer is still right; only the route differs.
+query I
+SELECT count(DISTINCT __delta_row_id) FROM im.main.t;
+----
+3
+
+query I
+SELECT count(*) > 0 FROM duckdb_logs
+WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native scan%'
+  AND message LIKE '%__delta_row_id%' AND message LIKE '%batched=0 %' AND message LIKE '%colmap=id%';
 ----
 true
 
