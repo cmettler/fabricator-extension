@@ -397,8 +397,10 @@ internal static class DeltaNativeReader
     /// through <c>children</c> — which 1.5 accepted and silently IGNORED. <see cref="TryFullForm"/> already
     /// uses it; the plain form still declines the position shapes because the full form serves them, not
     /// because it cannot. docs/duckdb-upstream-issues.md §1.</para></item>
-    /// <item><b>ID-mode column mapping is a CONTRACT gate, and the honest statement of it is narrower than it
-    /// first looks.</b> This path resolves columns by NAME (the map key), while id mode's contract is that a
+    /// <item><b>ID-mode column mapping — the plain form serves it BY FIELD ID since 2026-10-24 (DuckDB 2.0 takes an
+    /// INTEGER-keyed map), for PRIMITIVE columns only; structs, lists, maps and the full form stay on the loop.</b>
+    /// The paragraph below is why a NAME key is never used in id mode, and it still governs everything the
+    /// id-keyed map does not cover. A name-keyed map resolves columns by NAME, while id mode's contract is that a
     /// reader matches by FIELD ID and the stored name is <i>not</i> authoritative — a legacy engineered-wood
     /// id-mode file stores LOGICAL names under its field ids where a current one stores <c>col-&lt;guid&gt;</c>,
     /// and an external writer is free to do either. A name-keyed map meeting such a file finds nothing and hands
@@ -407,12 +409,13 @@ internal static class DeltaNativeReader
     /// with only b renamed gave <c>{'a': 20, 'b': NULL}</c>, no error; fully disjoint children DO error
     /// (<i>STRUCT to STRUCT cast must have at least one matching member</i>), so partial overlap is the
     /// dangerous shape and partial overlap is what one rename produces.
-    /// <para>⚠ <b>But OUR OWN writers never produce the divergence, so no test here can kill this gate, and it
-    /// must not be described as if one did.</b> MEASURED: an id-mode table taken through a nested RENAME and then
+    /// <para>⚠ <b>OUR OWN writers never produce the divergence</b> (verify_delta_batched_read §16 commits a
+    /// foreign-named file by hand to build it, and a name-keyed mutant reads it as NULL there). MEASURED: an id-mode table taken through a nested RENAME and then
     /// a top-level RENAME has all four of its files storing BYTE-IDENTICAL physical names — the physicalName is
     /// assigned once at column creation in id mode exactly as in name mode. A mutant with this gate removed
-    /// therefore passes the whole suite. It is kept because name-matching a table whose contract is
-    /// id-matching is unsound for files we did not write, not because a reachable bug was reproduced.</para>
+    /// therefore passed the whole suite until §16 existed. ⚠ Why id-mode STRUCTS stay on the loop: the rewrite
+    /// seam (NativeParquetDataFileWriter) stamps top-level field ids only, so an id-keyed <c>children</c> map
+    /// would read a rewritten file's struct members as NULL — a gap in OUR writer, not in the contract.</para>
     /// NAME mode needs no such gate: there the physical name IS authoritative and stable across renames, which
     /// is the reason the mode exists.</item>
     /// <item><b>Partition values are per file and absent from the data files</b>, so a declared <c>schema</c>
@@ -828,10 +831,21 @@ internal static class DeltaNativeReader
                 return new PlainParts { CoreSql = sb.ToString(), BatchFiles = batchFiles, LoopFiles = loopFiles };
             }
 
-            if (listing.TableSchema is null || listing.LogicalToFieldId is not null)
+            if (listing.TableSchema is null)
             {
-                return null; // case 2: no schema to declare, or id-mode column mapping
+                return null; // case 2: no schema to declare
             }
+            // ID mode keys the map by FIELD ID (DuckDB 2.0, measured): the id is the column's identity in that
+            // mode and the stored name is not authoritative, so an INTEGER-keyed map is the reader honouring
+            // the contract rather than guessing names — it matches across a physical rename and NULL-fills a
+            // file that predates the column, exactly like the name map does in name mode.
+            // ⚠ PRIMITIVE COLUMNS ONLY, and the reason is OUR OWN writer: the rewrite seam
+            // (NativeParquetDataFileWriter.FieldIdsFromMetadata — DML post-images, compaction) stamps TOP-LEVEL
+            // ids only, so a struct's members in such a file carry none. An id-keyed `children` map would read
+            // them as NULL with no error, where the per-file loop probes each file and falls back to the
+            // physical name. A LIST/MAP could not be expressed anyway: its element nodes have no Delta id to key
+            // a child entry by.
+            bool idMapped = listing.LogicalToFieldId is not null;
             // Whether to key the map by the PHYSICAL name at all. PhysicalName reads field metadata without
             // regard to the table's mapping MODE, so this is what stops a table whose mode is 'none' but whose
             // schema still carries physicalName metadata from being keyed physically against files that store
@@ -874,7 +888,20 @@ internal static class DeltaNativeReader
                     needsInner = true;
                     continue;
                 }
-                string stored = nameMapped ? PhysicalName(field) : field.Name;
+                string key;
+                if (idMapped)
+                {
+                    if (field.Type is not DeltaSchema.PrimitiveType
+                        || DeltaSchema.ColumnMapping.GetFieldId(field) is not { } fid)
+                    {
+                        return null; // nested in id mode, or a column with no id — the loop resolves per file
+                    }
+                    key = fid.ToString(CultureInfo.InvariantCulture);
+                }
+                else
+                {
+                    key = Literal(nameMapped ? PhysicalName(field) : field.Name);
+                }
                 string type;
                 try
                 {
@@ -884,7 +911,7 @@ internal static class DeltaNativeReader
                 {
                     return null; // no CAST-target rendering (variant, or a type we do not map) — loop it
                 }
-                entries.Add($"{Literal(stored)}: {{'name': {Literal(c)}, 'type': {Literal(type)}, "
+                entries.Add($"{key}: {{'name': {Literal(c)}, 'type': {Literal(type)}, "
                             + "'default_value': NULL}");
                 // `schema` renames only the TOP level, so a mapped struct's interior arrives physical. Rebuild it
                 // with logical member names in SQL — not for cosmetics: a pushed struct-member predicate
@@ -993,7 +1020,7 @@ internal static class DeltaNativeReader
         /// warm. So the remote-unlimited fallback stays the full form. ⚠ Measured on ONE shape — 200 tiny
         /// files, D=2; a table with many DV files pays D queries here and the balance could move.</para>
         /// <para><b>Eligibility is exactly the plain form's</b> — this is only called on its PARTIAL result, so
-        /// no rowid, no row tracking, no projected partition column, no id mode, every column renderable. Each
+        /// no rowid, no row tracking, id mode only for primitive columns, every column renderable. Each
         /// DV branch additionally needs its footer probe and typed-NULL rendering to succeed; any failure
         /// falls back to <see cref="TryFullForm"/> (the pre-2026-08-16 route), never to a worse answer.</para>
         /// <para><b>The struct-interior union hazard does NOT apply here</b> (the one
@@ -1515,8 +1542,8 @@ internal static class DeltaNativeReader
     }
 
     // The PHYSICAL (in-file) name of a top-level or nested field under NAME-mode column mapping: the declared
-    // physicalName, else the logical name (no mapping). Deliberately does NOT consult field ids — BatchPlan
-    // gates id mode out precisely because that answer is per-file.
+    // physicalName, else the logical name (no mapping). Deliberately does NOT consult field ids — an id-mode
+    // batch keys its map by the field id itself and never reaches this.
     private static string PhysicalName(DeltaSchema.StructField field)
         => field.Metadata is { } md
            && md.TryGetValue(DeltaSchema.ColumnMapping.PhysicalNameKey, out var phys)

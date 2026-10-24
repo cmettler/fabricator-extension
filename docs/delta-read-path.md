@@ -1273,6 +1273,13 @@
       RENAME has all four of its files storing BYTE-IDENTICAL physical names** — in id mode too, `physicalName` is
       assigned once at column creation. Keep the gate because name-matching a table whose contract is id-matching
       is unsound for files WE DID NOT WRITE, and say exactly that rather than implying a bug was reproduced.
+    - **⚠⚠ SUPERSEDED ON DuckDB 2.0 (2026-10-24): the plain form batches id-mode tables BY FIELD ID now** — 2.0
+      accepts an INTEGER-keyed `schema` map, which is the contract-honouring read the gate above was waiting for.
+      Primitive columns only: our rewrite seam (`NativeParquetDataFileWriter`) stamps top-level field ids and
+      none on struct members, so an id-keyed `children` map would NULL a rewritten file's struct members; and
+      the full form stays name-keyed, because the materialized row-tracking columns carry no id. The test this
+      gate could never have is now `verify_delta_batched_read` §16: a FOREIGN-named file committed by hand under
+      the same field ids, which a name-keyed mutant reads as `NULL NULL`. The union form inherits it (16d).
     - **⚠ AND THE DEFAULT COLUMN-MAPPING MODE IS `name`, NOT `id`** — measured off the `metaData` of a plain
       `PROVIDER 'delta'` create. `verify_delta_catalog_column_mapping`'s own header says *"DEFAULT = 'id'"* and is
       STALE. It matters here and not academically: were `id` the default, the gate above would disable batching

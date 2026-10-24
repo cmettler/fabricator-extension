@@ -915,6 +915,8 @@ case "$TIER" in
         #   §5 went from asserting nine REFUSALS to asserting the writes themselves plus a read-back
         #   through a sub-root attached FLAT (65 -> 79). Same arithmetic claim: +14 and nothing else moved,
         #   although this one touches every provider's write path rather than only the nesting one.
+        # 2026-10-24: 10262 -> 10296. verify_delta_batched_read 424 -> 458 (§16): id-mode tables take the plain
+        #   form keyed by FIELD ID (primitives only), gated by a hand-committed foreign-named file.
         # 2026-10-24: 10218 -> 10262. A SPARK-named materialized row id was ignored (read only under the
         #   literal `__delta_row_id`): verify_delta_batched_read 406 -> 424 (§13e) and
         #   verify_delta_clustered_optimize 147 -> 160 per engine leg (§9, the clustered rewrite).
@@ -929,7 +931,7 @@ case "$TIER" in
         #   as "no write to apply to", which stopped being true when the tuning became a persisted table
         #   property. ⚠ The load-bearing rows read a WRITTEN FILE: a property in the catalog proves only
         #   that the key was stored, and the point of persisting it is that a LATER INSERT obeys it.
-        : "${MIN_ASSERTIONS:=10262}"
+        : "${MIN_ASSERTIONS:=10296}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

@@ -21,6 +21,8 @@ require fabricator
 
 require parquet
 
+require json
+
 require-env FABRICATOR_DELTA_WRITE_DIR
 
 # ============================================================================
@@ -395,8 +397,8 @@ SELECT min(__delta_row_id), max(__delta_row_id) FROM b.main.trk;
 0	199
 
 # ============================================================================
-# 7. ID-MODE COLUMN MAPPING — gated off the batch, and this section is a POSITIVE CONTROL
-#    only: it cannot kill the gate and does not pretend to. The batch resolves columns by
+# 7. ID-MODE COLUMN MAPPING — a POSITIVE CONTROL only, and the rationale for section 16, which
+#    replaced the gate described here (2026-10-24: id mode batches by FIELD ID now, primitives only). The batch resolves columns by
 #    NAME while id mode's contract is that the reader matches by FIELD ID, so a legacy
 #    engineered-wood file (LOGICAL names under its field ids) or any external writer that
 #    names differently would silently read NULL. But MEASURED: our own writers keep the
@@ -1536,8 +1538,8 @@ WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native batch%'
 ----
 true
 
-# 15d. ID-MODE column mapping, which BOTH other batched forms decline outright (a name-keyed `schema` map is
-#      unsound against a file we did not write). This form resolves no stored name and opens no file, so it
+# 15d. ID-MODE column mapping, which the full form declines and the plain form serves only by FIELD ID and only
+#      for primitives (section 16 — a name-keyed `schema` map is unsound against a file we did not write). This form resolves no stored name and opens no file, so it
 #      serves it — a capability gain, not an oversight of that gate.
 statement ok
 CREATE TABLE im.main.poid (id BIGINT, pidz VARCHAR) PARTITIONED BY (pidz);
@@ -1595,6 +1597,104 @@ query I
 SELECT count(*) FROM b.main.ponly;
 ----
 60
+
+# ============================================================================
+# 16. ID-MODE TABLES TAKE THE PLAIN FORM, KEYED BY FIELD ID (2026-10-24, DuckDB 2.0). Section 7 explains why
+#     a NAME-keyed map is unsound in id mode: the stored name is not authoritative there, and a file that
+#     stores a different name under the right field id reads as NULL. 2.0 lets the `schema` map be keyed by
+#     INTEGER, so an id-mode scan resolves columns by field id, as the mode's contract says a reader should.
+#     ⚠ PRIMITIVE COLUMNS ONLY: our own rewrite seam stamps top-level field ids and none on struct members,
+#     so a struct projection stays on the per-file loop (16c).
+# ============================================================================
+
+statement ok
+CREATE TABLE im.main.fid AS SELECT 1::BIGINT AS a, 'one' AS b;
+
+# The foreign file below borrows these two ids, so they are asserted rather than assumed.
+query II
+SELECT count(*), list_sort(list(field_id)) FROM parquet_schema('${FABRICATOR_DELTA_WRITE_DIR}/brid/fid/*.parquet')
+WHERE field_id IS NOT NULL;
+----
+2	[1, 2]
+
+query I
+SELECT count(*) FROM glob('${FABRICATOR_DELTA_WRITE_DIR}/brid/fid/_delta_log/*.json');
+----
+2
+
+# 16a. A FOREIGN-WRITER FILE: different stored names under the SAME field ids, committed by hand as v2 (a plain
+#      `add` action). This is the shape section 7 could not build. A name-keyed batch reads it as NULL; the
+#      per-file loop and the id-keyed batch both read 7 / 'seven'.
+statement ok
+COPY (SELECT 7::BIGINT AS foreign_a, 'seven' AS foreign_b)
+TO '${FABRICATOR_DELTA_WRITE_DIR}/brid/fid/foreign.parquet' (FORMAT parquet, FIELD_IDS {'foreign_a': 1, 'foreign_b': 2});
+
+statement ok
+COPY (SELECT {'path': 'foreign.parquet', 'partitionValues': MAP {}::MAP(VARCHAR, VARCHAR),
+              'size': (SELECT size FROM read_blob('${FABRICATOR_DELTA_WRITE_DIR}/brid/fid/foreign.parquet')),
+              'modificationTime': 1700000000000, 'dataChange': true, 'stats': '{"numRecords":1}'} AS "add")
+TO '${FABRICATOR_DELTA_WRITE_DIR}/brid/fid/_delta_log/00000000000000000002.json' (FORMAT json);
+
+query II
+SELECT a, b FROM im.main.fid ORDER BY a;
+----
+1	one
+7	seven
+
+# ...and it was the BATCH that answered, keyed by field id (the map key is the integer, the name the logical one).
+query I
+SELECT count(*) > 0 FROM duckdb_logs
+WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native batch%'
+  AND message LIKE '%foreign.parquet%' AND message LIKE '%schema = map {1: {''name'': ''a''%';
+----
+true
+
+# 16b. A filter on a renamed-in-the-file column binds against the logical name above the scan.
+query I
+SELECT b FROM im.main.fid WHERE a = 7;
+----
+seven
+
+# 16d. A DELETION VECTOR sends the scan to the UNION form: the id-keyed plain branch over the clean files (the
+#      foreign one among them), UNION ALL a per-file branch for the DV file. Both branches must agree on types.
+#      Two rows go into a fresh file and one is deleted, so the file survives with a vector rather than being
+#      removed whole.
+statement ok
+INSERT INTO im.main.fid VALUES (9, 'nine'), (10, 'ten');
+
+statement ok
+DELETE FROM im.main.fid WHERE a = 10;
+
+query II
+SELECT a, b FROM im.main.fid ORDER BY a;
+----
+1	one
+7	seven
+9	nine
+
+query I
+SELECT count(*) > 0 FROM duckdb_logs
+WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native batch%'
+  AND message LIKE '%foreign.parquet%' AND message LIKE '%UNION ALL%' AND message LIKE '%schema = map {1: %';
+----
+true
+
+# 16c. A STRUCT projection in id mode stays on the per-file loop: the rewrite seam stamps no field ids on struct
+#      members, so an id-keyed `children` map would read them as NULL. The answer is the section-7 one.
+query III
+SELECT ident, (s).a, (s).renamed FROM im.main.t ORDER BY ident;
+----
+1	10	11
+2	20	21
+3	30	31
+4	40	41
+
+query I
+SELECT count(*) > 0 FROM duckdb_logs
+WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native scan%'
+  AND message LIKE '%cols=[ident,s]%' AND message LIKE '%batched=0 %' AND message LIKE '%colmap=id%';
+----
+true
 
 statement ok
 CALL disable_logging();
