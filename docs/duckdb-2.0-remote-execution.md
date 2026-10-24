@@ -136,6 +136,19 @@ surface IS the work).
   (a join and an aggregate executed by SQL Server instead of pulling rows), and also why it wants its own
   slice and its own differential test suite: every query a user runs against the catalog changes path.
 - It is SQL-Server-only by nature: Delta has no remote SQL engine, and DAX is not SQL.
+- **It is what makes COMPLEX DML pushable, and the plan-less route cannot be.** DuckDB's
+  `RewriteNode(DeleteQueryNode)` / `(UpdateQueryNode)` merge the USING / FROM tables, the WHERE (subqueries
+  included), the SET expressions and RETURNING into one catalog verdict, so `DELETE … WHERE id IN (SELECT …
+  FROM <same catalog>)`, EXISTS / correlated subqueries, `UPDATE … FROM` and even MERGE INTO are pushed WHOLE
+  when every reference is the one remote catalog (`remote_pushdown_optimizer.cpp`). By `PlanDelete` the same
+  subquery is a semi/mark join in an optimized plan, and SQL cannot be recovered from that soundly. The
+  subquery is a SELECT, so this comes with — not before — SELECT pushdown.
+- **DECIDED (user, 2026-10-24): pushed DML keeps DUCKDB's semantics.** A string comparison anywhere in a
+  pushed DML statement — a subquery included — is refused or rewritten exactly (a binary collation, plus a
+  trailing-space guard, since SQL Server's `=` pads even under BIN2), never left to the server's collation: a
+  wrong DELETE cannot be undone, and the same statement must not change meaning with the route it takes.
+  Server semantics may be acceptable for SELECT, if at all. duckdb-mysql chose the other way for
+  column-to-column comparisons (§1.3a).
 
 ## 2. The plan-less `PlanDelete` / `PlanUpdate` overloads (1.5 and 2.0)
 

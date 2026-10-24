@@ -1423,7 +1423,9 @@ case "$TIER" in
         # 2026-10-24: 3699 -> 3770. verify_dml_pushdown_mssql 60 -> 131: the UPDATE twin (ABI v94) — routing per
         #   refusal, an eleven-statement differential against the kill switch AND a native-DuckDB reference,
         #   overflow atomicity, transactions, no-PK. 3699 + 71 = 3770 exactly, so no other suite moved.
-        : "${MIN_ASSERTIONS:=3770}"
+        # 2026-10-24: 3770 -> 3792. verify_dml_pushdown_mssql 131 -> 153: §11, timestamps on the ROWID path bound as
+        #   the column's own type (datetime2 SET values were rounded, datetime2 KEYS matched nothing). +22 exactly.
+        : "${MIN_ASSERTIONS:=3792}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2
