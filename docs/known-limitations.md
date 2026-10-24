@@ -305,17 +305,25 @@ projection differs and a mutant removing it survives. It is set for the contract
 
 ---
 
-### 2.x ⚠ SUSPECTED, NOT MEASURED — a SPARK-named materialized row id may be ignored by our reader
+### ~~2.x~~ FIXED 2026-10-24 — a SPARK-named materialized row id was ignored (measured, then fixed)
 
-Found by READING the code on 2026-10-24, while re-checking the row-tracking layout above. Our native reader
-looks for a materialized row id only under the LITERAL name `__delta_row_id` — the name OUR tables declare in
-`delta.rowTracking.materializedRowIdColumnName` (`RowTrackingExpr`, `TryFullForm`, and the clustered rewrite
-in `DeltaReader`, which gates on that exact name). Spark names it `_row-id-col-<uuid>` through the same
-property. If that reading is right, a Spark-written table whose rows Spark has rewritten (UPDATE / MERGE /
-OPTIMIZE) reports a DERIVED id (`baseRowId + file_row_number` of the NEW file) in `__delta_row_id` instead of
-the row's original one — a different stable id, with no error. ⚠ **To settle it:** a row-tracking table
-written by Fabric Spark, one UPDATE, then compare Spark's `_metadata.row_id` with ours for the updated rows.
-Same for `__delta_row_commit_version`.
+Suspected from reading, then **MEASURED on a Fabric Spark table** (row tracking + mapping `name`, two
+appends, `UPDATE … WHERE id IN (2, 3, 12)`): Spark reports `_metadata.row_id` 2, 3, 12 for the rewritten
+rows; our `__delta_row_id` returned **22, 20, 21** — the NEW file's `baseRowId + position` — on BOTH the
+batched and the per-file read path, with no error. Cause: every place that looked for the materialized
+columns used the LITERAL `__delta_row_id` / `__delta_row_commit_version`, which is what OUR tables declare in
+`delta.rowTracking.materializedRowIdColumnName` / `…CommitVersionColumnName`; delta-spark generates
+`_row-id-col-<uuid>` / `_row-commit-version-col-<uuid>`.
+
+Three sites, all fixed to read the DECLARED names (`DeltaReader.MaterializedTrackingNames`, legacy literal
+when undeclared): the per-file `RowTrackingExpr` and its row-tracking filter verdict, the batched
+`TryFullForm`, and the **clustered rewrite**, which only carried materialized ids when the declared names
+EQUALLED ours — so a `SORTED BY` OPTIMIZE of a Spark table gave every moved row a NEW id. It now writes them
+under the declared names. Re-measured live after the fix on the same Spark table: 2, 3, 12 with commit
+version 3, both paths. Gates: `verify_delta_batched_read` §13e and `verify_delta_clustered_optimize` §9,
+which declare a Spark-style name before any rewrite (so the post-image stores it, exactly like a Spark file);
+reverting the name lookup fails §13e at its first id row, and the pre-fix clustered rewrite fails §9 at the
+file-layout check.
 
 ## 3. Interop constraints that are permanent, not bugs
 

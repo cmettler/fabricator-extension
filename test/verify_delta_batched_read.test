@@ -1322,6 +1322,47 @@ WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native batch%'
 ----
 true
 
+# 13e. A MATERIALIZED ROW ID STORED UNDER THE TABLE'S DECLARED NAME, not the literal (2026-10-24). The
+#      reader used to look for `__delta_row_id` only — the name OUR tables declare — while delta-spark
+#      generates `_row-id-col-<uuid>`. MEASURED on a Fabric Spark table before the fix: rows whose ids are
+#      2, 3, 12 read back as 22, 20, 21 (the NEW file's baseRowId + position), on the batched AND the
+#      per-file path, with no error. The Spark-style name is declared here BEFORE any rewrite, so the
+#      UPDATE's post-image stores the column under it — exactly a Spark-written file's layout.
+statement ok
+CREATE TABLE b.main.rtspark AS SELECT i::BIGINT AS id, i::BIGINT AS v FROM range(10) r(i);
+
+statement ok
+INSERT INTO b.main.rtspark SELECT i::BIGINT, i::BIGINT FROM range(10, 20) r(i);
+
+statement ok
+SELECT * FROM b.delta.set_tblproperties('main.rtspark', '{"delta.rowTracking.materializedRowIdColumnName":"_row-id-col-spark","delta.rowTracking.materializedRowCommitVersionColumnName":"_row-commit-version-col-spark"}');
+
+statement ok
+UPDATE b.main.rtspark SET v = v + 100 WHERE id IN (2, 3, 12);
+
+# The rewrite file really stores the declared name — the precondition, or the rows below prove nothing.
+query I
+SELECT count(*) > 0 FROM parquet_schema('${FABRICATOR_DELTA_WRITE_DIR}/br/rtspark/*.parquet')
+WHERE name = '_row-id-col-spark';
+----
+true
+
+# The batched full form: the rewritten rows keep the ids they were born with.
+query III
+SELECT id, v, __delta_row_id FROM b.main.rtspark WHERE id IN (2, 3, 12) ORDER BY id;
+----
+2	102	2
+3	103	3
+12	112	12
+
+# A FILTER on the row id takes the per-file path and its file-skip verdict, which made the same literal
+# lookup — under the old reader this returned NO rows, because ids 2 and 12 were nowhere to be found.
+query II
+SELECT id, v FROM b.main.rtspark WHERE __delta_row_id IN (2, 12) ORDER BY id;
+----
+2	102
+12	112
+
 # ============================================================================
 # 14. A PARTITIONED TABLE WITH A DELETION VECTOR — the union form and the partition join in ONE query
 #     (2026-08-17). Closing §10c's residual gave the plain form a per-file constants CTE, and the union
