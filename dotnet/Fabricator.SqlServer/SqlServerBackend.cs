@@ -639,6 +639,8 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
     // ATTACH option `keep_nulls true|false` (default TRUE). See ResolveKeepNulls; a SET mssql_keep_nulls
     // overrides it per session, the same precedence as materialize and isolation_level.
     private readonly bool? _keepNulls;
+    // ATTACH option `remote_pushdown` (default false) — see CapabilitiesJson.
+    private readonly bool _remotePushdown;
     // ATTACH option `command_timeout <seconds>` (0 = infinite, default): the catalog default SqlCommand.CommandTimeout
     // for scans/DML/bulk. A SET mssql_command_timeout overrides it per session (ResolveCommandTimeout).
     private readonly int _commandTimeout;
@@ -757,6 +759,12 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
                         break;
                     case "keep_nulls":
                         _keepNulls = !(string.Equals(val, "false", StringComparison.OrdinalIgnoreCase) || val == "0");
+                        break;
+                    // ATTACH option `remote_pushdown true` (default false): let DuckDB's remote optimizer push a
+                    // whole SELECT (aggregate / GROUP BY over one table) to the server. Read ONCE here because
+                    // DuckDB latches it at ATTACH — it counts remote catalogs when the database is attached.
+                    case "remote_pushdown":
+                        _remotePushdown = string.Equals(val, "true", StringComparison.OrdinalIgnoreCase) || val == "1";
                         break;
                     // ⚠ ADDED WITH CHANGE B, and it RESTORES a capability that change would otherwise have
                     // removed. MARS used to be frozen per catalog at its first connect, so attaching twice
@@ -2753,8 +2761,12 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
     /// </remarks>
     public void Initialize() => EnsureProfile();
 
+    // `remote_select`: the host may hand this catalog a whole SELECT (src/catalog/fabricator_remote_select.cpp).
+    // Opt-in through the `remote_pushdown` ATTACH option, and not on a warehouse engine: the renderer's T-SQL
+    // has been measured against box SQL Server only.
     public string CapabilitiesJson
-        => $"{{\"is_binary_collation\":{(Profile.IsBinaryCollation ? "true" : "false")}}}";
+        => $"{{\"is_binary_collation\":{(Profile.IsBinaryCollation ? "true" : "false")}," +
+           $"\"remote_select\":{(_remotePushdown && !Profile.IsWarehouse ? "true" : "false")}}}";
 
     // Builds a two-column (property, value) stream from the detected ServerProfile. Accessing Profile
     // detects it (via the non-MARS probe) on first use; for an attached catalog it is already cached.

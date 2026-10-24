@@ -1,0 +1,344 @@
+# name: test/verify_remote_select_mssql.test
+# description: DuckDB 2.0's remote pushdown optimizer, SELECT only, on SQL Server: with the `remote_pushdown`
+#              ATTACH option a single-table aggregate / GROUP BY whose every part renders EXACTLY runs as ONE
+#              T-SQL statement through fabricator_query, and everything else runs locally as before
+#              (src/catalog/fabricator_remote_select.cpp; docs/duckdb-2.0-remote-execution.md §4.1).
+#              Needs MSSQL_TESTDB_DSN.
+#
+#              ⚠⚠ THE LOAD-BEARING SECTION IS §3, A DIFFERENTIAL. Nothing re-checks what the server returns, so
+#              every query runs on two attaches of the SAME database — `rp` (pushdown) and `db` (the existing
+#              path, the oracle) — and the symmetric difference of their results must be empty. §4 does the same
+#              for the result TYPES and NAMES, which an EXCEPT would coerce away: T-SQL's COUNT is INT and an
+#              integer SUM keeps the column's type, so the pushed path casts back to DuckDB's own types.
+#
+#              ⚠ §1's routing rows keep §3 from passing VACUOUSLY: a build that never pushes agrees with the
+#              oracle perfectly. §2 pins what must NOT be pushed, each with its reason.
+# group: [fabricator]
+
+require fabricator
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE fabricator);
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS rp (TYPE fabricator, remote_pushdown 'true');
+
+# ═══ §0  Setup ═════════════════════════════════════════════════════════════════════════════════════════
+# One table, created SERVER-SIDE so its types are SQL Server's own. 300 rows. k NULL when id % 11 = 0; amount
+# NULL when id % 13 = 0; d NULL when id % 17 = 0; b reaches 9e18, so its SUM exceeds BIGINT; rows 299 and 300
+# carry ids 2147483646 and 2147483647, so the INTEGER sum exceeds INT.
+
+# ⚠ DROP in its own batch: SQL Server compiles a whole batch against the table as it exists, so a leftover
+# rs_t with other columns would fail the INSERT below with 213.
+statement ok
+SELECT fabricator_exec('db', 'DROP TABLE IF EXISTS dbo.rs_t;');
+
+statement ok
+SELECT fabricator_exec('db', 'CREATE TABLE dbo.rs_t (id INT, k SMALLINT NULL, t TINYINT, b BIGINT, amount DECIMAL(10,2) NULL, big DECIMAL(38,10),
+  d DATE NULL, s VARCHAR(20), f FLOAT);
+INSERT INTO dbo.rs_t SELECT CASE WHEN value = 300 THEN 2147483647 WHEN value = 299 THEN 2147483646 ELSE value - 150 END,
+  CASE WHEN value % 11 = 0 THEN NULL ELSE value % 7 END, value % 200, CAST(value AS BIGINT) * 30000000000000000,
+  CASE WHEN value % 13 = 0 THEN NULL ELSE value * 1.25 END, value * 1.0000000001,
+  CASE WHEN value % 17 = 0 THEN NULL ELSE DATEADD(day, value % 50, ''2026-01-01'') END,
+  ''s'' + CAST(value % 4 AS VARCHAR), value / 3.0 FROM GENERATE_SERIES(1, 300);');
+
+statement ok
+SELECT fabricator_refresh_cache('db');
+
+statement ok
+SELECT fabricator_refresh_cache('rp');
+
+# ═══ §1  Routing — pushed ═════════════════════════════════════════════════════════════════════════════
+
+query II
+EXPLAIN SELECT count(*), sum(id), min(d), max(amount), sum(amount), count(amount) FROM rp.dbo.rs_t;
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+query II
+EXPLAIN SELECT k, count(*), sum(b) FROM rp.dbo.rs_t WHERE id > 0 AND (d IS NOT NULL OR NOT (k = 2)) GROUP BY k;
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+# A constant that converts LOSSLESSLY to the column type: 2.250 is DECIMAL(4,3), the column DECIMAL(10,2).
+query II
+EXPLAIN SELECT count(*) FROM rp.dbo.rs_t WHERE amount = 2.250;
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+# A set operation whose branches name different catalogs pushes its remote branch ON ITS OWN — which is what
+# makes §3's EXCEPT ALL differentials compare the two paths rather than the existing path with itself.
+query II
+EXPLAIN SELECT count(*), sum(id) FROM rp.dbo.rs_t EXCEPT ALL SELECT count(*), sum(id) FROM db.dbo.rs_t;
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+# ⚠ BUT NOT A JOIN CHILD: DuckDB's optimizer pushes a node only when the WHOLE node is remote, and it has no
+# partial pushdown for one side of a join (unlike a set operation's branches). So a remote aggregate joined to
+# a local table runs locally today. This row pins upstream's behaviour and fails the day it changes.
+statement ok
+CREATE TEMP TABLE kn AS SELECT i::SMALLINT AS k, 'k' || i AS name FROM range(7) r(i);
+
+query II
+EXPLAIN SELECT kn.name, s.c FROM kn JOIN (SELECT k, count(*) AS c FROM rp.dbo.rs_t GROUP BY k) s ON kn.k = s.k;
+----
+physical_plan	<!REGEX>:.*Fabricator Query.*
+
+# ═══ §2  Routing — NOT pushed, each for its own reason ═════════════════════════════════════════════════
+
+# a string column: collation, and T-SQL ignores trailing spaces in '='
+query II
+EXPLAIN SELECT max(s) FROM rp.dbo.rs_t;
+----
+physical_plan	<!REGEX>:.*Fabricator Query.*
+
+query II
+EXPLAIN SELECT count(*) FROM rp.dbo.rs_t WHERE s = 's1';
+----
+physical_plan	<!REGEX>:.*Fabricator Query.*
+
+# a float: summation order and NaN
+query II
+EXPLAIN SELECT sum(f) FROM rp.dbo.rs_t;
+----
+physical_plan	<!REGEX>:.*Fabricator Query.*
+
+# avg is not admitted (T-SQL's AVG of an INT is integer division)
+query II
+EXPLAIN SELECT avg(id) FROM rp.dbo.rs_t;
+----
+physical_plan	<!REGEX>:.*Fabricator Query.*
+
+# ⚠ a constant that does NOT convert exactly: `id > 1.5` must not become `[id] > 2`. This exact shape was
+# a WRONG ANSWER in the first build (a "strict" DECIMAL -> INTEGER cast rounds).
+query II
+EXPLAIN SELECT count(*) FROM rp.dbo.rs_t WHERE id > 1.5;
+----
+physical_plan	<!REGEX>:.*Fabricator Query.*
+
+query II
+EXPLAIN SELECT count(*) FROM rp.dbo.rs_t WHERE t < 300;
+----
+physical_plan	<!REGEX>:.*Fabricator Query.*
+
+# ORDER BY / LIMIT, HAVING, an expression, a plain projection
+query II
+EXPLAIN SELECT k, count(*) FROM rp.dbo.rs_t GROUP BY k ORDER BY k;
+----
+physical_plan	<!REGEX>:.*Fabricator Query.*
+
+query II
+EXPLAIN SELECT k, count(*) FROM rp.dbo.rs_t GROUP BY k HAVING count(*) > 10;
+----
+physical_plan	<!REGEX>:.*Fabricator Query.*
+
+query II
+EXPLAIN SELECT sum(id + 1) FROM rp.dbo.rs_t;
+----
+physical_plan	<!REGEX>:.*Fabricator Query.*
+
+query II
+EXPLAIN SELECT id FROM rp.dbo.rs_t WHERE id > 5;
+----
+physical_plan	<!REGEX>:.*Fabricator Query.*
+
+# a self-join (two references): not a single table
+query II
+EXPLAIN SELECT count(*) FROM rp.dbo.rs_t a JOIN rp.dbo.rs_t b ON a.id = b.id;
+----
+physical_plan	<!REGEX>:.*Fabricator Query.*
+
+# ═══ §3  The differential: pushed (rp) and existing (db) agree, row for row ═══════════════════════════
+
+query I
+SELECT count(*) FROM (
+  (SELECT count(*), count(amount), count(d), sum(id), sum(t), sum(b), sum(amount), sum(big), min(id), max(id),
+          min(d), max(d), min(amount), max(amount), min(big), max(big), min(t), max(t) FROM rp.dbo.rs_t
+   EXCEPT ALL
+   SELECT count(*), count(amount), count(d), sum(id), sum(t), sum(b), sum(amount), sum(big), min(id), max(id),
+          min(d), max(d), min(amount), max(amount), min(big), max(big), min(t), max(t) FROM db.dbo.rs_t)
+  UNION ALL
+  (SELECT count(*), count(amount), count(d), sum(id), sum(t), sum(b), sum(amount), sum(big), min(id), max(id),
+          min(d), max(d), min(amount), max(amount), min(big), max(big), min(t), max(t) FROM db.dbo.rs_t
+   EXCEPT ALL
+   SELECT count(*), count(amount), count(d), sum(id), sum(t), sum(b), sum(amount), sum(big), min(id), max(id),
+          min(d), max(d), min(amount), max(amount), min(big), max(big), min(t), max(t) FROM rp.dbo.rs_t));
+----
+0
+
+# the numbers themselves, so a differential of two identically wrong paths cannot pass: sum(b) exceeds BIGINT
+# and sum(id) exceeds INT, which T-SQL's own SUM would overflow on
+query IIII
+SELECT count(*), sum(id), sum(b), count(amount) FROM rp.dbo.rs_t;
+----
+300	4294967144	1354500000000000000000	277
+
+query I
+SELECT count(*) FROM (
+  (SELECT k, count(*), sum(id), sum(b), min(d), max(amount), count(d) FROM rp.dbo.rs_t GROUP BY k
+   EXCEPT ALL SELECT k, count(*), sum(id), sum(b), min(d), max(amount), count(d) FROM db.dbo.rs_t GROUP BY k)
+  UNION ALL
+  (SELECT k, count(*), sum(id), sum(b), min(d), max(amount), count(d) FROM db.dbo.rs_t GROUP BY k
+   EXCEPT ALL SELECT k, count(*), sum(id), sum(b), min(d), max(amount), count(d) FROM rp.dbo.rs_t GROUP BY k));
+----
+0
+
+# eight groups: k 0..6 and the NULL group
+query I
+SELECT count(*) FROM (SELECT k, count(*) FROM rp.dbo.rs_t GROUP BY k);
+----
+8
+
+query I
+SELECT count(*) FROM (
+  (SELECT d, k, count(*), sum(amount) FROM rp.dbo.rs_t WHERE id >= -20 AND id < 100 GROUP BY d, k
+   EXCEPT ALL SELECT d, k, count(*), sum(amount) FROM db.dbo.rs_t WHERE id >= -20 AND id < 100 GROUP BY d, k)
+  UNION ALL
+  (SELECT d, k, count(*), sum(amount) FROM db.dbo.rs_t WHERE id >= -20 AND id < 100 GROUP BY d, k
+   EXCEPT ALL SELECT d, k, count(*), sum(amount) FROM rp.dbo.rs_t WHERE id >= -20 AND id < 100 GROUP BY d, k));
+----
+0
+
+# NULL semantics: `<>` keeps no NULL row, NOT keeps no NULL row, IS NULL finds them
+query II
+SELECT count(*), count(k) FROM rp.dbo.rs_t WHERE k <> 3;
+----
+234	234
+
+query II
+SELECT count(*), count(k) FROM db.dbo.rs_t WHERE k <> 3;
+----
+234	234
+
+query I
+SELECT count(*) FROM rp.dbo.rs_t WHERE NOT (k = 3) OR k IS NULL;
+----
+261
+
+query I
+SELECT count(*) FROM db.dbo.rs_t WHERE NOT (k = 3) OR k IS NULL;
+----
+261
+
+query II
+SELECT count(*), sum(b) FROM rp.dbo.rs_t WHERE d >= DATE '2026-02-01' AND amount IS NOT NULL;
+----
+99	483750000000000000000
+
+query II
+SELECT count(*), sum(b) FROM db.dbo.rs_t WHERE d >= DATE '2026-02-01' AND amount IS NOT NULL;
+----
+99	483750000000000000000
+
+# an empty input: ungrouped gives one row (0, NULL), grouped gives none
+query III
+SELECT count(*), sum(id), max(d) FROM rp.dbo.rs_t WHERE id < -1000;
+----
+0	NULL	NULL
+
+query I
+SELECT count(*) FROM (SELECT k, count(*) FROM rp.dbo.rs_t WHERE id < -1000 GROUP BY k);
+----
+0
+
+# the local join (not pushed, see §1) still answers like the existing path
+query I
+SELECT count(*) FROM (
+  (SELECT kn.name, s.c FROM kn JOIN (SELECT k, count(*) AS c FROM rp.dbo.rs_t GROUP BY k) s ON kn.k = s.k
+   EXCEPT ALL SELECT kn.name, s.c FROM kn JOIN (SELECT k, count(*) AS c FROM db.dbo.rs_t GROUP BY k) s ON kn.k = s.k)
+  UNION ALL
+  (SELECT kn.name, s.c FROM kn JOIN (SELECT k, count(*) AS c FROM db.dbo.rs_t GROUP BY k) s ON kn.k = s.k
+   EXCEPT ALL SELECT kn.name, s.c FROM kn JOIN (SELECT k, count(*) AS c FROM rp.dbo.rs_t GROUP BY k) s ON kn.k = s.k));
+----
+0
+
+# a declined shape still answers correctly (it runs locally, re-qualified)
+query I
+SELECT count(*) FROM rp.dbo.rs_t WHERE id > 1.5;
+----
+149
+
+query I
+SELECT count(*) FROM db.dbo.rs_t WHERE id > 1.5;
+----
+149
+
+# ═══ §4  Result types and names are DuckDB's, not T-SQL's ═════════════════════════════════════════════
+# ⚠ Through a CTAS, NOT `DESCRIBE`: a query inside `FROM (DESCRIBE …)` is never seen by the remote optimizer,
+# so a DESCRIBE comparison describes the LOCAL path on both sides and passes vacuously — measured: a mutant
+# that dropped the cast back to DuckDB's types survived it. A CTAS's query IS pushed on its own.
+
+query II
+EXPLAIN CREATE TEMP TABLE ty_rp AS SELECT k, count(*), sum(id) FROM rp.dbo.rs_t GROUP BY k;
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+statement ok
+CREATE TEMP TABLE ty_rp AS SELECT k, count(*), count(d), sum(id), sum(t), sum(b), sum(amount), sum(big), min(id),
+  max(d), max(amount), min(t), max(big) AS mb FROM rp.dbo.rs_t GROUP BY k;
+
+statement ok
+CREATE TEMP TABLE ty_db AS SELECT k, count(*), count(d), sum(id), sum(t), sum(b), sum(amount), sum(big), min(id),
+  max(d), max(amount), min(t), max(big) AS mb FROM db.dbo.rs_t GROUP BY k;
+
+query I
+SELECT count(*) FROM (
+  (SELECT column_name, column_type FROM (DESCRIBE ty_rp) EXCEPT ALL SELECT column_name, column_type FROM (DESCRIBE ty_db))
+  UNION ALL
+  (SELECT column_name, column_type FROM (DESCRIBE ty_db) EXCEPT ALL SELECT column_name, column_type FROM (DESCRIBE ty_rp)));
+----
+0
+
+query TT
+SELECT column_name, column_type FROM (DESCRIBE ty_rp) WHERE column_name IN ('count_star()', 'sum(id)', 'sum(amount)', 'mb')
+ORDER BY column_name;
+----
+count_star()	BIGINT
+mb	DECIMAL(38,10)
+sum(amount)	DECIMAL(38,2)
+sum(id)	HUGEINT
+
+# ═══ §5  Transactions: a pushed SELECT sees the transaction's own writes ═══════════════════════════════
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO rp.dbo.rs_t (id, k, t, b, big, s, f) VALUES (100000, 6, 1, 1, 1, 'x', 1);
+
+query II
+EXPLAIN SELECT count(*) FROM rp.dbo.rs_t WHERE id = 100000;
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+query I
+SELECT count(*) FROM rp.dbo.rs_t WHERE id = 100000;
+----
+1
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM rp.dbo.rs_t WHERE id = 100000;
+----
+0
+
+# ═══ §6  DML keeps its own paths ══════════════════════════════════════════════════════════════════════
+# The remote optimizer would also take DELETE / UPDATE nodes; this catalog refuses them, so the plan-less
+# shortcut (ABI v93) still runs them and still reports DuckDB's affected-row count.
+
+query II
+EXPLAIN DELETE FROM rp.dbo.rs_t WHERE id = 1;
+----
+physical_plan	<REGEX>:.*Fabricator Delete Where.*
+
+query I
+DELETE FROM rp.dbo.rs_t WHERE id = 1;
+----
+1
+
+statement ok
+SELECT fabricator_exec('db', 'DROP TABLE dbo.rs_t;');

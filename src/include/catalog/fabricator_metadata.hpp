@@ -71,6 +71,10 @@ struct FabricatorCapabilities {
 	//! session and gets its path on the MANAGED side, through `ITable.SchemaPath`. See
 	//! docs/nested-schemas.md.
 	bool supports_nested_schemas = false;
+
+	//! The provider runs a whole SELECT pushed by DuckDB's remote optimizer (src/catalog/fabricator_remote_select.cpp).
+	//! Opt-in: SQL Server reports it only with the `remote_pushdown` ATTACH option.
+	bool remote_select = false;
 };
 
 //! Reads the catalog's capability doc (one flat JSON object of booleans). Called once at ATTACH

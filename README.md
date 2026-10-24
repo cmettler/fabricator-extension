@@ -279,7 +279,23 @@ ATTACH 'Server=...;Database=...' AS mssql (TYPE fabricator, keep_nulls false);
 -- Use this rather than SET mssql_mars when two catalogs must differ — a SET applies to the whole
 -- DuckDB connection, so it would govern every catalog attached in it.
 ATTACH 'Server=...;Database=...' AS mssql (TYPE fabricator, mars 'false');
+
+-- EXPERIMENTAL, off by default: run a whole single-table aggregate / GROUP BY on the server.
+ATTACH 'Server=...;Database=...' AS mssql (TYPE fabricator, remote_pushdown 'true');
 ```
+
+**`remote_pushdown` (experimental, off by default).** With it, a `SELECT` over ONE table of the catalog that
+aggregates or groups — `count(*)`, `count(col)`, `min`, `max`, `sum` over integer and decimal columns,
+`GROUP BY` plain columns, and a `WHERE` of comparisons with constants, `AND`/`OR`/`NOT`, `IS [NOT] NULL` — runs
+as ONE T-SQL statement, so the rows never leave the server; `EXPLAIN` shows `Fabricator Query` instead of
+`Fabricator Scan`. Everything else runs exactly as before, and nothing pushed may answer differently: result
+types and column names are DuckDB's own, and a shape whose T-SQL meaning could differ is not pushed — strings
+(collation, trailing spaces), floats, `avg`, a constant that does not convert exactly to its column's type
+(`int_col > 1.5`), `ORDER BY`/`LIMIT`, `HAVING`, joins and subqueries. A branch of `UNION`/`EXCEPT` is pushed
+on its own; a subquery joined to a local table is not (DuckDB pushes only whole nodes). The one accepted
+difference: an integer `sum` past 10^38 raises an overflow on the server, where DuckDB's own sum would still
+answer up to about 1.7 x 10^38. Box SQL Server only (ignored on a Fabric/Synapse warehouse); read once at
+ATTACH. `FABRICATOR_DUMP_REMOTE=1` prints each decision and the T-SQL sent.
 
 On a **Fabric** SQL endpoint the catalog also gains a `fabric` schema of platform functions, which need no
 extra options (they derive the workspace and item from the connection string; `API_WORKSPACE` / `API_ITEM`

@@ -1,6 +1,7 @@
 # DuckDB 2.0: planner, optimizer and catalog features for remote execution
 
-**Status: survey, nothing built (2026-10-24).** Inputs: the DuckDB 2.0 source (our submodule, `v2.0.0`,
+**Status (2026-10-24): survey, plus BUILT — the SQL Server DELETE/UPDATE shortcut (§2.4/§2.5), Delta
+COUNT/MIN/MAX from the log (§3.1) and the SQL Server SELECT spike (§4.1).** Inputs: the DuckDB 2.0 source (our submodule, `v2.0.0`,
 diffed against `v1.5.6`), duckdb-postgres `e53270e`, ducklake `947c8496`, duckdb-iceberg `b92a85f74`, and
 the DuckLake 1.1 release post (2026-10-21). Paths below are relative to `duckdb/` unless a repo is named.
 
@@ -375,5 +376,57 @@ metadata and with the switch off. Mutants, native engine:
 2. **UPDATE shortcut, SQL Server** — BUILT (§2.5).
 3. **Delta metadata-only DELETE** — whole-file removal from partition values and exact statistics.
 4. **`get_partition_stats` for Delta** — BUILT (§3.1).
-5. **Remote optimizer spike for SQL Server** — `EXECUTE_QUERY_NODE` behind an ATTACH option, SELECT only
-   at first, with a T-SQL renderer and a veto for everything it cannot render.
+5. **Remote optimizer spike for SQL Server** — BUILT as a spike (§4.1), behind `remote_pushdown`.
+
+### 4.1 The SELECT spike — BUILT (2026-10-24), `remote_pushdown` ATTACH option, off by default
+
+`src/catalog/fabricator_remote_select.cpp`. No ABI change: the SQL Server provider reads its own
+`remote_pushdown` option and reports `"remote_select": true` in the capability doc (never on a warehouse
+profile — measured on box SQL Server only); `FabricatorCatalog::Supports` answers IS_REMOTE and
+EXECUTE_QUERY_NODE from it. It must be an ATTACH option, not a setting: DuckDB counts remote catalogs when the
+database is attached, and the veto hooks receive no `ClientContext`.
+
+**What it pushes.** A SELECT over ONE base table of the catalog that aggregates or groups: `count(*)`,
+`count(col)`, `min`/`max` and integer/decimal `sum` over columns; `GROUP BY` plain columns; a WHERE of
+`= <> < <= > >=` between a column and a constant, AND/OR/NOT and IS [NOT] NULL — over integer, decimal and date
+columns. It renders `SELECT … FROM [s].[t] WHERE … GROUP BY …` and replaces the node with
+`SELECT CAST(c0 AS <DuckDB type>) AS <DuckDB name>, … FROM fabricator_query('<catalog>', '<t-sql>')`.
+
+**Two halves**, because `SupportsPushdown(QueryNode)` has no context: it checks the SHAPE only; `RemoteExecute`
+resolves the table, types every column and constant, and renders. A shape whose types do not qualify is
+DECLINED there by returning the node itself with this catalog's name restored, so it binds and runs locally
+exactly as written. `SupportsPushdown(TableRef)` admits only a plain base table (a catalog-bound TVF or proc
+would otherwise be pushed alone), `SupportsPushdown(QueryNode)` refuses every non-SELECT node (DELETE/UPDATE
+keep the plan-less shortcut and its row count), and statements are never pushed.
+
+**Exactness, and what each rule is for:**
+
+- strings are out — collation, and T-SQL ignores trailing spaces in `=`; floats are out — NaN and summation
+  order; `avg` is out — T-SQL's AVG of an INT is integer division;
+- an integer `sum` is rendered `SUM(CAST(col AS DECIMAL(38,0)))` (T-SQL keeps an INT sum an INT and overflows),
+  then cast to HUGEINT; a decimal sum is DECIMAL(38,s) on both engines. Accepted divergence: past 10^38 the
+  server overflows where HUGEINT would still answer (up to ~1.7 x 10^38) — an error, never another number;
+- **a constant must convert LOSSLESSLY to its column's type, checked by a round trip.** ⚠ The first build
+  pushed `id > 1.5` as `[id] > 2` and counted 2 rows where 3 are right: DuckDB's "strict" DECIMAL -> INTEGER
+  cast ROUNDS (strict governs string parsing only). The converted value must cast back to the original unchanged;
+- result types and names are DuckDB's, by the outer CAST and alias (`count_star()`, `sum(id)`).
+
+**What DuckDB does and does not push**, measured: a set operation whose branches name different catalogs pushes
+its remote branch ON ITS OWN, and so does a CTAS's query; a subquery JOINED to a local table is NOT pushed
+(§1.2 — no partial pushdown for one side of a join). A query inside `FROM (DESCRIBE …)` is never seen by the
+optimizer at all. A pushed SELECT inside a transaction runs on the transaction's pinned connection
+(`fabricator_query` resolves the catalog and the scan sets the transaction ambient), so it sees uncommitted
+writes, like today's scans.
+
+Gate `test/verify_remote_select_mssql.test` (88, service): routing for each admitted and refused shape, an
+EXCEPT ALL differential of every query against a second attach WITHOUT the option (the oracle), hard values
+where the two paths could be identically wrong (an INT sum past 2^31, a BIGINT sum past 2^63), result types
+compared through CTAS tables, read-your-writes in a transaction, and DML still on the shortcut. Mutants, each
+killed: the round-trip check removed (§2, line 116), the integer sum not widened (§3, line 155 — the server's
+own overflow), strings treated as exact (§2, line 92), and the outer cast removed (§4, line 286). ⚠ The last one
+first SURVIVED: §4 compared `DESCRIBE` output, which never reaches the optimizer, so both sides described the
+local path. It now compares the types of CTAS tables, whose queries are pushed.
+
+**Not done, and what would come next:** ORDER BY / LIMIT (T-SQL's TOP and NULL ordering), HAVING, joins inside
+the catalog, booleans, `count(DISTINCT)`, and a warehouse profile. Each is a rendering rule plus a
+differential row; none needs a new mechanism.

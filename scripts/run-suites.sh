@@ -1008,7 +1008,7 @@ case "$TIER" in
         # executed is worth very little. ⚠ Its §10 drops the functions it created: they are catalog
         # objects on the shared TestDB, and a later suite enumerating this catalog would otherwise see
         # them (the cheap version of the MinIO/external-table lesson).
-        : "${MIN_SUITES:=61}"   # 2026-10-24: +verify_dml_pushdown_mssql
+        : "${MIN_SUITES:=62}"   # 2026-10-24: +verify_dml_pushdown_mssql, +verify_remote_select_mssql
         # 1424 since 2026-08-01: verify_exec_invalidate_cache 10 -> 21, for the OUT-OF-BAND DROP path Ã¢ÂÂ the
         # catalog's self-heal, documented in CLAUDE.md and until now covered by NOTHING. The service tier ran
         # 44/44 green while that path was broken, which is why the section exists. It must run with
@@ -1432,7 +1432,11 @@ case "$TIER" in
         #   overflow atomicity, transactions, no-PK. 3699 + 71 = 3770 exactly, so no other suite moved.
         # 2026-10-24: 3770 -> 3792. verify_dml_pushdown_mssql 131 -> 153: §11, timestamps on the ROWID path bound as
         #   the column's own type (datetime2 SET values were rounded, datetime2 KEYS matched nothing). +22 exactly.
-        : "${MIN_ASSERTIONS:=3792}"
+        # 2026-10-24: 3792 -> 3880. verify_remote_select_mssql (88): the `remote_pushdown` SELECT spike — DuckDB
+        #   2.0's remote optimizer pushing a single-table aggregate as one T-SQL statement, differential against
+        #   the existing path. ⚠ Its §4 compares result TYPES through a CTAS, not DESCRIBE: a query inside
+        #   `FROM (DESCRIBE …)` is never pushed, so a DESCRIBE comparison was vacuous (a mutant survived it).
+        : "${MIN_ASSERTIONS:=3880}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

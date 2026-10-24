@@ -196,6 +196,15 @@ public:
 	PhysicalOperator &PlanMergeInto(ClientContext &context, PhysicalPlanGenerator &planner, LogicalMergeInto &op,
 	                                PhysicalOperator &plan) override;
 
+	//! DuckDB 2.0's remote pushdown optimizer, SELECT only (src/catalog/fabricator_remote_select.cpp). Declared
+	//! only when the provider reports `remote_select` (SQL Server with the `remote_pushdown` ATTACH option),
+	//! and latched at ATTACH: DuckDB counts remote catalogs when the database is attached.
+	bool Supports(RemoteCapability capability) const override;
+	bool SupportsPushdown(const TableRef &ref) override;
+	bool SupportsPushdown(const QueryNode &node) override;
+	bool SupportsPushdown(const SQLStatement &statement) override;
+	unique_ptr<TableRef> RemoteExecute(ClientContext &context, unique_ptr<QueryNode> node) override;
+
 	DatabaseSize GetDatabaseSize(ClientContext &context) override;
 	bool InMemory() override;
 	string GetDBPath() override;
@@ -211,6 +220,8 @@ private:
 	bool string_order_pushable_ = false;
 	bool null_order_expressible_ = false;
 	bool supports_nested_schemas_ = false;
+	//! The provider runs a pushed SELECT (capability `remote_select`); see Supports().
+	bool remote_select_ = false;
 	//! Whether the provider applies pushed filters exactly (detected at LoadCatalog) => filter_pushdown=true
 	//! is safe on the scan (currently: Delta native_read only). See ExactFilterPushdown().
 	bool exact_filter_pushdown_ = false;
