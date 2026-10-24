@@ -91,7 +91,7 @@ public static unsafe class Bootstrap
                             () => OneRowStream(probeSchema, Interlocked.Increment(ref _lazyOpens) - 1),
                             probeSchema);
 
-        vtable->AbiVersion = 92;
+        vtable->AbiVersion = 93;
         vtable->OpenCatalog = &OpenCatalog;
         vtable->CloseCatalog = &CloseCatalog;
         vtable->ExecuteQuery = &ExecuteQuery;
@@ -174,6 +174,8 @@ public static unsafe class Bootstrap
         vtable->LateralCall = &LateralCall;
         vtable->LateralClose = &LateralClose;
         vtable->LateralBindClose = &LateralBindClose;
+        vtable->TableDmlInfo = &TableDmlInfo;
+        vtable->TableDeleteWhere = &TableDeleteWhere;
         return FabricatorStatus.Ok;
     }
 
@@ -633,6 +635,51 @@ public static unsafe class Bootstrap
         }
         catch (Exception ex)
         {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int TableDmlInfo(nint table, byte** outJson, byte** err)
+    {
+        try
+        {
+            if (outJson is null || Handles.Resolve<TableSession>(table) is not { } session)
+            {
+                return FabricatorStatus.InvalidArgument;
+            }
+            *outJson = (byte*)Marshal.StringToCoTaskMemUTF8(session.DmlInfoJson()); // host frees via free_error
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int TableDeleteWhere(nint table, byte* specJson, CArrowArrayStream* filterValues, long* affected,
+                                        byte** err)
+    {
+        // The filter-value stream is imported FIRST, so it is disposed on every path (the binding consumes it;
+        // a failure before that must not leak an imported C stream — see ExecuteDelete's guard).
+        IArrowArrayStream? values = filterValues is null ? null : CArrowArrayStreamImporter.ImportArrayStream(filterValues);
+        try
+        {
+            if (specJson is null || affected is null || Handles.Resolve<TableSession>(table) is not { } session)
+            {
+                values?.Dispose();
+                return FabricatorStatus.InvalidArgument;
+            }
+            var json = Marshal.PtrToStringUTF8((nint)specJson)!;
+            *affected = session.DeleteWhere(json, values);
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
+            values?.Dispose();
             SetError(err, ex);
             return FabricatorStatus.Error;
         }

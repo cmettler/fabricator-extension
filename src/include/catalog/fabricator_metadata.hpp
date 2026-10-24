@@ -77,6 +77,9 @@ struct FabricatorCapabilities {
 //! (LoadCatalog). Throws on a failed crossing — the caller keeps the old best-effort behaviour by
 //! catching and leaving every capability off.
 FabricatorCapabilities FetchCapabilities(FabricatorHandle handle);
+//! Whether the table can run a DELETE as one predicate statement (ABI v93 `table_dml_info`, parsed with
+//! yyjson). Absent key / malformed doc / an older bridge all read as false — the rowid path, which is safe.
+bool FetchDeleteWhereCapability(FabricatorHandle table);
 
 //! A discovery stream whose FIRST column is a `LIST<VARCHAR>` SCHEMA PATH (outermost element first) and
 //! whose remaining columns are UTF-8.

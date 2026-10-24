@@ -431,6 +431,14 @@ SELECT s.name, o.name, c.name, dc.definition
         public IArrowArrayStream Scan(string? specJson, IArrowArrayStream? filterValues) =>
             _catalog.ScanTableCore(_definition.SchemaName, _definition.TableName, specJson, filterValues);
 
+        /// <inheritdoc/>
+        public bool SupportsDeleteWhere =>
+            _catalog.SupportsDeleteWhereCore(_definition.SchemaName, _definition.TableName);
+
+        /// <inheritdoc/>
+        public long DeleteWhere(FilterNode? filter, IArrowArrayStream? filterValues) =>
+            _catalog.DeleteWhereCore(_definition.SchemaName, _definition.TableName, filter, filterValues);
+
         public void Dispose()
         {
             // Nothing held: the stream returned by Scan owns its connection, and the transaction is the

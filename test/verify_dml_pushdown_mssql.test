@@ -1,0 +1,286 @@
+# name: test/verify_dml_pushdown_mssql.test
+# description: A DELETE whose WHOLE predicate renders exactly runs as ONE SQL Server statement — no scan, no
+#              rowid (ABI v93; FabricatorCatalog's plan-less PlanDelete + FabricatorPhysicalDeleteWhere).
+#              Everything else keeps the rowid path. Needs MSSQL_TESTDB_DSN.
+#
+#              ⚠⚠ THE LOAD-BEARING SECTION IS §2, AND IT IS A DIFFERENTIAL. A scan's pushed filter may be a
+#              SUPERSET because DuckDB re-applies it above the scan; a DELETE has no such net, so a predicate
+#              rendered weaker than the user's deletes rows nobody named — with exit 0 and a plausible count.
+#              So the same DELETE sequence runs on two identical tables, one with the shortcut and one with
+#              `fabricator_dml_pushdown = false` (the rowid path, i.e. the reference oracle), and every count
+#              and the final contents must agree. The sequence covers the exact-type allow-list (INTEGER,
+#              DECIMAL, BIT, DATE), NULL semantics (`<>` must not delete a NULL), IS NULL, BETWEEN, IN and OR.
+#
+#              ⚠ §1's routing rows are what keep §2 from passing VACUOUSLY: without them a build in which the
+#              shortcut never fires would agree with the oracle perfectly. EXPLAIN title-cases operator names
+#              on DuckDB 2.0 (see verify_lateral), hence `Fabricator Delete Where` / `Mssql Net Delete`.
+# group: [fabricator]
+
+require fabricator
+
+require-env MSSQL_TESTDB_DSN
+
+statement ok
+ATTACH '${MSSQL_TESTDB_DSN}' AS db (TYPE fabricator);
+
+# ═══ §0  Setup ═════════════════════════════════════════════════════════════════════════════════════════
+# Two identical tables, created SERVER-SIDE so their types are SQL Server's own (BIT, DECIMAL(10,2), DATE).
+# id 1..40; n = NULL when id % 7 = 0, else id % 5; flag = id % 2; amount = id * 1.25; d = 2026-01-01 + id days;
+# v = 'v' || (id % 3). dp_heap has NO primary key and no unique index (§4).
+
+statement ok
+SELECT fabricator_exec('db', 'DROP TABLE IF EXISTS dbo.dp_on; DROP TABLE IF EXISTS dbo.dp_off; DROP TABLE IF EXISTS dbo.dp_heap;
+CREATE TABLE dbo.dp_on (id INT PRIMARY KEY, n INT NULL, flag BIT, amount DECIMAL(10,2), d DATE, v VARCHAR(20));
+INSERT INTO dbo.dp_on SELECT value, CASE WHEN value % 7 = 0 THEN NULL ELSE value % 5 END, value % 2, value * 1.25,
+  DATEADD(day, value, ''2026-01-01''), ''v'' + CAST(value % 3 AS VARCHAR) FROM GENERATE_SERIES(1, 40);
+SELECT * INTO dbo.dp_off FROM dbo.dp_on; ALTER TABLE dbo.dp_off ADD PRIMARY KEY (id);
+CREATE TABLE dbo.dp_heap (id INT, n INT); INSERT INTO dbo.dp_heap VALUES (1, 1), (2, 2), (3, 3);');
+
+statement ok
+SELECT fabricator_refresh_cache('db');
+
+# ═══ §1  Routing — the shortcut fires exactly where it should ═════════════════════════════════════════
+
+# Exact types: the shortcut, with the predicate it sent.
+query II
+EXPLAIN DELETE FROM db.dbo.dp_on WHERE id > 35 AND n <> 2;
+----
+physical_plan	<REGEX>:.*Fabricator Delete Where.*
+
+# A VARCHAR comparison is NOT exact on SQL Server (collation, trailing spaces) — the rowid path, and the
+# shortcut operator is ABSENT rather than merely bypassed.
+query II
+EXPLAIN DELETE FROM db.dbo.dp_on WHERE v = 'v1';
+----
+physical_plan	<REGEX>:.*Mssql Net Delete.*
+
+query II
+EXPLAIN DELETE FROM db.dbo.dp_on WHERE v = 'v1';
+----
+physical_plan	<!REGEX>:.*Fabricator Delete Where.*
+
+# ONE inexact conjunct sends the WHOLE statement to the rowid path — never a dropped conjunct.
+query II
+EXPLAIN DELETE FROM db.dbo.dp_on WHERE id > 5 AND v = 'v1';
+----
+physical_plan	<!REGEX>:.*Fabricator Delete Where.*
+
+# An AND NESTED in an OR is where a dropped conjunct would hide: a top-level AND arrives as separate filter
+# expressions (each refused on its own), so only this shape reaches the serializer's conjunction code.
+query II
+EXPLAIN DELETE FROM db.dbo.dp_on WHERE (id > 25 AND v = 'v2') OR id = 15;
+----
+physical_plan	<!REGEX>:.*Fabricator Delete Where.*
+
+# A subquery (a join under the DELETE) keeps the rowid path.
+query II
+EXPLAIN DELETE FROM db.dbo.dp_on WHERE id IN (SELECT 1 UNION ALL SELECT 2);
+----
+physical_plan	<!REGEX>:.*Fabricator Delete Where.*
+
+# The kill switch.
+statement ok
+SET fabricator_dml_pushdown = false;
+
+query II
+EXPLAIN DELETE FROM db.dbo.dp_on WHERE id > 35;
+----
+physical_plan	<!REGEX>:.*Fabricator Delete Where.*
+
+statement ok
+SET fabricator_dml_pushdown = true;
+
+# ═══ §2  The differential — same DELETEs, shortcut vs rowid path, identical counts and contents ════════
+
+query I
+DELETE FROM db.dbo.dp_on WHERE id > 35;
+----
+5
+
+# `<>` on a nullable column: id 7 (n NULL) must SURVIVE, in both engines' semantics.
+query I
+DELETE FROM db.dbo.dp_on WHERE n <> 2 AND id < 10;
+----
+7
+
+query I
+DELETE FROM db.dbo.dp_on WHERE n IS NULL;
+----
+5
+
+query I
+DELETE FROM db.dbo.dp_on WHERE flag = true AND amount >= 30.00;
+----
+5
+
+query I
+DELETE FROM db.dbo.dp_on WHERE d BETWEEN DATE '2026-01-12' AND DATE '2026-01-15';
+----
+3
+
+query I
+DELETE FROM db.dbo.dp_on WHERE id IN (11, 12, 13) OR n = 4;
+----
+3
+
+# Not exact (VARCHAR) — the rowid path inside the same sequence, so both kinds compose.
+query I
+DELETE FROM db.dbo.dp_on WHERE v = 'v1' AND id < 20;
+----
+2
+
+# The nested shape (see §1): rendered with its inexact conjunct DROPPED it would delete 4 rows, not 3.
+query I
+DELETE FROM db.dbo.dp_on WHERE (id > 25 AND v = 'v2') OR id = 15;
+----
+3
+
+statement ok
+SET fabricator_dml_pushdown = false;
+
+query I
+DELETE FROM db.dbo.dp_off WHERE id > 35;
+----
+5
+
+query I
+DELETE FROM db.dbo.dp_off WHERE n <> 2 AND id < 10;
+----
+7
+
+query I
+DELETE FROM db.dbo.dp_off WHERE n IS NULL;
+----
+5
+
+query I
+DELETE FROM db.dbo.dp_off WHERE flag = true AND amount >= 30.00;
+----
+5
+
+query I
+DELETE FROM db.dbo.dp_off WHERE d BETWEEN DATE '2026-01-12' AND DATE '2026-01-15';
+----
+3
+
+query I
+DELETE FROM db.dbo.dp_off WHERE id IN (11, 12, 13) OR n = 4;
+----
+3
+
+query I
+DELETE FROM db.dbo.dp_off WHERE v = 'v1' AND id < 20;
+----
+2
+
+# The nested shape (see §1): rendered with its inexact conjunct DROPPED it would delete 4 rows, not 3.
+query I
+DELETE FROM db.dbo.dp_off WHERE (id > 25 AND v = 'v2') OR id = 15;
+----
+3
+
+statement ok
+SET fabricator_dml_pushdown = true;
+
+# Identical contents, both directions.
+query I
+SELECT count(*) FROM (SELECT * FROM db.dbo.dp_on EXCEPT SELECT * FROM db.dbo.dp_off);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT * FROM db.dbo.dp_off EXCEPT SELECT * FROM db.dbo.dp_on);
+----
+0
+
+query III
+SELECT count(*), sum(id), sum(amount) FROM db.dbo.dp_on;
+----
+7	132	165.00
+
+# And on the SERVER, not only through our scan.
+query I
+SELECT * FROM fabricator_query('db', 'SELECT count(*) AS c FROM dbo.dp_on');
+----
+7
+
+# ═══ §3  Transactions — the statement runs on the transaction's own connection ═════════════════════════
+
+statement ok
+BEGIN;
+
+query I
+DELETE FROM db.dbo.dp_on WHERE id <= 15;
+----
+1
+
+# Read-your-writes inside the transaction.
+query I
+SELECT count(*) FROM db.dbo.dp_on;
+----
+6
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM db.dbo.dp_on;
+----
+7
+
+statement ok
+BEGIN;
+
+query I
+DELETE FROM db.dbo.dp_on WHERE id <= 15;
+----
+1
+
+statement ok
+COMMIT;
+
+query I
+SELECT * FROM fabricator_query('db', 'SELECT count(*) AS c FROM dbo.dp_on');
+----
+6
+
+# ═══ §4  A table with NO primary key — deletable now, where the rowid path refuses ═══════════════════════
+# The rowid path needs a key for row identity and refuses at plan time. The shortcut needs none.
+
+statement ok
+SET fabricator_dml_pushdown = false;
+
+statement error
+DELETE FROM db.dbo.dp_heap WHERE id = 1;
+----
+primary key
+
+statement ok
+SET fabricator_dml_pushdown = true;
+
+query I
+DELETE FROM db.dbo.dp_heap WHERE id = 1;
+----
+1
+
+query I
+SELECT count(*) FROM db.dbo.dp_heap;
+----
+2
+
+# ...while a predicate that is not exact still gets the refusal, unchanged.
+statement error
+DELETE FROM db.dbo.dp_heap WHERE CAST(n AS VARCHAR) = '2';
+----
+primary key
+
+# RETURNING keeps the rowid path and its existing answer.
+statement error
+DELETE FROM db.dbo.dp_on WHERE id = 20 RETURNING id;
+----
+RETURNING
+
+# ═══ §5  Cleanup ═══════════════════════════════════════════════════════════════════════════════════════
+
+statement ok
+SELECT fabricator_exec('db', 'DROP TABLE dbo.dp_on; DROP TABLE dbo.dp_off; DROP TABLE dbo.dp_heap;');

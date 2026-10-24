@@ -1001,7 +1001,7 @@ case "$TIER" in
         # executed is worth very little. ⚠ Its §10 drops the functions it created: they are catalog
         # objects on the shared TestDB, and a later suite enumerating this catalog would otherwise see
         # them (the cheap version of the MinIO/external-table lesson).
-        : "${MIN_SUITES:=60}"
+        : "${MIN_SUITES:=61}"   # 2026-10-24: +verify_dml_pushdown_mssql
         # 1424 since 2026-08-01: verify_exec_invalidate_cache 10 -> 21, for the OUT-OF-BAND DROP path Ã¢ÂÂ the
         # catalog's self-heal, documented in CLAUDE.md and until now covered by NOTHING. The service tier ran
         # 44/44 green while that path was broken, which is why the section exists. It must run with
@@ -1416,7 +1416,11 @@ case "$TIER" in
         #   said 199, so the growth is +23 per leg and not +26, and the floor check caught the six-
         #   assertion gap on the next run — which is what it is for. Take the baseline from the PREVIOUS
         #   RUN LOG, never from a number repeated in a doc: that has gone stale here four times already.
-        : "${MIN_ASSERTIONS:=3639}"
+        # 2026-10-24: 3639 -> 3699, and one more suite. NEW verify_dml_pushdown_mssql (60): a DELETE whose
+        #   whole predicate renders exactly runs as ONE statement (ABI v93). The load-bearing section is a
+        #   DIFFERENTIAL against fabricator_dml_pushdown=false, so a widened predicate shows as a count or
+        #   contents mismatch. 3639 + 60 = 3699 exactly, so no other suite moved.
+        : "${MIN_ASSERTIONS:=3699}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

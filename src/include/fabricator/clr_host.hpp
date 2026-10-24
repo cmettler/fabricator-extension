@@ -254,6 +254,11 @@ void TableScan(FabricatorHandle table, const std::string &spec_json, ArrowArrayS
                ArrowArrayStream &out);
 void TableAlter(FabricatorHandle table, const std::string &alter_json, ArrowArrayStream *column);
 void TableClose(FabricatorHandle table) noexcept;
+// Predicate DML (ABI v93). TableDmlInfo = the lazy capability doc ({"delete_where": bool}); an older bridge
+// without the entry answers "{}" (no capability) rather than throwing, so the planner simply falls back.
+// TableDeleteWhere runs one provider DELETE for an EXACT predicate and returns the affected-row count.
+std::string TableDmlInfo(FabricatorHandle table);
+int64_t TableDeleteWhere(FabricatorHandle table, const std::string &spec_json, ArrowArrayStream *filter_values);
 
 // Provider-declared settings (see docs/settings-architecture.md). ListSettings fills `out` with ALL
 // registered providers' declared settings (six string columns: provider, name, type, default, description,

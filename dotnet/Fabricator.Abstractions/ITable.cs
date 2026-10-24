@@ -179,4 +179,19 @@ public interface ITableBinding : IDisposable
     /// current transport, the AT clause (which for an AT-bound instance matches the binding's own).
     /// </summary>
     IArrowArrayStream Scan(string? specJson, IArrowArrayStream? filterValues);
+
+    /// <summary>Whether <see cref="DeleteWhere"/> can run a DELETE on this table as ONE predicate statement
+    /// (ABI v93). False by default, so a provider that does not implement it keeps the rowid path. Asked
+    /// when a DELETE is PLANNED, never during enumeration, so it may probe.</summary>
+    bool SupportsDeleteWhere => false;
+
+    /// <summary>Delete every row matching <paramref name="filter"/> (null = every row) in ONE statement, on the
+    /// AMBIENT transaction, and return the provider's own count of deleted rows. The filter references its
+    /// constants by index into <paramref name="filterValues"/> (a one-row batch; consume and dispose it).
+    /// </summary>
+    /// <remarks>⚠ THE FILTER IS EXACT, NOT A SUPERSET. A scan's pushed filter may be wider than the user's
+    /// predicate because DuckDB re-applies it; nothing re-checks a delete. The host only sends a predicate in
+    /// which every conjunct rendered exactly — render every node or THROW, never drop one.</remarks>
+    long DeleteWhere(FilterNode? filter, IArrowArrayStream? filterValues) =>
+        throw new NotSupportedException("fabricator: this table does not support predicate DELETE");
 }

@@ -174,4 +174,22 @@ internal sealed class TableSession
     // storage location, and this handler is where that was silently wrong before ABI v92.
     internal void Alter(AlterTableSpec spec, Field? column) =>
         _catalog.AlterTable(spec, _definition.SchemaPath, _definition.TableName, column);
+
+    /// <summary>The <c>table_dml_info</c> answer (ABI v93): <c>{"delete_where": bool}</c>.</summary>
+    internal string DmlInfoJson() => With(t =>
+    {
+        using var buffer = new MemoryStream();
+        using (var json = new Utf8JsonWriter(buffer))
+        {
+            json.WriteStartObject();
+            json.WriteBoolean("delete_where", t.SupportsDeleteWhere);
+            json.WriteEndObject();
+        }
+        return Encoding.UTF8.GetString(buffer.ToArray());
+    });
+
+    /// <summary>The <c>table_delete_where</c> answer (ABI v93). <paramref name="specJson"/> is
+    /// <c>{"filter": …}</c> or <c>{}</c> for an unconditional DELETE.</summary>
+    internal long DeleteWhere(string specJson, IArrowArrayStream? filterValues) =>
+        With(t => t.DeleteWhere(ScanSpec.Parse(specJson)?.Filter, filterValues));
 }

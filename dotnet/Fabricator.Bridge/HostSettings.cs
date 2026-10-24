@@ -43,6 +43,12 @@ internal static class HostSettings
     /// </remarks>
     public const string BatchedLateralName = "fabricator_batched_lateral";
 
+    /// <summary>The DuckDB setting that lets a DELETE whose whole predicate renders exactly run as ONE provider
+    /// statement (no scan, no rowid) — ABI v93. Like <see cref="BatchedLateralName"/> it is the reference
+    /// oracle as much as an escape hatch: off, every DELETE takes the rowid path, and the results must be
+    /// identical. See docs/duckdb-2.0-remote-execution.md §2.</summary>
+    public const string DmlPushdownName = "fabricator_dml_pushdown";
+
     public static IEnumerable<ProviderSetting> Settings { get; } = new[]
     {
         new ProviderSetting(
@@ -59,6 +65,13 @@ internal static class HostSettings
             Description: "Batch a correlated LATERAL call over a whole input chunk (one provider call per " +
                          "~2048 outer rows) instead of DuckDB's row-by-row driver. On by default; turn it " +
                          "off to fall back to the stock path, which is also the reference oracle for it."),
+        new ProviderSetting(
+            DmlPushdownName,
+            ProviderSettingType.Bool,
+            Default: true,
+            Description: "Run a DELETE whose whole WHERE translates exactly as one statement on the provider " +
+                         "(no scan, no row ids). On by default; turn it off to use the row-id path, which is " +
+                         "also the reference oracle for it."),
     };
 
     /// <summary>

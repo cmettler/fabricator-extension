@@ -12,6 +12,17 @@
 > parsed with our own vcpkg yyjson, retiring the `ReadCapabilityFlag` string-find). v74 below is the
 > follow-on that finished the same job for ALTER.
 
+## v93 (2026-10-24) — predicate DELETE on the table session
+
+Two entries APPENDED to the vtable, so no slot moved: `table_dml_info(table, out_json, err)` answers
+`{"delete_where": bool}` — asked when a DELETE is PLANNED, never at enumeration, so a provider may probe —
+and `table_delete_where(table, spec_json, filter_values, affected, err)` runs one DELETE whose predicate is
+`spec_json`'s `filter` (the scan's FilterNode format, constants by index into `filter_values`; `{}` = every
+row). Managed: `ITableBinding.SupportsDeleteWhere` (DIM, false) and `DeleteWhere` (DIM, throws), so no
+provider and no plugin has to implement anything. ⚠ The filter is EXACT, not a superset — the host sends only
+predicates its strict serializer rendered in full, and a provider must render every node or throw. Design,
+the refusal rules and the gate: [duckdb-2.0-remote-execution.md](duckdb-2.0-remote-execution.md) §2.4.
+
 ## v92 (2026-10-23) — the WRITE crossings take a SCHEMA PATH (nested schemas, slice 2c)
 
 Eight entries lost their single `const char *schema` and took

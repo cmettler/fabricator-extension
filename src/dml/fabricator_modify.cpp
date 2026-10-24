@@ -13,6 +13,7 @@
 #include "dml/fabricator_modify.hpp"
 
 #include "fabricator/arrow_produce.hpp"
+#include "fabricator/arrow_ingest.hpp"
 #include "fabricator/clr_host.hpp"
 #include "catalog/fabricator_txn_util.hpp"
 #include "duckdb/common/arrow/arrow_appender.hpp"
@@ -139,6 +140,59 @@ static SourceResultType EmitCount(GlobalSinkState &sink_state, DataChunk &chunk)
 	gstate.returned = true;
 	chunk.SetCardinality(1);
 	chunk.SetValue(0, 0, Value::BIGINT((int64_t)gstate.total));
+	return SourceResultType::FINISHED;
+}
+
+//===----------------------------------------------------------------------===//
+// DELETE WHERE (ABI v93) — one predicate statement, no scan
+//===----------------------------------------------------------------------===//
+namespace {
+struct DeleteWhereSourceState : public GlobalSourceState {
+	bool done = false;
+	mutex lock;
+};
+} // namespace
+
+FabricatorPhysicalDeleteWhere::FabricatorPhysicalDeleteWhere(PhysicalPlan &plan, vector<LogicalType> types,
+                                                             idx_t estimated_cardinality,
+                                                             FabricatorHandle catalog_handle,
+                                                             FabricatorHandle table_handle, string spec_json,
+                                                             vector<Value> constants, string predicate)
+    : PhysicalOperator(plan, PhysicalOperatorType::EXTENSION, std::move(types), estimated_cardinality),
+      catalog_handle_(catalog_handle), table_handle_(table_handle), spec_json_(std::move(spec_json)),
+      constants_(std::move(constants)), predicate_(std::move(predicate)) {
+}
+
+InsertionOrderPreservingMap<string> FabricatorPhysicalDeleteWhere::ParamsToString() const {
+	InsertionOrderPreservingMap<string> result;
+	result["Predicate"] = predicate_.empty() ? "(none: every row)" : predicate_;
+	return result;
+}
+
+unique_ptr<GlobalSourceState> FabricatorPhysicalDeleteWhere::GetGlobalSourceState(ClientContext &context) const {
+	return make_uniq<DeleteWhereSourceState>();
+}
+
+SourceResultType FabricatorPhysicalDeleteWhere::GetDataInternal(ExecutionContext &context, DataChunk &chunk,
+                                                                OperatorSourceInput &input) const {
+	auto &state = input.global_state.Cast<DeleteWhereSourceState>();
+	lock_guard<mutex> guard(state.lock);
+	if (state.done) {
+		return SourceResultType::FINISHED;
+	}
+	state.done = true;
+	// The transaction's pinned connection — the same routing the rowid DELETE takes in its Finalize.
+	FabricatorSetActiveTxn(catalog_handle_, context.client);
+	// ⚠ The producer is a LOCAL that must outlive the crossing: the managed side imports and disposes the
+	// stream INSIDE table_delete_where, which returns before this scope ends.
+	unique_ptr<fabricator::ArrowProducer> values;
+	if (!constants_.empty()) {
+		values = fabricator::FilterValueProducer(context.client, constants_);
+	}
+	auto affected =
+	    fabricator::TableDeleteWhere(table_handle_, spec_json_, values ? values->Stream() : nullptr);
+	chunk.SetCardinality(1);
+	chunk.SetValue(0, 0, Value::BIGINT(affected));
 	return SourceResultType::FINISHED;
 }
 

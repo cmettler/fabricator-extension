@@ -325,6 +325,16 @@ public unsafe struct FabricatorVTable
 
     // int32 lateral_bind_close(void* binding, char** err)
     public delegate* unmanaged[Cdecl]<nint, byte**, int> LateralBindClose;
+
+    // --- predicate DML on the table session, ABI v93 ---
+
+    // int32 table_dml_info(void* table, char** out_json, char** err) — {"delete_where": bool}; owned UTF-8,
+    // host frees via free_error. Lazy: asked when a DELETE is planned, never at enumeration.
+    public delegate* unmanaged[Cdecl]<nint, byte**, byte**, int> TableDmlInfo;
+
+    // int32 table_delete_where(void* table, const char* spec_json, ArrowArrayStream* filter_values /*nullable*/,
+    //                          int64_t* affected, char** err) — one predicate DELETE; the filter is EXACT.
+    public delegate* unmanaged[Cdecl]<nint, byte*, CArrowArrayStream*, long*, byte**, int> TableDeleteWhere;
 }
 
 /// <summary>

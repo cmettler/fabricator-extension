@@ -12,6 +12,7 @@
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 
+#include <mutex>
 #include <unordered_map>
 
 namespace duckdb {
@@ -26,6 +27,13 @@ class BoundAtClause;
 //! `filters` (best-effort — DuckDB re-applies them all, so an over-approximation is safe).
 void FabricatorComplexFilterPushdown(ClientContext &context, LogicalGet &get, FunctionData *bind_data,
                                    vector<unique_ptr<Expression>> &filters);
+
+//! The STRICT twin of the above, for predicate DML (ABI v93): serializes the AND of `filters` into one
+//! FilterNode JSON (+ the constants it references by index) iff EVERY conjunct renders EXACTLY — no dropped
+//! conjunct, an exact-type allow-list, no struct paths, every column ref naming `get`. Returns false on the
+//! first thing it cannot render exactly; true with an empty `json` means "no predicate".
+bool FabricatorSerializeExactFilter(LogicalGet &get, const vector<unique_ptr<Expression>> &filters, string &json,
+                                    vector<Value> &constants);
 
 class FabricatorTableEntry : public TableCatalogEntry {
 public:
@@ -104,6 +112,10 @@ public:
 	const LogicalType &RowIdType() const {
 		return rowid_type_;
 	}
+	//! Whether the provider can run a DELETE on this table as ONE predicate statement (ABI v93
+	//! `table_dml_info`). Asked lazily, at the first DELETE PLANNED against this entry — never during
+	//! enumeration — and cached for the entry's life (an ALTER or a refresh rebuilds the entry).
+	bool SupportsDeleteWhere();
 
 private:
 	//! Shared body of both GetScanFunction overloads; `at_clause` (nullable) is the time-travel snapshot.
@@ -133,6 +145,9 @@ private:
 	//! Guards the ONE lazy `table_stats` crossing that fills both fields above (was two crossings —
 	//! kinds 4 + 5 — with a flag each). The map may legitimately stay empty.
 	bool stats_fetched_ = false;
+	//! Guards the lazy `table_dml_info` crossing below; -1 = not asked yet, 0/1 = the answer.
+	std::mutex dml_info_lock_;
+	int8_t delete_where_ = -1;
 };
 
 } // namespace duckdb

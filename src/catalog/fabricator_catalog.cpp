@@ -35,6 +35,11 @@
 #include "duckdb/planner/operator/logical_create_table.hpp"
 #include "duckdb/planner/parsed_data/bound_create_table_info.hpp"
 #include "duckdb/planner/operator/logical_delete.hpp"
+#include "duckdb/planner/operator/logical_filter.hpp"
+#include "duckdb/common/enums/logical_operator_type.hpp"
+#include "duckdb/common/printer.hpp"
+#include <cstdlib>
+#include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
 #include "duckdb/planner/operator/logical_update.hpp"
 #include "duckdb/storage/database_size.hpp"
@@ -710,6 +715,102 @@ FabricatorModifyTarget FabricatorBuildModifyTarget(TableCatalogEntry &table) {
 		target.rowid_types.push_back(types[idx]);
 	}
 	return target;
+}
+
+// ⚠ THE RULE THIS PATH LIVES BY: render EXACTLY or fall back. A scan's pushed filter may be a SUPERSET because
+// DuckDB re-applies every predicate above the scan; a DELETE has no such net, so a predicate rendered WEAKER
+// than the user's deletes rows nobody named. Every refusal below returns null, and null means the rowid
+// path — never an error.
+// FABRICATOR_DUMP_DML=1 prints why a DELETE kept the rowid path (or that it took the shortcut). What route a
+// DELETE takes is visible in EXPLAIN, but WHY it fell back is not, and a silent fallback is the one failure
+// mode of this path that costs performance without saying so.
+static void DmlTrace(const string &message) {
+	static const bool enabled = [] {
+		auto v = std::getenv("FABRICATOR_DUMP_DML");
+		return v && *v && string(v) != "0";
+	}();
+	if (enabled) {
+		Printer::Print("[fabricator dml] " + message);
+	}
+}
+
+static optional_ptr<PhysicalOperator> TryPlanDeleteWhere(ClientContext &context, PhysicalPlanGenerator &planner,
+                                                         LogicalDelete &op, Catalog &catalog,
+                                                         FabricatorHandle catalog_handle) {
+	if (op.return_chunk) {
+		DmlTrace("rowid path: RETURNING");
+		return nullptr; // RETURNING needs the deleted rows themselves
+	}
+	// The kill switch, and the reference oracle the differential gate runs against. Absent (no bridge) or on
+	// => the shortcut is allowed.
+	Value enabled;
+	if (context.TryGetCurrentSetting("fabricator_dml_pushdown", enabled) && !enabled.IsNull() &&
+	    !enabled.GetValue<bool>()) {
+		DmlTrace("rowid path: fabricator_dml_pushdown = false");
+		return nullptr;
+	}
+	if (&op.table.ParentCatalog() != &catalog || op.children.size() != 1) {
+		DmlTrace("rowid path: not this catalog's single-child DELETE");
+		return nullptr;
+	}
+	// The ONE shape: [FILTER] -> scan of this very table. Anything else (a join for USING / IN (subquery),
+	// a projection, a second relation) keeps the rowid path. Measured on 2.0: the WHOLE WHERE survives as the
+	// FILTER's expressions because our pushdown never erases what it pushes.
+	auto *node = op.children[0].get();
+	vector<unique_ptr<Expression>> no_filters;
+	vector<unique_ptr<Expression>> *filters = &no_filters;
+	if (node->type == LogicalOperatorType::LOGICAL_FILTER) {
+		filters = &node->expressions;
+		if (node->children.size() != 1) {
+			DmlTrace("rowid path: filter with several children");
+			return nullptr;
+		}
+		node = node->children[0].get();
+	}
+	if (node->type != LogicalOperatorType::LOGICAL_GET) {
+		DmlTrace("rowid path: child is " + LogicalOperatorToString(node->type) + ", not a scan");
+		return nullptr;
+	}
+	auto &get = node->Cast<LogicalGet>();
+	if (get.GetTable().get() != &op.table) {
+		DmlTrace("rowid path: the scan is not of the DELETE's table");
+		return nullptr;
+	}
+	if (get.table_filters.HasFilters()) {
+		DmlTrace("rowid path: filters were erased into the scan");
+		return nullptr; // a filter erased into the scan would be invisible here, so never skip past one
+	}
+	auto &entry = op.table.Cast<FabricatorTableEntry>();
+	string json;
+	vector<Value> constants;
+	if (!FabricatorSerializeExactFilter(get, *filters, json, constants)) {
+		DmlTrace("rowid path: the predicate does not render exactly");
+		return nullptr;
+	}
+	// Asked LAST: it is the one crossing on this path (cached per entry after the first DELETE).
+	if (!entry.SupportsDeleteWhere()) {
+		DmlTrace("rowid path: the table does not support predicate DELETE");
+		return nullptr;
+	}
+	string spec = json.empty() ? "{}" : "{\"filter\":" + json + "}";
+	string predicate;
+	for (auto &f : *filters) {
+		predicate += predicate.empty() ? "" : " AND ";
+		predicate += f->ToString();
+	}
+	DmlTrace("delete-where: " + spec);
+	vector<LogicalType> result_types {LogicalType::BIGINT};
+	return planner.Make<FabricatorPhysicalDeleteWhere>(std::move(result_types), op.estimated_cardinality,
+	                                                   catalog_handle, entry.TableHandle(), std::move(spec),
+	                                                   std::move(constants), std::move(predicate));
+}
+
+PhysicalOperator &FabricatorCatalog::PlanDelete(ClientContext &context, PhysicalPlanGenerator &planner,
+                                              LogicalDelete &op) {
+	if (auto shortcut = TryPlanDeleteWhere(context, planner, op, *this, handle_)) {
+		return *shortcut;
+	}
+	return Catalog::PlanDelete(context, planner, op);
 }
 
 PhysicalOperator &FabricatorCatalog::PlanDelete(ClientContext &context, PhysicalPlanGenerator &planner,

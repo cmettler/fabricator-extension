@@ -181,6 +181,11 @@ public:
 	                             optional_ptr<PhysicalOperator> plan) override;
 	PhysicalOperator &PlanDelete(ClientContext &context, PhysicalPlanGenerator &planner, LogicalDelete &op,
 	                             PhysicalOperator &plan) override;
+	//! The PLAN-LESS overload DuckDB actually calls (plan_delete.cpp): its default builds the child scan and
+	//! forwards to the overload above. Overriding it lets a DELETE whose whole predicate renders EXACTLY run as
+	//! one provider statement with NO scan and NO rowid (FabricatorPhysicalDeleteWhere); everything else
+	//! falls back to that default unchanged. See docs/duckdb-2.0-remote-execution.md §2.
+	PhysicalOperator &PlanDelete(ClientContext &context, PhysicalPlanGenerator &planner, LogicalDelete &op) override;
 	PhysicalOperator &PlanUpdate(ClientContext &context, PhysicalPlanGenerator &planner, LogicalUpdate &op,
 	                             PhysicalOperator &plan) override;
 	//! MERGE INTO — and, since the binder rewrites `INSERT ... ON CONFLICT` into a MERGE, that too. The base

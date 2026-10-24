@@ -242,6 +242,13 @@ FabricatorCapabilities FetchCapabilities(FabricatorHandle handle) {
 	return caps;
 }
 
+bool FetchDeleteWhereCapability(FabricatorHandle table) {
+	auto json = fabricator::TableDmlInfo(table);
+	YyjsonDocGuard guard(json);
+	auto *root = guard.Root();
+	return root && yyjson_get_bool(yyjson_obj_get(root, "delete_where"));
+}
+
 vector<FabricatorTableInfo> DiscoverTables(FabricatorHandle handle) {
 	ArrowArrayStream stream;
 	std::memset(&stream, 0, sizeof(stream));

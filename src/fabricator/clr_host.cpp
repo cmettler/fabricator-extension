@@ -851,6 +851,27 @@ std::string TableStats(FabricatorHandle table) {
 	return TableJsonDoc(table, "table_stats", GetBridge().table_stats);
 }
 
+std::string TableDmlInfo(FabricatorHandle table) {
+	if (!GetBridge().table_dml_info) {
+		return "{}"; // an older bridge: no predicate DML, so the planner keeps the rowid path
+	}
+	return TableJsonDoc(table, "table_dml_info", GetBridge().table_dml_info);
+}
+
+int64_t TableDeleteWhere(FabricatorHandle table, const std::string &spec_json, ArrowArrayStream *filter_values) {
+	const FabricatorVTable &vt = GetBridge();
+	if (!vt.table_delete_where) {
+		throw duckdb::IOException("Fabricator: bridge does not provide table_delete_where");
+	}
+	char *err = nullptr;
+	int64_t affected = 0;
+	int32_t rc = vt.table_delete_where(table, spec_json.c_str(), filter_values, &affected, &err);
+	if (rc != FABRICATOR_OK) {
+		ThrowManagedError(vt, err, "Fabricator: table_delete_where failed");
+	}
+	return affected;
+}
+
 void TableScan(FabricatorHandle table, const std::string &spec_json, ArrowArrayStream *filter_values,
                ArrowArrayStream &out) {
 	const FabricatorVTable &vt = GetBridge();

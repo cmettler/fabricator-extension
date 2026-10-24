@@ -144,8 +144,8 @@ rows to match against.
 
 - **SQL Server:** one `DELETE FROM [s].[t] WHERE …` / `UPDATE [s].[t] SET … WHERE …` on the transaction's
   pinned connection; the affected-row count comes back from SqlClient. No scan and no rowid batches.
-  ⚠ UNVERIFIED: whether a table WITHOUT a PK or IDENTITY (no rowid today, so no DELETE/UPDATE at all) would
-  get through binding — `Binder::BindRowIdColumns` runs before planning, so the refusal may come first.
+  MEASURED for DELETE (§2.4): a table WITHOUT a PK or IDENTITY gets through binding and is deleted from —
+  the "needs a primary key" refusal comes from our 4-argument `PlanDelete`, which the shortcut never calls.
 - **Delta:** a metadata-only delete. If the predicate can be decided per FILE from the log — a partition
   column predicate, or file statistics that prove every row matches (min/max inside the range, no nulls) —
   the file is dropped with a `remove` action and no data is read; a file that only partly matches still
@@ -159,6 +159,39 @@ duckdb-postgres tried forwarding whole DELETE/UPDATE statements in 2023 and reve
 (`dd51b9f` → `f8da0a8`); today it scans ctids for both (duckdb-postgres `postgres_delete.cpp:129-140`,
 `postgres_update.cpp:210-220`). The commit message gives no reason, so the revert is a prompt to look for
 the edge case, not evidence that the design is wrong.
+
+### 2.4 DELETE on SQL Server — BUILT (ABI v93, 2026-10-24)
+
+`FabricatorCatalog::PlanDelete` (the plan-less overload) tries `TryPlanDeleteWhere` and otherwise calls the
+base overload. It fires only for `[FILTER] → FABRICATOR_SCAN` of the target table, with no `RETURNING`, no
+scan-level `table_filters`, the setting `fabricator_dml_pushdown` on, every filter expression serialized by
+the scan's own `FilterSerializer` in STRICT mode, and the table's binding answering `delete_where = true`
+(ABI `table_dml_info`; SQL Server says no for an EXTERNAL table, whose DELETE is routed to storage). The
+operator `FABRICATOR_DELETE_WHERE` sends the predicate through `table_delete_where`, and SQL Server renders it
+with the same `FilterWhereBuilder` the scan uses, so values are bound as parameters exactly as they are there.
+
+What strict mode refuses, so the shortcut cannot widen a predicate:
+
+- any child of an AND or an OR that does not serialize (the scan drops it from an AND — a superset);
+- a comparison on a type outside BOOLEAN, the signed/unsigned integers, DECIMAL and DATE. VARCHAR is out
+  because SQL Server compares under the column collation (case, accents, trailing spaces); BLOB because
+  trailing zeros are ignored; FLOAT/DOUBLE, TIMESTAMP and TIME because the T-SQL types they meet
+  (`datetime`, `real`) round differently;
+- a struct member path.
+
+Two things found while building it:
+
+- **At physical planning the filter's column references are `BOUND_REF`, not `BOUND_COLUMN_REF`** — the
+  `ColumnBindingResolver` has already run. They index the scan's output, so they map through
+  `projection_ids` and then `column_ids` to a name. Without that the shortcut never fired at all; the
+  `FABRICATOR_DUMP_DML=1` trace (env-gated, prints every fallback reason) is what showed it.
+- **A top-level AND arrives as SEPARATE filter expressions**, each checked alone, so the AND-drop rule is
+  reachable only for an AND nested in an OR. The gate has that shape for that reason.
+
+Gate `test/verify_dml_pushdown_mssql.test` (60, service tier): EXPLAIN routing rows for each fallback rule;
+the same eight DELETEs on two identical tables, one with the shortcut and one without, with every count and
+the final contents compared; a ROLLBACK and a COMMIT; and the no-PK case. Two mutants, each killed at its own
+row: types not checked (dies at the VARCHAR routing row) and the AND-drop allowed (dies at the nested-AND row).
 
 ## 3. Scan-side 2.0 features worth adopting (mostly for Delta)
 
@@ -183,9 +216,7 @@ honest answer rather than a silent `integer`.
 
 ## 4. Order of work
 
-1. **DELETE shortcut, SQL Server** — plan-less `PlanDelete`, exact rendering or fallback, RETURNING falls
-   back. Gate: differential (every statement also run with the shortcut disabled, identical table state
-   and row count), plus a fallback case per rule in §2.1.
+1. **DELETE shortcut, SQL Server** — BUILT (§2.4).
 2. **UPDATE shortcut, SQL Server** — the same, with the SET-expression rules.
 3. **Delta metadata-only DELETE** — whole-file removal from partition values and exact statistics.
 4. **`get_partition_stats` for Delta** (COUNT/MIN/MAX from the log).

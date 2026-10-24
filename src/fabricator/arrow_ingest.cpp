@@ -1399,6 +1399,10 @@ static unique_ptr<fabricator::ArrowProducer> BuildFilterValues(ClientContext &co
 	return producer;
 }
 
+unique_ptr<fabricator::ArrowProducer> FilterValueProducer(ClientContext &context, const vector<Value> &consts) {
+	return BuildFilterValues(context, consts);
+}
+
 // Resolves each requested output column (and each rowid source) to a position in the
 // actual result. By NAME when projection was pushed (the result is a subset), else by
 // positional identity (the full result is returned in table order).

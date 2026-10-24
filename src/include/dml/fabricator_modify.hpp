@@ -147,4 +147,36 @@ private:
 	FabricatorHandle handle_;
 };
 
+//! DELETE FROM [schema].[table] WHERE <exact predicate> as ONE provider statement (ABI v93). Planned by
+//! FabricatorCatalog's plan-less PlanDelete when the table can do it and the WHOLE predicate renders exactly
+//! (FabricatorSerializeExactFilter); otherwise that overload falls back to the rowid path. A pure SOURCE:
+//! no child, nothing scanned, no rowid read — one crossing, then the provider's own affected-row count.
+class FabricatorPhysicalDeleteWhere : public PhysicalOperator {
+public:
+	static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::EXTENSION;
+
+	FabricatorPhysicalDeleteWhere(PhysicalPlan &plan, vector<LogicalType> types, idx_t estimated_cardinality,
+	                              FabricatorHandle catalog_handle, FabricatorHandle table_handle, string spec_json,
+	                              vector<Value> constants, string predicate);
+
+	string GetName() const override {
+		return "FABRICATOR_DELETE_WHERE";
+	}
+	bool IsSource() const override {
+		return true;
+	}
+	//! EXPLAIN shows the predicate that was sent, which is what the routing assertions read.
+	InsertionOrderPreservingMap<string> ParamsToString() const override;
+	unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context) const override;
+	SourceResultType GetDataInternal(ExecutionContext &context, DataChunk &chunk,
+	                                 OperatorSourceInput &input) const override;
+
+private:
+	FabricatorHandle catalog_handle_;
+	FabricatorHandle table_handle_;
+	string spec_json_;
+	vector<Value> constants_;
+	string predicate_;
+};
+
 } // namespace duckdb

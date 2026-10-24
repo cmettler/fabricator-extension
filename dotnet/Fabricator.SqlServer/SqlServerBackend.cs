@@ -2338,6 +2338,55 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
         }
     }
 
+    /// <summary>Whether a DELETE on this table may run as ONE predicate statement (ABI v93). Not for an
+    /// EXTERNAL table: its DELETE is routed to storage by identity (ExecuteDelete above), and a plain T-SQL
+    /// DELETE against it fails. <see cref="DetectExternalTable"/> is cached and answers null at once on a
+    /// warehouse engine, so this costs at most one probe per table, at the first DELETE planned.</summary>
+    internal bool SupportsDeleteWhereCore(string schemaName, string tableName) =>
+        DetectExternalTable(schemaName, tableName) is null;
+
+    /// <summary>One <c>DELETE FROM [s].[t] WHERE …</c> for an EXACT predicate (ABI v93) — no scan, no rowid.
+    /// Same connection routing (the transaction's pinned connection via BeginWrite), the same interrupt scope
+    /// and the same parameterized renderer (<see cref="FilterWhereBuilder"/>) as the rowid DELETE and the
+    /// scan, so the three cannot drift on how a value is bound.</summary>
+    /// <remarks>⚠ The renderer throws on any node it cannot render, and that must stay so: the host sends this
+    /// path only predicates it already proved exact, so a silently dropped node would delete rows nobody
+    /// named. The returned count is SqlClient's, which — exactly like the rowid path's — includes rows a
+    /// trigger affected.</remarks>
+    internal long DeleteWhereCore(string schemaName, string tableName, FilterNode? filter,
+                                  IArrowArrayStream? filterValues)
+    {
+        RecordTouch(schemaName, tableName, schemaChanged: false);
+        var values = ReadFilterValues(filterValues); // consumes + disposes the stream
+        using var interrupt = new InterruptScope(AmbientOpener.Current);
+        var (connection, transaction, owns) = BeginWrite();
+        try
+        {
+            using var cmd = connection.CreateCommand();
+            cmd.Transaction = transaction;
+            cmd.CommandTimeout = ResolveCommandTimeout();
+            var sql = new StringBuilder("DELETE FROM ").Append(Quote(schemaName)).Append('.').Append(Quote(tableName));
+            if (filter is not null)
+            {
+                var builder = new FilterWhereBuilder(values);
+                sql.Append(" WHERE ").Append(builder.Build(filter));
+                cmd.Parameters.AddRange(builder.Parameters.ToArray());
+            }
+            cmd.CommandText = sql.ToString();
+            if (Log.IsEnabled(LogLevel.Debug))
+                Log.LogDebug("dml {Schema}.{Table}: delete-where {Sql} [params={Count}]", schemaName, tableName,
+                             Trunc(cmd.CommandText), cmd.Parameters.Count);
+            return cmd.ExecuteNonQueryAsync(interrupt.Token).GetAwaiter().GetResult();
+        }
+        finally
+        {
+            if (owns)
+            {
+                connection.Dispose();
+            }
+        }
+    }
+
     public long ExecuteUpdate(string schemaName, string tableName, int setColumnCount, IArrowArrayStream data)
     {
         RecordTouch(schemaName, tableName, schemaChanged: false);

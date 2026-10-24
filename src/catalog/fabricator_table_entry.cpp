@@ -19,6 +19,9 @@
 #include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/logging/logger.hpp"
+#include "duckdb/common/printer.hpp"
+#include "duckdb/common/enums/expression_type.hpp"
+#include <cstdlib>
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/constraints/bound_check_constraint.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
@@ -27,6 +30,7 @@
 #include "duckdb/planner/tableref/bound_at_clause.hpp"
 #include "duckdb/planner/expression/bound_between_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
+#include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
@@ -53,8 +57,14 @@ public:
 	// `_BIN/_BIN2` SQL collation, or a byte-ordered source like Parquet/Delta statistics). When true, string
 	// ordering comparisons (`<` `<=` `>` `>=` `<>` `is_distinct`) and string BETWEEN are superset-safe to push;
 	// otherwise only string equality (`=`/`is_not_distinct`, superset-safe under any collation) is pushed.
-	FilterSerializer(LogicalGet &get, vector<Value> &constants, bool string_order_pushable)
-	    : get_(get), constants_(constants), string_order_pushable_(string_order_pushable) {
+	//
+	// `strict` = the EXACT mode predicate DML needs (ABI v93, FabricatorSerializeExactFilter): a DELETE has no
+	// re-application above it, so a predicate rendered WEAKER than the user's deletes rows nobody named.
+	// Strict refuses every approximation the scan mode makes on purpose — a dropped AND conjunct, string /
+	// blob / uuid / float / temporal comparisons (collation, trailing-space, trailing-zero-byte and precision
+	// semantics all differ on SQL Server), struct paths — and requires each column ref to name THIS scan.
+	FilterSerializer(LogicalGet &get, vector<Value> &constants, bool string_order_pushable, bool strict = false)
+	    : get_(get), constants_(constants), string_order_pushable_(string_order_pushable), strict_(strict) {
 	}
 
 	// Returns true and fills `out` (a JSON object) + `sql` (an equivalent DuckDB SQL predicate, literals
@@ -142,10 +152,39 @@ private:
 
 	// Resolve a column-ref expression to its provider column name.
 	bool ColumnName(const Expression &e, string &name, LogicalType &type) {
+		// ⚠ STRICT mode runs at PHYSICAL planning (the plan-less PlanDelete), and by then DuckDB's
+		// ColumnBindingResolver has already rewritten every column ref into a BOUND_REF — a POSITION in the
+		// child chunk — where the optimizer-time pushdown sees BOUND_COLUMN_REFs. The caller guarantees the
+		// child IS this scan (FILTER directly over it), so a position resolves through the scan's OUTPUT:
+		// projection_ids index into column_ids, empty = all of them.
+		if (strict_ && e.GetExpressionClass() == ExpressionClass::BOUND_REF) {
+			auto pos = e.Cast<BoundReferenceExpression>().Index();
+			auto &out_cols = get_.GetColumnIds();
+			idx_t col_pos = pos;
+			if (!get_.projection_ids.empty()) {
+				if (pos >= get_.projection_ids.size()) {
+					return false;
+				}
+				col_pos = get_.projection_ids[pos].GetIndex();
+			}
+			if (col_pos >= out_cols.size()) {
+				return false;
+			}
+			auto &oci = out_cols[col_pos];
+			if (!oci.HasPrimaryIndex() || oci.HasChildren() || oci.GetPrimaryIndex() >= get_.names.size()) {
+				return false;
+			}
+			name = get_.names[oci.GetPrimaryIndex()].GetIdentifierName();
+			type = e.GetReturnType();
+			return true;
+		}
 		if (e.GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
 			return false;
 		}
 		auto &ref = e.Cast<BoundColumnRefExpression>();
+		if (strict_ && ref.Binding().table_index != get_.table_index) {
+			return false; // a column of some other relation — not this table's predicate
+		}
 		auto &cols = get_.GetColumnIds();
 		if (ref.Binding().column_index >= cols.size()) {
 			return false;
@@ -171,6 +210,9 @@ private:
 	// struct_extract_at's positional form.
 	bool ColumnPath(const Expression &e, vector<string> &path, LogicalType &type) {
 		if (e.GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
+			if (strict_) {
+				return false; // struct members: no SQL Server equivalent to render exactly
+			}
 			auto &func = e.Cast<BoundFunctionExpression>();
 			if ((func.Function().GetName() != "struct_extract" && func.Function().GetName() != "struct_extract_at") ||
 			    func.GetChildren().size() != 2 || !func.BindInfo()) {
@@ -264,6 +306,9 @@ private:
 	// for ordering / `<>` / IS DISTINCT can be a strict subset (=> drops rows). So for
 	// VARCHAR push only the positive-equality shapes.
 	bool SafeForType(const char *cmp, const LogicalType &type) const {
+		if (strict_) {
+			return ExactType(type);
+		}
 		if (type.id() != LogicalTypeId::VARCHAR) {
 			return true; // numeric / temporal / bool / blob / uuid: exact
 		}
@@ -274,6 +319,31 @@ private:
 			return true;
 		}
 		return string_order_pushable_;
+	}
+
+	// The strict-mode allow-list: types whose comparison means the same thing in DuckDB and on SQL Server, so
+	// a pushed predicate selects exactly the rows DuckDB would. Everything else falls back to the rowid path:
+	//   VARCHAR — collation (often case-insensitive) and SQL Server ignores TRAILING SPACES in `=`;
+	//   BLOB    — SQL Server ignores trailing zero bytes; UUID — uniqueidentifier orders by a different byte
+	//   order; FLOAT/DOUBLE — NaN; TIMESTAMP/TIME — the constant is bound as datetime2 while a legacy
+	//   `datetime` column is held truncated to microseconds in DuckDB, so a boundary row can differ.
+	static bool ExactType(const LogicalType &type) {
+		switch (type.id()) {
+		case LogicalTypeId::BOOLEAN:
+		case LogicalTypeId::TINYINT:
+		case LogicalTypeId::SMALLINT:
+		case LogicalTypeId::INTEGER:
+		case LogicalTypeId::BIGINT:
+		case LogicalTypeId::UTINYINT:
+		case LogicalTypeId::USMALLINT:
+		case LogicalTypeId::UINTEGER:
+		case LogicalTypeId::UBIGINT:
+		case LogicalTypeId::DECIMAL:
+		case LogicalTypeId::DATE:
+			return true;
+		default:
+			return false;
+		}
 	}
 
 	idx_t AddConstant(const Value &v) {
@@ -293,7 +363,8 @@ private:
 		auto rc = rhs.GetExpressionClass();
 		// Column side = a plain column ref OR a struct_extract chain (ColumnPath validates the shape).
 		auto is_col_side = [](ExpressionClass c) {
-			return c == ExpressionClass::BOUND_COLUMN_REF || c == ExpressionClass::BOUND_FUNCTION;
+			return c == ExpressionClass::BOUND_COLUMN_REF || c == ExpressionClass::BOUND_FUNCTION ||
+			       c == ExpressionClass::BOUND_REF; // BOUND_REF: strict mode only (ColumnName refuses it otherwise)
 		};
 		if (is_col_side(lc) && rc == ExpressionClass::BOUND_CONSTANT) {
 			col = &lhs;
@@ -377,6 +448,9 @@ private:
 			if (!ColumnPath(*op.GetChildren()[0], path, coltype)) {
 				return false;
 			}
+			if (strict_ && !ExactType(coltype)) {
+				return false;
+			}
 			vector<Value> values;
 			for (idx_t i = 1; i < op.GetChildren().size(); i++) {
 				if (op.GetChildren()[i]->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
@@ -432,8 +506,8 @@ private:
 			if (Serialize(*child, js, cs)) {
 				parts.push_back(std::move(js));
 				sql_parts.push_back(std::move(cs));
-			} else if (is_or) {
-				return false; // OR is all-or-nothing (dropping a branch would be a subset)
+			} else if (is_or || strict_) {
+				return false; // OR is all-or-nothing (dropping a branch would be a subset); strict: AND too
 			}
 			// AND: dropping a branch only widens the result (superset), so partial is OK.
 		}
@@ -502,6 +576,9 @@ private:
 		if (coltype.id() == LogicalTypeId::VARCHAR && !string_order_pushable_) {
 			return false; // string range: collation-dependent ordering, not superset-safe (unless byte-ordered)
 		}
+		if (strict_ && !ExactType(coltype)) {
+			return false;
+		}
 		if (lower.GetExpressionClass() != ExpressionClass::BOUND_CONSTANT ||
 		    upper.GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
 			return false;
@@ -546,6 +623,7 @@ private:
 	LogicalGet &get_;
 	vector<Value> &constants_;
 	bool string_order_pushable_;
+	bool strict_;
 };
 
 } // namespace
@@ -636,6 +714,51 @@ void FabricatorComplexFilterPushdown(ClientContext &context, LogicalGet &get, Fu
 	bind_data.filter_json = std::move(json);
 	bind_data.native_filter_sql = std::move(sql);
 	log_result(parts.size());
+}
+
+bool FabricatorSerializeExactFilter(LogicalGet &get, const vector<unique_ptr<Expression>> &filters, string &json,
+                                    vector<Value> &constants) {
+	json.clear();
+	constants.clear();
+	FilterSerializer ser(get, constants, /*string_order_pushable=*/false, /*strict=*/true);
+	vector<string> parts;
+	for (auto &f : filters) {
+		string js, cs;
+		if (!ser.Serialize(*f, js, cs)) {
+			auto v = std::getenv("FABRICATOR_DUMP_DML");
+			if (v && *v && string(v) != "0") {
+				Printer::Print("[fabricator dml] not exact: " + f->ToString() + " (" +
+				               ExpressionClassToString(f->GetExpressionClass()) + ")");
+			}
+			constants.clear();
+			return false; // one conjunct that does not render exactly sends the whole DELETE to the rowid path
+		}
+		parts.push_back(std::move(js));
+	}
+	if (parts.empty()) {
+		return true; // no predicate: an unconditional DELETE, rendered as no WHERE at all
+	}
+	if (parts.size() == 1) {
+		json = std::move(parts[0]);
+		return true;
+	}
+	json = "{\"op\":\"and\",\"children\":[";
+	for (idx_t i = 0; i < parts.size(); i++) {
+		if (i) {
+			json += ',';
+		}
+		json += parts[i];
+	}
+	json += "]}";
+	return true;
+}
+
+bool FabricatorTableEntry::SupportsDeleteWhere() {
+	lock_guard<mutex> guard(dml_info_lock_);
+	if (delete_where_ < 0) {
+		delete_where_ = FetchDeleteWhereCapability(table_handle_) ? 1 : 0;
+	}
+	return delete_where_ == 1;
 }
 
 FabricatorTableEntry::FabricatorTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateTableInfo &info,

@@ -336,4 +336,11 @@ private:
 	bool done_ = false;
 };
 
+class ArrowProducer;
+//! The filter constants as a one-row Arrow batch (column i == value i), the shape every filter crossing
+//! takes. ⚠ The producer must outlive the CONSUMER's use of its stream — keep it for the whole call that
+//! hands the stream over (the recorded BuildFilterValues use-after-free, abi.h).
+duckdb::unique_ptr<ArrowProducer> FilterValueProducer(duckdb::ClientContext &context,
+                                                      const duckdb::vector<duckdb::Value> &consts);
+
 } // namespace fabricator
