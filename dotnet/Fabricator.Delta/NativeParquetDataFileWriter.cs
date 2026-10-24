@@ -62,9 +62,11 @@ internal sealed class NativeParquetDataFileWriter : IDataFileWriter
         // rest through unchanged (the dataset never materializes here; a streaming caller stays streaming).
         // The stream never disposes the batches (the C export doesn't free managed buffers), so a caller that
         // holds them for its own stats collection is unaffected. A column-mapping rewrite/compaction hands us
-        // batches engineered-wood already annotated with `PARQUET:field_id` (via SetParquetFieldIds); DuckDB's
-        // COPY does NOT read Arrow field metadata, so lift those ids into an explicit FIELD_IDS clause — else
-        // the native-written file would lose its field ids and an id-mode reader couldn't map it.
+        // batches engineered-wood already annotated with `PARQUET:field_id` at EVERY nesting level
+        // (ColumnMappingRecursive.ToPhysical); DuckDB's COPY does NOT read Arrow field metadata, so lift those
+        // ids into an explicit FIELD_IDS clause — else the native-written file would lose its field ids and an
+        // id-mode reader couldn't map it. ⚠ The WHOLE tree, not the top level: until 2026-10-24 only top-level
+        // ids were lifted, so a rewritten id-mode file's struct members carried none.
         var e = CountBatches(batches, relativePath, Log, cancellationToken).GetAsyncEnumerator(cancellationToken);
         RecordBatch first;
         try
@@ -95,7 +97,7 @@ internal sealed class NativeParquetDataFileWriter : IDataFileWriter
         }
         var src = new AsyncEnumerableArrowStream(first.Schema, FirstThenRest(first, e));
         var (_, size, _) = RunCopy(_writableRoot, relativePath, src, cancellationToken,
-                                   fieldIds: FieldIdsFromMetadata(first.Schema), spec: _spec);
+                                   fieldIdsSpec: FieldIdsSpecFromArrow(first.Schema), spec: _spec);
         return size;
     }
 
@@ -243,7 +245,7 @@ internal sealed class NativeParquetDataFileWriter : IDataFileWriter
 
     internal static (long Rows, long Size, string? Stats) RunCopy(
         string writableRoot, string relativePath, IArrowArrayStream src, CancellationToken ct,
-        Schema? statsSchema = null, IReadOnlyDictionary<string, int>? fieldIds = null,
+        Schema? statsSchema = null,
         IReadOnlyDictionary<string, string>? renameToPhysical = null, string? fieldIdsSpec = null,
         DeltaWriteSpec? spec = null)
     {
@@ -262,7 +264,7 @@ internal sealed class NativeParquetDataFileWriter : IDataFileWriter
         var sql =
             $"COPY (SELECT {SelectList(src.Schema, renameToPhysical)} FROM {QuoteIdent(InputView)}) TO '{uri.Replace("'", "''")}' " +
             "(FORMAT parquet, WRITE_BLOOM_FILTER true, RETURN_STATS" + CopyTuning(spec)
-            + (fieldIdsSpec is not null ? ", FIELD_IDS " + fieldIdsSpec : FieldIdsClause(fieldIds)) + ")";
+            + (fieldIdsSpec is not null ? ", FIELD_IDS " + fieldIdsSpec : "") + ")";
         Log.LogInformation("delta native copy {Uri}", uri);
         var input = new (string, IArrowArrayStream)[] { (InputView, src) };
         using var result = Host.Query(sql, input);
@@ -307,7 +309,7 @@ internal sealed class NativeParquetDataFileWriter : IDataFileWriter
     /// </summary>
     internal static List<CopiedFile> RunCopyPartitioned(
         string writableRoot, IReadOnlyList<string> partitionColumns, IArrowArrayStream src,
-        CancellationToken ct, Schema? statsSchema, IReadOnlyDictionary<string, int>? fieldIds = null,
+        CancellationToken ct, Schema? statsSchema,
         IReadOnlyDictionary<string, string>? renameToPhysical = null, string? fieldIdsSpec = null,
         DeltaWriteSpec? spec = null)
     {
@@ -318,7 +320,7 @@ internal sealed class NativeParquetDataFileWriter : IDataFileWriter
             $"COPY (SELECT {SelectList(src.Schema, renameToPhysical)} FROM {QuoteIdent(InputView)}) TO '{writableRoot.Replace("'", "''")}' " +
             $"(FORMAT parquet, PARTITION_BY ({quoted}), APPEND true, FILENAME_PATTERN '{{uuid}}', " +
             "WRITE_BLOOM_FILTER true, RETURN_STATS" + CopyTuning(spec)
-            + (fieldIdsSpec is not null ? ", FIELD_IDS " + fieldIdsSpec : FieldIdsClause(fieldIds)) + ")";
+            + (fieldIdsSpec is not null ? ", FIELD_IDS " + fieldIdsSpec : "") + ")";
         Log.LogInformation("delta native partitioned copy {Root} by [{Cols}]", writableRoot, quoted);
         var input = new (string, IArrowArrayStream)[] { (InputView, src) };
         using var result = Host.Query(sql, input);
@@ -568,43 +570,73 @@ internal sealed class NativeParquetDataFileWriter : IDataFileWriter
 
     private static string QuoteIdent(string s) => "\"" + s.Replace("\"", "\"\"") + "\"";
 
-    // Renders the COPY `FIELD_IDS {'col': id, …}` option so DuckDB's parquet writer stamps each column's Delta
-    // `columnMapping.id` into the parquet field_id — the identity an id-mode reader maps by. Keys are the OUTPUT
-    // (physical) column names. Empty/null → no clause (a non-mapping table). String-literal keys tolerate
-    // arbitrary column names. Top-level columns only; a nested mapped column would use the
-    // `{'s': {__duckdb_field_id: 1, 'c': 2}}` recursion (a later slice).
-    private static string FieldIdsClause(IReadOnlyDictionary<string, int>? fieldIds)
+    // Renders the COPY `FIELD_IDS { … }` value from the `PARQUET:field_id` Arrow metadata engineered-wood stamps on
+    // a column-mapping batch at EVERY level (ColumnMappingRecursive.ToPhysical), so DuckDB's parquet writer
+    // writes each node's Delta `columnMapping.id` into the parquet field_id — the identity an id-mode reader maps
+    // by. Null when no field carries an id (the common non-mapping case) → no FIELD_IDS clause.
+    // The shape is the one DeltaGlobalTableFunction.BuildFieldIdsSpec renders from the Delta schema, so the bulk
+    // and rewrite paths stamp identical trees: a leaf is its bare id; a node with id'd descendants is a dict
+    // carrying `__duckdb_field_id` (when the node has its own id) plus its children — a struct's by field NAME
+    // (the batch's names are already physical), a list's under 'element', a map's under 'key'/'value'.
+    internal static string? FieldIdsSpecFromArrow(Schema schema)
     {
-        if (fieldIds is null || fieldIds.Count == 0)
-        {
-            return "";
-        }
-        var sb = new System.Text.StringBuilder(", FIELD_IDS {");
-        bool first = true;
-        foreach (var kv in fieldIds)
-        {
-            if (!first) { sb.Append(", "); }
-            first = false;
-            sb.Append('\'').Append(kv.Key.Replace("'", "''")).Append("': ").Append(kv.Value.ToString(CultureInfo.InvariantCulture));
-        }
-        sb.Append('}');
-        return sb.ToString();
-    }
-
-    // Lifts `PARQUET:field_id` Arrow field metadata (set by engineered-wood's SetParquetFieldIds on a
-    // column-mapping rewrite/compaction) into a logical-name → field_id map for FieldIdsClause. Null when no field
-    // carries the metadata (the common non-mapping case) → no FIELD_IDS clause.
-    private static IReadOnlyDictionary<string, int>? FieldIdsFromMetadata(Schema schema)
-    {
-        Dictionary<string, int>? map = null;
+        var parts = new List<string>();
         foreach (var f in schema.FieldsList)
         {
-            if (f.Metadata is { } md && md.TryGetValue("PARQUET:field_id", out var s)
-                && int.TryParse(s, out var id))
+            if (FieldIdValue(f) is { } v)
             {
-                (map ??= new Dictionary<string, int>())[f.Name] = id;
+                parts.Add(FieldIdKey(f.Name) + ": " + v);
             }
         }
-        return map;
+        return parts.Count > 0 ? "{" + string.Join(", ", parts) + "}" : null;
+    }
+
+    private static string FieldIdKey(string name) => "'" + name.Replace("'", "''") + "'";
+
+    private static string? FieldIdValue(Field f)
+    {
+        int? id = f.Metadata is { } md && md.TryGetValue("PARQUET:field_id", out var s)
+                  && int.TryParse(s, NumberStyles.Integer, CultureInfo.InvariantCulture, out var n) ? n : null;
+        var children = new List<string>();
+        void Child(string key, Field child)
+        {
+            if (FieldIdValue(child) is { } v)
+            {
+                children.Add(FieldIdKey(key) + ": " + v);
+            }
+        }
+        switch (f.DataType)
+        {
+            case StructType st:
+                foreach (var c in st.Fields)
+                {
+                    Child(c.Name, c);
+                }
+                break;
+            case MapType mt:
+                Child("key", mt.KeyField);
+                Child("value", mt.ValueField);
+                break;
+            case ListType lt:
+                Child("element", lt.ValueField);
+                break;
+            case LargeListType llt:
+                Child("element", llt.ValueField);
+                break;
+            case FixedSizeListType flt:
+                Child("element", flt.ValueField);
+                break;
+        }
+        if (children.Count == 0)
+        {
+            return id?.ToString(CultureInfo.InvariantCulture);
+        }
+        var sb = new System.Text.StringBuilder("{");
+        if (id is { } own)
+        {
+            sb.Append("__duckdb_field_id: ").Append(own.ToString(CultureInfo.InvariantCulture)).Append(", ");
+        }
+        sb.Append(string.Join(", ", children)).Append('}');
+        return sb.ToString();
     }
 }

@@ -199,7 +199,8 @@ table, whoever wrote it, because of the `No default expression in FieldId Map` a
 `file_row_number`, so the full form now declares a name-keyed `schema` map instead (`TryFullForm`). What still
 holds: an id-keyed map cannot reach these columns at all, because they carry no id — so an id-mode scan that
 needs a materialized row-tracking column (or the rowid) stays off the batched forms. A PLAIN id-mode projection
-of primitive columns does batch since 2026-10-24, keyed by field id (`verify_delta_batched_read` §16). **Where they sit was measured too, and it matters for the 2.0 field-id mapper's silent-NULL
+does batch since 2026-10-24, keyed by field id — structs too, via id-keyed `children`; only a list/map holding a
+struct stays per file (`verify_delta_batched_read` §16). **Where they sit was measured too, and it matters for the 2.0 field-id mapper's silent-NULL
 defect ([duckdb-upstream-issues.md](duckdb-upstream-issues.md) §11):** Fabric Spark writes them LAST, row id
 before commit version, in both mapping modes — and one rewrite file carried only `_row-id-col-…`. delta-spark's
 source, engineered-wood's writer and our native writer agree. ⚠ Fabric's Spark (runtime 2.0) does not know

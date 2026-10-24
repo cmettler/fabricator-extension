@@ -398,7 +398,8 @@ internal static class DeltaNativeReader
     /// uses it; the plain form still declines the position shapes because the full form serves them, not
     /// because it cannot. docs/duckdb-upstream-issues.md §1.</para></item>
     /// <item><b>ID-mode column mapping — the plain form serves it BY FIELD ID since 2026-10-24 (DuckDB 2.0 takes an
-    /// INTEGER-keyed map), for PRIMITIVE columns only; structs, lists, maps and the full form stay on the loop.</b>
+    /// INTEGER-keyed map), structs included via id-keyed <c>children</c>; a list/map holding a struct and the full
+    /// form stay on the loop.</b>
     /// The paragraph below is why a NAME key is never used in id mode, and it still governs everything the
     /// id-keyed map does not cover. A name-keyed map resolves columns by NAME, while id mode's contract is that a
     /// reader matches by FIELD ID and the stored name is <i>not</i> authoritative — a legacy engineered-wood
@@ -413,9 +414,9 @@ internal static class DeltaNativeReader
     /// foreign-named file by hand to build it, and a name-keyed mutant reads it as NULL there). MEASURED: an id-mode table taken through a nested RENAME and then
     /// a top-level RENAME has all four of its files storing BYTE-IDENTICAL physical names — the physicalName is
     /// assigned once at column creation in id mode exactly as in name mode. A mutant with this gate removed
-    /// therefore passed the whole suite until §16 existed. ⚠ Why id-mode STRUCTS stay on the loop: the rewrite
-    /// seam (NativeParquetDataFileWriter) stamps top-level field ids only, so an id-keyed <c>children</c> map
-    /// would read a rewritten file's struct members as NULL — a gap in OUR writer, not in the contract.</para>
+    /// therefore passed the whole suite until §16 existed. ⚠ Id-keyed <c>children</c> needs every writer to
+    /// stamp MEMBER ids; the rewrite seam (NativeParquetDataFileWriter) stamped the top level only until
+    /// 2026-10-24, and §16e is the gate that it no longer does.</para>
     /// NAME mode needs no such gate: there the physical name IS authoritative and stable across renames, which
     /// is the reason the mode exists.</item>
     /// <item><b>Partition values are per file and absent from the data files</b>, so a declared <c>schema</c>
@@ -839,12 +840,11 @@ internal static class DeltaNativeReader
             // mode and the stored name is not authoritative, so an INTEGER-keyed map is the reader honouring
             // the contract rather than guessing names — it matches across a physical rename and NULL-fills a
             // file that predates the column, exactly like the name map does in name mode.
-            // ⚠ PRIMITIVE COLUMNS ONLY, and the reason is OUR OWN writer: the rewrite seam
-            // (NativeParquetDataFileWriter.FieldIdsFromMetadata — DML post-images, compaction) stamps TOP-LEVEL
-            // ids only, so a struct's members in such a file carry none. An id-keyed `children` map would read
-            // them as NULL with no error, where the per-file loop probes each file and falls back to the
-            // physical name. A LIST/MAP could not be expressed anyway: its element nodes have no Delta id to key
-            // a child entry by.
+            // Structs are declared with an id-keyed `children` map at every level (IdMapEntry), so a member is
+            // found by its own field id whatever the file calls it. ⚠ That relies on EVERY writer stamping
+            // nested ids — true of the bulk path (BuildFieldIdsSpec) and, since 2026-10-24, of the rewrite seam
+            // (NativeParquetDataFileWriter.FieldIdsSpecFromArrow), which used to stamp the top level only. A
+            // LIST/MAP that holds a struct cannot be expressed: its element node has no Delta id to key by.
             bool idMapped = listing.LogicalToFieldId is not null;
             // Whether to key the map by the PHYSICAL name at all. PhysicalName reads field metadata without
             // regard to the table's mapping MODE, so this is what stops a table whose mode is 'none' but whose
@@ -888,20 +888,19 @@ internal static class DeltaNativeReader
                     needsInner = true;
                     continue;
                 }
-                string key;
                 if (idMapped)
                 {
-                    if (field.Type is not DeltaSchema.PrimitiveType
-                        || DeltaSchema.ColumnMapping.GetFieldId(field) is not { } fid)
+                    // The whole entry, children included: struct members are matched by THEIR field ids and
+                    // arrive under logical names, so no SQL rebuild follows.
+                    if (IdMapEntry(field, c) is not { } idEntry)
                     {
-                        return null; // nested in id mode, or a column with no id — the loop resolves per file
+                        return null; // a node with no id, a list/map holding a struct, or variant — loop it
                     }
-                    key = fid.ToString(CultureInfo.InvariantCulture);
+                    entries.Add(idEntry);
+                    inner.Add(Quote(c));
+                    continue;
                 }
-                else
-                {
-                    key = Literal(nameMapped ? PhysicalName(field) : field.Name);
-                }
+                string key = Literal(nameMapped ? PhysicalName(field) : field.Name);
                 string type;
                 try
                 {
@@ -1020,7 +1019,7 @@ internal static class DeltaNativeReader
         /// warm. So the remote-unlimited fallback stays the full form. ⚠ Measured on ONE shape — 200 tiny
         /// files, D=2; a table with many DV files pays D queries here and the balance could move.</para>
         /// <para><b>Eligibility is exactly the plain form's</b> — this is only called on its PARTIAL result, so
-        /// no rowid, no row tracking, id mode only for primitive columns, every column renderable. Each
+        /// no rowid, no row tracking, id mode only where IdMapEntry can express the column, every column renderable. Each
         /// DV branch additionally needs its footer probe and typed-NULL rendering to succeed; any failure
         /// falls back to <see cref="TryFullForm"/> (the pre-2026-08-16 route), never to a worse answer.</para>
         /// <para><b>The struct-interior union hazard does NOT apply here</b> (the one
@@ -1369,7 +1368,7 @@ internal static class DeltaNativeReader
             return new BatchPlan(sb.ToString(), files, System.Array.Empty<DeltaReader.NativeScanFile>(), inputs);
         }
 
-        private static string Literal(string s) => "'" + s.Replace("'", "''") + "'";
+        internal static string Literal(string s) => "'" + s.Replace("'", "''") + "'";
     }
 
     /// <summary>The name of the bound per-file constants input (global ordinal, partition values) the FULL
@@ -1550,6 +1549,59 @@ internal static class DeltaNativeReader
            && !string.IsNullOrEmpty(phys)
             ? phys
             : field.Name;
+
+    // One id-mode `schema` map entry, keyed by the field's own id, with its LOGICAL name and type. A struct
+    // carries an id-keyed `children` map for every member (DuckDB 2.0 requires all of them, in order), so each
+    // member is matched by its field id across renames and reorders and NULL-filled when a file lacks it —
+    // measured on read_parquet. Every entry carries 'children' (NULL for a leaf) so all values of one map
+    // literal share a struct type. Null when the shape cannot be expressed: a node without an id, a LIST/MAP
+    // holding a struct (the element node has no Delta id to key a child by), or a type with no CAST rendering.
+    private static string? IdMapEntry(DeltaSchema.StructField field, string name)
+    {
+        if (DeltaSchema.ColumnMapping.GetFieldId(field) is not { } fid)
+        {
+            return null;
+        }
+        string type;
+        try
+        {
+            type = PhysicalTypeText(field.Type, nameMapped: false); // logical names; refuses variant
+        }
+        catch (NotSupportedException)
+        {
+            return null;
+        }
+        string children = "NULL";
+        switch (field.Type)
+        {
+            case DeltaSchema.StructType st:
+                var kids = new List<string>(st.Fields.Count);
+                foreach (var child in st.Fields)
+                {
+                    if (IdMapEntry(child, child.Name) is not { } k)
+                    {
+                        return null;
+                    }
+                    kids.Add(k);
+                }
+                children = "map {" + string.Join(", ", kids) + "}";
+                break;
+            case DeltaSchema.ArrayType at when HoldsStruct(at.ElementType):
+                return null;
+            case DeltaSchema.MapType mt when HoldsStruct(mt.KeyType) || HoldsStruct(mt.ValueType):
+                return null;
+        }
+        return $"{fid.ToString(CultureInfo.InvariantCulture)}: {{'name': {BatchPlan.Literal(name)}, 'type': {BatchPlan.Literal(type)}, "
+               + $"'default_value': NULL, 'children': {children}}}";
+    }
+
+    private static bool HoldsStruct(DeltaSchema.DeltaDataType type) => type switch
+    {
+        DeltaSchema.StructType => true,
+        DeltaSchema.ArrayType at => HoldsStruct(at.ElementType),
+        DeltaSchema.MapType mt => HoldsStruct(mt.KeyType) || HoldsStruct(mt.ValueType),
+        _ => false,
+    };
 
     // Rebuilds a mapped struct with LOGICAL member names for the batched read, or null when nothing at any depth
     // needs renaming (so the caller can skip the wrapping projection entirely). The physical-name lookup is the

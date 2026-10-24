@@ -1603,8 +1603,9 @@ SELECT count(*) FROM b.main.ponly;
 #     a NAME-keyed map is unsound in id mode: the stored name is not authoritative there, and a file that
 #     stores a different name under the right field id reads as NULL. 2.0 lets the `schema` map be keyed by
 #     INTEGER, so an id-mode scan resolves columns by field id, as the mode's contract says a reader should.
-#     ⚠ PRIMITIVE COLUMNS ONLY: our own rewrite seam stamps top-level field ids and none on struct members,
-#     so a struct projection stays on the per-file loop (16c).
+#     Structs batch as well, through an id-keyed `children` map (16c) — which needs every writer to stamp
+#     member ids, and the rewrite seam did not until 2026-10-24 (16e). A list/map holding a struct stays on the
+#     per-file loop: its element node has no Delta id to key by.
 # ============================================================================
 
 statement ok
@@ -1679,8 +1680,9 @@ WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native batch%'
 ----
 true
 
-# 16c. A STRUCT projection in id mode stays on the per-file loop: the rewrite seam stamps no field ids on struct
-#      members, so an id-keyed `children` map would read them as NULL. The answer is the section-7 one.
+# 16c. STRUCTS in id mode batch too, each member declared under its OWN field id in an id-keyed `children` map
+#      (DuckDB 2.0), so a member is found whatever the file calls it. Section 7's table carries a nested RENAME
+#      (s.b -> renamed) across file vintages, which is exactly what this must survive.
 query III
 SELECT ident, (s).a, (s).renamed FROM im.main.t ORDER BY ident;
 ----
@@ -1691,8 +1693,40 @@ SELECT ident, (s).a, (s).renamed FROM im.main.t ORDER BY ident;
 
 query I
 SELECT count(*) > 0 FROM duckdb_logs
-WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native scan%'
-  AND message LIKE '%cols=[ident,s]%' AND message LIKE '%batched=0 %' AND message LIKE '%colmap=id%';
+WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native batch%'
+  AND message LIKE '%''children'': map {%' AND message LIKE '%''name'': ''renamed''%';
+----
+true
+
+# 16e. A REWRITE through the native data-file seam — an UPDATE's post-image, then OPTIMIZE's compaction — must
+#      stamp field ids on struct MEMBERS too. It stamped the top level only until 2026-10-24, so a rewritten
+#      file's members carried none and an id-keyed read would have returned them as NULL. The materialized
+#      row-tracking columns are the only id-less nodes a data file may hold (no writer gives them an id).
+statement ok
+UPDATE im.main.t SET s = {'a': 99, 'renamed': 98} WHERE ident = 2;
+
+statement ok
+SELECT fabricator_exec('im', 'OPTIMIZE main.t');
+
+query II
+SELECT count(*) FILTER (WHERE field_id IS NULL AND name <> 'duckdb_schema' AND name NOT LIKE '__delta_row%'),
+       count(DISTINCT file_name) FILTER (WHERE name LIKE '__delta_row%') > 0
+FROM parquet_schema('${FABRICATOR_DELTA_WRITE_DIR}/brid/t/*.parquet');
+----
+0	true
+
+query III
+SELECT ident, (s).a, (s).renamed FROM im.main.t ORDER BY ident;
+----
+1	10	11
+2	99	98
+3	30	31
+4	40	41
+
+query I
+SELECT count(*) >= 2 FROM duckdb_logs
+WHERE type LIKE 'Fabricator.Delta%' AND message LIKE '%delta native batch%'
+  AND message LIKE '%''children'': map {%' AND message LIKE '%''name'': ''renamed''%';
 ----
 true
 
