@@ -57,16 +57,27 @@ services:
       start_period: 20s
 
   minio:
-    # ⚠⚠ quay.io, NOT Docker Hub, and it is not interchangeable. `minio/minio` and `minio/mc` on Docker Hub
-    # became UNPULLABLE — "pull access denied ... repository does not exist or may require 'docker login'" —
-    # MEASURED 2026-09-13 both on a CI runner and from a developer box, and a PINNED older tag is gone too,
-    # so it is the repository that went rather than the tag. quay.io is MinIO's other official registry and
-    # serves both images.
+    # ⚠⚠ THIS IMAGE HAS MOVED TWICE, BOTH TIMES BECAUSE THE PUBLISHER WITHDREW IT — treat the registry as
+    # the fragile part of this rig, not the software. 2026-09-13: `minio/minio` + `minio/mc` on Docker Hub
+    # became unpullable, so we moved to quay.io. 2026-10-20: quay.io went the same way ("unauthorized"),
+    # and this time it is TOTAL -- the quay tag listing itself now demands authentication, Docker Hub
+    # denies access, and even the raw binaries at dl.min.io answer 410 Gone. MinIO no longer distributes
+    # a community build at all.
     #
-    # ⚠ It broke the SCHEDULED service tier from 2026-09-12 while local runs kept passing on an image cached
-    # since 2026-07-30. That is the usual shape: only a clean machine pulls, so only CI notices. Do not read
-    # a green local service tier as evidence that the rig can be provisioned from scratch.
-    image: quay.io/minio/minio:latest
+    # `bitnamilegacy/minio` is Bitnami's frozen mirror of the real MinIO (they moved their free images
+    # there in 2025) and is the newest freely obtainable build: 2025.7.23, which is ~6 weeks OLDER than
+    # the last image we had cached (RELEASE.2025-09-07). PINNED to an exact tag on purpose -- a moving
+    # `latest` on a frozen mirror is the worst of both worlds.
+    #
+    # ⚠ Both previous breakages hit the SCHEDULED service tier while local runs kept passing on a cached
+    # image; this one killed it from 2026-10-17. Do NOT read a green local service tier as evidence that
+    # the rig can be provisioned from scratch -- only a clean machine pulls, so only CI notices.
+    #
+    # ⚠ Bitnami conventions differ from the official image and all three matter: it runs as NON-ROOT
+    # (uid 1001), the data dir is /bitnami/minio/data (not /data), and the certs dir is /certs (not
+    # /root/.minio/certs). MINIO_DEFAULT_BUCKETS replaces the old `createbucket` service, which is why
+    # there is no longer a second image to lose.
+    image: bitnamilegacy/minio:2025.7.23-debian-12-r5
     # Survive a host reboot. Without this the containers exit and STAY exited — which happened on
     # 2026-07-30 (an overnight OS update rebooted the box) and surfaced only as the whole service tier
     # failing at each suite's first ATTACH with 'error 258: server not found'. `unless-stopped` rather
@@ -79,29 +90,21 @@ services:
     environment:
       - MINIO_ROOT_USER=miniouser
       - MINIO_ROOT_PASSWORD=miniosecret123
+      # Without this the bundled mc talks http to an https server and the bucket is never created.
+      - MINIO_SCHEME=https
+      # Replaces the old one-shot `createbucket` service. ⚠ It runs mc against our own self-signed
+      # endpoint, which only works because certs/CAs/public.crt is copied into mc's trust store by the
+      # image's setup.sh — see docker/certs/generate-certs.ps1, which writes that copy.
+      - MINIO_DEFAULT_BUCKETS=fabricator
     volumes:
-      - minio-data:/data
-      - ./certs:/root/.minio/certs:ro
-    command: server /data --console-address ":9001"
+      - minio-data:/bitnami/minio/data
+      - ./certs:/certs:ro
     healthcheck:
       test: ["CMD", "curl", "-k", "-f", "https://localhost:9000/minio/health/live"]
       interval: 5s
       timeout: 5s
       retries: 12
-      start_period: 5s
-
-  # One-shot bucket bootstrap: creates the `fabricator` test bucket (idempotent).
-  createbucket:
-    image: quay.io/minio/mc:latest
-    depends_on:
-      minio:
-        condition: service_healthy
-    entrypoint: >
-      /bin/sh -c "
-      mc alias set local https://minio:9000 miniouser miniosecret123 --api S3v4 --insecure &&
-      mc mb --ignore-existing local/fabricator --insecure &&
-      echo 'bucket fabricator ready'
-      "
+      start_period: 10s
 
 volumes:
   mssql-data:
