@@ -57,7 +57,9 @@ is wrapped as `SELECT * FROM <ref>`, replacing the original statement (`:1162-12
 | ducklake | NO (calls only the static `StripCatalogName` helper, for stored view SQL) | its own scan + delete files |
 | duckdb-iceberg | NO | its own scan + positional / Puffin deletes |
 
-No in-tree DuckDB test exercises it either: `test/extension/test_remote_optimizer.cpp` is an unrelated
+Its real consumer is DuckDB's own remote protocol: the **quack** extension together with the `CONNECT`
+statement (user, 2026-10-24 — quack is not checked out here, so that path was not read). No in-tree DuckDB
+test exercises it either: `test/extension/test_remote_optimizer.cpp` is an unrelated
 2024 OptimizerExtension demo that ships a serialized logical plan over a socket.
 
 ### 1.4 What it would take for SQL Server, and why it is not first
@@ -66,6 +68,16 @@ No in-tree DuckDB test exercises it either: `test/extension/test_remote_optimize
   not T-SQL (functions, `LIMIT`, literals, casts and quoting all differ). We would render the AST to T-SQL
   ourselves and use the `SupportsPushdown(expression)` veto for everything we cannot render — the same
   exactness discipline as §2, over a far larger surface.
+  - **A candidate transformation: Substrait.** The local repo `D:/repos/mssql-adbc` (an experiment by the
+    engineered-wood author) translates Substrait v0.107 plans to T-SQL — `SqlServerSubstrait.ToSql(plan)`,
+    emitter `Substrait/TSqlEmitter.cs`, function map `TSqlFunctionCatalog.cs` — and REJECTS what it cannot
+    translate with the same semantics (`SubstraitTranslationException`) instead of approximating, which is
+    exactly the exactness rule this needs. Its `substrait.md` (under its docs folder) names the three semantic differences it
+    accepts (UTF-16 strings, trailing-space comparison, trailing-zero binary comparison) and
+    `substrait-dialect-gaps.md` what a dialect file cannot express. DuckDB's side would be the
+    substrait extension (`get_substrait`), which is NOT linked into our build; whether it serves 2.0, and
+    whether a pushed DML node or the pre-bind AST (rather than a logical plan) can be turned into Substrait at
+    all, is unchecked. The renderer is C# and so is our bridge, which is what makes it worth a look.
 - **The statement is never bound locally.** For a pushed DELETE, `BindNode(DeleteQueryNode)` never runs,
   so there is no `RegisterDBModify` and no `CHANGED_ROWS` return type; the client sees whatever columns our
   TableRef returns. Transaction participation, `RETURNING`, and the affected-row count are ours to produce.
