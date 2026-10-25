@@ -264,6 +264,9 @@ int64_t TableDmlWhere(FabricatorHandle table, const std::string &spec_json, Arro
 // Partition statistics (ABI v95): the per-file count/bounds doc, or "{}" from an older bridge (no stats).
 std::string TablePartitionStats(FabricatorHandle table, const std::string &at_unit, const std::string &at_value);
 
+//! remote_translate (ABI v96): a Substrait plan to the provider's query, as the JSON doc in abi.h ("{}" = declined).
+std::string RemoteTranslate(FabricatorHandle catalog, const std::string &plan);
+
 // Provider-declared settings (see docs/settings-architecture.md). ListSettings fills `out` with ALL
 // registered providers' declared settings (six string columns: provider, name, type, default, description,
 // min); the host registers each as a DuckDB extension option at load. SetSetting pushes a setting's value

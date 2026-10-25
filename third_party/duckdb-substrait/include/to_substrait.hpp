@@ -95,7 +95,8 @@ private:
 	static bool IsPassthroughProjection(LogicalProjection &dproj, idx_t child_column_count, bool &needs_output_mapping);
 	//! Methods to transform different LogicalGet Types (e.g., Table, Parquet)
 	//! To Substrait;
-	void TransformTableScanToSubstrait(LogicalGet &dget, substrait::ReadRel *sget) const;
+	void TransformTableScanToSubstrait(LogicalGet &dget, substrait::ReadRel *sget,
+	                                   const unordered_set<idx_t> &read_columns) const;
 	void TransformParquetScanToSubstrait(LogicalGet &dget, substrait::ReadRel *sget, BindInfo &bind_info,
 	                                     const FunctionData &bind_data) const;
 

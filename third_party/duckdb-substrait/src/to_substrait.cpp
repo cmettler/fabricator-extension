@@ -1867,7 +1867,9 @@ void DuckDBToSubstrait::TransformWindowFunction(BoundWindowExpression &dwin,
 			if (children.size() > 1) {
 				add_constant(WindowConstant(context, *children[1], "offset"), LogicalType::INTEGER);
 			}
-			if (children.size() > 2) {
+			// a NULL default is the default: DuckDB 2.0 binds lag(x) with a typed NULL default, left out here
+			if (children.size() > 2 &&
+			    !(children[2]->IsFoldable() && ExpressionExecutor::EvaluateScalar(context, *children[2]).IsNull())) {
 				add_argument(*children[2]);
 			}
 			name = dwin.WindowFunction()->window_enum == ExpressionType::WINDOW_LAG ? "lag" : "lead";
@@ -1980,10 +1982,13 @@ substrait::Type DuckDBToSubstrait::DuckToSubstraitType(const LogicalType &type, 
 		date_type->set_nullability(type_nullability);
 		return s_type;
 	}
-	case LogicalTypeId::TIME_TZ:
-	case LogicalTypeId::TIME: {
-		auto time_type = s_type.mutable_precision_timestamp();
-		time_type->set_precision(6); // microseconds
+	// [FABRICATOR-PATCH: OFFER-READY] upstream declared TIME (and TIME WITH TIME ZONE) as a precision TIMESTAMP,
+	// while a TIME literal goes out as precision_time: a consumer then compares a time column as a timestamp.
+	// TIME is precision_time; TIME_NS too, with 9 digits; TIME_TZ has no Substrait type and declines.
+	case LogicalTypeId::TIME:
+	case LogicalTypeId::TIME_NS: {
+		auto time_type = s_type.mutable_precision_time();
+		time_type->set_precision(type.id() == LogicalTypeId::TIME ? 6 : 9);
 		time_type->set_nullability(type_nullability);
 		return s_type;
 	}
@@ -2107,7 +2112,8 @@ set<idx_t> GetNotNullConstraintCol(const TableCatalogEntry &tbl) {
 	return not_null;
 }
 
-void DuckDBToSubstrait::TransformTableScanToSubstrait(LogicalGet &dget, substrait::ReadRel *sget) const {
+void DuckDBToSubstrait::TransformTableScanToSubstrait(LogicalGet &dget, substrait::ReadRel *sget,
+                                                      const unordered_set<idx_t> &read_columns) const {
 	// [FABRICATOR-PATCH: OFFER-READY] Upstream casts the bind data to DuckDB's own TableScanBindData without a
 	// check, but any catalog's scan may report ScanType::TABLE (a foreign catalog's does), which makes that cast
 	// undefined behaviour. DuckDB 2.0 asks the function for its table (get_table_entry); use that, and name the
@@ -2134,7 +2140,16 @@ void DuckDBToSubstrait::TransformTableScanToSubstrait(LogicalGet &dget, substrai
 		auto column_statistics = GetColumnStatistics(context, dget.function, &table_scan_bind_data, i);
 		bool not_null = not_null_constraint.find(i) != not_null_constraint.end();
 		auto new_type = type_info->add_types();
-		*new_type = DuckToSubstraitType(cur_type, column_statistics.get(), not_null);
+		// [FABRICATOR-PATCH: OURS-BY-DESIGN] the base schema lists every column of the table; one the query does not
+		// read and whose type has no Substrait equivalent is declared opaque (binary) instead of failing the plan
+		try {
+			*new_type = DuckToSubstraitType(cur_type, column_statistics.get(), not_null);
+		} catch (NotImplementedException &) {
+			if (read_columns.count(i)) {
+				throw;
+			}
+			new_type->mutable_binary()->set_nullability(substrait::Type_Nullability_NULLABILITY_NULLABLE);
+		}
 	}
 	base_schema->set_allocated_struct_(type_info.release());
 	sget->set_allocated_base_schema(base_schema.release());
@@ -2243,6 +2258,14 @@ substrait::Rel *DuckDBToSubstrait::TransformGet(LogicalOperator &dop) {
 		}
 	}
 
+	// [FABRICATOR-PATCH: OFFER-READY] a row id (or any virtual column) has no base-schema field: upstream put a
+	// placeholder item (field 0) in the mask, so `SELECT rowid` read the table's FIRST column. Declined.
+	for (auto column : output_columns) {
+		if (column->IsRowIdColumn() || column->IsVirtualColumn()) {
+			throw NotImplementedException("to_substrait: row id and virtual columns are not supported");
+		}
+	}
+
 	bool has_pushdown_extract = false;
 	for (auto column : output_columns) {
 		if (column->IsPushdownExtract()) {
@@ -2319,9 +2342,14 @@ substrait::Rel *DuckDBToSubstrait::TransformGet(LogicalOperator &dop) {
 
 	// Add Table Schema
 	switch (bind_info.type) {
-	case ScanType::TABLE:
-		TransformTableScanToSubstrait(dget, sget);
+	case ScanType::TABLE: {
+		unordered_set<idx_t> read_columns;
+		for (auto column : output_columns) {
+			read_columns.insert(column->GetPrimaryIndex());
+		}
+		TransformTableScanToSubstrait(dget, sget, read_columns);
 		break;
+	}
 	case ScanType::PARQUET:
 		TransformParquetScanToSubstrait(dget, sget, bind_info, *dget.bind_data);
 		break;

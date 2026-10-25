@@ -51,6 +51,9 @@ internal sealed class TSqlEmitter
     /// <summary>The collation given to string values, or null.</summary>
     public string? Collation => _collation;
 
+    /// <summary>[FABRICATOR-PATCH: OURS-BY-DESIGN] The server takes IGNORE NULLS in window functions (SQL Server 2022+).</summary>
+    public bool SupportsIgnoreNulls { get; init; } = true;
+
     /// <summary>
     /// Writes the query. With <paramref name="nested"/>, the query is meant
     /// to be used as a derived table, so a final ORDER BY (which T-SQL does not
@@ -80,6 +83,35 @@ internal sealed class TSqlEmitter
 
         columns = block.Columns.Select((c, i) => new SqlColumn(names[i], c.Expr, c.IsBare, c.Raw)).ToList();
         return Render(block, SelectList(block, names), keepOrder: !nested);
+    }
+
+    /// <summary>
+    /// [FABRICATOR-PATCH: OURS-BY-DESIGN] Writes the query for the remote pushdown: the result columns are
+    /// named <c>c0</c>…<c>cN</c> (the host casts them to DuckDB's own types and names), and the final ORDER BY
+    /// items are selected too, as <c>k0</c>…<c>kM</c>, so the host can sort by them again — a pushed result
+    /// reaches the user through a subquery, which keeps no order. <paramref name="orderDescending"/> gives
+    /// each key's direction; SQL Server sorts nulls as the lowest values, which the host must do as well.
+    /// </summary>
+    public string EmitPushdown(RootRel root, out int columnCount, out List<bool> orderDescending)
+    {
+        var block = EmitRel(root.Input);
+        if (block.Columns.Count == 0)
+        {
+            throw SubstraitTranslationException.Unsupported("The plan's result has no columns.");
+        }
+        if (root.Names != null && root.Names.Count > 0 && root.Names.Count != block.Columns.Count)
+        {
+            throw SubstraitTranslationException.MalformedPlan($"RelRoot has {root.Names.Count} names but its input has {block.Columns.Count} columns.");
+        }
+        columnCount = block.Columns.Count;
+        var items = SelectList(block, Enumerable.Range(0, columnCount).Select(i => "c" + i.ToString(CultureInfo.InvariantCulture)).ToList());
+        orderDescending = new List<bool>();
+        for (int i = 0; i < block.OrderBy.Count; i++)
+        {
+            items.Add((block.OrderBy[i].Sql, "k" + i.ToString(CultureInfo.InvariantCulture)));
+            orderDescending.Add(block.OrderBy[i].Descending);
+        }
+        return Render(block, items, keepOrder: true);
     }
 
     #region Relations
@@ -387,6 +419,7 @@ internal sealed class TSqlEmitter
                 // T-SQL rejects constant ORDER BY items, and they don't change the order.
                 continue;
             }
+            Comparable(key.Type, key.Value); // [FABRICATOR-PATCH: OURS-BY-DESIGN] binary values decline
             if (key.Type.Kind == TypeKind.Uuid)
             {
                 throw SubstraitTranslationException.Unsupported("Sorting by uuid values is not supported; SQL Server orders uniqueidentifier by its last bytes first.");
@@ -477,7 +510,7 @@ internal sealed class TSqlEmitter
 
         var keys = groupingExpressions.Select(e => Render(e, block.Columns)).ToList();
         // [FABRICATOR-PATCH: OURS-BY-DESIGN] a string groups by its exact key and is read back from it
-        keys = keys.Select(k => k.Type.IsStringLike ? new SqlExpr(StringKey(k.Value), null, k.Type, k.Props) : k).ToList();
+        keys = keys.Select(k => k.Type.IsStringLike ? new SqlExpr(StringKey(k.Value), null, k.Type, k.Props) : new SqlExpr(Comparable(k.Type, k.Value), null, k.Type, k.Props)).ToList();
         string Out(SqlExpr key, string value) => key.Type.IsStringLike ? StringFromKey(value) : value;
         var measures = measureList.Select(m => TSqlFunctionCatalog.WriteAggregate(this, m, block.Columns)).ToList();
 
@@ -581,7 +614,7 @@ internal sealed class TSqlEmitter
             {
                 continue; // a constant puts every row in one partition, as no partition does
             }
-            partitions.Add(e.Type.IsStringLike ? StringKey(e.Value) : e.Value);
+            partitions.Add(e.Type.IsStringLike ? StringKey(e.Value) : Comparable(e.Type, e.Value));
         }
         foreach (var sort in rel.Sorts)
         {
@@ -792,7 +825,7 @@ internal sealed class TSqlEmitter
 
         // [FABRICATOR-PATCH: OURS-BY-DESIGN] a set operation that compares rows compares strings by collation: decline those
         // over strings (UNION ALL compares nothing).
-        if (rel.Op != F.SetOp_UnionAll && types.Any(t => t.IsStringLike))
+        if (rel.Op != F.SetOp_UnionAll && types.Any(t => t.IsStringLike || t.IsBinaryLike))
         {
             throw SubstraitTranslationException.Unsupported("set operations that compare string columns are not supported (collation semantics).");
         }
@@ -1138,6 +1171,16 @@ internal sealed class TSqlEmitter
     /// <summary>[FABRICATOR-PATCH: OURS-BY-DESIGN] Whether a rendered value is a plain column reference.</summary>
     internal static bool IsColumnReference(string? raw) => raw != null && s_columnReference.IsMatch(raw);
 
+    /// <summary>
+    /// [FABRICATOR-PATCH: OURS-BY-DESIGN] A value about to be compared, grouped or sorted. SQL Server ignores
+    /// trailing zero bytes when it compares binary values (0x01 = 0x0100), DuckDB does not, so binary values
+    /// decline.
+    /// </summary>
+    internal static string Comparable(SType type, string value)
+        => type.IsBinaryLike
+            ? throw SubstraitTranslationException.Unsupported("comparing, grouping or sorting binary values is not supported; SQL Server ignores trailing zero bytes.")
+            : value;
+
     /// <summary>[FABRICATOR-PATCH: OURS-BY-DESIGN] The string a <see cref="StringKey"/> was made from.</summary>
     internal static string StringFromKey(string key)
         => $"CONVERT(nvarchar(max), REPLACE(REPLACE(LEFT({key}, LEN({key}) - 1), CHAR(1) + CHAR(1), CHAR(0)), CHAR(1) + CHAR(2), CHAR(1)))";
@@ -1219,6 +1262,7 @@ internal sealed class TSqlEmitter
         var options = expr.Options.Select(o => Render(o, scope)).ToList();
         var props = options.Aggregate(value.Props, (p, o) => p | o.Props);
         // T-SQL's IN is three-valued, like Substrait's.
+        Comparable(value.Type, value.Value); // [FABRICATOR-PATCH: OURS-BY-DESIGN] binary values decline
         if (value.Type.IsStringLike) // [FABRICATOR-PATCH: OURS-BY-DESIGN] strings compare by their exact key
         {
             string exact = $"({StringKey(value.Value)} IN ({string.Join(", ", options.Select(o => StringKey(o.Value)))}))";
@@ -1250,7 +1294,7 @@ internal sealed class TSqlEmitter
             {
                 var o = Render(record[i], scope);
                 props |= o.Props;
-                terms.Add(values[i].Type.IsStringLike ? $"{StringKey(values[i].Value)} = {StringKey(o.Value)}" : $"{values[i].Value} = {o.Value}"); // [FABRICATOR-PATCH: OURS-BY-DESIGN] exact string equality
+                terms.Add(values[i].Type.IsStringLike ? $"{StringKey(values[i].Value)} = {StringKey(o.Value)}" : $"{Comparable(values[i].Type, values[i].Value)} = {o.Value}"); // [FABRICATOR-PATCH: OURS-BY-DESIGN] exact string equality
             }
             records.Add("(" + string.Join(" AND ", terms) + ")");
         }
@@ -1359,6 +1403,13 @@ internal sealed class TSqlEmitter
                 break;
             case TypeKind.I8:
                 throw SubstraitTranslationException.Unsupported("Casts to i8 are not supported; SQL Server's tinyint is unsigned.");
+            case TypeKind.I16 or TypeKind.I32 or TypeKind.I64 when source.IsFloat:
+                // [FABRICATOR-PATCH: OURS-BY-DESIGN] DuckDB rounds a float half to even, T-SQL truncates and its ROUND goes half away from zero
+                throw SubstraitTranslationException.Unsupported("Casts from floating point to integers are not supported; DuckDB rounds half to even.");
+            case TypeKind.I16 or TypeKind.I32 or TypeKind.I64 when source.Kind == TypeKind.Decimal && source.Scale > 0:
+                // [FABRICATOR-PATCH: OURS-BY-DESIGN] DuckDB rounds a decimal half away from zero, T-SQL's CAST truncates; ROUND first (measured)
+                text = Convert($"ROUND(CAST({input.Value} AS decimal(38,{source.Scale})), 0)", TSql.RequireTypeName(target));
+                break;
             default:
                 if (source.IsStringLike && target.Kind == TypeKind.Uuid)
                 {

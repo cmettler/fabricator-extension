@@ -508,7 +508,7 @@ originals. Gaps are fine if they decline; wrong answers are not.
   SELECT is pushed). Fixed beyond the port: the table scan names its table through `LogicalGet::GetTable()` with
   schema + table instead of an unchecked cast to DuckDB's own bind data; `TRY_CAST` and exclusive `BETWEEN`
   bounds decline (both would be widened).
-- **Build**: `-DFABRICATOR_SUBSTRAIT=ON` (default OFF) with protobuf 5.29.3 + substrait-protobuf 0.102.0 from a
+- **Build** (as of step 2; since §3.12 the producer is mandatory and the option is gone): `-DFABRICATOR_SUBSTRAIT=ON` (default OFF) with protobuf 5.29.3 + substrait-protobuf 0.102.0 from a
   manifest-mode vcpkg install (`CMAKE_PREFIX_PATH`, and `Protobuf_PROTOC_EXECUTABLE`, which protobuf's config
   demands even though nothing is generated). MSVC builds it unchanged.
 - **The pipeline** (probe level 5): bind a copy → `RecursiveDependentJoinPlanner` + `DecorrelateIndependent` →
@@ -686,6 +686,52 @@ decline (6 in the producer, 3 in the emitter).
 - ⚠ IGNORE NULLS needs **SQL Server 2022+**; the integration must gate it by server version (Fabric Warehouse
   unmeasured).
 - ⚠ Not measured: performance on columnstore (batch-mode window aggregate).
+
+### 3.12 Integration — ABI v96, the Substrait path replaces the hand-written renderer (2026-10-25)
+
+`RemoteExecute` (src/catalog/fabricator_remote_select.cpp, `SubstraitPushdown`) binds a copy of the node, flattens
+it, runs the one `FilterPushdown` pass, serializes it with the vendored `to_substrait`, and hands the bytes to the
+provider through `remote_translate` (ABI v96). SQL Server translates with the vendored emitter
+(`SqlServerSubstrait.TranslatePushdown`) into a query whose columns are `c0…` plus the final ORDER BY keys `k0…`;
+the host wraps it as `SELECT CAST(c0 AS <bound type>) AS <bound name>, … FROM fabricator_query(…) ORDER BY k0 …`
+(nulls lowest). Gated: `remote_pushdown` on, not a warehouse, SQL Server 2019+ / Azure SQL (UTF-8 collations, §3.6);
+IGNORE NULLS needs 2022+. **User decision (2026-10-25): this is THE path.** The §4.1–§4.3 renderer is deleted,
+the build option is gone, and protobuf + substrait-protobuf come from `deps/substrait/vcpkg.json` (CI: the shared
+build action, with the install root cached).
+
+**Every query shape is offered now** (SELECT, set operations, CTE nodes); RemoteExecute declines what does not
+translate. Two host rules on top: a plan of scans / filters / projections / sorts only stays on the table scan
+(nothing to gain, and the scan keeps its statistics), and a result with two columns of one name stays local
+(DuckDB re-wraps the pushed node as `SELECT * FROM <ref>`, so `SELECT a.id, b.id` would come back as `id, id_1`).
+
+**What the gate and the differentials found — every one a WRONG ANSWER until declined, all measured against DuckDB
+(type matrix 80 queries, string functions 38, expressions 76; 0 wrong after the fixes):**
+
+| shape | SQL Server | DuckDB | now |
+|---|---|---|---|
+| `lower` / `upper` | maps 298 / 308 BMP code points differently (Greek symbol forms, ß, µ, ſ, IPA) — measured over all 63 487 | Unicode | declined (and so is `nocase`, bound as `lower`) |
+| `length`, `substring`, `strpos`, LIKE `_` | UTF-16 code units under `BIN2_UTF8`: `length('𝄞x𝄞')` 5, a surrogate pair split | code points | declined; LIKE without `_` pushes |
+| `reverse` | code units | grapheme clusters (é + U+0301 keeps its accent) | declined |
+| `regexp_replace` | every match | the first (without 'g') | all `regexp_*` declined |
+| binary `=`, GROUP BY, ORDER BY | ignores trailing zero bytes (0x01 = 0x0100) | exact | declined |
+| float → integer CAST | truncates; ROUND goes half away from zero | half to even | declined |
+| decimal → integer CAST | truncates | half away from zero | `CAST(ROUND(x, 0) AS int)` — exact |
+| decimal arithmetic past precision 38 | reduces the scale and rounds | keeps the scale | declined where the server's scale falls below the result's |
+| float `/` by a value that may be 0 | error | inf / nan | declined unless the divisor is a non-zero constant |
+| `any_value` (and `nocase` GROUP BY) | MAX | first | declined |
+| `SELECT rowid …` (upstream to_substrait) | — | — | upstream read the table's FIRST column; declined |
+| TIME columns (upstream to_substrait) | declared as a TIMESTAMP | — | `precision_time`, TIME_NS with 9 digits |
+
+- ⚠ A table with ONE column of a type Substrait cannot express declined EVERY query on it (to_substrait writes
+  the whole base schema): an unread column of such a type is now declared opaque (binary).
+- ⚠ DuckDB 2.0 binds `lag(x)` with a typed NULL default; it is left out (T-SQL's default is NULL too), or every
+  lag/lead over strings declined on the NULL cast.
+- An improvement over the hand-written renderer: it computed integer intermediates in BIGINT and answered where
+  DuckDB overflows; the plan carries DuckDB's INTEGER now, so both paths raise the overflow.
+- Gate: `verify_remote_select_mssql` 373 → 439 (§2 rewritten: what still stays local; §2b the former declines,
+  each with a differential; §13 windows; §14 the declines above). Mutants killed at their own rows: the binary
+  decline removed (the binary routing row), the decimal ROUND removed (the cast differential).
+- ⚠ Not measured: columnstore segment elimination; Fabric Warehouse (not offered); CI (needs protobuf).
 
 ## 4. Order of work
 

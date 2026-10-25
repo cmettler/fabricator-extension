@@ -73,6 +73,8 @@ readonly struct SType : IEquatable<SType>
     public bool IsKnown => Kind != TypeKind.Unknown;
 
     public bool IsStringLike => Kind is TypeKind.String or TypeKind.VarChar or TypeKind.FixedChar;
+    /// <summary>[FABRICATOR-PATCH: OURS-BY-DESIGN] binary and fixed binary.</summary>
+    public bool IsBinaryLike => Kind is TypeKind.Binary or TypeKind.FixedBinary;
 
     public bool IsInteger => Kind is TypeKind.I8 or TypeKind.I16 or TypeKind.I32 or TypeKind.I64;
 

@@ -1,0 +1,7 @@
+{
+  "name": "fabricator-substrait-deps",
+  "version-string": "0",
+  "description": "Build dependencies of the Substrait producer behind the remote pushdown (third_party/duckdb-substrait). Installed with --x-manifest-root into a root of its own and handed to CMake via CMAKE_PREFIX_PATH; see .github/actions/build-extension.",
+  "dependencies": [ "protobuf", "substrait-protobuf" ],
+  "overrides": [ { "name": "substrait-protobuf", "version": "0.102.0" } ]
+}

@@ -282,6 +282,8 @@ internal static class TSqlFunctionCatalog
         {
             name = name.Substring(0, name.Length - "_ignore_nulls".Length);
             ignoreNulls = true;
+            if (!e.SupportsIgnoreNulls)
+                throw SubstraitTranslationException.Unsupported($"{name} IGNORE NULLS needs SQL Server 2022 or later.");
             if (name is not ("lag" or "lead" or "first_value" or "last_value"))
                 throw SubstraitTranslationException.UnsupportedFunction(call.Function.DisplayName);
         }
@@ -388,6 +390,13 @@ internal static class TSqlFunctionCatalog
             throw SubstraitTranslationException.Unsupported($"{call.Function.DisplayName}: no aggregate call to apply the window to.");
         return SqlExpr.Of(text, aggregate.Type, props);
     }
+
+    private static bool IsNonZeroConstant(Expr? e) => e switch
+    {
+        LiteralExpr { IsNull: false } lit => lit.Type.IsFloat ? lit.FloatValue != 0 : lit.Type.IsInteger ? lit.IntValue != 0 : false,
+        CastExpr cast => IsNonZeroConstant(cast.Input),
+        _ => false,
+    };
 
     private static bool IsNullValue(Expr? e) => e is LiteralExpr { IsNull: true } || e is CastExpr { Input: LiteralExpr { IsNull: true } };
 
@@ -687,7 +696,7 @@ internal static class TSqlFunctionCatalog
     }
 
     /// <summary>[FABRICATOR-PATCH: OURS-BY-DESIGN] Argument <paramref name="i"/>, a string as its exact key.</summary>
-    private static string K(TSqlCall c, int i) => c.T(i).IsStringLike ? TSqlEmitter.StringKey(c.V(i)) : c.V(i);
+    private static string K(TSqlCall c, int i) => c.T(i).IsStringLike ? TSqlEmitter.StringKey(c.V(i)) : TSqlEmitter.Comparable(c.T(i), c.V(i));
 
     /// <summary>
     /// [FABRICATOR-PATCH: OFFER-READY] An average computed as its exact sum divided by its count, in float; null
@@ -734,7 +743,12 @@ internal static class TSqlFunctionCatalog
             Scalar(ArithmeticUrn, name, op, "INFIX", SameAsFirst, c => $"({c.V(0)} {op} {c.V(1)})",
                 new TSqlFunctionVariant(ints, error), new TSqlFunctionVariant(floats, ieee));
         }
-        Scalar(ArithmeticUrn, "divide", "/", "INFIX", SameAsFirst, Divide,
+        // [FABRICATOR-PATCH: OURS-BY-DESIGN] a float divided by zero is inf / nan in DuckDB and an error in T-SQL, which has neither value:
+        // a float division declines unless the divisor is a non-zero constant (measured: f / (t - t))
+        Scalar(ArithmeticUrn, "divide", "/", "INFIX", SameAsFirst,
+            c => (c.T(0).IsFloat || c.T(1).IsFloat) && !IsNonZeroConstant(c.Args[1].Value)
+                ? throw c.Unsupported("a float division by a value that may be zero is not supported; DuckDB returns inf, SQL Server fails.")
+                : Divide(c),
             new TSqlFunctionVariant(ints, ("on_division_by_zero", "ERROR"), ("on_domain_error", "ERROR"), error),
             new TSqlFunctionVariant(ints, ("on_division_by_zero", "NULL"), ("on_domain_error", "NULL"), error),
             new TSqlFunctionVariant(floats, ("on_division_by_zero", "ERROR"), ("on_domain_error", "ERROR"), ieee),
@@ -814,7 +828,17 @@ internal static class TSqlFunctionCatalog
         // The result is cast to the type Substrait derives, which for division differs from SQL Server's.
         foreach (var (name, op) in new[] { ("add", "+"), ("subtract", "-"), ("multiply", "*"), ("divide", "/") })
         {
-            Scalar(ArithmeticDecimalUrn, name, op, "INFIX", t => DecimalResult(name, t), c => c.Cast($"({c.V(0)} {op} {c.V(1)})"),
+            // [FABRICATOR-PATCH: OURS-BY-DESIGN] SQL Server reduces the scale of a result whose precision exceeds 38 and rounds (measured:
+            // decimal(10,2) * decimal(38,10)); where its scale falls below the plan's, the answer differs: decline
+            Scalar(ArithmeticDecimalUrn, name, op, "INFIX", t => DecimalResult(name, t), c =>
+            {
+                var server = DecimalResult(name, c.ArgTypes);
+                if (c.ResultType.Kind == TypeKind.Decimal && server.Kind == TypeKind.Decimal && server.Scale < c.ResultType.Scale)
+                {
+                    throw c.Unsupported($"SQL Server computes this at scale {server.Scale}, below the result's {c.ResultType.Scale}.");
+                }
+                return c.Cast($"({c.V(0)} {op} {c.V(1)})");
+            },
                 new TSqlFunctionVariant(["dec_dec"], error));
         }
         Scalar(ArithmeticDecimalUrn, "negate", "-", "PREFIX", SameAsFirst, c => $"(- {c.V(0)})", V("dec"));
@@ -894,19 +918,24 @@ internal static class TSqlFunctionCatalog
         Condition(StringUrn, "contains", "LIKE", "INFIX", c => $"({c.S(0)} LIKE {LikePattern(c, 1, "%", "%", escapeWildcards: true)})",
             new TSqlFunctionVariant(["str_str"], caseSensitive), new TSqlFunctionVariant(["str_str"], caseInsensitive));
         // SUBSTRING counts positions before the first character, as LEFT_OF_BEGINNING does.
+        // [FABRICATOR-PATCH: OURS-BY-DESIGN] positions and lengths decline: SQL Server counts UTF-16 code units where DuckDB counts code points
+        // (measured on U+1D11E: LEN 2, SUBSTRING splits the surrogate pair, CHARINDEX one too far), and REVERSE reverses
+        // code units where DuckDB keeps a base character and its combining marks together
         Scalar(StringUrn, "substring", "SUBSTRING", "FUNCTION", Str,
-            c => c.Count >= 3 ? $"SUBSTRING({c.V(0)}, {c.V(1)}, {c.V(2)})" : $"SUBSTRING({c.V(0)}, {c.V(1)}, 2147483647)",
+            c => throw c.Unsupported("SQL Server counts string positions in UTF-16 code units."),
             new TSqlFunctionVariant(["str_i32_i32", "str_i32"], ("negative_start", "LEFT_OF_BEGINNING")));
-        Scalar(StringUrn, "strpos", "CHARINDEX", "FUNCTION", Long, StrPos,
+        Scalar(StringUrn, "strpos", "CHARINDEX", "FUNCTION", Long, c => throw c.Unsupported("SQL Server counts string positions in UTF-16 code units."),
             new TSqlFunctionVariant(["str_str"], caseSensitive), new TSqlFunctionVariant(["str_str"], caseInsensitive));
         Scalar(StringUrn, "replace", "REPLACE", "FUNCTION", Str, c => $"REPLACE({c.MaxString(0)}, {c.S(1)}, {c.S(2)})",
             new TSqlFunctionVariant(["str_str_str"], caseSensitive), new TSqlFunctionVariant(["str_str_str"], caseInsensitive));
         Scalar(StringUrn, "repeat", "REPLICATE", "FUNCTION", Str, c => $"REPLICATE({c.MaxString(0)}, {c.V(1)})", V("str_i64"));
-        Scalar(StringUrn, "reverse", "REVERSE", "FUNCTION", Str, c => $"REVERSE({c.V(0)})", V("str"));
-        Scalar(StringUrn, "lower", "LOWER", "FUNCTION", Str, c => $"LOWER({c.V(0)})", new TSqlFunctionVariant(["str"], ("char_set", "UTF8")));
-        Scalar(StringUrn, "upper", "UPPER", "FUNCTION", Str, c => $"UPPER({c.V(0)})", new TSqlFunctionVariant(["str"], ("char_set", "UTF8")));
+        Scalar(StringUrn, "reverse", "REVERSE", "FUNCTION", Str, c => throw c.Unsupported("SQL Server reverses UTF-16 code units."), V("str"));
+        // [FABRICATOR-PATCH: OURS-BY-DESIGN] LOWER / UPPER decline: measured against DuckDB over every BMP code point, LOWER maps 298 of them
+        // differently and UPPER 308 (Greek symbol forms, ß, µ, ſ, IPA letters)
+        Scalar(StringUrn, "lower", "LOWER", "FUNCTION", Str, c => throw c.Unsupported("SQL Server's LOWER differs from DuckDB's for some characters."), new TSqlFunctionVariant(["str"], ("char_set", "UTF8")));
+        Scalar(StringUrn, "upper", "UPPER", "FUNCTION", Str, c => throw c.Unsupported("SQL Server's UPPER differs from DuckDB's for some characters."), new TSqlFunctionVariant(["str"], ("char_set", "UTF8")));
         // LEN ignores trailing spaces; replacing spaces (with one character each) counts them.
-        Scalar(StringUrn, "char_length", "LEN", "FUNCTION", Long, c => $"CAST(LEN(REPLACE({c.V(0)}, N' ', N'.')) AS bigint)", V("str"));
+        Scalar(StringUrn, "char_length", "LEN", "FUNCTION", Long, c => throw c.Unsupported("SQL Server counts string lengths in UTF-16 code units."), V("str"));
         Scalar(StringUrn, "octet_length", "DATALENGTH", "FUNCTION", Long, c => $"CAST(DATALENGTH({Utf8(c)}) AS bigint)", V("str"));
         Scalar(StringUrn, "bit_length", "DATALENGTH", "FUNCTION", Long, c => $"(CAST(DATALENGTH({Utf8(c)}) AS bigint) * 8)", V("str"));
         Scalar(StringUrn, "ltrim", "LTRIM", "FUNCTION", Str, c => $"LTRIM({c.V(0)}, {TrimCharacters(c)})", V("str_str"));
@@ -916,16 +945,18 @@ internal static class TSqlFunctionCatalog
         Scalar(StringUrn, "right", "RIGHT", "FUNCTION", Str, c => $"RIGHT({c.V(0)}, {c.V(1)})", V("str_i32"));
         var regexDefaults = new[] { ("multiline", "MULTILINE_DISABLED"), ("dotall", "DOTALL_DISABLED") };
         TSqlFunctionVariant RegexVariant(string[] impls, (string, string) caseOption) => new(impls, regexDefaults.Append(caseOption).ToArray());
-        Scalar(StringUrn, "regexp_replace", "REGEXP_REPLACE", "FUNCTION", Str, RegexpReplace,
+        // [FABRICATOR-PATCH: OURS-BY-DESIGN] regular expressions decline: measured, REGEXP_REPLACE replaces every match where DuckDB's
+        // regexp_replace replaces the first, and positions are UTF-16 code units
+        Scalar(StringUrn, "regexp_replace", "REGEXP_REPLACE", "FUNCTION", Str, c => throw c.Unsupported("SQL Server's regular expressions differ from DuckDB's."),
             RegexVariant(["str_str_str", "str_str_str_i64_i64"], caseSensitive), RegexVariant(["str_str_str", "str_str_str_i64_i64"], caseInsensitive));
         Scalar(StringUrn, "regexp_match_substring", "REGEXP_SUBSTR", "FUNCTION", Str,
-            c => $"REGEXP_SUBSTR({c.V(0)}, {RegexPattern(c)}, {RegexInt(c, 2, "1")}, {RegexInt(c, 3, "1")}, {RegexFlags(c)}, {RegexInt(c, 4, "0")})",
+            c => throw c.Unsupported("SQL Server's regular expressions differ from DuckDB's."),
             RegexVariant(["str_str", "str_str_i64_i64_i64"], caseSensitive), RegexVariant(["str_str", "str_str_i64_i64_i64"], caseInsensitive));
         Scalar(StringUrn, "regexp_count_substring", "REGEXP_COUNT", "FUNCTION", Long,
-            c => $"CAST(REGEXP_COUNT({c.V(0)}, {RegexPattern(c)}, {RegexInt(c, 2, "1")}, {RegexFlags(c)}) AS bigint)",
+            c => throw c.Unsupported("SQL Server's regular expressions differ from DuckDB's."),
             RegexVariant(["str_str", "str_str_i64"], caseSensitive), RegexVariant(["str_str", "str_str_i64"], caseInsensitive));
         Scalar(StringUrn, "regexp_strpos", "REGEXP_INSTR", "FUNCTION", Long,
-            c => $"CAST(REGEXP_INSTR({c.V(0)}, {RegexPattern(c)}, {c.V(2)}, {c.V(3)}, 0, {RegexFlags(c)}) AS bigint)",
+            c => throw c.Unsupported("SQL Server's regular expressions differ from DuckDB's."),
             RegexVariant(["str_str_i64_i64"], caseSensitive), RegexVariant(["str_str_i64_i64"], caseInsensitive));
         list.Add(new TSqlFunction(StringUrn, "string_agg", TSqlFunctionKind.Aggregate, "STRING_AGG", "FUNCTION", [V("str_str")], Str, StringAgg, predicate: false)
         {
@@ -981,7 +1012,9 @@ internal static class TSqlFunctionCatalog
         // ── functions_aggregate_generic / functions_aggregate_approx ────
         Aggregate(AggregateGenericUrn, "count", "COUNT_BIG", t => SType.I64.WithNullable(false), Count, distinct: true,
             new TSqlFunctionVariant(["any", ""], error));
-        Aggregate(AggregateGenericUrn, "any_value", "MAX", SameAsFirst, AnyValue, distinct: false,
+        // [FABRICATOR-PATCH: OURS-BY-DESIGN] any_value declines: DuckDB returns ONE of the values (first() in practice) and MAX a different one
+        Aggregate(AggregateGenericUrn, "any_value", "MAX", SameAsFirst,
+            c => throw c.Unsupported("any_value picks a value other than DuckDB's."), distinct: false,
             new TSqlFunctionVariant(["any"], ("ignore_nulls", "TRUE")), new TSqlFunctionVariant(["any"], ("ignore_nulls", "FALSE")));
         Aggregate(AggregateApproxUrn, "approx_count_distinct", "APPROX_COUNT_DISTINCT", t => SType.I64.WithNullable(false),
             c => $"APPROX_COUNT_DISTINCT({c.AggArg(0)})", distinct: false, V("any"));
@@ -1127,6 +1160,10 @@ internal static class TSqlFunctionCatalog
         {
             return c.Filter == null ? "COUNT_BIG(*)" : $"COUNT_BIG(CASE WHEN {c.FilterPredicate()} THEN 1 END)";
         }
+        if (c.Distinct && c.T(0).IsBinaryLike)
+        {
+            TSqlEmitter.Comparable(c.T(0), "");
+        }
         if (c.Distinct && c.T(0).IsStringLike) // [FABRICATOR-PATCH: OURS-BY-DESIGN] distinct strings by their exact key
         {
             return $"COUNT_BIG(DISTINCT {TSqlEmitter.StringKey(c.AggArg(0))})";
@@ -1186,6 +1223,12 @@ internal static class TSqlFunctionCatalog
         string? collation = c.CaseCollation();
 
         string? literal = c.StringLiteral(index);
+        if (!escapeWildcards && (literal == null || literal.Contains('_')))
+        {
+            // [FABRICATOR-PATCH: OURS-BY-DESIGN] LIKE's `_` matches one UTF-16 code unit on the server and one code point in DuckDB
+            // (measured: N'𝄞' LIKE N'_' is false on the server); a pattern that is not a constant may hold one
+            throw c.Unsupported("a LIKE pattern with `_`, or one that is not a constant, is not supported; SQL Server's `_` matches a UTF-16 code unit.");
+        }
         if (literal != null)
         {
             string escaped = literal.Replace("[", "[[]");

@@ -5172,8 +5172,17 @@ git submodule update --init          # NOT --recursive — see engineered-wood b
 This repo's default branch is **`v1.5-variegata`**, matching DuckDB's own name for the 1.5 release line;
 the `duckdb` pin moves tag by tag within that line. (`main` is reserved for tracking duckdb `main`.)
 
-`httpfs` is linked unconditionally (for `s3://`), so it needs OpenSSL + curl from **vcpkg**:
-`vcpkg install openssl:x64-windows-static curl:x64-windows-static` (with `VCPKG_ROOT` set).
+`httpfs` is linked unconditionally (for `s3://`), so it needs OpenSSL + curl from **vcpkg**, and the ABI's
+JSON crossings need yyjson:
+`vcpkg install openssl:x64-windows-static curl:x64-windows-static yyjson:x64-windows-static` (with `VCPKG_ROOT`
+set). The Substrait producer behind the remote pushdown needs protobuf + substrait-protobuf, which come from a
+manifest of their own (`deps/substrait`; substrait-protobuf lives in the substrait-io registry) into a root of
+their own — run it from outside the repo root:
+
+```powershell
+& "$env:VCPKG_ROOT/vcpkg" install --x-manifest-root=<repo>/deps/substrait `
+  --x-install-root=<repo>/build/substrait-deps --triplet=x64-windows-static
+```
 
 On Windows, build with CMake + Ninja inside a **VS 18** dev environment — run
 `"C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Auxiliary\Build\vcvars64.bat"` first (a plain
@@ -5190,6 +5199,8 @@ cmake -G Ninja -DEXTENSION_STATIC_BUILD=1 `
   -DENABLE_UNITTEST_CPP_TESTS=FALSE -DCMAKE_BUILD_TYPE=Release `
   -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
   -DVCPKG_TARGET_TRIPLET=x64-windows-static `
+  -DCMAKE_PREFIX_PATH="<repo>/build/substrait-deps/x64-windows-static" `
+  -DProtobuf_PROTOC_EXECUTABLE="<repo>/build/substrait-deps/x64-windows-static/tools/protobuf/protoc.exe" `
   -S <repo>/duckdb -B <repo>/build/release
 cmake --build build/release --target fabricator_loadable_extension duckdb shell
 ```

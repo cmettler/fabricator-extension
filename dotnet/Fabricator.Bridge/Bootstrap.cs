@@ -91,7 +91,7 @@ public static unsafe class Bootstrap
                             () => OneRowStream(probeSchema, Interlocked.Increment(ref _lazyOpens) - 1),
                             probeSchema);
 
-        vtable->AbiVersion = 95;
+        vtable->AbiVersion = 96;
         vtable->OpenCatalog = &OpenCatalog;
         vtable->CloseCatalog = &CloseCatalog;
         vtable->ExecuteQuery = &ExecuteQuery;
@@ -177,6 +177,7 @@ public static unsafe class Bootstrap
         vtable->TableDmlInfo = &TableDmlInfo;
         vtable->TableDmlWhere = &TableDmlWhere;
         vtable->TablePartitionStats = &TablePartitionStats;
+        vtable->RemoteTranslate = &RemoteTranslate;
         return FabricatorStatus.Ok;
     }
 
@@ -681,6 +682,50 @@ public static unsafe class Bootstrap
         catch (Exception ex)
         {
             values?.Dispose();
+            SetError(err, ex);
+            return FabricatorStatus.Error;
+        }
+    }
+
+    // remote_translate (ABI v96): {"sql":"…","columns":N,"order":[desc,…]}, {"reason":"…"} when the provider
+    // declines with a reason, or {} when it declines without one.
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static int RemoteTranslate(nint handle, byte* plan, long planLength, byte** outJson, byte** err)
+    {
+        try
+        {
+            if (outJson is null || plan is null || planLength <= 0 || Handles.Resolve<IProviderCatalog>(handle) is not { } catalog)
+            {
+                return FabricatorStatus.InvalidArgument;
+            }
+            var bytes = new ReadOnlySpan<byte>(plan, checked((int)planLength)).ToArray();
+            var query = catalog.TranslateRemotePlan(bytes);
+            using var buffer = new System.IO.MemoryStream();
+            using (var json = new System.Text.Json.Utf8JsonWriter(buffer))
+            {
+                json.WriteStartObject();
+                if (query?.Reason != null)
+                {
+                    json.WriteString("reason", query.Reason);
+                }
+                else if (query != null)
+                {
+                    json.WriteString("sql", query.Sql);
+                    json.WriteNumber("columns", query.ColumnCount);
+                    json.WriteStartArray("order");
+                    foreach (bool descending in query.OrderDescending)
+                    {
+                        json.WriteBooleanValue(descending);
+                    }
+                    json.WriteEndArray();
+                }
+                json.WriteEndObject();
+            }
+            *outJson = (byte*)Marshal.StringToCoTaskMemUTF8(System.Text.Encoding.UTF8.GetString(buffer.ToArray())); // host frees via free_error
+            return FabricatorStatus.Ok;
+        }
+        catch (Exception ex)
+        {
             SetError(err, ex);
             return FabricatorStatus.Error;
         }

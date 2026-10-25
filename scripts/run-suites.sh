@@ -1440,7 +1440,10 @@ case "$TIER" in
         #   explicitly, re-sorted locally), HAVING, and INNER / LEFT joins within the catalog.
         # 2026-10-25: 4054 -> 4165. verify_remote_select_mssql 262 -> 373: exact string equality / GROUP BY / DISTINCT /
         #   count(DISTINCT) / joins (binary collation + sentinel), DISTINCT as GROUP BY, integer arithmetic.
-        : "${MIN_ASSERTIONS:=4165}"
+        # 2026-10-25: 4165 -> 4231. verify_remote_select_mssql 373 -> 439: the Substrait path (ABI v96) replaces the
+        #   hand-written renderer — the former declines pushed with differentials (§2b), windows (§13), and the
+        #   measured wrong-answer classes it declines (§14). Hermetic unchanged at 85/85 -- 10593.
+        : "${MIN_ASSERTIONS:=4231}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

@@ -92,6 +92,39 @@ runs:
         # DuckDB's vendored copy is namespaced + not DUCKDB_API-exported, so a loadable cannot link it.
         "$vcpkg" install "openssl:${{ inputs.triplet }}" "curl:${{ inputs.triplet }}" "yyjson:${{ inputs.triplet }}"
 
+    # protobuf + substrait-protobuf for the Substrait producer behind the remote pushdown
+    # (third_party/duckdb-substrait). substrait-protobuf lives in the substrait-io registry, not vcpkg's own, so
+    # these come from a MANIFEST of their own (deps/substrait) into a root of their own — never the classic tree
+    # above — and reach CMake through CMAKE_PREFIX_PATH. Both registries are pinned by baseline in
+    # vcpkg-configuration.json, so a shallow vcpkg clone (macOS bootstraps one) can resolve them.
+    - name: Cache the Substrait dependencies
+      uses: actions/cache@v4
+      with:
+        path: ${{ runner.temp }}/substrait-deps
+        key: substrait-deps-${{ runner.os }}-${{ inputs.triplet }}-${{ hashFiles('deps/substrait/vcpkg.json', 'deps/substrait/vcpkg-configuration.json') }}
+
+    - name: Install the Substrait dependencies (protobuf + substrait-protobuf)
+      shell: bash
+      env:
+        VCPKG_BINARY_SOURCES: 'clear;http,https://vcpkg-cache.duckdb.org,read'
+      run: |
+        if [ "$RUNNER_OS" = 'Windows' ]; then
+          vcpkg="$VCPKG_INSTALLATION_ROOT/vcpkg.exe"
+          protoc=protoc.exe
+        else
+          vcpkg="$VCPKG_INSTALLATION_ROOT/vcpkg"
+          protoc=protoc
+        fi
+        root="$RUNNER_TEMP/substrait-deps"
+        prefix="$root/${{ inputs.triplet }}"
+        # the cache restores the whole root; install only when it did not
+        if [ ! -f "$prefix/tools/protobuf/$protoc" ]; then
+          "$vcpkg" install --x-manifest-root="$GITHUB_WORKSPACE/deps/substrait" --x-install-root="$root" \
+            --triplet="${{ inputs.triplet }}"
+        fi
+        echo "FABRICATOR_SUBSTRAIT_PREFIX=$prefix" >> "$GITHUB_ENV"
+        echo "FABRICATOR_PROTOC=$prefix/tools/protobuf/$protoc" >> "$GITHUB_ENV"
+
     - name: Export the MSVC environment
       if: runner.os == 'Windows'
       shell: cmd
@@ -124,6 +157,8 @@ runs:
           -DCMAKE_BUILD_TYPE=Release \
           -DCMAKE_TOOLCHAIN_FILE="$VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" \
           -DVCPKG_TARGET_TRIPLET=${{ inputs.triplet }} \
+          -DCMAKE_PREFIX_PATH="$FABRICATOR_SUBSTRAIT_PREFIX" \
+          -DProtobuf_PROTOC_EXECUTABLE="$FABRICATOR_PROTOC" \
           "${extra[@]}"
 
     - name: Build

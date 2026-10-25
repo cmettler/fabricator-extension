@@ -2761,12 +2761,39 @@ public sealed partial class SqlServerCatalog : IProviderCatalog
     /// </remarks>
     public void Initialize() => EnsureProfile();
 
-    // `remote_select`: the host may hand this catalog a whole SELECT (src/catalog/fabricator_remote_select.cpp).
-    // Opt-in through the `remote_pushdown` ATTACH option, and not on a warehouse engine: the renderer's T-SQL
-    // has been measured against box SQL Server only.
+    // `remote_select`: the host may hand this catalog a whole SELECT as a Substrait plan
+    // (src/catalog/fabricator_remote_select.cpp, ABI v96). Opt-in through the `remote_pushdown` ATTACH option,
+    // not on a warehouse engine (measured against box SQL Server only), and only where UTF-8 collations exist
+    // (SQL Server 2019+, Azure SQL): exact string semantics rest on them (docs/duckdb-2.0-remote-execution.md §3.6).
     public string CapabilitiesJson
         => $"{{\"is_binary_collation\":{(Profile.IsBinaryCollation ? "true" : "false")}," +
-           $"\"remote_select\":{(_remotePushdown && !Profile.IsWarehouse ? "true" : "false")}}}";
+           $"\"remote_select\":{(_remotePushdown && !Profile.IsWarehouse && HasUtf8Collations ? "true" : "false")}}}";
+
+    private bool HasUtf8Collations
+        => Profile.EngineEdition == ServerProfile.EditionAzureSqlDatabase || Profile.ProductMajorVersion >= 15;
+
+    // IGNORE NULLS in LAG/LEAD/FIRST_VALUE/LAST_VALUE: SQL Server 2022+ and Azure SQL.
+    private bool HasIgnoreNulls
+        => Profile.EngineEdition == ServerProfile.EditionAzureSqlDatabase || Profile.ProductMajorVersion >= 16;
+
+    /// <summary>The pushed plan as T-SQL (Substrait → the vendored emitter, ABI v96); refuses what it cannot write exactly.</summary>
+    public RemoteQuery? TranslateRemotePlan(byte[] substraitPlan)
+    {
+        if (!_remotePushdown || Profile.IsWarehouse || !HasUtf8Collations)
+        {
+            return null;
+        }
+        try
+        {
+            string sql = Clast.Drivers.SqlServer.Substrait.SqlServerSubstrait.TranslatePushdown(
+                substraitPlan, HasIgnoreNulls, out int columnCount, out var orderDescending);
+            return new RemoteQuery(sql, columnCount, orderDescending);
+        }
+        catch (Clast.Drivers.SqlServer.Substrait.SubstraitTranslationException ex)
+        {
+            return RemoteQuery.Declined(ex.Message); // what the emitter refuses is an answer, not a failure
+        }
+    }
 
     // Builds a two-column (property, value) stream from the detected ServerProfile. Accessing Profile
     // detects it (via the non-MARS probe) on first use; for an attached catalog it is already cached.

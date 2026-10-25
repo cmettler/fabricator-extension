@@ -12,6 +12,25 @@
 > parsed with our own vcpkg yyjson, retiring the `ReadCapabilityFlag` string-find). v74 below is the
 > follow-on that finished the same job for ALTER.
 
+## v96 (2026-10-25) — `remote_translate`: a pushed query as a Substrait plan
+
+Appended to the vtable: `remote_translate(catalog, plan, plan_len, out_json, err)`. DuckDB 2.0's remote optimizer
+hands a catalog declaring `remote_select` a whole query node; the host binds a COPY with DuckDB's own binder,
+flattens subqueries, runs the one `FilterPushdown` pass, and serializes the plan with the vendored `to_substrait`
+(`third_party/duckdb-substrait`). The provider translates the plan (`IProviderCatalog.TranslateRemotePlan`, a
+DIM returning null = decline; SQL Server: the vendored mssql-adbc emitter) and answers
+`{"sql":…,"columns":N,"order":[desc,…]}` or `{}`. The host runs the query through `fabricator_query`, CASTs `c0…`
+to the bound types and names, and sorts again by the `k0…` keys with nulls lowest (SQL Server's order).
+
+- ⚠ EXACT OR NOTHING: every failure on the way — bind, producer, provider, a column-count mismatch — runs the
+  statement locally. Nothing checks what the server returns.
+- ⚠ Two shapes decline in the host: a plan of scans/filters/projections/sorts only (the table scan does that
+  already, with the catalog's statistics), and a result with two columns of one name (DuckDB re-wraps the pushed
+  node as `SELECT * FROM <ref>`, whose binding cannot hold duplicates — `id, id` would come back `id, id_1`).
+- The Substrait producer is mandatory (protobuf + substrait-protobuf from deps/substrait/vcpkg.json); the
+  hand-written renderer it replaced is deleted. An older bridge (no entry) answers `{}`.
+- Full record and every measurement: docs/duckdb-2.0-remote-execution.md §3.12.
+
 ## v95 (2026-10-24) — `table_partition_stats`: COUNT / MIN / MAX from metadata
 
 Appended to the table session: `table_partition_stats(table, at_unit, at_value, out_json, err)`, one JSON

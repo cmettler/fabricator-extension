@@ -115,76 +115,145 @@ physical_plan	<!REGEX>:.*Fabricator Query.*
 
 # ═══ §2  Routing — NOT pushed, each for its own reason ═════════════════════════════════════════════════
 
-# a string column: collation, and T-SQL ignores trailing spaces in '='
-query II
-EXPLAIN SELECT max(s) FROM rp.dbo.rs_t;
-----
-physical_plan	<!REGEX>:.*Fabricator Query.*
-
-# a string ORDER BY key and a string min / max: neither can be made to sort as DuckDB does (§10)
-query II
-EXPLAIN SELECT count(*) FROM rp.dbo.rs_t WHERE s > 's1';
-----
-physical_plan	<!REGEX>:.*Fabricator Query.*
-
-# a float: summation order and NaN
-query II
-EXPLAIN SELECT sum(f) FROM rp.dbo.rs_t;
-----
-physical_plan	<!REGEX>:.*Fabricator Query.*
-
-# avg is not admitted (T-SQL's AVG of an INT is integer division)
-query II
-EXPLAIN SELECT avg(id) FROM rp.dbo.rs_t;
-----
-physical_plan	<!REGEX>:.*Fabricator Query.*
-
-# ⚠ a constant that does NOT convert exactly: `id > 1.5` must not become `[id] > 2`. This exact shape was
-# a WRONG ANSWER in the first build (a "strict" DECIMAL -> INTEGER cast rounds).
-query II
-EXPLAIN SELECT count(*) FROM rp.dbo.rs_t WHERE id > 1.5;
-----
-physical_plan	<!REGEX>:.*Fabricator Query.*
-
-query II
-EXPLAIN SELECT count(*) FROM rp.dbo.rs_t WHERE t < 300;
-----
-physical_plan	<!REGEX>:.*Fabricator Query.*
-
-# division (DuckDB's `/` is float division), a plain projection over ONE table (the scan already pushes its
-# filter)
-query II
-EXPLAIN SELECT sum(id / 2) FROM rp.dbo.rs_t;
-----
-physical_plan	<!REGEX>:.*Fabricator Query.*
-
+# a plain scan (scans, filters, projections, a sort) gains nothing: the table scan already pushes its filter
+# and projection and keeps the catalog's statistics
 query II
 EXPLAIN SELECT id FROM rp.dbo.rs_t WHERE id > 5;
 ----
 physical_plan	<!REGEX>:.*Fabricator Query.*
 
-# a string sort key (collation), DISTINCT
+query II
+EXPLAIN SELECT id, s FROM rp.dbo.rs_t WHERE id > 5 ORDER BY s;
+----
+physical_plan	<!REGEX>:.*Fabricator Query.*
+
+# two result columns of one name: DuckDB re-wraps a pushed node as `SELECT * FROM <ref>`, which would rename the
+# second one (id_1) where DuckDB answers id, id
+query II
+EXPLAIN SELECT a.id, b.uid AS id FROM rp.dbo.rs_t a JOIN rp.dbo.rs_u b ON a.k = b.k;
+----
+physical_plan	<!REGEX>:.*Fabricator Query.*
+
+query II
+SELECT a.id, b.uid AS id FROM rp.dbo.rs_t a JOIN rp.dbo.rs_u b ON a.k = b.k ORDER BY 1, 2 LIMIT 1;
+----
+-149	1
+
+# window shapes SQL Server computes differently (docs/duckdb-2.0-remote-execution.md §3.11): GROUPS frames,
+# RANGE offsets, EXCLUDE, FILTER, DISTINCT, nth_value — and IGNORE NULLS with an offset other than 1 or a default
+query II
+EXPLAIN SELECT id, sum(id) OVER (ORDER BY k GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM rp.dbo.rs_t;
+----
+physical_plan	<!REGEX>:.*Fabricator Query.*
+
+query II
+EXPLAIN SELECT id, sum(id) OVER (ORDER BY id RANGE BETWEEN 5 PRECEDING AND CURRENT ROW) FROM rp.dbo.rs_t;
+----
+physical_plan	<!REGEX>:.*Fabricator Query.*
+
+query II
+EXPLAIN SELECT id, count(*) FILTER (WHERE amount > 100) OVER (PARTITION BY k) FROM rp.dbo.rs_t;
+----
+physical_plan	<!REGEX>:.*Fabricator Query.*
+
+query II
+EXPLAIN SELECT uid, lead(w, 2 IGNORE NULLS) OVER (ORDER BY uid) FROM rp.dbo.rs_u;
+----
+physical_plan	<!REGEX>:.*Fabricator Query.*
+
+query II
+EXPLAIN SELECT uid, lead(w, 1, -2 IGNORE NULLS) OVER (ORDER BY uid) FROM rp.dbo.rs_u;
+----
+physical_plan	<!REGEX>:.*Fabricator Query.*
+
+# a row's order that DuckDB leaves arbitrary: ROWS frame without ORDER BY
+query II
+EXPLAIN SELECT id, sum(id) OVER (ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM rp.dbo.rs_t;
+----
+physical_plan	<!REGEX>:.*Fabricator Query.*
+
+# ═══ §2b  Pushed through Substrait — every one of these stayed local under the hand-written renderer ═════
+# Each routing row is followed by its own differential against `db`.
+
+# string min / max and string order: by the exact key (§3.6 of the doc), never by the collation
+query II
+EXPLAIN SELECT max(s) FROM rp.dbo.rs_t;
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+query I
+SELECT (SELECT max(s) FROM rp.dbo.rs_t) IS NOT DISTINCT FROM (SELECT max(s) FROM db.dbo.rs_t);
+----
+true
+
+query II
+EXPLAIN SELECT count(*) FROM rp.dbo.rs_t WHERE s > 's1';
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+query I
+SELECT (SELECT count(*) FROM rp.dbo.rs_t WHERE s > 's1') = (SELECT count(*) FROM db.dbo.rs_t WHERE s > 's1');
+----
+true
+
 query II
 EXPLAIN SELECT s, count(*) FROM rp.dbo.rs_t GROUP BY s ORDER BY s;
 ----
-physical_plan	<!REGEX>:.*Fabricator Query.*
+physical_plan	<REGEX>:.*Fabricator Query.*
 
+query I
+SELECT (SELECT list(x ORDER BY i) FROM (SELECT row_number() OVER () AS i, x FROM (SELECT s || ':' || count(*) AS x FROM rp.dbo.rs_t GROUP BY s ORDER BY s)))
+     = (SELECT list(x ORDER BY i) FROM (SELECT row_number() OVER () AS i, x FROM (SELECT s || ':' || count(*) AS x FROM db.dbo.rs_t GROUP BY s ORDER BY s)));
+----
+true
+
+# a float sum and avg: an integer avg divides an EXACT sum (decimal(38,0)) by the count, in float
+query II
+EXPLAIN SELECT sum(f), avg(id), sum(id / 2) FROM rp.dbo.rs_t;
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+query I
+SELECT count(*) FROM ((SELECT sum(f), avg(id), sum(id / 2), avg(amount) FROM rp.dbo.rs_t)
+  EXCEPT ALL (SELECT sum(f), avg(id), sum(id / 2), avg(amount) FROM db.dbo.rs_t));
+----
+0
+
+# ⚠ a constant that does NOT convert exactly: `id > 1.5` must not become `[id] > 2` (a WRONG ANSWER in the first
+# hand-written build); and a constant out of the column's range
+query II
+EXPLAIN SELECT count(*) FROM rp.dbo.rs_t WHERE id > 1.5;
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+query II
+SELECT (SELECT count(*) FROM rp.dbo.rs_t WHERE id > 1.5), (SELECT count(*) FROM rp.dbo.rs_t WHERE t < 300);
+----
+149	300
+
+# DISTINCT ON, FULL and USING joins
 query II
 EXPLAIN SELECT DISTINCT ON (k) k FROM rp.dbo.rs_t;
 ----
-physical_plan	<!REGEX>:.*Fabricator Query.*
+physical_plan	<REGEX>:.*Fabricator Query.*
 
-# a FULL join, a USING join, a string join key
+query I
+SELECT count(*) FROM ((SELECT DISTINCT ON (k) k FROM rp.dbo.rs_t) EXCEPT ALL (SELECT DISTINCT ON (k) k FROM db.dbo.rs_t));
+----
+0
+
 query II
 EXPLAIN SELECT count(*) FROM rp.dbo.rs_t a FULL JOIN rp.dbo.rs_u b ON a.k = b.k;
 ----
-physical_plan	<!REGEX>:.*Fabricator Query.*
+physical_plan	<REGEX>:.*Fabricator Query.*
 
-query II
-EXPLAIN SELECT count(*) FROM rp.dbo.rs_t JOIN rp.dbo.rs_u USING (k);
+query IIII
+SELECT (SELECT count(*) FROM rp.dbo.rs_t a FULL JOIN rp.dbo.rs_u b ON a.k = b.k),
+       (SELECT count(*) FROM db.dbo.rs_t a FULL JOIN db.dbo.rs_u b ON a.k = b.k),
+       (SELECT count(*) FROM rp.dbo.rs_t JOIN rp.dbo.rs_u USING (k)),
+       (SELECT count(*) FROM db.dbo.rs_t JOIN db.dbo.rs_u USING (k));
 ----
-physical_plan	<!REGEX>:.*Fabricator Query.*
-
+382	382	312	312
 
 # an UNQUALIFIED name both tables have is ambiguous: declined, so DuckDB reports it rather than the server
 # picking one
@@ -522,11 +591,12 @@ SELECT count(*) FROM (
 ----
 0
 
-# a HAVING constant that does not convert exactly to the aggregate's type stays local
+# a HAVING constant that does not convert exactly to the aggregate's type: DuckDB's binder casts the count, so the
+# plan compares exactly (the hand-written renderer kept it local)
 query II
 EXPLAIN SELECT k FROM rp.dbo.rs_t GROUP BY k HAVING count(*) > 38.5;
 ----
-physical_plan	<!REGEX>:.*Fabricator Query.*
+physical_plan	<REGEX>:.*Fabricator Query.*
 
 query I
 SELECT count(*) FROM (SELECT k FROM rp.dbo.rs_t GROUP BY k HAVING count(*) > 38.5);
@@ -768,18 +838,26 @@ SELECT a.id, b.id FROM db.dbo.rs_s a JOIN db.dbo.rs_s b ON a.s = b.n ORDER BY a.
 7	9
 8	4
 
-# ordering, < / > and min / max over strings stay local and still answer
+# ordering, < / > and min / max over strings push through the exact key (UTF-8 bytes = code point order)
 query II
 EXPLAIN SELECT s, count(*) FROM rp.dbo.rs_s GROUP BY s ORDER BY s;
 ----
-physical_plan	<!REGEX>:.*Fabricator Query.*
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+query I
+SELECT (SELECT list(x ORDER BY i) FROM (SELECT row_number() OVER () AS i, x FROM (SELECT coalesce(s, '<null>') || ':' || count(*) AS x FROM rp.dbo.rs_s GROUP BY s ORDER BY s)))
+     = (SELECT list(x ORDER BY i) FROM (SELECT row_number() OVER () AS i, x FROM (SELECT coalesce(s, '<null>') || ':' || count(*) AS x FROM db.dbo.rs_s GROUP BY s ORDER BY s)));
+----
+true
 
 query T
 SELECT max(s) FROM rp.dbo.rs_s;
 ----
 e
 
-# ⚠ a DuckDB collation changes what equality means; the server is not told, so nothing string-shaped pushes
+# ⚠ a DuckDB collation changes what equality means. DuckDB binds `nocase` as lower(), and SQL Server's LOWER maps
+# 298 BMP code points differently from DuckDB's (measured over all of them), so lower() — and with it this — stays
+# local
 statement ok
 SET default_collation = 'nocase';
 
@@ -889,36 +967,250 @@ SELECT count(*) FROM (
 ----
 0
 
-# ⚠ THE ACCEPTED DIVERGENCE, pinned so a change to it is noticed: a ROW-LEVEL intermediate that overflows
-# DuckDB's type (id * 2 is an INTEGER, and id reaches 2^31 - 1) is an error locally, while the server computes
-# in BIGINT and answers. Error against answer — never two different answers.
+# A ROW-LEVEL intermediate that overflows DuckDB's type (id * 2 is an INTEGER, and id reaches 2^31 - 1) is an
+# error locally — and, through Substrait, on the server too: the plan carries DuckDB's INTEGER. (The hand-written
+# renderer computed in BIGINT and answered: error against answer, the divergence this used to pin.)
 statement error
 SELECT sum(id * 2) FROM db.dbo.rs_t;
 ----
 <REGEX>:.*Overflow.*
 
-query I
+statement error
 SELECT sum(id * 2) FROM rp.dbo.rs_t;
 ----
-8589934288
+<REGEX>:.*overflow.*
 
-# a FINAL value outside DuckDB's type is DuckDB's own error on both paths: the server computes it, the
-# wrapper's CAST refuses
+# a FINAL value outside DuckDB's type is an error on both paths (through Substrait the server computes in DuckDB's
+# INTEGER and fails itself)
 statement error
 SELECT max(id * 2) FROM rp.dbo.rs_t;
 ----
-<REGEX>:.*(Overflow|out of range).*
+<REGEX>:.*([Oo]verflow|out of range).*
 
 statement error
 SELECT max(id * 2) FROM db.dbo.rs_t;
 ----
 <REGEX>:.*(Overflow|out of range).*
 
-# a constant wider than its columns keeps DuckDB's widening, so it stays local
+# a constant wider than its columns: the bound plan carries DuckDB's widening (BIGINT, summed as decimal(38,0))
 query II
 EXPLAIN SELECT sum(id + 5000000000) FROM rp.dbo.rs_t;
 ----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+query I
+SELECT (SELECT sum(id + 5000000000) FROM rp.dbo.rs_t) = (SELECT sum(id + 5000000000) FROM db.dbo.rs_t);
+----
+true
+
+# ═══ §13  Window functions (Substrait, docs/duckdb-2.0-remote-execution.md §3.11) ════════════════════════
+# Ranks with NULLs in the order, running sums over peers (RANGE), ROWS frames, exact avg / HUGEINT sums over a
+# window, lag / lead with an offset and a default, first / last value, exact string partitions, a window after
+# GROUP BY, QUALIFY, and specs that alternate (the output keeps DuckDB's column order).
+
+query II
+EXPLAIN SELECT id, rank() OVER (ORDER BY k) FROM rp.dbo.rs_t;
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+# ⚠ written out, not as a table macro: a macro expands at BIND, after the remote optimizer, so a macro over
+# `rp` would never be pushed and this differential would compare local with local
+query I
+SELECT count(*) FROM ((SELECT id, rank() OVER (ORDER BY k) AS r, dense_rank() OVER (ORDER BY k DESC) AS dr,
+         percent_rank() OVER (PARTITION BY t % 3 ORDER BY id) AS pr, ntile(7) OVER (ORDER BY id) AS n7,
+         sum(amount) OVER (PARTITION BY k ORDER BY id) AS run, sum(id) OVER (ORDER BY k) AS peers,
+         sum(id) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND 1 FOLLOWING) AS frame,
+         avg(id) OVER (PARTITION BY k) AS a, sum(b) OVER (PARTITION BY k) AS hs,
+         lag(id) OVER (ORDER BY id) AS lg, lead(amount, 2, -1) OVER (PARTITION BY k ORDER BY id) AS ld,
+         first_value(amount) OVER (PARTITION BY k ORDER BY id) AS fv,
+         last_value(amount) OVER (PARTITION BY k ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS lv,
+         row_number() OVER (ORDER BY id DESC) AS rn
+  FROM rp.dbo.rs_t ORDER BY id LIMIT 1000)
+  EXCEPT ALL (SELECT id, rank() OVER (ORDER BY k) AS r, dense_rank() OVER (ORDER BY k DESC) AS dr,
+         percent_rank() OVER (PARTITION BY t % 3 ORDER BY id) AS pr, ntile(7) OVER (ORDER BY id) AS n7,
+         sum(amount) OVER (PARTITION BY k ORDER BY id) AS run, sum(id) OVER (ORDER BY k) AS peers,
+         sum(id) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND 1 FOLLOWING) AS frame,
+         avg(id) OVER (PARTITION BY k) AS a, sum(b) OVER (PARTITION BY k) AS hs,
+         lag(id) OVER (ORDER BY id) AS lg, lead(amount, 2, -1) OVER (PARTITION BY k ORDER BY id) AS ld,
+         first_value(amount) OVER (PARTITION BY k ORDER BY id) AS fv,
+         last_value(amount) OVER (PARTITION BY k ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS lv,
+         row_number() OVER (ORDER BY id DESC) AS rn
+  FROM db.dbo.rs_t ORDER BY id LIMIT 1000));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT id, rank() OVER (ORDER BY k) AS r, dense_rank() OVER (ORDER BY k DESC) AS dr,
+         percent_rank() OVER (PARTITION BY t % 3 ORDER BY id) AS pr, ntile(7) OVER (ORDER BY id) AS n7,
+         sum(amount) OVER (PARTITION BY k ORDER BY id) AS run, sum(id) OVER (ORDER BY k) AS peers,
+         sum(id) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND 1 FOLLOWING) AS frame,
+         avg(id) OVER (PARTITION BY k) AS a, sum(b) OVER (PARTITION BY k) AS hs,
+         lag(id) OVER (ORDER BY id) AS lg, lead(amount, 2, -1) OVER (PARTITION BY k ORDER BY id) AS ld,
+         first_value(amount) OVER (PARTITION BY k ORDER BY id) AS fv,
+         last_value(amount) OVER (PARTITION BY k ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS lv,
+         row_number() OVER (ORDER BY id DESC) AS rn
+  FROM db.dbo.rs_t ORDER BY id LIMIT 1000)
+  EXCEPT ALL (SELECT id, rank() OVER (ORDER BY k) AS r, dense_rank() OVER (ORDER BY k DESC) AS dr,
+         percent_rank() OVER (PARTITION BY t % 3 ORDER BY id) AS pr, ntile(7) OVER (ORDER BY id) AS n7,
+         sum(amount) OVER (PARTITION BY k ORDER BY id) AS run, sum(id) OVER (ORDER BY k) AS peers,
+         sum(id) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND 1 FOLLOWING) AS frame,
+         avg(id) OVER (PARTITION BY k) AS a, sum(b) OVER (PARTITION BY k) AS hs,
+         lag(id) OVER (ORDER BY id) AS lg, lead(amount, 2, -1) OVER (PARTITION BY k ORDER BY id) AS ld,
+         first_value(amount) OVER (PARTITION BY k ORDER BY id) AS fv,
+         last_value(amount) OVER (PARTITION BY k ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS lv,
+         row_number() OVER (ORDER BY id DESC) AS rn
+  FROM rp.dbo.rs_t ORDER BY id LIMIT 1000));
+----
+0
+
+query I
+SELECT count(*) FROM (
+  ((SELECT id, count(*) OVER (PARTITION BY s) AS c, max(s) OVER (PARTITION BY id % 3) AS m, rank() OVER (ORDER BY s) AS r FROM rp.dbo.rs_s ORDER BY id LIMIT 100)
+   EXCEPT ALL (SELECT id, count(*) OVER (PARTITION BY s), max(s) OVER (PARTITION BY id % 3), rank() OVER (ORDER BY s) FROM db.dbo.rs_s))
+  UNION ALL
+  ((SELECT id, count(*) OVER (PARTITION BY s), max(s) OVER (PARTITION BY id % 3), rank() OVER (ORDER BY s) FROM db.dbo.rs_s)
+   EXCEPT ALL (SELECT id, count(*) OVER (PARTITION BY s) AS c, max(s) OVER (PARTITION BY id % 3) AS m, rank() OVER (ORDER BY s) AS r FROM rp.dbo.rs_s ORDER BY id LIMIT 100)));
+----
+0
+
+# QUALIFY and a window over GROUP BY
+query I
+SELECT (SELECT list(id ORDER BY id) FROM (SELECT id FROM rp.dbo.rs_t QUALIFY row_number() OVER (PARTITION BY k ORDER BY id DESC) = 1))
+     = (SELECT list(id ORDER BY id) FROM (SELECT id FROM db.dbo.rs_t QUALIFY row_number() OVER (PARTITION BY k ORDER BY id DESC) = 1));
+----
+true
+
+query I
+SELECT count(*) FROM ((SELECT k, sum(id) AS s, rank() OVER (ORDER BY sum(id) DESC) AS r FROM rp.dbo.rs_t GROUP BY k)
+  EXCEPT ALL (SELECT k, sum(id) AS s, rank() OVER (ORDER BY sum(id) DESC) AS r FROM db.dbo.rs_t GROUP BY k));
+----
+0
+
+# IGNORE NULLS with offset 1 and no default agrees with DuckDB (SQL Server 2022+)
+query I
+SELECT count(*) FROM (
+  (SELECT uid, lag(w IGNORE NULLS) OVER (ORDER BY uid) AS l, lead(w IGNORE NULLS) OVER (PARTITION BY uid % 2 ORDER BY uid) AS ld,
+          first_value(w IGNORE NULLS) OVER (ORDER BY uid DESC) AS f FROM rp.dbo.rs_u ORDER BY uid LIMIT 100)
+  EXCEPT ALL
+  (SELECT uid, lag(w IGNORE NULLS) OVER (ORDER BY uid), lead(w IGNORE NULLS) OVER (PARTITION BY uid % 2 ORDER BY uid),
+          first_value(w IGNORE NULLS) OVER (ORDER BY uid DESC) FROM db.dbo.rs_u));
+----
+0
+
+# ═══ §14  Functions SQL Server computes differently — measured, so they run locally ═════════════════════
+# Each was a WRONG ANSWER before it was declined (docs/duckdb-2.0-remote-execution.md §3.12). The rows below pin
+# the routing; the answer is then DuckDB's own.
+
+statement ok
+SELECT fabricator_exec('db', 'DROP TABLE IF EXISTS dbo.rs_x;');
+
+statement ok
+SELECT fabricator_exec('db', 'CREATE TABLE dbo.rs_x (id INT, n NVARCHAR(40) NULL, vb VARBINARY(8) NULL);
+INSERT INTO dbo.rs_x VALUES (1, N''abc'', 0x01), (2, N''𝄞x𝄞'', 0x0100), (3, N''é'' + NCHAR(769), 0x02), (4, N''aAaA'', NULL);');
+
+statement ok
+SELECT fabricator_refresh_cache('rp');
+
+statement ok
+SELECT fabricator_refresh_cache('db');
+
+# lower / upper: 298 / 308 BMP code points map differently
+query II
+EXPLAIN SELECT lower(n), count(*) FROM rp.dbo.rs_x GROUP BY 1;
+----
 physical_plan	<!REGEX>:.*Fabricator Query.*
+
+# positions and lengths count UTF-16 code units on the server: length(N'𝄞x𝄞') is 5 there, 3 here
+query II
+EXPLAIN SELECT length(n), count(*) FROM rp.dbo.rs_x GROUP BY 1;
+----
+physical_plan	<!REGEX>:.*Fabricator Query.*
+
+query II
+EXPLAIN SELECT substring(n, 2, 2), count(*) FROM rp.dbo.rs_x GROUP BY 1;
+----
+physical_plan	<!REGEX>:.*Fabricator Query.*
+
+query II
+EXPLAIN SELECT strpos(n, 'x'), count(*) FROM rp.dbo.rs_x GROUP BY 1;
+----
+physical_plan	<!REGEX>:.*Fabricator Query.*
+
+# reverse: code units on the server, grapheme clusters here (é + U+0301 keeps its accent)
+query II
+EXPLAIN SELECT reverse(n), count(*) FROM rp.dbo.rs_x GROUP BY 1;
+----
+physical_plan	<!REGEX>:.*Fabricator Query.*
+
+# LIKE's `_` matches one UTF-16 code unit on the server; a pattern without `_` pushes
+query II
+EXPLAIN SELECT count(*) FROM rp.dbo.rs_x WHERE n LIKE '_';
+----
+physical_plan	<!REGEX>:.*Fabricator Query.*
+
+query II
+EXPLAIN SELECT count(*) FROM rp.dbo.rs_x WHERE n LIKE '%x%';
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+query I
+SELECT (SELECT count(*) FROM rp.dbo.rs_x WHERE n LIKE '%x%') = (SELECT count(*) FROM db.dbo.rs_x WHERE n LIKE '%x%');
+----
+true
+
+# regexp_replace replaces every match on the server, the first one here
+query II
+EXPLAIN SELECT regexp_replace(n, '[a-c]', 'z'), count(*) FROM rp.dbo.rs_x GROUP BY 1;
+----
+physical_plan	<!REGEX>:.*Fabricator Query.*
+
+# binary values compare with trailing zero bytes ignored on the server (0x01 = 0x0100)
+query II
+EXPLAIN SELECT count(*) FROM rp.dbo.rs_x a JOIN rp.dbo.rs_x b ON a.vb = b.vb;
+----
+physical_plan	<!REGEX>:.*Fabricator Query.*
+
+query I
+SELECT count(*) FROM rp.dbo.rs_x a JOIN rp.dbo.rs_x b ON a.vb = b.vb;
+----
+3
+
+# a float cast to an integer: DuckDB rounds half to even, T-SQL truncates
+query II
+EXPLAIN SELECT CAST(f AS INTEGER), count(*) FROM rp.dbo.rs_t GROUP BY 1;
+----
+physical_plan	<!REGEX>:.*Fabricator Query.*
+
+# a float divided by something that may be zero: inf here, an error on the server
+query II
+EXPLAIN SELECT max(f / (t - t)) FROM rp.dbo.rs_t;
+----
+physical_plan	<!REGEX>:.*Fabricator Query.*
+
+# decimal arithmetic whose T-SQL precision exceeds 38 loses scale on the server
+query II
+EXPLAIN SELECT max(amount * big) FROM rp.dbo.rs_t;
+----
+physical_plan	<!REGEX>:.*Fabricator Query.*
+
+# any_value: the server would pick a different value than DuckDB
+query II
+EXPLAIN SELECT k, any_value(s) FROM rp.dbo.rs_t GROUP BY k;
+----
+physical_plan	<!REGEX>:.*Fabricator Query.*
+
+# a decimal cast to an integer IS pushed: DuckDB rounds half away from zero, and so does ROUND before the cast
+query II
+EXPLAIN SELECT CAST(amount AS INTEGER), count(*) FROM rp.dbo.rs_t GROUP BY 1;
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+query I
+SELECT count(*) FROM ((SELECT CAST(amount AS INTEGER) AS c, CAST(-amount AS INTEGER) AS n, count(*) FROM rp.dbo.rs_t GROUP BY ALL)
+  EXCEPT ALL (SELECT CAST(amount AS INTEGER) AS c, CAST(-amount AS INTEGER) AS n, count(*) FROM db.dbo.rs_t GROUP BY ALL));
+----
+0
+
 
 # ═══ §6  DML keeps its own paths ══════════════════════════════════════════════════════════════════════
 # The remote optimizer would also take DELETE / UPDATE nodes; this catalog refuses them, so the plan-less

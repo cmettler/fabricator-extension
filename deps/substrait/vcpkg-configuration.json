@@ -1,0 +1,16 @@
+{
+  "default-registry": {
+    "kind": "git",
+    "repository": "https://github.com/microsoft/vcpkg",
+    "baseline": "856505bb767458c99d8e3c3ed441f59a058d3687"
+  },
+  "registries": [
+    {
+      "kind": "git",
+      "repository": "https://github.com/substrait-io/substrait-packaging",
+      "reference": "vcpkg-registry",
+      "baseline": "56ebf965f7f5fc46d8d4a72e0705c638031988ac",
+      "packages": [ "substrait-protobuf", "substrait-extensions", "substrait-antlr" ]
+    }
+  ]
+}

@@ -1196,6 +1196,22 @@ typedef struct FabricatorVTable {
 	// false, and DuckDB then uses neither the bounds nor a filter check for that column.
 	int32_t (*table_partition_stats)(FabricatorHandle table, const char *at_unit, const char *at_value,
 	                                 char **out_json, char **err);
+
+	// -------------------------------------------------------------------------
+	// REMOTE PUSHDOWN — ABI v96. A query DuckDB's remote optimizer handed to a catalog that declares
+	// `remote_select`, bound by DuckDB and serialized as a Substrait plan (src/catalog/fabricator_remote_select.cpp);
+	// the provider translates it into its own query, which the host runs through fabricator_query.
+	// -------------------------------------------------------------------------
+
+	// ONE JSON doc, owned UTF-8 in *out_json (host frees via free_error):
+	//   {"sql":"<query>","columns":N,"order":[<descending>,…]}
+	// The query's columns are c0…c{N-1}, then one per ORDER BY key, k0…; the host casts the c columns to
+	// DuckDB's bound types and sorts again by the k columns (nulls lowest, as SQL Server sorts them). An object
+	// without "sql" means the provider declines — {"reason":"…"} says why — and the statement runs locally.
+	// ⚠ EXACT OR NOTHING: nothing checks what the query returns, so a provider refuses (empty doc or error)
+	// whatever it cannot reproduce exactly.
+	int32_t (*remote_translate)(FabricatorHandle catalog, const uint8_t *plan, int64_t plan_len, char **out_json,
+	                            char **err);
 } FabricatorVTable;
 
 // -----------------------------------------------------------------------------
@@ -1432,7 +1448,7 @@ typedef struct FabricatorHostServices {
 // state blob is this many bytes + a 4-byte length prefix). Serialize() must fit within it.
 #define FABRICATOR_AGG_SPILL_CAP 1024
 
-#define FABRICATOR_ABI_VERSION 95
+#define FABRICATOR_ABI_VERSION 96
 
 // Signature of the managed bootstrap entry point loaded via hostfxr.
 // Returns 0 on success; fills *vtable. `size` is sizeof(FabricatorVTable) as seen

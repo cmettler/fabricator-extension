@@ -341,6 +341,12 @@ public unsafe struct FabricatorVTable
     // int32 table_partition_stats(void* table, const char* at_unit, const char* at_value, char** out_json,
     //                             char** err) — per-file count/bounds; owned UTF-8, host frees via free_error.
     public delegate* unmanaged[Cdecl]<nint, byte*, byte*, byte**, byte**, int> TablePartitionStats;
+
+    // --- remote pushdown, ABI v96 ---
+
+    // int32 remote_translate(void* catalog, const uint8_t* plan, int64 plan_len, char** out_json, char** err)
+    // — a Substrait plan to the provider's query; owned UTF-8, host frees via free_error.
+    public delegate* unmanaged[Cdecl]<nint, byte*, long, byte**, byte**, int> RemoteTranslate;
 }
 
 /// <summary>

@@ -253,6 +253,37 @@ public interface ITableFunctionSession : IDisposable
     IArrowArrayStream Execute(string? specJson, IArrowArrayStream? filterValues);
 }
 
+/// <summary>
+/// The query a provider runs for a plan the host pushed to it (ABI v96, <see cref="IProviderCatalog.TranslateRemotePlan"/>).
+/// </summary>
+public sealed class RemoteQuery
+{
+    /// <param name="sql">The provider's query. Its result columns are <c>c0</c>…<c>c{columnCount-1}</c>, followed
+    /// by one column per ORDER BY key, <c>k0</c>…, which the host sorts by again.</param>
+    /// <param name="columnCount">How many result columns the plan has (the keys not counted).</param>
+    /// <param name="orderDescending">Each ORDER BY key's direction. Nulls sort as the LOWEST values (first
+    /// ascending, last descending) — the host sorts the keys the same way.</param>
+    public RemoteQuery(string sql, int columnCount, IReadOnlyList<bool> orderDescending)
+    {
+        Sql = sql;
+        ColumnCount = columnCount;
+        OrderDescending = orderDescending;
+    }
+
+    public string Sql { get; }
+    public int ColumnCount { get; }
+    public IReadOnlyList<bool> OrderDescending { get; }
+
+    /// <summary>Why the provider declined the plan, when <see cref="Declined"/> made it; the statement runs locally.</summary>
+    public string? Reason { get; private init; }
+
+    /// <summary>
+    /// A refusal with its reason — an ordinary answer, not an error: the host runs the statement locally and only
+    /// traces the reason (a throw would be logged as a failed crossing on every refused query).
+    /// </summary>
+    public static RemoteQuery Declined(string reason) => new("", 0, System.Array.Empty<bool>()) { Reason = reason };
+}
+
 /// <summary>An opened connection/catalog. Disposed when the native side closes the handle.</summary>
 public interface IProviderCatalog : IDisposable
 {
@@ -334,6 +365,16 @@ public interface IProviderCatalog : IDisposable
     /// built by <c>COPY … (FORMAT delta)</c>, never goes through the host's catalog load and so never gets
     /// this call. Treat it as an EAGER, well-placed trigger for init that must remain lazily reachable.</para>
     /// </remarks>
+    /// <summary>
+    /// Translates a query the host pushed as a Substrait plan (DuckDB 2.0's remote pushdown, ABI v96) into
+    /// this provider's own query, run through <c>fabricator_query</c>. Asked only when the catalog declares
+    /// <c>remote_select</c> in <see cref="CapabilitiesJson"/>.
+    /// <para>⚠ EXACT OR NOTHING: nothing checks what the query returns, so a plan whose meaning the provider
+    /// cannot reproduce exactly — collation, padding, null order, rounding, overflow — must be refused (null or
+    /// a throw), and the host then runs the statement locally. This default refuses everything.</para>
+    /// </summary>
+    RemoteQuery? TranslateRemotePlan(byte[] substraitPlan) => null;
+
     void Initialize()
     {
     }

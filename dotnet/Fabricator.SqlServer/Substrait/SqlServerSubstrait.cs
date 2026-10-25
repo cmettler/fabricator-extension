@@ -68,6 +68,22 @@ public static class SqlServerSubstrait
         return emitter.EmitRoot(root, nested, out _);
     }
 
+    /// <summary>
+    /// [FABRICATOR-PATCH: OURS-BY-DESIGN] Translates a plan for the remote pushdown (see
+    /// <see cref="TSqlEmitter.EmitPushdown"/>).
+    /// </summary>
+    internal static string TranslatePushdown(byte[] plan, bool ignoreNulls, out int columnCount, out List<bool> orderDescending)
+    {
+        if (plan == null || plan.Length == 0)
+        {
+            throw new SubstraitTranslationException("The Substrait plan is empty.");
+        }
+        var decoder = new SubstraitPlanDecoder(plan);
+        RootRel root = decoder.DecodePlan();
+        var emitter = new TSqlEmitter(decoder.PerRecordEvaluation, DefaultCollation) { SupportsIgnoreNulls = ignoreNulls };
+        return emitter.EmitPushdown(root, out columnCount, out orderDescending);
+    }
+
     /// <summary>Checks that a collation name is a plain identifier, since it becomes part of the query.</summary>
     internal static string CheckCollation(string collation)
     {

@@ -890,6 +890,25 @@ std::string TablePartitionStats(FabricatorHandle table, const std::string &at_un
 	return result;
 }
 
+std::string RemoteTranslate(FabricatorHandle catalog, const std::string &plan) {
+	const FabricatorVTable &vt = GetBridge();
+	if (!vt.remote_translate) {
+		return "{}"; // an older bridge: the statement runs locally
+	}
+	char *out_json = nullptr;
+	char *err = nullptr;
+	int32_t rc = vt.remote_translate(catalog, reinterpret_cast<const uint8_t *>(plan.data()),
+	                                 static_cast<int64_t>(plan.size()), &out_json, &err);
+	if (rc != FABRICATOR_OK) {
+		ThrowManagedError(vt, err, "Fabricator: remote_translate failed");
+	}
+	std::string result = out_json ? out_json : "";
+	if (out_json && vt.free_error) {
+		vt.free_error(out_json);
+	}
+	return result;
+}
+
 void TableScan(FabricatorHandle table, const std::string &spec_json, ArrowArrayStream *filter_values,
                ArrowArrayStream &out) {
 	const FabricatorVTable &vt = GetBridge();
