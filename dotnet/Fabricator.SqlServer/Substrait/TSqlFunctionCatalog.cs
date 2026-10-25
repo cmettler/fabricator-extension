@@ -391,6 +391,33 @@ internal static class TSqlFunctionCatalog
         return SqlExpr.Of(text, aggregate.Type, props);
     }
 
+    /// <summary>[FABRICATOR-PATCH: OURS-BY-DESIGN] DuckDB's lpad / rpad, counted in code points.</summary>
+    private static string Pad(TSqlCall c, bool left)
+    {
+        string? fill = c.StringLiteral(2);
+        if (!IsNonNegativeConstant(c, 1) || string.IsNullOrEmpty(fill))
+        {
+            throw c.Unsupported("the length must be a constant of at least 0 and the fill a non-empty constant.");
+        }
+        string cp = TSqlEmitter.CodePointCollation;
+        string s = $"(({c.V(0)}) COLLATE {cp})";
+        string n = c.V(1);
+        string length = $"(LEN({s} + N'.') - 1)";
+        string padding = $"LEFT(REPLICATE(CAST({TSql.Unicode(fill)} AS nvarchar(max)) COLLATE {cp}, {n}), {n} - {length})";
+        string padded = left ? $"{padding} + {s}" : $"{s} + {padding}";
+        return c.Emitter.Collate($"(CASE WHEN {length} >= {n} THEN LEFT({s}, {n}) ELSE {padded} END)");
+    }
+
+    private static bool IsNonNegativeConstant(TSqlCall c, int index)
+    {
+        var e = index < c.Args.Count ? c.Args[index].Value : null;
+        while (e is CastExpr cast)
+        {
+            e = cast.Input;
+        }
+        return e is LiteralExpr { IsNull: false } lit && lit.Type.IsInteger && lit.IntValue >= 0;
+    }
+
     private static bool IsNonZeroConstant(Expr? e) => e switch
     {
         LiteralExpr { IsNull: false } lit => lit.Type.IsFloat ? lit.FloatValue != 0 : lit.Type.IsInteger ? lit.IntValue != 0 : false,
@@ -921,26 +948,42 @@ internal static class TSqlFunctionCatalog
         // [FABRICATOR-PATCH: OURS-BY-DESIGN] positions and lengths decline: SQL Server counts UTF-16 code units where DuckDB counts code points
         // (measured on U+1D11E: LEN 2, SUBSTRING splits the surrogate pair, CHARINDEX one too far), and REVERSE reverses
         // code units where DuckDB keeps a base character and its combining marks together
+        // [FABRICATOR-PATCH: OURS-BY-DESIGN] a NEGATIVE start counts from the end in DuckDB and lies before the
+        // beginning in T-SQL (measured), and a negative length errors in T-SQL: both must be constants >= 0
         Scalar(StringUrn, "substring", "SUBSTRING", "FUNCTION", Str,
-            c => throw c.Unsupported("SQL Server counts string positions in UTF-16 code units."),
+            c => !IsNonNegativeConstant(c, 1) || (c.Count >= 3 && !IsNonNegativeConstant(c, 2))
+                ? throw c.Unsupported("start and length must be constants of at least 0; DuckDB counts a negative start from the end.")
+                : c.Emitter.Collate(c.Count >= 3
+                ? $"SUBSTRING(({c.V(0)}) COLLATE {TSqlEmitter.CodePointCollation}, {c.V(1)}, {c.V(2)})"
+                : $"SUBSTRING(({c.V(0)}) COLLATE {TSqlEmitter.CodePointCollation}, {c.V(1)}, 2147483647)"),
             new TSqlFunctionVariant(["str_i32_i32", "str_i32"], ("negative_start", "LEFT_OF_BEGINNING")));
-        Scalar(StringUrn, "strpos", "CHARINDEX", "FUNCTION", Long, c => throw c.Unsupported("SQL Server counts string positions in UTF-16 code units."),
+        Scalar(StringUrn, "strpos", "CHARINDEX", "FUNCTION", Long, StrPos,
             new TSqlFunctionVariant(["str_str"], caseSensitive), new TSqlFunctionVariant(["str_str"], caseInsensitive));
         Scalar(StringUrn, "replace", "REPLACE", "FUNCTION", Str, c => $"REPLACE({c.MaxString(0)}, {c.S(1)}, {c.S(2)})",
             new TSqlFunctionVariant(["str_str_str"], caseSensitive), new TSqlFunctionVariant(["str_str_str"], caseInsensitive));
         Scalar(StringUrn, "repeat", "REPLICATE", "FUNCTION", Str, c => $"REPLICATE({c.MaxString(0)}, {c.V(1)})", V("str_i64"));
         Scalar(StringUrn, "reverse", "REVERSE", "FUNCTION", Str, c => throw c.Unsupported("SQL Server reverses UTF-16 code units."), V("str"));
-        // [FABRICATOR-PATCH: OURS-BY-DESIGN] LOWER / UPPER decline: measured against DuckDB over every BMP code point, LOWER maps 298 of them
-        // differently and UPPER 308 (Greek symbol forms, ß, µ, ſ, IPA letters)
-        Scalar(StringUrn, "lower", "LOWER", "FUNCTION", Str, c => throw c.Unsupported("SQL Server's LOWER differs from DuckDB's for some characters."), new TSqlFunctionVariant(["str"], ("char_set", "UTF8")));
-        Scalar(StringUrn, "upper", "UPPER", "FUNCTION", Str, c => throw c.Unsupported("SQL Server's UPPER differs from DuckDB's for some characters."), new TSqlFunctionVariant(["str"], ("char_set", "UTF8")));
+        // [FABRICATOR-PATCH: OURS-BY-DESIGN] LOWER / UPPER are pushed although they are NOT exact — the one ACCEPTED
+        // divergence (user decision 2026-10-25, documented in the README): measured over every BMP code point, LOWER
+        // maps 298 of them differently from DuckDB and UPPER 308 (SQL Server's _100 collations carry Unicode 5.0 case
+        // tables: ß, µ, ſ, Greek symbol forms, IPA letters, newer scripts). Latin letters, umlauts and accents agree.
+        Scalar(StringUrn, "lower", "LOWER", "FUNCTION", Str, c => $"LOWER({c.V(0)})", new TSqlFunctionVariant(["str"], ("char_set", "UTF8")));
+        Scalar(StringUrn, "upper", "UPPER", "FUNCTION", Str, c => $"UPPER({c.V(0)})", new TSqlFunctionVariant(["str"], ("char_set", "UTF8")));
         // LEN ignores trailing spaces; replacing spaces (with one character each) counts them.
-        Scalar(StringUrn, "char_length", "LEN", "FUNCTION", Long, c => throw c.Unsupported("SQL Server counts string lengths in UTF-16 code units."), V("str"));
+        // a character appended keeps LEN from dropping trailing spaces; the code-point collation makes it count
+        // code points, not UTF-16 code units
+        Scalar(StringUrn, "char_length", "LEN", "FUNCTION", Long,
+            c => $"CAST(LEN(({c.V(0)}) COLLATE {TSqlEmitter.CodePointCollation} + N'.') - 1 AS bigint)", V("str"));
         Scalar(StringUrn, "octet_length", "DATALENGTH", "FUNCTION", Long, c => $"CAST(DATALENGTH({Utf8(c)}) AS bigint)", V("str"));
         Scalar(StringUrn, "bit_length", "DATALENGTH", "FUNCTION", Long, c => $"(CAST(DATALENGTH({Utf8(c)}) AS bigint) * 8)", V("str"));
         Scalar(StringUrn, "ltrim", "LTRIM", "FUNCTION", Str, c => $"LTRIM({c.V(0)}, {TrimCharacters(c)})", V("str_str"));
         Scalar(StringUrn, "rtrim", "RTRIM", "FUNCTION", Str, c => $"RTRIM({c.V(0)}, {TrimCharacters(c)})", V("str_str"));
         Scalar(StringUrn, "trim", "TRIM", "FUNCTION", Str, c => $"TRIM({TrimCharacters(c)} FROM {c.V(0)})", V("str_str"));
+        // [FABRICATOR-PATCH: OURS-BY-DESIGN] lpad / rpad as DuckDB defines them (measured): the fill repeats from its
+        // start, a longer input is cut to the length from the RIGHT end, positions are code points. Length and fill
+        // must be constants (length >= 0, fill non-empty — DuckDB fails on an empty one).
+        Scalar(StringUrn, "lpad", "LPAD", "FUNCTION", Str, c => Pad(c, left: true), V("str_i32_str"));
+        Scalar(StringUrn, "rpad", "RPAD", "FUNCTION", Str, c => Pad(c, left: false), V("str_i32_str"));
         Scalar(StringUrn, "left", "LEFT", "FUNCTION", Str, c => $"LEFT({c.V(0)}, {c.V(1)})", V("str_i32"));
         Scalar(StringUrn, "right", "RIGHT", "FUNCTION", Str, c => $"RIGHT({c.V(0)}, {c.V(1)})", V("str_i32"));
         var regexDefaults = new[] { ("multiline", "MULTILINE_DISABLED"), ("dotall", "DOTALL_DISABLED") };
@@ -967,6 +1010,8 @@ internal static class TSqlFunctionCatalog
         Scalar(DatetimeUrn, "extract", "DATEPART", "FUNCTION", Long, Extract,
             V("req_pts", "req_ptstz_str", "req_date", "req_pt", "req_req_pts", "req_req_ptstz_str", "req_req_date"));
         Condition(DatetimeUrn, "extract_boolean", "DATEPART", "FUNCTION", ExtractBoolean, V("req_pts", "req_ptstz_str", "req_date"));
+        // [FABRICATOR-PATCH: OURS-BY-DESIGN] round_calendar rounding DOWN to one unit (DuckDB's date_trunc) as DATETRUNC
+        Scalar(DatetimeUrn, "round_calendar", "DATETRUNC", "FUNCTION", SameAsFirst, RoundCalendar, V("pts_req_req_req_i64"));
         Scalar(DatetimeUrn, "add", "DATEADD", "FUNCTION", DatetimeArithmeticType, c => DatetimeArithmetic(c, negate: false),
             V("pts_iday", "ptstz_iday", "date_iday", "pts_iyear", "ptstz_iyear_str", "date_iyear"));
         Scalar(DatetimeUrn, "subtract", "DATEADD", "FUNCTION", DatetimeArithmeticType, c => DatetimeArithmetic(c, negate: true),
@@ -1259,7 +1304,10 @@ internal static class TSqlFunctionCatalog
 
     private static string StrPos(TSqlCall c)
     {
-        string position = $"CAST(CHARINDEX({c.S(1)}, {c.S(0)}) AS bigint)";
+        // [FABRICATOR-PATCH: OURS-BY-DESIGN] CHARINDEX searches under the query's binary collation and answers in
+        // UTF-16 code units; the code points before the match are counted under the code-point collation
+        string unit = $"CHARINDEX({c.S(1)}, {c.S(0)})";
+        string position = $"CAST(CASE WHEN {unit} = 0 THEN 0 ELSE LEN((LEFT({c.S(0)}, {unit} - 1)) COLLATE {TSqlEmitter.CodePointCollation} + N'.') END AS bigint)";
         if (c.StringLiteral(1) is { Length: > 0 })
         {
             return position;
@@ -1374,6 +1422,34 @@ internal static class TSqlFunctionCatalog
     {
         "HOUR", "MINUTE", "SECOND", "MILLISECOND", "MICROSECOND", "SUBSECOND",
     };
+
+    /// <summary>
+    /// [FABRICATOR-PATCH: OURS-BY-DESIGN] round_calendar(x, FLOOR, unit, origin, multiple) for the forms date_trunc
+    /// produces, as DATETRUNC (SQL Server 2022+). The week is the ISO week (Monday), never DATEFIRST's.
+    /// </summary>
+    private static string RoundCalendar(TSqlCall c)
+    {
+        if (!c.Emitter.SupportsDateTrunc)
+        {
+            throw c.Unsupported("DATETRUNC needs SQL Server 2022 or later.");
+        }
+        long? multiple = c.Literal(4) is { } lit && lit.Type.IsInteger ? lit.IntValue : null;
+        string? part = (c.Enum(1), c.Enum(2), c.Enum(3), multiple) switch
+        {
+            ("FLOOR", "YEAR", "YEAR", 1) => "year",
+            ("FLOOR", "MONTH", "YEAR", 3) => "quarter",
+            ("FLOOR", "MONTH", "YEAR", 1) => "month",
+            ("FLOOR", "WEEK", "ISO_WEEK", 1) => "iso_week",
+            ("FLOOR", "DAY", _, 1) => "day",
+            ("FLOOR", "HOUR", "DAY", 1) => "hour",
+            ("FLOOR", "MINUTE", "HOUR", 1) => "minute",
+            ("FLOOR", "SECOND", "MINUTE", 1) => "second",
+            _ => null,
+        };
+        return part == null
+            ? throw c.Unsupported("only rounding down to one calendar unit is supported.")
+            : $"DATETRUNC({part}, {c.V(0)})";
+    }
 
     private static string Extract(TSqlCall c)
     {

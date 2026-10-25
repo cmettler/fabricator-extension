@@ -8,6 +8,7 @@
 #include "duckdb/common/enum_util.hpp" // [FABRICATOR-PATCH: DUCKDB-2.0] window bounds
 #include "duckdb/planner/operator/logical_window.hpp"
 #include "duckdb/function/window_function.hpp"
+#include "duckdb/common/enums/date_part_specifier.hpp"
 #include "duckdb/execution/index/art/art_key.hpp"
 #include "duckdb/function/table/table_scan.hpp"
 #include "duckdb/parser/constraints/not_null_constraint.hpp"
@@ -238,8 +239,30 @@ void DuckDBToSubstrait::TransformTime(const Value &dval, substrait::Expression &
 }
 
 void DuckDBToSubstrait::TransformTimestamp(const Value &dval, substrait::Expression &sexpr) {
-	auto &sval = *sexpr.mutable_literal();
-	sval.set_string(dval.ToString());
+	// [FABRICATOR-PATCH: OFFER-READY] upstream wrote a TIMESTAMP constant as a STRING literal (dval.ToString()), so a
+	// consumer compared a timestamp column with a string. A precision_timestamp in the type's own unit instead.
+	auto raw = dval.GetValueUnsafe<int64_t>();
+	if (!Value::IsFinite(timestamp_t(raw))) {
+		throw NotImplementedException("Substrait has no representation for infinite TIMESTAMP values");
+	}
+	int32_t precision;
+	switch (dval.type().id()) {
+	case LogicalTypeId::TIMESTAMP_SEC:
+		precision = 0;
+		break;
+	case LogicalTypeId::TIMESTAMP_MS:
+		precision = 3;
+		break;
+	case LogicalTypeId::TIMESTAMP_NS:
+		precision = 9;
+		break;
+	default:
+		precision = 6;
+		break;
+	}
+	auto timestamp = sexpr.mutable_literal()->mutable_precision_timestamp();
+	timestamp->set_precision(precision);
+	timestamp->set_value(raw);
 }
 
 void DuckDBToSubstrait::TransformTimestampTz(const Value &dval, substrait::Expression &sexpr) {
@@ -361,8 +384,11 @@ void DuckDBToSubstrait::TransformConstant(const Value &dval, substrait::Expressi
 		TransformInterval(dval, sexpr);
 		break;
 	case LogicalTypeId::VARCHAR:
-	case LogicalTypeId::BLOB:
 		TransformVarchar(dval, sexpr);
+		break;
+	case LogicalTypeId::BLOB:
+		// [FABRICATOR-PATCH: OFFER-READY] a BLOB constant is a binary literal, not a string (upstream sent a string)
+		sexpr.mutable_literal()->set_binary(StringValue::Get(dval));
 		break;
 	case LogicalTypeId::BOOLEAN:
 		TransformBoolean(dval, sexpr);
@@ -465,6 +491,70 @@ void DuckDBToSubstrait::TransformFunctionExpression(Expression &dexpr, substrait
 		return;
 	}
 	auto sfun = sexpr.mutable_scalar_function();
+	// [FABRICATOR-PATCH: OFFER-READY] date_trunc is Substrait's round_calendar(x, FLOOR, unit, origin, multiple): the
+	// last multiple of the unit since the origin, rounded down. DuckDB truncates a DATE to a TIMESTAMP, so a date
+	// goes in cast to one; weeks are ISO weeks (they start on Monday). Parts with no such form decline.
+	if (function_name == "date_trunc") {
+		auto &children = dfun.GetChildren();
+		if (children.size() != 2 || !children[0]->IsFoldable() || dfun.GetReturnType().id() != LogicalTypeId::TIMESTAMP) {
+			throw NotImplementedException("to_substrait: this date_trunc is not supported");
+		}
+		auto part_value = ExpressionExecutor::EvaluateScalar(context, *children[0]);
+		DatePartSpecifier part;
+		if (part_value.IsNull() || !TryGetDatePartSpecifier(part_value.ToString(), part)) {
+			throw NotImplementedException("to_substrait: date_trunc part is not supported");
+		}
+		const char *unit = nullptr, *origin = nullptr;
+		int64_t multiple = 1;
+		switch (part) {
+		case DatePartSpecifier::YEAR:
+			unit = "YEAR", origin = "YEAR";
+			break;
+		case DatePartSpecifier::QUARTER:
+			unit = "MONTH", origin = "YEAR", multiple = 3;
+			break;
+		case DatePartSpecifier::MONTH:
+			unit = "MONTH", origin = "YEAR";
+			break;
+		case DatePartSpecifier::WEEK:
+			unit = "WEEK", origin = "ISO_WEEK";
+			break;
+		case DatePartSpecifier::DAY:
+			unit = "DAY", origin = "MONTH";
+			break;
+		case DatePartSpecifier::HOUR:
+			unit = "HOUR", origin = "DAY";
+			break;
+		case DatePartSpecifier::MINUTE:
+			unit = "MINUTE", origin = "HOUR";
+			break;
+		case DatePartSpecifier::SECOND:
+			unit = "SECOND", origin = "MINUTE";
+			break;
+		default:
+			throw NotImplementedException("to_substrait: date_trunc part is not supported");
+		}
+		auto &input = *children[1];
+		auto input_type = input.GetReturnType().id();
+		if (input_type == LogicalTypeId::TIMESTAMP) {
+			TransformExpr(input, *sfun->add_arguments()->mutable_value(), col_offset);
+		} else if (input_type == LogicalTypeId::DATE) {
+			auto cast = sfun->add_arguments()->mutable_value()->mutable_cast();
+			TransformExpr(input, *cast->mutable_input(), col_offset);
+			*cast->mutable_type() = DuckToSubstraitType(LogicalType::TIMESTAMP);
+			cast->set_failure_behavior(substrait::Expression_Cast_FailureBehavior_FAILURE_BEHAVIOR_THROW_EXCEPTION);
+		} else {
+			throw NotImplementedException("to_substrait: date_trunc of %s is not supported", input.GetReturnType().ToString());
+		}
+		*sfun->add_arguments()->mutable_enum_() = "FLOOR";
+		*sfun->add_arguments()->mutable_enum_() = unit;
+		*sfun->add_arguments()->mutable_enum_() = origin;
+		sfun->add_arguments()->mutable_value()->mutable_literal()->set_i64(multiple);
+		sfun->set_function_reference(
+		    RegisterDeclaredFunction("round_calendar:pts_req_req_req_i64", "extension:io.substrait:functions_datetime"));
+		*sfun->mutable_output_type() = DuckToSubstraitType(dfun.GetReturnType());
+		return;
+	}
 	// [FABRICATOR-PATCH: OFFER-READY] a date part is Substrait's extract with the component in upper case (the
 	// spec's enum values) and, for components that count, the indexing enum; the compound name carries each
 	// enum as `req` (extract:req_date, extract:req_req_date). Upstream sent the lower-case function name and

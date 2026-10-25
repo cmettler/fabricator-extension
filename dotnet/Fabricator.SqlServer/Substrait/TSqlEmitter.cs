@@ -25,6 +25,13 @@ internal sealed class TSqlEmitter
     /// <summary>The collation closest to Substrait's string semantics: binary and case-sensitive, by UTF-16 code unit.</summary>
     public const string BinaryCollation = "Latin1_General_100_BIN2_UTF8";
 
+    /// <summary>
+    /// [FABRICATOR-PATCH: OURS-BY-DESIGN] A supplementary-character-aware collation: under it LEN, SUBSTRING and LEFT
+    /// count code points (as DuckDB does), where the binary collation counts UTF-16 code units. Used ONLY for
+    /// counting and cutting, never to compare — it is linguistic, not binary.
+    /// </summary>
+    public const string CodePointCollation = "Latin1_General_100_CS_AS_SC_UTF8";
+
     /// <summary>The collation used for functions asked to ignore case (and nothing else: accents, kana and width count).</summary>
     public const string CaseInsensitiveCollation = "Latin1_General_100_CI_AS_KS_WS_SC_UTF8";
 
@@ -53,6 +60,9 @@ internal sealed class TSqlEmitter
 
     /// <summary>[FABRICATOR-PATCH: OURS-BY-DESIGN] The server takes IGNORE NULLS in window functions (SQL Server 2022+).</summary>
     public bool SupportsIgnoreNulls { get; init; } = true;
+
+    /// <summary>[FABRICATOR-PATCH: OURS-BY-DESIGN] The server has DATETRUNC (SQL Server 2022+).</summary>
+    public bool SupportsDateTrunc { get; init; } = true;
 
     /// <summary>
     /// Writes the query. With <paramref name="nested"/>, the query is meant
@@ -1404,8 +1414,18 @@ internal sealed class TSqlEmitter
             case TypeKind.I8:
                 throw SubstraitTranslationException.Unsupported("Casts to i8 are not supported; SQL Server's tinyint is unsigned.");
             case TypeKind.I16 or TypeKind.I32 or TypeKind.I64 when source.IsFloat:
-                // [FABRICATOR-PATCH: OURS-BY-DESIGN] DuckDB rounds a float half to even, T-SQL truncates and its ROUND goes half away from zero
-                throw SubstraitTranslationException.Unsupported("Casts from floating point to integers are not supported; DuckDB rounds half to even.");
+            {
+                // [FABRICATOR-PATCH: OURS-BY-DESIGN] DuckDB rounds a float half to EVEN (2.5 -> 2, 3.5 -> 4, -2.5 -> -2);
+                // T-SQL's CAST truncates and its ROUND goes half away from zero. Rebuilt exactly from FLOOR / CEILING:
+                // the fraction x - FLOOR(x) is exact in binary floating point, so no ROUND (which can carry
+                // 0.49999999999999994 up) is involved; a fraction of exactly .5 takes the even neighbour.
+                string x = input.Value;
+                string f = $"({x} - FLOOR({x}))";
+                string rounded = $"(CASE WHEN {f} < 0.5E0 THEN FLOOR({x}) WHEN {f} > 0.5E0 THEN CEILING({x}) " +
+                                 $"WHEN FLOOR({x}) = 2E0 * FLOOR({x} / 2E0) THEN FLOOR({x}) ELSE CEILING({x}) END)";
+                text = Convert(rounded, TSql.RequireTypeName(target));
+                break;
+            }
             case TypeKind.I16 or TypeKind.I32 or TypeKind.I64 when source.Kind == TypeKind.Decimal && source.Scale > 0:
                 // [FABRICATOR-PATCH: OURS-BY-DESIGN] DuckDB rounds a decimal half away from zero, T-SQL's CAST truncates; ROUND first (measured)
                 text = Convert($"ROUND(CAST({input.Value} AS decimal(38,{source.Scale})), 0)", TSql.RequireTypeName(target));

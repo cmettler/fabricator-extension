@@ -280,38 +280,48 @@ ATTACH 'Server=...;Database=...' AS mssql (TYPE fabricator, keep_nulls false);
 -- DuckDB connection, so it would govern every catalog attached in it.
 ATTACH 'Server=...;Database=...' AS mssql (TYPE fabricator, mars 'false');
 
--- EXPERIMENTAL, off by default: run a whole single-table aggregate / GROUP BY on the server.
+-- EXPERIMENTAL, off by default: run whole queries (joins, aggregates, windows) on the server.
 ATTACH 'Server=...;Database=...' AS mssql (TYPE fabricator, remote_pushdown 'true');
 ```
 
 **`remote_pushdown` (experimental, off by default).** With it, a `SELECT` over tables of this catalog runs as
 ONE T-SQL statement, so only its result leaves the server; `EXPLAIN` shows `Fabricator Query` instead of
-`Fabricator Scan`. What is pushed:
+`Fabricator Scan`. DuckDB binds the query itself, the plan travels as [Substrait](https://substrait.io) and is
+translated to T-SQL; the result keeps DuckDB's types and column names, and an `ORDER BY` is applied again
+locally. Whenever any part cannot be translated EXACTLY, the whole statement runs locally as before. Pushed:
 
-- one table, or `INNER` / `LEFT JOIN`s of them `ON` column equalities and comparisons;
-- `count(*)`, `count([DISTINCT] col)`, `min`, `max`, `sum` over integer and decimal columns, `GROUP BY` plain
-  columns, `DISTINCT`, and `HAVING` over those aggregates — over one table it must aggregate, group or be
-  `DISTINCT` (the scan already pushes a plain filter), with a join a plain projection is pushed too;
-- integer `+ - *` over SMALLINT/INTEGER/BIGINT columns and constants, anywhere a column may appear;
-- `WHERE` / `ON` / `HAVING` of comparisons with constants or between two values, `AND`/`OR`/`NOT`,
-  `IS [NOT] NULL`;
-- strings: `=` and `<>`, `GROUP BY`, `DISTINCT`, `count(DISTINCT)` and string join keys — compared exactly as
-  DuckDB does (case-, accent- and trailing-space-sensitive) whatever the column's collation;
-- `ORDER BY` columns, aggregates, select aliases and positions, with `LIMIT` / `OFFSET`. DuckDB's NULL order
-  (including `SET default_null_order`) is reproduced on the server, and the result is sorted again locally.
+- joins of the catalog's tables (`INNER`, `LEFT`, `RIGHT`, `FULL`, and `IN` / `EXISTS` subqueries), `UNION ALL`,
+  `EXCEPT ALL`, `INTERSECT ALL`;
+- aggregates (`count`, `sum`, `avg`, `min`/`max` — strings too — `bool_and`/`bool_or`, …), `GROUP BY`, `HAVING`,
+  `DISTINCT`, `ORDER BY` with `LIMIT` / `OFFSET`;
+- window functions: `row_number`, `rank`, `dense_rank`, `percent_rank`, `cume_dist`, `ntile`, `lag`/`lead`,
+  `first_value`/`last_value`, aggregates over a window, `ROWS` frames with constant offsets and `RANGE` up to the
+  current row; `IGNORE NULLS` with an offset of 1 and no default (SQL Server 2022+);
+- arithmetic, `CASE`, `COALESCE`, `NULLIF`, casts (a float cast to an integer rounds half to even, as in DuckDB),
+  date parts (`year`, `month`, `day`, `hour`, … via `extract` / `date_part`), `date_trunc` to year / quarter /
+  month / week (ISO, Monday) / day / hour / minute / second (SQL Server 2022+);
+- strings, compared, grouped and sorted exactly as DuckDB does (case-, accent- and trailing-space-sensitive, code
+  point order) whatever the column's collation — an equality keeps an index seek usable; `concat`, `replace`,
+  `trim`, `lpad`/`rpad`, `length`, `substring`, `strpos` (counted in code points), `LIKE` without `_`,
+  `starts_with` / `contains` / `ends_with`, `lower` / `upper` (see below).
 
-Everything else runs exactly as before, and nothing pushed may answer differently: result types and column
-names are DuckDB's own, and a shape whose T-SQL meaning could differ is not pushed — comparing, grouping or
-ordering strings (`ORDER BY`, `<`, `>`, `min`/`max` — SQL Server cannot be made to sort like DuckDB), any string
-comparison while a DuckDB `default_collation` is set, floats, timestamps, `avg`, division, a constant that does
-not convert exactly to the other side's type (`int_col > 1.5`), `DISTINCT ON`, `FULL`/`SEMI`/`ANTI`/`USING`
-joins, an unqualified column name two joined tables share, and subqueries. A branch of `UNION`/`EXCEPT` is pushed on
-its own; a subquery joined to a local table is not (DuckDB pushes only whole nodes). The one accepted
-differences are both an error on one side and an answer on the other, never two answers: an integer `sum`
-past 10^38 overflows on the server (DuckDB's would answer up to about 1.7 x 10^38), and integer arithmetic
-whose INTERMEDIATE value overflows DuckDB's type (`int_col * 2` near 2^31) errors in DuckDB but is answered
-by the server, which computes in BIGINT — a final value out of range still errors. Box SQL Server only (ignored on a Fabric/Synapse warehouse); read once at
-ATTACH. `FABRICATOR_DUMP_REMOTE=1` prints each decision and the T-SQL sent.
+Runs locally (each measured to answer differently on SQL Server, or not expressible): a plain scan of one table
+(the table scan already pushes its filter and projection), two result columns of the same name, `reverse`,
+regular expressions, `LIKE` patterns with `_`, `substring` with a negative or non-constant start, comparing or
+grouping binary values (SQL Server ignores trailing zero bytes), a float divided by a value that may be zero,
+decimal arithmetic past precision 38 (SQL Server would round), float → string casts, `any_value`, `GROUPS` /
+`RANGE`-offset / `EXCLUDE` / `FILTER` windows, `nth_value`, functions without a Substrait counterpart (`date_diff`,
+`strftime`, list and JSON functions, …), prepared-statement parameters, and a subquery joined to a
+local table (DuckDB pushes only whole nodes).
+
+⚠ **The one accepted difference: `lower` / `upper`.** SQL Server's case tables are Unicode 5.0, DuckDB's are
+current: 298 (`lower`) and 308 (`upper`) rarely used BMP characters map differently — `upper('ß')` is `ẞ` in
+DuckDB and stays `ß` on the server, likewise `µ`, `ſ`, Greek symbol forms and some newer scripts. Latin letters,
+umlauts and accents agree. This also applies to a DuckDB `nocase` collation, which DuckDB binds as `lower()`.
+Overflows are an error on both sides.
+
+Needs SQL Server 2019+ or Azure SQL (exact string semantics rest on UTF-8 collations); ignored on a Fabric /
+Synapse warehouse; read once at ATTACH. `FABRICATOR_DUMP_REMOTE=1` prints each decision and the T-SQL sent.
 
 On a **Fabric** SQL endpoint the catalog also gains a `fabric` schema of platform functions, which need no
 extra options (they derive the workspace and item from the connection string; `API_WORKSPACE` / `API_ITEM`

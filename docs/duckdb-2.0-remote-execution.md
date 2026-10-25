@@ -709,17 +709,21 @@ translate. Two host rules on top: a plan of scans / filters / projections / sort
 
 | shape | SQL Server | DuckDB | now |
 |---|---|---|---|
-| `lower` / `upper` | maps 298 / 308 BMP code points differently (Greek symbol forms, ß, µ, ſ, IPA) — measured over all 63 487 | Unicode | declined (and so is `nocase`, bound as `lower`) |
-| `length`, `substring`, `strpos`, LIKE `_` | UTF-16 code units under `BIN2_UTF8`: `length('𝄞x𝄞')` 5, a surrogate pair split | code points | declined; LIKE without `_` pushes |
+| `lower` / `upper` | maps 298 / 308 BMP code points differently (Greek symbol forms, ß, µ, ſ, IPA) — measured over all 63 487 | Unicode | **pushed anyway — the ONE accepted divergence** (user decision 2026-10-25, in the README; `nocase` follows, bound as `lower`) |
+| `length`, `substring`, `strpos`, LIKE `_` | UTF-16 code units under `BIN2_UTF8`: `length('𝄞x𝄞')` 5, a surrogate pair split | code points | counted / cut under `Latin1_General_100_CS_AS_SC_UTF8` (never compared under it); `strpos` searches binary and converts the unit position; LIKE `_` still declined (an SC collation compares linguistically) |
+| `substring` with a negative start | before the beginning | counts from the end | declined unless start and length are constants >= 0 |
+| `lpad` / `rpad` | — (not in the emitter) | fill repeats from its start, a longer input is cut from the right, code points | added, length and fill constant |
 | `reverse` | code units | grapheme clusters (é + U+0301 keeps its accent) | declined |
 | `regexp_replace` | every match | the first (without 'g') | all `regexp_*` declined |
 | binary `=`, GROUP BY, ORDER BY | ignores trailing zero bytes (0x01 = 0x0100) | exact | declined |
-| float → integer CAST | truncates; ROUND goes half away from zero | half to even | declined |
+| float → integer CAST | truncates; ROUND goes half away from zero | half to even | rebuilt exactly from FLOOR / CEILING (the fraction is exact in binary floating point; no ROUND, which can carry 0.49999999999999994 up) |
 | decimal → integer CAST | truncates | half away from zero | `CAST(ROUND(x, 0) AS int)` — exact |
 | decimal arithmetic past precision 38 | reduces the scale and rounds | keeps the scale | declined where the server's scale falls below the result's |
 | float `/` by a value that may be 0 | error | inf / nan | declined unless the divisor is a non-zero constant |
 | `any_value` (and `nocase` GROUP BY) | MAX | first | declined |
 | `SELECT rowid …` (upstream to_substrait) | — | — | upstream read the table's FIRST column; declined |
+| TIMESTAMP constants (upstream to_substrait) | — | — | sent as a STRING literal (`dval.ToString()`), so `ts = TIMESTAMP '…'` failed on the server; a `precision_timestamp` in the type's unit now. BLOB constants were strings too; binary now |
+| `date_trunc` | `DATETRUNC` (2022+) | — | producer: Substrait `round_calendar` (FLOOR, one unit, ISO week); emitter: `DATETRUNC(year/quarter/month/iso_week/day/hour/minute/second, x)`; a DATE goes in cast to TIMESTAMP, as DuckDB returns one; other parts decline |
 | TIME columns (upstream to_substrait) | declared as a TIMESTAMP | — | `precision_time`, TIME_NS with 9 digits |
 
 - ⚠ A table with ONE column of a type Substrait cannot express declined EVERY query on it (to_substrait writes
@@ -728,6 +732,12 @@ translate. Two host rules on top: a plan of scans / filters / projections / sort
   lag/lead over strings declined on the NULL cast.
 - An improvement over the hand-written renderer: it computed integer intermediates in BIGINT and answered where
   DuckDB overflows; the plan carries DuckDB's INTEGER now, so both paths raise the overflow.
+- ⚠⚠ **A scalar-subquery comparison is NOT a differential**: `SELECT (SELECT … FROM rp…) = (SELECT … FROM db…)` puts
+  both sides in ONE expression, the remote optimizer pushes only whole nodes, so BOTH run locally and the check
+  compares local with local. Ten such rows in this suite were vacuous — found when a producer mutant (timestamp
+  constants as strings) survived them; the matching EXPLAIN row passed because EXPLAIN does not execute. Only the
+  `EXCEPT ALL` form compares (set-operation branches ARE pushed one by one). All ten are rewritten; an order check
+  is a `rank() OVER (ORDER BY …)` computed on the server instead of a local `list(… ORDER BY)`.
 - Gate: `verify_remote_select_mssql` 373 → 439 (§2 rewritten: what still stays local; §2b the former declines,
   each with a differential; §13 windows; §14 the declines above). Mutants killed at their own rows: the binary
   decline removed (the binary routing row), the decimal ROUND removed (the cast differential).

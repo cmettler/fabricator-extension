@@ -182,9 +182,10 @@ EXPLAIN SELECT max(s) FROM rp.dbo.rs_t;
 physical_plan	<REGEX>:.*Fabricator Query.*
 
 query I
-SELECT (SELECT max(s) FROM rp.dbo.rs_t) IS NOT DISTINCT FROM (SELECT max(s) FROM db.dbo.rs_t);
+SELECT count(*) FROM (((SELECT max(s) AS m FROM rp.dbo.rs_t) EXCEPT ALL (SELECT max(s) AS m FROM db.dbo.rs_t))
+  UNION ALL ((SELECT max(s) AS m FROM db.dbo.rs_t) EXCEPT ALL (SELECT max(s) AS m FROM rp.dbo.rs_t)));
 ----
-true
+0
 
 query II
 EXPLAIN SELECT count(*) FROM rp.dbo.rs_t WHERE s > 's1';
@@ -192,9 +193,10 @@ EXPLAIN SELECT count(*) FROM rp.dbo.rs_t WHERE s > 's1';
 physical_plan	<REGEX>:.*Fabricator Query.*
 
 query I
-SELECT (SELECT count(*) FROM rp.dbo.rs_t WHERE s > 's1') = (SELECT count(*) FROM db.dbo.rs_t WHERE s > 's1');
+SELECT count(*) FROM (((SELECT count(*) AS n FROM rp.dbo.rs_t WHERE s > 's1') EXCEPT ALL (SELECT count(*) AS n FROM db.dbo.rs_t WHERE s > 's1'))
+  UNION ALL ((SELECT count(*) AS n FROM db.dbo.rs_t WHERE s > 's1') EXCEPT ALL (SELECT count(*) AS n FROM rp.dbo.rs_t WHERE s > 's1')));
 ----
-true
+0
 
 query II
 EXPLAIN SELECT s, count(*) FROM rp.dbo.rs_t GROUP BY s ORDER BY s;
@@ -202,10 +204,10 @@ EXPLAIN SELECT s, count(*) FROM rp.dbo.rs_t GROUP BY s ORDER BY s;
 physical_plan	<REGEX>:.*Fabricator Query.*
 
 query I
-SELECT (SELECT list(x ORDER BY i) FROM (SELECT row_number() OVER () AS i, x FROM (SELECT s || ':' || count(*) AS x FROM rp.dbo.rs_t GROUP BY s ORDER BY s)))
-     = (SELECT list(x ORDER BY i) FROM (SELECT row_number() OVER () AS i, x FROM (SELECT s || ':' || count(*) AS x FROM db.dbo.rs_t GROUP BY s ORDER BY s)));
+SELECT count(*) FROM (((SELECT s, count(*) AS n, rank() OVER (ORDER BY s) AS r FROM rp.dbo.rs_t GROUP BY s) EXCEPT ALL (SELECT s, count(*) AS n, rank() OVER (ORDER BY s) AS r FROM db.dbo.rs_t GROUP BY s))
+  UNION ALL ((SELECT s, count(*) AS n, rank() OVER (ORDER BY s) AS r FROM db.dbo.rs_t GROUP BY s) EXCEPT ALL (SELECT s, count(*) AS n, rank() OVER (ORDER BY s) AS r FROM rp.dbo.rs_t GROUP BY s)));
 ----
-true
+0
 
 # a float sum and avg: an integer avg divides an EXACT sum (decimal(38,0)) by the count, in float
 query II
@@ -226,10 +228,11 @@ EXPLAIN SELECT count(*) FROM rp.dbo.rs_t WHERE id > 1.5;
 ----
 physical_plan	<REGEX>:.*Fabricator Query.*
 
-query II
-SELECT (SELECT count(*) FROM rp.dbo.rs_t WHERE id > 1.5), (SELECT count(*) FROM rp.dbo.rs_t WHERE t < 300);
+query I
+SELECT count(*) FROM (((SELECT count(*) FILTER (WHERE id > 1.5) AS a, count(*) FILTER (WHERE t < 300) AS b FROM rp.dbo.rs_t) EXCEPT ALL (SELECT count(*) FILTER (WHERE id > 1.5) AS a, count(*) FILTER (WHERE t < 300) AS b FROM db.dbo.rs_t))
+  UNION ALL ((SELECT count(*) FILTER (WHERE id > 1.5) AS a, count(*) FILTER (WHERE t < 300) AS b FROM db.dbo.rs_t) EXCEPT ALL (SELECT count(*) FILTER (WHERE id > 1.5) AS a, count(*) FILTER (WHERE t < 300) AS b FROM rp.dbo.rs_t)));
 ----
-149	300
+0
 
 # DISTINCT ON, FULL and USING joins
 query II
@@ -247,13 +250,17 @@ EXPLAIN SELECT count(*) FROM rp.dbo.rs_t a FULL JOIN rp.dbo.rs_u b ON a.k = b.k;
 ----
 physical_plan	<REGEX>:.*Fabricator Query.*
 
-query IIII
-SELECT (SELECT count(*) FROM rp.dbo.rs_t a FULL JOIN rp.dbo.rs_u b ON a.k = b.k),
-       (SELECT count(*) FROM db.dbo.rs_t a FULL JOIN db.dbo.rs_u b ON a.k = b.k),
-       (SELECT count(*) FROM rp.dbo.rs_t JOIN rp.dbo.rs_u USING (k)),
-       (SELECT count(*) FROM db.dbo.rs_t JOIN db.dbo.rs_u USING (k));
+query I
+SELECT count(*) FROM (((SELECT a.id, b.uid FROM rp.dbo.rs_t a FULL JOIN rp.dbo.rs_u b ON a.k = b.k) EXCEPT ALL (SELECT a.id, b.uid FROM db.dbo.rs_t a FULL JOIN db.dbo.rs_u b ON a.k = b.k))
+  UNION ALL ((SELECT a.id, b.uid FROM db.dbo.rs_t a FULL JOIN db.dbo.rs_u b ON a.k = b.k) EXCEPT ALL (SELECT a.id, b.uid FROM rp.dbo.rs_t a FULL JOIN rp.dbo.rs_u b ON a.k = b.k)));
 ----
-382	382	312	312
+0
+
+query I
+SELECT count(*) FROM (((SELECT a.id, b.uid FROM rp.dbo.rs_t a JOIN rp.dbo.rs_u b USING (k)) EXCEPT ALL (SELECT a.id, b.uid FROM db.dbo.rs_t a JOIN db.dbo.rs_u b USING (k)))
+  UNION ALL ((SELECT a.id, b.uid FROM db.dbo.rs_t a JOIN db.dbo.rs_u b USING (k)) EXCEPT ALL (SELECT a.id, b.uid FROM rp.dbo.rs_t a JOIN rp.dbo.rs_u b USING (k))));
+----
+0
 
 # an UNQUALIFIED name both tables have is ambiguous: declined, so DuckDB reports it rather than the server
 # picking one
@@ -845,26 +852,26 @@ EXPLAIN SELECT s, count(*) FROM rp.dbo.rs_s GROUP BY s ORDER BY s;
 physical_plan	<REGEX>:.*Fabricator Query.*
 
 query I
-SELECT (SELECT list(x ORDER BY i) FROM (SELECT row_number() OVER () AS i, x FROM (SELECT coalesce(s, '<null>') || ':' || count(*) AS x FROM rp.dbo.rs_s GROUP BY s ORDER BY s)))
-     = (SELECT list(x ORDER BY i) FROM (SELECT row_number() OVER () AS i, x FROM (SELECT coalesce(s, '<null>') || ':' || count(*) AS x FROM db.dbo.rs_s GROUP BY s ORDER BY s)));
+SELECT count(*) FROM (((SELECT s, count(*) AS n, rank() OVER (ORDER BY s) AS r FROM rp.dbo.rs_s GROUP BY s) EXCEPT ALL (SELECT s, count(*) AS n, rank() OVER (ORDER BY s) AS r FROM db.dbo.rs_s GROUP BY s))
+  UNION ALL ((SELECT s, count(*) AS n, rank() OVER (ORDER BY s) AS r FROM db.dbo.rs_s GROUP BY s) EXCEPT ALL (SELECT s, count(*) AS n, rank() OVER (ORDER BY s) AS r FROM rp.dbo.rs_s GROUP BY s)));
 ----
-true
+0
 
 query T
 SELECT max(s) FROM rp.dbo.rs_s;
 ----
 e
 
-# ⚠ a DuckDB collation changes what equality means. DuckDB binds `nocase` as lower(), and SQL Server's LOWER maps
-# 298 BMP code points differently from DuckDB's (measured over all of them), so lower() — and with it this — stays
-# local
+# ⚠ a DuckDB collation changes what equality means. DuckDB binds `nocase` as lower(), which is pushed as LOWER — the
+# ONE accepted divergence (user decision 2026-10-25): SQL Server maps 298 rare BMP code points differently (ß, µ,
+# Greek symbol forms, …); for this data, as for Latin text, the answer is DuckDB's
 statement ok
 SET default_collation = 'nocase';
 
 query II
 EXPLAIN SELECT count(*) FROM rp.dbo.rs_s WHERE s = 'a';
 ----
-physical_plan	<!REGEX>:.*Fabricator Query.*
+physical_plan	<REGEX>:.*Fabricator Query.*
 
 query I
 SELECT count(*) FROM rp.dbo.rs_s WHERE s = 'a';
@@ -999,9 +1006,10 @@ EXPLAIN SELECT sum(id + 5000000000) FROM rp.dbo.rs_t;
 physical_plan	<REGEX>:.*Fabricator Query.*
 
 query I
-SELECT (SELECT sum(id + 5000000000) FROM rp.dbo.rs_t) = (SELECT sum(id + 5000000000) FROM db.dbo.rs_t);
+SELECT count(*) FROM (((SELECT sum(id + 5000000000) AS s FROM rp.dbo.rs_t) EXCEPT ALL (SELECT sum(id + 5000000000) AS s FROM db.dbo.rs_t))
+  UNION ALL ((SELECT sum(id + 5000000000) AS s FROM db.dbo.rs_t) EXCEPT ALL (SELECT sum(id + 5000000000) AS s FROM rp.dbo.rs_t)));
 ----
-true
+0
 
 # ═══ §13  Window functions (Substrait, docs/duckdb-2.0-remote-execution.md §3.11) ════════════════════════
 # Ranks with NULLs in the order, running sums over peers (RANGE), ROWS frames, exact avg / HUGEINT sums over a
@@ -1075,10 +1083,10 @@ SELECT count(*) FROM (
 
 # QUALIFY and a window over GROUP BY
 query I
-SELECT (SELECT list(id ORDER BY id) FROM (SELECT id FROM rp.dbo.rs_t QUALIFY row_number() OVER (PARTITION BY k ORDER BY id DESC) = 1))
-     = (SELECT list(id ORDER BY id) FROM (SELECT id FROM db.dbo.rs_t QUALIFY row_number() OVER (PARTITION BY k ORDER BY id DESC) = 1));
+SELECT count(*) FROM (((SELECT id FROM rp.dbo.rs_t QUALIFY row_number() OVER (PARTITION BY k ORDER BY id DESC) = 1) EXCEPT ALL (SELECT id FROM db.dbo.rs_t QUALIFY row_number() OVER (PARTITION BY k ORDER BY id DESC) = 1))
+  UNION ALL ((SELECT id FROM db.dbo.rs_t QUALIFY row_number() OVER (PARTITION BY k ORDER BY id DESC) = 1) EXCEPT ALL (SELECT id FROM rp.dbo.rs_t QUALIFY row_number() OVER (PARTITION BY k ORDER BY id DESC) = 1)));
 ----
-true
+0
 
 query I
 SELECT count(*) FROM ((SELECT k, sum(id) AS s, rank() OVER (ORDER BY sum(id) DESC) AS r FROM rp.dbo.rs_t GROUP BY k)
@@ -1114,25 +1122,36 @@ SELECT fabricator_refresh_cache('rp');
 statement ok
 SELECT fabricator_refresh_cache('db');
 
-# lower / upper: 298 / 308 BMP code points map differently
+# lower / upper are PUSHED — the one accepted divergence (298 / 308 rare BMP code points map differently; ß, µ,
+# Greek symbol forms). Latin letters, umlauts and accents agree, which this data checks
 query II
 EXPLAIN SELECT lower(n), count(*) FROM rp.dbo.rs_x GROUP BY 1;
 ----
-physical_plan	<!REGEX>:.*Fabricator Query.*
+physical_plan	<REGEX>:.*Fabricator Query.*
 
-# positions and lengths count UTF-16 code units on the server: length(N'𝄞x𝄞') is 5 there, 3 here
+query I
+SELECT count(*) FROM (((SELECT id, lower(n), upper(n) FROM rp.dbo.rs_x ORDER BY id LIMIT 100) EXCEPT ALL (SELECT id, lower(n), upper(n) FROM db.dbo.rs_x ORDER BY id LIMIT 100))
+  UNION ALL ((SELECT id, lower(n), upper(n) FROM db.dbo.rs_x ORDER BY id LIMIT 100) EXCEPT ALL (SELECT id, lower(n), upper(n) FROM rp.dbo.rs_x ORDER BY id LIMIT 100)));
+----
+0
+
+# positions and lengths count code points: under the binary collation SQL Server counts UTF-16 code units
+# (length(N'𝄞x𝄞') 5, not 3), so length / substring / strpos / lpad / rpad count and cut under a supplementary-
+# character collation
 query II
 EXPLAIN SELECT length(n), count(*) FROM rp.dbo.rs_x GROUP BY 1;
 ----
-physical_plan	<!REGEX>:.*Fabricator Query.*
+physical_plan	<REGEX>:.*Fabricator Query.*
 
-query II
-EXPLAIN SELECT substring(n, 2, 2), count(*) FROM rp.dbo.rs_x GROUP BY 1;
+query I
+SELECT count(*) FROM (((SELECT id, length(n), substring(n, 2, 2), substring(n, 2), strpos(n, 'x'), lpad(n, 5, 'xy'), rpad(n, 2, '·') FROM rp.dbo.rs_x ORDER BY id LIMIT 100) EXCEPT ALL (SELECT id, length(n), substring(n, 2, 2), substring(n, 2), strpos(n, 'x'), lpad(n, 5, 'xy'), rpad(n, 2, '·') FROM db.dbo.rs_x ORDER BY id LIMIT 100))
+  UNION ALL ((SELECT id, length(n), substring(n, 2, 2), substring(n, 2), strpos(n, 'x'), lpad(n, 5, 'xy'), rpad(n, 2, '·') FROM db.dbo.rs_x ORDER BY id LIMIT 100) EXCEPT ALL (SELECT id, length(n), substring(n, 2, 2), substring(n, 2), strpos(n, 'x'), lpad(n, 5, 'xy'), rpad(n, 2, '·') FROM rp.dbo.rs_x ORDER BY id LIMIT 100)));
 ----
-physical_plan	<!REGEX>:.*Fabricator Query.*
+0
 
+# a NEGATIVE substring start counts from the end in DuckDB and lies before the beginning in T-SQL
 query II
-EXPLAIN SELECT strpos(n, 'x'), count(*) FROM rp.dbo.rs_x GROUP BY 1;
+EXPLAIN SELECT substring(n, -2, 2), count(*) FROM rp.dbo.rs_x GROUP BY 1;
 ----
 physical_plan	<!REGEX>:.*Fabricator Query.*
 
@@ -1154,9 +1173,10 @@ EXPLAIN SELECT count(*) FROM rp.dbo.rs_x WHERE n LIKE '%x%';
 physical_plan	<REGEX>:.*Fabricator Query.*
 
 query I
-SELECT (SELECT count(*) FROM rp.dbo.rs_x WHERE n LIKE '%x%') = (SELECT count(*) FROM db.dbo.rs_x WHERE n LIKE '%x%');
+SELECT count(*) FROM (((SELECT count(*) AS n FROM rp.dbo.rs_x WHERE n LIKE '%x%') EXCEPT ALL (SELECT count(*) AS n FROM db.dbo.rs_x WHERE n LIKE '%x%'))
+  UNION ALL ((SELECT count(*) AS n FROM db.dbo.rs_x WHERE n LIKE '%x%') EXCEPT ALL (SELECT count(*) AS n FROM rp.dbo.rs_x WHERE n LIKE '%x%')));
 ----
-true
+0
 
 # regexp_replace replaces every match on the server, the first one here
 query II
@@ -1175,11 +1195,18 @@ SELECT count(*) FROM rp.dbo.rs_x a JOIN rp.dbo.rs_x b ON a.vb = b.vb;
 ----
 3
 
-# a float cast to an integer: DuckDB rounds half to even, T-SQL truncates
+# a float cast to an integer: DuckDB rounds half to EVEN, T-SQL truncates — rebuilt exactly from FLOOR / CEILING.
+# f * 1.5 is id / 2, so every odd id is an exact .5, positive and negative
 query II
 EXPLAIN SELECT CAST(f AS INTEGER), count(*) FROM rp.dbo.rs_t GROUP BY 1;
 ----
-physical_plan	<!REGEX>:.*Fabricator Query.*
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+query I
+SELECT count(*) FROM (((SELECT id, CAST(f * 1.5 AS INTEGER), CAST(-f * 1.5 AS BIGINT), CAST(CAST(f * 1.5 AS REAL) AS SMALLINT), CAST(f AS INTEGER) FROM rp.dbo.rs_t ORDER BY id LIMIT 1000) EXCEPT ALL (SELECT id, CAST(f * 1.5 AS INTEGER), CAST(-f * 1.5 AS BIGINT), CAST(CAST(f * 1.5 AS REAL) AS SMALLINT), CAST(f AS INTEGER) FROM db.dbo.rs_t ORDER BY id LIMIT 1000))
+  UNION ALL ((SELECT id, CAST(f * 1.5 AS INTEGER), CAST(-f * 1.5 AS BIGINT), CAST(CAST(f * 1.5 AS REAL) AS SMALLINT), CAST(f AS INTEGER) FROM db.dbo.rs_t ORDER BY id LIMIT 1000) EXCEPT ALL (SELECT id, CAST(f * 1.5 AS INTEGER), CAST(-f * 1.5 AS BIGINT), CAST(CAST(f * 1.5 AS REAL) AS SMALLINT), CAST(f AS INTEGER) FROM rp.dbo.rs_t ORDER BY id LIMIT 1000)));
+----
+0
 
 # a float divided by something that may be zero: inf here, an error on the server
 query II
@@ -1211,6 +1238,46 @@ SELECT count(*) FROM ((SELECT CAST(amount AS INTEGER) AS c, CAST(-amount AS INTE
 ----
 0
 
+
+# ═══ §15  Dates: date_trunc and date/time constants ═════════════════════════════════════════════════════
+# date_trunc is Substrait's round_calendar (FLOOR, one unit; the week is the ISO week, Monday) and DATETRUNC on
+# the server (2022+). A DATE is truncated to a TIMESTAMP, as DuckDB does.
+
+query II
+EXPLAIN SELECT date_trunc('month', d), count(*) FROM rp.dbo.rs_t GROUP BY 1;
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+query I
+SELECT count(*) FROM (((SELECT id, date_trunc('year', d), date_trunc('quarter', d), date_trunc('month', d), date_trunc('week', d), date_trunc('day', d) FROM rp.dbo.rs_t ORDER BY id LIMIT 1000) EXCEPT ALL (SELECT id, date_trunc('year', d), date_trunc('quarter', d), date_trunc('month', d), date_trunc('week', d), date_trunc('day', d) FROM db.dbo.rs_t ORDER BY id LIMIT 1000))
+  UNION ALL ((SELECT id, date_trunc('year', d), date_trunc('quarter', d), date_trunc('month', d), date_trunc('week', d), date_trunc('day', d) FROM db.dbo.rs_t ORDER BY id LIMIT 1000) EXCEPT ALL (SELECT id, date_trunc('year', d), date_trunc('quarter', d), date_trunc('month', d), date_trunc('week', d), date_trunc('day', d) FROM rp.dbo.rs_t ORDER BY id LIMIT 1000)));
+----
+0
+
+query I
+SELECT count(*) FROM (((SELECT date_trunc('week', d) AS w, count(*) AS n, sum(amount) AS s FROM rp.dbo.rs_t GROUP BY 1) EXCEPT ALL (SELECT date_trunc('week', d) AS w, count(*) AS n, sum(amount) AS s FROM db.dbo.rs_t GROUP BY 1))
+  UNION ALL ((SELECT date_trunc('week', d) AS w, count(*) AS n, sum(amount) AS s FROM db.dbo.rs_t GROUP BY 1) EXCEPT ALL (SELECT date_trunc('week', d) AS w, count(*) AS n, sum(amount) AS s FROM rp.dbo.rs_t GROUP BY 1)));
+----
+0
+
+# a part with no round_calendar form runs locally
+query II
+EXPLAIN SELECT date_trunc('decade', d), count(*) FROM rp.dbo.rs_t GROUP BY 1;
+----
+physical_plan	<!REGEX>:.*Fabricator Query.*
+
+# ⚠ a TIMESTAMP constant was a STRING literal in upstream to_substrait, so comparing it failed on the server
+# ("Conversion failed when converting date and/or time from character string"); a precision_timestamp now
+query II
+EXPLAIN SELECT count(*) FROM rp.dbo.rs_t WHERE date_trunc('quarter', d) = TIMESTAMP '2026-01-01';
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+query I
+SELECT count(*) FROM (((SELECT count(*) AS n FROM rp.dbo.rs_t WHERE date_trunc('quarter', d) = TIMESTAMP '2026-01-01') EXCEPT ALL (SELECT count(*) AS n FROM db.dbo.rs_t WHERE date_trunc('quarter', d) = TIMESTAMP '2026-01-01'))
+  UNION ALL ((SELECT count(*) AS n FROM db.dbo.rs_t WHERE date_trunc('quarter', d) = TIMESTAMP '2026-01-01') EXCEPT ALL (SELECT count(*) AS n FROM rp.dbo.rs_t WHERE date_trunc('quarter', d) = TIMESTAMP '2026-01-01')));
+----
+0
 
 # ═══ §6  DML keeps its own paths ══════════════════════════════════════════════════════════════════════
 # The remote optimizer would also take DELETE / UPDATE nodes; this catalog refuses them, so the plan-less

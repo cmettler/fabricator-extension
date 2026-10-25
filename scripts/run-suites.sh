@@ -1443,7 +1443,9 @@ case "$TIER" in
         # 2026-10-25: 4165 -> 4231. verify_remote_select_mssql 373 -> 439: the Substrait path (ABI v96) replaces the
         #   hand-written renderer — the former declines pushed with differentials (§2b), windows (§13), and the
         #   measured wrong-answer classes it declines (§14). Hermetic unchanged at 85/85 -- 10593.
-        : "${MIN_ASSERTIONS:=4231}"
+        # 2026-10-25: 4231 -> 4232. verify_remote_select_mssql 439 -> 440: lower/upper pushed (the accepted divergence),
+        #   code-point length/substring/strpos/lpad/rpad, exact half-to-even float -> integer casts.
+        : "${MIN_ASSERTIONS:=4232}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

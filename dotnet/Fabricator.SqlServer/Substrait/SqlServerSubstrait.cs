@@ -80,7 +80,8 @@ public static class SqlServerSubstrait
         }
         var decoder = new SubstraitPlanDecoder(plan);
         RootRel root = decoder.DecodePlan();
-        var emitter = new TSqlEmitter(decoder.PerRecordEvaluation, DefaultCollation) { SupportsIgnoreNulls = ignoreNulls };
+        // IGNORE NULLS and DATETRUNC arrived together, with SQL Server 2022
+        var emitter = new TSqlEmitter(decoder.PerRecordEvaluation, DefaultCollation) { SupportsIgnoreNulls = ignoreNulls, SupportsDateTrunc = ignoreNulls };
         return emitter.EmitPushdown(root, out columnCount, out orderDescending);
     }
 
