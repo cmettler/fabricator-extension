@@ -92,6 +92,29 @@ if(APPLE)
                         "-Wl,-exported_symbol,_${TARGET_NAME}_core_duckdb_cpp_init")
 endif()
 
+# Linux ONLY: keep the statically linked OpenSSL out of libduckdb.so's DYNAMIC symbol table.
+#
+# DuckDB 2.0 links unittest (and the shell) against a SHARED libduckdb.so, and the vcpkg OpenSSL that httpfs
+# links statically lands in it with default visibility — 536 exported SSL_* symbols, where the 1.5
+# statically linked unittest exported none. .NET does TLS through the SYSTEM libssl.so.3, and that library's
+# references to libcrypto resolve through the GLOBAL scope first, i.e. into libduckdb.so. MEASURED with
+# LD_DEBUG=bindings: 495 of libssl's libcrypto bindings went to libduckdb.so and none to libcrypto.so.3, so
+# SqlClient's handshake ran system libssl 3.0 on top of vcpkg libcrypto 3.6.x. With CI's OpenSSL 3.6.5 every
+# SQL Server connect failed ("SSL Provider, error: 31 - Encryption(ssl/tls) handshake failed") and the 2.0
+# integration tier never passed. --exclude-libs leaves the copy PRIVATE to the code linked with it.
+# ⚠ DEFERRED to the end of the top-level configure: DuckDB adds extension directories BEFORE src/ in the
+# statically-linked build, so `duckdb` does not exist yet when this file runs — an immediate
+# `if(TARGET duckdb)` was silently false (measured: the flag never reached libduckdb.so's link line).
+# Shipped loadables do not link libduckdb.so and are unaffected.
+function(fabricator_hide_static_openssl)
+    if(TARGET duckdb)
+        target_link_options(duckdb PRIVATE "LINKER:--exclude-libs,libssl.a:libcrypto.a")
+    endif()
+endfunction()
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    cmake_language(DEFER DIRECTORY ${CMAKE_SOURCE_DIR} CALL fabricator_hide_static_openssl)
+endif()
+
 target_compile_definitions(${EXTENSION_NAME} PRIVATE FABRICATOR_VERSION="${FABRICATOR_EXTENSION_VERSION}")
 target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE FABRICATOR_VERSION="${FABRICATOR_EXTENSION_VERSION}")
 
