@@ -944,7 +944,11 @@ case "$TIER" in
         #   10333 + 260 exactly. ⚠ The first tier run with it was RED in verify_delta_catalog_transactions
         #   §42a: a metadata answer recorded no READ, so `INSERT INTO t SELECT max(id)+1 FROM t` committed as
         #   a blind append. That suite is the read-set gate this feature leans on.
-        : "${MIN_ASSERTIONS:=10593}"
+        # 2026-10-25: 10593 -> 10634. verify_delta_subplan_dedup 36 -> 77 (§7, a plan COPY of the catalog
+        #   scan): an inlined CTE referenced twice failed "Failed to find function fabricator_scan()" on every
+        #   provider. ⚠ Only the ORDER BY … LIMIT shape is inlined; a count(*) join stays materialized and
+        #   never copies, so §7 pins the inlined plan with EXPLAIN before trusting any answer.
+        : "${MIN_ASSERTIONS:=10634}"
         ;;
     service)
         SELECT_CMD=scripts/list-service-suites.sh

@@ -138,3 +138,66 @@ query II
 SELECT (SELECT sum(c) FROM lake.main.t2) AS same_shape, (SELECT sum(other_name) FROM lake.main.d1) AS different_name;
 ----
 17	7
+
+# ---- (7) A PLAN COPY must round-trip the scan: an INLINED CTE referenced twice is copied ----
+# DuckDB copies an operator by serializing and DESERIALIZING it (`LogicalOperator::Copy`), and the
+# deserializer resolves the function BY NAME first. The catalog scan is not a catalog function, so until
+# the zero-argument `fabricator_scan()` stub was registered such a CTE failed with "Failed to find function
+# fabricator_scan()" — on every provider, with or without remote pushdown. The stub carries the
+# serialize/deserialize pair; the deserializer swaps in the real scan of the named table.
+#
+# ⚠ ONLY SOME SHAPES ARE INLINED: DuckDB keeps `SELECT count(*) FROM x a JOIN x b …` as a materialized CTE
+# (no copy at all) and inlines the ORDER BY … LIMIT form. Every row below uses the inlined shape, and the
+# EXPLAIN pair proves it, or the section would pass without ever reaching the deserializer.
+statement ok
+CREATE TABLE lake.main.cte AS SELECT range::INTEGER AS id, 'v' || range AS v FROM range(10);
+
+query II
+EXPLAIN WITH x AS (SELECT * FROM lake.main.cte) SELECT a.id, b.id FROM x a JOIN x b ON a.id = b.id + 1 ORDER BY 1 LIMIT 2;
+----
+physical_plan	<REGEX>:.*Fabricator Scan.*Fabricator Scan.*
+
+query II
+EXPLAIN WITH x AS (SELECT * FROM lake.main.cte) SELECT a.id, b.id FROM x a JOIN x b ON a.id = b.id + 1 ORDER BY 1 LIMIT 2;
+----
+physical_plan	<!REGEX>:.*CTE.*
+
+query II
+WITH x AS (SELECT * FROM lake.main.cte) SELECT a.id, b.id FROM x a JOIN x b ON a.id = b.id + 1 ORDER BY 1 LIMIT 2;
+----
+1	0
+2	1
+
+# A filter inside the CTE travels with the copy (the pushed spec is part of the payload).
+query III
+WITH x AS (SELECT * FROM lake.main.cte WHERE id > 5) SELECT a.id, b.id, a.v FROM x a JOIN x b ON a.id = b.id + 1 ORDER BY 1 LIMIT 5;
+----
+7	6	v7
+8	7	v8
+9	8	v9
+
+# Time travel across a schema change: the copy must describe the REQUESTED version. Version 1 is the CTAS
+# (two columns); a rebuild at latest would describe three and disagree with the plan's own column list.
+statement ok
+ALTER TABLE lake.main.cte ADD COLUMN w INTEGER;
+
+statement ok
+INSERT INTO lake.main.cte VALUES (10, 'v10', 7);
+
+query IIII
+WITH x AS (SELECT * FROM lake.main.cte AT (VERSION => 1)) SELECT * FROM x a JOIN x b ON a.id = b.id + 1 ORDER BY 1 DESC LIMIT 2;
+----
+9	v9	8	v8
+8	v8	7	v7
+
+query IIIIII
+WITH x AS (SELECT * FROM lake.main.cte) SELECT * FROM x a JOIN x b ON a.id = b.id + 1 ORDER BY 1 DESC LIMIT 2;
+----
+10	v10	7	9	v9	NULL
+9	v9	NULL	8	v8	NULL
+
+# The stub is not callable: it names a catalog table's scan, which only the catalog hands out.
+statement error
+SELECT * FROM fabricator_scan();
+----
+fabricator_scan() is internal

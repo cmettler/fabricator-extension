@@ -58,6 +58,13 @@ public:
 	//! TIMESTAMP maps to `FOR SYSTEM_TIME AS OF` (system-versioned tables); VERSION is rejected managed-side.
 	TableFunction GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data,
 	                              const EntryLookupInfo &lookup_info) override;
+	//! The scan as a plan DESERIALIZATION rebuilds it: the AT clause arrives as the two strings the scan
+	//! spec carries (empty = latest), since the bound clause itself is not part of our payload.
+	TableFunction RebuildScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data,
+	                                  const string &at_unit, const string &at_value);
+	//! The zero-argument `fabricator_scan()` overload registered beside the named-source scan, so a
+	//! deserialized catalog scan resolves (see FabricatorScanDeserialize). Calling it directly is refused.
+	static TableFunction CatalogScanStub();
 
 	unique_ptr<BaseStatistics> GetStatistics(ClientContext &context, column_t column_id) override;
 	TableStorageInfo GetStorageInfo(ClientContext &context) override;
@@ -124,7 +131,7 @@ public:
 private:
 	//! Shared body of both GetScanFunction overloads; `at_clause` (nullable) is the time-travel snapshot.
 	TableFunction BuildScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data,
-	                                optional_ptr<BoundAtClause> at_clause);
+	                                const string &at_unit, const string &at_value);
 
 	//! The table's columns (2.0: owned here, see GetColumns). Declared FIRST so it is initialized first.
 	ColumnList columns_;

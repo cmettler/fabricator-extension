@@ -7,6 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "fabricator_host_query.hpp"
+#include "catalog/fabricator_table_entry.hpp" // CatalogScanStub
 
 #include "fabricator/arrow_ingest.hpp"
 #include "fabricator/arrow_produce.hpp"
@@ -1228,7 +1229,12 @@ void RegisterHostQuery(ExtensionLoader &loader) {
 	scan.get_partition_data = fabricator::ArrowStreamGetPartitionData;
 	// See the note on fabricator_host_query above: required, not an optimisation.
 	scan.projection_pushdown = true;
-	loader.RegisterFunction(scan);
+	// ONE set with the zero-argument stub a serialized CATALOG scan is looked up by — without it a plan copy
+	// (a CTE referenced twice is inlined by copying) fails "Failed to find function fabricator_scan()".
+	TableFunctionSet scans("fabricator_scan");
+	scans.AddFunction(scan);
+	scans.AddFunction(FabricatorTableEntry::CatalogScanStub());
+	loader.RegisterFunction(scans);
 }
 
 } // namespace duckdb
