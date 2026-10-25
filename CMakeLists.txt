@@ -55,6 +55,19 @@ set(EXTENSION_SOURCES
     src/copy/fabricator_copy.cpp
 )
 
+# The Substrait producer for the remote SELECT pushdown (third_party/duckdb-substrait, docs/duckdb-2.0-remote-execution.md
+# §3.4). OFF by default: it needs protobuf and substrait-protobuf, the latter from the substrait-packaging vcpkg
+# registry, which our CI does not install yet.
+option(FABRICATOR_SUBSTRAIT "Build the Substrait producer for the remote pushdown" OFF)
+if(FABRICATOR_SUBSTRAIT)
+    list(APPEND EXTENSION_SOURCES
+         third_party/duckdb-substrait/src/to_substrait.cpp
+         third_party/duckdb-substrait/src/custom_extensions.cpp
+         third_party/duckdb-substrait/src/custom_extensions_generated.cpp)
+    include_directories(third_party/duckdb-substrait/include)
+    add_compile_definitions(FABRICATOR_WITH_SUBSTRAIT)
+endif()
+
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 
@@ -71,6 +84,13 @@ target_link_libraries(${LOADABLE_EXTENSION_NAME} ${CMAKE_DL_LIBS})
 find_package(yyjson CONFIG REQUIRED)
 target_link_libraries(${EXTENSION_NAME} yyjson::yyjson)
 target_link_libraries(${LOADABLE_EXTENSION_NAME} yyjson::yyjson)
+
+if(FABRICATOR_SUBSTRAIT)
+    find_package(Protobuf CONFIG REQUIRED)
+    find_package(SubstraitProtobuf CONFIG REQUIRED)
+    target_link_libraries(${EXTENSION_NAME} substrait::proto)
+    target_link_libraries(${LOADABLE_EXTENSION_NAME} substrait::proto)
+endif()
 
 # macOS ONLY: export the SECOND entry point too.
 #

@@ -370,6 +370,238 @@ metadata and with the switch off. Mutants, native engine:
 | the explicit-transaction branch removed (latest pinned, no read recorded) | killed, §7b (line 285) — answered latest where the scan honours the instant; and `verify_delta_catalog_transactions` §42a (blind-append claim) |
 | the autocommit pin ignored | SURVIVED — inside a transaction the table's open is shared and was opened AT the pinned version, so `CurrentSnapshot` is already the pinned snapshot. The pin branch matters only when that cache declines (past the per-transaction open cap), which the gate does not reach |
 
+### 3.2 The Substrait spike — MEASURED (2026-10-25, user-asked)
+
+**Question:** could DuckDB's own Substrait producer plus clast **mssql-adbc** (Substrait -> T-SQL in C#) replace the
+hand-written renderer of §4.1–§4.3 — DuckDB doing the binding, C# doing the dialect?
+
+**Setup.** DuckDB **1.5.6** (the substrait community extension exists for 1.5.6 / `linux_amd64` only; the
+extension repo is pinned to 1.5.6, NOT 2.0) produced a plan per query in WSL from local tables holding the exact
+SQL Server data (exported through our catalog to parquet, so the types are ours), and computed DuckDB's answer.
+On Windows the mssql-adbc NativeAOT ADBC driver (`dotnet publish src/Clast.Drivers.SqlServer.Native`) executed
+each plan against the rig's SQL Server (database collation `SQL_Latin1_General_CP1_CI_AS`); a script compared
+values (in order where the query orders) and result types. 58 queries: the 35 differential cases of
+`verify_remote_select_mssql`, plus 23 shapes our renderer refuses.
+
+| verdict | n | queries |
+|---|---|---|
+| same values AND types | 29 | every ORDER BY / NULL-order / LIMIT / OFFSET case, alias shadowing, HAVING-only, INNER / LEFT / three-table / self joins, DISTINCT over a join, arithmetic ORDER BY — and, beyond our renderer: IN lists, BETWEEN, CASE, IN / EXISTS subqueries, UNION ALL, FULL JOIN, LIKE, upper/length, coalesce, division, a float sum, string `<` |
+| same values, other types | 3 | `sum(int)` is BIGINT where DuckDB says HUGEINT |
+| server ERROR, DuckDB answers | 4 | `sum(bigint)` overflows BIGINT on the server |
+| **WRONG ANSWER** | 13 | 9 string cases (`=`, `<>`, GROUP BY, HAVING, DISTINCT, count(DISTINCT), a VARCHAR/NVARCHAR join, ORDER BY); `avg` over integers, a scalar subquery using it, `avg` over a decimal; `EXCEPT ALL` |
+| refused by the translator | 8 | two malformed plans (COUNT pair under a filter; ROLLUP), `subtract` without the overflow option, `min:str`, `%`, `//`, `extract`, a window |
+| both error | 1 | the INTEGER overflow (`id * 2`) |
+
+**Where each defect sits**, read from the generated T-SQL and the plan JSON:
+
+- **mssql-adbc, by design:** strings compare under `Latin1_General_100_BIN2_UTF8`, which ignores TRAILING SPACES
+  (documented in its substrait.md as one of three accepted differences). On adversarial data that is 9 wrong
+  answers; our sentinel key (§4.3) is the fix it would need. The `_UTF8` collation also needs SQL Server 2019+.
+- **mssql-adbc, a bug:** `avg` over an integer renders `CAST(AVG(CAST(x AS bigint)) AS float)` — integer division
+  inside AVG, so `0.2307…` becomes `0.0`. Decimal `avg` keeps T-SQL's DECIMAL(38,6) where DuckDB returns a double.
+- **duckdb-substrait, a bug:** `EXCEPT ALL` is emitted as `SET_OP_MINUS_PRIMARY` (no ALL) — 0 rows where DuckDB
+  returns 291. Silent, and invisible to any consumer. Also two plans whose root names do not match their
+  columns (refused, so safe), and arithmetic without the `overflow` option the dialect requires (refused).
+- **the format:** Substrait has no 128-bit integer, so DuckDB's HUGEINT sums are declared i64 — a type change
+  everywhere and an overflow error past 2^63 where DuckDB answers. A DuckDB-side wrapper could restore the type
+  (it knows the bound type) but not the range.
+
+**What it means.** The approach delivers BREADTH our renderer will never reach by hand (subqueries, set
+operations, CASE, functions, any join), and it moves the dialect to C# where the architecture says it belongs.
+But out of the box it does NOT meet "exact or refuse": 13 of 58 are silent wrong answers. Every one is fixable
+and every fix is upstream — a strict-semantics mode in mssql-adbc (string keys, AVG, decimal avg, i64 sums), and
+three producer fixes plus a 2.0 port in duckdb-substrait. The harness of this spike is the gate either project
+would need (scratchpad `spike/produce.py` + `consume.py`). The renderer of §4.1–§4.3 stays the exact oracle.
+
+### 3.3 Binding inside RemoteExecute — PROBED (2026-10-25, user-asked)
+
+**Question:** §3.2 showed that Substrait needs types the unbound AST does not have, so producing it ourselves
+pre-bind would mean writing a binder. Can `RemoteExecute` instead bind a COPY of the node with DuckDB's own
+binder and take DuckDB's exact types from there?
+
+**Probe:** `FABRICATOR_PROBE_BIND=1|2` in `fabricator_remote_select.cpp` (spike, env-gated). It copies the
+node, restores this catalog's name on its tables (the optimizer stripped it), calls
+`Binder::CreateBinder(context)->Bind(*copy)` and prints the outcome, the time, the result types and (level 2)
+the logical plan. With the probe on, every SELECT and set operation reaches `RemoteExecute`, which declines
+what the renderer does not take. Off, nothing changes (`verify_remote_select_mssql` 373, unchanged).
+
+**Measured against the rig's SQL Server:**
+
+- **It binds, and it does not re-enter.** Binding a copy goes through `Binder::Bind`, not the planner, so the
+  remote optimizer (called from `Planner::CreatePlan`) does not run again; a re-entry guard never fired.
+- **The types are DuckDB's own, which is the point:** `sum(int)` HUGEINT, `avg` DOUBLE, `year(d)` BIGINT,
+  `coalesce(k, -1)` SMALLINT, `sum(amount * 2 + 1)` DECIMAL(38,2), and names as DuckDB reports them.
+- **Implicit casts are explicit in the bound plan**: `k = 1.0` binds as
+  `CAST(k AS DECIMAL(6,1)) = CAST(1.0 AS DECIMAL(6,1))`. A renderer over the bound tree sees exactly the
+  semantics DuckDB will apply and can refuse a cast it cannot render exactly, instead of re-deriving the rules.
+- **Subqueries stay subqueries**: `EXISTS` binds as a `Dependent Join` + `SUBQUERY` filter, not yet flattened
+  (that happens later, in the optimizer), so it can still be rendered back as `EXISTS (…)`. UNION ALL binds as
+  a `Union` over its branches.
+- **Cost:** ~1–2.5 ms per statement once warm, ~38 ms for the first statement of a session (most likely the
+  table entry being materialized, which the real bind needs anyway; not separated). ⚠ In the shell's agent
+  mode every statement is planned twice; with `-no-agent` once.
+
+**Two limits found:**
+
+- **Prepared parameters do not bind**: *"Unexpected prepared parameter"*. The fresh binder has no parameter
+  values, and `RemoteExecute(ClientContext&, QueryNode)` is not handed the outer binder that has them. Those
+  statements must keep declining, as they do today, unless the hook is given the binder.
+- **CTE references must be told apart from tables** before the catalog name is restored. The probe's naive
+  restore qualified the CTE `x` and failed (and in probe mode the declined query failed with it). A real
+  implementation reads the node's CTE map first.
+
+**What it means for §3.2's question.** Binding in `RemoteExecute` removes the hardest part of producing any
+intermediate form ourselves: we would not re-derive DuckDB's typing, casts or function resolution. What stays
+ours is translating a BOUND tree (logical operators + bound expressions) to T-SQL, refusing anything not exact.
+The intermediate form can be Substrait (still without HUGEINT, §3.2) or a narrow JSON of our own for a C#
+renderer. Nothing of this is built beyond the probe.
+
+### 3.4 Taking over to_substrait and mssql-adbc — step 1 measured (2026-10-25, user-directed)
+
+**Decision direction (user):** do not build our own translation; take over duckdb-substrait's `to_substrait`
+(ported to 2.0 until upstream has a 2.0 version) and mssql-adbc's T-SQL emitter, with references to the
+originals. Gaps are fine if they decline; wrong answers are not.
+
+- **duckdb-substrait** (`D:\repos\duckdb-substrait`, MIT, `97a46c7` of 2026-10-19) pins DuckDB **v1.5.6**.
+  Compiled against our 2.0 headers with g++: `to_substrait.cpp` **180 errors**, `custom_extensions*.cpp` 0.
+  The classes are the ones our own 2.0 port already solved: ~110 fields that became accessors, comparison /
+  BETWEEN / cast as function expressions, the `Legacy*` table filters, `Identifier`, `TableIndex`,
+  `ProjectionIndex`. Mechanical.
+- **Our scan needs an adaptation there**: `TransformTableScanToSubstrait` casts the bind data to DuckDB's own
+  `TableScanBindData` without a check, and our scan reports `ScanType::TABLE` too — undefined behaviour unless a
+  branch for our bind data names the table.
+- **Dependencies**: protobuf (with abseil) plus `substrait-protobuf` from the substrait-packaging vcpkg
+  REGISTRY (`vcpkg-configuration.json`), i.e. manifest mode. Our build and CI install vcpkg packages in
+  classic mode on three platforms, so this is the largest integration cost, along with protobuf's size in the
+  loadable. Built in WSL in 5.5 min.
+- **Flatten + optimize on the bound copy works**: `RecursiveDependentJoinPlanner::Plan` +
+  `FlattenDependentJoins::DecorrelateIndependent` (what `Planner::CreatePlan` does after binding), then
+  `Optimizer::Optimize`. `EXISTS` becomes a `RIGHT_SEMI` join, `IN` a `SEMI` join, `ORDER BY … LIMIT` a
+  `Top N`; ~0.3–1 ms on top of the bind. ⚠ duckdb-substrait disables seven optimizers (IN_CLAUSE,
+  COMPRESSED_MATERIALIZATION, MATERIALIZED_CTE, COMMON_SUBPLAN, STATISTICS_PROPAGATION, EMPTY_RESULT_PULLUP, …)
+  by mutating the GLOBAL `DBConfig`, which is not safe beside concurrent queries; we need a per-call way (or
+  run only the passes we need). STATISTICS_PROPAGATION must stay off for us in any case: a pushed plan must not
+  depend on local statistics.
+- **⚠ The optimizer is NOT needed, flattening alone is (measured the same day, user-asked: "the remote optimizes
+  itself").** After flattening alone, a correlated `EXISTS` and an uncorrelated `IN` are `MARK` joins under a
+  filter on the mark, and a correlated scalar subquery is a `LEFT` join on `IS NOT DISTINCT FROM` — no
+  duplicate-eliminated joins. Both sides already handle these: `to_substrait` maps `MARK` to
+  `JOIN_TYPE_LEFT_MARK` and `IS NOT DISTINCT FROM` to `is_not_distinct_from`; mssql-adbc emits mark joins as
+  `CASE WHEN EXISTS …` and has `IS NOT DISTINCT FROM`. Skipping the optimizer drops the global-config problem,
+  keeps the plan independent of local statistics, sends SQL Server something close to what the user wrote, and
+  shrinks the port: only the optimizer puts filters into `LogicalGet.table_filters`, so the `Legacy*` filter
+  code in `to_substrait` can decline instead of being ported.
+- **mssql-adbc** (`D:\repos\mssql-adbc`, Apache 2.0, `677676c`): `src/Clast.Drivers.SqlServer/Substrait`, ~5,560
+  lines of C#, BCL only plus its own protobuf reader; only the driver glue uses ADBC. It handles Read, Filter,
+  Project, Fetch, Sort, Aggregate, Join, Cross, Set and TopN — **no `ReferenceRel`** (so CTEs decline) and no
+  duplicate-eliminated join (which the optimizer removes for the shapes above).
+- **CTEs**: a statement over this catalog alone reaches us whole; a remote-only CTE block inside a MIXED
+  statement is never offered (the optimizer analyses CTE bodies but never replaces one, and `FinishPushdown`
+  blocks every pushdown below a scope that has a CTE — its own `FIXME`). That needs a DuckDB change.
+
+### 3.5 Step 2 — the vendored producer runs end to end (2026-10-25)
+
+- **`third_party/duckdb-substrait/`**: the producer (`to_substrait.cpp`, `custom_extensions*.cpp`, headers, MIT
+  license, README naming upstream commit `97a46c7`), ported to DuckDB 2.0 — 180 compile errors to 0, 30 places
+  marked `[FABRICATOR-PATCH: …]`. Declined rather than ported: the table-filter translators (only the optimizer
+  creates table filters), windows (2.0 reshaped them; the T-SQL emitter has none), CTAS/INSERT/DELETE (only
+  SELECT is pushed). Fixed beyond the port: the table scan names its table through `LogicalGet::GetTable()` with
+  schema + table instead of an unchecked cast to DuckDB's own bind data; `TRY_CAST` and exclusive `BETWEEN`
+  bounds decline (both would be widened).
+- **Build**: `-DFABRICATOR_SUBSTRAIT=ON` (default OFF) with protobuf 5.29.3 + substrait-protobuf 0.102.0 from a
+  manifest-mode vcpkg install (`CMAKE_PREFIX_PATH`, and `Protobuf_PROTOC_EXECUTABLE`, which protobuf's config
+  demands even though nothing is generated). MSVC builds it unchanged.
+- **The pipeline** (probe level 5): bind a copy → `RecursiveDependentJoinPlanner` + `DecorrelateIndependent` →
+  `ResolveOperatorTypes` + `ColumnBindingResolver` (to_substrait needs positional references — the first run
+  failed on `BOUND_COLUMN_REF` without it) → `to_substrait` in strict mode. No optimizer.
+- ⚠ **A name resolved only through `USE db.dbo` is not pushed at all** — DuckDB's remote optimizer acts on
+  catalog-qualified names; `RemoteExecute` was never called.
+- **Measured, the 58 spike queries through this path and mssql-adbc against SQL Server**: 30 identical, 3 same
+  values with BIGINT for HUGEINT, 4 overflow errors (`sum` declared i64), 1 both error, 5 declined by the
+  producer (strict mode: `%`, `//`, `min` on strings, an expression GROUP BY; and the window), 2 refused by the
+  consumer (`extract:date`; and the unoptimized mark join for `EXISTS`, whose field references mssql-adbc
+  reads as out of range — safe, but a mismatch between the two to resolve), **13 wrong answers — the same 13
+  as §3.2**: 9 strings (trailing spaces), `avg` over integers ×2, `avg` over a decimal, `EXCEPT ALL`. Producing
+  the plans ourselves changed nothing about them, as expected: they sit in the emitter and in to_substrait's
+  set operation, i.e. in code we now own copies of.
+- **One optimizer pass after all — `FilterPushdown`, alone (user-decided).** Without it `IN` / `EXISTS` stayed
+  `MARK` joins, rendered as a nested `CASE WHEN EXISTS … WHEN EXISTS … IS NULL`, and the mark join for `EXISTS`
+  was refused by the consumer. With it they become `SEMI` joins and plain `WHERE EXISTS (…)`. It adds no table
+  filters on SQL Server (that scan declares `filter_pushdown = false`). It surfaced two producer gaps, both
+  fixed: an exclusive `BETWEEN` (it folds `x > a AND x < b` into one) is emitted as its two comparisons, and a
+  join condition that is an arbitrary expression (2.0 allows them; the pass moves predicates into joins)
+  translates in the joined field space. **Re-measured: 31 identical, 13 wrong (unchanged), 5 declined by the
+  producer, 1 refused by the consumer (`extract:date`).**
+
+### 3.6 An exact string ORDER key — measured (2026-10-25, user-asked: window functions and string min/max are
+essential, e.g. on columnstore)
+
+§4.3 concluded string ordering cannot be exact on SQL Server (ANSI padding; UTF-16 code-unit order). It can,
+with SQL Server 2019+ UTF-8 collations and an escaped sentinel:
+
+```sql
+REPLACE(REPLACE(CONVERT(VARCHAR(MAX), x COLLATE Latin1_General_100_BIN2_UTF8),
+                CHAR(1), CHAR(1) + CHAR(2)), CHAR(0), CHAR(1) + CHAR(1)) + CHAR(0)
+```
+
+- **UTF-8 under a BIN2 collation compares bytes, and UTF-8 byte order IS code-point order** — DuckDB's order.
+  The control (`x COLLATE Latin1_General_100_BIN2` on NVARCHAR) sorts U+1D11E before U+E000; the key does not.
+  ⚠ Collate BEFORE converting: `CONVERT(VARCHAR(MAX), x COLLATE …_UTF8)` converts to UTF-8, while
+  `CAST(x AS VARCHAR) COLLATE …` would convert through the database code page first.
+- **The trailing `CHAR(0)` makes a prefix sort first despite padding** (`'a'` before `'a '` and before
+  `'a' + CHAR(1)`): it is below the space the shorter key is padded with.
+- **The escaping is needed for strings that contain `CHAR(0)`** — without it the padding wins again
+  (`'a' + CHAR(0)` sorted before `'a'`). Mapping `CHAR(0)` → `CHAR(1)+CHAR(1)` and `CHAR(1)` → `CHAR(1)+CHAR(2)`
+  keeps the order and leaves no `CHAR(0)` in the body, so the sentinel is strictly the smallest.
+- **Measured** on 11 adversarial values (NUL and `\x01` after a prefix, trailing space, case, U+E000, U+FF21,
+  U+1D11E): identical to DuckDB's order; decoding (`LEFT(k, LEN(k) - 1)`, then the two REPLACEs reversed)
+  round-trips all 11. `rs_s` (VARCHAR and NVARCHAR) ordered identically too.
+- **Use**: string `min`/`max` (aggregate the key, decode the result), ORDER BY, `<`/`>`, and window ORDER BY.
+  Equality/GROUP BY keep the cheaper §4.3 key. ⚠ Needs UTF-8 collations (SQL Server 2019+, Fabric Warehouse);
+  older engines decline. ⚠ A per-row expression: no index seek and possibly no batch-mode aggregate on it —
+  exact, but not free; measure on columnstore before relying on the speed.
+
+### 3.7 `IGNORE NULLS` in window functions — measured (2026-10-25, user-corrected)
+
+SQL Server supports null treatment for `LAG`, `LEAD`, `FIRST_VALUE` and `LAST_VALUE`. Measured on the rig
+(17.0.4055.5) against DuckDB over 61 rows with 6 NULLs, ordered by a unique key, `ROWS` frames for the two
+value functions: all four identical on every row. ⚠ The syntax differs: T-SQL puts it after the parentheses,
+`LAG(k) IGNORE NULLS OVER (…)`, DuckDB inside, `lag(k IGNORE NULLS) OVER (…)`. ⚠ Measured on 2025 only; the
+documented minimum is SQL Server 2022 and Fabric Warehouse is unverified, so gate on the engine version.
+Other functions with `IGNORE NULLS` keep declining.
+
+### 3.8 Step 3 — no wrong answers left (2026-10-25)
+
+The T-SQL emitter is vendored now: `dotnet/Fabricator.SqlServer/Substrait/` (mssql-adbc `677676c`, Apache 2.0,
+some files MIT from kusto_adbc; LICENSE, notices and a README beside it; ADBC dependencies removed; an
+`.editorconfig` keeps IDE0073 off so the original headers stay). Harness: plans → `ts2sql` (compiles the vendored
+files straight from the repo) → T-SQL executed on SQL Server → compared with DuckDB.
+
+| fix | where | patch |
+|---|---|---|
+| `EXCEPT ALL` / `INTERSECT ALL` emitted as their deduplicating forms | to_substrait | `setop_all` → `MINUS_PRIMARY_ALL` / `INTERSECTION_MULTISET_ALL` (the emitter numbers duplicates) |
+| integer `sum` overflowed BIGINT on the server | to_substrait | argument cast to `decimal(38,0)` when DuckDB's result is HUGEINT |
+| an aggregate's `FILTER` was dropped — every row aggregated (**found by this step**) | to_substrait | translated into the measure filter; an aggregate with `ORDER BY` declines |
+| `avg` truncated (integer AVG) and overflowed | emitter | exact sum (`decimal(38,0)`, or the decimal itself) divided by the count, in float, when the plan declares a float |
+| strings compared/grouped/sorted by collation (trailing spaces, case, UTF-16) | emitter | the §3.6 key for `=`, `<>`, `<`…`>=`, `BETWEEN`, `IS [NOT] DISTINCT FROM`, `IN`, GROUP BY (read back with `StringFromKey`), ORDER BY, `count(DISTINCT)`; set operations that compare string rows decline (`UNION ALL` stays) |
+| string `min`/`max` | both | declared under `extension:fabricator:functions_string`; `StringFromKey(MIN(StringKey(x)))` |
+| unary minus, `//`, `%` declined | to_substrait | `negate`, `divide`, `modulus` (DuckDB truncates toward zero, like T-SQL) |
+
+**Measured, 67 queries: 52 identical, 11 same values with `DECIMAL(38,0)` for HUGEINT (the pushdown wrapper casts
+to DuckDB's bound types), 1 within one ulp, 1 declined by the producer (window), 1 by the emitter (`extract:date`),
+1 error on both sides — and 0 wrong answers.**
+
+- ⚠ **The reference results were wrong first**: `COPY … (FORMAT parquet)` writes a HUGEINT as a DOUBLE, so the
+  harness flagged an exact server sum against a rounded reference. References go through Arrow now
+  (decimal128(38,0)).
+- ⚠ **DuckDB's own `avg` differs by one ulp between platforms** (long double: 80 bits on Linux, 64 on
+  Windows/MSVC) — measured: Windows DuckDB returns the pushdown's value. The harness reports it as `FLOAT_ULP`.
+- ⚠ `error_on_division_by_zero = false` makes DuckDB return NULL where the pushed query errors; the default
+  (error) matches.
+- ⚠ **Performance not measured**: every string comparison now goes through the key expression, which no index
+  seek and possibly no columnstore segment elimination can use. A sargable prefilter (`raw = literal AND key =
+  key`, a superset that is exact once combined) is the obvious next step for equality.
+
 ## 4. Order of work
 
 1. **DELETE shortcut, SQL Server** — BUILT (§2.4).

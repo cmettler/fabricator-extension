@@ -65,6 +65,20 @@
 #include "duckdb/parser/tableref/table_function_ref.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/expression_binder/constant_binder.hpp"
+#include "duckdb/common/error_data.hpp"
+#include "duckdb/parser/expression/subquery_expression.hpp"
+#include "duckdb/parser/parsed_expression_iterator.hpp"
+#include "duckdb/planner/logical_operator.hpp"
+#include "duckdb/optimizer/optimizer.hpp"
+#include "duckdb/planner/subquery/flatten_dependent_join.hpp"
+#include "duckdb/planner/subquery/recursive_dependent_join_planner.hpp"
+#include <chrono>
+#include <fstream>
+#ifdef FABRICATOR_WITH_SUBSTRAIT
+#include "duckdb/execution/column_binding_resolver.hpp"
+#include "duckdb/optimizer/filter_pushdown.hpp"
+#include "to_substrait.hpp"
+#endif
 #include <cstdlib>
 
 namespace duckdb {
@@ -78,6 +92,131 @@ void RemoteTrace(const string &message) {
 	}();
 	if (enabled) {
 		Printer::Print("[fabricator remote] " + message);
+	}
+}
+
+// ── SPIKE (FABRICATOR_PROBE_BIND=1|2): bind a COPY of the pushed node with DuckDB's own binder, to learn whether
+// RemoteExecute can get DuckDB's exact types instead of re-deriving them. Level 1 prints the outcome, the time and
+// the result types; level 2 also the logical plan. With the probe on, every SELECT reaches RemoteExecute, and the
+// shapes the renderer does not take are declined there.
+int ProbeBindLevel() {
+	static const int level = [] {
+		auto v = std::getenv("FABRICATOR_PROBE_BIND");
+		return v && *v ? std::atoi(v) : 0;
+	}();
+	return level;
+}
+
+void RestoreCatalog(QueryNode &node, const Identifier &catalog, const Identifier &default_schema);
+
+void RestoreCatalogInExpression(ParsedExpression &expr, const Identifier &catalog, const Identifier &default_schema) {
+	if (expr.GetExpressionClass() == ExpressionClass::SUBQUERY) {
+		RestoreCatalog(*expr.Cast<SubqueryExpression>().SubqueryMutable()->node, catalog, default_schema);
+	}
+	ParsedExpressionIterator::EnumerateChildren(
+	    expr, [&](ParsedExpression &child) { RestoreCatalogInExpression(child, catalog, default_schema); });
+}
+
+//! The optimizer stripped this catalog's name from every table it pushed; put it back (the decline path does the
+//! same for the shapes the renderer takes). ⚠ A CTE reference is a base table too — spike only.
+void RestoreCatalog(QueryNode &node, const Identifier &catalog, const Identifier &default_schema) {
+	ParsedExpressionIterator::EnumerateQueryNodeChildren(
+	    node,
+	    [&](unique_ptr<ParsedExpression> &child) {
+		    if (child) {
+			    RestoreCatalogInExpression(*child, catalog, default_schema);
+		    }
+	    },
+	    [&](TableRef &ref) {
+		    if (ref.type != TableReferenceType::BASE_TABLE) {
+			    return;
+		    }
+		    auto &base = ref.Cast<BaseTableRef>();
+		    auto &name = base.GetQualifiedName();
+		    if (!name.Catalog().empty()) {
+			    return;
+		    }
+		    Identifier schema = name.Schema().empty() ? default_schema : name.Schema();
+		    Identifier table = name.Name();
+		    base.SetQualifiedName(catalog, schema, table);
+	    });
+}
+
+void ProbeBind(ClientContext &context, const QueryNode &node, const Identifier &catalog,
+               const Identifier &default_schema) {
+	static thread_local int depth = 0;
+	if (depth > 0) {
+		Printer::Print("[probe-bind] RE-ENTERED RemoteExecute while binding (depth " + std::to_string(depth) + ")");
+		return;
+	}
+	auto copy = node.Copy();
+	RestoreCatalog(*copy, catalog, default_schema);
+	auto start = std::chrono::steady_clock::now();
+	auto elapsed = [&] {
+		return std::to_string(
+		    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count());
+	};
+	depth++;
+	try {
+		auto binder = Binder::CreateBinder(context);
+		auto bound = binder->Bind(*copy);
+		depth--;
+		string columns;
+		for (idx_t i = 0; i < bound.types.size(); i++) {
+			columns += (i ? ", " : "") + bound.names[i].GetIdentifierName() + " " + bound.types[i].ToString();
+		}
+		Printer::Print("[probe-bind] ok " + elapsed() + " us: " + columns);
+		if (ProbeBindLevel() == 2 && bound.plan) {
+			Printer::Print(bound.plan->ToString());
+		}
+		if (ProbeBindLevel() >= 3 && bound.plan) {
+			// what Planner::CreatePlan does after binding, then DuckDB's logical optimizer
+			auto plan = std::move(bound.plan);
+			RecursiveDependentJoinPlanner::Plan(*binder, plan);
+			plan = FlattenDependentJoins::DecorrelateIndependent(*binder, std::move(plan));
+			Printer::Print("[probe-bind] flattened " + elapsed() + " us");
+			if (ProbeBindLevel() == 3) {
+				Printer::Print(plan->ToString());
+			}
+			if (ProbeBindLevel() == 5) {
+#ifdef FABRICATOR_WITH_SUBSTRAIT
+				// the flattened plan, without DuckDB's optimizer (§3.4), as Substrait
+				vector<string> root_names;
+				for (auto &name : bound.names) {
+					root_names.push_back(name.GetIdentifierName());
+				}
+				// ONE optimizer pass: filter pushdown turns a MARK join filtered on its marker (IN / EXISTS)
+				// into a SEMI / ANTI join. It adds no table filters here — a SQL Server scan declares
+				// filter_pushdown = false, so filters stay above the scan.
+				Optimizer optimizer(*binder, context);
+				FilterPushdown filter_pushdown(optimizer);
+				plan = filter_pushdown.Rewrite(std::move(plan));
+				// column refs to positional refs, as duckdb-substrait's ExtractPlan does after planning
+				plan->ResolveOperatorTypes();
+				ColumnBindingResolver resolver;
+				resolver.VisitOperator(*plan);
+				plan->ResolveOperatorTypes();
+				DuckDBToSubstrait to_substrait(context, *plan, true, root_names);
+				auto bytes = to_substrait.SerializeToString();
+				Printer::Print("[probe-bind] substrait " + elapsed() + " us, " + std::to_string(bytes.size()) + " bytes");
+				auto file = std::getenv("FABRICATOR_PROBE_PLAN_FILE");
+				if (file && *file) {
+					std::ofstream out(file, std::ios::binary);
+					out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+				}
+#else
+				Printer::Print("[probe-bind] built without FABRICATOR_SUBSTRAIT");
+#endif
+				return;
+			}
+			Optimizer optimizer(*binder, context);
+			plan = optimizer.Optimize(std::move(plan));
+			Printer::Print("[probe-bind] optimized " + elapsed() + " us");
+			Printer::Print(plan->ToString());
+		}
+	} catch (std::exception &ex) {
+		depth--;
+		Printer::Print("[probe-bind] FAILED after " + elapsed() + " us: " + ErrorData(ex).RawMessage());
 	}
 }
 
@@ -1104,17 +1243,28 @@ bool FabricatorCatalog::SupportsPushdown(const QueryNode &node) {
 	// SELECT only. DELETE and UPDATE keep the plan-less shortcut (ABI v93/v94), which keeps DuckDB's binding
 	// and its affected-row count; INSERT and MERGE keep the rowid path.
 	if (node.type != QueryNodeType::SELECT_NODE) {
-		return false;
+		return ProbeBindLevel() > 0 && node.type == QueryNodeType::SET_OPERATION_NODE; // spike
 	}
 	string reason;
 	if (!RemoteSelect(node.Cast<SelectNode>()).Structural(reason)) {
 		RemoteTrace("local: " + reason);
-		return false;
+		return ProbeBindLevel() > 0; // spike: RemoteExecute probes it, then declines
 	}
 	return true;
 }
 
 unique_ptr<TableRef> FabricatorCatalog::RemoteExecute(ClientContext &context, unique_ptr<QueryNode> node) {
+	if (ProbeBindLevel() > 0) {
+		Identifier default_schema(GetDefaultSchema().value_or(Identifier("dbo")));
+		ProbeBind(context, *node, GetName(), default_schema);
+		string reason;
+		if (node->type != QueryNodeType::SELECT_NODE || !RemoteSelect(node->Cast<SelectNode>()).Structural(reason)) {
+			RestoreCatalog(*node, GetName(), default_schema);
+			auto declined = make_uniq<SelectStatement>();
+			declined->node = std::move(node);
+			return make_uniq<SubqueryRef>(std::move(declined));
+		}
+	}
 	auto &select = node->Cast<SelectNode>();
 	vector<reference<BaseTableRef>> tables;
 	RemoteSelect::CollectTables(*select.from_table, tables);

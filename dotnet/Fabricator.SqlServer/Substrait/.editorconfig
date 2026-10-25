@@ -1,0 +1,3 @@
+# Vendored files keep their original (licensed) copyright headers.
+[*.cs]
+dotnet_diagnostic.IDE0073.severity = none
