@@ -19,6 +19,8 @@ internal enum SqlProps
     Aggregate = 4,
     /// <summary>Refers to a column of an enclosing query (a correlated subquery's outer reference).</summary>
     Outer = 8,
+    /// <summary>[FABRICATOR-PATCH: OURS-BY-DESIGN] Contains a window function (not allowed in WHERE, GROUP BY or another window).</summary>
+    Window = 16,
 }
 
 /// <summary>
@@ -134,6 +136,8 @@ internal sealed class SelectBlock
     /// <summary>True when the columns are aggregates or grouping keys (a GROUP BY or a global aggregate).</summary>
     public bool Aggregated;
     public bool Distinct;
+    /// <summary>[FABRICATOR-PATCH: OURS-BY-DESIGN] True when some columns are window functions.</summary>
+    public bool Windowed;
     public List<OrderItem> OrderBy = new();
     public string? Top;
     public bool WithTies;
@@ -143,10 +147,10 @@ internal sealed class SelectBlock
     public bool HasFetch => Top != null || Offset != null || Fetch != null;
 
     /// <summary>True when a WHERE condition can be added (it applies before grouping and row limits).</summary>
-    public bool CanFilter => !Aggregated && !Distinct && !HasFetch;
+    public bool CanFilter => !Aggregated && !Distinct && !HasFetch && !Windowed;
 
     /// <summary>True when the block can be joined, or aggregated, as it stands.</summary>
-    public bool IsPlain => !Aggregated && !Distinct && !HasFetch;
+    public bool IsPlain => !Aggregated && !Distinct && !HasFetch && !Windowed;
 }
 
 /// <summary>T-SQL lexical helpers.</summary>

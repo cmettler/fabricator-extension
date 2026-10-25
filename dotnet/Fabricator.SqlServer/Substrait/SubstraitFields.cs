@@ -119,6 +119,31 @@ internal static class SubstraitFields
     public const int ProjectRel_Expressions = 3;
 
     // ── SortRel ────────────────────────────────────────────────────
+    // [FABRICATOR-PATCH: OURS-BY-DESIGN] ConsistentPartitionWindowRel and its parts (algebra.proto)
+    public const int WindowRel_Common = 1;
+    public const int WindowRel_Input = 2;
+    public const int WindowRel_WindowFunctions = 3;
+    public const int WindowRel_PartitionExpressions = 4;
+    public const int WindowRel_Sorts = 5;
+    public const int WindowRelFunction_FunctionReference = 1;
+    public const int WindowRelFunction_UpperBound = 4;
+    public const int WindowRelFunction_LowerBound = 5;
+    public const int WindowRelFunction_Phase = 6;
+    public const int WindowRelFunction_OutputType = 7;
+    public const int WindowRelFunction_Arguments = 9;
+    public const int WindowRelFunction_Invocation = 10;
+    public const int WindowRelFunction_Options = 11;
+    public const int WindowRelFunction_BoundsType = 12;
+    public const int WindowBound_Preceding = 1;
+    public const int WindowBound_Following = 2;
+    public const int WindowBound_CurrentRow = 3;
+    public const int WindowBound_Unbounded = 4;
+    public const int WindowBoundOffset_Offset = 1;
+    public const int WindowBoundOffset_OffsetExpr = 2;
+    public const int BoundsType_Unspecified = 0;
+    public const int BoundsType_Rows = 1;
+    public const int BoundsType_Range = 2;
+
     public const int SortRel_Common = 1;
     public const int SortRel_Input = 2;
     public const int SortRel_Sorts = 3;

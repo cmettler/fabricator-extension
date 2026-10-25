@@ -98,6 +98,7 @@ internal sealed class TSqlEmitter
             CrossRel r => EmitJoin(new JoinRel { Left = r.Left, Right = r.Right, Type = F.JoinType_Inner }),
             SetRel r => EmitSet(r),
             TopNRel r => EmitTopN(r),
+            WindowRel r => EmitWindow(r), // [FABRICATOR-PATCH: OURS-BY-DESIGN] window functions
             _ => throw SubstraitTranslationException.Unsupported($"relation {rel.GetType().Name}"),
         };
 
@@ -547,6 +548,51 @@ internal sealed class TSqlEmitter
         output.AddRange(measures.Select(m => new SqlColumn(NewName("_a"), m, isBare: false)));
         block.Columns = output;
         block.Aggregated = true;
+        return block;
+    }
+
+    /// <summary>
+    /// [FABRICATOR-PATCH: OURS-BY-DESIGN] A window relation: the input's columns, then one column per window
+    /// function. Partitions and ORDER BY items use the exact string key (§3.6), so partitions, peers and ranks are
+    /// DuckDB's; the ORDER BY items carry DuckDB's null order. The input is made plain first: T-SQL evaluates
+    /// window functions after WHERE and GROUP BY, and does not nest them.
+    /// </summary>
+    private SelectBlock EmitWindow(WindowRel rel)
+    {
+        var block = EmitRel(rel.Input);
+        if (!block.IsPlain)
+        {
+            block = Wrap(block, keepOrder: true);
+        }
+        var scope = block.Columns;
+        void Check(SqlExpr e, string what)
+        {
+            if ((e.Props & (SqlProps.Subquery | SqlProps.Outer | SqlProps.Window | SqlProps.Aggregate)) != 0)
+            {
+                throw SubstraitTranslationException.Unsupported($"a window {what} with a subquery, an outer reference or an aggregate is not supported.");
+            }
+        }
+        var partitions = new List<string>();
+        foreach (var expr in rel.Partitions)
+        {
+            var e = Render(expr, scope);
+            Check(e, "partition");
+            if ((e.Props & SqlProps.Column) == 0)
+            {
+                continue; // a constant puts every row in one partition, as no partition does
+            }
+            partitions.Add(e.Type.IsStringLike ? StringKey(e.Value) : e.Value);
+        }
+        foreach (var sort in rel.Sorts)
+        {
+            Check(Render(sort.Expr, scope), "order");
+        }
+        var order = OrderItems(rel.Sorts, scope);
+        var added = rel.Functions
+            .Select(f => new SqlColumn(NewName("_w"), TSqlFunctionCatalog.WriteWindow(this, f, scope, partitions, order), isBare: false))
+            .ToList();
+        block.Columns = block.Columns.Concat(added).ToList();
+        block.Windowed = true;
         return block;
     }
 

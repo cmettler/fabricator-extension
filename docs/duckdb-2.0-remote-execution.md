@@ -645,6 +645,48 @@ alone: `Index Scan`, 518 ms against 0 ms.** The 68-query correctness set is unch
 
 - ⚠ Not measured: columnstore segment elimination on strings (the prefilter is what makes it possible at all).
 
+### 3.11 Step 4 — window functions (2026-10-25, user-asked: "existentiell", fast on columnstore)
+
+**Producer** (`TransformWindow` rewritten for 2.0's `BoundWindowExpression`, where window functions are catalog
+functions and lag/lead's offset and default are ordinary children). Upstream's version had three wrong answers,
+fixed here (`[FABRICATOR-PATCH]`, offerable):
+
+| upstream | here |
+|---|---|
+| grouped ALL expressions with the same partition/order into one relation — output columns reordered against DuckDB's | only CONSECUTIVE expressions share a relation, so the order is DuckDB's (gate: `w_mixed`) |
+| `GROUPS` frames sent as `ROWS` | declined |
+| `IGNORE NULLS`, `EXCLUDE`, `FILTER`, an argument `ORDER BY`, `DISTINCT` dropped | declined — except IGNORE NULLS, declared as `<fn>_ignore_nulls` under `extension:fabricator:functions_window`, so a consumer that does not know it fails instead of respecting nulls |
+
+Also declined: RANGE frames with an offset (T-SQL's RANGE has none), non-constant ROWS offsets, `nth_value`,
+`fill`. Constant ROWS offsets and the integer `sum` → `decimal(38,0)` widening (as for aggregates) go through.
+
+**Emitter** (`EmitWindow`, `TSqlFunctionCatalog.WriteWindow`): a window aggregate is written by the ordinary
+aggregate writer and gets `OVER (...)` after each of its aggregate calls — so the exact avg, the HUGEINT sum and
+the string min/max via the key carry over unchanged. Ranking functions, `ntile`, `lag`/`lead`,
+`first_value`/`last_value` are written directly. Partitions and window ORDER BY use the §3.6 string key (exact
+partitions, peers and ranks); ORDER BY items carry DuckDB's null order. The input is made plain first (T-SQL
+evaluates windows after WHERE/GROUP BY and does not nest them), and a block with window columns is wrapped before
+a filter (QUALIFY) or an aggregate over it. Declined: a function that needs an order (ranks, lag/lead,
+first/last_value) without one, and a frame without ORDER BY that is not the whole partition.
+
+**Measured, 30 window queries against DuckDB's answers: 0 wrong.** Ranks with NULLs (NULLS LAST and DESC),
+`percent_rank`/`cume_dist`, `ntile` (300 rows / 7 and per partition), running sums with peers (RANGE),
+ROWS frames with offsets, whole-partition aggregates, exact avg and HUGEINT sums over windows, lag/lead with
+offsets and defaults, first/last value with frames, exact string partitions, string min/max over windows, ranks
+over strings, QUALIFY, a window over GROUP BY, mixed specs, a window inside an expression. The 9 decline cases
+decline (6 in the producer, 3 in the emitter).
+
+- ⚠⚠ **IGNORE NULLS is NOT DuckDB's semantics in two places, found by this measurement** (SQL Server 2025):
+  - `LEAD(w, 2) IGNORE NULLS`: T-SQL moves 2 rows and then on to the next non-null one, DuckDB counts non-null
+    rows only (row 3 of 10,20,30,NULL,50,60: T-SQL 50, DuckDB 60). They agree for an offset of 1 → any other
+    offset declines.
+  - With a default: when only nulls follow, DuckDB returns the default and T-SQL NULL (T-SQL's default applies
+    only where the offset leaves the partition) → a non-null default declines.
+  - `first_value`/`last_value` IGNORE NULLS and lag/lead IGNORE NULLS with offset 1 and no default agree.
+- ⚠ IGNORE NULLS needs **SQL Server 2022+**; the integration must gate it by server version (Fabric Warehouse
+  unmeasured).
+- ⚠ Not measured: performance on columnstore (batch-mode window aggregate).
+
 ## 4. Order of work
 
 1. **DELETE shortcut, SQL Server** — BUILT (§2.4).

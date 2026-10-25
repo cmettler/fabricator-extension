@@ -259,6 +259,7 @@ sealed class SubstraitPlanDecoder
                 case F.Rel_Set: rel = ReadSetRel(r.ReadMessage(wire)); break;
                 case F.Rel_Cross: rel = ReadCrossRel(r.ReadMessage(wire)); break;
                 case F.Rel_TopN: rel = ReadTopNRel(r.ReadMessage(wire)); break;
+                case F.Rel_Window: rel = ReadWindowRel(r.ReadMessage(wire)); break; // [FABRICATOR-PATCH: OURS-BY-DESIGN] window functions
                 default: throw SubstraitTranslationException.UnsupportedRelation(field);
             }
         }
@@ -563,6 +564,96 @@ sealed class SubstraitPlanDecoder
         }
         sf.Expr = expr ?? throw SubstraitTranslationException.MalformedPlan("SortField missing expression.");
         return sf;
+    }
+
+    // [FABRICATOR-PATCH: OURS-BY-DESIGN] ConsistentPartitionWindowRel
+    WindowRel ReadWindowRel(ProtoReader r)
+    {
+        var rel = new WindowRel();
+        Rel? input = null;
+        while (r.Next(out int field, out int wire))
+        {
+            switch (field)
+            {
+                case F.WindowRel_Common: rel.Emit = ReadRelCommon(r.ReadMessage(wire), "ConsistentPartitionWindowRel"); break;
+                case F.WindowRel_Input: input = ReadRel(r.ReadMessage(wire)); break;
+                case F.WindowRel_WindowFunctions: rel.Functions.Add(ReadWindowCall(r.ReadMessage(wire))); break;
+                case F.WindowRel_PartitionExpressions: rel.Partitions.Add(ReadExpression(r.ReadMessage(wire))); break;
+                case F.WindowRel_Sorts: rel.Sorts.Add(ReadSortField(r.ReadMessage(wire))); break;
+                case F.Rel_AdvancedExtension: CheckAdvancedExtension(r.ReadMessage(wire), "ConsistentPartitionWindowRel"); break;
+                default: throw SubstraitTranslationException.UnexpectedField("ConsistentPartitionWindowRel", field);
+            }
+        }
+        rel.Input = input ?? throw SubstraitTranslationException.MalformedPlan("ConsistentPartitionWindowRel missing input.");
+        if (rel.Functions.Count == 0)
+            throw SubstraitTranslationException.MalformedPlan("ConsistentPartitionWindowRel has no window functions.");
+        return rel;
+    }
+
+    WindowCall ReadWindowCall(ProtoReader r)
+    {
+        var call = new WindowCall();
+        uint functionRef = 0;
+        while (r.Next(out int field, out int wire))
+        {
+            switch (field)
+            {
+                case F.WindowRelFunction_FunctionReference: functionRef = r.ReadUInt32(wire); break;
+                case F.WindowRelFunction_Arguments: call.Args.Add(ReadFunctionArgument(r.ReadMessage(wire))); break;
+                case F.WindowRelFunction_Options: call.Options.Add(ReadFunctionOption(r.ReadMessage(wire))); break;
+                case F.WindowRelFunction_OutputType: call.OutputType = ReadType(r.ReadMessage(wire)); break;
+                case F.WindowRelFunction_Invocation: call.Invocation = r.ReadInt32(wire); break;
+                case F.WindowRelFunction_BoundsType: call.BoundsType = r.ReadInt32(wire); break;
+                case F.WindowRelFunction_LowerBound: call.Lower = ReadWindowBound(r.ReadMessage(wire)); break;
+                case F.WindowRelFunction_UpperBound: call.Upper = ReadWindowBound(r.ReadMessage(wire)); break;
+                case F.WindowRelFunction_Phase:
+                {
+                    int phase = r.ReadInt32(wire);
+                    if (phase is not (F.AggregationPhase_Unspecified or F.AggregationPhase_InitialToResult))
+                        throw SubstraitTranslationException.Unsupported($"Aggregation phase {phase} is not supported; only INITIAL_TO_RESULT can be translated.");
+                    break;
+                }
+                default: throw SubstraitTranslationException.UnexpectedField("WindowRelFunction", field);
+            }
+        }
+        call.Function = ResolveFunction(functionRef);
+        return call;
+    }
+
+    WindowBound ReadWindowBound(ProtoReader r)
+    {
+        var bound = new WindowBound();
+        while (r.Next(out int field, out int wire))
+        {
+            switch (field)
+            {
+                case F.WindowBound_Preceding:
+                case F.WindowBound_Following:
+                {
+                    bound.Kind = field;
+                    var offset = r.ReadMessage(wire);
+                    while (offset.Next(out int of, out int ow))
+                    {
+                        switch (of)
+                        {
+                            case F.WindowBoundOffset_Offset: bound.Offset ??= Int64Literal(offset.ReadInt64(ow)); break;
+                            case F.WindowBoundOffset_OffsetExpr: bound.Offset = ReadExpression(offset.ReadMessage(ow)); break;
+                            default: throw SubstraitTranslationException.UnexpectedField("WindowFunction.Bound offset", of);
+                        }
+                    }
+                    break;
+                }
+                case F.WindowBound_CurrentRow:
+                case F.WindowBound_Unbounded:
+                    bound.Kind = field;
+                    r.ReadMessage(wire);
+                    break;
+                default: throw SubstraitTranslationException.UnexpectedField("WindowFunction.Bound", field);
+            }
+        }
+        if (bound.Kind == 0)
+            throw SubstraitTranslationException.MalformedPlan("A window bound has no kind.");
+        return bound;
     }
 
     AggregateRel ReadAggregateRel(ProtoReader r)

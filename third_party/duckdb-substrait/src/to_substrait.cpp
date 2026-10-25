@@ -5,6 +5,9 @@
 #include "duckdb/common/enums/expression_type.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/execution/expression_executor.hpp"
+#include "duckdb/common/enum_util.hpp" // [FABRICATOR-PATCH: DUCKDB-2.0] window bounds
+#include "duckdb/planner/operator/logical_window.hpp"
+#include "duckdb/function/window_function.hpp"
 #include "duckdb/execution/index/art/art_key.hpp"
 #include "duckdb/function/table/table_scan.hpp"
 #include "duckdb/parser/constraints/not_null_constraint.hpp"
@@ -1682,8 +1685,228 @@ substrait::Rel *DuckDBToSubstrait::TransformAggregateGroup(LogicalOperator &dop)
 }
 
 substrait::Rel *DuckDBToSubstrait::TransformWindow(LogicalOperator &dop) {
-	// [FABRICATOR-PATCH: OURS-BY-DESIGN] DuckDB 2.0 reshaped window expressions (BoundWindowFunction, no offset/default fields) and the T-SQL emitter has no window relation; a window declines until both sides support it
-	throw NotImplementedException("to_substrait: TransformWindow is not supported by this build");
+	// [FABRICATOR-PATCH: DUCKDB-2.0 + OFFER-READY] Rewritten for DuckDB 2.0's BoundWindowExpression (window functions
+	// are catalog functions now; lag/lead offset and default are ordinary children). Changes against upstream, each
+	// of which gave a wrong answer there:
+	// - upstream grouped ALL expressions with the same partition/order into one relation, which reorders the output
+	//   columns (input, then group by group) against DuckDB's (input, then expressions in order). Only CONSECUTIVE
+	//   expressions share a relation here, so the order is DuckDB's.
+	// - GROUPS frames went out as ROWS, IGNORE NULLS / EXCLUDE / FILTER / an argument ORDER BY were dropped, and
+	//   RANGE offsets were sent. Here they decline, except IGNORE NULLS (declared under our own extension, so a
+	//   consumer that does not know it cannot ignore it) and constant ROWS offsets.
+	auto &dwindow = dop.Cast<LogicalWindow>();
+	substrait::Rel *current = TransformOp(*dop.children[0]);
+	auto &expressions = dwindow.expressions;
+	auto same_spec = [](BoundWindowExpression &a, BoundWindowExpression &b) {
+		if (a.Partitions().size() != b.Partitions().size() || a.OrderBy().size() != b.OrderBy().size()) {
+			return false;
+		}
+		for (idx_t i = 0; i < a.Partitions().size(); i++) {
+			if (!a.Partitions()[i]->Equals(*b.Partitions()[i])) {
+				return false;
+			}
+		}
+		for (idx_t i = 0; i < a.OrderBy().size(); i++) {
+			if (!a.OrderBy()[i].Equals(b.OrderBy()[i])) {
+				return false;
+			}
+		}
+		return true;
+	};
+	for (auto &dexpr : expressions) {
+		if (dexpr->GetExpressionClass() != ExpressionClass::BOUND_WINDOW) {
+			throw NotImplementedException("to_substrait: a window operator with a non-window expression");
+		}
+	}
+	idx_t begin = 0;
+	while (begin < expressions.size()) {
+		auto &first = expressions[begin]->Cast<BoundWindowExpression>();
+		idx_t end = begin + 1;
+		while (end < expressions.size() && same_spec(first, expressions[end]->Cast<BoundWindowExpression>())) {
+			end++;
+		}
+		auto res = make_uniq<substrait::Rel>();
+		auto swindow = res->mutable_window();
+		swindow->set_allocated_input(current);
+		for (auto &dpart : first.PartitionsMutable()) {
+			TransformExpr(*dpart, *swindow->add_partition_expressions());
+		}
+		for (auto &dorder : first.OrderBy()) {
+			TransformOrder(dorder, *swindow->add_sorts());
+		}
+		for (idx_t i = begin; i < end; i++) {
+			TransformWindowFunction(expressions[i]->Cast<BoundWindowExpression>(), *swindow->add_window_functions());
+		}
+		current = res.release();
+		begin = end;
+	}
+	return current;
+}
+
+//! [FABRICATOR-PATCH: OFFER-READY] A constant, non-negative integer (a ROWS offset, a lag/lead offset, a tile count)
+static int64_t WindowConstant(ClientContext &context, Expression &expr, const char *what) {
+	if (!expr.IsFoldable()) {
+		throw NotImplementedException("to_substrait: a window %s must be a constant", what);
+	}
+	auto value = ExpressionExecutor::EvaluateScalar(context, expr);
+	auto result = value.IsNull() ? optional<Value>() : value.DefaultTryCastAs(LogicalType::BIGINT, nullptr, true);
+	if (!result) {
+		throw NotImplementedException("to_substrait: a window %s must be an integer", what);
+	}
+	auto number = result->GetValue<int64_t>();
+	if (number < 0) {
+		throw NotImplementedException("to_substrait: a negative window %s is not supported", what);
+	}
+	return number;
+}
+
+static void WindowBound(ClientContext &context, WindowBoundary boundary, Expression *offset,
+                        substrait::Expression_WindowFunction_Bound &bound) {
+	switch (boundary) {
+	case WindowBoundary::UNBOUNDED_PRECEDING:
+	case WindowBoundary::UNBOUNDED_FOLLOWING:
+		bound.mutable_unbounded();
+		return;
+	case WindowBoundary::CURRENT_ROW_ROWS:
+	case WindowBoundary::CURRENT_ROW_RANGE:
+		bound.mutable_current_row();
+		return;
+	case WindowBoundary::EXPR_PRECEDING_ROWS:
+	case WindowBoundary::EXPR_FOLLOWING_ROWS: {
+		if (!offset) {
+			throw InternalException("Window boundary expression missing");
+		}
+		auto rows = WindowConstant(context, *offset, "frame offset");
+		auto target = boundary == WindowBoundary::EXPR_PRECEDING_ROWS ? bound.mutable_preceding()->mutable_offset_expr()
+		                                                              : bound.mutable_following()->mutable_offset_expr();
+		target->mutable_literal()->set_i64(rows);
+		return;
+	}
+	default:
+		// GROUPS frames and RANGE offsets have no consumer that computes them like DuckDB
+		throw NotImplementedException("to_substrait: window frame bound %s is not supported",
+		                              EnumUtil::ToString(boundary));
+	}
+}
+
+void DuckDBToSubstrait::TransformWindowFunction(BoundWindowExpression &dwin,
+                                                substrait::ConsistentPartitionWindowRel_WindowRelFunction &sfun) {
+	if (dwin.Filter()) {
+		throw NotImplementedException("to_substrait: a window function with FILTER is not supported");
+	}
+	if (!dwin.ArgOrders().empty()) {
+		throw NotImplementedException("to_substrait: a window function with an argument ORDER BY is not supported");
+	}
+	if (dwin.WindowExclude() != WindowExcludeMode::NO_OTHER) {
+		throw NotImplementedException("to_substrait: a window frame with EXCLUDE is not supported");
+	}
+	if (dwin.Distinct()) {
+		throw NotImplementedException("to_substrait: a DISTINCT window function is not supported");
+	}
+	*sfun.mutable_output_type() = DuckToSubstraitType(dwin.GetReturnType());
+	auto &children = dwin.GetChildrenMutable();
+	vector<::substrait::Type> args_types;
+	auto add_argument = [&](Expression &darg) {
+		args_types.emplace_back(DuckToSubstraitType(darg.GetReturnType()));
+		TransformExpr(darg, *sfun.add_arguments()->mutable_value());
+	};
+	auto add_constant = [&](int64_t number, const LogicalType &type) {
+		args_types.emplace_back(DuckToSubstraitType(type));
+		TransformConstant(Value::BIGINT(number).DefaultCastAs(type), *sfun.add_arguments()->mutable_value());
+	};
+	bool frame = false;
+	if (dwin.GetExpressionType() == ExpressionType::WINDOW_AGGREGATE) {
+		auto name = dwin.AggregateFunction()->GetName().GetIdentifierName();
+		// as in TransformAggregateGroup: an integer sum is a HUGEINT in DuckDB, so sum it as decimal(38,0)
+		bool widen_sum = name == "sum" && dwin.GetReturnType().id() == LogicalTypeId::HUGEINT && children.size() == 1 &&
+		                 children[0]->GetReturnType().IsIntegral();
+		for (auto &darg : children) {
+			if (widen_sum) {
+				auto decimal_type = LogicalType::DECIMAL(38, 0);
+				args_types.emplace_back(DuckToSubstraitType(decimal_type));
+				auto cast = sfun.add_arguments()->mutable_value()->mutable_cast();
+				TransformExpr(*darg, *cast->mutable_input());
+				*cast->mutable_type() = DuckToSubstraitType(decimal_type);
+				continue;
+			}
+			add_argument(*darg);
+		}
+		sfun.set_function_reference(RegisterFunction(RemapFunctionName(name), args_types));
+		frame = true;
+	} else {
+		string name;
+		switch (dwin.WindowFunction()->window_enum) {
+		case ExpressionType::WINDOW_ROW_NUMBER:
+			name = "row_number";
+			break;
+		case ExpressionType::WINDOW_RANK:
+			name = "rank";
+			break;
+		case ExpressionType::WINDOW_RANK_DENSE:
+			name = "dense_rank";
+			break;
+		case ExpressionType::WINDOW_PERCENT_RANK:
+			name = "percent_rank";
+			break;
+		case ExpressionType::WINDOW_CUME_DIST:
+			name = "cume_dist";
+			break;
+		case ExpressionType::WINDOW_NTILE:
+			if (children.size() != 1) {
+				throw NotImplementedException("to_substrait: ntile with %d arguments", children.size());
+			}
+			add_constant(WindowConstant(context, *children[0], "tile count"), LogicalType::BIGINT);
+			name = "ntile";
+			break;
+		case ExpressionType::WINDOW_LAG:
+		case ExpressionType::WINDOW_LEAD:
+			if (children.empty() || children.size() > 3) {
+				throw NotImplementedException("to_substrait: lag/lead with %d arguments", children.size());
+			}
+			add_argument(*children[0]);
+			if (children.size() > 1) {
+				add_constant(WindowConstant(context, *children[1], "offset"), LogicalType::INTEGER);
+			}
+			if (children.size() > 2) {
+				add_argument(*children[2]);
+			}
+			name = dwin.WindowFunction()->window_enum == ExpressionType::WINDOW_LAG ? "lag" : "lead";
+			break;
+		case ExpressionType::WINDOW_FIRST_VALUE:
+		case ExpressionType::WINDOW_LAST_VALUE:
+			if (children.size() != 1) {
+				throw NotImplementedException("to_substrait: first_value/last_value with %d arguments", children.size());
+			}
+			add_argument(*children[0]);
+			name = dwin.WindowFunction()->window_enum == ExpressionType::WINDOW_FIRST_VALUE ? "first_value" : "last_value";
+			frame = true;
+			break;
+		default:
+			throw NotImplementedException("to_substrait: window function %s is not supported",
+			                              ExpressionTypeToString(dwin.WindowFunction()->window_enum));
+		}
+		if (dwin.IgnoreNulls()) {
+			// [FABRICATOR-PATCH: OURS-BY-DESIGN] Substrait has no IGNORE NULLS; declared as a function of its own
+			// under our extension, so a consumer that does not know it fails instead of respecting nulls
+			sfun.set_function_reference(
+			    RegisterDeclaredFunction(name + "_ignore_nulls:any", "extension:fabricator:functions_window"));
+		} else {
+			sfun.set_function_reference(RegisterFunction(name, args_types));
+		}
+	}
+	if (!frame) {
+		// ranking and offset functions ignore the frame
+		sfun.set_bounds_type(substrait::Expression_WindowFunction_BoundsType_BOUNDS_TYPE_ROWS);
+		sfun.mutable_lower_bound()->mutable_unbounded();
+		sfun.mutable_upper_bound()->mutable_unbounded();
+		return;
+	}
+	auto range = dwin.WindowStart() == WindowBoundary::CURRENT_ROW_RANGE ||
+	             dwin.WindowEnd() == WindowBoundary::CURRENT_ROW_RANGE;
+	sfun.set_bounds_type(range ? substrait::Expression_WindowFunction_BoundsType_BOUNDS_TYPE_RANGE
+	                           : substrait::Expression_WindowFunction_BoundsType_BOUNDS_TYPE_ROWS);
+	WindowBound(context, dwin.WindowStart(), dwin.StartExprMutable().get(), *sfun.mutable_lower_bound());
+	WindowBound(context, dwin.WindowEnd(), dwin.EndExprMutable().get(), *sfun.mutable_upper_bound());
 }
 
 int32_t GetTimestampPrecision(LogicalTypeId type) {

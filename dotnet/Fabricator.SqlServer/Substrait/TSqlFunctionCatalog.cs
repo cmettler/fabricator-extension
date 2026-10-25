@@ -240,6 +240,8 @@ internal static class TSqlFunctionCatalog
     public const string AggregateApproxUrn = "extension:io.substrait:functions_aggregate_approx";
     /// <summary>[FABRICATOR-PATCH: OURS-BY-DESIGN] Fabricator's own extension: string min/max.</summary>
     public const string FabricatorStringUrn = "extension:fabricator:functions_string";
+    /// <summary>[FABRICATOR-PATCH: OURS-BY-DESIGN] Window functions with IGNORE NULLS, which Substrait cannot say.</summary>
+    public const string FabricatorWindowUrn = "extension:fabricator:functions_window";
 
     /// <summary>T-SQL functions take at most 254 arguments; CONCAT's first is an empty nvarchar(max).</summary>
     private const int MaxConcatArguments = 253;
@@ -262,6 +264,239 @@ internal static class TSqlFunctionCatalog
         var call = new TSqlCall(e, scope, sf.Function.DisplayName, sf.Args, rendered, argTypes, options, requested, resultType);
         string text = fn.Write(call);
         return fn.Predicate ? SqlExpr.Condition(text, call.Props) : SqlExpr.Of(text, resultType, call.Props);
+    }
+
+    /// <summary>
+    /// [FABRICATOR-PATCH: OURS-BY-DESIGN] A window function. An aggregate is written as it would be in an
+    /// aggregate relation (so exact avg/sum and string min/max carry over), with the OVER clause after each of its
+    /// aggregate calls; ranking and offset functions are written here. Declines what T-SQL computes differently:
+    /// DISTINCT, frames other than unbounded/current row under RANGE, ROWS offsets that are not constants, and
+    /// functions that need an order (ranks, lag/lead, first/last value) without one.
+    /// IGNORE NULLS (lag, lead, first_value, last_value) needs SQL Server 2022 or later.
+    /// </summary>
+    public static SqlExpr WriteWindow(TSqlEmitter e, WindowCall call, IReadOnlyList<SqlColumn> scope, List<string> partitions, List<OrderItem> order)
+    {
+        string name = call.Function.Name;
+        bool ignoreNulls = false;
+        if (call.Function.Urn == FabricatorWindowUrn && name.EndsWith("_ignore_nulls", StringComparison.Ordinal))
+        {
+            name = name.Substring(0, name.Length - "_ignore_nulls".Length);
+            ignoreNulls = true;
+            if (name is not ("lag" or "lead" or "first_value" or "last_value"))
+                throw SubstraitTranslationException.UnsupportedFunction(call.Function.DisplayName);
+        }
+        else if (call.Function.Urn != ArithmeticUrn && call.Function.Urn != AggregateGenericUrn
+            && call.Function.Urn != ArithmeticDecimalUrn && call.Function.Urn != FabricatorStringUrn
+            && call.Function.Urn != DatetimeUrn && call.Function.Urn != BooleanUrn)
+        {
+            throw SubstraitTranslationException.UnsupportedFunction(call.Function.DisplayName);
+        }
+        if (call.Invocation == F.AggregationInvocation_Distinct)
+            throw SubstraitTranslationException.Unsupported($"{call.Function.DisplayName}: DISTINCT window functions are not supported; T-SQL does not allow them.");
+        var resultType = call.OutputType ?? throw SubstraitTranslationException.MalformedPlan($"Window function {call.Function.DisplayName} has no output type.");
+
+        string Over(bool frame)
+        {
+            var parts = new List<string>();
+            if (partitions.Count > 0) parts.Add("PARTITION BY " + string.Join(", ", partitions));
+            if (order.Count > 0) parts.Add("ORDER BY " + string.Join(", ", order));
+            if (frame) parts.Add(Frame(call, order.Count > 0, out _) ?? "");
+            return "(" + string.Join(" ", parts.Where(p => p.Length > 0)) + ")";
+        }
+        string Value(int index)
+        {
+            var arg = index < call.Args.Count ? call.Args[index].Value : null;
+            if (arg == null) throw SubstraitTranslationException.MalformedPlan($"Argument {index} of window function {call.Function.DisplayName} must be a value.");
+            var v = e.Render(arg, scope);
+            if ((v.Props & (SqlProps.Subquery | SqlProps.Outer | SqlProps.Window | SqlProps.Aggregate)) != 0)
+                throw SubstraitTranslationException.Unsupported($"{call.Function.DisplayName}: arguments with a subquery, an outer reference or an aggregate are not supported.");
+            return v.Value;
+        }
+        long Constant(int index, long min)
+        {
+            if (index >= call.Args.Count || call.Args[index].Value is not LiteralExpr { IsNull: false } lit || !lit.Type.IsInteger || lit.IntValue < min)
+                throw SubstraitTranslationException.Unsupported($"{call.Function.DisplayName}: argument {index} must be a constant integer of at least {min}.");
+            return lit.IntValue;
+        }
+        void NeedsOrder()
+        {
+            if (order.Count == 0)
+                throw SubstraitTranslationException.Unsupported($"{name} without ORDER BY is not supported; its result would depend on an arbitrary order.");
+        }
+        string Nulls() => ignoreNulls ? " IGNORE NULLS" : "";
+        const SqlProps props = SqlProps.Column | SqlProps.Window;
+
+        if (call.Function.Urn is ArithmeticUrn or FabricatorWindowUrn)
+        {
+            switch (name)
+            {
+                case "row_number": NeedsOrder(); return SqlExpr.Of("ROW_NUMBER() OVER " + Over(false), resultType, props);
+                case "rank": NeedsOrder(); return SqlExpr.Of("RANK() OVER " + Over(false), resultType, props);
+                case "dense_rank": NeedsOrder(); return SqlExpr.Of("DENSE_RANK() OVER " + Over(false), resultType, props);
+                case "percent_rank": NeedsOrder(); return SqlExpr.Of("PERCENT_RANK() OVER " + Over(false), resultType, props);
+                case "cume_dist": NeedsOrder(); return SqlExpr.Of("CUME_DIST() OVER " + Over(false), resultType, props);
+                case "ntile": NeedsOrder(); return SqlExpr.Of($"NTILE({TSql.Int(Constant(0, 1))}) OVER " + Over(false), resultType, props);
+                case "lag":
+                case "lead":
+                {
+                    NeedsOrder();
+                    var args = new List<string> { Value(0) };
+                    long offset = call.Args.Count > 1 ? Constant(1, 0) : 1;
+                    if (ignoreNulls && offset != 1)
+                    {
+                        // measured: T-SQL moves `offset` rows and then on to the next non-null one, DuckDB counts
+                        // non-null rows only; the two agree for an offset of 1
+                        throw SubstraitTranslationException.Unsupported($"{name} IGNORE NULLS with an offset other than 1 is not supported; SQL Server counts the offset differently.");
+                    }
+                    if (ignoreNulls && call.Args.Count > 2 && !IsNullValue(call.Args[2].Value))
+                    {
+                        // measured: when only nulls follow, DuckDB returns the default and T-SQL null (T-SQL's
+                        // default applies only where the offset leaves the partition)
+                        throw SubstraitTranslationException.Unsupported($"{name} IGNORE NULLS with a default is not supported; SQL Server applies the default differently.");
+                    }
+                    if (call.Args.Count > 1) args.Add(TSql.Int(offset));
+                    if (call.Args.Count > 2) args.Add(Value(2));
+                    if (call.Args.Count > 3) throw SubstraitTranslationException.Unsupported($"{name} with {call.Args.Count} arguments is not supported.");
+                    return SqlExpr.Of($"{name.ToUpperInvariant()}({string.Join(", ", args)}){Nulls()} OVER " + Over(false), resultType, props);
+                }
+                case "first_value":
+                case "last_value":
+                    NeedsOrder();
+                    return SqlExpr.Of($"{name.ToUpperInvariant()}({Value(0)}){Nulls()} OVER " + Over(true), resultType, props);
+            }
+            if (call.Function.Urn == FabricatorWindowUrn)
+                throw SubstraitTranslationException.UnsupportedFunction(call.Function.DisplayName);
+        }
+
+        // an aggregate over the window
+        if (name is not ("count" or "sum" or "avg" or "min" or "max" or "bool_and" or "bool_or" or "std_dev" or "variance"))
+            throw SubstraitTranslationException.Unsupported($"{call.Function.DisplayName} is not supported as a window function.");
+        var measure = new Measure
+        {
+            Call = new AggregateCall
+            {
+                Function = call.Function,
+                Args = call.Args,
+                Options = call.Options,
+                OutputType = call.OutputType,
+                Invocation = call.Invocation,
+            },
+        };
+        var aggregate = WriteAggregate(e, measure, scope);
+        string text = InsertOver(aggregate.Value, "OVER " + Over(true), out int calls);
+        if (calls == 0)
+            throw SubstraitTranslationException.Unsupported($"{call.Function.DisplayName}: no aggregate call to apply the window to.");
+        return SqlExpr.Of(text, aggregate.Type, props);
+    }
+
+    private static bool IsNullValue(Expr? e) => e is LiteralExpr { IsNull: true } || e is CastExpr { Input: LiteralExpr { IsNull: true } };
+
+    /// <summary>[FABRICATOR-PATCH: OURS-BY-DESIGN] The frame clause, or null when the frame is the whole partition.</summary>
+    private static string? Frame(WindowCall call, bool ordered, out bool wholePartition)
+    {
+        var lower = call.Lower ?? throw SubstraitTranslationException.MalformedPlan("A window function has no lower bound.");
+        var upper = call.Upper ?? throw SubstraitTranslationException.MalformedPlan("A window function has no upper bound.");
+        bool range = call.BoundsType == F.BoundsType_Range;
+        if (call.BoundsType is not (F.BoundsType_Rows or F.BoundsType_Range))
+            throw SubstraitTranslationException.Unsupported($"window bounds type {call.BoundsType} is not supported.");
+        bool unboundedBoth = lower.Kind == F.WindowBound_Unbounded && upper.Kind == F.WindowBound_Unbounded;
+        // with all rows peers (no ORDER BY), RANGE ... CURRENT ROW reaches the last peer, i.e. the partition's end
+        wholePartition = unboundedBoth || (!ordered && range && lower.Kind == F.WindowBound_Unbounded && upper.Kind == F.WindowBound_CurrentRow);
+        if (!ordered)
+        {
+            if (!wholePartition)
+                throw SubstraitTranslationException.Unsupported("a window frame without ORDER BY that is not the whole partition is not supported; it depends on an arbitrary order.");
+            return null;
+        }
+        string Bound(WindowBound b, bool isLower)
+        {
+            switch (b.Kind)
+            {
+                case F.WindowBound_Unbounded: return isLower ? "UNBOUNDED PRECEDING" : "UNBOUNDED FOLLOWING";
+                case F.WindowBound_CurrentRow: return "CURRENT ROW";
+                case F.WindowBound_Preceding:
+                case F.WindowBound_Following:
+                    if (range)
+                        throw SubstraitTranslationException.Unsupported("RANGE frames with an offset are not supported; T-SQL's RANGE has none.");
+                    if (b.Offset is not LiteralExpr { IsNull: false } lit || !lit.Type.IsInteger || lit.IntValue < 0)
+                        throw SubstraitTranslationException.Unsupported("a ROWS frame offset must be a constant, non-negative integer.");
+                    return TSql.Int(lit.IntValue) + (b.Kind == F.WindowBound_Preceding ? " PRECEDING" : " FOLLOWING");
+                default: throw SubstraitTranslationException.MalformedPlan($"Window bound kind {b.Kind} is not valid.");
+            }
+        }
+        return $"{(range ? "RANGE" : "ROWS")} BETWEEN {Bound(lower, true)} AND {Bound(upper, false)}";
+    }
+
+    private static readonly HashSet<string> s_windowAggregates = new(StringComparer.Ordinal)
+    {
+        "SUM", "COUNT_BIG", "COUNT", "MIN", "MAX", "AVG", "STDEV", "STDEVP", "VAR", "VARP",
+    };
+
+    /// <summary>
+    /// [FABRICATOR-PATCH: OURS-BY-DESIGN] Puts <paramref name="over"/> after each aggregate call in written SQL,
+    /// skipping string literals and bracketed identifiers.
+    /// </summary>
+    internal static string InsertOver(string text, string over, out int calls)
+    {
+        calls = 0;
+        var sb = new StringBuilder(text.Length + over.Length + 2);
+        int i = 0;
+        while (i < text.Length)
+        {
+            char ch = text[i];
+            if (ch is '\'' or '[')
+            {
+                int end = SkipQuoted(text, i);
+                sb.Append(text, i, end - i);
+                i = end;
+                continue;
+            }
+            if (char.IsLetter(ch) || ch == '_')
+            {
+                int j = i;
+                while (j < text.Length && (char.IsLetterOrDigit(text[j]) || text[j] == '_')) j++;
+                bool wordStart = i == 0 || !(char.IsLetterOrDigit(text[i - 1]) || text[i - 1] is '_' or '@' or '#');
+                if (wordStart && j < text.Length && text[j] == '(' && s_windowAggregates.Contains(text.Substring(i, j - i)))
+                {
+                    int close = MatchingParen(text, j);
+                    sb.Append(text, i, close + 1 - i).Append(' ').Append(over);
+                    calls++;
+                    i = close + 1;
+                    continue;
+                }
+                sb.Append(text, i, j - i);
+                i = j;
+                continue;
+            }
+            sb.Append(ch);
+            i++;
+        }
+        return sb.ToString();
+    }
+
+    private static int SkipQuoted(string text, int start)
+    {
+        char close = text[start] == '[' ? ']' : '\'';
+        for (int k = start + 1; k < text.Length; k++)
+        {
+            if (text[k] != close) continue;
+            if (k + 1 < text.Length && text[k + 1] == close) { k++; continue; }
+            return k + 1;
+        }
+        throw SubstraitTranslationException.MalformedPlan("Unterminated literal in written SQL.");
+    }
+
+    private static int MatchingParen(string text, int open)
+    {
+        int depth = 0;
+        for (int k = open; k < text.Length; k++)
+        {
+            char ch = text[k];
+            if (ch is '\'' or '[') { k = SkipQuoted(text, k) - 1; continue; }
+            if (ch == '(') depth++;
+            else if (ch == ')' && --depth == 0) return k;
+        }
+        throw SubstraitTranslationException.MalformedPlan("Unbalanced parentheses in written SQL.");
     }
 
     public static SqlExpr WriteAggregate(TSqlEmitter e, Measure measure, IReadOnlyList<SqlColumn> scope)

@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include "duckdb/planner/expression/bound_window_expression.hpp" // [FABRICATOR-PATCH: DUCKDB-2.0]
 #include "custom_extensions/custom_extensions.hpp"
 #include "duckdb/common/helper.hpp"
 #include "duckdb/function/table_function.hpp"
@@ -44,6 +45,9 @@ private:
 	uint64_t RegisterFunction(const std::string &name, vector<::substrait::Type> &args_types);
 	//! [FABRICATOR-PATCH: OFFER-READY] Registers a function under a compound name and extension given as-is
 	uint64_t RegisterDeclaredFunction(const std::string &declared_name, const std::string &extension_urn);
+	//! [FABRICATOR-PATCH: DUCKDB-2.0] One window function of a window relation
+	void TransformWindowFunction(BoundWindowExpression &dwin,
+	                             substrait::ConsistentPartitionWindowRel_WindowRelFunction &sfun);
 	//! Creates a reference to a table column
 	static void CreateFieldRef(substrait::Expression *expr, uint64_t col_idx);
 	//! In case of struct types we might we do DFS to get all names

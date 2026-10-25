@@ -366,6 +366,35 @@ sealed class TopNRel : Rel
     public bool WithTies;
 }
 
+/// <summary>[FABRICATOR-PATCH: OURS-BY-DESIGN] A window frame bound: its kind (a WindowBound_* field) and a row offset.</summary>
+sealed class WindowBound
+{
+    public int Kind;
+    public Expr? Offset;
+}
+
+/// <summary>[FABRICATOR-PATCH: OURS-BY-DESIGN] A window function of a <see cref="WindowRel"/>.</summary>
+sealed class WindowCall
+{
+    public FunctionDecl Function = null!;
+    public List<FunctionArg> Args = new();
+    public List<FunctionOptionValue> Options = new();
+    public SType? OutputType;
+    public int Invocation;
+    public int BoundsType;
+    public WindowBound? Lower;
+    public WindowBound? Upper;
+}
+
+/// <summary>[FABRICATOR-PATCH: OURS-BY-DESIGN] ConsistentPartitionWindowRel: the input's columns, then one per function.</summary>
+sealed class WindowRel : Rel
+{
+    public Rel Input = null!;
+    public List<WindowCall> Functions = new();
+    public List<Expr> Partitions = new();
+    public List<SortField> Sorts = new();
+}
+
 sealed class RootRel
 {
     public Rel Input = null!;
