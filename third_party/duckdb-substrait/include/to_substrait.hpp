@@ -42,6 +42,8 @@ private:
 	void TransformPlan(LogicalOperator &dop);
 	//! Registers a function
 	uint64_t RegisterFunction(const std::string &name, vector<::substrait::Type> &args_types);
+	//! [FABRICATOR-PATCH: OFFER-READY] Registers a function under a compound name and extension given as-is
+	uint64_t RegisterDeclaredFunction(const std::string &declared_name, const std::string &extension_urn);
 	//! Creates a reference to a table column
 	static void CreateFieldRef(substrait::Expression *expr, uint64_t col_idx);
 	//! In case of struct types we might we do DFS to get all names

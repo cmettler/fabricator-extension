@@ -66,6 +66,39 @@ const case_insensitive_set_t DuckDBToSubstrait::valid_extract_subfields = {
 
 const SubstraitCustomFunctions DuckDBToSubstrait::custom_functions {};
 
+//! [FABRICATOR-PATCH: OFFER-READY] A DuckDB date-part function as a Substrait extract component, with the
+//! indexing enum the component takes (null when it takes none). Only parts whose meaning is the same on both
+//! sides: DuckDB's millisecond/microsecond count from the last full MINUTE (Substrait's from the last second),
+//! and decade/century/millennium have no component, so they decline.
+struct ExtractComponent {
+	const char *component;
+	const char *indexing;
+};
+static bool FindExtractComponent(const string &duck_name, ExtractComponent &result) {
+	static const std::unordered_map<string, ExtractComponent> components = {
+	    {"year", {"YEAR", nullptr}},
+	    {"isoyear", {"ISO_YEAR", nullptr}},
+	    {"quarter", {"QUARTER", "ONE"}},
+	    {"month", {"MONTH", "ONE"}},
+	    {"day", {"DAY", "ONE"}},
+	    {"dayofmonth", {"DAY", "ONE"}},
+	    {"dayofyear", {"DAY_OF_YEAR", "ONE"}},
+	    {"week", {"ISO_WEEK", "ONE"}},
+	    {"weekofyear", {"ISO_WEEK", "ONE"}},
+	    {"isodow", {"MONDAY_DAY_OF_WEEK", "ONE"}},
+	    {"dayofweek", {"SUNDAY_DAY_OF_WEEK", "ZERO"}},
+	    {"hour", {"HOUR", nullptr}},
+	    {"minute", {"MINUTE", nullptr}},
+	    {"second", {"SECOND", nullptr}}};
+	auto entry = components.find(StringUtil::Lower(duck_name));
+	if (entry == components.end()) {
+		return false;
+	}
+	result = entry->second;
+	return true;
+}
+
+
 std::string &DuckDBToSubstrait::RemapFunctionName(std::string &function_name) {
 	auto it = function_names_remap.find(function_name);
 	if (it != function_names_remap.end()) {
@@ -429,6 +462,37 @@ void DuckDBToSubstrait::TransformFunctionExpression(Expression &dexpr, substrait
 		return;
 	}
 	auto sfun = sexpr.mutable_scalar_function();
+	// [FABRICATOR-PATCH: OFFER-READY] a date part is Substrait's extract with the component in upper case (the
+	// spec's enum values) and, for components that count, the indexing enum; the compound name carries each
+	// enum as `req` (extract:req_date, extract:req_req_date). Upstream sent the lower-case function name and
+	// registered extract:date, which no consumer that follows the spec resolves.
+	ExtractComponent extract_component;
+	if (FindExtractComponent(function_name, extract_component) || IsExtractFunction(function_name)) {
+		if (!FindExtractComponent(function_name, extract_component) || dfun.GetChildren().size() != 1) {
+			throw NotImplementedException("to_substrait: extracting '%s' is not supported", function_name);
+		}
+		auto &input = *dfun.GetChildren()[0];
+		auto input_type = DuckToSubstraitType(input.GetReturnType());
+		string type_name = input_type.has_date() ? "date"
+		                   : input_type.has_precision_timestamp() ? "pts"
+		                   : input_type.has_precision_time()      ? "pt"
+		                                                          : "";
+		if (type_name.empty()) {
+			throw NotImplementedException("to_substrait: extracting from %s is not supported",
+			                              input.GetReturnType().ToString());
+		}
+		*sfun->add_arguments()->mutable_enum_() = extract_component.component;
+		string declared = "extract:req_";
+		if (extract_component.indexing) {
+			*sfun->add_arguments()->mutable_enum_() = extract_component.indexing;
+			declared += "req_";
+		}
+		declared += type_name;
+		TransformExpr(input, *sfun->add_arguments()->mutable_value(), col_offset);
+		sfun->set_function_reference(RegisterDeclaredFunction(declared, "extension:io.substrait:functions_datetime"));
+		*sfun->mutable_output_type() = DuckToSubstraitType(dfun.GetReturnType());
+		return;
+	}
 	if (IsExtractFunction(function_name)) {
 		// Change the name to 'extract', and add an Enum argument containing the subfield
 		auto subfield = function_name;
@@ -766,6 +830,30 @@ void DuckDBToSubstrait::TransformExpr(Expression &dexpr, substrait::Expression &
 	default:
 		throw NotImplementedException(ExpressionTypeToString(dexpr.GetExpressionType()));
 	}
+}
+
+// [FABRICATOR-PATCH: OFFER-READY] Registers a function whose compound name the catalog cannot produce (an
+// enum argument is part of a compound name, as `req`, but not of the argument types the catalog matches on).
+uint64_t DuckDBToSubstrait::RegisterDeclaredFunction(const string &declared_name, const string &extension_urn) {
+	auto it = extension_urn_map.find(extension_urn);
+	if (it == extension_urn_map.end()) {
+		extension_urn_map[extension_urn] = last_urn_id;
+		auto urn = plan.mutable_extension_urns()->Add();
+		urn->set_urn(extension_urn);
+		urn->set_extension_urn_anchor(last_urn_id);
+		last_urn_id++;
+	}
+	auto function_entry = functions_map.find(declared_name);
+	if (function_entry != functions_map.end()) {
+		return function_entry->second;
+	}
+	auto function_id = last_function_id++;
+	auto sfun = plan.add_extensions()->mutable_extension_function();
+	sfun->set_function_anchor(function_id);
+	sfun->set_name(declared_name);
+	sfun->set_extension_urn_reference(extension_urn_map[extension_urn]);
+	functions_map[declared_name] = function_id;
+	return function_id;
 }
 
 uint64_t DuckDBToSubstrait::RegisterFunction(const string &name, vector<::substrait::Type> &args_types) {
