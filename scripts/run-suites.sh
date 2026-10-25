@@ -1445,7 +1445,9 @@ case "$TIER" in
         #   measured wrong-answer classes it declines (§14). Hermetic unchanged at 85/85 -- 10593.
         # 2026-10-25: 4231 -> 4232. verify_remote_select_mssql 439 -> 440: lower/upper pushed (the accepted divergence),
         #   code-point length/substring/strpos/lpad/rpad, exact half-to-even float -> integer casts.
-        : "${MIN_ASSERTIONS:=4232}"
+        # 2026-10-25: 4232 -> 4238. verify_remote_select_mssql 440 -> 446: date_trunc, TIMESTAMP / BLOB constants, and ten
+        #   scalar-subquery comparisons rewritten as EXCEPT ALL (they ran both sides locally — vacuous).
+        : "${MIN_ASSERTIONS:=4238}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2
