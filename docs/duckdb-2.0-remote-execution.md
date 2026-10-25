@@ -723,6 +723,7 @@ translate. Two host rules on top: a plan of scans / filters / projections / sort
 | `any_value` (and `nocase` GROUP BY) | MAX | first | declined |
 | `SELECT rowid …` (upstream to_substrait) | — | — | upstream read the table's FIRST column; declined |
 | TIMESTAMP constants (upstream to_substrait) | — | — | sent as a STRING literal (`dval.ToString()`), so `ts = TIMESTAMP '…'` failed on the server; a `precision_timestamp` in the type's unit now. BLOB constants were strings too; binary now |
+| `date_diff`, `last_day`, `make_date` | — (no Substrait standard) | — | declared under `extension:fabricator:functions_datetime`; `date_diff` is `DATEDIFF_BIG` — measured on 2000 timestamp and date pairs, equal for every unit but the WEEK, which DuckDB counts as whole days / 7 (`DATEDIFF_BIG(day, a, b) / 7`, also measured exact); `last_day` → `EOMONTH`, `make_date` → `DATEFROMPARTS` |
 | `date_trunc` | `DATETRUNC` (2022+) | — | producer: Substrait `round_calendar` (FLOOR, one unit, ISO week); emitter: `DATETRUNC(year/quarter/month/iso_week/day/hour/minute/second, x)`; a DATE goes in cast to TIMESTAMP, as DuckDB returns one; other parts decline |
 | TIME columns (upstream to_substrait) | declared as a TIMESTAMP | — | `precision_time`, TIME_NS with 9 digits |
 

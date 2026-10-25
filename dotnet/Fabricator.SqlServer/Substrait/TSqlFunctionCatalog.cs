@@ -242,6 +242,8 @@ internal static class TSqlFunctionCatalog
     public const string FabricatorStringUrn = "extension:fabricator:functions_string";
     /// <summary>[FABRICATOR-PATCH: OURS-BY-DESIGN] Window functions with IGNORE NULLS, which Substrait cannot say.</summary>
     public const string FabricatorWindowUrn = "extension:fabricator:functions_window";
+    /// <summary>[FABRICATOR-PATCH: OURS-BY-DESIGN] DuckDB date functions with no Substrait counterpart.</summary>
+    public const string FabricatorDatetimeUrn = "extension:fabricator:functions_datetime";
 
     /// <summary>T-SQL functions take at most 254 arguments; CONCAT's first is an empty nvarchar(max).</summary>
     private const int MaxConcatArguments = 253;
@@ -1010,6 +1012,14 @@ internal static class TSqlFunctionCatalog
         Scalar(DatetimeUrn, "extract", "DATEPART", "FUNCTION", Long, Extract,
             V("req_pts", "req_ptstz_str", "req_date", "req_pt", "req_req_pts", "req_req_ptstz_str", "req_req_date"));
         Condition(DatetimeUrn, "extract_boolean", "DATEPART", "FUNCTION", ExtractBoolean, V("req_pts", "req_ptstz_str", "req_date"));
+        // [FABRICATOR-PATCH: OURS-BY-DESIGN] DuckDB's date_diff counts unit boundaries like DATEDIFF_BIG — measured on
+        // 2000 pairs, timestamps and dates, for every unit but the week, which DuckDB counts as whole days / 7
+        // (truncated toward zero, also measured); last_day is EOMONTH, make_date DATEFROMPARTS (a year past 9999 is
+        // an error there and an answer in DuckDB).
+        Scalar(FabricatorDatetimeUrn, "date_diff", "DATEDIFF_BIG", "FUNCTION", Long, DateDiff, V("req_pts_pts", "req_date_date"));
+        Scalar(FabricatorDatetimeUrn, "last_day", "EOMONTH", "FUNCTION", t => new SType(TypeKind.Date), c => $"EOMONTH({c.V(0)})", V("date", "pts"));
+        Scalar(FabricatorDatetimeUrn, "make_date", "DATEFROMPARTS", "FUNCTION", t => new SType(TypeKind.Date),
+            c => $"DATEFROMPARTS({c.V(0)}, {c.V(1)}, {c.V(2)})", V("i64_i64_i64"));
         // [FABRICATOR-PATCH: OURS-BY-DESIGN] round_calendar rounding DOWN to one unit (DuckDB's date_trunc) as DATETRUNC
         Scalar(DatetimeUrn, "round_calendar", "DATETRUNC", "FUNCTION", SameAsFirst, RoundCalendar, V("pts_req_req_req_i64"));
         Scalar(DatetimeUrn, "add", "DATEADD", "FUNCTION", DatetimeArithmeticType, c => DatetimeArithmetic(c, negate: false),
@@ -1449,6 +1459,28 @@ internal static class TSqlFunctionCatalog
         return part == null
             ? throw c.Unsupported("only rounding down to one calendar unit is supported.")
             : $"DATETRUNC({part}, {c.V(0)})";
+    }
+
+    /// <summary>[FABRICATOR-PATCH: OURS-BY-DESIGN] DuckDB's date_diff (see the registration for the measurement).</summary>
+    private static string DateDiff(TSqlCall c)
+    {
+        string unit = c.Enum(0) switch
+        {
+            "YEAR" => "year",
+            "QUARTER" => "quarter",
+            "MONTH" => "month",
+            "WEEK" => "week",
+            "DAY" => "day",
+            "HOUR" => "hour",
+            "MINUTE" => "minute",
+            "SECOND" => "second",
+            "MILLISECOND" => "millisecond",
+            "MICROSECOND" => "microsecond",
+            _ => throw c.Unsupported($"date_diff unit '{c.Enum(0)}' is not supported."),
+        };
+        return unit == "week"
+            ? $"(DATEDIFF_BIG(day, {c.V(1)}, {c.V(2)}) / 7)"
+            : $"DATEDIFF_BIG({unit}, {c.V(1)}, {c.V(2)})";
     }
 
     private static string Extract(TSqlCall c)

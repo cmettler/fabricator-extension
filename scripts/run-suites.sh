@@ -1447,7 +1447,9 @@ case "$TIER" in
         #   code-point length/substring/strpos/lpad/rpad, exact half-to-even float -> integer casts.
         # 2026-10-25: 4232 -> 4238. verify_remote_select_mssql 440 -> 446: date_trunc, TIMESTAMP / BLOB constants, and ten
         #   scalar-subquery comparisons rewritten as EXCEPT ALL (they ran both sides locally — vacuous).
-        : "${MIN_ASSERTIONS:=4238}"
+        # 2026-10-25: 4238 -> 4248. verify_remote_select_mssql 446 -> 456: date_diff (DATEDIFF_BIG; the week as days / 7),
+        #   last_day, make_date.
+        : "${MIN_ASSERTIONS:=4248}"
         ;;
     *)
         echo "usage: $0 [hermetic|service]" >&2

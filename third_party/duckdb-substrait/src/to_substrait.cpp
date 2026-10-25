@@ -555,6 +555,95 @@ void DuckDBToSubstrait::TransformFunctionExpression(Expression &dexpr, substrait
 		*sfun->mutable_output_type() = DuckToSubstraitType(dfun.GetReturnType());
 		return;
 	}
+	// [FABRICATOR-PATCH: OURS-BY-DESIGN] date_diff, last_day and make_date have no Substrait counterpart; declared
+	// under our own extension (a consumer that does not know it fails instead of guessing).
+	if (function_name == "date_diff" || function_name == "datediff" || function_name == "last_day" ||
+	    function_name == "make_date") {
+		static const char *FABRICATOR_DATETIME = "extension:fabricator:functions_datetime";
+		auto &children = dfun.GetChildren();
+		auto type_name = [&](const LogicalType &type) -> string {
+			switch (type.id()) {
+			case LogicalTypeId::DATE:
+				return "date";
+			case LogicalTypeId::TIMESTAMP:
+				return "pts";
+			default:
+				throw NotImplementedException("to_substrait: %s of %s is not supported", function_name, type.ToString());
+			}
+		};
+		string declared;
+		if (function_name == "last_day") {
+			if (children.size() != 1) {
+				throw NotImplementedException("to_substrait: last_day with %d arguments", children.size());
+			}
+			declared = "last_day:" + type_name(children[0]->GetReturnType());
+			TransformExpr(*children[0], *sfun->add_arguments()->mutable_value(), col_offset);
+		} else if (function_name == "make_date") {
+			if (children.size() != 3) {
+				throw NotImplementedException("to_substrait: make_date with %d arguments", children.size());
+			}
+			for (auto &child : children) {
+				if (child->GetReturnType().id() != LogicalTypeId::BIGINT) {
+					throw NotImplementedException("to_substrait: make_date of %s", child->GetReturnType().ToString());
+				}
+				TransformExpr(*child, *sfun->add_arguments()->mutable_value(), col_offset);
+			}
+			declared = "make_date:i64_i64_i64";
+		} else {
+			if (children.size() != 3 || !children[0]->IsFoldable() ||
+			    children[1]->GetReturnType() != children[2]->GetReturnType()) {
+				throw NotImplementedException("to_substrait: this date_diff is not supported");
+			}
+			auto part_value = ExpressionExecutor::EvaluateScalar(context, *children[0]);
+			DatePartSpecifier part;
+			if (part_value.IsNull() || !TryGetDatePartSpecifier(part_value.ToString(), part)) {
+				throw NotImplementedException("to_substrait: date_diff part is not supported");
+			}
+			const char *unit;
+			switch (part) {
+			case DatePartSpecifier::YEAR:
+				unit = "YEAR";
+				break;
+			case DatePartSpecifier::QUARTER:
+				unit = "QUARTER";
+				break;
+			case DatePartSpecifier::MONTH:
+				unit = "MONTH";
+				break;
+			case DatePartSpecifier::WEEK:
+				unit = "WEEK";
+				break;
+			case DatePartSpecifier::DAY:
+				unit = "DAY";
+				break;
+			case DatePartSpecifier::HOUR:
+				unit = "HOUR";
+				break;
+			case DatePartSpecifier::MINUTE:
+				unit = "MINUTE";
+				break;
+			case DatePartSpecifier::SECOND:
+				unit = "SECOND";
+				break;
+			case DatePartSpecifier::MILLISECONDS:
+				unit = "MILLISECOND";
+				break;
+			case DatePartSpecifier::MICROSECONDS:
+				unit = "MICROSECOND";
+				break;
+			default:
+				throw NotImplementedException("to_substrait: date_diff part is not supported");
+			}
+			auto value_type = type_name(children[1]->GetReturnType());
+			*sfun->add_arguments()->mutable_enum_() = unit;
+			TransformExpr(*children[1], *sfun->add_arguments()->mutable_value(), col_offset);
+			TransformExpr(*children[2], *sfun->add_arguments()->mutable_value(), col_offset);
+			declared = "date_diff:req_" + value_type + "_" + value_type;
+		}
+		sfun->set_function_reference(RegisterDeclaredFunction(declared, FABRICATOR_DATETIME));
+		*sfun->mutable_output_type() = DuckToSubstraitType(dfun.GetReturnType());
+		return;
+	}
 	// [FABRICATOR-PATCH: OFFER-READY] a date part is Substrait's extract with the component in upper case (the
 	// spec's enum values) and, for components that count, the indexing enum; the compound name carries each
 	// enum as `req` (extract:req_date, extract:req_req_date). Upstream sent the lower-case function name and

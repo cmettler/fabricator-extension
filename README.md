@@ -299,7 +299,8 @@ locally. Whenever any part cannot be translated EXACTLY, the whole statement run
   current row; `IGNORE NULLS` with an offset of 1 and no default (SQL Server 2022+);
 - arithmetic, `CASE`, `COALESCE`, `NULLIF`, casts (a float cast to an integer rounds half to even, as in DuckDB),
   date parts (`year`, `month`, `day`, `hour`, … via `extract` / `date_part`), `date_trunc` to year / quarter /
-  month / week (ISO, Monday) / day / hour / minute / second (SQL Server 2022+);
+  month / week (ISO, Monday) / day / hour / minute / second (SQL Server 2022+), `date_diff` from year down to
+  microsecond, `last_day`, `make_date` (a year past 9999 is an error on the server, an answer in DuckDB);
 - strings, compared, grouped and sorted exactly as DuckDB does (case-, accent- and trailing-space-sensitive, code
   point order) whatever the column's collation — an equality keeps an index seek usable; `concat`, `replace`,
   `trim`, `lpad`/`rpad`, `length`, `substring`, `strpos` (counted in code points), `LIKE` without `_`,
@@ -310,7 +311,7 @@ Runs locally (each measured to answer differently on SQL Server, or not expressi
 regular expressions, `LIKE` patterns with `_`, `substring` with a negative or non-constant start, comparing or
 grouping binary values (SQL Server ignores trailing zero bytes), a float divided by a value that may be zero,
 decimal arithmetic past precision 38 (SQL Server would round), float → string casts, `any_value`, `GROUPS` /
-`RANGE`-offset / `EXCLUDE` / `FILTER` windows, `nth_value`, functions without a Substrait counterpart (`date_diff`,
+`RANGE`-offset / `EXCLUDE` / `FILTER` windows, `nth_value`, functions with no T-SQL rendering (`date_sub`,
 `strftime`, list and JSON functions, …), prepared-statement parameters, and a subquery joined to a
 local table (DuckDB pushes only whole nodes).
 

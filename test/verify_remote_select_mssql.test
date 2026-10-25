@@ -1266,6 +1266,48 @@ EXPLAIN SELECT date_trunc('decade', d), count(*) FROM rp.dbo.rs_t GROUP BY 1;
 ----
 physical_plan	<!REGEX>:.*Fabricator Query.*
 
+# date_diff counts unit boundaries like DATEDIFF_BIG, except the WEEK, which DuckDB counts as whole days / 7;
+# last_day is EOMONTH, make_date DATEFROMPARTS (our own extension: Substrait has none of them). 300 timestamp pairs
+# spread over three years, both directions, with microseconds.
+statement ok
+SELECT fabricator_exec('db', 'DROP TABLE IF EXISTS dbo.rs_dd;');
+
+statement ok
+SELECT fabricator_exec('db', 'CREATE TABLE dbo.rs_dd (id INT, a DATETIME2(6), b DATETIME2(6), da DATE, db DATE);
+INSERT dbo.rs_dd SELECT value,
+  DATEADD(microsecond, (value * 7919) % 1000000, DATEADD(minute, (value * 104729) % 2000000, CAST(''2024-01-01'' AS DATETIME2(6)))),
+  DATEADD(microsecond, (value * 4243) % 1000000, DATEADD(minute, (value * 130363) % 2000000, CAST(''2024-01-01'' AS DATETIME2(6)))),
+  NULL, NULL FROM GENERATE_SERIES(1, 300);
+UPDATE dbo.rs_dd SET da = CAST(a AS DATE), db = CAST(b AS DATE);');
+
+statement ok
+SELECT fabricator_refresh_cache('rp');
+
+statement ok
+SELECT fabricator_refresh_cache('db');
+
+query II
+EXPLAIN SELECT date_diff('week', a, b), count(*) FROM rp.dbo.rs_dd GROUP BY 1;
+----
+physical_plan	<REGEX>:.*Fabricator Query.*
+
+query I
+SELECT count(*) FROM (((SELECT id, date_diff('year', a, b), date_diff('quarter', a, b), date_diff('month', a, b), date_diff('week', a, b), date_diff('day', a, b), date_diff('hour', a, b), date_diff('minute', a, b), date_diff('second', a, b), date_diff('millisecond', a, b), date_diff('microsecond', a, b) FROM rp.dbo.rs_dd ORDER BY id LIMIT 1000) EXCEPT ALL (SELECT id, date_diff('year', a, b), date_diff('quarter', a, b), date_diff('month', a, b), date_diff('week', a, b), date_diff('day', a, b), date_diff('hour', a, b), date_diff('minute', a, b), date_diff('second', a, b), date_diff('millisecond', a, b), date_diff('microsecond', a, b) FROM db.dbo.rs_dd ORDER BY id LIMIT 1000))
+  UNION ALL ((SELECT id, date_diff('year', a, b), date_diff('quarter', a, b), date_diff('month', a, b), date_diff('week', a, b), date_diff('day', a, b), date_diff('hour', a, b), date_diff('minute', a, b), date_diff('second', a, b), date_diff('millisecond', a, b), date_diff('microsecond', a, b) FROM db.dbo.rs_dd ORDER BY id LIMIT 1000) EXCEPT ALL (SELECT id, date_diff('year', a, b), date_diff('quarter', a, b), date_diff('month', a, b), date_diff('week', a, b), date_diff('day', a, b), date_diff('hour', a, b), date_diff('minute', a, b), date_diff('second', a, b), date_diff('millisecond', a, b), date_diff('microsecond', a, b) FROM rp.dbo.rs_dd ORDER BY id LIMIT 1000)));
+----
+0
+
+query I
+SELECT count(*) FROM (((SELECT id, date_diff('week', da, db), date_diff('month', da, db), last_day(a), last_day(da), make_date(year(da), month(da), 1) FROM rp.dbo.rs_dd ORDER BY id LIMIT 1000) EXCEPT ALL (SELECT id, date_diff('week', da, db), date_diff('month', da, db), last_day(a), last_day(da), make_date(year(da), month(da), 1) FROM db.dbo.rs_dd ORDER BY id LIMIT 1000))
+  UNION ALL ((SELECT id, date_diff('week', da, db), date_diff('month', da, db), last_day(a), last_day(da), make_date(year(da), month(da), 1) FROM db.dbo.rs_dd ORDER BY id LIMIT 1000) EXCEPT ALL (SELECT id, date_diff('week', da, db), date_diff('month', da, db), last_day(a), last_day(da), make_date(year(da), month(da), 1) FROM rp.dbo.rs_dd ORDER BY id LIMIT 1000)));
+----
+0
+
+query II
+EXPLAIN SELECT date_diff('decade', a, b), count(*) FROM rp.dbo.rs_dd GROUP BY 1;
+----
+physical_plan	<!REGEX>:.*Fabricator Query.*
+
 # ⚠ a TIMESTAMP constant was a STRING literal in upstream to_substrait, so comparing it failed on the server
 # ("Conversion failed when converting date and/or time from character string"); a precision_timestamp now
 query II
